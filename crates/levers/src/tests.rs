@@ -326,6 +326,18 @@ fn accessors_read_their_rows() {
     );
 }
 
+/// `BLOOMERY_DRAFT` takes `mtp` beside the V4.1 words: the row's own kind,
+/// read by the qwen4exp binaries; a word it does not take is refused by name.
+#[test]
+fn draft_row_takes_mtp() {
+    let mtp = read(&env(&[(DRAFT, "mtp")]), Scope::Every).expect("mtp is a word the row takes");
+    assert_eq!(mtp.draft(), Some("mtp"));
+    let Err(other) = read(&env(&[(DRAFT, "draft")]), Scope::Every) else {
+        panic!("a word the row does not take is refused");
+    };
+    assert!(other.to_string().contains("BLOOMERY_DRAFT"), "{other}");
+}
+
 /// `BLOOMERY_RESIDENCY` unset follows the placement: the serving word under a
 /// serving placement, `off` where the machine does not run, the first
 /// condition that holds named; set, it is the load's word wherever it is.

@@ -630,6 +630,10 @@ struct MtpArena {
     out: DeviceBuffer<u32>,
     done: DeviceBuffer<u32>,
     no_map: DeviceBuffer<u32>,
+    /// A window chain's readback: each walk's last row's id and probability
+    /// bits (two words a walk), then the last walk's fault word and site
+    /// mask — read once a window ([`Mtp38::run_chain`]).
+    chain: DeviceBuffer<u32>,
     taps: Option<TapBufs>,
     /// The rows of the last walk, which the readbacks and the next own row
     /// read.
@@ -699,6 +703,7 @@ impl MtpArena {
             out: u(2 * r + 2)?,
             done: u(1)?,
             no_map: u(1)?,
+            chain: u(2 * MTP_GRAPH_ROWS + 2)?,
             taps: None,
             last: None,
             held: 0,
@@ -750,6 +755,7 @@ impl MtpArena {
             &self.out,
             &self.done,
             &self.no_map,
+            &self.chain,
         ];
         f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
             + u32s.iter().map(|b| b.num_bytes()).sum::<usize>()
@@ -850,13 +856,16 @@ pub(super) struct MtpCtx<'a> {
 impl Mtp38 {
     /// The program's arena beside the loaded body: the router's dims, the
     /// vocabulary the head writes and the rope table's rows, which must
-    /// cover the store's positions. Load-time only.
+    /// cover the store's positions, held to `arena` device bytes — the plan's
+    /// count ([`model::arch::qwen35moe::place::mtp_arena_bytes`]). Load-time
+    /// only.
     pub(super) fn arm(
         &mut self,
         stream: &CudaStream,
         dims: RouterDims,
         vocab: usize,
         rope_rows: usize,
+        arena: u64,
     ) -> Result<(), GpuError> {
         if self.ctx > rope_rows {
             return Err(GpuError::shape(
@@ -867,7 +876,15 @@ impl Mtp38 {
                 ),
             ));
         }
-        self.a = Some(MtpArena::new(stream, dims, vocab, self.ctx)?);
+        let a = MtpArena::new(stream, dims, vocab, self.ctx)?;
+        let got = a.bytes() as u64;
+        if got != arena {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("the program's arena holds {got} device bytes; the plan counts {arena}"),
+            ));
+        }
+        self.a = Some(a);
         stream.synchronize()?;
         Ok(())
     }
@@ -946,6 +963,25 @@ impl Mtp38 {
         head: MtpHead,
         mode: MtpMode,
     ) -> Result<MtpDraft, GpuError> {
+        let stream = c.gpu.stream();
+        let m = self.run_walk(c, target, feed, head, mode)?;
+        let a = self.arena_ref()?;
+        read_draft(a, stream, m)
+    }
+
+    /// One walk of the program over `feed`'s rows into `head`, eager or
+    /// replayed from its capture, with no readback: [`Mtp38::run`]'s checks
+    /// and launches, the arena's last-walk bookkeeping moved and the walk's
+    /// rows returned. A fault the walk raised stays on the fault word, which
+    /// the next readback names ([`read_draft`], a chain's).
+    pub(super) fn run_walk(
+        &mut self,
+        c: &MtpCtx<'_>,
+        target: Option<&DeviceBuffer<f32>>,
+        feed: MtpFeed<'_>,
+        head: MtpHead,
+        mode: MtpMode,
+    ) -> Result<usize, GpuError> {
         let stream = c.gpu.stream();
         if head == MtpHead::Rows && self.head.is_none() {
             return Err(GpuError::state(
@@ -1068,7 +1104,128 @@ impl Mtp38 {
         let a = self.arena()?;
         a.last = Some((m, head));
         a.held = pos0 as usize + m;
-        read_draft(a, stream, m)
+        Ok(m)
+    }
+
+    /// One window's chain — the draft's proposal, one readback: `refresh`'s
+    /// walk (a [`MtpFeed::Rows`] feed, its rows the target's kept rows with
+    /// the target's hidden rows), whose last row proposes the first id, then
+    /// `own` walks of [`MtpFeed::Own`], each reading the walk before it on
+    /// the card and proposing one id more, into `head`. Each walk's last
+    /// row's id and probability bits are copied into the arena's chain
+    /// buffer as it ends and the whole chain is read back once, the last
+    /// walk's fault word with it: the tokens are the proposal's ids in
+    /// order (1 + `own` of them). Refused as [`Mtp38::run`] refuses each
+    /// walk, before the first one moves anything the chain's feeds name.
+    pub(super) fn run_chain(
+        &mut self,
+        c: &MtpCtx<'_>,
+        target: Option<&DeviceBuffer<f32>>,
+        refresh: MtpFeed<'_>,
+        own: usize,
+        head: MtpHead,
+        mode: MtpMode,
+    ) -> Result<MtpDraft, GpuError> {
+        let stream = c.gpu.stream();
+        let MtpFeed::Rows { tokens, pos0, .. } = refresh else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a chain's refresh {refresh:?}: the rows the target kept"),
+            ));
+        };
+        if own >= MTP_GRAPH_ROWS {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{own} own walks; a chain proposes at most {}",
+                    MTP_GRAPH_ROWS - 1
+                ),
+            ));
+        }
+        // Every walk's positions, checked before the first moves anything:
+        // the refresh's rows, then one own row at each position after them.
+        let (m, end) = (tokens.len(), pos0 as usize + tokens.len());
+        if end + own > self.ctx {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a chain of {} rows from position {pos0}: its last own row runs past a store \
+                     of {}",
+                    m + own,
+                    self.ctx
+                ),
+            ));
+        }
+        let feeds: Vec<MtpFeed<'_>> = std::iter::once(refresh)
+            .chain((0..own).map(|i| {
+                MtpFeed::Own {
+                    pos0: u32::try_from(end + i)
+                        .expect("a chain's positions lie below its store (checked above)"),
+                }
+            }))
+            .collect();
+        let mut walks = Vec::with_capacity(feeds.len());
+        for (i, feed) in feeds.iter().enumerate() {
+            let m = self.run_walk(c, target, *feed, head, mode)?;
+            let a = self.arena_ref()?;
+            // SAFETY: words m − 1 (the last row's id) and 2m − 1 (its
+            // probability's bits) of the readback's 2·MTP_ROWS + 2 words,
+            // and words 2i and 2i + 1 of the chain's 2·MTP_GRAPH_ROWS + 2
+            // (i + 1 <= MTP_GRAPH_ROWS walks); the windows live for these
+            // copies.
+            let (mut id, mut p) = unsafe {
+                (
+                    param_view::<u32>(&a.chain, 2 * i, 1),
+                    param_view::<u32>(&a.chain, 2 * i + 1, 1),
+                )
+            };
+            // SAFETY: as above, of `out`.
+            let (w_id, w_p) = unsafe {
+                (
+                    param_view::<u32>(&a.out, m - 1, 1),
+                    param_view::<u32>(&a.out, 2 * m - 1, 1),
+                )
+            };
+            id.copy_from_device_async(&w_id, stream)?;
+            p.copy_from_device_async(&w_p, stream)?;
+            walks.push(m);
+        }
+        // The last walk's fault word and site mask close the chain: the word
+        // is the card's own, so a fault any walk of the chain raised is on
+        // it (the argmax kernel copies it after its launch).
+        let m = *walks.last().expect("a chain runs its refresh");
+        let a = self.arena_ref()?;
+        // SAFETY: words 2m and 2m + 1 of the readback, and the chain's last
+        // two words; the windows live for these copies.
+        let (mut word, mut sites) = unsafe {
+            (
+                param_view::<u32>(&a.chain, 2 * MTP_GRAPH_ROWS, 1),
+                param_view::<u32>(&a.chain, 2 * MTP_GRAPH_ROWS + 1, 1),
+            )
+        };
+        // SAFETY: as above, of `out`.
+        let (w_word, w_sites) = unsafe {
+            (
+                param_view::<u32>(&a.out, 2 * m, 1),
+                param_view::<u32>(&a.out, 2 * m + 1, 1),
+            )
+        };
+        word.copy_from_device_async(&w_word, stream)?;
+        sites.copy_from_device_async(&w_sites, stream)?;
+        let out = a.chain.to_host_vec(stream)?;
+        let n = walks.len();
+        let (Some(&word), Some(&sites)) =
+            (out.get(2 * MTP_GRAPH_ROWS), out.get(2 * MTP_GRAPH_ROWS + 1))
+        else {
+            return Err(GpuError::state(WHAT, "a chain readback of 2n + 2 words"));
+        };
+        if let Some(fault) = Fault::from_words(word, sites) {
+            return Err(GpuError::fault(WHAT, fault));
+        }
+        Ok(MtpDraft {
+            tokens: out[..n].to_vec(),
+            p: out[n..2 * n].iter().map(|&b| f32::from_bits(b)).collect(),
+        })
     }
 
     /// The walk itself: every launch of the module doc's list, enqueued on

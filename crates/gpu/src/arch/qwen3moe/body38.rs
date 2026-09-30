@@ -508,6 +508,11 @@ pub struct Body38 {
     held: u32,
     /// The call planned and not yet launched.
     staged: Option<Staged38>,
+    /// The arena the last planned call walked (a step's, a pass's or a
+    /// verify's the step arena or the pass arena, a ubatch's its own): where
+    /// its rows' final streams sit for a caller that reads them back
+    /// ([`Body38::target_streams`], [`Tapped`]).
+    last_walk: TargetRows,
     /// A failure a gate planted for the next call.
     plant: Option<Plant>,
     /// The MTP draft layer, when the load opened one ([`Body38::open_placed_mtp`]).
@@ -642,7 +647,13 @@ impl Body38 {
                 )?;
                 if let Some(mut d) = draft {
                     let rows = body.rope.table.len() / body.rope.width;
-                    d.arm(gpu.stream(), body.s.route.dims(), body.vocab, rows)?;
+                    d.arm(
+                        gpu.stream(),
+                        body.s.route.dims(),
+                        body.vocab,
+                        rows,
+                        mtp.map(|(_, _, p)| p.arena_bytes).unwrap_or_default(),
+                    )?;
                     body.mtp = Some(d);
                 }
                 Ok(body)
@@ -825,6 +836,7 @@ impl Body38 {
             ctx,
             held: 0,
             staged: None,
+            last_walk: TargetRows::Step,
             plant: None,
             mtp: None,
         };
@@ -896,6 +908,20 @@ impl Body38 {
         Ok(v)
     }
 
+    /// The arena the last planned call walked: where its rows' final streams
+    /// sit ([`Body38::target_streams`]) — a MTP draft's taps read them there.
+    #[must_use]
+    pub fn last_walk(&self) -> TargetRows {
+        self.last_walk
+    }
+
+    /// The values of one tapped row: four streams of [`geo::HIDDEN`], the
+    /// final hidden row a position's — an MTP draft's tap need.
+    #[must_use]
+    pub fn mtp_tap_width(&self) -> usize {
+        geo::STREAMS * geo::HIDDEN
+    }
+
     fn draft_mut(&mut self) -> Result<&mut Mtp38, GpuError> {
         self.mtp.as_mut().ok_or(GpuError::state(
             WHAT,
@@ -934,23 +960,83 @@ impl Body38 {
             WHAT,
             "an MTP draft (Body38::open_placed_mtp)",
         ))?;
-        let target = match feed {
-            MtpFeed::Rows {
-                hidden: MtpHidden::Target { walk, .. },
-                ..
-            } => Some(final_streams(plans, [s, a, wa], walk)),
-            _ => None,
-        };
+        let target = mtp_target(plans, [s, a, wa], feed);
         d.run(
-            &MtpCtx {
-                gpu,
-                tw: w,
-                k,
-                eps: *eps,
-                table: &rope.table,
-            },
+            &mtp_ctx(gpu, w, k, *eps, &rope.table),
             target,
             feed,
+            head,
+            mode,
+        )
+    }
+
+    /// One walk of the draft's program with no readback
+    /// ([`Mtp38::run_walk`]) beside this body.
+    fn mtp_run_walk(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        feed: MtpFeed<'_>,
+        head: MtpHead,
+        mode: MtpMode,
+    ) -> Result<usize, GpuError> {
+        let Body38 {
+            mtp,
+            k,
+            rope,
+            eps,
+            plans,
+            s,
+            a,
+            wa,
+            ..
+        } = self;
+        let d = mtp.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))?;
+        let target = mtp_target(plans, [s, a, wa], feed);
+        d.run_walk(
+            &mtp_ctx(gpu, w, k, *eps, &rope.table),
+            target,
+            feed,
+            head,
+            mode,
+        )
+    }
+
+    /// One window's chain of the draft's program ([`Mtp38::run_chain`])
+    /// beside this body: `refresh`'s walk then `own` own walks, one readback.
+    fn mtp_run_chain(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        refresh: MtpFeed<'_>,
+        own: usize,
+        head: MtpHead,
+        mode: MtpMode,
+    ) -> Result<MtpDraft, GpuError> {
+        let Body38 {
+            mtp,
+            k,
+            rope,
+            eps,
+            plans,
+            s,
+            a,
+            wa,
+            ..
+        } = self;
+        let d = mtp.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))?;
+        let target = mtp_target(plans, [s, a, wa], refresh);
+        d.run_chain(
+            &mtp_ctx(gpu, w, k, *eps, &rope.table),
+            target,
+            refresh,
+            own,
             head,
             mode,
         )
@@ -1269,6 +1355,7 @@ impl Body38 {
         }
         self.check_next(pos, n)?;
         let hist = self.ple.fill(pos, tokens)?;
+        self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
         // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
         // `n <= PASS_ROWS` (the record's write refused more), and `e` stays in
@@ -1398,6 +1485,7 @@ impl Body38 {
         }
         self.check_next(pos, n)?;
         let hist = self.ple.fill(pos, tokens)?;
+        self.last_walk = TargetRows::Ubatch;
         self.wr.write(stream, tokens, pos)?;
         // SAFETY: the ubatch arena holds `wide.rows · HIDDEN` values of `e`
         // and `n <= wide.rows` (the record's write refused more), and `e`
@@ -1645,6 +1733,22 @@ impl GpuModel<Body38> {
     /// model where it stood; the layer taps must be off for passes and
     /// ubatches.
     pub fn prompt38(&mut self, tokens: &[u32], path: Prompt38) -> Result<u32, GpuError> {
+        self.prompt38_with(tokens, path, None)
+    }
+
+    /// [`GpuModel::prompt38`] with a tap on the prompt's units: `sink` is
+    /// called after each unit the path runs — every token's step, every
+    /// pass, every ubatch — with the arena its rows' final streams sit in,
+    /// the unit's first position and its rows, before the next unit
+    /// overwrites them. A `None` sink is [`GpuModel::prompt38`] itself: the
+    /// steps run as one call of the whole prompt; a sink's per-token steps
+    /// leave the same bits, a head readback a token.
+    pub fn prompt38_with(
+        &mut self,
+        tokens: &[u32],
+        path: Prompt38,
+        mut sink: Option<&mut Prompt38Sink<'_>>,
+    ) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
         if tokens.is_empty() {
             return Err(GpuError::shape(WHAT_P, "empty token slice"));
@@ -1668,8 +1772,25 @@ impl GpuModel<Body38> {
                 ),
             ));
         }
+        let tapped = sink.is_some();
         match path.resolve(tokens.len()) {
-            Prompt38::Step => self.step(tokens),
+            Prompt38::Step => {
+                if !tapped {
+                    // The plain call: every token's body, one readback at the
+                    // end.
+                    return self.step(tokens);
+                }
+                // A tap reads each token's row where the step left it.
+                let mut next = None;
+                for &token in tokens {
+                    next = Some(self.step(&[token])?);
+                    let (first, rows) = (self.pos() - 1, 1usize);
+                    if let Some(f) = sink.as_deref_mut() {
+                        f(self, TargetRows::Step, first, rows)?;
+                    }
+                }
+                next.ok_or(GpuError::state(WHAT_P, "a token read after the last step"))
+            }
             Prompt38::Gemm => {
                 let rows = self.body(WHAT_P)?.wide.rows;
                 let (mut next, mut at) = (None, 0);
@@ -1686,6 +1807,9 @@ impl GpuModel<Body38> {
                         body.walk_gemm(gpu, w, m, pos, last.then_some(head))?;
                         Ok(last)
                     })?;
+                    if let Some(f) = sink.as_deref_mut() {
+                        f(self, TargetRows::Ubatch, pos, m)?;
+                    }
                 }
                 next.ok_or(GpuError::state(
                     WHAT_P,
@@ -1707,6 +1831,9 @@ impl GpuModel<Body38> {
                         body.walk_pass(gpu, w, m, pos, last.then_some(head))?;
                         Ok(last)
                     })?;
+                    if let Some(f) = sink.as_deref_mut() {
+                        f(self, TargetRows::Pass, pos, m)?;
+                    }
                 }
                 next.ok_or(GpuError::state(WHAT_P, "a token read after the last pass"))
             }
@@ -1735,6 +1862,45 @@ fn final_streams<'b>(
     &arena.res[cur]
 }
 
+/// The target's streams a [`MtpHidden::Target`] feed of a walk or a chain's
+/// refresh names, over the body's arenas.
+fn mtp_target<'b>(
+    plans: &[Layer38],
+    arenas: [&'b Arena38; 3],
+    feed: MtpFeed<'_>,
+) -> Option<&'b DeviceBuffer<f32>> {
+    match feed {
+        MtpFeed::Rows {
+            hidden: MtpHidden::Target { walk, .. },
+            ..
+        } => Some(final_streams(plans, arenas, walk)),
+        _ => None,
+    }
+}
+
+/// The draft's context over the body's own pieces.
+fn mtp_ctx<'a>(
+    gpu: &'a Gpu,
+    w: &'a Weights,
+    k: &'a Kernels38,
+    eps: f32,
+    table: &'a DeviceBuffer<f32>,
+) -> MtpCtx<'a> {
+    MtpCtx {
+        gpu,
+        tw: w,
+        k,
+        eps,
+        table,
+    }
+}
+
+/// A prompt call's tap ([`GpuModel::prompt38_with`]): called after each unit
+/// the path runs, with the arena its rows' final streams sit in, the unit's
+/// first position and its rows.
+pub type Prompt38Sink<'a> =
+    dyn FnMut(&mut GpuModel<Body38>, TargetRows, u32, usize) -> Result<(), GpuError> + 'a;
+
 /// The MTP draft's calls ([`Mtp38::run`]); each is refused by name on a load
 /// without a draft.
 impl GpuModel<Body38> {
@@ -1761,11 +1927,61 @@ impl GpuModel<Body38> {
         self.note_fault(WHAT_D, r)
     }
 
+    /// One walk of the draft with no readback ([`Mtp38::run`]'s checks and
+    /// launches): the prompt's warmup rows, whose tokens are not asked for.
+    /// A fault the walk raises stays on the card's fault word, which the
+    /// next readback — a chain's, the target's — names.
+    pub fn mtp_walk(
+        &mut self,
+        feed: MtpFeed<'_>,
+        head: MtpHead,
+        mode: MtpMode,
+    ) -> Result<(), GpuError> {
+        const WHAT_D: &str = "qwen4exp mtp_walk";
+        if let Some(fault) = self.poisoned() {
+            return Err(GpuError::Poisoned {
+                what: WHAT_D,
+                fault,
+            });
+        }
+        let (gpu, w, body) = self.body_parts(WHAT_D)?;
+        let r = body.mtp_run_walk(gpu, w, feed, head, mode).map(|_| ());
+        self.note_fault(WHAT_D, r)
+    }
+
     /// Arm (or disarm) the draft's taps ([`Mtp38::set_taps`]); its captured
     /// walks are dropped first. Load-time allocation.
     pub fn set_mtp_taps(&mut self, on: bool) -> Result<(), GpuError> {
         let (gpu, _, body) = self.body_parts("qwen4exp set_mtp_taps")?;
         body.draft_mut()?.set_taps(gpu.stream(), on)
+    }
+
+    /// One window's chain of the draft (module doc of `mtp38`): `refresh`'s
+    /// rows — the target's kept rows with the target's hidden rows, a
+    /// [`MtpFeed::Rows`] feed — walked, then `own` own walks, each reading
+    /// the walk before it on the card, into `head`, eager or captured, and
+    /// the proposal's ids (1 + `own` of them) and their probabilities read
+    /// back once. A poisoned model is refused; a fault any walk of the chain
+    /// raised is its error and poisons the model as the target's would.
+    pub fn mtp_chain(
+        &mut self,
+        refresh: MtpFeed<'_>,
+        own: usize,
+        head: MtpHead,
+        mode: MtpMode,
+    ) -> Result<MtpDraft, GpuError> {
+        const WHAT_D: &str = "qwen4exp mtp_chain";
+        if let Some(fault) = self.poisoned() {
+            return Err(GpuError::Poisoned {
+                what: WHAT_D,
+                fault,
+            });
+        }
+        let (gpu, w, body) = self.body_parts(WHAT_D)?;
+        let r = body.mtp_run_chain(gpu, w, refresh, own, head, mode);
+        // A fault a walk of the chain raised poisons the model as the
+        // target's would.
+        self.note_fault(WHAT_D, r)
     }
 
     /// The last draft walk's taps ([`Mtp38::taps`]). Blocking.
@@ -1821,6 +2037,7 @@ impl ChainBody for Body38 {
     /// or replays its chain.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput38) -> Result<(), GpuError> {
         planted(&mut self.plant, Plant::BeforeLaunch)?;
+        self.last_walk = TargetRows::Step;
         self.s
             .ple
             .e
@@ -2023,6 +2240,7 @@ impl Body38 {
         super::refuse_past_vocab(WHAT_V, tokens, self.vocab)?;
         ple_takes(WHAT_V, self.ple.hash.window(), tokens)?;
         let hist = self.ple.fill(pos, tokens)?;
+        self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
         // SAFETY: the pass arena holds `PASS_ROWS · HIDDEN` rows of `e` and
         // `n <= VERIFY_ROWS <= PASS_ROWS`, and `e` stays in place while the

@@ -1,0 +1,48 @@
+# Round mtpwin (MTP chain 4): Qwen3.8's MTP speculative window, T = 4, wired end to end.
+# Same binary, two arms by the draft lever: the plain decode (one token a step, BLOOMERY_DRAFT
+# unset) against BLOOMERY_DRAFT=mtp (the window of four rows: the target's verify of the draft's
+# three ids, the kept rows committed, the draft's next chain one readback). The T = 1 arms are the
+# measured card-expert decode: prose:512 53.85 and prose:4096 53.47 tok/s (rig-log 09-29#q38prose-pp).
+# Decomposing that 18.57 ms step (prose:512): the dense front 7.3 ms (strataread, read once for the
+# window's rows by the m-column kernels), the layer-handoff term 1.0-1.7 ms, the host union over the
+# host's ~4.1 slots of 10 the residual 8-10 ms, the rest launches and the argmax. The window of four
+# rows pays the front once, the union over the four rows' host picks (the union factor 2.94-3.88 over
+# one token's, [derived, the design's U_host term]) and the draft's chain 1.3-1.6 ms (mtpprog 1a:
+# refresh 0.5-0.7 + two own steps 0.4-0.5 each, one readback), beside 0.28 ms of extra routed rows:
+# window 34-47 ms [derived] for E(4) = 2.80-3.35 tokens [derived, the design's 5 ①, the box term],
+# 60-98 tok/s, +11..+82 % over the plain arm. The band is widened for the union residual's 8-10 ms
+# spread (the step's own accounting is not decomposed on the card yet) and the acceptance rate, the
+# one term the derivation cannot close: E(4) is its box measurement, this sitting's first question.
+# prose:4096 carries the same band (the step 18.68 ms, the deeper QSA rows adding ~0.1 ms a row).
+# The runner pairs the arms in one lease:
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38mtp-tg.card BLOOMERY_GEN_CTX=4096' BLOOMERY_AB_ROUNDS=3
+# just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_DRAFT=mtp prose:4096 prose:4096@BLOOMERY_DRAFT=mtp
+# (the plain arm is the no-draft path; the mtp arm's load line carries draft=mtp and its mtp summary
+# record the kept lengths' histogram). Wall [derived]: 4 arms x 3 rounds = 12 fresh processes, each a
+# Qwen3.8 load of 40-90 s (the draft's load adds its 2.8 GB, the mtp arm's plan line names the
+# reserve) with the host set warm, plus the mtp arms' warmup (the draft walked over the prompt's
+# rows, ~70 ms at 512 and ~0.5 s at 4096) and ~2.5 s of 96 tokens: about 15-25 min. Under 30 min.
+kind: ab
+question: does Qwen3.8's MTP window lift the decode rate by the union-and-front model's band, and
+  what acceptance does the real prose reach?
+term: tg tok/s @ n=96, the prose corpus (prose:512 and prose:4096), ctx 4096
+  (BLOOMERY_GEN_CTX=4096), A6000, plan a (card experts), BLOOMERY_DRAFT=mtp against unset, same
+  binary, paired by round
+unit: %
+predict: +11..+82
+rounds: 3
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, both arms of a P in one lease, a fresh process per arm, the host set and the
+  PLE table warm before each timed window (majflt near 0), no [cpu-busy] or [other-busy] row; the
+  mtp arm's load line names draft=mtp and its mtp summary's kept histogram is non-empty, its
+  proposals' rate read from tok/s(positions); the plain arm's load line names no draft
+decide-in: land mtpwin's window as measured and read the realized acceptance (E(4) = positions /
+  passes) beside the design's 2.80-3.35; the (d) log-rollback round follows on the acceptance the
+  real prose reaches
+decide-below: read the mtp summary's kept histogram: an E(4) under ~2.4 is the acceptance, not the
+  window's cost (the p-min gate and the reduced head's coverage are the next levers, both backlog);
+  an E(4) near the band with the rate still low means the draft's chain is not under the verify —
+  nsys one window before any change
+decide-above: the union residual was over-counted at T = 1 or the draft's chain sat under the
+  verify's host term: re-derive both from one BLOOMERY_STEP_STATS window before opening another
+  round

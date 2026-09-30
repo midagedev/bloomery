@@ -1370,6 +1370,22 @@ pub static DRAFT_SUMMARY: Kind = Kind {
     ],
 };
 
+/// The MTP draft's window summary.
+pub static MTP_SUMMARY: Kind = Kind {
+    name: "mtp_summary",
+    head: "mtp summary",
+    doc: "BLOOMERY_DRAFT=mtp: the windows' proposals and the rows each kept (a count a kept \
+          length, 1 to 4), the positions and passes over the run, and the kept passes' \
+          positions per second.",
+    parts: &[
+        key("proposals", U64, ""),
+        key("kept", List, "windows"),
+        key("positions", U64, "positions"),
+        key("passes", U64, ""),
+        key("tok/s(positions)", F64(2), "tok/s"),
+    ],
+};
+
 /// The timed run's footer.
 pub static SMOKE: Kind = Kind {
     name: "smoke",
@@ -1702,6 +1718,7 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
     &TAPS_SEQ,
     &TAPS_DUMP,
+    &MTP_SUMMARY,
     &STAT_STEP_HOST,
     &STAT_SUMMARY_HOST,
     &STAT_PROMPT38_SPLIT,

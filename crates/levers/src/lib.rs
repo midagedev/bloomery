@@ -685,7 +685,7 @@ impl Levers {
         self.flag(PIN_MAIN)
     }
 
-    /// `BLOOMERY_DRAFT`: the served draft, `lookup` or `dspark`; `None`
+    /// `BLOOMERY_DRAFT`: the served draft, `lookup`, `dspark` or `mtp`; `None`
     /// unset (the plain path).
     #[must_use]
     pub fn draft(&self) -> Option<&'static str> {

@@ -169,9 +169,11 @@ const LIST_ROUNDING: u64 = 14_268_416;
 const LIST_MAP: u64 = 163_840;
 // The largest context each card holds with the draft (full head), as predicted [derived: the plan
 // test's CARD_MAX_CTX budget less 2,785,017,856 B of draft granules, over 28,416 + 2,048 B a
-// position, the last pool counted whole]. Printed beside the boundary the test finds; the clause
-// holds the plan to that boundary.
-const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_315_534), ("3090", 475_131)];
+// position plus the draft program's arena, whose dense flash partials grow 198,144 B a 64-key
+// segment (3,096 B a position) — the same budget over 33,560 B a position, its 4.86 MB of fixed
+// rows beside the granules; the last pool counted whole]. Printed beside the boundary the test
+// finds; the clause holds the plan to that boundary.
+const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_194_276), ("3090", 431_309)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
@@ -258,7 +260,8 @@ fn hw_qwen4exp_mtp_plan() {
                     ctx * DRAFT_KV_ROW,
                     map,
                 );
-                let headroom = plain.cards[0].headroom_bytes - i128::from(with.draft_card_bytes());
+                let headroom = plain.cards[0].headroom_bytes
+                    - i128::from(with.draft_card_bytes() + with.arena_bytes);
                 check(
                     &mut o,
                     format!(
@@ -270,7 +273,7 @@ fn hw_qwen4exp_mtp_plan() {
                         with.draft.n_l,
                         with.headroom_bytes,
                         plain.cards[0].headroom_bytes,
-                        with.draft_card_bytes()
+                        with.draft_card_bytes() + with.arena_bytes
                     ),
                     view(&with.plan) == view(&plain)
                         && got == want
@@ -305,6 +308,7 @@ fn hw_qwen4exp_mtp_plan() {
                 .map(|l| model::placement::KvBytes::layer_bytes(&inputs.kv, l, ctx))
                 .sum::<u64>()
                 + ctx * DRAFT_KV_ROW
+                + model::arch::qwen35moe::place::mtp_arena_bytes(u64::from(full.draft.vocab), ctx)
         };
         let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);
         while lo < hi {

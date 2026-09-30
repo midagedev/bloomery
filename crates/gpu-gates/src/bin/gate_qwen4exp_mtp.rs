@@ -44,6 +44,17 @@
 //!   token past the vocabulary, a hidden slice of the wrong length, a capture
 //!   with the taps armed — and a NaN in a hidden row raised on the fault
 //!   word as the draft layer's `hc_mix`, the walk's error.
+//! - (w) the windows end to end, against the plain run at the set's prompt
+//!   and D3K's (depth 3,000 after it): under `app::arch::qwen4exp`'s `Draft`
+//!   impl the drafted greedy ids are the plain run's for 64 tokens, with a
+//!   rejected row among the windows — else the rollback path never ran and
+//!   the clause is red — and the live stores after the run the plain run's
+//!   at the same position; `commit(k)` is `k` steps for every k, a
+//!   scripted draft keeping each exactly through the same verify and commit,
+//!   at the deep prompt its rejected row completing a pool leaving the
+//!   pooled planes the plain run's; and the lane word planted on a lane no
+//!   call wrote makes the next drafted pass raise the delta stamp fault, by
+//!   name, and poisons the model.
 //!
 //! (l) and (h) are held on at least one row each: a run that excuses every
 //! row as a flip fails.
@@ -68,21 +79,23 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
         Body38, MTP_GRAPH_ROWS, MTP_ROWS, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, Prompt38,
-        Qwen38Model, TargetRows,
+        Qwen38Model, Store38Host, TargetRows,
     };
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
-    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
     use gguf::Split;
     use model::arch::models::HeadRows;
     use model::arch::qwen35moe::place::{MtpInputs, PlanInputs, machine, vocab_sha256};
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
+    use refset::arch::qwen4exp::IK;
     use refset::arch::qwen4exp::MODEL;
     use refset::arch::qwen4exp::mtp::{DRAFT, MTP, MTP_SET};
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
+    use runtime::{Advance as _, Committed, Draft, PassSink, TapNeed, Target as _};
 
     /// Cache rows: the e2e gate's, and the load gate's.
     const CTX: u64 = 3072;
@@ -859,6 +872,482 @@ mod gate {
         Ok(ok && raised)
     }
 
+    /// D3K's prefill, the e2e family's deep prompt (the set's `# tokens`).
+    fn deep_prompt() -> Result<Vec<u32>, GateError> {
+        let man = RefManifest::open(&data_dir().join(refset::arch::qwen4exp::D3K), &IK)?;
+        let (_, _, prefill) = man.step()?;
+        Ok(prefill.to_vec())
+    }
+
+    /// One plain run: `ids` prefilled by `path`, `n` tokens generated one
+    /// step each, every step's stores captured. Its tokens and its stores at
+    /// each position are the drafted runs' reference.
+    struct Plain {
+        tokens: Vec<u32>,
+        stores: Vec<(Vec<Store38Host>, Vec<f32>)>,
+    }
+
+    fn plain_run(
+        m: Qwen38Model,
+        ids: &[u32],
+        path: Prompt38,
+        n: usize,
+    ) -> Result<(Qwen38Model, Plain), GateError> {
+        let mut m = m;
+        m.reset()?;
+        let mut tokens = vec![m.prompt38(ids, path)?];
+        let mut stores = Vec::with_capacity(n);
+        for _ in 1..n {
+            let t = m.step(&[tokens[tokens.len() - 1]])?;
+            tokens.push(t);
+            let (gpu, _, b) = m.body_parts("plain")?;
+            stores.push(b.stores_host(gpu)?);
+        }
+        Ok((m, Plain { tokens, stores }))
+    }
+
+    /// The store comparison's shape: the e2e gate's `(v)` rule in one bool —
+    /// the committed delta lane, the conv ring's eight slots before the
+    /// count, the K/V planes' and raw keys' rows below it, the pools
+    /// complete at the count (a pool a rejected row completed is read only
+    /// at a count that completes it again), the PLE ring's fourteen slots
+    /// before it.
+    fn live_same(
+        a: &(Vec<Store38Host>, Vec<f32>),
+        b: &(Vec<Store38Host>, Vec<f32>),
+        pos: usize,
+    ) -> bool {
+        const N_KV: usize = 2;
+        const HEAD: usize = 256;
+        const IDX_DIM: usize = 128;
+        const POOL: usize = 4;
+        const CONV_RING: usize = 11;
+        const PLE_RING: usize = 17;
+        let conv_ch = 2 * 16 * 128 + 48 * 128;
+        let slots =
+            |ring: usize, back: usize| (pos.saturating_sub(back)..pos).map(move |p| p % ring);
+        let ring_same = |x: &[f32], y: &[f32], ring: usize, width: usize, back: usize| {
+            x.len() == ring * width
+                && y.len() == ring * width
+                && slots(ring, back).all(|s| {
+                    x[s * width..(s + 1) * width]
+                        .iter()
+                        .zip(&y[s * width..(s + 1) * width])
+                        .all(|(u, v)| u.to_bits() == v.to_bits())
+                })
+        };
+        let rows_same = |x: &[u16], y: &[u16], heads: usize, width: usize| {
+            let ctx = x.len() / (heads * width);
+            x.len() == y.len()
+                && x.len() == heads * ctx * width
+                && pos <= ctx
+                && (0..heads).all(|h| {
+                    let at = h * ctx * width;
+                    x[at..at + pos * width] == y[at..at + pos * width]
+                })
+        };
+        let layers = a.0.len() == b.0.len()
+            && a.0.iter().zip(&b.0).all(|(x, y)| match (x, y) {
+                (
+                    Store38Host::Rec { state: s, ring: r },
+                    Store38Host::Rec {
+                        state: s2,
+                        ring: r2,
+                    },
+                ) => {
+                    s.len() == s2.len()
+                        && s.iter().zip(s2).all(|(u, v)| u.to_bits() == v.to_bits())
+                        && ring_same(r, r2, CONV_RING, conv_ch, 8)
+                }
+                (
+                    Store38Host::Qsa { k, v, raw, pooled },
+                    Store38Host::Qsa {
+                        k: k2,
+                        v: v2,
+                        raw: raw2,
+                        pooled: pooled2,
+                    },
+                ) => {
+                    let live = pos / POOL * IDX_DIM;
+                    rows_same(k, k2, N_KV, HEAD)
+                        && rows_same(v, v2, N_KV, HEAD)
+                        && rows_same(raw, raw2, 1, IDX_DIM)
+                        && pooled.len() == pooled2.len()
+                        && live <= pooled.len()
+                        && pooled[..live] == pooled2[..live]
+                }
+                _ => false,
+            });
+        layers && ring_same(&a.1, &b.1, PLE_RING, STREAMS * HIDDEN, 14)
+    }
+
+    /// One drafted pass's kept rows, for the histogram and the rejection.
+    #[derive(Default)]
+    struct Kept {
+        rows: Vec<usize>,
+        proposed: Vec<bool>,
+        /// The generation's end position: the target's after the last pass.
+        pos: u32,
+    }
+
+    impl PassSink<app::Session<Body38>> for Kept {
+        type Error = GateError;
+
+        fn begin(&mut self, _: &app::Session<Body38>) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            t: &app::Session<Body38>,
+            c: &Committed,
+            _: &[u32],
+            _: std::time::Duration,
+        ) -> Result<(), GateError> {
+            self.rows.push(c.kept);
+            self.proposed.push(c.proposed);
+            self.pos = t.pos();
+            Ok(())
+        }
+    }
+
+    /// [`PassSink`] that hears nothing.
+    struct QuietSink;
+
+    impl PassSink<app::Session<Body38>> for QuietSink {
+        type Error = GateError;
+
+        fn begin(&mut self, _: &app::Session<Body38>) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _: &app::Session<Body38>,
+            _: &Committed,
+            _: &[u32],
+            _: std::time::Duration,
+        ) -> Result<(), GateError> {
+            Ok(())
+        }
+    }
+
+    /// The rows-log that hears nothing.
+    struct Quiet;
+
+    impl app::RowsLog for Quiet {
+        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), app::SessionError> {
+            Ok(())
+        }
+    }
+
+    /// The drafted session over the model: the draft opened, the verify
+    /// widths captured.
+    fn drafted_session(
+        m: Qwen38Model,
+        cfg: app::arch::qwen3moe::Q38Cfg,
+        ctx: u32,
+    ) -> Result<(app::Session<Body38>, app::arch::qwen3moe::Drafted38), GateError> {
+        let mut s = app::Session::from_model(m, ctx);
+        let draft = app::arch::qwen3moe::MtpDraft::open(s.model(), cfg)?;
+        let spec = s.with_draft::<app::arch::qwen3moe::MtpDraft, 4>(draft, &mut Quiet)?;
+        Ok((s, spec))
+    }
+
+    /// A draft that proposes the plain run's own next tokens, its `keep`th
+    /// id one the target rejects: every window keeps exactly `keep` rows
+    /// through the same verify and commit the MTP draft drives.
+    struct Scripted<'a> {
+        plain: &'a [u32],
+        keep: usize,
+        vocab: u32,
+        at: usize,
+    }
+
+    impl Draft<app::Session<Body38>> for Scripted<'_> {
+        const WIDTH: usize = 3;
+        const TAPS: TapNeed = TapNeed::Final;
+
+        fn begin(
+            &mut self,
+            _: &app::Session<Body38>,
+            _: &[u32],
+            _: u32,
+        ) -> Result<(), app::SessionError> {
+            Ok(())
+        }
+
+        fn propose(
+            &mut self,
+            _: &mut app::Session<Body38>,
+            _: u32,
+            out: &mut [u32],
+        ) -> Result<usize, app::SessionError> {
+            // The plain run's next tokens up to the keep − 1st, then ids it
+            // never emits: the verify keeps exactly `keep` rows.
+            let wrong = |want: u32| (want + 1_000) % self.vocab;
+            for (i, o) in out.iter_mut().enumerate() {
+                let want = self.plain.get(self.at + 1 + i).copied().unwrap_or(0);
+                *o = if i < self.keep - 1 { want } else { wrong(want) };
+            }
+            self.at += self.keep;
+            Ok(Self::WIDTH)
+        }
+
+        fn accept(
+            &mut self,
+            _: &mut app::Session<Body38>,
+            _: &[u32],
+            _: &[u32],
+            _: usize,
+        ) -> Result<(), app::SessionError> {
+            Ok(())
+        }
+
+        fn stepped(
+            &mut self,
+            _: &mut app::Session<Body38>,
+            _: u32,
+            _: u32,
+        ) -> Result<(), app::SessionError> {
+            Ok(())
+        }
+    }
+
+    /// One scripted window keeping exactly `keep` rows: the kept tokens are
+    /// the plain run's, and the live stores after the commit equal its at
+    /// the same position — `commit(k)` is `k` steps. The model moves in and
+    /// out. The label names the prompt in the clause's line.
+    fn scripted_window(
+        m: Qwen38Model,
+        plain: &Plain,
+        ids: &[u32],
+        keep: usize,
+        ctx: u32,
+        label: &str,
+    ) -> Result<(Qwen38Model, bool), GateError> {
+        let mut s = app::Session::from_model(m, ctx);
+        let vocab = u32::try_from(s.model().body("scripted")?.vocab())?;
+        let mut spec = s.with_draft::<Scripted, 4>(
+            Scripted {
+                plain: &plain.tokens,
+                keep,
+                vocab,
+                at: 0,
+            },
+            &mut Quiet,
+        )?;
+        let first = spec.prompt(&mut s, ids)?;
+        let out = runtime::generate(
+            &mut s,
+            &mut spec,
+            ids,
+            first,
+            &runtime::Stop::new(keep + 1, ctx)?,
+            &mut QuietSink,
+        )?;
+        let mut m = s.into_model();
+        let at = m.pos() as usize;
+        let want = &plain.tokens[..=keep];
+        let tokens_ok = out.tokens == want;
+        let (gpu, _, b) = m.body_parts("scripted")?;
+        let stores_ok = live_same(&b.stores_host(gpu)?, &plain.stores[keep - 1], at);
+        let ok = tokens_ok && stores_ok;
+        println!(
+            "(w) {label}: a window that keeps {keep} -> {} tokens = the plain run's {}, the \
+             live stores after the commit its at position {at} {}",
+            out.tokens.len(),
+            verdict(tokens_ok),
+            verdict(stores_ok)
+        );
+        Ok((m, ok))
+    }
+
+    /// The drafted session's cfg, its prompt path `path`.
+    fn step_cfg(path: Prompt38) -> app::arch::qwen3moe::Q38Cfg {
+        app::arch::qwen3moe::Q38Cfg {
+            prompt: path,
+            draft: MtpMode::Graph,
+        }
+    }
+
+    /// (w): the windows end to end, against the plain run — at the set's
+    /// prompt and D3K's (depth 3,000 after it): the drafted greedy ids are
+    /// the plain run's for 64 tokens, with a rejected row among the windows
+    /// (else the rollback path never ran, and the clause is red) and the
+    /// live stores after the run the plain run's at the same position;
+    /// `commit(k)` is `k` steps for every k, a scripted draft keeping each
+    /// exactly through the same verify and commit, at the deep prompt its
+    /// second row completing a pool; and the lane word planted on a lane no
+    /// call wrote makes the next drafted pass raise the delta stamp fault,
+    /// by name, and poisons the model.
+    fn windows(
+        m: Qwen38Model,
+        prompt: &[u32],
+        deep: &[u32],
+    ) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 64;
+        let ctx = m.body("windows")?.ctx() as u32;
+        let mut ok = true;
+
+        // The plain reference: every step's live stores, four tokens past
+        // the drafted loop's count (its last pass may keep rows past it).
+        let (m, shallow) = plain_run(m, prompt, Prompt38::Auto, N + 4)?;
+        let (mut m, out, kept) = {
+            let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+            let first = spec.prompt(&mut s, prompt)?;
+            let mut k = Kept::default();
+            let out = runtime::generate(
+                &mut s,
+                &mut spec,
+                prompt,
+                first,
+                &runtime::Stop::new(N, ctx)?,
+                &mut k,
+            )?;
+            (s.into_model(), out, k)
+        };
+        let ids_ok = out.tokens[..N] == shallow.tokens[..N];
+        ok &= ids_ok;
+        println!(
+            "(w) depth {}: the drafted run's {N} ids = the plain run's {}",
+            prompt.len(),
+            verdict(ids_ok)
+        );
+        let rejections: usize = kept
+            .rows
+            .iter()
+            .zip(&kept.proposed)
+            .filter(|(k, p)| **p && **k < 4)
+            .count();
+        ok &= rejections > 0;
+        println!(
+            "(w) depth {}: {} windows kept {:?}, {rejections} rejected a row {}",
+            prompt.len(),
+            kept.rows.len(),
+            kept.rows,
+            verdict(rejections > 0)
+        );
+        let at = (kept.pos as usize - prompt.len()).min(N + 3);
+        let (gpu, _, b) = m.body_parts("windows")?;
+        let stores_ok = live_same(
+            &b.stores_host(gpu)?,
+            &shallow.stores[at - 1],
+            kept.pos as usize,
+        );
+        ok &= stores_ok;
+        println!(
+            "(w) depth {}: the live stores after the drafted run = the plain run's at position \
+             {} {}",
+            prompt.len(),
+            kept.pos,
+            verdict(stores_ok)
+        );
+
+        // commit(k) is k steps, every k, through the rule's own driving.
+        for keep in 1..=4usize {
+            let (model, k_ok) = scripted_window(m, &shallow, prompt, keep, ctx, "shallow")?;
+            m = model;
+            ok &= k_ok;
+        }
+
+        // The deep prompt: the drafted ids and stores, and a rejection whose
+        // row completes a pool (the scripted window's second row, at position
+        // 3,003, completes pool 750).
+        let (m, deep_plain) = plain_run(m, deep, Prompt38::Auto, 4)?;
+        let (mut m, out, kept) = {
+            let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+            let first = spec.prompt(&mut s, deep)?;
+            let mut k = Kept::default();
+            let out = runtime::generate(
+                &mut s,
+                &mut spec,
+                deep,
+                first,
+                &runtime::Stop::new(N, ctx)?,
+                &mut k,
+            )?;
+            (s.into_model(), out, k)
+        };
+        let ids_ok = out.tokens[..4] == deep_plain.tokens[..4];
+        ok &= ids_ok;
+        println!(
+            "(w) depth {}: the drafted run's first 4 ids = the plain run's {}",
+            deep.len(),
+            verdict(ids_ok)
+        );
+        let rejections: usize = kept
+            .rows
+            .iter()
+            .zip(&kept.proposed)
+            .filter(|(k, p)| **p && **k < 4)
+            .count();
+        ok &= rejections > 0;
+        println!(
+            "(w) depth {}: {} windows kept {:?}, {rejections} rejected a row {}",
+            deep.len(),
+            kept.rows.len(),
+            kept.rows,
+            verdict(rejections > 0)
+        );
+        let at = (kept.pos as usize - deep.len()).min(3);
+        let (gpu, _, b) = m.body_parts("windows")?;
+        let stores_ok = live_same(
+            &b.stores_host(gpu)?,
+            &deep_plain.stores[at - 1],
+            kept.pos as usize,
+        );
+        ok &= stores_ok;
+        println!(
+            "(w) depth {}: the live stores after the drafted run = the plain run's at position \
+             {} {}",
+            deep.len(),
+            kept.pos,
+            verdict(stores_ok)
+        );
+        let (model, p_ok) = scripted_window(
+            m,
+            &deep_plain,
+            deep,
+            2,
+            ctx,
+            "deep, its rejected row completing a pool",
+        )?;
+        m = model;
+        ok &= p_ok;
+
+        // The lane word planted on a lane no call wrote: the next drafted
+        // pass raises the delta stamp fault by name and poisons the model.
+        m.reset()?;
+        let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Step), ctx)?;
+        let first = spec.prompt(&mut s, prompt)?;
+        {
+            let (gpu, _, b) = s.model_mut().body_parts("plant")?;
+            b.plant_lane(gpu, 2)?;
+        }
+        let r = runtime::generate(
+            &mut s,
+            &mut spec,
+            prompt,
+            first,
+            &runtime::Stop::new(2, ctx)?,
+            &mut QuietSink,
+        );
+        let fault_ok = matches!(&r, Err(e) if e.to_string().contains("delta_stamp"));
+        ok &= fault_ok;
+        println!(
+            "(w) the lane word planted on lane 2, never written -> {} {}",
+            match &r {
+                Ok(o) => format!("accepted, {} tokens", o.tokens.len()),
+                Err(e) => e.to_string(),
+            },
+            verdict(fault_ok)
+        );
+        let mut m = s.into_model();
+        m.reset()?;
+        Ok((m, ok))
+    }
+
     pub(super) fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[])?;
         let dir = MTP.path(MTP_SET);
@@ -976,6 +1465,8 @@ mod gate {
         ok &= pairing(&mut m, &prompt, &warm)?;
         ok &= graphs(&mut m, &warm)?;
         ok &= refusals(&mut m, &warm)?;
+        let (_, w_ok) = windows(m, &prompt, &deep_prompt()?)?;
+        ok &= w_ok;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

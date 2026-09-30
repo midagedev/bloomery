@@ -68,9 +68,13 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
-    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
+    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::place::{
+        Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
+    };
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
+    use refset::arch::qwen4exp::mtp::DRAFT;
     use serde_json::{Value, json};
 
     /// The levers the server acts on — the same list
@@ -86,6 +90,8 @@ mod gate {
         bloomery_levers::HOST_LOCK,
         bloomery_levers::CARD_DONTNEED,
         bloomery_levers::R8,
+        bloomery_levers::DRAFT,
+        bloomery_levers::MTP_HEAD_ROWS,
     ];
 
     const USAGE: &str = "usage: gate_qwen38_serve --gen <generate_qwen3moe log> --prompt <text> \
@@ -271,6 +277,7 @@ mod gate {
         let (st, body) = curl(&url("/props"), None, false)?;
         let e = json_of("/props", st, &body)?["engine"].clone();
         println!("props engine {e}");
+        let mtp = levers.draft() == Some("mtp");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
@@ -282,28 +289,67 @@ mod gate {
             u64::try_from(ub)?,
             experts,
         );
-        let plan = inputs.plan_with(
-            &machine,
-            u64::try_from(CTX)?,
-            &PlanLevers::from_levers(levers)?,
-            experts,
-        )?;
-        let card = plan.cards.first().ok_or("the gate's plan has no card")?;
-        let card_bytes = card.dense_bytes + card.expert_bytes;
-        let host_bytes = plan.host.expert_bytes + plan.host.table_bytes;
-        let kv: u64 = plan.cards.iter().map(|c| c.kv_bytes).sum();
+        // Under the draft the plan carries it (its granules, its store, its
+        // row map and its program's arena beside the target's card terms),
+        // and `/props` files its bytes as the card's `draft` class.
+        let levers_plan = PlanLevers::from_levers(levers)?;
+        let rows = match levers.mtp_head_rows() {
+            Some(p) => Some(read_head_rows(p, &split, inputs.spec.vocab)?),
+            None => None,
+        };
+        let terms = |dense: u64, experts_at: u64, host: u64, tables: u64, kv: u64, draft: u64| {
+            (dense + experts_at + draft, host + tables, kv, draft)
+        };
+        let (card_bytes, host_bytes, kv, draft_bytes) = match mtp {
+            false => {
+                let plan =
+                    inputs.plan_with(&machine, u64::try_from(CTX)?, &levers_plan, experts)?;
+                let c = plan.cards.first().ok_or("the gate's plan has no card")?;
+                terms(
+                    c.dense_bytes,
+                    c.expert_bytes,
+                    plan.host.expert_bytes,
+                    plan.host.table_bytes,
+                    plan.cards.iter().map(|c| c.kv_bytes).sum(),
+                    0,
+                )
+            }
+            true => {
+                let rows = rows.unwrap_or(HeadRows::Full);
+                let draft =
+                    Split::open(DRAFT).map_err(|e| format!("open the MTP draft {DRAFT}: {e}"))?;
+                let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
+                let with = inputs.plan_mtp_with(
+                    &machine,
+                    u64::try_from(CTX)?,
+                    &levers_plan,
+                    &mtp,
+                    experts,
+                )?;
+                let bytes = with.draft_card_bytes() + with.arena_bytes;
+                let c = with
+                    .plan
+                    .cards
+                    .first()
+                    .ok_or("the gate's plan has no card")?;
+                terms(
+                    c.dense_bytes,
+                    c.expert_bytes,
+                    with.plan.host.expert_bytes,
+                    with.plan.host.table_bytes,
+                    with.plan.cards.iter().map(|c| c.kv_bytes).sum(),
+                    bytes,
+                )
+            }
+        };
         let mut file_bytes = 0u64;
         for i in 0..split.shard_count() {
             let shard = split.shard_path(i).ok_or("a shard without a path")?;
             file_bytes += std::fs::metadata(shard)?.len();
         }
         println!(
-            "plan card bytes {card_bytes} (dense {} + experts {}) host bytes {host_bytes} \
-             (experts {} + tables {}) kv {kv}; file {file_bytes} B in {} shards",
-            card.dense_bytes,
-            card.expert_bytes,
-            plan.host.expert_bytes,
-            plan.host.table_bytes,
+            "plan card bytes {card_bytes} (the draft's {draft_bytes} of it) host bytes \
+             {host_bytes} kv {kv}; file {file_bytes} B in {} shards",
             split.shard_count()
         );
         let devices = e["placement"]["devices"]
@@ -370,7 +416,24 @@ mod gate {
             "props_engine_vram_kv",
             e["placement"]["vram_kv_bytes"] == json!(kv),
         );
-        check(&mut ok, "props_engine_no_draft", e.get("draft").is_none());
+        match mtp {
+            false => check(&mut ok, "props_engine_no_draft", e.get("draft").is_none()),
+            true => {
+                let d = &e["draft"];
+                check(
+                    &mut ok,
+                    "props_engine_names_the_draft",
+                    d["kind"] == json!("mtp")
+                        && d["n_max"] == json!(3)
+                        && d["model"]
+                            .as_str()
+                            .is_some_and(|m| m.starts_with("mtp-Qwen3.8"))
+                        && devices
+                            .first()
+                            .is_some_and(|d| d["classes"]["draft"].as_u64() == Some(draft_bytes)),
+                );
+            }
+        }
         Ok(ok)
     }
 
@@ -453,6 +516,18 @@ mod gate {
             "completion_ids_are_generate_qwen3moe",
             agree(&first, &stop, &reference),
         );
+        if levers.draft() == Some("mtp") {
+            // The drafted server's own clause: the greedy ids above are the
+            // plain run's (a draft changes which passes run, never a token),
+            // and the pass carried its counts.
+            let d = &c1["timings"];
+            check(
+                &mut ok,
+                "drafted_timings_carry_the_draft_counts",
+                d["draft_n"].as_u64().is_some_and(|n| n > 0)
+                    && d["draft_n_accepted"].as_u64().is_some_and(|n| n > 0),
+            );
+        }
 
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c2 = json_of("/completion", st, &body)?;

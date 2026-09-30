@@ -319,6 +319,7 @@ impl<B: Open> Loaded<B> {
             ctx,
             rows: None,
             logits: Vec::new(),
+            tapped: Vec::new(),
             cleared: None,
         })
     }
@@ -339,6 +340,8 @@ pub struct Session<B: ChainBody> {
     rows: Option<RowsInFlight>,
     /// The last logits row read back ([`Want::Logits`]).
     logits: Vec<f32>,
+    /// The last tapped rows read back ([`Tapped::taps`]).
+    tapped: Vec<f32>,
     /// The residency reset the last clear made, until taken.
     cleared: Option<ResetReport>,
 }
@@ -353,6 +356,7 @@ impl<B: ChainBody> Session<B> {
             ctx,
             rows: None,
             logits: Vec::new(),
+            tapped: Vec::new(),
             cleared: None,
         }
     }
@@ -371,6 +375,7 @@ impl<B: ChainBody> Session<B> {
         self.model.reset()?;
         self.rows = None;
         self.logits.clear();
+        self.tapped.clear();
         self.cleared = self.model.residency_reset()?;
         Ok(())
     }
@@ -409,6 +414,12 @@ impl<B: ChainBody> Session<B> {
     /// The model, for what the traits do not carry (records, instruments).
     pub fn model(&self) -> &GpuModel<B> {
         &self.model
+    }
+
+    /// The session taken apart: the model as it stands. A caller that holds
+    /// one model across several sessions moves it in and out with this.
+    pub fn into_model(self) -> GpuModel<B> {
+        self.model
     }
 
     /// See [`Session::model`].

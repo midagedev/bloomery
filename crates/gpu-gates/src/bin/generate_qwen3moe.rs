@@ -80,6 +80,23 @@
 //! every arm writes when they all write the same count. The run ends with
 //! `route trace <dir> positions=<n> complete` once the set is sealed.
 //!
+//! Under `BLOOMERY_DRAFT=mtp` (a qwen4exp file only; every other family and
+//! word is refused by name) the decode runs through the runtime's
+//! speculative loop with the file's MTP draft (`app::arch::qwen4exp`'s
+//! `MtpDraft` over the shared draft file beside the target, its head reduced
+//! under `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows — the target's
+//! verify of the draft's three ids, the kept rows committed, the draft's
+//! next chain one readback — and the greedy ids are the plain run's. A
+//! `load draft=mtp` line follows the `load` line (the draft's resident
+//! bytes, its program's arena and its head), the `capture` line the verify
+//! passes' widths; each pass prints its `step` lines one kept token a line
+//! and, under `--time`, a `time pass` row (its wall, positions and kept
+//! rows) and a `time step` row a kept position (its pass's wall over its
+//! positions, the row a plain run's step wall compares with), and an
+//! `mtp summary` record closes the arm: the windows' kept lengths, the
+//! positions and their rate. A sampling request is a server matter; this
+//! CLI is greedy.
+//!
 //! Lines: `prompt_ids`, `load` (`arch=` the file's architecture; with the
 //! decode flash pass: `flash_mma=`; for qwen3moe the ubatches' attention,
 //! `ubatch_attn=gqa_prefill_flash`, and their size,
@@ -184,10 +201,11 @@ mod taps;
 mod cli {
     use super::taps;
     use app::Session;
+    use app::arch::qwen3moe::{MtpDraft, Q38Cfg};
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
-        Body, Body35, Body38, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
+        Body, Body35, Body38, MtpMode, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
         Qwen35moeModel, Qwen38Model,
     };
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
@@ -201,12 +219,17 @@ mod cli {
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::Arch;
-    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
+    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::place::{
+        Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
+    };
     use model::placement::PlanLevers;
     use model::placement::workstation::{A6000, RTX_3090};
+    use refset::arch::qwen4exp::mtp::DRAFT;
+    use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tokenizer::Tokenizer;
 
     // A Qwen3.6 prompt is cut by the qwen3moe pass plan (`PrefillPlan`),
@@ -446,6 +469,107 @@ mod cli {
         }
     }
 
+    /// The qwen4exp prompt call's own lines (the `Prompted` impl's and the
+    /// drafted path's): the host tier's batch services over the call, and
+    /// under `BLOOMERY_STEP_STATS` the ubatch walk's records.
+    fn after38_prompt(m: &mut Qwen38Model, before: HybridStats) -> Result<(), GateError> {
+        let after = m.body("prefill")?.hybrid().stats();
+        let served = after.batch_served - before.batch_served;
+        let ns = after.batch_ns - before.batch_ns;
+        // No service, no time a service: `-`, never a plausible 0.
+        let per_service = if served == 0 {
+            "-".to_string()
+        } else {
+            format!("{:.4}", ns as f64 / 1e6 / served as f64)
+        };
+        println!(
+            "stat prompt host services={served} cols={} host_slots={} union_ms={:.3} \
+         per_service_ms={per_service}",
+            after.batch_cols - before.batch_cols,
+            after.batch_host_slots - before.batch_host_slots,
+            ns as f64 / 1e6,
+        );
+        if let Some(s) = m.take_prompt38_stats()? {
+            let ms = |ns: u64| ns as f64 / 1e6;
+            let lbs = s.rows.len() as u64;
+            let (mut union, mut wait, mut serve, mut enqueue, mut slots) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut experts, mut m_hot, mut cols_hot, mut m_sq) = (0u64, 0u64, 0u64, 0u64);
+            let mut m_max = 0usize;
+            let (mut front, mut down, mut shadow, mut up, mut back) = (0.0_f64, 0.0, 0.0, 0.0, 0.0);
+            for r in &s.rows {
+                union += r.union_ns;
+                wait += r.wait_ns;
+                serve += r.serve_ns;
+                enqueue += r.enqueue_ns;
+                slots += r.slots;
+                experts += r.experts as u64;
+                m_max = m_max.max(r.m_max);
+                m_hot += r.m_hot as u64;
+                cols_hot += r.cols_hot as u64;
+                m_sq += r.m_sq;
+                front += r.front_ms;
+                down += r.down_ms;
+                shadow += r.shadow_ms;
+                up += r.upload_ms;
+                back += r.back_ms;
+                Record::new(&record::STAT_PROMPT38_LB)
+                    .u("b", r.b)
+                    .u("layer", r.layer as u64)
+                    .u("cols", r.cols as u64)
+                    .u("slots", r.slots)
+                    .u("experts", r.experts as u64)
+                    .u("m_max", r.m_max as u64)
+                    .u("m_hot", r.m_hot as u64)
+                    .u("cols_hot", r.cols_hot as u64)
+                    .u("m_sq", r.m_sq)
+                    .f("wait_ms", ms(r.wait_ns))
+                    .f("union_ms", ms(r.union_ns))
+                    .f("serve_ms", ms(r.serve_ns))
+                    .f("enqueue_ms", ms(r.enqueue_ns))
+                    .f("card_front_ms", r.front_ms)
+                    .f("card_down_ms", r.down_ms)
+                    .f("card_shadow_ms", r.shadow_ms)
+                    .f("card_upload_ms", r.upload_ms)
+                    .f("card_back_ms", r.back_ms)
+                    .print();
+            }
+            let per = |v: f64| if lbs == 0 { 0.0 } else { v / lbs as f64 };
+            Record::new(&record::STAT_PROMPT38_SPLIT)
+                .u("ubatches", s.ubatches)
+                .u("layer_batches", lbs)
+                .f("prologue_ms", ms(s.prologue_ns))
+                .f("walk_ms", ms(s.walk_ns))
+                .f("union_ms", ms(union))
+                .f("wait_ms", ms(wait))
+                .f("serve_ms", ms(serve))
+                .f("enqueue_ms", ms(s.walk_ns.saturating_sub(serve)))
+                .u("host_slots", slots)
+                .f("union_lb", per(ms(union)))
+                .f("wait_lb", per(ms(wait)))
+                .f("serve_lb", per(ms(serve)))
+                .f("enqueue_lb", per(ms(enqueue)))
+                .f("slots_lb", per(slots as f64))
+                .f("experts_lb", per(experts as f64))
+                .u("m_max", m_max as u64)
+                .f("m_hot_lb", per(m_hot as f64))
+                .f("cols_hot_lb", per(cols_hot as f64))
+                .f("m_sq_lb", per(m_sq as f64))
+                .f("card_front_ms", front)
+                .f("card_down_ms", down)
+                .f("card_shadow_ms", shadow)
+                .f("card_upload_ms", up)
+                .f("card_back_ms", back)
+                .f("card_front_lb", per(front))
+                .f("card_down_lb", per(down))
+                .f("card_shadow_lb", per(shadow))
+                .f("card_upload_lb", per(up))
+                .f("card_back_lb", per(back))
+                .print();
+        }
+        Ok(())
+    }
+
     impl Prompted for Body38 {
         type Path = Prompt38;
 
@@ -510,101 +634,7 @@ mod cli {
         fn prefill(m: &mut Qwen38Model, ids: &[u32], path: Prompt38) -> Result<u32, GateError> {
             let before = m.body("prefill")?.hybrid().stats();
             let next = m.prompt38(ids, path)?;
-            let after = m.body("prefill")?.hybrid().stats();
-            let served = after.batch_served - before.batch_served;
-            let ns = after.batch_ns - before.batch_ns;
-            // No service, no time a service: `-`, never a plausible 0.
-            let per_service = if served == 0 {
-                "-".to_string()
-            } else {
-                format!("{:.4}", ns as f64 / 1e6 / served as f64)
-            };
-            println!(
-                "stat prompt host services={served} cols={} host_slots={} union_ms={:.3} \
-                 per_service_ms={per_service}",
-                after.batch_cols - before.batch_cols,
-                after.batch_host_slots - before.batch_host_slots,
-                ns as f64 / 1e6,
-            );
-            if let Some(s) = m.take_prompt38_stats()? {
-                let ms = |ns: u64| ns as f64 / 1e6;
-                let lbs = s.rows.len() as u64;
-                let (mut union, mut wait, mut serve, mut enqueue, mut slots) =
-                    (0u64, 0u64, 0u64, 0u64, 0u64);
-                let (mut experts, mut m_hot, mut cols_hot, mut m_sq) = (0u64, 0u64, 0u64, 0u64);
-                let mut m_max = 0usize;
-                let (mut front, mut down, mut shadow, mut up, mut back) =
-                    (0.0_f64, 0.0, 0.0, 0.0, 0.0);
-                for r in &s.rows {
-                    union += r.union_ns;
-                    wait += r.wait_ns;
-                    serve += r.serve_ns;
-                    enqueue += r.enqueue_ns;
-                    slots += r.slots;
-                    experts += r.experts as u64;
-                    m_max = m_max.max(r.m_max);
-                    m_hot += r.m_hot as u64;
-                    cols_hot += r.cols_hot as u64;
-                    m_sq += r.m_sq;
-                    front += r.front_ms;
-                    down += r.down_ms;
-                    shadow += r.shadow_ms;
-                    up += r.upload_ms;
-                    back += r.back_ms;
-                    Record::new(&record::STAT_PROMPT38_LB)
-                        .u("b", r.b)
-                        .u("layer", r.layer as u64)
-                        .u("cols", r.cols as u64)
-                        .u("slots", r.slots)
-                        .u("experts", r.experts as u64)
-                        .u("m_max", r.m_max as u64)
-                        .u("m_hot", r.m_hot as u64)
-                        .u("cols_hot", r.cols_hot as u64)
-                        .u("m_sq", r.m_sq)
-                        .f("wait_ms", ms(r.wait_ns))
-                        .f("union_ms", ms(r.union_ns))
-                        .f("serve_ms", ms(r.serve_ns))
-                        .f("enqueue_ms", ms(r.enqueue_ns))
-                        .f("card_front_ms", r.front_ms)
-                        .f("card_down_ms", r.down_ms)
-                        .f("card_shadow_ms", r.shadow_ms)
-                        .f("card_upload_ms", r.upload_ms)
-                        .f("card_back_ms", r.back_ms)
-                        .print();
-                }
-                let per = |v: f64| if lbs == 0 { 0.0 } else { v / lbs as f64 };
-                Record::new(&record::STAT_PROMPT38_SPLIT)
-                    .u("ubatches", s.ubatches)
-                    .u("layer_batches", lbs)
-                    .f("prologue_ms", ms(s.prologue_ns))
-                    .f("walk_ms", ms(s.walk_ns))
-                    .f("union_ms", ms(union))
-                    .f("wait_ms", ms(wait))
-                    .f("serve_ms", ms(serve))
-                    .f("enqueue_ms", ms(s.walk_ns.saturating_sub(serve)))
-                    .u("host_slots", slots)
-                    .f("union_lb", per(ms(union)))
-                    .f("wait_lb", per(ms(wait)))
-                    .f("serve_lb", per(ms(serve)))
-                    .f("enqueue_lb", per(ms(enqueue)))
-                    .f("slots_lb", per(slots as f64))
-                    .f("experts_lb", per(experts as f64))
-                    .u("m_max", m_max as u64)
-                    .f("m_hot_lb", per(m_hot as f64))
-                    .f("cols_hot_lb", per(cols_hot as f64))
-                    .f("m_sq_lb", per(m_sq as f64))
-                    .f("card_front_ms", front)
-                    .f("card_down_ms", down)
-                    .f("card_shadow_ms", shadow)
-                    .f("card_upload_ms", up)
-                    .f("card_back_ms", back)
-                    .f("card_front_lb", per(front))
-                    .f("card_down_lb", per(down))
-                    .f("card_shadow_lb", per(shadow))
-                    .f("card_upload_lb", per(up))
-                    .f("card_back_lb", per(back))
-                    .print();
-            }
+            after38_prompt(m, before)?;
             Ok(next)
         }
 
@@ -728,6 +758,8 @@ mod cli {
             bloomery_levers::QWEN38_EXPERTS,
             bloomery_levers::HOT_LIST,
             bloomery_levers::ROUTE_TRACE,
+            bloomery_levers::DRAFT,
+            bloomery_levers::MTP_HEAD_ROWS,
         ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
         let experts = experts38(&levers)?;
@@ -793,6 +825,13 @@ mod cli {
         let t = Instant::now();
         let (file, family) = open_file()?;
         let prefill = prefill.as_deref();
+        let draft = match family {
+            Family::Qwen38 => draft38(&levers)?,
+            other => {
+                draft_refused_on_other(&levers, other)?;
+                Draft38::Off
+            }
+        };
         let chosen = match family {
             Family::Qwen3 => Chosen::Qwen3(Body::path(prefill)?),
             Family::Qwen35 => Chosen::Qwen35(Body35::path(prefill)?),
@@ -800,7 +839,11 @@ mod cli {
                 if let Some(d) = seed_depth {
                     return Err(no_seed38(d));
                 }
-                Chosen::Qwen38(Body38::path(prefill)?, Place38::parse(place.as_deref())?)
+                Chosen::Qwen38(
+                    Body38::path(prefill)?,
+                    Place38::parse(place.as_deref())?,
+                    draft,
+                )
             }
         };
         if family != Family::Qwen38 && place.is_some() {
@@ -828,6 +871,13 @@ mod cli {
             return Err(
                 "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's routing; a qwen3moe or \
                  qwen35moe plan holds every one on the card"
+                    .into(),
+            );
+        }
+        if family == Family::Qwen38 && draft == Draft38::Off && levers.mtp_head_rows().is_some() {
+            return Err(
+                "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; it needs BLOOMERY_DRAFT=mtp \
+                 on a qwen4exp file"
                     .into(),
             );
         }
@@ -880,6 +930,13 @@ mod cli {
                     .into(),
             );
         }
+        if matches!(chosen, Chosen::Qwen38(.., Draft38::Mtp)) && logits {
+            return Err(
+                "--logits with BLOOMERY_DRAFT=mtp: the drafted run's last call is a verify of \
+                 several rows into one head, and --logits reads the step head's row"
+                    .into(),
+            );
+        }
         let listed = !arm_specs.is_empty();
         if !listed {
             println!("prompt_ids {:?}", arms[0].ids);
@@ -911,24 +968,39 @@ mod cli {
                 listed,
                 sync,
             ),
-            Chosen::Qwen38(path, place) => {
-                let trace = trace38(
-                    &levers,
-                    &file,
-                    (path, place, experts),
-                    arms_chunk(&arms),
-                    timed,
-                )?;
-                let mut m = open_qwen38(file, &levers, (ctx, mode), (path, place, experts), t)?;
-                if let Some(t) = trace {
-                    m.body_parts("generate_qwen3moe")?
-                        .2
-                        .hybrid_mut()
-                        .attach_route_trace(t)?;
+            Chosen::Qwen38(path, place, draft) => match draft {
+                Draft38::Off => {
+                    let trace = trace38(
+                        &levers,
+                        &file,
+                        (path, place, experts),
+                        arms_chunk(&arms),
+                        timed,
+                    )?;
+                    let mut m = open_qwen38(file, &levers, (ctx, mode), (path, place, experts), t)?;
+                    if let Some(t) = trace {
+                        m.body_parts("generate_qwen3moe")?
+                            .2
+                            .hybrid_mut()
+                            .attach_route_trace(t)?;
+                    }
+                    m.set_prompt38_stats(run.stats)?;
+                    drive(m, &run, path, &arms, listed, sync)
                 }
-                m.set_prompt38_stats(run.stats)?;
-                drive(m, &run, path, &arms, listed, sync)
-            }
+                Draft38::Mtp => {
+                    if levers.route_trace().is_some() {
+                        return Err(
+                            "BLOOMERY_ROUTE_TRACE records the plain run's routing, one step a \
+                                    position; it is refused beside BLOOMERY_DRAFT=mtp"
+                                .into(),
+                        );
+                    }
+                    let (mut m, cfg) =
+                        open_qwen38_mtp(file, &levers, (ctx, mode), (path, place, experts), t)?;
+                    m.set_prompt38_stats(run.stats)?;
+                    drive38_mtp(m, cfg, &run, &arms, listed, sync)
+                }
+            },
         }
     }
 
@@ -946,6 +1018,45 @@ mod cli {
         "--mode",
         "--place",
     ];
+
+    /// Whether `BLOOMERY_DRAFT` drafts this run: `mtp` on a qwen4exp file;
+    /// every other family and word is refused by name.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Draft38 {
+        Off,
+        Mtp,
+    }
+
+    /// `BLOOMERY_DRAFT` on a qwen4exp file: unset the plain path, `mtp` the
+    /// MTP draft; the V4.1 words and any other are refused by name.
+    fn draft38(levers: &Levers) -> Result<Draft38, GateError> {
+        match levers.draft() {
+            None => Ok(Draft38::Off),
+            Some("mtp") => Ok(Draft38::Mtp),
+            Some(other) => Err(format!(
+                "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window; lookup and \
+                 dspark are the V4.1 binaries'"
+            )
+            .into()),
+        }
+    }
+
+    /// `BLOOMERY_DRAFT` on the other families: no word of it drafts them.
+    fn draft_refused_on_other(levers: &Levers, family: Family) -> Result<(), GateError> {
+        match levers.draft() {
+            None => Ok(()),
+            Some(word) => Err(format!(
+                "BLOOMERY_DRAFT={word}: only a qwen4exp file runs a draft (mtp); this is a {} \
+                 file",
+                match family {
+                    Family::Qwen3 => "qwen3moe",
+                    Family::Qwen35 => "qwen35moe",
+                    Family::Qwen38 => "qwen4exp",
+                }
+            )
+            .into()),
+        }
+    }
 
     /// `--dump-taps DIR`: the tap dump of every `--tokens-file`'s windows on
     /// a qwen3moe file, eager, then the manifest read back.
@@ -1039,14 +1150,14 @@ mod cli {
         Ok(())
     }
 
-    /// The engine and its `--prefill` path (and, for qwen4exp, its card),
-    /// chosen before the load; a qwen4exp plan's expert rule is
+    /// The engine and its `--prefill` path (and, for qwen4exp, its card and
+    /// draft), chosen before the load; a qwen4exp plan's expert rule is
     /// `BLOOMERY_QWEN38_EXPERTS`'s.
     #[derive(Clone, Copy)]
     enum Chosen {
         Qwen3(PrefillPath),
         Qwen35(PrefillPath),
-        Qwen38(Prompt38, Place38),
+        Qwen38(Prompt38, Place38, Draft38),
     }
 
     /// The Qwen3-30B-A3B model of `file`, its `load` line, and in graph mode
@@ -1277,26 +1388,136 @@ mod cli {
             body.card_layers(),
             t.elapsed().as_secs_f64()
         );
-        if mode == StepMode::Graph {
-            let (launches, memops) = m.body("generate_qwen3moe")?.step_launches();
-            let nodes = m.capture_step()?;
-            let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
-            let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
-            let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-            println!(
-                "capture graph_nodes={nodes} kernel={k} batch_mem_op={b} other={other} (the \
-                 program counts {launches}, {memops} of them batch_mem_op)"
-            );
-            if nodes != launches || b != memops || k + b != nodes || other != 0 {
-                return Err(format!(
-                    "the captured step is not the program's: {nodes} nodes ({k} kernel, {b} \
-                     batch_mem_op, {other} other) against {launches} launches, {memops} of them \
-                     batch_mem_op"
-                )
-                .into());
-            }
-        }
+        capture38_check(&mut m)?;
         Ok(m)
+    }
+
+    /// The Qwen3.8-Flash-Next model of `file` with its MTP draft loaded
+    /// beside it (`Body38::open_placed_mtp`, the shared draft file, its head
+    /// reduced under `BLOOMERY_MTP_HEAD_ROWS`): the `plan`, `load`, `load
+    /// draft=mtp` and `capture` lines of the plain open, the draft's own
+    /// resident bytes, its program's arena and its head named on the draft's
+    /// line. In graph mode the verify passes of 2 to 4 rows are captured by
+    /// the session's `with_draft`, whose log prints each width's nodes.
+    fn open_qwen38_mtp(
+        file: Split,
+        levers: &Levers,
+        (ctx, mode): (usize, StepMode),
+        (path, place, experts): (Prompt38, Place38, Experts),
+        t: Instant,
+    ) -> Result<(Qwen38Model, Q38Cfg), GateError> {
+        let inputs = PlanInputs::describe(&file)?;
+        let card = match place {
+            Place38::A => A6000,
+            Place38::Gate => RTX_3090,
+        };
+        let ub = ubatch_for(ctx)?;
+        let machine =
+            machine_for_experts(card, inputs.spec.layers.len(), u64::try_from(ub)?, experts);
+        let rows = match levers.mtp_head_rows() {
+            Some(p) => read_head_rows(p, &file, inputs.spec.vocab)?,
+            None => HeadRows::Full,
+        };
+        let draft_file =
+            Split::open(DRAFT).map_err(|e| format!("open the MTP draft {DRAFT}: {e}"))?;
+        let mtp = MtpInputs::read(&draft_file, &file, &inputs, rows)?;
+        let plan = inputs.plan_mtp_with(
+            &machine,
+            u64::try_from(ctx)?,
+            &PlanLevers::from_levers(levers)?,
+            &mtp,
+            experts,
+        )?;
+        let hot_list = levers
+            .hot_list()
+            .map_or_else(|| "none".to_string(), |p| p.display().to_string());
+        println!(
+            "{}",
+            Record::new(&record::PLAN38)
+                .w("place", place.name())
+                .w("card", card.name)
+                .w("experts", experts_name(experts))
+                .u("ctx_max", plan.plan.ctx_max)
+                .u("host_experts", plan.plan.host.experts)
+                .u("card_experts", plan.plan.cards[0].experts)
+                .w("hot_list", hot_list)
+                .line()
+        );
+        let mut m = Body38::open_placed_mtp(
+            file,
+            &plan,
+            &inputs,
+            0,
+            levers.host(),
+            ub,
+            &draft_file,
+            &mtp,
+        )?;
+        m.set_mode(mode);
+        let body = m.body("generate_qwen3moe")?;
+        println!(
+            "load arch=qwen4exp resident_bytes={} ctx={ctx} layers={} mode={} store_bytes={} \
+             prefill={} ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
+            m.resident_bytes(),
+            m.layers().len(),
+            mode_name(mode),
+            body.store_bytes(),
+            path.name(),
+            body.ubatch_rows(),
+            place.name(),
+            body.card_layers(),
+            t.elapsed().as_secs_f64()
+        );
+        let draft = body.mtp().ok_or("the load opened no MTP draft")?;
+        let head = match draft.head_map() {
+            Some((_, n)) => format!("rows={n}"),
+            None => "full".to_string(),
+        };
+        println!(
+            "load draft=mtp resident={} arena={} head={head} card_bytes={} in {:.1} s (runtime \
+             value)",
+            draft.resident_bytes(),
+            draft.arena_bytes(),
+            plan.draft_card_bytes() + plan.arena_bytes,
+            t.elapsed().as_secs_f64()
+        );
+        capture38_check(&mut m)?;
+        Ok((
+            m,
+            Q38Cfg {
+                prompt: path,
+                draft: match mode {
+                    StepMode::Graph => MtpMode::Graph,
+                    StepMode::Eager => MtpMode::Eager,
+                },
+            },
+        ))
+    }
+
+    /// In graph mode: capture the decode step and hold its node kinds to the
+    /// program's count, a mismatch ending the run by name.
+    fn capture38_check(m: &mut Qwen38Model) -> Result<(), GateError> {
+        if m.mode() != StepMode::Graph {
+            return Ok(());
+        }
+        let (launches, memops) = m.body("generate_qwen3moe")?.step_launches();
+        let nodes = m.capture_step()?;
+        let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
+        let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
+        let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
+        println!(
+            "capture graph_nodes={nodes} kernel={k} batch_mem_op={b} other={other} (the \
+             program counts {launches}, {memops} of them batch_mem_op)"
+        );
+        if nodes != launches || b != memops || k + b != nodes || other != 0 {
+            return Err(format!(
+                "the captured step is not the program's: {nodes} nodes ({k} kernel, {b} \
+                 batch_mem_op, {other} other) against {launches} launches, {memops} of them \
+                 batch_mem_op"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// The `capture prefill_graphs=` line: each pass size's node count, the
@@ -1353,6 +1574,249 @@ mod cli {
             println!("route trace {} positions={rows} complete", dir.display());
         }
         Ok(())
+    }
+
+    /// The verify pass's capture log: one line a width.
+    struct VerifyCaptures;
+
+    impl app::RowsLog for VerifyCaptures {
+        fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), app::SessionError> {
+            println!("capture verify rows={rows} nodes={nodes}");
+            Ok(())
+        }
+    }
+
+    /// Every arm on the loaded model through the MTP draft: the session over
+    /// it, the draft opened beside it (the verify passes of 2 to 4 rows
+    /// captured in graph mode, each width's nodes printed), each arm its
+    /// prompt — the draft walked over its units — and its windows; each
+    /// after the first from the session's clear, the draft started over.
+    fn drive38_mtp(
+        m: Qwen38Model,
+        cfg: Q38Cfg,
+        run: &Run,
+        arms: &[Arm],
+        listed: bool,
+        sync: bool,
+    ) -> Result<(), GateError> {
+        let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
+        let path = cfg.prompt;
+        let draft = MtpDraft::open(s.model(), cfg)?;
+        let mut spec = s.with_draft::<MtpDraft, 4>(draft, &mut VerifyCaptures)?;
+        let count = arms.len();
+        for (i, arm) in arms.iter().enumerate() {
+            if i > 0 {
+                s.clear()?;
+                spec.draft_mut().restart();
+            }
+            if listed {
+                println!(
+                    "arm i={i} arms={count} ids={} n={}",
+                    arm.ids.len(),
+                    arm.n_gen
+                );
+                if sync {
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line)? == 0 {
+                        return Err(
+                            format!("--arm-sync: stdin closed before arm {i} of {count}").into(),
+                        );
+                    }
+                }
+                println!("prompt_ids {:?}", arm.ids);
+            }
+            run_arm38_mtp(&mut s, &mut spec, path, run, arm)?;
+        }
+        Ok(())
+    }
+
+    /// What the drafted generation's sink keeps: every pass's outcome and
+    /// wall, every kept token at its position, and the stats probes.
+    struct Windows {
+        stats: bool,
+        emitted: Vec<(u32, u32)>,
+        passes: Vec<(bool, usize, f64, Duration)>,
+        probes: Vec<Probe>,
+        n_gen: usize,
+    }
+
+    impl PassSink<Session<Body38>> for Windows {
+        type Error = GateError;
+
+        fn begin(&mut self, t: &Session<Body38>) -> Result<(), GateError> {
+            if self.stats {
+                self.probes.reserve_exact(self.n_gen);
+                self.probes.push(probe38(t.model())?);
+            }
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            t: &Session<Body38>,
+            c: &Committed,
+            tokens: &[u32],
+            wall: Duration,
+        ) -> Result<(), GateError> {
+            for (r, &tok) in (0u32..).zip(tokens) {
+                self.emitted.push((c.pos + r, tok));
+            }
+            self.passes.push((
+                c.proposed,
+                c.kept,
+                wall.as_secs_f64() * 1e3 / c.kept as f64,
+                wall,
+            ));
+            if self.stats {
+                self.probes.push(probe38(t.model())?);
+            }
+            Ok(())
+        }
+    }
+
+    /// One arm through the draft: the prompt — the draft walked over its
+    /// units, its own lines as the plain run's — then the windows until `-n`
+    /// tokens are out, every kept token the target's own argmax.
+    fn run_arm38_mtp(
+        s: &mut Session<Body38>,
+        spec: &mut Speculative<MtpDraft, 4>,
+        path: Prompt38,
+        run: &Run,
+        arm: &Arm,
+    ) -> Result<(), GateError> {
+        let (ids, n_gen, warm) = (&arm.ids, arm.n_gen, run.warm);
+        let plan = <Body38 as Prompted>::plan(s.model(), ids.len(), path)?;
+        let t = Instant::now();
+        let before = s.model().body("prefill")?.hybrid().stats();
+        let next = spec.prompt(s, ids)?;
+        after38_prompt(s.model_mut(), before)?;
+        let prefill_wall = t.elapsed();
+        println!(
+            "step 0 {} {next} (the {} prompt ids in prefill_steps={} units, plan={}, {:.2} s, \
+             runtime value)",
+            s.pos() - 1,
+            ids.len(),
+            plan.count,
+            plan.text,
+            prefill_wall.as_secs_f64()
+        );
+        let mut sink = Windows {
+            stats: run.stats,
+            emitted: Vec::with_capacity(n_gen),
+            passes: Vec::with_capacity(n_gen),
+            probes: Vec::new(),
+            n_gen,
+        };
+        let stop = Stop::new(n_gen, s.ctx())?;
+        let out = runtime::generate(s, spec, ids, next, &stop, &mut sink)?;
+        if out.tokens.len() < n_gen {
+            return Err(format!(
+                "generate_qwen3moe: the generation stopped at {} after {} tokens, before -n",
+                out.stop.name(),
+                out.tokens.len()
+            )
+            .into());
+        }
+        let prefill_ms = prefill_wall.as_secs_f64() * 1e3;
+        println!(
+            "time prompt n={} ms={prefill_ms:.4} tok/s={:.2} passes={} kind={}",
+            ids.len(),
+            ids.len() as f64 * 1e3 / prefill_ms,
+            plan.count,
+            plan.kind
+        );
+        println!(
+            "stat prompt ubatch_tokens={} (no prompt image)",
+            plan.ubatch_tokens
+        );
+        let kept = &sink.emitted[..n_gen - 1];
+        for (k, &(pos, tok)) in kept.iter().enumerate() {
+            println!("step {} {pos} {tok}", k + 1);
+        }
+        if run.timed {
+            // A pass's wall over its positions is the row a plain run's step
+            // wall compares with: one a kept position.
+            let mut at = 0usize;
+            for (i, &(proposed, rows, per, wall)) in sink.passes.iter().enumerate() {
+                let tag = if i < warm { " warm" } else { "" };
+                println!(
+                    "time pass {}{tag} ms={:.4} positions={rows} kind={}",
+                    i + 1,
+                    wall.as_secs_f64() * 1e3,
+                    if proposed { "mtp" } else { "plain" }
+                );
+                for _ in 0..rows {
+                    if at >= n_gen - 1 {
+                        break;
+                    }
+                    at += 1;
+                    let tag = if at <= warm { " warm" } else { "" };
+                    println!("time step {at}{tag} ms={per:.4}");
+                }
+            }
+        }
+        let tokens: Vec<u32> = std::iter::once(next)
+            .chain(kept.iter().map(|&(_, t)| t))
+            .collect();
+        println!("tokens {tokens:?}");
+        if let Some(t) = &run.tok {
+            println!("text {:?}", t.decode(&tokens));
+        }
+        mtp_summary(&sink.passes, warm);
+        if run.timed {
+            let counted = &sink.passes[warm..];
+            let positions: usize = counted.iter().map(|&(_, k, ..)| k).sum();
+            let ms: f64 = counted
+                .iter()
+                .map(|&(_, _, _, w)| w.as_secs_f64() * 1e3)
+                .sum();
+            let mut per: Vec<f64> = counted.iter().map(|&(_, _, p, _)| p).collect();
+            per.sort_by(f64::total_cmp);
+            let p50 = per[per.len() / 2];
+            let mean = ms / positions as f64;
+            println!(
+                "SMOKE mode={} prompt_tokens={} depth={} generated={n_gen} warm={warm} \
+                 steps={positions} passes={} p50_ms={p50:.4} mean_ms={mean:.4} \
+                 tok/s(p50)={:.2} tok/s(mean)={:.2} ctx={}",
+                mode_name(run.mode),
+                ids.len(),
+                ids.len(),
+                counted.len(),
+                1e3 / p50,
+                1e3 / mean,
+                run.ctx
+            );
+        }
+        print_stats(&sink.probes, warm);
+        Ok(())
+    }
+
+    /// The `mtp summary` record: the windows' proposals, the kept lengths'
+    /// histogram, the positions and their rate over the counted passes.
+    fn mtp_summary(passes: &[(bool, usize, f64, Duration)], warm: usize) {
+        let mut kept = [0u64; 4];
+        let mut positions = 0usize;
+        let mut proposals = 0usize;
+        for &(p, k, ..) in passes {
+            if p {
+                proposals += 1;
+            }
+            kept[k - 1] += 1;
+            positions += k;
+        }
+        let counted = &passes[warm..];
+        let counted_positions: usize = counted.iter().map(|&(_, k, ..)| k).sum();
+        let ms: f64 = counted
+            .iter()
+            .map(|&(_, _, _, w)| w.as_secs_f64() * 1e3)
+            .sum();
+        Record::new(&record::MTP_SUMMARY)
+            .u("proposals", proposals)
+            .list("kept", &kept)
+            .u("positions", positions)
+            .u("passes", passes.len())
+            .f("tok/s(positions)", counted_positions as f64 * 1e3 / ms)
+            .print();
     }
 
     fn mode_name(mode: StepMode) -> &'static str {
@@ -1503,6 +1967,17 @@ mod cli {
                 vram_free: u64::try_from(m.gpu().mem_info()?.0)?,
             }))
         }
+    }
+
+    /// [`Probe::read`] of the qwen4exp body, which always has a host tier.
+    fn probe38(m: &Qwen38Model) -> Result<Probe, GateError> {
+        let (minflt, majflt) = faults()?;
+        Ok(Probe {
+            hybrid: m.body("generate_qwen3moe")?.hybrid().stats(),
+            majflt,
+            minflt,
+            vram_free: u64::try_from(m.gpu().mem_info()?.0)?,
+        })
     }
 
     /// The process's minor and major page faults since start: fields 10 and

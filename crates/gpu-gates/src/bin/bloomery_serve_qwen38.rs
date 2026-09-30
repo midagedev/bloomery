@@ -39,6 +39,16 @@
 //! `pass_rows` are the engine's defaults (no draft), which is where a draft
 //! plugs in.
 //!
+//! Under `BLOOMERY_DRAFT=mtp` the seat drives the session through the
+//! runtime's speculative loop with `app::arch::qwen4exp`'s `MtpDraft` (the
+//! shared draft file beside the target, its head reduced under
+//! `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows, the greedy ids the
+//! plain server's, `pass_rows` 4 and a sampling or id-banning request
+//! refused while a draft runs (the engine's own rule, a 400 naming the
+//! field). A `load draft=mtp` line follows the `load` line, and
+//! `/props`' `engine.draft` names the draft with its resident bytes as the
+//! card's `draft` class. Every other word of the lever is refused by name.
+//!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
 //! and the exit code is 70.
@@ -87,7 +97,7 @@ mod drive {
     use std::time::Instant;
 
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model};
+    use bloomery_gpu::arch::qwen3moe::{Body38, MtpMode, Prompt38};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::bind::{
         Ds41Engine, Seat, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
@@ -97,10 +107,18 @@ mod drive {
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use cuda_core::sys;
     use gguf::Split;
-    use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
+    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::place::{
+        Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
+    };
     use model::placement::PlanLevers;
     use model::placement::workstation::{A6000, CardSpec, RTX_3090};
-    use serve::{CacheNote, EngineProps, FATAL_LINGER, Saved, ServeError, Server, ServerConfig};
+    use refset::arch::qwen4exp::mtp::DRAFT;
+    use runtime::{Advance, Target as _};
+    use serve::{
+        CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, Saved, ServeError, Server,
+        ServerConfig,
+    };
     use tokenizer::Tokenizer;
 
     /// The levers `bloomery-serve-qwen38` acts on, for its own `main` and for
@@ -116,6 +134,8 @@ mod drive {
         bloomery_levers::HOST_LOCK,
         bloomery_levers::CARD_DONTNEED,
         bloomery_levers::R8,
+        bloomery_levers::DRAFT,
+        bloomery_levers::MTP_HEAD_ROWS,
     ];
 
     const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate] \
@@ -222,6 +242,23 @@ mod drive {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
         let a = parse_args()?;
+        let mtp =
+            match levers.draft() {
+                None => false,
+                Some("mtp") => true,
+                Some(other) => return Err(format!(
+                    "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window; lookup and \
+                     dspark are the V4.1 binaries'"
+                )
+                .into()),
+            };
+        let head_rows = levers.mtp_head_rows().map(PathBuf::from);
+        if !mtp && head_rows.is_some() {
+            return Err(
+                "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; it needs BLOOMERY_DRAFT=mtp"
+                    .into(),
+            );
+        }
         let experts = experts38(&levers)?;
         let plan_levers = PlanLevers::from_levers(&levers)?;
         let path = ref_model_path()?;
@@ -295,6 +332,8 @@ mod drive {
             host: levers.host(),
             pin_main: levers.pin_main(),
             path: path.clone(),
+            mtp,
+            head_rows,
         };
         // The prompt cache is off (its budget 0): the seat keeps no prefix
         // worth saving, and slot save/restore is the server's own 501.
@@ -333,20 +372,30 @@ mod drive {
         host: bloomery_levers::HostCfg,
         pin_main: bool,
         path: PathBuf,
+        /// `BLOOMERY_DRAFT=mtp`, the MTP draft; unset the plain path.
+        mtp: bool,
+        /// `BLOOMERY_MTP_HEAD_ROWS`, the draft head's row list.
+        head_rows: Option<std::path::PathBuf>,
     }
 
-    /// The Qwen3.8 session on the engine thread: the model, and the positions
-    /// its stores were sized for. A draft extends it here — its passes would
-    /// take `pass` and `pass_rows` and stand beside `prefill`'s feed.
+    /// The Qwen3.8 session on the engine thread: the session over the model,
+    /// the draft it drives when one runs (its windows of four rows through
+    /// the runtime's speculative loop), and the positions its stores were
+    /// sized for.
     struct Q38 {
-        m: Qwen38Model,
+        s: app::Session<Body38>,
+        spec: Option<app::arch::qwen3moe::Drafted38>,
         ctx: usize,
+        /// The draft's resident and arena bytes, for `/props`' `draft` class.
+        draft_bytes: u64,
     }
 
     impl Q38 {
         /// The session by `a.place` (the `load` and `capture` lines, as
-        /// `generate_qwen3moe` prints them), on the calling thread, pinned to
-        /// the dispatcher's cpu slot when asked.
+        /// `generate_qwen3moe` prints them; under `mtp` the draft loaded
+        /// beside the target, its own `load draft=mtp` line and the verify
+        /// passes' capture lines after them), on the calling thread, pinned
+        /// to the dispatcher's cpu slot when asked.
         fn open(a: SeatArgs) -> Result<Q38, GateError> {
             const WHAT: &str = "bloomery-serve-qwen38";
             if a.pin_main {
@@ -365,9 +414,34 @@ mod drive {
                 u64::try_from(ub)?,
                 a.experts,
             );
-            let plan =
-                inputs.plan_with(&machine, u64::try_from(a.ctx)?, &a.plan_levers, a.experts)?;
-            let mut m = Body38::open_placed(file, &plan, &inputs, 0, a.host, ub)?;
+            let mut m = match a.mtp {
+                false => {
+                    let plan = inputs.plan_with(
+                        &machine,
+                        u64::try_from(a.ctx)?,
+                        &a.plan_levers,
+                        a.experts,
+                    )?;
+                    Body38::open_placed(file, &plan, &inputs, 0, a.host, ub)?
+                }
+                true => {
+                    let rows = match a.head_rows.as_deref() {
+                        Some(p) => read_head_rows(p, &file, inputs.spec.vocab)?,
+                        None => HeadRows::Full,
+                    };
+                    let draft = Split::open(DRAFT)
+                        .map_err(|e| format!("open the MTP draft {DRAFT}: {e}"))?;
+                    let mtp = MtpInputs::read(&draft, &file, &inputs, rows)?;
+                    let plan = inputs.plan_mtp_with(
+                        &machine,
+                        u64::try_from(a.ctx)?,
+                        &a.plan_levers,
+                        &mtp,
+                        a.experts,
+                    )?;
+                    Body38::open_placed_mtp(file, &plan, &inputs, 0, a.host, ub, &draft, &mtp)?
+                }
+            };
             m.set_mode(StepMode::Graph);
             eprintln!(
                 "load arch=qwen4exp resident_bytes={} ctx={} layers={} mode=graph store_bytes={} \
@@ -381,6 +455,25 @@ mod drive {
                 m.body(WHAT)?.card_layers(),
                 t.elapsed().as_secs_f64()
             );
+            let draft_bytes = match a.mtp {
+                false => 0,
+                true => {
+                    let d = m.body(WHAT)?.mtp().ok_or("the load opened no MTP draft")?;
+                    let bytes = (d.resident_bytes() + d.arena_bytes()) as u64;
+                    let head = match d.head_map() {
+                        Some((_, n)) => format!("rows={n}"),
+                        None => "full".to_string(),
+                    };
+                    eprintln!(
+                        "load draft=mtp resident={} arena={} head={head} card_bytes={bytes} in \
+                         {:.1} s (runtime value)",
+                        d.resident_bytes(),
+                        d.arena_bytes(),
+                        t.elapsed().as_secs_f64(),
+                    );
+                    bytes
+                }
+            };
             let (launches, memops) = m.body(WHAT)?.step_launches();
             let nodes = m.capture_step()?;
             let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
@@ -398,13 +491,43 @@ mod drive {
                 )
                 .into());
             }
-            Ok(Q38 { m, ctx: a.ctx })
+            let mut s = app::Session::from_model(m, u32::try_from(a.ctx)?);
+            let spec = match a.mtp {
+                false => None,
+                true => {
+                    let draft = app::arch::qwen3moe::MtpDraft::open(
+                        s.model(),
+                        app::arch::qwen3moe::Q38Cfg {
+                            prompt: Prompt38::Auto,
+                            draft: MtpMode::Graph,
+                        },
+                    )?;
+                    struct Captures;
+                    impl app::RowsLog for Captures {
+                        fn capture_rows(
+                            &mut self,
+                            rows: usize,
+                            nodes: usize,
+                        ) -> Result<(), app::SessionError> {
+                            eprintln!("capture verify rows={rows} nodes={nodes}");
+                            Ok(())
+                        }
+                    }
+                    Some(s.with_draft::<app::arch::qwen3moe::MtpDraft, 4>(draft, &mut Captures)?)
+                }
+            };
+            Ok(Q38 {
+                s,
+                spec,
+                ctx: a.ctx,
+                draft_bytes,
+            })
         }
     }
 
     impl Seat for Q38 {
         fn pos(&self) -> usize {
-            self.m.pos() as usize
+            self.s.pos() as usize
         }
 
         fn ctx_max(&self) -> usize {
@@ -412,21 +535,61 @@ mod drive {
         }
 
         /// The prompt through the ubatch walk `--prefill auto` takes: `gemm`
-        /// from nine positions on, `pass` below — never one step per id.
+        /// from nine positions on, `pass` below — never one step per id;
+        /// under the draft the draft's own prompt call, its store walked over
+        /// the prompt's units.
         fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-            Ok(self.m.prompt38(ids, Prompt38::Auto)?)
+            match &mut self.spec {
+                Some(spec) => Ok(Advance::prompt(spec, &mut self.s, ids)?),
+                None => Ok(self.s.prompt(ids, runtime::Want::Argmax)?.argmax()),
+            }
         }
 
         fn step(&mut self, last: u32) -> Result<u32, GateError> {
-            Ok(self.m.step(&[last])?)
+            let next = self.s.step(last, runtime::Want::Argmax)?.argmax();
+            if let Some(spec) = &mut self.spec {
+                runtime::Draft::stepped(spec.draft_mut(), &mut self.s, last, next)?;
+            }
+            Ok(next)
         }
 
         fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
-            Ok(self.m.logits_into(row)?)
+            Ok(self.s.model().logits_into(row)?)
         }
 
         fn reset(&mut self) -> Result<(), GateError> {
-            Ok(self.m.reset()?)
+            self.s.reset()?;
+            if let Some(spec) = &mut self.spec {
+                spec.draft_mut().restart();
+            }
+            Ok(())
+        }
+
+        /// One pass from `last`: under the draft the window of four rows,
+        /// its kept tokens and counts; without it one step.
+        fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
+            match &mut self.spec {
+                Some(spec) => {
+                    let c = Advance::pass(spec, &mut self.s, last, out)?;
+                    Ok(Drafted {
+                        proposed: if c.proposed { c.rows - 1 } else { 0 },
+                        accepted: c.kept - 1,
+                    })
+                }
+                None => {
+                    out.push(self.step(last)?);
+                    Ok(Drafted::default())
+                }
+            }
+        }
+
+        /// The most positions one pass runs: the draft's four rows, or one
+        /// step without it.
+        fn pass_rows(&self) -> usize {
+            match self.spec {
+                Some(_) => 4,
+                None => 1,
+            }
         }
 
         /// The commit's rule, `Body38::kept`: with no verify waiting only
@@ -434,7 +597,7 @@ mod drive {
         /// and a request's shorter prefix grants nothing. [`KEEP_WHY`] is
         /// the rule string the server's reuse records print.
         fn keep(&self, n: usize) -> (usize, Option<String>) {
-            let pos = self.m.pos() as usize;
+            let pos = self.s.pos() as usize;
             if n >= pos {
                 return (pos, None);
             }
@@ -445,7 +608,7 @@ mod drive {
         /// path never reaches it (the server resets instead of cutting), so
         /// any other position is refused by name, the body's own message.
         fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
-            Ok(self.m.rollback(pos)?)
+            Ok(self.s.model_mut().rollback(pos)?)
         }
 
         /// Nowhere: the engine cuts a prompt call only where a later request
@@ -454,12 +617,36 @@ mod drive {
             Vec::new()
         }
 
+        /// `/props`' `engine.draft` under the MTP draft: its kind, the draft
+        /// file, its width and its resident bytes as the card's `draft`
+        /// class.
+        fn props(&self, mut p: EngineProps) -> EngineProps {
+            if self.spec.is_none() {
+                return p;
+            }
+            if let Some(place) = p.placement.as_mut() {
+                for d in place.devices.iter_mut() {
+                    if d.device.starts_with("GPU") {
+                        d.class_bytes.insert("draft".to_owned(), self.draft_bytes);
+                    }
+                }
+            }
+            p.draft = Some(DraftProps {
+                model: "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf".to_owned(),
+                n_max: Some(3),
+                kind: Some("mtp".to_owned()),
+                path: Some(DRAFT.to_owned()),
+                device: None,
+            });
+            p
+        }
+
         /// A Qwen3.8 sequence state is not a value a cache could hold: the
         /// recurrent stores and the PLE history have no copy to put back.
         /// The server's prompt cache is off, so this is never asked; a caller
         /// that asks is refused by name.
         fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
-            Err(format!("a snapshot at position {}: {KEEP_WHY}", self.m.pos()).into())
+            Err(format!("a snapshot at position {}: {KEEP_WHY}", self.s.pos()).into())
         }
 
         fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {

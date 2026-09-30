@@ -213,12 +213,16 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: DRAFT,
         class: Class::M,
-        kind: Kind::Words(&["lookup", "dspark"]),
+        kind: Kind::Words(&["lookup", "dspark", "mtp"]),
         default: Unset::Means("the plain path, one token a step"),
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
-              two-row pass; the greedy ids are the plain run's. The server refuses a request \
-              that samples or bans an id (a 400 naming the field).",
+              two-row pass; `generate_qwen3moe` and `bloomery-serve-qwen38` on a qwen4exp \
+              file: `mtp` serves the file's MTP draft (the shared draft file beside the \
+              target, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`) through a four-row \
+              window; the greedy ids are the plain run's. A server refuses a request that \
+              samples or bans an id (a 400 naming the field). Every other binary and family \
+              refuses each word by name.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

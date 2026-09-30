@@ -125,13 +125,14 @@ mod gate {
         let d = &plan.draft.cards[0];
         println!(
             "plan card={} ctx_max={CTX} draft dense={} experts={} rounding={} kv={} map={} \
-             headroom={}",
+             arena={} headroom={}",
             RTX_3090.name,
             d.dense_bytes,
             d.expert_bytes,
             d.rounding_bytes,
             d.kv_bytes,
             plan.map_bytes,
+            plan.arena_bytes,
             plan.headroom_bytes
         );
         let target = open(MODEL)?;
@@ -166,6 +167,14 @@ mod gate {
                 verdict(same)
             );
         }
+        let arena = mtp38.arena_bytes() as u64;
+        let arena_ok = arena == plan.arena_bytes;
+        ok &= arena_ok;
+        println!(
+            "(l) the draft program's arena {arena} (the plan's {}) {}",
+            plan.arena_bytes,
+            verdict(arena_ok)
+        );
         let borrowed = mtp38.borrowed(m.weights()).is_ok();
         ok &= borrowed;
         println!("(l) the walk's borrow resolves: {}", verdict(borrowed));
