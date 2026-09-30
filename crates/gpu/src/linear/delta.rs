@@ -553,8 +553,12 @@ mod delta_kernels {
         let o = o.as_mut_ptr();
         let state = state.as_mut_ptr();
         let stamp = stamp.as_mut_ptr();
-        // SAFETY: as gdn_delta_lanes', with the contract's m·n_v·HEAD decay
-        // values the body reads for DECAY_KEY; the launcher checks `row <
+        // SAFETY: the launch contract holds the lengths the body names, the
+        // lane word, `lanes >= 1`, `pos[0]`, `lanes` stamps and the m·n_v·HEAD
+        // decay values the body reads for DECAY_KEY; `o`, `state` and `stamp`
+        // are this launch's own outputs, the state read and written by the
+        // thread that owns each key and the stamps by block 0's thread 0 alone
+        // (the body's doc); the launcher checks n_k divides n_v, `row <
         // lanes`, row 0 in place mode and `row + m <= lanes` in row mode.
         unsafe {
             delta_lanes_body::<DECAY_KEY>(
