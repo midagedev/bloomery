@@ -1,6 +1,6 @@
 # just records-refresh: generate_ds41 --plan --depth 256 --place a under BLOOMERY_CED=on
 residency lever residency=mid-p40-s1 why=place
-plan place=a card=A6000 ctx_max=32768 card_experts=2668 (44750684160 B) host_experts=12692 (214016901120 B) host_shadow=1342177280 B n_l=70..71 on 38 layers card_budget=none hot_list=none
+plan place=a card=A6000 ctx_max=32768 card_experts=2668 (44750684160 B) host_experts=12692 (214016901120 B) host_shadow=1342177280 B n_l=70..71 on 38 layers card_budget=none
 residency host residency=mid-p40-s1 pinned=40 churn_experts=1148 churn_bytes=19255541760 headroom=43437910016 headroom_after=24182368256
 call plan first=0 end=256 batches=1 group=2 groups=1 t_max=512 chunk=8 sub_chunks=16 ring=128 layers=40 ced=on
 call groups g=1 sizes=[1]
