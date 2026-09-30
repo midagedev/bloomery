@@ -695,20 +695,24 @@ mod gate {
         Ok(ok)
     }
 
-    /// The drafted server's sampled request (`sampled`, answered `st`
-    /// `body`), served through plain steps, against the same request on a
-    /// plain server this starts once the drafted one has stopped
-    /// (`BLOOMERY_DRAFT=off`, the MTP levers removed; its logs in
-    /// `<dir>/plain`): served, the same ids, and no draft counts. Mutant: the
-    /// refusal of a sampled request under a draft restored (the drafted
-    /// server's 400).
-    fn sampled_as_plain(
-        dir: &Path,
-        sampled: &Value,
-        st: u16,
-        body: &str,
+    /// The drafted server's sampled requests, served through plain steps with
+    /// the target's logits row read after each step: `sampled` (answered `st`
+    /// `body`) is served and counts no draft; `top1` (answered `st1` `body1`),
+    /// the same request cut to `top_k` 1, samples the row's own argmax, so its
+    /// ids are this server's greedy `first`. A plain server is no reference
+    /// for the sampled ids: the drafted load plans fewer target experts on the
+    /// card (the draft takes card bytes), and an expert served on the host
+    /// rounds its sums another way, so a sampled id can differ at a near tie.
+    /// Mutants: the refusal of a sampled request under a draft restored (a
+    /// 400); a row read after the draft's walk from a buffer the walk writes
+    /// (`top1` then follows the draft's argmax, not `first`).
+    fn sampled_served(
+        sampled: (u16, &str),
+        top1: (u16, &str),
+        first: &[u32],
     ) -> Result<bool, GateError> {
         let mut ok = true;
+        let (st, body) = sampled;
         let drafted = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
         let got = ids_of(&drafted["tokens"]);
         println!("sampled on the drafted server: HTTP {st} tokens {got:?}");
@@ -722,23 +726,14 @@ mod gate {
             "drafted_sampled_request_drafts_nothing",
             drafted["timings"].get("draft_n").is_none(),
         );
-        let plain_dir = dir.join("plain");
-        std::fs::create_dir_all(&plain_dir)?;
-        let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::DRAFT, "off")
-            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
-            .env_remove(bloomery_levers::MTP_DRAFT);
-        let mut plain = Served38::spawn_with(&SERVER_ARGS, &plain_dir, &mut cmd)?;
-        println!("plain server pid {}", plain.child.id());
-        let addr = plain.address(&plain_dir.join("server.err"), POLLS, POLL)?;
-        let (st, body) = curl(&format!("http://{addr}/completion"), Some(sampled), false)?;
-        let want = ids_of(&json_of("/completion", st, &body)?["tokens"]);
-        println!("sampled on the plain server: tokens {want:?}");
-        println!("plain server stopped: {}", plain.stop()?);
+        let (st1, body1) = top1;
+        let k1 = json_of("/completion", st1, body1)?;
+        let got1 = ids_of(&k1["tokens"]);
+        println!("top_k 1 on the drafted server: tokens {got1:?}, greedy {first:?}");
         check(
             &mut ok,
-            "drafted_sampled_ids_are_the_plain_ids",
-            got == want,
+            "drafted_top1_sample_is_the_greedy_ids",
+            got1 == first && k1["timings"].get("draft_n").is_none(),
         );
         Ok(ok)
     }
@@ -887,17 +882,18 @@ mod gate {
             "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
             "seed": SAMPLED_SEED, "return_tokens": true,
         });
-        let drafted_sampled = if levers.draft() == Some("mtp") {
+        if levers.draft() == Some("mtp") {
             ok &= continued(&url, &err_log, &a.ids, &reference)?;
-            Some(curl(&url("/completion"), Some(&sampled), false)?)
-        } else {
-            None
-        };
+            let (st, body) = curl(&url("/completion"), Some(&sampled), false)?;
+            let top1 = json!({
+                "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
+                "top_k": 1, "seed": SAMPLED_SEED, "return_tokens": true,
+            });
+            let (st1, body1) = curl(&url("/completion"), Some(&top1), false)?;
+            ok &= sampled_served((st, &body), (st1, &body1), &first)?;
+        }
 
         println!("server stopped: {}", served.stop()?);
-        if let Some((st, body)) = drafted_sampled {
-            ok &= sampled_as_plain(&a.dir, &sampled, st, &body)?;
-        }
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");
             Ok(())
