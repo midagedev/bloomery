@@ -81,6 +81,25 @@
 #                --spec-type: the MTP arm refused by name, rc 64.
 #   srv-dry      the dry server command lines and the `[dry] server arms:` line. Every srv case but srv-past
 #                and the refusals of srv-flags needs the prose ids: the runner checks them for a server arm.
+#   mtp-past     oursmtp:2044 at C 2048, N 4: refused before the lease by name (2044 + 4 + 1 = 2049), rc 64;
+#                the dry run of 2044 and oursmtp:2043 beside it: rc 0, both arms' lines.
+#   mtp-env      BLOOMERY_DRAFT=mtp in the runner's environment beside an ours arm: refused by name, rc 64.
+#   mtp-dry      6 oursmtp:6's dry run: the oursmtp command line is ours' under env BLOOMERY_DRAFT=mtp, the
+#                ours one carries no env, and the `[dry] oursmtp:` line says the schema declares no mtp
+#                summary record.
+#   mtp          6 oursmtp:6 lcpp27752srv:6, two rounds, preheat on at GLM_PREHEAT_K 2 on the fixture (needs
+#                the prose ids): the stub generate_glm5next times its steps at half under BLOOMERY_DRAFT=mtp
+#                and logs each run's BLOOMERY_DRAFT ($TMPDIR/stub-gen-draft): three runs of each arm, the
+#                oursmtp ones alone under mtp; oursmtp's warm-up and rows, its K=2 preheats, its decode and
+#                prefill means under its own label, no draft fields in its row, its xcheck against ours;
+#                `ratio mtp d=6 ours/oursmtp mean 0.4999 ± 0.0000 (n=2)`, and oursmtp in no other ratio
+#                table (the decode and prefill tables hold ours/lcpp27752srv alone).
+#   mtp-rec      a schema copy that declares the mtp summary record (generate_qwen3moe's): with the stub
+#                printing one under mtp (STUB_GEN_MTP_REC=1) the oursmtp row carries `mtp positions/pass
+#                2.500 = positions 10 / passes 4, kept [1, 1, 1, 1]` and the ours row nothing; printing
+#                none, the oursmtp row is a FAIL row naming it, rc 1.
+#   mtp-lever    a generate_glm5next that refuses BLOOMERY_DRAFT (STUB_GEN_NODRAFT=1): oursmtp:6 refused
+#                before the lease by name with the binary's line, rc 2, no row.
 #   dry-same     DEPTH_GLM5NEXT_BASE set: the dry run of every arm kind the base runner knows, under the
 #                base and under the runner tested, byte for byte less the lines this runner changed on
 #                purpose: `[dry] preheat:`, `[dry] prompt:`, `[dry] WARMUP r0:`, `[dry] server arms:`, the
@@ -183,8 +202,11 @@ cp "$T/pr27752/llama-bench" "$T/pr27754/llama-bench"
 # The stub llama-server: tools/ref/stub-llama-server.py (its docstring has what it answers).
 cp "$ROOT/tools/ref/stub-llama-server.py" "$T/pr27752/llama-server"
 cp "$T/pr27752/llama-server" "$T/pr27754/llama-server"
-# The stub generate_glm5next: --records-schema prints the checked-in schema; a run prints the records a
-# timed run prints, the `fed` line left out under
+# The stub generate_glm5next: --records-schema prints the checked-in schema; --levers prints a line, or
+# under STUB_GEN_NODRAFT=1 with BLOOMERY_DRAFT set refuses it (exit 1), as a run does then; a run appends
+# `draft=<BLOOMERY_DRAFT or none> depth=<ids>` to $TMPDIR/stub-gen-draft, times its steps at half under
+# BLOOMERY_DRAFT=mtp, and prints there an `mtp summary` record when STUB_GEN_MTP_REC=1; it prints the
+# records a timed run prints, the `fed` line left out under
 # STUB_GEN_NOFED=1; its load record names --ctx (STUB_GEN_LOAD_CTX in its stead), its tokens record token 0
 # STUB_GEN_TOKEN0 (1000 by default) and then the step lines' ids. Under STUB_GEN_FAULT=<file> it takes major faults after its `fed` line (the file
 # written, its pages dropped, then read through a mapping) and times its prompt and steps at 0.01 ms,
@@ -193,6 +215,11 @@ G=$T/target/release/generate_glm5next
 # shellcheck disable=SC2016 # ${1:-} is the stub's own argument
 printf '#!/usr/bin/env bash\n[ "${1:-}" != --records-schema ] || exec cat %q\n' "$T/tools/bloomery/schema/generate_glm5next.jsonl" > "$G"
 cat >> "$G" << 'EOF'
+if [ -n "${STUB_GEN_NODRAFT:-}" ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
+  echo "Error: BLOOMERY_DRAFT is set, and generate_glm5next does not act on it (stub)" >&2
+  exit 1
+fi
+[ "${1:-}" != --levers ] || { echo "lever table (stub)"; exit 0; }
 n=32 place=gate depth=0 ctx=2048
 while [ $# -gt 0 ]; do
   case $1 in
@@ -201,11 +228,13 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+echo "draft=${BLOOMERY_DRAFT:-none} depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-draft"
 echo "plan place=$place card=A6000 ctx_max=2048 card_experts=2627 (39941832704 B) host_experts=9469 (145536581632 B) host_shadow=0 B n_l=67..68 on 39 layers card_budget=none"
 echo "load resident_bytes=0 ctx=${STUB_GEN_LOAD_CTX:-$ctx} (stub)"
 echo "capture graph_nodes=1348"
 [ -n "${STUB_GEN_NOFED:-}" ] || echo "fed ids=$depth first=[1, 2, 3, 4] last=[5, 6, 7, 8] depth_sequence_from=$depth"
 pms=100.0000 sms=33.0000
+[ "${BLOOMERY_DRAFT:-}" != mtp ] || sms=16.5000
 if [ -n "${STUB_GEN_FAULT:-}" ] && { [ -z "${STUB_GEN_FAULT_ONCE:-}" ] || [ ! -e "$STUB_GEN_FAULT.done" ]; }; then
   touch "$STUB_GEN_FAULT.done"
   pms=0.0100 sms=0.0100
@@ -229,6 +258,8 @@ echo "time prompt n=$depth ms=$pms tok/s=$((depth * 10)).00 passes=$depth kind=s
 for i in $(seq 1 $((n - 1))); do echo "step $i $((depth + i - 1)) $((1000 + i))"; done
 for i in $(seq 1 $((n - 1))); do echo "time step $i ms=$sms"; done
 echo "tokens [$(for i in $(seq 0 $((n - 1))); do [ "$i" = 0 ] && printf '%s' "${STUB_GEN_TOKEN0:-1000}" || printf ', %s' $((1000 + i)); done)]"
+[ -z "${STUB_GEN_MTP_REC:-}" ] || [ "${BLOOMERY_DRAFT:-}" != mtp ] ||
+  echo "mtp summary proposals=3 kept=[1, 1, 1, 1] positions=10 passes=4 tok/s(positions)=200.00"
 echo "SMOKE mode=graph place=$place prompt_tokens=$depth depth=$depth generated=$n warm=0 steps=$((n - 1)) p50_ms=$sms mean_ms=$sms tok/s(p50)=30.30"
 EOF
 chmod +x "$T/bin/"* "$T/pr27752/"* "$T/pr27754/"* "$G"
@@ -446,6 +477,39 @@ elif want srv-flags-refused "$L" 1 "^depth-glm5next.sh: arm 'lcpp27754srv\+x1:6'
   want srv-flags-refused "$L2" 1 "^depth-glm5next.sh: arm 'lcpp27754\+t16:6' is .* — \+t<N>, \+nopo<0\|1> and \+k<K> are a server arm's flags$"; then
   pass srv-flags-refused
 fi
+L=$tmp/mtp-past.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- oursmtp:2044
+L2=$tmp/mtp-past-dry.log
+RC1=$RC
+stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 2044 oursmtp:2043
+if [ "$RC1" != 64 ] || [ "$RC" != 0 ]; then
+  fail mtp-past "rc $RC1 (2044) and $RC (the dry run beside it), want 64 and 0" "$L"
+elif want mtp-past "$L" 1 "^depth-glm5next.sh: arm 'oursmtp:2044' is .* — oursmtp needs 1 <= D and D \+ N \+ 1 <= C \(2044 \+ 4 \+ 1 = 2049 against --ctx 2048\): the verify's last window takes one position past the N-th token$" &&
+  want mtp-past "$L" 0 '^(ROW|WARMUP|FAIL) ' &&
+  want mtp-past "$L2" 1 '^\[dry\] 2044:$' &&
+  want mtp-past "$L2" 1 '^\[dry\] oursmtp:2043:$' &&
+  want mtp-past "$L2" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_DRAFT=mtp target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.52042> -n 4 --ctx 2048 '; then
+  pass mtp-past
+fi
+L=$tmp/mtp-env.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRAFT=mtp -- 6 oursmtp:6
+if [ "$RC" != 64 ]; then
+  fail mtp-env "rc $RC, want 64" "$L"
+elif want mtp-env "$L" 1 "^depth-glm5next.sh: BLOOMERY_DRAFT is set to 'mtp' in the runner's environment, so the plain ours arms would run it too; unset it \(the oursmtp:<D> arm sets BLOOMERY_DRAFT=mtp for its own command\)$" &&
+  want mtp-env "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]) '; then
+  pass mtp-env
+fi
+L=$tmp/mtp-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- 6 oursmtp:6
+if [ "$RC" != 0 ]; then
+  fail mtp-dry "rc $RC, want 0" "$L"
+elif want mtp-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_DRAFT=mtp target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place a --time $' &&
+  want mtp-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place a --time $' &&
+  want mtp-dry "$L" 2 'BLOOMERY_DRAFT' &&
+  want mtp-dry "$L" 1 "^\[dry\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares no mtp summary record: the oursmtp rows carry no draft fields$" &&
+  want mtp-dry "$L" 1 '^\[dry\] round 1 gguf order: 6 oursmtp:6 $'; then
+  pass mtp-dry
+fi
 PROSE_SRC=${BLOOMERY_DATA:-/root/bloomery-data}/glm5next/corpus-prose.ids
 if [ -f "$PROSE_SRC" ]; then
   mkdir -p "$T/data/glm5next"
@@ -590,8 +654,79 @@ if [ -f "$PROSE_SRC" ]; then
     want srv-fail "$L2" 1 "^FAIL r1 lcpp27754srv d=6 rc=5 \| -c 2048 \(ours' --ctx\): llama-server exited 5 before it answered /health \| "; then
     pass srv-fail
   fi
+
+  # The MTP arm: ours under BLOOMERY_DRAFT=mtp, its rows, preheat, xcheck and the ours / oursmtp table.
+  L=$tmp/mtp.log
+  : > "$tmp/tmp/stub-gen-draft"
+  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_TIMING_GPU="$GPU_A" "${PH_ENV[@]}" -- 6 oursmtp:6 lcpp27752srv:6
+  if [ "$RC" != 0 ]; then
+    fail mtp "rc $RC, want 0" "$L"
+  elif want mtp "$L" 1 '^WARMUP r0 oursmtp d=6 n=4 ctx=2048 \| ' &&
+    want mtp "$L" 1 '^ROW r1 oursmtp d=6 n=4 ctx=2048 \| tok/s\(mean\) 60\.61 @ n=4, depth 6, A6000 \(stub\) \| .*\| prompt ids 50000\.\.50005 \| .*\| pp_tok/s 60\.00 \(n=6, passes=6, kind=steps\) \| majflt [0-9]+ \(timed, from the fed line; ' &&
+    want mtp "$L" 1 '^ROW r2 oursmtp d=6 ' &&
+    want mtp "$L" 1 '^ROW r1 ours d=6 n=4 ctx=2048 \| tok/s\(mean\) 30\.30 @ ' &&
+    want mtp "$L" 0 '\| mtp positions/pass ' &&
+    want mtp "$L" 3 '^preheat oursmtp K=2 bytes=2136 ' &&
+    want mtp "$L" 3 '^preheat ours K=2 bytes=2136 ' &&
+    want mtp "$L" 1 "^\[config\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares no mtp summary record: the oursmtp rows carry no draft fields$" &&
+    want mtp "$L" 1 '^mean oursmtp 6 +60\.61 tok/s ' &&
+    want mtp "$L" 1 '^mean ours 6 +30\.30 tok/s ' &&
+    want mtp "$L" 1 '^mean oursmtp 6 +60\.00 tok/s\(pp\) ' &&
+    want mtp "$L" 1 '^xcheck prose p=6 r1 ours\(r1\)/oursmtp: same 4 \(1000,1001,1002,1003\)$' &&
+    want mtp "$L" 1 '^xcheck prose p=6 r2 ours\(r2\)/oursmtp: same 4 ' &&
+    want mtp "$L" 1 '^ratio mtp d=6 +ours/oursmtp +mean 0\.4999 ± 0\.0000 \(n=2\)  of means 0\.4999  per round: r1 0\.4999 r2 0\.4999$' &&
+    want mtp "$L" 1 '^ratio mtp d=' &&
+    want mtp "$L" 1 '^ratio d=6 +ours/lcpp27752srv ' &&
+    want mtp "$L" 1 '^ratio d=' &&
+    want mtp "$L" 1 '^ratio pp p=6 +ours/lcpp27752srv ' &&
+    want mtp "$L" 1 '^ratio pp p=' &&
+    want mtp "$L" 0 '^failed arms' &&
+    want "mtp draft" "$tmp/tmp/stub-gen-draft" 3 '^draft=mtp depth=6$' &&
+    want "mtp draft" "$tmp/tmp/stub-gen-draft" 3 '^draft=none depth=6$' &&
+    want "mtp draft" "$tmp/tmp/stub-gen-draft" 6 '.'; then
+    pass mtp
+  fi
+
+  # The mtp summary record, when the schema declares it: a schema copy with generate_qwen3moe's kind.
+  SCH=$T/tools/bloomery/schema/generate_glm5next.jsonl
+  cp "$SCH" "$tmp/schema-glm5next.jsonl"
+  python3 - "$tmp/schema-glm5next.jsonl" "$ROOT/tools/bloomery/schema/generate_qwen3moe.jsonl" "$SCH" << 'PY'
+import json, sys
+glm, qwen, out = sys.argv[1:]
+lines = open(glm).read().splitlines()
+head = json.loads(lines[0])
+kind = next(l for l in open(qwen).read().splitlines() if json.loads(l).get("kind") == "mtp_summary")
+head["kinds"] += 1
+open(out, "w").write("\n".join([json.dumps(head, separators=(",", ":"))] + lines[1:] + [kind]) + "\n")
+PY
+  L=$tmp/mtp-rec.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 -- 6 oursmtp:6
+  L2=$tmp/mtp-rec-none.log
+  RC1=$RC
+  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 6 oursmtp:6
+  cp "$tmp/schema-glm5next.jsonl" "$SCH"
+  if [ "$RC1" != 0 ] || [ "$RC" != 1 ]; then
+    fail mtp-rec "rc $RC1 (a record) and $RC (none), want 0 and 1" "$L"
+  elif want mtp-rec "$L" 1 '^ROW r1 oursmtp d=6 .*\| pp_tok/s 60\.00 \(n=6, passes=6, kind=steps\) \| mtp positions/pass 2\.500 = positions 10 / passes 4, kept \[1, 1, 1, 1\] \| majflt ' &&
+    want mtp-rec "$L" 1 '^ROW r1 ours d=6 ' &&
+    want mtp-rec "$L" 1 '\| mtp positions/pass ' &&
+    want mtp-rec "$L" 1 "^\[config\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares the mtp summary record: " &&
+    want mtp-rec "$L2" 1 '^FAIL r1 oursmtp d=6 rc=0 \| the oursmtp arm printed no mtp summary record, which its schema declares \| full output: ' &&
+    want mtp-rec "$L2" 1 '^ROW r1 ours d=6 ' &&
+    want mtp-rec "$L2" 1 '^failed arms: r1:oursmtp@d=6$'; then
+    pass mtp-rec
+  fi
+
+  L=$tmp/mtp-lever.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NODRAFT=1 -- 6 oursmtp:6
+  if [ "$RC" != 2 ]; then
+    fail mtp-lever "rc $RC, want 2" "$L"
+  elif want mtp-lever "$L" 1 '^depth-glm5next.sh: target/release/generate_glm5next refuses BLOOMERY_DRAFT=mtp \(its --levers under it: Error: BLOOMERY_DRAFT is set, and generate_glm5next does not act on it \(stub\)\): no oursmtp arm can run$' &&
+    want mtp-lever "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]) '; then
+    pass mtp-lever
+  fi
 else
-  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe and srv-fail: no prose ids at $PROSE_SRC (the profile pins their sha256)"
+  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec and mtp-lever: no prose ids at $PROSE_SRC (the profile pins their sha256)"
 fi
 
 # same_view: a dry run less the lines this runner changes on purpose (dry-same).

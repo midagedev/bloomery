@@ -25,6 +25,21 @@
 #             ids from 0-based index GLM_PROSE_FROM (models/glm5next.sh: past the ids the router set
 #             was traced from, docs/fair-measure.md 4.2). Each ours and server row prints
 #             `prompt ids <a>..<b>`.
+#   oursmtp:<D>  ours with the MTP draft: the same command under `env BLOOMERY_DRAFT=mtp`, its rows
+#             labelled `oursmtp`, its prompt row a prefill record under that label. A drafted arm takes
+#             one position more than ours, for the verify's last window: D + N + 1 <= C, checked before
+#             the lease. Before the lease the binary's `--levers` under BLOOMERY_DRAFT=mtp must pass (a
+#             binary that does not act on the lever refuses it by name), and a BLOOMERY_DRAFT already set
+#             in the runner's environment is refused: the plain ours arms would draft too. Its greedy ids
+#             are the plain run's, so each row is held to ours' on the same ids and length as a server row
+#             is (the xcheck below; oursmtp is never the ours side of it). When generate_glm5next's
+#             checked-in schema declares the `mtp summary` record, the row carries its fields through
+#             tools/bloomery/records.py (` | mtp positions/pass <positions / passes> = positions P / passes
+#             Q, kept [..]`), and an oursmtp row that prints none is a FAIL row; a schema that declares
+#             none reads none, the row carries nothing for it, and the [config] (or [dry]) `oursmtp:` line
+#             says which. Its row's tok/s is the SMOKE mean's, as ours'. After the tables, `ratio mtp d=`:
+#             ours / oursmtp per depth, paired by round (below 1: the draft is faster); oursmtp is in no
+#             other ratio table.
 #   lcpp27752:<D>, lcpp27754:<D>   the PR branch's llama-bench -p 0 -n N -d D -r 1 at the profile's
 #             LCPP27752_GPU_FLAGS / LCPP27754_GPU_FLAGS (the second under LCPP27754_ENV). -d prefills
 #             D of llama-bench's own std::rand() ids before its clock starts; its row label is `tgN @
@@ -181,12 +196,12 @@ case $WARM in '' | [0-9] | [1-9][0-9]*) ;; *) echo "depth-glm5next.sh: BLOOMERY_
 
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(512 lcpp27754:512)
-# Per arm: the engine (ours, lcpp27752, lcpp27754, exl3), whether it is a prefill arm, its
+# Per arm: the engine (ours, oursmtp, lcpp27752, lcpp27754, exl3), whether it is a prefill arm, its
 # ubatch lever, its depth or prompt length, and its row label (a prefill arm's names its ubatch).
 A_ENG=() A_PP=() A_UB=() A_DEP=() A_LABEL=()
-ours=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0
+ours=0 ours_mtp=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0
 usage() {
-  echo "depth-glm5next.sh: arm '$1' is <D>, lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}[+t<N>][+nopo<0|1>][+k<K>]:<D>, lcpp2775{2,4}srvpp[<U>][+…]:<P>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
+  echo "depth-glm5next.sh: arm '$1' is <D>, oursmtp:<D>, lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}[+t<N>][+nopo<0|1>][+k<K>]:<D>, lcpp2775{2,4}srvpp[<U>][+…]:<P>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
   exit 64
 }
 # The fit arms' flags, probe and column (lcpp-fit.sh); fit_eng names this runner's fit engines.
@@ -212,6 +227,10 @@ for a in "${ARMS[@]}"; do
     ours)
       ours=1
       [ "$dep" -ge 1 ] && [ $((dep + N)) -le "$CTX" ] || usage "$a" "ours needs 1 <= D and D + N <= C ($N + D against --ctx $CTX)"
+      ;;
+    oursmtp)
+      ours=1 ours_mtp=1
+      [ "$dep" -ge 1 ] && [ $((dep + N + 1)) -le "$CTX" ] || usage "$a" "oursmtp needs 1 <= D and D + N + 1 <= C ($dep + $N + 1 = $((dep + N + 1)) against --ctx $CTX): the verify's last window takes one position past the N-th token"
       ;;
     lcpp27752 | lcpp27754) lcpp=1 ;;
     lcpp27752fit | lcpp27754fit) lcpp=1 ;;
@@ -251,6 +270,11 @@ for a in "${ARMS[@]}"; do
   case $eng in exl3*) ;; *) gguf=1 ;; esac
   A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng")
 done
+# The draft is the oursmtp arm's alone: set here, every ours arm would draft and their ratio would read 1.
+if [ "$ours" = 1 ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
+  echo "depth-glm5next.sh: BLOOMERY_DRAFT is set to '$BLOOMERY_DRAFT' in the runner's environment, so the plain ours arms would run it too; unset it (the oursmtp:<D> arm sets BLOOMERY_DRAFT=mtp for its own command)" >&2
+  exit 64
+fi
 
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
@@ -307,6 +331,23 @@ if [ "$ours" = 1 ]; then
     check 2 "no binary at $BIN"
   fi
 fi
+# The oursmtp arm: its binary takes BLOOMERY_DRAFT=mtp (at_main refuses a lever the binary does not act
+# on, --levers included), and the checked-in schema says whether its `mtp summary` record is read (MTP_REC
+# 1) or none is (0), probed as cold-blocks.sh's res_kinds probes the residency records.
+MTP_REC=0 MTP_NOTE=''
+if [ "$ours_mtp" = 1 ]; then
+  if [ -x "$BIN" ]; then
+    lv=$(env BLOOMERY_DRAFT=mtp "$BIN" --levers 2>&1) || check 2 "$BIN refuses BLOOMERY_DRAFT=mtp (its --levers under it: ${lv##*$'\n'}): no oursmtp arm can run"
+  fi
+  if lv=$(python3 "$RECORDS" sh --bin generate_glm5next /dev/null 'MK=mtp_summary.kept' 'MP=mtp_summary.positions' 'MQ=mtp_summary.passes' 2>&1); then
+    MTP_REC=1 MTP_NOTE="generate_glm5next's checked-in schema declares the mtp summary record: each oursmtp row carries its positions, passes and kept, and one that prints none is a FAIL row"
+  else
+    case $lv in
+      *"prints no kind mtp_summary"*) MTP_NOTE="generate_glm5next's checked-in schema declares no mtp summary record: the oursmtp rows carry no draft fields" ;;
+      *) check 2 "records.py could not read generate_glm5next's schema for the mtp summary record: $lv" ;;
+    esac
+  fi
+fi
 case " ${A_ENG[*]}" in *" lcpp27752"*) [ -x "$LCPP27752BIN" ] || check 2 "no llama-bench at $LCPP27752BIN (PR #27752's tree)" ;; esac
 case " ${A_ENG[*]}" in *" lcpp27754"*) [ -x "$LCPP27754BIN" ] || check 2 "no llama-bench at $LCPP27754BIN (PR #27754's tree)" ;; esac
 # A fit arm needs its branch's llama-bench to have the fit (lcpp_fit_probe runs its --help with no card).
@@ -354,8 +395,9 @@ arm_cmd() {
   local -a words=() mtpw=()
   CMD=() LABEL_TEST='' BATCH='' FIT_NOTE='' SRV_ENVS=() SRV_NP=$N
   case ${eng%%+*} in
-    ours)
+    ours | oursmtp)
       CMD=("$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
+      [ "$eng" = ours ] || CMD=(env BLOOMERY_DRAFT=mtp "${CMD[@]}")
       ;;
     lcpp2775[24]srv | lcpp2775[24]srvpp* | lcpp2775[24]mtp)
       # The branch's bench flags (its GLM_NCMOE_MTP for the MTP arm) with the arm's own, in the server's
@@ -461,7 +503,7 @@ ph_k() {
   PHK='' PHNGL=''
   case ${A_ENG[$i]} in
     exl3*) return 0 ;;
-    ours) PHK=$GLM_PREHEAT_K; return 0 ;;
+    ours | oursmtp) PHK=$GLM_PREHEAT_K; return 0 ;;
   esac
   arm_cmd "$i"
   for w in "${CMD[@]}"; do
@@ -526,6 +568,7 @@ preheat_arm() {
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS ctx=$CTX place=$PLACE warm=${WARM:-0} card=$CARD_NAME timing_gpu=$TIMING_GPU arm_bound=${BOUND}s warmup=$WARMUP cold_us=$COLD_US"
   echo "[dry] ours: $BIN prose=$PROSE"
+  [ "$ours_mtp" = 0 ] || echo "[dry] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; ${MTP_NOTE:-the schema of the mtp summary record was not read (the check lines)}"
   echo "[dry] prompt: GLM_PROSE ids from index $PROSE_FROM"
   ref_witness | sed 's/^   /[dry]/'
   [ ${#CHECKS[@]} -eq 0 ] || printf '[dry] check: %s\n' "${CHECKS[@]}"
@@ -667,7 +710,7 @@ run_arm() {
       srv_start_arm "$i" "$dep"
       rc=0
       ;;
-    ours)
+    ours | oursmtp)
       # Through majflt_mark: the fault count at the `fed` line, where the feed's timer starts.
       markf=$(mktemp "${TMPDIR:-/tmp}/depth-glm5next-fed.XXXXXX") || exit 2
       out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1 | majflt_mark "$markf" '^fed '; exit "${PIPESTATUS[0]}")
@@ -700,7 +743,7 @@ run_arm() {
   fi
   if [ "$rc" -ne 0 ]; then fail_row "" "${r_tag#r}" "$i" "$rc" "exited $rc" "$out"; return; fi
   case ${eng%%+*} in
-    ours)
+    ours | oursmtp)
       local rec P50 MEAN WARMCOL PLACE_RAN SERIES TOKENS PP_N PP_MS PP_TPS PP_PASSES PP_KIND CARD_EXP HOST_EXP XTOK
       rec=$(python3 "$RECORDS" sh --bin generate_glm5next - P50=smoke.p50_ms MEAN=smoke.mean_ms WARMCOL=smoke.warm \
         PLACE_RAN=smoke.place 'SERIES=time_step.ms*' 'TOKENS=step.token*' PP_N=time_prompt.n PP_MS=time_prompt.ms \
@@ -711,6 +754,19 @@ run_arm() {
       [ "$PLACE_RAN" = "$PLACE" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its SMOKE names place=$PLACE_RAN; the runner passed --place $PLACE" "$out"; return; }
       # The context the servers are given is the one this load made (docs/fair-measure.md 1.5).
       [ "$LCTX" = "$CTX" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its load record names ctx=${LCTX:-none}, and the server arms run at -c $CTX (BLOOMERY_GEN_CTX, ours' --ctx)" "$out"; return; }
+      # The oursmtp row's draft fields: the mtp summary record, when the schema declares it (MTP_REC).
+      local MK='' MP='' MQ='' MTP_COL='' mrec mlines
+      if [ "$eng" = oursmtp ] && [ "$MTP_REC" = 1 ]; then
+        if ! mrec=$(python3 "$RECORDS" sh --bin generate_glm5next - 'MK=mtp_summary.kept' 'MP=mtp_summary.positions' 'MQ=mtp_summary.passes' <<< "$out" 2>&1) ||
+          ! mlines=$(python3 "$RECORDS" lines --bin generate_glm5next - mtp_summary <<< "$out" 2>&1); then
+          fail_row "" "${r_tag#r}" "$i" 0 "records.py did not read its mtp summary record: $mrec${mlines:+ $mlines}" "$out"
+          return
+        fi
+        eval "$mrec"
+        [ -n "$mlines" ] || { fail_row "" "${r_tag#r}" "$i" 0 "the oursmtp arm printed no mtp summary record, which its schema declares" "$out"; return; }
+        [ -n "$MK" ] && [ -n "$MP" ] && [ -n "$MQ" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its mtp summary record has no kept, positions or passes (kept='$MK' positions='$MP' passes='$MQ')" "$out"; return; }
+        MTP_COL=" | mtp positions/pass $(awk -v p="$MP" -v q="$MQ" 'BEGIN { printf "%.3f", (q > 0) ? p / q : 0 }') = positions $MP / passes $MQ, kept $MK"
+      fi
       echo "$out" | grep -E '^(plan|load|capture|fed|step 0|time prompt) '
       local h10 t10 uniq tps tps50
       h10=$(echo "$SERIES" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
@@ -727,11 +783,12 @@ run_arm() {
       cold_pass "$tag" "$r" "$i"
       prompt_col "$dep"
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-      echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MAJ_COL | wall $((t1 - t0))s$rowtags"
+      echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
       [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
       sums+=("$label|$dep|$r|$tps")
       pp_sums+=("$label|$PP_N|$r|$PP_TPS")
-      xc_add ours prose "$dep" "$r" ours "$XTOK"
+      # The drafted run's ids are held to ours' as a server row's are; it is never the ours side.
+      if [ "$eng" = ours ]; then xc_add ours prose "$dep" "$r" ours "$XTOK"; else xc_add srv prose "$dep" "$r" "$label" "$XTOK"; fi
       ;;
     lcpp2775[24]srv | lcpp2775[24]srvpp* | lcpp2775[24]mtp)
       local acc prps wtps w
@@ -859,6 +916,7 @@ majflt_require depth-glm5next.sh
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS card=$CARD_NAME timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU arm_bound=${BOUND}s cold_us=$COLD_US"
 [ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE"
+[ "$ours_mtp" = 0 ] || echo "[config] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; $MTP_NOTE"
 [ "$ours$srv" = 00 ] || echo "[config] prompt: GLM_PROSE ids from index $PROSE_FROM"
 [ "$lcpp" = 0 ] || echo "[config] lcpp27752 flags=$LCPP27752_GPU_FLAGS | lcpp27754 env=$LCPP27754_ENV flags=$LCPP27754_GPU_FLAGS"
 for e in 27752 27754; do
@@ -912,7 +970,7 @@ echo "=== per-arm prefill means (tok/s(pp) @ n=0, prompt P, $CARD_NAME; ours its
 # share a routing condition: ours and the server arms feed the same prose ids, ours places card experts by
 # id; llama-bench feeds std::rand() ids and places whole layers, whose host bytes a token do not depend on
 # the ids; exllamav3 feeds wikitext-2 and adapts its placement to that stream.
-same_file() { grep -vE '^exl3' | grep -vx ours; }
+same_file() { grep -vE '^exl3' | grep -vxE 'ours|oursmtp'; }
 if [ ${#sums[@]} -gt 0 ]; then
   echo
   echo "=== ours / each engine on the same file, per depth: each round's ratio, their mean ± 95 % (t, rounds - 1 df) ==="
@@ -926,6 +984,13 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
   keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
   refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | sort -u | same_file | tr '\n' ' ')
   printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$keys" "$refs"
+fi
+# The draft's own effect: the same binary, ids, context and placement, BLOOMERY_DRAFT=mtp the one difference.
+if [[ " ${sums[*]+${sums[*]}}" == *" oursmtp|"* ]]; then
+  echo
+  echo "=== ours / oursmtp per depth (below 1: the MTP draft is faster): each round's ratio, their mean ± 95 % (t, rounds - 1 df) ==="
+  keys=$(printf '%s\n' "${sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
+  printf '%s\n' "${sums[@]}" | ratio_table "ratio mtp d=" "$keys" oursmtp
 fi
 witness post
 ref_witness
