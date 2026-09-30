@@ -35,8 +35,10 @@
 //!   step` records print after the last step, so no write sits between two
 //!   timed steps.
 //! - `--pair` then runs the same tokens again as verifies of two rows
-//!   (`runtime::Verify` on the session, `bloomery_gpu_glm5next`'s verify):
-//!   the model cut back to the prompt's end (its checkpoint), in graph mode
+//!   (`runtime::Verify` on the session, `bloomery_gpu_glm5next`'s verify) on
+//!   the verify's load (`app::arch::glm5next::open_pair`: each KDA layer's
+//!   state two lanes, the plan's card experts fewer by the second lane's
+//!   bytes; the plain run's load holds one): the model cut back to the prompt's end (its checkpoint), in graph mode
 //!   the verify captured first (`capture` with `pair_graph_nodes`), then
 //!   pass `k` feeds the plain run's fed tokens `2k` and `2k + 1` at their
 //!   positions and keeps both rows — the draft is the target's own greedy
@@ -120,7 +122,7 @@ mod cli {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use app::arch::glm5next::{GlmCfg, open_nextn, open_resident};
+    use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident};
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
@@ -412,6 +414,11 @@ mod cli {
         };
         let mut s = if drafted {
             let Some(s) = open_nextn(file, args, &mut log)? else {
+                return Ok(());
+            };
+            s
+        } else if pair {
+            let Some(s) = open_pair(file, args, &mut log)? else {
                 return Ok(());
             };
             s

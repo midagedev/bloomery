@@ -12,6 +12,9 @@
 //! positions a latent layer keeps whole), every set read through its family.
 //!
 //! What is asserted:
+//! The load at [`CTX`] is the verify's (`app::arch::glm5next::open_pair`:
+//! two KDA lanes, since (v) verifies on it); the prompt batch's load below
+//! is the plain session's, one lane.
 //! - (card) right after the load at [`CTX`], the card experts' slot map,
 //!   slots and card copy, checks (i)–(iii) of `shared/glm5next_card.rs`.
 //! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes
@@ -24,8 +27,8 @@
 //!   reads — none of [`Q6K_DOWN`], whose downs are Q6_K — and, without a
 //!   card budget (`BLOOMERY_CARD_BUDGET`), every one of those; the
 //!   latent layers are the ones the file's description names, the dense
-//!   blocks the first three; the stores' bytes equal their derivation from
-//!   the header ([`store_bytes`]).
+//!   blocks the first three; the load holds two KDA lanes, and the stores'
+//!   bytes equal their derivation from the header at two ([`store_bytes`]).
 //! - (p) one chain: the batch set's five tokens as five graph steps and as
 //!   five eager steps (the per-layer taps armed), each from a reset, leave
 //!   the same per-position tokens and logits bit for bit.
@@ -132,6 +135,11 @@
 //! position the latent layers attend whole — in its own session fed in
 //! batches (`bloomery_gpu_glm5next::prefill`), the clauses above having run
 //! on the steps feed:
+//! - (l1) the plain load holds one KDA lane and the stores' bytes are their
+//!   derivation at one ([`store_bytes`]); after a step, a verify of two rows
+//!   is refused by name, eager and in its capture, the model standing where
+//!   it stood with every store as it was, and the step after it the plain
+//!   run's.
 //! - (pb) one run of plain steps over [`CTX_PP`] lcg ids from a reset, every
 //!   store digested and the logits and argmax kept after each of [`PP`]
 //!   positions; then for each, a batch call of that many ids from a reset:
@@ -151,8 +159,9 @@
 //!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
-//! at [`CTX`], `--only verify` (s) and (v) alone on a load at [`CTX`] (the
-//! plain graph run of the batch set they compare against included).
+//! at [`CTX`] of one lane, `--only verify` (s) and (v) alone on a load at
+//! [`CTX`] of two (the plain graph run of the batch set they compare against
+//! included).
 //! `--step-sets short` takes (t)'s two 4-token sets only,
 //! `--step-sets long` the 1,024- and 3,070-position sets only, `--step-sets
 //! all` (the default) all four; it names the sets of the load at [`CTX`], so
@@ -187,7 +196,7 @@ mod gate {
     use crate::card;
     use std::time::Instant;
 
-    use app::arch::glm5next::GlmCfg;
+    use app::arch::glm5next::{GlmCfg, open_pair};
     use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::{Fault, FaultSite, LAYER_HEAD};
@@ -202,15 +211,15 @@ mod gate {
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
-        Body, Glm5nextModel, LANES, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill,
-        set_taps, step_launches, store_digests,
+        Body, Glm5nextModel, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill, set_taps,
+        step_launches, store_digests,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
     use gguf::quant::dequant_row;
     use gguf::{GgmlType, Split};
     use model::arch::glm5next::names;
-    use model::arch::glm5next::place::PlanInputs;
+    use model::arch::glm5next::place::{KdaLanes, PlanInputs};
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
@@ -346,14 +355,14 @@ mod gate {
     /// bound); the three step sets read 0.75, 0.67 and 0.83 of it.
     const HEAD_RATIO: f64 = 1.5;
 
-    /// The stores' bytes at [`CTX`] rows, derived from the header: each KDA
-    /// layer's state, [`LANES`] lanes of 64 heads of 128 × 128 f32, a u32
-    /// stamp a lane, and conv ring, 11 rows of 3 · 64 · 128 f32; each latent
-    /// layer's latent and index rows, 512 + 256 f16 a position, and its pool
-    /// plane, 128 f16 a pool of four.
-    fn store_bytes() -> usize {
-        N_KDA * ((LANES * 64 * 128 * 128 + 11 * 3 * 64 * 128) * 4 + LANES * 4)
-            + N_LATENT * (CTX * (512 + 256) + CTX.div_ceil(4) * 128) * 2
+    /// The stores' bytes at `ctx` rows and `lanes` KDA lanes, derived from
+    /// the header: each KDA layer's state, `lanes` lanes of 64 heads of 128 ×
+    /// 128 f32, a u32 stamp a lane, and conv ring, 11 rows of 3 · 64 · 128
+    /// f32; each latent layer's latent and index rows, 512 + 256 f16 a
+    /// position, and its pool plane, 128 f16 a pool of four.
+    fn store_bytes(ctx: usize, lanes: usize) -> usize {
+        N_KDA * ((lanes * 64 * 128 * 128 + 11 * 3 * 64 * 128) * 4 + lanes * 4)
+            + N_LATENT * (ctx * (512 + 256) + ctx.div_ceil(4) * 128) * 2
     }
 
     /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch, so
@@ -460,11 +469,14 @@ mod gate {
     }
 
     /// The session at `ctx` positions on the gate placement, its prompts fed
-    /// by `prefill`.
+    /// by `prefill`, each KDA layer's state `lanes` lanes: two opens the
+    /// verify's load (`app::arch::glm5next::open_pair`), one the plain
+    /// session's.
     fn open(
         levers: &bloomery_levers::Levers,
         ctx: usize,
         prefill: PrefillMode,
+        lanes: KdaLanes,
     ) -> Result<(Session<Body>, Opened), GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let cfg = GlmCfg {
@@ -487,9 +499,14 @@ mod gate {
             mode: StepMode::Graph,
             cfg,
         };
-        let loaded =
-            Loaded::<Body>::open(file, args, &mut log)?.ok_or("the open stopped at its plan")?;
-        let s = loaded.ready(&mut log)?;
+        let s = match lanes {
+            KdaLanes::One => Loaded::<Body>::open(file, args, &mut log)?
+                .ok_or("the open stopped at its plan")?
+                .ready(&mut log)?,
+            KdaLanes::Two => {
+                open_pair(file, args, &mut log)?.ok_or("the open stopped at its plan")?
+            }
+        };
         let nodes = log.nodes.ok_or("graph mode captured no step")?;
         let n_l = log.n_l;
         Ok((
@@ -515,17 +532,21 @@ mod gate {
         let latent = at(&|l| kinds[l].mixer == MixerKind::Latent);
         let dense = at(&|l| kinds[l].ffn == FfnKind::Dense);
         let want_latent: Vec<usize> = (0..N_LAYER).filter(|l| l % 4 == 3).collect();
-        let (stores, want_stores) = (body.store_bytes(), store_bytes());
+        let lanes = body.lanes();
+        let (stores, want_stores) = (body.store_bytes(), store_bytes(CTX, lanes.count()));
         let mut ok = kinds.len() == N_LAYER
             && latent == want_latent
             && dense == (0..N_DENSE).collect::<Vec<_>>()
             && body.host_run() == (N_DENSE..N_LAYER)
+            && lanes == KdaLanes::Two
             && stores == want_stores;
         println!(
-            "structure layers={} latent at {latent:?} dense at {dense:?} host run {:?}; store bytes \
-             {stores} (want {want_stores}, derived) {}",
+            "structure layers={} latent at {latent:?} dense at {dense:?} host run {:?}; {} KDA \
+             lanes (want 2: the verify's load); store bytes {stores} (want {want_stores}, derived) \
+             {}",
             kinds.len(),
             body.host_run(),
+            lanes.count(),
             verdict(ok)
         );
         let mixers: Vec<MixerKind> = kinds.iter().map(|k| k.mixer).collect();
@@ -1854,7 +1875,7 @@ mod gate {
             ok &= verify_only(&levers)?;
         }
         if only == Only::PpLong {
-            let (mut s, _) = open(&levers, CTX, PrefillMode::Steps)?;
+            let (mut s, _) = open(&levers, CTX, PrefillMode::Steps, KdaLanes::One)?;
             ok &= prompt_long(s.model_mut())?;
         }
         if matches!(only, Only::All | Only::Pp) {
@@ -1863,9 +1884,10 @@ mod gate {
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 
-    /// Every clause on the steps feed, on the load at [`CTX`].
+    /// Every clause on the steps feed, on the load at [`CTX`] of two KDA
+    /// lanes: (v) verifies on it.
     fn main_clauses(levers: &bloomery_levers::Levers, sets: StepSets) -> Result<bool, GateError> {
-        let (mut s, opened) = open(levers, CTX, PrefillMode::Steps)?;
+        let (mut s, opened) = open(levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
         let mut ok = card::clauses(&mut s, &opened.n_l, opened.experts, opened.budgeted)?;
         let m = s.model_mut();
         ok &= structure(m, &opened)?;
@@ -1916,7 +1938,7 @@ mod gate {
     /// (s) and (v) alone on the load at [`CTX`] (`--only verify`), against
     /// the plain graph run of the batch set.
     fn verify_only(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
-        let (mut s, opened) = open(levers, CTX, PrefillMode::Steps)?;
+        let (mut s, opened) = open(levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
         let m = s.model_mut();
         let mut ok = structure(m, &opened)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
@@ -2096,12 +2118,13 @@ mod gate {
         Ok(pass)
     }
 
-    /// (pb), (pr), (pf) on a load at [`CTX_PP`] whose session feeds in batches.
+    /// (l1), (pb), (pr), (pf) on a load at [`CTX_PP`] of one KDA lane whose
+    /// session feeds in batches.
     fn prompt_batch(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
-        let (mut s, _) = open(levers, CTX_PP, PrefillMode::Batch)?;
+        let (mut s, _) = open(levers, CTX_PP, PrefillMode::Batch, KdaLanes::One)?;
         let m = s.model_mut();
         let ids = lcg_ids(CTX_PP + 1);
-        let mut ok = true;
+        let mut ok = one_lane(m, &ids[..3])?;
         // (pb): the steps' record, then one batch call a position count.
         m.reset()?;
         let t = Instant::now();
@@ -2164,6 +2187,65 @@ mod gate {
         ok &= refused_past(m, &ids)?;
         let clean = after.iter().find(|a| a.p == 9).map(|a| a.argmax);
         ok &= batch_fault(m, &ids[..9], &ids[..513], clean)?;
+        Ok(ok)
+    }
+
+    /// (l1) on the plain session's load: one KDA lane, the stores the header's
+    /// bytes at that lane; a verify of two rows refused by name in eager
+    /// mode and in its capture, the model standing where it stood with the
+    /// stores as they were, and the step after it the plain step. The model
+    /// left reset, in the step mode it came in.
+    fn one_lane(m: &mut Glm5nextModel, toks: &[u32]) -> Result<bool, GateError> {
+        const WANT: &str = "on a load of one KDA lane";
+        let mode = m.mode();
+        m.reset()?;
+        m.set_mode(StepMode::Eager);
+        let body = m.body("one lane")?;
+        let lanes = body.lanes();
+        let (stores, want) = (body.store_bytes(), store_bytes(CTX_PP, 1));
+        let t0 = m.step(&toks[..1])?;
+        let before = store_digests(m)?;
+        let pos = m.pos();
+        let rows = m.step_rows::<2>([toks[1], toks[2]]);
+        let captured = m.capture_rows::<2>();
+        let after = store_digests(m)?;
+        let stood = m.pos() == pos && after == before;
+        fn named<T>(r: &Result<T, GpuError>) -> bool {
+            matches!(r, Err(GpuError::Shape { detail, .. }) if detail.contains(WANT))
+        }
+        let t1 = m.step(&toks[1..2]);
+        let reset_ok = m.reset().is_ok();
+        let plain = m.step(&toks[..1]).and_then(|_| m.step(&toks[1..2]));
+        m.reset()?;
+        m.set_mode(mode);
+        let ok = lanes == KdaLanes::One
+            && stores == want
+            && named(&rows)
+            && named(&captured)
+            && stood
+            && reset_ok
+            && matches!((&t1, &plain), (Ok(a), Ok(b)) if a == b);
+        let text = |r: &Result<u32, GpuError>| match r {
+            Ok(t) => format!("token {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        println!(
+            "(l1) the plain load: {} KDA lanes, store bytes {stores} (want {want}, derived at one \
+             lane); after a step ({t0}) a verify of two rows: {}; its capture: {}; the model at \
+             {pos} with its stores as they were ({stood}); the next step {} (plain {}) {}",
+            lanes.count(),
+            match &rows {
+                Ok(r) => format!("tokens {r:?}"),
+                Err(e) => format!("error \"{e}\""),
+            },
+            match &captured {
+                Ok(n) => format!("{n} nodes"),
+                Err(e) => format!("error \"{e}\""),
+            },
+            text(&t1),
+            text(&plain),
+            verdict(ok)
+        );
         Ok(ok)
     }
 

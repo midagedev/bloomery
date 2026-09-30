@@ -34,7 +34,14 @@
 //! of it, so no walk is captured ([`NextnMode::Graph`] is refused by name).
 //! The store is by position: one walk may start at or below the end of the
 //! last walk of the sequence, never past it ([`Nextn::held`]); the model's
-//! reset and a cut behind it move that end back.
+//! reset and a cut behind it move that end back, and a walk that fails
+//! between its appends leaves it at the walk's first position.
+//!
+//! A walk that reads the target's rows reads them by position: each target
+//! arena records the positions its rows hold ([`Wrote`]) — the step, the
+//! verify and the prompt batch that last wrote it, less what a cut took
+//! back — and a walk from `pos0` reads rows that hold positions `pos0 − 1 ..
+//! pos0 + m − 2` of it, or is refused by name.
 //!
 //! A fault a launch raises poisons the model as soon as a call of the
 //! program meets it ([`GpuModel::note_fault`]): the chain's readback, or a
@@ -123,8 +130,10 @@ pub enum NextnMode {
     Store,
 }
 
-/// The layer's tensor names, made at load.
+/// The layer's tensor names, and the target's `output_norm` its hidden rows
+/// are normed by, made at load.
 struct NextnNames {
+    output_norm: String,
     eh: String,
     enorm: String,
     hnorm: String,
@@ -373,6 +382,7 @@ impl Nextn {
             return Err(shape(format!("layer {index}: names of another kind")));
         };
         let names = NextnNames {
+            output_norm: names::output_norm(),
             eh: names::nextn_eh_proj(index),
             enorm: names::nextn_enorm(index),
             hnorm: names::nextn_hnorm(index),
@@ -406,6 +416,7 @@ impl Nextn {
         for name in [&names.eh, &names.enorm, &names.hnorm, &names.head_norm] {
             weight(&w, name)?;
         }
+        f32v(tw, &names.output_norm)?;
         let bias_held = w.get(&names.bias).is_some();
         if bias_held != moe.router.bias {
             return Err(shape(format!(
@@ -462,6 +473,79 @@ fn shape(detail: String) -> GpuError {
     GpuError::Shape { what: WHAT, detail }
 }
 
+/// The positions a target arena's rows hold, row `i` position `first + i`:
+/// what the call that last wrote the arena left there, less the positions a
+/// cut took back since. No rows: the arena holds no position.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Held {
+    first: u32,
+    rows: u32,
+}
+
+impl Held {
+    /// No position.
+    pub(crate) const NONE: Held = Held { first: 0, rows: 0 };
+
+    /// Rows `0 .. rows` at positions `first ..`.
+    pub(crate) fn at(first: u32, rows: u32) -> Held {
+        Held { first, rows }
+    }
+
+    /// The positions from `pos` on taken back.
+    fn cut(&mut self, pos: u32) {
+        self.rows = self.rows.min(pos.saturating_sub(self.first));
+    }
+
+    /// Whether rows `row .. row + m` hold positions `at .. at + m`.
+    fn holds(&self, row: usize, m: usize, at: u32) -> bool {
+        row + m <= self.rows as usize && self.first as usize + row == at as usize
+    }
+
+    /// The positions held, for a refusal's words.
+    fn shown(&self) -> String {
+        match self.rows {
+            0 => "no position".to_string(),
+            r => format!("positions {}..{}", self.first, self.first + r),
+        }
+    }
+}
+
+/// Each target arena's [`Held`]: the body's record of where the step, the
+/// verify and the prompt batch left their rows.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Wrote {
+    pub(crate) step: Held,
+    pub(crate) pair: Held,
+    pub(crate) prefill: Held,
+}
+
+impl Wrote {
+    /// Every arena's positions from `pos` on taken back.
+    pub(crate) fn cut(&mut self, pos: u32) {
+        for h in [&mut self.step, &mut self.pair, &mut self.prefill] {
+            h.cut(pos);
+        }
+    }
+
+    fn of(&self, walk: GlmArena) -> Held {
+        match walk {
+            GlmArena::Step => self.step,
+            GlmArena::Pair => self.pair,
+            GlmArena::Prefill => self.prefill,
+        }
+    }
+}
+
+/// What a walk's hidden rows are gathered for: the feed's source, its first
+/// position, its rows and their width.
+#[derive(Clone, Copy)]
+struct Want<'h> {
+    hidden: NextnHidden<'h>,
+    pos0: u32,
+    m: usize,
+    n: usize,
+}
+
 /// The target's streams a [`NextnHidden::Target`] feed reads: one buffer of
 /// rows of `4 · n_embd` values, or the verify's two rows apart.
 enum Src<'a> {
@@ -491,19 +575,22 @@ impl Src<'_> {
     }
 }
 
-/// The target's rows a walk of `m` rows of `n` values reads for `hidden`:
-/// `None` for rows from the host, else the arena's rows from `first` on.
-/// Refused by name: a host slice of other than `m · n` values, prompt-batch
-/// rows before any batch buffers, rows past the arena's.
+/// The target's rows a walk of `want.m` rows of `want.n` values from
+/// `want.pos0` reads for `want.hidden`: `None` for rows from the host, else
+/// the arena's rows from `first` on, which must hold positions `pos0 − 1 ..
+/// pos0 + m − 2` ([`Wrote`]). Refused by name: a host slice of other than
+/// `m · n` values, prompt-batch rows before any batch buffers, rows past the
+/// arena's buffers, a walk at position 0 (no target row before it), rows
+/// that hold other positions or none.
 fn hidden_src<'a>(
     s: &'a Scratch,
     prompt: &'a PromptState,
     pair0: &'a DeviceBuffer<f32>,
+    wrote: &Wrote,
     layers: usize,
-    hidden: NextnHidden<'_>,
-    m: usize,
-    n: usize,
+    want: Want<'_>,
 ) -> Result<Option<(Src<'a>, usize)>, GpuError> {
+    let Want { hidden, pos0, m, n } = want;
     let fin = crate::program::final_streams(layers);
     let (walk, first) = match hidden {
         NextnHidden::Host(v) if v.len() != m * n => {
@@ -517,12 +604,15 @@ fn hidden_src<'a>(
     };
     let src = match walk {
         GlmArena::Step => Src::Rows {
-            buf: &s.rows[0].streams[fin],
+            buf: &s.row0.streams[fin],
             rows: 1,
         },
         GlmArena::Pair => Src::Pair {
             row0: pair0,
-            row1: &s.rows[1].streams[fin],
+            row1: &s
+                .row(1)
+                .ok_or_else(|| shape("the pair arena on a load of one KDA lane".to_string()))?
+                .streams[fin],
         },
         GlmArena::Prefill => {
             let (buf, rows) = prompt
@@ -541,19 +631,36 @@ fn hidden_src<'a>(
             first + m
         )));
     }
+    let at = pos0.checked_sub(1).ok_or_else(|| {
+        shape(format!(
+            "the {walk:?} arena's rows for a walk at position 0: the target holds no row before \
+             it (a host zero row is position 0's)"
+        ))
+    })?;
+    let held = wrote.of(walk);
+    if !held.holds(first, m, at) {
+        return Err(shape(format!(
+            "rows {first}..{} of the {walk:?} arena as positions {at}..{} for a walk from {pos0}: \
+             the arena holds {}",
+            first + m,
+            at as usize + m,
+            held.shown()
+        )));
+    }
     Ok(Some((src, first)))
 }
 
 /// The walk's `m` hidden rows into `a.hn`, normed as the target's head
 /// norms them: copied from the host, or each target row's streams' mean
-/// then the `output_norm` RMS.
+/// then the RMS by the target's `output_norm` (`norm`).
 #[allow(
     clippy::too_many_arguments,
-    reason = "the card, the target's weights, the kernels and widths, the feed's source resolved and its rows, and the arena (rust-quality R8)"
+    reason = "the card, the target's weights and its norm's name, the kernels and widths, the feed's source resolved and its rows, and the arena (rust-quality R8)"
 )]
 fn enqueue_hidden(
     gpu: &Gpu,
     tw: &Weights,
+    norm: &str,
     k: &Kernels,
     d: &Dims,
     hidden: NextnHidden<'_>,
@@ -575,7 +682,7 @@ fn enqueue_hidden(
             gpu.elem().enqueue_rms_norm(
                 stream,
                 &a.hid,
-                f32v(tw, &names::output_norm())?,
+                f32v(tw, norm)?,
                 d.rms_eps,
                 n,
                 m,
@@ -590,6 +697,12 @@ fn enqueue_hidden(
 }
 
 impl Body {
+    /// The step arena's rows written by a call that is no step (a gate's
+    /// forced row): the arena holds no position until the next step.
+    pub(crate) fn overwrote_step_arena(&mut self) {
+        self.wrote.step = Held::NONE;
+    }
+
     /// The NextN layer, when the load carries it.
     #[must_use]
     pub fn nextn(&self) -> Option<&Nextn> {
@@ -608,7 +721,7 @@ impl Body {
     /// captured walk, rows outside 1..=[`WALK_ROWS`], a token past the
     /// vocabulary, rows past the store, a walk from past [`Nextn::held`], a
     /// hidden slice of other than the rows' values, target rows the arena
-    /// does not hold.
+    /// does not hold at the walk's positions ([`Wrote`]).
     fn nextn_run(
         &mut self,
         gpu: &Gpu,
@@ -625,6 +738,7 @@ impl Body {
             prompt,
             embd,
             nextn,
+            wrote,
             ..
         } = self;
         let nx = nextn
@@ -665,7 +779,13 @@ impl Body {
                 embd.n_vocab
             )));
         }
-        let src = hidden_src(s, prompt, &nx.pair0, layers, feed.hidden, m, n)?;
+        let want = Want {
+            hidden: feed.hidden,
+            pos0: feed.pos0,
+            m,
+            n,
+        };
+        let src = hidden_src(s, prompt, &nx.pair0, wrote, layers, want)?;
         let stream = gpu.stream();
         let fault = gpu.layer_sink(nx.index)?;
         let Nextn {
@@ -694,7 +814,7 @@ impl Body {
         span_mut(WHAT, &mut a.emb, 0, m * n)?.copy_from_host(stream, &a.e_host[..m * n])?;
         span_mut(WHAT, &mut a.pos, 0, m)?.copy_from_host(stream, &a.pos_host[..m])?;
         span_mut(WHAT, &mut a.cnt, 0, m)?.copy_from_host(stream, &a.cnt_host[..m])?;
-        enqueue_hidden(gpu, tw, k, &d, feed.hidden, src, m, a)?;
+        enqueue_hidden(gpu, tw, &nm.output_norm, k, &d, feed.hidden, src, m, a)?;
         // Each row's [enorm(e) | hnorm(h)], then eh_proj over the columns.
         let (enorm, hnorm) = (f32v(w, &nm.enorm)?, f32v(w, &nm.hnorm)?);
         for t in 0..m {
@@ -748,6 +868,10 @@ impl Body {
             m,
             &mut a.stack,
         )?;
+        // From the first append on, rows from pos0 may be overwritten: a
+        // failure before the last leaves the store holding positions below
+        // pos0 alone.
+        *held = (*held).min(pos0);
         {
             let rows = span(WHAT, &a.stack, 0, m * stride)?;
             let pos = span(WHAT, &a.pos, 0, m)?;
@@ -969,12 +1093,13 @@ pub fn nextn_chain(
     Ok(1)
 }
 
-/// The `rows` hidden rows a walk fed `hidden` reads, as the walk norms them
-/// (the model's width a row), read back: the walk's own gather and nothing
-/// after it, the store untouched. Refused as a walk refuses its hidden rows
-/// and its rows' count. Blocking; gate use.
+/// The `rows` hidden rows a walk from `pos0` fed `hidden` reads, as the
+/// walk norms them (the model's width a row), read back: the walk's own
+/// gather and nothing after it, the store untouched. Refused as a walk
+/// refuses its hidden rows and its rows' count. Blocking; gate use.
 pub fn nextn_hidden(
     m: &mut GpuModel<Body>,
+    pos0: u32,
     hidden: NextnHidden<'_>,
     rows: usize,
 ) -> Result<Vec<f32>, GpuError> {
@@ -991,16 +1116,78 @@ pub fn nextn_hidden(
         s,
         prompt,
         nextn,
+        wrote,
         ..
     } = body;
     let nx = nextn
         .as_deref_mut()
         .ok_or_else(|| shape("hidden rows on a load without the NextN layer".to_string()))?;
-    let src = hidden_src(s, prompt, &nx.pair0, layers, hidden, rows, d.embd)?;
-    enqueue_hidden(gpu, tw, k, &d, hidden, src, rows, &mut nx.a)?;
+    let want = Want {
+        hidden,
+        pos0,
+        m: rows,
+        n: d.embd,
+    };
+    let src = hidden_src(s, prompt, &nx.pair0, wrote, layers, want)?;
+    enqueue_hidden(
+        gpu,
+        tw,
+        &nx.names.output_norm,
+        k,
+        &d,
+        hidden,
+        src,
+        rows,
+        &mut nx.a,
+    )?;
     let mut v = nx.a.hn.to_host_vec(gpu.stream())?;
     v.truncate(rows * d.embd);
     Ok(v)
+}
+
+/// The target's streams the `rows` hidden rows of a walk from `pos0` fed
+/// `hidden` are made from, read back: each row's `4 · n_embd` values as its
+/// arena holds them (stream-major), the rows the walk's gather reads.
+/// Refused as a walk refuses its target rows, and by name for rows from the
+/// host, which have no target streams. Blocking; gate use.
+pub fn nextn_target_streams(
+    m: &mut GpuModel<Body>,
+    pos0: u32,
+    hidden: NextnHidden<'_>,
+    rows: usize,
+) -> Result<Vec<f32>, GpuError> {
+    if !(1..=WALK_ROWS).contains(&rows) {
+        return Err(shape(format!(
+            "{rows} hidden rows; a walk takes 1..={WALK_ROWS}"
+        )));
+    }
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let layers = body.cfg.len();
+    let n = body.dims.embd;
+    let Body {
+        s,
+        prompt,
+        nextn,
+        wrote,
+        ..
+    } = body;
+    let nx = nextn
+        .as_deref()
+        .ok_or_else(|| shape("target rows on a load without the NextN layer".to_string()))?;
+    let want = Want {
+        hidden,
+        pos0,
+        m: rows,
+        n,
+    };
+    let (src, first) = hidden_src(s, prompt, &nx.pair0, wrote, layers, want)?
+        .ok_or_else(|| shape("rows from the host have no target streams".to_string()))?;
+    let wide = HC_STREAMS * n;
+    let mut out = Vec::with_capacity(rows * wide);
+    for t in 0..rows {
+        out.extend(src.row(first + t, wide)?.to_host_vec(gpu.stream())?);
+    }
+    Ok(out)
 }
 
 /// The last full walk's head logits (`n_vocab` f32). Blocking; gate use.

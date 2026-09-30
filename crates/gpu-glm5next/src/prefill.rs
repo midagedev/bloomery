@@ -91,8 +91,7 @@ use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 use super::nextn::GlmArena;
 use super::{
-    Body, Dims, Embedding, Glm5nextModel, LANES, Parts, Store, f32t, f32v, prompt, q8, shape,
-    weight,
+    Body, Dims, Embedding, Glm5nextModel, Parts, Store, f32t, f32v, prompt, q8, shape, weight,
 };
 use crate::ffn::{self, CardRows};
 use crate::host::GlmHost;
@@ -692,12 +691,12 @@ pub struct StoreDigest {
 pub fn store_digests(m: &mut Glm5nextModel) -> Result<Vec<StoreDigest>, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
     let stream = gpu.stream();
-    let lane = body.s.lanes.committed() as usize;
+    let lane = body.s.lanes.committed();
     let mut out = Vec::new();
     for (layer, s) in body.stores.iter().enumerate() {
         match s {
             Store::Kda { state, ring, .. } => {
-                for (what, b) in [("state", state.part(lane)), ("ring", ring)] {
+                for (what, b) in [("state", state.part(lane)?), ("ring", ring)] {
                     let words = b.to_host_vec(stream)?;
                     out.push(StoreDigest {
                         layer,
@@ -818,6 +817,7 @@ impl Body {
             card,
             embd,
             held,
+            wrote,
             dense,
             prompt,
             ..
@@ -850,6 +850,7 @@ impl Body {
         span_mut(WHAT, &mut bufs.cnt, 0, t)?.copy_from_host(stream, &bufs.cnt_host[..t])?;
         span_mut(WHAT, &mut bufs.vis, 0, 2 * t)?.copy_from_host(stream, &bufs.vis_host[..2 * t])?;
         *held = pos + t as u32;
+        wrote.prefill = super::nextn::Held::at(pos, t as u32);
         let cap = bufs.cap;
         let mut prog = PromptProgram {
             gpu,
@@ -1191,7 +1192,7 @@ impl PromptProgram<'_> {
                         decay: &b.decay,
                         lane: self.p.lane,
                         lane_at: 0,
-                        lanes: LANES,
+                        lanes: state.lanes().count(),
                         shape: d.kda,
                         m: t,
                         fault,

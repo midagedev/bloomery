@@ -26,9 +26,17 @@ impl MtpBody for Body {
     type Head = NextnHead;
     type Path = PrefillMode;
 
-    /// The full vocabulary: the load opens no row list.
-    fn head(_: &GpuModel<Body>) -> Result<NextnHead, GpuError> {
-        Ok(NextnHead::Full)
+    /// The full vocabulary: the load opens no row list. Refused by name on a
+    /// load without the NextN layer, so the window never opens over it.
+    fn head(m: &GpuModel<Body>) -> Result<NextnHead, GpuError> {
+        match m.body(WHAT)?.nextn() {
+            Some(_) => Ok(NextnHead::Full),
+            None => Err(GpuError::Shape {
+                what: WHAT,
+                detail: "an MTP draft on a load without the NextN layer (open_nextn loads it)"
+                    .to_string(),
+            }),
+        }
     }
 
     /// One row of the model's width ([`Body::nextn_hidden_width`]), normed
@@ -37,9 +45,15 @@ impl MtpBody for Body {
         Ok(m.body(WHAT)?.nextn_hidden_width())
     }
 
-    /// [`Nextn::held`]; 0 on a load without the layer.
+    /// [`Nextn::held`]; refused by name on a load without the layer.
     fn held(m: &GpuModel<Body>) -> Result<usize, GpuError> {
-        Ok(m.body(WHAT)?.nextn().map_or(0, Nextn::held))
+        m.body(WHAT)?
+            .nextn()
+            .map(Nextn::held)
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: "the draft's store on a load without the NextN layer".to_string(),
+            })
     }
 
     fn prompt_with(
