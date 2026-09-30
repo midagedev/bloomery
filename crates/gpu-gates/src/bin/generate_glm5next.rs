@@ -87,6 +87,12 @@
 //! then each step's), none between two timed steps. Refused by name beside
 //! the MTP draft, `--pair`, the route trace and `--prefill steps`.
 //!
+//! `BLOOMERY_STEP_STATS=1` reads the host tier before the first generated
+//! step and after each (`host_stats::Probe`) and prints, after `SMOKE`, a
+//! `stat step` record a step past `--warm` and one `stat summary` (kinds
+//! `stat_step_host`, `stat_summary_host`: each step's host leg, served slots, straggle and go-wait gaps). Refused
+//! by name beside the MTP draft.
+//!
 //! `BLOOMERY_ROUTE_TRACE=<dir>` writes the engine's route trace of the run
 //! into `dir`, a new directory made before the load
 //! (`crates/gpu/src/host/route_trace.rs`): every position's routed ids per
@@ -120,13 +126,14 @@ mod cli {
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{Lever38, residency38};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, R8, RESIDENCY, ROUTE_TRACE,
-        ResidencyPick, ResidencyWhy,
+        ResidencyPick, ResidencyWhy, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::glm5next::place::PlanInputs;
@@ -143,6 +150,7 @@ mod cli {
         ROUTE_TRACE,
         DRAFT,
         RESIDENCY,
+        STEP_STATS,
     ];
 
     /// The drafted window's verify: the target's next token and the draft's
@@ -313,6 +321,8 @@ mod cli {
                 Some("--logits (the drafted run's last call is a verify of two rows)")
             } else if levers.route_trace().is_some() {
                 Some("BLOOMERY_ROUTE_TRACE (the trace records one-row steps)")
+            } else if levers.step_stats() {
+                Some("BLOOMERY_STEP_STATS (the probes read the plain run's steps)")
             } else {
                 None
             };
@@ -469,12 +479,20 @@ mod cli {
         let mut tokens = vec![next];
         // (i, pos, token, ms): printed after the last step.
         let mut rows: Vec<(usize, u32, u32, f64)> = Vec::with_capacity(n_gen);
+        let stats = levers.step_stats();
+        let mut probes: Vec<Probe> = Vec::with_capacity(if stats { n_gen } else { 0 });
+        if stats {
+            probes.push(probe5(s.model(), None)?);
+        }
         for i in 1..n_gen {
             let pos = s.pos();
             let t = Instant::now();
             next = s.step(next, Want::Argmax)?.argmax();
             rows.push((i, pos, next, t.elapsed().as_secs_f64() * 1e3));
             tokens.push(next);
+            if stats {
+                probes.push(probe5(s.model(), probes.last())?);
+            }
         }
         let passes_ms = if pair {
             Some(pairs(&mut s, mode, fed_end, &tokens)?)
@@ -555,6 +573,7 @@ mod cli {
                 .f("tok/s(p50)", 1e3 / p50)
                 .print();
         }
+        print_stats(&probes, warm);
         for (kind, r) in s
             .model_mut()
             .body_parts("generate_glm5next")?
@@ -582,6 +601,11 @@ mod cli {
 
     /// The `fed` record, printed just before the feed's timer starts, after
     /// every capture: the runner counts the timed window's faults from it.
+    /// A [`Probe`] of the body's host tier, which a glm5next load always has.
+    fn probe5(m: &Glm5nextModel, prev: Option<&Probe>) -> Result<Probe, GateError> {
+        Probe::read(m.body("generate_glm5next")?.hybrid(), m.gpu(), prev)
+    }
+
     fn fed(ids: &[u32]) {
         let head: Vec<u32> = ids.iter().copied().take(4).collect();
         let tail: Vec<u32> = ids
