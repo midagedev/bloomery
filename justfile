@@ -1247,7 +1247,8 @@ gate-gpu-ds41-chat:
 # server it spawned and waits for it. Then the same server under BLOOMERY_DRAFT=dspark with the draft on the A6000
 # (BLOOMERY_DSPARK_CARD=A6000, the profile's DSPARK_MODEL): gate_ds41_serve --plain holds its greedy ids to the plain
 # server's and generate_ds41's, and checks /props' draft object and row, the draft counts in timings and /metrics, the
-# 400s for sampling and ignore_eos, and prefix reuse under the draft (a continuation, a cut, a resume) against
+# sampled and ignore_eos requests served by plain steps with no draft counted, and prefix reuse under the draft
+# (a continuation, a cut, a resume) against
 # cache_prompt: false. Then plan (b′) with the draft (--place bp: the A6000 plan (a), the 3090 the expert tier and the
 # draft): generate_ds41 --place bp under the draft, then gate_ds41_serve --place bp holds the server's greedy ids to it
 # (both under BLOOMERY_RESIDENCY=off: the fixed placement, whose card and host rounding do not move with a flip's timing) and
