@@ -1,0 +1,30 @@
+# Round glmwire's timed term: GLM-5.3-Flash decode through the NextN MTP window (BLOOMERY_DRAFT=mtp) on the
+# A6000, plan (a), prose ids, depth 512. Derivation [derived]: speed ratio = (1 + alpha) / (V2/S1 + D/S1), with
+# S1 = 47.7 ms (the plain step, 20.95 tok/s), V2/S1 = 1.13-1.51 (docs/cards/glmpair-probe.card), D = 2.4-2.7 ms
+# (layer 45: the card share, 874 MB of non-expert weights and the shared head, 1.29-1.42 ms plus launches; the host
+# share, 8 routed experts of 15.2 MB, 0.9-1.0 ms), alpha = 26/38 = 0.684 (gate_glm5next_mtp (w), the set's
+# 64-position prompt; ik 27/35 on the same set): 22.5-29.9 tok/s, centre 25.7. llama.cpp #27754's MTP arm read
+# 23.29 tok/s on this card; beating it needs V2/S1 <= 1.46 at this alpha (1.54 at ik's). Layer 45's routed
+# experts are in the load's host set, read in before the `fed` record, so the timed window takes no first-touch
+# read of them. The variable reaches generate_glm5next through BLOOMERY_BOX_ENV: the runner's ours command
+# inherits the environment (the reference arms ignore it).
+kind: baseline
+question: does GLM-5.3-Flash's NextN MTP window beat the plain step, and llama.cpp #27754's MTP arm, at depth 512?
+term: tok/s(mean) @ n=96, depth 512, A6000: the ours arm under BLOOMERY_DRAFT=mtp, 1e3 over its SMOKE mean_ms (the
+  kept positions' walls, each window's wall over the rows it kept), plan (a), prose ids
+unit: tok/s
+predict: 22.5..29.9
+condition: one lease, 2 rounds; every ours row prints an mtp summary with proposals above 0, and its tokens line
+  equals the plain run's of the same 512 ids (the functional run on the 3090 before the lease prints both; (w)
+  holds it on the set); no row carries [cpu-busy], [other-busy] or [cold]; the lcpp27754mtp arm in the same lease;
+  the full output to a file first. Command: BLOOMERY_DECODE_N=96 BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmwire-mtp.card BLOOMERY_DRAFT=mtp'
+  just depth-gpu-glm5next 512 lcpp27754mtp:512 > <log> 2>&1
+decide-in: land glmwire; the MTP row goes to rig-log beside the plain row; the accept-time chain overlap (the
+  next window's row 0 under the chain, -1 to -2.5 ms [derived]) is the next lever
+decide-below: take the V2/S1 probe (docs/cards/glmpair-probe.card) if it has not sat; if it has and sits in its
+  band, one nsys of the drafted window (the verify's host legs and the chain's walk) before any lever
+reason: the first timed number of GLM's MTP arm, the row the public table sets beside #27754's MTP arm; why
+  now: the CLI arm exists and the NextN load's host set holds layer 45
+decide-above: re-derive alpha at depth 512 on prose from the mtp summary's kept counts (0.684 is the set's
+  64-position prompt) and raise the model's alpha before the next round

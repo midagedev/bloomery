@@ -26,10 +26,13 @@
 //!   (`bloomery_gpu_glm5next::nextn_hidden`, the walk's own gather): the
 //!   set's prompt in batches and by steps leaves the same rows in the
 //!   prompt-batch and step arenas, bit for bit; the row at position `q`
-//!   within [`FREE_BAND`] of ik's warmup row at `q + 1` and closer than at
-//!   `q` or `q + 2`; a verify of two rows leaves in the pair arena the rows
-//!   two plain steps leave, bit for bit, and keeps them past its commit and
-//!   the next step.
+//!   closer to ik's warmup row at `q + 1` than to its rows `q` and `q + 2`,
+//!   each row's three distances printed, not held (no band in the tree
+//!   derives a row past a flip, and the set carries no routing to tell the
+//!   rows off every flip's path; the rows' value is held by (o), the drafts
+//!   = ik's); a verify of two
+//!   rows leaves in the pair arena the rows two plain steps leave, bit for
+//!   bit, and keeps them past its commit and the next step.
 //! - (t) the target is the NextN load's own: the plain run of the set's
 //!   prompt and [`N`] greedy ids on a load of the NextN plan's target plan
 //!   without the layer, and the same on the NextN load, give the same ids
@@ -46,6 +49,11 @@
 //!   slice of the wrong length, target rows past the arena's, and a chain
 //!   with own walks, in the store walk's mode or into no place; each leaves
 //!   the store's positions where they were.
+//! - (h) a fault in a chain poisons the model at once: the layer's
+//!   `shared_head_norm` gain's first value set to NaN, a chain from a reset
+//!   is a fault by name and leaves the model poisoned by that fault before
+//!   any target call, and a walk after it is refused as poisoned; the gain
+//!   put back and a reset, the same chain gives the clean chain's id.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -69,14 +77,16 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::rounding::q8_32_rel;
-    use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
+    use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
         Body, Glm5nextModel, GlmArena, GlmPromptSink, NextnFeed, NextnHead, NextnHidden, NextnMode,
         PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden, nextn_logits, nextn_walk,
         prompt_with, set_prefill,
     };
     use gguf::Split;
+    use model::arch::glm5next::names;
     use model::arch::glm5next::place::{NextnInputs, PlanInputs};
     use model::placement::{PlanLevers, workstation};
     use refset::arch::glm5next::{MODEL, MTP, MTP_SET};
@@ -102,14 +112,6 @@ mod gate {
     fn logits_band() -> f64 {
         11f64.sqrt() * q8_32_rel()
     }
-
-    /// PIN(2026-10-01): [provisional — backlog] our hidden rows after the
-    /// set's prompt against ik's warmup `inp_mtp_states`: the e2e gate's
-    /// `FREE_BAND`, its derivation over the layer outputs (√45 · 1.415e-2 ≈
-    /// 0.095) carried through the streams' mean and `output_norm`, which add
-    /// a rounding each; held here at 64 positions of drift where the e2e gate
-    /// holds it at 4, so a red here reads the drift first.
-    const FREE_BAND: f64 = 0.10;
 
     /// The deviation of `v` about its mean: the spread a ranking reads.
     fn spread(v: &[f32]) -> f64 {
@@ -499,9 +501,9 @@ mod gate {
     /// (p) the pairing: the hidden rows a walk fed the target's arenas reads.
     /// A prompt call's units in batches (the prompt-batch arena) and by steps
     /// (the step arena) leave the same rows bit for bit; the row at position
-    /// `q` lies within [`FREE_BAND`] of ik's warmup row at `q + 1` — ik's MTP
-    /// row `p` reads the target's hidden of `p − 1` — and closer than at `q`
-    /// or `q + 2`. Then a verify of two rows after the prompt leaves in the
+    /// `q` lies closer to ik's warmup row at `q + 1` — ik's MTP row `p` reads
+    /// the target's hidden of `p − 1` — than to its rows `q` and `q + 2`, the
+    /// distances printed. Then a verify of two rows after the prompt leaves in the
     /// pair arena the rows two plain steps leave in the step arena, bit for
     /// bit, and after its commit and one more step still does, the step arena
     /// holding the plain run's next row: the verify's row 0 kept past the
@@ -532,28 +534,30 @@ mod gate {
             return Ok(false);
         }
         let ik_row = |p: usize| &warm.states[p * hidden..(p + 1) * hidden];
-        let (mut worst, mut bad_band, mut bad_shift) = (0.0f64, 0usize, 0usize);
+        let (mut worst, mut bad_shift) = (0.0f64, 0usize);
         for q in 0..n - 1 {
             let ours = &batch[q * hidden..(q + 1) * hidden];
             let at = rel(ours, ik_row(q + 1));
             worst = worst.max(at);
-            if at > FREE_BAND {
-                bad_band += 1;
-            }
-            let off = [Some(q), (q + 2 < n).then_some(q + 2)];
-            if off
-                .into_iter()
-                .flatten()
-                .any(|o| rel(ours, ik_row(o)) <= at)
-            {
+            let before = rel(ours, ik_row(q));
+            let after = (q + 2 < n).then(|| rel(ours, ik_row(q + 2)));
+            let shifted = before <= at || after.is_some_and(|a| a <= at);
+            if shifted {
                 bad_shift += 1;
             }
+            println!(
+                "(p) row {q}: against ik's row {} {at:.3e}, row {q} {before:.3e}, row {} {}{}",
+                q + 1,
+                q + 2,
+                after.map_or_else(|| "-".to_string(), |a| format!("{a:.3e}")),
+                if shifted { " closer off its pair" } else { "" }
+            );
         }
-        let ik_ok = bad_band == 0 && bad_shift == 0;
+        let ik_ok = bad_shift == 0;
         ok &= ik_ok;
         println!(
-            "(p) our row at q against ik's warmup row q + 1, {} rows: worst {worst:.3e} (band \
-             {FREE_BAND:.2}), {bad_band} past it, {bad_shift} closer at q or q + 2 {}",
+            "(p) our row at q against ik's warmup row q + 1, {} rows: worst {worst:.3e} (printed), \
+             {bad_shift} closer at q or q + 2 {}",
             n - 1,
             verdict(ik_ok)
         );
@@ -888,6 +892,73 @@ mod gate {
         Ok(ok)
     }
 
+    /// Write `bytes` over the first value of the NextN layer's
+    /// `shared_head_norm` gain and return the bytes it replaced.
+    fn patch_head_norm(
+        m: &mut Glm5nextModel,
+        index: usize,
+        bytes: [u8; 4],
+    ) -> Result<[u8; 4], GateError> {
+        let name = names::nextn_shared_head_norm(index);
+        let nx = m
+            .body("patch_head_norm")?
+            .nextn()
+            .ok_or("the NextN load holds no NextN layer")?;
+        let Some(DevWeight::F32 { w: gain, .. }) = nx.weights().get(&name) else {
+            return Err(format!("{name} is not resident as F32").into());
+        };
+        patch_bytes(m.gpu().stream(), gain.buf(), 0, bytes)
+    }
+
+    /// (h): a NaN gain in the head's norm makes the chain's logits NaN; the
+    /// chain is a fault by name and the model poisoned by it at once, a walk
+    /// after it refused as poisoned; the gain put back and a reset, the
+    /// chain's id is the clean one.
+    fn chain_fault(m: &mut Glm5nextModel, index: usize, hidden: usize) -> Result<bool, GateError> {
+        let zeros = vec![0.0f32; hidden];
+        let tok = [1u32];
+        let feed = || f(&tok, 0, NextnHidden::Host(&zeros));
+        let mut out = [0u32; 1];
+        m.reset()?;
+        nextn_chain(m, feed(), 0, NextnHead::Full, NextnMode::Eager, &mut out)?;
+        let clean = out[0];
+        m.reset()?;
+        let old = patch_head_norm(m, index, f32::NAN.to_le_bytes())?;
+        let first =
+            nextn_chain(m, feed(), 0, NextnHead::Full, NextnMode::Eager, &mut out).map(|_| out[0]);
+        let poisoned = m.poisoned();
+        let walk = nextn_walk(m, feed(), NextnHead::Full, NextnMode::Store);
+        patch_head_norm(m, index, old)?;
+        m.reset()?;
+        let again =
+            nextn_chain(m, feed(), 0, NextnHead::Full, NextnMode::Eager, &mut out).map(|_| out[0]);
+        m.reset()?;
+        let named = match &first {
+            Err(GpuError::Fault { fault, .. }) => poisoned == Some(*fault),
+            _ => false,
+        };
+        let walk_refused = matches!(walk, Err(GpuError::Poisoned { .. }));
+        let ok = named && walk_refused && matches!(again, Ok(t) if t == clean);
+        let shown = |r: &Result<u32, GpuError>| match r {
+            Ok(t) => format!("id {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        println!(
+            "(h) NaN in the NextN head norm's gain, a chain: {} (want a fault), the model poisoned \
+             by {} (want the chain's fault), a walk after it: {}; the gain put back and a reset: \
+             {} (want the clean {clean}) {}",
+            shown(&first),
+            poisoned.map_or_else(|| "none".to_string(), |f| f.to_string()),
+            match &walk {
+                Ok(()) => "accepted".to_string(),
+                Err(e) => format!("error \"{e}\""),
+            },
+            shown(&again),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub(super) fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[])?;
         let dir = MTP.path(MTP_SET);
@@ -974,6 +1045,7 @@ mod gate {
 
         ok &= pos_mask(&set, hidden)?;
         ok &= refusals(&mut m, hidden)?;
+        ok &= chain_fault(&mut m, nextn.index, hidden)?;
         ok &= pairing(&mut m, &set, &prompt, hidden)?;
         ok &= oracle(&mut m, &set, hidden)?;
 

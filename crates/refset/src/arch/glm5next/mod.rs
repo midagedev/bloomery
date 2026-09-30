@@ -91,7 +91,7 @@ pub static MTP: Family = Family {
     build: Some(Build::Is(MTP_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-glm5next-mtp"],
 };
 
 /// ik's node dumps with its k-pool indexer on (`--dsa`): the selector's

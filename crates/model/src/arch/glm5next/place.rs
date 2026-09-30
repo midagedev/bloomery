@@ -19,8 +19,8 @@ use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::placement::workstation::GRANULE;
 use crate::placement::{
-    self, Card, CardFormat, CardTotals, Host, KvBytes, Machine, ModelTensor, ModelTensors,
-    PlacementError, Plan, PlanLevers, Unimplemented, Violation,
+    self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
+    ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
 };
 
 const F16_BYTES: u64 = 2;
@@ -355,6 +355,50 @@ impl NextnPlan<'_> {
     #[must_use]
     pub fn nextn_resident_bytes(&self) -> u64 {
         self.nextn.cards[0].dense_bytes + self.nextn.cards[0].expert_bytes
+    }
+
+    /// The NextN layer's host segments — its routed stacks, every expert —
+    /// as runs of the target plan's model: each stack's index among the
+    /// target's tensors (where it is [`placement::Role::Unused`]) and its
+    /// experts, the host set the load reads in beside the target's own.
+    /// With them, their file bytes (the segments' resident bytes).
+    /// Refused by name: a host segment of a tensor the target does not
+    /// carry, or of a whole tensor rather than an expert stack.
+    pub fn host_runs(&self) -> Result<(Vec<(usize, ExpertList)>, u64), PlacementError> {
+        let mut out = Vec::new();
+        let mut bytes = 0u64;
+        for row in &self.nextn.rows {
+            let t = self.nextn.model.tensors.get(row.tensor).ok_or_else(|| {
+                PlacementError::Host(format!(
+                    "a NextN plan row names tensor {}, past its model",
+                    row.tensor
+                ))
+            })?;
+            for seg in row
+                .segments
+                .iter()
+                .filter(|s| s.device == Device::Host && s.format == Format::HostFile)
+            {
+                let refuse = |detail: &str| PlacementError::Tensor {
+                    name: t.name.clone(),
+                    detail: detail.to_string(),
+                };
+                let experts = seg
+                    .experts
+                    .clone()
+                    .ok_or_else(|| refuse("a NextN host segment of a whole tensor"))?;
+                let at = self
+                    .plan
+                    .model
+                    .tensors
+                    .iter()
+                    .position(|u| u.name == t.name)
+                    .ok_or_else(|| refuse("is not among the target plan's tensors"))?;
+                out.push((at, experts));
+                bytes += seg.resident_bytes;
+            }
+        }
+        Ok((out, bytes))
     }
 }
 

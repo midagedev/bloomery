@@ -36,9 +36,10 @@
 //! last walk of the sequence, never past it ([`Nextn::held`]); the model's
 //! reset and a cut behind it move that end back.
 //!
-//! A fault a launch raises stays on the card's fault word: the chain's
-//! readback names it as the chain's error, and the target's next readback
-//! names it again and poisons the model.
+//! A fault a launch raises poisons the model as soon as a call of the
+//! program meets it ([`GpuModel::note_fault`]): the chain's readback, or a
+//! walk's host leg; until then it stays on the card's fault word, which the
+//! target's next readback names.
 
 use bloomery_gpu::head::{Head, HeadNorm};
 use bloomery_gpu::host::BatchLeg;
@@ -266,6 +267,13 @@ impl Nextn {
     #[must_use]
     pub fn ctx(&self) -> usize {
         self.ctx
+    }
+
+    /// The layer's own weights, which the load uploaded beside the
+    /// target's. Gate use: a fault clause patches one in place.
+    #[must_use]
+    pub fn weights(&self) -> &Weights {
+        &self.w
     }
 
     /// Device bytes of the layer's weights and store.
@@ -902,8 +910,9 @@ fn mcol(
 }
 
 /// One NextN walk of `feed` into `head` in `mode`, with no readback
-/// ([`Body::nextn_run`]'s refusals, and a poisoned model's). A fault the walk
-/// raises stays on the card's fault word, which the next readback names.
+/// ([`Body::nextn_run`]'s refusals, and a poisoned model's). A fault the
+/// walk's own calls meet is its error and poisons the model; one they do not
+/// read stays on the card's fault word, which the next readback names.
 pub fn nextn_walk(
     m: &mut GpuModel<Body>,
     feed: NextnFeed<'_>,
@@ -915,14 +924,16 @@ pub fn nextn_walk(
         return Err(GpuError::Poisoned { what: WHAT, fault });
     }
     let (gpu, tw, body) = m.body_parts(WHAT)?;
-    body.nextn_run(gpu, tw, feed, mode)
+    let r = body.nextn_run(gpu, tw, feed, mode);
+    m.note_fault(WHAT, r)
 }
 
 /// One window's chain, one readback: `refresh` walked eager through the head,
 /// its last row's prediction the proposal's one id, written to `out[0]`; the
 /// count, 1. `own` walks past it are refused by name (a proposal holds one
 /// id), as are a store walk's mode, a captured one and an `out` with no
-/// place. A fault any launch raised is the chain's error.
+/// place. A fault any launch raised is the chain's error and poisons the
+/// model as the target's would.
 pub fn nextn_chain(
     m: &mut GpuModel<Body>,
     refresh: NextnFeed<'_>,
@@ -950,7 +961,8 @@ pub fn nextn_chain(
         .nextn
         .as_deref()
         .ok_or_else(|| shape("a chain on a load without the NextN layer".to_string()))?;
-    let tokens = nx.head.tokens(gpu)?;
+    let read = nx.head.tokens(gpu);
+    let tokens = m.note_fault(WHAT, read)?;
     *place = *tokens
         .first()
         .ok_or_else(|| shape("a head readback of no token".to_string()))?;
