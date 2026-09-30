@@ -602,7 +602,7 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // 32,768 with the full 248,320-row head): each row's card experts plus
 // rounding fall by that arena to within the 2 MiB granules the spread fills
 // (25,165,824 B at 4k, 111,149,056–115,343,360 B at 32k) [derived]; the
-// values are the planner's on the box (the lead's window C, 2026-09-30),
+// values are the planner's on the box (the lead's landing window C),
 // which the old pins held red on this tree and green before the arena term.
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
