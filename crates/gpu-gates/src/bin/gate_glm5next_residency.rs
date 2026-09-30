@@ -22,10 +22,19 @@
 //!   batch service notes no id) and each step (1 kept) (mutant: the call
 //!   keeps its rows as a step's kind).
 //! - `transform`: after the history, every expert the machine admitted holds
-//!   in its slot, part by part, the bytes a static load uploads for it — on
-//!   a layer whose gate and up are Q4_K and on the one layer whose three
-//!   stacks are all Q5_K, whose parts are its own, not the Q4_K layers'
-//!   (mutant: every layer staged at the first card layer's part sizes).
+//!   in its slot, part by part, the bytes a static load uploads for it; and
+//!   the source's parts are the header's: each card layer's part sizes are
+//!   its three stacks' own (each stack's type and shape as the header states
+//!   them), the card layers hold one layout, and no layer whose down the
+//!   header gives as Q6_K holds a card part (mutant: every part of a layer
+//!   sized at its first stack's — the down's slots then sit at the gate's
+//!   stride, which the load's stack-size check, the byte check and `c1` all
+//!   pass, and the header's down size does not).
+//!   PIN(2026-10-01): the file's card layers share one part layout —
+//!   `card_routed` admits Q4_K and Q5_K alone and `eligible` needs every
+//!   stack of a layer routable, so the one Q5_K gate/up layer, whose down is
+//!   Q6_K, has no card slot — and per-layer part sizes are not exercised by
+//!   this file.
 //! - `steps` (the steps feed refused under the machine): a prompt fed one
 //!   decode step an id is refused by name while the machine runs, and the
 //!   batch feed still serves after it (mutant: the steps arm of the feed
@@ -60,7 +69,6 @@ mod gate {
     use app::{Loaded, OpenLog, Session, SessionError};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{Residency, SlotState, SwapMachine, SwapSource};
-    use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu::{GpuError, window};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
@@ -71,7 +79,7 @@ mod gate {
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::churn::ChurnPool;
-    use model::placement::{Machine, Plan, PlanLevers, workstation};
+    use model::placement::{Machine, ModelTensors, Plan, PlanLevers, workstation};
     use runtime::{Out, Target, Want};
 
     const NAME: &str = "gate_glm5next_residency";
@@ -305,18 +313,47 @@ mod gate {
         Ok(ok)
     }
 
-    /// The gate type of layer `l`'s stacks, as the resident weights hold
-    /// them; `None` on a layer without card experts.
-    fn gate_ty(s: &Session<Body>, l: usize) -> Option<GgmlType> {
-        match s.model().weights().get(&names::ffn_gate_exps(l)) {
-            Some(DevWeight::KQuant { ty, .. }) => Some(*ty),
-            _ => None,
+    /// Layer `l`'s parts as the header states them: per stack (gate, up,
+    /// down), its type and one expert's bytes from that type and the stack's
+    /// first two dims; `None` on a layer without the three stacks.
+    fn header_parts(
+        model: &ModelTensors,
+        l: usize,
+    ) -> Result<Option<Vec<(GgmlType, usize)>>, GateError> {
+        let names = [
+            names::ffn_gate_exps(l),
+            names::ffn_up_exps(l),
+            names::ffn_down_exps(l),
+        ];
+        let mut out = Vec::with_capacity(names.len());
+        for n in &names {
+            let Some(t) = model.tensors.iter().find(|t| &t.name == n) else {
+                return Ok(None);
+            };
+            let (Some(blck), Some(size)) = (t.ty.blck_size(), t.ty.type_size()) else {
+                return Err(format!("{n}: {:?}, a type the header cannot size", t.ty).into());
+            };
+            let [row, rows, ..] = t.dims[..] else {
+                return Err(format!("{n}: dims {:?}, not a stack of experts", t.dims).into());
+            };
+            if !row.is_multiple_of(blck) {
+                return Err(
+                    format!("{n}: rows of {row} values, not whole blocks of {blck}").into(),
+                );
+            }
+            out.push((t.ty, usize::try_from(size * (row / blck) * rows)?));
         }
+        Ok(Some(out))
     }
 
     /// `transform`: each admitted expert's slot against its static bytes,
-    /// part by part, on a Q4_K-gate layer and on the Q5_K one.
-    fn transform_clause(s: &Session<Body>, seeds: &[(usize, Vec<u32>)]) -> Result<bool, GateError> {
+    /// part by part; then every layer's parts in the source against the
+    /// header's.
+    fn transform_clause(
+        s: &Session<Body>,
+        model: &ModelTensors,
+        seeds: &[(usize, Vec<u32>)],
+    ) -> Result<bool, GateError> {
         let m = s.model();
         let b = m.body(NAME)?;
         let machine = machine_of(s)?;
@@ -325,15 +362,10 @@ mod gate {
             .ok_or("the load has no residency source")?;
         let (gpu, stream) = (m.gpu(), m.gpu().stream());
         stream.synchronize()?;
-        let mut checked = [0usize; 2];
-        let mut bad = [Vec::new(), Vec::new()];
+        let mut checked = 0usize;
+        let mut bad = Vec::new();
         for (l, seed) in seeds {
             let l = *l;
-            let class = match gate_ty(s, l) {
-                Some(GgmlType::Q4_K) => 0,
-                Some(_) => 1,
-                None => continue,
-            };
             let parts = source.part_bytes(l).len();
             let Some(row) = machine.ledger().row(l) else {
                 continue;
@@ -343,7 +375,7 @@ mod gate {
                 if seed.contains(&e) {
                     continue;
                 }
-                checked[class] += 1;
+                checked += 1;
                 for part in 0..parts {
                     let want = source.card_bytes(l, e, part)?;
                     let at = source.dest(l, part, slot as u32)?;
@@ -356,26 +388,71 @@ mod gate {
                     let got: Vec<u8> = got.iter().flat_map(|w| w.to_le_bytes()).collect();
                     if got != want {
                         let first = got.iter().zip(want).position(|(a, b)| a != b);
-                        bad[class].push(format!(
+                        bad.push(format!(
                             "layer {l} expert {e} slot {slot} part {part} at {first:?}"
                         ));
                     }
                 }
             }
         }
-        let ok = checked[0] > 0 && checked[1] > 0 && bad.iter().all(Vec::is_empty);
+        // The source's parts against the header, over every layer: the byte
+        // check above reads the source's own part sizes on both sides.
+        let mut cards = Vec::new();
+        let mut layouts: Vec<Vec<(GgmlType, usize)>> = Vec::new();
+        let mut off_header = Vec::new();
+        let mut q6k_down = Vec::new();
+        let mut on_q6k = Vec::new();
+        for l in 0..model.layers {
+            let parts = source.part_bytes(l);
+            let header = header_parts(model, l)?;
+            if header
+                .as_ref()
+                .is_some_and(|h| h.last().is_some_and(|&(ty, _)| ty == GgmlType::Q6_K))
+            {
+                q6k_down.push(l);
+                if !parts.is_empty() {
+                    on_q6k.push(l);
+                }
+                continue;
+            }
+            if parts.is_empty() {
+                continue;
+            }
+            cards.push(l);
+            match header {
+                Some(h) if h.iter().map(|&(_, n)| n).eq(parts.iter().copied()) => {
+                    if !layouts.contains(&h) {
+                        layouts.push(h);
+                    }
+                }
+                _ => off_header.push(l),
+            }
+        }
+        let layout = layouts
+            .iter()
+            .map(|h| {
+                let parts: Vec<String> = h.iter().map(|(ty, n)| format!("{ty:?} {n} B")).collect();
+                format!("[{}]", parts.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let ok = checked > 0
+            && bad.is_empty()
+            && !cards.is_empty()
+            && off_header.is_empty()
+            && layouts.len() == 1
+            && !q6k_down.is_empty()
+            && on_q6k.is_empty();
         println!(
-            "transform: {} admitted experts on Q4_K-gate layers, {} on the Q5_K one; parts \
-             differing from a static load {} and {}{}: {}",
-            checked[0],
-            checked[1],
-            bad[0].len(),
-            bad[1].len(),
-            bad[0]
-                .first()
-                .or(bad[1].first())
+            "transform: {checked} admitted experts on {} card layers, {} parts differing from a \
+             static load{}; card parts {layout} (layouts: {}), the header's on all but {off_header:?}; \
+             Q6_K-down layers {q6k_down:?}, those with card parts {on_q6k:?}: {}",
+            cards.len(),
+            bad.len(),
+            bad.first()
                 .map(|f| format!(" (first {f})"))
                 .unwrap_or_default(),
+            layouts.len(),
             verdict(ok)
         );
         Ok(ok)
@@ -449,7 +526,7 @@ mod gate {
         );
         pass &= passes_ok;
 
-        pass &= transform_clause(&s, &seeds)?;
+        pass &= transform_clause(&s, &inputs.model, &seeds)?;
         pass &= steps_clause(&mut s, &ids)?;
 
         let again = history(&mut s, &ids[..PROMPT])?;
