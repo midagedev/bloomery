@@ -81,8 +81,9 @@
 //! Under `BLOOMERY_DRAFT=mtp` (a qwen4exp file only; every other family and
 //! word is refused by name) the decode runs through the runtime's
 //! speculative loop with the file's MTP draft (`app::arch::qwen4exp`'s
-//! `MtpDraft` over the shared draft file beside the target, its head reduced
-//! under `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows — the target's
+//! `MtpDraft` over the shared draft file beside the target or
+//! `BLOOMERY_MTP_DRAFT`'s, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`):
+//! windows of four rows — the target's
 //! verify of the draft's three ids, the kept rows committed, the draft's
 //! next chain one readback — and the greedy ids are the plain run's. A
 //! `load draft=mtp` line follows the `load` line (the draft's resident
@@ -224,7 +225,7 @@ mod cli {
     };
     use model::placement::PlanLevers;
     use model::placement::workstation::{A6000, RTX_3090};
-    use refset::arch::qwen4exp::mtp::DRAFT;
+    use refset::arch::qwen4exp::mtp::draft_file;
     use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
     use std::num::NonZeroUsize;
     use std::path::{Path, PathBuf};
@@ -758,6 +759,7 @@ mod cli {
             bloomery_levers::ROUTE_TRACE,
             bloomery_levers::DRAFT,
             bloomery_levers::MTP_HEAD_ROWS,
+            bloomery_levers::MTP_DRAFT,
         ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
         let experts = experts38(&levers)?;
@@ -776,6 +778,13 @@ mod cli {
                 return Err(
                     "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's steps; --dump-taps runs \
                      a qwen3moe file"
+                        .into(),
+                );
+            }
+            if levers.mtp_draft().is_some() {
+                return Err(
+                    "BLOOMERY_MTP_DRAFT names a qwen4exp file's MTP draft; --dump-taps runs a \
+                     qwen3moe file"
                         .into(),
                 );
             }
@@ -861,6 +870,13 @@ mod cli {
             return Err(
                 "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; it needs BLOOMERY_DRAFT=mtp \
                  on a qwen4exp file"
+                    .into(),
+            );
+        }
+        if draft == Draft38::Off && levers.mtp_draft().is_some() {
+            return Err(
+                "BLOOMERY_MTP_DRAFT names the MTP draft file; it needs BLOOMERY_DRAFT=mtp on a \
+                 qwen4exp file"
                     .into(),
             );
         }
@@ -1366,8 +1382,8 @@ mod cli {
     }
 
     /// The Qwen3.8-Flash-Next model of `file` with its MTP draft loaded
-    /// beside it (`Body38::open_placed_mtp`, the shared draft file, its head
-    /// reduced under `BLOOMERY_MTP_HEAD_ROWS`): the `plan`, `load`, `load
+    /// beside it (`Body38::open_placed_mtp`, the draft file `draft_file`
+    /// picks, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`): the `plan`, `load`, `load
     /// draft=mtp` and `capture` lines of the plain open, the draft's own
     /// resident bytes, its program's arena and its head named on the draft's
     /// line. In graph mode the verify passes of 2 to 4 rows are captured by
@@ -1391,9 +1407,15 @@ mod cli {
             Some(p) => read_head_rows(p, &file, inputs.spec.vocab)?,
             None => HeadRows::Full,
         };
-        let draft_file =
-            Split::open(DRAFT).map_err(|e| format!("open the MTP draft {DRAFT}: {e}"))?;
-        let mtp = MtpInputs::read(&draft_file, &file, &inputs, rows)?;
+        let (draft_path, from) = draft_file(levers.mtp_draft(), &ref_model_path()?);
+        let draft_split = Split::open(&draft_path).map_err(|e| {
+            format!(
+                "open the MTP draft {} ({}): {e}",
+                draft_path.display(),
+                from.describe()
+            )
+        })?;
+        let mtp = MtpInputs::read(&draft_split, &file, &inputs, rows)?;
         let plan = inputs.plan_mtp_with(
             &machine,
             u64::try_from(ctx)?,
@@ -1419,7 +1441,7 @@ mod cli {
             0,
             levers.host(),
             ub,
-            &draft_file,
+            &draft_split,
             &mtp,
         )?;
         m.set_mode(mode);

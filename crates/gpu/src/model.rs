@@ -45,6 +45,7 @@ use cuda_core::CudaStream;
 use gguf::Split;
 use model::arch::Arch;
 use model::placement::churn::ChurnPool;
+use model::placement::workstation::{self, HostNeed};
 use model::placement::{ExpertList, Plan};
 use std::ops::Range;
 use std::sync::Arc;
@@ -561,7 +562,7 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        let (p, residency) = placed_pre(&file, plan, card, host, &[], derive)?;
+        let (p, residency) = placed_pre(&file, plan, card, host, (&[], 0), derive)?;
         let t_body = Instant::now();
         let body = body(&p.gpu, file, &p.weights, residency)?;
         placed_done(p, body, t_body.elapsed())
@@ -603,7 +604,9 @@ impl<B: ChainBody> GpuModel<B> {
         if let Some(p) = &churn {
             p.check(plan).map_err(|e| GpuError::plan(WHAT, e))?;
         }
-        let extra = churn.as_ref().map_or(&[][..], |p| p.runs.as_slice());
+        let extra = churn
+            .as_ref()
+            .map_or((&[][..], 0), |p| (p.runs.as_slice(), p.bytes));
         let file = Arc::new(file);
         let (p, set) = placed_pre(&file, plan, card, host, extra, derive)?;
         let t_body = Instant::now();
@@ -1159,16 +1162,20 @@ impl<B: ChainBody> GpuModel<B> {
 }
 
 /// The steps of a placed load before its body: the plan's card and context
-/// budget, the card, its weights with `derive`'s filings, and — after the
-/// uploads, so the card's file bytes have left the page cache first — the
-/// plan's host set read in and locked as `host` asks, with `extra` beside
-/// it. The pieces, and the host set.
+/// budget, the card, the host's memory against the plan's host need, the
+/// card's weights with `derive`'s filings, and — after the uploads, so the
+/// card's file bytes have left the page cache first — the plan's host set
+/// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
+/// bytes) beside it. The pieces, and the host set. Every placed load passes
+/// here, so the two refusals before any upload are made once: a plan's card
+/// that is not one visible device ([`workstation::card_on_host`]), and a
+/// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
 fn placed_pre(
     file: &Split,
     plan: &Plan<'_>,
     card: usize,
     host: HostCfg,
-    extra: &[(usize, ExpertList)],
+    extra: (&[(usize, ExpertList)], u64),
     derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
 ) -> Result<(PlacedPre, HostResidency), GpuError> {
     let what = "GpuModel::load_placed";
@@ -1182,9 +1189,14 @@ fn placed_pre(
         .filter(|&c| c > 0)
         .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
     let layers = spec.layers.clone();
+    let (extra, extra_bytes) = extra;
     let t = Instant::now();
-    let gpu = Gpu::for_card(&spec.name)?;
+    let gpu = Gpu::for_card(&spec.name).map_err(|e| card_refusal(what, &spec.name, e))?;
     let context = t.elapsed();
+    let available = workstation::host_available().map_err(|e| GpuError::plan(what, e))?;
+    HostNeed::of(plan, extra_bytes)
+        .check(available)
+        .map_err(|e| GpuError::plan(what, e))?;
     let t = Instant::now();
     let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
     let upload = t.elapsed();
@@ -1213,6 +1225,24 @@ fn placed_pre(
         },
         residency,
     ))
+}
+
+/// [`Gpu::for_card`]'s error `e` for the plan's card `name`, as the host
+/// shows it: the visible devices and the placement that fits them
+/// ([`workstation::card_on_host`]). When the devices cannot be listed, or
+/// exactly one is named like the card, the error is `e` itself.
+fn card_refusal(what: &'static str, name: &str, e: GpuError) -> GpuError {
+    let seen = (|| -> Result<Vec<String>, GpuError> {
+        let n = usize::try_from(cuda_core::Device::device_count()?)
+            .map_err(|_| GpuError::shape(what, "negative device count"))?;
+        (0..n)
+            .map(|o| crate::raw_device_name(cuda_core::Device::raw_device(o)?))
+            .collect()
+    })();
+    match seen.map(|seen| workstation::card_on_host(name, &seen)) {
+        Ok(Err(r)) => GpuError::plan(what, r),
+        Ok(Ok(_)) | Err(_) => e,
+    }
 }
 
 /// The placed load after its body, which took `built`: the output head the

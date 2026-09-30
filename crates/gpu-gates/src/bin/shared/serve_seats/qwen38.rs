@@ -45,8 +45,8 @@
 //!
 //! Under `BLOOMERY_DRAFT=mtp` the seat drives the session through the
 //! runtime's speculative loop with the shared window `app::mtp::MtpDraft` (the
-//! shared draft file beside the target, its head reduced under
-//! `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows, the greedy ids the
+//! shared draft file beside the target or `BLOOMERY_MTP_DRAFT`'s, its head
+//! reduced under `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows, the greedy ids the
 //! plain server's, `pass_rows` 4 and a sampling or id-banning request
 //! refused while a draft runs (the engine's own rule, a 400 naming the
 //! field). A `load draft=mtp` line follows the `load` line, and
@@ -73,7 +73,7 @@
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
 //! kinds and exits.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -95,7 +95,7 @@ use model::arch::qwen35moe::place::{
 };
 use model::placement::PlanLevers;
 use model::placement::workstation::{A6000, CardSpec, RTX_3090};
-use refset::arch::qwen4exp::mtp::DRAFT;
+use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, Saved, ServeError, Server,
@@ -119,6 +119,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::R8,
     bloomery_levers::DRAFT,
     bloomery_levers::MTP_HEAD_ROWS,
+    bloomery_levers::MTP_DRAFT,
 ];
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate] \
@@ -165,6 +166,18 @@ impl Place38 {
             Place38::Gate => RTX_3090,
         }
     }
+}
+
+/// The MTP draft file at `path`, which `from` picked; an error names both.
+fn open_draft(path: &Path, from: DraftFrom) -> Result<Split, GateError> {
+    Split::open(path).map_err(|e| {
+        format!(
+            "open the MTP draft {} ({}): {e}",
+            path.display(),
+            from.describe()
+        )
+        .into()
+    })
 }
 
 /// `BLOOMERY_QWEN38_EXPERTS` as the plan's expert rule.
@@ -243,9 +256,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 .into(),
         );
     }
+    if !mtp && levers.mtp_draft().is_some() {
+        return Err(
+            "BLOOMERY_MTP_DRAFT names the MTP draft file; it needs BLOOMERY_DRAFT=mtp".into(),
+        );
+    }
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let path = ref_model_path()?;
+    let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let template = match &a.template_file {
@@ -284,8 +303,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
                 Some(p) => read_head_rows(p, &split, inputs.spec.vocab)?,
                 None => HeadRows::Full,
             };
-            let draft =
-                Split::open(DRAFT).map_err(|e| format!("open the MTP draft {DRAFT}: {e}"))?;
+            let draft = open_draft(&draft_path, draft_from)?;
             Some(MtpInputs::read(&draft, &split, &inputs, rows)?)
         }
     };
@@ -339,6 +357,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         path: path.clone(),
         mtp,
         head_rows,
+        draft_path,
+        draft_from,
         draft_bytes,
     };
     // The prompt cache is off (its budget 0): the seat keeps no prefix
@@ -382,6 +402,9 @@ struct SeatArgs {
     mtp: bool,
     /// `BLOOMERY_MTP_HEAD_ROWS`, the draft head's row list.
     head_rows: Option<std::path::PathBuf>,
+    /// The MTP draft file under `mtp`, and what picked it.
+    draft_path: PathBuf,
+    draft_from: DraftFrom,
     /// The plan's `draft` class bytes, which `/props` files.
     draft_bytes: u64,
 }
@@ -396,6 +419,8 @@ struct Q38 {
     ctx: usize,
     /// The plan's draft card bytes and arena, for `/props`' `draft` class.
     draft_bytes: u64,
+    /// The MTP draft file, which `/props`' `draft` names.
+    draft_path: PathBuf,
 }
 
 impl Q38 {
@@ -432,8 +457,7 @@ impl Q38 {
                     Some(p) => read_head_rows(p, &file, inputs.spec.vocab)?,
                     None => HeadRows::Full,
                 };
-                let draft =
-                    Split::open(DRAFT).map_err(|e| format!("open the MTP draft {DRAFT}: {e}"))?;
+                let draft = open_draft(&a.draft_path, a.draft_from)?;
                 let mtp = MtpInputs::read(&draft, &file, &inputs, rows)?;
                 let plan = inputs.plan_mtp_with(
                     &machine,
@@ -515,6 +539,7 @@ impl Q38 {
             drafted,
             ctx: a.ctx,
             draft_bytes: a.draft_bytes,
+            draft_path: a.draft_path,
         })
     }
 }
@@ -603,10 +628,13 @@ impl Seat for Q38 {
             }
         }
         p.draft = Some(DraftProps {
-            model: "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf".to_owned(),
+            model: self.draft_path.file_name().map_or_else(
+                || self.draft_path.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            ),
             n_max: Some(<Body38 as MtpBody>::WIDTH as u64),
             kind: Some("mtp".to_owned()),
-            path: Some(DRAFT.to_owned()),
+            path: Some(self.draft_path.display().to_string()),
             device: None,
         });
         p
