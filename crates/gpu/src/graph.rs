@@ -446,10 +446,18 @@ impl MappedHost {
         self.host.wrapping_add(off)
     }
 
+    /// Whether the `len` f32 at byte `off` lie inside the allocation, with no
+    /// wrap for an `off` or `len` near `usize::MAX`.
+    fn holds(&self, off: usize, len: usize) -> bool {
+        len.checked_mul(4)
+            .and_then(|n| off.checked_add(n))
+            .is_some_and(|end| end <= self.bytes)
+    }
+
     /// The u32 at byte `off` as an atomic; `None` when it is not 4-aligned
     /// or passes the allocation.
     pub(crate) fn atomic_u32(&self, off: usize) -> Option<&AtomicU32> {
-        if !off.is_multiple_of(4) || off + 4 > self.bytes {
+        if !off.is_multiple_of(4) || off.checked_add(4).is_none_or(|end| end > self.bytes) {
             return None;
         }
         // SAFETY: the word is 4-aligned and inside the allocation (checked
@@ -463,7 +471,7 @@ impl MappedHost {
     /// 4-aligned or past the allocation. `&mut self` makes it the only host
     /// reference; the owner's protocol keeps the card off the span meanwhile.
     pub(crate) fn f32_mut(&mut self, off: usize, len: usize) -> Option<&mut [f32]> {
-        if !off.is_multiple_of(4) || off + 4 * len > self.bytes {
+        if !off.is_multiple_of(4) || !self.holds(off, len) {
             return None;
         }
         // SAFETY: the span is inside the allocation and 4-aligned (checked
@@ -473,7 +481,7 @@ impl MappedHost {
 
     /// A copy of the `len` f32 at byte `off`, when inside the allocation.
     pub(crate) fn f32_copy(&self, off: usize, len: usize) -> Option<Vec<f32>> {
-        if !off.is_multiple_of(4) || off + 4 * len > self.bytes {
+        if !off.is_multiple_of(4) || !self.holds(off, len) {
             return None;
         }
         let mut out = vec![0.0f32; len];
