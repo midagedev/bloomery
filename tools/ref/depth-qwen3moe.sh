@@ -76,8 +76,8 @@
 #            variables. Refused by name before anything runs: a corpus file that is missing or
 #            unreadable (under --parse-arms one names itself on the arm's line instead), a P past its
 #            line count, a P < 1, a line among its first P that is not one id, and prose: on a
-#            reference, server or bin: arm — a corpus arm feeds our binary (depth-ds41.sh's
-#            lcppsrv…:prose:<P> and bin:…:prose:<P> are not this runner's arms).
+#            reference or bin: arm — a corpus arm feeds our binary or a server (bin:…:prose:<P> is not
+#            this runner's arm; lcppsrv…:prose:<P> is, below).
 #   bin:<path>:<D>  a second generate_qwen3moe (an absolute path on the box, a base tree's build) at
 #             depth D with the ours arm's command line, row label `bin:<basename of its tree>` (the
 #             tree is the path above `target/`). Beside a plain `<D>` arm it is the same-lease A/B of
@@ -125,9 +125,20 @@
 #   lcppsrv:<D>, lcppsrvpp[<U>]:<P>, lcppsrvfit:<D>, lcppsrvppfit[<U>]:<P>  mainline warm, on our ids: the
 #             tree's llama-server at LCPP_GPU_FLAGS in its spellings (the fit twins at its fit), one process
 #             a row, a discarded POST /completion of lcg_prompt D (P), then the same timed: decode rows
-#             predicted_per_second at n_predict N, prompt rows prompt_per_second at n_predict 1, `ids=lcg`
-#             (depth-ds41.sh's arms of the same names; lcpp-warm.sh has the server's flags, its rates
-#             against llama-bench's and every failure that is a FAIL row). No corpus ids here.
+#             predicted_per_second at n_predict N (and their prompt_per_second a prefill record under the
+#             same label), prompt rows prompt_per_second at n_predict 1, `ids=lcg` (depth-ds41.sh's arms of
+#             the same names; lcpp-warm.sh has the server's flags, its rates against llama-bench's and
+#             every failure that is a FAIL row). The server's -c is ours' at that D or P: BLOOMERY_GEN_CTX,
+#             else D + N rounded up to 256 (docs/fair-measure.md 1.5), and an arm whose ids + n_predict + 1
+#             do not fit it is refused before the lease. An engine word takes its own flags, `+t<N>`,
+#             `+nopo<0|1>`, `+k<K>` (-t, -nopo, -ncmoe in place of the profile's: lcpp-warm.sh's Per-arm
+#             flags), its label with them.
+#   lcppsrv…:prose:<P>  a server arm fed the corpus's first P ids, the ids a prose:<P> arm feeds: row
+#             label `<engine>@prose`, `ids=prose`, in the prose tables beside ours@prose.
+# Every server row's first ids are held to ours' on the same ids (lcpp-warm.sh's Cross-check: the plain
+# `ours` and `ours@prose` rows' `tokens` lines); a server row whose first id parts from ours is a FAIL
+# xcheck line in the failed arms and drops out of the means and ratios; one that parts later is a
+# [xcheck-tail] line and stays.
 #   mrspp:<P> mistral.rs's prefill: mistralrs bench -f <MODEL> --prompt-len P --gen-len 1
 #             --iterations 1 --warmup 1 --max-seq-len C --pa-context-len C+32 $MRS_FLAGS, C = P + 1
 #             rounded up to 256 (or BLOOMERY_GEN_CTX): a gen length below 2 skips the decode case,
@@ -278,11 +289,23 @@
 # [derived]. ikpp<U> / lcpppp<U> interleaved with the default arm find the references' faster
 # setting; the line to beat is a reference at its fastest flags.
 #
+# Records in the row. Our row reads its engine's records through tools/bloomery/records.py by kind and
+# field (--bin generate_qwen3moe): under BLOOMERY_DRAFT=mtp the `mtp summary` (` | mtp E(4) <positions /
+# passes> = positions P / passes Q, kept [..]`), under BLOOMERY_STEP_STATS=1 the `stat summary`'s host slots
+# a token (` | host slots/token X`), and under adaptive residency the `residency lever` word and why and the
+# timed passes' `residency pass` fields (cold-blocks.sh's residency sums: ` | residency <word> (<why>)
+# passes n kept k landed l late t made m bytes b`), with each label's per-pass means after the tables. A
+# checked-in schema that declares no residency record reads none, and an arm that sets BLOOMERY_RESIDENCY
+# under it is a FAIL row naming the schema.
 # Co-tenants. A compute process on the other card is recorded ([other-busy], timing-card.sh), and
-# the arm's row ends in ` [other-busy]`; the closing summary counts those rows. This runner has no
-# CPU guard, so no row carries [cpu-busy]. A compute process on the timing card as an arm starts
-# holds the arm until it is gone, and after 10 minutes stops the runner with rc 75 and no summary
-# (guard_timing below).
+# the arm's row ends in ` [other-busy]`; the closing summary counts those rows. The CPU is checked before
+# and after every arm (guard_cpu, lease.sh, as depth-ds41.sh does: builds and the engines this runner did
+# not start, CPU_BUSY_COMMS with generate_qwen3moe, llama-server and mistralrs added unless
+# BLOOMERY_CPU_BUSY_COMMS names the list, past
+# BLOOMERY_CPU_BUSY_PCT percent of one cpu): a row that met it ends in ` [cpu-busy]`, before its
+# [other-busy]; Qwen3.8's host tier and a reference's host layers run on those cores. A compute process on
+# the timing card as an arm starts holds the arm until it is gone, and after 10 minutes stops the runner
+# with rc 75 and no summary (guard_timing below). BLOOMERY_OTHER_STRICT=1 aborts on either tag instead.
 #
 # Failures (depth-ds41.sh's contract; the FAIL row, the failed list and the drop are cold-blocks.sh's).
 # An arm that exits non-zero, prints no row (no SMOKE line or one without its p50 and mean, no time
@@ -302,6 +325,7 @@
 # may run, default 900: a hung arm ends at rc 124/137 as a FAIL row instead of holding the lease; a
 # shared load's process has that bound per arm and one more for its load, and one that prints nothing
 # for that long is killed),
+# BLOOMERY_GEN_PLACE (Qwen3.8 only: a or gate, passed as --place; unset passes none, the binary's a),
 # BLOOMERY_AB_ORDER, BLOOMERY_AB_WARMUP and BLOOMERY_WARM_ROWS (above), BLOOMERY_DRY=1 (print each arm's command line,
 # the binaries' tree lines and the rotation, or the blocks and their discards, then exit 0 before the
 # lease: nothing is loaded and nothing is timed).
@@ -314,7 +338,10 @@
 # profile's reference trees and flags are its own (models/qwen35moe.sh).
 #
 # Qwen3.8-Flash-Next runs under the qwen4exp profile (`just depth-gpu-qwen4exp`, BLOOMERY_MODEL=qwen4exp)
-# the same way: generate_qwen3moe opens Body38, its plan on the A6000 (`--place a`, the default),
+# the same way: generate_qwen3moe opens Body38, its plan on the A6000 (`--place a`, the default; under
+# BLOOMERY_GEN_PLACE=gate every ours arm runs `--place gate`, the 3090's plan, which needs the 3090 as the
+# timing card, BLOOMERY_TIMING_GPU, and the profile's -ncmoe is then the 3090's; each row's `load` line
+# must name the placement it was given, or the arm is a FAIL row),
 # each layer's routed expert prefix on the card as its budget holds and the rest on the host tier
 # (BLOOMERY_QWEN38_EXPERTS unset is `card`; an arm with no such variable is a card arm, and `…=host`
 # every routed expert on the host tier, the same-binary arm; a row of one does not share a table with
@@ -479,11 +506,29 @@ q3_self_test() {
   # A prose arm's NAME=VALUE list is a <D> arm's: the registry still gates it.
   run_parse BLOOMERY_DATA="$pt/data" -- prose:4@FOO=1
   want prose-lever 64 "FOO is no row of the lever registry"
-  # prose: is ours' corpus arm, never a reference's, a server's or a bin:'s.
+  # prose: feeds ours or a server, never a reference or a bin: arm.
   run_parse -- ik:prose:512
   want prose-ref 64 "ik: is a reference engine, which feeds its own prompt ids"
-  run_parse -- lcppsrv:prose:512
-  want prose-srv 64 "a server arm of this runner sends the LCG prompt's ids"
+  # A server arm on the prose ids, and the arms after it keep their own prompts: the lcg arm the LCG
+  # walk, the prose arm the corpus (a server arm that took no prompt slot swaps them).
+  run_parse BLOOMERY_DATA="$pt/data" -- lcppsrv:prose:512 lcppsrvpp4096+nopo0:prose:512 512 prose:512
+  want prose-srv 0 \
+    "[parse] lcppsrv:prose:512: kind=srv depth=512 label=lcppsrv@prose env=- load=(a process of its own)" \
+    "[parse] lcppsrvpp4096+nopo0:prose:512: kind=srv depth=512 label=lcppsrvpp4096+nopo0@prose env=- load=(a process of its own)" \
+    "[parse] load: $bin --arm <lcg_prompt 512> --arm <prose_prompt 512> -n 96 --ctx 768 --time --arm-sync"
+  run_parse BLOOMERY_DATA="$pt/data" -- lcppsrv:prose:702
+  want prose-srv-past 64 "a prose prompt of 702 ids; $pt/data/qwen3moe/corpus-prose.ids holds 701 (1..701)"
+  run_parse -- lcppsrv+x1:512
+  want srv-flag-bad 64 "'+x1' in 'lcppsrv+x1' is none of +t<N> (-t), +nopo<0|1> (-nopo), +k<K> (--n-cpu-moe)"
+  # The placement (BLOOMERY_GEN_PLACE): a qwen4exp file's only, in the load key and the command line.
+  run_parse BLOOMERY_GEN_PLACE=gate -- 6
+  want place-other-file 64 "BLOOMERY_GEN_PLACE=gate: only a qwen4exp file takes --place"
+  out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen4exp BLOOMERY_AB_ROUNDS=2 BLOOMERY_GEN_PLACE=gate "$BASH" "$me" --parse-arms 6 2>&1)
+  rc=$?
+  want place-gate 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256|place=gate" \
+    "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --place gate --time --arm-sync"
+  run_parse BLOOMERY_GEN_PLACE=b -- 6
+  want place-bad 64 "BLOOMERY_GEN_PLACE is a (the A6000's plan) or gate (the 3090's)"
   run_parse -- bin:/root/r/t/release/generate_qwen3moe:prose:512
   want prose-bin 64 "a bin: arm is another build, run as it is (on the LCG prompt)"
   rm -rf "$pt"
@@ -527,7 +572,15 @@ ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate_qwen3moe}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 GEN_CTX=${BLOOMERY_GEN_CTX:-}
+PLACE=${BLOOMERY_GEN_PLACE:-}
 DRY=${BLOOMERY_DRY:-}
+case $PLACE in
+  '') ;;
+  a | gate)
+    [ "$MODEL_NAME" = qwen4exp ] || { echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=$PLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)" >&2; exit 64; }
+    ;;
+  *) echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE is a (the A6000's plan) or gate (the 3090's), or unset (no --place: the binary's a), got '$PLACE'" >&2; exit 64 ;;
+esac
 case $GEN_CTX in
   *[!0-9]* | 0) echo "depth-qwen3moe.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
 esac
@@ -702,12 +755,20 @@ for a in "${ARMS[@]}"; do
     *:*) arm_refuse "$a" "'@' sets a lever of ours, and ${a%%:*}: is a reference engine's arm — a lever of ours is not a reference's" ;;
   esac
   if srv_eng "$eng"; then
-    case $dep in prose:*) arm_refuse "$a" "prose:<P> is ours on the corpus's first P ids, and a server arm of this runner sends the LCG prompt's ids" ;; esac
+    ids=lcg label=$eng
+    case $dep in
+      prose:*)
+        dep=${dep#prose:} ids=prose label=$eng@prose
+        case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
+        corpus_check "$a" "$dep"
+        tok=$(corpus_ids "$dep")
+        ;;
+    esac
     case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
     [ "$dep" -ge 1 ] || { echo "depth-qwen3moe.sh: arm '$a': a server arm sends at least one id" >&2; exit 64; }
     srv_check_arm "$a" || { echo "depth-qwen3moe.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     srv=1
-    A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$eng") A_ENG+=("$eng") A_BIN+=('') A_IDS+=(lcg) A_ENV+=('')
+    A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_IDS+=("$ids") A_ENV+=('') A_TOK+=("$tok")
     continue
   fi
   case $a in
@@ -805,7 +866,7 @@ arm_env_list() {
 for i in "${!ARMS[@]}"; do
   LG_KEY[i]=
   [ "${A_KIND[$i]}" = ours ] || continue
-  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")"
+  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")${PLACE:+|place=$PLACE}"
   [ -n "${A_ENV[$i]}" ] || continue
   env_key=$(lg_env_key "$(arm_env_list "$i")")
   [ -z "$env_key" ] || LG_KEY[i]+="|$env_key"
@@ -828,8 +889,12 @@ lg_cmd() {
   LG_CMD=("$BIN")
   for i in "$@"; do LG_CMD+=(--arm "$(arm_prompt "$i")"); done
   # shellcheck disable=SC2206 # an empty WARM adds nothing
-  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" --time ${WARM:+--warm "$WARM"} --arm-sync)
+  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" ${PLACE:+--place "$PLACE"} --time ${WARM:+--warm "$WARM"} --arm-sync)
 }
+# srv_ctx_of <i> <n_predict>: a server arm's -c, ours' context at its D or P (lcpp-warm.sh's Context).
+srv_ctx_of() { echo "${GEN_CTX:-$(((A_DEP[$1] + N + 255) / 256 * 256))}"; }
+# shellcheck disable=SC2034 # read by lcpp-warm.sh's srv_cmd_of
+SRV_CTX_SRC="ours' --ctx at that D or P: ${GEN_CTX:+BLOOMERY_GEN_CTX }${GEN_CTX:-D + N rounded up to 256}"
 # --parse-arms: the arms as parsed and each round's order, then exit before the card, the binaries and
 # the lease.
 if [ -n "$PARSE_ONLY" ]; then
@@ -878,6 +943,20 @@ timing_cards_mode || exit $?
 TC_ARMS=()
 for i in "${!ARMS[@]}"; do TC_ARMS+=("${ARMS[$i]}" "${A_KIND[$i]}" "${A_ENG[$i]}"); done
 timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
+# Qwen3.8's placement names its card (workstation::plan_a, plan_gate: the card found by name), and the arms
+# see the timing card only.
+if [ "$ours" = 1 ] && [ -n "$PLACE" ]; then
+  want=$GPU_A6000
+  [ "$PLACE" = a ] || want=$GPU_3090
+  if [ -z "$want" ]; then
+    echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=$PLACE loads on the $([ "$PLACE" = a ] && echo A6000 || echo 3090), and tools/ref/cards.sh resolved no UUID for it (${CARDS_ERROR:-no reason given})" >&2
+    exit 64
+  fi
+  [ "$TIMING_GPU" = "$want" ] || {
+    echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=$PLACE loads on the $([ "$PLACE" = a ] && echo A6000 || echo 3090), and the timing card is $TIMING_GPU (BLOOMERY_TIMING_GPU): generate_qwen3moe would refuse every arm" >&2
+    exit 64
+  }
+fi
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
@@ -892,6 +971,22 @@ T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
 # recipe skips the build) nor reads it, so its freshness is not asked. A dry run asks nothing of
 # our binary: it prints the command line it would run.
 if [ "$ours" = 1 ] && [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?; fi
+# The residency records (cold-blocks.sh's residency sums): Q_RES 0 when generate_qwen3moe's checked-in
+# schema declares them, 1 when it declares none (an arm that sets BLOOMERY_RESIDENCY then fails by name).
+Q_RES=0
+res_kinds generate_qwen3moe || Q_RES=$?
+[ "$Q_RES" != 2 ] || { echo "depth-qwen3moe.sh: $RS_WHY" >&2; exit 2; }
+# res_asked <i>: the BLOOMERY_RESIDENCY arm <i> runs with (its own list's, else the runner's), empty when
+# neither sets it.
+res_asked() {
+  local e v=${BLOOMERY_RESIDENCY:-}
+  local -a kv=()
+  [ -z "$(arm_env_list "$1")" ] || IFS=, read -r -a kv <<< "$(arm_env_list "$1")"
+  for e in ${kv[@]+"${kv[@]}"}; do
+    case $e in BLOOMERY_RESIDENCY=*) v=${e#*=} ;; esac
+  done
+  echo "$v"
+}
 # A bin:<path> arm's binary is checked where its tree line is taken, below.
 if [ "$ik" = 1 ]; then [ -x "$IKBIN" ] || { echo "depth-qwen3moe.sh: no llama-bench at $IKBIN" >&2; exit 2; }; fi
 if [ "$lcpp" = 1 ]; then [ -x "$LCPPBIN" ] || { echo "depth-qwen3moe.sh: no llama-bench at $LCPPBIN" >&2; exit 2; }; fi
@@ -902,6 +997,9 @@ fi
 if [ "$mrs" = 1 ]; then [ -x "$MRSBIN" ] || { echo "depth-qwen3moe.sh: no mistralrs at $MRSBIN" >&2; exit 2; }; fi
 SRVBIN=
 [ "$srv" = 0 ] || srv_preflight depth-qwen3moe.sh
+# The CPU guard's names: builds and the engines this runner did not start (its own arms run under its pid);
+# a BLOOMERY_CPU_BUSY_COMMS the caller gives is the whole list.
+[ -n "${BLOOMERY_CPU_BUSY_COMMS:-}" ] || CPU_BUSY_COMMS="$CPU_BUSY_COMMS generate_qwen3moe llama-server mistralrs"
 if [ -n "$TIMING_CARDS" ]; then
   CARD_NAME=$TIMING_CARDS_NAME
 else
@@ -1079,6 +1177,7 @@ ref_arm() {
   mark=$(cat "$markf")
   rm -f "$markf"
   witness "post r$r $eng d=$dep"
+  guard_cpu "post r$r $eng d=$dep"
   # Two cards: an Xid, a card lost or off its cap, or an engine that saw one card fails the arm.
   if ! timing_cards_arm "$raw"; then
     arm_fail "$r" "$eng" "$key" "$rc" "two cards: $TWOCARD_WHY" "$raw"
@@ -1137,20 +1236,22 @@ ref_arm() {
   # Under the warm rows a tagged first run prints as COLD, a tagged retry as its FAIL row (cold-blocks.sh).
   cold_verdict "$r" "$eng" "$key" "$cnt" "$win" || return 0
   if pp_eng "$eng"; then
-    echo "$ROW_TAG r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME$FIT_COL | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$OTHER_BUSY_TAG$MAJ_COL$COLD_TAG"
+    echo "$ROW_TAG r$r $eng p=$dep n=0 | tok/s(pp) $val @ n=0, prompt $dep, $CARD_NAME$FIT_COL | $REF_BATCH | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG$MAJ_COL$COLD_TAG"
     counted || return 0
-    pp_sums+=("$eng|$dep|$r|$val|$OTHER_BUSY_TAG$COLD_TAG")
+    pp_sums+=("$eng|$dep|$r|$val|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
   else
-    echo "$ROW_TAG r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME$FIT_COL | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$OTHER_BUSY_TAG$MAJ_COL$COLD_TAG"
+    echo "$ROW_TAG r$r $eng d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME$FIT_COL | build ${build:-?} | device ${dev:-?} | wall $((t1 - t0))s$CPU_BUSY_TAG$OTHER_BUSY_TAG$MAJ_COL$COLD_TAG"
     counted || return 0
-    sums+=("$eng|$dep|$r|$val||$OTHER_BUSY_TAG$COLD_TAG")
+    sums+=("$eng|$dep|$r|$val||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
   fi
   count_row
 }
 
-# The closing summary's row counts: every ROW line, and those that carried [other-busy] and [cold].
+# The closing summary's row counts: every ROW line, and those that carried [cpu-busy], [other-busy] and
+# [cold].
 count_row() {
   n_rows=$((n_rows + 1))
+  [ -z "$CPU_BUSY_TAG" ] || busy_rows=$((busy_rows + 1))
   [ -z "$OTHER_BUSY_TAG" ] || other_rows=$((other_rows + 1))
   [ -z "$COLD_TAG" ] || cold_rows=$((cold_rows + 1))
 }
@@ -1189,7 +1290,7 @@ ours_arm() {
   ours_pre "$i" "$r"
   t0=$(date +%s)
   f0=$(majflt_now)
-  out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" --time ${WARM:+--warm "$WARM"} 2>&1)
+  out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${PLACE:+--place "$PLACE"} --time ${WARM:+--warm "$WARM"} 2>&1)
   rc=$?
   f1=$(majflt_now)
   t1=$(date +%s)
@@ -1203,9 +1304,10 @@ ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N ctx=$(arm_ctx "
 # and mean, no time prompt row). An output that opens with an `arm` line (an --arm list's) gives the
 # row its slot in the load. MAJ_WHOLE and MAJ_TIMED are the arm's (the driver's, or ours_arm's).
 ours_post() {
-  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot='' win timed
+  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot='' win timed ran mtp=''
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} ctx=$(arm_ctx "$i")
   witness "post r$r $label d=$dep n=$N ctx=$ctx"
+  guard_cpu "post r$r $label d=$dep"
   a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
   [ -z "$a" ] || slot=" | slot $((${a% *} + 1))/${a#* }"
   if [ "$rc" -ne 0 ]; then
@@ -1221,6 +1323,38 @@ ours_post() {
     return 0
   fi
   pp_col "${A_KIND[$i]}" "$out" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"; return 0; }
+  # The placement it was given: its own `load` line, or its load's (LG_HEADER).
+  if [ -n "$PLACE" ]; then
+    ran=$(printf '%s\n%s\n' "$out" "${LG_HEADER:-}" | sed -n 's/^load .* place=\([a-z]*\).*/\1/p' | head -n 1)
+    [ "$ran" = "$PLACE" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its load line names place=${ran:-none}; the runner passed --place $PLACE" "$out"; return 0; }
+  fi
+  # Under BLOOMERY_DRAFT=mtp the `mtp summary` record: E(4), the positions a four-row window kept on
+  # average, beside the per-position rate the SMOKE mean already is. Under BLOOMERY_STEP_STATS=1 the
+  # `stat summary` record's host slots a token. Both through records.py, by kind and field.
+  local MK='' MP='' MQ='' HS='' rec lines n_mtp
+  if ! rec=$(python3 "$RS_RECORDS" sh --bin generate_qwen3moe - 'MK=mtp_summary.kept' 'MP=mtp_summary.positions' \
+    'MQ=mtp_summary.passes' 'HS=stat_summary_host.host_slots_mean' <<< "$out" 2>&1) ||
+    ! lines=$(python3 "$RS_RECORDS" lines --bin generate_qwen3moe - mtp_summary <<< "$out" 2>&1); then
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "records.py did not read its mtp and stat records: $rec${lines:+ $lines}" "$out"
+    return 0
+  fi
+  n_mtp=$(grep -c . <<< "$lines")
+  eval "$rec"
+  mtp=''
+  if [ "$n_mtp" -gt 0 ]; then
+    [ -n "$MK" ] && [ -n "$MP" ] && [ -n "$MQ" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its mtp summary record has no kept, positions or passes (kept='$MK' positions='$MP' passes='$MQ')" "$out"; return 0; }
+    mtp=" | mtp E(4) $(awk -v p="$MP" -v q="$MQ" 'BEGIN { printf "%.3f", (q > 0) ? p / q : 0 }') = positions $MP / passes $MQ, kept $MK"
+  fi
+  [ -z "$HS" ] || mtp+=" | host slots/token $HS"
+  # The residency records: the lever and the timed passes' sums (cold-blocks.sh's residency sums).
+  RS_WORD='' RS_COL=''
+  if [ "$Q_RES" = 0 ]; then
+    res_sums generate_qwen3moe "$out" "${LG_HEADER:-}" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$RS_WHY" "$out"; return 0; }
+  elif [ -n "$(res_asked "$i")" ]; then
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "the arm runs BLOOMERY_RESIDENCY=$(res_asked "$i"), and generate_qwen3moe's checked-in schema (tools/bloomery/schema/generate_qwen3moe.jsonl) declares no residency record, so its row cannot carry them: refresh the schema from the binary that prints them (just records-refresh)" "$out"
+    return 0
+  fi
+  mtp+=$RS_COL
   # The prompt_ids line is the whole prompt; the load, capture, step-0, time prompt and stat prompt
   # lines are the arm's configuration, the prefill's time and its host prologue; under
   # BLOOMERY_STEP_STATS the ubatch walk's split and per-layer-batch records follow.
@@ -1245,11 +1379,17 @@ ours_post() {
     timed='? (a one-arm run prints its prompt ids before its load: the whole process)'
   fi
   cold_verdict "$r" "$label" "d=$dep" "${MAJ_TIMED:-$MAJ_WHOLE}" "$win" || return 0
-  echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$slot | wall ${wall}s$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
+  echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${PLACE:+ | place $PLACE} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
   counted || return 0
   count_row
-  sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$OTHER_BUSY_TAG$COLD_TAG")
-  [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$OTHER_BUSY_TAG$COLD_TAG")
+  sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
+  [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
+  res_sums_add "$label" "$dep" "$r"
+  # The greedy cross-check's ours side: the plain rows (no NAME=VALUE list) of this tree's binary.
+  case ${A_KIND[$i]}:$label in
+    ours:ours) xc_add ours lcg "$dep" "$r" "$label" "$(sed -n 's/^tokens //p' <<< "$out" | tail -n 1)" ;;
+    ours:ours@prose) xc_add ours prose "$dep" "$r" "$label" "$(sed -n 's/^tokens //p' <<< "$out" | tail -n 1)" ;;
+  esac
 }
 # The driver's hooks (tools/ref/load-groups.sh). The timing card must be free before the load's process
 # starts: after that the process itself holds it between its arms. The load's lines echoed once; its
@@ -1262,6 +1402,8 @@ lg_before_load() {
 }
 lg_pre() {
   prime_tag "$1"
+  CPU_BUSY_TAG=
+  guard_cpu "pre r$2 ${ARMS[$1]}"
   ours_pre "$@"
 }
 # A COLD row's arm goes on COLD_LIST, its unit's retry (run_unit); a PRIME or COLD row's tag is undone.
@@ -1272,7 +1414,16 @@ lg_post() {
   [ "$PRIMING" = 0 ] && [ "$COLD_QUEUED" = 0 ] || ROW_TAG=ROW
 }
 # A server arm's row after its device column (lcpp-warm.sh srv_row).
-srv_tail() { echo " | wall ${1}s$OTHER_BUSY_TAG$MAJ_COL$COLD_TAG"; }
+srv_tail() { echo " | wall ${1}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$MAJ_COL$COLD_TAG"; }
+srv_after() { guard_cpu "post r$1 $2 $3"; }
+# unit_guard <index> <round>: the contention guards before an arm's own process: the other card, the
+# timing card and the CPU.
+unit_guard() {
+  CPU_BUSY_TAG=
+  guard_other
+  guard_timing
+  guard_cpu "pre r$2 ${ARMS[$1]}"
+}
 # run_unit <round> <index...>: one unit of a round: the ours arms of one load key in one process, or one
 # reference, server or bin: arm after the card guards. Under the warm rows (cold-blocks.sh) our arms run
 # each after its PRIME, and a COLD row's arm runs once more: ours in a fresh load of its prime and the arm,
@@ -1298,15 +1449,13 @@ run_unit() {
     return
   fi
   a=${ARMS[$1]}
-  guard_other
-  guard_timing
+  unit_guard "$1" "$r"
   case ${A_KIND[$1]} in
     ref)
       ref_arm "${a%%:*}" "${a#*:}" "$r"
       [ "$COLD_QUEUED" = 1 ] || return 0
       ROW_TAG=ROW COLD_TRY=1
-      guard_other
-      guard_timing
+      unit_guard "$1" "$r"
       ref_arm "${a%%:*}" "${a#*:}" "$r"
       COLD_TRY=0
       ;;
@@ -1316,19 +1465,16 @@ run_unit() {
         ROW_TAG=PRIME
         ours_arm "$1" "$r"
         ROW_TAG=ROW
-        guard_other
-        guard_timing
+        unit_guard "$1" "$r"
       fi
       COLD_QUEUED=0
       ours_arm "$1" "$r"
       [ "$COLD_QUEUED" = 1 ] || return 0
       ROW_TAG=PRIME COLD_TRY=1
-      guard_other
-      guard_timing
+      unit_guard "$1" "$r"
       ours_arm "$1" "$r"
       ROW_TAG=ROW
-      guard_other
-      guard_timing
+      unit_guard "$1" "$r"
       ours_arm "$1" "$r"
       COLD_TRY=0
       ;;
@@ -1427,9 +1573,9 @@ dry_cmd() {
   fi
   if lg_grouped "$i"; then
     arm_envs "$i"
-    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
+    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${PLACE:+ --place $PLACE} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
   else
-    echo "timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx --time${WARM:+ --warm $WARM}$note"
+    echo "timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${PLACE:+ --place $PLACE} --time${WARM:+ --warm $WARM}$note"
   fi
 }
 
@@ -1445,7 +1591,9 @@ ratio_table() {
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
   if (tagged && $5 ~ /other-busy/) bo[a]++
+  if (tagged && $5 ~ /cpu-busy/) bc[a]++
   if (tf && $tf ~ /cold/) bk[a]++
+  if (tf && $tf ~ /cpu-busy/) bt[a]++
 } END {
   nt = split(t975, t, " ")
   nd = split(deps, d, " ")
@@ -1467,7 +1615,8 @@ ratio_table() {
     else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
     else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
     ao = base SUBSEP d[i]; ar = ref SUBSEP d[i]
-    busy = tagged ? sprintf("  busy: %s [other-busy %d/%d], %s [other-busy %d/%d]", base, bo[ao], an[ao], ref, bo[ar], an[ar]) : ""
+    busy = tagged ? sprintf("  busy: %s [cpu-busy %d/%d] [other-busy %d/%d], %s [cpu-busy %d/%d] [other-busy %d/%d]", base, bc[ao], an[ao], bo[ao], an[ao], ref, bc[ar], an[ar], bo[ar], an[ar]) : ""
+    if (!tagged && tf) busy = sprintf("  cpu-busy: %s %d/%d, %s %d/%d", base, bt[ao], an[ao], ref, bt[ar], an[ar])
     cold = tf ? sprintf("  cold: %s %d/%d, %s %d/%d", base, bk[ao], an[ao], ref, bk[ar], an[ar]) : ""
     printf "%s%-5s %s/%-6s  mean %.4f %s (n=%d)  of means %.4f  per round:%s%s%s\n", prefix, d[i], base, ref, m, ci, c, (as[ao] / an[ao]) / (as[ar] / an[ar]), list, busy, cold
   }
@@ -1476,6 +1625,8 @@ ratio_table() {
 
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+  echo "[dry] place: ${PLACE:-unset, the binary default a}"
+  echo "[dry] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0} now: $(cpu_busy_reading)"
   if [ -n "$TIMING_CARDS" ]; then
     echo "[dry] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
     tc_rc=0
@@ -1512,7 +1663,8 @@ lease_take
 timing_cards_start
 [ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
-echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}"
+echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}${PLACE:+ --place $PLACE}"
+echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 [ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $(corpus_file) (${PROSE_N} ids), in prose's own tables"
 blocks_config
 echo "[config] cold tag: majflt in the row's measured window (ours: from its prompt_ids line; lcpp: from its --progress line; mrs: from its Iteration line; ik and bin: the whole process) × ${COLD_US} µs ≥ ${COLD_PCT} % of that window"
@@ -1532,9 +1684,10 @@ witness pre
 ref_witness
 guard_other
 guard_timing
+guard_cpu pre
 
 sums=() pp_sums=()
-n_rows=0 other_rows=0 cold_rows=0
+n_rows=0 busy_rows=0 other_rows=0 cold_rows=0
 if [ "$ORDER" = rotate ]; then
   if [ "$AB_WARMUP" = 1 ]; then
     ROW_TAG=WARMUP
@@ -1547,9 +1700,15 @@ else
   blocks_run
 fi
 echo
+echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT}% over [$CPU_BUSY_COMMS])"
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
 warm_rows_summary
+# The greedy cross-check (lcpp-warm.sh), before the tables: a server row whose first id parts from ours
+# is a failed arm and drops out at its depth or P with them; a later id's part is a [xcheck-tail] line.
+xc_table
+[ ${#XC_FAILED[@]} -eq 0 ] || FAILED+=("${XC_FAILED[@]}")
+[ ${#XC_DROP[@]} -eq 0 ] || FAILED_KEYS+=("${XC_DROP[@]}")
 # A failed arm drops out at its depth or P (cold-blocks.sh).
 failed_tally
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
@@ -1567,13 +1726,15 @@ echo "=== ours / reference per depth: each round's ratio of the pair measured in
 echo "    that ran more than once in a round are averaged first), their mean with its 95 % interval"
 echo "    (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds), and the ratio of the arm means ==="
 deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
-# The prose labels have their own table: their prompt is not the one ours and the references ran.
-refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE '^ours@prose(@|$)' | sort -u | tr '\n' ' ')
+# The prose labels have their own table: their prompt is not the one ours and the references ran. A label
+# fed the prose ids is `ours@prose`, `ours@prose@…` or `<server engine>@prose`.
+prose_re='^ours@prose(@|$)|^[^@]+@prose$'
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "$prose_re" | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 0 6
-prose_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E '^ours@prose@' | sort -u | tr '\n' ' ')
+prose_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "$prose_re" | grep -vx ours@prose | sort -u | tr '\n' ' ')
 if [ -n "$prose_refs" ]; then
   echo
-  echo "=== the prose prompt: ours@prose / each ours@prose@ arm per P, the same statistics ==="
+  echo "=== the prose prompt: ours@prose / each arm on the prose ids per P, the same statistics ==="
   printf '%s\n' "${sums[@]}" | ratio_table "ratio prose d=" "$deps" "$prose_refs" 0 6 ours@prose
 fi
 if [ ${#pp_sums[@]} -gt 0 ]; then
@@ -1584,23 +1745,24 @@ if [ ${#pp_sums[@]} -gt 0 ]; then
   printf '%s\n' "${pp_sums[@]}" | awk -F'|' '{
     k = $1 " p=" $2; s[k] += $4; n[k]++
     if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
-    if ($5 ~ /other-busy/) o[k]++; if ($5 ~ /cold/) f[k]++
+    if ($5 ~ /cpu-busy/) c[k]++; if ($5 ~ /other-busy/) o[k]++; if ($5 ~ /cold/) f[k]++
   } END { for (k in s) {
     spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
-    printf "mean pp %-14s %8.2f tok/s(pp)  [%s..%s, spread %.2f%%]  (n=%d)  [other-busy %d/%d] [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, n[k], o[k], n[k], f[k], n[k] } }' | sort
+    printf "mean pp %-14s %8.2f tok/s(pp)  [%s..%s, spread %.2f%%]  (n=%d)  [cpu-busy %d/%d] [other-busy %d/%d] [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, n[k], c[k], n[k], o[k], n[k], f[k], n[k] } }' | sort
   echo
   echo "=== ours / reference prefill per prompt length: the decode table's statistics over the pp"
   echo "    values, then how many of each side's rows carried [other-busy] and [cold] ==="
   pp_keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
-  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | grep -vE '^ours@prose(@|$)' | sort -u | tr '\n' ' ')
+  pp_refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -vx ours | grep -vE "$prose_re" | sort -u | tr '\n' ' ')
   printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$pp_keys" "$pp_refs" 1 5
-  pp_prose=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -E '^ours@prose@' | sort -u | tr '\n' ' ')
+  pp_prose=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | grep -E "$prose_re" | grep -vx ours@prose | sort -u | tr '\n' ' ')
   if [ -n "$pp_prose" ]; then
     echo
-    echo "=== the prose prompt's prefill: ours@prose / each ours@prose@ arm per P, the same statistics ==="
+    echo "=== the prose prompt's prefill: ours@prose / each arm on the prose ids per P, the same statistics ==="
     printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp prose p=" "$pp_keys" "$pp_prose" 1 5 ours@prose
   fi
 fi
+res_sums_table
 witness post
 ref_witness
 failed_end

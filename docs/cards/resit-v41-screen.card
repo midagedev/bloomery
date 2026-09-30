@@ -1,0 +1,45 @@
+# The resit's V4.1 reference screen (SV), one round on the A6000, not a public row: which llama.cpp
+# flags are its fastest before the public windows (docs/fair-measure.md 3). One runner call, each server
+# arm's own flags in its engine word (lcpp-warm.sh's Per-arm flags). The decision term is pp4096 at
+# K 34 with op offload on and one ubatch of 4096, the one line that can reach ours (376.67, README).
+#
+# Band [derived]: at --n-cpu-moe 34 the host keeps layers 0-33's experts, 2 x 7,007,109,120 B + 32 x
+# 6,440,878,080 B = 220,120,317,440 B (models/deepseek41.sh's per-layer bytes). With op offload on, a
+# host-resident expert tensor of an op with a batch >= 32 is copied to the card whole per ubatch; one
+# ubatch of 4096 copies all of it once, from the pageable mapping at 21.16 GB/s (facts.md, the A6000's
+# pageable H2D): 220.12 / 21.16 = 10.40 s, pp4096 <= 4096 / 10.40 = 393.8 tok/s, the copy alone. The low
+# edge 250 (16.4 s) leaves 6.0 s for everything the copy does not price: the routed MMQ over the copied
+# weights (34 layers x 6.44 GB at ~3.79 bits a weight = 13.6e9 weights a layer, 6 of 384 experts a
+# token: 2 x 13.6e9 / 64 x 34 x 4096 = 59 TFLOP) and the rest of the forward; that width is not a
+# derivation. K 33 leaves 2,713 MiB on the card, under one layer's expert tensor (up to 3,114,270,720 B):
+# op offload and ub 4096 need K >= 34.
+#
+# Wall [derived]: five server arms, ~15 s cached load each, two requests each: lcppsrvfit:prose:512
+# (cold by design, ~3 min), lcppsrv+t16:prose:4096 (~2 x 45 s), three pp4096 arms (~2 x 15..45 s),
+# the block's discard ~3.5 min: 15..20 min. Needs a generate_ds41 built first (W0): the server -c is
+# its --plan's ctx_max.
+kind: baseline
+question: at op offload on, K 34 and one ubatch of 4096, is llama.cpp's V4.1 prompt rate at P = 4096
+  near ours, and which flags (-t, -nopo, K, fit) does each public window run?
+term: pp tok/s @ P = 4096, llama.cpp PR #28696 llama-server /completion prompt_per_second on the first
+  4096 ids of corpus-prose.ids after a same-id warm-up (-ngl 999 --n-cpu-moe 34 -fa on -t 32
+  --op-offload -ub 4096 -b 4096 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c <plan ctx_max>), A6000,
+  the row `lcppsrvpp4096+nopo0+k34@prose`
+unit: tok/s
+predict: 250..394
+condition: one lease, one round, BLOOMERY_AB_ORDER=blocks, the arms lcppsrvfit:prose:512
+  lcppsrv+t16:prose:4096 lcppsrvpp4096+k34:prose:4096 lcppsrvpp+nopo0+k34:prose:4096
+  lcppsrvpp4096+nopo0+k34:prose:4096; the block's DISCARD r0 row present; every server row's n_ctx line
+  equal to the plan's ctx_max (else a FAIL row by name); prompt_n 4096 and cache_n 0 on every pp row;
+  no row [cold] past its retry, [cpu-busy] or [other-busy]; the full output to a file first. Command:
+  BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-v41-screen.card
+  BLOOMERY_AB_ORDER=blocks' just depth-gpu-ds41 <the arms above> > <log> 2>&1
+reason: sets the reference flags the public V4.1 windows (W2, W3) run, one round and unpublished;
+  why now: the public rows need llama.cpp at its fastest flags (docs/fair-measure.md 3), and the
+  only line that can reach ours is untried
+decide-in: W2 and W3 carry lcppsrvpp4096+nopo0+k34:prose:4096 as llama.cpp's pp4096 line beside the
+  plain arms; -t 16 replaces -t 32 in W2 only if its decode row beats the plain one past 2 %
+decide-below: op offload costs more than its copy: read the server log's n_ubatch and offload lines;
+  W2 keeps op offload off (lcppsrvpp4096+k34) as llama.cpp's pp4096 line
+decide-above: the copy is not the whole host set per ubatch (a pinned or partial offload path): read
+  the log, re-derive the band, and screen again before W2 publishes a ratio

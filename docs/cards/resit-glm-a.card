@@ -1,0 +1,31 @@
+# The resit's GLM public window on the A6000 (W6): our arms at C = 4352 (the batched prompt call, the
+# binary's --prefill default), the server arms of SG's branch at -c 4352 (the runner's one C), on the same
+# prose ids, each server row's first ids held to ours'. Our arms still warm up as a WARMUP r0 process of
+# their own: generate_glm5next takes no --arm list, so there is no same-load PRIME (the report's binary-side
+# design).
+#
+# Band [derived]: glmppa-pp.card's batch of 512 is 3.85..5.11 s (the card front plus the host union),
+# pp512 100..133. P = 4096 is eight such batches; the latent layers' attention over the cache grows with
+# depth, <= 5 % a batch at a mean depth of 1,024 (glmppa's pp2048 derivation), so <= 10 % at a mean of 2,048:
+# 4096 / (8 x 5.11 x 1.10) = 91.1 and 4096 / (8 x 3.85) = 133. Past 2,051 positions the sparse selector
+# runs, a term no derivation prices; the low edge 85 leaves it 7 %. No batched GLM prompt has been timed.
+kind: baseline
+question: at our context and on our prose ids, what is our GLM-5.3 prompt rate at P = 4096 on the A6000,
+  beside llama.cpp's warm server rows?
+term: pp tok/s @ P = 4096, ours (generate_glm5next --prefill batch, the default; 4096 prose ids from
+  GLM_PROSE_FROM, --ctx 4352, plan (a)), A6000, the row's time prompt record (kind=batch)
+unit: tok/s
+predict: 85..133
+condition: one lease, two rounds, BLOOMERY_GEN_CTX=4352, the arms 512 4096 lcpp27752srv:512
+  lcpp27752srv:4096 (SG's branch and flags in their place); each ours row's load record ctx 4352 and
+  its time prompt kind=batch; every server n_ctx line 4352; every xcheck line `same`; no counted row
+  [cold], [cpu-busy] or [other-busy]; the full output to a file first. Command: BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-glm-a.card BLOOMERY_GEN_CTX=4352' just
+  depth-gpu-glm5next <the arms above> > <log> 2>&1
+reason: sets the public GLM A6000 rows, ours and llama.cpp's; why now: the public GLM row fed its prompt
+  one step per token, and its batched prompt has landed since
+decide-in: write the GLM A6000 rows (rig-log first), our pp beside decode, llama.cpp's warm server rows
+decide-below: the selector or the deep attention costs more than priced: time one 4096 prompt's
+  batches under nsys and name the term before the row goes out
+decide-above: the host union is under glmppa's band: re-base glmppa's derivation on this row before
+  the next GLM prefill round opens

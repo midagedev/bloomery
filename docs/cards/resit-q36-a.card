@@ -1,0 +1,27 @@
+# The resit's Qwen3.6 public window on the A6000 (W11): our arms on the lcg ids (the whole model on the
+# card, so the ids move no bytes), the mainline server arms at -c ours' --ctx at that D or P (already equal,
+# docs/fair-measure.md 1.5), mistral.rs captioned only (it feeds its own ids, G12). A decode row's prompt
+# rate is its pp row; the ub 4096 line runs as its own arm.
+#
+# Band [derived]: the 09-28 bench pp4096 at -ub 4096, 5,036 tok/s (rig-log 09-28#q36-release), +-5 %.
+kind: baseline
+question: warm, what is llama.cpp's Qwen3.6 server prompt rate at P = 4096 with one ubatch of 4096 on the
+  A6000, beside ours?
+term: pp tok/s @ P = 4096, llama.cpp mainline llama-server /completion prompt_per_second on the lcg ids
+  after a same-id warm-up (-ngl 99 -fa on -ub 4096 -b 4096 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 4352),
+  A6000
+unit: tok/s
+predict: 4780..5290
+condition: one lease, two rounds, BLOOMERY_WARM_ROWS=1, the arms 512 4096 lcppsrv:512 lcppsrv:4096
+  lcppsrvpp4096:4096 mrs:512 mrs:4096 mrspp:512 mrspp:4096; every server n_ctx line equal to ours' --ctx
+  at that D or P; every xcheck line `same`; no counted row [cold], [cpu-busy] or [other-busy]; the full
+  output to a file first. Command: BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-q36-a.card BLOOMERY_WARM_ROWS=1' just
+  depth-gpu-qwen35moe <the arms above> > <log> 2>&1
+reason: sets the public Qwen3.6 A6000 rows from server arms on our ids; why now: the release replaces every
+  cross-engine row with one warm re-measure
+decide-in: write the Qwen3.6 A6000 rows (rig-log first), llama.cpp at the faster of its plain and ub 4096
+  lines, mistral.rs captioned without a ratio
+decide-below: the server's prompt path pays a term the bench does not at ub 4096: read its n_ubatch line;
+  publish the bench-consistent line only after naming it
+decide-above: the bench row was not llama.cpp's best: note it, and publish the server row

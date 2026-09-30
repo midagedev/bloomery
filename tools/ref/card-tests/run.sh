@@ -496,6 +496,16 @@ done
 run 'box.sh: BLOOMERY_BOX_READONLY takes 1 or 0' 64 'BLOOMERY_BOX_READONLY is 1' box env BLOOMERY_BOX_READONLY=yes "$B/tools/box.sh" ls
 run 'box.sh: BLOOMERY_BOX_WAIT is seconds' 64 'BLOOMERY_BOX_WAIT is whole seconds' box env BLOOMERY_BOX_WAIT=30m "$B/tools/box.sh" ls
 run 'box.sh: BLOOMERY_HOLD_OWNER is a word' 64 'BLOOMERY_HOLD_OWNER is the <owner>' box env BLOOMERY_HOLD_OWNER=/root/bloomery-03-hold "$B/tools/box.sh" ls
+# BLOOMERY_BOX_ENV splits on spaces: a value with a space is refused by name, never exported in halves.
+rc_is 'box.sh: BLOOMERY_BOX_ENV entries reach the command' 0 box env BLOOMERY_BOX_ENV='A=1 B_2=x' "$B/tools/box.sh" true
+sshlog 'box.sh: each BLOOMERY_BOX_ENV entry is one export' 'export A=1 && export B_2=x && .*true$'
+run 'box.sh: a BLOOMERY_BOX_ENV entry with a quote is refused' 64 "entry 'F=\"-ngl' holds a quote: BLOOMERY_BOX_ENV splits on spaces" \
+  box env BLOOMERY_BOX_ENV='F="-ngl 999" X=1' "$B/tools/box.sh" true
+run 'box.sh: the second half of a spaced value is refused' 64 "got '16' \\(after 'F=-t': the rest of a value with a space" \
+  box env BLOOMERY_BOX_ENV='F=-t 16' "$B/tools/box.sh" true
+run 'box.sh: a lower-case name after an entry is refused' 64 "'x' in BLOOMERY_BOX_ENV is not an upper-case variable name \(after 'F=-t'" \
+  box env BLOOMERY_BOX_ENV='F=-t x=1' "$B/tools/box.sh" true
+if grep -q 'true$' "$tmp/ssh.log"; then fail 'box.sh: a BLOOMERY_BOX_ENV refusal ran the command' 'the command reached ssh' "$tmp/ssh.log"; else pass 'box.sh: a BLOOMERY_BOX_ENV refusal runs no command'; fi
 rc_is 'box.sh: a command with the default card runs' 0 box "$B/tools/box.sh" true
 sshlog 'box.sh: the default card reaches the box as BLOOMERY_BOX_CARD=3090' ' BLOOMERY_BOX_CARD=3090 && .*true$'
 rc_is 'box.sh: a command with BLOOMERY_CARD=both runs' 0 box env BLOOMERY_CARD=both "$B/tools/box.sh" true
