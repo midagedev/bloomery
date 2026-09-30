@@ -80,6 +80,20 @@
 - **Qwen3.8 tiered requant**(자주 쓰는 expert는 비트를 올리고 드문 것은 내려 72 GB에 통째로 넣는다. 3×3090 공개 23 → 79–92 tok/s + MTP, 대가는 KLD 0.045 → 0.091): **보류.** KLD 두 배는 반올림 규칙이 아니라 모델 품질 손실이고, 파일이 달라져 llama.cpp와 같은 파일 비교가 깨진다. 두 카드 raw 실측을 먼저 보고, 그 뒤에도 필요하면 KLD를 표기한 별도 파일로만 낸다.
 - **K7 선택 폭: `top_k + 3` = 2,051칸(ik·mainline·Strata와 같게).** 「Performance first, accuracy opt-in」: 좁은 쪽이 싸고 공개 비교선·ik 오라클과 같다. 풀 전체 + 꼬리는 `exact_ref`의 팔로만 남긴다.
 - **`Body38::ALLOWED` still lists `pre-tokenizer qwen35`** (`crates/gpu/src/arch/qwen3moe/body38.rs`, XS): the item left the coverage list when the tokenizer gained the qwen35 pre-tokenizer (2026-09-30), so the entry is dead. Remove it with the next change to `crates/gpu`, which moves every GPU gate's key anyway.
+- **qwen4exp MTP gate, what the node-local pins leave open** (mtpfix; window D, `12789ca8`):
+  - The windows' proposals are not pinned (S). Under app mutant 02 (the anchor reads its hidden row one past its own)
+    every greedy and store clause of (w) passes: verify keeps the ids the plain run's whatever the draft proposes. It
+    turned red only through the lane-word clause's refusal. A clause holding each window's proposed ids to a host-fed
+    walk's, as `prompt_walks` does for the prompt call, catches a proposal defect directly; the same clause holds the
+    catch-up's last-row token swap, which today moves only the accept rate.
+  - Three links have no node pin (S): AttnIn → AttnGated (the attention core), FfnIn → the router's ids and weights,
+    FfnIn → `rh`/`sh_h` (gate·up·SwiGLU). Only the ik catchers ((h) argmax, (l) flips) hold them. The `rh`/`sh_h` taps
+    exist, so a SwiGLU pin is the cheapest close.
+  - `MtpNode::at` is private (`crates/gpu/src/arch/qwen3moe/mtp38.rs`), so the gate re-derives `node_at` (XS).
+- **Qwen3.8 serve's draft hooks** (mtpfix): `before_step` is a serve-only calling convention; a before-step hook on
+  the `Draft` trait removes it (`crates/app/src/arch/qwen3moe/mod.rs` `stepped`, S–M). `gate_qwen38_serve.rs`'s
+  `join_of` is the one place Rust parses a record line; a kind reader in `record.rs` keeps records to one owner (S).
+  `crates/gpu-gates/src/bind.rs:842` could say that an empty prefill never reaches the Seat (XS).
 - **Qwen3.8 레버 순서: 배치 프리필 → 두 카드 residency → raw Q5_1 → MTP.** 격차가 pp 쪽(llama.cpp의 약 0.3배)이 decode(약 0.9배)보다 크고 프리필은 헤드라인 축이다. Qwen3.6의 ubatch GEMM 경로 재사용 여부가 첫 라운드의 종이 분해 항목이다.
 - **출시 범위**: 네 모델(V4.1·Qwen3.6·GLM·Qwen3.8) 모두 싣는다. Qwen3.8은 진 숫자 그대로, 캡션에 이유(호스트 전용 경로, 배치 프리필 없음). GLM은 "깊이 ≤ 2k" 캡션, hot 행은 하한.
 - **down 활성값 q8_K: 위 기본 추천대로.** h3tile(비트 동일)을 먼저 올려 c를 실측하고, 실측이 예측 안이면 q8_K 라운드를 연다.
