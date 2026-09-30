@@ -46,7 +46,12 @@
 //! event is recorded; then the rule plans and the new flips' copies are
 //! issued. A flip lands at `b + delay` whatever its copy's progress: a late
 //! copy makes the engine stream wait, and the boundary never moves, so the
-//! same history of passes gives the same map at every pass.
+//! same history of passes gives the same map at every pass. A boundary may be
+//! made ahead of its pass ([`SwapMachine::boundary_ahead`]) — once the pass
+//! before it is served and ended, before that pass's readback — and the next
+//! launch takes it ([`SwapMachine::take_ahead`]): the same boundary, its
+//! engine stream work in the same place between the two passes, its host
+//! time under the pass before it.
 //!
 //! **No wait without a bound.** A flip landing at a boundary makes its job
 //! due: the staging thread stages a due job whatever the window says. The
@@ -55,7 +60,10 @@
 //! its ring slot's previous copy, which waits on a boundary event recorded at
 //! or before the boundary that issued the job, and the engine stream reaches
 //! that event having waited only on copies that landed earlier — each of
-//! which the host waited for at its own landing. Every host wait the machine
+//! which the host waited for at its own landing — and on the host words of
+//! passes this thread served before this boundary: a boundary runs after the
+//! last launched pass's host service has returned, after that pass's
+//! readback or ahead of it. Every host wait the machine
 //! makes — for a landing job, for a ring slot's last copy, for the copy
 //! stream at a reset or a drop — ends by [`MachineCfg::deadline`] with a
 //! named error; only a job not yet due waits for the window as long as the
@@ -917,6 +925,36 @@ pub struct PassReport {
     /// bytes into the ring, and preparing victims for the host.
     pub stage_us: u64,
     pub prepare_us: u64,
+    /// Made ahead of its pass ([`SwapMachine::boundary_ahead`]): after the
+    /// pass before it was served and ended, before that pass's readback.
+    pub ahead: bool,
+    /// The engine's step and pass readbacks before this boundary, as its
+    /// caller stamps it ([`BoundaryAt`]); 0 from a driver of the machine.
+    pub reads: u64,
+}
+
+/// Where a residency boundary runs in the engine's pass order, with the
+/// engine's readbacks before it ([`PassReport::reads`]): what a body's host
+/// service is told at every boundary call
+/// ([`crate::host::HostTier::swap_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoundaryAt {
+    /// Before a pass's launch: the boundary made ahead of it taken when the
+    /// machine holds one, else the boundary made here.
+    Launch { reads: u64 },
+    /// After a pass's host service and its kept rows, before its readback:
+    /// the next pass's boundary made ahead, under the rest of the pass.
+    Ahead { reads: u64 },
+}
+
+impl BoundaryAt {
+    /// The readbacks the caller stamps.
+    #[must_use]
+    pub fn reads(self) -> u64 {
+        match self {
+            BoundaryAt::Launch { reads } | BoundaryAt::Ahead { reads } => reads,
+        }
+    }
 }
 
 /// Why a dropped machine leaked its shared state ([`Leak`]).
@@ -1156,6 +1194,9 @@ pub struct SwapMachine {
     jobs_issued: u64,
     /// The boundary planned last; `None` until the first.
     planned: Option<u64>,
+    /// A boundary made ahead of its pass ([`SwapMachine::boundary_ahead`])
+    /// that no launch has taken yet ([`SwapMachine::take_ahead`]).
+    ahead: Option<u64>,
     kept: usize,
     /// Host microseconds the last pass's end took (the fold into the rule),
     /// for the next boundary's report.
@@ -1305,6 +1346,7 @@ impl SwapMachine {
             events,
             jobs_issued: 0,
             planned: None,
+            ahead: None,
             end_us: 0,
             kept: 0,
             ops: Vec::with_capacity(BATCH_OPS),
@@ -1513,6 +1555,29 @@ impl SwapMachine {
         self.planned == Some(self.rule.passes())
     }
 
+    /// The boundary made ahead of its pass that no launch has taken yet
+    /// ([`SwapMachine::boundary_ahead`]), when there is one.
+    #[must_use]
+    pub fn ahead(&self) -> Option<u64> {
+        self.ahead
+    }
+
+    /// Refuse `what` while a boundary made ahead waits for its pass's
+    /// launch: that pass has not run, so nothing may end it or open another
+    /// boundary before it. One wording for every refusal of it.
+    pub(crate) fn refuse_if_ahead(&self, what: &'static str) -> Result<(), GpuError> {
+        match self.ahead {
+            Some(b) => Err(GpuError::protocol(
+                what,
+                format!(
+                    "boundary {b} was made ahead of its pass and no launch has taken it \
+                     (SwapMachine::take_ahead): the pass it opened has not run"
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// The error that broke the machine, when one has.
     #[must_use]
     pub fn broken(&self) -> Option<&str> {
@@ -1639,6 +1704,7 @@ impl SwapMachine {
         let start = Instant::now();
         self.refuse_if_broken(WHAT)?;
         self.refuse_in_call(WHAT)?;
+        self.refuse_if_ahead(WHAT)?;
         if self.planned != Some(self.rule.passes()) {
             return Err(GpuError::state(WHAT, "a boundary before the pass"));
         }
@@ -1747,8 +1813,10 @@ impl SwapMachine {
     /// their copies, the card's copy and `slots` change), this boundary's
     /// event is recorded, then the rule plans and the new flips' copies are
     /// issued. Refused by name, the machine unchanged: a boundary twice with
-    /// no pass between, a landing job not staged within the deadline, and a
-    /// landing flip whose victim the host cannot serve from resident pages.
+    /// no pass between, one while a boundary made ahead waits for its launch
+    /// ([`SwapMachine::boundary_ahead`]), a landing job not staged within the
+    /// deadline, and a landing flip whose victim the host cannot serve from
+    /// resident pages.
     /// Refused by name, the machine broken: a staging failure, a ledger that
     /// does not hold the flips the rule lands, and any error after the first
     /// change.
@@ -1761,6 +1829,7 @@ impl SwapMachine {
         let start = Instant::now();
         self.refuse_if_broken(WHAT)?;
         self.refuse_in_call(WHAT)?;
+        self.refuse_if_ahead(WHAT)?;
         let b = self.rule.passes();
         if self.planned == Some(b) {
             return Err(GpuError::state(WHAT, "a pass since the last boundary"));
@@ -1803,6 +1872,55 @@ impl SwapMachine {
         self.planned = Some(b);
         report.boundary_us = micros(start);
         Ok(report)
+    }
+
+    /// [`SwapMachine::boundary`] made ahead of the pass it opens: after the
+    /// pass before it was served and ended ([`SwapMachine::end_pass`]), while
+    /// the engine stream may still run that pass's last kernels, so the
+    /// boundary's host time runs under them. The engine stream's order is a
+    /// boundary's at the launch: its waits, the card's words and its event
+    /// follow the pass before it and precede the next launch. The pass it
+    /// opens takes it exactly once ([`SwapMachine::take_ahead`]); until then
+    /// every boundary, end of pass and prompt call is refused by name. Its
+    /// refusals are [`SwapMachine::boundary`]'s.
+    pub fn boundary_ahead(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+    ) -> Result<PassReport, GpuError> {
+        let mut report = self.boundary(stream, slots)?;
+        self.ahead = Some(report.boundary);
+        report.ahead = true;
+        Ok(report)
+    }
+
+    /// The launch of the pass a boundary made ahead opened takes it: the
+    /// boundary, once. Refused by name, the machine unchanged: no boundary
+    /// made ahead waiting (none was made, or a launch took it already — a
+    /// second take), a broken machine and an open call.
+    pub fn take_ahead(&mut self) -> Result<u64, GpuError> {
+        const WHAT: &str = "SwapMachine::take_ahead";
+        self.refuse_if_broken(WHAT)?;
+        self.refuse_in_call(WHAT)?;
+        let b = self.ahead.ok_or_else(|| {
+            GpuError::state(
+                WHAT,
+                "a boundary made ahead of this pass (SwapMachine::boundary_ahead): none waits, \
+                 so none was made or a launch took it already",
+            )
+        })?;
+        if self.planned != Some(b) || self.rule.passes() != b {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "boundary {b} was made ahead, and the machine stands at pass {} planned {:?}",
+                    self.rule.passes(),
+                    self.planned
+                ),
+            ));
+        }
+        self.ahead = None;
+        Ok(b)
     }
 
     /// Wait, within the deadline, until landing flip `f`'s job is staged or
@@ -2101,8 +2219,9 @@ impl SwapMachine {
     /// and every seed expert not live is copied back onto the card, the
     /// engine stream waiting for the copies; the host pages of the seed
     /// experts back on the card and of the cancelled flips' victims are
-    /// released; the rule returns to its seed. The caller's tally is its own
-    /// to clear ([`Tally::clear`]). Refused by name, the machine unchanged:
+    /// released; the rule returns to its seed, and a boundary made ahead
+    /// waiting for its launch goes with the pass it opened, which never ran.
+    /// The caller's tally is its own to clear ([`Tally::clear`]). Refused by name, the machine unchanged:
     /// a copy stream that does not drain within the deadline. Refused by
     /// name, the machine broken: a staging failure, an expert sent to the
     /// host the source cannot serve from resident pages, and any error after
@@ -2269,6 +2388,7 @@ impl SwapMachine {
         self.write_changed(stream)?;
         self.rule.reset();
         self.planned = None;
+        self.ahead = None;
         self.kept = 0;
         self.end_us = 0;
         for (i, l) in self.layers.clone().enumerate() {
@@ -2294,6 +2414,7 @@ impl SwapMachine {
         const WHAT: &str = "SwapMachine::begin_call";
         self.refuse_if_broken(WHAT)?;
         self.refuse_in_call(WHAT)?;
+        self.refuse_if_ahead(WHAT)?;
         if !self.pass_open() {
             return Err(GpuError::state(WHAT, "a boundary before the call"));
         }

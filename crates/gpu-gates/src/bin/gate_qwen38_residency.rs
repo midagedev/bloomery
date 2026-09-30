@@ -33,7 +33,15 @@
 //!   gate's stack).
 //! - `passes` (green-only): a history's boundaries end, in order, no pass,
 //!   the prompt call (one pass, 0 rows kept), a step (1 kept), a verify (its
-//!   accepted rows) and the steps after it (1 kept each).
+//!   accepted rows) and the steps after it (1 kept each), the last step's
+//!   own included.
+//! - `order`: every step's own boundary — the next pass's — runs ahead of
+//!   the step's readback: when the step returns, the last boundary ends it,
+//!   was made ahead (`PassReport::ahead`), and carries the readbacks from
+//!   before the step (`PassReport::reads`), while the model has read once
+//!   more since (mutants: the boundary made after the head's readback, which
+//!   carries the step's own readback; the boundary back at the next launch,
+//!   which leaves the step unended when it returns).
 //! - `c7`: a residency reset after the history brings every layer's live set
 //!   back to its seed (`diff` 0, and the ledger), and lets go of no host
 //!   byte (`dropped_bytes` 0: the churn pool stays in the host set for the
@@ -215,14 +223,52 @@ mod gate {
     }
 
     /// What a history saw: every call's argmax, each step's logits FNV, each
-    /// boundary's ended pass (its kind and kept rows), and the flips that
-    /// landed.
+    /// boundary's ended pass (its kind and kept rows), the flips that
+    /// landed, and the steps whose own boundary ran ahead of their readback
+    /// ([`ended_ahead`]).
     #[derive(PartialEq)]
     struct History {
         tokens: Vec<u32>,
         fnvs: Vec<u64>,
         passes: Vec<(PassKind, usize)>,
         landed: usize,
+        ahead: usize,
+    }
+
+    /// Whether the step just run ended at a boundary made ahead of its
+    /// readback: the last of `passes`, the boundaries since the step began,
+    /// ends a step, was made ahead and carries `before`, the model's
+    /// readbacks before the step, and the model has read once since
+    /// (`after`).
+    fn ended_ahead(passes: &[(PassKind, PassReport)], before: u64, after: u64) -> bool {
+        after == before + 1
+            && passes
+                .last()
+                .is_some_and(|(k, r)| *k == PassKind::Step && r.ahead && r.reads == before)
+    }
+
+    /// One greedy step of `next` in the history `h`, `want` its readback:
+    /// its argmax and logits FNV noted, its boundaries taken into `passes`
+    /// and whether it ended ahead counted. The step's argmax.
+    fn history_step(
+        s: &mut Session<Body38>,
+        h: &mut History,
+        passes: &mut Vec<(PassKind, PassReport)>,
+        next: u32,
+        want: Want,
+    ) -> Result<u32, GateError> {
+        let before = s.model().reads();
+        let out = s.step(next, want)?;
+        if let Out::Logits { row, .. } = out {
+            h.fnvs.push(fnv(row));
+        }
+        let next = out.argmax();
+        h.tokens.push(next);
+        let after = s.model().reads();
+        let taken = take_passes(s)?;
+        h.ahead += usize::from(ended_ahead(&taken, before, after));
+        passes.extend(taken);
+        Ok(next)
     }
 
     /// The boundaries' reports since the last take.
@@ -241,23 +287,19 @@ mod gate {
             fnvs: Vec::with_capacity(STEPS),
             passes: Vec::new(),
             landed: 0,
+            ahead: 0,
         };
         let mut next = s.prompt(ids, Want::Argmax)?.argmax();
         h.tokens.push(next);
-        next = s.step(next, Want::Argmax)?.argmax();
-        h.tokens.push(next);
+        let mut passes = take_passes(s)?;
+        next = history_step(s, &mut h, &mut passes, next, Want::Argmax)?;
         let out = s.verify::<3>([next; 3])?;
         h.tokens.extend_from_slice(&out[1..]);
         s.commit(2)?;
         for _ in 0..STEPS {
-            let out = s.step(next, Want::Logits)?;
-            if let Out::Logits { row, .. } = out {
-                h.fnvs.push(fnv(row));
-            }
-            next = out.argmax();
-            h.tokens.push(next);
+            next = history_step(s, &mut h, &mut passes, next, Want::Logits)?;
         }
-        let passes = take_passes(s)?;
+        passes.extend(take_passes(s)?);
         h.landed = passes.iter().map(|(_, r)| r.landed).sum();
         h.passes = passes.iter().map(|&(k, r)| (k, r.kept)).collect();
         Ok(h)
@@ -669,23 +711,36 @@ mod gate {
         pass &= c1;
 
         // The prompt call is one pass that keeps 0 rows; a step keeps 1; a
-        // verify keeps its accepted rows.
+        // verify keeps its accepted rows. A step's own boundary is made ahead
+        // of its readback, so the history's last step ends one too.
+        // PIN(2026-10-01): STEPS steps after the verify, not STEPS - 1: the last one's boundary runs ahead.
         let mut want = vec![
             (PassKind::None, 0),
             (PassKind::Prompt, 0),
             (PassKind::Step, 1),
             (PassKind::Pair, 2),
         ];
-        want.extend(std::iter::repeat_n((PassKind::Step, 1), STEPS - 1));
+        want.extend(std::iter::repeat_n((PassKind::Step, 1), STEPS));
         let passes_ok = first.passes == want;
         println!(
             "passes: a history's boundaries end none, the prompt call (0 kept), a step (1), a \
-             verify (2), then {} steps (1 kept each): {} boundaries, same {passes_ok}: {}",
-            STEPS - 1,
+             verify (2), then {STEPS} steps (1 kept each): {} boundaries, same {passes_ok}: {}",
             first.passes.len(),
             verdict(passes_ok)
         );
         pass &= passes_ok;
+
+        // Every plain step of the history: the one after the prompt and the
+        // STEPS after the verify.
+        let order = first.ahead == STEPS + 1;
+        println!(
+            "order: {} of {} steps ended at a boundary made ahead of their readback, stamped \
+             with the readbacks before the step: {}",
+            first.ahead,
+            STEPS + 1,
+            verdict(order)
+        );
+        pass &= order;
 
         let r = s
             .residency_reset()?

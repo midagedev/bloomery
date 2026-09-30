@@ -95,7 +95,9 @@ use super::wide38::{
 };
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
-use crate::host::swap::{CallCfg, CallPick, CallReport, PassReport, ResetReport, Residency};
+use crate::host::swap::{
+    BoundaryAt, CallCfg, CallPick, CallReport, PassReport, ResetReport, Residency,
+};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
@@ -2460,11 +2462,12 @@ impl HostServed for Body38 {
         self.hybrid.residency()
     }
 
-    /// The host tier's residency boundary
+    /// The host tier's residency boundary at `at`
     /// ([`ResidencyGlue::at_boundary`]), its report logged when a binary
     /// asked ([`Body38::log_residency`]).
-    fn at_boundary(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.residency_glue.at_boundary(&mut self.hybrid, stream)
+    fn at_boundary(&mut self, stream: &CudaStream, at: BoundaryAt) -> Result<(), GpuError> {
+        self.residency_glue
+            .at_boundary(&mut self.hybrid, stream, at)
     }
 
     fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {

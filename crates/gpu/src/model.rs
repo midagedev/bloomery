@@ -35,7 +35,7 @@ pub use probe::{OpTime, StepProbe};
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
-use crate::host::swap::{MachineCfg, Residency};
+use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
 use crate::weights::Weights;
@@ -143,23 +143,31 @@ pub trait HostServed {
     /// `None` on any other load.
     fn host_residency(&self) -> Option<&HostResidency>;
 
-    /// The residency boundary before a replay's launch, on the engine
-    /// stream `stream` ([`crate::host::swap::SwapMachine::boundary`]): the
-    /// flips live here land and the next ones are issued. A body with no
+    /// The residency boundary at `at` on the engine stream `stream`
+    /// ([`crate::host::HostTier::swap_at`]): the flips live there land and
+    /// the next ones are issued. Before a launch ([`BoundaryAt::Launch`]) it
+    /// takes the boundary made ahead of that pass when there is one, else
+    /// makes it; ahead ([`BoundaryAt::Ahead`]) it makes the next pass's
+    /// boundary under the rest of the pass before it
+    /// ([`crate::host::swap::SwapMachine::boundary_ahead`]). A body with no
     /// residency machine does nothing, the load's slot map for the model's
     /// life.
     ///
-    /// The contract a body with a machine relies on: it is called once
-    /// before every launch that reads the slot map, after the chain it
-    /// launches is known to exist, and after the previous pass's host
-    /// service has returned, so every host word the engine stream's enqueued
-    /// work waits on is written. The callers: `GpuModel::replay`, and through
-    /// [`GpuModel::pass_boundary`] an eager step or pass
-    /// (`GpuModel::run_tokens`, `GpuModel::run_pass`) and a prompt call, whose
-    /// caller makes one before it and none inside it; the pass before a
-    /// boundary ends with the rows it kept ([`HostServed::keep_rows`]).
-    fn at_boundary(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        let _ = stream;
+    /// The contract a body with a machine relies on: every launch that
+    /// reads the slot map has one boundary before it, taken or made at
+    /// `Launch` after the chain it launches is known to exist; and every
+    /// boundary runs after the last launched pass's host service has
+    /// returned, so every host word the engine stream's enqueued work waits
+    /// on is written, and after that pass's kept rows
+    /// ([`HostServed::keep_rows`]). The callers: `GpuModel::replay`, and
+    /// through [`GpuModel::pass_boundary`] an eager step or pass
+    /// (`GpuModel::run_tokens`, `GpuModel::run_pass`) and a prompt call,
+    /// whose caller makes one before it and none inside it — all at
+    /// `Launch`; and `GpuModel::run_tokens` at `Ahead`, after each step's
+    /// kept row and before its readback, the one pass whose kept rows are
+    /// known before its readback.
+    fn at_boundary(&mut self, stream: &CudaStream, at: BoundaryAt) -> Result<(), GpuError> {
+        let _ = (stream, at);
         Ok(())
     }
 
@@ -455,6 +463,9 @@ pub struct GpuModel<B: ChainBody> {
     /// The load's phases, when its load timed them ([`LoadTimes`]); `None`
     /// on a load that timed none.
     load_times: Option<LoadTimes>,
+    /// The step and pass readbacks begun ([`GpuModel::reads`]): the stamp
+    /// every residency boundary carries ([`BoundaryAt`]).
+    reads: u64,
 }
 
 impl<B: ChainBody> Drop for GpuModel<B> {
@@ -492,6 +503,7 @@ impl<B: ChainBody> GpuModel<B> {
             pos: 0,
             poisoned: None,
             load_times: None,
+            reads: 0,
         }
     }
 
@@ -743,6 +755,16 @@ impl<B: ChainBody> GpuModel<B> {
         self.pos
     }
 
+    /// The step and pass readbacks begun since the load — one a
+    /// [`GpuModel::step`] call, one a [`GpuModel::step_rows`] pass: a
+    /// residency boundary's report carries the count it ran after
+    /// ([`crate::host::swap::PassReport::reads`]), so a boundary made ahead
+    /// of a step's readback carries the count before it.
+    #[must_use]
+    pub fn reads(&self) -> u64 {
+        self.reads
+    }
+
     /// Stand at `pos`: the one write of the position.
     fn stand_at(&mut self, pos: u32) {
         self.pos = pos;
@@ -875,9 +897,14 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// [`GpuModel::step`]'s tokens once its checks have passed: each
-    /// position's refresh and chain, then the head's readback. An error
-    /// here can follow launches, so the caller passes it through
-    /// [`GpuModel::note_fault`].
+    /// position's refresh and chain, its kept row and then the next pass's
+    /// residency boundary made ahead ([`HostServed::at_boundary`] at
+    /// [`BoundaryAt::Ahead`]: its host time runs under the rest of the
+    /// step, the head's read included), then the head's readback. This is
+    /// the one place a boundary runs ahead of its pass. An error here can
+    /// follow launches, so the caller passes it through
+    /// [`GpuModel::note_fault`]; a boundary that fails leaves the model at
+    /// the step's position, as a refused kept row does.
     fn run_tokens(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         self.one_pass = None;
         for &token in tokens {
@@ -892,8 +919,10 @@ impl<B: ChainBody> GpuModel<B> {
             };
             self.name_host_refusal(r)?;
             self.keep_rows(1, crate::host::PassKind::Step)?;
+            self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
             self.stand_at(pos + 1);
         }
+        self.reads += 1;
         self.heads
             .first()
             .ok_or(no_head("GpuModel::step"))?
@@ -904,16 +933,20 @@ impl<B: ChainBody> GpuModel<B> {
     /// of the replay, as `chain`, when the body has a host service: the only
     /// place a captured chain is replayed. The host service's residency
     /// boundary runs first, once the chain is known to exist
-    /// ([`HostServed::at_boundary`]).
+    /// ([`HostServed::at_boundary`] at [`BoundaryAt::Launch`]).
     fn replay(&mut self, rows: usize, chain: Chain) -> Result<(), GpuError> {
         let GpuModel {
-            graphs, body, gpu, ..
+            graphs,
+            body,
+            gpu,
+            reads,
+            ..
         } = self;
         let graph = graphs
             .get(rows)
             .ok_or(GpuError::state("GpuModel::replay", "no captured chain"))?;
         if let Some(host) = body.host() {
-            host.at_boundary(gpu.stream())?;
+            host.at_boundary(gpu.stream(), BoundaryAt::Launch { reads: *reads })?;
         }
         graph.launch(gpu.stream())?;
         match body.host() {
@@ -924,12 +957,19 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// The residency boundary before a pass the caller enqueues itself (a
     /// prompt call, before its first group and none inside it), and before
-    /// every eager step or pass here ([`HostServed::at_boundary`]). Nothing
-    /// for a body with no host service.
+    /// every eager step or pass here ([`HostServed::at_boundary`] at
+    /// [`BoundaryAt::Launch`]: the boundary a step made ahead of this pass
+    /// taken, else made now). Nothing for a body with no host service.
     pub fn pass_boundary(&mut self) -> Result<(), GpuError> {
+        self.boundary_at(BoundaryAt::Launch { reads: self.reads })
+    }
+
+    /// The host service's residency boundary at `at`; nothing for a body
+    /// with no host service.
+    fn boundary_at(&mut self, at: BoundaryAt) -> Result<(), GpuError> {
         let GpuModel { body, gpu, .. } = self;
         match body.host() {
-            Some(host) => host.at_boundary(gpu.stream()),
+            Some(host) => host.at_boundary(gpu.stream(), at),
             None => Ok(()),
         }
     }
@@ -1373,6 +1413,7 @@ impl<B: Rows> GpuModel<B> {
         };
         self.name_host_refusal(r)?;
         self.stand_at(pos + crate::launch_u32(WHAT, "rows", M)?);
+        self.reads += 1;
         let mut out = [0u32; M];
         match B::HEADS {
             RowHeads::PerRow => {
