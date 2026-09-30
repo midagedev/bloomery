@@ -5,7 +5,9 @@
 
 use crate::GpuError;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy, sys};
-use std::mem::{ManuallyDrop, size_of};
+use std::marker::PhantomData;
+use std::mem::{ManuallyDrop, align_of, size_of};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 /// A non-owning window of `len` `T` at device address `ptr` in `ctx`. The
@@ -27,6 +29,150 @@ pub unsafe fn window<T>(
     // `cuMemAlloc` pointer because its drop frees one; a window is never
     // dropped, so the only uses left are the address and the length.
     ManuallyDrop::new(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx.clone()) })
+}
+
+/// A non-owning window of `len` `T` at `byte_off` of a live parent buffer,
+/// borrowed for the window's lifetime: the launches read it exactly as they
+/// read a buffer of its own, and dropping it frees nothing — the parent
+/// frees the allocation after the window is gone.
+///
+/// [`Window::of`] checks the span and the offset, so a window cannot leave
+/// its parent or start misaligned for `T`. This is the shared form, over a
+/// parent borrowed shared: it derefs to `&DeviceBuffer<T>` only. A window to
+/// write through is a [`WindowMut`], from [`WindowMut::of_mut`], which takes
+/// the parent exclusively.
+pub struct Window<'a, T> {
+    buf: ManuallyDrop<DeviceBuffer<T>>,
+    _parent: PhantomData<&'a ()>,
+}
+
+impl<T> Deref for Window<'_, T> {
+    type Target = DeviceBuffer<T>;
+
+    fn deref(&self) -> &DeviceBuffer<T> {
+        &self.buf
+    }
+}
+
+impl<T> Drop for Window<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: `buf` is taken once, here, and never read again.
+        let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
+        // The window owns no memory: its raw parts are dropped, the context
+        // handle with them, and nothing is freed.
+        drop(buf.into_raw_parts());
+    }
+}
+
+impl<T> Window<'_, T> {
+    /// `len` `T` of `parent` from byte `byte_off`, shared with the parent's
+    /// other readers.
+    pub fn of<P>(
+        parent: &DeviceBuffer<P>,
+        byte_off: usize,
+        len: usize,
+    ) -> Result<Window<'_, T>, GpuError> {
+        Ok(Window {
+            buf: cut(parent, byte_off, len, "Window::of")?,
+            _parent: PhantomData,
+        })
+    }
+
+    /// The window's buffer as a plain non-owning handle, past its borrow: for
+    /// a parent that moves beside its windows rather than staying borrowed
+    /// (an arena cut at load).
+    ///
+    /// # Safety
+    ///
+    /// - The parent must stay alive and in place — the same allocation, not
+    ///   freed — for as long as the handle is used.
+    /// - The handle's owner owes it, exactly once, the release this window's
+    ///   `Drop` would have done: dropping the buffer's raw parts, which
+    ///   releases the context handle and frees nothing.
+    pub(crate) unsafe fn into_handle(mut self) -> ManuallyDrop<DeviceBuffer<T>> {
+        // SAFETY: `buf` is taken once, here; `self` is forgotten right below,
+        // so its drop cannot take it again.
+        let buf = ManuallyDrop::new(unsafe { ManuallyDrop::take(&mut self.buf) });
+        std::mem::forget(self);
+        buf
+    }
+}
+
+/// A [`Window`] over a parent held exclusively: the form a staging copy or a
+/// launch writes through. Holding the parent's exclusive borrow for the
+/// window's lifetime is what makes handing out `&mut DeviceBuffer<T>` sound;
+/// the checks and the release on drop are [`Window::of`]'s.
+pub struct WindowMut<'a, T> {
+    window: Window<'a, T>,
+}
+
+impl<T> Deref for WindowMut<'_, T> {
+    type Target = DeviceBuffer<T>;
+
+    fn deref(&self) -> &DeviceBuffer<T> {
+        &self.window.buf
+    }
+}
+
+impl<T> DerefMut for WindowMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut DeviceBuffer<T> {
+        &mut self.window.buf
+    }
+}
+
+impl<T> WindowMut<'_, T> {
+    /// [`Window::of`] over a parent held exclusively: the form a staging copy
+    /// writes through.
+    pub fn of_mut<P>(
+        parent: &mut DeviceBuffer<P>,
+        byte_off: usize,
+        len: usize,
+    ) -> Result<WindowMut<'_, T>, GpuError> {
+        Ok(WindowMut {
+            window: Window {
+                buf: cut(parent, byte_off, len, "WindowMut::of_mut")?,
+                _parent: PhantomData,
+            },
+        })
+    }
+}
+
+/// The checked cut the window constructors share: `len` `T` at `byte_off`,
+/// inside `parent` and on `T`'s alignment, as a non-owning buffer of
+/// `parent`'s context. Each constructor ties the result to `parent`'s
+/// borrow, so the parent stays in place for the window's lifetime.
+fn cut<T, P>(
+    parent: &DeviceBuffer<P>,
+    byte_off: usize,
+    len: usize,
+    what: &'static str,
+) -> Result<ManuallyDrop<DeviceBuffer<T>>, GpuError> {
+    let (size, align) = (size_of::<T>(), align_of::<T>());
+    let refuse = |detail: String| GpuError::Shape { what, detail };
+    if len == 0 {
+        return Err(refuse(format!("a window of 0 {size}-byte values")));
+    }
+    if !byte_off.is_multiple_of(align) {
+        return Err(refuse(format!(
+            "byte {byte_off}, not a multiple of {align}, a {size}-byte value's alignment"
+        )));
+    }
+    let end = len
+        .checked_mul(size)
+        .and_then(|bytes| bytes.checked_add(byte_off))
+        .ok_or_else(|| refuse(format!("{len} × {size} B at byte {byte_off} overflows")))?;
+    let parent_bytes = parent.num_bytes();
+    if end > parent_bytes {
+        return Err(refuse(format!(
+            "{len} × {size} B at byte {byte_off} in a {parent_bytes}-byte parent"
+        )));
+    }
+    let off = u64::try_from(byte_off).map_err(|_| refuse(format!("byte {byte_off} passes u64")))?;
+    // SAFETY: the span `off .. off + len × size` lies inside `parent`'s
+    // allocation and starts aligned for `T` (each refused above); the
+    // constructors tie the window to `parent`'s borrow, so the parent stays
+    // in place until the window is gone.
+    Ok(unsafe { window::<T>(parent.cu_deviceptr() + off, len, parent.context()) })
 }
 
 /// One device allocation cut into `N` consecutive parts, each of which the
@@ -166,6 +312,32 @@ impl<T: DeviceCopy> DeviceTensor<T> {
         drop(ManuallyDrop::into_inner(t).buf.into_raw_parts());
     }
 
+    /// A `rows × cols` window of `parent` from byte `byte_off`, for a
+    /// launcher that takes a tensor: [`Window::of`]'s checks, with the shape
+    /// on top. The window borrows `parent`; dropping it releases the context
+    /// handle, as a [`DeviceTensor::window`] caller's
+    /// [`DeviceTensor::release`] does.
+    pub fn window_of<P>(
+        parent: &DeviceBuffer<P>,
+        byte_off: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<TensorWindow<'_, T>, GpuError> {
+        let what = "DeviceTensor::window_of";
+        let len = rows
+            .checked_mul(cols)
+            .filter(|len| *len > 0)
+            .ok_or_else(|| GpuError::shape(what, format!("{rows} × {cols} values")))?;
+        Ok(TensorWindow {
+            tensor: Some(DeviceTensor {
+                buf: ManuallyDrop::into_inner(cut(parent, byte_off, len, what)?),
+                rows,
+                cols,
+            }),
+            _parent: PhantomData,
+        })
+    }
+
     /// Row count.
     pub fn rows(&self) -> usize {
         self.rows
@@ -185,6 +357,39 @@ impl<T: DeviceCopy> DeviceTensor<T> {
     /// Writable view for `DisjointSlice<T>` / `&mut [T]` kernel parameters.
     pub fn buf_mut(&mut self) -> &mut DeviceBuffer<T> {
         &mut self.buf
+    }
+}
+
+/// A `rows × cols` non-owning window of `parent` from byte `byte_off`,
+/// borrowed for the window's lifetime, for a launcher that takes a tensor:
+/// [`DeviceTensor::window_of`]'s checked cut with the shape on top. Dropping
+/// it frees nothing — the parent frees the allocation after the window is
+/// gone.
+///
+/// Like [`Window::of`], this is the shared form, over a parent borrowed
+/// shared: it derefs to `&DeviceTensor<T>` only.
+pub struct TensorWindow<'p, T> {
+    tensor: Option<DeviceTensor<T>>,
+    _parent: PhantomData<&'p ()>,
+}
+
+impl<T> Deref for TensorWindow<'_, T> {
+    type Target = DeviceTensor<T>;
+
+    fn deref(&self) -> &DeviceTensor<T> {
+        // `Some` for the window's whole life; only `Drop` takes it.
+        self.tensor.as_ref().expect("a live tensor window")
+    }
+}
+
+impl<T> Drop for TensorWindow<'_, T> {
+    fn drop(&mut self) {
+        // The window owns no memory: the tensor's raw parts are dropped, the
+        // context handle with them, and nothing is freed — the parent frees
+        // the allocation after the window is gone.
+        if let Some(t) = self.tensor.take() {
+            drop(t.buf.into_raw_parts());
+        }
     }
 }
 

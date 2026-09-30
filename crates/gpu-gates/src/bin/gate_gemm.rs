@@ -1397,17 +1397,7 @@ mod gate {
         // refusal comes before any launch, so the window's bytes are never
         // read; the error must name the alignment, not another shape check.
         let pad = DeviceBuffer::<u32>::zeroed(stream, res.w.buf().len() + 4)?;
-        // SAFETY: the window is the span after the first word of `pad`, which
-        // holds four more words than the span; `pad` outlives the call and the
-        // window is given back right after it.
-        let w_off = unsafe {
-            DeviceTensor::<u32>::window(
-                pad.cu_deviceptr() + 4,
-                res.w.rows(),
-                res.w.cols(),
-                dev.gpu.context(),
-            )
-        };
+        let w_off = DeviceTensor::<u32>::window_of(&pad, 4, res.w.rows(), res.w.cols())?;
         let misaligned = dev.gk.enqueue_gemm(
             stream,
             GemmArgs {
@@ -1420,7 +1410,6 @@ mod gate {
                 y: &mut y,
             },
         );
-        DeviceTensor::release(w_off);
         refusals.push((
             "q4k_stack_misaligned",
             misaligned.is_err_and(|e| e.to_string().contains("16-byte aligned")),

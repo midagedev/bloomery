@@ -8,8 +8,9 @@
 use super::body35::Body35;
 use super::dispatch::{self, Ctx};
 use super::plan::MixerPlan;
-use super::scratch::{LayerStore, f32_view};
+use super::scratch::LayerStore;
 use crate::model::{GpuModel, MAX_PASS_ROWS, StepMode};
+use crate::tensor::WindowMut;
 use crate::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 
@@ -271,10 +272,9 @@ impl GpuModel<Body35> {
             let io = b.rp.io(m)?;
             dispatch::embed_rows(gpu, w, &io, &mut b.a)?;
         }
-        // SAFETY: `m · hidden` values lie inside `x` (`MAX_PASS_ROWS ·
-        // hidden`); the window lives for this copy alone.
-        let mut rows = unsafe { f32_view(&b.a.x, 0, m * hidden) };
-        rows.copy_from_host(stream, x_in)?;
+        // `x_in` replaces the embedding rows the front wrote; the window
+        // lives for this copy alone.
+        WindowMut::<f32>::of_mut(&mut b.a.x, 0, m * hidden)?.copy_from_host(stream, x_in)?;
         let c = Ctx::new(
             gpu,
             w,
@@ -299,10 +299,9 @@ impl GpuModel<Body35> {
         let slot = self.layer_slot(l, WHAT)?;
         let (gpu, w, b) = self.body_parts(WHAT)?;
         let stream = gpu.stream();
-        // SAFETY: `m · hidden` values lie inside `ffn_inp` (`MAX_PASS_ROWS ·
-        // hidden`); the window lives for this copy alone.
-        let mut rows = unsafe { f32_view(&b.a.ffn_inp, 0, m * hidden) };
-        rows.copy_from_host(stream, ffn_inp)?;
+        // The window lives for this copy alone.
+        WindowMut::<f32>::of_mut(&mut b.a.ffn_inp, 0, m * hidden)?
+            .copy_from_host(stream, ffn_inp)?;
         let c = Ctx::new(
             gpu,
             w,
