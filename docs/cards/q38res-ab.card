@@ -11,7 +11,7 @@
 # window's first steps are the seed's (hit near f): step 11-14.5 ms, +30..+70 %; widened low for the
 # warm-up steps inside n = 96 and for a hit below the replay's: +15..+70.
 # prose:4096 carries the same band (the deeper attention adds ~0.1 ms a step to both arms).
-# Runner (from /Users/hckim/repo/bloomery-c4resid):
+# Runner (from /Users/hckim/repo/bloomery-q38x: c4resid a011bc63 + mtppf 1ce1b0ee):
 # BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38res-ab.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=3
 # just depth-gpu-qwen4exp prose:512@BLOOMERY_RESIDENCY=off prose:512@BLOOMERY_RESIDENCY=mid-p148-s1
 #   prose:4096@BLOOMERY_RESIDENCY=off prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1

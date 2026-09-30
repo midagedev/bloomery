@@ -1,0 +1,35 @@
+# Round c4resid × mtppf: Qwen3.8's MTP draft on top of adaptive residency, plan a (A6000), the same
+# binary, BLOOMERY_RESIDENCY=mid-p148-s1 in both arms, BLOOMERY_DRAFT=mtp against unset. The MTP
+# plan's min n_l is 277 (card_experts 11925 on 43 layers at C 4096), over P + S + 1 = 150.
+# Without residency the draft lifted decode +52 % / +31 % at P 512 / 4096 (mtppf window, 09-30):
+# the window of four rows reads the dense front once and the four rows' host union at a union factor
+# 2.94-3.88 of one token's. Residency moves the host slots a token from ~4.1 to 0.8-1.8 [derived,
+# q38res-ab.card], so the union term MTP amortizes shrinks and the front's share of the step grows:
+# the plain residency step 11-14.5 ms [derived] against a window of the front once (7.3 ms) + the
+# union over ~2.3-5.4 host slots + the draft's chain 1.3-1.6 ms. The draft's 2.8 GB card reserve
+# costs residency its churn room too (min n_l 277 against 298). Band [derived, wide]: +5..+50 %.
+# Runner (from /Users/hckim/repo/bloomery-q38x: c4resid a011bc63 + mtppf 1ce1b0ee):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38resmtp-ab.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=3
+# just depth-gpu-qwen4exp prose:512@BLOOMERY_RESIDENCY=mid-p148-s1
+#   prose:512@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=mtp prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1
+#   prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=mtp
+# Wall [derived]: 4 arms × 3 rounds as the mtppf window, about 6-8 min.
+kind: ab
+question: with adaptive residency on, does Qwen3.8's MTP window still lift decode, and what does
+  its prompt cost?
+term: tg tok/s @ n=96, the prose corpus (prose:512 and prose:4096), ctx 4352
+  (BLOOMERY_GEN_CTX=4352), A6000, plan a (card experts), BLOOMERY_RESIDENCY=mid-p148-s1 in both
+  arms, BLOOMERY_DRAFT=mtp against unset, same binary, paired by round
+unit: %
+predict: +5..+50
+rounds: 3
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, both arms of a P in one lease, a fresh process per load group, the host set
+  and the PLE table warm before each timed window, no [cpu-busy] or [other-busy] row; both arms'
+  residency records name mid-p148-s1; the mtp arm's load line names draft=mtp; distinct_tokens
+  equal between the arms
+decide-in: the defaults for Qwen3.8 from the 2x2 (this card and q38res-ab): residency on, and MTP
+  on where the end-to-end break-even at the measured prompt cost holds
+decide-below: MTP stays opt-in; the draft's card reserve (place.rs) is the next Qwen3.8 round
+decide-above: the union factor was under-counted with residency on: re-derive from one
+  BLOOMERY_STEP_STATS window
