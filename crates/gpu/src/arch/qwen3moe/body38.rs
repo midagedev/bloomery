@@ -90,12 +90,12 @@ use super::scratch38::{
 use super::swap38::{DEADLINE, LIVE_DELAY, Qwen38Stacks};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
-    Gemm38, Prompt38Stats, Wide38, WideForce, WideParts, WideTaps, WideTiming, dense_rows, nanos,
-    route_taps_host,
+    Gemm38, Prompt38Stats, STREAM_FLOOR, Stream38, Wide38, WideForce, WideParts, WideTaps,
+    WideTiming, dense_rows, nanos, route_taps_host,
 };
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
-use crate::host::swap::{PassReport, ResetReport, Residency};
+use crate::host::swap::{CallCfg, CallPick, CallReport, PassReport, ResetReport, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
@@ -497,6 +497,9 @@ pub struct Body38 {
     /// ([`GpuModel::set_prompt38_stats`]); unarmed, the walk records and
     /// waits for nothing.
     wide_timing: Option<WideTiming>,
+    /// The prompt call's host streaming (`BLOOMERY_HOSTSTREAM`): off until
+    /// a caller sets it ([`Body38::set_hoststream`]).
+    stream: Stream38,
     /// The map check every walk reads ([`MapCheck::refuse`]): the tier's
     /// slot map's, or the one a gate planted in its place until it is taken
     /// back or the model reset.
@@ -915,6 +918,7 @@ impl Body38 {
             wide_hsum,
             wide,
             wide_timing: None,
+            stream: Stream38::default(),
             card_leg,
             lane: LaneWord::new(stream)?,
             pending: None,
@@ -1163,6 +1167,46 @@ impl Body38 {
     /// two takes. Nothing is kept until then.
     pub fn log_residency(&mut self, passes: usize) {
         self.residency_glue.log_passes(passes);
+    }
+
+    /// The least count a streaming pick admits ([`super::wide38`]'s
+    /// `STREAM_FLOOR`): a prompt call of fewer ids opens no call.
+    pub const STREAM_FLOOR: u32 = STREAM_FLOOR;
+
+    /// Whether the next prompt calls stream host experts into the residency
+    /// pool (`BLOOMERY_HOSTSTREAM`, [`super::wide38`]'s module doc): off
+    /// until set here, so one load can run both arms. Refused by name: `on`
+    /// on a load that runs no residency machine, and any change while a call
+    /// streams.
+    pub fn set_hoststream(&mut self, on: bool) -> Result<(), GpuError> {
+        const WHAT_S: &str = "Body38::set_hoststream";
+        if self.stream.on {
+            return Err(GpuError::state(WHAT_S, "no prompt call streaming"));
+        }
+        if on && self.hybrid.swap().is_none() {
+            return Err(GpuError::state(
+                "BLOOMERY_HOSTSTREAM=on",
+                "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>)",
+            ));
+        }
+        self.stream.lever = on;
+        Ok(())
+    }
+
+    /// Whether the next prompt calls stream ([`Body38::set_hoststream`]).
+    #[must_use]
+    pub fn hoststream(&self) -> bool {
+        self.stream.lever
+    }
+
+    /// The last streaming prompt call's picks, each with its ubatch, and its
+    /// end; empty and `None` after a call that did not stream. Taken: a
+    /// second read is empty.
+    pub fn take_stream_records(&mut self) -> (Vec<(usize, CallPick)>, Option<CallReport>) {
+        (
+            std::mem::take(&mut self.stream.picks),
+            self.stream.end.take(),
+        )
     }
 
     /// The residency machine's source, when the load runs one.
@@ -1641,6 +1685,7 @@ impl Body38 {
             wide_hsum,
             wide,
             wide_timing,
+            stream,
             k,
             slots,
             card,
@@ -1671,6 +1716,7 @@ impl Body38 {
                 pos0: pos as usize,
                 dense,
                 cur: 0,
+                stream,
             },
         };
         let cap = prog.p.x.rows;
@@ -1862,6 +1908,13 @@ impl GpuModel<Body38> {
     /// returned: the rule counts decode rows only, and the batch service
     /// notes no id. A step-fed prompt is refused by name under a running
     /// machine: each prompt id would end a decode pass the rule counts.
+    /// Under host streaming ([`Body38::set_hoststream`]) a ubatch-fed call
+    /// is also the machine's call: its walks move the pool
+    /// ([`super::wide38`]'s module doc), its placement stays for the decode
+    /// after it, and a call that fails leaves each layer at the set it
+    /// started with. A pass-fed call, and one of fewer ids than the pick's
+    /// floor, opens none: its rows give an expert fewer counts than the
+    /// floor, so its pick would admit nothing.
     pub fn prompt38_with(
         &mut self,
         tokens: &[u32],
@@ -1902,13 +1955,67 @@ impl GpuModel<Body38> {
             ));
         }
         self.pass_boundary()?;
-        let r = self.feed38(tokens, resolved, sink);
-        // The call's own error first: a keep refused after a failed call is
-        // its echo.
+        let r = self
+            .stream_begin(resolved, tokens.len())
+            .and_then(|()| self.feed38(tokens, resolved, sink));
+        // The call's own error first: an end or a keep refused after a
+        // failed call is its echo. A failed call's streaming ends with each
+        // layer back at the set it started with.
+        let ended = self.stream_end(r.is_ok());
         let kept = self.keep_rows(0, PassKind::Prompt);
         let next = r?;
+        ended?;
         kept?;
         Ok(next)
+    }
+
+    /// Open the prompt call's streaming when the lever is on, the path is
+    /// the ubatch walk's ([`super::wide38`]'s module doc) and the prompt's
+    /// `n` ids reach [`STREAM_FLOOR`]: the residency machine's call
+    /// ([`crate::host::HostTier::call_begin`]) at that floor, inside the pass
+    /// the boundary just opened. Nothing otherwise: a row routes an expert
+    /// once at most, so a prompt of fewer ids than the floor — and every
+    /// pass, of at most [`PASS_ROWS`] rows — gives no expert a count its
+    /// pick would admit, and its walks would only wait on each layer's
+    /// download for nothing. Refused by name: a call streaming already, and
+    /// the lever on with no machine.
+    fn stream_begin(&mut self, path: Prompt38, n: usize) -> Result<(), GpuError> {
+        const _: () = assert!(PASS_ROWS < STREAM_FLOOR as usize);
+        const WHAT_B: &str = "qwen4exp prompt streaming";
+        let (gpu, _, body) = self.body_parts(WHAT_B)?;
+        if body.stream.on {
+            return Err(GpuError::state(WHAT_B, "no call streaming (stream_end)"));
+        }
+        body.stream.picks.clear();
+        body.stream.end = None;
+        body.stream.ubatch = 0;
+        if !body.stream.lever || path != Prompt38::Gemm || n < STREAM_FLOOR as usize {
+            return Ok(());
+        }
+        let cfg = CallCfg {
+            floor: STREAM_FLOOR,
+        };
+        if !body.hybrid.call_begin(gpu.stream(), cfg)? {
+            return Err(GpuError::state(
+                "BLOOMERY_HOSTSTREAM=on",
+                "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>)",
+            ));
+        }
+        body.stream.on = true;
+        Ok(())
+    }
+
+    /// End the prompt call's streaming, if it streams
+    /// ([`crate::host::HostTier::call_end`]): its placement `kept` for the
+    /// decode after it, else each layer back at the set the call started
+    /// with; the end's report kept for [`Body38::take_stream_records`].
+    fn stream_end(&mut self, kept: bool) -> Result<(), GpuError> {
+        let (gpu, _, body) = self.body_parts("qwen4exp prompt streaming")?;
+        if !std::mem::take(&mut body.stream.on) {
+            return Ok(());
+        }
+        body.stream.end = body.hybrid.call_end(gpu.stream(), kept)?;
+        Ok(())
     }
 
     /// [`GpuModel::prompt38_with`]'s paths once its checks have passed, its
@@ -1954,6 +2061,7 @@ impl GpuModel<Body38> {
                     }
                     next = self.run_rows(m, WHAT_P, |gpu, w, body, head, pos| {
                         body.walk_gemm(gpu, w, m, pos, last.then_some(head))?;
+                        body.stream.ubatch += 1;
                         Ok(last)
                     })?;
                     if let Some(f) = sink.as_deref_mut() {

@@ -39,6 +39,28 @@
 //!   byte (`dropped_bytes` 0: the churn pool stays in the host set for the
 //!   model's life) (mutant: the reset's copies of the seed experts back
 //!   skipped).
+//! - `stream` (host streaming, `Body38::set_hoststream`): from a clear, the
+//!   first [`STREAM_PROMPT`] ids of the qwen4exp prose corpus as one prompt
+//!   call, then [`STREAM_STEPS`] greedy steps, once with the prompt's
+//!   streaming off and once on. On, the call's end leaves a live set other
+//!   than the seed on some layer, the call closed, and admitted experts; off,
+//!   every live set is the seed. The first decode step's host slots are
+//!   fewer on than off. The two runs agree as the unstreamed walk and the
+//!   streamed one can (the card and the host sum a token's experts in
+//!   another split): the prompt's last logits row within
+//!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN) of the off run's
+//!   everywhere, and the greedy ids equal or, where they first part, the on
+//!   run's top-1 margin below it (a near tie, V4.1's `gate_ds41_callstream`
+//!   `s3` rule). A prompt of one id fewer than `Body38::STREAM_FLOOR`,
+//!   streaming on, opens no call (no pick record, no end). Mutants, one a
+//!   rule: the call's end returns each layer to
+//!   the set it started with (`stream_end` with `kept` false: the live sets
+//!   and the first step's host slots are the seed's); the pick admits
+//!   nothing (a floor past any count: the same, and no expert admitted); the
+//!   card route enqueued before the pick (it reads the call's start words
+//!   while the union reads the moved map, so an admitted expert's columns
+//!   run nowhere and the logits part); the short prompt's guard removed (its
+//!   call opens and ends, admitting nothing).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -63,10 +85,10 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model};
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::swap::{PassReport, Residency, SlotState, SwapSource};
+    use bloomery_gpu::host::swap::{CallReport, PassReport, Residency, SlotState, SwapSource};
     use bloomery_gpu::window;
     use bloomery_gpu_gates::record;
-    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
     use gguf::Split;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
@@ -87,10 +109,34 @@ mod gate {
     const STEPS: usize = 96;
     /// A refusal before the load reads the file's headers only.
     const REFUSE_BOUND_S: f64 = 120.0;
+    /// The streaming clause's prompt: one ubatch of real text, whose routing
+    /// clears the pick's floor on most card layers.
+    const STREAM_PROMPT: usize = 512;
+    /// Greedy steps after the streaming clause's prompt.
+    const STREAM_STEPS: usize = 32;
 
     /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
     fn prose(n: usize) -> Result<Vec<u32>, GateError> {
         let path = data_dir().join("engram").join("corpus-prose.ids");
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let ids = text
+            .split_whitespace()
+            .take(n)
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() < n {
+            return Err(
+                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
+            );
+        }
+        Ok(ids)
+    }
+
+    /// The first `n` ids of `$BLOOMERY_DATA/qwen4exp/corpus-prose.ids`, the
+    /// Qwen3.8 tokenizer's prose corpus (the runner's `prose:<P>` ids).
+    fn prose38(n: usize) -> Result<Vec<u32>, GateError> {
+        let path = data_dir().join("qwen4exp").join("corpus-prose.ids");
         let text =
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let ids = text
@@ -318,6 +364,188 @@ mod gate {
         Ok(ok)
     }
 
+    /// What one run of the streaming clause saw: the greedy ids, the prompt
+    /// call's host slots, the first decode step's, the layers whose live set
+    /// is not the seed after the call, whether a call is left open, and the
+    /// call's end.
+    struct StreamRun {
+        tokens: Vec<u32>,
+        /// The prompt call's last logits row, and each greedy id's top-1
+        /// margin, the call's first.
+        logits: Vec<f32>,
+        margins: Vec<f32>,
+        prompt_slots: u64,
+        first_slots: u64,
+        moved: usize,
+        open: bool,
+        end: Option<CallReport>,
+    }
+
+    /// The layers whose live set is not their seed.
+    fn moved_layers(s: &Session<Body38>) -> Result<usize, GateError> {
+        let m = s.model();
+        let b = m.body(NAME)?;
+        let machine = b
+            .hybrid()
+            .swap()
+            .ok_or("the load runs no residency machine")?;
+        let mut moved = 0;
+        for l in b.hybrid().slots().layers() {
+            let seed = machine.seed(l)?;
+            let live: Vec<u32> = machine
+                .ledger()
+                .row(l)
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|st| match st {
+                    SlotState::Live(e) => Some(*e),
+                    _ => None,
+                })
+                .collect();
+            if live.len() != seed.len() || !seed.iter().all(|e| live.contains(e)) {
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// One run of the streaming clause from a clear, the prompt call's
+    /// streaming `on`; the lever off again after it.
+    fn stream_run(s: &mut Session<Body38>, ids: &[u32], on: bool) -> Result<StreamRun, GateError> {
+        s.clear()?;
+        take_passes(s)?;
+        s.model_mut().body_parts(NAME)?.2.set_hoststream(on)?;
+        let stats = |s: &Session<Body38>| -> Result<_, GateError> {
+            Ok(s.model().body(NAME)?.hybrid().stats())
+        };
+        let before = stats(s)?.batch_host_slots;
+        let out = s.prompt(ids, Want::Logits)?;
+        let mut next = out.argmax();
+        let Out::Logits { row, .. } = out else {
+            return Err("the prompt call returned no logits row".into());
+        };
+        let logits = row.to_vec();
+        let mut margins = vec![margin(&logits)?];
+        let prompt_slots = stats(s)?.batch_host_slots - before;
+        let (_, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        let moved = moved_layers(s)?;
+        let open = s
+            .model()
+            .body(NAME)?
+            .hybrid()
+            .swap()
+            .is_some_and(|m| m.call_open());
+        let mut tokens = vec![next];
+        let mut first_slots = 0;
+        for i in 0..STREAM_STEPS {
+            let before = stats(s)?.host_slots;
+            let out = s.step(next, Want::Logits)?;
+            next = out.argmax();
+            if let Out::Logits { row, .. } = out {
+                margins.push(margin(row)?);
+            }
+            if i == 0 {
+                first_slots = stats(s)?.host_slots - before;
+            }
+            tokens.push(next);
+        }
+        take_passes(s)?;
+        s.model_mut().body_parts(NAME)?.2.set_hoststream(false)?;
+        Ok(StreamRun {
+            tokens,
+            logits,
+            margins,
+            prompt_slots,
+            first_slots,
+            moved,
+            open,
+            end,
+        })
+    }
+
+    /// The top-1 margin of a logits row; a value that is not finite is
+    /// refused by name.
+    fn margin(row: &[f32]) -> Result<f32, GateError> {
+        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for (i, &v) in row.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(format!("logit {i} is {v}").into());
+            }
+            if v > a {
+                b = a;
+                a = v;
+            } else if v > b {
+                b = v;
+            }
+        }
+        Ok(a - b)
+    }
+
+    /// `stream`: the prompt call streaming against not, from a clear each.
+    fn stream_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
+        let ids = prose38(STREAM_PROMPT)?;
+        let off = stream_run(s, &ids, false)?;
+        let on = stream_run(s, &ids, true)?;
+        if let Some(r) = &on.end {
+            record::call_report(r).print();
+        }
+        let admitted = on.end.map_or(0, |r| r.admitted);
+        let map_ok = on.moved > 0 && off.moved == 0 && admitted > 0 && !on.open && !off.open;
+        let slots_ok = on.first_slots < off.first_slots;
+        let dlogit = on
+            .logits
+            .iter()
+            .zip(&off.logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let logits_ok = on.logits.len() == off.logits.len() && dlogit < GREEDY_MARGIN;
+        let parted = on.tokens.iter().zip(&off.tokens).position(|(a, b)| a != b);
+        let ids_ok = on.tokens.len() == off.tokens.len()
+            && parted.is_none_or(|i| on.margins.get(i).is_some_and(|&m| m < GREEDY_MARGIN));
+        // A prompt too short for the floor opens no call.
+        let short_ids = prose38(Body38::STREAM_FLOOR as usize - 1)?;
+        s.clear()?;
+        take_passes(s)?;
+        s.model_mut().body_parts(NAME)?.2.set_hoststream(true)?;
+        s.prompt(&short_ids, Want::Argmax)?;
+        let (short_picks, short_end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        s.model_mut().body_parts(NAME)?.2.set_hoststream(false)?;
+        take_passes(s)?;
+        let short_ok = short_picks.is_empty() && short_end.is_none();
+        println!(
+            "stream: a {}-id prompt, streaming on: {} picks, an end {}: {}",
+            short_ids.len(),
+            short_picks.len(),
+            short_end.is_some(),
+            verdict(short_ok)
+        );
+        let ok = map_ok && slots_ok && logits_ok && ids_ok && short_ok;
+        println!(
+            "stream: a {STREAM_PROMPT}-id prompt call, off / on: layers moved from the seed {} / \
+             {} ({admitted} experts admitted, a call left open {} / {}), the prompt's host slots \
+             {} / {}, the first step's host slots {} / {}, the prompt's logits max|diff| {dlogit} \
+             (under {GREEDY_MARGIN}: {logits_ok}), {} greedy ids equal or parted at a near tie \
+             {ids_ok}{}: {}",
+            off.moved,
+            on.moved,
+            off.open,
+            on.open,
+            off.prompt_slots,
+            on.prompt_slots,
+            off.first_slots,
+            on.first_slots,
+            on.tokens.len(),
+            parted
+                .map(|i| format!(
+                    " (first parted at {i}, on's margin {:?})",
+                    on.margins.get(i)
+                ))
+                .unwrap_or_default(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// `refuse`: the host one byte short of the churn pool.
     fn refuse_clause(
         path: &Path,
@@ -490,6 +718,8 @@ mod gate {
             verdict(c7)
         );
         pass &= c7;
+
+        pass &= stream_clause(&mut s)?;
 
         if pass {
             println!("{NAME}: every clause passed");
