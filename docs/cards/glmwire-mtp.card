@@ -13,7 +13,9 @@ question: does GLM-5.3-Flash's NextN MTP window beat the plain step, and llama.c
 term: tok/s(mean) @ n=96, depth 512, A6000: the ours arm under BLOOMERY_DRAFT=mtp, 1e3 over its SMOKE mean_ms (the
   kept positions' walls, each window's wall over the rows it kept), plan (a), prose ids
 unit: tok/s
-predict: 22.5..29.9
+# Corrected 2026-10-01 with glmpair-probe.card's V2/S1 1.34-1.52 (was 1.13-1.51): ~~22.5..29.9~~ 22.4..25.3,
+# center 23.6 tok/s at alpha 0.684 [derived]; llama.cpp #27754's MTP arm is 23.29, so the verdict sits in the band.
+predict: 22.4..25.3
 condition: one lease, 2 rounds; every ours row prints an mtp summary with proposals above 0, and its tokens line
   equals the plain run's of the same 512 ids (the functional run on the 3090 before the lease prints both; (w)
   holds it on the set); no row carries [cpu-busy], [other-busy] or [cold]; the lcpp27754mtp arm in the same lease;
