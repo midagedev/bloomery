@@ -793,10 +793,8 @@ impl Body {
         let map_layers = hosted(&inputs.spec.layers)
             .map_err(|e| shape(e.to_string()))?
             .len();
-        // The most rows one pass runs: the decode step alone today. The
-        // verify of a shared MTP window, when it lands, is the pass that
-        // raises this.
-        const MAX_ROWS: usize = 1;
+        // The most rows one pass runs: the two-row verify pass.
+        const MAX_ROWS: usize = PAIR_ROWS;
         let spec = ResidencySpec {
             lever: residency,
             delay: swap::LIVE_DELAY,
@@ -949,7 +947,7 @@ impl Body {
                 hidden: dims.embd,
                 n_used: N_USED,
             },
-            1,
+            PAIR_ROWS,
         )?;
         let file = Arc::clone(file);
         let experts = GlmHost::build(Arc::clone(&file), hp, run.clone(), host.r8)?;
