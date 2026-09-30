@@ -3392,6 +3392,8 @@ TREE_WALK = re.compile(
 )
 ITEM_RE = re.compile(r"^([A-Za-z0-9_-]+)(?:@([^:]*))?(?::(.*))?$")
 ANY_CARD = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
+# The form on a tools/gpu-gate.sh call in a script, as tools/gate-batch.sh's walk reads a lane from it.
+ANY_CARD_CALL = re.compile(re.escape(ANY_CARD) + r"\s+(?:bash\s+|exec\s+)?[^\s;&|#'\"]*gpu-gate\.sh\b")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 # A /models path as a literal: not the tail of a longer path (`tools/ref/models/x.sh`, `$HOME/models`,
 # `${D}/models`, `$(pwd)/models`), but after a quote, `=`, a space, the `-` of a `${V:-/models/…}` default,
@@ -3744,11 +3746,18 @@ class KeyContext:
                     return f"{hit} reads a reference tree, which is outside the key"
         # tools/gpu-gate.sh's `any` picks a card at run time (the idle A6000, else the 3090): with no card
         # forced (--lanes 1) the key cannot name the card a green ran on.
+        # The form counts in the recipe's text and in every script it runs (tools/ptx-scan.sh's JIT), the
+        # closure tools/gate-batch.sh classifies a lane from.
         forced = any(e.partition("=")[0] == "BLOOMERY_GATE_CARD" for e in self.box_env.split() + envs)
         if not forced:
             for n in names:
                 if any(ANY_CARD in ln for ln in recipes[n].lines):
                     return f"{n} calls tools/gpu-gate.sh with the `any` card and no card is forced (--lanes 1): the card is picked at run time"
+            boxed = [n for n in names if self.side.graph.inputs(n).commands.box]
+            for f in self.run_scripts(boxed) if boxed else []:
+                hit = scan_file(self.side.tree.root, f, ANY_CARD_CALL)
+                if hit:
+                    return f"{hit} calls tools/gpu-gate.sh with the `any` card and no card is forced (--lanes 1): the card is picked at run time"
         # A path in an env entry is read by the gate but not by the box manifest: the manifest walks
         # $BLOOMERY_DATA and the model directories as the caller's env names them, never an item's.
         for e in envs:
@@ -4455,6 +4464,11 @@ def key_self_test(expect, real: Side) -> None:
         expect(c.parts(items["gpu"])[1] is not None, "a failed manifest fetch keyed an item")
         c = KeyContext(sa, mf, "", {}, settings=settings)
         expect(c.parts("gate gpu")[1] is not None and c.parts("gate-nope")[1] is not None, "a malformed or unknown item was keyed")
+        # The `any` card in a script the recipe runs (ptx-scan.sh's JIT) picks the card at run time as it does
+        # in the recipe's text: with no card forced the item never skips; forced, it can.
+        for n in ("gate-ptx-spill",):
+            expect(c.parts(n)[2] is not None, f"{n} with no card forced was skippable: its script's any-card call picks the card at run time")
+            expect(c.parts(f"{n}@BLOOMERY_GATE_CARD=a6000")[2] is None, f"{n} with the A6000 forced never skips: {c.parts(n + '@BLOOMERY_GATE_CARD=a6000')[2]}")
         expect(c.parts("gate-sampler@BLOOMERY_REF_MODEL=/models/small/x.gguf")[2] is not None, "an item env naming a path was skippable")
         c2 = KeyContext(sa, mf, "BLOOMERY_KLD_FILE=/root/x.kld", {}, settings=settings)
         expect(c2.parts(items["cpu"])[2] is not None, "a caller env path outside data and /models was skippable")
@@ -4475,7 +4489,7 @@ def key_self_test(expect, real: Side) -> None:
         with open(plan, "w", encoding="utf-8") as fh:
             fh.write(plan_text)
         expect(not before.startswith("error") and before != after, "a tree file named in ARGS is not in the key")
-        expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000")[2] is None and c.parts("gate-gpu-q4k-sel")[2] is None, "a card-determined item was never-skip")
+        expect(c.parts("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000")[2] is None and c.parts("gate-gpu-hybrid")[2] is None, "a card-determined item was never-skip")
         expect(c.parts("ptx-scan@BLOOMERY_GATE_CARD=a6000:generate_ds41 --features gpu,deepseek41")[2] is not None,
                "an item whose cargo selector is a recipe parameter was skippable")
         # a module file the walk reaches through `mod` (not a target root): gone, the item is an error

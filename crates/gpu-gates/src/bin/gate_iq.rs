@@ -1,5 +1,5 @@
 //! GPU gate for the IQ2_XS, IQ3_XXS, IQ4_XS and Q2_K row cores
-//! (`bloomery_gpu::iq`) on the 3090.
+//! (`bloomery_gpu::iq`) on one card.
 //!
 //! Weights are the synthetic rows `dequant_ref --synthetic` writes for
 //! `just gate-1-1` (`$BLOOMERY_DATA/ref-synth/<type>.blocks`: 64 rows ggml

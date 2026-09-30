@@ -24,7 +24,8 @@
 # Lanes (--lanes 2, the default), read from each recipe's text and attributes in `just --dump` (and
 # its dependencies'), and from the scripts that text runs, followed transitively (walk() below):
 #   A  fixed, the 3090: a tools/gpu-gate.sh call, in the recipe or a script it runs, without
-#      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} (V4.1 `--place gate` gates, the V2-Lite p-gates), or device code run with no gate lock at all
+#      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} (V4.1 `--place gate` gates; gate-gpu-hybrid, whose host tier spins
+#      the worker pool on the cores a V4.1 gate's pool is pinned to), or device code run with no gate lock at all
 #      (`tools/gate.sh --oxide`, `cargo oxide test|run`, a `target/release/` binary of a recipe that
 #      runs `cargo oxide`: it lands on the box env's 3090 pin). A gpu-gate.sh recipe here runs with
 #      BLOOMERY_GATE_CARD=3090 in BLOOMERY_BOX_ENV, so a mixed recipe's `any` calls stay on the 3090.
@@ -67,8 +68,13 @@
 # own on the same cards), and an item whose ARGS hand a `[group('solo')]` recipe's gpu-gate.sh binary
 # one of the --flags that recipe passes it (in the self-test's fixture, `v41-a:--faults` is the solo
 # recipe v41-solo's arm, which runs alone and with BLOOMERY_HOST_LOCK=1) — the error names the solo
-# recipe to list instead. Each lane runs its items in list order; A and B run
-# concurrently (cargo serializes their builds by its own lock). --lanes 1 runs every item in the
+# recipe to list instead. Lane A runs its items in list order, lane B in the order the balance placed them
+# (its skips, then longest first), lane X by model family (the profile box.sh loads: V4.1 first, then each
+# family in the order its first item is listed, each in list order); A and B run concurrently (cargo
+# serializes their builds by one lock on the box tree's target directory, so a long lane-B build makes a
+# lane-A item that starts inside it wait: lane B's order decides when its long builds start, and in a
+# landing list whose longest balanced item runs on the Mac, check-recipes, they start after it).
+# --lanes 1 runs every item in the
 # list's order in one lane (labelled A), with no card forced — the recipes' own defaults, as a hand
 # batch runs them.
 #
@@ -385,7 +391,32 @@ weekly-a:
 [group('solo')]
 weekly-b:
     ./tools/box.sh 'BLOOMERY_HOST_LOCK=1 bash tools/gpu-gate.sh wb'
+
+[group('solo')]
+x-glm:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/gpu-gate.sh xg'
+
+[group('solo')]
+x-q:
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/gpu-gate.sh xq'
+
+[group('solo')]
+x-v41:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/gpu-gate.sh xv'
+
+[group('solo')]
+x-none:
+    ./tools/box.sh 'bash tools/gpu-gate.sh xn'
+
+[group('solo')]
+x-v41b: x-v41dep
+
+x-v41dep:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gpu-gate.sh xw'
 JF
+  # The default profile a recipe with no BLOOMERY_MODEL loads.
+  mkdir -p "$t/tools/ref"
+  printf '%s\n' ': "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deepseek2}}"' > "$t/tools/ref/ref-paths.sh"
   # Unpinned, v41-any (50 s, balanced) would go to lane B: lane A holds v41-a's 100 s.
   printf '%s\t%s\t%s\t%s\t%s\n' v41-a A 3090 100 2026-09-27T10:00:00+0900 v41-any B a6000 50 2026-09-27T10:00:00+0900 \
     plain-any B a6000 10 2026-09-27T10:00:00+0900 host B none 5 2026-09-27T10:00:00+0900 > "$t/times.tsv"
@@ -431,6 +462,17 @@ DF
     "^lane A  v41-any +BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=3090' just v41-any$" "${gb[@]}" --dry-run v41-a v41-any plain-any host
   check 'dry run: lane A holds both V4.1 loads' 0 'predicted laneA=150s laneB=15s laneX=0s wall=150s' \
     "${gb[@]}" --dry-run v41-a v41-any plain-any host
+  # Lane X by model family, V4.1 first, then each family in the order its first item is listed; a
+  # dependency's profile is the recipe's, a recipe with none loads ref-paths.sh's default.
+  out=$("${gb[@]}" --dry-run x-glm x-none x-q x-v41 x-glm x-v41b 2>&1) || fail 'order: lane X by family' "the dry run failed"
+  got=$(printf '%s\n' "$out" | sed -n 's/^lane X  \([^ ]*\) .*/\1/p' | tr '\n' ' ')
+  if [ "$got" = 'x-v41 x-v41b x-glm x-glm-2 x-none x-q ' ]; then pass 'order: lane X by family, V4.1 first, then first appearance'
+  else fail 'order: lane X by family, V4.1 first, then first appearance' "got '$got'"; fi
+  # Lane B runs longest first (the Mac-only check-recipes heads it in a landing batch), not in list order.
+  out=$("${gb[@]}" --dry-run v41-a host plain-any 2>&1) || fail 'order: lane B longest first' "the dry run failed"
+  got=$(printf '%s\n' "$out" | sed -n 's/^lane B  \([^ ]*\) .*/\1/p' | tr '\n' ' ')
+  if [ "$got" = 'plain-any host ' ]; then pass 'order: lane B longest first, not in list order'
+  else fail 'order: lane B longest first, not in list order' "got '$got'"; fi
   check 'items: a batch as an item is refused by name' 65 'nested runs tools/gate-batch\.sh' "${gb[@]}" --dry-run host nested
   check "items: a solo recipe's arm through another recipe is refused, naming the solo recipe" 65 \
     "'v41-a:--faults' hands gen_y --faults, the arm of the solo recipe v41-solo" "${gb[@]}" --dry-run 'v41-a:--faults'
@@ -1083,7 +1125,39 @@ if src == "classes":
             print("\t".join([name, cls, kind, ",".join(cards), "; ".join(tags + [reason])]))
     sys.exit(0)
 
-counts, errors, out = {}, [], []
+# An item's model family: the profile tools/box.sh loads for it — the BLOOMERY_MODEL a recipe of its
+# closure sets on its box line, else tools/ref/ref-paths.sh's default. Lane X runs FIRST_FAMILY first:
+# lane A's last loads are V4.1's (the v41-load group), so its host set is still in the page cache when lane
+# X starts, and every family switch after that refetches a host set once.
+FIRST_FAMILY = "deepseek41"
+PROFILE_SET = re.compile(r"\bBLOOMERY_MODEL=([A-Za-z0-9_]+)\s+(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*\./tools/box\.sh\b")
+DEFAULT_PROFILE = []
+
+
+def default_profile():
+    """ref-paths.sh's default profile, read once, when a recipe sets none."""
+    if not DEFAULT_PROFILE:
+        path = os.path.join(root, "tools/ref/ref-paths.sh")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                got = re.findall(r'^: "\$\{BLOOMERY_MODEL:=\$\{BLOOMERY_REF_MODEL_PROFILE:-([A-Za-z0-9_]+)\}\}"$', fh.read(), re.M)
+        except OSError as e:
+            fail(f"{path} cannot be read ({e.strerror}): lane X's family order reads the default profile there")
+        if len(got) != 1:
+            fail(f"{path} holds {len(got)} default-profile lines, not one: lane X's family order reads the default there")
+        DEFAULT_PROFILE.append(got[0])
+    return DEFAULT_PROFILE[0]
+
+
+def family(name):
+    for n in closure(name, set()):
+        m = PROFILE_SET.search(body(n))
+        if m:
+            return m.group(1)
+    return default_profile()
+
+
+counts, errors, out, fams = {}, [], [], []
 for item, at in zip(raw_items, where):
     m = ITEM.match(item)
     if not m:
@@ -1146,10 +1220,20 @@ for item, at in zip(raw_items, where):
     stem = name if counts[name] == 1 else f"{name}-{counts[name]}"
     shown = item if (env is not None or args is not None) else ""
     out.append("\x1f".join([cls, stem, name, " ".join(envs), qargs, shown, reason, kind, str(exp), esrc, tkey, " ".join(cards), " ".join(labels)]))
+    fams.append(family(name) if cls == "X" else "")
 if errors:
     for e in errors:
         print("gate-batch: " + e, file=sys.stderr)
     fail(f"{len(errors)} item error(s); nothing ran")
+# Lane X by model family: FIRST_FAMILY's items first, then each other family's in the order its first item
+# is listed, each family's items in list order. The other lanes keep list order (a record's lane is its
+# first field, and lanes run their own records in order).
+rank = {FIRST_FAMILY: 0}
+for f in fams:
+    if f:
+        rank.setdefault(f, len(rank))
+xs = sorted((k for k, rec in enumerate(out) if rec.startswith("X\x1f")), key=lambda k: (rank[fams[k]], k))
+out = [rec for rec in out if not rec.startswith("X\x1f")] + [out[k] for k in xs]
 print("\n".join(out))
 PY
 PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" ${ITEMS[@]+"${ITEMS[@]}"}) \
@@ -1224,15 +1308,17 @@ for i, f in enumerate(recs):
     else:
         fail(f"{stem} fits no lane (class {cls!r}, cards {' '.join(cards)}, --lanes {lanes})")
 # The ledger first: an item green on one lane's card only skips there, so it goes there at 0 s.
-rest = []
+rest, seq = [], []
 for i in flex:
     lc, states = lane_cand(recs[i][11].split()), recs[i][13].split()
     green = [ln for ln in ("A", "B") if states[lc[ln]] == "skip"]
     if len(green) == 1:
         placed[i] = (green[0], lc[green[0]], 0, f"to {green[0]}, the one lane whose card has it green")
+        seq.append(i)
     elif green:
         ln = "A" if sums["A"] < sums["B"] else "B"
         placed[i] = (ln, lc[ln], 0, f"to {ln}, green in either lane")
+        seq.append(i)
     else:
         rest.append(i)
 # Then longest first, each to the lane with the smaller running sum (B on a tie).
@@ -1240,6 +1326,7 @@ for i in sorted(rest, key=lambda i: (-int(recs[i][8]), i)):
     ln, lc, exp = "A" if sums["A"] < sums["B"] else "B", lane_cand(recs[i][11].split()), int(recs[i][8])
     placed[i] = (ln, lc[ln], exp, f"to {ln} (lane sums before it: A {sums['A']} s, B {sums['B']} s)")
     sums[ln] += exp
+    seq.append(i)
 defaults = []
 for i, f in enumerate(recs):
     cls, stem, name, env, args, shown, why, kind, exp, esrc, tkey, cards, labels, states = f
@@ -1257,6 +1344,17 @@ for i, f in enumerate(recs):
     print("\x1f".join([ln, stem, name, env, args, shown, why, plan, str(cost), tkey, label, str(c)]))
 wall = max(sums["A"], sums["B"]) + sums["X"]
 print("\x1f".join(["=", str(sums["A"]), str(sums["B"]), str(sums["X"]), str(wall), str(len(defaults)), " ".join(defaults)]))
+# The run order: lanes A and X in record order, lane B in the order the balance placed it — its skips, then
+# longest first. Every lane-A item opens with a release build, and cargo holds one build lock per target
+# directory for the whole box tree: a lane-B build that starts at t = 0 (a device crate's lib tests build
+# for ~100 s) makes lane A's first build wait for it. When the longest balanced item runs on the Mac
+# (check-recipes, ~130 s, in a narrowed landing list), longest first starts the long builds behind it,
+# while lane A runs its first binaries; when it is a box build, lane B opens with that build as before.
+order = ([i for i in range(len(recs)) if placed[i][0] == "A"] + [i for i in seq if placed[i][0] == "B"]
+         + [i for i in range(len(recs)) if placed[i][0] == "X"])
+if sorted(order) != list(range(len(recs))):
+    fail(f"the run order is not a permutation of the {len(recs)} items: {order}")
+print("\x1f".join(["O", " ".join(map(str, order))]))
 PY
 
 balance() { # PYBAL over the records and their candidates' ledger states: the P_* arrays and SUM_*
@@ -1275,14 +1373,19 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
       SUM_A=$stem SUM_B=$name SUM_X=$env SUM_W=$args SUM_NDEF=$item SUM_DEF=$why
       continue
     fi
+    if [ "$lane" = O ]; then
+      read -r -a ORDER <<< "$stem"
+      continue
+    fi
     P_LANE+=("$lane"); P_STEM+=("$stem"); P_NAME+=("$name"); P_ENV+=("$env"); P_ARGS+=("$args")
     P_ITEM+=("$item"); P_WHY+=("$why"); P_PLAN+=("$plan"); P_TKEY+=("$tkey"); P_TCARD+=("$tcard")
     j=$((${R_C0[$i]} + cand))
     P_CI+=("$j"); P_KEY+=("${C_KEY[$j]}"); P_LST+=("${C_LST[$j]}"); P_LDET+=("${C_LDET[$j]}")
     i=$((i + 1))
   done <<< "$plan_out"
-  [ "$i" = "$N" ] && [ -n "$SUM_W" ] || RC=70 die "the lane balance returned $i of $N items"
+  [ "$i" = "$N" ] && [ -n "$SUM_W" ] && [ "${#ORDER[@]}" = "$N" ] || RC=70 die "the lane balance returned $i of $N items and an order of ${#ORDER[@]}"
 }
+ORDER=() # the run order (PYBAL's `O` record): plan indices, each lane's items in the order they run
 P_LANE=() P_STEM=() P_NAME=() P_ENV=() P_ARGS=() P_ITEM=() P_WHY=() P_PLAN=() P_TKEY=() P_TCARD=()
 P_CI=() P_KEY=() P_LST=() P_LDET=() # the candidate taken, its ledger key, status and detail
 SUM_A=0 SUM_B=0 SUM_X=0 SUM_W=0 SUM_NDEF=0 SUM_DEF=''
@@ -1435,7 +1538,7 @@ predicted() { # the plan's lane sums, derived from the times file
 
 if [ "$DRY" = 1 ]; then
   echo "gate-batch: dry run — $N items, lanes $LANES, logs would go to $OUT"
-  for ((i = 0; i < N; i++)); do
+  for i in "${ORDER[@]}"; do
     printf 'lane %s  %-28s %s\n        %s — %s\n' "${P_LANE[$i]}" "${P_STEM[$i]}" "$(cmd_of "$i")" "${P_PLAN[$i]}" "${P_WHY[$i]}"
     [ "$LEDGER" = 0 ] || printf '        ledger: %s — %s\n' "${P_LST[$i]}" "${P_LDET[$i]}"
   done
@@ -1515,10 +1618,10 @@ skip_item() { # $1 = plan index, $2 = lane label: the ledger holds a green run o
   echo "$line"
 }
 
-run_lane() { # $1 = lane label; runs its items in plan order, then writes lane-<lane>.s
+run_lane() { # $1 = lane label; runs its items in the run order (ORDER), then writes lane-<lane>.s
   local lane=$1 t0 i
   t0=$(date +%s)
-  for ((i = 0; i < N; i++)); do
+  for i in "${ORDER[@]}"; do
     [ "${P_LANE[$i]}" = "$lane" ] || continue
     if [ "${P_LST[$i]}" = skip ]; then skip_item "$i" "$lane"; else run_item "$i" "$lane"; fi
   done

@@ -1,5 +1,5 @@
 //! GPU gate for the DSpark draft's routed MoE (`bloomery_gpu_deepseek41::
-//! experts_mxfp4`) on the 3090: block 0's three MXFP4 stacks and its router.
+//! experts_mxfp4`) on one card: block 0's three MXFP4 stacks and its router.
 //!
 //! 1. **Experts, host rule.** For slots `[0, 64, 127]` and m = 1, 3, 8 token
 //!    columns (every token routed to all three slots, weights seeded), then

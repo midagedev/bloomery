@@ -1,6 +1,6 @@
 //! GPU gate for the DSpark draft's block pass and head
-//! (`bloomery_gpu_deepseek41::draft::{block, head}` and `DraftBody`), on the
-//! 3090, against the dsref set `code64_n32_w3` (ik's draft, dumped at block
+//! (`bloomery_gpu_deepseek41::draft::{block, head}` and `DraftBody`), on one
+//! card, against the dsref set `code64_n32_w3` (ik's draft, dumped at block
 //! width 3).
 //!
 //! Inputs. For each block the set's own: each layer's ring as ik's block

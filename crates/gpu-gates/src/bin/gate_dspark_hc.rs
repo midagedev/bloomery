@@ -1,5 +1,5 @@
 //! GPU gate for the DSpark draft's two kernels the target lacks
-//! (`bloomery_gpu_deepseek41::hc_f32` and `::markov`), on the 3090.
+//! (`bloomery_gpu_deepseek41::hc_f32` and `::markov`), on one card.
 //!
 //! 1. **HC_PRE, F32 weights** (`ds41_hc_pre_f32`): block 0's `hc_attn_fn` and
 //!    `hc_ffn_fn` against pseudo-random streams in ±2 for m = 1, 3, 5 tokens;
