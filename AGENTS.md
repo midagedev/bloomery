@@ -163,6 +163,11 @@ The plan lives in `docs/plan.md`. This file is the working contract.
     just mac-check    # check, and `mac-lint` clippy held to the Known-state count, on the Mac (tools/mac-check.sh):
     just mac-lint     # the recipes' box commands as an x86_64-linux cross check, no linker; `mac-fmt-check` is fmt-check
     just mac-test     # native `cargo test -p` of the pure crates on the Mac (`tools/recipes.py pure-crates`: the rule, each rejected crate's reason)
+    just weekly       # every `weekly-*` recipe (gates taken out of the landing batch: the V4.1 server,
+                      # the flow model's counts, GLM's long step sets) in one sitting through
+                      # tools/gate-batch.sh --weekly on the lead's ledger. `just affected` selects no
+                      # weekly recipe by the graph; it names one, with the row, when a changed file
+                      # matches one of its trigger rows in tools/gate-paths.tsv or its own text changes
     just stage-gpu-load-v41 [--plan a]  # opt-in, not a gate-* recipe: `just affected` never
                       # selects it. Plan (b) — the tree's only two-card load — staged on both
                       # cards and checked byte for byte against the plan; solo. `-lock` also

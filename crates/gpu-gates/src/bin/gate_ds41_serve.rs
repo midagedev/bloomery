@@ -125,7 +125,7 @@
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
     eprintln!(
-        "gate_ds41_serve: built without the `deepseek41` feature; see `just gate-gpu-ds41-serve`."
+        "gate_ds41_serve: built without the `deepseek41` feature; see `just weekly-gpu-ds41-serve`."
     );
     std::process::exit(2);
 }
@@ -1113,7 +1113,7 @@ mod gate {
 
         println!("server stopped: {}", served.stop()?);
         if ok {
-            println!("gate-gpu-ds41-serve draft: PASS");
+            println!("weekly-gpu-ds41-serve draft: PASS");
             Ok(())
         } else {
             Err(checks_failed())
@@ -1386,7 +1386,7 @@ mod gate {
         );
         println!("server stopped: {}", served.stop()?);
         if ok {
-            println!("gate-gpu-ds41-serve bp: PASS");
+            println!("weekly-gpu-ds41-serve bp: PASS");
             Ok(())
         } else {
             Err(checks_failed())
@@ -1656,7 +1656,7 @@ mod gate {
 
         println!("server stopped: {}", served.stop()?);
         if ok {
-            println!("gate-gpu-ds41-serve: PASS");
+            println!("weekly-gpu-ds41-serve: PASS");
             Ok(())
         } else {
             Err(checks_failed())

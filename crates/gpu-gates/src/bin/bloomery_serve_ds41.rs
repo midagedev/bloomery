@@ -84,7 +84,7 @@
 #[cfg(not(feature = "deepseek41"))]
 fn main() {
     eprintln!(
-        "bloomery-serve-ds41: built without the `deepseek41` feature; see `just gate-gpu-ds41-serve`."
+        "bloomery-serve-ds41: built without the `deepseek41` feature; see `just weekly-gpu-ds41-serve`."
     );
     std::process::exit(2);
 }

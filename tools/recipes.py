@@ -154,6 +154,9 @@ from dataclasses import dataclass, field
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 GATE_PREFIX = "gate-"
+# A gate taken out of the landing batch: `just weekly` runs every one, and `just affected` names one only when a
+# changed file matches one of its trigger rows in tools/gate-paths.tsv, or its own recipe text changed.
+WEEKLY_PREFIX = "weekly-"
 # The checks the lead's batches always run; the diff does not pick them.
 ALWAYS = ["check-recipes", "check-rustflags", "check-comments", "check-levers", "check-arch", "check", "fmt-check", "lint"]
 CARGO_GLOBALS = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml"]
@@ -1215,7 +1218,7 @@ def check(tree: Tree, recipes: dict[str, Recipe], prefix: str = GATE_PREFIX) -> 
         where = f"justfile:{recipes[name].line} {name}"
         for e in ri.errors:
             problems.append(f"{where}: {e}")
-        if name.startswith(prefix) and not ri.targets:
+        if name.startswith((prefix, WEEKLY_PREFIX)) and not ri.targets:
             problems.append(f"{where}: a gate recipe that builds or tests no cargo target")
     for u in sorted(set(tree.unresolved)):
         problems.append(f"source walk: {u}")
@@ -1430,15 +1433,23 @@ def cmd_affected(args: argparse.Namespace) -> int:
                 attach_depinfo(a.tree, entries)
         sels, unmapped, more = select(changed, a, b, prefix)
         notes += more
+        trows, tnote = trigger_rows(b)
+        if tnote:
+            notes.append(tnote)
+        trig = weekly_triggers(changed, a, b, trows) if prefix == GATE_PREFIX else []
+        named = {f for t in trig for f in t.files}
+        unmapped = [u for u in unmapped if u.split("  (")[0] not in named]
+        n_weekly = sum(1 for n in b.recipes if n.startswith(WEEKLY_PREFIX))
+        weekly = f", {len(trig)} of {n_weekly} weekly-recipes by a trigger" if prefix == GATE_PREFIX else ""
         total = sum(1 for n in b.recipes if n.startswith(prefix))
         rng = f"{a_rev[:9]}..{b_rev[:9]}" if b_rev else f"{a_rev[:9]}..(working tree)"
         nar = narrow(changed, a, b, scans, rows) if args.narrow else None
         narrowed = nar is not None and not nar.full
         if narrowed:
             print(f"affected: {rng} — {len(changed)} changed files, {len(nar.picks)} of {total} {prefix or ''}recipes selected "
-                  f"(narrowed from {len(sels)} by ptx-scan)")
+                  f"(narrowed from {len(sels)} by ptx-scan){weekly}")
         else:
-            print(f"affected: {rng} — {len(changed)} changed files, {len(sels)} of {total} {prefix or ''}recipes selected")
+            print(f"affected: {rng} — {len(changed)} changed files, {len(sels)} of {total} {prefix or ''}recipes selected{weekly}")
         if nar is not None:
             for r in nar.full:
                 print(f"narrow: full list — {r}")
@@ -1447,10 +1458,11 @@ def cmd_affected(args: argparse.Namespace) -> int:
             for line in nar.files:
                 print(f"narrow: file {line}")
         if narrowed:
-            width = max([len(n) for n in nar.picks] + [10])
+            width = max([len(n) for n in nar.picks] + [len(t.recipe) for t in trig] + [10])
             for n, why in nar.picks.items():
                 print(f"  {n:<{width}}  {why}")
-            print("recipes: " + " ".join(nar.picks))
+            print_triggers(trig, width)
+            print("recipes: " + " ".join([*nar.picks, *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
             let_out = "; ".join(v.line() for v in nar.verdicts)
             out = [s.recipe for s in sels if s.recipe not in nar.picks]
@@ -1458,11 +1470,12 @@ def cmd_affected(args: argparse.Namespace) -> int:
             for n in out:
                 print(f"  - {n}  (ptx-scan {let_out})")
         else:
-            width = max([len(s.recipe) for s in sels] + [10])
+            width = max([len(s.recipe) for s in sels] + [len(t.recipe) for t in trig] + [10])
             for s in sels:
                 more_n = f" (+{len(s.files) - 1})" if len(s.files) > 1 else ""
                 print(f"  {s.recipe:<{width}}  {s.files[0]}{more_n}  [{s.why}]")
-            print("recipes: " + " ".join(s.recipe for s in sels))
+            print_triggers(trig, width)
+            print("recipes: " + " ".join([*(s.recipe for s in sels), *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
@@ -1499,6 +1512,12 @@ def cmd_affected(args: argparse.Namespace) -> int:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return 0
+
+
+def print_triggers(trig: list["Trigger"], width: int) -> None:
+    for t in trig:
+        more_n = f" (+{len(t.files) - 1})" if len(t.files) > 1 else ""
+        print(f"  {t.recipe:<{width}}  {t.files[0]}{more_n}  [{t.why}]")
 
 
 def depinfo_only(side: Side) -> list[str]:
@@ -1593,6 +1612,12 @@ def cmd_box_command(args: argparse.Namespace) -> int:
 #   - the gates of a kernel carrier no scan pair covers: a device lib whose bundle is in no pair's
 #     banner, or a bin with kernels of its own, whenever the change touches that carrier's closure.
 # Then the static checks (ALWAYS), gate-ptx-spill, and every recipe the diff adds.
+#
+# The same table holds the weekly tier's triggers. A `weekly-*` name in a row is a trigger: a changed file
+# the row's glob matches names that recipe, with or without --narrow and whatever the scans say, and so
+# does a change of the recipe's own text (weekly_triggers). Only a row's gate-* names map a file for the
+# rule above: a file that only trigger rows match, read by a gate through a dependency, still keeps the
+# full list.
 
 GATE_PATHS = "tools/gate-paths.tsv"
 PTX_CANON = "tools/ref/ptx-canon.py"
@@ -1703,6 +1728,14 @@ class PathRow:
 
     def every(self) -> bool:
         return self.recipes == ["*"]
+
+    def gates(self) -> list[str]:
+        """The names that map a file for narrow(): the row's gate-* recipes, or `*`."""
+        return [n for n in self.recipes if not n.startswith(WEEKLY_PREFIX)]
+
+    def weeklies(self) -> list[str]:
+        """The row's triggers: weekly-* recipes it names by a change of a file it matches."""
+        return [n for n in self.recipes if n.startswith(WEEKLY_PREFIX)]
 
 
 def glob_alternatives(glob: str) -> list[str]:
@@ -1909,9 +1942,12 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
     for r in rows:
         at = f"{GATE_PATHS}:{r.line} {r.glob}"
         if not r.every():
-            for n in r.recipes:
+            for n in r.gates():
                 if n not in recipes or not n.startswith(GATE_PREFIX):
                     problems.append(f"{at}: {n} is not a gate-* recipe in the justfile")
+            for n in r.weeklies():
+                if n not in recipes:
+                    problems.append(f"{at}: {n} is not a weekly-* recipe in the justfile")
         for alt in glob_alternatives(r.glob):
             if not any(glob_regex(alt).match(f) for f in files):
                 problems.append(f"{at}: {alt} matches no file in the tree")
@@ -1920,7 +1956,14 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
             continue
         if r.every():
             continue
-        named = [n for n in r.recipes if n in recipes]
+        # A trigger is the lead's choice of what a weekly gate is run by, not a claim that it links every file
+        # the glob matches; it must read one of them, or the glob has drifted off the gate it names.
+        for n in r.weeklies():
+            if n in recipes and not any(graph.inputs(n).match(f) for f in matched):
+                problems.append(f"{at}: {n} reads none of the {len(matched)} files the glob matches — a trigger off its gate")
+        if not r.gates():
+            continue
+        named = [n for n in r.gates() if n in recipes]
         unread: dict[str, list[str]] = {}
         for f in matched:
             dep = any(not _own_origin(w) for w in (graph.inputs(n).match(f) for n in gates) if w)
@@ -1952,6 +1995,17 @@ def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathR
                     problems.append(f"{at}: {n} runs {kind} {tname}, whose {hit} names {'::'.join(paths[0][0])} — add {n} to the row")
                     break
     return problems
+
+
+def weekly_problems(recipes: dict[str, Recipe], rows: list[PathRow] | None = None, root: str = ROOT) -> list[str]:
+    """Every weekly-* recipe has a trigger row: one that no change can name runs only when someone remembers it."""
+    try:
+        rows = rows if rows is not None else load_gate_paths(root)
+    except RecipeError as err:
+        return [str(err)]
+    named = {n for r in rows for n in r.weeklies()}
+    return [f"justfile:{recipes[n].line} {n}: no row of {GATE_PATHS} names it — no changed file can pull it into `just affected`"
+            for n in sorted(recipes, key=lambda n: recipes[n].line) if n.startswith(WEEKLY_PREFIX) and n not in named]
 
 
 # ---- the host group: device-crate tests that open no card ----
@@ -2103,7 +2157,7 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
                 (own if _own_origin(w) else dep).append((n, w))
         for n, w in own:
             pick(n, f"{f} [{w}]")
-        hit_rows = [r for r in rows if r.pattern.match(f)]
+        hit_rows = [r for r in rows if r.pattern.match(f) and r.gates()]
         star = next((r for r in hit_rows if r.every()), None)
         rule: list[str] = [f"own target of {len(own)}"] if own else []
         if NOT_HOST.search(f):
@@ -2113,9 +2167,9 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
             rule.append(f"* (row {star.line})")
         elif hit_rows:
             for r in hit_rows:
-                for n in r.recipes:
+                for n in r.gates():
                     pick(n, f"{f} [row {r.line}]")
-            rule.append("rows " + " ".join(str(r.line) for r in hit_rows) + f" -> {len({n for r in hit_rows for n in r.recipes})} recipes")
+            rule.append("rows " + " ".join(str(r.line) for r in hit_rows) + f" -> {len({n for r in hit_rows for n in r.gates()})} recipes")
         elif dep:
             n, w = dep[0]
             res.full.append(f"{f}: {n} reads it through a dependency ({w}) and no row of {GATE_PATHS} maps it")
@@ -2133,6 +2187,44 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
             picks.setdefault(n, "the spill ratchet over the scanned bins")
     res.picks = {n: picks[n] for n in gates if n in picks}
     return res
+
+
+def trigger_rows(side: Side) -> tuple[list[PathRow], str | None]:
+    """The trigger rows of the tree the change is read at: its own table, beside its own justfile (a range's B is
+    a `git archive`, whose recipes can predate the working tree's table)."""
+    if not os.path.exists(os.path.join(side.tree.root, GATE_PATHS)):
+        return [], f"no {GATE_PATHS} in the tree read: no weekly trigger read"
+    return load_gate_paths(side.tree.root), None
+
+
+@dataclass
+class Trigger:
+    recipe: str
+    files: list[str]  # the changed files that name it, the first one's rule in `why`
+    why: str
+
+
+def weekly_triggers(changed: list[str], a: Side | None, b: Side, rows: list[PathRow]) -> list[Trigger]:
+    """The weekly-* recipes a change names, in justfile order: by a trigger row whose glob matches a changed
+    file, or by a change of the recipe's own text. A row naming a weekly recipe the justfile lacks is refused."""
+    names = [n for n in sorted(b.recipes, key=lambda n: b.recipes[n].line) if n.startswith(WEEKLY_PREFIX)]
+    for r in rows:
+        for n in r.weeklies():
+            if n not in b.recipes:
+                raise RecipeError(f"{GATE_PATHS}:{r.line}: the trigger {n} is not a weekly-* recipe in the justfile")
+    hits: dict[str, dict[str, str]] = {n: {} for n in names}
+    for f in changed:
+        if f == "justfile":
+            for n in names:
+                old = a.recipes.get(n) if a is not None else None
+                if old is None or old.text != b.recipes[n].text:
+                    hits[n].setdefault(f, "new recipe" if old is None else "recipe text")
+            continue
+        for r in rows:
+            if r.pattern.match(f):
+                for n in r.weeklies():
+                    hits[n].setdefault(f, f"trigger {GATE_PATHS}:{r.line} {r.glob}")
+    return [Trigger(n, list(hits[n]), next(iter(hits[n].values()))) for n in names if hits[n]]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -2286,7 +2378,8 @@ def plan_problems(root: str, recipes: dict[str, Recipe]) -> list[str]:
 def cmd_check(args: argparse.Namespace) -> int:
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
-    problems = check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes) + host_problems(tree, recipes)
+    problems = (check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes) + weekly_problems(recipes)
+                + host_problems(tree, recipes))
     for p in problems:
         print(f"check-recipes: {p}", file=sys.stderr)
     return 1 if problems else 0
@@ -4813,13 +4906,58 @@ def narrow_self_test(expect, side: Side) -> None:
                f"narrow: a kernel carrier no pair covers does not keep its gates: {n.files} {sorted(n.picks)}")
         n = narrow(["crates/gpu-gates/src/bin/gate_p1.rs"], side, side, [(base, same)], rows)
         expect(not n.full and set(n.picks) == {"gate-gpu-p1", *NARROW_ALWAYS}, f"narrow: a bin's own file: {n.full} {sorted(n.picks)}")
+        # a trigger names its weekly recipe and maps nothing: a file only a trigger row matches, which every gate reads
+        # through a dependency, keeps the full list; beside a gate row it narrows as that row says
+        trig = [row("rust-toolchain.toml", ["weekly-gpu-ds41-serve"], 9)]
+        n = narrow(["rust-toolchain.toml"], side, side, [(base, same)], trig)
+        expect(len(n.full) == 1 and n.full[0].startswith("rust-toolchain.toml:") and "no row of" in n.full[0],
+               f"narrow: a file only a trigger row matches does not keep the full list: {n.full}")
+        n = narrow(["rust-toolchain.toml"], side, side, [(base, same)], rows + trig)
+        expect(not n.full and set(n.picks) == {"gate-sampler", *NARROW_ALWAYS}, f"narrow: a trigger row beside a gate row: {n.full} {sorted(n.picks)}")
+        got = weekly_triggers(["rust-toolchain.toml", "crates/vision/src/lib.rs"], side, side, rows + trig)
+        expect([(t.recipe, t.files, t.why) for t in got] == [("weekly-gpu-ds41-serve", ["rust-toolchain.toml"], f"trigger {GATE_PATHS}:9 rust-toolchain.toml")],
+               f"weekly: a changed file a trigger matches names its recipe, and only it: {[(t.recipe, t.files, t.why) for t in got]}")
+        expect(not weekly_triggers(["crates/vision/src/lib.rs", "justfile"], side, side, rows + trig), "weekly: a change no trigger matches names a weekly recipe")
+        import copy
+
+        moved = copy.copy(side)
+        moved.recipes = dict(side.recipes)
+        moved.recipes["weekly-gpu-ds41-serve"] = copy.copy(side.recipes["weekly-gpu-ds41-serve"])
+        moved.recipes["weekly-gpu-ds41-serve"].text += " moved"
+        got = weekly_triggers(["justfile"], side, moved, rows)
+        expect([(t.recipe, t.why) for t in got] == [("weekly-gpu-ds41-serve", "recipe text")], f"weekly: its own recipe text changed: {[(t.recipe, t.why) for t in got]}")
+        expect(refused(lambda: weekly_triggers(["rust-toolchain.toml"], side, side, [row("rust-toolchain.toml", ["weekly-nope"], 4)]), "weekly-nope is not a weekly-* recipe"),
+               "weekly: a trigger naming no recipe not refused by name")
+        # the triggers are read from the tree the change is read at (a range's B), never the working tree's table
+        from types import SimpleNamespace
+
+        old = os.path.join(tmp, "old-tree")
+        os.makedirs(os.path.join(old, "tools"))
+        got = trigger_rows(SimpleNamespace(tree=SimpleNamespace(root=old)))
+        expect(got[0] == [] and got[1] is not None and "no weekly trigger" in got[1], f"weekly: a tree with no table reads no trigger: {got}")
+        with open(os.path.join(old, GATE_PATHS), "w", encoding="utf-8") as fh:
+            fh.write("crates/x/**\tgate-x\tan old row\n")
+        got = trigger_rows(SimpleNamespace(tree=SimpleNamespace(root=old)))
+        expect([r.glob for r in got[0]] == ["crates/x/**"] and got[1] is None, f"weekly: the rows of the tree read, not the working tree's: {got}")
     # the table's checks: planted rows, each refused by name; the real table clean
     tree, recipes = side.tree, side.recipes
     got = gate_paths_problems(tree, recipes, [row("crates/nothing/**", ["gate-nope"])])
     expect(any("gate-nope is not a gate-* recipe" in p for p in got) and any("matches no file" in p for p in got),
            f"gate-paths: an unknown recipe or a glob matching nothing not refused: {got}")
-    got = gate_paths_problems(tree, recipes, [row("crates/serve/src/**", ["gate-gpu-ds41-serve", "gate-ds41-bind", "gate-gpu-p1"])])
+    got = gate_paths_problems(tree, recipes, [row("crates/serve/src/**", ["gate-ds41-bind", "gate-gpu-p1"])])
     expect(len(got) == 1 and "gate-gpu-p1 does not read crates/serve/src/" in got[0], f"gate-paths: a recipe that does not link the row's files: {got}")
+    # the weekly tier's triggers: a name the justfile lacks, and a trigger whose recipe reads none of the glob's files,
+    # each refused by name; a trigger-only row is held to no gate's module (it maps nothing for --narrow)
+    got = gate_paths_problems(tree, recipes, [row("crates/serve/src/**", ["weekly-nope"])])
+    expect(len(got) == 1 and "weekly-nope is not a weekly-* recipe" in got[0], f"gate-paths: an unknown weekly trigger not refused: {got}")
+    got = gate_paths_problems(tree, recipes, [row("crates/vision/src/**", ["weekly-gpu-ds41-serve"])])
+    expect(len(got) == 1 and "weekly-gpu-ds41-serve reads none of the" in got[0], f"gate-paths: a trigger off its gate not refused: {got}")
+    got = gate_paths_problems(tree, recipes, [row("crates/gpu-deepseek41/src/{body.rs,body/**}", ["weekly-gpu-ds41-flowcounts"])])
+    expect(not got, f"gate-paths: a trigger-only row held to the gates that name its module: {got[:2]}")
+    got = weekly_problems(recipes, [row("crates/serve/**", ["weekly-gpu-ds41-serve"])])
+    expect(len(got) == len([n for n in recipes if n.startswith(WEEKLY_PREFIX)]) - 1 and all("no row of" in p for p in got)
+           and not any("weekly-gpu-ds41-serve:" in p for p in got), f"weekly: a weekly recipe with no trigger row not refused: {got}")
+    expect(not weekly_problems(recipes), f"weekly: the real table: {weekly_problems(recipes)}")
     got = gate_paths_problems(tree, recipes, [row("crates/gpu-deepseek41/src/{body.rs,body/**}", ["gate-gpu-ds41-step"])])
     expect(any("gate-gpu-ds41-long runs bin gate_deepseek41_long" in p and "names bloomery_gpu_deepseek41::body" in p for p in got),
            f"gate-paths: a gate whose bin names the module, left out of its row: {got[:2]}")
@@ -5071,10 +5209,11 @@ def self_test() -> int:
     # check and lint compile both (--all-targets)
     lev = sel("tools/levers-direct.txt")
     expect(lev == {"gate-levers"}, f"tools/levers-direct.txt selects {sorted(lev)}")
-    # gate-gpu-ds41-flowcounts reads it through a script: ds41_prefill.py --counts parses the engine's log with
+    # weekly-gpu-ds41-flowcounts reads it through a script: ds41_prefill.py --counts parses the engine's log with
     # records.py, which loads the schema (the scan reaches records.py by routes.py's chain of tools)
-    schema = sel("tools/bloomery/schema/generate_ds41.jsonl")
-    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    weeklies = [n for n in recipes if n.startswith(WEEKLY_PREFIX)]
+    schema = sel("tools/bloomery/schema/generate_ds41.jsonl") | {n for n in weeklies if graph.inputs(n).match("tools/bloomery/schema/generate_ds41.jsonl")}
+    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
     for n in ("check", "lint"):
         expect(graph.inputs(n).match("tools/levers-direct.txt") is not None, f"{n} (--all-targets) does not read tools/levers-direct.txt")
 

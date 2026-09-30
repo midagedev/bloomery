@@ -65,7 +65,7 @@ pub static IK: Family = Family {
     build: Some(Build::Is(IK_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &["gate-gpu-glm5next-e2e"],
+    consumers: &["gate-gpu-glm5next-e2e", "weekly-gpu-glm5next-e2e-long"],
 };
 
 /// The ik tree the MTP draft set is dumped from: ik's glm5next MTP graph
@@ -108,7 +108,7 @@ pub static IK_DSA: Family = Family {
     build: Some(Build::Is(IK_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &["gate-gpu-glm-sel", "gate-gpu-glm5next-e2e"],
+    consumers: &["gate-gpu-glm-sel", "weekly-gpu-glm5next-e2e-long"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them.

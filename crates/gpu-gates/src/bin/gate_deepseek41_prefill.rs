@@ -260,13 +260,16 @@ mod gate {
     const ORACLE: usize = 4097;
     /// The longest case.
     const P_MAX: usize = ORACLE - 1;
-    /// The prompt lengths: one chunk, one ubatch's chunk seams, the ring's
-    /// wrap, the ubatch seam, and several ubatches — three (a group of three
-    /// under the default group of two), five (a pair, then three), six and
-    /// eight.
-    const CASES: [usize; 13] = [
-        1, 2, 5, 127, 128, 129, 511, 512, 513, 1100, 2300, 2600, 4096,
-    ];
+    /// The prompt lengths: one position (the only one-position call, and the
+    /// fault-reset case's clean `P`), the ring's wrap, the ubatch seam, and
+    /// several ubatches — five (a pair, then three) and eight. Three batches
+    /// (a lone last batch joining the group before it) is the wide-taps
+    /// case's `P`, a pair with a partial last batch the 1800 + 1000 split's
+    /// second call.
+    // PIN(2026-09-30): 2, 5, 1100 and 2600 cut (user-approved): 2 and 5 are
+    // held by 1 and 127/129, 1100 by the wide-taps case on the same ids,
+    // 2600 by the 1800 + 1000 split and 4096.
+    const CASES: [usize; 9] = [1, 127, 128, 129, 511, 512, 513, 2300, 4096];
     /// The splits: `ids[.. a + b]` as two prefill calls (module doc).
     const SPLITS: [(usize, usize); 3] = [(700, 400), (1800, 1000), (300, 2700)];
     /// The wide-taps case: `P` and the features it keeps.

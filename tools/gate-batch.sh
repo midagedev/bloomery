@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #   tools/gate-batch.sh --self-test   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it)
@@ -14,9 +14,10 @@
 #   gate-gpu-ds41-prefill@BLOOMERY_PREFILL_GROUP=1:--cases 512 --no-split --no-extra
 # --list FILE: one item per line (blank lines and `#` lines skipped), or the raw output of `just
 # affected …` (first line `affected:`, or just's echoed `./tools/affected-gates.sh …` line and then it): then
-# only lines starting with two spaces and `gate-` count, the first word is the recipe, everything else is
-# ignored — the `always:` checks are not taken from it.
-# --smoke: the fixed smoke list (SMOKE below; docs/gates-plan.md 3.1). An unknown recipe, a malformed
+# only lines starting with two spaces and `gate-` or `weekly-` (a weekly recipe a trigger named) count, the
+# first word is the recipe, everything else is ignored — the `always:` checks are not taken from it.
+# --smoke: the fixed smoke list (SMOKE below; docs/gates-plan.md 3.1). --weekly: every `weekly-*` recipe in
+# `just --dump`, in its order (`just weekly`; a justfile with none is a named error). An unknown recipe, a malformed
 # item, ARGS given to a recipe with no parameters, or an empty list is a named error before anything
 # runs.
 #
@@ -213,7 +214,7 @@ MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 COLD_FILE=${TIMES_FILE%.tsv}-cold.tsv # a cold build's rows, outside the median (the header)
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun] | --classes | --self-test"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--ledger [--trust-rounds] | --round-ledger] [--rerun] | --classes | --self-test"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -377,6 +378,13 @@ timedrun:
 
 nested *ARGS:
     ./tools/gate-batch.sh --smoke {{ARGS}}
+
+weekly-a:
+    ./tools/box.sh 'bash tools/gate.sh -p wa'
+
+[group('solo')]
+weekly-b:
+    ./tools/box.sh 'BLOOMERY_HOST_LOCK=1 bash tools/gpu-gate.sh wb'
 JF
   # Unpinned, v41-any (50 s, balanced) would go to lane B: lane A holds v41-a's 100 s.
   printf '%s\t%s\t%s\t%s\t%s\n' v41-a A 3090 100 2026-09-27T10:00:00+0900 v41-any B a6000 50 2026-09-27T10:00:00+0900 \
@@ -440,6 +448,17 @@ DF
   check 'list: a narrowed affected output runs the recipes it keeps' 0 '^lane [AB]  gate-x ' "${gb[@]}" --dry-run --list "$t/aff-narrow.txt"
   if printf '%s\n' "$out" | grep -q 'gate-y'; then fail 'list: a narrowed affected output does not run a left-out recipe' "gate-y is in the batch"
   else pass 'list: a narrowed affected output does not run a left-out recipe'; fi
+  # A weekly recipe a trigger named: its `  weekly-` line runs, beside the gate lines.
+  printf '%s\n' 'affected: a..b — 2 changed files, 1 of 6 gate-recipes selected, 1 of 2 weekly-recipes by a trigger' \
+    '  gate-x    crates/x/src/lib.rs  [lib x]' '  weekly-a  crates/w/src/lib.rs  [trigger tools/gate-paths.tsv:9 crates/w/**]' \
+    'recipes: gate-x weekly-a' 'unmapped (0):' > "$t/aff-weekly.txt"
+  check 'list: a weekly recipe a trigger named in affected output runs' 0 '^lane [AB]  weekly-a ' "${gb[@]}" --dry-run --list "$t/aff-weekly.txt"
+  # --weekly: every weekly-* recipe of the justfile, each in its class; none of another name.
+  check 'weekly: a weekly recipe with no group is balanced' 0 '^lane [AB]  weekly-a ' "${gb[@]}" --dry-run --weekly
+  check 'weekly: a solo weekly recipe runs alone' 0 '^lane X  weekly-b ' "${gb[@]}" --dry-run --weekly
+  if printf '%s\n' "$out" | grep -Eq '^lane [ABX]  (gate|v41|host|plain)'; then fail 'weekly: nothing but the weekly-* recipes' "another recipe is in the batch"
+  else pass 'weekly: nothing but the weekly-* recipes'; fi
+  check 'weekly: with items, a named error' 64 'exclusive' "${gb[@]}" --dry-run --weekly gate-x
   printf '%s\n' 'something else' 'affected: a..b — 1 changed file' '  gate-x  crates/x/src/lib.rs (+1)' > "$t/aff-other.txt"
   check 'list: any other line above the affected: header is a malformed item' 65 "aff-other.txt:1: malformed item 'something else'" \
     "${gb[@]}" --dry-run --list "$t/aff-other.txt"
@@ -471,6 +490,9 @@ DF
   cp "$t/justfile.good" "$t/justfile"
   printf '%s\n' '' "[group('host')]" "[group('solo')]" 'host-solo:' "    ./tools/box.sh 'bash tools/gpu-gate.sh other'" >> "$t/justfile"
   check 'host with solo and a card gate: a named error' 65 "recipe host-solo: \[group\('host'\)\] with \[group\('solo'\)\] and a tools/gpu-gate.sh call" "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  sed '/^weekly-a:$/,$d' "$t/justfile.good" > "$t/justfile" # the weekly recipes close the fixture
+  check 'weekly: a justfile with no weekly-* recipe is a named error' 65 'no weekly-\* recipe' "${gb[@]}" --dry-run --weekly
   cp "$t/justfile.good" "$t/justfile"
   # The disk floor: above the floor a run proceeds on the verdict line; below it a real run stops at
   # 69 with the named line (nothing created — the fake HOME's tree would show it), a dry run shows
@@ -518,10 +540,11 @@ ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --out) [ $# -ge 2 ] || die "--out needs a directory; $USAGE"; OUT=$2; shift 2 ;;
-    --smoke) [ -z "$SRC" ] || die "--smoke, --list and items are exclusive; $USAGE"; SRC=smoke; shift ;;
+    --smoke) [ -z "$SRC" ] || die "--smoke, --weekly, --list and items are exclusive; $USAGE"; SRC=smoke; shift ;;
+    --weekly) [ -z "$SRC" ] || die "--smoke, --weekly, --list and items are exclusive; $USAGE"; SRC=weekly; shift ;;
     --classes) [ -z "$SRC" ] || die "--classes takes no items; $USAGE"; SRC=classes; shift ;;
     --list) [ $# -ge 2 ] || die "--list needs a file; $USAGE"
-      [ -z "$SRC" ] || die "--smoke, --list and items are exclusive; $USAGE"; SRC=list; LIST=$2; shift 2 ;;
+      [ -z "$SRC" ] || die "--smoke, --weekly, --list and items are exclusive; $USAGE"; SRC=list; LIST=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     --ledger) [ "$LMODE" != round ] || die "--ledger and --round-ledger are exclusive; $USAGE"
       LEDGER=1 LMODE=lead; shift ;;
@@ -533,7 +556,7 @@ while [ $# -gt 0 ]; do
       case "$2" in 1 | 2) LANES=$2 ;; *) die "--lanes is 1 or 2, got '$2'" ;; esac; shift 2 ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d'; exit 0 ;;
     --*) die "unknown option '$1'; $USAGE" ;;
-    *) [ -z "$SRC" ] || [ "$SRC" = items ] || die "--smoke, --list, --classes and items are exclusive; $USAGE"
+    *) [ -z "$SRC" ] || [ "$SRC" = items ] || die "--smoke, --weekly, --list, --classes and items are exclusive; $USAGE"
       SRC=items; ITEMS+=("$1"); shift ;;
   esac
 done
@@ -577,7 +600,7 @@ if src == "list":
     if head and head[0].startswith("./tools/affected-gates.sh ") and len(head) > 1:
         head = head[1:]
     if head and head[0].startswith("affected:"):
-        raw_items = [ln.split()[0] for ln in lines if ln.startswith("  gate-")]
+        raw_items = [ln.split()[0] for ln in lines if ln.startswith(("  gate-", "  weekly-"))]
         where = [f"{listfile} (just affected output)"] * len(raw_items)
     else:
         raw_items, where = [], []
@@ -587,13 +610,18 @@ if src == "list":
                 where.append(f"{listfile}:{i}")
 else:
     where = [src] * len(raw_items)
-if not raw_items and src != "classes":
+if not raw_items and src not in ("classes", "weekly"):
     fail(f"the {src} input names no item — nothing to run is not a green batch")
 
 proc = subprocess.run(just + ["--dump", "--dump-format", "json"], capture_output=True, text=True)
 if proc.returncode != 0:
     fail(f"`just --dump` failed (exit {proc.returncode}): {proc.stderr.strip()}")
 recipes = json.loads(proc.stdout)["recipes"]
+if src == "weekly":
+    raw_items = [n for n in recipes if n.startswith("weekly-")]
+    where = ["--weekly"] * len(raw_items)
+    if not raw_items:
+        fail("--weekly: the justfile has no weekly-* recipe — nothing to run is not a green batch")
 
 
 def body(name):

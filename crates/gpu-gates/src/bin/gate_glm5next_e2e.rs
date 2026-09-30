@@ -131,7 +131,10 @@
 //!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
-//! at [`CTX`].
+//! at [`CTX`]. `--step-sets short` takes (t)'s two 4-token sets only,
+//! `--step-sets long` the 1,024- and 3,070-position sets only, `--step-sets
+//! all` (the default) all four; it names the sets of the load at [`CTX`], so
+//! beside `--only pp` or `--only pplong` it is refused by name.
 //!
 //! Named differences, not banded away: ik clamps each KDA state to ±1e6
 //! after every token, ours raises its fault site where the state stops being
@@ -1586,6 +1589,62 @@ mod gate {
         PpLong,
     }
 
+    /// Which of (t)'s step sets the load at [`CTX`] runs.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StepSets {
+        /// All four.
+        All,
+        /// [`STEP4`] and [`STEP4_EVERY_NODE`].
+        Short,
+        /// [`D1K`] and [`D3K_DSA`].
+        Long,
+    }
+
+    impl StepSets {
+        fn name(self) -> &'static str {
+            match self {
+                StepSets::All => "all",
+                StepSets::Short => "short",
+                StepSets::Long => "long",
+            }
+        }
+
+        /// Whether the set is taken: the 4-token sets are the short ones.
+        fn takes(self, name: &str) -> bool {
+            let short = name == STEP4 || name == STEP4_EVERY_NODE;
+            match self {
+                StepSets::All => true,
+                StepSets::Short => short,
+                StepSets::Long => !short,
+            }
+        }
+    }
+
+    /// `--step-sets short|long|all`, `all` when absent; refused beside an
+    /// `--only` that runs no load at [`CTX`]'s clauses.
+    fn step_sets(only: Only) -> Result<StepSets, GateError> {
+        let args: Vec<String> = std::env::args().collect();
+        let sets = match args.iter().position(|a| a == "--step-sets") {
+            None => return Ok(StepSets::All),
+            Some(i) => match args.get(i + 1).map(String::as_str) {
+                Some("all") => StepSets::All,
+                Some("short") => StepSets::Short,
+                Some("long") => StepSets::Long,
+                other => {
+                    return Err(format!("--step-sets is short, long or all, not {other:?}").into());
+                }
+            },
+        };
+        if !matches!(only, Only::All | Only::Main) {
+            return Err(
+                "--step-sets names the step sets of the load at CTX: it goes with \
+                        --only main or no --only"
+                    .into(),
+            );
+        }
+        Ok(sets)
+    }
+
     /// `--only main`, `--only pp`, `--only pplong`, or every clause.
     fn only() -> Result<Only, GateError> {
         let args: Vec<String> = std::env::args().collect();
@@ -1603,9 +1662,10 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         let only = only()?;
+        let sets = step_sets(only)?;
         let mut ok = true;
         if matches!(only, Only::All | Only::Main) {
-            ok &= main_clauses(&levers)?;
+            ok &= main_clauses(&levers, sets)?;
         }
         if only == Only::PpLong {
             let (mut s, _) = open(&levers, CTX, PrefillMode::Steps)?;
@@ -1618,7 +1678,7 @@ mod gate {
     }
 
     /// Every clause on the steps feed, on the load at [`CTX`].
-    fn main_clauses(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+    fn main_clauses(levers: &bloomery_levers::Levers, sets: StepSets) -> Result<bool, GateError> {
         let (mut s, opened) = open(levers, CTX, PrefillMode::Steps)?;
         let m = s.model_mut();
         let mut ok = structure(m, &opened)?;
@@ -1643,15 +1703,23 @@ mod gate {
         ok &= forced_ok;
         let mut ties = 0usize;
         let band = Some((&toks[..], last));
+        let mut ran = Vec::new();
         for (set, band) in [
             ((STEP4, &IK), band),
             ((STEP4_EVERY_NODE, &IK), band),
             ((D1K, &IK), None),
             ((D3K_DSA, &IK_DSA), None),
         ] {
-            ok &= step_set(m, set, band, &mut ties)?;
+            if sets.takes(set.0) {
+                ok &= step_set(m, set, band, &mut ties)?;
+                ran.push(set.0);
+            }
         }
-        println!("step sets: {ties} named tie(s)");
+        println!(
+            "step sets ({}): {} ran, {ties} named tie(s)",
+            sets.name(),
+            ran.join(" ")
+        );
         ok &= keep(&mut s)?;
         ok &= prompt_long(s.model_mut())?;
         Ok(ok)
