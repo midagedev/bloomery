@@ -48,11 +48,37 @@
 //!   1 gives this server's greedy ids.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
-//! waited for. Logs and the raw stream go to `--dir`.
+//! waited for, and one more server starts on the card, alone:
+//!
+//! - `residency`: `bloomery-serve-qwen38` with the same arguments under
+//!   `BLOOMERY_RESIDENCY=mid-p0-s1` (`BLOOMERY_DRAFT=off`, the MTP levers
+//!   removed; the word set explicitly, one the lever takes): it loads and
+//!   prints the word as a `residency lever` record (`why=set`) and a
+//!   `residency host` record; the greedy `/completion` above ends a prompt
+//!   pass and step passes, as `residency pass` records say; `POST
+//!   /residency/reset` is a 200 whose `diff` is 0, and the server prints its
+//!   `residency reset` record with the same counts; the same `/completion`
+//!   after the reset gives the first one's ids. Not the first server's ids: a
+//!   flip moves an expert from the host to the card, whose sums round another
+//!   way, so a greedy id can move at a near tie; from the seed, one history
+//!   lands the same flips at the same passes, so two runs of it are bit for
+//!   bit. Its logs are in `<dir>/residency` (mutants: the seat opens with
+//!   `Body38::open_placed`, which runs no machine whatever the lever — no
+//!   `residency pass` record, and the reset is the server's 501; a reset that
+//!   leaves the learned residency — the second request runs on the flips the
+//!   first one made).
+//!
+//! Logs and the raw stream go to `--dir`.
 //!
 //! The server inherits this binary's environment, so the levers it acts on
 //! are the server's (`ACTS_ON`, the same list): one the server would refuse
-//! is refused here, at `main`, before the server starts.
+//! is refused here, at `main`, before the server starts. The gate sets two of
+//! them itself on every server it starts, so neither the placement's defaults
+//! nor the environment move what a clause means: `BLOOMERY_DRAFT` (`mtp` when
+//! this binary's environment names it, else `off`; the sampled clause's plain
+//! server `off`) and `BLOOMERY_RESIDENCY` (`off`, the residency clause's
+//! word there); `BLOOMERY_RESIDENCY` set in this binary's environment is
+//! refused by name.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -103,6 +129,7 @@ mod gate {
         bloomery_levers::DRAFT,
         bloomery_levers::MTP_HEAD_ROWS,
         bloomery_levers::MTP_DRAFT,
+        bloomery_levers::RESIDENCY,
     ];
 
     const USAGE: &str = "usage: gate_qwen38_serve --gen <generate_qwen3moe log> --prompt <text> \
@@ -124,6 +151,9 @@ mod gate {
     /// The sampled request's temperature (llama-server's default) and seed.
     const SAMPLED_TEMPERATURE: f64 = 0.8;
     const SAMPLED_SEED: u64 = 42;
+    /// The residency clause's word: set explicitly, one the lever takes; no
+    /// seed expert pinned, one spare a layer.
+    const RESIDENCY_WORD: &str = "mid-p0-s1";
 
     /// `BLOOMERY_QWEN38_EXPERTS` as the plan's expert rule — the server's
     /// reading of the inherited environment.
@@ -148,16 +178,11 @@ mod gate {
             Ok(std::env::current_exe()?.with_file_name("bloomery-serve-qwen38"))
         }
 
-        /// Starts `bloomery-serve-qwen38` beside this binary with `args`,
+        /// Starts `bloomery-serve-qwen38` beside this binary with `args` on
+        /// `cmd` (the server with the environment the caller set on it),
         /// stdout to `<dir>/server.out` and stderr to `<dir>/server.err`. The
         /// child is killed when this process dies, so a runner's bound that
         /// ends this process does not leave the server holding a card.
-        fn spawn(args: &[&str], dir: &Path) -> Result<Served38, GateError> {
-            Self::spawn_with(args, dir, &mut Command::new(Self::exe()?))
-        }
-
-        /// [`Served38::spawn`] on `cmd`, `bloomery-serve-qwen38` with the
-        /// environment the caller set on it.
         fn spawn_with(args: &[&str], dir: &Path, cmd: &mut Command) -> Result<Served38, GateError> {
             let exe = Self::exe()?;
             cmd.args(args)
@@ -737,6 +762,91 @@ mod gate {
         Ok(ok)
     }
 
+    /// The first record on the server's stderr at `err_log` whose line
+    /// starts with `head` and a space.
+    fn record_line(err_log: &Path, head: &str) -> Result<Option<String>, GateError> {
+        let prefix = format!("{head} ");
+        Ok(std::fs::read_to_string(err_log)?
+            .lines()
+            .find(|l| l.starts_with(&prefix))
+            .map(str::to_owned))
+    }
+
+    /// The `residency` clause (the module header): a server under
+    /// [`RESIDENCY_WORD`], started alone once the others have stopped,
+    /// serves `completion`, its reset is a 200 with its record, and
+    /// `completion` after the reset gives the first one's ids.
+    fn residency(dir: &Path, completion: &Value) -> Result<bool, GateError> {
+        let word = RESIDENCY_WORD;
+        println!("residency: {word}");
+        let res_dir = dir.join("residency");
+        std::fs::create_dir_all(&res_dir)?;
+        let err_log = res_dir.join("server.err");
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::RESIDENCY, word)
+            .env(bloomery_levers::DRAFT, "off")
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT);
+        let mut served = Served38::spawn_with(&SERVER_ARGS, &res_dir, &mut cmd)?;
+        println!("residency server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = true;
+        let lever = record_line(&err_log, "residency lever")?;
+        let host = record_line(&err_log, "residency host")?;
+        println!("residency records: {lever:?} {host:?}");
+        let named = format!("residency={word}");
+        check(
+            &mut ok,
+            "residency_loads_the_word",
+            lever.is_some_and(|l| l.contains(&named) && l.ends_with(" why=set"))
+                && host.is_some_and(|l| l.contains(&named)),
+        );
+        let (st, body) = curl(&url("/completion"), Some(completion), false)?;
+        let ids = ids_of(&json_of("/completion", st, &body)?["tokens"]);
+        println!("residency completion tokens {ids:?}");
+        let passes = |kind: &str| -> Result<bool, GateError> {
+            let want = format!("residency pass pass={kind} ");
+            Ok(std::fs::read_to_string(&err_log)?
+                .lines()
+                .any(|l| l.starts_with(&want)))
+        };
+        check(
+            &mut ok,
+            "residency_request_ends_prompt_and_step_passes",
+            passes("prompt")? && passes("step")?,
+        );
+        let landed: u64 = std::fs::read_to_string(&err_log)?
+            .lines()
+            .filter(|l| l.starts_with("residency pass "))
+            .filter_map(|l| l.split(' ').find_map(|w| w.strip_prefix("landed=")))
+            .filter_map(|n| n.parse::<u64>().ok())
+            .sum();
+        println!("residency flips landed over the request: {landed}");
+        let (st, body) = curl(&url("/residency/reset"), Some(&json!({})), false)?;
+        let reset: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let record = record_line(&err_log, "residency reset")?;
+        println!("residency reset: HTTP {st} {reset}; record {record:?}");
+        let counts = ["cancelled", "copies", "diff"].map(|k| format!("{k}={}", reset[k]));
+        check(
+            &mut ok,
+            "residency_reset_is_a_200_with_its_record",
+            st == 200
+                && reset["diff"] == json!(0)
+                && record.is_some_and(|l| counts.iter().all(|c| l.contains(&format!(" {c} ")))),
+        );
+        let (st, body) = curl(&url("/completion"), Some(completion), false)?;
+        let again = ids_of(&json_of("/completion", st, &body)?["tokens"]);
+        println!("residency completion after the reset tokens {again:?}");
+        check(
+            &mut ok,
+            "residency_ids_after_the_reset_are_the_first_requests",
+            !ids.is_empty() && again == ids,
+        );
+        println!("residency server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         if levers.draft() != Some("mtp") && levers.mtp_draft().is_some() {
@@ -744,12 +854,29 @@ mod gate {
                 "BLOOMERY_MTP_DRAFT names the MTP draft file; it needs BLOOMERY_DRAFT=mtp".into(),
             );
         }
+        if let Some(word) = levers.residency() {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={word}: the gate sets it on every server it starts (off, and \
+                 the residency clause's mid-p0-s1)"
+            )
+            .into());
+        }
         let a = parse_args()?;
         let reference = gen_tokens(&a.gen_log)?;
         std::fs::create_dir_all(&a.dir)?;
         let exe = Served38::exe()?;
         let err_log = a.dir.join("server.err");
-        let mut served = Served38::spawn(&SERVER_ARGS, &a.dir)?;
+        let mut cmd = Command::new(&exe);
+        cmd.env(
+            bloomery_levers::DRAFT,
+            if levers.draft() == Some("mtp") {
+                "mtp"
+            } else {
+                "off"
+            },
+        )
+        .env(bloomery_levers::RESIDENCY, "off");
+        let mut served = Served38::spawn_with(&SERVER_ARGS, &a.dir, &mut cmd)?;
         println!("server pid {}", served.child.id());
         let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
@@ -893,6 +1020,7 @@ mod gate {
         }
 
         println!("server stopped: {}", served.stop()?);
+        ok &= residency(&a.dir, &completion)?;
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");
             Ok(())

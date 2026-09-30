@@ -215,9 +215,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::M,
         kind: Kind::Words(&["lookup", "dspark", "mtp", "off"]),
         default: Unset::Means(
-            "the plain path, one token a step; `generate_qwen3moe` on a qwen4exp file under \
-             `--place a`: `mtp` when the MTP draft file is there, else the plain path with a \
-             `load draft=off` record naming why",
+            "the plain path, one token a step; `generate_qwen3moe` on a qwen4exp file and \
+             `bloomery-serve-qwen38` under `--place a`: `mtp` when the MTP draft file is there, \
+             else the plain path with a `load draft=off` record naming why",
         ),
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
@@ -236,7 +236,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               and when an arm's last four-row window would pass `--ctx` (depth + n + 2 \
               positions) — each printed as a `load draft=off (<why>)` record after the `load` \
               line (`no file at <path>` for the missing file), never a refusal. \
-              `bloomery-serve-qwen38` keeps unset as the plain path. Every other binary and \
+              `bloomery-serve-qwen38` follows the same rule, its conditions the seat's: under \
+              `--place a` the draft when its file is there; the plain path under `--place gate`, \
+              with no file there, and with stores too short for one window (`--ctx-size` under \
+              5: the server takes a window only while its rows fit), with the same record; it \
+              has no `--logits` (a request that reads the logits row steps plainly) and takes \
+              no route trace. Every other binary and \
               family refuses each word by name, `off` included.",
         site: Site::Parsed { left: &[] },
     },
@@ -262,7 +267,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
              path gives it; with no such file there, that path",
         ),
         doc: "Qwen3.8's MTP draft, when the run drafts (`BLOOMERY_DRAFT=mtp`, or unset in \
-              `generate_qwen3moe` under `--place a`): the draft file \
+              `generate_qwen3moe` and `bloomery-serve-qwen38` under `--place a`): the draft file \
               `generate_qwen3moe` and `bloomery-serve-qwen38` open (and `gate_qwen38_serve`, \
               which starts that server). A path with no regular file is refused at `main`, and \
               the lever set on a run that drafts nothing by each of them, naming why. The MTP \
@@ -352,8 +357,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
              `off` under `--place gate`, beside `BLOOMERY_ROUTE_TRACE`, `--prefill step` or \
              `--dump-taps`, on a qwen3moe or qwen35moe file, and on plan (a) when the plan \
              leaves no room for the word, or its host headroom or `MemAvailable` none for its \
-             churn pool; `off` in \
-             every other binary",
+             churn pool; `bloomery-serve-qwen38` by the same rule under `--place a` and `off` \
+             under `gate`; `off` in every other binary",
         ),
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
@@ -393,7 +398,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `why=set` print as a `residency lever` record before the load. There `mid-…` is refused by \
               name beside `BLOOMERY_ROUTE_TRACE` (a fixed placement's routing), with a step-fed \
               prompt (`--prefill step`, at the prompt), on a qwen3moe or qwen35moe file and under \
-              `--dump-taps`. `bloomery-serve-qwen38` does not take it yet. Every other binary \
+              `--dump-taps`. `bloomery-serve-qwen38` takes it as `generate_qwen3moe` does, \
+              from the same rule and records (its prompt path is never a step feed, and it takes \
+              no route trace): unset `mid-p<P>-s1` under `--place a` from the plan it loads, \
+              `off` under `--place gate`; running `mid-…` each call prints its `residency pass` \
+              records; a request's reset keeps the residency, and only `POST /residency/reset` \
+              moves it back to the seed, with a `residency reset` record. Every other binary \
               refuses it set, by name.",
         site: Site::Parsed { left: &[] },
     },
