@@ -440,6 +440,16 @@ rig-log 09-29 #chatlist-dspark의 열린 잔차(ko-08 목록 + draft, 예측 54.
 
 - **overflow-checks 게이트 프로필**(S–M, 결정): release 게이트와 GPU 게이트는 정수 wrap이 조용하다(`gate-ops/attn/ffn/moe/head` 다섯만 dev라 켜져 있다, `justfile:455-467`). `[profile.gate] inherits = "release"`, `overflow-checks = true`, 디바이스 크레이트는 패키지별 off(cargo-oxide 주석: overflow-check MIR이 패턴 민감 디바이스 lowering을 깬다) — 게이트만 `--profile gate`. 대가: 타이밍 러너와 target 디렉터리가 갈려 게이트 빌드가 한 벌 더. 「조용한 실패」 규칙의 연장이라 리드 추천은 넣기; 다섯 dev 게이트도 같은 프로필로 통일(S).
 - `.config/nextest.toml`이 박스에 `cargo-nextest`가 없어 죽은 설정(XS: 설치하거나 지운다 — 게이트는 `tools/gate.sh` → `cargo test`).
+- **Instrument defect: batch order alone can turn `gate-gpu-ds41-residency`'s `resident` clause red** (S).
+  - The clause asks `HostSet::serves`, which is `mincore` over the whole run (`crates/model/src/placement/host_lock.rs:365`). An item earlier in lane X that loads a large host set can evict V4.1 pages, and the clause then reads "not resident" for experts the load did hold.
+  - Seen in land8b's batch on 09-30: 21 wrong after qwen4exp-e2e (~111 GB host set) and twocard in lane X, green
+    on a solo rerun. The same clause's 1,574 wrong in fastupload's first batch was a real defect (page releases
+    deferred to the end of the upload, so the tier card's pages evicted the host set) and went green only with the
+    fix in `493ec88a` — the clause catches real evictions too, which is why it is worth fixing rather than dropping.
+  - Two fixes are on the table:
+    - Ask the clause right after populate, before the step runs.
+    - Hold the expectation to a `mincore` snapshot taken at the end of the load.
+  - Check in the same round whether the minflt pin on `gate-gpu-ds41-faults` (`gate_deepseek41_long.rs:463`, pin 2 per step) is the same class. It read 5 at step 26 in that batch and was green on rerun.
 
 - V4.1 첫 샤드 경로 사본 여섯(`gate-1-1` 기본값, `gguf/tests/oracle.rs:17`, `model/tests/placement.rs:23`, `models/deepseek41.sh`, `build-qdot-ref.sh:36`, `qdot.rs` `Q5K_MODEL`)과 모델·데이터 경로를 다시 적는 12곳을 한 자리로(M); `ref-v41` 대 `ref_deepseek41` 디렉터리 이름 — `ref_dir`가 `Arch`를 받게, qdot·dequant 참조를 오라클 세트에서 분리(S).
 - 매니페스트 파서 셋(`gpu-gates/oracle`, `model/tests/ds41_meta.rs` `Manifest`, `model/tests/ds41_host.rs:93` `Set`) → 세트 이름을 받는 읽기 함수 하나(model은 gpu-gates에 의존 못 하므로 작은 공용 크레이트, M); `Oracle::open`(`# arch` 없어도 받음)과 `open_named`(거절) 규칙 둘 — V2-Lite 세트를 다시 뜨면 하나로; `common/oracle.rs`에서 `common/model.rs` 분리(dead-code 13줄, S); 테스트 전용 GGUF 작성기 세 벌(S); `activation_format(F16)` 거부(XS).
