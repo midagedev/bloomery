@@ -232,26 +232,25 @@ impl<'b, 's, 'a, T> Rope<'b, 's, 'a, T> {
     {
         let i = idx.get();
         let (npairs, n_vec, nd) = (self.npairs, self.n_vec, self.nd);
-        if i >= self.total {
-            return;
-        }
-        let col = i / npairs;
-        let d = (i % npairs) * 2;
-        let t = col / n_vec;
-        let base = col * nd + d;
-        let cache = t * nd + d;
-        // SAFETY: `base`, `cache` and their `+ 1`s are inside the buffers the
-        // constructing `new` proved (the doc above), and `dst`'s two cells are
-        // this thread's alone.
-        unsafe {
-            let (y0, y1) = f(
-                *self.src.add(base),
-                *self.src.add(base + 1),
-                *self.cs.add(cache),
-                *self.cs.add(cache + 1),
-            );
-            *self.dst.add(base) = y0;
-            *self.dst.add(base + 1) = y1;
+        if i < self.total {
+            let col = i / npairs;
+            let d = (i % npairs) * 2;
+            let t = col / n_vec;
+            let base = col * nd + d;
+            let cache = t * nd + d;
+            // SAFETY: `base`, `cache` and their `+ 1`s are inside the buffers
+            // the constructing `new` proved (the doc above), and `dst`'s two
+            // cells are this thread's alone.
+            unsafe {
+                let (y0, y1) = f(
+                    *self.src.add(base),
+                    *self.src.add(base + 1),
+                    *self.cs.add(cache),
+                    *self.cs.add(cache + 1),
+                );
+                *self.dst.add(base) = y0;
+                *self.dst.add(base + 1) = y1;
+            }
         }
     }
 }
