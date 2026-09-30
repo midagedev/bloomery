@@ -5,16 +5,17 @@
 //!
 //! **Parts.** An expert is three parts in stack order: gate and up (`ff`
 //! rows of `n_embd` values each) and down (`n_embd` rows of `ff`). The
-//! parts are each layer's own as the file holds them: most layers' gate and
-//! up are Q4_K with a Q5_K down, one layer's three stacks are all Q5_K, and
-//! the layers whose down is Q6_K keep their experts whole on the host
-//! ([`model::arch::glm5next::place::card_routed`] admits Q4_K and Q5_K
-//! alone), so a card layer is one of the first two kinds. On the card each
-//! part of slot `s` is the file's bytes of that expert at byte `s · part` of
-//! its layer's stack, which the placed load uploads as file bytes in slot
-//! order — no convert step, and no r8 sidecar (that format is Q3_K's alone,
-//! and no GLM stack is one), so a staged part is its slot's bytes as it
-//! stands.
+//! parts are each layer's own as the file holds them, and the file's card
+//! layers are all of one kind, gate and up Q4_K with a Q5_K down:
+//! [`model::arch::glm5next::place::card_routed`] admits Q4_K and Q5_K alone
+//! and a layer takes card slots only when every one of its stacks is
+//! routable, so the layers whose down is Q6_K — among them the one layer
+//! whose gate and up are Q5_K — keep their experts whole on the host. On the
+//! card each part of slot `s` is the file's bytes of that expert at byte
+//! `s · part` of its layer's stack, which the placed load uploads as file
+//! bytes in slot order — no convert step, and no r8 sidecar (that format is
+//! Q3_K's alone, and no GLM stack is one), so a staged part is its slot's
+//! bytes as it stands.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,15 +32,18 @@ use model::arch::glm5next::place::PlanInputs;
 /// read, only on its staging and its copy: a planning pass makes at most the
 /// rule's `cap` flips ([`runtime::swaprule::SwapParams::mid`]), each one
 /// expert's memcpy into the pinned ring on one thread and one H2D copy over
-/// the card's link. The widest expert a layer holds is the one layer whose
-/// three stacks are all Q5_K; one thread's copy rate and the link's pinned
-/// H2D rate (the machine facts doc's measured values) put a whole planning
-/// pass of those at about 1.9 of GLM's measured decode steps' wall and about
-/// 2.2 of the same line's prediction for the step [derived], so three steps'
-/// wall holds the pass at either end and two hold it only at the measured
-/// one. The staging runs in the host leg's wait window, and a late copy only
-/// makes the engine stream wait at the landing.
-pub const LIVE_DELAY: u64 = 3;
+/// the card's link, an expert's copy running under the next one's memcpy
+/// (the ring holds [`bloomery_gpu::host::swap::RING_SLOTS`] experts). The
+/// widest expert a card layer holds is gate and up Q4_K with a Q5_K down;
+/// one thread's copy rate, taken as its share of the host's measured
+/// all-core read rate, and the link's measured pinned H2D rate (the machine
+/// facts doc) put a whole planning pass of those inside two of GLM's decode
+/// steps both at their measured wall and at the prediction for the step
+/// [derived], so two passes hold it. The staging runs in the host leg's wait
+/// window, a share of the step this derivation does not price: a late
+/// staging makes the host wait at the landing and a late copy the engine
+/// stream, and neither moves the boundary a flip lands at.
+pub const LIVE_DELAY: u64 = 2;
 
 /// The bound on every host wait of the machine. Every boundary follows a
 /// pass's readback, so the engine stream has drained and a wait is for the
