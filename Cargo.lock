@@ -201,6 +201,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-levers",
  "bloomery-models",
+ "bloomery-placement",
  "bloomery-qdot",
  "bloomery-refset",
  "bloomery-runtime",
@@ -216,6 +217,16 @@ name = "bloomery-models"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+]
+
+[[package]]
+name = "bloomery-placement"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-levers",
+ "bloomery-models",
+ "thiserror",
 ]
 
 [[package]]

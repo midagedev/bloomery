@@ -642,7 +642,7 @@ gate-profile:
 # BLOOMERY_PLACEMENT_TABLE=1이면 텐서별 표도 찍는다. (b′) 시험은 DSpark 드래프트 헤더에서 3090 예약을 읽으므로
 # 프로필의 DSPARK_MODEL을 내보낸다.
 gate-placement:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '__s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test placement -- --include-ignored --nocapture'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh '__s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test placement -- --include-ignored --nocapture && bash tools/gate.sh --release -p bloomery-placement --lib -- --include-ignored --nocapture'
 
 # B5 메타 게이트. 먼저 층 표 단위 시험을 돌린다: 일부러 깨뜨린 층 표 일곱 개를 ik 적재기의 검사 넷과 우리 거부 둘이
 # 각각 깨진 그 층에서 거부해야 한다. 이어서 V4.1의 하이퍼파라미터·층 종류·텐서 이름(arch/deepseek41/{hparams,names}.rs)을

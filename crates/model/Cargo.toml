@@ -15,6 +15,10 @@ workspace = true
 bloomery-gguf = { path = "../gguf" }
 bloomery-levers = { path = "../levers" }
 bloomery-models = { path = "../models" }
+# The placement planner, as a pure crate so its tests run on the Mac; this
+# crate re-exports it at `placement` and keeps the parts the Mac cannot run
+# (host_lock, workstation::host_available) beside the re-export.
+bloomery-placement = { path = "../placement" }
 bloomery-qdot = { path = "../qdot" }
 bloomery-threads = { path = "../threads" }
 # The plans count the stores by the rules the card bodies allocate them by (`runtime::stores`).

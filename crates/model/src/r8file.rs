@@ -32,24 +32,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 
-use gguf::write::{Layout, TensorDecl, WriteError, Writer};
-use gguf::{
-    GENERAL_ARCHITECTURE, GgmlType, Gguf, LoadError, PrivateType, Split, TensorInfo, Value, Weights,
-};
+use gguf::write::{Layout, TensorDecl, Writer};
+use gguf::{GENERAL_ARCHITECTURE, GgmlType, Gguf, PrivateType, Split, TensorInfo, Value, Weights};
 use qdot::{Q3K_R8_LAYOUT, Q3K_R8_ROWS};
 
 use crate::ModelError;
 use crate::fileio::{self, sha256_hex};
 use crate::placement::host_lock::{FileMapping, HostFile, drop_pages};
 
-/// The sidecar's architecture string: a file with any other is not a sidecar.
-pub const R8_ARCH: &str = "bloomery-r8";
-
-/// The sidecar's tensor type id: bloomery's private range (1000 + the ggml
-/// id of the layout's source type, Q3_K's 11), outside every ggml table, so
-/// the strict readers and ggml's own refuse the file instead of reading its
-/// bytes as another type's. Never 211: ik reads that as its `Q3_K_R4`.
-pub const Q3K_R8_TYPE: u32 = 1011;
+/// The r8 format's refusal type and its two identity constants live in
+/// `bloomery-placement` (the planner's error wraps them); this module is
+/// the format's one owner and re-exports them.
+pub use bloomery_placement::r8::{Q3K_R8_TYPE, R8_ARCH, R8Error};
 
 /// The table [`Sidecar::open`] opens with: an r8 group super-block of a row
 /// is Q3_K's 256 values in 110 bytes.
@@ -68,167 +62,6 @@ const KEY_TAILS: &str = "bloomery.r8.source.tail_sha256";
 
 /// Bytes of a source tensor's head and of its tail that the identity hashes.
 const SPAN: usize = 4096;
-
-/// Why a sidecar is not written, not opened or not equal to its source. The
-/// identity refusals carry the sidecar's path, what it recorded and what the
-/// source is now.
-#[derive(Debug, thiserror::Error)]
-pub enum R8Error {
-    #[error("no tensors to convert")]
-    NoTensors,
-    #[error("{}: no tensor {tensor} in the source", .path.display())]
-    SourceMissing { path: PathBuf, tensor: String },
-    #[error("{}: tensor {tensor} is {got:?}; a sidecar stack is Q3_K", .path.display())]
-    SourceType {
-        path: PathBuf,
-        tensor: String,
-        got: GgmlType,
-    },
-    #[error(
-        "{}: tensor {tensor} has dims {dims:?}; a sidecar stack is [k, rows, experts] with k a multiple of 256 and rows of {}",
-        .path.display(),
-        Q3K_R8_ROWS
-    )]
-    Grid {
-        path: PathBuf,
-        tensor: String,
-        dims: Vec<u64>,
-    },
-    #[error("{} exists; a sidecar is never overwritten", .path.display())]
-    Exists { path: PathBuf },
-    #[error("{} is locked by a conversion still running", .path.display())]
-    Busy { path: PathBuf },
-    #[error("{}: the sidecar needs {need} bytes, {free} are free", .path.display())]
-    Space { path: PathBuf, need: u64, free: u64 },
-    #[error("{}: {op}: {source}", .path.display())]
-    Io {
-        path: PathBuf,
-        op: &'static str,
-        source: io::Error,
-    },
-    #[error("{}: {source}", .path.display())]
-    Write { path: PathBuf, source: WriteError },
-    #[error("{}: {source}", .path.display())]
-    Open { path: PathBuf, source: LoadError },
-    #[error("{}: architecture {got:?}, a sidecar's is {:?}", .path.display(), R8_ARCH)]
-    Architecture { path: PathBuf, got: String },
-    #[error("{}: row-lane layout {got}, this build reads {}", .path.display(), Q3K_R8_LAYOUT)]
-    Layout { path: PathBuf, got: u32 },
-    #[error("{}: {key} {detail}", .path.display())]
-    Key {
-        path: PathBuf,
-        key: &'static str,
-        detail: String,
-    },
-    #[error("{}: made from {recorded} shards, the source has {found}", .path.display())]
-    ShardCount {
-        path: PathBuf,
-        recorded: usize,
-        found: usize,
-    },
-    #[error("{}: shard {shard} was {recorded:?}, the source's is {found:?}", .path.display())]
-    ShardName {
-        path: PathBuf,
-        shard: usize,
-        recorded: String,
-        found: String,
-    },
-    #[error("{}: shard {shard} was {recorded} bytes, it is {found}", .path.display())]
-    ShardBytes {
-        path: PathBuf,
-        shard: String,
-        recorded: u64,
-        found: u64,
-    },
-    #[error("{}: shard {shard}'s header sha256 was {recorded}, it is {found}", .path.display())]
-    HeaderDigest {
-        path: PathBuf,
-        shard: String,
-        recorded: String,
-        found: String,
-    },
-    #[error("{}: tensor {tensor} appears twice", .path.display())]
-    DuplicateTensor { path: PathBuf, tensor: String },
-    #[error("{}: tensor {tensor} has type id {got}, a sidecar's are {}", .path.display(), Q3K_R8_TYPE)]
-    TensorType {
-        path: PathBuf,
-        tensor: String,
-        got: u32,
-    },
-    #[error(
-        "{}: tensor {tensor} is {recorded_dims:?} ({recorded_bytes} bytes), the source's is {found_dims:?} ({found_bytes} bytes)",
-        .path.display()
-    )]
-    Shape {
-        path: PathBuf,
-        tensor: String,
-        recorded_dims: Vec<u64>,
-        recorded_bytes: u64,
-        found_dims: Vec<u64>,
-        found_bytes: u64,
-    },
-    #[error("{}: tensor {tensor}'s first 4 KiB hashed {recorded}, the source's hash {found}", .path.display())]
-    Head {
-        path: PathBuf,
-        tensor: String,
-        recorded: String,
-        found: String,
-    },
-    #[error("{}: tensor {tensor}'s last 4 KiB hashed {recorded}, the source's hash {found}", .path.display())]
-    Tail {
-        path: PathBuf,
-        tensor: String,
-        recorded: String,
-        found: String,
-    },
-    #[error("{}: no tensor {tensor} in the sidecar", .path.display())]
-    NotInSidecar { path: PathBuf, tensor: String },
-    #[error(
-        "{}: the sidecar holds {tensor}, a layer's down stack; a host tier reads only a gate and an up from it",
-        .path.display()
-    )]
-    HoldsDown { path: PathBuf, tensor: String },
-    #[error(
-        "{}: tensor {tensor} unpacks to other bytes than the source's, first at expert {expert} byte {byte}",
-        .path.display()
-    )]
-    Mismatch {
-        path: PathBuf,
-        tensor: String,
-        expert: u64,
-        byte: u64,
-    },
-    #[error("the source split has no first shard to name the sidecar after")]
-    NoFirstShard,
-    #[error(
-        "no r8 sidecar at {}: a gate that covers the r8 path reads one (just r8-sidecar); \
-         BLOOMERY_R8=off runs it on the source",
-        .path.display()
-    )]
-    NoSidecar { path: PathBuf },
-    /// A value built beside one open sidecar, called with a pair that reads
-    /// another open — of the same path or not — or none ([`R8Source`]).
-    #[error(
-        "{what}: built beside the sidecar {} open, called with a pair that reads {}",
-        .held.display(),
-        .read.as_ref().map_or_else(|| "none".to_string(), |p| format!("another open, {}", p.display()))
-    )]
-    OtherSidecar {
-        what: &'static str,
-        held: PathBuf,
-        read: Option<PathBuf>,
-    },
-    /// A call that acts on the pair's sidecar, with a pair that reads none.
-    #[error("{what}: the pair reads no sidecar")]
-    PairReadsNone { what: &'static str },
-    /// A page release of a resident copy, whose bytes are anonymous pages
-    /// `MADV_DONTNEED` would zero.
-    #[error(
-        "{}: a resident copy, not its file's mapping: it has no file pages to release",
-        .path.display()
-    )]
-    ResidentCopy { path: PathBuf },
-}
 
 fn io_err(path: &Path, op: &'static str, source: io::Error) -> ModelError {
     R8Error::Io {
@@ -350,6 +183,7 @@ fn grids(path: &Path, name: &str, ty: GgmlType, dims: &[u64]) -> Result<[usize; 
             path: path.to_path_buf(),
             tensor: name.to_string(),
             dims: dims.to_vec(),
+            rows: Q3K_R8_ROWS,
         }),
     }
 }
@@ -1370,6 +1204,7 @@ fn check(path: &Path, g: &Gguf, now: &Inputs<&[u8]>) -> Result<(), R8Error> {
         return Err(R8Error::Layout {
             path: path.to_path_buf(),
             got: layout,
+            reads: Q3K_R8_LAYOUT,
         });
     }
     let recorded = match value(path, g, KEY_SHARDS)? {

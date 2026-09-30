@@ -5406,7 +5406,7 @@ def self_test() -> int:
     real = dict(pure_crates(tree, load_lock(tree.root)))
     pure_now = sorted(n for n, w in real.items() if not w)
     expect(
-        pure_now == ["bloomery-levers", "bloomery-models", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-vision"],
+        pure_now == ["bloomery-levers", "bloomery-models", "bloomery-placement", "bloomery-refset", "bloomery-runtime", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     expect(any("crates/gguf/src/lib.rs:" in w and "RUSAGE_THREAD" in w for w in real.get("bloomery-gguf", [])), f"pure: gguf's reason {real.get('bloomery-gguf')}")
