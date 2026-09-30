@@ -248,10 +248,11 @@ mod cli {
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
+    use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_levers::{
-        Draft38At, Draft38Off, Levers, RESIDENCY38_SPARES, Residency38At, Residency38Pick,
-        ResidencyPick, ResidencyWhy, draft38_unset, residency38_at_plan, residency38_unset,
+        Draft38At, Draft38Off, Levers, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
+        residency38_unset,
     };
     use cuda_core::sys;
     use gguf::Split;
@@ -260,9 +261,8 @@ mod cli {
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
     };
-    use model::placement::churn::ChurnPool;
-    use model::placement::workstation::{A6000, HostNeed, RTX_3090, host_available};
-    use model::placement::{Plan, PlanLevers};
+    use model::placement::PlanLevers;
+    use model::placement::workstation::{A6000, RTX_3090};
     use refset::arch::qwen4exp::mtp::draft_file;
     use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
     use std::num::NonZeroUsize;
@@ -1213,15 +1213,6 @@ mod cli {
         }
     }
 
-    /// `BLOOMERY_RESIDENCY` as a qwen4exp load takes it: a set word, or
-    /// unset and what the rule decided before the plan — `None` when plan
-    /// (a) decides.
-    #[derive(Clone, Copy)]
-    enum Lever38 {
-        Set(Residency, &'static str),
-        Unset(Option<Residency38Pick>),
-    }
-
     /// Unset, the `residency unset` record of a run the rule decides with no
     /// plan (`--dump-taps`, another family's file); nothing when set.
     fn residency_unset_early(levers: &Levers, at: Residency38At) {
@@ -1531,7 +1522,7 @@ mod cli {
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
         (path, place, experts): (Prompt38, Place38, Experts),
-        (lever, draft_off): (Lever38, Option<&Draft38Off>),
+        (lever, draft_off): (Lever38<'static>, Option<&Draft38Off>),
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
@@ -1559,7 +1550,7 @@ mod cli {
                 .u("card_experts", plan.cards[0].experts)
                 .line()
         );
-        let residency = residency38(&plan, lever)?;
+        let residency = residency38(&plan, lever, Record::print)?;
         let mut m = Body38::open_placed_residency(
             file,
             &plan,
@@ -1605,7 +1596,7 @@ mod cli {
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
         (path, place, experts): (Prompt38, Place38, Experts),
-        lever: Lever38,
+        lever: Lever38<'static>,
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
@@ -1647,7 +1638,7 @@ mod cli {
                 .u("card_experts", plan.plan.cards[0].experts)
                 .line()
         );
-        let residency = residency38(&plan.plan, lever)?;
+        let residency = residency38(&plan.plan, lever, Record::print)?;
         let mut m = Body38::open_placed_mtp_residency(
             file,
             &plan,
@@ -1696,60 +1687,6 @@ mod cli {
             },
             residency,
         ))
-    }
-
-    /// The plan's card a qwen4exp open loads: its one card.
-    const CARD38: usize = 0;
-
-    /// The residency a load of `plan` runs under `lever`: a set word as
-    /// given; unset, the rule's before the plan or on plan (a) from it
-    /// (`bloomery_levers::residency38_at_plan`: P half the fewest card
-    /// experts a layer, `off` with why where the plan has no room, or the
-    /// plan's host headroom or `MemAvailable` none for the churn pool), its
-    /// `residency unset` record printed.
-    /// Under `mid`, the `residency host` record of `plan` follows: the churn
-    /// pool (card [`CARD38`]'s experts past the pinned ones) the load's host
-    /// set holds beside the plan's host segments, which the load refuses by
-    /// name for a set word when the plan's host headroom cannot take it.
-    fn residency38(plan: &Plan<'_>, lever: Lever38) -> Result<Residency, GateError> {
-        let (residency, word) = match lever {
-            Lever38::Set(r, word) => (r, word.to_string()),
-            Lever38::Unset(pre) => {
-                let pick = match pre {
-                    Some(off) => off,
-                    None => {
-                        // The load refuses a host set past `MemAvailable`
-                        // before any upload; the default leaves the pool out
-                        // instead.
-                        let available = host_available()?;
-                        let need = HostNeed::of(plan, 0).bytes();
-                        residency38_at_plan(
-                            plan.n_l.iter().copied(),
-                            |pinned| ChurnPool::of(plan, CARD38, pinned).map(|pool| pool.bytes),
-                            plan.host.headroom_bytes,
-                            i128::from(available) - i128::from(need),
-                        )
-                        .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
-                    }
-                };
-                record::residency_unset(&pick).print();
-                let residency = match pick.pinned {
-                    None => Residency::Off,
-                    Some(pinned) => Residency::Mid {
-                        pinned,
-                        spares: RESIDENCY38_SPARES,
-                    },
-                };
-                (residency, pick.word())
-            }
-        };
-        let Residency::Mid { pinned, .. } = residency else {
-            return Ok(residency);
-        };
-        let pool = ChurnPool::of(plan, CARD38, pinned)
-            .map_err(|e| format!("BLOOMERY_RESIDENCY={word}: the churn pool: {e}"))?;
-        record::residency_host(&word, &pool, plan).print();
-        Ok(residency)
     }
 
     /// Under `mid`, keep the residency boundaries' reports for the `residency

@@ -121,10 +121,11 @@ use bloomery_gpu_gates::bind::{
 };
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
+use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
 use bloomery_gpu_gates::{GateError, ref_model_path};
 use bloomery_levers::{
-    Draft38At, Draft38Off, RESIDENCY38_SPARES, Residency38At, ResidencyPick, ResidencyWhy,
-    draft38_unset, residency38_at_plan, residency38_unset,
+    Draft38At, Draft38Off, Residency38At, ResidencyPick, ResidencyWhy, draft38_unset,
+    residency38_unset,
 };
 use cuda_core::sys;
 use gguf::Split;
@@ -132,8 +133,7 @@ use model::arch::models::HeadRows;
 use model::arch::qwen35moe::place::{
     Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
 };
-use model::placement::churn::ChurnPool;
-use model::placement::workstation::{A6000, CardSpec, HostNeed, RTX_3090, host_available};
+use model::placement::workstation::{A6000, CardSpec, RTX_3090};
 use model::placement::{Plan, PlanLevers};
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
@@ -274,27 +274,17 @@ fn draft38(
     }
 }
 
-/// The plan's card a qwen4exp open loads: its one card.
-const CARD38: usize = 0;
-
 /// The residency the load of `plan` at `place` runs: `set` (the word and
-/// its parse) as given; unset, the Qwen3.8 rule's — before the plan
-/// (`bloomery_levers::residency38_unset`: `off` under `--place gate`), else
-/// on plan (a) from it (`bloomery_levers::residency38_at_plan`: P half the
-/// fewest card experts a layer, `off` with why where the plan has no room,
-/// or its host headroom or `MemAvailable` none for the churn pool) — its
-/// `residency unset` record printed. Under `mid`, the `residency host`
-/// record of `plan` follows: the churn pool (card [`CARD38`]'s experts past
-/// the pinned ones) the load's host set holds beside the plan's host
-/// segments, which the load refuses by name for a set word when the plan's
-/// host headroom cannot take it.
-fn residency38(
+/// its parse) as given; unset, the Qwen3.8 rule's
+/// ([`residency38`]: before the plan `off` under `--place gate`, else on plan
+/// (a) from it), its records on stderr.
+fn residency38_at(
     plan: &Plan<'_>,
     place: Place38,
     set: Option<(Residency, &str)>,
 ) -> Result<Residency, GateError> {
-    let (residency, word) = match set {
-        Some((r, word)) => (r, word.to_owned()),
+    let lever = match set {
+        Some((r, word)) => Lever38::Set(r, word),
         None => {
             // The seat feeds no prompt by steps (its path is `auto`) and
             // takes no route trace.
@@ -305,40 +295,10 @@ fn residency38(
                 route_trace: false,
                 prefill_step: false,
             };
-            let pick = match residency38_unset(at) {
-                Some(off) => off,
-                None => {
-                    // The load refuses a host set past `MemAvailable` before
-                    // any upload; the default leaves the pool out instead.
-                    let available = host_available()?;
-                    let need = HostNeed::of(plan, 0).bytes();
-                    residency38_at_plan(
-                        plan.n_l.iter().copied(),
-                        |pinned| ChurnPool::of(plan, CARD38, pinned).map(|pool| pool.bytes),
-                        plan.host.headroom_bytes,
-                        i128::from(available) - i128::from(need),
-                    )
-                    .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
-                }
-            };
-            record::residency_unset(&pick).eprint();
-            let residency = match pick.pinned {
-                None => Residency::Off,
-                Some(pinned) => Residency::Mid {
-                    pinned,
-                    spares: RESIDENCY38_SPARES,
-                },
-            };
-            (residency, pick.word())
+            Lever38::Unset(residency38_unset(at))
         }
     };
-    let Residency::Mid { pinned, .. } = residency else {
-        return Ok(residency);
-    };
-    let pool = ChurnPool::of(plan, CARD38, pinned)
-        .map_err(|e| format!("BLOOMERY_RESIDENCY={word}: the churn pool: {e}"))?;
-    record::residency_host(&word, &pool, plan).eprint();
-    Ok(residency)
+    residency38(plan, lever, Record::eprint)
 }
 
 struct Args {
@@ -495,7 +455,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .u("host_experts", plan.host.experts)
         .u("card_experts", plan.cards[0].experts)
         .eprint();
-    let residency = residency38(&plan, a.place, set)?;
+    let residency = residency38_at(&plan, a.place, set)?;
     let gpu = nvidia_smi_index(&machine.cards[0].name)
         .map(|i| format!("GPU{i}"))
         .and_then(|g| placement_props(&plan, &[g]));
