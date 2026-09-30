@@ -30,14 +30,13 @@ use bloomery_gpu::hybrid::HOST;
 use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
-use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, verdict};
+use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, ref_model_path, verdict};
 use bloomery_gpu_glm5next::Body;
 use cuda_core::DeviceBuffer;
 use gguf::{GgmlType, Split};
 use model::arch::glm5next::hparams::Hparams;
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::{PlanInputs, card_routed};
-use refset::arch::glm5next::MODEL;
 
 /// The checks (i)–(iii) on `s`'s model, whose plan put `n_l[l]` card experts
 /// on layer `l`, of `experts` a layer; `budgeted` when the plan ran under a
@@ -48,7 +47,8 @@ pub fn clauses(
     experts: u64,
     budgeted: bool,
 ) -> Result<bool, GateError> {
-    let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+    let path = ref_model_path()?;
+    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let hp = PlanInputs::read(&split)?.hp;
     let lists = card_lists(n_l)?;
     let experts = usize::try_from(experts)?;

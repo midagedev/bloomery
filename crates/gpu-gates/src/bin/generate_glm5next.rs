@@ -6,7 +6,7 @@
 //! steps.
 //!
 //! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate]
-//! [--mode graph|eager] [--prefill batch|steps] [--model PATH] [--time [--warm W]]
+//! [--mode graph|eager] [--prefill batch|steps] [--time [--warm W]]
 //! [--logits] [--plan]`
 //!
 //! - `--tokens`: the prompt's ids (the file's own vocabulary, no BOS added).
@@ -20,8 +20,8 @@
 //!   (`bloomery_gpu_glm5next::prefill`), `steps` one decode step a position,
 //!   the same bits at any `--ctx`, past the positions the latent layers
 //!   attend whole too; the same-binary arm. Default `batch`.
-//! - `--model`: the first shard; default the file the reference sets were
-//!   dumped from (`refset::arch::glm5next::MODEL`).
+//! - The model file is `$BLOOMERY_REF_MODEL` (`ref_model_path`), which
+//!   `tools/box.sh` exports from the `glm5next` profile, as in every other bin.
 //! - `--plan` prints the plan and exits before the load.
 //! - `--logits` prints the head's last logits row by its bits after the
 //!   tokens.
@@ -72,8 +72,8 @@ mod cli {
     use app::{Loaded, OpenArgs, OpenLog, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::GateError;
     use bloomery_gpu_gates::record::{self, Record};
+    use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8, ROUTE_TRACE};
     use gguf::Split;
@@ -233,7 +233,17 @@ mod cli {
             Some(p) => PrefillMode::from_name(&p)
                 .ok_or_else(|| format!("--prefill is batch or steps, not {p}"))?,
         };
-        let path = flag("--model")?.unwrap_or_else(|| refset::arch::glm5next::MODEL.to_string());
+        if has("--model") {
+            return Err(
+                "--model is not a flag: the file is $BLOOMERY_REF_MODEL, which \
+                 tools/box.sh exports from the glm5next profile"
+                    .into(),
+            );
+        }
+        let path = ref_model_path()?
+            .into_os_string()
+            .into_string()
+            .map_err(|p| format!("BLOOMERY_REF_MODEL is not UTF-8: {p:?}"))?;
         // The last generated token is read out, not fed: the run takes the
         // prompt's positions and one a step after the first token.
         let takes = ids.len() + n_gen.saturating_sub(1);
