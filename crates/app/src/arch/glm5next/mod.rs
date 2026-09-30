@@ -27,8 +27,7 @@ const WHAT: &str = "glm5next session";
 /// How the GLM session opens.
 #[derive(Clone, Debug)]
 pub struct GlmCfg {
-    /// The placement's levers the plan is made under: the hot list, or the
-    /// id prefix, and the card budget.
+    /// The placement's levers the plan is made under: the card budget.
     pub place: PlanLevers,
     /// The host set's read-in and lock, and the file pages' release.
     pub host: HostCfg,

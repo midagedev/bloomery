@@ -7,7 +7,7 @@
 # (app::Session::clear: a prompt after the clear writes the bits it writes in a fresh process). Arms
 # share a process only when everything the load reads is theirs alike: the binary, its environment
 # (every lever the binaries act on is parsed once at main and consumed by the load — the placement's
-# hot list and card budget, BLOOMERY_R8, CED, the prompt call's group and buffers, the pin, the step
+# card budget, BLOOMERY_R8, CED, the prompt call's group and buffers, the pin, the step
 # stats' card events — so any NAME=VALUE an arm sets is load-time), and the runner's load-time
 # arguments (--place; Qwen3's --ctx, the cache height and the flash grid). The runner writes that
 # string per arm into LG_KEY[i]; an empty key is an arm that runs by itself outside this driver (a

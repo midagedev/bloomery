@@ -100,7 +100,7 @@
 # trace (per layer-batch the enqueue calls, the most activities in flight when the queue fills, from
 # which activity it is full, the calls longer than BLOOMERY_NSYS_BLOCKED_US µs, default 8, after and
 # before that, and the queue model at those values). ds41pp.py's header has the cut. The profile writes
-# <out>.meta beside the report (the binary's sha256, P, N, the command, the hot list): the ncu ds41pp
+# <out>.meta beside the report (the binary's sha256, P, N, the command): the ncu ds41pp
 # form reads it and the sqlite to derive its launch skip. `--analyze <sqlite> <P> <n> <run log> [--plan FILE]`
 # under BLOOMERY_NSYS_FORM=prefill re-prints the tables (the run log is required: the cut reads it); --plan
 # FILE is the call's plan for a run log from before the engine printed it (`generate_ds41 --plan` with the
@@ -436,7 +436,7 @@ import records
 
 RUNLOG = (
     "plan place=a card=A6000 ctx_max=4096 card_experts=200 (100 B) host_experts=88 (100 B) "
-    "host_shadow=1 B 40 on 40 layers 20000000000 hot_list=none\n"
+    "host_shadow=1 B 40 on 40 layers 20000000000\n"
     "load resident_bytes=1 shadow=host 0 unified_addressing=1 cards=[A6000] ctx=4096 layers=40 "
     "top_k=512 mode=graph place=a pin_main=on pinned=true prefill=batch ced=on group=1 in 1.0 s "
     "(runtime value)\n"
@@ -652,7 +652,7 @@ profile_cmd() {
 }
 
 if [ -n "$DRY" ]; then
-  echo "[dry] form=$FORM bin=$BIN n=$NGEN place=$PLACE residency=${BLOOMERY_RESIDENCY:-<unset>} args='${DEPTHS[*]}' out=$OUTDIR timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+  echo "[dry] form=$FORM bin=$BIN n=$NGEN place=$PLACE residency=${BLOOMERY_RESIDENCY:-<unset>} args='${DEPTHS[*]}' out=$OUTDIR timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   if [ -n "$TIMING_CARDS" ]; then
     echo "[dry] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
     tc_rc=0
@@ -693,7 +693,7 @@ lease_take
 timing_cards_start
 echo "[config] form=$FORM nsys=$($NSYS --version) n=$NGEN place=$PLACE args='${DEPTHS[*]}' last=$LAST out=$OUTDIR bound=${BOUND}s"
 [ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
-echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 LEVER_SET=$(awk '$3 == "set"' "$LEVERS_TXT")
 if [ -n "$LEVER_SET" ]; then
   sed 's/^/[levers] /' <<< "$LEVER_SET"
@@ -747,7 +747,6 @@ for i in "${!A_NAME[@]}"; do
       echo "P=$d"
       echo "n=$NGEN"
       echo "place=$PLACE"
-      echo "hot_list=${BLOOMERY_HOT_LIST:-}"
       echo "cmd=${CMD[*]}"
     } > "$out.meta"
   fi

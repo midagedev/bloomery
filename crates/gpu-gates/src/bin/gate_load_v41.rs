@@ -98,9 +98,7 @@ mod gate {
     use bloomery_gpu::hybrid::HostResidency;
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
-    use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOT_LIST, HostCfg, R8,
-    };
+    use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg, R8};
     use cuda_core::CudaStream;
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
@@ -201,14 +199,8 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let parsed = bloomery_levers::at_main(&[
-            HOT_LIST,
-            CARD_BUDGET,
-            HOST_POPULATE,
-            HOST_LOCK,
-            CARD_DONTNEED,
-            R8,
-        ])?;
+        let parsed =
+            bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
         let args = parse_args()?;
         let place = PlanLevers::from_levers(&parsed)?;
         let levers = parsed.host();
@@ -714,8 +706,8 @@ mod gate {
                 .get(&s.t.name)
                 .ok_or_else(|| format!("{} is not resident", s.t.name))?;
             let diff = difference(&device_planes(dw, gpu.stream())?, &want);
-            // One run prints as itself; a hot list's scattered ids print as
-            // counts, not as every range.
+            // One run prints as itself; scattered ids print as counts, not
+            // as every range.
             let experts = s.experts().map_or(String::new(), |e| match e.runs().len() {
                 1 => format!(" experts {e}"),
                 n => format!(" experts {} in {n} ranges", e.len()),

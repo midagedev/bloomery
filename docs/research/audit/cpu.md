@@ -42,7 +42,7 @@
 다시 확인하지 않은 주장은 본문에 "(하위 조사)"로 표시했다.
 
 **읽지 않은 것**
-- model: `placement.rs` 본문(80–730, 775–1724), `placement/{hot_list,card_budget,host_lock}` 본문, `deepseek41/{hparams 본문, plan.rs, kv, roles, names, place 본문}`, `dspark.rs` 본문, `r8file.rs` [03].
+- model: `placement.rs` 본문(80–730, 775–1724), `placement/{card_budget,host_lock}` 본문과 router-frequency list reader(since deleted), `deepseek41/{hparams 본문, plan.rs, kv, roles, names, place 본문}`, `dspark.rs` 본문, `r8file.rs` [03].
 - CPU 엔진: `deepseek2/attn.rs` 본문(`MlaParams` 밖), `forward.rs`·`ffn.rs`·`head.rs` 본문.
 - `ops.rs` 60–896·1335–2276·2315–3140·3260–4579, `moe.rs` 1–600·960–1530, `model/tests/*` 본문 대부분.
 - gguf의 `quant.rs`·`write.rs`·`iq_tables.rs`·`gguf-inventory`.
@@ -507,7 +507,7 @@ crates/qdot      (타입, 형식)별 AVX2 커널; 디스패치는 기술자를 �
 crates/threads   풀 + 친화성 전부(topology, pin_to, sibling_of, cpu_list) + PIN_MAIN 파싱 하나
 crates/model     GPU 엔진이 싣고 서빙하는 것:
   arch/{mod, deepseek2/{hparams, names, host, wk_b}, deepseek41/*, qwen3moe/*, dspark}
-  placement/*    역할 → 장치, 계획, hot list, 예산, host set populate/lock
+  placement/*    역할 → 장치, 계획, router-frequency list, 예산, host set populate/lock
   host/          Tensor2·Weight·ShardTensor; HostLayer(Split + spec);
                  호출 하나 experts(layer, x: Tensor2View, lists, out, scratch) = UnionCall
                  (≤8열: 풀 디스패치 2 + 호출자 합, 넓으면 5); UnionScratch; r8 리더(03)

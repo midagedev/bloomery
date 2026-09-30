@@ -30,8 +30,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOSTSTREAM, HOT_LIST, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX,
-    QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    HOSTSTREAM, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX, QWEN38_EXPERTS,
+    R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -657,16 +657,6 @@ impl Levers {
     #[must_use]
     pub fn step_stats(&self) -> bool {
         self.flag(STEP_STATS)
-    }
-
-    /// `BLOOMERY_HOT_LIST`: the hot list file; `None` unset (the id prefix).
-    #[must_use]
-    pub fn hot_list(&self) -> Option<&Path> {
-        match &self.entry(HOT_LIST).value {
-            None => None,
-            Some(Value::Path(p)) => Some(p),
-            v => panic!("{HOT_LIST} holds {v:?}, not a path"),
-        }
     }
 
     /// `BLOOMERY_CARD_BUDGET`: a card budget in bytes; `None` unset.

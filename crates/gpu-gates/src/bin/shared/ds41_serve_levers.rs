@@ -4,20 +4,19 @@
 
 use bloomery_levers::{
     CARD_BUDGET, CARD_DONTNEED, CED, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOSTSTREAM,
-    HOT_LIST, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE,
+    PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE,
 };
 
 /// Besides the pool's two: how a prompt is fed, and the batched feed's CED
-/// triangle and group; the step rows' helper; the placement's hot list and
-/// card budget; the main thread's pin; the host tier's load settings; the
-/// draft; the route trace; adaptive expert residency and its prompt streaming. The draft's file and card (`BLOOMERY_DSPARK_MODEL`,
+/// triangle and group; the step rows' helper; the placement's card budget;
+/// the main thread's pin; the host tier's load settings; the draft; the route
+/// trace; adaptive expert residency and its prompt streaming. The draft's file and card (`BLOOMERY_DSPARK_MODEL`,
 /// `BLOOMERY_DSPARK_CARD`) are read where the draft opens, not here.
 pub const ACTS_ON: &[&str] = &[
     CED,
     PREFILL,
     PREFILL_GROUP,
     ENGRAM_HELPER,
-    HOT_LIST,
     CARD_BUDGET,
     PIN_MAIN,
     HOST_POPULATE,

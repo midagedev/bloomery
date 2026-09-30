@@ -50,7 +50,7 @@ pp512 ≈ 127)이 틀렸다는 것이다 — 256열 둘은 전문가마다 고�
 
 - **창 안 카드 항이 큰 이유.** `ds41_expert_gate_up_tok`(`chain/ffn/batch.rs:131-151`)과 `q4k_sel`(`crates/gpu/src/q4k_sel.rs:1-8`)이 슬롯마다 전문가 행 전체를 읽습니다. 그래서 600 GB/s에서 18.4 ms에 공유 전문가 몫이 더해집니다.
 - **호스트 로드맵과 어긋납니다.** 호스트 레버가 좋아질수록 union이 DRAM 바닥에 붙어 분할 벌점이 커집니다. P = 512 반쪽 어긋내기의 값은 h1fold 뒤 +2…+13 %로 줄고 h3tile 뒤에는 약 0입니다.
-- **균등 가정.** 이항분포는 호스트 전문가의 비율이 같다고 둡니다. 뜨거운 목록 아래서 호스트는 차가운 꼬리를 맡으므로, 256열의 W 낭비는 하한으로 읽습니다.
+- **균등 가정.** 이항분포는 호스트 전문가의 비율이 같다고 둡니다. router-frequency list 아래서 호스트는 차가운 꼬리를 맡으므로, 256열의 W 낭비는 하한으로 읽습니다.
 - **유일한 미결 항.** 실측 46.7 ms는 여러 몫을 묶은 값입니다. max(카드 union 밖 실행, 호스트 enqueue) + x_host 복사 + 프롤로그/40입니다. 커널 합으로 유도한 카드 union 밖 항은 25–30 ms뿐입니다. 근거는 디코드 m=1 커널 합 9.8 ms/스텝(`report-ds41prefill.md:69`, 09-24 nsys), 8열 1.1–1.4배, 토큰당 라우터 512회입니다. 나머지 16–21 ms가 8토큰 점유율인지 호스트 enqueue인지는 종이로 가르지 못합니다. 빌더의 skew=0 첫 실행이 `wait_ms`와 `enqueue_ms`로 가릅니다. 예측은 wait 35–45, enqueue 6–9 ms/층입니다. enqueue가 20을 넘으면 (a)는 거의 0이고 (c′)가 필수입니다.
 
 **의존 그래프 (한 층 l, A = 앞 반쪽, B = 뒤 반쪽)**
@@ -199,7 +199,7 @@ pp512 ≈ 127)이 틀렸다는 것이다 — 256열 둘은 전문가마다 고�
 - **A/B 명령.** 효과가 10 %를 넘으므로 2바퀴입니다.
 
 ```
-BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV="BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt" \
+BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV="<the router-frequency list lever, since deleted>" \
   just depth-gpu-ds41 512 4096 512@BLOOMERY_PREFILL_SKEW=0 4096@BLOOMERY_PREFILL_SKEW=0
 ```
 

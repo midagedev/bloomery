@@ -230,7 +230,7 @@ pub struct OpenCfg {
 impl OpenCfg {
     /// The open's levers of a binary's one parse (`bloomery_levers::at_main`)
     /// for a load the residency machine does not run over, where
-    /// `BLOOMERY_RESIDENCY` unset is `off`; the hot list file is read here.
+    /// `BLOOMERY_RESIDENCY` unset is `off`.
     pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<OpenCfg, GpuError> {
         OpenCfg::from_levers_at(levers, ResidencyAt::FIXED)
     }

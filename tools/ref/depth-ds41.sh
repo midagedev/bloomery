@@ -353,8 +353,8 @@
 #     walk and a corpus's first P ids are prefixes of each other, so it reads every shorter arm's prompt
 #     ids, though not the tokens another arm generates. Our engine reads a step's engram rows ahead of
 #     it (WILLNEED, then the copy), so those are not a serial term in our rows. A lever arm whose
-#     variable moves the host set (a hot list) reads its own set after the discard; its `timed` count
-#     shows what that cost.
+#     variable moves the host set (a card budget) reads its own set after the discard; its `timed`
+#     count shows what that cost.
 # Its cost is one row of the arm a block, 22-230 s for the V4.1 rows (the `wall` column of rig-log
 # 2026-09-27's two windows). Under blocks BLOOMERY_AB_WARMUP=1 (the default) is the discards — the first
 # block's discard is the lease's first process, so there is no separate warm-up — and 0 skips them.

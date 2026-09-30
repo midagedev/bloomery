@@ -17,8 +17,7 @@
 Every command takes --data DIR (default /Users/hckim/data/bloomery-router): the directory the router
 sets live in. A set is a router_trace directory, read through tools/ref/router-coverage.py
 (read_manifest over tools/bloomery/manifest.py, read_topk), which refuses a set without its
-`# complete` trailer. A <set> is a name under --data or a directory path. A hot list (`hot:<file>`
-seeds) is read by tools/ref/window-union.py's read_hot.
+`# complete` trailer. A <set> is a name under --data or a directory path.
 
 One token of a set is one decode step (a pass of one row), on the family's eligible layers only
 (FAMILY below). A hit is a routed slot whose expert is on the card when the pass starts. Sets are
@@ -27,7 +26,7 @@ split by position: seeds learn on [0, SPLIT) and every replay evaluates on [SPLI
 Seeds (per layer, a ranked list; the card holds its first n_l ids):
     in        the set's own [0, SPLIT)            insample  the set's own [SPLIT, tokens)
     cross     the family's other sets, whole      pooled    every family set's [0, SPLIT)
-    prefix    ids 0, 1, 2, ...                    hot:FILE  a router-hotlist.py file
+    prefix    ids 0, 1, 2, ...
 Ranks are hottest first, ties to the lower id.
 
 hit      Without --window, the continuous replay over the eval half, one markdown row per policy:
@@ -61,9 +60,7 @@ gen      The router-gen replay: <trace> holds prompt + generation in one context
          no window arms (a `skipped K of M` line lists them) and still counts in the steady rule.
          --split held|learn scores only that split's requests of a contexts.tsv (the steady rule still
          walks every position); without it a `split:` line says both are scored, and --split on a
-         trace with no contexts.tsv is refused. A hot:<file> seed whose `# sets` names the trace is
-         refused unless --split held and the file's `# split` is learn (tools/ref/router-hotlist.py
-         --split learn): a list learned on the requests it is scored on is in-sample.
+         trace with no contexts.tsv is refused.
          Over the window [P, P + N) of each context (N = --window, 96):
            (a) static    the seed's card set
            (b) adaptive  the rule from zero counts, reset to the seed at P
@@ -299,7 +296,7 @@ def n_cap(fam, label, E):
     return [n] * L
 
 
-def seed_lists(fam, s, name, data, need=None):
+def seed_lists(fam, s, name, data):
     """Per eligible layer, the ranked list of seed `name` for set s (evaluated on [SPLIT, T))."""
     F = family(fam)
     lay = F["eligible"]
@@ -317,17 +314,7 @@ def seed_lists(fam, s, name, data, need=None):
         if name == "cross":
             return [rank(sum(o.counts(l) for o in others)) for l in lay]
         return [rank(sum(o.counts(l, 0, SPLIT) for o in others)) for l in lay]
-    if name.startswith("hot:"):
-        hot = wu.read_hot(name[4:])
-        out = []
-        for i, l in enumerate(lay):
-            if l not in hot:
-                raise ToolError(f"{name[4:]}: no line for layer {l}")
-            if need is not None and len(hot[l]) < need[i]:
-                raise ToolError(f"{name[4:]}: layer {l} holds {len(hot[l])} ids, the plan keeps {need[i]}")
-            out.append(np.asarray(hot[l], dtype=np.int64))
-        return out
-    raise ToolError(f"no seed {name!r}: in, insample, cross, pooled, prefix or hot:<file>")
+    raise ToolError(f"no seed {name!r}: in, insample, cross, pooled or prefix")
 
 
 def seed_resident(lists, n_l, E):
@@ -765,33 +752,6 @@ def gen_values(X, contexts, P, N, seed, n_l, E, rule, M, stage, d, copies, spare
     return rows, float(gen_rows.mean())
 
 
-def hot_header(path):
-    """A router-hotlist.py file's `# key<TAB>value` lines (read_hot reads its layer lines)."""
-    header = {}
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            if line.startswith("# ") and "\t" in line:
-                key, value = line[2:].rstrip("\n").split("\t", 1)
-                header.setdefault(key, value)
-    return header
-
-
-def hot_guard(seedname, trace, split):
-    """Refuse a hot:<file> seed learned on the trace it would score, unless it learned on the trace's
-    learn requests alone and --split held scores the others."""
-    if not seedname.startswith("hot:"):
-        return
-    path = seedname[4:]
-    header = hot_header(path)
-    names = [x.rsplit(":", 1)[0] for x in header.get("sets", "").split(",") if x]
-    if trace not in names:
-        return
-    if split != "held" or header.get("split") != "learn":
-        raise ToolError(f"gen: {path} was learned on {trace} (# sets {header.get('sets')}, # split "
-                        f"{header.get('split', 'none: every position')}); scored on it without --split held "
-                        "over a list of its learn requests (router-hotlist.py --split learn) it is in-sample")
-
-
 def verdict(a, c, steady):
     """adaptres §6: (c)-(a) >= 10 points -> R5 with R3; < 3 -> drop R5; steady adaptive < 70 % -> hold R3."""
     x = 100.0 * (c - a)
@@ -1091,7 +1051,7 @@ def cmd_hit(a, out):
             s = Set(set_dir(a.data, n), a.family)
             n_l = n_cap(a.family, a.cap, s.E)
             X = hit_eval_stack(s, F)
-            lists = seed_lists(a.family, s, seedname, a.data, n_l)
+            lists = seed_lists(a.family, s, seedname, a.data)
             for arm in ("static", "open" if has_open else "zero"):
                 r = dict(fam=a.family, set=s.name, seed=seedname, P=P, N=a.window, arm=arm,
                          M=M if arm == "open" else None, K=(a.stage or 0) if arm == "open" else None, d=a.d,
@@ -1121,9 +1081,9 @@ def cmd_hit(a, out):
             n_l = n_cap(a.family, a.cap, s.E)
             X = hit_eval_stack(s, F)
             seeds = [a.seed] if a.seed else list(F["seeds"])
-            lists = {sd: seed_lists(a.family, s, sd, a.data, n_l) for sd in seeds}
+            lists = {sd: seed_lists(a.family, s, sd, a.data) for sd in seeds}
             if "static" in pol and not a.seed:
-                lists["insample"] = seed_lists(a.family, s, "insample", a.data, n_l)
+                lists["insample"] = seed_lists(a.family, s, "insample", a.data)
             S, step = F["expert_bytes"], F["step_ms"]
 
             def emit(policy, sd, label, hits, swaps, link=None):
@@ -1188,12 +1148,11 @@ def cmd_gen(a, out):
     seedname = a.seed or "pooled"
     if seedname in ("in", "insample", "cross"):
         raise ToolError(f"gen: seed {seedname} would learn on the trace itself or cut it at {SPLIT}; "
-                        "use pooled, prefix or hot:<file>")
+                        "use pooled or prefix")
     if seedname == "pooled" and s.name in F["sets"]:
         raise ToolError(f"gen: {s.name} is one of family {a.family}'s corpus sets, whose first halves build the pooled "
-                        "seed: the seed would have seen the trace; use hot:<file> or prefix")
-    hot_guard(seedname, s.name, a.split)
-    lists = seed_lists(a.family, s, seedname, a.data, n_l)
+                        "seed: the seed would have seen the trace; use prefix")
+    lists = seed_lists(a.family, s, seedname, a.data)
     rule = Rule(a.rule)
     X = s.stack(F["eligible"])
     skipped = [] if a.short == "skip" else None
@@ -1600,7 +1559,7 @@ def case_gen_contexts():
         s = Set(d, "v41")
         n_l = n_plan("v41")
         want, steady = gen_values(s.stack(family("v41")["eligible"]), [(0, 10, 4), (10, 17, 3)], None, 2,
-                                  seed_lists("v41", s, "prefix", root, n_l), n_l, 384, Rule("mid"),
+                                  seed_lists("v41", s, "prefix", root), n_l, 384, Rule("mid"),
                                   family("v41")["open_m"], 0, 1, COPIES)
         assert got["contexts"] == want and got["steady"] == steady, (got, want)
         err = io.StringIO()
@@ -1621,7 +1580,7 @@ def case_gen_contexts():
         with open(js3, encoding="utf-8") as f:
             got3 = json.load(f)
         want3, _ = gen_values(s.stack(family("v41")["eligible"]), [(0, 10, 4), (10, 17, 3)], None, 2,
-                              seed_lists("v41", s, "prefix", root, n_l), n_l, 384, Rule("mid"),
+                              seed_lists("v41", s, "prefix", root), n_l, 384, Rule("mid"),
                               family("v41")["open_m"], 0, 1, COPIES, last=3)
         assert got3["contexts"] == want3 and want3 != want and got3["open_from"] == "last:3", (got3, want3)
 
@@ -1629,8 +1588,7 @@ def case_gen_contexts():
 def case_gen_split():
     # The two requests of case_gen_contexts, 0 learn and 1 held. --split held scores request 1 alone: its
     # window row as gen_values gives it, and the steady hit over its [P, end) with the rule walked over all
-    # 17 positions; no --split says both are scored; --split on a chunk trace is refused. A hot list whose
-    # `# sets` names the trace is refused unless it learned on the learn split and --split held scores it.
+    # 17 positions; no --split says both are scored; --split on a chunk trace is refused.
     with tempfile.TemporaryDirectory() as root:
         rows = {l: [tuple((7 * t + l + 50 * j) % 384 for j in range(6)) for t in range(17)] for l in range(40)}
         d = wu._fake_set(root, "chat", rows, 384, 6)
@@ -1662,7 +1620,7 @@ def case_gen_split():
         assert "split: held, 1 of 2 requests scored" in text and "context 0:" not in text, text
         s = Set(d, "v41")
         n_l = n_plan("v41")
-        seed = seed_lists("v41", s, "prefix", root, n_l)
+        seed = seed_lists("v41", s, "prefix", root)
         X = s.stack(family("v41")["eligible"])
         rule = Rule("mid")
         want, _ = gen_values(X, [(10, 17, 3)], None, 2, seed, n_l, 384, rule, family("v41")["open_m"], 0, 1, COPIES)
@@ -1674,22 +1632,6 @@ def case_gen_split():
         assert got["steady"] == float(per[13:17].mean()) and got["split"] == "held", got
         got, text = gen(["--split", "learn"])
         assert [r["context"] for r in got["contexts"]] == [0] and got["steady"] == float(per[4:10].mean()), got
-
-        hot = os.path.join(root, "hot.txt")
-
-        def hot_list(split):
-            lines = ["# router-hotlist", "# sets\tchat:17,other:9"] + ([f"# split\t{split}"] if split else [])
-            lines += [f"{l}\t" + ",".join(str(e) for e in range(384)) for l in family("v41")["eligible"]]
-            with open(hot, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
-
-        for split, extra in ((None, ["--split", "held"]), ("learn", []), ("learn", ["--split", "learn"])):
-            hot_list(split)
-            got, err = gen(extra, "hot:" + hot)
-            assert got is None and "it is in-sample" in err, (split, extra, err)
-        hot_list("learn")
-        got, text = gen(["--split", "held"], "hot:" + hot)
-        assert got is not None and [r["context"] for r in got["contexts"]] == [1], text
 
         c = wu._fake_set(root, "chunked", rows, 384, 6)
         err = io.StringIO()
@@ -1734,7 +1676,7 @@ def case_gen_short():
             got = json.load(f)
         s = Set(d, "v41")
         n_l = n_plan("v41")
-        seed = seed_lists("v41", s, "prefix", root, n_l)
+        seed = seed_lists("v41", s, "prefix", root)
         X = s.stack(family("v41")["eligible"])
         rule = Rule("mid")
         alone, _ = gen_values(X, [spans[0], spans[2]], None, 2, seed, n_l, 384, rule, family("v41")["open_m"], 0, 1,
@@ -1785,7 +1727,6 @@ def q38_engine_set(root, name, rows, chunk=None, complete=True, n_expert=512):
         "# slots\tslots-<layer>.u8 beside topk-<layer>.u16: C stage card, T tier card, H host",
         "# place\ta",
         "# experts\tcard",
-        "# hot_list\tnone",
         "# prefill\tstep",
     ]
     if chunk:
@@ -1830,7 +1771,7 @@ def case_q38_family():
         with open(js, encoding="utf-8") as f:
             got = json.load(f)
         X = s.stack(F["eligible"])
-        want, steady = gen_values(X, [(0, 17, 8)], 8, 4, seed_lists("q38", s, "prefix", root, n_l),
+        want, steady = gen_values(X, [(0, 17, 8)], 8, 4, seed_lists("q38", s, "prefix", root),
                                   n_l, 512, Rule("mid"), None, 0, 1, COPIES)
         assert got["contexts"] == want and got["steady"] == steady, (got["contexts"], want)
         # refusals: a set that lacks an eligible layer, and one of another experts x top-k

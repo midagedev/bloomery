@@ -48,9 +48,9 @@
 #                runs (STUB_BENCH_RM): the hand-set arm's warm-up and row read shard 1 alone (K=1) and
 #                run; the fit twin's preheats (K=2) cannot open shard 2: its warm-up's and its row's FAIL
 #                rows carry the preheat's rc 2 and its message, the runner rc 1. Red on a runner that loses the preheat's rc.
-#   ours-timed   6 hot:6 through the stub generate_glm5next (needs the profile's prose ids, copied from
+#   ours-timed   6 through the stub generate_glm5next (needs the profile's prose ids, copied from
 #                $BLOOMERY_DATA; skipped, and said so, without them), preheat on at GLM_PREHEAT_K 2 on the
-#                fixture: each ours and hot row counts its faults from the `fed` line and prints the whole
+#                fixture: each ours row counts its faults from the `fed` line and prints the whole
 #                process's beside it, and each arm is preheated at K=2; with STUB_GEN_NOFED=1 the rows
 #                count the whole process and say there was no fed line. Red on the runner before the fed
 #                mark.
@@ -158,7 +158,7 @@ cp "$T/pr27752/llama-bench" "$T/pr27754/llama-bench"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$T/pr27752/llama-server"
 cp "$T/pr27752/llama-server" "$T/pr27754/llama-server"
 # The stub generate_glm5next: --records-schema prints the checked-in schema; a run prints the records a
-# timed run prints (the plan's card_experts nonzero, so a hot arm passes), the `fed` line left out under
+# timed run prints, the `fed` line left out under
 # STUB_GEN_NOFED=1. Under STUB_GEN_FAULT=<file> it takes major faults after its `fed` line (the file
 # written, its pages dropped, then read through a mapping) and times its prompt and steps at 0.01 ms,
 # so the row is [cold]; with STUB_GEN_FAULT_ONCE=1 only its first run does.
@@ -174,7 +174,7 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-echo "plan place=$place card=A6000 ctx_max=2048 card_experts=2627 (39941832704 B) host_experts=9469 (145536581632 B) host_shadow=0 B n_l=67..68 on 39 layers card_budget=none hot_list=none"
+echo "plan place=$place card=A6000 ctx_max=2048 card_experts=2627 (39941832704 B) host_experts=9469 (145536581632 B) host_shadow=0 B n_l=67..68 on 39 layers card_budget=none"
 echo "capture graph_nodes=1348"
 [ -n "${STUB_GEN_NOFED:-}" ] || echo "fed ids=$depth first=[1, 2, 3, 4] last=[5, 6, 7, 8] depth_sequence_from=$depth"
 pms=100.0000 sms=33.0000
@@ -390,26 +390,24 @@ fi
 
 PROSE_SRC=${BLOOMERY_DATA:-/root/bloomery-data}/glm5next/corpus-prose.ids
 if [ -f "$PROSE_SRC" ]; then
-  mkdir -p "$T/data/glm5next" "$T/data/router"
+  mkdir -p "$T/data/glm5next"
   cp "$PROSE_SRC" "$T/data/glm5next/"
-  echo "stub hot list" > "$T/data/router/glm5next-hotlist.txt"
   GPU_A=$STUB_GPU_A6000
   L=$tmp/ours-timed.log
-  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" "${PH_ENV[@]}" -- 6 hot:6
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" "${PH_ENV[@]}" -- 6
   L2=$tmp/ours-nofed.log
   RC1=$RC
-  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NOFED=1 GLM_PROSE_FROM=0 -- 6 hot:6
+  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NOFED=1 GLM_PROSE_FROM=0 -- 6
   if [ "$RC1" != 0 ]; then
     fail ours-timed "rc $RC1, want 0" "$L"
   elif [ "$RC" != 0 ]; then
     fail ours-timed "no fed line: rc $RC, want 0" "$L2"
-  elif want ours-timed "$L" 2 '^ROW r1 (ours|hot) d=6 n=4 ctx=2048 \| .*\| prompt ids 50000..50005 \| .*\| majflt [0-9]+ \(timed, from the fed line; whole process [0-9]+\) <= [0-9.]+ % of the timed window \| wall [0-9]+s$' &&
-    want ours-timed "$L" 2 '^WARMUP r0 (ours|hot) d=6 .*\| majflt [0-9]+ \(timed, from the fed line; ' &&
-    want ours-timed "$L" 4 '^preheat (ours|hot) K=2 bytes=2136 ' &&
-    want ours-timed "$L" 1 '^\[config\] prompt: GLM_PROSE ids from index 50000; the hot list.s trace: ids 0..49999$' &&
+  elif want ours-timed "$L" 1 '^ROW r1 ours d=6 n=4 ctx=2048 \| .*\| prompt ids 50000..50005 \| .*\| majflt [0-9]+ \(timed, from the fed line; whole process [0-9]+\) <= [0-9.]+ % of the timed window \| wall [0-9]+s$' &&
+    want ours-timed "$L" 1 '^WARMUP r0 ours d=6 .*\| majflt [0-9]+ \(timed, from the fed line; ' &&
+    want ours-timed "$L" 2 '^preheat ours K=2 bytes=2136 ' &&
+    want ours-timed "$L" 1 '^\[config\] prompt: GLM_PROSE ids from index 50000$' &&
     want ours-timed "$L" 0 '\(whole process\)' &&
-    want ours-timed "$L2" 2 '^ROW r1 (ours|hot) d=6 .*\| majflt [0-9]+ \(whole process: no fed line\) <= ' &&
-    want ours-timed "$L2" 1 '^ROW r1 hot d=6 .*\| prompt ids 0..5 \| .* \[in-trace\]$' &&
+    want ours-timed "$L2" 1 '^ROW r1 ours d=6 .*\| majflt [0-9]+ \(whole process: no fed line\) <= ' &&
     want ours-timed "$L2" 1 '^ROW r1 ours d=6 .*\| prompt ids 0..5 \| .*s$' &&
     want ours-timed "$L2" 0 '^preheat '; then
     pass ours-timed
@@ -450,7 +448,7 @@ same_view() {
     sed -E 's/--tokens <[^>]*>/--tokens <prompt>/; s/row "POST \/completion: [^,]*,/row "POST \/completion: <prompt>,/'
 }
 if [ -n "$BASE" ]; then
-  SAME_ARMS=(6 hot:6 lcpp27752:6 lcpp27754:6 lcpp27752pp:4 lcpp27754pp:4 lcpp27752pp8:4 lcpp27754pp4096:4 lcpp27752srv:6 lcpp27754srv:6 lcpp27752mtp:6 lcpp27754mtp:6 exl3:256 exl3pp:256)
+  SAME_ARMS=(6 lcpp27752:6 lcpp27754:6 lcpp27752pp:4 lcpp27754pp:4 lcpp27752pp8:4 lcpp27754pp4096:4 lcpp27752srv:6 lcpp27754srv:6 lcpp27752mtp:6 lcpp27754mtp:6 exl3:256 exl3pp:256)
   cp "$BASE" "$T/tools/ref/depth-glm5next-base.sh"
   L=$tmp/dry-same-base.log L2=$tmp/dry-same.log
   RUNNER_FILE=tools/ref/depth-glm5next-base.sh stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_DRY=1 -- "${SAME_ARMS[@]}"
@@ -460,7 +458,7 @@ if [ -n "$BASE" ]; then
     fail dry-same "rc $RC1 (base) and $RC (tested), want 0 and 0" "$L2"
   elif ! diff <(same_view < "$L") <(same_view < "$L2") > "$tmp/dry-same.diff"; then
     fail dry-same "the dry runs differ, less the lines changed on purpose (base <, tested >)" "$tmp/dry-same.diff"
-  elif want dry-same "$L2" 14 '^\[dry\]     '; then
+  elif want dry-same "$L2" 13 '^\[dry\]     '; then
     pass dry-same
   fi
 else

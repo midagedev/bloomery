@@ -20,14 +20,9 @@
 #             2048): the plan refuses more positions than the latent layers attend whole (2,051), so
 #             D + N <= C is checked before the lease. The prompt is prose under this model's own
 #             vocabulary (models/glm5next.sh GLM_PROSE, its sha256 checked before the lease): the D
-#             ids from 0-based index GLM_PROSE_FROM, past the GLM_HOT_TRACE ids the hot list was traced
-#             from (docs/fair-measure.md 4.2: the list is held out from the measured prompt). Each ours,
-#             hot and server row prints `prompt ids <a>..<b>`; a hot row whose ids overlap the trace
-#             ends in ` [in-trace]`, the favourable case, which the contract publishes only as such.
-#   hot:<D>   ours with BLOOMERY_HOT_LIST=$BLOOMERY_DATA/$GLM_HOT (the profile's list; a plain <D>
-#             arm runs with BLOOMERY_HOT_LIST unset): the card experts ranked by the hot list. The row carries the plan's card_experts; a
-#             hot row whose plan put no expert on the card is a FAIL row (a binary whose placement
-#             keeps every routed expert on the host ignores the list), never an ours twin.
+#             ids from 0-based index GLM_PROSE_FROM (models/glm5next.sh: past the ids the router set
+#             was traced from, docs/fair-measure.md 4.2). Each ours and server row prints
+#             `prompt ids <a>..<b>`.
 #   lcpp27752:<D>, lcpp27754:<D>   the PR branch's llama-bench -p 0 -n N -d D -r 1 at the profile's
 #             LCPP27752_GPU_FLAGS / LCPP27754_GPU_FLAGS (the second under LCPP27754_ENV). -d prefills
 #             D of llama-bench's own std::rand() ids before its clock starts; its row label is `tgN @
@@ -86,8 +81,7 @@
 # The file does not stay whole in the cache on its own: our load drops the file pages of what it
 # uploads (BLOOMERY_CARD_DONTNEED, 1 by default: the card trunk, 8.97 GB, and the card experts,
 # 39.94 GB), so the next arm whose host set holds those pages reads them from the drive — ours in its
-# populate, before its timer (a hot arm after an id-prefix arm: the id-prefix card experts the hot
-# list leaves on the host), llama-bench through its mapping, at its load and inside its timer.
+# populate, before its timer, llama-bench through its mapping, at its load and inside its timer.
 # Preheat. Before every GGUF arm (the warm-up included; no exllamav3 arm) the runner reads a host set
 # into the page cache with tools/ref/gguf-ranges.py (host, once per K before the lease; preheat, pread
 # in chunks, the data discarded): token_embd and the routed experts of blocks 0..K-1. A llama.cpp
@@ -120,7 +114,7 @@
 # (guard_cpu, before and after, ` [cpu-busy]`: every engine here runs routed experts on the host
 # cores). BLOOMERY_OTHER_STRICT=1 aborts on either tag instead.
 #
-# Failures. An arm that exits non-zero, prints no value, or (hot) loaded no card expert prints `FAIL
+# Failures. An arm that exits non-zero or prints no value prints `FAIL
 # r<r> <label> <d|p>=<X> rc=<rc> | <why> | full output: <file>` where its row would be; the runner
 # goes on, that label at that key drops out of the means and ratios, and the runner exits 1 at the end
 # with the list.
@@ -157,8 +151,7 @@ COLD_US=75.4
 DRY=${BLOOMERY_DRY:-}
 PROSE=$BLOOMERY_DATA/$GLM_PROSE
 PROSE_FROM=$GLM_PROSE_FROM
-HOT=$BLOOMERY_DATA/$GLM_HOT
-case $PROSE_FROM:$GLM_HOT_TRACE in *[!0-9:]* | :* | *:) echo "depth-glm5next.sh: GLM_PROSE_FROM and GLM_HOT_TRACE are id counts, got '$PROSE_FROM' and '$GLM_HOT_TRACE'" >&2; exit 64 ;; esac
+case $PROSE_FROM in '' | *[!0-9]*) echo "depth-glm5next.sh: GLM_PROSE_FROM is an id count, got '$PROSE_FROM'" >&2; exit 64 ;; esac
 for v in N:$N ROUNDS:$ROUNDS CTX:$CTX BOUND:$BOUND; do
   case ${v#*:} in '' | *[!0-9]* | 0*) echo "depth-glm5next.sh: ${v%%:*} is a positive integer, got '${v#*:}'" >&2; exit 64 ;; esac
 done
@@ -169,12 +162,12 @@ case $WARM in '' | [0-9] | [1-9][0-9]*) ;; *) echo "depth-glm5next.sh: BLOOMERY_
 
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(512 lcpp27754:512)
-# Per arm: the engine (ours, hot, lcpp27752, lcpp27754, exl3), whether it is a prefill arm, its
+# Per arm: the engine (ours, lcpp27752, lcpp27754, exl3), whether it is a prefill arm, its
 # ubatch lever, its depth or prompt length, and its row label (a prefill arm's names its ubatch).
 A_ENG=() A_PP=() A_UB=() A_DEP=() A_LABEL=()
 ours=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0
 usage() {
-  echo "depth-glm5next.sh: arm '$1' is <D>, hot:<D>, lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}:<D>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
+  echo "depth-glm5next.sh: arm '$1' is <D>, lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}:<D>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
   exit 64
 }
 # The fit arms' flags, probe and column (lcpp-fit.sh); fit_eng names this runner's fit engines.
@@ -188,7 +181,7 @@ for a in "${ARMS[@]}"; do
   [ "$a" != "$eng" ] || { eng=ours dep=$a; }
   case $dep in '' | *[!0-9]*) usage "$a" ;; esac
   case $eng in
-    ours | hot)
+    ours)
       ours=1
       [ "$dep" -ge 1 ] && [ $((dep + N)) -le "$CTX" ] || usage "$a" "ours needs 1 <= D and D + N <= C ($N + D against --ctx $CTX)"
       ;;
@@ -248,8 +241,8 @@ fi
 CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 
 # What every arm needs, checked before the lease (a dry run prints the findings and goes on). Ours:
-# a binary no older than its sources that declares the timing records, the prose ids at their sha256,
-# the hot list for a hot arm. The references: their binaries, and exllamav3's venv, bench and model.
+# a binary no older than its sources that declares the timing records, the prose ids at their sha256.
+# The references: their binaries, and exllamav3's venv, bench and model.
 CHECKS=()
 check() { # check <rc> <message>: fatal before a real run, printed in a dry one
   if [ -n "$DRY" ]; then CHECKS+=("$2"); else echo "depth-glm5next.sh: $2" >&2; exit "$1"; fi
@@ -276,7 +269,6 @@ if [ "$ours" = 1 ]; then
   else
     check 2 "no binary at $BIN"
   fi
-  for e in "${A_ENG[@]}"; do [ "$e" != hot ] || [ -f "$HOT" ] || { check 66 "hot arm: no hot list at $HOT"; break; }; done
 fi
 case " ${A_ENG[*]}" in *" lcpp27752"*) [ -x "$LCPP27752BIN" ] || check 2 "no llama-bench at $LCPP27752BIN (PR #27752's tree)" ;; esac
 case " ${A_ENG[*]}" in *" lcpp27754"*) [ -x "$LCPP27754BIN" ] || check 2 "no llama-bench at $LCPP27754BIN (PR #27754's tree)" ;; esac
@@ -316,12 +308,10 @@ fi
 ref_witness() { [ ${#REF_LINES[@]} -eq 0 ] || printf '    %s\n' "${REF_LINES[@]}"; }
 
 # prompt_ids <D>: the D prompt ids, one a line: GLM_PROSE from 0-based index PROSE_FROM (the header's
-# Arms). prompt_col <engine> <D>: the row's `prompt ids` column, and ` [in-trace]` for a hot arm whose
-# ids overlap the hot list's trace, ids 0..GLM_HOT_TRACE-1.
+# Arms). prompt_col <D>: the row's `prompt ids` column.
 prompt_ids() { tail -n +"$((PROSE_FROM + 1))" "$PROSE" | head -n "$1"; }
 prompt_col() {
-  PROMPT_COL=" | prompt ids $PROSE_FROM..$((PROSE_FROM + $2 - 1))" TRACE_TAG=''
-  [ "$1" != hot ] || [ "$PROSE_FROM" -ge "$GLM_HOT_TRACE" ] || TRACE_TAG=' [in-trace]'
+  PROMPT_COL=" | prompt ids $PROSE_FROM..$((PROSE_FROM + $1 - 1))"
 }
 # The command of arm <i>, into CMD (an array, its environment first through env), LABEL_TEST
 # (the row the reference's output is read by) and, for a fit arm, FIT_NOTE (what its flags dropped).
@@ -329,11 +319,8 @@ arm_cmd() {
   local i=$1 eng=${A_ENG[$1]} dep=${A_DEP[$1]} ub=${A_UB[$1]} flags envs=''
   CMD=() LABEL_TEST='' BATCH='' FIT_NOTE=''
   case $eng in
-    ours | hot)
-      envs="-u BLOOMERY_HOT_LIST"
-      [ "$eng" = ours ] || envs="BLOOMERY_HOT_LIST=$HOT"
-      # shellcheck disable=SC2206 # an empty envs adds nothing
-      CMD=(env $envs "$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"})
+    ours)
+      CMD=("$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"})
       ;;
     lcpp2775[24]srv | lcpp2775[24]mtp)
       # shellcheck disable=SC2206 # the profile's NAME=VALUE words
@@ -414,7 +401,7 @@ ph_k() {
   PHK='' PHNGL=''
   case ${A_ENG[$i]} in
     exl3*) return 0 ;;
-    ours | hot) PHK=$GLM_PREHEAT_K; return 0 ;;
+    ours) PHK=$GLM_PREHEAT_K; return 0 ;;
   esac
   arm_cmd "$i"
   for w in "${CMD[@]}"; do
@@ -478,8 +465,8 @@ preheat_arm() {
 
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS ctx=$CTX place=$PLACE warm=${WARM:-0} card=$CARD_NAME timing_gpu=$TIMING_GPU arm_bound=${BOUND}s warmup=$WARMUP cold_us=$COLD_US"
-  echo "[dry] ours: $BIN prose=$PROSE hot=$HOT"
-  echo "[dry] prompt: GLM_PROSE ids from index $PROSE_FROM; the hot list's trace: ids 0..$((GLM_HOT_TRACE - 1))"
+  echo "[dry] ours: $BIN prose=$PROSE"
+  echo "[dry] prompt: GLM_PROSE ids from index $PROSE_FROM"
   ref_witness | sed 's/^   /[dry]/'
   [ ${#CHECKS[@]} -eq 0 ] || printf '[dry] check: %s\n' "${CHECKS[@]}"
   for i in "${!ARMS[@]}"; do
@@ -636,7 +623,7 @@ run_arm() {
   m0=$(majflt) t0=$(date +%s)
   case $eng in
     lcpp2775[24]srv | lcpp2775[24]mtp) srv_run "$dep" ;;
-    ours | hot)
+    ours)
       # Through majflt_mark: the fault count at the `fed` line, where the feed's timer starts.
       markf=$(mktemp "${TMPDIR:-/tmp}/depth-glm5next-fed.XXXXXX") || exit 2
       out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1 | majflt_mark "$markf" '^fed '; exit "${PIPESTATUS[0]}")
@@ -669,7 +656,7 @@ run_arm() {
   fi
   if [ "$rc" -ne 0 ]; then fail_row "" "${r_tag#r}" "$i" "$rc" "exited $rc" "$out"; return; fi
   case $eng in
-    ours | hot)
+    ours)
       local rec P50 MEAN WARMCOL PLACE_RAN SERIES TOKENS PP_N PP_MS PP_TPS PP_PASSES PP_KIND CARD_EXP HOST_EXP
       rec=$(python3 "$RECORDS" sh --bin generate_glm5next - P50=smoke.p50_ms MEAN=smoke.mean_ms WARMCOL=smoke.warm \
         PLACE_RAN=smoke.place 'SERIES=time_step.ms*' 'TOKENS=step.token*' PP_N=time_prompt.n PP_MS=time_prompt.ms \
@@ -678,7 +665,6 @@ run_arm() {
       eval "$rec"
       [ -n "$P50" ] && [ -n "$PP_N" ] || { fail_row "" "${r_tag#r}" "$i" 0 "no SMOKE or time prompt record" "$out"; return; }
       [ "$PLACE_RAN" = "$PLACE" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its SMOKE names place=$PLACE_RAN; the runner passed --place $PLACE" "$out"; return; }
-      [ "$eng" != hot ] || [ "${CARD_EXP:-0}" -gt 0 ] || { fail_row "" "${r_tag#r}" "$i" 0 "plan card_experts=${CARD_EXP:-?} under BLOOMERY_HOT_LIST: this binary keeps every routed expert on the host" "$out"; return; }
       echo "$out" | grep -E '^(plan|load|capture|fed|step 0|time prompt) '
       local h10 t10 uniq tps tps50
       h10=$(echo "$SERIES" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
@@ -693,8 +679,8 @@ run_arm() {
         cold_col "$((m1 - m0))" "$w" "whole process: no fed line"
       fi
       cold_pass "$tag" "$r" "$i"
-      prompt_col "$eng" "$dep"
-      rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG$TRACE_TAG"
+      prompt_col "$dep"
+      rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
       echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MAJ_COL | wall $((t1 - t0))s$rowtags"
       [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
       sums+=("$label|$dep|$r|$tps")
@@ -715,7 +701,7 @@ print(t["predicted_per_second"], t["predicted_n"], t["prompt_n"], t["prompt_per_
       val=$(awk -v v="$val" 'BEGIN{printf "%.2f", v}')
       cold_col "$((m1 - m0))" "$(awk -v n="$N" -v v="$val" 'BEGIN{print n / v}')"
       cold_pass "$tag" "$r" "$i"
-      prompt_col "$eng" "$dep"
+      prompt_col "$dep"
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
       echo "$PTAG $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | prompt_n $prn prompt tok/s $(awk -v v="$prps" 'BEGIN{printf "%.2f", v}') | draft_n $dn draft_n_accepted $dna | ${acc:-no draft acceptance line}$MAJ_COL | wall $((t1 - t0))s$rowtags"
       [ "$PTAG" = ROW ] && sums+=("$label|$dep|$r|$val")
@@ -818,8 +804,8 @@ means() { # means <unit>: `label|key|round|value` on stdin, one mean line per la
 majflt_require depth-glm5next.sh
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS card=$CARD_NAME timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU arm_bound=${BOUND}s cold_us=$COLD_US"
-[ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE hot=$HOT"
-[ "$ours$srv" = 00 ] || echo "[config] prompt: GLM_PROSE ids from index $PROSE_FROM; the hot list's trace: ids 0..$((GLM_HOT_TRACE - 1))"
+[ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE"
+[ "$ours$srv" = 00 ] || echo "[config] prompt: GLM_PROSE ids from index $PROSE_FROM"
 [ "$lcpp" = 0 ] || echo "[config] lcpp27752 flags=$LCPP27752_GPU_FLAGS | lcpp27754 env=$LCPP27754_ENV flags=$LCPP27754_GPU_FLAGS"
 for e in 27752 27754; do
   case $e in 27752) [ "$fit27752" = 1 ] || continue ;; *) [ "$fit27754" = 1 ] || continue ;; esac
@@ -854,8 +840,7 @@ echo "=== per-arm decode means (tok/s @ n=$N, $CARD_NAME; exl3 rows @ n=100, ano
 echo "=== per-arm prefill means (tok/s(pp) @ n=0, prompt P, $CARD_NAME; ours is the step feed, kind=steps) ==="
 [ ${#pp_sums[@]} -eq 0 ] || printf '%s\n' "${pp_sums[@]}" | means 'tok/s(pp)'
 # Ratios against ours: the same file's engines only. exl3 runs another quantization. The engines do not
-# share a routing condition: ours feeds prose ids and places card experts by id or by a prose hot
-# list; llama-bench feeds std::rand() ids and places whole layers, whose host bytes a token do not
+# share a routing condition: ours feeds prose ids and places card experts by id; llama-bench feeds std::rand() ids and places whole layers, whose host bytes a token do not
 # depend on the ids; exllamav3 feeds wikitext-2 and adapts its placement to that stream.
 same_file() { grep -vE '^exl3' | grep -vx ours; }
 if [ ${#sums[@]} -gt 0 ]; then

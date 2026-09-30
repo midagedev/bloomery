@@ -1,6 +1,6 @@
 //! Greedy generation with the GLM-5.3-Flash program: the file planned onto
 //! one card, the routed experts the card experts read by the expert rule
-//! (the hot list `BLOOMERY_HOT_LIST`, or the id prefix) and the rest on the
+//! (each layer's id prefix) and the rest on the
 //! host tier (`model::arch::glm5next::place`), loaded through the session
 //! (`app::Loaded`), the prompt fed as `--prefill` says, then `-n` greedy
 //! steps.
@@ -75,9 +75,7 @@ mod cli {
     use bloomery_gpu_gates::GateError;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
-    use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8, ROUTE_TRACE,
-    };
+    use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8, ROUTE_TRACE};
     use gguf::Split;
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
@@ -85,7 +83,6 @@ mod cli {
     use runtime::{Target, Want};
 
     const ACTS_ON: &[&str] = &[
-        HOT_LIST,
         CARD_BUDGET,
         HOST_POPULATE,
         HOST_LOCK,
@@ -148,7 +145,7 @@ mod cli {
             machine: &Machine,
             plan: &Plan<'_>,
         ) -> Result<bool, SessionError> {
-            record::plan(place, machine, plan, "none").print();
+            record::plan(place, machine, plan).print();
             self.top_k = inputs.hp.indexer.top_k;
             Ok(!self.stop_at_plan)
         }
@@ -460,12 +457,6 @@ mod cli {
             n_layer: run.len(),
             extra: vec![
                 ("place".to_owned(), place.to_owned()),
-                (
-                    "hot_list".to_owned(),
-                    levers
-                        .hot_list()
-                        .map_or_else(|| "none".to_owned(), |p| p.display().to_string()),
-                ),
                 (
                     "card_budget".to_owned(),
                     levers

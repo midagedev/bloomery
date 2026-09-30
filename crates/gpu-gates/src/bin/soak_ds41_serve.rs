@@ -4,8 +4,8 @@
 //!
 //!     soak_ds41_serve --minutes <M> --dir <out> [--seed <n>]
 //!
-//! Starts the server beside this binary (`--port 0 --place a`, the hot list
-//! it inherits through `BLOOMERY_HOT_LIST`), waits for it to listen, then
+//! Starts the server beside this binary (`--port 0 --place a`), waits for it
+//! to listen, then
 //! until the deadline sends a mix drawn from `--seed` (printed): turns of a
 //! multi-turn chat that reuses the cached prefix and starts over past
 //! [`CHAT_CAP`] positions, `/completion` with `cache_prompt: false`, streamed
@@ -65,7 +65,6 @@ mod soak {
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
-    use model::placement::{HotList, PlanLevers};
     use serde_json::{Value, json};
 
     const USAGE: &str = "usage: soak_ds41_serve --minutes <M> --dir <out> [--seed <n>]";
@@ -1215,9 +1214,8 @@ mod soak {
     // ------------------------------------------------------------ the run
 
     /// Starts the server and waits for it to listen: the server, its address,
-    /// and its `plan` line, refused unless it is placement (a) on the A6000
-    /// with the hot list this process was given.
-    fn start(dir: &Path, hot: Option<&str>, uuid: &str) -> Result<(Served, String), GateError> {
+    /// and its `plan` line, refused unless it is placement (a) on the A6000.
+    fn start(dir: &Path, uuid: &str) -> Result<(Served, String), GateError> {
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&SERVER_ARGS, dir)?;
         let t = Instant::now();
@@ -1233,12 +1231,10 @@ mod soak {
             t.elapsed().as_secs_f64()
         );
         println!("soak: {plan}");
-        let want = format!("hot_list={}", hot.unwrap_or("none"));
-        if !plan.contains("place=a ") || !plan.contains("card=A6000") || !plan.contains(&want) {
-            return Err(format!(
-                "the server's plan is not placement (a) on the A6000 with {want}: {plan:?}"
-            )
-            .into());
+        if !plan.contains("place=a ") || !plan.contains("card=A6000") {
+            return Err(
+                format!("the server's plan is not placement (a) on the A6000: {plan:?}").into(),
+            );
         }
         Ok((served, addr))
     }
@@ -1292,10 +1288,8 @@ mod soak {
     pub fn run() -> Result<(), GateError> {
         // The server starts with this process's environment: a lever it
         // would refuse is refused here first.
-        let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
+        bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         let a = parse_args()?;
-        let place = PlanLevers::from_levers(&levers)?;
-        let hot = place.hot.as_ref().map(HotList::path);
         let uuid = a6000_uuid()?;
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -1316,7 +1310,7 @@ mod soak {
         );
         println!("soak: rss_anon bound {} B = {}", anon.total(), anon.terms());
 
-        let (mut served, addr) = start(&a.dir, hot, &uuid)?;
+        let (mut served, addr) = start(&a.dir, &uuid)?;
         let mut log = File::create(a.dir.join("requests.tsv"))?;
         writeln!(log, "t_s\tkind\tpath\tstatus\tms\tnote")?;
         let mut out = File::create(a.dir.join("samples.tsv"))?;

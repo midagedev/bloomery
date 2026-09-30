@@ -7,7 +7,7 @@
 build reads each router set (tools/ref/router-coverage.py's readers: a set without its `# complete`
 trailer is refused) under DIR (default $BLOOMERY_DATA/router; the box's sets, or a copy of them) and
 writes routes-idprefix.tsv beside this file, which tools/flow/ds41_prefill.py reads for the prompts
-`prose`, `code` and `korean` without a hot list. The card holds each layer's id prefix [0, n_l): n_l is
+`prose`, `code` and `korean` at the id prefix. The card holds each layer's id prefix [0, n_l): n_l is
 placement (a)'s, the plan record's `card_experts` spread over its last `n_l_layers` layers one expert a
 layer in ascending order, cycling (crates/model/src/placement.rs `spread`; the plan is
 plans/ds41-p512-ced-on.rec).

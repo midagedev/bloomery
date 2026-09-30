@@ -210,11 +210,11 @@ gpuab 'gpu-ab checks the card at its rounds' 68 'resolves at 5 rounds' 'BLOOMERY
 gpuab 'gpu-ab refuses an example card' 66 'is an example' 'BLOOMERY_LEASE_CARD=docs/cards/example-ab.card' \
   --rounds 5 --arm base="$tmp/old" --arm new="$T"
 gpuab 'gpu-ab passes the card and plans' 0 '^gpu-ab plan: 3 arms x 5 rounds' \
-  'BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card BLOOMERY_HOT_LIST=h.txt' \
+  'BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card BLOOMERY_CARD_BUDGET=38G' \
   --rounds 5 --arm base="$tmp/old" --arm new="$T" --arm lever="$T:BLOOMERY_X=1"
 has 'gpu-ab names the tree that checks nothing' "^gpu-ab: $tmp/old predates the card check"
-has 'gpu-ab merges BLOOMERY_BOX_ENV' "BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab\\.card BLOOMERY_HOT_LIST=h\\.txt BLOOMERY_AB_ROUNDS=5'"
-has 'gpu-ab puts the arm levers after the caller' "BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab\\.card BLOOMERY_HOT_LIST=h\\.txt BLOOMERY_X=1 BLOOMERY_AB_ROUNDS=5'"
+has 'gpu-ab merges BLOOMERY_BOX_ENV' "BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab\\.card BLOOMERY_CARD_BUDGET=38G BLOOMERY_AB_ROUNDS=5'"
+has 'gpu-ab puts the arm levers after the caller' "BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab\\.card BLOOMERY_CARD_BUDGET=38G BLOOMERY_X=1 BLOOMERY_AB_ROUNDS=5'"
 gpuab 'gpu-ab refuses an arm tree without the card' 66 "$tmp/nocard checks cards and has no docs/cards/hcpre-ab\\.card" \
   'BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card' --rounds 5 --arm base="$tmp/nocard" --arm new="$T"
 gpuab 'gpu-ab refuses an arm that sets the rounds' 2 'belongs to the run, not an arm' 'BLOOMERY_LEASE_CARD=docs/cards/hcpre-ab.card' \

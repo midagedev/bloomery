@@ -194,7 +194,7 @@ V4F DeepSeek V4 Flash · G53F GLM-5.3-Flash · Q35 Qwen3.5/3.6/3.8 (dense and Mo
 | host tier dots | R | R | — | R | N M (MXFP4 × Q8) | R (Q4_XL); N (IQ at Q3) | — | V (Q5_1 exps: R) |
 | host tier service (`HostExperts` impl, `HostLayerSpec`) | V XS | V XS | — | V XS | V XS | V XS | — | V XS |
 | placement roles + `KvBytes` | V XS (deepseek2 table) | N S | N S (dense-FFN role) | N S | V S (per-layer compressors) | N S (KDA state, `nextn` Unread) | N S | N S |
-| hot list | R | R | — | R | R | R | — | R |
+| router-frequency list | R | R | — | R | R | R | — | R |
 | draft (n-gram lookup; `step_pair`) | V S (two-row pass in its body) | V S | V S | V S | V S | V M (recurrent state rewind) | V M | V M |
 | embedding row | V XS (Q4_K row) | V XS (Q4_K row) | V XS | unverified | R (Q8_0 row, V4.1 reads bf16) | V XS | V XS | V XS + PLE N |
 | norms | R | V XS (per-head QK RMS) | V XS | V XS (4.7 only) | R | V XS (LayerNorm for indexer k) | V XS | V XS |

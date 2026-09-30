@@ -25,7 +25,7 @@
 ## 1. 지금 스펙 — 무엇을 위해 짓는가
 
 - **지금 도는 모델 둘, 그리고 다음 모델들.** 다음 모델(GLM-5.3 Flash와 최신 공개 모델, Qwen 계열의 변형들)이 들어올 자리가 목표 모양의 첫 축이다(§2-1).
-  - **DeepSeek V4.1 Flash**(공개 GGUF): 카드에는 dense 그래뉼과 층별 expert 접두(또는 hot list)를 두고, 호스트 RAM 264 GB에 expert 약 214 GB를 두고 CPU(AVX2 `qdot`, 고정 풀)가 계산한다. 초안(DSpark)은 둘째 카드에서 돈다.
+  - **DeepSeek V4.1 Flash**(공개 GGUF): 카드에는 dense 그래뉼과 층별 expert 접두를 두고, 호스트 RAM 264 GB에 expert 약 214 GB를 두고 CPU(AVX2 `qdot`, 고정 풀)가 계산한다. 초안(DSpark)은 둘째 카드에서 돈다.
   - **Qwen3 MoE**: 카드에 통째로 올라가고, 프리필은 GEMM 우배치(최대 4096)다.
 - **두 헤드라인.** 디코드 tok/s(깊이를 적는다)와 프리필 pp512·pp4096, 둘 다 A6000에서 잰다. 공개 비교는 llama.cpp와 mistral.rs다.
 - **계약.**
@@ -33,7 +33,7 @@
   - 조용한 실패는 없다. 정의되지 않은 입력은 이름 붙은 오류가 되고, 커널은 fault word를 올린다.
 - **자원 시간선(지금).**
   - 디코드: 산문, 깊이 512, A6000에서 토큰당 22.3 ms[유도, 44.8 tok/s]. 층마다 카드 → 호스트 서비스 → 카드 합류가 이어지고, 벽은 호스트 다리가 정한다.
-  - 프롬프트(G 뒤, 층-배치당): lcg는 호스트 union 69 / 74 ms로 호스트 바운드, 산문(hot list 384)은 카드 바운드.
+  - 프롬프트(G 뒤, 층-배치당): lcg는 호스트 union 69 / 74 ms로 호스트 바운드, 산문(router-frequency list 384)은 카드 바운드.
 
 **이 스펙에 없는 것**: V2-Lite(디딤돌 모델), CPU 전용 디코드 엔진(`bloomery-decode`), stage 0(q3k-gemv·q3k-cpu·gpu-spike). 셋 다 게이트·레버·러너·계약을 싣고 있다(§3의 A).
 
@@ -114,7 +114,7 @@ tools/bloomery/    records · manifest · affected · batch · sit(측정 러너
   - 45층은 KDA 선형 어텐션 34층과, k-pool DSA 인덱서가 붙은 NoPE MLA 11층이다(`layer_types`가 linear ×3 + sparse ×1을 되풀이). 모든 블록이 mHC(4 스트림, Sinkhorn 20)로 싸여 있고, expert 288개 중 8개를 sigmoid 라우터로 고른다(`swiglu_limit 10.0`).
   - ik(`glm5next`)와 exllamav3(`glm5_next.py`)는 지원한다. llama.cpp 메인라인에는 머지된 지원이 없다(PR #27752·#27754·#27773 열림, MTP 드래프트 #27917). 공개 비교는 사용자 규칙대로 PR 브랜치로 하고 번호를 적는다. unsloth GGUF가 나온 #27754가 첫 후보다.
   - 적합성[유도]: UD-Q4_K_XL 파일이 199.7 GB다. 비-expert를 Q8_0(8.5 bpw, `models-survey.md` 표 C)로 보면 10.3 GB, expert는 189.4 GB다. expert는 호스트 예산 214 GB 안에, 비-expert는 A6000에 들어간다. 토큰당 routed 바이트는 V4.1의 1.27배(Q4_XL), 0.92배(Q3_XL)다.
-  - 이 파일의 routed down은 Q5_K라서, 오늘 배치는 hot list를 카드로 보내지 못한다(아래 설계 사실 2).
+  - 이 파일의 routed down은 Q5_K라서, 오늘 배치는 routed expert를 카드로 보내지 못한다(아래 설계 사실 2).
 - **Qwen은 프로그램 모양 셋이다.**
   - Qwen3: 전 층 GQA.
   - Qwen3-Next·3.5·3.6·3.8: GDN 3층마다 게이트 GQA 1층. plan의 `qwen35moe: GQA 16/2 × 256, GDN 30층`은 config로 확인했다.

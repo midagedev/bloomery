@@ -28,14 +28,12 @@
 //! clipped to the cache, read once: the plan counts that ubatch's arena and
 //! the load runs it.
 //!
-//! A qwen4exp file's plan puts each layer's `n_l` hottest ids from
-//! `BLOOMERY_HOT_LIST` or its id prefix on the card as its budget holds
-//! (`place::Experts::Card`, `BLOOMERY_QWEN38_EXPERTS` unset or `card`),
-//! which the step's, the verify's and the pass's card leg and the ubatch
-//! walk's card route run, or with `BLOOMERY_QWEN38_EXPERTS=host` every
-//! routed expert on the host tier; a hot list is refused on a host plan (one
-//! ranks nothing) and on the other families' files, as a set `card` is there;
-//! the `plan` line prints `experts=` and the `load` line `card_layers=`.
+//! A qwen4exp file's plan puts each layer's id prefix on the card as its
+//! budget holds (`place::Experts::Card`, `BLOOMERY_QWEN38_EXPERTS` unset or
+//! `card`), which the step's, the verify's and the pass's card leg and the
+//! ubatch walk's card route run, or with `BLOOMERY_QWEN38_EXPERTS=host` every
+//! routed expert on the host tier; a set `card` is refused on the other
+//! families' files; the `plan` line prints `experts=` and the `load` line `card_layers=`.
 //!
 //! A qwen35moe file runs `auto` and `gemm` through `Body35`'s prompt call
 //! (`Qwen35moeModel::prefill_with`: the same plan, every unit a walk of the
@@ -756,7 +754,6 @@ mod cli {
         let levers = bloomery_levers::at_main(&[
             bloomery_levers::STEP_STATS,
             bloomery_levers::QWEN38_EXPERTS,
-            bloomery_levers::HOT_LIST,
             bloomery_levers::ROUTE_TRACE,
             bloomery_levers::DRAFT,
             bloomery_levers::MTP_HEAD_ROWS,
@@ -773,14 +770,6 @@ mod cli {
                      --dump-taps runs a qwen3moe file"
                         .into(),
                 );
-            }
-            if let Some(h) = levers.hot_list() {
-                return Err(format!(
-                    "BLOOMERY_HOT_LIST={} ranks a qwen4exp card plan's routed experts; \
-                     --dump-taps runs a qwen3moe file",
-                    h.display()
-                )
-                .into());
             }
             if levers.route_trace().is_some() {
                 return Err(
@@ -857,13 +846,6 @@ mod cli {
             return Err(
                 "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a \
                  qwen3moe or qwen35moe file has no host tier"
-                    .into(),
-            );
-        }
-        if family != Family::Qwen38 && levers.hot_list().is_some() {
-            return Err(
-                "BLOOMERY_HOT_LIST ranks a qwen4exp card plan's routed experts; a qwen3moe or \
-                 qwen35moe plan holds every one on the card"
                     .into(),
             );
         }
@@ -1308,12 +1290,6 @@ mod cli {
         let mut extra = vec![
             ("place".to_owned(), place.name().to_owned()),
             ("experts".to_owned(), experts_name(experts).to_owned()),
-            (
-                "hot_list".to_owned(),
-                levers
-                    .hot_list()
-                    .map_or_else(|| "none".to_owned(), |p| p.display().to_string()),
-            ),
             ("prefill".to_owned(), path.name().to_owned()),
         ];
         if let Some(n) = chunk {
@@ -1357,9 +1333,6 @@ mod cli {
             &PlanLevers::from_levers(levers)?,
             experts,
         )?;
-        let hot_list = levers
-            .hot_list()
-            .map_or_else(|| "none".to_string(), |p| p.display().to_string());
         println!(
             "{}",
             Record::new(&record::PLAN38)
@@ -1369,7 +1342,6 @@ mod cli {
                 .u("ctx_max", plan.ctx_max)
                 .u("host_experts", plan.host.experts)
                 .u("card_experts", plan.cards[0].experts)
-                .w("hot_list", hot_list)
                 .line()
         );
         let mut m = Body38::open_placed(file, &plan, &inputs, 0, levers.host(), ub)?;
@@ -1428,9 +1400,6 @@ mod cli {
             &mtp,
             experts,
         )?;
-        let hot_list = levers
-            .hot_list()
-            .map_or_else(|| "none".to_string(), |p| p.display().to_string());
         println!(
             "{}",
             Record::new(&record::PLAN38)
@@ -1440,7 +1409,6 @@ mod cli {
                 .u("ctx_max", plan.plan.ctx_max)
                 .u("host_experts", plan.plan.host.experts)
                 .u("card_experts", plan.plan.cards[0].experts)
-                .w("hot_list", hot_list)
                 .line()
         );
         let mut m = Body38::open_placed_mtp(

@@ -179,7 +179,7 @@ Qwen3-30B-A3B 상수는 다음과 같다. d 2048, 48층, q 헤드 32개, kv 헤�
 | 1 | 호스트 티어 배치 MoE(합집합, 전문가 우선 순회) | KT SOSP §3.2, ik iqk_mul_mat | 전문가 가중치를 ubatch당 한 번 읽고 토큰을 모은다. 활성값 q8 한 번, gate·up 융합, 작업 도둑질 | 전문가별 토큰 목록(CSR), m=2–64 AVX2 GEMM 타일, L2 블로킹, 도둑질 큐 | 작은 m에서 효율이 dense보다 낮다 |
 | 2 | 카드 m행 IMMA GEMM + 카드 MUL_MAT_ID | llama.cpp MMQ(#7921, #15525), `mmq.cu:266` | q8_1 활성값, K-quant 블록 스케일을 IMMA로. 디바이스 쪽 전문가 정렬 | A5 커널(m 16–512), 전문가 경계 타일, ubatch 최대 4096 | cuda-oxide 커널 개발량, 레지스터와 공유메모리 |
 | 3 | CED 정확 재생(삼각형) | V4.1 논문 §2.2, §3.2.2; ik는 미구현 | 인코더 20층은 전 토큰, 디코더 층 39−j는 마지막 1+127j 토큰 | 층별 행 범위, H_20의 층 20 압축 KV와 인덱서 K, 링 채움 | 창·링 경계 버그. 최종 상태 동등 게이트가 필요 |
-| 4 | 동시 분할: 스트림(뜨거운 것) + CPU(꼬리), 끝나는 시각 균형 | HybriMoE Eq.2, exllamav3 `submit_prefill`, Fiddler | 층 l+1의 정적 핫셋(hot list)을 층 l 중에 선반입한다. 라우팅 뒤 나머지는 CPU | pinned 소스(26.2 대 14.4 GB/s), 슬롯 2개, copy 스트림 | A6000에 빈 VRAM이 없고(plan (a)가 약 48.3 GB), DMA가 DRAM을 두고 경합 |
+| 4 | 동시 분할: 스트림(뜨거운 것) + CPU(꼬리), 끝나는 시각 균형 | HybriMoE Eq.2, exllamav3 `submit_prefill`, Fiddler | 층 l+1의 정적 핫셋(router-frequency list)을 층 l 중에 선반입한다. 라우팅 뒤 나머지는 CPU | pinned 소스(26.2 대 14.4 GB/s), 슬롯 2개, copy 스트림 | A6000에 빈 VRAM이 없고(plan (a)가 약 48.3 GB), DMA가 DRAM을 두고 경합 |
 | 5 | 층별 전체 스트리밍(P ≥ 약 2300에서만) | kt layerwise, llama.cpp/ik op offload | 층의 호스트 전문가 전부를 카드로 보내 GPU에서 계산 | 4와 같다. ubatch는 프롬프트 전체 | P가 작으면 진다 |
 | 6 | 두 카드 스트리밍(3090이 스트리밍 카드) | [I], 링크별 x16 가정 | 3090에 슬롯을 두고 자기 링크로 받는다. 카드 사이 활성값은 호스트 경유 | 링크 토폴로지 확인, 층마다 교차 복사 약 168 MB | 3090 Xid 79 이력, 토폴로지 미검증 |
 | 7 | CED Bounded Replay(근사) | V4.1 논문 §3.2.2(DeepSeek 배포 모드) | 디코더를 마지막 128 토큰에만 | 3의 일반화 | **출력이 바뀐다**. ik 오라클과 KL 비교, 사용자 결정 |
@@ -222,7 +222,7 @@ Qwen3-30B-A3B 상수는 다음과 같다. d 2048, 48층, q 헤드 32개, kv 헤�
 ## 4. 문헌이 답하지 못하는 것과 그것을 가를 측정
 
 1. **5975WX에서 m=2/8/32/64 토큰/전문가일 때 Q3_K gate·up과 Q4_K down GEMM 실효.** 합성 전문가 묶음으로 호스트 커널을 마이크로벤치하고 dense 4 TOPS 눈금과 비교한다. 1번 아이디어의 "현실" 계수를 정한다.
-2. **V4.1 프리필의 라우팅 편중과 hot list 아래 카드 활성 몫.** 512·4096 프롬프트의 층별 max/mean과 카드 적중 비율을 잰다. 라우터 id 덤프로 답하며 `tools/ref/router-hotlist.py`가 있다. 가정 0.75를 대체한다.
+2. **V4.1 프리필의 라우팅 편중과 router-frequency list 아래 카드 활성 몫.** 512·4096 프롬프트의 층별 max/mean과 카드 적중 비율을 잰다. 라우터 id 덤프로 답하며 the router-frequency list writer(since deleted)가 있었다. 가정 0.75를 대체한다.
 3. **200 GB가 넘는 mmap 호스트 집합에서 pinned DMA가 되는가.** cuMemHostRegister(읽기 전용 플래그) 대 pinned 스테이징 링을 비교한다. 달성 GB/s와, 동시 DMA 아래 CPU GEMM의 감속을 잰다.
 4. **카드별 PCIe 세대·폭과 두 카드 동시 H2D 합.** `nvidia-smi -q`의 링크 정보와 두 스트림 복사 시험으로 잰다. 26.2 GB/s를 어느 카드에서 쟀는지도 확인한다.
 5. **이 박스에서 ik와 llama.cpp의 pp512·pp4096.** 각자 최적 플래그로 잰다(시팅 P). 특히 ik `-ub 4096`에서 규칙 2048 위아래를 본다.

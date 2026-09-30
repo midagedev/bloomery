@@ -1,8 +1,8 @@
 //! The GLM-5.3-Flash end-to-end gate: the whole program — 34 KDA layers and
 //! 11 latent-attention layers, every block in the four hyper-connection
 //! streams, three dense blocks and 42 routed blocks whose experts run on the
-//! card where the plan puts them (the hot list `BLOOMERY_HOT_LIST`, or the id
-//! prefix) and on the host tier otherwise, the streams' mean, the q8_0 head
+//! card where the plan puts them (each layer's id prefix) and on the host
+//! tier otherwise, the streams' mean, the q8_0 head
 //! and the argmax — loaded
 //! once by its placement on the gate card (`workstation::plan_gate`), against
 //! ik's CPU oracle sets (`refset::arch::glm5next`: the 5-token batch set, the
@@ -174,7 +174,7 @@ mod gate {
         Body, Glm5nextModel, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill, set_taps,
         step_launches, store_digests,
     };
-    use bloomery_levers::{CARD_BUDGET, HOT_LIST};
+    use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
     use gguf::quant::dequant_row;
     use gguf::{GgmlType, Split};
@@ -298,7 +298,8 @@ mod gate {
     /// about 2) may carry at an excused flip — a measured frontier, not a
     /// derivation, in the rule the Qwen3.8 gate's cap takes. The clean
     /// chain's largest, over the batch set's 56 free flips, is 0.157 (layer
-    /// 27, position 0; 0.140 over 42 under the hot list); with one layer's delta-rule mixer skipped (layer 5,
+    /// 27, position 0; 0.140 over 42 with the card experts ranked by a
+    /// router-frequency list learned from the test corpora); with one layer's delta-rule mixer skipped (layer 5,
     /// its output zeroed) the largest is 0.301 (layer 5, position 4) and the
     /// next 0.170. 0.2 is their geometric mean rounded, 1.27x above clean,
     /// and only that one flip past it: a thin frontier. The forced arm's
@@ -1600,7 +1601,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
+        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         let only = only()?;
         let mut ok = true;
         if matches!(only, Only::All | Only::Main) {

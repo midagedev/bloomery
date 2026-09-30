@@ -1,11 +1,10 @@
 //! GPU gate for the V4.1 expert tier (`bloomery_gpu::host::tier`), on one
 //! card: the loopback. The stage and the tier both run on the gate card
-//! (`workstation::plan_gate`), two `Gpu`s on it. The gate plans with a hot
-//! list (`BLOOMERY_HOT_LIST`, refused unset), so each routed layer's card
-//! list is its hottest `n_l`. The tiered plan moves the coldest [`K3`] of
-//! them, ranks `n_l - K3 .. n_l`, from card 0 to device 1 (the tier) through
+//! (`workstation::plan_gate`), two `Gpu`s on it. Each routed layer's card
+//! list is its id prefix `[0, n_l)`. The tiered plan moves the last [`K3`] of
+//! them, ids `n_l - K3 .. n_l`, from card 0 to device 1 (the tier) through
 //! the placement's own split (`placement::routed_row`): the (b′) shape, the
-//! stage the hottest ranks and the tier the next ones, on the gate machine
+//! stage the first ids and the tier the next ones, on the gate machine
 //! with (b′)'s tier card and its prompt-batch reserves beside the stage card
 //! (`tier_machine`). The reference is the gate plan itself, whose card holds
 //! the union — the same experts on one card. Loads run one after the other,
@@ -110,16 +109,14 @@ mod gate {
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8,
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::place::tier_batch;
-    use model::placement::{
-        self, Device, ExpertList, HotList, Machine, Plan, Role, Row, workstation,
-    };
+    use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row, workstation};
 
     use crate::dspark;
 
@@ -284,8 +281,8 @@ mod gate {
     }
 
     /// `plan` on `machine` (the gate plan's with the tier card,
-    /// [`tier_machine`]) with the coldest `k3` experts of each routed stack's
-    /// card-0 list by `hot`'s ranks moved to device [`TIER_DEVICE`]; a stack
+    /// [`tier_machine`]) with the last `k3` experts of each routed stack's
+    /// card-0 list, in id order, moved to device [`TIER_DEVICE`]; a stack
     /// whose card list holds `k3` or fewer is refused by name. With `twice`,
     /// the first stack's tier list also keeps its first expert on card 0 (an
     /// expert on two devices). The host segments stay as they are, so the
@@ -293,7 +290,6 @@ mod gate {
     fn tiered<'a>(
         plan: &Plan<'a>,
         machine: &'a Machine,
-        hot: &HotList,
         k3: usize,
         twice: bool,
     ) -> Result<Plan<'a>, GateError> {
@@ -312,20 +308,12 @@ mod gate {
             let layer = t
                 .layer
                 .ok_or_else(|| format!("{}: a routed stack without a layer", t.name))?;
-            let mut ids = card
+            let ids = card
                 .experts
                 .as_ref()
                 .ok_or_else(|| format!("{}: a card segment without experts", t.name))?
                 .ids()
                 .to_vec();
-            let ranked = hot.ranked(layer);
-            let rank = |e: u32| ranked.iter().position(|&r| r == e);
-            if let Some(&e) = ids.iter().find(|&&e| rank(e).is_none()) {
-                return Err(
-                    format!("{}: card expert {e} has no rank in {}", t.name, hot.path()).into(),
-                );
-            }
-            ids.sort_by_key(|&e| rank(e));
             if ids.len() <= k3 {
                 return Err(format!(
                     "{}: the card keeps {} experts, the gate moves {k3} to the tier",
@@ -603,7 +591,6 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
-            HOT_LIST,
             CARD_BUDGET,
             HOST_POPULATE,
             HOST_LOCK,
@@ -624,33 +611,27 @@ mod gate {
             hp: inputs.hp.clone(),
             levers: cfg.body,
         };
-        let hot = cfg
-            .place
-            .hot
-            .as_ref()
-            .ok_or("the gate plans with a hot list: set BLOOMERY_HOT_LIST")?;
         let card = machine.cards[0].name.clone();
         let tier_open = || TierOpen {
             card: TIER_DEVICE,
             name: card.clone(),
         };
         let tmachine = tier_machine(&machine, &inputs.hp)?;
-        let tplan = tiered(&plan, &tmachine, hot, K3, false)?;
+        let tplan = tiered(&plan, &tmachine, K3, false)?;
         let tier_layers: Vec<usize> = (0..inputs.model.layers)
             .filter(|&l| tplan.n_l.get(l) != plan.n_l.get(l))
             .collect();
         println!(
-            "plan: gate card {card}, {} experts on it by {}; tier: the coldest {K3} of each routed \
-             layer's list on {} layers ({} experts), stage keeps the rest",
+            "plan: gate card {card}, {} experts on it by the id prefix; tier: the last {K3} of each \
+             routed layer's list on {} layers ({} experts), stage keeps the rest",
             plan.cards[0].experts,
-            hot.path(),
             tier_layers.len(),
             K3 * tier_layers.len()
         );
         let mut pass = true;
 
         if args.two {
-            let bad = tiered(&plan, &tmachine, hot, K3, true)?;
+            let bad = tiered(&plan, &tmachine, K3, true)?;
             let t0 = Instant::now();
             match open(split()?, &bad, Some(tier_open()), &meta) {
                 Err(e @ GpuError::Plan { what, .. })

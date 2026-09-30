@@ -404,11 +404,11 @@ The token path is `generate::<Session<B>, Speculative<D>>`, with no `dyn`. The o
 - The session is kept across turns.
 - A new turn whose ids extend `history` feeds only the suffix. Otherwise it cuts to `keepable(common)` and re-feeds, which is serve's `reuse` rule (`genloop.rs:172-193`).
 
-**Derived gain.** All rows are A6000, plan (a), with a hot list.
+**Derived gain.** All rows are A6000, plan (a), with a router-frequency list.
 
 | | step feed (proxy: the decode rate) | batch | gain |
 |---|---|---|---|
-| prose P = 512 | ≤ 512 / 44.8 = 11.4 s (README `:66`; shallower steps are cheaper, so this is an upper bound) | 512 / 216.1 = 2.37 s (`237321a` cardtile, hot list 384, **before** prefillgroup `eb3e08a`; rig-log 09-26#cardtile-ab) | ≈ **4.8×** [derived] |
+| prose P = 512 | ≤ 512 / 44.8 = 11.4 s (README `:66`; shallower steps are cheaper, so this is an upper bound) | 512 / 216.1 = 2.37 s (`237321a` cardtile, router-frequency list 384, **before** prefillgroup `eb3e08a`; rig-log 09-26#cardtile-ab) | ≈ **4.8×** [derived] |
 | prose P = 4096 | 4096 / 44.8 to 4096 / 39.6 = 91.4–103.4 s (39.6 tok/s after a 4096 prompt, README `:71`) | 4096 / 292.1 = 14.0 s | **6.5–7.4×** [derived] |
 
 - Assumption: a step-feed token costs what a decode step costs at the same depth. The step feed has not been re-measured since `43cd107`, where the batch was 2.97× (`gates-ds41.md:147-148`; Open 8).

@@ -31,13 +31,10 @@
 #
 #   GLM_PROSE       the prose ids under $BLOOMERY_DATA (the d1k variant's and the timing runner's
 #   GLM_PROSE_SHA256  prompt, below) and their sha256
-#   GLM_HOT         the card hot list under $BLOOMERY_DATA (`just hotlist all glm5next-hotlist.txt
-#                   glm5next-prose`: 42 layers x 288 ids ranked over 50,000 prose tokens)
-#   GLM_HOT_TRACE   the ids of GLM_PROSE that trace was made of: the first 50,000 (router-trace.sh
-#                   prose --max-tokens 50000; router_trace.cpp reads the file's first --max-tokens ids;
-#                   the set's manifest `# complete 50000 42`)
-#   GLM_PROSE_FROM  the 0-based index of the first prompt id depth-glm5next.sh feeds: GLM_HOT_TRACE,
-#                   so the measured prompt is text the hot list never saw (docs/fair-measure.md 4.2);
+#   GLM_PROSE_FROM  the 0-based index of the first prompt id depth-glm5next.sh feeds: 50,000, past
+#                   the router set glm5next-prose (router-trace.sh prose --max-tokens 50000, the file's
+#                   first 50,000 ids), so the measured prompt is text no router trace saw
+#                   (docs/fair-measure.md 4.2) and every published row keeps the same ids;
 #                   71,727 - 50,000 = 21,727 ids remain, more than any context the plan allows
 #
 # The public lines (tools/ref/depth-glm5next.sh, `just depth-gpu-glm5next`). Mainline llama.cpp does
@@ -98,7 +95,7 @@
 #                   preheats before our arms and the fit twins: 45, every routed expert of blocks 3-44
 #                   and token_embd. Blocks 3-44 are the engine's routed layers (blk.45, NextN, is no
 #                   arm's host set but an MTP context's, whose leading-layer rule puts it on the card),
-#                   so the set holds ours' host experts under any card rule — id prefix or hot list, the
+#                   so the set holds ours' host experts under any card count — the
 #                   plan line's card_experts 39,941,832,704 B plus host_experts 145,536,581,632 B are
 #                   exactly blocks 3-44's 185,478,414,336 — and a fit twin's trailing blocks. It is
 #                   185.5 GB and token_embd of the 199.7 GB file, which the page cache holds whole
@@ -154,9 +151,7 @@ REF_TOKENS=785,6722,315,9621,374
 REF_DUMP_LEASE=1
 GLM_PROSE=glm5next/corpus-prose.ids
 GLM_PROSE_SHA256=8af07981c1749170b57d424cff5274b89be063c1eb44ffa3a443ddc16642bb64
-GLM_HOT=router/glm5next-hotlist.txt
-GLM_HOT_TRACE=50000
-: "${GLM_PROSE_FROM:=$GLM_HOT_TRACE}"
+: "${GLM_PROSE_FROM:=50000}"
 : "${LCPP27752:=/home/user/llama.cpp-pr27752}"
 : "${LCPP27752BIN:=$LCPP27752/build/bin/llama-bench}"
 : "${LCPP27754:=/home/user/llama.cpp-pr27754}"

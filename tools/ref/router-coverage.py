@@ -5,7 +5,7 @@
     tools/ref/router-coverage.py transfer <set A> <set B> [--n 64]
     tools/ref/router-coverage.py compare <set A> <set B> [--tokens N]
     tools/ref/router-coverage.py oracle <set> <oracle set dir>
-    tools/ref/router-coverage.py bursts <set> [<set>...] [--window 512] [--n-l <spec> [--hot <file>]] [--layers 2-39]
+    tools/ref/router-coverage.py bursts <set> [<set>...] [--window 512] [--n-l <spec>] [--layers 2-39]
     tools/ref/router-coverage.py --self-test
 
 A set is a directory router_trace wrote under $BLOOMERY_DATA/router/: counts.tsv, topk-<layer>.u16
@@ -20,9 +20,9 @@ coverage  Per layer: the share of the layer's selections (tokens x n_expert_used
           N_LIST's up to the expert count. --layers keeps only the listed layers (ranges `a-b`
           inclusive), rows and the `all` mean alike; a listed layer the set lacks is refused. Two
           tables:
-            in    the hot list and the share come from the same tokens. Biased up: the top n of noisy
+            in    the top-n list and the share come from the same tokens. Biased up: the top n of noisy
                   counts are partly the lucky ones.
-            held  the hot list from the tokens before the held-out split, the share on the tokens after
+            held  the top-n list from the tokens before the held-out split, the share on the tokens after
                   it — what a placement fixed before the traffic would serve, and the noise floor for
                   `transfer`. The split is the chunk boundary nearest T / 2 (held_split), so no context
                   is cut in two; a set without a `chunk` line, or of one chunk, splits at T / 2.
@@ -36,8 +36,8 @@ compare   Two traces of the same tokens (another schedule, ubatch or backend), t
           (another model file's trace of the same text, say).
 bursts    Per window of W consecutive positions inside one chunk (--window, default 512; a window across a
           chunk edge crosses a context reset and is skipped), how bursty the routing of the host experts
-          is — the experts the card does not hold (--n-l and --hot as tools/ref/window-union.py reads
-          them; without --n-l every expert is a host expert). Two tables:
+          is — the experts the card does not hold (--n-l as tools/ref/window-union.py reads it: each
+          layer's id prefix; without --n-l every expert is a host expert). Two tables:
             m     per window and host expert, m = the window's selections of it, over m̄ = W x
                   n_expert_used / n_expert (every expert's mean): p50, p90, p99 and max of m / m̄ over the
                   (window, host expert) pairs the window touches, and the share of the host slots taken
@@ -183,7 +183,7 @@ def coverage(set_dirs, asked=None, keep=None):
         half = held_split(s)
         print(f"## {d}\n")
         print(f"{T} tokens of {h.get('ids', '?')} (md5 {h.get('ids_md5', '?')}), chunk {h.get('chunk', '?')}, "
-              f"{len(s['layers'])} layers, {E} experts, top-{K}. held = hot list from tokens [0, {half}), "
+              f"{len(s['layers'])} layers, {E} experts, top-{K}. held = top-n list from tokens [0, {half}), "
               f"share on [{half}, {T}).\n")
         rows_in, rows_held = [], []
         if keep is not None and not set(keep) <= set(s["layers"]):
@@ -369,7 +369,7 @@ def burst_stats(s, card, window, keep=None):
             "slots": slots, "thresh": thresh, "top_tenth": top_tenth, "phi": phis, "touched": touched}
 
 
-def bursts(set_dirs, window, spec=None, hot_path=None, keep=None):
+def bursts(set_dirs, window, spec=None, keep=None):
     wu = window_union() if spec else None
     for d in set_dirs:
         s = read_manifest(d)
@@ -377,7 +377,7 @@ def bursts(set_dirs, window, spec=None, hot_path=None, keep=None):
             raise SetError(f"{d}: --layers {sorted(set(keep) - set(s['layers']))} not in the set")
         if spec:
             n_l = wu.parse_n_l(spec, s["layers"])
-            card = wu.card_sets(s["layers"], n_l, s["n_expert"], wu.read_hot(hot_path) if hot_path else None)
+            card = wu.card_sets(s["layers"], n_l, s["n_expert"])
         else:
             card = {l: set() for l in s["layers"]}
         b = burst_stats(s, card, window, keep)
@@ -392,8 +392,7 @@ def bursts(set_dirs, window, spec=None, hot_path=None, keep=None):
             return sum(v) / len(v) if v else float("nan")
         phis = sorted(b["phi"])
         print(f"## {d}: {b['windows']} windows of {window} inside chunks of {s['header'].get('chunk', '-')}, "
-              f"{b['layers']} layers, card {'n_l ' + spec if spec else 'none'}"
-              f"{', list ' + hot_path if hot_path else ''}, m̄ {b['mbar']:.2f}\n")
+              f"{b['layers']} layers, card {'n_l ' + spec if spec else 'none'}, m̄ {b['mbar']:.2f}\n")
         print("| host slots/window, layers summed | p50 m/m̄ | p90 | p99 | max | slots m>=2m̄ | >=3m̄ | >=4m̄ | hottest tenth |")
         print("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
         print(f"| {total / b['windows']:.0f} | {q(0.5):.2f} | {q(0.9):.2f} | {q(0.99):.2f} | "
@@ -677,7 +676,7 @@ def main(argv):
             sets, opts = [], {}
             it = iter(argv[1:])
             for a in it:
-                if a in ("--window", "--n-l", "--hot", "--layers"):
+                if a in ("--window", "--n-l", "--layers"):
                     v = next(it, None)
                     if v is None:
                         raise SetError(f"{a} takes a value")
@@ -686,13 +685,11 @@ def main(argv):
                     raise SetError(f"bursts: unknown flag {a}")
                 else:
                     sets.append(a)
-            if "--hot" in opts and "--n-l" not in opts:
-                raise SetError("bursts: --hot names the card's order; --n-l says how many it keeps")
             window = int(opts.get("--window", 512))
             if window < 1 or not sets:
                 raise SetError("bursts: a set and a window of at least one position")
             keep = layer_list(opts["--layers"]) if "--layers" in opts else None
-            bursts(sets, window, opts.get("--n-l"), opts.get("--hot"), keep)
+            bursts(sets, window, opts.get("--n-l"), keep)
             return 0
     except SetError as e:
         print(f"router-coverage: {e}", file=sys.stderr)

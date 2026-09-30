@@ -51,7 +51,7 @@
 # with its .meta and run log): the eager q3k_gemv / ds41_q3k_gemv_heads_mcol launches in launch order
 # before the chunk's qkv, and the shapes of the launches it reaches. The profile runs that command with
 # --mode eager — the prompt batch is eager in both modes, and without the capture before it the
-# filter's launch count is the trace's — and refuses a trace made by another binary or hot list.
+# filter's launch count is the trace's — and refuses a trace made by another binary.
 # BLOOMERY_NCU_LAYER picks the layer (default: the first >= 2 whose full chunks carry only the four
 # projections and no engram, compressor or indexer launch); the chunk is its middle full chunk. The
 # summary checks every profiled launch's name, grid and block against the plan and each one's column
@@ -413,7 +413,7 @@ if [ "$FORM" = ds41pp ]; then
   }
   if [ -n "$DRY" ]; then
     pp_cmd '<the plan skip>' '<the plan count>' '<the plan regex>'
-    echo "[dry] form=ds41pp bin=$GEN trace=${TRACE:-<none: run just nsys-gpu-ds41-prefill $P first>} (sha256 $(meta sha256), hot list '$(meta hot_list)') bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+    echo "[dry] form=ds41pp bin=$GEN trace=${TRACE:-<none: run just nsys-gpu-ds41-prefill $P first>} (sha256 $(meta sha256)) bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     echo "[dry] ${CMD[*]}"
     exit 0
   fi
@@ -421,7 +421,6 @@ if [ "$FORM" = ds41pp ]; then
   [ -f "$META" ] && [ -f "$RUNLOG" ] || { echo "ncu-gpu.sh: $TRACE has no .meta or run log beside it: the trace's binary and command are unknown" >&2; exit 2; }
   assert_fresh_binary "$GEN" || exit $?
   [ "$(meta sha256)" = "$BIN_SHA" ] || { echo "[skip] the trace was made by generate_ds41 sha256 $(meta sha256), this one is $BIN_SHA: its launch order is not this binary's — run just nsys-gpu-ds41-prefill $P again" >&2; exit 3; }
-  [ "$(meta hot_list)" = "${BLOOMERY_HOT_LIST:-}" ] || { echo "[skip] the trace ran with BLOOMERY_HOT_LIST='$(meta hot_list)', this run with '${BLOOMERY_HOT_LIST:-}': another placement" >&2; exit 3; }
   [ -x "$NCU" ] || { echo "no ncu at $NCU" >&2; exit 2; }
   [ "$(id -u)" = 0 ] || { echo "ncu 카운터는 root가 필요하다(RmProfilingAdminOnly=1)" >&2; exit 77; }
   WITNESS=(head-open indent card model)
@@ -435,7 +434,7 @@ if [ "$FORM" = ds41pp ]; then
   COUNT=$(sed -n 's/^count=//p' "$out.plan")
   REGEX=$(sed -n 's/^regex=//p' "$out.plan")
   echo "[config] ncu=$($NCU --version | sed -n 3p) form=ds41pp P=$P n=$N skip=$SKIP count=$COUNT regex='$REGEX' bound=${BOUND}s"
-  echo "[config] sections='$SECTIONS_PP' out=$out hot_list=${BLOOMERY_HOT_LIST:-<unset>}"
+  echo "[config] sections='$SECTIONS_PP' out=$out"
   witness pre
   guard_other
   t0=$(date +%s)

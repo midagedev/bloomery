@@ -423,7 +423,7 @@ Extra    = Engram{..} | Ple{..} | Deepstack{..}
 ## 7. 지정 밖에서 본 개선 여지 (보고만 했고 손대지 않았습니다)
 
 1. **`crates/gpu-deepseek41/src/engram_gate.rs:57`.** `pub const ROW: usize = 5120;`로 V4.1의 hidden이 커널 기하에 박혀 있습니다(:60 assert). Qwen3.8 PLE(2560)나 다른 n-gram 모델이 재사용할 수 없습니다. 크기 S.
-2. **`crates/model/src/placement.rs:270-299`와 `:363-368`.** `CardFormat::of`와 `of_routed`가 MXFP4, Q2_K, IQ2_XS/IQ3_XXS/IQ4_XS를 거부합니다. 그런데 카드 커널은 있습니다(`crates/gpu/src/mxfp4.rs`, `crates/gpu/src/iq.rs`). "카드가 무엇을 돌리나"의 주인이 둘인 셈입니다. GLM-5.3-Flash UD-Q4_K_XL의 routed down은 Q5_K라서 hot list가 카드로 못 갑니다. 크기 S–M.
+2. **`crates/model/src/placement.rs:270-299`와 `:363-368`.** `CardFormat::of`와 `of_routed`가 MXFP4, Q2_K, IQ2_XS/IQ3_XXS/IQ4_XS를 거부합니다. 그런데 카드 커널은 있습니다(`crates/gpu/src/mxfp4.rs`, `crates/gpu/src/iq.rs`). "카드가 무엇을 돌리나"의 주인이 둘인 셈입니다. GLM-5.3-Flash UD-Q4_K_XL의 routed down은 Q5_K라서 router-frequency list가 카드로 못 갑니다. 크기 S–M.
 3. **`crates/gpu/src/route_core.rs:14-16`.** `Sigmoid` 점수는 컴파일되지만 아무 라우터도 쓰지 않습니다. 라우터 넷이 각자 (E, K) 상수를 가집니다: `crates/gpu/src/router.rs:38-41`, `crates/gpu-deepseek41/src/router.rs:60-63`, `crates/gpu/src/arch/qwen3moe/router.rs:72-75`, `crates/gpu-deepseek41/src/experts_mxfp4.rs:63-66`. `[S]` §6의 const-generic 코어로 모을 수 있습니다(감사의 `dflash_router` 발견과 겹칩니다). 크기 M.
 4. **`crates/model/src/arch/deepseek41/roles.rs:39-41`.** V4.1 파일에 든 nextn 3층이 `Role::Unused`입니다. DSpark와 n-gram 옆에 셋째 드래프트 소스가 놀고 있습니다. 크기 M.
 5. **`crates/gpu/src/flash_gqa.rs:67-69`, `flash_gqa_prefill.rs:178`, `rope_neox.rs:46`.** HEAD 128, GROUP 8, 전면 회전이 assert로 고정돼 있습니다. Qwen3 dense(GROUP 2/4/5), 235B(16), Qwen3.5+ 전부(HEAD 256, partial 64)가 이 경로를 못 씁니다. 크기 M.

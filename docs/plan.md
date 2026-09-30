@@ -4,11 +4,11 @@
 
 ## 지금 (2026-09-25 새벽)
 
-**목표는 "커뮤니티 공개"(사용자 09-24 09:35)**: 3090 한두 장과 AVX2 Threadripper를 가진 사람이 받아서 돌리고 우리 숫자를 재현하는 공개 엔진. 순서를 정하는 축은 ① 타겟 카드의 헤드라인 숫자 ② 받아서 돌리는 경로 ③ 차별점(어긋난 드래프트 + DSpark, 뜨거운 목록) ④ 사람들이 쓰는 모델(Qwen3·GLM-4.7-Flash·V4-Flash)이다.
+**목표는 "커뮤니티 공개"(사용자 09-24 09:35)**: 3090 한두 장과 AVX2 Threadripper를 가진 사람이 받아서 돌리고 우리 숫자를 재현하는 공개 엔진. 순서를 정하는 축은 ① 타겟 카드의 헤드라인 숫자 ② 받아서 돌리는 경로 ③ 차별점(어긋난 드래프트 + DSpark) ④ 사람들이 쓰는 모델(Qwen3·GLM-4.7-Flash·V4-Flash)이다.
 
 - **재구성(09-26 밤, 사용자 지시)**: "처음부터 지금 스펙을 목표로 설계했다면"을 기준으로 전면 리팩터한다. 사후 감사 보고 일곱과 목표 모양·이행 계획은 [`rebuild.md`](rebuild.md)에 있다. 목표 모양의 첫 축은 다음 모델(GLM-5.3 Flash와 최신 공개 모델, Qwen 계열의 변형)이 들어올 자리다. 순서는 삭제 → 한 주인 → 모델 서술과 연산 라이브러리 → 층 프로그램 하나 → 새 모델이다. 연산 어휘는 조사 라운드 `modelvocab`의 표로 확정한다.
 - **파일은 공개 `DeepSeek-V4.1-Flash-Q3_K_M` 하나다**(사용자 09-24 14:30 결정, `d771085`로 기본값). 혼합 파일 `attnQ8`은 시팅 10(참조 재생성) 뒤 지운다.
-- **헤드라인(측정, A6000, plan (a) 카드 expert 2,668, 뜨거운 목록, prose/code 512 프롬프트 뒤 n 96)**: 우리 **42.9 / 42.4 tok/s**, ik plain 20.0(같은 임대, 혼합 파일 플래그 — 공개 파일 최적 플래그는 N5 미탐색), 예산 38G 40.3, 24G(3090 흉내) 35.8(rig-log 09-24#public-q3km-prose-code-and-budget). lcg 깊이 6·목록 없음은 29.7(09-25#launch-thread-lever-ab), llama.cpp PR 브랜치 21.5. Qwen3-30B-A3B 전 카드: mainline llama.cpp 대비 깊이 6 +6 %, 4096 −7 %(09-24#qwen3-30b-a3b-e28).
+- **헤드라인(측정, A6000, plan (a) 카드 expert 2,668, router-frequency list, prose/code 512 프롬프트 뒤 n 96)**: 우리 **42.9 / 42.4 tok/s**, ik plain 20.0(같은 임대, 혼합 파일 플래그 — 공개 파일 최적 플래그는 N5 미탐색), 예산 38G 40.3, 24G(3090 흉내) 35.8(rig-log 09-24#public-q3km-prose-code-and-budget). lcg 깊이 6·목록 없음은 29.7(09-25#launch-thread-lever-ab), llama.cpp PR 브랜치 21.5. Qwen3-30B-A3B 전 카드: mainline llama.cpp 대비 깊이 6 +6 %, 4096 −7 %(09-24#qwen3-30b-a3b-e28).
 - **DSpark를 붙이면 [유도]** 48 GB급 ~45–50 tok/s = ik + DSpark의 1.4–1.5배; 3090 한 장은 +7 %(8.5 GB 드래프트가 expert 자리를 먹는다 — E27 레버 셋).
 - **공개를 막는 것**: ① E21 3090 실측(공개 파일, 승인됨 — 시팅 큐 1) ② 우리 DSpark tok/s(`dsloop` `c00274c` 착륙 — 무손실 루프 동작, 측정은 시팅 DS) ③ 사용자 결정(공개 시점 — LICENSE는 MIT로 결정, 09-25) ④ **프리필 숫자**(사용자 09-25: 디코드만큼 중요, V4.1·Qwen3 둘 다) — ~~V4.1은 배치 프리필이 없어 토큰마다 디코드 스텝(≈ 43 tok/s, 512토큰 ≈ 12 s[유도]), Qwen3는 eager 8위치 패스; 우리·ik·llama.cpp 어느 쪽도 pp를 잰 적이 없다.~~ 09-25 15:30 정정: Qwen3는 `qwen3prefill` `dfa8b5d`로 pp512 **5,304**(llama.cpp 4,256의 1.25배)·pp4096 2,615(0.63배, rig-log 09-25#qwen3prefill-ab); V4.1은 ~~`ds41batch`(B0, 비트 정확 512 배치)가 착륙 중이고 pp는 착륙 직후 시팅이 잰다(측정 대기).~~ `ds41batch` `43cd107`로 pp512 **91.2**·pp4096 **89.2**(스텝 피드의 2.97배, 벽시계의 2/3가 호스트 union — 슬롯당 39 µs, 실효 f ≈ 0.92[유도]; rig-log 09-25#ds41batch-pp). 그 임대의 참조 팔은 페이지 캐시 폴트로 무효라 llama.cpp 같은 임대 비율은 파동 경계 재시팅이 낸다(오전 P512 104.6 대비 0.87배, 다른 임대).
 - **비행 중(파동 21)**: `dspark-q3k` ‖ `ds41hcbranch` ‖ `unionhost` → `ds41splitk` ‖ `qwen3route` ‖ `fixup3`. 09-24 밤 ~ 09-25 새벽 착륙: `ds41router` `dd5422b` · `ds41join` `075ceef` · `ds41hcfin` `ecaacdd` · `ds41dense` `4953fdb` · `pubflip` `d771085` · `loudnan` `5fe50f6`(카드의 조용한 NaN → 폴트 워드) · `tokfix` `3ef2c8a` · `v4host` `55b5249` · `qwen3deep` `5712f25` · `gate-ds41-load` 닫음 `8dd878f`. 리드 재실행 lint **167**(main `43d5ba9`).
@@ -189,10 +189,9 @@ T1의 실측은 E21(24G 흉내 35.8 tok/s, 예측 33–38). T2는 DSpark 드래�
 
 | # | 실험 | 무엇을 정하나 | 비용 | 막는 것 |
 |---|---|---|---|---|
-| E21 | **3090 단일 배치 tok/s**(공개 파일, `--place gate` + 뜨거운 목록, 깊이 6/4096, prose·code 512, n 96, 2바퀴; ik·ik + DSpark·llama.cpp·N5 플래그 세트) | 공개 글 헤드라인 = 타겟 카드의 값 | 임대 ~30분 | 빌더 틈 |
+| E21 | **3090 단일 배치 tok/s**(공개 파일, `--place gate` + router-frequency list, 깊이 6/4096, prose·code 512, n 96, 2바퀴; ik·ik + DSpark·llama.cpp·N5 플래그 세트) | 공개 글 헤드라인 = 타겟 카드의 값 | 임대 ~30분 | 빌더 틈 |
 | E29 | DSpark 수락률의 온도(`--temp 0/0.7/1.0`) | 드래프트 이득이 실사용 샘플링에서도 서는가 | ~15분 | `ik-draft.sh` 온도 인자 |
 | E5b → E19 | 우리 greedy 출력에 `draft-accept.py`; lookup 게이트 정책 넷 채점 | 오라클 − 항상쌍 < 2 %면 게이트 버림 | 오프라인 | — |
-| E17 → E18 | 뜨거운 목록의 프롬프트 의존(코퍼스 × 목록 적중 행렬 + 접두 N 열) | 정적 목록 하나로 충분한지(격차 > 10 %p면 E18 프롬프트 적응 배치) | ~10분 | — |
 | E7 · E9 · E14 · E10 · E27 · E28 재측정 | 3090 250 W 실효 BW · engram 콜드 팔 · 0층 브리지 2.1–2.7 ms · 층 l+1 라우터 적중률 · 3090 DSpark 자리 · qwen3route 뒤 | 각각 dspark D 유도·C3·스텝 최대 노출 항·P1 여부·T1 DSpark 배치·두 번째 헤드라인 | 소 | — |
 
 ## 측정 프로토콜 치트시트

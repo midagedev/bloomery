@@ -269,7 +269,7 @@ ncu-gpu-gemm ARM='gemm_q4k_moe_t4096':
 
 # The V4.1 prompt projections' counters (ncu, A6000, under the lease, lead-only): one launch each of the joined qkv, q_b,
 # wo_a heads and wo_b at m = 8 in the middle full chunk of a layer >= 2 of a P-token prompt (default 512). The launch skip
-# comes from the newest nsys-gpu-ds41-prefill trace of the same P (run that first; it must be of this binary and hot list),
+# comes from the newest nsys-gpu-ds41-prefill trace of the same P (run that first; it must be of this binary),
 # and the profiled launches' names, grids, blocks and column counts are checked before the summary: per launch the
 # block-step cycles and each unit's demand in cycles. The header of tools/ref/ncu-gpu.sh has the form. Under
 # BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and the runner prints its command line.
@@ -574,12 +574,6 @@ trace-router-glm5next CORPUS *ARGS:
 # 세트 이름은 qwen4exp-<이름>이다.
 trace-router-qwen4exp CORPUS *ARGS:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/router-trace.sh {{CORPUS}} {{ARGS}}'
-
-# 라우터 세트들을 합쳐 층마다 뜨거운 expert를 순위대로 적은 목록(B12)을 $BLOOMERY_DATA/router/<OUT>에 쓴다. 적재는
-# BLOOMERY_HOT_LIST=<그 경로>로 이 목록의 앞 n_l개를 카드에 둔다. N은 어느 플랜의 n_l보다도 커야 한다(all = 세트의 expert 수, 전체 순위).
-# GLM: just hotlist all glm5next-hotlist.txt glm5next-prose
-hotlist N='all' OUT='hotlist-384.txt' *SETS='code prose korean threads':
-    ./tools/box.sh 'D=$BLOOMERY_DATA/router && python3 tools/ref/router-hotlist.py $(for s in {{SETS}}; do printf "%s " "$D/$s"; done) --n {{N}} --out "$D/{{OUT}}"'
 
 # ik 트리 하나의 wikitext-2 퍼플렉서티(c2048, 4청크, CPU만)를 서빙하는 V4.1 파일로 CPU 임대 아래서 잰다.
 # 두 트리를 연달아 돌리면 포트의 A/B다. ARGS: --chunks N.
@@ -1075,8 +1069,8 @@ gate-gpu-ds41-skew *ARGS='--structure --sets --api':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_skew && bash tools/gpu-gate.sh gate_deepseek41_skew {{ARGS}}'
 
 # V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
-# 게이트 계획은 핫 리스트(router/hotlist-384.txt)로 층마다 가장 뜨거운 n_l개를 카드에 두고, 층 계획은 그중 순위가 낮은
-# 23개(순위 n_l−23 … n_l)를 장치 1(층)로 옮긴 것이다((b′) 모양). 기준은 게이트 계획 자체(합집합이 한 카드에)다. 두 적재는
+# The gate plan puts each layer's id prefix [0, n_l) on the card; the tier plan moves its last 23 ids (n_l−23 … n_l) to
+# device 1 (the tier), the (b′) shape. 기준은 게이트 계획 자체(합집합이 한 카드에)다. 두 적재는
 # 차례로, 기준 먼저. --union(T1): 산문 프롬프트 16위치를 한 스텝씩, 탐욕 32스텝, 쌍 4번(그래프),
 # 프롬프트와 4스텝(eager)이 기준과 argmax·logits 비트까지 같고 스테이지 그래프 노드 수가 같다; 전제: 층이 가진 층마다
 # 라우팅된 슬롯이 한 번 이상 갔다. --fault(T2): 층 카드 폴트가 스텝의 오류·독, 리셋 뒤 기준과 같다. --lost(T3): 층
@@ -1091,13 +1085,13 @@ gate-gpu-ds41-skew *ARGS='--structure --sets --api':
 # 3090, 게이트 락.
 [group('v41-load')]
 gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault --blost --bfirst --bfeat':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
 # V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.
 # The reference is the same plan with every tier set joined to the stage card's (one card, no tier code); --loopback adds
 # the plan with the tier on the A6000 beside the stage (two Gpus on one card). The draft is on the 3090 in every load; the
-# plans are made under a card budget so the A6000 holds both sets, ranked by the serving hot list (hotlist-384) so the tier
-# holds each layer's next hot ranks. --union: the prose prompt (32 ids) step by step, 48 greedy steps, then the prompt
+# plans are made under a card budget so the A6000 holds both sets; the stage keeps each layer's id prefix and the tier
+# the next ids. --union: the prose prompt (32 ids) step by step, 48 greedy steps, then the prompt
 # through the draft and 16 DSpark passes, every token, kept count and logits row bit for bit the reference's, the stage
 # graph's node count too; precondition: every tier layer sent a routed slot, the passes kept and rejected a proposal.
 # --lost: the tier's stream held behind a host flag, the step named as a lost card within the deadline, no token,
@@ -1106,7 +1100,7 @@ gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-twocard *ARGS='--union --loopback --lost':
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt bash tools/gpu-gate.sh gate_deepseek41_twocard {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard {{ARGS}}'
 
 # V4.1 adaptive residency (BLOOMERY_RESIDENCY, set in the gate to mid-p40-s1) on plan (b′), both cards, the id-prefix
 # seed, the r8 sidecar: the host-set refusal at load (a host one byte short of the churn pool, named, before the load),
@@ -1355,13 +1349,13 @@ depth-gpu-qwen4exp *ARMS:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(산문 첫 D개 id를 스텝마다 먹임, pp는
-# `kind=steps`)·`hot:<D>`(BLOOMERY_HOT_LIST), llama.cpp PR 두 가지 `lcpp27752:<D>`·`lcpp27754:<D>`(-d D)와 `…pp[<U>]:<P>`,
+# `kind=steps`), llama.cpp PR 두 가지 `lcpp27752:<D>`·`lcpp27754:<D>`(-d D)와 `…pp[<U>]:<P>`,
 # llama-server 한 요청으로 재는 `…srv:<D>`·`…mtp:<D>`(MTP 초안, 서버가 찍는 draft acceptance 줄을 행에 그대로 싣는다),
 # exllamav3 `exl3:<D>`·`exl3pp:<P>`(perf.py, EXL3 4.05 bpw — 다른 양자화라 비율 표에 넣지 않는다). GGUF 팔은 바퀴마다 순서를
 # 돌리고 exllamav3 팔은 그 뒤 한 덩어리로 돈다. 팔·플래그 근거는 tools/ref/depth-glm5next.sh와 models/glm5next.sh 머리에.
 # 우리 팔이 없거나 BLOOMERY_BOX_ENV=BLOOMERY_DRY=1이면 generate_glm5next를 빌드하지 않는다; 인자 없으면 512 lcpp27754:512.
 depth-gpu-glm5next *ARMS:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in hot:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next; fi; } && bash tools/ref/depth-glm5next.sh {{ARMS}}'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next; fi; } && bash tools/ref/depth-glm5next.sh {{ARMS}}'
 
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
@@ -1390,7 +1384,7 @@ nsys-gpu-ds41 *DEPTHS:
 # each prompt length P (default 512), the window from the prompt's first kernel to the first replay, cut into layer-batches
 # at ds41_ffn_places and the joins against the run's stat lines; per layer-batch the route window, the union gap and the
 # post, the kernel terms of one layer-batch (BLOOMERY_NSYS_LAYER, default 2) and of layers 2-39, the card's idle time and the
-# launch queue from the CUDA API trace. Pass the sitting's hot list through BLOOMERY_BOX_ENV (BLOOMERY_HOT_LIST=...). The
+# launch queue from the CUDA API trace. The
 # header of tools/ref/nsys-ds41.sh and tools/ref/ds41pp.py have the cut. Under BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built.
 nsys-gpu-ds41-prefill *PROMPTS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && BLOOMERY_NSYS_FORM=prefill bash tools/ref/nsys-ds41.sh {{PROMPTS}}'
@@ -1545,7 +1539,7 @@ gate-glm5next-meta:
 gate-gpu-glm5next-e2e:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e'
 
-# GLM의 카드 expert를 게이트 배치(BLOOMERY_HOT_LIST가 있으면 그 목록, 없으면 id 접두)대로 올린다. 슬롯 맵이 목록의 앞 n_l개를
+# GLM의 카드 expert를 게이트 배치(층마다 id 접두 [0, n_l))대로 올린다. 슬롯 맵이 그 n_l개를
 # 오름차순으로 담는지, 카드가 읽는 층에만 있는지, 층마다 슬롯 0·n/2·n-1에서 스택의 `_sel`과 gate·up이 그 expert만 파일에서
 # 올린 것과 비트까지 같은지 본다. 모델 전체를 올린다: e2e와 같은 묶음 규칙.
 [group('solo')]
@@ -1580,9 +1574,9 @@ gate-qwen4exp-meta:
 route-trace-chat OUT PROMPTS='tools/ref/data/d2-prompts-ko.tsv,tools/ref/data/d2-prompts-en-code.tsv':
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 && python3 tools/ref/route-trace-chat.py run --server target/release/bloomery-serve-ds41 --out {{OUT}} --prompts {{PROMPTS}}'
 
-# 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)와 뜨거운 목록으로 띄우고, 시드를 고정한 요청 묶음을
+# 서버 soak(M2, 리드 전용, 게이트 아님): bloomery-serve-ds41을 A6000에 배치 (a)로 띄우고, 시드를 고정한 요청 묶음을
 # MINUTES분 보낸다. 30초마다 표본을 떠서 메모리 누수를 판정한다. 상한은 MINUTES분에 900초를 더한 값이다.
 [group('solo')]
 [group('v41-load')]
 soak-ds41 MINUTES='30':
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 --bin soak_ds41_serve && D=target/soak && rm -rf $D && mkdir -p $D && BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt BLOOMERY_GATE_BOUND=$(( {{MINUTES}} * 60 + 900 )) bash tools/gpu-gate.sh soak_ds41_serve --minutes {{MINUTES}} --dir $D'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve-ds41 --bin soak_ds41_serve && D=target/soak && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=$(( {{MINUTES}} * 60 + 900 )) bash tools/gpu-gate.sh soak_ds41_serve --minutes {{MINUTES}} --dir $D'

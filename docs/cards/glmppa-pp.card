@@ -15,7 +15,7 @@
 kind: ab
 question: does the batched prompt call run GLM-5.3-Flash's prompt at the rate the sum of the card front and the
   host union predicts, against the step feed of the same binary?
-term: pp tok/s @ P = 512, prose prompt (GLM_PROSE), no hot list, A6000, plan (a), --ctx 2051 - (batch - steps) /
+term: pp tok/s @ P = 512, prose prompt (GLM_PROSE), the id prefix, A6000, plan (a), --ctx 2051 - (batch - steps) /
   steps, paired by round
 unit: %
 predict: +280..+550

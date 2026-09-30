@@ -27,10 +27,9 @@
 //! batch (`PrefillMode::Batch`, set here; `BLOOMERY_PREFILL` is refused, so
 //! the environment cannot move the feed, and the reference and the tiered
 //! loads run the same one): on a tiered load the tier serves its experts'
-//! slots of each batch. The recipe ranks the
-//! experts by the serving hot list (`BLOOMERY_HOT_LIST`), so the tier holds
-//! each layer's next hot ranks and the preconditions below are met by
-//! routing, not by chance.
+//! slots of each batch. Each layer's stage card keeps its id prefix and the
+//! tier the next ids, so the preconditions below are met by the prompts'
+//! routing, which the run checks.
 //!
 //! - `--union`: from a reset, the first [`PROMPT`] ids of the prose prompt
 //!   one decode step per id and [`STEPS`] greedy steps, every position's
@@ -93,7 +92,7 @@ mod gate {
     use bloomery_gpu_deepseek41::draft::DraftBody;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path};
-    use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8};
+    use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::{self, PlanInputs};
@@ -549,7 +548,6 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
-            HOT_LIST,
             HOST_POPULATE,
             HOST_LOCK,
             CARD_DONTNEED,

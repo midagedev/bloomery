@@ -43,7 +43,7 @@ condition: one lease, three rounds, arms 6 lcpp:6 512 lcpppp:512 1024 lcpp:1024 
   BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38-public.card
   BLOOMERY_AB_ORDER=blocks' just depth-gpu-qwen4exp <the arms above> > <log> 2>&1
 reason: sets the public Qwen3.8 rows (decode and prompt processing, llama.cpp beside ours) and
-  the host service term every later Qwen3.8 lever is priced against (hot list, card experts, the
+  the host service term every later Qwen3.8 lever is priced against (a router-frequency list, card experts, the
   q38ub ubatch round); why now: the final sitting takes every model's table in one window, and
   Qwen3.8 has no timed number yet
 decide-in: write the rows into rig-log first, then the README's Qwen3.8 section, ratios from this
@@ -52,7 +52,7 @@ decide-in: write the rows into rig-log first, then the README's Qwen3.8 section,
   to rig-log only, marked the pass path's — the baseline q38ub is judged against, as GLM's are
 decide-below: the host tier serves faster than the byte law says for 3 MB experts: name the term
   (the dispatch rate or the fixed cost) against V4.1's measured union, re-derive the card-expert
-  and hot-list levers from the lower h before any lever round opens, then write the rows
+  and router-frequency-list levers from the lower h before any lever round opens, then write the rows
 decide-above: no Qwen3.8 row goes out: nsys-gpu.sh has no qwen4exp form, so a round gives it one,
   profiles one depth-6 step to split h into the gate-up and down dispatches and the go/wait gaps,
   and names the term that missed (dispatch rate, a serial host cost such as the PLE read, or the

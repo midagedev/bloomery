@@ -13,9 +13,7 @@
 //!   layer, the layer's card experts in slots `0..n_l` in ascending id order
 //!   and the host mark on the rest, and equals the host copy the host tier
 //!   serves by. The card experts are made here from their source alone — the
-//!   hot list `BLOOMERY_HOT_LIST` names (its first `n_l` ids of the layer), or
-//!   the id prefix `[0, n_l)` when it is unset, as the levers parsed at `main`
-//!   hold it — not from the plan's segments.
+//!   id prefix `[0, n_l)` — not from the plan's segments.
 //! - (ii) state: per layer, the body's window ring, compressed rows, index
 //!   keys and compressor state are `KvLayout`'s bytes for the layer, exactly;
 //!   its ring shadow is `KvLayout`'s shadow bytes, and the page-locked host
@@ -75,7 +73,7 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
-    use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8};
+    use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8};
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::GgmlType;
@@ -84,7 +82,7 @@ mod gate {
     use model::arch::deepseek41::kv::KvLayout;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
-    use model::placement::{CardFormat, Device, HotList, KvBytes, Plan, Role, workstation};
+    use model::placement::{CardFormat, Device, KvBytes, Plan, Role, workstation};
 
     /// The decode-step sets whose positions check (iii) builds: 4, where no
     /// csa group completes, and 301 and 1,025, where one does and the window
@@ -102,14 +100,8 @@ mod gate {
     const PINNED_GRANULE: i128 = 2 << 20;
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[
-            HOT_LIST,
-            CARD_BUDGET,
-            HOST_POPULATE,
-            HOST_LOCK,
-            CARD_DONTNEED,
-            R8,
-        ])?;
+        let levers =
+            bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
         let cfg = OpenCfg::from_levers(&levers)?;
         let path = workstation::model_v41();
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
@@ -121,9 +113,8 @@ mod gate {
         let planner = Planner::from_file(&split, &inputs.hp, CTX_MAX)?;
         let specs = rope_specs_from_keys(&split)?;
         drop(split);
-        let hot = cfg.place.hot.as_ref();
-        let lists = card_lists(&plan, hot)?;
-        print_plan(&path, &plan, hot);
+        let lists = card_lists(&plan)?;
+        print_plan(&path, &plan);
 
         let card = &plan.machine.cards[0];
         let probe = Gpu::for_card(&card.name).map_err(|e| {
@@ -160,7 +151,7 @@ mod gate {
         }
         {
             let (gpu, w, body) = m.body_parts("gate_deepseek41_load")?;
-            ok &= check_slots(&plan, &lists, hot.is_some(), body, gpu.stream())?;
+            ok &= check_slots(&plan, &lists, body, gpu.stream())?;
             ok &= check_sel(&plan, &lists, &path, gpu, w)?;
             ok &= check_state(&inputs.kv, &plan, body);
             shadow_host = body.shadow_host().bytes;
@@ -181,16 +172,12 @@ mod gate {
         }
         println!(
             "PASSED: gate_deepseek41_load — the gate plan's segments are resident at its bytes and \
-             the slot map is its card experts ({}) on the card and in the host tier, each slot's \
+             the slot map is its card experts (the id prefix) on the card and in the host tier, each slot's \
              `_sel` gemv its expert's own; every layer's state is KvLayout's bytes; the step image \
              at positions 4, 301 and 1025 reads back as the plan's integers and RopeTable's \
              tables; the chain captures and a synthetic depth refuses; a second load takes what \
              the first took and each drop gives back all but the context's capture (and the \
-             page-locked shadows' granule it keeps)",
-            hot.map_or("the id prefix".to_string(), |h| format!(
-                "hot list {}",
-                h.path()
-            ))
+             page-locked shadows' granule it keeps)"
         );
         Ok(())
     }
@@ -214,27 +201,16 @@ mod gate {
         Ok(m)
     }
 
-    /// Each layer's card experts, ascending, from their source alone: the
-    /// hot list's first `n_l` ids of the layer, or `0..n_l` without one.
-    fn card_lists(plan: &Plan<'_>, hot: Option<&HotList>) -> Result<Vec<Vec<u32>>, GateError> {
-        let mut out = Vec::with_capacity(plan.model.layers);
-        for (l, &n) in plan.n_l.iter().enumerate() {
-            let n = usize::try_from(n)?;
-            let mut ids: Vec<u32> = match hot {
-                Some(h) => h
-                    .ranked(l)
-                    .get(..n)
-                    .ok_or_else(|| format!("the hot list has fewer than {n} ids on layer {l}"))?
-                    .to_vec(),
-                None => (0..u32::try_from(n)?).collect(),
-            };
-            ids.sort_unstable();
-            out.push(ids);
-        }
-        Ok(out)
+    /// Each layer's card experts, ascending, from their source alone: the id
+    /// prefix `0..n_l`.
+    fn card_lists(plan: &Plan<'_>) -> Result<Vec<Vec<u32>>, GateError> {
+        plan.n_l
+            .iter()
+            .map(|&n| Ok((0..u32::try_from(n)?).collect()))
+            .collect()
     }
 
-    fn print_plan(path: &str, plan: &Plan<'_>, hot: Option<&HotList>) {
+    fn print_plan(path: &str, plan: &Plan<'_>) {
         println!(
             "gate plan of {path}: {} layers, ctx_max {}",
             plan.model.layers, plan.ctx_max
@@ -268,21 +244,6 @@ mod gate {
             .map(|(a, b, n)| format!("layers {a}..{b} n_l {n}"))
             .collect();
         println!("  expert prefixes: {}", runs.join(", "));
-        match hot {
-            None => println!("  card experts: the id prefix (BLOOMERY_HOT_LIST unset)"),
-            Some(h) => {
-                let about: Vec<String> = h
-                    .provenance()
-                    .iter()
-                    .map(|(k, v)| format!("{k} {v}"))
-                    .collect();
-                println!(
-                    "  card experts: hot list {} ({}), each layer's first n_l",
-                    h.path(),
-                    about.join("; ")
-                );
-            }
-        }
     }
 
     /// The window-only and the compressed layers' ropes from the file's keys,
@@ -455,7 +416,6 @@ mod gate {
     fn check_slots(
         plan: &Plan<'_>,
         lists: &[Vec<u32>],
-        listed: bool,
         body: &Body,
         stream: &CudaStream,
     ) -> Result<bool, GateError> {
@@ -511,9 +471,8 @@ mod gate {
         let planned: u64 = layers.clone().map(|l| plan.n_l[l]).sum();
         println!(
             "check i {name} slot map: {} layers x {n} experts, {on_card} on the card, the plan's \
-             {} hold {planned}, host copy {}: {}",
+             prefixes hold {planned}, host copy {}: {}",
             layers.len(),
-            if listed { "hot lists" } else { "prefixes" },
             if same { "equal" } else { "differs" },
             verdict(bad.is_empty())
         );

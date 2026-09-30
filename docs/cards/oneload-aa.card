@@ -19,7 +19,7 @@
 kind: calibration
 question: does an arm run after another arm of its load and the clear time the same as it does first
   after a load, so rows of a shared load and rows of one process an arm share a table?
-term: pp tok/s @ P = 512, prose prompt, no hot list, A6000, plan (a), CED on, N = 16 - the rows at
+term: pp tok/s @ P = 512, prose prompt, the id prefix, A6000, plan (a), CED on, N = 16 - the rows at
   slot 2 and 3 of a shared load over the rows first after their load (the solo processes and slot 1),
   the runner's `slots` line
 unit: %

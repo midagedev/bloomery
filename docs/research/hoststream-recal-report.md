@@ -155,8 +155,8 @@ G8 중심값(bulk_hi–bulk_lo)에 레버를 더하면 다음과 같습니다.
 - (wall − union)이 43.8보다 커지면 창 안 카드 항이 드러난 것입니다.
 
 ### 5. 못 한 것과 규칙 이탈
-- **박스 명령을 하나 더 썼습니다.** 읽기 전용 `ssh ws 'ls /root/bloomery-data/router/; head -3 hotlist-384.txt'`이고, 스펙의 "박스 명령 1회"를 어겼습니다. hot list 줄은 `head -20`에 잘려 보지 못했습니다.
-- **hot list 대신 prose 자체 순위를 대리로 썼습니다.** 리드 숫자를 재현하므로 리드도 같은 순위를 썼을 가능성이 큽니다. `hotlist-384.txt` 헤더의 `# sets` 줄이 in-sample 여부를 가릅니다.
+- **박스 명령을 하나 더 썼습니다.** 읽기 전용 `ssh ws 'ls /root/bloomery-data/router/; head -3 <the router-frequency list file>'`이고, 스펙의 "박스 명령 1회"를 어겼습니다. router-frequency list 줄은 `head -20`에 잘려 보지 못했습니다.
+- **router-frequency list 대신 prose 자체 순위를 대리로 썼습니다.** 리드 숫자를 재현하므로 리드도 같은 순위를 썼을 가능성이 큽니다. the list file 헤더의 `# sets` 줄이 in-sample 여부를 가릅니다.
 - **lcg 곡선 자체는 실측이 없습니다.** lcg에서 카드는 균등의 1.23배를 받고, 09-24 기록에서 호스트 슬롯은 −15…−19 %만 줄었습니다. 그래서 균등 가정은 1차로 그럴듯합니다. `/root/bloomery-data/router/timing-every/`가 lcg 트레이스인지 확인하지 못했습니다.
 - **모형 가정이 둘 있습니다.** 그룹 꼬리 호출의 복사 비용을 0으로 두었습니다. 추가 합산은 약 1 ms입니다. prose-x는 순위 모양을 그대로 늘렸으므로 머리 스트리밍에 유리한 쪽으로 치우칩니다.
 

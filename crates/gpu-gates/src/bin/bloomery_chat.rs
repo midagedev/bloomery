@@ -69,12 +69,12 @@ mod drive {
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, PIN_MAIN, R8,
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PIN_MAIN, R8,
     };
     use gguf::Split;
     use model::arch::deepseek41::place::PlanInputs;
+    use model::placement::PlanLevers;
     use model::placement::workstation::{self, TierBatchBytes};
-    use model::placement::{HotList, PlanLevers};
     use sampler::{Sampler, SamplerParams};
     use tokenizer::{Decoder, Tokenizer};
 
@@ -237,7 +237,6 @@ mod drive {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
-            HOT_LIST,
             CARD_BUDGET,
             PIN_MAIN,
             HOST_POPULATE,
@@ -326,8 +325,7 @@ mod drive {
     ) -> Result<(), GateError> {
         let machine = place.machine(None, tier_batch)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
-        let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
-        record::plan(place.name(), &machine, &plan, hot_list).eprint();
+        record::plan(place.name(), &machine, &plan).eprint();
         Ok(())
     }
 

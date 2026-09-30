@@ -15,7 +15,7 @@
 kind: ab
 question: does streaming the call's hottest host experts into the residency pool raise plan (a)'s prose prompt rate
   by the flow model's threshold-pick gain, with the decode after the call no slower?
-term: pp tok/s @ P = 4096, prose prompt (corpus-prose.ids, the first 4096), no hot list, BLOOMERY_RESIDENCY=
+term: pp tok/s @ P = 4096, prose prompt (corpus-prose.ids, the first 4096), the id prefix, BLOOMERY_RESIDENCY=
   mid-p40-s1, A6000, plan (a), CED on, G 2 - (on - off) / off, paired by round
 unit: %
 predict: +10..+22

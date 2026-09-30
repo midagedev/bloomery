@@ -183,7 +183,7 @@ mod gate {
         topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, R8,
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
     };
     use cuda_core::sys;
     use gguf::quant::half_to_f32;
@@ -280,7 +280,6 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
-            HOT_LIST,
             CARD_BUDGET,
             HOST_POPULATE,
             HOST_LOCK,

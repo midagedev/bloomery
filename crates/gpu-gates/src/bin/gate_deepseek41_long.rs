@@ -137,7 +137,7 @@ mod gate {
     use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
     use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST, HostCfg, R8,
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HostCfg, R8,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -241,7 +241,6 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
-            HOT_LIST,
             CARD_BUDGET,
             HOST_POPULATE,
             HOST_LOCK,

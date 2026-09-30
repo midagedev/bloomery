@@ -1,13 +1,11 @@
 //! Gate `gate-gpu-glm5next-card`: GLM-5.3-Flash's routed experts on the card.
 //! The model is loaded through the session the engine opens it with, by the
 //! gate placement (`workstation::plan_gate`) under the levers parsed at
-//! `main` — the hot list `BLOOMERY_HOT_LIST`, or the id prefix without one,
-//! and the card budget — and its card experts are checked against sources
+//! `main` — the card budget — and its card experts are checked against sources
 //! made here, never against the plan's own segments:
 //!
 //! - (i) slot map: every routed layer's row of the host tier's slot map
-//!   holds the layer's card experts — the hot list's first `n_l` ids of the
-//!   layer, or `[0, n_l)`, `n_l` the plan's — in slots `0..n_l` in ascending
+//!   holds the layer's card experts — `[0, n_l)`, `n_l` the plan's — in slots `0..n_l` in ascending
 //!   id order, and the host mark on the rest; card experts sit only on
 //!   layers whose three stacks `card_routed` reads, and those layers' counts
 //!   differ by at most one (the expert rule deals one at a time in turn);
@@ -24,9 +22,8 @@
 //! - (iii) card copy: read back from the card, the slot map's copy the
 //!   handoff reads holds each routed layer's host row at the map's
 //!   `row_offset(l)` — the offset the layer's handoff adds an id to — entry
-//!   for entry; under a hot list the rows must differ between layers (a
-//!   map of one row repeated would pass a prefix, not a list), so a copy laid
-//!   out or indexed by another rule than the host's fails here.
+//!   for entry, so a copy laid out or indexed by another rule than the host's
+//!   fails here.
 //!
 //! A correctness run: the figures it prints are runtime values.
 
@@ -56,13 +53,13 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_gates::{GateError, bits_equal, bytes_to_words, checks_failed, verdict};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel};
-    use bloomery_levers::{CARD_BUDGET, HOT_LIST};
+    use bloomery_levers::CARD_BUDGET;
     use cuda_core::DeviceBuffer;
     use gguf::{GgmlType, Split};
     use model::arch::glm5next::hparams::Hparams;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{PlanInputs, card_routed};
-    use model::placement::{HotList, Machine, Plan, PlanLevers, workstation};
+    use model::placement::{Machine, Plan, PlanLevers, workstation};
     use refset::arch::glm5next::MODEL;
 
     /// The serving context the e2e gate loads at.
@@ -110,24 +107,11 @@ mod gate {
         }
     }
 
-    /// Each layer's card experts from their source: the hot list's first
-    /// `n_l[l]` ids of the layer, or `[0, n_l[l])`, ascending.
-    fn card_lists(n_l: &[u64], hot: Option<&HotList>) -> Result<Vec<Vec<u32>>, GateError> {
-        let mut out = Vec::with_capacity(n_l.len());
-        for (l, &n) in n_l.iter().enumerate() {
-            let n = usize::try_from(n)?;
-            let mut ids: Vec<u32> = match hot {
-                Some(h) => h
-                    .ranked(l)
-                    .get(..n)
-                    .ok_or_else(|| format!("the hot list has fewer than {n} ids on layer {l}"))?
-                    .to_vec(),
-                None => (0..u32::try_from(n)?).collect(),
-            };
-            ids.sort_unstable();
-            out.push(ids);
-        }
-        Ok(out)
+    /// Each layer's card experts from their source: `[0, n_l[l])`, ascending.
+    fn card_lists(n_l: &[u64]) -> Result<Vec<Vec<u32>>, GateError> {
+        n_l.iter()
+            .map(|&n| Ok((0..u32::try_from(n)?).collect()))
+            .collect()
     }
 
     /// Check (i): the host tier's slot map against `lists`, and the layers
@@ -137,7 +121,6 @@ mod gate {
         split: &Split,
         lists: &[Vec<u32>],
         hp: &Hparams,
-        listed: bool,
         budgeted: bool,
     ) -> Result<bool, GateError> {
         let map = body.hybrid().slots();
@@ -204,10 +187,9 @@ mod gate {
         }
         let on_card: usize = lists.iter().map(Vec::len).sum();
         println!(
-            "check i slot map: {} layers x {n} experts, {on_card} on the card from the {}, \
+            "check i slot map: {} layers x {n} experts, {on_card} on the card from the prefix, \
              {lo}..{hi} a layer on the {} layers whose stacks the card reads {readable:?}: {}",
             map.layers().len(),
-            if listed { "hot list" } else { "prefix" },
             readable.len(),
             verdict(bad.is_empty())
         );
@@ -218,13 +200,8 @@ mod gate {
     }
 
     /// Check (iii) (module doc): the card copy against the host map, row by
-    /// row at `row_offset`, and a list's rows not all one.
-    fn check_copy(
-        gpu: &Gpu,
-        body: &Body,
-        lists: &[Vec<u32>],
-        listed: bool,
-    ) -> Result<bool, GateError> {
+    /// row at `row_offset`.
+    fn check_copy(gpu: &Gpu, body: &Body, lists: &[Vec<u32>]) -> Result<bool, GateError> {
         let map = body.hybrid().slots();
         let copy = body.slot_copy().buf().to_host_vec(gpu.stream())?;
         let n = map.n_expert();
@@ -251,9 +228,6 @@ mod gate {
         }
         let card: Vec<&Vec<u32>> = lists.iter().filter(|l| !l.is_empty()).collect();
         let distinct = card.windows(2).any(|w| w[0] != w[1]);
-        if listed && card.len() > 1 && !distinct {
-            bad.push("a hot list put the same experts on every card layer".to_string());
-        }
         println!(
             "check iii card copy: {} rows of {n} at their row offsets equal to the host map, \
              {} card layers, rows {}: {}",
@@ -507,9 +481,8 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[HOT_LIST, CARD_BUDGET])?;
+        let levers = bloomery_levers::at_main(&[CARD_BUDGET])?;
         let place = PlanLevers::from_levers(&levers)?;
-        let hot = place.hot.clone();
         let budgeted = place.card_budget_bytes.is_some();
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let inputs = PlanInputs::read(&file)?;
@@ -534,25 +507,20 @@ mod gate {
         let loaded =
             Loaded::<Body>::open(file, args, &mut log)?.ok_or("the open stopped at its plan")?;
         let mut s: Session<Body> = loaded.ready(&mut log)?;
-        let lists = card_lists(&log.n_l, hot.as_ref())?;
+        let lists = card_lists(&log.n_l)?;
         let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let experts = usize::try_from(log.experts)?;
         let m = s.model_mut();
         let (gpu, w, body) = m.body_parts("gate_glm5next_card")?;
-        let mut ok = check_map(body, &split, &lists, &hp, hot.is_some(), budgeted)?;
-        ok &= check_copy(gpu, body, &lists, hot.is_some())?;
+        let mut ok = check_map(body, &split, &lists, &hp, budgeted)?;
+        ok &= check_copy(gpu, body, &lists)?;
         ok &= check_slots(gpu, w, &split, &lists, &hp, experts)?;
         if ok {
             println!(
-                "PASSED: gate_glm5next_card the slot map holds the {} card experts, only on \
+                "PASSED: gate_glm5next_card the slot map holds the prefix's card experts, only on \
                  layers whose stacks the card reads; the card copy is the host map at its row \
                  offsets; each stack's `_sel` and the gate·up at slots 0, n/2 and n-1 are the \
-                 listed expert's own bit for bit",
-                if hot.is_some() {
-                    "hot list's"
-                } else {
-                    "prefix's"
-                }
+                 listed expert's own bit for bit"
             );
             Ok(())
         } else {

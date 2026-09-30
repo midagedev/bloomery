@@ -65,7 +65,7 @@ The launch's wall is the max of these, which is card DRAM. It runs on the card's
 - PCIe carries the prompt image (49,152 B, q3rope) and the readback: µs.
 - The wall is the card.
 
-**(c) V4.1 prompt, per layer-batch (T = 512, lcg, no hot list).** All from `AGENTS.md`'s prefill paragraph:
+**(c) V4.1 prompt, per layer-batch (T = 512, lcg, no router-frequency list).** All from `AGENTS.md`'s prefill paragraph:
 - Host union: 66.7 ms (rig-log 09-26#uniondispatch-ab).
 - Card route: 19.6 ms (#b1-pp-ab).
 - The host's wait for the route: 0.8 ms (#prefillgroup-ab).

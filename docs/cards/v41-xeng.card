@@ -1,4 +1,4 @@
-# The public V4.1 table in one window on the A6000: ours (placement (a), lcg ids, no hot list) against
+# The public V4.1 table in one window on the A6000: ours (placement (a), lcg ids, the id prefix) against
 # llama.cpp's V4.1 PR branch (#28696 at 5210c7c, --n-cpu-moe 33), decode at depth 6 and 4096, pp at
 # P = 512 and 4096, with the relrunner preheat: each reference arm's host set (K = 33, 213,965,854,720 B,
 # header-read) is read into the page cache before its timer. The README's llama.cpp prefill rows

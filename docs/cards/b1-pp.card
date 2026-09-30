@@ -1,14 +1,14 @@
 # Round ds41proj (B1), the engine-level A/B: the prompt batch's four attention projections batch-wide
 # per 128-token sub-block against the per-chunk launches. The round's re-derivation from the nsys/ncu
 # sitting (rig-log 09-26#v41-prefill-nsys): the card route -5.4..-9.5 ms a layer-batch [derived]; the
-# flow model (tools/flow, main 8181acc) puts B1 at +8.9 % (lcg, P = 512, hot list 384) with band
+# flow model (tools/flow, main 8181acc) puts B1 at +8.9 % (lcg, P = 512, a router-frequency card list) with band
 # 144.4-157.8 over 136.0 [derived]. Runtime value from the round's gate run (3090 gate placement, not a
-# lease number): card_out 28.8-29.3 -> 19.14 ms a layer-batch. On uniondispatch's arms (hot list off,
+# lease number): card_out 28.8-29.3 -> 19.14 ms a layer-batch. On uniondispatch's arms (the id prefix,
 # rig-log 09-26#uniondispatch-ab) the round's band is pp512 137-143 over 129.6 = +5.7..+10.3 %.
 kind: ab
 question: does running the attention projections batch-wide shorten the V4.1 prompt call by the
   card route the round derived?
-term: pp tok/s @ P = 512, lcg prompt, A6000, plan (a), no hot list - (B1 - base) / base, paired by
+term: pp tok/s @ P = 512, lcg prompt, A6000, plan (a), the id prefix - (B1 - base) / base, paired by
   round
 unit: %
 predict: +5.7..+10.3

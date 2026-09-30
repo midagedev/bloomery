@@ -472,7 +472,7 @@ fn hw_deepseek4_plans() {
         (&pins::PLAN_B, workstation::plan_b(layers)),
         (&pins::PLAN_GATE, workstation::plan_gate(layers)),
     ] {
-        let plan = placement::plan_with(&inputs.model, &machine, ctx, &inputs.kv, None, None)
+        let plan = placement::plan_with(&inputs.model, &machine, ctx, &inputs.kv, None)
             .unwrap_or_else(|e| panic!("plan {}: {e}", pin.name));
         plan_rows(o, b, &plan, pin);
     }

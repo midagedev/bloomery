@@ -220,7 +220,6 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.prefill_group(), 2);
     assert!(unset.engram_helper());
     assert!(!unset.step_stats());
-    assert_eq!(unset.hot_list(), None);
     assert_eq!(unset.card_budget_bytes(), None);
     assert!(unset.pin_main());
     assert_eq!(unset.draft(), None);
@@ -250,7 +249,6 @@ fn accessors_read_their_rows() {
             (PREFILL_GROUP, "1"),
             (ENGRAM_HELPER, "0"),
             (STEP_STATS, "1"),
-            (HOT_LIST, "/data/hot.txt"),
             (CARD_BUDGET, "38G"),
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
@@ -276,7 +274,6 @@ fn accessors_read_their_rows() {
     assert_eq!(set.prefill_group(), 8);
     assert!(!set.engram_helper());
     assert!(set.step_stats());
-    assert_eq!(set.hot_list(), Some(Path::new("/data/hot.txt")));
     assert_eq!(set.card_budget_bytes(), Some(38 << 30));
     assert!(!set.pin_main());
     assert_eq!(set.draft(), Some("dspark"));
@@ -308,7 +305,6 @@ fn accessors_read_their_rows() {
             PREFILL_GROUP,
             ENGRAM_HELPER,
             STEP_STATS,
-            HOT_LIST,
             CARD_BUDGET,
             PIN_MAIN,
             DRAFT,

@@ -133,7 +133,6 @@
 | PREFILL | body/prefill.rs:117 | batch/steps, 오류 | 아니오 | 아니오 | M | `43cd107` 2.97× | 모드 |
 | PREFILL_GROUP | body/prefill.rs:346 | 1..8 → 2, 오류 | 아니오 | 예 | A 정착 + 조율 축 | 09-26#prefillgroup-ab | 설정 |
 | CARD_EXPERTS | chain/ffn/batch.rs:1438 (+재독 2곳) | tile/expert/slot, 오류 | 아니오 | 예 | A 정착 | 09-26#cardtile-ab | 인자; `expert` 존폐 |
-| HOT_LIST | model/src/placement/hot_list.rs:18 | 경로, 오류 | 아니오 | 예 | C | `e32664a` | 설정 |
 | CARD_BUDGET | placement/card_budget.rs:15 | 바이트, 오류 | 아니오 | 예 | C | — | 설정 |
 | PIN_MAIN | generate_ds41.rs:410, bloomery_serve_ds41.rs:132, bloomery_chat.rs:226, bloomery-decode.rs:122, bench_v41_host.rs:3415 | "0"만 → 떠 있음 | 예 | 예 | A | 09-25:12 −1.2 % ± 3.4 % | 설정 |
 | DRAFT | generate_ds41.rs:741 (+셸 2) | off/lookup/dspark, 오류 | 아니오 | 예 | M | `c00274c` | CLI 플래그 |

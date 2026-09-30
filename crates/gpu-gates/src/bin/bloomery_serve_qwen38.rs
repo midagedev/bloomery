@@ -61,8 +61,8 @@
 //! (`bloomery_levers::at_main`), which refuses by name a lever set outside
 //! them and a `BLOOMERY_*` name no registry row names; `--levers` prints them
 //! with this process's values and exits. The Qwen3.8 levers are
-//! `BLOOMERY_QWEN38_EXPERTS` (the plan's expert rule) with `BLOOMERY_HOT_LIST`
-//! and `BLOOMERY_CARD_BUDGET` ranking and bounding its card plan, the host
+//! `BLOOMERY_QWEN38_EXPERTS` (the plan's expert rule) with
+//! `BLOOMERY_CARD_BUDGET` bounding its card plan, the host
 //! tier's load settings, and `BLOOMERY_PIN_MAIN`; the ubatch size
 //! (`BLOOMERY_QWEN3_UBATCH`) is read where the load sizes its arena. The
 //! stderr lines named above are records of the kinds
@@ -127,7 +127,6 @@ mod drive {
     /// first; the two lists must stay one).
     pub const ACTS_ON: &[&str] = &[
         bloomery_levers::QWEN38_EXPERTS,
-        bloomery_levers::HOT_LIST,
         bloomery_levers::CARD_BUDGET,
         bloomery_levers::PIN_MAIN,
         bloomery_levers::HOST_POPULATE,
@@ -323,9 +322,6 @@ mod drive {
                 (with.plan, bytes)
             }
         };
-        let hot_list = levers
-            .hot_list()
-            .map_or_else(|| "none".to_string(), |p| p.display().to_string());
         Record::new(&record::PLAN38)
             .w("place", a.place.name())
             .w("card", machine.cards[0].name.as_str())
@@ -340,7 +336,6 @@ mod drive {
             .u("ctx_max", plan.ctx_max)
             .u("host_experts", plan.host.experts)
             .u("card_experts", plan.cards[0].experts)
-            .w("hot_list", hot_list)
             .eprint();
         let gpu = nvidia_smi_index(&machine.cards[0].name)
             .map(|i| format!("GPU{i}"))

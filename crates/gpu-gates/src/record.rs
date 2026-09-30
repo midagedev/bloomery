@@ -478,7 +478,6 @@ pub static PLAN: Kind = Kind {
         pos("n_l_layers", U64, "layers"),
         lit(" layers"),
         key("card_budget", Word, "B"),
-        key("hot_list", Text, ""),
     ],
 };
 
@@ -486,7 +485,7 @@ pub static PLAN: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "The qwen4exp placement the engine is about to load by: its card, the expert rule (host or card), the context, where the routed experts sit, and the hot list file the card's experts were ranked by (none: each layer's id prefix).",
+    doc: "The qwen4exp placement the engine is about to load by: its card, the expert rule (host or card), the context, and where the routed experts sit (each layer's id prefix on the card).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -494,7 +493,6 @@ pub static PLAN38: Kind = Kind {
         key("ctx_max", U64, "positions"),
         key("host_experts", U64, "experts"),
         key("card_experts", U64, "experts"),
-        key("hot_list", Text, ""),
     ],
 };
 
@@ -1745,9 +1743,8 @@ pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
 
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
-/// card counts' range, the budget, and the hot list file the card's experts
-/// were ranked by (`none` without one).
-pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>, hot_list: &str) -> Record {
+/// card counts' range, and the budget.
+pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
     let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
     let card = &plan.cards[0];
     Record::new(&PLAN)
@@ -1773,7 +1770,6 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>, hot_list: &str) -> 
             plan.card_budget
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
         )
-        .w("hot_list", hot_list)
 }
 
 /// The load's phases record: `open` the file's headers' wall, `plan` the
@@ -2029,11 +2025,10 @@ mod tests {
             .u("ctx_max", 4096)
             .u("host_experts", 11_735)
             .u("card_experts", 12_841)
-            .w("hot_list", "none")
             .line();
         assert_eq!(
             plan38,
-            "plan place=a card=A6000 experts=card ctx_max=4096 host_experts=11735 card_experts=12841 hot_list=none"
+            "plan place=a card=A6000 experts=card ctx_max=4096 host_experts=11735 card_experts=12841"
         );
         let smoke = Record::new(&SMOKE)
             .w("mode", "graph")

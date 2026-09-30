@@ -36,8 +36,8 @@
 //! tier) and the one the timing runners use; `gate` is the step gate's
 //! (`workstation::plan_gate`, the same on the 3090); `bp` is plan (b′)
 //! (`workstation::plan_bp`): plan (a) on the A6000 byte for byte, and the
-//! 3090 an expert tier under the host tier holding each layer's next hot
-//! ranks (`app::arch::deepseek41::tier_of`), with the DSpark draft's reserve
+//! 3090 an expert tier under the host tier holding each layer's next ids
+//! (`app::arch::deepseek41::tier_of`), with the DSpark draft's reserve
 //! when the draft runs (its header's bytes, read before the load; the draft
 //! then sits on the 3090, and a `BLOOMERY_DSPARK_CARD` naming another card is
 //! refused), and the tier's prompt-batch bytes (its staging and tile scratch
@@ -270,13 +270,13 @@ mod drive {
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK,
-        HOST_POPULATE, HOSTSTREAM, HOT_LIST, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8,
-        RESIDENCY, ResidencyAt, ResidencyPick, ResidencyWhy, STEP_STATS,
+        HOST_POPULATE, HOSTSTREAM, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY,
+        ResidencyAt, ResidencyPick, ResidencyWhy, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{HotList, Machine, Plan, workstation};
+    use model::placement::{Machine, Plan, workstation};
     use runtime::{
         Advance, Committed, GenOutcome, Lookup, PassSink, Speculative, Stop, StopReason, Target,
         Want,
@@ -607,7 +607,6 @@ mod drive {
         PREFILL_GROUP,
         ENGRAM_HELPER,
         STEP_STATS,
-        HOT_LIST,
         CARD_BUDGET,
         PIN_MAIN,
         DRAFT,
@@ -1367,8 +1366,7 @@ mod drive {
             // follows.
             self.plan = Some(self.t.elapsed() - self.headers);
             let a = self.a;
-            let hot_list = self.cfg.place.hot.as_ref().map_or("none", HotList::path);
-            record::plan(place, machine, plan, hot_list).print();
+            record::plan(place, machine, plan).print();
             let residency = self.cfg.body.residency;
             if let Some(pool) = swap::churn(plan, 0, residency)? {
                 record::residency_host(self.residency.word, &pool, plan).print();

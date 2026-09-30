@@ -38,6 +38,9 @@ layer-batch, the shadow's start among them) and `_clk` (the card's
 SM-bound kernels at an SM clock ratio: the prose prompt ran its route clk_cardbound slower in the expert arm,
 clk_tile_prose in the tile arm). T's items cost their SASS issue (tile_inst_fix + tile_inst_col x m an item, scaled to
 t_tile_ab at cardnext's lcg mix) plus GT's activation re-reads from DRAM once its row-tile sweep outgrows L2 (prose).
+`hot` (True unless a config says otherwise): the card held each layer's first n_l ids of a router-frequency list learned
+from the test corpora — the frequency list, the condition many measured rows ran under, which the engine no longer
+has; False: the id prefix, what the engine runs.
 
 Host streaming (`stream`, in the stock order and in the wrap): `ring` (slots; `borrow` takes them from
 the coldest card experts for the prompt, re-upload in the wall; unset, the triage rule: 128 borrowed from
@@ -63,7 +66,7 @@ plan of it (plans/, `generate_ds41 --plan` records).
                        the timeline per layer of a group, the DRAM term and its variants
     --levers           today's flow (r8, G 2, no streaming) against its measured rows, and each lever re-derived against
                        it: host streaming, q8_K down, B4 over its GEMM time, the batch-wide shadow, GT's block order;
-                       per cell of the lcg prompt (hot list or not), the hot-list prose prompt, and the real texts at
+                       per cell of the lcg prompt (frequency list or not), the frequency-list prose prompt, and the real texts at
                        today's default placement, the id prefix: prose, code and korean (routes-idprefix.tsv)
     --counts LOG       a generate_ds41 run's queue-entry counter (BLOOMERY_STEP_STATS=1: `stat prefill front`,
                        `stat prefill lb`) against this model's counts for the same call, layer-batch by layer-batch
@@ -446,7 +449,7 @@ def routing_lcg(p, hot=True):
     """The timing runner's lcg prompt: per layer one host rate and one card rate (lcg is uniform to
     first order, hoststream-recal-report.md 「5. 못 한 것과 규칙 이탈」 'lcg 곡선 자체는 실측이 없습니다'). Layers below card_first_layer hold no card expert
     (plan (a)), so all six slots of a token go to the host there; the recorded mean host rate
-    (s_host_lcg with the hot list, s_host_lcg_nohot without) sets the other layers'."""
+    (s_host_lcg with the frequency list, s_host_lcg_nohot without) sets the other layers'."""
     s = p["s_host_lcg"] if hot else p["s_host_lcg_nohot"]
     n0 = int(p["card_first_layer"])
     nc = p["n_card_total"] / (L - n0)
@@ -492,7 +495,7 @@ def routing_prose_trace(p):
 def routing_prose(p, P=512):
     """prose: the prose prompt the lease feeds (corpus-prose.ids, the first 512) under plan (a) and hot
     list 384, from the trace's per-layer rank curve. Three facts the trace alone does not give:
-    layers below card_first_layer hold no card expert (plan (a)); the hot list is learned from other
+    layers below card_first_layer hold no card expert (plan (a)); the frequency list is learned from other
     sets too, so the card holds the trace's ranks [s, s + n_l) instead of [0, n_l) — the prompt's s
     hottest experts stay on the host (prose_swap, fixed by the prompt's host-slot count); and a
     512-token window routes burstier than the 50,000-token average, so its host columns land on a
@@ -538,10 +541,10 @@ def _routes():
 
 def routing_idprefix(name, G):
     """A real text (the router set `name`: prose, code, korean) at today's default placement, the id prefix
-    (no hot list), for groups of G batches (routes.py build writes routes-idprefix.tsv from the router sets): per
+    (the id prefix), for groups of G batches (routes.py build writes routes-idprefix.tsv from the router sets): per
     layer the host experts in the order a causal pick at the group's first route sees them and the card's
     [0, n_l), each at its rank's mean columns per 512 positions over the set's windows of G x 512. The
-    lists are the set's own, so the card's share is its id prefix's (about n_l / 384), not a hot list's."""
+    lists are the set's own, so the card's share is its id prefix's (about n_l / 384), not a frequency list's."""
     table, n_l = _routes()
     if (name, G) not in table:
         raise SystemExit(f"ds41_prefill.py: {ROUTES} holds no {name} routing for groups of {G} batches "
@@ -556,7 +559,7 @@ def routing_idprefix(name, G):
 
 
 def routing(p, name, hot=True, P=512, G=1):
-    """The routing a prompt runs: lcg (with the hot list or at the id prefix); prose with the hot list (the
+    """The routing a prompt runs: lcg (with the frequency list or at the id prefix); prose with the frequency list (the
     trace's curve, routing_prose); prose, code or korean at the id prefix (hot False: routing_idprefix, which
     reads the list of the prompt's group of G batches); prose-in."""
     if name == "lcg":
@@ -566,10 +569,10 @@ def routing(p, name, hot=True, P=512, G=1):
     if name == "prose":
         return routing_prose(p, P)
     if name in REAL_TEXTS:
-        raise SystemExit(f"ds41_prefill.py: no {name} routing with the hot list; {name} runs at the id prefix (hot False)")
+        raise SystemExit(f"ds41_prefill.py: no {name} routing with the frequency list; {name} runs at the id prefix (hot False)")
     if name == "prose-in":
         return routing_prose_trace(p)
-    raise SystemExit(f"ds41_prefill.py: no routing {name!r} (lcg, prose, prose-in; code and korean without the hot list)")
+    raise SystemExit(f"ds41_prefill.py: no routing {name!r} (lcg, prose, prose-in; code and korean at the id prefix)")
 
 
 # ============================================================================ the host union
@@ -697,7 +700,7 @@ def _layer_calls(rt, P, ced, a, c, w):
 def union_anchor(p, anchors):
     """f and X_u for these constants.
 
-    f, the join-tail share of a steal block: the uniondispatch A/B at P 512 (no hot list, CED on, one
+    f, the join-tail share of a steal block: the uniondispatch A/B at P 512 (the id prefix, CED on, one
     lease) measured the chunk flow minus the five dispatches; X_u is the same per slot in both arms,
     so that difference is f x (tail coefficients) + the other cause terms, linear in f.
     X_u, the union's named residual: its anchor row minus the kernel sum and the anchor flow's causes,
@@ -719,7 +722,7 @@ def union_anchor(p, anchors):
     mode = anchors.get("resid_mode", "slot")
 
     def resid(name):
-        # (P, CED, hot list, flow) of the anchor row: S13b CED off and S14's slot arm ran the chunk flow with the hot
+        # (P, CED, frequency list, flow) of the anchor row: S13b CED off and S14's slot arm ran the chunk flow with the frequency
         # list; the uniondispatch lease's new arm ran today's five dispatches without it
         P, ced, hot, flow = {"anchor_union_s13b": (512, False, True, "chunks"),
                              "anchor_union_s14s": (512, True, True, "chunks"),
@@ -1112,7 +1115,7 @@ def l2_miss(p, cfg, slots, touched):
     """The fraction of GT's activation reads that miss L2 in one launch over `slots` columns of `touched` experts: a
     row tile's sweep reads every column (ACT_GT_BYTES) and its experts' row-tile weights, so the reuse distance is that
     working set W. 'lru' (the default): cyclic reuse over W > L2 misses every time, W <= L2 never; 'edge90' (the band's
-    alternative): the same step at 0.9 L2 (other data holding a tenth of it), which puts lcg with the hot list (W 0.975
+    alternative): the same step at 0.9 L2 (other data holding a tenth of it), which puts lcg with the frequency list (W 0.975
     L2) over the edge; 'random': the random-replacement hit rate L2 / W, which the cardtile lease's card_in rejects at
     both P (-9 %). DT's set (2,376 B a column) stays under L2 on prose."""
     mode = cfg.get("_l2", "lru")
@@ -1142,7 +1145,7 @@ def card_tile_us(p, cfg, rt, l, T, clk=1.0):
 
 def shadow_tile_us(p):
     """The grouped kernels' cost per (card expert, 8-column tile), from the same trace mean shadow_slot was
-    read from (lcg, hot list 384, P 512 CED on, layers 2-39) [derived]."""
+    read from (lcg, frequency list 384, P 512 CED on, layers 2-39) [derived]."""
     rt = routing_lcg(p, True)
     slots = tiles = 0.0
     for _, _, lbs in prompt_plan(512, True):
@@ -1785,7 +1788,7 @@ CONFIGS = {
     # what each recorded commit ran: route "prebulk" = one-token router launches and a places launch
     # per chunk (d37136c batch.rs:815-866) and the per-slot shadow; copy = the union's copy of x before
     # hostserve (c58cb37); the union kernel (hosttile before h1fold, 5685a15); flow = the union's
-    # dispatch flow (chunks before 9626c7f, five after); hot = the hot list 384 (else the id prefix); xu_old = the
+    # dispatch flow (chunks before 9626c7f, five after); hot = the frequency list 384 (else the id prefix); xu_old = the
     # union's residual from the S13b anchor (the sittings before the uniondispatch lease; union_anchor)
     "ds41batch": dict(commit="43cd107", route="prebulk", union="hosttile", unionreal_cut=True, copy=True, ced=False,
                       flow="chunks", xu_old=True),
@@ -1799,14 +1802,14 @@ CONFIGS = {
     "UD": dict(commit="9626c7f", route="bulk", copy=False, flow="five", hot=False),
     "now": dict(commit="9626c7f", route="bulk", copy=False, flow="five"),
     # the B1 lease (09-26#b1-pp-ab): main 0bcee2c with B1 and the tree before it (74fe84c, the uniondispatch
-    # flow), no hot list, BLOOMERY_STEP_STATS=1 (timed: the card-timing marks are queue events); the prose
-    # calibration ran the same B1 binary with hot list 384
+    # flow), the id prefix, BLOOMERY_STEP_STATS=1 (timed: the card-timing marks are queue events); the prose
+    # calibration ran the same B1 binary with frequency list 384
     "B1": dict(commit="0bcee2c", route="bulk", copy=False, flow="five", b1=True, hot=False, timed=True),
     "B1base": dict(commit="74fe84c", route="bulk", copy=False, flow="five", hot=False, timed=True),
     "B1prose": dict(commit="0bcee2c", route="bulk", copy=False, flow="five", b1=True, timed=True),
-    # the cardtile lease (09-26#cardtile-ab): main efc202f (B1, udfix, cardtile), hot list 384, the prose prompt,
+    # the cardtile lease (09-26#cardtile-ab): main efc202f (B1, udfix, cardtile), frequency list 384, the prose prompt,
     # BLOOMERY_CARD_EXPERTS=tile (the default) against =expert, one binary; the prefillgroup lease
-    # (09-26#prefillgroup-ab): main e690f54 (+ prefillgroup), lcg without the hot list, BLOOMERY_PREFILL_GROUP=2
+    # (09-26#prefillgroup-ab): main e690f54 (+ prefillgroup), lcg at the id prefix, BLOOMERY_PREFILL_GROUP=2
     # (the wrap) against =1, one binary; marks4 = prefillgroup's four card-timing marks a layer-batch (the shadow's
     # start as well as its end; three before it)
     "CT": dict(commit="efc202f", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True),
@@ -1815,16 +1818,16 @@ CONFIGS = {
                 marks4=True),
     "PG2": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
                 wrap=True, marks4=True),
-    # the r8host lease (09-27#r8host-pp): bloomery 6ffed9e (r8host, landed as r8land 1ad6599), hot list 384, CED on, G 2
+    # the r8host lease (09-27#r8host-pp): bloomery 6ffed9e (r8host, landed as r8land 1ad6599), frequency list 384, CED on, G 2
     # (prefillgroup's default), BLOOMERY_STEP_STATS=1, BLOOMERY_R8=on (the default) against =off, one binary; the release
-    # sitting (09-28#v41-release): main 53e2def, the same flow, lcg without the hot list, no STEP_STATS (no card marks)
+    # sitting (09-28#v41-release): main 53e2def, the same flow, lcg at the id prefix, no STEP_STATS (no card marks)
     "R8": dict(commit="6ffed9e", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True, G=2, wrap=True,
                marks4=True, union="r8"),
     "R8off": dict(commit="6ffed9e", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True, G=2, wrap=True,
                   marks4=True),
     "REL": dict(commit="53e2def", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, G=2, wrap=True,
                 union="r8"),
-    # the pfxprose lease (09-29#pfxprose): main e577ac9, the r8 flow at the id prefix (no hot list), the router sets' own
+    # the pfxprose lease (09-29#pfxprose): main e577ac9, the r8 flow at the id prefix, the router sets' own
     # windows as routing (routes-idprefix.tsv); S0 = its BLOOMERY_STEP_STATS=1 arms (card marks), S0pp = the arms without
     "S0": dict(commit="e577ac9", route="bulk", copy=False, flow="five", b1=True, tile=True, timed=True, G=2, wrap=True,
                marks4=True, union="r8", hot=False),
@@ -1952,7 +1955,7 @@ ROWS = [
     ("S15.diff.enqueue", "S15", 384, {"arm": "slot", "vs": ("S15", {})}, "diff:enqueue", 1.83, 1, "info",
      "slot - expert"),
     ("S15.diff.wait", "S15", 384, {"arm": "slot", "vs": ("S15", {})}, "diff:wait", -1.82, 1, "info", ""),
-    # uniondispatch, one lease, no hot list: base = main af929ae (chunk flow), new = 9626c7f (five);
+    # uniondispatch, one lease, the id prefix: base = main af929ae (chunk flow), new = 9626c7f (five);
     # the new arm's round 1 was the lease's first process at each P (prologue 114.2 / 908.3 ms)
     ("UD.base512.union", "UDbase", 512, {}, "union", 77.07, 3, "abs", UDS + " 76.97, 77.68, 76.57)"),
     ("UD.base512.wait", "UDbase", 512, {}, "wait", 11.63, 3, "abs", "11.60, 11.65, 11.64"),
@@ -1975,7 +1978,7 @@ ROWS = [
      "+-0.030; rounds 1.0845, 1.1053, 1.1049"),
     ("UD.ratio4096", "UD", 4096, {"cold": 1 / 3, "vs": ("UDbase", {})}, "ratio", 1.083, 3, "ratio",
      "+-0.035; rounds 1.0670, 1.0873, 1.0942"),
-    # B1, two leases in a row, no hot list, lcg, BLOOMERY_STEP_STATS=1: main 0bcee2c (B1; generate_ds41
+    # B1, two leases in a row, the id prefix, lcg, BLOOMERY_STEP_STATS=1: main 0bcee2c (B1; generate_ds41
     # f0dddb6f7667, rebuilt 75dadf84c752 for the second lease) and 74fe84c (791dec6236ff). Four clean rounds
     # (b1pp r2, r3; b1pp2 r1, r2); b1pp round 1 is void: base P 512 and ours P 4096 [cpu-busy] (a build),
     # ours P 512 the lease's first process (prologue 108.3 ms). Stat values are the four rows' means.
@@ -2012,7 +2015,7 @@ ROWS = [
     ("B1.base.p4096.wait", "B1base", 4096, {}, "wait", 12.11, 4, "abs", "12.13, 12.10, 12.10, 12.10"),
     ("B1.base.p4096.enqueue", "B1base", 4096, {}, "enqueue", 20.85, 4, "abs", "20.89, 20.83, 20.82, 20.84"),
     ("B1.diff512.card_out", "B1", 512, {"vs": ("B1base", {})}, "diff:card_out", -10.08, 4, "info", "B1 - base"),
-    # the prose calibration: the same B1 binary (75dadf84c752), hot list 384, the prose prompt
+    # the prose calibration: the same B1 binary (75dadf84c752), frequency list 384, the prose prompt
     # (corpus-prose.ids, the first 512), one prompt, the lease's only process; the card was busy ~0.91 of the
     # wall, and its route ran clk_cardbound slower than lcg's (the row's own condition)
     ("B1.prose.pp", "B1prose", 512, {"rt": "prose", "clk": "cardbound"}, "pp", 171.64, 1, "abs",
@@ -2029,7 +2032,7 @@ ROWS = [
     ("B1.prose.slots", "B1prose", 512, {"rt": "prose"}, "host_slots", 52189, 1, "info", "a routing count, no timing ruler"),
     ("B1.prose.prologue", "B1prose", 512, {"rt": "prose"}, "prologue", 81.3, 1, "info",
      "no model term: the prompt's first process in its lease (eng_cold 2,741; lcg's warm 44.3)"),
-    # cardtile (T), one lease, prose, hot list 384, both arms of one binary (generate_ds41 e7870ea97ffb), two
+    # cardtile (T), one lease, prose, frequency list 384, both arms of one binary (generate_ds41 e7870ea97ffb), two
     # rounds each, 0/8 busy rows; values are the rounds' means (scratch cardab/run.log:150-435)
     ("CT.p512.tile.pp", "CT", 512, {"rt": "prose", "clk": "tile"}, "pp", 216.10, 2, "abs", CTS + " 217.02, 215.17)"),
     ("CT.p512.expert.pp", "CTexp", 512, {"rt": "prose", "clk": "cardbound"}, "pp", 173.585, 2, "abs", "173.67, 173.50"),
@@ -2075,7 +2078,7 @@ ROWS = [
      "a routing count, no timing ruler: 3.058 a block position against P 512's 2.714"),
     ("CT.p512.prologue", "CT", 512, {"rt": "prose"}, "prologue", 37.7, 2, "info", "37.7, 37.7"),
     ("CT.p4096.prologue", "CT", 4096, {"rt": "prose"}, "prologue", 271.6, 2, "info", "270.6, 272.6"),
-    # prefillgroup (G), one lease, lcg, no hot list, G 2 against G 1 (generate_ds41 of e690f54), 0/4 busy rows
+    # prefillgroup (G), one lease, lcg, the id prefix, G 2 against G 1 (generate_ds41 of e690f54), 0/4 busy rows
     # (scratch gab/run.log:145-274). G 2's round 1 was the lease's first process (prologue 1,018.5 ms, eng_cold 286):
     # the named exception PG.g2.r1.*, printed, not data; G 2's values are round 2's
     ("PG.g1.pp", "PG1", 4096, {}, "pp", 200.43, 2, "abs", PGS + " 199.91, 200.95)"),
@@ -2102,7 +2105,7 @@ ROWS = [
     ("PG.g2.chain", "PG2", 4096, {}, "chain", 16225.3, 1, "abs", "round 2 (round 1 16,392.5)"),
     ("PG.g2.prologue", "PG2", 4096, {}, "prologue", 323.2, 1, "info", "round 2"),
     ("PG.g2.r1.prologue", "PG2", 4096, {}, "prologue", 1018.5, 1, "info", "round 1, cold: the named exception"),
-    # r8host (09-27#r8host-pp), the sitting's stat prefill split lines (a scratch log of the lead: r8hostpp-sitting.log), hot list
+    # r8host (09-27#r8host-pp), the sitting's stat prefill split lines (a scratch log of the lead: r8hostpp-sitting.log), frequency list
     # 384, 0/16 busy rows. lcg P 512 is round 1 alone (round 2 and both off-arm rounds are [cold]: the two files' pages switched);
     # the others the two rounds' means. Its prologues read 2-3x prologue_tok (67-983 ms: engram and host pages evicted between
     # the arms), so the pp rows carry the row's own measured prologue (`pro`) and chain (the prompt less its prologues) is the
@@ -2155,7 +2158,7 @@ ROWS = [
      "ratio:chain", 10782.7 / 11342.4, 2, "ratio", "chain on / off (pp 1.045 +- 0.053)"),
     # today's public rows (09-28#v41-release): no stat line, and the runner's [cpu-busy] flag counted the arm itself
     # (rig-log 09-28#release-sit): printed beside the model, not scored
-    ("REL.pp512", "REL", 512, {}, "pp", 190.6, 1, "info", "09-28#v41-release, main 53e2def, lcg, no hot list"),
+    ("REL.pp512", "REL", 512, {}, "pp", 190.6, 1, "info", "09-28#v41-release, main 53e2def, lcg, the id prefix"),
     ("REL.pp4096", "REL", 4096, {}, "pp", 358.4, 1, "info", ""),
     # pfxprose (09-29#pfxprose), the lease's lines (flowfit's copy of the runner log, s0-run.log): the id prefix, 3 rounds, no
     # [cpu-busy] or [cold] row; the first prose P 512 arm (the lease's first process, prologue 101.8 ms) is the runner's
@@ -2185,7 +2188,7 @@ ROWS = [
      "union_host_slots, every round: the set's windows against the prompt"),
     ("S0.p4096.prose.slots", "S0", 4096, {"rt": "prose"}, "host_slots", 529103, 3, "info", ""),
     ("S0.p512.code.slots", "S0", 512, {"rt": "code"}, "host_slots", 94155, 3, "info", ""),
-    # 09-27#v41-ppdepth: the r8 flow on b684167, prose, hot list 384, STEP_STATS; its prologue 53.7-88.6 us a token
+    # 09-27#v41-ppdepth: the r8 flow on b684167, prose, frequency list 384, STEP_STATS; its prologue 53.7-88.6 us a token
     ("PPD.p4096.prose.pp", "R8", 4096, {"rt": "prose", "clk": "tile"}, "pp", 373.2, 2, "info",
      "09-27#v41-ppdepth 373.0, 373.4 (prologue ~0.22 s, the model's 0.32)"),
 ]
@@ -2236,11 +2239,11 @@ TERMS = {
                      " (enqueue 14.6). With the card-bound clock at the row's duty (clk_at 1.118, the band's term, not the"
                      " central) the chain reads 10,928 against 10,783 (+1.3 %): the SM clock sampled under a prose P 4096 arm"
                      " decides (the uncalibrated 'card-bound clock' row)",
-    "prose-phi-r8": "the hot-list prose rows of the r8 lease under r8_kappa: their routing is prose_swap / prose_phi_five /"
+    "prose-phi-r8": "the frequency-list prose rows of the r8 lease under r8_kappa: their routing is prose_swap / prose_phi_five /"
                     " prose_phi_4096, which put the host columns on phi of the ranks at rates / phi, fitted to the union"
                     " under the union kernel's own two-point law (c_union 22.2 a column); under a slope of 13.2 that"
                     " concentration reads the union 12-15 % short. The prose router set's own windows with the card at"
-                    " hotlist-384's first n_l ids of each layer (no fitted routing constant) read the same rows at r8_kappa"
+                    " the frequency list's first n_l ids of each layer (no fitted routing constant) read the same rows at r8_kappa"
                     " 27.62 (-2.6 %) at P 512 and 28.92 (-3.7 %, per-batch lists) at P 4096, with 4 % and 10 % fewer host"
                     " slots than those leases: the routing term, not the law",
     "glist": "P 4096 at the id prefix: routes-idprefix.tsv's group lists are rank means over windows of G x 512, read by"
@@ -2250,10 +2253,10 @@ TERMS = {
              " the P 4096 prompt reads union 44.45 (+0.6 %), chain 10,926 (+0.5 %), pp 366.7 (-0.5 %); the lists' order"
              " is the streaming pick's, so the fix is a per-batch count beside it (routes.py)",
     "card_in-4096": "the tile shadow at P 4096 reads ~1.1 ms a layer-batch over the model on both leases that have the row: r8"
-                    " lcg with the hot list 13.44 against 12.31, pfxprose's id-prefix prose 12.44 against 11.39; their P 512"
+                    " lcg with the frequency list 13.44 against 12.31, pfxprose's id-prefix prose 12.44 against 11.39; their P 512"
                     " rows hold (-4.0 %, -1.2 %). Both cells are host-bound (the union 44-47 over the card's 33-34): under"
                     " its shadow, 0 to the wall",
-    "card_in-lcg-hot-4096": "lcg with the hot list at P 4096: the tile shadow 13.44 against T's 12.31 (+1.1 ms); T's items were"
+    "card_in-lcg-hot-4096": "lcg with the frequency list at P 4096: the tile shadow 13.44 against T's 12.31 (+1.1 ms); T's items were"
                             " validated on lcg without the list and on prose, and this is the one mix no earlier row held. The"
                             " host binds lcg (the union 44.3 over the card's 35.9), so the term is under its shadow: 0 to the wall",
 }
@@ -2418,7 +2421,7 @@ def fit(f, target, lo, hi):
     return 0.5 * (lo + hi)
 
 
-# the trace's per-layer host wait (h-wait, ms; under the profiler) at P 512, hot list 384, afe86d5
+# the trace's per-layer host wait (h-wait, ms; under the profiler) at P 512, frequency list 384, afe86d5
 NSYS_WAIT = {0: 16.30, 1: 16.31, 2: 9.89, 3: 11.83, 14: 9.80, 20: 10.17, 36: 14.52, 37: 11.16, 38: 5.90, 39: 0.62}
 # the trace's layer-2 projections per chunk (us): an indexer layer (q_b 36,864 rows) and qkv's 228 blocks
 NSYS_L2 = dict(qkv=29.62, q_b=82.90, wo_a=105.32, wo_b=123.67)
@@ -2540,7 +2543,7 @@ def tile_diagnostics(p):
     out = [f"T's grouped pair (tile_kappa {tile_kappa(p) * 1000:.2f} ns an instruction-unit: t_tile_ab {p['t_tile_ab']} us at"
            f" cardnext's {p['tile_cal_slots'] / p['tile_cal_tiles']:.2f} columns an item; L2 {p['l2_bytes'] / 2 ** 20:.0f} MiB),"
            " per served layer-batch [derived] against the rows' card_in:"]
-    for label, cname, P, over, meas in (("lcg no hot list P 4096 (PG G 1)", "PG1", 4096, {}, 11.84),
+    for label, cname, P, over, meas in (("lcg at the id prefix P 4096 (PG G 1)", "PG1", 4096, {}, 11.84),
                                          ("prose P 512 (CT tile)", "CT", 512, {"rt": "prose", "clk": "tile"}, 23.13),
                                          ("prose P 4096 (CT tile)", "CT", 4096, {"rt": "prose", "clk": "tile"}, 21.705)):
         cfg, rn = row_cfg(p, cname, over)
@@ -2567,7 +2570,7 @@ def group_diagnostics(p):
     share = [(68.875 * 220 / 20089.2), (68.60 * 220 / 16225.3)]
     out.append(f"prefillgroup: the union's share of the chain {share[0] * 100:.0f} % at G 1, {share[1] * 100:.0f} % at G 2 (round"
                f" 2), the union 68.875 / 68.60 ms a layer-batch: the same binary's union does not move with its duty. The card's"
-               f" 'union 63' was the hot-list cell (63.28 in the model before flowg, {hot:.2f} now); without the list, the"
+               f" 'union 63' was the frequency-list cell (63.28 in the model before flowg, {hot:.2f} now); without the list, the"
                f" lease's condition, it read 65.90 and reads {g1['agg']['union']:.2f} now")
     out.append(f"  the five-dispatch union from P 512 to P 4096 in one lease: +1.41 (UD), +1.42 (B1), +1.08 (B1 base) ms against"
                f" the model's +{g1['agg']['union'] - evaluate(p, CONFIGS['B1'], 512)['agg']['union']:.2f} (the chunk flow: +0.52"
@@ -2587,7 +2590,7 @@ def group_diagnostics(p):
 
 STEPS = [
     # (name, overrides on "now", what it is, decisions (low, in band, high))
-    ("now", {}, "main 9626c7f: the five-dispatch union (uniondispatch) on sitting 15's card route, hot list 384", None),
+    ("now", {}, "main 9626c7f: the five-dispatch union (uniondispatch) on sitting 15's card route, frequency list 384", None),
     ("B1", {"b1": True}, "the four attention projections per 128-token sub-block (ds41proj, landed 2f45a79)", None),
     ("B1+T", {"b1": True, "tile": True},
      "+ cardtile: the grouped shadow as (card expert, row tile, 8-column tile) items, bit for bit"
@@ -2623,20 +2626,20 @@ COMPARE = [
      "host streaming on B1+T+G without the r8 tile (the order the ladder had before r8 landed first)"),
 ]
 MEASURED = {
-    "B1": "measured 09-26#b1-pp-ab on the lcg prompt without the hot list: 144.6 / 201.0 (the B1 rows; the model"
+    "B1": "measured 09-26#b1-pp-ab on the lcg prompt at the id prefix: 144.6 / 201.0 (the B1 rows; the model"
           " reads 145.3 / 204.8 there), and on the prose prompt with it: 171.6 at P 512, where the card was busy 0.93"
           " of the wall and its route ran clk_cardbound slower (175.7 with the ratio, 183.6 without); the cardtile"
           " lease's expert arm (B1 on efc202f) read 173.6 / 250.3 on prose (the model 175.7 / 254.5)",
-    "B1+T": "measured 09-26#cardtile-ab on the prose prompt, hot list 384: 216.1 / 292.1 (the model 219.6 / 294.9 at the"
+    "B1+T": "measured 09-26#cardtile-ab on the prose prompt, frequency list 384: 216.1 / 292.1 (the model 219.6 / 294.9 at the"
             " tile arm's card clock, clk_tile_prose); card_in 23.13 / 21.71 (22.95 / 21.58: the items' m mix x1.13 and"
             " GT's L2 spill 3.5 ms a layer-batch, which the flat t_tile_T left out at 18.2 / 17.4); lcg without the"
-            " hot list 200.4 at P 4096 (the prefillgroup lease's G 1 arm, the model 204.8)",
-    "r8": "measured 09-27#r8host-pp (hot list 384, STEP_STATS): lcg 191.0 / 338.7, prose 237.3 / 358.8, with prologues of"
+            " frequency list 200.4 at P 4096 (the prefillgroup lease's G 1 arm, the model 204.8)",
+    "r8": "measured 09-27#r8host-pp (frequency list 384, STEP_STATS): lcg 191.0 / 338.7, prose 237.3 / 358.8, with prologues of"
           " 67-983 ms (the model's 40-317); chain 2,613 / 11,163 and 2,052 / 10,783 ms (the R8 backtest rows); 09-28#v41-release"
-          " (lcg without the hot list): 190.6 / 358.4 (the model 193.0 / 358.4, the REL rows); 09-27#v41-ppdepth prose P 4096"
-          " 373.2 (prologue 0.22 s); 09-29#pfxprose (the id prefix, no hot list): prose 193.2 / 368.5, code 198.7 at P 512"
+          " (lcg at the id prefix): 190.6 / 358.4 (the model 193.0 / 358.4, the REL rows); 09-27#v41-ppdepth prose P 4096"
+          " 373.2 (prologue 0.22 s); 09-29#pfxprose (the id prefix): prose 193.2 / 368.5, code 198.7 at P 512"
           " (the model 196.8 / 350.7, 200.3 with each arm's prologue, the S0 rows; P 4096 reads the group-list term glist)",
-    "B1+T+G": "measured 09-26#prefillgroup-ab on lcg without the hot list, P 4096: 247.5 (round 2; the model 251.6),"
+    "B1+T+G": "measured 09-26#prefillgroup-ab on lcg at the id prefix, P 4096: 247.5 (round 2; the model 251.6),"
               " G 2 / G 1 1.232 (round 2's pair; the model 1.228); the union 68.6-69.3 ms a layer-batch in both arms"
               " (the model 67.4) — it does not move with its share of the wall",
 }
@@ -2753,7 +2756,7 @@ def predict(which):
     comp = COMPARE if which == "all" else [c for c in COMPARE if c[0] == which]
     if not todo and not comp:
         raise SystemExit(f"--predict: no step {which!r}; steps: all, " + ", ".join(s[0] for s in STEPS))
-    print("pp tok/s [derived] @ A6000 300 W, plan (a), hot list 384, CED on, CARD_EXPERTS expert, the lcg prompt or the"
+    print("pp tok/s [derived] @ A6000 300 W, plan (a), frequency list 384, CED on, CARD_EXPERTS expert, the lcg prompt or the"
           " prose prompt (corpus-prose.ids; routing calibrated on its B1 row), from main 9626c7f.")
     print("band = central -/+ quadrature of every read constant's lo/hi and the structural alternatives (resid_mode prop,"
           " X_u carried from S13b instead of today's uniondispatch arm, GT's sweep spilling at 0.9 of L2) and,"
@@ -2796,10 +2799,10 @@ def predict(which):
                 prev[(rname, P)] = b["pp"]
         if name == "now":
             print("  variants of today's flow (central; CED off = BLOOMERY_CED=off,"
-                  " no hot list = the uniondispatch lease's condition, measured 129.63 / 180.02):")
-            for label, vo in (("CED off", {"ced": False}), ("no hot list", {"hot": False})):
+                  " id prefix = the uniondispatch lease's condition, measured 129.63 / 180.02):")
+            for label, vo in (("CED off", {"ced": False}), ("id prefix", {"hot": False})):
                 vals = [f"{rn} P {P} {evaluate(central(), dict(cfg, **vo), P, rn)['pp']:.1f}"
-                        for rn in (("lcg",) if label == "no hot list" else ("lcg", "prose")) for P in (512, 4096)]
+                        for rn in (("lcg",) if label == "id prefix" else ("lcg", "prose")) for P in (512, 4096)]
                 print(f"      {label:11}: " + ", ".join(vals))
         if name in MEASURED:
             print(f"  {MEASURED[name]}")
@@ -2823,7 +2826,7 @@ def predict(which):
 
 CELL_STEPS = (("B1", {"b1": True}), ("B1+T", {"b1": True, "tile": True}), ("B1+G", {"b1": True, "G": 2, "wrap": True}),
               ("B1+T+G", {"b1": True, "tile": True, "G": 2, "wrap": True}))
-CELL_MEASURED = {("lcg", 512): "144.6 (no hot list)", ("lcg", 4096): "201.0 (no hot list)", ("prose", 512): "171.6",
+CELL_MEASURED = {("lcg", 512): "144.6 (the id prefix)", ("lcg", 4096): "201.0 (the id prefix)", ("prose", 512): "171.6",
                  ("prose", 4096): "250.3 (CT expert)"}
 
 
@@ -2850,8 +2853,8 @@ def imma_over_t(cfg_t, cfg_i, P, rname):
 def cells():
     """The next two levers per cell (lcg or prose, P 512 or 4096), with bands, and what the IMMA shadow is worth
     over T's at G 1 and at G 2 [derived]."""
-    print("pp tok/s [derived] @ A6000 300 W, plan (a), hot list 384, CED on; bands as --predict. B1 measured: lcg"
-          " without the hot list (09-26#b1-pp-ab), prose with it.")
+    print("pp tok/s [derived] @ A6000 300 W, plan (a), frequency list 384, CED on; bands as --predict. B1 measured: lcg"
+          " at the id prefix (09-26#b1-pp-ab), prose with it.")
     print(f"{'cell':12} {'B1 meas':>18} {'B1':>22} {'B1+T':>22} {'B1+G':>22} {'B1+T+G':>22} {'IMMA/T G1':>18} {'IMMA/T G2':>18}")
     for rname in ("lcg", "prose"):
         for P in (512, 4096):
@@ -3029,7 +3032,7 @@ def stream_report():
     U = union_anchor(p, DEFAULT_ANCHORS)
     fus = expert_bytes_stream(p, 2) / (p["pcie_pinned"] * 1e9) * 1e6
     fus0 = expert_bytes_stream(p, 0) / (p["pcie_pinned"] * 1e9) * 1e6
-    print("host streaming after B1 + T [derived]: A6000 300 W, plan (a), hot list 384, CED on; streamed experts priced at"
+    print("host streaming after B1 + T [derived]: A6000 300 W, plan (a), frequency list 384, CED on; streamed experts priced at"
           " T's tile rate (bit rule b'), a static rank table (pick static), the fill gated by the layer's start, pinned"
           f" {p['pcie_pinned']:.2f} GB/s, fill {p['fill_crossings']:.0f} DRAM crossings under dram_eff {p['dram_eff']:.0f} GB/s.")
     a, c, f8 = union_kernel(p, step_cfg(STREAM_BASE), 2)
@@ -3177,7 +3180,7 @@ def lever_rows(p):
 def lever_cell(p, over, pov, rn, hot, P, duty_clock):
     cfg = dict(TODAY, hot=hot, **over)
     q = p.but(**pov) if pov else p
-    if rn == "prose" and hot:               # the clock the hot-list prose prompt ran its card at
+    if rn == "prose" and hot:               # the clock the frequency-list prose prompt ran its card at
         cfg["_clk"] = p["clk_tile_prose"]
     r = evaluate(q, cfg, P, rn)
     if duty_clock:
@@ -3194,7 +3197,7 @@ def levers():
           " prompt at clk_tile_prose. 'clk' = the card-bound clock at the run's duty (clk_at, the band's term) in place of the"
           " central clock: it moves the cells where the card binds." % (p["r8_kappa"], p["r8_kappa"] * (p["r8_tile_col"] + p["r8_tile_fix"] / 8)))
     meas = {r[0]: r[5] for r in ROWS}
-    print("measured (the backtest rows): lcg no hot list %.1f / %.1f (REL.pp512 / REL.pp4096); lcg hot list %.1f / %.1f,"
+    print("measured (the backtest rows): lcg at the id prefix %.1f / %.1f (REL.pp512 / REL.pp4096); lcg with the frequency list %.1f / %.1f,"
           " prose %.1f / %.1f (R8.p512 / R8.p4096 .lcg.pp / .prose.pp, under STEP_STATS, each with its own prologue)"
           % tuple(meas[k] for k in ("REL.pp512", "REL.pp4096", "R8.p512.lcg.pp", "R8.p4096.lcg.pp", "R8.p512.prose.pp",
                                     "R8.p4096.prose.pp")))
@@ -3205,7 +3208,7 @@ def levers():
         cell = f"{rn}{'' if rn == 'prose' and hot else (' hot' if hot else ' no hot')} P {P}"
         if rn in REAL_TEXTS and not hot and rn not in said:
             said.add(rn)
-            print(f"\n{rn} without the hot list: the router set's own windows at the id prefix (routes-idprefix.tsv),"
+            print(f"\n{rn} at the id prefix: the router set's own windows (routes-idprefix.tsv),"
                   " the central clock ('pp clk' moves it by the run's duty); no measured row")
         print(f"\n== {cell}")
         print(f"   {'lever':34} {'pp':>7} {'gain':>7} {'pp clk':>7} {'gain':>7} | per served lb (ms): {'host':>5} {'card':>5}"
@@ -3224,15 +3227,14 @@ def levers():
 
 # ============================================================================ uncalibrated terms
 
-SWEEP = ("BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_HOT_LIST=/root/bloomery-data/router/hotlist-384.txt"
-         " BLOOMERY_STEP_STATS=1 BLOOMERY_CED=off BLOOMERY_LEASE_CARD=docs/cards/<slug>.card' just depth-gpu-ds41 128 256 384 512")
+SWEEP = ("BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_STEP_STATS=1 BLOOMERY_CED=off BLOOMERY_LEASE_CARD=docs/cards/<slug>.card' just depth-gpu-ds41 128 256 384 512")
 
 
 def uncal_rows(p):
     """(term, what the model assumes now, the cheapest runner command, expected [derived], box minutes [derived])."""
     sw = []
     for P in (128, 256, 384, 512):
-        cfg = dict(CONFIGS["now"], ced=False)
+        cfg = dict(CONFIGS["now"], ced=False, hot=False)
         a = evaluate(p, cfg, P)["agg"]
         b = evaluate(p, cfg, P, "lcg", dict(DEFAULT_ANCHORS, resid_mode="prop"))["agg"]
         sw.append(f"P {P}: union {a['union']:.1f} (prop {b['union']:.1f}), wait {a['wait']:.1f}, enqueue {a['enqueue']:.1f},"
@@ -3254,7 +3256,7 @@ def uncal_rows(p):
          f" {t['card_in']:.1f} ms a layer-batch (t_tile_ab band {tlo['card_in']:.1f}-{thi['card_in']:.1f})", "3"),
         ("the five-dispatch union from P 512 to P 4096", "the model's +0.65 ms a layer-batch against +1.1-1.4 measured in"
          " three leases: the CED tail's small-T calls or a sustained-load host term (20 s of union at P 4096, 3 s at"
-         " P 512)", "BLOOMERY_CED=off at P 512 and P 4096, lcg, no hot list, one lease, BLOOMERY_STEP_STATS=1 (every"
+         " P 512)", "BLOOMERY_CED=off at P 512 and P 4096, lcg, the id prefix, one lease, BLOOMERY_STEP_STATS=1 (every"
          " layer-batch is T 512 at both P)", f"union {evaluate(p, dict(CONFIGS['PG1'], ced=False), 512)['agg']['union']:.2f}"
          " ms a layer-batch at both P: equal = the CED tail's small calls; P 4096 +1 ms = the sustained-load term", "8"),
         ("union T-scaling (union-T)", f"X_u {union_anchor(p, DEFAULT_ANCHORS)['x'] * 1000:.2f} us a host slot on top of the"
@@ -3539,7 +3541,7 @@ def self_test():
           abs(tile_compute_us(p, p["tile_cal_tiles"], p["tile_cal_slots"]) / p["tile_cal_tiles"] - p["t_tile_ab"]) < 1e-9)
     lcg_over = [tile_parts(p, CONFIGS["B1"], routing_lcg(p, h), 512, 1.0)[4] for h in (True, False)]
     pr_over = tile_parts(p, CONFIGS["CT"], routing_prose(p, 512), 512, 1.0)[4]
-    check("GT's sweep set: under L2 on every lcg layer-batch (hot list or not), over it on most prose ones",
+    check("GT's sweep set: under L2 on every lcg layer-batch (frequency list or not), over it on most prose ones",
           lcg_over == [0, 0] and pr_over >= 30, f"lcg {lcg_over}, prose {pr_over} of 38")
     for P, want in ((512, 52189), (4096, 325368)):
         cfg, rn = row_cfg(p, "CT", {"rt": "prose"})
@@ -3606,14 +3608,14 @@ def self_test():
     idp = p["n_card_total"] / (L - n0) / N_EXPERT
     check("the id-prefix routing: six slots a position on every layer, the card's list inside n_l and hottest first,"
           " no card on layers 0-1, and the card's share of layers 2-39 within 0.02 of n_l / 384 (the prefix is"
-          " not a hot list)", not bad and all(abs(x - idp) < 0.02 for x in shares),
+          " not a frequency list)", not bad and all(abs(x - idp) < 0.02 for x in shares),
           (", ".join(bad[:3]) or "") + f" shares {min(shares):.3f}..{max(shares):.3f} against {idp:.3f}")
     try:
         routing(p, "code", True)
         refused = False
     except SystemExit:
         refused = True
-    check("code and korean have no hot-list arm: asked for one, the routing is refused by name", refused)
+    check("code and korean have no frequency-list arm: asked for one, the routing is refused by name", refused)
     print(f"self-test: {len(fails)} failed")
     return fails
 

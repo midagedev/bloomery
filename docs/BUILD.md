@@ -68,7 +68,6 @@ export BLOOMERY_REF_MODEL=/path/to/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.ggu
 
 | Path under `$BLOOMERY_DATA` | What | Made by |
 |---|---|---|
-| `router/hotlist-384.txt` | per layer, the routed experts ranked by how often the router picks them | `just trace-router <corpus>` for each corpus, then `just hotlist` |
 | `greedy-ds41/prompt<P>.tsv` | the token ids of prompt row P | `just ik-greedy-ds41 <P>` (needs ik_llama.cpp) |
 | `engram/corpus-*.ids` | token-id corpora for the draft gate and the router trace | not in this repository |
 | `ref_deepseek41/` | the oracle tensor dumps the gates read | `tools/ref/dump.sh` (needs ik_llama.cpp) |
@@ -107,7 +106,6 @@ On the V4.1 engine the server is `bloomery-serve-ds41` (build it with `--bin blo
 
 | Variable | Effect |
 |---|---|
-| `BLOOMERY_HOT_LIST=$BLOOMERY_DATA/router/hotlist-384.txt` | each routed layer's card keeps the list's first `n_l` experts instead of the id prefix. Same count and bytes. It was 4.5 ms per step faster (A6000, placement (a), depth 6, `n = 96`, instrumentation off, the earlier mixed-quantization file; rig-log [2026-09-24](https://github.com/midagedev/rig-log/blob/main/log/2026-09-24.md#hot-list-placement-and-real-text-prompt)) |
 | `BLOOMERY_DRAFT=lookup` | the n-gram lookup draft through the skewed two-row pass. The `tokens` line equals the plain run's. Needs `--ctx` to hold one extra position. Prints a `draft summary` line |
 | `BLOOMERY_STEP_STATS=1` | a `stat step` line per step. It slows each step by 2.5–3 ms, so compare instrumented runs only with instrumented runs |
 | `BLOOMERY_PIN_MAIN=0` | leave the main thread unpinned |

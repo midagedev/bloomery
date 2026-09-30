@@ -529,19 +529,19 @@ first suspect is a hung gate on the box, not the agent.
   launches~~ the per-chunk kernels themselves — every 8-token chunk re-reads the four projections at m = 8; the
   launch gaps are 1.4–3.6 ms of it [derived, docs/research/cardroute-design-report.md]).
   Since round `uniondispatch` (the host union in five dispatches a layer-batch instead of 161)
-  pp512 **129.6** and pp4096 **180.0** with no hot list (main's binary 118.0 / 166.3 in the same
+  pp512 **129.6** and pp4096 **180.0** at the id prefix (main's binary 118.0 / 166.3 in the same
   lease, 1.098 ± 0.030 / 1.083 ± 0.035, the union 77.1 → 66.7 ms per layer-batch; sitting 14's
-  121.4 / 169.4 ran with the hot list, so the two pairs do not share a table; rig-log
+  121.4 / 169.4 ran with a router-frequency card list, so the two pairs do not share a table; rig-log
   09-26#uniondispatch-ab). Since `2f45a79` (B1: the prompt batch's attention projections once per
-  128-token sub-block instead of per 8-token chunk) pp512 **144.6** and pp4096 **201.0** with no hot
-  list (the tree before it 130.6 / 182.4 in the same leases, 1.108 ± 0.011 / 1.102 ± 0.011 over four
+  128-token sub-block instead of per 8-token chunk) pp512 **144.6** and pp4096 **201.0** at the id
+  prefix (the tree before it 130.6 / 182.4 in the same leases, 1.108 ± 0.011 / 1.102 ± 0.011 over four
   clean rounds; the card route 29.7 → 19.6 ms per layer-batch; rig-log 09-26#b1-pp-ab). Since `237321a`
   (cardtile, T: the prompt batch's card experts by (slot tile, row tile) blocks) the prose prompt
-  (`corpus-prose.ids`, hot list 384) runs pp512 **216.1** and pp4096 **292.1** against the `expert` arm's
+  (`corpus-prose.ids`, a router-frequency card list) runs pp512 **216.1** and pp4096 **292.1** against the `expert` arm's
   173.6 / 250.3 in the same lease (1.245 ± 0.060 / 1.167 ± 0.011 over two rounds; the shadow 45.4 → 23.1 ms
   per layer-batch at P = 512; prose rows and the lcg rows above do not share a table; rig-log
   09-26#cardtile-ab). Since `eb3e08a` (prefillgroup, G: batches in pairs, layer by layer, the route
-  enqueued ahead of the host serve across layers too) the lcg prompt with no hot list runs pp4096
+  enqueued ahead of the host serve across layers too) the lcg prompt at the id prefix runs pp4096
   **247.5** against the `BLOOMERY_PREFILL_GROUP=1` arm's 201.0 in one lease (rounds 1.177 and 1.232 —
   round 1's G 2 row was the lease's first run with a 0.7 s colder prologue; the chain ratio 0.814 /
   0.810; the host's wait for the route 17.8 → 0.8 ms per layer-batch; rig-log 09-26#prefillgroup-ab).

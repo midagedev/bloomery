@@ -16,7 +16,7 @@
 #                                                       layers: a uniform 23.3 % of the 4.744 GB, 8.1-
 #                                                       8.5 ms off the step, the card experts in the
 #                                                       host leg's shadow)
-#   ours hot:<D> (glmcard's list)    21.4..30.5 tok/s  (glmcard-tg's +32..+63 % over host-only)
+#   ours, a router-frequency list    21.4..30.5 tok/s  (glmcard's card A/B: +32..+63 % over host-only)
 #   ours pp, the step feed           at or just above the decode rate: one body a fed id and one
 #                                                       readback at the end
 #   ours at depth 1024 vs 512        the same within the ruler: 11 latent layers x 1,536 B a position
@@ -74,7 +74,7 @@
 #                                                       x 1.39 on 32.7 ms of a 43.5 ms step)
 #   exllamav3 pp512 / pp4096         150..400 tok/s    (361 tok/s at 11k on the two-card run)
 # The engines do not share a routing condition: ours feeds prose and places card experts by id or by a
-# prose hot list; llama-bench feeds std::rand() ids to whole layers placed by index, whose host bytes a
+# prose router-frequency list; llama-bench feeds std::rand() ids to whole layers placed by index, whose host bytes a
 # token do not depend on the ids; exllamav3 feeds wikitext-2 and adapts its placement to it.
 # So ours / llama.cpp: decode 0.95..1.56 host-only, 1.10..1.85 with glmcard's default; pp512 0.18..0.29
 # (the step feed against a batched prefill: not a prefill to headline until GLM has one, glmpp).
@@ -83,17 +83,17 @@ question: what are ours, llama.cpp's (PR #27752 and #27754) and exllamav3's GLM-
   prompt rows on the A6000 in one window, for the public table?
 term: tok/s @ n=96, depth 512, A6000, bloomery (generate_glm5next of the sitting's tree, plan (a),
   the `512` arm of just depth-gpu-glm5next, prose ids), with glmcard landed (its default: the
-  id-prefix card experts, no hot list)
+  id-prefix card experts)
 unit: tok/s
 predict: 18.7..22.2
 condition: one lease, two rounds, the GGUF arms rotated each round after a discarded warm-up, the
-  exllamav3 arms after them behind a discarded load; arms 512 1024 hot:512 hot:1024 lcpp27752:512
+  exllamav3 arms after them behind a discarded load; arms 512 1024, the router-frequency-list arms at 512 and 1024, lcpp27752:512
   lcpp27752:1024 lcpp27754:512 lcpp27754:1024 lcpp27752pp:512 lcpp27754pp:512 lcpp27752pp4096:4096
   lcpp27754pp:4096 lcpp27754srv:512 lcpp27754mtp:512 lcpp27752fit:512 lcpp27754fit:512
   lcpp27752ppfit:512 lcpp27754ppfit:512 exl3:512 exl3:1024 exl3pp:512 exl3pp:4096; no row carries [cpu-busy] or
   [other-busy], and no GGUF row [cold] (the discarded warm-up keeps the file cached — both placements'
   host sets together are the 199.7 GB file, which the page cache holds; exllamav3's fault
-  counts are its load's and untagged); every hot row names card_experts > 0; every fit row carries its
+  counts are its load's and untagged); every router-frequency-list row names card_experts > 0; every fit row carries its
   `fit` column; a llama.cpp arm that fails
   to fit is a FAIL row the runner goes past, rerun at BLOOMERY_BOX_ENV='GLM_NCMOE=37 …' (the profile
   keeps a caller's value), and a fit twin whose fit failed is a FAIL row naming it; the full output to a file first. Command:

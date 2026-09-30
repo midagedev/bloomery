@@ -12,18 +12,16 @@
 //! Routed experts follow one rule ([`plan`]): the eligible layers of a card
 //! keep the same number of experts on it, give or take one — the count
 //! `n_l` — and the rest stay on the host. Which experts a layer keeps is an
-//! [`ExpertList`]: the id prefix `[0, n_l)` by default, or the layer's `n_l`
-//! hottest ids from a hot list file ([`HotList`], the `BLOOMERY_HOT_LIST`
-//! lever). The count, and so every byte total, is the same either way; only
-//! the ids change. A card byte budget (`BLOOMERY_CARD_BUDGET`,
-//! [`card_budget`]) caps every card's usable bytes before the rule runs. Both
-//! come in as [`PlanLevers`], which a binary parses once.
+//! [`ExpertList`]: the id prefix `[0, n_l)`. A card byte budget
+//! (`BLOOMERY_CARD_BUDGET`, [`card_budget`]) caps every card's usable bytes
+//! before the rule runs; it comes in as [`PlanLevers`], which a binary parses
+//! once.
 //!
 //! A machine may also carry expert tier cards ([`Machine::tiers`]): cards
 //! that run no stage and hold only routed experts beside the host. The stage
 //! cards are planned first, exactly as without tiers; then each tier, in
-//! order, takes per eligible layer the ranks after the stage card's `n_l` and
-//! the earlier tiers' — the hot list's next ids, or the id order's — one
+//! order, takes per eligible layer the ids after the stage card's `n_l` and
+//! the earlier tiers', in id order, one
 //! expert at a time on the layer that holds the fewest so far, so the
 //! per-layer totals stay even ([`Plan::tier_n_l`]).
 
@@ -36,10 +34,7 @@ use gguf::GgmlType;
 pub mod card_budget;
 pub mod churn;
 pub mod host_lock;
-pub mod hot_list;
 pub mod workstation;
-
-pub use hot_list::HotList;
 
 pub use models::{Role, Unimplemented};
 
@@ -734,7 +729,7 @@ pub struct Plan<'a> {
     /// routed stacks' segments on that card, [`Segment::experts`]).
     pub n_l: Vec<u64>,
     /// Per tier of [`Machine::tiers`], per layer: how many experts the tier
-    /// holds — the ranks after the stage card's `n_l` and the earlier
+    /// holds — the ids after the stage card's `n_l` and the earlier
     /// tiers'. The host holds the rest.
     pub tier_n_l: Vec<Vec<u64>>,
     /// The card byte budget the plan was made under: every card planned
@@ -788,9 +783,6 @@ pub enum PlacementError {
     /// the token embedding.
     #[error("tier card {card}: {detail}; a tier card runs no stage")]
     Tier { card: String, detail: String },
-    /// A hot list file that cannot serve this plan: the file and why.
-    #[error("hot list {path}: {detail}")]
-    HotList { path: String, detail: String },
     /// Features of the file the engine does not run yet — every one, each with
     /// the layer it is on, or none for a model-wide one.
     #[error("{} feature(s) of this file are not implemented: {}", .0.len(), unimplemented_list(.0))]
@@ -1423,14 +1415,10 @@ fn footprint(
 }
 
 /// The placement's levers, which a binary parses once
-/// ([`PlanLevers::from_levers`]): the hot list `BLOOMERY_HOT_LIST` names, read
-/// and checked, and the card budget `BLOOMERY_CARD_BUDGET` sets. The default
-/// is neither: the id prefix, and each card's own usable bytes.
+/// ([`PlanLevers::from_levers`]): the card budget `BLOOMERY_CARD_BUDGET`
+/// sets. The default is none: each card's own usable bytes.
 #[derive(Clone, Debug, Default)]
 pub struct PlanLevers {
-    /// The hot list `BLOOMERY_HOT_LIST` names, read and checked; `None`
-    /// unset: each routed layer's card keeps the id prefix `[0, n_l)`.
-    pub hot: Option<HotList>,
     /// The card budget `BLOOMERY_CARD_BUDGET` sets, in bytes: every card of
     /// the plan plans with `min(usable, budget)`; `None` unset, each card's
     /// own usable bytes.
@@ -1438,18 +1426,15 @@ pub struct PlanLevers {
 }
 
 impl PlanLevers {
-    /// The placement's levers of a binary's one parse; the hot list file is
-    /// read and checked here.
+    /// The placement's levers of a binary's one parse.
     pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<PlanLevers, PlacementError> {
         Ok(PlanLevers {
-            hot: levers.hot_list().map(HotList::read).transpose()?,
             card_budget_bytes: levers.card_budget_bytes(),
         })
     }
 }
 
-/// [`plan_with`] under `levers`: the hot list's ids, or the id prefix without
-/// one, and the card budget, or none.
+/// [`plan_with`] under `levers`: the card budget, or none.
 pub fn plan<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1457,14 +1442,7 @@ pub fn plan<'a>(
     kv: &dyn KvBytes,
     levers: &PlanLevers,
 ) -> Result<Plan<'a>, PlacementError> {
-    plan_with(
-        model,
-        machine,
-        ctx_max,
-        kv,
-        levers.hot.as_ref(),
-        levers.card_budget_bytes,
-    )
+    plan_with(model, machine, ctx_max, kv, levers.card_budget_bytes)
 }
 
 /// `card`'s usable bytes under `budget`: the one place the cap is taken.
@@ -1479,8 +1457,8 @@ fn capped(card: &Card, budget: Option<u64>) -> u64 {
 /// card's allocator — within usable − KV − context − scratch − margin. A card
 /// whose layers cannot keep one expert keeps none; one that cannot hold even
 /// its dense tensors shows up in [`Plan::violations`], not as an error here.
-/// The `n_l` experts of a layer are `hot`'s first `n_l` for it, or the id
-/// prefix `[0, n_l)` without `hot`. With `card_budget`, every card plans
+/// The `n_l` experts of a layer are its id prefix `[0, n_l)`. With
+/// `card_budget`, every card plans
 /// with `min(usable, budget)` usable bytes, and a card whose dense tensors,
 /// KV, context, scratch and margin pass that is refused
 /// ([`PlacementError::CardBudgetFloor`]).
@@ -1489,7 +1467,6 @@ pub fn plan_with<'a>(
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
-    hot: Option<&HotList>,
     card_budget: Option<u64>,
 ) -> Result<Plan<'a>, PlacementError> {
     plan_rule(
@@ -1497,7 +1474,6 @@ pub fn plan_with<'a>(
         machine,
         ctx_max,
         kv,
-        hot,
         card_budget,
         Some(CardFormat::of_routed),
         0,
@@ -1506,8 +1482,8 @@ pub fn plan_with<'a>(
 
 /// [`plan`] with the expert rule run on the layers every routed stack of
 /// which `routed` gives a card format, for a program whose card expert
-/// kernels read other types than [`CardFormat::of_routed`]'s: the hot list's
-/// ids, or the id prefix without one, and the card budget, or none.
+/// kernels read other types than [`CardFormat::of_routed`]'s: the card
+/// budget, or none.
 pub fn plan_routed<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1521,7 +1497,6 @@ pub fn plan_routed<'a>(
         machine,
         ctx_max,
         kv,
-        levers.hot.as_ref(),
         levers.card_budget_bytes,
         Some(routed),
         0,
@@ -1548,7 +1523,6 @@ pub fn plan_routed_reserving<'a>(
         machine,
         ctx_max,
         kv,
-        levers.hot.as_ref(),
         levers.card_budget_bytes,
         Some(routed),
         reserve,
@@ -1557,8 +1531,7 @@ pub fn plan_routed_reserving<'a>(
 
 /// [`plan`] with every routed stack on the host: no card is eligible for the
 /// expert rule, for a program with no card kernel for the model's routed
-/// experts. The card budget applies as in [`plan`]; a hot list ranks card
-/// experts, and this plan keeps none, so one is refused by name.
+/// experts. The card budget applies as in [`plan`].
 pub fn plan_host_routed<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1566,19 +1539,11 @@ pub fn plan_host_routed<'a>(
     kv: &dyn KvBytes,
     levers: &PlanLevers,
 ) -> Result<Plan<'a>, PlacementError> {
-    if let Some(h) = &levers.hot {
-        return Err(PlacementError::HotList {
-            path: h.path().to_string(),
-            detail: "this plan keeps every routed expert on the host: a hot list ranks none"
-                .to_string(),
-        });
-    }
     plan_rule(
         model,
         machine,
         ctx_max,
         kv,
-        None,
         levers.card_budget_bytes,
         None,
         0,
@@ -1591,21 +1556,17 @@ pub fn plan_host_routed<'a>(
 /// in the format `routed` gives them.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the planners' one body: the model, machine, context and cache, and the rule's four inputs"
+    reason = "the planners' one body: the model, machine, context and cache, and the rule's three inputs"
 )]
 fn plan_rule<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
-    hot: Option<&HotList>,
     card_budget: Option<u64>,
     routed: Option<RoutedFormat>,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
-    if let Some(h) = hot {
-        h.check_model(model)?;
-    }
     let stages = Stages::new(model.layers, &machine.cards)?;
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
     let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
@@ -1675,12 +1636,12 @@ fn plan_rule<'a>(
             continue;
         }
         let stage = stages.of_layer[l];
-        let mut lists = vec![(stage, ranked(hot, l, 0..n_l[l], model.experts)?)];
+        let mut lists = vec![(stage, ExpertList::range(0..n_l[l])?)];
         let mut next = n_l[l];
         for (t, own) in tier_n_l.iter().enumerate() {
-            let ranks = next..next + own[l];
-            next = ranks.end;
-            let list = ranked(hot, l, ranks, model.experts)?;
+            let ids = next..next + own[l];
+            next = ids.end;
+            let list = ExpertList::range(ids)?;
             lists.push((machine.cards.len() + t, list));
         }
         for &i in layer_stacks {
@@ -1721,20 +1682,6 @@ fn card_kv(card: &Card, kv: &dyn KvBytes, ctx_max: u64) -> (u64, u64) {
         .map(|l| kv.shadow_bytes(l, ctx_max))
         .sum();
     (kv_card, shadow)
-}
-
-/// The experts of layer `l` at rank positions `ranks`: the hot list's, or the
-/// id order's without one.
-fn ranked(
-    hot: Option<&HotList>,
-    l: usize,
-    ranks: Range<u64>,
-    experts: u64,
-) -> Result<ExpertList, PlacementError> {
-    match hot {
-        Some(h) => h.ranked_list(l, ranks, experts),
-        None => ExpertList::range(ranks),
-    }
 }
 
 /// Refuse a tier card that says it runs a stage.
@@ -2107,6 +2054,27 @@ mod tests {
         assert_eq!(
             refused([true, true]),
             "2 cards hold the token embedding, not one"
+        );
+    }
+
+    /// The list type itself: sorted on construction, duplicates and ids past
+    /// the stack refused, the complement and runs of a scattered list, and a
+    /// prefix recognised as one.
+    #[test]
+    fn expert_list_shapes() {
+        let l = ExpertList::new(vec![6, 1, 2], 8).expect("a list");
+        assert_eq!(l.ids(), &[1, 2, 6]);
+        assert_eq!(l.runs(), vec![1..3, 6..7]);
+        assert_eq!(l.to_string(), "1..3,6..7");
+        assert_eq!(l.complement(8).expect("fits").ids(), &[0, 3, 4, 5, 7]);
+        assert_eq!(l.slot_of(6), Some(2));
+        assert_eq!(l.as_prefix(), None);
+        assert!(ExpertList::new(vec![1, 1], 8).is_err());
+        assert!(ExpertList::new(vec![8], 8).is_err());
+        let p = ExpertList::prefix(3).expect("a prefix");
+        assert_eq!(
+            (p.as_prefix(), p.to_string()),
+            (Some(3), "0..3".to_string())
         );
     }
 }

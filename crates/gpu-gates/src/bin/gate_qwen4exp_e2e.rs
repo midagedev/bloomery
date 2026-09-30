@@ -178,10 +178,7 @@
 //!   batch set and D3K's prefill each as two cut ubatches against one, bit
 //!   for bit — a token's bits depend neither on the ubatch it lands in nor
 //!   on the route's run (D3K's 3,001 tokens run two at the load's ubatch
-//!   of 4,096). (iv) A hot list whose rank order is the id order leaves the
-//!   no-list card plan's plan, so its five steps' tokens and logits are the
-//!   no-list run's bit for bit; a scattered list's run is a sum-order
-//!   change, so no bit pin for one.
+//!   of 4,096).
 //! - (r) refusals: `Prompt38::parse` takes `step`, `pass`, `gemm` and `auto`
 //!   and refuses any other name by name; the image placeholder
 //!   [`IMAGE_TOKEN`] as a step, as a pass and as a ubatch is refused by name
@@ -235,8 +232,8 @@ mod gate {
     use gguf::Split;
     use gguf::quant::half_to_f32;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
+    use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
-    use model::placement::{HotList, PlanLevers};
     use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
 
     /// Cache rows: D3K's step at position 3,000, with room.
@@ -484,12 +481,8 @@ mod gate {
         let held = plan.n_l.iter().filter(|&&n| n > 0).count();
         println!(
             "plan card={} experts={experts:?} ctx_max={} host_experts={} card_experts={} \
-             card_layers={held} hot_list={}",
-            RTX_3090.name,
-            plan.ctx_max,
-            plan.host.experts,
-            plan.cards[0].experts,
-            plan_levers.hot.as_ref().map_or("none", HotList::path)
+             card_layers={held}",
+            RTX_3090.name, plan.ctx_max, plan.host.experts, plan.cards[0].experts
         );
         let mut m = Body38::open_placed(file, &plan, &inputs, 0, levers.host(), ub)?;
         m.set_mode(StepMode::Graph);
@@ -3103,50 +3096,9 @@ mod gate {
         Ok(ok)
     }
 
-    /// (k) (iv): a hot list whose every layer lists the id order — so the
-    /// first `n_l` ranks each layer's card takes are the id prefix, and the
-    /// plan is the no-list plan's — gives the no-list card run's tokens and
-    /// logits bit for bit: the identity that proves the lever reaches the
-    /// plan without moving anything else. A scattered list's run is a
-    /// sum-order change (an expert moves between the host and the card), so
-    /// no bit pin for one.
-    fn hot_list_identity(mut m: Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
-        let plain = run_steps(&mut m, toks, StepMode::Eager, true)?;
-        drop(m);
-        let mut text = String::from("# n_expert\t512\n# order\trank\n");
-        for l in 0..N_LAYER {
-            let ids: Vec<String> = (0..N_EXPERT).map(|e| e.to_string()).collect();
-            text.push_str(&format!("{l}\t{}\n", ids.join(",")));
-        }
-        let hot = HotList::parse("the id order", &text)
-            .map_err(|e| format!("the id-order hot list: {e}"))?;
-        let levers = PlanLevers {
-            hot: Some(hot),
-            card_budget_bytes: None,
-        };
-        let mut listed = open(Experts::Card, &levers)?;
-        let listed = run_steps(&mut listed, toks, StepMode::Eager, true)?;
-        let tokens = plain.tokens == listed.tokens;
-        let logits = plain.logits.len() == listed.logits.len()
-            && plain
-                .logits
-                .iter()
-                .zip(&listed.logits)
-                .all(|(a, b)| same_bits(a, b));
-        let ok = tokens && logits;
-        println!(
-            "card leg hot list: the id order as the rank order — tokens {:?} vs {:?}, every \
-             logits row bit for bit: {logits} {}",
-            plain.tokens,
-            listed.tokens,
-            verdict(ok)
-        );
-        Ok(ok)
-    }
-
     /// (k): the card plan loaded on the gate card (the host plan's model
     /// dropped first), then its structure, the places entry's rule, (i)
-    /// against `host`, (ii), (iii) and (iv).
+    /// against `host`, (ii) and (iii).
     fn card_leg(toks: &[u32], host: &Run, man: &RefManifest) -> Result<bool, GateError> {
         let mut m = match open(Experts::Card, &PlanLevers::default()) {
             Ok(m) => m,
@@ -3163,13 +3115,6 @@ mod gate {
         ok &= guarded("vs host", &mut m, |m| card_vs_host(m, toks, host))?;
         ok &= guarded("rows", &mut m, |m| card_rows(m, toks))?;
         ok &= guarded("gemm", &mut m, |m| card_gemm(m, man, toks))?;
-        ok &= match hot_list_identity(m, toks) {
-            Ok(hot) => hot,
-            Err(e) => {
-                println!("card leg hot list: FAILED: {e} {}", verdict(false));
-                false
-            }
-        };
         Ok(ok)
     }
 

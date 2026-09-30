@@ -803,8 +803,8 @@ mod tests {
     #[test]
     fn of_plan_one_card_no_tier_is_the_card_fill() {
         let (model, machine) = (model(), workstation::plan_a(2));
-        let mut plan = placement::plan_with(&model, &machine, 4096, &NoKv, None, None)
-            .expect("a synthetic plan");
+        let mut plan =
+            placement::plan_with(&model, &machine, 4096, &NoKv, None).expect("a synthetic plan");
         let n_l = plan.n_l.clone();
         assert!(
             n_l.iter().any(|&n| n > 0),
@@ -845,8 +845,8 @@ mod tests {
     #[test]
     fn of_plan_without_a_tier_refuses_another_card() {
         let (model, machine) = (model(), workstation::plan_a(2));
-        let mut plan = placement::plan_with(&model, &machine, 4096, &NoKv, None, None)
-            .expect("a synthetic plan");
+        let mut plan =
+            placement::plan_with(&model, &machine, 4096, &NoKv, None).expect("a synthetic plan");
         place(
             &mut plan,
             0,
@@ -878,8 +878,8 @@ mod tests {
     #[test]
     fn of_plan_fills_the_tier_and_refuses_an_expert_on_both() {
         let (model, machine) = (model(), workstation::plan_a(2));
-        let mut plan = placement::plan_with(&model, &machine, 4096, &NoKv, None, None)
-            .expect("a synthetic plan");
+        let mut plan =
+            placement::plan_with(&model, &machine, 4096, &NoKv, None).expect("a synthetic plan");
         place(
             &mut plan,
             0,

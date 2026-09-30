@@ -17,7 +17,6 @@ pub const PREFILL: &str = "BLOOMERY_PREFILL";
 pub const PREFILL_GROUP: &str = "BLOOMERY_PREFILL_GROUP";
 pub const ENGRAM_HELPER: &str = "BLOOMERY_ENGRAM_HELPER";
 pub const STEP_STATS: &str = "BLOOMERY_STEP_STATS";
-pub const HOT_LIST: &str = "BLOOMERY_HOT_LIST";
 pub const CARD_BUDGET: &str = "BLOOMERY_CARD_BUDGET";
 pub const PIN_MAIN: &str = "BLOOMERY_PIN_MAIN";
 pub const DRAFT: &str = "BLOOMERY_DRAFT";
@@ -166,18 +165,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
-        name: HOT_LIST,
+        name: "BLOOMERY_HOT_LIST",
         class: Class::C,
         kind: Kind::Path,
-        default: Unset::Means("the id prefix [0, n_l)"),
-        doc: "Placement: a hot list file (`tools/ref/router-hotlist.py`); each routed \
-              layer's card keeps the file's first `n_l` ranked ids instead of the id \
-              prefix, the same counts and bytes. A layer listing fewer than the plan's \
-              `n_l` is refused. Read by `generate_ds41`, `bloomery-chat`, \
-              `bloomery-serve-ds41`, `generate_glm5next` and `generate_qwen3moe` (a \
-              qwen4exp card plan, `BLOOMERY_QWEN38_EXPERTS=card`; a host plan ranks \
-              none). The `plan` line of the V4.1 binaries and `generate_qwen3moe` prints `hot_list=`.",
-        site: Site::Parsed { left: &[] },
+        default: Unset::Means("the only path"),
+        doc: "Was a placement file that ranked each routed layer's card experts by router \
+              frequency, learned from the test corpora, in place of the id prefix.",
+        site: Site::Retired {
+            why: "each routed layer's card keeps the id prefix `[0, n_l)` and adaptive residency \
+                  (`BLOOMERY_RESIDENCY`) moves experts at run time; a list learned from the test \
+                  corpora ranked them in-sample",
+            left: &[],
+        },
     },
     LeverSpec {
         name: CARD_BUDGET,
@@ -342,8 +341,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::A,
         kind: Kind::Words(&["host", "card"]),
         default: Unset::Means("`card` on a qwen4exp file; nothing on another family's"),
-        doc: "Qwen3.8 (`generate_qwen3moe`): `card` plans each layer's id prefix (or its \
-              `BLOOMERY_HOT_LIST` ranks) on the card as its budget holds \
+        doc: "Qwen3.8 (`generate_qwen3moe`): `card` plans each layer's id prefix on the card \
+              as its budget holds \
               (`place::Experts::Card`), run by the step's, the verify's and the pass's card \
               leg and the ubatch walk's card route; `host` plans every routed expert on the \
               host tier, the same-binary arm. Unset is `card` on a qwen4exp file; set to \

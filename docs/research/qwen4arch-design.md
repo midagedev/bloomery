@@ -35,7 +35,7 @@
 - **Q6 시간선: 긴 막대는 카드 dense와 호스트 expert, 레버는 흐름 먼저.** 받는다. 토큰당 카드 dense 4.83 GB(700 GB/s에서 6.9 ms)
   + 호스트 expert 4.9–10.9 ms(대역 가정 둘 사이의 밴드) → 약 12–18 ms, 55–80 tok/s @ depth ≤ 2k, A6000, 균등 라우팅[유도].
   카드 expert 1.1–1.2 ms는 호스트의 그늘 아래라 그 커널을 줄이는 라운드는 열지 않는다. 순서: ① 두 카드(3090에 expert 16–20 GB
-  → 호스트 몫 20–25 %, 호스트 항이 카드 front 아래로) ② hot list ③ MTP verify k+1 배치(카드 dense를 k+1 토큰이 나눠 읽음 — 이
+  → 호스트 몫 20–25 %, 호스트 항이 카드 front 아래로) ② router-frequency list ③ MTP verify k+1 배치(카드 dense를 k+1 토큰이 나눠 읽음 — 이
   모델의 가장 큰 레버; 초안은 unsloth 공유 MTP 2.79 GB, 오라클은 ik). output 675 MB·F32 라우터 252 MB를 줄이는 것은 정확도가
   바뀌는 선택이라 트리아지에 「사용자 결정」으로 둔다.
 - **Q7 스펙 입력의 오류 셋을 고친다.** 풀 어텐션 헤드 차원은 **256**(스펙의 128은 틀림; config `head_dim`, 카드 L57, GGUF
@@ -80,7 +80,7 @@
 5. **인스턴스는 셋이 더 필요합니다.** GDN sigmoid 게이트 엔트리 하나, GQA flash (HEAD 256, PACK 4), 라우터 512/10입니다.
 6. **디코드 시간선의 긴 막대는 두 개입니다.** 하나는 카드 dense 4.83 GB/토큰(700 GB/s에서 6.9 ms)입니다. 다른 하나는 호스트 expert로, 균등 라우팅에서 4.9–10.9 ms입니다.
    - 카드 expert는 약 1.1–1.2 ms로 호스트의 그늘 아래 있으니, 카드 expert 커널을 줄이는 라운드는 가치가 0입니다.
-   - 레버 순서는 흐름 레버가 먼저입니다: 두 카드 → hot list → MTP verify 배치.
+   - 레버 순서는 흐름 레버가 먼저입니다: 두 카드 → router-frequency list → MTP verify 배치.
 7. **스펙 입력의 오류 셋을 바로잡습니다.**
    - 풀 어텐션 헤드 차원은 **256**입니다(스펙의 128은 틀림). 근거는 config `"head_dim": 256`, 카드 L57 `- Head Dimension: 256`, GGUF `attention.key_length = 256`입니다.
    - MoE는 **48층 전부**입니다(스펙의 36층은 틀림).
@@ -334,7 +334,7 @@ UD-Q4_K_XL 샤드와 lfs sha256입니다. 박스 파일의 크기는 넷 모두 
 
 **흐름 레버, 순서대로.**
 1. **두 카드.** 3090에 expert 약 16–20 GB를 더 두면 호스트 몫이 약 20–25 %로 내려갑니다. 그러면 호스트 항이 약 2–3 ms가 되어 카드 front 아래로 들어갑니다. 오늘 엔진은 두 카드 배치를 거부하고(`body.rs:127-135`, modelvocab 인용), 두 카드 적재의 선례는 V4.1 plan (b)(`stage-gpu-load-v41`)입니다.
-2. **hot list.** 토큰 몫을 카드로 옮깁니다.
+2. **router-frequency list.** 토큰 몫을 카드로 옮깁니다.
 3. **MTP verify k+1 배치.** 카드 dense 4.83 GB를 k+1 토큰이 나눠 읽습니다. 카드 front가 긴 막대인 이 모델에서는 가장 큰 레버입니다. 초안은 unsloth 공유 MTP(2.79 GB)이고 오라클은 ik입니다.
 
 그 다음이 항 단축입니다. output 675 MB를 줄이는 것(예: 어휘 부분 head)과 F32 라우터 252 MB를 줄이는 것(적재 때 변환)은 **정확도가 바뀌는 선택**이라 AGENTS 「Performance first」 판단이 필요합니다.

@@ -375,7 +375,7 @@ Two more numbers:
 
 ### 4.1 V4.1 decode, per step
 
-The row is from `nsys-ds41-d6-n8-101249.sqlite`: A6000, plan (a), hot list, depth 6, n 8 (`plan-triage.md:195`; `plan-ledger.md:1159`).
+The row is from `nsys-ds41-d6-n8-101249.sqlite`: A6000, plan (a), router-frequency list, depth 6, n 8 (`plan-triage.md:195`; `plan-ledger.md:1159`).
 
 | Resource | Per step | Source |
 |---|---|---|

@@ -170,7 +170,7 @@
     - `ds41_host.rs:106-224`: v41set의 거의 그대로 된 사본입니다. diff해 보면 이름과 상수, 단언 하나만 다릅니다.
     - `ds41_meta.rs:575-724`, `qwen3moe_meta.rs:59-95`
   - 이들이 열 위치를 손으로 박아 둡니다(`f[11]`, `f[13]`, `f[14]`, `len == 15`).
-  - Python에도 넷이 더 있습니다(`tools/ref/{check-int-twins,router-hotlist,window-union,router-coverage}.py`).
+  - Python에도 넷이 더 있습니다(`tools/ref/{check-int-twins,window-union,router-coverage}.py`, and the router-frequency list writer, since deleted).
 - **쌓인 경위:** `52837f6`(09-23)이 "one owner of the dump file-name rule"을 선언했지만, 모델 테스트는 gpu-gates에 의존할 수 없습니다(gpu-gates가 model에 의존하므로 순환). 그래서 파일마다 따로 자랐습니다.
 - **오늘 짓는다면:** `crates/oracle`(gguf에만 의존)에 v2 매니페스트, 세트 이름, 헤더 검사(build, arch, complete, model_file), 트윈을 둡니다. gpu-gates와 model tests가 둘 다 의존합니다.
 - **payoff:** 모델 테스트 쪽 중복 파서 약 600줄[유도]이 사라지고, 열 위치의 소유자가 하나가 됩니다. pre-v2 호환은 v1 세트(V2-Lite CPU `ref`)가 은퇴할 때 함께 삭제합니다.

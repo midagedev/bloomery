@@ -86,7 +86,7 @@ G=8(hoststream 때)은 쌍 형식으로 0.79–0.97 GB라 한계에 닿습니다
   - F4 `routed` 공유 → 비트는 녹색, `wait_lb` ≈ route로 성능 실패(타입으로 표현할 수 없게 만듭니다)
 - `gate_deepseek41_prefill`의 observer는 seam을 층 우선 순서로 받게 됩니다. 배치 우선 순서를 가정하는지 확인하고, G=1과 G=2 두 팔을 둡니다.
 
-**1.6 예측** pp tok/s [derived]. A6000, plan (a), 뜨거운 목록 384, CED on, B1 위.
+**1.6 예측** pp tok/s [derived]. A6000, plan (a), router-frequency list 384, CED on, B1 위.
 
 | | lcg 512 | lcg 4096 | prose-in 512 | prose-in 4096 |
 |---|---:|---:|---:|---:|
@@ -231,7 +231,7 @@ G의 A/B(`BLOOMERY_PREFILL_GROUP=1` 대 `2`)는 lcg 4096 +23…+27 %를 예측�
    ```
    kind: calibration
    question: is the prose prompt's shadow the per-slot reading (R) that sizes the tile lever
-   term: card_in_lb ms @ prose prompt P 512, B1 binary, A6000 plan (a), hot list 384, CED on, CARD_EXPERTS expert
+   term: card_in_lb ms @ prose prompt P 512, B1 binary, A6000 plan (a), router-frequency list 384, CED on, CARD_EXPERTS expert
    unit: ms
    predict: 45..53
    condition: one prompt under BLOOMERY_STEP_STATS=1 (card event pairs), lease held, no other card work

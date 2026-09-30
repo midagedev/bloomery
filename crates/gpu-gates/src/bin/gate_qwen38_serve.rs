@@ -90,7 +90,6 @@ mod gate {
     /// refused here first.
     const ACTS_ON: &[&str] = &[
         bloomery_levers::QWEN38_EXPERTS,
-        bloomery_levers::HOT_LIST,
         bloomery_levers::CARD_BUDGET,
         bloomery_levers::PIN_MAIN,
         bloomery_levers::HOST_POPULATE,

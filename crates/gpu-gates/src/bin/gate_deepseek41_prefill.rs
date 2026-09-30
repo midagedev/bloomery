@@ -242,8 +242,8 @@ mod gate {
         no_local_depot, patch_bytes, record, row_bytes, verdict,
     };
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HOT_LIST,
-        PREFILL_GROUP, R8, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_GROUP,
+        R8, STEP_STATS,
     };
     use cuda_core::{DeviceBuffer, DeviceCopy};
     use gguf::Split;
@@ -408,7 +408,6 @@ mod gate {
             PREFILL_GROUP,
             ENGRAM_HELPER,
             STEP_STATS,
-            HOT_LIST,
             CARD_BUDGET,
             HOST_POPULATE,
             HOST_LOCK,

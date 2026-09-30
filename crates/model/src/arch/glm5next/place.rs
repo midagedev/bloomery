@@ -131,7 +131,7 @@ impl PlanInputs {
 
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// the placement's `levers`: the expert rule on the layers whose routed
-    /// stacks [`card_routed`] runs, the hot list's ids or the id prefix;
+    /// stacks [`card_routed`] runs, each layer's id prefix;
     /// refused past [`ORACLE_POSITIONS`], when it cannot be built, or when it
     /// breaks an invariant.
     pub fn plan<'a>(

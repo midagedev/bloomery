@@ -91,7 +91,7 @@
 | 43 | hotset §5, plan `:21` | `gpu/src/weights.rs` 바이트+워드 2배 | 예 `:481` `words_of` | KQuant 워드로 바로 모으기 | S | perf | TRACKER weights.rs는 load 소유 |
 | 44 | hotset §5, plan `:21` | `gate_load_v41.rs` check 3 출력 길이 | 예 `:581` | 구간 수만 찍기 | XS | measurement-tooling | DO-NOW(H-load) |
 | 45 | hotset §5 | `hybrid.rs:3,98,156`, `model.rs:127,144,420,455` "[0, n_l)" | 예 `hybrid.rs:3,105,163`, `model.rs:127,516` | V2-Lite 전용임을 문서에 | XS | docs | DO-NOW(B) hybrid.rs. model.rs 몫은 H-ngdraft |
-| 46 | hotset §5 | `generate_ds41.rs:334` plan 줄 | 예 `:356` (목록 여부 없음) | plan 줄에 hot list 사용 표시 | XS | measurement-tooling | DO-NOW(H-ngdraft) |
+| 46 | hotset §5 | `generate_ds41.rs:334` plan 줄 | 예 `:356` (목록 여부 없음) | plan 줄에 router-frequency list 사용 표시 | XS | measurement-tooling | DO-NOW(H-ngdraft) |
 | 47 | hotset §5 | 목록 실행 첫 토큰 분기 교차 확인 | 없음 — E16 답함(`64946ab`, KLD 0.00601) | | S | measurement-tooling | DROP |
 | 48 | hybrid-engines §8 | `roofline.md:96-98` MLA | 없음 — `:97` 정정 2026-09-21 | | XS | docs | DROP |
 | 49 | hybrid-engines §8 | `roofline.md:161` engram 상주 | 없음 — `:165` 정정 | | XS | docs | DROP |

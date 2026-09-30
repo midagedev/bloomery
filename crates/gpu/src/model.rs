@@ -541,8 +541,7 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// Card `card` of `plan` resident: the segments the plan puts on the
     /// card ([`Weights::load_placed`] — whole tensors, and each routed
-    /// stack's card `ExpertList` of its layer, the id prefix or a hot list's
-    /// ranked ids), the weights `derive` files for the card's layers, and the
+    /// stack's card `ExpertList` of its layer), the weights `derive` files for the card's layers, and the
     /// body `body` builds over them, which keeps `file` for what the plan
     /// leaves on the host and its host tier the host set's residency; plus
     /// the output head when the card carries it. Between the uploads and the

@@ -266,7 +266,6 @@ selftests=(
   "tools/ref/ptx-canon.py --self-test"
   "tools/ref/route-trace-chat.py --self-test"
   "tools/ref/router-coverage.py --self-test"
-  "tools/ref/router-hotlist.py --self-test"
   "tools/ref/router-residency.py --self-test"
   "tools/ref/window-union.py --self-test"
   "tools/verdict-diff.py --self-test"

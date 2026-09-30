@@ -144,7 +144,7 @@ mod drive {
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::dspark::DraftHparams;
     use model::placement::workstation::{self, TierBatchBytes};
-    use model::placement::{HotList, Machine, Plan, PlanLevers};
+    use model::placement::{Machine, Plan, PlanLevers};
     use runtime::{Committed, Lookup, Speculative, Target, Want};
     use serve::{
         CacheNote, DeviceProps, DraftProps, Drafted, EngineProps, FATAL_LINGER, PlacementProps,
@@ -393,12 +393,6 @@ mod drive {
             extra: vec![
                 ("placement".to_owned(), place.name().to_owned()),
                 (
-                    "hot_list".to_owned(),
-                    levers
-                        .hot_list()
-                        .map_or_else(|| "none".to_owned(), |p| p.display().to_string()),
-                ),
-                (
                     "card_budget".to_owned(),
                     levers
                         .card_budget_bytes()
@@ -431,8 +425,7 @@ mod drive {
     ) -> Result<(String, Option<PlacementProps>, i64), GateError> {
         let machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
-        let hot_list = levers.hot.as_ref().map_or("none", HotList::path);
-        record::plan(place.name(), &machine, &plan, hot_list).eprint();
+        record::plan(place.name(), &machine, &plan).eprint();
         let mut host_headroom = plan.host.headroom_bytes;
         if let Some(pool) = swap::churn(&plan, 0, residency.0)? {
             let pick = residency.1;

@@ -30,6 +30,6 @@ decide-in: the file carries most of it: the old sets are cross-file lists, not a
   (-c10 vs -pub-4k) is printed beside it and goes to the #2507 notes
 decide-below: the file alone disagrees more than file and build together: the measurements do not
   compose; hotdiag's alignment (positions, prefill by steps vs chunk prefill) is chased before any
-  hot-list conclusion is drawn from it
+  router-frequency-list conclusion is drawn from it
 decide-above: the build carries much of it: the index keys of ik#2507 move routing materially; that goes
   to #2507's PPL question and the oracle choice, and the pub-seed list is kept as the engine's
