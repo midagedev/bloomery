@@ -446,13 +446,20 @@ mod cand_kernels {
         fault: FaultSink,
         mut bmax: DisjointSlice<f32>,
     ) {
-        let _ = tokens;
         let bid = thread::blockIdx_x();
-        let t = (bid / grid_per_row) as usize;
+        // A block past the rows has no row: the launcher's grid is exactly
+        // grid_per_row · tokens, so this fires only on a larger grid, whose
+        // extra blocks it keeps off every buffer. Block-uniform, before any
+        // access.
+        let row = bid / grid_per_row;
+        if row >= tokens {
+            return;
+        }
+        let t = row as usize;
         let gb = (bid % grid_per_row) as usize;
         let tid = thread::threadIdx_x() as usize;
-        // SAFETY: t < tokens (the grid is grid_per_row · tokens), so n_at + t <
-        // ints.len() by the launch contract.
+        // SAFETY: t < tokens (the guard above), so n_at + t < ints.len() by
+        // the launch contract.
         let n = unsafe { *ints.get_unchecked(n_at as usize + t) };
         if n > rows {
             if gb == 0 && tid == 0 {
@@ -540,12 +547,18 @@ mod cand_kernels {
         static mut WTOT: SharedArray<u32, { 2 * SEL_WARPS }> = SharedArray::UNINIT;
         static mut PICK: SharedArray<u32, 2> = SharedArray::UNINIT;
 
-        let _ = tokens;
-        let t = thread::blockIdx_x() as usize;
+        let bid = thread::blockIdx_x();
+        // A block past the rows has no row: the launcher's grid is exactly
+        // tokens, so this fires only on a larger grid. Block-uniform, before
+        // any access or barrier.
+        if bid >= tokens {
+            return;
+        }
+        let t = bid as usize;
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id();
         let wid = tid / 32;
-        // SAFETY: t < tokens (one block per row), so n_at + t < ints.len() by
+        // SAFETY: t < tokens (the guard above), so n_at + t < ints.len() by
         // the launch contract.
         let n = unsafe { *ints.get_unchecked(n_at as usize + t) };
         if n > rows {
@@ -733,16 +746,26 @@ mod cand_kernels {
         static mut HS: SharedArray<u32, HIST_BINS> = SharedArray::UNINIT;
         static mut BAD: SharedArray<u32, 1> = SharedArray::UNINIT;
 
-        let t = thread::blockIdx_x() as usize;
+        let bid = thread::blockIdx_x();
+        // A block past the rows has no row: the launcher's grid is exactly
+        // tokens, so this fires only on a larger grid — whose block `tokens`
+        // would otherwise write `n_c` over the `top_k` word below. Block-
+        // uniform, before any access or barrier.
+        if bid >= tokens {
+            return;
+        }
+        let t = bid as usize;
         let tid = thread::threadIdx_x() as usize;
         // SAFETY: top_k_at < ints.len() by the launch contract.
         let top_k = unsafe { *ints.get_unchecked(top_k_at as usize) };
         let cbase = counts_at as usize;
         if t == 0 && tid == 0 {
-            // SAFETY: counts_at + tokens < counts.len() (launch contract).
+            // SAFETY: counts_at + tokens < counts.len() (launch contract);
+            // every other block writes counts_at + t with t < tokens (the
+            // guard above), so this word has one writer.
             unsafe { *counts.get_unchecked_mut(cbase + tokens as usize) = top_k };
         }
-        // SAFETY: t < tokens (one block per row), so n_at + t < ints.len() by
+        // SAFETY: t < tokens (the guard above), so n_at + t < ints.len() by
         // the launch contract.
         let n = unsafe { *ints.get_unchecked(n_at as usize + t) };
         if n > rows {
@@ -930,9 +953,16 @@ mod cand_kernels {
         fault: FaultSink,
         mut list: DisjointSlice<u32>,
     ) {
-        let t = thread::blockIdx_x() as usize;
+        let bid = thread::blockIdx_x();
+        // A block past the rows has no row: the launcher's grid is exactly
+        // tokens, so this fires only on a larger grid. Block-uniform, before
+        // any access.
+        if bid >= tokens {
+            return;
+        }
+        let t = bid as usize;
         let tid = thread::threadIdx_x() as usize;
-        // SAFETY: t < tokens (one block per row), so n_at + t < ints.len() by
+        // SAFETY: t < tokens (the guard above), so n_at + t < ints.len() by
         // the launch contract.
         let n = unsafe { *ints.get_unchecked(n_at as usize + t) };
         if n > rows || !selects(n, blocks, block) {
