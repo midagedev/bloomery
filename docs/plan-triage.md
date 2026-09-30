@@ -149,6 +149,16 @@ nothing inside 95 steps [derived]. The one open term is τ, a flip's staging cos
   n_l live (no spare), a `Budget(30)` link and no prompt pass (`tools/ref/router-residency.py:655, 750`); give it an
   engine-shape option.
 
+### Upstream rename (10-01, line1)
+
+- **cuda-oxide's repository is now NVIDIA/cuda-rust** (the project and crate names stay; GitHub redirects the old
+  URLs, and `git ls-remote https://github.com/NVlabs/cuda-oxide.git` answers). The docs name the new repository
+  since `oxrename`. The source URL stays NVlabs for now: `Cargo.toml` (`[workspace.dependencies]` and the `[patch]`
+  key), `deny.toml` `allow-git`, `crates/oxide-ice-unroll/**/Cargo.toml`, and AGENTS.md's "declared against NVlabs".
+  Moving it rewrites `Cargo.lock`'s source strings, so every gate's ledger key moves; it rides the next cuda-oxide
+  pin move, which runs every gate anyway. Risk until then: a new repository under the old name would break the
+  redirect for a fresh clone.
+
 ### What T0 and the 09-30 night left (line3 — `lanea`, `gmerge`, `mtppf`, `mtpcost`, `c4resid`, `resitrun`)
 
 Qwen3.8 on the A6000 plan (a), prose, C 4352 (rig-log 09-30 #q38mtp-speed, #q38res-mtp, #q38mtp-wide): the MTP

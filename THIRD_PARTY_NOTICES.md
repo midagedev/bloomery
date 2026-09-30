@@ -37,7 +37,7 @@ SOFTWARE.
 `crates/oxide-ice-unroll` (a compiler-bug reproducer, excluded from the workspace) carries NVIDIA's
 Apache-2.0 headers from cuda-oxide. The GPU crates depend on cuda-oxide (Apache-2.0) as a pinned git revision.
 
-`Cargo.toml` declares the dependency on NVlabs/cuda-oxide at revision `ec4aa4797956534578a1af010f86252a0b6d8626`
+`Cargo.toml` declares the dependency on NVlabs/cuda-oxide (now [NVIDIA/cuda-rust](https://github.com/NVIDIA/cuda-rust); GitHub redirects the old URL) at revision `ec4aa4797956534578a1af010f86252a0b6d8626`
 and a `[patch]` section takes the source from our fork, [midagedev/cuda-oxide](https://github.com/midagedev/cuda-oxide),
 branch `bloomery`: that revision plus the patches below. Every patch is meant for upstream and leaves the fork once
 upstream has it; with none left, the `[patch]` section goes away.
@@ -46,7 +46,7 @@ upstream has it; with none left, the `[patch]` section goes away.
 |---|---|
 | [`dcf5636d`](https://github.com/midagedev/cuda-oxide/commit/dcf5636dbd2116c5112ccf832fee0389e0acd662) feat(cuda-macros): let `requires` name unsigned integer constants | not yet proposed |
 | [`29213c14`](https://github.com/midagedev/cuda-oxide/commit/29213c1436a16ad6ea61b4aea9e077db2e95bc7c) fix(cuda-macros): name the macro call when a cuda_module finds no kernels | not yet proposed |
-| [`c76f1e17`](https://github.com/midagedev/cuda-oxide/commit/c76f1e173b0e9468bc0b05d49d99560844a06fec) feat(unroll): recognize range `for` loops | proposed upstream as NVlabs/cuda-oxide#1346 (open) |
+| [`c76f1e17`](https://github.com/midagedev/cuda-oxide/commit/c76f1e173b0e9468bc0b05d49d99560844a06fec) feat(unroll): recognize range `for` loops | proposed upstream as [NVIDIA/cuda-rust#1346](https://github.com/NVIDIA/cuda-rust/pull/1346) (open) |
 | [`0af1016c`](https://github.com/midagedev/cuda-oxide/commit/0af1016c72c2224857d02bead7bdb7cbc10e580b) fix(mir-lower): give an aggregate niche payload's leaves typed slots | not yet proposed |
 
 ## cuda-core (cutile-rs)
