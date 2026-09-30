@@ -917,6 +917,264 @@ pub fn residency_unset(at: ResidencyAt) -> ResidencyPick {
     ResidencyPick { word, why }
 }
 
+/// The slots a layer the Qwen3.8 unset word frees for flips in flight.
+pub const RESIDENCY38_SPARES: usize = 1;
+
+/// What decides [`RESIDENCY`] unset in `generate_qwen3moe` before any plan:
+/// the file and the run's flags ([`residency38_unset`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Residency38At {
+    /// The file is a qwen4exp one.
+    pub qwen38_file: bool,
+    /// `--dump-taps`: a qwen3moe file's tap dump.
+    pub dump_taps: bool,
+    /// `--place a`: the plan on the A6000.
+    pub place_a: bool,
+    /// `BLOOMERY_ROUTE_TRACE` is set.
+    pub route_trace: bool,
+    /// `--prefill step`: each prompt id a step.
+    pub prefill_step: bool,
+}
+
+/// Why a `generate_qwen3moe` load runs the residency it does with
+/// [`RESIDENCY`] unset; its `Display` is the `residency unset` record's why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Residency38Why {
+    /// Plan (a): P half the plan's fewest card experts a layer, `fewest`.
+    PlanA { fewest: usize },
+    /// `--dump-taps` runs a qwen3moe file.
+    DumpTaps,
+    /// A qwen3moe or qwen35moe file: every routed expert on the card.
+    Family,
+    /// `--place gate` keeps its fixed placement.
+    Gate,
+    /// The route trace records a fixed placement's routing.
+    RouteTrace,
+    /// A step-fed prompt: each prompt id would end a pass the rule counts.
+    PrefillStep,
+    /// The plan holds no routed expert on the card.
+    NoCardExperts,
+    /// The plan's fewest card experts a layer, `fewest`, leave no room for
+    /// half of them pinned, the spares and one that moves.
+    NoRoom { fewest: usize },
+    /// The churn pool at P takes `needs` bytes of host RAM; the plan leaves
+    /// `leaves`.
+    HostShort { needs: u64, leaves: i128 },
+    /// The churn pool at P takes `needs` bytes; the host's `MemAvailable`
+    /// leaves `leaves` past the plan's own host need.
+    MemShort { needs: u64, leaves: i128 },
+}
+
+impl fmt::Display for Residency38Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Residency38Why::PlanA { fewest } => write!(
+                f,
+                "unset: plan (a), P half the plan's fewest card experts a layer ({fewest})"
+            ),
+            Residency38Why::DumpTaps => f.write_str("unset: --dump-taps runs a qwen3moe file"),
+            Residency38Why::Family => f.write_str(
+                "unset: a qwen3moe or qwen35moe file holds every routed expert on the card",
+            ),
+            Residency38Why::Gate => f.write_str("unset: --place gate keeps its fixed placement"),
+            Residency38Why::RouteTrace => {
+                f.write_str("unset: BLOOMERY_ROUTE_TRACE records a fixed placement's routing")
+            }
+            Residency38Why::PrefillStep => f.write_str(
+                "unset: --prefill step feeds each prompt id as a pass the residency rule counts",
+            ),
+            Residency38Why::NoCardExperts => {
+                f.write_str("unset: the plan holds no routed expert on the card")
+            }
+            Residency38Why::NoRoom { fewest } => write!(
+                f,
+                "unset: the plan's fewest card experts a layer ({fewest}) leave no room for half \
+                 of them pinned, {RESIDENCY38_SPARES} spare and one that moves"
+            ),
+            Residency38Why::HostShort { needs, leaves } => write!(
+                f,
+                "unset: the churn pool needs {needs} B, the plan leaves {leaves} B"
+            ),
+            Residency38Why::MemShort { needs, leaves } => write!(
+                f,
+                "unset: the churn pool needs {needs} B, MemAvailable leaves {leaves} B past the \
+                 plan's host need"
+            ),
+        }
+    }
+}
+
+/// The residency a `generate_qwen3moe` load runs with [`RESIDENCY`] unset:
+/// `pinned` seed experts a layer under `mid` with [`RESIDENCY38_SPARES`]
+/// spares, `None` for `off`; and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Residency38Pick {
+    pub pinned: Option<usize>,
+    pub why: Residency38Why,
+}
+
+impl Residency38Pick {
+    fn off(why: Residency38Why) -> Residency38Pick {
+        Residency38Pick { pinned: None, why }
+    }
+
+    /// The word the load runs by: `off` or `mid-p<P>-s<S>`.
+    #[must_use]
+    pub fn word(&self) -> String {
+        match self.pinned {
+            None => "off".to_string(),
+            Some(p) => format!("mid-p{p}-s{RESIDENCY38_SPARES}"),
+        }
+    }
+}
+
+/// [`RESIDENCY`] unset in `generate_qwen3moe`, before the plan: `off` where
+/// the machine does not run — the first of `--dump-taps`, a qwen3moe or
+/// qwen35moe file, `--place gate`, the route trace and a step-fed prompt
+/// names why; `None` when plan (a) decides ([`residency38_at_plan`]).
+#[must_use]
+pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
+    let why = if at.dump_taps {
+        Residency38Why::DumpTaps
+    } else if !at.qwen38_file {
+        Residency38Why::Family
+    } else if !at.place_a {
+        Residency38Why::Gate
+    } else if at.route_trace {
+        Residency38Why::RouteTrace
+    } else if at.prefill_step {
+        Residency38Why::PrefillStep
+    } else {
+        return None;
+    };
+    Some(Residency38Pick::off(why))
+}
+
+/// [`RESIDENCY`] unset on plan (a), from the plan: `card_experts` its card
+/// experts a layer (a layer holding none left out), `pool_bytes` the churn
+/// pool's bytes at P pinned, `headroom` the plan's host headroom and
+/// `mem_left` what the host's `MemAvailable` leaves past the plan's own host
+/// need (the load's check before any upload). P is half the fewest; `off`
+/// when no layer holds one, when the fewest leave no room for P pinned, the
+/// spares and one that moves, or when the pool at P does not fit the
+/// headroom or `mem_left` — a default the user did not set never refuses the
+/// load. An error of `pool_bytes` is the call's.
+pub fn residency38_at_plan<E>(
+    card_experts: impl IntoIterator<Item = u64>,
+    pool_bytes: impl FnOnce(usize) -> Result<u64, E>,
+    headroom: i128,
+    mem_left: i128,
+) -> Result<Residency38Pick, E> {
+    let Some(fewest) = card_experts.into_iter().filter(|&n| n > 0).min() else {
+        return Ok(Residency38Pick::off(Residency38Why::NoCardExperts));
+    };
+    let fewest = usize::try_from(fewest).unwrap_or(usize::MAX);
+    let pinned = fewest / 2;
+    if pinned == 0 || fewest < pinned + RESIDENCY38_SPARES + 1 {
+        return Ok(Residency38Pick::off(Residency38Why::NoRoom { fewest }));
+    }
+    let needs = pool_bytes(pinned)?;
+    if headroom < i128::from(needs) {
+        return Ok(Residency38Pick::off(Residency38Why::HostShort {
+            needs,
+            leaves: headroom,
+        }));
+    }
+    if mem_left < i128::from(needs) {
+        return Ok(Residency38Pick::off(Residency38Why::MemShort {
+            needs,
+            leaves: mem_left,
+        }));
+    }
+    Ok(Residency38Pick {
+        pinned: Some(pinned),
+        why: Residency38Why::PlanA { fewest },
+    })
+}
+
+/// What decides [`DRAFT`] unset on a qwen4exp file in `generate_qwen3moe`
+/// ([`draft38_unset`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Draft38At<'a> {
+    /// `--place a`: the plan on the A6000.
+    pub place_a: bool,
+    /// `--logits`: the step head's row, which a drafted run's last call
+    /// does not leave.
+    pub logits: bool,
+    /// `BLOOMERY_ROUTE_TRACE` is set.
+    pub route_trace: bool,
+    /// The MTP draft file the run would open, and whether a regular file is
+    /// there.
+    pub file: &'a Path,
+    pub file_is_there: bool,
+    /// The positions the drafted run's last window needs at most over the
+    /// run's arms, and `--ctx`.
+    pub need: usize,
+    pub ctx: usize,
+}
+
+/// Why a qwen4exp run of `generate_qwen3moe` drafts nothing; its `Display`
+/// is the `load draft=off` record's why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Draft38Off {
+    /// `BLOOMERY_DRAFT=off`.
+    Set,
+    /// Unset under `--place gate`.
+    Gate,
+    /// Unset beside `--logits`.
+    Logits,
+    /// Unset beside the route trace.
+    RouteTrace,
+    /// Unset, and no regular file where the draft would be opened.
+    NoFile(PathBuf),
+    /// Unset, and the last window needs `need` positions of `ctx`.
+    Ctx { need: usize, ctx: usize },
+}
+
+impl fmt::Display for Draft38Off {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Draft38Off::Set => f.write_str("BLOOMERY_DRAFT=off"),
+            Draft38Off::Gate => f.write_str("unset: --place gate"),
+            Draft38Off::Logits => f.write_str(
+                "unset: --logits reads the step head's row; a drafted run ends on a verify",
+            ),
+            Draft38Off::RouteTrace => {
+                f.write_str("unset: BLOOMERY_ROUTE_TRACE records one step a position")
+            }
+            Draft38Off::NoFile(p) => write!(f, "no file at {}", p.display()),
+            Draft38Off::Ctx { need, ctx } => write!(
+                f,
+                "unset: the last window needs {need} positions, past --ctx {ctx}"
+            ),
+        }
+    }
+}
+
+/// [`DRAFT`] unset on a qwen4exp file in `generate_qwen3moe`: the MTP draft
+/// (`None`) under `--place a` when its file is there; else why not — the
+/// first of `--place gate`, `--logits`, the route trace, no file and a last
+/// window past `--ctx`. None of them refuses the run: the plain path runs.
+#[must_use]
+pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
+    if !at.place_a {
+        Some(Draft38Off::Gate)
+    } else if at.logits {
+        Some(Draft38Off::Logits)
+    } else if at.route_trace {
+        Some(Draft38Off::RouteTrace)
+    } else if !at.file_is_there {
+        Some(Draft38Off::NoFile(at.file.to_path_buf()))
+    } else if at.need > at.ctx {
+        Some(Draft38Off::Ctx {
+            need: at.need,
+            ctx: at.ctx,
+        })
+    } else {
+        None
+    }
+}
+
 /// The host tier's load settings, from a binary's one reading
 /// ([`Levers::host`]): what a placed load does to its plan's host set and to
 /// the card segments' file pages, and where the host tier reads a V4.1 file's

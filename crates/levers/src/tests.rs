@@ -334,12 +334,15 @@ fn accessors_read_their_rows() {
     );
 }
 
-/// `BLOOMERY_DRAFT` takes `mtp` beside the V4.1 words: the row's own kind,
-/// read by the qwen4exp binaries; a word it does not take is refused by name.
+/// `BLOOMERY_DRAFT` takes `mtp` and `off` beside the V4.1 words: the row's
+/// own kind, read by the qwen4exp binaries; a word it does not take is
+/// refused by name.
 #[test]
-fn draft_row_takes_mtp() {
-    let mtp = read(&env(&[(DRAFT, "mtp")]), Scope::Every).expect("mtp is a word the row takes");
-    assert_eq!(mtp.draft(), Some("mtp"));
+fn draft_row_takes_mtp_and_off() {
+    for w in ["mtp", "off"] {
+        let set = read(&env(&[(DRAFT, w)]), Scope::Every).expect("a word the row takes");
+        assert_eq!(set.draft(), Some(w));
+    }
     let Err(other) = read(&env(&[(DRAFT, "draft")]), Scope::Every) else {
         panic!("a word the row does not take is refused");
     };
@@ -431,6 +434,203 @@ fn residency_unset_follows_the_placement() {
     row.kind
         .parse(RESIDENCY_SERVING)
         .unwrap_or_else(|e| panic!("the serving word is not one the row takes: {e}"));
+}
+
+/// `BLOOMERY_RESIDENCY` unset in `generate_qwen3moe`: `off` before the plan
+/// where the machine does not run, the first condition that holds named;
+/// on plan (a) `mid-p<P>-s1`, P half the plan's fewest card experts a layer,
+/// and `off` with why when no layer holds one, when the fewest leave no room,
+/// and when the churn pool at P does not fit the plan's host headroom or
+/// what `MemAvailable` leaves.
+#[test]
+fn residency38_unset_follows_the_plan() {
+    let at = |qwen38_file, dump_taps, place_a, route_trace, prefill_step| Residency38At {
+        qwen38_file,
+        dump_taps,
+        place_a,
+        route_trace,
+        prefill_step,
+    };
+    let off = |why| Some(Residency38Pick { pinned: None, why });
+    for (at, want) in [
+        (at(true, false, true, false, false), None),
+        (
+            at(true, false, false, false, false),
+            off(Residency38Why::Gate),
+        ),
+        (
+            at(true, false, false, true, true),
+            off(Residency38Why::Gate),
+        ),
+        (
+            at(true, false, true, true, false),
+            off(Residency38Why::RouteTrace),
+        ),
+        (
+            at(true, false, true, true, true),
+            off(Residency38Why::RouteTrace),
+        ),
+        (
+            at(true, false, true, false, true),
+            off(Residency38Why::PrefillStep),
+        ),
+        (
+            at(false, false, true, false, false),
+            off(Residency38Why::Family),
+        ),
+        (
+            at(false, false, false, true, true),
+            off(Residency38Why::Family),
+        ),
+        (
+            at(false, true, true, false, false),
+            off(Residency38Why::DumpTaps),
+        ),
+        (
+            at(true, true, true, true, true),
+            off(Residency38Why::DumpTaps),
+        ),
+    ] {
+        assert_eq!(residency38_unset(at), want, "{at:?}");
+    }
+
+    // The pool is 10 B an expert past the pinned ones, on two layers of the
+    // fewest; the headroom takes it or does not.
+    let pool = |fewest: usize| move |p: usize| Ok::<u64, ()>(2 * 10 * (fewest - p) as u64);
+    let pick_mem = |n_l: &[u64], headroom: i128, mem_left: i128| {
+        let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
+        residency38_at_plan(n_l.iter().copied(), pool(fewest), headroom, mem_left)
+            .expect("no pool error")
+    };
+    let pick = |n_l: &[u64], headroom: i128| pick_mem(n_l, headroom, 1 << 40);
+    let derived = pick(&[0, 297, 298, 0, 297], 1 << 40);
+    assert_eq!(
+        derived,
+        Residency38Pick {
+            pinned: Some(148),
+            why: Residency38Why::PlanA { fewest: 297 }
+        }
+    );
+    assert_eq!(derived.word(), "mid-p148-s1");
+    assert_eq!(
+        derived.why.to_string(),
+        "unset: plan (a), P half the plan's fewest card experts a layer (297)"
+    );
+    let row = spec(RESIDENCY).expect("the row");
+    row.kind
+        .parse(&derived.word())
+        .unwrap_or_else(|e| panic!("the derived word at the plain plan's count: {e}"));
+    assert_eq!(pick(&[3, 4], 1 << 40).word(), "mid-p1-s1");
+    for n_l in [&[0u64, 0][..], &[]] {
+        let p = pick(n_l, 1 << 40);
+        assert_eq!(
+            p,
+            Residency38Pick {
+                pinned: None,
+                why: Residency38Why::NoCardExperts
+            }
+        );
+        assert_eq!(p.word(), "off");
+    }
+    for fewest in [1u64, 2] {
+        assert_eq!(
+            pick(&[fewest, 9], 1 << 40),
+            Residency38Pick {
+                pinned: None,
+                why: Residency38Why::NoRoom {
+                    fewest: fewest as usize
+                }
+            }
+        );
+    }
+    // 297 − 148 = 149 experts a layer, 2 layers, 10 B each: 2,980 B.
+    assert_eq!(pick(&[297, 297], 2_980).pinned, Some(148));
+    let short = pick(&[297, 297], 2_979);
+    assert_eq!(
+        short,
+        Residency38Pick {
+            pinned: None,
+            why: Residency38Why::HostShort {
+                needs: 2_980,
+                leaves: 2_979
+            }
+        }
+    );
+    assert_eq!(
+        short.why.to_string(),
+        "unset: the churn pool needs 2980 B, the plan leaves 2979 B"
+    );
+    assert_eq!(
+        pick(&[297], -5).why,
+        Residency38Why::HostShort {
+            needs: 2_980,
+            leaves: -5
+        }
+    );
+    assert_eq!(pick_mem(&[297, 297], 2_980, 2_980).pinned, Some(148));
+    let mem = pick_mem(&[297, 297], 1 << 40, 2_979);
+    assert_eq!(
+        mem.why,
+        Residency38Why::MemShort {
+            needs: 2_980,
+            leaves: 2_979
+        }
+    );
+    assert_eq!(mem.word(), "off");
+    assert_eq!(
+        mem.why.to_string(),
+        "unset: the churn pool needs 2980 B, MemAvailable leaves 2979 B past the plan's host need"
+    );
+    assert_eq!(
+        residency38_at_plan([297u64], |_| Err::<u64, &str>("the pool"), 0, 0),
+        Err("the pool"),
+        "the pool's error is the call's"
+    );
+}
+
+/// `BLOOMERY_DRAFT` unset on a qwen4exp file in `generate_qwen3moe`: the MTP
+/// draft under `--place a` with its file there and room for the last
+/// window; else the plain path, the first condition that holds named.
+#[test]
+fn draft38_unset_follows_the_place_and_the_file() {
+    let file = Path::new("/models/q/mtp.gguf");
+    let at = |place_a, logits, route_trace, file_is_there, need| Draft38At {
+        place_a,
+        logits,
+        route_trace,
+        file,
+        file_is_there,
+        need,
+        ctx: 4352,
+    };
+    for (at, want) in [
+        (at(true, false, false, true, 4194), None),
+        (at(true, false, false, true, 4352), None),
+        (
+            at(true, false, false, true, 4353),
+            Some(Draft38Off::Ctx {
+                need: 4353,
+                ctx: 4352,
+            }),
+        ),
+        (
+            at(true, false, false, false, 4353),
+            Some(Draft38Off::NoFile(file.to_path_buf())),
+        ),
+        (
+            at(true, false, true, false, 1),
+            Some(Draft38Off::RouteTrace),
+        ),
+        (at(true, true, true, false, 1), Some(Draft38Off::Logits)),
+        (at(false, true, true, false, 9999), Some(Draft38Off::Gate)),
+        (at(false, false, false, true, 1), Some(Draft38Off::Gate)),
+    ] {
+        assert_eq!(draft38_unset(&at), want, "{at:?}");
+    }
+    assert_eq!(
+        Draft38Off::NoFile(file.to_path_buf()).to_string(),
+        "no file at /models/q/mtp.gguf"
+    );
 }
 
 /// `BLOOMERY_QWEN38_EXPERTS` unset is the card plan; set, as set.

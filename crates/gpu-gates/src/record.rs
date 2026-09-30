@@ -632,6 +632,17 @@ pub static LOAD_DRAFT: Kind = Kind {
     ],
 };
 
+/// A qwen4exp run of `generate_qwen3moe` that drafts nothing
+/// ([`bloomery_levers::Draft38Off`]).
+pub static LOAD_DRAFT_OFF38: Kind = Kind {
+    name: "load_draft_off38",
+    head: "load draft=off",
+    doc: "A qwen4exp run that drafts nothing, after its load line, and why: BLOOMERY_DRAFT=off, or \
+          unset and the condition that left the plain path (--place gate, --logits, the route \
+          trace, no file where the MTP draft would be opened, or the last window past --ctx).",
+    parts: &[lit(" ("), pos("why", Text, ""), lit(")")],
+};
+
 /// The step's capture.
 pub static CAPTURE: Kind = Kind {
     name: "capture",
@@ -1040,6 +1051,19 @@ pub static RESIDENCY_LEVER: Kind = Kind {
           set, or unset and what picked it (place: the serving placement's default; off under \
           fixed_place, check_finite, route_trace or prefill_steps, where the machine does not run).",
     parts: &[key("residency", Word, ""), key("why", Word, "")],
+};
+
+/// What `BLOOMERY_RESIDENCY` unset resolved to in `generate_qwen3moe`
+/// ([`bloomery_levers::Residency38Pick`]).
+pub static RESIDENCY_UNSET: Kind = Kind {
+    name: "residency_unset",
+    head: "residency unset",
+    doc: "What BLOOMERY_RESIDENCY unset resolved to in generate_qwen3moe: the word the load runs \
+          by (off, or mid-p<P>-s1 on plan (a), P half the plan's fewest card experts a layer) \
+          and why, the condition that picked it (the placement, the flags, the file, or the plan: \
+          no card expert, no room, or the churn pool past the plan's host headroom or past what \
+          MemAvailable leaves).",
+    parts: &[key("residency", Word, ""), key("why", Text, "")],
 };
 
 /// Adaptive residency's host share at the plan
@@ -1736,11 +1760,15 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_LEAK,
 ];
 
-/// What `generate_qwen3moe` prints as records: under `--dump-taps`, after
-/// its `load` line, and under `BLOOMERY_STEP_STATS`, after a qwen4exp run's
-/// lines; the binary's other lines are its own.
+/// What `generate_qwen3moe` prints as records: a qwen4exp load's `plan`,
+/// its residency lever's word (set, before the load; unset, after the
+/// `plan`, or before the load on another family and under `--dump-taps`)
+/// and, drafting nothing, why after the `load` line; under `--dump-taps`,
+/// after its `load` line; and under `BLOOMERY_STEP_STATS`, after a qwen4exp
+/// run's lines; the binary's other lines are its own.
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
+    &LOAD_DRAFT_OFF38,
     &TAPS_SEQ,
     &TAPS_DUMP,
     &MTP_SUMMARY,
@@ -1749,6 +1777,7 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &STAT_PROMPT38_SPLIT,
     &STAT_PROMPT38_LB,
     &RESIDENCY_LEVER,
+    &RESIDENCY_UNSET,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
@@ -1853,6 +1882,14 @@ pub fn residency_lever(pick: bloomery_levers::ResidencyPick) -> Record {
     Record::new(&RESIDENCY_LEVER)
         .w("residency", pick.word)
         .w("why", pick.why.name())
+}
+
+/// The record of what the residency lever unset resolved to in
+/// `generate_qwen3moe`.
+pub fn residency_unset(pick: &bloomery_levers::Residency38Pick) -> Record {
+    Record::new(&RESIDENCY_UNSET)
+        .w("residency", pick.word())
+        .w("why", pick.why)
 }
 
 /// The churn pool's record under the residency word `residency`, against

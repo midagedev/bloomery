@@ -51,7 +51,8 @@
 //! refused while a draft runs (the engine's own rule, a 400 naming the
 //! field). A `load draft=mtp` line follows the `load` line, and
 //! `/props`' `engine.draft` names the draft with its resident bytes as the
-//! card's `draft` class. Every other word of the lever is refused by name.
+//! card's `draft` class. Unset and `off` are the plain path; every other
+//! word of the lever is refused by name.
 //!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
@@ -239,7 +240,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
     let a = parse_args(args)?;
     let mtp = match levers.draft() {
-        None => false,
+        None | Some("off") => false,
         Some("mtp") => true,
         Some(other) => {
             return Err(format!(

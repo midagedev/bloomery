@@ -213,16 +213,30 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: DRAFT,
         class: Class::M,
-        kind: Kind::Words(&["lookup", "dspark", "mtp"]),
-        default: Unset::Means("the plain path, one token a step"),
+        kind: Kind::Words(&["lookup", "dspark", "mtp", "off"]),
+        default: Unset::Means(
+            "the plain path, one token a step; `generate_qwen3moe` on a qwen4exp file under \
+             `--place a`: `mtp` when the MTP draft file is there, else the plain path with a \
+             `load draft=off` record naming why",
+        ),
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
               two-row pass; `generate_qwen3moe` and `bloomery-serve-qwen38` on a qwen4exp \
               file: `mtp` serves the file's MTP draft (`BLOOMERY_MTP_DRAFT`, else the shared \
               draft file beside the target, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`) \
               through a four-row window; the greedy ids are the plain run's. A server refuses a request that \
-              samples or bans an id (a 400 naming the field). Every other binary and family \
-              refuses each word by name.",
+              samples or bans an id (a 400 naming the field). `off` is the plain path on a \
+              qwen4exp file, the same-binary arm of the unset draft. Unset in \
+              `generate_qwen3moe` on a qwen4exp file follows the placement \
+              (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft runs when a \
+              regular file is where it would be opened (`BLOOMERY_MTP_DRAFT`, else the shared \
+              draft beside the target, else the family's path); the plain path runs under \
+              `--place gate`, beside `--logits` or `BLOOMERY_ROUTE_TRACE`, with no file there, \
+              and when an arm's last four-row window would pass `--ctx` (depth + n + 2 \
+              positions) — each printed as a `load draft=off (<why>)` record after the `load` \
+              line (`no file at <path>` for the missing file), never a refusal. \
+              `bloomery-serve-qwen38` keeps unset as the plain path. Every other binary and \
+              family refuses each word by name, `off` included.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
@@ -246,11 +260,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             "the shared draft file beside the target, by the name the qwen4exp MTP family's \
              path gives it; with no such file there, that path",
         ),
-        doc: "Qwen3.8's MTP draft under `BLOOMERY_DRAFT=mtp`: the draft file \
+        doc: "Qwen3.8's MTP draft, when the run drafts (`BLOOMERY_DRAFT=mtp`, or unset in \
+              `generate_qwen3moe` under `--place a`): the draft file \
               `generate_qwen3moe` and `bloomery-serve-qwen38` open (and `gate_qwen38_serve`, \
               which starts that server). A path with no regular file is refused at `main`, and \
-              the lever set without `BLOOMERY_DRAFT=mtp` by each of them. The MTP draft gate \
-              opens the file its reference set states and does not act on it.",
+              the lever set on a run that drafts nothing by each of them, naming why. The MTP \
+              draft gate opens the file its reference set states and does not act on it.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
@@ -331,7 +346,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means(
             "V4.1 follows the placement: `mid-p40-s1` under `--place a` and `bp`, `off` under \
              `gate`, beside `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or \
-             `BLOOMERY_PREFILL=steps`; `off` in `generate_qwen3moe` and in every other binary",
+             `BLOOMERY_PREFILL=steps`; `generate_qwen3moe` on a qwen4exp file follows its plan: \
+             `mid-p<P>-s1` under `--place a`, P half the plan's fewest card experts a layer, \
+             `off` under `--place gate`, beside `BLOOMERY_ROUTE_TRACE`, `--prefill step` or \
+             `--dump-taps`, on a qwen3moe or qwen35moe file, and on plan (a) when the plan \
+             leaves no room for the word, or its host headroom or `MemAvailable` none for its \
+             churn pool; `off` in \
+             every other binary",
         ),
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
@@ -350,14 +371,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               binaries print the word and why as a `residency lever` record before the load. \
               Set, `mid-…` is refused by name under `--place gate`, beside the finite probe, \
               the route trace and the step feed. Qwen3.8 (`generate_qwen3moe` on a qwen4exp \
-              file, `--place a` or `gate`, plain or `BLOOMERY_DRAFT=mtp`): unset is `off`; its \
-              `--place a` word is `mid-p148-s1`, half the fewest card experts a layer keeps \
-              there, below both the plain and the MTP plan's count; set, \
+              file, `--place a` or `gate`, plain or `BLOOMERY_DRAFT=mtp`): unset follows the \
+              plan (`bloomery_levers::residency38_unset`, `residency38_at_plan`) — under \
+              `--place a` `mid-p<P>-s1`, P half the fewest card experts a layer of the plan \
+              the load runs (the plain or the MTP plan, at its `--ctx`), derived at load so \
+              the default always fits the plan; `off` under `--place gate`, beside \
+              `BLOOMERY_ROUTE_TRACE`, with `--prefill step`, under `--dump-taps`, on a \
+              qwen3moe or qwen35moe file, when the plan holds no card expert or its fewest \
+              leave no room for P pinned, one spare and one that moves, and when the churn \
+              pool at P does not fit the plan's host headroom or what the host's \
+              `MemAvailable` leaves past the plan's host need — never a refusal; the word and \
+              why print as a `residency unset` record after the `plan` line (on a qwen3moe or \
+              qwen35moe file, and under `--dump-taps`, before the load). \
+              `mid-p148-s1` is the word a set lever names for plan (a) at the plain plan's \
+              count; set, \
               `mid-…` runs the same machine over the card's routed stacks, the load's host set \
               holds the churn pool, refused by name as above, and prints `residency host`, and \
               each arm prints its `residency pass` records after its lines; an arm's clear \
-              resets it, with a `residency reset` record; the word and why \
-              print as a `residency lever` record before the load. There `mid-…` is refused by \
+              resets it, with a `residency reset` record; a set word and \
+              `why=set` print as a `residency lever` record before the load. There `mid-…` is refused by \
               name beside `BLOOMERY_ROUTE_TRACE` (a fixed placement's routing), with a step-fed \
               prompt (`--prefill step`, at the prompt), on a qwen3moe or qwen35moe file and under \
               `--dump-taps`. `bloomery-serve-qwen38` does not take it yet. Every other binary \

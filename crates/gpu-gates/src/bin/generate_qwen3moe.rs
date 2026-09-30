@@ -78,20 +78,40 @@
 //! every arm writes when they all write the same count. The run ends with
 //! `route trace <dir> positions=<n> complete` once the set is sealed.
 //!
-//! `BLOOMERY_RESIDENCY` resolves first thing, unset to `off`, and prints as a
-//! `residency lever` record on every run. Set to `mid-p<P>-s<S>` on a
+//! `BLOOMERY_RESIDENCY` set prints as a `residency lever` record first
+//! thing. Unset, the Qwen3.8 rule picks the word
+//! (`bloomery_levers::residency38_unset`, `residency38_at_plan`) and a
+//! `residency unset` record prints it with why: on a qwen4exp file under
+//! `--place a` `mid-p<P>-s1`, P half the fewest card experts a layer of the
+//! plan the load runs, after the `plan` line; `off` under `--place gate`,
+//! beside `BLOOMERY_ROUTE_TRACE`, with `--prefill step`, when the plan holds
+//! no card expert or its fewest leave no room, and when the churn pool does
+//! not fit the plan's host headroom or what `MemAvailable` leaves past the
+//! plan's host need (after the `plan` line too), and on a
+//! qwen3moe or qwen35moe file and under `--dump-taps` (before the load) —
+//! never a refusal. Running `mid-p<P>-s<S>` on a
 //! qwen4exp file (plain or drafted, either `--place`), the load runs the
 //! common residency machine over the card's routed stacks
 //! (`Body38::open_placed_residency`): a `residency host` record follows the
 //! `plan` line, each arm prints its boundaries' `residency pass` records
 //! after its other lines — after its error, when it failed — and each arm
 //! after the first opens with the `residency reset` record of the clear
-//! before it. `mid-…` is
+//! before it. A set `mid-…` is
 //! refused by name on a qwen3moe or qwen35moe file, under `--dump-taps` and
-//! beside `BLOOMERY_ROUTE_TRACE`, and by the body at a step-fed prompt.
+//! beside `BLOOMERY_ROUTE_TRACE`, when the plan's host headroom cannot take
+//! its churn pool, and by the body at a step-fed prompt.
 //!
-//! Under `BLOOMERY_DRAFT=mtp` (a qwen4exp file only; every other family and
-//! word is refused by name) the decode runs through the runtime's
+//! `BLOOMERY_DRAFT` unset on a qwen4exp file follows the placement
+//! (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft runs
+//! when a regular file is where it would be opened; the plain path runs
+//! under `--place gate`, beside `--logits` or `BLOOMERY_ROUTE_TRACE`, with no
+//! file there, and when an arm's last window would pass `--ctx` (depth + n +
+//! 2 positions), with a `load draft=off (<why>)` record after the `load`
+//! line — `no file at <path>` for the missing file — never a refusal.
+//! `BLOOMERY_DRAFT=off` is the plain path with the same record.
+//!
+//! Drafting (`BLOOMERY_DRAFT=mtp`, or unset as above; a qwen4exp file only,
+//! every other family and word refused by name) the decode runs through the runtime's
 //! speculative loop with the file's MTP draft (`app::arch::qwen4exp`'s
 //! `MtpDraft` over the shared draft file beside the target or
 //! `BLOOMERY_MTP_DRAFT`'s, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`):
@@ -213,7 +233,7 @@ mod cli {
     use super::taps;
     use app::Session;
     use app::arch::qwen3moe::Q38Cfg;
-    use app::mtp::MtpDraft;
+    use app::mtp::{MtpBody, MtpDraft};
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
@@ -229,7 +249,10 @@ mod cli {
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
-    use bloomery_levers::{Levers, ResidencyAt, ResidencyPick};
+    use bloomery_levers::{
+        Draft38At, Draft38Off, Levers, RESIDENCY38_SPARES, Residency38At, Residency38Pick,
+        ResidencyPick, ResidencyWhy, draft38_unset, residency38_at_plan, residency38_unset,
+    };
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::Arch;
@@ -238,7 +261,7 @@ mod cli {
         Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
     };
     use model::placement::churn::ChurnPool;
-    use model::placement::workstation::{A6000, RTX_3090};
+    use model::placement::workstation::{A6000, HostNeed, RTX_3090, host_available};
     use model::placement::{Plan, PlanLevers};
     use refset::arch::qwen4exp::mtp::draft_file;
     use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
@@ -716,7 +739,7 @@ mod cli {
     }
 
     /// Where `--place` puts a qwen4exp plan's one card.
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum Place38 {
         /// The A6000, the timing card (the default).
         A,
@@ -793,11 +816,17 @@ mod cli {
             bloomery_levers::RESIDENCY,
         ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
-        // Unset is `off` here: the machine runs over a qwen4exp load only when
-        // the lever asks for it.
-        let pick = levers.residency_at(ResidencyAt::FIXED);
-        record::residency_lever(pick).print();
-        let residency = Residency::parse(pick.word)?;
+        // Set, the word runs as given; unset, the Qwen3.8 rule picks it once
+        // the file, the flags and plan (a) are known (`residency unset`).
+        if let Some(word) = levers.residency() {
+            record::residency_lever(ResidencyPick {
+                word,
+                why: ResidencyWhy::Set,
+            })
+            .print();
+        }
+        let word_set = levers.residency().unwrap_or("off");
+        let residency = Residency::parse(word_set)?;
         let experts = experts38(&levers)?;
         // Unset, the lever is a qwen4exp plan's card experts and nothing on
         // another family's file; only a set `card` is refused there.
@@ -826,12 +855,21 @@ mod cli {
             }
             if residency != Residency::Off {
                 return Err(format!(
-                    "BLOOMERY_RESIDENCY={} moves a qwen4exp plan's card experts; --dump-taps runs \
-                     a qwen3moe file",
-                    pick.word
+                    "BLOOMERY_RESIDENCY={word_set} moves a qwen4exp plan's card experts; \
+                     --dump-taps runs a qwen3moe file"
                 )
                 .into());
             }
+            residency_unset_early(
+                &levers,
+                Residency38At {
+                    qwen38_file: false,
+                    dump_taps: true,
+                    place_a: false,
+                    route_trace: false,
+                    prefill_step: false,
+                },
+            );
             return dump_taps(&dir);
         }
         let timed = std::env::args().any(|a| a == "--time");
@@ -868,81 +906,6 @@ mod cli {
         let t = Instant::now();
         let (file, family) = open_file()?;
         let prefill = prefill.as_deref();
-        let draft = match family {
-            Family::Qwen38 => draft38(&levers)?,
-            other => {
-                draft_refused_on_other(&levers, other)?;
-                Draft38::Off
-            }
-        };
-        let chosen = match family {
-            Family::Qwen3 => Chosen::Qwen3(Body::path(prefill)?),
-            Family::Qwen35 => Chosen::Qwen35(Body35::path(prefill)?),
-            Family::Qwen38 => {
-                if let Some(d) = seed_depth {
-                    return Err(no_seed38(d));
-                }
-                Chosen::Qwen38(
-                    Body38::path(prefill)?,
-                    Place38::parse(place.as_deref())?,
-                    draft,
-                )
-            }
-        };
-        if family != Family::Qwen38 && place.is_some() {
-            return Err(
-                "--place picks a qwen4exp plan's card; a qwen3moe or qwen35moe file runs on the \
-                 card box.sh puts in view"
-                    .into(),
-            );
-        }
-        if family != Family::Qwen38 && card_set {
-            return Err(
-                "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a \
-                 qwen3moe or qwen35moe file has no host tier"
-                    .into(),
-            );
-        }
-        if family != Family::Qwen38 && levers.route_trace().is_some() {
-            return Err(
-                "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's routing; a qwen3moe or \
-                 qwen35moe plan holds every one on the card"
-                    .into(),
-            );
-        }
-        if family != Family::Qwen38 && residency != Residency::Off {
-            return Err(format!(
-                "BLOOMERY_RESIDENCY={} moves a qwen4exp plan's card experts; a qwen3moe or \
-                 qwen35moe plan holds every one on the card",
-                pick.word
-            )
-            .into());
-        }
-        // The trace is the input the residency model replays under a fixed
-        // seed; under the machine its slot files would record the machine's
-        // own moves.
-        if residency != Residency::Off && levers.route_trace().is_some() {
-            return Err(format!(
-                "BLOOMERY_ROUTE_TRACE records a fixed placement's routing; \
-                 BLOOMERY_RESIDENCY={} moves the slot map under it",
-                pick.word
-            )
-            .into());
-        }
-        if family == Family::Qwen38 && draft == Draft38::Off && levers.mtp_head_rows().is_some() {
-            return Err(
-                "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; it needs BLOOMERY_DRAFT=mtp \
-                 on a qwen4exp file"
-                    .into(),
-            );
-        }
-        if draft == Draft38::Off && levers.mtp_draft().is_some() {
-            return Err(
-                "BLOOMERY_MTP_DRAFT names the MTP draft file; it needs BLOOMERY_DRAFT=mtp on a \
-                 qwen4exp file"
-                    .into(),
-            );
-        }
         let arms: Vec<Arm> = if arm_specs.is_empty() {
             let ids: Vec<u32> = match (&text, &tokens, seed_depth) {
                 (Some(t), _, _) => tok.as_ref().ok_or("no tokenizer")?.encode(t, true, false),
@@ -982,6 +945,103 @@ mod cli {
                 );
             }
         }
+        let (chosen, draft_off) = match family {
+            Family::Qwen3 => {
+                draft_refused_on_other(&levers, family)?;
+                (Chosen::Qwen3(Body::path(prefill)?), None)
+            }
+            Family::Qwen35 => {
+                draft_refused_on_other(&levers, family)?;
+                (Chosen::Qwen35(Body35::path(prefill)?), None)
+            }
+            Family::Qwen38 => {
+                if let Some(d) = seed_depth {
+                    return Err(no_seed38(d));
+                }
+                let place = Place38::parse(place.as_deref())?;
+                let (draft, off) = draft38(&levers, place, logits, &arms, ctx)?;
+                (Chosen::Qwen38(Body38::path(prefill)?, place, draft), off)
+            }
+        };
+        let draft = match chosen {
+            Chosen::Qwen38(_, _, d) => d,
+            Chosen::Qwen3(_) | Chosen::Qwen35(_) => Draft38::Off,
+        };
+        if family != Family::Qwen38 && place.is_some() {
+            return Err(
+                "--place picks a qwen4exp plan's card; a qwen3moe or qwen35moe file runs on the \
+                 card box.sh puts in view"
+                    .into(),
+            );
+        }
+        if family != Family::Qwen38 && card_set {
+            return Err(
+                "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a \
+                 qwen3moe or qwen35moe file has no host tier"
+                    .into(),
+            );
+        }
+        if family != Family::Qwen38 && levers.route_trace().is_some() {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's routing; a qwen3moe or \
+                 qwen35moe plan holds every one on the card"
+                    .into(),
+            );
+        }
+        if family != Family::Qwen38 && residency != Residency::Off {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={word_set} moves a qwen4exp plan's card experts; a qwen3moe \
+                 or qwen35moe plan holds every one on the card"
+            )
+            .into());
+        }
+        // The trace is the input the residency model replays under a fixed
+        // seed; under the machine its slot files would record the machine's
+        // own moves.
+        if residency != Residency::Off && levers.route_trace().is_some() {
+            return Err(format!(
+                "BLOOMERY_ROUTE_TRACE records a fixed placement's routing; \
+                 BLOOMERY_RESIDENCY={word_set} moves the slot map under it"
+            )
+            .into());
+        }
+        // Why the run drafts nothing, as a refusal of a draft lever names it.
+        let no_draft = |need: &str| match &draft_off {
+            Some(why) => format!("the run drafts nothing ({why})"),
+            None => format!("it needs {need}"),
+        };
+        if family == Family::Qwen38 && draft == Draft38::Off && levers.mtp_head_rows().is_some() {
+            return Err(format!(
+                "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; {}",
+                no_draft("BLOOMERY_DRAFT=mtp on a qwen4exp file")
+            )
+            .into());
+        }
+        if draft == Draft38::Off && levers.mtp_draft().is_some() {
+            return Err(format!(
+                "BLOOMERY_MTP_DRAFT names the MTP draft file; {}",
+                no_draft("BLOOMERY_DRAFT=mtp on a qwen4exp file")
+            )
+            .into());
+        }
+        let (place_a, prefill_step) = match chosen {
+            Chosen::Qwen38(path, place, _) => (place == Place38::A, path == Prompt38::Step),
+            Chosen::Qwen3(_) | Chosen::Qwen35(_) => (false, false),
+        };
+        let at = Residency38At {
+            qwen38_file: family == Family::Qwen38,
+            dump_taps: false,
+            place_a,
+            route_trace: levers.route_trace().is_some(),
+            prefill_step,
+        };
+        if family != Family::Qwen38 {
+            residency_unset_early(&levers, at);
+        }
+        let lever38 = match levers.residency() {
+            Some(_) => Lever38::Set(residency, word_set),
+            None => Lever38::Unset(residency38_unset(at)),
+        };
         if matches!(chosen, Chosen::Qwen35(PrefillPath::Pass))
             && logits
             && arms.iter().any(|a| a.n_gen == 1)
@@ -1039,12 +1099,12 @@ mod cli {
                         arms_chunk(&arms),
                         timed,
                     )?;
-                    let mut m = open_qwen38(
+                    let (mut m, residency) = open_qwen38(
                         file,
                         &levers,
                         (ctx, mode),
                         (path, place, experts),
-                        (residency, pick),
+                        (lever38, draft_off.as_ref()),
                         t,
                     )?;
                     log38(&mut m, residency, &arms)?;
@@ -1065,12 +1125,12 @@ mod cli {
                                 .into(),
                         );
                     }
-                    let (mut m, cfg) = open_qwen38_mtp(
+                    let (mut m, cfg, residency) = open_qwen38_mtp(
                         file,
                         &levers,
                         (ctx, mode),
                         (path, place, experts),
-                        (residency, pick),
+                        lever38,
                         t,
                     )?;
                     log38(&mut m, residency, &arms)?;
@@ -1104,17 +1164,72 @@ mod cli {
         Mtp,
     }
 
-    /// `BLOOMERY_DRAFT` on a qwen4exp file: unset the plain path, `mtp` the
-    /// MTP draft; the V4.1 words and any other are refused by name.
-    fn draft38(levers: &Levers) -> Result<Draft38, GateError> {
+    /// `BLOOMERY_DRAFT` on a qwen4exp file run at `place` over `arms` with
+    /// `--ctx` `ctx`: `mtp` the MTP draft, `off` the plain path; unset, the
+    /// rule's (`bloomery_levers::draft38_unset`); and, drafting nothing, why
+    /// (the `load draft=off` record's). The V4.1 words and any other are
+    /// refused by name.
+    fn draft38(
+        levers: &Levers,
+        place: Place38,
+        logits: bool,
+        arms: &[Arm],
+        ctx: usize,
+    ) -> Result<(Draft38, Option<Draft38Off>), GateError> {
         match levers.draft() {
-            None => Ok(Draft38::Off),
-            Some("mtp") => Ok(Draft38::Mtp),
+            Some("mtp") => Ok((Draft38::Mtp, None)),
+            Some("off") => Ok((Draft38::Off, Some(Draft38Off::Set))),
             Some(other) => Err(format!(
-                "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window; lookup and \
-                 dspark are the V4.1 binaries'"
+                "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window and off runs \
+                 the plain path; lookup and dspark are the V4.1 binaries'"
             )
             .into()),
+            None => {
+                let (file, _) = draft_file(levers.mtp_draft(), &ref_model_path()?);
+                // The generation loop runs a window of ROWS rows only while
+                // they fit (`runtime::Stop::check`): at `e` tokens emitted the
+                // target stands at depth + e − 1, and the last check before
+                // -n is at e = n − 1.
+                let rows = <Body38 as MtpBody>::VERIFY_ROWS;
+                let need = arms
+                    .iter()
+                    .map(|a| a.ids.len() + a.n_gen + rows - 2)
+                    .max()
+                    .unwrap_or(0);
+                let at = Draft38At {
+                    place_a: place == Place38::A,
+                    logits,
+                    route_trace: levers.route_trace().is_some(),
+                    file: &file,
+                    file_is_there: file.is_file(),
+                    need,
+                    ctx,
+                };
+                Ok(match draft38_unset(&at) {
+                    None => (Draft38::Mtp, None),
+                    Some(off) => (Draft38::Off, Some(off)),
+                })
+            }
+        }
+    }
+
+    /// `BLOOMERY_RESIDENCY` as a qwen4exp load takes it: a set word, or
+    /// unset and what the rule decided before the plan — `None` when plan
+    /// (a) decides.
+    #[derive(Clone, Copy)]
+    enum Lever38 {
+        Set(Residency, &'static str),
+        Unset(Option<Residency38Pick>),
+    }
+
+    /// Unset, the `residency unset` record of a run the rule decides with no
+    /// plan (`--dump-taps`, another family's file); nothing when set.
+    fn residency_unset_early(levers: &Levers, at: Residency38At) {
+        if levers.residency().is_some() {
+            return;
+        }
+        if let Some(pick) = residency38_unset(at) {
+            record::residency_unset(&pick).print();
         }
     }
 
@@ -1405,18 +1520,20 @@ mod cli {
 
     /// The Qwen3.8-Flash-Next model of `file`, placed by its plan on the
     /// card `place` names, its routed experts where `experts` says, under
-    /// `residency` (the lever's word `pick`): the `plan` line, under `mid`
-    /// the `residency host` line, the `load` line, and in graph mode the step
+    /// the residency `lever` resolves over the plan ([`residency38`]): the
+    /// `plan` line, the `residency unset` line when the lever is unset, under
+    /// `mid` the `residency host` line, the `load` line, `load draft=off`
+    /// with why when `draft_off` names one, and in graph mode the step
     /// captured and its `capture` line, its node kinds held to the program's
-    /// count.
+    /// count. Returns the residency the load runs.
     fn open_qwen38(
         file: Split,
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
         (path, place, experts): (Prompt38, Place38, Experts),
-        (residency, pick): (Residency, ResidencyPick),
+        (lever, draft_off): (Lever38, Option<&Draft38Off>),
         t: Instant,
-    ) -> Result<Qwen38Model, GateError> {
+    ) -> Result<(Qwen38Model, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
         let card = match place {
             Place38::A => A6000,
@@ -1442,7 +1559,7 @@ mod cli {
                 .u("card_experts", plan.cards[0].experts)
                 .line()
         );
-        residency_host38(&plan, residency, pick)?;
+        let residency = residency38(&plan, lever)?;
         let mut m = Body38::open_placed_residency(
             file,
             &plan,
@@ -1467,13 +1584,17 @@ mod cli {
             body.card_layers(),
             t.elapsed().as_secs_f64()
         );
+        if let Some(why) = draft_off {
+            Record::new(&record::LOAD_DRAFT_OFF38).w("why", why).print();
+        }
         capture38_check(&mut m)?;
-        Ok(m)
+        Ok((m, residency))
     }
 
     /// The Qwen3.8-Flash-Next model of `file` with its MTP draft loaded
     /// beside it (`Body38::open_placed_mtp_residency`, the draft file `draft_file`
-    /// picks, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`): the `plan`,
+    /// picks, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`), the residency
+    /// `lever` resolves over the MTP plan: the `plan`, `residency unset`,
     /// `residency host`, `load`, `load draft=mtp` and `capture` lines of the
     /// plain open, the draft's own
     /// resident bytes, its program's arena and its head named on the draft's
@@ -1484,9 +1605,9 @@ mod cli {
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
         (path, place, experts): (Prompt38, Place38, Experts),
-        (residency, pick): (Residency, ResidencyPick),
+        lever: Lever38,
         t: Instant,
-    ) -> Result<(Qwen38Model, Q38Cfg), GateError> {
+    ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
         let card = match place {
             Place38::A => A6000,
@@ -1526,7 +1647,7 @@ mod cli {
                 .u("card_experts", plan.plan.cards[0].experts)
                 .line()
         );
-        residency_host38(&plan.plan, residency, pick)?;
+        let residency = residency38(&plan.plan, lever)?;
         let mut m = Body38::open_placed_mtp_residency(
             file,
             &plan,
@@ -1573,28 +1694,62 @@ mod cli {
                 prompt: path,
                 draft: mode,
             },
+            residency,
         ))
     }
 
     /// The plan's card a qwen4exp open loads: its one card.
     const CARD38: usize = 0;
 
-    /// Under `mid`, the `residency host` record of `plan`: the churn pool
-    /// (card [`CARD38`]'s experts past the pinned ones) the load's host set
-    /// holds beside the plan's host segments, which the load refuses by name
-    /// when the plan's host headroom cannot take it; nothing under `off`.
-    fn residency_host38(
-        plan: &Plan<'_>,
-        residency: Residency,
-        pick: ResidencyPick,
-    ) -> Result<(), GateError> {
+    /// The residency a load of `plan` runs under `lever`: a set word as
+    /// given; unset, the rule's before the plan or on plan (a) from it
+    /// (`bloomery_levers::residency38_at_plan`: P half the fewest card
+    /// experts a layer, `off` with why where the plan has no room, or the
+    /// plan's host headroom or `MemAvailable` none for the churn pool), its
+    /// `residency unset` record printed.
+    /// Under `mid`, the `residency host` record of `plan` follows: the churn
+    /// pool (card [`CARD38`]'s experts past the pinned ones) the load's host
+    /// set holds beside the plan's host segments, which the load refuses by
+    /// name for a set word when the plan's host headroom cannot take it.
+    fn residency38(plan: &Plan<'_>, lever: Lever38) -> Result<Residency, GateError> {
+        let (residency, word) = match lever {
+            Lever38::Set(r, word) => (r, word.to_string()),
+            Lever38::Unset(pre) => {
+                let pick = match pre {
+                    Some(off) => off,
+                    None => {
+                        // The load refuses a host set past `MemAvailable`
+                        // before any upload; the default leaves the pool out
+                        // instead.
+                        let available = host_available()?;
+                        let need = HostNeed::of(plan, 0).bytes();
+                        residency38_at_plan(
+                            plan.n_l.iter().copied(),
+                            |pinned| ChurnPool::of(plan, CARD38, pinned).map(|pool| pool.bytes),
+                            plan.host.headroom_bytes,
+                            i128::from(available) - i128::from(need),
+                        )
+                        .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
+                    }
+                };
+                record::residency_unset(&pick).print();
+                let residency = match pick.pinned {
+                    None => Residency::Off,
+                    Some(pinned) => Residency::Mid {
+                        pinned,
+                        spares: RESIDENCY38_SPARES,
+                    },
+                };
+                (residency, pick.word())
+            }
+        };
         let Residency::Mid { pinned, .. } = residency else {
-            return Ok(());
+            return Ok(residency);
         };
         let pool = ChurnPool::of(plan, CARD38, pinned)
-            .map_err(|e| format!("BLOOMERY_RESIDENCY={}: the churn pool: {e}", pick.word))?;
-        record::residency_host(pick.word, &pool, plan).print();
-        Ok(())
+            .map_err(|e| format!("BLOOMERY_RESIDENCY={word}: the churn pool: {e}"))?;
+        record::residency_host(&word, &pool, plan).print();
+        Ok(residency)
     }
 
     /// Under `mid`, keep the residency boundaries' reports for the `residency
