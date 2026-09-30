@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The depth-qwen3moe.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_QWEN3MOE_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
-# timing-card.sh, lease-probe.sh, tdist.py, load-groups.sh, lcpp-fit.sh, cold-blocks.sh and
+# timing-card.sh, lease-probe.sh, tdist.py, load-groups.sh, lcpp-fit.sh, cold-blocks.sh, lever-arms.sh and
 # lcpp-warm.sh, and a copy of lease.sh whose lease_take is replaced by a line that takes nothing; cards.sh
 # there is depth-stub-cards.sh's, two made-up UUIDs;
 # ref-paths.sh there is a stub qwen4exp profile whose engines are stub scripts (llama-bench as lcpp and ik,
@@ -121,7 +121,7 @@ mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/base/target/
 cp "$RUNNER" "$T/tools/ref/depth-qwen3moe.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/load-groups.sh" \
-  "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$ROOT/tools/ref/lever-arms.sh" "$T/tools/ref/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
 # records.py and the checked-in schemas: the runner reads the arm's residency, mtp and stat records by kind.
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
