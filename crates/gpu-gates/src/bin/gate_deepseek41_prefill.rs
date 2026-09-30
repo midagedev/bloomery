@@ -2385,7 +2385,7 @@ mod gate {
                         format!("{NAME}: the features after step {p} name {}", f.pos).into(),
                     );
                 }
-                taps.push(md5(bytes_of(f.values)));
+                taps.push(md5(&bytes_of(f.values)));
             }
             let at = p + 1;
             if wanted.contains(&at) {
@@ -2416,7 +2416,7 @@ mod gate {
                     .ok_or_else(|| format!("{NAME}: no shadow for layer {l}"))?;
                 Ok(host[..n * hp.head_dim]
                     .chunks_exact(hp.head_dim)
-                    .map(|r| md5(bytes_of(r)))
+                    .map(|r| md5(&bytes_of(r)))
                     .collect())
             })
             .collect()
@@ -2439,7 +2439,7 @@ mod gate {
         for &n in parts {
             let mut feed = |first: u32, rows: &[f32]| -> Result<(), GpuError> {
                 for (i, r) in rows.chunks_exact(width).enumerate() {
-                    taps.push((first as usize + i, md5(bytes_of(r))));
+                    taps.push((first as usize + i, md5(&bytes_of(r))));
                 }
                 Ok(())
             };
@@ -2729,8 +2729,8 @@ mod gate {
             s.state.push(match (st.values, st.scores) {
                 (Some(v), Some(sc)) => {
                     let mut h = Md5::new();
-                    h.update(bytes_of(&tensor_host(stream, v, None)?));
-                    h.update(bytes_of(&tensor_host(stream, sc, None)?));
+                    h.update(&bytes_of(&tensor_host(stream, v, None)?));
+                    h.update(&bytes_of(&tensor_host(stream, sc, None)?));
                     Some(h.finish())
                 }
                 _ => None,
@@ -3036,14 +3036,14 @@ mod gate {
         Ok(host)
     }
 
-    fn md5_of<T: DeviceCopy + Default + Clone>(
+    fn md5_of<T: DeviceCopy + Default + Clone + NeBytes>(
         stream: &cuda_core::CudaStream,
         t: &DeviceTensor<T>,
         rows: Option<usize>,
     ) -> Result<Digest, GateError> {
         let host = tensor_host(stream, t, rows)?;
         let mut h = Md5::new();
-        h.update(bytes_of(&host));
+        h.update(&bytes_of(&host));
         Ok(h.finish())
     }
 
@@ -3058,12 +3058,33 @@ mod gate {
         v.iter().map(|x| x.to_bits()).collect()
     }
 
-    /// The bytes of `v`, as the host holds them.
-    fn bytes_of<T: DeviceCopy>(v: &[T]) -> &[u8] {
-        // SAFETY: `T` is a plain device-copyable value type (no padding in
-        // the u16/u32/f32 the gate reads); the slice covers exactly `v`'s
-        // initialized bytes and borrows `v`.
-        unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
+    /// One value's bytes as the host holds them, for a hash that reads the
+    /// memory image the device tap wrote. The gate's taps are u16 and f32.
+    trait NeBytes: DeviceCopy {
+        /// Append this value's bytes, in host order.
+        fn write_ne(&self, out: &mut Vec<u8>);
+    }
+
+    impl NeBytes for u16 {
+        fn write_ne(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&self.to_ne_bytes());
+        }
+    }
+
+    impl NeBytes for f32 {
+        fn write_ne(&self, out: &mut Vec<u8>) {
+            out.extend_from_slice(&self.to_ne_bytes());
+        }
+    }
+
+    /// The bytes of `v`, as the host holds them: one `to_ne_bytes` copy per
+    /// value, in order.
+    fn bytes_of<T: NeBytes>(v: &[T]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(std::mem::size_of_val(v));
+        for x in v {
+            x.write_ne(&mut out);
+        }
+        out
     }
 
     /// The md5 of the per-layer md5s, in order: a field's one printed value.
