@@ -226,7 +226,10 @@ mod qwen3moe_expert_kernels {
             return;
         }
         let t = i / rows_u;
-        let acc = weighted_expert_sum(down, w, rows, n_slots, t, i - t * rows_u);
+        // SAFETY: i < rows·m (the guard above) gives t < m and i - t·rows <
+        // rows; the launch contract gives down.len() >= rows·n_slots·m and
+        // w.len() >= n_slots·m.
+        let acc = unsafe { weighted_expert_sum(down, w, rows, n_slots, t, i - t * rows_u) };
         // SAFETY: i < rows·m bounds the resid read and the y store by the
         // launch contract.
         unsafe {

@@ -1245,11 +1245,13 @@ mod gate {
         if !n.is_multiple_of(256) || row.len() != n / 256 * 110 {
             return Err(format!("a Q3_K row of {} bytes for {n} values", row.len()).into());
         }
-        // q3k_embed_value's contract: super-block `i / 256` ends at byte
-        // 110·(i/256 + 1) <= row.len() <= 4·words.len(), and starts 0 or 2
-        // mod 4.
         let q3k = (0..n)
-            .map(|i| q3k_embed_value(&words, 110 * (i / 256), i % 256))
+            // The super-block starts 0 or 2 mod 4, the two alignments the core
+            // funnels.
+            // SAFETY: i < n and row.len() == n / 256 · 110 (checked above), so
+            // super-block `i / 256` ends at byte 110·(i/256 + 1) <= row.len()
+            // <= 4·words.len(); i % 256 < 256.
+            .map(|i| unsafe { q3k_embed_value(&words, 110 * (i / 256), i % 256) })
             .collect();
         Ok((deq, Some(q3k)))
     }
