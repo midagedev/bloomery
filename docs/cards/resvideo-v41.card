@@ -1,0 +1,37 @@
+# The adaptive-residency video's three arms on plan (a), one lease: no residency (the id-prefix seed, static),
+# the residency with the decode rule only (BLOOMERY_HOSTSTREAM=0), and the residency with the prompt call's picks
+# kept for the decode (streaming on). Decode after the call is the term. The streaming arm against the decode-rule
+# arm was 1.201 / 1.156 after prose 512 / 4096 (rig-log 09-30#callstream-pp-a, 2 rounds, 36.05 -> 43.30 and
+# 31.81 -> 36.77 tok/s). The decode-rule arm against no residency is resv41's prediction +8..+24 % (the replay's
+# in-request hit 46.5 % -> the 96-token window's, at the step model 10 ms + 0.139 ms a host slot, rig-log 09-29)
+# [derived]. The product is +30..+49 % after prose 512 [derived: 1.08 x 1.201 = 1.297, 1.24 x 1.201 = 1.489]; the
+# 4096 rows are read beside against +25..+43 % (the same product with 1.156). The hit curve is 1 - host_slots /
+# (layers x top-k) per step, from separate BLOOMERY_STEP_STATS=1 arms (the stats tax 2.5-3 ms a step is kept out of
+# the tok/s rows). Victims filled from NVMe: 0 by design (the churn pool is also in the load's host set); majflt
+# over the decode rows checks it.
+kind: ab
+question: does the residency with the prompt call's picks kept (the video's third arm) raise V4.1 decode after a
+  prose prompt over no residency by the product of the decode rule's and the call's measured gains?
+term: decode tok/s @ n=96 after prose:512 (the first 512 ids of corpus-prose.ids), A6000, plan (a), CED on -
+  (BLOOMERY_RESIDENCY=mid-p40-s1 with BLOOMERY_HOSTSTREAM=on - BLOOMERY_RESIDENCY=off) / off, paired by round
+unit: %
+predict: +30..+49
+rounds: 2
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, the larger of two per-round ratio SDs
+condition: the landed tree's generate_ds41, every arm with its levers set explicitly (no default decides an arm):
+  BLOOMERY_AB_ROUNDS=2 BLOOMERY_DECODE_N=96 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resvideo-v41.card'
+  just depth-gpu-ds41 prose:512@BLOOMERY_RESIDENCY=off prose:512@BLOOMERY_RESIDENCY=mid-p40-s1,BLOOMERY_HOSTSTREAM=0
+  prose:512@BLOOMERY_RESIDENCY=mid-p40-s1,BLOOMERY_HOSTSTREAM=on and the same three at prose:4096; then one round
+  of the six with BLOOMERY_STEP_STATS=1 for the per-step host_slots (the hit curve). Every residency arm starts
+  from the seed (a `residency reset` or a fresh process, resrunner's check); every streaming row carries `call
+  stream end` with admitted > 0 and kept 1, no other row one; no row [cold], [cpu-busy] or [other-busy]. Box time
+  14..20 min [derived: 18 arm processes at 16..36 s a load (fastupload, rig-log 09-30) plus the prompt (<= 11 s at
+  4096) and 96 decode steps (3 s), and the guards' idle waits]
+decide-in: hand the rows, the per-step host_slots with their record paths and the call records to rig-log-6a for
+  the video
+decide-below: split by arm: if the decode-rule arm is under +8 % over no residency, read its residency pass
+  records (landed, late) before the video uses the curve; if the streaming arm's ratio over the decode-rule arm
+  is under callstream-pp-a's 1.2, the landed tree moved it (the stack's Session::commit) - diff the call stream
+  records against 09-30's
+decide-above: the seed map is worse than the replay's: read the no-residency arm's host_slots against the replay's
+  static hit (39-50 % cross-domain) before the video states the gap

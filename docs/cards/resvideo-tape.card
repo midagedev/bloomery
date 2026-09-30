@@ -1,0 +1,11 @@
+# The adaptive-residency video's toktape tapes, plan (a) on the A6000 alone, no draft, greedy, thinking off: one
+# bloomery-serve-ds41 per arm (no residency; the residency with the decode rule only, BLOOMERY_HOSTSTREAM=0; the
+# residency with the prompt call's picks kept, streaming on), one discarded warm-up request, then
+# POST /residency/reset (the residency arms) and one tape of the 507-token RateLimiter coding review, 400 tokens out.
+# The tapes carry the prompt, the tokens and each token's time for the video; the table numbers are
+# resvideo-v41.card's generate_ds41 rows, not these.
+kind: exclusive
+reason: three server loads on the A6000 and one timed request each; the per-token times are the video's evidence of
+  the rule arm warming up, so the box must be quiet (a build or a load beside it moves them); why now: the
+  residency video (rig-log-6a, user-approved 2026-09-30), right after resvideo-v41.card's sitting
+minutes: 8..12
