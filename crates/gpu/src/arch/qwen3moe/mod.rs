@@ -46,7 +46,7 @@ pub use body38::{
 };
 pub use mtp38::{
     BorrowedPlanes, MTP_GRAPH_ROWS, MTP_ROWS, Mtp38, MtpDraft, MtpFeed, MtpHead, MtpHidden,
-    MtpMode, MtpTaps, TargetRows, walk_launches,
+    MtpMode, MtpNode, MtpTaps, TargetRows, walk_launches,
 };
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};
 

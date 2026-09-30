@@ -560,16 +560,81 @@ pub struct MtpDraft {
 }
 
 /// A gate's taps of an eager walk: the streams `eh_proj` wrote (`m · 4 ·
-/// 2560`) and the router's logits and ids, `slots` and `logits` a row as
-/// the router writes them.
+/// 2560`), the router's logits, ids and weights, `slots` and `logits` a row
+/// as the router writes them, the routed slots' and the shared expert's
+/// SwiGLU outputs (the downs' inputs, `m · 10 · 640` and `m · 640`), and
+/// every [`MtpNode`]'s rows, token-major.
 #[derive(Clone, Debug)]
 pub struct MtpTaps {
     pub eh: Vec<f32>,
     pub logits: Vec<f32>,
     pub ids: Vec<u32>,
+    pub weights: Vec<f32>,
+    pub routed_h: Vec<f32>,
+    pub shared_h: Vec<f32>,
     /// The router's logits and slots a row.
     pub logits_row: usize,
     pub slots_row: usize,
+    /// Each node of [`MtpNode::ALL`] in order: `m` rows of its width.
+    pub nodes: Vec<(MtpNode, Vec<f32>)>,
+}
+
+/// A value the walk writes between `eh_proj` and the head, which armed taps
+/// copy as the walk writes it: where a comparison with ik's graph finds the
+/// first node that leaves its band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtpNode {
+    /// The attention site's mix: the attention's input.
+    AttnIn,
+    /// The attention's heads after the output gate, before the output
+    /// projection.
+    AttnGated,
+    /// The output projection: the attention block's output.
+    AttnOut,
+    /// The streams after the attention's combine.
+    AttnCombined,
+    /// The feed-forward site's mix: the router's and the experts' input.
+    FfnIn,
+    /// The routed slots' weighted sum.
+    Routed,
+    /// The shared expert's down projection, before its gate.
+    Shared,
+    /// The block's output: the routed sum and the gated shared expert.
+    FfnOut,
+    /// The head site's mix: the head projection's input.
+    HeadIn,
+}
+
+impl MtpNode {
+    /// Every node, in the walk's order.
+    pub const ALL: [MtpNode; 9] = [
+        MtpNode::AttnIn,
+        MtpNode::AttnGated,
+        MtpNode::AttnOut,
+        MtpNode::AttnCombined,
+        MtpNode::FfnIn,
+        MtpNode::Routed,
+        MtpNode::Shared,
+        MtpNode::FfnOut,
+        MtpNode::HeadIn,
+    ];
+
+    /// The node's values a row.
+    #[must_use]
+    pub fn width(self) -> usize {
+        match self {
+            MtpNode::AttnGated => geo::ATTN,
+            MtpNode::AttnCombined => WIDE,
+            _ => geo::HIDDEN,
+        }
+    }
+
+    fn at(self) -> usize {
+        MtpNode::ALL
+            .iter()
+            .position(|&n| n == self)
+            .expect("ALL lists every node")
+    }
 }
 
 /// The taps' device side.
@@ -577,6 +642,32 @@ struct TapBufs {
     eh: DeviceBuffer<f32>,
     logits: DeviceBuffer<f32>,
     ids: DeviceBuffer<u32>,
+    weights: DeviceBuffer<f32>,
+    routed_h: DeviceBuffer<f32>,
+    shared_h: DeviceBuffer<f32>,
+    /// [`MtpNode::ALL`]'s rows, [`MTP_ROWS`] of each node's width.
+    nodes: Vec<DeviceBuffer<f32>>,
+}
+
+impl TapBufs {
+    /// Copy the first `m` rows of `src`, `node`'s values, into its tap;
+    /// enqueued on `stream`.
+    fn node(
+        &mut self,
+        stream: &CudaStream,
+        node: MtpNode,
+        src: &DeviceBuffer<f32>,
+        m: usize,
+    ) -> Result<(), GpuError> {
+        let n = m * node.width();
+        // SAFETY: `src` holds MTP_ROWS rows of the node's width (the arena's
+        // buffer the node names) and the tap as many; m <= MTP_ROWS; the
+        // windows live for this copy.
+        let (mut dst, src) =
+            unsafe { (f32_view(&self.nodes[node.at()], 0, n), f32_view(src, 0, n)) };
+        dst.copy_from_device_async(&src, stream)?;
+        Ok(())
+    }
 }
 
 /// The program's buffers for up to [`MTP_ROWS`] rows, token-major.
@@ -895,8 +986,9 @@ impl Mtp38 {
         self.a.as_ref().map_or(0, MtpArena::bytes)
     }
 
-    /// Arm (or disarm) the taps of the eager walks: `eh_proj`'s streams and
-    /// the router's logits and ids. The captured walks are dropped first (a
+    /// Arm (or disarm) the taps of the eager walks ([`MtpTaps`]): `eh_proj`'s
+    /// streams, the router's logits, ids and weights, the SwiGLU outputs and
+    /// every [`MtpNode`]. The captured walks are dropped first (a
     /// capture records what it was given). Load-time allocation; gate use.
     pub fn set_taps(&mut self, stream: &CudaStream, on: bool) -> Result<(), GpuError> {
         self.graphs.clear();
@@ -906,6 +998,13 @@ impl Mtp38 {
                 eh: DeviceBuffer::zeroed(stream, MTP_ROWS * WIDE)?,
                 logits: DeviceBuffer::zeroed(stream, a.route.logits.len())?,
                 ids: DeviceBuffer::zeroed(stream, a.route.ids.len())?,
+                weights: DeviceBuffer::zeroed(stream, a.route.weights.len())?,
+                routed_h: DeviceBuffer::zeroed(stream, a.rh.len())?,
+                shared_h: DeviceBuffer::zeroed(stream, a.sh_h.len())?,
+                nodes: MtpNode::ALL
+                    .iter()
+                    .map(|n| DeviceBuffer::zeroed(stream, MTP_ROWS * n.width()))
+                    .collect::<Result<_, _>>()?,
             })
         } else {
             None
@@ -922,6 +1021,13 @@ impl Mtp38 {
             a.last = None;
             a.held = 0;
         }
+    }
+
+    /// Positions of the current sequence the store holds: a walk may start
+    /// at or below it, never past it. 0 before the arena is made.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.a.as_ref().map_or(0, |a| a.held)
     }
 
     fn arena(&mut self) -> Result<&mut MtpArena, GpuError> {
@@ -1222,9 +1328,14 @@ impl Mtp38 {
         if let Some(fault) = Fault::from_words(word, sites) {
             return Err(GpuError::fault(WHAT, fault));
         }
+        // Walk i's id and probability bits sit at words 2i and 2i + 1.
         Ok(MtpDraft {
-            tokens: out[..n].to_vec(),
-            p: out[n..2 * n].iter().map(|&b| f32::from_bits(b)).collect(),
+            tokens: out[..2 * n].iter().step_by(2).copied().collect(),
+            p: out[1..2 * n]
+                .iter()
+                .step_by(2)
+                .map(|&b| f32::from_bits(b))
+                .collect(),
         })
     }
 
@@ -1341,6 +1452,9 @@ impl Mtp38 {
             &mut a.hc,
             &mut a.mixed,
         )?;
+        if let (Some(t), false) = (a.taps.as_mut(), capturing) {
+            t.node(stream, MtpNode::AttnIn, &a.mixed, m)?;
+        }
         cx.q8_gemv(&n.q, &a.mixed, m, &mut a.qg)?;
         cx.q8_gemv(&n.k, &a.mixed, m, &mut a.k)?;
         cx.q8_gemv(&n.v, &a.mixed, m, &mut a.v)?;
@@ -1396,6 +1510,10 @@ impl Mtp38 {
             },
         )?;
         cx.q8_gemv(&n.out, &a.attn, m, &mut a.y)?;
+        if let (Some(t), false) = (a.taps.as_mut(), capturing) {
+            t.node(stream, MtpNode::AttnGated, &a.attn, m)?;
+            t.node(stream, MtpNode::AttnOut, &a.y, m)?;
+        }
 
         // The feed-forward site: the router, the routed slots, the shared
         // expert.
@@ -1408,6 +1526,10 @@ impl Mtp38 {
             &mut a.hc,
             &mut a.ffn_x,
         )?;
+        if let (Some(t), false) = (a.taps.as_mut(), capturing) {
+            t.node(stream, MtpNode::AttnCombined, &a.res, m)?;
+            t.node(stream, MtpNode::FfnIn, &a.ffn_x, m)?;
+        }
         k.router.enqueue_fused(
             stream,
             f32_tensor(w, &n.router)?,
@@ -1419,6 +1541,7 @@ impl Mtp38 {
         if let (Some(t), false) = (a.taps.as_mut(), capturing) {
             t.logits.copy_from_device_async(&a.route.logits, stream)?;
             t.ids.copy_from_device_async(&a.route.ids, stream)?;
+            t.weights.copy_from_device_async(&a.route.weights, stream)?;
         }
         let pitch = a.route.dims().slots();
         k.handoff.enqueue_places_cols(
@@ -1501,6 +1624,13 @@ impl Mtp38 {
                 y: &mut a.y,
             },
         )?;
+        if let (Some(t), false) = (a.taps.as_mut(), capturing) {
+            t.node(stream, MtpNode::Routed, &a.acc, m)?;
+            t.node(stream, MtpNode::Shared, &a.sh_y, m)?;
+            t.node(stream, MtpNode::FfnOut, &a.y, m)?;
+            t.routed_h.copy_from_device_async(&a.rh, stream)?;
+            t.shared_h.copy_from_device_async(&a.sh_h, stream)?;
+        }
 
         // The head: its site's mix (the block's combine first), the
         // projection and the argmax.
@@ -1513,6 +1643,9 @@ impl Mtp38 {
             &mut a.hc,
             &mut a.head_x,
         )?;
+        if let (Some(t), false) = (a.taps.as_mut(), capturing) {
+            t.node(stream, MtpNode::HeadIn, &a.head_x, m)?;
+        }
         let ((qs, d), map) = match head {
             MtpHead::Full => {
                 let DevWeight::Q8_0 { qs, d, .. } = output else {
@@ -1603,12 +1736,29 @@ impl Mtp38 {
         let dims = a.route.dims();
         let mut eh = t.eh.to_host_vec(stream)?;
         eh.truncate(m * WIDE);
+        let nodes = MtpNode::ALL
+            .iter()
+            .zip(&t.nodes)
+            .map(|(&n, b)| {
+                let mut v = b.to_host_vec(stream)?;
+                v.truncate(m * n.width());
+                Ok((n, v))
+            })
+            .collect::<Result<_, GpuError>>()?;
+        let mut routed_h = t.routed_h.to_host_vec(stream)?;
+        routed_h.truncate(m * geo::N_USED * geo::FF);
+        let mut shared_h = t.shared_h.to_host_vec(stream)?;
+        shared_h.truncate(m * geo::FF);
         Ok(MtpTaps {
             eh,
             logits: t.logits.to_host_vec(stream)?,
             ids: t.ids.to_host_vec(stream)?,
+            weights: t.weights.to_host_vec(stream)?,
+            routed_h,
+            shared_h,
             logits_row: dims.logits(),
             slots_row: dims.slots(),
+            nodes,
         })
     }
 }

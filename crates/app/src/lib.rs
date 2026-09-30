@@ -525,13 +525,14 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
                 r.m
             )));
         }
-        if accepted < r.m {
-            let back = r.first
-                + u32::try_from(accepted).map_err(|_| {
-                    SessionError::Refused(format!("{accepted} accepted rows pass u32"))
-                })?;
-            self.model.rollback(back)?;
-        }
+        // Every commit rolls back, a whole accepted verify too: a body that
+        // holds the verify pending (Qwen3.8's lane word) settles its state
+        // only here, and a rollback to the position a body stands at takes
+        // nothing back.
+        let back = r.first
+            + u32::try_from(accepted)
+                .map_err(|_| SessionError::Refused(format!("{accepted} accepted rows pass u32")))?;
+        self.model.rollback(back)?;
         self.model.keep_rows(accepted, PassKind::Pair)?;
         Ok(())
     }

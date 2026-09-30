@@ -280,11 +280,12 @@ mod drive {
             .to_owned();
         drop(inv);
 
-        // The plan record, and `/props` from the same plan the load runs by.
+        // The plan record, and `/props` from the same plan the load runs by:
+        // under the draft `plan_mtp_with`'s, its draft's card bytes (granules,
+        // store, row map) and its program's arena the card's `draft` class.
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
         let model = model_props(&split, &inputs.model);
-        drop(split);
         let ub = ubatch_for(a.ctx)?;
         let machine = machine_for_experts(
             a.place.spec(),
@@ -292,7 +293,36 @@ mod drive {
             u64::try_from(ub)?,
             experts,
         );
-        let plan = inputs.plan_with(&machine, u64::try_from(a.ctx)?, &plan_levers, experts)?;
+        let mtp_inputs = match mtp {
+            false => None,
+            true => {
+                let rows = match head_rows.as_deref() {
+                    Some(p) => read_head_rows(p, &split, inputs.spec.vocab)?,
+                    None => HeadRows::Full,
+                };
+                let draft =
+                    Split::open(DRAFT).map_err(|e| format!("open the MTP draft {DRAFT}: {e}"))?;
+                Some(MtpInputs::read(&draft, &split, &inputs, rows)?)
+            }
+        };
+        drop(split);
+        let (plan, draft_bytes) = match &mtp_inputs {
+            None => (
+                inputs.plan_with(&machine, u64::try_from(a.ctx)?, &plan_levers, experts)?,
+                0,
+            ),
+            Some(mi) => {
+                let with = inputs.plan_mtp_with(
+                    &machine,
+                    u64::try_from(a.ctx)?,
+                    &plan_levers,
+                    mi,
+                    experts,
+                )?;
+                let bytes = with.draft_card_bytes() + with.arena_bytes;
+                (with.plan, bytes)
+            }
+        };
         let hot_list = levers
             .hot_list()
             .map_or_else(|| "none".to_string(), |p| p.display().to_string());
@@ -334,6 +364,7 @@ mod drive {
             path: path.clone(),
             mtp,
             head_rows,
+            draft_bytes,
         };
         // The prompt cache is off (its budget 0): the seat keeps no prefix
         // worth saving, and slot save/restore is the server's own 501.
@@ -376,6 +407,20 @@ mod drive {
         mtp: bool,
         /// `BLOOMERY_MTP_HEAD_ROWS`, the draft head's row list.
         head_rows: Option<std::path::PathBuf>,
+        /// The plan's `draft` class bytes, which `/props` files.
+        draft_bytes: u64,
+    }
+
+    /// The draft's join to the held sequence, when a call made one: how
+    /// many rows it caught up, or why it skips.
+    fn print_join(spec: &mut app::arch::qwen3moe::Drafted38) {
+        if let Some(j) = spec.draft_mut().take_joined() {
+            Record::new(&record::MTP_PROMPT)
+                .u("start", j.start)
+                .u("caught_up", j.caught_up)
+                .w("skipped", j.skipped.unwrap_or("none"))
+                .eprint();
+        }
     }
 
     /// The Qwen3.8 session on the engine thread: the session over the model,
@@ -386,7 +431,7 @@ mod drive {
         s: app::Session<Body38>,
         spec: Option<app::arch::qwen3moe::Drafted38>,
         ctx: usize,
-        /// The draft's resident and arena bytes, for `/props`' `draft` class.
+        /// The plan's draft card bytes and arena, for `/props`' `draft` class.
         draft_bytes: u64,
     }
 
@@ -455,25 +500,22 @@ mod drive {
                 m.body(WHAT)?.card_layers(),
                 t.elapsed().as_secs_f64()
             );
-            let draft_bytes = match a.mtp {
-                false => 0,
-                true => {
-                    let d = m.body(WHAT)?.mtp().ok_or("the load opened no MTP draft")?;
-                    let bytes = (d.resident_bytes() + d.arena_bytes()) as u64;
-                    let head = match d.head_map() {
-                        Some((_, n)) => format!("rows={n}"),
-                        None => "full".to_string(),
-                    };
-                    eprintln!(
-                        "load draft=mtp resident={} arena={} head={head} card_bytes={bytes} in \
-                         {:.1} s (runtime value)",
-                        d.resident_bytes(),
-                        d.arena_bytes(),
-                        t.elapsed().as_secs_f64(),
-                    );
-                    bytes
-                }
-            };
+            if a.mtp {
+                let d = m.body(WHAT)?.mtp().ok_or("the load opened no MTP draft")?;
+                let bytes = (d.resident_bytes() + d.arena_bytes()) as u64;
+                let head = match d.head_map() {
+                    Some((_, n)) => format!("rows={n}"),
+                    None => "full".to_string(),
+                };
+                eprintln!(
+                    "load draft=mtp resident={} arena={} head={head} card_bytes={bytes} (the \
+                     plan's {}) in {:.1} s (runtime value)",
+                    d.resident_bytes(),
+                    d.arena_bytes(),
+                    a.draft_bytes,
+                    t.elapsed().as_secs_f64(),
+                );
+            }
             let (launches, memops) = m.body(WHAT)?.step_launches();
             let nodes = m.capture_step()?;
             let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
@@ -520,7 +562,7 @@ mod drive {
                 s,
                 spec,
                 ctx: a.ctx,
-                draft_bytes,
+                draft_bytes: a.draft_bytes,
             })
         }
     }
@@ -540,12 +582,23 @@ mod drive {
         /// the prompt's units.
         fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
             match &mut self.spec {
-                Some(spec) => Ok(Advance::prompt(spec, &mut self.s, ids)?),
+                Some(spec) => {
+                    let next = Advance::prompt(spec, &mut self.s, ids)?;
+                    print_join(spec);
+                    Ok(next)
+                }
                 None => Ok(self.s.prompt(ids, runtime::Want::Argmax)?.argmax()),
             }
         }
 
+        /// One step; under the draft the rows it left waiting walked first
+        /// (`MtpDraft::before_step`: a request that continues the held
+        /// sequence joins it here when its prompt call is empty).
         fn step(&mut self, last: u32) -> Result<u32, GateError> {
+            if let Some(spec) = &mut self.spec {
+                spec.draft_mut().before_step(&mut self.s, last)?;
+                print_join(spec);
+            }
             let next = self.s.step(last, runtime::Want::Argmax)?.argmax();
             if let Some(spec) = &mut self.spec {
                 runtime::Draft::stepped(spec.draft_mut(), &mut self.s, last, next)?;

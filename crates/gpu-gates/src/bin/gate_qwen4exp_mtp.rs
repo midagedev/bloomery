@@ -9,19 +9,31 @@
 //!   the warmup, then each block's graphs — each row's token, position and
 //!   target hidden row (ik's `inp_tokens`, `inp_pos`, `inp_mtp_states`) fed
 //!   in runs of up to eight rows: the streams `eh_proj` writes within
-//!   [`EH_BAND`] of ik's `mtp_eh_proj-48`, a row at a time.
-//! - (l) each row's streams after the layer within [`L_OUT_BAND`] of ik's
-//!   `l_out-48`, but on a row whose routed set is not ik's: such a flip is
-//!   allowed only when each exchanged pair's gap in ik's router logits lies
-//!   within our two logits' error, that error within [`flip_cap`] and the
-//!   gap within [`margin_cap`] of the router input's band
-//!   ([`ROUTER_BAND`]); its row's streams and logits are then printed, not
-//!   held.
-//! - (h) the full head's logits of each row ik computes one for (its
-//!   `inp_out_ids`) within [`LOGITS_BAND`] of ik's `result_output`, and the
-//!   row's draft token the argmax of our logits, first index on a tie; it
-//!   equals ik's argmax wherever ik's top-2 margin clears
-//!   [`margin_cap`] at [`LOGITS_BAND`], and is ik's runner-up otherwise.
+//!   [`eh_band`] of ik's `mtp_eh_proj-48`, a row at a time.
+//! - (l) each row's routed set is ik's (`ffn_moe_topk-48`), but where it is
+//!   not: such a flip is allowed only when each exchanged pair's gap in
+//!   ik's router logits lies within our two logits' error, that error
+//!   within [`flip_cap`] and the gap within [`margin_cap`] of the router
+//!   input's band ([`router_band`]). The layer's output's distance from
+//!   ik's `l_out-48` on the other rows is printed, not held: our f32
+//!   activations against ik's q8 ones move each projection by its own
+//!   rounding term, which the node-local pins (n) hold instead.
+//! - (h) each row's draft token the argmax of our full head's logits, first
+//!   index on a tie; on each row ik computes a head for (its `inp_out_ids`)
+//!   that argmax is ik's wherever ik's top-2 margin clears [`margin_cap`] at
+//!   [`logits_band`], and ik's runner-up otherwise. The logits' distance
+//!   from ik's `result_output` is printed, not held.
+//! - (n) the node-local pins, on every row: each node the walk taps against
+//!   the host's f64 simulation of our own rule on that node's inputs as the
+//!   walk read them back, within the bound of the node's own rounding —
+//!   `eh_proj` from the fed token and hidden row (the input pack, then the
+//!   projection), the attention site's mix, `AttnOut`, the attention's
+//!   combine, the feed-forward site's mix, the routed slots' downs and
+//!   their weighted sum, the shared expert's down, the gated sum (bit for
+//!   bit), `l_out` (the head site's combine), the head site's mix and, on
+//!   ik's head rows, the full head's logits. A dot's bound is `γ(k/32 +
+//!   5)·Σ|w·x|` ([`dot_depth`]), a mix's the hyper-connection gate's
+//!   `MIXED_BAND`, a combine's its weight's `LO_BAND` and one rounding.
 //! - (r) the row-list head against the full head over one walk's rows: each
 //!   list row's logits the full head's row of its id, bit for bit; each
 //!   row's token the id of the list's argmax; each head's probability the
@@ -37,14 +49,20 @@
 //!   list head and at 1 row with the full head, each capture of
 //!   [`GRAPH_NODES`] nodes; two own rows (`MtpFeed::Own`) in a row, captured
 //!   then replayed, equal them eager, and the first equals a host walk of
-//!   the previous walk's last token and streams.
+//!   the previous walk's last token and streams; a window's chain
+//!   (`GpuModel::mtp_chain`: a refresh and two own walks, one readback)
+//!   reads back each walk's last id and probability, bit for bit.
 //! - (f) the walk's refusals by name — its own row before any walk and
 //!   after a reset, no rows, nine rows eager, five captured, rows past the
 //!   store, a walk past the positions the store holds for the sequence, a
 //!   token past the vocabulary, a hidden slice of the wrong length, a capture
 //!   with the taps armed — and a NaN in a hidden row raised on the fault
 //!   word as the draft layer's `hc_mix`, the walk's error.
-//! - (w) the windows end to end, against the plain run at the set's prompt
+//! - (w) the windows end to end: first the drafted session's prompt call
+//!   walks the draft as walks fed the target's hidden rows from the host
+//!   (position 0 beside a zero row, each later position beside the row of
+//!   the one before it), the anchor walk after them bit for bit; then
+//!   against the plain run at the set's prompt
 //!   and D3K's (depth 3,000 after it): under `app::arch::qwen4exp`'s `Draft`
 //!   impl the drafted greedy ids are the plain run's for 64 tokens, with a
 //!   rejected row among the windows — else the rollback path never ran and
@@ -54,10 +72,13 @@
 //!   at the deep prompt its rejected row completing a pool leaving the
 //!   pooled planes the plain run's; and the lane word planted on a lane no
 //!   call wrote makes the next drafted pass raise the delta stamp fault, by
-//!   name, and poisons the model.
+//!   name, and poisons the model. Last, prompt calls that continue the held
+//!   sequence: the draft joins at the call's start and drafts with the plain
+//!   run's ids, and restarted beside the held sequence it skips the next
+//!   call by name, proposing nothing, the ids still the plain run's.
 //!
-//! (l) and (h) are held on at least one row each: a run that excuses every
-//! row as a flip fails.
+//! (l) and (h) hold at least one row each off a flip: a run that excuses
+//! every row as a flip fails.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -78,8 +99,8 @@ mod gate {
 
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, MTP_GRAPH_ROWS, MTP_ROWS, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, Prompt38,
-        Qwen38Model, Store38Host, TargetRows,
+        Body38, MTP_GRAPH_ROWS, MTP_ROWS, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, MtpNode,
+        MtpTaps, Prompt38, Qwen38Model, Store38Host, TargetRows,
     };
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu_gates::flip::{self, Flip};
@@ -95,6 +116,7 @@ mod gate {
     use refset::arch::qwen4exp::mtp::{DRAFT, MTP, MTP_SET};
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
+    use runtime::hc_gated::{Geometry, LO_BAND, MIXED_BAND, MixWeights, mix_ref};
     use runtime::{Advance as _, Committed, Draft, PassSink, TapNeed, Target as _};
 
     /// Cache rows: the e2e gate's, and the load gate's.
@@ -107,11 +129,14 @@ mod gate {
     const STREAMS: usize = 4;
     const HIDDEN: usize = 2560;
     const WIDE: usize = STREAMS * HIDDEN;
+    /// The hyper-connection mix's rank.
+    const RANK: usize = 320;
     /// ggml's IMROPE position streams per row.
     const POS_SECTIONS: usize = 4;
-    /// The router's experts and routed picks.
+    /// The router's experts and routed picks, and an expert's width.
     const N_EXPERT: usize = 512;
     const N_USED: usize = 10;
+    const FF: usize = 640;
 
     /// PIN(2026-09-30): the streams `eh_proj` writes against ik's on the same
     /// inputs. Both sides compute the two norms in f32 (a few roundings
@@ -123,25 +148,13 @@ mod gate {
         q8_32_rel()
     }
 
-    /// PIN(2026-09-30): the layer's output against ik's on the same inputs,
-    /// the error model of the e2e gate's `gemm_band` counted over the
-    /// draft's projections in series whose outputs join the streams, where
-    /// ik's side reads q8 activations and ours f32: `eh_proj`, the
-    /// attention's input (q, k and v read one quantized row) and output
-    /// projections, the routed experts' gate·up and down (ours
-    /// `q8_0_gemv_sel_f32` over f32 rows, ik's CPU `mul_mat_id` over q8
-    /// rows) and the shared expert's gate·up and down: seven terms of
-    /// [`q8_32_rel`] each, independent, √7 · 1.2858e-2 = 3.40e-2. The mixes'
-    /// down and up reach the streams through σ (slope at most ¼) and add
-    /// under 4 %, as the e2e derivation states; the f16 store both sides'
-    /// attention reads rounds at 2^-11, under 1/25 of a term.
-    fn l_out_band() -> f64 {
-        7f64.sqrt() * q8_32_rel()
-    }
-
-    /// PIN(2026-09-30): the head's logits against ik's: [`l_out_band`]'s
-    /// seven terms and the output projection's own, √8 · 1.2858e-2 =
-    /// 3.64e-2 (the head mix's down and up as above).
+    /// PIN(2026-09-30): the band of the head's logits against ik's that
+    /// (h)'s tie cap reads: the error model of the e2e gate's `gemm_band`
+    /// over the draft's projections in series, where ik's side reads q8
+    /// activations and ours f32 — `eh_proj`, the attention's input and
+    /// output projections, the routed experts' gate·up and down, the shared
+    /// expert's gate·up and down, and the head's projection: eight terms of
+    /// [`q8_32_rel`], √8 · 1.2858e-2 = 3.64e-2.
     fn logits_band() -> f64 {
         8f64.sqrt() * q8_32_rel()
     }
@@ -401,15 +414,571 @@ mod gate {
             && bits(&a.logits) == bits(&b.logits)
     }
 
+    /// A Q8_0 matrix's rows on the host, `k` values a row.
+    struct HostQ8<'a> {
+        bytes: &'a [u8],
+        k: usize,
+        rows: usize,
+    }
+
+    impl<'a> HostQ8<'a> {
+        fn open(split: &'a Split, name: &str) -> Result<HostQ8<'a>, GateError> {
+            let (sh, t) = split
+                .find(name)
+                .ok_or_else(|| format!("no tensor {name}"))?;
+            if t.ty != gguf::quant::GgmlType::Q8_0 || !(2..=3).contains(&t.dims.len()) {
+                return Err(format!(
+                    "{name} is {:?} {:?}, not a Q8_0 matrix or stack",
+                    t.ty, t.dims
+                )
+                .into());
+            }
+            let g = split
+                .shard(sh)
+                .ok_or_else(|| format!("{name}: shard {sh}"))?;
+            let bytes = g.data(t)?;
+            let k = usize::try_from(t.dims[0])?;
+            let rows = t.dims[1..]
+                .iter()
+                .try_fold(1usize, |a, &d| usize::try_from(d).map(|d| a * d))?;
+            Ok(HostQ8 { bytes, k, rows })
+        }
+
+        /// Row `r`'s 34-byte blocks.
+        fn blocks(&self, r: usize) -> &[[u8; 34]] {
+            let nb = self.k / 32;
+            self.bytes[r * nb * 34..(r + 1) * nb * 34]
+                .as_chunks::<34>()
+                .0
+        }
+
+        /// Row `r` dequantized: each value `q·d`, exact in f32.
+        fn row(&self, r: usize) -> Vec<f32> {
+            let mut v = Vec::with_capacity(self.k);
+            for blk in self.blocks(r) {
+                let d = gguf::quant::half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                v.extend(blk[2..].iter().map(|&q| f32::from(q as i8) * d));
+            }
+            v
+        }
+
+        /// Every row dequantized, row after row.
+        fn dequant(&self) -> Vec<f32> {
+            (0..self.rows).flat_map(|r| self.row(r)).collect()
+        }
+
+        /// Row `r` against `x` in f64 over the exact weight values: `Σ w·x`
+        /// and `Σ |w·x|`.
+        fn dot_abs(&self, r: usize, x: &[f64]) -> (f64, f64) {
+            let (mut acc, mut abs) = (0.0f64, 0.0f64);
+            for (b, blk) in self.blocks(r).iter().enumerate() {
+                let d = f64::from(gguf::quant::half_to_f32(u16::from_le_bytes([
+                    blk[0], blk[1],
+                ])));
+                for (i, &q) in blk[2..].iter().enumerate() {
+                    let t = d * f64::from(q as i8) * x[b * 32 + i];
+                    acc += t;
+                    abs += t.abs();
+                }
+            }
+            (acc, abs)
+        }
+
+        /// Rows `rows` against `x` ([`HostQ8::dot_abs`]), split over the
+        /// host's cores.
+        fn apply_abs(&self, x: &[f64], rows: std::ops::Range<usize>) -> (Vec<f64>, Vec<f64>) {
+            let n = rows.len();
+            let lanes = std::thread::available_parallelism().map_or(1, |p| p.get());
+            let chunk = n.div_ceil(lanes).max(1);
+            let mut out = vec![(0.0f64, 0.0f64); n];
+            std::thread::scope(|s| {
+                for (c, part) in out.chunks_mut(chunk).enumerate() {
+                    let first = rows.start + c * chunk;
+                    s.spawn(move || {
+                        for (i, o) in part.iter_mut().enumerate() {
+                            *o = self.dot_abs(first + i, x);
+                        }
+                    });
+                }
+            });
+            out.into_iter().unzip()
+        }
+    }
+
+    /// PIN(2026-09-30): the rounding path of one output of the q8f32 Q8_0
+    /// dot over `k` values (`q8_0_lane_partial_1col`, which the gemv, the
+    /// token-major mcol gemv and the selecting gemv all run): a lane's `k/32`
+    /// fused multiply-adds — its `k/128` words, four values a word, `q·d`
+    /// exact in f32 — then the butterfly's five adds, so `|ŷ − Σ w·x| ≤
+    /// γ(k/32 + 5)·Σ|w·x|` (Higham's bound for a sum of that depth).
+    /// Measured on the set's 127 rows: the worst distance at 0.009 of its
+    /// row's bound (the shared expert's down, 1.405e-7).
+    fn dot_depth(k: usize) -> usize {
+        k / 32 + 5
+    }
+
+    /// PIN(2026-09-30): the input pack's values against the host's, relative
+    /// (`mtp_input`): the hidden row's sum of squares over its 10,240 values
+    /// is 40 fused multiply-adds a thread, the butterfly's 5 and the 7 warp
+    /// sums, every term positive: γ(52) of the sum (the embedding's 2,560
+    /// values take γ(22), inside it); the root halves that share, the
+    /// division by the count, `+ eps`, the root and the reciprocal add 4u,
+    /// and `(x·r)·γ` two more: ½γ(52) + 6u. Measured on the set's 127
+    /// rows: `eh_proj` over the pack at worst 2.240e-7, 0.001 of its bound.
+    fn pack_rel() -> f64 {
+        0.5 * gamma(52) + 6.0 * U
+    }
+
+    /// One hyper-connection site's weights on the host, dequantized, in
+    /// `runtime::hc_gated::MixWeights`' layouts.
+    struct HostSite {
+        gamma: Vec<f32>,
+        down: Vec<f32>,
+        up: Vec<f32>,
+        inject: Option<Vec<f32>>,
+    }
+
+    impl HostSite {
+        /// The site `sub` of the draft layer (`attn`, `ffn`), or the head's
+        /// (`nextn.hc_head`, no inject).
+        fn open(draft: &Split, stem: &str, inject: bool) -> Result<HostSite, GateError> {
+            let b = |s: &str| format!("blk.{LAYER}.{stem}_{s}.weight");
+            let q = |s: &str| HostQ8::open(draft, &b(s)).map(|m| m.dequant());
+            Ok(HostSite {
+                gamma: bloomery_gpu_gates::split_f32(draft, &b("norm"), WIDE)?,
+                down: q("down")?,
+                up: q("up")?,
+                inject: if inject { Some(q("inject")?) } else { None },
+            })
+        }
+
+        fn weights(&self) -> MixWeights<'_> {
+            MixWeights {
+                gamma: &self.gamma,
+                down: &self.down,
+                up: &self.up,
+                inject: self.inject.as_deref(),
+            }
+        }
+    }
+
+    /// The draft layer's weights the node-local pins read, the target's
+    /// embedding and head, and the model's norm epsilon.
+    struct Host<'a> {
+        embd: HostQ8<'a>,
+        enorm: Vec<f32>,
+        hnorm: Vec<f32>,
+        eh: HostQ8<'a>,
+        out: HostQ8<'a>,
+        down_e: HostQ8<'a>,
+        down_s: HostQ8<'a>,
+        head: HostQ8<'a>,
+        attn: HostSite,
+        ffn: HostSite,
+        head_site: HostSite,
+        geo: Geometry,
+        eps: f32,
+    }
+
+    impl<'a> Host<'a> {
+        fn open(file: &'a Split, draft: &'a Split, eps: f32) -> Result<Host<'a>, GateError> {
+            let o = |stem: &str| HostQ8::open(draft, &format!("blk.{LAYER}.{stem}.weight"));
+            let f = |stem: &str, n: usize| {
+                bloomery_gpu_gates::split_f32(draft, &format!("blk.{LAYER}.{stem}.weight"), n)
+            };
+            Ok(Host {
+                embd: HostQ8::open(file, "token_embd.weight")?,
+                enorm: f("nextn.enorm", HIDDEN)?,
+                hnorm: f("nextn.hnorm", WIDE)?,
+                eh: o("nextn.eh_proj")?,
+                out: o("attn_output")?,
+                down_e: o("ffn_down_exps")?,
+                down_s: o("ffn_down_shexp")?,
+                head: HostQ8::open(file, "output.weight")?,
+                attn: HostSite::open(draft, "hc_attn", true)?,
+                ffn: HostSite::open(draft, "hc_ffn", true)?,
+                head_site: HostSite::open(draft, "nextn.hc_head", false)?,
+                geo: Geometry::new(STREAMS as u32, RANK as u32, HIDDEN as u32)
+                    .map_err(|e| format!("the draft's hyper-connection shape: {e}"))?,
+                eps,
+            })
+        }
+    }
+
+    /// PIN(2026-09-30): a hyper-connection mix against `mix_ref` on its
+    /// input as read back, `max|ours − ref| / max|ref|`: the hyper-connection
+    /// gate's `MIXED_BAND`, whose derivation takes the up's gain on random
+    /// inputs. Measured on this set's 127 rows: AttnIn at worst 0.023 of it,
+    /// FfnIn 0.021, HeadIn 0.007.
+    fn mix_band() -> f64 {
+        f64::from(MIXED_BAND)
+    }
+
+    /// A node's index in the taps ([`MtpNode::ALL`]'s order).
+    fn node_at(n: MtpNode) -> usize {
+        MtpNode::ALL
+            .iter()
+            .position(|&m| m == n)
+            .expect("ALL lists every node")
+    }
+
+    /// One node-local pin's record over the replay: each row's distance
+    /// from the host's simulation of our rule on the node's inputs as the
+    /// walk read them back, against its bound.
+    struct Pin {
+        what: &'static str,
+        rule: &'static str,
+        rows: usize,
+        past: usize,
+        worst: f64,
+        /// The largest distance over its row's bound.
+        ratio: f64,
+        first_past: Option<String>,
+    }
+
+    impl Pin {
+        fn new(what: &'static str, rule: &'static str) -> Pin {
+            Pin {
+                what,
+                rule,
+                rows: 0,
+                past: 0,
+                worst: 0.0,
+                ratio: 0.0,
+                first_past: None,
+            }
+        }
+
+        /// A row at distance `d` against its bound `band` (0: bit for bit).
+        fn hold(&mut self, d: f64, band: f64, label: &dyn Fn() -> String) {
+            self.rows += 1;
+            self.worst = self.worst.max(d);
+            let r = if band > 0.0 {
+                d / band
+            } else if d == 0.0 {
+                0.0
+            } else {
+                f64::INFINITY
+            };
+            self.ratio = self.ratio.max(if r.is_nan() { f64::INFINITY } else { r });
+            // A NaN distance is past every bound.
+            if d.is_nan() || d > band {
+                self.past += 1;
+                if self.first_past.is_none() {
+                    self.first_past = Some(format!("{} ({d:.3e}, bound {band:.3e})", label()));
+                }
+            }
+        }
+
+        fn ok(&self) -> bool {
+            self.past == 0 && self.rows > 0
+        }
+
+        fn line(&self) -> String {
+            format!(
+                "(n) {} = {}: {} rows, worst {:.3e}, worst over its bound {:.3}, {} past{} {}",
+                self.what,
+                self.rule,
+                self.rows,
+                self.worst,
+                self.ratio,
+                self.past,
+                self.first_past
+                    .as_ref()
+                    .map_or(String::new(), |f| format!(", first {f}")),
+                verdict(self.ok())
+            )
+        }
+    }
+
+    /// The node-local pins, in the walk's order.
+    struct Pins {
+        eh: Pin,
+        attn_in: Pin,
+        attn_out: Pin,
+        attn_combined: Pin,
+        ffn_in: Pin,
+        routed: Pin,
+        shared: Pin,
+        ffn_out: Pin,
+        l_out: Pin,
+        head_in: Pin,
+        logits: Pin,
+    }
+
+    impl Pins {
+        fn new() -> Pins {
+            Pins {
+                eh: Pin::new(
+                    "eh_proj",
+                    "the input pack of the token's embedding row and the fed hidden row, \
+                     then the projection",
+                ),
+                attn_in: Pin::new("AttnIn", "the attention site's mix of eh_proj's streams"),
+                attn_out: Pin::new("AttnOut", "the output projection of AttnGated"),
+                attn_combined: Pin::new(
+                    "AttnCombined",
+                    "eh_proj's streams plus the attention site's weights times AttnOut",
+                ),
+                ffn_in: Pin::new("FfnIn", "the feed-forward site's mix of AttnCombined"),
+                routed: Pin::new(
+                    "Routed",
+                    "the routed slots' downs of their SwiGLU rows, weighted, in slot order",
+                ),
+                shared: Pin::new("Shared", "the shared expert's down of its SwiGLU row"),
+                ffn_out: Pin::new("FfnOut", "Routed plus Shared times its gate, bit for bit"),
+                l_out: Pin::new(
+                    "l_out",
+                    "AttnCombined plus the feed-forward site's weights times FfnOut",
+                ),
+                head_in: Pin::new("HeadIn", "the head site's mix of l_out"),
+                logits: Pin::new("logits", "the full head's projection of HeadIn"),
+            }
+        }
+
+        fn all(&self) -> [&Pin; 11] {
+            [
+                &self.eh,
+                &self.attn_in,
+                &self.attn_out,
+                &self.attn_combined,
+                &self.ffn_in,
+                &self.routed,
+                &self.shared,
+                &self.ffn_out,
+                &self.l_out,
+                &self.head_in,
+                &self.logits,
+            ]
+        }
+    }
+
+    /// `‖ours − y‖ / ‖y‖` and `‖Σ|w·x|‖ / ‖y‖`, the host's `y` and
+    /// absolute sums in f64: a dot's bound is `γ(depth)` times the second.
+    fn dot_pin(ours: &[f32], y: &[f64], abs: &[f64]) -> (f64, f64) {
+        let den = y
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+            .max(f64::MIN_POSITIVE);
+        let num = ours
+            .iter()
+            .zip(y)
+            .map(|(&o, &v)| (f64::from(o) - v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let a = abs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        (nan_inf(num / den), a / den)
+    }
+
+    /// A NaN distance as infinite, so no band passes it.
+    fn nan_inf(d: f64) -> f64 {
+        if d.is_nan() { f64::INFINITY } else { d }
+    }
+
+    /// `max|ours − ref| / max|ref|`: the mix bands' measure
+    /// (`runtime::hc_gated::MIXED_BAND`).
+    fn max_rel(ours: &[f32], r: &[f64]) -> f64 {
+        let den = r
+            .iter()
+            .fold(0.0f64, |a, v| a.max(v.abs()))
+            .max(f64::MIN_POSITIVE);
+        let num = ours
+            .iter()
+            .zip(r)
+            .fold(0.0f64, |a, (&o, &v)| a.max((f64::from(o) - v).abs()));
+        nan_inf(num / den)
+            + if ours.len() == r.len() {
+                0.0
+            } else {
+                f64::INFINITY
+            }
+    }
+
+    /// A combine against the host's (`res + wgt·y` per stream, `wgt` the
+    /// site's in f64): `‖ours − host‖ / ‖host‖` and its bound over it.
+    ///
+    /// PIN(2026-09-30): the card's weight is within `LO_BAND` of the largest
+    /// of the site's (`runtime::hc_gated::LO_BAND`'s derivation), so a value
+    /// moves by at most that times `|y|`, and the fused multiply-add rounds
+    /// once: per value `LO_BAND·max|wgt|·|y| + u·|host|`. Measured on the
+    /// set's 127 rows: AttnCombined at worst 0.011 of its bound, l_out 0.018.
+    fn combine_pin(ours: &[f32], res: &[f32], y: &[f32], wgt: &[f64]) -> (f64, f64) {
+        let top = wgt.iter().fold(0.0f64, |a, w| a.max(w.abs()));
+        let (mut num, mut den, mut bound) = (0.0f64, 0.0f64, 0.0f64);
+        for (s, &w) in wgt.iter().enumerate() {
+            let span = s * HIDDEN..(s + 1) * HIDDEN;
+            for ((&o, &r), &yi) in ours[span.clone()].iter().zip(&res[span]).zip(y) {
+                let h = f64::from(r) + w * f64::from(yi);
+                num += (f64::from(o) - h).powi(2);
+                den += h * h;
+                bound += (f64::from(LO_BAND) * top * f64::from(yi).abs() + U * h.abs()).powi(2);
+            }
+        }
+        let den = den.sqrt().max(f64::MIN_POSITIVE);
+        (nan_inf(num.sqrt() / den), bound.sqrt() / den)
+    }
+
+    /// The node-local pins of row `t` of a walk of graph `g` at its row
+    /// `at` ([`Pins`]): each node against the host's simulation of our rule
+    /// on the node's inputs as the walk read them back — the eh_proj pin's
+    /// inputs are the fed token and hidden row themselves.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one row of one walk: its taps, streams, logits and the host's weights"
+    )]
+    fn pin_row(
+        h: &Host<'_>,
+        g: &IkGraph,
+        at: usize,
+        taps: &MtpTaps,
+        t: usize,
+        l_out: &[f32],
+        p: &mut Pins,
+    ) {
+        let label = || format!("{} row {at}", g.label());
+        let node = |n: MtpNode| {
+            let wd = n.width();
+            &taps.nodes[node_at(n)].1[t * wd..(t + 1) * wd]
+        };
+        let f64s = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<f64>>();
+
+        // eh_proj: the pack `[e·r_e·enorm | h_s·r_h·hnorm_s]` a stream, then
+        // the projection of its 5,120 values.
+        let e = h.embd.row(g.tokens[at] as usize);
+        let hid = &g.states[at * WIDE..(at + 1) * WIDE];
+        let inv_rms = |v: &[f32]| {
+            1.0 / (v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / v.len() as f64
+                + f64::from(h.eps))
+            .sqrt()
+        };
+        let (re, rh) = (inv_rms(&e), inv_rms(hid));
+        let (mut y, mut abs) = (Vec::with_capacity(WIDE), Vec::with_capacity(WIDE));
+        for s in 0..STREAMS {
+            let mut pack = Vec::with_capacity(2 * HIDDEN);
+            pack.extend((0..HIDDEN).map(|i| f64::from(e[i]) * re * f64::from(h.enorm[i])));
+            pack.extend((0..HIDDEN).map(|i| {
+                let j = s * HIDDEN + i;
+                f64::from(hid[j]) * rh * f64::from(h.hnorm[j])
+            }));
+            let (ys, a) = h.eh.apply_abs(&pack, 0..HIDDEN);
+            y.extend(ys);
+            abs.extend(a);
+        }
+        let eh = &taps.eh[t * WIDE..(t + 1) * WIDE];
+        let (d, a) = dot_pin(eh, &y, &abs);
+        // The pack's own error reaches the output through |W|: at most
+        // pack_rel of Σ|w·x|, beside the projection's γ.
+        let g = gamma(dot_depth(2 * HIDDEN));
+        p.eh.hold(d, (g + pack_rel() * (1.0 + g)) * a, &label);
+
+        // The attention site: its mix of eh_proj's streams, the output
+        // projection, the combine.
+        let attn = mix_ref(h.geo, h.attn.weights(), eh, h.eps);
+        p.attn_in.hold(
+            max_rel(node(MtpNode::AttnIn), &attn.mixed),
+            mix_band(),
+            &label,
+        );
+        let gated = f64s(node(MtpNode::AttnGated));
+        let (y, abs) = h.out.apply_abs(&gated, 0..HIDDEN);
+        let (d, a) = dot_pin(node(MtpNode::AttnOut), &y, &abs);
+        p.attn_out
+            .hold(d, gamma(dot_depth(gated.len())) * a, &label);
+        let wgt = attn.wgt.as_deref().unwrap_or(&[]);
+        let (d, b) = combine_pin(node(MtpNode::AttnCombined), eh, node(MtpNode::AttnOut), wgt);
+        p.attn_combined.hold(d, b, &label);
+
+        // The feed-forward site: its mix, the routed slots, the shared
+        // expert, their gated sum.
+        let ffn = mix_ref(h.geo, h.ffn.weights(), node(MtpNode::AttnCombined), h.eps);
+        p.ffn_in.hold(
+            max_rel(node(MtpNode::FfnIn), &ffn.mixed),
+            mix_band(),
+            &label,
+        );
+        let slots = taps.slots_row;
+        // PIN(2026-09-30): the routed sum's bound per value — each slot's
+        // down (γ(640/32 + 5) of Σ|w·x|, `dot_depth`) through its weight,
+        // and `q38_card_acc`'s ten fused multiply-adds in slot order, γ(10)
+        // of Σ|w·down|. Measured on the set's 127 rows: at worst 0.006 of it.
+        let (mut acc, mut bound) = (vec![0.0f64; HIDDEN], vec![0.0f64; HIDDEN]);
+        for j in 0..N_USED {
+            let e = taps.ids[t * slots + j] as usize;
+            let w = f64::from(taps.weights[t * slots + j]);
+            let x = f64s(&taps.routed_h[(t * N_USED + j) * FF..(t * N_USED + j + 1) * FF]);
+            let (dj, aj) = h.down_e.apply_abs(&x, e * HIDDEN..(e + 1) * HIDDEN);
+            for i in 0..HIDDEN {
+                acc[i] += w * dj[i];
+                // The down's own bound through the weight, and the ten
+                // slots' fused multiply-adds (depth 10) over |w·down|.
+                bound[i] += w.abs() * (gamma(dot_depth(FF)) * aj[i] + gamma(N_USED) * dj[i].abs());
+            }
+        }
+        let routed = node(MtpNode::Routed);
+        let den = acc
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+            .max(f64::MIN_POSITIVE);
+        let num = routed
+            .iter()
+            .zip(&acc)
+            .map(|(&o, &v)| (f64::from(o) - v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let b = bound.iter().map(|v| v * v).sum::<f64>().sqrt();
+        p.routed.hold(nan_inf(num / den), b / den, &label);
+        let x = f64s(&taps.shared_h[t * FF..(t + 1) * FF]);
+        let (y, abs) = h.down_s.apply_abs(&x, 0..HIDDEN);
+        let (d, a) = dot_pin(node(MtpNode::Shared), &y, &abs);
+        p.shared.hold(d, gamma(dot_depth(FF)) * a, &label);
+        // `q38_shared_add`: the product rounded, then the sum rounded.
+        let gate = taps.weights[t * slots + N_USED];
+        let differ = routed
+            .iter()
+            .zip(node(MtpNode::Shared))
+            .zip(node(MtpNode::FfnOut))
+            .filter(|&((r, s), o)| (*r + *s * gate).to_bits() != o.to_bits())
+            .count();
+        p.ffn_out.hold(differ as f64, 0.0, &label);
+
+        // The layer's output: the head site's combine.
+        let wgt = ffn.wgt.as_deref().unwrap_or(&[]);
+        let (d, b) = combine_pin(
+            l_out,
+            node(MtpNode::AttnCombined),
+            node(MtpNode::FfnOut),
+            wgt,
+        );
+        p.l_out.hold(d, b, &label);
+        let head = mix_ref(h.geo, h.head_site.weights(), l_out, h.eps);
+        p.head_in.hold(
+            max_rel(node(MtpNode::HeadIn), &head.mixed),
+            mix_band(),
+            &label,
+        );
+    }
+
+    /// The logits pin of one head row: our logits `ours` against the full
+    /// head's projection of our `HeadIn` row `x`.
+    fn pin_logits(h: &Host<'_>, x: &[f32], ours: &[f32], p: &mut Pin, label: &dyn Fn() -> String) {
+        let x: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+        let (y, abs) = h.head.apply_abs(&x, 0..h.head.rows);
+        let (d, a) = dot_pin(ours, &y, &abs);
+        p.hold(d, gamma(dot_depth(HIDDEN)) * a, label);
+    }
+
     /// The worst of each clause over the replay, and the counts.
-    #[derive(Default)]
     struct Replay {
         eh_worst: f64,
         eh_fail: usize,
+        /// The layer's output's and the logits' distance from ik's: printed
+        /// inside (l) and (h), not held.
         l_out_worst: f64,
-        l_out_fail: usize,
         logits_worst: f64,
-        logits_fail: usize,
         rows: usize,
         heads: usize,
         flips: usize,
@@ -420,11 +989,43 @@ mod gate {
         argmax_tie: usize,
         argmax_bad: usize,
         kernel_bad: usize,
+        /// The held head rows' smallest top-2 margin of ik's logits, over
+        /// its tie cap, and the row: how near (h) came to a tie.
+        margin_min: Option<(f64, f64, String)>,
+        pins: Pins,
+    }
+
+    impl Replay {
+        fn new() -> Replay {
+            Replay {
+                eh_worst: 0.0,
+                eh_fail: 0,
+                l_out_worst: 0.0,
+                logits_worst: 0.0,
+                rows: 0,
+                heads: 0,
+                flips: 0,
+                flips_bad: 0,
+                argmax_same: 0,
+                l_out_held: 0,
+                heads_held: 0,
+                argmax_tie: 0,
+                argmax_bad: 0,
+                kernel_bad: 0,
+                margin_min: None,
+                pins: Pins::new(),
+            }
+        }
     }
 
     /// Replay graph `g` in runs of up to [`MTP_ROWS`] rows, the full head,
     /// the taps armed, into `r`.
-    fn replay(m: &mut Qwen38Model, g: &IkGraph, r: &mut Replay) -> Result<(), GateError> {
+    fn replay(
+        m: &mut Qwen38Model,
+        g: &IkGraph,
+        host: &Host<'_>,
+        r: &mut Replay,
+    ) -> Result<(), GateError> {
         let n = g.tokens.len();
         let vocab = m.body("replay")?.vocab();
         if g.logits.len() != g.out_ids.len() * vocab {
@@ -486,19 +1087,11 @@ mod gate {
                         verdict(ok)
                     );
                 }
-                let l = rel(&w.l_out[t * WIDE..(t + 1) * WIDE], &g.l_out[span]);
-                if flipped[t] {
-                    println!(
-                        "(l) {} row {at}: l_out {l:.3e} on a flip, not held",
-                        g.label()
-                    );
-                } else {
+                let l_out = &w.l_out[t * WIDE..(t + 1) * WIDE];
+                pin_row(host, g, at, &taps, t, l_out, &mut r.pins);
+                if !flipped[t] {
                     r.l_out_held += 1;
-                    r.l_out_worst = r.l_out_worst.max(l);
-                    if l > l_out_band() {
-                        r.l_out_fail += 1;
-                        println!("(l) {} row {at}: l_out {l:.3e} FAIL", g.label());
-                    }
+                    r.l_out_worst = r.l_out_worst.max(rel(l_out, &g.l_out[span]));
                 }
             }
             r.rows += rows;
@@ -524,25 +1117,30 @@ mod gate {
                 let c = o - c0;
                 r.heads += 1;
                 let ours = column(&w.logits, rows, c);
+                let head_in = &taps.nodes[node_at(MtpNode::HeadIn)].1[c * HIDDEN..(c + 1) * HIDDEN];
+                pin_logits(host, head_in, &ours, &mut r.pins.logits, &|| {
+                    format!("{} row {o}", g.label())
+                });
                 let ik = &g.logits[k * vocab..(k + 1) * vocab];
-                let d = rel(&ours, ik);
                 let (top, _) = top2(&ours);
                 let (ik_top, ik_2) = top2(ik);
                 let margin = f64::from(ik[ik_top]) - f64::from(ik[ik_2]);
                 let clears = margin > margin_cap(logits_band(), ik);
                 if flipped[c] {
                     println!(
-                        "(h) {} row {o}: logits {d:.3e}, argmax {top} ik {ik_top} on a flip, not \
-                         held",
+                        "(h) {} row {o}: argmax {top} ik {ik_top} on a flip, not held",
                         g.label()
                     );
                     continue;
                 }
                 r.heads_held += 1;
-                r.logits_worst = r.logits_worst.max(d);
-                if d > logits_band() {
-                    r.logits_fail += 1;
-                    println!("(h) {} row {o}: logits {d:.3e} FAIL", g.label());
+                r.logits_worst = r.logits_worst.max(rel(&ours, ik));
+                let cap = margin_cap(logits_band(), ik);
+                if r.margin_min
+                    .as_ref()
+                    .is_none_or(|(_, q, _)| margin / cap < *q)
+                {
+                    r.margin_min = Some((margin, margin / cap, format!("{} row {o}", g.label())));
                 }
                 if top == ik_top {
                     r.argmax_same += 1;
@@ -753,6 +1351,35 @@ mod gate {
             verdict(chain_ok),
             verdict(host_ok)
         );
+        // A window's chain — a refresh of two rows, then two own walks, one
+        // readback — against the same walks one by one: each walk's last id
+        // and probability, bit for bit.
+        let chain = m.mtp_chain(rows_of(2), 2, MtpHead::Rows, MtpMode::Graph)?;
+        let one = [
+            walk(m, rows_of(2), MtpHead::Rows, MtpMode::Eager)?,
+            walk(m, own(g.pos[0] + 2), MtpHead::Rows, MtpMode::Eager)?,
+            walk(m, own(g.pos[0] + 3), MtpHead::Rows, MtpMode::Eager)?,
+        ];
+        let want: Vec<(u32, u32)> = one
+            .iter()
+            .map(|w| {
+                let last = w.draft.tokens.len() - 1;
+                (w.draft.tokens[last], w.draft.p[last].to_bits())
+            })
+            .collect();
+        let got: Vec<(u32, u32)> = chain
+            .tokens
+            .iter()
+            .zip(&chain.p)
+            .map(|(&t, p)| (t, p.to_bits()))
+            .collect();
+        let chain_walks = got == want;
+        ok &= chain_walks;
+        println!(
+            "(g) a chain of two rows and two own walks = its walks one by one: ids {:?} {}",
+            chain.tokens,
+            verdict(chain_walks)
+        );
         let nodes = m
             .body("graphs")?
             .mtp()
@@ -922,6 +1549,31 @@ mod gate {
         Ok((m, Plain { tokens, stores }))
     }
 
+    /// A run's live stores as the body reads them back, and its PLE ring.
+    type Stores = (Vec<Store38Host>, Vec<f32>);
+
+    /// One plain run of `n` tokens from a reset, as [`plain_run`]'s, its
+    /// stores read once at its end.
+    fn plain_to(
+        m: Qwen38Model,
+        ids: &[u32],
+        path: Prompt38,
+        n: usize,
+    ) -> Result<(Qwen38Model, Vec<u32>, Stores), GateError> {
+        let mut m = m;
+        m.reset()?;
+        let mut tokens = vec![m.prompt38(ids, path)?];
+        for _ in 1..n {
+            let t = m.step(&[tokens[tokens.len() - 1]])?;
+            tokens.push(t);
+        }
+        let stores = {
+            let (gpu, _, b) = m.body_parts("plain")?;
+            b.stores_host(gpu)?
+        };
+        Ok((m, tokens, stores))
+    }
+
     /// The store comparison's shape: the e2e gate's `(v)` rule in one bool —
     /// the committed delta lane, the conv ring's eight slots before the
     /// count, the K/V planes' and raw keys' rows below it, the pools
@@ -1057,13 +1709,16 @@ mod gate {
         }
     }
 
-    /// The drafted session over the model: the draft opened, the verify
+    /// The drafted session over the model from a reset — the plain run it
+    /// is held against starts at position 0 — the draft opened, the verify
     /// widths captured.
     fn drafted_session(
         m: Qwen38Model,
         cfg: app::arch::qwen3moe::Q38Cfg,
         ctx: u32,
     ) -> Result<(app::Session<Body38>, app::arch::qwen3moe::Drafted38), GateError> {
+        let mut m = m;
+        m.reset()?;
         let mut s = app::Session::from_model(m, ctx);
         let draft = app::arch::qwen3moe::MtpDraft::open(s.model(), cfg)?;
         let spec = s.with_draft::<app::arch::qwen3moe::MtpDraft, 4>(draft, &mut Quiet)?;
@@ -1133,7 +1788,8 @@ mod gate {
     /// One scripted window keeping exactly `keep` rows: the kept tokens are
     /// the plain run's, and the live stores after the commit equal its at
     /// the same position — `commit(k)` is `k` steps. The model moves in and
-    /// out. The label names the prompt in the clause's line.
+    /// out, from a reset as the plain run's. The label names the prompt in
+    /// the clause's line.
     fn scripted_window(
         m: Qwen38Model,
         plain: &Plain,
@@ -1142,6 +1798,8 @@ mod gate {
         ctx: u32,
         label: &str,
     ) -> Result<(Qwen38Model, bool), GateError> {
+        let mut m = m;
+        m.reset()?;
         let mut s = app::Session::from_model(m, ctx);
         let vocab = u32::try_from(s.model().body("scripted")?.vocab())?;
         let mut spec = s.with_draft::<Scripted, 4>(
@@ -1179,6 +1837,104 @@ mod gate {
         Ok((m, ok))
     }
 
+    /// (w)'s first clause: the draft's walks over a prompt call are the
+    /// walks the module doc of `app::arch::qwen3moe` names. From a reset,
+    /// the prompt by passes with every unit's hidden rows read to the host,
+    /// then the draft walked from the host as the prompt call walks it —
+    /// position 0 with a zero hidden row, each unit's rows from its second
+    /// position on (the last unit's last excepted) each beside the hidden
+    /// row of the position before it, in runs of eight — and one anchor walk
+    /// at the prompt's end; against the drafted session's prompt call by
+    /// the same passes and the same anchor walk: the anchor's token, streams
+    /// and logits bit for bit — the anchor's attention reads every key the
+    /// walks before it wrote.
+    fn prompt_walks(
+        m: Qwen38Model,
+        prompt: &[u32],
+        path: Prompt38,
+        ctx: u32,
+    ) -> Result<(Qwen38Model, bool), GateError> {
+        let n = prompt.len();
+        let mut m = m;
+        m.reset()?;
+        let mut streams = vec![0.0f32; n * WIDE];
+        let mut units: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut sink = |mm: &mut Qwen38Model,
+                            walk: TargetRows,
+                            first: u32,
+                            rows: usize|
+             -> Result<(), GpuError> {
+                let f = first as usize;
+                let v = mm.target_streams(walk, rows)?;
+                streams[f * WIDE..(f + rows) * WIDE].copy_from_slice(&v);
+                units.push((f, rows));
+                Ok(())
+            };
+            m.prompt38_with(prompt, path, Some(&mut sink))?;
+        }
+        let (h, e) = (MtpHead::Rows, MtpMode::Eager);
+        let zeros = vec![0.0f32; WIDE];
+        m.mtp_walk(
+            MtpFeed::Rows {
+                tokens: &prompt[..1],
+                pos0: 0,
+                hidden: MtpHidden::Host(&zeros),
+            },
+            h,
+            e,
+        )?;
+        for &(f, rows) in &units {
+            let end = (f + rows + 1).min(n);
+            for (i, run) in prompt[f + 1..end].chunks(MTP_ROWS).enumerate() {
+                let q = f + 1 + i * MTP_ROWS;
+                m.mtp_walk(
+                    MtpFeed::Rows {
+                        tokens: run,
+                        pos0: u32::try_from(q)?,
+                        hidden: MtpHidden::Host(
+                            &streams[(q - 1) * WIDE..(q - 1 + run.len()) * WIDE],
+                        ),
+                    },
+                    h,
+                    e,
+                )?;
+            }
+        }
+        let anchor = |m: &mut Qwen38Model| {
+            walk(
+                m,
+                MtpFeed::Rows {
+                    tokens: &prompt[..1],
+                    pos0: u32::try_from(n).expect("a prompt fits u32"),
+                    hidden: MtpHidden::Host(&streams[(n - 1) * WIDE..]),
+                },
+                h,
+                e,
+            )
+        };
+        let host = anchor(&mut m)?;
+        let cfg = app::arch::qwen3moe::Q38Cfg {
+            prompt: path,
+            draft: MtpMode::Eager,
+        };
+        let (mut s, mut spec) = drafted_session(m, cfg, ctx)?;
+        spec.prompt(&mut s, prompt)?;
+        let mut m = s.into_model();
+        let call = anchor(&mut m)?;
+        let same = same_bits(&host, &call);
+        println!(
+            "(w) the prompt call ({path:?}) walks the draft over {n} positions in {} units as the \
+             walks fed from the host: the anchor's token {} (host {}), streams and logits bit \
+             for bit {}",
+            units.len(),
+            call.draft.tokens[0],
+            host.draft.tokens[0],
+            verdict(same)
+        );
+        Ok((m, same))
+    }
+
     /// The drafted session's cfg, its prompt path `path`.
     fn step_cfg(path: Prompt38) -> app::arch::qwen3moe::Q38Cfg {
         app::arch::qwen3moe::Q38Cfg {
@@ -1204,7 +1960,9 @@ mod gate {
     ) -> Result<(Qwen38Model, bool), GateError> {
         const N: usize = 64;
         let ctx = m.body("windows")?.ctx() as u32;
-        let mut ok = true;
+        let (m, auto_ok) = prompt_walks(m, prompt, Prompt38::Auto, ctx)?;
+        let (m, pass_ok) = prompt_walks(m, prompt, Prompt38::Pass, ctx)?;
+        let mut ok = pass_ok && auto_ok;
 
         // The plain reference: every step's live stores, four tokens past
         // the drafted loop's count (its last pass may keep rows past it).
@@ -1285,10 +2043,18 @@ mod gate {
             )?;
             (s.into_model(), out, k)
         };
-        let ids_ok = out.tokens[..4] == deep_plain.tokens[..4];
+        let drafted = {
+            let (gpu, _, b) = m.body_parts("windows")?;
+            b.stores_host(gpu)?
+        };
+        // The plain run to the drafted run's end, its stores read there.
+        let n_plain = kept.pos as usize - deep.len() + 1;
+        let (m2, plain_tokens, plain_stores) = plain_to(m, deep, Prompt38::Auto, n_plain)?;
+        let mut m = m2;
+        let ids_ok = out.tokens[..N] == plain_tokens[..N];
         ok &= ids_ok;
         println!(
-            "(w) depth {}: the drafted run's first 4 ids = the plain run's {}",
+            "(w) depth {}: the drafted run's {N} ids = the plain run's {}",
             deep.len(),
             verdict(ids_ok)
         );
@@ -1306,13 +2072,7 @@ mod gate {
             kept.rows,
             verdict(rejections > 0)
         );
-        let at = (kept.pos as usize - deep.len()).min(3);
-        let (gpu, _, b) = m.body_parts("windows")?;
-        let stores_ok = live_same(
-            &b.stores_host(gpu)?,
-            &deep_plain.stores[at - 1],
-            kept.pos as usize,
-        );
+        let stores_ok = live_same(&drafted, &plain_stores, kept.pos as usize);
         ok &= stores_ok;
         println!(
             "(w) depth {}: the live stores after the drafted run = the plain run's at position \
@@ -1334,7 +2094,6 @@ mod gate {
 
         // The lane word planted on a lane no call wrote: the next drafted
         // pass raises the delta stamp fault by name and poisons the model.
-        m.reset()?;
         let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Step), ctx)?;
         let first = spec.prompt(&mut s, prompt)?;
         {
@@ -1364,6 +2123,91 @@ mod gate {
         Ok((m, ok))
     }
 
+    /// (w) prompt calls that continue the held sequence: after the drafted
+    /// windows of `prompt`, three ids the model did not generate fed by the
+    /// rule's prompt call, then windows. The draft joins at the call's start
+    /// (the rows the last window left waiting walked, the call's first id at
+    /// their last position) and drafts, and the ids are the plain run's —
+    /// the same prompt, the drafted run's fed ids stepped, the same three ids
+    /// by the same prompt path. Then a join the draft cannot make: restarted
+    /// beside a target that holds the sequence, it skips the next call by
+    /// name and proposes nothing, the ids still the plain run's.
+    fn continued(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 8;
+        let ctx = m.body("continued")?.ctx() as u32;
+        let ext: Vec<u32> = prompt.iter().copied().skip(1).take(3).collect();
+        let p0 = prompt.len();
+        let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+        let first = spec.prompt(&mut s, prompt)?;
+        let stop = runtime::Stop::new(N, ctx)?;
+        let out1 = runtime::generate(&mut s, &mut spec, prompt, first, &stop, &mut QuietSink)?;
+        let p1 = s.pos() as usize;
+        let fed1 = out1.tokens[..p1 - p0].to_vec();
+        let own = out1.tokens[p1 - p0];
+        let first2 = spec.prompt(&mut s, &ext)?;
+        let join = spec.draft_mut().take_joined();
+        let mut k2 = Kept::default();
+        let out2 = runtime::generate(&mut s, &mut spec, &ext, first2, &stop, &mut k2)?;
+        let p2 = s.pos() as usize;
+        let fed2 = out2.tokens[..p2 - p1 - ext.len()].to_vec();
+        spec.draft_mut().restart();
+        let first3 = spec.prompt(&mut s, &ext)?;
+        let skip = spec.draft_mut().take_joined();
+        let mut k3 = Kept::default();
+        let out3 = runtime::generate(&mut s, &mut spec, &ext, first3, &stop, &mut k3)?;
+        let mut m = s.into_model();
+
+        // The plain run: the same prompt calls, the drafted run's fed ids
+        // stepped between them.
+        m.reset()?;
+        let plain = |m: &mut Qwen38Model, ids: &[u32]| -> Result<Vec<u32>, GateError> {
+            let mut t = vec![m.prompt38(ids, Prompt38::Auto)?];
+            for _ in 1..N {
+                t.push(m.step(&[t[t.len() - 1]])?);
+            }
+            Ok(t)
+        };
+        let _ = m.prompt38(prompt, Prompt38::Auto)?;
+        for &x in &fed1 {
+            m.step(&[x])?;
+        }
+        let plain2 = plain(&mut m, &ext)?;
+        m.reset()?;
+        let _ = m.prompt38(prompt, Prompt38::Auto)?;
+        for &x in fed1.iter().chain(&ext).chain(&fed2) {
+            m.step(&[x])?;
+        }
+        let plain3 = plain(&mut m, &ext)?;
+        m.reset()?;
+
+        let joined_ok =
+            join.is_some_and(|j| j.start as usize == p1 && j.caught_up >= 1 && j.skipped.is_none());
+        let drafted_ok = k2.proposed.iter().any(|&p| p);
+        let ids2_ok = out2.tokens[..N] == plain2[..];
+        let skip_ok =
+            skip.is_some_and(|j| j.start as usize == p2 && j.caught_up == 0 && j.skipped.is_some());
+        let none_ok = !k3.proposed.iter().any(|&p| p);
+        let ids3_ok = out3.tokens[..N] == plain3[..];
+        println!(
+            "(w) a prompt call of {ext:?} continuing at {p1} (the model's own next id {own}): \
+             joined {join:?} {}, windows kept {:?} drafted {}, its {N} ids = the plain run's {}",
+            verdict(joined_ok),
+            k2.rows,
+            verdict(drafted_ok),
+            verdict(ids2_ok)
+        );
+        println!(
+            "(w) the draft restarted, a prompt call continuing at {p2}: joined {skip:?} {}, \
+             {} passes proposed nothing {}, its {N} ids = the plain run's {}",
+            verdict(skip_ok),
+            k3.rows.len(),
+            verdict(none_ok),
+            verdict(ids3_ok)
+        );
+        let ok = joined_ok && drafted_ok && ids2_ok && skip_ok && none_ok && ids3_ok;
+        Ok((m, ok))
+    }
+
     pub(super) fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[])?;
         let dir = MTP.path(MTP_SET);
@@ -1382,11 +2226,15 @@ mod gate {
             MTP.name
         );
         println!(
-            "bands: eh {:.4e} l_out {:.4e} logits {:.4e} router {:.4e} free {FREE_BAND:.2}",
+            "bands: eh {:.4e} router {:.4e} the argmax cap's {:.4e} free {FREE_BAND:.2}; the \
+             node-local pins: γ(k/32 + 5) a dot, the pack ½γ(52) + 6u = {:.3e}, the mixes \
+             MIXED_BAND {:.1e}, the combines' weights LO_BAND {:.1e}",
             eh_band(),
-            l_out_band(),
+            router_band(),
             logits_band(),
-            router_band()
+            pack_rel(),
+            MIXED_BAND,
+            LO_BAND
         );
         let open = |p: &str| Split::open(p).map_err(|e| format!("open {p}: {e}"));
         let (file, draft) = (open(MODEL)?, open(DRAFT)?);
@@ -1416,13 +2264,15 @@ mod gate {
             "a walk before the draft's own row",
         );
 
+        let head_file = open(MODEL)?;
+        let host = Host::open(&head_file, &draft, inputs.hp.rms_eps)?;
         m.set_mtp_taps(true)?;
-        let mut r = Replay::default();
+        let mut r = Replay::new();
         let mut last = None;
         let mut warm = None;
         for &(b, g) in &order {
             let ig = IkGraph::read(&set, b, g)?;
-            replay(&mut m, &ig, &mut r)?;
+            replay(&mut m, &ig, &host, &mut r)?;
             if g == Graph::Warmup {
                 warm = Some(ig);
             } else {
@@ -1440,34 +2290,42 @@ mod gate {
             r.eh_fail,
             verdict(e_ok)
         );
-        let l_ok = r.l_out_fail == 0 && r.flips_bad == 0 && r.l_out_held > 0;
+        let l_ok = r.flips_bad == 0 && r.l_out_held > 0;
         println!(
-            "(l) l_out on {} rows held, {} on flips: worst {:.3e} (band {:.3e}), {} past; {} \
-             flips not allowed {}",
-            r.l_out_held,
+            "(l) {} rows, {} on flips, {} flips not allowed; l_out's distance from ik's on the {} \
+             rows held {:.3e} (printed, not held: the rounding of ik's q8 activations) {}",
+            r.rows,
             r.flips,
-            r.l_out_worst,
-            l_out_band(),
-            r.l_out_fail,
             r.flips_bad,
+            r.l_out_held,
+            r.l_out_worst,
             verdict(l_ok)
         );
-        let h_ok = r.logits_fail == 0 && r.argmax_bad == 0 && r.kernel_bad == 0 && r.heads_held > 0;
+        let h_ok = r.argmax_bad == 0 && r.kernel_bad == 0 && r.heads_held > 0;
         println!(
-            "(h) {} head rows, {} held: logits worst {:.3e} (band {:.3e}), {} past; argmax = \
-             ik's {}, ties {}, wrong {}; the draft's token = our argmax but {} {}",
+            "(h) {} head rows, {} held: argmax = ik's {}, ties {}, wrong {}; ik's smallest top-2 \
+             margin {}; the draft's token = our argmax but {}; the logits' distance from ik's \
+             {:.3e} (printed, not held) {}",
             r.heads,
             r.heads_held,
-            r.logits_worst,
-            logits_band(),
-            r.logits_fail,
             r.argmax_same,
             r.argmax_tie,
             r.argmax_bad,
+            r.margin_min
+                .as_ref()
+                .map_or("-".to_string(), |(m, q, at)| format!(
+                    "{m:.3e}, {q:.2} of its tie cap, at {at}"
+                )),
             r.kernel_bad,
+            r.logits_worst,
             verdict(h_ok)
         );
-        ok &= e_ok && l_ok && h_ok;
+        let mut n_ok = true;
+        for p in r.pins.all() {
+            println!("{}", p.line());
+            n_ok &= p.ok();
+        }
+        ok &= e_ok && l_ok && h_ok && n_ok;
         let map = m
             .body("list")?
             .mtp()
@@ -1481,8 +2339,10 @@ mod gate {
         ok &= pairing(&mut m, &prompt, &warm)?;
         ok &= graphs(&mut m, &warm)?;
         ok &= refusals(&mut m, &warm)?;
-        let (_, w_ok) = windows(m, &prompt, &deep_prompt()?)?;
+        let (m, w_ok) = windows(m, &prompt, &deep_prompt()?)?;
         ok &= w_ok;
+        let (_, c_ok) = continued(m, &prompt)?;
+        ok &= c_ok;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

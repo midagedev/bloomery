@@ -26,8 +26,9 @@
 //!   and `generate_qwen3moe`'s (the whole prompt) leave the same state, while
 //!   past that each runs the prompt's last position through a different arm;
 //! - the same `/completion` again, and once more after the other requests
-//!   below: the same ids each time (a request keeps no prefix of another's —
-//!   every request prefills from a reset, never a wrong state);
+//!   below: the same ids each time (a request that does not extend the held
+//!   sequence keeps none of it — it prefills from a reset, never a wrong
+//!   state);
 //! - `/v1/chat/completions` of one user turn at temperature 0: the streamed
 //!   deltas concatenate to the non-streamed content, and the stream ends with
 //!   `data: [DONE]`;
@@ -35,6 +36,12 @@
 //! - the positions the server serves: `/props`' `n_ctx` is the server's
 //!   default context; a prompt of that many ids is a 400
 //!   (`exceed_context_size_error`, naming it) and the server stays up.
+//! - under `BLOOMERY_DRAFT=mtp`, requests that extend the sequence the
+//!   server holds (`continued`): each keeps the held prefix (`cache_n`), a
+//!   prompt call past it prints one `mtp prompt` record — the draft caught
+//!   up at the kept position, nothing skipped — and none prints a skip, and
+//!   each drafts, with the plain run's ids (the generated ones) or the same
+//!   prompt's fed fresh.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
@@ -477,6 +484,197 @@ mod gate {
         Ok(ok)
     }
 
+    /// The `mtp prompt` records on the server's stderr so far.
+    fn mtp_prompts(err_log: &Path) -> Result<Vec<String>, GateError> {
+        Ok(std::fs::read_to_string(err_log)?
+            .lines()
+            .filter(|l| l.starts_with("mtp prompt "))
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// An `mtp prompt` record's join: its start, the rows the draft caught
+    /// up and why it skipped (`none` when it drafts; the text runs to the
+    /// line's end).
+    fn join_of(line: &str) -> Option<(u64, u64, &str)> {
+        let key = |name: &str| {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))
+                .and_then(|v| v.parse().ok())
+        };
+        let (_, skipped) = line.split_once(" skipped=")?;
+        Some((key("start")?, key("caught_up")?, skipped))
+    }
+
+    /// One greedy `/completion` of the token array `ids`: its status, ids,
+    /// `cache_n` and `draft_n`, and the `mtp prompt` records it made the
+    /// server print. A request the server does not answer is a status of 0
+    /// and its error as the ids' line.
+    fn greedy(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        ids: &[u32],
+        n: usize,
+        cache: bool,
+    ) -> Result<Greedy, GateError> {
+        let before = mtp_prompts(err_log)?.len();
+        let body = json!({
+            "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
+            "cache_prompt": cache,
+        });
+        let g = match curl(&url("/completion"), Some(&body), false) {
+            Ok((200, text)) => {
+                let v = json_of("/completion", 200, &text)?;
+                Greedy {
+                    ok: true,
+                    tokens: ids_of(&v["tokens"]),
+                    cache_n: v["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX),
+                    draft_n: v["timings"]["draft_n"].as_u64().unwrap_or(0),
+                    joins: Vec::new(),
+                    said: String::new(),
+                }
+            }
+            Ok((st, text)) => Greedy::failed(format!("HTTP {st}: {text}")),
+            Err(e) => Greedy::failed(e.to_string()),
+        };
+        let joins = mtp_prompts(err_log)?.split_off(before);
+        Ok(Greedy { joins, ..g })
+    }
+
+    struct Greedy {
+        ok: bool,
+        tokens: Vec<u32>,
+        cache_n: u64,
+        draft_n: u64,
+        joins: Vec<String>,
+        said: String,
+    }
+
+    impl Greedy {
+        fn failed(said: String) -> Greedy {
+            Greedy {
+                ok: false,
+                tokens: Vec::new(),
+                cache_n: u64::MAX,
+                draft_n: 0,
+                joins: Vec::new(),
+                said,
+            }
+        }
+
+        /// The request's line.
+        fn show(&self, what: &str) {
+            if self.ok {
+                println!(
+                    "{what}: tokens {:?} cache_n={} draft_n={} joins {:?}",
+                    self.tokens, self.cache_n, self.draft_n, self.joins
+                );
+            } else {
+                println!("{what}: {} joins {:?}", self.said, self.joins);
+            }
+        }
+
+        /// One join printed for this request, at `start`, that walked the
+        /// draft up to it and skipped nothing.
+        fn joined_at(&self, start: u64) -> bool {
+            matches!(self.joins.as_slice(), [l] if join_of(l)
+                .is_some_and(|(s, c, k)| s == start && c >= 1 && k == "none"))
+        }
+    }
+
+    /// The drafted server's continuations (`BLOOMERY_DRAFT=mtp`): requests
+    /// that extend the sequence the server holds keep its prefix
+    /// (`cache_prompt`), and the draft joins them — the rows an earlier
+    /// request left waiting walked, the token the new request puts at their
+    /// last position — so it drafts from the first window, with the plain
+    /// run's ids. Three joins: after a request that ended on its first step
+    /// (`n_predict` 1), extended by the id it generated: its prompt call is
+    /// empty, the join is its first step's, and no `mtp prompt` record says
+    /// it skipped; after drafted windows (the held sequence is at most 11
+    /// ids past the prompt: 8 generated, the last window's 3 past them),
+    /// extended by the plain run's next ids, a prompt call of 1 to 4 ids and
+    /// its record; and after a first step again, extended by ids the model
+    /// did not generate, against the same prompt fed fresh. Every prompt
+    /// call stays below
+    /// [`GEMM_FROM`](bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM), so
+    /// a continued and a fresh feed leave the same state.
+    fn continued(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        ids: &[u32],
+        reference: &[u32],
+    ) -> Result<bool, GateError> {
+        let p = ids.len() as u64;
+        let with = |tail: &[u32]| -> Vec<u32> { ids.iter().chain(tail).copied().collect() };
+        let mut ok = true;
+
+        let a = greedy(url, err_log, ids, 1, true)?;
+        a.show("continued: the prompt, one id");
+        check(
+            &mut ok,
+            "continued_first_request_is_the_plain_first_id",
+            a.ok && a.tokens == reference[..1],
+        );
+
+        let x1 = greedy(url, err_log, &with(&reference[..1]), 8, true)?;
+        x1.show("continued: extended by its id");
+        check(
+            &mut ok,
+            "continued_by_its_own_id_keeps_the_prompt_and_skips_nothing",
+            x1.ok && x1.cache_n == p && x1.joins.is_empty(),
+        );
+        check(
+            &mut ok,
+            "continued_by_its_own_id_drafts_the_plain_ids",
+            x1.ok && x1.draft_n > 0 && x1.tokens == reference[1..9],
+        );
+
+        let x2 = greedy(url, err_log, &with(&reference[..13]), 3, true)?;
+        x2.show("continued: after windows, extended by the plain ids");
+        check(
+            &mut ok,
+            "continued_after_windows_keeps_them_and_joins_at_their_end",
+            x2.ok && x2.cache_n > p + 1 && x2.joined_at(x2.cache_n),
+        );
+        check(
+            &mut ok,
+            "continued_after_windows_drafts_the_plain_ids",
+            x2.ok && x2.draft_n > 0 && x2.tokens == reference[13..16],
+        );
+
+        let ext: Vec<u32> = ids.iter().copied().skip(1).take(3).collect();
+        if ext.len() != 3 || ext[0] == reference[0] {
+            return Err(format!(
+                "--ids {ids:?}: the extension {ext:?} must be three ids, its first not the \
+                 generated id {}",
+                reference[0]
+            )
+            .into());
+        }
+        let b = greedy(url, err_log, ids, 1, true)?;
+        b.show("continued: the prompt again, one id");
+        let x3 = greedy(url, err_log, &with(&ext), 8, true)?;
+        x3.show("continued: extended by other ids");
+        let fresh = greedy(url, err_log, &with(&ext), 8, false)?;
+        fresh.show("continued: the same ids fed fresh");
+        check(
+            &mut ok,
+            "continued_by_other_ids_keeps_the_prompt_and_joins_at_its_end",
+            b.ok && x3.ok && x3.cache_n == p && x3.joined_at(p),
+        );
+        check(
+            &mut ok,
+            "continued_by_other_ids_drafts_the_fresh_ids",
+            x3.ok
+                && fresh.ok
+                && fresh.cache_n == 0
+                && x3.draft_n > 0
+                && x3.tokens == fresh.tokens
+                && x3.tokens.len() == 8,
+        );
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
         let a = parse_args()?;
@@ -612,6 +810,9 @@ mod gate {
 
         let id = a.ids.iter().copied().min().ok_or("--ids is empty")?;
         ok &= position_limit(&url, id)?;
+        if levers.draft() == Some("mtp") {
+            ok &= continued(&url, &err_log, &a.ids, &reference)?;
+        }
 
         println!("server stopped: {}", served.stop()?);
         if ok {

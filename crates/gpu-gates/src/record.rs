@@ -1370,6 +1370,20 @@ pub static DRAFT_SUMMARY: Kind = Kind {
     ],
 };
 
+/// The MTP draft's join to a held sequence a prompt call continues.
+pub static MTP_PROMPT: Kind = Kind {
+    name: "mtp_prompt",
+    head: "mtp prompt",
+    doc: "BLOOMERY_DRAFT=mtp: a prompt call that continues the held sequence: its first \
+          position, the rows the draft walked to catch its store up to it, and why the draft \
+          proposes nothing for the call's generation (none when it drafts).",
+    parts: &[
+        key("start", U64, "positions"),
+        key("caught_up", U64, ""),
+        key("skipped", Text, ""),
+    ],
+};
+
 /// The MTP draft's window summary.
 pub static MTP_SUMMARY: Kind = Kind {
     name: "mtp_summary",
@@ -1687,7 +1701,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
 ];
 
 /// What `bloomery-serve-qwen38` prints, all on stderr.
-pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[&PLAN38, &LISTENING38, &CACHE_REUSE];
+pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[&PLAN38, &LISTENING38, &CACHE_REUSE, &MTP_PROMPT];
 
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
