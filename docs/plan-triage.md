@@ -120,6 +120,35 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### What glmpaper-replay left (line1, 10-01 — a Mac replay of GLM residency over the ik router set glm5next-prose)
+
+The replay (24 contexts of 2048, a 512-token prompt kept 0, then the engine's `mid` rule) puts the cold n = 96 arm at
+hit 23.1 → 39.5 % and +3…+15 % at the timed prompt, the steady state at +28…+41 % (P 0) and +20…+30 % (P 33); P changes
+nothing inside 95 steps [derived]. The one open term is τ, a flip's staging cost on the step, 0.13–0.60 ms
+(`docs/cards/glmres-ab.card`).
+
+- **The GLM A/B cannot run yet (S–M, `tools/` — lead after the freeze)**: `tools/ref/depth-glm5next.sh` has no
+  `<D>@NAME=VALUE` lever arm (depth-qwen3moe.sh's grammar), and its line ~770 keeps only
+  `plan|load|capture|fed|step 0|time prompt` lines, so the `residency` and `stat` records the card's condition and
+  its τ read-out need are dropped. Port depth-qwen3moe.sh's residency sum and host-slots columns.
+- **GLM default P = 0 (XS, after the A/B)**: steady state +7.7 hit points over P 33, ≈ −2.7 ms a step; the churn pool
+  grows 20.2 → 39.7 GB of host RAM. `residency host`'s headroom_after checks it.
+- **Prompt-call pick for GLM (M, the biggest lever)**: V4.1's callstream pick at floor 32 (22 experts a layer, 334 MB
+  inside one 86–114 ms layer-batch): n = 96 at 58.3 % hit, +23…+34 %, and the MTP window at 32–34 tok/s [derived];
+  floors 16 and 1 overflow the layer-batch.
+- **Staging that pauses outside the window (S–M, `crates/gpu/src/host/swap.rs:815`)**: the window is read only when a
+  job starts, so ~70 % of a memcpy runs over the host leg; re-reading it per 2 MiB piece could take τ near 0 —
+  worth f·τ = 0.7–3.5 ms a step (+1.5…+9 %) [derived]. After τ is measured.
+- **A `knee` rule preset (S–M, `crates/runtime/src/swaprule.rs:55`)**: 1.3–1.5 flips a step, steady state +30…+33 %
+  at any τ; beats `mid` only when τ > 0.55. After τ is measured.
+- **glm5next router set: chunk ≥ 1 routing drifts (S, oracle identity)**: `tools/ref/router_trace.cpp:442` clears only
+  the KV cache between chunks. Engine vs ik id overlap is 95–96 % on chunk 0's late layers and 81–87 % on chunk 1's
+  (early layers 98–99 % in both), so the KDA recurrent state may carry across chunks. Re-trace two contexts and
+  compare before any gate reads chunk ≥ 1.
+- **router-residency.py's `gen` is off the engine's shape by one pass (S)**: the zero arm and steady state run with
+  n_l live (no spare), a `Budget(30)` link and no prompt pass (`tools/ref/router-residency.py:655, 750`); give it an
+  engine-shape option.
+
 ### What T0 and the 09-30 night left (line3 — `lanea`, `gmerge`, `mtppf`, `mtpcost`, `c4resid`, `resitrun`)
 
 Qwen3.8 on the A6000 plan (a), prose, C 4352 (rig-log 09-30 #q38mtp-speed, #q38res-mtp, #q38mtp-wide): the MTP
