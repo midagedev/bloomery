@@ -1,0 +1,996 @@
+//! The GLM-5.3-Flash NextN draft's gate: the target opened by its NextN plan
+//! on the gate card with the next-token layer beside it
+//! (`Body::open_placed_nextn`, `place::PlanInputs::plan_nextn`), the NextN
+//! program's walks (`bloomery_gpu_glm5next::nextn_walk`, `nextn_chain`)
+//! held against ik's MTP draft set (refset family `mtp-glm5next`) and the
+//! drafted windows (`app::mtp::MtpDraft<Body>`) against the plain run.
+//!
+//! What is asserted:
+//! - (m) the set's position mask: its warmup graph holds ik's
+//!   `mtp_token_embd_pos_masked`, zeros on the row at position 0 and not on
+//!   the others — the rule the program's embedding rows follow.
+//! - (o) teacher-forced, every graph of the set replayed in ik's order — the
+//!   warmup, then each block's graphs — each row's token, position and
+//!   target hidden row (ik's `inp_tokens`, `inp_pos`, `inp_mtp_states`) fed
+//!   from the host in runs of up to [`WALK_ROWS`] rows, the runs before the
+//!   last store-only walks and the last one a chain: the chain's id is the
+//!   argmax of our full head's logits, first index on a tie; on the graph's
+//!   last row that argmax is ik's `result_output` argmax wherever ik's
+//!   top-2 margin clears [`margin_cap`] at [`logits_band`], and ik's
+//!   runner-up otherwise. Each block's proposal — the argmax of the graph
+//!   before its update graph — is the set's draft token for the block, or
+//!   that graph's tie. The logits' distance from ik's is printed, not held.
+//!   At least one graph is held off a tie.
+//! - (p) the pairing: the hidden rows a walk fed the target's arenas reads
+//!   (`bloomery_gpu_glm5next::nextn_hidden`, the walk's own gather): the
+//!   set's prompt in batches and by steps leaves the same rows in the
+//!   prompt-batch and step arenas, bit for bit; the row at position `q`
+//!   within [`FREE_BAND`] of ik's warmup row at `q + 1` and closer than at
+//!   `q` or `q + 2`; a verify of two rows leaves in the pair arena the rows
+//!   two plain steps leave, bit for bit, and keeps them past its commit and
+//!   the next step.
+//! - (t) the target is the NextN load's own: the plain run of the set's
+//!   prompt and [`N`] greedy ids on a load of the NextN plan's target plan
+//!   without the layer, and the same on the NextN load, give the same ids
+//!   and every step's logits bit for bit. ik's committed stream beside them
+//!   is printed, not held.
+//! - (w) the windows end to end, the prompt fed in batches and by steps:
+//!   under `Speculative<MtpDraft<Body>, 2>` the drafted greedy ids are the
+//!   plain run's for [`N`] tokens, with a rejected row and an accepted
+//!   proposal among the windows — else either path never ran and the clause
+//!   is red.
+//! - (f) the walk's refusals by name: a walk on a load without the layer, a
+//!   captured walk, no rows, [`WALK_ROWS`] + 1 rows, a walk from past the
+//!   positions the store holds, a token past the vocabulary, a host hidden
+//!   slice of the wrong length, target rows past the arena's, and a chain
+//!   with own walks, in the store walk's mode or into no place; each leaves
+//!   the store's positions where they were.
+
+#[cfg(not(feature = "glm5next"))]
+fn main() {
+    eprintln!(
+        "gate_glm5next_mtp: built without the `glm5next` feature; see `just gate-gpu-glm5next-mtp`."
+    );
+    std::process::exit(2);
+}
+
+#[cfg(feature = "glm5next")]
+fn main() -> std::process::ExitCode {
+    bloomery_gpu_gates::exit_with("gate_glm5next_mtp", gate::run())
+}
+
+#[cfg(feature = "glm5next")]
+mod gate {
+    use std::time::Instant;
+
+    use app::Session;
+    use app::mtp::MtpDraft;
+    use bloomery_gpu::GpuError;
+    use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::model::StepMode;
+    use bloomery_gpu_gates::rounding::q8_32_rel;
+    use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, verdict};
+    use bloomery_gpu_glm5next::{
+        Body, Glm5nextModel, GlmArena, GlmPromptSink, NextnFeed, NextnHead, NextnHidden, NextnMode,
+        PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden, nextn_logits, nextn_walk,
+        prompt_with, set_prefill,
+    };
+    use gguf::Split;
+    use model::arch::glm5next::place::{NextnInputs, PlanInputs};
+    use model::placement::{PlanLevers, workstation};
+    use refset::arch::glm5next::{MODEL, MTP, MTP_SET};
+    use refset::ik::Layout;
+    use refset::mtpref::{Graph, MtpSet};
+    use runtime::{Advance as _, Committed, PassSink};
+
+    /// Cache rows: the e2e gate's main load.
+    const CTX: usize = 3136;
+    /// Generated ids a plain or drafted run holds: the set's.
+    const N: usize = 64;
+    /// The verify's rows: a proposal of one id and the token before it.
+    const M: usize = 2;
+
+    /// PIN(2026-10-01): the band of the NextN head's logits against ik's that
+    /// (o)'s tie cap reads: on ik's own inputs (the token and the hidden row
+    /// fed from the set), the projections in series where ik's CPU side reads
+    /// 32-value q8 activations and ours f32 — `eh_proj`, the joined latent
+    /// projection, the query's up projection, the key and value absorbs, the
+    /// attention's output projection, the routed experts' gate·up and down,
+    /// the shared expert's gate·up and down, and the head's projection:
+    /// eleven terms of [`q8_32_rel`], √11 · 1.2858e-2 = 4.26e-2.
+    fn logits_band() -> f64 {
+        11f64.sqrt() * q8_32_rel()
+    }
+
+    /// PIN(2026-10-01): [provisional — backlog] our hidden rows after the
+    /// set's prompt against ik's warmup `inp_mtp_states`: the e2e gate's
+    /// `FREE_BAND`, its derivation over the layer outputs (√45 · 1.415e-2 ≈
+    /// 0.095) carried through the streams' mean and `output_norm`, which add
+    /// a rounding each; held here at 64 positions of drift where the e2e gate
+    /// holds it at 4, so a red here reads the drift first.
+    const FREE_BAND: f64 = 0.10;
+
+    /// The deviation of `v` about its mean: the spread a ranking reads.
+    fn spread(v: &[f32]) -> f64 {
+        let n = v.len().max(1) as f64;
+        let mean = v.iter().map(|&x| f64::from(x)).sum::<f64>() / n;
+        (v.iter()
+            .map(|&x| (f64::from(x) - mean).powi(2))
+            .sum::<f64>()
+            / n)
+            .sqrt()
+    }
+
+    /// The widest gap between two of a row's values the errors can cross:
+    /// `band` times the row's spread (a common offset moves no rank), three
+    /// deviations each — the e2e gates' `margin_cap`.
+    fn margin_cap(band: f64, v: &[f32]) -> f64 {
+        6.0 * band * spread(v)
+    }
+
+    /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch.
+    fn rel(a: &[f32], b: &[f32]) -> f64 {
+        if a.len() != b.len() {
+            return f64::INFINITY;
+        }
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (&x, &y) in a.iter().zip(b) {
+            num += (f64::from(x) - f64::from(y)).powi(2);
+            den += f64::from(y).powi(2);
+        }
+        let r = (num / den.max(f64::MIN_POSITIVE)).sqrt();
+        if r.is_nan() { f64::INFINITY } else { r }
+    }
+
+    /// The first index of the largest value, and the largest of the rest:
+    /// the head's tie rule.
+    fn top2(v: &[f32]) -> (usize, usize) {
+        let mut best = 0;
+        for (i, &x) in v.iter().enumerate() {
+            if x > v[best] {
+                best = i;
+            }
+        }
+        let mut second = usize::from(best == 0);
+        for (i, &x) in v.iter().enumerate() {
+            if i != best && x > v[second] {
+                second = i;
+            }
+        }
+        (best, second)
+    }
+
+    /// One graph of the set: its block, label and rows, ik's side.
+    struct IkGraph {
+        block: i32,
+        graph: Graph,
+        tokens: Vec<u32>,
+        pos: Vec<u32>,
+        states: Vec<f32>,
+        /// ik's head rows: `inp_out_ids`, or the one row of a one-row graph.
+        out_ids: Vec<usize>,
+        logits: Vec<f32>,
+    }
+
+    impl IkGraph {
+        fn read(
+            set: &MtpSet,
+            block: i32,
+            graph: Graph,
+            hidden: usize,
+        ) -> Result<IkGraph, GateError> {
+            let find = |name: &str| set.find(block, graph, name, 0);
+            let unsigned = |name: &str| -> Result<Vec<u32>, GateError> {
+                set.i32s(find(name)?, Layout::Flat)?
+                    .into_iter()
+                    .map(|v| u32::try_from(v).map_err(|_| format!("{name} holds {v}").into()))
+                    .collect()
+            };
+            let tokens = unsigned("inp_tokens")?;
+            let n = tokens.len();
+            let pos = unsigned("inp_pos")?;
+            // ik builds `inp_out_ids` only for a graph of more than one row.
+            let out_ids = if n > 1 {
+                unsigned("inp_out_ids")?
+                    .into_iter()
+                    .map(|v| v as usize)
+                    .collect()
+            } else {
+                vec![0]
+            };
+            let g = IkGraph {
+                block,
+                graph,
+                states: set.logical_f32s(find("inp_mtp_states")?)?,
+                logits: set.logical_f32s(find("result_output")?)?,
+                tokens,
+                pos,
+                out_ids,
+            };
+            let label = g.label();
+            if n == 0 || g.pos.len() != n || g.states.len() != n * hidden {
+                return Err(format!(
+                    "{label}: {n} tokens, {} positions, {} hidden values; {n} rows of {hidden} take \
+                     {}",
+                    g.pos.len(),
+                    g.states.len(),
+                    n * hidden
+                )
+                .into());
+            }
+            if g.pos.windows(2).any(|w| w[1] != w[0] + 1) || g.out_ids.iter().any(|&o| o >= n) {
+                return Err(format!(
+                    "{label}: positions not consecutive, or an output row past {n}"
+                )
+                .into());
+            }
+            Ok(g)
+        }
+
+        fn label(&self) -> String {
+            format!("block {} {}", self.block, self.graph.as_str())
+        }
+    }
+
+    /// The set's graphs in the order ik computed them: the warmup, then each
+    /// verified block's graphs in file order.
+    fn graphs_of(set: &MtpSet) -> Vec<(i32, Graph)> {
+        let mut order: Vec<(i32, Graph)> = Vec::new();
+        for r in &set.rows {
+            if !order.contains(&(r.block, r.graph)) {
+                order.push((r.block, r.graph));
+            }
+        }
+        order
+    }
+
+    /// How a graph's last row's argmax stood against ik's.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Head {
+        Same,
+        /// ik's runner-up, ik's margin under the cap.
+        Tie,
+        Bad,
+        /// ik computed no head on the last row: not held.
+        Unheld,
+    }
+
+    /// One graph's replay: our id, ik's, and how they stood.
+    struct Replayed {
+        ours: u32,
+        ik: Option<u32>,
+        head: Head,
+    }
+
+    /// Replay `g` from the host: the runs before the last store-only walks,
+    /// the last a chain; our logits against ik's on the last row.
+    fn replay(m: &mut Glm5nextModel, g: &IkGraph, hidden: usize) -> Result<Replayed, GateError> {
+        let n = g.tokens.len();
+        let mut c0 = 0;
+        let mut ours = None;
+        while c0 < n {
+            let rows = WALK_ROWS.min(n - c0);
+            let f = NextnFeed {
+                tokens: &g.tokens[c0..c0 + rows],
+                pos0: g.pos[c0],
+                hidden: NextnHidden::Host(&g.states[c0 * hidden..(c0 + rows) * hidden]),
+            };
+            if c0 + rows < n {
+                nextn_walk(m, f, NextnHead::Full, NextnMode::Store)?;
+            } else {
+                let mut out = [0u32; 1];
+                let k = nextn_chain(m, f, 0, NextnHead::Full, NextnMode::Eager, &mut out)?;
+                if k != 1 {
+                    return Err(format!("{}: a chain of {k} ids, want 1", g.label()).into());
+                }
+                ours = Some(out[0]);
+            }
+            c0 += rows;
+        }
+        let ours = ours.ok_or_else(|| format!("{}: no chain ran", g.label()))?;
+        let logits = nextn_logits(m)?;
+        let vocab = logits.len();
+        let (top, _) = top2(&logits);
+        if top != ours as usize {
+            println!(
+                "(o) {}: the chain names {ours}, our logits' argmax {top} FAIL",
+                g.label()
+            );
+            return Ok(Replayed {
+                ours,
+                ik: None,
+                head: Head::Bad,
+            });
+        }
+        if g.logits.len() != g.out_ids.len() * vocab {
+            return Err(format!(
+                "{}: result_output holds {} values, {} output rows of {vocab}",
+                g.label(),
+                g.logits.len(),
+                g.out_ids.len()
+            )
+            .into());
+        }
+        let Some(k) = g.out_ids.iter().position(|&o| o == n - 1) else {
+            println!(
+                "(o) {}: ik computed no head on row {}, not held",
+                g.label(),
+                n - 1
+            );
+            return Ok(Replayed {
+                ours,
+                ik: None,
+                head: Head::Unheld,
+            });
+        };
+        let ik = &g.logits[k * vocab..(k + 1) * vocab];
+        let (ik_top, ik_2) = top2(ik);
+        let margin = f64::from(ik[ik_top]) - f64::from(ik[ik_2]);
+        let cap = margin_cap(logits_band(), ik);
+        let head = if top == ik_top {
+            Head::Same
+        } else if margin <= cap && top == ik_2 {
+            Head::Tie
+        } else {
+            Head::Bad
+        };
+        println!(
+            "(o) {}: {n} rows from {}, argmax {top} ik {ik_top} (runner-up {ik_2}, margin \
+             {margin:.3e}, cap {cap:.3e}), logits rel {:.3e} {}",
+            g.label(),
+            g.pos[0],
+            rel(&logits, ik),
+            match head {
+                Head::Same => "PASS",
+                Head::Tie => "PASS (a tie: ik's runner-up)",
+                _ => "FAIL",
+            }
+        );
+        Ok(Replayed {
+            ours,
+            ik: Some(ik_top as u32),
+            head,
+        })
+    }
+
+    /// (m): the position mask on the warmup graph's embedding rows.
+    fn pos_mask(set: &MtpSet, hidden: usize) -> Result<bool, GateError> {
+        let row = set
+            .find(-1, Graph::Warmup, "mtp_token_embd_pos_masked", 0)
+            .map_err(|e| {
+                format!(
+                    "the set's warmup holds no position mask ({e}): the tree it was dumped from \
+                     runs another MTP input than the program's"
+                )
+            })?;
+        let e = set.logical_f32s(row)?;
+        let pos = set.i32s(set.find(-1, Graph::Warmup, "inp_pos", 0)?, Layout::Flat)?;
+        if e.len() != pos.len() * hidden {
+            return Err(format!(
+                "the mask holds {} values for {} rows of {hidden}",
+                e.len(),
+                pos.len()
+            )
+            .into());
+        }
+        let ok = pos.iter().enumerate().all(|(r, &p)| {
+            let zero = e[r * hidden..(r + 1) * hidden].iter().all(|&x| x == 0.0);
+            zero == (p == 0)
+        }) && pos.contains(&0);
+        println!(
+            "(m) the warmup's {} embedding rows: zeros exactly at position 0 {}",
+            pos.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (o): every graph replayed, each block's proposal against the set's.
+    fn oracle(m: &mut Glm5nextModel, set: &MtpSet, hidden: usize) -> Result<bool, GateError> {
+        m.reset()?;
+        let mut ok = true;
+        let mut last: Option<Replayed> = None;
+        let (mut same, mut ties, mut bad, mut unheld) = (0usize, 0usize, 0usize, 0usize);
+        let (mut blocks_ok, mut blocks_tie, mut blocks_bad) = (0usize, 0usize, 0usize);
+        for (b, g) in graphs_of(set) {
+            if g == Graph::Update {
+                let draft = set.drafts_of(b);
+                let (&[want], Some(prev)) = (draft.as_slice(), last.as_ref()) else {
+                    println!(
+                        "(o) block {b}: {} draft rows and {} graph before its update FAIL",
+                        draft.len(),
+                        if last.is_some() { "a" } else { "no" }
+                    );
+                    blocks_bad += 1;
+                    continue;
+                };
+                if prev.ik.is_some_and(|ik| ik != want) {
+                    println!(
+                        "(o) block {b}: the set's draft {want} is not the argmax {:?} of the graph \
+                         before its update FAIL",
+                        prev.ik
+                    );
+                    blocks_bad += 1;
+                } else if prev.ours == want {
+                    blocks_ok += 1;
+                } else if prev.head == Head::Tie {
+                    blocks_tie += 1;
+                    println!(
+                        "(o) block {b}: our proposal {} against the set's {want}, a tie",
+                        prev.ours
+                    );
+                } else {
+                    blocks_bad += 1;
+                    println!(
+                        "(o) block {b}: our proposal {} against the set's {want} FAIL",
+                        prev.ours
+                    );
+                }
+            }
+            let ig = IkGraph::read(set, b, g, hidden)?;
+            let r = replay(m, &ig, hidden)?;
+            match r.head {
+                Head::Same => same += 1,
+                Head::Tie => ties += 1,
+                Head::Bad => bad += 1,
+                Head::Unheld => unheld += 1,
+            }
+            last = Some(r);
+        }
+        let blocks = set.blocks().len();
+        let graphs_ok = bad == 0 && same > 0;
+        let props_ok = blocks_bad == 0 && blocks_ok + blocks_tie == blocks && blocks_ok > 0;
+        ok &= graphs_ok && props_ok;
+        println!(
+            "(o) graphs: {same} ik's argmax, {ties} ik's runner-up at a tie, {bad} other, {unheld} \
+             without ik's head {}",
+            verdict(graphs_ok)
+        );
+        println!(
+            "(o) blocks: {blocks_ok} of {blocks} proposals the set's draft, {blocks_tie} a tie, \
+             {blocks_bad} other {}",
+            verdict(props_ok)
+        );
+        Ok(ok)
+    }
+
+    /// Every hidden row a prompt call's units leave, in position order, read
+    /// by [`nextn_hidden`] from the unit's arena in runs of [`WALK_ROWS`].
+    fn unit_rows(
+        m: &mut Glm5nextModel,
+        prompt: &[u32],
+        path: PrefillMode,
+    ) -> Result<Vec<f32>, GateError> {
+        m.reset()?;
+        set_prefill(m, path)?;
+        let mut got: Vec<f32> = Vec::new();
+        let mut units = |m: &mut Glm5nextModel, arena: GlmArena, _: u32, rows: usize| {
+            let mut c0 = 0;
+            while c0 < rows {
+                let r = WALK_ROWS.min(rows - c0);
+                got.extend(nextn_hidden(
+                    m,
+                    NextnHidden::Target {
+                        walk: arena,
+                        first: c0,
+                    },
+                    r,
+                )?);
+                c0 += r;
+            }
+            Ok(())
+        };
+        let sink: &mut GlmPromptSink<'_> = &mut units;
+        prompt_with(m, prompt, path, Some(sink))?;
+        Ok(got)
+    }
+
+    /// (p) the pairing: the hidden rows a walk fed the target's arenas reads.
+    /// A prompt call's units in batches (the prompt-batch arena) and by steps
+    /// (the step arena) leave the same rows bit for bit; the row at position
+    /// `q` lies within [`FREE_BAND`] of ik's warmup row at `q + 1` — ik's MTP
+    /// row `p` reads the target's hidden of `p − 1` — and closer than at `q`
+    /// or `q + 2`. Then a verify of two rows after the prompt leaves in the
+    /// pair arena the rows two plain steps leave in the step arena, bit for
+    /// bit, and after its commit and one more step still does, the step arena
+    /// holding the plain run's next row: the verify's row 0 kept past the
+    /// step that writes its buffers.
+    fn pairing(
+        m: &mut Glm5nextModel,
+        set: &MtpSet,
+        prompt: &[u32],
+        hidden: usize,
+    ) -> Result<bool, GateError> {
+        let batch = unit_rows(m, prompt, PrefillMode::Batch)?;
+        let steps = unit_rows(m, prompt, PrefillMode::Steps)?;
+        let n = prompt.len();
+        let same = batch.len() == n * hidden
+            && batch
+                .iter()
+                .map(|x| x.to_bits())
+                .eq(steps.iter().map(|x| x.to_bits()));
+        let mut ok = same;
+        println!(
+            "(p) the prompt's {n} units' hidden rows, in batches = by steps, bit for bit {}",
+            verdict(same)
+        );
+        let warm = IkGraph::read(set, -1, Graph::Warmup, hidden)?;
+        let pos_ok = warm.tokens == prompt && warm.pos.iter().copied().eq(0..n as u32);
+        if !pos_ok {
+            println!("(p) the warmup's rows are not the prompt's at positions 0.. FAIL");
+            return Ok(false);
+        }
+        let ik_row = |p: usize| &warm.states[p * hidden..(p + 1) * hidden];
+        let (mut worst, mut bad_band, mut bad_shift) = (0.0f64, 0usize, 0usize);
+        for q in 0..n - 1 {
+            let ours = &batch[q * hidden..(q + 1) * hidden];
+            let at = rel(ours, ik_row(q + 1));
+            worst = worst.max(at);
+            if at > FREE_BAND {
+                bad_band += 1;
+            }
+            let off = [Some(q), (q + 2 < n).then_some(q + 2)];
+            if off
+                .into_iter()
+                .flatten()
+                .any(|o| rel(ours, ik_row(o)) <= at)
+            {
+                bad_shift += 1;
+            }
+        }
+        let ik_ok = bad_band == 0 && bad_shift == 0;
+        ok &= ik_ok;
+        println!(
+            "(p) our row at q against ik's warmup row q + 1, {} rows: worst {worst:.3e} (band \
+             {FREE_BAND:.2}), {bad_band} past it, {bad_shift} closer at q or q + 2 {}",
+            n - 1,
+            verdict(ik_ok)
+        );
+
+        m.reset()?;
+        set_prefill(m, PrefillMode::Batch)?;
+        let step_row = |m: &mut Glm5nextModel| -> Result<Vec<f32>, GpuError> {
+            nextn_hidden(
+                m,
+                NextnHidden::Target {
+                    walk: GlmArena::Step,
+                    first: 0,
+                },
+                1,
+            )
+        };
+        let t0 = feed(m, prompt)?;
+        let p = m.pos();
+        let t1 = m.step(&[t0])?;
+        let s0 = step_row(m)?;
+        let t2 = m.step(&[t1])?;
+        let s1 = step_row(m)?;
+        m.step(&[t2])?;
+        let s2 = step_row(m)?;
+        let plain: Vec<u32> = s0.iter().chain(&s1).map(|x| x.to_bits()).collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+        m.reset()?;
+        feed(m, prompt)?;
+        let rows = m.step_rows::<2>([t0, t1])?;
+        let pair_row = |m: &mut Glm5nextModel| {
+            nextn_hidden(
+                m,
+                NextnHidden::Target {
+                    walk: GlmArena::Pair,
+                    first: 0,
+                },
+                2,
+            )
+        };
+        let v = pair_row(m)?;
+        let verify_ok = rows == [t1, t2] && bits(&v) == plain;
+        m.rollback(p + 2)?;
+        m.keep_rows(2, PassKind::Pair)?;
+        m.step(&[t2])?;
+        let kept_ok = bits(&pair_row(m)?) == plain && bits(&step_row(m)?) == bits(&s2);
+        ok &= verify_ok && kept_ok;
+        println!(
+            "(p) a verify of two rows at {p}: tokens {rows:?} (want {:?}), the pair arena's rows = \
+             two plain steps' {}; after its commit and a step, the pair arena's rows unchanged and \
+             the step arena's the plain run's next {}",
+            [t1, t2],
+            verdict(verify_ok),
+            verdict(kept_ok)
+        );
+        m.reset()?;
+        Ok(ok)
+    }
+
+    /// A plain run's ids and each step's logits digest.
+    struct Plain {
+        ids: Vec<u32>,
+        steps: Vec<u64>,
+    }
+
+    /// The set's prompt fed by `path` from a reset, then [`N`] − 1 steps.
+    fn plain(m: &mut Glm5nextModel, prompt: &[u32], path: PrefillMode) -> Result<Plain, GateError> {
+        m.reset()?;
+        set_prefill(m, path)?;
+        let mut ids = vec![feed(m, prompt)?];
+        let mut steps = Vec::with_capacity(N);
+        for _ in 1..N {
+            let t = m.step(&[ids[ids.len() - 1]])?;
+            ids.push(t);
+            steps.push(Fnv1a64::default().f32s(&m.logits()?).value());
+        }
+        Ok(Plain { ids, steps })
+    }
+
+    /// ik's committed stream after the prompt: each round's target tokens,
+    /// then its plain steps' tokens.
+    fn ik_stream(set: &MtpSet) -> Vec<u32> {
+        let mut s: Vec<u32> = set
+            .verify
+            .iter()
+            .flat_map(|v| v.target.iter().copied())
+            .collect();
+        let mut plain = set.plain.clone();
+        plain.sort_by_key(|p| p.pos);
+        s.extend(plain.iter().map(|p| p.token));
+        s
+    }
+
+    /// The generation's passes, kept.
+    #[derive(Default)]
+    struct Kept {
+        rows: Vec<usize>,
+        proposed: Vec<bool>,
+    }
+
+    impl PassSink<Session<Body>> for Kept {
+        type Error = GateError;
+
+        fn begin(&mut self, _: &Session<Body>) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _: &Session<Body>,
+            c: &Committed,
+            _: &[u32],
+            _: std::time::Duration,
+        ) -> Result<(), GateError> {
+            self.rows.push(c.kept);
+            self.proposed.push(c.proposed);
+            Ok(())
+        }
+    }
+
+    /// The rows-log that hears nothing.
+    struct Quiet;
+
+    impl app::RowsLog for Quiet {
+        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), app::SessionError> {
+            Ok(())
+        }
+    }
+
+    /// (w) one drafted run: the set's prompt fed by `path` from a reset, the
+    /// windows for [`N`] ids, against `plain`.
+    fn drafted(
+        m: Glm5nextModel,
+        prompt: &[u32],
+        path: PrefillMode,
+        plain: &Plain,
+        set: &MtpSet,
+    ) -> Result<(Glm5nextModel, bool), GateError> {
+        let mut m = m;
+        m.reset()?;
+        set_prefill(&mut m, path)?;
+        let ctx = u32::try_from(CTX)?;
+        let mut s = Session::from_model(m, ctx);
+        let draft = MtpDraft::open(s.model(), path, StepMode::Eager)?;
+        let mut spec = s.with_draft::<MtpDraft<Body>, M>(draft, &mut Quiet)?;
+        let first = spec.prompt(&mut s, prompt)?;
+        let mut k = Kept::default();
+        let out = runtime::generate(
+            &mut s,
+            &mut spec,
+            prompt,
+            first,
+            &runtime::Stop::new(N, ctx)?,
+            &mut k,
+        )?;
+        let m = s.into_model();
+        let ids_ok = out.tokens.len() >= N && out.tokens[..N] == plain.ids[..N];
+        let windows = k.proposed.iter().filter(|&&p| p).count();
+        let accepted = k
+            .rows
+            .iter()
+            .zip(&k.proposed)
+            .filter(|&(&r, &p)| p && r == M)
+            .count();
+        let rejected = windows - accepted;
+        let rows_ok = rejected > 0 && accepted > 0;
+        println!(
+            "(w) {path:?}: the drafted run's {N} ids = the plain run's {}",
+            verdict(ids_ok)
+        );
+        println!(
+            "(w) {path:?}: {windows} windows, {accepted} accepted, {rejected} rejected a row (ik: {} \
+             blocks, {} accepted) {}",
+            set.verify.len(),
+            set.verify.iter().map(|v| v.accepted).sum::<usize>(),
+            verdict(rows_ok)
+        );
+        Ok((m, ids_ok && rows_ok))
+    }
+
+    /// Whether `r` is refused by name, `want` in its message.
+    fn refused<T>(what: &str, r: Result<T, GpuError>, want: &str) -> bool {
+        let ok = matches!(&r, Err(e) if e.to_string().contains(want));
+        let got = match &r {
+            Ok(_) => "accepted".to_string(),
+            Err(e) => e.to_string(),
+        };
+        println!("(f) {what} -> {got} {}", verdict(ok));
+        ok
+    }
+
+    /// A walk's feed.
+    fn f<'a>(tokens: &'a [u32], pos0: u32, hidden: NextnHidden<'a>) -> NextnFeed<'a> {
+        NextnFeed {
+            tokens,
+            pos0,
+            hidden,
+        }
+    }
+
+    /// (f) on the NextN load, from a reset: every refusal leaves the store's
+    /// positions at 0.
+    fn refusals(m: &mut Glm5nextModel, hidden: usize) -> Result<bool, GateError> {
+        m.reset()?;
+        let zeros = vec![0.0f32; (WALK_ROWS + 1) * hidden];
+        let host = |rows: usize| NextnHidden::Host(&zeros[..rows * hidden]);
+        let toks = vec![1u32; WALK_ROWS + 1];
+        let mut ok = true;
+        ok &= refused(
+            "a captured walk",
+            nextn_walk(
+                m,
+                f(&toks[..1], 0, host(1)),
+                NextnHead::Full,
+                NextnMode::Graph,
+            ),
+            "a captured NextN walk",
+        );
+        ok &= refused(
+            "no rows",
+            nextn_walk(
+                m,
+                f(&toks[..0], 0, host(0)),
+                NextnHead::Full,
+                NextnMode::Eager,
+            ),
+            "a walk of 0 rows",
+        );
+        ok &= refused(
+            "one row past the walk's width",
+            nextn_walk(
+                m,
+                f(&toks, 0, host(WALK_ROWS + 1)),
+                NextnHead::Full,
+                NextnMode::Eager,
+            ),
+            &format!("a walk of {} rows", WALK_ROWS + 1),
+        );
+        ok &= refused(
+            "a walk from past the store's positions",
+            nextn_walk(
+                m,
+                f(&toks[..1], 1, host(1)),
+                NextnHead::Full,
+                NextnMode::Eager,
+            ),
+            "a walk from position 1",
+        );
+        ok &= refused(
+            "a token past the vocabulary",
+            nextn_walk(
+                m,
+                f(&[u32::MAX], 0, host(1)),
+                NextnHead::Full,
+                NextnMode::Eager,
+            ),
+            "past the",
+        );
+        ok &= refused(
+            "a host hidden slice of the wrong length",
+            nextn_walk(
+                m,
+                f(&toks[..1], 0, NextnHidden::Host(&zeros[..hidden - 1])),
+                NextnHead::Full,
+                NextnMode::Eager,
+            ),
+            "hidden values for 1 rows",
+        );
+        ok &= refused(
+            "target rows past the step arena's one",
+            nextn_walk(
+                m,
+                f(
+                    &toks[..1],
+                    0,
+                    NextnHidden::Target {
+                        walk: GlmArena::Step,
+                        first: 1,
+                    },
+                ),
+                NextnHead::Full,
+                NextnMode::Eager,
+            ),
+            "of the Step arena's 1",
+        );
+        let mut out = [0u32; 1];
+        ok &= refused(
+            "a chain with an own walk",
+            nextn_chain(
+                m,
+                f(&toks[..1], 0, host(1)),
+                1,
+                NextnHead::Full,
+                NextnMode::Eager,
+                &mut out,
+            ),
+            "a chain of 1 own walks",
+        );
+        ok &= refused(
+            "a chain in the store walk's mode",
+            nextn_chain(
+                m,
+                f(&toks[..1], 0, host(1)),
+                0,
+                NextnHead::Full,
+                NextnMode::Store,
+                &mut out,
+            ),
+            "a chain in the store walk's mode",
+        );
+        ok &= refused(
+            "a chain into no place",
+            nextn_chain(
+                m,
+                f(&toks[..1], 0, host(1)),
+                0,
+                NextnHead::Full,
+                NextnMode::Eager,
+                &mut [],
+            ),
+            "into 0 places",
+        );
+        let held = m
+            .body("refusals")?
+            .nextn()
+            .map_or(usize::MAX, bloomery_gpu_glm5next::Nextn::held);
+        let held_ok = held == 0;
+        ok &= held_ok;
+        println!(
+            "(f) the store's positions after the refusals: {held} {}",
+            verdict(held_ok)
+        );
+        Ok(ok)
+    }
+
+    pub(super) fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main(&[])?;
+        let dir = MTP.path(MTP_SET);
+        let set = MtpSet::open(&dir, &MTP)?;
+        let prompt = set
+            .tokens
+            .clone()
+            .ok_or_else(|| format!("{}: no # tokens line", dir.display()))?;
+        let order = graphs_of(&set);
+        let accepted: usize = set.verify.iter().map(|v| v.accepted).sum();
+        println!(
+            "{}: {} graphs over {} blocks ({accepted} accepted), prompt {} ids, family {}",
+            dir.display(),
+            order.len(),
+            set.blocks().len(),
+            prompt.len(),
+            MTP.name
+        );
+        println!("bands: the argmax cap's {:.4e}", logits_band());
+        let open = |p: &str| Split::open(p).map_err(|e| format!("open {p}: {e}"));
+        let file = open(MODEL)?;
+        let inputs = PlanInputs::read(&file)?;
+        let nextn = NextnInputs::read(&inputs)?;
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let place = PlanLevers::from_levers(&levers)?;
+        let ctx = u64::try_from(CTX)?;
+        let base = inputs.plan(&machine, ctx, &place)?;
+        let np = inputs.plan_nextn(&machine, ctx, &place, &nextn)?;
+        let card = |n_l: &[u64]| n_l.iter().sum::<u64>();
+        println!(
+            "plan: layer {} beside the target, its card bytes {} and arena {}; card experts {} \
+             without it, {} with it",
+            nextn.index,
+            np.nextn_card_bytes(),
+            np.arena_bytes,
+            card(&base.n_l),
+            card(&np.plan.n_l)
+        );
+        drop(file);
+
+        // (t) the target's plan loaded without the layer: the reference run.
+        let t = Instant::now();
+        let mut m = Body::open_placed(open(MODEL)?, &np.plan, &inputs, 0, levers.host())?;
+        m.set_mode(StepMode::Graph);
+        println!(
+            "load without the layer: {:.1} s, {} resident bytes",
+            t.elapsed().as_secs_f64(),
+            m.resident_bytes()
+        );
+        let hidden = m.body("run")?.nextn_hidden_width();
+        let mut ok = refused(
+            "a walk on a load without the layer",
+            nextn_walk(
+                &mut m,
+                NextnFeed {
+                    tokens: &[1],
+                    pos0: 0,
+                    hidden: NextnHidden::Host(&vec![0.0; hidden]),
+                },
+                NextnHead::Full,
+                NextnMode::Eager,
+            ),
+            "without the NextN layer",
+        );
+        let reference = plain(&mut m, &prompt, PrefillMode::Batch)?;
+        drop(m);
+
+        // The NextN load.
+        let t = Instant::now();
+        let mut m = Body::open_placed_nextn(open(MODEL)?, &np, &inputs, &nextn, 0, levers.host())?;
+        m.set_mode(StepMode::Graph);
+        let (res, arena) = m
+            .body("run")?
+            .nextn()
+            .map(|n| (n.resident_bytes(), n.arena_bytes()))
+            .ok_or("the NextN load holds no NextN layer")?;
+        println!(
+            "load with layer {}: {:.1} s, {} resident bytes, the layer's {res} and its arena \
+             {arena}",
+            nextn.index,
+            t.elapsed().as_secs_f64(),
+            m.resident_bytes()
+        );
+
+        ok &= pos_mask(&set, hidden)?;
+        ok &= refusals(&mut m, hidden)?;
+        ok &= pairing(&mut m, &set, &prompt, hidden)?;
+        ok &= oracle(&mut m, &set, hidden)?;
+
+        let with = plain(&mut m, &prompt, PrefillMode::Batch)?;
+        let ids_same = with.ids == reference.ids;
+        let steps_same = with.steps == reference.steps;
+        ok &= ids_same && steps_same;
+        println!(
+            "(t) the NextN load's plain run = the load without the layer: {N} ids {}, {} steps' \
+             logits bit for bit {}",
+            verdict(ids_same),
+            with.steps.len(),
+            verdict(steps_same)
+        );
+        let ik = ik_stream(&set);
+        let agree = ik.iter().zip(&with.ids).take_while(|(a, b)| a == b).count();
+        println!(
+            "(t) ik's committed stream: {} ids, the plain run's first {agree} of them (printed, \
+             not held)",
+            ik.len()
+        );
+
+        for path in [PrefillMode::Batch, PrefillMode::Steps] {
+            let (model, w_ok) = drafted(m, &prompt, path, &with, &set)?;
+            m = model;
+            ok &= w_ok;
+        }
+        m.reset()?;
+        if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+}

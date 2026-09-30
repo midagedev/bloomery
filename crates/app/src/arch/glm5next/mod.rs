@@ -22,6 +22,8 @@ use runtime::seqstate::Kept;
 
 use crate::{Keep, Open, Prompt};
 
+mod mtp;
+
 const WHAT: &str = "glm5next session";
 
 /// How the GLM session opens.

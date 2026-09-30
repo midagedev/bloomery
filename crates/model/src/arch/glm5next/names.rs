@@ -237,3 +237,25 @@ pub fn hc_scale(l: usize, sub: Sub) -> String {
 pub fn hc_base(l: usize, sub: Sub) -> String {
     blk(l, &format!("hc_{}_base.weight", sub.stem()))
 }
+
+// ------------------------------------------------------- the next-token layer
+
+/// The next-token layer's input projection of `[enorm(e); hnorm(h)]`.
+pub fn nextn_eh_proj(l: usize) -> String {
+    blk(l, "nextn.eh_proj.weight")
+}
+
+/// The next-token layer's RMS gain of the token's embedding row.
+pub fn nextn_enorm(l: usize) -> String {
+    blk(l, "nextn.enorm.weight")
+}
+
+/// The next-token layer's RMS gain of the target's hidden row.
+pub fn nextn_hnorm(l: usize) -> String {
+    blk(l, "nextn.hnorm.weight")
+}
+
+/// The next-token layer's RMS gain before the shared head.
+pub fn nextn_shared_head_norm(l: usize) -> String {
+    blk(l, "nextn.shared_head_norm.weight")
+}

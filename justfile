@@ -1561,6 +1561,17 @@ gate-gpu-glm5next-e2e:
 weekly-gpu-glm5next-e2e-long:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
 
+# glm5next (GLM-5.3-Flash) NextN draft: the target loaded twice by its NextN plan on the 3090, without the next-token
+# layer and with it (`Body::open_placed_nextn`), against ik's MTP draft set (refset `mtp-glm5next`): the set's position
+# mask, the walk's refusals, every graph of the set replayed from ik's inputs with each block's proposal the set's
+# draft, the two loads' plain runs bit for bit, and the drafted windows (`MtpDraft<Body>`) the plain run's ids with a
+# rejected and an accepted row, the prompt in batches and by steps. Loads the whole model twice: alone in a batch, and
+# under the big-load lock the V4.1 loads take.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-glm5next-mtp:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_mtp && bash tools/gpu-gate.sh gate_glm5next_mtp'
+
 # GLM의 카드 expert를 게이트 배치(층마다 id 접두 [0, n_l))대로 올린다. 슬롯 맵이 그 n_l개를
 # 오름차순으로 담는지, 카드가 읽는 층에만 있는지, 층마다 슬롯 0·n/2·n-1에서 스택의 `_sel`과 gate·up이 그 expert만 파일에서
 # 올린 것과 비트까지 같은지 본다. 모델 전체를 올린다: e2e와 같은 묶음 규칙.

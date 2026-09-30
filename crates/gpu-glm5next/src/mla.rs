@@ -51,8 +51,8 @@ use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{AttnArgs, SelectedRows};
 use cuda_core::{CudaStream, DeviceBuffer};
 
-use crate::body::{Kernels, Parts, Store, f32t, f32v, gemv, q8};
-use crate::tensors::{MixerNames, SelNames, other_kind};
+use crate::body::{Dims, Kernels, Parts, RowScratch, Store, f32t, f32v, gemv, q8};
+use crate::tensors::{LatentNames, MixerNames, SelNames, other_kind};
 
 /// The launches [`mla`] makes.
 pub(crate) const LAUNCHES: usize = 16;
@@ -167,13 +167,10 @@ pub(crate) fn select(
 
 /// Enqueue layer `l`'s latent mixer on `p`'s buffers (module doc).
 pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let d = *p.d;
     let fault = gpu.layer_sink(l)?;
     let Some(MixerNames::Latent(n)) = p.names.get(l).map(|n| &n.mixer) else {
         return Err(other_kind("glm5next mla", l));
     };
-    let s = &mut *p.s;
     let Some(Store::Latent {
         latent,
         index,
@@ -185,6 +182,45 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
             missing: "the layer's latent store",
         });
     };
+    let store = LatentStore {
+        latent,
+        index,
+        pooled,
+    };
+    latent_row(gpu, w, p.k, p.d, n, store, p.s, fault)
+}
+
+/// A latent layer's store, lent apart from its layer's slot.
+pub(crate) struct LatentStore<'a> {
+    pub latent: &'a mut DeviceTensor<u16>,
+    pub index: &'a mut DeviceTensor<u16>,
+    pub pooled: &'a mut DeviceTensor<u16>,
+}
+
+/// The latent mixer of the layer named `n` over its store `st` on one row's
+/// buffers `s`, faults on `fault` (module doc): [`mla`]'s launches, for any
+/// latent layer the body holds — a trunk layer's, or the next-token layer's.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the launches' card, weights, kernels and widths, the layer's names and store, the row's buffers and its fault sink (rust-quality R8)"
+)]
+pub(crate) fn latent_row(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &Kernels,
+    d: &Dims,
+    n: &LatentNames,
+    st: LatentStore<'_>,
+    s: &mut RowScratch,
+    fault: FaultSink,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let d = *d;
+    let LatentStore {
+        latent,
+        index,
+        pooled,
+    } = st;
     let stride = d.stack();
     gpu.elem().enqueue_rms_norm(
         stream,
@@ -205,7 +241,7 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
         1,
         &mut s.qr,
     )?;
-    let lat = &p.k.latent;
+    let lat = &k.latent;
     lat.enqueue_latent_append(
         stream,
         LatentAppendArgs {
@@ -240,22 +276,12 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
             cache: index,
         },
     )?;
-    let fork = p.k.branch.fork(stream)?;
-    pool(
-        fork.stream(),
-        w,
-        p.k,
-        &n.sel,
-        index,
-        &s.cnt,
-        1,
-        fault,
-        pooled,
-    )?;
+    let fork = k.branch.fork(stream)?;
+    pool(fork.stream(), w, k, &n.sel, index, &s.cnt, 1, fault, pooled)?;
     select(
         gpu,
         w,
-        p.k,
+        k,
         &n.sel,
         Select {
             stream: fork.stream(),
@@ -276,7 +302,7 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     )?;
     gemv(gpu, w, &n.q_b, &s.qr, &mut s.q)?;
     let (qs, dd) = q8(w, &n.k_b)?;
-    p.k.step.enqueue_q8_0_gemv_heads(
+    k.step.enqueue_q8_0_gemv_heads(
         stream,
         Q8_0GemvHeadsArgs {
             qs,
@@ -297,7 +323,7 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     let window = unsafe {
         DeviceTensor::<u16>::window(latent.buf().cu_deviceptr(), 0, LATENT, gpu.context())
     };
-    let r = p.k.attn.enqueue(
+    let r = k.attn.enqueue(
         stream,
         AttnArgs {
             q: &s.qabs,
@@ -321,7 +347,7 @@ pub(crate) fn mla(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     DeviceTensor::release(window);
     r?;
     let (qs, dd) = q8(w, &n.v_b)?;
-    p.k.step.enqueue_q8_0_gemv_heads(
+    k.step.enqueue_q8_0_gemv_heads(
         stream,
         Q8_0GemvHeadsArgs {
             qs,
