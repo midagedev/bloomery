@@ -5,6 +5,11 @@
 #   tools/affected-gates.sh <base>       # the working tree vs the merge base of <base> and HEAD
 #   tools/affected-gates.sh A..B         # two commits, each read from its own `git archive`
 #   tools/affected-gates.sh … --no-box   # skip the box's dep-info (read-only ssh otherwise)
+#   tools/affected-gates.sh … --narrow --scan BASE_LOG NEW_LOG [--scan …]
+#                                        # narrowed by ptx-scan pairs (base, change) and tools/gate-paths.tsv:
+#                                        # identical or added pairs keep the gates whose own target changed and
+#                                        # the rows the changed files match; a moved pair, no pair or a file no
+#                                        # row maps prints the full list with the reason
 #
 # Output: one line per selected recipe with the file that selected it and the chain (`bin gate_x <- lib
 # bloomery-gpu (bloomery-gpu-gates -> bloomery-gpu)`), a `recipes:` line to paste, the `always:` static

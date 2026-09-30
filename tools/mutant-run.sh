@@ -3,7 +3,7 @@
 # kill), restore the sources from this runner's own copies, check them against the md5s recorded before
 # any mutant, and run the gate again (green is the clean run the kill is read against).
 #
-# Usage: tools/mutant-run.sh [--allow-dirty] [--retries N] [--out DIR] --crate NAME [--crate NAME]...
+# Usage: tools/mutant-run.sh [--allow-dirty] [--retries N] [--out DIR] [--clean each|once] --crate NAME [--crate NAME]...
 #                            <mutant dir> -- <gate command...>
 #        tools/mutant-run.sh --self-test   (a temp git repo, fake mutants and a fake gate; check-recipes runs it)
 #
@@ -20,10 +20,14 @@
 #                  to one log.
 #   --out DIR      the copies, the md5 record and one log per run (default a new temp dir; never inside
 #                  the tree, which box.sh syncs).
+#   --clean W      each (the default): a clean run after every mutant. once: one clean run, after the last
+#                  mutant — for a gate whose run and rebuild cost minutes. The restore and its md5 check
+#                  still follow every mutant; a red clean run under once means no kill above can be read.
 #   The gate command runs from the tree's top directory, stdout and stderr to `<out>/<run>.log`.
 #
 # Output, one line per run: `mut-<name> rc=<rc> <HH:MM:SS> killed|SURVIVED|NOT-BUILT|NOT-RUN|NO-COMPILE <crate>`
-# and `clean-after-<name> rc=<rc> <HH:MM:SS> green|RED|NO-COMPILE <crate>`, then a summary line.
+# and `clean-after-<name> rc=<rc> <HH:MM:SS> green|RED|NO-COMPILE <crate>` (under --clean once, one
+# `clean-once …` line after the last mutant), then a summary line.
 # A kill is any other nonzero rc of a run that compiled, a gate's timeout (124, 137) included. Not a kill:
 # a mutant that does not compile (NOT-BUILT: cargo printed `error: could not compile`), and a run the gate
 # runner refused or could not start (NOT-RUN: 64 a runner usage error, 69 a lock file it cannot open —
@@ -62,7 +66,8 @@ self_test() {
     cp "$t/$3" "$t/repo/src/$3"
   }
   # The fake gate: prints cargo's Compiling line, then reads the tree. A marker in a source picks what a
-  # mutant does to the run; with no marker the gate is green.
+  # mutant does to the run; with no marker the gate is green, or red under T_CLEANRED (a gate red only
+  # on the clean tree).
   cat > "$t/gate.sh" << 'EOF'
 #!/usr/bin/env bash
 s=$(cat src/a.rs src/b.rs)
@@ -78,6 +83,7 @@ case "$s" in
   *SIGNAL*) for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$T_PID" ] && break; sleep 0.1; done
             kill -TERM "$(cat "$T_PID")"; exit 1 ;;
 esac
+[ -z "${T_CLEANRED:-}" ] || exit 1
 exit 0
 EOF
   chmod +x "$t/gate.sh"
@@ -90,7 +96,7 @@ EOF
     local o=$1 m=$2
     shift 2
     rm -rf "$o"
-    out=$(cd "$t/repo" && T_OUT=$o T_PID=$t/pid bash "$me" --out "$o" --crate fake "$@" "$m" -- "$t/gate.sh" 2>&1)
+    out=$(cd "$t/repo" && T_OUT=$o T_PID=$t/pid T_CLEANRED=${CLEANRED:-} bash "$me" --out "$o" --crate fake "$@" "$m" -- "$t/gate.sh" 2>&1)
     rc=$?
   }
   expect() { # expect <case> <want rc> <want substring>
@@ -149,6 +155,29 @@ EOF
     fails=$((fails + 1))
   fi
   clean "a file edited while the gate ran"
+  # --clean once: one clean run after the last mutant; the restore check still follows every mutant.
+  run "$t/o" "$t/muts" --clean once
+  expect "--clean once" 0 "mutant-run: 2 mutants, 2 killed, 0 survived, 0 not built, 0 not run; clean runs 1 green — PASS"
+  expect "--clean once, its one clean run" 0 "clean-once rc=0"
+  if grep -qF clean-after- <<< "$out"; then
+    echo "mutant-run self-test: --clean once ran a clean run after a mutant" >&2
+    fails=$((fails + 1))
+  fi
+  clean "--clean once"
+  CLEANRED=1 run "$t/o" "$t/muts" --clean once
+  expect "--clean once, a gate red only on the clean tree" 1 "no kill above can be read"
+  expect "--clean once, a gate red only on the clean tree, after the last mutant" 1 "mut-m2 rc=1"
+  clean "--clean once, a gate red only on the clean tree"
+  CLEANRED=1 run "$t/o" "$t/muts"
+  expect "--clean each, a gate red only on the clean tree" 1 "clean-after-m1 rc=1"
+  clean "--clean each, a gate red only on the clean tree"
+  one c a.rs 'BREAKCOPY();'
+  run "$t/o" "$t/one" --clean once
+  expect "--clean once, a restore from a broken copy" 3 "RESTORE FAILED: src/a.rs"
+  cp "$t/a.rs" "$t/repo/src/a.rs"
+  clean "--clean once, a restore from a broken copy"
+  run "$t/o" "$t/muts" --clean some
+  expect "--clean with another value" 2 "--clean some is not each or once"
   # A signal: the runner in the background, its pid from $! for the gate to signal.
   one g a.rs 'SIGNAL();'
   rm -f "$t/pid"
@@ -191,11 +220,12 @@ fi
 
 usage() {
   echo "mutant-run: $1" >&2
-  echo "usage: mutant-run.sh [--allow-dirty] [--retries N] [--out DIR] --crate NAME [--crate NAME]... <mutant dir> -- <gate command...>" >&2
+  echo "usage: mutant-run.sh [--allow-dirty] [--retries N] [--out DIR] [--clean each|once] --crate NAME [--crate NAME]... <mutant dir> -- <gate command...>" >&2
   exit 2
 }
 ALLOW_DIRTY=0
 RETRIES=5
+CLEAN=each
 OUT=
 CRATES=()
 MUTDIR=
@@ -204,6 +234,7 @@ while [ $# -gt 0 ]; do
     --allow-dirty) ALLOW_DIRTY=1 ;;
     --retries) [ $# -ge 2 ] || usage "--retries takes a count"; RETRIES=$2; shift ;;
     --out) [ $# -ge 2 ] || usage "--out takes a directory"; OUT=$2; shift ;;
+    --clean) [ $# -ge 2 ] || usage "--clean takes each or once"; CLEAN=$2; shift ;;
     --crate) [ $# -ge 2 ] || usage "--crate takes a crate name"; CRATES+=("$2"); shift ;;
     --) shift; break ;;
     -*) usage "unknown flag $1" ;;
@@ -216,6 +247,7 @@ done
 [ -d "$MUTDIR" ] || usage "no mutant dir $MUTDIR"
 [ ${#CRATES[@]} -gt 0 ] || usage "no --crate: name the crate whose Compiling line proves each run rebuilt"
 case "$RETRIES" in '' | *[!0-9]* | 0) usage "--retries $RETRIES is not a count from 1" ;; esac
+case "$CLEAN" in each | once) ;; *) usage "--clean $CLEAN is not each or once" ;; esac
 MUTDIR=$(cd "$MUTDIR" && pwd)
 ROOT=$(git rev-parse --show-toplevel 2> /dev/null) || usage "not inside a git tree: $(pwd)"
 cd "$ROOT" || exit 2
@@ -317,8 +349,31 @@ compiled() {
   done
 }
 
+# clean_run <run> — the gate on the restored tree; a red run stops the runner: every kill is read against it.
+clean_run() {
+  local run=$1
+  run_gate "$run"
+  miss=$(compiled "$run")
+  if [ "$GRC" = 75 ]; then
+    echo "$run rc=75 $(date +%H:%M:%S) contention after $RETRIES attempts"
+    FINAL_RC=75; exit 75
+  elif [ -n "$miss" ]; then
+    echo "$run rc=$GRC $(date +%H:%M:%S) NO-COMPILE $miss"; fail=1
+  elif [ "$GRC" = 0 ]; then
+    echo "$run rc=0 $(date +%H:%M:%S) green"; green=$((green + 1))
+  else
+    echo "$run rc=$GRC $(date +%H:%M:%S) RED"
+    if [ "$CLEAN" = once ]; then
+      echo "mutant-run: the gate is red on the clean tree after the last mutant; no kill above can be read" >&2
+    else
+      echo "mutant-run: the gate is red on the clean tree; stopping" >&2
+    fi
+    FINAL_RC=1; exit 1
+  fi
+}
+
 CMD=("$@")
-echo "mutant-run: ${#PATCHES[@]} mutants from $MUTDIR over $(wc -l < "$OUT/files" | tr -d ' ') files, logs in $OUT"
+echo "mutant-run: ${#PATCHES[@]} mutants from $MUTDIR over $(wc -l < "$OUT/files" | tr -d ' ') files, logs in $OUT (clean runs: $CLEAN)"
 killed=0 survived=0 notbuilt=0 notrun=0 green=0 fail=0
 for p in "${PATCHES[@]}"; do
   name=$(basename "$p")
@@ -346,22 +401,9 @@ for p in "${PATCHES[@]}"; do
   echo "mut-$name rc=$GRC $(date +%H:%M:%S) $verdict"
   restore || { FINAL_RC=3; exit 3; }
   [ "$GRC" != 75 ] || { FINAL_RC=75; exit 75; }
-  run_gate "clean-after-$name"
-  miss=$(compiled "clean-after-$name")
-  if [ "$GRC" = 75 ]; then
-    echo "clean-after-$name rc=75 $(date +%H:%M:%S) contention after $RETRIES attempts"
-    FINAL_RC=75; exit 75
-  elif [ -n "$miss" ]; then
-    echo "clean-after-$name rc=$GRC $(date +%H:%M:%S) NO-COMPILE $miss"; fail=1
-  elif [ "$GRC" = 0 ]; then
-    echo "clean-after-$name rc=0 $(date +%H:%M:%S) green"; green=$((green + 1))
-  else
-    # A gate red with no mutant makes every later kill meaningless: stop here.
-    echo "clean-after-$name rc=$GRC $(date +%H:%M:%S) RED"
-    echo "mutant-run: the gate is red on the clean tree; stopping" >&2
-    FINAL_RC=1; exit 1
-  fi
+  [ "$CLEAN" = once ] || clean_run "clean-after-$name"
 done
+[ "$CLEAN" = each ] || clean_run clean-once
 verdict=PASS
 [ "$fail" = 0 ] || verdict=FAIL
 echo "mutant-run: ${#PATCHES[@]} mutants, $killed killed, $survived survived, $notbuilt not built, $notrun not run; clean runs $green green — $verdict"

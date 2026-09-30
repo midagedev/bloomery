@@ -76,6 +76,7 @@ check-recipes:
     ./tools/check-recipes.sh
 
 # BASE(기본 main)나 A..B 사이에 바뀐 파일을 입력으로 읽는 gate-* 레시피 목록 — 맥에서, 빌드 없이, 아무것도 돌리지 않는다(tools/affected-gates.sh).
+# `--narrow --scan BASE_LOG NEW_LOG …` (ptx-scan logs of the base and the change): the gates that run the changed host path.
 affected BASE='main' *ARGS:
     ./tools/affected-gates.sh {{BASE}} {{ARGS}}
 
@@ -833,7 +834,8 @@ gate-models:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-models --lib -- --nocapture'
 
 # The session crate's host tests (crates/app, a device-linked crate, so cargo oxide test): a fault
-# read at a step, a group end or a call end is one SessionError::Fault.
+# read at a step, a group end or a call end is one SessionError::Fault. They open no card (host group).
+[group('host')]
 gate-app:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-app --release --lib'
 
@@ -996,11 +998,13 @@ gate-gpu-ds41-index:
 
 # V4.1 디바이스 크레이트의 호스트 단위 시험(카드·게이트 락 없음): 오라클 세트가 닿지 않는 큰 위치에서도 rope 표가 ggml 레시피와 같다.
 # 락이 없어도 되는 까닭: 이 크레이트의 시험 모듈은 카드를 열지 않는다(Gpu·스트림·디바이스 버퍼를 쓰는 시험이 없다). cargo oxide는 빌드 때문이다.
+[group('host')]
 gate-gpu-ds41-lib:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-deepseek41 --release --lib'
 
 # V4.1 서버 엔진 결합(gpu-gates의 bind, deepseek41 기능 뒤에 있어 gate-gpu-gates-lib가 빌드하지 않는다)의 호스트 단위 시험:
 # 샘플링 스텝이 엔진의 로짓 버퍼 하나를 빌려 쓰고, 길이가 다른 호출자 버퍼는 이름 붙은 오류다. 카드·게이트 락 없음.
+[group('host')]
 gate-ds41-bind:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- bind::'
 
@@ -1131,25 +1135,22 @@ gate-gpu-ds41-unpack:
 gate-gpu-ds41-callstream *ARGS:
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream {{ARGS}}'
 
-# V4.1 long greedy runs on the gate placement, every position through the finite probe before the engine steps it:
-# --free, prompt row 0 then 330 greedy tokens; --trigger, the prompt plus the 311 fed ids whose last position selects
-# six layer-34 experts that all score 0, then 16 greedy tokens (no flag runs both). Red on a non-finite stream at any
-# seam, a run of 8 equal generated tokens, an eager argmax that is not the engine's token, or a first difference with
-# ik's greedy ids where our margin is not below 1.5. 3090, gate lock.
-[group('v41-load')]
-gate-gpu-ds41-long *ARGS:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && bash tools/gpu-gate.sh gate_deepseek41_long {{ARGS}}'
-
-# Step-level page faults of the V4.1 engine on the gate placement, host set populated and locked
-# (BLOOMERY_HOST_LOCK=1 unless the environment says otherwise: populated pages alone are
-# reclaimed under another process's reads): 32 greedy graph steps after a reset, alone in their
-# process, each step's faults outside the engram helper read around it; from step 2 on no major
-# fault and at most the pinned minor ones (the long gate's `--faults` arm). FAIL-first:
-# BLOOMERY_BOX_ENV="BLOOMERY_HOST_POPULATE=0 BLOOMERY_HOST_LOCK=0". 3090, gate lock.
+# V4.1 long runs on the gate placement, three arms on one load, the host set populated and locked
+# (BLOOMERY_HOST_LOCK=1 unless the environment says otherwise: populated pages alone are reclaimed under
+# another process's reads). --faults first, the process's first steps after the load: 32 greedy graph
+# steps after a reset, each step's faults outside the engram helper read around it; from step 2 on no
+# major fault and at most the pinned minor ones. Then, every position through the finite probe before the
+# engine steps it: --free, prompt row 7 then up to 330 greedy tokens; --trigger, prompt row 0 plus the 311
+# fed ids whose last position selects six layer-34 experts that all score 0, then 16 greedy tokens. Red on
+# a fault over the pin, a non-finite stream at any seam, a run of 8 equal generated tokens, an eager argmax
+# that is not the engine's token, or a first difference with ik's greedy ids where our margin is not below
+# 1.5. Solo: its fault pin is a host-memory count another lane's model load moves. ARGS go after the three
+# arms (`-n N`). FAIL-first for the faults arm: BLOOMERY_BOX_ENV="BLOOMERY_HOST_POPULATE=0 BLOOMERY_HOST_LOCK=0".
+# 3090, gate lock.
 [group('solo')]
 [group('v41-load')]
-gate-gpu-ds41-faults:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} bash tools/gpu-gate.sh gate_deepseek41_long --faults'
+gate-gpu-ds41-long *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} bash tools/gpu-gate.sh gate_deepseek41_long --faults --free --trigger {{ARGS}}'
 
 # ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — long 게이트
 # --free의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.

@@ -7,7 +7,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
 
     python3 tools/recipes.py check            # the target checks of `just check-recipes`, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
-    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes]
+    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...]
     python3 tools/recipes.py why FILE...       # every recipe a file selects, with the chain
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
@@ -181,6 +181,7 @@ class Recipe:
     deps: list[str]
     text: str  # canonical form of params + deps + body; equal text means an unchanged recipe
     line: int = 0  # 1-based header line in the justfile (0 when not found)
+    groups: tuple[str, ...] = ()  # its `[group('…')]` attributes, the scheduling classes of tools/gate-batch.sh
 
 
 def _render_expr(expr) -> str:
@@ -236,7 +237,8 @@ def load_justfile(path: str) -> dict[str, Recipe]:
         lines = join_continued(name, lines)
         deps = [d["recipe"] for d in rec["dependencies"]]
         text = json.dumps({"p": rec["parameters"], "d": rec["dependencies"], "b": rec["body"], "a": rec["attributes"]}, sort_keys=True)
-        recipes[name] = Recipe(name=name, lines=lines, deps=deps, text=text)
+        groups = tuple(a["group"] for a in rec["attributes"] if isinstance(a, dict) and "group" in a)
+        recipes[name] = Recipe(name=name, lines=lines, deps=deps, text=text, groups=groups)
     header = re.compile(r"^@?([A-Za-z0-9_-]+)(?:\s[^:]*)?\s*:(?!=)")
     for i, ln in enumerate(header_lines, 1):
         m = header.match(ln)
@@ -1409,6 +1411,11 @@ def changed_files(spec: str) -> tuple[list[str], str | None, str | None]:
 
 
 def cmd_affected(args: argparse.Namespace) -> int:
+    if args.scan and not args.narrow:
+        raise RecipeError("--scan needs --narrow")
+    # Every scan log and the table are read before the diff: one the tool cannot vouch for is refused first.
+    scans = [(read_scan(x), read_scan(y)) for x, y in args.scan or []]
+    rows = load_gate_paths() if args.narrow else []
     changed, a_rev, b_rev = changed_files(args.base)
     prefix = "" if args.all_recipes else GATE_PREFIX
     tmp = tempfile.mkdtemp(prefix="recipes-affected-")
@@ -1425,13 +1432,38 @@ def cmd_affected(args: argparse.Namespace) -> int:
         notes += more
         total = sum(1 for n in b.recipes if n.startswith(prefix))
         rng = f"{a_rev[:9]}..{b_rev[:9]}" if b_rev else f"{a_rev[:9]}..(working tree)"
-        print(f"affected: {rng} — {len(changed)} changed files, {len(sels)} of {total} {prefix or ''}recipes selected")
-        width = max([len(s.recipe) for s in sels] + [10])
-        for s in sels:
-            more_n = f" (+{len(s.files) - 1})" if len(s.files) > 1 else ""
-            print(f"  {s.recipe:<{width}}  {s.files[0]}{more_n}  [{s.why}]")
-        print("recipes: " + " ".join(s.recipe for s in sels))
-        print("always: " + " ".join(ALWAYS))
+        nar = narrow(changed, a, b, scans, rows) if args.narrow else None
+        narrowed = nar is not None and not nar.full
+        if narrowed:
+            print(f"affected: {rng} — {len(changed)} changed files, {len(nar.picks)} of {total} {prefix or ''}recipes selected "
+                  f"(narrowed from {len(sels)} by ptx-scan)")
+        else:
+            print(f"affected: {rng} — {len(changed)} changed files, {len(sels)} of {total} {prefix or ''}recipes selected")
+        if nar is not None:
+            for r in nar.full:
+                print(f"narrow: full list — {r}")
+            for v in nar.verdicts:
+                print(f"narrow: ptx-scan {v.line()}")
+            for line in nar.files:
+                print(f"narrow: file {line}")
+        if narrowed:
+            width = max([len(n) for n in nar.picks] + [10])
+            for n, why in nar.picks.items():
+                print(f"  {n:<{width}}  {why}")
+            print("recipes: " + " ".join(nar.picks))
+            print("always: " + " ".join(ALWAYS))
+            let_out = "; ".join(v.line() for v in nar.verdicts)
+            out = [s.recipe for s in sels if s.recipe not in nar.picks]
+            print(f"left out ({len(out)}), each by ptx-scan {let_out}:")
+            for n in out:
+                print(f"  - {n}  (ptx-scan {let_out})")
+        else:
+            width = max([len(s.recipe) for s in sels] + [10])
+            for s in sels:
+                more_n = f" (+{len(s.files) - 1})" if len(s.files) > 1 else ""
+                print(f"  {s.recipe:<{width}}  {s.files[0]}{more_n}  [{s.why}]")
+            print("recipes: " + " ".join(s.recipe for s in sels))
+            print("always: " + " ".join(ALWAYS))
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
             print(f"  {u}")
@@ -1534,6 +1566,573 @@ def cmd_box_command(args: argparse.Namespace) -> int:
         print(f"recipes.py box-command: {err}", file=sys.stderr)
         return 64
     return 0
+
+
+# ----------------------------------------------------------------------------------------------
+# affected --narrow: ptx-scan logs and the host-path table
+# ----------------------------------------------------------------------------------------------
+# The rule (AGENTS.md, `just affected`): when `just ptx-scan` of every bin a change reaches equals
+# the base, no kernel moved, and the landing batch is the gates that run the changed host path plus
+# the static checks. The "add" class is the same with the base plus exactly the new entries.
+#
+# A scan log is the text `just ptx-scan <bin>` prints. tools/ref/ptx-canon.py's parse_scan is the one
+# reader of its entry table and its md5 block; read_scan below adds what that reader does not see —
+# the banner's fields and the `ptx-scan: modN bundle=<crate>` lines — and refuses a log it cannot
+# vouch for by name: a failed or filtered scan, two scans in one log, a table row with no digest or a
+# digest with no row.
+#
+# A changed file selects, under --narrow:
+#   - the recipes whose own target reads it: the target's own module tree (a bin, a test file, a
+#     lib's own tests, a `#[path]` module a bin includes), a script the recipe names and what that
+#     script names, a path literal, the recipe's own text in the justfile;
+#   - when some gate reads it through a dependency edge (a workspace lib a target links, a crate
+#     manifest, a cargo global, box.sh's profile files): the recipes of the rows of
+#     tools/gate-paths.tsv whose glob matches it, all of them. No row: the full list, naming the file.
+#     A row whose recipes are `*`: the full list, naming the row;
+#   - a file under docs/, a `.card` or a `*.md` needs no row (not a host path);
+#   - the gates of a kernel carrier no scan pair covers: a device lib whose bundle is in no pair's
+#     banner, or a bin with kernels of its own, whenever the change touches that carrier's closure.
+# Then the static checks (ALWAYS), gate-ptx-spill, and every recipe the diff adds.
+
+GATE_PATHS = "tools/gate-paths.tsv"
+PTX_CANON = "tools/ref/ptx-canon.py"
+# The banner fields two scans of a pair must agree on: another digest rule, assembler, arch or driver
+# makes the columns incomparable, which is not the same as a kernel that moved.
+SCAN_SAME = ("method", "ptxas-version", "arch", "jit-card", "jit-cuda")
+NOT_HOST = re.compile(r"^docs/|\.card$|\.md$")
+# In every narrowed list, whatever the rows say: the spill ratchet over the scanned bins.
+NARROW_ALWAYS = ["gate-ptx-spill"]
+KERNEL_ATTR = re.compile(r"#\s*\[\s*(?:kernel|cuda_module)\b")
+
+
+@functools.cache
+def _ptx_canon():
+    """tools/ref/ptx-canon.py as a module (its file name is not an identifier)."""
+    import importlib.util
+
+    path = os.path.join(ROOT, PTX_CANON)
+    spec = importlib.util.spec_from_file_location("ptx_canon", path)
+    if spec is None or spec.loader is None:
+        raise RecipeError(f"cannot load {path}, the ptx-scan logs' reader")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@dataclass
+class ScanLog:
+    path: str
+    bin: str
+    fields: dict[str, str]  # the banner's key=value words, and `method` from the md5 block
+    bundles: list[str]
+    header: list[str]
+    rows: dict[str, list[str]]
+    md5: dict[str, tuple[str, str]]
+
+
+_SCAN_BANNER = re.compile(r"^ptx-scan bin=\S")
+_SCAN_BUNDLE = re.compile(r"^ptx-scan: mod[0-9]+ bundle=(\S+) bytes=[0-9]+$")
+
+
+def read_scan(path: str) -> ScanLog:
+    pc = _ptx_canon()
+    try:
+        method, header, rows, md5 = pc.parse_scan(path)
+    except pc.Refused as err:
+        raise RecipeError(f"scan log {path}: {err}") from err
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().split("\n")
+    banners = [ln for ln in lines if _SCAN_BANNER.match(ln)]
+    if len(banners) != 1:
+        raise RecipeError(f"scan log {path}: {len(banners)} `ptx-scan bin=` banners — one log holds one scan")
+    fields = dict(w.split("=", 1) for w in banners[0].split()[1:] if "=" in w)
+    if "filter" in fields:
+        raise RecipeError(f"scan log {path}: a scan filtered to entries containing {fields['filter']!r} holds part of the table — scan the whole binary")
+    bundles = [m.group(1) for m in map(_SCAN_BUNDLE.match, lines) if m]
+    if not bundles:
+        raise RecipeError(f"scan log {path}: no `ptx-scan: modN bundle=` line — which crates' kernels the scan read is unknown")
+    if set(rows) != set(md5):
+        odd = sorted(set(rows) ^ set(md5))
+        raise RecipeError(f"scan log {path}: {len(odd)} entries in only one of the table and the md5 block ({' '.join(odd[:4])}) — a cut or mixed log")
+    fields["method"] = method
+    return ScanLog(path, os.path.basename(fields["bin"]), fields, bundles, header, rows, md5)
+
+
+@dataclass
+class ScanVerdict:
+    bin: str
+    kind: str  # identical | added | moved
+    entries: list[str]  # added: the new entries; moved: the removed or changed ones
+    detail: str
+    bundles: list[str]
+
+    def line(self) -> str:
+        what = f" {' '.join(self.entries)}" if self.entries else ""
+        return f"{self.bin}: {self.kind}{what}{f' ({self.detail})' if self.detail else ''}"
+
+
+def scan_verdict(base: ScanLog, new: ScanLog) -> ScanVerdict:
+    """identical, added (every base row and digest unchanged, only new entries) or moved (a base row or
+    digest changed, or an entry removed). A pair of two binaries or of two scan setups is refused."""
+    if base.bin != new.bin:
+        raise RecipeError(f"scan pair {base.path} {new.path}: bin {base.bin} against bin {new.bin} — a pair is two scans of one binary")
+    for k in SCAN_SAME:
+        if base.fields.get(k) != new.fields.get(k):
+            raise RecipeError(f"scan pair {base.path} {new.path}: {k}={base.fields.get(k)} against {k}={new.fields.get(k)} — "
+                              "rescan both under one toolchain and card before comparing")
+    if base.header != new.header:
+        raise RecipeError(f"scan pair {base.path} {new.path}: the tables have other columns")
+    if sorted(base.bundles) != sorted(new.bundles):
+        return ScanVerdict(base.bin, "moved", [], f"bundles {' '.join(base.bundles)} -> {' '.join(new.bundles)}", new.bundles)
+    removed = sorted(set(base.rows) - set(new.rows))
+    changed = sorted(e for e in set(base.rows) & set(new.rows) if base.rows[e] != new.rows[e] or base.md5[e] != new.md5[e])
+    added = sorted(set(new.rows) - set(base.rows))
+    if removed or changed:
+        detail = "; ".join(x for x in (f"{len(removed)} removed" if removed else "", f"{len(changed)} changed" if changed else "") if x)
+        return ScanVerdict(base.bin, "moved", removed + changed, detail, new.bundles)
+    return ScanVerdict(base.bin, "added" if added else "identical", added, "", new.bundles)
+
+
+@dataclass
+class PathRow:
+    line: int
+    glob: str
+    recipes: list[str]  # ["*"]: every gate
+    why: str
+    pattern: re.Pattern
+
+    def every(self) -> bool:
+        return self.recipes == ["*"]
+
+
+def glob_alternatives(glob: str) -> list[str]:
+    """`a/{b,c/**}` as `a/b` and `a/c/**`; braces do not nest."""
+    m = re.search(r"\{([^{}]*)\}", glob)
+    if m is None:
+        if re.search(r"[{}]", glob):
+            raise RecipeError(f"{GATE_PATHS}: the glob {glob} has an unmatched brace")
+        return [glob]
+    return [x for alt in m.group(1).split(",") for x in glob_alternatives(glob[: m.start()] + alt + glob[m.end():])]
+
+
+def glob_regex(glob: str) -> re.Pattern:
+    """`**` any run of characters, `/` included; `*` any run without `/`; `?` one character but `/`;
+    `{a,b}` either."""
+    return re.compile("(?:" + "|".join(f"(?:{_glob_one(g)})" for g in glob_alternatives(glob)) + r")\Z")
+
+
+def _glob_one(glob: str) -> str:
+    out, i = [], 0
+    while i < len(glob):
+        if glob.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif glob[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif glob[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(glob[i]))
+            i += 1
+    return "".join(out)
+
+
+def load_gate_paths(root: str = ROOT) -> list[PathRow]:
+    """The table: `glob<TAB>recipes<TAB>why`, recipes space-separated or the literal `*`; `#` lines and
+    blank lines skipped. Anything else is a named error."""
+    path = os.path.join(root, GATE_PATHS)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as err:
+        raise RecipeError(f"{GATE_PATHS}: {err.strerror}") from err
+    rows: list[PathRow] = []
+    for n, ln in enumerate(text.split("\n"), 1):
+        if not ln.strip() or ln.startswith("#"):
+            continue
+        f = ln.split("\t")
+        if len(f) != 3 or not all(x.strip() == x and x for x in f):
+            raise RecipeError(f"{GATE_PATHS}:{n}: not glob<TAB>recipes<TAB>why with three non-empty fields: {ln[:120]!r}")
+        names = f[1].split(" ")
+        if "*" in names and names != ["*"]:
+            raise RecipeError(f"{GATE_PATHS}:{n}: `*` stands alone — it means every gate")
+        if len(set(names)) != len(names):
+            raise RecipeError(f"{GATE_PATHS}:{n}: a recipe named twice")
+        if f[0].startswith("/") or ".." in f[0].split("/"):
+            raise RecipeError(f"{GATE_PATHS}:{n}: the glob {f[0]} is not a path relative to the tree")
+        try:
+            pattern = glob_regex(f[0])
+        except RecipeError as err:
+            raise RecipeError(f"{GATE_PATHS}:{n}: {err}") from err
+        rows.append(PathRow(n, f[0], names, f[2], pattern))
+    if not rows:
+        raise RecipeError(f"{GATE_PATHS}: no rows")
+    return rows
+
+
+_OWN_LIB_TESTS = re.compile(r"^(?:libtest <- \S+ lib tests|doctest <- \S+ doctests)(?: \(path literal\))?$")
+
+
+def _own_origin(why: str) -> bool:
+    """Whether a hit's origin is the recipe's own target or its own text, not a dependency edge: a lib's
+    own tests read the lib as their own tree (Graph.inputs labels them `libtest <- <pkg> lib tests`)."""
+    inner = re.sub(r" \(via [^)]*\)$", "", why)
+    if _OWN_LIB_TESTS.match(inner):
+        return True
+    if "<-" in inner or inner.startswith(("cargo", "tools/box.sh", "profile ", "dep-info")):
+        return False
+    return True
+
+
+# ---- which module paths a target's own files name ----
+
+def _use_paths(stmt: str) -> list[tuple[str, ...]]:
+    """The paths of one `use` tree (`a::b::{c, d::{e as f}, self, *}`), each a tuple of segments."""
+    toks = re.findall(r"::|[{},*]|(?:r#)?[A-Za-z_][A-Za-z0-9_]*", stmt)
+
+    def tree(i: int, prefix: tuple[str, ...]) -> tuple[list[tuple[str, ...]], int]:
+        segs = list(prefix)
+        while i < len(toks):
+            t = toks[i]
+            if t == "{":
+                out: list[tuple[str, ...]] = []
+                i += 1
+                while i < len(toks) and toks[i] != "}":
+                    if toks[i] == ",":
+                        i += 1
+                        continue
+                    sub, i = tree(i, tuple(segs))
+                    out += sub
+                return out, i + 1
+            if t in (",", "}"):
+                break
+            if t == "as":
+                i += 2
+                continue
+            if t != "::" and t != "self":
+                segs.append(t[2:] if t.startswith("r#") else t)
+            i += 1
+        return [tuple(segs)], i
+
+    return [p for p in tree(0, ())[0] if p]
+
+
+_USE_STMT = re.compile(r"\buse\s+([^;]*);")
+_PATH_EXPR = re.compile(r"(?<![A-Za-z0-9_:])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+[A-Za-z_][A-Za-z0-9_]*)")
+
+
+@functools.cache
+def named_paths(text: str) -> frozenset[tuple[str, ...]]:
+    """Every module path a Rust file's code names: its `use` trees expanded, and its path expressions.
+    Comments and string contents do not count."""
+    _, shape = rust_lex(text)
+    out: set[tuple[str, ...]] = set()
+    for m in _USE_STMT.finditer(shape):
+        out.update(_use_paths(m.group(1)))
+    for m in _PATH_EXPR.finditer(shape):
+        out.add(tuple(re.split(r"\s*::\s*", m.group(1))))
+    return frozenset(out)
+
+
+def names_module(paths: frozenset[tuple[str, ...]], module: tuple[str, ...], children: frozenset[str] = frozenset()) -> bool:
+    """A path at or under `module` that does not go on into one of `children` (a submodule with a file of its
+    own, which a row for the parent's file alone does not cover), or a glob import of `module` or a module
+    above it."""
+    k = len(module)
+    return any(
+        (p[:k] == module and not (len(p) > k and p[k] in children)) or (p[-1] == "*" and module[: len(p) - 1] == p[:-1])
+        for p in paths
+    )
+
+
+def module_of(tree: Tree, glob: str) -> tuple[str, tuple[str, ...], frozenset[str]] | None:
+    """(package, module path below its lib, the submodules the glob leaves out) of a glob that names one lib
+    module: `…/src/x.rs` or `…/src/x/mod.rs` (the module's own file: its submodules' files are left out),
+    `…/src/x/**`, `…/src/x/*.rs`; None for any other glob (a crate root, a bin, a data file)."""
+    for p in tree.packages.values():
+        lib = p.lib()
+        if lib is None:
+            continue
+        srcdir = os.path.dirname(lib.src) + "/"
+        if not glob.startswith(srcdir):
+            continue
+        rest = glob[len(srcdir):]
+        children: frozenset[str] = frozenset()
+        for tail in ("/**", "/*.rs", "/*"):
+            if rest.endswith(tail):
+                rest = rest[: -len(tail)]
+                break
+        else:
+            if not rest.endswith(".rs"):
+                return None
+            rest = rest[:-3]
+            if rest.endswith("/mod"):
+                rest = rest[:-4]
+            sub = os.path.join(tree.root, srcdir, rest)
+            if os.path.isdir(sub):
+                children = frozenset(
+                    e[:-3] if e.endswith(".rs") else e
+                    for e in os.listdir(sub)
+                    if e != "mod.rs" and (e.endswith(".rs") or os.path.isdir(os.path.join(sub, e)))
+                )
+        if not rest or rest == "lib" or re.search(r"[*?]", rest):
+            return None
+        return p.name, tuple(rest.split("/")), children
+    return None
+
+
+def crate_idents(tree: Tree, pkg: str) -> set[str]:
+    """The names a dependent's code calls package `pkg` by: its lib's name and every rename of it."""
+    lib = tree.packages[pkg].lib()
+    out = {lib.name.replace("-", "_")} if lib is not None else set()
+    for p in tree.packages.values():
+        out |= {d.key.replace("-", "_") for d in p.deps if d.pkg == pkg and d.key != d.pkg}
+    return out
+
+
+def gate_paths_problems(tree: Tree, recipes: dict[str, Recipe], rows: list[PathRow] | None = None) -> list[str]:
+    """The table against the tree: each row's recipes are gate recipes; its glob matches a file; each file it
+    matches that a gate reads through a dependency edge is in the inputs of every recipe the row names
+    (a row cannot claim a gate runs code it does not link); and every gate whose own target names the
+    module the glob stands for is in the row (a gate that calls into the module directly is never left
+    out)."""
+    try:
+        rows = rows if rows is not None else load_gate_paths(tree.root)
+    except RecipeError as err:
+        return [str(err)]
+    graph = Graph(tree, recipes)
+    gates = [n for n in sorted(recipes, key=lambda n: recipes[n].line) if n.startswith(GATE_PREFIX)]
+    files = shipped_files(tree.root)
+    problems: list[str] = []
+    for r in rows:
+        at = f"{GATE_PATHS}:{r.line} {r.glob}"
+        if not r.every():
+            for n in r.recipes:
+                if n not in recipes or not n.startswith(GATE_PREFIX):
+                    problems.append(f"{at}: {n} is not a gate-* recipe in the justfile")
+        for alt in glob_alternatives(r.glob):
+            if not any(glob_regex(alt).match(f) for f in files):
+                problems.append(f"{at}: {alt} matches no file in the tree")
+        matched = [f for f in files if r.pattern.match(f)]
+        if not matched:
+            continue
+        if r.every():
+            continue
+        named = [n for n in r.recipes if n in recipes]
+        unread: dict[str, list[str]] = {}
+        for f in matched:
+            dep = any(not _own_origin(w) for w in (graph.inputs(n).match(f) for n in gates) if w)
+            if not dep:
+                continue
+            for n in named:
+                if graph.inputs(n).match(f) is None:
+                    unread.setdefault(n, []).append(f)
+        for n, fs in unread.items():
+            problems.append(f"{at}: {n} does not read {fs[0]}{f' and {len(fs) - 1} more files the glob matches' if len(fs) > 1 else ''} "
+                            "(its targets do not link them) — take it out of the row")
+        mods = [m for m in (module_of(tree, alt) for alt in glob_alternatives(r.glob)) if m is not None]
+        paths = [((ident, *rest), kids) for pkg, rest, kids in mods for ident in sorted(crate_idents(tree, pkg))]
+        pkgs = {m[0] for m in mods}
+        if not paths:
+            continue
+        for n in gates:
+            if n in r.recipes or n in NARROW_ALWAYS:
+                continue
+            for pname, kind, tname, _ in graph.inputs(n).targets:
+                if pname in pkgs or kind in ("lib", "libtest", "doctest"):
+                    continue
+                t = tree.packages[pname].find(kind, tname or "")
+                if t is None:
+                    continue
+                own, _ = tree.tree_of(t.src, test=True)
+                hit = next((f for f in sorted(own) if any(names_module(named_paths(tree.read(f)), p, kids) for p, kids in paths)), None)
+                if hit:
+                    problems.append(f"{at}: {n} runs {kind} {tname}, whose {hit} names {'::'.join(paths[0][0])} — add {n} to the row")
+                    break
+    return problems
+
+
+# ---- the host group: device-crate tests that open no card ----
+
+HOST_GROUP = "host"
+CARD_OPEN = re.compile(r"\bGpu\s*::|\b(?:Cuda)?Stream\b|\bDeviceBuffer\b|\bcuInit\b|\bCudaContext\b")
+
+
+def host_problems(tree: Tree, recipes: dict[str, Recipe]) -> list[str]:
+    """A recipe in `[group('host')]` (tools/gate-batch.sh balances it over both lanes, like a recipe with no
+    device code) runs tests that open no card: it calls no tools/gpu-gate.sh and picks no card for box.sh,
+    carries neither solo nor v41-load, runs a cargo test, and the code of every test it runs names nothing
+    that opens a card (CARD_OPEN). The test code read is the test-only module that holds each run test —
+    its inline block, or its file — and the whole tree of a test target. What the check cannot see: a lib
+    function a test calls that opens a card itself, and a test-only helper module that holds no test."""
+    scan = TestScan(tree)
+    problems: list[str] = []
+    for name in sorted(recipes, key=lambda n: recipes[n].line):
+        r = recipes[name]
+        if HOST_GROUP not in r.groups:
+            continue
+        at = f"justfile:{r.line} {name}"
+        for g in ("solo", "v41-load"):
+            if g in r.groups:
+                problems.append(f"{at}: [group('{HOST_GROUP}')] with [group('{g}')] — a host recipe runs beside other items, which those groups forbid")
+        text = "\n".join(r.lines)
+        if "gpu-gate.sh" in text or re.search(r"\bBLOOMERY_CARD=", text):
+            problems.append(f"{at}: [group('{HOST_GROUP}')] on a recipe that runs a card gate or picks a card")
+        try:
+            invs = [i for i in recipe_commands(r).invocations if i.sub == "test"]
+        except RecipeError as err:
+            problems.append(f"{at}: {err}")
+            continue
+        if not invs:
+            problems.append(f"{at}: [group('{HOST_GROUP}')] on a recipe that runs no cargo test")
+        for inv in invs:
+            try:
+                args = libtest_args(inv)
+            except RecipeError as err:
+                problems.append(f"{at}: {err}")
+                continue
+            targets, _ = tree.resolve(inv)
+            for pname, kind, tname, _ in targets:
+                pkg = tree.packages[pname]
+                t = pkg.lib() if kind == "libtest" else pkg.find(kind, tname or "")
+                if t is None or kind not in ("libtest", "test", "bin"):
+                    continue
+                items, errs = scan.tests_of(t.src)
+                problems += [f"{at}: {e}" for e in errs]
+                run = [it for it in items if args.misses(it.path, it.ignored) is None]
+                if not run:
+                    continue
+                if kind == "test":
+                    regions = [(f, 0, None) for f in sorted(tree.tree_of(t.src, test=True)[0])]
+                else:
+                    test_files = tree.tree_of(t.src, test=True)[0] - tree.tree_of(t.src)[0]
+                    regions = sorted({(it.file, 0, None) for it in run if it.file in test_files})
+                    for f, a, b in scan.test_blocks(t.src):
+                        if b is None:
+                            continue
+                        lo, hi = scan.line_of(f, a), scan.line_of(f, b)
+                        if any(it.file == f and lo <= it.line <= hi for it in run):
+                            regions.append((f, a, b))
+                for f, a, b in regions:
+                    code = rust_lex(tree.read(f))[0]
+                    for m in CARD_OPEN.finditer(code, a, len(code) if b is None else b):
+                        problems.append(f"{at}: [group('{HOST_GROUP}')], and {f}:{scan.line_of(f, m.start())} in a test it runs "
+                                        f"names {m.group(0)!r} — a test that may open a card is not host work")
+    return list(dict.fromkeys(problems))
+
+
+# ---- the narrowed selection ----
+
+@dataclass
+class Carrier:
+    """A cargo target with kernels of its own: its PTX is a bundle a scan may cover."""
+
+    label: str
+    bundle: str | None  # the package name of a device lib; None for a bin (no scan reads it)
+    files: set[str]  # the files its kernels can take code from: its own tree and its closure's libs
+    recipes: list[str]  # the gates that link it
+
+
+def kernel_carriers(side: Side, gates: list[str]) -> list[Carrier]:
+    tree = side.tree
+
+    def has_kernels(src: str) -> bool:
+        files, _ = tree.tree_of(src)
+        return any(KERNEL_ATTR.search(rust_lex(tree.read(f))[0]) for f in files)
+
+    out: list[Carrier] = []
+    for p in sorted(tree.packages.values(), key=lambda p: p.name):
+        for t in p.targets:
+            if t.kind not in ("lib", "bin") or not has_kernels(t.src):
+                continue
+            if t.kind == "lib":
+                files = set(tree.lib_files(p.name))
+                for dep in tree.closure(p, [], False, all_features=True):
+                    files |= set(tree.lib_files(dep))
+                users = [n for n in gates if side.graph.inputs(n).match(t.src)]
+                out.append(Carrier(f"lib {p.name}", p.name, files, users))
+            else:
+                files = set(tree.target_files(p.name, "bin", t.name, list(p.features), True, True))
+                users = [n for n in gates if any(k == "bin" and tn == t.name for _, k, tn, _ in side.graph.inputs(n).targets)]
+                out.append(Carrier(f"bin {t.name}", None, files, users))
+    return out
+
+
+@dataclass
+class Narrowed:
+    full: list[str]  # reasons the full list stands; empty when the list narrowed
+    picks: dict[str, str]  # recipe -> the rule that picked it, in justfile order
+    files: list[str]  # one line per changed file: the rule that mapped it
+    verdicts: list[ScanVerdict]
+
+
+def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLog, ScanLog]], rows: list[PathRow]) -> Narrowed:
+    gates = [n for n in sorted(b.recipes, key=lambda n: b.recipes[n].line) if n.startswith(GATE_PREFIX)]
+    res = Narrowed([], {}, [], [])
+    if not scans:
+        res.full.append("no --scan pair: whether a kernel moved is unknown")
+        return res
+    res.verdicts = [scan_verdict(x, y) for x, y in scans]
+    for v in res.verdicts:
+        if v.kind == "moved":
+            res.full.append(f"ptx-scan {v.line()}")
+    covered = {bd for v in res.verdicts for bd in v.bundles}
+    picks: dict[str, str] = {}
+
+    def pick(n: str, why: str) -> None:
+        if n in b.recipes:
+            picks.setdefault(n, why)
+
+    carriers = kernel_carriers(b, gates)
+    for f in changed:
+        if f == "justfile":
+            moved = [n for n in gates if a is None or n not in a.recipes or a.recipes[n].text != b.recipes[n].text]
+            for n in moved:
+                pick(n, "new recipe" if a is None or n not in a.recipes else "recipe text")
+            res.files.append(f"justfile: the text of {len(moved)} gate recipes" + (f" ({' '.join(moved[:6])}{' …' if len(moved) > 6 else ''})" if moved else ""))
+            continue
+        side = b if b.tree.exists(f) or a is None else a
+        own, dep = [], []
+        for n in gates:
+            if n not in side.recipes:
+                continue
+            w = side.graph.inputs(n).match(f)
+            if w is not None:
+                (own if _own_origin(w) else dep).append((n, w))
+        for n, w in own:
+            pick(n, f"{f} [{w}]")
+        hit_rows = [r for r in rows if r.pattern.match(f)]
+        star = next((r for r in hit_rows if r.every()), None)
+        rule: list[str] = [f"own target of {len(own)}"] if own else []
+        if NOT_HOST.search(f):
+            rule.append("not a host path")
+        elif star is not None:
+            res.full.append(f"{f} maps to * ({GATE_PATHS}:{star.line}: {star.why})")
+            rule.append(f"* (row {star.line})")
+        elif hit_rows:
+            for r in hit_rows:
+                for n in r.recipes:
+                    pick(n, f"{f} [row {r.line}]")
+            rule.append("rows " + " ".join(str(r.line) for r in hit_rows) + f" -> {len({n for r in hit_rows for n in r.recipes})} recipes")
+        elif dep:
+            n, w = dep[0]
+            res.full.append(f"{f}: {n} reads it through a dependency ({w}) and no row of {GATE_PATHS} maps it")
+            rule.append("no row")
+        elif not own:
+            rule.append("no gate reads it")
+        for c in carriers:
+            if f in c.files and (c.bundle is None or c.bundle not in covered):
+                for n in c.recipes:
+                    pick(n, f"{f} [{c.label}: kernels no scan pair covers]")
+                rule.append(f"{c.label} not scanned -> {len(c.recipes)} recipes")
+        res.files.append(f"{f}: {'; '.join(rule)}")
+    for n in NARROW_ALWAYS:
+        if n in b.recipes:
+            picks.setdefault(n, "the spill ratchet over the scanned bins")
+    res.picks = {n: picks[n] for n in gates if n in picks}
+    return res
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1687,7 +2286,7 @@ def plan_problems(root: str, recipes: dict[str, Recipe]) -> list[str]:
 def cmd_check(args: argparse.Namespace) -> int:
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
-    problems = check(tree, recipes) + plan_problems(ROOT, recipes)
+    problems = check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes) + host_problems(tree, recipes)
     for p in problems:
         print(f"check-recipes: {p}", file=sys.stderr)
     return 1 if problems else 0
@@ -2344,6 +2943,10 @@ class TestScan:
         self.tree = tree
         self._lex: dict[str, tuple[str, str, list[int]]] = {}
         self._cache: dict[str, tuple[list[TestItem], list[str]]] = {}
+        # per target root: the test-only code, (file, start, end) — a module under its own cfg that names
+        # `test`, inline (its braces' inside) or a file (0, None)
+        self._blocks: dict[str, list[tuple[str, int, int | None]]] = {}
+        self._blocks_cur: list[tuple[str, int, int | None]] | None = None
 
     def lexed(self, rel: str) -> tuple[str, str, list[int]]:
         if rel not in self._lex:
@@ -2356,9 +2959,15 @@ class TestScan:
         if src not in self._cache:
             out: list[TestItem] = []
             errs: list[str] = []
+            self._blocks_cur = []
             self._file(src, os.path.dirname(src), [], [], out, errs, ())
+            self._blocks[src], self._blocks_cur = self._blocks_cur, None
             self._cache[src] = (out, errs)
         return self._cache[src]
+
+    def test_blocks(self, src: str) -> list[tuple[str, int, int | None]]:
+        self.tests_of(src)
+        return self._blocks[src]
 
     def _file(self, rel: str, moddir: str, modpath: list[str], cfgs: list, out: list[TestItem], errs: list[str], stack: tuple[str, ...]) -> None:
         if rel in stack:
@@ -2489,13 +3098,18 @@ class TestScan:
         mm = _ITEM_MOD.match(head)
         if mm:
             name = mm.group(1)
+            test_only = any(re.search(r"\btest\b", c[2]) for c in here[len(cfgs):])
             if body is None:
                 hit, child_dir, err = self.tree.mod_file(rel, moddir, inner, name, path_attr)
                 if hit is None:
                     errs.append(f"{rel}:{line}: {err}")
                     return
+                if test_only and self._blocks_cur is not None:
+                    self._blocks_cur.append((hit, 0, None))
                 self._file(hit, child_dir, modpath + [name], here, out, errs, stack)
             else:
+                if test_only and self._blocks_cur is not None:
+                    self._blocks_cur.append((rel, body[0], body[1]))
                 self._items(rel, body[0], body[1], moddir, inner + [name], modpath + [name], here, out, errs, stack)
             return
         fm = _ITEM_FN.match(head)
@@ -4052,7 +4666,7 @@ def orphan_self_test(expect, real: Side) -> None:
     with tempfile.TemporaryDirectory(prefix="recipes-orphan-ff-") as tmp:
         p = os.path.join(tmp, "justfile")
         # (a) the recipe removed: both bind tests red, each naming the cfg the plain lib run lacks
-        m = re.search(r"^gate-ds41-bind:\n(?:    .*\n)+", text, re.M)
+        m = re.search(r"^(?:\[[^\n]*\]\n)*gate-ds41-bind:\n(?:    .*\n)+", text, re.M)  # its attributes go with it
         if m is None:
             expect(False, "orphan FAIL-first: no gate-ds41-bind recipe to remove")
         else:
@@ -4114,6 +4728,124 @@ def ledger_self_test(expect) -> None:
         expect(st == "run" and "no green record of gate-q" in det, f"unknown item: {st} {det}")
         st, det = ledger_status(k_none, "gate-y", "gate-y", [], leds)
         expect(st == "run" and det.endswith("(src=round)"), f"history from the rounds' ledger is labelled: {st} {det}")
+
+
+def narrow_self_test(expect, side: Side) -> None:
+    """--narrow: the scan verdicts and their refusals, the four rules of narrow() on the real tree with rows of
+    the test's own, the table's checks, and the host group's guard."""
+    header = "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local"
+    h1, h2, h3 = "1" * 32, "2" * 32, "3" * 32
+
+    def scan(tmp: str, name: str, rows: dict[str, str], banner_extra: str = "", bundles=("bloomery-gpu",), md5_rows=None, banners=1) -> str:
+        lines = ["./tools/box.sh 'cargo oxide build …'", "   Compiling bloomery-gpu v0.1.0 (/root/x/crates/gpu)"]
+        lines += [f"ptx-scan: mod{i + 1} bundle={b} bytes=100" for i, b in enumerate(bundles)]
+        for _ in range(banners):
+            lines.append(f"ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 "
+                         f"modules={len(bundles)} jit-card=NVIDIA_RTX_A6000 jit-cuda=13.4{banner_extra}")
+        lines.append(header)
+        lines += [f"{e:<24} 256 no 0 0 0 0 12 0 0 6 12 0" for e in rows]
+        lines.append("ptx-scan-md5: method=decl1")
+        lines += [f"{e} {h} 41" for e, h in (md5_rows if md5_rows is not None else rows).items()]
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+
+    def refused(fn, why: str) -> bool:
+        try:
+            fn()
+        except RecipeError as err:
+            return why in str(err)
+        return False
+
+    def row(glob: str, names: list[str], line: int = 1) -> PathRow:
+        return PathRow(line, glob, names, "why", glob_regex(glob))
+
+    with tempfile.TemporaryDirectory(prefix="recipes-narrow-") as tmp:
+        base = read_scan(scan(tmp, "base.log", {"alpha": h1, "beta": h2}))
+        same = read_scan(scan(tmp, "same.log", {"alpha": h1, "beta": h2}))
+        add = read_scan(scan(tmp, "add.log", {"alpha": h1, "beta": h2, "gamma": h3}))
+        md5 = read_scan(scan(tmp, "md5.log", {"alpha": h1, "beta": h3}))
+        gone = read_scan(scan(tmp, "gone.log", {"alpha": h1}))
+        v = [scan_verdict(base, x) for x in (same, add, md5, gone)]
+        expect([x.kind for x in v] == ["identical", "added", "moved", "moved"], f"narrow: verdicts {[x.line() for x in v]}")
+        expect(v[1].entries == ["gamma"] and v[2].entries == ["beta"] and v[3].entries == ["beta"], f"narrow: verdict entries {[x.entries for x in v]}")
+        # a log the tool cannot vouch for is refused by name, never read as identical
+        failed = os.path.join(tmp, "failed.log")
+        with open(failed, "w", encoding="utf-8") as fh:
+            fh.write("ptx-scan bin=target/release/gx scan=failed\n")
+        expect(refused(lambda: read_scan(failed), "failed scan"), "narrow: a failed scan not refused")
+        expect(refused(lambda: read_scan(scan(tmp, "f.log", {"alpha": h1}, " filter=alp")), "filtered"), "narrow: a filtered scan not refused")
+        expect(refused(lambda: read_scan(scan(tmp, "two.log", {"alpha": h1}, banners=2)), "2 `ptx-scan bin=` banners"), "narrow: two scans in one log not refused")
+        expect(refused(lambda: read_scan(scan(tmp, "cut.log", {"alpha": h1, "beta": h2}, md5_rows={"alpha": h1})), "only one of the table and the md5 block"),
+               "narrow: a table row with no digest not refused")
+        expect(refused(lambda: read_scan(os.path.join(tmp, "missing.log")), "missing.log"), "narrow: a missing log not refused by name")
+        other = read_scan(scan(tmp, "card.log", {"alpha": h1, "beta": h2}).replace("card.log", "card.log"))
+        other.fields["jit-card"] = "NVIDIA_GeForce_RTX_3090"
+        expect(refused(lambda: scan_verdict(base, other), "jit-card="), "narrow: a pair scanned on two cards not refused")
+        other = read_scan(scan(tmp, "bin.log", {"alpha": h1, "beta": h2}))
+        other.bin = "gy"
+        expect(refused(lambda: scan_verdict(base, other), "a pair is two scans of one binary"), "narrow: a pair of two binaries not refused")
+        # narrow() on the real tree. A cargo global reaches every gate through a dependency edge and sits in no
+        # kernel carrier's closure, so its row's recipes are its whole selection.
+        rows = [row("rust-toolchain.toml", ["gate-sampler"]), row("crates/vision/src/**", ["gate-vision"], 2)]
+        n = narrow(["rust-toolchain.toml"], side, side, [(base, same)], rows)
+        expect(not n.full and set(n.picks) == {"gate-sampler", *NARROW_ALWAYS},
+               f"narrow: an identical pair and a mapped file do not give the mapped recipes only: full={n.full} picks={sorted(n.picks)}")
+        n = narrow(["rust-toolchain.toml"], side, side, [(base, add)], rows)
+        expect(not n.full and set(n.picks) == {"gate-sampler", *NARROW_ALWAYS}, f"narrow: an added pair does not narrow: {n.full}")
+        n = narrow(["rust-toolchain.toml"], side, side, [(base, md5)], rows)
+        expect(any("ptx-scan gx: moved beta" in r for r in n.full), f"narrow: one md5 changed does not keep the full list: {n.full}")
+        n = narrow(["rust-toolchain.toml"], side, side, [(base, gone)], rows)
+        expect(any("ptx-scan gx: moved beta (1 removed)" in r for r in n.full), f"narrow: a removed entry does not keep the full list: {n.full}")
+        n = narrow(["rust-toolchain.toml"], side, side, [], rows)
+        expect(any("no --scan pair" in r for r in n.full), f"narrow: no scan pair does not keep the full list: {n.full}")
+        n = narrow(["Cargo.lock", "rust-toolchain.toml"], side, side, [(base, same)], rows)
+        expect(len(n.full) == 1 and n.full[0].startswith("Cargo.lock:") and "no row of" in n.full[0],
+               f"narrow: an unmatched changed file does not keep the full list, naming it: {n.full}")
+        n = narrow(["rust-toolchain.toml"], side, side, [(base, same)], [row("rust-toolchain.toml", ["*"], 7)])
+        expect(any(f"{GATE_PATHS}:7" in r for r in n.full), f"narrow: a `*` row does not keep the full list: {n.full}")
+        n = narrow(["docs/plan.md"], side, side, [(base, same)], rows)
+        expect(not n.full and set(n.picks) == {"gate-tokenizer", *NARROW_ALWAYS} and "not a host path" in n.files[0],
+               f"narrow: docs/plan.md (walked by gate-tokenizer's oracle only): full={n.full} picks={sorted(n.picks)}")
+        n = narrow(["crates/vision/src/lib.rs"], side, side, [(base, same)], rows)
+        expect(not n.full and {"gate-vision", "gate-gpu-vision"} <= set(n.picks) and "lib bloomery-gpu-vision not scanned" in n.files[0],
+               f"narrow: a kernel carrier no pair covers does not keep its gates: {n.files} {sorted(n.picks)}")
+        n = narrow(["crates/gpu-gates/src/bin/gate_p1.rs"], side, side, [(base, same)], rows)
+        expect(not n.full and set(n.picks) == {"gate-gpu-p1", *NARROW_ALWAYS}, f"narrow: a bin's own file: {n.full} {sorted(n.picks)}")
+    # the table's checks: planted rows, each refused by name; the real table clean
+    tree, recipes = side.tree, side.recipes
+    got = gate_paths_problems(tree, recipes, [row("crates/nothing/**", ["gate-nope"])])
+    expect(any("gate-nope is not a gate-* recipe" in p for p in got) and any("matches no file" in p for p in got),
+           f"gate-paths: an unknown recipe or a glob matching nothing not refused: {got}")
+    got = gate_paths_problems(tree, recipes, [row("crates/serve/src/**", ["gate-gpu-ds41-serve", "gate-ds41-bind", "gate-gpu-p1"])])
+    expect(len(got) == 1 and "gate-gpu-p1 does not read crates/serve/src/" in got[0], f"gate-paths: a recipe that does not link the row's files: {got}")
+    got = gate_paths_problems(tree, recipes, [row("crates/gpu-deepseek41/src/{body.rs,body/**}", ["gate-gpu-ds41-step"])])
+    expect(any("gate-gpu-ds41-long runs bin gate_deepseek41_long" in p and "names bloomery_gpu_deepseek41::body" in p for p in got),
+           f"gate-paths: a gate whose bin names the module, left out of its row: {got[:2]}")
+    got = gate_paths_problems(tree, recipes, [row("crates/refset/src/arch/mod.rs", ["gate-refset"])])
+    expect([p.split(": ")[1].split(" ")[0] for p in got] == ["gate-gpu-linear"],
+           f"gate-paths: arch/mod.rs's row asks for exactly the gates that call its own items (gate_linear's node_dumps), not its submodules' users: {got}")
+    expect(names_module(named_paths("use a::b::{self, C};"), ("a", "b")) and not names_module(named_paths("// a::b::c\nlet s = \"a::b\";"), ("a", "b")),
+           "gate-paths: a module named in a use tree, or only in a comment or a string")
+    expect(glob_regex("x/{a.rs,b/**}").match("x/b/c/d.rs") and not glob_regex("x/*.rs").match("x/b/c.rs"), "gate-paths: glob `**`, `*` and braces")
+    got = gate_paths_problems(tree, recipes)
+    expect(not got, f"gate-paths: the real table: {got[:3]}")
+    # the host group: the real host recipes pass; gate-gpu-lib, whose hw_ tests use the card, is refused by name
+    expect(not host_problems(tree, recipes), f"host: the real justfile: {host_problems(tree, recipes)[:2]}")
+    import copy
+
+    planted = dict(recipes)
+    planted["gate-gpu-lib"] = copy.copy(recipes["gate-gpu-lib"])
+    planted["gate-gpu-lib"].groups = (HOST_GROUP,)
+    got = host_problems(tree, planted)
+    expect(got and all("gate-gpu-lib" in p for p in got) and any("names 'CudaContext'" in p or "names 'DeviceBuffer'" in p for p in got),
+           f"host: gate-gpu-lib tagged host not refused: {got[:2]}")
+    planted["gate-gpu-ds41-long"] = copy.copy(recipes["gate-gpu-ds41-long"])
+    planted["gate-gpu-ds41-long"].groups = (HOST_GROUP, "solo")
+    got = host_problems(tree, planted)
+    expect(any("gate-gpu-ds41-long" in p and "[group('solo')]" in p for p in got) and any("gate-gpu-ds41-long" in p and "runs a card gate" in p for p in got),
+           f"host: a host recipe that is solo and runs a card gate not refused: {got}")
 
 
 def self_test() -> int:
@@ -4585,6 +5317,9 @@ def self_test() -> int:
     # orphan-tests
     orphan_self_test(expect, side)
 
+    # affected --narrow
+    narrow_self_test(expect, side)
+
     # the green ledger's key
     key_self_test(expect, side)
     ledger_self_test(expect)
@@ -4609,6 +5344,8 @@ def main(argv: list[str]) -> int:
     a.add_argument("--all-recipes", action="store_true", help="every recipe, not only gate-*")
     a.add_argument("--box", default=os.environ.get("BLOOMERY_BOX", "ws"))
     a.add_argument("--depinfo-remote", default=os.environ.get("BLOOMERY_DEPINFO_REMOTE", "~/repo/bloomery"))
+    a.add_argument("--narrow", action="store_true", help=f"the gates that run the changed host path, when every --scan pair is identical or added (the rule and {GATE_PATHS}: the section above narrow())")
+    a.add_argument("--scan", nargs=2, action="append", metavar=("BASE_LOG", "NEW_LOG"), help="a pair of `just ptx-scan <bin>` logs, the base tree's and the change's (repeatable)")
     w = sub.add_parser("why")
     w.add_argument("files", nargs="+")
     w.add_argument("--all-recipes", action="store_true")

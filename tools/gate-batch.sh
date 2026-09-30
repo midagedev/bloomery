@@ -43,8 +43,12 @@
 #      a6000 for an `any` one); a BLOOMERY_CARD recipe gets none (box.sh picks). Alone means within
 #      this batch: another track's box jobs still run. The attribute is read from `just --dump --dump-format json`, where a recipe's
 #      "attributes" list holds {"group": "solo"}; a `[group('…')]` value anywhere in the justfile other
-#      than solo and v41-load is a named error — a group is a scheduling class here, and a typo must not
-#      drop a gate out of its class.
+#      than solo, v41-load and host is a named error — a group is a scheduling class here, and a typo must
+#      not drop a gate out of its class.
+#   host: a recipe that carries `[group('host')]` — device code built and run by `cargo oxide test` on a
+#      device-linked crate whose tests open no card (tools/recipes.py check holds that: the code of every
+#      test it runs names no card opener) — is balanced like a recipe with no device code, with no card
+#      forced. With solo, v41-load, a tools/gpu-gate.sh call or a box.sh card pick it is a named error.
 #   v41-load: a recipe (or a dependency) that carries `[group('v41-load')]` — one whose binary loads the
 #      whole V4.1 model (body::open, HostResidency::at_load: the host set, ~190 GB, populated) — runs
 #      in lane A even when its gpu-gate.sh call takes `any` (then on the 3090). Not alone: lane B keeps
@@ -57,11 +61,12 @@
 # A recipe that runs a timing runner or takes the timing lease is refused, because a batch's builds
 # contaminate a timed run. Two tests: what a script the recipe runs does, followed transitively — a
 # tools/…sh that calls lease_take (tools/ref/lease.sh), or that opens the lease lock for a descriptor
-# and waits on it with flock -w — and, for what that walk cannot see, the names in TIMED below. Also
+# and waits on it with flock -w — and, for what that walk cannot see, the names in timed() below. Also
 # refused: a recipe whose text runs this script (`just smoke`: a batch inside a batch runs lanes of its
 # own on the same cards), and an item whose ARGS hand a `[group('solo')]` recipe's gpu-gate.sh binary
-# one of the --flags that recipe passes it (`gate-gpu-ds41-long:--faults` is gate-gpu-ds41-faults' arm,
-# which runs alone and with BLOOMERY_HOST_LOCK=1) — the error names the solo recipe to list instead. Each lane runs its items in list order; A and B run
+# one of the --flags that recipe passes it (in the self-test's fixture, `v41-a:--faults` is the solo
+# recipe v41-solo's arm, which runs alone and with BLOOMERY_HOST_LOCK=1) — the error names the solo
+# recipe to list instead. Each lane runs its items in list order; A and B run
 # concurrently (cargo serializes their builds by its own lock). --lanes 1 runs every item in the
 # list's order in one lane (labelled A), with no card forced — the recipes' own defaults, as a hand
 # batch runs them.
@@ -356,6 +361,20 @@ host:
 gate-x:
     ./tools/box.sh 'bash tools/gate.sh -p y'
 
+gate-y:
+    ./tools/box.sh 'bash tools/gate.sh -p w'
+
+[group('host')]
+hostdev:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p hd'
+
+commented:
+    # the timed recipes source tools/ref/timing-card.sh; this one runs none
+    ./tools/box.sh 'bash tools/gate.sh -p c'
+
+timedrun:
+    ./tools/box.sh 'bash tools/ref/timing-card.sh probe'
+
 nested *ARGS:
     ./tools/gate-batch.sh --smoke {{ARGS}}
 JF
@@ -396,6 +415,9 @@ DF
     "^v41-any	A	fixed	3090	v41-any: \[group\('v41-load'\)\]" "${gb[@]}" --classes
   check 'classes: an any-form recipe outside the group stays balanced' 0 '^plain-any	F	balanced	3090,a6000	' "${gb[@]}" --classes
   check 'classes: solo wins over v41-load' 0 '^v41-solo	X	solo	3090	' "${gb[@]}" --classes
+  check 'classes: a host recipe with device code is balanced with no card forced' 0 "^hostdev	F	balanced	-	hostdev: \[group\('host'\)\]" "${gb[@]}" --classes
+  check 'classes: a timed name in a comment of the body is not a timed recipe' 0 '^commented	F	balanced	-	no device code$' "${gb[@]}" --classes
+  check 'classes: a timed script in command position is' 0 '^timedrun	T	timed	-	timedrun runs tools/ref/timing-card\.sh' "${gb[@]}" --classes
   check 'classes: a recipe that runs a batch is refused' 0 '^nested	R	refused	-	nested runs tools/gate-batch\.sh' "${gb[@]}" --classes
   check 'dry run: the v41-load member runs in lane A with the 3090 forced' 0 \
     "^lane A  v41-any +BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=3090' just v41-any$" "${gb[@]}" --dry-run v41-a v41-any plain-any host
@@ -410,6 +432,14 @@ DF
     '  gate-x                      crates/x/src/lib.rs (+1)' 'unmapped: none' > "$t/aff-echo.txt"
   check "list: just affected output behind just's echoed line takes its recipe lines" 0 '^lane [AB]  gate-x ' \
     "${gb[@]}" --dry-run --list "$t/aff-echo.txt"
+  # `just affected --narrow` output: the recipes it keeps run; a `  - gate-y` line it leaves out does not.
+  printf '%s\n' './tools/affected-gates.sh main --no-box --narrow --scan b.log n.log' \
+    'affected: a..b — 2 changed files, 1 of 6 gate-recipes selected (narrowed from 2 by ptx-scan)' 'narrow: ptx-scan gx: identical' \
+    '  gate-x  crates/x/src/lib.rs (+1)' 'recipes: gate-x' 'always: ' 'left out (1), each by ptx-scan gx: identical:' \
+    '  - gate-y  (ptx-scan gx: identical)' 'unmapped (0):' > "$t/aff-narrow.txt"
+  check 'list: a narrowed affected output runs the recipes it keeps' 0 '^lane [AB]  gate-x ' "${gb[@]}" --dry-run --list "$t/aff-narrow.txt"
+  if printf '%s\n' "$out" | grep -q 'gate-y'; then fail 'list: a narrowed affected output does not run a left-out recipe' "gate-y is in the batch"
+  else pass 'list: a narrowed affected output does not run a left-out recipe'; fi
   printf '%s\n' 'something else' 'affected: a..b — 1 changed file' '  gate-x  crates/x/src/lib.rs (+1)' > "$t/aff-other.txt"
   check 'list: any other line above the affected: header is a malformed item' 65 "aff-other.txt:1: malformed item 'something else'" \
     "${gb[@]}" --dry-run --list "$t/aff-other.txt"
@@ -438,6 +468,9 @@ DF
   cp "$t/justfile.good" "$t/justfile"
   printf '%s\n' '' 'plain-v41:' "    ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gpu-gate.sh other'" >> "$t/justfile"
   check 'export without the group: a named error' 65 'recipe plain-v41: names BLOOMERY_GATE_V41_LOAD without' "${gb[@]}" --classes
+  cp "$t/justfile.good" "$t/justfile"
+  printf '%s\n' '' "[group('host')]" "[group('solo')]" 'host-solo:' "    ./tools/box.sh 'bash tools/gpu-gate.sh other'" >> "$t/justfile"
+  check 'host with solo and a card gate: a named error' 65 "recipe host-solo: \[group\('host'\)\] with \[group\('solo'\)\] and a tools/gpu-gate.sh call" "${gb[@]}" --classes
   cp "$t/justfile.good" "$t/justfile"
   # The disk floor: above the floor a run proceeds on the verdict line; below it a real run stops at
   # 69 with the named line (nothing created — the fake HOME's tree would show it), a dry run shows
@@ -585,8 +618,29 @@ ANY = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
 # The names the structural rule (walk() and takes_lease below) cannot see: timing-card.sh, a library a
 # timing runner sources, which takes no lease itself; gpu-ab.py, a Python runner walk() does not read;
 # the lease lock named in a recipe's own text, which walk() does not read either. Every runner that calls
-# lease_take is found by the walk.
-TIMED = re.compile(r"tools/ref/timing-card\.sh|gpu-ab\.py|/root/bloomery-(cpu|lease)\.lock")
+# lease_take is found by the walk. Each counts where it runs, as TAKE's name does: the two scripts in
+# command position (after env words and an interpreter, `.`, `source`, `exec` or `timeout N`; the start
+# of box.sh's quoted command and of a `bash -c` string is a command position too), the lock as a word of
+# a command; never in a comment, and never in a message (echo, printf, die, fail, say).
+TIMED_RUN = re.compile(r"^[^#\n]*?(?:^|[;&|({!]|\b(?:then|do|else|if|while|until)(?=\s)|(?:tools/box\.sh|\b(?:ba)?sh\s+-c)\s+['\"])\s*"
+                       r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:(?:bash|sh|source|\.|exec|python3?|timeout(?:\s+-\S+)*\s+\S+)\s+)*"
+                       r"[^\s;&|#'\"]*(tools/ref/timing-card\.sh|gpu-ab\.py)\b", re.M)
+TIMED_LOCK = re.compile(r"(?<![A-Za-z0-9_./-])['\"]?(/root/bloomery-(?:cpu|lease)\.lock)\b")
+
+
+def timed(text):
+    """The timed name a recipe's text runs, or None: TIMED_RUN, or the lease lock in a command that is
+    not a message, outside a comment."""
+    m = TIMED_RUN.search(text)
+    if m:
+        return m.group(1)
+    for line in text.split("\n"):
+        for seg in SEGMENT.split(line.split("#", 1)[0]):
+            if not MESSAGE.match(seg):
+                m = TIMED_LOCK.search(seg)
+                if m:
+                    return m.group(1)
+    return None
 BOX_CARD = re.compile(r"\bBLOOMERY_CARD=(both|a6000)\b")
 UNLOCKED = re.compile(r"tools/gate\.sh --oxide|cargo oxide (test|run)\b")
 SEGMENT = re.compile(r"&&|\|\||;|\||\n")
@@ -731,9 +785,9 @@ def classify(name):
         if BATCH in SCRIPT.findall(text):
             return "R", (f"{n} runs {BATCH}: a batch inside a batch runs lanes of its own beside this batch's, "
                          "on the same cards; list its items instead")
-        m = TIMED.search(text)
-        if m:
-            return "T", f"{n} names {m.group(0)}: a timed recipe does not run in a gate batch"
+        hit = timed(text)
+        if hit:
+            return "T", f"{n} runs {hit}: a timed recipe does not run in a gate batch"
         w = walk(SCRIPT.findall(text))
         if w["error"]:
             return "R", f"{n}: {w['error']}"
@@ -789,6 +843,7 @@ def classify(name):
 GROUPS = {
     "solo": "alone in lane X, after both lanes",
     "v41-load": "lane A, one after another (solo wins)",
+    "host": "balanced over lanes A and B, no card forced: device-crate tests that open no card",
 }
 unknown = [
     f"recipe {n}: [group({a['group']!r})] is not a group this runner knows ({', '.join(GROUPS)}) — "
@@ -827,14 +882,28 @@ def group_of(name, group):
     return [n for n in closure(name, set()) if {"group": group} in recipes[n]["attributes"]]
 
 
+host_bad = []
+for n in sorted(recipes):
+    if {"group": "host"} not in recipes[n]["attributes"]:
+        continue
+    text = "\n".join(body(m) for m in closure(n, set()))
+    why = [f"[group('{g}')]" for g in ("solo", "v41-load") if group_of(n, g)]
+    why += [w for w, hit in (("a tools/gpu-gate.sh call", GPU_GATE in text), ("a box.sh card pick", BOX_CARD.search(text))) if hit]
+    if why:
+        host_bad.append(f"recipe {n}: [group('host')] with {' and '.join(why)} — a host recipe opens no card and runs beside other items")
+if host_bad:
+    for e in host_bad:
+        print("gate-batch: " + e, file=sys.stderr)
+    fail(f"{len(host_bad)} host recipe(s) that open a card or run alone; nothing ran")
+
+
 def solo_of(name):
     return group_of(name, "solo")
 
 
 # A solo recipe's arm run through another recipe: a non-solo item whose ARGS hand a solo recipe's
-# gpu-gate.sh binary one of the flags that solo recipe passes it (gate-gpu-ds41-long:--faults runs
-# gate-gpu-ds41-faults' arm) would run that arm in a lane beside other loads, and without whatever
-# else the solo recipe sets around it. Read from the justfile: per solo recipe, the binary of each
+# gpu-gate.sh binary one of the flags that solo recipe passes it would run that arm in a lane beside
+# other loads, and without whatever else the solo recipe sets around it. Read from the justfile: per solo recipe, the binary of each
 # gpu-gate.sh call and the literal --flags after it.
 CALL_ARGS = re.compile(r"gpu-gate\.sh\s+([A-Za-z0-9_-]+)((?:\s+[^\s;&|]+)*)")
 
@@ -957,6 +1026,9 @@ def placement(name, lane, lanes):
         if uses_gpu_gate:
             return "X", kind, ["3090" if lane == "A" else "a6000"], ["3090" if lane == "A" else "a6000"]
         return "X", kind, ["-"], ["3090" if lane == "A" else "none"]
+    if group_of(name, "host"):
+        # Device code with no card: its lane is a scheduling choice, and the balance makes it.
+        return "F", "balanced", ["-"], ["none"]
     if group_of(name, "v41-load"):
         # One lane: two V4.1 loads at once evict each other's host set from the page cache. Lane A,
         # where the 3090-only (`--place gate`) loads already are; an `any` member runs on the 3090.
@@ -979,7 +1051,7 @@ if src == "classes":
             print("\t".join([name, lane, "timed" if lane == "T" else "refused", "-", reason]))
         else:
             cls, kind, cards, _ = placement(name, lane, "2")
-            tags = [f"{n}: [group('{g}')]" for g in ("solo", "v41-load") for n in group_of(name, g)]
+            tags = [f"{n}: [group('{g}')]" for g in ("solo", "v41-load", "host") for n in group_of(name, g)]
             print("\t".join([name, cls, kind, ",".join(cards), "; ".join(tags + [reason])]))
     sys.exit(0)
 
@@ -1032,7 +1104,7 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: {item!r} hands {b} {flag}, the arm of the solo recipe {solo_n} — it runs alone in "
                       f"lane X with what that recipe sets around it; list {solo_n} instead")
         continue
-    tags = [f"{n}: [group('{g}')]" for g in ("solo", "v41-load") for n in group_of(name, g)]
+    tags = [f"{n}: [group('{g}')]" for g in ("solo", "v41-load", "host") for n in group_of(name, g)]
     if tags:
         reason = "; ".join(tags + [reason])
     qargs = " ".join(shlex.quote(a) for a in argv)

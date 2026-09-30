@@ -6,7 +6,7 @@
 //! wrote them; then the position is taken back and the token stepped through
 //! the engine's captured graph, whose argmax is the run's token.
 //!
-//! Two arms on one load, each from a reset:
+//! Three arms on one load, each from a reset (`just gate-gpu-ds41-long` runs all three):
 //! - `--free`: prompt row 7 of `$BLOOMERY_DATA/greedy-ds41` (four ids; ik's
 //!   greedy run on it is tens of ids long before its EOS, so the long run is
 //!   compared over all of them — prompt 0's stops at its third token), then
@@ -23,9 +23,9 @@
 //!   CPU build divides the same zeros by their zero sum. The free arm's path
 //!   moves with the placement and the rounding; this one is fed.
 //!
-//! - `--faults` (its own recipe, `just gate-gpu-ds41-faults`, alone in its
-//!   process so no earlier arm has touched the host tier's pages): the same
-//!   prompt from a reset, then [`FAULT_STEPS`] greedy tokens through the
+//! - `--faults` (run first, the process's first steps after the load, so no
+//!   earlier arm has touched the host tier's pages): prompt row 0 from a
+//!   reset, then [`FAULT_STEPS`] greedy tokens through the
 //!   engine's captured graph alone, each step's page faults read around it
 //!   (`getrusage(RUSAGE_SELF)`, less the engram helper thread's own, which
 //!   reads the engram table the load does not populate). Red when a step

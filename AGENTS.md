@@ -113,10 +113,15 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # experiments again; read the code instead"): when `just ptx-scan` is
                       # identical to the base for every bin the change reaches, no kernel
                       # moved, so the landing batch is the gates that run the changed host
-                      # path (for the V4.1 prompt call: ds41-prefill, -step, -long, -faults,
+                      # path (for the V4.1 prompt call: ds41-prefill, -step, -long,
                       # e2e and the changed bins' own gates) plus the static checks; the
                       # batch's list names the gates it leaves out and the ptx-scan line that
-                      # lets it. A kernel, a launch or a byte formula moved runs the whole list
+                      # lets it. A kernel, a launch or a byte formula moved runs the whole list.
+                      # `just affected BASE --narrow --scan BASE_LOG NEW_LOG …` prints that list:
+                      # each scan pair's verdict (identical, added or moved), the gates whose own
+                      # target changed, and the rows of tools/gate-paths.tsv the changed files match;
+                      # a moved pair, no pair, or a changed file no row maps prints the full list
+                      # and names why
     just gate         # the static checks, lint, gate-1-1 and the fast library gates
     just smoke        # the smoke tier: the static checks, gate-gpu-ds41-step, gate-gpu-ds41-prefill at
                       # P = 512 alone, gate-gpu-e2e, in two lanes through tools/gate-batch.sh — a subset
@@ -127,12 +132,14 @@ The plan lives in `docs/plan.md`. This file is the working contract.
                       # transitively: gate-ptx-spill's JIT is one) and those with no device code are
                       # balanced, longest first to the lane expected to end first (the median of their last
                       # five rows in ~/.cache/bloomery/gate-times.tsv, 45 s without one), lane A forcing the
-                      # 3090, lane B the A6000; X = alone after both lanes: a `[group('solo')]` recipe (a
-                      # host-memory pin another lane's model load moves — gate-gpu-ds41-faults, the load
-                      # gates) or BLOOMERY_CARD=both; any other group value is an error; rc 75 retries;
-                      # one log per item and a run.log ending in `DONE total= red= wall=`; refuses to
-                      # start while the timing lease is held and refuses a recipe that names a timing runner
-                      # or whose script takes the lease.
+                      # 3090, lane B the A6000; a `[group('host')]` recipe (device-crate tests that open no
+                      # card, which `just check-recipes` holds) is balanced with no card forced; X = alone
+                      # after both lanes: a `[group('solo')]` recipe (a host-memory pin another lane's model
+                      # load moves — gate-gpu-ds41-long, the load gates) or BLOOMERY_CARD=both; any other
+                      # group value is an error; rc 75 retries; one log per item and a run.log ending in
+                      # `DONE total= red= wall=`; refuses to start while the timing lease is held and refuses
+                      # a recipe that runs a timing runner (in command position, not in a comment or a
+                      # message) or whose script takes the lease.
                       # `--ledger` (the lead's batches) and `--round-ledger` (a round's): an item whose input
                       # key (`tools/recipes.py key` — its source closure, recipe text, cargo globals, ARGS, env
                       # and card, and a box manifest read once per batch, whose model rows enter it only for the
