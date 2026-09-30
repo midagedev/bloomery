@@ -10,7 +10,7 @@
 //! (ik's `result_mtp_embd`). Every launch is an entry the target's chain
 //! already has:
 //! - the store part, every row: the token's embedding row read from the file
-//!   on the host and written as zeros at position 0 (ik's position mask);
+//!   on the host, position 0 included (ik's GLM MTP input masks no row);
 //!   the hidden rows — a target arena's streams' mean (`ds41_hc_mean`) then
 //!   the `output_norm` RMS, or rows from the host already normed; each row's
 //!   `[enorm(e) | hnorm(h)]`, two RMS norms into the halves of its packed
@@ -675,15 +675,11 @@ impl Body {
             index,
             ..
         } = nx;
-        // The rows' embeddings (zeros at position 0) and positions.
+        // The rows' embeddings and positions.
         for t in 0..m {
             let p = pos0 + t;
             let e = &mut a.e_host[t * n..(t + 1) * n];
-            if p == 0 {
-                e.fill(0.0);
-            } else {
-                embd.row_into(feed.tokens[t], e)?;
-            }
+            embd.row_into(feed.tokens[t], e)?;
             a.pos_host[t] = p as u32;
             a.cnt_host[t] = p as u32 + 1;
         }

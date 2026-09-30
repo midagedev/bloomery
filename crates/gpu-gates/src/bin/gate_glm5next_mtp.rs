@@ -6,9 +6,10 @@
 //! drafted windows (`app::mtp::MtpDraft<Body>`) against the plain run.
 //!
 //! What is asserted:
-//! - (m) the set's position mask: its warmup graph holds ik's
-//!   `mtp_token_embd_pos_masked`, zeros on the row at position 0 and not on
-//!   the others — the rule the program's embedding rows follow.
+//! - (m) the set's MTP input: its warmup graph's `enorm` reads `inp_embd`
+//!   itself, with no position-mask node between, and no row of `inp_embd`
+//!   is zeros, position 0 included — the rule the program's embedding rows
+//!   follow.
 //! - (o) teacher-forced, every graph of the set replayed in ik's order — the
 //!   warmup, then each block's graphs — each row's token, position and
 //!   target hidden row (ik's `inp_tokens`, `inp_pos`, `inp_mtp_states`) fed
@@ -188,7 +189,29 @@ mod gate {
             };
             let tokens = unsigned("inp_tokens")?;
             let n = tokens.len();
-            let pos = unsigned("inp_pos")?;
+            // GLM's MTP layer has no rope, so ik's graph has no `inp_pos`: a
+            // row's position is its mask row's count of visible keys, less one.
+            // The mask is `ne[0]` keys by its rows padded past `n`.
+            let mask_row = find("KQ_mask")?;
+            let kv = usize::try_from(mask_row.row.ne[0])?;
+            let mask = set.logical_f32s(mask_row)?;
+            if n == 0 || kv == 0 || mask.len() < n * kv {
+                return Err(
+                    format!("KQ_mask holds {} values, {n} rows of {kv} keys", mask.len()).into(),
+                );
+            }
+            let pos: Vec<u32> = (0..n)
+                .map(|r| {
+                    let seen = mask[r * kv..(r + 1) * kv]
+                        .iter()
+                        .filter(|x| x.is_finite())
+                        .count();
+                    u32::try_from(seen)
+                        .ok()
+                        .and_then(|c| c.checked_sub(1))
+                        .ok_or_else(|| GateError::from(format!("KQ_mask row {r} shows no key")))
+                })
+                .collect::<Result<_, _>>()?;
             // ik builds `inp_out_ids` only for a graph of more than one row.
             let out_ids = if n > 1 {
                 unsigned("inp_out_ids")?
@@ -353,33 +376,21 @@ mod gate {
         })
     }
 
-    /// (m): the position mask on the warmup graph's embedding rows.
+    /// (m): the warmup graph's embedding rows, unmasked at every position.
     fn pos_mask(set: &MtpSet, hidden: usize) -> Result<bool, GateError> {
-        let row = set
+        let masked = set
             .find(-1, Graph::Warmup, "mtp_token_embd_pos_masked", 0)
-            .map_err(|e| {
-                format!(
-                    "the set's warmup holds no position mask ({e}): the tree it was dumped from \
-                     runs another MTP input than the program's"
-                )
-            })?;
-        let e = set.logical_f32s(row)?;
-        let pos = set.i32s(set.find(-1, Graph::Warmup, "inp_pos", 0)?, Layout::Flat)?;
-        if e.len() != pos.len() * hidden {
-            return Err(format!(
-                "the mask holds {} values for {} rows of {hidden}",
-                e.len(),
-                pos.len()
-            )
-            .into());
+            .is_ok();
+        let e = set.logical_f32s(set.find(-1, Graph::Warmup, "inp_embd", 0)?)?;
+        if e.is_empty() || e.len() % hidden != 0 {
+            return Err(format!("inp_embd holds {} values, rows of {hidden}", e.len()).into());
         }
-        let ok = pos.iter().enumerate().all(|(r, &p)| {
-            let zero = e[r * hidden..(r + 1) * hidden].iter().all(|&x| x == 0.0);
-            zero == (p == 0)
-        }) && pos.contains(&0);
+        let rows = e.len() / hidden;
+        // The warmup is the prompt from position 0, so its row 0 is position 0.
+        let ok =
+            !masked && (0..rows).all(|r| e[r * hidden..(r + 1) * hidden].iter().any(|&x| x != 0.0));
         println!(
-            "(m) the warmup's {} embedding rows: zeros exactly at position 0 {}",
-            pos.len(),
+            "(m) the warmup's {rows} embedding rows (the prompt from position 0): no mask node, none zeros {}",
             verdict(ok)
         );
         Ok(ok)
