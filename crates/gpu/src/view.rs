@@ -140,9 +140,9 @@ impl<'g, 'x, 's, 'a, T> Apply<'g, 'x, 's, 'a, T> {
 /// The rope launch's three buffers as one shape: `src` and `dst` hold
 /// `m * n_vec * nd` values in the `[n_dims, n_vec, m]` column layout, `cs`
 /// holds `m * nd` cache values, one thread per (column, pair) of the
-/// `npairs = nd / 2` pairs each column covers. [`own`](Rope::own) mints
-/// the calling thread's pair from its own launch index; it takes no caller
-/// index.
+/// `npairs = nd / 2` pairs each column covers. [`apply`](Rope::apply)
+/// rotates the calling thread's pair, found from its own launch index; it
+/// takes no caller index.
 #[must_use]
 pub(crate) struct Rope<'b, 's, 'a, T> {
     src: *const T,
@@ -203,111 +203,55 @@ impl<'b, 's, 'a, T> Rope<'b, 's, 'a, T> {
         }
     }
 
-    /// The pair this launch thread owns, `None` for a thread past the last
-    /// pair — the kernel's own `i >= total` guard, same polarity.
+    /// Rotate this launch thread's pair: `(y0, y1) = f(src0, src1, cos, sin)`
+    /// written to `dst` at the pair's two cells, nothing for a thread past
+    /// the last pair (the kernel's own `i >= total` guard, same polarity).
+    /// The view does the guard, the loads and the stores and hands `f`
+    /// values only: a pair handed back as a value would carry the buffer
+    /// pointers through the `Some`/`None` merge, where the backend loses
+    /// their global state space and the accesses turn generic.
     ///
     /// Sound for every `Rope` safe code can name: a `Rope` can only be
     /// built by [`new`](Self::new), whose contract proved `src` and `dst`
     /// cover `m * n_vec * nd` values and `cs` `m * nd`. A
     /// [`ThreadIndex`] cannot be forged by safe code — only the launch
     /// machinery mints it from hardware coordinates — and it is unique per
-    /// thread of the launch, so two threads' `own` calls decompose
-    /// different flat indices: `i ↦ (col, p)` is a bijection onto
-    /// `[0, m * n_vec) × [0, npairs)`, and `(col, p) ↦ col·nd + 2p` is
-    /// injective (`2p < nd`), so the pairs' cells — and their `+1`s — are
-    /// disjoint writes inside `dst`, and the read offsets stay below the
-    /// extents the contract proved (`2p + 1 <= nd - 1` for any `nd >= 2`).
-    /// The pair borrows this `Rope` exclusively, so one is live per thread.
-    /// It copies the three buffer pointers rather than pointing at the
-    /// `Rope`: a returned value holding the address of a kernel-local struct
-    /// keeps that struct in a local depot.
+    /// thread of the launch, so two threads' calls decompose different flat
+    /// indices: `i ↦ (col, p)` is a bijection onto `[0, m * n_vec) ×
+    /// [0, npairs)`, and `(col, p) ↦ col·nd + 2p` is injective (`2p < nd`),
+    /// so the pairs' cells — and their `+1`s — are disjoint writes inside
+    /// `dst`, and the read offsets stay below the extents the contract
+    /// proved (`2p + 1 <= nd - 1` for any `nd >= 2`). The call consumes the
+    /// `Rope`, so it runs once per thread.
     ///
     /// [`ThreadIndex`]: cuda_device::thread::ThreadIndex
     #[inline(always)]
-    pub(crate) fn own(
-        &mut self,
-        idx: ThreadIndex<'_, Index1D>,
-    ) -> Option<RopePair<'_, 'b, 's, 'a, T>> {
+    pub(crate) fn apply(self, idx: ThreadIndex<'_, Index1D>, f: impl FnOnce(T, T, T, T) -> (T, T))
+    where
+        T: Copy,
+    {
         let i = idx.get();
         let (npairs, n_vec, nd) = (self.npairs, self.n_vec, self.nd);
         if i >= self.total {
-            return None;
+            return;
         }
         let col = i / npairs;
         let d = (i % npairs) * 2;
         let t = col / n_vec;
-        Some(RopePair {
-            src: self.src,
-            cs: self.cs,
-            dst: self.dst,
-            base: col * nd + d,
-            cache: t * nd + d,
-            _rope: PhantomData,
-        })
-    }
-}
-
-/// One launch thread's rope pair: the two `src` values and the two cache
-/// values to read, the two `dst` cells to write — offsets resolved when
-/// [`Rope::own`] minted the pair. Built only there.
-///
-/// [`Rope::own`]: Rope::own
-#[must_use]
-pub(crate) struct RopePair<'v, 'b, 's, 'a, T> {
-    /// The minting `Rope`'s buffer pointers, copied.
-    src: *const T,
-    cs: *const T,
-    dst: *mut T,
-    /// The pair's first cell in `src`/`dst` (`col * nd + 2p`); `+ 1` is the
-    /// second. Both below `m * n_vec * nd` by `own`'s decomposition.
-    base: usize,
-    /// The pair's first cache cell (`t * nd + 2p`); `+ 1` is the second.
-    /// Both below `m * nd`.
-    cache: usize,
-    /// The exclusive borrow of the minting `Rope`: one pair per thread.
-    _rope: PhantomData<&'v mut Rope<'b, 's, 'a, T>>,
-}
-
-impl<'v, 'b, 's, 'a, T> RopePair<'v, 'b, 's, 'a, T> {
-    /// The pair's four inputs: `(src0, src1, cos, sin)`.
-    ///
-    /// Sound: the offsets were resolved by the minting [`Rope::own`] from
-    /// this thread's own launch index below `total`, a decomposition the
-    /// `Rope`'s constructor contract keeps below the extents it proved, so
-    /// all four loads are inside their buffers.
-    ///
-    /// [`Rope::own`]: Rope::own
-    #[inline(always)]
-    pub(crate) fn load(&self) -> (T, T, T, T)
-    where
-        T: Copy,
-    {
-        // SAFETY: `base` and `cache` were proven in bounds by the minting
-        // `own` from a launch index below `total`; `+ 1` is part of that
-        // proof.
+        let base = col * nd + d;
+        let cache = t * nd + d;
+        // SAFETY: `base`, `cache` and their `+ 1`s are inside the buffers the
+        // constructing `new` proved (the doc above), and `dst`'s two cells are
+        // this thread's alone.
         unsafe {
-            (
-                *self.src.add(self.base),
-                *self.src.add(self.base + 1),
-                *self.cs.add(self.cache),
-                *self.cs.add(self.cache + 1),
-            )
-        }
-    }
-
-    /// Write the pair's two outputs to `dst`.
-    ///
-    /// Sound: the cells were proven inside `dst` at mint, and the minting
-    /// index is unique per thread of the launch, so no other thread's pair
-    /// resolves to either cell; the pair holds its `Rope` exclusively, so
-    /// at most one pair per thread is live.
-    #[inline(always)]
-    pub(crate) fn store(&mut self, y0: T, y1: T) {
-        // SAFETY: `base` and `base + 1` were proven inside `dst` by the
-        // minting `own`, and this thread alone owns the pair's cells.
-        unsafe {
-            *self.dst.add(self.base) = y0;
-            *self.dst.add(self.base + 1) = y1;
+            let (y0, y1) = f(
+                *self.src.add(base),
+                *self.src.add(base + 1),
+                *self.cs.add(cache),
+                *self.cs.add(cache + 1),
+            );
+            *self.dst.add(base) = y0;
+            *self.dst.add(base + 1) = y1;
         }
     }
 }

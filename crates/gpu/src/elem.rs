@@ -570,13 +570,8 @@ mod elem_kernels {
         // SAFETY: the contract above was launcher-checked (`requires` on the
         // host before enqueue) and `nd`, `n_vec`, `m` are this kernel's own
         // parameters, one value per grid.
-        let mut rope = unsafe { Rope::new(src, cs, &mut dst, nd, n_vec, m) };
-        let Some(mut pair) = rope.own(idx) else {
-            return;
-        };
-        let (x0, x1, c, s) = pair.load();
-        let (y0, y1) = rope_pair_core(x0, x1, c, s);
-        pair.store(y0, y1);
+        let rope = unsafe { Rope::new(src, cs, &mut dst, nd, n_vec, m) };
+        rope.apply(idx, rope_pair_core);
     }
 
     /// The card's slot list of a hybrid layer whose card holds the id
