@@ -19,9 +19,11 @@
 #
 # Arms, in lease order under the default order (it rotates by one slot each round — the position
 # bias ab-decode.sh names; Order below has the engine blocks):
-#   <D>      ours: generate_ds41 --depth D -n N --time. The fed ids are lease.sh's lcg_prompt D,
-#            one real decode step each, untimed; generated token 0 comes out of the last of them and
-#            the N - 1 steps after it are timed. The context is the binary's default, the serving
+#   <D>      ours: generate_ds41 --depth D -n N --time. The fed ids are lease.sh's lcg_prompt D, run
+#            as the binary's prompt call (in batches, bit for bit the decode steps' state; under
+#            BLOOMERY_PREFILL=steps one decode step each), outside the decode clock; generated token 0
+#            comes out of the last of them and the N - 1 steps after it are timed. The context is the
+#            binary's default, the serving
 #            ctx_max the plan (a) is made for, at every depth: the plan's card expert prefix depends
 #            on ctx_max, so a per-depth ctx would move experts between the card and the host.
 #            The row also carries `pp_tok/s <v> (n=D, passes=K)` from the binary's `time prompt`
@@ -72,6 +74,21 @@
 #            server's `-fit on -fitt 1024 -v`, and their `fit` column.
 #   lcppsrv…:prose:<P>, lcppsrv…:code:<P>  a server arm fed the corpus's first P ids, the ids a prose:<P> or
 #            code:<P> arm feeds: row label `<engine>@prose` (`@code`), `ids=prose`, in that corpus's tables.
+#   A server arm's -c is our arms' context (docs/fair-measure.md 1.5): the plan's ctx_max, which this
+#            tree's generate_ds41 --plan prints at the run's --place before any load (the binary's own
+#            answer, read once before the lease, a dry run's too; in a real run the binary must be no
+#            older than its sources; a server arm without the binary is refused by name, and the recipe
+#            builds it only for an ours arm). A server that makes its context at another n_ctx is a FAIL
+#            row, and so is one of our rows whose `load` record names another ctx; a server that cannot hold it fails at its load and
+#            its FAIL row names the -c and the log's allocation line. A decode row's prompt_per_second is
+#            also a prefill record under its label: the same P ids through the same prompt path, so a
+#            decode arm at D = P carries the pp table's row. An engine word takes its own flags,
+#            `+t<N>`, `+nopo<0|1>`, `+k<K>` (-t, -nopo, --n-cpu-moe in place of LCPP_GPU_FLAGS'; the label
+#            carries them: lcpp-warm.sh's Per-arm flags), e.g. `lcppsrvpp4096+nopo0+k34:prose:4096`.
+#            Every server row's first ids are held to our plain arm's on the same ids and length (ours,
+#            prose, code; lcpp-warm.sh's Cross-check): one whose first id parts from ours is a FAIL
+#            xcheck line in the failed arms and drops out of the means and ratios; one that parts later
+#            is a [xcheck-tail] line and stays.
 #   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
 #            a lever arm of the same binary, row label `ours@NAME=VALUE[,...]`. Beside a plain `<D>`
 #            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_PIN_MAIN=0`.
@@ -217,11 +234,10 @@
 #
 # Prefill. pp_tok/s is P over the wall of processing a P-token prompt, in each engine's terms:
 #   ours     generate_ds41's `time prompt` row: before the first fed step to after the readback of
-#            generated token 0, `passes` the steps it took. V4.1's ours is one decode step per
-#            token today, so its pp equals its step rate at the fed depths by construction — at or
-#            above it: the plain feed is one body per id and one readback at the end, a timed step
-#            one body and one readback. A DSpark arm's feed reads back per id and also reads each
-#            position's features into the draft (`kind=dspark`).
+#            generated token 0, `passes` the passes the feed took: its batches under `kind=batch` (the
+#            default prompt call), one step per id under `kind=steps` (BLOOMERY_PREFILL=steps, whose pp
+#            is the step rate by construction). A DSpark arm's feed reads back per id and also reads
+#            each position's features into the draft (`kind=dspark`).
 #   ik, lcpp llama-bench's pp test: llama_decode over the P ids in batches of -b and ubatches of
 #            -ub, then one synchronize (test_prompt), one repetition, llama-bench's own value.
 #            Both trees default to -ub 512 -b 2048; the row names the batch sizes that ran.
@@ -294,7 +310,9 @@
 # position each; under a draft `time pass`, its positions) in windows of RES_WINDOW (16) passes, in
 # order, the last window short when they do not divide, and the flips its `residency pass` records made
 # (the sum of `made`) — a printed line in no mean; the prompt call is not in it (the row's pp column is
-# its rate).
+# its rate). It is followed by `residency sums <label> r<r> d=<D> | residency <word> (<why>) passes <n> kept
+# <k> landed <l> late <t> made <m> bytes <b> | <its row's tag>` (cold-blocks.sh's residency sums: the lever
+# record and the timed passes' fields), and the run ends with each label's per-pass means.
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (rounds, default 3),
 # BLOOMERY_GEN_WARM, BLOOMERY_GEN_BIN (default target/release/generate_ds41), BLOOMERY_GEN_PLACE and
@@ -420,7 +438,7 @@ ours_parse() {
     D_PROP=draft_summary.proposals D_ACC=draft_summary.accepts D_POS=draft_summary.positions \
     D_PASSES=draft_summary.passes 'D_TPS=draft_summary.tok/s(positions)' 'TOKENS=step.token*' \
     PP_N=time_prompt.n PP_MS=time_prompt.ms 'PP_TPS=time_prompt.tok/s' PP_PASSES=time_prompt.passes \
-    PP_KIND=time_prompt.kind) || { FAIL_WHY="records.py did not read the output"; return 2; }
+    PP_KIND=time_prompt.kind 'XC_TOK=tokens.tokens') || { FAIL_WHY="records.py did not read the output"; return 2; }
   eval "$rec"
 }
 # pp_col <arm kind>: an ours or bin arm's prefill column from its parsed time prompt row (ours_parse),
@@ -881,7 +899,28 @@ fi
 # A server arm needs the tree's llama-server, every flag it passes in that server's --help (run with no
 # card), and curl; the server is a reference engine to the CPU guard.
 SRVBIN=
+# The server arms' -c (the header's A server arm's -c): the plan's ctx_max at this run's --place, from
+# this tree's binary's --plan, which loads nothing. SRV_CTX_PLAN stays empty when no server arm runs.
+SRV_CTX_PLAN=
+SRV_CTX_SRC="generate_ds41 --plan --place $PLACE: its plan record's ctx_max"
+srv_ctx_of() { echo "$SRV_CTX_PLAN"; }
 if [ "$srv" = 1 ]; then
+  if [ -x "$BIN" ]; then
+    # A real run reads the context from a binary no older than its sources, as an ours arm's run does.
+    if [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?; fi
+    plan_out=$(timeout --kill-after=10 300 "$BIN" --plan --depth 512 --place "$PLACE" 2>&1) || {
+      rc=$?
+      echo "depth-ds41.sh: the server arms' -c is the plan's ctx_max, and $BIN --plan --depth 512 --place $PLACE exited $rc: ${plan_out##*$'\n'}" >&2
+      exit 2
+    }
+    plan_rec=$(python3 "$RECORDS" sh - 'SRV_CTX_PLAN=plan.ctx_max' <<< "$plan_out") && eval "$plan_rec" || SRV_CTX_PLAN=''
+    case $SRV_CTX_PLAN in
+      '' | *[!0-9]*) echo "depth-ds41.sh: $BIN --plan --place $PLACE printed no plan record with a ctx_max (got '$SRV_CTX_PLAN'): the server arms have no -c" >&2; exit 2 ;;
+    esac
+  else
+    echo "depth-ds41.sh: the server arms' -c is the plan's ctx_max, which $BIN --plan prints, and there is no binary at $BIN (a dry run too: build it first; the recipe builds it only for an ours arm)" >&2
+    exit 2
+  fi
   srv_preflight depth-ds41.sh
   CPU_BUSY_COMMS="$CPU_BUSY_COMMS llama-server"
 fi
@@ -1333,13 +1372,32 @@ ours_post() {
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" residency "$RES_WHY" "$out"
     return 0
   }
+  # Beside a server arm, the context our row ran at is the one the servers were given (the header's
+  # A server arm's -c): its load record, or its load's.
+  if [ -n "$SRV_CTX_PLAN" ]; then
+    local lctx
+    lctx=$(python3 "$RECORDS" sh - 'LCTX=load.ctx' <<< "$out"$'\n'"${LG_HEADER:-}") && eval "$lctx" || LCTX=''
+    if [ "$LCTX" != "$SRV_CTX_PLAN" ]; then
+      arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its load record names ctx=${LCTX:-none}, and the server arms run at -c $SRV_CTX_PLAN ($SRV_CTX_SRC)" "$out"
+      return 0
+    fi
+  fi
   ours_row "${A_KIND[$i]}" "$label" "$dep" "$r" "$out" "$wall" || {
     [ $? = 3 ] || arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"
     return 0
   }
   res_curve "$label" "$r" "$dep" "$slot"
+  # The lever and the timed passes' sums (cold-blocks.sh's residency sums), a line of its own.
+  res_sums generate_ds41 "$out" "${LG_HEADER:-}" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$RS_WHY" "$out"; return 0; }
+  [ -z "$RS_COL" ] || echo "residency sums $label r$r d=$dep$RS_COL | $ROW_TAG"
   counted || return 0
   count_row
+  res_sums_add "$label" "$dep" "$r"
+  # The greedy cross-check's ours side: this tree's plain arms (no NAME=VALUE list), on their ids.
+  case ${A_KIND[$i]}:$label in
+    ours:ours) xc_add ours lcg "$dep" "$r" "$label" "$XC_TOK" ;;
+    corpus:prose | corpus:code) xc_add ours "$label" "$dep" "$r" "$label" "$XC_TOK" ;;
+  esac
   tags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
   if [ -n "$DRAFT" ]; then TPS_MEAN=${DRAFT##*tok/s(positions)=}; fi
   sums+=("$label|$dep|$r|$TPS_MEAN|$TPS_P50|$tags")
@@ -1624,6 +1682,7 @@ if [ -n "$DRY" ]; then
   fi
   [ "$WARM_ROWS" = 0 ] || echo "[dry] warm rows: each of our arms after a same-id PRIME in its load; a counted row tagged [cold] prints as COLD and runs once more (cold-blocks.sh)"
   [ "$gen" = 0 ] || echo "[dry] $(res_config)"
+  [ -z "$SRV_CTX_PLAN" ] || echo "[dry] server context: -c $SRV_CTX_PLAN ($SRV_CTX_SRC); each ours row's load record must name it"
   xbin_pairs
   for pair in "${XB_PAIRS[@]}"; do
     IFS='|' read -r c base lab <<< "$pair"
@@ -1677,6 +1736,7 @@ if [ "$lcppfit" = 1 ]; then
 fi
 echo "[config] prefill: ikpp/lcpppp run llama-bench -p P -n 0 -r 2 -o json at the flags above, the row is repetition 2 (<U>: -ub U -b max(U, 2048)); ours from its time prompt row"
 [ "$srv" = 0 ] || srv_config
+[ -z "$SRV_CTX_PLAN" ] || echo "[config] server context: -c $SRV_CTX_PLAN ($SRV_CTX_SRC); each ours row's load record must name it"
 warm_rows_config
 [ "$gen" = 0 ] || echo "[config] $(res_config)"
 echo "[config] arms=${ARMS[*]} timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
@@ -1704,6 +1764,11 @@ echo "cpu-busy rows: $busy_rows of $n_rows (BLOOMERY_CPU_BUSY_PCT=${CPU_BUSY_PCT
 echo "other-busy rows: $other_rows of $n_rows (a compute process on the other card as the arm started)"
 echo "cold rows: $cold_rows of $n_rows (the measured window's majflt × ${COLD_US} µs ≥ ${COLD_PCT} % of that window)"
 warm_rows_summary
+# The greedy cross-check (lcpp-warm.sh), before the tables: a server row whose first id parts from ours
+# is a failed arm and drops out at its depth or P with them; a later id's part is a [xcheck-tail] line.
+xc_table
+[ ${#XC_FAILED[@]} -eq 0 ] || FAILED+=("${XC_FAILED[@]}")
+[ ${#XC_DROP[@]} -eq 0 ] || FAILED_KEYS+=("${XC_DROP[@]}")
 # A failed arm drops out at its depth or P (cold-blocks.sh).
 failed_tally
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
@@ -1776,6 +1841,7 @@ if [ ${#slot_sums[@]} -gt 0 ]; then
     if (np[k, 0] && np[k, 1]) line = line sprintf("  later/first pp %.4f", (pp[k, 1] / np[k, 1]) / (pp[k, 0] / np[k, 0]))
     print line } }' | sort
 fi
+res_sums_table
 witness post
 ref_witness
 failed_end

@@ -317,6 +317,67 @@ blocks_run() {
   done
 }
 
+# The residency sums. An arm whose engine runs adaptive residency prints a `residency lever` record before
+# its load (the word it runs by and why) and a `residency pass` record at every boundary
+# (crates/gpu-gates/src/record.rs). res_sums carries them into the row, read through records.py by kind
+# and field: the lever's word and why (the arm's own output, else its load's lines), and over the pass
+# records whose pass is step or pair — the first boundary's (none) and a prompt call's are not a timed pass
+# — their count and the sums of kept (the rows the pass kept), landed (flips that went live), late (of
+# them, flips whose copy had not completed), made (flips the rule made) and bytes (the bytes they copy).
+# The record carries no hit rate; these are its fields. res_sums_table prints each label's per-pass means
+# over its counted rows.
+RS_RECORDS="${BASH_SOURCE[0]%/*}/../bloomery/records.py"
+RS_ROWS=()
+# res_kinds <bin>: 0 when <bin>'s checked-in schema declares the residency records, 1 when records.py
+# names it as printing none, 2 with RS_WHY for any other refusal.
+res_kinds() {
+  local out
+  out=$(python3 "$RS_RECORDS" sh --bin "$1" /dev/null 'X=residency_lever.residency' 'Y=residency_pass.pass*' 2>&1) && return 0
+  case $out in *"prints no kind residency_"*) return 1 ;; esac
+  RS_WHY="records.py: $out"
+  return 2
+}
+# res_sums <bin> <output> [<its load's lines>]: RS_WORD, RS_WHYW (the lever's why), RS_N, RS_KEPT,
+# RS_LANDED, RS_LATE, RS_MADE_SUM, RS_BYTES, and RS_COL, ` | residency <word> (<why>) passes <n> kept <k>
+# landed <l> late <t> made <m> bytes <b>` — empty when the arm printed no lever record. Returns 2 with
+# RS_WHY when records.py cannot read the output.
+res_sums() {
+  local rec lev P='' K='' L='' T='' M='' B='' RW='' RY=''
+  RS_WORD='' RS_WHYW='' RS_N=0 RS_KEPT=0 RS_LANDED=0 RS_LATE=0 RS_MADE_SUM=0 RS_BYTES=0 RS_COL='' RS_WHY=''
+  rec=$(python3 "$RS_RECORDS" sh --bin "$1" - 'P=residency_pass.pass*' 'K=residency_pass.kept*' \
+    'L=residency_pass.landed*' 'T=residency_pass.late*' 'M=residency_pass.made*' 'B=residency_pass.bytes*' \
+    <<< "$2" 2>&1) || { RS_WHY="records.py did not read the residency records: $rec"; return 2; }
+  lev=$(python3 "$RS_RECORDS" sh --bin "$1" - 'RW=residency_lever.residency' 'RY=residency_lever.why' \
+    <<< "$2"$'\n'"${3:-}" 2>&1) || { RS_WHY="records.py did not read the residency lever: $lev"; return 2; }
+  eval "$rec"
+  eval "$lev"
+  RS_WORD=$RW RS_WHYW=$RY
+  [ -n "$RS_WORD" ] || return 0
+  read -r RS_N RS_KEPT RS_LANDED RS_LATE RS_MADE_SUM RS_BYTES < <(paste -d' ' <(echo "$P") <(echo "$K") <(echo "$L") \
+    <(echo "$T") <(echo "$M") <(echo "$B") | awk '$1 == "step" || $1 == "pair" { n++; k += $2; l += $3; t += $4; m += $5; b += $6 }
+      END { printf "%d %d %d %d %d %d\n", n, k, l, t, m, b }')
+  RS_COL=" | residency $RS_WORD ($RS_WHYW) passes $RS_N kept $RS_KEPT landed $RS_LANDED late $RS_LATE made $RS_MADE_SUM bytes $RS_BYTES"
+}
+# res_sums_add <label> <key> <round>: the last res_sums into RS_ROWS, when it read a lever record.
+res_sums_add() {
+  [ -n "$RS_WORD" ] || return 0
+  RS_ROWS+=("$1|$2|$3|$RS_WORD|$RS_N|$RS_KEPT|$RS_LANDED|$RS_LATE|$RS_MADE_SUM")
+}
+# res_sums_table: one line per label and key with a residency word: the rows, the timed passes a row, and
+# kept, landed, late and made a pass over those rows (0 passes: `-`).
+res_sums_table() {
+  [ ${#RS_ROWS[@]} -gt 0 ] || return 0
+  echo "=== residency per arm: the residency pass records' fields a timed pass (step or pair), over the counted rows ==="
+  printf '%s\n' "${RS_ROWS[@]}" | awk -F'|' '{
+    k = $1 " d=" $2 " " $4; r[k]++; n[k] += $5; kp[k] += $6; l[k] += $7; t[k] += $8; m[k] += $9
+  } END {
+    for (k in r) {
+      if (n[k] > 0) printf "residency mean %s: rows %d, passes/row %.1f, kept/pass %.2f, landed/pass %.3f, late/pass %.3f, made/pass %.3f\n", k, r[k], n[k] / r[k], kp[k] / n[k], l[k] / n[k], t[k] / n[k], m[k] / n[k]
+      else printf "residency mean %s: rows %d, passes/row 0, kept/pass -, landed/pass -, late/pass -, made/pass -\n", k, r[k]
+    }
+  }' | sort
+}
+
 # `bash tools/ref/cold-blocks.sh --self-test`: the cold bound, the flag rewrite, the order's refusal and
 # the block planner on fixed arms (just check-recipes runs it on the Mac; the runners' use of it is
 # depth-ds41-stub.sh's and depth-qwen3moe-stub.sh's, on the box).
@@ -420,6 +481,27 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   PRIMING=0 ROW_TAG=ROW
   prime_tag 4
   check prime-off "$ROW_TAG" ROW
+  # The residency sums over generate_ds41's schema (the one that declares the kinds on this tree).
+  rp() { echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=$5 made=$6 in_flight=0 bytes=$7 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
+  out=$(echo "residency lever residency=mid-p40-s1 why=place"; rp none 0 0 0 0 3 300; rp prompt 1 50 1 0 2 200; rp step 2 10 2 1 1 100; rp step 3 12 1 0 0 0)
+  res_sums generate_ds41 "$out" && r=0 || r=$?
+  check res-sums "$r|$RS_COL" "0| | residency mid-p40-s1 (place) passes 2 kept 22 landed 3 late 1 made 1 bytes 100"
+  res_sums_add ours@X 512 1
+  res_sums generate_ds41 "$(rp step 1 5 0 0 0 0)" "residency lever residency=mid-p40-s1 why=set" && r=0 || r=$?
+  check res-sums-load "$r|$RS_WORD|$RS_WHYW|$RS_N|$RS_KEPT" "0|mid-p40-s1|set|1|5"
+  res_sums generate_ds41 "$(rp step 1 5 0 0 0 0)" && r=0 || r=$?
+  check res-sums-nolever "$r|$RS_COL" "0|"
+  res_sums_add ours 512 1
+  res_sums generate_ds41 "$(echo "residency lever residency=mid-p40-s1 why=place"; rp step 2 20 1 1 1 100; rp pair 3 10 0 0 1 100)"
+  res_sums_add ours@X 512 2
+  check res-sums-table "$(res_sums_table | tail -n +2)" "residency mean ours@X d=512 mid-p40-s1: rows 2, passes/row 2.0, kept/pass 13.00, landed/pass 1.000, late/pass 0.500, made/pass 0.750"
+  res_kinds generate_ds41 && r=0 || r=$?
+  check res-kinds "$r" 0
+  res_kinds generate_qwen3moe && r=0 || r=$?
+  check res-kinds-none "$r" "$(python3 "$RS_RECORDS" sh --bin generate_qwen3moe /dev/null 'X=residency_lever.residency' > /dev/null 2>&1 && echo 0 || echo 1)"
+  res_kinds no_such_bin && r=0 || r=$?
+  check res-kinds-bad "$r|${RS_WHY:0:11}" "2|records.py:"
+  RS_ROWS=()
   rm -rf "$TMPDIR"
   FAILED=() FAILED_KEYS=() WARM_ROWS=0
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"

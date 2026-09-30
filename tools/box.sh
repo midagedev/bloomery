@@ -136,19 +136,27 @@ fi
 DATA="${DATA}__d=\$(. tools/ref/ref-paths.sh && printf %s \"\$BLOOMERY_DATA\") && export BLOOMERY_DATA=\"\$__d\" && unset __d"
 # BLOOMERY_BOX_ENV="NAME=value NAME2=value2" exports those variables into the command, so a lever arm
 # reaches the binary through an unchanged recipe (tools/gpu-ab.py's env arms). Entries are split on
-# spaces; each value is quoted for the remote shell.
+# spaces and quote nothing; each value is quoted for the remote shell. So a value with a space cannot
+# cross: an entry that holds a quote, or one that is not an upper-case NAME=value (the second half of a
+# spaced value), is refused by name — such a value goes in the command itself, or in an arm word (a
+# server arm's +t<N>, +nopo<0|1>, +k<K>: tools/ref/lcpp-warm.sh).
 ENVS=
 read -r -a box_env <<< "${BLOOMERY_BOX_ENV:-}"
+prev=
+spaced="BLOOMERY_BOX_ENV splits on spaces and quotes nothing, so a value with a space does not cross it; put it in the command, or in an arm word (a server arm's +t<N>, +nopo<0|1>, +k<K>)"
 for kv in ${box_env[@]+"${box_env[@]}"}; do
-  name=${kv%%=*}
+  name=${kv%%=*} after=
+  [ -z "$prev" ] || after=" (after '$prev': the rest of a value with a space? $spaced)"
   case "$kv" in
+    *[\"\']*) echo "box.sh: BLOOMERY_BOX_ENV entry '$kv' holds a quote: $spaced" >&2; exit 64 ;;
     *=*) ;;
-    *) echo "box.sh: BLOOMERY_BOX_ENV entries are NAME=value, got '$kv'" >&2; exit 64 ;;
+    *) echo "box.sh: BLOOMERY_BOX_ENV entries are NAME=value, got '$kv'$after" >&2; exit 64 ;;
   esac
   case "$name" in
-    '' | [0-9]* | *[!A-Za-z0-9_]*) echo "box.sh: '$name' in BLOOMERY_BOX_ENV is not a variable name" >&2; exit 64 ;;
+    '' | [0-9]* | *[![:upper:][:digit:]_]*) echo "box.sh: '$name' in BLOOMERY_BOX_ENV is not an upper-case variable name$after" >&2; exit 64 ;;
   esac
   ENVS="${ENVS}export $name=$(printf %q "${kv#*=}") && "
+  prev=$kv
 done
 # 트랙 원격 디렉터리(BLOOMERY_REMOTE)의 빌드는 CARGO_BUILD_JOBS 기본 12: 파동의 4중 빌드가 32코어를 스래싱하지 않게.
 # BLOOMERY_BOX_ENV로 주면 그 값이고, 메인 트리(BLOOMERY_REMOTE 없음)는 그대로다.

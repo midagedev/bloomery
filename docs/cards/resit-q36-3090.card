@@ -1,0 +1,25 @@
+# The resit's Qwen3.6 public window on the RTX 3090 (W12): W11's arms with the 3090 as the timing card (this
+# file takes no --place; the whole model stays on one card).
+#
+# Band [derived]: our A6000 decode at depth 6, 204.4 tok/s (rig-log 09-28#q36-release), is bound by the
+# card's memory bandwidth; at the 3090's 936 GB/s against the A6000's 768 it would be 204.4 x 936 / 768 =
+# 249.1. The 250 W cap and the non-bandwidth part of the step are unpriced: the low edge 190 leaves them
+# 24 %. Whether the ub 4096 buffers fit beside the model on the 3090 is the run's to say (a FAIL row).
+kind: baseline
+question: on the RTX 3090, what is our Qwen3.6 decode after a prompt of 512, beside llama.cpp's warm
+  server rows?
+term: tok/s @ n=96, depth 512, ours (generate_qwen3moe on qwen35moe, the lcg ids, after a same-id PRIME),
+  RTX 3090 at 250 W
+unit: tok/s
+predict: 190..250
+condition: one lease, two rounds, BLOOMERY_WARM_ROWS=1, the 3090 as BLOOMERY_TIMING_GPU, W11's arms; every
+  server n_ctx line equal to ours' --ctx; every xcheck line `same`; no counted row [cold], [cpu-busy] or
+  [other-busy]; the full output to a file first. Command: BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-q36-3090.card BLOOMERY_WARM_ROWS=1
+  BLOOMERY_TIMING_GPU=<the 3090's UUID>' just depth-gpu-qwen35moe <W11's arms> > <log> 2>&1
+reason: sets the public Qwen3.6 3090 rows; why now: the release table has no Qwen3.6 3090 row
+decide-in: write the Qwen3.6 3090 rows (rig-log first) in the 3090's own table
+decide-below: the cap binds the decode: read the witness card's power and clock counters and caption
+  the rows with the cap
+decide-above: the A6000 row was not bandwidth-bound as priced: re-read its step's bytes against 768 GB/s
+  before either row goes out

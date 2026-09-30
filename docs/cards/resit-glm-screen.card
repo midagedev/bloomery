@@ -1,0 +1,30 @@
+# The resit's GLM reference screen (SG), one round on the A6000, not a public row: which PR branch and
+# which flags are llama.cpp's fastest GLM-5.3 line before W6 and W7 (docs/fair-measure.md 3). The server
+# arms now run through tools/ref/lcpp-warm.sh: a same-id warm-up request, -ctxcp 0 --cache-ram 0, -c the
+# runner's C (ours' --ctx), each arm's own flags in its engine word. A decode row at D is also its pp row.
+#
+# Band [derived]: the 09-28 bench rows, #27752 17.80 [cold] and #27754 16.78 at depth 512, ratio 1.061.
+# #27752's row was cold; warm it can only rise, so the high edge allows +5.6 % (1.12); the low edge is
+# parity (1.00), below which the branch order flips.
+kind: baseline
+question: warm and on our prose ids, how much faster is llama.cpp PR #27752's GLM-5.3 server decode than
+  #27754's, and which of -t 16, op offload at K 37 and ub 4096 does W6 carry?
+term: ratio of tok/s @ n=96, depth 512, llama-server /completion predicted_per_second on 512 prose ids
+  from GLM_PROSE_FROM after a same-id warm-up, #27752 (-ngl 999 --n-cpu-moe 36 -fa on -t 32
+  --no-op-offload -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 4352) over #27754 (the same with -fa off,
+  NVIDIA_TF32_OVERRIDE=0), A6000
+unit: ratio
+predict: 1.00..1.12
+condition: one lease, one round, BLOOMERY_GEN_CTX=4352, the arms lcpp27752srv:512 lcpp27754srv:512
+  lcpp27752srv+t16:512 lcpp27752srv:4096 lcpp27752srvpp+nopo0+k37:4096 lcpp27752srvpp4096:4096
+  lcpp27754srvpp4096:4096; every server n_ctx line 4352; prompt_n equal to the ids and cache_n 0 on
+  every row; no row [cold] past its retry, [cpu-busy] or [other-busy]; the full output to a file first.
+  Command: BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-glm-screen.card
+  BLOOMERY_GEN_CTX=4352' just depth-gpu-glm5next <the arms above> > <log> 2>&1
+reason: sets the reference branch and flags of the public GLM windows (W6, W7), one round and
+  unpublished; why now: the GLM server arms had no warm-up and kept context checkpoints until this tree
+decide-in: W6 and W7 run #27752's server arms, with -t 16 only if its row beats the plain one past 2 %,
+  and whichever pp4096 line (op offload at K 37, ub 4096) is fastest and loads
+decide-below: #27754 is the faster branch warm: W6 and W7 run its server arms (under NVIDIA_TF32_OVERRIDE=0)
+decide-above: #27752 gained more than its cold row's faults price: read its timed majflt and re-price the
+  cold bound before any GLM row goes out

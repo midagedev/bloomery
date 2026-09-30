@@ -1,0 +1,32 @@
+# The resit's V4.1 public window on both cards (W3), the "A6000+3090" table: W2's arms with
+# BLOOMERY_TIMING_CARDS=a6000+3090 and our plan (b), the reference at the profile's two-card line
+# (--n-cpu-moe 30 -ts 36.5/4.5, models/deepseek41.sh), which has never been loaded. The 3090 stays at its
+# 250 W cap and the witness blocks check for Xid.
+#
+# Band [derived]: llama.cpp's A6000 decode step, 47.6 ms (21.0 tok/s), is ~7 ms of card and ~40.6 ms of
+# host experts; the two-card line keeps 30 of 40 layers' experts on the host in place of 33, so the host
+# term scales by 30/33 to 36.9 ms and the step to ~44-45 ms (22.2..22.7 tok/s); the edges are no gain
+# (21.0, the A6000 step) and 40 ms (25). The cross-card hop at the split is one activation row a token.
+kind: baseline
+question: on both cards, what is llama.cpp's V4.1 decode after a prose prompt of 512, beside our plan (b)?
+term: tok/s @ n=96, depth 512, llama.cpp PR #28696 llama-server /completion predicted_per_second on the
+  first 512 ids of corpus-prose.ids after a same-id warm-up (-ngl 999 --n-cpu-moe 30 -ts 36.5/4.5 -fa on
+  -t 32 --no-op-offload -fit off -np 1 -ctxcp 0 --cache-ram 0 -c <plan ctx_max>), A6000+3090
+unit: tok/s
+predict: 21..25
+condition: one lease, two rounds, BLOOMERY_AB_ORDER=blocks, BLOOMERY_WARM_ROWS=1,
+  BLOOMERY_TIMING_CARDS=a6000+3090, BLOOMERY_GEN_PLACE=bp, the arms prose:512 prose:4096
+  prose:512@BLOOMERY_RESIDENCY=off prose:4096@BLOOMERY_RESIDENCY=off lcppsrv:prose:512
+  lcppsrv:prose:4096 lcppsrvpp4096:prose:4096; no Xid in any witness; our load records and the server
+  n_ctx lines at plan (b)'s ctx_max; every xcheck line `same`; no counted row [cold], [cpu-busy] or
+  [other-busy]; the full output to a file first. Command: BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-v41-bp.card BLOOMERY_AB_ORDER=blocks
+  BLOOMERY_WARM_ROWS=1 BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_GEN_PLACE=bp' just depth-gpu-ds41 <the
+  arms above> > <log> 2>&1
+reason: sets the public "A6000+3090" V4.1 rows; why now: the release table carries a two-card row and
+  its reference line has never been loaded
+decide-in: write the two-card rows (rig-log first) in their own table, never beside the A6000 rows
+decide-below: the split costs more than its hop: read the server log's device buffers and whether the
+  3090's layers ran the experts or the host did; re-derive before a row goes out
+decide-above: the host term shrank more than 30/33: read the log's CPU_Mapped size against the profile's
+  and correct the placement arithmetic in models/deepseek41.sh first

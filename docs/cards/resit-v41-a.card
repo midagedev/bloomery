@@ -1,0 +1,39 @@
+# The resit's V4.1 public window on the A6000 (W2). Our arms on the first P prose ids with and without
+# adaptive residency, the llama.cpp server arms on the same ids after a same-id warm-up, at -c the plan's
+# ctx_max (docs/fair-measure.md 1.5), each server row's first ids held to ours' (6.1). A server decode
+# row's prompt rate is also its pp row (the same ids through the same prompt path), so no plain srvpp arm
+# runs; lcppsrvpp4096+k34 is llama.cpp's ub 4096 line (at K 33 the card cannot hold it), and SV may swap
+# it for its +nopo0 twin.
+#
+# Band: v41-warm.card's, 76.6..106 (the cold bench row, and that row with its whole timed-fault bound
+# removed [derived]). Prose ids in place of lcg move nothing here: at P = 4096 each of the 384 experts of a
+# host layer gets 4096 x 6 / 384 = 64 tokens on average, so the bytes a ubatch reads do not depend on
+# which ids [derived]. The -c of 32768 in place of ~4352 moves no prompt time (flash attention reads the
+# used cells) but costs 1,280 MiB of KV [derived: 170 MiB x 32768 / 4352] of the 2,713 left at K 33;
+# whether the compute buffers still fit is the run's to say (a FAIL row names the allocation).
+#
+# Wall [derived, resitplan 2]: ~25.6 min for two rounds with the pp rows taken from the decode arms.
+kind: baseline
+question: with its engram rows warm and at our context, what is llama.cpp's V4.1 prompt rate at
+  P = 4096 on the A6000 on our prose ids, beside ours with and without adaptive residency?
+term: pp tok/s @ P = 4096, llama.cpp PR #28696 llama-server /completion prompt_per_second on the first
+  4096 ids of corpus-prose.ids after a same-id warm-up (-ngl 999 --n-cpu-moe 33 -fa on -t 32
+  --no-op-offload -fit off -np 1 -ctxcp 0 --cache-ram 0 -c <plan ctx_max>), A6000, engine blocks,
+  the `lcppsrv@prose` decode row's prompt rate
+unit: tok/s
+predict: 76.6..106
+condition: one lease, two rounds, BLOOMERY_AB_ORDER=blocks, BLOOMERY_WARM_ROWS=1, the arms prose:512
+  prose:4096 prose:512@BLOOMERY_RESIDENCY=off prose:4096@BLOOMERY_RESIDENCY=off lcppsrv:prose:512
+  lcppsrv:prose:4096 lcppsrvpp4096+k34:prose:4096; each block's DISCARD r0 row present; our load
+  records and every server n_ctx line at the plan's ctx_max; every xcheck line `same`; no counted row
+  [cold], [cpu-busy] or [other-busy]; the full output to a file first. Command: BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-v41-a.card BLOOMERY_AB_ORDER=blocks
+  BLOOMERY_WARM_ROWS=1' just depth-gpu-ds41 <the arms above> > <log> 2>&1
+reason: sets the public V4.1 A6000 rows, ours and llama.cpp's, from one window; why now: the release
+  replaces every cross-engine row with one warm re-measure (docs/fair-measure.md)
+decide-in: write the V4.1 A6000 rows (rig-log first): ours from the prose arms, llama.cpp at the faster
+  of its plain and ub 4096 lines, the ratio from this window only
+decide-below: the server pays a term the bench does not: read the server log's n_ubatch and the row's
+  prompt_n, and re-derive before any row goes out
+decide-above: the warm server beats the bench's cold bound: re-price COLD_US from this row against the
+  cold bench row before any [cold] tag is trusted again

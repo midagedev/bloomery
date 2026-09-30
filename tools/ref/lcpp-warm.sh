@@ -17,7 +17,13 @@
 #                                  `fit`: the fit twin's (lcpp-fit.sh's lcpp_fit_flags first: the placement
 #                                  options dropped, then -fitt T -v, here `-fit on -fitt T -v`); without it
 #                                  `-fit off`, the hand-set placement kept as given
-#   lcpp_srv_ctx <prompt ids> <n_predict>  the -c: prompt + n_predict + 1 rounded up to 256
+#   lcpp_srv_ctx <prompt ids> <n_predict>  the -c a runner without its own context rule gives: prompt +
+#                                  n_predict + 1 rounded up to 256 (Context below)
+#   lcpp_flag_set <flags> <flag> <value> <spelling...>  the flags with every word pair of one of the
+#                                  spellings removed and `<flag> <value>` appended
+#   srv_mods_split <engine word>   a server engine word's per-arm flags (Per-arm flags below): SRV_BASE the
+#                                  engine, SRV_MODS its `+…` suffix; 1 and SRV_WHY on a word it does not take
+#   srv_mods_apply <flags> <mods>  the flags with those per-arm flags set in place of the profile's
 #   lcpp_srv_cmd <server> <model> <ctx> <flag words...>  into SRV_CMD, the server's whole command line:
 #                                  the flags, then LCPP_SRV_FIXED, -c, --host 127.0.0.1 --port 0
 #   lcpp_srv_probe <server>        true when <server> --help (no card: CUDA_VISIBLE_DEVICES=-1) lists every
@@ -32,7 +38,9 @@
 #                                  greedy (temperature 0, top_k 1), ignore_eos, cache_prompt off,
 #                                  return_tokens; pgmajfault read just before and after (SRV_F0, SRV_F1). Into
 #                                  SRV_PROMPT_N, SRV_PROMPT_MS, SRV_PROMPT_TPS, SRV_PRED_N, SRV_PRED_MS,
-#                                  SRV_PRED_TPS, SRV_CACHE_N, SRV_TOKENS (the generated ids, comma-separated).
+#                                  SRV_PRED_TPS, SRV_CACHE_N, SRV_TOKENS (the generated ids, comma-separated),
+#                                  SRV_DRAFT_N and SRV_DRAFT_ACC (the timings' draft_n and draft_n_accepted,
+#                                  0 when the server drafts nothing).
 #                                  1 with SRV_WHY when the request fails, answers other than 200, has no
 #                                  timings, or prompt_n is not the ids' count, cache_n is not 0, or
 #                                  predicted_n is not n_predict
@@ -47,13 +55,48 @@
 #   lcpp_srv_stop                  TERM to SRV_PID, which passes it to the server; KILL to its children and
 #                                  to it 30 s later if it is still up; SRV_EXIT its status
 #   lcpp_srv_build <log>, lcpp_srv_device <log>  the server's `build:` line and the card it opened
+#   lcpp_srv_nctx <log>            the n_ctx the server's context was made with (its `llama_context: n_ctx =`
+#                                  line, the first: an MTP draft's context prints its own after it)
+#   lcpp_srv_ctx_check <log> <ctx> 1 and SRV_WHY when that n_ctx is missing or is not <ctx>
 #   lcpp_srv_majflt                /proc/vmstat's pgmajfault (the stub tests redefine it)
+#   xc_add, xc_table               the greedy cross-check (Cross-check below)
 # A caller runs: lcpp_srv_flags, lcpp_srv_cmd, (before its lease) lcpp_srv_probe, then per arm
-# lcpp_srv_start, lcpp_srv_arm, [lcpp_srv_request], lcpp_srv_stop — and stops the server on every path
-# after a start, the failed ones included. The depth runners' own arms are built on these by the runner
-# side below (srv_eng, srv_pp, srv_ub, srv_cmd_of, srv_ids, srv_check_arm, srv_preflight, srv_tree,
-# srv_dry_cmd, srv_config, srv_arm, srv_take, srv_row); the GLM runner's srv_run is the same sequence
-# without the warm-up and can move onto the functions above.
+# lcpp_srv_start, lcpp_srv_ctx_check, lcpp_srv_arm, [lcpp_srv_request], lcpp_srv_stop — and stops the
+# server on every path after a start, the failed ones included. The depth runners' own arms are built on
+# these by the runner side below (srv_eng, srv_pp, srv_ub, srv_cmd_of, srv_ids, srv_check_arm,
+# srv_preflight, srv_tree, srv_dry_cmd, srv_config, srv_arm, srv_take, srv_row); depth-glm5next.sh builds
+# its server arms on the functions above with rows of its own.
+#
+# Context (docs/fair-measure.md 1.5). The server's -c is our arm's context. A runner states its rule by
+# defining srv_ctx_of <arm index> <n_predict> (the -c of that server arm) and SRV_CTX_SRC (where the value
+# comes from, printed on the dry line and in a FAIL row): depth-ds41.sh the plan's ctx_max, which
+# generate_ds41 --plan prints before any load; depth-qwen3moe.sh ours' --ctx rule at the arm's depth;
+# depth-glm5next.sh its --ctx C. Without one the -c is lcpp_srv_ctx's. A server arm whose prompt ids +
+# n_predict + 1 do not fit that -c is refused before the lease; a server whose log names another n_ctx, or
+# none, is a FAIL row; a server that exits before it answers names the -c and the log's allocation
+# failure (a -c the card's memory cannot hold fails there, by name).
+#
+# Per-arm flags. A server engine word takes flags of its own after its name, each once and in any order,
+# so no value with a space crosses tools/box.sh's BLOOMERY_BOX_ENV: `+t<N>` sets -t N, `+nopo<0|1>` -nopo,
+# `+k<K>` --n-cpu-moe K (a fit twin places by its own fit and refuses it), e.g.
+# `lcppsrvpp4096+nopo0+k34:prose:4096`. Each replaces the profile's value of that flag (lcpp_flag_set:
+# a doubled -nopo would translate to both --no-op-offload and --op-offload). The word is the row label, so
+# each flag set is its own engine in the means and the ratios.
+#
+# Cross-check (docs/fair-measure.md 6.1). A fast row of a different answer is not published: the runner
+# keeps the greedy continuation of every plain ours row (no NAME=VALUE list; the `tokens` record, token 0
+# first) and of every server row (the timed request's tokens) on the ids they were fed, with the ids'
+# name and length, and after the tables compares each server row with the ours row of the same ids,
+# length and round (else the first ours row of that ids and length): the first XC_N ids, fewer when one
+# side generated fewer (a prompt arm asks one), before the tables. `xcheck … same <k>` when they agree.
+# When the first id differs, or a side has no ids, it is `FAIL xcheck … differs at 0 of <k>` (or `no ids to
+# compare`) with both lists: the row joins the runner's failed arms (rc 1) and its label drops out of the
+# means and ratios at that length, as a failed arm's does (XC_DROP). When the first id agrees and a later one
+# of the XC_N differs, it is `xcheck … first id same, differs at <i> of <k> … [xcheck-tail]`: not a FAIL, the
+# row stays in the means, and the closing count names the tagged rows (a near tie of two logits can part
+# greedy decoding of the same file and ids after the first token). A server row with no ours row on its ids
+# prints `unchecked`. The rows print as they run, and an ours row can run after its server row, so the tag
+# is on the row's xcheck line, which names its round and label.
 #
 # The rates, against llama-bench's (tools/server/server-common.h server_slot_stats, the V4.1 branch 5210c7c
 # and mainline 53ed051ce alike):
@@ -91,10 +134,11 @@
 #                 whole state per request and memory the page cache loses
 #   -fit off      llama-server fits by default (`-fit on`, 1024 MiB), moving the arguments not given; the
 #                 hand-set arm keeps its placement as given, the fit twin passes -fit on explicitly
-#   -c C          the prompt ids + n_predict + 1, rounded up to 256: the bench's n_ctx is D + N (P for a pp
-#                 test) padded to 256 under flash attention, and the server stops a slot whose next token
-#                 would not fit, so a pp arm of P = 4096 has 4352 here against the bench's 4096 (256 more
-#                 positions of cache; V4.1: 40 KiB a position [derived, the profile's KV note])
+#   -c C          our arm's context (Context above); lcpp_srv_ctx's rule, the prompt ids + n_predict + 1
+#                 rounded up to 256, where a runner states none. The server stops a slot whose next token
+#                 would not fit, hence the + 1; the bench's n_ctx is D + N (P for a pp test) padded to 256
+#                 under flash attention, so a server's cache can be longer than the bench's (V4.1: 40 KiB a
+#                 position [derived, the profile's KV note])
 #   --host 127.0.0.1 --port 0   an ephemeral port the kernel picks at bind; the server logs it
 # The fit twin's column needs -v: common_fit_params demotes its measuring loads' log lines to debug
 # (common/fit.cpp:49), so lcpp_fit_col counts two loads only at the debug level. -v also prints the slot's
@@ -165,6 +209,65 @@ lcpp_srv_flags() {
 
 lcpp_srv_ctx() { echo $((($1 + $2 + 1 + 255) / 256 * 256)); }
 
+lcpp_flag_set() {
+  local -a words out=()
+  local flags=$1 flag=$2 value=$3 i=0 w s hit
+  shift 3
+  read -r -a words <<< "$flags"
+  while [ "$i" -lt ${#words[@]} ]; do
+    w=${words[$i]} hit=0
+    for s in "$@"; do [ "$w" != "$s" ] || hit=1; done
+    if [ "$hit" = 1 ]; then
+      i=$((i + 2))
+    else
+      out+=("$w")
+      i=$((i + 1))
+    fi
+  done
+  out+=("$flag" "$value")
+  echo "${out[*]}"
+}
+
+srv_mods_split() {
+  local m rest seen=' ' name
+  SRV_BASE=${1%%+*} SRV_MODS='' SRV_WHY=''
+  [ "$SRV_BASE" = "$1" ] && return 0
+  SRV_MODS=${1#"$SRV_BASE"}
+  rest=${SRV_MODS#+}
+  while :; do
+    m=${rest%%+*}
+    case $m in
+      t[1-9] | t[1-9][0-9] | t[1-9][0-9][0-9]) name=t ;;
+      nopo0 | nopo1) name=nopo ;;
+      k[0-9] | k[1-9][0-9] | k[1-9][0-9][0-9]) name=k ;;
+      *) SRV_WHY="'+$m' in '$1' is none of +t<N> (-t), +nopo<0|1> (-nopo), +k<K> (--n-cpu-moe)"; return 1 ;;
+    esac
+    case $seen in *" $name "*) SRV_WHY="'$1' sets +$name twice"; return 1 ;; esac
+    seen+="$name "
+    [ "$m" != "$rest" ] || break
+    rest=${rest#*+}
+  done
+  case $SRV_BASE:$seen in
+    *fit*:*" k "*) SRV_WHY="'$1': a fit twin places by the server's fit, and +k sets a hand placement"; return 1 ;;
+  esac
+}
+
+srv_mods_apply() {
+  local flags=$1 rest=${2#+} m
+  [ -n "$2" ] || { echo "$flags"; return 0; }
+  while :; do
+    m=${rest%%+*}
+    case $m in
+      t*) flags=$(lcpp_flag_set "$flags" -t "${m#t}" -t --threads) ;;
+      nopo*) flags=$(lcpp_flag_set "$flags" -nopo "${m#nopo}" -nopo --no-op-offload) ;;
+      k*) flags=$(lcpp_flag_set "$flags" --n-cpu-moe "${m#k}" --n-cpu-moe -ncmoe) ;;
+    esac
+    [ "$m" != "$rest" ] || break
+    rest=${rest#*+}
+  done
+  echo "$flags"
+}
+
 lcpp_srv_cmd() {
   local server=$1 model=$2 ctx=$3
   shift 3
@@ -195,13 +298,18 @@ lcpp_srv_probe() {
 lcpp_srv_majflt() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
 
 lcpp_srv_start() {
-  local bound=$1 log=$2 k
+  local bound=$1 log=$2 k a
   shift 2
   SRV_PID='' SRV_PORT='' SRV_WHY='' SRV_RC=0
   timeout --kill-after=10 "$bound" env "$@" "${SRV_CMD[@]}" > "$log" 2>&1 &
   SRV_PID=$!
   for ((k = 0; k < 2 * bound; k++)); do
     [ -n "$SRV_PORT" ] || SRV_PORT=$(sed -n 's|.*listening on http://127\.0\.0\.1:\([0-9][0-9]*\)$|\1|p' "$log" | head -n 1)
+    if [ "$SRV_PORT" = 0 ]; then
+      # A tree that logs the port it was given, not the one the kernel picked: nothing would answer.
+      SRV_RC=70 SRV_WHY="llama-server logged 'listening on http://127.0.0.1:0': this tree does not print the port --port 0 bound"
+      return 1
+    fi
     if [ -n "$SRV_PORT" ] && curl -sf -o /dev/null --max-time 10 "http://127.0.0.1:$SRV_PORT/health"; then
       return 0
     fi
@@ -210,6 +318,10 @@ lcpp_srv_start() {
       SRV_RC=$?
       [ "$SRV_RC" != 0 ] || SRV_RC=70
       SRV_WHY="llama-server exited $SRV_RC before it answered /health"
+      # The load's own reason, when the log names an allocation that failed (a -c or a ubatch the card
+      # cannot hold): the first such line.
+      a=$(grep -m 1 -iE 'failed to allocate|out of memory|cudaMalloc failed|unable to allocate|failed to create context' "$log")
+      [ -z "$a" ] || SRV_WHY+=": $a"
       return 1
     fi
     sleep 0.5
@@ -222,7 +334,7 @@ lcpp_srv_start() {
 lcpp_srv_request() {
   local ids=$1 np=$2 bound=$3 body resp code rc=0 t
   SRV_WHY='' SRV_PROMPT_N='' SRV_PROMPT_MS='' SRV_PROMPT_TPS='' SRV_PRED_N='' SRV_PRED_MS='' SRV_PRED_TPS=''
-  SRV_CACHE_N='' SRV_TOKENS=''
+  SRV_CACHE_N='' SRV_TOKENS='' SRV_DRAFT_N='' SRV_DRAFT_ACC=''
   body=$(mktemp "${TMPDIR:-/tmp}/lcpp-warm-body.XXXXXX") || return 2
   resp=$(mktemp "${TMPDIR:-/tmp}/lcpp-warm-resp.XXXXXX") || { rm -f "$body"; return 2; }
   python3 -c '
@@ -244,13 +356,14 @@ import json, sys
 r = json.load(open(sys.argv[1]))
 t = r["timings"]
 print(t["prompt_n"], t["prompt_ms"], t["prompt_per_second"], t["predicted_n"], t["predicted_ms"],
-      t["predicted_per_second"], t.get("cache_n", 0), ",".join(str(x) for x in r.get("tokens", [])) or "-")' "$resp" 2> /dev/null) || {
+      t["predicted_per_second"], t.get("cache_n", 0), t.get("draft_n", 0), t.get("draft_n_accepted", 0),
+      ",".join(str(x) for x in r.get("tokens", [])) or "-")' "$resp" 2> /dev/null) || {
     SRV_WHY="no timings in the /completion response: $(head -c 300 "$resp")"
     rm -f "$body" "$resp"
     return 1
   }
   rm -f "$body" "$resp"
-  read -r SRV_PROMPT_N SRV_PROMPT_MS SRV_PROMPT_TPS SRV_PRED_N SRV_PRED_MS SRV_PRED_TPS SRV_CACHE_N SRV_TOKENS <<< "$t"
+  read -r SRV_PROMPT_N SRV_PROMPT_MS SRV_PROMPT_TPS SRV_PRED_N SRV_PRED_MS SRV_PRED_TPS SRV_CACHE_N SRV_DRAFT_N SRV_DRAFT_ACC SRV_TOKENS <<< "$t"
   local n
   n=$(tr ',' '\n' <<< "$ids" | grep -c .)
   if [ "$SRV_PROMPT_N" != "$n" ]; then
@@ -274,11 +387,11 @@ lcpp_srv_arm() {
 
 lcpp_srv_same() {
   local k
-  local -a a b
+  local -a ta tb
   if [ "$1" = "$2" ]; then echo same; return; fi
-  IFS=, read -r -a a <<< "$1"
-  IFS=, read -r -a b <<< "$2"
-  for ((k = 0; k < ${#a[@]} || k < ${#b[@]}; k++)); do [ "${a[$k]:-}" = "${b[$k]:-}" ] || break; done
+  IFS=, read -r -a ta <<< "$1"
+  IFS=, read -r -a tb <<< "$2"
+  for ((k = 0; k < ${#ta[@]} || k < ${#tb[@]}; k++)); do [ "${ta[$k]:-}" = "${tb[$k]:-}" ] || break; done
   echo "differs at $k"
 }
 
@@ -299,6 +412,106 @@ lcpp_srv_stop() {
 
 lcpp_srv_build() { sed -n 's/^build: //p' "$1" | head -n 1; }
 lcpp_srv_device() { sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' "$1" | head -n 1; }
+lcpp_srv_nctx() { sed -n 's/.*llama_context: n_ctx *= *\([0-9][0-9]*\)$/\1/p' "$1" | head -n 1; }
+lcpp_srv_ctx_check() {
+  local n
+  n=$(lcpp_srv_nctx "$1")
+  SRV_WHY=''
+  if [ -z "$n" ]; then
+    SRV_WHY="the server's log has no 'llama_context: n_ctx =' line: its context against -c $2 cannot be read"
+  elif [ "$n" != "$2" ]; then
+    SRV_WHY="the server made its context at n_ctx $n, not the -c $2 ours runs at (docs/fair-measure.md 1.5)"
+  fi
+  [ -z "$SRV_WHY" ]
+}
+
+# The greedy cross-check (Cross-check above). XC_N: the ids compared, the few the contract asks for. The
+# records, one `<ids>|<P>|<round>|<label>|<tokens>` each: XC_OURS, XC_SRV; XC_FAILED the failures' names
+# for the runner's failed list.
+: "${XC_N:=4}"
+XC_OURS=() XC_SRV=() XC_FAILED=()
+# xc_norm <tokens>: `[a, b]` (a record's list) or `a,b` (the server's) as `a,b`; `-` or nothing as nothing.
+xc_norm() { local t; t=$(tr -d '[] ' <<< "$1"); [ "$t" != - ] || t=''; echo "$t"; }
+# xc_add ours|srv <ids> <P> <round> <label> <tokens>
+xc_add() {
+  local rec
+  rec="$2|$3|$4|$5|$(xc_norm "$6")"
+  if [ "$1" = ours ]; then XC_OURS+=("$rec"); else XC_SRV+=("$rec"); fi
+}
+# xc_cmp <a> <b> <n>: into XC_V `same <k>` when the first k = min(n, |a|, |b|) ids of the two comma lists
+# agree, else `differs at <i> of <k>`; `empty` when either list is empty. XC_A and XC_B: the compared ids.
+xc_cmp() {
+  local -a ta tb
+  local k i
+  IFS=, read -r -a ta <<< "$1"
+  IFS=, read -r -a tb <<< "$2"
+  XC_A='' XC_B=''
+  if [ ${#ta[@]} -eq 0 ] || [ ${#tb[@]} -eq 0 ]; then XC_V=empty; return; fi
+  k=$3
+  [ ${#ta[@]} -ge "$k" ] || k=${#ta[@]}
+  [ ${#tb[@]} -ge "$k" ] || k=${#tb[@]}
+  XC_A=$(echo "${ta[@]:0:$k}" | tr ' ' ,) XC_B=$(echo "${tb[@]:0:$k}" | tr ' ' ,)
+  for ((i = 0; i < k; i++)); do
+    [ "${ta[$i]}" = "${tb[$i]}" ] || { XC_V="differs at $i of $k"; return; }
+  done
+  XC_V="same $k"
+}
+# xc_table: one line per server record against the ours record of its ids, length and round (else the
+# first of its ids and length); a FAIL line, and a name in XC_FAILED, for each that differs or has no ids.
+xc_table() {
+  local s o ids p r lab tok oi op or ol ot pick n_same=0 n_tail=0 n_fail=0 n_un=0
+  XC_FAILED=() XC_DROP=()
+  [ ${#XC_SRV[@]} -gt 0 ] || return 0
+  echo
+  echo "=== greedy cross-check (docs/fair-measure.md 6.1): each server row's first $XC_N generated ids against ours on"
+  echo "    the same ids, length and round (a prompt row asks one id) ==="
+  for s in "${XC_SRV[@]}"; do
+    IFS='|' read -r ids p r lab tok <<< "$s"
+    pick=''
+    for o in ${XC_OURS[@]+"${XC_OURS[@]}"}; do
+      IFS='|' read -r oi op or ol ot <<< "$o"
+      [ "$oi|$op" = "$ids|$p" ] || continue
+      if [ "$or" = "$r" ]; then pick=$o; break; fi
+      [ -n "$pick" ] || pick=$o
+    done
+    if [ -z "$pick" ]; then
+      echo "xcheck $ids p=$p r$r $lab: unchecked (no plain ours row on these ids)"
+      n_un=$((n_un + 1))
+      continue
+    fi
+    IFS='|' read -r oi op or ol ot <<< "$pick"
+    xc_cmp "$ot" "$tok" "$XC_N"
+    case $XC_V in
+      same*)
+        echo "xcheck $ids p=$p r$r $ol(r$or)/$lab: $XC_V ($XC_A)"
+        n_same=$((n_same + 1))
+        ;;
+      'differs at 0 '* | empty)
+        if [ "$XC_V" = empty ]; then
+          echo "FAIL xcheck $ids p=$p r$r $ol(r$or)/$lab: no ids to compare | $ol ${ot:-none} | $lab ${tok:-none}"
+          XC_FAILED+=("r$r xcheck $lab p=$p (no ids)")
+        else
+          echo "FAIL xcheck $ids p=$p r$r $ol(r$or)/$lab: $XC_V | $ol $XC_A | $lab $XC_B"
+          XC_FAILED+=("r$r xcheck $lab p=$p ($XC_V)")
+        fi
+        XC_DROP+=("$lab|$p")
+        n_fail=$((n_fail + 1))
+        ;;
+      *)
+        echo "xcheck $ids p=$p r$r $ol(r$or)/$lab: first id same, $XC_V | $ol $XC_A | $lab $XC_B [xcheck-tail]"
+        n_tail=$((n_tail + 1))
+        ;;
+    esac
+  done
+  echo "xcheck: ${#XC_SRV[@]} server row(s): $n_same same, $n_tail [xcheck-tail] (first id same, a later one differs; in the means), $n_fail FAIL (the first id differs or no ids; dropped from the means and ratios), $n_un unchecked"
+}
+# xc_drop: the records `label|key|…` on stdin, less those whose `label|key` a FAIL xcheck names (XC_DROP).
+xc_drop() {
+  # One space between the names: a label holds no space, and an awk -v value may not hold a newline.
+  awk -F'|' -v ex="${XC_DROP[*]+${XC_DROP[*]}}" '
+    BEGIN { n = split(ex, e, " "); for (i = 1; i <= n; i++) if (e[i] != "") x[e[i]] = 1 }
+    !(($1 "|" $2) in x)'
+}
 
 # The runner side, shared by depth-ds41.sh and depth-qwen3moe.sh: their server arms' engines, command lines,
 # checks, dry line, run and row. The runner has, before calling them: its arm arrays A_ENG, A_DEP, A_LABEL,
@@ -309,18 +522,21 @@ lcpp_srv_device() { sed -n 's/^ *Device 0: \([^,]*\),.*/\1/p' "$1" | head -n 1; 
 # as its devices 0 and 1, or an Xid, a lost card or a 3090 off its cap since the last arm, fails the arm); and
 #   srv_tail <wall s>   the end of a server row after its device column, in that runner's field order
 #   srv_after <round> <label> <key>   (optional) a guard after the server stopped
-# A server arm's engine (lcppsrv, lcppsrvfit, lcppsrvpp[fit][<U>]): srv_pp says whether it times the prompt,
-# srv_ub its ubatch lever.
-srv_eng() { case $1 in lcppsrv | lcppsrvfit | lcppsrvpp | lcppsrvpp[1-9]* | lcppsrvppfit | lcppsrvppfit[1-9]*) return 0 ;; *) return 1 ;; esac; }
-srv_pp() { case $1 in lcppsrvpp*) return 0 ;; *) return 1 ;; esac; }
-srv_ub() { case $1 in lcppsrvpp*) local u=${1#lcppsrvpp}; echo "${u#fit}" ;; esac; }
-# srv_cmd_of <i>: server arm <i>'s command line into SRV_CMD, its n_predict into SRV_NP and
-# the batch sizes its prompt row names into SRV_BATCH: LCPP_GPU_FLAGS (with the ubatch lever) in the
-# server's spellings, at the fit for a fit twin.
+# A server arm's engine (lcppsrv, lcppsrvfit, lcppsrvpp[fit][<U>], each with its per-arm flags `+…`, the
+# header's Per-arm flags): srv_pp says whether it times the prompt, srv_ub its ubatch lever.
+srv_eng() { case ${1%%+*} in lcppsrv | lcppsrvfit | lcppsrvpp | lcppsrvpp[1-9]* | lcppsrvppfit | lcppsrvppfit[1-9]*) return 0 ;; *) return 1 ;; esac; }
+srv_pp() { case ${1%%+*} in lcppsrvpp*) return 0 ;; *) return 1 ;; esac; }
+srv_ub() { local e=${1%%+*}; case $e in lcppsrvpp*) local u=${e#lcppsrvpp}; echo "${u#fit}" ;; esac; }
+# srv_cmd_of <i>: server arm <i>'s command line into SRV_CMD, its n_predict into SRV_NP, its -c into
+# SRV_CTX and the batch sizes its prompt row names into SRV_BATCH: LCPP_GPU_FLAGS with the arm's own flags
+# (and the ubatch lever) in the server's spellings, at the fit for a fit twin, at the runner's context
+# (srv_ctx_of, the header's Context). 1 with SRV_WHY when the prompt ids and n_predict do not fit it.
 srv_cmd_of() {
-  local eng=${A_ENG[$1]} flags=$LCPP_GPU_FLAGS ub
+  local eng=${A_ENG[$1]} flags ub
   local -a words
   SRV_NP=$N SRV_BATCH="ub 512 b 2048 (llama-server defaults)"
+  srv_mods_split "$eng" || return 1
+  flags=$(srv_mods_apply "$LCPP_GPU_FLAGS" "$SRV_MODS")
   if srv_pp "$eng"; then
     SRV_NP=1 ub=$(srv_ub "$eng")
     if [ -n "$ub" ]; then
@@ -328,9 +544,21 @@ srv_cmd_of() {
       SRV_BATCH="ub $ub b $((ub > 2048 ? ub : 2048)) (the arm's lever)"
     fi
   fi
-  case $eng in *fit*) lcpp_srv_flags "$flags" fit ;; *) lcpp_srv_flags "$flags" ;; esac || return 1
+  case ${eng%%+*} in *fit*) lcpp_srv_flags "$flags" fit ;; *) lcpp_srv_flags "$flags" ;; esac || return 1
   read -r -a words <<< "$SRV_FLAGS"
-  lcpp_srv_cmd "$SRVBIN" "$MODEL" "$(lcpp_srv_ctx "${A_DEP[$1]}" "$SRV_NP")" "${words[@]}"
+  if declare -F srv_ctx_of > /dev/null; then
+    SRV_CTX=$(srv_ctx_of "$1" "$SRV_NP")
+  else
+    SRV_CTX=$(lcpp_srv_ctx "${A_DEP[$1]}" "$SRV_NP") SRV_CTX_SRC="lcpp-warm.sh's rule: the ids + n_predict + 1, rounded up to 256"
+  fi
+  case $SRV_CTX in
+    '' | *[!0-9]*) SRV_WHY="no -c for arm '${ARMS[$1]}' (${SRV_CTX_SRC:-no source}): got '$SRV_CTX'"; return 1 ;;
+  esac
+  if [ $((A_DEP[$1] + SRV_NP + 1)) -gt "$SRV_CTX" ]; then
+    SRV_WHY="its ${A_DEP[$1]} ids and n_predict $SRV_NP take $((A_DEP[$1] + SRV_NP + 1)) positions, past the server's -c $SRV_CTX ($SRV_CTX_SRC: docs/fair-measure.md 1.5)"
+    return 1
+  fi
+  lcpp_srv_cmd "$SRVBIN" "$MODEL" "$SRV_CTX" "${words[@]}"
 }
 # srv_ids <i>: the ids server arm <i> sends, comma-separated: lcg_prompt D, or its corpus's first P ids.
 srv_ids() { if [ "${A_IDS[$1]}" = lcg ]; then lcg_prompt "${A_DEP[$1]}"; else echo "${A_TOK[$1]}"; fi; }
@@ -338,9 +566,10 @@ srv_ids() { if [ "${A_IDS[$1]}" = lcg ]; then lcg_prompt "${A_DEP[$1]}"; else ec
 # flags that already set a batch size, and every word of LCPP_GPU_FLAGS in the translation table. 1 with
 # SRV_WHY.
 srv_check_arm() {
-  local eng=${1%%:*} ub
+  local eng=${1%%:*} ub flags
+  srv_mods_split "$eng" || return 1
   ub=$(srv_ub "$eng")
-  case $ub in *[!0-9]*) SRV_WHY="'$eng' is lcppsrv, lcppsrvfit, lcppsrvpp[fit][<U>]"; return 1 ;; esac
+  case $ub in *[!0-9]*) SRV_WHY="'$eng' is lcppsrv, lcppsrvfit, lcppsrvpp[fit][<U>], each with +t<N>, +nopo<0|1>, +k<K>"; return 1 ;; esac
   if [ -n "$ub" ]; then
     case " $LCPP_GPU_FLAGS " in
       *" -ub "* | *" --ubatch-size "* | *" -b "* | *" --batch-size "*)
@@ -349,7 +578,8 @@ srv_check_arm() {
         ;;
     esac
   fi
-  case $eng in *fit*) lcpp_srv_flags "$LCPP_GPU_FLAGS" fit ;; *) lcpp_srv_flags "$LCPP_GPU_FLAGS" ;; esac
+  flags=$(srv_mods_apply "$LCPP_GPU_FLAGS" "$SRV_MODS")
+  case ${eng%%+*} in *fit*) lcpp_srv_flags "$flags" fit ;; *) lcpp_srv_flags "$flags" ;; esac
 }
 # srv_preflight <runner>: before the lease, when a server arm is given: SRVBIN, which must exist, curl, and
 # every flag of every server arm's command line in the server's --help (run with no card); exits 2 or 64
@@ -361,7 +591,7 @@ srv_preflight() {
   command -v curl > /dev/null || { echo "$1: the lcppsrv arms need curl" >&2; exit 2; }
   for i in "${!ARMS[@]}"; do
     [ "${A_KIND[$i]}" = srv ] || continue
-    srv_cmd_of "$i"
+    srv_cmd_of "$i" || { echo "$1: arm '${ARMS[$i]}': $SRV_WHY" >&2; exit 64; }
     lcpp_srv_probe "$SRVBIN" || { echo "$1: arm '${ARMS[$i]}': $SRV_WHY" >&2; exit 64; }
   done
 }
@@ -372,13 +602,13 @@ srv_tree() {
 }
 # srv_dry_cmd <i>: server arm <i>'s command line as a dry run prints it.
 srv_dry_cmd() {
-  srv_cmd_of "$1"
-  echo "timeout --kill-after=10 $BOUND ${SRV_CMD[*]}   # row label '${A_LABEL[$1]}', ids=${A_IDS[$1]} (${A_DEP[$1]} ids): one POST /completion discarded, then the same timed, n_predict $SRV_NP, greedy, ignore_eos, cache_prompt off$(srv_pp "${A_ENG[$1]}" && echo ", $SRV_BATCH")"
+  srv_cmd_of "$1" || { echo "refused: $SRV_WHY"; return 0; }
+  echo "timeout --kill-after=10 $BOUND ${SRV_CMD[*]}   # row label '${A_LABEL[$1]}', ids=${A_IDS[$1]} (${A_DEP[$1]} ids): one POST /completion discarded, then the same timed, n_predict $SRV_NP, greedy, ignore_eos, cache_prompt off, -c $SRV_CTX ($SRV_CTX_SRC)$(srv_pp "${A_ENG[$1]}" && echo ", $SRV_BATCH")"
 }
 # srv_config: the [config] lines of the server arms.
 srv_config() {
   lcpp_srv_flags "$LCPP_GPU_FLAGS"
-  echo "[config] lcppsrv: $SRVBIN $SRV_FLAGS $LCPP_SRV_FIXED -c <ids + n_predict + 1, rounded up to 256> (lcpp-warm.sh): a discarded POST /completion of the arm's ids, then the same timed; decode rows predicted_per_second at n_predict $N, prompt rows prompt_per_second at n_predict 1 (lcppsrvpp<U>: -ub U -b max(U, 2048))"
+  echo "[config] lcppsrv: $SRVBIN $SRV_FLAGS $LCPP_SRV_FIXED -c <${SRV_CTX_SRC:-the ids + n_predict + 1, rounded up to 256}> (lcpp-warm.sh): a discarded POST /completion of the arm's ids, then the same timed; decode rows predicted_per_second at n_predict $N (their prompt_per_second also a prefill row), prompt rows prompt_per_second at n_predict 1 (lcppsrvpp<U>: -ub U -b max(U, 2048)); +t<N> +nopo<0|1> +k<K> on an engine set that arm's -t, -nopo, --n-cpu-moe; the first $XC_N generated ids against ours (the greedy cross-check)"
   if lcpp_srv_flags "$LCPP_GPU_FLAGS" fit 2> /dev/null; then echo "[config] lcppsrvfit: $SRVBIN $SRV_FLAGS $LCPP_SRV_FIXED (the server's fit places the model)"; fi
 }
 # One server arm: its llama-server, the warm-up request and the timed one between the
@@ -401,7 +631,9 @@ srv_arm() {
   t0=$(date +%s) f0=$(majflt_now)
   SRV_TRIES=0 SRV_RETRY_WHY=''
   if ! lcpp_srv_start "$BOUND" "$log"; then
-    rc=$SRV_RC why=$SRV_WHY
+    rc=$SRV_RC why="-c $SRV_CTX ($SRV_CTX_SRC): $SRV_WHY"
+  elif ! lcpp_srv_ctx_check "$log" "$SRV_CTX"; then
+    rc=0 why=$SRV_WHY
   elif ! lcpp_srv_arm "$ids" "$SRV_NP" "$BOUND"; then
     rc=0 why=$SRV_WHY
   else
@@ -450,12 +682,14 @@ srv_arm() {
 # (whole from <f0>, timed around it), the wall from <t0>, the continuation.
 srv_take() {
   SRV_T_PTPS[$1]=$SRV_PROMPT_TPS SRV_T_PN[$1]=$SRV_PROMPT_N SRV_T_PMS[$1]=$SRV_PROMPT_MS
-  SRV_T_GTPS[$1]=$SRV_PRED_TPS SRV_T_GMS[$1]=$SRV_PRED_MS SRV_T_SAME[$1]=$SRV_SAME
+  SRV_T_GTPS[$1]=$SRV_PRED_TPS SRV_T_GMS[$1]=$SRV_PRED_MS SRV_T_SAME[$1]=$SRV_SAME SRV_T_TOK[$1]=$SRV_TOKENS
   SRV_T_TIMED[$1]=$((SRV_F1 - SRV_F0)) SRV_T_WHOLE[$1]=$((SRV_F1 - $3)) SRV_T_WALL[$1]=$(($(date +%s) - $2))
   SRV_TRIES=$(($1 + 1))
 }
 # srv_row <index> <round> <try> <build> <device>: a server arm's row from try <try> (srv_take), and its
-# sums; under the warm rows cold_verdict makes it a COLD row or, on the retry, its FAIL row.
+# sums — a decode row's prompt_per_second also a prefill record under its label, the same P ids through
+# the same prompt path (cache_n 0) as a prompt arm's — and its tokens for the cross-check; under the warm
+# rows cold_verdict makes it a COLD row or, on the retry, its FAIL row.
 srv_row() {
   local i=$1 r=$2 k=$3 eng=${A_ENG[$1]} dep=${A_DEP[$1]} label=${A_LABEL[$1]} v win tags col unit=tok/s key
   if srv_pp "$eng"; then key=p=$dep unit='tok/s(pp)' v=${SRV_T_PTPS[$k]}; else key=d=$dep v=${SRV_T_GTPS[$k]}; fi
@@ -470,19 +704,23 @@ srv_row() {
     echo "$ROW_TAG r$r $label p=$dep n=0 | tok/s(pp) $v @ n=0, prompt $dep, $CARD_NAME$FIT_COL$col | $SRV_BATCH | build ${4:-?} | device ${5:-?}$(srv_tail "${SRV_T_WALL[$k]}")"
     counted || return 0
     pp_sums+=("$label|$dep|$r|$v|$tags")
+    xc_add srv "${A_IDS[$i]}" "$dep" "$r" "$label" "${SRV_T_TOK[$k]}"
   else
     echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s $v @ n=$N, depth $dep, $CARD_NAME$FIT_COL$col | prompt_n ${SRV_T_PN[$k]} prompt tok/s $(awk -v x="${SRV_T_PTPS[$k]}" 'BEGIN { printf "%.2f", x }') | build ${4:-?} | device ${5:-?}$(srv_tail "${SRV_T_WALL[$k]}")"
     counted || return 0
     sums+=("$label|$dep|$r|$v||$tags")
+    pp_sums+=("$label|$dep|$r|$(awk -v x="${SRV_T_PTPS[$k]}" 'BEGIN { printf "%.2f", x }')|$tags")
+    xc_add srv "${A_IDS[$i]}" "$dep" "$r" "$label" "${SRV_T_TOK[$k]}"
   fi
   count_row
 }
 
 
 # `bash tools/ref/lcpp-warm.sh --self-test`: the flag table against V4.1's LCPP_CLI_FLAGS, its refusals,
-# the fit twin's flags, the context, the probe against stub binaries, and a stub server's start, requests,
-# checks and stop (python3 and curl; just check-recipes runs it on the Mac, where a stub server binds a
-# port on 127.0.0.1). The runners' use of it is depth-ds41-stub.sh's and depth-qwen3moe-stub.sh's.
+# the fit twin's flags, the context and its rule's refusal, the per-arm flags, the probe against stub
+# binaries, a stub server's start, n_ctx, requests, checks and stop, a server row's sums and the greedy
+# cross-check (python3 and curl; just check-recipes runs it on the Mac, where a stub server binds a port
+# on 127.0.0.1). The runners' use of it is depth-ds41-stub.sh's and depth-qwen3moe-stub.sh's.
 if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   fails=0
   check() {
@@ -517,6 +755,46 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check ctx-pp "$(lcpp_srv_ctx 4096 1)" 4352
   check ctx-small "$(lcpp_srv_ctx 6 96)" 256
   check ctx-edge "$(lcpp_srv_ctx 160 96)" 512
+  # The per-arm flags (the header's Per-arm flags): each replaces the profile's value, never adds one.
+  check flag-set "$(lcpp_flag_set '-ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1' -t 16 -t --threads)" "-ngl 999 --n-cpu-moe 33 -fa on -nopo 1 -t 16"
+  check flag-set-long "$(lcpp_flag_set '-ngl 99 --threads 32' -t 16 -t --threads)" "-ngl 99 -t 16"
+  check flag-set-add "$(lcpp_flag_set '-ngl 99' -nopo 0 -nopo --no-op-offload)" "-ngl 99 -nopo 0"
+  srv_mods_split lcppsrvpp4096+nopo0+k34 && r=0 || r=1
+  check mods-split "$r|$SRV_BASE|$SRV_MODS" "0|lcppsrvpp4096|+nopo0+k34"
+  srv_mods_split lcppsrv && r=0 || r=1
+  check mods-none "$r|$SRV_BASE|$SRV_MODS" "0|lcppsrv|"
+  lcpp_srv_flags "$(srv_mods_apply '-ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1' +nopo0+k34+t16)"
+  check mods-apply "$SRV_FLAGS" "-ngl 999 -fa on --op-offload --n-cpu-moe 34 -t 16 -fit off"
+  check mods-apply-none "$(srv_mods_apply '-ngl 99 -t 32' '')" "-ngl 99 -t 32"
+  srv_mods_split lcppsrv+t16+t32 && r=0 || r=1
+  check mods-twice "$r|$SRV_WHY" "1|'lcppsrv+t16+t32' sets +t twice"
+  srv_mods_split lcppsrv+x1 && r=0 || r=1
+  check mods-unknown "$r|$SRV_WHY" "1|'+x1' in 'lcppsrv+x1' is none of +t<N> (-t), +nopo<0|1> (-nopo), +k<K> (--n-cpu-moe)"
+  srv_mods_split lcppsrv+t0 && r=0 || r=1
+  check mods-t0 "$r" 1
+  srv_mods_split lcppsrvfit+k34 && r=0 || r=1
+  check mods-fit-k "$r|$SRV_WHY" "1|'lcppsrvfit+k34': a fit twin places by the server's fit, and +k sets a hand placement"
+  check eng-mods "$(srv_eng lcppsrvpp4096+nopo0 && echo y)|$(srv_pp lcppsrvpp4096+nopo0 && echo y)|$(srv_ub lcppsrvpp4096+nopo0)|$(srv_eng lcppsrvx+t16 || echo n)" "y|y|4096|n"
+  # The context rule (the header's Context): the runner's -c, and a prompt that does not fit it refused.
+  A_ENG=(lcppsrv lcppsrvpp4096+k34) A_DEP=(4096 4096) ARMS=(lcppsrv:4096 lcppsrvpp4096+k34:4096) N=96 SRVBIN=/x/llama-server MODEL=/m.gguf
+  LCPP_GPU_FLAGS='-ngl 999 --n-cpu-moe 33 -fa on -t 32 -nopo 1'
+  srv_ctx_of() { echo 32768; }
+  SRV_CTX_SRC="the plan's ctx_max"
+  srv_cmd_of 0 && r=0 || r=1
+  check ctx-hook "$r|$SRV_CTX|${SRV_CMD[*]}" "0|32768|/x/llama-server -m /m.gguf -ngl 999 --n-cpu-moe 33 -fa on -t 32 --no-op-offload -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 32768 --host 127.0.0.1 --port 0"
+  srv_cmd_of 1 && r=0 || r=1
+  check ctx-hook-pp "$r|$SRV_NP|${SRV_CMD[*]}" "0|1|/x/llama-server -m /m.gguf -ngl 999 -fa on -t 32 --no-op-offload --n-cpu-moe 34 -ub 4096 -b 4096 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 32768 --host 127.0.0.1 --port 0"
+  # shellcheck disable=SC2329 # srv_cmd_of calls it
+  srv_ctx_of() { echo 4096; }
+  srv_cmd_of 0 && r=0 || r=1
+  check ctx-refuse "$r|$SRV_WHY" "1|its 4096 ids and n_predict 96 take 4193 positions, past the server's -c 4096 (the plan's ctx_max: docs/fair-measure.md 1.5)"
+  # shellcheck disable=SC2329 # srv_cmd_of calls it
+  srv_ctx_of() { echo ''; }
+  srv_cmd_of 0 && r=0 || r=1
+  check ctx-empty "$r|$SRV_WHY" "1|no -c for arm 'lcppsrv:4096' (the plan's ctx_max): got ''"
+  unset -f srv_ctx_of
+  srv_cmd_of 0 && r=0 || r=1
+  check ctx-default "$r|$SRV_CTX" "0|4352"
   lcpp_srv_cmd /x/llama-server /m.gguf 256 -ngl 99 -fit off
   check cmd "${SRV_CMD[*]}" "/x/llama-server -m /m.gguf -ngl 99 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 256 --host 127.0.0.1 --port 0"
   LCPPBIN=/t/build/bin/llama-bench
@@ -524,8 +802,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check bin-own "$(LCPPSRV=/s/llama-server lcpp_srv_bin)" /s/llama-server
   t=$(mktemp -d "${TMPDIR:-/tmp}/lcpp-warm-self-test.XXXXXX")
   # The stub server: --help lists the flags; otherwise it binds 127.0.0.1 at a kernel-picked port, prints
+  # llama_context's n_ctx line (the -c it was given, STUB_SRV_NCTX in its place, none under STUB_SRV_NOCTX),
   # the listening line and answers /health and /completion with timings. STUB_SRV_BADN answers with one
-  # predicted token too few, STUB_SRV_CACHED with cache_n 3, STUB_SRV_EXIT exits 5 before it listens.
+  # predicted token too few, STUB_SRV_CACHED with cache_n 3, STUB_SRV_DRAFT with draft_n 7 and 5 accepted,
+  # STUB_SRV_EXIT exits 5 before it listens after an allocation failure line, STUB_SRV_PORT0 logs port 0.
   cat > "$t/llama-server" << 'EOF'
 #!/usr/bin/env python3
 import http.server, json, os, signal, sys
@@ -535,7 +815,11 @@ if "--help" in sys.argv:
         print(f"{f}, --x   stub")
     sys.exit(0)
 if os.environ.get("STUB_SRV_EXIT"):
+    print("ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1280.00 MiB on device 0: cudaMalloc failed: out of memory", flush=True)
     sys.exit(5)
+ctx = sys.argv[sys.argv.index("-c") + 1] if "-c" in sys.argv else "0"
+if not os.environ.get("STUB_SRV_NOCTX"):
+    print(f"llama_context: n_ctx                 = {os.environ.get('STUB_SRV_NCTX', ctx)}", flush=True)
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def reply(self, code, obj):
@@ -548,12 +832,15 @@ class H(http.server.BaseHTTPRequestHandler):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         n, p = len(req["prompt"]), req["n_predict"]
         if os.environ.get("STUB_SRV_BADN"): p -= 1
-        self.reply(200, {"tokens": [1000 + i for i in range(p)], "timings": {
-            "cache_n": 3 if os.environ.get("STUB_SRV_CACHED") else 0, "prompt_n": n, "prompt_ms": 100.0,
-            "prompt_per_second": n * 10.0, "predicted_n": p, "predicted_ms": 50.0 * max(p - 1, 0),
-            "predicted_per_second": 20.0 if p > 1 else 0.0}})
+        t = {"cache_n": 3 if os.environ.get("STUB_SRV_CACHED") else 0, "prompt_n": n, "prompt_ms": 100.0,
+             "prompt_per_second": n * 10.0, "predicted_n": p, "predicted_ms": 50.0 * max(p - 1, 0),
+             "predicted_per_second": 20.0 if p > 1 else 0.0}
+        if os.environ.get("STUB_SRV_DRAFT"):
+            t.update(draft_n=7, draft_n_accepted=5)
+        self.reply(200, {"tokens": [1000 + i for i in range(p)], "timings": t})
 s = http.server.HTTPServer(("127.0.0.1", 0), H)
-print(f"main: listening on http://127.0.0.1:{s.server_address[1]}", flush=True)
+port = 0 if os.environ.get("STUB_SRV_PORT0") else s.server_address[1]
+print(f"main: listening on http://127.0.0.1:{port}", flush=True)
 s.serve_forever()
 EOF
   chmod +x "$t/llama-server"
@@ -566,9 +853,13 @@ EOF
   lcpp_srv_cmd "$t/llama-server" /m.gguf 256 -ngl 99 -fit off
   lcpp_srv_majflt() { echo 7; }
   if lcpp_srv_start 20 "$t/log"; then
+    lcpp_srv_ctx_check "$t/log" 256 && r=0 || r=1
+    check nctx "$r|$(lcpp_srv_nctx "$t/log")" "0|256"
+    lcpp_srv_ctx_check "$t/log" 4352 && r=0 || r=1
+    check nctx-other "$r|$SRV_WHY" "1|the server made its context at n_ctx 256, not the -c 4352 ours runs at (docs/fair-measure.md 1.5)"
     lcpp_srv_arm 1,2,3,4,5,6 4 20 && r=0 || r=1
-    check arm "$r|$WARM_TPS|$WARM_FAULTS|$SRV_SAME|$SRV_PROMPT_N|$SRV_PRED_N|$SRV_PRED_TPS|$SRV_CACHE_N|$SRV_TOKENS" \
-      "0|20.0|0|same|6|4|20.0|0|1000,1001,1002,1003"
+    check arm "$r|$WARM_TPS|$WARM_FAULTS|$SRV_SAME|$SRV_PROMPT_N|$SRV_PRED_N|$SRV_PRED_TPS|$SRV_CACHE_N|$SRV_DRAFT_N|$SRV_DRAFT_ACC|$SRV_TOKENS" \
+      "0|20.0|0|same|6|4|20.0|0|0|0|1000,1001,1002,1003"
     lcpp_srv_request 1,2,3 1 20 && r=0 || r=1
     check pp "$r|$SRV_PROMPT_TPS|$SRV_PRED_N" "0|30.0|1"
     check same "$(lcpp_srv_same 1,2,3 1,2,3)|$(lcpp_srv_same 1,2,3 1,5,3)|$(lcpp_srv_same 1,2 1,2,3)" "same|differs at 1|differs at 2"
@@ -587,8 +878,62 @@ EOF
     check cached "$r|$SRV_WHY" "1|cache_n 3: the prompt was not processed whole"
     lcpp_srv_stop
   }
+  lcpp_srv_start 20 "$t/log" STUB_SRV_DRAFT=1 && {
+    lcpp_srv_request 1,2,3 4 20 && r=0 || r=1
+    check draft "$r|$SRV_DRAFT_N|$SRV_DRAFT_ACC" "0|7|5"
+    lcpp_srv_stop
+  }
+  lcpp_srv_start 20 "$t/log" STUB_SRV_NOCTX=1 && {
+    lcpp_srv_ctx_check "$t/log" 256 && r=0 || r=1
+    check nctx-none "$r|$SRV_WHY" "1|the server's log has no 'llama_context: n_ctx =' line: its context against -c 256 cannot be read"
+    lcpp_srv_stop
+  }
+  lcpp_srv_start 20 "$t/log" STUB_SRV_PORT0=1 && r=0 || r=1
+  check port0 "$r|$SRV_RC|$SRV_WHY" "1|70|llama-server logged 'listening on http://127.0.0.1:0': this tree does not print the port --port 0 bound"
+  lcpp_srv_stop
   lcpp_srv_start 20 "$t/log" STUB_SRV_EXIT=1 && r=0 || r=1
-  check exits "$r|$SRV_RC|$SRV_WHY" "1|5|llama-server exited 5 before it answered /health"
+  check exits "$r|$SRV_RC|$SRV_WHY" "1|5|llama-server exited 5 before it answered /health: ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1280.00 MiB on device 0: cudaMalloc failed: out of memory"
+  # A server row (srv_row, the runner's hooks stubbed): its decode value, its prompt rate as a prefill
+  # record under its own label, and its tokens for the cross-check; a prompt row's one id.
+  cold_check() { COLD_TAG='' MAJ_BOUND=0.0; }
+  cold_verdict() { return 0; }
+  counted() { return 0; }
+  count_row() { :; }
+  srv_tail() { echo " | wall ${1}s"; }
+  ROW_TAG=ROW CPU_BUSY_TAG='' OTHER_BUSY_TAG='' COLD_TAG='' FIT_COL='' CARD_NAME=A6000 WARM_TPS=20 WARM_FAULTS=0
+  A_ENG=(lcppsrv+t16 lcppsrvpp) A_DEP=(512 512) A_LABEL=(lcppsrv+t16@prose lcppsrvpp@prose) A_IDS=(prose prose) N=4
+  sums=() pp_sums=() XC_SRV=() XC_OURS=()
+  SRV_T_PTPS[0]=5120.004 SRV_T_PN[0]=512 SRV_T_PMS[0]=100 SRV_T_GTPS[0]=20 SRV_T_GMS[0]=150 SRV_T_SAME[0]=same
+  SRV_T_TOK[0]=11,12,13,14 SRV_T_TIMED[0]=0 SRV_T_WHOLE[0]=0 SRV_T_WALL[0]=3
+  srv_row 0 1 0 b A6000 > /dev/null
+  SRV_T_PTPS[0]=6000 SRV_T_TOK[0]=11
+  srv_row 1 1 0 b A6000 > /dev/null
+  check row-sums "${sums[*]}|${pp_sums[*]}" "lcppsrv+t16@prose|512|1|20.00|||lcppsrv+t16@prose|512|1|5120.00| lcppsrvpp@prose|512|1|6000.00|"
+  check row-xc "${XC_SRV[*]}" "prose|512|1|lcppsrv+t16@prose|11,12,13,14 prose|512|1|lcppsrvpp@prose|11"
+  # The greedy cross-check (the header's Cross-check).
+  XC_OURS=() XC_SRV=()
+  xc_add ours prose 512 1 prose '[11, 12, 13, 14, 15]'
+  xc_add ours prose 512 2 prose '[11, 12, 13, 14, 15]'
+  xc_add ours lcg 512 1 ours '[7, 8]'
+  xc_add srv prose 512 1 lcppsrv@prose 11,12,13,14,99
+  xc_add srv prose 512 2 lcppsrvpp@prose 11
+  xc_add srv prose 512 3 lcppsrv+t16@prose 11,12,99,14
+  xc_add srv prose 512 1 lcppsrv+k34@prose 99,12,13,14
+  xc_add srv prose 4096 1 lcppsrv@prose 1,2
+  xc_add srv lcg 512 1 lcppsrv -
+  out=$(xc_table)
+  xc_table > /dev/null
+  check xc-same "$(grep -cxF 'xcheck prose p=512 r1 prose(r1)/lcppsrv@prose: same 4 (11,12,13,14)' <<< "$out")" 1
+  check xc-pp "$(grep -cxF 'xcheck prose p=512 r2 prose(r2)/lcppsrvpp@prose: same 1 (11)' <<< "$out")" 1
+  check xc-tail "$(grep -cxF 'xcheck prose p=512 r3 prose(r1)/lcppsrv+t16@prose: first id same, differs at 2 of 4 | prose 11,12,13,14 | lcppsrv+t16@prose 11,12,99,14 [xcheck-tail]' <<< "$out")" 1
+  check xc-differs "$(grep -cxF 'FAIL xcheck prose p=512 r1 prose(r1)/lcppsrv+k34@prose: differs at 0 of 4 | prose 11,12,13,14 | lcppsrv+k34@prose 99,12,13,14' <<< "$out")" 1
+  check xc-count "$(grep -c '^xcheck: 6 server row(s): 2 same, 1 \[xcheck-tail\] .*, 2 FAIL .*, 1 unchecked$' <<< "$out")" 1
+  check xc-unchecked "$(grep -cxF 'xcheck prose p=4096 r1 lcppsrv@prose: unchecked (no plain ours row on these ids)' <<< "$out")" 1
+  check xc-empty "$(grep -cxF 'FAIL xcheck lcg p=512 r1 ours(r1)/lcppsrv: no ids to compare | ours 7,8 | lcppsrv none' <<< "$out")" 1
+  check xc-failed "${XC_FAILED[*]}" "r1 xcheck lcppsrv+k34@prose p=512 (differs at 0 of 4) r1 xcheck lcppsrv p=512 (no ids)"
+  check xc-drop "$(printf 'lcppsrv+k34@prose|512|1|9\nlcppsrv+k34@prose|4096|1|9\nlcppsrv+t16@prose|512|3|9\nlcppsrv|512|1|9\n' | xc_drop | paste -sd';' -)" "lcppsrv+k34@prose|4096|1|9;lcppsrv+t16@prose|512|3|9"
+  XC_SRV=()
+  check xc-none "$(xc_table)" ""
   rm -rf "$t"
   echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($fails failures)"
   [ "$fails" = 0 ]

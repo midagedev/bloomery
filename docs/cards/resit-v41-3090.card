@@ -1,0 +1,29 @@
+# The resit's V4.1 public window on the RTX 3090 (W4): our arms at --place gate, the reference at the
+# profile's 3090 line (--n-cpu-moe 37), on the same prose ids; no residency twin (gate runs residency off by
+# the registry's rule, captioned). ub 4096 is out: 2,319 MiB usable left at K 37 [derived,
+# models/deepseek41.sh] cannot hold its buffers.
+#
+# Band: e21-warm.card's, 20.3..21.4 (the warm bench rows 20.83..20.88 at depth 4096 +-2.5 % [derived]).
+# At -c 32768 the KV is 1,280 MiB of those 2,319 [derived]: a load that cannot hold it is a FAIL row that
+# names the allocation, and the window then answers that the 3090 cannot run llama.cpp at our context.
+kind: baseline
+question: on the RTX 3090 at our context, what is llama.cpp's V4.1 decode after a prose prompt of 4096?
+term: tok/s @ n=96, depth 4096, llama.cpp PR #28696 llama-server /completion predicted_per_second on the
+  first 4096 ids of corpus-prose.ids after a same-id warm-up (-ngl 999 --n-cpu-moe 37 -fa on -t 32
+  --no-op-offload -fit off -np 1 -ctxcp 0 --cache-ram 0 -c <plan ctx_max at gate>), RTX 3090 at 250 W
+unit: tok/s
+predict: 20.3..21.4
+condition: one lease, two rounds, BLOOMERY_AB_ORDER=blocks, BLOOMERY_WARM_ROWS=1, BLOOMERY_GEN_PLACE=gate,
+  the 3090 as BLOOMERY_TIMING_GPU, the arms prose:512 prose:4096 lcppsrv:prose:512 lcppsrv:prose:4096;
+  each block's DISCARD r0 row present; our load records and the server n_ctx lines at the gate plan's
+  ctx_max; every xcheck line `same`; no counted row [cold], [cpu-busy] or [other-busy]; the full output
+  to a file first. Command: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-v41-3090.card
+  BLOOMERY_AB_ORDER=blocks BLOOMERY_WARM_ROWS=1 BLOOMERY_GEN_PLACE=gate BLOOMERY_TIMING_GPU=<the 3090's
+  UUID>' just depth-gpu-ds41 <the arms above> > <log> 2>&1
+reason: sets the public V4.1 3090 rows; why now: the 09-28 3090 rows placed card experts by a corpus-trained list the chat
+  replies do not route by, and at another context than the reference's
+decide-in: write the 3090 rows (rig-log first) in the 3090's own table
+decide-below: the server at -c 32768 pays a term the bench did not: compare its n_ctx line and compute
+  buffer with e21ref's, and re-sit one arm at the bench's context before any row goes out
+decide-above: the warm rows beat the bench's warm ones: read both logs' n_cpu_moe and buffer lines
+  for a placement that moved, and correct the profile's 3090 line first

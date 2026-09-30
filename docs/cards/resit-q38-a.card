@@ -1,0 +1,32 @@
+# The resit's Qwen3.8 public window on the A6000 (W9): our arms on prose (card experts, --prefill auto; unset
+# levers are --place a's defaults, adaptive residency and the MTP draft, beside a plain twin with both off) after
+# a same-id PRIME, the mainline server arms on the same ids after a same-id warm-up, at -c ours' --ctx at
+# that P, each server row's first ids held to ours'. A decode row's prompt rate is its pp row; the ub
+# 4096 line runs as its own arm.
+#
+# Band [derived]: the 09-28 bench decode rows, 44.68 (depth 6) and 44.03 (1024), +-5 %: 42.3..46.9. llama.cpp
+# keeps whole layers' experts on the host, so the bytes a decode step reads do not depend on the ids (prose
+# in place of lcg moves nothing); the server's step is the bench's plus a top_k 1 sample.
+kind: baseline
+question: warm and on our prose ids, what is llama.cpp's Qwen3.8 server decode after a prompt of 512 on
+  the A6000, beside ours?
+term: tok/s @ n=96, depth 512, llama.cpp mainline llama-server /completion predicted_per_second on the
+  first 512 ids of the qwen4exp corpus-prose.ids after a same-id warm-up (-ngl 99 -fa on -lzm off -ncmoe 26
+  -t 32 -fit off -np 1 -ctxcp 0 --cache-ram 0, SQ8's flags in their place), A6000
+unit: tok/s
+predict: 42.3..46.9
+condition: one lease, two rounds, BLOOMERY_WARM_ROWS=1, the arms prose:512 prose:4096
+  prose:512@BLOOMERY_DRAFT=off,BLOOMERY_RESIDENCY=off prose:4096@BLOOMERY_DRAFT=off,BLOOMERY_RESIDENCY=off
+  lcppsrv:prose:512 lcppsrv:prose:4096 lcppsrvpp4096:prose:4096; every server n_ctx line equal to ours'
+  --ctx at that P; every xcheck line `same` or `[xcheck-tail]`; the default arms' rows carry the mtp column
+  and their residency word, the plain twins' rows no mtp column and a residency lever record naming off;
+  no counted row [cold], [cpu-busy] or [other-busy]; the full output to a file first. Command:
+  BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-q38-a.card BLOOMERY_WARM_ROWS=1'
+  just depth-gpu-qwen4exp <the arms above> > <log> 2>&1
+reason: sets the public Qwen3.8 A6000 rows, ours and llama.cpp's; why now: the README's Qwen3.8 row is
+  ours alone on prose, and its reference rows ran on lcg ids
+decide-in: write the Qwen3.8 A6000 rows (rig-log first), llama.cpp from the server arms
+decide-below: the server step costs a term the bench does not: read its log's n_ubatch and slot lines,
+  and compare one bench row in the next screen before the row goes out
+decide-above: the bench rows were colder than their tags said: re-price the PLE fault in COLD_US from
+  this row before any Qwen3.8 [cold] tag is trusted

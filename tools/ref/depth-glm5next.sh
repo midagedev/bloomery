@@ -13,24 +13,41 @@
 #
 # Arms:
 #   <D>       ours: generate_glm5next --tokens <D ids of GLM_PROSE from GLM_PROSE_FROM> -n N --ctx C --place
-#             PLACE --time. The prompt is fed one decode step a position (the program has no batched
-#             prefill), so the row's pp_tok/s is the step feed's rate, `kind=steps`: D over the wall
-#             from the first fed step to the readback of generated token 0. The N - 1 steps after
-#             token 0 are timed. C is one context for every ours arm (BLOOMERY_GEN_CTX, default
-#             2048): the plan refuses more positions than the latent layers attend whole (2,051), so
-#             D + N <= C is checked before the lease. The prompt is prose under this model's own
+#             PLACE --time. The prompt runs as the binary's --prefill default, its batches (the row's
+#             pp_tok/s `kind=` names the feed): D over the wall from the first fed position to the
+#             readback of generated token 0. The N - 1 steps after token 0 are timed. C is one context
+#             for every ours arm and every server arm (BLOOMERY_GEN_CTX, default 2048; docs/fair-measure.md
+#             1.5): the plan refuses more than the deepest context a reference set checks
+#             (place::ORACLE_POSITIONS, 16,384), and D + N <= C is checked before the lease. The binary
+#             takes no --arm list, so an ours arm's warm-up is a process of its own (WARMUP r0, below),
+#             not a same-id PRIME in its load. The prompt is prose under this model's own
 #             vocabulary (models/glm5next.sh GLM_PROSE, its sha256 checked before the lease): the D
 #             ids from 0-based index GLM_PROSE_FROM (models/glm5next.sh: past the ids the router set
 #             was traced from, docs/fair-measure.md 4.2). Each ours and server row prints
 #             `prompt ids <a>..<b>`.
+#   oursmtp:<D>  ours with the MTP draft: the same command under `env BLOOMERY_DRAFT=mtp`, its rows
+#             labelled `oursmtp`, its prompt row a prefill record under that label. A drafted arm takes
+#             one position more than ours, for the verify's last window: D + N + 1 <= C, checked before
+#             the lease. Before the lease the binary's `--levers` under BLOOMERY_DRAFT=mtp must pass (a
+#             binary that does not act on the lever refuses it by name), and a BLOOMERY_DRAFT already set
+#             in the runner's environment is refused: the plain ours arms would draft too. Its greedy ids
+#             are the plain run's, so each row is held to ours' on the same ids and length as a server row
+#             is (the xcheck below; oursmtp is never the ours side of it). When generate_glm5next's
+#             checked-in schema declares the `mtp summary` record, the row carries its fields through
+#             tools/bloomery/records.py (` | mtp positions/pass <positions / passes> = positions P / passes
+#             Q, kept [..]`), and an oursmtp row that prints none is a FAIL row; a schema that declares
+#             none reads none, the row carries nothing for it, and the [config] (or [dry]) `oursmtp:` line
+#             says which. Its row's tok/s is the SMOKE mean's, as ours'. After the tables, `ratio mtp d=`:
+#             ours / oursmtp per depth, paired by round (below 1: the draft is faster); oursmtp is in no
+#             other ratio table.
 #   lcpp27752:<D>, lcpp27754:<D>   the PR branch's llama-bench -p 0 -n N -d D -r 1 at the profile's
 #             LCPP27752_GPU_FLAGS / LCPP27754_GPU_FLAGS (the second under LCPP27754_ENV). -d prefills
 #             D of llama-bench's own std::rand() ids before its clock starts; its row label is `tgN @
 #             dD`.
 #   lcpp27752pp:<P>, lcpp27754pp:<P>   the branch's prefill: llama-bench -p P -n 0 -r 1 at the same
 #             flags, `ppP`. lcpp27752pp<U>:<P> (and 27754's) adds -ub U -b max(U, 2048): the ubatch
-#             lever, not a default. P is not bounded by our context: the branches run the indexer
-#             past 2,051 positions, ours does not, so a P above C has no ours row beside it.
+#             lever, not a default. P is not bounded by our context C, so a P above C has no ours row
+#             beside it.
 #   lcpp27752fit:<D>, lcpp27754fit:<D>, lcpp27752ppfit[<U>]:<P>, lcpp27754ppfit[<U>]:<P>   the
 #             branch at llama.cpp's own placement: the lcpp2775x:<D> and lcpp2775xpp[<U>]:<P> command
 #             lines with the profile's placement options (-ngl, --n-cpu-moe, -ts, -ot) removed and
@@ -48,19 +65,32 @@
 #             (common/fit.cpp:141 in #27754, 140 in #27752, under load_mtp) and a server without the
 #             draft's does not, so a fitted srv/mtp pair would sit at two placements and their ratio
 #             would no longer be the draft's alone; the placement question is the llama-bench twins'.
-#   lcpp27754mtp:<D>, lcpp27754srv:<D> (and lcpp27752's)   the branch's llama-server, because
-#             llama-bench drives no speculation: one server process a row (LCPP2775x_SRV_FLAGS, or
-#             LCPP2775x_MTP_FLAGS with the MTP draft, --spec-type draft-mtp --spec-draft-n-max 2, at
-#             GLM_NCMOE_MTP), -c D + N + 256 rounded up to 256, on 127.0.0.1 at a free port; after
-#             its /health answers (its own warm-up runs before that), one POST /completion of
-#             ours' D prompt ids (from GLM_PROSE_FROM), so the draft sees prose — with n_predict N,
-#             temperature 0, ignore_eos and cache_prompt off. The row is the response's `timings`:
-#             predicted_per_second over predicted_n (the decode, drafts included), prompt_n and
-#             prompt_per_second, and for the MTP arm draft_n / draft_n_accepted beside the server's
-#             own `draft acceptance = … (A accepted / G generated), mean len = …` log line, which the
-#             row carries verbatim. predicted_n other than N, or an MTP arm that drafted nothing, is a
-#             FAIL row. The srv arm is the MTP arm's twin without the draft: the same binary, request
-#             and path, so their ratio is the draft's alone.
+#   lcpp27754srv:<D>, lcpp27754srvpp[<U>]:<P>, lcpp27754mtp:<D> (and lcpp27752's)   the branch's
+#             llama-server, because llama-bench feeds its own ids and drives no speculation: one server
+#             process a row, built on tools/ref/lcpp-warm.sh's functions — the branch's
+#             LCPP2775x_GPU_FLAGS in the server's spellings (that file's table, -fit off), its
+#             LCPP_SRV_FIXED (-np 1 -ctxcp 0 --cache-ram 0: without -ctxcp 0 this model's recurrent
+#             layers have the server copy their state to the host inside the prompt clock) and -c C,
+#             ours' --ctx; #27754's under LCPP27754_ENV; the MTP arm at GLM_NCMOE_MTP with GLM_MTP_FLAGS
+#             (--spec-type draft-mtp --spec-draft-n-max 2) after them. A server arm whose ids + n_predict +
+#             1 pass C is refused before the lease, and a server whose log names another n_ctx is a FAIL
+#             row. After /health answers, one POST /completion of ours' D prompt ids (from
+#             GLM_PROSE_FROM), so the draft sees prose, is sent and discarded (the warm-up,
+#             docs/fair-measure.md 2.1), then the same request is timed: greedy, ignore_eos, cache_prompt
+#             off. A decode row (srv, mtp) is predicted_per_second at n_predict N (the decode, drafts
+#             included) and carries prompt_n and prompt_per_second, which is also a prefill record under
+#             its label; a srvpp row is prompt_per_second at n_predict 1, <U> the ubatch lever (-ub U -b
+#             max(U, 2048)). The MTP row carries draft_n / draft_n_accepted beside the server's own
+#             `draft acceptance = … (A accepted / G generated), mean len = …` log line, verbatim.
+#             predicted_n other than asked, prompt_n other than the ids, cache_n other than 0, or an MTP
+#             arm that drafted nothing, is a FAIL row. The srv arm is the MTP arm's twin without the
+#             draft: the same binary, request and path, so their ratio is the draft's alone. An engine
+#             word takes its own flags, `+t<N>`, `+nopo<0|1>`, `+k<K>` (-t, -nopo, --n-cpu-moe in place
+#             of the profile's; lcpp-warm.sh's Per-arm flags), its label with them. Each server row's
+#             first ids are held to ours' on the same ids and length (lcpp-warm.sh's Cross-check): one
+#             whose first id parts from ours is a FAIL xcheck line in the failed arms and drops out of
+#             the means and ratios; one that parts later is a [xcheck-tail] line and stays. A server arm runs no WARMUP
+#             r0 process: its warm-up is its own discarded request.
 #   exl3:<D>  exllamav3's eval/perf.py -spf --max_length D + 256 at EXL3_FLAGS on EXL3_MODEL, the
 #             `Context D` row of its Generation table: 100 steps at depth D (its fixed count, the
 #             row says n=100) over wikitext-2 ids, the recurrent state a test state of that depth.
@@ -75,9 +105,10 @@
 # the branches read the same file pages, so their arms rotate freely. The EXL3 directory (154 GB) and
 # its CPU-tier copies do not fit beside it: the exllamav3 arms run as a block after every GGUF round,
 # opened by a discarded process (`DISCARD r0`), so no GGUF row is timed after the EXL3 set evicted the
-# file. Every GGUF arm runs once, discarded, right before its round-1 row, on the same ids (`WARMUP
-# r0`, docs/fair-measure.md 2.1; the exllamav3 block keeps its one discard; BLOOMERY_AB_WARMUP=0 skips
-# both): the sitting's earlier segments leave another model's pages cached.
+# file. Every ours and llama-bench arm runs once, discarded, right before its round-1 row, on the same
+# ids (`WARMUP r0`, docs/fair-measure.md 2.1; a server arm's warm-up is its own discarded request, the
+# exllamav3 block keeps its one discard; BLOOMERY_AB_WARMUP=0 skips them): the sitting's earlier
+# segments leave another model's pages cached.
 # The file does not stay whole in the cache on its own: our load drops the file pages of what it
 # uploads (BLOOMERY_CARD_DONTNEED, 1 by default: the card trunk, 8.97 GB, and the card experts,
 # 39.94 GB), so the next arm whose host set holds those pages reads them from the drive — ours in its
@@ -122,6 +153,7 @@
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (default 2), BLOOMERY_GEN_WARM
 # (--warm), BLOOMERY_GEN_CTX (C), BLOOMERY_GEN_BIN (default target/release/generate_glm5next),
 # BLOOMERY_GEN_PLACE (a, the default, needs the A6000 as the timing card; gate the 3090),
+# BLOOMERY_GEN_PAIR (1 passes --pair to our arms; unset or empty passes nothing),
 # BLOOMERY_AB_WARMUP (1 or 0), BLOOMERY_PREHEAT (1 or 0, above), BLOOMERY_ARM_BOUND (seconds one
 # arm, or one preheat, may run, default 900), BLOOMERY_DRY=1 (every arm's command line and preheat,
 # the trees, the checks and each round's order, then exit 0 before the lease: nothing is loaded and
@@ -140,6 +172,7 @@ WARM=${BLOOMERY_GEN_WARM:-}
 CTX=${BLOOMERY_GEN_CTX:-2048}
 BIN=${BLOOMERY_GEN_BIN:-target/release/generate_glm5next}
 PLACE=${BLOOMERY_GEN_PLACE:-a}
+PAIR=${BLOOMERY_GEN_PAIR:-}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 WARMUP=${BLOOMERY_AB_WARMUP:-1}
 PREHEAT=${BLOOMERY_PREHEAT:-1}
@@ -156,23 +189,29 @@ for v in N:$N ROUNDS:$ROUNDS CTX:$CTX BOUND:$BOUND; do
   case ${v#*:} in '' | *[!0-9]* | 0*) echo "depth-glm5next.sh: ${v%%:*} is a positive integer, got '${v#*:}'" >&2; exit 64 ;; esac
 done
 case $PLACE in a | gate) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_PLACE is a or gate, got '$PLACE'" >&2; exit 64 ;; esac
+case $PAIR in '' | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_PAIR is 1 or unset, got '$PAIR'" >&2; exit 64 ;; esac
 case $WARMUP in 0 | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_AB_WARMUP is 0 or 1, got '$WARMUP'" >&2; exit 64 ;; esac
 case $PREHEAT in 0 | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_PREHEAT is 1 (read each GGUF arm's host set before it, the default) or 0, got '$PREHEAT'" >&2; exit 64 ;; esac
 case $WARM in '' | [0-9] | [1-9][0-9]*) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_WARM is a count, got '$WARM'" >&2; exit 64 ;; esac
 
 ARMS=("$@")
 [ ${#ARMS[@]} -gt 0 ] || ARMS=(512 lcpp27754:512)
-# Per arm: the engine (ours, lcpp27752, lcpp27754, exl3), whether it is a prefill arm, its
+# Per arm: the engine (ours, oursmtp, lcpp27752, lcpp27754, exl3), whether it is a prefill arm, its
 # ubatch lever, its depth or prompt length, and its row label (a prefill arm's names its ubatch).
 A_ENG=() A_PP=() A_UB=() A_DEP=() A_LABEL=()
-ours=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0
+ours=0 ours_mtp=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0
 usage() {
-  echo "depth-glm5next.sh: arm '$1' is <D>, lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}:<D>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
+  echo "depth-glm5next.sh: arm '$1' is <D>, oursmtp:<D>, lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}[+t<N>][+nopo<0|1>][+k<K>]:<D>, lcpp2775{2,4}srvpp[<U>][+…]:<P>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
   exit 64
 }
 # The fit arms' flags, probe and column (lcpp-fit.sh); fit_eng names this runner's fit engines.
 # shellcheck source=tools/ref/lcpp-fit.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
+# The server arms' flags, start, requests, context check and stop, and the greedy cross-check.
+# shellcheck source=tools/ref/lcpp-warm.sh
+source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
+# srv_glm <engine>: true for a server engine (srv, srvpp[<U>], mtp, each with its per-arm flags).
+srv_glm() { case ${1%%+*} in lcpp2775[24]srv | lcpp2775[24]srvpp | lcpp2775[24]srvpp[1-9]* | lcpp2775[24]mtp) return 0 ;; *) return 1 ;; esac; }
 fit_eng() { case $1 in lcpp2775[24]fit | lcpp2775[24]ppfit | lcpp2775[24]ppfit[1-9]*) return 0 ;; *) return 1 ;; esac; }
 # gpu_flags <engine>: the profile's llama-bench flags of that engine's branch.
 gpu_flags() { case $1 in lcpp27752*) echo "$LCPP27752_GPU_FLAGS" ;; *) echo "$LCPP27754_GPU_FLAGS" ;; esac; }
@@ -180,16 +219,33 @@ for a in "${ARMS[@]}"; do
   eng=${a%%:*} dep=${a#*:} pp=0 ub=''
   [ "$a" != "$eng" ] || { eng=ours dep=$a; }
   case $dep in '' | *[!0-9]*) usage "$a" ;; esac
-  case $eng in
+  if [ "${eng%%+*}" != "$eng" ]; then
+    srv_glm "$eng" || usage "$a" "+t<N>, +nopo<0|1> and +k<K> are a server arm's flags"
+    srv_mods_split "$eng" || usage "$a" "$SRV_WHY"
+  fi
+  case ${eng%%+*} in
     ours)
       ours=1
       [ "$dep" -ge 1 ] && [ $((dep + N)) -le "$CTX" ] || usage "$a" "ours needs 1 <= D and D + N <= C ($N + D against --ctx $CTX)"
       ;;
+    oursmtp)
+      ours=1 ours_mtp=1
+      [ "$dep" -ge 1 ] && [ $((dep + N + 1)) -le "$CTX" ] || usage "$a" "oursmtp needs 1 <= D and D + N + 1 <= C ($dep + $N + 1 = $((dep + N + 1)) against --ctx $CTX): the verify's last window takes one position past the N-th token"
+      ;;
     lcpp27752 | lcpp27754) lcpp=1 ;;
     lcpp27752fit | lcpp27754fit) lcpp=1 ;;
-    lcpp27752srv | lcpp27754srv | lcpp27752mtp | lcpp27754mtp)
-      lcpp=1 srv=1
+    lcpp27752srv | lcpp27754srv | lcpp27752mtp | lcpp27754mtp | lcpp2775[24]srvpp | lcpp2775[24]srvpp[1-9]*)
+      lcpp=1 srv=1 np=$N
+      case ${eng%%+*} in
+        *srvpp*)
+          pp=1 np=1 ub=${eng%%+*} ub=${ub#lcpp2775?srvpp}
+          case $ub in *[!0-9]* | 0*) usage "$a" ;; esac
+          ;;
+      esac
       [ "$dep" -ge 1 ] || usage "$a" "a server arm feeds D >= 1 prose ids"
+      [ $((dep + np + 1)) -le "$CTX" ] || usage "$a" "the server's -c is ours' --ctx $CTX (docs/fair-measure.md 1.5), and $dep ids + n_predict $np + 1 take $((dep + np + 1)) positions; raise BLOOMERY_GEN_CTX"
+      srv_mods_split "$eng"
+      lcpp_srv_flags "$(srv_mods_apply "$(gpu_flags "$eng")" "$SRV_MODS")" || usage "$a" "$SRV_WHY"
       ;;
     lcpp27752pp* | lcpp27754pp*)
       lcpp=1 pp=1 ub=${eng#lcpp2775?pp}
@@ -214,12 +270,17 @@ for a in "${ARMS[@]}"; do
   case $eng in exl3*) ;; *) gguf=1 ;; esac
   A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng")
 done
+# The draft is the oursmtp arm's alone: set here, every ours arm would draft and their ratio would read 1.
+if [ "$ours" = 1 ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
+  echo "depth-glm5next.sh: BLOOMERY_DRAFT is set to '$BLOOMERY_DRAFT' in the runner's environment, so the plain ours arms would run it too; unset it (the oursmtp:<D> arm sets BLOOMERY_DRAFT=mtp for its own command)" >&2
+  exit 64
+fi
 
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
-CPU_BUSY_COMMS=${BLOOMERY_CPU_BUSY_COMMS:-$CPU_BUSY_COMMS generate_glm5next generate_qwen3moe python3}
+CPU_BUSY_COMMS=${BLOOMERY_CPU_BUSY_COMMS:-$CPU_BUSY_COMMS generate_glm5next generate_qwen3moe llama-server python3}
 WITNESS=(head-open indent card busiest model mem pgmajfault)
 T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
   echo "depth-glm5next.sh: tools/ref/tdist.py gave no t quantiles for ROUNDS=$ROUNDS" >&2
@@ -270,15 +331,29 @@ if [ "$ours" = 1 ]; then
     check 2 "no binary at $BIN"
   fi
 fi
+# The oursmtp arm: its binary takes BLOOMERY_DRAFT=mtp (at_main refuses a lever the binary does not act
+# on, --levers included), and the checked-in schema says whether its `mtp summary` record is read (MTP_REC
+# 1) or none is (0), probed as cold-blocks.sh's res_kinds probes the residency records.
+MTP_REC=0 MTP_NOTE=''
+if [ "$ours_mtp" = 1 ]; then
+  if [ -x "$BIN" ]; then
+    lv=$(env BLOOMERY_DRAFT=mtp "$BIN" --levers 2>&1) || check 2 "$BIN refuses BLOOMERY_DRAFT=mtp (its --levers under it: ${lv##*$'\n'}): no oursmtp arm can run"
+  fi
+  if lv=$(python3 "$RECORDS" sh --bin generate_glm5next /dev/null 'MK=mtp_summary.kept' 'MP=mtp_summary.positions' 'MQ=mtp_summary.passes' 2>&1); then
+    MTP_REC=1 MTP_NOTE="generate_glm5next's checked-in schema declares the mtp summary record: each oursmtp row carries its positions, passes and kept, and one that prints none is a FAIL row"
+  else
+    case $lv in
+      *"prints no kind mtp_summary"*) MTP_NOTE="generate_glm5next's checked-in schema declares no mtp summary record: the oursmtp rows carry no draft fields" ;;
+      *) check 2 "records.py could not read generate_glm5next's schema for the mtp summary record: $lv" ;;
+    esac
+  fi
+fi
 case " ${A_ENG[*]}" in *" lcpp27752"*) [ -x "$LCPP27752BIN" ] || check 2 "no llama-bench at $LCPP27752BIN (PR #27752's tree)" ;; esac
 case " ${A_ENG[*]}" in *" lcpp27754"*) [ -x "$LCPP27754BIN" ] || check 2 "no llama-bench at $LCPP27754BIN (PR #27754's tree)" ;; esac
 # A fit arm needs its branch's llama-bench to have the fit (lcpp_fit_probe runs its --help with no card).
 # shellcheck disable=SC2153 # LCPP27752 and LCPP27754 are the profile's
 { [ "$fit27752" = 0 ] || [ ! -x "$LCPP27752BIN" ] || lcpp_fit_probe "$LCPP27752BIN"; } || check 64 "the lcpp27752fit/lcpp27752ppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP27752)"
 { [ "$fit27754" = 0 ] || [ ! -x "$LCPP27754BIN" ] || lcpp_fit_probe "$LCPP27754BIN"; } || check 64 "the lcpp27754fit/lcpp27754ppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP27754)"
-case " ${A_ENG[*]} " in *" lcpp27752srv "* | *" lcpp27752mtp "*) [ -x "$LCPP27752SRV" ] || check 2 "no llama-server at $LCPP27752SRV" ;; esac
-case " ${A_ENG[*]} " in *" lcpp27754srv "* | *" lcpp27754mtp "*) [ -x "$LCPP27754SRV" ] || check 2 "no llama-server at $LCPP27754SRV" ;; esac
-[ "$srv" = 0 ] || command -v curl > /dev/null || check 2 "no curl for the server arms"
 if [ "$exl3" = 1 ]; then
   [ -x "$EXL3_PY" ] || check 2 "no exllamav3 python at $EXL3_PY"
   # shellcheck disable=SC2153 # EXL3 is the profile's
@@ -316,23 +391,37 @@ prompt_col() {
 # The command of arm <i>, into CMD (an array, its environment first through env), LABEL_TEST
 # (the row the reference's output is read by) and, for a fit arm, FIT_NOTE (what its flags dropped).
 arm_cmd() {
-  local i=$1 eng=${A_ENG[$1]} dep=${A_DEP[$1]} ub=${A_UB[$1]} flags envs=''
-  CMD=() LABEL_TEST='' BATCH='' FIT_NOTE=''
-  case $eng in
-    ours)
-      CMD=("$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"})
+  local i=$1 eng=${A_ENG[$1]} dep=${A_DEP[$1]} ub=${A_UB[$1]} flags server
+  local -a words=() mtpw=()
+  CMD=() LABEL_TEST='' BATCH='' FIT_NOTE='' SRV_ENVS=() SRV_NP=$N
+  case ${eng%%+*} in
+    ours | oursmtp)
+      CMD=("$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
+      [ "$eng" = ours ] || CMD=(env BLOOMERY_DRAFT=mtp "${CMD[@]}")
       ;;
-    lcpp2775[24]srv | lcpp2775[24]mtp)
-      # shellcheck disable=SC2206 # the profile's NAME=VALUE words
+    lcpp2775[24]srv | lcpp2775[24]srvpp* | lcpp2775[24]mtp)
+      # The branch's bench flags (its GLM_NCMOE_MTP for the MTP arm) with the arm's own, in the server's
+      # spellings (lcpp-warm.sh), the MTP words after them, at -c C; #27754's environment.
       case $eng in
-        lcpp27752srv) CMD=(env "$LCPP27752SRV") flags=$LCPP27752_SRV_FLAGS ;;
-        lcpp27752mtp) CMD=(env "$LCPP27752SRV") flags=$LCPP27752_MTP_FLAGS ;;
-        lcpp27754srv) CMD=(env $LCPP27754_ENV "$LCPP27754SRV") flags=$LCPP27754_SRV_FLAGS ;;
-        lcpp27754mtp) CMD=(env $LCPP27754_ENV "$LCPP27754SRV") flags=$LCPP27754_MTP_FLAGS ;;
+        lcpp27752*) server=$LCPP27752SRV ;;
+        *) server=$LCPP27754SRV && read -r -a SRV_ENVS <<< "$LCPP27754_ENV" ;;
       esac
-      # shellcheck disable=SC2206
-      CMD=(timeout --kill-after=10 "$BOUND" "${CMD[@]}" -m "$MODEL" --host 127.0.0.1 -c "$(((dep + N + 256 + 255) / 256 * 256))" $flags)
-      LABEL_TEST="POST /completion: GLM_PROSE ids $PROSE_FROM..$((PROSE_FROM + dep - 1)), n_predict $N, temperature 0, ignore_eos"
+      flags=$(gpu_flags "$eng")
+      case ${eng%%+*} in *mtp) flags=$(with_ncmoe "$flags" "$GLM_NCMOE_MTP") ;; esac
+      srv_mods_split "$eng"
+      flags=$(srv_mods_apply "$flags" "$SRV_MODS")
+      if [ "${A_PP[$i]}" = 1 ]; then
+        SRV_NP=1 BATCH="ub 512 b 2048 (llama-server defaults)"
+        if [ -n "$ub" ]; then
+          flags="$flags -ub $ub -b $((ub > 2048 ? ub : 2048))" BATCH="ub $ub b $((ub > 2048 ? ub : 2048)) (the arm's lever)"
+        fi
+      fi
+      lcpp_srv_flags "$flags"
+      read -r -a words <<< "$SRV_FLAGS"
+      case ${eng%%+*} in *mtp) read -r -a mtpw <<< "$GLM_MTP_FLAGS" && words+=("${mtpw[@]}") ;; esac
+      lcpp_srv_cmd "$server" "$MODEL" "$CTX" "${words[@]}"
+      CMD=("${SRV_CMD[@]}")
+      LABEL_TEST="POST /completion: GLM_PROSE ids $PROSE_FROM..$((PROSE_FROM + dep - 1)), a discarded warm-up then the same timed, n_predict $SRV_NP, temperature 0, ignore_eos, -c $CTX (ours' --ctx)"
       ;;
     lcpp*)
       # shellcheck disable=SC2206 # the profile's NAME=VALUE words
@@ -365,6 +454,19 @@ arm_cmd() {
       ;;
   esac
 }
+# A server arm needs its branch's llama-server, whose --help (run with no card) lists every flag the arm
+# passes, and curl.
+for i in "${!ARMS[@]}"; do
+  srv_glm "${A_ENG[$i]}" || continue
+  case ${A_ENG[$i]} in lcpp27752*) sb=$LCPP27752SRV ;; *) sb=$LCPP27754SRV ;; esac
+  if [ ! -x "$sb" ]; then
+    check 2 "no llama-server at $sb"
+  else
+    arm_cmd "$i"
+    lcpp_srv_probe "$sb" || check 64 "arm ${ARMS[$i]}: $SRV_WHY"
+  fi
+done
+[ "$srv" = 0 ] || command -v curl > /dev/null || check 2 "no curl for the server arms"
 # exllamav3 runs as the tree's owner, from / (its CPU-tier worker process opens the working directory,
 # which that user cannot enter under /root): perf.py keeps a disk cache beside itself, and its token stream
 # reads the wikitext-2 test text from the temp dir, downloading it when absent; the staged copy
@@ -401,7 +503,7 @@ ph_k() {
   PHK='' PHNGL=''
   case ${A_ENG[$i]} in
     exl3*) return 0 ;;
-    ours) PHK=$GLM_PREHEAT_K; return 0 ;;
+    ours | oursmtp) PHK=$GLM_PREHEAT_K; return 0 ;;
   esac
   arm_cmd "$i"
   for w in "${CMD[@]}"; do
@@ -466,6 +568,7 @@ preheat_arm() {
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS ctx=$CTX place=$PLACE warm=${WARM:-0} card=$CARD_NAME timing_gpu=$TIMING_GPU arm_bound=${BOUND}s warmup=$WARMUP cold_us=$COLD_US"
   echo "[dry] ours: $BIN prose=$PROSE"
+  [ "$ours_mtp" = 0 ] || echo "[dry] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; ${MTP_NOTE:-the schema of the mtp summary record was not read (the check lines)}"
   echo "[dry] prompt: GLM_PROSE ids from index $PROSE_FROM"
   ref_witness | sed 's/^   /[dry]/'
   [ ${#CHECKS[@]} -eq 0 ] || printf '[dry] check: %s\n' "${CHECKS[@]}"
@@ -473,7 +576,8 @@ if [ -n "$DRY" ]; then
     arm_cmd "$i"
     row=${LABEL_TEST% |}
     echo "[dry] ${ARMS[$i]}:${row:+ row \"$row\"}${BATCH:+, $BATCH}${FIT_NOTE:+, $FIT_NOTE}"
-    case ${A_ENG[$i]} in lcpp2775[24]srv | lcpp2775[24]mtp) pre='' post=' --port <free>' ;; *) pre="timeout --kill-after=10 $BOUND " post='' ;; esac
+    pre="timeout --kill-after=10 $BOUND " post=''
+    ! srv_glm "${A_ENG[$i]}" || [ ${#SRV_ENVS[@]} -eq 0 ] || pre+="env ${SRV_ENVS[*]} "
     echo "[dry]     $pre$(printf '%q ' "${CMD[@]}" | sed -E 's/--tokens [^ ]+/--tokens <GLM_PROSE ids '"$PROSE_FROM..$((PROSE_FROM + A_DEP[i] - 1))"'>/')$post"
     [ -n "${A_PHK[$i]:-}" ] || continue
     ph_k "$i"
@@ -487,7 +591,8 @@ if [ -n "$DRY" ]; then
   else
     echo "[dry] preheat: off ($([ "$PREHEAT" = 0 ] && echo BLOOMERY_PREHEAT=0 || echo 'no GGUF arm'))"
   fi
-  [ "$gguf" = 0 ] || [ "$WARMUP" = 0 ] || echo "[dry] WARMUP r0: every GGUF arm once on its own ids, discarded, right before its round-1 row"
+  [ "$srv" = 0 ] || echo "[dry] server arms: -c $CTX (ours' --ctx), a discarded request then the timed one; each row's first $XC_N ids held to ours' on the same ids (xcheck)"
+  [ "$gguf" = 0 ] || [ "$WARMUP" = 0 ] || echo "[dry] WARMUP r0: every ours and llama-bench arm once on its own ids, discarded, right before its round-1 row (a server arm's warm-up is its own discarded request)"
   for r in $(seq "$ROUNDS"); do
     o='' ; for i in $(order_of "$r" 0); do o+="${ARMS[$i]} "; done
     [ "$gguf" = 0 ] || echo "[dry] round $r gguf order: $o"
@@ -561,46 +666,25 @@ fail_row() {
   failed+=("r$2:${A_LABEL[$3]}@$key=${A_DEP[$3]}")
 }
 
-# srv_run <depth>: a server arm's process (CMD, which starts with its own timeout) on a free port, one
-# request after /health answers, then the process stopped by the pid it was started with. Sets out (the
-# server's log, then `RESPONSE <json>`) and rc (the server's exit when it died first, 124 when /health
-# never answered inside BOUND, curl's code when the request failed).
-srv_run() {
-  local dep=$1 port log pid k body resp=''
-  port=$((20000 + RANDOM % 20000))
-  log=${TMPDIR:-/tmp}/depth-glm5next-server.$$.log
-  "${CMD[@]}" --port "$port" > "$log" 2>&1 &
-  pid=$!
-  rc=124
-  for ((k = 0; k < BOUND / 2; k++)); do
-    if curl -sf -o /dev/null "http://127.0.0.1:$port/health"; then rc=0; break; fi
-    if ! kill -0 "$pid" 2> /dev/null; then
-      wait "$pid"
-      rc=$?
-      [ "$rc" != 0 ] || rc=70
-      break
-    fi
-    sleep 2
-  done
-  if [ "$rc" = 0 ]; then
-    body=$(prompt_ids "$dep" | python3 -c '
-import json, sys
-ids = [int(l) for l in sys.stdin if l.strip()]
-print(json.dumps({"prompt": ids, "n_predict": int(sys.argv[1]), "temperature": 0, "ignore_eos": True, "cache_prompt": False}))' "$N")
-    resp=$(curl -sf --max-time "$BOUND" -H 'Content-Type: application/json' --data-binary @- "http://127.0.0.1:$port/completion" <<< "$body") || rc=$?
+# srv_start_arm <index> <depth>: a server arm's process (lcpp-warm.sh: SRV_CMD under its own bound,
+# #27754's environment, a port the kernel picks), its context against -c C, the discarded warm-up request
+# and the timed one, then the server stopped by the pid it was started with, on every path. out is the
+# server's log; SRV_RUN_WHY and SRV_FAIL_RC say what failed (empty: every step ran), the timed request's
+# SRV_* its values.
+srv_start_arm() {
+  local ids log
+  ids=$(prompt_ids "$2" | paste -sd, -)
+  log=$(mktemp "${TMPDIR:-/tmp}/depth-glm5next-server.XXXXXX") || exit 2
+  SRV_RUN_WHY='' SRV_FAIL_RC=0
+  if ! lcpp_srv_start "$BOUND" "$log" ${SRV_ENVS[@]+"${SRV_ENVS[@]}"}; then
+    SRV_FAIL_RC=$SRV_RC SRV_RUN_WHY="-c $CTX (ours' --ctx): $SRV_WHY"
+  elif ! lcpp_srv_ctx_check "$log" "$CTX"; then
+    SRV_RUN_WHY=$SRV_WHY
+  elif ! lcpp_srv_arm "$ids" "$SRV_NP" "$BOUND"; then
+    SRV_RUN_WHY=$SRV_WHY
   fi
-  # TERM to the timeout, which passes it to the server; a server still up 30 s later is killed by its
-  # parent's pid, the one started here, never by a name.
-  kill "$pid" 2> /dev/null
-  for ((k = 0; k < 30; k++)); do kill -0 "$pid" 2> /dev/null || break; sleep 1; done
-  if kill -0 "$pid" 2> /dev/null; then
-    echo "[server] still up 30 s after TERM; KILL to the children of $pid, then $pid" >&2
-    pkill -KILL -P "$pid"
-    kill -KILL "$pid" 2> /dev/null
-  fi
-  wait "$pid" 2> /dev/null
-  out="$(cat "$log")
-RESPONSE $resp"
+  lcpp_srv_stop
+  out=$(cat "$log")
   rm -f "$log"
 }
 
@@ -621,9 +705,12 @@ run_arm() {
   witness "pre $tag r$r $label ${dep}"
   ref_witness
   m0=$(majflt) t0=$(date +%s)
-  case $eng in
-    lcpp2775[24]srv | lcpp2775[24]mtp) srv_run "$dep" ;;
-    ours)
+  case ${eng%%+*} in
+    lcpp2775[24]srv | lcpp2775[24]srvpp* | lcpp2775[24]mtp)
+      srv_start_arm "$i" "$dep"
+      rc=0
+      ;;
+    ours | oursmtp)
       # Through majflt_mark: the fault count at the `fed` line, where the feed's timer starts.
       markf=$(mktemp "${TMPDIR:-/tmp}/depth-glm5next-fed.XXXXXX") || exit 2
       out=$(lease_bounded "$BOUND" "${CMD[@]}" 2>&1 | majflt_mark "$markf" '^fed '; exit "${PIPESTATUS[0]}")
@@ -655,16 +742,31 @@ run_arm() {
     return
   fi
   if [ "$rc" -ne 0 ]; then fail_row "" "${r_tag#r}" "$i" "$rc" "exited $rc" "$out"; return; fi
-  case $eng in
-    ours)
-      local rec P50 MEAN WARMCOL PLACE_RAN SERIES TOKENS PP_N PP_MS PP_TPS PP_PASSES PP_KIND CARD_EXP HOST_EXP
+  case ${eng%%+*} in
+    ours | oursmtp)
+      local rec P50 MEAN WARMCOL PLACE_RAN SERIES TOKENS PP_N PP_MS PP_TPS PP_PASSES PP_KIND CARD_EXP HOST_EXP XTOK
       rec=$(python3 "$RECORDS" sh --bin generate_glm5next - P50=smoke.p50_ms MEAN=smoke.mean_ms WARMCOL=smoke.warm \
         PLACE_RAN=smoke.place 'SERIES=time_step.ms*' 'TOKENS=step.token*' PP_N=time_prompt.n PP_MS=time_prompt.ms \
         'PP_TPS=time_prompt.tok/s' PP_PASSES=time_prompt.passes PP_KIND=time_prompt.kind CARD_EXP=plan.card_experts \
-        HOST_EXP=plan.host_experts <<< "$out") || { fail_row "" "${r_tag#r}" "$i" 0 "records.py did not read the output" "$out"; return; }
+        HOST_EXP=plan.host_experts XTOK=tokens.tokens LCTX=load_generator.ctx <<< "$out") || { fail_row "" "${r_tag#r}" "$i" 0 "records.py did not read the output" "$out"; return; }
       eval "$rec"
       [ -n "$P50" ] && [ -n "$PP_N" ] || { fail_row "" "${r_tag#r}" "$i" 0 "no SMOKE or time prompt record" "$out"; return; }
       [ "$PLACE_RAN" = "$PLACE" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its SMOKE names place=$PLACE_RAN; the runner passed --place $PLACE" "$out"; return; }
+      # The context the servers are given is the one this load made (docs/fair-measure.md 1.5).
+      [ "$LCTX" = "$CTX" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its load record names ctx=${LCTX:-none}, and the server arms run at -c $CTX (BLOOMERY_GEN_CTX, ours' --ctx)" "$out"; return; }
+      # The oursmtp row's draft fields: the mtp summary record, when the schema declares it (MTP_REC).
+      local MK='' MP='' MQ='' MTP_COL='' mrec mlines
+      if [ "$eng" = oursmtp ] && [ "$MTP_REC" = 1 ]; then
+        if ! mrec=$(python3 "$RECORDS" sh --bin generate_glm5next - 'MK=mtp_summary.kept' 'MP=mtp_summary.positions' 'MQ=mtp_summary.passes' <<< "$out" 2>&1) ||
+          ! mlines=$(python3 "$RECORDS" lines --bin generate_glm5next - mtp_summary <<< "$out" 2>&1); then
+          fail_row "" "${r_tag#r}" "$i" 0 "records.py did not read its mtp summary record: $mrec${mlines:+ $mlines}" "$out"
+          return
+        fi
+        eval "$mrec"
+        [ -n "$mlines" ] || { fail_row "" "${r_tag#r}" "$i" 0 "the oursmtp arm printed no mtp summary record, which its schema declares" "$out"; return; }
+        [ -n "$MK" ] && [ -n "$MP" ] && [ -n "$MQ" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its mtp summary record has no kept, positions or passes (kept='$MK' positions='$MP' passes='$MQ')" "$out"; return; }
+        MTP_COL=" | mtp positions/pass $(awk -v p="$MP" -v q="$MQ" 'BEGIN { printf "%.3f", (q > 0) ? p / q : 0 }') = positions $MP / passes $MQ, kept $MK"
+      fi
       echo "$out" | grep -E '^(plan|load|capture|fed|step 0|time prompt) '
       local h10 t10 uniq tps tps50
       h10=$(echo "$SERIES" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
@@ -681,30 +783,39 @@ run_arm() {
       cold_pass "$tag" "$r" "$i"
       prompt_col "$dep"
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-      echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MAJ_COL | wall $((t1 - t0))s$rowtags"
+      echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
       [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
       sums+=("$label|$dep|$r|$tps")
       pp_sums+=("$label|$PP_N|$r|$PP_TPS")
+      # The drafted run's ids are held to ours' as a server row's are; it is never the ours side.
+      if [ "$eng" = ours ]; then xc_add ours prose "$dep" "$r" ours "$XTOK"; else xc_add srv prose "$dep" "$r" "$label" "$XTOK"; fi
       ;;
-    lcpp2775[24]srv | lcpp2775[24]mtp)
-      local t acc pn prn prps dn dna
-      t=$(sed -n 's/^RESPONSE //p' <<< "$out" | python3 -c '
-import json, sys
-t = json.loads(sys.stdin.read())["timings"]
-print(t["predicted_per_second"], t["predicted_n"], t["prompt_n"], t["prompt_per_second"], t.get("draft_n", 0), t.get("draft_n_accepted", 0))' 2> /dev/null) ||
-        { fail_row "" "${r_tag#r}" "$i" 0 "no timings in the /completion response" "$out"; return; }
-      read -r val pn prn prps dn dna <<< "$t"
-      [ "$pn" = "$N" ] || { fail_row "" "${r_tag#r}" "$i" 0 "predicted_n $pn, not $N" "$out"; return; }
+    lcpp2775[24]srv | lcpp2775[24]srvpp* | lcpp2775[24]mtp)
+      local acc prps wtps w
+      [ -z "$SRV_RUN_WHY" ] || { fail_row "" "${r_tag#r}" "$i" "$SRV_FAIL_RC" "$SRV_RUN_WHY" "$out"; return; }
       acc=$(grep -o 'draft acceptance = .*' <<< "$out" | tail -n 1)
-      case $eng in *mtp) [ "$dn" -gt 0 ] || { fail_row "" "${r_tag#r}" "$i" 0 "the MTP arm drafted nothing (draft_n 0)" "$out"; return; } ;; esac
-      echo "$out" | grep -v '^RESPONSE ' | grep -E '^build:|model buffer size|speculative|draft-mtp|nextn' | head -n 8 | sed "s/^/    $label load /"
-      val=$(awk -v v="$val" 'BEGIN{printf "%.2f", v}')
-      cold_col "$((m1 - m0))" "$(awk -v n="$N" -v v="$val" 'BEGIN{print n / v}')"
+      case ${eng%%+*} in *mtp) [ "${SRV_DRAFT_N:-0}" -gt 0 ] || { fail_row "" "${r_tag#r}" "$i" 0 "the MTP arm drafted nothing (draft_n ${SRV_DRAFT_N:-0})" "$out"; return; } ;; esac
+      echo "$out" | grep -E '^build:|model buffer size|speculative|draft-mtp|nextn|llama_context: n_ctx ' | head -n 8 | sed "s/^/    $label load /"
+      wtps=$(awk -v v="$WARM_TPS" 'BEGIN{printf "%.2f", v}')
+      prps=$(awk -v v="$SRV_PROMPT_TPS" 'BEGIN{printf "%.2f", v}')
+      # The timed window: the timed request's prompt and decode; its faults counted around it alone.
+      w=$(awk -v p="$SRV_PROMPT_MS" -v g="$SRV_PRED_MS" 'BEGIN { print (p + g) / 1e3 }')
+      cold_col "$((SRV_F1 - SRV_F0))" "$w" "timed: the timed request; whole process $((m1 - m0))"
       cold_pass "$tag" "$r" "$i"
       prompt_col "$dep"
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-      echo "$PTAG $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | prompt_n $prn prompt tok/s $(awk -v v="$prps" 'BEGIN{printf "%.2f", v}') | draft_n $dn draft_n_accepted $dna | ${acc:-no draft acceptance line}$MAJ_COL | wall $((t1 - t0))s$rowtags"
-      [ "$PTAG" = ROW ] && sums+=("$label|$dep|$r|$val")
+      if [ "${A_PP[$i]}" = 1 ]; then
+        echo "$PTAG $r_tag $label p=$dep n=0 | tok/s(pp) $prps @ n=0, prompt $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | warm-up $wtps tok/s(pp) majflt $WARM_FAULTS, continuation $SRV_SAME | -c $CTX | $BATCH$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
+        pp_sums+=("$label|$dep|$r|$prps")
+      else
+        val=$(awk -v v="$SRV_PRED_TPS" 'BEGIN{printf "%.2f", v}')
+        echo "$PTAG $r_tag $label d=$dep n=$N | tok/s $val @ n=$N, depth $dep, $CARD_NAME | llama-server /completion$PROMPT_COL | warm-up $wtps tok/s majflt $WARM_FAULTS, continuation $SRV_SAME | -c $CTX | prompt_n $SRV_PROMPT_N prompt tok/s $prps | draft_n $SRV_DRAFT_N draft_n_accepted $SRV_DRAFT_ACC | ${acc:-no draft acceptance line}$MAJ_COL | wall $((t1 - t0))s$rowtags"
+        [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
+        sums+=("$label|$dep|$r|$val")
+        pp_sums+=("$label|$dep|$r|$prps")
+      fi
+      xc_add srv prose "$dep" "$r" "$label" "$SRV_TOKENS"
       ;;
     lcpp*)
       val=$(echo "$out" | grep -F "$LABEL_TEST" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//; s/ //g' | head -n 1)
@@ -805,6 +916,7 @@ majflt_require depth-glm5next.sh
 lease_take
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS card=$CARD_NAME timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU arm_bound=${BOUND}s cold_us=$COLD_US"
 [ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE"
+[ "$ours_mtp" = 0 ] || echo "[config] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; $MTP_NOTE"
 [ "$ours$srv" = 00 ] || echo "[config] prompt: GLM_PROSE ids from index $PROSE_FROM"
 [ "$lcpp" = 0 ] || echo "[config] lcpp27752 flags=$LCPP27752_GPU_FLAGS | lcpp27754 env=$LCPP27754_ENV flags=$LCPP27754_GPU_FLAGS"
 for e in 27752 27754; do
@@ -812,6 +924,7 @@ for e in 27752 27754; do
   lcpp_fit_flags "$(gpu_flags "lcpp$e")"
   echo "[config] lcpp${e}fit: flags=$FIT_FLAGS (llama-bench's fit places the model; dropped: $FIT_DROPPED; lcpp${e}ppfit<U>: -ub U -b max(U, 2048))"
 done
+[ "$srv" = 0 ] || echo "[config] server arms: the branch's bench flags in llama-server's spellings (lcpp-warm.sh) with $LCPP_SRV_FIXED, -c $CTX (ours' --ctx; a load record naming another ctx, or a server log naming another n_ctx, is a FAIL row), a discarded request then the timed one on ours' prose ids; MTP at --n-cpu-moe $GLM_NCMOE_MTP with $GLM_MTP_FLAGS; each row's first $XC_N ids held to ours' on the same ids (xcheck)"
 [ "$exl3" = 0 ] || echo "[config] exl3: $EXL3_MODEL ($EXL3_BPW bpw) flags=$EXL3_FLAGS, perf.py's defaults otherwise (cache 32768, chunk 4096)"
 echo "[config] arms=${ARMS[*]}"
 if [ -n "$PH_DIR" ]; then
@@ -827,7 +940,7 @@ for grp in 0 1; do
   for r in $(seq "$ROUNDS"); do
     for i in $(order_of "$r" "$grp"); do
       # Each GGUF arm's warm-up: the same ids, discarded, right before its first round's row.
-      [ "$WARMUP" = 0 ] || [ "$grp" = 1 ] || [ "$r" != 1 ] || run_arm WARMUP 0 "$i"
+      [ "$WARMUP" = 0 ] || [ "$grp" = 1 ] || [ "$r" != 1 ] || srv_glm "${A_ENG[$i]}" || run_arm WARMUP 0 "$i"
       run_row "$r" "$i"
     done
   done
@@ -835,14 +948,29 @@ done
 
 echo
 echo "arm runs: $n_rows (FAIL rows included); rows tagged [cpu-busy] $busy_rows, [other-busy] $other_rows, [cold] $cold_rows; cold re-runs $retry_rows, FAIL-cold $fail_cold"
+# The greedy cross-check (lcpp-warm.sh), before the tables: a server row whose first id parts from ours
+# joins the failed arms and its label drops out of the means and ratios at that depth or P (xc_drop); a
+# later id's part is a [xcheck-tail] line and stays.
+xc_table
+if [ ${#XC_FAILED[@]} -gt 0 ]; then
+  failed+=("${XC_FAILED[@]}")
+  printf '%s\n' "${XC_DROP[@]}" | sort -u | awk -F'|' '{ printf "    dropped: %s at %s (FAIL xcheck)\n", $1, $2 }'
+  kept=()
+  while IFS= read -r l; do [ -z "$l" ] || kept+=("$l"); done < <(printf '%s\n' ${sums[@]+"${sums[@]}"} | xc_drop)
+  sums=(${kept[@]+"${kept[@]}"})
+  kept=()
+  while IFS= read -r l; do [ -z "$l" ] || kept+=("$l"); done < <(printf '%s\n' ${pp_sums[@]+"${pp_sums[@]}"} | xc_drop)
+  pp_sums=(${kept[@]+"${kept[@]}"})
+fi
 echo "=== per-arm decode means (tok/s @ n=$N, $CARD_NAME; exl3 rows @ n=100, another quantization) ==="
 [ ${#sums[@]} -eq 0 ] || printf '%s\n' "${sums[@]}" | means tok/s
-echo "=== per-arm prefill means (tok/s(pp) @ n=0, prompt P, $CARD_NAME; ours is the step feed, kind=steps) ==="
+echo "=== per-arm prefill means (tok/s(pp) @ n=0, prompt P, $CARD_NAME; ours its time prompt row, a server decode row its prompt_per_second) ==="
 [ ${#pp_sums[@]} -eq 0 ] || printf '%s\n' "${pp_sums[@]}" | means 'tok/s(pp)'
 # Ratios against ours: the same file's engines only. exl3 runs another quantization. The engines do not
-# share a routing condition: ours feeds prose ids and places card experts by id; llama-bench feeds std::rand() ids and places whole layers, whose host bytes a token do not
-# depend on the ids; exllamav3 feeds wikitext-2 and adapts its placement to that stream.
-same_file() { grep -vE '^exl3' | grep -vx ours; }
+# share a routing condition: ours and the server arms feed the same prose ids, ours places card experts by
+# id; llama-bench feeds std::rand() ids and places whole layers, whose host bytes a token do not depend on
+# the ids; exllamav3 feeds wikitext-2 and adapts its placement to that stream.
+same_file() { grep -vE '^exl3' | grep -vxE 'ours|oursmtp'; }
 if [ ${#sums[@]} -gt 0 ]; then
   echo
   echo "=== ours / each engine on the same file, per depth: each round's ratio, their mean ± 95 % (t, rounds - 1 df) ==="
@@ -852,10 +980,17 @@ if [ ${#sums[@]} -gt 0 ]; then
 fi
 if [ ${#pp_sums[@]} -gt 0 ]; then
   echo
-  echo "=== ours / each engine on the same file, prefill per prompt length (ours: the step feed) ==="
+  echo "=== ours / each engine on the same file, prefill per prompt length (ours: its time prompt row) ==="
   keys=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
   refs=$(printf '%s\n' "${pp_sums[@]}" | cut -d'|' -f1 | sort -u | same_file | tr '\n' ' ')
   printf '%s\n' "${pp_sums[@]}" | ratio_table "ratio pp p=" "$keys" "$refs"
+fi
+# The draft's own effect: the same binary, ids, context and placement, BLOOMERY_DRAFT=mtp the one difference.
+if [[ " ${sums[*]+${sums[*]}}" == *" oursmtp|"* ]]; then
+  echo
+  echo "=== ours / oursmtp per depth (below 1: the MTP draft is faster): each round's ratio, their mean ± 95 % (t, rounds - 1 df) ==="
+  keys=$(printf '%s\n' "${sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
+  printf '%s\n' "${sums[@]}" | ratio_table "ratio mtp d=" "$keys" oursmtp
 fi
 witness post
 ref_witness

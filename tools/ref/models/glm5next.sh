@@ -87,10 +87,12 @@
 #                   the build smoke: --no-op-offload, and -fit off (common's fit pass would move the
 #                   arguments not given)
 #   LCPP27752SRV, LCPP27754SRV  each branch's llama-server: the server arms (`lcpp2775xsrv:<D>`,
-#                   `lcpp2775xmtp:<D>`) time one /completion request, because llama-bench drives no
-#                   speculation; llama-server prints the draft acceptance and returns it in `timings`
-#   LCPP27752_SRV_FLAGS, LCPP27754_SRV_FLAGS  the CLI flags with one slot (-np 1: the automatic slots
-#                   would set four and a unified cache)
+#                   `lcpp2775xsrvpp[<U>]:<P>`, `lcpp2775xmtp:<D>`) time a /completion request after a
+#                   discarded one on the same ids, because llama-bench feeds its own ids and drives no
+#                   speculation; llama-server prints the draft acceptance and returns it in `timings`.
+#                   Their flags are LCPP2775x_GPU_FLAGS in the server's spellings (tools/ref/lcpp-warm.sh's
+#                   table, which adds -fit off and LCPP_SRV_FIXED: -np 1 -ctxcp 0 --cache-ram 0), so no
+#                   second copy of the placement lives here
 #   GLM_PREHEAT_K   the --n-cpu-moe K whose host set (tools/ref/gguf-ranges.py host) depth-glm5next.sh
 #                   preheats before our arms and the fit twins: 45, every routed expert of blocks 3-44
 #                   and token_embd. Blocks 3-44 are the engine's routed layers (blk.45, NextN, is no
@@ -105,7 +107,6 @@
 #                   37-45 hold the bytes 36-44 held, plus 191 MiB [derived]
 #   GLM_MTP_FLAGS   the MTP draft: --spec-type draft-mtp --spec-draft-n-max 2 (#27754's body and the
 #                   unsloth guide: n = 2 is its best, more drafts run slower)
-#   LCPP27752_MTP_FLAGS, LCPP27754_MTP_FLAGS  the server flags at GLM_NCMOE_MTP with GLM_MTP_FLAGS
 #   EXL3            the exllamav3 source tree; its bench is eval/perf.py, run by EXL3_PY (the venv of
 #                   exllamav3 1.5.0 +cu128, torch 2.10.0), on EXL3_MODEL: another quantization (EXL3
 #                   at EXL3_BPW bits a weight), so its rows are a table of their own, never a ratio
@@ -182,11 +183,7 @@ fi
 : "${LCPP27754SRV:=$LCPP27754/build/bin/llama-server}"
 : "${GLM_NCMOE_MTP:=$((GLM_NCMOE + 1))}"
 : "${GLM_PREHEAT_K:=45}"
-: "${LCPP27752_SRV_FLAGS:=$LCPP27752_CLI_FLAGS -np 1}"
-: "${LCPP27754_SRV_FLAGS:=$LCPP27754_CLI_FLAGS -np 1}"
 : "${GLM_MTP_FLAGS:=--spec-type draft-mtp --spec-draft-n-max 2}"
-: "${LCPP27752_MTP_FLAGS:=-ngl 999 --n-cpu-moe $GLM_NCMOE_MTP -fa on -t 32 --no-op-offload -fit off -np 1 $GLM_MTP_FLAGS}"
-: "${LCPP27754_MTP_FLAGS:=-ngl 999 --n-cpu-moe $GLM_NCMOE_MTP -fa off -t 32 --no-op-offload -fit off -np 1 $GLM_MTP_FLAGS}"
 : "${EXL3:=/home/user/exllamav3-src}"
 : "${EXL3_PY:=/home/user/.venv-exl3/bin/python}"
 : "${EXL3_MODEL:=/models/GLM-5.3-Flash-exl3-4.05}"

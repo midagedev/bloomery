@@ -113,6 +113,19 @@
 #                table, not in ours'.
 #   srv-fit      lcppsrvfit:6: the server's fit flags and its fit column.
 #   srv-dry      the dry run's server command line.
+#   srv-ctx      the servers' -c is the plan's ctx_max (the stub's --plan, STUB_GEN_CTX 32768) on every
+#                server's command line; STUB_SRV_NCTX=4096 (a server that made another context): a FAIL row
+#                naming both, rc 1; STUB_GEN_LOAD_CTX=4096 (our load at another ctx): ours' FAIL row, rc 1;
+#                no binary for the plan: refused by name before the lease, rc 2.
+#   srv-xcheck   6 lcppsrv:6 lcppsrvpp:6: every server row's first ids against ours' (`xcheck lcg p=6 r1 …
+#                same`), and ours' decode row's prompt rate a prefill record (`ratio pp p=6 ours/lcppsrv`);
+#                STUB_GEN_TOKEN0=7 (ours' token 0 another id): a FAIL xcheck line per server row, both in
+#                the failed arms, both labels dropped from the means and ratios, rc 1 (srv-xcheck-differs);
+#                STUB_SRV_TOKEN1=7 (the server's second id another): a [xcheck-tail] line, the row kept in
+#                the ratios, rc 0 (srv-xcheck-tail).
+#   srv-flags    lcppsrv+t2:6 lcppsrvpp+nopo0+k2:4: each server's command line with its own -t, -nopo
+#                and --n-cpu-moe in place of the profile's, the rows under those labels; lcppsrv+x9:6 is
+#                refused by name, rc 64.
 #   srv-cold     BLOOMERY_WARM_ROWS=1, a server whose timed request faults: a COLD row, then the retry's
 #                row from one more request to the same server, rc 0.
 #   srv-cold2    the retry faults too: the COLD row, then FAIL rc=cold, dropped, rc 1.
@@ -143,6 +156,9 @@
 #                record is in its load lines, not in either arm's output; both are residency rows with their
 #                curve lines (slot 2 with the reset), the explicit off arm is an off row with no curve, and
 #                the [config] line names the arm that sets the lever; rc 0.
+#                Each residency row's `residency sums` line (the lever record's word and why, and the timed
+#                passes' kept, landed, late, made and bytes: the none and prompt boundaries not counted) and
+#                the per-arm mean lines; the off arm's with 0 passes.
 #   res-gate     BLOOMERY_GEN_PLACE=gate, 6: the unset lever resolves to off (residency lever why=fixed_place,
 #                no residency host), an off row with no curve line; rc 0.
 #   res-mismatch 6@BLOOMERY_RESIDENCY=off on a binary that runs the residency anyway (STUB_RES_IGNORE_SET):
@@ -307,17 +323,25 @@ touch "$T/Cargo.toml"
 # the boundary counted from the load or the last reset (from 1 under STUB_RES_WARM: a warm map); under
 # STUB_RES_LEAK the passes print with the lever off too. Every arm appends `<its path> <arm> ids=<the ids it
 # fed>` to $TMPDIR/stub-gen-feeds — `lcg`, the --tokens list (arm `tokens`), or a corpus arm's first P ids of
-# $STUB_ENGRAM/corpus-<name>.ids — and a fed id list prints in its `fed` line's first and last.
+# $STUB_ENGRAM/corpus-<name>.ids — and a fed id list prints in its `fed` line's first and last. --plan
+# prints the plan record with ctx_max STUB_GEN_CTX (32768) and exits, loading nothing; the load line names
+# ctx STUB_GEN_LOAD_CTX (the plan's by default); each arm ends with its `tokens` record, token 0
+# STUB_GEN_TOKEN0 (1000) and then 1001, 1002, ... as the step lines.
 cat > "$T/target/release/generate_ds41" << 'EOF'
 #!/usr/bin/env bash
-depth='' n=32 place=a tokens='' sync='' arms=()
+depth='' n=32 place=a tokens='' sync='' arms=() plan=''
 while [ $# -gt 0 ]; do
   case $1 in
     --depth) depth=$2; shift ;; --tokens) tokens=$2; shift ;; -n) n=$2; shift ;; --place) place=$2; shift ;;
-    --warm) shift ;; --arm) arms+=("$2"); shift ;; --arm-sync) sync=1 ;;
+    --warm) shift ;; --arm) arms+=("$2"); shift ;; --arm-sync) sync=1 ;; --plan) plan=1 ;;
   esac
   shift
 done
+if [ -n "$plan" ]; then
+  echo "plan place=$place ctx_max=${STUB_GEN_CTX:-32768} (stub)"
+  exit 0
+fi
+lctx=${STUB_GEN_LOAD_CTX:-${STUB_GEN_CTX:-32768}}
 echo "${arms[*]:-one}" >> "${TMPDIR:-/tmp}/stub-gen-loads"
 echo $$ >> "${TMPDIR:-/tmp}/stub-gen-pids"
 [ -z "$tokens" ] || depth=$(echo "$tokens" | tr ',' '\n' | grep -c .)
@@ -326,9 +350,9 @@ echo "plan place=$place (stub)"
 cards=${STUB_GEN_CARDS:-}
 [ -n "$cards" ] || [ "$place" != bp ] || cards='[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]'
 if [ -n "$cards" ]; then
-  echo "load resident_bytes=0 place=$place cards=$cards arms=${#arms[@]} (stub)"
+  echo "load resident_bytes=0 place=$place cards=$cards arms=${#arms[@]} ctx=$lctx (stub)"
 else
-  echo "load place=$place arms=${#arms[@]} (stub)"
+  echo "load resident_bytes=0 ctx=$lctx place=$place arms=${#arms[@]} (stub)"
 fi
 # STUB_RES_IGNORE_SET: the stub reads the lever as unset whatever it is (a binary that disagrees with it).
 res=${BLOOMERY_RESIDENCY:-} b=0
@@ -386,6 +410,7 @@ for k in "${!arms[@]}"; do
   echo "time prompt n=$depth ms=100.0000 tok/s=$((depth * 10)).00 passes=1 kind=batch"
   for i in $(seq 0 $((n - 1))); do echo "step $i $((depth + i)) $((1000 + i))"; done
   for i in $(seq 1 $((n - 1))); do echo "time step $i ms=33.0000"; done
+  echo "tokens [$(for i in $(seq 0 $((n - 1))); do [ "$i" = 0 ] && printf '%s' "${STUB_GEN_TOKEN0:-1000}" || printf ', %s' $((1000 + i)); done)]"
   echo "SMOKE mode=graph place=${STUB_GEN_PLACE:-$place} prompt_tokens=0 depth=$depth generated=$n warm=0 steps=$((n - 1)) p50_ms=33.0000 mean_ms=33.0000 tok/s(p50)=30.30"
   if [ "$res" != off ] || [ -n "${STUB_RES_LEAK:-}" ]; then
     for j in $(seq 0 $((n - 1))); do
@@ -599,7 +624,7 @@ elif [ "$seq" != "$want_seq" ]; then
 elif [ "$(paste -sd'|' - < "$LOADS")" != "6 4 code:4|4 code:4 6" ]; then
   fail grouped "the processes' --arm lists: $(paste -sd'|' - < "$LOADS"), want 6 4 code:4|4 code:4 6" "$L"
 elif want grouped "$L" 2 '^\[load\] r[12] 3 arm\(s\): ' &&
-  want grouped "$L" 2 '^    load place=a arms=3 \(stub\)$' &&
+  want grouped "$L" 2 '^    load resident_bytes=0 ctx=32768 place=a arms=3 \(stub\)$' &&
   want grouped "$L" 1 '^ROW r1 ours d=6 .*\| majflt [0-9]+ \(timed [0-9]+; .*\| slot 1/3 \| wall ' &&
   want grouped "$L" 1 '^ROW r2 ours d=6 .*\| slot 3/3 \| wall ' &&
   want grouped "$L" 1 '^ROW r1 code d=4 .*\| slot 3/3 \| wall ' &&
@@ -932,8 +957,9 @@ elif want srv "$L" 1 "^ROW r1 lcppsrv d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A60
   want srv "$L" 1 '^ratio pp p=4 +ours/lcppsrvpp8 ' &&
   want srv "$L" 1 '^\[config\] lcppsrv: .*/llama-server -ngl 999 --n-cpu-moe 1 -fa on -t 4 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c ' &&
   want srv "$L" 5 '^    lcppsrv: .*/llama-server sha256=' &&
-  want "srv argv" "$tmp/tmp/stub-srv-argv" 2 "^-m [^ ]+ -ngl 999 --n-cpu-moe 1 -fa on -t 4 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 256 --host 127.0.0.1 --port 0$" &&
-  want "srv argv" "$tmp/tmp/stub-srv-argv" 1 "^-m [^ ]+ -ngl 999 --n-cpu-moe 1 -fa on -t 4 -ub 8 -b 2048 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 256 " &&
+  want "srv argv" "$tmp/tmp/stub-srv-argv" 2 "^-m [^ ]+ -ngl 999 --n-cpu-moe 1 -fa on -t 4 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 32768 --host 127.0.0.1 --port 0$" &&
+  want "srv argv" "$tmp/tmp/stub-srv-argv" 1 "^-m [^ ]+ -ngl 999 --n-cpu-moe 1 -fa on -t 4 -ub 8 -b 2048 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 32768 " &&
+  want srv "$L" 1 '^ratio pp p=6 +ours/lcppsrv ' &&
   want "srv ids" "$tmp/tmp/stub-srv-reqs" 2 "^[12] 6 4 $lcg6$" &&
   want "srv ids" "$tmp/tmp/stub-srv-reqs" 4 "^[12] 4 1 100000,"; then
   pass srv
@@ -949,8 +975,8 @@ elif want srv-blocks "$L" 1 '^\[config\] block 2/2 lcppsrv: lcppsrv:6 lcppsrvpp:
   pass srv-blocks
 fi
 
-for c in "srv-exit STUB_SRV_EXIT=1 rc=5 \| llama-server exited 5 before it answered /health" \
-  "srv-hang STUB_SRV_HANG=1 rc=124 \| llama-server did not answer /health within 4 s" \
+for c in "srv-exit STUB_SRV_EXIT=1 rc=5 \| -c 32768 \(generate_ds41 --plan --place a: its plan record's ctx_max\): llama-server exited 5 before it answered /health" \
+  "srv-hang STUB_SRV_HANG=1 rc=124 \| -c 32768 \(.*\): llama-server did not answer /health within 4 s" \
   "srv-badn STUB_SRV_BADN=1 rc=0 \| timed: predicted_n 3, not 4"; do
   name=${c%% *} rest=${c#* } envv=${rest%% *} pat=${rest#* }
   L=$tmp/$name.log
@@ -1006,12 +1032,93 @@ L=$tmp/srv-dry.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 -- lcppsrv:6 lcppsrvpp:4
 if [ "$RC" != 0 ]; then
   fail srv-dry "rc $RC, want 0" "$L"
-elif want srv-dry "$L" 1 "^\[dry\] lcppsrv:6: timeout --kill-after=10 60 [^ ]*/llama-server -m [^ ]* -ngl 999 --n-cpu-moe 1 -fa on -t 4 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 256 --host 127.0.0.1 --port 0   # row label 'lcppsrv', ids=lcg \(6 ids\): one POST /completion discarded, then the same timed, n_predict 4, " &&
-  want srv-dry "$L" 1 "^\[dry\] lcppsrvpp:4: .* n_predict 1, greedy, ignore_eos, cache_prompt off, ub 512 b 2048 \(llama-server defaults\)$" &&
+elif want srv-dry "$L" 1 "^\[dry\] lcppsrv:6: timeout --kill-after=10 60 [^ ]*/llama-server -m [^ ]* -ngl 999 --n-cpu-moe 1 -fa on -t 4 -fit off -np 1 -ctxcp 0 --cache-ram 0 -c 32768 --host 127.0.0.1 --port 0   # row label 'lcppsrv', ids=lcg \(6 ids\): one POST /completion discarded, then the same timed, n_predict 4, " &&
+  want srv-dry "$L" 1 "^\[dry\] lcppsrvpp:4: .* n_predict 1, greedy, ignore_eos, cache_prompt off, -c 32768 \(generate_ds41 --plan --place a: its plan record's ctx_max\), ub 512 b 2048 \(llama-server defaults\)$" &&
+  want srv-dry "$L" 1 "^\[dry\] server context: -c 32768 " &&
   [ ! -f "$tmp/tmp/stub-srv-argv" ]; then
   pass srv-dry
 elif [ -f "$tmp/tmp/stub-srv-argv" ]; then
   fail srv-dry "the dry run started a server" "$L"
+fi
+
+L=$tmp/srv-ctx.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_SRV_NCTX=4096 -- lcppsrv:6
+if [ "$RC" != 1 ]; then
+  fail srv-ctx "rc $RC, want 1" "$L"
+elif none_left srv-ctx "$L" &&
+  want srv-ctx "$L" 1 "^FAIL r1 lcppsrv d=6 rc=0 \| the server made its context at n_ctx 4096, not the -c 32768 ours runs at " &&
+  want "srv-ctx argv" "$tmp/tmp/stub-srv-argv" 1 ' -c 32768 --host 127\.0\.0\.1 --port 0$'; then
+  pass srv-ctx
+fi
+L=$tmp/srv-loadctx.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_GEN_LOAD_CTX=4096 -- 6 lcppsrv:6
+if [ "$RC" != 1 ]; then
+  fail srv-loadctx "rc $RC, want 1" "$L"
+elif want srv-loadctx "$L" 1 "^FAIL r1 ours d=6 rc=0 \| its load record names ctx=4096, and the server arms run at -c 32768 " &&
+  want srv-loadctx "$L" 1 '^ROW r1 lcppsrv d=6 '; then
+  pass srv-loadctx
+fi
+L=$tmp/srv-noplan.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_BIN="$T/target/release/no-generate_ds41" -- lcppsrv:6
+if [ "$RC" != 2 ]; then
+  fail srv-noplan "rc $RC, want 2" "$L"
+elif want srv-noplan "$L" 1 "^depth-ds41.sh: the server arms' -c is the plan's ctx_max, which .* --plan prints, and there is no binary at " &&
+  [ ! -f "$tmp/tmp/stub-srv-argv" ]; then
+  pass srv-noplan
+fi
+
+L=$tmp/srv-xcheck.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- 6 lcppsrv:6 lcppsrvpp:6
+if [ "$RC" != 0 ]; then
+  fail srv-xcheck "rc $RC, want 0" "$L"
+elif want srv-xcheck "$L" 1 '^xcheck lcg p=6 r1 ours\(r1\)/lcppsrv: same 4 \(1000,1001,1002,1003\)$' &&
+  want srv-xcheck "$L" 1 '^xcheck lcg p=6 r1 ours\(r1\)/lcppsrvpp: same 1 \(1000\)$' &&
+  want srv-xcheck "$L" 1 '^ratio pp p=6 +ours/lcppsrv ' &&
+  want srv-xcheck "$L" 1 '^ratio pp p=6 +ours/lcppsrvpp '; then
+  pass srv-xcheck
+fi
+L=$tmp/srv-xcheck-differs.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_GEN_TOKEN0=7 -- 6 lcppsrv:6 lcppsrvpp:6
+if [ "$RC" != 1 ]; then
+  fail srv-xcheck-differs "rc $RC, want 1" "$L"
+elif want srv-xcheck-differs "$L" 1 '^FAIL xcheck lcg p=6 r1 ours\(r1\)/lcppsrv: differs at 0 of 4 \| ours 7,1001,1002,1003 \| lcppsrv 1000,1001,1002,1003$' &&
+  want srv-xcheck-differs "$L" 1 '^FAIL xcheck lcg p=6 r1 ours\(r1\)/lcppsrvpp: differs at 0 of 1 ' &&
+  want srv-xcheck-differs "$L" 3 '^ROW r1 ' &&
+  want srv-xcheck-differs "$L" 1 '^failed arms: r1 xcheck lcppsrv p=6 \(differs at 0 of 4\); r1 xcheck lcppsrvpp p=6 \(differs at 0 of 1\); $' &&
+  want srv-xcheck-differs "$L" 1 '^    dropped: lcppsrv at 6$' &&
+  want srv-xcheck-differs "$L" 1 '^    dropped: lcppsrvpp at 6$' &&
+  want srv-xcheck-differs "$L" 0 '^ratio pp p=6 +ours/lcppsrv' &&
+  want srv-xcheck-differs "$L" 1 '^xcheck: 2 server row\(s\): 0 same, 0 \[xcheck-tail\] .*, 2 FAIL '; then
+  pass srv-xcheck-differs
+fi
+L=$tmp/srv-xcheck-tail.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 STUB_SRV_TOKEN1=7 -- 6 lcppsrv:6 lcppsrvpp:6
+if [ "$RC" != 0 ]; then
+  fail srv-xcheck-tail "rc $RC, want 0" "$L"
+elif want srv-xcheck-tail "$L" 1 '^xcheck lcg p=6 r1 ours\(r1\)/lcppsrv: first id same, differs at 1 of 4 \| ours 1000,1001,1002,1003 \| lcppsrv 1000,7,1002,1003 \[xcheck-tail\]$' &&
+  want srv-xcheck-tail "$L" 1 '^xcheck lcg p=6 r1 ours\(r1\)/lcppsrvpp: same 1 \(1000\)$' &&
+  want srv-xcheck-tail "$L" 1 '^xcheck: 2 server row\(s\): 1 same, 1 \[xcheck-tail\] .*, 0 FAIL ' &&
+  want srv-xcheck-tail "$L" 1 '^ratio pp p=6 +ours/lcppsrv ' &&
+  want srv-xcheck-tail "$L" 0 '^(FAIL|    dropped:) '; then
+  pass srv-xcheck-tail
+fi
+
+L=$tmp/srv-flags.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- lcppsrv+t2:6 lcppsrvpp+nopo0+k2:4
+if [ "$RC" != 0 ]; then
+  fail srv-flags "rc $RC, want 0" "$L"
+elif want srv-flags "$L" 1 '^ROW r1 lcppsrv\+t2 d=6 n=4 ' &&
+  want srv-flags "$L" 1 '^ROW r1 lcppsrvpp\+nopo0\+k2 p=4 n=0 ' &&
+  want "srv-flags argv" "$tmp/tmp/stub-srv-argv" 1 '^-m [^ ]+ -ngl 999 --n-cpu-moe 1 -fa on -t 2 -fit off ' &&
+  want "srv-flags argv" "$tmp/tmp/stub-srv-argv" 1 '^-m [^ ]+ -ngl 999 -fa on -t 4 --op-offload --n-cpu-moe 2 -fit off '; then
+  pass srv-flags
+fi
+L=$tmp/srv-flags-bad.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- lcppsrv+x9:6
+if [ "$RC" != 64 ]; then
+  fail srv-flags-bad "rc $RC, want 64" "$L"
+elif want srv-flags-bad "$L" 1 "^depth-ds41.sh: arm 'lcppsrv\+x9:6': '\+x9' in 'lcppsrv\+x9' is none of "; then
+  pass srv-flags-bad
 fi
 
 L=$tmp/srv-cold.log
@@ -1187,6 +1294,11 @@ elif want res-default "$L" 1 "^ROW r1 ours d=6 .*\| slot 1/2 \| wall " &&
   want res-default "$L" 1 '^    residency lever residency=off why=set$' &&
   want res-default "$L" 1 '^    residency host residency=mid-p40-s1 ' &&
   want res-default "$L" 1 "^\[config\] residency: arms that set BLOOMERY_RESIDENCY: 6@$OFF; each of 6 6@$OFF 4 runs " &&
+  want res-default "$L" 1 "^residency sums ours r1 d=6 \| residency mid-p40-s1 \(place\) passes 2 kept 2 landed 0 late 0 made 2 bytes 8192 \| ROW$" &&
+  want res-default "$L" 1 "^residency sums ours r1 d=4 \| residency mid-p40-s1 \(place\) passes 2 kept 2 landed 0 late 0 made 2 bytes 8192 \| ROW$" &&
+  want res-default "$L" 1 "^residency sums ours@$OFF r1 d=6 \| residency off \(set\) passes 0 kept 0 landed 0 late 0 made 0 bytes 0 \| ROW$" &&
+  want res-default "$L" 1 "^residency mean ours d=6 mid-p40-s1: rows 1, passes/row 2\.0, kept/pass 1\.00, landed/pass 0\.000, late/pass 0\.000, made/pass 1\.000$" &&
+  want res-default "$L" 1 "^residency mean ours@$OFF d=6 off: rows 1, passes/row 0, kept/pass -, " &&
   want res-default "$L" 0 '^FAIL '; then
   pass res-default
 fi

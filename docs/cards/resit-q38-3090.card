@@ -1,0 +1,33 @@
+# The resit's Qwen3.8 public window on the RTX 3090 (W10): our arms at --place gate (depth-qwen3moe.sh now
+# passes it for qwen4exp, and refuses gate with the A6000 as the timing card), the mainline server arms at
+# the profile's 3090 line (-ncmoe 43, QWEN38_NCMOE [derived, no load run]).
+# Under --place gate the Qwen3.8 defaults are off (adaptive residency and the MTP draft are --place a's), so
+# the arms here are the plain path; the defaults' 3090 cell is a later card.
+#
+# Band [derived]: our step as c + h (1 - s), s the share of routed expert bytes on the card. All-host
+# (s = 0): 40.90 tok/s at depth 1024, 24.45 ms (rig-log 09-28#q38-release); card experts on the A6000:
+# 53.85 at depth 512, 18.57 ms (README, q38prose-pp), at s = 22 / 48 = 0.458, the A6000's line. Then h =
+# 5.88 / 0.458 = 12.84 ms and c = 11.61 ms. The 3090 holds about 5 of 48 layers' experts (s = 0.104):
+# 11.61 + 0.896 x 12.84 = 23.11 ms, 43.3 tok/s; if all of c is card work it runs at the 3090's 936 GB/s
+# against the A6000's 768: 9.53 + 11.50 = 21.03 ms, 47.5 tok/s. The low edge is the all-host floor less
+# 1.5 % for the 250 W cap (40.3). Changed from the plan report's 40.3..47: its high edge sat under the
+# bandwidth-scaled 47.5, so the band is 40.3..48.
+kind: baseline
+question: on the RTX 3090 at --place gate, what is our Qwen3.8 decode after a prose prompt of 512, beside
+  llama.cpp's warm server rows at its 3090 line?
+term: tok/s @ n=96, depth 512, ours (generate_qwen3moe --place gate on qwen4exp, the first 512 ids of
+  corpus-prose.ids, after a same-id PRIME), RTX 3090 at 250 W
+unit: tok/s
+predict: 40.3..48
+condition: one lease, two rounds, BLOOMERY_WARM_ROWS=1, BLOOMERY_GEN_PLACE=gate, the 3090 as
+  BLOOMERY_TIMING_GPU, the arms prose:512 prose:4096 lcppsrv:prose:512 lcppsrv:prose:4096; each ours row's
+  place gate and its load line's place=gate (else a FAIL row); every server n_ctx line equal to ours'
+  --ctx; every xcheck line `same`; no counted row [cold], [cpu-busy] or [other-busy]; the full output to
+  a file first. Command: BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-q38-3090.card
+  BLOOMERY_WARM_ROWS=1 BLOOMERY_GEN_PLACE=gate BLOOMERY_TIMING_GPU=<the 3090's UUID>' just
+  depth-gpu-qwen4exp <the arms above> > <log> 2>&1
+reason: sets the public Qwen3.8 3090 rows; why now: the 3090 had no Qwen3.8 arm before this tree
+decide-in: write the Qwen3.8 3090 rows (rig-log first) in the 3090's own table
+decide-below: the gate plan holds fewer card experts than 5 of 48 layers, or the cap costs more: read its
+  plan line's card experts and the witness power counters, and re-derive
+decide-above: the card share is larger than 0.104: read the plan line and correct s before the row goes out

@@ -1353,8 +1353,9 @@ depth-gpu-qwen3moe *ARMS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
 # Qwen3.6-35B-A3B(qwen35moe) 같은 표: depth-gpu-qwen3moe의 러너·팔·표를 qwen35moe 프로필로 돈다. 우리 팔은 같은
-# generate_qwen3moe가 파일 헤더에서 아키텍처를 읽어 Body35로 연다. 프리필은 8위치 패스뿐이라 pp 열은 `kind=prefill`이다
-# (ubatch 경로 없음). `prose:<P>`는 depth-gpu-qwen3moe의 prose 팔과 같다. 이 프로필의
+# generate_qwen3moe가 파일 헤더에서 아키텍처를 읽어 Body35로 연다.
+# Its prompt runs as its `--prefill` default (auto: ubatches for nine ids or more, `kind=` in the row names the path).
+# `prose:<P>`는 depth-gpu-qwen3moe의 prose 팔과 같다. 이 프로필의
 # $BLOOMERY_DATA/qwen35moe/corpus-prose.ids 앞 P개 id를 --tokens로 넣고(행 라벨 ours@prose), prose 표에서만 비교한다.
 # 참조 트리와 플래그는 tools/ref/models/qwen35moe.sh. BLOOMERY_DRY=1이면 명령줄만, 빌드 없음.
 depth-gpu-qwen35moe *ARMS:
@@ -1372,8 +1373,9 @@ depth-gpu-qwen35moe *ARMS:
 depth-gpu-qwen4exp *ARMS:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { ours=; [ -n "{{ARMS}}" ] || ours=1; for a in {{ARMS}}; do case $a in prose:*) ours=1 ;; *:*) ;; *) ours=1 ;; esac; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe; fi; } && bash tools/ref/depth-qwen3moe.sh {{ARMS}}'
 
-# GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용): 우리 `<D>`(산문 첫 D개 id를 스텝마다 먹임, pp는
-# `kind=steps`), llama.cpp PR 두 가지 `lcpp27752:<D>`·`lcpp27754:<D>`(-d D)와 `…pp[<U>]:<P>`,
+# GLM-5.3-Flash 디코드를 깊이별로, 프리필을 길이별로(A6000, 한 임대, 리드 전용):
+# ours `<D>` (the first D prose ids, run as the binary's `--prefill` default, batches; `kind=` in the row names the feed),
+# llama.cpp PR 두 가지 `lcpp27752:<D>`·`lcpp27754:<D>`(-d D)와 `…pp[<U>]:<P>`,
 # llama-server 한 요청으로 재는 `…srv:<D>`·`…mtp:<D>`(MTP 초안, 서버가 찍는 draft acceptance 줄을 행에 그대로 싣는다),
 # exllamav3 `exl3:<D>`·`exl3pp:<P>`(perf.py, EXL3 4.05 bpw — 다른 양자화라 비율 표에 넣지 않는다). GGUF 팔은 바퀴마다 순서를
 # 돌리고 exllamav3 팔은 그 뒤 한 덩어리로 돈다. 팔·플래그 근거는 tools/ref/depth-glm5next.sh와 models/glm5next.sh 머리에.

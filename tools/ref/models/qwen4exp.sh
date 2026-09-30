@@ -37,7 +37,13 @@
 #                   -ub 4096 arm's compute and output buffers [derived]. The fit arms (lcppfit,
 #                   lcppppfit) let llama-bench place to the byte; each row publishes the faster.
 #                   -t 32 is the host's cores, spelled out as deepseek41.sh does: the host layers'
-#                   experts run on them. No flag sweep has been run
+#                   experts run on them. No flag sweep has been run. With the 3090 as the timing card
+#                   (BLOOMERY_TIMING_GPU names its UUID) -ncmoe is 43 (QWEN38_NCMOE): its usable 24,176 MiB
+#                   (25.35 GB) less the same ~10 GB for the -ub 4096 buffers and ~4.9 GB of non-expert
+#                   weights leave ~10.45 GB, 5 layers at the band's top of 1.84 GB (10.45 / 1.84 = 5.7), so
+#                   48 - 5 = 43 layers keep their experts on the host [derived: the band is this comment's,
+#                   per-layer bytes not read; no 3090 load has been run]. The fit twins are the check; a
+#                   line that does not load is a FAIL row
 #   TWO_CARD_PLACEMENT  the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, tools/ref/timing-card.sh; the
 #                   default file only, empty otherwise, and depth-qwen3moe.sh then refuses the mode by name):
 #                   the "A6000+3090" table's mainline line, LCPP_GPU_FLAGS at -ncmoe 21 and -ts 42.5/6.5
@@ -79,13 +85,30 @@ MODEL=${BLOOMERY_REF_MODEL:-$QWEN38_FILE}
 : "${REF_SET_CUDA:=ref_cuda_qwen4exp}"
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 : "${LCPPBIN:=$LCPP/build/bin/llama-bench}"
+__q38_dir=${BASH_SOURCE[0]%/*}
+[ "$__q38_dir" != "${BASH_SOURCE[0]}" ] || __q38_dir=.
+# shellcheck source=tools/ref/cards.sh
+source "$__q38_dir/../cards.sh"
+unset __q38_dir
+# The 3090-vs-A6000 sizing below turns on GPU_3090; a timing card that is not the resolved A6000 with no
+# 3090 UUID is undecidable — refuse rather than size the reference for the wrong card (ref-paths.sh's
+# refusal code).
+if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ -z "${GPU_3090:-}" ] && [ "$BLOOMERY_TIMING_GPU" != "${GPU_A6000:-}" ]; then
+  echo "models/qwen4exp.sh: BLOOMERY_TIMING_GPU=$BLOOMERY_TIMING_GPU, and tools/ref/cards.sh resolved no 3090 UUID (${CARDS_ERROR:-no reason given}): whether the timing card is the 3090 sizes QWEN38_NCMOE (43 vs 26)" >&2
+  exit 64
+fi
+if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ "$BLOOMERY_TIMING_GPU" = "${GPU_3090:-}" ]; then
+  : "${QWEN38_NCMOE:=43}"
+else
+  : "${QWEN38_NCMOE:=26}"
+fi
 TWO_CARD_PLACEMENT=
 if [ "${BLOOMERY_TIMING_CARDS:-}" = a6000+3090 ] && [ "$MODEL" = "$QWEN38_FILE" ]; then
   : "${QWEN38_TS:=42.5/6.5}"
   : "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe 21 -t 32 -ts $QWEN38_TS}"
   TWO_CARD_PLACEMENT="lcpp -ncmoe 21 -ts $QWEN38_TS: the A6000 (device 0) layers 0-42, 21-42 with their experts; the 3090 (device 1) layers 43-47 with their experts and the output [derived, models/qwen4exp.sh]"
 fi
-: "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe 26 -t 32}"
+: "${LCPP_GPU_FLAGS:=-ngl 99 -fa on -lzm off -ncmoe $QWEN38_NCMOE -t 32}"
 # "The capital of France is" under this model's tokenizer: what `$IK/build/bin/llama-tokenize
 # -m $MODEL -p "The capital of France is" --ids --log-disable --no-parse-special` prints (it loads
 # the vocabulary only). Five ids and no BOS: the file sets tokenizer.ggml.add_bos_token to false.

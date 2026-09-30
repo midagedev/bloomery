@@ -1,0 +1,27 @@
+# The resit's GLM public window on the RTX 3090 (W7): W6's arms with our --place gate and the 3090 as the
+# timing card (the profile's GLM_NCMOE is 42 there [derived, no load run], models/glm5next.sh).
+#
+# Band [derived]: glm-public.card's 3090 gate step feed of 1,024 steps, 53.7 ms a step, is 18.6 tok/s;
+# decode after 512 reads the same step at a shallower cache: 18..20 (50.0..55.6 ms).
+kind: baseline
+question: on the RTX 3090 at --place gate, what is our GLM-5.3 decode after a prose prompt of 512,
+  beside llama.cpp's warm server rows at its 3090 line?
+term: tok/s @ n=96, depth 512, ours (generate_glm5next --place gate, 512 prose ids from GLM_PROSE_FROM,
+  --ctx 4352), RTX 3090 at 250 W
+unit: tok/s
+predict: 18..20
+condition: one lease, two rounds, BLOOMERY_GEN_CTX=4352, BLOOMERY_GEN_PLACE=gate, the 3090 as
+  BLOOMERY_TIMING_GPU, the arms 512 4096 lcpp27752srv:512 lcpp27752srv:4096 (SG's pick); each ours row's
+  SMOKE place gate and load record ctx 4352; every server n_ctx line 4352 (a load that cannot hold it is a
+  FAIL row naming the allocation); every xcheck line `same`; no counted row [cold], [cpu-busy] or
+  [other-busy]; the full output to a file first. Command: BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resit-glm-3090.card BLOOMERY_GEN_CTX=4352
+  BLOOMERY_GEN_PLACE=gate BLOOMERY_TIMING_GPU=<the 3090's UUID>' just depth-gpu-glm5next <the arms
+  above> > <log> 2>&1
+reason: sets the public GLM 3090 rows; why now: the release table has no GLM 3090 row and its reference
+  line has never been loaded
+decide-in: write the GLM 3090 rows (rig-log first) in the 3090's own table
+decide-below: the gate plan's host share runs slower at 250 W than the step feed priced: read the witness
+  card's power-cap counters, and re-derive before the row goes out
+decide-above: the step feed's 53.7 ms carried a prompt term the decode does not: re-base glm-public's
+  3090 number on this row

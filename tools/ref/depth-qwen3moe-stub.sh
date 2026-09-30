@@ -42,6 +42,28 @@
 #   warmup-bad   BLOOMERY_AB_WARMUP=2 is refused by name (rc 64).
 #   blocks-dry   the blocks run's arms under BLOOMERY_DRY=1: the block plan, the ik discard's command line
 #                at --n-cpu-moe 2, each block's rotation, and no plain round lines.
+# The server arms on the prose ids, the placement, MTP's acceptance and the cross-check (red on the runner
+# before them: arm usage or refusal, rc 64; no place, E(4) or xcheck line):
+#   srv-prose    prose:512 lcppsrv:prose:512, one round: the server row `lcppsrv@prose` fed the corpus's
+#                first 512 ids (twice: the warm-up and the timed request), its -c ours' 768, its ratio in the
+#                prose table and not in the lcg one, its decode row's prompt rate in the prose prefill table,
+#                `xcheck prose p=512 r1 ours@prose(r1)/lcppsrv@prose: same 4`, and `cpu-busy rows: 0 of 2`.
+#   srv-xcheck   the same with ours' token 0 another id (STUB_GEN_TOKEN0=7): the FAIL xcheck line, in the
+#                failed arms, the server label dropped from the ratios, rc 1; the server's second id another
+#                (STUB_SRV_TOKEN1=7): a [xcheck-tail] line, the ratio kept, rc 0.
+#   place-gate   BLOOMERY_GEN_PLACE=gate with the 3090 as the timing card, 6: `--place gate` on the stub's
+#                command line, the row's `place gate`; the load line naming place=a (STUB_GEN_PLACE_RAN): a
+#                FAIL row naming both, rc 1; gate with the A6000 as the timing card: refused by name, rc 64.
+#   mtp          STUB_GEN_MTP=1, 6: the row's `mtp E(4) 2.500 = positions 10 / passes 4, kept [1, 1, 1, 1]`.
+#   res-sums     generate_qwen3moe's schema with the residency kinds (the stub tree's copy, its own residency
+#                rows replaced by generate_ds41's), STUB_GEN_RES=mid-p148-s1, 6@BLOOMERY_RESIDENCY=mid-p148-s1: the row's
+#                `residency mid-p148-s1 (set) passes 3 kept 30 landed 3 late 1 made 3 bytes 12288` (the none and
+#                prompt boundaries not counted) and the per-arm mean line; STUB_GEN_STATS=1 adds `host slots/token
+#                3.4`. Under a copy with no residency kind the same arm is a FAIL row naming the schema, rc 1.
+#   cpu-guard    STUB_CPU_BUSY=1 (every CPU sample 99 %), 6 lcpp:6: both rows [cpu-busy], `cpu-busy rows: 2 of 2`.
+#   profile-3090 the real models/qwen4exp.sh: -ncmoe 43 with the 3090 as the timing card, 26 with the A6000 or
+#                none; another card with no 3090 UUID resolved: refused by name, rc 64.
+#                DEPTH_QWEN3MOE_PROFILE names another copy of the profile (FAIL-first).
 # The failures, red on the runner before FAIL rows (it stopped at the first failed arm, rc 1):
 #   ref-fail     6 lcpp:6 lcpppp:4 lcppfit:6 ik:6 mrs:6 mrspp:4, two rounds; in round 1 lcpppp:4 aborts (rc
 #                134), lcppfit:6's fit never runs and mrs:6 prints no row: three FAIL rows naming why, the
@@ -95,13 +117,22 @@ tmp=${TMPDIR:-/tmp}
 tmp=$(mktemp -d "${tmp%/}/depth-qwen3moe-stub.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 T=$tmp/tree
-mkdir -p "$T/tools/ref" "$T/target/release" "$T/base/target/release" "$T/bin" "$tmp/tmp"
+mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/base/target/release" "$T/bin" "$tmp/tmp"
 cp "$RUNNER" "$T/tools/ref/depth-qwen3moe.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/load-groups.sh" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
+# records.py and the checked-in schemas: the runner reads the arm's residency, mtp and stat records by kind.
+cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
+# The lever registry, which an arm's @NAME=VALUE list is checked against (before the stub binaries are
+# written, so they are newer than every crates/ source).
+mkdir -p "$T/crates/levers/src"
+cp "$ROOT/crates/levers/src/registry.rs" "$T/crates/levers/src/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
+# STUB_CPU_BUSY=1: every CPU sample reads 99 % of one cpu from a stub process (the cpu-guard case).
+# shellcheck disable=SC2016 # written into the stub tree's lease.sh, expanded there
+echo '[ -z "${STUB_CPU_BUSY:-}" ] || cpu_busy_sample() { CPU_BUSY_READING="99.0 stubproc 99.0;" CPU_BUSY_OWN= CPU_BUSY_ERR= CPU_BUSY_SPAN=1; }' >> "$T/tools/ref/lease.sh"
 # The stub's lease writes no record; it says it would write a two-card one (the precheck asks), and
 # STUB_ONE_CARD_LEASE=1 takes that back: a lease.sh without the two-card record.
 # shellcheck disable=SC2016 # the line is written for the copy to expand
@@ -248,22 +279,28 @@ touch "$T/Cargo.toml"
 # --arm list prints each arm's `arm` line, waits for a line on stdin under --arm-sync, then its prompt ids.
 # Each arm: the step-0, time prompt (P x 10 tok/s, kind=gemm) and step lines, and a SMOKE footer at 5 ms
 # a step. Every process appends its arm list to $TMPDIR/stub-gen-loads. An arm of depth
-# STUB_GEN_FAIL_DEPTH ends the process at rc 3 the first time (a marker file), after its prompt ids.
+# STUB_GEN_FAIL_DEPTH ends the process at rc 3 the first time (a marker file), after its prompt ids. Its
+# load line names --place's placement (a when none; STUB_GEN_PLACE_RAN in its stead), each arm ends with
+# its `tokens` line (token 0 STUB_GEN_TOKEN0, 1000 by default, then the step lines' ids), and under
+# STUB_GEN_MTP an `mtp summary` of 10 positions in 4 passes. Every process appends its --place to
+# $TMPDIR/stub-gen-place (`-` when none).
 cat > "$T/target/release/generate_qwen3moe" << 'EOF'
 #!/usr/bin/env bash
-tokens='' n=32 ctx=0 sync='' arms=()
+tokens='' n=32 ctx=0 sync='' arms=() place=''
 while [ $# -gt 0 ]; do
   case $1 in
     --tokens) tokens=$2; shift ;; -n) n=$2; shift ;; --ctx) ctx=$2; shift ;; --warm) shift ;;
-    --arm) arms+=("$2"); shift ;; --arm-sync) sync=1 ;;
+    --arm) arms+=("$2"); shift ;; --arm-sync) sync=1 ;; --place) place=$2; shift ;;
   esac
   shift
 done
+echo "${place:--}" >> "${TMPDIR:-/tmp}/stub-gen-place"
 count() { echo "$1" | tr ',' '\n' | grep -c .; }
 listed=1
 if [ ${#arms[@]} -eq 0 ]; then listed='' arms=("$tokens"); echo "prompt_ids [$tokens]"; fi
 echo "$(for a in "${arms[@]}"; do printf '%s ' "$(count "$a")"; done)" >> "${TMPDIR:-/tmp}/stub-gen-loads"
-echo "load arch=stub ctx=$ctx (stub)"
+[ -z "${STUB_GEN_RES:-}" ] || echo "residency lever residency=$STUB_GEN_RES why=set"
+echo "load arch=stub ctx=$ctx place=${STUB_GEN_PLACE_RAN:-${place:-a}} (stub)"
 echo "capture graph_nodes=10"
 for k in "${!arms[@]}"; do
   depth=$(count "${arms[$k]}")
@@ -289,6 +326,15 @@ for k in "${!arms[@]}"; do
   echo "time prompt n=$depth ms=100.0000 tok/s=$((depth * 10)).00 passes=1 kind=gemm"
   echo "stat prompt ubatch_tokens=0 (no ubatch ran)"
   for i in $(seq 1 $((n - 1))); do echo "step $i $((depth + i)) $((1000 + i))"; echo "time step $i ms=5.0000"; done
+  echo "tokens [$(for i in $(seq 0 $((n - 1))); do [ "$i" = 0 ] && printf '%s' "${STUB_GEN_TOKEN0:-1000}" || printf ', %s' $((1000 + i)); done)]"
+  [ -z "${STUB_GEN_MTP:-}" ] || echo "mtp summary proposals=3 kept=[1, 1, 1, 1] positions=10 passes=4 tok/s(positions)=200.00"
+  [ -z "${STUB_GEN_STATS:-}" ] || echo "stat summary steps=$((n - 1)) leg_us_mean=1.0 leg_us_p50=1.0 straggle_us_max=1.0 host_slots_mean=3.4 majflt=0 minflt=0 vram_free_load=1 vram_free_min=1"
+  if [ -n "${STUB_GEN_RES:-}" ]; then
+    rp() { echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=$5 made=$6 in_flight=0 bytes=$7 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
+    rp none 0 0 0 0 1 4096
+    rp prompt 1 99 1 0 1 4096
+    for i in $(seq 1 $((n - 1))); do rp step $((i + 1)) 10 1 $((i == 1 ? 1 : 0)) 1 4096; done
+  fi
   echo "SMOKE mode=graph prompt_tokens=$depth depth=$depth seeded=false generated=$n warm=0 steps=$((n - 1)) p50_ms=5.0000 mean_ms=5.0000 tok/s(p50)=200.00 ctx=$ctx"
 done
 EOF
@@ -315,8 +361,8 @@ stub_run() {
   rm -f "$tmp/tmp/stub-xid"
   echo 0 > "$tmp/tmp/stub-majflt"
   (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_DECODE_N=4 BLOOMERY_ARM_BOUND=60 \
-    STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 STUB_MAJFLT="$tmp/tmp/stub-majflt" "${e[@]}" \
-    bash tools/ref/depth-qwen3moe.sh "$@") > "$log" 2>&1
+    STUB_BENCH_CARDS="$T/bin/stub-bench-cards" TIMING_CARDS_POLL=1 STUB_MAJFLT="$tmp/tmp/stub-majflt" \
+    BLOOMERY_CPU_BUSY_COMMS=none "${e[@]}" bash tools/ref/depth-qwen3moe.sh "$@") > "$log" 2>&1
   RC=$?
 }
 # srv_left: the stub servers of the last run still up (pids from their own file), none when all stopped.
@@ -775,7 +821,7 @@ L=$tmp/srv-exit.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_SRV_EXIT=1 -- lcppsrv:6
 if [ "$RC" != 1 ]; then
   fail srv-exit "rc $RC, want 1" "$L"
-elif want srv-exit "$L" 1 '^FAIL r1 lcppsrv d=6 rc=5 \| llama-server exited 5 before it answered /health' &&
+elif want srv-exit "$L" 1 "^FAIL r1 lcppsrv d=6 rc=5 \| -c 256 \(ours' --ctx at that D or P: D \+ N rounded up to 256\): llama-server exited 5 before it answered /health" &&
   want srv-exit "$L" 0 '^ROW '; then
   pass srv-exit
 fi
@@ -788,6 +834,140 @@ elif want srv-cold "$L" 1 '^COLD r1 lcppsrv d=6 .*\| wall [0-9]+s \| majflt 1000
   want srv-cold "$L" 1 '^ROW r1 lcppsrv d=6 .* continuation same \(the retry\) .*\(timed 0; ' &&
   want srv-cold "$L" 1 '^warm rows: 1 COLD row\(s\) ran once more: 1 clean on the retry, 0 FAIL rc=cold$'; then
   pass srv-cold
+fi
+
+mkdir -p "$T/data/qwen4exp"
+seq 100 800 > "$T/data/qwen4exp/corpus-prose.ids"
+prose512=$(seq 100 611 | paste -sd, -)
+L=$tmp/srv-prose.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DATA="$T/data" -- prose:512 lcppsrv:prose:512
+if [ "$RC" != 0 ]; then
+  fail srv-prose "rc $RC, want 0" "$L"
+elif [ -n "$(srv_left)" ]; then
+  fail srv-prose "servers still up: $(srv_left)" "$L"
+elif want srv-prose "$L" 1 '^ROW r1 lcppsrv@prose d=512 n=4 \| tok/s 20.00 @ n=4, depth 512, A6000 \(stub\) \| llama-server ids=prose: ' &&
+  want srv-prose "$L" 1 '^ratio prose d=512 +ours@prose/lcppsrv@prose ' &&
+  want srv-prose "$L" 0 '^ratio d=512 ' &&
+  want srv-prose "$L" 1 '^ratio pp prose p=512 +ours@prose/lcppsrv@prose ' &&
+  want srv-prose "$L" 1 '^xcheck prose p=512 r1 ours@prose\(r1\)/lcppsrv@prose: same 4 \(1000,1001,1002,1003\)$' &&
+  want srv-prose "$L" 1 '^cpu-busy rows: 0 of 2 ' &&
+  want "srv-prose ids" "$tmp/tmp/stub-srv-reqs" 2 "^[12] 512 4 $prose512$" &&
+  want "srv-prose argv" "$tmp/tmp/stub-srv-argv" 1 ' -c 768 --host 127\.0\.0\.1 --port 0$'; then
+  pass srv-prose
+fi
+L=$tmp/srv-xcheck.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DATA="$T/data" STUB_GEN_TOKEN0=7 -- prose:512 lcppsrv:prose:512
+if [ "$RC" != 1 ]; then
+  fail srv-xcheck "rc $RC, want 1" "$L"
+elif want srv-xcheck "$L" 1 '^FAIL xcheck prose p=512 r1 ours@prose\(r1\)/lcppsrv@prose: differs at 0 of 4 \| ours@prose 7,1001,1002,1003 \| lcppsrv@prose 1000,1001,1002,1003$' &&
+  want srv-xcheck "$L" 1 '^failed arms: r1 xcheck lcppsrv@prose p=512 \(differs at 0 of 4\); $' &&
+  want srv-xcheck "$L" 1 '^    dropped: lcppsrv@prose at 512$' &&
+  want srv-xcheck "$L" 0 '^ratio prose d=512 +ours@prose/lcppsrv@prose '; then
+  L=$tmp/srv-xcheck-tail.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DATA="$T/data" STUB_SRV_TOKEN1=7 -- prose:512 lcppsrv:prose:512
+  if [ "$RC" != 0 ]; then
+    fail srv-xcheck "tail: rc $RC, want 0" "$L"
+  elif want srv-xcheck "$L" 1 '^xcheck prose p=512 r1 ours@prose\(r1\)/lcppsrv@prose: first id same, differs at 1 of 4 \| ours@prose 1000,1001,1002,1003 \| lcppsrv@prose 1000,7,1002,1003 \[xcheck-tail\]$' &&
+    want srv-xcheck "$L" 1 '^xcheck: 1 server row\(s\): 0 same, 1 \[xcheck-tail\] ' &&
+    want srv-xcheck "$L" 1 '^ratio prose d=512 +ours@prose/lcppsrv@prose '; then
+    pass srv-xcheck
+  fi
+fi
+
+L=$tmp/place-gate.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PLACE=gate BLOOMERY_TIMING_GPU="$STUB_GPU_3090" -- 6
+if [ "$RC" != 0 ]; then
+  fail place-gate "rc $RC, want 0" "$L"
+elif want place-gate "$L" 1 '^ROW r1 ours d=6 n=4 ctx=256 \| tok/s\(mean\) 200.00 @ n=4, depth 6, [^|]* \| place gate \| ' &&
+  want "place-gate argv" "$tmp/tmp/stub-gen-place" 1 '^gate$'; then
+  pass place-gate
+fi
+L=$tmp/place-ran.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PLACE=gate BLOOMERY_TIMING_GPU="$STUB_GPU_3090" STUB_GEN_PLACE_RAN=a -- 6
+if [ "$RC" != 1 ]; then
+  fail place-ran "rc $RC, want 1" "$L"
+elif want place-ran "$L" 1 '^FAIL r1 ours d=6 rc=0 \| its load line names place=a; the runner passed --place gate'; then
+  pass place-ran
+fi
+L=$tmp/place-card.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PLACE=gate BLOOMERY_TIMING_GPU="$STUB_GPU_A6000" -- 6
+if [ "$RC" != 64 ]; then
+  fail place-card "rc $RC, want 64" "$L"
+elif want place-card "$L" 1 '^depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=gate loads on the 3090, and the timing card is '; then
+  pass place-card
+fi
+
+# Two copies of generate_qwen3moe's schema: without the residency kinds, and with generate_ds41's rows of
+# them, so the case reads the same whether or not this tree's schema declares them.
+QS=$T/tools/bloomery/schema/generate_qwen3moe.jsonl
+cp "$QS" "$tmp/qschema.keep"
+qschema() { # qschema <file> <with 0|1>: the kept schema less its residency rows, plus generate_ds41's when 1
+  python3 - "$tmp/qschema.keep" "$T/tools/bloomery/schema/generate_ds41.jsonl" "$2" > "$1" << 'PY'
+import json, sys
+keep, ds41, add = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+res = ("residency_lever", "residency_host", "residency_pass", "residency_reset")
+lines = open(keep).read().splitlines()
+head, rows = json.loads(lines[0]), [l for l in lines[1:] if json.loads(l).get("kind") not in res]
+if add:
+    rows += [l for l in open(ds41).read().splitlines()[1:] if json.loads(l).get("kind") in res]
+head["kinds"] = len(rows)
+print(json.dumps(head, separators=(",", ":")))
+print("\n".join(rows))
+PY
+}
+qschema "$QS" 0
+L=$tmp/res-noschema.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_RES=mid-p148-s1 -- 6@BLOOMERY_RESIDENCY=mid-p148-s1
+RC1=$RC
+qschema "$QS" 1
+L2=$tmp/res-sums.log
+stub_run "$L2" BLOOMERY_AB_ROUNDS=1 STUB_GEN_RES=mid-p148-s1 STUB_GEN_STATS=1 -- 6@BLOOMERY_RESIDENCY=mid-p148-s1
+cp "$tmp/qschema.keep" "$QS"
+if [ "$RC1" != 1 ]; then
+  fail res-sums "a schema with no residency kind: rc $RC1, want 1" "$L"
+elif [ "$RC" != 0 ]; then
+  fail res-sums "rc $RC, want 0" "$L2"
+elif want res-sums "$L" 1 "^FAIL r1 ours@[^ ]* d=6 rc=0 \| the arm runs BLOOMERY_RESIDENCY=mid-p148-s1, and generate_qwen3moe's checked-in schema \(tools/bloomery/schema/generate_qwen3moe.jsonl\) declares no residency record, " &&
+  want res-sums "$L2" 1 '^ROW r1 ours@[^ ]* d=6 .* \| host slots/token 3\.4 \| residency mid-p148-s1 \(set\) passes 3 kept 30 landed 3 late 1 made 3 bytes 12288 \| ' &&
+  want res-sums "$L2" 1 '^residency mean ours@[^ ]* d=6 mid-p148-s1: rows 1, passes/row 3\.0, kept/pass 10\.00, landed/pass 1\.000, late/pass 0\.333, made/pass 1\.000$'; then
+  pass res-sums
+fi
+
+L=$tmp/cpu-guard.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_CPU_BUSY=1 -- 6 lcpp:6
+if [ "$RC" != 0 ]; then
+  fail cpu-guard "rc $RC, want 0" "$L"
+elif want cpu-guard "$L" 1 '^ROW r1 ours d=6 .*\[cpu-busy\]' &&
+  want cpu-guard "$L" 1 '^ROW r1 lcpp d=6 .*\[cpu-busy\]' &&
+  want cpu-guard "$L" 1 '^cpu-busy rows: 2 of 2 '; then
+  pass cpu-guard
+fi
+
+# The real qwen4exp profile's 3090 line: -ncmoe 43 when the timing card is the 3090, 26 otherwise, and a
+# timing card that is not the A6000 with no 3090 UUID resolved refused by name.
+mkdir -p "$T/tools/ref/models-real"
+cp "${DEPTH_QWEN3MOE_PROFILE:-$ROOT/tools/ref/models/qwen4exp.sh}" "$T/tools/ref/models-real/qwen4exp.sh"
+# shellcheck disable=SC2016 # the profile's names expand in the child shell
+prof() { (cd "$T" && env -i PATH="$PATH" BLOOMERY_TIMING_GPU="$1" bash -c 'source tools/ref/models-real/qwen4exp.sh && echo "flags=$LCPP_GPU_FLAGS"' 2>&1); }
+p_a=$(prof "$STUB_GPU_A6000") p_3=$(prof "$STUB_GPU_3090") p_0=$(prof '')
+cp "$T/tools/ref/cards.sh" "$tmp/cards.sh.keep"
+echo "GPU_A6000=$STUB_GPU_A6000" > "$T/tools/ref/cards.sh"
+p_x=$(prof GPU-99999999)
+rc_x=$?
+cp "$tmp/cards.sh.keep" "$T/tools/ref/cards.sh"
+case "$p_a|$p_3|$p_0" in
+  *'-ncmoe 26 '*'|'*'-ncmoe 43 '*'|'*'-ncmoe 26 '*)
+    if [ "$rc_x" = 64 ] && [[ $p_x == *'sizes QWEN38_NCMOE (43 vs 26)'* ]]; then pass profile-3090; else fail profile-3090 "no 3090 UUID: rc $rc_x, $p_x"; fi
+    ;;
+  *) fail profile-3090 "A6000: $p_a; 3090: $p_3; unset: $p_0" ;;
+esac
+
+L=$tmp/mtp.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_MTP=1 -- 6
+if [ "$RC" != 0 ]; then
+  fail mtp "rc $RC, want 0" "$L"
+elif want mtp "$L" 1 '^ROW r1 ours d=6 .* \| mtp E\(4\) 2\.500 = positions 10 / passes 4, kept \[1, 1, 1, 1\] \| '; then
+  pass mtp
 fi
 
 L=$tmp/warm.log
@@ -818,7 +998,7 @@ if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
     "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
-    "$tmp"/srv*.log "$tmp"/warm.log; do
+    "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp.log "$tmp"/cpu-guard.log "$tmp"/warm.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done
