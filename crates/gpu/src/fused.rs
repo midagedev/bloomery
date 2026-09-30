@@ -153,7 +153,10 @@ mod fused_kernels {
         // The first RMS_WARPS warps only: the condition is warp-uniform, so
         // the butterfly sees a full warp.
         if tid < RMS_THREADS {
-            let part = warp::reduce_sum_f32(rms_partial_sq(x, base, k, tid));
+            // SAFETY: base + k = (t + 1)·k <= m·k <= x.len() (the `t < m`
+            // guard and the launcher-checked `requires`); tid < RMS_THREADS
+            // by the branch.
+            let part = warp::reduce_sum_f32(unsafe { rms_partial_sq(x, base, k, tid) });
             if lane == 0 {
                 // SAFETY: warp_of < RMS_WARPS here; one lane per warp writes
                 // its slot.
@@ -314,7 +317,10 @@ mod fused_kernels {
         // the only way to reach it without a reference to a `static mut`.
         // Every access is below RMS_WARPS and ordered by `sync_threads`.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
-        let part = warp::reduce_sum_f32(rms_partial_sq(kv_a, 0, k, tid));
+        // SAFETY: 0 + latent <= latent + rope <= kv_a.len() (the
+        // launcher-checked `requires`); tid < RMS_THREADS, the contract's
+        // exact block width.
+        let part = warp::reduce_sum_f32(unsafe { rms_partial_sq(kv_a, 0, k, tid) });
         if lane == 0 {
             // SAFETY: tid / 32 < RMS_WARPS; one lane per warp writes its slot.
             unsafe {
