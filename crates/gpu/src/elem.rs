@@ -209,9 +209,17 @@ fn position_word(v: usize) -> u32 {
 /// the lot — and the rest one stride at a time. Only the loads move; the
 /// fold is the same squares in the same order.
 ///
-/// Caller contract: `base + k <= x.len()`, `tid < RMS_THREADS`.
+/// # Safety
+///
+/// `base + k <= x.len()`: every load is `x[base + it]` with `it < k`, read
+/// unchecked. `tid < RMS_THREADS` keeps `it + (RMS_BATCH − 1)·RMS_THREADS`,
+/// the batch loop's condition, from overflowing. A kernel caller discharges
+/// both from its launch facts (`crate::view`'s module doc): the `requires`
+/// clause bounding `x`, a `base` that is 0 or a row its block-uniform row
+/// guard has bounded, and a block of `RMS_THREADS` threads (or a `tid <
+/// RMS_THREADS` branch).
 #[inline(always)]
-pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
+pub unsafe fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
     let mut acc = 0.0f32;
     let mut it = tid;
     while it + (RMS_BATCH - 1) * RMS_THREADS < k {
@@ -219,8 +227,8 @@ pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
         macro_rules! load {
             ($j:literal) => {
                 // SAFETY: it + j·RMS_THREADS <= it + (RMS_BATCH − 1)·RMS_THREADS
-                // < k (the loop condition), and base + k <= x.len() by the
-                // caller contract.
+                // < k (the loop condition), and base + k <= x.len() by this
+                // fn's `# Safety`.
                 unsafe { *x.get_unchecked(base + it + $j * RMS_THREADS) }
             };
         }
@@ -251,7 +259,7 @@ pub fn rms_partial_sq(x: &[f32], base: usize, k: usize, tid: usize) -> f32 {
         it += RMS_BATCH * RMS_THREADS;
     }
     while it < k {
-        // SAFETY: it < k and base + k <= x.len() by the caller contract.
+        // SAFETY: it < k and base + k <= x.len() by this fn's `# Safety`.
         let v = unsafe { *x.get_unchecked(base + it) };
         acc += v * v;
         it += RMS_THREADS;
@@ -485,7 +493,7 @@ mod elem_kernels {
     /// contract's `requires` clauses before enqueueing, the shape values are
     /// this kernel's own inputs (one value per grid), and the block is the
     /// contract's 1-D `(RMS_THREADS, 1, 1)`. The same entry facts discharge
-    /// `rms_partial_sq`'s `base + k <= x.len()` caller contract. The
+    /// `rms_partial_sq`'s `# Safety` (`base + k <= x.len()`). The
     /// warp-slot reduce keeps its raw shared reach: no per-thread type can
     /// prove every slot was written before the barrier that publishes it (a
     /// warp that diverges around the write leaves its slot uninitialized,
@@ -517,7 +525,10 @@ mod elem_kernels {
         // the only way to reach it without a reference to a `static mut`.
         // Every access is below RMS_WARPS and ordered by `sync_threads`.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
-        let part = warp::reduce_sum_f32(rms_partial_sq(x, base, k, tid));
+        // SAFETY: base + k = (t + 1)·k <= m·k <= x.len() (the `t < m` guard
+        // and the launcher-checked `requires`); tid < RMS_THREADS, the
+        // contract's exact block width.
+        let part = warp::reduce_sum_f32(unsafe { rms_partial_sq(x, base, k, tid) });
         if warp::lane_id() == 0 {
             // SAFETY: tid / 32 < RMS_WARPS; one lane per warp writes its slot.
             unsafe {

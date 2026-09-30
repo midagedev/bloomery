@@ -164,7 +164,10 @@ mod rope_kernels {
         // the only way to reach it without a reference to a `static mut`.
         // Every access is below RMS_WARPS and ordered by `sync_threads`.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
-        let part = warp::reduce_sum_f32(rms_partial_sq(kv, base, k, tid));
+        // SAFETY: base + k = (t + 1)·width <= m·width <= kv.len() (the `t <
+        // m` guard and the launcher-checked `requires`); tid < RMS_THREADS,
+        // the contract's exact block width.
+        let part = warp::reduce_sum_f32(unsafe { rms_partial_sq(kv, base, k, tid) });
         if warp::lane_id() == 0 {
             // SAFETY: tid / 32 < RMS_WARPS; one lane per warp writes its slot.
             unsafe {
