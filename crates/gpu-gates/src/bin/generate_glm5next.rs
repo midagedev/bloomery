@@ -75,6 +75,18 @@
 //! as are `--pair`, `--logits` and the route trace beside the draft. Unset or
 //! `off`, the load, the plan and every step are the plain run's.
 //!
+//! `BLOOMERY_RESIDENCY` runs adaptive expert residency (`host::swap`) over
+//! the card's routed stacks: unset or `off`, the load's slot map for the
+//! model's life; set, the word prints as a `residency lever` record before
+//! the load, and `mid-p<P>-s<S>` opens the load under it
+//! (`app::arch::glm5next::open_resident`): after the `plan` line, the
+//! `residency host` record of the churn pool the host set also holds, the
+//! word refused by name when the plan's fewest card experts a layer leave
+//! no room for P pinned, S spares and one that moves; after the run's
+//! lines, the `residency pass` record of every boundary (the prompt call's,
+//! then each step's), none between two timed steps. Refused by name beside
+//! the MTP draft, `--pair`, the route trace and `--prefill steps`.
+//!
 //! `BLOOMERY_ROUTE_TRACE=<dir>` writes the engine's route trace of the run
 //! into `dir`, a new directory made before the load
 //! (`crates/gpu/src/host/route_trace.rs`): every position's routed ids per
@@ -102,16 +114,19 @@ mod cli {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
-    use app::arch::glm5next::{GlmCfg, open_nextn};
+    use app::arch::glm5next::{GlmCfg, open_nextn, open_resident};
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
+    use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::record::{self, Record};
+    use bloomery_gpu_gates::residency38::{Lever38, residency38};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, R8, ROUTE_TRACE,
+        CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, R8, RESIDENCY, ROUTE_TRACE,
+        ResidencyPick, ResidencyWhy,
     };
     use gguf::Split;
     use model::arch::glm5next::place::PlanInputs;
@@ -127,6 +142,7 @@ mod cli {
         R8,
         ROUTE_TRACE,
         DRAFT,
+        RESIDENCY,
     ];
 
     /// The drafted window's verify: the target's next token and the draft's
@@ -177,6 +193,8 @@ mod cli {
         ctx: usize,
         stop_at_plan: bool,
         t: Instant,
+        /// `BLOOMERY_RESIDENCY` set to `mid-…`: its parse and its word.
+        residency: Option<(Residency, &'static str)>,
     }
 
     impl OpenLog<Body> for Log {
@@ -189,6 +207,11 @@ mod cli {
         ) -> Result<bool, SessionError> {
             record::plan(place, machine, plan).print();
             self.top_k = inputs.hp.indexer.top_k;
+            if let Some((r, word)) = self.residency {
+                residency_room(plan, r, word).map_err(SessionError::Caller)?;
+                residency38(plan, Lever38::Set(r, word), Record::print)
+                    .map_err(SessionError::Caller)?;
+            }
             Ok(!self.stop_at_plan)
         }
 
@@ -314,6 +337,7 @@ mod cli {
             Some(p) => PrefillMode::from_name(&p)
                 .ok_or_else(|| format!("--prefill is batch or steps, not {p}"))?,
         };
+        let residency = residency_of(&levers, drafted, pair, prefill)?;
         if has("--model") {
             return Err(
                 "--model is not a flag: the file is $BLOOMERY_REF_MODEL, which \
@@ -367,6 +391,7 @@ mod cli {
             ctx,
             stop_at_plan: has("--plan"),
             t,
+            residency,
         };
         let args = OpenArgs {
             place,
@@ -377,6 +402,11 @@ mod cli {
         };
         let mut s = if drafted {
             let Some(s) = open_nextn(file, args, &mut log)? else {
+                return Ok(());
+            };
+            s
+        } else if let Some((r, _)) = residency {
+            let Some(s) = open_resident(file, args, r, &mut log)? else {
                 return Ok(());
             };
             s
@@ -392,6 +422,13 @@ mod cli {
                 .2
                 .hybrid_mut()
                 .attach_route_trace(t)?;
+        }
+        if residency.is_some() {
+            // The prompt call's boundary, then one a generated step.
+            s.model_mut()
+                .body_parts("generate_glm5next")?
+                .2
+                .log_residency(n_gen + 1);
         }
         let passes = match prefill {
             PrefillMode::Batch => bloomery_gpu_glm5next::batches_of(s.model(), ids.len())?.len(),
@@ -517,6 +554,14 @@ mod cli {
                 .f("mean_ms", mean)
                 .f("tok/s(p50)", 1e3 / p50)
                 .print();
+        }
+        for (kind, r) in s
+            .model_mut()
+            .body_parts("generate_glm5next")?
+            .2
+            .take_residency_passes()
+        {
+            record::residency_pass_of(kind, &r).print();
         }
         if let Some(t) = s
             .model_mut()
@@ -764,6 +809,74 @@ mod cli {
             }
         }
         Ok(out)
+    }
+
+    /// `BLOOMERY_RESIDENCY` as this run takes it: unset or `off`, `None` (the
+    /// plain load); set to `mid-…`, its parse and word, its `residency lever`
+    /// record printed. Refused by name beside the MTP draft (the NextN load
+    /// runs no residency machine), `--pair` (its verifies run after a cut
+    /// back to the prompt's end), the route trace (a fixed placement's
+    /// routing) and the steps feed (each prompt id would end a pass the rule
+    /// counts; the body refuses it at the feed, this before the load).
+    fn residency_of(
+        levers: &bloomery_levers::Levers,
+        drafted: bool,
+        pair: bool,
+        prefill: PrefillMode,
+    ) -> Result<Option<(Residency, &'static str)>, GateError> {
+        let Some(word) = levers.residency() else {
+            return Ok(None);
+        };
+        let r = Residency::parse(word)?;
+        record::residency_lever(ResidencyPick {
+            word,
+            why: ResidencyWhy::Set,
+        })
+        .print();
+        if r == Residency::Off {
+            return Ok(None);
+        }
+        let beside = if drafted {
+            Some("BLOOMERY_DRAFT=mtp (the NextN load runs no residency machine)")
+        } else if pair {
+            Some("--pair (its verifies run after a cut back to the prompt's end)")
+        } else if levers.route_trace().is_some() {
+            Some("BLOOMERY_ROUTE_TRACE (the trace records a fixed placement's routing)")
+        } else if prefill == PrefillMode::Steps {
+            Some("--prefill steps (each prompt id would end a pass the rule counts)")
+        } else {
+            None
+        };
+        if let Some(what) = beside {
+            return Err(format!("BLOOMERY_RESIDENCY={word} is refused beside {what}").into());
+        }
+        Ok(Some((r, word)))
+    }
+
+    /// `word`'s pinned experts, its spares and one that moves fit every
+    /// layer's card experts in `plan`, else a named refusal before the load.
+    fn residency_room(plan: &Plan<'_>, r: Residency, word: &str) -> Result<(), GateError> {
+        let Residency::Mid { pinned, spares } = r else {
+            return Ok(());
+        };
+        let fewest = plan
+            .n_l
+            .iter()
+            .copied()
+            .filter(|&n| n > 0)
+            .min()
+            .ok_or_else(|| {
+                format!("BLOOMERY_RESIDENCY={word}: the plan puts no routed expert on the card")
+            })?;
+        let need = pinned + spares + 1;
+        if usize::try_from(fewest)? < need {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={word}: the plan's fewest card experts a layer is {fewest}, \
+                 fewer than {pinned} pinned, {spares} spare and one that moves"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made
