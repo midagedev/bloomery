@@ -218,6 +218,9 @@ impl<'b, 's, 'a, T> Rope<'b, 's, 'a, T> {
     /// disjoint writes inside `dst`, and the read offsets stay below the
     /// extents the contract proved (`2p + 1 <= nd - 1` for any `nd >= 2`).
     /// The pair borrows this `Rope` exclusively, so one is live per thread.
+    /// It copies the three buffer pointers rather than pointing at the
+    /// `Rope`: a returned value holding the address of a kernel-local struct
+    /// keeps that struct in a local depot.
     ///
     /// [`ThreadIndex`]: cuda_device::thread::ThreadIndex
     #[inline(always)]
@@ -234,9 +237,12 @@ impl<'b, 's, 'a, T> Rope<'b, 's, 'a, T> {
         let d = (i % npairs) * 2;
         let t = col / n_vec;
         Some(RopePair {
+            src: self.src,
+            cs: self.cs,
+            dst: self.dst,
             base: col * nd + d,
             cache: t * nd + d,
-            rope: self,
+            _rope: PhantomData,
         })
     }
 }
@@ -248,13 +254,18 @@ impl<'b, 's, 'a, T> Rope<'b, 's, 'a, T> {
 /// [`Rope::own`]: Rope::own
 #[must_use]
 pub(crate) struct RopePair<'v, 'b, 's, 'a, T> {
-    rope: &'v mut Rope<'b, 's, 'a, T>,
+    /// The minting `Rope`'s buffer pointers, copied.
+    src: *const T,
+    cs: *const T,
+    dst: *mut T,
     /// The pair's first cell in `src`/`dst` (`col * nd + 2p`); `+ 1` is the
     /// second. Both below `m * n_vec * nd` by `own`'s decomposition.
     base: usize,
     /// The pair's first cache cell (`t * nd + 2p`); `+ 1` is the second.
     /// Both below `m * nd`.
     cache: usize,
+    /// The exclusive borrow of the minting `Rope`: one pair per thread.
+    _rope: PhantomData<&'v mut Rope<'b, 's, 'a, T>>,
 }
 
 impl<'v, 'b, 's, 'a, T> RopePair<'v, 'b, 's, 'a, T> {
@@ -276,10 +287,10 @@ impl<'v, 'b, 's, 'a, T> RopePair<'v, 'b, 's, 'a, T> {
         // proof.
         unsafe {
             (
-                *self.rope.src.add(self.base),
-                *self.rope.src.add(self.base + 1),
-                *self.rope.cs.add(self.cache),
-                *self.rope.cs.add(self.cache + 1),
+                *self.src.add(self.base),
+                *self.src.add(self.base + 1),
+                *self.cs.add(self.cache),
+                *self.cs.add(self.cache + 1),
             )
         }
     }
@@ -295,8 +306,8 @@ impl<'v, 'b, 's, 'a, T> RopePair<'v, 'b, 's, 'a, T> {
         // SAFETY: `base` and `base + 1` were proven inside `dst` by the
         // minting `own`, and this thread alone owns the pair's cells.
         unsafe {
-            *self.rope.dst.add(self.base) = y0;
-            *self.rope.dst.add(self.base + 1) = y1;
+            *self.dst.add(self.base) = y0;
+            *self.dst.add(self.base + 1) = y1;
         }
     }
 }
