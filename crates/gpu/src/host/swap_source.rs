@@ -7,7 +7,10 @@
 //! up and down; a model names its own ([`FileStacks`]). On the card each
 //! part of slot `s` is the file's bytes of that expert at byte `s · part` of
 //! its layer's stack, which the placed load uploads as file bytes in slot
-//! order.
+//! order. The parts are each layer's own as the file holds them: a model
+//! whose layers quantize their stacks differently (a layer's gate and up of
+//! another type) still stages every expert as its layer lays it out, and the
+//! staging ring's slot is sized by the widest layer.
 //!
 //! **Sources.** The host reads a part from the r8 sidecar when the load
 //! reads one (`BLOOMERY_R8`) and the sidecar holds its stack, else from the
@@ -55,15 +58,26 @@ pub trait FileStacks: Send + Sync {
     /// order.
     fn names(&self, layer: usize) -> Vec<String>;
 
-    /// The K-quant type the model's kernels read each stack in, in the same
-    /// order; a card stack of another type is refused by name.
-    fn types(&self) -> &'static [GgmlType];
+    /// The K-quant type the model's kernels read layer `layer`'s stacks in,
+    /// in the same order; a card stack of another type is refused by name.
+    /// A layer's list is its own as the file holds it: layers may differ.
+    fn types(&self, layer: usize) -> &[GgmlType];
+
+    /// The layers the body's slot map holds, when it is not the load's whole
+    /// card range — a body whose host tier serves a run of the card's layers
+    /// builds its map over the run, and the machine's per-layer lists (its
+    /// pinned counts) cover the map's layers. `None`: the card's layers.
+    fn map_layers(&self) -> Option<usize> {
+        None
+    }
 
     /// The load's convert step over the stacks the load found: `dims` the
-    /// first stack's dims, `parts` each part's bytes an expert, `sidecar`
-    /// whether the host reads the r8 sidecar — `None` when the staged bytes
-    /// are the slot's. A model with a shape contract of its own on the stacks
-    /// refuses here, by name. Load-time only.
+    /// first card layer's first stack's dims, `parts` that layer's parts,
+    /// each part's bytes an expert, `sidecar` whether the host reads the r8
+    /// sidecar — `None` when the staged bytes are the slot's. A model with a
+    /// shape contract of its own on the stacks refuses here, by name; a
+    /// convert step whose sizes the layers do not share refuses the layers
+    /// that differ. Load-time only.
     fn open(
         &self,
         dims: &[u64],
@@ -110,11 +124,13 @@ pub struct ResidencySpec {
 // --------------------------------------------------------------- source
 
 /// One layer's parts: the file tensors, the stage stacks' base addresses and
-/// slots, and each part's bytes.
+/// slots, and each part's bytes — this layer's own, as the file holds its
+/// stacks.
 struct LayerParts {
     tensors: Vec<ModelTensor>,
     base: Vec<sys::CUdeviceptr>,
     slots: usize,
+    parts: Vec<usize>,
 }
 
 /// A placed load's [`SwapSource`] over its model file: each part of an expert
@@ -127,7 +143,6 @@ pub struct FileSwap {
     experts: u64,
     first: usize,
     layers: Vec<Option<LayerParts>>,
-    parts: Vec<usize>,
     /// The model's convert step, when its staged bytes are not its slots'.
     convert: Option<Arc<dyn Convert>>,
 }
@@ -149,8 +164,8 @@ impl FileSwap {
     /// load read in (`populated` saying it was), and `stacks`, the model's
     /// stacks. Refused by name: a set the load did not populate, a layer
     /// whose stacks are not all resident in the types the model reads, a
-    /// stack the plan does not name, parts not whole words or not the same on
-    /// every layer, and the model's own contract
+    /// stack the plan does not name, parts not whole words, and the model's
+    /// own contract
     /// ([`FileStacks::open`]). Load-time only.
     #[allow(
         clippy::too_many_arguments,
@@ -177,7 +192,6 @@ impl FileSwap {
         }
         let pair = R8Pair::at_load(file, r8).map_err(|e| GpuError::plan(WHAT, e))?;
         let experts = plan.model.experts;
-        let types = stacks.types();
         let find = |name: String| {
             plan.model
                 .tensors
@@ -187,9 +201,18 @@ impl FileSwap {
                 .ok_or(GpuError::tensor(WHAT, name, "a routed stack of the plan"))
         };
         let mut out = Vec::with_capacity(layers.len());
-        let mut parts: Option<Vec<usize>> = None;
         for l in layers.clone() {
             let names = stacks.names(l);
+            // The card's stacks first: all of the layer's or none. A layer
+            // none of whose stacks the load holds (a dense block, a layer the
+            // plan keeps whole on the host) is skipped whatever its types
+            // list says.
+            let found = names.iter().map(|n| w.get(n)).collect::<Vec<_>>();
+            if found.iter().all(Option::is_none) {
+                out.push(None);
+                continue;
+            }
+            let types = stacks.types(l);
             if names.len() != types.len() {
                 return Err(GpuError::shape(
                     WHAT,
@@ -199,13 +222,6 @@ impl FileSwap {
                         types.len()
                     ),
                 ));
-            }
-            // The card's stacks first: all of the layer's or none, each the
-            // type the model's kernels read.
-            let found = names.iter().map(|n| w.get(n)).collect::<Vec<_>>();
-            if found.iter().all(Option::is_none) {
-                out.push(None);
-                continue;
             }
             let stacks_of = found
                 .iter()
@@ -244,37 +260,26 @@ impl FileSwap {
                     ));
                 }
             }
-            match &parts {
-                Some(p) if *p != per => {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        format!("layer {l}: parts of {per:?} bytes, earlier layers {p:?}"),
-                    ));
-                }
-                _ => parts = Some(per),
-            }
             out.push(Some(LayerParts {
                 tensors,
                 base: stacks_of.iter().map(|st| st.buf().cu_deviceptr()).collect(),
                 slots,
+                parts: per,
             }));
         }
-        let parts = parts
-            .ok_or_else(|| GpuError::shape(WHAT, "no layer of the card holds routed stacks"))?;
-        let t0 = out
+        let first = out
             .iter()
             .flatten()
             .next()
-            .map(|p| p.tensors[0].clone())
             .ok_or_else(|| GpuError::shape(WHAT, "no layer of the card holds routed stacks"))?;
-        let convert = stacks.open(&t0.dims, &parts, pair.r8().sidecar().is_some(), ctx)?;
+        let t0 = first.tensors[0].clone();
+        let convert = stacks.open(&t0.dims, &first.parts, pair.r8().sidecar().is_some(), ctx)?;
         Ok(FileSwap {
             pair,
             set,
             experts,
             first: layers.start,
             layers: out,
-            parts,
             convert,
         })
     }
@@ -291,11 +296,12 @@ impl FileSwap {
     /// to a card slot: the source file's bytes, whatever the host reads.
     pub fn card_bytes(&self, layer: usize, id: u32, part: usize) -> Result<&[u8], GpuError> {
         const WHAT: &str = "FileSwap::card_bytes";
-        let t = &self.layer(layer, WHAT)?.tensors[part.min(self.parts.len() - 1)];
-        let per = *self
+        let p = self.layer(layer, WHAT)?;
+        let per = *p
             .parts
             .get(part)
             .ok_or_else(|| GpuError::shape(WHAT, format!("part {part} of an expert")))?;
+        let t = &p.tensors[part.min(p.tensors.len() - 1)];
         let split = self.pair.source().split();
         let (s, info) = split.find(&t.name).ok_or(GpuError::tensor(
             WHAT,
@@ -343,17 +349,22 @@ impl FileSwap {
 }
 
 impl SwapSource for FileSwap {
-    fn part_bytes(&self) -> &[usize] {
-        &self.parts
+    fn part_bytes(&self, layer: usize) -> &[usize] {
+        layer
+            .checked_sub(self.first)
+            .and_then(|i| self.layers.get(i))
+            .and_then(Option::as_ref)
+            .map_or(&[], |p| p.parts.as_slice())
     }
 
     fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError> {
         const WHAT: &str = "FileSwap::source";
-        let t = &self.layer(layer, WHAT)?.tensors[part];
-        let per = *self
+        let p = self.layer(layer, WHAT)?;
+        let per = *p
             .parts
             .get(part)
             .ok_or_else(|| GpuError::shape(WHAT, format!("part {part} of an expert")))?;
+        let t = &p.tensors[part];
         let src = self.pair.source();
         let whole = match src
             .sidecar()
@@ -394,17 +405,17 @@ impl SwapSource for FileSwap {
     fn dest(&self, layer: usize, part: usize, slot: u32) -> Result<sys::CUdeviceptr, GpuError> {
         const WHAT: &str = "FileSwap::dest";
         let p = self.layer(layer, WHAT)?;
-        if slot as usize >= p.slots || part >= self.parts.len() {
+        if slot as usize >= p.slots || part >= p.parts.len() {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
                     "layer {layer} part {part} slot {slot}: {} slots of {} parts",
                     p.slots,
-                    self.parts.len()
+                    p.parts.len()
                 ),
             ));
         }
-        Ok(p.base[part] + (slot as usize * self.parts[part]) as u64)
+        Ok(p.base[part] + (slot as usize * p.parts[part]) as u64)
     }
 
     /// The model's convert step of the staged part just copied to `dst`
@@ -424,7 +435,8 @@ impl SwapSource for FileSwap {
 
     fn prepare_victim(&self, layer: usize, id: u32) -> Result<(), GpuError> {
         const WHAT: &str = "FileSwap::prepare_victim";
-        for part in 0..self.parts.len() {
+        let parts = self.layer(layer, WHAT)?.parts.len();
+        for part in 0..parts {
             let (file, at) = self.run(layer, id, part, WHAT)?;
             self.set
                 .populate_run(self.pair.source(), &file, &at)
@@ -435,7 +447,8 @@ impl SwapSource for FileSwap {
 
     fn host_resident(&self, layer: usize, id: u32) -> Result<bool, GpuError> {
         const WHAT: &str = "FileSwap::host_resident";
-        for part in 0..self.parts.len() {
+        let parts = self.layer(layer, WHAT)?.parts.len();
+        for part in 0..parts {
             let (file, at) = self.run(layer, id, part, WHAT)?;
             let serves = self
                 .set
