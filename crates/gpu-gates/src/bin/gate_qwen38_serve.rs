@@ -44,9 +44,8 @@
 //!   prompt's fed fresh; `/props`' `engine.draft` names the draft file
 //!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path;
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) is served
-//!   through plain steps, drafting nothing, with the ids of the same request
-//!   on a plain server (`BLOOMERY_DRAFT=off`) started once the drafted one
-//!   has stopped.
+//!   through plain steps, drafting nothing, and the same request at `top_k`
+//!   1 gives this server's greedy ids.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. Logs and the raw stream go to `--dir`.
