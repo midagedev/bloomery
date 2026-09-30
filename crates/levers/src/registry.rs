@@ -327,7 +327,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: RESIDENCY,
         class: Class::C,
-        kind: Kind::Words(&["off", "mid-p0-s1", "mid-p40-s1"]),
+        kind: Kind::Words(&["off", "mid-p0-s1", "mid-p40-s1", "mid-p148-s1"]),
         default: Unset::Means(
             "V4.1 follows the placement: `mid-p40-s1` under `--place a` and `bp`, `off` under \
              `gate`, beside `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or \
@@ -350,7 +350,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               binaries print the word and why as a `residency lever` record before the load. \
               Set, `mid-…` is refused by name under `--place gate`, beside the finite probe, \
               the route trace and the step feed. Qwen3.8 (`generate_qwen3moe` on a qwen4exp \
-              file, `--place a` or `gate`, plain or `BLOOMERY_DRAFT=mtp`): unset is `off`; set, \
+              file, `--place a` or `gate`, plain or `BLOOMERY_DRAFT=mtp`): unset is `off`; its \
+              `--place a` word is `mid-p148-s1`, half the fewest card experts a layer keeps \
+              there, below both the plain and the MTP plan's count; set, \
               `mid-…` runs the same machine over the card's routed stacks, the load's host set \
               holds the churn pool, refused by name as above, and prints `residency host`, and \
               each arm prints its `residency pass` records after its lines; an arm's clear \
