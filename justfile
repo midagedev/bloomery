@@ -1579,6 +1579,16 @@ gate-gpu-glm5next-e2e:
 weekly-gpu-glm5next-e2e-long:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
 
+# GLM's adaptive expert residency on the gate placement (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P half the
+# plan's least card slots a layer): the churn pool's host refusal at load, the batch prompt one pass keeping 0 and each
+# step 1, every admitted slot byte for byte the file's on a Q4_K layer and on the Q5_K gate/up layer (per-layer parts),
+# the steps prompt refused by name, the same history twice with flips landed, and a reset back to the seed. Loads the
+# whole host set: the e2e gates' batching rule.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-glm5next-residency:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_residency && bash tools/gpu-gate.sh gate_glm5next_residency'
+
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.
 [group('v41-load')]
