@@ -40,7 +40,9 @@ use model::placement::{ModelTensor, Plan};
 use model::r8file::R8Pair;
 
 use super::HostExperts;
-use super::swap::{MachineCfg, PassReport, Piece, ResetReport, Residency, SwapSource, Transform};
+use super::swap::{
+    BoundaryAt, MachineCfg, PassReport, Piece, ResetReport, Residency, SwapSource, Transform,
+};
 use super::{HostTier, PassKind};
 use crate::GpuError;
 use crate::tensor::DeviceTensor;
@@ -637,15 +639,16 @@ impl ResidencyGlue {
         tier.start_swap(ctx, stream, view, source, cfg)
     }
 
-    /// The tier's residency boundary ([`HostTier::swap_boundary`]), its
-    /// report logged when a binary asked
+    /// The tier's residency boundary at `at` ([`HostTier::swap_at`]), the
+    /// report of a boundary it made logged when a binary asked
     /// ([`ResidencyGlue::log_passes`]). Nothing without a machine.
     pub fn at_boundary<H: HostExperts>(
         &mut self,
         tier: &mut HostTier<H>,
         stream: &CudaStream,
+        at: BoundaryAt,
     ) -> Result<(), GpuError> {
-        if let Some(r) = tier.swap_boundary(stream)?
+        if let Some(r) = tier.swap_at(stream, at)?
             && let Some(log) = self.log.as_mut()
         {
             log.push(r);

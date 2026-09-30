@@ -70,6 +70,15 @@
 //!   refused by name, and so is a kept row with a slot missing, after which
 //!   the machine takes the full row (its mutant: a note that does not check
 //!   the slot's bit).
+//! - ahead: the trace driven with every boundary after the first made ahead
+//!   of its pass (`SwapMachine::boundary_ahead`: after the pass before it is
+//!   launched and ended, before that pass's drain and readback, the engine's
+//!   step order) and taken by its launch (`SwapMachine::take_ahead`) gives
+//!   the prompt run's values and flips; then a boundary made ahead refuses a
+//!   boundary, an end of pass and a prompt call by name until a launch takes
+//!   it, the take returns it once and a second take is refused by name, and
+//!   a reset drops one made ahead (its mutant: a take that leaves the
+//!   boundary waiting, so the second take passes).
 //! - keep: a count the tier's own `keep_rows` gives with no pass open,
 //!   after a reset, is refused by name — the write side of the boundary's
 //!   kept-count refusal — and nothing is stored, so the next boundary
@@ -1211,6 +1220,116 @@ mod gate {
                 .all(|&(e, slot)| slot.is_some() && run.slots.slot(l, e) == slot)
         });
         Ok(())
+    }
+
+    /// Drive `passes` of the trace with every boundary after the first made
+    /// ahead of its pass: per pass the ids refreshed, the boundary taken
+    /// (the first made), the graph, the ids noted and the pass's end, the
+    /// next pass's boundary made ahead ([`SwapMachine::boundary_ahead`]),
+    /// then the bounded drain and the readback, the value read against the
+    /// map the pass ran on.
+    fn drive_ahead(
+        gpu: &Gpu,
+        run: &mut Run,
+        trace: &Trace,
+        passes: Range<usize>,
+    ) -> Result<(), GateError> {
+        let stream = gpu.stream();
+        let delay = run.delay;
+        let m = run.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let mut tally = m.tally();
+        let mut pre: Option<PassReport> = None;
+        let end = passes.end;
+        for p in passes {
+            let (rows, kept) = &trace.passes[p];
+            run.card.refresh(gpu, rows)?;
+            let report = match pre.take() {
+                Some(r) => {
+                    m.take_ahead()?;
+                    r
+                }
+                None => m.boundary(stream, &mut run.slots)?,
+            };
+            for f in m.rule().in_flight() {
+                if f.live_at == report.boundary + delay {
+                    run.flips.push((report.boundary, *f));
+                }
+            }
+            run.slot_moves += report.landed;
+            run.card.launch(gpu)?;
+            note_rows(&mut tally, rows)?;
+            m.end_pass(&mut tally, *kept)?;
+            let ran_on = run.slots.clone();
+            if p + 1 < end {
+                pre = Some(m.boundary_ahead(stream, &mut run.slots)?);
+            }
+            drain(gpu).map_err(|e| format!("pass {p}: {e}"))?;
+            let out = run.card.read(gpu)?;
+            run.values.push(value(rows, &out, &ran_on));
+            run.reports.push(report);
+            run.sets.push(card_sets(&ran_on));
+        }
+        Ok(())
+    }
+
+    /// Whether `r` is the refusal of a boundary made ahead that no launch
+    /// has taken.
+    fn refused_ahead<T>(r: Result<T, GpuError>) -> bool {
+        r.err()
+            .is_some_and(|e| e.to_string().contains("made ahead of its pass"))
+    }
+
+    /// ahead: the trace with its boundaries made ahead against run `a`, then
+    /// the made-ahead state's refusals on that machine.
+    fn ahead(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let mut r = plain(gpu, pm, Faults::default(), DELAY)?;
+        drive_ahead(gpu, &mut r, trace, 0..PASSES)?;
+        let same = r.err.is_none()
+            && r.values.len() == PASSES
+            && fnvs(&r.values) == fnvs(&a.values)
+            && r.flips == a.flips
+            && clean(&r.values);
+        let made = r.reports.iter().filter(|p| p.ahead).count();
+        let n = r.values.len();
+        let Run { machine, slots, .. } = &mut r;
+        let m = machine.as_mut().ok_or("gate_swap: no machine")?;
+        let b = m.boundary_ahead(stream, slots)?.boundary;
+        let boundary = refused_ahead(m.boundary(stream, slots));
+        let mut t = m.tally();
+        let end = refused_ahead(m.end_pass(&mut t, 0));
+        let call = refused_ahead(m.begin_call(stream, CallCfg { floor: 1 }));
+        let took = m.take_ahead().ok() == Some(b);
+        let again = m.take_ahead().err().map(|e| e.to_string());
+        let twice = again.as_deref().is_some_and(|e| e.contains("none waits"));
+        m.end_pass(&mut t, 0)?;
+        m.boundary_ahead(stream, slots)?;
+        m.reset(stream, slots)?;
+        let dropped = m.ahead().is_none() && m.take_ahead().is_err();
+        let unbroken = m.broken().is_none();
+        let ok = same
+            && made == PASSES - 1
+            && boundary
+            && end
+            && call
+            && took
+            && twice
+            && dropped
+            && unbroken;
+        println!(
+            "ahead: {} passes with {made} boundaries made ahead, values and flips equal the \
+             prompt run {same}; boundary {b} made ahead refuses a boundary {boundary}, an end of \
+             pass {end}, a prompt call {call}; taken once {took}, a second take {again:?} \
+             refused {twice}; a reset drops one made ahead {dropped}; unbroken {unbroken} {}",
+            n,
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// A fresh arm over `slots`: its card, its captured probe and a machine
@@ -3001,6 +3120,7 @@ mod gate {
         ok &= tier(&gpu, &pm, &trace, &a)?;
         ok &= staging_failure(&gpu, &pm, &trace, &a)?;
         ok &= tally_clause(&gpu, &pm, &trace)?;
+        ok &= ahead(&gpu, &pm, &trace, &a)?;
         ok &= keep_clause(&gpu)?;
         ok &= broken(&gpu, &pm, &trace, &a)?;
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;

@@ -753,12 +753,14 @@ impl<H: HostExperts> HostTier<H> {
     /// step 1, a verify its accepted rows, a prompt call 0): what the next
     /// boundary folds. Refused by name — the write side of the refusal the
     /// next boundary makes ([`pass_kept`]) — a count given with no pass
-    /// open. Nothing without a machine.
+    /// open, and one given while a boundary made ahead waits for its launch
+    /// (the pass it opened has not run). Nothing without a machine.
     pub fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::keep_rows";
         let Some(m) = self.swap.as_ref() else {
             return Ok(());
         };
+        m.refuse_if_ahead(WHAT)?;
         if !m.pass_open() {
             return Err(GpuError::protocol(WHAT, kept_with_no_pass(kept, kind)));
         }
@@ -776,15 +778,60 @@ impl<H: HostExperts> HostTier<H> {
         &mut self,
         stream: &CudaStream,
     ) -> Result<Option<(PassKind, swap::PassReport)>, GpuError> {
+        self.boundary_of(stream, false)
+    }
+
+    /// The residency boundary an engine's pass order calls for at `at`
+    /// ([`swap::BoundaryAt`]), stamped with its readbacks: before a launch,
+    /// the boundary made ahead of it taken when the machine holds one
+    /// ([`swap::SwapMachine::take_ahead`]; `None`, its report was given when
+    /// it was made), else [`HostTier::swap_boundary`]; ahead, after a pass's
+    /// service and kept rows and before its readback, the next pass's
+    /// boundary made now ([`swap::SwapMachine::boundary_ahead`]). `None`
+    /// without a machine. Refused by name: [`HostTier::swap_boundary`]'s
+    /// refusals, and a boundary made ahead while another waits.
+    pub fn swap_at(
+        &mut self,
+        stream: &CudaStream,
+        at: swap::BoundaryAt,
+    ) -> Result<Option<(PassKind, swap::PassReport)>, GpuError> {
+        let ahead = match (at, self.swap.as_mut()) {
+            (_, None) => return Ok(None),
+            (swap::BoundaryAt::Launch { .. }, Some(m)) if m.ahead().is_some() => {
+                m.take_ahead()?;
+                return Ok(None);
+            }
+            (swap::BoundaryAt::Launch { .. }, Some(_)) => false,
+            (swap::BoundaryAt::Ahead { .. }, Some(_)) => true,
+        };
+        let mut made = self.boundary_of(stream, ahead)?;
+        if let Some((_, r)) = made.as_mut() {
+            r.reads = at.reads();
+        }
+        Ok(made)
+    }
+
+    /// [`HostTier::swap_boundary`], made ahead of its pass when `ahead`.
+    /// A boundary made ahead that waits for its launch is refused first, so
+    /// the open pass's kept count stays where it was.
+    fn boundary_of(
+        &mut self,
+        stream: &CudaStream,
+        ahead: bool,
+    ) -> Result<Option<(PassKind, swap::PassReport)>, GpuError> {
         let Some(m) = self.swap.as_mut() else {
             return Ok(None);
         };
+        m.refuse_if_ahead("HostTier::swap_boundary")?;
         let mut kind = PassKind::None;
         if let Some((rows, of)) = pass_kept(m.pass_open(), self.swap_kept.take())? {
             m.end_pass(&mut self.step.tally, rows)?;
             kind = of;
         }
-        let report = m.boundary(stream, &mut self.slots)?;
+        let report = match ahead {
+            true => m.boundary_ahead(stream, &mut self.slots)?,
+            false => m.boundary(stream, &mut self.slots)?,
+        };
         Ok(Some((kind, report)))
     }
 

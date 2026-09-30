@@ -45,11 +45,28 @@ use model::arch::glm5next::place::PlanInputs;
 /// stream, and neither moves the boundary a flip lands at.
 pub const LIVE_DELAY: u64 = 2;
 
-/// The bound on every host wait of the machine. Every boundary follows a
-/// pass's readback, so the engine stream has drained and a wait is for the
-/// staging thread and the copy stream alone: at most a planning pass's
-/// `cap` experts ([`runtime::swaprule::SwapParams::mid`]), far inside this
-/// bound.
+/// The bound on every host wait of the machine. A boundary runs after the
+/// last launched pass's host service has returned: before a launch, or ahead
+/// of the next pass after a step's kept row and before its readback
+/// (`GpuModel::run_tokens`), while the engine stream still runs that step's
+/// last kernels and its head. So the engine stream need not be empty, but
+/// nothing on it waits on this thread: every host word its waits read was
+/// written by a service that has returned. The one host wait a boundary
+/// makes is for a landing flip's staging. The flip's job `n` was issued
+/// `LIVE_DELAY` = 2 boundaries back (a live delay of 1 or more, which the
+/// machine holds), and its staging waits only for its ring slot's previous
+/// copy, an earlier job issued at or before that boundary. That copy
+/// waits on the copy stream for its own staging (an earlier, due job: the
+/// same argument) and for the boundary event recorded when it was issued,
+/// which precedes the last launched pass in the engine stream's order, so
+/// the stream reaches it with no further host action — the waits before it
+/// are copies whose staging the host already waited for at their own
+/// landing, and the host words of passes already served. No wait can
+/// close a cycle through the engine stream, and a wait is for the staging
+/// thread and the copy stream alone: at most a planning pass's `cap`
+/// experts ([`runtime::swaprule::SwapParams::mid`]), far inside this bound.
+/// A late copy landing at a boundary made ahead delays the step's readback,
+/// which the engine stream orders after that boundary's wait.
 pub const DEADLINE: Duration = Duration::from_secs(30);
 
 /// GLM's [`FileStacks`]: each layer's gate, up and down by name, with the
