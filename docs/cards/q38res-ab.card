@@ -1,0 +1,39 @@
+# Round c4resid (C4): Qwen3.8's routed experts under adaptive residency on plan a (A6000), the
+# same binary, BLOOMERY_RESIDENCY=off against mid-p148-s1 (148 pinned, 1 spare a layer; the plan's
+# min n_l is 298 at C 4096, 43 layers of 512 experts, card_experts 12841).
+# Decomposing the plain step (prose:512 18.9 ms, 52.77 tok/s, rig-log 09-30 mtppf window): the host
+# serves about 4.1 of the 10 routed slots a token (f = 298.6 / 512 = 0.583 on the card by the id
+# prefix; the static hit ≈ f on prose), its union the step's 8-10 ms residual, ~2.0-2.4 ms a host
+# slot [derived]. Adaptive residency's replay hit for Qwen3.8 at f 0.36-0.59 is 0.82-0.92 (idea
+# ledger, llama.cpp #27861's locality, ideaverify's rule), so the host serves 0.8-1.8 slots: the
+# residual falls by 2.3-3.3 slots × 2.0-2.4 ms = 4.6-7.9 ms [derived]. The swaps cost PCIe beside the
+# step (2-5 experts a token, 3-5 MB each, ~0.5-1.2 ms at 20 GB/s, mostly under the host leg) and the
+# window's first steps are the seed's (hit near f): step 11-14.5 ms, +30..+70 %; widened low for the
+# warm-up steps inside n = 96 and for a hit below the replay's: +15..+70.
+# prose:4096 carries the same band (the deeper attention adds ~0.1 ms a step to both arms).
+# Runner (from /Users/hckim/repo/bloomery-c4resid):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38res-ab.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=3
+# just depth-gpu-qwen4exp prose:512@BLOOMERY_RESIDENCY=off prose:512@BLOOMERY_RESIDENCY=mid-p148-s1
+#   prose:4096@BLOOMERY_RESIDENCY=off prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1
+# Wall [derived]: as the mtppf window's 4 arms × 3 rounds, 6 min, plus the residency arms' seed.
+kind: ab
+question: does adaptive residency lift Qwen3.8's decode on plan a by the host-slot model's band?
+term: tg tok/s @ n=96, the prose corpus (prose:512 and prose:4096), ctx 4352
+  (BLOOMERY_GEN_CTX=4352), A6000, plan a (card experts), BLOOMERY_RESIDENCY=mid-p148-s1 against off,
+  same binary, paired by round
+unit: %
+predict: +15..+70
+rounds: 3
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, both arms of a P in one lease, a fresh process per load group, the host set
+  and the PLE table warm before each timed window (majflt near 0), no [cpu-busy] or [other-busy]
+  row; the residency arm's `residency lever` and `residency host` records name mid-p148-s1, its
+  `residency pass` records show flips; the off arm's lever record names off; distinct_tokens equal
+  between the arms
+decide-in: land C4 with residency on by default for Qwen3.8 under --place a (the V4.1 rule), after
+  gate-gpu-qwen38-residency is green
+decide-below: read the residency pass records' hit per window: a hit under ~0.75 is the rule's
+  (P, S) or the seed, not the copy; a hit in band with the rate low means the swaps sit on the
+  step (nsys one window before any change)
+decide-above: the host slot cost was under-counted at T = 1: re-derive it from one
+  BLOOMERY_STEP_STATS window before the next Qwen3.8 round
