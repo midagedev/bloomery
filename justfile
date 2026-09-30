@@ -1587,6 +1587,17 @@ gate-gpu-glm5next-e2e:
 weekly-gpu-glm5next-e2e-long:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
 
+# glm5next (GLM-5.3-Flash) NextN draft: the target loaded twice by its NextN plan on the 3090, without the next-token
+# layer and with it (`Body::open_placed_nextn`), against ik's MTP draft set (refset `mtp-glm5next`): the set's MTP input
+# (no position mask), the walk's refusals, every graph of the set replayed from ik's inputs with each block's proposal the set's
+# draft, the two loads' plain runs bit for bit, and the drafted windows (`MtpDraft<Body>`) the plain run's ids with a
+# rejected and an accepted row, the prompt in batches and by steps. Loads the whole model twice: alone in a batch, and
+# under the big-load lock the V4.1 loads take.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-glm5next-mtp:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_mtp && bash tools/gpu-gate.sh gate_glm5next_mtp'
+
 # GLM's adaptive expert residency on the gate placement (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P half the
 # plan's least card slots a layer): the churn pool's host refusal at load, the batch prompt one pass keeping 0 and each
 # step 1, every admitted slot byte for byte the file's on a Q4_K layer and on the Q5_K gate/up layer (per-layer parts),

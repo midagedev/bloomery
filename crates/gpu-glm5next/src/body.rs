@@ -27,9 +27,11 @@
 //! they complete, and attends the positions its selector lists (every one
 //! while it sees at most `top_k / kpool` pools, [`crate::mla`]); the plan
 //! serves a context up to the deepest one a reference set checks the
-//! selector at (`place::ORACLE_POSITIONS`). The next-token (MTP) layer is carried by the
-//! file and not loaded: its tensors are `Role::Unused`, as ik loads and does
-//! not run it.
+//! selector at (`place::ORACLE_POSITIONS`). The next-token (MTP) layer is
+//! carried by the file and loaded only by a NextN load
+//! ([`Body::open_placed_nextn`], [`nextn`]): beside the chain, never in it,
+//! its routed experts one more layer of the host tier's run; the plain load
+//! leaves its tensors `Role::Unused`, as ik loads and does not run them.
 //!
 //! A cut behind the fed positions finds a KDA layer's state only in a
 //! checkpoint ([`bloomery_gpu::checkpoint`]): each prompt call ([`prompt`])
@@ -75,7 +77,7 @@ use gguf::quant::dequant_row;
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::arch::glm5next::names;
-use model::arch::glm5next::place::{self, PlanInputs};
+use model::arch::glm5next::place::{self, NextnInputs, NextnPlan, PlanInputs};
 use model::placement::Plan;
 use models::{Act, Ffn, LayerSpec, Mixer, Score};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
@@ -92,6 +94,9 @@ pub mod prefill;
 
 #[path = "pair.rs"]
 mod pair;
+
+#[path = "nextn.rs"]
+pub mod nextn;
 
 pub use pair::PAIR_ROWS;
 
@@ -598,6 +603,8 @@ pub struct Body {
     /// The residency the body was loaded with: `off` keeps the load's slot
     /// map for the model's life.
     residency: Residency,
+    /// The next-token layer, on a NextN load ([`nextn`]).
+    nextn: Option<Box<nextn::Nextn>>,
 }
 
 /// Every KDA layer's committed lane `lane` of its state and its conv ring,
@@ -811,7 +818,65 @@ impl Body {
             spec,
             |stream, _, layers, w| Body::derive(stream, &kinds, layers, w),
             |gpu, file, w, set, glue| {
-                Body::load_placed(gpu, file, w, plan, inputs, card, host, set, glue, residency)
+                Body::load_placed(
+                    gpu, file, w, plan, inputs, card, host, set, glue, residency, None,
+                )
+            },
+        )
+    }
+
+    /// [`Body::open_placed`] with the next-token layer beside the chain: card
+    /// `card` of `plan`'s target plan resident as [`Body::open_placed`] makes
+    /// it, the layer `nextn` describes resident as `plan`'s NextN plan places
+    /// it ([`nextn::Nextn`]), and its routed experts served by the host tier
+    /// as the run's last layer (the slot map's row for it every expert on the
+    /// host), the host tier's batch port made for the walk's host leg. The
+    /// load takes no residency machine: the host set's layers are the run's
+    /// before it. Refused as [`Body::open_placed`] refuses, and by name for a
+    /// next-token layer that does not follow the host run.
+    pub fn open_placed_nextn(
+        file: Split,
+        plan: &NextnPlan<'_>,
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+        card: usize,
+        host: HostCfg,
+    ) -> Result<Glm5nextModel, GpuError> {
+        let target = &plan.plan;
+        refuse_expert_tiers(WHAT, target.machine)?;
+        let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
+        let map_layers = hosted(&inputs.spec.layers)
+            .map_err(|e| shape(e.to_string()))?
+            .len();
+        let spec = ResidencySpec {
+            lever: Residency::Off,
+            delay: swap::LIVE_DELAY,
+            deadline: swap::DEADLINE,
+            top_k: N_USED,
+            max_rows: PAIR_ROWS,
+            stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers)?),
+        };
+        GpuModel::load_placed_with(
+            file,
+            target,
+            card,
+            host,
+            spec,
+            |stream, _, layers, w| Body::derive(stream, &kinds, layers, w),
+            |gpu, file, w, set, glue| {
+                Body::load_placed(
+                    gpu,
+                    file,
+                    w,
+                    target,
+                    inputs,
+                    card,
+                    host,
+                    set,
+                    glue,
+                    Residency::Off,
+                    Some((plan, nextn)),
+                )
             },
         )
     }
@@ -864,10 +929,11 @@ impl Body {
     /// experts it puts on the card and the host tier over the routed run.
     /// `glue` is the load's residency side ([`ResidencyGlue`]) for the
     /// `lever` the load ran under, whose machine the body starts once its
-    /// pieces are sized.
+    /// pieces are sized. With `nextn` the next-token layer joins the host
+    /// run's end and loads beside the chain ([`Body::open_placed_nextn`]).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card, file, weights, plan and inputs, the host tier's residency and levers, and the residency glue (rust-quality R8)"
+        reason = "the load's card, file, weights, plan and inputs, the host tier's residency and levers, the residency glue and the NextN plan (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
@@ -880,6 +946,7 @@ impl Body {
         residency: HostResidency,
         glue: ResidencyGlue,
         lever: Residency,
+        nextn: Option<(&NextnPlan<'_>, &NextnInputs)>,
     ) -> Result<Body, GpuError> {
         let hp = &inputs.hp;
         let spec = &inputs.spec;
@@ -910,7 +977,19 @@ impl Body {
             })?;
         let dense = usize::try_from(place::dense_positions(hp))
             .map_err(|_| shape(format!("dense positions {}", place::dense_positions(hp))))?;
-        let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
+        let trunk_run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
+        // The host run: the trunk's routed layers, and the next-token layer
+        // after them on a NextN load.
+        let run = match nextn {
+            None => trunk_run,
+            Some((_, n)) if trunk_run.end == n.index => trunk_run.start..n.index + 1,
+            Some((_, n)) => {
+                return Err(shape(format!(
+                    "the next-token layer {} does not follow the host run {trunk_run:?}",
+                    n.index
+                )));
+            }
+        };
         let dims = dims_of(inputs)?;
         let map = SlotMap::of_plan(plan, card, None, run.clone(), N_EXPERT)?;
         let cfg = spec
@@ -989,9 +1068,25 @@ impl Body {
             prompt: prefill::PromptState::new(),
             residency_glue: glue,
             residency: lever,
+            nextn: None,
         };
         body.s.lane.copy_from_host(stream, &lane)?;
         stream.synchronize()?;
+        if let Some((np, ni)) = nextn {
+            let layer = nextn::Nextn::open(
+                gpu,
+                &body.embd.file,
+                np,
+                inputs,
+                ni,
+                w,
+                &body.dims,
+                ctx,
+                host.card_dontneed,
+            )?;
+            body.nextn = Some(Box::new(layer));
+            body.prepare_port(gpu)?;
+        }
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.
         body.start_residency(gpu)?;
@@ -1460,6 +1555,9 @@ impl ChainBody for Body {
         }
         self.s.lane.copy_from_host(stream, &[0])?;
         self.s.lanes = pair::Lanes::default();
+        if let Some(n) = self.nextn.as_deref_mut() {
+            n.forget();
+        }
         self.held = 0;
         self.plant = None;
         self.ckpt.clear();
@@ -1483,6 +1581,10 @@ impl ChainBody for Body {
                 .taps
                 .as_ref()
                 .map_or(0, |t| t.iter().map(DeviceBuffer::num_bytes).sum())
+            + self
+                .nextn
+                .as_deref()
+                .map_or(0, |n| n.resident_bytes() + n.arena_bytes())
     }
 
     fn layers(&self) -> Range<usize> {
