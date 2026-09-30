@@ -111,13 +111,15 @@ impl Keep for Body {
             .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
     }
 
-    /// Nothing to take back at the model's position; back to empty at 0;
-    /// else the checkpoint at `n` ([`Body`]'s rollback), any other position
+    /// Nothing to take back at the model's position; back to empty at 0 —
+    /// the fresh-context state, the residency back to its seed with it, as
+    /// a clear of the session does ([`GpuModel::residency_reset`]); else
+    /// the checkpoint at `n` ([`Body`]'s rollback), any other position
     /// refused by name.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
         match n {
             n if n == m.pos() => Ok(()),
-            0 => m.reset(),
+            0 => m.reset().and_then(|()| m.residency_reset()).map(drop),
             n => m.rollback(n),
         }
     }

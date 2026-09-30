@@ -466,13 +466,36 @@ fn check_call(m: &Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
 /// Feed `ids` from where `m` stands by the body's mode ([`set_prefill`]) and
 /// return the argmax after the last: [`prefill`] or the steps ([`prompt`]),
 /// each call refused by name before anything runs when it would pass the
-/// stores' positions, so neither feed stops part of the way there.
+/// stores' positions, so neither feed stops part of the way there. The batch
+/// call is one residency pass ([`call`]); the steps feed is refused by name
+/// while a residency machine runs ([`refuse_steps_under_residency`]).
 pub fn feed(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
     check_call(m, ids)?;
     match m.body(WHAT)?.prompt.mode {
-        PrefillMode::Batch => prefill(m, ids),
-        PrefillMode::Steps => prompt(m, ids),
+        PrefillMode::Batch => call(m, |m| prefill(m, ids)),
+        PrefillMode::Steps => {
+            super::refuse_steps_under_residency(m)?;
+            prompt(m, ids)
+        }
     }
+}
+
+/// A prompt call `run` of `m` as one residency pass: its boundary before it
+/// and none inside ([`GpuModel::pass_boundary`]), so the slot map is one map
+/// for the whole call, and 0 rows kept after it, whatever it returned — the
+/// residency rule counts decode rows only, and the batch service notes no
+/// id. Nothing more on a load with no residency machine.
+fn call<T>(
+    m: &mut Glm5nextModel,
+    run: impl FnOnce(&mut Glm5nextModel) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    m.pass_boundary()?;
+    let r = run(m);
+    let kept = m.keep_rows(0, bloomery_gpu::host::PassKind::Prompt);
+    // The call's own error first: a keep refused after a failed call is its echo.
+    let v = r?;
+    kept?;
+    Ok(v)
 }
 
 /// The body's feed mode.

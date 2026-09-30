@@ -205,12 +205,14 @@ pub struct Piece<'a> {
 /// experts the spare slots give up and at [`SwapMachine::reset`] for the
 /// admitted experts it sends back, and makes every other call.
 pub trait SwapSource: Send + Sync {
-    /// Bytes one expert takes in each of a layer's stage stacks (its parts:
-    /// gate, up, down, …), in stack order; every entry a multiple of 4.
-    fn part_bytes(&self) -> &[usize];
+    /// Bytes one expert takes in each of layer `layer`'s stage stacks (its
+    /// parts: gate, up, down, …), in stack order; every entry a multiple of
+    /// 4. Empty for a layer whose stacks the source holds none of: nothing
+    /// of that layer ever stages, so the machine takes no part in it.
+    fn part_bytes(&self, layer: usize) -> &[usize];
 
     /// Part `part` of layer `layer`'s expert `id` as its source holds it:
-    /// [`SwapSource::part_bytes`]`[part]` bytes once transformed.
+    /// [`SwapSource::part_bytes`]`(layer)[part]` bytes once transformed.
     fn source(&self, layer: usize, id: u32, part: usize) -> Result<Piece<'_>, GpuError>;
 
     /// The device address slot `slot` of layer `layer`'s stack `part` starts
@@ -775,10 +777,10 @@ impl Shared {
     }
 
     /// Copy `job`'s expert from its source into its ring slot, part after
-    /// part.
+    /// part, at the offsets its layer's parts lay out.
     fn stage(&self, job: &Job) -> Result<(), GpuError> {
         let mut at = 0usize;
-        for (part, &want) in self.source.part_bytes().iter().enumerate() {
+        for (part, &want) in self.source.part_bytes(job.layer).iter().enumerate() {
             let piece = self.source.source(job.layer, job.id, part)?;
             if piece.bytes.len() != want {
                 return Err(GpuError::shape(
@@ -1245,14 +1247,35 @@ impl SwapMachine {
                 ),
             ));
         }
-        let parts = source.part_bytes();
-        if parts.is_empty() || parts.iter().any(|&b| b == 0 || b % 4 != 0) {
+        // A ring slot holds any layer's expert, so it is sized by the widest:
+        // the layers whose parts differ (a layer's stacks of another type)
+        // stage at their own offsets and never fill the slot.
+        let mut slot_bytes = 0usize;
+        let mut parts_named = false;
+        for l in layers.clone() {
+            let parts = source.part_bytes(l);
+            if parts.is_empty() {
+                continue;
+            }
+            parts_named = true;
+            if parts.iter().any(|&b| b == 0 || b % 4 != 0) {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l}: expert parts of {parts:?} bytes: each a nonzero multiple \
+                             of 4"
+                    ),
+                ));
+            }
+            slot_bytes = slot_bytes.max(parts.iter().sum());
+        }
+        if !parts_named {
             return Err(GpuError::shape(
                 WHAT,
-                format!("expert parts of {parts:?} bytes: each a nonzero multiple of 4"),
+                "no layer of the map names expert parts: the source holds no stacks the machine \
+                 could move",
             ));
         }
-        let slot_bytes: usize = parts.iter().sum();
         let layout = SwapMachine::layout(slots, &cfg.pinned, cfg.params.spares)?;
         for &(l, id) in &layout.freed {
             source.prepare_victim(l, id)?;
@@ -1981,7 +2004,7 @@ impl SwapMachine {
             ));
         }
         let source = Arc::clone(&self.shared.source);
-        let parts = source.part_bytes();
+        let parts = source.part_bytes(l);
         let dsts = (0..parts.len())
             .map(|part| source.dest(l, part, spare))
             .collect::<Result<Vec<_>, _>>()?;

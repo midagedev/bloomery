@@ -631,7 +631,10 @@ impl<B: ChainBody> GpuModel<B> {
                     source,
                     MachineCfg {
                         params,
-                        pinned: vec![pinned; p.layers.len()],
+                        pinned: vec![
+                            pinned;
+                            residency.stacks.map_layers().unwrap_or(p.layers.len())
+                        ],
                         top_k: residency.top_k,
                         max_rows: residency.max_rows,
                         deadline: residency.deadline,

@@ -15,6 +15,7 @@
 //! - `kda`, `mla`: the two mixers; `ffn`: the dense block, and the routed
 //!   block around its host leg with its card experts in the leg's shadow;
 //! - `host`: the host tier's routed stacks;
+//! - [`swap`]: the model's side of adaptive expert residency;
 //! - `tensors`: each layer's tensor names, made at load;
 //! - [`forced`]: one layer alone on given streams, for the gates.
 //!
@@ -27,6 +28,7 @@ mod host;
 mod kda;
 mod mla;
 mod program;
+mod swap;
 mod tensors;
 
 pub use body::prefill::{
@@ -36,3 +38,4 @@ pub use body::prefill::{
 pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, Plant, prompt, set_taps};
 pub use host::GlmHost;
 pub use program::{layer_launches, step_launches};
+pub use swap::{DEADLINE, LIVE_DELAY};
