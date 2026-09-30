@@ -45,8 +45,10 @@
 //! layer's intermediates in place for the gate to read, and a captured pass
 //! replays against fixed addresses.
 
+use std::mem::size_of;
+
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, launch_u32};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, Window, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use gguf::Split;
 use model::arch::deepseek41::names as target_names;
@@ -55,7 +57,7 @@ use model::arch::dspark::{DraftHparams, names};
 use super::head::DraftHead;
 use super::kv::DraftRings;
 use super::load::{DraftWeights, EmbdRows, pack_words};
-use super::stage::{Inbox, put_f32, view, view_mut};
+use super::stage::{Inbox, put_f32};
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
 use crate::chain::glue::glue_kernels;
 use crate::experts::ExpertKernels;
@@ -66,6 +68,7 @@ use crate::experts_mxfp4::{
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels, HcPostArgs};
 use crate::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
 use crate::rope::{Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable, TailShape};
+use crate::span::span_mut;
 
 const WHAT: &str = "draft::block";
 
@@ -588,8 +591,8 @@ fn enqueue_ffn(cx: &Cx<'_>, l: usize, b: &mut LayerBufs) -> Result<(), GpuError>
         0.0
     };
     for t in 0..m {
-        let x = view::<f32, _>(&b.normed_f, t * d.n_embd, d.n_embd)?;
-        let mut h = view_mut::<f32, _>(&mut b.sh_h, t * d.ff_shared, d.ff_shared)?;
+        let x = Window::<f32>::of(&b.normed_f, t * d.n_embd * size_of::<f32>(), d.n_embd)?;
+        let mut h = span_mut(WHAT, &mut b.sh_h, t * d.ff_shared, d.ff_shared)?;
         cx.k.experts
             .enqueue_shexp_gate_up(s, gate, up, &x, limit_sh, &mut h)?;
     }
@@ -646,8 +649,8 @@ fn enqueue_embed(
             ),
         });
     }
-    let mut streams = view_mut::<f32, _>(streams0, 0, HC_STREAMS * n)?;
-    let mut input = view_mut::<f32, _>(fold0, 0, n)?;
+    let mut streams = span_mut(WHAT, streams0, 0, HC_STREAMS * n)?;
+    let mut input = span_mut(WHAT, fold0, 0, n)?;
     let (at, hc) = (
         launch_u32(WHAT, "the row's word", e.at)?,
         launch_u32(WHAT, "streams", HC_STREAMS)?,

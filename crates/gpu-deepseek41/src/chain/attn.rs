@@ -65,14 +65,13 @@
 //! windows of those words. The gather's pairs are fixed at load from the
 //! image's layout.
 
-use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, size_of};
-use std::ops::{Deref, Range};
+use std::ops::Range;
 
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{Branch, DeviceTensor, FaultSink, Gpu, GpuError, PartedBuffer, Q8Act, window};
+use bloomery_gpu::{Branch, DeviceTensor, FaultSink, Gpu, GpuError, PartedBuffer, Q8Act, Window};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use model::arch::deepseek41::hparams::Hparams;
@@ -260,56 +259,6 @@ pub struct SourceTaps<'a> {
     pub score: &'a DeviceBuffer<f32>,
     pub pre: &'a DeviceBuffer<f32>,
     pub key: &'a DeviceBuffer<f32>,
-}
-
-/// `len` values of `T` at word `off` of a buffer, read by the launches as a
-/// buffer of their own. It borrows that buffer, which therefore outlives it
-/// and stays in place; dropping it frees nothing.
-struct View<'a, T> {
-    buf: ManuallyDrop<DeviceBuffer<T>>,
-    _parent: PhantomData<&'a ()>,
-}
-
-impl<T> Deref for View<'_, T> {
-    type Target = DeviceBuffer<T>;
-
-    fn deref(&self) -> &DeviceBuffer<T> {
-        &self.buf
-    }
-}
-
-impl<T> Drop for View<'_, T> {
-    fn drop(&mut self) {
-        // SAFETY: `buf` is taken once, here, and never read again.
-        let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        // The window owns no memory: its raw parts are dropped, the context
-        // handle with them, and nothing is freed.
-        drop(buf.into_raw_parts());
-    }
-}
-
-/// A [`View`] of `len` `T` from word `off` of `parent`, both one word wide.
-fn view<P, T>(parent: &DeviceBuffer<P>, off: usize, len: usize) -> Result<View<'_, T>, GpuError> {
-    const { assert!(size_of::<P>() == 4 && size_of::<T>() == 4) };
-    let refuse = || GpuError::Shape {
-        what: WHAT,
-        detail: format!(
-            "a view of {len} words at {off} in a buffer of {}",
-            parent.len()
-        ),
-    };
-    if len == 0 || off.checked_add(len).is_none_or(|end| end > parent.len()) {
-        return Err(refuse());
-    }
-    let bytes = u64::try_from(off * size_of::<P>()).map_err(|_| refuse())?;
-    // SAFETY: the words lie inside `parent`'s allocation (checked above) and
-    // start on a word boundary, which is `T`'s; `parent` is borrowed for the
-    // view's lifetime, so it outlives the view and stays in place.
-    let buf = unsafe { window::<T>(parent.cu_deviceptr() + bytes, len, parent.context()) };
-    Ok(View {
-        buf,
-        _parent: PhantomData,
-    })
 }
 
 /// The gather's pairs while they are laid out: image word → the piece's word.
@@ -523,8 +472,9 @@ struct RowWords<'a> {
 }
 
 impl<'a> RowWords<'a> {
-    fn view<T>(&self, off: usize, len: usize) -> Result<View<'a, T>, GpuError> {
-        view(self.buf, off, len)
+    /// `len` `T` of the row's copy from word `off` of its f32 buffer.
+    fn view<T>(&self, off: usize, len: usize) -> Result<Window<'a, T>, GpuError> {
+        Window::<T>::of(self.buf, off * size_of::<f32>(), len)
     }
 }
 
@@ -1225,7 +1175,7 @@ impl AttnChain {
                 ),
             });
         }
-        let x = view::<u32, f32>(image, 0, image.len())?;
+        let x = Window::<f32>::of(image, 0, image.len())?;
         self.kernels
             .step
             .enqueue_gather(gpu.stream(), &x, &w.src, &w.dst, w.pairs, buf)
@@ -1806,8 +1756,8 @@ fn enqueue_indexer(
         };
         gpu.enqueue_gemv_q3k(q3_k(w, &ip.proj)?, act, qkv.part_mut(INDEX_W))?;
     }
-    let q_in = view(q.part(INDEX_Q), 0, q_len * m)?;
-    let w_in = view(qkv.part(INDEX_W), 0, w_rows * m)?;
+    let q_in = Window::<f32>::of(q.part(INDEX_Q), 0, q_len * m)?;
+    let w_in = Window::<f32>::of(qkv.part(INDEX_W), 0, w_rows * m)?;
     enqueue_select(cx, lp, kernels, sel, &q_in, &w_in, io)
 }
 
