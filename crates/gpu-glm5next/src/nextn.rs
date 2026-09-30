@@ -1,0 +1,1051 @@
+//! The next-token (NextN, MTP) layer on the target's card ([`Nextn`]): its
+//! weights, its store and its walk's arena, opened once at load beside the
+//! target from the NextN plan (`place::PlanInputs::plan_nextn`), and its
+//! program ([`nextn_walk`], [`nextn_chain`]).
+//!
+//! The program is ik's GLM5NEXT MTP graph (`build_glm5next_mtp`,
+//! `build_mtp_input`) over `m` rows (1..=[`WALK_ROWS`]): row `t` is the token
+//! at position `pos0 + t` beside the target's hidden row at `pos0 + t − 1`,
+//! the hidden row being the target's streams' mean normed by `output_norm`
+//! (ik's `result_mtp_embd`). Every launch is an entry the target's chain
+//! already has:
+//! - the store part, every row: the token's embedding row read from the file
+//!   on the host and written as zeros at position 0 (ik's position mask);
+//!   the hidden rows — a target arena's streams' mean (`ds41_hc_mean`) then
+//!   the `output_norm` RMS, or rows from the host already normed; each row's
+//!   `[enorm(e) | hnorm(h)]`, two RMS norms into the halves of its packed
+//!   row; `nextn.eh_proj` over the `m` packed columns (`q8_0_gemv_mcol`);
+//!   `attn_norm`, the joined `[q_a; latent; key; gate]` projection over the
+//!   columns, the latent and index rows appended at the rows' positions and
+//!   the pools they complete — a later row's attention reads nothing else of
+//!   a row, so [`NextnMode::Store`] stops here;
+//! - the full part, the last row alone: the latent mixer of a trunk layer on
+//!   the one-row buffers (`crate::mla::latent_row`, which appends the row
+//!   again, the same bits), the plain residual `h = x + attn`, `ffn_norm`,
+//!   the router over 288 experts with the selection bias, the download of the
+//!   row and its routing to the host tier's batch port, the shared expert
+//!   under the host's union call over the layer's routed experts (every one
+//!   on the host), the upload of their sum, `out = (routed + shared) + h`,
+//!   `shared_head_norm` into the head's input, and the target's `output`
+//!   projection and its argmax (a `HeadNorm::Mixed` head: the norm is the
+//!   layer's own launch).
+//!
+//! The walk runs launch by launch: the host's union call sits in the middle
+//! of it, so no walk is captured ([`NextnMode::Graph`] is refused by name).
+//! The store is by position: one walk may start at or below the end of the
+//! last walk of the sequence, never past it ([`Nextn::held`]); the model's
+//! reset and a cut behind it move that end back.
+//!
+//! A fault a launch raises stays on the card's fault word: the chain's
+//! readback names it as the chain's error, and the target's next readback
+//! names it again and poisons the model.
+
+use bloomery_gpu::head::{Head, HeadNorm};
+use bloomery_gpu::host::BatchLeg;
+use bloomery_gpu::latent::{
+    INDEX_HEAD, INDEX_ROW, IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for,
+};
+use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs};
+use bloomery_gpu::weights::Weights;
+use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel};
+use bloomery_gpu_deepseek41::hc::HC_STREAMS;
+use bloomery_gpu_deepseek41::span::{span, span_mut};
+use cuda_core::{CudaStream, DeviceBuffer};
+use gguf::Split;
+use model::arch::glm5next::names;
+use model::arch::glm5next::place::{NEXTN_ARENA_BYTES, NextnInputs, NextnPlan, PlanInputs};
+use models::{Act, Ffn};
+use runtime::layer::{FfnKind, Layer, MixerKind};
+use runtime::sched::{At, Overlap, Port, PortKind};
+
+use super::prefill::PromptState;
+use super::{Body, Dims, Embedding, Kernels, RowScratch, Scratch, f32t, f32v, gemv, q8, weight};
+use crate::mla::{self, LatentStore};
+use crate::tensors::{FfnNames, LatentNames, LayerNames, MixerNames};
+
+/// What the NextN walk's errors name.
+const WHAT: &str = "glm5next NextN";
+
+/// The most rows one walk takes: the m-column kernels' width.
+pub const WALK_ROWS: usize = COL_GROUP;
+
+/// A target arena whose final hidden rows a NextN walk reads: where a step,
+/// a verify and a prompt batch leave their rows' streams.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlmArena {
+    /// The step's one row: the step's row buffers.
+    Step,
+    /// A verify's two rows: row 0 copied out of the step's row buffers at the
+    /// verify's end (the next step writes them), row 1 in its own.
+    Pair,
+    /// A prompt batch's rows, row `i` the batch's position `i`.
+    Prefill,
+}
+
+/// Where a walk's hidden rows come from.
+#[derive(Clone, Copy, Debug)]
+pub enum NextnHidden<'a> {
+    /// Rows written from the host, [`Body::nextn_hidden_width`] values a row,
+    /// normed as the target's head norms them: the row at position 0 reads a
+    /// zero row, the target holding nothing before it.
+    Host(&'a [f32]),
+    /// The target's rows in the arena `walk`, from its row `first` on, as the
+    /// target's last call of that arena left them.
+    Target { walk: GlmArena, first: usize },
+}
+
+/// A walk's rows: `tokens` at positions `pos0 ..`, each beside its hidden row.
+#[derive(Clone, Copy, Debug)]
+pub struct NextnFeed<'a> {
+    pub tokens: &'a [u32],
+    pub pos0: u32,
+    pub hidden: NextnHidden<'a>,
+}
+
+/// Which projection the draft's head runs: the target's `output`, the whole
+/// vocabulary (the load opens no row list).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextnHead {
+    Full,
+}
+
+/// How a walk runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextnMode {
+    /// Enqueued launch by launch, the last row through the head.
+    Eager,
+    /// Replayed from a capture: refused by name, the walk's host union call
+    /// sits between its launches.
+    Graph,
+    /// Enqueued launch by launch through the store's appends and no further
+    /// (module doc): no head, no readback.
+    Store,
+}
+
+/// The layer's tensor names, made at load.
+struct NextnNames {
+    eh: String,
+    enorm: String,
+    hnorm: String,
+    head_norm: String,
+    latent: LatentNames,
+    ffn_norm: String,
+    router: String,
+    bias: String,
+    sh_gate: String,
+    sh_up: String,
+    sh_down: String,
+}
+
+/// The walk's rows' buffers, up to [`WALK_ROWS`] rows, and the full row's
+/// own: its residual, its block's input and output, the host sums.
+struct Arena {
+    /// The rows' embedding values on the host before their upload.
+    e_host: Vec<f32>,
+    pos_host: Vec<u32>,
+    cnt_host: Vec<u32>,
+    emb: DeviceBuffer<f32>,
+    /// The hidden rows' streams' means, and the rows normed by `output_norm`.
+    hid: DeviceBuffer<f32>,
+    hn: DeviceBuffer<f32>,
+    /// Each row's `[enorm(e) | hnorm(h)]`.
+    pack: DeviceBuffer<f32>,
+    /// `eh_proj`'s rows (the residual), their `attn_norm` and the joined
+    /// projection's rows.
+    x: DeviceBuffer<f32>,
+    xn: DeviceBuffer<f32>,
+    stack: DeviceBuffer<f32>,
+    pos: DeviceBuffer<u32>,
+    cnt: DeviceBuffer<u32>,
+    /// The full row's `h = x + attn`, its `ffn_norm`, the routed and shared
+    /// sum and the layer's output.
+    res: DeviceBuffer<f32>,
+    normed: DeviceBuffer<f32>,
+    moe: DeviceBuffer<f32>,
+    out: DeviceBuffer<f32>,
+    /// The host's routed sum the batch port uploads.
+    hsum: DeviceBuffer<f32>,
+}
+
+impl Arena {
+    fn new(stream: &CudaStream, n: usize, stack: usize) -> Result<Arena, GpuError> {
+        let r = WALK_ROWS;
+        let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
+        Ok(Arena {
+            e_host: vec![0.0; r * n],
+            pos_host: vec![0; r],
+            cnt_host: vec![0; r],
+            emb: z(r * n)?,
+            hid: z(r * n)?,
+            hn: z(r * n)?,
+            pack: z(r * 2 * n)?,
+            x: z(r * n)?,
+            xn: z(r * n)?,
+            stack: z(r * stack)?,
+            pos: DeviceBuffer::zeroed(stream, r)?,
+            cnt: DeviceBuffer::zeroed(stream, r)?,
+            res: z(n)?,
+            normed: z(n)?,
+            moe: z(n)?,
+            out: z(n)?,
+            hsum: z(n)?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        [
+            &self.emb,
+            &self.hid,
+            &self.hn,
+            &self.pack,
+            &self.x,
+            &self.xn,
+            &self.stack,
+            &self.res,
+            &self.normed,
+            &self.moe,
+            &self.out,
+            &self.hsum,
+        ]
+        .iter()
+        .map(|b| b.num_bytes())
+        .sum::<usize>()
+            + self.pos.num_bytes()
+            + self.cnt.num_bytes()
+    }
+}
+
+/// The NextN layer resident on the target's card. See the module doc.
+pub struct Nextn {
+    /// The layer's `blk.` index in the file.
+    index: usize,
+    /// The layer's own weights: its tensors but the routed stacks, and the
+    /// joined projection.
+    w: Weights,
+    names: NextnNames,
+    latent: DeviceTensor<u16>,
+    index_rows: DeviceTensor<u16>,
+    pooled: DeviceTensor<u16>,
+    /// The full row's buffers: a trunk step's one-row buffers.
+    s: RowScratch,
+    a: Arena,
+    /// The verify's row 0 streams, copied at the verify's end.
+    pair0: DeviceBuffer<f32>,
+    /// The head over the target's `output`, its input the layer's own norm.
+    head: Head,
+    /// The shared expert's SwiGLU limit, and whether the file holds the
+    /// router's selection bias.
+    limit: f32,
+    bias: bool,
+    /// Positions of this sequence the store holds: the end of its last walk.
+    held: usize,
+    ctx: usize,
+}
+
+impl Nextn {
+    /// Positions of the current sequence the store holds: a walk may start at
+    /// or below it, never past it.
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Whether the head is a row list: never, this load opens the full head.
+    #[must_use]
+    pub fn head_rows(&self) -> bool {
+        false
+    }
+
+    /// The layer's `blk.` index in the file.
+    #[must_use]
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// Positions the store holds.
+    #[must_use]
+    pub fn ctx(&self) -> usize {
+        self.ctx
+    }
+
+    /// Device bytes of the layer's weights and store.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.w.resident_bytes() + self.store_bytes()
+    }
+
+    /// Device bytes of the walk's arena: its rows, the full row's buffers,
+    /// the verify's row-0 copy and the head.
+    #[must_use]
+    pub fn arena_bytes(&self) -> usize {
+        self.a.bytes() + self.s.bytes() + self.pair0.num_bytes() + self.head.resident_bytes()
+    }
+
+    fn store_bytes(&self) -> usize {
+        self.latent.buf().num_bytes()
+            + self.index_rows.buf().num_bytes()
+            + self.pooled.buf().num_bytes()
+    }
+
+    /// A new sequence: the store holds no position of it.
+    pub(super) fn forget(&mut self) {
+        self.held = 0;
+    }
+
+    /// A cut of the target to `pos`: the store holds no position past it.
+    pub(super) fn cut(&mut self, pos: u32) {
+        self.held = self.held.min(pos as usize);
+    }
+
+    /// The verify's row-0 streams buffer, which the verify's end fills.
+    pub(super) fn pair0_mut(&mut self) -> &mut DeviceBuffer<f32> {
+        &mut self.pair0
+    }
+
+    /// The layer the NextN plan `plan` places, as `inputs` and `nextn`
+    /// describe it, resident on `gpu` beside the target's weights `tw`, from
+    /// `file`: its tensors uploaded from the plan's rows and checked against
+    /// its bytes, the joined projection derived, its store at `ctx`
+    /// positions and its arena, held to [`NEXTN_ARENA_BYTES`]. Refused by
+    /// name: a layer other than a routed latent one, a tensor absent or of
+    /// another type, an upload or a store whose bytes are not the plan's, an
+    /// arena past its bound. Load-time only.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the load's card, file, plans, inputs, the target's weights and widths, its context and page release (rust-quality R8)"
+    )]
+    pub(super) fn open(
+        gpu: &Gpu,
+        file: &Split,
+        plan: &NextnPlan<'_>,
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+        tw: &Weights,
+        d: &Dims,
+        ctx: usize,
+        card_dontneed: bool,
+    ) -> Result<Nextn, GpuError> {
+        let index = nextn.index;
+        let spec =
+            inputs.spec.mtp.first().ok_or_else(|| {
+                shape("the file's description has no next-token layer".to_string())
+            })?;
+        let kind = Layer::of(spec);
+        if kind.mixer != MixerKind::Latent || kind.ffn != FfnKind::Moe {
+            return Err(shape(format!(
+                "layer {index} runs a {:?} mixer and a {:?} block; the NextN program runs a \
+                 latent mixer and a routed block",
+                kind.mixer, kind.ffn
+            )));
+        }
+        let Ffn::Moe(moe) = &spec.ffn else {
+            return Err(shape(format!(
+                "layer {index}: a routed block without its routing"
+            )));
+        };
+        let shared = moe.shared.ok_or_else(|| {
+            shape(format!(
+                "layer {index}: a routed block without its shared expert"
+            ))
+        })?;
+        let Act::SwiGlu { limit } = shared.act;
+        let ln = LayerNames::of(index, kind)?;
+        let (
+            MixerNames::Latent(latent_names),
+            FfnNames::Moe {
+                norm,
+                router,
+                bias,
+                sh_gate,
+                sh_up,
+                sh_down,
+            },
+        ) = (ln.mixer, ln.ffn)
+        else {
+            return Err(shape(format!("layer {index}: names of another kind")));
+        };
+        let names = NextnNames {
+            eh: names::nextn_eh_proj(index),
+            enorm: names::nextn_enorm(index),
+            hnorm: names::nextn_hnorm(index),
+            head_norm: names::nextn_shared_head_norm(index),
+            latent: latent_names,
+            ffn_norm: norm,
+            router,
+            bias,
+            sh_gate,
+            sh_up,
+            sh_down,
+        };
+        gpu.context().bind_to_thread()?;
+        let stream = gpu.stream();
+        let mut w = Weights::load_placed(stream, file, &plan.nextn, 0, card_dontneed)?;
+        let parts = [
+            names::attn_q_a(index),
+            names::attn_kv_a_mqa(index),
+            names::indexer_attn_k(index),
+            names::indexer_compressor_gate(index),
+        ];
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        w.join_rows(stream, &parts, names::attn_a_stack(index))?;
+        let held_bytes = w.resident_bytes() as u64;
+        if held_bytes != plan.nextn_resident_bytes() {
+            return Err(shape(format!(
+                "the layer's weights hold {held_bytes} device bytes; the NextN plan has {}",
+                plan.nextn_resident_bytes()
+            )));
+        }
+        for name in [&names.eh, &names.enorm, &names.hnorm, &names.head_norm] {
+            weight(&w, name)?;
+        }
+        let bias_held = w.get(&names.bias).is_some();
+        if bias_held != moe.router.bias {
+            return Err(shape(format!(
+                "layer {index}: the selection bias resident {bias_held}, the description {}",
+                moe.router.bias
+            )));
+        }
+        let head = Head::with_norm(gpu, tw, d.rms_eps, 1, HeadNorm::Mixed)?;
+        if head.hidden() != d.embd {
+            return Err(shape(format!(
+                "the head projects rows of {} values; the layer's are {}",
+                head.hidden(),
+                d.embd
+            )));
+        }
+        let n = d.embd;
+        let body = Nextn {
+            index,
+            w,
+            names,
+            latent: DeviceTensor::zeroed(stream, ctx, LATENT)?,
+            index_rows: DeviceTensor::zeroed(stream, ctx, INDEX_ROW)?,
+            pooled: DeviceTensor::zeroed(stream, pools_for(ctx), INDEX_HEAD)?,
+            s: RowScratch::new(stream, d, shared.ff as usize, ctx)?,
+            a: Arena::new(stream, n, d.stack())?,
+            pair0: DeviceBuffer::zeroed(stream, HC_STREAMS * n)?,
+            head,
+            limit: limit.unwrap_or(0.0),
+            bias: moe.router.bias,
+            held: 0,
+            ctx,
+        };
+        stream.synchronize()?;
+        let store = body.store_bytes() as u64;
+        if store != plan.nextn.cards[0].kv_bytes {
+            return Err(shape(format!(
+                "the layer's store holds {store} device bytes; the NextN plan has {}",
+                plan.nextn.cards[0].kv_bytes
+            )));
+        }
+        let arena = body.arena_bytes() as u64;
+        if arena > NEXTN_ARENA_BYTES {
+            return Err(shape(format!(
+                "the walk's arena holds {arena} device bytes, past the plan's bound of \
+                 {NEXTN_ARENA_BYTES}"
+            )));
+        }
+        Ok(body)
+    }
+}
+
+/// A shape the walk refuses, by name.
+fn shape(detail: String) -> GpuError {
+    GpuError::Shape { what: WHAT, detail }
+}
+
+/// The target's streams a [`NextnHidden::Target`] feed reads: one buffer of
+/// rows of `4 · n_embd` values, or the verify's two rows apart.
+enum Src<'a> {
+    Rows {
+        buf: &'a DeviceBuffer<f32>,
+        rows: usize,
+    },
+    Pair {
+        row0: &'a DeviceBuffer<f32>,
+        row1: &'a DeviceBuffer<f32>,
+    },
+}
+
+impl Src<'_> {
+    /// Row `r`'s streams, `wide` values.
+    fn row(
+        &self,
+        r: usize,
+        wide: usize,
+    ) -> Result<bloomery_gpu_deepseek41::span::Span<'_, f32>, GpuError> {
+        match *self {
+            Src::Rows { buf, rows } if r < rows => span(WHAT, buf, r * wide, wide),
+            Src::Pair { row0, .. } if r == 0 => span(WHAT, row0, 0, wide),
+            Src::Pair { row1, .. } if r == 1 => span(WHAT, row1, 0, wide),
+            _ => Err(shape(format!("row {r} of the arena's rows"))),
+        }
+    }
+}
+
+/// The target's rows a walk of `m` rows of `n` values reads for `hidden`:
+/// `None` for rows from the host, else the arena's rows from `first` on.
+/// Refused by name: a host slice of other than `m · n` values, prompt-batch
+/// rows before any batch buffers, rows past the arena's.
+fn hidden_src<'a>(
+    s: &'a Scratch,
+    prompt: &'a PromptState,
+    pair0: &'a DeviceBuffer<f32>,
+    layers: usize,
+    hidden: NextnHidden<'_>,
+    m: usize,
+    n: usize,
+) -> Result<Option<(Src<'a>, usize)>, GpuError> {
+    let fin = crate::program::final_streams(layers);
+    let (walk, first) = match hidden {
+        NextnHidden::Host(v) if v.len() != m * n => {
+            return Err(shape(format!(
+                "{} hidden values for {m} rows of {n}",
+                v.len()
+            )));
+        }
+        NextnHidden::Host(_) => return Ok(None),
+        NextnHidden::Target { walk, first } => (walk, first),
+    };
+    let src = match walk {
+        GlmArena::Step => Src::Rows {
+            buf: &s.rows[0].streams[fin],
+            rows: 1,
+        },
+        GlmArena::Pair => Src::Pair {
+            row0: pair0,
+            row1: &s.rows[1].streams[fin],
+        },
+        GlmArena::Prefill => {
+            let (buf, rows) = prompt
+                .final_streams(fin)
+                .ok_or_else(|| shape("prompt-batch rows before any batch buffers".to_string()))?;
+            Src::Rows { buf, rows }
+        }
+    };
+    let rows = match src {
+        Src::Rows { rows, .. } => rows,
+        Src::Pair { .. } => 2,
+    };
+    if first + m > rows {
+        return Err(shape(format!(
+            "rows {first}..{} of the {walk:?} arena's {rows}",
+            first + m
+        )));
+    }
+    Ok(Some((src, first)))
+}
+
+/// The walk's `m` hidden rows into `a.hn`, normed as the target's head
+/// norms them: copied from the host, or each target row's streams' mean
+/// then the `output_norm` RMS.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the card, the target's weights, the kernels and widths, the feed's source resolved and its rows, and the arena (rust-quality R8)"
+)]
+fn enqueue_hidden(
+    gpu: &Gpu,
+    tw: &Weights,
+    k: &Kernels,
+    d: &Dims,
+    hidden: NextnHidden<'_>,
+    src: Option<(Src<'_>, usize)>,
+    m: usize,
+    a: &mut Arena,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let n = d.embd;
+    match (hidden, src) {
+        (NextnHidden::Host(v), _) => {
+            span_mut(WHAT, &mut a.hn, 0, m * n)?.copy_from_host(stream, v)?;
+        }
+        (NextnHidden::Target { .. }, Some((src, first))) => {
+            for t in 0..m {
+                let rowv = src.row(first + t, HC_STREAMS * n)?;
+                k.hc.enqueue_mean(stream, &rowv, n, t * n, &mut a.hid)?;
+            }
+            gpu.elem().enqueue_rms_norm(
+                stream,
+                &a.hid,
+                f32v(tw, &names::output_norm())?,
+                d.rms_eps,
+                n,
+                m,
+                &mut a.hn,
+            )?;
+        }
+        (NextnHidden::Target { .. }, None) => {
+            return Err(shape("the target's rows to read".to_string()));
+        }
+    }
+    Ok(())
+}
+
+impl Body {
+    /// The NextN layer, when the load carries it.
+    #[must_use]
+    pub fn nextn(&self) -> Option<&Nextn> {
+        self.nextn.as_deref()
+    }
+
+    /// Values of one hidden row a NextN walk reads: the model's width.
+    #[must_use]
+    pub fn nextn_hidden_width(&self) -> usize {
+        self.dims.embd
+    }
+
+    /// One NextN walk of `feed` in `mode` (module doc), with no readback;
+    /// `tw` the target's weights (the head's projection, `output_norm`).
+    /// Refused by name before anything moves: a load without the layer, a
+    /// captured walk, rows outside 1..=[`WALK_ROWS`], a token past the
+    /// vocabulary, rows past the store, a walk from past [`Nextn::held`], a
+    /// hidden slice of other than the rows' values, target rows the arena
+    /// does not hold.
+    fn nextn_run(
+        &mut self,
+        gpu: &Gpu,
+        tw: &Weights,
+        feed: NextnFeed<'_>,
+        mode: NextnMode,
+    ) -> Result<(), GpuError> {
+        let layers = self.cfg.len();
+        let Body {
+            hybrid,
+            dims,
+            k,
+            s,
+            prompt,
+            embd,
+            nextn,
+            ..
+        } = self;
+        let nx = nextn
+            .as_deref_mut()
+            .ok_or_else(|| shape("a walk on a load without the NextN layer".to_string()))?;
+        if mode == NextnMode::Graph {
+            return Err(shape(
+                "a captured NextN walk: the host's union call over the layer's routed experts \
+                 sits between its launches"
+                    .to_string(),
+            ));
+        }
+        let d = *dims;
+        let n = d.embd;
+        let m = feed.tokens.len();
+        let pos0 = feed.pos0 as usize;
+        if !(1..=WALK_ROWS).contains(&m) {
+            return Err(shape(format!(
+                "a walk of {m} rows; a walk takes 1..={WALK_ROWS}"
+            )));
+        }
+        if pos0 + m > nx.ctx {
+            return Err(shape(format!(
+                "{m} rows from position {pos0} in a store of {}",
+                nx.ctx
+            )));
+        }
+        if pos0 > nx.held {
+            return Err(shape(format!(
+                "a walk from position {pos0}: the store holds this sequence's positions below {}, \
+                 and the walk would read the rows between",
+                nx.held
+            )));
+        }
+        if let Some(&t) = feed.tokens.iter().find(|&&t| t as usize >= embd.n_vocab) {
+            return Err(shape(format!(
+                "token {t} is past the {} embedding rows",
+                embd.n_vocab
+            )));
+        }
+        let src = hidden_src(s, prompt, &nx.pair0, layers, feed.hidden, m, n)?;
+        let stream = gpu.stream();
+        let fault = gpu.layer_sink(nx.index)?;
+        let Nextn {
+            w,
+            names: nm,
+            latent,
+            index_rows,
+            pooled,
+            s: row,
+            a,
+            head,
+            limit,
+            bias,
+            held,
+            index,
+            ..
+        } = nx;
+        // The rows' embeddings (zeros at position 0) and positions.
+        for t in 0..m {
+            let p = pos0 + t;
+            let e = &mut a.e_host[t * n..(t + 1) * n];
+            if p == 0 {
+                e.fill(0.0);
+            } else {
+                embd.row_into(feed.tokens[t], e)?;
+            }
+            a.pos_host[t] = p as u32;
+            a.cnt_host[t] = p as u32 + 1;
+        }
+        span_mut(WHAT, &mut a.emb, 0, m * n)?.copy_from_host(stream, &a.e_host[..m * n])?;
+        span_mut(WHAT, &mut a.pos, 0, m)?.copy_from_host(stream, &a.pos_host[..m])?;
+        span_mut(WHAT, &mut a.cnt, 0, m)?.copy_from_host(stream, &a.cnt_host[..m])?;
+        enqueue_hidden(gpu, tw, k, &d, feed.hidden, src, m, a)?;
+        // Each row's [enorm(e) | hnorm(h)], then eh_proj over the columns.
+        let (enorm, hnorm) = (f32v(w, &nm.enorm)?, f32v(w, &nm.hnorm)?);
+        for t in 0..m {
+            let e = span(WHAT, &a.emb, t * n, n)?;
+            let h = span(WHAT, &a.hn, t * n, n)?;
+            gpu.elem().enqueue_rms_norm(
+                stream,
+                &e,
+                enorm,
+                d.rms_eps,
+                n,
+                1,
+                &mut *span_mut(WHAT, &mut a.pack, t * 2 * n, n)?,
+            )?;
+            gpu.elem().enqueue_rms_norm(
+                stream,
+                &h,
+                hnorm,
+                d.rms_eps,
+                n,
+                1,
+                &mut *span_mut(WHAT, &mut a.pack, t * 2 * n + n, n)?,
+            )?;
+        }
+        mcol(
+            gpu,
+            w,
+            &nm.eh,
+            &*span(WHAT, &a.pack, 0, m * 2 * n)?,
+            m,
+            &mut a.x,
+        )?;
+        // The store: the joined projection's rows, the latent and index rows
+        // at the rows' positions, the pools they complete.
+        let ln = &nm.latent;
+        let stride = d.stack();
+        gpu.elem().enqueue_rms_norm(
+            stream,
+            &a.x,
+            f32v(w, &ln.norm)?,
+            d.rms_eps,
+            n,
+            m,
+            &mut a.xn,
+        )?;
+        mcol(
+            gpu,
+            w,
+            &ln.stack,
+            &*span(WHAT, &a.xn, 0, m * n)?,
+            m,
+            &mut a.stack,
+        )?;
+        {
+            let rows = span(WHAT, &a.stack, 0, m * stride)?;
+            let pos = span(WHAT, &a.pos, 0, m)?;
+            k.latent.enqueue_latent_append(
+                stream,
+                LatentAppendArgs {
+                    rows: Rows {
+                        x: &rows,
+                        stride,
+                        m,
+                    },
+                    off: d.q_lora,
+                    gain: f32v(w, &ln.kv_a_norm)?,
+                    pos: &pos,
+                    eps: d.rms_eps,
+                    fault,
+                    cache: latent,
+                },
+            )?;
+            k.latent.enqueue_index_key_append(
+                stream,
+                IndexKeyArgs {
+                    rows: Rows {
+                        x: &rows,
+                        stride,
+                        m,
+                    },
+                    k_off: d.q_lora + LATENT,
+                    g_off: d.q_lora + LATENT + d.index_d,
+                    w: f32v(w, &ln.index_norm)?,
+                    b: f32v(w, &ln.index_norm_bias)?,
+                    pos: &pos,
+                    eps: d.norm_eps,
+                    fault,
+                    cache: index_rows,
+                },
+            )?;
+            let cnt = span(WHAT, &a.cnt, 0, m)?;
+            mla::pool(stream, w, k, &ln.sel, index_rows, &cnt, m, fault, pooled)?;
+        }
+        *held = pos0 + m;
+        if mode == NextnMode::Store {
+            return Ok(());
+        }
+        // The full part, the last row alone.
+        let r = m - 1;
+        let p = (pos0 + r) as u32;
+        row.x
+            .copy_from_device_async(&*span(WHAT, &a.x, r * n, n)?, stream)?;
+        row.pos.copy_from_host(stream, &[p])?;
+        row.vis.copy_from_host(stream, &[0, p + 1])?;
+        row.cnt.copy_from_host(stream, &[p + 1])?;
+        mla::latent_row(
+            gpu,
+            w,
+            k,
+            &d,
+            ln,
+            LatentStore {
+                latent,
+                index: index_rows,
+                pooled,
+            },
+            row,
+            fault,
+        )?;
+        gpu.elem()
+            .enqueue_add(stream, &row.out, &row.x, n, &mut a.res)?;
+        gpu.elem().enqueue_rms_norm(
+            stream,
+            &a.res,
+            f32v(w, &nm.ffn_norm)?,
+            d.rms_eps,
+            n,
+            1,
+            &mut a.normed,
+        )?;
+        let sel_bias = if *bias {
+            f32v(w, &nm.bias)?
+        } else {
+            &row.no_bias
+        };
+        k.router.enqueue_router(
+            stream,
+            f32t(w, &nm.router)?,
+            &a.normed,
+            sel_bias,
+            d.scale,
+            &mut row.rout,
+            fault,
+        )?;
+        let at = At {
+            unit: 0,
+            layer: *index,
+        };
+        {
+            let mut leg = BatchLeg::new(stream, hybrid, &mut a.hsum, 1);
+            leg.open(Overlap {
+                units: 1,
+                cols: 1,
+                port: PortKind::Batch,
+            })?;
+            let key = leg.key(at);
+            leg.hybrid().enqueue_download(
+                stream,
+                [&a.normed, &row.rout.weights],
+                &row.rout.ids,
+                key,
+            )?;
+            k.experts.enqueue_shexp_gate_up(
+                stream,
+                weight(w, &nm.sh_gate)?,
+                weight(w, &nm.sh_up)?,
+                &a.normed,
+                *limit,
+                &mut row.h,
+            )?;
+            gemv(gpu, w, &nm.sh_down, &row.h, &mut row.sh_y)?;
+            leg.serve(at)?;
+            gpu.elem()
+                .enqueue_add(stream, leg.hsum(), &row.sh_y, n, &mut a.moe)?;
+        }
+        gpu.elem()
+            .enqueue_add(stream, &a.moe, &a.res, n, &mut a.out)?;
+        gpu.elem().enqueue_rms_norm(
+            stream,
+            &a.out,
+            f32v(w, &nm.head_norm)?,
+            d.rms_eps,
+            n,
+            1,
+            head.input_mut(),
+        )?;
+        head.enqueue(gpu, tw)
+    }
+}
+
+/// `y = W · x` for the q8_0 weight `name` over `c` token columns of `x`,
+/// token-major (`q8_0_gemv_mcol`: each column the one-column gemv's bits).
+fn mcol(
+    gpu: &Gpu,
+    w: &Weights,
+    name: &str,
+    x: &DeviceBuffer<f32>,
+    c: usize,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (qs, d) = q8(w, name)?;
+    gpu.q8f32().enqueue_q8_0_gemv_mcol(
+        gpu.stream(),
+        Q8_0GemvMcolArgs {
+            qs,
+            d,
+            x,
+            m: c,
+            out: GemvOut::TokenMajor,
+            y,
+        },
+    )
+}
+
+/// One NextN walk of `feed` into `head` in `mode`, with no readback
+/// ([`Body::nextn_run`]'s refusals, and a poisoned model's). A fault the walk
+/// raises stays on the card's fault word, which the next readback names.
+pub fn nextn_walk(
+    m: &mut GpuModel<Body>,
+    feed: NextnFeed<'_>,
+    head: NextnHead,
+    mode: NextnMode,
+) -> Result<(), GpuError> {
+    let NextnHead::Full = head;
+    if let Some(fault) = m.poisoned() {
+        return Err(GpuError::Poisoned { what: WHAT, fault });
+    }
+    let (gpu, tw, body) = m.body_parts(WHAT)?;
+    body.nextn_run(gpu, tw, feed, mode)
+}
+
+/// One window's chain, one readback: `refresh` walked eager through the head,
+/// its last row's prediction the proposal's one id, written to `out[0]`; the
+/// count, 1. `own` walks past it are refused by name (a proposal holds one
+/// id), as are a store walk's mode, a captured one and an `out` with no
+/// place. A fault any launch raised is the chain's error.
+pub fn nextn_chain(
+    m: &mut GpuModel<Body>,
+    refresh: NextnFeed<'_>,
+    own: usize,
+    head: NextnHead,
+    mode: NextnMode,
+    out: &mut [u32],
+) -> Result<usize, GpuError> {
+    if own != 0 {
+        return Err(shape(format!(
+            "a chain of {own} own walks; a GLM proposal holds one id"
+        )));
+    }
+    if mode == NextnMode::Store {
+        return Err(shape(
+            "a chain in the store walk's mode: it reads the head".to_string(),
+        ));
+    }
+    let place = out
+        .first_mut()
+        .ok_or_else(|| shape("a proposal of 1 id into 0 places".to_string()))?;
+    nextn_walk(m, refresh, head, mode)?;
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let nx = body
+        .nextn
+        .as_deref()
+        .ok_or_else(|| shape("a chain on a load without the NextN layer".to_string()))?;
+    let tokens = nx.head.tokens(gpu)?;
+    *place = *tokens
+        .first()
+        .ok_or_else(|| shape("a head readback of no token".to_string()))?;
+    Ok(1)
+}
+
+/// The `rows` hidden rows a walk fed `hidden` reads, as the walk norms them
+/// (the model's width a row), read back: the walk's own gather and nothing
+/// after it, the store untouched. Refused as a walk refuses its hidden rows
+/// and its rows' count. Blocking; gate use.
+pub fn nextn_hidden(
+    m: &mut GpuModel<Body>,
+    hidden: NextnHidden<'_>,
+    rows: usize,
+) -> Result<Vec<f32>, GpuError> {
+    if !(1..=WALK_ROWS).contains(&rows) {
+        return Err(shape(format!(
+            "{rows} hidden rows; a walk takes 1..={WALK_ROWS}"
+        )));
+    }
+    let (gpu, tw, body) = m.body_parts(WHAT)?;
+    let layers = body.cfg.len();
+    let d = body.dims;
+    let Body {
+        k,
+        s,
+        prompt,
+        nextn,
+        ..
+    } = body;
+    let nx = nextn
+        .as_deref_mut()
+        .ok_or_else(|| shape("hidden rows on a load without the NextN layer".to_string()))?;
+    let src = hidden_src(s, prompt, &nx.pair0, layers, hidden, rows, d.embd)?;
+    enqueue_hidden(gpu, tw, k, &d, hidden, src, rows, &mut nx.a)?;
+    let mut v = nx.a.hn.to_host_vec(gpu.stream())?;
+    v.truncate(rows * d.embd);
+    Ok(v)
+}
+
+/// The last full walk's head logits (`n_vocab` f32). Blocking; gate use.
+pub fn nextn_logits(m: &mut GpuModel<Body>) -> Result<Vec<f32>, GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let nx = body
+        .nextn
+        .as_deref()
+        .ok_or_else(|| shape("logits on a load without the NextN layer".to_string()))?;
+    nx.head.logits_to_host(gpu)
+}
+
+/// The NextN layer's store as the card holds it: its latent rows and index
+/// rows, `n` positions of each. Blocking; gate use.
+pub fn nextn_store(m: &mut GpuModel<Body>, n: usize) -> Result<(Vec<u16>, Vec<u16>), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let nx = body
+        .nextn
+        .as_deref()
+        .ok_or_else(|| shape("a store on a load without the NextN layer".to_string()))?;
+    if n > nx.ctx {
+        return Err(shape(format!("{n} positions of a store of {}", nx.ctx)));
+    }
+    let stream = gpu.stream();
+    let mut lat = nx.latent.buf().to_host_vec(stream)?;
+    let mut idx = nx.index_rows.buf().to_host_vec(stream)?;
+    lat.truncate(n * LATENT);
+    idx.truncate(n * INDEX_ROW);
+    Ok((lat, idx))
+}
+
+impl Embedding {
+    /// Token `token`'s embedding row into `out`, one copy; a token past the
+    /// vocabulary is refused by name.
+    pub(super) fn row_into(&self, token: u32, out: &mut [f32]) -> Result<(), GpuError> {
+        let t = token as usize;
+        if t >= self.n_vocab {
+            return Err(shape(format!(
+                "token {token} is past the {} embedding rows",
+                self.n_vocab
+            )));
+        }
+        let data = self
+            .file
+            .shard(self.shard)
+            .ok_or(GpuError::State {
+                what: WHAT,
+                missing: "the embedding's shard",
+            })?
+            .data(&self.info)?;
+        let src = &data[t * self.row_bytes..][..self.row_bytes];
+        gguf::quant::dequant_row(gguf::GgmlType::Q8_0, src, out)
+            .map_err(model::ModelError::from)?;
+        Ok(())
+    }
+}

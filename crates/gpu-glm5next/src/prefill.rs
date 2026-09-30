@@ -89,6 +89,7 @@ use model::moe::UNION_MAX_COLS;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
+use super::nextn::GlmArena;
 use super::{
     Body, Dims, Embedding, Glm5nextModel, LANES, Parts, Store, f32t, f32v, prompt, q8, shape,
     weight,
@@ -157,7 +158,22 @@ impl PromptState {
     pub(crate) fn bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, |b| b.bytes())
     }
+
+    /// The stream buffer `fin` of the batch's rows, where a batch's walk
+    /// leaves every row's final streams, and the rows it holds; `None`
+    /// before the batch's buffers are made.
+    pub(crate) fn final_streams(&self, fin: usize) -> Option<(&DeviceBuffer<f32>, usize)> {
+        let b = self.batch.as_deref()?;
+        Some((b.bufs.streams.get(fin)?, b.bufs.cap))
+    }
 }
+
+/// A prompt call's tap ([`prompt_with`]): called after each unit the call
+/// runs — a batch, or a step — with the arena its rows' final streams sit in,
+/// the unit's first position and its rows, before the next unit overwrites
+/// them.
+pub type GlmPromptSink<'a> =
+    dyn FnMut(&mut Glm5nextModel, GlmArena, u32, usize) -> Result<(), GpuError> + 'a;
 
 /// The batch's buffers: the walk's, and the host sums the batch port uploads
 /// (lent to the port apart from them).
@@ -499,6 +515,66 @@ fn call<T>(
     Ok(v)
 }
 
+/// Feed `ids` from where `m` stands by `mode` and return the argmax after
+/// the last, `sink` called after each unit the call runs ([`GlmPromptSink`]):
+/// each batch of [`prefill`] ([`GlmArena::Prefill`]), or each step
+/// ([`GlmArena::Step`]), one a position. Refused by name before anything runs
+/// as [`feed`] refuses. `None` is [`feed`]'s call by `mode`. A sink's error
+/// ends the call with it, its positions taken back as a failed call's are.
+pub fn prompt_with(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    mode: PrefillMode,
+    sink: Option<&mut GlmPromptSink<'_>>,
+) -> Result<u32, GpuError> {
+    check_call(m, ids)?;
+    match (mode, sink) {
+        (PrefillMode::Batch, sink) => call(m, |m| prefill_units(m, ids, sink)),
+        (PrefillMode::Steps, None) => {
+            super::refuse_steps_under_residency(m)?;
+            prompt(m, ids)
+        }
+        (PrefillMode::Steps, Some(sink)) => {
+            super::refuse_steps_under_residency(m)?;
+            steps_with(m, ids, sink)
+        }
+    }
+}
+
+/// [`prompt`]'s steps one position each, `sink` called after each with the
+/// step's arena, and its checkpoints at the call's marks.
+fn steps_with(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    sink: &mut GlmPromptSink<'_>,
+) -> Result<u32, GpuError> {
+    let from = m.pos();
+    let to = end_of(from, ids.len())?;
+    let marks = m.body(WHAT)?.ckpt.marks(from, to);
+    let mut argmax = None;
+    let mut at = from;
+    for mark in marks {
+        while at < mark {
+            let id = ids[(at - from) as usize];
+            let r = m
+                .step(&[id])
+                .and_then(|t| sink(m, GlmArena::Step, at, 1).map(|()| t));
+            match r {
+                Ok(t) => argmax = Some(t),
+                Err(e) => return Err(take_back(m, from, e)),
+            }
+            at += 1;
+        }
+        let pos = m.pos();
+        let (gpu, _, body) = m.body_parts(WHAT)?;
+        body.checkpoint(gpu, pos)?;
+    }
+    argmax.ok_or(GpuError::State {
+        what: WHAT,
+        missing: "a mark at the call's end",
+    })
+}
+
 /// The body's feed mode.
 pub fn prefill_mode(m: &Glm5nextModel) -> Result<PrefillMode, GpuError> {
     Ok(m.body(WHAT)?.prompt.mode)
@@ -523,6 +599,15 @@ pub fn set_prefill(m: &mut Glm5nextModel, mode: PrefillMode) -> Result<bool, Gpu
 /// holds one token's streams, and a batch runs many). The batch's buffers
 /// are made by the first call when [`set_prefill`] has not made them.
 pub fn prefill(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
+    prefill_units(m, ids, None)
+}
+
+/// [`prefill`], `sink` called after each batch ([`prompt_with`]).
+fn prefill_units(
+    m: &mut Glm5nextModel,
+    ids: &[u32],
+    mut sink: Option<&mut GlmPromptSink<'_>>,
+) -> Result<u32, GpuError> {
     let to = check_call(m, ids)?;
     let from = m.pos();
     {
@@ -546,6 +631,10 @@ pub fn prefill(m: &mut Glm5nextModel, ids: &[u32]) -> Result<u32, GpuError> {
             let ran = m.run_rows(seg.len(), WHAT, |gpu, w, body, head, pos| {
                 body.enqueue_batch(gpu, w, head, seg, pos, last)
             });
+            let ran = match (ran, sink.as_deref_mut()) {
+                (Ok(t), Some(s)) => s(m, GlmArena::Prefill, run.start, seg.len()).map(|()| t),
+                (r, _) => r,
+            };
             match ran {
                 Ok(t) => argmax = t.or(argmax),
                 Err(e) => return Err(take_back(m, from, e)),
@@ -672,6 +761,15 @@ fn prompt_keys(rows: usize, positions: Range<usize>, dense: usize) -> Result<Key
 }
 
 impl Body {
+    /// The host tier's batch sets and the host union's slabs for batches of
+    /// the batch feed's size, made once, without the batch's buffers: what a
+    /// NextN walk's host leg serves through.
+    pub(super) fn prepare_port(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        let cap = T_MAX.min(self.ctx);
+        self.hybrid.prepare_batch(gpu.context(), cap)?;
+        self.hybrid.host_mut().prepare_union(cap)
+    }
+
     /// The batch feed's buffers, the host tier's batch sets for as many
     /// tokens and the host union's slabs, made once.
     fn make_batch(&mut self, gpu: &Gpu) -> Result<(), GpuError> {

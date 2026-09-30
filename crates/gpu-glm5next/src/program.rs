@@ -74,6 +74,15 @@ pub fn layer_launches(mixer: MixerKind, ffn: FfnKind, card: bool) -> usize {
     2 * 3 + mix + block
 }
 
+/// The stream buffer a row's streams end in after a walk of `layers`
+/// layers from buffer 0: each layer's two sub-layers flip it once each
+/// (`hc_post` writes the other buffer), the step's walk and a prompt
+/// batch's alike.
+#[must_use]
+pub(crate) const fn final_streams(layers: usize) -> usize {
+    (2 * layers) % 2
+}
+
 /// Walk the step over `parts`, the host tier opened for it first, into
 /// `head`.
 pub(crate) fn walk_step(

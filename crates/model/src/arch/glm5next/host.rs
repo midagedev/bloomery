@@ -8,19 +8,20 @@ use crate::ModelError;
 use crate::moe::{HostLayer, HostLayerSpec};
 use crate::r8file::R8Source;
 
-/// Trunk layer `layer`'s routed experts as the host tier serves them, built
-/// from `src` ([`HostLayer::build`]) with the routed limit
-/// (`swiglu_clamp_exp`); `None` for a dense layer, an error for a layer past
-/// the trunk. Load-time only: the stacks are checked here.
+/// Layer `layer`'s routed experts as the host tier serves them — a trunk
+/// layer's, or the next-token layer's when its load carries it — built from
+/// `src` ([`HostLayer::build`]) with the routed limit (`swiglu_clamp_exp`);
+/// `None` for a dense layer, an error for a layer past the file's. Load-time
+/// only: the stacks are checked here.
 pub fn layer(
     src: R8Source<'_>,
     hp: &Hparams,
     layer: usize,
 ) -> Result<Option<HostLayer>, ModelError> {
-    if layer >= hp.n_trunk {
+    if layer >= hp.n_layer {
         return Err(ModelError::Shape {
-            what: "glm5next host layer: [trunk layers, 1], a trunk layer",
-            want_ne0: hp.n_trunk,
+            what: "glm5next host layer: [layers, 1], a layer of the file",
+            want_ne0: hp.n_layer,
             want_ne1: 1,
             got_ne0: layer,
             got_ne1: 1,
