@@ -596,6 +596,14 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // at U 4,096 (303/302 → 299/298, 149 experts off the card) and the 3090 32k
 // row at U 4,096 (103/102 → 98, 176 experts), the smallest the rows whose
 // budget slack absorbed the term].
+// PIN(2026-09-30): the eight draft rows re-pinned for the MTP program's arena,
+// which the draft's plan now reserves beside its card bytes
+// (`place::mtp_arena_bytes`, 25,479,044 B at ctx 4,096 and 114,247,556 B at
+// 32,768 with the full 248,320-row head): each row's card experts plus
+// rounding fall by that arena to within the 2 MiB granules the spread fills
+// (25,165,824 B at 4k, 111,149,056–115,343,360 B at 32k) [derived]; the
+// values are the planner's on the box (the lead's window C, 2026-09-30),
+// which the old pins held red on this tree and green before the arena term.
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -625,10 +633,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         278,
-        20,
+        14,
         277,
-        36_652_032_000,
-        532_533_760,
+        36_633_600_000,
+        525_799_936,
     ),
     (
         "A6000",
@@ -636,10 +644,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         299,
-        12,
+        8,
         298,
-        39_401_472_000,
-        480_031_232,
+        39_389_184_000,
+        467_153_408,
     ),
     (
         "A6000",
@@ -668,22 +676,22 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         32_768,
         true,
         4_096,
-        271,
-        27,
         270,
-        35_748_864_000,
-        563_286_528,
+        43,
+        270,
+        35_665_920_000,
+        532_984_320,
     ),
     (
         "A6000",
         32_768,
         true,
         512,
-        292,
-        16,
         291,
-        38_489_088_000,
-        515_805_696,
+        38,
+        290,
+        38_424_576_000,
+        469_168_640,
     ),
     (
         "3090",
@@ -712,11 +720,11 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         4_096,
         true,
         4_096,
-        85,
-        1,
         84,
-        11_099_136_000,
-        485_495_296,
+        33,
+        83,
+        11_065_344_000,
+        494_121_472,
     ),
     (
         "3090",
@@ -724,10 +732,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         105,
-        13,
+        9,
         104,
-        13_777_920_000,
-        499_454_464,
+        13_765_632_000,
+        486_576_640,
     ),
     (
         "3090",
@@ -756,22 +764,22 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         32_768,
         true,
         4_096,
-        78,
-        8,
         77,
-        10_195_968_000,
-        516_248_064,
+        4,
+        76,
+        10_051_584_000,
+        545_288_704,
     ),
     (
         "3090",
         32_768,
         true,
         512,
-        98,
-        17,
-        97,
-        12_865_536_000,
-        535_228_928,
+        96,
+        42,
+        95,
+        12_678_144_000,
+        609_374_720,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
