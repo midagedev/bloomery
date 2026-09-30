@@ -11,6 +11,7 @@
 
 use gguf::{GgmlType, Split};
 use models::ModelSpec;
+use runtime::stores;
 
 use super::hparams::{Hparams, Kind};
 use super::{roles, spec};
@@ -28,6 +29,11 @@ const F32_BYTES: u64 = 4;
 /// ring keeps `conv − 1 + PASS_ROWS` inputs. The card body binds it to its
 /// kernels' own constant.
 pub const PASS_ROWS: usize = 8;
+
+/// Lanes of a KDA layer's recurrent state: a verify of up to this many rows
+/// keeps the state after each row in a lane of its own, each lane stamped
+/// with its position. The card body binds it to its own constant.
+pub const KDA_LANES: usize = 2;
 
 /// The routed stacks the program's card experts run, in their file bytes
 /// ([`CardFormat::KQuant`]): Q4_K (the gate·up) and Q5_K (a gate·up or the
@@ -158,9 +164,9 @@ impl PlanInputs {
 }
 
 /// One file's per-layer bytes beside the weights: a KDA layer's recurrent
-/// state (`n_head` heads of `d × d` f32) and conv ring (`conv − 1 +
-/// PASS_ROWS` rows of the q, k and v channels in f32), both fixed by the
-/// file; a latent layer's cache, a latent row and an index row
+/// state ([`KDA_LANES`] lanes of `n_head` heads of `d × d` f32, a u32 stamp
+/// a lane) and conv ring (`conv − 1 + PASS_ROWS` rows of the q, k and v
+/// channels in f32), both fixed by the file; a latent layer's cache, a latent row and an index row
 /// (`[key; gate]`, twice the indexer's key width) in f16 a position, and a
 /// pool key (the indexer's key width in f16) every `kpool` positions, the
 /// last pool whole.
@@ -191,12 +197,15 @@ impl KvLayout {
     }
 }
 
-/// A KDA layer's state and conv ring over `heads` heads `d` wide with a
-/// `conv`-tap conv, in bytes.
+/// A KDA layer's state of [`KDA_LANES`] lanes with their stamps and its conv
+/// ring over `heads` heads `d` wide with a `conv`-tap conv, in bytes: the
+/// lanes past the first counted by `runtime::stores`, the rule the delta
+/// stores are allocated by.
 fn recurrent_bytes(heads: usize, d: usize, conv: usize) -> u64 {
+    let lanes = stores::delta_lane_bytes(heads, d, KDA_LANES);
     let (heads, d) = (heads as u64, d as u64);
     let ring_rows = (conv as u64).saturating_sub(1) + PASS_ROWS as u64;
-    heads * d * d * F32_BYTES + ring_rows * 3 * heads * d * F32_BYTES
+    heads * d * d * F32_BYTES + lanes + ring_rows * 3 * heads * d * F32_BYTES
 }
 
 /// A latent layer's cache bytes a position: the `latent`-wide row and the
@@ -219,13 +228,16 @@ impl KvBytes for KvLayout {
 mod tests {
     use super::{Kind, KvBytes, KvLayout, recurrent_bytes, row_bytes};
 
-    /// GLM-5.3-Flash's sizes: a KDA layer holds 64 heads of 128 × 128 f32 and
-    /// eleven conv rows of 24,576 f32 channels; a latent layer 512 + 256 f16 a
-    /// position and 128 f16 a pool of four, the last one whole; a layer past
-    /// the trunk nothing.
+    /// GLM-5.3-Flash's sizes: a KDA layer holds two lanes of 64 heads of 128
+    /// × 128 f32, a u32 stamp a lane, and eleven conv rows of 24,576 f32
+    /// channels; a latent layer 512 + 256 f16 a position and 128 f16 a pool
+    /// of four, the last one whole; a layer past the trunk nothing.
     #[test]
     fn glm_layer_bytes() {
-        assert_eq!(recurrent_bytes(64, 128, 4), 4_194_304 + 11 * 24_576 * 4);
+        assert_eq!(
+            recurrent_bytes(64, 128, 4),
+            2 * 4_194_304 + 2 * 4 + 11 * 24_576 * 4
+        );
         assert_eq!(row_bytes(512, 128), 1536);
         let kv = KvLayout {
             kinds: vec![Kind::Kda, Kind::Kda, Kind::Kda, Kind::Latent],
@@ -234,7 +246,7 @@ mod tests {
             pool_row: 256,
             kpool: 4,
         };
-        assert_eq!(kv.layer_bytes(0, 2051), 5_275_648);
+        assert_eq!(kv.layer_bytes(0, 2051), 9_469_960);
         assert_eq!(kv.layer_bytes(3, 2051), 2051 * 1536 + 513 * 256);
         assert_eq!(kv.layer_bytes(3, 16_384), 16_384 * (1536 + 64));
         assert_eq!(kv.layer_bytes(4, 2051), 0);

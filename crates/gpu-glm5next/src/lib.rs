@@ -12,6 +12,8 @@
 //!   behind `GpuModel`;
 //! - `program`: the step's walk and its host leg's port;
 //! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps;
+//! - `body::pair`: the verify of two rows behind `Rows`, bit for bit two
+//!   steps, and its commit over the KDA lanes;
 //! - `kda`, `mla`: the two mixers; `ffn`: the dense block, and the routed
 //!   block around its host leg with its card experts in the leg's shadow;
 //! - `host`: the host tier's routed stacks;
@@ -35,7 +37,7 @@ pub use body::prefill::{
     CHUNK, PrefillMode, StoreDigest, T_MAX, batches_of, call_batches, feed, prefill, prefill_mode,
     set_prefill, store_digests,
 };
-pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, Plant, prompt, set_taps};
+pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, PAIR_ROWS, Plant, prompt, set_taps};
 pub use host::GlmHost;
 pub use program::{layer_launches, step_launches};
 pub use swap::{DEADLINE, LIVE_DELAY};

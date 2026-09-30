@@ -24,6 +24,18 @@
 //! lanes` and copies nothing. Each token's `o` and each state are the bits
 //! `gdn_delta` writes: the loop is its loop, the stores placed per row.
 //!
+//! `kda_delta_lanes` is `kda_delta` over stamped lanes by the same rule, with
+//! one more launch value, the row base `row`: the call's first token is row
+//! `row` of a verify whose rows before it an earlier launch of the same verify
+//! ran, one launch a row. It reads the lane the row before it wrote — lane
+//! [`read_lane`]`(c, row)`, `c` itself for row 0 — checks that lane's stamp
+//! against `pos[0]`, and in row mode writes the state after token `j` into
+//! lane [`row_lane`]`(c, row + j)`: the lanes a one-launch verify of the same
+//! rows writes, so the commit rule is the one above. A verify of one token a
+//! row writes row 0 in place and row `r` into lane `c + r`; the one-token step
+//! and a prompt batch are row 0 in place. In place mode takes row 0 only, and
+//! row mode `row + m <= lanes`; the launcher refuses anything else by name.
+//!
 //! Geometry: a warp owns four value columns of one head, eight lanes per
 //! column; lane `j` of a column holds its [`KEYS_PER_LANE`] keys
 //! `32·r + 4·j + c` (`r, c = 0..4`, in `(r, c)` order). Four warps per block,
@@ -31,10 +43,10 @@
 //! barrier: a column's two dot products are a lane's own sums, then a
 //! butterfly over its eight lanes.
 //!
-//! Two entries share the body: `gdn_delta`, one decay per value head
-//! (Gated DeltaNet), and `kda_delta`, one per (value head, key channel)
-//! (Kimi Delta Attention), read `[m][n_v][HEAD]` by the lane's own sixteen
-//! keys.
+//! Two entries share each body: `gdn_delta` and `gdn_delta_lanes`, one decay
+//! per value head (Gated DeltaNet), and `kda_delta` and `kda_delta_lanes`,
+//! one per (value head, key channel) (Kimi Delta Attention), read
+//! `[m][n_v][HEAD]` by the lane's own sixteen keys.
 //!
 //! Numeric contract (the host rules [`delta_host`] and [`kda_delta_host`]
 //! are this list), per token and column:
@@ -486,9 +498,68 @@ mod delta_kernels {
         // 0's thread 0 alone (the body's doc); the launcher checks n_k
         // divides n_v, `m <= lanes` in row mode, the block width and the grid.
         unsafe {
-            delta_lanes_body(
-                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, each, pos, fault, o,
-                state, stamp,
+            delta_lanes_body::<DECAY_HEAD>(
+                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, each, 0, pos, fault,
+                o, state, stamp,
+            );
+        }
+    }
+
+    /// [`kda_delta`] over `lanes` lanes with their stamps, from row `row` of
+    /// a verify (module doc): lane [`read_lane`]`(c, row)` read, checked
+    /// against `pos[0]`, and written in place (`each == 0`, `row == 0`) or
+    /// token `j` into lane [`row_lane`]`(c, row + j)` (`each != 0`, `row + m
+    /// <= lanes`), `c = lane[lane_at] mod lanes`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            qkv.len() >= m * (2 * n_k + n_v) * 128,
+            beta.len() >= m * n_v,
+            decay.len() >= m * n_v * 128,
+            lane.len() >= lane_at + 1,
+            lanes >= 1,
+            pos.len() >= 1,
+            o.len() >= m * n_v * 128,
+            state.len() >= lanes * n_v * 16384,
+            stamp.len() >= lanes
+        )
+    )]
+    pub fn kda_delta_lanes(
+        qkv: &[f32],
+        beta: &[f32],
+        decay: &[f32],
+        lane: &[u32],
+        lane_at: u32,
+        lanes: u32,
+        n_k: u32,
+        n_v: u32,
+        grouped: u32,
+        m: u32,
+        each: u32,
+        row: u32,
+        pos: &[u32],
+        fault: FaultSink,
+        mut o: DisjointSlice<f32>,
+        mut state: DisjointSlice<f32>,
+        mut stamp: DisjointSlice<u32>,
+    ) {
+        let o = o.as_mut_ptr();
+        let state = state.as_mut_ptr();
+        let stamp = stamp.as_mut_ptr();
+        // SAFETY: as gdn_delta_lanes', with the contract's m·n_v·HEAD decay
+        // values the body reads for DECAY_KEY; the launcher checks `row <
+        // lanes`, row 0 in place mode and `row + m <= lanes` in row mode.
+        unsafe {
+            delta_lanes_body::<DECAY_KEY>(
+                qkv, beta, decay, lane, lane_at, lanes, n_k, n_v, grouped, m, each, row, pos,
+                fault, o, state, stamp,
             );
         }
     }
@@ -507,7 +578,8 @@ pub struct DeltaArgs<'a> {
     pub decay: &'a DeviceBuffer<f32>,
     pub lane: &'a DeviceBuffer<u32>,
     pub lane_at: usize,
-    /// Lanes of `state`; only 1 is built.
+    /// Lanes of `state`: 1 for [`DeltaKernels::enqueue_delta`] and
+    /// [`DeltaKernels::enqueue_kda_delta`], any for the stamped entries.
     pub lanes: usize,
     pub shape: LinearShape,
     pub m: usize,
@@ -781,16 +853,33 @@ fn delta_rule_host<const DECAY: u32>(
 /// so reading the lane raises [`FaultSite::DeltaStamp`].
 pub const NEVER: u32 = u32::MAX;
 
-/// The loop of one block of `gdn_delta_lanes` (module doc): [`delta_body`]'s
-/// loop for [`DECAY_HEAD`] over lane `c = lane[lane_at] mod lanes`, with the
-/// stamp check and writes on block 0's thread 0 and the state stored per
-/// row (`each != 0`) or once after the last token.
+/// The lane row `j` of a verify writes when the verify's lanes start from
+/// the committed lane `c`: `(c + j) mod lanes`. A host that keeps the first
+/// `k` rows moves the lane word to `row_lane(c, k − 1)`.
+#[must_use]
+pub const fn row_lane(c: u32, j: u32, lanes: u32) -> u32 {
+    (c + j) % lanes
+}
+
+/// The lane row `row` of a verify reads when the verify's lanes start from
+/// the committed lane `c`: the lane the row before it wrote, `c` itself for
+/// row 0.
+#[must_use]
+pub const fn read_lane(c: u32, row: u32, lanes: u32) -> u32 {
+    if row == 0 { c } else { (c + row - 1) % lanes }
+}
+
+/// The loop of one block of `gdn_delta_lanes` and `kda_delta_lanes` (module
+/// doc): [`delta_body`]'s loop for `DECAY` over lane [`read_lane`]`(c, row)`,
+/// `c = lane[lane_at] mod lanes`, with the stamp check and writes on block
+/// 0's thread 0 and the state stored per row (`each != 0`) or once after the
+/// last token.
 ///
 /// # Safety
 ///
-/// [`delta_body`]'s contract for [`DECAY_HEAD`], and `pos` holds a word,
-/// `stamp` addresses `lanes` writable u32s no other launch touches, and
-/// `m <= lanes` when `each != 0`.
+/// [`delta_body`]'s contract for `DECAY`, and `pos` holds a word, `stamp`
+/// addresses `lanes` writable u32s no other launch touches, `row == 0` when
+/// `each == 0`, and `row + m <= lanes` when `each != 0`.
 #[allow(
     clippy::too_many_arguments,
     reason = "the kernel entry's arguments, forwarded flat"
@@ -800,7 +889,7 @@ pub const NEVER: u32 = u32::MAX;
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn delta_lanes_body(
+unsafe fn delta_lanes_body<const DECAY: u32>(
     qkv: &[f32],
     beta: &[f32],
     decay: &[f32],
@@ -812,6 +901,7 @@ unsafe fn delta_lanes_body(
     grouped: u32,
     m: u32,
     each: u32,
+    row: u32,
     pos: &[u32],
     fault: FaultSink,
     o: *mut f32,
@@ -837,18 +927,20 @@ unsafe fn delta_lanes_body(
         fault.raise(FaultSite::DeltaLane);
     }
     let c = word % lanes;
+    let rin = if row == 0 { c } else { (c + row - 1) % lanes };
     if b == 0 && tid == 0 {
-        // SAFETY: c < lanes and every (c + t) mod lanes < lanes: inside the
-        // `lanes` stamps; block 0's thread 0 is their only reader and writer
-        // in the launch, and it reads stamp c before it writes any.
+        // SAFETY: rin < lanes and every (c + row + t) mod lanes < lanes:
+        // inside the `lanes` stamps; block 0's thread 0 is their only reader
+        // and writer in the launch, and it reads stamp rin before it writes
+        // any.
         unsafe {
-            if *stamp.add(c as usize) != p0 {
+            if *stamp.add(rin as usize) != p0 {
                 fault.raise(FaultSite::DeltaStamp);
             }
             if each != 0 {
                 let mut t = 0u32;
                 while (t as usize) < m {
-                    *stamp.add(((c + t) % lanes) as usize) = p0.wrapping_add(t + 1);
+                    *stamp.add(((c + row + t) % lanes) as usize) = p0.wrapping_add(t + 1);
                     t += 1;
                 }
             } else {
@@ -871,38 +963,56 @@ unsafe fn delta_lanes_body(
     let v_at = 2 * n_k * HEAD + h * HEAD + col;
     let lane_len = n_v * HEAD * HEAD;
     let col_at = (h * HEAD + col) * HEAD;
-    let s_at = c as usize * lane_len + col_at;
+    let s_at = rin as usize * lane_len + col_at;
 
     // SAFETY: as in `delta_body`: the rows read are inside qkv and the
-    // column inside lane c of the state (`c < lanes`), 16-byte aligned; the
-    // state is read before this thread writes its keys of any lane, and no
-    // other thread touches them.
+    // column inside lane rin of the state (`rin < lanes`), 16-byte aligned;
+    // the state is read before this thread writes its keys of any lane, and
+    // no other thread touches them.
     let (qkv_g, state_g) = (global_addr(qkv.as_ptr()), global_addr(state.cast_const()));
     // SAFETY: s_at + HEAD <= lanes·n_v·HEAD·HEAD, the column inside state.
     let mut s = unsafe { lane_keys::<false>(state_g + 4 * s_at as u64, j) };
     let mut raised = false;
     let mut t = 0usize;
     while t < m {
-        let row = t * ch;
+        let row_at = t * ch;
         // SAFETY: whole heads inside qkv, as in `delta_body`.
         let (k, q) = unsafe {
             (
-                lane_keys::<true>(qkv_g + 4 * (row + k_at) as u64, j),
-                lane_keys::<true>(qkv_g + 4 * (row + q_at) as u64, j),
+                lane_keys::<true>(qkv_g + 4 * (row_at + k_at) as u64, j),
+                lane_keys::<true>(qkv_g + 4 * (row_at + q_at) as u64, j),
             )
         };
-        // SAFETY: row + v_at < m·ch; t·n_v + h < m·n_v <= the lengths of
-        // beta and decay.
+        let dk = if DECAY == DECAY_HEAD {
+            [0.0f32; KEYS_PER_LANE]
+        } else {
+            // SAFETY: the per-key decay row (t·n_v + h)·HEAD .. + HEAD is
+            // inside decay's m·n_v·HEAD values for DECAY_KEY, a multiple of
+            // four floats from an aligned base, and no launch writes it
+            // while this one runs.
+            unsafe {
+                lane_keys::<true>(
+                    global_addr(decay.as_ptr()) + 4 * ((t * n_v + h) * HEAD) as u64,
+                    j,
+                )
+            }
+        };
+        // SAFETY: row_at + v_at < m·ch; t·n_v + h < m·n_v <= the lengths of
+        // beta and (per head) decay.
         let (vt, bt, dh) = unsafe {
             (
-                *qkv.get_unchecked(row + v_at),
+                *qkv.get_unchecked(row_at + v_at),
                 *beta.get_unchecked(t * n_v + h),
-                *decay.get_unchecked(t * n_v + h),
+                if DECAY == DECAY_HEAD {
+                    *decay.get_unchecked(t * n_v + h)
+                } else {
+                    0.0
+                },
             )
         };
         for i in 0..KEYS_PER_LANE {
             cuda_device::thread::__unroll_config::<0>();
-            s[i] = mul_rn_f32(s[i], dh);
+            s[i] = mul_rn_f32(s[i], if DECAY == DECAY_HEAD { dh } else { dk[i] });
         }
         let kv = column_sum(lane_dot(s, k));
         let u = mul_rn_f32(vt - kv, bt);
@@ -921,12 +1031,12 @@ unsafe fn delta_lanes_body(
             unsafe { *o.add((t * n_v + h) * HEAD + col) = y };
         }
         if each != 0 {
-            let at = ((c as usize + t) % lanes as usize) * lane_len + col_at;
+            let at = ((c as usize + row as usize + t) % lanes as usize) * lane_len + col_at;
             for i in 0..KEYS_PER_LANE {
                 cuda_device::thread::__unroll_config::<0>();
-                // SAFETY: lane (c + t) mod lanes < lanes, so this lane's
-                // sixteen keys of the column are inside state; this thread
-                // is their only writer.
+                // SAFETY: lane (c + row + t) mod lanes < lanes, so this
+                // lane's sixteen keys of the column are inside state; this
+                // thread is their only writer.
                 unsafe { *state.add(at + key_of(j, i)) = s[i] };
             }
         }
@@ -935,7 +1045,8 @@ unsafe fn delta_lanes_body(
     if each == 0 {
         for i in 0..KEYS_PER_LANE {
             cuda_device::thread::__unroll_config::<0>();
-            // SAFETY: the sixteen keys this lane read from lane c above.
+            // SAFETY: the sixteen keys this lane read from lane rin above
+            // (lane c: in place mode is row 0).
             unsafe { *state.add(s_at + key_of(j, i)) = s[i] };
         }
     }
@@ -951,6 +1062,16 @@ pub struct DeltaLanesArgs<'a> {
     pub each: bool,
     pub pos: &'a DeviceBuffer<u32>,
     pub stamp: &'a mut DeviceBuffer<u32>,
+}
+
+/// [`DeltaKernels::enqueue_kda_delta_lanes`]'s arguments: [`DeltaLanesArgs`]
+/// with the decay per key (`[m][n_v][HEAD]`), and the verify row the call's
+/// first token is.
+pub struct KdaLanesArgs<'a> {
+    pub lanes: DeltaLanesArgs<'a>,
+    /// Row 0 for the one-token step and a prompt batch (in place), the
+    /// verify's row for a launch of one of its rows.
+    pub row: usize,
 }
 
 impl DeltaKernels {
@@ -1036,11 +1157,122 @@ impl DeltaKernels {
         )?;
         Ok(())
     }
+
+    /// Enqueue `kda_delta_lanes` (module doc): `8·n_v` blocks of 128
+    /// threads. Refused by name: no token or no lane, a row base at or past
+    /// the lanes, in place mode past row 0, row mode past the lanes (`row +
+    /// m > lanes`), a slice shorter than the launch reads. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_kda_delta_lanes(
+        &self,
+        stream: &CudaStream,
+        args: KdaLanesArgs<'_>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "enqueue_kda_delta_lanes";
+        let KdaLanesArgs {
+            lanes:
+                DeltaLanesArgs {
+                    delta:
+                        DeltaArgs {
+                            qkv,
+                            beta,
+                            decay,
+                            lane,
+                            lane_at,
+                            lanes,
+                            shape,
+                            m,
+                            fault,
+                            o,
+                            state,
+                        },
+                    each,
+                    pos,
+                    stamp,
+                },
+            row,
+        } = args;
+        shape.check(WHAT)?;
+        if let Some(why) = lanes_refusal(m, lanes, each, row) {
+            return Err(GpuError::shape(WHAT, why));
+        }
+        let nv = shape.n_v;
+        let lens = [
+            ("qkv", qkv.len(), m * shape.channels()),
+            ("beta", beta.len(), m * nv),
+            ("decay", decay.len(), m * nv * HEAD),
+            ("lane", lane.len(), lane_at + 1),
+            ("pos", pos.len(), 1),
+            ("o", o.len(), m * nv * HEAD),
+            ("state", state.len(), lanes * shape.state_len()),
+            ("stamp", stamp.len(), lanes),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(WHAT, "grid", nv * (HEAD / COLUMNS_PER_BLOCK))?;
+        let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
+        let prep = self.module.prepare_kda_delta_lanes(cfg)?;
+        self.module.kda_delta_lanes(
+            stream,
+            &prep,
+            qkv,
+            beta,
+            decay,
+            lane,
+            launch_u32(WHAT, "lane_at", lane_at)?,
+            launch_u32(WHAT, "lanes", lanes)?,
+            launch_u32(WHAT, "n_k", shape.n_k)?,
+            launch_u32(WHAT, "n_v", nv)?,
+            shape.map.code(),
+            launch_u32(WHAT, "m", m)?,
+            u32::from(each),
+            launch_u32(WHAT, "row", row)?,
+            pos,
+            fault,
+            o,
+            state,
+            stamp,
+        )?;
+        Ok(())
+    }
+}
+
+/// Why a stamped call of `m` tokens over `lanes` lanes from verify row `row`,
+/// in row mode when `each`, is refused ([`DeltaKernels::enqueue_kda_delta_lanes`]'s
+/// rule); `None` for a call the kernel takes.
+#[must_use]
+pub fn lanes_refusal(m: usize, lanes: usize, each: bool, row: usize) -> Option<String> {
+    if m == 0 || lanes == 0 {
+        return Some(format!(
+            "m={m} over {lanes} lanes: a call takes one token or more and a lane or more"
+        ));
+    }
+    if row >= lanes {
+        return Some(format!(
+            "row {row} over {lanes} lanes: a verify's rows each write a lane of their own"
+        ));
+    }
+    if !each && row != 0 {
+        return Some(format!(
+            "row {row} in place: only row 0 writes back into the lane it read"
+        ));
+    }
+    if each && row + m > lanes {
+        return Some(format!(
+            "rows {row}..{} over {lanes} lanes in row mode: at most a token a lane",
+            row + m
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{delta_host, kda_delta_host};
+    use super::{delta_host, kda_delta_host, lanes_refusal, read_lane, row_lane};
     use crate::linear::{HEAD, KHeadMap, LinearShape};
 
     /// Knuth's MMIX LCG, the high 24 bits as a float in `[lo, hi)`.
@@ -1104,6 +1336,58 @@ mod tests {
         for (i, (x, y)) in a.state.iter().zip(&b.state).enumerate() {
             let key = i % HEAD;
             assert_eq!(x.to_bits() == y.to_bits(), key != 37, "state value {i}");
+        }
+    }
+
+    /// A verify launched one row at a time reads and writes the lanes a
+    /// one-launch verify of its rows does: row 0 reads the committed lane
+    /// `c`, row `r` the lane row `r − 1` wrote, and row `r` writes lane `c +
+    /// r`; every row's lane is its own, none is the lane row 0 read unless it
+    /// is row 0's, and keeping `k` rows leaves the word at the lane row `k −
+    /// 1` wrote.
+    #[test]
+    fn a_row_reads_the_lane_the_row_before_wrote() {
+        for lanes in 1..=4u32 {
+            for c in 0..lanes {
+                let wrote: Vec<u32> = (0..lanes).map(|r| row_lane(c, r, lanes)).collect();
+                let mut sorted = wrote.clone();
+                sorted.sort_unstable();
+                assert_eq!(
+                    sorted,
+                    (0..lanes).collect::<Vec<_>>(),
+                    "lanes {lanes} c {c}"
+                );
+                assert_eq!(read_lane(c, 0, lanes), c);
+                for r in 1..lanes {
+                    assert_eq!(read_lane(c, r, lanes), wrote[r as usize - 1], "row {r}");
+                }
+            }
+        }
+        // Two lanes, committed lane 1: row 0 in place on 1, row 1 reads 1
+        // and writes 0; keeping both moves the word to 0.
+        assert_eq!((read_lane(1, 1, 2), row_lane(1, 1, 2)), (1, 0));
+    }
+
+    /// The launcher's refusals: no token or lane, a row past the lanes, a
+    /// later row in place, row mode past the lanes; the step (row 0 in
+    /// place, any m) and each row of a two-row verify (row mode, m = 1) are
+    /// taken.
+    #[test]
+    fn the_lanes_launch_takes_the_step_and_each_verify_row() {
+        assert!(lanes_refusal(1, 2, false, 0).is_none());
+        assert!(lanes_refusal(512, 2, false, 0).is_none());
+        assert!(lanes_refusal(1, 2, true, 0).is_none());
+        assert!(lanes_refusal(1, 2, true, 1).is_none());
+        assert!(lanes_refusal(2, 2, true, 0).is_none());
+        for (m, lanes, each, row, says) in [
+            (0, 2, false, 0, "one token or more"),
+            (1, 0, false, 0, "a lane or more"),
+            (1, 2, true, 2, "row 2 over 2 lanes"),
+            (1, 2, false, 1, "only row 0"),
+            (2, 2, true, 1, "rows 1..3 over 2 lanes"),
+        ] {
+            let why = lanes_refusal(m, lanes, each, row).expect("refused");
+            assert!(why.contains(says), "{m} {lanes} {each} {row}: {why}");
         }
     }
 }

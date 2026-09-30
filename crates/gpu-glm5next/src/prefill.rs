@@ -69,7 +69,7 @@ use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::kpool;
 use bloomery_gpu::latent::{IndexKeyArgs, LATENT, LatentAppendArgs, Rows, pools_for};
 use bloomery_gpu::linear::conv::KdaConvArgs;
-use bloomery_gpu::linear::delta::DeltaArgs;
+use bloomery_gpu::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
 use bloomery_gpu::linear::norm_gate::NormGateArgs;
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::qsa::list_width;
@@ -90,7 +90,8 @@ use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 use super::{
-    Body, Dims, Embedding, Glm5nextModel, Parts, Store, f32t, f32v, prompt, q8, shape, weight,
+    Body, Dims, Embedding, Glm5nextModel, LANES, Parts, Store, f32t, f32v, prompt, q8, shape,
+    weight,
 };
 use crate::ffn::{self, CardRows};
 use crate::host::GlmHost;
@@ -596,16 +597,18 @@ pub struct StoreDigest {
 }
 
 /// Every layer's stores read back and digested, in layer order: a KDA
-/// layer's state and conv ring, a latent layer's latent and index rows and
-/// its pool plane (all the rows the stores hold, fed or not). Blocking.
+/// layer's committed lane of its state and its conv ring, a latent layer's
+/// latent and index rows and its pool plane (all the rows the stores hold,
+/// fed or not). Blocking.
 pub fn store_digests(m: &mut Glm5nextModel) -> Result<Vec<StoreDigest>, GpuError> {
     let (gpu, _, body) = m.body_parts(WHAT)?;
     let stream = gpu.stream();
+    let lane = body.s.lanes.committed() as usize;
     let mut out = Vec::new();
     for (layer, s) in body.stores.iter().enumerate() {
         match s {
-            Store::Kda { state, ring } => {
-                for (what, b) in [("state", state), ("ring", ring)] {
+            Store::Kda { state, ring, .. } => {
+                for (what, b) in [("state", state.part(lane)), ("ring", ring)] {
                     let words = b.to_host_vec(stream)?;
                     out.push(StoreDigest {
                         layer,
@@ -753,17 +756,7 @@ impl Body {
         let mut prog = PromptProgram {
             gpu,
             w,
-            p: Parts {
-                k,
-                d: dims,
-                cfg,
-                names,
-                s,
-                stores,
-                slots,
-                card,
-                taps: None,
-            },
+            p: Parts::of(k, dims, cfg, names, s, stores, slots, card, None),
             b: bufs,
             t,
             cur: 0,
@@ -996,7 +989,7 @@ impl PromptProgram<'_> {
         let Some(MixerNames::Kda(nm)) = self.p.names.get(l).map(|n| &n.mixer) else {
             return Err(other_kind(W, l));
         };
-        let Some(Store::Kda { state, ring }) = self.p.stores.get_mut(l) else {
+        let Some(Store::Kda { state, stamp, ring }) = self.p.stores.get_mut(l) else {
             return Err(GpuError::State {
                 what: W,
                 missing: "the layer's KDA store",
@@ -1090,20 +1083,28 @@ impl PromptProgram<'_> {
                 ring,
             },
         )?;
-        lin.delta.enqueue_kda_delta(
+        lin.delta.enqueue_kda_delta_lanes(
             stream,
-            DeltaArgs {
-                qkv: &b.conv,
-                beta: &b.beta,
-                decay: &b.decay,
-                lane: &self.p.s.lane,
-                lane_at: 0,
-                lanes: 1,
-                shape: d.kda,
-                m: t,
-                fault,
-                o: &mut b.o,
-                state,
+            KdaLanesArgs {
+                lanes: DeltaLanesArgs {
+                    delta: DeltaArgs {
+                        qkv: &b.conv,
+                        beta: &b.beta,
+                        decay: &b.decay,
+                        lane: self.p.lane,
+                        lane_at: 0,
+                        lanes: LANES,
+                        shape: d.kda,
+                        m: t,
+                        fault,
+                        o: &mut b.o,
+                        state: state.whole_mut(),
+                    },
+                    each: false,
+                    pos: &b.pos,
+                    stamp,
+                },
+                row: 0,
             },
         )?;
         lin.norm_gate.enqueue_norm_gate_sigmoid(
