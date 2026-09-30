@@ -42,6 +42,9 @@ use std::sync::Arc;
 
 use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::swap::{PassReport, ResetReport, Residency};
+use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap, refuse_expert_tiers,
 };
@@ -72,6 +75,7 @@ use runtime::seqstate::{HOST_BUDGET, Kept, Take};
 use crate::ffn::CardExperts;
 use crate::host::GlmHost;
 use crate::program;
+use crate::swap;
 use crate::tensors::LayerNames;
 
 #[path = "prefill.rs"]
@@ -475,7 +479,8 @@ pub struct StepInput {
 }
 
 /// The GLM body. Field order is drop order: the host tier (its lock over
-/// the host set, its page windows) before the buffers.
+/// the host set, its page windows, its residency machine) before the
+/// buffers.
 pub struct Body {
     hybrid: Hybrid<GlmHost>,
     layers: Range<usize>,
@@ -486,8 +491,10 @@ pub struct Body {
     k: Kernels,
     s: Scratch,
     stores: Vec<Store>,
-    /// The slot map's card copy, the host run's rows.
-    slots: DeviceTensor<u32>,
+    /// The slot map's card copy, the host run's rows. The host tier holds
+    /// the host copy, and its residency machine, when it runs one, the
+    /// second reference: the copy lives until both let go.
+    slots: Arc<DeviceTensor<u32>>,
     /// The routed experts the slot map puts on the card.
     card: CardExperts,
     embd: Embedding,
@@ -510,6 +517,12 @@ pub struct Body {
     ckpt: Checkpoints,
     /// How a prompt is fed, and the batch feed's buffers.
     prompt: prefill::PromptState,
+    /// The load's residency side ([`ResidencyGlue`]): the machine's source
+    /// and shape, the boundaries' log, the delegation to the host tier.
+    residency_glue: ResidencyGlue,
+    /// The residency the body was loaded with: `off` keeps the load's slot
+    /// map for the model's life.
+    residency: Residency,
 }
 
 /// Every KDA layer's state and conv ring, in layer order: the list the
@@ -615,13 +628,9 @@ fn limit_of(act: Act) -> f32 {
 }
 
 impl Body {
-    /// Card `card` of `plan`, which `inputs` made, resident: the plan's card
-    /// segments, the projections that read one input joined into one row
-    /// stream each ([`Body::derive`]), and the body over them with the host
-    /// tier over the file's routed layers, holding the load's host set as
-    /// `host` asks. Refused by name: a plan with an expert tier card (before
-    /// anything uploads), a plan of more than one card, a layer kind or a
-    /// width no kernel here runs, routed layers that are not one run.
+    /// Card `card` of `plan`, which `inputs` made, resident, the load's
+    /// slot map for the model's life ([`Body::open_placed_with`] under
+    /// [`Residency::Off`]).
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -629,16 +638,55 @@ impl Body {
         card: usize,
         host: HostCfg,
     ) -> Result<Glm5nextModel, GpuError> {
+        Body::open_placed_with(file, plan, inputs, card, host, Residency::Off)
+    }
+
+    /// [`Body::open_placed`] under `residency` ([`ResidencySpec`]): the
+    /// plan's host set also holds each layer's churn pool — the card's
+    /// experts past the pinned ones — and the body keeps the load's
+    /// [`ResidencyGlue`], whose machine it starts once its pieces are sized
+    /// ([`HostServed::start_residency`]). Refused by name: a plan with an
+    /// expert tier card (before anything uploads), a plan of more than one
+    /// card, a layer kind or a width no kernel here runs, routed layers that
+    /// are not one run, and the machine's own refusals at the load (the
+    /// churn pool past the host's headroom, a layer whose stacks the common
+    /// file source cannot take).
+    pub fn open_placed_with(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        card: usize,
+        host: HostCfg,
+        residency: Residency,
+    ) -> Result<Glm5nextModel, GpuError> {
         refuse_expert_tiers(WHAT, plan.machine)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
-        GpuModel::load_placed(
+        // The host tier's run — the layers the body's slot map holds, which
+        // the machine's per-layer lists cover.
+        let map_layers = hosted(&inputs.spec.layers)
+            .map_err(|e| shape(e.to_string()))?
+            .len();
+        // The most rows one pass runs: the decode step alone today. The
+        // verify of a shared MTP window, when it lands, is the pass that
+        // raises this.
+        const MAX_ROWS: usize = 1;
+        let spec = ResidencySpec {
+            lever: residency,
+            delay: swap::LIVE_DELAY,
+            deadline: swap::DEADLINE,
+            top_k: N_USED,
+            max_rows: MAX_ROWS,
+            stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers)?),
+        };
+        GpuModel::load_placed_with(
             file,
             plan,
             card,
             host,
+            spec,
             |stream, _, layers, w| Body::derive(stream, &kinds, layers, w),
-            |gpu, file, w, residency| {
-                Body::load_placed(gpu, file, w, plan, inputs, card, host, residency)
+            |gpu, file, w, set, glue| {
+                Body::load_placed(gpu, file, w, plan, inputs, card, host, set, glue, residency)
             },
         )
     }
@@ -689,19 +737,24 @@ impl Body {
     /// plan's description, the stores at the plan's `ctx_max`, the step's
     /// buffers, the slot map the plan's routed segments make, the card
     /// experts it puts on the card and the host tier over the routed run.
+    /// `glue` is the load's residency side ([`ResidencyGlue`]) for the
+    /// `lever` the load ran under, whose machine the body starts once its
+    /// pieces are sized.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card, file, weights, plan and inputs, and the host tier's residency and levers (rust-quality R8)"
+        reason = "the load's card, file, weights, plan and inputs, the host tier's residency and levers, and the residency glue (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
-        file: Split,
+        file: &Arc<Split>,
         w: &Weights,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         card: usize,
         host: HostCfg,
         residency: HostResidency,
+        glue: ResidencyGlue,
+        lever: Residency,
     ) -> Result<Body, GpuError> {
         let hp = &inputs.hp;
         let spec = &inputs.spec;
@@ -754,7 +807,12 @@ impl Body {
             .iter()
             .map(|c| store(stream, c.kind, &dims, ctx))
             .collect::<Result<Vec<_>, _>>()?;
-        let slots = DeviceTensor::upload(stream, &map.stage_view(), run.len(), N_EXPERT)?;
+        let slots = Arc::new(DeviceTensor::upload(
+            stream,
+            &map.stage_view(),
+            run.len(),
+            N_EXPERT,
+        )?);
         let experts_on_card =
             CardExperts::new(gpu, w, &spec.layers, &map, dims.embd, hp.expert_ff)?;
         let boundary = Boundary::with_rows(
@@ -766,7 +824,7 @@ impl Body {
             },
             1,
         )?;
-        let file = Arc::new(file);
+        let file = Arc::clone(file);
         let experts = GlmHost::build(Arc::clone(&file), hp, run.clone(), host.r8)?;
         let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
@@ -804,9 +862,14 @@ impl Body {
             dense,
             ckpt,
             prompt: prefill::PromptState::new(),
+            residency_glue: glue,
+            residency: lever,
         };
         body.s.lane.copy_from_host(stream, &lane)?;
         stream.synchronize()?;
+        // Last: the machine frees each layer's spare slots, and every piece
+        // above sized itself from the load's map, capacity = live.
+        body.start_residency(gpu)?;
         Ok(body)
     }
 
@@ -843,6 +906,27 @@ impl Body {
     /// The host tier, for a caller that attaches or marks its route trace.
     pub fn hybrid_mut(&mut self) -> &mut Hybrid<GlmHost> {
         &mut self.hybrid
+    }
+
+    /// Keep every residency boundary's report from now on, for
+    /// [`Body::take_residency_passes`]: a binary that prints the `residency
+    /// pass` records asks once, with the boundaries it takes at most between
+    /// two takes, `passes`, so a pass logs its report without growing the
+    /// log. Nothing is kept until then.
+    pub fn log_residency(&mut self, passes: usize) {
+        self.residency_glue.log_passes(passes);
+    }
+
+    /// The residency machine's source, when the load runs one.
+    #[must_use]
+    pub fn residency_source(&self) -> Option<&FileSwap> {
+        self.residency_glue.source()
+    }
+
+    /// The residency boundaries' reports since the last take, in order,
+    /// each with the kind of the pass it ended; the log keeps its capacity.
+    pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
+        self.residency_glue.take_passes()
     }
 
     /// The slot map's card copy the handoff reads, a routed layer's row at
@@ -1286,4 +1370,60 @@ impl HostServed for Body {
     fn host_residency(&self) -> Option<&HostResidency> {
         self.hybrid.residency()
     }
+
+    /// The host tier's residency boundary ([`Hybrid::swap_boundary`]), its
+    /// report logged when a binary asked ([`Body::log_residency`]).
+    fn at_boundary(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.residency_glue.at_boundary(&mut self.hybrid, stream)
+    }
+
+    fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
+        self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
+    }
+
+    fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {
+        self.residency_glue.reset(&mut self.hybrid, stream)
+    }
+
+    fn stop_residency(&mut self) {
+        self.residency_glue.stop(&mut self.hybrid);
+    }
+
+    fn start_residency(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.residency_glue.start(
+            &mut self.hybrid,
+            gpu.context(),
+            gpu.stream(),
+            Arc::clone(&self.slots),
+        )
+    }
+}
+
+impl Drop for Body {
+    /// The residency machine stops before any field frees card or pinned
+    /// memory ([`Hybrid::stop_swap`]): the host tier is the first field and
+    /// stops it in its own drop, and this holds that order as the machine's
+    /// rule rather than the field list's — a field that waits on the card
+    /// (a synchronize, a free) dropping ahead of the tier would hold that
+    /// wait until the machine's own drop, which comes later.
+    fn drop(&mut self) {
+        self.hybrid.stop_swap();
+    }
+}
+
+/// The steps feed under the residency machine, refused by name: each prompt
+/// id would end a decode pass the residency rule counts, where the prompt
+/// call keeps 0 rows (V4.1's rule, `gpu_deepseek41::body`'s
+/// `refuse_steps_under_residency`, at its load there).
+pub(crate) fn refuse_steps_under_residency(m: &Glm5nextModel) -> Result<(), GpuError> {
+    if m.body(WHAT)?.residency != Residency::Off {
+        return Err(GpuError::Shape {
+            what: "BLOOMERY_PREFILL",
+            detail: "steps beside BLOOMERY_RESIDENCY: each prompt id would end a decode pass \
+                     the residency rule counts, where the prompt call keeps 0 rows; use \
+                     BLOOMERY_PREFILL=batch or BLOOMERY_RESIDENCY=off"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
