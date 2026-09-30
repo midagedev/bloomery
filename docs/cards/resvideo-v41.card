@@ -1,5 +1,5 @@
 # The adaptive-residency video's three arms on plan (a), one lease: no residency (the id-prefix seed, static),
-# the residency with the decode rule only (BLOOMERY_HOSTSTREAM=0), and the residency with the prompt call's picks
+# the residency with the decode rule only (BLOOMERY_HOSTSTREAM=off), and the residency with the prompt call's picks
 # kept for the decode (streaming on). Decode after the call is the term. The streaming arm against the decode-rule
 # arm was 1.201 / 1.156 after prose 512 / 4096 (rig-log 09-30#callstream-pp-a, 2 rounds, 36.05 -> 43.30 and
 # 31.81 -> 36.77 tok/s). The decode-rule arm against no residency is resv41's prediction +8..+24 % (the replay's
@@ -20,7 +20,7 @@ rounds: 2
 sd: 1.1 % rig-log 09-25#v41-prefill-s14, the larger of two per-round ratio SDs
 condition: the landed tree's generate_ds41, every arm with its levers set explicitly (no default decides an arm):
   BLOOMERY_AB_ROUNDS=2 BLOOMERY_DECODE_N=96 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/resvideo-v41.card'
-  just depth-gpu-ds41 prose:512@BLOOMERY_RESIDENCY=off prose:512@BLOOMERY_RESIDENCY=mid-p40-s1,BLOOMERY_HOSTSTREAM=0
+  just depth-gpu-ds41 prose:512@BLOOMERY_RESIDENCY=off prose:512@BLOOMERY_RESIDENCY=mid-p40-s1,BLOOMERY_HOSTSTREAM=off
   prose:512@BLOOMERY_RESIDENCY=mid-p40-s1,BLOOMERY_HOSTSTREAM=on, the same three at prose:4096, and the three
   prose:512 arms again with BLOOMERY_STEP_STATS=1 added for the per-step host_slots (the hit curve; their tok/s is
   not read). Every residency arm starts

@@ -1,5 +1,5 @@
 # The adaptive-residency video's toktape tapes, plan (a) on the A6000 alone, no draft, greedy, thinking off: one
-# bloomery-serve-ds41 per arm (no residency; the residency with the decode rule only, BLOOMERY_HOSTSTREAM=0; the
+# bloomery-serve-ds41 per arm (no residency; the residency with the decode rule only, BLOOMERY_HOSTSTREAM=off; the
 # residency with the prompt call's picks kept, streaming on), one discarded warm-up request, then
 # POST /residency/reset (the residency arms) and one tape of the 507-token RateLimiter coding review, 400 tokens out.
 # The tapes carry the prompt, the tokens and each token's time for the video; the table numbers are
