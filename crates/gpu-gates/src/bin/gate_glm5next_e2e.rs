@@ -12,6 +12,8 @@
 //! positions a latent layer keeps whole), every set read through its family.
 //!
 //! What is asserted:
+//! - (card) right after the load at [`CTX`], the card experts' slot map,
+//!   slots and card copy, checks (i)–(iii) of `shared/glm5next_card.rs`.
 //! - (s) structure: the captured decode step holds [`NODES_DECODE`] nodes
 //!   plus [`CARD_NODES`] for each routed layer the plan gives card experts
 //!   (its `n_l`, which the host tier's slot map must hold layer for layer),
@@ -157,7 +159,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_card.rs"]
+mod card;
+
+#[cfg(feature = "glm5next")]
 mod gate {
+    use crate::card;
     use std::time::Instant;
 
     use app::arch::glm5next::GlmCfg;
@@ -378,6 +385,8 @@ mod gate {
         nodes: Option<usize>,
         /// The plan's card experts a layer.
         n_l: Vec<u64>,
+        /// The routed experts a layer.
+        experts: u64,
     }
 
     impl OpenLog<Body> for Log {
@@ -393,6 +402,7 @@ mod gate {
                 plan.ctx_max, plan.host.experts, plan.cards[0].experts
             );
             self.n_l = plan.n_l.clone();
+            self.experts = plan.model.experts;
             Ok(true)
         }
 
@@ -418,10 +428,12 @@ mod gate {
     }
 
     /// What the open decided besides the session: the step's captured nodes,
-    /// the plan's card experts a layer, and whether it ran under a card budget.
+    /// the plan's card experts a layer and routed experts a layer, and whether
+    /// it ran under a card budget.
     struct Opened {
         nodes: usize,
         n_l: Vec<u64>,
+        experts: u64,
         budgeted: bool,
     }
 
@@ -444,6 +456,7 @@ mod gate {
             ctx,
             nodes: None,
             n_l: Vec::new(),
+            experts: 0,
         };
         let args = OpenArgs {
             place: "gate",
@@ -462,6 +475,7 @@ mod gate {
             Opened {
                 nodes,
                 n_l,
+                experts: log.experts,
                 budgeted,
             },
         ))
@@ -1680,8 +1694,9 @@ mod gate {
     /// Every clause on the steps feed, on the load at [`CTX`].
     fn main_clauses(levers: &bloomery_levers::Levers, sets: StepSets) -> Result<bool, GateError> {
         let (mut s, opened) = open(levers, CTX, PrefillMode::Steps)?;
+        let mut ok = card::clauses(&mut s, &opened.n_l, opened.experts, opened.budgeted)?;
         let m = s.model_mut();
-        let mut ok = structure(m, &opened)?;
+        ok &= structure(m, &opened)?;
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();

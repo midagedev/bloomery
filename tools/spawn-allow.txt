@@ -23,7 +23,7 @@ crates/gpu-gates/src/bin/gate_deepseek41_chain_glue.rs 2 a gate binary, never pi
 crates/gpu-gates/src/bin/gate_deepseek41_engram.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_index.rs 2 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_moe.rs 1 a gate binary, never pinned
-crates/gpu-gates/src/bin/gate_deepseek41_residency.rs 1 a gate binary, never pinned
+crates/gpu-gates/src/bin/shared/ds41_residency.rs 1 the residency clauses of a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_woa.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_ds41_callstream.rs 2 a gate binary: the copy stream hold's raiser and the clause watchdog, each asleep but for one store or print
 crates/gpu-gates/src/bin/gate_dspark_experts.rs 1 a gate binary, never pinned

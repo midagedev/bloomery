@@ -1065,17 +1065,16 @@ gate-gpu-ds41-chain-attn:
 # --select(2단계): d1(top_k 64)·d2 세트, 인덱서 층마다 선택이 실제로 일어나는 자리 — 리스트가 그 층 점수의 정확한 top-k인지,
 # 인덱서의 쿼리·가중치가 포락선 안인지, ik 리스트와의 차이가 동률 밴드 안뿐인지; 리스트를 바꿔 끼웠을 때 어텐션이 받는
 # 영향은 포락선에 합쳐 잰다.
+# --skew-structure, --skew-sets, --skew-api (C4 ktok-skew, shared/ds41_skew.rs), on the same load after those, from a
+# reset: tokens t and t+1 as two rows one layer apart on one stream against two one-token steps, bit for bit.
+# --skew-structure: the captured nodes exactly twice the step's by kind and kernel name, the batch order, each row's
+# shadow table. --skew-sets: after step4 and d1 are injected, both rows' logits, streams, folds and lists and every
+# cache, compressor state and history equal the steps in turn, eager and replayed, and after a rollback (t+1 refused)
+# one step of another token equals the steps. --skew-api: the engine's entry (step_pair, rollback), graph and eager,
+# then the deep cuts. One load.
 [group('v41-load')]
-gate-gpu-ds41-step *ARGS='--structure --sets --select':
+gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-sets --skew-api':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}}'
-
-# V4.1 어긋난 2행 패스(C4 ktok-skew): 토큰 t와 t+1을 한 층 어긋난 두 행으로 한 스트림에서 돌린 결과가 한 토큰 스텝
-# 둘과 비트까지 같은지 본다. --structure: 캡처 노드가 종류별·커널 이름별로 정확히 두 배, 배치 순서, 행마다 그늘 표.
-# --sets: step4·d1 세트 주입 뒤 두 행의 logits·스트림·접기·목록, 모든 캐시·압축기 상태·history가 eager·재생 모두 순차와
-# 같고, 롤백(t+1 거절) 뒤 다른 토큰 한 스텝이 순차와 같다. --api: 엔진 진입점(step_pair·rollback)을 그래프·eager로. 3090, 게이트 락.
-[group('v41-load')]
-gate-gpu-ds41-skew *ARGS='--structure --sets --api':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_skew && bash tools/gpu-gate.sh gate_deepseek41_skew {{ARGS}}'
 
 # V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
 # The gate plan puts each layer's id prefix [0, n_l) on the card; the tier plan moves its last 23 ids (n_l−23 … n_l) to
@@ -1091,9 +1090,10 @@ gate-gpu-ds41-skew *ARGS='--structure --sets --api':
 # --bfeat(B8) 따로 한 번 더 적재해, 적재가 배치 버퍼를 만든 뒤 드래프트 특징 탭을 붙이고 prepare_prefill을 다시 부른다(--place bp가
 # 드래프트를 여는 순서). P = 1024를 스텝으로 먹여 위치마다 읽은 특징과, 같은 id의 프롬프트 호출이 넘긴 특징(드래프트 창, 전 위치)이
 # 위치·값 비트까지 같다; 전제: 배치 둘이 한 그룹, 넓은 호출은 두 배치 모두에서 행을 넘겼다. 드래프트 헤더는 프로필의 DSPARK_MODEL.
-# 3090, 게이트 락.
+# The lost-card clauses --lost (T3), --blost (B3) and --bfirst (B3f) are not in the landing run: weekly-gpu-ds41-lost
+# runs them. 3090, 게이트 락.
 [group('v41-load')]
-gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault --blost --bfirst --bfeat':
+gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
 # V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.
@@ -1104,26 +1104,24 @@ gate-gpu-ds41-tier *ARGS='--union --fault --lost --two --batch --batch2 --bfault
 # through the draft and 16 DSpark passes, every token, kept count and logits row bit for bit the reference's, the stage
 # graph's node count too; precondition: every tier layer sent a routed slot, the passes kept and rejected a proposal.
 # --lost: the tier's stream held behind a host flag, the step named as a lost card within the deadline, no token,
-# CardLost, the next step refused. Two loads, one after the other. Both cards (BLOOMERY_CARD=both: both gate locks),
-# alone in a batch.
+# CardLost, the next step refused; not in the landing run: weekly-gpu-ds41-lost runs it. Two loads, one after the
+# other. Both cards (BLOOMERY_CARD=both: both gate locks), alone in a batch.
 [group('solo')]
 [group('v41-load')]
-gate-gpu-ds41-twocard *ARGS='--union --lost':
+gate-gpu-ds41-twocard *ARGS='--union':
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard {{ARGS}}'
 
-# V4.1 adaptive residency (BLOOMERY_RESIDENCY, set in the gate to mid-p40-s1) on plan (b′), both cards, the id-prefix
-# seed, the r8 sidecar: the host-set refusal at load (a host one byte short of the churn pool, named, before the load),
-# then one load — c6 (a DSpark pair pass keeping one row folds what one step folds), c1 (the prose history twice, same
-# tokens and logits, flips landed), the admitted experts' slots byte for byte a static load's (the r8 unpack), the host
-# set's residency answers, the tier entries unmoved, the passes' kinds and kept rows (the prompt call one pass, 0 kept),
-# c3 (the copy stream held 1 s, same history), the serve seat's reset leaving the residency, c7 (a reset back to the
-# seed, no host byte released). One load (the refusal stops before its own), its host set populated and locked
-# (BLOOMERY_HOST_LOCK=1 unless the environment says otherwise: populated pages alone are reclaimed under another
-# process's reads, and a victim not host-resident is red). Both cards, alone in a batch.
+# The lost-card clauses: gate_deepseek41_tier --bfirst --blost --lost (B3f, B3 and T3: the loopback's tier stream held
+# behind a host flag before a fresh load's first prompt call, before a prompt call, before a step, on the 3090, each on
+# a load of its own) and gate_deepseek41_twocard --lost (before a step on plan (b′), both cards, one load): the call or
+# the step fails within the go deadline and its grace naming the lost card, the host tier is poisoned as a lost card
+# (CardLost), the next call or step is refused by that poison and a reset by name. Weekly: `just weekly` runs it, and
+# `just affected` names it when a file its triggers in tools/gate-paths.tsv match changes. Alone in a batch.
 [group('solo')]
 [group('v41-load')]
-gate-gpu-ds41-residency *ARGS:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_residency && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} bash tools/gpu-gate.sh gate_deepseek41_residency {{ARGS}}'
+weekly-gpu-ds41-lost:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard --lost'
 
 # 상주 교체의 r8 → Q3_K 풀기(`ds41_r8_q3k_groups`, 그룹 하나를 블록 하나가 제자리에서): 무작위 r8 워드를 V4.1 파트
 # 모양(2304행 × 20 슈퍼블록)과 홀수 폭 작은 모양으로 풀어 참조 커널 `ds41_r8_q3k`와 `qdot::unpack_q3k_r8`의 바이트와
@@ -1133,7 +1131,13 @@ gate-gpu-ds41-unpack:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_unpack && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_unpack'
 
 # V4.1 host streaming in a prompt call (BLOOMERY_HOSTSTREAM, set on in the gate) over the residency at mid-p40-s1, plan
-# (b′), groups of 2, both cards, one load: s2 (a call that streams, then the same call on the placement it left admits
+# (b′), groups of 2, the host set locked, both cards, one load. First the residency's own clauses (shared/ds41_residency.rs,
+# streaming off): the host-set refusal at load (a host one byte short of the churn pool, named, before the load), then on
+# the load c6 (a DSpark pair pass keeping one row folds what one step folds), c1 (the prose history twice, same tokens and
+# logits, flips landed), the admitted experts' slots byte for byte a static load's (the r8 unpack), the host set's
+# residency answers, the tier entries unmoved, the passes' kinds and kept rows (the prompt call one pass, 0 kept), c3
+# (the copy stream held 1 s, same history), the serve seat's reset leaving the residency, c7 (a reset back to the seed,
+# no host byte released). Then, streaming on: s2 (a call that streams, then the same call on the placement it left admits
 # nothing and gives the same argmax and logits), s1 (a 1,536-id call and 8 steps free and with the copy stream held 1 s:
 # the same picks per group and layer, tokens and logits), s3 (4 prose and 4 code windows of 512 ids, streaming off and
 # on: where they first differ, on's top-1 margin below 1.5). Both cards, alone in a batch.
@@ -1544,8 +1548,11 @@ gate-glm5next-meta:
 # on the host tier, the host set of about 185 GB populated), against ik's sets (refset `ik-glm5next`): the step's
 # node count, graph = eager bit for bit, every layer's streams on the batch set within the derived band, and the argmax
 # after each step set's prompt — here the two 4-token step sets (`--step-sets short`); the 1,024- and 3,070-position
-# sets are weekly-gpu-glm5next-e2e-long's. Loads the whole model: alone in a batch, and under the big-load lock the
-# V4.1 loads take.
+# sets are weekly-gpu-glm5next-e2e-long's. Right after the load, before those, the card experts (shared/glm5next_card.rs):
+# the slot map holds each layer's id prefix [0, n_l) in ascending order, only on layers whose stacks the card reads; at
+# slots 0, n/2 and n-1 each stack's `_sel` and the gate·up are that expert's own upload from the file, bit for bit; the
+# card copy of the map is the host map at its row offsets. Loads the whole model: alone in a batch, and under the
+# big-load lock the V4.1 loads take.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-e2e:
@@ -1559,14 +1566,6 @@ gate-gpu-glm5next-e2e:
 [group('v41-load')]
 weekly-gpu-glm5next-e2e-long:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e --only main --step-sets long'
-
-# GLM의 카드 expert를 게이트 배치(층마다 id 접두 [0, n_l))대로 올린다. 슬롯 맵이 그 n_l개를
-# 오름차순으로 담는지, 카드가 읽는 층에만 있는지, 층마다 슬롯 0·n/2·n-1에서 스택의 `_sel`과 gate·up이 그 expert만 파일에서
-# 올린 것과 비트까지 같은지 본다. 모델 전체를 올린다: e2e와 같은 묶음 규칙.
-[group('solo')]
-[group('v41-load')]
-gate-gpu-glm5next-card:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_card && bash tools/gpu-gate.sh gate_glm5next_card'
 
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.

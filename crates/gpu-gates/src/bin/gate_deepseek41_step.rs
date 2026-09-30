@@ -102,6 +102,9 @@
 //!   at every scored position the paired difference `d = NLL_ours − NLL_ik`,
 //!   KL(ik‖ours), the top-1 agreement and both margins. Red is
 //!   Δ_PPL = e^mean(d) − 1 above [`PPL_RED`].
+//! - `--skew-structure`, `--skew-sets`, `--skew-api` (C4): the pair pass's
+//!   clauses (`shared/ds41_skew.rs`) on the same load, after the clauses
+//!   above, from a reset.
 //!
 //! The envelope (G1). Each sub-layer adds to the streams its own rule
 //! difference from ik's, and carries on the one it read. A rule difference is
@@ -148,12 +151,21 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_finite.rs"]
+mod finite;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_shadow.rs"]
 mod shadow;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_skew.rs"]
+mod skew;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use crate::shadow;
+    use crate::skew;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -243,16 +255,22 @@ mod gate {
         sets: bool,
         select: bool,
         ppl: Option<String>,
+        skew: skew::Clauses,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str =
-            "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--ppl TAG]";
+        const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--ppl TAG] \
+             [--skew-structure] [--skew-sets] [--skew-api]";
         let mut a = Args {
             structure: false,
             sets: false,
             select: false,
             ppl: None,
+            skew: skew::Clauses {
+                structure: false,
+                sets: false,
+                api: false,
+            },
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -260,6 +278,9 @@ mod gate {
                 "--structure" => a.structure = true,
                 "--sets" => a.sets = true,
                 "--select" => a.select = true,
+                "--skew-structure" => a.skew.structure = true,
+                "--skew-sets" => a.skew.sets = true,
+                "--skew-api" => a.skew.api = true,
                 "--ppl" => {
                     a.ppl = Some(
                         it.next()
@@ -269,7 +290,7 @@ mod gate {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.structure || a.sets || a.select || a.ppl.is_some()) {
+        if !(a.structure || a.sets || a.select || a.ppl.is_some() || a.skew.any()) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -357,6 +378,9 @@ mod gate {
         }
         if let Some(tag) = &args.ppl {
             pass &= ppl(&mut m, &hp, tag)?;
+        }
+        if args.skew.any() {
+            pass &= skew::clauses(&mut m, &split, &hp, &args.skew)?;
         }
         if !pass {
             return Err(checks_failed());

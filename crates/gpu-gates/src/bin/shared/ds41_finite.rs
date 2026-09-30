@@ -1,5 +1,5 @@
 //! The V4.1 step's finite probe, for the bins that read a step's seams
-//! (`generate_ds41`'s `BLOOMERY_CHECK_FINITE`, `gate_deepseek41_skew`'s cuts,
+//! (`generate_ds41`'s `BLOOMERY_CHECK_FINITE`, the skew cuts (`shared/ds41_skew.rs`),
 //! `gate_deepseek41_long`): one step of the body run eagerly through
 //! `Body::enqueue_observed`, each sub-layer's streams read back where it wrote
 //! them, every seam whose streams hold a NaN or an infinity named, and at the

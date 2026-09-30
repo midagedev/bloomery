@@ -5,8 +5,12 @@
 //! (set here; the lever itself is refused, so the environment cannot move
 //! it), the host set locked (set here too, `BLOOMERY_HOST_LOCK` refused: a
 //! pick refuses a victim the host would serve from the file, and another
-//! process's reads reclaim populated pages). One load. Each clause starts from a clear (the residency back to its
-//! seed) and names its mutant:
+//! process's reads reclaim populated pages). One load. The residency's own
+//! clauses (`shared/ds41_residency.rs`) run first: its host-set refusal
+//! before the load, the rest on the load before the clauses below, with
+//! streaming off; `--only residency` stops after them. Each clause below
+//! starts from a clear (the residency back to its seed), streaming on, and
+//! names its mutant:
 //!
 //! - `s2` (DEMOTE: a streamed expert gives the bits a card-resident one
 //!   does): call A, [`S2_P`] prose ids in one batch, streams — its pick
@@ -84,8 +88,13 @@ fn main() -> std::process::ExitCode {
 mod ds41_open;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_residency.rs"]
+mod residency;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use crate::ds41_open::{fnv, open};
+    use crate::residency;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -530,8 +539,21 @@ mod gate {
         Ok(ok)
     }
 
+    /// `--only residency`: the residency's clauses alone; no argument, every
+    /// clause.
+    fn residency_only() -> Result<bool, GateError> {
+        const USAGE: &str = "usage: gate_ds41_callstream [--only residency]";
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [] => Ok(false),
+            ["--only", "residency"] => Ok(true),
+            _ => Err(format!("{USAGE}, not {args:?}").into()),
+        }
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOST_POPULATE, CARD_DONTNEED, R8])?;
+        let only_residency = residency_only()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         cfg.body.residency = RESIDENCY;
         cfg.body.prefill = PrefillMode::Batch;
@@ -550,18 +572,29 @@ mod gate {
             &Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
         )?;
         let bp = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
+        let refused = residency::refuse_clause(&path, &inputs, &cfg, &bp)?;
         let t0 = Instant::now();
         let mut s = open(&path, bp, &cfg)?;
         println!("load in {:.1} s", t0.elapsed().as_secs_f64());
         flags = HostFlags::new(s.model().gpu().context(), 1)?;
         let clauses = |s: &mut Session<Body>| -> Result<bool, GateError> {
-            let mut pass = watched("s2", || s2(s))?;
+            let mut pass = refused;
+            pass &= watched("residency", || residency::clauses(s, &flags))?;
+            if only_residency {
+                return Ok(pass);
+            }
+            set_stream(s, true)?;
+            pass &= watched("s2", || s2(s))?;
             pass &= watched("s1", || s1(s, &flags))?;
             pass &= watched("s3", || on_off(s, "s3", S3_P, S3_WINDOWS))?;
             pass &= watched("s4", || s4(s))?;
             Ok(pass)
         };
         let pass = clauses(&mut s);
+        // Named before the teardown, so a failure there does not hide it.
+        if let Err(e) = &pass {
+            println!("{NAME}: a clause failed: {e}");
+        }
         // Every free of device or pinned host memory waits for every stream
         // of the context, and the machine's copy stream can hold a copy that
         // waits for the staging of a flip not yet due, which only a pass or

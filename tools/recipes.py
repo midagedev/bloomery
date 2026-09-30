@@ -5192,8 +5192,8 @@ def self_test() -> int:
 
     one = sel("crates/gpu-gates/src/bin/gate_p1.rs")
     expect(one == {"gate-gpu-p1"}, f"gate_p1.rs selects {sorted(one)}")
-    shared = sel("crates/gpu-gates/src/bin/shared/ds41_shadow.rs")
-    expect({"gate-gpu-ds41-step", "gate-gpu-ds41-skew"} <= shared and "gate-gpu-e2e" not in shared, f"shared/ds41_shadow.rs selects {sorted(shared)}")
+    shared = sel("crates/gpu-gates/src/bin/shared/ds41_finite.rs")
+    expect({"gate-gpu-ds41-step", "gate-gpu-ds41-long"} <= shared and "gate-gpu-e2e" not in shared, f"shared/ds41_finite.rs selects {sorted(shared)}")
     samp = sel("crates/sampler/src/lib.rs")
     expect("gate-sampler" in samp and "gate-ops" not in samp and "gate-gpu-e2e" not in samp, f"sampler lib selects {sorted(samp)}")
     ds41 = sel("crates/gpu-deepseek41/src/lib.rs")

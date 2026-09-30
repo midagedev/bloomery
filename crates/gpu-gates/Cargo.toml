@@ -186,19 +186,11 @@ name = "gate_deepseek41_rope"
 required-features = ["deepseek41"]
 
 [[bin]]
-name = "gate_deepseek41_skew"
-required-features = ["deepseek41"]
-
-[[bin]]
 name = "gate_deepseek41_tier"
 required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_deepseek41_twocard"
-required-features = ["deepseek41"]
-
-[[bin]]
-name = "gate_deepseek41_residency"
 required-features = ["deepseek41"]
 
 [[bin]]
@@ -263,10 +255,6 @@ required-features = ["glm5next"]
 
 [[bin]]
 name = "gate_glm5next_e2e"
-required-features = ["glm5next"]
-
-[[bin]]
-name = "gate_glm5next_card"
 required-features = ["glm5next"]
 
 [[bin]]

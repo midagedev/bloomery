@@ -1,7 +1,7 @@
 //! The V4.1 residency gates' shared open: the records-free open log
 //! ([`Quiet`]), the load through the binaries' open ([`open`]) and the
-//! FNV-1a 64 of a logits row ([`fnv`]). `gate_deepseek41_residency` and
-//! `gate_ds41_callstream` read them here.
+//! FNV-1a 64 of a logits row ([`fnv`]). `gate_ds41_callstream` and the
+//! residency clauses it runs (`shared/ds41_residency.rs`) read them here.
 
 use std::path::Path;
 

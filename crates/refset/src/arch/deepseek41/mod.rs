@@ -71,7 +71,6 @@ pub static IK: Family = Family {
         "gate-gpu-ds41-chain-ffn",
         "gate-gpu-ds41-chain-glue",
         "gate-gpu-ds41-step",
-        "gate-gpu-ds41-skew",
     ],
 };
 
