@@ -120,6 +120,48 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### What T0 and the 09-30 night left (line3 — `lanea`, `gmerge`, `mtppf`, `mtpcost`, `c4resid`, `resitrun`)
+
+Qwen3.8 on the A6000 plan (a), prose, C 4352 (rig-log 09-30 #q38mtp-speed, #q38res-mtp, #q38mtp-wide): the MTP
+draft takes decode from 51.6 to 84.0 tok/s at P 512 and from 52.2 to 68.5 at P 4096, and costs the prompt
+3.1 % / 6.1 %. Residency on top gives 85.7 / 70.7 with the prompt at −7.0 % / −9.2 %. With both on, a reply
+breaks even against the plain path at about 10 output tokens at P 512 and about 167 at P 4096 [derived].
+
+- **gate-gpu-lib's capture race (investigation, S–M)**: on a card-locked runner it went red once in 4 runs on
+  the 3090. Four hw_ tests failed with DriverError 900 "operation not permitted when stream is capturing":
+  `hw_host_flag_holds_a_copy_until_raised`, `hw_boundary_gives_back_its_context_handles`,
+  `hw_a_capture_body_that_fails_or_panics_leaves_the_stream_capturable` and
+  `hw_nodes_report_a_captured_host_function`. The old path failed 0 of 6. The capture mode is THREAD_LOCAL
+  (`crates/gpu/src/graph.rs`), and the mechanism is not known. It may become a line in the nvlabs ledger.
+  (`lanea`)
+- **callstream teardown segfault (M)**: after a device fault with residency on, the process ends with rc 139
+  while the model is dropped. The gate prints the clause error before its teardown, so no verdict is lost.
+  The crash still needs a fix. (`gmerge`)
+- **callstream mutant s3-drop-admitted (S)**: it is caught by s2 and s4, not by s3, and its output is
+  byte-identical to s2-acc-first's, so its site may be wrong. (`gmerge`)
+- **Qwen3.8 MTP prompt cost after `mtpcost` (M, a placement round)**: at P 4096 the MTP arm's prompt is
+  still about 0.43 s slower (pp 616.9 → 579.4). The store walks are no longer the term: `mtpcost` walks 64
+  rows wide, so P 4096 runs about 64 walks, about 30 ms at their 0.45–0.6 ms fixed cost each [derived]. A
+  graph capture of the walk would win under 1 %. The term is the draft's card reserve: 2.82 GB, 94 % of it
+  the draft's 512 Q8_0 experts, moves target experts to the host, host_slots +8.0 % at P 4096 (+6.8 % at
+  512). On a prompt union of 4.99 s that is about 0.40 s, nearly all of the rest [derived]. There are two
+  levers. C1 requantizes the draft experts (L). C2 lends the draft's expert area to the target during the
+  prompt (M–L). `head=full` borrows the target's output, so a smaller head frees no card bytes. The
+  catch_up and stepped whole walks can also become store walks (XS). (`mtppf`, `mtpcost`)
+- **MTP warm before the last layer's combine (S–M, after MTP phase B)**: on non-last prompt units (the Pass
+  path, and a ubatch with P > U), the warm stores rows before the last layer's combine. Acceptance drops,
+  and tokens do not change, so gate (w) cannot see it. The fix sites are `MtpDraft<B>::warm`, `prompt` (the
+  per-unit warm in the sink) and `catch_up` in `crates/app/src/mtp.rs`.
+- **`residency pass` has no hit field (S)**: residency's +3…+7 % per round was below its card band
+  (+15…+70), and the hit per window could not be read to say why. Add the hit to the record, and read one
+  window before any rule change. (`c4resid`)
+- **The Qwen3.8 defaults on the 3090 (M, after the resit's 3090 cells)**: residency and MTP stay off under
+  `--place gate` until a 3090 cell measures them.
+- **GLM G2: PRIME in the load (M, binary change)**: this is a follow-up of GLM's MTP arm. (`glmmtparm`)
+- **gate_deepseek41_tier's lost_case and batch_lost_case (S)**: about 80 % of the two is the same, so one
+  helper would serve both. (`gmerge`)
+- **recipes.py's self-test names specific recipes (S)**: it breaks on every merge that renames one. (`gmerge`)
+
 ### dsres가 남긴 것 (09-29 아침, 03 종이 라운드 — ko-08 목록 + DSpark 잔차)
 
 rig-log 09-29 #chatlist-dspark의 열린 잔차(ko-08 목록 + draft, 예측 54.2, 실측 46.4 tok/s, toktape 클립 값)를 코드와 트레이스로 가른 종이 판정이다. 쌍 패스는 행마다 한 토큰 스텝의 m = 1 체인을 한 A6000 스트림에서 번갈아 치러서(`gpu-deepseek41/src/body.rs`의 `enqueue_pair`, `runtime/src/sched.rs`의 `step_nth`), A6000 직렬 체인이 두 배가 된다. ko-08은 held A6000 적중이 67.7 %여서 쌍 패스의 호스트 수요 20.2 ms가 A6000 30.7 ms 아래로 내려간다. 그러면 벽시계는 max(호스트, A6000) + 결합 손실 2–3 ms + 가장자리다[유도]. 예측식 2Hd + 4.1은 카드를 늘 호스트 그늘로 두어서 이 경우를 놓쳤다. 보고서: `specs/wave-m8/reports/dsres.md`(세션 쪽 사본). 판정은 아래 측정 하나로 닫는다. 레버 판단은 그 결과를 보고 한다(aa).
