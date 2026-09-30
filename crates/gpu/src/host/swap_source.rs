@@ -133,6 +133,116 @@ struct LayerParts {
     parts: Vec<usize>,
 }
 
+/// What the per-layer parts check reads of one stack name's resident weight
+/// ([`Weights::get`]): `None` when the load holds no weight of the name,
+/// else the resident stack's K-quant type, its words and rows, and its
+/// buffer's device address. `ty` is `None` — and the words and rows stand
+/// unread — for a weight of another device format, which the check refuses
+/// beside its layer's other parts.
+struct FoundStack {
+    ty: Option<GgmlType>,
+    words: usize,
+    rows: usize,
+    ptr: sys::CUdeviceptr,
+}
+
+impl FoundStack {
+    /// The parts check's view of one resident weight.
+    fn of(d: &DevWeight) -> FoundStack {
+        match d {
+            DevWeight::KQuant { ty, w, .. } => FoundStack {
+                ty: Some(*ty),
+                words: w.buf().len(),
+                rows: w.rows(),
+                ptr: w.buf().cu_deviceptr(),
+            },
+            _ => FoundStack {
+                ty: None,
+                words: 0,
+                rows: 0,
+                ptr: 0,
+            },
+        }
+    }
+}
+
+/// Layer `l`'s parts and slots from what the load holds of its stacks:
+/// `names` its stack names in stack order, `types` the K-quants its kernels
+/// read them in, `found` and `tensors` what the load's weights and the plan
+/// hold of each name, and `experts` the routed experts a stack holds. Each
+/// part is its tensor's `file_bytes / experts`; the slots are the last
+/// stack's rows over its tensor's `dims[1]`. `Ok(None)`: the load holds
+/// none of the layer's stacks. Refused by name, every error naming
+/// `FileSwap::new`, the entry point the check serves: a names and types
+/// count that differs, a stack not a resident K-quant of its listed type, a
+/// name the plan does not hold, a part not a whole number of 4-byte words,
+/// and a stack too short for its slots. Pure host code: the tests below
+/// exercise layers whose layouts differ without a model file.
+fn layer_parts(
+    l: usize,
+    names: &[String],
+    types: &[GgmlType],
+    found: &[Option<FoundStack>],
+    tensors: &[Option<&ModelTensor>],
+    experts: u64,
+) -> Result<Option<(Vec<usize>, usize)>, GpuError> {
+    const WHAT: &str = "FileSwap::new";
+    // All of the layer's stacks or none: a layer none of whose stacks the
+    // load holds is skipped whatever its types list says.
+    if found.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    if names.len() != types.len() {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "layer {l}: {} stack names for {} types",
+                names.len(),
+                types.len()
+            ),
+        ));
+    }
+    let stacks_of = found
+        .iter()
+        .zip(names)
+        .zip(types)
+        .map(|((d, n), want)| match d {
+            Some(st) if st.ty == Some(*want) => Ok(st),
+            _ => Err(GpuError::tensor(
+                WHAT,
+                n.clone(),
+                "a resident K-quant routed stack beside the layer's other parts",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let tensors = names
+        .iter()
+        .zip(tensors)
+        .map(|(n, t)| {
+            t.ok_or_else(|| GpuError::tensor(WHAT, n.clone(), "a routed stack of the plan"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let per: Vec<usize> = tensors
+        .iter()
+        .map(|t| usize::try_from(t.file_bytes / experts.max(1)).unwrap_or(0))
+        .collect();
+    let slots =
+        stacks_of[stacks_of.len() - 1].rows / tensors[tensors.len() - 1].dims[1].max(1) as usize;
+    for (i, st) in stacks_of.iter().enumerate() {
+        if per[i] == 0 || !per[i].is_multiple_of(4) || st.words * 4 < slots * per[i] {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l} part {i}: {} bytes an expert, a stack of {} words for \
+                     {slots} slots",
+                    per[i], st.words
+                ),
+            ));
+        }
+    }
+    Ok(Some((per, slots)))
+}
+
 /// A placed load's [`SwapSource`] over its model file: each part of an expert
 /// as the file (or the r8 sidecar the host reads) holds it, into the slot's
 /// place in the layer's stage stack, with the load's host set saying what the
@@ -192,14 +302,6 @@ impl FileSwap {
         }
         let pair = R8Pair::at_load(file, r8).map_err(|e| GpuError::plan(WHAT, e))?;
         let experts = plan.model.experts;
-        let find = |name: String| {
-            plan.model
-                .tensors
-                .iter()
-                .find(|t| t.name == name)
-                .cloned()
-                .ok_or(GpuError::tensor(WHAT, name, "a routed stack of the plan"))
-        };
         let mut out = Vec::with_capacity(layers.len());
         for l in layers.clone() {
             let names = stacks.names(l);
@@ -207,64 +309,33 @@ impl FileSwap {
             // none of whose stacks the load holds (a dense block, a layer the
             // plan keeps whole on the host) is skipped whatever its types
             // list says.
-            let found = names.iter().map(|n| w.get(n)).collect::<Vec<_>>();
-            if found.iter().all(Option::is_none) {
-                out.push(None);
-                continue;
-            }
-            let types = stacks.types(l);
-            if names.len() != types.len() {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "layer {l}: {} stack names for {} types",
-                        names.len(),
-                        types.len()
-                    ),
-                ));
-            }
-            let stacks_of = found
+            let found = names
                 .iter()
-                .zip(&names)
-                .zip(types)
-                .map(|((d, n), want)| match d {
-                    Some(DevWeight::KQuant { ty, w, .. }) if ty == want => Ok(w),
-                    _ => Err(GpuError::tensor(
-                        WHAT,
-                        n.clone(),
-                        "a resident K-quant routed stack beside the layer's other parts",
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|n| w.get(n).map(FoundStack::of))
+                .collect::<Vec<_>>();
             let tensors = names
                 .iter()
-                .cloned()
-                .map(find)
-                .collect::<Result<Vec<_>, _>>()?;
-            let per: Vec<usize> = tensors
-                .iter()
-                .map(|t| usize::try_from(t.file_bytes / experts.max(1)).unwrap_or(0))
-                .collect();
-            let slots = stacks_of[stacks_of.len() - 1].rows()
-                / tensors[tensors.len() - 1].dims[1].max(1) as usize;
-            for (i, st) in stacks_of.iter().enumerate() {
-                if per[i] == 0 || !per[i].is_multiple_of(4) || st.buf().len() * 4 < slots * per[i] {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        format!(
-                            "layer {l} part {i}: {} bytes an expert, a stack of {} words for \
-                             {slots} slots",
-                            per[i],
-                            st.buf().len()
-                        ),
-                    ));
-                }
-            }
+                .map(|n| plan.model.tensors.iter().find(|t| t.name == *n))
+                .collect::<Vec<_>>();
+            let Some((parts, slots)) =
+                layer_parts(l, &names, stacks.types(l), &found, &tensors, experts)?
+            else {
+                out.push(None);
+                continue;
+            };
+            // The check held every name: a resident K-quant stack of its
+            // listed type and a tensor of the plan.
             out.push(Some(LayerParts {
-                tensors,
-                base: stacks_of.iter().map(|st| st.buf().cu_deviceptr()).collect(),
+                tensors: tensors
+                    .into_iter()
+                    .map(|t| t.cloned().expect("a plan tensor the check held"))
+                    .collect(),
+                base: found
+                    .iter()
+                    .map(|st| st.as_ref().expect("a resident stack the check held").ptr)
+                    .collect(),
                 slots,
-                parts: per,
+                parts,
             }));
         }
         let first = out
@@ -607,5 +678,211 @@ impl ResidencyGlue {
     /// ([`HostTier::stop_swap`]); nothing without one.
     pub fn stop<H>(&mut self, tier: &mut HostTier<H>) {
         tier.stop_swap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model::placement::Role;
+
+    /// The plan's tensor of one routed stack: `dims` in gguf `ne[]` order,
+    /// `per` bytes an expert, its `file_bytes` `per * 8` — the eight experts
+    /// every check here runs. No real tensor data, only what the parts
+    /// check reads.
+    fn stack(l: usize, name: &str, ty: GgmlType, dims: &[u64], per: u64) -> ModelTensor {
+        ModelTensor {
+            name: name.to_string(),
+            shard: 0,
+            layer: Some(l),
+            role: Role::RoutedExperts,
+            ty,
+            dims: dims.to_vec(),
+            file_bytes: per * 8,
+            gathered_rows: None,
+        }
+    }
+
+    /// A resident K-quant stack of `ty`: `words` words, `rows` rows.
+    fn resident(ty: GgmlType, words: usize, rows: usize) -> Option<FoundStack> {
+        Some(FoundStack {
+            ty: Some(ty),
+            words,
+            rows,
+            ptr: 0,
+        })
+    }
+
+    /// A resident weight that is no K-quant stack at all.
+    fn other_format() -> Option<FoundStack> {
+        Some(FoundStack {
+            ty: None,
+            words: 0,
+            rows: 0,
+            ptr: 0,
+        })
+    }
+
+    fn names(of: &[&str]) -> Vec<String> {
+        of.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Two layers whose layouts differ — [Q4_K, Q4_K, Q5_K] against
+    /// [Q5_K, Q5_K, Q6_K], each part its own bytes an expert and the down
+    /// stack its own rows — hold their own parts and slots, each layer as
+    /// the file lays it out. Mutant: parts taken from the first card layer
+    /// for every layer — the layer 1 arm catches it.
+    #[test]
+    fn layers_of_different_layouts_hold_their_own_parts() {
+        // Layer 0: 4096, 12288 and 8192 bytes an expert, the down stack 4096
+        // rows of 512 an expert — 8 slots.
+        let names0 = names(&["layer.0.gate", "layer.0.up", "layer.0.down"]);
+        let types0 = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q5_K];
+        let t0 = [
+            stack(0, "layer.0.gate", GgmlType::Q4_K, &[512, 128, 8], 4096),
+            stack(0, "layer.0.up", GgmlType::Q4_K, &[1536, 128, 8], 12288),
+            stack(0, "layer.0.down", GgmlType::Q5_K, &[2048, 512, 8], 8192),
+        ];
+        let tensors0: Vec<Option<&ModelTensor>> = t0.iter().map(Some).collect();
+        let found0 = [
+            resident(GgmlType::Q4_K, 8192, 1024),
+            resident(GgmlType::Q4_K, 24576, 1024),
+            resident(GgmlType::Q5_K, 16384, 4096),
+        ];
+        match layer_parts(0, &names0, &types0, &found0, &tensors0, 8) {
+            Ok(Some((parts, slots))) => {
+                assert_eq!(parts, vec![4096, 12288, 8192]);
+                assert_eq!(slots, 8);
+            }
+            other => panic!("layer 0 holds its parts, got {other:?}"),
+        }
+        // Layer 1: 6144, 6144 and 16384 bytes an expert, the down stack 1536
+        // rows of 256 an expert — 6 slots.
+        let names1 = names(&["layer.1.gate", "layer.1.up", "layer.1.down"]);
+        let types1 = [GgmlType::Q5_K, GgmlType::Q5_K, GgmlType::Q6_K];
+        let t1 = [
+            stack(1, "layer.1.gate", GgmlType::Q5_K, &[768, 96, 8], 6144),
+            stack(1, "layer.1.up", GgmlType::Q5_K, &[768, 96, 8], 6144),
+            stack(1, "layer.1.down", GgmlType::Q6_K, &[2048, 256, 8], 16384),
+        ];
+        let tensors1: Vec<Option<&ModelTensor>> = t1.iter().map(Some).collect();
+        let found1 = [
+            resident(GgmlType::Q5_K, 9216, 576),
+            resident(GgmlType::Q5_K, 9216, 576),
+            resident(GgmlType::Q6_K, 24576, 1536),
+        ];
+        match layer_parts(1, &names1, &types1, &found1, &tensors1, 8) {
+            Ok(Some((parts, slots))) => {
+                assert_eq!(parts, vec![6144, 6144, 16384]);
+                assert_eq!(slots, 6);
+            }
+            other => panic!("layer 1 holds its own parts, not layer 0's, got {other:?}"),
+        }
+    }
+
+    /// A layer none of whose stacks the load holds is skipped whatever its
+    /// types list says: the skip reads only the found stacks, before the
+    /// names-and-types count it would otherwise refuse.
+    #[test]
+    fn a_layer_with_no_resident_stack_is_none_whatever_its_types() {
+        let names = names(&["layer.4.gate", "layer.4.up", "layer.4.down"]);
+        let types = [GgmlType::Q4_K];
+        let found = [None, None, None];
+        let tensors: Vec<Option<&ModelTensor>> = vec![None, None, None];
+        match layer_parts(4, &names, &types, &found, &tensors, 8) {
+            Ok(None) => {}
+            other => panic!("a layer the load holds nothing of is skipped, got {other:?}"),
+        }
+    }
+
+    /// A stack resident as another K-quant than the one its layer lists —
+    /// and a resident weight that is no K-quant stack at all — is refused
+    /// by name, beside its layer's other parts.
+    #[test]
+    fn a_stack_of_another_type_than_listed_is_refused_by_name() {
+        let names = names(&["layer.2.gate", "layer.2.down"]);
+        let types = [GgmlType::Q4_K, GgmlType::Q5_K];
+        let gate = stack(2, "layer.2.gate", GgmlType::Q4_K, &[512, 128, 8], 4096);
+        let down = stack(2, "layer.2.down", GgmlType::Q5_K, &[2048, 512, 8], 8192);
+        let tensors = vec![Some(&gate), Some(&down)];
+        let wrong_type = [
+            resident(GgmlType::Q6_K, 8192, 1024),
+            resident(GgmlType::Q5_K, 16384, 4096),
+        ];
+        match layer_parts(2, &names, &types, &wrong_type, &tensors, 8) {
+            Err(GpuError::Tensor { what, name, need }) => {
+                assert_eq!(
+                    (what, need),
+                    (
+                        "FileSwap::new",
+                        "a resident K-quant routed stack beside the layer's other parts"
+                    )
+                );
+                assert_eq!(name, "layer.2.gate");
+            }
+            other => panic!("a stack of another type than listed is refused, got {other:?}"),
+        }
+        let no_kquant = [other_format(), resident(GgmlType::Q5_K, 16384, 4096)];
+        match layer_parts(2, &names, &types, &no_kquant, &tensors, 8) {
+            Err(GpuError::Tensor { name, .. }) => assert_eq!(name, "layer.2.gate"),
+            other => panic!("a weight of another device format is refused, got {other:?}"),
+        }
+    }
+
+    /// A layer whose stack names and types differ in count is refused
+    /// before any stack is read.
+    #[test]
+    fn names_and_types_of_different_counts_are_refused() {
+        let names = names(&["layer.1.gate", "layer.1.up", "layer.1.down"]);
+        let types = [GgmlType::Q4_K, GgmlType::Q4_K];
+        let gate = stack(1, "layer.1.gate", GgmlType::Q4_K, &[512, 128, 8], 4096);
+        let tensors: Vec<Option<&ModelTensor>> = vec![Some(&gate), None, None];
+        let found = [resident(GgmlType::Q4_K, 8192, 1024), None, None];
+        match layer_parts(1, &names, &types, &found, &tensors, 8) {
+            Err(GpuError::Shape { what, detail }) => {
+                assert_eq!(what, "FileSwap::new");
+                assert_eq!(detail, "layer 1: 3 stack names for 2 types");
+            }
+            other => panic!("names and types of different counts are refused, got {other:?}"),
+        }
+    }
+
+    /// A part that is not a whole number of 4-byte words — zero bytes an
+    /// expert included — or a stack too short for its slots is refused with
+    /// its bytes and words. One stack, 8 slots of 512 rows.
+    #[test]
+    fn a_part_not_whole_words_or_a_stack_too_short_is_refused() {
+        let names = names(&["layer.0.gate"]);
+        let types = [GgmlType::Q4_K];
+        let case = |per: u64, words: usize| {
+            let t = stack(0, "layer.0.gate", GgmlType::Q4_K, &[512, 512, 8], per);
+            let tensors = vec![Some(&t)];
+            let found = [resident(GgmlType::Q4_K, words, 4096)];
+            layer_parts(0, &names, &types, &found, &tensors, 8)
+        };
+        match case(6, 12) {
+            Err(GpuError::Shape { what, detail }) => {
+                assert_eq!(what, "FileSwap::new");
+                assert_eq!(
+                    detail,
+                    "layer 0 part 0: 6 bytes an expert, a stack of 12 words for 8 slots"
+                );
+            }
+            other => panic!("a part that is not whole words is refused, got {other:?}"),
+        }
+        match case(0, 100) {
+            Err(GpuError::Shape { detail, .. }) => assert_eq!(
+                detail,
+                "layer 0 part 0: 0 bytes an expert, a stack of 100 words for 8 slots"
+            ),
+            other => panic!("a part of no bytes is refused, got {other:?}"),
+        }
+        match case(4096, 8191) {
+            Err(GpuError::Shape { detail, .. }) => assert_eq!(
+                detail,
+                "layer 0 part 0: 4096 bytes an expert, a stack of 8191 words for 8 slots"
+            ),
+            other => panic!("a stack too short for its slots is refused, got {other:?}"),
+        }
     }
 }
