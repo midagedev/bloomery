@@ -616,7 +616,7 @@ impl FileStacks for Ds41Stacks {
         ]
     }
 
-    fn types(&self) -> &'static [GgmlType] {
+    fn types(&self, _layer: usize) -> &[GgmlType] {
         &TYPES
     }
 

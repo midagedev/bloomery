@@ -561,7 +561,7 @@ mod gate {
     }
 
     impl SwapSource for Synth {
-        fn part_bytes(&self) -> &[usize] {
+        fn part_bytes(&self, _layer: usize) -> &[usize] {
             &PART_BYTES
         }
 
