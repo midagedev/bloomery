@@ -1,7 +1,9 @@
-//! The GLM layer program of the one-token step ([`StepProgram`]) and the
-//! port its host legs go through ([`HostLeg`]): [`runtime::sched::walk`]
-//! over the point `(1, 1, Step)`. Each layer's parts, by its programs
-//! (`runtime::layer::Layer`), never its number:
+//! The GLM layer program of the one-token step and of the verify's two rows
+//! ([`StepProgram`]) and the port its host legs go through ([`HostLeg`]):
+//! [`runtime::sched::walk`] over the point `(1, 1, Step)`, or `(2, 1, Step)`
+//! for the verify, whose rows run one layer apart, each row's launches the
+//! step's on its own buffers (`crate::body::Parts::at_row`). Each layer's
+//! parts, by its programs (`runtime::layer::Layer`), never its number:
 //!
 //! - the front: the mixer sub-layer whole — `hc_pre`, the fold, the KDA or
 //!   latent mixer, `hc_post` — then the feed-forward sub-layer's `hc_pre`
@@ -33,7 +35,7 @@ use model::arch::glm5next::names::Sub;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind, Refused};
 
-use crate::body::{Parts, f32v, q8};
+use crate::body::{PAIR_ROWS, Parts, f32v, q8};
 use crate::host::GlmHost;
 use crate::tensors::LayerNames;
 use crate::{ffn, kda, mla};
@@ -81,9 +83,32 @@ pub(crate) fn walk_step(
     hybrid: &mut Hybrid<GlmHost>,
     head: &mut Head,
 ) -> Result<(), GpuError> {
+    walk(gpu, w, parts, hybrid, [Some(head), None])
+}
+
+/// Walk the verify's two rows over `parts`, the host tier opened for them
+/// first, row `r` into `heads[r]`.
+pub(crate) fn walk_pair(
+    gpu: &Gpu,
+    w: &Weights,
+    parts: Parts<'_>,
+    hybrid: &mut Hybrid<GlmHost>,
+    heads: [&mut Head; PAIR_ROWS],
+) -> Result<(), GpuError> {
+    walk(gpu, w, parts, hybrid, heads.map(Some))
+}
+
+/// Walk one row per head in `heads` (the step's one, or the verify's two).
+fn walk(
+    gpu: &Gpu,
+    w: &Weights,
+    parts: Parts<'_>,
+    hybrid: &mut Hybrid<GlmHost>,
+    heads: [Option<&mut Head>; PAIR_ROWS],
+) -> Result<(), GpuError> {
     let layers = parts.cfg.len();
     let o = Overlap {
-        units: 1,
+        units: heads.iter().flatten().count(),
         cols: 1,
         port: PortKind::Step,
     };
@@ -95,8 +120,8 @@ pub(crate) fn walk_step(
         gpu,
         w,
         parts,
-        cur: 0,
-        head,
+        cur: [0; PAIR_ROWS],
+        heads,
     };
     sched::walk(o, layers, &mut port, &mut prog)
 }
@@ -112,8 +137,9 @@ impl Port for HostLeg<'_> {
     const KIND: PortKind = PortKind::Step;
 
     /// Opens the host tier's step port on the point's rows
-    /// ([`Hybrid::open_step`]): one row of one column; any other point is
-    /// refused by name.
+    /// ([`Hybrid::open_step`]): one row of one column, or two for the
+    /// verify (the boundary must carry two rows); any other point is refused
+    /// by name.
     fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
         self.hybrid.open_step(self.stream, o.units, o.cols)
     }
@@ -126,25 +152,34 @@ impl Port for HostLeg<'_> {
     }
 }
 
-/// The GLM program over one walk of the step: the body's parts, the stream
-/// buffer the next sub-layer reads, the head.
+/// The GLM program over one walk: the body's parts, each row's stream
+/// buffer its next sub-layer reads, each row's head.
 struct StepProgram<'s, 'w> {
     gpu: &'w Gpu,
     w: &'w Weights,
     parts: Parts<'s>,
-    cur: usize,
-    head: &'s mut Head,
+    cur: [usize; PAIR_ROWS],
+    heads: [Option<&'s mut Head>; PAIR_ROWS],
 }
 
 impl StepProgram<'_, '_> {
-    /// Sub-layer `sub` of layer `l`'s input into `x` ([`hc_in`]).
-    fn hc_in(&mut self, l: usize, sub: Sub) -> Result<(), GpuError> {
-        hc_in(self.gpu, self.w, &mut self.parts, self.cur, l, sub)
+    /// The launches after this are row `row`'s, on its buffers.
+    fn at(&mut self, row: usize) -> Result<(), GpuError> {
+        self.parts.at_row(row)
     }
 
-    /// The sub-layer's output into the next streams ([`hc_out`]).
+    /// Sub-layer `sub` of layer `l`'s input into the current row's `x`
+    /// ([`hc_in`]).
+    fn hc_in(&mut self, l: usize, sub: Sub) -> Result<(), GpuError> {
+        let cur = self.cur[self.parts.row];
+        hc_in(self.gpu, self.w, &mut self.parts, cur, l, sub)
+    }
+
+    /// The current row's sub-layer output into its next streams
+    /// ([`hc_out`]).
     fn hc_out(&mut self) -> Result<(), GpuError> {
-        self.cur = hc_out(self.gpu, &mut self.parts, self.cur)?;
+        let row = self.parts.row;
+        self.cur[row] = hc_out(self.gpu, &mut self.parts, self.cur[row])?;
         Ok(())
     }
 }
@@ -152,15 +187,16 @@ impl StepProgram<'_, '_> {
 impl<'s> LayerProgram for StepProgram<'s, '_> {
     type Port = HostLeg<'s>;
 
-    /// Stream buffer 0, which the embedding wrote.
-    fn begin(&mut self, _unit: usize) -> Result<(), GpuError> {
-        self.cur = 0;
+    /// The row's stream buffer 0, which its embedding wrote.
+    fn begin(&mut self, unit: usize) -> Result<(), GpuError> {
+        *self.cur.get_mut(unit).ok_or_else(|| no_row(unit))? = 0;
         Ok(())
     }
 
     /// The mixer sub-layer, then the block's input and the dense block with
     /// its `hc_post`, or the routed block up to its go.
     fn front(&mut self, port: &mut HostLeg<'s>, at: At) -> Result<(), GpuError> {
+        self.at(at.unit)?;
         let (gpu, w, l) = (self.gpu, self.w, at.layer);
         let kind = self.parts.cfg[l].kind;
         self.hc_in(l, Sub::Attn)?;
@@ -180,7 +216,7 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
             FfnKind::Dense => {
                 ffn::dense(gpu, w, &mut self.parts, l)?;
                 self.hc_out()?;
-                self.parts.tap(gpu, l, self.cur)
+                self.parts.tap(gpu, l, self.cur[at.unit])
             }
             FfnKind::Moe => ffn::front(gpu, w, &mut self.parts, port.hybrid, l),
         }
@@ -188,6 +224,7 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
 
     /// A routed layer's card experts and shared expert under its host leg.
     fn shadow(&mut self, port: &mut HostLeg<'s>, at: At) -> Result<(), GpuError> {
+        self.at(at.unit)?;
         let l = at.layer;
         if !self.parts.cfg[l].kind.host_leg() {
             return Ok(());
@@ -202,22 +239,37 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
         if !self.parts.cfg[l].kind.host_leg() {
             return Ok(());
         }
+        self.at(at.unit)?;
         ffn::back(gpu, &mut self.parts, port.hybrid.boundary(), l)?;
         self.hc_out()?;
-        self.parts.tap(gpu, l, self.cur)?;
-        port.hybrid.row_enqueued(l, 0)
+        self.parts.tap(gpu, l, self.cur[at.unit])?;
+        port.hybrid.row_enqueued(l, at.unit)
     }
 
-    /// The streams' mean into the head, and the head.
-    fn end(&mut self, _unit: usize) -> Result<(), GpuError> {
+    /// The row's streams' mean into its head, and the head.
+    fn end(&mut self, unit: usize) -> Result<(), GpuError> {
+        self.at(unit)?;
         let (gpu, w) = (self.gpu, self.w);
         let n = self.parts.d.embd;
-        let s = &self.parts.s.streams[self.cur];
+        let head = self
+            .heads
+            .get_mut(unit)
+            .and_then(Option::as_deref_mut)
+            .ok_or_else(|| no_row(unit))?;
+        let s = &self.parts.s.streams[self.cur[unit]];
         self.parts
             .k
             .hc
-            .enqueue_mean(gpu.stream(), s, n, 0, self.head.input_mut())?;
-        self.head.enqueue(gpu, w)
+            .enqueue_mean(gpu.stream(), s, n, 0, head.input_mut())?;
+        head.enqueue(gpu, w)
+    }
+}
+
+/// A unit the walk has no row or head for, by name.
+fn no_row(unit: usize) -> GpuError {
+    GpuError::Shape {
+        what: WHAT,
+        detail: format!("row {unit} of a walk of {PAIR_ROWS} rows at most, or one with no head"),
     }
 }
 

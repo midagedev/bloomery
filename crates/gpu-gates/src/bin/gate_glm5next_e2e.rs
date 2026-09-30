@@ -90,6 +90,24 @@
 //!   after the launch leaves the model there too, the next step there
 //!   refused by name (the recurrent stores hold it already) and nothing a
 //!   cut keeps past the model's position.
+//! - (v) the verify of two rows (`Rows`, `bloomery_gpu_glm5next`'s verify):
+//!   its capture holds twice the step's nodes (each row the step's
+//!   launches, the head included); on the batch set's tokens, in graph mode
+//!   and in eager: from a reset
+//!   and a step of token 0, a verify of tokens 1 and 2 gives the plain
+//!   graph run's tokens and logits at positions 1 and 2 bit for bit; a step
+//!   while it waits for its commit is refused by name and moves nothing;
+//!   keeping both rows, the stores (each KDA layer's committed lane and
+//!   ring, every latent layer's rows and pool plane) digest as three plain
+//!   steps', and the step of token 3 gives the plain run's position 3. Then
+//!   the draft rejected: a verify of token 1 and a wrong draft, row 0 kept
+//!   alone, then the steps of tokens 2 and 3 give the plain run's positions
+//!   2 and 3 and the stores after token 2 digest as the plain steps'. A
+//!   verify whose row 1 wrote the committed lane in place fails the
+//!   reject's step at 2 by its stamp, and one that left row 1's lane
+//!   uncommitted fails the accept's step at 3. It runs last on the load
+//!   ((pb-long) before it), and an error in it is its FAIL, not the gate's
+//!   end.
 //! - (k) checkpoints, on the prose set's ids through the session: a prompt
 //!   of [`A`] ids takes its checkpoints at 512 and [`A`]; a cut keeps 512 for
 //!   600 and nothing for 500, each with its reason's code, and a cut to 600
@@ -133,7 +151,9 @@
 //!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
-//! at [`CTX`]. `--step-sets short` takes (t)'s two 4-token sets only,
+//! at [`CTX`], `--only verify` (s) and (v) alone on a load at [`CTX`] (the
+//! plain graph run of the batch set they compare against included).
+//! `--step-sets short` takes (t)'s two 4-token sets only,
 //! `--step-sets long` the 1,024- and 3,070-position sets only, `--step-sets
 //! all` (the default) all four; it names the sets of the load at [`CTX`], so
 //! beside `--only pp` or `--only pplong` it is refused by name.
@@ -171,6 +191,7 @@ mod gate {
     use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::{Fault, FaultSite, LAYER_HEAD};
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
@@ -181,8 +202,8 @@ mod gate {
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
-        Body, Glm5nextModel, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill, set_taps,
-        step_launches, store_digests,
+        Body, Glm5nextModel, LANES, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill,
+        set_taps, step_launches, store_digests,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -326,11 +347,12 @@ mod gate {
     const HEAD_RATIO: f64 = 1.5;
 
     /// The stores' bytes at [`CTX`] rows, derived from the header: each KDA
-    /// layer's state, 64 heads of 128 × 128 f32, and conv ring, 11 rows of
-    /// 3 · 64 · 128 f32; each latent layer's latent and index rows, 512 +
-    /// 256 f16 a position, and its pool plane, 128 f16 a pool of four.
+    /// layer's state, [`LANES`] lanes of 64 heads of 128 × 128 f32, a u32
+    /// stamp a lane, and conv ring, 11 rows of 3 · 64 · 128 f32; each latent
+    /// layer's latent and index rows, 512 + 256 f16 a position, and its pool
+    /// plane, 128 f16 a pool of four.
     fn store_bytes() -> usize {
-        N_KDA * (64 * 128 * 128 + 11 * 3 * 64 * 128) * 4
+        N_KDA * ((LANES * 64 * 128 * 128 + 11 * 3 * 64 * 128) * 4 + LANES * 4)
             + N_LATENT * (CTX * (512 + 256) + CTX.div_ceil(4) * 128) * 2
     }
 
@@ -1460,6 +1482,149 @@ mod gate {
         Ok(before_ok && after_ok)
     }
 
+    // ------------------------------------------------ (v) the verify
+
+    /// `m` from a reset, the plain steps of `toks` in graph mode: every
+    /// store's digest after them.
+    fn digests_after(m: &mut Glm5nextModel, toks: &[u32]) -> Result<Vec<StoreDigest>, GateError> {
+        m.reset()?;
+        m.set_mode(StepMode::Graph);
+        m.step(toks)?;
+        Ok(store_digests(m)?)
+    }
+
+    /// The first store whose digest differs, by layer and name.
+    fn same_stores(got: &[StoreDigest], want: &[StoreDigest]) -> Result<(), String> {
+        match first_store_diff(got, want) {
+            None => Ok(()),
+            Some(d) => Err(d),
+        }
+    }
+
+    /// Whether the last step's logits are `want`'s bit for bit.
+    fn logits_are(m: &Glm5nextModel, want: Option<&Vec<f32>>) -> bool {
+        want.is_some_and(|w| m.logits().is_ok_and(|l| same_bits(&l, w)))
+    }
+
+    /// (v) in `mode`: the accepted verify, then the rejected one, against
+    /// the plain graph run of `toks` and the digests of its first three and
+    /// two steps.
+    fn verify_mode(
+        m: &mut Glm5nextModel,
+        mode: StepMode,
+        toks: &[u32],
+        graph: &Run,
+        (d3, d2): (&[StoreDigest], &[StoreDigest]),
+    ) -> Result<bool, GateError> {
+        let text = |r: &Result<u32, GpuError>| match r {
+            Ok(t) => format!("token {t}"),
+            Err(e) => format!("error \"{e}\""),
+        };
+        m.reset()?;
+        m.set_mode(mode);
+        m.step(&toks[..1])?;
+        let rows = m.step_rows::<2>([toks[1], toks[2]])?;
+        let logits = m.rows_logits::<2>()?;
+        let rows_ok = rows == [graph.tokens[1], graph.tokens[2]]
+            && same_bits(&logits[0], &graph.logits[1])
+            && same_bits(&logits[1], &graph.logits[2]);
+        let at = m.pos();
+        let waiting = m.step(&toks[3..4]);
+        let refused = matches!(&waiting, Err(e) if e.to_string().contains("waits for its commit"))
+            && m.pos() == at;
+        m.rollback(3)?;
+        m.keep_rows(2, PassKind::Pair)?;
+        let accept_stores = same_stores(&store_digests(m)?, d3);
+        let next = m.step(&toks[3..4]);
+        let accept_ok = matches!(next, Ok(t) if t == graph.tokens[3])
+            && logits_are(m, graph.logits.get(3))
+            && accept_stores.is_ok();
+        println!(
+            "verify ({mode:?}): rows 1, 2 {rows:?} (want {:?}), logits bit for bit: {rows_ok}; a \
+             step while it waits: {} (want refused by name, the model left at {at}): {refused}; \
+             both kept: stores {} (want three steps'), the step at 3 {} (want token {}, the plain \
+             logits) {}",
+            [graph.tokens[1], graph.tokens[2]],
+            text(&waiting),
+            accept_stores
+                .as_ref()
+                .map_or_else(|d| format!("differ at {d}"), |()| "equal".to_string()),
+            text(&next),
+            graph.tokens[3],
+            verdict(rows_ok && refused && accept_ok)
+        );
+        m.reset()?;
+        m.step(&toks[..1])?;
+        let wrong = (toks[2] + 1) % N_VOCAB as u32;
+        let rows = m.step_rows::<2>([toks[1], wrong])?;
+        let row0 = m.rows_logits::<2>()?;
+        let row0_ok = rows[0] == graph.tokens[1] && same_bits(&row0[0], &graph.logits[1]);
+        m.rollback(2)?;
+        m.keep_rows(1, PassKind::Pair)?;
+        let at2 = m.step(&toks[2..3]);
+        let at2_ok =
+            matches!(at2, Ok(t) if t == graph.tokens[2]) && logits_are(m, graph.logits.get(2));
+        let reject_stores = if at2.is_ok() {
+            same_stores(&store_digests(m)?, d2)
+        } else {
+            Err("the step at 2 failed".to_string())
+        };
+        let at3 = m.step(&toks[3..4]);
+        let at3_ok =
+            matches!(at3, Ok(t) if t == graph.tokens[3]) && logits_are(m, graph.logits.get(3));
+        let reject_ok = row0_ok && at2_ok && reject_stores.is_ok() && at3_ok;
+        println!(
+            "verify ({mode:?}): a wrong draft {wrong} rejected, row 0 kept: row 0 token {} (want \
+             {}), logits bit for bit {row0_ok}; the step at 2 {} (want token {}), stores {} (want \
+             two steps'); the step at 3 {} (want token {}) {}",
+            rows[0],
+            graph.tokens[1],
+            text(&at2),
+            graph.tokens[2],
+            reject_stores
+                .as_ref()
+                .map_or_else(|d| format!("differ at {d}"), |()| "equal".to_string()),
+            text(&at3),
+            graph.tokens[3],
+            verdict(reject_ok)
+        );
+        m.reset()?;
+        m.set_mode(StepMode::Graph);
+        Ok(rows_ok && refused && accept_ok && reject_ok)
+    }
+
+    /// (v): the captured verify holds the step's nodes twice (each row the
+    /// step's launches), then [`verify_mode`] in graph mode and in eager.
+    fn verify_rows(
+        m: &mut Glm5nextModel,
+        toks: &[u32],
+        graph: &Run,
+        step_nodes: usize,
+    ) -> Result<bool, GateError> {
+        if toks.len() < 4 || graph.tokens.len() < 4 {
+            return Err(format!(
+                "the verify clause reads 4 tokens, the set has {}",
+                toks.len()
+            )
+            .into());
+        }
+        m.reset()?;
+        m.set_mode(StepMode::Graph);
+        let pair_nodes = m.capture_rows::<2>()?;
+        let mut ok = pair_nodes == 2 * step_nodes;
+        println!(
+            "verify: the captured verify of 2 rows holds {pair_nodes} nodes (want twice the \
+             step's {step_nodes}) {}",
+            verdict(ok)
+        );
+        let d3 = digests_after(m, &toks[..3])?;
+        let d2 = digests_after(m, &toks[..2])?;
+        for mode in [StepMode::Graph, StepMode::Eager] {
+            ok &= verify_mode(m, mode, toks, graph, (&d3, &d2))?;
+        }
+        Ok(ok)
+    }
+
     // ------------------------------------------------ (k) checkpoints
 
     /// The first prompt's ids: past one inner mark (512) and short of the
@@ -1601,6 +1766,8 @@ mod gate {
         Pp,
         /// (pb-long) alone, on a load at [`CTX`].
         PpLong,
+        /// (s) and (v) alone, on a load at [`CTX`].
+        Verify,
     }
 
     /// Which of (t)'s step sets the load at [`CTX`] runs.
@@ -1659,7 +1826,8 @@ mod gate {
         Ok(sets)
     }
 
-    /// `--only main`, `--only pp`, `--only pplong`, or every clause.
+    /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, or every
+    /// clause.
     fn only() -> Result<Only, GateError> {
         let args: Vec<String> = std::env::args().collect();
         match args.iter().position(|a| a == "--only") {
@@ -1668,7 +1836,8 @@ mod gate {
                 Some("main") => Ok(Only::Main),
                 Some("pp") => Ok(Only::Pp),
                 Some("pplong") => Ok(Only::PpLong),
-                other => Err(format!("--only is main, pp or pplong, not {other:?}").into()),
+                Some("verify") => Ok(Only::Verify),
+                other => Err(format!("--only is main, pp, pplong or verify, not {other:?}").into()),
             },
         }
     }
@@ -1680,6 +1849,9 @@ mod gate {
         let mut ok = true;
         if matches!(only, Only::All | Only::Main) {
             ok &= main_clauses(&levers, sets)?;
+        }
+        if only == Only::Verify {
+            ok &= verify_only(&levers)?;
         }
         if only == Only::PpLong {
             let (mut s, _) = open(&levers, CTX, PrefillMode::Steps)?;
@@ -1737,7 +1909,35 @@ mod gate {
         );
         ok &= keep(&mut s)?;
         ok &= prompt_long(s.model_mut())?;
+        ok &= verify_clause(s.model_mut(), &toks, &graph, opened.nodes);
         Ok(ok)
+    }
+
+    /// (s) and (v) alone on the load at [`CTX`] (`--only verify`), against
+    /// the plain graph run of the batch set.
+    fn verify_only(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let (mut s, opened) = open(levers, CTX, PrefillMode::Steps)?;
+        let m = s.model_mut();
+        let mut ok = structure(m, &opened)?;
+        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
+        let (_, toks, _) = man.step()?;
+        let toks = toks.to_vec();
+        let graph = run_steps(m, &toks, StepMode::Graph)?;
+        ok &= verify_clause(m, &toks, &graph, opened.nodes);
+        Ok(ok)
+    }
+
+    /// [`verify_rows`], an error it ends in printed as the clause's FAIL
+    /// rather than ending the gate; the gate's last clause, so nothing runs
+    /// on the model it leaves.
+    fn verify_clause(m: &mut Glm5nextModel, toks: &[u32], graph: &Run, nodes: usize) -> bool {
+        match verify_rows(m, toks, graph, nodes) {
+            Ok(ok) => ok,
+            Err(e) => {
+                println!("verify: ended in error \"{e}\" {}", verdict(false));
+                false
+            }
+        }
     }
 
     // ------------------------------------------- (pb) (pr) (pf) prompt batch

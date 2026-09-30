@@ -1,7 +1,9 @@
 //! The KDA mixer of one layer at one token: `x` (the fold of the streams by
-//! the sub-layer's own mix) in, the update into `out`, the layer's state and
-//! conv ring read and written in place. One lane: the store keeps one state
-//! and no history of it, so a position is taken back only by a reset.
+//! the sub-layer's own mix) in, the update into `out`, the layer's conv ring
+//! written at the token's position and its state read from the committed
+//! lane: the step (row 0) writes it back in place, a verify's row 1 into the
+//! next lane ([`crate::body::LANES`]). The store keeps no history past its
+//! lanes: an earlier position comes back only through a checkpoint.
 //!
 //! The launches, in order (ik `src/llama-kda.cpp`):
 //! 1. `attn_norm` RMS;
@@ -12,7 +14,8 @@
 //! 4. the conv and prep with one decay per key channel
 //!    (`kda_conv_prep`: the conv over the ring by the token's position, SiLU,
 //!    the q and k L2 norms, σ(β), `exp(lb · σ(−ssm_a · (f + dt)))`);
-//! 5. the delta step (`kda_delta`) over the state's one lane;
+//! 5. the delta step (`kda_delta_lanes`) over the state's committed lane, its
+//!    stamp checked against the position;
 //! 6. the gated per-head RMS norm with the sigmoid gate;
 //! 7. the output projection.
 //!
@@ -22,12 +25,12 @@
 //! magnitude.
 
 use bloomery_gpu::linear::conv::KdaConvArgs;
-use bloomery_gpu::linear::delta::DeltaArgs;
+use bloomery_gpu::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
 use bloomery_gpu::linear::norm_gate::NormGateArgs;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 
-use crate::body::{Parts, Store, f32v, gemv};
+use crate::body::{LANES, Parts, Store, f32v, gemv};
 use crate::tensors::{MixerNames, other_kind};
 
 /// The launches [`kda`] makes.
@@ -42,7 +45,7 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
         return Err(other_kind("glm5next kda", l));
     };
     let s = &mut *p.s;
-    let Some(Store::Kda { state, ring }) = p.stores.get_mut(l) else {
+    let Some(Store::Kda { state, stamp, ring }) = p.stores.get_mut(l) else {
         return Err(GpuError::State {
             what: "glm5next kda",
             missing: "the layer's KDA store",
@@ -85,20 +88,28 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
             ring,
         },
     )?;
-    lin.delta.enqueue_kda_delta(
+    lin.delta.enqueue_kda_delta_lanes(
         stream,
-        DeltaArgs {
-            qkv: &s.conv,
-            beta: &s.beta,
-            decay: &s.decay,
-            lane: &s.lane,
-            lane_at: 0,
-            lanes: 1,
-            shape: d.kda,
-            m: 1,
-            fault,
-            o: &mut s.o,
-            state,
+        KdaLanesArgs {
+            lanes: DeltaLanesArgs {
+                delta: DeltaArgs {
+                    qkv: &s.conv,
+                    beta: &s.beta,
+                    decay: &s.decay,
+                    lane: p.lane,
+                    lane_at: 0,
+                    lanes: LANES,
+                    shape: d.kda,
+                    m: 1,
+                    fault,
+                    o: &mut s.o,
+                    state: state.whole_mut(),
+                },
+                each: p.row > 0,
+                pos: &s.pos,
+                stamp,
+            },
+            row: p.row,
         },
     )?;
     lin.norm_gate.enqueue_norm_gate_sigmoid(

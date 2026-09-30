@@ -33,9 +33,18 @@
 //!
 //! A cut behind the fed positions finds a KDA layer's state only in a
 //! checkpoint ([`bloomery_gpu::checkpoint`]): each prompt call ([`prompt`])
-//! copies every KDA layer's state and conv ring to the host at the marks of
-//! `runtime::seqstate`, and a cut to one of them copies it back at the next
-//! step; the latent rows are cut by position.
+//! copies every KDA layer's committed state and conv ring to the host at the
+//! marks of `runtime::seqstate`, and a cut to one of them copies it back at
+//! the next step; the latent rows are cut by position.
+//!
+//! Each KDA layer's state has [`LANES`] stamped lanes (`linear::delta`'s
+//! module doc), the committed one named by one lane word every KDA launch
+//! reads. The step and a prompt batch run in place on it. A verify of two
+//! rows ([`pair`]) runs the step's launches once a row, the rows one layer
+//! apart: row 0 in place, row 1 from the lane row 0 wrote into the other; its
+//! commit keeps row 0 (the word stays) or both (the word moves to row 1's
+//! lane) and copies nothing. The conv ring and the latent rows are indexed by
+//! position, so a row taken back is written again by the next step there.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -50,11 +59,11 @@ use bloomery_gpu::hybrid::{
 };
 use bloomery_gpu::kpool::{self, KpoolKernels};
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, LatentKernels, POOL, pools_for};
-use bloomery_gpu::linear::{HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
+use bloomery_gpu::linear::{self, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
 use bloomery_gpu::model::{ChainBody, HostServed, Rollback, StepKernels, StepMode};
 use bloomery_gpu::qsa::{QsaKernels, list_width};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, GpuModel};
+use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer};
 use bloomery_gpu_deepseek41::attn::{self, AttnKernels};
 use bloomery_gpu_deepseek41::chain::ffn::FfnKernels;
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
@@ -81,11 +90,19 @@ use crate::tensors::LayerNames;
 #[path = "prefill.rs"]
 pub mod prefill;
 
+#[path = "pair.rs"]
+mod pair;
+
+pub use pair::PAIR_ROWS;
+
 /// What the body's errors name.
 const WHAT: &str = "glm5next Body";
 
 // The plan sizes each KDA layer's conv ring by its own pass width.
 const _: () = assert!(place::PASS_ROWS == PASS_ROWS);
+
+// The plan counts each KDA layer's state by the lanes the store holds.
+const _: () = assert!(place::KDA_LANES == LANES);
 
 /// The GLM model: one card, the skeleton over this body.
 pub type Glm5nextModel = GpuModel<Body>;
@@ -93,6 +110,10 @@ pub type Glm5nextModel = GpuModel<Body>;
 /// The spacing of a prompt call's inner checkpoints; past the host budget's
 /// slots the oldest is evicted (`runtime::seqstate`).
 pub const CHECKPOINT_EVERY: u32 = 512;
+
+/// Lanes of a KDA layer's state: a verify of up to this many rows keeps the
+/// state after each row in a lane of its own.
+pub const LANES: usize = 2;
 
 /// The kernels the step launches, loaded once.
 pub(crate) struct Kernels {
@@ -186,7 +207,10 @@ pub(crate) struct LayerCfg {
 /// plane, one key a pool of [`POOL`] positions.
 pub(crate) enum Store {
     Kda {
-        state: DeviceBuffer<f32>,
+        /// [`LANES`] lanes of the recurrent state, each a part of its own.
+        state: PartedBuffer<f32, LANES>,
+        /// The position each lane's state stands at (`linear::delta`).
+        stamp: DeviceBuffer<u32>,
         ring: DeviceBuffer<f32>,
     },
     Latent {
@@ -199,7 +223,9 @@ pub(crate) enum Store {
 impl Store {
     fn bytes(&self) -> usize {
         match self {
-            Store::Kda { state, ring } => state.num_bytes() + ring.num_bytes(),
+            Store::Kda { state, stamp, ring } => {
+                state.whole().num_bytes() + stamp.num_bytes() + ring.num_bytes()
+            }
             Store::Latent {
                 latent,
                 index,
@@ -208,18 +234,30 @@ impl Store {
         }
     }
 
-    /// A KDA layer's state and conv ring, the stores a checkpoint copies.
-    fn copied(&mut self) -> Option<[&mut DeviceBuffer<f32>; 2]> {
+    /// A KDA layer's committed lane `lane` of its state and its conv ring,
+    /// the stores a checkpoint copies.
+    fn copied(&mut self, lane: u32) -> Option<[&mut DeviceBuffer<f32>; 2]> {
         match self {
-            Store::Kda { state, ring } => Some([state, ring]),
+            Store::Kda { state, ring, .. } => Some([state.part_mut(lane as usize), ring]),
             Store::Latent { .. } => None,
         }
     }
 
+    /// A KDA layer's stamps: lane `lane` at position `at`, every other lane
+    /// never written. Synchronizes; never inside a capture.
+    fn restamp(&mut self, stream: &CudaStream, lane: u32, at: u32) -> Result<(), GpuError> {
+        if let Store::Kda { stamp, .. } = self {
+            stamp.copy_from_host(stream, &stamps(lane, at))?;
+        }
+        Ok(())
+    }
+
+    /// Every lane zeroed, lane 0 stamped at position 0 (a fresh store).
     fn zero(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         match self {
-            Store::Kda { state, ring } => {
-                state.zero_async(stream)?;
+            Store::Kda { state, stamp, ring } => {
+                state.whole_mut().zero_async(stream)?;
+                stamp.copy_from_host(stream, &stamps(0, 0))?;
                 ring.zero_async(stream)?;
             }
             Store::Latent {
@@ -236,8 +274,48 @@ impl Store {
     }
 }
 
-/// Every buffer the step writes or reads besides the stores, one token's.
+/// A KDA layer's stamps with lane `lane` at position `at` and every other
+/// lane never written ([`linear::delta::NEVER`]).
+fn stamps(lane: u32, at: u32) -> [u32; LANES] {
+    let mut st = [linear::delta::NEVER; LANES];
+    st[lane as usize % LANES] = at;
+    st
+}
+
+/// The step's buffers for each row of a pass ([`PAIR_ROWS`]: the one-token
+/// step and a prompt batch use row 0's), the lane word every KDA launch
+/// reads, and the host's side of the lanes: the committed lane and the
+/// verify waiting for its commit ([`pair`]).
 pub(crate) struct Scratch {
+    pub rows: [RowScratch; PAIR_ROWS],
+    /// The committed lane of every KDA layer's state; one word, since every
+    /// layer commits the same rows.
+    pub lane: DeviceBuffer<u32>,
+    pub lanes: pair::Lanes,
+}
+
+impl Scratch {
+    /// Every row's buffers ([`RowScratch::new`]) and the lane word at lane
+    /// 0. Load-time only.
+    fn new(stream: &CudaStream, d: &Dims, ff: usize, ctx: usize) -> Result<Scratch, GpuError> {
+        Ok(Scratch {
+            rows: [
+                RowScratch::new(stream, d, ff, ctx)?,
+                RowScratch::new(stream, d, ff, ctx)?,
+            ],
+            lane: DeviceBuffer::zeroed(stream, 1)?,
+            lanes: pair::Lanes::default(),
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.rows.iter().map(RowScratch::bytes).sum::<usize>() + self.lane.num_bytes()
+    }
+}
+
+/// Every buffer one row of the step writes or reads besides the stores, one
+/// token's.
+pub(crate) struct RowScratch {
     /// The four streams, ping-ponged: a sub-layer reads one and writes the
     /// other. The embedding writes buffer 0 before the chain, and every
     /// chain starts there.
@@ -290,22 +368,21 @@ pub(crate) struct Scratch {
     pub sel: DeviceBuffer<u32>,
     /// A layer without a selection bias in the file selects with none.
     pub no_bias: DeviceBuffer<f32>,
-    // The step's words: its position; the attention's visible counts (no
-    // window row, then the selector's list length); the delta rule's lane, 0.
+    // The row's words: its position; the attention's visible counts (no
+    // window row, then the selector's list length).
     pub pos: DeviceBuffer<u32>,
     pub vis: DeviceBuffer<u32>,
-    pub lane: DeviceBuffer<u32>,
 }
 
-impl Scratch {
-    /// The step's buffers; the low-rank halves are `kda.head_dim` wide, as
+impl RowScratch {
+    /// One row's buffers; the low-rank halves are `kda.head_dim` wide, as
     /// the header reader holds every KDA tensor to ik's exact dims.
-    fn new(stream: &CudaStream, d: &Dims, ff: usize, ctx: usize) -> Result<Scratch, GpuError> {
+    fn new(stream: &CudaStream, d: &Dims, ff: usize, ctx: usize) -> Result<RowScratch, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let (n, c, v) = (d.embd, d.kda.channels(), d.kda.n_v * HEAD);
         let rows = d.heads;
         let segs = attn::segments(0, list_width(d.kept));
-        Ok(Scratch {
+        Ok(RowScratch {
             streams: [z(HC_STREAMS * n)?, z(HC_STREAMS * n)?],
             x: z(n)?,
             xn: z(n)?,
@@ -346,7 +423,6 @@ impl Scratch {
             no_bias: z(N_EXPERT)?,
             pos: DeviceBuffer::zeroed(stream, 1)?,
             vis: DeviceBuffer::zeroed(stream, 2)?,
-            lane: DeviceBuffer::zeroed(stream, 1)?,
         })
     }
 
@@ -398,7 +474,6 @@ impl Scratch {
             + self.vis.num_bytes()
             + self.cnt.num_bytes()
             + self.list.num_bytes()
-            + self.lane.num_bytes()
     }
 }
 
@@ -525,12 +600,12 @@ pub struct Body {
     residency: Residency,
 }
 
-/// Every KDA layer's state and conv ring, in layer order: the list the
-/// checkpoints copy.
-fn copied(stores: &mut [Store]) -> Vec<&mut DeviceBuffer<f32>> {
+/// Every KDA layer's committed lane `lane` of its state and its conv ring,
+/// in layer order: the list the checkpoints copy.
+fn copied(stores: &mut [Store], lane: u32) -> Vec<&mut DeviceBuffer<f32>> {
     stores
         .iter_mut()
-        .filter_map(Store::copied)
+        .filter_map(|s| s.copied(lane))
         .flatten()
         .collect()
 }
@@ -541,14 +616,66 @@ pub(crate) struct Parts<'s> {
     pub d: &'s Dims,
     pub cfg: &'s [LayerCfg],
     pub names: &'s [LayerNames],
-    pub s: &'s mut Scratch,
+    /// Row `row`'s buffers, which the launches write ([`Parts::at_row`]),
+    /// and the other row's.
+    pub s: &'s mut RowScratch,
+    pub idle: &'s mut RowScratch,
+    pub row: usize,
+    /// The committed lane word every KDA launch reads.
+    pub lane: &'s DeviceBuffer<u32>,
     pub stores: &'s mut [Store],
     pub slots: &'s DeviceTensor<u32>,
     pub card: &'s mut CardExperts,
     pub taps: Option<&'s mut [DeviceBuffer<f32>]>,
 }
 
-impl Parts<'_> {
+impl<'s> Parts<'s> {
+    /// The parts over `s`'s rows, at row 0.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the body's pieces a walk borrows apart, each named as the body names it (rust-quality R8)"
+    )]
+    pub(crate) fn of(
+        k: &'s Kernels,
+        d: &'s Dims,
+        cfg: &'s [LayerCfg],
+        names: &'s [LayerNames],
+        s: &'s mut Scratch,
+        stores: &'s mut [Store],
+        slots: &'s DeviceTensor<u32>,
+        card: &'s mut CardExperts,
+        taps: Option<&'s mut [DeviceBuffer<f32>]>,
+    ) -> Parts<'s> {
+        let [s0, s1] = &mut s.rows;
+        Parts {
+            k,
+            d,
+            cfg,
+            names,
+            s: s0,
+            idle: s1,
+            row: 0,
+            lane: &s.lane,
+            stores,
+            slots,
+            card,
+            taps,
+        }
+    }
+
+    /// The launches after this write row `row`'s buffers (`row <
+    /// PAIR_ROWS`).
+    pub(crate) fn at_row(&mut self, row: usize) -> Result<(), GpuError> {
+        if row >= PAIR_ROWS {
+            return Err(shape(format!("row {row} of a pass of {PAIR_ROWS}")));
+        }
+        if row != self.row {
+            std::mem::swap(&mut self.s, &mut self.idle);
+            self.row = row;
+        }
+        Ok(())
+    }
+
     /// Layer `l`'s streams, `cur`, copied into its tap when a gate armed
     /// them.
     pub(crate) fn tap(&mut self, gpu: &Gpu, l: usize, cur: usize) -> Result<(), GpuError> {
@@ -973,17 +1100,17 @@ impl Body {
     /// The walk's parts, lent apart from the host tier.
     pub(crate) fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<GlmHost>) {
         (
-            Parts {
-                k: &self.k,
-                d: &self.dims,
-                cfg: &self.cfg,
-                names: &self.names,
-                s: &mut self.s,
-                stores: &mut self.stores,
-                slots: &self.slots,
-                card: &mut self.card,
-                taps: self.taps.as_deref_mut(),
-            },
+            Parts::of(
+                &self.k,
+                &self.dims,
+                &self.cfg,
+                &self.names,
+                &mut self.s,
+                &mut self.stores,
+                &self.slots,
+                &mut self.card,
+                self.taps.as_deref_mut(),
+            ),
             &mut self.hybrid,
         )
     }
@@ -999,9 +1126,13 @@ impl Body {
     /// What a cut to at most `n` positions of a model standing at `pos`
     /// keeps, and why: never past `pos`, and after a step that failed past
     /// its launch not `pos` either, since the stores hold one more.
+    /// With a verify waiting for its commit, a cut into its rows keeps them
+    /// by the lanes' rule (`Rule`, [`pair`]).
     #[must_use]
     pub fn kept(&self, n: u32, pos: u32) -> Kept {
-        if self.held == pos {
+        if let Some(k) = self.s.lanes.kept(n, pos, self.held) {
+            k
+        } else if self.held == pos {
             self.ckpt.kept(n, pos)
         } else {
             self.ckpt.kept(n.min(pos), self.held)
@@ -1015,20 +1146,42 @@ impl Body {
     }
 
     /// A checkpoint at `pos`, the model's position, after any waiting cut:
-    /// the KDA layers' stores copied to a host slot, or nothing where one
-    /// stands. Refused by name when the stores hold other positions (a step
-    /// failed past its launch). Waits for the copies.
+    /// the KDA layers' committed stores copied to a host slot, or nothing
+    /// where one stands. Refused by name when the stores hold other
+    /// positions (a step failed past its launch, a verify waits for its
+    /// commit). Waits for the copies.
     pub fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
         self.stores_at(pos)?;
+        self.apply_cut(gpu.stream())?;
+        let lane = self.s.lanes.committed();
         self.ckpt
-            .take(gpu.stream(), pos, &mut copied(&mut self.stores))
+            .take(gpu.stream(), pos, &mut copied(&mut self.stores, lane))
     }
 
-    /// Refused by name unless the stores hold `pos` positions: a step at
-    /// `pos` that failed after its inputs were on the card has already run
-    /// the KDA layers' recurrence over it, and running it again would apply
-    /// the position twice.
+    /// The waiting cut carried out on the committed lane
+    /// ([`Checkpoints::apply`]) and every KDA layer's stamps set to the
+    /// position it leaves (`held`): the committed lane there, the
+    /// other never written. Nothing when no cut waits. Waits for the copies.
+    fn apply_cut(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if !self.ckpt.pending() {
+            return Ok(());
+        }
+        let lane = self.s.lanes.committed();
+        self.ckpt
+            .apply(stream, &mut copied(&mut self.stores, lane))?;
+        for st in &mut self.stores {
+            st.restamp(stream, lane, self.held)?;
+        }
+        Ok(())
+    }
+
+    /// Refused by name unless the stores hold `pos` positions and no verify
+    /// waits for its commit: a step at `pos` that failed after its inputs
+    /// were on the card has already run the KDA layers' recurrence over it,
+    /// and running it again would apply the position twice; a verify's rows
+    /// stand in lanes no launch reads until its commit names the one kept.
     fn stores_at(&self, pos: u32) -> Result<(), GpuError> {
+        self.s.lanes.refuse_if_waiting(pos)?;
         match self.held {
             h if h == pos => Ok(()),
             h if h == pos.wrapping_add(1) => Err(shape(format!(
@@ -1236,12 +1389,14 @@ fn layer_cfg(l: usize, s: &LayerSpec, map: &SlotMap) -> Result<LayerCfg, GpuErro
     })
 }
 
-/// Layer `kind`'s store at `ctx` positions: a KDA layer's one-lane state and
-/// its conv ring, a latent layer's latent and index rows and its pool plane.
+/// Layer `kind`'s store at `ctx` positions: a KDA layer's [`LANES`]-lane
+/// state, lane 0 stamped at position 0, and its conv ring, a latent layer's
+/// latent and index rows and its pool plane.
 fn store(stream: &CudaStream, kind: Layer, d: &Dims, ctx: usize) -> Result<Store, GpuError> {
     Ok(match kind.mixer {
         MixerKind::DeltaRule => Store::Kda {
-            state: DeviceBuffer::zeroed(stream, d.kda.state_len())?,
+            state: PartedBuffer::zeroed(stream, [d.kda.state_len(); LANES])?,
+            stamp: DeviceBuffer::from_host(stream, &stamps(0, 0))?,
             ring: DeviceBuffer::zeroed(stream, d.kda.ring_len())?,
         },
         MixerKind::Latent => Store::Latent {
@@ -1282,16 +1437,7 @@ impl ChainBody for Body {
     /// they are sent the stores count the position: what follows launches.
     fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
         self.planted(Plant::BeforeLaunch)?;
-        if self.ckpt.pending() {
-            self.ckpt.apply(stream, &mut copied(&mut self.stores))?;
-        }
-        let p = input.pos;
-        self.s.streams[0].copy_from_host(stream, &self.embd.streams)?;
-        self.s.pos.copy_from_host(stream, &[p])?;
-        self.s.vis.copy_from_host(stream, &[0, p + 1])?;
-        self.s.cnt.copy_from_host(stream, &[p + 1])?;
-        self.held = p + 1;
-        Ok(())
+        self.refresh_row(stream, input, 0)
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
@@ -1309,9 +1455,13 @@ impl ChainBody for Body {
         for s in &mut self.stores {
             s.zero(stream)?;
         }
-        for s in &mut self.s.streams {
-            s.zero_async(stream)?;
+        for row in &mut self.s.rows {
+            for s in &mut row.streams {
+                s.zero_async(stream)?;
+            }
         }
+        self.s.lane.copy_from_host(stream, &[0])?;
+        self.s.lanes = pair::Lanes::default();
         self.held = 0;
         self.plant = None;
         self.ckpt.clear();
@@ -1347,13 +1497,14 @@ impl ChainBody for Body {
 }
 
 impl Rollback for Body {
-    /// A cut to `pos`: nothing at the fed position; the empty model at 0;
-    /// else the checkpoint at `pos`, copied back at the next step. Any other
-    /// position is refused by name ([`Body::kept`] says what a cut keeps).
+    /// A cut to `pos` ([`Body::cut`]).
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
-        self.ckpt.cut(pos, self.held)?;
-        self.held = pos;
-        Ok(())
+        self.cut(pos)
+    }
+
+    /// A verify's commit, or else a cut ([`Body::commit`]).
+    fn rollback_on(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
+        self.commit(gpu, pos)
     }
 }
 

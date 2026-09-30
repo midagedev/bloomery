@@ -42,13 +42,13 @@ use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, Q8Act};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, FfnBatchKernels, Handoff, Places};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
-use cuda_core::DeviceBuffer;
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::arch::glm5next::names;
 use model::arch::glm5next::place::card_routed;
 use models::{Ffn, LayerSpec};
 
-use crate::body::{Parts, f32t, f32v, gemv, weight};
+use crate::body::{PAIR_ROWS, Parts, f32t, f32v, gemv, weight};
 use crate::host::GlmHost;
 use crate::tensors::{FfnNames, LayerNames, other_kind};
 
@@ -73,8 +73,9 @@ struct CardLayer {
 }
 
 /// The card's routed experts of the step: the family's kernels, each layer's
-/// count and limit from the slot map and the description, and the one-token
-/// buffers every card layer's shadow writes. Made at load, after the weights,
+/// count and limit from the slot map and the description, and each row's
+/// one-token buffers every card layer's shadow writes (a verify's row reads
+/// its own card sum in its back, after the other row's shadow). Made at load, after the weights,
 /// from the stacks they hold; a layer the map puts experts on holds its three
 /// stacks in a format [`card_routed`] names, at `n_card` experts each, and a
 /// layer it puts none on holds none — anything else is refused by name.
@@ -85,6 +86,12 @@ pub(crate) struct CardExperts {
     layers: Vec<Option<CardLayer>>,
     /// Routed expert width: a gate·up slot's rows.
     ff: usize,
+    /// Each row's buffers, row 0 the step's.
+    rows: [CardRow; PAIR_ROWS],
+}
+
+/// One row's buffers of the card experts' shadow.
+struct CardRow {
     /// The norm's q8_1 form, one column.
     act_x: Q8Act,
     /// The gate·up's output, a slot's `ff` rows each.
@@ -96,6 +103,28 @@ pub(crate) struct CardExperts {
     /// The card slots' weighted sum, and it plus the shared expert's output.
     acc: DeviceBuffer<f32>,
     pre: DeviceBuffer<f32>,
+}
+
+impl CardRow {
+    fn new(stream: &CudaStream, n_embd: usize, ff: usize) -> Result<CardRow, GpuError> {
+        Ok(CardRow {
+            act_x: Q8Act::with_k(stream, 1, n_embd)?,
+            h: DeviceBuffer::zeroed(stream, N_USED * ff)?,
+            act_h: Q8Act::with_slots(stream, N_USED, ff)?,
+            down: DeviceBuffer::zeroed(stream, N_USED * n_embd)?,
+            acc: DeviceBuffer::zeroed(stream, n_embd)?,
+            pre: DeviceBuffer::zeroed(stream, n_embd)?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.act_x.device_bytes()
+            + self.h.num_bytes()
+            + self.act_h.device_bytes()
+            + self.down.num_bytes()
+            + self.acc.num_bytes()
+            + self.pre.num_bytes()
+    }
 }
 
 impl CardExperts {
@@ -159,12 +188,10 @@ impl CardExperts {
             batch: FfnBatchKernels::load(gpu.context())?,
             layers: per,
             ff,
-            act_x: Q8Act::with_k(stream, 1, n_embd)?,
-            h: DeviceBuffer::zeroed(stream, N_USED * ff)?,
-            act_h: Q8Act::with_slots(stream, N_USED, ff)?,
-            down: DeviceBuffer::zeroed(stream, N_USED * n_embd)?,
-            acc: DeviceBuffer::zeroed(stream, n_embd)?,
-            pre: DeviceBuffer::zeroed(stream, n_embd)?,
+            rows: [
+                CardRow::new(stream, n_embd, ff)?,
+                CardRow::new(stream, n_embd, ff)?,
+            ],
         })
     }
 
@@ -177,9 +204,9 @@ impl CardExperts {
         self.layers.get(l).copied().flatten()
     }
 
-    /// The card slots' weighted sum of the last card layer enqueued.
+    /// Row 0's card slots' weighted sum of the last card layer enqueued.
     pub(crate) fn acc(&self) -> &DeviceBuffer<f32> {
-        &self.acc
+        &self.rows[0].acc
     }
 
     /// The routed experts' width: a gate·up slot's rows.
@@ -189,12 +216,7 @@ impl CardExperts {
 
     /// Device bytes of the buffers.
     pub(crate) fn bytes(&self) -> usize {
-        self.act_x.device_bytes()
-            + self.h.num_bytes()
-            + self.act_h.device_bytes()
-            + self.down.num_bytes()
-            + self.acc.num_bytes()
-            + self.pre.num_bytes()
+        self.rows.iter().map(CardRow::bytes).sum()
     }
 }
 
@@ -355,10 +377,10 @@ pub(crate) fn front(
         row_off: c.row_off,
         n_expert: N_EXPERT,
     };
-    let target = hybrid.boundary_mut().handoff_target_of(0)?;
+    let target = hybrid.boundary_mut().handoff_target_of(p.row)?;
     p.k.ffn
         .enqueue_handoff(stream, &h, target, fault, &mut s.sel)?;
-    hybrid.boundary().enqueue_go_of(stream, l, 0)
+    hybrid.boundary().enqueue_go_of(stream, l, p.row)
 }
 
 /// Enqueue layer `l`'s card experts, when it has any, and its shared expert
@@ -388,7 +410,7 @@ pub(crate) fn shadow(
     )?;
     gemv(gpu, w, sh.sh_down, &s.h, &mut s.sh_y)?;
     if card.is_some() {
-        let k = &mut *p.card;
+        let k = &mut p.card.rows[p.row];
         gpu.elem()
             .enqueue_add(gpu.stream(), &k.acc, &s.sh_y, n, &mut k.pre)?;
     }
@@ -409,7 +431,14 @@ fn card_slots(
     let n = p.d.embd;
     let fault = gpu.layer_sink(l)?;
     let s = &*p.s;
-    let k = &mut *p.card;
+    let CardExperts {
+        kq,
+        batch,
+        ff,
+        rows,
+        ..
+    } = &mut *p.card;
+    let k = &mut rows[p.row];
     let st = CardStacks::of(w, l)?;
     gpu.enqueue_quantize_q8_1_layer(boundary.normed(), &mut k.act_x, l)?;
     let a = GateUpAct {
@@ -418,13 +447,13 @@ fn card_slots(
         act: &k.act_x,
         sel: &s.sel,
         n_slots: N_USED,
-        rows_per_expert: k.ff,
+        rows_per_expert: *ff,
         slots_per_col: N_USED,
         rule: Act::SwigluClamp { limit: cl.limit },
     };
     match st.gate.ty {
-        GgmlType::Q4_K => k.kq.enqueue_gate_up_q4k(stream, &a, fault, &mut k.h)?,
-        GgmlType::Q5_K => k.kq.enqueue_gate_up_q5k(stream, &a, fault, &mut k.h)?,
+        GgmlType::Q4_K => kq.enqueue_gate_up_q4k(stream, &a, fault, &mut k.h)?,
+        GgmlType::Q5_K => kq.enqueue_gate_up_q5k(stream, &a, fault, &mut k.h)?,
         _ => return Err(unrun(&st.gate)),
     }
     let q = QuantSel {
@@ -444,7 +473,7 @@ fn card_slots(
                 n_slots: N_USED,
                 rows_per_expert: n,
             };
-            k.kq.enqueue_gemv_q5k_sel(stream, &a, fault, &mut k.down)?;
+            kq.enqueue_gemv_q5k_sel(stream, &a, fault, &mut k.down)?;
         }
         GgmlType::Q4_K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
             stream,
@@ -466,7 +495,7 @@ fn card_slots(
         n_card: cl.n_card,
         n_used: N_USED,
     };
-    k.batch.enqueue_card_acc(stream, &acc, &mut k.acc)
+    batch.enqueue_card_acc(stream, &acc, &mut k.acc)
 }
 
 /// A prompt batch's card slots ([`card_rows`]): the batch's `t` normed rows
@@ -622,8 +651,12 @@ pub(crate) fn back(
     let stream = gpu.stream();
     let n = p.d.embd;
     let s = &mut *p.s;
-    let shadowed = if p.card.has(l) { &p.card.pre } else { &s.sh_y };
-    boundary.enqueue_back_of(stream, 0)?;
+    let shadowed = if p.card.has(l) {
+        &p.card.rows[p.row].pre
+    } else {
+        &s.sh_y
+    };
+    boundary.enqueue_back_of(stream, p.row)?;
     gpu.elem()
-        .enqueue_add(stream, boundary.hsum_of(0)?, shadowed, n, &mut s.out)
+        .enqueue_add(stream, boundary.hsum_of(p.row)?, shadowed, n, &mut s.out)
 }

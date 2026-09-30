@@ -7,7 +7,7 @@
 //!
 //! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate]
 //! [--mode graph|eager] [--prefill batch|steps] [--time [--warm W]]
-//! [--logits] [--plan]`
+//! [--pair] [--logits] [--plan]`
 //!
 //! - `--tokens`: the prompt's ids (the file's own vocabulary, no BOS added).
 //! - `--ctx`: the positions the caches hold; the plan refuses more than the
@@ -34,6 +34,21 @@
 //!   machine-wide lease (`tools/ref/depth-glm5next.sh`). The `step` and `time
 //!   step` records print after the last step, so no write sits between two
 //!   timed steps.
+//! - `--pair` then runs the same tokens again as verifies of two rows
+//!   (`runtime::Verify` on the session, `bloomery_gpu_glm5next`'s verify):
+//!   the model cut back to the prompt's end (its checkpoint), in graph mode
+//!   the verify captured first (`capture` with `pair_graph_nodes`), then
+//!   pass `k` feeds the plain run's fed tokens `2k` and `2k + 1` at their
+//!   positions and keeps both rows — the draft is the target's own greedy
+//!   token, so every row is accepted — for `(N − 1) / 2` passes. Each pass's
+//!   two tokens must be the plain run's next two, else the run ends in a
+//!   named error: the verify is not two steps. With `--time` each pass
+//!   prints `time pass` (`kind=pair`, `positions=2`), its wall from the
+//!   verify's plan through its commit, both rows' readbacks included; `--warm
+//!   W` marks the passes over the first W steps' positions. The pass wall
+//!   over the step's (`smoke`'s `p50_ms`) is the verify's cost `V2/S1`, both
+//!   from one process on one load. Refused beside the route trace (the trace
+//!   records one-row steps) and with `-n` under 3 (no pass).
 //!
 //! The `load` line's `top_k` is the file's indexer top-k: a position whose
 //! whole pools hold at most `top_k` positions attends every position; past
@@ -69,7 +84,7 @@ mod cli {
     use std::time::Instant;
 
     use app::arch::glm5next::GlmCfg;
-    use app::{Loaded, OpenArgs, OpenLog, SessionError};
+    use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::record::{self, Record};
@@ -80,7 +95,7 @@ mod cli {
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use runtime::layer::hosted;
-    use runtime::{Target, Want};
+    use runtime::{Target, Verify, Want};
 
     const ACTS_ON: &[&str] = &[
         CARD_BUDGET,
@@ -216,6 +231,13 @@ mod cli {
             )
             .into());
         }
+        let pair = has("--pair");
+        if pair && n_gen < 3 {
+            return Err(
+                "--pair needs -n 3 or more: a verify runs two of the fed tokens and checks the next"
+                    .into(),
+            );
+        }
         let ctx: usize = flag("--ctx")?.map_or(Ok(2048), |s| s.parse())?;
         let (place, machine): (&'static str, fn(usize) -> Machine) =
             match flag("--place")?.as_deref() {
@@ -265,6 +287,13 @@ mod cli {
             ids.len() + n_gen.saturating_sub(1),
             timed,
         )?;
+        if trace.is_some() && pair {
+            return Err(
+                "BLOOMERY_ROUTE_TRACE records one-row steps: --pair's verifies are not; run the \
+                 trace without --pair"
+                    .into(),
+            );
+        }
         let cfg = GlmCfg {
             place: PlanLevers::from_levers(&levers)?,
             host: levers.host(),
@@ -330,6 +359,7 @@ mod cli {
             .u("fed", ids.len())
             .f("feed_s", feed.as_secs_f64())
             .print();
+        let fed_end = s.pos();
         let mut tokens = vec![next];
         // (i, pos, token, ms): printed after the last step.
         let mut rows: Vec<(usize, u32, u32, f64)> = Vec::with_capacity(n_gen);
@@ -340,6 +370,11 @@ mod cli {
             rows.push((i, pos, next, t.elapsed().as_secs_f64() * 1e3));
             tokens.push(next);
         }
+        let passes_ms = if pair {
+            Some(pairs(&mut s, mode, fed_end, &tokens)?)
+        } else {
+            None
+        };
         if timed {
             let ms = feed.as_secs_f64() * 1e3;
             Record::new(&record::TIME_PROMPT)
@@ -361,6 +396,18 @@ mod cli {
                     .u("i", i)
                     .flag("warm", i <= warm)
                     .f("ms", ms)
+                    .print();
+            }
+        }
+        if let (true, Some(ms)) = (timed, &passes_ms) {
+            for (k, &ms) in ms.iter().enumerate() {
+                let i = k + 1;
+                Record::new(&record::TIME_PASS)
+                    .u("i", i)
+                    .flag("warm", 2 * i - 1 <= warm)
+                    .f("ms", ms)
+                    .u("positions", 2)
+                    .w("kind", "pair")
                     .print();
             }
         }
@@ -417,6 +464,48 @@ mod cli {
             );
         }
         Ok(())
+    }
+
+    /// `--pair`: the model cut back to `from`, the prompt's end, in graph
+    /// mode the verify captured, then `(tokens.len() − 1) / 2` verifies of
+    /// the plain run's fed tokens `tokens[2k]`, `tokens[2k + 1]`, each
+    /// committing both rows and each giving the plain run's next two tokens
+    /// or ending the run in a named error. Returns each pass's wall in ms,
+    /// from its plan through its commit.
+    fn pairs(
+        s: &mut Session<Body>,
+        mode: StepMode,
+        from: u32,
+        tokens: &[u32],
+    ) -> Result<Vec<f64>, GateError> {
+        s.cut(from)?;
+        if mode == StepMode::Graph {
+            let m = s.model_mut();
+            m.capture_rows::<2>()?;
+            Record::new(&record::CAPTURE_PAIR)
+                .u("pair_graph_nodes", m.rows_graph_nodes::<2>()?.len())
+                .print();
+        }
+        let n = (tokens.len() - 1) / 2;
+        let mut out = Vec::with_capacity(n);
+        for k in 0..n {
+            let pos = s.pos();
+            let fed = [tokens[2 * k], tokens[2 * k + 1]];
+            let t = Instant::now();
+            let got = s.verify(fed)?;
+            s.commit(2)?;
+            out.push(t.elapsed().as_secs_f64() * 1e3);
+            let want = [tokens[2 * k + 1], tokens[2 * k + 2]];
+            if got != want {
+                return Err(format!(
+                    "pass {} at position {pos}: the verify of {fed:?} gave {got:?} where the steps \
+                     gave {want:?}: the verify is not two steps",
+                    k + 1
+                )
+                .into());
+            }
+        }
+        Ok(out)
     }
 
     /// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made

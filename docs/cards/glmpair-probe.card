@@ -1,0 +1,37 @@
+# Round glmpair's one box term: the wall of GLM-5.3-Flash's two-row verify over one step on the same
+# load, V2/S1, which decides whether the native MTP draft (k = 1, NextN layer 45) can win. One process
+# gives both: generate_glm5next --time --pair times the plain greedy steps (`time step`, `smoke`),
+# cuts back to the prompt's end, then runs the same tokens as verifies of two rows that keep both rows
+# (`time pass kind=pair`), each checked against the plain run's tokens.
+# Derivation [derived] (A6000, plan (a), prose ids): S1 = C1 + F + h = 47.7 ms (our plain 20.95 tok/s);
+# C1 13.5-18.5 ms of card front, F 2.5-3.5 ms of host fixed cost, so h 25.7-31.7 ms of host expert
+# bytes; the shadow Cx 3.8-5.5 ms sits under the host leg. The verify runs each row's layer one layer
+# apart: per MoE layer the host serves 2 legs (1.35-1.66 ms) while the card runs 2 fronts and shadows
+# (0.8-1.1 ms), so the wall is the host's, V2 = (1 + rho) h + 2F + edge: rho 0.85-1.0 is the second
+# row's expert bytes that miss what the first row read (0.854 is the all-host k=2 union share; every
+# row reads its own experts, the union is only what the cache keeps), edge 1.5 ms (the dense lead and
+# the first front before the host starts, the last back and the heads after it). V2 = 54.1-71.9 ms:
+# V2/S1 = 1.13-1.51, center 1.32. MTP breaks even at 1.70 (alpha1 0.753); beating llama.cpp #27754's MTP
+# arm (23.29 tok/s) needs <= 1.53.
+kind: baseline
+question: what does the two-row verify cost over one plain step on the same load: does the host serve
+  one row's layer under the card's other row, as the walk's order allows?
+term: V2/S1 @ n=97, depth 512, A6000: the p50 of `time pass kind=pair` over the p50 of `time step`
+  (smoke p50_ms), both from one generate_glm5next --time --pair process, plan (a), prose ids
+unit: ratio
+predict: 1.13..1.51
+condition: one lease, one process, 96 plain steps then 48 verifies of two rows at the same positions
+  (the pair cut back to the prompt's end, its capture before the first pass); every pass's two tokens
+  equal the plain run's (else the process ends in a named error, no row); no row carries [cpu-busy] or
+  [other-busy]; the full output to a file first. Command (needs the runner's BLOOMERY_GEN_PAIR=1,
+  which appends --pair to the ours arm, and generate_glm5next's records CAPTURE_PAIR and TIME_PASS):
+  BLOOMERY_DECODE_N=97 BLOOMERY_AB_ROUNDS=1 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmpair-probe.card
+  BLOOMERY_DECODE_N=97 BLOOMERY_GEN_PAIR=1' just depth-gpu-glm5next 512 > <log> 2>&1
+reason: the one term of the MTP plan the derivation cannot close (glmmtp design); why now: the verify
+  exists, and the glmmtpload and glmmtp rounds are sized by it
+decide-in: open glmmtpload then glmmtp as planned; write V2/S1 into the MTP speed ratio (1 + alpha) /
+  (V2/S1 + D/S1) with the measured value
+decide-below: the host reuses more of row 0's experts than rho 0.85 says (cache reuse): re-derive rho
+  from the pass's host leg and raise the MTP prediction before glmmtp; still open glmmtpload
+decide-above: the two rows are not overlapping as the walk orders them: take one nsys of the verify
+  (the host legs and the card's fronts per layer) before any MTP round, and hold glmmtp

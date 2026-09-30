@@ -38,7 +38,7 @@
 //!    names that layer and the kernel's site, the values the planted input
 //!    reaches are not finite, every other value is the clean launch's bit
 //!    for bit, and the word is clean before and after.
-//! 8. `shape`: the seven entries compile with no local depot.
+//! 8. `shape`: the eight entries compile with no local depot.
 //! 9. `kda` (Kimi Delta Attention at GLM-5.3-Flash's shape: 64 query/key and
 //!    64 value heads, ε 1e-5, bound −5): `kda_conv_prep` at 512 and 1 tokens
 //!    over a random ring against its host rule; its `y`, β and ring against
@@ -65,6 +65,18 @@
 //!     position raising `delta_stamp` with every value the clean launch's
 //!     (judged as clause 7); and the launcher's refusal of row mode over more
 //!     tokens than lanes.
+//! 13. `kda lanes` (`kda_delta_lanes` at GLM-5.3-Flash's KDA shape over a
+//!     state of [`KDA_LANES`] random lanes, the lane word on lane 1): row 0
+//!     in place over 512 and 1 tokens equal to the one-lane rule on lane 1 —
+//!     `o`, lane 1 after it, the other lane untouched, lane 1's stamp moved to
+//!     the position after the call and the other kept; a verify of one token
+//!     a row, row 0 in place then row 1 at row base 1, each its own launch on
+//!     what the one before left, equal to two one-token calls chained — each
+//!     row's `o`, row 0's state in lane 1 and row 1's in lane 0, stamps the
+//!     positions after them; row 1 launched on a lane 1 stamped one past its
+//!     position raising `delta_stamp` with every value the clean launch's
+//!     (judged as clause 7); and the launcher's refusals of a row base at the
+//!     lanes, a later row in place and row mode past the lanes.
 //!
 //! One case runs only when named, `--case kda_ik`, and alone: per KDA layer of
 //! the `ref_glm5next` set, the KDA conv and prep on ik's own inputs against
@@ -91,7 +103,7 @@ mod gate {
         ConvArgs, ConvOut, KdaConvArgs, conv_prep_host, kda_conv_prep_host,
     };
     use bloomery_gpu::linear::delta::{
-        DeltaArgs, DeltaLanesArgs, DeltaOut, delta_host, kda_delta_host,
+        DeltaArgs, DeltaLanesArgs, DeltaOut, KdaLanesArgs, delta_host, kda_delta_host,
     };
     use bloomery_gpu::linear::norm_gate::{NormGateArgs, norm_gate_host};
     use bloomery_gpu::linear::{
@@ -295,6 +307,10 @@ mod gate {
     /// Lanes of the lane clauses' states: any count past one, four here.
     const ROW_LANES: usize = 4;
 
+    /// Lanes of the KDA lane clause's state: GLM-5.3-Flash's, a verify of
+    /// two rows.
+    const KDA_LANES: usize = 2;
+
     /// A lanes launch's word and mode: the lane word, the call's first
     /// position, row mode.
     #[derive(Clone, Copy)]
@@ -465,6 +481,60 @@ mod gate {
             ))
         }
 
+        /// One `kda_delta_lanes` launch of `m` tokens at the KDA shape on a
+        /// [`KDA_LANES`]-lane state holding `state` with `stamp`, from verify
+        /// row `row`; `o`, the state and the stamps after it.
+        fn kda_lanes(
+            &self,
+            fault: FaultSink,
+            st: &Step,
+            (state, stamp): (&[f32], &[u32]),
+            (call, row): (LaneCall, usize),
+            m: usize,
+        ) -> Result<(DeltaOut, Vec<u32>), GateError> {
+            let s = self.stream();
+            let qkv = DeviceBuffer::from_host(s, &st.qkv)?;
+            let beta = DeviceBuffer::from_host(s, &st.beta)?;
+            let decay = DeviceBuffer::from_host(s, &st.decay)?;
+            let lw = DeviceBuffer::from_host(s, &[0xdead_beef, call.lane])?;
+            let pd = DeviceBuffer::from_host(s, &[call.p0])?;
+            let mut o = DeviceBuffer::from_host(s, &vec![0.0f32; m * KDA_SHAPE.n_v * HEAD])?;
+            let mut sd = DeviceBuffer::from_host(s, state)?;
+            let mut sp = DeviceBuffer::from_host(s, stamp)?;
+            self.k.delta.enqueue_kda_delta_lanes(
+                s,
+                KdaLanesArgs {
+                    lanes: DeltaLanesArgs {
+                        delta: DeltaArgs {
+                            qkv: &qkv,
+                            beta: &beta,
+                            decay: &decay,
+                            lane: &lw,
+                            lane_at: 1,
+                            lanes: KDA_LANES,
+                            shape: KDA_SHAPE,
+                            m,
+                            fault,
+                            o: &mut o,
+                            state: &mut sd,
+                        },
+                        each: call.each,
+                        pos: &pd,
+                        stamp: &mut sp,
+                    },
+                    row,
+                },
+            )?;
+            s.synchronize()?;
+            Ok((
+                DeltaOut {
+                    o: o.to_host_vec(s)?,
+                    state: sd.to_host_vec(s)?,
+                },
+                sp.to_host_vec(s)?,
+            ))
+        }
+
         fn norm(
             &self,
             fault: FaultSink,
@@ -576,6 +646,7 @@ mod gate {
             "kda_delta",
             "gdn_norm_gate_sigmoid",
             "gdn_delta_lanes",
+            "kda_delta_lanes",
         ])?);
         for pass in kda_clauses(&cx)? {
             tally(pass);
@@ -587,6 +658,9 @@ mod gate {
             tally(pass);
         }
         for pass in lanes_clauses(&cx)? {
+            tally(pass);
+        }
+        for pass in kda_lanes_clauses(&cx)? {
             tally(pass);
         }
         let pass = failed == 0;
@@ -2120,6 +2194,121 @@ mod gate {
             verdict(named)
         );
         out.push(named);
+        Ok(out)
+    }
+
+    /// Clause 13: `kda_delta_lanes` against the one-lane rule, a verify of
+    /// one token a row against two one-token calls chained.
+    fn kda_lanes_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
+        let unl = cx.gpu.unlabelled_sink();
+        let len = KDA_SHAPE.state_len();
+        let st = kda_host_step(PROMPT, 0x6b6c_616e);
+        let lanes = Lcg(0x6b6c_6e73).fill(KDA_LANES * len, -0.1, 0.1);
+        let (c, p0) = (1usize, 40u32);
+        let stamps = [7, p0];
+        let lane_of = |v: &[f32], i: usize| v[i * len..(i + 1) * len].to_vec();
+        let mut out = Vec::new();
+        let at_c = LaneCall {
+            lane: c as u32,
+            p0,
+            each: false,
+        };
+
+        for m in [PROMPT, 1] {
+            let t = st.slice(0, m);
+            let (d, sp) = cx.kda_lanes(unl, &t, (&lanes, &stamps), (at_c, 0), m)?;
+            let h = kda_delta_ref(&t, &lane_of(&lanes, c), m);
+            let lane_c = lane_of(&d.state, c);
+            let other = bits_equal(&lane_of(&d.state, 1 - c), &lane_of(&lanes, 1 - c));
+            let mut want = stamps;
+            want[c] = p0 + m as u32;
+            let pass =
+                bits_equal(&d.o, &h.o) && bits_equal(&lane_c, &h.state) && other && sp == want;
+            println!(
+                "kda lanes row 0 in place m={m} on lane {c} of {KDA_LANES}: o {} lane {c} {} the \
+                 other lane untouched {other}, stamps {sp:?} (want {want:?}) {}",
+                cmp(&d.o, &h.o),
+                cmp(&lane_c, &h.state),
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+
+        // A verify of one token a row: row 0 in place, then row 1 at row
+        // base 1 on what row 0 left, against two one-token calls chained.
+        let (t0, t1) = (st.slice(0, 1), st.slice(1, 1));
+        let (d0, sp0) = cx.kda_lanes(unl, &t0, (&lanes, &stamps), (at_c, 0), 1)?;
+        let row1 = LaneCall {
+            lane: c as u32,
+            p0: p0 + 1,
+            each: true,
+        };
+        let (d1, sp1) = cx.kda_lanes(unl, &t1, (&d0.state, &sp0), (row1, 1), 1)?;
+        let h0 = kda_delta_ref(&t0, &lane_of(&lanes, c), 1);
+        let h1 = kda_delta_ref(&t1, &h0.state, 1);
+        let (w0, w1) = (c, (c + 1) % KDA_LANES);
+        let rows = bits_equal(&d0.o, &h0.o)
+            && bits_equal(&d1.o, &h1.o)
+            && bits_equal(&lane_of(&d1.state, w0), &h0.state)
+            && bits_equal(&lane_of(&d1.state, w1), &h1.state);
+        let mut want = [0u32; KDA_LANES];
+        want[w0] = p0 + 1;
+        want[w1] = p0 + 2;
+        let pass = rows && sp1 == want;
+        println!(
+            "kda lanes verify of 2 rows from lane {c}: row 0 in place, row 1 at base 1: o and row \
+             j's state in lane (c + j) mod {KDA_LANES} vs two one-token calls chained {rows}; \
+             stamps {sp1:?} (want {want:?}) {}",
+            verdict(pass)
+        );
+        out.push(pass);
+
+        // Row 1 on a lane 1 stamped one past its position: the word names
+        // the layer and `delta_stamp`; every value is the clean launch's.
+        let layer = 33usize;
+        let (clean, _) = cx.kda_lanes(unl, &t1, (&d0.state, &sp0), (row1, 1), 1)?;
+        let sink = cx.gpu.layer_sink(layer)?;
+        let before = cx.gpu.fault()?;
+        let mut stale = sp0.clone();
+        stale[c] = p0 + 2;
+        let (bad, _) = cx.kda_lanes(sink, &t1, (&d0.state, &stale), (row1, 1), 1)?;
+        let word = cx.gpu.take_fault()?;
+        let _ = cx.kda_lanes(sink, &t1, (&d0.state, &sp0), (row1, 1), 1)?;
+        let after = cx.gpu.fault()?;
+        out.push(
+            Planted {
+                what: "kda lanes stamp of lane 1 one past row 1's position",
+                want: Fault::at(u32::try_from(layer)?, FaultSite::DeltaStamp),
+                before,
+                word,
+                after,
+                hit: vec![vec![], vec![]],
+                clean: vec![clean.o, clean.state],
+                bad: vec![bad.o, bad.state],
+            }
+            .judge(),
+        );
+
+        // The launcher's refusals, each by name before any launch.
+        for (call, row, m, says) in [
+            (row1, KDA_LANES, 1, "over 2 lanes"),
+            (at_c, 1, 1, "only row 0"),
+            (row1, 1, 2, "rows 1..3"),
+        ] {
+            let t = st.slice(0, m);
+            let got = cx.kda_lanes(unl, &t, (&lanes, &stamps), (call, row), m);
+            let named = matches!(&got, Err(e) if e.to_string().contains(says));
+            println!(
+                "kda lanes launcher refuses row {row} m={m} (row mode {}): \"{}\" {}",
+                call.each,
+                match &got {
+                    Ok(_) => "launched".to_owned(),
+                    Err(e) => e.to_string(),
+                },
+                verdict(named)
+            );
+            out.push(named);
+        }
         Ok(out)
     }
 
