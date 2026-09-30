@@ -127,10 +127,10 @@ hit 23.1 → 39.5 % and +3…+15 % at the timed prompt, the steady state at +28�
 nothing inside 95 steps [derived]. The one open term is τ, a flip's staging cost on the step, 0.13–0.60 ms
 (`docs/cards/glmres-ab.card`).
 
-- **The GLM A/B cannot run yet (S–M, `tools/` — lead after the freeze)**: `tools/ref/depth-glm5next.sh` has no
-  `<D>@NAME=VALUE` lever arm (depth-qwen3moe.sh's grammar), and its line ~770 keeps only
-  `plan|load|capture|fed|step 0|time prompt` lines, so the `residency` and `stat` records the card's condition and
-  its τ read-out need are dropped. Port depth-qwen3moe.sh's residency sum and host-slots columns.
+- **The GLM runner keeps no host-slots column (S, `tools/`)**: `glmarms` (T2) gives `tools/ref/depth-glm5next.sh` the
+  `<D>@NAME=VALUE` lever arm and the residency sums, but not the `stat` records, so the card's τ read-out needs the
+  timed prompt's host slots from a route trace of ids 50000..50511 + 96 through the replay, or a `stat` column
+  ported from depth-qwen3moe.sh (`q38stats`).
 - **GLM default P = 0 (XS, after the A/B)**: steady state +7.7 hit points over P 33, ≈ −2.7 ms a step; the churn pool
   grows 20.2 → 39.7 GB of host RAM. `residency host`'s headroom_after checks it.
 - **Prompt-call pick for GLM (M, the biggest lever)**: V4.1's callstream pick at floor 32 (22 experts a layer, 334 MB
