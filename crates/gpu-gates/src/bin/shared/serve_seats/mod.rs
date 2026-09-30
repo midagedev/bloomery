@@ -1,0 +1,21 @@
+//! One server binary's seats: each module is one model the server serves —
+//! the flags it takes, the records it prints, its cache and slot rules —
+//! behind [`bloomery_gpu_gates::bind::Seat`], with a `run(&args)` a binary
+//! calls once. The per-model binaries (`bloomery-serve-ds41`,
+//! `bloomery-serve-qwen38`) include their one seat directly; the one-binary
+//! server (`bloomery-serve --model ds41|qwen38|glm`) includes this registry
+//! and is one call into the seat the model names.
+//!
+//! A seat's module is its contract's owner: read it for the flags, the
+//! records, the keep rule and the prompt cache. [`glm`] is the GLM-5.3-Flash
+//! seat, opened as `generate_glm5next` opens the model.
+
+#[cfg(feature = "deepseek41")]
+pub mod ds41;
+#[cfg(feature = "glm5next")]
+pub mod glm;
+// The qwen38 seat runs no V4.1 code, but the server surface it sits on —
+// `bind` and the `serve` and `sampler` crates — is scoped to `deepseek41`,
+// as its per-model binary's doc says.
+#[cfg(feature = "deepseek41")]
+pub mod qwen38;
