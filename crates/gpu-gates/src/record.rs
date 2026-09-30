@@ -1295,11 +1295,12 @@ pub static STAT_SUMMARY: Kind = Kind {
     ],
 };
 
-/// One generated step's host-tier counters on a body with no engram rows.
+/// One generated step's host-tier counters on a body with a host tier and
+/// no engram rows.
 pub static STAT_STEP_HOST: Kind = Kind {
     name: "stat_step_host",
     head: "stat step",
-    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults and free device bytes (generate_qwen3moe's qwen4exp body).",
+    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults and free device bytes (a body with a host tier and no engram rows: generate_qwen3moe, generate_glm5next). `gap_min_us`, `gap_p50_us` and `gap_max_us` are the step's go waits, one per service; a step no service ran in prints zeros.",
     parts: &[
         lit(" "),
         pos("i", U64, ""),
@@ -1315,14 +1316,17 @@ pub static STAT_STEP_HOST: Kind = Kind {
         key("majflt", U64, ""),
         key("minflt", U64, ""),
         key("vram_free", U64, "B"),
+        key("gap_min_us", F64(1), "us"),
+        key("gap_p50_us", F64(1), "us"),
+        key("gap_max_us", F64(1), "us"),
     ],
 };
 
-/// The steps' summary on a body with no engram rows.
+/// The steps' summary on a body with a host tier and no engram rows.
 pub static STAT_SUMMARY_HOST: Kind = Kind {
     name: "stat_summary_host",
     head: "stat summary",
-    doc: "BLOOMERY_STEP_STATS: the kept steps' host-tier, fault and device-memory statistics (generate_qwen3moe's qwen4exp body).",
+    doc: "BLOOMERY_STEP_STATS: the kept steps' host-tier, fault and device-memory statistics (a body with a host tier and no engram rows: generate_qwen3moe, generate_glm5next).",
     parts: &[
         key("steps", U64, ""),
         key("leg_us_mean", F64(1), "us"),
@@ -1751,7 +1755,9 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
 
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
+    &RESIDENCY_LEVER,
     &PLAN,
+    &RESIDENCY_HOST,
     &LOAD_GENERATOR,
     &LOAD_PHASES,
     &HOST_POPULATE,
@@ -1769,6 +1775,8 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &LOGITS,
     &MTP_SUMMARY,
     &SMOKE,
+    &STAT_STEP_HOST,
+    &STAT_SUMMARY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
