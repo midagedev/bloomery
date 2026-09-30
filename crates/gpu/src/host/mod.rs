@@ -819,6 +819,40 @@ impl<H: HostExperts> HostTier<H> {
         m.call_pick(stream, &mut self.slots, layer, counts, cap)
     }
 
+    /// [`HostTier::call_pick`] at `key`'s layer from the routed ids of
+    /// `key`'s download ([`HostTier::routed_ids`], which waits for its
+    /// copies), counted into `counts` — one count per expert of the slot
+    /// map, the caller's buffer, reused. Refused by name before the pick: a
+    /// routed id past the map's experts, and every refusal of the two it
+    /// calls.
+    pub fn call_pick_routed(
+        &mut self,
+        stream: &CudaStream,
+        key: BatchKey,
+        counts: &mut Vec<u32>,
+        cap: usize,
+    ) -> Result<swap::CallPick, GpuError> {
+        let n_expert = self.slots.n_expert();
+        counts.clear();
+        counts.resize(n_expert, 0);
+        for &id in self.routed_ids(key)? {
+            let c = usize::try_from(id)
+                .ok()
+                .and_then(|i| counts.get_mut(i))
+                .ok_or_else(|| {
+                    GpuError::shape(
+                        "HostTier::call_pick_routed",
+                        format!(
+                            "layer {}: a routed id {id} of {n_expert} experts",
+                            key.layer
+                        ),
+                    )
+                })?;
+            *c += 1;
+        }
+        self.call_pick(stream, key.layer, counts, cap)
+    }
+
     /// The open call's floor from its next pick on
     /// ([`swap::SwapMachine::set_call_floor`]). Refused by name without a
     /// machine.

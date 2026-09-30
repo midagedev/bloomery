@@ -431,7 +431,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::A,
         kind: Kind::OnOff,
         default: Unset::Means(
-            "on under a residency (`BLOOMERY_RESIDENCY` not `off`), off without one",
+            "V4.1: on under a residency (`BLOOMERY_RESIDENCY` not `off`), off without one; \
+             Qwen3.8: on under `--place a` with a residency, off everywhere else",
         ),
         doc: "V4.1 prompt calls under adaptive residency (`BLOOMERY_RESIDENCY=mid-…`): `on` \
               streams each group's hottest host experts into the residency's churn pool at \
@@ -442,7 +443,16 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               prompt call bit for bit the decode steps' state, the same-binary arm. Unset follows \
               the residency: on under one, off without one. `on` is refused by name at the load \
               beside `BLOOMERY_RESIDENCY=off`. Every pick prints `call \
-              stream`, every call `call stream end`.",
+              stream`, every call `call stream end`. Qwen3.8 (`generate_qwen3moe`) runs the \
+              same call mode in its ubatch walk: `on` moves each card layer's pool toward the \
+              ubatch's hottest host experts before the layer's card route (a count of at least \
+              the walk's `STREAM_FLOOR`), the union and the route under the moved map, and the \
+              call's picks stay for the decode; a pass-fed prompt, and one of fewer ids than the \
+              floor, opens no call (its rows give an expert fewer counts than the floor, so \
+              its pick could admit nothing). \
+              Unset there is on under `--place a` with a residency, off everywhere else; \
+              `off` is the same-binary arm; `on` is refused by name beside \
+              `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

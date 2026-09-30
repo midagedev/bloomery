@@ -101,6 +101,14 @@
 //! beside `BLOOMERY_ROUTE_TRACE`, when the plan's host headroom cannot take
 //! its churn pool, and by the body at a step-fed prompt.
 //!
+//! `BLOOMERY_HOSTSTREAM` (a qwen4exp file only, refused by name on the
+//! others) streams each prompt call's hottest host experts into the
+//! residency pool (`Body38::set_hoststream`): unset it is on under
+//! `--place a` with a residency machine and off everywhere else; `on`
+//! beside `BLOOMERY_RESIDENCY=off` is refused by name. A streaming call
+//! prints a `call stream` record a pick and a `call stream end` record
+//! after its arm's lines.
+//!
 //! `BLOOMERY_DRAFT` unset on a qwen4exp file follows the placement
 //! (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft runs
 //! when a regular file is where it would be opened; the plain path runs
@@ -244,7 +252,7 @@ mod cli {
     };
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
-    use bloomery_gpu::host::swap::{PassReport, Residency};
+    use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
@@ -432,6 +440,12 @@ mod cli {
             _m: &mut GpuModel<Self>,
         ) -> Result<Vec<(PassKind, PassReport)>, GateError> {
             Ok(Vec::new())
+        }
+
+        /// The last prompt call's streaming picks, each with its ubatch, and
+        /// its end; none for a body that does not stream.
+        fn stream_records(_m: &mut GpuModel<Self>) -> Result<StreamRecords, GateError> {
+            Ok((Vec::new(), None))
         }
     }
 
@@ -736,6 +750,11 @@ mod cli {
         fn residency_passes(m: &mut Qwen38Model) -> Result<Vec<(PassKind, PassReport)>, GateError> {
             Ok(m.body_parts("generate_qwen3moe")?.2.take_residency_passes())
         }
+
+        /// [`Body38::take_stream_records`].
+        fn stream_records(m: &mut Qwen38Model) -> Result<StreamRecords, GateError> {
+            Ok(m.body_parts("generate_qwen3moe")?.2.take_stream_records())
+        }
     }
 
     /// The refusal of `--seed-depth D` on a qwen4exp file.
@@ -806,6 +825,9 @@ mod cli {
         stats: bool,
     }
 
+    /// A prompt call's streaming picks, each with its ubatch, and its end.
+    type StreamRecords = (Vec<(usize, CallPick)>, Option<CallReport>);
+
     /// One arm: its ids and its generated count.
     struct Arm {
         ids: Vec<u32>,
@@ -823,6 +845,7 @@ mod cli {
             bloomery_levers::MTP_HEAD_ROWS,
             bloomery_levers::MTP_DRAFT,
             bloomery_levers::RESIDENCY,
+            bloomery_levers::HOSTSTREAM,
         ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
         // Set, the word runs as given; unset, the Qwen3.8 rule picks it once
@@ -997,6 +1020,13 @@ mod cli {
                     .into(),
             );
         }
+        if family != Family::Qwen38 && levers.hoststream().is_some() {
+            return Err(
+                "BLOOMERY_HOSTSTREAM streams a qwen4exp prompt's host experts into its \
+                 residency pool; a qwen3moe or qwen35moe plan holds every one on the card"
+                    .into(),
+            );
+        }
         if family != Family::Qwen38 && residency != Residency::Off {
             return Err(format!(
                 "BLOOMERY_RESIDENCY={word_set} moves a qwen4exp plan's card experts; a qwen3moe \
@@ -1117,6 +1147,7 @@ mod cli {
                         t,
                     )?;
                     log38(&mut m, residency, &arms)?;
+                    stream38(&mut m, &levers, place, residency)?;
                     if let Some(t) = trace {
                         m.body_parts("generate_qwen3moe")?
                             .2
@@ -1143,6 +1174,7 @@ mod cli {
                         t,
                     )?;
                     log38(&mut m, residency, &arms)?;
+                    stream38(&mut m, &levers, place, residency)?;
                     m.set_prompt38_stats(run.stats)?;
                     drive38_mtp(m, cfg, &run, &arms, listed, sync)
                 }
@@ -1711,6 +1743,23 @@ mod cli {
         Ok(())
     }
 
+    /// `BLOOMERY_HOSTSTREAM` on the load (`Body38::set_hoststream`): as set;
+    /// unset, on under `--place a` with a residency machine (V4.1's rule),
+    /// off everywhere else. `on` beside `BLOOMERY_RESIDENCY=off` is refused
+    /// there by name.
+    fn stream38(
+        m: &mut Qwen38Model,
+        levers: &Levers,
+        place: Place38,
+        residency: Residency,
+    ) -> Result<(), GateError> {
+        let on = levers
+            .hoststream()
+            .unwrap_or(place == Place38::A && residency != Residency::Off);
+        m.body_parts("generate_qwen3moe")?.2.set_hoststream(on)?;
+        Ok(())
+    }
+
     /// In graph mode: capture the decode step and hold its node kinds to the
     /// program's count, a mismatch ending the run by name.
     fn capture38_check(m: &mut Qwen38Model) -> Result<(), GateError> {
@@ -1874,6 +1923,13 @@ mod cli {
     /// The `residency pass` records of the boundaries since the last print,
     /// after the arm's lines: nothing prints between two timed steps.
     fn print_passes<B: Prompted>(m: &mut GpuModel<B>) -> Result<(), GateError> {
+        let (picks, end) = B::stream_records(m)?;
+        for (ubatch, p) in &picks {
+            record::call_stream(*ubatch, p).print();
+        }
+        if let Some(r) = end {
+            record::call_report(&r).print();
+        }
         for (kind, r) in B::residency_passes(m)? {
             record::residency_pass_of(kind, &r).print();
         }
