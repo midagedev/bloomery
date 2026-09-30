@@ -15,8 +15,9 @@
 # one term the derivation cannot close: E(4) is its box measurement, this sitting's first question.
 # prose:4096 carries the same band (the step 18.68 ms, the deeper QSA rows adding ~0.1 ms a row).
 # The runner pairs the arms in one lease:
-# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38mtp-tg.card BLOOMERY_GEN_CTX=4096' BLOOMERY_AB_ROUNDS=3
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38mtp-tg.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=3
 # just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_DRAFT=mtp prose:4096 prose:4096@BLOOMERY_DRAFT=mtp
+# (C 4352: the deepest arm needs 4096 + 96 positions, rounded up to 256; one C lets the arms share a load)
 # (the plain arm is the no-draft path; the mtp arm's load line carries draft=mtp and its mtp summary
 # record the kept lengths' histogram). Wall [derived]: 4 arms x 3 rounds = 12 fresh processes, each a
 # Qwen3.8 load of 40-90 s (the draft's load adds its 2.8 GB, the mtp arm's plan line names the
@@ -25,8 +26,8 @@
 kind: ab
 question: does Qwen3.8's MTP window lift the decode rate by the union-and-front model's band, and
   what acceptance does the real prose reach?
-term: tg tok/s @ n=96, the prose corpus (prose:512 and prose:4096), ctx 4096
-  (BLOOMERY_GEN_CTX=4096), A6000, plan a (card experts), BLOOMERY_DRAFT=mtp against unset, same
+term: tg tok/s @ n=96, the prose corpus (prose:512 and prose:4096), ctx 4352
+  (BLOOMERY_GEN_CTX=4352), A6000, plan a (card experts), BLOOMERY_DRAFT=mtp against unset, same
   binary, paired by round
 unit: %
 predict: +11..+82
