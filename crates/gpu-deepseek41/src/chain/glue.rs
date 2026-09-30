@@ -259,10 +259,12 @@ pub(crate) mod glue_kernels {
         if i >= n {
             return;
         }
-        // q3k_embed_value's contract: the super-block at byte 4·at + 110·(i /
-        // 256) ends inside params by the launch contract, and starts 0 or 2
-        // mod 4 (a word, plus an even byte count).
-        let v = q3k_embed_value(params, 4 * at as usize + 110 * (i / 256), i % 256);
+        // The super-block starts 0 or 2 mod 4 (a word, plus an even byte
+        // count), the two alignments the core funnels.
+        // SAFETY: i < n (the guard above) gives i / 256 < n_sb, so the
+        // super-block ends at byte 4·at + 110·(i/256 + 1) <= 4·at + 110·n_sb
+        // <= 4·params.len() (the launch contract); i % 256 < 256.
+        let v = unsafe { q3k_embed_value(params, 4 * at as usize + 110 * (i / 256), i % 256) };
         for s in 0..hc as usize {
             // SAFETY: s < hc and i < n, so s·n + i < hc·n <= streams.len() by
             // the launch contract; the value is this thread's alone.
@@ -300,10 +302,12 @@ pub(crate) mod glue_kernels {
             return;
         }
         let sb = i / 256;
-        // q3k_embed_value's contract: super-block sb < rows·n_sb of the packed
-        // rows ends inside params by the launch contract, and starts 0 or 2
-        // mod 4 (`Glue::new` checks at_byte even; 110 is even).
-        let v = q3k_embed_value(params, at_byte as usize + 110 * sb, i % 256);
+        // The super-block starts 0 or 2 mod 4 (`Glue::new` checks at_byte
+        // even; 110 is even), the two alignments the core funnels.
+        // SAFETY: i < rows·256·n_sb (the guard above) gives sb < rows·n_sb, so
+        // the super-block ends at byte at_byte + 110·(sb + 1) <= at_byte +
+        // rows·110·n_sb <= 4·params.len() (the launch contract); i % 256 < 256.
+        let v = unsafe { q3k_embed_value(params, at_byte as usize + 110 * sb, i % 256) };
         // SAFETY: i < rows·256·n_sb <= y.len() by the launch contract; one
         // thread per value.
         unsafe { *y.get_unchecked_mut(i) = v };

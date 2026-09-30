@@ -94,27 +94,34 @@ pub const ARGMAX_WARPS: usize = ARGMAX_THREADS / 32;
 /// 16·half16 + l` at field `2·field`; the high bit is hmask byte `v16 % 32`
 /// bit `4·half + field` (clear subtracts 4); the sub-block scale is the
 /// aux-shuffle byte `v16/16` minus 32; `d` is the f16 at super-block bytes
-/// 108..109.
+/// 108..109. A super-block starts 0 or 2 mod 4 (a word plus an even byte
+/// count): the scale window funnels the 2-mod-4 case, single bytes load from
+/// their covering words.
 ///
-/// Caller contract: `base + 110 <= 4 * w.len()` and `base` inside one row's
-/// span (rows are 880 bytes, so `base` sits 0 or 2 mod 4 with the
-/// super-block; the scale window funnels the 2-mod-4 case, single bytes load
-/// from their covering words), `v16 < 256`.
+/// # Safety
+///
+/// `base + 110 <= 4 * w.len()` and `v16 < 256`. The qs byte is at most
+/// `base + 95`, the hmask byte below `base + 32`, and the scale window's four
+/// words end at or before the first word boundary at or past `base + 110`;
+/// `4 * w.len()` is a word boundary at or past `base + 110`, so every word
+/// read is inside `w`. A kernel caller discharges both from its launch facts
+/// (`crate::view`'s module doc): the `requires` clause bounding `w` at the
+/// super-block its thread's guarded index names, and `v16` taken `% 256`.
 #[inline(always)]
-pub fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
+pub unsafe fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
     let field = (v16 >> 5) & 3;
     let qs_byte = 32 * (v16 >> 7) + 16 * ((v16 >> 4) & 1) + (v16 & 15);
     // Single bytes load directly from their covering word — the value's qs
     // and hmask bytes sit at arbitrary byte offsets (the gemv reads whole
     // aligned quads and funnels; a lone byte needs no funnel).
     let qx = base + 32 + qs_byte;
-    // SAFETY: qx < base + 95 < base + 110 <= 4 * w.len() by the caller
-    // contract, so the covering word is inside w.
+    // SAFETY: qx <= base + 95 < base + 110 <= 4 * w.len() by this fn's
+    // `# Safety`, so the covering word is inside w.
     let qsw = unsafe { *w.get_unchecked(qx >> 2) };
     let qv = (qsw >> (8 * (qx & 3) + 2 * field)) & 3;
 
     let hx = base + (v16 & 31);
-    // SAFETY: hx < base + 32, inside the super-block by the caller contract.
+    // SAFETY: hx < base + 32, inside the super-block by this fn's `# Safety`.
     let hmw = unsafe { *w.get_unchecked(hx >> 2) };
     let hv = if (hmw >> (8 * (hx & 3) + 4 * (v16 >> 7) + field)) & 1 != 0 {
         0
@@ -126,7 +133,7 @@ pub fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
 
     let ak = (base + 96) >> 2;
     // SAFETY: the 12 scale bytes end at 108 and d at 110, inside the
-    // super-block by the caller contract.
+    // super-block by this fn's `# Safety`.
     let (aw0, aw1, aw2, aw3) = unsafe {
         (
             *w.get_unchecked(ak),
@@ -159,15 +166,21 @@ pub fn q3k_embed_value(w: &[u32], base: usize, v16: usize) -> f32 {
 /// fused or unfused subtraction rounds alike: a correct caller is
 /// bit-identical to `gguf::quant::dequant_row` on the same row bytes.
 ///
-/// Caller contract: `wk + 36 <= w.len()` (the super-block's 36 words), `v < 256`.
+/// # Safety
+///
+/// `wk + 36 <= w.len()` (the super-block's 36 words) and `v < 256`: every
+/// word read is `wk + 0..=35`. A kernel caller discharges both from its
+/// launch facts (`crate::view`'s module doc): the `requires` clause bounding
+/// `w` at the super-block its thread's guarded index names, and `v` taken
+/// `% 256`.
 #[inline(always)]
-pub(crate) fn q4k_embed_value(w: &[u32], wk: usize, v: usize) -> f32 {
+pub(crate) unsafe fn q4k_embed_value(w: &[u32], wk: usize, v: usize) -> f32 {
     let j = v >> 6;
     let h = (v >> 5) & 1;
     let l = v & 31;
     let qb = 32 * j + l;
     // SAFETY: every index is wk + 0..=35 (qb < 128, so 4 + qb/4 <= 35),
-    // inside `w` by the caller contract.
+    // inside `w` by this fn's `# Safety`.
     let (w0, w1, w2, w3, qw) = unsafe {
         (
             *w.get_unchecked(wk),
@@ -319,10 +332,16 @@ pub(crate) fn silu_mul(g: f32, u: f32) -> f32 {
 /// `acc = w.mul_add(d, acc)` per term, not a multiply then an add; the
 /// sequence of terms is fixed.
 ///
-/// Caller contract: `down.len() >= rows * n_exp * m`, `w.len() >= n_exp * m`,
-/// `t < m`, `d < rows`.
+/// # Safety
+///
+/// For some `m`: `down.len() >= rows * n_exp * m`, `w.len() >= n_exp * m`,
+/// `t < m` and `d < rows`, which bound every weight index `t·n_exp + e` and
+/// down index `(t·n_exp + e)·rows + d` with `e < n_exp`. A kernel caller
+/// discharges them from its launch facts (`crate::view`'s module doc): the
+/// `requires` clauses bounding `down` and `w`, and `(t, d)` split from its
+/// thread's index past its `i < rows·m` guard.
 #[inline(always)]
-pub(crate) fn weighted_expert_sum(
+pub(crate) unsafe fn weighted_expert_sum(
     down: &[f32],
     w: &[f32],
     rows: u32,
@@ -335,12 +354,11 @@ pub(crate) fn weighted_expert_sum(
     let mut acc = 0.0f32;
     let mut e = 0usize;
     while e < n_exp {
-        // SAFETY: e < n_exp and t < m bound the weight index t*n_exp + e and
-        // the down index (t*n_exp + e)*rows + d inside their buffers by the
-        // caller contract.
+        // SAFETY: e < n_exp and t < m bound the weight index t*n_exp + e
+        // inside `w` by this fn's `# Safety`.
         let wv = unsafe { *w.get_unchecked(t * n_exp + e) };
-        // SAFETY: the same e < n_exp and t < m bound the down index
-        // (t*n_exp + e)*rows + d inside `down` by the caller contract.
+        // SAFETY: the same e < n_exp and t < m, with d < rows, bound the down
+        // index (t*n_exp + e)*rows + d inside `down` by this fn's `# Safety`.
         let dv = unsafe { *down.get_unchecked((t * n_exp + e) * rows + d) };
         acc += wv * dv;
         e += 1;
@@ -395,7 +413,10 @@ mod elem_kernels {
         let v = if id < n_rows {
             // Row spans are whole 880-byte blocks, so only the super-block
             // offset can sit 2 mod 4; the core funnels both alignments.
-            q3k_embed_value(w, id as usize * 880 + ((k >> 8) * 110), k & 255)
+            // SAFETY: id < n_rows and k >> 8 < 8, so the super-block ends at
+            // byte <= 880·(id + 1) <= 880·n_rows <= 4·w.len() (the launch
+            // contract); k & 255 < 256.
+            unsafe { q3k_embed_value(w, id as usize * 880 + ((k >> 8) * 110), k & 255) }
         } else {
             if k == 0 {
                 fault.raise(FaultSite::TokenId);
@@ -468,7 +489,10 @@ mod elem_kernels {
         // SAFETY: t < ids.len() by the guard.
         let id = unsafe { *ids.get_unchecked(t) };
         let v = if id < n_rows {
-            q4k_embed_value(w, (id as usize * n_sb as usize + (k >> 8)) * 36, k & 255)
+            // SAFETY: id < n_rows and k >> 8 < n_sb (k < width), so the
+            // super-block's 36 words end at <= 36·n_sb·n_rows <= w.len() (the
+            // launch contract); k & 255 < 256.
+            unsafe { q4k_embed_value(w, (id as usize * n_sb as usize + (k >> 8)) * 36, k & 255) }
         } else {
             if k == 0 {
                 fault.raise(FaultSite::TokenId);
@@ -696,7 +720,10 @@ mod elem_kernels {
         }
         let t = i / rows as usize;
         let d = i % rows as usize;
-        let v = weighted_expert_sum(down, w, rows, n_exp, t, d);
+        // SAFETY: i < rows·m (the guard above) gives t < m and d < rows; the
+        // launch contract gives down.len() >= rows·n_exp·m and w.len() >=
+        // n_exp·m.
+        let v = unsafe { weighted_expert_sum(down, w, rows, n_exp, t, d) };
         // SAFETY: i < rows*m <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = v;
@@ -803,6 +830,13 @@ mod elem_kernels {
         static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
         static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
 
+        // One block: the launcher's grid is exactly 1, so this fires only on a
+        // larger grid, whose extra blocks it keeps off `out`. Block-uniform,
+        // before any access or barrier.
+        if thread::blockIdx_x() != 0 {
+            return;
+        }
+
         // SAFETY: both arrays are this block's own shared allocations; the
         // raw form is the only way to reach them without a reference to a
         // `static mut`.
@@ -819,8 +853,8 @@ mod elem_kernels {
         if thread::threadIdx_x() == 0 {
             let word = fault.read();
             let sites = fault.read_sites(word);
-            // SAFETY: out.len() >= 3 by the launch contract; only thread 0
-            // writes.
+            // SAFETY: out.len() >= 3 by the launch contract; thread 0 of the
+            // grid's one block (the guard above) alone writes.
             unsafe {
                 *out.get_unchecked_mut(0) = fi;
                 *out.get_unchecked_mut(1) = word;
@@ -842,6 +876,13 @@ mod elem_kernels {
     pub fn argmax_finite_fault(x: &[f32], n: u32, fault: FaultSink, mut out: DisjointSlice<u32>) {
         static mut BEST_V: SharedArray<f32, ARGMAX_WARPS> = SharedArray::UNINIT;
         static mut BEST_I: SharedArray<u32, ARGMAX_WARPS> = SharedArray::UNINIT;
+
+        // One block: the launcher's grid is exactly 1, so this fires only on a
+        // larger grid, whose extra blocks it keeps off `out`. Block-uniform,
+        // before any access or barrier.
+        if thread::blockIdx_x() != 0 {
+            return;
+        }
 
         let mut finite = true;
         let mut i = thread::threadIdx_x();
@@ -870,8 +911,8 @@ mod elem_kernels {
         if thread::threadIdx_x() == 0 {
             let word = fault.read();
             let sites = fault.read_sites(word);
-            // SAFETY: out.len() >= 3 by the launch contract; only thread 0
-            // writes.
+            // SAFETY: out.len() >= 3 by the launch contract; thread 0 of the
+            // grid's one block (the guard above) alone writes.
             unsafe {
                 *out.get_unchecked_mut(0) = fi;
                 *out.get_unchecked_mut(1) = word;
