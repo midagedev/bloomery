@@ -635,17 +635,16 @@ mod elem_kernels {
         if i >= n as usize {
             return;
         }
-        // SAFETY: the `requires` above were launcher-checked, `n` is this
-        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
-        // guard, and the launch is `domain = 1` with the contract's exact 1-D
-        // block.
-        let e = unsafe { Elem::new(ids, &mut sel, i) };
-        e.map(move |id| {
-            if id >= n_expert {
-                fault.raise(FaultSite::ExpertId);
-            }
-            if id < n_card { id } else { HOST }
-        });
+        // SAFETY: i < n <= ids.len() by the launch contract.
+        let id = unsafe { *ids.get_unchecked(i) };
+        if id >= n_expert {
+            fault.raise(FaultSite::ExpertId);
+        }
+        // SAFETY: i < n <= sel.len() by the launch contract; thread i alone
+        // writes it.
+        unsafe {
+            *sel.get_unchecked_mut(i) = if id < n_card { id } else { HOST };
+        }
     }
 
     /// `y[i] = silu(gate[i]) * up[i]`, elementwise over `n` values.
