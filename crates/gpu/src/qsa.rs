@@ -63,6 +63,7 @@
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f32_to_f16_bits, half_bits_to_f32};
 use crate::rope_neox::neox_pair;
+use crate::view::RowWord;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicU32};
@@ -808,6 +809,12 @@ mod qsa_kernels {
     /// ..]` and its length into `n_sel[t]` (module doc). A [`scored`] row
     /// reads its scores; a row that sees at most `kept` pools gets `0 .. c`;
     /// a refused count gets length 0.
+    ///
+    /// The row's count and its length word go through [`RowWord`], built
+    /// once at entry from the launch facts. The other global accesses keep
+    /// their `// SAFETY:`: the list places come from ballots over the
+    /// scores, and the identity fill and the score reads are bounded by the
+    /// row's count, which is buffer data.
     #[kernel]
     #[launch_bounds(512)]
     #[launch_contract(
@@ -854,8 +861,13 @@ mod qsa_kernels {
         let lane = warp::lane_id();
         let wid = tid / 32;
         let lbase = t * width as usize;
-        // SAFETY: t < m <= n_keys.len() by the launch contract.
-        let c = unsafe { *n_keys.get_unchecked(t) };
+        // SAFETY: the contract above was launcher-checked (`requires`
+        // `n_keys.len() >= m` and `n_sel.len() >= m` on the host before
+        // enqueue), `t` is this block's index past the `t < m` guard and `tid`
+        // its thread's own, and the launch's block is the contract's exact
+        // 1-D `(TOPK_THREADS, 1, 1)`.
+        let row = unsafe { RowWord::<1, 0>::new(n_keys, t, &mut n_sel, tid) };
+        let c = row.count();
         if !scored(c, ctx, kept) {
             let len = if c >= 1 && c <= ctx { c as usize } else { 0 };
             let mut i = tid;
@@ -866,10 +878,7 @@ mod qsa_kernels {
                 unsafe { *list.get_unchecked_mut(lbase + i) = i as u32 };
                 i += TOPK_THREADS as usize;
             }
-            if tid == 0 {
-                // SAFETY: t < m <= n_sel.len().
-                unsafe { *n_sel.get_unchecked_mut(t) = len as u32 };
-            }
+            row.first(move || len as u32);
             return; // block-uniform
         }
         // SAFETY: block-shared statics; the raw forms reach them without a
@@ -996,10 +1005,7 @@ mod qsa_kernels {
             // width.
             unsafe { *list.get_unchecked_mut(lbase + kept_tokens + tid) = (POOL * n + tid) as u32 };
         }
-        if tid == 0 {
-            // SAFETY: t < m <= n_sel.len().
-            unsafe { *n_sel.get_unchecked_mut(t) = (kept_tokens + tail) as u32 };
-        }
+        row.first(move || (kept_tokens + tail) as u32);
     }
 
     /// [`qsa_topk`] with the higher pools of a tie at the cut: block `t`
@@ -1010,6 +1016,9 @@ mod qsa_kernels {
     /// then its tail; a row that sees at most `kept` pools gets `0 .. c`; a
     /// refused count (0, or past the cache) gets length 0 and raises
     /// [`FaultSite::PoolSelect`].
+    ///
+    /// The row's count and `vis[2t + 1]` go through [`RowWord`], as in
+    /// [`qsa_topk`].
     #[kernel]
     #[launch_bounds(512)]
     #[launch_contract(
@@ -1057,8 +1066,13 @@ mod qsa_kernels {
         let lane = warp::lane_id();
         let wid = tid / 32;
         let lbase = t * width as usize;
-        // SAFETY: t < m <= n_keys.len() by the launch contract.
-        let c = unsafe { *n_keys.get_unchecked(t) };
+        // SAFETY: the contract above was launcher-checked (`requires`
+        // `n_keys.len() >= m` and `vis.len() >= 2 * m` on the host before
+        // enqueue), `t` is this block's index past the `t < m` guard and `tid`
+        // its thread's own, and the launch's block is the contract's exact
+        // 1-D `(TOPK_THREADS, 1, 1)`.
+        let row = unsafe { RowWord::<2, 1>::new(n_keys, t, &mut vis, tid) };
+        let c = row.count();
         if !scored(c, ctx, kept) {
             let accepted = c >= 1 && c <= ctx;
             let len = if accepted { c as usize } else { 0 };
@@ -1070,13 +1084,12 @@ mod qsa_kernels {
                 unsafe { *list.get_unchecked_mut(lbase + i) = i as u32 };
                 i += TOPK_THREADS as usize;
             }
-            if tid == 0 {
+            row.first(move || {
                 if !accepted {
                     fault.raise(FaultSite::PoolSelect);
                 }
-                // SAFETY: 2t + 1 < 2m <= vis.len() (launch contract).
-                unsafe { *vis.get_unchecked_mut(2 * t + 1) = len as u32 };
-            }
+                len as u32
+            });
             return; // block-uniform
         }
         // SAFETY: block-shared statics; the raw forms reach them without a
@@ -1202,10 +1215,7 @@ mod qsa_kernels {
             // width.
             unsafe { *list.get_unchecked_mut(lbase + kept_tokens + tid) = (POOL * n + tid) as u32 };
         }
-        if tid == 0 {
-            // SAFETY: 2t + 1 < 2m <= vis.len() (launch contract).
-            unsafe { *vis.get_unchecked_mut(2 * t + 1) = (kept_tokens + tail) as u32 };
-        }
+        row.first(move || (kept_tokens + tail) as u32);
     }
 }
 
