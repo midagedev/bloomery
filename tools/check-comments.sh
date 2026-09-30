@@ -87,8 +87,6 @@ fi
 RETIRED_WORDS='h[o]t.?list|뜨[거]운 목록|핫 ?리[스]트'
 WORD_ALLOW=(
   'crates/levers/src/registry.rs|name: "BLOOMERY_HOT_|the retired row refuses the name when it is set'
-  'docs/plan-ledger.md||the lead owns the history in it'
-  'docs/plan-triage.md||the lead owns the history in it'
 )
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || { echo "check-comments: not a git work tree — the retired-word rule reads the tracked files; no verdict" >&2; exit 69; }
