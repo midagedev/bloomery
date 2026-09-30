@@ -594,6 +594,35 @@ impl<B: ChainBody> GpuModel<B> {
             ResidencyGlue,
         ) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
+        GpuModel::load_placed_hosting(file, plan, card, host, residency, (&[], 0), derive, body)
+    }
+
+    /// [`GpuModel::load_placed_with`] whose host set also holds `hosted` (its
+    /// runs and their file bytes, which the host need counts):
+    /// per entry, the experts of the plan's model tensor at that index the
+    /// host tier serves though the plan places the tensor nowhere (a draft
+    /// layer the body loads beside the plan's own), read in and locked with
+    /// the plan's host segments as `host` asks.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "load_placed_with's arguments and the extra host runs (rust-quality R8)"
+    )]
+    pub fn load_placed_hosting(
+        file: Split,
+        plan: &Plan<'_>,
+        card: usize,
+        host: HostCfg,
+        residency: ResidencySpec,
+        hosted: (&[(usize, ExpertList)], u64),
+        derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
+        body: impl FnOnce(
+            &Gpu,
+            &Arc<Split>,
+            &Weights,
+            HostResidency,
+            ResidencyGlue,
+        ) -> Result<B, GpuError>,
+    ) -> Result<GpuModel<B>, GpuError> {
         const WHAT: &str = "GpuModel::load_placed_with";
         let churn = match residency.lever {
             Residency::Off => None,
@@ -604,9 +633,16 @@ impl<B: ChainBody> GpuModel<B> {
         if let Some(p) = &churn {
             p.check(plan).map_err(|e| GpuError::plan(WHAT, e))?;
         }
-        let extra = churn
+        let pool = churn
             .as_ref()
             .map_or((&[][..], 0), |p| (p.runs.as_slice(), p.bytes));
+        let joined: Vec<(usize, ExpertList)>;
+        let extra = if hosted.0.is_empty() {
+            pool
+        } else {
+            joined = pool.0.iter().chain(hosted.0).cloned().collect();
+            (&joined[..], pool.1 + hosted.1)
+        };
         let file = Arc::new(file);
         let (p, set) = placed_pre(&file, plan, card, host, extra, derive)?;
         let t_body = Instant::now();
@@ -979,8 +1015,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// poisons every later call until [`GpuModel::reset`]. A fault is the
     /// call's error whatever else failed: any other error is read behind
     /// ([`GpuModel::fault_behind`]). The fault prints its site mask in this
-    /// body's step order.
-    pub(crate) fn note_fault<T>(
+    /// body's step order. A body crate passes its own launches' results
+    /// through it — a draft layer's walk poisons the model as a step does.
+    pub fn note_fault<T>(
         &mut self,
         what: &'static str,
         r: Result<T, GpuError>,

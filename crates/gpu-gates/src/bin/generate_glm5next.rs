@@ -56,6 +56,25 @@
 //! at `main`; every line is a record of a kind `bloomery_gpu_gates::record`
 //! declares (`--records-schema` prints them).
 //!
+//! Under `BLOOMERY_DRAFT=mtp` the load carries the file's next-token layer
+//! beside the target (`app::arch::glm5next::open_nextn`) and the generated
+//! tokens run through the shared MTP window (`app::mtp::MtpDraft<Body>`,
+//! `runtime::Speculative` of two rows): each window verifies the target's
+//! next token and the draft's one proposal, the target's step mode as
+//! `--mode` says, the draft's walks eager; the greedy ids are the plain
+//! run's. In graph mode the verify of two rows is captured before the
+//! prompt (a `capture` line of its nodes). Each kept token prints its `step`
+//! line and, under `--time`, a `time step` line (its window's wall over the
+//! window's kept rows, the row a plain step's wall compares with; `--warm W`
+//! marks the first W), and each window a `time pass` line (its wall from the
+//! proposal through the commit, the rows it kept, `kind=mtp`, or `plain` for
+//! a window with no proposal). The feed's `time prompt` wall holds the
+//! draft's store walks over the prompt's units. The `mtp summary` line counts the proposals
+//! and the windows by rows kept; the `SMOKE` footer is over the kept
+//! positions past the warm ones. `lookup` and `dspark` are refused by name,
+//! as are `--pair`, `--logits` and the route trace beside the draft. Unset or
+//! `off`, the load, the plan and every step are the plain run's.
+//!
 //! `BLOOMERY_ROUTE_TRACE=<dir>` writes the engine's route trace of the run
 //! into `dir`, a new directory made before the load
 //! (`crates/gpu/src/host/route_trace.rs`): every position's routed ids per
@@ -81,21 +100,24 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "glm5next")]
 mod cli {
     use std::path::PathBuf;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    use app::arch::glm5next::GlmCfg;
-    use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
+    use app::arch::glm5next::{GlmCfg, open_nextn};
+    use app::mtp::MtpDraft;
+    use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
-    use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8, ROUTE_TRACE};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, R8, ROUTE_TRACE,
+    };
     use gguf::Split;
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use runtime::layer::hosted;
-    use runtime::{Target, Verify, Want};
+    use runtime::{Advance, Committed, PassSink, Stop, Target, Verify, Want};
 
     const ACTS_ON: &[&str] = &[
         CARD_BUDGET,
@@ -104,7 +126,12 @@ mod cli {
         CARD_DONTNEED,
         R8,
         ROUTE_TRACE,
+        DRAFT,
     ];
+
+    /// The drafted window's verify: the target's next token and the draft's
+    /// one proposal.
+    const VERIFY_ROWS: usize = 2;
 
     /// The last value of flag `name`, if given.
     fn flag(name: &str) -> Result<Option<String>, GateError> {
@@ -238,6 +265,38 @@ mod cli {
                     .into(),
             );
         }
+        let drafted = match levers.draft() {
+            None | Some("off") => false,
+            Some("mtp") => true,
+            Some(other) => {
+                return Err(format!(
+                    "BLOOMERY_DRAFT={other}: on a glm5next file mtp drafts the window (the \
+                     file's NextN layer); lookup and dspark are the V4.1 binaries'"
+                )
+                .into());
+            }
+        };
+        if drafted {
+            if n_gen < 2 {
+                return Err(
+                    "BLOOMERY_DRAFT=mtp needs -n 2 or more: token 0 comes out of the feed, and the \
+                     windows run after it"
+                        .into(),
+                );
+            }
+            let beside = if pair {
+                Some("--pair (the plain verify probe runs without the draft)")
+            } else if has("--logits") {
+                Some("--logits (the drafted run's last call is a verify of two rows)")
+            } else if levers.route_trace().is_some() {
+                Some("BLOOMERY_ROUTE_TRACE (the trace records one-row steps)")
+            } else {
+                None
+            };
+            if let Some(what) = beside {
+                return Err(format!("BLOOMERY_DRAFT=mtp is refused beside {what}").into());
+            }
+        }
         let ctx: usize = flag("--ctx")?.map_or(Ok(2048), |s| s.parse())?;
         let (place, machine): (&'static str, fn(usize) -> Machine) =
             match flag("--place")?.as_deref() {
@@ -267,8 +326,9 @@ mod cli {
             .into_string()
             .map_err(|p| format!("BLOOMERY_REF_MODEL is not UTF-8: {p:?}"))?;
         // The last generated token is read out, not fed: the run takes the
-        // prompt's positions and one a step after the first token.
-        let takes = ids.len() + n_gen.saturating_sub(1);
+        // prompt's positions and one a step after the first token. A drafted
+        // window's verify runs one row past the token it keeps last.
+        let takes = ids.len() + n_gen.saturating_sub(1) + usize::from(drafted);
         if takes > ctx {
             return Err(format!(
                 "{} prompt ids and {n_gen} generated take {takes} positions, past --ctx {ctx}",
@@ -315,10 +375,17 @@ mod cli {
             mode,
             cfg,
         };
-        let Some(loaded) = Loaded::<Body>::open(file, args, &mut log)? else {
-            return Ok(());
+        let mut s = if drafted {
+            let Some(s) = open_nextn(file, args, &mut log)? else {
+                return Ok(());
+            };
+            s
+        } else {
+            let Some(loaded) = Loaded::<Body>::open(file, args, &mut log)? else {
+                return Ok(());
+            };
+            loaded.ready(&mut log)?
         };
-        let mut s = loaded.ready(&mut log)?;
         if let Some(t) = trace {
             s.model_mut()
                 .body_parts("generate_glm5next")?
@@ -326,22 +393,24 @@ mod cli {
                 .hybrid_mut()
                 .attach_route_trace(t)?;
         }
-        let head: Vec<u32> = ids.iter().copied().take(4).collect();
-        let tail: Vec<u32> = ids
-            .iter()
-            .copied()
-            .skip(ids.len().saturating_sub(4))
-            .collect();
-        Record::new(&record::FED)
-            .u("ids", ids.len())
-            .list("first", &head)
-            .list("last", &tail)
-            .u("depth_sequence_from", ids.len())
-            .print();
         let passes = match prefill {
             PrefillMode::Batch => bloomery_gpu_glm5next::batches_of(s.model(), ids.len())?.len(),
             PrefillMode::Steps => ids.len(),
         };
+        if drafted {
+            let arm = Arm {
+                ids: &ids,
+                n_gen,
+                timed,
+                warm,
+                mode,
+                place,
+                prefill,
+                passes,
+            };
+            return drafted_run(&mut s, &arm);
+        }
+        fed(&ids);
         let t_feed = Instant::now();
         if prefill == PrefillMode::Steps {
             let pos = s.pos();
@@ -462,6 +531,195 @@ mod cli {
                 dir.display(),
                 t.finish()?
             );
+        }
+        Ok(())
+    }
+
+    /// The `fed` record, printed just before the feed's timer starts, after
+    /// every capture: the runner counts the timed window's faults from it.
+    fn fed(ids: &[u32]) {
+        let head: Vec<u32> = ids.iter().copied().take(4).collect();
+        let tail: Vec<u32> = ids
+            .iter()
+            .copied()
+            .skip(ids.len().saturating_sub(4))
+            .collect();
+        Record::new(&record::FED)
+            .u("ids", ids.len())
+            .list("first", &head)
+            .list("last", &tail)
+            .u("depth_sequence_from", ids.len())
+            .print();
+    }
+
+    /// What a drafted run is asked for.
+    struct Arm<'a> {
+        ids: &'a [u32],
+        n_gen: usize,
+        timed: bool,
+        warm: usize,
+        mode: StepMode,
+        place: &'static str,
+        prefill: PrefillMode,
+        /// The feed's batches or steps, as the plain run counts them.
+        passes: usize,
+    }
+
+    /// The verify pass's capture: its nodes, one line.
+    struct PairCapture;
+
+    impl RowsLog for PairCapture {
+        fn capture_rows(&mut self, _rows: usize, nodes: usize) -> Result<(), SessionError> {
+            Record::new(&record::CAPTURE_PAIR)
+                .u("pair_graph_nodes", nodes)
+                .print();
+            Ok(())
+        }
+    }
+
+    /// What the drafted generation's windows kept: every kept token at its
+    /// position with its window's wall over the window's kept rows, and every
+    /// window's proposal, kept rows and wall in ms.
+    struct Windows {
+        kept: Vec<(u32, u32, f64)>,
+        passes: Vec<(bool, usize, f64)>,
+    }
+
+    impl PassSink<Session<Body>> for Windows {
+        type Error = GateError;
+
+        fn begin(&mut self, _: &Session<Body>) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _: &Session<Body>,
+            c: &Committed,
+            tokens: &[u32],
+            wall: Duration,
+        ) -> Result<(), GateError> {
+            let ms = wall.as_secs_f64() * 1e3;
+            let per = ms / c.kept as f64;
+            for (r, &token) in (0u32..).zip(tokens) {
+                self.kept.push((c.pos + r, token, per));
+            }
+            self.passes.push((c.proposed, c.kept, ms));
+            Ok(())
+        }
+    }
+
+    /// `BLOOMERY_DRAFT=mtp`: the draft opened over the NextN load, in graph
+    /// mode the verify of two rows captured before the `fed` record, the
+    /// prompt fed with the draft's
+    /// store walked over its units, then windows until `-n` tokens are out,
+    /// every kept token the target's own argmax; the lines the module doc
+    /// names.
+    fn drafted_run(s: &mut Session<Body>, a: &Arm<'_>) -> Result<(), GateError> {
+        let draft = MtpDraft::open(s.model(), a.prefill, StepMode::Eager)?;
+        let mut spec = s.with_draft::<MtpDraft<Body>, VERIFY_ROWS>(draft, &mut PairCapture)?;
+        fed(a.ids);
+        let t_feed = Instant::now();
+        let first = spec.prompt(s, a.ids)?;
+        let feed = t_feed.elapsed();
+        Record::new(&record::STEP0)
+            .u("pos", s.pos() - 1)
+            .u("token", first)
+            .u("fed", a.ids.len())
+            .f("feed_s", feed.as_secs_f64())
+            .print();
+        let mut sink = Windows {
+            kept: Vec::with_capacity(a.n_gen + VERIFY_ROWS),
+            passes: Vec::with_capacity(a.n_gen),
+        };
+        let stop = Stop::new(a.n_gen, s.ctx())?;
+        let out = runtime::generate(s, &mut spec, a.ids, first, &stop, &mut sink)?;
+        if out.tokens.len() < a.n_gen {
+            return Err(format!(
+                "generate_glm5next: the drafted run stopped at {} after {} tokens, before -n {}",
+                out.stop.name(),
+                out.tokens.len(),
+                a.n_gen
+            )
+            .into());
+        }
+        // Generated token i >= 1 is kept token i - 1; the last window may
+        // keep one past -n.
+        let rows = &sink.kept[..a.n_gen - 1];
+        if a.timed {
+            let ms = feed.as_secs_f64() * 1e3;
+            Record::new(&record::TIME_PROMPT)
+                .u("n", a.ids.len())
+                .f("ms", ms)
+                .f("tok/s", a.ids.len() as f64 * 1e3 / ms)
+                .u("passes", a.passes)
+                .w("kind", a.prefill.name())
+                .print();
+        }
+        for (i, &(pos, token, per)) in (1usize..).zip(rows) {
+            Record::new(&record::STEP)
+                .u("i", i)
+                .u("pos", pos)
+                .u("token", token)
+                .print();
+            if a.timed {
+                Record::new(&record::TIME_STEP)
+                    .u("i", i)
+                    .flag("warm", i <= a.warm)
+                    .f("ms", per)
+                    .print();
+            }
+        }
+        if a.timed {
+            // Pass k's first kept position is generated token `at`.
+            let mut at = 1;
+            for (k, &(proposed, kept, ms)) in (1usize..).zip(&sink.passes) {
+                Record::new(&record::TIME_PASS)
+                    .u("i", k)
+                    .flag("warm", at <= a.warm)
+                    .f("ms", ms)
+                    .u("positions", kept)
+                    .w("kind", if proposed { "mtp" } else { "plain" })
+                    .print();
+                at += kept;
+            }
+        }
+        Record::new(&record::TOKENS)
+            .list("tokens", &out.tokens[..a.n_gen])
+            .print();
+        let counted: Vec<f64> = rows[a.warm.min(rows.len())..].iter().map(|r| r.2).collect();
+        let counted_ms: f64 = counted.iter().sum();
+        let rate = counted.len() as f64 * 1e3 / counted_ms;
+        let mut kept = [0u64; VERIFY_ROWS];
+        for &(_, k, _) in &sink.passes {
+            kept[k - 1] += 1;
+        }
+        Record::new(&record::MTP_SUMMARY)
+            .u("proposals", sink.passes.iter().filter(|p| p.0).count())
+            .list("kept", &kept)
+            .u("positions", sink.passes.iter().map(|p| p.1).sum::<usize>())
+            .u("passes", sink.passes.len())
+            .f("tok/s(positions)", rate)
+            .print();
+        if a.timed {
+            let mut sorted = counted.clone();
+            sorted.sort_by(f64::total_cmp);
+            let p50 = sorted[sorted.len() / 2];
+            let mean = counted_ms / counted.len() as f64;
+            Record::new(&record::SMOKE)
+                .w("mode", mode_name(a.mode))
+                .w("place", a.place)
+                .u("prompt_tokens", a.ids.len())
+                .u("depth", a.ids.len())
+                .u("generated", a.n_gen)
+                .u("warm", a.warm)
+                .u("steps", counted.len())
+                .f("p50_ms", p50)
+                .f("mean_ms", mean)
+                .f("tok/s(p50)", 1e3 / p50)
+                .u("positions", counted.len())
+                .f("tok/s(positions)", rate)
+                .print();
         }
         Ok(())
     }

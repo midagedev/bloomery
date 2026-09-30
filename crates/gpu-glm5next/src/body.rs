@@ -830,10 +830,12 @@ impl Body {
     /// it, the layer `nextn` describes resident as `plan`'s NextN plan places
     /// it ([`nextn::Nextn`]), and its routed experts served by the host tier
     /// as the run's last layer (the slot map's row for it every expert on the
-    /// host), the host tier's batch port made for the walk's host leg. The
-    /// load takes no residency machine: the host set's layers are the run's
-    /// before it. Refused as [`Body::open_placed`] refuses, and by name for a
-    /// next-token layer that does not follow the host run.
+    /// host), the host tier's batch port made for the walk's host leg. Those
+    /// experts join the plan's host set ([`NextnPlan::host_runs`]), read in
+    /// and locked with it as `host` asks, so no walk takes their first-touch
+    /// reads. The load takes no residency machine: the host set's layers are
+    /// the run's before it. Refused as [`Body::open_placed`] refuses, and by
+    /// name for a next-token layer that does not follow the host run.
     pub fn open_placed_nextn(
         file: Split,
         plan: &NextnPlan<'_>,
@@ -856,12 +858,14 @@ impl Body {
             max_rows: PAIR_ROWS,
             stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers)?),
         };
-        GpuModel::load_placed_with(
+        let hosted = plan.host_runs().map_err(|e| GpuError::plan(WHAT, e))?;
+        GpuModel::load_placed_hosting(
             file,
             target,
             card,
             host,
             spec,
+            (&hosted.0, hosted.1),
             |stream, _, layers, w| Body::derive(stream, &kinds, layers, w),
             |gpu, file, w, set, glue| {
                 Body::load_placed(
