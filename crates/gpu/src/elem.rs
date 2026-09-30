@@ -23,6 +23,7 @@ use crate::flash::{f32_to_f16_bits, f32x2_to_f16x2_bits};
 use crate::hybrid::HOST;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
+use crate::view::{Apply, Rope};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
@@ -478,6 +479,18 @@ mod elem_kernels {
     /// reference's order. `k` a positive multiple of 32 (host-checked); the
     /// token guard is block-uniform, so no barrier and no warp collective is
     /// skipped, and a thread past `k` contributes an exact zero.
+    ///
+    /// The apply pass runs over [`crate::view`]'s block-strided view: one
+    /// `unsafe` at entry carries the whole pass — the launcher evaluated the
+    /// contract's `requires` clauses before enqueueing, the shape values are
+    /// this kernel's own inputs (one value per grid), and the block is the
+    /// contract's 1-D `(RMS_THREADS, 1, 1)`. The same entry facts discharge
+    /// `rms_partial_sq`'s `base + k <= x.len()` caller contract. The
+    /// warp-slot reduce keeps its raw shared reach: no per-thread type can
+    /// prove every slot was written before the barrier that publishes it (a
+    /// warp that diverges around the write leaves its slot uninitialized,
+    /// and reading an unwritten slot is undefined for any element type), so
+    /// that access stays `unsafe` with its `// SAFETY:`.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -495,6 +508,11 @@ mod elem_kernels {
         let tid = thread::threadIdx_x() as usize;
         let k = k as usize;
         let base = t * k;
+        // SAFETY: the contract above was launcher-checked (`requires` on the
+        // host before enqueue), `base = t*k` past the `t < m` guard and `k`,
+        // `tid`, `RMS_THREADS` are this kernel's own inputs, and the launch's
+        // block is the contract's exact 1-D `(RMS_THREADS, 1, 1)`.
+        let mut apply = unsafe { Apply::new(gain, x, &mut y, base, k, tid, RMS_THREADS) };
         // SAFETY: WSUM is this block's own shared allocation; the raw form is
         // the only way to reach it without a reference to a `static mut`.
         // Every access is below RMS_WARPS and ordered by `sync_threads`.
@@ -522,16 +540,8 @@ mod elem_kernels {
             ]
         };
         let scale = rms_scale(rms_warp_tree(sums), k as u32, eps);
-        let mut it = tid;
-        while it < k {
-            // SAFETY: it < k bounds the gain read by the contract and the x
-            // read as base + it < k*m; base + it < k*m <= y.len() too.
-            unsafe {
-                let g = *gain.get_unchecked(it);
-                let v = *x.get_unchecked(base + it);
-                *y.get_unchecked_mut(base + it) = (scale * g) * v;
-            }
-            it += RMS_THREADS;
+        while let Some((g, v, out)) = apply.next_cell() {
+            *out = (scale * g) * v;
         }
     }
 
@@ -539,6 +549,13 @@ mod elem_kernels {
     /// pair). Column `c = t*n_vec + v` covers `nd` values; token `t`'s cache
     /// is `nd` f32 at `cs[t*nd ..]`, interleaved `[cos0, sin0, …]`. `nd`
     /// even (host-checked).
+    ///
+    /// The reads and writes run over [`crate::view`]'s rope views: one
+    /// `unsafe` at entry carries the whole kernel — the launcher evaluated
+    /// the contract's `requires` clauses before enqueueing, and the shape
+    /// values are this kernel's own parameters (one value per grid), so the
+    /// thread's flat launch index resolves to a pair whose loads and stores
+    /// the view proved from stored state.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -551,33 +568,17 @@ mod elem_kernels {
         )
     )]
     pub fn rope(src: &[f32], cs: &[f32], nd: u32, n_vec: u32, m: u32, mut dst: DisjointSlice<f32>) {
-        let i = thread::index_1d().get();
-        let npairs = (nd >> 1) as usize;
-        let total = m as usize * n_vec as usize * npairs;
-        if i >= total {
+        let idx = thread::index_1d();
+        // SAFETY: the contract above was launcher-checked (`requires` on the
+        // host before enqueue) and `nd`, `n_vec`, `m` are this kernel's own
+        // parameters, one value per grid.
+        let mut rope = unsafe { Rope::new(src, cs, &mut dst, nd, n_vec, m) };
+        let Some(mut pair) = rope.own(idx) else {
             return;
-        }
-        let col = i / npairs;
-        let d = (i % npairs) * 2;
-        let nd = nd as usize;
-        let t = col / n_vec as usize;
-        // SAFETY: d + 1 <= nd - 1, so both src indices stay below
-        // m*n_vec*nd <= src.len() and both cache indices below m*nd <=
-        // cs.len() by the launch contract.
-        let (x0, x1, c, s) = unsafe {
-            (
-                *src.get_unchecked(col * nd + d),
-                *src.get_unchecked(col * nd + d + 1),
-                *cs.get_unchecked(t * nd + d),
-                *cs.get_unchecked(t * nd + d + 1),
-            )
         };
+        let (x0, x1, c, s) = pair.load();
         let (y0, y1) = rope_pair_core(x0, x1, c, s);
-        // SAFETY: the same indices as the loads, inside dst by the contract.
-        unsafe {
-            *dst.get_unchecked_mut(col * nd + d) = y0;
-            *dst.get_unchecked_mut(col * nd + d + 1) = y1;
-        }
+        pair.store(y0, y1);
     }
 
     /// The card's slot list of a hybrid layer whose card holds the id
