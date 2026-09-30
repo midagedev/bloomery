@@ -1,0 +1,21 @@
+[package]
+name = "bloomery-placement"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+# The lib name is the full `bloomery_placement`: a short `placement` would
+# collide with `bloomery-model`'s own `placement` module in every `use` path
+# there (this crate is its dependency).
+[lib]
+name = "bloomery_placement"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
+bloomery-models = { path = "../models" }
+thiserror = { workspace = true }

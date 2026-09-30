@@ -3,9 +3,10 @@
 //! must be able to serve each of them without a fault: that is the churn
 //! pool, each layer's card segment's experts from rank `pinned` on (the
 //! list's order, which is slot order). A load holds the pool in its host set
-//! ([`super::host_lock::HostSet::of_with`]) beside the plan's host segments,
-//! and the plan's host headroom ([`super::HostTotals::headroom_bytes`], the
-//! one budget) must take the pool's bytes.
+//! (`HostSet::of_with`, `bloomery-model`'s `placement::host_lock`) beside the
+//! plan's host segments, and the plan's host headroom
+//! ([`super::HostTotals::headroom_bytes`], the one budget) must take the
+//! pool's bytes.
 
 use super::{Device, ExpertList, PlacementError, Plan, Role, per_expert};
 
