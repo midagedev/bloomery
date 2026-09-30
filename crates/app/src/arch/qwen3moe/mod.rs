@@ -49,6 +49,7 @@ use bloomery_gpu::arch::qwen3moe::{
 use runtime::{Draft, Speculative, TapNeed, Tapped, Target};
 
 use crate::{Keep, Prompt, Session, SessionError};
+mod mtp;
 
 const WHAT: &str = "qwen4exp session";
 
