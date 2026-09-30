@@ -199,11 +199,12 @@ mod taps;
 mod cli {
     use super::taps;
     use app::Session;
-    use app::arch::qwen3moe::{MtpDraft, Q38Cfg};
+    use app::arch::qwen3moe::Q38Cfg;
+    use app::mtp::MtpDraft;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
-        Body, Body35, Body38, MtpMode, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
+        Body, Body35, Body38, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
         Qwen35moeModel, Qwen38Model,
     };
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
@@ -1454,10 +1455,7 @@ mod cli {
             m,
             Q38Cfg {
                 prompt: path,
-                draft: match mode {
-                    StepMode::Graph => MtpMode::Graph,
-                    StepMode::Eager => MtpMode::Eager,
-                },
+                draft: mode,
             },
         ))
     }
@@ -1569,8 +1567,8 @@ mod cli {
     ) -> Result<(), GateError> {
         let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         let path = cfg.prompt;
-        let draft = MtpDraft::open(s.model(), cfg)?;
-        let mut spec = s.with_draft::<MtpDraft, 4>(draft, &mut VerifyCaptures)?;
+        let draft = MtpDraft::open(s.model(), path, cfg.draft)?;
+        let mut spec = s.with_draft::<MtpDraft<Body38>, 4>(draft, &mut VerifyCaptures)?;
         let count = arms.len();
         for (i, arm) in arms.iter().enumerate() {
             if i > 0 {
@@ -1647,7 +1645,7 @@ mod cli {
     /// tokens are out, every kept token the target's own argmax.
     fn run_arm38_mtp(
         s: &mut Session<Body38>,
-        spec: &mut Speculative<MtpDraft, 4>,
+        spec: &mut Speculative<MtpDraft<Body38>, 4>,
         path: Prompt38,
         run: &Run,
         arm: &Arm,

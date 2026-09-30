@@ -44,7 +44,7 @@
 //! plugs in.
 //!
 //! Under `BLOOMERY_DRAFT=mtp` the seat drives the session through the
-//! runtime's speculative loop with `app::arch::qwen4exp`'s `MtpDraft` (the
+//! runtime's speculative loop with the shared window `app::mtp::MtpDraft` (the
 //! shared draft file beside the target, its head reduced under
 //! `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows, the greedy ids the
 //! plain server's, `pass_rows` 4 and a sampling or id-banning request
@@ -77,8 +77,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use app::mtp::MtpBody;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-use bloomery_gpu::arch::qwen3moe::{Body38, MtpMode, Prompt38};
+use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38};
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
@@ -95,12 +96,14 @@ use model::arch::qwen35moe::place::{
 use model::placement::PlanLevers;
 use model::placement::workstation::{A6000, CardSpec, RTX_3090};
 use refset::arch::qwen4exp::mtp::DRAFT;
-use runtime::{Advance, Target as _};
+use runtime::Target as _;
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, Saved, ServeError, Server,
     ServerConfig,
 };
 use tokenizer::Tokenizer;
+
+use super::drafted::DraftedSeat;
 
 /// The levers `bloomery-serve-qwen38` acts on, for its own `main` and for
 /// `gate_qwen38_serve`'s (the gate starts the server with its own
@@ -383,25 +386,13 @@ struct SeatArgs {
     draft_bytes: u64,
 }
 
-/// The draft's join to the held sequence, when a call made one: how
-/// many rows it caught up, or why it skips.
-fn print_join(spec: &mut app::arch::qwen3moe::Drafted38) {
-    if let Some(j) = spec.draft_mut().take_joined() {
-        Record::new(&record::MTP_PROMPT)
-            .u("start", j.start)
-            .u("caught_up", j.caught_up)
-            .w("skipped", j.skipped.unwrap_or("none"))
-            .eprint();
-    }
-}
-
 /// The Qwen3.8 session on the engine thread: the session over the model,
 /// the draft it drives when one runs (its windows of four rows through
 /// the runtime's speculative loop), and the positions its stores were
 /// sized for.
 struct Q38 {
     s: app::Session<Body38>,
-    spec: Option<app::arch::qwen3moe::Drafted38>,
+    drafted: DraftedSeat<Body38, { <Body38 as MtpBody>::VERIFY_ROWS }>,
     ctx: usize,
     /// The plan's draft card bytes and arena, for `/props`' `draft` class.
     draft_bytes: u64,
@@ -501,16 +492,10 @@ impl Q38 {
             .into());
         }
         let mut s = app::Session::from_model(m, u32::try_from(a.ctx)?);
-        let spec = match a.mtp {
+        let drafted = DraftedSeat::new(match a.mtp {
             false => None,
             true => {
-                let draft = app::arch::qwen3moe::MtpDraft::open(
-                    s.model(),
-                    app::arch::qwen3moe::Q38Cfg {
-                        prompt: Prompt38::Auto,
-                        draft: MtpMode::Graph,
-                    },
-                )?;
+                let draft = app::mtp::MtpDraft::open(s.model(), Prompt38::Auto, StepMode::Graph)?;
                 struct Captures;
                 impl app::RowsLog for Captures {
                     fn capture_rows(
@@ -522,12 +507,12 @@ impl Q38 {
                         Ok(())
                     }
                 }
-                Some(s.with_draft::<app::arch::qwen3moe::MtpDraft, 4>(draft, &mut Captures)?)
+                Some(s.with_draft(draft, &mut Captures)?)
             }
-        };
+        });
         Ok(Q38 {
             s,
-            spec,
+            drafted,
             ctx: a.ctx,
             draft_bytes: a.draft_bytes,
         })
@@ -548,29 +533,14 @@ impl Seat for Q38 {
     /// under the draft the draft's own prompt call, its store walked over
     /// the prompt's units.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        match &mut self.spec {
-            Some(spec) => {
-                let next = Advance::prompt(spec, &mut self.s, ids)?;
-                print_join(spec);
-                Ok(next)
-            }
-            None => Ok(self.s.prompt(ids, runtime::Want::Argmax)?.argmax()),
-        }
+        self.drafted.prefill(&mut self.s, ids)
     }
 
     /// One step; under the draft the rows it left waiting walked first
     /// (`MtpDraft::before_step`: a request that continues the held
     /// sequence joins it here when its prompt call is empty).
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
-        if let Some(spec) = &mut self.spec {
-            spec.draft_mut().before_step(&mut self.s, last)?;
-            print_join(spec);
-        }
-        let next = self.s.step(last, runtime::Want::Argmax)?.argmax();
-        if let Some(spec) = &mut self.spec {
-            runtime::Draft::stepped(spec.draft_mut(), &mut self.s, last, next)?;
-        }
-        Ok(next)
+        self.drafted.step(&mut self.s, last)
     }
 
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
@@ -578,38 +548,19 @@ impl Seat for Q38 {
     }
 
     fn reset(&mut self) -> Result<(), GateError> {
-        self.s.reset()?;
-        if let Some(spec) = &mut self.spec {
-            spec.draft_mut().restart();
-        }
-        Ok(())
+        self.drafted.reset(&mut self.s)
     }
 
     /// One pass from `last`: under the draft the window of four rows,
     /// its kept tokens and counts; without it one step.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
-        match &mut self.spec {
-            Some(spec) => {
-                let c = Advance::pass(spec, &mut self.s, last, out)?;
-                Ok(Drafted {
-                    proposed: if c.proposed { c.rows - 1 } else { 0 },
-                    accepted: c.kept - 1,
-                })
-            }
-            None => {
-                out.push(self.step(last)?);
-                Ok(Drafted::default())
-            }
-        }
+        self.drafted.pass(&mut self.s, last, out)
     }
 
     /// The most positions one pass runs: the draft's four rows, or one
     /// step without it.
     fn pass_rows(&self) -> usize {
-        match self.spec {
-            Some(_) => 4,
-            None => 1,
-        }
+        self.drafted.pass_rows()
     }
 
     /// The commit's rule, `Body38::kept`: with no verify waiting only
@@ -641,7 +592,7 @@ impl Seat for Q38 {
     /// file, its width and its resident bytes as the card's `draft`
     /// class.
     fn props(&self, mut p: EngineProps) -> EngineProps {
-        if self.spec.is_none() {
+        if !self.drafted.drafts() {
             return p;
         }
         if let Some(place) = p.placement.as_mut() {
@@ -653,7 +604,7 @@ impl Seat for Q38 {
         }
         p.draft = Some(DraftProps {
             model: "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf".to_owned(),
-            n_max: Some(3),
+            n_max: Some(<Body38 as MtpBody>::WIDTH as u64),
             kind: Some("mtp".to_owned()),
             path: Some(DRAFT.to_owned()),
             device: None,

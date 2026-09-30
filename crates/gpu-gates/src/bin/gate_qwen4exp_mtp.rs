@@ -1749,8 +1749,8 @@ mod gate {
         let mut m = m;
         m.reset()?;
         let mut s = app::Session::from_model(m, ctx);
-        let draft = app::arch::qwen3moe::MtpDraft::open(s.model(), cfg)?;
-        let spec = s.with_draft::<app::arch::qwen3moe::MtpDraft, 4>(draft, &mut Quiet)?;
+        let draft = app::mtp::MtpDraft::open(s.model(), cfg.prompt, cfg.draft)?;
+        let spec = s.with_draft::<app::mtp::MtpDraft<Body38>, 4>(draft, &mut Quiet)?;
         Ok((s, spec))
     }
 
@@ -1980,7 +1980,7 @@ mod gate {
             .count();
         let cfg = app::arch::qwen3moe::Q38Cfg {
             prompt: path,
-            draft: MtpMode::Eager,
+            draft: bloomery_gpu::model::StepMode::Eager,
         };
         let (mut s, mut spec) = drafted_session(m, cfg, ctx)?;
         spec.prompt(&mut s, prompt)?;
@@ -2028,7 +2028,7 @@ mod gate {
     fn step_cfg(path: Prompt38) -> app::arch::qwen3moe::Q38Cfg {
         app::arch::qwen3moe::Q38Cfg {
             prompt: path,
-            draft: MtpMode::Graph,
+            draft: bloomery_gpu::model::StepMode::Graph,
         }
     }
 

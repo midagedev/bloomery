@@ -8,8 +8,12 @@
 //!
 //! A seat's module is its contract's owner: read it for the flags, the
 //! records, the keep rule and the prompt cache. [`glm`] is the GLM-5.3-Flash
-//! seat, opened as `generate_glm5next` opens the model.
+//! seat, opened as `generate_glm5next` opens the model. `drafted` is the
+//! seats' shared MTP draft driver, one file a seat's per-model binary
+//! includes beside the seat.
 
+#[cfg(feature = "deepseek41")]
+mod drafted;
 #[cfg(feature = "deepseek41")]
 pub mod ds41;
 #[cfg(feature = "glm5next")]
