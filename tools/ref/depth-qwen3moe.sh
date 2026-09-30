@@ -1357,8 +1357,11 @@ ours_post() {
   mtp+=$RS_COL
   # The prompt_ids line is the whole prompt; the load, capture, step-0, time prompt and stat prompt
   # lines are the arm's configuration, the prefill's time and its host prologue; under
-  # BLOOMERY_STEP_STATS the ubatch walk's split and per-layer-batch records follow.
-  echo "$out" | grep -E '^(load|capture|step 0|time prompt|stat prompt|stat prompt38 split|stat prompt38 lb) '
+  # BLOOMERY_STEP_STATS the ubatch walk's split and per-layer-batch records follow, then each generated
+  # step's host counters and their summary (the host slots a step, from which the residency hit reads).
+  # An MTP arm's window walls and kept rows, a residency arm's boundaries and the greedy ids stay in the
+  # log beside the row that sums them.
+  echo "$out" | grep -E '^(load|capture|step 0|time prompt|stat prompt|stat prompt38 split|stat prompt38 lb|stat step|stat summary|residency pass|mtp summary|time pass|tokens) '
   warmcol=$(echo "$smoke" | sed -n 's/.* warm=\([0-9]*\).*/\1/p')
   nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
   [ -n "$nodes" ] || nodes=$(sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p' <<< "${LG_HEADER:-}")
