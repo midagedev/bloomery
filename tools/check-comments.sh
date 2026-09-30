@@ -91,6 +91,14 @@ WORD_ALLOW=(
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || { echo "check-comments: not a git work tree — the retired-word rule reads the tracked files; no verdict" >&2; exit 69; }
 words=$(git grep --untracked -nIiE -- "$RETIRED_WORDS" || [ "$?" = 1 ])
+# The English word wrapped across a line break ("… a h""ot" / "// list …"), which a line grep cannot see; reported
+# at the line the word starts on.
+split=$(git grep --untracked -zIl -e . | xargs -0 awk '
+  FNR == 1 { prev = "" }
+  { cur = tolower($0) }
+  prev ~ /h[o]t[ -]?$/ && cur ~ /^[[:space:]]*[\/!#*-]*[[:space:]]*list/ { print FILENAME ":" FNR - 1 ":" last " / " $0 }
+  { prev = cur; last = $0 }')
+[ -n "$split" ] && words=$(printf '%s\n%s\n' "$words" "$split" | sed '/^$/d')
 wunmatched=()
 wallowed=0
 for a in "${WORD_ALLOW[@]}"; do

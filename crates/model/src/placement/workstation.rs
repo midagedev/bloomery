@@ -226,8 +226,8 @@ pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> T
 }
 
 /// Plan (b′): the A6000 runs all `layers` and the head as in [`plan_a`];
-/// the 3090 is an expert tier beside the host, holding each layer's next hot
-/// ranks, with `draft_bytes` — the DSpark draft's resident bytes
+/// the 3090 is an expert tier beside the host, holding each layer's next ids
+/// after the stage's prefix, with `draft_bytes` — the DSpark draft's resident bytes
 /// (`model::arch::dspark::card_bytes`), when the draft lives there — as a
 /// named reserve, and the tier's prompt-batch service `batch`
 /// ([`tier_batch_bytes`]) as named reserves on the tier and the host.

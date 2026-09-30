@@ -3,8 +3,7 @@
 //! ports); [`Hybrid`] is the tier's name at the call sites that have not
 //! moved to it. What stays here is V2-Lite's own lever: the prefix `[0, n_l)`
 //! of every MoE layer on the card ([`HybridConfig`], [`SlotMap::prefix`]); a
-//! V4.1 card holds its plan's `ExpertList` per layer — the id prefix or a hot
-//! list's ranked ids.
+//! V4.1 card holds its plan's `ExpertList` per layer, the id prefix.
 
 use crate::GpuError;
 use gguf::Split;

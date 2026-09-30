@@ -156,8 +156,7 @@
 //!   below `Prompt38::GEMM_FROM` positions and the ubatch from it.
 //! - (k) the card leg: after every clause above, the host plan's model
 //!   dropped, the card rule's plan (`place::Experts::Card`: each eligible
-//!   layer's id prefix on the card, or its `n_l` hottest ids under a hot
-//!   list) loaded on the same card. Its step graph
+//!   layer's id prefix on the card) loaded on the same card. Its step graph
 //!   holds [`NODES_DECODE_CARD`] nodes over [`CARD_LAYERS`] card layers, the
 //!   program's count. The pass's places entry, on synthetic ids at the
 //!   router's pitch, writes each slot's place, [`HOST`] and `expert_id` for

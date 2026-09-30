@@ -1,5 +1,5 @@
-# The public V4.1-Flash table in one window on the A6000: ours (placement (a), r8 sidecar, lcg ids, no hot
-# list) against llama.cpp's V4.1 PR branch (#28696 at 5210c7c; the PR carries three commits by this
+# The public V4.1-Flash table in one window on the A6000: ours (placement (a), r8 sidecar, lcg ids, the id-prefix
+# placement) against llama.cpp's V4.1 PR branch (#28696 at 5210c7c; the PR carries three commits by this
 # repository's author, which the table's caption says). llama.cpp runs at its fastest flags we can name:
 # the hand-set placement (--n-cpu-moe 33, the profile's LCPP_GPU_FLAGS) and llama-bench's own fit
 # (-fitt 1024, fitarm), each with the -ub/-b 4096 lever on the P = 4096 prompt; the table publishes the

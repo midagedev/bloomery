@@ -493,8 +493,8 @@ def routing_prose_trace(p):
 
 
 def routing_prose(p, P=512):
-    """prose: the prose prompt the lease feeds (corpus-prose.ids, the first 512) under plan (a) and hot
-    list 384, from the trace's per-layer rank curve. Three facts the trace alone does not give:
+    """prose: the prose prompt the lease feeds (corpus-prose.ids, the first 512) under plan (a) and a
+    384-per-layer router-frequency list (since deleted from the engine), from the trace's per-layer rank curve. Three facts the trace alone does not give:
     layers below card_first_layer hold no card expert (plan (a)); the frequency list is learned from other
     sets too, so the card holds the trace's ranks [s, s + n_l) instead of [0, n_l) — the prompt's s
     hottest experts stay on the host (prose_swap, fixed by the prompt's host-slot count); and a
