@@ -28,3 +28,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/qwen38.rs"]
 mod qwen38;
+
+// The seat's MTP draft driver, a sibling of the seat as in `bloomery-serve`.
+#[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/drafted.rs"]
+mod drafted;

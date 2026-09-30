@@ -8,12 +8,10 @@ use bloomery_gpu::arch::qwen3moe::{
     Body38, MTP_GRAPH_ROWS, MTP_ROWS, Mtp38, MtpFeed, MtpHead, MtpHidden, MtpMode, Prompt38,
     Qwen38Model, TargetRows,
 };
-use bloomery_gpu::model::{Rows, StepMode};
-use runtime::{Advance, Draft};
+use bloomery_gpu::model::Rows;
 
-use super::{Drafted38, MtpDraft, WHAT};
-use crate::Session;
-use crate::mtp::{Feed, Hidden, MtpBody, UnitSink};
+use super::WHAT;
+use crate::mtp::{Feed, Hidden, MtpBody, UnitSink, WalkMode};
 
 impl MtpBody for Body38 {
     /// A proposal fills the widest verify the GDN lanes hold.
@@ -56,7 +54,7 @@ impl MtpBody for Body38 {
         m: &mut Qwen38Model,
         feed: Feed<'_, TargetRows>,
         head: MtpHead,
-        mode: StepMode,
+        mode: WalkMode,
     ) -> Result<(), GpuError> {
         m.mtp_walk(mtp_feed(feed), head, mtp_mode(mode))
     }
@@ -66,7 +64,7 @@ impl MtpBody for Body38 {
         refresh: Feed<'_, TargetRows>,
         own: usize,
         head: MtpHead,
-        mode: StepMode,
+        mode: WalkMode,
         out: &mut [u32],
     ) -> Result<usize, GpuError> {
         let d = m.mtp_chain(mtp_feed(refresh), own, head, mtp_mode(mode))?;
@@ -82,12 +80,9 @@ impl MtpBody for Body38 {
     }
 }
 
-// The adapter's widths are the ones Qwen3.8's draft and window run, and
-// a refresh of a whole verify's rows is a captured walk.
+// The adapter's widths fit together, and a refresh of a whole verify's
+// rows is a captured walk.
 const _: () = <Body38 as MtpBody>::FITS;
-const _: () = assert!(<Body38 as MtpBody>::WIDTH == <MtpDraft as Draft<Session<Body38>>>::WIDTH);
-const _: () =
-    assert!(<Body38 as MtpBody>::VERIFY_ROWS == <Drafted38 as Advance<Session<Body38>>>::ROWS);
 const _: () = assert!(<Body38 as MtpBody>::VERIFY_ROWS <= MTP_GRAPH_ROWS);
 
 /// The shared feed as Qwen3.8's: always [`MtpFeed::Rows`], which the window
@@ -103,33 +98,35 @@ fn mtp_feed(f: Feed<'_, TargetRows>) -> MtpFeed<'_> {
     }
 }
 
-/// The walk mode as Qwen3.8's.
-fn mtp_mode(m: StepMode) -> MtpMode {
+/// The walk mode as Qwen3.8's: each shared mode is one of the draft's own,
+/// the store-only walk included.
+fn mtp_mode(m: WalkMode) -> MtpMode {
     match m {
-        StepMode::Eager => MtpMode::Eager,
-        StepMode::Graph => MtpMode::Graph,
+        WalkMode::Eager => MtpMode::Eager,
+        WalkMode::Graph => MtpMode::Graph,
+        WalkMode::Store => MtpMode::Store,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{mtp_feed, mtp_mode};
-    use crate::mtp::{Feed, Hidden};
+    use crate::mtp::{Feed, Hidden, WalkMode};
     use bloomery_gpu::arch::qwen3moe::{MtpFeed, MtpHidden, MtpMode, TargetRows};
-    use bloomery_gpu::model::StepMode;
 
     /// The shared walk mode and feed map onto Qwen3.8's one to one: each
     /// value comes back from its image as itself, and a variant added to
     /// either walk mode or to the shared hidden source fails to compile.
     #[test]
     fn feed_and_mode_map_one_to_one() {
-        fn mode_back(m: MtpMode) -> StepMode {
+        fn mode_back(m: MtpMode) -> WalkMode {
             match m {
-                MtpMode::Eager => StepMode::Eager,
-                MtpMode::Graph => StepMode::Graph,
+                MtpMode::Eager => WalkMode::Eager,
+                MtpMode::Graph => WalkMode::Graph,
+                MtpMode::Store => WalkMode::Store,
             }
         }
-        for m in [StepMode::Eager, StepMode::Graph] {
+        for m in [WalkMode::Eager, WalkMode::Graph, WalkMode::Store] {
             assert_eq!(mode_back(mtp_mode(m)), m);
         }
 
