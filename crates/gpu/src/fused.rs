@@ -306,6 +306,13 @@ mod fused_kernels {
     ) {
         static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
 
+        // One block: the kernel has no row index — every block would write the
+        // same `kv_s`, `kvr` and cache cells. The launcher's grid is exactly 1,
+        // so this fires only on a larger grid, whose extra blocks it keeps off
+        // every buffer. Block-uniform, before any access or barrier.
+        if thread::blockIdx_x() != 0 {
+            return;
+        }
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
         let k = latent as usize;
@@ -364,7 +371,9 @@ mod fused_kernels {
             // the kv_s slot is it < k < width <= kv_s.len(), the kvr slot is
             // nd + it < width <= kvr.len(), and the cache slot is
             // crow + nd + it < (pos + 1) * width <= dst_rows * width <=
-            // cache.len() because `live` bounds pos below dst_rows.
+            // cache.len() because `live` bounds pos below dst_rows. Each slot
+            // is this thread's alone: `it` is its own stride of the grid's one
+            // block (the guard above).
             unsafe {
                 let g = *gain.get_unchecked(it);
                 let v = *kv_a.get_unchecked(it);
@@ -386,7 +395,9 @@ mod fused_kernels {
             // SAFETY: d + 1 < nd, so the kv_a reads stay below k + nd <=
             // kv_a.len(), the cs reads below nd <= cs.len(), the kv_s slots
             // below width, the kvr slots below nd <= width, and the cache
-            // slots below (pos + 1) * width <= cache.len() under `live`.
+            // slots below (pos + 1) * width <= cache.len() under `live`; the
+            // pair is this thread's alone in the grid's one block (the guard
+            // above).
             unsafe {
                 let x0 = *kv_a.get_unchecked(k + d);
                 let x1 = *kv_a.get_unchecked(k + d + 1);

@@ -162,7 +162,9 @@ mod moe_fused_kernels {
         if d >= rows as usize {
             return;
         }
-        let acc = weighted_expert_sum(down, w, rows, n_slots, 0, d);
+        // SAFETY: m = 1: t = 0 < 1 and d < rows (the guard above); the launch
+        // contract gives down.len() >= rows·n_slots and w.len() >= n_slots.
+        let acc = unsafe { weighted_expert_sum(down, w, rows, n_slots, 0, d) };
         // SAFETY: d < rows bounds the shexp/resid reads and the y store by
         // the launch contract.
         unsafe {

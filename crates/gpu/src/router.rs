@@ -136,6 +136,14 @@ mod router_kernels {
 
         let t = thread::index_1d().get();
         if m == 1 {
+            // One block: the launcher's grid is exactly 1 (`enqueue_router_topk`),
+            // so this fires only on a larger grid, whose extra blocks it keeps
+            // off `probs`, `weights`, `ids` and a `P` no thread of theirs wrote.
+            // Block-uniform, before any access or barrier; past it `t` is
+            // `threadIdx_x`.
+            if thread::blockIdx_x() != 0 {
+                return;
+            }
             // The refusal first: lane L tests experts L and L + 32, and one
             // ballot refuses the token — warp-uniform, so the whole block
             // returns together and no barrier below is skipped by half of it.
@@ -144,7 +152,7 @@ mod router_kernels {
             let (x0, x1) = unsafe { (*x.get_unchecked(lane), *x.get_unchecked(lane + 32)) };
             if warp::ballot(!(x0.is_finite() & x1.is_finite())) != 0 {
                 // SAFETY: lane + 32 < 64 <= probs.len(); the two slots are
-                // this lane's own.
+                // this lane's own, in the grid's one block (the guard above).
                 unsafe {
                     *probs.get_unchecked_mut(lane) = f32::NAN;
                     *probs.get_unchecked_mut(lane + 32) = f32::NAN;
@@ -153,8 +161,8 @@ mod router_kernels {
                     fault.raise(FaultSite::Router);
                     let mut s = 0usize;
                     while s < N_USED {
-                        // SAFETY: s < 6 <= weights.len(); lane 0 alone
-                        // writes them.
+                        // SAFETY: s < 6 <= weights.len(); lane 0 of the
+                        // grid's one block (the guard above) alone writes them.
                         unsafe { *weights.get_unchecked_mut(s) = f32::NAN };
                         s += 1;
                     }
@@ -164,8 +172,9 @@ mod router_kernels {
             // SAFETY: P is this block's own shared allocation; the raw form
             // is the only way to reach it without a reference to a
             // `static mut`. Every index below is an expert id < N_EXPERT, and
-            // lane 0's writes precede every other lane's reads by
-            // `sync_threads`.
+            // thread 0's writes precede every other lane's reads by
+            // `sync_threads` — `t == 0` is this block's thread 0 (the guard
+            // above).
             let p = unsafe { SharedArray::as_raw_mut_ptr(&raw mut P) };
             if t == 0 {
                 // Passes 1-3, the module doc's orders op for op — the serial
@@ -248,10 +257,11 @@ mod router_kernels {
                 taken |= 1u64 << bi;
                 if t == 0 {
                     // SAFETY: bi < 64 — inside P; s < 6 <= ids.len() and
-                    // weights.len() by the launch contract. The weight is
-                    // read from the winner's slot rather than from the
-                    // comparison, so a prob no comparison won is carried
-                    // through unchanged.
+                    // weights.len() by the launch contract, and thread 0 of
+                    // the grid's one block (the guard above) alone writes
+                    // them. The weight is read from the winner's slot rather
+                    // than from the comparison, so a prob no comparison won is
+                    // carried through unchanged.
                     unsafe {
                         let w = *p.add(bi as usize) * scale;
                         *ids.get_unchecked_mut(s) = bi;
