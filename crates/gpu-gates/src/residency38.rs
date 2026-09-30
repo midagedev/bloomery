@@ -1,7 +1,8 @@
-//! The residency a qwen4exp load runs, for every binary that loads one
-//! (`generate_qwen3moe`, the Qwen3.8 serve seat): the lever's word as set,
-//! or unset the Qwen3.8 rule's (`bloomery_levers::residency38_unset` before
-//! the plan, `residency38_at_plan` on it), with the records that say which.
+//! The residency a load runs and the records that say which: a set word on
+//! any model's plan ([`residency_set`], the churn pool of the card it names;
+//! `generate_glm5next`), and a qwen4exp load's lever, set or unset by the
+//! Qwen3.8 rule (`bloomery_levers::residency38_unset` before the plan,
+//! `residency38_at_plan` on it; `generate_qwen3moe`, the Qwen3.8 serve seat).
 
 use crate::GateError;
 use crate::record::{self, Record};
@@ -68,11 +69,26 @@ pub fn residency38(
             (residency, pick.word())
         }
     };
+    residency_set(plan, CARD38, residency, &word, emit)
+}
+
+/// A load of `plan` under `residency`, the word `word` names, whatever the
+/// model: under `mid`, the `residency host` record of `plan` handed to
+/// `emit` — the churn pool (card `card`'s experts past the pinned ones) the
+/// load's host set holds beside the plan's host segments, refused by name
+/// when the plan cannot give it; `off` as it is, with no record.
+pub fn residency_set(
+    plan: &Plan<'_>,
+    card: usize,
+    residency: Residency,
+    word: &str,
+    emit: fn(Record),
+) -> Result<Residency, GateError> {
     let Residency::Mid { pinned, .. } = residency else {
         return Ok(residency);
     };
-    let pool = ChurnPool::of(plan, CARD38, pinned)
+    let pool = ChurnPool::of(plan, card, pinned)
         .map_err(|e| format!("BLOOMERY_RESIDENCY={word}: the churn pool: {e}"))?;
-    emit(record::residency_host(&word, &pool, plan));
+    emit(record::residency_host(word, &pool, plan));
     Ok(residency)
 }
