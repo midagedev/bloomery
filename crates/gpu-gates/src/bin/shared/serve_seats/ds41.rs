@@ -69,8 +69,10 @@
 //! line, the pair pass captured after the step. Every greedy token after a
 //! request's first then comes out of a pass (`serve::Engine::advance`), and
 //! a request that needs the logits row — `temperature` above 0 (llama-server's
-//! default 0.8 included) or `ignore_eos` — is a 400 naming the field.
-//! `timings` carry `draft_n` and `draft_n_accepted`, `/metrics` their sums,
+//! default 0.8 included) or `ignore_eos` — takes plain steps, each step's row
+//! the target's (the draft writes only its own card's buffers or host tables).
+//! A greedy request's `timings` carry `draft_n` and `draft_n_accepted`,
+//! `/metrics` their sums,
 //! and `/props`' `engine.draft` names the draft (its kind, file and device),
 //! whose card's placement row holds its resident bytes as the class `draft`.
 //!

@@ -53,11 +53,40 @@ where
     /// sequence joins it here when its prompt call is empty), then the step
     /// told to the draft ([`Draft::stepped`]).
     pub(crate) fn step(&mut self, s: &mut Session<B>, last: u32) -> Result<u32, GateError> {
+        self.step_reading(s, last, None)
+    }
+
+    /// [`DraftedSeat::step`] with the target's logits of the step into `row`
+    /// (`n_vocab` f32), read after the target's step and before the step is
+    /// told to the draft: whatever the draft's walks write, the row is the
+    /// target's.
+    pub(crate) fn step_with_row(
+        &mut self,
+        s: &mut Session<B>,
+        last: u32,
+        row: &mut [f32],
+    ) -> Result<u32, GateError> {
+        self.step_reading(s, last, Some(row))
+    }
+
+    /// The step's order, the one owner of it: the draft's waiting rows, the
+    /// target's step, the target's row when asked, then the draft told.
+    fn step_reading(
+        &mut self,
+        s: &mut Session<B>,
+        last: u32,
+        row: Option<&mut [f32]>,
+    ) -> Result<u32, GateError> {
         if let Some(spec) = &mut self.spec {
             spec.draft_mut().before_step(s, last)?;
             print_join(spec);
         }
         let next = s.step(last, Want::Argmax)?.argmax();
+        if let Some(row) = row {
+            s.model()
+                .logits_into(row)
+                .map_err(|e| format!("logits of the step: {e}"))?;
+        }
         if let Some(spec) = &mut self.spec {
             Draft::stepped(spec.draft_mut(), s, last, next)?;
         }
