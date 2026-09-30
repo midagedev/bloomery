@@ -78,6 +78,18 @@
 //! every arm writes when they all write the same count. The run ends with
 //! `route trace <dir> positions=<n> complete` once the set is sealed.
 //!
+//! `BLOOMERY_RESIDENCY` resolves first thing, unset to `off`, and prints as a
+//! `residency lever` record on every run. Set to `mid-p<P>-s<S>` on a
+//! qwen4exp file (plain or drafted, either `--place`), the load runs the
+//! common residency machine over the card's routed stacks
+//! (`Body38::open_placed_residency`): a `residency host` record follows the
+//! `plan` line, each arm prints its boundaries' `residency pass` records
+//! after its other lines — after its error, when it failed — and each arm
+//! after the first opens with the `residency reset` record of the clear
+//! before it. `mid-…` is
+//! refused by name on a qwen3moe or qwen35moe file, under `--dump-taps` and
+//! beside `BLOOMERY_ROUTE_TRACE`, and by the body at a step-fed prompt.
+//!
 //! Under `BLOOMERY_DRAFT=mtp` (a qwen4exp file only; every other family and
 //! word is refused by name) the decode runs through the runtime's
 //! speculative loop with the file's MTP draft (`app::arch::qwen4exp`'s
@@ -208,14 +220,16 @@ mod cli {
         Body, Body35, Body38, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
         Qwen35moeModel, Qwen38Model,
     };
+    use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
+    use bloomery_gpu::host::swap::{PassReport, Residency};
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, ref_model_path};
-    use bloomery_levers::Levers;
+    use bloomery_levers::{Levers, ResidencyAt, ResidencyPick};
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::Arch;
@@ -223,8 +237,9 @@ mod cli {
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
     };
-    use model::placement::PlanLevers;
+    use model::placement::churn::ChurnPool;
     use model::placement::workstation::{A6000, RTX_3090};
+    use model::placement::{Plan, PlanLevers};
     use refset::arch::qwen4exp::mtp::draft_file;
     use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
     use std::num::NonZeroUsize;
@@ -376,6 +391,15 @@ mod cli {
         /// with no trace.
         fn finish_trace(_m: &mut GpuModel<Self>) -> Result<Option<(PathBuf, u64)>, GateError> {
             Ok(None)
+        }
+
+        /// The residency boundaries' reports since the last take, each with
+        /// the kind of the pass it ended; none for a body with no residency
+        /// machine.
+        fn residency_passes(
+            _m: &mut GpuModel<Self>,
+        ) -> Result<Vec<(PassKind, PassReport)>, GateError> {
+            Ok(Vec::new())
         }
     }
 
@@ -674,6 +698,12 @@ mod cli {
             let dir = t.dir().to_path_buf();
             Ok(Some((dir, t.finish()?)))
         }
+
+        /// [`Body38::take_residency_passes`]: empty unless the load runs the
+        /// machine and [`log38`] asked for the log.
+        fn residency_passes(m: &mut Qwen38Model) -> Result<Vec<(PassKind, PassReport)>, GateError> {
+            Ok(m.body_parts("generate_qwen3moe")?.2.take_residency_passes())
+        }
     }
 
     /// The refusal of `--seed-depth D` on a qwen4exp file.
@@ -760,8 +790,14 @@ mod cli {
             bloomery_levers::DRAFT,
             bloomery_levers::MTP_HEAD_ROWS,
             bloomery_levers::MTP_DRAFT,
+            bloomery_levers::RESIDENCY,
         ])?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
+        // Unset is `off` here: the machine runs over a qwen4exp load only when
+        // the lever asks for it.
+        let pick = levers.residency_at(ResidencyAt::FIXED);
+        record::residency_lever(pick).print();
+        let residency = Residency::parse(pick.word)?;
         let experts = experts38(&levers)?;
         // Unset, the lever is a qwen4exp plan's card experts and nothing on
         // another family's file; only a set `card` is refused there.
@@ -787,6 +823,14 @@ mod cli {
                      qwen3moe file"
                         .into(),
                 );
+            }
+            if residency != Residency::Off {
+                return Err(format!(
+                    "BLOOMERY_RESIDENCY={} moves a qwen4exp plan's card experts; --dump-taps runs \
+                     a qwen3moe file",
+                    pick.word
+                )
+                .into());
             }
             return dump_taps(&dir);
         }
@@ -865,6 +909,25 @@ mod cli {
                  qwen35moe plan holds every one on the card"
                     .into(),
             );
+        }
+        if family != Family::Qwen38 && residency != Residency::Off {
+            return Err(format!(
+                "BLOOMERY_RESIDENCY={} moves a qwen4exp plan's card experts; a qwen3moe or \
+                 qwen35moe plan holds every one on the card",
+                pick.word
+            )
+            .into());
+        }
+        // The trace is the input the residency model replays under a fixed
+        // seed; under the machine its slot files would record the machine's
+        // own moves.
+        if residency != Residency::Off && levers.route_trace().is_some() {
+            return Err(format!(
+                "BLOOMERY_ROUTE_TRACE records a fixed placement's routing; \
+                 BLOOMERY_RESIDENCY={} moves the slot map under it",
+                pick.word
+            )
+            .into());
         }
         if family == Family::Qwen38 && draft == Draft38::Off && levers.mtp_head_rows().is_some() {
             return Err(
@@ -976,7 +1039,15 @@ mod cli {
                         arms_chunk(&arms),
                         timed,
                     )?;
-                    let mut m = open_qwen38(file, &levers, (ctx, mode), (path, place, experts), t)?;
+                    let mut m = open_qwen38(
+                        file,
+                        &levers,
+                        (ctx, mode),
+                        (path, place, experts),
+                        (residency, pick),
+                        t,
+                    )?;
+                    log38(&mut m, residency, &arms)?;
                     if let Some(t) = trace {
                         m.body_parts("generate_qwen3moe")?
                             .2
@@ -994,8 +1065,15 @@ mod cli {
                                 .into(),
                         );
                     }
-                    let (mut m, cfg) =
-                        open_qwen38_mtp(file, &levers, (ctx, mode), (path, place, experts), t)?;
+                    let (mut m, cfg) = open_qwen38_mtp(
+                        file,
+                        &levers,
+                        (ctx, mode),
+                        (path, place, experts),
+                        (residency, pick),
+                        t,
+                    )?;
+                    log38(&mut m, residency, &arms)?;
                     m.set_prompt38_stats(run.stats)?;
                     drive38_mtp(m, cfg, &run, &arms, listed, sync)
                 }
@@ -1326,14 +1404,17 @@ mod cli {
     }
 
     /// The Qwen3.8-Flash-Next model of `file`, placed by its plan on the
-    /// card `place` names, its routed experts where `experts` says: the
-    /// `plan` and `load` lines, and in graph mode the step captured and its
-    /// `capture` line, its node kinds held to the program's count.
+    /// card `place` names, its routed experts where `experts` says, under
+    /// `residency` (the lever's word `pick`): the `plan` line, under `mid`
+    /// the `residency host` line, the `load` line, and in graph mode the step
+    /// captured and its `capture` line, its node kinds held to the program's
+    /// count.
     fn open_qwen38(
         file: Split,
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
         (path, place, experts): (Prompt38, Place38, Experts),
+        (residency, pick): (Residency, ResidencyPick),
         t: Instant,
     ) -> Result<Qwen38Model, GateError> {
         let inputs = PlanInputs::describe(&file)?;
@@ -1361,7 +1442,16 @@ mod cli {
                 .u("card_experts", plan.cards[0].experts)
                 .line()
         );
-        let mut m = Body38::open_placed(file, &plan, &inputs, 0, levers.host(), ub)?;
+        residency_host38(&plan, residency, pick)?;
+        let mut m = Body38::open_placed_residency(
+            file,
+            &plan,
+            &inputs,
+            CARD38,
+            levers.host(),
+            ub,
+            residency,
+        )?;
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
         println!(
@@ -1382,9 +1472,10 @@ mod cli {
     }
 
     /// The Qwen3.8-Flash-Next model of `file` with its MTP draft loaded
-    /// beside it (`Body38::open_placed_mtp`, the draft file `draft_file`
-    /// picks, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`): the `plan`, `load`, `load
-    /// draft=mtp` and `capture` lines of the plain open, the draft's own
+    /// beside it (`Body38::open_placed_mtp_residency`, the draft file `draft_file`
+    /// picks, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`): the `plan`,
+    /// `residency host`, `load`, `load draft=mtp` and `capture` lines of the
+    /// plain open, the draft's own
     /// resident bytes, its program's arena and its head named on the draft's
     /// line. In graph mode the verify passes of 2 to 4 rows are captured by
     /// the session's `with_draft`, whose log prints each width's nodes.
@@ -1393,6 +1484,7 @@ mod cli {
         levers: &Levers,
         (ctx, mode): (usize, StepMode),
         (path, place, experts): (Prompt38, Place38, Experts),
+        (residency, pick): (Residency, ResidencyPick),
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg), GateError> {
         let inputs = PlanInputs::describe(&file)?;
@@ -1434,15 +1526,17 @@ mod cli {
                 .u("card_experts", plan.plan.cards[0].experts)
                 .line()
         );
-        let mut m = Body38::open_placed_mtp(
+        residency_host38(&plan.plan, residency, pick)?;
+        let mut m = Body38::open_placed_mtp_residency(
             file,
             &plan,
             &inputs,
-            0,
+            CARD38,
             levers.host(),
             ub,
             &draft_split,
             &mtp,
+            residency,
         )?;
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
@@ -1480,6 +1574,40 @@ mod cli {
                 draft: mode,
             },
         ))
+    }
+
+    /// The plan's card a qwen4exp open loads: its one card.
+    const CARD38: usize = 0;
+
+    /// Under `mid`, the `residency host` record of `plan`: the churn pool
+    /// (card [`CARD38`]'s experts past the pinned ones) the load's host set
+    /// holds beside the plan's host segments, which the load refuses by name
+    /// when the plan's host headroom cannot take it; nothing under `off`.
+    fn residency_host38(
+        plan: &Plan<'_>,
+        residency: Residency,
+        pick: ResidencyPick,
+    ) -> Result<(), GateError> {
+        let Residency::Mid { pinned, .. } = residency else {
+            return Ok(());
+        };
+        let pool = ChurnPool::of(plan, CARD38, pinned)
+            .map_err(|e| format!("BLOOMERY_RESIDENCY={}: the churn pool: {e}", pick.word))?;
+        record::residency_host(pick.word, &pool, plan).print();
+        Ok(())
+    }
+
+    /// Under `mid`, keep the residency boundaries' reports for the `residency
+    /// pass` records each arm prints after its lines; nothing under `off`.
+    fn log38(m: &mut Qwen38Model, residency: Residency, arms: &[Arm]) -> Result<(), GateError> {
+        if residency == Residency::Off {
+            return Ok(());
+        }
+        // An arm's boundaries: its prompt call's, then at most one a
+        // generated token (a step, or a verify keeping at least one).
+        let passes = arms.iter().map(|a| a.n_gen).max().unwrap_or(0) + 1;
+        m.body_parts("generate_qwen3moe")?.2.log_residency(passes);
+        Ok(())
     }
 
     /// In graph mode: capture the decode step and hold its node kinds to the
@@ -1539,6 +1667,9 @@ mod cli {
         let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         let count = arms.len();
         let ran = s.arms(arms, |s, i, arm| {
+            if let Some(c) = s.take_cleared() {
+                record::residency_reset(&c).print();
+            }
             if listed {
                 println!(
                     "arm i={i} arms={count} ids={} n={}",
@@ -1555,7 +1686,8 @@ mod cli {
                 }
                 println!("prompt_ids {:?}", arm.ids);
             }
-            run_arm(s.model_mut(), run, path, arm)
+            let ran = run_arm(s.model_mut(), run, path, arm);
+            after_passes(s.model_mut(), ran)
         });
         ran.map_err(|f| Box::new(f) as GateError)?;
         if let Some((dir, rows)) = B::finish_trace(s.model_mut())? {
@@ -1596,6 +1728,9 @@ mod cli {
             if i > 0 {
                 s.clear()?;
                 spec.draft_mut().restart();
+                if let Some(c) = s.take_cleared() {
+                    record::residency_reset(&c).print();
+                }
             }
             if listed {
                 println!(
@@ -1613,7 +1748,33 @@ mod cli {
                 }
                 println!("prompt_ids {:?}", arm.ids);
             }
-            run_arm38_mtp(&mut s, &mut spec, path, run, arm)?;
+            let ran = run_arm38_mtp(&mut s, &mut spec, path, run, arm);
+            after_passes(s.model_mut(), ran)?;
+        }
+        Ok(())
+    }
+
+    /// An arm's result `ran`, with the `residency pass` records of its
+    /// boundaries printed after it ([`print_passes`]): a failed print is the
+    /// arm's error, and when the arm failed too the error names both.
+    fn after_passes<B: Prompted, T>(
+        m: &mut GpuModel<B>,
+        ran: Result<T, GateError>,
+    ) -> Result<T, GateError> {
+        match (ran, print_passes(m)) {
+            (ran, Ok(())) => ran,
+            (Ok(_), Err(p)) => Err(p),
+            (Err(r), Err(p)) => {
+                Err(format!("{r}; then printing the residency passes after it: {p}").into())
+            }
+        }
+    }
+
+    /// The `residency pass` records of the boundaries since the last print,
+    /// after the arm's lines: nothing prints between two timed steps.
+    fn print_passes<B: Prompted>(m: &mut GpuModel<B>) -> Result<(), GateError> {
+        for (kind, r) in B::residency_passes(m)? {
+            record::residency_pass_of(kind, &r).print();
         }
         Ok(())
     }

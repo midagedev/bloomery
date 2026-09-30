@@ -329,14 +329,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::C,
         kind: Kind::Words(&["off", "mid-p0-s1", "mid-p40-s1"]),
         default: Unset::Means(
-            "follows the placement: `mid-p40-s1` under `--place a` and `bp`, `off` under `gate`, \
-             beside `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or `BLOOMERY_PREFILL=steps`, \
-             and in every other binary",
+            "V4.1 follows the placement: `mid-p40-s1` under `--place a` and `bp`, `off` under \
+             `gate`, beside `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or \
+             `BLOOMERY_PREFILL=steps`; `off` in `generate_qwen3moe` and in every other binary",
         ),
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
               stage card's routed stacks, the first P seed experts of each layer never a victim \
-              and S slots a layer freed for flips in flight. V4.1 only, under `--place a` and \
+              and S slots a layer freed for flips in flight. V4.1 under `--place a` and \
               `bp` (`generate_ds41`, `bloomery-serve-ds41`): the load's host set also holds \
               the churn pool, each layer's stage card experts past the first P, refused by \
               name when the plan's host headroom cannot take it, and prints `residency host`; \
@@ -349,7 +349,17 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `BLOOMERY_PREFILL=steps` (each prompt id would end a pass the rule counts); both \
               binaries print the word and why as a `residency lever` record before the load. \
               Set, `mid-…` is refused by name under `--place gate`, beside the finite probe, \
-              the route trace and the step feed. Every other binary refuses it set, by name.",
+              the route trace and the step feed. Qwen3.8 (`generate_qwen3moe` on a qwen4exp \
+              file, `--place a` or `gate`, plain or `BLOOMERY_DRAFT=mtp`): unset is `off`; set, \
+              `mid-…` runs the same machine over the card's routed stacks, the load's host set \
+              holds the churn pool, refused by name as above, and prints `residency host`, and \
+              each arm prints its `residency pass` records after its lines; an arm's clear \
+              resets it, with a `residency reset` record; the word and why \
+              print as a `residency lever` record before the load. There `mid-…` is refused by \
+              name beside `BLOOMERY_ROUTE_TRACE` (a fixed placement's routing), with a step-fed \
+              prompt (`--prefill step`, at the prompt), on a qwen3moe or qwen35moe file and under \
+              `--dump-taps`. `bloomery-serve-qwen38` does not take it yet. Every other binary \
+              refuses it set, by name.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
