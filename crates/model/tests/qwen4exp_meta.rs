@@ -604,6 +604,14 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // (25,165,824 B at 4k, 111,149,056–115,343,360 B at 32k) [derived]; the
 // values are the planner's on the box (the lead's landing window C),
 // which the old pins held red on this tree and green before the arena term.
+// PIN(2026-10-01): the eight draft rows re-pinned for the store walk's arena, which the draft
+// program's arena now holds beside its eight-row buffers (`place::mtp_arena_bytes`, 24,877,352 B
+// more at every context: 50,356,396 B at ctx 4,096 and 139,124,908 B at 32,768): each row's budget
+// falls by those bytes [derived: the spread replayed over the 43 eligible layers — three stacks of
+// 921,600 + 921,600 + 1,228,800 B an expert in whole 2 MiB granules past CARD_DENSE + CARD_ROUNDING
+// — by a replica that first reproduced all eight old draft rows exactly from the budgets above
+// (the 09-28 budgets less the 09-29 card route's scratch and the 09-30 arena); 4 to 12 experts off
+// each card, 6 on the A6000 at 4k and U 4,096 (11,925 -> 11,919)].
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -633,10 +641,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         278,
-        14,
+        8,
         277,
-        36_633_600_000,
-        525_799_936,
+        36_615_168_000,
+        519_066_112,
     ),
     (
         "A6000",
@@ -644,10 +652,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         299,
-        8,
+        4,
         298,
-        39_389_184_000,
-        467_153_408,
+        39_376_896_000,
+        454_275_584,
     ),
     (
         "A6000",
@@ -677,10 +685,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         270,
-        43,
-        270,
-        35_665_920_000,
-        532_984_320,
+        31,
+        269,
+        35_629_056_000,
+        544_682_496,
     ),
     (
         "A6000",
@@ -688,10 +696,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         291,
-        38,
+        26,
         290,
-        38_424_576_000,
-        469_168_640,
+        38_387_712_000,
+        480_866_816,
     ),
     (
         "3090",
@@ -721,10 +729,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         84,
-        33,
+        21,
         83,
-        11_065_344_000,
-        494_121_472,
+        11_028_480_000,
+        505_819_648,
     ),
     (
         "3090",
@@ -732,10 +740,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         105,
-        9,
+        5,
         104,
-        13_765_632_000,
-        486_576_640,
+        13_753_344_000,
+        473_698_816,
     ),
     (
         "3090",
@@ -764,11 +772,11 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         32_768,
         true,
         4_096,
-        77,
-        4,
         76,
-        10_051_584_000,
-        545_288_704,
+        40,
+        75,
+        10_030_080_000,
+        539_529_728,
     ),
     (
         "3090",
@@ -776,10 +784,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         96,
-        42,
+        38,
         95,
-        12_678_144_000,
-        609_374_720,
+        12_665_856_000,
+        596_496_896,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their

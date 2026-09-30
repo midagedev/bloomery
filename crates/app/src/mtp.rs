@@ -147,6 +147,11 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     /// rows) is one walk.
     const WALK_ROWS: usize;
 
+    /// The most rows one store walk ([`WalkMode::Store`], the prompt's
+    /// warmup) takes: a body whose store walk runs wider than its whole walks
+    /// names its width; the default is [`MtpBody::WALK_ROWS`].
+    const STORE_ROWS: usize = Self::WALK_ROWS;
+
     /// Holds when the widths fit together: at least one id a proposal, a
     /// verify the body's passes take ([`Rows::MAX_ROWS`]), a refresh one
     /// walk. The window reads it, so a body that breaks it fails to compile
@@ -434,7 +439,7 @@ impl<B: MtpBody> MtpDraft<B> {
     /// One run of the warmup: `tokens` at `pos0`, their hidden rows the
     /// arena `walk`'s from `first` on, walked through the store's append
     /// alone ([`WalkMode::Store`]: a warm row's keys and values are all a
-    /// later row reads of it) in runs of [`MtpBody::WALK_ROWS`] with no
+    /// later row reads of it) in runs of [`MtpBody::STORE_ROWS`] with no
     /// readback — a fault stays on the fault word, which the next readback
     /// (the first chain's) names.
     fn warm(
@@ -445,17 +450,17 @@ impl<B: MtpBody> MtpDraft<B> {
         first: usize,
         tokens: &[u32],
     ) -> Result<(), GpuError> {
-        for (i, run) in tokens.chunks(B::WALK_ROWS).enumerate() {
+        for (i, run) in tokens.chunks(B::STORE_ROWS).enumerate() {
             B::walk(
                 m,
                 Feed {
                     tokens: run,
                     pos0: pos0
-                        + u32::try_from(i * B::WALK_ROWS)
+                        + u32::try_from(i * B::STORE_ROWS)
                             .expect("a prompt's positions lie below its context"),
                     hidden: Hidden::Target {
                         walk,
-                        first: first + i * B::WALK_ROWS,
+                        first: first + i * B::STORE_ROWS,
                     },
                 },
                 self.head,

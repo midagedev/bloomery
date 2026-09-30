@@ -56,17 +56,24 @@
 //!   after a reset, no rows, nine rows eager, five captured, rows past the
 //!   store, a walk past the positions the store holds for the sequence, a
 //!   token past the vocabulary, a hidden slice of the wrong length, a capture
-//!   with the taps armed; a store walk (`MtpMode::Store`) read back or
-//!   chained, and the own row and the streams after one — and a NaN in a
+//!   with the taps armed; a store walk (`MtpMode::Store`) past its
+//!   `MTP_STORE_ROWS` rows, read back or chained, and the own row and the
+//!   streams after one — and a NaN in a
 //!   hidden row raised on the fault word as the draft layer's `hc_mix`, the
 //!   walk's error.
+//! - (s) the store walks: over a prompt's rows fed the target's hidden rows
+//!   from the host (position 0 beside a zero row, each later position beside
+//!   the row of the one before it), store walks in runs of three leave each
+//!   position's keys within `key_band` and its values within `value_band`
+//!   of what eager walks over the same rows store — the store walk's
+//!   projections read q8 activations of 32 values, the eager walk's the f32
+//!   rows.
 //! - (w) the windows end to end: first the drafted session's prompt call
-//!   walks the draft as walks fed the target's hidden rows from the host
-//!   (position 0 beside a zero row, each later position beside the row of
-//!   the one before it): its warmup, which walks the store alone, leaves
-//!   every prompt position's keys and values those eager walks stored, bit
-//!   for bit, over a store other ids overwrote first, and the anchor walk
-//!   after them is bit for bit the same; then
+//!   walks the draft as (s)'s store walks: its warmup, which walks the store
+//!   alone in walks of its own width, leaves every prompt position's keys
+//!   and values those store walks stored, bit for bit, over a store other
+//!   ids overwrote first — a row's stored bits are its own inputs' alone —
+//!   and the anchor walk after them is bit for bit the same; then
 //!   against the plain run at the set's prompt
 //!   and D3K's (depth 3,000 after it): under `app::arch::qwen4exp`'s `Draft`
 //!   impl the drafted greedy ids are the plain run's for 64 tokens, with a
@@ -104,14 +111,15 @@ mod gate {
 
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, MTP_GRAPH_ROWS, MTP_ROWS, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, MtpNode,
-        MtpTaps, Prompt38, Qwen38Model, Store38Host, TargetRows,
+        Body38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, MtpDraft, MtpFeed, MtpHead, MtpHidden,
+        MtpMode, MtpNode, MtpTaps, Prompt38, Qwen38Model, Store38Host, TargetRows,
     };
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
     use gguf::Split;
+    use gguf::quant::half_to_f32;
     use model::arch::models::HeadRows;
     use model::arch::qwen35moe::place::{MtpInputs, PlanInputs, machine, vocab_sha256};
     use model::placement::PlanLevers;
@@ -169,6 +177,33 @@ mod gate {
     fn router_band() -> f64 {
         3f64.sqrt() * q8_32_rel()
     }
+
+    /// PIN(2026-10-01): a store walk's values against an eager walk's over
+    /// the same rows, a position's row at a time: the store walk's
+    /// projections read 32-value q8 activations where the eager walk reads
+    /// the f32 rows — `eh_proj`, then the value's own projection, two
+    /// roundings of at most `rounding::q8_32_rel` each in series, which add
+    /// (the triangle inequality; a quadrature sum assumes the two independent,
+    /// and the clean run's worst position already sits past √2 of it); the
+    /// attention site's mix reaches that input through σ, whose slope is at
+    /// most ¼, and adds under 4 % of it (the e2e gate's `gemm_band` rule);
+    /// each side's f16 store one rounding of 2^−11. 2.772e-2.
+    fn value_band() -> f64 {
+        2.0 * q8_32_rel() * 1.04 + 2.0 * 2f64.powi(-11)
+    }
+
+    /// PIN(2026-10-01): a store walk's keys against an eager walk's: the
+    /// value's two projections in series, then each head's RMS norm, which
+    /// moves a unit vector by at most twice its input's relative distance,
+    /// and the rope, a rotation; each side's f16 store one rounding. 5.446e-2.
+    fn key_band() -> f64 {
+        2.0 * 2.0 * q8_32_rel() * 1.04 + 2.0 * 2f64.powi(-11)
+    }
+
+    /// Rows a host store walk of (s) and (w) takes: a width no caller walks,
+    /// so the call's warmup equals it only when a row's stored bits are a
+    /// function of that row's inputs alone, not of the walk it lands in.
+    const HOST_STORE_RUN: usize = 3;
 
     /// PIN(2026-09-30): a captured walk's nodes at 1 to 4 rows, derived from
     /// the walk's launch list (`mtp38`'s module doc): the embedding and the
@@ -1424,8 +1459,9 @@ mod gate {
             let b = m.body("refusals")?;
             (b.vocab(), b.mtp().map_or(0, |d| d.ctx()))
         };
-        let tokens: Vec<u32> = g.tokens.iter().copied().cycle().take(9).collect();
-        let states: Vec<f32> = g.states.iter().copied().cycle().take(9 * WIDE).collect();
+        let over = MTP_STORE_ROWS + 1;
+        let tokens: Vec<u32> = g.tokens.iter().copied().cycle().take(over).collect();
+        let states: Vec<f32> = g.states.iter().copied().cycle().take(over * WIDE).collect();
         let feed = |k: usize, pos0: u32| MtpFeed::Rows {
             tokens: &tokens[..k],
             pos0,
@@ -1443,6 +1479,11 @@ mod gate {
             "five captured rows",
             m.mtp_draft(feed(5, 0), h, MtpMode::Graph),
             "a walk of 5 rows",
+        );
+        ok &= refused(
+            "a store walk past its rows",
+            m.mtp_walk(feed(over, 0), h, MtpMode::Store),
+            &format!("a walk of {over} rows"),
         );
         let last = u32::try_from(ctx - 1)?;
         ok &= refused(
@@ -1866,18 +1907,21 @@ mod gate {
         Ok((m, ok))
     }
 
-    /// (w)'s first clause: the draft's walks over a prompt call are the
-    /// walks the module doc of `app::arch::qwen3moe` names. From a reset,
+    /// (s) and (w)'s first clause: the draft's walks over a prompt call are
+    /// the walks the module doc of `app::arch::qwen3moe` names. From a reset,
     /// the prompt by passes with every unit's hidden rows read to the host,
-    /// then the draft walked eagerly (every launch, the head's included)
-    /// from the host as the prompt call walks it — position 0 with a zero
-    /// hidden row, each unit's rows from its second position on (the last
-    /// unit's last excepted) each beside the hidden row of the position
-    /// before it, in runs of eight — and one anchor walk at the prompt's
-    /// end; against the drafted session's prompt call by the same passes,
-    /// whose warmup walks the store alone (`MtpMode::Store`): the store's
-    /// keys and values at every prompt position bit for bit, then the same
-    /// anchor walk's token, streams and logits bit for bit — the anchor's
+    /// then the draft walked from the host as the prompt call walks it —
+    /// position 0 with a zero hidden row, each unit's rows from its second
+    /// position on (the last unit's last excepted) each beside the hidden row
+    /// of the position before it — eagerly in runs of eight (every launch,
+    /// the head's included), then over the same rows as store walks
+    /// (`MtpMode::Store`) in runs of [`HOST_STORE_RUN`]: (s) each position's
+    /// keys and values the store walks leave within [`key_band`] and
+    /// [`value_band`] of the eager walks'. Then one anchor walk at the
+    /// prompt's end; against the drafted session's prompt call by the same
+    /// passes, whose warmup walks the store alone: the store's keys and values
+    /// at every prompt position bit for bit the host's store walks', then the
+    /// same anchor walk's token, streams and logits bit for bit — the anchor's
     /// attention reads every key the walks before it wrote. Between the two,
     /// eager walks of other ids over the same positions overwrite every
     /// stored row, so a position the prompt call does not write reads as
@@ -1909,19 +1953,54 @@ mod gate {
         }
         let (h, e) = (MtpHead::Rows, MtpMode::Eager);
         let zeros = vec![0.0f32; WIDE];
-        m.mtp_walk(
-            MtpFeed::Rows {
-                tokens: &prompt[..1],
-                pos0: 0,
-                hidden: MtpHidden::Host(&zeros),
-            },
-            h,
-            e,
-        )?;
-        for &(f, rows) in &units {
-            let end = (f + rows + 1).min(n);
-            for (i, run) in prompt[f + 1..end].chunks(MTP_ROWS).enumerate() {
-                let q = f + 1 + i * MTP_ROWS;
+        // Position 0 beside a zero row, then each unit's rows from its second
+        // position on, each beside the hidden row of the position before it,
+        // in walks of `mode` of `run` rows.
+        let walk_host = |m: &mut Qwen38Model, mode: MtpMode, run: usize| -> Result<(), GateError> {
+            m.mtp_walk(
+                MtpFeed::Rows {
+                    tokens: &prompt[..1],
+                    pos0: 0,
+                    hidden: MtpHidden::Host(&zeros),
+                },
+                h,
+                mode,
+            )?;
+            for &(f, rows) in &units {
+                let end = (f + rows + 1).min(n);
+                for (i, r) in prompt[f + 1..end].chunks(run).enumerate() {
+                    let q = f + 1 + i * run;
+                    m.mtp_walk(
+                        MtpFeed::Rows {
+                            tokens: r,
+                            pos0: u32::try_from(q)?,
+                            hidden: MtpHidden::Host(
+                                &streams[(q - 1) * WIDE..(q - 1 + r.len()) * WIDE],
+                            ),
+                        },
+                        h,
+                        mode,
+                    )?;
+                }
+            }
+            Ok(())
+        };
+        // Other ids over the same positions, from position 0, eagerly: every
+        // row an earlier walk stored is overwritten.
+        let vocab = u32::try_from(m.body("prompt_walks")?.vocab())?;
+        let other: Vec<u32> = prompt.iter().map(|&t| (t + 1) % vocab).collect();
+        let overwrite = |m: &mut Qwen38Model| -> Result<(), GateError> {
+            m.mtp_walk(
+                MtpFeed::Rows {
+                    tokens: &other[..1],
+                    pos0: 0,
+                    hidden: MtpHidden::Host(&zeros),
+                },
+                h,
+                e,
+            )?;
+            for (i, run) in other[1..].chunks(MTP_ROWS).enumerate() {
+                let q = 1 + i * MTP_ROWS;
                 m.mtp_walk(
                     MtpFeed::Rows {
                         tokens: run,
@@ -1934,7 +2013,22 @@ mod gate {
                     e,
                 )?;
             }
-        }
+            Ok(())
+        };
+        walk_host(&mut m, e, MTP_ROWS)?;
+        let eager_store = store_of(&m, n)?;
+        overwrite(&mut m)?;
+        walk_host(&mut m, MtpMode::Store, HOST_STORE_RUN)?;
+        let host_store = store_of(&m, n)?;
+        let (dk, dv) = store_rel(&host_store, &eager_store, n);
+        let (bk, bv) = (key_band(), value_band());
+        let band_ok = dk <= bk && dv <= bv;
+        println!(
+            "(s) the store walks ({path:?}, runs of {HOST_STORE_RUN}) over a store other ids \
+             overwrote, against the eager walks over the same {n} positions: keys within \
+             {dk:.3e} (band {bk:.3e}), values within {dv:.3e} (band {bv:.3e}) {}",
+            verdict(band_ok)
+        );
         let anchor = |m: &mut Qwen38Model| {
             walk(
                 m,
@@ -1947,33 +2041,8 @@ mod gate {
                 e,
             )
         };
-        let host_store = store_of(&m, n)?;
         let host = anchor(&mut m)?;
-        // Other ids over the same positions, from position 0: every row the
-        // host walks stored is overwritten.
-        let vocab = u32::try_from(m.body("prompt_walks")?.vocab())?;
-        let other: Vec<u32> = prompt.iter().map(|&t| (t + 1) % vocab).collect();
-        m.mtp_walk(
-            MtpFeed::Rows {
-                tokens: &other[..1],
-                pos0: 0,
-                hidden: MtpHidden::Host(&zeros),
-            },
-            h,
-            e,
-        )?;
-        for (i, run) in other[1..].chunks(MTP_ROWS).enumerate() {
-            let q = 1 + i * MTP_ROWS;
-            m.mtp_walk(
-                MtpFeed::Rows {
-                    tokens: run,
-                    pos0: u32::try_from(q)?,
-                    hidden: MtpHidden::Host(&streams[(q - 1) * WIDE..(q - 1 + run.len()) * WIDE]),
-                },
-                h,
-                e,
-            )?;
-        }
+        overwrite(&mut m)?;
         let overwritten = same_rows(&host_store, &store_of(&m, n)?, n)
             .iter()
             .filter(|&&same| !same)
@@ -1993,9 +2062,9 @@ mod gate {
         let same = same_bits(&host, &call);
         println!(
             "(w) the prompt call ({path:?}) walks the draft over {n} positions in {} units as the \
-             walks fed from the host: other ids overwrote {overwritten} of {n} stored rows, then \
-             the call's warmup stored {} of {n} as the host's (first other at {first_off:?}) {}; \
-             the anchor's token {} (host {}), streams and logits bit for bit {}",
+             store walks fed from the host: other ids overwrote {overwritten} of {n} stored rows, \
+             then the call's warmup stored {} of {n} as the host's (first other at {first_off:?}) \
+             {}; the anchor's token {} (host {}), streams and logits bit for bit {}",
             units.len(),
             stored,
             verdict(store_ok),
@@ -2003,13 +2072,30 @@ mod gate {
             host.draft.tokens[0],
             verdict(same)
         );
-        Ok((m, store_ok && same))
+        Ok((m, band_ok && store_ok && same))
     }
 
     /// The draft's stored keys and values at positions `0..n`, position-major.
     fn store_of(m: &Qwen38Model, n: usize) -> Result<(Vec<u16>, Vec<u16>), GateError> {
         let d = m.body("store")?.mtp().ok_or("the load opened no draft")?;
         Ok(d.store_host(m.gpu().stream(), n)?)
+    }
+
+    /// The largest relative distance over the positions below `n` of the
+    /// keys, then of the values, in `a` from those in `b` (two [`store_of`]
+    /// reads of `n` positions), a position's row at a time.
+    fn store_rel(a: &(Vec<u16>, Vec<u16>), b: &(Vec<u16>, Vec<u16>), n: usize) -> (f64, f64) {
+        let row = a.0.len() / n.max(1);
+        let f = |v: &[u16]| -> Vec<f32> { v.iter().map(|&x| half_to_f32(x)).collect() };
+        let worst = |x: &[u16], y: &[u16]| {
+            (0..n)
+                .map(|p| {
+                    let r = p * row..(p + 1) * row;
+                    rel(&f(&x[r.clone()]), &f(&y[r]))
+                })
+                .fold(0.0f64, f64::max)
+        };
+        (worst(&a.0, &b.0), worst(&a.1, &b.1))
     }
 
     /// Whether each position below `n` holds bit for bit the same keys and

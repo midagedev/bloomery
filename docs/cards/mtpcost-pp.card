@@ -1,0 +1,55 @@
+# Round mtpcost: the MTP arm's prompt warmup walks the draft's store through the wide launches the
+# ubatch walk runs (mtp38 store_walk: the pack and the attention site's mix quantized to 32-value q8
+# blocks, eh_proj, q, k and v as 32-value GEMMs, one walk of up to MTP_STORE_ROWS = 64 rows) instead
+# of 8-row walks of the m-column gemvs. Same binary, two arms by the draft lever, as the mtppf
+# window (docs/cards/mtppf-pp.card; its log: plain pp512 618.60 / pp4096 614.74, mtp 573.15 /
+# 556.10 tok/s, 3 rounds, prose, A6000 plan a, C 4352).
+# Decomposing that window's gap at P 4096, per round from its `stat prompt host` and `time prompt`
+# rows: the plain wall 6,663 ms; the mtp arm's 7,365 ms; the union term (the draft's card reserve)
+# +377..+422 ms; the rest, ~300 ms over 513 store walks of up to 8 rows, 0.585 ms a walk (0.55 at P
+# 512, 65 walks). Per walk the DRAM bytes are ~95 MB (0.14 ms at 700 GB/s) and the FP32 FMAs ~0.69 G
+# (~40 us); what the bytes do not explain is the gemvs' f32 activations, re-read by every weight row
+# (eh_proj 2,560 rows x 32 columns x 5,120 values = 1.68 GB of L1/L2 requests a walk, q 1.0 GB),
+# and the sub-wave launches (k and v 64 blocks, the mix, the embedding, the pack, the append).
+# The wide walk reads each weight once per 64 rows and stages the activations as int8 in shared
+# memory: per 64-row walk, 19 launches, ~55 MB of weights, 11 G int8 MACs; the sub-wave terms are
+# the mix's down GEMM (3 blocks of 128 rows at K 10,240) and the k and v GEMMs (4 blocks each):
+# 0.2-0.45 ms a walk [derived], 64 walks at P 4096: 13-29 ms; 8 walks at P 512: 1.6-3.6 ms. The
+# arena grows 24,877,352 B (place.rs mtp_arena_bytes), 6 target experts off the card at this
+# placement [derived, the qwen4exp_meta replica: 11,925 -> 11,919 at A6000 4k U 4,096], +~500 host
+# slots and +3 ms of union at P 4096.
+# This card needs the app's warmup to chunk by MTP_STORE_ROWS (crates/app/src/arch/qwen3moe/mod.rs
+# `warm`); with the app still chunking by 8 rows the walk is 8 rows wide and this band does not apply.
+# New MTP arm [derived]: P 4096 6,663 + 330..440 + 3 + 13..29 = 7,009..7,135 ms against 6,663:
+# -6.6..-4.9 %; P 512 828 + 27..35 + 1.6..3.6 = 857..867 ms: -4.5..-3.4 % (printed, not decided).
+# The runner (wall: the mtppf window took ~6 min for the same 12 processes):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mtpcost-pp.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=3
+# just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_DRAFT=mtp prose:4096 prose:4096@BLOOMERY_DRAFT=mtp
+kind: ab
+question: does walking the draft's prompt warmup through the wide store walk close the MTP arm's
+  prompt gap down to the draft's card reserve, as the wide walk's launch and GEMM costs predict?
+term: pp tok/s @ P=4096 (prose:4096, the time prompt row), n=96, ctx 4352 (BLOOMERY_GEN_CTX=4352),
+  A6000, plan a (card experts), BLOOMERY_DRAFT=mtp against unset, same binary, paired by round
+unit: %
+predict: -6.6..-4.9
+rounds: 3
+sd: 0.55 % the q38mtp-tg sitting's pp4096 rows (docs/cards/q38mtp-tg.card), plain/mtp paired ratio
+  SD 0.75 % over 3 rounds, divided by the square root of 2
+condition: one binary, both arms of a P in one lease, a fresh process per load group, the host set
+  and the PLE table warm (majflt near 0), no [cpu-busy] or [other-busy] row; the mtp arm's load line
+  names draft=mtp and head=full and its arena=51,148,972 (the mtppf window's 26,271,620 plus the
+  store arena's 24,877,352); each arm's stat prompt host line gives host_slots 908,274 (plain) and
+  981,105 + 200..900 (mtp) at P 4096, 115,726 and 123,608 + 20..120 at P 512; the store the warmup
+  leaves reads as before: the mtp arm's decode at prose:512 near the mtppf window's 80.2 tok/s (a
+  store off by more than its q8 band drops the acceptance toward the plain 52.8) and each arm's
+  distinct_tokens the plain arm's (70 at P 512, 61 at P 4096)
+decide-in: land mtpcost with the app's chunk edit; the prompt gap left is the draft's card reserve
+  (94 % of it the draft's 512 Q8_0 experts, 2.67 GB), and the MTP default is decided on decode
+  +31..+52 % against this pp
+decide-below: the wide walk costs more than 0.45 ms or a term outside it moved: read each arm's stat
+  prompt host union_ms first (+330..+440 ms at P 4096); inside that band, nsys one MTP prompt call at
+  P 4096 and read the store walks' per-launch durations (the mix's down GEMM, k and v) before any
+  change
+decide-above: the union term landed under +330 ms or the warmup under 13 ms: compare both arms'
+  host_slots and union_ms with this card's, then re-derive the union's share from one
+  BLOOMERY_STEP_STATS=1 run before the next round

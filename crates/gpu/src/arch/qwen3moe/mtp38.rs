@@ -63,7 +63,21 @@
 //!
 //! A store walk ([`MtpMode::Store`], the prompt's warmup) stops after the
 //! append: a later row reads a row's keys and values and nothing else of
-//! it, so its first `2 + ⌈4m/8⌉ + 3 + 3 + 1` launches are the whole walk.
+//! it. It runs over up to [`MTP_STORE_ROWS`] rows at once through the
+//! launches the ubatch walk (`wide38`) runs, in its own buffers:
+//! - the embedding rows and the input pack, as above;
+//! - the pack quantized to 32-value q8 blocks (`quantize_gemm32`) and
+//!   `eh_proj` as one 32-value GEMM (`gemm_q8_0p`) over the `4·m` packed
+//!   columns, through a one-expert table;
+//! - the attention site's wide mix (`HcWideKernels::enqueue_mix`);
+//! - the mix quantized, q (with each head's gate), k and v as three GEMMs
+//!   over the rows, then the norm and append.
+//!
+//! Each op computes a row's values from that row's inputs alone, so a
+//! row's keys and values do not depend on the walk it lands in or on its
+//! neighbours. Against an [`MtpMode::Eager`] walk, which reads the f32
+//! rows, the three projections read q8 activations: the two stores agree to
+//! the error of that quantization and are not bit-equal.
 //!
 //! Launches of a walk at `m` rows: [`walk_launches`]. The arena is the
 //! program's, allocated once beside the body ([`Mtp38::arm`]) and counted
@@ -77,8 +91,9 @@ use super::scratch::{IN_IDS, IN_POS0, Inbox, KvPlanes, f32_view, param_view, put
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::fault::Fault;
 use crate::flash_gqa::{GqaArgs, partials_ms_len, partials_v_len_256};
+use crate::gemm::{Gemm32Args, Gemm32Weight, GemmAct32, GemmInput, GemmRoute};
 use crate::graph::Graph;
-use crate::hc_gated::{Before, HcScratch};
+use crate::hc_gated::{Before, HcScratch, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::host::handoff::Places;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
@@ -499,6 +514,10 @@ pub const MTP_ROWS: usize = PASS_ROWS;
 /// refresh runs.
 pub const MTP_GRAPH_ROWS: usize = VERIFY_ROWS;
 
+/// The most rows one store walk ([`MtpMode::Store`]) takes: the columns of
+/// its GEMMs, and the rows of the store arena it runs in.
+pub const MTP_STORE_ROWS: usize = 64;
+
 /// Values of a row's streams, the target's hidden row.
 const WIDE: usize = geo::STREAMS * geo::HIDDEN;
 
@@ -571,19 +590,13 @@ pub enum MtpMode {
     /// Replayed from its capture, captured on first use.
     Graph,
     /// Enqueued launch by launch through the store's append and no
-    /// further: the rows' keys and values, which are all a later row reads
-    /// of them (a row's input is its token and the target's hidden row,
-    /// never the draft's output). No flash, feed-forward block or head, no
-    /// readback and no own row: the prompt's warmup. The store's bits are
-    /// an [`MtpMode::Eager`] walk's.
-    Store,
-}
-
-/// Where a walk's launches stop: after the head (a walk a readback or an
-/// own row may follow), or after the store's append ([`MtpMode::Store`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WalkEnd {
-    Head,
+    /// further, up to [`MTP_STORE_ROWS`] rows through the wide launches
+    /// (module doc): the rows' keys and values, which are all a later row
+    /// reads of them (a row's input is its token and the target's hidden
+    /// row, never the draft's output). No flash, feed-forward block or head,
+    /// no readback and no own row: the prompt's warmup. A row's stored bits
+    /// are a function of that row's inputs alone, within the q8
+    /// activations' error of an [`MtpMode::Eager`] walk's.
     Store,
 }
 
@@ -715,7 +728,82 @@ impl TapBufs {
     }
 }
 
-/// The program's buffers for up to [`MTP_ROWS`] rows, token-major.
+/// A store walk's own buffers for up to [`MTP_STORE_ROWS`] rows,
+/// token-major (module doc): the hidden rows, the embedding with its
+/// positions and key counts, the pack and its q8 blocks over the `4·m`
+/// packed columns, the streams, the wide mix's scratch, the mix and its q8
+/// blocks, q with its gates, the turned q, k and v, and the two one-expert
+/// tables (`4·m` and `m` slots).
+struct StoreArena {
+    h: DeviceBuffer<f32>,
+    emb: DeviceBuffer<f32>,
+    pos: DeviceBuffer<u32>,
+    n_keys: DeviceBuffer<u32>,
+    pack: DeviceBuffer<f32>,
+    pack_q: GemmAct32,
+    res: DeviceBuffer<f32>,
+    hc: HcWideScratch,
+    mixed: DeviceBuffer<f32>,
+    mixed_q: GemmAct32,
+    qg: DeviceBuffer<f32>,
+    q: DeviceBuffer<f32>,
+    k: DeviceBuffer<f32>,
+    v: DeviceBuffer<f32>,
+    packed: GemmRoute,
+    rows: GemmRoute,
+}
+
+impl StoreArena {
+    fn new(stream: &CudaStream, geometry: Geometry) -> Result<StoreArena, GpuError> {
+        let r = MTP_STORE_ROWS;
+        let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
+        let (h, cols) = (geo::HIDDEN, geo::STREAMS * r);
+        Ok(StoreArena {
+            h: f(r * WIDE)?,
+            emb: f(r * h)?,
+            pos: u(r)?,
+            n_keys: u(r)?,
+            pack: f(r * 2 * WIDE)?,
+            pack_q: GemmAct32::new(stream, cols, 2 * h)?,
+            res: f(r * WIDE)?,
+            hc: HcWideScratch::new(stream, geometry, r)?,
+            mixed: f(r * h)?,
+            mixed_q: GemmAct32::new(stream, r, h)?,
+            qg: f(r * geo::Q_ROWS)?,
+            q: f(r * geo::ATTN)?,
+            k: f(r * geo::KV)?,
+            v: f(r * geo::KV)?,
+            packed: GemmRoute::new(stream, cols, 1)?,
+            rows: GemmRoute::new(stream, r, 1)?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        let f32s = [
+            &self.h,
+            &self.emb,
+            &self.pack,
+            &self.res,
+            &self.mixed,
+            &self.qg,
+            &self.q,
+            &self.k,
+            &self.v,
+        ];
+        f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + self.pos.num_bytes()
+            + self.n_keys.num_bytes()
+            + self.pack_q.bytes()
+            + self.hc.bytes()
+            + self.mixed_q.bytes()
+            + self.packed.bytes()
+            + self.rows.bytes()
+    }
+}
+
+/// The program's buffers for up to [`MTP_ROWS`] rows, token-major, and a
+/// store walk's for up to [`MTP_STORE_ROWS`] (`st`).
 struct MtpArena {
     /// The walk's record — `pos0`, then the rows' tokens — and its windows.
     inbox: Inbox,
@@ -771,6 +859,7 @@ struct MtpArena {
     /// mask — read once a window ([`Mtp38::run_chain`]).
     chain: DeviceBuffer<u32>,
     taps: Option<TapBufs>,
+    st: StoreArena,
     /// The rows of the last walk, which the readbacks and the next own row
     /// read; `None` before a walk of the sequence and after a store walk.
     last: Option<(usize, MtpHead)>,
@@ -791,10 +880,10 @@ impl MtpArena {
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
         let h = geo::HIDDEN;
-        let inbox = Inbox::new(stream, IN_IDS + r)?;
-        // SAFETY: word IN_POS0 of the inbox's IN_IDS + r device words, and the
-        // inbox moves into the arena beside the window (a move of the
-        // handle, not of the allocation), where it outlives it.
+        let inbox = Inbox::new(stream, IN_IDS + MTP_STORE_ROWS)?;
+        // SAFETY: word IN_POS0 of the inbox's IN_IDS + MTP_STORE_ROWS device
+        // words, and the inbox moves into the arena beside the window (a
+        // move of the handle, not of the allocation), where it outlives it.
         let pos0 = unsafe { param_view::<u32>(inbox.dev(), IN_POS0, 1) };
         let geometry = Geometry::new(geo::STREAMS as u32, geo::RANK as u32, h as u32)
             .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
@@ -841,6 +930,7 @@ impl MtpArena {
             no_map: u(1)?,
             chain: u(2 * MTP_GRAPH_ROWS + 2)?,
             taps: None,
+            st: StoreArena::new(stream, geometry)?,
             last: None,
             held: 0,
             vocab,
@@ -897,6 +987,7 @@ impl MtpArena {
             + u32s.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.inbox.bytes()
             + self.route.bytes()
+            + self.st.bytes()
             + self.taps.as_ref().map_or(0, |t| {
                 t.eh.num_bytes() + t.logits.num_bytes() + t.ids.num_bytes()
             })
@@ -1158,8 +1249,9 @@ impl Mtp38 {
             MtpFeed::Own { pos0 } => (1, true, pos0),
         };
         let most = match mode {
-            MtpMode::Eager | MtpMode::Store => MTP_ROWS,
+            MtpMode::Eager => MTP_ROWS,
             MtpMode::Graph => MTP_GRAPH_ROWS,
+            MtpMode::Store => MTP_STORE_ROWS,
         };
         if !(1..=most).contains(&m) {
             return Err(GpuError::shape(
@@ -1221,9 +1313,15 @@ impl Mtp38 {
             MtpFeed::Rows { tokens, hidden, .. } => {
                 put_input(a.inbox.host_mut()?, tokens, pos0)?;
                 a.inbox.upload(stream, IN_IDS + m)?;
-                // SAFETY: `h_in` holds MTP_ROWS · WIDE values and m <=
-                // MTP_ROWS; the window lives for this copy.
-                let mut h = unsafe { f32_view(&a.h_in, 0, m * WIDE) };
+                // SAFETY: `h_in` holds MTP_ROWS · WIDE values and the store
+                // arena's `h` MTP_STORE_ROWS · WIDE, and m is at most the
+                // mode's rows (checked above); the window lives for this copy.
+                let mut h = unsafe {
+                    match mode {
+                        MtpMode::Store => f32_view(&a.st.h, 0, m * WIDE),
+                        MtpMode::Eager | MtpMode::Graph => f32_view(&a.h_in, 0, m * WIDE),
+                    }
+                };
                 match (hidden, src) {
                     (MtpHidden::Host(v), _) => h.copy_from_host(stream, v)?,
                     (MtpHidden::Target { .. }, Some((t, first))) => {
@@ -1244,14 +1342,14 @@ impl Mtp38 {
         }
         let key = MtpKey { m, own, head };
         match mode {
-            MtpMode::Eager => self.walk(c, key, WalkEnd::Head)?,
-            MtpMode::Store => self.walk(c, key, WalkEnd::Store)?,
+            MtpMode::Eager => self.walk(c, key)?,
+            MtpMode::Store => self.store_walk(c, m, own)?,
             MtpMode::Graph => {
                 let mut graphs = std::mem::take(&mut self.graphs);
                 let found = graphs.iter().position(|(k, _)| *k == key);
                 let r = match found {
                     Some(i) => Ok(i),
-                    None => Graph::capture(stream, |_| self.walk(c, key, WalkEnd::Head)).map(|g| {
+                    None => Graph::capture(stream, |_| self.walk(c, key)).map(|g| {
                         graphs.push((key, g));
                         graphs.len() - 1
                     }),
@@ -1399,9 +1497,9 @@ impl Mtp38 {
         })
     }
 
-    /// The walk itself: every launch of the module doc's list through
-    /// `end`, enqueued on the card's stream (what a capture records).
-    fn walk(&mut self, c: &MtpCtx<'_>, key: MtpKey, end: WalkEnd) -> Result<(), GpuError> {
+    /// The walk itself: every launch of the module doc's list, enqueued on
+    /// the card's stream (what a capture records).
+    fn walk(&mut self, c: &MtpCtx<'_>, key: MtpKey) -> Result<(), GpuError> {
         let MtpKey { m, own, head } = key;
         let (embd, output) = self.borrowed(c.tw)?;
         let Mtp38 {
@@ -1435,8 +1533,9 @@ impl Mtp38 {
         let DevWeight::Q8_0 { qs: eqs, d: ed, .. } = embd else {
             return Err(GpuError::tensor(WHAT, "token_embd.weight", "Q8_0 planes"));
         };
-        // SAFETY: words IN_IDS .. IN_IDS + m of the inbox's IN_IDS + MTP_ROWS
-        // words (m <= MTP_ROWS); the window lives for the embedding's enqueue.
+        // SAFETY: words IN_IDS .. IN_IDS + m of the inbox's IN_IDS +
+        // MTP_STORE_ROWS words (m <= MTP_ROWS <= MTP_STORE_ROWS); the window
+        // lives for the embedding's enqueue.
         let ids = unsafe { param_view::<u32>(a.inbox.dev(), IN_IDS, m) };
         k.q38.enqueue_embed_rows(
             stream,
@@ -1539,9 +1638,6 @@ impl Mtp38 {
                 cache_v: &mut store.v,
             },
         )?;
-        if end == WalkEnd::Store {
-            return Ok(());
-        }
         k.flash.enqueue_pass_256_p4(
             stream,
             GqaArgs {
@@ -1763,6 +1859,157 @@ impl Mtp38 {
         Ok(())
     }
 
+    /// A store walk over `m` rows (module doc): the embedding and the pack,
+    /// `eh_proj`, the attention site's mix, q, k and v, the norm and
+    /// append, every launch over the rows at once in the store arena, on
+    /// the card's stream. The rows' tokens are the inbox's and their hidden
+    /// rows the store arena's `h`, or the draft's own last row when `own`.
+    fn store_walk(&mut self, c: &MtpCtx<'_>, m: usize, own: bool) -> Result<(), GpuError> {
+        let (embd, _) = self.borrowed(c.tw)?;
+        let Mtp38 {
+            w,
+            store,
+            index,
+            ctx,
+            a,
+            ..
+        } = self;
+        let a = a
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "the program's arena (Mtp38::arm)"))?;
+        let (gpu, k) = (c.gpu, c.k);
+        let stream = gpu.stream();
+        let sink = gpu.layer_sink(*index as usize)?;
+        let n = Names::of(*index);
+        let (h, cols) = (geo::HIDDEN, geo::STREAMS * m);
+        let s = &mut a.st;
+
+        // The embedding rows and the input pack.
+        let DevWeight::Q8_0 { qs: eqs, d: ed, .. } = embd else {
+            return Err(GpuError::tensor(WHAT, "token_embd.weight", "Q8_0 planes"));
+        };
+        // SAFETY: words IN_IDS .. IN_IDS + m of the inbox's IN_IDS +
+        // MTP_STORE_ROWS words (m <= MTP_STORE_ROWS); the window lives for
+        // the embedding's enqueue.
+        let ids = unsafe { param_view::<u32>(a.inbox.dev(), IN_IDS, m) };
+        k.q38.enqueue_embed_rows(
+            stream,
+            EmbedQ8Args {
+                qs: eqs,
+                d: ed,
+                ids: if own { &a.own_id } else { &ids },
+                pos0: &a.pos0,
+                first: 0,
+                fault: sink,
+                y: &mut s.emb,
+                pos: &mut s.pos,
+                n_keys: &mut s.n_keys,
+            },
+        )?;
+        k.mtp.enqueue_mtp_input(
+            stream,
+            MtpInputArgs {
+                e: &s.emb,
+                h: if own { &a.own_h } else { &s.h },
+                enorm: f32_gain(w, &n.enorm)?,
+                hnorm: f32_gain(w, &n.hnorm)?,
+                hidden: h,
+                eps: c.eps,
+                m,
+                fault: sink,
+                out: &mut s.pack,
+            },
+        )?;
+
+        // `eh_proj` over the packed columns into the streams.
+        k.g32
+            .enqueue_quantize_gemm32(stream, &s.pack, cols, &mut s.pack_q, sink)?;
+        k.gemm
+            .enqueue_route_dense(stream, cols, &mut s.packed, gpu.unlabelled_sink())?;
+        let (qs, d) = q8(w, &n.eh)?;
+        k.g32.enqueue_gemm32(
+            stream,
+            Gemm32Args {
+                w: Gemm32Weight::Q8_0Plane { qs, d },
+                rows_per_expert: qs.rows(),
+                act: &s.pack_q,
+                route: &s.packed,
+                input: GemmInput::PerSlot,
+                y: &mut s.res,
+            },
+        )?;
+
+        // The attention site's mix, then q, k and v over the rows.
+        k.gemm
+            .enqueue_route_dense(stream, m, &mut s.rows, gpu.unlabelled_sink())?;
+        let site = &n.attn_site;
+        let (down_qs, down_d) = q8(w, &site.down)?;
+        let (up_qs, up_d) = q8(w, &site.up)?;
+        let inject = match &site.inject {
+            Some(t) => Some(f32_tensor(w, t)?),
+            None => None,
+        };
+        k.hcw.enqueue_mix(
+            stream,
+            WideMixArgs {
+                res: &mut s.res,
+                before: Before::Plain,
+                w: SiteWeights {
+                    gamma: f32_gain(w, &site.norm)?,
+                    down_qs,
+                    down_d,
+                    up_qs,
+                    up_d,
+                    inject,
+                },
+                eps: c.eps,
+                m,
+                fault: sink,
+                scratch: &mut s.hc,
+                gemm: &k.g32,
+                dense: &s.rows,
+                mixed: &mut s.mixed,
+            },
+        )?;
+        k.g32
+            .enqueue_quantize_gemm32(stream, &s.mixed, m, &mut s.mixed_q, sink)?;
+        for (name, y) in [(&n.q, &mut s.qg), (&n.k, &mut s.k), (&n.v, &mut s.v)] {
+            let (qs, d) = q8(w, name)?;
+            k.g32.enqueue_gemm32(
+                stream,
+                Gemm32Args {
+                    w: Gemm32Weight::Q8_0Plane { qs, d },
+                    rows_per_expert: qs.rows(),
+                    act: &s.mixed_q,
+                    route: &s.rows,
+                    input: GemmInput::PerSlot,
+                    y,
+                },
+            )?;
+        }
+        k.neox.enqueue_head_norm_neox_append_256(
+            stream,
+            PartialNeoxArgs {
+                qg: &s.qg,
+                q: &mut s.q,
+                k: &mut s.k,
+                v: &s.v,
+                gq: f32_gain(w, &n.q_norm)?,
+                gk: f32_gain(w, &n.k_norm)?,
+                table: c.table,
+                pos: &s.pos,
+                eps: c.eps,
+                n_head: geo::N_HEAD,
+                n_kv: geo::N_KV,
+                ctx: *ctx,
+                m,
+                fault: sink,
+                cache_k: &mut store.k,
+                cache_v: &mut store.v,
+            },
+        )
+    }
+
     /// The streams of the last walk's rows: the layer's output, `l_out`.
     /// Blocking; gate use.
     pub fn l_out(&self, stream: &CudaStream) -> Result<Vec<f32>, GpuError> {
@@ -1852,5 +2099,8 @@ fn read_draft(a: &MtpArena, stream: &CudaStream, m: usize) -> Result<MtpDraft, G
     })
 }
 
-// A walk's rows fit the eh_proj run and the m-column kernels.
-const _: () = assert!(MTP_ROWS <= 8 && MTP_GRAPH_ROWS <= MTP_ROWS && EH_COLS == 8);
+// A walk's rows fit the eh_proj run and the m-column kernels; a store
+// walk's inbox holds an eager walk's rows too.
+const _: () = assert!(
+    MTP_ROWS <= 8 && MTP_GRAPH_ROWS <= MTP_ROWS && EH_COLS == 8 && MTP_ROWS <= MTP_STORE_ROWS
+);

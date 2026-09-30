@@ -5,8 +5,8 @@
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::{
-    Body38, MTP_GRAPH_ROWS, MTP_ROWS, Mtp38, MtpFeed, MtpHead, MtpHidden, MtpMode, Prompt38,
-    Qwen38Model, TargetRows,
+    Body38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpFeed, MtpHead, MtpHidden, MtpMode,
+    Prompt38, Qwen38Model, TargetRows,
 };
 use bloomery_gpu::model::Rows;
 
@@ -17,6 +17,8 @@ impl MtpBody for Body38 {
     /// A proposal fills the widest verify the GDN lanes hold.
     const WIDTH: usize = <Body38 as Rows>::MAX_ROWS - 1;
     const WALK_ROWS: usize = MTP_ROWS;
+    /// The prompt's store walks run wide, through the GEMM path.
+    const STORE_ROWS: usize = MTP_STORE_ROWS;
 
     type Arena = TargetRows;
     const STEP_ARENA: TargetRows = TargetRows::Step;
