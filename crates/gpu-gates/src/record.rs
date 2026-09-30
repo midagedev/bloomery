@@ -1748,6 +1748,10 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &STAT_SUMMARY_HOST,
     &STAT_PROMPT38_SPLIT,
     &STAT_PROMPT38_LB,
+    &RESIDENCY_LEVER,
+    &RESIDENCY_HOST,
+    &RESIDENCY_PASS,
+    &RESIDENCY_RESET,
 ];
 
 /// The record `gate_deepseek41_prefill` prints inside its own lines, after
