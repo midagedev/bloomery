@@ -165,10 +165,12 @@ pub trait HostServed {
     /// The pass the last boundary opened, a `kind`, keeps its first `kept`
     /// rows: a step 1, a verify its accepted rows, a prompt call 0. The
     /// caller that knows the pass's outcome says so before the next
-    /// boundary, which refuses a pass with no kept count by name. A body with
-    /// no machine ignores it.
-    fn keep_rows(&mut self, kept: usize, kind: crate::host::PassKind) {
+    /// boundary, which refuses a pass with no kept count by name; a count
+    /// with no pass open is refused here, the write side of that refusal. A
+    /// body with no machine ignores it.
+    fn keep_rows(&mut self, kept: usize, kind: crate::host::PassKind) -> Result<(), GpuError> {
         let _ = (kept, kind);
+        Ok(())
     }
 
     /// The residency back to its seed at a quiet boundary, on `stream`
@@ -848,7 +850,7 @@ impl<B: ChainBody> GpuModel<B> {
                 StepMode::Graph => self.replay(1, Chain::Step),
             };
             self.name_host_refusal(r)?;
-            self.keep_rows(1, crate::host::PassKind::Step);
+            self.keep_rows(1, crate::host::PassKind::Step)?;
             self.stand_at(pos + 1);
         }
         self.heads
@@ -894,9 +896,10 @@ impl<B: ChainBody> GpuModel<B> {
     /// The pass the last boundary opened keeps its first `kept` rows
     /// ([`HostServed::keep_rows`]): what its caller, which knows the pass's
     /// outcome, says before the next pass.
-    pub fn keep_rows(&mut self, kept: usize, kind: crate::host::PassKind) {
-        if let Some(host) = self.body.host() {
-            host.keep_rows(kept, kind);
+    pub fn keep_rows(&mut self, kept: usize, kind: crate::host::PassKind) -> Result<(), GpuError> {
+        match self.body.host() {
+            Some(host) => host.keep_rows(kept, kind),
+            None => Ok(()),
         }
     }
 

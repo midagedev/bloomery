@@ -521,7 +521,7 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
                 })?;
             self.model.rollback(back)?;
         }
-        self.model.keep_rows(accepted, PassKind::Pair);
+        self.model.keep_rows(accepted, PassKind::Pair)?;
         Ok(())
     }
 }

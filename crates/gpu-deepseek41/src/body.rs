@@ -2591,8 +2591,8 @@ impl HostServed for Body {
         self.residency_glue.at_boundary(&mut self.hybrid, stream)
     }
 
-    fn keep_rows(&mut self, kept: usize, kind: PassKind) {
-        self.residency_glue.keep_rows(&mut self.hybrid, kept, kind);
+    fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
+        self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
     }
 
     fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {

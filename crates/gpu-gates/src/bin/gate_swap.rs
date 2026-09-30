@@ -70,6 +70,10 @@
 //!   refused by name, and so is a kept row with a slot missing, after which
 //!   the machine takes the full row (its mutant: a note that does not check
 //!   the slot's bit).
+//! - keep: a count the tier's own `keep_rows` gives with no pass open,
+//!   after a reset, is refused by name — the write side of the boundary's
+//!   kept-count refusal — and nothing is stored, so the next boundary
+//!   still runs (its mutant: the refusal dropped, the count stored).
 //! - broken: a failure after a boundary's first change is a named error, and
 //!   every later boundary, end of pass and reset is refused naming it (its
 //!   mutant: the machine not marked broken).
@@ -1990,6 +1994,59 @@ mod gate {
         Ok(ok)
     }
 
+    /// keep: the tier's own `keep_rows` refuses a count with no pass open —
+    /// the write side of the boundary's kept-count refusal.
+    fn keep_clause(gpu: &Gpu) -> Result<bool, GateError> {
+        let stacks = Stacks::new(gpu)?;
+        let source = Arc::new(Synth::new(&stacks, N_L, Faults::default()));
+        let slots = seed_map(&[])?;
+        let view = Arc::new(DeviceTensor::upload(
+            gpu.stream(),
+            &slots.stage_view(),
+            L,
+            E,
+        )?);
+        let boundary = Boundary::with_rows(
+            gpu.context(),
+            gpu.stream(),
+            BoundaryShape {
+                hidden: TIER_HIDDEN,
+                n_used: K,
+            },
+            MAX_ROWS,
+        )?;
+        let mut tier = HostTier::new(boundary, slots, NoExperts, L)?;
+        tier.start_swap(
+            gpu.context(),
+            gpu.stream(),
+            view,
+            source,
+            cfg(DELAY, DEADLINE),
+        )?;
+        tier.swap_boundary(gpu.stream())?
+            .ok_or("gate_swap: the tier's boundary")?;
+        let kept_open = tier.keep_rows(1, PassKind::Step).is_ok();
+        tier.swap_reset(gpu.stream())?
+            .ok_or("gate_swap: the tier's reset")?;
+        let no_pass = tier.swap().is_some_and(|m| !m.pass_open());
+        let refused = tier
+            .keep_rows(1, PassKind::Step)
+            .err()
+            .map(|e| e.to_string());
+        let named = refused
+            .as_deref()
+            .is_some_and(|e| e.contains("no boundary opened the pass"));
+        let after = tier.swap_boundary(gpu.stream()).is_ok();
+        let ok = kept_open && no_pass && named && after;
+        println!(
+            "keep: a step kept on the pass the boundary opened {kept_open}; after the reset no \
+             pass open {no_pass}, that keep {refused:?} named {named}, nothing stored (the next \
+             boundary {after}) {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// broken: every stack destination of the first flip's layer fails, so
     /// its boundary fails after its first change.
     fn broken(
@@ -2371,7 +2428,7 @@ mod gate {
                 tier.swap_tally().ok_or("gate_swap: the tier's tally")?,
                 rows,
             )?;
-            tier.keep_rows(*kept, PassKind::Driver);
+            tier.keep_rows(*kept, PassKind::Driver)?;
         }
         window.store(0, Ordering::Release);
         let made = tier
@@ -2944,6 +3001,7 @@ mod gate {
         ok &= tier(&gpu, &pm, &trace, &a)?;
         ok &= staging_failure(&gpu, &pm, &trace, &a)?;
         ok &= tally_clause(&gpu, &pm, &trace)?;
+        ok &= keep_clause(&gpu)?;
         ok &= broken(&gpu, &pm, &trace, &a)?;
         ok &= panic_clause(&gpu, &pm, &trace, &a)?;
         ok &= refusal(&gpu, &pm, &trace)?;

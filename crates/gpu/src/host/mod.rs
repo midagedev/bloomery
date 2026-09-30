@@ -335,15 +335,19 @@ fn pass_kept(
             "the last pass's kept rows (HostTier::keep_rows)",
         )),
         (false, None) => Ok(None),
-        (false, Some((rows, kind))) => Err(GpuError::protocol(
-            WHAT,
-            format!(
-                "{rows} rows kept as a {} pass with no pass open: no boundary opened the pass \
-                 they would end",
-                kind.word()
-            ),
-        )),
+        (false, Some((rows, kind))) => Err(GpuError::protocol(WHAT, kept_with_no_pass(rows, kind))),
     }
+}
+
+/// A kept count with no pass open, refused by name at the write
+/// ([`HostTier::keep_rows`]) and at the read ([`pass_kept`], the next
+/// boundary): one wording, one owner.
+fn kept_with_no_pass(rows: usize, kind: PassKind) -> String {
+    format!(
+        "{rows} rows kept as a {} pass with no pass open: no boundary opened the pass \
+         they would end",
+        kind.word()
+    )
 }
 
 /// What a residency pass was, as its caller names it when it keeps its rows
@@ -747,12 +751,19 @@ impl<H: HostExperts> HostTier<H> {
 
     /// The pass that just ran, a `kind`, keeps its first `kept` rows (a
     /// step 1, a verify its accepted rows, a prompt call 0): what the next
-    /// boundary folds, which refuses by name a count given with no pass open.
-    /// Nothing without a machine.
-    pub fn keep_rows(&mut self, kept: usize, kind: PassKind) {
-        if self.swap.is_some() {
-            self.swap_kept = Some((kept, kind));
+    /// boundary folds. Refused by name — the write side of the refusal the
+    /// next boundary makes ([`pass_kept`]) — a count given with no pass
+    /// open. Nothing without a machine.
+    pub fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
+        const WHAT: &str = "HostTier::keep_rows";
+        let Some(m) = self.swap.as_ref() else {
+            return Ok(());
+        };
+        if !m.pass_open() {
+            return Err(GpuError::protocol(WHAT, kept_with_no_pass(kept, kind)));
         }
+        self.swap_kept = Some((kept, kind));
+        Ok(())
     }
 
     /// The residency boundary before a pass on `stream`

@@ -163,8 +163,11 @@ fn call<T>(
 ) -> Result<T, GpuError> {
     m.pass_boundary()?;
     let r = run(m);
-    m.keep_rows(0, PassKind::Prompt);
-    r
+    let kept = m.keep_rows(0, PassKind::Prompt);
+    // The call's own error first: a keep refused after a failed call is its echo.
+    let v = r?;
+    kept?;
+    Ok(v)
 }
 
 impl Keep for Body {

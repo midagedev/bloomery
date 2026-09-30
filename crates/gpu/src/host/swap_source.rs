@@ -576,8 +576,8 @@ impl ResidencyGlue {
         tier: &mut HostTier<H>,
         kept: usize,
         kind: PassKind,
-    ) {
-        tier.keep_rows(kept, kind);
+    ) -> Result<(), GpuError> {
+        tier.keep_rows(kept, kind)
     }
 
     /// The residency back to its seed at a quiet boundary
