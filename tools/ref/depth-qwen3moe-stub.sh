@@ -60,6 +60,8 @@
 #                `residency mid-p148-s1 (set) passes 3 kept 30 landed 3 late 1 made 3 bytes 12288` (the none and
 #                prompt boundaries not counted) and the per-arm mean line; STUB_GEN_STATS=1 adds `host slots/token
 #                3.4`. Under a copy with no residency kind the same arm is a FAIL row naming the schema, rc 1.
+#   res-nolever  the copy with the residency kinds, 6@BLOOMERY_RESIDENCY=mid-p148-s1 with no STUB_GEN_RES (the stub
+#                prints no lever record): a FAIL row naming the missing record, rc 1, never a row with no column.
 #   cpu-guard    STUB_CPU_BUSY=1 (every CPU sample 99 %), 6 lcpp:6: both rows [cpu-busy], `cpu-busy rows: 2 of 2`.
 #   profile-3090 the real models/qwen4exp.sh: -ncmoe 43 with the 3090 as the timing card, 26 with the A6000 or
 #                none; another card with no 3090 UUID resolved: refused by name, rc 64.
@@ -922,6 +924,10 @@ RC1=$RC
 qschema "$QS" 1
 L2=$tmp/res-sums.log
 stub_run "$L2" BLOOMERY_AB_ROUNDS=1 STUB_GEN_RES=mid-p148-s1 STUB_GEN_STATS=1 -- 6@BLOOMERY_RESIDENCY=mid-p148-s1
+RC2=$RC
+L3=$tmp/res-nolever.log
+stub_run "$L3" BLOOMERY_AB_ROUNDS=1 -- 6@BLOOMERY_RESIDENCY=mid-p148-s1
+RC3=$RC RC=$RC2
 cp "$tmp/qschema.keep" "$QS"
 if [ "$RC1" != 1 ]; then
   fail res-sums "a schema with no residency kind: rc $RC1, want 1" "$L"
@@ -931,6 +937,11 @@ elif want res-sums "$L" 1 "^FAIL r1 ours@[^ ]* d=6 rc=0 \| the arm runs BLOOMERY
   want res-sums "$L2" 1 '^ROW r1 ours@[^ ]* d=6 .* \| host slots/token 3\.4 \| residency mid-p148-s1 \(set\) passes 3 kept 30 landed 3 late 1 made 3 bytes 12288 \| ' &&
   want res-sums "$L2" 1 '^residency mean ours@[^ ]* d=6 mid-p148-s1: rows 1, passes/row 3\.0, kept/pass 10\.00, landed/pass 1\.000, late/pass 0\.333, made/pass 1\.000$'; then
   pass res-sums
+fi
+if [ "$RC3" != 1 ]; then
+  fail res-nolever "an arm that asks for residency and prints no lever record: rc $RC3, want 1" "$L3"
+elif want res-nolever "$L3" 1 "^FAIL r1 ours@[^ ]* d=6 rc=0 \| the arm runs BLOOMERY_RESIDENCY=mid-p148-s1 and printed no residency lever record, which its schema declares"; then
+  pass res-nolever
 fi
 
 L=$tmp/cpu-guard.log
