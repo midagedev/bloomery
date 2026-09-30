@@ -345,6 +345,26 @@ box-gc` sends `tools/box-gc.sh` that way). The lease's one probe is `lease_free`
 true` is a take for a few ms and reads a free lease as held beside another
 probe (429 of 1,000 parallel probes on the box, 2026-09-26).
 
+**Batch only the overlap; land the rest as it comes** (user, 2026-10-01). The cost to cut is a
+gate run that repeats. Before landing, run `just affected` on each pending piece (a commit or a
+branch) and sort the pieces:
+- **Express.** A piece whose gate set is small (a predicted wall of 15 minutes or less), or
+  disjoint from every other pending piece's, lands alone as soon as it is Mac-green. It runs its
+  own `tools/gate-batch.sh --ledger`, ff-merges and pushes, and never waits for a train.
+- **Train.** Only pieces whose sets overlap wait and land together. A change in `crates/gpu`,
+  `crates/model` or `crates/levers` selects 77–119 gates, and one run of the union replaces one run
+  per piece. T2 is the worked case: 44 commits, 2,429 gate runs one by one, against a union of 119.
+
+The two lanes do not undo each other's work. A rebase moves only the keys of gates whose closure
+holds the landed files, so an express landing leaves a train's greens standing. The box already
+schedules small runs: one gate lock per card, the timing lease, and `any` recipes placed on an
+idle card. A gate set therefore needs no window of its own. A hold is for a timing sitting, the
+case its header names; a functional window of gates and mutants takes the card locks only, so
+it never parks another track's small run behind it. Rounds run their owning gates the same way,
+through `--round-ledger`. The same rule applies inside a gate: a clause another gate already pins,
+a model load a sibling arm repeats, or a gate the ptx-scan shows untouched is duplicate work to
+remove, not to schedule around.
+
 Track checklist, first and last:
 
 1. **First**: `just box-gc` — clear anything a previous track left under this
