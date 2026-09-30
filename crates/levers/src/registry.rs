@@ -1235,6 +1235,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The depth runners: steps our arm runs before its statistics (`--warm`).",
     ),
     runner(
+        "BLOOMERY_GEN_PAIR",
+        Some("ref/depth-glm5next.sh"),
+        "The GLM depth runner: our arm runs --pair after its steps (the verify's V2/S1).",
+    ),
+    runner(
         "BLOOMERY_GEN_PLACE",
         Some("ref/depth-ds41.sh"),
         "The depth runners: our arms' `--place` — `a` (plan (a), the A6000; the \
