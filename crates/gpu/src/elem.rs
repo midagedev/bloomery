@@ -23,7 +23,7 @@ use crate::flash::{f32_to_f16_bits, f32x2_to_f16x2_bits};
 use crate::hybrid::HOST;
 use crate::launch_u32;
 use crate::tensor::DeviceTensor;
-use crate::view::Apply;
+use crate::view::{Apply, Elem, Elem2, RopePair};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
@@ -576,27 +576,13 @@ mod elem_kernels {
         if i >= total {
             return;
         }
-        let col = i / npairs;
-        let d = (i % npairs) * 2;
         let nd = nd as usize;
-        let t = col / n_vec as usize;
-        // SAFETY: d + 1 <= nd - 1, so both src indices stay below
-        // m*n_vec*nd <= src.len() and both cache indices below m*nd <=
-        // cs.len() by the launch contract.
-        let (x0, x1, c, s) = unsafe {
-            (
-                *src.get_unchecked(col * nd + d),
-                *src.get_unchecked(col * nd + d + 1),
-                *cs.get_unchecked(t * nd + d),
-                *cs.get_unchecked(t * nd + d + 1),
-            )
-        };
-        let (y0, y1) = rope_pair_core(x0, x1, c, s);
-        // SAFETY: the same indices as the loads, inside dst by the contract.
-        unsafe {
-            *dst.get_unchecked_mut(col * nd + d) = y0;
-            *dst.get_unchecked_mut(col * nd + d + 1) = y1;
-        }
+        // SAFETY: the `requires` above were launcher-checked, `nd`, `n_vec`
+        // and `npairs` are this kernel's own parameters and `i` this thread's
+        // `index_1d` past the `i < total` guard, and the launch is `domain =
+        // 1` with the contract's exact 1-D block.
+        let pair = unsafe { RopePair::new(src, cs, &mut dst, i, npairs, nd, n_vec as usize) };
+        pair.map(rope_pair_core);
     }
 
     /// The card's slot list of a hybrid layer whose card holds the id
@@ -625,16 +611,17 @@ mod elem_kernels {
         if i >= n as usize {
             return;
         }
-        // SAFETY: i < n <= ids.len() by the launch contract.
-        let id = unsafe { *ids.get_unchecked(i) };
-        if id >= n_expert {
-            fault.raise(FaultSite::ExpertId);
-        }
-        // SAFETY: i < n <= sel.len() by the launch contract; thread i alone
-        // writes it.
-        unsafe {
-            *sel.get_unchecked_mut(i) = if id < n_card { id } else { HOST };
-        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem::new(ids, &mut sel, i) };
+        e.map(move |id| {
+            if id >= n_expert {
+                fault.raise(FaultSite::ExpertId);
+            }
+            if id < n_card { id } else { HOST }
+        });
     }
 
     /// `y[i] = silu(gate[i]) * up[i]`, elementwise over `n` values.
@@ -650,12 +637,12 @@ mod elem_kernels {
         if i >= n as usize {
             return;
         }
-        // SAFETY: i < n bounds both loads by the launch contract.
-        let (g, u) = unsafe { (*gate.get_unchecked(i), *up.get_unchecked(i)) };
-        // SAFETY: i < n <= y.len() by the launch contract.
-        unsafe {
-            *y.get_unchecked_mut(i) = silu_mul(g, u);
-        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem2::new(gate, up, &mut y, i) };
+        e.map(silu_mul);
     }
 
     /// `y[i] = a[i] + b[i]`, elementwise over `n` values — exact; the body
@@ -672,12 +659,12 @@ mod elem_kernels {
         if i >= n as usize {
             return;
         }
-        // SAFETY: i < n bounds both loads by the launch contract.
-        let (av, bv) = unsafe { (*a.get_unchecked(i), *b.get_unchecked(i)) };
-        // SAFETY: i < n <= y.len() by the launch contract.
-        unsafe {
-            *y.get_unchecked_mut(i) = av + bv;
-        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem2::new(a, b, &mut y, i) };
+        e.map(|av, bv| av + bv);
     }
 
     /// The routed-expert combine, one thread per (token, output value):
@@ -734,12 +721,12 @@ mod elem_kernels {
         if i >= n as usize {
             return;
         }
-        // SAFETY: i < n <= bits.len() by the launch contract.
-        let b = unsafe { *bits.get_unchecked(i) } as u16;
-        // SAFETY: i < n <= y.len() by the launch contract.
-        unsafe {
-            *y.get_unchecked_mut(i) = half_to_f32(b);
-        }
+        // SAFETY: the `requires` above were launcher-checked, `n` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the `i < n`
+        // guard, and the launch is `domain = 1` with the contract's exact 1-D
+        // block.
+        let e = unsafe { Elem::new(bits, &mut y, i) };
+        e.map(|b| half_to_f32(b as u16));
     }
 
     /// Every f32 bit pattern `x`, one per thread (the launch is exactly 2^32

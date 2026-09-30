@@ -61,6 +61,7 @@ use crate::gemm::{Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput,
 use crate::linear::{sigmoid, silu};
 use crate::q8f32::{f32_lane_partial_1col, gemv_lane_sums, q8_0_lane_partials_mcol};
 use crate::tensor::DeviceTensor;
+use crate::view::{Elem, StreamFma, StreamNorm};
 use crate::{GpuError, launch_u32, store_cols};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
@@ -365,50 +366,35 @@ mod hc_kernels {
         }
         let tid = thread::threadIdx_x() as usize;
         let hid = hidden as usize;
-        let base = (c * STREAMS + s) * hid;
         // SAFETY: this block's own shared allocation, reached without a
         // reference; `block_sum` is its only user.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
-        let w = if combine == 1 {
-            // SAFETY: c·4 + s < m·4 <= wgt.len().
-            unsafe { *wgt.get_unchecked(c * STREAMS + s) }
-        } else {
-            0.0
+        // SAFETY: the `requires` above were launcher-checked, `(c, s)` is this
+        // block's stream past the `c < m` guard, `hid`, `combine`, `init` are
+        // this kernel's own parameters and `tid` its thread's own, and the
+        // launch's block is the contract's exact 1-D `(NORM_THREADS, 1, 1)`.
+        let mut stream = unsafe {
+            StreamNorm::<STREAMS>::new(
+                y,
+                wgt,
+                gamma,
+                &mut res,
+                &mut xn,
+                (c, s),
+                (combine, init),
+                hid,
+                tid,
+                NORM_THREADS,
+            )
         };
-        let mut acc = 0.0f32;
-        let mut i = tid;
-        while i < hid {
-            // SAFETY: base + i < m·4·hidden <= res.len(), c·hidden + i <
-            // m·hidden <= y.len(); this block owns stream s of column c and
-            // this thread value i of it.
-            let x = unsafe {
-                let r = res.get_unchecked_mut(base + i);
-                if combine == 1 {
-                    *r = f32::mul_add(w, *y.get_unchecked(c * hid + i), *r);
-                } else if init == 1 {
-                    *r = *y.get_unchecked(c * hid + i);
-                }
-                *r
-            };
-            acc = f32::mul_add(x, x, acc);
-            i += NORM_THREADS;
-        }
+        let acc = stream.combine_fold(0.0f32, f32::mul_add, |acc, x| f32::mul_add(x, x, acc));
         // SAFETY: `ws` is NORM_WARPS f32 of this block's shared memory.
         let sum = unsafe { block_sum(acc, tid, ws) };
         if tid == 0 && !sum.is_finite() {
             fault.raise(SITE);
         }
         let r = 1.0 / (sum / hidden as f32 + eps).sqrt();
-        let mut i = tid;
-        while i < hid {
-            // SAFETY: as above; s·hidden + i < 4·hidden <= gamma.len(). The
-            // value was written by this thread in the pass above.
-            unsafe {
-                let x = *res.get_unchecked_mut(base + i);
-                *xn.get_unchecked_mut(base + i) = (x * r) * *gamma.get_unchecked(s * hid + i);
-            }
-            i += NORM_THREADS;
-        }
+        stream.apply(move |x, g| (x * r) * g);
     }
 
     /// The down's partial dots: blocks below 160 are Q8_0 row tiles, block
@@ -655,15 +641,12 @@ mod hc_kernels {
         if i >= m as usize * STREAMS * hid {
             return;
         }
-        let (cs, v) = (i / hid, i % hid);
-        let c = cs / STREAMS;
-        // SAFETY: i < m·4·hidden <= res.len(), cs < m·4 <= wgt.len(), c·hidden
-        // + v < m·hidden <= y.len(); one thread a value.
-        let out = unsafe {
-            let r = res.get_unchecked_mut(i);
-            *r = f32::mul_add(*wgt.get_unchecked(cs), *y.get_unchecked(c * hid + v), *r);
-            *r
-        };
+        // SAFETY: the `requires` above were launcher-checked, `hid` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the
+        // `i < m·4·hidden` guard, and the launch is `domain = 1` with the
+        // contract's exact 1-D block.
+        let cell = unsafe { StreamFma::<STREAMS>::new(y, wgt, &mut res, i, hid) };
+        let out = cell.map(f32::mul_add);
         if !out.is_finite() {
             fault.raise(SITE);
         }
@@ -1061,52 +1044,35 @@ mod hc_wide_kernels {
         }
         let tid = thread::threadIdx_x() as usize;
         let hid = hidden as usize;
-        let base = (c * STREAMS + s) * hid;
         // SAFETY: this block's own shared allocation, reached without a
         // reference; `block_sum` is its only user.
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WS) };
-        let w = if combine == 1 {
-            // SAFETY: c·4 + s < m·4 <= wgt.len().
-            unsafe { *wgt.get_unchecked(c * STREAMS + s) }
-        } else {
-            0.0
+        // SAFETY: the `requires` above were launcher-checked, `(c, s)` is this
+        // block's stream past the `c < m` guard, `hid`, `combine`, `init` are
+        // this kernel's own parameters and `tid` its thread's own, and the
+        // launch's block is the contract's exact 1-D `(NORM_THREADS, 1, 1)`.
+        let mut stream = unsafe {
+            StreamNorm::<STREAMS>::new(
+                y,
+                wgt,
+                gamma,
+                &mut res,
+                &mut xn,
+                (c, s),
+                (combine, init),
+                hid,
+                tid,
+                NORM_THREADS,
+            )
         };
-        let mut acc = 0.0f32;
-        let mut i = tid;
-        while i < hid {
-            // SAFETY: base + i < m·4·hidden <= res.len(), c·hidden + i <
-            // m·hidden <= y.len(); this block owns stream s of column c and
-            // this thread value i of it.
-            let x = unsafe {
-                let r = res.get_unchecked_mut(base + i);
-                if combine == 1 {
-                    *r = f32::mul_add(w, *y.get_unchecked(c * hid + i), *r);
-                } else if init == 1 {
-                    *r = *y.get_unchecked(c * hid + i);
-                }
-                *r
-            };
-            acc = f32::mul_add(x, x, acc);
-            i += NORM_THREADS;
-        }
+        let acc = stream.combine_fold(0.0f32, f32::mul_add, |acc, x| f32::mul_add(x, x, acc));
         // SAFETY: `ws` is NORM_WARPS f32 of this block's shared memory.
         let sum = unsafe { block_sum(acc, tid, ws) };
         if tid == 0 && !sum.is_finite() {
             fault.raise(SITE);
         }
         let r = 1.0 / (sum / hidden as f32 + eps).sqrt();
-        let mut i = tid;
-        while i < hid {
-            // SAFETY: base + i < m·4·hidden <= res.len(), xn.len(), and
-            // s·hidden + i < 4·hidden <= gamma.len(), by the launch contract;
-            // this thread wrote res[base + i] in the pass above and is the
-            // only writer of xn[base + i].
-            unsafe {
-                let x = *res.get_unchecked_mut(base + i);
-                *xn.get_unchecked_mut(base + i) = (x * r) * *gamma.get_unchecked(s * hid + i);
-            }
-            i += NORM_THREADS;
-        }
+        stream.apply(move |x, g| (x * r) * g);
     }
 
     /// [`hc_kernels::hc_gated_combine_4`] over any number of columns: value
@@ -1135,15 +1101,12 @@ mod hc_wide_kernels {
         if i >= m as usize * STREAMS * hid {
             return;
         }
-        let (cs, v) = (i / hid, i % hid);
-        let c = cs / STREAMS;
-        // SAFETY: i < m·4·hidden <= res.len(), cs < m·4 <= wgt.len(), c·hidden
-        // + v < m·hidden <= y.len(); one thread a value.
-        let out = unsafe {
-            let r = res.get_unchecked_mut(i);
-            *r = f32::mul_add(*wgt.get_unchecked(cs), *y.get_unchecked(c * hid + v), *r);
-            *r
-        };
+        // SAFETY: the `requires` above were launcher-checked, `hid` is this
+        // kernel's parameter and `i` this thread's `index_1d` past the
+        // `i < m·4·hidden` guard, and the launch is `domain = 1` with the
+        // contract's exact 1-D block.
+        let cell = unsafe { StreamFma::<STREAMS>::new(y, wgt, &mut res, i, hid) };
+        let out = cell.map(f32::mul_add);
         if !out.is_finite() {
             fault.raise(SITE);
         }
@@ -1178,29 +1141,36 @@ mod hc_wide_kernels {
         let i = thread::index_1d().get();
         let n = m as usize * RANK;
         if i < n {
-            // SAFETY: i < m·320 <= down.len(), lo.len(); one thread a value.
-            let l = unsafe { silu(*down.get_unchecked(i) * INV) };
-            if !l.is_finite() {
-                fault.raise(SITE);
-            }
-            // SAFETY: i < m·320 <= lo.len() by the launch contract; this
-            // thread is value i's only writer.
-            unsafe { *lo.get_unchecked_mut(i) = l };
+            // SAFETY: the `requires` above were launcher-checked, `n = m·320`
+            // comes from this kernel's parameter and `i` is this thread's
+            // `index_1d` below it, and the launch is `domain = 1` with the
+            // contract's exact 1-D block.
+            let e = unsafe { Elem::new(down, &mut lo, i) };
+            e.map(move |d| {
+                let l = silu(d * INV);
+                if !l.is_finite() {
+                    fault.raise(SITE);
+                }
+                l
+            });
             return;
         }
         let j = i - n;
         if inject == 0 || j >= m as usize * STREAMS {
             return;
         }
-        // SAFETY: j < m·4 <= inj.len(), wgt.len() with inject 1; one thread a
-        // weight.
-        let w = 2.0 * sigmoid(unsafe { *inj.get_unchecked(j) } * INV);
-        if !w.is_finite() {
-            fault.raise(SITE);
-        }
-        // SAFETY: j < m·4 <= wgt.len() with inject 1, by the launch
-        // contract; this thread is weight j's only writer.
-        unsafe { *wgt.get_unchecked_mut(j) = w };
+        // SAFETY: the `requires` above were launcher-checked (with `inject`
+        // 1 they read `inj.len()`, `wgt.len() >= m·4`), `j` is this thread's
+        // `index_1d` less the grid-uniform `n`, below `m·4` past the guard,
+        // and the launch is `domain = 1` with the contract's exact 1-D block.
+        let e = unsafe { Elem::new(inj, &mut wgt, j) };
+        e.map(move |v| {
+            let w = 2.0 * sigmoid(v * INV);
+            if !w.is_finite() {
+                fault.raise(SITE);
+            }
+            w
+        });
     }
 
     /// The mixed values of `m` columns: value `i = c·hidden + h` is `(xn_0·
