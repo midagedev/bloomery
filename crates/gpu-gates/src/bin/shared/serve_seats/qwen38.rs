@@ -39,17 +39,52 @@
 //! rule. Where the body does take positions back — a verify's commit — no
 //! request path reaches.
 //!
-//! Under `BLOOMERY_DRAFT=mtp` the seat drives the session through the
-//! runtime's speculative loop with the shared window `app::mtp::MtpDraft` (the
-//! shared draft file beside the target or `BLOOMERY_MTP_DRAFT`'s, its head
-//! reduced under `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows, the greedy ids the
-//! plain server's, `pass_rows` 4. A sampling or id-banning request takes
-//! plain steps (the server's loop asks a pass only of a greedy request with
-//! no banned id), each step's row the target's, read before the step is told
+//! `BLOOMERY_DRAFT` unset follows the placement as `generate_qwen3moe`'s
+//! does (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft
+//! runs when a regular file is where it would be opened
+//! (`BLOOMERY_MTP_DRAFT`, else the shared draft file beside the target); the
+//! plain path runs under `--place gate`, with no file there, and with stores
+//! too short for one window (`--ctx-size` under 5), each printed as a `load
+//! draft=off (<why>)` record after the `load` line (`no file at <path>` for
+//! the missing file), never a refusal. `BLOOMERY_DRAFT=off` is the plain
+//! path with the same record; `mtp` drafts wherever the draft loads. The
+//! CLI's `--logits` and route-trace conditions have no seat equivalent: a
+//! request that reads the logits row steps plainly, and the seat does not
+//! take the route trace.
+//!
+//! Drafting, the seat drives the session through the runtime's speculative
+//! loop with the shared window `app::mtp::MtpDraft` (the shared draft file
+//! beside the target or `BLOOMERY_MTP_DRAFT`'s, its head reduced under
+//! `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows, the greedy ids the plain
+//! server's, `pass_rows` 4. A sampling or id-banning request takes plain
+//! steps (the server's loop asks a pass only of a greedy request with no
+//! banned id), each step's row the target's, read before the step is told
 //! to the draft; its ids are the plain server's. A `load draft=mtp` line
 //! follows the `load` line, and `/props`' `engine.draft` names the draft
-//! with its resident bytes as the card's `draft` class. Unset and `off` are the plain path; every other
-//! word of the lever is refused by name.
+//! with its resident bytes as the card's `draft` class. Every other word of
+//! the lever is refused by name, and so are `BLOOMERY_MTP_HEAD_ROWS` and
+//! `BLOOMERY_MTP_DRAFT` set on a server that drafts nothing, with why.
+//!
+//! `BLOOMERY_RESIDENCY` set prints as a `residency lever` record first
+//! thing. Unset, the Qwen3.8 rule picks the word as in `generate_qwen3moe`
+//! (`bloomery_levers::residency38_unset`, `residency38_at_plan`) and a
+//! `residency unset` record after the `plan` line prints it with why: under
+//! `--place a` `mid-p<P>-s1`, P half the fewest card experts a layer of the
+//! plan the load runs (the plain or the MTP plan, at `--ctx-size`); `off`
+//! under `--place gate`, when the plan holds no card expert or its fewest
+//! leave no room, and when the churn pool does not fit the plan's host
+//! headroom or what `MemAvailable` leaves past the plan's host need — never
+//! a refusal. Running `mid-p<P>-s<S>` (plain or drafted, either `--place`),
+//! the load runs the common residency machine over the card's routed stacks
+//! (`Body38::open_placed_residency`, `open_placed_mtp_residency`): a
+//! `residency host` record follows the `plan` line, and each call (a prompt,
+//! a step, a pass) prints its boundaries' `residency pass` records after it.
+//! A request's reset keeps the residency where use has taken it; `POST
+//! /residency/reset` moves it back to its seed on a free slot and prints a
+//! `residency reset` record (without the residency, the server's 501). The
+//! seat's prompt path is `auto` — passes below nine ids, ubatches from nine
+//! on, never one step an id — so the body's refusal of a step-fed prompt
+//! beside the machine is never reached.
 //!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
@@ -65,7 +100,8 @@
 //! with this process's values and exits. The Qwen3.8 levers are
 //! `BLOOMERY_QWEN38_EXPERTS` (the plan's expert rule) with
 //! `BLOOMERY_CARD_BUDGET` bounding its card plan, the host
-//! tier's load settings, and `BLOOMERY_PIN_MAIN`; the ubatch size
+//! tier's load settings, `BLOOMERY_PIN_MAIN`, the draft's levers and
+//! `BLOOMERY_RESIDENCY`; the ubatch size
 //! (`BLOOMERY_QWEN3_UBATCH`) is read where the load sizes its arena. The
 //! stderr lines named above are records of the kinds
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
@@ -78,6 +114,7 @@ use std::time::Instant;
 use app::mtp::MtpBody;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38};
+use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
@@ -85,19 +122,24 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, ref_model_path};
+use bloomery_levers::{
+    Draft38At, Draft38Off, RESIDENCY38_SPARES, Residency38At, ResidencyPick, ResidencyWhy,
+    draft38_unset, residency38_at_plan, residency38_unset,
+};
 use cuda_core::sys;
 use gguf::Split;
 use model::arch::models::HeadRows;
 use model::arch::qwen35moe::place::{
     Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
 };
-use model::placement::PlanLevers;
-use model::placement::workstation::{A6000, CardSpec, RTX_3090};
+use model::placement::churn::ChurnPool;
+use model::placement::workstation::{A6000, CardSpec, HostNeed, RTX_3090, host_available};
+use model::placement::{Plan, PlanLevers};
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
 use serve::{
-    CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, Saved, ServeError, Server,
-    ServerConfig,
+    CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
+    Server, ServerConfig,
 };
 use tokenizer::Tokenizer;
 
@@ -118,6 +160,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::DRAFT,
     bloomery_levers::MTP_HEAD_ROWS,
     bloomery_levers::MTP_DRAFT,
+    bloomery_levers::RESIDENCY,
 ];
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate] \
@@ -187,6 +230,117 @@ fn experts38(levers: &bloomery_levers::Levers) -> Result<Experts, GateError> {
     }
 }
 
+/// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions,
+/// `file` the MTP draft file the load would open: `mtp` the draft, `off` the
+/// plain path; unset, `generate_qwen3moe`'s rule
+/// (`bloomery_levers::draft38_unset`); and, drafting nothing, why (the `load
+/// draft=off` record's). The V4.1 words and any other are refused by name.
+///
+/// The rule's run conditions as the seat meets them: no `--logits` (a
+/// request that reads the logits row steps plainly, the row the target's),
+/// no route trace (the seat does not act on `BLOOMERY_ROUTE_TRACE`, so
+/// `at_main` refuses it set), and the positions the server's loop needs for
+/// one window — it takes one only while its rows fit, the first at a one-id
+/// prompt's first generated token: 1 + 1 + rows − 1.
+fn draft38(
+    levers: &bloomery_levers::Levers,
+    place: Place38,
+    ctx: usize,
+    file: &Path,
+) -> Result<(bool, Option<Draft38Off>), GateError> {
+    match levers.draft() {
+        Some("mtp") => Ok((true, None)),
+        Some("off") => Ok((false, Some(Draft38Off::Set))),
+        Some(other) => Err(format!(
+            "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window and off runs the \
+             plain path; lookup and dspark are the V4.1 binaries'"
+        )
+        .into()),
+        None => {
+            let at = Draft38At {
+                place_a: matches!(place, Place38::A),
+                logits: false,
+                route_trace: false,
+                file,
+                file_is_there: file.is_file(),
+                need: <Body38 as MtpBody>::VERIFY_ROWS + 1,
+                ctx,
+            };
+            Ok(match draft38_unset(&at) {
+                None => (true, None),
+                Some(off) => (false, Some(off)),
+            })
+        }
+    }
+}
+
+/// The plan's card a qwen4exp open loads: its one card.
+const CARD38: usize = 0;
+
+/// The residency the load of `plan` at `place` runs: `set` (the word and
+/// its parse) as given; unset, the Qwen3.8 rule's — before the plan
+/// (`bloomery_levers::residency38_unset`: `off` under `--place gate`), else
+/// on plan (a) from it (`bloomery_levers::residency38_at_plan`: P half the
+/// fewest card experts a layer, `off` with why where the plan has no room,
+/// or its host headroom or `MemAvailable` none for the churn pool) — its
+/// `residency unset` record printed. Under `mid`, the `residency host`
+/// record of `plan` follows: the churn pool (card [`CARD38`]'s experts past
+/// the pinned ones) the load's host set holds beside the plan's host
+/// segments, which the load refuses by name for a set word when the plan's
+/// host headroom cannot take it.
+fn residency38(
+    plan: &Plan<'_>,
+    place: Place38,
+    set: Option<(Residency, &str)>,
+) -> Result<Residency, GateError> {
+    let (residency, word) = match set {
+        Some((r, word)) => (r, word.to_owned()),
+        None => {
+            // The seat feeds no prompt by steps (its path is `auto`) and
+            // takes no route trace.
+            let at = Residency38At {
+                qwen38_file: true,
+                dump_taps: false,
+                place_a: matches!(place, Place38::A),
+                route_trace: false,
+                prefill_step: false,
+            };
+            let pick = match residency38_unset(at) {
+                Some(off) => off,
+                None => {
+                    // The load refuses a host set past `MemAvailable` before
+                    // any upload; the default leaves the pool out instead.
+                    let available = host_available()?;
+                    let need = HostNeed::of(plan, 0).bytes();
+                    residency38_at_plan(
+                        plan.n_l.iter().copied(),
+                        |pinned| ChurnPool::of(plan, CARD38, pinned).map(|pool| pool.bytes),
+                        plan.host.headroom_bytes,
+                        i128::from(available) - i128::from(need),
+                    )
+                    .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
+                }
+            };
+            record::residency_unset(&pick).eprint();
+            let residency = match pick.pinned {
+                None => Residency::Off,
+                Some(pinned) => Residency::Mid {
+                    pinned,
+                    spares: RESIDENCY38_SPARES,
+                },
+            };
+            (residency, pick.word())
+        }
+    };
+    let Residency::Mid { pinned, .. } = residency else {
+        return Ok(residency);
+    };
+    let pool = ChurnPool::of(plan, CARD38, pinned)
+        .map_err(|e| format!("BLOOMERY_RESIDENCY={word}: the churn pool: {e}"))?;
+    record::residency_host(&word, &pool, plan).eprint();
+    Ok(residency)
+}
+
 struct Args {
     host: String,
     port: u16,
@@ -235,34 +389,42 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     record::at_main("bloomery-serve-qwen38", record::BLOOMERY_SERVE_QWEN38);
+    // Set, the word runs as given; unset, the Qwen3.8 rule picks it once the
+    // placement and the plan are known (`residency unset`).
+    if let Some(word) = levers.residency() {
+        record::residency_lever(ResidencyPick {
+            word,
+            why: ResidencyWhy::Set,
+        })
+        .eprint();
+    }
+    let set = match levers.residency() {
+        Some(word) => Some((Residency::parse(word)?, word)),
+        None => None,
+    };
     let a = parse_args(args)?;
-    let mtp = match levers.draft() {
-        None | Some("off") => false,
-        Some("mtp") => true,
-        Some(other) => {
+    let path = ref_model_path()?;
+    let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
+    let (mtp, draft_off) = draft38(&levers, a.place, a.ctx, &draft_path)?;
+    let head_rows = levers.mtp_head_rows().map(PathBuf::from);
+    // A draft lever set on a server that drafts nothing is refused, with why.
+    if let Some(why) = &draft_off {
+        if head_rows.is_some() {
             return Err(format!(
-                "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window; lookup and \
-                 dspark are the V4.1 binaries'"
+                "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; the server drafts nothing \
+                 ({why})"
             )
             .into());
         }
-    };
-    let head_rows = levers.mtp_head_rows().map(PathBuf::from);
-    if !mtp && head_rows.is_some() {
-        return Err(
-            "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; it needs BLOOMERY_DRAFT=mtp"
-                .into(),
-        );
-    }
-    if !mtp && levers.mtp_draft().is_some() {
-        return Err(
-            "BLOOMERY_MTP_DRAFT names the MTP draft file; it needs BLOOMERY_DRAFT=mtp".into(),
-        );
+        if levers.mtp_draft().is_some() {
+            return Err(format!(
+                "BLOOMERY_MTP_DRAFT names the MTP draft file; the server drafts nothing ({why})"
+            )
+            .into());
+        }
     }
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
-    let path = ref_model_path()?;
-    let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let template = match &a.template_file {
@@ -333,6 +495,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .u("host_experts", plan.host.experts)
         .u("card_experts", plan.cards[0].experts)
         .eprint();
+    let residency = residency38(&plan, a.place, set)?;
     let gpu = nvidia_smi_index(&machine.cards[0].name)
         .map(|i| format!("GPU{i}"))
         .and_then(|g| placement_props(&plan, &[g]));
@@ -358,6 +521,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_path,
         draft_from,
         draft_bytes,
+        draft_off,
+        residency,
     };
     // The prompt cache is off (its budget 0): the seat keeps no prefix
     // worth saving, and slot save/restore is the server's own 501.
@@ -405,6 +570,10 @@ struct SeatArgs {
     draft_from: DraftFrom,
     /// The plan's `draft` class bytes, which `/props` files.
     draft_bytes: u64,
+    /// Drafting nothing, why: the `load draft=off` record's.
+    draft_off: Option<Draft38Off>,
+    /// The residency the load runs ([`residency38`]).
+    residency: Residency,
 }
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
@@ -419,6 +588,9 @@ struct Q38 {
     draft_bytes: u64,
     /// The MTP draft file, which `/props`' `draft` names.
     draft_path: PathBuf,
+    /// The load runs the residency machine: each call prints its
+    /// boundaries' `residency pass` records.
+    residency: bool,
 }
 
 impl Q38 {
@@ -448,7 +620,15 @@ impl Q38 {
             false => {
                 let plan =
                     inputs.plan_with(&machine, u64::try_from(a.ctx)?, &a.plan_levers, a.experts)?;
-                Body38::open_placed(file, &plan, &inputs, 0, a.host, ub)?
+                Body38::open_placed_residency(
+                    file,
+                    &plan,
+                    &inputs,
+                    CARD38,
+                    a.host,
+                    ub,
+                    a.residency,
+                )?
             }
             true => {
                 let rows = match a.head_rows.as_deref() {
@@ -464,7 +644,17 @@ impl Q38 {
                     &mtp,
                     a.experts,
                 )?;
-                Body38::open_placed_mtp(file, &plan, &inputs, 0, a.host, ub, &draft, &mtp)?
+                Body38::open_placed_mtp_residency(
+                    file,
+                    &plan,
+                    &inputs,
+                    CARD38,
+                    a.host,
+                    ub,
+                    &draft,
+                    &mtp,
+                    a.residency,
+                )?
             }
         };
         m.set_mode(StepMode::Graph);
@@ -480,6 +670,11 @@ impl Q38 {
             m.body(WHAT)?.card_layers(),
             t.elapsed().as_secs_f64()
         );
+        if let Some(why) = &a.draft_off {
+            Record::new(&record::LOAD_DRAFT_OFF38)
+                .w("why", why)
+                .eprint();
+        }
         if a.mtp {
             let d = m.body(WHAT)?.mtp().ok_or("the load opened no MTP draft")?;
             let bytes = (d.resident_bytes() + d.arena_bytes()) as u64;
@@ -514,6 +709,12 @@ impl Q38 {
             .into());
         }
         let mut s = app::Session::from_model(m, u32::try_from(a.ctx)?);
+        let residency = a.residency != Residency::Off;
+        if residency {
+            // A request's passes are not known at load: the log grows as it
+            // must, and every call takes it.
+            s.model_mut().body_parts(WHAT)?.2.log_residency(0);
+        }
         let drafted = DraftedSeat::new(match a.mtp {
             false => None,
             true => {
@@ -538,7 +739,26 @@ impl Q38 {
             ctx: a.ctx,
             draft_bytes: a.draft_bytes,
             draft_path: a.draft_path,
+            residency,
         })
+    }
+
+    /// The `residency pass` records of the boundaries the last call made, on
+    /// stderr; nothing without the residency.
+    fn print_passes(&mut self) -> Result<(), GateError> {
+        if !self.residency {
+            return Ok(());
+        }
+        for (kind, r) in self
+            .s
+            .model_mut()
+            .body_parts("bloomery-serve-qwen38")?
+            .2
+            .take_residency_passes()
+        {
+            record::residency_pass_of(kind, &r).eprint();
+        }
+        Ok(())
     }
 }
 
@@ -556,14 +776,18 @@ impl Seat for Q38 {
     /// under the draft the draft's own prompt call, its store walked over
     /// the prompt's units.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        self.drafted.prefill(&mut self.s, ids)
+        let next = self.drafted.prefill(&mut self.s, ids)?;
+        self.print_passes()?;
+        Ok(next)
     }
 
     /// One step; under the draft the rows it left waiting walked first
     /// (`MtpDraft::before_step`: a request that continues the held
     /// sequence joins it here when its prompt call is empty).
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
-        self.drafted.step(&mut self.s, last)
+        let next = self.drafted.step(&mut self.s, last)?;
+        self.print_passes()?;
+        Ok(next)
     }
 
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
@@ -573,17 +797,39 @@ impl Seat for Q38 {
     /// One step and the target's row of it, read before the step is told
     /// to the draft ([`DraftedSeat::step_with_row`]).
     fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
-        self.drafted.step_with_row(&mut self.s, last, row)
+        let next = self.drafted.step_with_row(&mut self.s, last, row)?;
+        self.print_passes()?;
+        Ok(next)
     }
 
+    /// The session's reset: the residency stays where use has taken it
+    /// (only [`Seat::residency_reset`] moves it back).
     fn reset(&mut self) -> Result<(), GateError> {
         self.drafted.reset(&mut self.s)
+    }
+
+    /// [`app::Session::residency_reset`], its `residency reset` record on
+    /// stderr; `None` without the residency (the server's 501).
+    fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, GateError> {
+        let Some(r) = self.s.residency_reset()? else {
+            return Ok(None);
+        };
+        record::residency_reset(&r).eprint();
+        let n = |v: usize| v as u64;
+        Ok(Some(ResidencyReset {
+            cancelled: n(r.cancelled),
+            copies: n(r.copies),
+            diff: n(r.diff),
+            dropped_bytes: r.dropped_bytes,
+        }))
     }
 
     /// One pass from `last`: under the draft the window of four rows,
     /// its kept tokens and counts; without it one step.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
-        self.drafted.pass(&mut self.s, last, out)
+        let d = self.drafted.pass(&mut self.s, last, out)?;
+        self.print_passes()?;
+        Ok(d)
     }
 
     /// The most positions one pass runs: the draft's four rows, or one

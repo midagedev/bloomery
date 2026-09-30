@@ -1284,7 +1284,9 @@ gate-gpu-qwen38-residency:
 # generate_qwen3moe's (all 16, or a prefix ending in the end-of-generation id), the same /completion again and
 # once more after the other requests (a request keeps no prefix: every request prefills from a reset), a chat
 # turn streamed and not streamed (same content, [DONE] last), /tokenize of the prompt against REF_TOKENS, and a
-# prompt of the served context a 400 the server survives. Two loads; logs and the raw stream in
+# prompt of the served context a 400 the server survives; then one server alone under BLOOMERY_RESIDENCY=mid-p0-s1:
+# its residency records and passes, a reset of diff 0, the same request after it with the first one's ids. Three
+# loads; logs and the raw stream in
 # target/q38-serve-gate/. The build takes the deepseek41 feature, not the qwen family's plain gpu:
 # the server surface it links (gpu-gates' bind, serve_client; the serve and sampler crates) sits behind
 # that feature today — `just affected` and the recipes.py pins scope it so.

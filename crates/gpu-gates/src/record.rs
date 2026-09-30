@@ -1736,7 +1736,18 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
 ];
 
 /// What `bloomery-serve-qwen38` prints, all on stderr.
-pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[&PLAN38, &LISTENING38, &CACHE_REUSE, &MTP_PROMPT];
+pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
+    &PLAN38,
+    &LISTENING38,
+    &CACHE_REUSE,
+    &MTP_PROMPT,
+    &LOAD_DRAFT_OFF38,
+    &RESIDENCY_LEVER,
+    &RESIDENCY_UNSET,
+    &RESIDENCY_HOST,
+    &RESIDENCY_PASS,
+    &RESIDENCY_RESET,
+];
 
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
