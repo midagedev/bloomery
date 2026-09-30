@@ -74,7 +74,7 @@ use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
-use bloomery_gpu::host::swap::{PassReport, ResetReport, Residency};
+use bloomery_gpu::host::swap::{BoundaryAt, PassReport, ResetReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::host::tier::{TierCard, TierSet, TierShape};
 use bloomery_gpu::hybrid::{
@@ -2596,10 +2596,11 @@ impl HostServed for Body {
         self.hybrid.residency()
     }
 
-    /// The host tier's residency boundary ([`Hybrid::swap_boundary`]), its
+    /// The host tier's residency boundary at `at` ([`Hybrid::swap_at`]), its
     /// report logged when a binary asked ([`Body::log_residency`]).
-    fn at_boundary(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.residency_glue.at_boundary(&mut self.hybrid, stream)
+    fn at_boundary(&mut self, stream: &CudaStream, at: BoundaryAt) -> Result<(), GpuError> {
+        self.residency_glue
+            .at_boundary(&mut self.hybrid, stream, at)
     }
 
     fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {

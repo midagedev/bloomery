@@ -48,7 +48,8 @@
 //!   the residency where use took it — the live sets and the rule as before
 //!   it, no `residency reset` (mutant: that reset resets the residency).
 //! - `passes` (green-only): a history's boundaries end, in order, no pass,
-//!   the prompt call (one pass, 0 rows kept) and each step (1 kept).
+//!   the prompt call (one pass, 0 rows kept) and each step (1 kept), the
+//!   last step's own included: its boundary is made ahead of its readback.
 //!
 //! The gate runs with the r8 sidecar (`BLOOMERY_R8` on, its default): without
 //! it no flip unpacks, and `transform` is red by name.
@@ -491,14 +492,16 @@ pub fn clauses(s: &mut Session<Body>, flags: &HostFlags) -> Result<bool, GateErr
     );
     pass &= c1;
 
-    // The prompt call is one pass that keeps 0 rows; each step keeps 1.
+    // The prompt call is one pass that keeps 0 rows; each step keeps 1. A
+    // step's own boundary is made ahead of its readback, so the history's
+    // last step ends one too.
+    // PIN(2026-10-01): STEPS steps, not STEPS - 1: the last one's boundary runs ahead.
     let mut want = vec![(PassKind::None, 0), (PassKind::Prompt, 0)];
-    want.extend(std::iter::repeat_n((PassKind::Step, 1), STEPS - 1));
+    want.extend(std::iter::repeat_n((PassKind::Step, 1), STEPS));
     let passes_ok = first.passes == want;
     println!(
-        "passes: a history's boundaries end none, the prompt call (0 kept), then {} steps (1 \
-         kept each): {} boundaries, same {passes_ok}: {}",
-        STEPS - 1,
+        "passes: a history's boundaries end none, the prompt call (0 kept), then {STEPS} steps \
+         (1 kept each): {} boundaries, same {passes_ok}: {}",
         first.passes.len(),
         verdict(passes_ok)
     );
