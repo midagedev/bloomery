@@ -538,26 +538,28 @@ mod q4k_sel_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        // The block body's contract: column j < m_cols and b < 2 n_sb by the
-        // lines above, the launch contract bounds `x` (at base 0) and the five
-        // planes at m_cols columns, and the block index is warp-uniform.
-        q8_1_quant_block(
-            x,
-            0,
-            j,
-            b,
-            n_sb,
-            half_it,
-            quad_it,
-            lane,
-            &mut q3,
-            &mut q4,
-            &mut q6,
-            &mut s8,
-            &mut d8,
-            fault,
-            FaultSite::QuantColumn,
-        );
+        // SAFETY: j < m_cols, b < 2 n_sb (above), so `requires` bounds x and
+        // the planes; `enqueue_quantize_ord` passes n_sb.div_ceil(2) and
+        // div_ceil(4); one warp per block index, `lane` its lane id.
+        unsafe {
+            q8_1_quant_block(
+                x,
+                0,
+                j,
+                b,
+                n_sb,
+                half_it,
+                quad_it,
+                lane,
+                &mut q3,
+                &mut q4,
+                &mut q6,
+                &mut s8,
+                &mut d8,
+                fault,
+                FaultSite::QuantColumn,
+            )
+        };
     }
 
     /// The q8_1 form of the activation columns the card's expert slots read:
@@ -617,27 +619,28 @@ mod q4k_sel_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        // The block body's contract: column c0 + j < c0 + m_cols and b < 2
-        // n_sb by the lines above, the launch contract bounds `x` (at base 0)
-        // and the five planes at c0 + m_cols columns, and the block index is
-        // warp-uniform.
-        q8_1_quant_block(
-            x,
-            0,
-            c0 as usize + j,
-            b,
-            n_sb,
-            half_it,
-            quad_it,
-            lane,
-            &mut q3,
-            &mut q4,
-            &mut q6,
-            &mut s8,
-            &mut d8,
-            fault,
-            FaultSite::QuantColumn,
-        );
+        // SAFETY: c0 + j < c0 + m_cols, b < 2 n_sb (above), so `requires`
+        // bounds x and the planes; `enqueue_quantize_sel` passes div_ceil(2)
+        // and div_ceil(4) of n_sb; one warp per block index, `lane` its id.
+        unsafe {
+            q8_1_quant_block(
+                x,
+                0,
+                c0 as usize + j,
+                b,
+                n_sb,
+                half_it,
+                quad_it,
+                lane,
+                &mut q3,
+                &mut q4,
+                &mut q6,
+                &mut s8,
+                &mut d8,
+                fault,
+                FaultSite::QuantColumn,
+            )
+        };
     }
 }
 

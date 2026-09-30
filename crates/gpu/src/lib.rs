@@ -530,16 +530,31 @@ impl From<::model::ModelError> for GpuError {
 /// [`q8_1_quant_vals`] refuses it (NaN scale, zero codes and sums), and this
 /// raises `site` on `fault` for it.
 ///
-/// SAFETY: the caller guarantees `col < m_cols`, `b < 2 * n_sb`, the launch
-/// contract's bounds on `x` at base `x0` and on the five outputs, and that
-/// all 32 lanes of one warp enter with the same `(col, b)` — the collectives
-/// below are warp-wide.
+/// # Safety
+///
+/// - `b < 2 * n_sb` and `x.len() >= x0 + (col + 1) * 256 * n_sb`, so the
+///   lane's four values are inside column `col` of `x`.
+/// - `half_it >= ceil(n_sb / 2)` and `quad_it >= ceil(n_sb / 4)`, and the
+///   planes hold at least `col + 1` columns: `q3` of `64 * half_it` words,
+///   `q4` of `256 * quad_it`, `q6` of `128 * half_it`, `s8` of `8 * n_sb` and
+///   `d8` of `2 * n_sb`. The block's word slots then stay inside column `col`
+///   of each plane.
+/// - All 32 lanes of one warp enter with the same `(col, b)`, `lane` is the
+///   calling lane's id, and no other warp of the grid enters with that pair:
+///   the collectives are warp-wide, and each store's slot belongs to this
+///   lane alone.
+///
+/// A kernel caller discharges these from its launch facts (`crate::view`'s
+/// module doc): the `requires` clauses bounding `x` and the planes, `(col,
+/// b)` split from its warp-uniform block index past its guard, and `half_it`,
+/// `quad_it` as `n_sb.div_ceil(2)`, `n_sb.div_ceil(4)`, which each of its
+/// launchers passes.
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub fn q8_1_quant_block(
+pub unsafe fn q8_1_quant_block(
     x: &[f32],
     x0: usize,
     col: usize,
@@ -561,8 +576,8 @@ pub fn q8_1_quant_block(
     // (no cross-lane byte packing needed, unlike the 32-value geometry where
     // one value per lane forced two shuffle_downs).
     let base = x0 + col * 256 * n_sb + 128 * b + 4 * lane;
-    // SAFETY: base + 3 < x0 + (col+1)*256*n_sb <= x.len() by the caller's
-    // contract.
+    // SAFETY: base + 3 < x0 + (col+1)*256*n_sb <= x.len() by this fn's
+    // `# Safety`.
     let v = unsafe {
         [
             *x.get_unchecked(base),
@@ -571,10 +586,9 @@ pub fn q8_1_quant_block(
             *x.get_unchecked(base + 3),
         ]
     };
-    // SAFETY: this fn's own contract gives `col < m_cols`, `b < 2*n_sb`, the
-    // output bounds and the warp-uniform `(col, b)` that
-    // [`q8_1_quant_vals`] requires, and `v` holds exactly its values
-    // `128*b + 4*lane .. +3` of column `col` — the rest of its contract.
+    // SAFETY: this fn's `# Safety` is [`q8_1_quant_vals`]'s but for the
+    // clause on `x`, and `v` holds exactly values `128*b + 4*lane .. +3` of
+    // column `col` — the rest of its contract.
     let refused =
         unsafe { q8_1_quant_vals(v, col, b, n_sb, half_it, quad_it, lane, q3, q4, q6, s8, d8) };
     if refused && lane == 0 {
@@ -599,8 +613,10 @@ pub fn q8_1_quant_block(
 /// to raise its own fault site; a caller that ignores it still stores no
 /// plausible block. A finite block is stored as it always was.
 ///
-/// SAFETY: as [`q8_1_quant_block`], and `v` must be values `128 * b + 4 *
-/// lane .. +3` of column `col`.
+/// # Safety
+///
+/// [`q8_1_quant_block`]'s, less its clause on `x`, and `v` must be values
+/// `128 * b + 4 * lane .. +3` of column `col`.
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
@@ -773,26 +789,28 @@ mod kernels {
         let col = blk / blocks_per_col;
         let b = blk % blocks_per_col;
         let lane = warp::lane_id() as usize;
-        // SAFETY: col < m_cols and b < 2*n_sb by the two lines above; the
-        // launch contract carries the rest of `q8_1_quant_block`'s
-        // preconditions, and the block index is warp-uniform.
-        q8_1_quant_block(
-            x,
-            x0 as usize,
-            col,
-            b,
-            n_sb,
-            half_it,
-            quad_it,
-            lane,
-            &mut q3,
-            &mut q4,
-            &mut q6,
-            &mut s8,
-            &mut d8,
-            fault,
-            FaultSite::QuantColumn,
-        );
+        // SAFETY: col < m_cols, b < 2*n_sb (above), so `requires` bounds x and
+        // the planes; both launchers pass n_sb.div_ceil(2) and div_ceil(4);
+        // one warp per block index, `lane` its lane id.
+        unsafe {
+            q8_1_quant_block(
+                x,
+                x0 as usize,
+                col,
+                b,
+                n_sb,
+                half_it,
+                quad_it,
+                lane,
+                &mut q3,
+                &mut q4,
+                &mut q6,
+                &mut s8,
+                &mut d8,
+                fault,
+                FaultSite::QuantColumn,
+            )
+        };
     }
 
     /// Q4_K packing recap (word arithmetic verified against ggml's

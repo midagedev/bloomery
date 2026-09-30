@@ -197,26 +197,28 @@ mod dflash_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        // SAFETY: col < m_cols and b < 2·n_sb by the division; the launch
-        // contract carries the rest of `q8_1_quant_block`'s preconditions,
-        // and the block index is warp-uniform.
-        q8_1_quant_block(
-            x,
-            x0 as usize,
-            blk / blocks_per_col,
-            blk % blocks_per_col,
-            n_sb,
-            half_it,
-            quad_it,
-            lane,
-            &mut q3,
-            &mut q4,
-            &mut q6,
-            &mut s8,
-            &mut d8,
-            fault,
-            FaultSite::QuantColumn,
-        );
+        // SAFETY: col < m_cols, b < 2·n_sb (the division), so `requires`
+        // bounds x and the planes; `enqueue_quantize` passes n_sb.div_ceil(2)
+        // and div_ceil(4); one warp per block index, `lane` its lane id.
+        unsafe {
+            q8_1_quant_block(
+                x,
+                x0 as usize,
+                blk / blocks_per_col,
+                blk % blocks_per_col,
+                n_sb,
+                half_it,
+                quad_it,
+                lane,
+                &mut q3,
+                &mut q4,
+                &mut q6,
+                &mut s8,
+                &mut d8,
+                fault,
+                FaultSite::QuantColumn,
+            )
+        };
     }
 
     /// Gate·up·SwiGLU over MXFP4 stacks for `m_cols` token columns: thread

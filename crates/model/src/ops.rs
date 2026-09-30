@@ -2095,7 +2095,17 @@ impl<'a> PairWork<'a> {
     }
 
     /// Rows `rows` of this pair across every token column → cells `t * n + r`; ROW_BUF is borrowed once per call.
-    fn compute_rows(
+    ///
+    /// # Safety
+    ///
+    /// `rows` lies inside `0..n` (whole groups of [`qdot::Q3K_R8_ROWS`] for a
+    /// row-lane pair), and no other participant computes any of those rows,
+    /// or touches their output cells, until the dispatch joins. The column
+    /// buffer this pair was built over holds `src_ne1` columns for the whole
+    /// call, and every write to it happens before this call's reads: the
+    /// pre-pass join, the slot's DONE that `defer` waits for here, or a union
+    /// pass's claim wait in its `compute`.
+    unsafe fn compute_rows(
         &self,
         rows: Range<usize>,
         lvl: u8,
@@ -2109,9 +2119,8 @@ impl<'a> PairWork<'a> {
         }
         if let Some((cb, aptr)) = self.fused_cols {
             // SAFETY: the slot's buffer is `src_ne1 * cb` bytes as allocated,
-            // and its writes are ordered before this read — the pre-pass
-            // join, the DONE store the wait above just observed, or, for a
-            // union pass, the claim wait its `compute` ran before this call.
+            // and its writes happen before this read (this fn's `# Safety`;
+            // on the deferred arm, the DONE the wait above just observed).
             let acol = unsafe { std::slice::from_raw_parts(aptr, self.src_ne1 * cb) };
             if self.layout == RowLayout::R8 {
                 return self.compute_groups(rows, acol, cb, lvl, acc);
@@ -2419,7 +2428,14 @@ struct Combine<'a> {
 /// The column walker both dispatch shapes ride: quantize columns `cols` of the
 /// concatenated slot space, one `quantize_into` call per column,
 /// chunk-straddling slots handled segment-wise.
-fn quant_range(
+///
+/// # Safety
+///
+/// `shared` are the write views of `slots`' buffers, and of each unproduced
+/// combine's par block, live for the call; columns `cols` of the slot space
+/// are this caller's alone — no other participant combines, quantizes or
+/// reads them until the dispatch joins.
+unsafe fn quant_range(
     slots: &Flex<QuantSlot<'_>>,
     col_starts: &Flex<usize>,
     shared: &Flex<SharedQuantCols>,
@@ -2453,18 +2469,18 @@ fn quant_range(
                         "column {t} inside the par block"
                     );
                     // SAFETY: `comb.par` holds the par block's `k · ne1` cells, lent for the
-                    // call, and column `t` of it is this chunk's alone (the construction
-                    // site in `quantize_slots`); nothing reads the block before the join.
+                    // call, and column `t` of it is this caller's alone (this fn's
+                    // `# Safety`); nothing reads the block before the join.
                     let par =
                         unsafe { std::slice::from_raw_parts_mut(comb.par.0.add(t * s.k), s.k) };
                     swiglu_into(comb.gate.col(t), comb.up.col(t), comb.limit, par);
-                    // SAFETY: column `t` of slot `d` is inside this chunk's sub-range — see the construction site in `quantize_slots`.
+                    // SAFETY: column `t` of slot `d` is inside `cols`, this caller's alone (this fn's `# Safety`).
                     unsafe { shared.get(d).quantize_into(s.ty, s.k, par, t) };
                 }
             }
             _ => {
                 for t in t0..t_end {
-                    // SAFETY: column `t` of slot `d` is inside this chunk's sub-range — see the construction site in `quantize_slots`.
+                    // SAFETY: column `t` of slot `d` is inside `cols`, this caller's alone (this fn's `# Safety`).
                     unsafe { shared.get(d).quantize_into(s.ty, s.k, s.x.col(t), t) };
                 }
             }
@@ -2595,7 +2611,9 @@ impl<'a> DeferredSlots<'a> {
                 t_first = Some(Instant::now());
             }
             let _done = ClaimDone(&self.states[s]);
-            self.produce(s, lvl, acc);
+            // SAFETY: the compare-exchange above won slot `s`'s claim, and
+            // `_done` releases it only after `produce` returns.
+            unsafe { self.produce(s, lvl, acc) };
         }
         if let Some(t_first) = t_first {
             self.claim_ns.fetch_max(
@@ -2609,15 +2627,20 @@ impl<'a> DeferredSlots<'a> {
     /// pre-pass and `ffn::swiglu` make today, whole columns, one encoder
     /// call per column; only WHICH thread runs them changes. Timers match
     /// those call sites: the combine at level 1, the encoder at level 2.
-    fn produce(&self, s: usize, lvl: u8, acc: &mut profile::CallAcc) {
+    ///
+    /// # Safety
+    ///
+    /// The caller holds slot `s`'s claim: it won the slot's TODO → CLAIMED
+    /// compare-exchange and has not stored DONE yet, so it is the only
+    /// participant that writes the slot's par block and columns.
+    unsafe fn produce(&self, s: usize, lvl: u8, acc: &mut profile::CallAcc) {
         let q = self.slots.get(s);
         let ne1 = q.x.ne1();
         if let Some(c) = q.swiglu {
             let t_s = if lvl >= 1 { Some(Instant::now()) } else { None };
-            // SAFETY: `c.par` aliases this slot's `x`, the par block the entry
-            // placed and handed off here. This claimer is the block's only
-            // writer: no other participant touches it before the slot
-            // observes DONE, and the caller reads it only after the join.
+            // SAFETY: `c.par` is this slot's par block, `c.par.1` cells, and
+            // this claimer its only writer until DONE (this fn's `# Safety`);
+            // the caller reads it only after the join.
             let par = unsafe { std::slice::from_raw_parts_mut(c.par.0, c.par.1) };
             swiglu_into(&c.gate.data, &c.up.data, c.limit, par);
             if let Some(t_s) = t_s {
@@ -2629,8 +2652,8 @@ impl<'a> DeferredSlots<'a> {
             let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
             for t in 0..ne1 {
                 // SAFETY: every column of the slot is this claimer's
-                // exclusively (the compare-exchange above); the par block
-                // was written by this same thread just above.
+                // exclusively (this fn's `# Safety`); the par block was
+                // written by this same thread just above.
                 unsafe {
                     self.shared
                         .get(s)
@@ -2644,7 +2667,7 @@ impl<'a> DeferredSlots<'a> {
             let t_q = if lvl >= 2 { Some(Instant::now()) } else { None };
             for t in 0..ne1 {
                 // SAFETY: every column of the slot is this claimer's
-                // exclusively (the compare-exchange above).
+                // exclusively (this fn's `# Safety`).
                 unsafe { self.shared.get(s).quantize_into(q.ty, q.k, q.x.col(t), t) };
             }
             if let Some(t_q) = t_q {
@@ -2715,7 +2738,9 @@ fn quantize_slots(
     if total_cols > QUANT_INLINE_COLS || total_cols > n {
         threads::pool().for_each_chunk(total_cols, |cols| {
             let mut acc = profile::CallAcc::new();
-            quant_range(slots, &col_starts, shared, cols, lvl, &mut acc);
+            // SAFETY: the construction site above; the pool's chunks partition
+            // `0..total_cols`, so `cols` is this participant's alone.
+            unsafe { quant_range(slots, &col_starts, shared, cols, lvl, &mut acc) };
             if let Some(collected) = &collected {
                 collected.push(acc);
             }
@@ -2724,7 +2749,9 @@ fn quantize_slots(
         // The inline shape: the walker runs on the caller, no split —
         // deterministic, `tests/mt.rs` covers this branch too.
         let mut acc = profile::CallAcc::new();
-        quant_range(slots, &col_starts, shared, 0..total_cols, lvl, &mut acc);
+        // SAFETY: the construction site above; no split, so every column is
+        // the caller's.
+        unsafe { quant_range(slots, &col_starts, shared, 0..total_cols, lvl, &mut acc) };
         if let Some(collected) = &collected {
             collected.push(acc);
         }
@@ -3012,7 +3039,14 @@ trait RowSet: Sync {
     /// A participant's first work, before any unit: the dispatch's claims.
     fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc);
     /// Units `units` of pair `p`.
-    fn compute(
+    ///
+    /// # Safety
+    ///
+    /// `p < pairs()`, `units` lies inside pair `p`'s units (`units.end <=
+    /// start(p + 1) - start(p)`), and no other participant computes any of
+    /// those units until the dispatch joins; the dispatch reads their output
+    /// cells only after the join.
+    unsafe fn compute(
         &self,
         p: usize,
         units: Range<usize>,
@@ -3086,7 +3120,7 @@ impl RowSet for GroupRows<'_, '_> {
         }
     }
 
-    fn compute(
+    unsafe fn compute(
         &self,
         p: usize,
         units: Range<usize>,
@@ -3095,7 +3129,10 @@ impl RowSet for GroupRows<'_, '_> {
     ) -> Result<(), crate::ModelError> {
         let w = self.pairs.get(p);
         let g = w.layout.grain();
-        w.compute_rows(units.start * g..units.end * g, lvl, acc)
+        // SAFETY: the units are pair `p`'s (`n / grain` a pair) and this
+        // participant's alone by this fn's `# Safety`; the columns and their
+        // ordering are `run_group`'s construction site.
+        unsafe { w.compute_rows(units.start * g..units.end * g, lvl, acc) }
     }
 }
 
@@ -3317,7 +3354,14 @@ fn run_row_pool<S: RowSet>(
                 while gr < to {
                     let sub_end = to.min(set.start(p + 1));
                     let r0 = gr - set.start(p);
-                    if let Err(e) = set.compute(p, r0..r0 + (sub_end - gr), lvl, &mut chunk.acc) {
+                    if let Err(e) =
+                        // SAFETY: `gr..sub_end` is inside pair `p` (`pair_at`); the
+                        // lanes partition the units and each `fetch_add` hands its
+                        // block to one participant; the join precedes every read.
+                        unsafe {
+                            set.compute(p, r0..r0 + (sub_end - gr), lvl, &mut chunk.acc)
+                        }
+                    {
                         chunk.err = Some(e);
                         break 'lanes;
                     }
@@ -3871,7 +3915,7 @@ impl RowSet for UnionRows<'_, '_> {
         }
     }
 
-    fn compute(
+    unsafe fn compute(
         &self,
         p: usize,
         units: Range<usize>,
@@ -3905,11 +3949,16 @@ impl RowSet for UnionRows<'_, '_> {
         // slot of the plan (asserted where the pass is built).
         let out = unsafe { self.out.offset(first * st.n) };
         let g = st.layout.grain();
-        PairWork::at((out, m), bytes, src, st.meta(), 0, None).compute_rows(
-            units.start * g..units.end * g,
-            lvl,
-            acc,
-        )
+        // SAFETY: the units are pair `p`'s and this participant's alone (this
+        // fn's `# Safety`); the input columns were written before this read,
+        // by the caller or by the claim waited for above.
+        unsafe {
+            PairWork::at((out, m), bytes, src, st.meta(), 0, None).compute_rows(
+                units.start * g..units.end * g,
+                lvl,
+                acc,
+            )
+        }
     }
 }
 
