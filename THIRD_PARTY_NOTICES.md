@@ -47,6 +47,7 @@ upstream has it; with none left, the `[patch]` section goes away.
 | [`dcf5636d`](https://github.com/midagedev/cuda-oxide/commit/dcf5636dbd2116c5112ccf832fee0389e0acd662) feat(cuda-macros): let `requires` name unsigned integer constants | not yet proposed |
 | [`29213c14`](https://github.com/midagedev/cuda-oxide/commit/29213c1436a16ad6ea61b4aea9e077db2e95bc7c) fix(cuda-macros): name the macro call when a cuda_module finds no kernels | not yet proposed |
 | [`c76f1e17`](https://github.com/midagedev/cuda-oxide/commit/c76f1e173b0e9468bc0b05d49d99560844a06fec) feat(unroll): recognize range `for` loops | proposed upstream as NVlabs/cuda-oxide#1346 (open) |
+| [`0af1016c`](https://github.com/midagedev/cuda-oxide/commit/0af1016c72c2224857d02bead7bdb7cbc10e580b) fix(mir-lower): give an aggregate niche payload's leaves typed slots | not yet proposed |
 
 ## cuda-core (cutile-rs)
 
