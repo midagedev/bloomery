@@ -1,10 +1,21 @@
 //! The Qwen3.8-Flash-Next MTP draft program's gate: the target opened by
 //! its placement on the gate card with the shared draft file beside it
 //! (`Body38::open_placed_mtp`, the head a list of every sixth id), the
-//! draft's walks (`GpuModel::mtp_draft`) held against ik's MTP draft set
-//! (refset family `mtp-qwen4exp`) and against themselves.
+//! draft's load held to its plan, and the draft's walks
+//! (`GpuModel::mtp_draft`) held against ik's MTP draft set (refset family
+//! `mtp-qwen4exp`) and against themselves.
 //!
 //! What is asserted:
+//! - (d) right after the load, before any walk: the draft is open: its
+//!   weights, its store and the row map hold the bytes its plan
+//!   (`PlanInputs::plan_mtp`) gives; the two matrices it borrows
+//!   (`token_embd`, `output`) are the target's own buffers, at the target's
+//!   addresses — nothing copied; the program's arena is the plan's; the map
+//!   holds the list's ids and each gathered row is the target's resident
+//!   `output` row of its id.
+//! - (q) `Mtp38::open` refuses by name, beside the loaded model: a draft
+//!   read as carrying its own matrices, and a plan whose row map is not the
+//!   one the load makes (after the draft's uploads, which it frees).
 //! - (e) teacher-forced, every graph of the set replayed in ik's order —
 //!   the warmup, then each block's graphs — each row's token, position and
 //!   target hidden row (ik's `inp_tokens`, `inp_pos`, `inp_mtp_states`) fed
@@ -111,17 +122,20 @@ mod gate {
 
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, MtpDraft, MtpFeed, MtpHead, MtpHidden,
-        MtpMode, MtpNode, MtpTaps, Prompt38, Qwen38Model, Store38Host, TargetRows,
+        Body38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft, MtpFeed, MtpHead,
+        MtpHidden, MtpMode, MtpNode, MtpTaps, Prompt38, Qwen38Model, Store38Host, TargetRows,
     };
     use bloomery_gpu::fault::FaultSite;
+    use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
     use gguf::Split;
     use gguf::quant::half_to_f32;
-    use model::arch::models::HeadRows;
-    use model::arch::qwen35moe::place::{MtpInputs, PlanInputs, machine, vocab_sha256};
+    use model::arch::models::{Borrows, HeadRows, MtpSource};
+    use model::arch::qwen35moe::place::{
+        MTP_HEAD_ROWS, MtpInputs, MtpPlan, PlanInputs, machine, vocab_sha256,
+    };
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
     use refset::arch::qwen4exp::IK;
@@ -132,9 +146,9 @@ mod gate {
     use runtime::hc_gated::{Geometry, LO_BAND, MIXED_BAND, MixWeights, mix_ref};
     use runtime::{Advance as _, Committed, Draft, PassSink, TapNeed, Target as _};
 
-    /// Cache rows: the e2e gate's, and the load gate's.
+    /// Cache rows: the e2e gate's.
     const CTX: u64 = 3072;
-    /// The head's rows: every sixth id, 0 to 245,754, the load gate's list.
+    /// The head's rows: every sixth id, 0 to 245,754.
     const LIST_ROWS: u32 = 40_960;
     /// The draft layer's index in the draft file: ik names its nodes by it.
     const LAYER: usize = 48;
@@ -2383,6 +2397,135 @@ mod gate {
         Ok((m, ok))
     }
 
+    /// A Q8_0 weight's two planes' device addresses.
+    fn planes(dw: Option<&DevWeight>) -> Option<[u64; 2]> {
+        match dw {
+            Some(DevWeight::Q8_0 { qs, d, .. }) => {
+                Some([qs.buf().cu_deviceptr(), d.buf().cu_deviceptr()])
+            }
+            _ => None,
+        }
+    }
+
+    /// (d) the head's map holds `ids`, and its row `i` is the target's
+    /// resident `output` row `ids[i]`, both planes, bit for bit: the gather
+    /// against the placement loader's upload of the whole matrix.
+    fn head_rows(m: &Qwen38Model, mtp: &Mtp38, ids: &[u32]) -> Result<bool, GateError> {
+        let stream = m.gpu().stream();
+        let Some((map, n)) = mtp.head_map() else {
+            println!("(d) the draft has no head map FAIL");
+            return Ok(false);
+        };
+        let map = map.to_host_vec(stream)?;
+        let map_ok = n == ids.len() && map == ids;
+        println!(
+            "(d) head map: {n} rows, the list's ids {} (want {LIST_ROWS})",
+            verdict(map_ok)
+        );
+        let (
+            Some(DevWeight::Q8_0Derived { qs, d, k }),
+            Some(DevWeight::Q8_0 { qs: tq, d: td, .. }),
+        ) = (
+            mtp.weights().get(MTP_HEAD_ROWS),
+            m.weights().get("output.weight"),
+        )
+        else {
+            println!("(d) the head's rows or the target's output are not Q8_0 planes FAIL");
+            return Ok(false);
+        };
+        let (qs, d) = (qs.buf().to_host_vec(stream)?, d.buf().to_host_vec(stream)?);
+        let (tq, td) = (tq.buf().to_host_vec(stream)?, td.buf().to_host_vec(stream)?);
+        let (wq, wd) = (k / 4, k / 32);
+        let differ: Vec<usize> = (0..n)
+            .filter(|&i| {
+                let r = ids[i] as usize;
+                qs[i * wq..(i + 1) * wq] != tq[r * wq..(r + 1) * wq]
+                    || d[i * wd..(i + 1) * wd] != td[r * wd..(r + 1) * wd]
+            })
+            .take(4)
+            .collect();
+        let rows_ok = differ.is_empty();
+        println!(
+            "(d) head row i = output row ids[i], {n} rows, both planes: first differing rows \
+             {differ:?} {}",
+            verdict(rows_ok)
+        );
+        Ok(map_ok && rows_ok)
+    }
+
+    /// (d) and (q), on the model as the load left it: no walk has run.
+    fn draft_load(
+        m: &Qwen38Model,
+        plan: MtpPlan<'_>,
+        inputs: &PlanInputs,
+        draft: &Split,
+        mtp: &MtpInputs,
+        ids: &[u32],
+    ) -> Result<bool, GateError> {
+        let target = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let d = &plan.draft.cards[0];
+        let body = m.body("mtp load")?;
+        let Some(mtp38) = body.mtp() else {
+            return Err("the load opened no MTP draft".into());
+        };
+        let want = plan.draft_resident_bytes() + d.kv_bytes + plan.map_bytes;
+        let got = mtp38.resident_bytes() as u64;
+        let mut ok = got == want;
+        println!(
+            "(d) draft resident {got} (want {want}: weights {} + store {} + map {}) {}",
+            plan.draft_resident_bytes(),
+            d.kv_bytes,
+            plan.map_bytes,
+            verdict(got == want)
+        );
+        for b in mtp38.borrowed_planes() {
+            let target_planes = planes(m.weights().get(&b.name));
+            let same = target_planes == Some(b.planes);
+            ok &= same;
+            println!(
+                "(d) {} read at {:x?}, the target's at {target_planes:x?} {}",
+                b.name,
+                b.planes,
+                verdict(same)
+            );
+        }
+        let arena = mtp38.arena_bytes() as u64;
+        let arena_ok = arena == plan.arena_bytes;
+        ok &= arena_ok;
+        println!(
+            "(d) the draft program's arena {arena} (the plan's {}) {}",
+            plan.arena_bytes,
+            verdict(arena_ok)
+        );
+        let borrowed = mtp38.borrowed(m.weights()).is_ok();
+        ok &= borrowed;
+        println!("(d) the walk's borrow resolves: {}", verdict(borrowed));
+        let rows_ok = head_rows(m, mtp38, ids)?;
+        ok &= rows_ok;
+        let mut own = MtpInputs::read(draft, &target, inputs, HeadRows::Full)?;
+        if let MtpSource::File { borrows, .. } = &mut own.draft.source {
+            *borrows = Borrows {
+                embedding: false,
+                head: false,
+            };
+        }
+        let r1 = Mtp38::open(m.gpu(), &target, m.weights(), draft, &own, &plan, false)
+            .err()
+            .map_or("opened".to_string(), |e| e.to_string());
+        let r1_ok = r1.contains("the load borrows the target's token_embd and output");
+        ok &= r1_ok;
+        println!("(q) a draft with its own matrices: {r1} {}", verdict(r1_ok));
+        let mut other = plan;
+        other.map_bytes += 4;
+        let r2 = Mtp38::open(m.gpu(), &target, m.weights(), draft, mtp, &other, false)
+            .err()
+            .map_or("opened".to_string(), |e| e.to_string());
+        let r2_ok = r2.contains("resident weights, store and row map hold");
+        ok &= r2_ok;
+        println!("(q) a plan of another row map: {r2} {}", verdict(r2_ok));
+        Ok(ok)
+    }
+
     pub(super) fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[])?;
         let dir = MTP.path(MTP_SET);
@@ -2424,16 +2567,31 @@ mod gate {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
         let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
         let plan = inputs.plan_mtp(&machine, CTX, &PlanLevers::from_levers(&levers)?, &mtp)?;
+        let d = &plan.draft.cards[0];
+        println!(
+            "plan card={} ctx_max={CTX} draft dense={} experts={} rounding={} kv={} map={} \
+             arena={} headroom={}",
+            RTX_3090.name,
+            d.dense_bytes,
+            d.expert_bytes,
+            d.rounding_bytes,
+            d.kv_bytes,
+            plan.map_bytes,
+            plan.arena_bytes,
+            plan.headroom_bytes
+        );
         let mut m =
             Body38::open_placed_mtp(file, &plan, &inputs, 0, levers.host(), ub, &draft, &mtp)?;
         let arena = m.body("mtp")?.mtp().map_or(0, |d| d.arena_bytes());
         println!(
-            "load card={} ctx_max={CTX} in {:.1} s; the draft program's arena {arena} bytes \
-             (runtime value, outside the plan)",
+            "load card={} ctx_max={CTX} resident_bytes={} in {:.1} s; the draft program's arena \
+             {arena} bytes (runtime value, outside the plan)",
             RTX_3090.name,
+            m.resident_bytes(),
             t.elapsed().as_secs_f64()
         );
-        let mut ok = refused(
+        let mut ok = draft_load(&m, plan, &inputs, &draft, &mtp, &ids)?;
+        ok &= refused(
             "the draft's own row before any walk",
             m.mtp_draft(MtpFeed::Own { pos0: 0 }, MtpHead::Rows, MtpMode::Eager),
             "a walk before the draft's own row",

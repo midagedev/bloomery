@@ -690,19 +690,13 @@ gate-gpu-qwen35moe-e2e:
 gate-gpu-qwen4exp-e2e:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_e2e && bash tools/gpu-gate.sh gate_qwen4exp_e2e'
 
-# Qwen3.8's MTP draft load on the 3090 beside the target (no step): the draft's weights, store and row map hold its
-# plan's bytes, its token_embd and output are the target's own buffers at their addresses, and Mtp38::open's refusals.
-# Loads the whole host set: alone in a batch, under the big-load lock.
-[group('solo')]
-[group('v41-load')]
-gate-gpu-qwen4exp-mtp-load:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_mtp_load && bash tools/gpu-gate.sh gate_qwen4exp_mtp_load'
-
-# Qwen3.8's MTP draft program on the 3090 beside the target: every graph of ik's MTP draft set (mtp-qwen4exp) replayed
-# teacher-forced — eh_proj, l_out and the head's logits within their derived bands, the router's flips named, the argmax
-# ik's where its margin clears the band — the row-list head against the full head, the target's streams paired with
-# ik's hidden rows, the captured walks = the eager ones, and the refusals and the NaN fault. Loads the whole host set:
-# alone in a batch, under the big-load lock.
+# Qwen3.8's MTP draft program on the 3090 beside the target: first, before any walk, the draft's load — its weights,
+# store and row map hold its plan's bytes, its token_embd and output are the target's own buffers at their addresses,
+# and Mtp38::open's refusals — then every graph of ik's MTP draft set (mtp-qwen4exp) replayed teacher-forced — eh_proj,
+# l_out and the head's logits within their derived bands, the router's flips named, the argmax ik's where its margin
+# clears the band — the row-list head against the full head, the target's streams paired with ik's hidden rows, the
+# captured walks = the eager ones, and the refusals and the NaN fault. Loads the whole host set: alone in a batch, under
+# the big-load lock.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen4exp-mtp:
