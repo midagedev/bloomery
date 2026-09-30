@@ -135,9 +135,10 @@ pub unsafe fn q5_1_row_dot(
         // SAFETY: d8b0 + b < (col + 1) · k_blocks <= d8.len(), s8.len() by
         // this fn's contract.
         let (e, s) = unsafe { (*d8.get_unchecked(d8b0 + b), *s8.get_unchecked(d8b0 + b)) };
-        // q5_a_chain's window: q0 + 256·(b >> 5) + (b & 31) + 224 <
-        // q0 + 256·((b >> 5) + 1) <= q0 + q_stride <= q.len().
-        let a = q5_a_chain(&cw, q, q0 + 256 * (b >> 5) + (b & 31));
+        // SAFETY: q5_a_chain's window: q0 + 256·(b >> 5) + (b & 31) + 224 <
+        // q0 + 256·((b >> 5) + 1) <= q0 + q_stride <= q.len(), by this fn's
+        // `# Safety` and b < k_blocks.
+        let a = unsafe { q5_a_chain(&cw, q, q0 + 256 * (b >> 5) + (b & 31)) };
         // q5_row_dot's term, so the packed kernel's sum is this one's.
         f0 += (a as f32 * d + m * s as f32) * e;
         b += 32;

@@ -27,14 +27,17 @@ use std::sync::Arc;
 /// `wbase + 256*(b>>5) + 32*i + (b&31)`), so a warp's eight code loads are
 /// lane-consecutive.
 ///
-/// SAFETY: callers keep the eight words inside one row's code section —
-/// `b < k_blocks` and the row based at `wbase` carries `q_stride >= 256`
-/// code words with `q_stride >= 256*((b>>5)+1)`.
+/// # Safety
+///
+/// `wbase + 256 * (b >> 5) + 255 < w.len()`: the eight words are at most
+/// `wbase + 256 * (b >> 5) + (b & 31) + 224`. It holds when the row based at
+/// `wbase` lies inside `w` and carries `q_stride >= 256 * ((b >> 5) + 1)`
+/// code words — `b < k_blocks` and `q_stride >= 256 * ceil(k_blocks / 32)`.
 #[inline(always)]
-pub(crate) fn q5_code_words(w: &[u32], wbase: usize, b: usize) -> [u32; 8] {
+pub(crate) unsafe fn q5_code_words(w: &[u32], wbase: usize, b: usize) -> [u32; 8] {
     let base = wbase + 256 * (b >> 5) + (b & 31);
-    // SAFETY: base + 224 <= wbase + 256*(b>>5) + 255 < wbase + q_stride by
-    // this fn's contract.
+    // SAFETY: base + 224 <= wbase + 256*(b>>5) + 255 < w.len() by this fn's
+    // `# Safety`.
     unsafe {
         [
             *w.get_unchecked(base),
@@ -54,12 +57,16 @@ pub(crate) fn q5_code_words(w: &[u32], wbase: usize, b: usize) -> [u32; 8] {
 /// transposed order, so each of the eight loads is one 128 B line across the
 /// warp).
 ///
-/// SAFETY: callers keep `qb + 7*32` inside one column's q8 word span.
+/// # Safety
+///
+/// `qb + 224 < q.len()`: the eight words are `qb + 32 * i`, `i < 8`. A caller
+/// keeps them inside one column's q8 word span: `qb = col * q_stride + 256 *
+/// (b >> 5) + (b & 31)` with `b < k_blocks`, `q_stride >= 256 * ceil(k_blocks
+/// / 32)` and `q.len() >= (col + 1) * q_stride`.
 #[inline(always)]
-pub(crate) fn q5_a_chain(cw: &[u32; 8], q: &[u32], qb: usize) -> i32 {
-    // SAFETY: qb + 224 is inside the caller's column span by this fn's
-    // contract (max qb within a window is 256*(b>>5) + (b&31), so + 224
-    // stays under the next window boundary).
+pub(crate) unsafe fn q5_a_chain(cw: &[u32; 8], q: &[u32], qb: usize) -> i32 {
+    // SAFETY: qb + 224 < q.len() by this fn's `# Safety`, and every index
+    // below is at most qb + 224.
     let (w0, w1, w2, w3, w4, w5, w6, w7) = unsafe {
         (
             *q.get_unchecked(qb),
@@ -85,9 +92,14 @@ pub(crate) fn q5_a_chain(cw: &[u32; 8], q: &[u32], qb: usize) -> i32 {
 /// One (block, column) term. `mds` is the Q5_1 min-term numerator `m·s` of
 /// this (block, column) pair; Q5_0 passes 0.0, for which the add is exact,
 /// so both types share the body.
+///
+/// # Safety
+///
+/// [`q5_a_chain`]'s: `qb + 224 < q.len()`.
 #[inline(always)]
-fn q5_block_col(cw: &[u32; 8], q: &[u32], qb: usize, d: f32, mds: f32, e: f32) -> f32 {
-    (q5_a_chain(cw, q, qb) as f32 * d + mds) * e
+unsafe fn q5_block_col(cw: &[u32; 8], q: &[u32], qb: usize, d: f32, mds: f32, e: f32) -> f32 {
+    // SAFETY: this fn's `# Safety` is the chain's.
+    (unsafe { q5_a_chain(cw, q, qb) } as f32 * d + mds) * e
 }
 
 /// One row's dot products with `m_cols` (1..=8) activation columns,
@@ -106,16 +118,22 @@ fn q5_block_col(cw: &[u32; 8], q: &[u32], qb: usize, d: f32, mds: f32, e: f32) -
 ///   and `s8`, per column: `k_blocks` entries, block-indexed. Column c reads
 ///   `(col0 + c)` of each.
 ///
-/// SAFETY: callers guarantee `w.len() >= (row_abs + 1) * row_words` (with
-/// `row_words = q_stride + k_blocks`, or `+ 2*k_blocks` when `q5_1`),
-/// `q.len() >= (col0 + m_cols) * q_stride`, `d8.len()` and `s8.len()`
-/// `>= (col0 + m_cols) * k_blocks`, and `1 <= m_cols <= 8`.
+/// # Safety
+///
+/// `w.len() >= (row_abs + 1) * row_words` (with `row_words = q_stride +
+/// k_blocks`, or `+ 2*k_blocks` when `q5_1`), `q_stride >= 256 *
+/// ceil(k_blocks / 32)`, `q.len() >= (col0 + m_cols) * q_stride`, `d8.len()`
+/// and `s8.len()` `>= (col0 + m_cols) * k_blocks`, and `1 <= m_cols <= 8`
+/// (column 0 is always read). A kernel caller discharges them from its launch
+/// facts (`crate::view`'s module doc): the `requires` clauses bounding the
+/// four buffers at its guarded row and its columns, and `q_stride` and
+/// `m_cols` as its launchers pass them.
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
 )]
 #[inline(always)]
-pub(crate) fn q5_row_dot(
+pub(crate) unsafe fn q5_row_dot(
     w: &[u32],
     q: &[u32],
     d8: &[f32],
@@ -149,7 +167,9 @@ pub(crate) fn q5_row_dot(
 
     let mut b = lane;
     while b < k_blocks {
-        let cw = q5_code_words(w, wbase, b);
+        // SAFETY: b < k_blocks and q_stride >= 256*((b>>5)+1), and the row at
+        // wbase ends at or before w.len(), by this fn's `# Safety`.
+        let cw = unsafe { q5_code_words(w, wbase, b) };
         // SAFETY: sbase + b < sbase + k_blocks <= row end <= w.len() by this
         // fn's contract.
         let d = f32::from_bits(unsafe { *w.get_unchecked(sbase + b) });
@@ -161,8 +181,10 @@ pub(crate) fn q5_row_dot(
         };
         let qslot = 256 * (b >> 5) + (b & 31);
 
-        // Column 0 (always active). q0 + qslot + 224 < (col0+1)*q_stride <=
-        // q.len() (m_cols >= 1) is `q5_block_col`'s contract.
+        // Column 0 (always active). Column c's chain reads up to q0 +
+        // c*q_stride + qslot + 224 < (col0 + c + 1)*q_stride, because qslot +
+        // 224 <= 256*(b>>5) + 255 < q_stride; that is <= q.len() when m_cols >
+        // c (this fn's `# Safety`) — the `q5_block_col` calls below.
         {
             // SAFETY: d8b0 + b < (col0+1)*k_blocks <= d8.len() (m_cols >= 1).
             let e0 = unsafe { *d8.get_unchecked(d8b0 + b) };
@@ -173,7 +195,8 @@ pub(crate) fn q5_row_dot(
             } else {
                 0
             };
-            f0 += q5_block_col(&cw, q, q0 + qslot, d, mv * s0 as f32, e0);
+            // SAFETY: column 0 of the note above; m_cols >= 1.
+            f0 += unsafe { q5_block_col(&cw, q, q0 + qslot, d, mv * s0 as f32, e0) };
         }
         // Columns 1..7: one launch-uniform guard per column so the work and
         // the buffer bounds scale with m_cols. Column c reads q words at
@@ -190,7 +213,8 @@ pub(crate) fn q5_row_dot(
             } else {
                 0
             };
-            f1 += q5_block_col(&cw, q, q0 + q_stride + qslot, d, mv * s1 as f32, e1);
+            // SAFETY: column 1 of the note above; m_cols > 1.
+            f1 += unsafe { q5_block_col(&cw, q, q0 + q_stride + qslot, d, mv * s1 as f32, e1) };
         }
         if m_cols > 2 {
             // SAFETY: m_cols > 2 => d8.len() >= (col0+3)*k_blocks >
@@ -203,7 +227,8 @@ pub(crate) fn q5_row_dot(
             } else {
                 0
             };
-            f2 += q5_block_col(&cw, q, q0 + 2 * q_stride + qslot, d, mv * s2 as f32, e2);
+            // SAFETY: column 2 of the note above; m_cols > 2.
+            f2 += unsafe { q5_block_col(&cw, q, q0 + 2 * q_stride + qslot, d, mv * s2 as f32, e2) };
         }
         if m_cols > 3 {
             // SAFETY: m_cols > 3 => d8.len() >= (col0+4)*k_blocks >
@@ -216,7 +241,8 @@ pub(crate) fn q5_row_dot(
             } else {
                 0
             };
-            f3 += q5_block_col(&cw, q, q0 + 3 * q_stride + qslot, d, mv * s3 as f32, e3);
+            // SAFETY: column 3 of the note above; m_cols > 3.
+            f3 += unsafe { q5_block_col(&cw, q, q0 + 3 * q_stride + qslot, d, mv * s3 as f32, e3) };
         }
         if m_cols > 4 {
             // SAFETY: m_cols > 4 => d8.len() >= (col0+5)*k_blocks >
@@ -229,7 +255,8 @@ pub(crate) fn q5_row_dot(
             } else {
                 0
             };
-            f4 += q5_block_col(&cw, q, q0 + 4 * q_stride + qslot, d, mv * s4 as f32, e4);
+            // SAFETY: column 4 of the note above; m_cols > 4.
+            f4 += unsafe { q5_block_col(&cw, q, q0 + 4 * q_stride + qslot, d, mv * s4 as f32, e4) };
         }
         if m_cols > 5 {
             // SAFETY: m_cols > 5 => d8.len() >= (col0+6)*k_blocks >
@@ -242,7 +269,8 @@ pub(crate) fn q5_row_dot(
             } else {
                 0
             };
-            f5 += q5_block_col(&cw, q, q0 + 5 * q_stride + qslot, d, mv * s5 as f32, e5);
+            // SAFETY: column 5 of the note above; m_cols > 5.
+            f5 += unsafe { q5_block_col(&cw, q, q0 + 5 * q_stride + qslot, d, mv * s5 as f32, e5) };
         }
         if m_cols > 6 {
             // SAFETY: m_cols > 6 => d8.len() >= (col0+7)*k_blocks >
@@ -255,7 +283,8 @@ pub(crate) fn q5_row_dot(
             } else {
                 0
             };
-            f6 += q5_block_col(&cw, q, q0 + 6 * q_stride + qslot, d, mv * s6 as f32, e6);
+            // SAFETY: column 6 of the note above; m_cols > 6.
+            f6 += unsafe { q5_block_col(&cw, q, q0 + 6 * q_stride + qslot, d, mv * s6 as f32, e6) };
         }
         if m_cols > 7 {
             // SAFETY: m_cols > 7 => d8.len() >= (col0+8)*k_blocks >
@@ -268,7 +297,8 @@ pub(crate) fn q5_row_dot(
             } else {
                 0
             };
-            f7 += q5_block_col(&cw, q, q0 + 7 * q_stride + qslot, d, mv * s7 as f32, e7);
+            // SAFETY: column 7 of the note above; m_cols > 7.
+            f7 += unsafe { q5_block_col(&cw, q, q0 + 7 * q_stride + qslot, d, mv * s7 as f32, e7) };
         }
 
         b += 32;
@@ -567,10 +597,9 @@ mod q5_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        // SAFETY: the arm's index is inside its own total, so
-        // the column and group/block indices below are in range, and the
-        // launch contract bounds that arm's source and outputs. The arm is
-        // chosen by the block index, so a warp never splits across it.
+        // SAFETY: each arm's indices are inside its own total, so `requires`
+        // bounds its source and outputs; one warp per block index, never split
+        // across the arm; the launcher passes n_sb.div_ceil(2), div_ceil(4).
         unsafe {
             if blk < total_a {
                 let (col, g) = (blk / n_groups as usize, blk % n_groups as usize);
@@ -644,19 +673,24 @@ mod q5_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        let f = q5_row_dot(
-            w,
-            q,
-            d8,
-            s8,
-            k_blocks as usize,
-            q_stride as usize,
-            row0 as usize + row,
-            col0 as usize,
-            m_cols as usize,
-            lane,
-            false,
-        );
+        // SAFETY: row < n_rows, so `requires` bounds w at row0 + row and q, d8,
+        // s8 at col0 + m_cols columns; `enqueue_gemv_q5_0` passes the
+        // activation's own q_stride and refuses m_cols outside 1..=8.
+        let f = unsafe {
+            q5_row_dot(
+                w,
+                q,
+                d8,
+                s8,
+                k_blocks as usize,
+                q_stride as usize,
+                row0 as usize + row,
+                col0 as usize,
+                m_cols as usize,
+                lane,
+                false,
+            )
+        };
         let s = reduce_cols(f, m_cols as usize);
         if lane == 0 {
             let yb = y0 as usize + row * m_cols as usize;
@@ -730,19 +764,24 @@ mod q5_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        let f = q5_row_dot(
-            w,
-            q,
-            d8,
-            s8,
-            k_blocks as usize,
-            q_stride as usize,
-            row0 as usize + row,
-            col0 as usize,
-            m_cols as usize,
-            lane,
-            true,
-        );
+        // SAFETY: row < n_rows, so `requires` bounds w at row0 + row and q, d8,
+        // s8 at col0 + m_cols columns; `enqueue_gemv_q5_1` passes the
+        // activation's own q_stride and refuses m_cols outside 1..=8.
+        let f = unsafe {
+            q5_row_dot(
+                w,
+                q,
+                d8,
+                s8,
+                k_blocks as usize,
+                q_stride as usize,
+                row0 as usize + row,
+                col0 as usize,
+                m_cols as usize,
+                lane,
+                true,
+            )
+        };
         let s = reduce_cols(f, m_cols as usize);
         if lane == 0 {
             let yb = y0 as usize + row * m_cols as usize;
@@ -844,19 +883,24 @@ mod q5_kernels {
             return;
         }
         let id = id as usize;
-        let f = q5_row_dot(
-            w,
-            q,
-            d8,
-            s8,
-            k_blocks as usize,
-            q_stride as usize,
-            id * rows_per_expert as usize + row % rows_per_expert as usize,
-            slot, // col0: slot s reads activation column s
-            1,    // m_cols: one output per slot row
-            lane,
-            false,
-        );
+        // SAFETY: id < n_experts and slot < n_slots, so `requires` bounds w at
+        // the row and q, d8, s8 at column slot; m_cols is 1; the launcher
+        // passes the activation's own q_stride.
+        let f = unsafe {
+            q5_row_dot(
+                w,
+                q,
+                d8,
+                s8,
+                k_blocks as usize,
+                q_stride as usize,
+                id * rows_per_expert as usize + row % rows_per_expert as usize,
+                slot, // col0: slot s reads activation column s
+                1,    // m_cols: one output per slot row
+                lane,
+                false,
+            )
+        };
         let s = reduce_cols(f, 1);
         if lane == 0 {
             // SAFETY: row < n_slots*rows_per_expert <= y.len() by the launch

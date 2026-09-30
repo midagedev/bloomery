@@ -515,19 +515,24 @@ mod fused_kernels {
             return;
         }
         let lane = warp::lane_id() as usize;
-        let f = q5_row_dot(
-            w,
-            q,
-            d8,
-            s8,
-            k_blocks as usize,
-            q_stride as usize,
-            row0 as usize + row,
-            0,
-            1,
-            lane,
-            true,
-        );
+        // SAFETY: row < n_rows, so `requires` bounds w at row0 + row and q, d8,
+        // s8 at one column; m_cols is 1; `enqueue_down_add_q5_1` passes the
+        // activation's own q_stride.
+        let f = unsafe {
+            q5_row_dot(
+                w,
+                q,
+                d8,
+                s8,
+                k_blocks as usize,
+                q_stride as usize,
+                row0 as usize + row,
+                0,
+                1,
+                lane,
+                true,
+            )
+        };
         // `q5_1_gemv`'s m = 1 reduction is this one warp tree over f[0].
         let a = warp::reduce_sum_f32(f[0]);
         if lane == 0 {
