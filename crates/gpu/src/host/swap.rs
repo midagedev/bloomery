@@ -116,8 +116,8 @@ use crate::graph::{MappedHost, cu, mem_batch, op_write};
 /// The residency lever: `off`, or the rule's `mid` parameters with `P`
 /// pinned seed experts a layer and `S` spare slots a layer (`mid-p<P>-s<S>`).
 /// The values a binary takes are the lever registry's, read at `main`
-/// (`bloomery_levers::Levers::residency`); [`Residency::parse`] is their
-/// grammar.
+/// (`bloomery_levers::Levers::residency`); `bloomery_levers::residency_word`
+/// is their grammar.
 pub use bloomery_levers::RESIDENCY;
 
 /// What [`RESIDENCY`] asks a load for.
@@ -131,33 +131,19 @@ pub enum Residency {
 }
 
 impl Residency {
-    /// `v` as a value of [`RESIDENCY`]: `off`, or `mid-p<P>-s<S>` with `P` and
-    /// `S` whole numbers in base 10 with no leading zero and `S` at least 1.
-    /// Anything else is refused by name.
+    /// `v` as a value of [`RESIDENCY`], in the lever's grammar
+    /// ([`bloomery_levers::residency_word`]: `off`, or `mid-p<P>-s<S>`, `S` at
+    /// least 1). Anything else is refused by name.
     pub fn parse(v: &str) -> Result<Residency, GpuError> {
-        let refuse = || {
-            GpuError::shape(
+        match bloomery_levers::residency_word(v) {
+            Some(bloomery_levers::ResidencyWord::Off) => Ok(Residency::Off),
+            Some(bloomery_levers::ResidencyWord::Mid { pinned, spares }) => {
+                Ok(Residency::Mid { pinned, spares })
+            }
+            None => Err(GpuError::shape(
                 "Residency::parse",
                 format!("{RESIDENCY}={v:?}: it takes off or mid-p<P>-s<S> (S at least 1)"),
-            )
-        };
-        if v == "off" {
-            return Ok(Residency::Off);
-        }
-        let (p, s) = v
-            .strip_prefix("mid-p")
-            .and_then(|rest| rest.split_once("-s"))
-            .ok_or_else(refuse)?;
-        let whole = |t: &str| -> Option<usize> {
-            let digits = !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
-            if !digits || (t.len() > 1 && t.starts_with('0')) {
-                return None;
-            }
-            t.parse().ok()
-        };
-        match (whole(p), whole(s)) {
-            (Some(pinned), Some(spares)) if spares >= 1 => Ok(Residency::Mid { pinned, spares }),
-            _ => Err(refuse()),
+            )),
         }
     }
 
@@ -2846,44 +2832,18 @@ fn not_resident(what: &'static str, layer: usize, id: u32, which: &str) -> GpuEr
 #[cfg(test)]
 mod tests {
     use super::super::slots::{HOST, SlotMap};
-    use super::{RESIDENCY, Residency, SlotLedger, SlotState, Tally};
+    use super::{Residency, SlotLedger, SlotState, Tally};
 
-    /// The lever registry's words for [`RESIDENCY`], from its table
-    /// (`bloomery_levers::markdown`): the one list of the values a binary
-    /// takes.
-    fn registry_words() -> Vec<String> {
-        let md = bloomery_levers::markdown();
-        let head = format!("| `{RESIDENCY}` |");
-        let line = md
-            .lines()
-            .find(|l| l.starts_with(&head))
-            .unwrap_or_else(|| panic!("the lever table has no row {RESIDENCY}"));
-        let takes = line.split('|').nth(3).expect("a takes cell").trim();
-        takes
-            .strip_prefix("one of ")
-            .unwrap_or_else(|| panic!("{RESIDENCY} takes {takes:?}, not words"))
-            .split(", ")
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// Every word the registry gives the lever is one the grammar takes, and
-    /// the grammar refuses what is not `off` or `mid-p<P>-s<S>`.
+    /// The parse takes exactly what the lever's grammar takes
+    /// (`bloomery_levers::residency_word`, the one owner), with the same
+    /// numbers. Mutant: a parse of its own that drifts from the lever's.
     #[test]
-    fn every_registry_word_parses() {
-        let words = registry_words();
-        assert!(words.iter().any(|w| w == "off"), "{words:?}");
-        for w in &words {
-            Residency::parse(w).unwrap_or_else(|e| panic!("{w}: {e}"));
-        }
-        assert_eq!(
-            Residency::parse("mid-p40-s1").ok(),
-            Some(Residency::Mid {
-                pinned: 40,
-                spares: 1
-            })
-        );
-        for bad in [
+    fn parse_is_the_levers_grammar() {
+        for v in [
+            "off",
+            "mid-p0-s1",
+            "mid-p33-s1",
+            "mid-p40-s2",
             "",
             "on",
             "mid",
@@ -2893,8 +2853,19 @@ mod tests {
             "mid-p4-s1x",
             "mid-p+4-s1",
         ] {
-            assert!(Residency::parse(bad).is_err(), "{bad:?}");
+            assert_eq!(
+                Residency::parse(v).is_ok(),
+                bloomery_levers::residency_word(v).is_some(),
+                "{v:?}"
+            );
         }
+        assert_eq!(
+            Residency::parse("mid-p40-s2").ok(),
+            Some(Residency::Mid {
+                pinned: 40,
+                spares: 2
+            })
+        );
     }
 
     /// An off tally notes nothing; a live one refuses a slot noted twice and

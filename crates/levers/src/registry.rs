@@ -351,7 +351,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: RESIDENCY,
         class: Class::C,
-        kind: Kind::Words(&["off", "mid-p0-s1", "mid-p40-s1", "mid-p148-s1"]),
+        kind: Kind::Residency,
         default: Unset::Means(
             "V4.1 follows the placement: `mid-p40-s1` under `--place a` and `bp`, `off` under \
              `gate`, beside `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or \
@@ -406,8 +406,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               no route trace): unset `mid-p<P>-s1` under `--place a` from the plan it loads, \
               `off` under `--place gate`; running `mid-…` each call prints its `residency pass` \
               records; a request's reset keeps the residency, and only `POST /residency/reset` \
-              moves it back to the seed, with a `residency reset` record. Every other binary \
-              refuses it set, by name.",
+              moves it back to the seed, with a `residency reset` record. `generate_glm5next`: \
+              unset is `off`; set, the word runs as given (`mid-p33-s1` is plan (a)'s word), \
+              refused by name beside `BLOOMERY_DRAFT=mtp`, `--pair`, `BLOOMERY_ROUTE_TRACE` and \
+              `--prefill steps`. Every other binary refuses it set, by name.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

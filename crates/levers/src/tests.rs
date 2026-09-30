@@ -65,6 +65,7 @@ fn sample(kind: Kind) -> String {
         Kind::Path => "/data/set".into(),
         Kind::File => A_FILE.into(),
         Kind::Text => "text".into(),
+        Kind::Residency => "mid-p33-s1".into(),
     }
 }
 
@@ -121,6 +122,26 @@ fn garbage(kind: Kind) -> Vec<String> {
             env!("CARGO_MANIFEST_DIR").to_string(),
         ]),
         Kind::Path | Kind::Text => {}
+        Kind::Residency => g.extend(
+            [
+                "OFF",
+                " off",
+                "off ",
+                "mid",
+                "mid-p",
+                "mid-p1",
+                "mid-p-s1",
+                "mid-p1-s",
+                "mid-p1-s0",
+                "mid-p01-s1",
+                "mid-p1-s01",
+                "mid-p+1-s1",
+                "mid-p1-s1 ",
+                "MID-p1-s1",
+                "mid-p18446744073709551616-s1",
+            ]
+            .map(String::from),
+        ),
     }
     g
 }
@@ -1050,4 +1071,25 @@ fn table_is_a_line_per_lever() {
         };
         assert!(value.starts_with(&want), "{line}");
     }
+}
+
+/// The residency grammar's one owner reads each model's derived word (a P no
+/// list could name ahead) and the spares, and refuses S = 0.
+/// Mutant: a closed word list — `mid-p33-s1` refused.
+#[test]
+fn residency_words_take_any_p_and_s_at_least_1() {
+    assert_eq!(residency_word("off"), Some(ResidencyWord::Off));
+    for (v, pinned, spares) in [
+        ("mid-p0-s1", 0, 1),
+        ("mid-p33-s1", 33, 1),
+        ("mid-p138-s2", 138, 2),
+    ] {
+        assert_eq!(
+            residency_word(v),
+            Some(ResidencyWord::Mid { pinned, spares }),
+            "{v}"
+        );
+        assert!(Kind::Residency.parse(v).is_ok(), "{v}");
+    }
+    assert_eq!(residency_word("mid-p33-s0"), None);
 }
