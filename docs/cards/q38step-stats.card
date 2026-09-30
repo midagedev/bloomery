@@ -1,0 +1,48 @@
+# Round q38step (paper): the one box run the decode-step derivation leaves open. Counts, not a timing:
+# the arms are greedy and the residency rule is a pure function of the routing, so the host slots and
+# the flips of a BLOOMERY_STEP_STATS arm are the C4 window's timed arms' when the target path and plan
+# are C4's (the load and capture lines and distinct_tokens are the check). Step ms is not read from the
+# stats arms (the probe's tax); the MTP arms run without stats and their `time pass` walls are read.
+# [derived, q38step ressim4.py]: the mid rule from the id-prefix seed over n = 96 steps, Zipf a read from
+# the prompt's measured R (rig-log 09-29 prose: 9.62 -> a 1.0, 3.83 -> a 0.72), W 23.36 us a slot: the
+# P 512 residency arm's last-10 host slots a step 144 (a 1.0) .. 164 (a 0.85), the off arm's 222..232.
+# Read beside it, not decided on [derived]: P 4096 residency last-10 175..190; the off arms' leg_us_mean
+# 5.3..6.1 ms (226 slots x 23.4 us + 48 services x 0..15 us); residency pass late 0 and 20..24 flips
+# (61..74 MB) a planning boundary; the MTP arms' mtp summary positions/passes 2.2..3.5 at P 512 and
+# 1.9..2.9 at P 4096 (ratio 0.80..0.91), their median `time pass` wall 27.8..41.2 ms at P 512 and at most
+# 1.3 ms more at P 4096.
+# Instrument first: tools/ref/depth-qwen3moe.sh:1227's grep also passes `stat step`, `stat summary`,
+# `residency pass`, `mtp summary`, `time pass` and `tokens` (today it drops them).
+# Wall [derived]: 6 arms, one round, four loads of ~20..25 s and ~35 s of prompts and steps: under 8 min.
+kind: calibration
+question: how many host slots does the residency arm's decode step serve by its last ten steps?
+term: stat step host_slots, mean of steps 87..96, prose:512@BLOOMERY_RESIDENCY=mid-p148-s1, n=96,
+  depth 512, ctx 4352, BLOOMERY_STEP_STATS=1 on that arm, A6000, plan a
+unit: slots
+predict: 140..170
+condition: on C4's tree (bloomery-q38x a3a8bbb3) or one whose load and capture lines read C4's
+  (card_layers=43 resident_bytes=48743837372 graph_nodes=1366):
+  BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38step-stats.card BLOOMERY_GEN_CTX=4352'
+  BLOOMERY_AB_ROUNDS=1 just depth-gpu-qwen4exp
+  prose:512@BLOOMERY_RESIDENCY=off,BLOOMERY_STEP_STATS=1
+  prose:512@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_STEP_STATS=1
+  prose:4096@BLOOMERY_RESIDENCY=off,BLOOMERY_STEP_STATS=1
+  prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_STEP_STATS=1
+  prose:512@BLOOMERY_RESIDENCY=off,BLOOMERY_DRAFT=mtp prose:4096@BLOOMERY_RESIDENCY=off,BLOOMERY_DRAFT=mtp
+  (if an arm refuses the per-arm stats word, the four stats arms run as their own invocation with
+  BLOOMERY_STEP_STATS=1 in BLOOMERY_BOX_ENV), the full output to a file first; every arm's
+  distinct_tokens equals C4's (70 at P 512, 61 at P 4096) and the tokens lines of a P's arms are equal;
+  96 stat step records a stats arm; the residency arms print residency pass records with made > 0; no
+  counted row [cold]
+decide-in: the hit's transient is the shortfall (the per-slot cost is W): open the prompt-seeded
+  residency round (the prompt tail's counts through call_pick), and price S and cap at 0; write the hit
+  per ten steps into rig-log beside the C4 row
+decide-below: the rule tracks better than the stationary sim, so the cut a slot is below W: read the
+  in-arm slope of leg_us on host_slots and each residency pass's boundary_us and late; a landing that
+  carries 0.5 ms a step or more moves off the host's serial boundary first, else W at decode is
+  re-priced from leg_us before any residency round
+decide-above: the continuation routes flatter than its prompt: fit a from the arm's own host slots a
+  step, re-derive the prompt-seeded round's band from it before opening it
+reason: sets the decode hit a step and the host's service time a slot, the two terms q38res-ab's
+  decide-below left open, and reads the MTP windows' kept rows and walls; why now: the next Qwen3.8
+  decode round is priced on them
