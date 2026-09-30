@@ -1,0 +1,34 @@
+# Round q38seed: the shipped default's pair — residency and the draft unset (under --place a they resolve to
+# mid-p148-s1 and the MTP draft: read the `residency unset` and `load draft=mtp` records), BLOOMERY_HOSTSTREAM
+# off against on, same binary. It decides whether the lever becomes the default.
+# [derived]: a window is the draft's chain plus a 4-row verify; the verify's host union serves each layer's
+# distinct host experts of 4 rows at about W 23.36 us each (at most 3 columns an expert: max(W, 6.7 c) = W).
+# From the q38seed-ab replay, a token's host slots on the 43 card layers fall 124.5 -> 72.4 (P 512) and
+# 118.7 -> 28.8 (P 4096) a step; at 0.8 overlap among 4 rows the verify's union falls about 3.9 ms (P 512) and
+# 6.9 ms (P 4096) on a 27.8..41.2 ms window (q38step §3), the 5 host-only layers unchanged: +10..+14 % and
+# +17..+25 %; E(4) unchanged (the greedy ids are the target's, and a window keeps what the draft and the target
+# agree on). Band widened for the overlap and the window's spread: +5..+30.
+# Runner (after the q38seed-ab window, the full output to a file first):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38seed-mtp.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=6
+# just depth-gpu-qwen4exp prose:512@BLOOMERY_HOSTSTREAM=off prose:512@BLOOMERY_HOSTSTREAM=on
+#   prose:4096@BLOOMERY_HOSTSTREAM=off prose:4096@BLOOMERY_HOSTSTREAM=on
+# Rounds: the q38seed-ab window's paired tg ratios scattered with SD 3.7 % (P 512) and 3.8 % (P 4096) over 4
+# rounds, one run's sd about 2.6 %, so 6 rounds (h 3.3 %) to keep the band's low edge outside the ruler.
+# Wall [derived]: the q38seed-ab window ran 16 rows in 4.7 min; 24 rows with the draft's load, 8..12 min.
+kind: ab
+question: does the prompt call's pick lift Qwen3.8's shipped default (residency + MTP) decode?
+term: tg tok/s @ n=96, prose:512 and prose:4096, ctx 4352, A6000, plan a, BLOOMERY_RESIDENCY and
+  BLOOMERY_DRAFT unset (mid-p148-s1 and mtp), BLOOMERY_HOSTSTREAM=on against off, same binary, paired by round
+unit: %
+predict: +5..+30
+rounds: 6
+sd: 2.6 % the q38seed-ab window (09-30 21:04-21:09 UTC), paired tg ratio SD 3.7-3.8 % over 4 rounds / sqrt 2
+condition: one binary, both arms of a P in one lease, a fresh process per load group, the host set and the
+  PLE table warm, no [cpu-busy] or [other-busy] row; each arm's records name residency mid-p148-s1 (unset)
+  and load draft=mtp; the arms of a P print the same distinct_tokens and an mtp E(4) within 0.05 of each other
+decide-in: propose BLOOMERY_HOSTSTREAM unset = on under --place a with a residency for Qwen3.8 (V4.1's rule),
+  with this row, q38seed-ab's and the pp rows beside them
+decide-below: read the arms' E(4) and the functional run's host slots: an E(4) that moved is the draft's
+  store (the prompt's bits changed), host slots at the replay's with no gain is the verify's union not
+  shrinking with its slots — one nsys window of a verify before any change
+decide-above: the verify's union is not W-bound at 4 rows: re-derive V from the window's time pass walls

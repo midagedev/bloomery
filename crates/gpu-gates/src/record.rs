@@ -1803,6 +1803,8 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &CALL_STREAM,
+    &CALL_STREAM_END,
 ];
 
 /// The record `gate_deepseek41_prefill` prints inside its own lines, after

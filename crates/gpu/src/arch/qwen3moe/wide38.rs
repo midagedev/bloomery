@@ -51,6 +51,23 @@
 //! experts, and holds no card buffers on a map without them: a slot map with
 //! an expert on a tier card is refused by name at its entry (`card38`),
 //! before anything moves.
+//!
+//! Under host streaming (`BLOOMERY_HOSTSTREAM=on`, a residency machine, a
+//! prompt call fed by ubatches: V4.1's `body::prefill` flow at one ubatch a
+//! group) every walk of the call moves each card layer's residency pool
+//! toward the experts the unit routes most, at that layer: in the shadow, the
+//! host waits for the front's download, counts the unit's routed ids and the
+//! machine's pick (`SwapMachine::call_pick`, [`STREAM_FLOOR`] the least count
+//! admitted) sends the pool's coldest residents to the host and copies the
+//! hottest host experts over them; the engine stream waits for those copies
+//! before the card route, and the serve's union and the card route both run
+//! under the moved map. Unlike V4.1 there is no second card pass: the pick
+//! comes before the layer's only card route, which reads the moved words. The
+//! route is then the layer's reader of the call ([`Gemm38::stream_read`]),
+//! which the next ubatch's pick copies behind. The call's placement stays
+//! for the decode after it. A token's bits then depend on its ubatch's
+//! routing too — which of its experts the pick moved sums on the card, not
+//! the host — so the numeric class above holds for an unstreamed walk only.
 
 use super::body::ATTN_SCALE_256;
 use super::card38::Card38;
@@ -69,6 +86,7 @@ use crate::hc_gated::{Before, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
 use crate::host::handoff::Places;
 use crate::host::run::HostRun;
+use crate::host::swap::{CallPick, CallReport};
 use crate::host::{BatchLeg, LegTimer, ServeNote};
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
@@ -597,6 +615,9 @@ pub(super) struct WideParts<'a> {
     pub(super) pos0: usize,
     pub(super) dense: usize,
     pub(super) cur: usize,
+    /// The prompt call's host streaming: whether this walk picks, and its
+    /// records.
+    pub(super) stream: &'a mut Stream38,
 }
 
 /// `y = W · act` for the Q8_0 weight `name` over the first `m` columns of
@@ -1325,6 +1346,32 @@ fn qsa(
     Ok((dense, m - dense))
 }
 
+/// The least count an expert's ubatch routes to it for a streaming pick to
+/// admit it: about the least column count whose share of the host union
+/// passes one flip's copy on the staging ring (an expert's three stacks),
+/// which the layer's card route waits for [derived]; V4.1's `STREAM_FLOOR`,
+/// the same value, sits inside that estimate's error. Below it a flip
+/// lengthens a layer whose card already waits on its copies more than it
+/// shortens the union.
+pub(super) const STREAM_FLOOR: u32 = 32;
+
+/// A prompt call's host streaming (`BLOOMERY_HOSTSTREAM`, the residency
+/// machine's call mode): whether the next prompt calls stream, whether one
+/// is streaming now, the pick's count buffer, and the call's pick and end
+/// records for the binary that prints them.
+#[derive(Default)]
+pub(super) struct Stream38 {
+    /// The next prompt calls stream ([`super::body38::Body38::set_hoststream`]).
+    pub(super) lever: bool,
+    /// A call is streaming: every ubatch walk of it picks.
+    pub(super) on: bool,
+    /// The ubatch the walk runs, from 0, the pick records' group.
+    pub(super) ubatch: usize,
+    counts: Vec<u32>,
+    pub(super) picks: Vec<(usize, CallPick)>,
+    pub(super) end: Option<CallReport>,
+}
+
 /// A ubatch's walk `(1, m, Batch)`: every layer through the batch port at
 /// the unit's width; the head is the caller's ([`Gemm38::head`]).
 pub(super) struct Gemm38<'a> {
@@ -1375,6 +1422,49 @@ impl<'a> Gemm38<'a> {
             t.walked = Some((self.p.pos0, m));
         }
         Ok(())
+    }
+
+    /// Under host streaming, on a layer with card experts, the layer's pick
+    /// before its card route: the host waits for the front's download of the
+    /// unit's routed ids, counts them, and the residency machine's pick
+    /// (`SwapMachine::call_pick`, [`STREAM_FLOOR`] the least count admitted)
+    /// sends the pool's coldest residents to the host and copies the unit's
+    /// hottest host experts over them, the host map and the card's copy of
+    /// the layer's words moved at once — so the union the walk's serve runs
+    /// next, and the card route, run under the moved map — then the engine
+    /// stream waits for the pick's copies. Nothing else, and nothing in a
+    /// unit of fewer rows than the floor.
+    fn stream_pick(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
+        // A unit of fewer rows than the floor gives no expert a count the
+        // pick admits (a call's last ubatch can be one).
+        if !self.p.stream.on || !self.p.card.has(l) || self.p.m < STREAM_FLOOR as usize {
+            return Ok(());
+        }
+        let key = port.key(at);
+        let stream = self.p.c.gpu.stream();
+        let s = &mut *self.p.stream;
+        let pick = port
+            .hybrid()
+            .call_pick_routed(stream, key, &mut s.counts, usize::MAX)?;
+        s.picks.push((s.ubatch, pick));
+        let landed = port.hybrid().call_landed(l)?.ok_or(GpuError::state(
+            WHAT,
+            "a residency machine's call for the streamed layer",
+        ))?;
+        stream.wait(landed)?;
+        Ok(())
+    }
+
+    /// Under host streaming, on a layer with card experts, the layer's last
+    /// read of its slots in the call so far, after its card route
+    /// (`SwapMachine::call_reader`): the next ubatch's pick of the layer
+    /// copies behind it. Nothing else.
+    fn stream_read(&mut self, port: &mut BatchLeg<'a, HostRun>, l: usize) -> Result<(), GpuError> {
+        if !self.p.stream.on || !self.p.card.has(l) {
+            return Ok(());
+        }
+        port.hybrid().call_reader(l, self.p.c.gpu.stream())
     }
 
     /// After the walk: the head's mix over the unit's columns (the last
@@ -1438,14 +1528,25 @@ impl<'a> LayerProgram for Gemm38<'a> {
     /// else — after the front's download, the stream order the route's
     /// buffers exist under (its module doc): enqueued before the download,
     /// the d2h would queue behind the route's card GEMMs and the host tier
-    /// would start late by their whole time.
+    /// would start late by their whole time. Under host streaming the shared
+    /// expert comes first, so the card runs it while the host counts and
+    /// picks; then the layer's pick and the route after its copies
+    /// ([`Gemm38::stream_pick`]), the route the layer's last read of its
+    /// slots in the call ([`Gemm38::stream_read`]).
     fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let enq = port.part_start();
-        let r = self
-            .p
-            .route_card(at.layer)
-            .and_then(|()| self.p.shared(at.layer))
-            .and_then(|()| port.mark(at.layer, Mark::Shadow as usize));
+        let r = if self.p.stream.on {
+            self.p
+                .shared(at.layer)
+                .and_then(|()| self.stream_pick(port, at))
+                .and_then(|()| self.p.route_card(at.layer))
+                .and_then(|()| self.stream_read(port, at.layer))
+        } else {
+            self.p
+                .route_card(at.layer)
+                .and_then(|()| self.p.shared(at.layer))
+        }
+        .and_then(|()| port.mark(at.layer, Mark::Shadow as usize));
         port.part_end(at.layer, enq);
         r
     }

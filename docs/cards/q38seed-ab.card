@@ -1,0 +1,63 @@
+# Round q38seed: Qwen3.8's prompt call moves the residency pool (BLOOMERY_HOSTSTREAM=on, the machine's call
+# mode in the ubatch walk), so decode starts from the prompt's hottest experts instead of the load's id prefix.
+# Same binary, both arms BLOOMERY_RESIDENCY=mid-p148-s1 and BLOOMERY_DRAFT=off, the lever off against on.
+#
+# Decomposition [derived] (Step 0, the replay of the engine's own route trace router/q38-prose-trace-09300532:
+# 8 prose contexts of 512 prompt ids + 256 greedy steps, all 48 layers; P 4096 stands in as the 8 prompts in
+# order, the decode after the last): the pick is SwapRule::call_pick over the ubatch's whole counts at floor 32
+# (STREAM_FLOOR: a flip the card route waits for pays when its columns' union share, ~5.0 us a column, passes
+# its copy, 3.072 MB at 21.19 GB/s = 145 us: c >= 29), 148 pinned, the pool the live unpinned rest. Then the mid
+# rule (every 4, cap 24, margin 3, min 2, decay 0.9, 1 spare, delay 2) from zero counts over 96 steps.
+#   Decode host slots a step (5 host-only layers = 50 + the card layers'): without the pick 174.5 (P 512;
+#   measured 181.3, rig-log 09-30 #q38res-hit — the replay reads 4 % low) and 168.7 (P 4096; measured 179.8);
+#   with it 122.4 and 78.8. At 23.6 us a slot (the measured in-arm slope) on the 17.6 ms step: tg x1.075 at
+#   P 512 and x1.138 at P 4096. Band widened for the replay's low base, for P 4096 being eight contexts rather
+#   than one text, and for the A/B's greedy continuation (gemm-fed) differing from the trace's (step-fed).
+#   Whole-ubatch counts against the last K rows (tail 128/256 at P 512, 512/1024 at P 4096) moved the decode
+#   slots by <= 9 while cutting the prompt's own gain, so the pick counts the whole ubatch.
+# The prompt [derived, not this card's term, read beside it]: per card layer the wall is rest (3.6 / 27.9 ms a
+#   layer-batch) + max(host: 0.35 ms pick + the backlog wait + the union under the moved map (sum over host
+#   experts of max(23.36 us, 5.0 us x columns), slowed 3.8 % beside the copies), card: the pick's copies on one
+#   FIFO + the card route (1.3 ms a 2048-row run + 0.16 us a card slot-column)). Host columns fall 88.0k -> 37.2k
+#   (P 512) and 704k -> 105k (P 4096): pp512 x1.41 (x1.37 at 3/4 of the copy rate), pp4096 x1.77 (x1.70; 214 ms
+#   of backlog wait, 82 flips a layer past the 48-job bound), so pp512 +20..+45 %, pp4096 +40..+85 % [derived].
+# Added after the window (lead's question, 21:45 UTC; the band above is the one the run was held to): why pp
+#   is not V4.1's +3.8 % (rig-log 09-30 #callstream-pp-a). V4.1 runs a second card pass over the streamed
+#   places after the pick's copies, and that pass's enqueue+wait grew 1,149 -> 3,280 ms against a union that
+#   fell 9,746 -> 7,350 ms. Qwen3.8 has no second pass: the pick comes before the layer's only card route,
+#   which reads the moved map, so an admitted expert costs the route 0.16 us a slot-column under the union's
+#   shadow, and one flip moves 3.07 MB where V4.1's expert is 16.77 MB (5.5x fewer copy-ms a flip). The prose
+#   ubatch's routing is concentrated enough that ~17 / ~82 flips a layer take the host columns 88.0k -> 37.2k
+#   and 704k -> 105k, and the union is ~77 % of the prompt's wall.
+# Runner (from /Users/hckim/repo/bloomery-q38seed, the full output to a file first):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38seed-ab.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=4
+# just depth-gpu-qwen4exp prose:512@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=off,BLOOMERY_HOSTSTREAM=off
+#   prose:512@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=off,BLOOMERY_HOSTSTREAM=on
+#   prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=off,BLOOMERY_HOSTSTREAM=off
+#   prose:4096@BLOOMERY_RESIDENCY=mid-p148-s1,BLOOMERY_DRAFT=off,BLOOMERY_HOSTSTREAM=on
+# Wall [derived]: 4 arms x 4 rounds of a fresh Qwen3.8 load (q38res-ab: 4 x 3 in about 6 min, plus the seed),
+# 9..12 min.
+kind: ab
+question: does the prompt call's pick into the residency pool lift Qwen3.8's plain decode by the replay's band?
+term: tg tok/s @ n=96, the prose corpus (prose:512 and prose:4096), ctx 4352 (BLOOMERY_GEN_CTX=4352), A6000,
+  plan a (card experts), BLOOMERY_RESIDENCY=mid-p148-s1 and BLOOMERY_DRAFT=off in both arms,
+  BLOOMERY_HOSTSTREAM=on against off, same binary, paired by round
+unit: %
+predict: +3..+17
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, both arms of a P in one lease, a fresh process per load group, the host set and the
+  PLE table warm before each timed window (majflt near 0), no [cpu-busy] or [other-busy] row; every arm's
+  `residency lever` record names mid-p148-s1 and its `load draft=off` record is there; the on arm streams —
+  the runner passes no `call stream` line, so a functional run of the same binary and levers just before the
+  window (gpu-gate.sh, not timed, BLOOMERY_STEP_STATS=1) shows one `call stream` record a card layer and a
+  `call stream end` with kept=1 and admitted > 0 at each P, and none with the lever off; distinct_tokens equal
+  between the arms of a P
+decide-in: run the shipped-default pair (docs/cards/q38seed-mtp.card) next, then the residency gate's stream clause and its three mutants; propose
+  BLOOMERY_HOSTSTREAM unset = on under --place a with a residency (V4.1's rule) when pp is not below the off arm
+decide-below: read the on arm's `call stream` records (admitted a layer against the replay's ~17 / ~82, and
+  backlog_us) and the functional run's stat step host slots a step before any change: admitted near the replay means the decode rule
+  undoes the pick (the base's prompt-counted residents cold to the rule), fewer means the ubatch's routing is
+  flatter than the trace's
+decide-above: the replay under-counts the base's host slots (it read 4..7 % low): re-derive the step from the
+  functional run's host slots before the next Qwen3.8 residency round
