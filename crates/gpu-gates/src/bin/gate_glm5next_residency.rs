@@ -513,14 +513,16 @@ mod gate {
         let ids = lcg_ids(PROMPT + 8, inputs.hp.n_vocab);
 
         let first = history(&mut s, &ids[..PROMPT])?;
-        // The prompt call is one pass that keeps 0 rows; each step keeps 1.
+        // The prompt call is one pass that keeps 0 rows; each step keeps 1. A
+        // step's own boundary is made ahead of its readback, so the history's
+        // last step ends one too.
+        // PIN(2026-10-01): STEPS steps, not STEPS - 1: the last one's boundary runs ahead.
         let mut want = vec![(PassKind::None, 0), (PassKind::Prompt, 0)];
-        want.extend(std::iter::repeat_n((PassKind::Step, 1), STEPS - 1));
+        want.extend(std::iter::repeat_n((PassKind::Step, 1), STEPS));
         let passes_ok = first.passes == want;
         println!(
-            "passes: a history's boundaries end none, the prompt call (0 kept), then {} steps (1 \
-             kept each): {} boundaries, same {passes_ok}: {}",
-            STEPS - 1,
+            "passes: a history's boundaries end none, the prompt call (0 kept), then {STEPS} steps \
+             (1 kept each): {} boundaries, same {passes_ok}: {}",
             first.passes.len(),
             verdict(passes_ok)
         );
