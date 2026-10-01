@@ -658,6 +658,131 @@ fn draft38_unset_follows_the_place_and_the_file() {
     );
 }
 
+/// The GLM seat's levers unset: under `--place a` the NextN draft and the
+/// residency's default word; `off`, the first condition that holds named,
+/// under `--place gate`, with stores short of a window (both), on a file of
+/// other than one next-token layer (the draft), beside the step feed (the
+/// residency).
+#[test]
+fn glm_unset_follows_the_place() {
+    let at = |place_a, nextn_layers, ctx, prefill_steps| GlmAt {
+        place_a,
+        nextn_layers,
+        need: 3,
+        ctx,
+        prefill_steps,
+    };
+    let pick = |word, why| GlmPick { word, why };
+    let on_a = GlmUnset {
+        draft: pick("mtp", GlmWhy::PlaceA),
+        residency: pick("mid-p0-s1", GlmWhy::PlaceA),
+    };
+    for (at, want) in [
+        (at(true, 1, 2048, false), on_a),
+        (at(true, 1, 3, false), on_a),
+        (
+            at(false, 1, 2048, false),
+            GlmUnset {
+                draft: pick("off", GlmWhy::Gate),
+                residency: pick("off", GlmWhy::Gate),
+            },
+        ),
+        (
+            at(false, 0, 2, true),
+            GlmUnset {
+                draft: pick("off", GlmWhy::Gate),
+                residency: pick("off", GlmWhy::Gate),
+            },
+        ),
+        (
+            at(true, 1, 2, false),
+            GlmUnset {
+                draft: pick("off", GlmWhy::Ctx { need: 3, ctx: 2 }),
+                residency: pick("off", GlmWhy::Ctx { need: 3, ctx: 2 }),
+            },
+        ),
+        (
+            at(true, 0, 2048, true),
+            GlmUnset {
+                draft: pick("off", GlmWhy::Nextn { layers: 0 }),
+                residency: pick("off", GlmWhy::PrefillSteps),
+            },
+        ),
+        (
+            at(true, 2, 2048, false),
+            GlmUnset {
+                draft: pick("off", GlmWhy::Nextn { layers: 2 }),
+                residency: pick("mid-p0-s1", GlmWhy::PlaceA),
+            },
+        ),
+    ] {
+        assert_eq!(glm_unset(at), want, "{at:?}");
+    }
+    assert_eq!(
+        GlmWhy::Ctx { need: 3, ctx: 2 }.to_string(),
+        "unset: one window needs 3 positions, past --ctx 2"
+    );
+    assert_eq!(
+        GlmWhy::Gate.to_string(),
+        "unset: --place gate keeps its fixed placement"
+    );
+}
+
+/// The GLM seat's unset residency on the plan: the default word where it
+/// fits, else `off` naming the first shortfall; `off` and a set word pass
+/// through untouched.
+#[test]
+fn glm_residency_at_plan_takes_only_what_fits() {
+    let mid = GlmPick {
+        word: "mid-p0-s1",
+        why: GlmWhy::PlaceA,
+    };
+    let off = |why| GlmPick { word: "off", why };
+    let fit = |n: &[u64], pool: u64, headroom, mem| {
+        glm_residency_at_plan(
+            mid,
+            n.iter().copied(),
+            |p| {
+                assert_eq!(p, 0, "the word's pinned count");
+                Ok::<u64, &str>(pool)
+            },
+            headroom,
+            mem,
+        )
+    };
+    assert_eq!(fit(&[0, 66, 67], 10, 10, 10), Ok(mid));
+    assert_eq!(fit(&[0, 0], 10, 10, 10), Ok(off(GlmWhy::NoCardExperts)));
+    assert_eq!(
+        fit(&[0, 1, 67], 10, 10, 10),
+        Ok(off(GlmWhy::NoRoom { fewest: 1 }))
+    );
+    assert_eq!(
+        fit(&[66], 10, 9, 10),
+        Ok(off(GlmWhy::HostShort {
+            needs: 10,
+            leaves: 9
+        }))
+    );
+    assert_eq!(
+        fit(&[66], 10, 10, 9),
+        Ok(off(GlmWhy::MemShort {
+            needs: 10,
+            leaves: 9
+        }))
+    );
+    let gate = off(GlmWhy::Gate);
+    assert_eq!(
+        glm_residency_at_plan(gate, [66u64], |_| Err("not asked"), 0, 0),
+        Ok(gate)
+    );
+    assert_eq!(fit(&[66], 10, 10, 10).map(|p| p.why), Ok(GlmWhy::PlaceA));
+    assert_eq!(
+        glm_residency_at_plan(mid, [66u64], |_| Err::<u64, &str>("the pool"), 0, 0),
+        Err("the pool"),
+        "the pool's error is the call's"
+    );
+}
+
 /// `BLOOMERY_QWEN38_EXPERTS` unset is the card plan; set, as set.
 #[test]
 fn qwen38_experts_unset_is_card() {

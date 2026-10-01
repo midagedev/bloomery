@@ -218,7 +218,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means(
             "the plain path, one token a step; `generate_qwen3moe` on a qwen4exp file and \
              `bloomery-serve-qwen38` under `--place a`: `mtp` when the MTP draft file is there, \
-             else the plain path with a `load draft=off` record naming why",
+             else the plain path with a `load draft=off` record naming why; the GLM seat of \
+             `bloomery-serve`: `mtp` under `--place a` on a file of one next-token layer, else the \
+             plain path, with a `draft unset` record naming why (`bloomery_levers::glm_unset`)",
         ),
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
@@ -245,7 +247,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               with no file there, and with stores too short for one window (`--ctx-size` under \
               5: the server takes a window only while its rows fit), with the same record; it \
               has no `--logits` (a request that reads the logits row steps plainly) and takes \
-              no route trace. Every other binary and \
+              no route trace. The GLM seat of `bloomery-serve` takes `mtp` and `off`; unset \
+              (`bloomery_levers::glm_unset`, a `draft unset` record before the plan) it drafts \
+              under `--place a` on a file of one next-token layer, and runs the plain path under \
+              `--place gate`, on any other file and with stores too short for one window (`--ctx` \
+              under 3), never a refusal. Drafting, the load carries the NextN layer as \
+              `generate_glm5next`'s does, prints a `load draft=mtp` record after the `load` line, \
+              and `/props`' `engine.draft` names it; the plain path prints `load draft=off \
+              (<why>)`; `mtp` set is refused by name with stores too short for one window. Every \
+              other binary and \
               family refuses each word by name, `off` included.",
         site: Site::Parsed { left: &[] },
     },
@@ -382,7 +392,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
              `--dump-taps`, on a qwen3moe or qwen35moe file, and on plan (a) when the plan \
              leaves no room for the word, or its host headroom or `MemAvailable` none for its \
              churn pool; `bloomery-serve-qwen38` by the same rule under `--place a` and `off` \
-             under `gate`; `off` in every other binary",
+             under `gate`; the GLM seat of `bloomery-serve` `mid-p0-s1` under `--place a` where \
+             the plan has room, `off` under `gate` (`bloomery_levers::glm_unset`, \
+             `glm_residency_at_plan`), with a `residency unset` record; `off` in every other \
+             binary",
         ),
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
@@ -428,9 +441,21 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `off` under `--place gate`; running `mid-…` each call prints its `residency pass` \
               records; a request's reset keeps the residency, and only `POST /residency/reset` \
               moves it back to the seed, with a `residency reset` record. `generate_glm5next`: \
-              unset is `off`; set, the word runs as given (`mid-p33-s1` is plan (a)'s word), \
-              refused by name beside `BLOOMERY_DRAFT=mtp`, `--pair`, `BLOOMERY_ROUTE_TRACE` and \
-              `--prefill steps`. Every other binary refuses it set, by name.",
+              unset is `off`; set, the word runs as given (on plan (a) `mid-p0-s1`, the GLM seat's \
+              unset word, and `mid-p33-s1`, P half the fewest card experts a layer, both fit), \
+              beside `BLOOMERY_DRAFT=mtp` over the NextN load, refused by name beside `--pair`, \
+              `BLOOMERY_ROUTE_TRACE` and `--prefill steps`. The GLM seat of `bloomery-serve` takes \
+              it as `generate_glm5next` does, plain or drafted, refused by name beside `--prefill \
+              steps`. Unset (`bloomery_levers::glm_unset`, `glm_residency_at_plan`), a \
+              `residency unset` record after the `plan` line names the word and why: \
+              `mid-p0-s1` under `--place a`; `off` under `--place gate`, with stores too short \
+              for one window, beside `--prefill steps`, when the plan holds no card expert or its \
+              fewest leave no room, and when the churn pool does not fit the plan's host \
+              headroom less the NextN layer's host experts or what `MemAvailable` leaves — never \
+              a refusal. Running `mid-…` each call \
+              prints its `residency pass` records, a request's reset keeps the residency, and \
+              `POST /residency/reset` moves it back to the seed with a `residency reset` record. \
+              Every other binary refuses it set, by name.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

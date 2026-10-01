@@ -138,7 +138,7 @@ mod cli {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
-    use bloomery_gpu_gates::residency38::residency_set;
+    use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
     use bloomery_levers::{
@@ -915,35 +915,6 @@ mod cli {
             return Err(format!("BLOOMERY_RESIDENCY={word} is refused beside {what}").into());
         }
         Ok(Some((r, word)))
-    }
-
-    /// The plan's card GLM's residency machine runs over: plan (a)'s one card.
-    const GLM_CARD: usize = 0;
-
-    /// `word`'s pinned experts, its spares and one that moves fit every
-    /// layer's card experts in `plan`, else a named refusal before the load.
-    fn residency_room(plan: &Plan<'_>, r: Residency, word: &str) -> Result<(), GateError> {
-        let Residency::Mid { pinned, spares } = r else {
-            return Ok(());
-        };
-        let fewest = plan
-            .n_l
-            .iter()
-            .copied()
-            .filter(|&n| n > 0)
-            .min()
-            .ok_or_else(|| {
-                format!("BLOOMERY_RESIDENCY={word}: the plan puts no routed expert on the card")
-            })?;
-        let need = pinned + spares + 1;
-        if usize::try_from(fewest)? < need {
-            return Err(format!(
-                "BLOOMERY_RESIDENCY={word}: the plan's fewest card experts a layer is {fewest}, \
-                 fewer than {pinned} pinned, {spares} spare and one that moves"
-            )
-            .into());
-        }
-        Ok(())
     }
 
     /// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made

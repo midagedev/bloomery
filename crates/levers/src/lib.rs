@@ -1223,6 +1223,205 @@ pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
     }
 }
 
+/// The word the GLM seat of `bloomery-serve` drafts by with [`DRAFT`]
+/// unset where the draft can run: `mtp`, the file's NextN layer
+/// ([`glm_unset`]).
+pub const GLM_DRAFT_UNSET: &str = "mtp";
+
+/// The word the GLM seat runs by with [`RESIDENCY`] unset where the machine
+/// runs: plan (a)'s, no seed expert pinned and one spare a layer
+/// ([`glm_unset`], [`glm_residency_at_plan`]).
+pub const GLM_RESIDENCY_UNSET: &str = "mid-p0-s1";
+
+/// What decides the GLM seat's unset words before any plan ([`glm_unset`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlmAt {
+    /// `--place a`: the serving plan on the A6000.
+    pub place_a: bool,
+    /// The file's next-token layers (`block_count` less the trunk's); the
+    /// NextN draft runs one.
+    pub nextn_layers: usize,
+    /// The positions one drafted window needs from an empty model at most,
+    /// and the stores' positions (`--ctx`).
+    pub need: usize,
+    pub ctx: usize,
+    /// `--prefill steps`: each prompt id would end a pass the residency rule
+    /// counts.
+    pub prefill_steps: bool,
+}
+
+/// Why the GLM seat runs the unset word it does; its `Display` is the
+/// `draft unset`, `load draft=off` and `residency unset` records' why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlmWhy {
+    /// `--place a` runs the default word.
+    PlaceA,
+    /// `--place gate` keeps its fixed placement and drafts nothing.
+    Gate,
+    /// The file carries `layers` next-token layers, not the one the draft
+    /// runs.
+    Nextn { layers: usize },
+    /// One window needs `need` positions of `ctx`: the stores are short of
+    /// a window.
+    Ctx { need: usize, ctx: usize },
+    /// The prompt is fed by steps.
+    PrefillSteps,
+    /// The plan holds no routed expert on the card.
+    NoCardExperts,
+    /// The plan's fewest card experts a layer, `fewest`, leave no room for
+    /// the word's pinned experts, its spares and one that moves.
+    NoRoom { fewest: u64 },
+    /// The churn pool takes `needs` bytes of host RAM; the plan leaves
+    /// `leaves`.
+    HostShort { needs: u64, leaves: i128 },
+    /// The churn pool takes `needs` bytes; the host's `MemAvailable` leaves
+    /// `leaves` past the load's own host need.
+    MemShort { needs: u64, leaves: i128 },
+}
+
+impl fmt::Display for GlmWhy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            GlmWhy::PlaceA => f.write_str("unset: --place a"),
+            GlmWhy::Gate => f.write_str("unset: --place gate keeps its fixed placement"),
+            GlmWhy::Nextn { layers } => write!(
+                f,
+                "unset: the file carries {layers} next-token layers; the NextN draft runs one"
+            ),
+            GlmWhy::Ctx { need, ctx } => write!(
+                f,
+                "unset: one window needs {need} positions, past --ctx {ctx}"
+            ),
+            GlmWhy::PrefillSteps => f.write_str(
+                "unset: --prefill steps feeds each prompt id as a pass the residency rule counts",
+            ),
+            GlmWhy::NoCardExperts => {
+                f.write_str("unset: the plan holds no routed expert on the card")
+            }
+            GlmWhy::NoRoom { fewest } => write!(
+                f,
+                "unset: the plan's fewest card experts a layer ({fewest}) leave no room for the \
+                 word's pinned experts, its spares and one that moves"
+            ),
+            GlmWhy::HostShort { needs, leaves } => write!(
+                f,
+                "unset: the churn pool needs {needs} B, the plan leaves {leaves} B"
+            ),
+            GlmWhy::MemShort { needs, leaves } => write!(
+                f,
+                "unset: the churn pool needs {needs} B, MemAvailable leaves {leaves} B past the \
+                 load's host need"
+            ),
+        }
+    }
+}
+
+/// One unset lever of the GLM seat: the word it runs by, and why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlmPick {
+    pub word: &'static str,
+    pub why: GlmWhy,
+}
+
+impl GlmPick {
+    fn off(why: GlmWhy) -> GlmPick {
+        GlmPick { word: "off", why }
+    }
+}
+
+/// The GLM seat's [`DRAFT`] and [`RESIDENCY`] unset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GlmUnset {
+    pub draft: GlmPick,
+    pub residency: GlmPick,
+}
+
+/// [`DRAFT`] and [`RESIDENCY`] unset on the GLM seat at `at`, before the
+/// plan: under `--place a` [`GLM_DRAFT_UNSET`] when the file carries the one
+/// next-token layer and [`GLM_RESIDENCY_UNSET`], which the plan then decides
+/// ([`glm_residency_at_plan`]); `off`, with why, under `--place gate` and
+/// with stores too short for one window (both), for the draft on a file of
+/// other than one next-token layer, and for the residency beside the step
+/// feed. None of them refuses the load.
+#[must_use]
+pub fn glm_unset(at: GlmAt) -> GlmUnset {
+    let short = at.need > at.ctx;
+    let draft = if !at.place_a {
+        GlmPick::off(GlmWhy::Gate)
+    } else if at.nextn_layers != 1 {
+        GlmPick::off(GlmWhy::Nextn {
+            layers: at.nextn_layers,
+        })
+    } else if short {
+        GlmPick::off(GlmWhy::Ctx {
+            need: at.need,
+            ctx: at.ctx,
+        })
+    } else {
+        GlmPick {
+            word: GLM_DRAFT_UNSET,
+            why: GlmWhy::PlaceA,
+        }
+    };
+    let residency = if !at.place_a {
+        GlmPick::off(GlmWhy::Gate)
+    } else if short {
+        GlmPick::off(GlmWhy::Ctx {
+            need: at.need,
+            ctx: at.ctx,
+        })
+    } else if at.prefill_steps {
+        GlmPick::off(GlmWhy::PrefillSteps)
+    } else {
+        GlmPick {
+            word: GLM_RESIDENCY_UNSET,
+            why: GlmWhy::PlaceA,
+        }
+    };
+    GlmUnset { draft, residency }
+}
+
+/// [`glm_unset`]'s residency on the plan: `pick` as it is unless it runs the
+/// machine; then `off`, with why, when the plan holds no card expert
+/// (`card_experts` a layer, a layer holding none left out), when its fewest
+/// leave no room for the word's pinned experts, its spares and one that
+/// moves, or when the churn pool at the word's pinned count (`pool_bytes`)
+/// does not fit `headroom` (the plan's host headroom less what the load
+/// hosts beside it) or `mem_left` (what `MemAvailable` leaves past the
+/// load's host need) — a default the user did not set never refuses the
+/// load. An error of `pool_bytes` is the call's.
+pub fn glm_residency_at_plan<E>(
+    pick: GlmPick,
+    card_experts: impl IntoIterator<Item = u64>,
+    pool_bytes: impl FnOnce(usize) -> Result<u64, E>,
+    headroom: i128,
+    mem_left: i128,
+) -> Result<GlmPick, E> {
+    let Some(ResidencyWord::Mid { pinned, spares }) = residency_word(pick.word) else {
+        return Ok(pick);
+    };
+    let Some(fewest) = card_experts.into_iter().filter(|&n| n > 0).min() else {
+        return Ok(GlmPick::off(GlmWhy::NoCardExperts));
+    };
+    if usize::try_from(fewest).unwrap_or(usize::MAX) < pinned + spares + 1 {
+        return Ok(GlmPick::off(GlmWhy::NoRoom { fewest }));
+    }
+    let needs = pool_bytes(pinned)?;
+    if headroom < i128::from(needs) {
+        return Ok(GlmPick::off(GlmWhy::HostShort {
+            needs,
+            leaves: headroom,
+        }));
+    }
+    if mem_left < i128::from(needs) {
+        return Ok(GlmPick::off(GlmWhy::MemShort {
+            needs,
+            leaves: mem_left,
+        }));
+    }
+    Ok(pick)
+}
+
 /// The host tier's load settings, from a binary's one reading
 /// ([`Levers::host`]): what a placed load does to its plan's host set and to
 /// the card segments' file pages, and where the host tier reads a V4.1 file's

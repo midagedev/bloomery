@@ -1552,6 +1552,58 @@ pub static LISTENING_GLM: Kind = Kind {
     ],
 };
 
+/// The GLM seat's NextN draft, loaded beside the target.
+pub static LOAD_DRAFT_GLM: Kind = Kind {
+    name: "load_draft_glm",
+    head: "load draft=mtp",
+    doc: "The GLM seat's MTP draft, the file's NextN layer loaded beside the target, after the \
+          load line: the layer's index in the file, its weights' and store's device bytes, its \
+          walk's arena, the head it scores with, the card bytes the plan reserved for it, and the \
+          load's wall.",
+    parts: &[
+        key("layer", U64, ""),
+        key("resident", U64, "B"),
+        key("arena", U64, "B"),
+        key("head", Word, ""),
+        key("plan_bytes", U64, "B"),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s (runtime value)"),
+    ],
+};
+
+/// A GLM seat that drafts nothing ([`bloomery_levers::GlmWhy`]).
+pub static LOAD_DRAFT_OFF_GLM: Kind = Kind {
+    name: "load_draft_off_glm",
+    head: "load draft=off",
+    doc: "A GLM seat that drafts nothing, after its load line, and why: BLOOMERY_DRAFT=off, or \
+          unset and the condition that left the plain path (the draft unset record's).",
+    parts: &[lit(" ("), pos("why", Text, ""), lit(")")],
+};
+
+/// What `BLOOMERY_DRAFT` unset resolved to on the GLM seat
+/// ([`bloomery_levers::glm_unset`]).
+pub static DRAFT_UNSET_GLM: Kind = Kind {
+    name: "draft_unset_glm",
+    head: "draft unset",
+    doc: "What BLOOMERY_DRAFT unset resolved to on the GLM seat before the plan: the word the load \
+          runs by (mtp, the file's NextN layer, or off) and why (--place a, or what left the plain \
+          path: --place gate, a file of other than one next-token layer, stores short of a window).",
+    parts: &[key("draft", Word, ""), key("why", Text, "")],
+};
+
+/// What `BLOOMERY_RESIDENCY` unset resolved to on the GLM seat
+/// ([`bloomery_levers::glm_unset`]).
+pub static RESIDENCY_UNSET_GLM: Kind = Kind {
+    name: "residency_unset_glm",
+    head: "residency unset",
+    doc: "What BLOOMERY_RESIDENCY unset resolved to on the GLM seat, after the plan line: the word \
+          the load runs by and why (--place a, or what left it off: --place gate, stores short of \
+          a window, the step feed, or the plan: no card expert, no room, or the churn pool past \
+          the plan's host headroom or past what MemAvailable leaves).",
+    parts: &[key("residency", Word, ""), key("why", Text, "")],
+};
+
 /// The server's prompt cache: its budget, the host headroom it was derived
 /// from, and the token a prompt call is cut at.
 pub static CACHE_CONFIG: Kind = Kind {

@@ -1621,6 +1621,20 @@ gate-gpu-glm5next-twocard:
 gate-gpu-glm5next-residency:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_residency && bash tools/gpu-gate.sh gate_glm5next_residency'
 
+# The GLM seat of bloomery-serve (--model glm) on the 3090, placement gate, against generate_glm5next on the same card
+# (gate_glm5next_serve's header has the clauses). Two processes, each under its own gate-lock hold and bound, the loads
+# one after the other: --arm plain first runs the seat with both levers unset and --plan at --place a and gate (the
+# unset rule's records, no load), then holds the served greedy ids of one chat turn's prompt to the plain CLI's under
+# BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off and under BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off (three loads); --arm
+# drafted (BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=mid-p0-s1, the clip's levers) holds the draft's records and counts, the
+# residency's records, its reset and the same ids after it, and the ids against the CLI under the same levers through
+# the first landed flip (two loads). Logs in target/glm-serve-gate/{plain,plain/mtp,drafted}/.
+# Loads the whole host set: alone in a batch, under the big-load lock.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-glm5next-serve:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
+
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.
 [group('v41-load')]
