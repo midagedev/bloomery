@@ -1535,7 +1535,7 @@ mod gate {
         mode: StepMode,
         toks: &[u32],
         graph: &Run,
-        (d3, d2): (&[StoreDigest], &[StoreDigest]),
+        d3: &[StoreDigest],
     ) -> Result<bool, GateError> {
         let text = |r: &Result<u32, GpuError>| match r {
             Ok(t) => format!("token {t}"),
@@ -1585,8 +1585,11 @@ mod gate {
         let at2 = m.step(&toks[2..3]);
         let at2_ok =
             matches!(at2, Ok(t) if t == graph.tokens[2]) && logits_are(m, graph.logits.get(2));
+        // After the step at 2 the stores are three steps': the state grew from
+        // the kept row's lane, and the step wrote over the rejected row's ring
+        // slot.
         let reject_stores = if at2.is_ok() {
-            same_stores(&store_digests(m)?, d2)
+            same_stores(&store_digests(m)?, d3)
         } else {
             Err("the step at 2 failed".to_string())
         };
@@ -1597,7 +1600,7 @@ mod gate {
         println!(
             "verify ({mode:?}): a wrong draft {wrong} rejected, row 0 kept: row 0 token {} (want \
              {}), logits bit for bit {row0_ok}; the step at 2 {} (want token {}), stores {} (want \
-             two steps'); the step at 3 {} (want token {}) {}",
+             three steps'); the step at 3 {} (want token {}) {}",
             rows[0],
             graph.tokens[1],
             text(&at2),
@@ -1639,9 +1642,8 @@ mod gate {
             verdict(ok)
         );
         let d3 = digests_after(m, &toks[..3])?;
-        let d2 = digests_after(m, &toks[..2])?;
         for mode in [StepMode::Graph, StepMode::Eager] {
-            ok &= verify_mode(m, mode, toks, graph, (&d3, &d2))?;
+            ok &= verify_mode(m, mode, toks, graph, &d3)?;
         }
         Ok(ok)
     }
