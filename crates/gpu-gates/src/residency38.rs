@@ -69,19 +69,22 @@ pub fn residency38(
             (residency, pick.word())
         }
     };
-    residency_set(plan, CARD38, residency, &word, emit)
+    residency_set(plan, CARD38, residency, &word, 0, emit)
 }
 
 /// A load of `plan` under `residency`, the word `word` names, whatever the
 /// model: under `mid`, the `residency host` record of `plan` handed to
 /// `emit` — the churn pool (card `card`'s experts past the pinned ones) the
 /// load's host set holds beside the plan's host segments, refused by name
-/// when the plan cannot give it; `off` as it is, with no record.
+/// when the plan cannot give it, and the headroom left after it and the
+/// `beside` bytes the load hosts outside the plan (a draft layer's experts;
+/// 0 for a plain load); `off` as it is, with no record.
 pub fn residency_set(
     plan: &Plan<'_>,
     card: usize,
     residency: Residency,
     word: &str,
+    beside: u64,
     emit: fn(Record),
 ) -> Result<Residency, GateError> {
     let Residency::Mid { pinned, .. } = residency else {
@@ -89,6 +92,6 @@ pub fn residency_set(
     };
     let pool = ChurnPool::of(plan, card, pinned)
         .map_err(|e| format!("BLOOMERY_RESIDENCY={word}: the churn pool: {e}"))?;
-    emit(record::residency_host(word, &pool, plan));
+    emit(record::residency_host_beside(word, &pool, plan, beside));
     Ok(residency)
 }
