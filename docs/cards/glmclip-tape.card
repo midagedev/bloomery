@@ -4,7 +4,8 @@
 # --place a (the A6000 alone, the serving defaults: adaptive residency mid-p0-s1 and the NextN MTP draft);
 # llama.cpp PR #27754's llama-server on the A6000 alone at the profile's MTP placement (models/glm5next.sh:
 # --n-cpu-moe 38, one past GLM_NCMOE_MTP: at 37 the MTP context's compute buffer does not fit at -c 4096;
-# -fa off, -nopo 1, GLM_MTP_FLAGS, NVIDIA_TF32_OVERRIDE=0), same file.
+# -fa off, -nopo 1, GLM_MTP_FLAGS, NVIDIA_TF32_OVERRIDE=0, the server arm's -np 1 -ctxcp 0 --cache-ram 0), same
+# file, its shards read once before the load and two warm-ups discarded.
 # The tapes are the clip's evidence; the table numbers stay the depth runner's.
 kind: exclusive
 reason: a 186 GB host set plus a card load and three timed requests per engine; per-token times are the clip, so
