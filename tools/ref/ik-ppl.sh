@@ -57,7 +57,7 @@
 # runs, the pid it runs under is in $BLOOMERY_DATA/ikppl/<tag>.pid (`timeout` passes a signal on);
 # nothing here signals a pid found by a pattern. The last line is the result:
 #
-#   ppl tag=<tag> tree=<path> head=<rev> dirty_files=<n> model=<basename> ctx=<c> batch=<b> ubatch=<u> chunks=<N> ppl=<v> err=<±> per_chunk=[…] wall_s=<s>
+#   ppl tag=<tag> tree=<path> head=<rev> dirty_files=<n> model=<path of shard 1> ctx=<c> batch=<b> ubatch=<u> chunks=<N> ppl=<v> err=<±> per_chunk=[…] wall_s=<s>
 #
 # ubatch is the n_ubatch ik's log states. per_chunk lists what llama-perplexity prints after each chunk:
 # the running estimate over chunks 1..i. wall_s is the tool's run, lease wait excluded. A base run adds
@@ -329,5 +329,5 @@ if [ "$KLD_BASE" = 1 ]; then
 fi
 # "llama_init_from_model: n_ubatch      = 512": the physical batch ik ran, whether or not --ubatch set it.
 ubatch=$(grep -a -m1 'n_ubatch' "$LOG" | awk '{ print $NF }' || true)
-say "ppl tag=$TAG tree=$TREE head=$HEAD_REV dirty_files=$NDIRTY model=$(basename "$MODEL") ctx=$CTX batch=$BATCH ubatch=${ubatch:-?} chunks=$CHUNKS ppl=$ppl err=$err per_chunk=[$per_chunk]$extra wall_s=$((t1 - t0))"
+say "ppl tag=$TAG tree=$TREE head=$HEAD_REV dirty_files=$NDIRTY model=$MODEL ctx=$CTX batch=$BATCH ubatch=${ubatch:-?} chunks=$CHUNKS ppl=$ppl err=$err per_chunk=[$per_chunk]$extra wall_s=$((t1 - t0))"
 mv -f -- "$LOG" "$LOGDIR/$TAG.log"
