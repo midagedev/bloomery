@@ -267,6 +267,10 @@ name = "gate_glm5next_residency"
 required-features = ["glm5next"]
 
 [[bin]]
+name = "gate_glm5next_gemm"
+required-features = ["glm5next"]
+
+[[bin]]
 name = "gate_glm5next_mtp"
 required-features = ["glm5next"]
 

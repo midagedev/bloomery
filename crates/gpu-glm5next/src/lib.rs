@@ -21,13 +21,16 @@
 //! - `host`: the host tier's routed stacks;
 //! - [`swap`]: the model's side of adaptive expert residency;
 //! - `tensors`: each layer's tensor names, made at load;
-//! - [`forced`]: one layer alone on given streams, for the gates.
+//! - [`forced`]: one layer alone on given streams, for the gates;
+//! - [`gemm`]: the prompt batch's Q8_0 projections on the tensor-core GEMM,
+//!   no caller yet but its gate.
 //!
 //! Built with `cargo oxide`, as the device crates it links are.
 
 pub mod body;
 mod ffn;
 pub mod forced;
+pub mod gemm;
 mod host;
 mod kda;
 mod mla;

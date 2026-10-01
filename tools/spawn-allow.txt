@@ -19,6 +19,7 @@ crates/gpu-gates/src/bin/h2d_probe.rs 3 a probe binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs 4 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_chain_ffn.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_qwen4exp_mtp.rs 1 a gate binary, never pinned: the host simulations' scoped workers
+crates/gpu-gates/src/bin/gate_glm5next_gemm.rs 1 a gate binary, never pinned: the host transcription's scoped workers
 crates/gpu-gates/src/bin/gate_deepseek41_chain_glue.rs 2 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_engram.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_index.rs 2 a gate binary, never pinned

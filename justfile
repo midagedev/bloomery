@@ -742,6 +742,13 @@ gate-gpu-glm-mla:
 gate-gpu-glm-sel:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_sel'
 
+# GLM-5.3-Flash's prompt projections on the tensor-core GEMM (`gpu-glm5next/src/gemm.rs`, no engine caller yet): a KDA
+# layer's seven and a latent layer's stack over 512 fixed-seed columns, on the file's own weights (only those tensors
+# resident, about 0.3 GB), every output bit for bit the host transcription of `gemm_q8_0p`'s contract
+# (`gpu-gates/src/gemm32.rs`); one quantize per input; the refusals by name.
+gate-gpu-glm5next-gemm:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_gemm && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_gemm'
+
 gate-gpu-qwen3moe-flash:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_flash && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_flash'
 
