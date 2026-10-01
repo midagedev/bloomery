@@ -1830,26 +1830,29 @@ pub fn role_stream(ctx: &Arc<CudaContext>, role: StreamRole) -> Result<Arc<CudaS
     Ok(ctx.new_stream_with_priority(priority)?)
 }
 
-/// One primary-context handle per device, held for the process's life.
-static CONTEXTS: Mutex<Vec<Option<Arc<CudaContext>>>> = Mutex::new(Vec::new());
+/// One retained primary context per device, taken on first use and never
+/// released: the process's anchor under every `Gpu`'s own handle.
+static ANCHORS: Mutex<Vec<Option<Arc<CudaContext>>>> = Mutex::new(Vec::new());
 
-/// Device `device`'s primary context, retained once on first use and released
-/// only when the process exits: every `Gpu` on a device shares the handle.
-/// Releasing it mid-run is what crashes — the A6000's final release after the
-/// 3090's, once an expert tier had run across the two, faults inside
-/// `cuDevicePrimaryCtxRelease` with every stream idle and every free bound to
-/// its own context. Card memory still comes back as each owner drops.
+/// A handle of its own on device `device`'s primary context, over the anchor
+/// the process retains on first use and releases only at exit, so no `Gpu`'s
+/// drop is the context's final release. Releasing it mid-run is what crashes —
+/// the A6000's final release after the 3090's, once an expert tier had run
+/// across the two, faults inside `cuDevicePrimaryCtxRelease` with every stream
+/// idle and every free bound to its own context. The handle is the `Gpu`'s own
+/// because the driver error a drop records stays on its handle until that
+/// handle's next call: a `Gpu` never surfaces another's (a tier and a draft
+/// share the 3090). Card memory still comes back as each owner drops.
 fn primary_context(device: usize) -> Result<Arc<CudaContext>, GpuError> {
-    let mut held = CONTEXTS.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(Some(ctx)) = held.get(device) {
-        return Ok(Arc::clone(ctx));
+    let mut held = ANCHORS.lock().unwrap_or_else(PoisonError::into_inner);
+    if !matches!(held.get(device), Some(Some(_))) {
+        let anchor = CudaContext::new(device)?;
+        if held.len() <= device {
+            held.resize(device + 1, None);
+        }
+        held[device] = Some(anchor);
     }
-    let ctx = CudaContext::new(device)?;
-    if held.len() <= device {
-        held.resize(device + 1, None);
-    }
-    held[device] = Some(Arc::clone(&ctx));
-    Ok(ctx)
+    Ok(CudaContext::new(device)?)
 }
 
 impl Gpu {
@@ -2591,25 +2594,44 @@ impl Gpu {
 #[cfg(test)]
 mod context_tests {
     use super::Gpu;
+    use cuda_core::{DriverError, sys};
     use std::sync::Arc;
 
-    /// Every `Gpu` on a device takes the one primary-context handle the
-    /// process holds, and a dropped `Gpu` leaves it in place for the next.
+    /// Two `Gpu`s on a device hold handles of their own on its one primary
+    /// context: the same driver context, and a driver error recorded on one
+    /// handle surfaces on that handle alone. After both drop, the context is
+    /// still retained and the next `Gpu` gets it again.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
-    fn hw_gpus_on_a_device_share_its_primary_context() {
+    fn hw_gpus_on_a_device_hold_their_own_handles_on_its_primary_context() {
         let a = Gpu::with_device(0).expect("a Gpu on device 0");
         let b = Gpu::with_device(0).expect("a second Gpu on device 0");
         assert!(
-            Arc::ptr_eq(a.context(), b.context()),
-            "two Gpus on device 0 hold different context handles"
+            !Arc::ptr_eq(a.context(), b.context()),
+            "two Gpus on device 0 share one context handle"
         );
-        let held = Arc::clone(a.context());
+        assert_eq!(
+            a.context().cu_ctx(),
+            b.context().cu_ctx(),
+            "two Gpus on device 0 hold different driver contexts"
+        );
+        let raw = a.context().cu_ctx();
+        a.context()
+            .record_err::<()>(Err(DriverError(sys::cudaError_enum_CUDA_ERROR_UNKNOWN)));
+        assert!(
+            b.context().check_err().is_ok(),
+            "an error recorded on one Gpu's handle surfaced on the other's"
+        );
+        assert!(
+            a.context().check_err().is_err(),
+            "an error recorded on a Gpu's handle did not surface on it"
+        );
         drop((a, b));
         let c = Gpu::with_device(0).expect("a Gpu on device 0 after both dropped");
-        assert!(
-            Arc::ptr_eq(&held, c.context()),
-            "a Gpu after the first two dropped took a new context handle"
+        assert_eq!(
+            c.context().cu_ctx(),
+            raw,
+            "a Gpu after the first two dropped got another driver context"
         );
     }
 }
