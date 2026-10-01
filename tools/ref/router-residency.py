@@ -4,6 +4,9 @@
     tools/ref/router-residency.py hit <family> [<set>...] [--cap plan|n<N>|<f>] [--seed <seed>]
                                   [--rule mid|strata|knee] [--every N] [--link-gbps G]
                                   [--policies static,adaptive,lru,belady] [--json PATH]
+    tools/ref/router-residency.py hit <family> --streams S1,S2[,...] [--offset K] [--cap ...] [--seed <seed>]
+                                  [--rule ...] [--every N] [--link-gbps G] [--policies static,adaptive,belady]
+                                  [--json PATH]
     tools/ref/router-residency.py hit <family> [<set>...] --window N [--prompt P] [--open M|all
                                   [--stage K] [--open-from all|last:N]] [--seed <seed>] [--d D]
                                   [--copies K] [--json PATH]
@@ -38,6 +41,26 @@ hit      Without --window, the continuous replay over the eval half, one markdow
                      fill=budget at most step_ms x pin GB/s of expert bytes a token
            belady    per layer, MIN with bypass and free swaps: the ceiling for a demand policy
          and the prices at --pin-gbps / --page-gbps. Columns as ideaverify's v1 table.
+         With --streams S1,S2,... (B of them, 1..8, each a set of the family's table), the interleaved
+         replay: B sessions share one card, pass t carries token t of every stream (B rows a pass), and
+         the rule counts every row of the pass under the same decay. A set named once is its whole eval
+         half; a set named m > 1 times is m windows of it, copy j at eval positions [j K, (j + 1) K) with
+         K = --offset (by default floor(eval / m): disjoint, adjacent windows, the "similar topic" arm);
+         --offset 0 makes every copy the whole eval half (identical streams, each pass counted m times);
+         m K past the eval half is refused, and so is --offset with no set named twice. Streams of
+         unequal lengths are truncated to the shortest, and a `truncated` line says so: refusing would
+         rule out every arm that mixes a windowed set with a whole one, and only passes that carry all B
+         rows measure the merged count. Seeds: in = the streams' learn halves summed, insample = their
+         eval windows summed, cross = the family's sets that are no stream (refused when there is none),
+         pooled and prefix as above. Rows: `pooled` (all B rows), `sK` (stream K inside the merged
+         replay), and per stream `alone sK` (that stream replayed by itself from its own seed, B = 1),
+         then a `merged` line per arm: pooled minus the alone mean, and the host cost of the difference
+         a pass at host_gbps [derived]. `tok` columns are per pass here; host GB a pass counts missed
+         slots, and `unique` counts each missed (layer, expert) of a pass once (the host reads it once).
+         belady has no per-stream split: its pooled row is MIN over the interleaved rows in order (it
+         may change the set between the rows of a pass, so it is above any pass-granular policy), and
+         its alone rows are each stream's own ceiling. lru is refused here: it has no rows-a-pass form.
+         B = 1 prints the plain hit's rows, every column, with the streams' columns beside them.
          With --window N, the timed-window replay: the eval half cut into requests of P prompt then
          N decode tokens; each request starts from the seed after a reset with counts at zero and
          runs the rule with admit-then-flip (--spares S slots a layer, 1 by default; the victim stays
@@ -155,6 +178,8 @@ RULES = {
     "knee": dict(every=16, cap=24, margin=6.0, min_count=2.0, decay=0.9),
 }
 B_PIN, B_PAGE = 25.0, 14.4  # GB/s: the rates the recorded replays priced with (A6000: 26.28 / 21.16)
+HOST_GBPS = 121.0  # GB/s: the host expert read rate b5prof measured (docs/plan-ledger.md B12), prices a host miss
+MAX_STREAMS = 8  # hit --streams: the most sessions one card is replayed for
 COPIES = 30  # the window replays' copy budget, copies a decode step
 WINDOW_B = 16  # the block the window replays average over
 
@@ -955,17 +980,20 @@ def fixture_text(fx, command):
 # --- output -----------------------------------------------------------------------------------------
 
 
-def v1_row(fam, s, cap_label, n_l, policy, seedname, label, hits, swaps, link, B_pin, B_page):
+def v1_row(fam, s, cap_label, n_l, policy, seedname, label, hits, swaps, link, B_pin, B_page, tokens=None, rows=1,
+           name=None):
+    """One policy's row. tokens: passes replayed (the eval half by default); rows: rows a pass, which the hit
+    divides by and host_gb_tok multiplies by (so with rows > 1 the `tok` columns are per pass)."""
     F = family(fam)
     L = len(F["eligible"])
-    Tev = s.T - SPLIT
+    Tev = s.T - SPLIT if tokens is None else tokens
     S = F["expert_bytes"]
-    h = hits.sum() / (Tev * L * s.K)
-    row = dict(fam=fam, set=s.name, cap=cap_label, f=sum(n_l) / (L * s.E), n_l=f"{min(n_l)}..{max(n_l)}",
-               policy=policy, label=label, seed=seedname, tokens=Tev, layers=L, hit=h,
-               hit_layer=(hits / (Tev * s.K)).tolist(), swaps_tok=swaps / Tev, mb_tok=swaps / Tev * S / 1e6,
+    h = hits.sum() / (Tev * rows * L * s.K)
+    row = dict(fam=fam, set=s.name if name is None else name, cap=cap_label, f=sum(n_l) / (L * s.E),
+               n_l=f"{min(n_l)}..{max(n_l)}", policy=policy, label=label, seed=seedname, tokens=Tev, layers=L, hit=h,
+               hit_layer=(hits / (Tev * rows * s.K)).tolist(), swaps_tok=swaps / Tev, mb_tok=swaps / Tev * S / 1e6,
                ms_pin=swaps / Tev * S / (B_pin * 1e6), ms_page=swaps / Tev * S / (B_page * 1e6),
-               host_gb_tok=(1 - h) * L * s.K * S / 1e9)
+               host_gb_tok=(1 - h) * L * s.K * S * rows / 1e9)
     if link is not None and link.copy_ms:
         row["link_util"] = link.busy_ms / (Tev * F["step_ms"])
         row["delay_steps"] = link.delay_steps / max(swaps, 1)
@@ -1025,8 +1053,219 @@ def parse_open_from(text, P, what="the prompt's positions"):
     return last
 
 
+def stream_windows(fam, names, offset, data):
+    """--streams: (sets by name, streams [(name, set, t0, t1)] in eval positions, truncation line or None)."""
+    F = family(fam)
+    if not names or any(not n for n in names):
+        raise ToolError("--streams: a comma-separated list of set names, none empty")
+    if len(names) > MAX_STREAMS:
+        raise ToolError(f"--streams: {len(names)} streams, at most {MAX_STREAMS}")
+    for n in names:
+        if n not in F["sets"]:
+            raise ToolError(f"--streams: {n!r} is not a set of family {fam} "
+                            f"({', '.join(F['sets']) if F['sets'] else 'its table names no set'})")
+    if offset is not None and offset < 0:
+        raise ToolError(f"--offset {offset}: 0 or more")
+    if offset is not None and all(names.count(n) == 1 for n in names):
+        raise ToolError(f"--offset {offset}: it places the copies of a set named more than once, and every stream "
+                        "names another set")
+    sets, streams, seen = {}, [], {}
+    for n in names:
+        if n not in sets:
+            sets[n] = Set(set_dir(data, n), fam)
+            if sets[n].T <= SPLIT:
+                raise ToolError(f"{sets[n].dir}: {sets[n].T} tokens; hit evaluates [{SPLIT}, tokens), which it holds "
+                                "none of")
+        s, m, j = sets[n], names.count(n), seen.get(n, 0)
+        seen[n] = j + 1
+        N = s.T - SPLIT
+        K = N if m == 1 else N // m if offset is None else offset
+        if m > 1 and K == 0 and offset is None:
+            raise ToolError(f"--streams: {n} named {m} times, and its eval half holds {N} positions")
+        if m * K > N:
+            raise ToolError(f"--offset {K}: {m} windows of {n} reach eval position {m * K}, past its eval half of {N}")
+        streams.append((n, s, 0, N) if K == 0 else (n, s, j * K, (j + 1) * K))
+    W = min(t1 - t0 for _, _, t0, t1 in streams)
+    note = None
+    if any(t1 - t0 != W for _, _, t0, t1 in streams):
+        note = (f"truncated to the shortest stream, {W} passes: " +
+                ", ".join(f"s{i} {n} {t1 - t0} -> {W}" for i, (n, _, t0, t1) in enumerate(streams) if t1 - t0 != W))
+        streams = [(n, s, t0, t0 + W) for n, s, t0, _ in streams]
+    return sets, streams, note
+
+
+def stream_seed(fam, streams, name, data, sets):
+    """Per eligible layer, the ranked list of seed `name` for the streams sharing one card."""
+    F = family(fam)
+    lay = F["eligible"]
+    if name == "in":
+        return [rank(sum(s.counts(l, 0, SPLIT) for _, s, _, _ in streams)) for l in lay]
+    if name == "insample":
+        return [rank(sum(s.counts(l, SPLIT + t0, SPLIT + t1) for _, s, t0, t1 in streams)) for l in lay]
+    if name == "prefix":
+        return [np.arange(F["n_expert"]) for _ in lay]
+    if name in ("cross", "pooled"):
+        mine = {n for n, _, _, _ in streams}
+        names = [n for n in F["sets"] if name == "pooled" or n not in mine]
+        if not names:
+            raise ToolError(f"seed cross: every set of family {fam} is a stream")
+        for n in names:
+            if n not in sets:
+                sets[n] = Set(set_dir(data, n), fam)
+        if name == "cross":
+            return [rank(sum(sets[n].counts(l) for n in names)) for l in lay]
+        return [rank(sum(sets[n].counts(l, 0, SPLIT) for n in names)) for l in lay]
+    raise ToolError(f"no seed {name!r}: in, insample, cross, pooled or prefix")
+
+
+def unique_misses(X, rec, B, E):
+    """Missed (pass, layer, expert) triples of X [W B, L, K] (B rows a pass), each counted once."""
+    W, L = X.shape[0] // B, X.shape[1]
+    key = (np.repeat(np.arange(W, dtype=np.int64), B)[:, None, None] * L + np.arange(L)[None, :, None]) * E + X
+    return int(np.unique(key[~rec]).size)
+
+
+def streams_replay(fam, streams, seeds, pol, rule, link_gbps, a, data, sets, extra):
+    """The merged replay of `streams` on one card: rows (pooled first, then one a stream for static and adaptive)
+    for every policy and seed."""
+    F = family(fam)
+    B, s0 = len(streams), streams[0][1]
+    W = streams[0][3] - streams[0][2]
+    n_l = n_cap(fam, a.cap, s0.E)
+    S, step = F["expert_bytes"], F["step_ms"]
+    X = np.stack([s.stack(F["eligible"], SPLIT + t0, SPLIT + t1) for _, s, t0, t1 in streams], axis=1)
+    X = X.reshape(W * B, X.shape[2], X.shape[3])
+    passes = [(p * B, (p + 1) * B, B) for p in range(W)]
+    joined = "+".join(n for n, _, _, _ in streams)
+    rows = []
+
+    def emit(policy, sd, label, hits, swaps, rec=None, link=None, ties=None):
+        r = v1_row(fam, s0, a.cap, n_l, policy, sd, label, hits, swaps, link, a.pin_gbps, a.page_gbps,
+                   tokens=W, rows=B, name=joined)
+        r.update(role="pooled", streams=joined, rows_pass=B)
+        if ties is not None:
+            r["cap_bound"] = ties["cap_bound"] / max(W // rule.every, 1)
+        if rec is not None:
+            u = unique_misses(X, rec, B, s0.E)
+            r["host_gb_unique"] = u * S / W / 1e9
+        rows.append(r)
+        if rec is None or B == 1:
+            return
+        per = rec.reshape(W, B, rec.shape[1], rec.shape[2])
+        for j, (n, s, t0, t1) in enumerate(streams):
+            q = v1_row(fam, s, a.cap, n_l, policy, sd, label, per[:, j].sum(axis=(0, 2)).astype(np.int64), swaps, link,
+                       a.pin_gbps, a.page_gbps, tokens=W)
+            q.update(role=f"s{j}", streams=joined, rows_pass=B, window=[SPLIT + t0, SPLIT + t1])
+            rows.append(q)
+
+    lists = {sd: stream_seed(fam, streams, sd, data, sets) for sd in seeds}
+    if "static" in pol and not a.seed:
+        lists["insample"] = stream_seed(fam, streams, "insample", data, sets)
+    L, K = X.shape[1], X.shape[2]
+    if "static" in pol:
+        for sd in lists:
+            rec = np.zeros((W * B, L, K), dtype=bool)
+            r = replay(X, seed_resident(lists[sd], n_l, s0.E), n_l, s0.E, record=rec, passes=passes)
+            emit("static", sd, f"static[{sd}]", r.hits_layer, 0, rec)
+    if "adaptive" in pol:
+        for sd in seeds:
+            link = Link(S, link_gbps, step) if link_gbps else None
+            rec = np.zeros((W * B, L, K), dtype=bool)
+            ties = {"across_layers": 0, "in_id": 0, "out_id": 0, "cap_bound": 0}
+            r = replay(X, seed_resident(lists[sd], n_l, s0.E), n_l, s0.E, rule, sem="hole", d=0, link=link,
+                       record=rec, passes=passes, ties=ties)
+            emit("adaptive", sd, f"{rule.name}[{sd}{',' + extra if extra else ''}]", r.hits_layer, r.swaps, rec, link,
+                 ties)
+    if "belady" in pol:
+        h, adm = belady(X, lists[seeds[0]], n_l)
+        emit("belady", seeds[0], f"belady[{seeds[0]}]", h, adm)
+    return rows
+
+
+def streams_line(r):
+    host = r["host_gb_tok"]
+    uniq = r.get("host_gb_unique", float("nan"))
+    return (f"| {r['fam']} | {r['streams']} | {r['role']} | {r['cap']} {r['n_l']} ({r['f']:.3f}) | {r['label']} | "
+            f"{100 * r['hit']:.2f} | {r['swaps_tok']:.2f} | {r['mb_tok']:.0f} | {r['ms_pin']:.2f} | "
+            f"{r.get('link_util', float('nan')):.3f} | {r.get('delay_steps', float('nan')):.2f} | "
+            f"{100 * r.get('cap_bound', float('nan')):.1f} | {host:.3f} | {uniq:.3f} | {1e3 * uniq / HOST_GBPS:.2f} |")
+
+
+def cmd_streams(a, out):
+    F = family(a.family)
+    if a.sets:
+        raise ToolError(f"--streams names the sets; drop the positional sets {' '.join(a.sets)}")
+    if a.window is not None or a.open is not None or a.prompt is not None:
+        raise ToolError("--streams is the continuous replay: drop --window, --open and --prompt")
+    pol = (a.policies or "static,adaptive,belady").split(",")
+    bad = [p for p in pol if p not in ("static", "adaptive", "belady")]
+    if bad:
+        raise ToolError(f"--policies with --streams: no policy {', '.join(bad)} (static, adaptive, belady; lru has "
+                        "no rows-a-pass form)")
+    names = a.streams.split(",")
+    sets, streams, note = stream_windows(a.family, names, a.offset, a.data)
+    B = len(streams)
+    rule = Rule(a.rule, every=a.every)
+    link_gbps = B_PIN if a.link_gbps is None else a.link_gbps
+    extra = ",".join(x for x in (f"every={a.every}" if a.every is not None else "",
+                                 f"gbps={a.link_gbps:g}" if a.link_gbps is not None else "") if x)
+    seeds = [a.seed] if a.seed else list(F["seeds"])
+    skipped = []
+    if not a.seed and "cross" in seeds and all(n in {m for m, _, _, _ in streams} for n in F["sets"]):
+        seeds.remove("cross")
+        skipped.append("seed cross: every set of the family is a stream, so it has no cross seed; not run")
+    out.write(f"# router-residency hit --streams: data={a.data} family={a.family} B={B} rule {rule.text()} "
+              f"link {link_gbps:g} GB/s, step {F['step_ms']:g} ms, host {HOST_GBPS:g} GB/s\n")
+    out.write("# streams: " + "  ".join(f"s{j} {n} [{SPLIT + t0}, {SPLIT + t1})" for j, (n, _, t0, t1) in
+                                       enumerate(streams)) + "\n")
+    for line in ([note] if note else []) + skipped:
+        out.write(line + "\n")
+    out.write("| fam | streams | row | cap (f) | policy | hit % | swaps/pass | MB/pass | ms/pass pin | link util | "
+              "admit delay (steps) | cap-bound % | host GB/pass (slots) | host GB/pass (unique) | host ms/pass @"
+              f"{HOST_GBPS:g} |\n")
+    out.write("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+    rows = streams_replay(a.family, streams, seeds, pol, rule, link_gbps, a, a.data, sets, extra)
+    for r in rows:
+        out.write(streams_line(r) + "\n")
+    out.flush()
+    if B == 1:
+        return rows
+    alone = []
+    for j, st in enumerate(streams):
+        for r in streams_replay(a.family, [st], seeds, pol, rule, link_gbps, a, a.data, sets, extra):
+            r["role"] = f"alone s{j}"
+            r["window"] = [SPLIT + st[2], SPLIT + st[3]]
+            alone.append(r)
+            out.write(streams_line(r) + "\n")
+        out.flush()
+    L, K, S = len(F["eligible"]), F["n_used"], F["expert_bytes"]
+    for r in rows:
+        if r["role"] != "pooled":
+            continue
+        mine = [q for q in alone if (q["policy"], q["label"]) == (r["policy"], r["label"])]
+        if len(mine) != B:
+            raise ToolError(f"{r['label']}: {len(mine)} alone rows for {B} streams")
+        mean = sum(q["hit"] for q in mine) / B
+        slots_ms = (mean - r["hit"]) * B * L * K * S / (HOST_GBPS * 1e6)
+        sum_u = (sum(q["host_gb_unique"] for q in mine)
+                 if "host_gb_unique" in r and all("host_gb_unique" in q for q in mine) else None)
+        r.update(alone_mean=mean, delta=r["hit"] - mean, extra_ms_slots=slots_ms)
+        text = (f"merged {r['streams']} {r['label']}: pooled {100 * r['hit']:.2f} alone mean {100 * mean:.2f} "
+                f"delta {100 * (r['hit'] - mean):+.2f} points; extra host {slots_ms:+.2f} ms/pass at {HOST_GBPS:g} GB/s "
+                "priced by slots [derived]")
+        if sum_u is not None:
+            text += (f"; unique host {1e3 * r['host_gb_unique'] / HOST_GBPS:.2f} ms/pass against {1e3 * sum_u / HOST_GBPS:.2f}"
+                     f" for the {B} streams in passes of their own [derived]")
+        out.write(text + "\n")
+    return rows + alone
+
+
 def cmd_hit(a, out):
     F = family(a.family)
+    if a.streams is not None:
+        return cmd_streams(a, out)
+    if a.offset is not None:
+        raise ToolError("--offset needs --streams: it places the windows of a set named twice")
     if a.open is not None and a.window is None:
         raise ToolError("--open needs --window: the opening reshuffle is a timed-window replay")
     if a.stage is not None and a.open is None:
@@ -1065,7 +1304,7 @@ def cmd_hit(a, out):
                 out.write(window_line(r) + "\n")
                 out.flush()
     else:
-        pol = a.policies.split(",")
+        pol = (a.policies or "static,adaptive,lru,belady").split(",")
         bad = [p for p in pol if p not in ("static", "adaptive", "lru", "belady")]
         if bad:
             raise ToolError(f"--policies: no policy {', '.join(bad)} (static, adaptive, lru, belady)")
@@ -1296,7 +1535,11 @@ def parser():
     h.add_argument("--link-gbps", type=float)
     h.add_argument("--pin-gbps", type=float, default=B_PIN)
     h.add_argument("--page-gbps", type=float, default=B_PAGE)
-    h.add_argument("--policies", default="static,adaptive,lru,belady")
+    h.add_argument("--policies", help="static,adaptive,lru,belady by default; static,adaptive,belady with --streams")
+    h.add_argument("--streams", help="S1,S2,...: B interleaved sessions on one card, each a set of the family; a set "
+                                     "named m > 1 times is m windows of its eval half, copy j at [j K, (j + 1) K)")
+    h.add_argument("--offset", type=int, help="K for --streams' windows of a repeated set: floor(eval / m) by default "
+                                              "(disjoint), 0 = every copy the whole eval half")
     g = sub.add_parser("gen")
     g.add_argument("family")
     g.add_argument("trace")
@@ -1905,10 +2148,123 @@ def case_refusals():
             assert code != 0 and want in err.getvalue(), (argv, code, err.getvalue())
 
 
+def fixture_sets(root, specs):
+    """v41-shaped router sets from the fixture's trace: per (name, lcg seed, eval positions), make_fixture(400)'s
+    rows in pass order, tiled to SPLIT + eval positions; v41 layer i routes fixture layer i % 3's ids plus
+    64 ((i // 3) % 6), so every layer is distinct and every id is below 384."""
+    for name, lcg, ev in specs:
+        trace = make_fixture(400, lcg)["trace"]
+        seq = np.asarray([[row for p in trace[l] for row in p] for l in range(3)], dtype=np.int64)  # [3, R, 6]
+        T = SPLIT + ev
+        seq = seq[:, np.arange(T) % seq.shape[1]]
+        d = os.path.join(root, name)
+        os.makedirs(d)
+        with open(os.path.join(d, "MANIFEST.tsv"), "w", encoding="utf-8") as f:
+            f.write("# router_trace — test\n# model\t/m/m.gguf\n# model_file\tm.gguf\n# build\tb0\n")
+            f.write(f"# tokens\t{T}\n# n_expert\t384\n# n_expert_used\t6\n")
+            f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
+            for l in range(40):
+                f.write(f"layer\t{l}\tx\tx\t{T}\t0\t0\ttopk-{l}.u16\n")
+            f.write(f"# complete\t{T}\t40\n")
+        for l in range(40):
+            (seq[l % 3] + 64 * ((l // 3) % 6)).astype("<u2").tofile(os.path.join(d, f"topk-{l}.u16"))
+
+
+def hit_json(argv, root):
+    js = os.path.join(root, "hit.json")
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stderr(err):
+        code = main(argv + ["--data", root, "--json", js], out)
+    assert code == 0, (argv, err.getvalue())
+    with open(js, encoding="utf-8") as f:
+        return json.load(f), out.getvalue()
+
+
+def case_streams_one():
+    # B = 1 through --streams is the plain hit, every column of every row (static over cross, in and insample,
+    # the adaptive rule over cross and in, belady), with the streams' columns beside them and no other row.
+    with tempfile.TemporaryDirectory() as root:
+        fixture_sets(root, (("prose", 1, 240), ("code", 2, 200), ("korean", 3, 240)))
+        plain, _ = hit_json(["hit", "v41", "prose", "--cap", "n16", "--policies", "static,adaptive,belady"], root)
+        merged, text = hit_json(["hit", "v41", "--streams", "prose", "--cap", "n16"], root)
+        assert len(plain) == 6 and len(merged) == len(plain), (len(plain), len(merged))
+        for p, m in zip(plain, merged):
+            assert m["role"] == "pooled" and m["rows_pass"] == 1, m
+            assert {k: m[k] for k in p} == p, (p, m)
+        assert "s0 prose [24576, 24816)" in text and "alone" not in text, text
+
+
+def case_streams_twice():
+    # B = 2 of one fixture set at offset 0: both streams are the whole eval half, so every pass counts each id
+    # twice. Doubled counts against margin 3 and min_count 2 are the single stream's counts against 1.5 and 1
+    # (decay and the gain order scale with them, exactly in binary), so each stream's adaptive row is that
+    # replay's, and differs from the stream alone (the case tells two counts from one).
+    with tempfile.TemporaryDirectory() as root:
+        fixture_sets(root, (("prose", 1, 240),))
+        rows, text = hit_json(["hit", "v41", "--streams", "prose,prose", "--offset", "0", "--cap", "n16", "--seed", "in",
+                               "--policies", "static,adaptive"], root)
+        assert "s0 prose [24576, 24816)  s1 prose [24576, 24816)" in text, text
+        by = {(r["policy"], r["role"]): r for r in rows}
+        s = Set(os.path.join(root, "prose"), "v41")
+        F = family("v41")
+        X = hit_eval_stack(s, F)
+        n_l = [16] * len(F["eligible"])
+        seed = seed_lists("v41", s, "in", root)
+        r = replay(X, seed_resident(seed, n_l, 384), n_l, 384, Rule("mid", margin=1.5, min_count=1.0), sem="hole", d=0,
+                   link=Link(F["expert_bytes"], B_PIN, F["step_ms"]))
+        want = r.hits_layer.sum() / (X.shape[0] * X.shape[1] * X.shape[2])
+        for pol in ("static", "adaptive"):
+            s0, s1, pooled = by[(pol, "s0")], by[(pol, "s1")], by[(pol, "pooled")]
+            strip = lambda q: {k: v for k, v in q.items() if k != "role"}
+            assert strip(s0) == strip(s1) and pooled["hit"] == s0["hit"], (s0, s1, pooled)
+        assert by[("adaptive", "s0")]["hit"] == want and by[("adaptive", "s0")]["swaps_tok"] == r.swaps / X.shape[0], \
+            (by[("adaptive", "s0")], want, r.swaps)
+        assert by[("adaptive", "s0")]["hit"] != by[("adaptive", "alone s0")]["hit"], by[("adaptive", "alone s0")]
+        assert by[("static", "s0")]["hit"] == by[("static", "alone s0")]["hit"]
+        assert "merged prose+prose mid[in]: pooled" in text, text
+
+
+def case_streams_windows():
+    # A set named twice is two adjacent disjoint windows of its eval half by default, K = floor(240 / 2); unequal
+    # lengths are truncated to the shortest and the line names each cut stream.
+    with tempfile.TemporaryDirectory() as root:
+        fixture_sets(root, (("prose", 1, 240), ("code", 2, 200)))
+        rows, text = hit_json(["hit", "v41", "--streams", "prose,prose", "--cap", "n16", "--seed", "in",
+                               "--policies", "static"], root)
+        assert "s0 prose [24576, 24696)  s1 prose [24696, 24816)" in text, text
+        assert [r["window"] for r in rows if r["role"] in ("s0", "s1")] == [[24576, 24696], [24696, 24816]], rows
+        rows, text = hit_json(["hit", "v41", "--streams", "prose,code", "--cap", "n16", "--seed", "in",
+                               "--policies", "static"], root)
+        assert "truncated to the shortest stream, 200 passes: s0 prose 240 -> 200" in text, text
+        assert {r["tokens"] for r in rows} == {200}, rows
+
+
+def case_streams_refusals():
+    with tempfile.TemporaryDirectory() as root:
+        fixture_sets(root, (("prose", 1, 240), ("code", 2, 240), ("korean", 3, 240)))
+        cases = [
+            (["hit", "v41", "--streams", "prose,threads"], "'threads' is not a set of family v41"),
+            (["hit", "v41", "--streams", ",".join(["prose"] * 9)], "9 streams, at most 8"),
+            (["hit", "v41", "--streams", "prose,prose", "--offset", "121"], "past its eval half of 240"),
+            (["hit", "v41", "--streams", "prose,code", "--offset", "5"], "every stream names another set"),
+            (["hit", "v41", "--streams", "prose", "--policies", "lru"], "lru has no rows-a-pass form"),
+            (["hit", "v41", "prose", "--streams", "prose"], "drop the positional sets"),
+            (["hit", "v41", "prose", "--offset", "3"], "--offset needs --streams"),
+            (["hit", "v41", "--streams", "prose,code,korean", "--seed", "cross"], "every set of family v41 is a stream"),
+            (["hit", "q38", "--streams", "prose"], "is not a set of family q38 (its table names no set)"),
+        ]
+        for argv, want in cases:
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                code = main(argv + ["--data", root, "--cap", "n16"])
+            assert code == 1 and want in err.getvalue(), (argv, code, err.getvalue())
+
+
 CASES = [case_static, case_belady, case_lru, case_adaptive_link, case_adaptive_margin, case_adaptive_min_count,
          case_adaptive_cap, case_lru_is_global, case_in_flight, case_land_then_plan, case_window, case_open,
          case_open_last, case_gen, case_gen_contexts, case_gen_split, case_gen_short, case_q38_family,
-         case_fixture, case_refusals]
+         case_fixture, case_refusals, case_streams_one, case_streams_twice, case_streams_windows,
+         case_streams_refusals]
 
 
 def self_test():
