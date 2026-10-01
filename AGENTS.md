@@ -225,6 +225,10 @@ A quiet agent is a symptom: the first suspect is a hung gate on the box.
   moment they are met, before any workaround. A cuda-oxide defect that shapes our code is fixed in our fork as it is
   met: one commit on the `bloomery` branch with its reproducer and FAIL-first, the pin moved (below), the workaround
   removed by the round that moves the pin.
+- **Common code first, so the next model attaches cheaply.** A concept two models share (tier legs, prompt walks,
+  seats, placement sizing, drafts, residency glue) has one common owner. A model's own code holds only what an
+  architecture fact forces (tensor shapes, the recurrent state, the attention kind, the quant), and its spec names that
+  fact. A per-model copy of shared logic stays only for a large measured speed gain, named in the code beside it.
 - **Code shape** is judged by `docs/rust-quality.md` (R1–R29); review reports cite rule numbers.
 - **Comments state what is true now.** Keep `// SAFETY:` (the invariant), one line of why for a non-obvious choice,
   "this order is the gate" on a load-bearing float reduction, a caller's contract. Remove issue numbers, dates, measured
