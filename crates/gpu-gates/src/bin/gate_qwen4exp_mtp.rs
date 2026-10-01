@@ -90,7 +90,12 @@
 //!   impl the drafted greedy ids are the plain run's for 64 tokens, with a
 //!   rejected row among the windows — else the rollback path never ran and
 //!   the clause is red — and the live stores after the run the plain run's
-//!   at the same position; `commit(k)` is `k` steps for every k, a
+//!   at the same position; at the set's prompt the draft keeps no window
+//!   unset, and the same run keeping its windows (`BLOOMERY_MTP_WINDOWS`'s
+//!   `MtpDraft::keep_windows`) reads back the same ids through the same
+//!   passes, one window a drafted pass, each window's kept count its pass's
+//!   kept rows less one and its kept ids the run's tokens after its position;
+//!   `commit(k)` is `k` steps for every k, a
 //!   scripted draft keeping each exactly through the same verify and commit,
 //!   at the deep prompt its rejected row completing a pool leaving the
 //!   pooled planes the plain run's; and the lane word planted on a lane no
@@ -1809,6 +1814,91 @@ mod gate {
         Ok((s, spec))
     }
 
+    /// The windows the draft keeps ([`app::mtp::MtpDraft::keep_windows`],
+    /// `BLOOMERY_MTP_WINDOWS`): `unkept` windows came back from the drafted
+    /// run `off` (its ids and passes), which kept none, and must be 0; the
+    /// same run keeping its windows reads back the same ids through the same
+    /// passes, one window a drafted pass, each kept one row past the ids its
+    /// window says the target kept, those ids the run's own tokens at the
+    /// positions after the window's, each probability in (0, 1].
+    fn kept_windows(
+        m: Qwen38Model,
+        prompt: &[u32],
+        ctx: u32,
+        off: (&[u32], &Kept),
+        unkept: usize,
+    ) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 64;
+        let (off_tokens, off_kept) = off;
+        let (m, out, kept, windows) = {
+            let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+            spec.draft_mut().keep_windows();
+            let first = spec.prompt(&mut s, prompt)?;
+            let mut k = Kept::default();
+            let out = runtime::generate(
+                &mut s,
+                &mut spec,
+                prompt,
+                first,
+                &runtime::Stop::new(N, ctx)?,
+                &mut k,
+            )?;
+            let w = spec.draft_mut().take_windows();
+            (s.into_model(), out, k, w)
+        };
+        let same = out.tokens == off_tokens
+            && kept.rows == off_kept.rows
+            && kept.proposed == off_kept.proposed;
+        let drafted: Vec<usize> = kept
+            .rows
+            .iter()
+            .zip(&kept.proposed)
+            .filter(|(_, p)| **p)
+            .map(|(k, _)| *k)
+            .collect();
+        let p0 = prompt.len();
+        let mut bad = Vec::new();
+        if drafted.len() != windows.len() {
+            bad.push(format!(
+                "{} windows of {} drafted passes",
+                windows.len(),
+                drafted.len()
+            ));
+        }
+        for (i, (&k, w)) in drafted.iter().zip(&windows).enumerate() {
+            let at = w.pos as usize + 1 - p0;
+            let emitted = out.tokens.get(at..at + w.accepted);
+            let p_ok = w.p.iter().all(|&p| p > 0.0 && p <= 1.0);
+            if w.accepted + 1 != k
+                || w.ids.len() != w.p.len()
+                || w.ids.is_empty()
+                || !p_ok
+                || emitted.is_some_and(|e| e != &w.ids[..w.accepted])
+            {
+                bad.push(format!(
+                    "window {i}: pass kept {k}, window {:?} p {:?} accepted {}, emitted {emitted:?}",
+                    w.ids, w.p, w.accepted
+                ));
+            }
+        }
+        let ok = unkept == 0 && same && bad.is_empty();
+        println!(
+            "(w) depth {}: unset the draft keeps {unkept} windows; kept, the same ids and passes \
+             {} and {} windows of {} drafted passes, each its pass's kept rows and ids{} {}",
+            prompt.len(),
+            verdict(same),
+            windows.len(),
+            drafted.len(),
+            if bad.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", bad.join("; "))
+            },
+            verdict(ok)
+        );
+        Ok((m, ok))
+    }
+
     /// A draft that proposes the plain run's own next tokens, its `keep`th
     /// id one the target rejects: every window keeps exactly `keep` rows
     /// through the same verify and commit the MTP draft drives.
@@ -2156,7 +2246,7 @@ mod gate {
         // The plain reference: every step's live stores, four tokens past
         // the drafted loop's count (its last pass may keep rows past it).
         let (m, shallow) = plain_run(m, prompt, Prompt38::Auto, N + 4)?;
-        let (mut m, out, kept) = {
+        let (mut m, out, kept, unkept) = {
             let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
             let first = spec.prompt(&mut s, prompt)?;
             let mut k = Kept::default();
@@ -2168,7 +2258,8 @@ mod gate {
                 &runtime::Stop::new(N, ctx)?,
                 &mut k,
             )?;
-            (s.into_model(), out, k)
+            let unkept = spec.draft_mut().take_windows();
+            (s.into_model(), out, k, unkept)
         };
         let ids_ok = out.tokens[..N] == shallow.tokens[..N];
         ok &= ids_ok;
@@ -2206,6 +2297,10 @@ mod gate {
             kept.pos,
             verdict(stores_ok)
         );
+
+        let (model, kept_ok) = kept_windows(m, prompt, ctx, (&out.tokens, &kept), unkept.len())?;
+        m = model;
+        ok &= kept_ok;
 
         // commit(k) is k steps, every k, through the rule's own driving.
         for keep in 1..=4usize {

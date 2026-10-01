@@ -27,6 +27,7 @@ pub const CARD_DONTNEED: &str = "BLOOMERY_CARD_DONTNEED";
 pub const R8: &str = "BLOOMERY_R8";
 pub const MTP_HEAD_ROWS: &str = "BLOOMERY_MTP_HEAD_ROWS";
 pub const MTP_DRAFT: &str = "BLOOMERY_MTP_DRAFT";
+pub const MTP_WINDOWS: &str = "BLOOMERY_MTP_WINDOWS";
 pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
@@ -275,6 +276,20 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               which starts that server). A path with no regular file is refused at `main`, and \
               the lever set on a run that drafts nothing by each of them, naming why. The MTP \
               draft gate opens the file its reference set states and does not act on it.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: MTP_WINDOWS,
+        class: Class::D,
+        kind: Kind::Flag,
+        default: Unset::Is("0"),
+        doc: "`generate_qwen3moe` drafting a qwen4exp file (`BLOOMERY_DRAFT=mtp`, or unset \
+              under `--place a`): an `mtp window` record a drafted window after the arm's `mtp \
+              summary` — its pass, the target's position before it, the proposal's ids, each \
+              one's probability among the draft head's rows (from the chain's one readback, \
+              which holds them either way) and how many the target kept. Refused by name on a \
+              run that drafts nothing. Off, the chain hands back its ids alone and nothing is \
+              kept; the tokens are the same either way.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

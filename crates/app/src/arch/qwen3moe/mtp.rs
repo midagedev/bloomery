@@ -68,6 +68,7 @@ impl MtpBody for Body38 {
         head: MtpHead,
         mode: WalkMode,
         out: &mut [u32],
+        p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError> {
         let d = m.mtp_chain(mtp_feed(refresh), own, head, mtp_mode(mode))?;
         let n = d.tokens.len();
@@ -78,6 +79,15 @@ impl MtpBody for Body38 {
                 detail: format!("a proposal of {n} ids into {places} places"),
             })?
             .copy_from_slice(&d.tokens);
+        if let Some(p) = p {
+            let places = p.len();
+            p.get_mut(..n)
+                .ok_or_else(|| GpuError::Shape {
+                    what: WHAT,
+                    detail: format!("a proposal's {n} probabilities into {places} places"),
+                })?
+                .copy_from_slice(&d.p);
+        }
         Ok(n)
     }
 }

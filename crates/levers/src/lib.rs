@@ -30,8 +30,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOSTSTREAM, MTP_DRAFT, MTP_HEAD_ROWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_MAX,
-    QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    HOSTSTREAM, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WINDOWS, PIN_MAIN, PREFILL, PREFILL_GROUP,
+    PREFILL_GROUP_MAX, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -749,6 +749,13 @@ impl Levers {
             Some(Value::Path(p)) => Some(p),
             v => panic!("{MTP_DRAFT} holds {v:?}, not a path"),
         }
+    }
+
+    /// `BLOOMERY_MTP_WINDOWS`: every drafted window's proposal, probabilities
+    /// and kept count are printed.
+    #[must_use]
+    pub fn mtp_windows(&self) -> bool {
+        self.flag(MTP_WINDOWS)
     }
 
     /// `BLOOMERY_ROUTE_TRACE`: the route trace's new directory; `None` unset

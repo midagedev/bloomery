@@ -1426,6 +1426,23 @@ pub static MTP_SUMMARY: Kind = Kind {
     ],
 };
 
+/// One drafted window of Qwen3.8's MTP draft.
+pub static MTP_WINDOW: Kind = Kind {
+    name: "mtp_window",
+    head: "mtp window",
+    doc: "BLOOMERY_MTP_WINDOWS: one drafted window, after the arm's mtp summary: its pass (the \
+          time pass row's number), the target's position before its verify, the proposal's ids, \
+          each one's probability among the draft head's rows (as the chain read it back, in the \
+          proposal's order) and how many of the ids the target kept.",
+    parts: &[
+        key("window", U64, ""),
+        key("pos", U64, "positions"),
+        key("ids", Csv, ""),
+        key("p", Csv, ""),
+        key("accepted", U64, ""),
+    ],
+};
+
 /// The timed run's footer.
 pub static SMOKE: Kind = Kind {
     name: "smoke",
@@ -1786,14 +1803,17 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// its residency lever's word (set, before the load; unset, after the
 /// `plan`, or before the load on another family and under `--dump-taps`)
 /// and, drafting nothing, why after the `load` line; under `--dump-taps`,
-/// after its `load` line; and under `BLOOMERY_STEP_STATS`, after a qwen4exp
-/// run's lines; the binary's other lines are its own.
+/// after its `load` line; a drafted arm's `mtp summary` and, under
+/// `BLOOMERY_MTP_WINDOWS`, its `mtp window` records after its lines; and
+/// under `BLOOMERY_STEP_STATS`, after a qwen4exp run's lines; the binary's
+/// other lines are its own.
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
     &LOAD_DRAFT_OFF38,
     &TAPS_SEQ,
     &TAPS_DUMP,
     &MTP_SUMMARY,
+    &MTP_WINDOW,
     &STAT_STEP_HOST,
     &STAT_SUMMARY_HOST,
     &STAT_PROMPT38_SPLIT,

@@ -235,9 +235,12 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     /// `refresh` walked (the rows the target kept with their hidden rows, its
     /// last row the target's own next token), then `own` walks, each reading the walk before it on the card;
     /// the proposal, `1 + own` ids with the refresh's last row's prediction
-    /// first, written to the front of `out`, and how many. `out` shorter than
-    /// the proposal is refused by name. A fault any walk raised is the
-    /// chain's error and poisons the model as the target's would.
+    /// first, written to the front of `out`, and how many. With `p`, each
+    /// id's probability among the head's rows, as the same readback holds
+    /// it, written to the front of `p`; a body whose readback holds none
+    /// refuses `p` by name. `out` or `p` shorter than the proposal is
+    /// refused by name. A fault any walk raised is the chain's error and
+    /// poisons the model as the target's would.
     fn chain(
         m: &mut GpuModel<Self>,
         refresh: Feed<'_, Self::Arena>,
@@ -245,6 +248,7 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         head: Self::Head,
         mode: WalkMode,
         out: &mut [u32],
+        p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError>;
 }
 
@@ -270,6 +274,25 @@ impl<A: Copy> Refresh<A> {
             },
         }
     }
+}
+
+/// One drafted window as the draft saw it ([`MtpDraft::keep_windows`]): the
+/// target's position before its verify, the proposal's ids and each one's
+/// probability among the head's rows, and how many of them the target kept.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowDraft {
+    pub pos: u32,
+    pub ids: Vec<u32>,
+    pub p: Vec<f32>,
+    pub accepted: usize,
+}
+
+/// What [`MtpDraft::keep_windows`] keeps: the last proposal's probabilities
+/// until its accept, and every window since the last take.
+struct Windows {
+    p: Vec<f32>,
+    pending: Option<(Vec<u32>, Vec<f32>)>,
+    kept: Vec<WindowDraft>,
 }
 
 /// A join the draft cannot make: no rows of the held sequence wait for it.
@@ -321,6 +344,9 @@ pub struct MtpDraft<B: MtpBody> {
     /// Why the draft proposes nothing until the next prompt call from
     /// position 0 or restart; `None` while it drafts.
     skip: Option<&'static str>,
+    /// The windows kept under [`MtpDraft::keep_windows`]; `None`, the chain
+    /// reads no probability and nothing is kept.
+    windows: Option<Windows>,
 }
 
 impl<B: MtpBody> MtpDraft<B> {
@@ -341,7 +367,28 @@ impl<B: MtpBody> MtpDraft<B> {
             zeros,
             joined: None,
             skip: None,
+            windows: None,
         })
+    }
+
+    /// Keep every drafted window from here on ([`WindowDraft`]): the chain
+    /// hands back each id's probability, which its one readback already
+    /// holds. Load-time only.
+    pub fn keep_windows(&mut self) {
+        self.windows = Some(Windows {
+            p: vec![0.0; B::WIDTH],
+            pending: None,
+            kept: Vec::new(),
+        });
+    }
+
+    /// The windows kept since the last take, in order; empty when
+    /// [`MtpDraft::keep_windows`] was never called.
+    pub fn take_windows(&mut self) -> Vec<WindowDraft> {
+        self.windows
+            .as_mut()
+            .map(|w| std::mem::take(&mut w.kept))
+            .unwrap_or_default()
     }
 
     /// The join of the last call that continued a held sequence, once: a
@@ -364,6 +411,9 @@ impl<B: MtpBody> MtpDraft<B> {
         self.last_unit = None;
         self.joined = None;
         self.skip = None;
+        if let Some(w) = &mut self.windows {
+            w.pending = None;
+        }
     }
 
     /// Before a plain step of `last` at the target's position: a refresh an
@@ -604,14 +654,28 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
             )));
         }
         let own = (Self::WIDTH - 1).min(t.ctx() as usize - end);
-        Ok(B::chain(
+        let Some(w) = &mut self.windows else {
+            return Ok(B::chain(
+                t.model_mut(),
+                r.feed(),
+                own,
+                self.head,
+                self.mode,
+                out,
+                None,
+            )?);
+        };
+        let n = B::chain(
             t.model_mut(),
             r.feed(),
             own,
             self.head,
             self.mode,
             out,
-        )?)
+            Some(&mut w.p),
+        )?;
+        w.pending = Some((out[..n].to_vec(), w.p[..n].to_vec()));
+        Ok(n)
     }
 
     /// The next refresh recorded before the commit takes the rejected rows
@@ -637,6 +701,19 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
             walk: B::VERIFY_ARENA,
             first: 0,
         });
+        if let Some(w) = &mut self.windows {
+            let (ids, p) = w.pending.take().ok_or_else(|| {
+                SessionError::Refused(format!(
+                    "{WHAT}: an accept of a window whose proposal the draft did not keep"
+                ))
+            })?;
+            w.kept.push(WindowDraft {
+                pos: p0,
+                ids,
+                p,
+                accepted: accepted - 1,
+            });
+        }
         Ok(())
     }
 

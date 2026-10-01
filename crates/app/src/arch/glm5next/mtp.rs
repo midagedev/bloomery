@@ -74,6 +74,7 @@ impl MtpBody for Body {
         bloomery_gpu_glm5next::nextn_walk(m, nextn_feed(feed), head, nextn_mode(mode))
     }
 
+    /// The NextN head reads back its ids alone: `p` is refused by name.
     fn chain(
         m: &mut GpuModel<Body>,
         refresh: Feed<'_, GlmArena>,
@@ -81,7 +82,14 @@ impl MtpBody for Body {
         head: NextnHead,
         mode: WalkMode,
         out: &mut [u32],
+        p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError> {
+        if p.is_some() {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: "a chain's probabilities: the NextN head reads back its ids alone".into(),
+            });
+        }
         bloomery_gpu_glm5next::nextn_chain(m, nextn_feed(refresh), own, head, nextn_mode(mode), out)
     }
 }

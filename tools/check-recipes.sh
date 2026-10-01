@@ -254,6 +254,7 @@ selftests=(
   "tools/check-comment-only.py --self-test"
   "tools/flow/ds41_prefill.py --self-test"
   "tools/flow/pplb.py --self-test"
+  "tools/flow/q38width.py --self-test"
   "tools/flow/routes.py --self-test"
   "tools/mac-disk.py --self-test"
   "tools/ref/check-int-twins.py --self-test"

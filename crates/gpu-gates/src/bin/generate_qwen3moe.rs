@@ -134,8 +134,11 @@
 //! rows) and a `time step` row a kept position (its pass's wall over its
 //! positions, the row a plain run's step wall compares with), and an
 //! `mtp summary` record closes the arm: the windows' kept lengths, the
-//! positions and their rate. A sampling request is a server matter; this
-//! CLI is greedy.
+//! positions and their rate. Under `BLOOMERY_MTP_WINDOWS=1` an `mtp window`
+//! record a drafted pass follows it: the pass, the target's position, the
+//! proposal's ids, each one's probability among the draft head's rows and
+//! how many the target kept (`tools/flow/q38width.py` replays them). A
+//! sampling request is a server matter; this CLI is greedy.
 //!
 //! Lines: `prompt_ids`, `load` (`arch=` the file's architecture; with the
 //! decode flash pass: `flash_mma=`; for qwen3moe the ubatches' attention,
@@ -244,7 +247,7 @@ mod cli {
     use super::taps;
     use app::Session;
     use app::arch::qwen3moe::Q38Cfg;
-    use app::mtp::{MtpBody, MtpDraft};
+    use app::mtp::{MtpBody, MtpDraft, WindowDraft};
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
@@ -824,6 +827,8 @@ mod cli {
         ctx: usize,
         /// `BLOOMERY_STEP_STATS`, as the levers hold it.
         stats: bool,
+        /// `BLOOMERY_MTP_WINDOWS`, as the levers hold it.
+        windows: bool,
     }
 
     /// A prompt call's streaming picks, each with its ubatch, and its end.
@@ -845,6 +850,7 @@ mod cli {
             bloomery_levers::DRAFT,
             bloomery_levers::MTP_HEAD_ROWS,
             bloomery_levers::MTP_DRAFT,
+            bloomery_levers::MTP_WINDOWS,
             bloomery_levers::RESIDENCY,
             bloomery_levers::HOSTSTREAM,
         ])?;
@@ -1064,6 +1070,13 @@ mod cli {
             )
             .into());
         }
+        if draft == Draft38::Off && levers.mtp_windows() {
+            return Err(format!(
+                "BLOOMERY_MTP_WINDOWS prints the MTP draft's windows; {}",
+                no_draft("BLOOMERY_DRAFT=mtp on a qwen4exp file")
+            )
+            .into());
+        }
         let (place_a, prefill_step) = match chosen {
             Chosen::Qwen38(path, place, _) => (place == Place38::A, path == Prompt38::Step),
             Chosen::Qwen3(_) | Chosen::Qwen35(_) => (false, false),
@@ -1112,6 +1125,7 @@ mod cli {
             tok,
             ctx,
             stats: levers.step_stats(),
+            windows: levers.mtp_windows(),
         };
         match chosen {
             Chosen::Qwen3(path) => drive(
@@ -1876,7 +1890,10 @@ mod cli {
     ) -> Result<(), GateError> {
         let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         let path = cfg.prompt;
-        let draft = MtpDraft::open(s.model(), path, cfg.draft)?;
+        let mut draft = MtpDraft::open(s.model(), path, cfg.draft)?;
+        if run.windows {
+            draft.keep_windows();
+        }
         let mut spec = s.with_draft::<MtpDraft<Body38>, 4>(draft, &mut VerifyCaptures)?;
         let count = arms.len();
         for (i, arm) in arms.iter().enumerate() {
@@ -2074,6 +2091,9 @@ mod cli {
             println!("text {:?}", t.decode(&tokens));
         }
         mtp_summary(&sink.passes, warm);
+        if run.windows {
+            mtp_windows(&sink.passes, &spec.draft_mut().take_windows())?;
+        }
         if run.timed {
             let counted = &sink.passes[warm..];
             let positions: usize = counted.iter().map(|&(_, k, ..)| k).sum();
@@ -2128,6 +2148,52 @@ mod cli {
             .u("passes", passes.len())
             .f("tok/s(positions)", counted_positions as f64 * 1e3 / ms)
             .print();
+    }
+
+    /// The `mtp window` records: each drafted window beside its pass, which
+    /// must keep one row past the ids the draft says the target kept. A
+    /// window the passes do not hold, or a pass the draft kept no window of,
+    /// is refused by name.
+    fn mtp_windows(
+        passes: &[(bool, usize, f64, Duration)],
+        windows: &[WindowDraft],
+    ) -> Result<(), GateError> {
+        let drafted: Vec<(usize, usize)> = passes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.0)
+            .map(|(i, p)| (i + 1, p.1))
+            .collect();
+        if drafted.len() != windows.len() {
+            return Err(format!(
+                "generate_qwen3moe: the draft kept {} windows of {} drafted passes",
+                windows.len(),
+                drafted.len()
+            )
+            .into());
+        }
+        for (&(pass, kept), w) in drafted.iter().zip(windows) {
+            if w.accepted + 1 != kept || w.ids.len() != w.p.len() {
+                return Err(format!(
+                    "generate_qwen3moe: pass {pass} kept {kept} rows, and its window kept {} of \
+                     {} ids with {} probabilities",
+                    w.accepted,
+                    w.ids.len(),
+                    w.p.len()
+                )
+                .into());
+            }
+        }
+        for (&(pass, _), w) in drafted.iter().zip(windows) {
+            Record::new(&record::MTP_WINDOW)
+                .u("window", pass)
+                .u("pos", w.pos)
+                .csv("ids", &w.ids)
+                .csv("p", w.p.iter().map(|p| format!("{p:.5}")))
+                .u("accepted", w.accepted)
+                .print();
+        }
+        Ok(())
     }
 
     fn mode_name(mode: StepMode) -> &'static str {
