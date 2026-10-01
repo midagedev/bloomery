@@ -16,9 +16,10 @@
 //! - the routed experts the slot map puts on the card, on a layer with card
 //!   experts, the card route ([`CardRoute38`]): per [`ROUTE_ROWS`] run, in
 //!   the shadow after the front's download, the compressed ids and the
-//!   places from the walk's ids, the remapped route table, the Q4_K gate
-//!   and up GEMMs, the card slots' SwiGLU (`swiglu_quant32_sel`), the Q5_1
-//!   down GEMM and the card sum into the unit-wide acc — the host tier
+//!   places from the walk's ids, the remapped route table, the gate and up
+//!   GEMMs of the layer's type (Q4_K or Q5_K), the card slots' SwiGLU
+//!   (`swiglu_quant32_sel`), the down GEMM of its type (the file's Q5_1 or
+//!   Q8_0 blocks) and the card sum into the unit-wide acc — the host tier
 //!   serves the rest of the slots, and the back adds the card sum on a
 //!   layer with card experts (`q38_card_shared_add`);
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
@@ -100,6 +101,7 @@ use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
+use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::sync::Arc;
@@ -391,8 +393,9 @@ impl CardRoute38 {
     /// places from the walk's ids (`ids`, eleven slots a token, the shared
     /// expert's last — never read), the remapped route table over the slot
     /// map's layer row (`slots`), the q8_1 of the run's normed rows
-    /// (`ffn_x`, `[m][HIDDEN]`), the Q4_K gate and up GEMMs over the unit's
-    /// ten slots a token, the card slots' SwiGLU, the Q5_1 down GEMM and
+    /// (`ffn_x`, `[m][HIDDEN]`), the gate and up GEMMs of the layer's type
+    /// (Q4_K or Q5_K) over the unit's ten slots a token, the card slots'
+    /// SwiGLU, the down GEMM of its type (the file's Q5_1 or Q8_0 blocks) and
     /// the card sum by the router's weights (`weights`, eleven a token)
     /// into the unit-wide acc's rows for the run. Nine launches a run.
     /// Refused by name on a layer without card experts. Asynchronous,
@@ -411,7 +414,12 @@ impl CardRoute38 {
         m: usize,
     ) -> Result<(), GpuError> {
         let st = card.stacks(c.w, l)?;
-        let (n_card, gate, up, down) = (st.n_card, st.gate, st.up, st.down);
+        let (n_card, gate, up) = (st.n_card, st.gate, st.up);
+        let gate_up_ty = GemmWeight::from_ggml(st.gate_up_ty)?;
+        let down = match st.down_ty {
+            GgmlType::Q8_0 => Gemm32Weight::Q8_0File(st.down),
+            _ => Gemm32Weight::Q5_1File(st.down),
+        };
         let (gpu, stream, sink) = (c.gpu, c.gpu.stream(), c.gpu.layer_sink(l)?);
         let pitch = geo::N_USED + 1;
         // SAFETY: layer l's row of the slot map's card copy (`EXPERTS` words
@@ -464,7 +472,7 @@ impl CardRoute38 {
                 c.k.gemm.enqueue_gemm(
                     stream,
                     GemmArgs {
-                        ty: GemmWeight::Q4K,
+                        ty: gate_up_ty,
                         w,
                         rows_per_expert: geo::FF,
                         act: &self.x,
@@ -487,7 +495,7 @@ impl CardRoute38 {
             c.k.g32.enqueue_gemm32(
                 stream,
                 Gemm32Args {
-                    w: Gemm32Weight::Q5_1File(down),
+                    w: down,
                     rows_per_expert: geo::HIDDEN,
                     act: &self.act,
                     route: &self.routes[at],

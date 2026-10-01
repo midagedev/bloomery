@@ -313,7 +313,11 @@ mod gate {
     /// 3090 at this cache (the card rule's plans, `qwen4exp_meta`'s
     /// `CARD_PLANS`: 105/104 at 4,096 positions and a ubatch of 4,096, the
     /// ubatch walk's card route in the budget).
-    const CARD_LAYERS: usize = 43;
+    /// PIN(2026-10-01): all 48: the card experts read layer 2's q5_K gate and
+    /// up and the q8_0 downs (`kq_gate_up_act_q5k`, `q8_0_gemv_sel32`), so
+    /// `place::host_only` is empty and every layer holds its prefix (93/92 on
+    /// the 3090 at 4,096 positions and a ubatch of 4,096, `CARD_PLANS`).
+    const CARD_LAYERS: usize = 48;
 
     /// PIN(2026-09-29): the captured step's and verify's node counts under
     /// the card plan, derived before the leg was built: each card layer's
@@ -321,8 +325,10 @@ mod gate {
     /// gate·up, the q8_1 of the card slots' columns, the down, the card sum),
     /// and its back combines the card sum in the gated sum's launch:
     /// 1151 + 5·43 and 1235 + 5·43.
-    const NODES_DECODE_CARD: usize = 1366;
-    const NODES_VERIFY_CARD: usize = 1450;
+    /// PIN(2026-10-01): over the 48 card layers, the same five launches on
+    /// each whatever its types: 1151 + 5·48 and 1235 + 5·48.
+    const NODES_DECODE_CARD: usize = 1391;
+    const NODES_VERIFY_CARD: usize = 1475;
 
     const _: () = assert!(
         NODES_DECODE_CARD == NODES_DECODE + 5 * CARD_LAYERS
