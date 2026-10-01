@@ -1,723 +1,314 @@
 # AGENTS.md — bloomery
 
-An LLM inference engine for one workstation: Rust host, CUDA-Rust kernels
-(cuda-oxide today, cutile-rs later), AVX2 kernels for the CPU expert tier.
-The plan lives in `docs/plan.md`. This file is the working contract.
+An LLM inference engine for one workstation: Rust host, CUDA-Rust kernels (cuda-oxide today, cutile-rs later), AVX2
+kernels for the CPU expert tier. The plan lives in `docs/plan.md`. This file is the working contract, and it holds only
+rules in force; their history is in rig-log, the commit log, and this file at `4e7fa8af`.
 
 ## Never
 
-- **Never build a device crate with plain `cargo`.** `crates/gpu` (and every
-  crate that links it: `gpu-deepseek41`, `gpu-vision`, `gpu-gates` with its
-  `gpu` feature) contains `#[cuda_module]`/`#[kernel]` code that needs the CUDA
-  codegen backend; a plain `cargo build` of it produces nothing usable. Use
-  `cargo oxide` (the recipes do).
-- **Never run a gate on the Mac.** The Mac is arm64 and an editor; the CPU
-  kernels (`qdot`) use `std::arch::x86_64` and the worker pool (`threads`)
-  Linux affinity calls, neither of which the Mac runs. The static tier (`just mac-check`,
-  `just mac-lint`: check and clippy as an x86_64-linux cross check, no linker; `just mac-fmt-check`)
-  and the pure crates' native tests (`just mac-test`: `cargo test -p` for each crate
-  `tools/recipes.py pure-crates` selects — no device root in its closure, no x86_64 or Linux-only
-  code) run on the Mac; every other crate's tests and every gate never, and a Mac result is
-  development-loop evidence — landing evidence is the box's record (the landing batch).
-  Every command below goes through `tools/box.sh`, which rsyncs the tree to the
-  workstation and runs there. That rsync is `--delete`: never edit on the box.
-- **Never hand-run a benchmark.** Measurements belong to the lease runners in
-  `tools/ref/` (`decode-measure.sh`, `ab-decode.sh`, `depth-gpu.sh`,
-  `depth-ds41.sh`, `nsys-gpu.sh`, `ncu-gpu.sh` and their recipes; each takes
-  the timing lease through `lease_take`). They own the quiet-machine
-  protocol: a machine-wide lock, GPU-idle wait, and witness blocks around every
-  timed region. A number produced outside them is not admissible. While the
-  lock is held, `netdata-lease-gate.service` (source in rig-log `configs/`)
-  freezes netdata, whose GPU collector queries both cards every 2 s;
-  `lease_take` prints its state.
-- **Both cards are ours** (user, 2026-09-22: "gpu 2개 다 쓰기로 했으니"). Nothing
-  else holds the A6000 any more — the nightly vocoder training ended 2026-09-21
-  and `llm.service` is inactive and disabled — so a compute process on either
-  card that is not one of our rounds is a surprise to investigate, not a tenant
-  to yield to. **Timed numbers are taken on the A6000** (user, 2026-09-22 —
-  the 3090 fell off the bus twice that day under load, Xid 79 at ~~01:51 and
-  21:38 UTC~~ 01:51 and 06:38 KST (16:51 and 21:38 UTC on 09-21; the kernel
-  journal, read 2026-09-23); the timing runners `tools/ref/depth-gpu.sh`, `nsys-gpu.sh`,
-  `ncu-gpu.sh` pin it through `TIMING_GPU`, override with
-  `BLOOMERY_TIMING_GPU`, and every witness block opens with the card name and
-  power limit). The ik baselines are re-measured there; **3090 numbers from
-  before that date and A6000 numbers never share a table**. One exception
-  (user, 2026-09-28): a model that does not fit one card may carry a second,
-  separate "A6000+3090" table — the reference engine gets the same two cards
-  (`-ts` split) in the same lease, the 3090 stays at its 250 W cap, and the
-  witness blocks check for Xid before and after; it never shares a table with
-  the A6000 rows. The 3090 is the
-  gate-and-build card: `tools/box.sh` defaults to it (the box env pin), it is
-  capped at 250 W by a systemd oneshot (`gpu-power-limit.service`), and a
-  compute process on it does not stop a timing run — the runner records it as
-  `[other-busy]` (abort with `BLOOMERY_OTHER_STRICT=1`). `BLOOMERY_CARD=a6000|
-  both tools/box.sh …` still exists for functional runs on the A6000 and
-  refuses (rc 75) while that card has a compute process — i.e. while a timing
-  run holds it; its pick reaches the box as `BLOOMERY_BOX_CARD`, and the gate
-  runner takes the gate lock of every card in view (see Commands).
-- **Never start a box job longer than 30 minutes without the user's approval**
-  (user, 2026-09-22). Estimate the wall time before launching — full-set CPU
-  simulations, truth-file builds, depth sweeps, timing tables — and batch such
-  jobs so one approval covers one sitting of box time. A round spec that needs
-  one says so and names the estimate; the round waits for the lead, and the
-  lead asks the user. Gates and builds that finish inside 30 minutes need no
-  approval. (Context: the error-source round queued ~2 h of CPU simulation,
-  50 min of it a duplicate arm, without anyone asking.) One exception (user,
-  2026-09-27, `docs/rebuild.md` §7 decision 3): during the rebuild waves, the
-  lead's landing batch of gates through `tools/gate-batch.sh` needs no approval
-  past 30 minutes; its predicted wall is still printed before it starts. Timing
-  sittings and every other long job still ask.
-- **Never relax a gate or a lint to make it pass.** Raise it with a dated
-  comment and a reason, or file an issue. The lint levels in the root
-  `Cargo.toml` carry the hit counts they were chosen from.
-- **Never write a number you did not measure.** If it is derived, say so. If it
-  turns out wrong, strike it through and correct it in place; do not silently edit.
+- **Never build a device crate with plain `cargo`.** `crates/gpu` and every crate that links it (`gpu-deepseek41`,
+  `gpu-glm5next`, `gpu-vision`, `gpu-gates` with its `gpu` feature) hold `#[cuda_module]`/`#[kernel]` code that needs
+  the CUDA codegen backend. Use `cargo oxide` (the recipes do).
+- **Never run a gate on the Mac.** The Mac is arm64 and an editor: `qdot` uses `std::arch::x86_64`, `threads` Linux
+  affinity calls. On the Mac run only the static tier (`just mac-check`, `just mac-lint`: check and clippy as an
+  x86_64-linux cross check, no linker; `just mac-fmt-check`) and the pure crates' native tests (`just mac-test`, the
+  crates `tools/recipes.py pure-crates` selects). A Mac result is development-loop evidence; landing evidence is the
+  box's record. Every box command goes through `tools/box.sh`, whose rsync is `--delete`: never edit on the box.
+- **Never hand-run a benchmark.** Measurements belong to the lease runners in `tools/ref/` (`decode-measure.sh`,
+  `ab-decode.sh`, `depth-gpu.sh`, `depth-ds41.sh`, `nsys-gpu.sh`, `ncu-gpu.sh` and their recipes), each taking the
+  timing lease through `lease_take`: a machine-wide lock, GPU-idle wait, and witness blocks around every timed region.
+  A number produced outside them is not admissible. While the lock is held, `netdata-lease-gate.service` (rig-log
+  `configs/`) freezes netdata; `lease_take` prints its state.
+- **Both cards are ours.** A compute process on either card that is not one of our rounds is a surprise to
+  investigate. **Timed numbers are taken on the A6000** (the 3090 fell off the bus under load, Xid 79): the timing
+  runners pin it through `TIMING_GPU` (override `BLOOMERY_TIMING_GPU`), and every witness block opens with the card
+  name and power limit. 3090 numbers from before 2026-09-22 and A6000 numbers never share a table. A model that does
+  not fit one card may carry a separate "A6000+3090" table: the reference engine gets the same two cards (`-ts`) in the
+  same lease, the 3090 stays at its 250 W cap, the witness blocks check for Xid before and after. The 3090 is the
+  gate-and-build card: `tools/box.sh` defaults to it, `gpu-power-limit.service` caps it at 250 W, and a compute process
+  on it does not stop a timing run (recorded `[other-busy]`; abort with `BLOOMERY_OTHER_STRICT=1`).
+  `BLOOMERY_CARD=a6000|both tools/box.sh …` runs functional work on the A6000 and refuses (rc 75) while that card has
+  a compute process; the pick reaches the box as `BLOOMERY_BOX_CARD`.
+- **Never start a box job longer than 30 minutes without the user's approval.** Estimate the wall first and batch long
+  jobs so one approval covers one sitting. A round spec that needs one names the estimate; the lead asks the user.
+  Exception: the lead's landing batch of gates through `tools/gate-batch.sh` needs none; it still prints its predicted
+  wall before it starts.
+- **Never relax a gate or a lint to make it pass.** Raise it with a dated comment and a reason, or file an issue. The
+  lint levels in the root `Cargo.toml` carry the hit counts they were chosen from.
+- **Never write a number you did not measure.** If it is derived, say so. If it turns out wrong, strike it through and
+  correct it in place.
 
 ## Commands
 
-    just check        # cargo check --workspace --all-targets — also the step that
-                      # refreshes Cargo.lock after a dependency edit — `cargo oxide
-                      # build` does not rewrite the lock (lock md5 unchanged
-                      # across oxide builds in the gates-v2 round). box.sh syncs one
-                      # way, so the recipe ends with tools/lock-back.sh, which copies
-                      # the box's rewritten lock into this tree: commit it with the
-                      # edit, or every sync restores the old lock and the timing
-                      # runners refuse their binaries as stale (rc 3)
-    just lint         # cargo clippy --workspace; contract is 0 errors
-                      # FAIL-first on the box: `box.sh` syncs by content checksum
-                      # and does NOT carry the Mac's mtimes, so a changed file
-                      # gets the box's own "now" and cargo rebuilds it. (It used
-                      # to carry them: a restore handed back an older mtime, and
-                      # even a `touch` lost to the box clock running 4.1 s ahead
-                      # of the Mac — the MUTATED binary was served twice.)
-                      # Before trusting a run whose source changed, the build
-                      # log must still show `Compiling <crate>`. The flip side
-                      # (2026-09-21): a Mac `touch` changes no content, so the
-                      # box never sees it — to force a rebuild of UNCHANGED
-                      # source, touch on the box (`box.sh 'touch <file> && …'`).
-    just fmt          # cargo fmt --all on the Mac, with the pinned nightly's rustfmt (tools/mac-check.sh)
-    just build-ref    # the C++ reference harnesses that link ggml
-    just deny         # cargo deny check; fails if the cuda-oxide pin ever floats
-    just affected [BASE|A..B]  # the gate-* recipes a change touches, from the crate graph,
-                      # each target's module tree (a module under `#[cfg(test)]` belongs to
-                      # its own target's test build, not to the lib its dependents link), the
-                      # scripts a recipe names and the cargo globals (tools/recipes.py, the
-                      # parser check-recipes shares);
-                      # Mac-only, builds nothing, runs nothing — it prints the list a
-                      # landing batch runs, the `unmapped:` files no gate reads, and how
-                      # old the box's dep-info of each selected bin is (read-only ssh;
-                      # `--no-box` skips it). A change in crates/gpu or crates/model
-                      # selects every GPU gate: the graph's true answer. A gate left out
-                      # of a batch is then a printed record, not a judgment.
-                      # The graph over-selects a host-only change (user, 2026-09-26: "heavy
-                      # experiments again; read the code instead"): when `just ptx-scan` is
-                      # identical to the base for every bin the change reaches, no kernel
-                      # moved, so the landing batch is the gates that run the changed host
-                      # path (for the V4.1 prompt call: ds41-prefill, -step, -long,
-                      # e2e and the changed bins' own gates) plus the static checks; the
-                      # batch's list names the gates it leaves out and the ptx-scan line that
-                      # lets it. A kernel, a launch or a byte formula moved runs the whole list.
-                      # `just affected BASE --narrow --scan BASE_LOG NEW_LOG …` prints that list:
-                      # each scan pair's verdict (identical, added or moved), the gates whose own
-                      # target changed, and the rows of tools/gate-paths.tsv the changed files match;
-                      # a moved pair, no pair, or a changed file no row maps prints the full list
-                      # and names why
-    just gate         # the static checks, lint, gate-1-1 and the fast library gates
-    just smoke        # the smoke tier: the static checks, gate-gpu-ds41-step, gate-gpu-ds41-prefill at
-                      # P = 512 alone, gate-gpu-e2e, in two lanes through tools/gate-batch.sh — a subset
-                      # run for a round's loop and the lead's first look, never a landing batch.
-                      # tools/gate-batch.sh is also the landing-batch runner: `--list FILE` takes `just
-                      # affected` output; lane A = the 3090, fixed (gpu-gate.sh without `any`, and device
-                      # code run with no gate lock); the `any` recipes (read through the scripts a recipe names,
-                      # transitively: gate-ptx-spill's JIT is one) and those with no device code are
-                      # balanced, longest first to the lane expected to end first (the median of their last
-                      # five rows in ~/.cache/bloomery/gate-times.tsv, 45 s without one), lane A forcing the
-                      # 3090, lane B the A6000; a `[group('host')]` recipe (device-crate tests that open no
-                      # card, which `just check-recipes` holds) is balanced with no card forced; X = alone
-                      # after both lanes: a `[group('solo')]` recipe (a host-memory pin another lane's model
-                      # load moves — gate-gpu-ds41-long, the load gates) or BLOOMERY_CARD=both; any other
-                      # group value is an error; rc 75 retries; one log per item and a run.log ending in
-                      # `DONE total= red= wall=`; refuses to start while the timing lease is held and refuses
-                      # a recipe that runs a timing runner (in command position, not in a comment or a
-                      # message) or whose script takes the lease.
-                      # `--ledger` (the lead's batches) and `--round-ledger` (a round's): an item whose input
-                      # key (`tools/recipes.py key` — its source closure, recipe text, cargo globals, ARGS, env
-                      # and card, and a box manifest read once per batch, whose model rows enter it only for the
-                      # model directories that item can open) is green in a ledger it reads is not
-                      # run and prints `rc=skip green-at=<commit> src=lead|round`; an item whose final rc is 0 is
-                      # recorded — the lead's in ~/.cache/bloomery/gate-ledger.tsv, a round's only in
-                      # gate-ledger-rounds.tsv beside it. A round reads both files. The lead reads the rounds'
-                      # file only with `--trust-rounds`, and passes it only for a change that moves no
-                      # behaviour: a move whose `just ptx-scan` equals the base (user, 2026-09-27: a round
-                      # runner's recorded green at the same key is not re-run at landing; an agent saying
-                      # "green" is not a record). A rebase still moves the key of every item the landed
-                      # commits touch. `--rerun` runs every item and still records; `--dry-run --ledger`
-                      # prints what would skip and what moved; the header lists what the key cannot see
-    just gate-<name>  # one subsystem's tests on the box, bounded, real exit code:
-                      # ops attn ffn moe head forward kv derived mt profile
-                      # alloc threads qdot engram prompts placement 1-1 runtime app
-    just gate-ptx-spill  # compile-time ratchet: every PTX entry's spill/jit_local bytes
-                      # against tools/ref/ptx-shapes.tsv (a new kernel must be pinned)
-    just box-gc       # kill orphan processes under this track's remote dir
-    just box-tracks   # remote track dirs vs local worktrees; --remove NAME… deletes those, if stale
-    just mac-check    # check, and `mac-lint` clippy held to the Known-state count, on the Mac (tools/mac-check.sh):
-    just mac-lint     # the recipes' box commands as an x86_64-linux cross check, no linker; `mac-fmt-check` is fmt-check
-    just mac-test     # native `cargo test -p` of the pure crates on the Mac (`tools/recipes.py pure-crates`: the rule, each rejected crate's reason)
-    just weekly       # every `weekly-*` recipe (gates taken out of the landing batch: the V4.1 server,
-                      # the flow model's counts, GLM's long step sets) in one sitting through
-                      # tools/gate-batch.sh --weekly on the lead's ledger. `just affected` selects no
-                      # weekly recipe by the graph; it names one, with the row, when a changed file
-                      # matches one of its trigger rows in tools/gate-paths.tsv or its own text changes
-    just stage-gpu-load-v41 [--plan a]  # opt-in, not a gate-* recipe: `just affected` never
-                      # selects it. Plan (b) — the tree's only two-card load — staged on both
-                      # cards and checked byte for byte against the plan; solo. `-lock` also
-                      # mlocks the host set. A change to crates/model/src/placement.rs,
-                      # placement/{workstation,host_lock}.rs, crates/gpu/src/{hybrid,weights}.rs
-                      # or gate_load_v41.rs runs both by name in its landing batch
-    just lab-engram   # the engram IO lab's tests (crates/engram-lab, no engine user);
-                      # lab-, not gate-, so no engine landing selects it
-    just records-refresh  # the V4.1 binaries' record schemas into tools/bloomery/schema/ and
-                      # generate_ds41 --plan's prompt-call plans (placement (a), P 128/256/384/
-                      # 512/4096, CED on and off) into tools/flow/plans/; loads nothing onto a
-                      # card. Run it after changing a record kind (the gpu-gates lib test
-                      # checked_in_schemas_are_current is red until then) or the prompt call's plan
-    just gate-refset  # crates/refset: the reference-set readers' unit tests, then every family's
-                      # sets in place against the family table (crates/refset/src/arch) — each
-                      # complete, dumped from the model file the tree runs (the first shard's full
-                      # path, as the set states it), of the family's ik build; host only
-    just refset-check [FAMILY PATH...]  # which reference sets are stale, one line a set; with
-                      # no arguments every family's sets in place; reads only
-    just gate-qwen35moe-meta  # the Qwen3.6 (qwen35moe) header-only reader: its ModelSpec pins over the
-                      # Q4_K_M and UD-Q4_K_XL files and the coverage check's list (what the tree cannot
-                      # run yet, per instance with its layers); host only, like the other *-meta gates
+The recipes' own lines and the tool headers (`tools/gate-batch.sh`, `tools/recipes.py`, `tools/gpu-gate.sh`,
+`tools/box.sh`) are the full reference; what follows is the contract.
 
-`just gate` excludes the measure targets on purpose: they need a quiet machine
-and take a lock, so running them is a separate, deliberate act. It also excludes
-`just deny`, which reaches the network for the advisory database.
+    just check / lint / fmt   # check --all-targets (also refreshes Cargo.lock: commit the lock tools/lock-back.sh copies
+                              # back with the edit, or the timing runners refuse stale binaries, rc 3); clippy, 0 errors;
+                              # cargo fmt with the pinned nightly
+    just build-ref            # the C++ reference harnesses that link ggml (rerun when ik moves; gate-qdot reads them)
+    just deny                 # cargo deny; fails if the cuda-oxide pin floats; reaches the network
+    just affected [BASE|A..B] # the gate-* recipes a change selects, from the crate graph and module trees, the scripts
+                              # a recipe names, the cargo globals and each manifest by table; Mac only, builds nothing
+    just gate / smoke         # static checks, lint, fast library gates / the round loop's subset (never a landing batch)
+    just gate-<name>          # one subsystem's tests on the box, bounded, real exit code
+    just gate-ptx-spill       # every PTX entry's spill/jit_local bytes against tools/ref/ptx-shapes.tsv
+    just weekly               # every weekly-* recipe in one sitting on the lead's ledger
+    just box-gc / box-tracks  # orphans under this track's remote dir / remote dirs vs local worktrees
+    just mac-check / mac-lint / mac-fmt-check / mac-test   # the Mac's static tier (above)
+    just records-refresh      # tools/bloomery/schema/ and tools/flow/plans/ after a record kind or prompt-call plan change
+    just lab-engram           # the engram IO lab's tests; lab-, not gate-, so no engine landing selects it
+    just gate-refset / refset-check   # the reference-set readers and every family's sets in place
 
-Build artifacts land in the workspace root `target/`, not under `crates/*/`.
-The measure runners read from there and exit rather than fall back, because a
-stale binary at an old path is a wrong number, not a missing one.
+- **FAIL-first on the box.** `box.sh` syncs by content checksum and does not carry the Mac's mtimes, so a changed file
+  gets the box's "now" and cargo rebuilds it. Before trusting a run whose source changed, the build log must show
+  `Compiling <crate>`. A Mac `touch` changes no content; to rebuild unchanged source, touch on the box.
+- **Bounds and exit codes.** Every `gate-*` recipe runs under `timeout --kill-after=10 900`; the exit code has one
+  owner, `tools/gate.sh`. GPU gate binaries run through `tools/gpu-gate.sh`: it takes a card's gate lock, runs under
+  the same bound (`BLOOMERY_GATE_BOUND`, whole seconds ≥ 1, parsed by `tools/gate-bound.sh`; any other value ends the
+  runner with 64), and returns the binary's code (124/137 timed out, 75 lock contention, 69 a lock file it cannot open).
+  `just check-recipes` fails on a test recipe with `||` or a bare `cargo test`, on a `--bin`/`--test`/`-p`/feature
+  that names nothing, a script not in the tree, a `gate-*` recipe with no cargo target or one that runs its binary with
+  `cargo run`, a bin built without its `required-features`, a recipe that takes a lock itself, and on a Python tool
+  under `tools/` whose self-test is not listed.
+- **Card locks.** `/root/bloomery-gate.lock` (3090) and `/root/bloomery-gate-a6000.lock`. Under
+  `BLOOMERY_CARD=a6000|both` the runner takes that card's lock, or both for `both` (the 3090's first, then the A6000's;
+  every other run holds one, so the order cannot deadlock), and refuses (64) a `BLOOMERY_GATE_CARD` naming another card.
+  Under box.sh's default pin, `BLOOMERY_GATE_CARD=3090|a6000|any` picks (default `3090`; `any` takes an idle A6000 when
+  no timing lease is held, else the 3090). Pass it through `BLOOMERY_BOX_ENV`.
+- **Landing batches.** `tools/gate-batch.sh --list FILE` takes `just affected` output and runs it in lanes (A the 3090,
+  B the A6000, X alone after both: `[group('solo')]` or `BLOOMERY_CARD=both`); it refuses to start while the timing
+  lease is held and refuses a recipe that runs a timing runner. `--ledger` (the lead's) skips an item whose input key
+  (`tools/recipes.py key`) is green in `~/.cache/bloomery/gate-ledger.tsv`; `--round-ledger` (a round's) records only in
+  `gate-ledger-rounds.tsv`. The lead reads the rounds' file only with `--trust-rounds`, and only for a change that moves
+  no behaviour (`just ptx-scan` equal to the base). A rebase moves the key of every item the landed commits touch.
+- **Narrowing.** The graph over-selects a host-only change. When `just ptx-scan` equals the base for every bin the
+  change reaches, no kernel moved, and the landing batch is the gates that run the changed host path plus the static
+  checks; `just affected BASE --narrow --scan BASE_LOG NEW_LOG …` prints that list and why. A kernel, a launch or a byte
+  formula moved runs the whole list. Always `just ptx-scan <bin> --features …`.
+- **Weekly and opt-in.** `just affected` selects a `weekly-*` recipe only when a changed file matches one of its trigger
+  rows in `tools/gate-paths.tsv` or its own text changes. `just stage-gpu-load-v41 [--plan a]` (plan (b) staged on
+  both cards, checked byte for byte; solo) is never selected: a change to `crates/model/src/placement.rs`,
+  `placement/{workstation,host_lock}.rs`, `crates/gpu/src/{hybrid,weights}.rs` or `gate_load_v41.rs` runs it by name.
+- `just gate` excludes the measure targets (they need a quiet machine and a lock) and `just deny`. Build artifacts land
+  in the workspace root `target/`; the measure runners read only from there.
 
-Every `gate-*` recipe runs its `cargo test` under
-`timeout --kill-after=10 900`: warm runs take seconds, cold builds a few
-minutes, and a gate that hangs must fail loudly in fifteen minutes rather than
-hang a pipeline forever. (2026-09-20: an infinite loop in a first-draft chunk
-walk hung `gate-mt` past an hour; two parallel agents died as "inactive"
-watching it, and orphaned test processes piled up on the box until they were
-found by hand. The bound, `box-gc`, and the checklist below all come from that
-incident. The first form of the bound was `cargo test … || echo "TIMED OUT"`,
-which made every gate exit 0 whether it passed, failed or timed out; it was
-caught in review the same evening, and a 13-gate rerun found no red hidden in
-that window. The exit code now has one owner, `tools/gate.sh`, and
-`just check-recipes` fails on a test recipe that carries `||` or a bare
-`cargo test`, and (through `tools/recipes.py check`, `cargo metadata` on the Mac, no build) on a
-`--bin`, `--test`, `-p` or feature that names nothing, a runner name the recipe does not build, a
-script not in the tree, a `gate-*` recipe with no cargo target, a bin built without its
-`required-features`, or a `gate-*` recipe that runs its binary with `cargo run` (no bound, no
-runner's exit code); it also runs every Python tool's self-test under `tools/`, and fails on a
-tool that grows one without being listed there.) GPU gate binaries have the same bound through their own
-runner, `tools/gpu-gate.sh`: it takes a card's gate lock, runs the
-binary under `timeout --kill-after=10 900` (`BLOOMERY_GATE_BOUND`: whole seconds from 1 up,
-one parser for the three runners in `tools/gate-bound.sh`; any other value, empty included,
-ends the runner with 64 before the binary runs), and
-returns the binary's exit code (124/137 timed out, 75 lock contention, 69 a lock
-file it cannot open: not root on the box).
-There is one lock per card: `/root/bloomery-gate.lock` (the 3090) and
-`/root/bloomery-gate-a6000.lock`. The cards box.sh put in view decide the lock
-(2026-09-27: a two-card load that held the 3090's lock alone shared the A6000
-with another track's `any` gate, which ran out of memory): under `BLOOMERY_CARD=a6000|both` the runner takes that card's lock, or
-both locks for `both` — the 3090's, then the A6000's while holding it (every other run holds one lock,
-so the order cannot deadlock) — and refuses (64) a
-`BLOOMERY_GATE_CARD` that names another card, so the two-card
-`stage-gpu-load-v41*` recipes need no card of their own. Under box.sh's default
-pin `BLOOMERY_GATE_CARD=3090|a6000|any`
-picks (the runner's default is `3090`; since 2026-09-25 the recipes that do
-not need the V4.1 gate placement — the qwen3moe gates, `gate-gpu-gemm`,
-`gate-gpu-e2e`, `gate-gpu-p6`, `gate-gpu-ds41-chain-ffn`, `gate-gpu-vision`,
-`gate-gpu-dspark-kv` — default to `any`); `any` takes an idle A6000 when no timing lease is
-held, else the 3090, so a gate that names no card does not queue behind a
-V4.1 `--place gate` gate, which can only run on the 3090. Pass it through
-`BLOOMERY_BOX_ENV`. One hung GPU gate used to stall every track through the
-single lock; `just check-recipes` fails on a recipe that takes a lock itself.
+## Derive first, measure the gap
 
-## Derive first, measure the gap (2026-09-22)
-
-A round opens with a prediction, not only an end number: the value and band
-derived from the cost and error models in `docs/plan.md` (section 「모델」),
-and the proof its change class needs. Measurement checks the prediction; when
-it misses, which term of the model was wrong is the round's finding. Looking
-back, several closed rounds were arithmetic before they were code — A4d's 8.3 %
-occupancy is 4 warps of 48 on the SMs its 18 blocks reach; A3f's f16 lever
-could not win on a kernel already at ~700 GB/s.
+A round opens with a prediction: the value and band derived from the cost and error models in `docs/plan.md`
+(「모델」), and the proof its change class needs. When the measurement misses, which term was wrong is the finding.
 
 | Change class | Proof | Runtime gate | Timed A/B |
 |---|---|---|---|
-| move, split, rename (semantics kept) | `just ptx-scan` table identical — that proves the kernels only; host dispatch code also needs its structural lines unchanged (graph node count, eager = replay, e2e set identical) | none beyond those structural lines | none |
-| delete (a settled arm, a dead entry, a museum bin; rebuild wave 1, 2026-09-26) | `just ptx-scan` of `generate_ds41` and `gate_e2e` equals the base minus exactly the deleted entries — every remaining row and md5 identical — and `just gate-ptx-spill` is red on exactly those rows before `ptx-shapes.tsv` loses them and green after; per deleted entry, the grep that shows no caller left. A remaining entry whose md5 moves makes the change more than a deletion: it lands only when `tools/ref/ptx-canon.py` prints `reordered-only` for it (the same canonical lines, independent instructions in another order) and its resource columns are equal (wave 1: `flash_latent`, `flash_latent_q8` after the `TWICE` scaffolding left `latent_range` — one loop-counter init moved above two constants) | the owning gates of what the deletion touched — for an entry whose md5 moved, its owning gates bit-identical to the base; a removed gate, case or arm is a coverage change and its commit carries the dated reason (the verdict or the grep that retires it) | none |
-| add (a new kernel family or entry with no caller in the engine yet; rebuild wave 3, 2026-09-27: the k-quant expert family's Q5_K entries) | `just ptx-scan` of `generate_ds41` and `gate_e2e` equals the base **plus exactly the new entries** — every existing row and md5 identical; `just gate-ptx-spill` red on exactly the new rows before `ptx-shapes.tsv` gains them and green after; the family's own gate green with FAIL-first shown per clause (a mutant per rule the clause pins) | the new family gate, and the owning gates of any entry the engine bins gained | none — an added kernel with no engine caller moves no step |
+| move, split, rename | `just ptx-scan` identical; host dispatch code also keeps its structural lines (graph node count, eager = replay, e2e set identical) | none beyond those lines | none |
+| delete | ptx-scan of `generate_ds41` and `gate_e2e` = base minus exactly the deleted entries; `gate-ptx-spill` red on exactly those rows before `ptx-shapes.tsv` loses them; per entry, the grep that shows no caller. A remaining entry whose md5 moves needs `tools/ref/ptx-canon.py` = `reordered-only` and equal resource columns | the owning gates of what it touched (bit-identical for a moved md5); a removed gate, case or arm is a coverage change with a dated reason | none |
+| add (no engine caller yet) | ptx-scan = base plus exactly the new entries; `gate-ptx-spill` red on exactly them before pinning; the family gate green with FAIL-first per clause | the new family gate, and the owning gates of entries engine bins gained | none |
 | integer-path reorder | bit-identical by associativity | the owning gate once | none |
-| launch count only | Δt = ΔN × c_node, predicted | the owning gate | once, only if occupancy moves too |
-| fold a launch's work into a neighbour kernel | Δt = −ΔN × c_node − the removed kernel's time + the work every block of the host grid now repeats or waits on × its blocks; a grid already near ~700 GB/s pays that last term in full | the owning gate | once (qwen3fuse set that term to 0: two folds predicted faster, each measured +0.13 ms) |
+| launch count only | Δt = ΔN × c_node | the owning gate | once, only if occupancy moves too |
+| fold a launch into a neighbour | Δt = −ΔN × c_node − the removed kernel's time + the work every host-grid block now repeats or waits on × its blocks (paid in full on a grid near ~700 GB/s) | the owning gate | once |
 | instruction count on a kernel near ~700 GB/s | model says 0 — do not open the round | — | — |
-| occupancy / geometry | occupancy computed from regs, smem, threads, SM count (ptxas `-v`) and written in the spec | the owning gate | once, to confirm |
-| float sum order or precision | the error model (σ against `exact-forced-32.tsv`, a diagnostic — see the next section) | `gate-gpu-e2e` count pin | once, to confirm |
+| occupancy / geometry | computed from regs, smem, threads, SM count (ptxas `-v`), written in the spec | the owning gate | once |
+| float sum order or precision | the error model (σ against `exact-forced-32.tsv`, a diagnostic) | `gate-gpu-e2e` count pin | once |
 
-Two habits precede every round's code (user, 2026-09-25). First, decompose on
-paper: the terms come from the code (byte, instruction, launch and loop
-counts) and from numbers already measured; a box run is for the one term the
-derivation cannot fix, named with its expected value before it runs — tests
-are expensive, and what arithmetic settles is not resolved by experiment.
-`lease_take` enforces it (user, 2026-09-26): a run without a prediction card
-(`BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/<slug>.card'`; the format,
-the kinds and the exit codes are in `tools/ref/card.py`) gets no lease, an A/B
-whose predicted effect sits inside the ruler at its round count is refused
-before it starts, and a job that holds the lease without a runner goes through
-`tools/ref/lease-hold.sh` — a raw `flock` on the lease file is not a lease. A child a runner starts keeps
-the lease (descriptor 9 is inherited) until it exits, so a heavy orphan stalls the next runner instead
-of sharing the box with it; the waiter names every holder (pid, exe, cwd, age, its card) within seconds
-and once a minute, and every child under the lease runs under a `timeout` bound.
-Second, draw the resource timeline: per unit of work, how long the host CPU,
-the card SMs, PCIe, host DRAM and NVMe are each busy, and whether the wall is
-their sum or one resource's max; then ask whether the flow should change —
-asynchrony, bulk, SIMD, SIMT — before a term is shortened. A term under
-another resource's shadow is worth 0. The V4.1 prefill timeline and its
-ladder are the worked example (`docs/plan.md` 「흐름 모델」).
+Two habits precede every round's code. **Decompose on paper:** the terms come from the code (byte, instruction, launch,
+loop counts) and numbers already measured; a box run is for the one term derivation cannot fix, named with its expected
+value. `lease_take` enforces it: a run without a prediction card
+(`BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/<slug>.card'`; format, kinds and exit codes in `tools/ref/card.py`)
+gets no lease, an A/B whose effect sits inside the ruler at its round count is refused, and a lease without a runner
+goes through `tools/ref/lease-hold.sh` (a raw `flock` on the lease file is not a lease). A runner's child keeps the
+lease (fd 9) until it exits; the waiter names every holder within seconds, and every child runs under a `timeout`.
+**Draw the resource timeline:** per unit of work, how long the host CPU, card SMs, PCIe, host DRAM and NVMe are each
+busy, and whether the wall is their sum or one resource's max; ask whether the flow should change (asynchrony, bulk,
+SIMD, SIMT) before a term is shortened. A term under another resource's shadow is worth 0
+(worked example: `docs/plan.md` 「흐름 모델」).
 
-The busiest unit is not the bound until the step's cycles are its demand.
-Before a round shortens one unit's term (bytes, wavefronts, instructions on
-one pipe), write every unit's demand next to the step's cycles in the same
-unit (cycles an SM or a scheduler). When the largest demand is well under the
-step, the step is latency the resident warps do not hide, and a lever on that
-unit predicts 0 until occupancy or ILP changes. Case (2026-09-26, rig-log
-09-26#q3gemma-ab): `gemm_q4k`'s L1TEX was the top unit at 70.6 %, about 2,450
-of ≈ 3,530 cycles a block-step; lever A cut its wavefronts 39 % and the
-elapsed cycles did not move.
+The busiest unit is not the bound until the step's cycles are its demand: write every unit's demand next to the step's
+cycles in the same unit; when the largest is well under the step, the step is latency the resident warps do not hide,
+and a lever on that unit predicts 0 (rig-log 09-26#q3gemma-ab: L1TEX wavefronts −39 %, cycles unmoved).
 
-Measurement comes first only for the named residue: hardware faults (Xid 79),
-compiler register allocation, cache effects with no mechanism yet. Anything
-fixed at build time (node count, launch count, per-kernel instructions and
-registers) is a compile-time ratchet and is not re-measured at runtime.
+Measurement comes first only for the named residue: hardware faults (Xid 79), register allocation, cache effects with
+no mechanism yet. Build-time facts (node, launch, instruction, register counts) are compile-time ratchets, not runtime
+measurements. Every number carries its conditions — `tok/s @ n=N, depth D, card` — or it is not a number.
 
-Every number carries its conditions — `tok/s @ n=N, depth D, card` — or it is
-not a number: the n=32 vs n=96 ratios lost on 2026-09-22 were a units error.
+## Performance first, accuracy opt-in
 
-## Performance first, accuracy opt-in (user, 2026-09-22)
-
-When a choice trades speed against closeness to the exact result, the default
-is the faster one, and the engine carries only that path. A more exact variant
-is not built into the engine as a second path; it lives on the verification
-side, in the f64 referee (`exact_ref --act f64|ours|ik|ik16` simulates each
-rounding rule). Bug hunting compares the engine with the simulation of its own
-rule (`--act ours`): a position off by more than σ is a bug candidate, one
-within σ is rounding. Accuracy measures (σ, forced_exact buckets) are
-diagnostics that tell how far the default sits from the truth; they do not
-block a performance change. The only accuracy pins are bug catchers — the
-existing forced_exact count pin and the reference gates — not a precision
-ranking to ratchet down. Case that set it: the 32-value activation block
-(errsrc) would bring σ from 0.378 to ~0.26, ik's level, but costs 4× the
-activation scales, a re-pin of every bit gate and a CPU/GPU rule split; an
-opt-in GPU path was considered and dropped (a second path needs its own gate
-to not rot), so 32-value exists only as `exact_ref --act ik`.
+When a choice trades speed against closeness to the exact result, the default is the faster one, and the engine carries
+only that path. A more exact variant lives on the verification side, in the f64 referee (`exact_ref --act f64|ours|ik|ik16`). Bug hunting compares the engine with the simulation of its own rule (`--act ours`): off by more than
+σ is a bug candidate, within σ is rounding. Accuracy measures (σ, forced_exact buckets) are diagnostics and do not block
+a performance change; the only accuracy pins are bug catchers (the forced_exact count pin, the reference gates).
 
 ## Parallel tracks (subagent rounds)
 
-Independent rounds run as git worktrees, each with its own remote directory via
-`BLOOMERY_REMOTE='~/repo/bloomery-<track>' tools/box.sh '...'` — the protocol
-box.sh's header already reserved. Lease-taking measurements (decode-measure,
-profile-of-record) stay with the main track: the lease is machine-wide, so
-measurement is serialized by design.
+Independent rounds run as git worktrees, each with its own remote directory
+(`BLOOMERY_REMOTE='~/repo/bloomery-<track>' tools/box.sh '...'`). Two trees never share one remote dir. Lease-taking
+measurements stay with the main track.
 
-**Every box command waits for a sitting.** `tools/box.sh` runs `lease_guard`
-(`tools/ref/lease-probe.sh`) on the box before its command, in the same ssh:
-while the timing lease is held or a hold `/root/bloomery-<owner>-hold` is up,
-the command waits — naming what is up at once and once a minute, polling every
-30 s, starting after two quiet polls in a row — and exits 75 after
-`BLOOMERY_BOX_WAIT` seconds (default 1800; 0 does not wait). A sitting of
-several runs puts its hold up first and exports `BLOOMERY_HOLD_OWNER=<owner>`,
-which passes its own hold only; of two holds up at once, the later one gives
-way. A command that builds nothing and must run beside a sitting (`ps`, `tail`,
-`nvidia-smi`, `just box-gc`) passes with `BLOOMERY_BOX_READONLY=1`, which
-refuses a command naming cargo, just, make, cmake, ninja or `target/`. It
-syncs nothing — the command runs in the remote directory as it is, and one that
-is not there is refused (66) — so a script it needs goes over stdin (`just
-box-gc` sends `tools/box-gc.sh` that way). The lease's one probe is `lease_free`, a shared lock: an exclusive `flock -n <lease>
-true` is a take for a few ms and reads a free lease as held beside another
-probe (429 of 1,000 parallel probes on the box, 2026-09-26).
+**Every box command waits for a sitting.** `tools/box.sh` runs `lease_guard` (`tools/ref/lease-probe.sh`) first: while
+the timing lease or a hold `/root/bloomery-<owner>-hold` is up, the command waits (naming what is up, polling every
+30 s, starting after two quiet polls) and exits 75 after `BLOOMERY_BOX_WAIT` seconds (default 1800; 0 does not wait). A
+sitting puts its hold up first and exports `BLOOMERY_HOLD_OWNER=<owner>`; of two holds, the later gives way. A command
+that builds nothing (`ps`, `tail`, `nvidia-smi`, `just box-gc`) passes with `BLOOMERY_BOX_READONLY=1`, which refuses
+cargo, just, make, cmake, ninja or `target/`, syncs nothing, and is refused (66) in a remote dir that is not there.
+The lease's one probe is `lease_free`, a shared lock; never probe with an exclusive `flock -n`.
 
-**Batch only the overlap; land the rest as it comes** (user, 2026-10-01). The cost to cut is a
-gate run that repeats. Before landing, run `just affected` on each pending piece (a commit or a
-branch) and sort the pieces:
-- **Express.** A piece whose gate set is small (a predicted wall of 15 minutes or less), or
-  disjoint from every other pending piece's, lands alone as soon as it is Mac-green. It runs its
-  own `tools/gate-batch.sh --ledger`, ff-merges and pushes, and never waits for a train.
-- **Train.** Only pieces whose sets overlap wait and land together. A change in `crates/gpu`,
-  `crates/model` or `crates/levers` selects 77–119 gates, and one run of the union replaces one run
-  per piece. T2 is the worked case: 44 commits, 2,429 gate runs one by one, against a union of 119.
+**Batch only the overlap; land the rest as it comes** (user, 2026-10-01). The cost to cut is a gate run that repeats.
+Before landing, run `just affected` on each pending piece and sort:
+- **Express.** A piece whose gate set is small (predicted wall ≤ 15 min) or disjoint from every other pending piece's
+  lands alone as soon as it is Mac-green: its own `tools/gate-batch.sh --ledger`, ff-merge, push.
+- **Train.** Only pieces whose sets overlap wait and land together; one run of the union replaces one run per piece
+  (`crates/gpu`, `crates/model`, `crates/levers` select 77–119 gates).
 
-The two lanes do not undo each other's work. A rebase moves only the keys of gates whose closure
-holds the landed files, so an express landing leaves a train's greens standing. The box already
-schedules small runs: one gate lock per card, the timing lease, and `any` recipes placed on an
-idle card. A gate set therefore needs no window of its own. A hold is for a timing sitting, the
-case its header names; a functional window of gates and mutants takes the card locks only, so
-it never parks another track's small run behind it. Rounds run their owning gates the same way,
-through `--round-ledger`. The same rule applies inside a gate: a clause another gate already pins,
-a model load a sibling arm repeats, or a gate the ptx-scan shows untouched is duplicate work to
-remove, not to schedule around.
+A rebase moves only the keys of gates whose closure holds the landed files, so an express landing leaves a train's
+greens standing. The box already schedules small runs (one gate lock per card, the timing lease, `any` on an idle
+card), so a gate set needs no window of its own; a hold is for a timing sitting only. Rounds run their owning gates
+through `--round-ledger`. Inside a gate too, a clause another gate pins, a load a sibling arm repeats, or a gate the
+ptx-scan shows untouched is duplicate work to remove.
 
-Track checklist, first and last:
+**Track checklist.**
+1. First: `just box-gc` (an orphaned test binary can hold the cargo build lock forever).
+2. Run long box commands through `gate-*` recipes or under an explicit `timeout`. box.sh's guard prints `[guard]` lines
+   while it waits, so minutes of silence mean a hang on the box: check `just box-gc --dry-run` (it selects by
+   `/proc/<pid>/exe`; a `pgrep -f '<dir>'` matches its own shell).
+3. Last: `just box-gc`, remove the worktree, then `just box-tracks --remove <track> [<track>-<suffix>…]`. It removes
+   only the names given, each only if still stale, never a directory a process runs in; a bare `--remove` is refused.
+   An auxiliary dir is `bloomery-<track>-<suffix>` and goes only after its track's worktree.
 
-1. **First**: `just box-gc` — clear anything a previous track left under this
-   remote dir. An orphaned test binary can hold the cargo build lock and make
-   every later command wait forever.
-2. **Always** run long box commands through the `gate-*` recipes or with an
-   explicit `timeout` — never bare `cargo test` at a prompt you are not
-   watching. A command waiting for a sitting is not silent (box.sh's guard
-   prints `[guard]` lines at once and once a minute), so if a command produces
-   no output for minutes, assume it is hung on
-   the box, not thinking: check `just box-gc --dry-run` (it selects by
-   `/proc/<pid>/exe`, never by cmdline — a `pgrep -f '<dir>'` also matches the
-   shell that runs it).
-3. **Last**: `just box-gc` again, remove the worktree, then `just box-tracks
-   --remove <track> [<track>-<suffix>…]` — a removed worktree leaves its remote
-   directory (and a `target/` of several hundred MB) behind on the box. It
-   removes only the names given, each only if it is still stale when it runs;
-   a stale directory not named is printed and kept (another session's track
-   can turn stale between your listing and your remove), and a bare
-   `--remove` is refused. A track's auxiliary remote directory (a `git archive`
-   base tree, say) is named `bloomery-<track>-<suffix>`: `box-tracks` lists
-   it as `aux` of the live track and can remove it only after that track's
-   worktree is gone, and it never removes a directory a process runs in
-   (an exe under its `target/`, or a cwd inside it — a build in progress).
+A quiet agent is a symptom: the first suspect is a hung gate on the box.
 
-A quiet agent is a symptom, not a state: when a subagent goes inactive, the
-first suspect is a hung gate on the box, not the agent.
+## Sessions, tracking and delegation
+
+- **Open work has one owner, `docs/plan-triage.md`.** The self-hosted tracker's **MUL** project holds only stage
+  milestones (MUL-1 to MUL-5), machine changes (MUL-6) and upstream work (MUL-7), never a copy of a triage item:
+  `GADAK_HOME=$HOME/.gadak gadak --workspace gdk` (on the Mac `/opt/homebrew/bin/gadak`); comments are
+  `gadak --workspace gdk comment <KEY> "<body>"` (not `issue comment`). Do not open `TODO.md`.
+- **Records.** A round's detail (sitting tables, [derived] predictions, round names) lives in this repo's docs. A
+  [rig-log](https://github.com/midagedev/rig-log) `log/` section holds what was measured on this machine and links here;
+  read `~/repo/rig-log/CLAUDE.md` before writing one. rig-log is public: grep for `192.168`, `100.` addresses, `.ts.net`
+  and `admin` before committing; never BMC addresses, credentials or the box's nvidia-bug-report archive. Disclose AI
+  help in prose; rig-log commits pass `tools/check-log.py`.
+- **Delegation.** Spec-able rounds go to GLM-5.3 through the `outsource` skill (`--effort max`, claude-code harness, one
+  worktree per track); investigation-only rounds may go to agy; opus subagents (`model:"opus"` stated) are the
+  exceptions: vision, multi-turn cause narrowing, re-judging a verdict that disagrees with its instrument. Round
+  operation is `docs/plan.md` 「라운드 운영」. Copy the relevant clauses of this file into the spec. A delegate's report
+  is not evidence: count the tool calls in its transcript and read its worktree's `git status`, then re-run the gates
+  under the lead's ownership. Commits and pushes are lead-only.
 
 ## Layout
 
-    crates/gguf/           GGUF reader, dequant, per-weight-type activation format
-    crates/threads/        resident pinned worker pool (spin, then park)
-    crates/qdot/           fused quantized dot kernels, AVX2: Q3_K x q8_K,
-                           Q4_K/Q5_0/Q5_1/Q6_K x q8_2_x4, Q8_0 x Q8_0 cells
-    crates/model/          the engine: ops (matmul_q), attn (MLA, flash), ffn,
-                           moe, head, forward, kv, derived, profile; bin
-                           bloomery-decode; tests/ are the gates
-    crates/tokenizer/      byte-level BPE from the GGUF header, bit-identical to
-                           llama-tokenize (gate-tokenizer); bin bloomery-tokenize
-    crates/sampler/        the sampling chain in the reference's order (gate-sampler)
-    crates/runtime/        the generation loop, host only: Target/Verify/Draft, the
-                           plain and speculative advances, Lookup, Stop (gate-runtime)
-    crates/app/            Session<B> over a GpuModel: open, plan, capture, and the
-                           card draft (DSpark) for V4.1 (gate-app)
-    crates/serve/          llama-server-compatible HTTP API over an Engine trait
-                           (gate-serve on a mock engine); bin bloomery-serve
-    crates/refset/         the reference sets the gates compare against: one reader per kind
-                           (ik node dumps, DSpark draft sets, greedy files, KLD bases, the vision
-                           set), each set refused by name unless it was dumped from the file the
-                           tree runs; the family table per architecture under src/arch
-    crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile;
-                               excluded from the workspace on purpose
-    tools/ref/             C++ harnesses linking ggml: ground truth and baseline
-    tools/bloomery/        the Python side's one reader per fact: records.py (record lines),
-                           manifest.py (reference-set manifests, by column name)
-    tools/box.sh           the only way code reaches the workstation
-    tools/gate.sh          the gate runner: 900 s bound, cargo's own exit code
-    tools/gpu-gate.sh      the GPU gate runner: gate lock, 900 s bound, the binary's exit code
-    docs/plan.md           what is live: state, waves, cost model, release
-    docs/facts.md          machine, model file and toolchain facts the plan rests on
-    docs/plan-triage.md    open items, grouped by the round that takes them
-    docs/plan-ledger.md    what is closed, moved verbatim out of plan.md
-    docs/research/         sourced surveys behind the conventions here
+    crates/gguf/        GGUF reader, dequant, per-weight-type activation format
+    crates/threads/     resident pinned worker pool (spin, then park)
+    crates/qdot/        fused quantized dot kernels, AVX2
+    crates/model/       the CPU engine (ops, attn, ffn, moe, head, forward, kv, derived, profile); tests/ are the gates
+    crates/tokenizer/   byte-level BPE from the GGUF header, bit-identical to llama-tokenize
+    crates/sampler/     the sampling chain in the reference's order
+    crates/runtime/     the generation loop, host only: Target/Verify/Draft, plain and speculative advances
+    crates/app/         Session<B> over a GpuModel: open, plan, capture, the card drafts
+    crates/serve/       llama-server-compatible HTTP API over an Engine trait
+    crates/refset/      the reference sets' readers and the family table per architecture (src/arch)
+    crates/gpu*/        the card engine and its per-family crates; gpu-gates holds the GPU gates and bins
+    crates/oxide-ice-unroll/   a compiler-bug reproducer that must NOT compile; excluded from the workspace
+    tools/ref/          C++ harnesses linking ggml, and the lease runners
+    tools/bloomery/     the Python side's one reader per fact: records.py, manifest.py
+    docs/plan.md        what is live; docs/facts.md machine and toolchain facts; docs/plan-triage.md open items;
+                        docs/plan-ledger.md what is closed; docs/research/ sourced surveys
 
 ## Conventions
 
-- **No silent failure** (user, 2026-09-24: "나는 조용한 실패를 극혐해"). Undefined
-  input gets a named panic or error, never a defined output: an activation block
-  with a NaN or an infinity does not quantize to code 0, a NaN router lane does
-  not yield duplicate ids, an out-of-range index is not clamped to a plausible
-  row. When a fix offers "both paths give the same defined output" against "a
-  named error", take the error, even when it costs an API change. A device
-  kernel that cannot panic writes a flag the host checks at the next sync and
-  turns into the same named error. That flag is the fault word
-  (`crates/gpu/src/fault.rs`): one `u32` per `Gpu`, `(layer << 8) | site` by atomic
-  min, copied next to the token by the head's argmax so the step's readback carries
-  it for free; `Head::tokens` returns `GpuError::Fault`, and the model stays
-  `Poisoned` until `reset`. A kernel that meets undefined input raises it and keeps
-  its memory accesses defined; it never writes a plausible value.
-- Correctness is defined against ggml, not against intuition: kernels must match
-  its output within the relative-error band recorded in each crate's RESULTS file.
-- **GPU-stage toolchain defects and gaps (cuda-oxide, cutile-rs's cuda-core/cuda-bindings) go
-  into `docs/upstream/nvlabs-ledger.md` the moment they are met** — one line, before any
-  workaround is written; a workaround erases the evidence. The user wants these as upstream
-  issues/PRs; the ledger is where the lead triages them. A cuda-oxide defect that shapes our
-  code is then fixed in our fork as it is met (user, 2026-09-27: "oxide는 패치해가면서 쓰고
-  있으니 결함은 패치해가면서 써"): one fork commit on the `bloomery` branch with its reproducer
-  and FAIL-first, the pin moved as the cuda-oxide bullet below says, and a workaround kept only
-  until that commit lands, and the round that moves the pin removes it; the upstream PR follows
-  at the maintainers' pace.
-- **Code shape is judged by `docs/rust-quality.md`** (numbered rules R1–R29: unsafe scope,
-  unit-carrying types, error enums per crate, clippy ratchet, refactor = bit-identical gates +
-  same-lease A/B). Review reports cite rule numbers; the warning baseline in Known state only
-  goes down.
-- **Comments state what is true now, not how we got here.** Keep: `// SAFETY:`
-  (the invariant, one to three lines); one line of *why* for a non-obvious
-  choice; "this order is the gate" on a load-bearing float reduction; the
-  contract a caller must meet. Remove: issue numbers, dates, measured
-  ms/GB/s/tok/s, "until round N this was…", how a bug was found. That history
-  lives in rig-log and the commit message; a comment repeating it is dual
-  bookkeeping that rots. One exception, and it is the existing contract: a
-  re-pinned gate constant (band, tolerance, `KNOWN_DIVERGENCE`) keeps its dated
-  one-line attribution, marked `PIN(YYYY-MM-DD):`. `tools/check-comments.sh`
-  fails on an issue number or a date in `crates/*/src` outside a `PIN` line.
-- **Tests are the gates, and only the gates.** One test per contract; shared
-  harness code lives in `tests/common`. No print-only tests, no second test
-  pinning what another already pins. Removing a gate is a coverage change and
-  needs the same dated reason as relaxing one.
-- **Record lines have one owner.** Every line `generate_ds41`, `bloomery-chat`,
-  `bloomery-serve-ds41` and the prefill gate's split print is a `Kind` in
-  `crates/gpu-gates/src/record.rs`, rendered by `Record`, which panics by name on a
-  value out of order, missing or of another type; `<bin> --records-schema` prints
-  the kinds. Readers go through `tools/bloomery/records.py` by kind and field,
-  never by a column or a pattern. `generate_ds41 --plan` prints the prompt call's
-  `call …` records and exits before the load; a batched run prints `call plan` and
-  `call batch` before its load and stops with a named error when the call it ran
-  had other needs than its printed plan. Under `BLOOMERY_STEP_STATS=1`,
-  `tools/flow/ds41_prefill.py --counts <log>` holds the flow model's queue-entry
-  counts to the engine's `stat prefill front` and `stat prefill lb` records.
-- **Reference sets have one reader.** A gate, a test or a tool reads an oracle set only
-  through `crates/refset` (Rust) or `tools/bloomery/manifest.py` (Python), by the column
-  names its header lines give, never by position. Every set opens through its family's
-  check (`crates/refset/src/arch`), which refuses by name a set dumped from another model
-  file (the first shard's full path is the identity: two quantizations of one model can
-  share their shard names), of another ik build or architecture, or without its completion
-  trailer. A new kind
-  of set is a new family row with its writer's recipe, not a parser in the gate.
-- **A feature-gated bin says so to cargo.** A `crates/gpu-gates` bin whose `main` sits behind a
-  feature declares `required-features` in the crate's `Cargo.toml`: cargo refuses to build it
-  without them instead of linking the stub `main` over the working binary (twice a scan built a
-  host-only `generate_ds41` over a track's binary). `just check-recipes` holds every recipe's
-  features to them.
-- **Do not split a `#[target_feature]` kernel body into helpers** (measured:
-  10-13 % loss). Orchestration code is ordinary Rust: a function that no longer
-  fits on two screens gets split.
-- **An unprofiled chunk takes no lock and reports nothing.** Per-chunk
-  collectors (`Mutex<Vec<_>>`) are for `BLOOMERY_PROFILE` and for errors only:
-  balanced chunks finish together, so an unconditional lock at the end of each
-  is a futex convoy per dispatch. The symptom is a flat thread-scaling curve
-  (8 threads as fast as 32) — `SWEEP="8 16 24 32" just measure-decode` is the
-  first question to ask of any dispatch-path slowness.
-- **No gate guards speed, so a round that touches the dispatch path ends with
-  a same-lease A/B.** Build the base commit in a worktree (`just build-decode`
-  there), then `just ab-decode bloomery-<track>` from the changed tree; judge
-  by the interleaved relative numbers only — the same commit moves ~5 % between
-  windows. Bit-identical is not speed-identical: an expression moved from a
-  write-into-zeros loop to `map().collect()` doubled its site. The runner
-  rotates arm order every round and prints per-arm means: in a fixed order the
-  round's first arm read 0.3–0.8 % slow (same-binary A/A), enough to flip a
-  small verdict. `BLOOMERY_AB_ENVS="K=V;K=V"` adds same-binary arms that differ
-  only by a lever — put an A/A arm in whenever the claim is under 1 %.
-- **Know the ruler before reading it.** Same-binary runs scatter with SD
-  0.6 % (18 runs, 2026-09-21), so the 95 % interval on a difference of two arm
-  means is ±1.0 % at four rounds and ±0.8 % at six; ~~±0.5 % takes about 23
-  rounds per arm, ±0.3 % about 63~~ ±0.5 % takes 13 rounds per arm and ±0.3 %
-  takes 32 (corrected 2026-09-26: 23 and 63 used √(4/N); the difference of two
-  arm means has SD sd·√(2/N), and with t(0.975, 2N−2), the form that gives
-  ±1.0 % and ±0.8 %, the counts are 13 and 32 [derived]; `tools/ref/card.py`
-  computes it for a card). Report the effect and its interval, not a
-  win count — 4/4 is p = 0.06 by the sign test. Under 1 %, judge only between
-  same-binary lever arms: two builds differ by link layout alone.
-- **Prefill is a headline metric beside decode** (user, 2026-09-25: "특히 프리필이 진짜 중요한데";
-  for V4.1 and Qwen3 alike). Every model's public numbers carry prompt
-  processing — `pp tok/s @ P = 512 and 4096, card` — next to decode tok/s, for
-  ours and the reference engines in one lease; a round that touches a path the
-  prompt runs through is judged on it. ~~As of this date V4.1 feeds the prompt one
-  decode step per token (no batched prefill) and Qwen3 prefills eagerly in passes
-  of at most 8 positions, so neither number has been measured yet.~~ Since
-  2026-09-25 (`dfa8b5d`) Qwen3 runs a prompt of P ≥ 9 in ubatches of 512 through
-  the grouped int8 GEMM: pp512 5,304 and pp4096 2,615 tok/s on the A6000
-  (llama.cpp 4,256 / 4,170, `-ub 4096` 6,864; rig-log 09-25#qwen3prefill-ab),
-  and since `54ef56e` (q3pflash, a prefill attention kernel) pp512 6,236 and
-  pp4096 5,557 (llama.cpp 4,320 / 4,204 in the same lease; rig-log
-  09-25#q3pflash-ab), and since `ded6c51` (q3ubatch, ubatches of up to 4096
-  tokens, a load-time size) pp512 6,402 and pp4096 7,490 (llama.cpp 4,318 /
-  4,205, `-ub 4096 -b 4096` 6,904 in the same lease; rig-log 09-25#q3ubatch-ab), and since `ef00f78` (q3router, the ubatch router logits as register tiles, 1.19 → 0.281 ms a launch) pp512 6,815 and pp4096 8,024 (llama.cpp 4,267 / 4,191, `-ub 4096 -b 4096` 6,872 in the same lease; rig-log 09-26#q3router-ab), and since `ccdd3dc` (q3gemmb, `gemm_q4k`'s step in fewer instructions) pp512 7,706 and pp4096 8,818 (main's binary 6,803 / 7,955 in the same lease, 1.133 ± 0.005 / 1.108 ± 0.009, no reference rows in that lease; rig-log 09-26#q3gemmb-ab), and since `031b842` (q3swz with q3fa's `b00af8f`: the prefill flash in fewer instructions, its K/V tiles XOR-swizzled, its query prologue converted in pairs, bit for bit) pp512 7,854 and pp4096 9,268 (`4786c1e`'s binary 7,714 / 8,838 in the same lease, 1.018 ± 0.009 / 1.049 ± 0.004, no reference rows in that lease; rig-log 09-26#q3swz-pp);
-  ~~V4.1 still feeds one decode step per token (batched prefill in flight).~~ Since
-  2026-09-25 (`43cd107`) V4.1 runs a prompt in batches of up to 512 positions, bit for bit the
-  decode steps' state: pp512 91.2 and pp4096 89.2 tok/s on the A6000 plan (a), 2.97x the step
-  feed; the host union is two thirds of the wall (rig-log 09-25#ds41batch-pp; that lease's
-  reference rows were void, re-sat at the next wave boundary). Since 2026-09-25 (round `ds41ced`) the
-  prompt call runs each layer only at the positions a later reader needs — the CED triangle,
-  `body/ced.rs`; `BLOOMERY_CED=off` is its same-binary arm — predicted +2…+7 % at P = 512 and
-  +35…+54 % at P = 4096 over the `off` arm [derived], ~~measured at the wave boundary~~ measured
-  the same evening on `e4d0aae` (h1fold, unionreal, CED, oxcpu): pp512 **109.9**, pp4096 **152.8**
-  (CED off 104.7 / 102.6, so +5.0 % / +49 %; ~~llama.cpp 77.6 / 76.2 in the same lease~~ the same
-  lease's reference rows read the file cold after our arms — llama.cpp's clean values are the
-  morning's 104.6 / 103.8, so ours is 1.05× / 1.47×; host union 76.1 ms/layer at 512 columns,
-  31.5 µs/slot; rig-log 09-25#v41-prefill-resit, #v41-prefill-resit-b). Since `9d61a13` (ds41bulk: the T-row router,
-  one places launch per layer-batch, each card expert read once per layer-batch) pp512 **121.4** and pp4096
-  **169.4** (the pre-landing binary 111.3 / 155.8 in the same lease, +9.1 % / +8.7 %; the `slot` arm does not
-  separate; rig-log 09-25#v41-prefill-s14); all of the gain is outside the host union, and what remains
-  outside it is the card route before the union, 30.4 ms per layer-batch (~~per-chunk attention and projection
-  launches~~ the per-chunk kernels themselves — every 8-token chunk re-reads the four projections at m = 8; the
-  launch gaps are 1.4–3.6 ms of it [derived, docs/research/cardroute-design-report.md]).
-  Since round `uniondispatch` (the host union in five dispatches a layer-batch instead of 161)
-  pp512 **129.6** and pp4096 **180.0** at the id prefix (main's binary 118.0 / 166.3 in the same
-  lease, 1.098 ± 0.030 / 1.083 ± 0.035, the union 77.1 → 66.7 ms per layer-batch; sitting 14's
-  121.4 / 169.4 ran with a router-frequency card list, so the two pairs do not share a table; rig-log
-  09-26#uniondispatch-ab). Since `2f45a79` (B1: the prompt batch's attention projections once per
-  128-token sub-block instead of per 8-token chunk) pp512 **144.6** and pp4096 **201.0** at the id
-  prefix (the tree before it 130.6 / 182.4 in the same leases, 1.108 ± 0.011 / 1.102 ± 0.011 over four
-  clean rounds; the card route 29.7 → 19.6 ms per layer-batch; rig-log 09-26#b1-pp-ab). Since `237321a`
-  (cardtile, T: the prompt batch's card experts by (slot tile, row tile) blocks) the prose prompt
-  (`corpus-prose.ids`, a router-frequency card list) runs pp512 **216.1** and pp4096 **292.1** against the `expert` arm's
-  173.6 / 250.3 in the same lease (1.245 ± 0.060 / 1.167 ± 0.011 over two rounds; the shadow 45.4 → 23.1 ms
-  per layer-batch at P = 512; prose rows and the lcg rows above do not share a table; rig-log
-  09-26#cardtile-ab). Since `eb3e08a` (prefillgroup, G: batches in pairs, layer by layer, the route
-  enqueued ahead of the host serve across layers too) the lcg prompt at the id prefix runs pp4096
-  **247.5** against the `BLOOMERY_PREFILL_GROUP=1` arm's 201.0 in one lease (rounds 1.177 and 1.232 —
-  round 1's G 2 row was the lease's first run with a 0.7 s colder prologue; the chain ratio 0.814 /
-  0.810; the host's wait for the route 17.8 → 0.8 ms per layer-batch; rig-log 09-26#prefillgroup-ab).
-- **A decode headline names its depth.** tg96 after a 6-token prompt measures
-  the n → 0 end of attention. `tools/ref/depth-decode.sh` runs both engines at
-  each depth in one lease (`BLOOMERY_DEPTHS="6 1024 4096"`, ik via
-  `llama-bench -gp d,96`); 2026-09-21: +1.7 % at depth 6, −15 % at 1024, −39 %
-  at 4096 (3.4 vs 0.87 µs per cached key per step). Any round that touches
-  attention or the KV cache is judged on the deep rows too.
-  For V4.1, `just depth-gpu-ds41 prose:<P>[@K=V,…]` feeds generate_ds41 the first P ids of
-  `corpus-prose.ids` (`--tokens`) instead of the lcg prompt; prose arms are compared only with prose
-  arms of the same P, in their own decode and prefill tables — a lever that moves the card's routed
-  experts (the shadow) is judged on them, because the lcg prompt's routing leaves the shadow under the
-  union. `code:<P>` is the same on `corpus-code.ids`, in its own tables; `BLOOMERY_GEN_PLACE=gate` runs our
-  arms at `--place gate`, with the 3090 as `BLOOMERY_TIMING_GPU`; each reference arm's host set is preheated
-  first (`BLOOMERY_PREHEAT=0` off), rows carry `majflt` and `[cold]`, and a failed arm is a `FAIL` row the
-  runner goes past (rc 1 at the end). `BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks'` runs a cross-engine V4.1 window in
-  engine blocks, each opened by a discarded process that warms that engine's engram rows and host set; the
-  preheat is then off unless `BLOOMERY_PREHEAT=1`. The `card` witness field prints the timing card's SM clock, the active clock-event mask and
-  the cumulative power and thermal slowdown counters (post − pre bounds the arm's capped time), and a
-  `cpu-freq` line (`scaling_cur_freq` mean/min/max over the cores at the block's instant).
-- **The step does no load-time work.** Anything that does not depend on the
-  tokens — tensor lookups, names, metadata keys, views, decoded gains — is
-  resolved once into `Derived`; the calling thread's serial time is the step's
-  length because every worker waits on it. `just gate-alloc` counts allocator
-  calls per steady step and only ratchets down. Activation blocks come from
-  `Tensor2::scratch` (no zero fill) when every cell is written;
-  `BLOOMERY_POISON=1` turns a missed cell into a NaN the gates catch.
-- **Read chunk skew at profile level 1, never level 2.** Level 2 times every
-  row, and the timer tax scales with row count — it inflated "slowest chunk vs
-  mean" from 11 % to 20–40 % and a whole round was aimed at the difference.
-  `span ms` / `slowest ms` and the per-chunk line print at level 1 for this. A
-  microbench µs is not a step µs either: the pool bench went 4.56 → 1.61 µs
-  per dispatch and decode did not move.
-- **Profile the binary you think you are profiling.** `tools/box.sh` syncs
-  source and builds nothing; run `just build-decode` first. `perf record -D`
-  skips startup, not teardown — cut the report with `--time`, or the
-  `munmap` of the populated mapping reads as step cost. Use `-e cpu-clock`
-  (the default IBS event misattributes symbols on this CPU).
-- **Price a serial cost with a doubling probe, not a perf percentage.** A
-  detached worktree, a one-line patch that runs the suspect work twice, `just
-  build-decode` there, then `just ab-decode <that-tree>`: the slowdown is the
-  work's cost per step (a lower bound — the second run is cache-warm). perf put
-  caller-side quantization at 14–15 % of the main thread twice; the probe
-  priced it at 1.3 %. Do this before spending a round on the item.
-- **The line to beat is the reference at its fastest flags, measured
-  interleaved.** `decode-measure.sh` runs ik twice (default, and
-  `IK_BEST_FLAGS`); a difference under 1 % is only claimable from
-  `BLOOMERY_AB_IK=1 just ab-decode` rounds, never from one headline.
-- **Matching the reference's sum order can be faster and exact at once.** The
-  F32 router dot and `rms_norm` were scalar "to keep the bits"; the reference
-  sums in lanes (`dot_f32`) and in f64 (`sum_sq_f64`), and porting that order
-  took both to max|diff| 0 against the oracle. Read the reference kernel before
-  assuming SIMD opens a gate.
-- `rust-toolchain.toml` at the root pins the nightly; it moves only when the
-  cuda-oxide pin moves. `cuda-oxide` itself is pinned by `rev` in
-  `[workspace.dependencies]` (declared against NVlabs) and taken from our fork's
-  `bloomery` branch through `[patch]` — that rev plus patches bound for upstream,
-  listed in `THIRD_PARTY_NOTICES.md`; `just deny` fails if either ever floats. Before
-  the fork's `bloomery` branch moves, the old pin gets the tag `pin/<short rev>` on the
-  fork, and pin tags are never deleted: a rev a past commit pins must stay fetchable. The
-  box never rebuilds the backend in place: `tools/box.sh` exports
-  `CUDA_OXIDE_BACKEND=~/.cargo/cuda-oxide-bloomery/<rev>/librustc_codegen_cuda.so`
-  and a `cargo oxide` command stops (rc 70) when that rev's backend is missing or
-  its `source-rev.txt` names another commit (pinned this way, cargo-oxide no
-  longer compares the backend with the dependency's commit). A pin move whose fork commits
-  leave the backend crate's dependency closure untouched may reuse the previous rev's backend:
-  the copy's md5 and the reason go in that directory's `PROVENANCE`, and `source-rev.txt` then
-  names the rev it serves.
-  A fork patch that changes codegen is a pin move (every gate); one that must not
-  proves it with the `just ptx-scan` tables of `generate_ds41` and `gate_e2e`
-  identical.
-- Open items have one owner, `docs/plan-triage.md` (user, 2026-09-27, `docs/rebuild.md`
-  §7 decision 2); the self-hosted tracker's MUL project keeps the stage milestones,
-  the machine changes and the upstream work, and never a copy of a triage item.
-  Measurements are written up in the rig-log repository first and linked from
-  the item or the issue.
+- **No silent failure.** Undefined input gets a named panic or error, never a defined output: a NaN block does not
+  quantize to code 0, a NaN router lane does not yield duplicate ids, an out-of-range index is not clamped. Take the
+  named error over "both paths give the same defined output", even at the cost of an API change. A device kernel that
+  cannot panic raises the fault word (`crates/gpu/src/fault.rs`: one `u32` per `Gpu`, `(layer << 8) | site` by atomic
+  min, read back with the token); `Head::tokens` returns `GpuError::Fault` and the model stays `Poisoned` until
+  `reset`. The kernel keeps its memory accesses defined and never writes a plausible value.
+- Correctness is defined against ggml: kernels match its output within the band in each crate's RESULTS file.
+- **Toolchain defects** (cuda-oxide, cutile-rs's cuda-core/cuda-bindings) go into `docs/upstream/nvlabs-ledger.md` the
+  moment they are met, before any workaround. A cuda-oxide defect that shapes our code is fixed in our fork as it is
+  met: one commit on the `bloomery` branch with its reproducer and FAIL-first, the pin moved (below), the workaround
+  removed by the round that moves the pin.
+- **Code shape** is judged by `docs/rust-quality.md` (R1–R29); review reports cite rule numbers.
+- **Comments state what is true now.** Keep `// SAFETY:` (the invariant), one line of why for a non-obvious choice,
+  "this order is the gate" on a load-bearing float reduction, a caller's contract. Remove issue numbers, dates, measured
+  ms/GB/s/tok/s and how a bug was found. One exception: a re-pinned gate constant keeps its dated one-line attribution,
+  `PIN(YYYY-MM-DD):` (a band, a tolerance, `KNOWN_DIVERGENCE`). `tools/check-comments.sh` enforces it in `crates/*/src`.
+- **Tests are the gates, and only the gates.** One test per contract; shared harness code in `tests/common`; no
+  print-only tests, no second test pinning what another pins. Removing a gate needs the same dated reason as relaxing
+  one. Gate tests are `hw_`-prefixed and `#[ignore]`d (`.config/nextest.toml` fences them); the `just gate-*` recipes
+  run them.
+- **Record lines have one owner:** a `Kind` in `crates/gpu-gates/src/record.rs`, rendered by `Record`, which panics by
+  name on a value out of order, missing or of another type (`<bin> --records-schema` prints the kinds). Readers go
+  through `tools/bloomery/records.py` by kind and field. `generate_ds41 --plan` prints the prompt call's records and
+  exits before the load; a batched run stops with a named error when the call it ran differs from its printed plan.
+  Under `BLOOMERY_STEP_STATS=1`, `tools/flow/ds41_prefill.py --counts <log>` holds the flow model's queue-entry counts
+  to the engine's `stat prefill front` and `stat prefill lb` records.
+- **Reference sets have one reader:** `crates/refset` (Rust) or `tools/bloomery/manifest.py` (Python), by column name.
+  Every set opens through its family's check (`crates/refset/src/arch`), which refuses by name a set dumped from another
+  model file (the first shard's full path is the identity), another ik build or architecture, or without its trailer.
+  A new kind of set is a new family row with its writer's recipe.
+- **A feature-gated bin declares `required-features`** in `crates/gpu-gates/Cargo.toml`, so cargo refuses to build it
+  without them instead of linking the stub `main`.
+- **Do not split a `#[target_feature]` kernel body into helpers** (10–13 % loss). A helper touching `_mm*` intrinsics
+  is `#[inline(always)]` or carries the attribute itself. `.cargo/config.toml` sets `-C target-cpu=znver3` for plain
+  cargo builds, and `.cargo/cuda-oxide.toml` carries it for oxide builds (`CARGO_ENCODED_RUSTFLAGS` masks the former);
+  `just check-rustflags` holds the two equal. The attributes stay.
+- **An unprofiled chunk takes no lock and reports nothing.** Per-chunk collectors are for `BLOOMERY_PROFILE` and
+  errors; an unconditional lock per chunk is a futex convoy (symptom: a flat thread-scaling curve; first question
+  `SWEEP="8 16 24 32" just measure-decode`).
+- **No gate guards speed, so a round that touches the dispatch path ends with a same-lease A/B.** Build the base in a
+  worktree (`just build-decode`), then `just ab-decode bloomery-<track>`; judge by the interleaved relative numbers (the
+  same commit moves ~5 % between windows). The runner rotates arm order every round (a fixed first arm reads 0.3–0.8 %
+  slow). `BLOOMERY_AB_ENVS="K=V;K=V"` adds same-binary lever arms; put an A/A arm in for any claim under 1 %.
+- **Know the ruler before reading it.** Same-binary runs scatter with SD 0.6 %, so the 95 % interval on a difference of
+  two arm means is ±1.0 % at four rounds and ±0.8 % at six; ±0.5 % takes 13 rounds per arm and ±0.3 % takes 32
+  (sd·√(2/N) with t(0.975, 2N−2); `tools/ref/card.py` computes it). Report the effect and its interval, not a win
+  count. Under 1 %, judge only between same-binary lever arms.
+- **Prefill is a headline metric beside decode.** Every model's public numbers carry `pp tok/s @ P = 512 and 4096, card`
+  next to decode tok/s, for ours and the reference engines in one lease; a round touching the prompt path is judged on
+  it. The measured history is in rig-log.
+- **A decode headline names its depth.** `tools/ref/depth-decode.sh` runs both engines at each depth in one lease
+  (`BLOOMERY_DEPTHS="6 1024 4096"`); a round touching attention or the KV cache is judged on the deep rows. For V4.1,
+  `just depth-gpu-ds41 prose:<P>[@K=V,…]` / `code:<P>` feed the first P ids of `corpus-prose.ids` / `corpus-code.ids`;
+  each corpus's arms are compared only with arms of the same corpus and P, in their own tables. `BLOOMERY_GEN_PLACE=gate`
+  runs our arms at `--place gate` on the 3090. Reference arms are preheated (`BLOOMERY_PREHEAT=0` off); rows carry
+  `majflt` and `[cold]`; a failed arm is a `FAIL` row (rc 1 at the end). `BLOOMERY_AB_ORDER=blocks` runs a cross-engine
+  window in engine blocks, each opened by a discarded warm-up process (the preheat is then off unless
+  `BLOOMERY_PREHEAT=1`). The `card` witness field prints SM clock, the
+  clock-event mask and the power/thermal slowdown counters; `cpu-freq` prints `scaling_cur_freq` over the cores.
+- **The step does no load-time work.** Anything that does not depend on the tokens is resolved once into `Derived`.
+  `just gate-alloc` counts allocator calls per steady step and only ratchets down. Activation blocks come from
+  `Tensor2::scratch` when every cell is written; `BLOOMERY_POISON=1` turns a missed cell into a NaN the gates catch.
+- **Read chunk skew at profile level 1, never level 2** (level 2's per-row timer tax inflates the skew). A microbench
+  µs is not a step µs.
+- **Profile the binary you think you are profiling.** box.sh builds nothing: run `just build-decode` first. `perf record -D`
+  skips startup, not teardown: cut with `--time`. Use `-e cpu-clock`.
+- **Price a serial cost with a doubling probe, not a perf percentage:** a detached worktree whose one-line patch runs the
+  suspect work twice, `just build-decode`, `just ab-decode <that-tree>`; the slowdown is the cost per step (a lower
+  bound).
+- **The line to beat is the reference at its fastest flags, measured interleaved** (`decode-measure.sh` runs ik at
+  default and `IK_BEST_FLAGS`); under 1 % is claimable only from `BLOOMERY_AB_IK=1 just ab-decode` rounds.
+- **Matching the reference's sum order can be faster and exact at once.** Read the reference kernel before assuming SIMD
+  opens a gate.
+- **Toolchain pins.** `rust-toolchain.toml` pins the nightly and moves only with the cuda-oxide pin. `cuda-oxide` is
+  pinned by `rev` in `[workspace.dependencies]` and taken from our fork's `bloomery` branch through `[patch]` (patches
+  listed in `THIRD_PARTY_NOTICES.md`); `just deny` fails if either floats. Before the fork's branch moves, the old pin
+  gets the tag `pin/<short rev>`; pin tags are never deleted. The box never rebuilds the backend in place: `box.sh`
+  exports `CUDA_OXIDE_BACKEND=~/.cargo/cuda-oxide-bloomery/<rev>/librustc_codegen_cuda.so`, and `cargo oxide` stops
+  (rc 70) when that backend is missing or its `source-rev.txt` names another commit. A pin move that leaves the backend
+  crate's closure untouched may reuse the previous backend (md5 and reason in that directory's `PROVENANCE`). A fork
+  patch that changes codegen is a pin move (every gate); one that must not proves it with identical `just ptx-scan`
+  tables of `generate_ds41` and `gate_e2e`.
+- **Runtime levers** are the rows of `crates/levers/src/registry.rs` and nothing else documents them. A binary parses the
+  `parsed` rows first thing in `main` (`bloomery_levers::at_main`), refuses a value its kind does not take, and hands
+  typed values down; `<bin> --levers` prints them. An `in place` row is a line of `tools/levers-direct.txt` with the
+  round that converts it (`just check-levers`). A retired name that is set is refused by name. `just gate-levers` prints
+  the table.
 
-## Known state, 2026-09-20
+## Known state
 
-All 13 subsystem gates pass on main with real exit codes (rerun after the
-`tools/gate.sh` fix). Gate tests are `hw_`-prefixed and `#[ignore]`d: a plain
-`cargo test` runs almost nothing by design, and `.config/nextest.toml` fences
-them out of the fast loop. The `just gate-*` recipes are how they run.
-
-`just lint` runs clippy **with `--features gpu`** (without it the GPU gpu-gates binaries
-are dummy mains and their bodies are never linted). The ratchet counter is
-`grep -c '^warning:'` on that output, which counts a warning once per target it
-appears in (an agent's unique-count will read lower — same direction, different
-ruler). 2026-09-22 night, measured: 308 before the quality rounds; 234 after
-`gpusafety`, 305 after `gatesdedup` on its own base — the merged value is re-measured
-and written here when a round lands — 221 on main `0ff785e` after the four rounds, 211 on main `48ee5c2` (after fnsplit), 210 on main `c69642b` (after gatesc), **175 on main `2d1abc0`** (after the night wave: gatesd, tools6, mechlint, gatesc2, gpucast), 169 through the 09-23/24 waves, **168 on main `76c9ad8`** (q8dead, 2026-09-24), 167 through the 09-25 waves, **144 on main after `fixup5`** (2026-09-25 night: the model test harness split into `tests/common/{model_path,manifest,prompt,oracle,asserts,exact}` removed the per-test dead-code warnings), **133 on main `5cd4859`** (2026-09-27, rebuild wave 1: the museum bins, settled arms and dead entries deleted), **48 on main after `del2`** (2026-09-27, rebuild wave 2: stage 0 deleted — q3k-gemv's 60 and q3k-cpu's 21 warnings and their four summary lines). Of the 175, 58 are
-`undocumented_unsafe_blocks` and all 58 are in the stage-0 crates; since del2 the tree has none (0 of 48).
-`gate-qdot`'s hw tests read harness dumps under `$BLOOMERY_DATA/ref/` — six read
-`*-ik-dot.txt`, one reads q5_K's `q5k-v41-dequant.raw`/`.meta` (q5_K comes from the V4.1
-first shard: V2-Lite has no Q5_K tensor); `just build-ref` writes them
-(`tools/ref/build-qdot-ref.sh` builds and runs the x4 harnesses) — before 2026-09-22
-no recipe did, and the four that existed then were a standing red on every tree. Rerun
-`build-ref` when ik moves. `docs/rust-quality.md` §0 is the table that tracks the lint count. Timed recipes (`time-gpu-*`, `prof-gpu-p8`, `bench-gpu-kernels`) run on the
-A6000 since the runners share `tools/ref/timing-card.sh`; their earlier 3090 numbers do
-not belong in the same table.
-
-Older baselines, kept for the slope: 144 warnings on main (2026-09-21 morning;
-169 on the `gpu-p0` tree with `crates/gpu` + `crates/gpu-spike` as members; 114 on 2026-09-20; 74 on
-09-19). 81 are in the stage-0 crates (q3k-gemv 60, q3k-cpu 21); the engine
-crates carry 33 (model 16, qdot 13, gguf 4). 63 are
-`undocumented_unsafe_blocks` (q3k-gemv 49, q3k-cpu 10, qdot 4), kept at `warn`;
-MUL-10 ratchets it to `deny`. New engine code should not add to that count.
-
-~~No `RUSTFLAGS`/`.cargo/config` enables AVX2 globally: every kernel's
-`#[target_feature]` is load-bearing.~~ Corrected 2026-09-23: `.cargo/config.toml`
-has set `-C target-cpu=znver3` for `x86_64-unknown-linux-gnu` since `48fc38c`
-(2026-09-20), ~~so every box build compiles with AVX2 and FMA on~~ so every
-plain `cargo` build (the CPU gates, `bench_v41_host`, `bloomery-decode`) compiles with AVX2 and
-FMA on. Corrected 2026-09-25 (rustmodern): a `cargo oxide` build does **not** — cargo-oxide
-exports `CARGO_ENCODED_RUSTFLAGS`, which cargo consults first and which masks
-`target.<triple>.rustflags`, so `generate_ds41` and every GPU gate binary compile their host
-code for baseline x86-64 (measured on the box: 1,688 legacy scalar SSE instructions in
-`generate_ds41` against 4 in `bench_v41_host`). Since the same day `.cargo/cuda-oxide.toml`
-carries the flag for oxide builds through `extra-rustflags`, and `just check-rustflags` (in
-`just gate`) fails when the two files disagree. The attributes
-stay — they are what keeps a kernel right in a build without that config
-(another target, a `RUSTFLAGS` override). A helper that touches `_mm*`
-intrinsics is either `#[inline(always)]` (it inherits the caller's features)
-or carries the attribute itself; with neither it runs tens of times slower in
-any build without the config — on the box the config now hides that mistake.
-
-Runtime levers are the rows of `crates/levers/src/registry.rs`, and nothing
-else documents them. A binary parses the `parsed` rows once, first thing in
-`main` (`bloomery_levers::at_main`), refuses by name a value its kind does not
-take, and hands typed values down; `<bin> --levers` prints what that process
-parsed. An `in place` row is still read where it is used, each a line of
-`tools/levers-direct.txt` with the round that converts it (`just
-check-levers`). A retired name that is set is refused by name in the binaries
-that parse at `main`. The table — lever, class, what it takes, what unset
-means, who reads it, what it does — is `bloomery_levers::markdown()`, and `just
-gate-levers` prints it. The prose the registry replaced, with the
-measurements some of its entries cited, is this file at `382bde6`, lines
-566–681.
-
-A V4.1 prompt batch's shadow runs the card's routed experts over the layer's whole block by
-tiles, one path with no lever: `ds41_card_buckets` groups the block's card slots by expert,
-`grouped_tiles` cuts each expert's run into tiles of up to 8 slots, `ds41_card_gather` copies
-each slot's q8_1 column into run order, and `ds41_expert_gate_up_tiles` and `q4k_gemv_tiles`
-run a block per (tile, 8 weight rows) with the m-column cores, reading each weight row once for
-up to 8 slots, the down scattering each column back to its slot; it writes the step's bits
-(`just gate-gpu-ds41-prefill`).
+- `just lint` runs clippy with `--features gpu`; its ratchet is `grep -c '^warning:'` (one per target a warning appears
+  in), held by `tools/lint-ratchet.txt` and tracked in `docs/rust-quality.md` §0. It only goes down; the stage-0 crates
+  are gone and the tree has no `undocumented_unsafe_blocks`.
+- `gate-qdot`'s hw tests read harness dumps under `$BLOOMERY_DATA/ref/` that `just build-ref` writes.
+- Timed recipes (`time-gpu-*`, `prof-gpu-p8`, `bench-gpu-kernels`) run on the A6000 through `tools/ref/timing-card.sh`.
+- A V4.1 prompt batch's shadow runs the card's routed experts by (slot tile, row tile) blocks, one path with no lever:
+  `ds41_card_buckets` → `grouped_tiles` (≤ 8 slots) → `ds41_card_gather` → `ds41_expert_gate_up_tiles` /
+  `q4k_gemv_tiles`, the down scattering back to each slot; it writes the step's bits (`just gate-gpu-ds41-prefill`).
