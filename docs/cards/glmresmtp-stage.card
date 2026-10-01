@@ -1,0 +1,64 @@
+# Round glmresmtp's one box term: how long a landing boundary waits for its flips' staging when
+# adaptive residency and the NextN draft share one load (GLM-5.3-Flash, generate_glm5next under
+# BLOOMERY_DRAFT=mtp and BLOOMERY_RESIDENCY=mid-p0-s1), which decides whether LIVE_DELAY 2 holds on the
+# drafted load or the stacked arm pays its staging at the boundary.
+# Derivation [derived], from crates/gpu/src/host/swap.rs: the staging thread serves its jobs one at a
+# time, in issue order (Shared::run), and stages a job only while `open` holds (Shared::serve):
+# the step port's window is nonzero, a flush, or the job is due (job.n < due). The window is 1 only
+# inside the step port's go waits (host/step.rs, the store(1) / store(0) around wait_go); the batch port,
+# which serves the NextN walk and the prompt call, never opens it. A plan every 4 passes makes at most
+# the rule's cap of 24 flips, live at the boundary 2 passes later; that boundary raises `due` for them
+# and waits for their staging (wait_staged), which is the record's wait_us. In between, two verify or
+# step passes' go waits hold the window open: W = 4..6 jobs' worth (the glmpaper-resmtp report: the
+# staggered two-row verify keeps the host leg in the card's shadow, so the go waits are short). Each job
+# is one expert of the card layers' [Q4_K, Q4_K, Q5_K] layout, 15.2 MB, copied into the pinned ring
+# by one thread (the ring's 4 slots each drain in 0.58 ms at the A6000's measured 26.28 GB/s pinned
+# H2D, so the ring never holds a job back). The rate is the open part: glmres-ab.card's one thread at
+# 6..12 GB/s gives 1.27..2.53 ms a job; the glmpaper-resmtp report's 0.76..1.5 ms (10..20 GB/s) has no
+# measured row in the tree; swap.rs's own share of the all-core read, 4.1 GB/s, gives 3.7 ms.
+# wait_us = (L - W) x t_job over the L flips a plan lands: at the cap, L = 24, 18..20 jobs; a
+# steady-state plan under the cap, L = 16, 10..12. At 6..12 GB/s: 10 x 1.27 = 12.7 .. 20 x 2.53 =
+# 50.6 ms; at 10..20 GB/s: 10 x 0.76 = 7.6 .. 20 x 1.5 = 30 ms; at 4.1 GB/s 37..74 ms. Band 8..51 ms a
+# landing boundary [derived]. It spans two decisions — up to 30 ms the paper's rate, past it the
+# in-tree one-thread rate — and the run picks between them.
+# Runner: tools/ref/depth-glm5next.sh's lever arm on the drafted arm, n = 192 at depth 512, one round:
+#   BLOOMERY_DECODE_N=192 BLOOMERY_GEN_WARM=96 BLOOMERY_AB_ROUNDS=1
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmresmtp-stage.card BLOOMERY_DECODE_N=192
+#   BLOOMERY_GEN_WARM=96 BLOOMERY_AB_ROUNDS=1' just depth-gpu-glm5next oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1
+#   > <log> 2>&1
+# The runner lacks one knob: an ok row carries the residency sums (passes, kept, landed, late, made,
+# bytes) but neither wait_us nor the per-boundary `residency pass` lines, and it keeps an arm's full
+# output only on a FAIL row. The run needs either the arm's output kept (a runner knob) or a wait_us
+# sum over the boundaries with landed > 0 past the warm positions in the row's residency part.
+# Wall [derived]: the warm-up process and one timed process, each a plan (a) load with its host set
+# preheated plus 512 prompt ids and 192 generated: 4..8 min.
+kind: baseline
+question: on the stacked load (residency and the NextN draft), does a landing boundary wait for its
+  flips' staging, and for how long, at LIVE_DELAY 2?
+term: mean wait_us over the `residency pass` records with landed > 0 after the first 96 generated
+  tokens (about the last 48 passes) @ n=192, depth 512, A6000, plan (a), prose ids (GLM_PROSE from
+  GLM_PROSE_FROM), ctx 2048, BLOOMERY_DRAFT=mtp, BLOOMERY_RESIDENCY=mid-p0-s1
+unit: ms
+predict: 8..51
+condition: one lease, one timed process after the runner's warm-up process; the arm prints `residency
+  lever residency=mid-p0-s1 why=set`, a `residency host` record with pinned=0, one `residency pass`
+  record a boundary (pass=none, pass=prompt kept=0, then pass=pair with kept 1 or 2 and pass=step
+  kept=1), landed > 0 on at least 8 boundaries past the warm tokens, no staging failure, and its greedy
+  ids the same over two such runs of this binary (the stacked arm's determinism, as gate
+  gate-gpu-glm5next-residency's c1-mtp holds it); no row carries [cpu-busy], [other-busy] or [cold];
+  the full output to a file first
+reason: the one term of the stacked load the derivation cannot close: how much of a plan's staging
+  the two passes' go waits hide, W (the staging thread copies only in the step port's go waits); why
+  now: the stacked load exists (round glmresmtp), and its LIVE_DELAY decides the stacked arm's
+  prediction (25.7 / 30.2 / 35.8 tok/s, glmpaper-resmtp) before the arm goes into a public table
+decide-in: wait_us is a leg tax that one more pass hides: set LIVE_DELAY 3 on the NextN load and open
+  a staging window at the batch port's go wait (the walk's host leg); a value above 30 (the staging at
+  the in-tree one-thread rate, 6..12 GB/s) takes one nsys window of the stacked arm first, to see
+  whether the go waits hide any of it, before the delay change; then re-read this term at delay 3
+  before the stacked arm's public row
+decide-below: keep LIVE_DELAY 2; staging stays a leg tax of the go waits, and the stacked arm goes to
+  its timed A/B against the plain drafted arm as it stands
+decide-above: the staging runs slower than one thread's 6 GB/s, or outside the window altogether: one
+  nsys window of the stacked arm (the staging thread's memcpy against the step port's go waits and the
+  walk's batch leg) before any delay or window change, and a second staging thread priced beside
+  LIVE_DELAY 3

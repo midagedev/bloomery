@@ -4,8 +4,11 @@
 //! release scope; a plan over more than one card is refused at the body's
 //! load), the residency machine over the stage card's routed stacks, the
 //! lever set here from the plan's own card slots a layer (the environment
-//! cannot move it). The seed is the plan's id prefix. One load; a prompt is
-//! fed in batches ([`bloomery_gpu_glm5next::feed`]), one residency pass.
+//! cannot move it). The seed is the plan's id prefix. Two loads, one after
+//! the other: the plain load, then the NextN load (the file's next-token
+//! layer beside the target, `app::arch::glm5next::open_nextn`) under
+//! `mid-p0-s1`; a prompt is fed in batches
+//! ([`bloomery_gpu_glm5next::feed`]), one residency pass.
 //!
 //! A history is: the session cleared (the residency back to its seed), the
 //! first [`PROMPT`] ids of an lcg over the vocabulary as one prompt call,
@@ -47,6 +50,41 @@
 //!   byte (`dropped_bytes` 0: the churn pool stays in the host set for the
 //!   model's life) (mutant: the reset copies only the first seed expert
 //!   back).
+//!
+//! On the NextN load, whose slot map is the host run and the next-token
+//! layer after it (every expert of that layer on the host):
+//!
+//! - `nextn-refuse`: a host one byte short of the churn pool and the
+//!   next-token layer's host experts — the host set holds both beside the
+//!   plan's segments — is refused by name before anything loads, while the
+//!   planner at that host still plans (mutant: the load's pool check without
+//!   the layer's bytes).
+//! - `nextn-open`: the machine starts over the map's layers — the rule's
+//!   layer count, the tally's edges — every pinned count 0, the next-token
+//!   layer's ledger row empty, no card part of it in the source, and it alone
+//!   listed as routed by no pass (the trunk's layers with no card slot stay
+//!   routed) (mutant:
+//!   the machine's pinned list at the trunk run's length, which the machine
+//!   refuses by name at the load).
+//! - `pair-map` (bits): from a clear, the step history; from a clear again,
+//!   verifies of two rows over its fed tokens, both kept. Before the first
+//!   landing of either, each verify's two tokens and logits FNVs are the
+//!   steps' at those positions (mutant: the verify's replay skips its
+//!   boundary).
+//! - `pair-fold`: a drafted history (the MTP window,
+//!   `Speculative<MtpDraft<Body>, 2>`) ends at its boundaries no pass, the
+//!   prompt call (0 kept), then each window but the last: a verify as a
+//!   `pair` pass keeping its commit's accepted rows, a window with no
+//!   proposal as a `step` keeping 1, a rejected row among them (mutant: the
+//!   commit keeps the verify's rows, not its accepted ones).
+//! - `draft-quiet`: after it, the next-token layer is the one layer the rule
+//!   holds routed by no pass, no flip in flight names it, and its card set
+//!   and ledger row stay empty (mutant: the batch port notes the walk's ids —
+//!   the tally refuses a note of that layer by name, and the history ends in
+//!   that error).
+//! - `c1-mtp`: the drafted history twice, a residency reset between, gives
+//!   the same ids, windows and flips, flips landed (mutant: the staging
+//!   thread stages an expert's first part alone).
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -63,12 +101,15 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "glm5next")]
 mod gate {
+    use std::ops::Range;
     use std::time::Instant;
 
-    use app::arch::glm5next::GlmCfg;
-    use app::{Loaded, OpenLog, Session, SessionError};
+    use app::arch::glm5next::{GlmCfg, open_nextn};
+    use app::mtp::MtpDraft;
+    use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{Residency, SlotState, SwapMachine, SwapSource};
+    use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{GpuError, window};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
@@ -77,10 +118,11 @@ mod gate {
     use gguf::Split;
     use gguf::quant::GgmlType;
     use model::arch::glm5next::names;
-    use model::arch::glm5next::place::PlanInputs;
+    use model::arch::glm5next::place::{NextnInputs, NextnPlan, PlanInputs};
     use model::placement::churn::ChurnPool;
     use model::placement::{Machine, ModelTensors, Plan, PlanLevers, workstation};
-    use runtime::{Out, Target, Want};
+    use runtime::layer::hosted;
+    use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Verify, Want};
 
     const NAME: &str = "gate_glm5next_residency";
     /// Positions the stores hold: a prompt and the steps with room.
@@ -225,14 +267,16 @@ mod gate {
         Ok(out)
     }
 
-    /// What a history saw: every step's argmax and logits FNV, each
-    /// boundary's ended pass (its kind and kept rows), and the flips that
-    /// landed.
+    /// What a history saw: the prompt's argmax, every step's argmax and
+    /// logits FNV, each boundary's ended pass (its kind and kept rows) and
+    /// the flips that landed there, and their sum.
     #[derive(PartialEq)]
     struct History {
+        first: u32,
         tokens: Vec<u32>,
         fnvs: Vec<u64>,
         passes: Vec<(PassKind, usize)>,
+        landings: Vec<usize>,
         landed: usize,
     }
 
@@ -246,9 +290,11 @@ mod gate {
         b.take_residency_passes();
         let mut next = s.prompt(ids, Want::Argmax)?.argmax();
         let mut h = History {
+            first: next,
             tokens: Vec::with_capacity(STEPS),
             fnvs: Vec::with_capacity(STEPS),
             passes: Vec::new(),
+            landings: Vec::new(),
             landed: 0,
         };
         let t = Instant::now();
@@ -263,7 +309,8 @@ mod gate {
         let steps_s = t.elapsed().as_secs_f64();
         let (_, _, b) = s.model_mut().body_parts(NAME)?;
         let passes = b.take_residency_passes();
-        h.landed = passes.iter().map(|(_, r)| r.landed).sum();
+        h.landings = passes.iter().map(|(_, r)| r.landed).collect();
+        h.landed = h.landings.iter().sum();
         h.passes = passes.iter().map(|&(k, r)| (k, r.kept)).collect();
         println!(
             "history: clear {clear_s:.1} s, prompt + {STEPS} steps in {steps_s:.1} s (runtime \
@@ -483,6 +530,431 @@ mod gate {
         Ok(named && served)
     }
 
+    // ------------------------------------ the NextN load under the machine
+
+    /// The NextN clauses' lever: no pinned expert and one spare, the default
+    /// the router-set replay picked.
+    const NEXTN_LEVER: Residency = Residency::Mid {
+        pinned: 0,
+        spares: 1,
+    };
+
+    /// The rows a verify runs: the target's next token and one proposal.
+    const PAIR: usize = 2;
+
+    /// A clause's verdict, an error it met printed as its red line.
+    fn held(clause: &str, r: Result<bool, GateError>) -> bool {
+        r.unwrap_or_else(|e| {
+            println!("{clause}: error \"{e}\": {}", verdict(false));
+            false
+        })
+    }
+
+    /// The file planned with its next-token layer onto `machine`
+    /// ([`open_nextn`]) and loaded under `residency` in graph mode, its
+    /// session's prompts fed in batches.
+    fn open_nextn_on(
+        path: &str,
+        machine: Machine,
+        levers: &bloomery_levers::Levers,
+        residency: Residency,
+    ) -> Result<Session<Body>, GateError> {
+        let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let args = OpenArgs {
+            place: "gate",
+            machine: move |_| machine.clone(),
+            ctx: CTX,
+            mode: StepMode::Graph,
+            cfg: GlmCfg {
+                place: PlanLevers::from_levers(levers)?,
+                host: levers.host(),
+                prefill: PrefillMode::Batch,
+            },
+        };
+        open_nextn(file, args, residency, &mut Quiet)?
+            .ok_or_else(|| "the NextN open stopped at its plan".into())
+    }
+
+    /// `nextn-refuse`: a host one byte short of the churn pool and the
+    /// next-token layer's host experts, which the load's host set holds
+    /// beside the plan's own: the planner at that host still plans (its own
+    /// bound is the layer's experts), and the load refuses by name before
+    /// anything loads.
+    fn nextn_refuse_clause(
+        path: &str,
+        machine: &Machine,
+        levers: &bloomery_levers::Levers,
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+        np: &NextnPlan<'_>,
+    ) -> Result<bool, GateError> {
+        let pool = ChurnPool::of(&np.plan, 0, 0).map_err(|e| format!("{path}: {e}"))?;
+        let (_, hosted) = np.host_runs().map_err(|e| format!("{path}: {e}"))?;
+        let need = i128::from(pool.bytes) + i128::from(hosted);
+        let short = i128::from(machine.host.usable_bytes) - np.plan.host.headroom_bytes + need - 1;
+        let mut small = machine.clone();
+        small.host.usable_bytes = u64::try_from(short)?;
+        let place = PlanLevers::from_levers(levers)?;
+        let planner = match inputs.plan_nextn(&small, CTX as u64, &place, nextn) {
+            Ok(p) => {
+                let same_pool = ChurnPool::of(&p.plan, 0, 0).is_ok_and(|q| q.bytes == pool.bytes);
+                (p.plan.host.headroom_bytes == need - 1 && same_pool).then_some(())
+            }
+            Err(_) => None,
+        };
+        let t0 = Instant::now();
+        let opened = open_nextn_on(path, small, levers, NEXTN_LEVER);
+        let secs = t0.elapsed().as_secs_f64();
+        let beside = format!("{hosted} B of it held");
+        let (named, why) = match opened {
+            Err(e) => {
+                let text = e.to_string();
+                (
+                    text.contains("churn pool") && text.contains(&beside) && secs < REFUSE_BOUND_S,
+                    text,
+                )
+            }
+            Ok(_) => (false, "the open loaded".to_string()),
+        };
+        let ok = planner.is_some() && named;
+        println!(
+            "nextn-refuse: a host of {short} B, one byte short of the {} B churn pool and the \
+             layer's {hosted} B of host experts; the planner there {}; the load in {secs:.1} s — \
+             {why}: {}",
+            pool.bytes,
+            if planner.is_some() {
+                "plans, its headroom the two less one byte"
+            } else {
+                "refused or planned another headroom"
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `nextn-open`: the machine's layers are the slot map's, the trunk's
+    /// routed run and the next-token layer `nextn` after it, every layer's
+    /// pinned count 0; that layer's ledger row is empty and the source holds
+    /// no card part of it.
+    fn nextn_open_clause(
+        s: &Session<Body>,
+        trunk: &Range<usize>,
+        nextn: usize,
+    ) -> Result<bool, GateError> {
+        let b = s.model().body(NAME)?;
+        let machine = machine_of(s)?;
+        let source = b
+            .residency_source()
+            .ok_or("the load has no residency source")?;
+        let map = b.hybrid().slots().layers();
+        let want = trunk.start..nextn + 1;
+        let tally = machine.tally();
+        let covers = tally.covers(want.start)
+            && tally.covers(nextn)
+            && !tally.covers(want.end)
+            && want.start.checked_sub(1).is_none_or(|l| !tally.covers(l));
+        let layers_ok = map == want && machine.rule().layers() == want.len() && covers;
+        let mut pinned = Vec::new();
+        for l in want.clone() {
+            pinned.push(machine.pinned(l)?);
+        }
+        let row = machine.ledger().row(nextn).map(<[SlotState]>::len);
+        let empty = row == Some(0)
+            && source.part_bytes(nextn).is_empty()
+            && machine.seed(nextn)?.is_empty();
+        let p0 = pinned.iter().all(|&p| p == 0);
+        let unrouted: Vec<usize> = want
+            .clone()
+            .zip(machine.rule().unrouted())
+            .filter_map(|(l, &u)| u.then_some(l))
+            .collect();
+        let ok = layers_ok && empty && p0 && unrouted == [nextn];
+        println!(
+            "nextn-open: the map's layers {map:?} (want {want:?}), the rule's {}, the tally's \
+             edges {covers}; layer {nextn}'s ledger row {row:?} slots, its card parts {}, its \
+             seed {}; pinned 0 on every layer {p0}; routed by no pass {unrouted:?} (want \
+             [{nextn}]): {}",
+            machine.rule().layers(),
+            source.part_bytes(nextn).len(),
+            machine.seed(nextn)?.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The first boundary whose flips landed, as the pass it opens: boundary
+    /// 0 opens the prompt call and boundary `j` the `j`-th pass after it.
+    /// `passes` when none landed.
+    fn seed_passes(landings: &[usize], passes: usize) -> usize {
+        landings
+            .iter()
+            .position(|&n| n > 0)
+            .map_or(passes, |j| j.saturating_sub(1))
+            .min(passes)
+    }
+
+    /// `pair-map` (bits): from a clear, the step history; from a clear
+    /// again, the same prompt, then verifies of two rows over the history's
+    /// fed tokens, both rows kept. Before the first landing of either, each
+    /// verify's two tokens and logits FNVs are the steps' at the same
+    /// positions: both rows read one map, the seed.
+    fn pair_map_clause(s: &mut Session<Body>, ids: &[u32]) -> Result<bool, GateError> {
+        let steps = history(s, ids)?;
+        let seed_steps = seed_passes(&steps.landings, STEPS);
+        let fed: Vec<u32> = std::iter::once(steps.first)
+            .chain(steps.tokens.iter().copied())
+            .collect();
+        s.clear()?;
+        s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+        let first = s.prompt(ids, Want::Argmax)?.argmax();
+        s.model_mut().capture_rows::<PAIR>()?;
+        let runs = seed_steps / PAIR;
+        let mut got = Vec::with_capacity(runs);
+        for k in 0..runs {
+            let tokens = s.verify([fed[PAIR * k], fed[PAIR * k + 1]])?;
+            let logits = s.model().rows_logits::<PAIR>()?;
+            s.commit(PAIR)?;
+            got.push((tokens, [fnv(&logits[0]), fnv(&logits[1])]));
+        }
+        let passes = s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+        let landings: Vec<usize> = passes.iter().map(|(_, r)| r.landed).collect();
+        let compared = seed_passes(&landings, runs);
+        let differ = (0..compared).find(|&k| {
+            let (tokens, fnvs) = got[k];
+            let at = PAIR * k;
+            tokens[..] != steps.tokens[at..at + PAIR] || fnvs[..] != steps.fnvs[at..at + PAIR]
+        });
+        let ok = first == steps.first && compared > 0 && differ.is_none();
+        println!(
+            "pair-map: the steps on the seed for {seed_steps} positions, the verifies for {} of \
+             {runs}; {compared} verifies compared, tokens and logits FNV equal the steps' {} \
+             (first differing verify {differ:?}), the prompt's token {first} (steps {}): {}",
+            seed_passes(&landings, runs),
+            differ.is_none(),
+            steps.first,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// What a drafted history saw: the generated ids, each window's
+    /// proposal and kept rows, and each boundary's ended pass with the flips
+    /// that landed there.
+    #[derive(PartialEq)]
+    struct Drafted {
+        tokens: Vec<u32>,
+        windows: Vec<(bool, usize)>,
+        passes: Vec<(PassKind, usize)>,
+        landings: Vec<usize>,
+    }
+
+    /// The windows' proposals and kept rows, as the generation reports them.
+    #[derive(Default)]
+    struct Windows(Vec<(bool, usize)>);
+
+    impl PassSink<Session<Body>> for Windows {
+        type Error = GateError;
+
+        fn begin(&mut self, _: &Session<Body>) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _: &Session<Body>,
+            c: &Committed,
+            _: &[u32],
+            _: std::time::Duration,
+        ) -> Result<(), GateError> {
+            self.0.push((c.proposed, c.kept));
+            Ok(())
+        }
+    }
+
+    /// The verify's capture, heard by nobody.
+    struct QuietRows;
+
+    impl RowsLog for QuietRows {
+        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    /// The stacked history from a clear (the residency back to its seed):
+    /// the prompt call with the draft's store walks, then MTP windows
+    /// (`Speculative<MtpDraft<Body>, 2>`) for [`STEPS`] ids.
+    fn drafted_history(s: &mut Session<Body>, ids: &[u32]) -> Result<Drafted, GateError> {
+        let t = Instant::now();
+        s.clear()?;
+        s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+        let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
+        let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut QuietRows)?;
+        let first = spec.prompt(s, ids)?;
+        let mut w = Windows::default();
+        let stop = Stop::new(STEPS, s.ctx())?;
+        let out = runtime::generate(s, &mut spec, ids, first, &stop, &mut w)?;
+        let passes = s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+        let d = Drafted {
+            tokens: out.tokens,
+            windows: w.0,
+            passes: passes.iter().map(|&(k, r)| (k, r.kept)).collect(),
+            landings: passes.iter().map(|(_, r)| r.landed).collect(),
+        };
+        println!(
+            "drafted history: prompt + {} ids in {} windows in {:.1} s (runtime value), {} \
+             boundaries, {} flips landed",
+            d.tokens.len(),
+            d.windows.len(),
+            t.elapsed().as_secs_f64(),
+            d.passes.len(),
+            d.landings.iter().sum::<usize>()
+        );
+        Ok(d)
+    }
+
+    /// `pair-fold`: the boundaries end no pass, the prompt call (0 kept),
+    /// then each window but the last, whose pass the next boundary would
+    /// end: a verify as a `pair` pass keeping its commit's accepted rows, a
+    /// window with no proposal as a `step` keeping 1; a rejected row among
+    /// them.
+    fn pair_fold_clause(d: &Drafted) -> bool {
+        let mut want = vec![(PassKind::None, 0), (PassKind::Prompt, 0)];
+        let ended = d.windows.len().saturating_sub(1);
+        want.extend(
+            d.windows[..ended]
+                .iter()
+                .map(|&(proposed, kept)| match proposed {
+                    true => (PassKind::Pair, kept),
+                    false => (PassKind::Step, 1),
+                }),
+        );
+        let rejected = d.windows.iter().filter(|&&(p, k)| p && k == 1).count();
+        let accepted = d.windows.iter().filter(|&&(p, k)| p && k == PAIR).count();
+        let differ = d.passes.iter().zip(&want).position(|(a, b)| a != b);
+        let ok = d.passes == want && rejected > 0;
+        println!(
+            "pair-fold: {} boundaries (want {}), each verify a pair pass keeping its accepted \
+             rows {} (first differing boundary {differ:?}); {accepted} accepted, {rejected} with \
+             a rejected row: {}",
+            d.passes.len(),
+            want.len(),
+            d.passes == want,
+            verdict(ok)
+        );
+        ok
+    }
+
+    /// `draft-quiet`: after a drafted history, the rule holds the next-token
+    /// layer `nextn` routed by no pass, no flip in flight names it, and its
+    /// card set and ledger row stay empty.
+    fn draft_quiet_clause(
+        s: &Session<Body>,
+        trunk: &Range<usize>,
+        nextn: usize,
+    ) -> Result<bool, GateError> {
+        let machine = machine_of(s)?;
+        let at = nextn - trunk.start;
+        let flips = machine
+            .rule()
+            .in_flight()
+            .iter()
+            .filter(|f| f.layer == at)
+            .count();
+        let live = machine
+            .rule()
+            .live(at)
+            .map_err(|e| format!("the rule's layer {at}: {e:?}"))?
+            .count();
+        let row = machine.ledger().row(nextn).map(<[SlotState]>::len);
+        let listed = machine.rule().unrouted().get(at) == Some(&true);
+        let ok = listed && flips == 0 && live == 0 && row == Some(0);
+        println!(
+            "draft-quiet: layer {nextn} (the rule's {at}) routed by no pass {listed}: {flips} \
+             flips in flight, {live} live on the card, its ledger row {row:?} slots: {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `c1-mtp`: the stacked history twice, a residency reset between, gives
+    /// the same ids, windows and flips, flips landed.
+    fn c1_mtp_clause(a: &Drafted, b: &Drafted) -> bool {
+        let landed: usize = a.landings.iter().sum();
+        let ok = a == b && landed > 0;
+        println!(
+            "c1-mtp: the stacked history twice, {} ids, {} windows, {landed} flips landed: same \
+             {}: {}",
+            a.tokens.len(),
+            a.windows.len(),
+            a == b,
+            verdict(ok)
+        );
+        ok
+    }
+
+    /// The NextN clauses, on a NextN load of the gate placement under
+    /// [`NEXTN_LEVER`]: `nextn-refuse` before it, then `nextn-open`,
+    /// `pair-map`, `pair-fold`, `draft-quiet` and `c1-mtp` on it.
+    fn nextn_clauses(
+        path: &str,
+        machine: &Machine,
+        levers: &bloomery_levers::Levers,
+        inputs: &PlanInputs,
+        ids: &[u32],
+    ) -> Result<bool, GateError> {
+        let nextn = NextnInputs::read(inputs).map_err(|e| format!("{path}: {e}"))?;
+        let place = PlanLevers::from_levers(levers)?;
+        let np = inputs
+            .plan_nextn(machine, CTX as u64, &place, &nextn)
+            .map_err(|e| format!("{path}: {e}"))?;
+        let trunk = hosted(&inputs.spec.layers).map_err(|e| format!("{path}: {e}"))?;
+        println!(
+            "{NAME}: the NextN load under {}, layer {} after the host run {trunk:?}",
+            word_of(NEXTN_LEVER),
+            nextn.index
+        );
+        let mut ok = held(
+            "nextn-refuse",
+            nextn_refuse_clause(path, machine, levers, inputs, &nextn, &np),
+        );
+        let t0 = Instant::now();
+        let mut s = match open_nextn_on(path, machine.clone(), levers, NEXTN_LEVER) {
+            Ok(s) => s,
+            Err(e) => {
+                println!(
+                    "nextn-open: the load: error \"{e}\": {}; pair-map, pair-fold, \
+                     draft-quiet and c1-mtp not run",
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        s.model_mut().body_parts(NAME)?.2.log_residency(0);
+        println!(
+            "NextN load in {:.1} s (runtime value)",
+            t0.elapsed().as_secs_f64()
+        );
+        ok &= held("nextn-open", nextn_open_clause(&s, &trunk, nextn.index));
+        ok &= held("pair-map", pair_map_clause(&mut s, &ids[..PROMPT]));
+        match drafted_history(&mut s, &ids[..PROMPT]) {
+            Ok(a) => {
+                ok &= pair_fold_clause(&a);
+                ok &= held("draft-quiet", draft_quiet_clause(&s, &trunk, nextn.index));
+                let b = drafted_history(&mut s, &ids[..PROMPT]);
+                ok &= held("c1-mtp", b.map(|b| c1_mtp_clause(&a, &b)));
+            }
+            Err(e) => {
+                println!(
+                    "pair-fold: the drafted history: error \"{e}\": {}; draft-quiet and c1-mtp \
+                     not run",
+                    verdict(false)
+                );
+                ok = false;
+            }
+        }
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers =
             bloomery_levers::at_main(&[CARD_BUDGET, HOST_POPULATE, HOST_LOCK, CARD_DONTNEED, R8])?;
@@ -571,6 +1043,9 @@ mod gate {
             verdict(c7)
         );
         pass &= c7;
+        drop(s);
+
+        pass &= nextn_clauses(&path, &machine, &levers, &inputs, &ids)?;
 
         if pass {
             println!("{NAME}: every clause passed");

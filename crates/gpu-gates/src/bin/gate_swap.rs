@@ -1033,6 +1033,7 @@ mod gate {
                 .collect(),
             top_k: K,
             max_rows: MAX_ROWS,
+            unrouted: Vec::new(),
             deadline,
         }
     }

@@ -912,6 +912,21 @@ fn refuse_other_lanes(
     Ok(())
 }
 
+/// The host tier's run over the trunk `layers`: its routed layers, and on a
+/// NextN load the next-token layer `nextn` after them — the slot map's
+/// layers. Refused by name: a trunk with no routed run, and a next-token
+/// layer that does not follow it.
+fn host_run(layers: &[LayerSpec], nextn: Option<usize>) -> Result<Range<usize>, GpuError> {
+    let trunk = hosted(layers).map_err(|e| shape(e.to_string()))?;
+    match nextn {
+        None => Ok(trunk),
+        Some(n) if trunk.end == n => Ok(trunk.start..n + 1),
+        Some(n) => Err(shape(format!(
+            "the next-token layer {n} does not follow the host run {trunk:?}"
+        ))),
+    }
+}
+
 impl Body {
     /// Card `card` of `plan`, which `inputs` made, resident, the load's
     /// slot map for the model's life, one KDA lane ([`Body::open_placed_lanes`]
@@ -978,9 +993,7 @@ impl Body {
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         // The host tier's run — the layers the body's slot map holds, which
         // the machine's per-layer lists cover.
-        let map_layers = hosted(&inputs.spec.layers)
-            .map_err(|e| shape(e.to_string()))?
-            .len();
+        let map_layers = host_run(&inputs.spec.layers, None)?.len();
         // The most rows one pass runs: a row a lane.
         let spec = ResidencySpec {
             lever: residency,
@@ -988,7 +1001,7 @@ impl Body {
             deadline: swap::DEADLINE,
             top_k: N_USED,
             max_rows: lanes.count(),
-            stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers)?),
+            stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers, None)?),
         };
         GpuModel::load_placed_with(
             file,
@@ -1005,19 +1018,9 @@ impl Body {
         )
     }
 
-    /// [`Body::open_placed`] with the next-token layer beside the chain: card
-    /// `card` of `plan`'s target plan resident as [`Body::open_placed`] makes
-    /// it, the layer `nextn` describes resident as `plan`'s NextN plan places
-    /// it ([`nextn::Nextn`]), and its routed experts served by the host tier
-    /// as the run's last layer (the slot map's row for it every expert on the
-    /// host), the host tier's batch port made for the walk's host leg. Those
-    /// experts join the plan's host set ([`NextnPlan::host_runs`]), read in
-    /// and locked with it as `host` asks, so no walk takes their first-touch
-    /// reads. The load takes no residency machine: the host set's layers are
-    /// the run's before it. Its KDA state holds two lanes: the draft's rows
-    /// are verified two at a time. Refused as [`Body::open_placed_lanes`]
-    /// refuses, and by name for a next-token layer that does not follow the
-    /// host run.
+    /// [`Body::open_placed`] with the next-token layer beside the chain, the
+    /// load's slot map for the model's life ([`Body::open_placed_nextn_with`]
+    /// under [`Residency::Off`]).
     pub fn open_placed_nextn(
         file: Split,
         plan: &NextnPlan<'_>,
@@ -1026,20 +1029,52 @@ impl Body {
         card: usize,
         host: HostCfg,
     ) -> Result<Glm5nextModel, GpuError> {
+        Body::open_placed_nextn_with(file, plan, inputs, nextn, card, host, Residency::Off)
+    }
+
+    /// [`Body::open_placed`] with the next-token layer beside the chain under
+    /// `residency`: card `card` of `plan`'s target plan resident as
+    /// [`Body::open_placed_lanes`] makes it, the layer `nextn` describes
+    /// resident as `plan`'s NextN plan places it ([`nextn::Nextn`]), and its
+    /// routed experts served by the host tier as the run's last layer (the
+    /// slot map's row for it every expert on the host), the host tier's batch
+    /// port made for the walk's host leg. Those experts join the plan's host
+    /// set ([`NextnPlan::host_runs`]), read in and locked with it as `host`
+    /// asks, so no walk takes their first-touch reads. Its KDA state holds
+    /// two lanes: the draft's rows are verified two at a time. Under
+    /// `mid-p<P>-s<S>` the residency machine runs over the slot map's layers,
+    /// the next-token layer's among them: the file source's parts span the
+    /// card's trunk layers, so that layer has no card part and no card slot
+    /// and the machine moves none of its experts, and no pass routes it (the
+    /// draft's walks serve it through the batch port, which notes no id), so
+    /// the machine lists it as unrouted; the host set also holds the
+    /// churn pool, which the target plan's host headroom less the layer's
+    /// host experts must take. Refused as [`Body::open_placed_lanes`]
+    /// refuses, and by name for a next-token layer that does not follow the
+    /// host run.
+    pub fn open_placed_nextn_with(
+        file: Split,
+        plan: &NextnPlan<'_>,
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+        card: usize,
+        host: HostCfg,
+        residency: Residency,
+    ) -> Result<Glm5nextModel, GpuError> {
         let target = &plan.plan;
         refuse_expert_tiers(WHAT, target.machine)?;
         refuse_other_lanes(target, inputs, card, KdaLanes::Two)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
-        let map_layers = hosted(&inputs.spec.layers)
-            .map_err(|e| shape(e.to_string()))?
-            .len();
+        // The slot map's layers: the trunk's routed run and the next-token
+        // layer after it, which the machine's per-layer lists cover.
+        let map_layers = host_run(&inputs.spec.layers, Some(nextn.index))?.len();
         let spec = ResidencySpec {
-            lever: Residency::Off,
+            lever: residency,
             delay: swap::LIVE_DELAY,
             deadline: swap::DEADLINE,
             top_k: N_USED,
             max_rows: KdaLanes::Two.count(),
-            stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers)?),
+            stacks: Arc::new(swap::Glm5Stacks::of(inputs, map_layers, Some(nextn.index))?),
         };
         let hosted = plan.host_runs().map_err(|e| GpuError::plan(WHAT, e))?;
         GpuModel::load_placed_hosting(
@@ -1061,7 +1096,7 @@ impl Body {
                     host,
                     set,
                     glue,
-                    Residency::Off,
+                    residency,
                     KdaLanes::Two,
                     Some((plan, nextn)),
                 )
@@ -1169,19 +1204,7 @@ impl Body {
             })?;
         let dense = usize::try_from(place::dense_positions(hp))
             .map_err(|_| shape(format!("dense positions {}", place::dense_positions(hp))))?;
-        let trunk_run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
-        // The host run: the trunk's routed layers, and the next-token layer
-        // after them on a NextN load.
-        let run = match nextn {
-            None => trunk_run,
-            Some((_, n)) if trunk_run.end == n.index => trunk_run.start..n.index + 1,
-            Some((_, n)) => {
-                return Err(shape(format!(
-                    "the next-token layer {} does not follow the host run {trunk_run:?}",
-                    n.index
-                )));
-            }
-        };
+        let run = host_run(&spec.layers, nextn.map(|(_, n)| n.index))?;
         let dims = dims_of(inputs)?;
         let map = SlotMap::of_plan(plan, card, None, run.clone(), N_EXPERT)?;
         let cfg = spec

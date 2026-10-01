@@ -13,9 +13,10 @@
 //! A session opens at one KDA lane: its loads run one row a pass and pay
 //! nothing for a verify. [`open_nextn`] opens the same session with the
 //! file's next-token layer beside the target — the body the MTP window drafts
-//! on (`MtpBody`) — and [`open_pair`] with no layer, for the two-row verify
-//! probe; both hold two lanes. [`open_resident`] opens the plain session under
-//! adaptive expert residency, at one lane.
+//! on (`MtpBody`), under adaptive expert residency or not — and [`open_pair`]
+//! with no layer, for the two-row verify probe; both hold two lanes.
+//! [`open_resident`] opens the plain session under adaptive expert residency,
+//! at one lane.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
@@ -106,13 +107,17 @@ impl Open for Body {
 /// `args`' placement ([`PlanInputs::plan_nextn`]: the target's expert rule
 /// within the card less the layer's bytes, two KDA lanes) and its target plan
 /// handed to `log` (`false` stops there: `Ok(None)`), then the load by that
-/// plan ([`Body::open_placed_nextn`]) in `args`' step mode, handed to `log`,
-/// the step captured and the prompt call's buffers made. Refused as
-/// [`Open::plan`] refuses, and by name for a file of other than one
-/// next-token layer and a plan the layer breaks.
+/// plan under `residency` ([`Body::open_placed_nextn_with`]: under `mid` the
+/// host set also holds each layer's churn pool, which the target plan's host
+/// headroom less the layer's host experts must take) in `args`' step mode,
+/// handed to `log`, the step captured and the prompt call's buffers made.
+/// Refused as [`Open::plan`] refuses, as the residency machine refuses at the
+/// load, and by name for a file of other than one next-token layer and a
+/// plan the layer breaks.
 pub fn open_nextn<M: Fn(usize) -> Machine>(
     file: Split,
     args: OpenArgs<GlmCfg, M>,
+    residency: Residency,
     log: &mut impl OpenLog<Body>,
 ) -> Result<Option<Session<Body>>, SessionError> {
     let inputs = <Body as Open>::inputs(&file)?;
@@ -121,11 +126,13 @@ pub fn open_nextn<M: Fn(usize) -> Machine>(
     let plan = inputs
         .plan_nextn(&machine, ctx, &args.cfg.place, &nextn)
         .map_err(|e| GpuError::plan(WHAT, e))?;
+    log.beside(plan.host_runs().map_err(|e| GpuError::plan(WHAT, e))?.1);
     if !log.plan(args.place, &inputs, &machine, &plan.plan)? {
         return Ok(None);
     }
     let ctx = ctx_of(&plan.plan)?;
-    let model = Body::open_placed_nextn(file, &plan, &inputs, &nextn, 0, args.cfg.host)?;
+    let model =
+        Body::open_placed_nextn_with(file, &plan, &inputs, &nextn, 0, args.cfg.host, residency)?;
     ready(model, args.mode, args.cfg, ctx, log)
 }
 

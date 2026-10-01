@@ -167,6 +167,16 @@ pub enum SwapRuleError {
         layer: usize,
         row: usize,
     },
+    /// A row observed at a layer no pass routes ([`SwapRule::with_unrouted`]).
+    UnroutedObserved {
+        layer: usize,
+        row: usize,
+    },
+    /// A layer listed as routed by no pass that holds card slots.
+    UnroutedWithSlots {
+        layer: usize,
+        capacity: usize,
+    },
     /// An end of pass while the boundary the last pass ended at is unplanned.
     PlanSkipped {
         boundary: u64,
@@ -275,6 +285,15 @@ impl fmt::Display for SwapRuleError {
             SwapRuleError::RowMissing { layer, row } => {
                 write!(f, "kept row {row} was never observed at layer {layer}")
             }
+            SwapRuleError::UnroutedObserved { layer, row } => write!(
+                f,
+                "row {row} observed at layer {layer}, which no pass routes: its routing is not \
+                 the rule's"
+            ),
+            SwapRuleError::UnroutedWithSlots { layer, capacity } => write!(
+                f,
+                "layer {layer} is listed as routed by no pass but holds {capacity} card slots"
+            ),
             SwapRuleError::PlanSkipped { boundary } => write!(
                 f,
                 "a pass ended while boundary {boundary} is unplanned: plan it first"
@@ -366,6 +385,8 @@ pub struct SwapRule {
     /// `layer * experts + id`.
     slot: Vec<Slot>,
     counts: Vec<f64>,
+    /// Per layer: no pass routes it ([`SwapRule::with_unrouted`]).
+    unrouted: Vec<bool>,
     in_flight: Vec<usize>,
     pending: Vec<Flip>,
     /// `(row * layers + layer) * top_k`.
@@ -394,6 +415,7 @@ impl PartialEq for SwapRule {
             && self.away == o.away
             && self.slot == o.slot
             && self.counts == o.counts
+            && self.unrouted == o.unrouted
             && self.in_flight == o.in_flight
             && self.pending == o.pending
             && self.pass_rows == o.pass_rows
@@ -604,6 +626,7 @@ impl SwapRule {
             away: is_away,
             slot,
             counts: vec![0.0; layers * e],
+            unrouted: vec![false; layers],
             in_flight: vec![0; layers],
             pending: Vec::with_capacity(most),
             rows: vec![0; shape.max_rows * layers * shape.top_k],
@@ -616,6 +639,29 @@ impl SwapRule {
             pairs: Vec::with_capacity(most),
             flips: Vec::with_capacity(most.min(params.cap)),
         })
+    }
+
+    /// The rule with `layers` routed by no pass: layers a pass never
+    /// observes (a draft layer its host serves beside the chain), each with no
+    /// card slot. Such a layer's rows are refused ([`SwapRule::observe`]), a
+    /// kept row needs none of it ([`SwapRule::end_pass`]), and its counts stay
+    /// 0. Refused by name: a layer past the rule's, and one with card slots.
+    pub fn with_unrouted(mut self, layers: &[usize]) -> Result<Self, SwapRuleError> {
+        for &layer in layers {
+            self.check_layer(layer)?;
+            let capacity = self.capacity[layer];
+            if capacity != 0 {
+                return Err(SwapRuleError::UnroutedWithSlots { layer, capacity });
+            }
+            self.unrouted[layer] = true;
+        }
+        Ok(self)
+    }
+
+    /// Per layer, whether no pass routes it ([`SwapRule::with_unrouted`]).
+    #[must_use]
+    pub fn unrouted(&self) -> &[bool] {
+        &self.unrouted
     }
 
     /// This pass's observed cells and their ids.
@@ -739,6 +785,9 @@ impl SwapRule {
                 return Err(SwapRuleError::DuplicateId { layer, row, id });
             }
         }
+        if self.unrouted[layer] {
+            return Err(SwapRuleError::UnroutedObserved { layer, row });
+        }
         let cell = row * self.layers + layer;
         if self.seen[cell] {
             return Err(SwapRuleError::RowObservedTwice { layer, row });
@@ -750,8 +799,8 @@ impl SwapRule {
     }
 
     /// End the pass: fold its first `kept` rows into the counts and drop the
-    /// rest, so a rejected row leaves no trace. Every layer must have observed
-    /// every kept row.
+    /// rest, so a rejected row leaves no trace. Every layer but the ones no
+    /// pass routes must have observed every kept row.
     pub fn end_pass(&mut self, kept: usize) -> Result<(), SwapRuleError> {
         if self.planned != self.passes {
             return Err(SwapRuleError::PlanSkipped {
@@ -767,13 +816,16 @@ impl SwapRule {
         let (l_n, top_k, e) = (self.layers, self.shape.top_k, self.shape.experts);
         for row in 0..kept {
             for layer in 0..l_n {
-                if !self.seen[row * l_n + layer] {
+                if !self.seen[row * l_n + layer] && !self.unrouted[layer] {
                     return Err(SwapRuleError::RowMissing { layer, row });
                 }
             }
         }
         for cell in 0..kept * l_n {
             let layer = cell % l_n;
+            if self.unrouted[layer] {
+                continue;
+            }
             for &id in &self.rows[cell * top_k..(cell + 1) * top_k] {
                 self.counts[layer * e + id as usize] += 1.0;
             }
@@ -2203,5 +2255,69 @@ mod tests {
         // A settled flip is the rule's from here: a planning pass may evict it.
         r.settle(&[flip(0, 2, 5, 0)]).unwrap();
         assert_eq!(r.live(0).unwrap().collect::<Vec<_>>(), [0, 1, 2]);
+    }
+
+    /// A rule over a routed layer with card slots, a trunk layer with none
+    /// (routed, all its experts on the host) and a layer with none that no
+    /// pass routes; its counts are read at `counts`.
+    fn unrouted_rule(listed: &[usize]) -> Result<SwapRule, SwapRuleError> {
+        let shape = Shape {
+            experts: 4,
+            top_k: 2,
+            max_rows: 2,
+        };
+        let seed: [&[u32]; 3] = [&[0, 1], &[], &[]];
+        SwapRule::new(SwapParams::mid(2), shape, &seed, &[2, 0, 0])?.with_unrouted(listed)
+    }
+
+    /// A listed layer needs no kept row and gains no count; a kept row
+    /// missing at a layer with no card slot that is not listed is still
+    /// refused (mutants: the end without the listed skip, the fold without
+    /// it).
+    #[test]
+    fn a_layer_no_pass_routes_needs_no_row_and_gains_no_count() {
+        let mut r = unrouted_rule(&[2]).unwrap();
+        assert_eq!(r.unrouted(), [false, false, true]);
+        for row in 0..2 {
+            r.observe(0, row, &[0, 2]).unwrap();
+            r.observe(1, row, &[1, 3]).unwrap();
+        }
+        r.end_pass(2).expect("the listed layer needs no kept row");
+        assert!(r.counts[2 * 4..3 * 4].iter().all(|&c| c == 0.0));
+        assert_eq!(r.counts[4..8], [0.0, 2.0, 0.0, 2.0]);
+        let mut unlisted = unrouted_rule(&[]).unwrap();
+        unlisted.observe(0, 0, &[0, 2]).unwrap();
+        unlisted.observe(1, 0, &[1, 3]).unwrap();
+        assert_eq!(
+            unlisted.end_pass(1),
+            Err(SwapRuleError::RowMissing { layer: 2, row: 0 })
+        );
+    }
+
+    /// A row at a listed layer is refused by name and leaves the pass as it
+    /// was; a listed layer with card slots, or past the rule's, is refused
+    /// (mutant: observe without the listed refusal).
+    #[test]
+    fn a_row_at_a_layer_no_pass_routes_is_refused() {
+        let mut r = unrouted_rule(&[2]).unwrap();
+        assert_eq!(
+            r.observe(2, 0, &[0, 1]),
+            Err(SwapRuleError::UnroutedObserved { layer: 2, row: 0 })
+        );
+        assert_eq!(r.observed().count(), 0);
+        assert_eq!(
+            unrouted_rule(&[0]).unwrap_err(),
+            SwapRuleError::UnroutedWithSlots {
+                layer: 0,
+                capacity: 2
+            }
+        );
+        assert_eq!(
+            unrouted_rule(&[3]).unwrap_err(),
+            SwapRuleError::LayerOutOfRange {
+                layer: 3,
+                layers: 3
+            }
+        );
     }
 }
