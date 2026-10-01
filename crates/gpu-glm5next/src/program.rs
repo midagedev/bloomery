@@ -249,7 +249,7 @@ impl<'s> LayerProgram for StepProgram<'s, '_> {
             return Ok(());
         }
         self.at(at.unit)?;
-        ffn::back(gpu, &mut self.parts, port.hybrid.boundary(), l)?;
+        ffn::back(gpu, &mut self.parts, port.hybrid, l)?;
         self.hc_out()?;
         self.parts.tap(gpu, l, self.cur[at.unit])?;
         port.hybrid.row_enqueued(l, at.unit)

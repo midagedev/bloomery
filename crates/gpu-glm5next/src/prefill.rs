@@ -64,6 +64,7 @@
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 
+use bloomery_gpu::fault::read_cards;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::kpool;
@@ -97,6 +98,7 @@ use crate::ffn::{self, CardRows};
 use crate::host::GlmHost;
 use crate::mla::{self, Select};
 use crate::tensors::{FfnNames, MixerNames, other_kind};
+use bloomery_gpu_deepseek41::chain::ffn::{CardAccTier, Places};
 
 /// What the prompt batch's errors name.
 const WHAT: &str = "glm5next prefill";
@@ -254,27 +256,32 @@ struct Bufs {
     weights: DeviceBuffer<f32>,
     sel: DeviceBuffer<u32>,
     // The card experts', per chunk: the rows' q8_1 form, the gate·up rows a
-    // slot, per chunk width the q8_1 of its slots' columns, the downs.
+    // slot, per chunk width the q8_1 of its slots' columns, the downs — on a
+    // load with an expert tier the whole batch's, which a tiered layer's
+    // card sum reads beside the tier's rows after the serve — and with a tier
+    // each slot's tier place.
     act_x: Q8Act,
     card_h: DeviceBuffer<f32>,
     act_h: Vec<Q8Act>,
     card_down: DeviceBuffer<f32>,
+    tsel: Option<DeviceBuffer<u32>>,
 }
 
 impl Bufs {
     /// The buffers for batches of up to `cap` tokens of `d`'s widths, `ff`
     /// the widest dense or shared-expert width, `expert_ff` a routed
-    /// expert's, over stores of `ctx` positions. The attention's partials
-    /// cover `ctx` keys: a chunk selects only on stores past the dense
-    /// positions, which are a list's width, so they cover a list too.
-    /// Load-time or first-prompt only.
+    /// expert's, over stores of `ctx` positions, the card downs and the tier
+    /// places a batch's when `tiered` (a load with an expert tier). The
+    /// attention's partials cover `ctx` keys: a chunk selects only on stores
+    /// past the dense positions, which are a list's width, so they cover a
+    /// list too. Load-time or first-prompt only.
     fn new(
         gpu: &Gpu,
         d: &Dims,
-        ff: usize,
-        expert_ff: usize,
+        [ff, expert_ff]: [usize; 2],
         ctx: usize,
         cap: usize,
+        tiered: bool,
     ) -> Result<Bufs, GpuError> {
         let stream = gpu.stream();
         let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
@@ -344,7 +351,12 @@ impl Bufs {
             act_h: (1..=CHUNK)
                 .map(|c| Q8Act::with_slots(stream, c * N_USED, expert_ff))
                 .collect::<Result<_, _>>()?,
-            card_down: z(CHUNK * N_USED * n)?,
+            card_down: z(if tiered { cap } else { CHUNK } * N_USED * n)?,
+            tsel: if tiered {
+                Some(zu(cap * N_USED)?)
+            } else {
+                None
+            },
         })
     }
 
@@ -401,6 +413,7 @@ impl Bufs {
             + self.hc_scratch.device_bytes()
             + self.act_x.device_bytes()
             + self.act_h.iter().map(Q8Act::device_bytes).sum::<usize>()
+            + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
     }
 }
 
@@ -778,7 +791,8 @@ impl Body {
         let ff = self.cfg.iter().map(|c| c.ff).max().unwrap_or(0);
         let expert_ff = self.card.ff();
         let cap = T_MAX.min(self.ctx);
-        let bufs = Bufs::new(gpu, &self.dims, ff, expert_ff, self.ctx, cap)?;
+        let tiered = self.card.tier().is_some();
+        let bufs = Bufs::new(gpu, &self.dims, [ff, expert_ff], self.ctx, cap, tiered)?;
         let hsum = DeviceBuffer::zeroed(gpu.stream(), cap * self.dims.embd)?;
         self.hybrid.prepare_batch(gpu.context(), cap)?;
         self.hybrid.host_mut().prepare_union(cap)?;
@@ -870,9 +884,20 @@ impl Body {
         sched::walk(o, layers, &mut leg, &mut prog)?;
         if last {
             prog.head(head)?;
-            return Ok(true);
         }
-        match gpu.fault()? {
+        // A fault the batch raised on the expert tier is the call's error,
+        // as the stage card's is (the first layer wins); `None` without a tier.
+        let tier = hybrid.tier_fault()?;
+        if last {
+            return match tier {
+                Some(t) => Err(GpuError::fault(
+                    WHAT,
+                    read_cards(&[gpu.fault()?, Some(t)]).unwrap_or(t),
+                )),
+                None => Ok(true),
+            };
+        }
+        match read_cards(&[gpu.fault()?, tier]) {
             Some(fault) => Err(GpuError::fault(WHAT, fault)),
             None => Ok(false),
         }
@@ -1529,8 +1554,36 @@ impl PromptProgram<'_> {
             fault,
         )?;
         let key = port.key(at);
-        port.hybrid()
-            .enqueue_download(stream, [&b.normed, &b.weights], &b.ids, key)
+        let Some(side) = self.p.card.tier().filter(|t| t.k(l) > 0) else {
+            return port
+                .hybrid()
+                .enqueue_download(stream, [&b.normed, &b.weights], &b.ids, key);
+        };
+        // A tiered layer's route carries each slot's tier place too, which the
+        // tier's service reads.
+        let tsel = b.tsel.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the tier places of a batch made with a tier",
+        })?;
+        self.p.card.batch().enqueue_places(
+            stream,
+            &Places {
+                ids: &b.ids,
+                n: t * N_USED,
+                map: side.places(),
+                row_off: c.row_off,
+                n_expert: N_EXPERT,
+            },
+            fault,
+            &mut *tsel,
+        )?;
+        port.hybrid().enqueue_download_tiered(
+            stream,
+            [&b.normed, &b.weights],
+            &b.ids,
+            &[&*tsel],
+            key,
+        )
     }
 
     /// Layer `l`'s card experts, where the slot map puts any, and its shared
@@ -1543,6 +1596,7 @@ impl PromptProgram<'_> {
         let c = self.p.cfg[l];
         let n = self.p.d.embd;
         let card = self.p.card.has(l);
+        let tiered = self.p.card.tier_k(l) > 0;
         let b = &mut *self.b;
         if card {
             ffn::card_rows(
@@ -1561,6 +1615,7 @@ impl PromptProgram<'_> {
                     act_h: &mut b.act_h,
                     down: &mut b.card_down,
                     acc: &mut b.acc,
+                    tiered,
                 },
             )?;
         }
@@ -1581,11 +1636,49 @@ impl PromptProgram<'_> {
                 &mut *span_mut(W, &mut b.sh_y, c0 * n, cn * n)?,
             )?;
         }
-        if card {
+        if card && !tiered {
             gpu.elem()
                 .enqueue_add(stream, &b.acc, &b.sh_y, t * n, &mut b.pre)?;
         }
         Ok(())
+    }
+
+    /// A tiered layer's card sum over the batch, once the walk's serve has
+    /// served the block and the tier's rows have landed
+    /// ([`BatchLeg::join_tiered`], which uploads the host sums after it):
+    /// every token's slots in slot order from the stage card's downs or the
+    /// tier's rows (`ds41_ffn_card_acc_8_tier`), then the shared expert's
+    /// output added — the shadow's two launches of a one-card layer.
+    fn join_tier(&mut self, port: &mut BatchLeg<'_, GlmHost>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
+        let (gpu, t) = (self.gpu, self.t);
+        let n = self.p.d.embd;
+        let n_card = self.p.card.n_card(l);
+        let n_tier = self.p.card.tier_k(l);
+        let batch = self.p.card.batch();
+        let b = &mut *self.b;
+        let tsel = b.tsel.as_ref().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the tier places of a batch made with a tier",
+        })?;
+        let (down, w, sel, acc) = (&b.card_down, &b.weights, &b.sel, &mut b.acc);
+        port.join_tiered(at, |stream, trows| {
+            let a = CardAccTier {
+                down,
+                trows,
+                w,
+                sel,
+                tsel,
+                n,
+                m: t,
+                n_card,
+                n_tier,
+                n_used: N_USED,
+            };
+            batch.enqueue_card_acc_tier(stream, &a, acc)
+        })?;
+        gpu.elem()
+            .enqueue_add(gpu.stream(), &b.acc, &b.sh_y, t * n, &mut b.pre)
     }
 
     /// After the last layer: the last token's streams' mean into the head's
@@ -1655,9 +1748,12 @@ impl<'a> LayerProgram for PromptProgram<'a> {
         if !self.p.cfg[l].kind.host_leg() {
             return Ok(());
         }
+        if self.p.card.tier_k(l) > 0 {
+            self.join_tier(port, at)?;
+        }
         let n = self.p.d.embd;
         let b = &mut *self.b;
-        let shadowed = if self.p.card.has(l) { &b.pre } else { &b.sh_y };
+        let shadowed = if self.p.card.sums(l) { &b.pre } else { &b.sh_y };
         self.gpu.elem().enqueue_add(
             self.gpu.stream(),
             port.hsum(),

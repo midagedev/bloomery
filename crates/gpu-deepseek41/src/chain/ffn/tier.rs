@@ -23,7 +23,7 @@
 //! ([`super::batch::enqueue_tiled_experts`]).
 
 use bloomery_gpu::FaultSite;
-use bloomery_gpu::host::tier::{TierBlock, TierExperts, TierIo, TierSet, TierTarget};
+use bloomery_gpu::host::tier::{TierBlock, TierExperts, TierInput, TierIo, TierSet, TierTarget};
 
 use super::batch::{FfnBatchKernels, TileScratch, TiledBlock, enqueue_tiled_experts};
 
@@ -861,11 +861,18 @@ impl TierExperts for Ds41Tier {
             name: names::ffn_down_exps(layer),
             need: "the tier's routed stacks of a tier layer",
         })?;
+        let TierInput::Q8(act) = io.act else {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: "an f32 tier image: V4.1's tier reads the stage card's q8_1 codes"
+                    .to_string(),
+            });
+        };
         let stream = gpu.stream();
         let args = ExpertGateUp {
             wg: s.gate,
             wu: s.up,
-            act: io.act,
+            act,
             sel: io.sel,
             n_slots: N_USED,
             rows_per_expert: self.ff,

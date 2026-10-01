@@ -984,6 +984,7 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
     tier.enqueue_block(
         layer,
         TierBlock {
+            x: &*stage_x,
             act: &*act,
             sel: &*stage_tsel,
             cols,

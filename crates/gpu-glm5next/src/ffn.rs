@@ -23,6 +23,16 @@
 //!   `hsum + (card + shexp)`, or `hsum + shexp` on a layer without card
 //!   experts (`moe + shexp` as ik adds them). One kernel after the wait.
 //!
+//! A layer the expert tier card holds experts of (a load with a tier,
+//! [`crate::tier`]) runs as a tier layer: the front's handoff also writes the
+//! tier's image (the normed row in f32 and each slot's tier place,
+//! `FfnKernels::enqueue_handoff_tier`) and the go is the host's and the
+//! tier's; the shadow runs the card slots' downs but not their sum; the back
+//! waits for the host and the tier, then sums the card's and the tier's rows
+//! in one weighted sum (`ds41_ffn_card_acc_8_tier`, the card sum's order with
+//! the tier's slots in it), adds the shared expert and the host's sum. The
+//! step graph holds the same node count either way.
+//!
 //! The handoff carries the boundary's eight slots through
 //! `FfnKernels::enqueue_handoff`, which picks its entry by the slot count and
 //! refuses by name a count it has no entry for. Neither post entry of the
@@ -39,7 +49,7 @@ use bloomery_gpu::kquant::{Act, GateUpAct, KquantKernels, SelDown};
 use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, Q8Act};
-use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, FfnBatchKernels, Handoff, Places};
+use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, CardAccTier, FfnBatchKernels, Handoff, Places};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -51,6 +61,7 @@ use models::{Ffn, LayerSpec};
 use crate::body::{Parts, f32t, f32v, gemv, weight};
 use crate::host::GlmHost;
 use crate::tensors::{FfnNames, LayerNames, other_kind};
+use crate::tier::{STAGE_TIER, TierSide};
 
 /// The dense block's launches.
 pub(crate) const DENSE_LAUNCHES: usize = 3;
@@ -88,6 +99,8 @@ pub(crate) struct CardExperts {
     ff: usize,
     /// Each row's buffers, row 0 the step's: a row a KDA lane of the load.
     rows: Vec<CardRow>,
+    /// The stage card's side of the tier layers, on a load with a tier card.
+    tier: Option<TierSide>,
 }
 
 /// One row's buffers of the card experts' shadow.
@@ -192,12 +205,41 @@ impl CardExperts {
             rows: (0..lanes.count())
                 .map(|_| CardRow::new(stream, n_embd, ff))
                 .collect::<Result<Vec<_>, _>>()?,
+            tier: match map.tiers() {
+                0 => None,
+                _ => Some(TierSide::new(gpu, map, layers.len(), lanes.count())?),
+            },
         })
     }
 
     /// Layer `l` computes experts on the card.
     pub(crate) fn has(&self, l: usize) -> bool {
         self.layer(l).is_some()
+    }
+
+    /// The experts of layer `l` the expert tier holds: 0 without a tier.
+    pub(crate) fn tier_k(&self, l: usize) -> usize {
+        self.tier.as_ref().map_or(0, |t| t.k(l))
+    }
+
+    /// Layer `l` has a card sum: card experts on the stage card or the tier.
+    pub(crate) fn sums(&self, l: usize) -> bool {
+        self.has(l) || self.tier_k(l) > 0
+    }
+
+    /// The stage card's side of the tier layers, on a load with a tier card.
+    pub(crate) fn tier(&self) -> Option<&TierSide> {
+        self.tier.as_ref()
+    }
+
+    /// The stage card's experts of layer `l`: 0 off the card.
+    pub(crate) fn n_card(&self, l: usize) -> usize {
+        self.layer(l).map_or(0, |c| c.n_card)
+    }
+
+    /// The batch kernels the card sums run on.
+    pub(crate) fn batch(&self) -> &FfnBatchKernels {
+        &self.batch
     }
 
     fn layer(&self, l: usize) -> Option<CardLayer> {
@@ -216,7 +258,8 @@ impl CardExperts {
 
     /// Device bytes of the buffers.
     pub(crate) fn bytes(&self) -> usize {
-        self.rows.iter().map(CardRow::bytes).sum()
+        self.rows.iter().map(CardRow::bytes).sum::<usize>()
+            + self.tier.as_ref().map_or(0, TierSide::bytes)
     }
 }
 
@@ -243,7 +286,7 @@ fn past_rows(n: usize, row: usize) -> GpuError {
 }
 
 /// Layer `l`'s routed gate, up and down names.
-fn stack_names(l: usize) -> [String; 3] {
+pub(crate) fn stack_names(l: usize) -> [String; 3] {
     [
         names::ffn_gate_exps(l),
         names::ffn_up_exps(l),
@@ -252,22 +295,22 @@ fn stack_names(l: usize) -> [String; 3] {
 }
 
 /// One resident routed stack: its name, file type and words.
-struct Stack<'w> {
-    name: String,
-    ty: GgmlType,
-    w: &'w DeviceTensor<u32>,
+pub(crate) struct Stack<'w> {
+    pub(crate) name: String,
+    pub(crate) ty: GgmlType,
+    pub(crate) w: &'w DeviceTensor<u32>,
 }
 
 /// A layer's three resident routed stacks, each in a format [`card_routed`]
 /// names and the gate and up of one type.
-struct CardStacks<'w> {
-    gate: Stack<'w>,
-    up: Stack<'w>,
-    down: Stack<'w>,
+pub(crate) struct CardStacks<'w> {
+    pub(crate) gate: Stack<'w>,
+    pub(crate) up: Stack<'w>,
+    pub(crate) down: Stack<'w>,
 }
 
 impl<'w> CardStacks<'w> {
-    fn of(w: &'w Weights, l: usize) -> Result<CardStacks<'w>, GpuError> {
+    pub(crate) fn of(w: &'w Weights, l: usize) -> Result<CardStacks<'w>, GpuError> {
         let [gate, up, down] = stack_names(l).map(|name| match w.get(&name) {
             Some(DevWeight::KQuant { ty, w, .. }) if card_routed(*ty).is_some() => {
                 Ok(Stack { name, ty: *ty, w })
@@ -396,6 +439,13 @@ pub(crate) fn front(
         row_off: c.row_off,
         n_expert: N_EXPERT,
     };
+    if let Some(side) = p.card.tier.as_mut().filter(|t| t.k(l) > 0) {
+        let (places, tsel) = side.handoff_parts(p.row)?;
+        let targets = hybrid.tier_handoff(p.row, STAGE_TIER)?;
+        p.k.ffn
+            .enqueue_handoff_tier(stream, &h, places, targets, fault, (&mut s.sel, tsel))?;
+        return hybrid.enqueue_tier_go(stream, l, p.row);
+    }
     let target = hybrid.boundary_mut().handoff_target_of(p.row)?;
     p.k.ffn
         .enqueue_handoff(stream, &h, target, fault, &mut s.sel)?;
@@ -403,7 +453,9 @@ pub(crate) fn front(
 }
 
 /// Enqueue layer `l`'s card experts, when it has any, and its shared expert
-/// in its host leg's shadow, after its [`front`].
+/// in its host leg's shadow, after its [`front`]. On a layer the expert tier
+/// holds experts of, the card sum waits for the tier's rows: it runs in the
+/// [`back`].
 pub(crate) fn shadow(
     gpu: &Gpu,
     w: &Weights,
@@ -414,8 +466,9 @@ pub(crate) fn shadow(
     let c = p.cfg[l];
     let n = p.d.embd;
     let card = p.card.layer(l);
+    let tiered = p.card.tier_k(l) > 0;
     if let Some(cl) = card {
-        card_slots(gpu, w, p, boundary, l, cl)?;
+        card_slots(gpu, w, p, boundary, l, cl, tiered)?;
     }
     let sh = moe_names(p, l)?;
     let s = &mut *p.s;
@@ -428,7 +481,7 @@ pub(crate) fn shadow(
         &mut s.h,
     )?;
     gemv(gpu, w, sh.sh_down, &s.h, &mut s.sh_y)?;
-    if card.is_some() {
+    if card.is_some() && !tiered {
         let k = card_row_mut(&mut p.card.rows, p.row)?;
         gpu.elem()
             .enqueue_add(gpu.stream(), &k.acc, &s.sh_y, n, &mut k.pre)?;
@@ -437,7 +490,9 @@ pub(crate) fn shadow(
 }
 
 /// Layer `l`'s card slots into the card sum `acc` (module doc): every slot
-/// the handoff placed below `cl.n_card` on the card, the host's left alone.
+/// the handoff placed below `cl.n_card` on the card, the host's left alone;
+/// on a `tiered` layer their downs alone, which the [`back`]'s card sum
+/// reads beside the tier's rows.
 fn card_slots(
     gpu: &Gpu,
     w: &Weights,
@@ -445,6 +500,7 @@ fn card_slots(
     boundary: &Boundary,
     l: usize,
     cl: CardLayer,
+    tiered: bool,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let n = p.d.embd;
@@ -505,6 +561,9 @@ fn card_slots(
         )?,
         _ => return Err(unrun(&st.down)),
     }
+    if tiered {
+        return Ok(());
+    }
     let acc = CardAcc {
         down: &k.down,
         w: &s.rout.weights,
@@ -521,7 +580,10 @@ fn card_slots(
 /// and their routing, the places the call writes, and the buffers its chunks
 /// write — each chunk's rows in q8_1 ([`COL_GROUP`] columns), its gate·up
 /// rows a slot, per chunk width `c` the q8_1 of its `c · N_USED` slots'
-/// columns (`act_h[c - 1]`), its downs — and the card sums, `t` rows.
+/// columns (`act_h[c - 1]`), its downs — and the card sums, `t` rows. On a
+/// `tiered` layer the downs are the whole batch's, slot-major from its first
+/// slot, and no card sum is written: the back's sums them with the tier's
+/// rows.
 pub(crate) struct CardRows<'a> {
     pub normed: &'a DeviceBuffer<f32>,
     pub ids: &'a DeviceBuffer<u32>,
@@ -533,6 +595,7 @@ pub(crate) struct CardRows<'a> {
     pub act_h: &'a mut [Q8Act],
     pub down: &'a mut DeviceBuffer<f32>,
     pub acc: &'a mut DeviceBuffer<f32>,
+    pub tiered: bool,
 }
 
 /// Layer `l`'s card slots over a prompt batch's `t` tokens into the card
@@ -609,6 +672,9 @@ pub(crate) fn card_rows(
         };
         gpu.q4k_sel()
             .enqueue_quantize_sel(stream, &q, fault, act_h)?;
+        // A tiered layer keeps every chunk's downs for the back's sum.
+        let d0 = if io.tiered { c0 * N_USED * n } else { 0 };
+        let mut down = span_mut(W, &mut *io.down, d0, slots * n)?;
         match st.down.ty {
             GgmlType::Q5_K => {
                 let a = SelDown {
@@ -618,18 +684,16 @@ pub(crate) fn card_rows(
                     n_slots: slots,
                     rows_per_expert: n,
                 };
-                k.kq.enqueue_gemv_q5k_sel(stream, &a, fault, &mut *io.down)?;
+                k.kq.enqueue_gemv_q5k_sel(stream, &a, fault, &mut down)?;
             }
-            GgmlType::Q4_K => gpu.q4k_sel().enqueue_gemv_q4k_sel(
-                stream,
-                st.down.w,
-                act_h,
-                &sel_c,
-                slots,
-                n,
-                &mut *io.down,
-            )?,
+            GgmlType::Q4_K => gpu
+                .q4k_sel()
+                .enqueue_gemv_q4k_sel(stream, st.down.w, act_h, &sel_c, slots, n, &mut down)?,
             _ => return Err(unrun(&st.down)),
+        }
+        drop(down);
+        if io.tiered {
+            continue;
         }
         let acc = CardAcc {
             down: &*io.down,
@@ -650,7 +714,7 @@ pub(crate) fn card_rows(
 }
 
 /// A stack whose type [`card_routed`] names but no launch here runs.
-fn unrun(st: &Stack<'_>) -> GpuError {
+pub(crate) fn unrun(st: &Stack<'_>) -> GpuError {
     GpuError::Tensor {
         what: CARD,
         name: st.name.clone(),
@@ -660,13 +724,22 @@ fn unrun(st: &Stack<'_>) -> GpuError {
 
 /// Enqueue layer `l`'s wait and the host's routed sum plus its shadow's —
 /// the card sum and the shared expert's output, or the latter alone — into
-/// `out`, after its [`shadow`].
+/// `out`, after its [`shadow`]. On a layer the expert tier holds experts of,
+/// the wait is the host's and the tier's ([`Hybrid::enqueue_tier_back`]),
+/// then the card sum over the stage card's and the tier's slots in slot
+/// order (`ds41_ffn_card_acc_8_tier`) and the shared expert's output added
+/// to it: the shadow's two launches of a one-card layer, after the wait.
 pub(crate) fn back(
     gpu: &Gpu,
     p: &mut Parts<'_>,
-    boundary: &Boundary,
+    hybrid: &Hybrid<GlmHost>,
     l: usize,
 ) -> Result<(), GpuError> {
+    let n_tier = p.card.tier_k(l);
+    if n_tier > 0 {
+        return back_tier(gpu, p, hybrid, l, n_tier);
+    }
+    let boundary = hybrid.boundary();
     let stream = gpu.stream();
     let n = p.d.embd;
     let s = &mut *p.s;
@@ -678,4 +751,53 @@ pub(crate) fn back(
     boundary.enqueue_back_of(stream, p.row)?;
     gpu.elem()
         .enqueue_add(stream, boundary.hsum_of(p.row)?, shadowed, n, &mut s.out)
+}
+
+/// [`back`] of a layer whose `n_tier` experts the expert tier holds.
+fn back_tier(
+    gpu: &Gpu,
+    p: &mut Parts<'_>,
+    hybrid: &Hybrid<GlmHost>,
+    l: usize,
+    n_tier: usize,
+) -> Result<(), GpuError> {
+    const W: &str = "glm5next back (tier layer)";
+    let stream = gpu.stream();
+    let (n, row) = (p.d.embd, p.row);
+    let n_card = p.card.n_card(l);
+    hybrid.enqueue_tier_back(stream, l, row)?;
+    let s = &mut *p.s;
+    let CardExperts {
+        batch, rows, tier, ..
+    } = &mut *p.card;
+    let tsel = tier
+        .as_ref()
+        .ok_or(GpuError::State {
+            what: W,
+            missing: "the stage card's tier side",
+        })?
+        .tsel(row)?;
+    let k = card_row_mut(rows, row)?;
+    let acc = CardAccTier {
+        down: &k.down,
+        trows: hybrid.tier_rows(row)?,
+        w: &s.rout.weights,
+        sel: &s.sel,
+        tsel,
+        n,
+        m: 1,
+        n_card,
+        n_tier,
+        n_used: N_USED,
+    };
+    batch.enqueue_card_acc_tier(stream, &acc, &mut k.acc)?;
+    gpu.elem()
+        .enqueue_add(stream, &k.acc, &s.sh_y, n, &mut k.pre)?;
+    gpu.elem().enqueue_add(
+        stream,
+        hybrid.boundary().hsum_of(row)?,
+        &k.pre,
+        n,
+        &mut s.out,
+    )
 }

@@ -17,7 +17,7 @@ use super::hparams::{Hparams, Kind};
 use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
-use crate::placement::workstation::GRANULE;
+use crate::placement::workstation::{self, GRANULE, TierBatchBytes};
 use crate::placement::{
     self, Card, CardFormat, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine,
     ModelTensor, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
@@ -66,6 +66,27 @@ pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
     match ty {
         GgmlType::Q4_K | GgmlType::Q5_K => CardFormat::of(ty),
         _ => None,
+    }
+}
+
+/// Tokens a chunk of the tier's prompt-batch service runs at most: the
+/// stage card's chunk of the card experts' launches, which the body binds
+/// to its own constant.
+pub const TIER_CHUNK: u64 = 8;
+
+/// The expert tier's prompt-batch bytes ([`TierBatchBytes`]) for blocks of
+/// the host union's columns: the tier card's staging, the chunked card
+/// path's scratch ([`workstation::tier_chunk_scratch_bytes`]) and the host's
+/// rows and places, which the plan reserves on the tier card and the host
+/// and the load checks its allocations against.
+#[must_use]
+pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
+    let (n, ff, used) = (hp.n_embd as u64, hp.expert_ff as u64, hp.n_used as u64);
+    let cols = crate::moe::UNION_MAX_COLS as u64;
+    TierBatchBytes {
+        staging: workstation::tier_batch_staging_bytes(n, used, cols),
+        scratch: workstation::tier_chunk_scratch_bytes(n, ff, used, TIER_CHUNK),
+        host: workstation::tier_batch_host_bytes(n, used, cols),
     }
 }
 

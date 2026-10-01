@@ -1599,6 +1599,18 @@ weekly-gpu-glm5next-e2e-long:
 gate-gpu-glm5next-mtp:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_mtp && bash tools/gpu-gate.sh gate_glm5next_mtp'
 
+# glm5next (GLM-5.3-Flash) on plan (b′): the stage on the A6000, the expert tier on the 3090 (`app::arch::glm5next::open_pair`
+# at --place bp, two KDA lanes, under a 16 GiB card budget on both cards), against a reference load of the same plan whose
+# A6000 holds the stage's and the tier's experts with no tier: the step leg (32 prompt steps, 48 greedy), the pair leg (16
+# verifies of two rows, a third rejected) and the call leg (one 512-position prompt batch, 4 steps after) bit for bit the
+# reference's, tokens, kept counts and logits rows; the stage's step graph of the reference's node count; every tier layer
+# sent a routed slot by each leg, the call's batch served by the tier. Two loads, one after the other. Both cards
+# (BLOOMERY_CARD=both: both gate locks), alone in a batch.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-glm5next-twocard:
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_twocard && bash tools/gpu-gate.sh gate_glm5next_twocard'
+
 # GLM's adaptive expert residency on the gate placement (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P half the
 # plan's least card slots a layer): the churn pool's host refusal at load, the batch prompt one pass keeping 0 and each
 # step 1, every admitted slot byte for byte the file's on a Q4_K layer and on the Q5_K gate/up layer (per-layer parts),

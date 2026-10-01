@@ -9,6 +9,10 @@
 //! and its parts timed sets a [`LegTimer`] on its leg
 //! ([`BatchLeg::set_timer`]) — the architecture's adapter; without one the
 //! leg runs the exchange alone.
+//! A batch walk whose layer's card sum reads the tier's rows (GLM) leaves
+//! the upload to its join ([`BatchLeg::join_tiered`]): the serve does not
+//! upload a tier layer, and the join settles the tiers, enqueues the sum over
+//! their rows, then the upload.
 
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::sched::{At, Overlap, Port, PortKind, Refused};
@@ -231,6 +235,49 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
             None => Ok(()),
         }
     }
+
+    /// Whether `layer` is a tiered layer: one an expert tier holds experts
+    /// of, whose serve leaves the upload to [`BatchLeg::join_tiered`].
+    fn tiered(&self, layer: usize) -> Result<bool, GpuError> {
+        if self.hybrid.tiers().is_empty() {
+            return Ok(false);
+        }
+        Ok(self.hybrid.on_tier(layer)? > 0)
+    }
+
+    /// The join of `at`'s tiered layer after its serve: the expert tier's
+    /// rows of the block, once the host has seen its service complete under
+    /// the go deadline ([`HostTier::tier_rows_of`]: a tier late past it is
+    /// lost), handed to `join` with the stream — the program enqueues the
+    /// card sum that reads them — then the upload of the host sums into the
+    /// leg's `hsum`, marked for the walk's timer when it has one. The rows
+    /// stay readable on the stream until the set's next download. Refused by
+    /// name for a layer no tier holds an expert of, and past the one tier
+    /// card the host tier serves.
+    pub fn join_tiered(
+        &mut self,
+        at: At,
+        join: impl FnOnce(&CudaStream, &DeviceBuffer<f32>) -> Result<(), GpuError>,
+    ) -> Result<(), GpuError> {
+        if !self.tiered(at.layer)? {
+            return Err(GpuError::Shape {
+                what: WHAT_BATCH,
+                detail: format!(
+                    "a tiered join of layer {}, which no expert tier holds an expert of",
+                    at.layer
+                ),
+            });
+        }
+        super::refuse_tier_count(WHAT_BATCH, self.hybrid.tiers().len())?;
+        let key = self.key(at);
+        let rows = self.hybrid.tier_rows_of(key, 0)?;
+        join(self.stream, rows)?;
+        self.hybrid.enqueue_upload(self.stream, self.hsum, key)?;
+        match self.timer.as_deref_mut() {
+            Some(t) => t.upload_mark(self.stream, at.layer),
+            None => Ok(()),
+        }
+    }
 }
 
 impl<H: HostExperts> Port for BatchLeg<'_, H> {
@@ -259,19 +306,26 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
     /// enqueue the upload of their sums into the leg's `hsum`, the serve
     /// timed — its per-expert column counts ([`HostTier::served_union_cols`])
     /// read between the serve and the upload — and the upload marked for the
-    /// walk's timer when it has one.
+    /// walk's timer when it has one. A tiered layer's upload waits for its
+    /// tier's rows: the program's back calls [`BatchLeg::join_tiered`].
     fn serve(&mut self, at: At) -> Result<(), GpuError> {
         let key = self.key(at);
+        let tiered = self.tiered(at.layer)?;
         let Some(t) = self.timer.as_deref_mut() else {
             self.hybrid.serve_key(key)?;
+            if tiered {
+                return Ok(());
+            }
             return self.hybrid.enqueue_upload(self.stream, self.hsum, key);
         };
         let t0 = Instant::now();
         let before = self.hybrid.stats();
         let times = self.hybrid.serve_key(key)?;
         let union_cols = self.hybrid.served_union_cols(key)?;
-        self.hybrid.enqueue_upload(self.stream, self.hsum, key)?;
-        t.upload_mark(self.stream, at.layer)?;
+        if !tiered {
+            self.hybrid.enqueue_upload(self.stream, self.hsum, key)?;
+            t.upload_mark(self.stream, at.layer)?;
+        }
         let after = self.hybrid.stats();
         t.served(ServeNote {
             layer: at.layer,

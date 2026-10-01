@@ -25,8 +25,14 @@ gguf 9 2 0
 # q8_0_gemv_ids_mcol (Qwen3.8's MTP head over its row list at one and at 2..=8 columns, the target's output rows read
 # in place, q8f32.rs) add four blocks each: the id load, the NaN store for an id past the matrix, the row dot and the
 # store, each with its SAFETY line.
-gpu 1373 144 6
-gpu-deepseek41 459 51 0
+# PIN(2026-10-01): gpu 1373 -> 1379 blocks, 144 -> 145 fns, a new kernel entry, not old code relaxed:
+# ds41_ffn_handoff_8_tier (GLM's tier handoff at 8 slots, host/handoff.rs) adds its two calls (handoff_at and
+# handoff_tier_at), handoff_tier_at (the one unsafe fn) and that fn's four blocks, each with its SAFETY line.
+gpu 1379 145 6
+# PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
+# ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
+# card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
+gpu-deepseek41 464 52 0
 gpu-gates 60 5 1
 gpu-glm5next 4 0 0
 gpu-vision 48 0 0

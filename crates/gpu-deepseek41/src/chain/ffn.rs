@@ -77,6 +77,7 @@ use std::sync::Arc;
 use bloomery_gpu::fused::FusedKernels;
 pub use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::handoff::HandoffKernels;
+use bloomery_gpu::host::tier::TierTarget;
 use bloomery_gpu::hybrid::{Boundary, HOST, HandoffTarget, HostExperts, Hybrid, SlotMap};
 use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::weights::{DevWeight, Weights};
@@ -104,8 +105,8 @@ use crate::transpose::TransposeKernels;
 mod batch;
 mod tier;
 pub use batch::{
-    BatchLayer, BlockIo, CardAcc, CardGather, ChunkIo, FfnBatch, FfnBatchKernels, JoinIo, Places,
-    TiledGateUp,
+    BatchLayer, BlockIo, CardAcc, CardAccTier, CardGather, ChunkIo, FfnBatch, FfnBatchKernels,
+    JoinIo, Places, TiledGateUp,
 };
 pub use tier::{Ds41Tier, STAGE_TIER, TierPiece};
 
@@ -809,6 +810,26 @@ impl FfnKernels {
         sel: &mut DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
         self.handoff.enqueue_handoff(stream, h, target, fault, sel)
+    }
+
+    /// Enqueue the handoff of a tier layer of eight slots a token, the tier
+    /// places from `tmap` into `tsel` and the tier image
+    /// ([`HandoffKernels::enqueue_handoff_tier`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one launch's routing, maps, targets, sink and places (rust-quality R8)"
+    )]
+    pub fn enqueue_handoff_tier(
+        &self,
+        stream: &CudaStream,
+        h: &Handoff<'_>,
+        tmap: &DeviceBuffer<u32>,
+        targets: (HandoffTarget<'_>, TierTarget<'_>),
+        fault: FaultSink,
+        sels: (&mut DeviceBuffer<u32>, &mut DeviceBuffer<u32>),
+    ) -> Result<(), GpuError> {
+        self.handoff
+            .enqueue_handoff_tier(stream, h, tmap, targets, fault, sels)
     }
 
     /// Enqueue the combine and HC_POST of `p.n_used` slots a token

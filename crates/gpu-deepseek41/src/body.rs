@@ -75,7 +75,7 @@ use std::sync::Arc;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::{BoundaryAt, PassReport, ResetReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
-use bloomery_gpu::host::tier::{TierCard, TierSet, TierShape};
+use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet, TierShape};
 use bloomery_gpu::host::{PassKind, refuse_tier_count};
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap, refuse_expert_tiers,
@@ -820,14 +820,8 @@ pub struct Body {
 }
 
 /// A tier card a placed load hangs under the host tier
-/// ([`Body::open_placed_tiered`]): the plan's device index its routed
-/// segments sit on (`Device::Card(card)`), and the card's name, by which the
-/// card is found ([`Gpu::for_card`]).
-#[derive(Clone, Debug)]
-pub struct TierOpen {
-    pub card: usize,
-    pub name: String,
-}
+/// ([`Body::open_placed_tiered`]).
+pub use bloomery_gpu::host::tier::TierOpen;
 
 /// `pair[read]` to read and the other to write.
 fn ping<T>(pair: &mut [T; 2], read: usize) -> (&T, &mut T) {
@@ -2447,6 +2441,7 @@ fn open_tier(
             hidden: hp.n_embd,
             n_used: hp.experts.n_used,
             rows: PAIR_ROWS,
+            act: TierAct::Q8,
         },
     )?;
     stage.context().bind_to_thread()?;

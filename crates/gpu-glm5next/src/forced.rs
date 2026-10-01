@@ -131,7 +131,7 @@ impl Body {
                 hybrid.open_step(stream, 1, 1)?;
                 ffn::front(gpu, w, &mut p, hybrid, l)?;
                 ffn::shadow(gpu, w, &mut p, hybrid.boundary(), l)?;
-                ffn::back(gpu, &mut p, hybrid.boundary(), l)?;
+                ffn::back(gpu, &mut p, hybrid, l)?;
                 hybrid.row_enqueued(l, 0)?;
                 let bias = if p.cfg[l].bias {
                     f32v(w, ffn::moe_names(&p, l)?.bias)?

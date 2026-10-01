@@ -21,6 +21,8 @@
 //! - `host`: the host tier's routed stacks;
 //! - [`swap`]: the model's side of adaptive expert residency;
 //! - `tensors`: each layer's tensor names, made at load;
+//! - `tier`: the expert tier card's side of the routed layers, GLM's
+//!   computation on it and the stage card's handoff and card sum around it;
 //! - [`forced`]: one layer alone on given streams, for the gates;
 //! - [`gemm`]: the prompt batch's Q8_0 projections on the tensor-core GEMM,
 //!   no caller yet but its gate.
@@ -37,6 +39,7 @@ mod mla;
 mod program;
 mod swap;
 mod tensors;
+mod tier;
 
 pub use body::nextn::{
     GlmArena, Nextn, NextnFeed, NextnHead, NextnHidden, NextnMode, WALK_ROWS, nextn_chain,
@@ -46,7 +49,10 @@ pub use body::prefill::{
     CHUNK, GlmPromptSink, PrefillMode, StoreDigest, T_MAX, batches_of, call_batches, feed, prefill,
     prefill_mode, prompt_with, set_prefill, store_digests,
 };
-pub use body::{Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, PAIR_ROWS, Plant, prompt, set_taps};
+pub use body::{
+    Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, PAIR_ROWS, Plant, TIER_BEFORE_UPLOAD, prompt,
+    set_taps,
+};
 pub use host::GlmHost;
 pub use model::arch::glm5next::place::KdaLanes;
 pub use program::{layer_launches, step_launches};

@@ -5,7 +5,7 @@
 //! (`app::Loaded`), the prompt fed as `--prefill` says, then `-n` greedy
 //! steps.
 //!
-//! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate]
+//! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate|bp]
 //! [--mode graph|eager] [--prefill batch|steps] [--time [--warm W]]
 //! [--pair] [--logits] [--plan]`
 //!
@@ -14,8 +14,10 @@
 //!   deepest context a reference set checks the selector at
 //!   (`place::ORACLE_POSITIONS`). Default 2048.
 //! - `--place`: `a` is the serving plan (`workstation::plan_a`, the A6000),
-//!   `gate` the gate card's (`workstation::plan_gate`, the 3090). Default
-//!   `gate`.
+//!   `gate` the gate card's (`workstation::plan_gate`, the 3090), `bp` plan
+//!   (b′) (`workstation::plan_bp`: plan (a) on the A6000, the 3090 an expert
+//!   tier under the host tier, its prompt-batch bytes `place::tier_batch`'s).
+//!   Default `gate`. A NextN draft and residency are refused beside `bp`.
 //! - `--prefill`: `batch` feeds the prompt in batches
 //!   (`bloomery_gpu_glm5next::prefill`), `steps` one decode step a position,
 //!   the same bits at any `--ctx`, past the positions the latent layers
@@ -133,6 +135,7 @@ mod cli {
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::residency_set;
@@ -143,7 +146,8 @@ mod cli {
         ResidencyPick, ResidencyWhy, STEP_STATS,
     };
     use gguf::Split;
-    use model::arch::glm5next::place::PlanInputs;
+    use model::arch::glm5next::hparams::Hparams;
+    use model::arch::glm5next::place::{self, PlanInputs};
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use runtime::layer::hosted;
     use runtime::{Advance, Committed, PassSink, Stop, Target, Verify, Want};
@@ -345,12 +349,12 @@ mod cli {
             }
         }
         let ctx: usize = flag("--ctx")?.map_or(Ok(2048), |s| s.parse())?;
-        let (place, machine): (&'static str, fn(usize) -> Machine) =
-            match flag("--place")?.as_deref() {
-                None | Some("gate") => ("gate", workstation::plan_gate),
-                Some("a") => ("a", workstation::plan_a),
-                Some(o) => return Err(format!("--place is a or gate, not {o}").into()),
-            };
+        let place: &'static str = match flag("--place")?.as_deref() {
+            None | Some("gate") => "gate",
+            Some("a") => "a",
+            Some("bp") => "bp",
+            Some(o) => return Err(format!("--place is a, gate or bp, not {o}").into()),
+        };
         let mode = match flag("--mode")?.as_deref() {
             None | Some("graph") => StepMode::Graph,
             Some("eager") => StepMode::Eager,
@@ -386,6 +390,16 @@ mod cli {
         }
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
+        let machine: Box<dyn Fn(usize) -> Machine> = match place {
+            "a" => Box::new(workstation::plan_a),
+            "bp" => {
+                // Plan (b′): plan (a) on the A6000, the 3090 the host tier's
+                // expert tier, its prompt-batch bytes GLM's own.
+                let hp = Hparams::read(&file)?;
+                Box::new(Place::Bp.machine(None, Some(place::tier_batch(&hp)))?)
+            }
+            _ => Box::new(workstation::plan_gate),
+        };
         let trace = trace_of(
             &levers,
             &file,

@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, sys};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
+use model::placement::Machine;
 
 use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
@@ -193,6 +194,33 @@ impl TierSet {
     }
 }
 
+/// A tier card a placed load hangs under the host tier: the plan's device
+/// index its routed segments sit on (`Device::Card(card)`), and the card's
+/// name, by which the card is found ([`Gpu::for_card`]).
+#[derive(Clone, Debug)]
+pub struct TierOpen {
+    pub card: usize,
+    pub name: String,
+}
+
+impl TierOpen {
+    /// The expert tier cards `machine` names, in tier order: each card's
+    /// index in [`Machine::all_cards`] (after the stage cards) and its name.
+    /// Empty without a tier.
+    #[must_use]
+    pub fn of_machine(machine: &Machine) -> Vec<TierOpen> {
+        machine
+            .tiers
+            .iter()
+            .enumerate()
+            .map(|(i, t)| TierOpen {
+                card: machine.cards.len() + i,
+                name: t.name.clone(),
+            })
+            .collect()
+    }
+}
+
 // ------------------------------------------------------------------ page
 
 /// One tier's flag words on the page, one 64-byte line each, from the
@@ -228,20 +256,24 @@ const TIER_FLAGS: usize = 128 * MAX_ROWS + 128;
 const _: () = assert!(TWord::Fault.offset() + 8 <= TIER_FLAGS);
 
 /// One row's tier image as one tier reads it, in words from its start: that
-/// tier's places of the routed slots (`n_used` at `sel`), the stage card's
-/// q8_1 activation codes (`q3_words` u32 at `q3`: the u64 codes as word
-/// pairs) and its block scales (`d8_len` f32 at `d8`), each field at a
-/// 256-byte boundary. Every tier's image of a row has the same `q3` and `d8`
-/// and its own `sel` ([`TierLayout::image`]).
+/// tier's places of the routed slots (`n_used` at `sel`), then the
+/// activation in the form the architecture's [`TierAct`] names — the stage
+/// card's q8_1 codes (`q3_words` u32 at `q3`: the u64 codes as word pairs)
+/// and its block scales (`d8_len` f32 at `d8`), or the normed activation
+/// itself (`x_len` f32 at `x`) — each field at a 256-byte boundary; the
+/// fields of the other form are empty. Every tier's image of a row has the
+/// same activation and its own `sel` ([`TierLayout::image`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierImageLayout {
     pub sel: usize,
     pub q3: usize,
     pub d8: usize,
+    pub x: usize,
     pub n_used: usize,
     /// u32 words of the q8_1 codes: twice the activation's u64 codes.
     pub q3_words: usize,
     pub d8_len: usize,
+    pub x_len: usize,
     pub hidden: usize,
 }
 
@@ -249,7 +281,31 @@ impl TierImageLayout {
     /// Words of the row's image, every tier's places with it.
     #[must_use]
     pub fn words(&self) -> usize {
-        self.d8 + self.d8_len
+        self.x + self.x_len
+    }
+}
+
+/// The activation a row's tier image carries, the architecture's choice
+/// ([`TierShape::act`]): what its tier kernels read decides it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierAct {
+    /// The stage card's q8_1 codes and block scales of the normed
+    /// activation, which the tier's kernels read as staged.
+    Q8,
+    /// The normed activation in f32, which the architecture quantizes on
+    /// the tier card itself, with the stage card's quantizer.
+    F32,
+}
+
+impl TierAct {
+    /// Copies from the page a tier layer stages: the activation's fields
+    /// and the places.
+    #[must_use]
+    pub const fn copies(self) -> usize {
+        match self {
+            TierAct::Q8 => 3,
+            TierAct::F32 => 2,
+        }
     }
 }
 
@@ -269,10 +325,13 @@ pub struct TierLayout {
 }
 
 impl TierLayout {
-    /// The layout of `shape`'s rows over an activation whose q8_1 codes are
-    /// `q3_u64` u64 and its scales `d8_len` f32, for `tiers` tiers; a size
-    /// past `usize`, a row count outside `1..=MAX_ROWS` and a tier count
-    /// outside `1..=MAX_TIERS` are refused by name.
+    /// The layout of `shape`'s rows for `tiers` tiers over an activation
+    /// whose q8_1 codes are `q3_u64` u64 and its scales `d8_len` f32 when
+    /// `shape.act` is [`TierAct::Q8`], or its `hidden` f32 values when it is
+    /// [`TierAct::F32`] (codes and scales then empty); a size past `usize`, a
+    /// row count outside `1..=MAX_ROWS`, a tier count outside
+    /// `1..=MAX_TIERS` and an f32 image given codes or scales are refused by
+    /// name.
     pub fn new(
         shape: TierShape,
         q3_u64: usize,
@@ -284,15 +343,20 @@ impl TierLayout {
             hidden,
             n_used,
             rows,
+            act,
         } = shape;
         if !(1..=MAX_ROWS).contains(&rows)
             || !(1..=MAX_TIERS).contains(&tiers)
             || hidden == 0
             || n_used == 0
+            || (act == TierAct::F32 && (q3_u64, d8_len) != (0, 0))
         {
             return Err(GpuError::shape(
                 WHAT,
-                format!("{rows} rows of {hidden} values, {n_used} slots, {tiers} tiers"),
+                format!(
+                    "{rows} rows of {hidden} values, {n_used} slots, {tiers} tiers, an {act:?} \
+                     image of {q3_u64} codes and {d8_len} scales"
+                ),
             ));
         }
         let o = || GpuError::shape(WHAT, "the page's size passes usize");
@@ -303,13 +367,19 @@ impl TierLayout {
             .checked_add(q3_words)
             .map(|w| w.next_multiple_of(64))
             .ok_or_else(o)?;
+        let (x, x_len) = match act {
+            TierAct::Q8 => (d8.checked_add(d8_len).ok_or_else(o)?, 0),
+            TierAct::F32 => (d8, hidden),
+        };
         let image = TierImageLayout {
             sel: 0,
             q3,
             d8,
+            x,
             n_used,
             q3_words,
             d8_len,
+            x_len,
             hidden,
         };
         let image_stride = image
@@ -396,12 +466,13 @@ impl TierLayout {
 }
 
 /// The shapes a tier is cut for: the model width, the routed slots a token,
-/// the rows (tokens) in flight.
+/// the rows (tokens) in flight, and the activation its image carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierShape {
     pub hidden: usize,
     pub n_used: usize,
     pub rows: usize,
+    pub act: TierAct,
 }
 
 /// One row's windows over the page as the stage card's launches address
@@ -663,15 +734,24 @@ mod tier_kernels {
 // ------------------------------------------------------------- the card
 
 /// What the tier's layer computes, supplied by the architecture: over the
-/// staged activation `act` (the stage card's q8_1 codes and scales of the
-/// normed activation, one column), each routed slot whose place in `sel`
-/// (`n_used` places, a tier slot or [`super::slots::HOST`]) is a tier slot
-/// runs its expert and writes its down output over `rows[j · hidden ..]`
-/// for its routed slot `j`; no other row is written.
+/// staged activation `act` (one column, in the form [`TierShape::act`]
+/// names), each routed slot whose place in `sel` (`n_used` places, a tier
+/// slot or [`super::slots::HOST`]) is a tier slot runs its expert and writes
+/// its down output over `rows[j · hidden ..]` for its routed slot `j`; no
+/// other row is written.
 pub struct TierIo<'a> {
-    pub act: &'a Q8Act,
+    pub act: TierInput<'a>,
     pub sel: &'a DeviceBuffer<u32>,
     pub rows: &'a mut DeviceBuffer<f32>,
+}
+
+/// A tier layer's staged activation: the stage card's q8_1 codes and scales
+/// of the normed activation ([`TierAct::Q8`]), or the normed activation in
+/// f32 ([`TierAct::F32`]).
+#[derive(Clone, Copy)]
+pub enum TierInput<'a> {
+    Q8(&'a Q8Act),
+    F32(&'a DeviceBuffer<f32>),
 }
 
 /// The architecture's tier computation: layer `layer`'s tier experts over
@@ -707,12 +787,14 @@ pub trait TierExperts {
 }
 
 /// A block of a prompt batch as the tier's batch service hands it to the
-/// architecture ([`TierExperts::enqueue_block`]): the q8_1 form of its
-/// `cols` token columns from column 0, each of its `n_used · cols` slots'
-/// tier place (a tier slot, or [`super::slots::HOST`] for a slot the tier
-/// does not compute), and the down outputs, slot-major (`hidden` a slot), of
-/// which the tier's slots' rows are written and no other.
+/// architecture ([`TierExperts::enqueue_block`]): its `cols` token columns
+/// from column 0 in f32 (`x`, `hidden` a column) and in q8_1 form (`act`,
+/// the quantizer's over `x`), each of its `n_used · cols` slots' tier place
+/// (a tier slot, or [`super::slots::HOST`] for a slot the tier does not
+/// compute), and the down outputs, slot-major (`hidden` a slot), of which
+/// the tier's slots' rows are written and no other.
 pub struct TierBlock<'a> {
+    pub x: &'a DeviceBuffer<f32>,
     pub act: &'a Q8Act,
     pub sel: &'a DeviceBuffer<u32>,
     pub cols: usize,
@@ -782,7 +864,7 @@ pub struct TierCard {
     module: tier_kernels::LoadedModule,
     /// The staged activation and places a layer's kernels read, copied in
     /// from the row's image.
-    act: Q8Act,
+    act: Staged,
     sel: DeviceBuffer<u32>,
     /// Per row, the page's routed rows in this card's context: made when the
     /// host tier binds the card to its page ([`TierCard::bind`]).
@@ -818,10 +900,14 @@ impl TierCard {
         let ctx = Arc::clone(gpu.context());
         ctx.bind_to_thread()?;
         let stream = gpu.stream();
-        let act = Q8Act::with_k(stream, 1, shape.hidden)?;
+        let act = match shape.act {
+            TierAct::Q8 => Staged::Q8(Q8Act::with_k(stream, 1, shape.hidden)?),
+            TierAct::F32 => Staged::F32(DeviceBuffer::zeroed(stream, shape.hidden)?),
+        };
         // The shape is checked once here, as the page the card binds to
         // will be laid out.
-        TierLayout::new(shape, act.q3.len(), act.d8.len(), 1)?;
+        let (q3, d8) = act.planes();
+        TierLayout::new(shape, q3, d8, 1)?;
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; its launcher checks the launch contract.
         let module = unsafe { tier_kernels::load(&ctx)? };
@@ -882,7 +968,8 @@ impl TierCard {
 
     /// The layout of a page of `tiers` tiers this card's staging reads.
     pub(super) fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
-        TierLayout::new(self.shape, self.act.q3.len(), self.act.d8.len(), tiers)
+        let (q3, d8) = self.act.planes();
+        TierLayout::new(self.shape, q3, d8, tiers)
     }
 
     /// What the tier has done since load.
@@ -897,12 +984,13 @@ impl TierCard {
         self.act.device_bytes() + self.sel.num_bytes()
     }
 
-    /// Nodes per tier layer of a captured tier graph: the go wait, three
-    /// copies in, the architecture's launches (`launches`) and the signal;
-    /// the graph's last layer adds the fault copy.
+    /// Nodes per tier layer of a captured tier graph whose image carries
+    /// `act`: the go wait, the copies in ([`TierAct::copies`]), the
+    /// architecture's launches (`launches`) and the signal; the graph's last
+    /// layer adds the fault copy.
     #[must_use]
-    pub const fn nodes_per_layer(launches: usize) -> usize {
-        1 + 3 + launches + 1
+    pub const fn nodes_per_layer(act: TierAct, launches: usize) -> usize {
+        1 + act.copies() + launches + 1
     }
 
     /// Nodes of `chain`'s captured tier graph; `None` before its first
@@ -1313,11 +1401,43 @@ fn chain_slot(chain: Chain) -> Result<usize, GpuError> {
     }
 }
 
+/// A tier card's staging of a row's activation, in its image's form
+/// ([`TierAct`]).
+enum Staged {
+    Q8(Q8Act),
+    F32(DeviceBuffer<f32>),
+}
+
+impl Staged {
+    /// The q8_1 codes (u64) and scales the staging holds: none for f32.
+    fn planes(&self) -> (usize, usize) {
+        match self {
+            Staged::Q8(a) => (a.q3.len(), a.d8.len()),
+            Staged::F32(_) => (0, 0),
+        }
+    }
+
+    fn device_bytes(&self) -> usize {
+        match self {
+            Staged::Q8(a) => a.device_bytes(),
+            Staged::F32(x) => x.num_bytes(),
+        }
+    }
+
+    /// The staging as the architecture's launches read it.
+    fn input(&self) -> TierInput<'_> {
+        match self {
+            Staged::Q8(a) => TierInput::Q8(a),
+            Staged::F32(x) => TierInput::F32(x),
+        }
+    }
+}
+
 /// The card's parts one tier layer's enqueue reads and writes.
 struct Parts<'a> {
     experts: &'a mut dyn TierExperts,
     module: &'a tier_kernels::LoadedModule,
-    act: &'a mut Q8Act,
+    act: &'a mut Staged,
     sel: &'a mut DeviceBuffer<u32>,
     rows: &'a mut [TierRows],
     page: &'a TierPage,
@@ -1328,8 +1448,9 @@ struct Parts<'a> {
 
 impl Parts<'_> {
     /// Layer `layer` of row `row` on the tier's stream: wait for the row's
-    /// go and take it back, copy the row's image — the q8_1 codes, their
-    /// scales, this tier's places — into the staging, the architecture's
+    /// go and take it back, copy the row's image — the activation (the q8_1
+    /// codes and their scales, or the f32 values), this tier's places — into
+    /// the staging, the architecture's
     /// launches into the row's routed rows, then (when `copy_fault`) the
     /// fault copy, a system barrier and the row's counter and the progress
     /// word each plus one.
@@ -1355,27 +1476,38 @@ impl Parts<'_> {
             "cuStreamBatchMemOp_v2 (tier go)",
         )?;
         let at = page.layout.image_off(row);
-        if self.act.q3.len() * 2 != img.q3_words
-            || self.act.d8.len() != img.d8_len
-            || self.sel.len() != img.n_used
-        {
+        let staged = match &*self.act {
+            Staged::Q8(a) => a.q3.len() * 2 == img.q3_words && a.d8.len() == img.d8_len,
+            Staged::F32(x) => x.len() == img.x_len && img.q3_words + img.d8_len == 0,
+        };
+        if !staged || self.sel.len() != img.n_used {
             return Err(GpuError::shape(
                 WHAT,
                 "the staging is not the image's shape".to_string(),
             ));
         }
-        copy_in(
-            stream,
-            self.act.q3.cu_deviceptr(),
-            page.page.dev_at(at + 4 * img.q3),
-            4 * img.q3_words,
-        )?;
-        copy_in(
-            stream,
-            self.act.d8.cu_deviceptr(),
-            page.page.dev_at(at + 4 * img.d8),
-            4 * img.d8_len,
-        )?;
+        match &*self.act {
+            Staged::Q8(a) => {
+                copy_in(
+                    stream,
+                    a.q3.cu_deviceptr(),
+                    page.page.dev_at(at + 4 * img.q3),
+                    4 * img.q3_words,
+                )?;
+                copy_in(
+                    stream,
+                    a.d8.cu_deviceptr(),
+                    page.page.dev_at(at + 4 * img.d8),
+                    4 * img.d8_len,
+                )?;
+            }
+            Staged::F32(x) => copy_in(
+                stream,
+                x.cu_deviceptr(),
+                page.page.dev_at(at + 4 * img.x),
+                4 * img.x_len,
+            )?,
+        }
         copy_in(
             stream,
             self.sel.cu_deviceptr(),
@@ -1388,7 +1520,7 @@ impl Parts<'_> {
             self.weights,
             layer,
             TierIo {
-                act: self.act,
+                act: self.act.input(),
                 sel: self.sel,
                 rows: &mut r.0,
             },
@@ -1439,7 +1571,7 @@ fn copy_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{TIER_FLAGS, TWord, TierLayout, TierSet, TierShape};
+    use super::{TIER_FLAGS, TWord, TierAct, TierLayout, TierSet, TierShape};
     use crate::host::slots::{HOST, Slot, SlotMap, TIER};
 
     /// A set's rows are ascending ids below the stack, each once; a map's
@@ -1489,6 +1621,7 @@ mod tests {
         hidden: 4096,
         n_used: 6,
         rows: 2,
+        act: TierAct::Q8,
     };
 
     /// V4.1's tier page of one tier: two rows of six slots over 4096 values,
@@ -1549,5 +1682,31 @@ mod tests {
                 .all(|w| w[0].sel + w[0].n_used <= w[1].sel)
         );
         assert!(l.image(3).is_err());
+    }
+
+    /// GLM's tier page of one tier: two rows of eight slots over the 4096
+    /// f32 of the normed activation, the activation at the first 256-byte
+    /// boundary past the places, no codes and no scales; an f32 image handed
+    /// codes or scales is refused.
+    #[test]
+    fn an_f32_tier_page_keeps_its_fields_apart() {
+        let glm = TierShape {
+            hidden: 4096,
+            n_used: 8,
+            rows: 2,
+            act: TierAct::F32,
+        };
+        let l = TierLayout::new(glm, 0, 0, 1).expect("GLM's tier page");
+        let i = l.image(0).expect("tier 0");
+        assert_eq!(
+            (i.sel, i.x, i.x_len, i.q3_words, i.d8_len),
+            (0, 64, 4096, 0, 0)
+        );
+        assert_eq!(i.words(), 64 + 4096);
+        assert!(l.rows_off(0) >= l.image_off(1) + 4 * i.words());
+        assert!(l.bytes().unwrap() >= l.rows_off(1) + 4 * 8 * 4096);
+        assert!(TierLayout::new(glm, 512, 0, 1).is_err());
+        assert!(TierLayout::new(glm, 0, 32, 1).is_err());
+        assert_eq!(TierAct::F32.copies() + 1, TierAct::Q8.copies());
     }
 }

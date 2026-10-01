@@ -57,10 +57,12 @@ use std::sync::Arc;
 use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
+use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::swap::{BoundaryAt, PassReport, ResetReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
+use bloomery_gpu::host::tier::TierOpen;
 use bloomery_gpu::hybrid::{
-    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap, refuse_expert_tiers,
+    Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap,
 };
 use bloomery_gpu::kpool::{self, KpoolKernels};
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, LatentKernels, POOL, pools_for};
@@ -91,6 +93,7 @@ use crate::host::GlmHost;
 use crate::program;
 use crate::swap;
 use crate::tensors::LayerNames;
+use crate::tier;
 
 #[path = "prefill.rs"]
 pub mod prefill;
@@ -912,6 +915,42 @@ fn refuse_other_lanes(
     Ok(())
 }
 
+/// Refused by name, before anything uploads, unless the expert tier cards
+/// `tiers` of `plan` are ones this load hangs: at most the cards the host
+/// tier serves ([`refuse_tier_count`]), none beside a residency other than
+/// `off` (the residency machine's moves are not built beside a tier here),
+/// and a slot map with every expert on one device.
+fn refuse_tiers_before_upload(
+    plan: &Plan<'_>,
+    inputs: &PlanInputs,
+    card: usize,
+    tiers: &[TierOpen],
+    residency: Residency,
+) -> Result<(), GpuError> {
+    if tiers.is_empty() {
+        return Ok(());
+    }
+    refuse_tier_count(TIER_BEFORE_UPLOAD, tiers.len())?;
+    if residency != Residency::Off {
+        return Err(GpuError::Shape {
+            what: TIER_BEFORE_UPLOAD,
+            detail: format!(
+                "an expert tier card beside BLOOMERY_RESIDENCY {residency:?}: residency on a \
+                 tiered GLM load is not built; use BLOOMERY_RESIDENCY=off"
+            ),
+        });
+    }
+    let run = host_run(&inputs.spec.layers, None)?;
+    let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+    SlotMap::of_plan_tiers(plan, card, &cards, run, N_EXPERT)
+        .map_err(|e| GpuError::plan(TIER_BEFORE_UPLOAD, e))?;
+    Ok(())
+}
+
+/// What a tiered load's checks before any upload are named as in their
+/// refusals ([`Body::open_placed_lanes`]).
+pub const TIER_BEFORE_UPLOAD: &str = "glm5next Body::open_placed_lanes (before upload)";
+
 /// The host tier's run over the trunk `layers`: its routed layers, and on a
 /// NextN load the next-token layer `nextn` after them — the slot map's
 /// layers. Refused by name: a trunk with no routed run, and a next-token
@@ -968,13 +1007,18 @@ impl Body {
     /// plan's host set also holds each layer's churn pool — the card's
     /// experts past the pinned ones — and the body keeps the load's
     /// [`ResidencyGlue`], whose machine it starts once its pieces are sized
-    /// ([`HostServed::start_residency`]). Refused by name: a plan with an
-    /// expert tier card (before anything uploads), a plan of more than one
-    /// card, a layer kind or a width no kernel here runs, routed layers that
-    /// are not one run, and the machine's own refusals at the load (the
-    /// churn pool past the host's headroom, a layer whose stacks the common
-    /// file source cannot take), a plan made for other lanes
-    /// ([`PlanInputs::plan_lanes`]).
+    /// ([`HostServed::start_residency`]). The plan's expert tier card, when
+    /// it names one, is hung under the host tier ([`TierOpen::of_machine`]):
+    /// its routed segments load onto that card, the slot map sends their
+    /// experts to it, and each layer that holds one runs as a tier layer
+    /// ([`crate::tier`]). Refused by name: more tier cards than the host
+    /// tier serves, a tier beside residency other than `off`, and a slot map
+    /// that puts an expert on two devices (each before anything uploads), a
+    /// plan of more than one stage card, a layer kind or a width no kernel
+    /// here runs, routed layers that are not one run, and the machine's own
+    /// refusals at the load (the churn pool past the host's headroom, a layer
+    /// whose stacks the common file source cannot take), a plan made for
+    /// other lanes ([`PlanInputs::plan_lanes`]).
     #[allow(
         clippy::too_many_arguments,
         reason = "the load's file, plan, inputs and card, the host tier's levers and residency, and the KDA lanes (rust-quality R8)"
@@ -988,7 +1032,8 @@ impl Body {
         residency: Residency,
         lanes: KdaLanes,
     ) -> Result<Glm5nextModel, GpuError> {
-        refuse_expert_tiers(WHAT, plan.machine)?;
+        let tiers = TierOpen::of_machine(plan.machine);
+        refuse_tiers_before_upload(plan, inputs, card, &tiers, residency)?;
         refuse_other_lanes(plan, inputs, card, lanes)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         // The host tier's run — the layers the body's slot map holds, which
@@ -1012,7 +1057,16 @@ impl Body {
             |stream, _, layers, w| Body::derive(stream, &kinds, layers, w),
             |gpu, file, w, set, glue| {
                 Body::load_placed(
-                    gpu, file, w, plan, inputs, card, host, set, glue, residency, lanes, None,
+                    gpu,
+                    file,
+                    w,
+                    (plan, inputs, card, &tiers),
+                    host,
+                    set,
+                    glue,
+                    residency,
+                    lanes,
+                    None,
                 )
             },
         )
@@ -1062,7 +1116,13 @@ impl Body {
         residency: Residency,
     ) -> Result<Glm5nextModel, GpuError> {
         let target = &plan.plan;
-        refuse_expert_tiers(WHAT, target.machine)?;
+        if !target.machine.tiers.is_empty() {
+            return Err(shape(format!(
+                "a NextN load beside {} expert tier card(s): the next-token layer's walk is not \
+                 built on the tier (the tier serves the target's step and verify only)",
+                target.machine.tiers.len()
+            )));
+        }
         refuse_other_lanes(target, inputs, card, KdaLanes::Two)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         // The slot map's layers: the trunk's routed run and the next-token
@@ -1090,9 +1150,7 @@ impl Body {
                     gpu,
                     file,
                     w,
-                    target,
-                    inputs,
-                    card,
+                    (target, inputs, card, &[]),
                     host,
                     set,
                     glue,
@@ -1159,15 +1217,13 @@ impl Body {
     /// the chain ([`Body::open_placed_nextn`]).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card, file, weights, plan and inputs, the host tier's residency and levers, the residency glue, the KDA lanes and the NextN plan (rust-quality R8)"
+        reason = "the load's card, file, weights, plan, inputs and tiers, the host tier's residency and levers, the residency glue, the KDA lanes and the NextN plan (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
         file: &Arc<Split>,
         w: &Weights,
-        plan: &Plan<'_>,
-        inputs: &PlanInputs,
-        card: usize,
+        (plan, inputs, card, tiers): (&Plan<'_>, &PlanInputs, usize, &[TierOpen]),
         host: HostCfg,
         residency: HostResidency,
         glue: ResidencyGlue,
@@ -1206,7 +1262,8 @@ impl Body {
             .map_err(|_| shape(format!("dense positions {}", place::dense_positions(hp))))?;
         let run = host_run(&spec.layers, nextn.map(|(_, n)| n.index))?;
         let dims = dims_of(inputs)?;
-        let map = SlotMap::of_plan(plan, card, None, run.clone(), N_EXPERT)?;
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), N_EXPERT)?;
         let cfg = spec
             .layers
             .iter()
@@ -1254,9 +1311,34 @@ impl Body {
         )?;
         let file = Arc::clone(file);
         let experts = GlmHost::build(Arc::clone(&file), hp, run.clone(), host.r8)?;
+        let tier_cards = tiers
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                tier::open_tier(
+                    gpu,
+                    &file,
+                    plan,
+                    t,
+                    i,
+                    &spec.layers,
+                    &map,
+                    [dims.embd, hp.expert_ff, lanes.count()],
+                    host.card_dontneed,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut hybrid = Hybrid::new(boundary, map, experts, run.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(residency);
+        if !tier_cards.is_empty() {
+            let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+            hybrid.attach_tiers(tier_cards, gpu)?;
+            // The tier's batch staging is reserved on its card by the plan, so
+            // it is made at load, not at the first prompt.
+            hybrid.prepare_batch(gpu.context(), prefill::T_MAX.min(ctx))?;
+            hybrid.check_tier_reserves(plan.machine, &cards)?;
+        }
         let embd = Embedding::new(file, dims.embd)?;
         if embd.n_vocab != hp.n_vocab {
             return Err(shape(format!(

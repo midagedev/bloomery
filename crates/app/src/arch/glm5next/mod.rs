@@ -21,7 +21,6 @@
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::hybrid::refuse_expert_tiers;
 use bloomery_gpu_glm5next::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
 use gguf::Split;
@@ -59,8 +58,9 @@ impl Open for Body {
     }
 
     /// The plan on `machine` at one KDA lane, refused unless its layers sit
-    /// on one card: the chain runs on one. A placement with an expert tier
-    /// card is refused: the load hangs no tier under its host tier.
+    /// on one card: the chain runs on one. A placement's expert tier card is
+    /// hung under the host tier by the load ([`Body::open_placed`]), which
+    /// refuses more than the host tier serves.
     fn plan<'a>(
         inputs: &'a PlanInputs,
         machine: &'a Machine,
@@ -76,7 +76,6 @@ impl Open for Body {
                 ),
             });
         }
-        refuse_expert_tiers(WHAT, machine)?;
         let ctx = u64::try_from(ctx).map_err(|_| GpuError::Shape {
             what: WHAT,
             detail: format!("a context of {ctx} positions passes u64"),
@@ -122,7 +121,7 @@ pub fn open_nextn<M: Fn(usize) -> Machine>(
 ) -> Result<Option<Session<Body>>, SessionError> {
     let inputs = <Body as Open>::inputs(&file)?;
     let nextn = NextnInputs::read(&inputs).map_err(|e| GpuError::plan(WHAT, e))?;
-    let (machine, ctx) = one_card(&args, &inputs)?;
+    let (machine, ctx) = one_card(&args, &inputs, Tiers::Refused)?;
     let plan = inputs
         .plan_nextn(&machine, ctx, &args.cfg.place, &nextn)
         .map_err(|e| GpuError::plan(WHAT, e))?;
@@ -148,7 +147,7 @@ pub fn open_pair<M: Fn(usize) -> Machine>(
     log: &mut impl OpenLog<Body>,
 ) -> Result<Option<Session<Body>>, SessionError> {
     let inputs = <Body as Open>::inputs(&file)?;
-    let (machine, ctx) = one_card(&args, &inputs)?;
+    let (machine, ctx) = one_card(&args, &inputs, Tiers::Hung)?;
     let plan = inputs
         .plan_lanes(&machine, ctx, &args.cfg.place, KdaLanes::Two)
         .map_err(|e| GpuError::plan(WHAT, e))?;
@@ -168,11 +167,22 @@ pub fn open_pair<M: Fn(usize) -> Machine>(
     ready(model, args.mode, args.cfg, ctx, log)
 }
 
+/// Whether a session's open hangs the placement's expert tier cards under
+/// the host tier, or refuses them by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tiers {
+    Hung,
+    /// The NextN load: the next-token layer's walk is not built on a tier.
+    Refused,
+}
+
 /// `args`' machine for `inputs` and its context, refused by name unless the
-/// machine is one card without an expert tier ([`Open::plan`]'s rule).
+/// machine is one stage card ([`Open::plan`]'s rule) and, under
+/// [`Tiers::Refused`], has no expert tier card.
 fn one_card<M: Fn(usize) -> Machine>(
     args: &OpenArgs<GlmCfg, M>,
     inputs: &PlanInputs,
+    tiers: Tiers,
 ) -> Result<(Machine, u64), SessionError> {
     let machine = (args.machine)(<Body as Open>::layer_count(inputs));
     if machine.cards.len() != 1 {
@@ -185,7 +195,17 @@ fn one_card<M: Fn(usize) -> Machine>(
         }
         .into());
     }
-    refuse_expert_tiers(WHAT, &machine)?;
+    if tiers == Tiers::Refused && !machine.tiers.is_empty() {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "a NextN session beside {} expert tier card(s): the next-token layer's walk is not \
+                 built on the tier; open it on one card (--place a or gate)",
+                machine.tiers.len()
+            ),
+        }
+        .into());
+    }
     let ctx = u64::try_from(args.ctx).map_err(|_| GpuError::Shape {
         what: WHAT,
         detail: format!("a context of {} positions passes u64", args.ctx),

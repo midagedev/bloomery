@@ -855,6 +855,61 @@ mod ffn_batch_kernels {
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
+
+    /// [`ds41_ffn_card_acc_8`] over the stage card's and the expert tier's
+    /// slots ([`card_acc_tier_at`]): a slot on the stage card read from
+    /// `down`, one on the tier from `trows`, each at its turn in slot order —
+    /// the one-card sum over the union of the two cards' slots.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 8 * n * m,
+            trows.len() >= 8 * n * m,
+            w.len() >= 8 * m,
+            sel.len() >= 8 * m,
+            tsel.len() >= 8 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_8_tier(
+        down: &[f32],
+        trows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        n_tier: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let a = AccTierIn {
+            down,
+            trows,
+            w,
+            sel,
+            tsel,
+            n_card,
+            n_tier,
+        };
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_8 slots.
+        let v = unsafe { card_acc_tier_at::<SLOTS_8>(&a, n, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
 }
 
 /// What a gather entry of `N` slots a token reads ([`gather_at`]): its
@@ -951,6 +1006,58 @@ unsafe fn card_acc_at<const N: usize>(
         if place < n_card {
             // SAFETY: s < N·m and d < n, so s·n + d < N·n·m <= down.len().
             let ds = unsafe { *down.get_unchecked(s * n + d) };
+            acc = ds.mul_add(ws, acc);
+        }
+    }
+    acc
+}
+
+/// What a tier card sum of `N` slots a token reads ([`card_acc_tier_at`]):
+/// the stage card's down outputs and the tier's (slot-major), the weights,
+/// each slot's stage and tier place, and the two cards' expert counts.
+struct AccTierIn<'a> {
+    down: &'a [f32],
+    trows: &'a [f32],
+    w: &'a [f32],
+    sel: &'a [u32],
+    tsel: &'a [u32],
+    n_card: u32,
+    n_tier: u32,
+}
+
+/// [`card_acc_at`]'s sum with the expert tier's slots in it: `acc =
+/// fma(row, w[Nt + j], acc)` from zero for each slot `j` below `N` in
+/// ascending `j`, `row` the stage card's `down[(Nt + j)·n + d]` when its
+/// place `sel[Nt + j]` is below `n_card`, else the tier's `trows[(Nt +
+/// j)·n + d]` when its tier place `tsel[Nt + j]` is below `n_tier`, the slot
+/// left out otherwise — over the union of the two cards' slots the order
+/// [`card_acc_at`] sums one card's in (this order is the gate).
+///
+/// SAFETY: `i < n · m` for an `m` with `down.len()` and `trows.len() >= N ·
+/// n · m`, `w.len()`, `sel.len()` and `tsel.len() >= N · m`.
+#[inline(always)]
+unsafe fn card_acc_tier_at<const N: usize>(a: &AccTierIn<'_>, n: usize, i: usize) -> f32 {
+    let (t, d) = (i / n, i % n);
+    let mut acc = 0.0f32;
+    for j in 0..N {
+        cuda_device::thread::__unroll_config::<0>();
+        let s = t * N + j;
+        // SAFETY: s < N·m <= sel.len(), tsel.len() and w.len() by this fn's
+        // contract.
+        let (place, tplace, ws) = unsafe {
+            (
+                *a.sel.get_unchecked(s),
+                *a.tsel.get_unchecked(s),
+                *a.w.get_unchecked(s),
+            )
+        };
+        if place < a.n_card {
+            // SAFETY: s < N·m and d < n, so s·n + d < N·n·m <= down.len().
+            let ds = unsafe { *a.down.get_unchecked(s * n + d) };
+            acc = ds.mul_add(ws, acc);
+        } else if tplace < a.n_tier {
+            // SAFETY: as above, for trows.
+            let ds = unsafe { *a.trows.get_unchecked(s * n + d) };
             acc = ds.mul_add(ws, acc);
         }
     }
@@ -1393,39 +1500,43 @@ impl FfnBatchKernels {
 
     /// Enqueue `ds41_ffn_card_acc_tier`: the card sums of `a.m` tokens over
     /// the stage card's and the tier's slots, value `i` of token `t = i / a.n`
-    /// into `acc[i]`. Six slots a token; any other count is refused by name.
-    /// One launch. Asynchronous, allocation-free.
+    /// into `acc[i]`: `ds41_ffn_card_acc_tier` for six slots a token,
+    /// `ds41_ffn_card_acc_8_tier` (the fma chain of `ds41_ffn_card_acc_8`)
+    /// for eight; any other count is refused by name. One launch.
+    /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_card_acc_tier(
         &self,
         stream: &CudaStream,
         a: &CardAccTier<'_>,
         acc: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "ds41_ffn_card_acc_tier";
-        if a.n_used != N_USED {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!("{what} of {} slots a token; it takes {N_USED}", a.n_used),
-            });
-        }
+        let slots = slots_of("ds41_ffn_card_acc_tier", a.n_used)?;
+        let what = match slots {
+            Slots::Six => "ds41_ffn_card_acc_tier",
+            Slots::Eight => "ds41_ffn_card_acc_8_tier",
+        };
         let grid = launch_u32(what, "grid", (a.m * a.n).div_ceil(THREADS as usize))?;
-        let prep = self
-            .module
-            .prepare_ds41_ffn_card_acc_tier(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.ds41_ffn_card_acc_tier(
-            stream,
-            &prep,
-            a.down,
-            a.trows,
-            a.w,
-            a.sel,
-            a.tsel,
+        let cfg = LaunchConfig1D::new(grid, THREADS, 0);
+        let (n, m, n_card, n_tier) = (
             launch_u32(what, "n", a.n)?,
             launch_u32(what, "m", a.m)?,
             launch_u32(what, "n_card", a.n_card)?,
             launch_u32(what, "n_tier", a.n_tier)?,
-            acc,
-        )?;
+        );
+        match slots {
+            Slots::Six => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_tier(cfg)?;
+                self.module.ds41_ffn_card_acc_tier(
+                    stream, &prep, a.down, a.trows, a.w, a.sel, a.tsel, n, m, n_card, n_tier, acc,
+                )?;
+            }
+            Slots::Eight => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_8_tier(cfg)?;
+                self.module.ds41_ffn_card_acc_8_tier(
+                    stream, &prep, a.down, a.trows, a.w, a.sel, a.tsel, n, m, n_card, n_tier, acc,
+                )?;
+            }
+        }
         Ok(())
     }
 
