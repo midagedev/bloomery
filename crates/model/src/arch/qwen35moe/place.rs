@@ -48,7 +48,10 @@ use super::{mtp, roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::fileio::hex;
-use crate::placement::workstation::{CONTEXT, CardSpec, GRANULE, MARGIN, SCRATCH, host};
+use crate::placement::workstation::{
+    A6000, CONTEXT, CardSpec, GRANULE, MARGIN, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+    TIER_BATCH_RESERVE, TierBatchBytes, host, tier_batch_host_bytes, tier_batch_staging_bytes,
+};
 use crate::placement::{
     self, Card, CardFormat, Device, Format, Host, KvBytes, Machine, ModelTensor, ModelTensors,
     PlacementError, Plan, PlanLevers, Unimplemented, Violation,
@@ -157,6 +160,26 @@ pub enum PlaceError {
     /// The reduced head's row list, refused.
     #[error(transparent)]
     HeadRows(#[from] HeadRowsError),
+    /// A machine with an expert tier card, planned with every routed expert
+    /// on the host.
+    #[error(
+        "the machine has the expert tier card {tier}, and the plan puts every routed expert on \
+         the host (BLOOMERY_QWEN38_EXPERTS=host): the tier would hold none; plan (b′) runs the \
+         card experts"
+    )]
+    TierHost { tier: String },
+    /// The stage card's MTP draft reserve ([`MTP_RESERVE`]) is not the one
+    /// the plan needs: none for a plan without the draft or on a machine with
+    /// no tier card, the draft's card bytes for a draft beside a tier.
+    #[error(
+        "card {card} reserves {got:?} B as \"{MTP_RESERVE}\"; this plan needs {}",
+        want.map_or("no such row".to_string(), |b| format!("one row of {b} B"))
+    )]
+    DraftReserve {
+        card: String,
+        got: Vec<u64>,
+        want: Option<u64>,
+    },
 }
 
 /// The violations, `; `-separated.
@@ -216,7 +239,9 @@ impl PlanInputs {
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// the placement's `levers`, the routed experts where `experts` says and
     /// the PLE table on the host; refused past [`KERNEL_POSITIONS`], when it
-    /// cannot be built, or when it breaks an invariant. A card plan
+    /// cannot be built, or when it breaks an invariant; a machine whose stage
+    /// card reserves bytes for an MTP draft ([`MTP_RESERVE`]) is refused by
+    /// name, as is a tier machine under [`Experts::Host`]. A card plan
     /// whose budget leaves no expert on the card is the [`Experts::Host`]
     /// plan of the same levers.
     pub fn plan_with<'a>(
@@ -229,6 +254,7 @@ impl PlanInputs {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
         }
+        check_draft_reserve(machine, None)?;
         let plan = self.target(machine, ctx_max, levers, experts, 0)?;
         let broken = plan.violations();
         if broken.is_empty() {
@@ -240,8 +266,11 @@ impl PlanInputs {
 
     /// The target's plan, unchecked: every routed expert on the host, or the
     /// expert rule over [`card_routed`]'s layers within each card's budget
-    /// less `reserve` ([`placement::plan_routed_reserving`]); then the PLE
-    /// table moved to the host ([`ple_on_host`]).
+    /// less `reserve` ([`placement::plan_routed_reserving`]) — on a machine
+    /// with expert tier cards, the stage cards first and each tier the next
+    /// ids after them (plan (b′), [`machine_bp`]); then the PLE table moved
+    /// to the host ([`ple_on_host`]). A tier machine under [`Experts::Host`]
+    /// is refused by name: its tier would hold nothing.
     fn target<'a>(
         &'a self,
         machine: &'a Machine,
@@ -250,6 +279,11 @@ impl PlanInputs {
         experts: Experts,
         reserve: u64,
     ) -> Result<Plan<'a>, PlaceError> {
+        if let (Some(tier), Experts::Host) = (machine.tiers.first(), experts) {
+            return Err(PlaceError::TierHost {
+                tier: tier.name.clone(),
+            });
+        }
         let mut plan = match experts {
             Experts::Host => {
                 placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?
@@ -311,7 +345,13 @@ impl PlanInputs {
     /// `experts` says: under [`Experts::Card`] the target's expert rule
     /// spreads within its card's budget less the draft's card bytes
     /// ([`MtpPlan::draft_card_bytes`]), so the sum keeps the card's bound;
-    /// the draft's plan is the same under either.
+    /// the draft's plan is the same under either. On a machine with an
+    /// expert tier card (plan (b′), [`machine_bp`]) the draft's card bytes
+    /// are the stage card's named reserve [`MTP_RESERVE`] instead, which the
+    /// tier's budget does not see: the stage card's row must be the draft's
+    /// [`MtpInputs::card_bytes`], else the plan is refused by name; the
+    /// stage card's own bound and headroom then hold the sum, and the tier
+    /// plans as without the draft.
     pub fn plan_mtp_with<'a>(
         &'a self,
         machine: &'a Machine,
@@ -328,23 +368,28 @@ impl PlanInputs {
                 cards: machine.cards.len(),
             });
         };
-        let draft = placement::plan_routed(
-            &mtp.model,
-            &mtp.machine,
-            ctx_max,
-            &mtp.kv,
-            &PlanLevers::default(),
-            CardFormat::of_routed,
-        )?;
-        let held: u64 = draft.n_l.iter().sum();
-        if held != mtp.model.experts {
-            return Err(PlaceError::DraftExperts {
-                held,
-                experts: mtp.model.experts,
+        let (draft, reserve) = mtp.draft_plan(ctx_max)?;
+        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab), ctx_max);
+        if !machine.tiers.is_empty() {
+            check_draft_reserve(machine, Some(reserve))?;
+            let plan = self.target(machine, ctx_max, levers, experts, 0)?;
+            let broken: Vec<Violation> = plan
+                .violations()
+                .into_iter()
+                .chain(draft.violations())
+                .collect();
+            if !broken.is_empty() {
+                return Err(PlaceError::Broken(broken));
+            }
+            return Ok(MtpPlan {
+                headroom_bytes: plan.cards[0].headroom_bytes,
+                plan,
+                draft,
+                map_bytes: mtp.map_bytes,
+                arena_bytes: arena,
             });
         }
-        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab), ctx_max);
-        let reserve = draft_card_bytes(&draft.cards[0], mtp.map_bytes) + arena;
+        check_draft_reserve(machine, None)?;
         let plan = self.target(machine, ctx_max, levers, experts, reserve)?;
         let (t, d) = (&plan.cards[0], &draft.cards[0]);
         let total = [
@@ -487,7 +532,9 @@ pub struct MtpPlan<'a> {
     /// The target's plan — under [`Experts::Host`] [`PlanInputs::plan`]'s
     /// bit for bit, under [`Experts::Card`] its expert rule within the card's
     /// budget less the draft's card bytes: its card totals and headroom are
-    /// the target's alone.
+    /// the target's alone — on a plan (b′) machine the stage card's
+    /// [`MTP_RESERVE`] row is the draft's bytes, so that card's reserve and
+    /// headroom count them.
     pub plan: Plan<'a>,
     /// The draft's plan on [`MtpInputs::machine`]: its tensors' rows, its
     /// routed experts (every one on the card), its granules in its own heap
@@ -652,6 +699,131 @@ pub fn machine_for_experts(
         tiers: Vec::new(),
         host: host(),
     }
+}
+
+/// What the MTP draft's reserve on the stage card of a plan (b′) machine is
+/// called ([`machine_bp`]): its card bytes and arena
+/// ([`MtpInputs::card_bytes`]).
+pub const MTP_RESERVE: &str = "MTP draft";
+
+/// The expert tier's prompt-batch bytes a qwen4exp plan (b′) reserves
+/// ([`machine_bp`]) for a load whose ubatches take up to `ubatch` positions.
+/// The host tier's batch port is made for blocks as wide as the ubatch
+/// (`Body38`'s host columns, at least [`PASS_ROWS`]), and its tier side is
+/// the common one: on the tier card the staging of a block — the
+/// activations, the tier places, their q8_1 form (the same 8,592 bytes a
+/// column at the model width as the card route's gate·up input), the down
+/// outputs by slot ([`tier_batch_staging_bytes`]) — and on the host, per
+/// exchange set, the rows the tier hands back and the places it reads
+/// ([`tier_batch_host_bytes`]). The tier's block scratch is the card
+/// route's at that ubatch ([`card_route_scratch_bytes`]): the tier runs its
+/// slots of a block through the route the stage card runs its own through.
+#[must_use]
+pub fn tier_batch(hp: &Hparams, ubatch: u64) -> TierBatchBytes {
+    tier_batch_of(hp.n_embd as u64, hp.n_used as u64, ubatch)
+}
+
+/// [`tier_batch`] for rows of `n_embd` routed to `n_used` experts.
+const fn tier_batch_of(n_embd: u64, n_used: u64, ubatch: u64) -> TierBatchBytes {
+    let cols = if ubatch > PASS_ROWS as u64 {
+        ubatch
+    } else {
+        PASS_ROWS as u64
+    };
+    TierBatchBytes {
+        staging: tier_batch_staging_bytes(n_embd, n_used, cols),
+        scratch: card_route_scratch_bytes(ubatch),
+        host: tier_batch_host_bytes(n_embd, n_used, cols),
+    }
+}
+
+/// Plan (b′) for a qwen4exp file (`--place bp`): the A6000 runs every one
+/// of `layers`, the head and the token embedding as
+/// [`machine_for_experts`] lays it out under [`Experts::Card`] for
+/// ubatches of up to `ubatch` positions, with `draft` — the MTP draft's
+/// card bytes ([`MtpInputs::card_bytes`]) when the draft runs beside the
+/// target — as its named reserve [`MTP_RESERVE`]; the 3090 is an expert
+/// tier beside the host, with no stage, its prompt-batch service `batch`
+/// ([`tier_batch`]) a named reserve on it and on the host.
+///
+/// **The split.** The planner fills the A6000 first and then the tier with
+/// each layer's next ids, each card to its own budget, so the A6000 keeps
+/// the counts plan (a) gives it, byte for byte, and the tier takes the
+/// next ids it holds after them. That is the rule this plan keeps, from
+/// the per-slot costs:
+/// - the residency machine holds the tier's experts away for the load's
+///   life (never admitted, never a victim), so the tier's share of a
+///   pass's routed slots is the routing mass of its fixed ids — about
+///   its count over the 512 experts under the id prefix, whatever the
+///   A6000 keeps — and the A6000's residency serves the hottest of the
+///   other ids;
+/// - an expert the A6000 gives up under its budget goes to the host, not
+///   the tier (the tier is at its own budget), and a host slot costs four
+///   to five A6000 slots, so a smaller A6000 share trades one card slot for
+///   four or five card slots' time on the host leg, which wins only where
+///   the host leg sits well under the A6000's; how far under is a hit-rate
+///   question, which a plan made before any routing cannot answer;
+/// - so the tier takes from the A6000 in routed mass, not in count: its
+///   fixed ids carry the share of the routing that plan (a)'s residency
+///   served on the A6000 (and the rest from the host), and the A6000's leg
+///   shortens by that share while the tier's runs beside it.
+///
+/// The per-card counts at 4,096 positions and their derivation are pinned in
+/// `crates/model/tests/qwen4exp_meta.rs` (plain) and
+/// `crates/model/tests/qwen4exp_mtp_meta.rs` (with the draft).
+#[must_use]
+pub fn machine_bp(
+    layers: usize,
+    ubatch: u64,
+    draft: Option<u64>,
+    batch: TierBatchBytes,
+) -> Machine {
+    let mut m = machine_for_experts(A6000, layers, ubatch, Experts::Card);
+    m.cards[0]
+        .reserves
+        .extend(draft.map(|b| (MTP_RESERVE.to_string(), b)));
+    m.tiers.push(Card {
+        name: RTX_3090.name.to_string(),
+        usable_bytes: RTX_3090.usable_bytes(),
+        context_bytes: CONTEXT,
+        scratch_bytes: SCRATCH,
+        margin_bytes: MARGIN,
+        granule_bytes: GRANULE,
+        layers: 0..0,
+        head: false,
+        token_embedding: false,
+        reserves: vec![(TIER_BATCH_RESERVE.to_string(), batch.card())],
+    });
+    m.host
+        .reserves
+        .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
+    m
+}
+
+/// The stage cards' [`MTP_RESERVE`] rows against `want`: none for `None`,
+/// exactly one of `want` bytes on the one stage card for `Some`; anything
+/// else is refused by name ([`PlaceError::DraftReserve`]).
+fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), PlaceError> {
+    for (i, card) in machine.cards.iter().enumerate() {
+        let got: Vec<u64> = card
+            .reserves
+            .iter()
+            .filter(|(name, _)| name == MTP_RESERVE)
+            .map(|&(_, b)| b)
+            .collect();
+        let ok = match want {
+            Some(b) if i == 0 => got == [b],
+            _ => got.is_empty(),
+        };
+        if !ok {
+            return Err(PlaceError::DraftReserve {
+                card: card.name.clone(),
+                got,
+                want,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// One file's per-layer bytes beside the weights, all on the card:
@@ -932,6 +1104,44 @@ pub struct MtpInputs {
 }
 
 impl MtpInputs {
+    /// The draft's plan at `ctx_max` positions on its own card
+    /// ([`MtpInputs::machine`]), and the bytes it adds to the target's card:
+    /// its granules, its store, the head's row map and its program's arena
+    /// ([`mtp_arena_bytes`]). Refused by name when the plan keeps a routed
+    /// expert off the card.
+    fn draft_plan(&self, ctx_max: u64) -> Result<(Plan<'_>, u64), PlaceError> {
+        let draft = placement::plan_routed(
+            &self.model,
+            &self.machine,
+            ctx_max,
+            &self.kv,
+            &PlanLevers::default(),
+            CardFormat::of_routed,
+        )?;
+        let held: u64 = draft.n_l.iter().sum();
+        if held != self.model.experts {
+            return Err(PlaceError::DraftExperts {
+                held,
+                experts: self.model.experts,
+            });
+        }
+        let arena = mtp_arena_bytes(u64::from(self.draft.vocab), ctx_max);
+        let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + arena;
+        Ok((draft, bytes))
+    }
+
+    /// The bytes the draft adds to the target's card at `ctx_max` positions
+    /// ([`MtpPlan::draft_card_bytes`] and its arena): the stage card's
+    /// [`MTP_RESERVE`] row of a plan (b′) machine that runs the draft
+    /// ([`machine_bp`]). Refused as [`PlanInputs::plan_mtp`] refuses the
+    /// context and the draft's plan.
+    pub fn card_bytes(&self, ctx_max: u64) -> Result<u64, PlaceError> {
+        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
+            return Err(PlaceError::Positions { ctx_max });
+        }
+        self.draft_plan(ctx_max).map(|(_, bytes)| bytes)
+    }
+
     /// The MTP draft `draft` read against the target `target` that `inputs`
     /// describes (`mtp::mtp_of`), its head scoring `rows`. Refused by name:
     /// what `mtp_of` refuses; a draft file that carries its own `token_embd`
@@ -2168,6 +2378,141 @@ mod tests {
                 hex(&got),
                 "cf6ab613e3942391f88ed698557e1680f160bd10e88c6b668c50360c10930e2b"
             );
+        }
+    }
+
+    /// Plan (b′)'s machine ([`super::machine_bp`]): the A6000 as
+    /// [`super::machine_for_experts`] lays it out under the card experts, the
+    /// draft's bytes its one named reserve when given; the 3090 a tier with
+    /// no stage and the tier's prompt batch as its one reserve; the host's
+    /// reserves the workstation's and the tier's rows. The tier's prompt
+    /// batch at U 4,096 and 512 [derived: cols = U, 10 slots a column of
+    /// 2,560 values; staging 4·cols·2560 + 4·slots + 8,592·cols +
+    /// 4·slots·2560, the card route's scratch (2,048 run tokens at most of
+    /// 170,360 B, 10,240 B a token), host 2·(4·slots·2560 + 4·slots)]. The
+    /// stage card's draft reserve is checked against what the plan needs.
+    mod bp {
+        use super::super::{
+            Experts, MTP_RESERVE, PlaceError, check_draft_reserve, machine_bp, machine_for_experts,
+            tier_batch_of,
+        };
+        use crate::placement::workstation::{
+            A6000, CONTEXT, MARGIN, OS_RESERVE, ROW_CACHE_RESERVE, RTX_3090, SCRATCH,
+            TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes,
+        };
+
+        #[test]
+        fn tier_batch_at_two_ubatches() {
+            assert_eq!(
+                tier_batch_of(2560, 10, 4096),
+                TierBatchBytes {
+                    staging: 496_730_112,
+                    scratch: 390_840_320,
+                    host: 839_188_480,
+                }
+            );
+            assert_eq!(
+                tier_batch_of(2560, 10, 512),
+                TierBatchBytes {
+                    staging: 62_091_264,
+                    scratch: 92_467_200,
+                    host: 104_898_560,
+                }
+            );
+        }
+
+        #[test]
+        fn the_machine_of_plan_bp() {
+            let batch = tier_batch_of(2560, 10, 4096);
+            for draft in [None, Some(2_843_762_444u64)] {
+                let m = machine_bp(48, 4096, draft, batch);
+                let a = machine_for_experts(A6000, 48, 4096, Experts::Card);
+                let [stage] = m.cards.as_slice() else {
+                    panic!("{} stage cards", m.cards.len())
+                };
+                let want = draft.map(|b| (MTP_RESERVE.to_string(), b));
+                assert_eq!(stage.reserves, want.into_iter().collect::<Vec<_>>());
+                let s = &a.cards[0];
+                assert_eq!(
+                    (
+                        &stage.name,
+                        stage.usable_bytes,
+                        stage.context_bytes,
+                        stage.scratch_bytes,
+                        stage.margin_bytes,
+                        stage.granule_bytes,
+                        &stage.layers,
+                        stage.head,
+                        stage.token_embedding
+                    ),
+                    (
+                        &s.name,
+                        s.usable_bytes,
+                        s.context_bytes,
+                        s.scratch_bytes,
+                        s.margin_bytes,
+                        s.granule_bytes,
+                        &s.layers,
+                        s.head,
+                        s.token_embedding
+                    )
+                );
+                let [tier] = m.tiers.as_slice() else {
+                    panic!("{} tiers", m.tiers.len())
+                };
+                assert_eq!(tier.name, RTX_3090.name);
+                assert_eq!(tier.usable_bytes, RTX_3090.usable_bytes());
+                assert_eq!(
+                    (
+                        tier.context_bytes,
+                        tier.scratch_bytes,
+                        tier.margin_bytes,
+                        tier.layers.clone(),
+                        tier.head,
+                        tier.token_embedding
+                    ),
+                    (CONTEXT, SCRATCH, MARGIN, 0..0, false, false)
+                );
+                assert_eq!(
+                    tier.reserves,
+                    vec![(TIER_BATCH_RESERVE.to_string(), 887_570_432)]
+                );
+                let names: Vec<&str> = m.host.reserves.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(
+                    names,
+                    [ROW_CACHE_RESERVE, OS_RESERVE, TIER_BATCH_HOST_RESERVE]
+                );
+                assert_eq!(m.host.reserves[2].1, 839_188_480);
+                assert_eq!(m.host.usable_bytes, a.host.usable_bytes);
+            }
+        }
+
+        #[test]
+        fn the_draft_reserve_is_the_plans_own() {
+            let batch = tier_batch_of(2560, 10, 4096);
+            let plain = machine_bp(48, 4096, None, batch);
+            let drafted = machine_bp(48, 4096, Some(100), batch);
+            assert!(check_draft_reserve(&plain, None).is_ok());
+            assert!(check_draft_reserve(&drafted, Some(100)).is_ok());
+            let mut twice = machine_bp(48, 4096, Some(100), batch);
+            twice.cards[0].reserves.push((MTP_RESERVE.to_string(), 100));
+            for (m, want, got) in [
+                (&plain, Some(100), vec![]),
+                (&drafted, None, vec![100]),
+                (&drafted, Some(101), vec![100]),
+                (&twice, Some(100), vec![100, 100]),
+            ] {
+                match check_draft_reserve(m, want) {
+                    Err(PlaceError::DraftReserve {
+                        card,
+                        got: g,
+                        want: w,
+                    }) => {
+                        assert_eq!((card.as_str(), &g, w), (A6000.name, &got, want));
+                    }
+                    other => panic!("want {want:?} got {got:?}: {other:?}"),
+                }
+            }
         }
     }
 }

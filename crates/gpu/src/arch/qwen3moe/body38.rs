@@ -705,8 +705,21 @@ impl Body38 {
         )>,
     ) -> Result<Qwen38Model, GpuError> {
         // The routed experts are the host's past the card's prefix: an expert
-        // tier's would be computed on the host unasked.
-        crate::host::refuse_expert_tiers(WHAT, plan.machine)?;
+        // tier's would be computed on the host unasked, or by nobody.
+        if !plan.machine.tiers.is_empty() {
+            let names: Vec<&str> = plan.machine.tiers.iter().map(|t| t.name.as_str()).collect();
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the placement names {} expert tier card(s) ({}): the program's tier leg — \
+                     each walk's tier handoff, the tier card's walk over its columns, the join of \
+                     its rows — is not built yet, so a plan with a tier does not load; run \
+                     --place a or gate",
+                    names.len(),
+                    names.join(", ")
+                ),
+            ));
+        }
         let refused: Vec<String> = inputs
             .unimplemented()
             .into_iter()

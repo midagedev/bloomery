@@ -6,7 +6,7 @@
 //!
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
 //!                       [-n N] [--ctx C] [--mode eager|graph]
-//!                       [--prefill auto|pass|gemm|step] [--place a|gate]
+//!                       [--prefill auto|pass|gemm|step] [--place a|gate|bp]
 //!                       [--time [--warm W]] [--logits]
 //!     generate_qwen3moe --arm a,b,c[/N] [--arm ...] [--arm-sync] [-n N] [--ctx C] ...
 //!     generate_qwen3moe --dump-taps DIR --tokens-file F [--tokens-file F ...]
@@ -51,8 +51,11 @@
 //! A qwen4exp file runs through `Body38`, placed by its own plan
 //! (`model::arch::qwen35moe::place`: every layer, the head and the embedding
 //! on one card, its routed experts as above) on the card `--place`
-//! names — `a` the A6000 (the default), `gate` the 3090 — and printed as a
-//! `plan` line. Its `--prefill` is `auto` (the default: `gemm` for a prompt
+//! names — `a` the A6000 (the default), `gate` the 3090, `bp` plan (b′):
+//! the A6000 as under `a` with the 3090 as its expert tier
+//! (`place::machine_bp`, the tier's experts printed as the `plan` line's
+//! `tier=` and `tier_experts=`; the load then refuses it by name, since
+//! `Body38` has no tier leg yet) — and printed as a `plan` line. Its `--prefill` is `auto` (the default: `gemm` for a prompt
 //! of nine positions or more, `pass` below), `gemm` (ubatches of up to the
 //! load's size through the host tier's batch port at their width, the Q8_0
 //! projections on q8 activations), `pass` (eager passes of up to eight
@@ -83,7 +86,7 @@
 //! thing. Unset, the Qwen3.8 rule picks the word
 //! (`bloomery_levers::residency38_unset`, `residency38_at_plan`) and a
 //! `residency unset` record prints it with why: on a qwen4exp file under
-//! `--place a` `mid-p<P>-s1`, P half the fewest card experts a layer of the
+//! `--place a` or `bp` `mid-p<P>-s1`, P half the fewest card experts a layer of the
 //! plan the load runs, after the `plan` line; `off` under `--place gate`,
 //! beside `BLOOMERY_ROUTE_TRACE`, with `--prefill step`, when the plan holds
 //! no card expert or its fewest leave no room, and when the churn pool does
@@ -105,13 +108,13 @@
 //! `BLOOMERY_HOSTSTREAM` (a qwen4exp file only, refused by name on the
 //! others) streams each prompt call's hottest host experts into the
 //! residency pool (`Body38::set_hoststream`): unset it is on under
-//! `--place a` with a residency machine and off everywhere else; `on`
+//! `--place a` or `bp` with a residency machine and off everywhere else; `on`
 //! beside `BLOOMERY_RESIDENCY=off` is refused by name. A streaming call
 //! prints a `call stream` record a pick and a `call stream end` record
 //! after its arm's lines.
 //!
 //! `BLOOMERY_DRAFT` unset on a qwen4exp file follows the placement
-//! (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft runs
+//! (`bloomery_levers::draft38_unset`): under `--place a` or `bp` the MTP draft runs
 //! when a regular file is where it would be opened; the plain path runs
 //! under `--place gate`, beside `--logits` or `BLOOMERY_ROUTE_TRACE`, with no
 //! file there, and when an arm's last window would pass `--ctx` (depth + n +
@@ -274,10 +277,10 @@ mod cli {
     use model::arch::Arch;
     use model::arch::models::HeadRows;
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
+        Experts, MtpInputs, PlanInputs, machine_bp, machine_for_experts, read_head_rows, tier_batch,
     };
-    use model::placement::PlanLevers;
-    use model::placement::workstation::{A6000, RTX_3090};
+    use model::placement::workstation::{A6000, CardSpec, RTX_3090};
+    use model::placement::{Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::mtp::draft_file;
     use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
     use std::num::NonZeroUsize;
@@ -697,13 +700,17 @@ mod cli {
         .into()
     }
 
-    /// Where `--place` puts a qwen4exp plan's one card.
+    /// Where `--place` puts a qwen4exp plan's stage card, and its expert
+    /// tier card when it has one.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Place38 {
         /// The A6000, the timing card (the default).
         A,
         /// The 3090, the gate card.
         Gate,
+        /// Plan (b′): the A6000 as under `a`, the 3090 its expert tier
+        /// (`place::machine_bp`).
+        Bp,
     }
 
     impl Place38 {
@@ -711,7 +718,12 @@ mod cli {
             match arg {
                 None | Some("a") => Ok(Place38::A),
                 Some("gate") => Ok(Place38::Gate),
-                Some(o) => Err(format!("--place is a or gate, not {o}").into()),
+                Some("bp") => Ok(Place38::Bp),
+                Some(o) => Err(format!(
+                    "--place is a, gate or bp (plan (b′): the 3090 as the A6000's expert tier), \
+                     not {o}"
+                )
+                .into()),
             }
         }
 
@@ -719,7 +731,60 @@ mod cli {
             match self {
                 Place38::A => "a",
                 Place38::Gate => "gate",
+                Place38::Bp => "bp",
             }
+        }
+
+        /// The stage card's spec.
+        fn card(self) -> CardSpec {
+            match self {
+                Place38::A | Place38::Bp => A6000,
+                Place38::Gate => RTX_3090,
+            }
+        }
+
+        /// The stage card is the A6000: the placement the Qwen3.8 defaults
+        /// (residency, the MTP draft, host streaming) treat as plan (a).
+        fn stage_a(self) -> bool {
+            matches!(self, Place38::A | Place38::Bp)
+        }
+
+        /// The machine a plan of `inputs` at ubatches of `ub` positions
+        /// under `experts` runs on; `draft` the MTP draft's card bytes when
+        /// the draft runs beside the target, which plan (b′) reserves on its
+        /// stage card (`place::machine_bp`) and the one-card plans count in
+        /// `plan_mtp_with` instead.
+        fn machine(
+            self,
+            inputs: &PlanInputs,
+            ub: u64,
+            experts: Experts,
+            draft: Option<u64>,
+        ) -> Machine {
+            let layers = inputs.spec.layers.len();
+            match self {
+                Place38::A | Place38::Gate => machine_for_experts(self.card(), layers, ub, experts),
+                Place38::Bp => machine_bp(layers, ub, draft, tier_batch(&inputs.hp, ub)),
+            }
+        }
+    }
+
+    /// The `plan` record of `plan` at `place` under `experts`: the stage
+    /// card's experts, and the tier card's when the plan has one.
+    fn plan38_line(place: Place38, experts: Experts, plan: &Plan<'_>) -> String {
+        let r = Record::new(&record::PLAN38)
+            .w("place", place.name())
+            .w("card", place.card().name)
+            .w("experts", experts_name(experts))
+            .u("ctx_max", plan.ctx_max)
+            .u("host_experts", plan.host.experts)
+            .u("card_experts", plan.cards[0].experts);
+        match (plan.machine.tiers.first(), plan.tier_n_l.first()) {
+            (Some(t), Some(n)) => r
+                .w("tier", &t.name)
+                .u("tier_experts", n.iter().sum::<u64>())
+                .line(),
+            _ => r.line(),
         }
     }
 
@@ -1005,7 +1070,7 @@ mod cli {
             .into());
         }
         let (place_a, prefill_step) = match chosen {
-            Chosen::Qwen38(path, place, _) => (place == Place38::A, path == Prompt38::Step),
+            Chosen::Qwen38(path, place, _) => (place.stage_a(), path == Prompt38::Step),
             Chosen::Qwen3(_) | Chosen::Qwen35(_) => (false, false),
         };
         let at = Residency38At {
@@ -1180,7 +1245,7 @@ mod cli {
                     .max()
                     .unwrap_or(0);
                 let at = Draft38At {
-                    place_a: place == Place38::A,
+                    place_a: place.stage_a(),
                     logits,
                     route_trace: levers.route_trace().is_some(),
                     file: &file,
@@ -1509,30 +1574,15 @@ mod cli {
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
-        let card = match place {
-            Place38::A => A6000,
-            Place38::Gate => RTX_3090,
-        };
         let ub = ubatch_for(ctx)?;
-        let machine =
-            machine_for_experts(card, inputs.spec.layers.len(), u64::try_from(ub)?, experts);
+        let machine = place.machine(&inputs, u64::try_from(ub)?, experts, None);
         let plan = inputs.plan_with(
             &machine,
             u64::try_from(ctx)?,
             &PlanLevers::from_levers(levers)?,
             experts,
         )?;
-        println!(
-            "{}",
-            Record::new(&record::PLAN38)
-                .w("place", place.name())
-                .w("card", card.name)
-                .w("experts", experts_name(experts))
-                .u("ctx_max", plan.ctx_max)
-                .u("host_experts", plan.host.experts)
-                .u("card_experts", plan.cards[0].experts)
-                .line()
-        );
+        println!("{}", plan38_line(place, experts, &plan));
         let residency = residency38(&plan, lever, Record::print)?;
         let mut m = Body38::open_placed_residency(
             file,
@@ -1585,13 +1635,7 @@ mod cli {
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
-        let card = match place {
-            Place38::A => A6000,
-            Place38::Gate => RTX_3090,
-        };
         let ub = ubatch_for(ctx)?;
-        let machine =
-            machine_for_experts(card, inputs.spec.layers.len(), u64::try_from(ub)?, experts);
         let rows = match levers.mtp_head_rows() {
             Some(p) => read_head_rows(p, &file, inputs.spec.vocab)?,
             None => HeadRows::Full,
@@ -1605,24 +1649,20 @@ mod cli {
             )
         })?;
         let mtp = MtpInputs::read(&draft_split, &file, &inputs, rows)?;
+        let ctx_max = u64::try_from(ctx)?;
+        let reserve = match place {
+            Place38::Bp => Some(mtp.card_bytes(ctx_max)?),
+            Place38::A | Place38::Gate => None,
+        };
+        let machine = place.machine(&inputs, u64::try_from(ub)?, experts, reserve);
         let plan = inputs.plan_mtp_with(
             &machine,
-            u64::try_from(ctx)?,
+            ctx_max,
             &PlanLevers::from_levers(levers)?,
             &mtp,
             experts,
         )?;
-        println!(
-            "{}",
-            Record::new(&record::PLAN38)
-                .w("place", place.name())
-                .w("card", card.name)
-                .w("experts", experts_name(experts))
-                .u("ctx_max", plan.plan.ctx_max)
-                .u("host_experts", plan.plan.host.experts)
-                .u("card_experts", plan.plan.cards[0].experts)
-                .line()
-        );
+        println!("{}", plan38_line(place, experts, &plan.plan));
         let residency = residency38(&plan.plan, lever, Record::print)?;
         let mut m = Body38::open_placed_mtp_residency(
             file,
@@ -1701,7 +1741,7 @@ mod cli {
     ) -> Result<(), GateError> {
         let on = levers
             .hoststream()
-            .unwrap_or(place == Place38::A && residency != Residency::Off);
+            .unwrap_or(place.stage_a() && residency != Residency::Off);
         m.body_parts("generate_qwen3moe")?.2.set_hoststream(on)?;
         Ok(())
     }

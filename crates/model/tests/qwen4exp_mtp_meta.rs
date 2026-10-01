@@ -421,3 +421,150 @@ fn hw_qwen4exp_mtp_plan() {
         b.join("\n  ")
     );
 }
+
+// PIN(2026-10-01): plan (b′) (`place::machine_bp`, `--place bp`) with the shared draft (full head)
+// at 4,096 positions and U 4,096: the A6000 keeps plan (a)'s drafted row byte for byte — 244 on the
+// first 18 layers, 243 on the rest (qwen4exp_meta's CARD_PLANS) — the draft's card bytes now the
+// A6000's "MTP draft" reserve, which the tier's budget does not see; the split's derivation is
+// qwen4exp_meta's BP_PLAIN [derived: the tier's budget is BP_PLAIN's, 22,785,081,344 B; the same
+// replica's spread beside 244/243: both cards 394 on the first 47 layers and 393 on layer 47, so the
+// tier holds 150 on layers 0-17 and 47 and 151 on 18-46, 7,229 experts, 22,653,952,000 B of experts
+// and 125,313,024 B of rounding; the host 118 or 119 a layer, 5,665 experts]. Row: the A6000's
+// (high, at_high, low), both cards' (high, at_high), the tier's experts, expert bytes, rounding.
+const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
+    (244, 18, 243, 394, 47, 7_229, 22_653_952_000, 125_313_024);
+
+/// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
+/// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`
+/// under `Experts::Card`): the A6000's counts, card bytes and headroom plan
+/// (a)'s drafted plan's, its reserve the draft's card bytes, the draft's
+/// plan (a)'s; the 3090 tier's per layer both cards' totals less the
+/// A6000's, its expert and rounding bytes as predicted; a plan with the
+/// draft on a machine that reserves nothing for it, or another amount, is
+/// refused by name.
+#[test]
+#[ignore = "needs the Qwen3.8-Flash-Next shards and MTP files on the box (just gate-qwen4exp-meta)"]
+fn hw_qwen4exp_bp_mtp_plan() {
+    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::place::{
+        self, Experts, MtpInputs, PlaceError, PlanInputs, machine_bp, tier_batch,
+    };
+    use model::placement::PlanLevers;
+    use model::placement::workstation::A6000;
+
+    let mut o = String::new();
+    let mut b: Vec<String> = Vec::new();
+    let mut check = |o: &mut String, what: String, ok: bool| {
+        let _ = writeln!(o, "{what}: {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            b.push(what);
+        }
+    };
+    let target = Split::open(Q38).unwrap_or_else(|e| panic!("open {Q38}: {e}"));
+    let draft = Split::open(SHARED).unwrap_or_else(|e| panic!("open {SHARED}: {e}"));
+    let inputs = PlanInputs::describe(&target).unwrap_or_else(|e| panic!("describe: {e}"));
+    let mtp = MtpInputs::read(&draft, &target, &inputs, HeadRows::Full)
+        .unwrap_or_else(|e| panic!("MtpInputs::read {SHARED}: {e}"));
+    let (ctx, u) = (4096u64, 4096u64);
+    let n = inputs.hp.n_layer;
+    let levers = PlanLevers::default();
+    let batch = tier_batch(&inputs.hp, u);
+    let bytes = mtp
+        .card_bytes(ctx)
+        .unwrap_or_else(|e| panic!("card_bytes: {e}"));
+    let machine = machine_bp(n, u, Some(bytes), batch);
+    let a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
+    let a = inputs
+        .plan_mtp_with(&a_machine, ctx, &levers, &mtp, Experts::Card)
+        .unwrap_or_else(|e| panic!("plan (a) with the draft: {e}"));
+    let view = |p: &model::placement::Plan<'_>| {
+        format!(
+            "{:?}",
+            (&p.rows, &p.cards, &p.host, p.nvme_bytes, &p.n_l, p.ctx_max)
+        )
+    };
+    let (high, at_high, low, t_high, t_at_high, t_experts, t_bytes, t_rounding) = BP_DRAFTED;
+    match inputs.plan_mtp_with(&machine, ctx, &levers, &mtp, Experts::Card) {
+        Err(e) => check(
+            &mut o,
+            format!("plan (b′) with the draft refused: {e}"),
+            false,
+        ),
+        Ok(m) => {
+            let plan = &m.plan;
+            let stage: Vec<u64> = (0..n)
+                .map(|l| if l < at_high { high } else { low })
+                .collect();
+            let total: Vec<u64> = (0..n)
+                .map(|l| if l < t_at_high { t_high } else { t_high - 1 })
+                .collect();
+            let tier_want: Vec<u64> = total.iter().zip(&stage).map(|(t, s)| t - s).collect();
+            let tier = plan.tier_n_l.first().cloned().unwrap_or_default();
+            let (s, sa, t) = (&plan.cards[0], &a.plan.cards[0], &plan.cards[1]);
+            let stage_same = (s.dense_bytes, s.expert_bytes, s.rounding_bytes, s.kv_bytes)
+                == (
+                    sa.dense_bytes,
+                    sa.expert_bytes,
+                    sa.rounding_bytes,
+                    sa.kv_bytes,
+                )
+                && plan.n_l == a.plan.n_l
+                && m.headroom_bytes == a.headroom_bytes
+                && view(&m.draft) == view(&a.draft)
+                && s.reserve_bytes == m.draft_card_bytes() + m.arena_bytes
+                && s.reserve_bytes == bytes;
+            check(
+                &mut o,
+                format!(
+                    "the A6000 {high} on the first {at_high}, {low} on the rest ({}), plan (a)'s \
+                     drafted counts, card bytes, headroom and draft plan, its reserve {} the \
+                     draft's {bytes} ({stage_same}); headroom {} ((a) {})",
+                    plan.n_l == stage,
+                    s.reserve_bytes,
+                    m.headroom_bytes,
+                    a.headroom_bytes
+                ),
+                plan.n_l == stage && stage_same,
+            );
+            let held: u64 = tier.iter().sum();
+            check(
+                &mut o,
+                format!(
+                    "the 3090 tier: both cards {t_high} on the first {t_at_high}, {} on the rest, \
+                     so the tier {tier:?} (want {tier_want:?}); {held} experts (want {t_experts}), \
+                     expert bytes {} (want {t_bytes}), rounding {} (want {t_rounding}); host {} \
+                     experts; tier headroom {}",
+                    t_high - 1,
+                    t.expert_bytes,
+                    t.rounding_bytes,
+                    plan.host.experts,
+                    t.headroom_bytes
+                ),
+                tier == tier_want
+                    && held == t_experts
+                    && (t.expert_bytes, t.rounding_bytes) == (t_bytes, t_rounding)
+                    && plan.host.experts
+                        == n as u64 * inputs.model.experts - plan.n_l.iter().sum::<u64>() - held,
+            );
+        }
+    }
+    for (label, reserve) in [("none", None), ("one byte more", Some(bytes + 1))] {
+        let wrong = machine_bp(n, u, reserve, batch);
+        let got = inputs.plan_mtp_with(&wrong, ctx, &levers, &mtp, Experts::Card);
+        check(
+            &mut o,
+            format!(
+                "the draft on a tier machine reserving {label}: {:?}",
+                got.as_ref().err().map(ToString::to_string)
+            ),
+            matches!(got, Err(PlaceError::DraftReserve { .. })),
+        );
+    }
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} clause(s) failed:\n  {}",
+        b.len(),
+        b.join("\n  ")
+    );
+}

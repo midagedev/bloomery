@@ -1,0 +1,73 @@
+# Round q38tier (ntier piece 7, Phase 2's A/B, written in Phase 1): Qwen3.8 at --place bp, plan (b′): the A6000
+# as under plan (a) with the 3090 as its expert tier, against --place a, same binary, the shipped defaults otherwise
+# (residency, the MTP draft and host streaming unset: mid-p121-s1, mtp, on). It runs once Phase 2 has built the tier
+# leg (Body38 refuses a tier plan by name until then).
+#
+# [derived] The split (place::machine_bp; qwen4exp_meta BP_PLAIN, qwen4exp_mtp_meta BP_DRAFTED): both cards plan to
+# their budgets, the A6000 keeping plan (a)'s drafted row (244/243 a layer, 11,682 at 4k), the 3090 the next ids
+# (150/151 a layer, 7,229), the host the rest (118/119, 5,665). Residency holds the tier's ids away, so the tier's
+# routed share is its ids' mass, about 150.6 / 512 = 29.4 % under the id prefix, whatever the A6000 keeps.
+# Term by term on a drafted pass (window: the draft's chain + a verify of E(4) rows; rig-log 10-01#q38head-ab,
+# 37.43 ms at P 512, 37.06 ms at P 4096; slots a layer 10 x E(4): 36.9 at P 512, 31.0 at P 4096):
+# - the A6000's card slots. Plan (a)'s residency serves 83.5 % of the mass on 244 of 512 ids at P 4096 and 70.2 %
+#   at P 512 (rig-log 10-01#q38hol-ab: 246 / 527 host slots a pass). A concentration curve 1 - (1 - x)^a fitted
+#   there (a 2.78 / 1.87) puts the A6000's top 243.6 of the 361.4 non-tier ids at 95.6 % / 87.8 % of their 70.6 %:
+#   67.5 % / 62.0 % of the mass, so its slots fall 25.9 -> 20.9 (P 4096) and 25.9 -> 22.9 (P 512) a layer,
+#   at 3.072 MB an expert and 575 GB/s (5.3 us a slot): -1.28 ms and -0.77 ms a pass. Band from the curve's
+#   shape (the A6000 loses 12..20 points of mass): -0.95..-1.6 ms at P 4096, -0.6..-1.0 ms at P 512.
+# - the tier's leg: 9.1 / 10.8 slots a layer at 4.4 us (3090, 700 GB/s), with its go wait, three copies in and
+#   its signal about 60..70 us a layer, under the A6000's leg of about 120 us: 0.
+# - the host leg: under the A6000's at P 4096 in both arms (0). At P 512 plan (a)'s host leg shows by about 0.8 ms
+#   a pass (the two P's passes differ by 0.37 ms while P 4096's attention reads about 0.4 ms more); under bp the
+#   host's share falls 29.8 % -> 8.6 %, 11.0 -> 3.2 slots a layer, under the A6000's: -0.8 ms at P 512.
+# - the handoff and the join: the tier's places and q8_1 activation in the same handoff launch, the tier's go and
+#   wait in the existing mem-op batches (no node), the card sum reading 9..11 tier rows of 10 KB a layer through
+#   the mapping: +0.2..+0.5 ms a pass; up to +1.0 ms if each mapped access pays the per-node floor the pass's
+#   15 ms residue suggests (q38two2).
+# - dense, KV, head, the MTP chain: unmoved.
+# Net: P 4096 -1.4..-0.45 ms of 37.06 (-3.8..-1.2 %); P 512 -2.4..-0.4 ms of 37.43 (-6.4..-1.1 %). Band for both
+# P: -6.5..-1, their union with the edge nearest 0 rounded out to -1. The term is signed as card.py reads it:
+# below the band is a larger saving than predicted, above it a smaller one (or none). This is below the spec's
+# +5..+10 % decode: that figure balanced the two cards' slots as if they were freely assignable, which needs the
+# hot ids on the tier (a frequency list, retired, or tier-slot residency, a swap.rs design question).
+#
+# Why the term is the pass's time and not tok/s: the tier computes its experts on card kernels where plan (a) ran
+# them on the host's AVX2 union, so the target's bits move at near ties and the greedy text parts (q38hol-ab and
+# q38head-ab parted at tokens 72 / 8 for smaller moves); E(4) then mixes into tok/s. The term is read from each arm's
+# `time pass` rows of kind=mtp, warm passes left out; tok/s and E(4) are read beside it, never as it.
+#
+# Runner (lead, after Phase 2 lands; the full output to a file first). Two gaps Phase 2 closes first:
+# tools/ref/depth-qwen3moe.sh takes one BLOOMERY_GEN_PLACE for every ours arm and refuses bp, so it needs a per-arm
+# place (e.g. `prose:512@place=bp`) in the load key; and the timing runner pins TIMING_GPU to the A6000 alone, so a bp
+# arm needs both cards in view with the 3090 at its 250 W cap and the Xid witness before and after (AGENTS.md:
+# the A6000+3090 table). Then:
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38tier-ab.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=10
+# just depth-gpu-qwen4exp prose:512 prose:4096 prose:512@place=bp prose:4096@place=bp
+# Rounds: sd 1.0 %, from q38seed-mtp's same-binary MTP pairs (q38head-ab's): 10 rounds give h 0.94 %, under the
+# band's edge 1.
+# Wall [derived]: 2 load groups x 10 rounds = 20 Qwen3.8 loads with the draft (31-49 s each; a bp load uploads
+# 22.7 GB more to the 3090 in parallel with the A6000's), the two prompts (0.5 + 3.4 s) and 2 x 96 tokens a load:
+# 15-22 min.
+kind: ab
+question: does plan (b′) — the 3090 as the A6000's expert tier, holding each layer's next 150/151 ids — shorten
+  Qwen3.8's drafted pass by the tier's share of the A6000's card slots and of the host leg's exposed time?
+term: ms per drafted pass (time pass rows, kind=mtp, warm left out) @ n=96, prose:512 and prose:4096, ctx 4352,
+  A6000 + 3090, --place bp against --place a, residency, draft and host streaming unset (mtp), same binary,
+  paired by round
+unit: %
+predict: -6.5..-1
+rounds: 10
+sd: 1.0 % q38seed-mtp's same-binary MTP pairs (rig-log 09-30#q38seed-ab, 6 rounds, +-1.3 % / +-0.9 %)
+condition: one binary, every arm in one lease, a fresh process per load group, the order rotated every round, the
+  host set and the PLE table warm, no [cpu-busy] or [other-busy] row, no Xid in either witness, the 3090 at 250 W;
+  the a arms' plan line names place=a and no tier, the bp arms' place=bp tier=3090 with tier_experts within 48 of
+  7,229 and card_experts the a arms'; both arms' load draft=mtp and residency unset mid-p121-s1; each arm's tokens
+  line, mtp summary E(4) and tok/s read beside its pass time
+decide-in: the tier is on the pass's path at the slots it takes: write the rows (pass ms, tok/s, E(4)) to rig-log's
+  A6000+3090 table and open the next lever on paper — hot ids on the tier (tier-slot residency, a swap.rs design
+  question) against its cost model
+decide-below: the pass shortened by more than the A6000's slots and the host's exposure: read one
+  BLOOMERY_STEP_STATS=1 functional run per arm (host slots, tier hits per layer) and re-fit the concentration curve
+  before the next placement round
+decide-above: the pass shortened less than the slots it moved: one nsys window of a bp drafted pass — the tier's
+  go-to-signal chain against the A6000's leg, and the mapped join's time — before any change

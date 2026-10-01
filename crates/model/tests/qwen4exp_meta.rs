@@ -1021,3 +1021,195 @@ fn hw_qwen4exp_card_plan() {
         b.join("\n  ")
     );
 }
+
+/// Plan (b′)'s row: the A6000's counts (`high` on the first `at_high`
+/// layers, `low` on the rest), both cards' totals a layer (`total_high` on
+/// the first `total_at_high`, one fewer on the rest), the tier's experts,
+/// expert bytes and rounding bytes.
+type BpRow = (u64, usize, u64, u64, usize, u64, u64, u64);
+// PIN(2026-10-01): plan (b′) (`place::machine_bp`, `--place bp`), plain, at 4,096 positions and
+// U 4,096. The split [derived: per routed slot of a decode pass the A6000's card leg reads an expert
+// of 3,072,000 B, ~5.3 µs at 575 GB/s, the 3090's ~4.4 µs at 700 GB/s, the host's union 23.6 µs
+// (rig-log 09-30#q38res-hit); residency holds the tier's ids away for the load's life, so the
+// tier's share of the routed mass is its ids' — ~k/512 under the id prefix — whatever the A6000
+// keeps, and an expert the A6000 gave up past its budget would go to the host (the tier is at its
+// own), at ~4.5 A6000 slots' time; so both cards plan to their budgets and the A6000 keeps plan (a)'s
+// row byte for byte (CARD_PLANS' first: 262 on the first 40 layers, 261 on the rest)]. The tier
+// [derived: budget 25,350,373,376 usable − 536,870,912 context − 67,108,864 scratch − 887,570,432
+// tier prompt batch (`place::tier_batch` at U 4,096: staging 496,730,112, the card route's
+// 390,840,320) − 1,073,741,824 margin = 22,785,081,344 B; the spread over all 48 layers beside the
+// A6000's counts, the layer with the fewest on both cards first, each stack in whole 2 MiB granules
+// (a gate or up 921,600 B an expert, 1,126,400 on layer 2; a down 1,228,800, 1,740,800 on layers 2,
+// 4, 30, 46 and 47), by a replica that first reproduced CARD_PLANS' four A6000 rows at 4k exactly:
+// both cards 413 on the first 21 layers and 412 on the rest, the tier 151 on layers 0-20 and 40-47
+// and 150 on 21-39, 7,229 experts, 22,655,385,600 B of experts and 123,879,424 B of rounding; the
+// host 99 or 100 a layer, 4,779 experts].
+const BP_PLAIN: BpRow = (262, 40, 261, 413, 21, 7_229, 22_655_385_600, 123_879_424);
+
+/// Plan (b′) of the Qwen3.8 file without the draft (`place::machine_bp`,
+/// `plan_with` under `Experts::Card`): the A6000's counts and card bytes
+/// plan (a)'s, the 3090 tier's per layer both cards' totals less the
+/// A6000's, its expert and rounding bytes and the host's as predicted, each
+/// routed stack in three segments — the A6000's id prefix, the tier's next
+/// ids, the host's rest; the host-routed rule on the tier machine and a
+/// draft reserve on a plan without the draft are refused by name.
+#[test]
+#[ignore = "needs the Qwen3.8-Flash-Next shards on the box (just gate-qwen4exp-meta)"]
+fn hw_qwen4exp_bp_plan() {
+    use model::arch::qwen35moe::place::{
+        self, Experts, MTP_RESERVE, PlaceError, PlanInputs, machine_bp, tier_batch,
+    };
+    use model::placement::workstation::A6000;
+    use model::placement::{Device, PlanLevers};
+
+    let mut o = String::new();
+    let mut b: Vec<String> = Vec::new();
+    let mut check = |o: &mut String, what: String, ok: bool| {
+        let _ = writeln!(o, "{what}: {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            b.push(what);
+        }
+    };
+    let split = Split::open(Q38).unwrap_or_else(|e| panic!("open {Q38}: {e}"));
+    let inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
+    let (ctx, u) = (4096u64, 4096u64);
+    let n = inputs.hp.n_layer;
+    let levers = PlanLevers::default();
+    let batch = tier_batch(&inputs.hp, u);
+    let machine = machine_bp(n, u, None, batch);
+    let a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
+    let a = inputs
+        .plan_with(&a_machine, ctx, &levers, Experts::Card)
+        .unwrap_or_else(|e| panic!("plan (a): {e}"));
+    let (high, at_high, low, t_high, t_at_high, t_experts, t_bytes, t_rounding) = BP_PLAIN;
+    match inputs.plan_with(&machine, ctx, &levers, Experts::Card) {
+        Err(e) => check(&mut o, format!("plan (b′) refused: {e}"), false),
+        Ok(plan) => {
+            let stage: Vec<u64> = (0..n)
+                .map(|l| if l < at_high { high } else { low })
+                .collect();
+            let total: Vec<u64> = (0..n)
+                .map(|l| if l < t_at_high { t_high } else { t_high - 1 })
+                .collect();
+            let tier_want: Vec<u64> = total.iter().zip(&stage).map(|(t, s)| t - s).collect();
+            let tier = plan.tier_n_l.first().cloned().unwrap_or_default();
+            let (s, sa, t) = (&plan.cards[0], &a.cards[0], &plan.cards[1]);
+            let stage_same = (s.dense_bytes, s.expert_bytes, s.rounding_bytes, s.kv_bytes)
+                == (
+                    sa.dense_bytes,
+                    sa.expert_bytes,
+                    sa.rounding_bytes,
+                    sa.kv_bytes,
+                )
+                && plan.n_l == a.n_l
+                && s.headroom_bytes == sa.headroom_bytes;
+            check(
+                &mut o,
+                format!(
+                    "the A6000 {high} on the first {at_high}, {low} on the rest ({}), plan (a)'s \
+                     counts and card bytes ({stage_same}); headroom {}",
+                    plan.n_l == stage,
+                    s.headroom_bytes
+                ),
+                plan.n_l == stage && stage_same,
+            );
+            let held: u64 = tier.iter().sum();
+            check(
+                &mut o,
+                format!(
+                    "the 3090 tier: both cards {t_high} on the first {t_at_high}, {} on the rest, \
+                     so the tier {tier:?} (want {tier_want:?}); {held} experts (want {t_experts}), \
+                     card experts {} (want {t_experts}), expert bytes {} (want {t_bytes}), \
+                     rounding {} (want {t_rounding}), dense {}, kv {}; headroom {}",
+                    t_high - 1,
+                    t.experts,
+                    t.expert_bytes,
+                    t.rounding_bytes,
+                    t.dense_bytes,
+                    t.kv_bytes,
+                    t.headroom_bytes
+                ),
+                tier == tier_want
+                    && held == t_experts
+                    && t.experts == t_experts
+                    && (t.expert_bytes, t.rounding_bytes, t.dense_bytes, t.kv_bytes)
+                        == (t_bytes, t_rounding, 0, 0),
+            );
+            let host_experts =
+                n as u64 * inputs.model.experts - plan.n_l.iter().sum::<u64>() - held;
+            let host_bytes = HOST_EXPERTS - s.expert_bytes - t.expert_bytes;
+            check(
+                &mut o,
+                format!(
+                    "the host {} experts (want {host_experts}), {} B (want {host_bytes}); \
+                     headroom {}",
+                    plan.host.experts, plan.host.expert_bytes, plan.host.headroom_bytes
+                ),
+                plan.host.experts == host_experts && plan.host.expert_bytes == host_bytes,
+            );
+            let mut off_rule = Vec::new();
+            for r in &plan.rows {
+                let tensor = &inputs.model.tensors[r.tensor];
+                let Some(l) = tensor
+                    .layer
+                    .filter(|_| tensor.role == model::placement::Role::RoutedExperts)
+                else {
+                    continue;
+                };
+                let per = tensor.file_bytes / inputs.model.experts;
+                let (ns, nt) = (plan.n_l[l], tier.get(l).copied().unwrap_or(0));
+                let ok = match r.segments.as_slice() {
+                    [c, k, h] => {
+                        c.device == Device::Card(0)
+                            && c.experts.as_ref().and_then(|e| e.as_prefix()) == Some(ns)
+                            && k.device == Device::Card(1)
+                            && k.experts.as_ref().is_some_and(|e| {
+                                e.ids().iter().map(|&i| u64::from(i)).eq(ns..ns + nt)
+                            })
+                            && k.resident_bytes == nt * per
+                            && h.device == Device::Host
+                            && h.resident_bytes == (inputs.model.experts - ns - nt) * per
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    off_rule.push(tensor.name.clone());
+                }
+            }
+            check(
+                &mut o,
+                format!(
+                    "each routed stack: the A6000's prefix, the tier's next ids, the host's rest; \
+                     off the rule {off_rule:?}"
+                ),
+                off_rule.is_empty(),
+            );
+        }
+    }
+    let host = inputs.plan_with(&machine, ctx, &levers, Experts::Host);
+    check(
+        &mut o,
+        format!(
+            "the host-routed rule on the tier machine: {:?}",
+            host.as_ref().err()
+        ),
+        matches!(host, Err(PlaceError::TierHost { .. })),
+    );
+    let drafted = machine_bp(n, u, Some(1), batch);
+    let reserve = inputs.plan_with(&drafted, ctx, &levers, Experts::Card);
+    check(
+        &mut o,
+        format!(
+            "a plain plan on a machine reserving \"{MTP_RESERVE}\": {:?}",
+            reserve.as_ref().err().map(ToString::to_string)
+        ),
+        matches!(reserve, Err(PlaceError::DraftReserve { .. })),
+    );
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} clause(s) failed:\n  {}",
+        b.len(),
+        b.join("\n  ")
+    );
+}

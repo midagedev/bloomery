@@ -487,7 +487,7 @@ pub static PLAN: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "The qwen4exp placement the engine is about to load by: its card, the expert rule (host or card), the context, and where the routed experts sit (each layer's id prefix on the card).",
+    doc: "The qwen4exp placement the engine is about to load by: its card, the expert rule (host or card), the context, and where the routed experts sit (each layer's id prefix on the card; under plan (b′) the expert tier card and the next ids it holds).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -495,6 +495,8 @@ pub static PLAN38: Kind = Kind {
         key("ctx_max", U64, "positions"),
         key("host_experts", U64, "experts"),
         key("card_experts", U64, "experts"),
+        opt("tier", Word, ""),
+        opt("tier_experts", U64, "experts"),
     ],
 };
 
