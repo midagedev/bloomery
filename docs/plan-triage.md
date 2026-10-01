@@ -172,19 +172,25 @@ breaks even against the plain path at about 10 output tokens at P 512 and about 
   `hw_a_capture_body_that_fails_or_panics_leaves_the_stream_capturable` and
   `hw_nodes_report_a_captured_host_function`. The old path failed 0 of 6. The capture mode is THREAD_LOCAL
   (`crates/gpu/src/graph.rs`), and the mechanism is not known. It may become a line in the nvlabs ledger.
-  (`lanea`)
-- **callstream teardown segfault (M)**: after a device fault with residency on, the process ends with rc 139
-  while the model is dropped. The gate prints the clause error before its teardown, so no verdict is lost.
-  The crash still needs a fix. (`gmerge`)
+  (`lanea`) The red runs came from `tools/gpu-test.sh`, which did not land; main's `tools/gate.sh` path is the
+  0-of-6 one. Candidate mechanism (code reading, 10-01, 8a): the lib tests run as threads of one process on device
+  0's one primary context, and cuda-core 0.3.1's `DeviceBuffer` drop calls `cuCtxSynchronize` before its async free
+  (`simt/device_buffer.rs:163-176`). One test's drop, synchronizing every stream while another test's stream is in a
+  THREAD_LOCAL capture, gets 900 and records it as the context handle's sticky error (`record_err`). Discriminator:
+  the same binary at `--test-threads=1` against the default, N runs each.
+- ~~**callstream teardown segfault (M)**~~ closed by `efc983ea` on code reading (10-01, 8a): the gate runs
+  `--place bp` on both cards (`gate_ds41_callstream.rs:3`, the recipe's `BLOOMERY_CARD=both`), the tier's stream
+  memops cross the two contexts, and the crash is the model drop's second primary-context release, the stagewin
+  mechanism; no `Gpu` drop releases a primary context now. The fault path's teardown has not run since: the next run
+  of a faulting mutant (s1's slot read mid-copy) confirms it. (`gmerge`)
 - ~~**stagewin teardown segfault**~~ closed by `efc983ea` (2026-10-01): the driver faults in the second
   `cuDevicePrimaryCtxRelease_v2` once one context's stream memops touched a portable host page of the other —
   reproduced without the engine (`docs/upstream/nvlabs-ledger.md` #36, `docs/upstream/ctxrelease-repro.c`). A device's
   primary context is now retained once and released only at exit. The callstream item below ran green in that
   landing batch (gate-gpu-ds41-callstream rc 0, no segfault in any log); re-read it before closing it.
-- **t2review leftovers (S each, report `t2review`)**: `crates/gpu/src/tensor.rs` `DeviceTensor::window`'s
-  `rows * cols` is unchecked; host_stats' p50 convention; `crates/gpu/src/arch/deepseek2/scratch.rs:698-701` `into_handle` leaks
-  a handle when a later window of the four fails; `tools/check-unsafe.sh` misses an unquoted `unsafe extern {` and `build.rs`; the
-  residency refusal text differs between its two owners.
+- **t2review leftovers (S each, report `t2review`)**: host_stats' p50 convention; the residency refusal text differs
+  between its two owners. (`DeviceTensor::window`'s unchecked product, the `scratch.rs` handle leak and the two
+  `check-unsafe.sh` gaps closed in `80e86b6b`.)
 - **callstream mutant s3-drop-admitted (S)**: it is caught by s2 and s4, not by s3, and its output is
   byte-identical to s2-acc-first's, so its site may be wrong. (`gmerge`)
 - **Qwen3.8 MTP prompt cost after `mtpcost` (M, a placement round)**: at P 4096 the MTP arm's prompt is
