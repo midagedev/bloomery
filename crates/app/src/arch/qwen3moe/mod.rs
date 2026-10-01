@@ -12,6 +12,7 @@
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, TargetRows};
 use bloomery_gpu::model::StepMode;
+use runtime::seqstate::Kept;
 use runtime::{Speculative, Tapped};
 
 use crate::mtp::{MtpBody, MtpDraft};
@@ -40,20 +41,29 @@ impl Prompt for Body38 {
 }
 
 impl Keep for Body38 {
-    /// Every position when `n` reaches the model's, else nothing: the
-    /// recurrent state (the GDN lanes, the PLE hash history) keeps no
-    /// earlier position — a verify's commit aside, which [`Keep::cut`]
-    /// serves through the body's own rule.
+    /// [`Body38::kept`]'s position: every position, the empty model, the
+    /// nearest checkpoint at or below `n` a prompt call took, or a waiting
+    /// verify's rows.
     fn keepable(m: &Qwen38Model, n: u32) -> u32 {
-        let pos = m.pos();
-        if n >= pos { pos } else { 0 }
+        <Body38 as Keep>::kept(m, n).at
     }
 
-    /// The body's commit: nothing to take back at the model's position, the
-    /// waiting verify's kept rows anywhere past its first, refused by name
-    /// elsewhere.
+    /// [`Body38::kept`]: what a cut keeps and why — a checkpoint's position,
+    /// or nothing with the reason a delta layer holds no earlier state.
+    fn kept(m: &Qwen38Model, n: u32) -> Kept {
+        m.body(WHAT)
+            .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
+    }
+
+    /// Back to empty at 0 — a reset, the residency where use has taken it;
+    /// else the body's commit ([`Rollback`](bloomery_gpu::model::Rollback)):
+    /// a waiting verify's kept rows, or the checkpoint at `n`, any other
+    /// position refused by name.
     fn cut(m: &mut Qwen38Model, n: u32) -> Result<(), GpuError> {
-        m.rollback(n)
+        match n {
+            0 => m.reset(),
+            n => m.rollback(n),
+        }
     }
 }
 

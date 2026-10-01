@@ -5,8 +5,8 @@
 //!                       --ids <a,b,…> --dir <out>
 //!
 //! Starts the server beside this binary (`--host 127.0.0.1 --port 0 --place
-//! gate`), reads its address from its stderr, waits for `/health`, then
-//! checks:
+//! gate --ctx-size 4096`), reads its address from its stderr, waits for
+//! `/health`, then checks:
 //!
 //! - `/props`' `engine` object, printed once, against this gate's own plan of
 //!   the file the server opens (the gate card, the server's default context,
@@ -27,29 +27,45 @@
 //!   past that each runs the prompt's last position through a different arm;
 //! - the same `/completion` again, and once more after the other requests
 //!   below: the same ids each time (a request that does not extend the held
-//!   sequence keeps none of it — it prefills from a reset, never a wrong
-//!   state);
+//!   sequence keeps the checkpoint at its prompt call's end, or under the
+//!   draft prefills from a reset — never a wrong state);
 //! - `/v1/chat/completions` of one user turn at temperature 0: the streamed
 //!   deltas concatenate to the non-streamed content, and the stream ends with
 //!   `data: [DONE]`;
 //! - `/tokenize` of `--prompt` is `--ids`;
-//! - the positions the server serves: `/props`' `n_ctx` is the server's
-//!   default context; a prompt of that many ids is a 400
-//!   (`exceed_context_size_error`, naming it) and the server stays up.
+//! - the positions the server serves: `/props`' `n_ctx` is the context it
+//!   was started at; a prompt of that many ids is a 400
+//!   (`exceed_context_size_error`, naming it) and the server stays up;
+//! - `cache` ([`cache`]): two sessions' requests through the prompt cache —
+//!   a verbatim resend after the other session keeps every held position
+//!   (under the draft the turn's prompt end, its last window having fed
+//!   rows past the reply) and gives the ids of the same session run with no
+//!   switch; a resend with the reply's reasoning stripped keeps the
+//!   checkpoint at the first turn's end and gives a fresh run's ids; under
+//!   the draft every request that kept a checkpoint by a cut drafts nothing
+//!   and says why by name;
 //! - under `BLOOMERY_DRAFT=mtp`, requests that extend the sequence the
 //!   server holds (`continued`): each keeps the held prefix (`cache_n`), a
 //!   prompt call past it prints one `mtp prompt` record — the draft caught
 //!   up at the kept position, nothing skipped — and none prints a skip, and
-//!   each drafts, with the plain run's ids (the generated ones) or the same
-//!   prompt's fed fresh; `/props`' `engine.draft` names the draft file
+//!   each drafts, with the plain run's ids (the generated ones); the prompt
+//!   resent keeps its end by a cut, after which the extension drafts
+//!   nothing, by name, with the same prompt's ids fed fresh; `/props`' `engine.draft` names the draft file
 //!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path;
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) is served
 //!   through plain steps, drafting nothing, and the same request at `top_k`
 //!   1 gives this server's greedy ids.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
-//! waited for, and one more server starts on the card, alone:
+//! waited for, and more servers start on the card, one at a time:
 //!
+//! - `cache` again on a server with the draft the first did not run
+//!   (`BLOOMERY_DRAFT=mtp` when it ran `off`, and the other way);
+//! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default
+//!   ([`CTX`]), the largest context the card holds with its card expert
+//!   bytes and the largest within the plan's margin, before its load, each
+//!   the rule's against this gate's own plans (stopped there), and one asked for a position past the largest
+//!   context the card holds is refused by name before it listens;
 //! - `residency`: `bloomery-serve-qwen38` with the same arguments under
 //!   `BLOOMERY_RESIDENCY=mid-p0-s1` (`BLOOMERY_DRAFT=off`, the MTP levers
 //!   removed; the word set explicitly, one the lever takes): it loads and
@@ -135,15 +151,48 @@ mod gate {
     const USAGE: &str = "usage: gate_qwen38_serve --gen <generate_qwen3moe log> --prompt <text> \
                          --ids <a,b,…> --dir <out>";
 
-    /// The server's arguments after its path; `/props` must echo them.
-    const SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "gate"];
+    /// The server's arguments after its path; `/props` must echo them. The
+    /// context is named: the clauses below count on [`CTX`] positions, and
+    /// the default is the `ctx` clause's. The slot actions need a save
+    /// directory; the gate asks only for `erase`, which writes nothing.
+    const SERVER_ARGS: [&str; 10] = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--place",
+        "gate",
+        "--ctx-size",
+        "4096",
+        "--slot-save-path",
+        "/tmp",
+    ];
+    /// The same arguments with no context named: the default's.
+    const DEFAULT_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "gate"];
     /// The load takes tens of seconds; the bound is the spec's 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
     /// The greedy requests' length, `generate_qwen3moe -n 16`'s.
     const N_PREDICT: usize = 16;
-    /// The server's default context, the stores it sizes.
+    /// The context the servers are started at (`SERVER_ARGS`), and the one
+    /// the default's expert cost is counted against.
     const CTX: usize = 4096;
+    /// The default context's multiple.
+    const CTX_STEP: usize = 256;
+    /// Session A's first turn, session B's, a later turn A resends after its
+    /// reply (`cache` clause (a)), and the text A resends instead of its
+    /// reply (clause (b)): the last's first id is not the reply's.
+    const TURN_A: &str = "Name three rivers that flow through Germany and say in one sentence \
+                          which of them is the longest.";
+    const TURN_B: &str = "Write a haiku about a lighthouse in winter.";
+    const LATER_A: &str = "<|im_end|>\n<|im_start|>user\nAnd which of them reaches the sea \
+                           first?<|im_end|>\n<|im_start|>assistant\n";
+    const STRIPPED_A: &str = "The Rhine, the Danube and the Elbe; the Danube is the longest.\
+                              <|im_end|>\n<|im_start|>user\nAnd which of them reaches the sea \
+                              first?<|im_end|>\n<|im_start|>assistant\n";
+    /// The words of the seat's line that says the MTP draft proposes nothing
+    /// after a cut or a state put back.
+    const DRAFT_OFF: &str = "the MTP draft proposes nothing from position";
     /// The one chat turn the chat clauses send.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
     /// The chat's reply length.
@@ -537,6 +586,16 @@ mod gate {
             .collect())
     }
 
+    /// The seat's lines on the server's stderr so far that say the MTP draft
+    /// proposes nothing after a cut or a state put back.
+    fn draft_offs(err_log: &Path) -> Result<Vec<String>, GateError> {
+        Ok(std::fs::read_to_string(err_log)?
+            .lines()
+            .filter(|l| l.contains(DRAFT_OFF))
+            .map(str::to_owned)
+            .collect())
+    }
+
     /// An `mtp prompt` record's join: its start, the rows the draft caught
     /// up and why it skipped (`none` when it drafts; the text runs to the
     /// line's end).
@@ -551,8 +610,8 @@ mod gate {
     }
 
     /// One greedy `/completion` of the token array `ids`: its status, ids,
-    /// `cache_n` and `draft_n`, and the `mtp prompt` records it made the
-    /// server print. A request the server does not answer is a status of 0
+    /// `cache_n` and `draft_n`, and the `mtp prompt` records and draft-off
+    /// lines it made the server print. A request the server does not answer is a status of 0
     /// and its error as the ids' line.
     fn greedy(
         url: &dyn Fn(&str) -> String,
@@ -562,6 +621,7 @@ mod gate {
         cache: bool,
     ) -> Result<Greedy, GateError> {
         let before = mtp_prompts(err_log)?.len();
+        let offs_before = draft_offs(err_log)?.len();
         let body = json!({
             "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
             "cache_prompt": cache,
@@ -575,6 +635,7 @@ mod gate {
                     cache_n: v["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX),
                     draft_n: v["timings"]["draft_n"].as_u64().unwrap_or(0),
                     joins: Vec::new(),
+                    offs: Vec::new(),
                     said: String::new(),
                 }
             }
@@ -582,7 +643,8 @@ mod gate {
             Err(e) => Greedy::failed(e.to_string()),
         };
         let joins = mtp_prompts(err_log)?.split_off(before);
-        Ok(Greedy { joins, ..g })
+        let offs = draft_offs(err_log)?.split_off(offs_before);
+        Ok(Greedy { joins, offs, ..g })
     }
 
     struct Greedy {
@@ -591,6 +653,7 @@ mod gate {
         cache_n: u64,
         draft_n: u64,
         joins: Vec<String>,
+        offs: Vec<String>,
         said: String,
     }
 
@@ -602,6 +665,7 @@ mod gate {
                 cache_n: u64::MAX,
                 draft_n: 0,
                 joins: Vec::new(),
+                offs: Vec::new(),
                 said,
             }
         }
@@ -610,12 +674,25 @@ mod gate {
         fn show(&self, what: &str) {
             if self.ok {
                 println!(
-                    "{what}: tokens {:?} cache_n={} draft_n={} joins {:?}",
-                    self.tokens, self.cache_n, self.draft_n, self.joins
+                    "{what}: tokens {:?} cache_n={} draft_n={} joins {:?} offs {:?}",
+                    self.tokens, self.cache_n, self.draft_n, self.joins, self.offs
                 );
             } else {
                 println!("{what}: {} joins {:?}", self.said, self.joins);
             }
+        }
+
+        /// Under the draft, a request that kept `cache_n` by a cut: its last
+        /// draft-off line names that position, its join there names why the
+        /// draft skips, and it drafted nothing.
+        fn skipped_by_name(&self) -> bool {
+            let at = format!(" from position {} ", self.cache_n);
+            self.ok
+                && self.draft_n == 0
+                && self.offs.last().is_some_and(|l| l.contains(&at))
+                && self.joins.iter().any(|l| {
+                    join_of(l).is_some_and(|(s, c, k)| s == self.cache_n && c == 0 && k != "none")
+                })
         }
 
         /// One join printed for this request, at `start`, that walked the
@@ -631,15 +708,18 @@ mod gate {
     /// (`cache_prompt`), and the draft joins them — the rows an earlier
     /// request left waiting walked, the token the new request puts at their
     /// last position — so it drafts from the first window, with the plain
-    /// run's ids. Three joins: after a request that ended on its first step
-    /// (`n_predict` 1), extended by the id it generated: its prompt call is
+    /// run's ids. Three joins: after a request fed fresh that ended on its
+    /// first step (`n_predict` 1), extended by the id it generated: its prompt call is
     /// empty, the join is its first step's, and no `mtp prompt` record says
     /// it skipped; after drafted windows (the held sequence is at most 11
     /// ids past the prompt: 8 generated, the last window's 3 past them),
     /// extended by the plain run's next ids, a prompt call of 1 to 4 ids and
     /// its record; and after a first step again, extended by ids the model
-    /// did not generate, against the same prompt fed fresh. Every prompt
-    /// call stays below
+    /// did not generate, against the same prompt fed fresh. That first step
+    /// is the prompt resent, which keeps the prompt's end (one short of it)
+    /// by a cut: the draft proposes nothing from there, by name, and the
+    /// extension keeps the prompt and runs plain steps with the fresh run's
+    /// ids. Every prompt call stays below
     /// [`GEMM_FROM`](bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM), so
     /// a continued and a fresh feed leave the same state.
     fn continued(
@@ -652,7 +732,10 @@ mod gate {
         let with = |tail: &[u32]| -> Vec<u32> { ids.iter().chain(tail).copied().collect() };
         let mut ok = true;
 
-        let a = greedy(url, err_log, ids, 1, true)?;
+        // PIN(2026-10-01): fed fresh, so the draft starts on: under the keep rule's checkpoints
+        // the prompt kept from an earlier request's cached state is a cut, after which the draft
+        // proposes nothing; was `cache_prompt` true.
+        let a = greedy(url, err_log, ids, 1, false)?;
         a.show("continued: the prompt, one id");
         check(
             &mut ok,
@@ -701,18 +784,31 @@ mod gate {
         x3.show("continued: extended by other ids");
         let fresh = greedy(url, err_log, &with(&ext), 8, false)?;
         fresh.show("continued: the same ids fed fresh");
+        // PIN(2026-10-01): the keep rule grants checkpoints under the draft (lead, round recsave),
+        // and the draft's rejoin after a cut is not built (app/src/mtp.rs): `b` keeps p − 1 by a
+        // cut, so `x3` drafts nothing and its join names why; was a join at p that drafts.
+        let skips_at_p = x3
+            .joins
+            .iter()
+            .any(|l| join_of(l).is_some_and(|(s, c, k)| s == p && c == 0 && k != "none"));
         check(
             &mut ok,
-            "continued_by_other_ids_keeps_the_prompt_and_joins_at_its_end",
-            b.ok && x3.ok && x3.cache_n == p && x3.joined_at(p),
+            "continued_by_other_ids_keeps_the_prompt_and_skips_by_name",
+            b.cache_n == p - 1
+                && b.skipped_by_name()
+                && x3.ok
+                && x3.cache_n == p
+                && x3.draft_n == 0
+                && x3.offs.is_empty()
+                && skips_at_p,
         );
         check(
             &mut ok,
-            "continued_by_other_ids_drafts_the_fresh_ids",
+            "continued_by_other_ids_runs_the_fresh_ids",
             x3.ok
                 && fresh.ok
                 && fresh.cache_n == 0
-                && x3.draft_n > 0
+                && fresh.draft_n > 0
                 && x3.tokens == fresh.tokens
                 && x3.tokens.len() == 8,
         );
@@ -844,6 +940,341 @@ mod gate {
             !ids.is_empty() && again == ids,
         );
         println!("residency server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
+    /// The ids of `messages` as the server's chat template renders them
+    /// (`/apply-template`, then `/tokenize`).
+    fn rendered(url: &dyn Fn(&str) -> String, messages: Value) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(
+            &url("/apply-template"),
+            Some(&json!({ "messages": messages })),
+            false,
+        )?;
+        let text = json_of("/apply-template", st, &body)?["prompt"]
+            .as_str()
+            .ok_or("/apply-template: no prompt")?
+            .to_owned();
+        tokenized(url, &text)
+    }
+
+    /// `/tokenize` of `text`.
+    fn tokenized(url: &dyn Fn(&str) -> String, text: &str) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": text })), false)?;
+        Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
+    }
+
+    /// The slot dropped and not saved (`POST /slots/0?action=erase`): the
+    /// prompt cache keeps what it held, and nothing more.
+    fn erase(url: &dyn Fn(&str) -> String) -> Result<(), GateError> {
+        let (st, body) = curl(&url("/slots/0?action=erase"), Some(&json!({})), false)?;
+        json_of("/slots/0?action=erase", st, &body)?;
+        Ok(())
+    }
+
+    /// The `cache` clause on one server (`drafted`: its MTP draft runs):
+    /// session A's first turn fed fresh, session B's turn, then A again — its
+    /// state saved when B took the slot and put back — and the greedy ids
+    /// against a run of A with no switch between:
+    /// - (a) A's conversation resent verbatim with a later turn: it keeps
+    ///   every position A held (under the draft, whose last window fed rows
+    ///   past the reply it returned, the resend shares fewer than held and
+    ///   keeps the turn's prompt end, as the same session does with no
+    ///   switch), and its ids are those of the same two requests run back to
+    ///   back (fresh, then the resend), run first. Not a fresh run
+    ///   of the resend: the positions A's generation fed were steps, which a
+    ///   fresh prompt call would run through the ubatch walk;
+    /// - (b) A's first turn resent with the reasoning-stripped reply in place
+    ///   of the reply, so the shared prefix ends at the first turn's end: it
+    ///   keeps the checkpoint there (the turn's prompt call's end, one short
+    ///   of the turn: its last id is fed by the first step), the draft on
+    ///   or off, and its ids are a fresh run's of the same ids (every prompt
+    ///   call of at least nine ids is the ubatch walk, whose bits do not
+    ///   depend on where a call is cut);
+    /// - under the draft, every request that kept a checkpoint by a cut (the
+    ///   resends with and without the switch, the stripped resend) drafted
+    ///   nothing and says so by name: the seat's draft-off line at the kept
+    ///   position, and an `mtp prompt` record there with why; the fresh run
+    ///   after them drafts again. Without the draft no such line prints.
+    ///   The draft's rejoin after a cut is not built: when it is, this
+    ///   clause turns over.
+    ///
+    /// Mutants: the state keeping the current position's recurrent stores
+    /// alone ((b) keeps 0); a resume that leaves the PLE history behind (the
+    /// resend is refused); a keep rule that grants any position (B's request
+    /// cuts where no checkpoint stands, refused); under the draft every
+    /// shorter prefix kept as none (the cuts' clause sees no cut).
+    fn cache(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        drafted: bool,
+        label: &str,
+    ) -> Result<bool, GateError> {
+        let p1 = rendered(url, json!([{ "role": "user", "content": TURN_A }]))?;
+        let pb = rendered(url, json!([{ "role": "user", "content": TURN_B }]))?;
+        let later = tokenized(url, LATER_A)?;
+        let stripped = tokenized(url, STRIPPED_A)?;
+        let gemm = bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM;
+        if p1.len() < gemm + 1 || later.len() < gemm || stripped.len() < gemm {
+            return Err(format!(
+                "the cache clause's turns are {}, {} and {} ids; each needs at least {gemm} past \
+                 the last kept position",
+                p1.len(),
+                later.len(),
+                stripped.len()
+            )
+            .into());
+        }
+        let n = N_PREDICT;
+        let with = |a: &[u32], b: &[u32], c: &[u32]| -> Vec<u32> {
+            a.iter().chain(b).chain(c).copied().collect()
+        };
+        let mut ok = true;
+
+        // The run with no switch first, then the slot dropped unsaved, so no
+        // cached state holds the resend when the switched run asks for it.
+        let r1 = greedy(url, err_log, &p1, n, false)?;
+        r1.show(&format!("cache {label}: A's turn fresh"));
+        let resend = with(&p1, &r1.tokens, &later);
+        let r2 = greedy(url, err_log, &resend, n, true)?;
+        r2.show(&format!("cache {label}: A resent verbatim, no switch"));
+        erase(url)?;
+        let a1 = greedy(url, err_log, &p1, n, false)?;
+        a1.show(&format!("cache {label}: A's turn fresh again"));
+        let b1 = greedy(url, err_log, &pb, n, true)?;
+        b1.show(&format!("cache {label}: B's turn"));
+        let a2 = greedy(url, err_log, &resend, n, true)?;
+        a2.show(&format!("cache {label}: A resent verbatim after B"));
+        let held = (p1.len() + a1.tokens.len()).saturating_sub(1) as u64;
+        let turn_end = p1.len() as u64 - 1;
+        let want = if drafted { turn_end } else { held };
+        let kept = a2.cache_n == want && r2.cache_n == want;
+        check(
+            &mut ok,
+            &format!("cache_{label}_a_keeps_every_held_position_after_the_switch"),
+            r1.ok && a1.ok && b1.ok && a2.ok && !a1.tokens.is_empty() && kept,
+        );
+        check(
+            &mut ok,
+            &format!("cache_{label}_a_ids_are_the_run_with_no_switch"),
+            r2.ok && r1.tokens == a1.tokens && !a2.tokens.is_empty() && a2.tokens == r2.tokens,
+        );
+
+        if stripped.first() == a1.tokens.first() {
+            return Err(format!(
+                "the stripped reply's first id {:?} is the reply's: the shared prefix would not \
+                 end at the turn",
+                stripped.first()
+            )
+            .into());
+        }
+        erase(url)?;
+        let c1 = greedy(url, err_log, &p1, n, false)?;
+        c1.show(&format!("cache {label}: A's turn fresh (b)"));
+        let b2 = greedy(url, err_log, &pb, n, true)?;
+        b2.show(&format!("cache {label}: B's turn (b)"));
+        let strip = with(&p1, &stripped, &[]);
+        let a3 = greedy(url, err_log, &strip, n, true)?;
+        a3.show(&format!("cache {label}: A resent stripped after B"));
+        let f3 = greedy(url, err_log, &strip, n, false)?;
+        f3.show(&format!("cache {label}: the same ids fresh"));
+        check(
+            &mut ok,
+            &format!("cache_{label}_b_keeps_the_turns_end"),
+            c1.ok && b2.ok && a3.ok && a3.cache_n == turn_end,
+        );
+        check(
+            &mut ok,
+            &format!("cache_{label}_b_ids_are_a_fresh_runs"),
+            f3.ok && f3.cache_n == 0 && !a3.tokens.is_empty() && a3.tokens == f3.tokens,
+        );
+        let cuts = [&r2, &a2, &a3];
+        let named = if drafted {
+            cuts.iter().all(|g| g.skipped_by_name()) && f3.draft_n > 0 && f3.offs.is_empty()
+        } else {
+            cuts.iter().chain([&f3].iter()).all(|g| g.offs.is_empty())
+        };
+        check(
+            &mut ok,
+            &format!("cache_{label}_cuts_leave_the_draft_off_by_name"),
+            named,
+        );
+        Ok(ok)
+    }
+
+    /// The `cache` clause on a server of its own with the draft the main
+    /// server did not run (`drafted`), the residency off.
+    fn cache_other(dir: &Path, drafted: bool) -> Result<bool, GateError> {
+        let label = if drafted { "drafted" } else { "plain" };
+        let own = dir.join(format!("cache-{label}"));
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, if drafted { "mtp" } else { "off" })
+            .env(bloomery_levers::RESIDENCY, "off");
+        if !drafted {
+            cmd.env_remove(bloomery_levers::MTP_HEAD_ROWS)
+                .env_remove(bloomery_levers::MTP_DRAFT);
+        }
+        let mut served = Served38::spawn_with(&SERVER_ARGS, &own, &mut cmd)?;
+        println!("cache {label} server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let ok = cache(&url, &err_log, drafted, label)?;
+        println!("cache {label} server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
+    /// The plan's card expert bytes on the gate card at `ctx`, plain, as the
+    /// server makes it; `None` when no plan takes the context.
+    fn card_at(
+        inputs: &PlanInputs,
+        levers: &PlanLevers,
+        experts: Experts,
+        ctx: usize,
+    ) -> Result<Option<u64>, GateError> {
+        let machine = machine_for_experts(
+            RTX_3090,
+            inputs.spec.layers.len(),
+            u64::try_from(ubatch_for(ctx)?)?,
+            experts,
+        );
+        Ok(inputs
+            .plan_with(&machine, u64::try_from(ctx)?, levers, experts)
+            .ok()
+            .and_then(|p| p.cards.first().map(|c| c.expert_bytes)))
+    }
+
+    /// The `ctx` clause: a plain server with no `--ctx-size` prints its
+    /// `ctx` line before its load (it is stopped there), against this gate's
+    /// own plans of the file: its context is [`CTX`] (`base`), or the
+    /// largest the card holds when that is fewer (`card`); the line's `fit`
+    /// is the largest the card holds — its plan taken, the one past it
+    /// refused — with that plan's card expert bytes; its `margin_ctx` holds
+    /// at most the plan's margin fewer card expert bytes than the plan at
+    /// [`CTX`], and the next multiple of [`CTX_STEP`] past it more (or it is
+    /// the fit). A server asked for one position past the fit is refused by
+    /// name before it listens. Mutant: the refusal of a context past the
+    /// card taken out (the load's own plan refuses it, not by the rule's
+    /// name).
+    fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let own = dir.join("ctx");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let spawn = |args: &[&str]| -> Result<Served38, GateError> {
+            let mut cmd = Command::new(Served38::exe()?);
+            cmd.env(bloomery_levers::DRAFT, "off")
+                .env(bloomery_levers::RESIDENCY, "off")
+                .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+                .env_remove(bloomery_levers::MTP_DRAFT);
+            Served38::spawn_with(args, &own, &mut cmd)
+        };
+        let mut served = spawn(&DEFAULT_ARGS)?;
+        let mut line = None;
+        for _ in 0..POLLS {
+            let text = std::fs::read_to_string(&err_log).unwrap_or_default();
+            line = text
+                .lines()
+                .find(|l| l.starts_with("ctx rule="))
+                .map(str::to_owned);
+            if line.is_some() || served.child.try_wait()?.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        if served.child.try_wait()?.is_none() {
+            println!("ctx: the default server stopped: {}", served.stop()?);
+        }
+        let line = line.ok_or("the default server printed no `ctx` line")?;
+        println!("ctx: {line}");
+        let field = |k: &str| -> Option<String> {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
+                .map(str::to_owned)
+        };
+        let num = |k: &str| field(k).and_then(|v| v.parse::<usize>().ok());
+        let (rule, ctx, fit) = (field("rule"), num("ctx"), num("fit"));
+        let fit_bytes = field("fit_card_expert_bytes").and_then(|v| v.parse::<u64>().ok());
+        let margin_ctx = num("margin_ctx");
+        let (Some(rule), Some(ctx), Some(fit), Some(fit_bytes), Some(margin_ctx)) =
+            (rule, ctx, fit, fit_bytes, margin_ctx)
+        else {
+            return Err(format!(
+                "a `ctx` line without its rule, ctx, fit, fit_card_expert_bytes and margin_ctx: \
+                 {line}"
+            )
+            .into());
+        };
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::describe(&split)?;
+        let experts = experts38(levers)?;
+        let plan_levers = PlanLevers::from_levers(levers)?;
+        let at = |c: usize| card_at(&inputs, &plan_levers, experts, c);
+        let base = at(CTX)?.ok_or("no plan at the base context")?;
+        let lost = |c: usize| -> Result<Option<u64>, GateError> {
+            Ok(at(c)?.map(|e| base.saturating_sub(e)))
+        };
+        let margin = model::placement::workstation::MARGIN;
+        let here = lost(margin_ctx)?;
+        let past = lost(margin_ctx + CTX_STEP)?;
+        let (at_fit, past_fit) = (at(fit)?, at(fit + 1)?);
+        println!(
+            "ctx: the gate's plans: lost at {margin_ctx} {here:?}, at {} {past:?}, fit {fit} \
+             {at_fit:?}, past it {past_fit:?}",
+            margin_ctx + CTX_STEP,
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "ctx_default_is_the_rules",
+            match rule.as_str() {
+                "base" => ctx == CTX && CTX <= fit,
+                "card" => ctx == fit && fit < CTX,
+                _ => false,
+            },
+        );
+        check(
+            &mut ok,
+            "ctx_line_prints_the_fit_and_the_margin",
+            at_fit == Some(fit_bytes)
+                && past_fit.is_none()
+                && here.is_some_and(|l| l <= margin)
+                && margin_ctx <= fit
+                && (margin_ctx == fit
+                    || (margin_ctx.is_multiple_of(CTX_STEP) && past.is_none_or(|l| l > margin))),
+        );
+        let over = (fit + 1).to_string();
+        let args: Vec<&str> = DEFAULT_ARGS
+            .iter()
+            .copied()
+            .chain(["--ctx-size", &over])
+            .collect();
+        let mut refused = spawn(&args)?;
+        let mut status = None;
+        for _ in 0..POLLS {
+            status = refused.child.try_wait()?;
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let text = std::fs::read_to_string(&err_log).unwrap_or_default();
+        let named = format!("--ctx-size {over}: the card holds at most {fit} positions");
+        println!(
+            "ctx: --ctx-size {over}: exit {status:?}; named {}",
+            text.contains(&named)
+        );
+        if status.is_none() {
+            println!("ctx: the refused server stopped: {}", refused.stop()?);
+        }
+        check(
+            &mut ok,
+            "ctx_past_the_card_is_refused_by_name",
+            status.is_some_and(|s| !s.success())
+                && text.contains(&named)
+                && !text.contains("listening on http://"),
+        );
         Ok(ok)
     }
 
@@ -1004,6 +1435,13 @@ mod gate {
 
         let id = a.ids.iter().copied().min().ok_or("--ids is empty")?;
         ok &= position_limit(&url, id)?;
+        let drafted = levers.draft() == Some("mtp");
+        ok &= cache(
+            &url,
+            &err_log,
+            drafted,
+            if drafted { "drafted" } else { "plain" },
+        )?;
         let sampled = json!({
             "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": SAMPLED_TEMPERATURE,
             "seed": SAMPLED_SEED, "return_tokens": true,
@@ -1020,6 +1458,8 @@ mod gate {
         }
 
         println!("server stopped: {}", served.stop()?);
+        ok &= cache_other(&a.dir, !drafted)?;
+        ok &= ctx(&a.dir, &levers)?;
         ok &= residency(&a.dir, &completion)?;
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");

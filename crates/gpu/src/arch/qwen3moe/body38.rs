@@ -82,7 +82,7 @@ use super::program38::{
     Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, Verify38, step_launches,
     verify_launches,
 };
-use super::scratch::{Io, LANE, RopeRows, StepParams, f32_view};
+use super::scratch::{Io, KvPlanes, LANE, RecStore, RopeRows, StepParams, f32_view};
 use super::scratch38::{
     Arena38, LANES, LaneWord, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, WideRecord,
     dims, kept_lane, store_rule_bytes,
@@ -93,6 +93,8 @@ use super::wide38::{
     Gemm38, Prompt38Stats, STREAM_FLOOR, Stream38, Wide38, WideForce, WideParts, WideTaps,
     WideTiming, dense_rows, nanos, route_taps_host,
 };
+use crate::checkpoint::Checkpoints;
+use crate::checkpoint::saved::{Identity, Lent, SeqState, Spans};
 use crate::head::{Head, HeadNorm};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{
@@ -103,6 +105,7 @@ use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::model::{ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows};
 use crate::rope_table::{RopeSpec, RopeTable};
+use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError, launch_u32, ple};
 use bloomery_levers::HostCfg;
@@ -113,7 +116,7 @@ use gguf::quant::dequant_row;
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::placement::Plan;
-use runtime::seqstate::{Kept, Why};
+use runtime::seqstate::{HOST_BUDGET, Kept, Take, Why};
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -131,6 +134,39 @@ pub const ALLOWED: &[&str] = &[
 
 /// The Qwen3.8 model: one card, the skeleton over this body.
 pub type Qwen38Model = GpuModel<Body38>;
+
+/// A Qwen3.8 sequence state on the host ([`GpuModel::seq_save`]): its
+/// positional rows, the recurrent stores at its position and at the last
+/// prompt call's end, each with the PLE hash's history there.
+pub type Seq38 = SeqState<History>;
+
+/// The spacing of a prompt call's inner checkpoints (`runtime::seqstate`'s
+/// marks), when the load takes them ([`Body38::set_checkpoints`]): the
+/// ubatch walk's most positions, so a mark cuts a call's ubatches at most
+/// once more than the call's own cut, and a context of 60k positions takes
+/// 15 inner marks against the host budget's 32 slots of one copy
+/// ([`checkpoint_bytes`]).
+pub const CHECKPOINT_EVERY: u32 = UBATCH_MOST as u32;
+
+/// The bytes one checkpoint of a load of `gdn` delta layers copies: each
+/// delta layer's committed lane and conv ring, and the PLE ring.
+#[must_use]
+pub fn checkpoint_bytes(gdn: usize) -> u64 {
+    ((gdn * (GDN.state_len() + GDN.ring_len()) + ple::ring_len(geo::STREAMS)) * size_of::<f32>())
+        as u64
+}
+
+/// The positional bytes a sequence state of `positions` positions carries
+/// for `qsa` selecting layers: each one's K and V rows, raw indexer keys and
+/// the pooled keys of the pools the positions reach.
+#[must_use]
+pub const fn seq_positional_bytes(qsa: usize, positions: usize) -> u64 {
+    let f16 = size_of::<u16>();
+    let layer = 2 * geo::N_KV * positions * geo::HEAD * f16
+        + positions * geo::IDX_DIM * f16
+        + positions.div_ceil(geo::POOL) * geo::IDX_DIM * f16;
+    (qsa * layer) as u64
+}
 
 /// How a prompt runs: captured steps, one a position — the decode step's
 /// graph — eager passes of up to eight positions through the host tier's
@@ -535,6 +571,14 @@ pub struct Body38 {
     /// lever runs one, over `hybrid`'s slot map through `slots`; every call
     /// nothing without one.
     residency_glue: ResidencyGlue,
+    /// The recurrent stores on the host at chosen positions, and the PLE
+    /// hash's history at each, ascending: the points a cut behind the fed
+    /// positions restores. A prompt call takes them only while `marks` is on.
+    ckpt: Checkpoints,
+    ple_points: Vec<(u32, History)>,
+    marks: bool,
+    /// What a sequence state of this load belongs to.
+    who: Identity,
 }
 
 impl Body38 {
@@ -900,6 +944,22 @@ impl Body38 {
         hybrid.keep_residency(set);
         hybrid.prepare_batch(gpu.context(), host_cols)?;
         let ple = PleHost::new(Arc::clone(file), spec.vocab as usize, host_cols)?;
+        let lens = stores
+            .iter()
+            .filter(|s| matches!(s, Store38::Rec { .. }))
+            .flat_map(|_| [GDN.state_len(), GDN.ring_len()])
+            .chain([ple_ring.len()])
+            .collect();
+        let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?;
+        let who = Identity {
+            arch: "qwen4exp",
+            file: file
+                .shard_path(0)
+                .ok_or(GpuError::state(WHAT, "the file's first shard"))?
+                .to_path_buf(),
+            card: gpu.device_name()?,
+            ctx,
+        };
         let mut body = Body38 {
             hybrid,
             plans,
@@ -934,6 +994,10 @@ impl Body38 {
             plant: None,
             mtp: None,
             residency_glue,
+            ckpt,
+            ple_points: Vec::new(),
+            marks: false,
+            who,
         };
         body.sp.write(stream, 0, 0)?;
         // Last: the machine frees each layer's spare slots, and every piece
@@ -1381,30 +1445,303 @@ impl Body38 {
     }
 
     /// What a cut to at most `n` positions of a model standing at `pos`
-    /// keeps, and why: every position when `n` reaches `pos` (`Current`);
-    /// with a verify waiting, `n` when it lies past the verify's first
-    /// position (`Rule`: its commit moves the lane word and copies
-    /// nothing); anything else nothing (`Missed`), since a delta layer keeps
-    /// no earlier state — also after a call failed past its launch, when
-    /// the stores hold more than `pos`. Never past `pos`. The rule
+    /// keeps, and why: with a verify waiting, `n` when it lies past the
+    /// verify's first position (`Rule`: its commit moves the lane word and
+    /// copies nothing) and every position when `n` reaches them (`Current`);
+    /// else the checkpoints' rule ([`Checkpoints::kept`]): every position, the
+    /// empty model at 0, or the nearest point at or below `n`, nothing
+    /// (`Missed`) when none lies there — a delta layer keeps no earlier state
+    /// but a copy. After a call failed past its launch the stores hold more
+    /// than `pos`, which is no longer kept. Never past `pos`. The rule
     /// [`Body38::commit`] takes.
     #[must_use]
     pub fn kept(&self, n: u32, pos: u32) -> Kept {
-        let (at, why) = if self.held != pos {
-            (0, Why::Missed { lost: None })
-        } else if n >= pos {
-            (pos, Why::Current)
-        } else if self.pending.as_ref().is_some_and(|p| n > p.pos0) {
-            (n, Why::Rule)
-        } else {
-            (0, Why::Missed { lost: None })
-        };
-        Kept {
-            asked: n,
-            held: self.held,
-            at,
-            why,
+        if let Some(p) = &self.pending
+            && n > p.pos0
+        {
+            let at = n.min(self.held);
+            let why = if at == self.held {
+                Why::Current
+            } else {
+                Why::Rule
+            };
+            return Kept {
+                asked: n,
+                held: self.held,
+                at,
+                why,
+            };
         }
+        if self.held == pos {
+            self.ckpt.kept(n, pos)
+        } else {
+            self.ckpt.kept(n.min(pos), self.held)
+        }
+    }
+
+    /// The checkpoints: their positions, their slots, what they have done.
+    #[must_use]
+    pub fn checkpoints(&self) -> &Checkpoints {
+        &self.ckpt
+    }
+
+    /// Whether a prompt call takes checkpoints at its marks: off at load, so
+    /// a binary that never cuts behind the fed positions copies nothing; the
+    /// serve seat turns it on. Off drops none taken.
+    pub fn set_checkpoints(&mut self, on: bool) {
+        self.marks = on;
+    }
+
+    /// Whether a prompt call takes checkpoints ([`Body38::set_checkpoints`]).
+    #[must_use]
+    pub fn takes_checkpoints(&self) -> bool {
+        self.marks
+    }
+
+    /// The waiting cut carried out ([`Checkpoints::apply`]): the committed
+    /// lane, the conv rings and the PLE ring from the point's slot, each
+    /// delta layer's committed lane stamped at the position the cut left
+    /// (`held`) and every other never written. Nothing when no cut waits.
+    /// Waits for the copies.
+    fn settle(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if !self.ckpt.pending() {
+            return Ok(());
+        }
+        let lane = self.lane.lane();
+        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None)?;
+        self.ckpt.apply(stream, &mut c.list())?;
+        drop(c);
+        self.restamp(stream, lane, self.held)
+    }
+
+    /// Every delta layer's stamps: lane `lane` at position `at`, every other
+    /// never written. Synchronizes; never inside a capture.
+    fn restamp(&mut self, stream: &CudaStream, lane: u32, at: u32) -> Result<(), GpuError> {
+        let mut st = [crate::linear::delta::NEVER; LANES];
+        *st.get_mut(lane as usize)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("lane {lane} of {LANES}")))? = at;
+        for s in &mut self.stores {
+            if let Store38::Rec { stamp, .. } = s {
+                stamp.copy_from_host(stream, &st)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A checkpoint at `pos`, where the stores stand, after any waiting cut:
+    /// the recurrent stores copied to a host slot with the PLE history beside
+    /// them, or nothing where one stands. Refused by name while a verify
+    /// waits or the stores hold another position. Waits for the copies.
+    fn take_mark(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
+        self.stores_at(pos)?;
+        if let Some(p) = &self.pending {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a checkpoint at {pos} while the verify of {} rows at {} waits for its commit",
+                    p.tokens.len(),
+                    p.pos0
+                ),
+            ));
+        }
+        self.settle(stream)?;
+        if self.ple.hist.next_pos() != u64::from(pos) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a checkpoint at {pos} with the PLE history at {}",
+                    self.ple.hist.next_pos()
+                ),
+            ));
+        }
+        let lane = self.lane.lane();
+        let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None)?;
+        let take = self.ckpt.take(stream, pos, &mut c.list());
+        drop(c);
+        match take {
+            Ok(Take::Copy { evicted, .. }) => {
+                if let Some(e) = evicted {
+                    self.ple_points.retain(|&(p, _)| p != e);
+                }
+                let i = self.ple_points.partition_point(|&(p, _)| p < pos);
+                self.ple_points.insert(i, (pos, self.ple.hist.clone()));
+                Ok(())
+            }
+            Ok(Take::Held | Take::Empty) => Ok(()),
+            Err(e) => {
+                self.ple_points.clear();
+                Err(e)
+            }
+        }
+    }
+
+    /// A cut to `pos`, behind the stores' position: the point at `pos`
+    /// planned for the next call ([`Body38::settle`]), the PLE history set
+    /// back to the point's, every later point dropped, the MTP draft's store
+    /// forgotten (its rows past `pos` belong to the branch the cut dropped),
+    /// and a verify waiting dropped. Refused by name, nothing moved, at 0 (a
+    /// reset) and where no point stands.
+    fn cut(&mut self, pos: u32) -> Result<(), GpuError> {
+        const WHAT_C: &str = "qwen4exp cut";
+        if pos == 0 {
+            return Err(GpuError::shape(
+                WHAT_C,
+                format!(
+                    "back to position 0 from {}: the empty model is a reset",
+                    self.held
+                ),
+            ));
+        }
+        let hist = self
+            .ple_points
+            .iter()
+            .find(|&&(p, _)| p == pos)
+            .map(|(_, h)| h.clone());
+        let why = match &self.pending {
+            None => "with no verify waiting".to_owned(),
+            Some(p) => format!("below the verify of {} rows at {}", p.tokens.len(), p.pos0),
+        };
+        let refuse = |e: String| {
+            GpuError::shape(
+                WHAT_C,
+                format!("back to position {pos} from {} {why}: {e}", self.held),
+            )
+        };
+        let Some(hist) = hist else {
+            return Err(refuse(format!(
+                "no checkpoint stands there ({})",
+                self.kept(pos, pos)
+            )));
+        };
+        if hist.next_pos() != u64::from(pos) {
+            return Err(refuse(format!(
+                "the point's PLE history stands at {}",
+                hist.next_pos()
+            )));
+        }
+        self.ckpt
+            .cut(pos, self.held)
+            .map_err(|e| refuse(e.to_string()))?;
+        self.ple.hist = hist;
+        self.ple_points.retain(|&(p, _)| p <= pos);
+        self.pending = None;
+        self.staged = None;
+        self.held = pos;
+        if let Some(d) = self.mtp.as_mut() {
+            d.forget();
+        }
+        Ok(())
+    }
+
+    /// The sequence state at `pos`, where the stores stand (a waiting cut
+    /// carried out first): the K/V planes' rows, the raw keys' and the pooled
+    /// keys' of positions below `pos`, the recurrent stores at `pos` and at
+    /// the last checkpoint below it (the last prompt call's end), each with
+    /// its PLE history. Refused by name while a verify waits, after a call
+    /// failed past its launch, and when the history disagrees.
+    fn save_state(&mut self, stream: &CudaStream, pos: u32) -> Result<Seq38, GpuError> {
+        const WHAT_S: &str = "qwen4exp snapshot";
+        self.stores_at(pos)?;
+        if let Some(p) = &self.pending {
+            return Err(GpuError::shape(
+                WHAT_S,
+                format!(
+                    "a snapshot at {pos} while the verify of {} rows at {} waits for its commit",
+                    p.tokens.len(),
+                    p.pos0
+                ),
+            ));
+        }
+        self.settle(stream)?;
+        let current = self.ple.hist.clone();
+        if current.next_pos() != u64::from(pos) {
+            return Err(GpuError::shape(
+                WHAT_S,
+                format!(
+                    "a snapshot at {pos} with the PLE history at {}",
+                    current.next_pos()
+                ),
+            ));
+        }
+        let points: Vec<(u32, History)> = self
+            .ple_points
+            .iter()
+            .rev()
+            .find(|&&(p, _)| p < pos)
+            .cloned()
+            .into_iter()
+            .collect();
+        let lane = self.lane.lane();
+        let mut c = Copied::of(
+            &mut self.stores,
+            &mut self.ple_ring,
+            lane,
+            Some((self.ctx, pos as usize)),
+        )?;
+        let (positional, mut recurrent) = c.list_split();
+        let lent = Lent {
+            positional,
+            recurrent: &mut recurrent,
+        };
+        SeqState::save(
+            stream,
+            self.who.clone(),
+            pos,
+            &lent,
+            current,
+            points,
+            &self.ckpt,
+        )
+    }
+
+    /// `s` put back on the empty model ([`SeqState::load`]): the stores
+    /// stand at its positions, the committed lane stamped there, the PLE
+    /// history and the points it carried the model's own. Refused by name,
+    /// nothing copied, for another model's state or onto a model that is not
+    /// empty.
+    fn load_state(&mut self, stream: &CudaStream, s: &Seq38) -> Result<(), GpuError> {
+        const WHAT_L: &str = "qwen4exp resume";
+        if self.held != 0 || self.pending.is_some() || self.staged.is_some() {
+            return Err(GpuError::shape(
+                WHAT_L,
+                format!("a resume onto stores at {}: reset first", self.held),
+            ));
+        }
+        let n = s.positions();
+        let lane = self.lane.lane();
+        let (cur, pts) = {
+            let mut c = Copied::of(
+                &mut self.stores,
+                &mut self.ple_ring,
+                lane,
+                Some((self.ctx, n as usize)),
+            )?;
+            let (positional, mut recurrent) = c.list_split();
+            let mut lent = Lent {
+                positional,
+                recurrent: &mut recurrent,
+            };
+            let (cur, pts) = s.load(stream, &self.who, &mut lent, &mut self.ckpt)?;
+            (cur.clone(), pts.to_vec())
+        };
+        let off = std::iter::once((n, &cur))
+            .chain(pts.iter().map(|(p, h)| (*p, h)))
+            .find(|&(p, h)| h.next_pos() != u64::from(p));
+        if let Some((p, h)) = off {
+            self.ckpt.clear();
+            return Err(GpuError::shape(
+                WHAT_L,
+                format!(
+                    "a state whose PLE history at {p} stands at {}",
+                    h.next_pos()
+                ),
+            ));
+        }
+        self.restamp(stream, lane, n)?;
+        self.ple.hist = cur;
+        self.ple_points = pts;
+        self.held = n;
+        Ok(())
     }
 
     /// Plant a failure for the next call once its plan and copies are made,
@@ -1512,6 +1849,7 @@ impl Body38 {
             return Err(GpuError::state(WHAT, "layer taps off (a pass writes none)"));
         }
         self.check_next(pos, n)?;
+        self.settle(stream)?;
         let hist = self.ple.fill(pos, tokens)?;
         self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
@@ -1642,6 +1980,7 @@ impl Body38 {
             f.covers(pos as usize, n)?;
         }
         self.check_next(pos, n)?;
+        self.settle(stream)?;
         let hist = self.ple.fill(pos, tokens)?;
         self.last_walk = TargetRows::Ubatch;
         self.wr.write(stream, tokens, pos)?;
@@ -1967,7 +2306,7 @@ impl GpuModel<Body38> {
         self.pass_boundary()?;
         let r = self
             .stream_begin(resolved, tokens.len())
-            .and_then(|()| self.feed38(tokens, resolved, sink));
+            .and_then(|()| self.feed_marked(tokens, resolved, sink));
         // The call's own error first: an end or a keep refused after a
         // failed call is its echo. A failed call's streaming ends with each
         // layer back at the set it started with.
@@ -2026,6 +2365,44 @@ impl GpuModel<Body38> {
         }
         body.stream.end = body.hybrid.call_end(gpu.stream(), kept)?;
         Ok(())
+    }
+
+    /// [`GpuModel::prompt38_with`]'s units ([`GpuModel::feed38`]); while the
+    /// load takes checkpoints ([`Body38::set_checkpoints`]) the call runs as
+    /// the runs between its marks (`Checkpoints::marks`: its start when it
+    /// continues a sequence, every [`CHECKPOINT_EVERY`] positions inside it,
+    /// its end), each on the path the whole call resolved to, a checkpoint
+    /// taken at every mark: a ubatch walk leaves the same bits cut there or
+    /// not, as a pass and a step do. The argmax after the last id.
+    fn feed_marked(
+        &mut self,
+        tokens: &[u32],
+        path: Prompt38,
+        mut sink: Option<&mut Prompt38Sink<'_>>,
+    ) -> Result<u32, GpuError> {
+        const WHAT_M: &str = "qwen4exp prompt checkpoints";
+        let body = self.body(WHAT_M)?;
+        if !body.marks {
+            return self.feed38(tokens, path, sink);
+        }
+        let from = self.pos();
+        let to = launch_u32(WHAT_M, "positions", tokens.len())
+            .ok()
+            .and_then(|n| from.checked_add(n))
+            .ok_or_else(|| GpuError::shape(WHAT_M, format!("{} ids from {from}", tokens.len())))?;
+        let marks = body.ckpt.marks(from, to);
+        let (mut next, mut at) = (None, from);
+        for mark in marks {
+            if mark > at {
+                let run = &tokens[(at - from) as usize..(mark - from) as usize];
+                next = Some(self.feed38(run, path, sink.as_deref_mut())?);
+                at = mark;
+            }
+            let pos = self.pos();
+            let (gpu, _, body) = self.body_parts(WHAT_M)?;
+            body.take_mark(gpu.stream(), pos)?;
+        }
+        next.ok_or(GpuError::state(WHAT_M, "a mark at the call's end"))
     }
 
     /// [`GpuModel::prompt38_with`]'s paths once its checks have passed, its
@@ -2278,6 +2655,58 @@ impl GpuModel<Body38> {
     }
 }
 
+impl GpuModel<Body38> {
+    /// The sequence state on the host ([`Seq38`], `checkpoint::saved`): the
+    /// positional rows below the model's position, the recurrent stores
+    /// there and at the last checkpoint below it, each with its PLE history.
+    /// A waiting cut is carried out first. Refused by name on a poisoned
+    /// model, while a verify waits for its commit, and after a call failed
+    /// past its launch.
+    pub fn seq_save(&mut self) -> Result<Seq38, GpuError> {
+        const WHAT_S: &str = "qwen4exp snapshot";
+        if let Some(fault) = self.poisoned() {
+            return Err(GpuError::Poisoned {
+                what: WHAT_S,
+                fault,
+            });
+        }
+        let pos = self.pos();
+        let (gpu, _, body) = self.body_parts(WHAT_S)?;
+        body.save_state(gpu.stream(), pos)
+    }
+
+    /// Replace the sequence with `s`, which [`GpuModel::seq_save`] took of
+    /// this load: a reset unless the model is empty already (a reset just
+    /// before, or the load), then — as a pass of `s`'s positions whose work
+    /// is the copies — the state put back; the model stands at its
+    /// positions, its checkpoints the points `s` carried and no other, and
+    /// the calls after it are bit for bit those after the state was taken.
+    /// Refused by name, nothing copied, for another model's state (its
+    /// file, card or context).
+    pub fn seq_resume(&mut self, s: &Seq38) -> Result<(), GpuError> {
+        const WHAT_R: &str = "qwen4exp resume";
+        let b = self.body(WHAT_R)?;
+        let empty = self.pos() == 0
+            && b.held == 0
+            && b.pending.is_none()
+            && b.staged.is_none()
+            && b.ckpt.positions().is_empty()
+            && !b.ckpt.pending();
+        if !empty {
+            self.reset()?;
+        }
+        let n = s.positions() as usize;
+        if n == 0 {
+            return Ok(());
+        }
+        self.run_rows(n, WHAT_R, |gpu, _, body, _, _| {
+            body.load_state(gpu.stream(), s)?;
+            Ok(false)
+        })?;
+        Ok(())
+    }
+}
+
 impl ChainBody for Body38 {
     type Input = DecodeInput38;
     type Host = Body38;
@@ -2304,6 +2733,7 @@ impl ChainBody for Body38 {
     /// or replays its chain.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput38) -> Result<(), GpuError> {
         planted(&mut self.plant, Plant::BeforeLaunch)?;
+        self.settle(stream)?;
         self.last_walk = TargetRows::Step;
         self.s
             .ple
@@ -2396,6 +2826,8 @@ impl ChainBody for Body38 {
             .ple
             .reset_ring(stream, &mut self.ple_ring, geo::STREAMS)?;
         self.ple.restart()?;
+        self.ckpt.clear();
+        self.ple_points.clear();
         if let Some(d) = self.mtp.as_mut() {
             d.forget();
         }
@@ -2535,6 +2967,7 @@ impl Body38 {
         self.check_next(pos, n)?;
         super::refuse_past_vocab(WHAT_V, tokens, self.vocab)?;
         ple_takes(WHAT_V, self.ple.hash.window(), tokens)?;
+        self.settle(stream)?;
         let hist = self.ple.fill(pos, tokens)?;
         self.last_walk = TargetRows::Pass;
         self.rp.write(stream, tokens, pos)?;
@@ -2611,33 +3044,34 @@ impl Body38 {
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit
     /// and take the rest back: the lane word to the last kept row's lane
-    /// ([`kept_lane`]), the PLE history over the kept rows. With no
-    /// verify waiting only the position the stores stand at is taken. What
-    /// is taken is [`Body38::kept`]'s rule; anything else is refused by
-    /// name, the verify left waiting.
+    /// ([`kept_lane`]), the PLE history over the kept rows. With no verify
+    /// waiting nothing is taken at the position the stores stand at, and a
+    /// position behind it is a cut to the checkpoint there ([`Body38::cut`]),
+    /// as it is at or below a waiting verify's first position. What is taken
+    /// is [`Body38::kept`]'s rule; anything else is refused by name, the
+    /// verify left waiting.
     fn commit(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
-        const WHAT_C: &str = "qwen4exp commit";
-        let rule = self.kept(pos, self.held);
-        if rule.at != pos || matches!(rule.why, Why::Missed { .. }) {
-            let why = match &self.pending {
-                None => format!(
-                    "back to position {pos} from {} with no verify waiting: a delta layer keeps \
-                     no state for an earlier position",
-                    self.held
-                ),
-                Some(p) => format!(
+        let Some(p) = self.pending.as_ref().filter(|p| pos > p.pos0) else {
+            if pos == self.held && self.pending.is_none() {
+                return Ok(());
+            }
+            return self.cut(pos);
+        };
+        let rows = p.tokens.len();
+        if pos as usize > p.pos0 as usize + rows {
+            return Err(GpuError::shape(
+                "qwen4exp commit",
+                format!(
                     "back to position {pos}: the verify of {rows} rows at {} keeps 1..={rows} \
                      (row 0 always)",
-                    p.pos0,
-                    rows = p.tokens.len()
+                    p.pos0
                 ),
-            };
-            return Err(GpuError::shape(WHAT_C, format!("{why} ({rule})")));
+            ));
         }
         let Some(p) = self.pending.take() else {
             return Ok(());
         };
-        let (rows, kept) = (p.tokens.len(), (pos - p.pos0) as usize);
+        let kept = (pos - p.pos0) as usize;
         let stream = gpu.stream();
         self.lane.set(stream, kept_lane(self.lane.lane(), kept))?;
         if kept < rows {
@@ -2645,6 +3079,87 @@ impl Body38 {
         }
         self.held = pos;
         Ok(())
+    }
+}
+
+/// The stores a checkpoint copies, lent for one call ([`Copied::of`]), and
+/// a sequence state's positional rows beside them.
+struct Copied<'a> {
+    /// Each selecting layer's rows of the positions the call carries.
+    spans: Vec<Spans<'a>>,
+    /// Each delta layer's committed state lane and conv ring, in layer
+    /// order.
+    lanes: Vec<WindowMut<'a, f32>>,
+    rings: Vec<&'a mut DeviceBuffer<f32>>,
+    ple: &'a mut DeviceBuffer<f32>,
+}
+
+impl<'a> Copied<'a> {
+    /// The stores of `stores` and `ple_ring` a checkpoint copies — each
+    /// delta layer's state lane `lane` and its conv ring, then the PLE ring
+    /// — and, with `rows` (`(ctx, n)`), each selecting layer's rows of
+    /// positions below `n`: its K and V planes' (`[N_KV][ctx][HEAD]` each),
+    /// its raw keys' (`[ctx][IDX_DIM]`) and its pooled keys' of the pools
+    /// those positions reach.
+    fn of(
+        stores: &'a mut [Store38],
+        ple: &'a mut DeviceBuffer<f32>,
+        lane: u32,
+        rows: Option<(usize, usize)>,
+    ) -> Result<Copied<'a>, GpuError> {
+        let len = GDN.state_len();
+        let mut c = Copied {
+            spans: Vec::new(),
+            lanes: Vec::new(),
+            rings: Vec::new(),
+            ple,
+        };
+        for s in stores {
+            match s {
+                Store38::Rec { rec, .. } => {
+                    let RecStore { state, ring, .. } = rec;
+                    let byte = lane as usize * len * size_of::<f32>();
+                    c.lanes.push(WindowMut::of_mut(state, byte, len)?);
+                    c.rings.push(ring);
+                }
+                Store38::Qsa { kv, raw, pooled } => {
+                    if let Some((ctx, n)) = rows {
+                        let (h, d) = (geo::HEAD, geo::IDX_DIM);
+                        let KvPlanes { k, v } = kv;
+                        c.spans.push(Spans::planes(k, geo::N_KV, ctx * h, n * h)?);
+                        c.spans.push(Spans::planes(v, geo::N_KV, ctx * h, n * h)?);
+                        c.spans.push(Spans::planes(raw, 1, 0, n * d)?);
+                        let pools = crate::qsa::pools_for(n) * d;
+                        c.spans.push(Spans::planes(pooled, 1, 0, pools)?);
+                    }
+                }
+            }
+        }
+        Ok(c)
+    }
+
+    /// The stores in the checkpoints' order: each delta layer's lane, then
+    /// its ring, then the PLE ring.
+    fn list(&mut self) -> Vec<&mut DeviceBuffer<f32>> {
+        self.list_split().1
+    }
+
+    /// The positional rows, and the stores in the checkpoints' order
+    /// ([`Copied::list`]).
+    fn list_split(&mut self) -> (&mut [Spans<'a>], Vec<&mut DeviceBuffer<f32>>) {
+        let Copied {
+            spans,
+            lanes,
+            rings,
+            ple,
+        } = self;
+        let mut out: Vec<&mut DeviceBuffer<f32>> = Vec::new();
+        for (l, r) in lanes.iter_mut().zip(rings.iter_mut()) {
+            out.push(&mut **l);
+            out.push(&mut **r);
+        }
+        out.push(&mut **ple);
+        (spans, out)
     }
 }
 

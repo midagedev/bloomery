@@ -15,6 +15,12 @@
 //! copy holds, apart from the ledger: a restore reads a slot only as that
 //! position ([`seqstate::restorable`]), so no ledger point can hand back a
 //! slot no copy filled.
+//!
+//! A sequence state on the host ([`saved`]) carries the stores of some of
+//! these points away and hands them back: [`Checkpoints::read_point`] copies
+//! a point's slot out, [`Checkpoints::adopt`] makes a point of host bytes.
+
+pub mod saved;
 
 use std::sync::Arc;
 
@@ -38,6 +44,9 @@ pub struct Checkpoints {
     /// f32s of each copied store, in the body's order.
     lens: Vec<usize>,
     slots: Vec<Slot>,
+    /// The ledger's points and the slot each fills, ascending by position:
+    /// the ledger's own map, kept beside it from what its calls return.
+    points: Vec<(u32, usize)>,
     /// The spacing of a prompt call's inner checkpoints (`seqstate::marks`).
     every: u32,
     ctx: Arc<CudaContext>,
@@ -59,9 +68,16 @@ impl Checkpoints {
             ledger: Ledger::new(cap).map_err(refused)?,
             lens,
             slots: Vec::new(),
+            points: Vec::new(),
             every,
             ctx: Arc::clone(ctx),
         })
+    }
+
+    /// f32s of each copied store, in the body's order.
+    #[must_use]
+    pub fn lens(&self) -> &[usize] {
+        &self.lens
     }
 
     /// Bytes one checkpoint copies.
@@ -117,7 +133,11 @@ impl Checkpoints {
     /// Plan a cut to `n` of the `held` positions; refused by name unless a
     /// checkpoint, the held position or 0 is at `n`.
     pub fn cut(&mut self, n: u32, held: u32) -> Result<(), GpuError> {
-        self.ledger.cut(n, held).map(|_| ()).map_err(refused)
+        let cut = self.ledger.cut(n, held).map_err(refused)?;
+        if cut != Cut::Stay {
+            self.points.retain(|&(p, _)| p <= n);
+        }
+        Ok(())
     }
 
     /// Carry out the waiting cut on `stores`: each from its slot, or each
@@ -177,7 +197,7 @@ impl Checkpoints {
         self.apply(stream, stores)?;
         self.check(stores)?;
         let take = self.ledger.take(at).map_err(refused)?;
-        if let Take::Copy { slot, new, .. } = take {
+        if let Take::Copy { slot, new, evicted } = take {
             if new {
                 if slot != self.slots.len() {
                     return Err(GpuError::State {
@@ -192,13 +212,131 @@ impl Checkpoints {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.slots.push(Slot { bufs, holds: None });
             }
+            self.took(at, slot, evicted);
             if let Err(e) = self.copy_into(stream, slot, at, stores) {
                 // The slot holds part of a copy: no point may name it.
-                self.ledger.clear();
+                self.clear();
                 return Err(e);
             }
         }
         Ok(take)
+    }
+
+    /// The ledger's new point at `at` in `slot`, which the point at
+    /// `evicted` gave up when there was one.
+    fn took(&mut self, at: u32, slot: usize, evicted: Option<u32>) {
+        if let Some(e) = evicted {
+            self.points.retain(|&(p, _)| p != e);
+        }
+        let i = self.points.partition_point(|&(p, _)| p < at);
+        self.points.insert(i, (at, slot));
+    }
+
+    /// The slot of the point at `at`, which its last finished copy holds;
+    /// refused by name when no point stands there or its slot holds another
+    /// position.
+    fn slot_of(&self, at: u32) -> Result<&Slot, GpuError> {
+        let slot = self
+            .points
+            .iter()
+            .find(|&&(p, _)| p == at)
+            .map(|&(_, s)| s)
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "no checkpoint at position {at}; they stand at {:?}",
+                    self.positions()
+                ),
+            })?;
+        let src = self.slots.get(slot).ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the point's slot",
+        })?;
+        seqstate::restorable(slot, src.holds, at).map_err(refused)?;
+        Ok(src)
+    }
+
+    /// The point at `at`'s stores into `dst`, one after another in the
+    /// body's order ([`Checkpoints::lens`] summed); refused by name when no
+    /// point stands there, its slot holds another position, or `dst` is
+    /// another length. Host memory only.
+    pub fn read_point(&self, at: u32, dst: &mut [f32]) -> Result<(), GpuError> {
+        let src = self.slot_of(at)?;
+        self.fits(dst.len())?;
+        let mut off = 0;
+        for b in &src.bufs {
+            dst[off..off + b.len()].copy_from_slice(b.as_slice());
+            off += b.len();
+        }
+        Ok(())
+    }
+
+    /// A point at `at` whose stores are `src` ([`Checkpoints::read_point`]'s
+    /// layout): a slot the ledger gives it, filled from the host. The model
+    /// is cut without a copy: `at` lies at or above every point, and no cut
+    /// waits. Refused by name otherwise, at 0, where a point stands, and when
+    /// `src` is another length; a slot left half written names no point.
+    /// Host memory only.
+    pub fn adopt(&mut self, at: u32, src: &[f32]) -> Result<(), GpuError> {
+        self.fits(src.len())?;
+        let take = self.ledger.take(at).map_err(refused)?;
+        let Take::Copy { slot, new, evicted } = take else {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("a point adopted at {at}, where the ledger takes {take:?}"),
+            });
+        };
+        if new {
+            if slot != self.slots.len() {
+                self.clear();
+                return Err(GpuError::State {
+                    what: WHAT,
+                    missing: "the ledger's new slot next to the made ones",
+                });
+            }
+            let bufs = match self
+                .lens
+                .iter()
+                .map(|&n| PinnedHostBuffer::<f32>::zeroed(&self.ctx, n))
+                .collect::<Result<Vec<_>, _>>()
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    self.clear();
+                    return Err(e.into());
+                }
+            };
+            self.slots.push(Slot { bufs, holds: None });
+        }
+        self.took(at, slot, evicted);
+        let Some(dst) = self.slots.get_mut(slot) else {
+            self.clear();
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "the adopted point's slot",
+            });
+        };
+        let mut off = 0;
+        for b in &mut dst.bufs {
+            let n = b.len();
+            b.as_mut_slice().copy_from_slice(&src[off..off + n]);
+            off += n;
+        }
+        dst.holds = Some(at);
+        Ok(())
+    }
+
+    /// Refused by name unless `len` f32s are one checkpoint's.
+    fn fits(&self, len: usize) -> Result<(), GpuError> {
+        let want: usize = self.lens.iter().sum();
+        if len == want {
+            Ok(())
+        } else {
+            Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("{len} host f32s for a checkpoint of {want}"),
+            })
+        }
     }
 
     /// `stores`, which hold position `at`, into slot `slot`'s buffers; waits
@@ -238,6 +376,7 @@ impl Checkpoints {
     /// slots stay made.
     pub fn clear(&mut self) {
         self.ledger.clear();
+        self.points.clear();
     }
 
     /// Refused by name unless `stores` are the stores of the lengths this

@@ -6,10 +6,11 @@
 //! (`--model` already taken out by the one-binary server).
 //!
 //!     bloomery-serve-qwen38 [--host 127.0.0.1] [--port 8080] [--place a|gate]
-//!                           [--ctx-size C] [--alias NAME]
-//!                           [--chat-template-file PATH]
+//!                           [--ctx-size C] [--alias NAME] [--cache-ram MIB]
+//!                           [--chat-template-file PATH] [--slot-save-path DIR]
 //!
-//! `--ctx` is `--ctx-size` under its family's other spelling. The model is
+//! `--slot-save-path` names the directory the slot actions answer from, as
+//! llama-server's; without it every slot action is refused. `--ctx` is `--ctx-size` under its family's other spelling. The model is
 //! `$BLOOMERY_REF_MODEL` (a `--model` flag is not taken: the family's
 //! binaries read the one the profile pins); its first shard gives the
 //! vocabulary, `tokenizer.chat_template` the chat template
@@ -25,20 +26,58 @@
 //! prompt's greedy ids are the walk's, not a step-fed run's).
 //!
 //! The positions the server serves are the stores the load sized
-//! (`--ctx-size`, default 4096): `/props`' `n_ctx` is that number, a prompt
-//! that long is a 400 before it reaches the engine, and generation stops
-//! there with `truncated`.
+//! (`--ctx-size`): `/props`' `n_ctx` is that number, a prompt that long is a
+//! 400 before it reaches the engine, and generation stops there with
+//! `truncated`. Unset, the context is [`CTX`] positions, or the largest the
+//! card holds when that is fewer, and at most what lets one session's
+//! sequence state with its two recurrent copies fit the prompt cache's budget
+//! (one session's whole context can be saved). Set, a context the card cannot
+//! hold beside the plan's dense weights — the largest context any plan of the
+//! file and the placement takes ([`fit38`]) — is refused by name before the
+//! load. A `ctx` line on stderr names the rule and the context, the largest
+//! context the card holds with its card expert bytes, and the largest whose
+//! plan holds at most the plan's own margin (`MARGIN`) fewer card expert
+//! bytes than the plan at [`CTX`] ([`margin38`]): more positions on the card
+//! push card experts to the host.
 //!
-//! A request keeps no prefix of another's: the recurrent layers (the GDN
-//! state lanes, the PLE hash history) keep no state for an earlier position,
-//! so the seat's keep rule grants nothing and every request prefills from a
-//! reset — the same ids as a fresh one, never a silently wrong state. The
-//! server's host prompt cache is therefore off for this engine (its budget is
-//! 0) and slot save/restore answers the server's own 501; every prefix a
-//! request shares with what the slot holds is a `cache reuse` record with the
-//! rule. Where the body does take positions back — a verify's commit — no
-//! request path reaches.
+//! A request keeps the longest prefix it shares with what the slot holds that
+//! the recurrent layers can stand at: every held position, or the nearest
+//! checkpoint at or below the shared prefix. A prompt call copies the
+//! recurrent stores (each delta layer's committed state lane and conv ring,
+//! the PLE ring) and the PLE hash's history to the host at its start when it
+//! continues a sequence, every `CHECKPOINT_EVERY` positions inside it and at
+//! its end (`Body38::set_checkpoints`), so a request that resends the
+//! conversation with the last turn's reasoning taken out keeps everything up
+//! to the last prompt's end. The server cuts a prompt call at the first and
+//! the last message start inside it (`<|im_start|>`, when the vocabulary and
+//! the chat template have it), where both runs keep at least
+//! `Prompt38::GEMM_FROM` ids, so a later session that shares the system
+//! prompt keeps it; each run is the ubatch walk, whose bits do not depend on
+//! where a call is cut. Every prefix a request keeps less of than it shares is
+//! a `cache reuse` record with the rule.
 //!
+//! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
+//! holds the slot's sequence state when a request of another session takes
+//! the slot: the positional rows (K/V, raw and pooled keys) of the held
+//! positions, the recurrent stores at the held position and at the last
+//! prompt call's end, each with its PLE history (`Seq38`). A returning
+//! session's state comes back whole, and its checkpoints are those two
+//! points. Its default is the lesser of [`CACHE_RAM_CAP`] and half of what
+//! `MemAvailable` leaves at load past the plan's host need, the residency's
+//! churn pool and the checkpoints' host budget; a `cache` line on stderr
+//! prints it with each term. A state of another model, card or context is
+//! refused by name; every save, load, eviction and skip prints as a line.
+//!
+//! The MTP draft keeps the same rule, and the server cuts its prompt calls
+//! at the same message starts (the draft's prompt call joins each run where
+//! the one before left it). The draft rejoins a sequence only where its last
+//! call left it, so a cut to a checkpoint, or a state put back, leaves it
+//! proposing nothing until a request starts from position 0: the seat turns
+//! the draft off there (`DraftedSeat::turn_off`), prints a
+//! `bloomery-serve-qwen38: the MTP draft proposes nothing …` line at the cut
+//! or the resume, and each later prompt call's `mtp prompt` record names why. A request
+//! that keeps every held position keeps the draft.
+
 //! `BLOOMERY_DRAFT` unset follows the placement as `generate_qwen3moe`'s
 //! does (`bloomery_levers::draft38_unset`): under `--place a` the MTP draft
 //! runs when a regular file is where it would be opened
@@ -107,13 +146,16 @@
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
 //! kinds and exits.
 
+use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use app::mtp::MtpBody;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38};
+use bloomery_gpu::arch::qwen3moe::{
+    Body38, Prompt38, Seq38, checkpoint_bytes, seq_positional_bytes,
+};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
@@ -129,14 +171,16 @@ use bloomery_levers::{
 };
 use cuda_core::sys;
 use gguf::Split;
-use model::arch::models::HeadRows;
+use model::arch::models::{HeadRows, Mixer};
 use model::arch::qwen35moe::place::{
-    Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
+    Experts, KERNEL_POSITIONS, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
 };
-use model::placement::workstation::{A6000, CardSpec, RTX_3090};
+use model::placement::churn::ChurnPool;
+use model::placement::workstation::{A6000, CardSpec, HostNeed, MARGIN, RTX_3090, host_available};
 use model::placement::{Plan, PlanLevers};
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
+use runtime::seqstate::HOST_BUDGET;
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
     Server, ServerConfig,
@@ -164,16 +208,28 @@ pub const ACTS_ON: &[&str] = &[
 ];
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate] \
-                     [--ctx-size C] [--alias NAME] [--chat-template-file PATH]";
+                     [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
+                     [--slot-save-path DIR]";
 
-/// The positions the stores are sized for when `--ctx-size` names none:
-/// `generate_qwen3moe`'s default.
+/// The context the default's expert cost is counted against: the plan
+/// every Qwen3.8 measurement ran at, and `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
 
-/// Why no prefix is kept: the recurrent layers hold no state for an
-/// earlier position.
-const KEEP_WHY: &str = "the recurrent state (the GDN lanes, the PLE hash history) keeps no \
-                        prefix: every request prefills from a reset";
+/// The default context is a multiple of this many positions.
+const CTX_STEP: usize = 256;
+
+/// The most the prompt cache takes by default: llama-server's
+/// `--cache-ram` default.
+const CACHE_RAM_CAP: u64 = 8192 << 20;
+
+/// The token every message of the chat template opens with: a prompt call is
+/// cut at the first and the last inside it.
+const MESSAGE_START: &str = "<|im_start|>";
+
+/// Why a cut or a state put back leaves the MTP draft proposing nothing
+/// ([`DraftedSeat::turn_off`]).
+const DRAFT_OFF_WHY: &str = "the draft rejoins a sequence only where its last call left it, \
+                             and it holds no rows at the kept position";
 
 /// Where `--place` puts the plan's one card, as `generate_qwen3moe`
 /// takes it.
@@ -301,14 +357,319 @@ fn residency38_at(
     residency38(plan, lever, Record::eprint)
 }
 
+/// The plans the seat can load, by context: the file's inputs at `place`
+/// under the expert rule, the placement levers and the draft.
+struct Plans<'a> {
+    inputs: &'a PlanInputs,
+    place: Place38,
+    experts: Experts,
+    levers: &'a PlanLevers,
+    mtp: Option<&'a MtpInputs>,
+}
+
+impl Plans<'_> {
+    /// The plan's card expert bytes at `ctx` positions, or why no plan takes
+    /// that context.
+    fn card(&self, ctx: usize) -> Result<u64, GateError> {
+        let ub = ubatch_for(ctx)?;
+        let machine = machine_for_experts(
+            self.place.spec(),
+            self.inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+            self.experts,
+        );
+        let ctx = u64::try_from(ctx)?;
+        let plan = match self.mtp {
+            None => self
+                .inputs
+                .plan_with(&machine, ctx, self.levers, self.experts)?,
+            Some(mi) => {
+                self.inputs
+                    .plan_mtp_with(&machine, ctx, self.levers, mi, self.experts)?
+                    .plan
+            }
+        };
+        Ok(plan
+            .cards
+            .first()
+            .ok_or("a plan with no card")?
+            .expert_bytes)
+    }
+
+    /// The plan's host need (`HostNeed`) at `ctx` and the churn pool the
+    /// residency it runs holds beside it (`set` the lever as `run` read it;
+    /// the rule's records unprinted).
+    fn host(&self, ctx: usize, set: Option<(Residency, &str)>) -> Result<(u64, u64), GateError> {
+        let ub = ubatch_for(ctx)?;
+        let machine = machine_for_experts(
+            self.place.spec(),
+            self.inputs.spec.layers.len(),
+            u64::try_from(ub)?,
+            self.experts,
+        );
+        let c = u64::try_from(ctx)?;
+        let plan = match self.mtp {
+            None => self
+                .inputs
+                .plan_with(&machine, c, self.levers, self.experts)?,
+            Some(mi) => {
+                self.inputs
+                    .plan_mtp_with(&machine, c, self.levers, mi, self.experts)?
+                    .plan
+            }
+        };
+        let lever = match set {
+            Some((r, word)) => Lever38::Set(r, word),
+            None => Lever38::Unset(residency38_unset(Residency38At {
+                qwen38_file: true,
+                dump_taps: false,
+                place_a: matches!(self.place, Place38::A),
+                route_trace: false,
+                prefill_step: false,
+            })),
+        };
+        let pool = match residency38(&plan, lever, |_| {})? {
+            Residency::Mid { pinned, .. } => {
+                ChurnPool::of(&plan, CARD38, pinned)
+                    .map_err(|e| format!("the churn pool: {e}"))?
+                    .bytes
+            }
+            _ => 0,
+        };
+        Ok((HostNeed::of(&plan, 0).bytes(), pool))
+    }
+}
+
+/// The context the seat loads ([`ctx38`]) and what decided it.
+struct Ctx38 {
+    ctx: usize,
+    /// `set` (`--ctx-size`), or what bounded the default: `base` ([`CTX`]),
+    /// `card` (the largest context the card holds, fewer), `cache` (one
+    /// state in the prompt cache's budget).
+    rule: &'static str,
+    /// The largest context the card holds ([`fit38`]).
+    fit: Fit38,
+    /// The largest context within the plan's margin ([`margin38`]).
+    margin_ctx: usize,
+    /// The plan's card expert bytes at [`CTX`] and at `ctx`.
+    base_bytes: u64,
+    card_bytes: u64,
+}
+
+/// The largest context the card holds beside the plan's dense weights, and
+/// the plan's card expert bytes there.
+#[derive(Clone, Copy)]
+struct Fit38 {
+    ctx: usize,
+    card_bytes: u64,
+}
+
+/// The largest `c` in `lo..=hi` for which `ok` holds, `ok(lo)` given: `ok`
+/// holds below a point and not above it.
+fn largest(
+    mut lo: usize,
+    mut hi: usize,
+    ok: impl Fn(usize) -> Result<bool, GateError>,
+) -> Result<usize, GateError> {
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if ok(mid)? {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Ok(lo)
+}
+
+/// The largest context any plan of the file and the placement takes, up to
+/// the kernels' positions: the most a `--ctx-size` may name.
+fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
+    let fits = |c: usize| Ok(plans.card(c).is_ok());
+    if !fits(1)? {
+        return Err(format!(
+            "no context fits the card: the plan at 1 position is refused ({})",
+            plans
+                .card(1)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        )
+        .into());
+    }
+    let most = usize::try_from(KERNEL_POSITIONS)?;
+    let ctx = largest(1, most, fits)?;
+    Ok(Fit38 {
+        ctx,
+        card_bytes: plans.card(ctx)?,
+    })
+}
+
+/// The largest multiple of [`CTX_STEP`] up to `fit` whose plan holds at most
+/// `MARGIN` fewer card expert bytes than the plan at `base_at` (`base_bytes`
+/// there), `fit` when every context does, `base_at` when no step past it
+/// does.
+fn margin38(
+    plans: &Plans<'_>,
+    fit: usize,
+    base_at: usize,
+    base_bytes: u64,
+) -> Result<usize, GateError> {
+    let within = |c: usize| Ok(base_bytes.saturating_sub(plans.card(c)?) <= MARGIN);
+    let c = largest(base_at, fit, within)?;
+    if c == fit {
+        return Ok(c);
+    }
+    Ok((c / CTX_STEP * CTX_STEP).max(base_at))
+}
+
+/// The seat's context (the module doc): `set` when it fits the card
+/// ([`fit38`]), else refused by name; unset, [`CTX`], or the fit when that
+/// is fewer. The prompt cache's bound comes after ([`Ctx38::host_bound`]).
+fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
+    let fit = fit38(plans)?;
+    let base_at = CTX.min(fit.ctx);
+    let base_bytes = plans.card(base_at)?;
+    let margin_ctx = margin38(plans, fit.ctx, base_at, base_bytes)?;
+    let (ctx, rule) = match set {
+        Some(c) if c > fit.ctx => {
+            return Err(format!(
+                "--ctx-size {c}: the card holds at most {} positions beside the plan's dense \
+                 weights (`--place {}`)",
+                fit.ctx,
+                plans.place.name()
+            )
+            .into());
+        }
+        Some(c) => (c, "set"),
+        None if base_at < CTX => (base_at, "card"),
+        None => (base_at, "base"),
+    };
+    Ok(Ctx38 {
+        ctx,
+        rule,
+        fit,
+        margin_ctx,
+        base_bytes,
+        card_bytes: plans.card(ctx)?,
+    })
+}
+
+impl Ctx38 {
+    /// A default bounded by the prompt cache too: one session's state at the
+    /// whole context (`Seq38`: its positional rows and two recurrent copies)
+    /// fits `ram` bytes, when the cache is on. A set context keeps its value.
+    fn host_bound(self, inputs: &PlanInputs, ram: u64) -> Result<Ctx38, GateError> {
+        if self.rule == "set" || ram == 0 {
+            return Ok(self);
+        }
+        let gdn = inputs
+            .spec
+            .layers
+            .iter()
+            .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
+            .count();
+        let qsa = inputs.spec.layers.len() - gdn;
+        let state = |n: usize| seq_positional_bytes(qsa, n) + 2 * checkpoint_bytes(gdn);
+        if state(self.ctx) <= ram {
+            return Ok(self);
+        }
+        if state(1) > ram {
+            return Err(format!(
+                "the prompt cache's {ram} bytes hold no sequence state (two recurrent copies \
+                 of {} bytes); --cache-ram 0 turns it off",
+                checkpoint_bytes(gdn)
+            )
+            .into());
+        }
+        let c = largest(1, self.ctx, |n| Ok(state(n) <= ram))?;
+        let ctx = (c / CTX_STEP * CTX_STEP).max(c.min(CTX_STEP));
+        Ok(Ctx38 {
+            ctx,
+            rule: "cache",
+            ..self
+        })
+    }
+
+    /// The `ctx` line on stderr.
+    fn print(&self) {
+        eprintln!(
+            "ctx rule={} ctx={} fit={} fit_card_expert_bytes={} margin_ctx={} base={CTX} \
+             base_card_expert_bytes={} card_expert_bytes={} lost_bytes={} margin_bytes={MARGIN}",
+            self.rule,
+            self.ctx,
+            self.fit.ctx,
+            self.fit.card_bytes,
+            self.margin_ctx,
+            self.base_bytes,
+            self.card_bytes,
+            self.base_bytes.saturating_sub(self.card_bytes)
+        );
+    }
+}
+
+/// The prompt cache's budget (the module doc) and its terms.
+struct CacheRam {
+    ram: u64,
+    /// `--cache-ram`, or the default's terms: `MemAvailable`, the plan's
+    /// host need, the churn pool, the checkpoints' host budget.
+    set: bool,
+    available: u64,
+    need: u64,
+    pool: u64,
+}
+
+impl CacheRam {
+    /// `set` as given, else the lesser of [`CACHE_RAM_CAP`] and half of what
+    /// `MemAvailable` leaves past `need`, `pool` and the checkpoints' host
+    /// budget (`runtime::seqstate::HOST_BUDGET`), 0 when nothing is left.
+    fn of(set: Option<u64>, need: u64, pool: u64) -> Result<CacheRam, GateError> {
+        let available = host_available()?;
+        let ram = set.unwrap_or_else(|| {
+            let left = i128::from(available)
+                - i128::from(need)
+                - i128::from(pool)
+                - i128::from(HOST_BUDGET);
+            u64::try_from((left / 2).max(0)).map_or(CACHE_RAM_CAP, |h| h.min(CACHE_RAM_CAP))
+        });
+        Ok(CacheRam {
+            ram,
+            set: set.is_some(),
+            available,
+            need,
+            pool,
+        })
+    }
+
+    /// The `cache` line on stderr, with the message start prompt calls are
+    /// cut at and whether the vocabulary and the template have it.
+    fn print(&self, start: &str, in_vocab: bool, in_template: bool) {
+        eprintln!(
+            "cache ram={} rule={} available={} need={} pool={} checkpoints={HOST_BUDGET} \
+             message_start={start} in_vocab={in_vocab} in_template={in_template}",
+            self.ram,
+            if self.set { "set" } else { "default" },
+            self.available,
+            self.need,
+            self.pool
+        );
+    }
+}
+
 struct Args {
     host: String,
     port: u16,
     place: Place38,
-    ctx: usize,
+    /// `--ctx-size`; `None` takes the rule's default.
+    ctx: Option<usize>,
     alias: Option<String>,
+    /// `--cache-ram` in bytes; `None` takes the default.
+    cache_ram: Option<u64>,
     /// `--chat-template-file`, replacing the file's own template.
     template_file: Option<PathBuf>,
+    /// `--slot-save-path`: the directory the slot actions answer from;
+    /// `None` refuses every one, as llama-server does.
+    slot_save_path: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -316,9 +677,11 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         host: "127.0.0.1".to_owned(),
         port: 8080,
         place: Place38::A,
-        ctx: CTX,
+        ctx: None,
         alias: None,
+        cache_ram: None,
         template_file: None,
+        slot_save_path: None,
     };
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
@@ -332,13 +695,21 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = v.parse()?,
             "--place" => a.place = Place38::parse(v)?,
-            "--ctx-size" | "--ctx" => a.ctx = v.parse()?,
+            "--ctx-size" | "--ctx" => a.ctx = Some(v.parse()?),
             "--alias" => a.alias = Some(v.to_owned()),
+            "--cache-ram" => {
+                let mib: u64 = v.parse()?;
+                a.cache_ram = Some(
+                    mib.checked_mul(1 << 20)
+                        .ok_or_else(|| format!("--cache-ram {mib} MiB passes u64 bytes"))?,
+                );
+            }
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
+            "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
-    if a.ctx == 0 {
+    if a.ctx == Some(0) {
         return Err("--ctx-size 0: the stores hold no position".into());
     }
     Ok(a)
@@ -365,7 +736,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let a = parse_args(args)?;
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
-    let (mtp, draft_off) = draft38(&levers, a.place, a.ctx, &draft_path)?;
+    // The draft's one context condition (a window's positions) holds at any
+    // context the rule grants; it is asked again at the final context below.
+    let (mtp, draft_off) = draft38(&levers, a.place, a.ctx.unwrap_or(CTX), &draft_path)?;
     let head_rows = levers.mtp_head_rows().map(PathBuf::from);
     // A draft lever set on a server that drafts nothing is refused, with why.
     if let Some(why) = &draft_off {
@@ -385,7 +758,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
-    let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
+    let tok = Tokenizer::from_gguf(&path)?;
     let inv = gguf::inventory_of(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let template = match &a.template_file {
         Some(file) => std::fs::read_to_string(file)
@@ -402,6 +775,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .unwrap_or("qwen3.8")
         .to_owned();
     drop(inv);
+    // The message start the server cuts prompt calls at, when both the
+    // vocabulary and the template have it.
+    let has_start = tok
+        .special_tokens()
+        .iter()
+        .any(|&id| tok.text(id) == Some(MESSAGE_START));
+    let in_template = template.contains(MESSAGE_START);
+    let vocab = Vocab::new(tok)?;
+    let vocab = Arc::new(if has_start && in_template {
+        vocab.with_user_start(MESSAGE_START)?
+    } else {
+        vocab
+    });
 
     // The plan record, and `/props` from the same plan the load runs by:
     // under the draft `plan_mtp_with`'s, its draft's card bytes (granules,
@@ -409,13 +795,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::describe(&split)?;
     let model = model_props(&split, &inputs.model);
-    let ub = ubatch_for(a.ctx)?;
-    let machine = machine_for_experts(
-        a.place.spec(),
-        inputs.spec.layers.len(),
-        u64::try_from(ub)?,
-        experts,
-    );
     let mtp_inputs = match mtp {
         false => None,
         true => {
@@ -428,14 +807,43 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     drop(split);
+    let plans = Plans {
+        inputs: &inputs,
+        place: a.place,
+        experts,
+        levers: &plan_levers,
+        mtp: mtp_inputs.as_ref(),
+    };
+    let rule = ctx38(&plans, a.ctx)?;
+    let (need, pool) = plans.host(rule.ctx, set)?;
+    let cache = CacheRam::of(a.cache_ram, need, pool)?;
+    let rule = rule.host_bound(&inputs, cache.ram)?;
+    rule.print();
+    cache.print(MESSAGE_START, has_start, in_template);
+    let ctx = rule.ctx;
+    if draft38(&levers, a.place, ctx, &draft_path)?.0 != mtp {
+        return Err(format!(
+            "the context {ctx} leaves no positions for the MTP draft's window; --ctx-size names \
+             one past {}",
+            <Body38 as MtpBody>::VERIFY_ROWS
+        )
+        .into());
+    }
+    let ub = ubatch_for(ctx)?;
+    let machine = machine_for_experts(
+        a.place.spec(),
+        inputs.spec.layers.len(),
+        u64::try_from(ub)?,
+        experts,
+    );
     let (plan, draft_bytes) = match &mtp_inputs {
         None => (
-            inputs.plan_with(&machine, u64::try_from(a.ctx)?, &plan_levers, experts)?,
+            inputs.plan_with(&machine, u64::try_from(ctx)?, &plan_levers, experts)?,
             0,
         ),
         Some(mi) => {
             let with =
-                inputs.plan_mtp_with(&machine, u64::try_from(a.ctx)?, &plan_levers, mi, experts)?;
+                inputs.plan_mtp_with(&machine, u64::try_from(ctx)?, &plan_levers, mi, experts)?;
             let bytes = with.draft_card_bytes() + with.arena_bytes;
             (with.plan, bytes)
         }
@@ -470,7 +878,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
     let open = SeatArgs {
         place: a.place,
-        ctx: a.ctx,
+        ctx,
         experts,
         plan_levers,
         host: levers.host(),
@@ -484,15 +892,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_off,
         residency,
     };
-    // The prompt cache is off (its budget 0): the seat keeps no prefix
-    // worth saving, and slot save/restore is the server's own 501.
     let engine = SeatEngine::spawn(
         move || Q38::open(open),
-        a.ctx,
+        ctx,
         vocab,
         machine.cards[0].name.clone(),
         props,
-        0,
+        cache.ram,
     )?;
 
     let config = ServerConfig {
@@ -501,12 +907,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         chat_template: template,
         sampler: Some(sampler_factory()),
         fatal_linger: FATAL_LINGER,
-        slot_save_path: None,
+        slot_save_path: a.slot_save_path,
     };
     let server = Server::bind((a.host.as_str(), a.port), Box::new(engine), config)?;
     Record::new(&record::LISTENING38)
         .w("place", a.place.name())
-        .u("ctx", a.ctx)
+        .u("ctx", ctx)
         .w("addr", server.local_addr()?)
         .eprint();
     Ok(server.run())
@@ -668,6 +1074,9 @@ impl Q38 {
             )
             .into());
         }
+        // Every prompt call copies the recurrent stores at its marks: the
+        // checkpoints a later request's cut and a saved state come from.
+        m.body_parts(WHAT)?.2.set_checkpoints(true);
         let mut s = app::Session::from_model(m, u32::try_from(a.ctx)?);
         let residency = a.residency != Residency::Off;
         if residency {
@@ -719,6 +1128,42 @@ impl Q38 {
             record::residency_pass_of(kind, &r).eprint();
         }
         Ok(())
+    }
+}
+
+/// The line that says the MTP draft proposes nothing from `pos` on, for
+/// `what` (a cut or a state put back).
+fn draft_off(pos: u32, what: &str) {
+    eprintln!(
+        "bloomery-serve-qwen38: the MTP draft proposes nothing from position {pos} until a \
+         request starts from position 0: {what}; {DRAFT_OFF_WHY}"
+    );
+}
+
+/// A Qwen3.8 sequence state as the server's prompt cache holds it, and
+/// whether the MTP draft ran (a state is put back only on a seat with the
+/// same draft). The cache ranks it by the seat's rule: every position it
+/// holds, or the point it carries at or below the shared prefix.
+struct Saved38 {
+    state: Seq38,
+    drafted: bool,
+}
+
+impl Saved for Saved38 {
+    fn n_tokens(&self) -> usize {
+        self.state.positions() as usize
+    }
+
+    fn n_bytes(&self) -> u64 {
+        self.state.bytes() as u64
+    }
+
+    fn keepable(&self, n: usize) -> usize {
+        self.state.keep_point(u32::try_from(n).unwrap_or(u32::MAX)) as usize
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -798,29 +1243,45 @@ impl Seat for Q38 {
         self.drafted.pass_rows()
     }
 
-    /// The commit's rule, `Body38::kept`: with no verify waiting only
-    /// the position the stores stand at is kept — nothing to take back —
-    /// and a request's shorter prefix grants nothing. [`KEEP_WHY`] is
-    /// the rule string the server's reuse records print.
+    /// The body's rule (`Body38::kept`): every held position, or the
+    /// nearest checkpoint at or below `n`, with the rule's sentence when it
+    /// keeps less; the same under the MTP draft, which a cut leaves
+    /// proposing nothing ([`Seat::rollback`]).
     fn keep(&self, n: usize) -> (usize, Option<String>) {
         let pos = self.s.pos() as usize;
-        if n >= pos {
-            return (pos, None);
-        }
-        (0, Some(KEEP_WHY.to_owned()))
+        let k = self.s.kept(u32::try_from(n).unwrap_or(u32::MAX));
+        let at = k.at as usize;
+        (at, (at < n.min(pos)).then(|| k.to_string()))
     }
 
-    /// The body's commit, which only a waiting verify serves; a request
-    /// path never reaches it (the server resets instead of cutting), so
-    /// any other position is refused by name, the body's own message.
+    /// The body's commit or its cut to a checkpoint ([`Seat::keep`]
+    /// granted it); any other position is refused by name, the body's own
+    /// message. A cut under the MTP draft prints that the draft proposes
+    /// nothing from there ([`DRAFT_OFF_WHY`]).
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
-        Ok(self.s.model_mut().rollback(pos)?)
+        let held = self.s.pos();
+        self.s.model_mut().rollback(pos)?;
+        if self.drafted.drafts() && pos < held {
+            self.drafted.turn_off(DRAFT_OFF_WHY);
+            draft_off(pos, &format!("a cut back from {held}"));
+        }
+        Ok(())
     }
 
-    /// Nowhere: the engine cuts a prompt call only where a later request
-    /// can keep the cut, and this engine keeps no cut.
-    fn splits(&self, _: usize, _: usize, _: &[usize]) -> Vec<usize> {
-        Vec::new()
+    /// The message starts inside the call where both runs keep at least
+    /// `Prompt38::GEMM_FROM` ids, so each run is a ubatch walk and the bits
+    /// are the uncut call's; under the MTP draft the draft's prompt call
+    /// joins each run where the one before left it.
+    fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
+        let mut at = Vec::new();
+        let mut last = first;
+        for &u in marks {
+            if u >= last + Prompt38::GEMM_FROM && u + Prompt38::GEMM_FROM <= end {
+                at.push(u);
+                last = u;
+            }
+        }
+        at
     }
 
     /// `/props`' `engine.draft` under the MTP draft: its kind, the draft
@@ -850,24 +1311,42 @@ impl Seat for Q38 {
         p
     }
 
-    /// A Qwen3.8 sequence state is not a value a cache could hold: the
-    /// recurrent stores and the PLE history have no copy to put back.
-    /// The server's prompt cache is off, so this is never asked; a caller
-    /// that asks is refused by name.
+    /// The sequence state (`GpuModel::seq_save`) as the prompt cache holds
+    /// it, with the keep rule the seat grants after its resume.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
-        Err(format!("a snapshot at position {}: {KEEP_WHY}", self.s.pos()).into())
+        Ok(Arc::new(Saved38 {
+            state: self.s.model_mut().seq_save()?,
+            drafted: self.drafted.drafts(),
+        }))
     }
 
+    /// The state put back (`GpuModel::seq_resume`) after the session's reset,
+    /// which starts the draft over: no refresh of another sequence waits. A
+    /// state this seat did not take is refused by name.
     fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
-        Err(format!(
-            "a resume of a state of {} positions: {KEEP_WHY}",
-            state.n_tokens()
-        )
-        .into())
+        let saved = state
+            .as_any()
+            .downcast_ref::<Saved38>()
+            .ok_or("a saved state that is not a qwen4exp body's")?;
+        if saved.drafted != self.drafted.drafts() {
+            return Err(format!(
+                "a state saved with the MTP draft {} put back with it {}",
+                if saved.drafted { "on" } else { "off" },
+                if self.drafted.drafts() { "on" } else { "off" }
+            )
+            .into());
+        }
+        self.drafted.reset(&mut self.s)?;
+        self.s.model_mut().seq_resume(&saved.state)?;
+        if self.drafted.drafts() && saved.state.positions() > 0 {
+            self.drafted.turn_off(DRAFT_OFF_WHY);
+            draft_off(saved.state.positions(), "a state put back");
+        }
+        Ok(())
     }
 
-    /// Only `Reuse` arrives (the cache is off and no call is cut); the
-    /// other notes belong to a caching engine and print as they come.
+    /// A prefix kept less of than shared is a `cache reuse` record; every
+    /// other note of the prompt cache prints as its line.
     fn note(note: &CacheNote) {
         if let CacheNote::Reuse {
             common,
