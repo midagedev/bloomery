@@ -21,7 +21,11 @@ gguf 9 2 0
 # PIN(2026-10-01): gpu 1364 -> 1365 blocks, new code, not old code relaxed: the shared tier page (ntier1,
 # host/tier.rs) keeps the stage card's windows over it as rows of their own (StageRow), apart from the tier
 # cards' windows, and their Drop releases the two window handles in one block, with its SAFETY line.
-gpu 1365 144 6
+# PIN(2026-10-01): gpu 1365 -> 1373 blocks, two new kernel entries, not old code relaxed: q8_0_gemv_ids and
+# q8_0_gemv_ids_mcol (Qwen3.8's MTP head over its row list at one and at 2..=8 columns, the target's output rows read
+# in place, q8f32.rs) add four blocks each: the id load, the NaN store for an id past the matrix, the row dot and the
+# store, each with its SAFETY line.
+gpu 1373 144 6
 gpu-deepseek41 459 51 0
 gpu-gates 60 5 1
 gpu-glm5next 4 0 0

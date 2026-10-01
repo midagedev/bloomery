@@ -40,8 +40,9 @@ or one without the `gen_ids` and `top5_ids` columns, or a row of another width; 
 line; N outside 1..vocab-1; without --fill-ids, fewer distinct ids in the inputs and the kept ids than N
 (a list is padded with ids no input names only when --fill-ids asks for it); a header that is not GGUF 2 or 3, or has no token array.
 
-The list moves how often the draft is accepted, never the tokens the target emits: those are always the
-target's own argmax.
+The list moves how often the draft is accepted. The tokens the target emits are its own argmax, and the
+load's plan is the full head's, so they are the full head's unless a running residency (which counts by
+pass) moves its experts at other passes (the lever's doc, BLOOMERY_MTP_HEAD_ROWS).
 
 Exit status: 0; 2 a file missing or unreadable; 64 a usage error; 65 a malformed input.
 """

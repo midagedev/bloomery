@@ -26,10 +26,13 @@
 //! A plan with an MTP draft ([`PlanInputs::plan_mtp`]) is that plan, bit for
 //! bit, beside the draft layer's own plan ([`MtpInputs`]): its file's tensors
 //! as the card holds them ([`mtp_tensors`]), its routed experts every one on
-//! the card, its dense store and the reduced head's gathered rows, counted in
-//! the draft's own heap; the target card's bound is checked on the sum. The
-//! draft borrows the target's `token_embd` and `output`, which the target's
-//! plan already holds on the card, so they add nothing. Under
+//! the card and its dense store, counted in the draft's own heap, and the
+//! head's row map; the target card's bound is checked on the sum. The draft
+//! borrows the target's `token_embd` and `output`, which the target's plan
+//! already holds on the card, so they add nothing: a reduced head reads its
+//! rows of `output` in place, and its map is planned at one word a
+//! vocabulary id whatever the head, so a plan with a row list is the plan
+//! with the full head, byte for byte. Under
 //! [`Experts::Card`] ([`PlanInputs::plan_mtp_with`]) the target's expert rule
 //! spreads within its card's budget less the draft's card bytes, so the sum
 //! fits.
@@ -490,7 +493,7 @@ pub struct MtpPlan<'a> {
     /// routed experts (every one on the card), its granules in its own heap
     /// and its store (`cards[0].kv_bytes`).
     pub draft: Plan<'a>,
-    /// The head's row → id map, one `u32` a row; 0 for the full head.
+    /// The head's row → id map, one `u32` a vocabulary id whatever the head.
     pub map_bytes: u64,
     /// The draft program's arena ([`mtp_arena_bytes`] at the plan's context
     /// and the draft's vocabulary), counted beside the draft's card bytes;
@@ -771,10 +774,6 @@ pub fn mtp_widened(index: u32, stem: &str) -> String {
     format!("derived.blk.{index}.{stem}")
 }
 
-/// The reduced head's rows of the target's `output.weight`, gathered at load
-/// into one Q8_0 matrix, row `i` the list's `i`th id.
-pub const MTP_HEAD_ROWS: &str = "derived.mtp.head_rows";
-
 /// Every tensor of the dense MTP layer `d` describes, in the form its program
 /// reads: attention (the query projection writing each head's gate beside it
 /// when the layer has the output gate), its two hyper-connection sites (the
@@ -913,22 +912,22 @@ pub struct FileTensor {
 /// card of its own ([`MtpInputs::machine`]), and its store.
 #[derive(Debug)]
 pub struct MtpInputs {
-    /// The layer, its head rows the list the load gathers or the full head.
+    /// The layer, its head rows the list the head reads or the full head.
     pub draft: MtpDraft,
     /// [`mtp_tensors`] of `draft`.
     pub tensors: Vec<MtpTensor>,
     /// The draft's tensors in its file's order, as layer 0 of one — each
     /// [`MtpLoad::Card`] tensor in its role, every other one
-    /// [`Role::Unused`] — then the widened tensors ([`mtp_widened`], f32)
-    /// and, for a row list, the head's gathered rows ([`MTP_HEAD_ROWS`],
-    /// Q8_0 `[hidden, rows]`, [`Role::Head`]).
+    /// [`Role::Unused`] — then the widened tensors ([`mtp_widened`], f32).
+    /// A row list adds none: its head reads the target's `output` in place.
     pub model: ModelTensors,
     /// One card with no bound and the target cards' granule: the draft's
     /// plan places everything on it and counts its uploads in its own heap.
     /// The bound is the target's card's, on the sum.
     pub machine: Machine,
     kv: MtpKv,
-    /// The head's row → id map, one `u32` a row; 0 for the full head.
+    /// The head's row → id map, one `u32` a vocabulary id whatever the head,
+    /// so the plan with a row list is the plan with the full head.
     pub map_bytes: u64,
 }
 
@@ -1077,32 +1076,7 @@ impl MtpInputs {
                 });
             }
         }
-        let map_bytes = match &draft.head_rows {
-            HeadRows::Full => 0,
-            HeadRows::List { ids, .. } => {
-                let n = ids.len() as u64;
-                let hidden = u64::from(draft.hidden);
-                let row = GgmlType::Q8_0
-                    .type_size()
-                    .zip(GgmlType::Q8_0.blck_size())
-                    .map(|(size, blck)| hidden / blck * size)
-                    .ok_or_else(|| PlacementError::Metadata {
-                        key: "q8_0".to_string(),
-                        detail: "has no block size".to_string(),
-                    })?;
-                model.push(ModelTensor {
-                    name: MTP_HEAD_ROWS.to_string(),
-                    shard: 0,
-                    layer: None,
-                    role: Role::Head,
-                    ty: GgmlType::Q8_0,
-                    dims: vec![hidden, n],
-                    file_bytes: n * row,
-                    gathered_rows: None,
-                });
-                n * runtime::stores::U32_BYTES
-            }
-        };
+        let map_bytes = u64::from(draft.vocab) * runtime::stores::U32_BYTES;
         // `mtp_tensors` refused any other layer.
         let (Mixer::Gqa(g), Ffn::Moe(m)) = (&draft.layer.mixer, &draft.layer.ffn) else {
             return Err(PlacementError::Metadata {
@@ -1756,8 +1730,8 @@ mod tests {
         };
 
         use super::super::{
-            FileTensor, HEAD_ROWS_FORMAT, HeadRowsError, MTP_HEAD_ROWS, MtpInputs, MtpLoad,
-            mtp_arena_bytes, mtp_tensors, mtp_widened, parse_head_rows, vocab_sha256,
+            FileTensor, HEAD_ROWS_FORMAT, HeadRowsError, MtpInputs, MtpLoad, mtp_arena_bytes,
+            mtp_tensors, mtp_widened, parse_head_rows, vocab_sha256,
         };
         use crate::arch::synthetic::header;
         use crate::fileio::hex;
@@ -1875,22 +1849,21 @@ mod tests {
             out
         }
 
-        // PIN(2026-09-28): the MTP layer's card bytes [derived from the header dump's table: every
+        // PIN(2026-10-01): the MTP layer's card bytes [derived from the header dump's table: every
         // Q8_0 tensor but the injects in two planes of its file bytes, 2,766,827,520 B, of which
         // the routed stacks 3 x 891,289,600; the F32 tensors but the indexer's norms, 5,429,248 B;
         // the two injects widened to F32 [10240, 4], 2 x 163,840; so 98,715,648 dense and
         // 2,673,868,800 of experts, 2,772,584,448 resident; the uploads in the file's order, then
         // the injects, through the 2 MiB-granule heap: 2,785,017,856 B, rounding 12,433,408. The
-        // store: 2 x 2 x 256 f16 a position. A list of 40,960 rows: 40,960 x 2,720 = 111,411,200
-        // B of rows, the heap 2,898,264,064, and 40,960 x 4 B of map].
+        // store: 2 x 2 x 256 f16 a position. The head's map 248,320 x 4 B with the full head and
+        // with a list of 40,960 rows alike: the list's rows are the target's `output`, read in
+        // place].
         const DENSE: u64 = 98_715_648;
         const EXPERTS: u64 = 2_673_868_800;
         const ROUNDING: u64 = 12_433_408;
         const KV_4096: u64 = 8_388_608;
         const LIST_ROWS: usize = 40_960;
-        const LIST_HEAD: u64 = 111_411_200;
-        const LIST_ROUNDING: u64 = 14_268_416;
-        const LIST_MAP: u64 = 163_840;
+        const MAP: u64 = 993_280;
 
         fn list(n: usize) -> HeadRows {
             HeadRows::List {
@@ -1902,13 +1875,11 @@ mod tests {
         /// The draft's plan on its own card at 4,096 positions: every tensor
         /// once, the loaded ones on the card, the unread and the widened
         /// files' tensors nowhere, all 512 experts on the card; its bytes as
-        /// derived, with the full head and with a list of 40,960 rows.
+        /// derived, the same with the full head and with a list of 40,960
+        /// rows.
         #[test]
         fn mtp_card_bytes() {
-            for (rows, head, rounding, map) in [
-                (HeadRows::Full, 0, ROUNDING, 0),
-                (list(LIST_ROWS), LIST_HEAD, LIST_ROUNDING, LIST_MAP),
-            ] {
+            for rows in [HeadRows::Full, list(LIST_ROWS)] {
                 let with_list = matches!(rows, HeadRows::List { .. });
                 let m = MtpInputs::from_parts(draft(rows), &file()).expect("the draft's inputs");
                 let plan = placement::plan_routed(
@@ -1925,11 +1896,11 @@ mod tests {
                 let c = &plan.cards[0];
                 assert_eq!(
                     (c.dense_bytes, c.expert_bytes, c.rounding_bytes, c.kv_bytes),
-                    (DENSE + head, EXPERTS, rounding, KV_4096),
+                    (DENSE, EXPERTS, ROUNDING, KV_4096),
                     "list {with_list}"
                 );
-                assert_eq!(m.map_bytes, map);
-                assert_eq!(plan.rows.len(), 32 + 2 + usize::from(with_list));
+                assert_eq!(m.map_bytes, MAP, "list {with_list}");
+                assert_eq!(plan.rows.len(), 32 + 2, "list {with_list}");
                 for r in &plan.rows {
                     let t = &m.model.tensors[r.tensor];
                     let want = if t.role == Role::Unused {
@@ -1958,10 +1929,6 @@ mod tests {
                         .iter()
                         .any(|t| t.name == mtp_widened(48, "hc_ffn_inject.weight")
                             && t.ty == GgmlType::F32)
-                );
-                assert_eq!(
-                    m.model.tensors.iter().any(|t| t.name == MTP_HEAD_ROWS),
-                    with_list
                 );
             }
         }

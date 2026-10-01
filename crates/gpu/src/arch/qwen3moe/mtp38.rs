@@ -16,10 +16,10 @@
 //!   moved.
 //! - The store is every position's K and V, `[n_kv][ctx][head]` f16 each,
 //!   the target's attention layers' K/V planes ([`KvPlanes`]).
-//! - With a row list, the head's rows of the target's `output.weight` are
-//!   gathered from the target file on the host into one Q8_0 matrix
-//!   (`place::MTP_HEAD_ROWS`), uploaded once, beside the row → id map; with
-//!   the full head, nothing.
+//! - The head's row → id map, one `u32` a vocabulary id whatever the head
+//!   (so a list's plan is the full head's): with a row list its first rows
+//!   are the list's ids, which the head reads in place from the target's
+//!   `output`; with the full head no walk reads it.
 //!
 //! The program ([`Mtp38::run`]) is ik's MTP graph (`build_qwen4exp.cpp`,
 //! `is_mtp`) over `m` rows (1..=[`MTP_ROWS`]; captured at 1..=[`MTP_GRAPH_ROWS`]):
@@ -27,8 +27,9 @@
 //! four streams after the target's last layer, `res_hc`), or the draft's own
 //! last row ([`MtpFeed::Own`], ik's scheme A: its token the draft's argmax,
 //! its hidden the draft's own streams). Every launch is an entry the
-//! target's chain has, but two of its own (`crate::mtp`) and the routed
-//! experts' `q8_0_gemv_sel_f32`:
+//! target's chain has, but two of its own (`crate::mtp`), the routed
+//! experts' `q8_0_gemv_sel_f32` and a listed head's `q8_0_gemv_ids` (one
+//! row) or `q8_0_gemv_ids_mcol`:
 //! - the target's embedding rows (`embed_rows_q8_0`, the borrowed
 //!   `token_embd`), the input pack (`mtp_input`: `rms(e)·enorm` beside
 //!   `rms(h)·hnorm` over all four streams, a row's four `[e | h_s]`), and
@@ -49,8 +50,10 @@
 //!   and its gated sum (`q38_shared_add`);
 //! - the head site's mix (`nextn.hc_head_*`, the block's combine first, so
 //!   the streams are then the layer's output, `l_out`), the head's
-//!   projection — the target's `output` ([`MtpHead::Full`]) or the gathered
-//!   rows ([`MtpHead::Rows`]) — and `argmax_p_rows_fault`, which names each
+//!   projection — the target's `output` ([`MtpHead::Full`]), or its rows of
+//!   the list read in place through the map (`q8_0_gemv_ids`, or
+//!   `q8_0_gemv_ids_mcol` past one row; [`MtpHead::Rows`]) — and
+//!   `argmax_p_rows_fault`, which names each
 //!   row's token and the draft's largest probability among the head's rows;
 //! - the last row's token and streams copied beside the arena, where the
 //!   next [`MtpFeed::Own`] walk reads them.
@@ -97,10 +100,10 @@ use crate::hc_gated::{Before, HcScratch, HcWideScratch, SiteWeights, WideMixArgs
 use crate::host::handoff::Places;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
-use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs, Q8_0SelArgs};
+use crate::q8f32::{GemvOut, Q8_0GemvIdsArgs, Q8_0GemvMcolArgs, Q8_0SelArgs};
 use crate::q38::{CardAccArgs, EmbedQ8Args, OutGateArgs, SharedAddArgs};
 use crate::rope_neox::PartialNeoxArgs;
-use crate::weights::{DevWeight, Q8Block, Weights, q8_0_planes};
+use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -121,20 +124,22 @@ pub struct BorrowedPlanes {
     pub planes: [u64; 2],
 }
 
-/// The reduced head: `output.weight`'s rows of the list, one Q8_0 matrix in
-/// `w` under `place::MTP_HEAD_ROWS`, and each row's vocabulary id.
+/// The head's row → vocabulary id map, one word a vocabulary id: with a row
+/// list its first `rows` words are the list's ids (each a row of the
+/// target's `output`) and the rest 0; with the full head every word is 0
+/// and no walk reads it.
 struct HeadMap {
     ids: DeviceBuffer<u32>,
-    rows: usize,
+    /// The list's rows; `None` for the full head.
+    rows: Option<usize>,
 }
 
 /// The MTP layer on the target's card. See the module comment.
 pub struct Mtp38 {
-    /// The draft's own tensors, the widened injects, the joined router and,
-    /// with a row list, the head's rows.
+    /// The draft's own tensors, the widened injects and the joined router.
     w: Weights,
     store: KvPlanes,
-    head: Option<HeadMap>,
+    head: HeadMap,
     /// `token_embd`, then `output`.
     borrowed: [BorrowedPlanes; 2],
     /// The layer's `blk.` index in the draft file.
@@ -149,15 +154,15 @@ pub struct Mtp38 {
 
 impl Mtp38 {
     /// The draft `mtp` describes, resident on `gpu` as `plan`'s draft plan
-    /// places it, reading `target_w`'s `token_embd` and `output` and
-    /// gathering the head's rows from `target_file`; each segment's file
-    /// pages leave the page cache once uploaded when `card_dontneed`.
-    /// Refused by name: a draft that is not the target's shape, a draft
-    /// file that carries its own matrices, a borrowed matrix absent or not
-    /// Q8_0 `[hidden, vocab]`, an upload whose bytes are not the plan's.
+    /// places it, reading `target_w`'s `token_embd` and `output` (the head's
+    /// listed rows among them); each segment's file pages leave the page
+    /// cache once uploaded when `card_dontneed`. Refused by name: a draft
+    /// that is not the target's shape, a draft file that carries its own
+    /// matrices, a borrowed matrix absent or not Q8_0 `[hidden, vocab]`, a
+    /// listed id at or past the vocabulary, an upload whose bytes are not
+    /// the plan's.
     pub fn open(
         gpu: &Gpu,
-        target_file: &Split,
         target_w: &Weights,
         draft_file: &Split,
         mtp: &model::arch::qwen35moe::place::MtpInputs,
@@ -221,19 +226,33 @@ impl Mtp38 {
         );
         w.join_rows(stream, &[&gate, &shared], router(d.index as usize))?;
         let head = match &d.head_rows {
-            HeadRows::Full => None,
+            HeadRows::Full => HeadMap {
+                ids: DeviceBuffer::zeroed(stream, vocab)?,
+                rows: None,
+            },
             HeadRows::List { ids, .. } => {
-                let dw = gathered_rows(stream, target_file, ids, hidden, vocab)?;
-                held_as_planned(
-                    &plan.draft,
-                    model::arch::qwen35moe::place::MTP_HEAD_ROWS,
-                    dw.resident_bytes(),
-                )?;
-                w.insert_derived(model::arch::qwen35moe::place::MTP_HEAD_ROWS.to_string(), dw)?;
-                Some(HeadMap {
-                    ids: DeviceBuffer::from_host(stream, ids)?,
-                    rows: ids.len(),
-                })
+                if let Some(&id) = ids.iter().find(|&&id| id as usize >= vocab) {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!("the head's list names id {id}, past the vocabulary's {vocab}"),
+                    ));
+                }
+                if ids.is_empty() || ids.len() > vocab {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "the head's list holds {} rows; a list holds 1 to the vocabulary's \
+                             {vocab}",
+                            ids.len()
+                        ),
+                    ));
+                }
+                let mut map = vec![0u32; vocab];
+                map[..ids.len()].copy_from_slice(ids);
+                HeadMap {
+                    ids: DeviceBuffer::from_host(stream, &map)?,
+                    rows: Some(ids.len()),
+                }
             }
         };
         let n = geo::N_KV * ctx * geo::HEAD;
@@ -278,9 +297,7 @@ impl Mtp38 {
     }
 
     fn map_bytes(&self) -> u64 {
-        self.head
-            .as_ref()
-            .map_or(0, |h| (h.ids.len() * std::mem::size_of::<u32>()) as u64)
+        (self.head.ids.len() * std::mem::size_of::<u32>()) as u64
     }
 
     /// The target's matrices the draft reads, with their addresses at open.
@@ -315,16 +332,17 @@ impl Mtp38 {
     }
 
     /// The draft's own weights: its file's tensors by name, the widened
-    /// injects, the joined router and the head's rows.
+    /// injects and the joined router.
     #[must_use]
     pub fn weights(&self) -> &Weights {
         &self.w
     }
 
-    /// The row → vocabulary id map and its rows; `None` for the full head.
+    /// The row → vocabulary id map (one word a vocabulary id) and the list's
+    /// rows, its first words; `None` for the full head.
     #[must_use]
     pub fn head_map(&self) -> Option<(&DeviceBuffer<u32>, usize)> {
-        self.head.as_ref().map(|h| (&h.ids, h.rows))
+        self.head.rows.map(|n| (&self.head.ids, n))
     }
 
     /// The layer's `blk.` index in the draft file.
@@ -457,54 +475,6 @@ fn widened(
     })
 }
 
-/// The rows `ids` of `target`'s `output.weight`, a Q8_0 `[hidden, vocab]`
-/// matrix, gathered on the host in the list's order and uploaded as one
-/// derived Q8_0 matrix.
-fn gathered_rows(
-    stream: &CudaStream,
-    target: &Split,
-    ids: &[u32],
-    hidden: usize,
-    vocab: usize,
-) -> Result<DevWeight, GpuError> {
-    let name = model::arch::qwen35moe::names::output();
-    let (shard, info) = target
-        .find(&name)
-        .ok_or_else(|| GpuError::tensor(WHAT, name.clone(), "in the target file"))?;
-    if info.ty != GgmlType::Q8_0 || info.dims != [hidden as u64, vocab as u64] {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "{name} is {} {:?}; the head's rows are gathered from a Q8_0 [{hidden}, {vocab}] \
-                 matrix",
-                info.ty, info.dims
-            ),
-        ));
-    }
-    let g = target
-        .shard(shard)
-        .ok_or_else(|| GpuError::shape(WHAT, format!("{name} names shard {shard}")))?;
-    let data = g.data(info)?;
-    let row = hidden / 32 * 34;
-    let mut blocks: Vec<Q8Block> = Vec::with_capacity(ids.len() * hidden / 32);
-    for &id in ids {
-        let at = id as usize * row;
-        let bytes = data.get(at..at + row).ok_or_else(|| {
-            GpuError::shape(
-                WHAT,
-                format!("{name}: row {id} runs past its {} bytes", data.len()),
-            )
-        })?;
-        blocks.extend(bytes.as_chunks::<34>().0.iter().map(Q8Block::from_bytes));
-    }
-    let (qs, d) = q8_0_planes(&blocks);
-    Ok(DevWeight::Q8_0Derived {
-        qs: DeviceTensor::upload(stream, &qs, ids.len(), hidden / 4)?,
-        d: DeviceTensor::upload(stream, &d, ids.len(), hidden / 32)?,
-        k: hidden,
-    })
-}
-
 // ------------------------------------------------------------ the program
 
 /// The most rows one walk of the draft takes: the m-column kernels' width.
@@ -542,7 +512,8 @@ pub fn walk_launches(m: usize) -> usize {
 pub enum MtpHead {
     /// The target's `output`: every token of the vocabulary.
     Full,
-    /// The load's row list (`place::MTP_HEAD_ROWS`), each row naming its id.
+    /// The load's row list: the target's `output` rows of its ids, read in
+    /// place through the head's map.
     Rows,
 }
 
@@ -994,18 +965,6 @@ impl MtpArena {
     }
 }
 
-/// A Q8_0 matrix's planes, a file tensor's or a derived one's.
-fn q8_planes<'w>(
-    w: &'w Weights,
-    name: &str,
-) -> Result<(&'w DeviceTensor<u32>, &'w DeviceTensor<u16>), GpuError> {
-    match w.get(name) {
-        Some(DevWeight::Q8_0 { qs, d, .. } | DevWeight::Q8_0Derived { qs, d, .. }) => Ok((qs, d)),
-        Some(_) => Err(GpuError::tensor(WHAT, name, "Q8_0 planes")),
-        None => Err(GpuError::tensor(WHAT, name, "resident")),
-    }
-}
-
 /// The draft layer's names, read once a walk.
 struct Names {
     attn_site: HcSite,
@@ -1233,7 +1192,7 @@ impl Mtp38 {
         mode: MtpMode,
     ) -> Result<usize, GpuError> {
         let stream = c.gpu.stream();
-        if head == MtpHead::Rows && self.head.is_none() {
+        if head == MtpHead::Rows && self.head.rows.is_none() {
             return Err(GpuError::state(
                 WHAT,
                 "a row-list head: this draft was opened with the full head",
@@ -1805,30 +1764,40 @@ impl Mtp38 {
         if let (Some(t), false) = (a.taps.as_mut(), capturing) {
             t.node(stream, MtpNode::HeadIn, &a.head_x, m)?;
         }
-        let ((qs, d), map) = match head {
-            MtpHead::Full => {
-                let DevWeight::Q8_0 { qs, d, .. } = output else {
-                    return Err(GpuError::tensor(WHAT, "output.weight", "Q8_0 planes"));
-                };
-                ((qs, d), None)
-            }
-            MtpHead::Rows => {
-                let map = hm
-                    .as_ref()
-                    .ok_or(GpuError::state(WHAT, "a row list for the head"))?;
-                (
-                    q8_planes(w, model::arch::qwen35moe::place::MTP_HEAD_ROWS)?,
-                    Some(&map.ids),
-                )
-            }
+        let DevWeight::Q8_0 { qs, d, .. } = output else {
+            return Err(GpuError::tensor(WHAT, "output.weight", "Q8_0 planes"));
         };
-        let rows = d.rows();
+        let (rows, map) = match head {
+            MtpHead::Full => (d.rows(), None),
+            MtpHead::Rows => (
+                hm.rows
+                    .ok_or(GpuError::state(WHAT, "a row list for the head"))?,
+                Some(&hm.ids),
+            ),
+        };
         // SAFETY: the logits hold MTP_ROWS · vocab values and rows <= vocab
-        // (the full head's, or a list of ids below it), m <= MTP_ROWS; the
-        // window lives for the projection and the argmax.
+        // (the full head's, or a list no longer than the vocabulary, refused
+        // at open otherwise), m <= MTP_ROWS; the window lives for the
+        // projection and the argmax.
         let mut lg = unsafe { f32_view(&a.logits, 0, rows * m) };
-        gpu.q8f32()
-            .enqueue_q8_0_gemv(stream, qs, d, &a.head_x, m, &mut lg)?;
+        match map {
+            None => gpu
+                .q8f32()
+                .enqueue_q8_0_gemv(stream, qs, d, &a.head_x, m, &mut lg)?,
+            Some(ids) => gpu.q8f32().enqueue_q8_0_gemv_ids(
+                stream,
+                Q8_0GemvIdsArgs {
+                    qs,
+                    d,
+                    ids,
+                    rows,
+                    x: &a.head_x,
+                    m,
+                    y: &mut lg,
+                },
+                sink,
+            )?,
+        }
         k.mtp.enqueue_argmax_p_rows_fault(
             stream,
             ArgmaxPArgs {
@@ -2025,8 +1994,8 @@ impl Mtp38 {
     pub fn logits(&self, stream: &CudaStream) -> Result<(Vec<f32>, usize), GpuError> {
         let a = self.arena_ref()?;
         let (m, head) = a.last.ok_or(GpuError::state(WHAT, "a walk to read"))?;
-        let rows = match (head, &self.head) {
-            (MtpHead::Rows, Some(h)) => h.rows,
+        let rows = match (head, self.head.rows) {
+            (MtpHead::Rows, Some(n)) => n,
             _ => a.vocab,
         };
         let mut v = a.logits.to_host_vec(stream)?;

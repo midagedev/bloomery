@@ -10,9 +10,9 @@
 //!   weights, its store and the row map hold the bytes its plan
 //!   (`PlanInputs::plan_mtp`) gives; the two matrices it borrows
 //!   (`token_embd`, `output`) are the target's own buffers, at the target's
-//!   addresses — nothing copied; the program's arena is the plan's; the map
-//!   holds the list's ids and each gathered row is the target's resident
-//!   `output` row of its id.
+//!   addresses — nothing copied, the list's rows among them; the program's
+//!   arena is the plan's; the map holds one word a vocabulary id, its first
+//!   the list's ids and the rest 0.
 //! - (q) `Mtp38::open` refuses by name, beside the loaded model: a draft
 //!   read as carrying its own matrices, and a plan whose row map is not the
 //!   one the load makes (after the draft's uploads, which it frees).
@@ -45,8 +45,10 @@
 //!   ik's head rows, the full head's logits. A dot's bound is `γ(k/32 +
 //!   5)·Σ|w·x|` ([`dot_depth`]), a mix's the hyper-connection gate's
 //!   `MIXED_BAND`, a combine's its weight's `LO_BAND` and one rounding.
-//! - (r) the row-list head against the full head over one walk's rows: each
-//!   list row's logits the full head's row of its id, bit for bit; each
+//! - (r) the row-list head (`q8_0_gemv_ids` and `_mcol`, the list's rows of
+//!   `output` read in place) against the full head over one walk's rows and
+//!   over a walk of its last row alone: each list row's logits the full
+//!   head's row of its id, bit for bit; each
 //!   row's token the id of the list's argmax; each head's probability the
 //!   host's softmax maximum over its rows within the sum's rounding bound.
 //! - (t) the pairing: after the set's prompt through the target by passes,
@@ -138,9 +140,7 @@ mod gate {
     use gguf::Split;
     use gguf::quant::half_to_f32;
     use model::arch::models::{Borrows, HeadRows, MtpSource};
-    use model::arch::qwen35moe::place::{
-        MTP_HEAD_ROWS, MtpInputs, MtpPlan, PlanInputs, machine, vocab_sha256,
-    };
+    use model::arch::qwen35moe::place::{MtpInputs, MtpPlan, PlanInputs, machine, vocab_sha256};
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
     use refset::arch::qwen4exp::IK;
@@ -1227,64 +1227,68 @@ mod gate {
     }
 
     /// (r): the list head against the full head over the rows of `g`'s last
-    /// run.
+    /// run, as one walk of all of them (the m-column entry) and as one walk
+    /// of its last row (the one-column entry).
     fn list_head(m: &mut Qwen38Model, g: &IkGraph, ids: &[u32]) -> Result<bool, GateError> {
         let n = g.tokens.len();
-        let rows = MTP_ROWS.min(n);
-        let c0 = n - rows;
-        let feed = MtpFeed::Rows {
-            tokens: &g.tokens[c0..],
-            pos0: g.pos[c0],
-            hidden: MtpHidden::Host(&g.states[c0 * WIDE..]),
-        };
-        let full = walk(m, feed, MtpHead::Full, MtpMode::Eager)?;
-        let list = walk(m, feed, MtpHead::Rows, MtpMode::Eager)?;
-        let mut ok = list.rows == ids.len();
-        let mut differ = 0usize;
-        let (mut p_worst, mut p_bad) = (0.0f64, 0usize);
-        for c in 0..rows {
-            let lc = column(&list.logits, rows, c);
-            let fc = column(&full.logits, rows, c);
-            differ += lc
-                .iter()
-                .zip(ids)
-                .filter(|&(v, &id)| v.to_bits() != fc[id as usize].to_bits())
-                .count();
-            let (top, _) = top2(&lc);
-            let token_ok = list.draft.tokens[c] == ids[top];
-            ok &= token_ok;
-            if !token_ok {
-                println!(
-                    "(r) row {c}: the list head names {}, its argmax row {top} is id {} FAIL",
-                    list.draft.tokens[c], ids[top]
-                );
-            }
-            for (w, v) in [(&list, &lc), (&full, &fc)] {
-                let want = p_max(v);
-                let e = (f64::from(w.draft.p[c]) - want).abs() / want;
-                p_worst = p_worst.max(e / p_bound(v.len()));
-                if e > p_bound(v.len()) {
-                    p_bad += 1;
+        let mut all = true;
+        for rows in [MTP_ROWS.min(n), 1] {
+            let c0 = n - rows;
+            let feed = MtpFeed::Rows {
+                tokens: &g.tokens[c0..],
+                pos0: g.pos[c0],
+                hidden: MtpHidden::Host(&g.states[c0 * WIDE..]),
+            };
+            let full = walk(m, feed, MtpHead::Full, MtpMode::Eager)?;
+            let list = walk(m, feed, MtpHead::Rows, MtpMode::Eager)?;
+            let mut ok = list.rows == ids.len();
+            let mut differ = 0usize;
+            let (mut p_worst, mut p_bad) = (0.0f64, 0usize);
+            for c in 0..rows {
+                let lc = column(&list.logits, rows, c);
+                let fc = column(&full.logits, rows, c);
+                differ += lc
+                    .iter()
+                    .zip(ids)
+                    .filter(|&(v, &id)| v.to_bits() != fc[id as usize].to_bits())
+                    .count();
+                let (top, _) = top2(&lc);
+                let token_ok = list.draft.tokens[c] == ids[top];
+                ok &= token_ok;
+                if !token_ok {
                     println!(
-                        "(r) row {c}: p {} against the host's {want:.9} over {} rows, {e:.3e} past \
-                         {:.3e} FAIL",
-                        w.draft.p[c],
-                        v.len(),
-                        p_bound(v.len())
+                        "(r) row {c}: the list head names {}, its argmax row {top} is id {} FAIL",
+                        list.draft.tokens[c], ids[top]
                     );
                 }
+                for (w, v) in [(&list, &lc), (&full, &fc)] {
+                    let want = p_max(v);
+                    let e = (f64::from(w.draft.p[c]) - want).abs() / want;
+                    p_worst = p_worst.max(e / p_bound(v.len()));
+                    if e > p_bound(v.len()) {
+                        p_bad += 1;
+                        println!(
+                            "(r) row {c}: p {} against the host's {want:.9} over {} rows, {e:.3e} \
+                             past {:.3e} FAIL",
+                            w.draft.p[c],
+                            v.len(),
+                            p_bound(v.len())
+                        );
+                    }
+                }
             }
+            ok &= differ == 0 && p_bad == 0;
+            println!(
+                "(r) a walk of {rows} rows of {} ({}): list logits = the full head's rows of their \
+                 ids, {differ} differ; tokens mapped; p within its bound (worst {p_worst:.2} of it) \
+                 {}",
+                g.label(),
+                list.rows,
+                verdict(ok)
+            );
+            all &= ok;
         }
-        ok &= differ == 0 && p_bad == 0;
-        println!(
-            "(r) {} rows of {} ({}): list logits = the full head's rows of their ids, {differ} \
-             differ; tokens mapped; p within its bound (worst {p_worst:.2} of it) {}",
-            rows,
-            g.label(),
-            list.rows,
-            verdict(ok)
-        );
-        Ok(ok)
+        Ok(all)
     }
 
     /// (t): the target's streams after the prompt against ik's warmup hidden
@@ -2502,9 +2506,9 @@ mod gate {
         }
     }
 
-    /// (d) the head's map holds `ids`, and its row `i` is the target's
-    /// resident `output` row `ids[i]`, both planes, bit for bit: the gather
-    /// against the placement loader's upload of the whole matrix.
+    /// (d) the head's map holds one word a vocabulary id, its first `ids`
+    /// and the rest 0: the head reads the list's rows of the target's
+    /// `output` through it, in place.
     fn head_rows(m: &Qwen38Model, mtp: &Mtp38, ids: &[u32]) -> Result<bool, GateError> {
         let stream = m.gpu().stream();
         let Some((map, n)) = mtp.head_map() else {
@@ -2512,40 +2516,21 @@ mod gate {
             return Ok(false);
         };
         let map = map.to_host_vec(stream)?;
-        let map_ok = n == ids.len() && map == ids;
+        let vocab = m.weights().get("output.weight").map_or(0, |dw| match dw {
+            DevWeight::Q8_0 { d, .. } => d.rows(),
+            _ => 0,
+        });
+        let ok = n == ids.len()
+            && map.len() == vocab
+            && map.get(..n) == Some(ids)
+            && map[n..].iter().all(|&w| w == 0);
         println!(
-            "(d) head map: {n} rows, the list's ids {} (want {LIST_ROWS})",
-            verdict(map_ok)
+            "(d) head map: {} words (output's {vocab} rows), {n} rows, the list's ids then 0 {} \
+             (want {LIST_ROWS})",
+            map.len(),
+            verdict(ok)
         );
-        let (
-            Some(DevWeight::Q8_0Derived { qs, d, k }),
-            Some(DevWeight::Q8_0 { qs: tq, d: td, .. }),
-        ) = (
-            mtp.weights().get(MTP_HEAD_ROWS),
-            m.weights().get("output.weight"),
-        )
-        else {
-            println!("(d) the head's rows or the target's output are not Q8_0 planes FAIL");
-            return Ok(false);
-        };
-        let (qs, d) = (qs.buf().to_host_vec(stream)?, d.buf().to_host_vec(stream)?);
-        let (tq, td) = (tq.buf().to_host_vec(stream)?, td.buf().to_host_vec(stream)?);
-        let (wq, wd) = (k / 4, k / 32);
-        let differ: Vec<usize> = (0..n)
-            .filter(|&i| {
-                let r = ids[i] as usize;
-                qs[i * wq..(i + 1) * wq] != tq[r * wq..(r + 1) * wq]
-                    || d[i * wd..(i + 1) * wd] != td[r * wd..(r + 1) * wd]
-            })
-            .take(4)
-            .collect();
-        let rows_ok = differ.is_empty();
-        println!(
-            "(d) head row i = output row ids[i], {n} rows, both planes: first differing rows \
-             {differ:?} {}",
-            verdict(rows_ok)
-        );
-        Ok(map_ok && rows_ok)
+        Ok(ok)
     }
 
     /// (d) and (q), on the model as the load left it: no walk has run.
@@ -2604,7 +2589,7 @@ mod gate {
                 head: false,
             };
         }
-        let r1 = Mtp38::open(m.gpu(), &target, m.weights(), draft, &own, &plan, false)
+        let r1 = Mtp38::open(m.gpu(), m.weights(), draft, &own, &plan, false)
             .err()
             .map_or("opened".to_string(), |e| e.to_string());
         let r1_ok = r1.contains("the load borrows the target's token_embd and output");
@@ -2612,7 +2597,7 @@ mod gate {
         println!("(q) a draft with its own matrices: {r1} {}", verdict(r1_ok));
         let mut other = plan;
         other.map_bytes += 4;
-        let r2 = Mtp38::open(m.gpu(), &target, m.weights(), draft, mtp, &other, false)
+        let r2 = Mtp38::open(m.gpu(), m.weights(), draft, mtp, &other, false)
             .err()
             .map_or("opened".to_string(), |e| e.to_string());
         let r2_ok = r2.contains("resident weights, store and row map hold");
@@ -2758,7 +2743,11 @@ mod gate {
             .body("list")?
             .mtp()
             .and_then(|d| d.head_map())
-            .map(|(map, _)| map.to_host_vec(m.gpu().stream()))
+            .map(|(map, n)| -> Result<Vec<u32>, GateError> {
+                let mut v = map.to_host_vec(m.gpu().stream())?;
+                v.truncate(n);
+                Ok(v)
+            })
             .transpose()?
             .ok_or("the load opened no row list")?;
         ok &= map == ids;

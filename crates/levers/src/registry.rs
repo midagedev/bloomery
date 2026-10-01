@@ -255,11 +255,17 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         kind: Kind::Path,
         default: Unset::Means("the full head: every token of the vocabulary"),
         doc: "Qwen3.8's MTP draft: the reduced head's row list (`tools/ref/draft-vocab.py`), \
-              the vocabulary ids its head scores, gathered from the target's `output` at \
-              load. Its first line names the list's vocabulary and the target tokenizer's \
-              digest; a list of another tokenizer, unsorted, with an id repeated or past the \
-              vocabulary, or of no row is refused by name. It moves the drafts' acceptance, \
-              never the emitted tokens.",
+              the vocabulary ids its head scores, read in place from the target's `output` \
+              through the head's map. Its first line names the list's vocabulary and the \
+              target tokenizer's digest; a list of another tokenizer, unsorted, with an id \
+              repeated or past the vocabulary, or of no row is refused by name. The load's \
+              plan is the full head's, byte for byte (the map is one word a vocabulary id \
+              either way), so the target is the full head's target, and a drafted run's ids \
+              are its plain run's under any head: the list moves only the drafts' \
+              acceptance, and the emitted tokens are the full head's. One exception: a \
+              running residency (`BLOOMERY_RESIDENCY`) counts by pass, so a list that moves \
+              the acceptance moves the passes, the experts' flips with them, and the \
+              target's bits at a near tie.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

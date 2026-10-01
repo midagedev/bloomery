@@ -51,6 +51,12 @@
 //! rows on that column. An id at or past the stack's experts raises
 //! [`FaultSite::ExpertId`] and writes its slot's rows NaN; no slot is the
 //! host's here.
+//!
+//! `q8_0_gemv_ids` and `q8_0_gemv_ids_mcol` are `q8_0_gemv` and
+//! `q8_0_gemv_mcol` over a row list of one matrix, read in place: launch row
+//! `i` is the matrix's row `ids[i]`, its sums that row's in the plain entry,
+//! bit for bit, written row-major at row `i`. An id at or past the matrix's
+//! rows raises [`FaultSite::TokenId`] and writes its row NaN.
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -1415,6 +1421,156 @@ mod q8f32_kernels {
             unsafe { *y.get_unchecked_mut(row) = s };
         }
     }
+
+    /// Q8_0 gemv over a row list of one matrix against one f32 activation
+    /// column (module doc), the decode shape: launch row `i` dots the
+    /// matrix's row `ids[i]` with `x` through [`q8_0_lane_partial_1col`] and
+    /// the butterfly, and lane 0 stores `y[i]` — `q8_0_gemv`'s output row
+    /// `ids[i]`, bit for bit. One warp a row, eight rows a 256-thread block,
+    /// as `q8_0_gemv`. The id load and its refusal are warp-uniform: an id at
+    /// or past `n_matrix` raises [`FaultSite::TokenId`], reads no weight word
+    /// and stores NaN.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_matrix * k,
+            32 * d.len() >= n_matrix * k,
+            ids.len() >= n_rows,
+            x.len() >= k,
+            y.len() >= n_rows
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn q8_0_gemv_ids(
+        qs: &[u32],
+        d: &[u16],
+        x: &[f32],
+        ids: &[u32],
+        n_rows: u32,
+        n_matrix: u32,
+        k: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        // SAFETY: row < n_rows <= ids.len() by the launch contract.
+        let id = unsafe { *ids.get_unchecked(row) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_matrix {
+            if lane == 0 {
+                fault.raise(FaultSite::TokenId);
+                // SAFETY: row < n_rows <= y.len() by the launch contract; lane
+                // 0 of the row's warp alone writes y[row].
+                unsafe { *y.get_unchecked_mut(row) = f32::NAN };
+            }
+            return;
+        }
+        // SAFETY: id < n_matrix puts the matrix row's words and scales inside
+        // qs and d (the contract's 4·qs.len() and 32·d.len() bounds), and
+        // x.len() >= k is the one column the body reads from x0 = 0; the host
+        // passes k a positive multiple of 32.
+        let f = unsafe { q8_0_lane_partial_1col(qs, d, x, k, id as usize, 0, lane) };
+        let s = warp::reduce_sum_f32(f);
+        if lane == 0 {
+            // SAFETY: row < n_rows <= y.len() by the launch contract, and only
+            // lane 0 of the row's warp writes slot row.
+            unsafe { *y.get_unchecked_mut(row) = s };
+        }
+    }
+
+    /// Q8_0 gemv over a row list of one matrix (module doc): launch row `i`
+    /// dots the matrix's row `ids[i]` against `m_cols` f32 activation
+    /// columns in [`q8_0_lane_partials_mcol`]'s order, and lane 0 stores
+    /// column c at `y[i·m_cols + c]` — `q8_0_gemv_mcol`'s row-major output of
+    /// a matrix whose row `i` is that row, bit for bit. One warp a row, eight
+    /// rows a 256-thread block, as `q8_0_gemv`. The id load and its refusal
+    /// are warp-uniform (a warp's lanes share `row`): an id at or past
+    /// `n_matrix` raises [`FaultSite::TokenId`], reads no weight word and
+    /// stores NaN in the row's columns.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * qs.len() >= n_matrix * k,
+            32 * d.len() >= n_matrix * k,
+            ids.len() >= n_rows,
+            x.len() >= m_cols * k,
+            y.len() >= n_rows * m_cols
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
+    )]
+    pub fn q8_0_gemv_ids_mcol(
+        qs: &[u32],
+        d: &[u16],
+        x: &[f32],
+        ids: &[u32],
+        n_rows: u32,
+        n_matrix: u32,
+        k: u32,
+        m_cols: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        if row >= n_rows as usize {
+            return;
+        }
+        // SAFETY: row < n_rows <= ids.len() by the launch contract.
+        let id = unsafe { *ids.get_unchecked(row) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_matrix {
+            if lane == 0 {
+                fault.raise(FaultSite::TokenId);
+                // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
+                // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
+                // launch contract's bound; only lane 0 of the row's warp
+                // writes them.
+                unsafe {
+                    store_sums(
+                        &mut y,
+                        row * m_cols as usize,
+                        1,
+                        m_cols as usize,
+                        &[f32::NAN; 8],
+                    );
+                }
+            }
+            return;
+        }
+        // SAFETY: id < n_matrix puts the matrix row's words and scales inside
+        // qs and d (the contract's 4·qs.len() and 32·d.len() bounds), and
+        // column c at c*k with x.len() >= m_cols*k = (m_cols-1)*k + k; the
+        // host passes k a positive multiple of 32.
+        let Some(f) = (unsafe {
+            q8_0_lane_partials_m(qs, d, x, k, id as usize, 0, k as usize, m_cols, lane)
+        }) else {
+            return;
+        };
+        let sums = gemv_lane_sums(f, m_cols);
+        if lane == 0 {
+            // SAFETY: the slots row*m_cols + c, c < m_cols <= 8, lie in
+            // row*m_cols .. (row+1)*m_cols <= n_rows*m_cols <= y.len(), the
+            // launch contract's bound; only lane 0 of the row's warp writes
+            // them.
+            unsafe { store_sums(&mut y, row * m_cols as usize, 1, m_cols as usize, &sums) };
+        }
+    }
 }
 
 /// The loaded P3 device module: `f32_gemv`, `q8_0_gemv` and the two
@@ -1732,6 +1888,108 @@ impl Q8F32Kernels {
         )?;
         Ok(())
     }
+
+    /// Enqueue `y = W[ids] · x`: rows `ids[..rows]` of a Q8_0 matrix in the
+    /// module doc's device layout, read in place, against `m` f32 activation
+    /// columns of `k = d.cols() * 32` values each — `m = 1` through
+    /// `q8_0_gemv_ids`, the decode shape, `m > 1` through
+    /// `q8_0_gemv_ids_mcol`, as [`Self::enqueue_q8_0_gemv`] splits them.
+    /// `y` holds `rows * m` f32, row-major with m outputs per row, row `i`
+    /// bit for bit [`Self::enqueue_q8_0_gemv`]'s output row `ids[i]`. An id
+    /// at or past the matrix's rows raises [`FaultSite::TokenId`] on the
+    /// device and writes its row NaN. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_q8_0_gemv_ids(
+        &self,
+        stream: &CudaStream,
+        a: Q8_0GemvIdsArgs<'_>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_q8_0_gemv_ids";
+        let Q8_0GemvIdsArgs {
+            qs,
+            d,
+            ids,
+            rows,
+            x,
+            m,
+            y,
+        } = a;
+        let (n_matrix, k) = (d.rows(), d.cols() * 32);
+        if qs.rows() != n_matrix || qs.cols() != d.cols() * 8 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "qs is {}x{}, want {}x{} (k/4 words per row, k = d.cols()*32 = {k})",
+                    qs.rows(),
+                    qs.cols(),
+                    n_matrix,
+                    d.cols() * 8
+                ),
+            ));
+        }
+        if rows > ids.len() || rows > n_matrix {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{rows} listed rows: at most the map's {} ids and the matrix's {n_matrix} rows",
+                    ids.len()
+                ),
+            ));
+        }
+        check_gemv_geometry(what, rows, k, x.len(), m, y.len())?;
+        let n_rows = launch_u32(what, "rows", rows)?;
+        let n_matrix = launch_u32(what, "n_matrix", n_matrix)?;
+        let k = launch_u32(what, "k", k)?;
+        let grid = LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0);
+        if m == 1 {
+            let prep = self.module.prepare_q8_0_gemv_ids(grid)?;
+            self.module.q8_0_gemv_ids(
+                stream,
+                &prep,
+                qs.buf(),
+                d.buf(),
+                x,
+                ids,
+                n_rows,
+                n_matrix,
+                k,
+                fault,
+                y,
+            )?;
+            return Ok(());
+        }
+        let prep = self.module.prepare_q8_0_gemv_ids_mcol(grid)?;
+        self.module.q8_0_gemv_ids_mcol(
+            stream,
+            &prep,
+            qs.buf(),
+            d.buf(),
+            x,
+            ids,
+            n_rows,
+            n_matrix,
+            k,
+            launch_u32(what, "m", m)?,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
+}
+
+/// [`Q8F32Kernels::enqueue_q8_0_gemv_ids`]'s arguments: the Q8_0 planes of
+/// the whole matrix as [`Q8F32Kernels::enqueue_q8_0_gemv`] takes them, the
+/// row → matrix row map and how many of its rows the launch reads, `m`
+/// activation columns (1..=8), and the output.
+pub struct Q8_0GemvIdsArgs<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub d: &'a DeviceTensor<u16>,
+    pub ids: &'a DeviceBuffer<u32>,
+    pub rows: usize,
+    pub x: &'a DeviceBuffer<f32>,
+    pub m: usize,
+    pub y: &'a mut DeviceBuffer<f32>,
 }
 
 /// [`Q8F32Kernels::enqueue_q8_0_gemv_sel_f32`]'s arguments: a stack of

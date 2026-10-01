@@ -716,7 +716,7 @@ impl Body38 {
             |stream, _, layers, w| Body38::derive(stream, &shape.kinds, layers, w),
             |gpu, file, w, set, glue| {
                 let draft = mtp
-                    .map(|(d, m, p)| Mtp38::open(gpu, file, w, d, m, p, host.card_dontneed))
+                    .map(|(d, m, p)| Mtp38::open(gpu, w, d, m, p, host.card_dontneed))
                     .transpose()?;
                 let mut body = Body38::load_placed(
                     gpu,

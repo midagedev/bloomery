@@ -152,21 +152,19 @@ fn hw_qwen4exp_mtp_spec() {
     );
 }
 
-// PIN(2026-09-28): the shared draft's card terms [derived from the header dump's table: the Q8_0
+// PIN(2026-10-01): the shared draft's card terms [derived from the header dump's table: the Q8_0
 // tensors but the injects in two planes of their file bytes, the F32 ones but the indexer's norms,
 // the two injects widened to F32 [10240, 4]; 98,715,648 B dense, 2,673,868,800 B of routed experts,
 // 2,772,584,448 resident; the uploads in the file's order, then the injects, through a 2 MiB-granule
 // heap of their own: 2,785,017,856 B, rounding 12,433,408. The store 2 x 2 x 256 f16 = 2,048 B a
-// position. A list of 40,960 rows adds 40,960 x 2,720 = 111,411,200 B of rows (the heap then
-// 2,898,264,064 B, rounding 14,268,416) and 40,960 x 4 B of map].
+// position. The head's map 248,320 x 4 = 993,280 B, with the full head and with a list of 40,960
+// rows alike: a list's rows are the target's `output`, read in place].
 const DRAFT_DENSE: u64 = 98_715_648;
 const DRAFT_EXPERTS: u64 = 2_673_868_800;
 const DRAFT_ROUNDING: u64 = 12_433_408;
 const DRAFT_KV_ROW: u64 = 2048;
+const DRAFT_MAP: u64 = 993_280;
 const LIST_ROWS: u32 = 40_960;
-const LIST_HEAD: u64 = 111_411_200;
-const LIST_ROUNDING: u64 = 14_268_416;
-const LIST_MAP: u64 = 163_840;
 // The largest context each card holds with the draft (full head), as predicted [derived: the plan
 // test's CARD_MAX_CTX budget less 2,785,017,856 B of draft granules, over 28,416 + 2,048 B a
 // position plus the draft program's arena, whose dense flash partials grow 198,144 B a 64-key
@@ -180,8 +178,12 @@ const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_194_276), ("3090", 431_3
 /// for field, the draft's holds its 512 experts on the card with the bytes
 /// derived above, and the headroom is the target's less the draft's; the
 /// boundary context with the draft breaks with `CardOver`; a list of 40,960
-/// rows over the target's tokenizer adds its rows and map; the unshared
-/// file and a list of another tokenizer are refused by name.
+/// rows over the target's tokenizer plans as the full head does: under
+/// either expert rule (`plan_mtp_with`, `Experts::Host` and `Experts::Card`)
+/// at 4,096, 4,352 and 32,768 positions, the two plans' rows, cards, host
+/// and expert counts, the draft's, the map, the arena and the headroom are
+/// equal; the unshared file and a list of another tokenizer are refused by
+/// name.
 #[test]
 #[ignore = "needs the Qwen3.8-Flash-Next shards and MTP files on the box (just gate-qwen4exp-meta)"]
 fn hw_qwen4exp_mtp_plan() {
@@ -230,10 +232,7 @@ fn hw_qwen4exp_mtp_plan() {
             let plain = inputs
                 .plan(&machine, ctx, &levers)
                 .unwrap_or_else(|e| panic!("{} ctx {ctx}: plan: {e}", card.name));
-            for (label, m, head, rounding, map) in [
-                ("full", &full, 0, DRAFT_ROUNDING, 0),
-                ("list", &list, LIST_HEAD, LIST_ROUNDING, LIST_MAP),
-            ] {
+            for (label, m) in [("full", &full), ("list", &list)] {
                 let with = match inputs.plan_mtp(&machine, ctx, &levers, m) {
                     Ok(p) => p,
                     Err(e) => {
@@ -254,11 +253,11 @@ fn hw_qwen4exp_mtp_plan() {
                     with.map_bytes,
                 );
                 let want = (
-                    DRAFT_DENSE + head,
+                    DRAFT_DENSE,
                     DRAFT_EXPERTS,
-                    rounding,
+                    DRAFT_ROUNDING,
                     ctx * DRAFT_KV_ROW,
-                    map,
+                    DRAFT_MAP,
                 );
                 let headroom = plain.cards[0].headroom_bytes
                     - i128::from(with.draft_card_bytes() + with.arena_bytes);
@@ -279,6 +278,60 @@ fn hw_qwen4exp_mtp_plan() {
                         && got == want
                         && with.draft.n_l == [512]
                         && with.headroom_bytes == headroom,
+                );
+            }
+        }
+        for experts in [place::Experts::Host, place::Experts::Card] {
+            for ctx in [4096u64, 4352, 32_768] {
+                let machine = place::machine_for_experts(
+                    card,
+                    inputs.hp.n_layer,
+                    place::UBATCH_PLANNED.min(ctx),
+                    experts,
+                );
+                let plans = [&full, &list]
+                    .map(|m| inputs.plan_mtp_with(&machine, ctx, &levers, m, experts));
+                let [Ok(f), Ok(l)] = &plans else {
+                    let why: Vec<String> = plans
+                        .iter()
+                        .filter_map(|p| p.as_ref().err().map(ToString::to_string))
+                        .collect();
+                    check(
+                        &mut o,
+                        format!(
+                            "{} ctx {ctx} {experts:?}: plan_mtp_with refused: {why:?}",
+                            card.name
+                        ),
+                        false,
+                    );
+                    continue;
+                };
+                let terms = |p: &place::MtpPlan<'_>| {
+                    (
+                        view(&p.plan),
+                        view(&p.draft),
+                        p.map_bytes,
+                        p.arena_bytes,
+                        p.headroom_bytes,
+                    )
+                };
+                let same = terms(f) == terms(l);
+                let card_experts = |p: &place::MtpPlan<'_>| p.plan.n_l.iter().sum::<u64>();
+                check(
+                    &mut o,
+                    format!(
+                        "{} ctx {ctx} {experts:?}: the list's plan is the full head's, rows, cards, \
+                         host, expert counts, draft, map, arena and headroom ({same}; card \
+                         experts {} and {}, map {} and {}, headroom {} and {})",
+                        card.name,
+                        card_experts(f),
+                        card_experts(l),
+                        f.map_bytes,
+                        l.map_bytes,
+                        f.headroom_bytes,
+                        l.headroom_bytes
+                    ),
+                    same,
                 );
             }
         }

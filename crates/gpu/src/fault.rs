@@ -82,7 +82,8 @@ pub enum FaultSite {
     /// key source: the window ring's, or the compressed stream's.
     AttnCount = 8,
     /// A token id that selects a table row — an embedding row, the DSpark
-    /// Markov head's previous token — lies past the table's rows.
+    /// Markov head's previous token, a reduced head's listed row — lies past
+    /// the table's rows.
     TokenId = 9,
     /// A prefill flash row's live key count was zero or past the cache.
     KeyCount = 10,
