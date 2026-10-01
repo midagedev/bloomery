@@ -31,6 +31,16 @@ pub(crate) fn cu(result: sys::CUresult, what: &'static str) -> Result<(), GpuErr
     })
 }
 
+/// A driver result as cuda-core's error, for [`CudaContext::record_err`] on a
+/// drop path, where nothing can return it.
+fn driver(result: sys::CUresult) -> Result<(), DriverError> {
+    if result == sys::cudaError_enum_CUDA_SUCCESS {
+        Ok(())
+    } else {
+        Err(DriverError(result))
+    }
+}
+
 /// A captured kernel sequence, instantiated for replay.
 ///
 /// Replaying launches the recorded work with the recorded buffer addresses —
@@ -41,10 +51,14 @@ pub struct Graph {
     graph: sys::CUgraph,
     exec: sys::CUgraphExec,
     nodes: usize,
+    /// The context the graph was captured in: held so it outlives the
+    /// handles, and bound when they are destroyed, as cuda-core's owners do.
+    ctx: Arc<CudaContext>,
 }
 
 // SAFETY: the handles are opaque driver objects valid across threads while the
-// owning context lives; nothing here has interior mutability.
+// owning context lives, which `ctx` guarantees; nothing here has interior
+// mutability.
 unsafe impl Send for Graph {}
 
 impl Graph {
@@ -133,7 +147,12 @@ impl Graph {
             return Err(e);
         }
         // From here the handles are owned: a failed upload drops them.
-        let captured = Graph { graph, exec, nodes };
+        let captured = Graph {
+            graph,
+            exec,
+            nodes,
+            ctx: Arc::clone(stream.context()),
+        };
         // The upload the first launch of an exec would otherwise do inside
         // its own call, done once here on the stream the replays use.
         // SAFETY: exec is the live instantiation above; hs is the live stream
@@ -382,6 +401,9 @@ pub(crate) struct MappedHost {
     host: *mut u8,
     dev: sys::CUdeviceptr,
     bytes: usize,
+    /// The context that allocated the page: held so it outlives the
+    /// allocation, and bound when the page is freed, as cuda-core's owners do.
+    ctx: Arc<CudaContext>,
 }
 
 // SAFETY: the allocation is owned by this value alone and freed once, in its
@@ -431,6 +453,7 @@ impl MappedHost {
             host: host.cast(),
             dev,
             bytes,
+            ctx: Arc::clone(ctx),
         })
     }
 
@@ -496,11 +519,14 @@ impl MappedHost {
 
 impl Drop for MappedHost {
     fn drop(&mut self) {
+        // Freed under the context that allocated it, not whichever context
+        // the thread last bound; an error is kept on that context.
+        self.ctx.record_err(self.ctx.bind_to_thread());
         // SAFETY: `host` came from cuMemHostAlloc and is freed once, here —
         // after every graph that names it, since the graphs are declared
-        // before the bodies that own the views over it. A failure on the drop
-        // path is unreportable and ignored.
-        unsafe { sys::cuMemFreeHost(self.host.cast()) };
+        // before the bodies that own the views over it.
+        let rc = unsafe { sys::cuMemFreeHost(self.host.cast()) };
+        self.ctx.record_err(driver(rc));
     }
 }
 
@@ -705,13 +731,19 @@ pub struct KernelNode {
 
 impl Drop for Graph {
     fn drop(&mut self) {
+        // Destroyed under the context it was captured in; an error is kept on
+        // that context.
+        self.ctx.record_err(self.ctx.bind_to_thread());
         // SAFETY: both handles were created in `capture` and are destroyed
         // exactly once here; the exec first, then the template it came from.
-        // Errors on the drop path are unreportable and ignored.
-        unsafe {
-            sys::cuGraphExecDestroy(self.exec);
-            sys::cuGraphDestroy(self.graph);
-        }
+        let (exec, graph) = unsafe {
+            (
+                sys::cuGraphExecDestroy(self.exec),
+                sys::cuGraphDestroy(self.graph),
+            )
+        };
+        self.ctx.record_err(driver(exec));
+        self.ctx.record_err(driver(graph));
     }
 }
 
