@@ -14,7 +14,7 @@ DeepSeek-V4.1-Flash `Q3_K_M` on an RTX A6000 and a 32-core CPU: 29.66 tok/s deco
 - More than 200 CUDA kernels, all written in Rust with [cuda-oxide](https://github.com/NVIDIA/cuda-rust) ([how](docs/cuda-oxide.md)).
 - Experts on the GPU and the AVX2 CPU in one CUDA graph step.
 - Adaptive residency: routed experts move between the card and the host by the engine's own routing as it runs.
-- Speculative decoding with greedy output unchanged: DSpark for V4.1 (the draft on a second card), the MTP head for Qwen3.8.
+- Speculative decoding with greedy output unchanged: DSpark for V4.1 (the draft on a second card), the MTP head for Qwen3.8 and GLM-5.3.
 - V4.1's batched prompts leave the state of one step per token, bit for bit.
 - A llama-server-compatible HTTP API.
 - Every number comes from a runner and links its log.
@@ -37,9 +37,10 @@ The DSpark draft for V4.1 speculative decoding is not a public upload: it is con
 ## How it works
 
 - **Placement.** Each layer starts with a fixed number of routed experts on the card, the lowest ids. With `--place bp`, V4.1 puts the model on the A6000 and more routed experts (and the DSpark draft) on the 3090. Qwen3.8 runs its card share of the experts on the card (`BLOOMERY_QWEN38_EXPERTS=card`, the default).
-- **Adaptive residency.** Under V4.1's serving placements (`--place a` and `bp`) the engine counts its own routing and swaps experts between the card and the host between steps (`BLOOMERY_RESIDENCY`, on by default there). A prompt call also streams its hottest host experts into the card's pool (`BLOOMERY_HOSTSTREAM`), so decode starts on experts that fit the prompt.
+- **Adaptive residency.** Under V4.1's serving placements (`--place a` and `bp`) and Qwen3.8's `--place a` the engine counts its own routing and swaps experts between the card and the host between steps (`BLOOMERY_RESIDENCY`, on by default there; GLM-5.3 takes it when set). A prompt call also streams its hottest host experts into the card's pool (`BLOOMERY_HOSTSTREAM`, V4.1 and Qwen3.8), so decode starts on experts that fit the prompt.
 - **Engram rows from NVMe.** V4.1's engram table is read from NVMe, 48 rows a token, prefetched by a helper thread.
 - **Skewed pass.** Speculative decoding runs two positions one layer apart in one step and verifies a draft token: the DSpark draft (`BLOOMERY_DRAFT=dspark`) or an n-gram lookup (`BLOOMERY_DRAFT=lookup`).
+- **MTP drafts.** Qwen3.8's MTP head drafts a window of four rows and verifies it in one pass (`BLOOMERY_DRAFT=mtp`, on by default under `--place a`); GLM-5.3's next-token layer drafts one token for a two-row verify (`BLOOMERY_DRAFT=mtp`, off by default).
 - **Batched prompts.** V4.1 runs a prompt in batches of up to 512 positions, each expert over all its tokens at once, two batches in flight so the card and the CPU overlap. Qwen3-30B and Qwen3.6 run ubatches of up to 4096 tokens through an int8 tensor-core GEMM; Qwen3.8 runs ubatches of up to 4096 with its card experts beside the host tier; GLM-5.3 runs its prompt in batches, its sparse-attention selector included.
 - **Loading.** A load streams the file's bytes to the card through a pinned ring with one sync; a warm V4.1 load takes about 16 s ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#v41-load-upload)).
 
@@ -55,7 +56,7 @@ Adaptive residency on one A6000, V4.1-Flash `Q3_K_M`, 96 decode steps after a 51
 
 V4.1 runs on the public `Q3_K_M` file as uploaded. `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat` streams text; `bloomery-serve-ds41` and `bloomery-serve-qwen38` serve llama-server's HTTP API, streaming, one request at a time. The V4.1 server also reuses a cached prompt prefix, splits reasoning and returns tool calls; the Qwen3.8 server keeps no prefix (every request prefills from a reset). GLM-5.3 and Qwen3.6 run from their generator bins and have no server yet.<!-- pending: no-glm-qwen36-server --> The Qwen and GLM chat templates render as jinja2 does on their gates' cases, and the tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
 
-In progress: the warm re-measure against llama.cpp (below); Qwen3.8's MTP draft speed; GLM-5.3's prompt speed since batching; faster V4.1 host experts; DeepSeek-V4-Flash-0731.
+In progress: the warm re-measure against llama.cpp (below); GLM-5.3's prompt speed since batching, and its MTP draft and adaptive residency speed; faster V4.1 host experts; DeepSeek-V4-Flash-0731.
 
 ## Measured numbers
 
@@ -80,13 +81,13 @@ This table is provisional. llama.cpp ran through `llama-bench`, which feeds new 
 |---|---|---|---|---|---|
 | DeepSeek-V4.1-Flash `Q3_K_M` | A6000 + CPU, adaptive residency with prompt streaming (today's default), prose prompt | 43.30 after a prompt of 512, 36.77 after 4096 | 191.97 (P = 512), 376.67 (P = 4096) | not measured | [callstream-pp-a](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#callstream-pp-a) |
 | GLM-5.3-Flash `UD-Q4_K_XL` | A6000 + CPU, prose prompt | 20.95 (depth 512), 20.99 (depth 1024) | — | decode faster, but slower than its MTP draft; prompt slower | [glm-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#glm-release) |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL` | A6000 + CPU, card experts (today's default), prose prompt | 53.85 (depth 512), 53.47 (depth 4096) | 659.2 (P = 512), 618.2 (P = 4096) | not measured | [q38prose-pp](https://github.com/midagedev/rig-log/blob/main/log/2026-09-29.md#q38prose-pp) |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | A6000 + CPU, card experts, adaptive residency with prompt streaming and the MTP draft (today's default), prose prompt | 91.24 after a prompt of 512, 79.33 after 4096 | 861.7 (P = 512), 1,024.3 (P = 4096) | not measured | [q38seed-ab](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#q38seed-ab) |
 | Qwen3.6-35B-A3B `Q4_K_M` | A6000, whole model | 204.4 (depth 6), 195.8 (depth 4096) | 6,464 (P = 512), 8,311 (P = 4096) | faster | [q36-release](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q36-release) |
 | Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` | A6000, whole model | 209.2 (depth 6), 175.2 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) | faster; near par in decode at depth 4096 | [qwen3-xeng](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng) |
 
 - "vs llama.cpp" is the direction in the same window as the linked rig-log entry (decode and prompt alike unless it says otherwise): mainline llama.cpp, or the model's llama.cpp pull request. "Not measured" means that window had no llama.cpp rows. The rows from 2026-09-28 are provisional, as above.
-- The V4.1 and Qwen3.8 rows are two-round windows of bloomery alone; decode follows the prompt it names. Qwen3.8 on 2026-09-28, with every routed expert on the CPU, ran 40.46 decode and 104.0 prompt at P = 4096, slower than llama.cpp in that window.
-- GLM-5.3's row fed its prompt one step per token (about 21 tok/s); its batched prompt has landed since and is not re-measured yet.
+- The V4.1 row is a two-round window of bloomery alone and the Qwen3.8 row a six-round one; decode follows the prompt it names. Qwen3.8 with card experts alone ran 53.85 / 53.47 decode and 659.2 / 618.2 prompt on 2026-09-29 ([q38prose-pp](https://github.com/midagedev/rig-log/blob/main/log/2026-09-29.md#q38prose-pp)); on 2026-09-28, with every routed expert on the CPU, it ran 40.46 decode and 104.0 prompt at P = 4096, slower than llama.cpp in that window.
+- GLM-5.3's row fed its prompt one step per token (about 21 tok/s); its batched prompt, its MTP draft and its adaptive residency have landed since and are not measured yet.
 
 ### On two cards: DeepSeek-V4.1-Flash
 
@@ -122,7 +123,7 @@ Every throughput number in this README ran on the A6000: the one-card rows on th
 - **A pinned nightly** (`nightly-2026-08-28`) with a pinned cuda-oxide revision from our fork, where fixes wait for upstream (`THIRD_PARTY_NOTICES.md`).
 - **V4.1 prompts are bound by the CPU expert tier**: the host experts are most of each layer-batch. The V4.1 server reuses a cached prompt prefix; the Qwen3.8 server does not.
 - **One request at a time** in both servers. GLM-5.3 and Qwen3.6 have no server yet.<!-- pending: no-glm-qwen36-server -->
-- **Qwen3.8** keeps the routed experts past its card share on the CPU, and its MTP draft's speed is not measured yet.
+- **Qwen3.8** keeps the routed experts past its card share on the CPU, where adaptive residency moves them as it runs. Its MTP draft costs the prompt 3.1 % at P = 512 and 6.1 % at P = 4096 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#q38mtp-wide)).
 
 ## Build
 
