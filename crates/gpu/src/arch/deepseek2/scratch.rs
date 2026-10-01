@@ -688,17 +688,26 @@ impl ParamImage {
         // The four windows the launches take as their own buffers: cut from
         // the image by the `SP_*` layout, checked, then kept as handles — the
         // image moves beside them into the arena, a move of the handle, not
-        // of the allocation.
+        // of the allocation. All four windows are cut before any handle is
+        // taken: a failed cut drops the windows already made through their
+        // own `Drop`, and between the handle takings there is no return, so
+        // no handle is left owing its release.
+        let (cs_win, token_win, pos_win, n_keys_win) = (
+            Window::<f32>::of(&step_params, SP_CS * size_of::<u32>(), rope)?,
+            Window::<u32>::of(&step_params, SP_TOKEN * size_of::<u32>(), 1)?,
+            Window::<u32>::of(&step_params, SP_POS * size_of::<u32>(), 1)?,
+            Window::<u32>::of(&step_params, SP_N_KEYS * size_of::<u32>(), 1)?,
+        );
         // SAFETY: the handles and their parent `step_params` live and drop
         // together as `LayerScratch` fields (`pos_buf`…`cs_buf` beside
         // `step_params`): its `Drop` releases each handle once before any
         // field drops, so the parent's free happens after they are gone.
         let (cs_buf, token_buf, pos_buf, n_keys_buf) = unsafe {
             (
-                Window::<f32>::of(&step_params, SP_CS * size_of::<u32>(), rope)?.into_handle(),
-                Window::<u32>::of(&step_params, SP_TOKEN * size_of::<u32>(), 1)?.into_handle(),
-                Window::<u32>::of(&step_params, SP_POS * size_of::<u32>(), 1)?.into_handle(),
-                Window::<u32>::of(&step_params, SP_N_KEYS * size_of::<u32>(), 1)?.into_handle(),
+                cs_win.into_handle(),
+                token_win.into_handle(),
+                pos_win.into_handle(),
+                n_keys_win.into_handle(),
             )
         };
         Ok(ParamImage {

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # The per-crate unsafe ratchet (Mac, grep only, no build): each crate's counts against its pins in
 # tools/unsafe-ratchet.txt. This file owns the counting rule:
-#   blocks  `unsafe {` lines (with or without the space) and `unsafe extern "…" {` lines
+#   blocks  `unsafe {` lines (with or without the space) and `unsafe extern` block lines, with a
+#           quoted ABI (`unsafe extern "C" {`) or the edition-2024 quoteless form (`unsafe extern {`)
 #   fns     `unsafe fn` lines (pub, pub(crate), const and `unsafe extern "C" fn` forms included)
 #   impls   `unsafe impl` lines
-# over every .rs file under crates/<dir>/{src,tests,benches}. The crate set is written as an exclusion, not a list, so a
+# over every .rs file under crates/<dir>/{src,tests,benches} plus the crate's own crates/<dir>/build.rs.
+# The crate set is written as an exclusion, not a list, so a
 # new crate is never silently left out: every directory under crates/ except oxide-ice-unroll (the reproducer outside
 # the workspace). The search is by line, so comments and doc comments that name the words count too; a ratchet only
 # needs to be deterministic.
@@ -17,7 +19,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 export LC_ALL=C
 RATCHET=tools/unsafe-ratchet.txt
-BLOCK='unsafe[[:space:]]*\{|unsafe[[:space:]]+extern[[:space:]]+"[^"]*"[[:space:]]*\{'
+BLOCK='unsafe[[:space:]]*\{|unsafe[[:space:]]+extern([[:space:]]+"[^"]*")?[[:space:]]*\{'
 FN='unsafe[[:space:]]+(extern[[:space:]]+"[^"]*"[[:space:]]+)?fn'
 IMPL='unsafe[[:space:]]+impl'
 
@@ -41,7 +43,8 @@ count() {
   grep -hE -- "$pat" "$@" | wc -l | tr -d '[:space:]' || true
 }
 
-# collect CRATE — every .rs under the crate's three directories, sorted, into rs_files (global).
+# collect CRATE — every .rs under the crate's three directories plus its own build.rs, sorted, into
+# rs_files (global).
 rs_files=()
 collect() {
   rs_files=()
@@ -50,6 +53,11 @@ collect() {
     [ -d "$base" ] || continue
     while IFS= read -r f; do rs_files+=("$f"); done < <(find "$base" -type f -name '*.rs' | sort)
   done
+  # The build script sits at the crate root, outside src/, and is as much the
+  # crate's code as anything under it.
+  if [ -f "crates/$1/build.rs" ]; then
+    rs_files+=("crates/$1/build.rs")
+  fi
 }
 
 # has NAME LIST… — 0 when NAME is in LIST.

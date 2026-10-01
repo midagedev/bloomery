@@ -1,7 +1,8 @@
 # Per-crate unsafe counts, one line per workspace crate: <crate dir> <blocks> <fns> <impls>.
-# blocks counts `unsafe {` lines (and `unsafe extern "…" {` blocks), fns `unsafe fn` lines in every form,
-# impls `unsafe impl` lines, over crates/<dir>/{src,tests,benches} — the counting rule's one owner is
-# tools/check-unsafe.sh. Lower a pin when a crate's count comes down. Raise one only for new code whose
+# blocks counts `unsafe {` lines and `unsafe extern` blocks (quoted ABI or edition-2024 quoteless),
+# fns `unsafe fn` lines in every form, impls `unsafe impl` lines, over crates/<dir>/{src,tests,benches}
+# plus the crate's own crates/<dir>/build.rs — the counting rule's one owner is tools/check-unsafe.sh.
+# Lower a pin when a crate's count comes down. Raise one only for new code whose
 # unsafe the code needs, with a `PIN(YYYY-MM-DD):` line above the crate's line naming it and the block's
 # own `// SAFETY:`; never to let existing code off.
 app 0 0 0
@@ -13,7 +14,11 @@ gguf 9 2 0
 # PIN(2026-10-01): gpu 1356 -> 1363 blocks, 143 -> 144 fns, a new kernel entry, not old code relaxed:
 # q8_0_gemv_sel32 (the Q8_0 down of 32-value blocks for Qwen3.8's card experts, q8_0_sel32.rs) adds its row
 # dot (the one unsafe fn), the dot's three blocks, the entry's three, and its module load, each with its SAFETY line.
-gpu 1363 144 6
+# PIN(2026-10-01): gpu 1363 -> 1364 blocks, new code, not old code relaxed: the DeviceTensor::window
+# overflow gate (tensor.rs tests) calls the unsafe constructor inside its catch_unwind, one block with
+# its SAFETY line. The rule change in the same round (quoteless `unsafe extern {` blocks, build.rs
+# walked) counts 0 new sites in the tree the pin was measured on.
+gpu 1364 144 6
 gpu-deepseek41 459 51 0
 gpu-gates 60 5 1
 gpu-glm5next 4 0 0

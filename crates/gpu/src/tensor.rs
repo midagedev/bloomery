@@ -288,6 +288,11 @@ impl<T: DeviceCopy> DeviceTensor<T> {
     /// that takes a tensor: [`window`] with a shape. Give it back with
     /// [`DeviceTensor::release`].
     ///
+    /// # Panics
+    ///
+    /// Panics when `rows * cols` overflows `usize`: the window's length is
+    /// that product, and a wrapped length must not reach the launches.
+    ///
     /// # Safety
     ///
     /// [`window`]'s contract, for the `rows * cols` `T` at `ptr`.
@@ -297,8 +302,11 @@ impl<T: DeviceCopy> DeviceTensor<T> {
         cols: usize,
         ctx: &Arc<CudaContext>,
     ) -> ManuallyDrop<DeviceTensor<T>> {
+        let len = rows.checked_mul(cols).unwrap_or_else(|| {
+            panic!("DeviceTensor::window: rows {rows} × cols {cols} overflows usize")
+        });
         // SAFETY: the span is the caller's, under `window`'s contract.
-        let buf = unsafe { window::<T>(ptr, rows * cols, ctx) };
+        let buf = unsafe { window::<T>(ptr, len, ctx) };
         ManuallyDrop::new(DeviceTensor {
             buf: ManuallyDrop::into_inner(buf),
             rows,
@@ -521,5 +529,39 @@ impl Q8Act {
     #[must_use]
     pub fn d8(&self) -> &DeviceBuffer<f32> {
         &self.d8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `DeviceTensor::window` panics by name on a product that wraps, before
+    /// the call reaches the driver — but the `ctx` it must be handed exists
+    /// only through `CudaContext::new`, so the test runs on the box.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_window_panics_by_name_when_rows_times_cols_wraps() {
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: the product overflows, so the call panics before `ptr`
+            // or `ctx` is used.
+            unsafe { DeviceTensor::<u32>::window(sys::CUdeviceptr::MAX, usize::MAX, 2, &ctx) };
+        }));
+        let payload = match panicked {
+            Err(payload) => payload,
+            Ok(_) => panic!("the overflow must panic, not wrap"),
+        };
+        let msg = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied());
+        let msg = msg.unwrap_or_default();
+        assert!(
+            msg.contains("DeviceTensor::window")
+                && msg.contains(&format!("rows {}", usize::MAX))
+                && msg.contains("cols 2"),
+            "the panic names the constructor and both values: {msg}"
+        );
     }
 }
