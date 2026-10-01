@@ -26,8 +26,10 @@ A recipe's inputs are:
   - the files of every cargo target it builds or tests: the target's own module tree (`mod`,
     `#[path]`, `include_str!`/`include_bytes!`/`include!`), its package's lib, the libs of its
     workspace dependencies — feature-aware, so an optional dependency counts only when the recipe's
-    `--features` enable it, dev-dependencies only for test targets — each package's Cargo.toml and
-    build script, and repository paths named by a whole string literal (`"../../tools/ref/prompts.tsv"`
+    `--features` enable it, dev-dependencies only for test targets — each package's Cargo.toml (read
+    by table: its shared tables and the recipe's own targets' [[bin]]/[[test]]/[[bench]]/[[example]]
+    entries, so another target's entry selects nothing; `manifest_view`) and build script, and
+    repository paths named by a whole string literal (`"../../tools/ref/prompts.tsv"`
     joined to CARGO_MANIFEST_DIR is read at run time and is in no dep-info). A module declared under
     `#[cfg(test)]` (or `cfg(all(…, test, …))`), and whatever it includes or names, belongs to the test
     builds of its own target — a lib's test target (`--lib` under cargo test, `--tests`,
@@ -625,6 +627,128 @@ class Package:
         return next((t for t in self.targets if t.kind == kind and t.name == name), None)
 
 
+# ---- a package manifest, read by table ----
+#
+# A target's build sees its package manifest's shared tables — everything but the target arrays below:
+# [package], [lib], the dependency tables, [features], [lints], [profile*], [target.*] and any table
+# not named here — and its own entry in one of the target arrays, matched by `name` or by a `path` that
+# resolves to the target's source (an entry that claims another target's file is in that target's view).
+# Another target's entry is not: adding a [[bin]] moves only the recipes that build it. An entry with
+# no string `name`, or a target key that is not an array of tables, stays shared. Selection
+# (`TableReads`) and the ledger key (`KeyContext._parts`) read the view through `manifest_view` alone;
+# a manifest some input reads whole (a script, a path literal, `include_str!`, a `find`, dep-info) is
+# a file for that recipe, never a view (`ManifestUse.whole`).
+TARGET_TABLES = ("bin", "test", "bench", "example")
+Entry = tuple[str, str, str]  # (kind, name, src) of a target whose entry a view keeps
+_TOML_MEMO: dict[tuple[str, int, int], dict] = {}
+
+
+def read_manifest(root: str, rel: str) -> dict:
+    """`rel` parsed with tomllib, memoized on its stat. A manifest that does not parse is a named error,
+    never a fallback to the whole file."""
+    import tomllib
+
+    p = os.path.join(root, rel)
+    st = os.stat(p)
+    k = (p, st.st_size, st.st_mtime_ns)
+    if k not in _TOML_MEMO:
+        with open(p, "rb") as fh:
+            try:
+                _TOML_MEMO[k] = tomllib.load(fh)
+            except tomllib.TOMLDecodeError as err:
+                raise RecipeError(f"{rel} does not parse as TOML ({err}): a package manifest is read by table") from err
+    return _TOML_MEMO[k]
+
+
+def _target_array(key: str, value) -> bool:
+    return key in TARGET_TABLES and isinstance(value, list) and all(isinstance(e, dict) for e in value)
+
+
+def _keeps(e: dict, kind: str, pkg_dir: str, wants: frozenset[Entry] | None) -> bool:
+    """Whether a view of `wants` (None: every entry) keeps target-array entry `e` of `kind`."""
+    name = e.get("name")
+    if wants is None or not isinstance(name, str):
+        return True
+    path = e.get("path")
+    src = os.path.normpath(os.path.join(pkg_dir, path)) if isinstance(path, str) else None
+    return any((k == kind and n == name) or src == s for k, n, s in wants)
+
+
+def canon(value) -> str:
+    return json.dumps(value, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def manifest_view(doc: dict, pkg_dir: str, wants: frozenset[Entry] | None) -> dict:
+    """The tables of `doc` a build of the targets `wants` sees (None: the whole document): the shared
+    tables, and of each target array the entries it keeps, in canonical order (an array's order is not
+    an input)."""
+    out = {k: v for k, v in doc.items() if not _target_array(k, v)}
+    for k in TARGET_TABLES:
+        v = doc.get(k)
+        if _target_array(k, v):
+            kept = sorted((e for e in v if _keeps(e, k, pkg_dir, wants)), key=canon)
+            if kept:
+                out[k] = kept
+    return out
+
+
+def _by_name(entries: list[dict] | None) -> dict[str, str]:
+    """A target array's entries by name ("" for the nameless), each name's entries in canonical form."""
+    acc: dict[str, list[str]] = {}
+    for e in entries or []:
+        n = e.get("name")
+        acc.setdefault(n if isinstance(n, str) else "", []).append(canon(e))
+    return {n: canon(sorted(es)) for n, es in acc.items()}
+
+
+def view_moves(da: dict | None, db: dict | None, pkg_dir: str, wants: frozenset[Entry] | None) -> list[tuple[str, bool]]:
+    """What moved between two parses of a manifest in the view of `wants`, one (label, own) per table or
+    entry — `[features]`, `[[bin]] x (added)` — where `own` is a named entry of a target array, not a shared
+    table. Empty when the view did not move; a side with no file is the whole file."""
+    if da is None or db is None:
+        return [("the whole file (" + ("added" if da is None else "removed") + ")", False)] if da is not db else []
+    va, vb = manifest_view(da, pkg_dir, wants), manifest_view(db, pkg_dir, wants)
+    out: list[tuple[str, bool]] = []
+    for k in sorted(set(va) | set(vb)):
+        x, y = va.get(k), vb.get(k)
+        if canon(x) == canon(y):
+            continue
+        if k in TARGET_TABLES and all(v is None or _target_array(k, v) for v in (x, y)):
+            nx, ny = _by_name(x), _by_name(y)
+            before = len(out)
+            for n in sorted(set(nx) | set(ny)):
+                if nx.get(n) == ny.get(n):
+                    continue
+                how = " (added)" if n not in nx else " (removed)" if n not in ny else ""
+                out.append((f"[[{k}]] {n}{how}", True) if n else (f"[[{k}]] an entry with no name{how}", False))
+            if len(out) == before:
+                out.append((f"[[{k}]]", False))
+        else:
+            out.append((f"[{k}]", False))
+    return out
+
+
+@dataclass
+class ManifestUse:
+    """How a recipe's targets read the package manifests of their closure: `views` maps a manifest to
+    the entries its view keeps (empty: a dependent's view, the shared tables alone), and `whole` holds
+    the manifests some input reads as a file."""
+
+    views: dict[str, set[Entry]] = field(default_factory=dict)
+    whole: set[str] = field(default_factory=set)
+
+    def merge(self, other: "ManifestUse") -> None:
+        for m, es in other.views.items():
+            self.views.setdefault(m, set()).update(es)
+        self.whole |= other.whole
+
+    def entries(self, rel: str) -> frozenset[Entry] | None:
+        """The entries of `rel`'s view; None when the recipe reads `rel` whole, or not at all."""
+        if rel in self.whole or rel not in self.views:
+            return None
+        return frozenset(self.views[rel])
+
+
 def cargo_metadata(root: str) -> dict:
     if shutil.which("cargo") is None:
         raise RecipeError("`cargo` is not on PATH — recipes.py reads the workspace through `cargo metadata`")
@@ -703,6 +827,7 @@ class Tree:
                 deps=deps,
                 targets=targets,
             )
+        self.manifest_paths = {p.manifest for p in self.packages.values()}
         self._walk_cache: dict[str, ModuleTree] = {}
         self.unresolved: list[str] = []
         self.depinfo: dict[str, tuple[set[str], float]] = {}  # bin name -> (files, mtime)
@@ -885,8 +1010,15 @@ class Tree:
 
     def lib_files(self, name: str) -> dict[str, str]:
         """The files a dependent sees of package `name`: its lib tree, manifest and build script."""
+        out: dict[str, str] = {self.packages[name].manifest: f"{name} Cargo.toml"}
+        for f, why in self._lib_reads(name).items():
+            out.setdefault(f, why)
+        return out
+
+    def _lib_reads(self, name: str) -> dict[str, str]:
+        """lib_files but the manifest: what package `name`'s lib and build script read as files."""
         pkg = self.packages[name]
-        out: dict[str, str] = {pkg.manifest: f"{name} Cargo.toml"}
+        out: dict[str, str] = {}
         lib = pkg.lib()
         if lib is not None:
             files, lits = self.tree_of(lib.src)
@@ -942,11 +1074,13 @@ class Tree:
                 stack.append((d.pkg, d.features, d.default, f"{why} -> {d.pkg}"))
         return seen
 
-    def target_files(self, pkg_name: str, kind: str, name: str | None, features: list[str], default: bool = True, all_features: bool = False) -> dict[str, str]:
+    def target_files(self, pkg_name: str, kind: str, name: str | None, features: list[str], default: bool = True, all_features: bool = False, use: ManifestUse | None = None) -> dict[str, str]:
         """file -> origin for one target. kind: lib bin test example bench doctest libtest. The
         target's own test-only modules count for every kind but `lib` and `doctest` (rustdoc sets no
         cfg(test)); for a bin or an example that is also its plain build, an over-selection confined to
-        its own recipes. Every lib it links, its own package's included, is seen without them."""
+        its own recipes. Every lib it links, its own package's included, is seen without them. `use`,
+        when given, gains how the target reads each manifest of its closure: by table — its own entry in
+        its package's, the shared tables of every other — or whole, when a file walk reaches one."""
         pkg = self.packages[pkg_name]
         out: dict[str, str] = {}
         dev = kind in ("test", "bench", "doctest", "libtest", "example")
@@ -965,15 +1099,26 @@ class Tree:
             out.setdefault(f, f"{pkg_name} {label} (path literal)")
         for f, why in self.lib_files(pkg_name).items():
             out.setdefault(f, why)
-        for dep, why in self.closure(pkg, features, dev, default, all_features).items():
+        linked = self.closure(pkg, features, dev, default, all_features)
+        for dep, why in linked.items():
             for f, fwhy in self.lib_files(dep).items():
                 out.setdefault(f, f"{fwhy} ({why})")
+        read: set[str] = set(files) | set(self._resolve_literals(pkg, lits))
         if kind == "bin" and name in self.depinfo:
             dfiles, _ = self.depinfo[name]
             if own.src in dfiles:
+                read |= dfiles
                 for f in dfiles:
                     if f not in out and (self.exists(f)):
                         out[f] = f"dep-info of {name}"
+        if use is not None:
+            mine = use.views.setdefault(pkg.manifest, set())
+            if kind in TARGET_TABLES:
+                mine.add((kind, own.name, own.src))
+            for q in [pkg_name, *linked]:
+                use.views.setdefault(self.packages[q].manifest, set())
+                read |= set(self._lib_reads(q))
+            use.whole |= read & self.manifest_paths
         return out
 
     # ---------------- invocation -> targets ----------------
@@ -1087,6 +1232,7 @@ class RecipeInputs:
     targets: list[tuple[str, str, str | None, list[str]]]
     errors: list[str]
     commands: RecipeCommands
+    manifests: ManifestUse = field(default_factory=ManifestUse)  # how the targets read their package manifests
 
     def match(self, path: str) -> str | None:
         if path in self.files:
@@ -1152,13 +1298,14 @@ class Graph:
         files: dict[str, str] = {}
         prefixes: dict[str, str] = {}
         targets: list[tuple[str, str, str | None, list[str]]] = []
+        use = ManifestUse()
         for inv in rc.invocations:
             tl, errs = self.tree.resolve(inv)
             errors.extend(errs)
             for pname, kind, tname, feats in tl:
                 targets.append((pname, kind, tname, feats))
                 label = f"{kind} {tname}" if tname else kind
-                for f, why in self.tree.target_files(pname, kind, tname, feats, not inv.no_default, inv.all_features).items():
+                for f, why in self.tree.target_files(pname, kind, tname, feats, not inv.no_default, inv.all_features, use).items():
                     if f.endswith("/"):
                         prefixes.setdefault(f, f"{label} <- {why}")
                     else:
@@ -1180,6 +1327,8 @@ class Graph:
                         prefixes.setdefault(f, why)
                     else:
                         files.setdefault(f, why)
+                        if f in self.tree.manifest_paths:
+                            use.whole.add(f)
             elif self.tree.isdir(s):
                 prefixes.setdefault(s.rstrip("/") + "/", "named directory")
             elif s in rc.scripts or s.endswith(_SCRIPT_EXT):
@@ -1194,13 +1343,16 @@ class Graph:
                 files.setdefault(f, f"{why} (via {dep})")
             for p, why in di.prefixes.items():
                 prefixes.setdefault(p, f"{why} (via {dep})")
+            use.merge(di.manifests)
             built |= {t for (_, k, t, _) in di.targets if k == "bin"}
         for b in rc.runs:
             if "{{" in b or b.startswith("$"):
                 continue
             if b not in built:
                 errors.append(f"runs target/release/{b}, which the recipe does not build")
-        ri = RecipeInputs(files, prefixes, targets, errors, rc)
+        # a manifest that is a cargo global, or lies under a directory a script walks, is read whole
+        use.whole |= {m for m in self.tree.manifest_paths if m in CARGO_GLOBALS or any(m.startswith(p) for p in prefixes)}
+        ri = RecipeInputs(files, prefixes, targets, errors, rc, use)
         self._inputs[name] = ri
         return ri
 
@@ -1331,12 +1483,90 @@ class Selection:
     why: str
 
 
-def select(changed: list[str], a: Side | None, b: Side, prefix: str) -> tuple[list[Selection], list[str], list[str]]:
-    """(selections in justfile order, unmapped files, notes)."""
+class TableReads:
+    """The package manifests of one diff, each parsed on both sides, and what moved in each recipe's view
+    of them (manifest_view). One reader for every place a changed file picks recipes (select, narrow); the
+    key reads the same view. `hit` records each answer, which `lines` prints."""
+
+    def __init__(self, changed: list[str], a: Side | None, b: Side):
+        self.a, self.b = a, b
+        self.docs: dict[str, tuple[dict | None, dict | None]] = {}
+        for f in changed:
+            if a is not None and (f in b.tree.manifest_paths or f in a.tree.manifest_paths):
+                self.docs[f] = (self._doc(a, f), self._doc(b, f))
+        self.seen: dict[str, dict[str, list[tuple[str, bool]] | None]] = {f: {} for f in self.docs}
+
+    @staticmethod
+    def _doc(side: Side, f: str) -> dict | None:
+        return read_manifest(side.tree.root, f) if side.tree.exists(f) else None
+
+    def moves(self, n: str, f: str) -> list[tuple[str, bool]] | None:
+        """What moved in recipe `n`'s view of manifest `f`, its own entries taken from both sides (an entry
+        renamed, or a target a required-features edit lets in or out of a `--bins`, is in one side's list);
+        None when `f` is not a manifest of the diff or `n` reads it whole on either side (the file rule)."""
+        if f not in self.docs:
+            return None
+        wants: set[Entry] = set()
+        read = False
+        for side in (self.a, self.b):
+            if side is None or n not in side.recipes:
+                continue
+            mu = side.graph.inputs(n).manifests
+            if f in mu.whole:
+                self.seen[f][n] = None
+                return None
+            if f in mu.views:
+                read = True
+                wants |= mu.views[f]
+        if not read:
+            return None
+        da, db = self.docs[f]
+        mv = view_moves(da, db, os.path.dirname(f), frozenset(wants))
+        self.seen[f][n] = mv
+        return mv
+
+    def hit(self, n: str, f: str, side: Side) -> tuple[str | None, bool | None]:
+        """(why recipe `n` reads changed file `f` on `side`, with what moved in its view — None when it does
+        not read it or its view did not move; whether every move is an entry of its own targets — None when
+        `f` is read as a file). A manifest of the diff is read on A too: a recipe whose B build no longer
+        reaches it (a renamed entry, a target a required-features edit leaves out) read it before."""
+        why = side.graph.inputs(n).match(f)
+        if why is None and f in self.docs and self.a is not None and n in self.a.recipes:
+            why = self.a.graph.inputs(n).match(f)
+        if why is None:
+            return None, None
+        mv = self.moves(n, f)
+        if mv is None:
+            return why, None
+        if not mv:
+            return None, None
+        return f"{why}: {', '.join(m for m, _ in mv)}", all(own for _, own in mv)
+
+    def lines(self) -> list[str]:
+        """The debugging block of `affected`: per manifest, what changed by table and the recipes each change
+        selects, then the recipes that read it whole."""
+        out = []
+        for f, (da, db) in self.docs.items():
+            seen = self.seen[f]
+            by_table = {n: mv for n, mv in seen.items() if mv is not None}
+            whole = sorted(n for n, mv in seen.items() if mv is None)
+            out.append(f"  {f}: {len(by_table)} recipes read it by table, {len(whole)} whole")
+            for label, _ in view_moves(da, db, os.path.dirname(f), None) or [("nothing (comments or layout only)", False)]:
+                sel = [n for n, mv in by_table.items() if any(m == label for m, _ in mv)]
+                every = len(sel) == len(by_table) and len(sel) > 3
+                out.append(f"    {label} -> " + (f"every reader ({len(sel)})" if every else " ".join(sel) if sel else "no recipe"))
+            if whole:
+                out.append("    read whole -> " + " ".join(whole))
+        return out
+
+
+def select(changed: list[str], a: Side | None, b: Side, prefix: str, tables: TableReads | None = None) -> tuple[list[Selection], list[str], list[str]]:
+    """(selections in justfile order, unmapped files, notes). A manifest is read by table (`TableReads`)."""
     names = [n for n in sorted(b.recipes, key=lambda n: b.recipes[n].line) if n.startswith(prefix)]
     hits: dict[str, list[tuple[str, str]]] = {n: [] for n in names}
     mapped: set[str] = set()
     notes: list[str] = []
+    tables = tables if tables is not None else TableReads(changed, a, b)
     for f in changed:
         if f == "justfile":
             continue
@@ -1344,7 +1574,7 @@ def select(changed: list[str], a: Side | None, b: Side, prefix: str) -> tuple[li
         for n in names:
             if n not in side.recipes:
                 continue
-            why = side.graph.inputs(n).match(f)
+            why, _ = tables.hit(n, f, side)
             if why is not None:
                 hits[n].append((f, why))
                 mapped.add(f)
@@ -1364,7 +1594,12 @@ def select(changed: list[str], a: Side | None, b: Side, prefix: str) -> tuple[li
         if f in mapped:
             continue
         side = b if b.tree.exists(f) or a is None else a
-        hint = "no gate-* recipe text changed" if f == "justfile" else orphan_hint(side, f)
+        if f == "justfile":
+            hint = "no gate-* recipe text changed"
+        elif any(mv is not None for mv in tables.seen.get(f, {}).values()):
+            hint = "read by table: no recipe's view of it moved (manifests:)"
+        else:
+            hint = orphan_hint(side, f)
         unmapped.append(f + (f"  ({hint})" if hint else ""))
     return sels, unmapped, notes
 
@@ -1431,7 +1666,8 @@ def cmd_affected(args: argparse.Namespace) -> int:
             notes += attach_depinfo(b.tree, entries)
             if a is not None:
                 attach_depinfo(a.tree, entries)
-        sels, unmapped, more = select(changed, a, b, prefix)
+        tables = TableReads(changed, a, b)
+        sels, unmapped, more = select(changed, a, b, prefix, tables)
         notes += more
         trows, tnote = trigger_rows(b)
         if tnote:
@@ -1443,7 +1679,7 @@ def cmd_affected(args: argparse.Namespace) -> int:
         weekly = f", {len(trig)} of {n_weekly} weekly-recipes by a trigger" if prefix == GATE_PREFIX else ""
         total = sum(1 for n in b.recipes if n.startswith(prefix))
         rng = f"{a_rev[:9]}..{b_rev[:9]}" if b_rev else f"{a_rev[:9]}..(working tree)"
-        nar = narrow(changed, a, b, scans, rows) if args.narrow else None
+        nar = narrow(changed, a, b, scans, rows, tables) if args.narrow else None
         narrowed = nar is not None and not nar.full
         if narrowed:
             print(f"affected: {rng} — {len(changed)} changed files, {len(nar.picks)} of {total} {prefix or ''}recipes selected "
@@ -1480,6 +1716,10 @@ def cmd_affected(args: argparse.Namespace) -> int:
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
             print(f"  {u}")
+        if tables.docs:
+            print(f"manifests ({len(tables.docs)}), read by table:")
+            for line in tables.lines():
+                print(line)
         if not args.no_box:
             di = b.tree.depinfo
             if di:
@@ -2122,7 +2362,7 @@ class Narrowed:
     verdicts: list[ScanVerdict]
 
 
-def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLog, ScanLog]], rows: list[PathRow]) -> Narrowed:
+def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLog, ScanLog]], rows: list[PathRow], tables: TableReads | None = None) -> Narrowed:
     gates = [n for n in sorted(b.recipes, key=lambda n: b.recipes[n].line) if n.startswith(GATE_PREFIX)]
     res = Narrowed([], {}, [], [])
     if not scans:
@@ -2134,6 +2374,7 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
             res.full.append(f"ptx-scan {v.line()}")
     covered = {bd for v in res.verdicts for bd in v.bundles}
     picks: dict[str, str] = {}
+    tables = tables if tables is not None else TableReads(changed, a, b)
 
     def pick(n: str, why: str) -> None:
         if n in b.recipes:
@@ -2152,9 +2393,10 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
         for n in gates:
             if n not in side.recipes:
                 continue
-            w = side.graph.inputs(n).match(f)
+            # a manifest read by table: a move of the recipe's own entries alone is its own target's
+            w, own_entry = tables.hit(n, f, side)
             if w is not None:
-                (own if _own_origin(w) else dep).append((n, w))
+                (own if (own_entry if own_entry is not None else _own_origin(w)) else dep).append((n, w))
         for n, w in own:
             pick(n, f"{f} [{w}]")
         hit_rows = [r for r in rows if r.pattern.match(f) and r.gates()]
@@ -2176,8 +2418,11 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
             rule.append("no row")
         elif not own:
             rule.append("no gate reads it")
+        # a manifest whose diff moved only named entries changes no kernel: the bins whose entries moved
+        # are picked above as their own targets
+        entries_only = f in tables.docs and all(own for _, own in view_moves(*tables.docs[f], os.path.dirname(f), None))
         for c in carriers:
-            if f in c.files and (c.bundle is None or c.bundle not in covered):
+            if f in c.files and not entries_only and (c.bundle is None or c.bundle not in covered):
                 for n in c.recipes:
                     pick(n, f"{f} [{c.label}: kernels no scan pair covers]")
                 rule.append(f"{c.label} not scanned -> {len(c.recipes)} recipes")
@@ -3338,6 +3583,9 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #             or `tree`, every file tools/box.sh ships, with the reason: a command run on the Mac, a
 #             cargo subcommand the parser does not model (`cargo fmt`), a script that walks the tree
 #   file      path relative to the tree, content sha256 (a link: its target)
+#   manifest  a package manifest the closure reads by table: path, sha256 of the item's view of it
+#             (manifest_view: the shared tables and its own targets' entries, canonical JSON — a comment
+#             or another target's entry does not move it); one read whole is a `file` part
 #   global    Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/*, the cuda-oxide pin rev
 #   item      ARGS, the item's full BLOOMERY_BOX_ENV (the caller's, then the item's, then the lane's
 #             card), the card that env forces
@@ -3632,6 +3880,11 @@ class KeyContext:
             self._sha[rel] = sha256_file(p)
         return f"file\t{rel}\t{self._sha[rel]}"
 
+    def view_part(self, rel: str, wants: frozenset[Entry]) -> str:
+        """The part of a manifest read by table: the sha256 of the item's view of it."""
+        view = manifest_view(read_manifest(self.side.tree.root, rel), os.path.dirname(rel), wants)
+        return f"manifest\t{rel}\t{sha256_text(canon(view))}"
+
     def literal_dirs(self, rel: str) -> frozenset[str]:
         if rel not in self._lit:
             self._lit[rel] = file_model_literal_dirs(os.path.join(self.side.tree.root, rel)) if scans_for_models(rel) else frozenset()
@@ -3838,10 +4091,15 @@ class KeyContext:
                 if u.split(": ", 1)[0] in files:
                     return [], f"source walk: {u}", None, ""
         for rel in sorted(files):
+            # a package manifest the closure reads by table is keyed on that view (manifest_view, the reader
+            # selection uses); one read whole, named by the item, or in a tree-scoped key, on its bytes
+            wants = ri.manifests.entries(rel) if scope == "closure" and rel not in named else None
             try:
-                parts.append(self.file_part(rel))
+                parts.append(self.file_part(rel) if wants is None else self.view_part(rel, wants))
             except OSError as err:
                 return [], f"cannot read {rel}: {err.strerror}", None, ""
+            except RecipeError as err:
+                return [], str(err), None, ""
         parts += self.globals()
         card = "none"
         for e in eff:
@@ -4297,6 +4555,147 @@ def side_at(root: str, meta: dict) -> Side:
     tree = Tree(root, meta)
     recipes = load_justfile(os.path.join(tree.root, "justfile"))
     return Side(tree, recipes, Graph(tree, recipes))
+
+
+def manifest_self_test(expect) -> None:
+    """A package manifest read by table, on a synthetic workspace (package g: a lib and bins x, y, v; user: a
+    bin linking g; a script that reads g's manifest whole). Each change gives the recipes it must select and
+    the ledger keys must move on exactly those: the failure modes the rule must not create (the own entry's
+    required-features, a --bins list it flips, [features], a renamed path, a renamed entry, an entry whose
+    path claims a target's file) and the saving (another target's entry, a comment, entry order); a manifest
+    that does not parse is a named error in both."""
+    import tomllib
+
+    base = (
+        '[package]\nname = "g"\nversion = "0.1.0"\n\n[features]\nfy = []\n\n'
+        '[[bin]]\nname = "x"\npath = "src/bin/x.rs"\n\n'
+        '[[bin]]\nname = "y"\npath = "src/bin/y.rs"\nrequired-features = ["fy"]\n\n'
+        '[[bin]]\nname = "v"\npath = "src/bin/v.rs"\n'
+    )
+    just = (
+        "gate-x:\n    ./tools/box.sh 'cargo build -p g --bin x'\n"
+        "gate-y:\n    ./tools/box.sh 'cargo build -p g --features fy --bin y'\n"
+        "gate-bins:\n    ./tools/box.sh 'cargo build -p g --features fy --bins'\n"
+        "gate-plain:\n    ./tools/box.sh 'cargo build -p g --bins'\n"
+        "gate-lib:\n    ./tools/box.sh 'cargo test -p g --lib'\n"
+        "gate-user:\n    ./tools/box.sh 'cargo build -p user --bin user'\n"
+        "gate-whole:\n    ./tools/box.sh 'cargo build -p g --lib && bash tools/s.sh'\n"
+    )
+    every = {"gate-x", "gate-y", "gate-bins", "gate-plain", "gate-lib", "gate-user", "gate-whole"}
+    with tempfile.TemporaryDirectory(prefix="recipes-tables-") as tmp:
+        mf = os.path.join(tmp, "box-manifest.txt")
+        with open(mf, "w", encoding="utf-8") as fh:
+            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\n# end\n")
+        made: list[str] = []
+
+        def build(g_toml: str, justfile: str = just, meta_toml: str | None = None) -> Side:
+            root = os.path.join(tmp, f"t{len(made)}")
+            made.append(root)
+            doc = tomllib.loads(meta_toml if meta_toml is not None else g_toml)
+            files = {
+                "crates/g/Cargo.toml": g_toml,
+                "crates/g/src/lib.rs": "",
+                "crates/user/Cargo.toml": '[package]\nname = "user"\nversion = "0.1.0"\n\n[dependencies]\ng = { path = "../g" }\n',
+                "crates/user/src/main.rs": "fn main() {}\n",
+                "tools/s.sh": 'cat "$ROOT/crates/g/Cargo.toml"\n',
+                "justfile": justfile,
+            }
+            for f in BOX_GLOBALS + [f"tools/ref/models/{DEFAULT_PROFILE}.sh"]:
+                files[f] = ""
+            for e in doc.get("bin", []):
+                files.setdefault("crates/g/" + e["path"], "#[kernel]\nfn k() {}\nfn main() {}\n" if e["name"] == "x" else "fn main() {}\n")
+            for rel, text in files.items():
+                os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+                with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            g_targets = [{"kind": ["lib"], "name": "g", "src_path": os.path.join(root, "crates/g/src/lib.rs")}]
+            g_targets += [
+                {"kind": ["bin"], "name": e["name"], "src_path": os.path.join(root, "crates/g", e["path"]), "required-features": e.get("required-features", [])}
+                for e in doc.get("bin", [])
+            ]
+            meta = {
+                "workspace_root": root,
+                "workspace_members": ["g", "user"],
+                "packages": [
+                    {"id": "g", "name": "g", "manifest_path": os.path.join(root, "crates/g/Cargo.toml"), "features": {k: list(v) for k, v in doc.get("features", {}).items()},
+                     "dependencies": [], "targets": g_targets},
+                    {"id": "user", "name": "user", "manifest_path": os.path.join(root, "crates/user/Cargo.toml"), "features": {},
+                     "dependencies": [{"name": "g", "kind": None, "optional": False, "features": [], "uses_default_features": True}],
+                     "targets": [{"kind": ["bin"], "name": "user", "src_path": os.path.join(root, "crates/user/src/main.rs")}]},
+                ],
+            }
+            return side_at(root, meta)
+
+        def keys(side: Side) -> dict[str, str]:
+            ctx = KeyContext(side, mf, environ={})
+            out = {}
+            for n in sorted(every | {"gate-x2"}):
+                parts, err, _, _ = ctx.parts(n)
+                out[n] = item_key(parts) if err is None else "error: " + err
+            return out
+
+        a = build(base)
+        ka = keys(a)
+        expect(not any(v.startswith("error") for k, v in ka.items() if k != "gate-x2"), f"tables: base keys {ka}")
+        expect(keys(build(base)) == ka, "tables: the same manifest in a second tree gave other keys")
+        bin_z = '\n[[bin]]\nname = "z"\npath = "src/bin/z.rs"\n'
+        x_entry = '[[bin]]\nname = "x"\npath = "src/bin/x.rs"\n'
+        y_entry = '[[bin]]\nname = "y"\npath = "src/bin/y.rs"\nrequired-features = ["fy"]\n'
+        cases = [
+            ("another target's new entry", base + bin_z, just, {"gate-bins", "gate-plain", "gate-whole"}),
+            ("another target's entry edited", base.replace(x_entry, x_entry + "doc = false\n"), just, {"gate-x", "gate-bins", "gate-plain", "gate-whole"}),
+            ("its own required-features", base.replace('required-features = ["fy"]', "required-features = []"), just, {"gate-y", "gate-bins", "gate-plain", "gate-whole"}),
+            # x leaves gate-plain's --bins list (it lacks fy; v stays) and gate-x's build: only A's lists hold x
+            ("required-features that flips a --bins list", base.replace(x_entry, x_entry + 'required-features = ["fy"]\n'), just,
+             {"gate-x", "gate-bins", "gate-plain", "gate-whole"}),
+            ("[features]", base.replace("fy = []", "fy = []\nfz = []"), just, every),
+            ("a renamed path", base.replace('"src/bin/y.rs"', '"src/bin/y2.rs"'), just, {"gate-y", "gate-bins", "gate-whole"}),
+            # gate-x still names x (its B build is refused by name); gate-x2 is the new name's recipe
+            ("a renamed entry", base.replace('name = "x"', 'name = "x2"').replace('"src/bin/x.rs"', '"src/bin/x2.rs"'),
+             just + "gate-x2:\n    ./tools/box.sh 'cargo build -p g --bin x2'\n", {"gate-x", "gate-x2", "gate-bins", "gate-plain", "gate-whole"}),
+            ("an entry whose path claims x's file", base + '\n[[bin]]\nname = "w"\npath = "src/bin/x.rs"\n', just, {"gate-x", "gate-bins", "gate-plain", "gate-whole"}),
+            ("a comment", base + "# a comment\n", just, {"gate-whole"}),
+            ("the entries' order", base.replace(x_entry + "\n" + y_entry, y_entry + "\n" + x_entry), just, {"gate-whole"}),
+        ]
+        for what, g_toml, justfile, want in cases:
+            b = build(g_toml, justfile)
+            sels, unmapped, _ = select(["crates/g/Cargo.toml"], a, b, GATE_PREFIX)
+            got = {x.recipe for x in sels}
+            expect(got == want, f"tables: {what} selects {sorted(got)}, not {sorted(want)}")
+            kb = keys(b)
+            moved = {n for n in kb if kb[n] != ka[n]}
+            expect(moved == want, f"tables: {what} moves the keys of {sorted(moved)}, not {sorted(want)} (the key reads the view selection reads)")
+        # a manifest no recipe's view of which moved is printed under unmapped, never dropped
+        quiet = just.replace("gate-whole:\n    ./tools/box.sh 'cargo build -p g --lib && bash tools/s.sh'\n", "")
+        sels, unmapped, _ = select(["crates/g/Cargo.toml"], build(base, quiet), build(base + "# a comment\n", quiet), GATE_PREFIX)
+        expect(not sels and len(unmapped) == 1 and "read by table" in unmapped[0], f"tables: a comment-only manifest edit gives {[x.recipe for x in sels]}, unmapped {unmapped}")
+        # --narrow on an entries-only diff with an identical scan pair: the recipes whose own entries moved are
+        # own picks (not a dependency read that would print the full list), and bin x's kernels, which no scan
+        # covers, pick nothing: a new entry changes no kernel
+        lines = ["ptx-scan: mod1 bundle=bloomery-gpu bytes=100",
+                 "ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 modules=1 "
+                 "jit-card=NVIDIA_RTX_A6000 jit-cuda=13.4",
+                 "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local",
+                 f"{'alpha':<24} 256 no 0 0 0 0 12 0 0 6 12 0", "ptx-scan-md5: method=decl1", f"alpha {'1' * 32} 41"]
+        log = os.path.join(tmp, "scan.log")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        pair = (read_scan(log), read_scan(log))
+        na, nb = build(base, quiet), build(base + bin_z, quiet)
+        nar = narrow(["crates/g/Cargo.toml"], na, nb, [pair], [])
+        expect(not nar.full and set(nar.picks) == {"gate-bins", "gate-plain"},
+               f"tables: --narrow on a new entry gives full {nar.full}, picks {sorted(nar.picks)} (want gate-bins gate-plain)")
+        # a manifest that does not parse: a named error in selection and in the key, never the whole file
+        broken = build(base + "[[bin]\n", meta_toml=base)
+        try:
+            select(["crates/g/Cargo.toml"], a, broken, GATE_PREFIX)
+            fails = "accepted"
+        except RecipeError as err:
+            fails = str(err)
+        expect("crates/g/Cargo.toml does not parse as TOML" in fails, f"tables: a manifest that does not parse, in selection: {fails}")
+        kb = keys(broken)
+        expect(all(kb[n].startswith("error: crates/g/Cargo.toml does not parse as TOML") for n in every - {"gate-whole"}),
+               f"tables: a manifest that does not parse, in the key: {kb}")
 
 
 def key_self_test(expect, real: Side) -> None:
@@ -5472,6 +5871,9 @@ def self_test() -> int:
 
     # affected --narrow
     narrow_self_test(expect, side)
+
+    # a package manifest read by table
+    manifest_self_test(expect)
 
     # the green ledger's key
     key_self_test(expect, side)

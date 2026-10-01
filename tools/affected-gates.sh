@@ -15,7 +15,10 @@
 # bloomery-gpu (bloomery-gpu-gates -> bloomery-gpu)`), a `recipes:` line to paste, the `always:` static
 # checks, the changed files no gate reads under `unmapped:` (a source file some target reads but no
 # gate-* recipe builds is named there — a gate binary without a recipe shows up), and notes: how old
-# each selected bin's dep-info is, and which selected bins have none.
+# each selected bin's dep-info is, and which selected bins have none. A package manifest is read by table
+# (its shared tables and the recipe's own target entries: a new [[bin]] selects the recipes that build it,
+# not every reader of the file); the `manifests:` block prints, per changed manifest, what changed by table
+# and the recipes each change selects, and the recipes that read it whole.
 #
 # The mapping (tools/recipes.py, shared with tools/check-recipes.sh) is the crate graph, feature-aware,
 # plus the module tree of each target, the scripts the recipe names, box.sh's profile files and the
