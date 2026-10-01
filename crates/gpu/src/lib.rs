@@ -56,6 +56,7 @@ pub mod mtp;
 pub mod mxfp4;
 pub mod ple;
 pub mod probe;
+pub mod prompt_timing;
 pub mod q38;
 pub mod q4k_sel;
 pub mod q5;

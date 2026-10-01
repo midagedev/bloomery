@@ -90,8 +90,8 @@ use super::scratch38::{
 use super::swap38::{DEADLINE, LIVE_DELAY, Qwen38Stacks};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
-    Gemm38, Prompt38Stats, STREAM_FLOOR, Stream38, Wide38, WideForce, WideParts, WideTaps,
-    WideTiming, dense_rows, nanos, route_taps_host,
+    Gemm38, STREAM_FLOOR, Stream38, Wide38, WideForce, WideParts, WideTaps, dense_rows,
+    route_taps_host,
 };
 use crate::checkpoint::Checkpoints;
 use crate::checkpoint::saved::{Identity, Lent, SeqState, Spans};
@@ -104,6 +104,7 @@ use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::{BatchLeg, PassKind, StepLeg};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::model::{ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows};
+use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::WindowMut;
 use crate::weights::Weights;
@@ -534,7 +535,7 @@ pub struct Body38 {
     /// The ubatch walk's timing, when a caller armed it
     /// ([`GpuModel::set_prompt38_stats`]); unarmed, the walk records and
     /// waits for nothing.
-    wide_timing: Option<WideTiming>,
+    wide_timing: Option<PromptTiming>,
     /// The prompt call's host streaming (`BLOOMERY_HOSTSTREAM`): off until
     /// a caller sets it ([`Body38::set_hoststream`]).
     stream: Stream38,
@@ -2213,7 +2214,7 @@ impl GpuModel<Body38> {
     pub fn set_prompt38_stats(&mut self, on: bool) -> Result<(), GpuError> {
         let (gpu, _, body) = self.body_parts("qwen4exp set_prompt38_stats")?;
         body.wide_timing = if on {
-            Some(WideTiming::new(gpu.context(), body.plans.len())?)
+            Some(PromptTiming::new(gpu.context(), body.plans.len(), 1)?)
         } else {
             None
         };
@@ -2223,9 +2224,9 @@ impl GpuModel<Body38> {
     /// The prompt's ubatch-walk stats, taken — the next prompt starts clean.
     /// `Ok(None)` with the timing unarmed or no ubatch walked (a prompt by
     /// steps or passes keeps none).
-    pub fn take_prompt38_stats(&mut self) -> Result<Option<Prompt38Stats>, GpuError> {
+    pub fn take_prompt38_stats(&mut self) -> Result<Option<PromptStats>, GpuError> {
         let (_, _, body) = self.body_parts("qwen4exp take_prompt38_stats")?;
-        Ok(body.wide_timing.as_mut().and_then(WideTiming::take))
+        Ok(body.wide_timing.as_mut().and_then(PromptTiming::take))
     }
 
     /// Feed `tokens` from where the model stands by `path` and return the

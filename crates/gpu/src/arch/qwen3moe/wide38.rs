@@ -85,27 +85,26 @@ use crate::gemm::{
 };
 use crate::hc_gated::{Before, HcWideScratch, SiteWeights, WideMixArgs};
 use crate::head::Head;
+use crate::host::BatchLeg;
 use crate::host::handoff::Places;
 use crate::host::run::HostRun;
 use crate::host::swap::{CallPick, CallReport};
-use crate::host::{BatchLeg, LegTimer, ServeNote};
 use crate::linear::conv::ConvArgs;
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
+use crate::prompt_timing::Mark;
 use crate::q38::{
     CardAccArgs, CardSharedAddArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, SharedAddArgs,
 };
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
 use crate::tensor::DeviceTensor;
-use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
 use runtime::hc_gated::Geometry;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// What the walk's errors name.
 const WHAT: &str = "qwen4exp ubatch walk";
@@ -1423,7 +1422,7 @@ impl<'a> Gemm38<'a> {
             port: PortKind::Batch,
         };
         let layers = self.p.plans.len();
-        leg.begin_walk();
+        leg.begin_walk(1)?;
         sched::walk(o, layers, leg, self)?;
         leg.end_walk()?;
         if let Some(t) = self.p.x.taps.as_mut() {
@@ -1512,11 +1511,11 @@ impl<'a> LayerProgram for Gemm38<'a> {
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let enq = port.part_start();
-        port.mark(l, Mark::Front as usize)?;
+        port.mark(at, Mark::Front as usize)?;
         self.p.front(l)?;
         self.p.ffn_mix(l)?;
         self.p.route(l)?;
-        port.mark(l, Mark::FrontEnd as usize)?;
+        port.mark(at, Mark::FrontEnd as usize)?;
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
         let r = port.hybrid().enqueue_download_pitched(
@@ -1526,8 +1525,8 @@ impl<'a> LayerProgram for Gemm38<'a> {
             geo::N_USED + 1,
             key,
         );
-        let marked = r.and_then(|()| port.mark(l, Mark::Down as usize));
-        port.part_end(l, enq);
+        let marked = r.and_then(|()| port.mark(at, Mark::Down as usize));
+        port.part_end(at, enq);
         marked
     }
 
@@ -1554,8 +1553,8 @@ impl<'a> LayerProgram for Gemm38<'a> {
                 .route_card(at.layer)
                 .and_then(|()| self.p.shared(at.layer))
         }
-        .and_then(|()| port.mark(at.layer, Mark::Shadow as usize));
-        port.part_end(at.layer, enq);
+        .and_then(|()| port.mark(at, Mark::Shadow as usize));
+        port.part_end(at, enq);
         r
     }
 
@@ -1566,8 +1565,8 @@ impl<'a> LayerProgram for Gemm38<'a> {
         let r = self
             .p
             .shared_add(at.layer, port.hsum())
-            .and_then(|()| port.mark(at.layer, Mark::Back as usize));
-        port.part_end(at.layer, enq);
+            .and_then(|()| port.mark(at, Mark::Back as usize));
+        port.part_end(at, enq);
         r
     }
 }
@@ -1629,284 +1628,4 @@ pub(super) fn route_taps_host(
                 .collect()
         })
         .collect())
-}
-
-// ------------------------------------------------------------------ timing
-
-/// What the walk's timing refuses names.
-const WHAT_TIMING: &str = "qwen4exp ubatch walk timing";
-
-/// A card mark of a layer-batch's stream, in the order the walk enqueues
-/// them: the front's first launch, the front's last launch before the route's
-/// downloads, the downloads' end (the card route, on a card layer, and the
-/// shared expert's launches follow), the shared expert's last launch, the
-/// sums' upload, the gated sum.
-#[derive(Clone, Copy)]
-enum Mark {
-    Front = 0,
-    FrontEnd = 1,
-    Down = 2,
-    Shadow = 3,
-    Upload = 4,
-    Back = 5,
-}
-
-/// The marks one layer-batch's card time reads, one a part boundary.
-const MARKS: usize = 6;
-
-/// `d` in whole nanoseconds, saturating.
-pub(super) fn nanos(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
-}
-
-/// One layer-batch of a ubatch walk's timing: the serve's host time and the
-/// union's per-expert column counts. The card
-/// times and the parts' enqueue walls are read once the walk's last mark is
-/// waited for.
-struct WideLb {
-    b: u64,
-    layer: usize,
-    cols: usize,
-    slots: u64,
-    experts: usize,
-    m_max: usize,
-    m_hot: usize,
-    cols_hot: usize,
-    m_sq: u64,
-    wait_ns: u64,
-    union_ns: u64,
-    serve_ns: u64,
-}
-
-/// One layer-batch of a Qwen3.8 ubatch walk under
-/// [`GpuModel::set_prompt38_stats`]: its columns, listed host slots and their
-/// per-expert counts (the listed experts, the widest one's columns, the hot
-/// ones past an L2-sized activation set and their columns, and `Σ m²` over
-/// the listed experts), its
-/// serve's host time (the wait on the route's copies; the union call's wall,
-/// which carries the routing scan and the plan build in front of it; the
-/// serve's whole wall, the upload's enqueue in it), the host wall its parts
-/// took to enqueue, and its card time by part (the front's launches, the
-/// route's downloads, the shared expert under the union, the sums' upload,
-/// the gated sum).
-///
-/// Reached through [`GpuModel::take_prompt38_stats`]; the fields are public
-/// for the record a caller renders.
-pub struct Prompt38Lb {
-    /// The prompt's ubatch the walk ran, from 0.
-    pub b: u64,
-    pub layer: usize,
-    /// The unit's columns.
-    pub cols: usize,
-    /// Host slots the union listed.
-    pub slots: u64,
-    /// Distinct experts the layer-batch's columns listed.
-    pub experts: usize,
-    /// The most columns one listed expert took.
-    pub m_max: usize,
-    /// Listed experts past [`HOT_COLS`](crate::host::batch::HOT_COLS)
-    /// columns, and the columns they took.
-    pub m_hot: usize,
-    pub cols_hot: usize,
-    /// `Σ m²` over the listed experts.
-    pub m_sq: u64,
-    pub wait_ns: u64,
-    pub union_ns: u64,
-    pub serve_ns: u64,
-    /// The layer's front, shared expert and gated sum as the host enqueued
-    /// them.
-    pub enqueue_ns: u64,
-    pub front_ms: f64,
-    pub down_ms: f64,
-    pub shadow_ms: f64,
-    pub upload_ms: f64,
-    pub back_ms: f64,
-}
-
-/// A Qwen3.8 prompt's ubatch walks under [`GpuModel::set_prompt38_stats`]:
-/// the walks and layer-batches that ran, the host prologue every walk's plan
-/// took (the PLE rows, the record, their copy) and the walks' whole wall, and
-/// one row a layer-batch.
-///
-/// Reached through [`GpuModel::take_prompt38_stats`]; the fields are public
-/// for the record a caller renders.
-pub struct Prompt38Stats {
-    /// Ubatches walked.
-    pub ubatches: u64,
-    pub prologue_ns: u64,
-    pub walk_ns: u64,
-    pub rows: Vec<Prompt38Lb>,
-}
-
-/// A Qwen3.8 ubatch walk's timing, allocated once a caller arms it
-/// ([`GpuModel::set_prompt38_stats`]): one event a mark a layer, the walk in
-/// progress's rows, the walks that completed, and the prompt's host walls.
-/// Unarmed, nothing records and nothing is read.
-pub(super) struct WideTiming {
-    marks: Vec<CudaEvent>,
-    rows: Vec<WideLb>,
-    done: Vec<Prompt38Lb>,
-    /// The host wall the layers' parts took to enqueue, a layer each.
-    enqueue_ns: Vec<u64>,
-    walks: u64,
-    prologue_ns: u64,
-    walk_ns: u64,
-    /// The walk in progress's wall, from its first enqueue.
-    walk_t0: Option<Instant>,
-}
-
-impl WideTiming {
-    /// Timing for `layers` layers over one stream's context. Load-time only.
-    pub(super) fn new(ctx: &Arc<CudaContext>, layers: usize) -> Result<WideTiming, GpuError> {
-        // Timed events: `new_event(None)` makes a sync-only event, whose
-        // `elapsed_ms` the driver refuses.
-        let marks = (0..layers * MARKS)
-            .map(|_| ctx.new_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT)))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(WideTiming {
-            marks,
-            rows: Vec::new(),
-            done: Vec::new(),
-            enqueue_ns: vec![0; layers],
-            walks: 0,
-            prologue_ns: 0,
-            walk_ns: 0,
-            walk_t0: None,
-        })
-    }
-
-    /// A walk's plan's host wall added to the prompt's prologue.
-    pub(super) fn add_prologue(&mut self, ns: u64) {
-        self.prologue_ns += ns;
-    }
-
-    /// The prompt's stats so far, taken — every wall zeroed and the rows
-    /// moved — or `None` before a walk completed.
-    pub(super) fn take(&mut self) -> Option<Prompt38Stats> {
-        if self.walks == 0 {
-            return None;
-        }
-        let stats = Prompt38Stats {
-            ubatches: self.walks,
-            prologue_ns: std::mem::take(&mut self.prologue_ns),
-            walk_ns: std::mem::take(&mut self.walk_ns),
-            rows: std::mem::take(&mut self.done),
-        };
-        self.walks = 0;
-        Some(stats)
-    }
-
-    /// The walk over: its card marks read into its rows — the last mark
-    /// waited for first, so the reads see every event — and its rows filed
-    /// under its index, its wall added to the prompt's.
-    fn close(&mut self) -> Result<(), GpuError> {
-        let wall = self.walk_t0.take().map(|t| nanos(t.elapsed())).unwrap_or(0);
-        if let Some(last) = self.marks.last() {
-            last.synchronize()?;
-        }
-        let rows = std::mem::take(&mut self.rows);
-        for row in rows {
-            let Some(m) = self
-                .marks
-                .get(row.layer * MARKS..)
-                .and_then(|m| m.get(..MARKS))
-            else {
-                return Err(GpuError::state(
-                    WHAT_TIMING,
-                    "a card mark for every layer of the walk",
-                ));
-            };
-            let enqueue = *self.enqueue_ns.get(row.layer).unwrap_or(&0);
-            let span = |a: Mark, b: Mark| -> Result<f64, GpuError> {
-                Ok(f64::from(m[a as usize].elapsed_ms(&m[b as usize])?))
-            };
-            self.done.push(Prompt38Lb {
-                b: row.b,
-                layer: row.layer,
-                cols: row.cols,
-                slots: row.slots,
-                experts: row.experts,
-                m_max: row.m_max,
-                m_hot: row.m_hot,
-                cols_hot: row.cols_hot,
-                m_sq: row.m_sq,
-                wait_ns: row.wait_ns,
-                union_ns: row.union_ns,
-                serve_ns: row.serve_ns,
-                enqueue_ns: enqueue,
-                front_ms: span(Mark::Front, Mark::FrontEnd)?,
-                down_ms: span(Mark::FrontEnd, Mark::Down)?,
-                shadow_ms: span(Mark::Down, Mark::Shadow)?,
-                upload_ms: span(Mark::Shadow, Mark::Upload)?,
-                back_ms: span(Mark::Upload, Mark::Back)?,
-            });
-        }
-        self.enqueue_ns.fill(0);
-        self.walks += 1;
-        self.walk_ns += wall;
-        Ok(())
-    }
-}
-
-/// Mark `site` of `layer` on the stream, in [`Mark`]'s layout.
-fn record_mark(
-    marks: &[CudaEvent],
-    stream: &CudaStream,
-    layer: usize,
-    site: usize,
-) -> Result<(), GpuError> {
-    Ok(marks[layer * MARKS + site].record(stream)?)
-}
-
-/// The ubatch walk's timing behind the batch leg's [`LegTimer`]: the serve's
-/// host times and walls as its rows, the parts' card marks and enqueue walls,
-/// the walk's own wall.
-impl LegTimer for WideTiming {
-    /// The sums' upload ([`Mark::Upload`]).
-    fn upload_mark(&mut self, stream: &CudaStream, layer: usize) -> Result<(), GpuError> {
-        record_mark(&self.marks, stream, layer, Mark::Upload as usize)
-    }
-
-    /// The serve's row, in serve order for [`WideTiming::close`].
-    fn served(&mut self, note: ServeNote) {
-        self.rows.push(WideLb {
-            b: self.walks,
-            layer: note.layer,
-            cols: note.cols,
-            slots: note.slots,
-            experts: note.union_cols.experts,
-            m_max: note.union_cols.m_max,
-            m_hot: note.union_cols.m_hot,
-            cols_hot: note.union_cols.cols_hot,
-            m_sq: note.union_cols.m_sq,
-            wait_ns: note.times.wait_ns,
-            union_ns: note.union_ns,
-            serve_ns: note.serve_ns,
-        });
-    }
-
-    /// A part boundary's mark, in [`Mark`]'s layout.
-    fn mark(&mut self, stream: &CudaStream, layer: usize, site: usize) -> Result<(), GpuError> {
-        record_mark(&self.marks, stream, layer, site)
-    }
-
-    /// A part of layer `layer`'s host enqueue wall.
-    fn note_part(&mut self, layer: usize, ns: u64) {
-        if let Some(at) = self.enqueue_ns.get_mut(layer) {
-            *at += ns;
-        }
-    }
-
-    /// A walk begins: its rows taken back, its wall started. A walk that
-    /// fails leaves no rows: the next one clears them.
-    fn begin_walk(&mut self) {
-        self.rows.clear();
-        self.walk_t0 = Some(Instant::now());
-    }
-
-    /// A walk ends: its card marks read and its rows filed. Blocking — the
-    /// stream's tail, the last upload and gated sum, is waited for.
-    fn end_walk(&mut self) -> Result<(), GpuError> {
-        self.close()
-    }
 }

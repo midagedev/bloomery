@@ -71,13 +71,15 @@ impl<H: HostExperts> Port for StepLeg<'_, H> {
 }
 
 /// One serve of a batch walk's host exchange, timed, for the [`LegTimer`]
-/// that asked for it: which layer over how many columns of the open walk, the
+/// that asked for it: which layer of which unit over how many columns of the open walk, the
 /// slots its host experts listed and their per-expert counts, the wall of
 /// their union call, the serve's own host times and its whole wall (the
 /// upload's enqueue in it).
 pub struct ServeNote {
     /// The served layer.
     pub layer: usize,
+    /// The served unit of the walk.
+    pub unit: usize,
     /// The open walk's columns.
     pub cols: usize,
     /// Host slots the union listed.
@@ -101,22 +103,22 @@ pub struct ServeNote {
 /// [`BatchLeg::part_end`], [`BatchLeg::end_walk`]), so no program borrows an
 /// adapter of its own. With no timer set nothing records and nothing waits.
 pub trait LegTimer {
-    /// The mark of `layer`'s sums' upload on `stream`.
-    fn upload_mark(&mut self, stream: &CudaStream, layer: usize) -> Result<(), GpuError>;
+    /// The mark of `at`'s sums' upload on `stream`.
+    fn upload_mark(&mut self, stream: &CudaStream, at: At) -> Result<(), GpuError>;
 
     /// One serve exchanged: `note`'s times and walls.
     fn served(&mut self, note: ServeNote);
 
-    /// The mark of `layer`'s part `site` on `stream`, in the architecture's
+    /// The mark of `at`'s part `site` on `stream`, in the architecture's
     /// own layout of sites.
-    fn mark(&mut self, stream: &CudaStream, layer: usize, site: usize) -> Result<(), GpuError>;
+    fn mark(&mut self, stream: &CudaStream, at: At, site: usize) -> Result<(), GpuError>;
 
-    /// `ns` of layer `layer`'s host enqueue wall, a part of it.
-    fn note_part(&mut self, layer: usize, ns: u64);
+    /// `ns` of `at`'s host enqueue wall, a part of it.
+    fn note_part(&mut self, at: At, ns: u64);
 
-    /// A walk begins; whatever the adapter kept of an earlier one is its own
-    /// to clear.
-    fn begin_walk(&mut self);
+    /// A walk of `units` units begins; whatever the adapter kept of an
+    /// earlier one is its own to clear.
+    fn begin_walk(&mut self, units: usize) -> Result<(), GpuError>;
 
     /// A walk ends; the adapter may read its marks, which can wait for the
     /// stream's tail.
@@ -198,33 +200,35 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
         }
     }
 
-    /// Mark `site` of `layer`'s part on the stream, in the architecture's own
+    /// Mark `site` of `at`'s part on the stream, in the architecture's own
     /// layout of sites ([`LegTimer::mark`]); nothing with no timer.
-    pub fn mark(&mut self, layer: usize, site: usize) -> Result<(), GpuError> {
+    pub fn mark(&mut self, at: At, site: usize) -> Result<(), GpuError> {
         match self.timer.as_deref_mut() {
-            Some(t) => t.mark(self.stream, layer, site),
+            Some(t) => t.mark(self.stream, at, site),
             None => Ok(()),
         }
     }
 
-    /// The start of a part of layer `layer`'s host enqueue wall, which
+    /// The start of a part of a layer-batch's host enqueue wall, which
     /// [`BatchLeg::part_end`] closes; `None` with no timer.
     pub fn part_start(&self) -> Option<Instant> {
         self.timer.as_deref().map(|_| Instant::now())
     }
 
-    /// The wall of a part started at `t` added to layer `layer`'s enqueue
+    /// The wall of a part started at `t` added to `at`'s enqueue
     /// ([`LegTimer::note_part`]); nothing with no timer or no start.
-    pub fn part_end(&mut self, layer: usize, t: Option<Instant>) {
+    pub fn part_end(&mut self, at: At, t: Option<Instant>) {
         if let (Some(t), Some(w)) = (t, self.timer.as_deref_mut()) {
-            w.note_part(layer, nanos(t.elapsed()));
+            w.note_part(at, nanos(t.elapsed()));
         }
     }
 
-    /// A walk begins ([`LegTimer::begin_walk`]); nothing with no timer.
-    pub fn begin_walk(&mut self) {
-        if let Some(t) = self.timer.as_deref_mut() {
-            t.begin_walk();
+    /// A walk of `units` units begins ([`LegTimer::begin_walk`]); nothing
+    /// with no timer.
+    pub fn begin_walk(&mut self, units: usize) -> Result<(), GpuError> {
+        match self.timer.as_deref_mut() {
+            Some(t) => t.begin_walk(units),
+            None => Ok(()),
         }
     }
 
@@ -274,7 +278,7 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
         join(self.stream, rows)?;
         self.hybrid.enqueue_upload(self.stream, self.hsum, key)?;
         match self.timer.as_deref_mut() {
-            Some(t) => t.upload_mark(self.stream, at.layer),
+            Some(t) => t.upload_mark(self.stream, at),
             None => Ok(()),
         }
     }
@@ -324,11 +328,12 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
         let union_cols = self.hybrid.served_union_cols(key)?;
         if !tiered {
             self.hybrid.enqueue_upload(self.stream, self.hsum, key)?;
-            t.upload_mark(self.stream, at.layer)?;
+            t.upload_mark(self.stream, at)?;
         }
         let after = self.hybrid.stats();
         t.served(ServeNote {
             layer: at.layer,
+            unit: at.unit,
             cols: self.cols,
             slots: after
                 .batch_host_slots

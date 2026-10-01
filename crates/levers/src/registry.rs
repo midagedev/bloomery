@@ -162,8 +162,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               call's queue entries as each site enqueued them, per batch (`stat prefill \
               front`) and per layer-batch (`stat prefill lb`); `gate_deepseek41_prefill`: \
               that split line per case; `generate_qwen3moe` on a qwen4exp file: the \
-              ubatch walk's `stat prompt38 split` and its per layer-batch `stat \
-              prompt38 lb`. Off, nothing is read.",
+              ubatch walk's `stat prompt split` and its per layer-batch `stat \
+              prompt lb`. Off, nothing is read.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

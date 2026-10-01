@@ -31,6 +31,8 @@ use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::swap::{CallPick, CallReport, Leak, PassReport, ResetReport};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HostResidency;
+#[cfg(feature = "gpu")]
+use bloomery_gpu::prompt_timing::PromptStats;
 use model::placement::{Machine, Plan};
 
 /// The schema's version, the first line of `--records-schema`.
@@ -932,11 +934,12 @@ pub static TIME_PROMPT: Kind = Kind {
     ],
 };
 
-/// One layer-batch of a Qwen3.8 ubatch walk.
-pub static STAT_PROMPT38_LB: Kind = Kind {
-    name: "stat_prompt38_lb",
-    head: "stat prompt38 lb",
-    doc: "One layer-batch of a Qwen3.8 ubatch walk under BLOOMERY_STEP_STATS: its columns, the \
+/// One layer-batch of a prompt's batch walks.
+pub static STAT_PROMPT_LB: Kind = Kind {
+    name: "stat_prompt_lb",
+    head: "stat prompt lb",
+    doc: "One layer-batch of a prompt's batch walks (Qwen3.8's ubatches, GLM-5.3's batches) under \
+          BLOOMERY_STEP_STATS: its batch in the prompt, its layer, its columns, the \
           host slots its union listed and their per-expert counts (the listed experts, the widest \
           one's columns, the hot ones past an L2-sized activation set and their columns, and Σ m² \
           over the listed experts, which with the slots gives the routing's spread), its serve's \
@@ -968,13 +971,16 @@ pub static STAT_PROMPT38_LB: Kind = Kind {
     ],
 };
 
-/// Where a Qwen3.8 prompt's ubatch walks spent their time.
-pub static STAT_PROMPT38_SPLIT: Kind = Kind {
-    name: "stat_prompt38_split",
-    head: "stat prompt38 split",
-    doc: "A Qwen3.8 prompt's ubatch walks under BLOOMERY_STEP_STATS, summed: the ubatches and \
-          layer-batches that ran, the host prologue every walk's plan took (the PLE rows, the \
-          record, their copy) and the walks' whole wall, the serves' union and wait and the host \
+/// Where a prompt's batch walks spent their time.
+pub static STAT_PROMPT_SPLIT: Kind = Kind {
+    name: "stat_prompt_split",
+    head: "stat prompt split",
+    doc: "A prompt's batch walks (Qwen3.8's ubatches, GLM-5.3's batches) under \
+          BLOOMERY_STEP_STATS, summed: the batches and \
+          layer-batches that ran, the host prologue every walk's plan took (Qwen3.8: the PLE \
+          rows, the record, their copy) and the walks' whole wall, the host walls the call spent \
+          outside the walks reading the fault word and waiting for its checkpoints (GLM-5.3; 0 \
+          where the call notes none), the serves' union and wait and the host \
           slots they listed with their per-expert counts (the mean listed experts, hot experts \
           and their columns and Σ m² a layer-batch, and the widest one expert's columns over the \
           prompt), the walks' wall less the serves' as the enqueue's share, and the card \
@@ -985,6 +991,8 @@ pub static STAT_PROMPT38_SPLIT: Kind = Kind {
         key("layer_batches", U64, ""),
         key("prologue_ms", F64(1), "ms"),
         key("walk_ms", F64(1), "ms"),
+        key("fault_ms", F64(1), "ms"),
+        key("ckpt_ms", F64(1), "ms"),
         key("union_ms", F64(1), "ms"),
         key("wait_ms", F64(1), "ms"),
         key("serve_ms", F64(1), "ms"),
@@ -1821,8 +1829,8 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &MTP_WINDOW,
     &STAT_STEP_HOST,
     &STAT_SUMMARY_HOST,
-    &STAT_PROMPT38_SPLIT,
-    &STAT_PROMPT38_LB,
+    &STAT_PROMPT_SPLIT,
+    &STAT_PROMPT_LB,
     &RESIDENCY_LEVER,
     &RESIDENCY_UNSET,
     &RESIDENCY_HOST,
@@ -2032,6 +2040,94 @@ pub fn residency_leak(l: &Leak) -> Record {
     r.u("ring", l.ring_bytes).u("words", l.words_bytes)
 }
 
+/// A prompt's batch-walk records ([`PromptStats`]): one `stat prompt lb` a
+/// layer-batch, then the `stat prompt split` over them — the split's sums are
+/// the rows' sums, its enqueue the walks' wall less the serves'.
+#[cfg(feature = "gpu")]
+pub fn prompt_stats(s: &PromptStats) -> Vec<Record> {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let lbs = s.rows.len() as u64;
+    let (mut union, mut wait, mut serve, mut enqueue, mut slots) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut experts, mut m_hot, mut cols_hot, mut m_sq) = (0u64, 0u64, 0u64, 0u64);
+    let mut m_max = 0usize;
+    let (mut front, mut down, mut shadow, mut up, mut back) = (0.0_f64, 0.0, 0.0, 0.0, 0.0);
+    let mut out = Vec::with_capacity(s.rows.len() + 1);
+    for r in &s.rows {
+        union += r.union_ns;
+        wait += r.wait_ns;
+        serve += r.serve_ns;
+        enqueue += r.enqueue_ns;
+        slots += r.slots;
+        experts += r.experts as u64;
+        m_max = m_max.max(r.m_max);
+        m_hot += r.m_hot as u64;
+        cols_hot += r.cols_hot as u64;
+        m_sq += r.m_sq;
+        front += r.front_ms;
+        down += r.down_ms;
+        shadow += r.shadow_ms;
+        up += r.upload_ms;
+        back += r.back_ms;
+        out.push(
+            Record::new(&STAT_PROMPT_LB)
+                .u("b", r.b)
+                .u("layer", r.layer as u64)
+                .u("cols", r.cols as u64)
+                .u("slots", r.slots)
+                .u("experts", r.experts as u64)
+                .u("m_max", r.m_max as u64)
+                .u("m_hot", r.m_hot as u64)
+                .u("cols_hot", r.cols_hot as u64)
+                .u("m_sq", r.m_sq)
+                .f("wait_ms", ms(r.wait_ns))
+                .f("union_ms", ms(r.union_ns))
+                .f("serve_ms", ms(r.serve_ns))
+                .f("enqueue_ms", ms(r.enqueue_ns))
+                .f("card_front_ms", r.front_ms)
+                .f("card_down_ms", r.down_ms)
+                .f("card_shadow_ms", r.shadow_ms)
+                .f("card_upload_ms", r.upload_ms)
+                .f("card_back_ms", r.back_ms),
+        );
+    }
+    let per = |v: f64| if lbs == 0 { 0.0 } else { v / lbs as f64 };
+    out.push(
+        Record::new(&STAT_PROMPT_SPLIT)
+            .u("ubatches", s.ubatches)
+            .u("layer_batches", lbs)
+            .f("prologue_ms", ms(s.prologue_ns))
+            .f("walk_ms", ms(s.walk_ns))
+            .f("fault_ms", ms(s.fault_ns))
+            .f("ckpt_ms", ms(s.ckpt_ns))
+            .f("union_ms", ms(union))
+            .f("wait_ms", ms(wait))
+            .f("serve_ms", ms(serve))
+            .f("enqueue_ms", ms(s.walk_ns.saturating_sub(serve)))
+            .u("host_slots", slots)
+            .f("union_lb", per(ms(union)))
+            .f("wait_lb", per(ms(wait)))
+            .f("serve_lb", per(ms(serve)))
+            .f("enqueue_lb", per(ms(enqueue)))
+            .f("slots_lb", per(slots as f64))
+            .f("experts_lb", per(experts as f64))
+            .u("m_max", m_max as u64)
+            .f("m_hot_lb", per(m_hot as f64))
+            .f("cols_hot_lb", per(cols_hot as f64))
+            .f("m_sq_lb", per(m_sq as f64))
+            .f("card_front_ms", front)
+            .f("card_down_ms", down)
+            .f("card_shadow_ms", shadow)
+            .f("card_upload_ms", up)
+            .f("card_back_ms", back)
+            .f("card_front_lb", per(front))
+            .f("card_down_lb", per(down))
+            .f("card_shadow_lb", per(shadow))
+            .f("card_upload_lb", per(up))
+            .f("card_back_lb", per(back)),
+    );
+    out
+}
+
 /// A prompt call's pick record, of group `group`.
 #[cfg(feature = "gpu")]
 pub fn call_stream(group: usize, p: &CallPick) -> Record {
@@ -2169,7 +2265,7 @@ mod tests {
             "SMOKE mode=graph place=a prompt_tokens=0 depth=512 generated=2 warm=0 steps=1 \
              p50_ms=37.3698 mean_ms=37.3698 tok/s(p50)=26.76"
         );
-        let lb = Record::new(&STAT_PROMPT38_LB)
+        let lb = Record::new(&STAT_PROMPT_LB)
             .u("b", 0)
             .u("layer", 3)
             .u("cols", 4096)
@@ -2191,16 +2287,18 @@ mod tests {
             .line();
         assert_eq!(
             lb,
-            "stat prompt38 lb b=0 layer=3 cols=4096 slots=40960 experts=512 m_max=97 m_hot=0 \
+            "stat prompt lb b=0 layer=3 cols=4096 slots=40960 experts=512 m_max=97 m_hot=0 \
              cols_hot=0 m_sq=3312000 wait_ms=21.53 union_ms=214.87 \
              serve_ms=236.71 enqueue_ms=0.94 card_front_ms=19.62 card_down_ms=1.84 \
              card_shadow_ms=0.71 card_upload_ms=1.79 card_back_ms=0.21"
         );
-        let split = Record::new(&STAT_PROMPT38_SPLIT)
+        let split = Record::new(&STAT_PROMPT_SPLIT)
             .u("ubatches", 1)
             .u("layer_batches", 48)
             .f("prologue_ms", 18.4)
             .f("walk_ms", 13780.9)
+            .f("fault_ms", 0.0)
+            .f("ckpt_ms", 0.0)
             .f("union_ms", 10313.8)
             .f("wait_ms", 1033.4)
             .f("serve_ms", 11364.1)
@@ -2229,8 +2327,8 @@ mod tests {
             .line();
         assert_eq!(
             split,
-            "stat prompt38 split ubatches=1 layer_batches=48 prologue_ms=18.4 walk_ms=13780.9 \
-             union_ms=10313.8 wait_ms=1033.4 serve_ms=11364.1 enqueue_ms=2416.8 \
+            "stat prompt split ubatches=1 layer_batches=48 prologue_ms=18.4 walk_ms=13780.9 \
+             fault_ms=0.0 ckpt_ms=0.0 union_ms=10313.8 wait_ms=1033.4 serve_ms=11364.1 enqueue_ms=2416.8 \
              host_slots=1966080 union_lb=214.87 wait_lb=21.53 serve_lb=236.75 enqueue_lb=0.94 \
              slots_lb=40960.0 experts_lb=512.0 m_max=97 m_hot_lb=0.0 cols_hot_lb=0.0 \
              m_sq_lb=3312000.0 card_front_ms=941.8 card_down_ms=88.3 card_shadow_ms=34.1 \
