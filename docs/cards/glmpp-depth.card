@@ -1,0 +1,25 @@
+# GLM-5.3-Flash's batched prompt call at P = 512 and 4096 on main, the first pp rows since glmppa landed (it was
+# never timed after landing). Decomposition [derived, line3's multiseq report section 4 and the glmppa design
+# report]: the batch is one walk of the layer schedule; without groups its wall is the card front (m-column
+# projections, attention by 8-token chunk, router rows) plus the host union over every routed layer. At P = 4096
+# that is 0.35..0.59 s a layer over 42 layers, 13.2..24.8 s, so pp4096 165..310 tok/s. pp512 is printed beside it
+# (glmppa's band 100..133) and decides nothing here.
+kind: baseline
+reason: GLM's prompt rate has no measured row on main; long-context and session-switch costs (re-prefill of
+  16k: 53..99 s [derived]) are priced from it
+question: does GLM-5.3-Flash's batched prompt call run P = 4096 at the rate the card front plus the host union
+  predicts?
+term: pp tok/s @ P = 4096, prose prompt (GLM_PROSE), A6000, the default plan, --ctx 4200, ours only
+unit: tok/s
+predict: 165..310
+condition: one lease, main's binary, ours arms only, from a tree at main:
+  BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4200 BLOOMERY_DECODE_N=8
+  BLOOMERY_LEASE_CARD=docs/cards/glmpp-depth.card' just depth-gpu-glm5next 512 4096. A row marked [cold],
+  [cpu-busy] or [other-busy] is void. Box time ~8..12 min [derived: 2 rounds x 2 arms + a warm-up, 5 loads at
+  45..75 s, plus 4..25 s of prompt a row]
+decide-in: record it in rig-log as GLM's pp row on main and price long-context and re-prefill from it; the next
+  prefill round (R2, the card front's projections as int8 GEMM) takes it as its base
+decide-below: the batch is slower than the sum: time one batch under nsys (per-layer front, union, back) and name
+  the term past its band before R2 opens
+decide-above: the host union is under its band: re-derive with the card front as the larger share and move G
+  (batches in pairs) ahead of R2
