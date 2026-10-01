@@ -612,196 +612,202 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // — by a replica that first reproduced all eight old draft rows exactly from the budgets above
 // (the 09-28 budgets less the 09-29 card route's scratch and the 09-30 arena); 4 to 12 experts off
 // each card, 6 on the A6000 at 4k and U 4,096 (11,925 -> 11,919)].
+// PIN(2026-10-01): every row re-pinned for the card experts on all 48 layers: the card reads a
+// q5_K gate and up (`kq_gate_up_act_q5k`) and a q8_0 down (`q8_0_gemv_sel32`), so layers 2, 4,
+// 30, 46 and 47 join the spread, their experts in the file's bytes — layer 2's gate and up of 640
+// rows of ten 176 B super-blocks, 1,126,400 B each, and its down of 2,560 rows of twenty 34 B
+// blocks, 1,740,800 B (3,993,600 B an expert); layers 4, 30, 46 and 47 the q4_K gate and up and
+// that down (3,584,000 B); the rest 3,072,000 B as before [derived: the spread replayed over the
+// 48 layers, each stack in whole 2 MiB granules past CARD_DENSE + CARD_ROUNDING, within the
+// budgets above (the 09-28 budgets less the 09-29 card route's scratch, the draft rows also less
+// the 09-30 and 10-01 arena), by a replica that first reproduced all sixteen old rows exactly; the
+// eligible layers ascending, so the first `at_high` of the 48 hold `high`: 12,841 -> 12,568
+// experts on the A6000 at 4k and U 4,096, 262/261 a layer; the card's expert bytes move by the
+// three sizes and their granules, the budget's slack].
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
         4_096,
         false,
         4_096,
-        299,
-        27,
-        298,
-        39_447_552_000,
-        528_323_072,
+        262,
+        40,
+        261,
+        39_385_907_200,
+        594_162_176,
     ),
     (
         "A6000",
         4_096,
         false,
         512,
-        319,
-        39,
-        318,
-        42_126_336_000,
-        548_573_696,
+        280,
+        28,
+        279,
+        42_056_192_000,
+        616_620_544,
     ),
     (
         "A6000",
         4_096,
         true,
         4_096,
-        278,
+        244,
+        18,
+        243,
+        36_610_150_400,
+        524_083_712,
+    ),
+    (
+        "A6000",
+        4_096,
+        true,
+        512,
+        262,
+        16,
+        261,
+        39_311_667_200,
+        517_407_232,
+    ),
+    (
+        "A6000",
+        32_768,
+        false,
+        4_096,
+        258,
         8,
-        277,
-        36_615_168_000,
-        519_066_112,
-    ),
-    (
-        "A6000",
-        4_096,
-        true,
-        512,
-        299,
-        4,
-        298,
-        39_376_896_000,
-        454_275_584,
-    ),
-    (
-        "A6000",
-        32_768,
-        false,
-        4_096,
-        292,
-        41,
-        291,
-        38_565_888_000,
-        596_292_096,
+        257,
+        38_685_388_800,
+        478_888_448,
     ),
     (
         "A6000",
         32_768,
         false,
         512,
-        313,
-        33,
-        312,
-        41_315_328_000,
-        543_789_568,
+        275,
+        37,
+        274,
+        41_332_224_000,
+        526_893_568,
     ),
     (
         "A6000",
         32_768,
         true,
         4_096,
-        270,
-        31,
-        269,
-        35_629_056_000,
-        544_682_496,
+        237,
+        34,
+        236,
+        35_606_835_200,
+        564_806_144,
     ),
     (
         "A6000",
         32_768,
         true,
         512,
-        291,
-        26,
-        290,
-        38_387_712_000,
-        480_866_816,
+        255,
+        27,
+        254,
+        38_292_480_000,
+        574_001_664,
     ),
     (
         "3090",
         4_096,
         false,
         4_096,
-        105,
-        29,
-        104,
-        13_827_072_000,
-        550_965_760,
-    ),
-    (
-        "3090",
-        4_096,
-        false,
-        512,
-        126,
-        19,
-        125,
-        16_570_368_000,
-        500_412_928,
-    ),
-    (
-        "3090",
-        4_096,
-        true,
-        4_096,
-        84,
-        21,
-        83,
-        11_028_480_000,
-        505_819_648,
-    ),
-    (
-        "3090",
-        4_096,
-        true,
-        512,
-        105,
+        93,
         5,
-        104,
-        13_753_344_000,
-        473_698_816,
+        92,
+        13_855_948_800,
+        522_088_960,
     ),
     (
         "3090",
-        32_768,
-        false,
         4_096,
-        98,
-        43,
-        98,
-        12_945_408_000,
-        618_934_784,
-    ),
-    (
-        "3090",
-        32_768,
         false,
         512,
-        119,
-        40,
-        118,
-        15_710_208_000,
-        546_877_952,
-    ),
-    (
-        "3090",
-        32_768,
-        true,
-        4_096,
-        76,
-        40,
-        75,
-        10_030_080_000,
-        539_529_728,
-    ),
-    (
-        "3090",
-        32_768,
-        true,
-        512,
-        96,
+        110,
         38,
-        95,
-        12_665_856_000,
-        596_496_896,
+        109,
+        16_515_072_000,
+        557_806_080,
+    ),
+    (
+        "3090",
+        4_096,
+        true,
+        4_096,
+        73,
+        36,
+        72,
+        10_943_180_800,
+        591_118_848,
+    ),
+    (
+        "3090",
+        4_096,
+        true,
+        512,
+        92,
+        16,
+        91,
+        13_739_315_200,
+        487_727_616,
+    ),
+    (
+        "3090",
+        32_768,
+        false,
+        4_096,
+        87,
+        29,
+        86,
+        13_027_123_200,
+        535_122_432,
+    ),
+    (
+        "3090",
+        32_768,
+        false,
+        512,
+        105,
+        22,
+        104,
+        15_713_280_000,
+        539_611_648,
+    ),
+    (
+        "3090",
+        32_768,
+        true,
+        4_096,
+        67,
+        7,
+        66,
+        9_951_027_200,
+        620_679_680,
+    ),
+    (
+        "3090",
+        32_768,
+        true,
+        512,
+        85,
+        32,
+        84,
+        12_736_000_000,
+        528_450_048,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
 // layers' experts on the host [the header dump: layer 2's gate and up q5_K and its down q8_0, the
 // downs of layers 4, 30, 46 and 47 q8_0, every q8_0 down rows of 640 values].
-const HOST_ONLY: [(usize, &str); 7] = [
-    (2, "blk.2.ffn_down_exps.weight"),
-    (2, "blk.2.ffn_gate_exps.weight"),
-    (2, "blk.2.ffn_up_exps.weight"),
-    (4, "blk.4.ffn_down_exps.weight"),
-    (30, "blk.30.ffn_down_exps.weight"),
-    (46, "blk.46.ffn_down_exps.weight"),
-    (47, "blk.47.ffn_down_exps.weight"),
-];
+// PIN(2026-10-01): none: the card experts read the q5_K gate and up and the q8_0 down
+// (`place::card_routed`), so every layer's stacks are the card's [the same header dump].
+const HOST_ONLY: [(usize, &str); 0] = [];
 /// The draft that uses the target's embedding and output matrix.
 const SHARED: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
 
@@ -841,11 +847,9 @@ fn hw_qwen4exp_card_plan() {
         .iter()
         .map(|h| (h.layer, h.tensor.as_str()))
         .collect();
-    let reasons = host_only.iter().all(|h| {
-        let q8 = h.tensor.contains("down");
-        (q8 && h.why.contains("640") && h.why.contains("Q8Act"))
-            || (!q8 && h.why.starts_with("q5_K"))
-    });
+    let reasons = host_only
+        .iter()
+        .all(|h| h.why.contains("no card expert kernel"));
     for h in &host_only {
         let _ = writeln!(o, "host only: layer {} {}: {}", h.layer, h.tensor, h.why);
     }
@@ -964,7 +968,7 @@ fn hw_qwen4exp_card_plan() {
         check(
             &mut o,
             format!(
-                "{name} ctx {ctx} draft {with_draft} U {u}: n_l {high} on the first {at_high} of the 43, \
+                "{name} ctx {ctx} draft {with_draft} U {u}: n_l {high} on the first {at_high} of the {eligible}, \
                  {low} on the rest, 0 on {off:?} ({}; {held} experts); segments off the rule \
                  {segs_bad:?}; the draft's plan the host-routed one's {draft_same}; {}; headroom {}",
                 plan.n_l == want,

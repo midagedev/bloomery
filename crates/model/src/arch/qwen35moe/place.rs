@@ -12,9 +12,9 @@
 //! ([`PlanInputs::plan`], the plan the program loads), or by the expert rule
 //! ([`PlanInputs::plan_with`] under [`Experts::Card`]): each eligible layer's
 //! id prefix `[0, n_l)`, spread evenly, on the layers whose three routed stacks the card experts read
-//! ([`card_routed`]: the Q4_K gate and up, the Q5_1 down in the file's
-//! blocks), the rest on the host. A layer with a stack they do not read keeps
-//! every expert on the host, each such stack named with the reason
+//! ([`card_routed`]: a Q4_K or Q5_K gate and up, a Q5_1 or Q8_0 down, each in
+//! the file's blocks), the rest on the host. A layer with a stack they do not
+//! read keeps every expert on the host, each such stack named with the reason
 //! ([`PlanInputs::host_only`]).
 //!
 //! The attention layers select their positions by the mean-pool indexer at
@@ -73,37 +73,36 @@ pub enum Experts {
     Card,
 }
 
-/// The routed stacks the card experts read, in their card format: the Q4_K
-/// gate and up (`kq_gate_up_act_q4k`) and the Q5_1 down (`q5_1_gemv_sel`),
-/// both as the file stores them ([`CardFormat::KQuant`]: the down's
-/// `block_q5_1`s, 24 bytes a 32 values, unpacked). A stack of any other type
+/// The routed stacks the card experts read, in their card format, each as the
+/// file stores it ([`CardFormat::KQuant`]): a Q4_K or Q5_K gate and up
+/// (`kq_gate_up_act_q4k`, `kq_gate_up_act_q5k`) and a Q5_1 or Q8_0 down
+/// (`q5_1_gemv_sel`, `q8_0_gemv_sel32`: the down's `block_q5_1`s, 24 bytes a
+/// 32 values, or `block_q8_0`s, 34 bytes, unpacked). The rule reads a stack's
+/// type alone: a stack of one of these types in a place the card leg does not
+/// run it in (a Q5_1 or Q8_0 gate or up, a Q4_K or Q5_K down) is refused by
+/// name at load (`Card38::new`, `Qwen38Stacks::of`). A stack of any other type
 /// keeps its layer's experts on the host ([`host_only_reason`]).
 #[must_use]
 pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
     match ty {
-        GgmlType::Q4_K | GgmlType::Q5_1 => Some(CardFormat::KQuant),
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q5_1 | GgmlType::Q8_0 => {
+            Some(CardFormat::KQuant)
+        }
         _ => None,
     }
 }
 
-/// Why a routed stack of type `ty`, rows of `k` values, keeps its layer's
-/// experts on the host; `None` for a stack [`card_routed`] loads.
+/// Why a routed stack of type `ty` keeps its layer's experts on the host;
+/// `None` for a stack [`card_routed`] loads.
 #[must_use]
-pub fn host_only_reason(ty: GgmlType, k: u64) -> Option<String> {
+pub fn host_only_reason(ty: GgmlType) -> Option<String> {
     if card_routed(ty).is_some() {
         return None;
     }
-    Some(match ty {
-        GgmlType::Q8_0 if !k.is_multiple_of(256) => format!(
-            "q8_0 rows of {k} values: `q8_0_gemv_sel` reads its columns as `Q8Act`, which \
-             takes a multiple of 256 values"
-        ),
-        GgmlType::Q5_K => "q5_K: this program's card experts read a Q4_K gate·up and a Q5_1 \
-                           down; the q5_K entries (`kq_gate_up_act_q5k`, `q5k_gemv_sel`) are \
-                           not admitted for this file"
-            .to_string(),
-        other => format!("{other}: no card expert kernel of this program reads it"),
-    })
+    Some(format!(
+        "{ty}: no card expert kernel of this program reads it (the gate and up Q4_K or \
+         Q5_K, the down Q5_1 or Q8_0)"
+    ))
 }
 
 /// A routed stack whose layer keeps every expert on the host under
@@ -276,7 +275,7 @@ impl PlanInputs {
             .iter()
             .filter(|t| t.role == Role::RoutedExperts)
             .filter_map(|t| {
-                let why = host_only_reason(t.ty, t.dims.first().copied().unwrap_or(0))?;
+                let why = host_only_reason(t.ty)?;
                 Some(HostOnly {
                     layer: t.layer?,
                     tensor: t.name.clone(),
@@ -1449,9 +1448,9 @@ mod tests {
     /// The card rule over Qwen3.8's routed stacks ([`super::card_routed`]) on
     /// six synthetic layers of the file's per-expert shapes (512 experts; a
     /// Q4_K gate and up of 640 rows of 2560 values, a Q5_1 down of 2560 rows
-    /// of 640): layers 0, 1, 3 and 5 as the file's 43, layer 2 as its layer 2
-    /// (a q5_K gate and up, a q8_0 down), layer 4 as its layers 4, 30, 46 and
-    /// 47 (a q8_0 down); each layer a 2560-value F32 norm first.
+    /// of 640): layers 0, 1, 3 and 5 as most of the file's layers, layer 2 as
+    /// its layer 2 (a q5_K gate and up, a q8_0 down), layer 4 as its layers 4,
+    /// 30, 46 and 47 (a q8_0 down); each layer a 2560-value F32 norm first.
     mod card {
         use std::num::NonZeroU64;
 
@@ -1469,6 +1468,19 @@ mod tests {
         const GATE: u64 = 640 * 10 * 144;
         /// A Q5_1 down expert, 2560 rows of twenty 24-byte blocks.
         const DOWN: u64 = 2560 * 20 * 24;
+        /// A Q5_K gate (or up) expert, 640 rows of ten 176-byte super-blocks.
+        const GATE_Q5K: u64 = 640 * 10 * 176;
+        /// A Q8_0 down expert, 2560 rows of twenty 34-byte blocks.
+        const DOWN_Q80: u64 = 2560 * 20 * 34;
+
+        /// Layer `l`'s card bytes an expert: its gate, up and down.
+        fn expert_bytes(l: usize) -> u64 {
+            match l {
+                2 => 2 * GATE_Q5K + DOWN_Q80,
+                4 => 2 * GATE + DOWN_Q80,
+                _ => 2 * GATE + DOWN,
+            }
+        }
 
         struct NoKv;
 
@@ -1577,51 +1589,69 @@ mod tests {
         }
 
         /// The card format of each routed type, and the named reason of each
-        /// type it leaves on the host; the Q5_1 down's card bytes are its file
-        /// bytes, and a whole Q5_1 tensor keeps its packed format.
+        /// type it leaves on the host; the Q5_1 and Q8_0 downs' card bytes are
+        /// their file bytes, a whole Q5_1 tensor keeps its packed format and a
+        /// whole Q8_0 tensor its planes.
         #[test]
         fn routed_types_and_their_reasons() {
-            assert_eq!(card_routed(GgmlType::Q4_K), Some(CardFormat::KQuant));
-            assert_eq!(card_routed(GgmlType::Q5_1), Some(CardFormat::KQuant));
             for ty in [
+                GgmlType::Q4_K,
                 GgmlType::Q5_K,
+                GgmlType::Q5_1,
                 GgmlType::Q8_0,
-                GgmlType::Q6_K,
-                GgmlType::Q5_0,
             ] {
-                assert_eq!(card_routed(ty), None, "{ty}");
+                assert_eq!(card_routed(ty), Some(CardFormat::KQuant), "{ty}");
+                assert_eq!(host_only_reason(ty), None, "{ty}");
             }
-            assert_eq!(host_only_reason(GgmlType::Q4_K, 2560), None);
-            assert_eq!(host_only_reason(GgmlType::Q5_1, 640), None);
-            let q8 = host_only_reason(GgmlType::Q8_0, 640).expect("a q8_0 down is named");
-            assert!(q8.contains("640") && q8.contains("Q8Act"), "{q8}");
-            let q5k = host_only_reason(GgmlType::Q5_K, 2560).expect("a q5_K stack is named");
-            assert!(q5k.starts_with("q5_K"), "{q5k}");
-            let q6k = host_only_reason(GgmlType::Q6_K, 2560).expect("a q6_K stack is named");
-            assert!(q6k.starts_with("q6_K"), "{q6k}");
+            for ty in [GgmlType::Q6_K, GgmlType::Q5_0, GgmlType::Q3_K] {
+                assert_eq!(card_routed(ty), None, "{ty}");
+                let why = host_only_reason(ty).expect("a stack the card does not read is named");
+                assert!(why.starts_with(&ty.to_string()), "{why}");
+            }
             for n in [1, 3, 323] {
                 assert_eq!(
                     CardFormat::KQuant.resident_bytes(GgmlType::Q5_1, 640, 2560 * n),
                     Some(DOWN * n),
                     "{n} experts"
                 );
+                assert_eq!(
+                    CardFormat::KQuant.resident_bytes(GgmlType::Q8_0, 640, 2560 * n),
+                    Some(DOWN_Q80 * n),
+                    "{n} experts"
+                );
             }
+            // Rows of an odd count of blocks: the stream in whole words, a
+            // whole number a row (35 blocks of 34 bytes over 3 rows: 3,570 B,
+            // 893 words, 298 a row).
+            assert_eq!(
+                CardFormat::KQuant.buffer_bytes(GgmlType::Q8_0, 1120, 3),
+                Some(vec![298 * 3 * 4])
+            );
+            assert_eq!(
+                CardFormat::KQuant.resident_bytes(GgmlType::Q8_0, 48, 3),
+                None
+            );
             assert_eq!(CardFormat::of(GgmlType::Q5_1), Some(CardFormat::Q5_1));
+            assert_eq!(CardFormat::of(GgmlType::Q8_0), Some(CardFormat::Q8_0Planes));
         }
 
-        // PIN(2026-09-28): the card rule's counts on the synthetic model [derived: at ten experts a
-        // layer a gate and an up of 9,216,000 B take five 2 MiB granules each and a down of
-        // 12,288,000 B six, 32 MiB a layer; the six norms share one granule; four eligible
-        // layers make 130 MiB, and an eleventh expert on layer 0 moves its down to seven granules,
-        // 132 MiB, past 131 MiB. Under a reserve of 3 MiB the budget is 128 MiB: at nine experts a
-        // layer takes 28 MiB, the tenth adds 4 MiB, and layer 5's passes 128].
-        const N_L: [u64; 6] = [10, 10, 0, 10, 0, 10];
-        const N_L_RESERVED: [u64; 6] = [10, 10, 0, 10, 0, 9];
+        // PIN(2026-10-01): the card rule's counts on the synthetic model, every layer eligible
+        // once the card reads a q5_K gate and up and a q8_0 down [derived: at six experts a layer
+        // a q4_K gate and an up of 5,529,600 B take three 2 MiB granules each and a q5_1 down of
+        // 7,372,800 B four, 20 MiB a layer; layer 2's q5_K gate and up of 6,758,400 B four each and
+        // its q8_0 down of 10,444,800 B five, 26 MiB; layer 4's 6 + 6 + 10, 22 MiB; the six norms
+        // share one granule: 130 MiB, and a seventh expert on layer 0 takes 6 MiB more, past 131
+        // MiB. Under a reserve of 3 MiB the budget is 128 MiB: at five experts layer 5 takes 18
+        // MiB, 128 MiB in all, and its sixth passes it. A replica of the rule reproduced the
+        // four-layer counts these replaced (10 on layers 0, 1, 3, 5; 9 on layer 5 under the
+        // reserve) before it gave these].
+        const N_L: [u64; 6] = [6, 6, 6, 6, 6, 6];
+        const N_L_RESERVED: [u64; 6] = [6, 6, 6, 6, 6, 5];
         const HEAP: u64 = 130 * MIB;
-        const HEAP_RESERVED: u64 = 126 * MIB;
+        const HEAP_RESERVED: u64 = 128 * MIB;
 
-        /// The id prefix on the layers whose stacks the card experts read,
-        /// none on the others; each card segment in the file's bytes as words,
+        /// The id prefix on every layer, the card experts reading each of its
+        /// stacks; each card segment in the file's bytes as words,
         /// its bytes the prefix's file bytes; the rest on the host; deepseek2's
         /// `routed_row` still takes the packed q5_1.
         #[test]
@@ -1653,7 +1683,8 @@ mod tests {
                 }
             }
             let c = &plan.cards[0];
-            assert_eq!(c.expert_bytes, 40 * (2 * GATE + DOWN));
+            let expert_bytes: u64 = (0..6).map(|l| N_L[l] * expert_bytes(l)).sum();
+            assert_eq!(c.expert_bytes, expert_bytes);
             assert_eq!(c.dense_bytes, 6 * 2560 * 4);
             assert_eq!(c.dense_bytes + c.expert_bytes + c.rounding_bytes, HEAP);
             let down = model

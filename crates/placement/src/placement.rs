@@ -214,13 +214,13 @@ pub enum Device {
 pub enum CardFormat {
     /// The file's rows as they are stored, their byte stream as u32 words,
     /// zero-padded at its end to `rows · ceil(words / rows)` words: every
-    /// q3_K/q4_K/q5_K/q6_K tensor, and a routed q5_1 stack a program's card
-    /// experts read in the file's `block_q5_1` bytes (a program's
-    /// [`RoutedFormat`] names it; [`CardFormat::of`] keeps q5_1 in
-    /// [`CardFormat::Q5_1`]). The kernels address a row by its byte offset in
-    /// the stream, so a row need not start on a word (q6_K at k = 768 is 630
-    /// bytes); the padding only makes the buffer a whole number of words per
-    /// row.
+    /// q3_K/q4_K/q5_K/q6_K tensor, and a routed q5_1 or q8_0 stack a
+    /// program's card experts read in the file's `block_q5_1` or `block_q8_0`
+    /// bytes (a program's [`RoutedFormat`] names it; [`CardFormat::of`] keeps
+    /// q5_1 in [`CardFormat::Q5_1`] and q8_0 in [`CardFormat::Q8_0Planes`]).
+    /// The kernels address a row by its byte offset in the stream, so a row
+    /// need not start on a word (q6_K at k = 768 is 630 bytes); the padding
+    /// only makes the buffer a whole number of words per row.
     KQuant,
     /// q5_0 in the gemv's layout: per row one byte per 5-bit code in 1024-value
     /// windows, then one f32 scale per 32-value block.
@@ -357,14 +357,14 @@ impl CardFormat {
     /// format [`CardFormat::of`] names for `ty`, [`CardFormat::Bf16AsF32`] for
     /// a K-quant ([`CardFormat::of_role`]'s engram gain),
     /// [`CardFormat::Bf16Raw`] for bf16, which only a reader that picks it
-    /// uses, or [`CardFormat::KQuant`] for q5_1, the file's blocks, which
-    /// only a program's [`RoutedFormat`] picks.
+    /// uses, or [`CardFormat::KQuant`] for q5_1 and q8_0, the file's blocks,
+    /// which only a program's [`RoutedFormat`] picks.
     #[must_use]
     pub fn holds(self, ty: GgmlType) -> bool {
         CardFormat::of(ty) == Some(self)
             || (self == CardFormat::Bf16AsF32 && CardFormat::of(ty) == Some(CardFormat::KQuant))
             || (self == CardFormat::Bf16Raw && ty == GgmlType::BF16)
-            || (self == CardFormat::KQuant && ty == GgmlType::Q5_1)
+            || (self == CardFormat::KQuant && matches!(ty, GgmlType::Q5_1 | GgmlType::Q8_0))
     }
 
     /// Device bytes of `rows` rows of `k` values of file type `ty` in this

@@ -33,7 +33,8 @@
 //! `card`), which the step's, the verify's and the pass's card leg and the
 //! ubatch walk's card route run, or with `BLOOMERY_QWEN38_EXPERTS=host` every
 //! routed expert on the host tier; a set `card` is refused on the other
-//! families' files; the `plan` line prints `experts=` and the `load` line `card_layers=`.
+//! families' files; the `plan` line prints `experts=` and the `load` line `card_layers=` and
+//! `card_stacks=` (each card layer's gate·up and down types, with its layers).
 //!
 //! A qwen35moe file runs `auto` and `gemm` through `Body35`'s prompt call
 //! (`Qwen35moeModel::prefill_with`: the same plan, every unit a walk of the
@@ -1605,7 +1606,8 @@ mod cli {
         let body = m.body("generate_qwen3moe")?;
         println!(
             "load arch=qwen4exp resident_bytes={} ctx={ctx} layers={} mode={} store_bytes={} \
-             prefill={} ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
+             prefill={} ubatch={} place={} card_layers={} card_stacks={} in {:.1} s (runtime \
+             value)",
             m.resident_bytes(),
             m.layers().len(),
             mode_name(mode),
@@ -1614,6 +1616,7 @@ mod cli {
             body.ubatch_rows(),
             place.name(),
             body.card_layers(),
+            body.card_stacks(),
             t.elapsed().as_secs_f64()
         );
         if let Some(why) = draft_off {
@@ -1695,7 +1698,8 @@ mod cli {
         let body = m.body("generate_qwen3moe")?;
         println!(
             "load arch=qwen4exp resident_bytes={} ctx={ctx} layers={} mode={} store_bytes={} \
-             prefill={} ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
+             prefill={} ubatch={} place={} card_layers={} card_stacks={} in {:.1} s (runtime \
+             value)",
             m.resident_bytes(),
             m.layers().len(),
             mode_name(mode),
@@ -1704,6 +1708,7 @@ mod cli {
             body.ubatch_rows(),
             place.name(),
             body.card_layers(),
+            body.card_stacks(),
             t.elapsed().as_secs_f64()
         );
         let draft = body.mtp().ok_or("the load opened no MTP draft")?;

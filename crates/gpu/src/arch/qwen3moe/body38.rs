@@ -705,7 +705,7 @@ impl Body38 {
             deadline: DEADLINE,
             top_k: geo::N_USED,
             max_rows: PASS_ROWS,
-            stacks: Arc::new(Qwen38Stacks),
+            stacks: Arc::new(Qwen38Stacks::of(&inputs.model)?),
         };
         GpuModel::load_placed_with(
             file,
@@ -865,7 +865,7 @@ impl Body38 {
             n,
             geo::EXPERTS,
         )?);
-        let card = Card38::new(gpu, w, &map, n)?;
+        let card = Card38::new(gpu, w, &Qwen38Stacks::of(&inputs.model)?, &map, n)?;
         let wide = Wide38::new(stream, ub, &card)?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
         if wide_bytes > counted {
@@ -1760,6 +1760,14 @@ impl Body38 {
     #[must_use]
     pub fn card_layers(&self) -> usize {
         self.card.card_layers()
+    }
+
+    /// The card layers' routed stack types, each with its layers (the card
+    /// leg's own summary, `card38`'s `card_stacks`): what the load line
+    /// names beside the card layers.
+    #[must_use]
+    pub fn card_stacks(&self) -> String {
+        self.card.card_stacks()
     }
 
     /// The last ubatch walk's rows of each selecting layer: those the

@@ -88,6 +88,28 @@
 //!     in neither, each launch alone over NaN host columns; the launchers
 //!     refuse a card of no expert, weights at a pitch of ten, columns past the
 //!     scratch and a slot past the weights.
+//! 11. q8_0_sel32: the Q8_0 down `_sel` of 32-value blocks
+//!     (`bloomery_gpu::q8_0_sel32`, the file's `block_q8_0` bytes resident as
+//!     one word stream) over clause 7's seven experts and ten slots, at the
+//!     stack shapes (rows × K) 2560 × 640 (Qwen3.8's routed down of layers 2,
+//!     4, 30, 46 and 47: every row has odd blocks, whose `d` is a word's high
+//!     half), 100 × 1280 (a partial last grid block and a second lane pass),
+//!     64 × 1120 (35 blocks a row: every other row starts half a word in, so a
+//!     block's parity is its index in the stream, not in its row), 64 × 2080
+//!     (three q windows, 65 blocks) and 64 × 32 (one block): within
+//!     `KERNEL_BAND` of the f64 dot of `dequant_row(Q8_0)` rows with the
+//!     activation dequantized from the quantizer's own readback, the `HOST`
+//!     slot untouched, a rerun bit-identical. On 2560 × 640: a captured launch
+//!     replays as one node and follows overwritten ids; an id past the stack
+//!     raises `ExpertId` and leaves its slot as it was; a NaN in a column
+//!     raises `Q5Quant` from the quantizer and the down adds no fault; a NaN
+//!     `d` in an odd block of one row NaNs that row of each slot on its expert
+//!     and nothing else, with no fault; the launcher refuses an activation of
+//!     another K, a column count other than the slots, a non-dividing expert
+//!     size and a stack of Q5_1's row width. Mutants, each red here: the odd
+//!     block's `d` read from the low half (the band), the parity of a block
+//!     taken in its row (the band at 64 × 1120), the `HOST` slot not skipped
+//!     (the untouched slot), `ExpertId` not raised (the past-stack fault).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -111,6 +133,7 @@ mod gate {
     use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
     use bloomery_gpu::q5_1_sel::{BLOCK_WORDS, Q51SelDown, Q51SelKernels};
+    use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels, stream_cols};
     use bloomery_gpu::q38::{CardAccArgs, CardSharedAddArgs, Q38Kernels, SLOTS, W_PITCH};
     use bloomery_gpu::{
         DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_sums,
@@ -446,6 +469,7 @@ mod gate {
         gpu: Gpu,
         kq: KquantKernels,
         q51: Q51SelKernels,
+        q80: Q80SelKernels,
         gm: gate_kernels::LoadedModule,
     }
 
@@ -864,7 +888,14 @@ mod gate {
         // every launch here passes the launch contract's check.
         let gm = unsafe { gate_kernels::load(gpu.context())? };
         let q51 = Q51SelKernels::load(gpu.context(), gpu.fault_word())?;
-        let c = Ctx { gpu, kq, q51, gm };
+        let q80 = Q80SelKernels::load(gpu.context(), gpu.fault_word())?;
+        let c = Ctx {
+            gpu,
+            kq,
+            q51,
+            q80,
+            gm,
+        };
         if let Some(f) = c.gpu.take_fault()? {
             return Err(format!("gate_kquant: the fault word held {f} before any launch").into());
         }
@@ -879,6 +910,7 @@ mod gate {
         ok &= check_q8_0(&c)?;
         ok &= check_q4k_gate_up(&c)?;
         ok &= check_q38_card(&c)?;
+        ok &= check_q8_0_sel32(&c)?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -899,7 +931,10 @@ mod gate {
              Q5_K's; Qwen3.8's card leg over two tokens: the card columns' q8_1 the plain \
              quantizer's, the host columns untouched, the card sum and the combine the \
              runtime's rule bit for bit, five nodes replaying moved places, q5_quant and \
-             f32_product named, the launchers' refusals"
+             f32_product named, the launchers' refusals; q8_0_gemv_sel32 within \
+             {KERNEL_BAND:e} of the f64 dequant_row reference at 5 shapes (odd blocks a row \
+             among them), HOST untouched, graph replay, expert_id past the stack, q5_quant on a \
+             NaN column, a NaN scale NaNs its rows, the launcher's refusals"
         );
         Ok(())
     }
@@ -2448,6 +2483,315 @@ mod gate {
             };
             println!(
                 "q38_card_host[{case}] want=Err(Shape {what}) got={seen} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        stream.synchronize()?;
+        Ok(ok && c.gpu.take_fault()?.is_none())
+    }
+
+    /// One synthetic Q8_0 stack of [`E51`] experts of `rpe` rows of `k`
+    /// values: the file's `block_q8_0` bytes, and the word stream the card
+    /// holds ([`stream_cols`] words a row, zero-padded at the end).
+    struct Stack80 {
+        k: usize,
+        rpe: usize,
+        bytes: Vec<u8>,
+        w: DeviceTensor<u32>,
+    }
+
+    impl Stack80 {
+        fn new(c: &Ctx, rpe: usize, k: usize, seed: u64) -> Result<Stack80, GateError> {
+            let bytes = synthetic_q8_0(E51 * rpe * (k / 32), seed);
+            let w = upload80(c, &bytes, E51 * rpe, k)?;
+            Ok(Stack80 { k, rpe, bytes, w })
+        }
+
+        /// Expert `e`'s rows as bytes.
+        fn expert_bytes(&self, e: usize) -> &[u8] {
+            let per = self.rpe * (self.k / 32) * 34;
+            &self.bytes[e * per..(e + 1) * per]
+        }
+    }
+
+    /// `bytes`, `rows` rows of `k` values of `block_q8_0`s, as the card's word
+    /// stream.
+    fn upload80(
+        c: &Ctx,
+        bytes: &[u8],
+        rows: usize,
+        k: usize,
+    ) -> Result<DeviceTensor<u32>, GateError> {
+        let cols = stream_cols(k / 32, rows).ok_or("gate_kquant: a Q8_0 stack of no rows")?;
+        let mut words = vec![0u32; rows * cols];
+        for (i, b) in bytes.iter().enumerate() {
+            words[i / 4] |= u32::from(*b) << (8 * (i % 4));
+        }
+        Ok(DeviceTensor::upload(c.gpu.stream(), &words, rows, cols)?)
+    }
+
+    /// `blocks` synthetic `block_q8_0`s from a fixed-seed xorshift64: `d` a
+    /// positive normal f16 of exponent field 1..=9 (no NaN or infinity), the
+    /// 32 codes random over all 256 byte values.
+    fn synthetic_q8_0(blocks: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut out = Vec::with_capacity(blocks * 34);
+        for _ in 0..blocks {
+            let r = next();
+            let d = ((1 + (r % 9) as u16) << 10) | ((r >> 32) as u16 & 0x3ff);
+            out.extend_from_slice(&d.to_le_bytes());
+            for _ in 0..4 {
+                out.extend_from_slice(&next().to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// The Q8_0 down `_sel` of `w` (`rpe` rows an expert) for `sel` (one id a
+    /// column of `act`) into a `SENT`-filled output, synchronized; the output
+    /// and the fault word.
+    fn down80(
+        c: &Ctx,
+        w: &DeviceTensor<u32>,
+        rpe: usize,
+        act: &Q8Blocks32,
+        sel: &[u32],
+    ) -> Result<(Vec<f32>, Option<Fault>), GateError> {
+        let stream = c.gpu.stream();
+        let sel_dev = DeviceBuffer::from_host(stream, sel)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; sel.len() * rpe])?;
+        let a = Q80SelDown {
+            w,
+            act,
+            sel: &sel_dev,
+            n_slots: sel.len(),
+            rows_per_expert: rpe,
+        };
+        c.q80
+            .enqueue_gemv_q8_0_sel32(stream, &a, c.gpu.unlabelled_sink(), &mut y)?;
+        stream.synchronize()?;
+        Ok((y.to_host_vec(stream)?, c.gpu.take_fault()?))
+    }
+
+    /// Clause 11 (module doc).
+    fn check_q8_0_sel32(c: &Ctx) -> Result<bool, GateError> {
+        // (tag, rows an expert, K)
+        const SHAPES: [(&str, usize, usize); 5] = [
+            ("qwen38_down_2560x640", 2560, 640),
+            ("grid_tail_lane_pass2_100x1280", 100, 1280),
+            ("odd_blocks_64x1120", 64, 1120),
+            ("windows3_64x2080", 64, 2080),
+            ("one_block_64x32", 64, 32),
+        ];
+        let stream = c.gpu.stream();
+        let mut ok = true;
+        let mut first = None;
+        for (i, &(tag, rpe, k)) in SHAPES.iter().enumerate() {
+            let st = Stack80::new(c, rpe, k, 0x80b1_0001 + i as u64)?;
+            let x = activations(k, SEL51.len(), 8801 + i as u32);
+            let (act, xq) = quantize51(c, &x, SEL51.len(), k)?;
+            let (y, fault) = down80(c, &st.w, rpe, &act, &SEL51)?;
+            let (y2, fault2) = down80(c, &st.w, rpe, &act, &SEL51)?;
+            let (mut got, mut want) = (Vec::new(), Vec::new());
+            for (s, &e) in SEL51.iter().enumerate() {
+                if e == HOST {
+                    continue;
+                }
+                got.extend_from_slice(&y[s * rpe..(s + 1) * rpe]);
+                want.extend(ref_gemv(
+                    GgmlType::Q8_0,
+                    st.expert_bytes(e as usize),
+                    k,
+                    rpe,
+                    &xq[s * k..(s + 1) * k],
+                    1,
+                )?);
+            }
+            let rel = max_rel_err(&got, &want)?;
+            let host_untouched = y[HOST_SLOT * rpe..(HOST_SLOT + 1) * rpe]
+                .iter()
+                .all(|v| v.to_bits() == SENT.to_bits());
+            let rerun = bits_equal(&y, &y2);
+            let pass = fault.is_none()
+                && fault2.is_none()
+                && rel <= KERNEL_BAND
+                && host_untouched
+                && rerun;
+            ok &= pass;
+            println!(
+                "q8_0_sel32[{tag}] rows={rpe} K={k} k_blocks={} words_a_row={} sel={SEL51:?} \
+                 max_rel={rel:.3e} band={KERNEL_BAND:e} host_slot_untouched={host_untouched} \
+                 rerun_bit_identical={rerun} faults=\"{}\",\"{}\" {}",
+                k / 32,
+                st.w.cols(),
+                shown(fault),
+                shown(fault2),
+                verdict(pass),
+            );
+            if i == 0 {
+                first = Some((st, x, act));
+            }
+        }
+        let (st, x, act) = first.ok_or("gate_kquant: no Q8_0 stack for the graph case")?;
+        let (rpe, k) = (st.rpe, st.k);
+        let (clean, _) = down80(c, &st.w, rpe, &act, &SEL51)?;
+        // The graph: captured with SEL51, replayed, the ids overwritten outside it.
+        let sel_b: [u32; 10] = [1, 6, HOST, 0, 3, 5, 2, 2, 4, 0];
+        let eager_b = down80(c, &st.w, rpe, &act, &sel_b)?.0;
+        let mut sel_dev = DeviceBuffer::from_host(stream, &SEL51)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; SEL51.len() * rpe])?;
+        let graph = c.gpu.capture(|s| {
+            let a = Q80SelDown {
+                w: &st.w,
+                act: &act,
+                sel: &sel_dev,
+                n_slots: SEL51.len(),
+                rows_per_expert: rpe,
+            };
+            c.q80
+                .enqueue_gemv_q8_0_sel32(s, &a, c.gpu.unlabelled_sink(), &mut y)
+        })?;
+        let nodes = graph.node_count();
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let ya = y.to_host_vec(stream)?;
+        sel_dev.copy_from_host(stream, &sel_b)?;
+        y.copy_from_host(stream, &vec![SENT; SEL51.len() * rpe])?;
+        graph.launch(stream)?;
+        stream.synchronize()?;
+        let yb = y.to_host_vec(stream)?;
+        drop(graph);
+        let (a_same, b_same) = (bits_equal(&ya, &clean), bits_equal(&yb, &eager_b));
+        let pass = a_same && b_same && nodes == 1 && c.gpu.take_fault()?.is_none();
+        ok &= pass;
+        println!(
+            "q8_0_sel32_graph[{rpe}x{k}] replay_a_bit_identical={a_same} \
+             replay_b_bit_identical={b_same} graph_nodes={nodes} {}{}{}",
+            verdict(pass),
+            mismatch("first_mismatch_a", &ya, &clean, rpe),
+            mismatch("first_mismatch_b", &yb, &eager_b, rpe),
+        );
+        // An id past the stack in slot 1.
+        let expert_id = Some(Fault::at(LAYER_NONE, FaultSite::ExpertId));
+        let mut sel = SEL51;
+        sel[1] = E51 as u32 + 3;
+        let (got, fault) = down80(c, &st.w, rpe, &act, &sel)?;
+        let mut want = clean.clone();
+        want[rpe..2 * rpe].fill(SENT);
+        let values_ok = bits_equal(&got, &want);
+        let pass = values_ok && fault == expert_id;
+        ok &= pass;
+        println!(
+            "q8_0_sel32_fault[past_stack] sel={sel:?} fault=\"{}\" want=\"{}\" \
+             slot1_untouched_others_clean={values_ok} {}{}",
+            shown(fault),
+            shown(expert_id),
+            verdict(pass),
+            mismatch("first_mismatch", &got, &want, rpe),
+        );
+        // A NaN in column 2: the quantizer's fault; the down adds none.
+        let q5_quant = Some(Fault::at(LAYER_NONE, FaultSite::Q5Quant));
+        let mut xn = x.clone();
+        xn[2 * k + 77] = f32::NAN;
+        let (actn, _) = quantize51(c, &xn, SEL51.len(), k)?;
+        let qf = c.gpu.take_fault()?;
+        let (yn, fd) = down80(c, &st.w, rpe, &actn, &SEL51)?;
+        let nan_rows = yn[2 * rpe..3 * rpe].iter().filter(|v| v.is_nan()).count();
+        let pass = qf == q5_quant && fd.is_none();
+        ok &= pass;
+        println!(
+            "q8_0_sel32_fault[nan_column] quantizer_fault=\"{}\" want=\"{}\" down_fault=\"{}\" \
+             column2_nan_rows={nan_rows}/{rpe} {}",
+            shown(qf),
+            shown(q5_quant),
+            shown(fd),
+            verdict(pass)
+        );
+        // A NaN `d` in block 1 (odd: the high half of its first word) of row 5
+        // of expert 6, which slots 0 and 6 read: those two rows NaN, the rest
+        // the clean launch's, no fault.
+        const NAN_ROW: usize = 5;
+        let mut bytes = st.bytes.clone();
+        let at = ((6 * rpe + NAN_ROW) * (k / 32) + 1) * 34;
+        bytes[at..at + 2].copy_from_slice(&0x7e00u16.to_le_bytes());
+        let wn = upload80(c, &bytes, E51 * rpe, k)?;
+        let (ys, fs) = down80(c, &wn, rpe, &act, &SEL51)?;
+        let mut nan_at = Vec::new();
+        let mut others_clean = true;
+        for (i, (g, w)) in ys.iter().zip(&clean).enumerate() {
+            if g.is_nan() {
+                nan_at.push(i);
+            } else if g.to_bits() != w.to_bits() {
+                others_clean = false;
+            }
+        }
+        let want_nan = vec![NAN_ROW, 6 * rpe + NAN_ROW];
+        let pass = nan_at == want_nan && others_clean && fs.is_none();
+        ok &= pass;
+        println!(
+            "q8_0_sel32_nan_scale[expert6_row{NAN_ROW}_block1] nan_outputs={nan_at:?} \
+             want={want_nan:?} others_clean={others_clean} fault=\"{}\" {}",
+            shown(fs),
+            verdict(pass)
+        );
+        ok &= check_q8_0_sel32_host_contract(c, &st, &act)?;
+        Ok(ok)
+    }
+
+    /// Clause 11's refusals: each a `Shape` error of the launcher.
+    fn check_q8_0_sel32_host_contract(
+        c: &Ctx,
+        st: &Stack80,
+        act: &Q8Blocks32,
+    ) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let what = "enqueue_gemv_q8_0_sel32";
+        let sel = DeviceBuffer::from_host(stream, &SEL51)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; SEL51.len() * st.rpe])?;
+        let sink = c.gpu.unlabelled_sink();
+        let other_k = Q8Blocks32::with_slots(stream, 2 * st.k, SEL51.len())?;
+        let few = Q8Blocks32::new(stream, st.k, 2)?;
+        let q51_rows = Stack51::new(c, st.rpe, st.k, 0x80b1_00ff)?;
+        let down =
+            |w: &DeviceTensor<u32>, act: &Q8Blocks32, rpe: usize, y: &mut DeviceBuffer<f32>| {
+                c.q80.enqueue_gemv_q8_0_sel32(
+                    stream,
+                    &Q80SelDown {
+                        w,
+                        act,
+                        sel: &sel,
+                        n_slots: SEL51.len(),
+                        rows_per_expert: rpe,
+                    },
+                    sink,
+                    y,
+                )
+            };
+        let cases: [(&str, Result<(), GpuError>); 4] = [
+            ("act_of_twice_k", down(&st.w, &other_k, st.rpe, &mut y)),
+            (
+                "act_2_columns_for_10_slots",
+                down(&st.w, &few, st.rpe, &mut y),
+            ),
+            ("rows_per_expert_300", down(&st.w, act, 300, &mut y)),
+            ("q5_1_row_width", down(&q51_rows.w, act, st.rpe, &mut y)),
+        ];
+        let mut ok = true;
+        for (case, r) in cases {
+            let pass = matches!(&r, Err(GpuError::Shape { what: w, .. }) if *w == what);
+            let seen = match &r {
+                Ok(()) => "Ok (accepted)".to_string(),
+                Err(e) => format!("Err: {e}"),
+            };
+            println!(
+                "q8_0_sel32_host[{case}] want=Err(Shape {what}) got={seen} {}",
                 verdict(pass)
             );
             ok &= pass;

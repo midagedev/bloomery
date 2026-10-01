@@ -1,0 +1,47 @@
+# Round q38hol: card experts on Qwen3.8's five host-only layers (2, 4, 30, 46, 47), whose q5_K gate and up
+# and q8_0 down the card now reads (kq_gate_up_act_q5k, q8_0_gemv_sel32). Two builds, one lease: this tree's
+# generate_qwen3moe against the base's (b530ed42, a git archive in the aux remote dir bloomery-q38hol-base), both
+# at the shipped defaults (residency and the MTP draft unset, host streaming on; the residency resolves to
+# mid-p<half the plan's fewest card experts a layer>: p138 on the base's plan, p121 on ours).
+# [derived, q38async layers.py re-run with the base's measured host slots (q38seed §3: 136 a token at P 512, 77 at
+# P 4096 with residency on; 50 of them the five host-only layers' ten slots each)]: the with-draft plan (A6000,
+# ctx 4k, U 4,096) moves 278/277 experts on 43 layers to 244/243 on 48 (qwen4exp_meta CARD_PLANS); the 43 layers'
+# hit 0.800 -> 0.748..0.771 (P 512) and 0.937 -> 0.877..0.904 (P 4096) for Zipf a 0.72..1.0, the five layers'
+# the same. A window is the draft's chain plus a 4-row verify whose host union serves each layer's distinct
+# host experts (4 rows at 0.8 overlap, W 23.36 us at 3.072 MB, x1.17 for the five layers' heavier experts):
+# the five layers' union falls from 32 to 7..8 experts a layer at P 512 (-3.3..-3.4 ms) and to 3..4 at P 4096
+# (-3.8..-3.9 ms); the 43 layers' union grows by 12..22 slots a token x 3.2 (+0.9..+1.6 ms, P 512) and 14..26
+# (+1.1..+2.0 ms, P 4096). Net -1.7..-2.5 ms (P 512) and -1.9..-2.9 ms (P 4096) on a 27.8..41.2 ms window
+# (q38step §3), E(4) unchanged: +4.3..+9.9 % and +4.9..+11.6 %. Band for both P: +4..+12.
+# On a plain step (no draft) the same model gives -0.76..-0.91 ms (P 512) and -1.05..-1.13 ms (P 4096).
+# Runner (the full output to a file first; the base built by `just ptx-scan generate_qwen3moe --features gpu` in
+# the base tree, which is this runner's bin: arm build; bin:<path>:prose:<P> from the lead's binprose patch):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38hol-ab.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=6
+# just depth-gpu-qwen4exp prose:512 bin:/root/repo/bloomery-q38hol-base/target/release/generate_qwen3moe:prose:512
+#   prose:4096 bin:/root/repo/bloomery-q38hol-base/target/release/generate_qwen3moe:prose:4096
+# Rounds: sd 2.6 % (q38seed-mtp.card's), 6 rounds give h 3.3 %, under the band's low edge 4.
+# Wall [derived]: the q38seed-mtp window's 24 rows with the draft's load, 8..12 min.
+# Untimed functional reads before the run (gpu-gate.sh, BLOOMERY_STEP_STATS=1, one process each, not admissible as
+# tok/s): host slots a pass 621.2 -> 526.8 (P 512) and 351.0 -> 245.9 (P 4096), leg_us mean 13.44 -> 11.65 ms and
+# 8.75 -> 6.49 ms.
+kind: ab
+question: do card experts on Qwen3.8's five host-only layers lift the shipped default's decode?
+term: tg tok/s @ n=96, prose:512 and prose:4096, ctx 4352, A6000, plan a, residency and draft unset
+  (mid-p138-s1 base, mid-p121-s1 ours; mtp), host streaming on; this tree's generate_qwen3moe against the base build b530ed42,
+  paired by round
+unit: %
+predict: +4..+12
+rounds: 6
+sd: 2.6 % q38seed-mtp.card (the q38seed-ab window, 09-30 21:04-21:09 UTC, paired tg ratio SD 3.7-3.8 % over 4
+  rounds / sqrt 2)
+condition: both builds alternate in one lease, the order rotated every round, a fresh process per arm, the
+  host set and the PLE table warm, no [cpu-busy] or [other-busy] row; our arms' load line prints card_layers=48
+  and card_stacks naming q5_K/q8_0 on layer 2 and q4_K/q8_0 on 4, 30, 46, 47, and its plan card_experts
+  11680; the base's card_layers=43 and card_experts 11917; each arm's records name its residency unset
+  (mid-p121-s1 ours, mid-p138-s1 base) and load draft=mtp
+decide-in: land q38hol as measured and write the per-P rows with the functional run's host slots in rig-log
+decide-below: read the arms' E(4) and one BLOOMERY_STEP_STATS=1 functional run's host slots: slots down with no
+  gain is the five layers' shadow (their heavier card leg), not the bridge; an nsys window of one verify before
+  any change
+decide-above: the 43 layers' hit did not fall as the Zipf model says: re-derive the concave term from the
+  functional run's per-layer host slots before the next placement round
