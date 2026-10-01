@@ -1245,6 +1245,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          its thread stacks and ends it once its output has stopped that long; unset, no watch.",
     ),
     runner(
+        "BLOOMERY_GATE_GDB",
+        Some("gpu-gate.sh"),
+        "`1`: the GPU gate's binary runs under gdb, which prints every thread's stack when a \
+         signal ends it, and the runner exits 128 + the signal; `0` or unset, no gdb.",
+    ),
+    runner(
         "BLOOMERY_BOX_CARD",
         Some("box.sh"),
         "The card `tools/box.sh` put in view, passed to the box side: `3090`, `a6000` or \

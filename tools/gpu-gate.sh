@@ -19,6 +19,7 @@
 # 환경: BLOOMERY_GATE_BOUND(초, 기본 900 — tools/gate.sh와 같은 레버), BLOOMERY_GATE_CARD(아래 카드 고르기),
 # BLOOMERY_BOX_CARD(box.sh가 넘기는 카드 선택 — 아래), BLOOMERY_GATE_V41_LOAD(1이면 V4.1 적재 락도 잡는다 — 아래).
 # BLOOMERY_GATE_STACKS(초 — 설정하면 바이너리의 출력이 그만큼 멈출 때 tools/ref/stack-watch.sh가 스레드 스택을 뜨고 끝낸다).
+# BLOOMERY_GATE_GDB=1: the binary runs under gdb, which prints every thread's stack when a signal ends it.
 set -uo pipefail
 GATE_LOCK=/root/bloomery-gate.lock A6000_LOCK=/root/bloomery-gate-a6000.lock
 V41_LOCK=/root/bloomery-v41-load.lock V41_BOUND=1800 POLL=5 CARD_BOUND=1800
@@ -95,7 +96,7 @@ PY
   gate() {
     local o=$1 c=$2 l=$3
     shift 3
-    (cd "$t/tree" && env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u CUDA_VISIBLE_DEVICES \
+    (cd "$t/tree" && env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES \
       PATH="$t/bin:$PATH" BLOOMERY_GATE_CARD="$c" BLOOMERY_LEASE_LOCK="$l" BLOOMERY_LEASE_PROC="$t/proc" "$@" \
       bash "$self" --test-locks "$t" ok) > "$o" 2>&1
   }
@@ -187,6 +188,8 @@ PY
   case_ 'BLOOMERY_GATE_V41_LOAD other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_V41_LOAD is 1' 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=yes
   case_ 'BLOOMERY_GATE_STACKS not whole seconds: 64, named' 64 'BLOOMERY_GATE_STACKS is whole seconds' 3090 "$t/lease" BLOOMERY_GATE_STACKS=soon
   case_ 'BLOOMERY_GATE_STACKS set: the binary runs under the watch, its output through' 0 'ran on $' 3090 "$t/lease" BLOOMERY_GATE_STACKS=5
+  case_ 'BLOOMERY_GATE_GDB other than 0 or 1: 64, named' 64 'BLOOMERY_GATE_GDB is 1' 3090 "$t/lease" BLOOMERY_GATE_GDB=yes
+  case_ 'BLOOMERY_GATE_GDB with BLOOMERY_GATE_STACKS: 64, named' 64 'set one' 3090 "$t/lease" BLOOMERY_GATE_GDB=1 BLOOMERY_GATE_STACKS=5
   # Two V4.1 loads at once, on the two cards: the second waits for the first, names it, and counts the wait.
   gate "$t/first" a6000 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 STUB_SLEEP=3 &
   p1=$!
@@ -274,6 +277,18 @@ case $STACKS in
   '') ;;
   0 | *[!0-9]*) echo "gpu-gate.sh: BLOOMERY_GATE_STACKS is whole seconds from 1 (the quiet time before a stack dump) or unset, got '$STACKS'" >&2; exit 64 ;;
 esac
+# BLOOMERY_GATE_GDB=1: the binary runs under gdb. A signal that ends it (a segfault in a driver's teardown, say)
+# prints every thread's stack, and the runner exits 128 + the signal, as the bare run would; a clean exit keeps
+# its code. A crash then says where in the run that printed it, with no core file to find.
+GDB=${BLOOMERY_GATE_GDB:-0}
+case $GDB in
+  0 | 1) ;;
+  *) echo "gpu-gate.sh: BLOOMERY_GATE_GDB is 1 (run under gdb) or 0/unset, got '$GDB'" >&2; exit 64 ;;
+esac
+if [ "$GDB" = 1 ] && [ -n "$STACKS" ]; then
+  echo "gpu-gate.sh: BLOOMERY_GATE_GDB and BLOOMERY_GATE_STACKS each own the process; set one" >&2
+  exit 64
+fi
 # 카드 고르기. 락은 카드마다 하나: 3090은 예전 경로 그대로(돌고 있는 트랙의 옛 사본이 그 경로를 잡는다),
 # A6000은 새 파일. BLOOMERY_GATE_CARD=3090(기본 — 예전과 같다) | a6000 | any. any는 A6000을 먼저 본다 —
 # V4.1 `--place gate` 게이트는 3090에서만 돌 수 있으니 떠도는 게이트가 3090을 비워 두는 편이 낫다. any는
@@ -527,6 +542,24 @@ fi
 echo "gpu-gate.sh: $NAME on $([ "$GOT" = both ] && echo 'both cards, both gate locks' || echo "the $GOT") (asked $CARD)$([ "$V41" = 0 ] || echo ', V4.1 load lock')" >&2
 if [ -n "$STACKS" ]; then
   bash "${BASH_SOURCE[0]%/*}/ref/stack-watch.sh" "$STACKS" "$NAME" -- timeout --kill-after=10 "$BOUND" "$EXE" "$@"
+elif [ "$GDB" = 1 ]; then
+  GDB_CMDS=$(mktemp)
+  cat > "$GDB_CMDS" <<'G'
+set pagination off
+set print thread-events off
+handle SIGPIPE nostop noprint
+run
+if $_isvoid($_exitcode)
+  info threads
+  thread apply all bt 30
+  quit 128 + $_siginfo.si_signo
+end
+quit $_exitcode
+G
+  timeout --kill-after=10 "$BOUND" gdb -q -batch -x "$GDB_CMDS" --args "$EXE" "$@"
+  rc=$?
+  rm -f "$GDB_CMDS"
+  (exit "$rc")
 else
   timeout --kill-after=10 "$BOUND" "$EXE" "$@"
 fi
