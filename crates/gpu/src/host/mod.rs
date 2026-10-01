@@ -1737,7 +1737,7 @@ impl<H: HostExperts> HostTier<H> {
         self.health.refuse_if_poisoned(SERVE)?;
         let mask = self.tier_mask_in_service(layer)?;
         if mask != 0 {
-            self.feed_tiers(layer, row, mask)?;
+            self.feed_tiers(layer, row, mask, chain)?;
         }
         self.serve(layer, row, false, chain)?;
         if mask != 0 {
@@ -1801,7 +1801,7 @@ impl<H: HostExperts> HostTier<H> {
             if fed != 0 {
                 let mask = self.tier_mask_in_service(layer)? & fed;
                 if mask != 0 {
-                    self.feed_tiers(layer, row, mask)?;
+                    self.feed_tiers(layer, row, mask, chain)?;
                 }
             }
             self.serve(layer, row, i == 0, chain)?;
@@ -1823,17 +1823,23 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
-    /// Enqueue tier layer `layer` of row `row` on the streams of the tiers
-    /// whose bits `mask` sets now, for an eager chain or a fed pass; a
-    /// failure poisons the tier and releases every card's waits.
-    fn feed_tiers(&mut self, layer: usize, row: usize, mask: u32) -> Result<(), GpuError> {
+    /// Enqueue tier layer `layer` of row `row` of `chain` on the streams of
+    /// the tiers whose bits `mask` sets now, for an eager chain or a fed
+    /// pass; a failure poisons the tier and releases every card's waits.
+    fn feed_tiers(
+        &mut self,
+        layer: usize,
+        row: usize,
+        mask: u32,
+        chain: Chain,
+    ) -> Result<(), GpuError> {
         let r = match self.tier_page.as_ref() {
             Some(page) => self
                 .tiers
                 .iter_mut()
                 .enumerate()
                 .filter(|(t, _)| mask >> t & 1 == 1)
-                .try_for_each(|(_, t)| t.enqueue_eager(page, layer, row)),
+                .try_for_each(|(_, t)| t.enqueue_eager(page, chain, layer, row)),
             None => Ok(()),
         };
         if let Err(e) = r {

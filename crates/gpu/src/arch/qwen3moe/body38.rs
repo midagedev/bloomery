@@ -17,14 +17,21 @@
 //! map of the plan (`SlotMap::of_plan`: each layer's routed experts the plan
 //! puts on the card, the rest the host's), the card leg over the card's
 //! stacks (`card38`), and the host tier over every layer's routed stacks,
-//! which serves the map's host slots. Under an explicit `BLOOMERY_RESIDENCY`
+//! which serves the map's host slots. A plan with an expert tier card (plan
+//! (b′), `place::machine_bp`) hangs that card under the host tier (`tier38`:
+//! its routed segments, its set the map's tier rows, its computation, the
+//! tiers' page), the slot map then the plan's of both cards
+//! (`SlotMap::of_plan_tiers`); the step and the verify serve its layers, the
+//! pass and the ubatch walk refuse its map by name, so such a load feeds its
+//! prompt by steps. Under an explicit `BLOOMERY_RESIDENCY`
 //! word the load also runs the residency machine over the card's stacks
 //! (`swap38`: the common machine, Qwen3.8's parts and live delay), which
-//! moves the map between passes; unset keeps the load's map. Every walk runs
-//! its card side — the
-//! step, the verify and the pass the card leg, the ubatch walk its card
-//! route (`wide38`) — and every walk refuses by name a map with an expert
-//! on a tier card.
+//! moves the map between passes; unset keeps the load's map (the tier's
+//! experts are no part of the machine: held away, never moved). Every walk
+//! runs its card side — the step, the verify and the pass the card leg, the
+//! ubatch walk its card route (`wide38`) — and a walk with no tier leg (the
+//! pass and the ubatch walk, and every walk of a load that hung no tier)
+//! refuses by name a map with an expert on a tier card.
 //! [`Body38::open_placed_mtp`] also opens the MTP draft layer on the same
 //! card ([`Mtp38`]: its weights, its store, the reduced head's rows) and
 //! arms its program's arena; its walks ([`GpuModel::mtp_draft`]) read the
@@ -88,7 +95,8 @@ use super::scratch38::{
     dims, kept_lane, store_rule_bytes,
 };
 use super::swap38::{DEADLINE, LIVE_DELAY, Qwen38Stacks};
-use super::ubatch::UBATCH as UBATCH_MOST;
+use super::tier38::{TierSide38, open_tier};
+use super::ubatch::{UBATCH as UBATCH_MOST, UBATCH_ENV};
 use super::wide38::{
     Gemm38, STREAM_FLOOR, Stream38, Wide38, WideForce, WideParts, WideTaps, dense_rows,
     route_taps_host,
@@ -101,7 +109,8 @@ use crate::host::swap::{
     BoundaryAt, CallCfg, CallPick, CallReport, PassReport, ResetReport, Residency,
 };
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
-use crate::host::{BatchLeg, PassKind, StepLeg};
+use crate::host::tier::TierOpen;
+use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::model::{ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows};
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
@@ -526,6 +535,8 @@ pub struct Body38 {
     /// one, this `Arc`: the buffer lives until both let go.
     slots: Arc<DeviceTensor<u32>>,
     card: Card38,
+    /// The stage card's side of the expert tier, on a load that hung one.
+    tier: Option<TierSide38>,
     /// A ubatch walk's arena, record, host sums and own buffers, for
     /// ubatches of up to `wide.rows` positions.
     wa: Arena38,
@@ -587,10 +598,14 @@ impl Body38 {
     /// segments, the joins ([`Body38::derive`]) and the body over them with
     /// the host tier over every layer's routed experts, holding the load's
     /// host set as `host` asks, its ubatches of up to `ubatch` positions —
-    /// the value the plan's machine was built with (`place::machine`). The
-    /// load's slot map for the model's life ([`Residency::Off`]); refused by
-    /// name: a coverage item past [`ALLOWED`], a plan with an
-    /// expert tier card, a plan of more than one card or not every layer, a
+    /// the value the plan's machine was built with (`place::machine`) — and
+    /// the plan's expert tier card, when it names one, hung under the host
+    /// tier. The load's slot map for the model's life ([`Residency::Off`]);
+    /// refused by name: a coverage item past [`ALLOWED`], more expert tier
+    /// cards than the host tier serves, a tier layer with no card expert, a
+    /// tier whose prompt-batch bytes are not the plan's reserves
+    /// (`HostTier::check_tier_reserves`), a plan of more than one stage card
+    /// or not every layer, a
     /// layer or a width the kernels do not take, a `ubatch` outside
     /// `1..=min(UBATCH, ctx)`, and a ubatch arena past what the plan's
     /// scratch counts.
@@ -704,22 +719,7 @@ impl Body38 {
             &model::arch::qwen35moe::place::MtpPlan<'_>,
         )>,
     ) -> Result<Qwen38Model, GpuError> {
-        // The routed experts are the host's past the card's prefix: an expert
-        // tier's would be computed on the host unasked, or by nobody.
-        if !plan.machine.tiers.is_empty() {
-            let names: Vec<&str> = plan.machine.tiers.iter().map(|t| t.name.as_str()).collect();
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the placement names {} expert tier card(s) ({}): the program's tier leg — \
-                     each walk's tier handoff, the tier card's walk over its columns, the join of \
-                     its rows — is not built yet, so a plan with a tier does not load; run \
-                     --place a or gate",
-                    names.len(),
-                    names.join(", ")
-                ),
-            ));
-        }
+        refuse_tier_count(WHAT, plan.machine.tiers.len())?;
         let refused: Vec<String> = inputs
             .unimplemented()
             .into_iter()
@@ -915,15 +915,49 @@ impl Body38 {
         let wide_hsum = DeviceBuffer::zeroed(stream, ub * geo::HIDDEN)?;
         let host_cols = ub.max(PASS_ROWS);
         let run = 0..n;
-        let map = SlotMap::of_plan(plan, 0, None, run.clone(), geo::EXPERTS)?;
-        let card_leg = MapCheck::of(&map)?;
+        let tiers = TierOpen::of_machine(plan.machine);
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map = SlotMap::of_plan_tiers(plan, 0, &tier_cards, run.clone(), geo::EXPERTS)?;
+        let card_leg = MapCheck::of(&map, !tiers.is_empty())?;
+        // The batch port's tier legs quantize a block of `host_cols` tokens
+        // per slot, which a per-slot Q8Act caps.
+        if !tiers.is_empty() && host_cols > crate::tensor::Q8ACT_MAX_SLOTS {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a load with an expert tier takes a ubatch of at most {} tokens (its batch \
+                     port's tier legs quantize a block per slot); this load's is {host_cols}: \
+                     open it at a smaller context or under {UBATCH_ENV}",
+                    crate::tensor::Q8ACT_MAX_SLOTS
+                ),
+            ));
+        }
         let slots = Arc::new(DeviceTensor::upload(
             stream,
             &map.stage_view(),
             n,
             geo::EXPERTS,
         )?);
-        let card = Card38::new(gpu, w, &Qwen38Stacks::of(&inputs.model)?, &map, n)?;
+        let stacks = Qwen38Stacks::of(&inputs.model)?;
+        let card = Card38::new(gpu, w, &stacks, &map, n)?;
+        // A tier layer's join sums the card's slots and the tier's in one
+        // launch, which a layer with no card expert does not run.
+        if let Some(l) = run
+            .clone()
+            .find(|&l| map.on_tier(l).is_ok_and(|k| k > 0) && !card.has(l))
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l} holds {} routed experts on the tier card and none on the stage \
+                     card: a tier layer's join sums both cards' slots",
+                    map.on_tier(l)?
+                ),
+            ));
+        }
+        let tier = (!tiers.is_empty())
+            .then(|| TierSide38::new(gpu, &map))
+            .transpose()?;
         let wide = Wide38::new(stream, ub, &card)?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
         if wide_bytes > counted {
@@ -953,10 +987,43 @@ impl Body38 {
             model::arch::qwen35moe::host::layers(src, hp, run.clone())
         })?;
         experts.prepare_union(host_cols)?;
+        // The plan reserves the tier's block scratch at the load's ubatch:
+        // the card route's bytes there.
+        let block = usize::try_from(model::arch::qwen35moe::place::card_route_scratch_bytes(
+            ub as u64,
+        ))
+        .map_err(|_| GpuError::shape(WHAT, "the tier's block scratch passes usize"))?;
+        let tier_cards = tiers
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                open_tier(
+                    gpu,
+                    file,
+                    plan,
+                    (t, i),
+                    &map,
+                    &stacks,
+                    n,
+                    block,
+                    host.card_dontneed,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut hybrid = Hybrid::new(boundary, map, experts, n)?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(set);
+        let tiered = !tier_cards.is_empty();
+        if tiered {
+            hybrid.attach_tiers(tier_cards, gpu)?;
+        }
+        // With a tier the batch port's tier legs are made here too, which the
+        // plan reserves on the tier card and the host.
         hybrid.prepare_batch(gpu.context(), host_cols)?;
+        if tiered {
+            let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+            hybrid.check_tier_reserves(plan.machine, &cards)?;
+        }
         let ple = PleHost::new(Arc::clone(file), spec.vocab as usize, host_cols)?;
         let lens = stores
             .iter()
@@ -989,6 +1056,7 @@ impl Body38 {
             k: Kernels38::load(gpu)?,
             slots,
             card,
+            tier,
             wa,
             wr,
             wide_hsum,
@@ -1038,7 +1106,7 @@ impl Body38 {
     #[must_use]
     pub fn step_launches(&self) -> (usize, usize) {
         (
-            step_launches(&self.plans, &self.card),
+            step_launches(&self.plans, &self.card, self.tier.as_ref()),
             STEP_MEMOPS * self.plans.len(),
         )
     }
@@ -1433,7 +1501,7 @@ impl Body38 {
     /// count).
     #[must_use]
     pub fn verify_launches(&self, m: usize) -> usize {
-        verify_launches(&self.plans, &self.card, m)
+        verify_launches(&self.plans, &self.card, self.tier.as_ref(), m)
     }
 
     /// Refused by name unless the stores hold `pos` positions: a call from
@@ -1933,6 +2001,7 @@ impl Body38 {
                 taps: None,
                 slots,
                 card,
+                tier: None,
                 each: false,
             },
         };
@@ -2101,11 +2170,21 @@ impl Body38 {
     /// Every walk's map check reads `map` instead of the tier's own until a
     /// call with `None` takes it back or the model is reset: a gate's
     /// stand-in for a placement the walks refuse by name — an expert on a
-    /// tier card at every walk. The check alone reads it; the walks run the
-    /// loaded map. Gate use.
+    /// tier card at every walk with no tier leg. The check alone reads it;
+    /// the walks run the loaded map. Gate use.
     pub fn plant_slot_map(&mut self, map: Option<SlotMap>) -> Result<(), GpuError> {
-        self.card_leg = MapCheck::of(map.as_ref().unwrap_or(self.hybrid.slots()))?;
+        self.card_leg = MapCheck::of(
+            map.as_ref().unwrap_or(self.hybrid.slots()),
+            self.tier.is_some(),
+        )?;
         Ok(())
+    }
+
+    /// Layers the expert tier holds routed experts of; 0 on a load without
+    /// a tier.
+    #[must_use]
+    pub fn tier_layers(&self) -> usize {
+        self.tier.as_ref().map_or(0, TierSide38::layers)
     }
 
     /// Layers whose routed experts the card leg runs: the loaded slot map's
@@ -2772,6 +2851,7 @@ impl ChainBody for Body38 {
             k,
             slots,
             card,
+            tier,
             taps,
             eps,
             ctx,
@@ -2798,6 +2878,7 @@ impl ChainBody for Body38 {
                 taps: taps.as_mut(),
                 slots,
                 card,
+                tier: tier.as_mut(),
                 each: false,
             },
             head,
@@ -2848,7 +2929,7 @@ impl ChainBody for Body38 {
         self.held = 0;
         self.staged = None;
         self.plant = None;
-        self.card_leg = MapCheck::of(self.hybrid.slots())?;
+        self.card_leg = MapCheck::of(self.hybrid.slots(), self.tier.is_some())?;
         self.wide.split = None;
         self.wide.force = None;
         if let Some(t) = self.wide.taps.as_mut() {
@@ -2884,6 +2965,7 @@ impl ChainBody for Body38 {
             + self.wide.taps.as_ref().map_or(0, WideTaps::bytes)
             + self.slots.buf().num_bytes()
             + self.card.bytes()
+            + self.tier.as_ref().map_or(0, TierSide38::bytes)
             + self.lane.bytes()
             + self.hybrid.boundary().device_bytes()
             + self.taps.as_ref().map_or(0, Taps38::bytes)
@@ -3008,6 +3090,7 @@ impl Body38 {
                 "a verify planned for this head's rows (plan_rows before the pass)",
             ));
         }
+
         let io = Io {
             lane: Some(self.lane.word()),
             ..self.rp.io(m)?
@@ -3022,6 +3105,7 @@ impl Body38 {
             k,
             slots,
             card,
+            tier,
             eps,
             ctx,
             plant,
@@ -3047,6 +3131,7 @@ impl Body38 {
                 taps: None,
                 slots,
                 card,
+                tier: tier.as_mut(),
                 each: true,
             },
             head,

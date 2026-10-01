@@ -46,6 +46,7 @@ generate_ds41   ds41_ffn_card_acc_tier                  0          0
 generate_ds41   ds41_ffn_handoff                        0          0
 generate_ds41   ds41_ffn_handoff_10                     0          0
 generate_ds41   ds41_ffn_handoff_10_cols                0          0
+generate_ds41   ds41_ffn_handoff_10_cols_tier           0          0
 generate_ds41   ds41_ffn_handoff_8                      0          0
 generate_ds41   ds41_ffn_handoff_8_tier                 0          0
 generate_ds41   ds41_ffn_handoff_tier                   0          0
@@ -182,6 +183,7 @@ generate_ds41   ple_gate                                0          0
 generate_ds41   q2_k_rows                               0          0
 generate_ds41   q38_card_acc                            0          0
 generate_ds41   q38_card_shared_add                     0          0
+generate_ds41   q38_card_tier_shared_add                0          0
 generate_ds41   q38_shared_add                          0          0
 generate_ds41   q3k_gemv                                0          0
 generate_ds41   q3k_gemv_groups                         0          0
@@ -264,6 +266,7 @@ gate_e2e        down_add_q5_1                           0          0
 gate_e2e        ds41_ffn_handoff                        0          0
 gate_e2e        ds41_ffn_handoff_10                     0          0
 gate_e2e        ds41_ffn_handoff_10_cols                0          0
+gate_e2e        ds41_ffn_handoff_10_cols_tier           0          0
 gate_e2e        ds41_ffn_handoff_8                      0          0
 gate_e2e        ds41_ffn_handoff_8_tier                 0          0
 gate_e2e        ds41_ffn_places_10_cols                 0          0
@@ -350,6 +353,7 @@ gate_e2e        ple_gate                                0          0
 gate_e2e        q2_k_rows                               0          0
 gate_e2e        q38_card_acc                            0          0
 gate_e2e        q38_card_shared_add                     0          0
+gate_e2e        q38_card_tier_shared_add                0          0
 gate_e2e        q38_shared_add                          0          0
 gate_e2e        q3k_gemv                                0          0
 gate_e2e        q3k_gemv_groups                         0          0

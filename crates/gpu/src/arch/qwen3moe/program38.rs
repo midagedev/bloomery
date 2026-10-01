@@ -27,6 +27,16 @@
 //!   experts, plus the gated shared expert into `y`, the next site's combine
 //!   input.
 //!
+//! On a load with an expert tier (`tier38`) the step and the verify serve
+//! its layers: a tier layer's handoff is `ds41_ffn_handoff_10_cols_tier`
+//! (the step's of one column), which also writes the tier's places and the
+//! normed rows into the row's tier image, its go and its wait the tier's
+//! too ([`crate::hybrid::Hybrid::enqueue_tier_go`], `_back`), its card leg
+//! the launches but the card sum, and its back the join over both cards'
+//! slots in slot order with the combine in one launch
+//! (`q38_card_tier_shared_add`). The pass has no tier leg (`card38`'s map
+//! check refuses it first).
+//!
 //! After the last layer the head's mix (its norm applies the last combine)
 //! writes the head's input. Launches of the captured step
 //! ([`step_launches`]): the embedding; per layer the two mixes' three, the
@@ -34,15 +44,17 @@
 //! [`PLE_LAUNCHES`] on its layer, the block's [`FFN_LAUNCHES`] — two of
 //! them the go and the wait, stream memory-operation batches
 //! ([`STEP_MEMOPS`] a layer) — and the card leg's [`CARD_LAUNCHES`] on a
-//! layer with card experts; then the head's mix, projection and argmax.
+//! layer with card experts ([`TIER_CARD_LAUNCHES`] on a tier layer); then
+//! the head's mix, projection and argmax.
 
 use super::body::ATTN_SCALE_256;
-use super::card38::{CARD_LAUNCHES, Card38};
+use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
 use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
 use super::proj::ProjKernels;
 use super::router::gated;
 use super::scratch::{Io, f32_view};
 use super::scratch38::{Arena38, Store38, Taps38};
+use super::tier38::{STAGE_TIER, TierSide38};
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::{FlashGqaKernels, GqaSelArgs};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
@@ -108,20 +120,26 @@ pub(super) const GDN_ROWS_LAUNCHES: usize = 2;
 pub(super) const QSA_ROWS_LAUNCHES: usize = 1;
 
 /// The captured decode step's launches for `plans` with `card`'s card
-/// experts (module doc).
-pub(super) fn step_launches(plans: &[Layer38], card: &Card38) -> usize {
-    walk_launches(plans, card, 1)
+/// experts and `tier`'s tier layers (module doc).
+pub(super) fn step_launches(plans: &[Layer38], card: &Card38, tier: Option<&TierSide38>) -> usize {
+    walk_launches(plans, card, tier, 1)
 }
 
-/// The captured verify's launches for `plans` with `card`'s card experts at
-/// `m >= 2` rows: the step's, plus each mixer's token-major copies
-/// ([`GDN_ROWS_LAUNCHES`], [`QSA_ROWS_LAUNCHES`]); the handoff, the go, the
-/// wait, the card leg and the head are one each whatever `m`.
-pub(super) fn verify_launches(plans: &[Layer38], card: &Card38, m: usize) -> usize {
-    walk_launches(plans, card, m)
+/// The captured verify's launches for `plans` with `card`'s card experts and
+/// `tier`'s tier layers at `m >= 2` rows: the step's, plus each mixer's
+/// token-major copies ([`GDN_ROWS_LAUNCHES`], [`QSA_ROWS_LAUNCHES`]); the
+/// handoff, the go, the wait, the card leg and the head are one each
+/// whatever `m`.
+pub(super) fn verify_launches(
+    plans: &[Layer38],
+    card: &Card38,
+    tier: Option<&TierSide38>,
+    m: usize,
+) -> usize {
+    walk_launches(plans, card, tier, m)
 }
 
-fn walk_launches(plans: &[Layer38], card: &Card38, m: usize) -> usize {
+fn walk_launches(plans: &[Layer38], card: &Card38, tier: Option<&TierSide38>, m: usize) -> usize {
     let rows = m > 1;
     1 + plans
         .iter()
@@ -135,7 +153,11 @@ fn walk_launches(plans: &[Layer38], card: &Card38, m: usize) -> usize {
                 + mixer
                 + FFN_LAUNCHES
                 + p.ple.as_ref().map_or(0, |_| PLE_LAUNCHES)
-                + usize::from(card.has(l)) * CARD_LAUNCHES
+                + match (card.has(l), tier.is_some_and(|t| t.k(l) > 0)) {
+                    (true, true) => TIER_CARD_LAUNCHES,
+                    (true, false) => CARD_LAUNCHES,
+                    (false, _) => 0,
+                }
         })
         .sum::<usize>()
         + HEAD_LAUNCHES
@@ -316,6 +338,8 @@ pub(super) struct Parts38<'a> {
     pub(super) taps: Option<&'a mut Taps38>,
     pub(super) slots: &'a DeviceTensor<u32>,
     pub(super) card: &'a mut Card38,
+    /// The stage card's tier side on a load with an expert tier.
+    pub(super) tier: Option<&'a mut TierSide38>,
     /// A verify's row mode: each row's delta state into a lane of its own
     /// (`linear::delta`'s `gdn_delta_lanes`); else the last row's back into
     /// the committed lane.
@@ -552,8 +576,96 @@ impl Parts38<'_> {
         }
         let s = &*self.s;
         let x = x.unwrap_or(&s.ffn_x);
+        if self.tier_k(l) > 0 {
+            return self.card.enqueue_rows(&self.c, l, x, self.m, &s.sel);
+        }
         self.card
             .enqueue(&self.c, l, x, self.m, &s.sel, &s.route.weights)
+    }
+
+    /// The tier's experts of layer `l`: 0 off the tier and on a load
+    /// without one.
+    fn tier_k(&self, l: usize) -> usize {
+        self.tier.as_deref().map_or(0, |t| t.k(l))
+    }
+
+    /// Layer `l`'s handoff of the unit's `m` columns into the row's image
+    /// with the router's slots (eleven a column, the shared expert's last)
+    /// and the go: on a tier layer `ds41_ffn_handoff_10_cols_tier` with the
+    /// tier's go, else `plain` — the walk's own launch — and the plain go.
+    fn handoff_go(
+        &mut self,
+        hy: &mut crate::hybrid::Hybrid<HostRun>,
+        l: usize,
+        plain: impl FnOnce(
+            &HandoffKernels,
+            &Handoff<'_>,
+            crate::host::step::HandoffTarget<'_>,
+            &mut DeviceBuffer<u32>,
+        ) -> Result<(), GpuError>,
+    ) -> Result<(), GpuError> {
+        let sink = self.c.gpu.layer_sink(l)?;
+        let stream = self.c.gpu.stream();
+        let (m, s) = (self.m, &mut *self.s);
+        let h = Handoff {
+            ids: &s.route.ids,
+            weights: &s.route.weights,
+            map: self.slots.buf(),
+            row_off: l * geo::EXPERTS,
+            n_expert: geo::EXPERTS,
+        };
+        let tier = self.tier.as_deref_mut().filter(|t| t.k(l) > 0);
+        let Some(t) = tier else {
+            let target = hy.boundary_mut().handoff_target_of(0)?;
+            plain(&self.c.k.handoff, &h, target, &mut s.sel)?;
+            return hy.boundary().enqueue_go_of(stream, l, 0);
+        };
+        let targets = hy.tier_handoff(0, STAGE_TIER)?;
+        let (tmap, tsel) = t.handoff_parts();
+        self.c.k.handoff.enqueue_handoff_cols_tier(
+            stream,
+            &h,
+            (geo::N_USED + 1, m),
+            tmap,
+            targets,
+            sink,
+            (&mut s.sel, tsel),
+        )?;
+        hy.enqueue_tier_go(stream, l, 0)
+    }
+
+    /// Layer `l`'s back through the step port over row 0: the wait — the
+    /// host's, and on a tier layer the tier's too — then the block's output
+    /// into `y`: on a tier layer the join over both cards' slots with the
+    /// combine ([`Card38::enqueue_tier_join`]), else the shared add over the
+    /// host's sum ([`Parts38::shared_add`]).
+    fn step_back(
+        &mut self,
+        hy: &mut crate::hybrid::Hybrid<HostRun>,
+        l: usize,
+    ) -> Result<(), GpuError> {
+        let stream = self.c.gpu.stream();
+        let n_tier = self.tier_k(l);
+        if n_tier == 0 {
+            let b = hy.boundary();
+            b.enqueue_back_of(stream, 0)?;
+            return self.shared_add(l, b.hsum_of(0)?);
+        }
+        hy.enqueue_tier_back(stream, l, 0)?;
+        let (hy, s) = (&*hy, &mut *self.s);
+        let tsel = &self
+            .tier
+            .as_deref()
+            .ok_or(GpuError::state(WHAT, "the tier side of a tier layer"))?
+            .tsel;
+        self.card.enqueue_tier_join(
+            &self.c,
+            (l, self.m),
+            (&s.sel, tsel, n_tier),
+            hy.tier_rows(0)?,
+            (hy.boundary().hsum_of(0)?, &s.sh_y, &s.route.weights),
+            &mut s.y,
+        )
     }
 
     /// Layer `l`'s block output into `y`: the host's routed sum `hsum`, on a
@@ -890,21 +1002,9 @@ impl<'a> LayerProgram for Step38<'a> {
         self.p.route(l, Some(hy.boundary().normed()))?;
         let sink = self.p.c.gpu.layer_sink(l)?;
         let stream = self.p.c.gpu.stream();
-        let s = &mut *self.p.s;
-        let h = Handoff {
-            ids: &s.route.ids,
-            weights: &s.route.weights,
-            map: self.p.slots.buf(),
-            row_off: l * geo::EXPERTS,
-            n_expert: geo::EXPERTS,
-        };
-        let target = hy.boundary_mut().handoff_target_of(0)?;
-        self.p
-            .c
-            .k
-            .handoff
-            .enqueue_handoff(stream, &h, target, sink, &mut s.sel)?;
-        hy.boundary().enqueue_go_of(stream, l, 0)
+        self.p.handoff_go(hy, l, |k, h, target, sel| {
+            k.enqueue_handoff(stream, h, target, sink, sel)
+        })
     }
 
     /// The card leg, then the shared expert, over the boundary's activation.
@@ -918,12 +1018,7 @@ impl<'a> LayerProgram for Step38<'a> {
     /// (an eager step is served there).
     fn back(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        let stream = self.p.c.gpu.stream();
-        {
-            let b = port.hybrid().boundary();
-            b.enqueue_back_of(stream, 0)?;
-            self.p.shared_add(l, b.hsum_of(0)?)?;
-        }
+        self.p.step_back(port.hybrid(), l)?;
         port.hybrid().row_enqueued(l, 0)
     }
 
@@ -987,25 +1082,9 @@ impl<'a> LayerProgram for Verify38<'a> {
         let sink = self.p.c.gpu.layer_sink(l)?;
         let stream = self.p.c.gpu.stream();
         let m = self.p.m;
-        let s = &mut *self.p.s;
-        let h = Handoff {
-            ids: &s.route.ids,
-            weights: &s.route.weights,
-            map: self.p.slots.buf(),
-            row_off: l * geo::EXPERTS,
-            n_expert: geo::EXPERTS,
-        };
-        let target = hy.boundary_mut().handoff_target_of(0)?;
-        self.p.c.k.handoff.enqueue_handoff_cols(
-            stream,
-            &h,
-            geo::N_USED + 1,
-            m,
-            target,
-            sink,
-            &mut s.sel,
-        )?;
-        hy.boundary().enqueue_go_of(stream, l, 0)
+        self.p.handoff_go(hy, l, |k, h, target, sel| {
+            k.enqueue_handoff_cols(stream, h, geo::N_USED + 1, m, target, sink, sel)
+        })
     }
 
     /// The card leg, then the shared expert, over the boundary's
@@ -1020,12 +1099,7 @@ impl<'a> LayerProgram for Verify38<'a> {
     /// tier told the layer is enqueued (an eager verify is served there).
     fn back(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        let stream = self.p.c.gpu.stream();
-        {
-            let b = port.hybrid().boundary();
-            b.enqueue_back_of(stream, 0)?;
-            self.p.shared_add(l, b.hsum_of(0)?)?;
-        }
+        self.p.step_back(port.hybrid(), l)?;
         port.hybrid().row_enqueued(l, 0)
     }
 

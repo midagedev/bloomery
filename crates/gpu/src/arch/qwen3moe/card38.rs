@@ -25,12 +25,21 @@
 //! rows would leave slots that neither side sums, and one of another type
 //! would be read in a layout it is not in.
 //!
-//! No walk has a tier leg: a map with an expert on the tier card is refused
-//! by name at every walk's entry — the card copy marks those experts
-//! [`crate::hybrid::HOST`] and the host skips them, so a walk that ran
-//! would leave them out of the sum. The check's answer is read when the map
-//! is set — at the load, when a gate plants one and at reset — so a walk
-//! reads one field.
+//! On a layer an expert tier holds experts of (a two-card load, `tier38`)
+//! the step's and the verify's card leg runs the same launches but the card
+//! sum ([`TIER_CARD_LAUNCHES`]): the tier's rows land only with the wait, so
+//! the back sums the card's and the tier's slots in slot order and combines
+//! in one launch (`q38_card_tier_shared_add`, [`Card38::enqueue_tier_join`]).
+//! The tier card runs the same four launches over its own stacks
+//! ([`SelRun`], the one owner of that sequence).
+//!
+//! The pass and the ubatch walk have no tier leg, and a step or a verify
+//! has none on a load that hung no tier: a map with an expert on the tier
+//! card there is refused by name at the walk's entry — the card copy marks
+//! those experts [`crate::hybrid::HOST`] and the host skips them, so a walk
+//! that ran would leave them out of the sum. The check's answer is read
+//! when the map is set — at the load, when a gate plants one and at reset —
+//! so a walk reads one field.
 
 use super::plan38::geo;
 use super::program38::Ctx38;
@@ -42,7 +51,7 @@ use crate::q4k_sel::QuantSel;
 use crate::q5::Q8Blocks32;
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
 use crate::q8_0_sel32::{Q80SelDown, Q80SelKernels};
-use crate::q38::{CardAccArgs, SLOTS};
+use crate::q38::{CardAccArgs, CardTierSharedAddArgs, SLOTS};
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, Q8Act};
@@ -56,6 +65,9 @@ const WHAT: &str = "qwen4exp card leg";
 /// q8_1, the gate·up, the q8_1 of the card slots' columns, the down and the
 /// card sum.
 pub(super) const CARD_LAUNCHES: usize = 5;
+/// The card leg's launches on a layer an expert tier holds experts of: those
+/// of [`CARD_LAUNCHES`] but the card sum, which moves into the join.
+pub(super) const TIER_CARD_LAUNCHES: usize = CARD_LAUNCHES - 1;
 
 const _: () = assert!(SLOTS == geo::N_USED);
 
@@ -87,16 +99,19 @@ struct First {
 }
 
 /// A slot map's answer to the walks' check: its first layer with routed
-/// experts on the tier card.
+/// experts on the tier card, and whether the load hung a tier card whose
+/// leg the step and the verify run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct MapCheck {
     tier: Option<First>,
+    legs: bool,
 }
 
 impl MapCheck {
-    /// `map`'s answer. Reads one count a layer.
-    pub(super) fn of(map: &SlotMap) -> Result<MapCheck, GpuError> {
-        let mut out = MapCheck::default();
+    /// `map`'s answer on a load that hung a tier card when `legs`. Reads one
+    /// count a layer.
+    pub(super) fn of(map: &SlotMap, legs: bool) -> Result<MapCheck, GpuError> {
+        let mut out = MapCheck { tier: None, legs };
         for l in map.layers() {
             let tier = map.on_tier(l)?;
             if tier > 0 && out.tier.is_none() {
@@ -107,16 +122,30 @@ impl MapCheck {
     }
 
     /// Refused by name, before anything moves: a map with an expert on the
-    /// tier card at any walk; the error names the walk, the layer and its
-    /// count. Allocates nothing unless it refuses.
+    /// tier card at the pass and the ubatch walk, and at the step and the
+    /// verify on a load that hung no tier; the error names the walk, the
+    /// layer and its count, and on a tier load the way its prompt runs.
+    /// Allocates nothing unless it refuses.
     pub(super) fn refuse(self, walk: Walk38) -> Result<(), GpuError> {
         let Some(first) = self.tier else {
             return Ok(());
         };
+        let decode = matches!(walk, Walk38::Step | Walk38::Verify);
+        if decode && self.legs {
+            return Ok(());
+        }
+        let way = if self.legs {
+            "; a load with an expert tier feeds a prompt by steps (Prompt38::Step, \
+             --prefill step), whose walk serves the tier, with no residency machine (a step-fed \
+             prompt is refused beside one, so the unset residency resolves off there)"
+        } else {
+            ""
+        };
         Err(GpuError::shape(
             WHAT,
             format!(
-                "the {} walk has no tier leg: layer {} holds {} routed experts on the tier card",
+                "the {} walk has no tier leg: layer {} holds {} routed experts on the tier \
+                 card{way}",
                 walk.name(),
                 first.layer,
                 first.on
@@ -125,9 +154,10 @@ impl MapCheck {
     }
 }
 
-/// A layer's card experts: how many each of its routed stacks holds, the
-/// stacks' names, and the gate·up's and the down's types.
-struct CardLayer {
+/// A layer's experts on one card, the stage's or a tier's: how many each of
+/// its routed stacks holds, the stacks' names, and the gate·up's and the
+/// down's types.
+pub(super) struct LegLayer {
     n_card: usize,
     gate: String,
     up: String,
@@ -149,9 +179,12 @@ pub(super) struct Stacks38<'w> {
     pub(super) down_ty: GgmlType,
 }
 
-/// The leg's modules and the buffers every walk's card layers write, for up
-/// to [`PASS_ROWS`] columns.
-struct CardRun {
+/// The four `_sel` launches a card runs over a unit of `m` columns of its
+/// own experts of a layer — the normed rows' q8_1, the gate·up with
+/// SiLU·mul, the 32-value q8_1 of its slots' columns, the down — and their
+/// modules and buffers, for up to `cols` columns: the stage card's card leg
+/// and the tier card's layer ([`super::tier38`]) both run it.
+pub(super) struct SelRun {
     kq: KquantKernels,
     q51: Q51SelKernels,
     q80: Q80SelKernels,
@@ -162,6 +195,135 @@ struct CardRun {
     /// The card slots' columns in 32-value q8_1, per unit width `m` the
     /// `10·m` columns of `act_h[m − 1]` (the down reads one column a slot).
     act_h: Vec<Q8Blocks32>,
+}
+
+impl SelRun {
+    /// The modules on `gpu` and the buffers for units of up to `cols`
+    /// columns. Load-time only.
+    pub(super) fn new(gpu: &Gpu, cols: usize) -> Result<SelRun, GpuError> {
+        let stream = gpu.stream();
+        Ok(SelRun {
+            kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
+            q51: Q51SelKernels::load(gpu.context(), gpu.fault_word())?,
+            q80: Q80SelKernels::load(gpu.context(), gpu.fault_word())?,
+            act_x: Q8Act::with_k(stream, cols, geo::HIDDEN)?,
+            h: DeviceBuffer::zeroed(stream, cols * SLOTS * geo::FF)?,
+            act_h: (1..=cols)
+                .map(|m| Q8Blocks32::with_slots(stream, geo::FF, m * SLOTS))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// Device bytes of the buffers.
+    pub(super) fn bytes(&self) -> usize {
+        self.act_x.device_bytes()
+            + self.h.num_bytes()
+            + self
+                .act_h
+                .iter()
+                .map(|a| a.q.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes())
+                .sum::<usize>()
+    }
+
+    /// Enqueue on `gpu`'s stream layer `l`'s four launches over `cl`'s
+    /// stacks in `w`: `x` the normed rows (`[m][HIDDEN]`), `sel` the slots'
+    /// places (ten a column; below `cl`'s count this card's, else
+    /// [`crate::hybrid::HOST`] or a fault), the down's outputs into `down`
+    /// slot-major ([`geo::HIDDEN`] a slot, this card's slots only). `m`
+    /// outside the buffers' `1..=cols` is refused by name. Asynchronous,
+    /// allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, its weights, the layer and its stacks, the unit, its places and the output (rust-quality R8)"
+    )]
+    pub(super) fn enqueue(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        (l, cl): (usize, &LegLayer),
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        sel: &DeviceBuffer<u32>,
+        down: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let cols = self.act_h.len();
+        let act_h = m
+            .checked_sub(1)
+            .and_then(|i| self.act_h.get_mut(i))
+            .ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!("a unit of {m} columns; the leg takes 1..={cols}"),
+                )
+            })?;
+        let stream = gpu.stream();
+        let sink = gpu.layer_sink(l)?;
+        let slots = m * SLOTS;
+        let n_card = cl.n_card;
+        gpu.enqueue_quantize_q8_1_cols(x, &mut self.act_x, m, l)?;
+        let gu = GateUpAct {
+            wg: stack(w, &cl.gate, cl.gate_up_ty, n_card * geo::FF)?,
+            wu: stack(w, &cl.up, cl.gate_up_ty, n_card * geo::FF)?,
+            act: &self.act_x,
+            sel,
+            n_slots: slots,
+            rows_per_expert: geo::FF,
+            slots_per_col: SLOTS,
+            rule: Act::SiluMul,
+        };
+        if cl.gate_up_ty == GgmlType::Q5_K {
+            self.kq
+                .enqueue_gate_up_q5k(stream, &gu, sink, &mut self.h)?;
+        } else {
+            self.kq
+                .enqueue_gate_up_q4k(stream, &gu, sink, &mut self.h)?;
+        }
+        gpu.q5().enqueue_quantize_q8_sel(
+            stream,
+            &QuantSel {
+                x: &self.h,
+                cols: 0..slots,
+                sel,
+                n_card,
+            },
+            act_h,
+            sink,
+        )?;
+        let wd = stack(w, &cl.down, cl.down_ty, n_card * geo::HIDDEN)?;
+        if cl.down_ty == GgmlType::Q8_0 {
+            self.q80.enqueue_gemv_q8_0_sel32(
+                stream,
+                &Q80SelDown {
+                    w: wd,
+                    act: act_h,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert: geo::HIDDEN,
+                },
+                sink,
+                down,
+            )
+        } else {
+            self.q51.enqueue_gemv_q5_1_sel(
+                stream,
+                &Q51SelDown {
+                    w: wd,
+                    act: act_h,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert: geo::HIDDEN,
+                },
+                sink,
+                down,
+            )
+        }
+    }
+}
+
+/// The leg's launches and the buffers every walk's card layers write, for up
+/// to [`PASS_ROWS`] columns.
+struct CardRun {
+    sel: SelRun,
     /// The down's output, [`geo::HIDDEN`] values a slot.
     down: DeviceBuffer<f32>,
     /// The card slots' weighted sum, a row a token.
@@ -171,7 +333,7 @@ struct CardRun {
 /// Qwen3.8's card leg: each layer's card experts, and, when any layer has
 /// some, the modules and buffers the leg runs on (module doc).
 pub(super) struct Card38 {
-    layers: Vec<Option<CardLayer>>,
+    layers: Vec<Option<LegLayer>>,
     run: Option<CardRun>,
 }
 
@@ -197,11 +359,54 @@ fn stack<'w>(
         _ => Err(GpuError::Tensor {
             what: WHAT,
             name: name.to_string(),
-            need: "a resident routed stack of the slot map's card experts of its layer, in the \
-                   file's blocks of the type the plan lists for it (the gate and up Q4_K or \
-                   Q5_K, the down Q5_1 or Q8_0), each that count's rows",
+            need: "a resident routed stack of the slot map's experts of its layer on this card, \
+                   in the file's blocks of the type the plan lists for it (the gate and up Q4_K \
+                   or Q5_K, the down Q5_1 or Q8_0), each that count's rows",
         }),
     }
+}
+
+/// Per layer of `layers`, its experts on one card as `on(l)` counts them and
+/// `w` holds them, each layer's types as `stacks` lists them: a layer with
+/// experts there holds its three routed stacks as [`stack`] names them, at
+/// its count's rows and in types the leg runs ([`leg_types`]); a layer with
+/// none holds none. Anything else is refused by name. Load-time only.
+pub(super) fn leg_layers(
+    w: &Weights,
+    stacks: &Qwen38Stacks,
+    on: impl Fn(usize) -> Result<usize, GpuError>,
+    layers: usize,
+) -> Result<Vec<Option<LegLayer>>, GpuError> {
+    let mut per = Vec::with_capacity(layers);
+    for l in 0..layers {
+        let n_card = on(l)?;
+        let [gate, up, down] = stack_names(l);
+        if n_card == 0 {
+            if let Some(n) = [&gate, &up, &down].into_iter().find(|n| w.get(n).is_some()) {
+                return Err(GpuError::Tensor {
+                    what: WHAT,
+                    name: n.clone(),
+                    need: "no resident rows: the slot map puts no expert of its layer on this \
+                           card",
+                });
+            }
+            per.push(None);
+            continue;
+        }
+        let (gate_up_ty, down_ty) = leg_types(stacks, l)?;
+        stack(w, &gate, gate_up_ty, n_card * geo::FF)?;
+        stack(w, &up, gate_up_ty, n_card * geo::FF)?;
+        stack(w, &down, down_ty, n_card * geo::HIDDEN)?;
+        per.push(Some(LegLayer {
+            n_card,
+            gate,
+            up,
+            down,
+            gate_up_ty,
+            down_ty,
+        }));
+    }
+    Ok(per)
 }
 
 /// Layer `l`'s gate·up and down types as `stacks` lists them, refused by
@@ -235,47 +440,12 @@ impl Card38 {
         map: &SlotMap,
         layers: usize,
     ) -> Result<Card38, GpuError> {
-        let mut per = Vec::with_capacity(layers);
-        for l in 0..layers {
-            let n_card = map.on_card(l)?;
-            let [gate, up, down] = stack_names(l);
-            if n_card == 0 {
-                if let Some(n) = [&gate, &up, &down].into_iter().find(|n| w.get(n).is_some()) {
-                    return Err(GpuError::Tensor {
-                        what: WHAT,
-                        name: n.clone(),
-                        need: "no resident rows: the slot map puts no expert of its layer on \
-                               the card",
-                    });
-                }
-                per.push(None);
-                continue;
-            }
-            let (gate_up_ty, down_ty) = leg_types(stacks, l)?;
-            stack(w, &gate, gate_up_ty, n_card * geo::FF)?;
-            stack(w, &up, gate_up_ty, n_card * geo::FF)?;
-            stack(w, &down, down_ty, n_card * geo::HIDDEN)?;
-            per.push(Some(CardLayer {
-                n_card,
-                gate,
-                up,
-                down,
-                gate_up_ty,
-                down_ty,
-            }));
-        }
+        let per = leg_layers(w, stacks, |l| map.on_card(l), layers)?;
         let run = if per.iter().any(Option::is_some) {
             let stream = gpu.stream();
             let slots = PASS_ROWS * SLOTS;
             Some(CardRun {
-                kq: KquantKernels::load(gpu.context(), gpu.fault_word())?,
-                q51: Q51SelKernels::load(gpu.context(), gpu.fault_word())?,
-                q80: Q80SelKernels::load(gpu.context(), gpu.fault_word())?,
-                act_x: Q8Act::with_k(stream, PASS_ROWS, geo::HIDDEN)?,
-                h: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
-                act_h: (1..=PASS_ROWS)
-                    .map(|m| Q8Blocks32::with_slots(stream, geo::FF, m * SLOTS))
-                    .collect::<Result<_, _>>()?,
+                sel: SelRun::new(gpu, PASS_ROWS)?,
                 down: DeviceBuffer::zeroed(stream, slots * geo::HIDDEN)?,
                 acc: DeviceBuffer::zeroed(stream, PASS_ROWS * geo::HIDDEN)?,
             })
@@ -290,7 +460,7 @@ impl Card38 {
         self.layer(l).is_some()
     }
 
-    fn layer(&self, l: usize) -> Option<&CardLayer> {
+    fn layer(&self, l: usize) -> Option<&LegLayer> {
         self.layers.get(l).and_then(Option::as_ref)
     }
 
@@ -386,14 +556,7 @@ impl Card38 {
     /// Device bytes of the buffers.
     pub(super) fn bytes(&self) -> usize {
         self.run.as_ref().map_or(0, |r| {
-            r.act_x.device_bytes()
-                + r.h.num_bytes()
-                + r.act_h
-                    .iter()
-                    .map(|a| a.q.num_bytes() + a.s8.num_bytes() + a.d8.num_bytes())
-                    .sum::<usize>()
-                + r.down.num_bytes()
-                + r.acc.num_bytes()
+            r.sel.bytes() + r.down.num_bytes() + r.acc.num_bytes()
         })
     }
 
@@ -413,96 +576,95 @@ impl Card38 {
         sel: &DeviceBuffer<u32>,
         weights: &DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        self.enqueue_rows(c, l, x, m, sel)?;
         let (Some(cl), Some(r)) = (
             self.layers.get(l).and_then(Option::as_ref),
             self.run.as_mut(),
         ) else {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("a card leg on layer {l}, which has no card experts"),
-            ));
+            return Err(no_card(l));
         };
-        let act_h = m
-            .checked_sub(1)
-            .and_then(|i| r.act_h.get_mut(i))
-            .ok_or_else(|| {
-                GpuError::shape(
-                    WHAT,
-                    format!("a unit of {m} columns; the leg takes 1..={PASS_ROWS}"),
-                )
-            })?;
-        let (gpu, w) = (c.gpu, c.w);
-        let stream = gpu.stream();
-        let sink = gpu.layer_sink(l)?;
-        let slots = m * SLOTS;
-        let n_card = cl.n_card;
-        gpu.enqueue_quantize_q8_1_cols(x, &mut r.act_x, m, l)?;
-        let gu = GateUpAct {
-            wg: stack(w, &cl.gate, cl.gate_up_ty, n_card * geo::FF)?,
-            wu: stack(w, &cl.up, cl.gate_up_ty, n_card * geo::FF)?,
-            act: &r.act_x,
-            sel,
-            n_slots: slots,
-            rows_per_expert: geo::FF,
-            slots_per_col: SLOTS,
-            rule: Act::SiluMul,
-        };
-        if cl.gate_up_ty == GgmlType::Q5_K {
-            r.kq.enqueue_gate_up_q5k(stream, &gu, sink, &mut r.h)?;
-        } else {
-            r.kq.enqueue_gate_up_q4k(stream, &gu, sink, &mut r.h)?;
-        }
-        gpu.q5().enqueue_quantize_q8_sel(
-            stream,
-            &QuantSel {
-                x: &r.h,
-                cols: 0..slots,
-                sel,
-                n_card,
-            },
-            act_h,
-            sink,
-        )?;
-        let wd = stack(w, &cl.down, cl.down_ty, n_card * geo::HIDDEN)?;
-        if cl.down_ty == GgmlType::Q8_0 {
-            r.q80.enqueue_gemv_q8_0_sel32(
-                stream,
-                &Q80SelDown {
-                    w: wd,
-                    act: act_h,
-                    sel,
-                    n_slots: slots,
-                    rows_per_expert: geo::HIDDEN,
-                },
-                sink,
-                &mut r.down,
-            )?;
-        } else {
-            r.q51.enqueue_gemv_q5_1_sel(
-                stream,
-                &Q51SelDown {
-                    w: wd,
-                    act: act_h,
-                    sel,
-                    n_slots: slots,
-                    rows_per_expert: geo::HIDDEN,
-                },
-                sink,
-                &mut r.down,
-            )?;
-        }
         c.k.q38.enqueue_card_acc(
-            stream,
+            c.gpu.stream(),
             CardAccArgs {
                 down: &r.down,
                 w: weights,
                 sel,
                 n: geo::HIDDEN,
                 m,
-                n_card,
-                fault: sink,
+                n_card: cl.n_card,
+                fault: c.gpu.layer_sink(l)?,
                 acc: &mut r.acc,
             },
         )
     }
+
+    /// [`Card38::enqueue`] but the card sum: the card slots' down outputs
+    /// stay in the leg's rows for a tier layer's join
+    /// ([`Card38::enqueue_tier_join`]). [`TIER_CARD_LAUNCHES`] launches.
+    pub(super) fn enqueue_rows(
+        &mut self,
+        c: &Ctx38<'_>,
+        l: usize,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        sel: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let (Some(cl), Some(r)) = (
+            self.layers.get(l).and_then(Option::as_ref),
+            self.run.as_mut(),
+        ) else {
+            return Err(no_card(l));
+        };
+        r.sel.enqueue(c.gpu, c.w, (l, cl), x, m, sel, &mut r.down)
+    }
+
+    /// Enqueue the join of tier layer `l` over the unit's `m` columns, after
+    /// the wait: the card's slots (`sel`, the leg's rows of
+    /// [`Card38::enqueue_rows`]) and the tier's (`tsel`, below `n_tier`, the
+    /// tier's rows `trows`) summed in slot order by the router's `weights`,
+    /// then `(hsum + sum) + sh · w` into `y` (`q38_card_tier_shared_add`).
+    /// One launch. A layer without card experts is refused by name.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the walk's context, the layer and its width, both cards' places and rows, and the combine's inputs and output (rust-quality R8)"
+    )]
+    pub(super) fn enqueue_tier_join(
+        &self,
+        c: &Ctx38<'_>,
+        (l, m): (usize, usize),
+        (sel, tsel, n_tier): (&DeviceBuffer<u32>, &DeviceBuffer<u32>, usize),
+        trows: &DeviceBuffer<f32>,
+        (hsum, sh, weights): (&DeviceBuffer<f32>, &DeviceBuffer<f32>, &DeviceBuffer<f32>),
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let (Some(cl), Some(r)) = (self.layer(l), self.run.as_ref()) else {
+            return Err(no_card(l));
+        };
+        c.k.q38.enqueue_card_tier_shared_add(
+            c.gpu.stream(),
+            CardTierSharedAddArgs {
+                down: &r.down,
+                trows,
+                w: weights,
+                sel,
+                tsel,
+                hsum,
+                sh,
+                n: geo::HIDDEN,
+                m,
+                n_card: cl.n_card,
+                n_tier,
+                fault: c.gpu.layer_sink(l)?,
+                y,
+            },
+        )
+    }
+}
+
+/// The refusal of a card leg on layer `l`, which has no card experts.
+fn no_card(l: usize) -> GpuError {
+    GpuError::shape(
+        WHAT,
+        format!("a card leg on layer {l}, which has no card experts"),
+    )
 }

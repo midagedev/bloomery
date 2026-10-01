@@ -36,6 +36,7 @@ mod scratch38;
 mod swap38;
 mod taps;
 mod taps35;
+mod tier38;
 pub mod ubatch;
 mod wide;
 mod wide38;

@@ -443,6 +443,10 @@ name = "gate_qwen38_residency"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_qwen38_twocard"
+required-features = ["gpu"]
+
+[[bin]]
 name = "generate"
 required-features = ["gpu"]
 
