@@ -121,6 +121,8 @@ mod gate {
     use model::arch::glm5next::place::{NextnInputs, NextnPlan, PlanInputs};
     use model::placement::churn::ChurnPool;
     use model::placement::{Machine, ModelTensors, Plan, PlanLevers, workstation};
+    use refset::arch::glm5next::{MTP, MTP_SET};
+    use refset::mtpref::MtpSet;
     use runtime::layer::hosted;
     use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Verify, Want};
 
@@ -895,6 +897,27 @@ mod gate {
     /// The NextN clauses, on a NextN load of the gate placement under
     /// [`NEXTN_LEVER`]: `nextn-refuse` before it, then `nextn-open`,
     /// `pair-map`, `pair-fold`, `draft-quiet` and `c1-mtp` on it.
+    /// The prose prompt of ik's MTP draft set (refset `mtp-glm5next`), on
+    /// which a draft both keeps and rejects rows: the lcg prompt's greedy
+    /// output repeats, so every window keeps both and `pair-fold` has no
+    /// rejected row to fold.
+    fn prose_ids() -> Result<Vec<u32>, GateError> {
+        let dir = MTP.path(MTP_SET);
+        let set = MtpSet::open(&dir, &MTP)?;
+        let ids = set
+            .tokens
+            .ok_or_else(|| format!("{}: no # tokens line", dir.display()))?;
+        if ids.len() < PROMPT {
+            return Err(format!(
+                "{}: a prompt of {} ids, the NextN clauses read {PROMPT}",
+                dir.display(),
+                ids.len()
+            )
+            .into());
+        }
+        Ok(ids)
+    }
+
     fn nextn_clauses(
         path: &str,
         machine: &Machine,
@@ -1045,7 +1068,7 @@ mod gate {
         pass &= c7;
         drop(s);
 
-        pass &= nextn_clauses(&path, &machine, &levers, &inputs, &ids)?;
+        pass &= nextn_clauses(&path, &machine, &levers, &inputs, &prose_ids()?)?;
 
         if pass {
             println!("{NAME}: every clause passed");
