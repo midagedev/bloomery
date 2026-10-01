@@ -20,8 +20,9 @@
 //!   top-2 margin clears [`margin_cap`] at [`logits_band`], and ik's
 //!   runner-up otherwise. Each block's proposal — the argmax of the graph
 //!   before its update graph — is the set's draft token for the block, or
-//!   that graph's tie. The logits' distance from ik's is printed, not held.
-//!   At least one graph is held off a tie.
+//!   that graph's tie. Every graph with ik's head on its last row holds our
+//!   logits within [`logits_band`] of ik's (`‖ours − ik‖ / ‖ik‖`), the worst
+//!   printed over the band. At least one graph is held off a tie.
 //! - (p) the pairing: the hidden rows a walk fed the target's arenas reads
 //!   (`bloomery_gpu_glm5next::nextn_hidden`, the walk's own gather): the
 //!   set's prompt in batches and by steps leaves the same rows in the
@@ -115,7 +116,7 @@ mod gate {
     const M: usize = 2;
 
     /// PIN(2026-10-01): the band of the NextN head's logits against ik's that
-    /// (o)'s tie cap reads: on ik's own inputs (the token and the hidden row
+    /// (o) holds and its tie cap reads: on ik's own inputs (the token and the hidden row
     /// fed from the set), the projections in series where ik's CPU side reads
     /// 32-value q8 activations and ours f32 — `eh_proj`, the joined latent
     /// projection, the query's up projection, the key and value absorbs, the
@@ -293,11 +294,13 @@ mod gate {
         Unheld,
     }
 
-    /// One graph's replay: our id, ik's, and how they stood.
+    /// One graph's replay: our id, ik's, how they stood, and our logits'
+    /// distance from ik's where ik computed the head.
     struct Replayed {
         ours: u32,
         ik: Option<u32>,
         head: Head,
+        rel: Option<f64>,
     }
 
     /// Replay `g` from the host: the runs before the last store-only walks,
@@ -338,6 +341,7 @@ mod gate {
                 ours,
                 ik: None,
                 head: Head::Bad,
+                rel: None,
             });
         }
         if g.logits.len() != g.out_ids.len() * vocab {
@@ -359,6 +363,7 @@ mod gate {
                 ours,
                 ik: None,
                 head: Head::Unheld,
+                rel: None,
             });
         };
         let ik = &g.logits[k * vocab..(k + 1) * vocab];
@@ -372,15 +377,18 @@ mod gate {
         } else {
             Head::Bad
         };
+        let band = logits_band();
+        let r = rel(&logits, ik);
+        let in_band = r <= band;
         println!(
             "(o) {}: {n} rows from {}, argmax {top} ik {ik_top} (runner-up {ik_2}, margin \
-             {margin:.3e}, cap {cap:.3e}), logits rel {:.3e} {}",
+             {margin:.3e}, cap {cap:.3e}), logits rel {r:.3e} (held <= {band:.3e}) {}",
             g.label(),
             g.pos[0],
-            rel(&logits, ik),
-            match head {
-                Head::Same => "PASS",
-                Head::Tie => "PASS (a tie: ik's runner-up)",
+            match (head, in_band) {
+                (Head::Same, true) => "PASS",
+                (Head::Tie, true) => "PASS (a tie: ik's runner-up)",
+                (Head::Same | Head::Tie, false) => "FAIL (past the band)",
                 _ => "FAIL",
             }
         );
@@ -388,6 +396,7 @@ mod gate {
             ours,
             ik: Some(ik_top as u32),
             head,
+            rel: Some(r),
         })
     }
 
@@ -418,6 +427,8 @@ mod gate {
         let mut last: Option<Replayed> = None;
         let (mut same, mut ties, mut bad, mut unheld) = (0usize, 0usize, 0usize, 0usize);
         let (mut blocks_ok, mut blocks_tie, mut blocks_bad) = (0usize, 0usize, 0usize);
+        let band = logits_band();
+        let (mut worst, mut past) = (0.0f64, 0usize);
         for (b, g) in graphs_of(set) {
             if g == Graph::Update {
                 let draft = set.drafts_of(b);
@@ -461,15 +472,24 @@ mod gate {
                 Head::Bad => bad += 1,
                 Head::Unheld => unheld += 1,
             }
+            if let Some(d) = r.rel {
+                worst = worst.max(d);
+                // `rel` reads a NaN as infinite: past the band.
+                if d > band {
+                    past += 1;
+                }
+            }
             last = Some(r);
         }
         let blocks = set.blocks().len();
-        let graphs_ok = bad == 0 && same > 0;
+        let graphs_ok = bad == 0 && same > 0 && past == 0;
         let props_ok = blocks_bad == 0 && blocks_ok + blocks_tie == blocks && blocks_ok > 0;
         ok &= graphs_ok && props_ok;
         println!(
             "(o) graphs: {same} ik's argmax, {ties} ik's runner-up at a tie, {bad} other, {unheld} \
-             without ik's head {}",
+             without ik's head; logits rel worst {worst:.3e}, {:.3} of the band {band:.3e}, {past} \
+             past it {}",
+            worst / band,
             verdict(graphs_ok)
         );
         println!(
@@ -1204,7 +1224,10 @@ mod gate {
             prompt.len(),
             MTP.name
         );
-        println!("bands: the argmax cap's {:.4e}", logits_band());
+        println!(
+            "bands: the logits' (held, and the argmax cap's) {:.4e}",
+            logits_band()
+        );
         let open = |p: &str| Split::open(p).map_err(|e| format!("open {p}: {e}"));
         let file = open(MODEL)?;
         let inputs = PlanInputs::read(&file)?;
