@@ -22,11 +22,16 @@
 //! **Host residency.** The host serves an expert from resident pages when
 //! every byte it reads for it lies in the load's host set and is in the page
 //! cache now ([`HostSet::serves`], `mincore`): the set says what the load
-//! read in and locked, the page cache what a step would fault on. A victim
-//! outside the set is not host-resident whatever the page cache holds, so
-//! the machine refuses its flip by name. The load puts each layer's churn
-//! pool — its stage card experts past the pinned ones ([`ChurnPool`]) — in
-//! the set ([`crate::model::GpuModel::load_placed_with`]).
+//! read in (and locked, under `BLOOMERY_HOST_LOCK`), the page cache what a
+//! step would fault on. A victim outside the set is not host-resident
+//! whatever the page cache holds, so the machine refuses its flip by name. A
+//! victim in the set whose pages the page cache let go since the load or the
+//! staging thread's prepare (a set not locked) is read in again by the
+//! machine before it decides ([`SwapSource::prepare_victim`]) and counted
+//! ([`PassReport::rereads`]): a page fault's cost once, never a refusal. The
+//! load puts each layer's churn pool — its stage card experts past the
+//! pinned ones ([`ChurnPool`]) — in the set
+//! ([`crate::model::GpuModel::load_placed_with`]).
 
 use std::ops::Range;
 use std::sync::Arc;

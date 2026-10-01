@@ -168,6 +168,14 @@
 //!   expert whose count is under the new floor, and a floor set with no call
 //!   open is refused by name (its mutant: the pick reads the floor the call
 //!   began with, not the one set since).
+//!
+//! Evicted (a host set populated and not locked, whose pages the page cache
+//! lets go): a victim not host-resident when the machine decides is read
+//! back in and the flip goes on — at a boundary whose landing victims the
+//! staging thread prepared and lost again, at a call's pick and at the end
+//! of a call not kept — each arm running to its end with the values, card
+//! sets and flips of its twin without the fault (its mutant: no prepare in
+//! the machine's one decision, which refuses each by name).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -377,7 +385,11 @@ mod gate {
     }
 
     /// What an arm's source does wrong: `stuck` experts never become
-    /// host-resident, `slow` ones take `SLOW` to prepare, `fail_source` and
+    /// host-resident, `evicted` ones lose their pages after every prepare
+    /// but the machine's own thread's — not resident from the load,
+    /// `all_resident` or not, and a staging thread's prepare of one leaves
+    /// it not resident (the page cache let it go again before the machine
+    /// looked) — `slow` ones take `SLOW` to prepare, `fail_source` and
     /// `panic_source` fail or panic when their bytes are read, every stack
     /// destination of layer `fail_dest` is an error, and each part a copy
     /// moves carries `inflate` more copy stream commands. `dropped_on` gets
@@ -386,6 +398,7 @@ mod gate {
     struct Faults {
         dropped_on: Arc<Mutex<Option<String>>>,
         stuck: Vec<(usize, u32)>,
+        evicted: Vec<(usize, u32)>,
         slow: Vec<(usize, u32)>,
         fail_source: Option<(usize, u32)>,
         panic_source: Option<(usize, u32)>,
@@ -427,7 +440,8 @@ mod gate {
                 .map(|x| {
                     let (l, e) = (LAYERS.start + x / E, (x % E) as u32);
                     let all = faults.all_resident && !faults.stuck.contains(&(l, e));
-                    AtomicBool::new(all || x % E >= caps[x / E])
+                    let evicted = faults.evicted.contains(&(l, e));
+                    AtomicBool::new(!evicted && (all || x % E >= caps[x / E]))
                 })
                 .collect();
             Synth {
@@ -632,7 +646,9 @@ mod gate {
             if self.faults.slow.contains(&(layer, id)) {
                 std::thread::sleep(SLOW);
             }
-            if !self.faults.stuck.contains(&(layer, id)) {
+            let staging = std::thread::current().name() == Some("swap-staging");
+            let evicted = staging && self.faults.evicted.contains(&(layer, id));
+            if !self.faults.stuck.contains(&(layer, id)) && !evicted {
                 self.resident[li(layer) * E + id as usize].store(true, Ordering::Release);
             }
             Ok(())
@@ -3093,6 +3109,178 @@ mod gate {
         Ok(ok)
     }
 
+    // ----------------------------------------------------------- evicted
+
+    /// Layer 2's experts `ids`, for a fault's list.
+    fn layer2(ids: Range<u32>) -> Vec<(usize, u32)> {
+        ids.map(|e| (2, e)).collect()
+    }
+
+    /// A call arm with no pass before its call: every expert host-resident
+    /// from the load bar `faults`' evicted and stuck ones, the call over
+    /// passes `steps` of the trace (`kept` or not), then, when it ended,
+    /// the passes `CALL_AFTER`. No boundary before the call lands a flip, so
+    /// none takes one of the call's victims first.
+    fn fresh_call(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        faults: Faults,
+        steps: Range<usize>,
+        kept: bool,
+    ) -> Result<(Run, CallSeen), GateError> {
+        let faults = Faults {
+            all_resident: true,
+            ..faults
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        if let Some(e) = &r.err {
+            return Err(format!("gate_swap: a fresh call arm's machine: {e}").into());
+        }
+        let seen = call(gpu, &mut r, &trace.passes[steps], usize::MAX, kept, None)?;
+        if seen.err.is_none() {
+            drive(gpu, &mut r, trace, CALL_AFTER, Copies::Prompt, Hold::None)?;
+        }
+        Ok((r, seen))
+    }
+
+    /// A fresh call arm `(r, seen)` ran to its end with the values, card
+    /// sets and flips of its twin `(t, tseen)` without the fault, clean.
+    fn call_twin(r: &Run, seen: &CallSeen, t: &Run, tseen: &CallSeen) -> bool {
+        seen.err.is_none()
+            && r.err.is_none()
+            && tseen.err.is_none()
+            && t.err.is_none()
+            && fnvs(&seen.values) == fnvs(&tseen.values)
+            && seen.sets == tseen.sets
+            && fnvs(&r.values) == fnvs(&t.values)
+            && r.values.len() == CALL_AFTER.len()
+            && r.flips == t.flips
+            && clean(&seen.values)
+            && clean(&r.values)
+    }
+
+    /// The experts read in again that `run`'s boundaries reported.
+    fn rereads(run: &Run) -> usize {
+        run.reports.iter().map(|p| p.rereads).sum()
+    }
+
+    /// The experts read in again that the first boundary after a fresh
+    /// call arm's call reported: the call's own, as no flip lands there.
+    fn call_rereads(run: &Run) -> usize {
+        run.reports.first().map_or(0, |p| p.rereads)
+    }
+
+    /// Experts the twin's picks admitted at layer 2.
+    fn admitted_l2(seen: &CallSeen) -> usize {
+        seen.picks
+            .iter()
+            .filter(|p| p.layer == 2)
+            .map(|p| p.admitted)
+            .sum()
+    }
+
+    /// evicted: a victim whose pages the page cache let go after the load
+    /// or after the staging thread's prepare (a host set populated, not
+    /// locked) is read back in by the machine, never refused — at a
+    /// boundary (layer 2's pool, whose flips' victims the staging thread
+    /// prepares and loses again), at a call's pick (layer 2's pool, not
+    /// resident from the load) and at a call's end (layer 2's host experts,
+    /// which a one-step call admits and its end, not kept, sends back; one
+    /// step, so no later pick takes one as its victim first) each arm runs
+    /// to its end with its twin's values without the fault (its mutant: no
+    /// prepare in the machine's one decision, which refuses each by name).
+    /// Each arm reports its victims read in again, its twin and the runs
+    /// without a fault `clean_runs` none (a count that fires on a resident
+    /// victim is red).
+    fn evicted(
+        gpu: &Gpu,
+        pm: &probe_kernels::LoadedModule,
+        trace: &Trace,
+        a: &Run,
+        clean_runs: &[&Run],
+    ) -> Result<bool, GateError> {
+        let pool = layer2(PINNED as u32..(N_L[0] - 1) as u32);
+        let faults = Faults {
+            evicted: pool.clone(),
+            ..Faults::default()
+        };
+        let mut r = plain(gpu, pm, faults, DELAY)?;
+        drive(gpu, &mut r, trace, 0..PASSES, Copies::Prompt, Hold::None)?;
+        let at_boundary = r.err.is_none()
+            && r.values.len() == PASSES
+            && fnvs(&r.values) == fnvs(&a.values)
+            && r.flips == a.flips
+            && clean(&r.values)
+            && rereads(&r) > 0;
+        println!(
+            "evicted boundary: layer 2's pool lost after the staging thread's prepare, {} passes, \
+             values and flips equal the prompt run {}, {} victims read in again; error {} {}",
+            r.values.len(),
+            fnvs(&r.values) == fnvs(&a.values) && r.flips == a.flips,
+            rereads(&r),
+            show(&r.err),
+            verdict(at_boundary)
+        );
+
+        let (tp, tpseen) = fresh_call(gpu, pm, trace, Faults::default(), CALL_STEPS, true)?;
+        let faults = Faults {
+            evicted: pool,
+            ..Faults::default()
+        };
+        let (p, pseen) = fresh_call(gpu, pm, trace, faults, CALL_STEPS, true)?;
+        let at_pick = admitted_l2(&tpseen) > 0
+            && call_twin(&p, &pseen, &tp, &tpseen)
+            && call_rereads(&p) > 0
+            && rereads(&tp) == 0;
+        println!(
+            "evicted pick: layer 2's pool not resident from the load, a kept call of {} steps \
+             ({} admitted at layer 2 in the twin), then {} passes: equal to the twin {}, the call's \
+             victims read in again {} (twin {}); error {} {}",
+            CALL_STEPS.len(),
+            admitted_l2(&tpseen),
+            p.values.len(),
+            call_twin(&p, &pseen, &tp, &tpseen),
+            call_rereads(&p),
+            rereads(&tp),
+            show(&pseen.err),
+            verdict(at_pick)
+        );
+
+        let one = CALL_STEPS.start..CALL_STEPS.start + 1;
+        let (te, teseen) = fresh_call(gpu, pm, trace, Faults::default(), one.clone(), false)?;
+        let faults = Faults {
+            evicted: layer2(N_L[0] as u32..E as u32),
+            ..Faults::default()
+        };
+        let (e, eseen) = fresh_call(gpu, pm, trace, faults, one, false)?;
+        let restored = teseen.report.map_or(0, |rep| rep.restored);
+        let at_end = admitted_l2(&teseen) > 0
+            && restored > 0
+            && call_twin(&e, &eseen, &te, &teseen)
+            && call_rereads(&e) > 0
+            && rereads(&te) == 0;
+        println!(
+            "evicted end: layer 2's host experts not resident, a one-step call not kept ({} \
+             admitted at layer 2, {restored} restored in the twin), then {} passes: equal to the \
+             twin {}, the call's experts read in again {} (twin {}); error {} {}",
+            admitted_l2(&teseen),
+            e.values.len(),
+            call_twin(&e, &eseen, &te, &teseen),
+            call_rereads(&e),
+            rereads(&te),
+            show(&eseen.err),
+            verdict(at_end)
+        );
+        let none: Vec<usize> = clean_runs.iter().map(|r| rereads(r)).collect();
+        let quiet = none.iter().all(|&n| n == 0);
+        println!(
+            "evicted none: the runs without a fault read in again {none:?} victims (want 0 each) {}",
+            verdict(quiet)
+        );
+        Ok(at_boundary && at_pick && at_end && quiet)
+    }
+
     pub fn run() -> Result<(), GateError> {
         if !set_leak_sink(note_leak) {
             return Err("gate_swap: a leak sink was set before the gate's".into());
@@ -3153,6 +3341,7 @@ mod gate {
         ok &= s2(&gpu, &pm, &trace)?;
         ok &= s4(&gpu, &pm, &trace)?;
         ok &= s5(&gpu, &pm)?;
+        ok &= evicted(&gpu, &pm, &trace, &a, &[&a, &b, &h])?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
         let only_stall = all == [LeakReason::Join];
@@ -3175,7 +3364,7 @@ mod gate {
                  named error, and a dropped machine leaves no copy waiting on the card; an owner \
                  that syncs or frees after its machine, and the host tier itself, drop within \
                  the machine's deadline (dropq), and a plain free against a queued copy is named \
-                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next."
+                 (dropq free); pinned seed experts never move; a prompt call's picks equal a static replay of their card sets, land before any read, move the host map at the pick, refuse a victim the host cannot serve and take a floor raised between two picks at the next; a victim whose pages the page cache let go is read in again and counted at a boundary, a pick and a call's end."
             );
             Ok(())
         } else {
