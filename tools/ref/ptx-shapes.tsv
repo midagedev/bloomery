@@ -241,6 +241,7 @@ generate_ds41   rms_norm                                0          0
 generate_ds41   rope                                    0          0
 generate_ds41   router_topk                             0          0
 generate_ds41   swiglu                                  0          0
+generate_ds41   swiglu_act_quant32                      0          0
 generate_ds41   swiglu_quant32                          0          0
 generate_ds41   swiglu_quant32_sel                      0          0
 generate_ds41   tier_fault_copy                         0          0
@@ -408,6 +409,7 @@ gate_e2e        rms_norm                                0          0
 gate_e2e        rope                                    0          0
 gate_e2e        router_topk                             0          0
 gate_e2e        swiglu                                  0          0
+gate_e2e        swiglu_act_quant32                      0          0
 gate_e2e        swiglu_quant32                          0          0
 gate_e2e        swiglu_quant32_sel                      0          0
 gate_e2e        tier_fault_copy                         0          0

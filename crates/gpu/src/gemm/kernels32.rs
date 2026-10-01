@@ -28,11 +28,17 @@ use cuda_device::{
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
+// `swiglu_act_quant32`'s contract spells the largest gate·up rule code as a
+// literal.
+const _: () =
+    assert!(crate::kquant::act::ACT_SILU_MUL == 0 && crate::kquant::act::ACT_SWIGLU_CLAMP == 1);
+
 #[cuda_module]
 mod gemm32_kernels {
     use super::*;
     use crate::elem::silu_mul;
     use crate::flash::half_bits_to_f32;
+    use crate::kquant::act::apply;
     use crate::q5_1_sel::q5_1_codes;
     use cuda_device::async_copy::{
         cp_async_ca_4, cp_async_cg_16, cp_async_commit_group, cp_async_wait_group,
@@ -766,6 +772,107 @@ mod gemm32_kernels {
         // host sized the grid, checked k and the alignments; the lengths are
         // the launch contract's.
         unsafe { f32_tile_body(w, x, rows, k, n, &mut y, sh) };
+    }
+
+    /// [`swiglu_quant32`] under a gate·up rule of the K-quant family
+    /// (`kquant::act`): each value is `apply(act, limit, g, u)` — ik's
+    /// clamped SwiGLU at `limit` (`ACT_SWIGLU_CLAMP`) or `elem::silu_mul`
+    /// (`ACT_SILU_MUL`, then `swiglu_quant32`'s bytes) — quantized by the
+    /// same body; the contract admits those two codes alone. A non-finite
+    /// `g` or `u` refuses its block and raises [`FaultSite::QuantColumn`]
+    /// under either rule: the clamp would carry it to a finite value the
+    /// quantizer's test cannot see.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            act <= 1,
+            g.len() >= n_cols * 32 * blocks,
+            u.len() >= n_cols * 32 * blocks,
+            2 * steps >= blocks,
+            q.len() >= n_cols * 16 * steps,
+            d.len() >= n_cols * 2 * steps,
+            s.len() >= n_cols * 2 * steps
+        )
+    )]
+    pub fn swiglu_act_quant32(
+        g: &[f32],
+        u: &[f32],
+        act: u32,
+        limit: f32,
+        n_cols: u32,
+        blocks: u32,
+        groups: u32,
+        steps: u32,
+        mut q: DisjointSlice<u32>,
+        mut d: DisjointSlice<f32>,
+        mut s: DisjointSlice<i32>,
+        fault: FaultSink,
+    ) {
+        let grp = thread::index_1d().get() / 32;
+        let groups = groups as usize;
+        if grp >= n_cols as usize * groups {
+            return; // warp-uniform: one warp per block
+        }
+        let col = grp / groups;
+        let gi = grp - col * groups;
+        let lane = warp::lane_id() as usize;
+        let blocks = blocks as usize;
+        let b = (4 * gi + (lane >> 3)).min(blocks - 1);
+        let base = col * 32 * blocks + 32 * b + 4 * (lane & 7);
+        // SAFETY: b < blocks, so base + 3 < (col + 1)·32·blocks, inside g and
+        // u by the launch contract.
+        let (gv, uv) = unsafe {
+            (
+                [
+                    *g.get_unchecked(base),
+                    *g.get_unchecked(base + 1),
+                    *g.get_unchecked(base + 2),
+                    *g.get_unchecked(base + 3),
+                ],
+                [
+                    *u.get_unchecked(base),
+                    *u.get_unchecked(base + 1),
+                    *u.get_unchecked(base + 2),
+                    *u.get_unchecked(base + 3),
+                ],
+            )
+        };
+        let v = if crate::fault::quad_finite(gv) & crate::fault::quad_finite(uv) {
+            [
+                apply(act, limit, gv[0], uv[0]),
+                apply(act, limit, gv[1], uv[1]),
+                apply(act, limit, gv[2], uv[2]),
+                apply(act, limit, gv[3], uv[3]),
+            ]
+        } else {
+            [f32::NAN; 4]
+        };
+        // SAFETY: the warp enters with one (col, gi), col < n_cols and gi <
+        // groups = ceil(blocks / 4); the planes' bounds are the launch
+        // contract's.
+        let refused = unsafe {
+            quant32_group(
+                v,
+                col,
+                gi,
+                blocks,
+                steps as usize,
+                lane,
+                &mut q,
+                &mut d,
+                &mut s,
+            )
+        };
+        if refused && lane & 7 == 0 {
+            fault.raise(FaultSite::QuantColumn);
+        }
     }
 }
 

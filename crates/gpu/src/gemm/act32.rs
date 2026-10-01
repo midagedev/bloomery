@@ -1,12 +1,14 @@
-//! The 32-value-block activations of the Q8_0 and Q5_1 GEMMs, and the three
+//! The 32-value-block activations of the Q8_0 and Q5_1 GEMMs, and the four
 //! launches that fill them: the quantizer (`quantize_gemm32`), the SwiGLU
-//! quantizer between a gate·up pair and its down (`swiglu_quant32`), and its
-//! card-slots-only form over a remapped route (`swiglu_quant32_sel`). All
-//! entries are declared in `kernels32.rs`.
+//! quantizer between a gate·up pair and its down (`swiglu_quant32`), its
+//! card-slots-only form over a remapped route (`swiglu_quant32_sel`), and
+//! its form under a gate·up rule of `kquant::act`, ik's clamped SwiGLU among
+//! them (`swiglu_act_quant32`). All entries are declared in `kernels32.rs`.
 
 use super::kernels32::Gemm32Kernels;
 use super::{GEMM_MAX_SLOTS, GEMM32_STEP};
 use crate::fault::FaultSink;
+use crate::kquant::Act;
 use crate::tensor::Q8ACT_MAX_K;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -221,6 +223,65 @@ impl Gemm32Kernels {
         self.module.swiglu_quant32(
             stream, &prep, g, u, m, blocks, groups, steps, &mut act.q, &mut act.d, &mut act.s,
             fault,
+        )?;
+        act.filled = n_cols;
+        Ok(())
+    }
+
+    /// Enqueue `act = q8_1_32(rule(g, u))` over the first `n_cols` slot
+    /// columns (`swiglu_act_quant32`, declared in `kernels32.rs`):
+    /// [`Gemm32Kernels::enqueue_swiglu_quant32`] with the gate·up rule
+    /// `rule` (`kquant::act::apply`) in place of `silu(g) · u` — ik's
+    /// clamped SwiGLU for a feed-forward block its model clamps. A
+    /// non-finite `g` or `u` value refuses its block and raises
+    /// [`FaultSite::QuantColumn`] under either rule (the clamp would carry it
+    /// to a finite value); [`Act::SiluMul`] writes
+    /// `enqueue_swiglu_quant32`'s bytes. A clamp limit that is not finite is
+    /// refused by name. Asynchronous, allocation-free, capturable.
+    ///
+    /// [`FaultSite::QuantColumn`]: crate::FaultSite::QuantColumn
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
+    pub fn enqueue_swiglu_act_quant32(
+        &self,
+        stream: &CudaStream,
+        g: &DeviceBuffer<f32>,
+        u: &DeviceBuffer<f32>,
+        rule: Act,
+        n_cols: usize,
+        act: &mut GemmAct32,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "Gemm32Kernels::enqueue_swiglu_act_quant32";
+        if let Act::SwigluClamp { limit } = rule
+            && !limit.is_finite()
+        {
+            return Err(GpuError::shape(
+                what,
+                format!("the clamp limit must be finite, got {limit}"),
+            ));
+        }
+        let (grid, m, blocks, groups, steps) = act.quant_launch(what, n_cols)?;
+        if g.len() < n_cols * act.k || u.len() < n_cols * act.k {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "g.len() {} and u.len() {} need n_cols*k = {n_cols}*{}",
+                    g.len(),
+                    u.len(),
+                    act.k
+                ),
+            ));
+        }
+        let (code, limit) = rule.code();
+        let prep = self
+            .module
+            .prepare_swiglu_act_quant32(LaunchConfig1D::new(grid, 32, 0))?;
+        self.module.swiglu_act_quant32(
+            stream, &prep, g, u, code, limit, m, blocks, groups, steps, &mut act.q, &mut act.d,
+            &mut act.s, fault,
         )?;
         act.filled = n_cols;
         Ok(())

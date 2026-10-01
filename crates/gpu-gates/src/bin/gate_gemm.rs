@@ -102,6 +102,14 @@
 //!   card columns the plain launch's bits, the host columns a first plain
 //!   launch's, untouched, a NaN in a host column raising nothing and a
 //!   place in `[n_card, HOST)` `ExpertId` with nothing written.
+//! - `g32_swiglu_act`: `swiglu_act_quant32` under ik's clamped SwiGLU at
+//!   limits 10 (GLM-5.3's) and 0.5, K ∈ {96, 2048, 12288} for 1, 9 and 512
+//!   columns, bit for bit the CPU tier's ik-verified `qdot::swiglu_clamp`
+//!   then the host quantizer, each side of the clamp met (silu(g) past the
+//!   limit, u past either side, neither); under the plain rule
+//!   `swiglu_quant32`'s bytes; a NaN or infinite `g` or `u` refusing its
+//!   block and raising `QuantColumn` where the clamp alone would make it
+//!   finite.
 //! - `g32_dense`: at every K above and m ∈ {1, 8, 9, 512, 4096}, one
 //!   quantization and the three entries over the dense table, 272 rows (two
 //!   full slabs and one of 16): every output inside its band of the f64
@@ -133,7 +141,8 @@
 //!   K and columns, the quantizer's input and columns, an unfilled table,
 //!   rows not a multiple of 16, a layout or planes of another shape, an
 //!   activation of fewer columns than the slots or quantized for fewer, a
-//!   short `y`, an empty map and slots past the table for the remap, and the
+//!   short `y`, a clamp limit that is not finite and a short input for the
+//!   rule-taking SwiGLU, an empty map and slots past the table for the remap, and the
 //!   F32 tile's K, short `x` and an `x` off a 16-byte boundary.
 
 #[cfg(not(feature = "gpu"))]
@@ -2234,6 +2243,7 @@ mod gate {
             GemmKernels, GemmRoute, GemmWeight,
         };
         use bloomery_gpu::hybrid::HOST;
+        use bloomery_gpu::kquant::{Act, act::silu_ik};
         use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE};
         use bloomery_gpu_gates::gemm32::{HostAct, Planes32, dot32, host_act};
         use bloomery_gpu_gates::rounding::gamma;
@@ -2849,6 +2859,182 @@ mod gate {
                     "gemm32 case=g32_quant swiglu_sel_stray K={k} col={host_col} \
                      col_unwritten={unwritten} fault={} {}",
                     fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            Ok(ok)
+        }
+
+        /// The rule-taking SwiGLU quantizer (`swiglu_act_quant32`): under ik's
+        /// clamp, bit for bit the CPU tier's ik-verified `qdot::swiglu_clamp`
+        /// then the host quantizer, each side of the clamp met; under the
+        /// plain rule, `swiglu_quant32`'s bytes; a non-finite input refused.
+        fn swiglu_act_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_swiglu_act") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let mut ok = true;
+            gpu.clear_fault()?;
+            // GLM-5.3's dense lead and shared expert clamp at the file's
+            // `swiglu_clamp_shexp` (`limit_shexp` of
+            // `crates/model/src/arch/glm5next/hparams.rs`), its routed experts
+            // at `swiglu_clamp_exp`; 10 stands for them here, 0.5 clamps most
+            // values.
+            const LIMITS: [f32; 2] = [10.0, 0.5];
+            let max = 512;
+            // Per limit: values whose silu(g) passes it, whose u passes +limit
+            // or -limit, and that neither clamp touches.
+            let mut sides = [[0usize; 4]; 2];
+            // K 96 ends in a one-block step; 2048 and 12288 are the down's K of
+            // GLM's shared expert and dense lead.
+            for k in [96usize, 2048, 12288] {
+                let mut act = GemmAct32::new(stream, max, k)?;
+                let mut plain = GemmAct32::new(stream, max, k)?;
+                for n in [1usize, 9, max] {
+                    let scaled = |seed: u32| -> Vec<f32> {
+                        activations(k, n, seed)
+                            .into_iter()
+                            .map(|v| 12.0 * v)
+                            .collect()
+                    };
+                    let (gh, uh) = (scaled(9700 + (k + n) as u32), scaled(9800 + (k + n) as u32));
+                    let (g, u) = (
+                        DeviceBuffer::from_host(stream, &gh)?,
+                        DeviceBuffer::from_host(stream, &uh)?,
+                    );
+                    for (li, limit) in LIMITS.into_iter().enumerate() {
+                        dev.g32.enqueue_swiglu_act_quant32(
+                            stream,
+                            &g,
+                            &u,
+                            Act::SwigluClamp { limit },
+                            n,
+                            &mut act,
+                            sink,
+                        )?;
+                        stream.synchronize()?;
+                        let fault = gpu.take_fault()?;
+                        let mut h = vec![0.0f32; n * k];
+                        qdot::swiglu_clamp(&gh, &uh, limit, &mut h);
+                        let (_, want) = host_act(&h, k, n);
+                        let same = planes_equal(&act, n, &want, stream)?;
+                        for (&gv, &uv) in gh.iter().zip(&uh) {
+                            let over = silu_ik(gv) > limit;
+                            let c = &mut sides[li];
+                            c[0] += usize::from(over);
+                            c[1] += usize::from(uv > limit);
+                            c[2] += usize::from(uv < -limit);
+                            c[3] += usize::from(!over && uv.abs() <= limit);
+                        }
+                        let pass = same && fault.is_none();
+                        println!(
+                            "gemm32 case=g32_swiglu_act clamp K={k} cols={n} limit={limit} \
+                             planes_eq_host_of_ik_clamp={same} fault={} {}",
+                            fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                            verdict(pass)
+                        );
+                        ok &= pass;
+                    }
+                    // The plain rule: the bytes of `swiglu_quant32`.
+                    dev.g32.enqueue_swiglu_act_quant32(
+                        stream,
+                        &g,
+                        &u,
+                        Act::SiluMul,
+                        n,
+                        &mut act,
+                        sink,
+                    )?;
+                    dev.g32
+                        .enqueue_swiglu_quant32(stream, &g, &u, n, &mut plain, sink)?;
+                    stream.synchronize()?;
+                    let fault = gpu.take_fault()?;
+                    let st = plain.steps();
+                    let want: Planes32 = (
+                        plain.q().to_host_vec(stream)?[..n * 16 * st].to_vec(),
+                        plain.d().to_host_vec(stream)?[..n * 2 * st].to_vec(),
+                        plain.s().to_host_vec(stream)?[..n * 2 * st].to_vec(),
+                    );
+                    let same = planes_equal(&act, n, &want, stream)?;
+                    let pass = same && fault.is_none();
+                    println!(
+                        "gemm32 case=g32_swiglu_act silu_mul K={k} cols={n} \
+                         planes_eq_swiglu_quant32={same} fault={} {}",
+                        fault.map_or_else(|| "none".into(), |f| f.to_string()),
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            for (li, limit) in LIMITS.into_iter().enumerate() {
+                let [sg, up, dn, free] = sides[li];
+                let pass = sg > 0 && up > 0 && dn > 0 && free > 0;
+                println!(
+                    "gemm32 case=g32_swiglu_act sides limit={limit} silu_over={sg} up_over={up} \
+                     up_under={dn} unclamped={free} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            // A non-finite input refuses its block under the clamp, where the
+            // rule alone would carry a NaN or infinite `u`, or an infinite `g`,
+            // to a finite value: the host side is the clamp's rows with that
+            // value NaN.
+            let (k, n) = (2048usize, 9usize);
+            let mut act = GemmAct32::new(stream, n, k)?;
+            let at = 3 * k + 33;
+            let blk = 3 * act.steps() * 2 + 1;
+            let limit = LIMITS[0];
+            for (what, on_g, bad) in [
+                ("g_nan", true, f32::NAN),
+                ("g_inf", true, f32::INFINITY),
+                ("u_nan", false, f32::NAN),
+                ("u_inf", false, f32::NEG_INFINITY),
+            ] {
+                let mut gh: Vec<f32> = activations(k, n, 9900)
+                    .into_iter()
+                    .map(|v| 12.0 * v)
+                    .collect();
+                let mut uh: Vec<f32> = activations(k, n, 9901)
+                    .into_iter()
+                    .map(|v| 12.0 * v)
+                    .collect();
+                if on_g {
+                    gh[at] = bad;
+                } else {
+                    uh[at] = bad;
+                }
+                let (g, u) = (
+                    DeviceBuffer::from_host(stream, &gh)?,
+                    DeviceBuffer::from_host(stream, &uh)?,
+                );
+                dev.g32.enqueue_swiglu_act_quant32(
+                    stream,
+                    &g,
+                    &u,
+                    Act::SwigluClamp { limit },
+                    n,
+                    &mut act,
+                    sink,
+                )?;
+                stream.synchronize()?;
+                let fault = gpu.take_fault()?;
+                let mut h = vec![0.0f32; n * k];
+                qdot::swiglu_clamp(&gh, &uh, limit, &mut h);
+                h[at] = f32::NAN;
+                let (_, want) = host_act(&h, k, n);
+                let same = planes_equal(&act, n, &want, stream)?;
+                let refused = act.d().to_host_vec(stream)?[blk].is_nan();
+                let site = fault == Some(Fault::at(LAYER_NONE, FaultSite::QuantColumn));
+                let pass = same && refused && site;
+                println!(
+                    "gemm32 case=g32_swiglu_act fault={what} K={k} limit={limit} \
+                     planes_eq_host(block refused)={same} d_nan={refused} \
+                     site_quant_column={site} {}",
                     verdict(pass)
                 );
                 ok &= pass;
@@ -3545,6 +3731,32 @@ mod gate {
                     "1 <= n_cols <= act.cols()",
                 ),
                 (
+                    "swiglu_act_limit_nan",
+                    dev.g32.enqueue_swiglu_act_quant32(
+                        stream,
+                        &x,
+                        &x,
+                        Act::SwigluClamp { limit: f32::NAN },
+                        8,
+                        &mut act_q,
+                        sink,
+                    ),
+                    "the clamp limit must be finite",
+                ),
+                (
+                    "swiglu_act_short_input",
+                    dev.g32.enqueue_swiglu_act_quant32(
+                        stream,
+                        &short,
+                        &x,
+                        Act::SiluMul,
+                        8,
+                        &mut act_q,
+                        sink,
+                    ),
+                    "need n_cols*k",
+                ),
+                (
                     "unfilled_route",
                     gemm(plane, rows, &act, &unfilled, &mut y),
                     "a filled route table",
@@ -3641,6 +3853,7 @@ mod gate {
             };
             let t0 = std::time::Instant::now();
             let mut ok = quant_case(&dev)?;
+            ok &= swiglu_act_case(&dev)?;
             ok &= dense_case(&dev)?;
             ok &= routed_case(&dev)?;
             ok &= remap_case(&dev)?;
