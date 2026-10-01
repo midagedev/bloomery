@@ -1074,7 +1074,7 @@ pub static RESIDENCY_HOST: Kind = Kind {
     doc: "Adaptive residency's host share, from the plan before the load: the lever's word, the \
           seed experts a layer kept on the stage card, the churn pool (the stage card's experts \
           past them, which the load's host set holds too) and its bytes, and the plan's host \
-          headroom before and after the pool.",
+          headroom before and after the pool and any bytes the load hosts beside the plan.",
     parts: &[
         key("residency", Word, ""),
         key("pinned", U64, ""),
@@ -1923,13 +1923,29 @@ pub fn residency_host(
     pool: &model::placement::churn::ChurnPool,
     plan: &Plan<'_>,
 ) -> Record {
+    residency_host_beside(residency, pool, plan, 0)
+}
+
+/// [`residency_host`] of a load whose host set also holds `beside` bytes the
+/// plan does not count (a draft layer's experts hosted beside the plan's
+/// own): `headroom_after` is the plan's headroom less the pool and them, the
+/// sum the machine's `ChurnPool::check_beside` holds to 0 or more.
+pub fn residency_host_beside(
+    residency: &str,
+    pool: &model::placement::churn::ChurnPool,
+    plan: &Plan<'_>,
+    beside: u64,
+) -> Record {
     Record::new(&RESIDENCY_HOST)
         .w("residency", residency)
         .u("pinned", pool.pinned)
         .u("churn_experts", pool.experts)
         .u("churn_bytes", pool.bytes)
         .u("headroom", plan.host.headroom_bytes)
-        .u("headroom_after", pool.headroom_after(plan))
+        .u(
+            "headroom_after",
+            pool.headroom_after(plan) - i128::from(beside),
+        )
 }
 
 /// A residency boundary's record, of a machine driven directly
