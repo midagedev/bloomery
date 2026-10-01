@@ -34,7 +34,7 @@ pub fn with_cards(
     what: &'static str,
     r: Record,
 ) -> Result<Record, GateError> {
-    let tier = m.body(what)?.hybrid().tier();
+    let tier = m.body(what)?.hybrid().tiers().first();
     let mut devices = vec![m.gpu().device_name()?];
     if let Some(t) = tier {
         devices.push(t.gpu().device_name()?);

@@ -73,10 +73,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::swap::{BoundaryAt, PassReport, ResetReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use bloomery_gpu::host::tier::{TierCard, TierSet, TierShape};
+use bloomery_gpu::host::{PassKind, refuse_tier_count};
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap, refuse_expert_tiers,
 };
@@ -819,7 +819,7 @@ pub struct Body {
     residency_glue: ResidencyGlue,
 }
 
-/// The tier card a placed load hangs under the host tier
+/// A tier card a placed load hangs under the host tier
 /// ([`Body::open_placed_tiered`]): the plan's device index its routed
 /// segments sit on (`Device::Card(card)`), and the card's name, by which the
 /// card is found ([`Gpu::for_card`]).
@@ -2148,24 +2148,28 @@ impl Body {
         Body::open_placed_tiered(file, plan, card, None, meta)
     }
 
-    /// [`Body::open_placed`] with the tier card `tier` hung under the host
-    /// tier when given: the plan's routed segments on `tier.card` load onto
-    /// that card ([`Weights::load_placed`]), the slot map sends their
-    /// experts to it ([`SlotMap::of_plan`]), and each layer that holds one
-    /// runs as a tier layer ([`crate::chain::ffn`]'s tier entries), and under
-    /// the batch feed the prompt batch's buffers are made here
-    /// ([`prefill::prepare_prefill`]): making them inside a prompt call loads
-    /// modules, which waits on a context whose tier stream a lost card holds.
-    /// Without a tier it is [`Body::open_placed`], launch for launch.
+    /// [`Body::open_placed`] with the tier cards `tiers` hung under the host
+    /// tier, tier `t` the `t`-th: the plan's routed segments on each tier's
+    /// card load onto that card ([`Weights::load_placed`]), the slot map
+    /// sends their experts to it ([`SlotMap::of_plan_tiers`]), and each layer
+    /// that holds one runs as a tier layer ([`crate::chain::ffn`]'s tier
+    /// entries), and under the batch feed the prompt batch's buffers are made
+    /// here ([`prefill::prepare_prefill`]): making them inside a prompt call
+    /// loads modules, which waits on a context whose tier stream a lost card
+    /// holds. More tier cards than the host tier serves are refused by name
+    /// before anything uploads ([`refuse_tier_count`]). Without a tier it is
+    /// [`Body::open_placed`], launch for launch.
     pub fn open_placed_tiered(
         file: Split,
         plan: &Plan<'_>,
         card: usize,
-        tier: Option<TierOpen>,
+        tiers: impl IntoIterator<Item = TierOpen>,
         meta: &BodyMeta,
     ) -> Result<Deepseek41Model, GpuError> {
         meta.levers.check()?;
-        if let Some(t) = &tier {
+        let tiers: Vec<TierOpen> = tiers.into_iter().collect();
+        refuse_tier_count(TIER_MAP_BEFORE_UPLOAD, tiers.len())?;
+        if !tiers.is_empty() {
             // The map refuses an expert on two devices before anything
             // uploads, under a name of its own: the load's map is checked again
             // after the uploads (`Body::load_placed`).
@@ -2179,10 +2183,11 @@ impl Body {
                 })?
                 .layers
                 .clone();
-            SlotMap::of_plan(plan, card, Some(t.card), layers, meta.hp.experts.n_expert)
+            let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+            SlotMap::of_plan_tiers(plan, card, &cards, layers, meta.hp.experts.n_expert)
                 .map_err(|e| GpuError::plan(TIER_MAP_BEFORE_UPLOAD, e))?;
         }
-        let tiered = tier.is_some();
+        let tiered = !tiers.is_empty();
         let residency = ResidencySpec {
             lever: meta.levers.residency,
             delay: swap::LIVE_DELAY,
@@ -2199,7 +2204,16 @@ impl Body {
             residency,
             Body::derive,
             |gpu, file, _w, residency, residency_glue| {
-                Body::load_placed(gpu, file, plan, card, tier, meta, residency, residency_glue)
+                Body::load_placed(
+                    gpu,
+                    file,
+                    plan,
+                    card,
+                    tiers,
+                    meta,
+                    residency,
+                    residency_glue,
+                )
             },
         )?;
         if tiered && meta.levers.prefill == PrefillMode::Batch {
@@ -2230,14 +2244,14 @@ impl Body {
     /// pieces are sized.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the placed load's card, file, plan, tier, levers, host set and residency glue (rust-quality R8)"
+        reason = "the placed load's card, file, plan, tiers, levers, host set and residency glue (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
         file: &Arc<Split>,
         plan: &Plan<'_>,
         card: usize,
-        tier: Option<TierOpen>,
+        tiers: Vec<TierOpen>,
         meta: &BodyMeta,
         residency: HostResidency,
         residency_glue: ResidencyGlue,
@@ -2295,13 +2309,8 @@ impl Body {
         let arrival = RowsArrival::new(gpu.context(), PAIR_ROWS, image.layout())?;
 
         let n_expert = hp.experts.n_expert;
-        let map = SlotMap::of_plan(
-            plan,
-            card,
-            tier.as_ref().map(|t| t.card),
-            layers.clone(),
-            n_expert,
-        )?;
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, layers.clone(), n_expert)?;
         let slots = Arc::new(DeviceTensor::upload(
             stream,
             &map.stage_view(),
@@ -2337,32 +2346,24 @@ impl Body {
         )?;
         let file = Arc::clone(file);
         let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone(), cfg.host.r8)?;
-        let tier_index = tier.as_ref().map(|t| t.card);
-        let tier_card = match tier {
-            Some(t) => Some(open_tier(
-                gpu,
-                &file,
-                plan,
-                &t,
-                hp,
-                &map,
-                cfg.host.card_dontneed,
-            )?),
-            None => None,
-        };
+        let tier_cards = tiers
+            .iter()
+            .enumerate()
+            .map(|(i, t)| open_tier(gpu, &file, plan, t, i, hp, &map, cfg.host.card_dontneed))
+            .collect::<Result<Vec<_>, _>>()?;
         let mut hybrid = Hybrid::new(boundary, map, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         hybrid.keep_residency(residency);
-        let tier = match (tier_card, tier_index) {
-            (Some(t), Some(index)) => {
-                hybrid.attach_tier(t, gpu)?;
-                // The tier's batch staging is reserved on its card by the plan,
-                // so it is made at load, not at the first prompt.
-                hybrid.prepare_batch(gpu.context(), prefill::T_MAX)?;
-                hybrid.check_tier_reserves(plan.machine, index)?;
-                Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?)
-            }
-            _ => None,
+        let tier = if tier_cards.is_empty() {
+            None
+        } else {
+            let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+            hybrid.attach_tiers(tier_cards, gpu)?;
+            // The tiers' batch staging is reserved on their cards by the plan,
+            // so it is made at load, not at the first prompt.
+            hybrid.prepare_batch(gpu.context(), prefill::T_MAX)?;
+            hybrid.check_tier_reserves(plan.machine, &cards)?;
+            Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?)
         };
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
         let holds = Holds::new(ring_rows, planner.stream_ratios());
@@ -2413,23 +2414,28 @@ impl Body {
     }
 }
 
-/// The tier card `t` of `plan`, for the stage card `stage`'s load: its card
-/// found by name, its routed segments uploaded, its set the map's tier rows,
-/// V4.1's tier computation over them; `card_dontneed` as for the stage
-/// card's segments. The stage card's context is current again on return.
-/// Load-time only.
+/// The tier card `t` of `plan`, tier `tier` of the map, for the stage card
+/// `stage`'s load: its card found by name, its routed segments uploaded, its
+/// set the map's rows of that tier, V4.1's tier computation over them;
+/// `card_dontneed` as for the stage card's segments. The stage card's context
+/// is current again on return. Load-time only.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the stage card, the file, the plan, the tier and its index, the hparams, the map and the page lever (rust-quality R8)"
+)]
 fn open_tier(
     stage: &Gpu,
     file: &Split,
     plan: &Plan<'_>,
     t: &TierOpen,
+    tier: usize,
     hp: &Hparams,
     map: &SlotMap,
     card_dontneed: bool,
 ) -> Result<TierCard, GpuError> {
     let gpu = Gpu::for_card(&t.name)?;
     let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
-    let set = TierSet::of_map(map)?;
+    let set = TierSet::of_map(map, tier)?;
     let experts = Ds41Tier::new(&gpu, hp, &set, &w)?;
     let card = TierCard::open(
         gpu,

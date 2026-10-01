@@ -174,7 +174,7 @@ mod gate {
     use bloomery_gpu::host::route_trace::{
         KIND_CARD, KIND_HOST, KIND_TIER, RouteTrace, TraceHeader, TraceSet,
     };
-    use bloomery_gpu::hybrid::{Chain, HOST, HostExperts, PoisonKind, RELEASE, Slot, TIER};
+    use bloomery_gpu::hybrid::{Chain, HostExperts, PoisonKind, RELEASE, Slot};
     use bloomery_gpu::model::{ChainBody, HostServed};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD};
@@ -662,10 +662,10 @@ mod gate {
                             want_kind.get_mut(layer),
                         ) {
                             wi.extend_from_slice(i);
-                            wk.extend(s.iter().map(|&p| match p {
-                                HOST => KIND_HOST,
-                                p if p & TIER != 0 => KIND_TIER,
-                                _ => KIND_CARD,
+                            wk.extend(s.iter().map(|&p| match Slot::of(p) {
+                                Slot::Host => KIND_HOST,
+                                Slot::Tier { .. } => KIND_TIER,
+                                Slot::Card(_) => KIND_CARD,
                             }));
                             seen += 1;
                         }
@@ -758,7 +758,7 @@ mod gate {
                 for (&id, &kind) in g.iter().zip(k) {
                     let by_map = match slots.slot(l, u32::from(id)) {
                         Some(Slot::Card(_)) => Some(KIND_CARD),
-                        Some(Slot::Tier(_)) => Some(KIND_TIER),
+                        Some(Slot::Tier { .. }) => Some(KIND_TIER),
                         Some(Slot::Host) => Some(KIND_HOST),
                         None => None,
                     };

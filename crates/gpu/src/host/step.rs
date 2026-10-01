@@ -8,7 +8,7 @@
 
 use super::page::{HandoffLayout, PageLayout, Word};
 use super::route_trace::RouteTrace;
-use super::slots::{Slot, SlotMap};
+use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::{Health, HostExperts, Refusal, nanos, non_finite, unknown_id};
 use crate::GpuError;
 use crate::graph::{
@@ -621,9 +621,10 @@ pub struct StepPort {
     capturing: bool,
     /// A step service's refusal its step's caller has not yet named.
     pub(super) step_refusal: Option<Refusal>,
-    /// Routed slots the last one-column service's handoff sent to the tier
-    /// card: the tier's hits of that layer, which the host tier counts.
-    pub(super) tier_slots: u64,
+    /// Routed slots the last one-column service's handoff sent to each tier
+    /// card, by tier: the tiers' hits of that layer, which the host tier
+    /// counts.
+    pub(super) tier_slots: [u64; MAX_TIERS],
     /// For the row overlap in `stats`: the layer whose host ids row 0 of a
     /// two-row pass served last ([`Chain::Pair`] services only), `None` until
     /// a pair's row 0 is served, and those ids, with room for `n_used` made
@@ -732,7 +733,7 @@ impl StepPort {
             chain: Chain::Step,
             capturing: false,
             step_refusal: None,
-            tier_slots: 0,
+            tier_slots: [0; MAX_TIERS],
             pair_row0: None,
             row0_ids: Vec::with_capacity(h.n_used),
             stats: StepStats::default(),
@@ -981,7 +982,7 @@ impl StepPort {
         // list's room. A card's or the tier's id is theirs.
         self.list.clear();
         let (mut w2_host, mut w2_all) = (0.0f64, 0.0f64);
-        let mut tier_slots = 0u64;
+        let mut tier_slots = [0u64; MAX_TIERS];
         let mut unknown = None;
         for s in 0..h.n_used {
             let (Some(id), Some(wb)) = (
@@ -999,7 +1000,7 @@ impl StepPort {
                     w2_host += f64::from(w) * f64::from(w);
                 }
                 Some(Slot::Card(_)) => {}
-                Some(Slot::Tier(_)) => tier_slots += 1,
+                Some(Slot::Tier { tier, .. }) => tier_slots[tier] += 1,
                 None => unknown = unknown.or(Some((s, id))),
             }
         }
@@ -1118,7 +1119,7 @@ impl StepPort {
                         len += 1;
                         w2_host += f64::from(w) * f64::from(w);
                     }
-                    Some(Slot::Card(_) | Slot::Tier(_)) => {}
+                    Some(Slot::Card(_) | Slot::Tier { .. }) => {}
                     None => refused = refused.or(Some((j, unknown_id(s, id, slots.n_expert())))),
                 }
             }

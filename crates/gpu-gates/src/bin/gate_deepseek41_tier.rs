@@ -442,10 +442,14 @@ mod gate {
     /// without a tier.
     fn tier_counts(m: &Deepseek41Model) -> Result<Option<Sent>, GateError> {
         let hybrid = m.body(NAME)?.hybrid();
-        Ok(hybrid.tier().map(|t| Sent {
+        Ok(hybrid.tiers().first().map(|t| Sent {
             first: t.set().layers().start,
             hits: t.stats().layer_hits,
-            stats: hybrid.tier_batch_stats(),
+            stats: hybrid
+                .tier_batch_stats()
+                .first()
+                .copied()
+                .unwrap_or_default(),
         }))
     }
 
@@ -740,7 +744,8 @@ mod gate {
                 let body = m.body(NAME)?;
                 let tier = body
                     .hybrid()
-                    .tier()
+                    .tiers()
+                    .first()
                     .ok_or("the tiered load holds no tier card")?;
                 let st = tier.stats();
                 let first = tier.set().layers().start;
@@ -1003,7 +1008,7 @@ mod gate {
     /// met a NaN there; returns the fault a read of the word gives.
     fn raise_tier_fault(m: &mut Deepseek41Model, layer: usize) -> Result<Fault, GateError> {
         let body = m.body(NAME)?;
-        let tier = body.hybrid().tier().ok_or("no tier card")?;
+        let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
         let g = tier.gpu();
         let s = g.stream();
         let x = DeviceBuffer::from_host(s, &[f32::NAN; 256])?;
@@ -1069,7 +1074,7 @@ mod gate {
         m.reset()?;
         let flags = {
             let body = m.body(NAME)?;
-            let tier = body.hybrid().tier().ok_or("no tier card")?;
+            let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
             let flags = HostFlags::new(tier.gpu().context(), 1)?;
             flags.enqueue_wait(tier.gpu().stream(), 0)?;
             flags
@@ -1127,7 +1132,8 @@ mod gate {
         flags.raise(0)?;
         let body = m.body(NAME)?;
         body.hybrid()
-            .tier()
+            .tiers()
+            .first()
             .ok_or("no tier card")?
             .gpu()
             .stream()
@@ -1144,7 +1150,7 @@ mod gate {
         m.step(&prompt[..4])?;
         let flags = {
             let body = m.body(NAME)?;
-            let tier = body.hybrid().tier().ok_or("no tier card")?;
+            let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
             let flags = HostFlags::new(tier.gpu().context(), 1)?;
             flags.enqueue_wait(tier.gpu().stream(), 0)?;
             flags
@@ -1192,7 +1198,8 @@ mod gate {
         flags.raise(0)?;
         let body = m.body(NAME)?;
         body.hybrid()
-            .tier()
+            .tiers()
+            .first()
             .ok_or("no tier card")?
             .gpu()
             .stream()

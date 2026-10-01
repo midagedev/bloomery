@@ -18,7 +18,10 @@ gguf 9 2 0
 # overflow gate (tensor.rs tests) calls the unsafe constructor inside its catch_unwind, one block with
 # its SAFETY line. The rule change in the same round (quoteless `unsafe extern {` blocks, build.rs
 # walked) counts 0 new sites in the tree the pin was measured on.
-gpu 1364 144 6
+# PIN(2026-10-01): gpu 1364 -> 1365 blocks, new code, not old code relaxed: the shared tier page (ntier1,
+# host/tier.rs) keeps the stage card's windows over it as rows of their own (StageRow), apart from the tier
+# cards' windows, and their Drop releases the two window handles in one block, with its SAFETY line.
+gpu 1365 144 6
 gpu-deepseek41 459 51 0
 gpu-gates 60 5 1
 gpu-glm5next 4 0 0

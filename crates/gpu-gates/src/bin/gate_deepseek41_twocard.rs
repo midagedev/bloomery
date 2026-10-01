@@ -324,7 +324,8 @@ mod gate {
         let tier = m
             .body(NAME)?
             .hybrid()
-            .tier()
+            .tiers()
+            .first()
             .ok_or("the (b′) load holds no tier card")?;
         let tier_device = tier.gpu().device_name()?;
         if !tier_device.contains(tier_card) {
@@ -359,7 +360,7 @@ mod gate {
         };
         let mut model = Body::open_placed_tiered(file, plan, 0, None, &meta)?;
         model.set_mode(StepMode::Graph);
-        if model.body(NAME)?.hybrid().tier().is_some() {
+        if !model.body(NAME)?.hybrid().tiers().is_empty() {
             return Err("the reference load holds a tier card".into());
         }
         let loaded = Loaded::from_model(model, ds41(cfg), u32::try_from(plan.ctx_max)?);
@@ -429,10 +430,14 @@ mod gate {
     /// without a tier.
     fn tier_counts(m: &Deepseek41Model) -> Result<Option<Sent>, GateError> {
         let hybrid = m.body(NAME)?.hybrid();
-        Ok(hybrid.tier().map(|t| Sent {
+        Ok(hybrid.tiers().first().map(|t| Sent {
             first: t.set().layers().start,
             hits: t.stats().layer_hits,
-            stats: hybrid.tier_batch_stats(),
+            stats: hybrid
+                .tier_batch_stats()
+                .first()
+                .copied()
+                .unwrap_or_default(),
         }))
     }
 
@@ -674,7 +679,11 @@ mod gate {
                 pass = false;
             }
             let body = o.s.model().body(NAME)?;
-            let tier = body.hybrid().tier().ok_or("the (b′) load holds no tier")?;
+            let tier = body
+                .hybrid()
+                .tiers()
+                .first()
+                .ok_or("the (b′) load holds no tier")?;
             let st = tier.stats();
             let first = tier.set().layers().start;
             let hits = |l: usize| st.layer_hits.get(l - first).copied().unwrap_or(0);
@@ -763,7 +772,7 @@ mod gate {
         m.step(&prompt[..4])?;
         let flags = {
             let body = m.body(NAME)?;
-            let tier = body.hybrid().tier().ok_or("no tier card")?;
+            let tier = body.hybrid().tiers().first().ok_or("no tier card")?;
             let flags = HostFlags::new(tier.gpu().context(), 1)?;
             flags.enqueue_wait(tier.gpu().stream(), 0)?;
             flags
@@ -813,7 +822,8 @@ mod gate {
         flags.raise(0)?;
         let body = m.body(NAME)?;
         body.hybrid()
-            .tier()
+            .tiers()
+            .first()
             .ok_or("no tier card")?
             .gpu()
             .stream()

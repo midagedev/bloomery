@@ -375,7 +375,7 @@ impl RouteTrace {
                 .ok_or_else(|| GpuError::shape(WHAT, "the routing is outside the handoff"))?;
             let kind = match slots.slot(layer, id) {
                 Some(Slot::Card(_)) => KIND_CARD,
-                Some(Slot::Tier(_)) => KIND_TIER,
+                Some(Slot::Tier { .. }) => KIND_TIER,
                 Some(Slot::Host) => KIND_HOST,
                 None => {
                     return Err(GpuError::shape(

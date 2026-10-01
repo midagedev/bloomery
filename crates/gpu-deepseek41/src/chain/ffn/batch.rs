@@ -1906,7 +1906,7 @@ impl FfnBatch {
             return tier.enqueue_download(gpu.stream(), xw, &self.ids, key);
         }
         let tsel = self.tsel()?;
-        tier.enqueue_download_tiered(gpu.stream(), xw, &self.ids, tsel, key)
+        tier.enqueue_download_tiered(gpu.stream(), xw, &self.ids, &[tsel], key)
     }
 
     /// The tier places, refused by name on a batch made without a tier.

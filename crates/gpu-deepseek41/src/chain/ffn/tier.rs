@@ -32,6 +32,11 @@ use super::*;
 /// What the tier entries' errors name.
 const TIER_WHAT: &str = "FfnPiece::enqueue (tier layer)";
 
+/// The tier the stage card's tier entries serve: they hand one tier its
+/// image and join one tier's rows, so a load holds one tier card
+/// ([`bloomery_gpu::host::refuse_tier_count`]).
+pub const STAGE_TIER: usize = 0;
+
 #[cuda_module]
 mod tier_kernels {
     use super::*;
@@ -426,8 +431,12 @@ impl TierPiece {
         let tsel = (0..rows)
             .map(|_| DeviceBuffer::zeroed(stream, N_USED))
             .collect::<Result<Vec<_>, _>>()?;
-        let places =
-            DeviceTensor::upload(stream, &map.tier_view(), map.layers().len(), map.n_expert())?;
+        let places = DeviceTensor::upload(
+            stream,
+            &map.tier_view(STAGE_TIER)?,
+            map.layers().len(),
+            map.n_expert(),
+        )?;
         Ok(TierPiece {
             module,
             tsel,
@@ -504,7 +513,7 @@ impl FfnPiece {
             what: TIER_WHAT,
             detail: format!("row {row} of the tier piece"),
         })?;
-        let (target, ttarget) = hybrid.tier_handoff(row)?;
+        let (target, ttarget) = hybrid.tier_handoff(row, STAGE_TIER)?;
         let h = Handoff {
             ids: &r.rout.ids,
             weights: &r.rout.weights,
@@ -547,9 +556,9 @@ impl FfnPiece {
         tier: &TierPiece,
     ) -> Result<(), GpuError> {
         let i = self.check_io(layer, hybrid.slots(), &io, row)?;
-        let n_tier = hybrid.on_tier(layer)?;
+        let n_tier = hybrid.on_tier_of(STAGE_TIER, layer)?;
         let stream = gpu.stream();
-        hybrid.enqueue_tier_back(stream, row)?;
+        hybrid.enqueue_tier_back(stream, layer, row)?;
         {
             let hsum = hybrid.boundary().hsum_of(row)?;
             let trows = hybrid.tier_rows(row)?;

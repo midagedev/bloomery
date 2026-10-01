@@ -320,7 +320,7 @@ fn tier_entries(s: &Session<Body>) -> Result<Vec<(usize, u32, Slot)>, GateError>
     let mut out = Vec::new();
     for l in map.layers() {
         for id in 0..map.n_expert() as u32 {
-            if let Some(t @ Slot::Tier(_)) = map.slot(l, id) {
+            if let Some(t @ Slot::Tier { .. }) = map.slot(l, id) {
                 out.push((l, id, t));
             }
         }

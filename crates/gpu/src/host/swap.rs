@@ -1441,7 +1441,7 @@ impl SwapMachine {
             for id in 0..n_expert as u32 {
                 match slots.slot(l, id) {
                     Some(Slot::Card(s)) => order[s as usize] = id,
-                    Some(Slot::Tier(_)) => tier.push(id),
+                    Some(Slot::Tier { .. }) => tier.push(id),
                     Some(Slot::Host) | None => {}
                 }
             }

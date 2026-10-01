@@ -81,15 +81,17 @@
 //! poisons the tier; the model's reset lifts a refusal's poison
 //! ([`HostTier::reset`]), and any other stays until a reload.
 //!
-//! A tier may hang a second card under it ([`tier::TierCard`],
-//! [`HostTier::attach_tier`]): per hybrid layer the card computes the
-//! routed experts of its set in the host leg's shadow, behind its own go
-//! and counter in its own page, and the stage card's wait waits for both
-//! counters. The host launches the card's captured graph at the start of a
-//! replay's service and, once it has served the replay's last layer, waits
-//! for the card's progress under the go deadline and reads its fault copy
-//! (the module comment of [`tier`]). A card that stops signalling poisons
-//! the tier as a lost card, which no reset lifts.
+//! A tier may hang tier cards under it ([`tier::TierCard`],
+//! [`HostTier::attach_tiers`]; one today, [`refuse_tier_count`]): per
+//! hybrid layer each card computes the routed experts of its set in the host
+//! leg's shadow, behind its own go and counter on the tiers' page
+//! ([`tier::TierPage`]), and the stage card's wait waits for the host's
+//! counter and for those of the tiers that hold experts of the layer. The
+//! host launches each card's captured graph at the start of a replay's
+//! service and, once it has served the replay's last layer, waits for each
+//! card's progress under the go deadline and reads its fault copy (the module
+//! comment of [`tier`]). A card that stops signalling poisons the tier as a
+//! lost card, which no reset lifts.
 
 pub mod batch;
 pub mod handoff;
@@ -116,16 +118,49 @@ use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
 use residency::HostResidency;
 use route_trace::RouteTrace;
-use slots::SlotMap;
+use slots::{MAX_TIERS, SlotMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use step::{Boundary, Chain, GO_DEADLINE, HandoffTarget, SERVE, StepPort, stream_idle, word};
-use tier::{Pass, TierCard, TierTarget};
+use tier::{Pass, TierCard, TierPage, TierTarget};
 
 /// What a prompt group's start ([`HostTier::begin_group`]) is named as in its
 /// refusals.
 pub const BEGIN_GROUP: &str = "HostTier::begin_group";
+
+/// The tier cards one host tier serves at most. The stage card's tier
+/// entries hand one tier its image and join one tier's rows; N >= 2 lands
+/// with V4.1's `_tiers` handoff.
+pub const SERVED_TIERS: usize = 1;
+
+/// Refuse, as `what`, a load of `n` expert tier cards past
+/// [`SERVED_TIERS`], before anything of the load is uploaded: the one
+/// owner of that rule, which [`HostTier::attach_tiers`] holds too.
+pub fn refuse_tier_count(what: &'static str, n: usize) -> Result<(), GpuError> {
+    if n <= SERVED_TIERS {
+        return Ok(());
+    }
+    Err(GpuError::shape(
+        what,
+        format!(
+            "{n} expert tier cards: the host tier serves one tier card; N >= 2 lands with V4.1's \
+             `_tiers` handoff"
+        ),
+    ))
+}
+
+/// The tiers whose bits `mask` sets, in tier order, into `out`; their count.
+fn tiers_of(mask: u32, out: &mut [usize; MAX_TIERS]) -> usize {
+    let mut k = 0;
+    for t in (0..MAX_TIERS).filter(|t| mask >> t & 1 == 1) {
+        out[k] = t;
+        k += 1;
+    }
+    k
+}
+
+const _: () = assert!(MAX_TIERS <= u32::BITS as usize);
 
 /// Refuse, as `what`, a placement `machine` with an expert tier card, for a
 /// load path that hangs no tier under its host tier: before any upload,
@@ -638,11 +673,17 @@ pub struct HostTier<H> {
     /// caller made them ([`HostTier::prepare_batch`]).
     batch: BatchService,
     port: Option<BatchPort>,
-    /// The expert tier's card, once attached ([`HostTier::attach_tier`]).
-    tier: Option<TierCard>,
-    /// Tier layers the host has served since load (wrapping): a tier whose
-    /// progress is behind it holds the stage card at a wait.
-    tier_goes: u32,
+    /// The expert tier cards in tier order, once attached
+    /// ([`HostTier::attach_tiers`]): tier `t` serves the slot map's tier `t`.
+    tiers: Vec<TierCard>,
+    /// The tiers' page, which their graphs and windows address: after
+    /// `tiers`, so it is freed after them.
+    tier_page: Option<TierPage>,
+    /// Per tier, the tier layers the host has served since load (wrapping):
+    /// a tier whose progress is behind it holds the stage card at a wait.
+    tier_goes: Vec<u32>,
+    /// Per tier, a replay's tier layers in go order: the service's scratch.
+    tier_lists: Vec<Vec<(usize, usize)>>,
     /// The residency machine over the stage card's slots, once started
     /// ([`HostTier::start_swap`]), and the rows the open pass keeps.
     swap: Option<swap::SwapMachine>,
@@ -703,8 +744,10 @@ impl<H: HostExperts> HostTier<H> {
             step: StepPort::new(boundary, layers),
             batch: BatchService::default(),
             port: None,
-            tier: None,
-            tier_goes: 0,
+            tiers: Vec::new(),
+            tier_page: None,
+            tier_goes: Vec::new(),
+            tier_lists: Vec::new(),
             swap: None,
             swap_kept: None,
             swap_view: None,
@@ -969,38 +1012,73 @@ impl<H: HostExperts> HostTier<H> {
         Ok(Some(r))
     }
 
-    /// Hang `tier` under the host tier, on `stage`, the card the chain
-    /// launches on: the tier's set must be the slot map's tier rows
-    /// ([`tier::TierSet::of_map`]), else it is refused by name. Load-time
-    /// only.
-    pub fn attach_tier(&mut self, mut tier: TierCard, stage: &crate::Gpu) -> Result<(), GpuError> {
-        const WHAT: &str = "HostTier::attach_tier";
-        let set = tier.set();
-        if set.layers() != self.slots.layers() || set.n_expert() != self.slots.n_expert() {
+    /// Hang `tiers` under the host tier, tier `t` its `t`-th card, on
+    /// `stage`, the card the chain launches on: the tiers' page made in
+    /// `stage`'s context, each card bound to it. The slot map must name
+    /// exactly these tiers, and each tier's set must be the map's rows of
+    /// that tier ([`tier::TierSet::of_map`]); more tiers than one host tier
+    /// serves ([`refuse_tier_count`]), no tier, a second attach, and cards
+    /// cut for different pages are refused by name. Load-time only.
+    pub fn attach_tiers(
+        &mut self,
+        mut tiers: Vec<TierCard>,
+        stage: &crate::Gpu,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "HostTier::attach_tiers";
+        refuse_tier_count(WHAT, tiers.len())?;
+        if tiers.is_empty() || !self.tiers.is_empty() {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "the tier's set covers layers {:?} of {} experts, the slot map {:?} of {}",
-                    set.layers(),
-                    set.n_expert(),
-                    self.slots.layers(),
-                    self.slots.n_expert()
+                    "{} tier cards onto a host tier that holds {}: one attach of at least one",
+                    tiers.len(),
+                    self.tiers.len()
                 ),
             ));
         }
-        // An expert on two devices is the slot map's refusal (`SlotMap::from_rows`).
-        if *set != tier::TierSet::of_map(&self.slots)? {
+        if self.slots.tiers() != tiers.len() {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "the tier {} holds another set than the slot map's tier rows",
-                    tier.name()
+                    "the slot map names {} tiers and the load hangs {} tier cards",
+                    self.slots.tiers(),
+                    tiers.len()
                 ),
             ));
         }
-        tier.bind_stage(stage)?;
-        self.tier_goes = tier.progress();
-        self.tier = Some(tier);
+        for (t, tier) in tiers.iter().enumerate() {
+            let set = tier.set();
+            if set.layers() != self.slots.layers() || set.n_expert() != self.slots.n_expert() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "the tier's set covers layers {:?} of {} experts, the slot map {:?} of {}",
+                        set.layers(),
+                        set.n_expert(),
+                        self.slots.layers(),
+                        self.slots.n_expert()
+                    ),
+                ));
+            }
+            // An expert on two devices is the slot map's refusal (`SlotMap::from_rows`).
+            if *set != tier::TierSet::of_map(&self.slots, t)? {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "the tier {} holds another set than the slot map's rows of tier {t}",
+                        tier.name()
+                    ),
+                ));
+            }
+        }
+        let page = TierPage::new(stage, tiers[0].page_layout(tiers.len())?)?;
+        for (t, tier) in tiers.iter_mut().enumerate() {
+            tier.bind(&page, t, stage)?;
+        }
+        self.tier_goes = tiers.iter().map(|t| t.progress(&page)).collect();
+        self.tier_lists = tiers.iter().map(|_| Vec::new()).collect();
+        self.tiers = tiers;
+        self.tier_page = Some(page);
         Ok(())
     }
 
@@ -1055,72 +1133,123 @@ impl<H: HostExperts> HostTier<H> {
         Ok(())
     }
 
-    /// The expert tier's card, when one is attached.
+    /// The expert tier cards, in tier order; empty without a tier.
     #[must_use]
-    pub fn tier(&self) -> Option<&TierCard> {
-        self.tier.as_ref()
+    pub fn tiers(&self) -> &[TierCard] {
+        &self.tiers
     }
 
-    /// The expert tier's card, for a gate that drives its stream.
-    pub fn tier_mut(&mut self) -> Option<&mut TierCard> {
-        self.tier.as_mut()
+    /// The expert tier cards, for a gate that drives their streams.
+    pub fn tiers_mut(&mut self) -> &mut [TierCard] {
+        &mut self.tiers
     }
 
-    /// The experts of layer `layer` the tier card holds, as the slot map
-    /// says; a layer the map has no row for is refused by name.
+    /// What each tier has done since load, in tier order.
+    #[must_use]
+    pub fn tier_stats(&self) -> Vec<tier::TierStats> {
+        self.tiers.iter().map(TierCard::stats).collect()
+    }
+
+    /// The experts of layer `layer` the tier cards hold, summed over the
+    /// tiers, as the slot map says; a layer the map has no row for is
+    /// refused by name.
     pub fn on_tier(&self, layer: usize) -> Result<usize, GpuError> {
         self.slots.on_tier(layer)
     }
 
-    /// Row `row`'s handoff target and its tier image, for a tier layer's
-    /// handoff launch; refused without a tier.
+    /// The experts of layer `layer` tier `tier` holds, as the slot map
+    /// says; a layer the map has no row for, and a tier it does not name, are
+    /// refused by name.
+    pub fn on_tier_of(&self, tier: usize, layer: usize) -> Result<usize, GpuError> {
+        self.slots.on_tier_of(tier, layer)
+    }
+
+    /// Row `row`'s handoff target and its tier image as tier `tier` reads
+    /// it, for a tier layer's handoff launch; refused without a tier.
     pub fn tier_handoff(
         &mut self,
         row: usize,
+        tier: usize,
     ) -> Result<(HandoffTarget<'_>, TierTarget<'_>), GpuError> {
-        let tier = self.tier.as_mut().ok_or(GpuError::state(
+        let page = self.tier_page.as_mut().ok_or(GpuError::state(
             "HostTier::tier_handoff",
-            "an expert tier (HostTier::attach_tier)",
+            "an expert tier (HostTier::attach_tiers)",
         ))?;
         let target = self.step.boundary.handoff_target_of(row)?;
-        Ok((target, tier.target_of(row)?))
+        Ok((target, page.target_of(row, tier)?))
     }
 
-    /// Row `row`'s routed rows the tier writes, for a tier layer's join;
+    /// Row `row`'s routed rows the tiers write, for a tier layer's join;
     /// refused without a tier.
     pub fn tier_rows(&self, row: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
-        self.tier_ref("HostTier::tier_rows")?.rows_of(row)
+        self.page_ref("HostTier::tier_rows")?.rows_of(row)
     }
 
     /// Enqueue a tier layer's go of layer `layer`, row `row`, on the stage
-    /// card's `stream` ([`TierCard`]'s go batch); refused without a tier.
+    /// card's `stream`: one go batch with a go for each tier that holds
+    /// experts of the layer ([`TierPage::enqueue_go_of`]); refused without a
+    /// tier, and for a layer no tier holds an expert of.
     pub fn enqueue_tier_go(
         &self,
         stream: &CudaStream,
         layer: usize,
         row: usize,
     ) -> Result<(), GpuError> {
-        self.tier_ref("HostTier::enqueue_tier_go")?.enqueue_go_of(
-            stream,
-            &self.step.boundary,
-            layer,
-            row,
-        )
+        const WHAT: &str = "HostTier::enqueue_tier_go";
+        let mut tiers = [0; MAX_TIERS];
+        let k = tiers_of(self.tier_mask(layer)?, &mut tiers);
+        self.page_ref(WHAT)?
+            .enqueue_go_of(stream, &self.step.boundary, layer, row, &tiers[..k])
     }
 
-    /// Enqueue a tier layer's wait of row `row` on the stage card's
-    /// `stream`, for the host's counter and the tier's; refused without a
-    /// tier.
-    pub fn enqueue_tier_back(&self, stream: &CudaStream, row: usize) -> Result<(), GpuError> {
-        self.tier_ref("HostTier::enqueue_tier_back")?
-            .enqueue_back_of(stream, &self.step.boundary, row)
+    /// Enqueue a tier layer's wait of layer `layer`, row `row`, on the stage
+    /// card's `stream`, for the host's counter and the counter of each tier
+    /// that holds experts of the layer — the settle rule of
+    /// [`TierPage::enqueue_back_of`]; refused without a tier, and for a layer
+    /// no tier holds an expert of.
+    pub fn enqueue_tier_back(
+        &self,
+        stream: &CudaStream,
+        layer: usize,
+        row: usize,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "HostTier::enqueue_tier_back";
+        let mut tiers = [0; MAX_TIERS];
+        let k = tiers_of(self.tier_mask(layer)?, &mut tiers);
+        self.page_ref(WHAT)?
+            .enqueue_back_of(stream, &self.step.boundary, layer, row, &tiers[..k])
     }
 
-    fn tier_ref(&self, what: &'static str) -> Result<&TierCard, GpuError> {
-        self.tier.as_ref().ok_or(GpuError::state(
+    fn page_ref(&self, what: &'static str) -> Result<&TierPage, GpuError> {
+        self.tier_page.as_ref().ok_or(GpuError::state(
             what,
-            "an expert tier (HostTier::attach_tier)",
+            "an expert tier (HostTier::attach_tiers)",
         ))
+    }
+
+    /// The tiers that hold experts of layer `layer`, one bit a tier; 0
+    /// without a tier. A layer the slot map has no row for is refused by
+    /// name.
+    fn tier_mask(&self, layer: usize) -> Result<u32, GpuError> {
+        let mut mask = 0;
+        for t in 0..self.tiers.len() {
+            if self.slots.on_tier_of(t, layer)? > 0 {
+                mask |= 1 << t;
+            }
+        }
+        Ok(mask)
+    }
+
+    /// The tier cards' names, in tier order, for a refusal or a loss.
+    fn tier_names(&self, mask: u32) -> String {
+        let names: Vec<&str> = self
+            .tiers
+            .iter()
+            .enumerate()
+            .filter(|(t, _)| mask >> t & 1 == 1)
+            .map(|(_, t)| t.name())
+            .collect();
+        names.join(", ")
     }
 
     /// The refusal of the direct batch service on a host tier with an
@@ -1128,24 +1257,24 @@ impl<H: HostExperts> HostTier<H> {
     /// experts uncomputed. Prompt batches go through the port
     /// ([`HostTier::serve_key`]).
     fn refuse_tier_batch(&self, what: &'static str) -> Result<(), GpuError> {
-        match &self.tier {
-            Some(t) => Err(GpuError::protocol(
-                what,
-                format!(
-                    "the direct batch service has no tier path (it would leave the experts on {} \
-                     uncomputed): a model with an expert tier serves prompt batches through the \
-                     port (HostTier::serve_key)",
-                    t.name()
-                ),
-            )),
-            None => Ok(()),
+        if self.tiers.is_empty() {
+            return Ok(());
         }
+        Err(GpuError::protocol(
+            what,
+            format!(
+                "the direct batch service has no tier path (it would leave the experts on {} \
+                 uncomputed): a model with an expert tier serves prompt batches through the port \
+                 (HostTier::serve_key)",
+                self.tier_names(u32::MAX)
+            ),
+        ))
     }
 
     /// The refusal of an untiered route of a layer whose expert tier holds
     /// experts: without its tier places the tier would not serve the block.
     fn refuse_untiered_route(&self, what: &'static str, layer: usize) -> Result<(), GpuError> {
-        if self.tier.is_some() && self.slots.on_tier(layer)? > 0 {
+        if !self.tiers.is_empty() && self.slots.on_tier(layer)? > 0 {
             return Err(GpuError::shape(
                 what,
                 format!(
@@ -1371,25 +1500,27 @@ impl<H: HostExperts> HostTier<H> {
                 return Ok(());
             }
             let w = self.words();
-            if let Some(t) = self.tier.as_mut() {
-                drain_within(
-                    t.gpu().stream(),
-                    DRAIN_DEADLINE,
-                    "Hybrid::reset: the expert tier's stream",
-                )?;
-                if !t.at_rest() {
-                    return Err(GpuError::protocol(
-                        WHAT,
-                        format!(
-                            "the stream has drained and the expert tier is not at rest (progress \
-                             {} of {} asked): a go the tier never took, or a signal no wait took \
-                             back",
-                            t.progress(),
-                            t.issued()
-                        ),
-                    ));
+            if let Some(page) = self.tier_page.as_ref() {
+                for t in &mut self.tiers {
+                    drain_within(
+                        t.gpu().stream(),
+                        DRAIN_DEADLINE,
+                        "Hybrid::reset: the expert tier's stream",
+                    )?;
+                    if !t.at_rest(page) {
+                        return Err(GpuError::protocol(
+                            WHAT,
+                            format!(
+                                "the stream has drained and the expert tier is not at rest \
+                                 (progress {} of {} asked): a go the tier never took, or a signal \
+                                 no wait took back",
+                                t.progress(page),
+                                t.issued()
+                            ),
+                        ));
+                    }
+                    t.clear_fault(page)?;
                 }
-                t.clear_fault()?;
             }
             if !w.at_rest() {
                 return Err(GpuError::protocol(
@@ -1435,9 +1566,11 @@ impl<H: HostExperts> HostTier<H> {
             word(&boundary.page, Word::Cnt(row)).store(0, Ordering::Release);
         }
         self.step.rest_at(generation);
-        if let Some(t) = self.tier.as_mut() {
-            t.reset()?;
-            self.tier_goes = t.progress();
+        if let Some(page) = self.tier_page.as_ref() {
+            for (t, goes) in self.tiers.iter_mut().zip(&mut self.tier_goes) {
+                t.reset(page)?;
+                *goes = t.progress(page);
+            }
         }
         if let Some(t) = self.step.trace.as_mut() {
             t.abandon_position();
@@ -1563,10 +1696,11 @@ impl<H: HostExperts> HostTier<H> {
     /// A chain being captured records a new go order: the tier's graph of
     /// that chain is captured again at its next replay.
     fn note_capture(&mut self) {
-        if self.step.is_capturing()
-            && let Some(t) = self.tier.as_mut()
-        {
-            t.forget_order(self.step.chain());
+        if self.step.is_capturing() {
+            let chain = self.step.chain();
+            for t in &mut self.tiers {
+                t.forget_order(chain);
+            }
         }
     }
 
@@ -1601,13 +1735,13 @@ impl<H: HostExperts> HostTier<H> {
         }
         let chain = self.step.chain();
         self.health.refuse_if_poisoned(SERVE)?;
-        let tiered = self.tiered_in_service(layer)?;
-        if tiered {
-            self.feed_tier(layer, row)?;
+        let mask = self.tier_mask_in_service(layer)?;
+        if mask != 0 {
+            self.feed_tiers(layer, row, mask)?;
         }
         self.serve(layer, row, false, chain)?;
-        if tiered {
-            self.settle_tier(layer)
+        if mask != 0 {
+            self.settle_tiers(layer, mask)
         } else {
             Ok(())
         }
@@ -1621,148 +1755,205 @@ impl<H: HostExperts> HostTier<H> {
 
     /// [`HostTier::serve_captured`] for a replay of `chain`'s capture.
     ///
-    /// With an expert tier the tier's graph of `chain` is launched first when
-    /// one is held for the chain's go order; with none, the host enqueues
-    /// each tier layer on the tier's stream as it serves it, and captures the
-    /// graph once the pass has settled ([`tier::Pass`]). Once the last layer
-    /// is served the host waits for the tier to catch up and reads its fault
-    /// copy ([`HostTier::settle_tier`]).
+    /// With expert tiers each tier's graph of `chain` is launched first when
+    /// one is held for that tier's layers of the chain's go order; for a tier
+    /// with none, the host enqueues each of its layers on its stream as it
+    /// serves it, and captures its graph once the pass has settled
+    /// ([`tier::Pass`]). Once the last layer is served the host waits for
+    /// every tier with a layer in the pass to catch up and reads their fault
+    /// copies ([`HostTier::settle_tiers`]).
     pub fn serve_captured_of(&mut self, chain: Chain) -> Result<(), GpuError> {
-        let mut list = Vec::new();
-        let mut pass = Pass::Graph;
-        if self.tier.is_some() {
+        let k = self.tiers.len();
+        let mut pass = [Pass::Graph; MAX_TIERS];
+        let (mut listed, mut last) = (0u32, None);
+        if k > 0 {
             self.health.refuse_if_poisoned(SERVE)?;
+            for list in &mut self.tier_lists {
+                list.clear();
+            }
             let mut i = 0;
             while let Some((l, r)) = self.step.captured(chain, i) {
-                if self.tiered_in_service(l)? {
-                    list.push((l, r));
+                let mask = self.tier_mask_in_service(l)?;
+                for t in (0..k).filter(|t| mask >> t & 1 == 1) {
+                    self.tier_lists[t].push((l, r));
                 }
+                if mask != 0 {
+                    last = Some(l);
+                }
+                listed |= mask;
                 i += 1;
             }
-            let r = self
-                .tier
-                .as_mut()
-                .map_or(Ok(Pass::Graph), |t| t.replay(chain, &list));
-            pass = match r {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(self.fail_released(SERVE, list.first().map_or(0, |p| p.0), e));
+            for t in 0..k {
+                match self.tiers[t].replay(chain, &self.tier_lists[t]) {
+                    Ok(p) => pass[t] = p,
+                    Err(e) => {
+                        let at = self.tier_lists[t].first().map_or(0, |p| p.0);
+                        return Err(self.fail_released(SERVE, at, e));
+                    }
                 }
-            };
+            }
         }
+        let fed = (0..k)
+            .filter(|&t| pass[t] == Pass::Feed)
+            .fold(0u32, |m, t| m | 1 << t);
         let mut i = 0;
         while let Some((layer, row)) = self.step.captured(chain, i) {
-            if pass == Pass::Feed && self.tiered_in_service(layer)? {
-                self.feed_tier(layer, row)?;
+            if fed != 0 {
+                let mask = self.tier_mask_in_service(layer)? & fed;
+                if mask != 0 {
+                    self.feed_tiers(layer, row, mask)?;
+                }
             }
             self.serve(layer, row, i == 0, chain)?;
             i += 1;
         }
-        let Some(&(last, _)) = list.last() else {
+        let Some(last) = last else {
             return Ok(());
         };
-        self.settle_tier(last)?;
-        if pass == Pass::Feed {
-            let r = self
-                .tier
-                .as_mut()
-                .map_or(Ok(()), |t| t.capture(chain, &list));
-            if let Err(e) = r {
+        self.settle_tiers(last, listed)?;
+        for t in (0..k).filter(|t| fed >> t & 1 == 1) {
+            let page = self
+                .tier_page
+                .as_ref()
+                .expect("a host tier with tiers holds their page");
+            if let Err(e) = self.tiers[t].capture(page, chain, &self.tier_lists[t]) {
                 return Err(self.fail_released(SERVE, last, e));
             }
         }
         Ok(())
     }
 
-    /// Enqueue tier layer `layer` of row `row` on the tier's stream now, for
-    /// an eager chain or a fed pass; a failure poisons the tier and releases
-    /// both cards' waits.
-    fn feed_tier(&mut self, layer: usize, row: usize) -> Result<(), GpuError> {
-        let r = self
-            .tier
-            .as_mut()
-            .map_or(Ok(()), |t| t.enqueue_eager(layer, row));
+    /// Enqueue tier layer `layer` of row `row` on the streams of the tiers
+    /// whose bits `mask` sets now, for an eager chain or a fed pass; a
+    /// failure poisons the tier and releases every card's waits.
+    fn feed_tiers(&mut self, layer: usize, row: usize, mask: u32) -> Result<(), GpuError> {
+        let r = match self.tier_page.as_ref() {
+            Some(page) => self
+                .tiers
+                .iter_mut()
+                .enumerate()
+                .filter(|(t, _)| mask >> t & 1 == 1)
+                .try_for_each(|(_, t)| t.enqueue_eager(page, layer, row)),
+            None => Ok(()),
+        };
         if let Err(e) = r {
             return Err(self.fail_released(SERVE, layer, e));
         }
         Ok(())
     }
 
-    /// Whether layer `layer` is a tier layer (false without a tier), asked
-    /// while a step's service is under way: the stage card may wait at that
-    /// layer already, so a layer the slot map has no row for fails the
-    /// service — the tier poisoned, both cards' waits released — instead of
-    /// returning with the card left waiting.
-    fn tiered_in_service(&mut self, layer: usize) -> Result<bool, GpuError> {
-        if self.tier.is_none() {
-            return Ok(false);
+    /// The tiers that hold experts of layer `layer`, one bit a tier (0
+    /// without a tier), asked while a step's service is under way: the stage
+    /// card may wait at that layer already, so a layer the slot map has no
+    /// row for fails the service — the tier poisoned, every card's waits
+    /// released — instead of returning with the card left waiting.
+    fn tier_mask_in_service(&mut self, layer: usize) -> Result<u32, GpuError> {
+        if self.tiers.is_empty() {
+            return Ok(0);
         }
-        match self.slots.on_tier(layer) {
-            Ok(n) => Ok(n > 0),
+        match self.tier_mask(layer) {
+            Ok(mask) => Ok(mask),
             Err(e) => Err(self.fail_released(SERVE, layer, e)),
         }
     }
 
     /// A service `what` of layer `layer` failed with `e` after either card
-    /// may have been given work: poison the tier, release both cards' waits,
-    /// and return `e`.
+    /// may have been given work: poison the tier, release every card's
+    /// waits, and return `e`.
     fn fail_released(&mut self, what: &'static str, layer: usize, e: GpuError) -> GpuError {
         self.health.set_poison(what, layer, Some(&e), None);
         self.release_all();
         e
     }
 
-    /// Wait under the go deadline for the expert tier to serve every layer
-    /// asked of it — `layer` the last the host served — then read its fault
-    /// copy: a raised copy is the step's fault, merged with the stage card's
-    /// word once that card's stream has drained (the first layer wins). A
-    /// tier that does not catch up in time is a lost card: the tier is
-    /// poisoned, both cards' waits released, and the error names the card.
-    fn settle_tier(&mut self, layer: usize) -> Result<(), GpuError> {
-        let Some(t) = self.tier.as_mut() else {
+    /// Wait under one go deadline for each tier whose bit `mask` sets to
+    /// serve every layer asked of it — `layer` the last the host served —
+    /// then read their fault copies: a raised copy is the step's fault,
+    /// merged with the stage card's word once that card's stream has drained
+    /// (the first layer wins). A tier that does not catch up in time is a
+    /// lost card: the tier is poisoned, every card's waits released, and the
+    /// error names each tier still behind.
+    fn settle_tiers(&mut self, layer: usize, mask: u32) -> Result<(), GpuError> {
+        let Some(page) = self.tier_page.as_ref() else {
             return Ok(());
         };
         let t0 = Instant::now();
-        if !t.wait_caught_up(t0 + GO_DEADLINE) {
-            return Err(self.lose_tier(SERVE, layer, t0.elapsed()));
+        for (t, card) in self.tiers.iter_mut().enumerate() {
+            if mask >> t & 1 == 1 && !card.wait_caught_up(page, t0 + GO_DEADLINE) {
+                let behind = self.behind_mask(mask) | 1 << t;
+                return Err(self.lose_tiers(SERVE, layer, behind, t0.elapsed()));
+            }
         }
-        match t.merged_fault()? {
+        match tier::merged_fault(page, &self.tiers, mask)? {
             Some(f) => Err(GpuError::fault(SERVE, f)),
             None => Ok(()),
         }
     }
 
-    /// The expert tier is lost to service `what` at layer `layer`, after the
-    /// host `waited` for it: poison the tier as a lost card, release both
-    /// cards' waits, and name the card.
-    fn lose_tier(&mut self, what: &'static str, layer: usize, waited: Duration) -> GpuError {
-        self.lose_tier_as(what, layer, |t| t.lost_detail(waited))
+    /// The tiers of `mask` that have served fewer layers than the host
+    /// asked of them, one bit a tier.
+    fn behind_mask(&self, mask: u32) -> u32 {
+        let Some(page) = self.tier_page.as_ref() else {
+            return 0;
+        };
+        self.tiers
+            .iter()
+            .enumerate()
+            .filter(|(t, c)| mask >> t & 1 == 1 && c.behind(page))
+            .fold(0, |m, (t, _)| m | 1 << t)
     }
 
-    /// [`HostTier::lose_tier`], the loss named by `detail` of the tier. With
-    /// no tier attached there is none to lose: the service fails by name
-    /// instead, the tier poisoned and both cards' waits released.
-    fn lose_tier_as(
+    /// The expert tiers whose bits `behind` sets are lost to service `what`
+    /// at layer `layer`, after the host `waited` for them: poison the tier as
+    /// a lost card, release every card's waits, and name each card.
+    fn lose_tiers(
         &mut self,
         what: &'static str,
         layer: usize,
-        detail: impl FnOnce(&TierCard) -> String,
+        behind: u32,
+        waited: Duration,
     ) -> GpuError {
-        let Some(t) = self.tier.as_ref() else {
-            let e = GpuError::state(what, "an expert tier to lose (HostTier::attach_tier)");
-            return self.fail_released(what, layer, e);
+        self.lose_tiers_as(what, layer, behind, |t, page| t.lost_detail(page, waited))
+    }
+
+    /// [`HostTier::lose_tiers`], each loss named by `detail` of its tier over
+    /// the tiers' page, in tier order. With no tier of `behind` attached there
+    /// is none to lose: the service fails by name instead, the tier poisoned
+    /// and every card's waits released.
+    fn lose_tiers_as(
+        &mut self,
+        what: &'static str,
+        layer: usize,
+        behind: u32,
+        detail: impl Fn(&TierCard, &TierPage) -> String,
+    ) -> GpuError {
+        let details: Vec<String> = match self.tier_page.as_ref() {
+            Some(page) => self
+                .tiers
+                .iter()
+                .enumerate()
+                .filter(|(t, _)| behind >> t & 1 == 1)
+                .map(|(_, t)| detail(t, page))
+                .collect(),
+            None => Vec::new(),
         };
-        let (name, detail) = (t.name().to_string(), detail(t));
+        if details.is_empty() {
+            let e = GpuError::state(what, "an expert tier to lose (HostTier::attach_tiers)");
+            return self.fail_released(what, layer, e);
+        }
+        let (name, detail) = (self.tier_names(behind), details.join("; "));
         self.health.set_lost(what, &name, layer, &detail);
         self.release_all();
         GpuError::protocol(what, format!("layer {layer}: {detail}"))
     }
 
-    /// Release every wait still pending on both cards.
+    /// Release every wait still pending on every card.
     fn release_all(&self) {
         self.step.boundary.release();
-        if let Some(t) = self.tier.as_ref() {
-            t.release();
+        if let Some(page) = self.tier_page.as_ref() {
+            for t in &self.tiers {
+                t.release(page);
+            }
         }
     }
 
@@ -1836,27 +2027,30 @@ impl<H: HostExperts> HostTier<H> {
         }));
         match r {
             Ok(Ok(())) => {
-                if self.tiered_in_service(layer)? {
-                    self.tier_goes = self.tier_goes.wrapping_add(1);
-                    let hits = self.step.tier_slots;
-                    if let Some(t) = self.tier.as_mut() {
-                        t.hit(layer, hits);
+                let mask = self.tier_mask_in_service(layer)?;
+                for (t, card) in self.tiers.iter_mut().enumerate() {
+                    if mask >> t & 1 == 1 {
+                        self.tier_goes[t] = self.tier_goes[t].wrapping_add(1);
+                        card.hit(layer, self.step.tier_slots[t]);
                     }
                 }
                 Ok(())
             }
             Ok(Err(e)) => {
                 // The stage card waits at a tier layer the host has served
-                // while the tier has not: past the grace, the tier is the
-                // one behind.
-                let want = self.tier_goes;
+                // while a tier has not: past the grace, that tier is the one
+                // behind.
                 let t0 = Instant::now();
-                if self
-                    .tier
-                    .as_ref()
-                    .is_some_and(|t| !t.wait_for(want, t0 + tier::TIER_GRACE))
-                {
-                    return Err(self.lose_tier(SERVE, layer, t0.elapsed()));
+                let mut behind = 0u32;
+                if let Some(page) = self.tier_page.as_ref() {
+                    for (t, card) in self.tiers.iter().enumerate() {
+                        if !card.wait_for(page, self.tier_goes[t], t0 + tier::TIER_GRACE) {
+                            behind |= 1 << t;
+                        }
+                    }
+                }
+                if behind != 0 {
+                    return Err(self.lose_tiers(SERVE, layer, behind, t0.elapsed()));
                 }
                 Err(self.fail_released(SERVE, layer, e))
             }
@@ -1927,7 +2121,22 @@ pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PassKind, pass_kept};
+    use super::{PassKind, SERVED_TIERS, pass_kept, refuse_tier_count};
+
+    /// A load of one tier card, or none, passes; a second tier card is
+    /// refused by name before anything uploads.
+    #[test]
+    fn a_second_tier_card_is_refused_by_name() {
+        assert_eq!(SERVED_TIERS, 1);
+        assert!(refuse_tier_count("t", 0).is_ok());
+        assert!(refuse_tier_count("t", 1).is_ok());
+        let err = refuse_tier_count("t", 2).expect_err("two tier cards");
+        assert!(
+            err.to_string()
+                .contains("the host tier serves one tier card; N >= 2 lands"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn a_boundary_takes_kept_rows_only_for_an_open_pass() {

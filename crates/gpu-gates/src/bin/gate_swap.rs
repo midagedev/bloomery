@@ -188,7 +188,7 @@ mod gate {
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::slots::{HOST, Slot, SlotMap, TIER};
+    use bloomery_gpu::host::slots::{HOST, Slot, SlotMap};
     use bloomery_gpu::host::swap::{
         CallCfg, CallPick, CallReport, Leak, LeakReason, MachineCfg, PassReport, Piece, SlotState,
         SwapMachine, SwapSource, Transform, set_leak_sink,
@@ -719,7 +719,11 @@ mod gate {
                 .iter()
                 .enumerate()
             {
-                rows[i * E + e as usize] = TIER | s as u32;
+                rows[i * E + e as usize] = Slot::Tier {
+                    tier: 0,
+                    slot: s as u32,
+                }
+                .entry()?;
             }
         }
         Ok(SlotMap::from_rows(LAYERS, E, rows)?)
@@ -915,7 +919,7 @@ mod gate {
                     let on_card = out[i * PARTS * NIDS + j] != OUT_HOST;
                     let entry = slots.slot(l, id);
                     let on_host = entry == Some(Slot::Host);
-                    let on_tier = matches!(entry, Some(Slot::Tier(_)));
+                    let on_tier = matches!(entry, Some(Slot::Tier { .. }));
                     mix(id);
                     match u32::from(on_card) + u32::from(on_host) + u32::from(on_tier) {
                         0 => miss += 1,
@@ -1997,10 +2001,13 @@ mod gate {
             .filter(|(_, f)| tiers[f.layer].contains(&f.admit) || tiers[f.layer].contains(&f.evict))
             .count();
         let kept = LAYERS.enumerate().all(|(i, l)| {
-            tiers[i]
-                .iter()
-                .enumerate()
-                .all(|(s, &e)| t.slots.slot(l, e) == Some(Slot::Tier(s as u32)))
+            tiers[i].iter().enumerate().all(|(s, &e)| {
+                t.slots.slot(l, e)
+                    == Some(Slot::Tier {
+                        tier: 0,
+                        slot: s as u32,
+                    })
+            })
         });
         let bait = a
             .flips

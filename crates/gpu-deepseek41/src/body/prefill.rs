@@ -125,7 +125,7 @@ use bloomery_gpu::weights::DevWeight;
 use super::ced::{Ced, Mode};
 use super::*;
 use crate::chain::attn::{AttnBatch, BatchIo, ChunkCaches, ChunkSource};
-use crate::chain::ffn::{BatchLayer, BlockIo, FfnBatch, JoinIo};
+use crate::chain::ffn::{BatchLayer, BlockIo, FfnBatch, JoinIo, STAGE_TIER};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
@@ -1337,16 +1337,22 @@ impl Body {
         })
     }
 
-    /// Per layer index of the body, the experts the host tier's expert tier
-    /// holds of the layer, as the slot map says now; all 0 without a tier.
-    /// With a tier, a layer the slot map has no row for is refused by name.
-    /// Read once per group.
+    /// Per layer index of the body, the experts the stage card's tier
+    /// ([`STAGE_TIER`]) holds of the layer, as the slot map says now; all 0
+    /// without a tier. With a tier, a layer the slot map has no row for is
+    /// refused by name. Read once per group.
     fn tier_counts(&self) -> Result<Vec<usize>, GpuError> {
         let map = self.slot_map();
-        let tier = self.hybrid.tier().is_some();
+        let tier = !self.hybrid.tiers().is_empty();
         self.layers
             .clone()
-            .map(|l| if tier { map.on_tier(l) } else { Ok(0) })
+            .map(|l| {
+                if tier {
+                    map.on_tier_of(STAGE_TIER, l)
+                } else {
+                    Ok(0)
+                }
+            })
             .collect()
     }
 
@@ -2447,7 +2453,7 @@ impl<'a> GroupCx<'a> {
         if r.block.is_some() {
             let key = m.key(l, r.at);
             if tiered {
-                let rows = self.hybrid.tier_rows_of(key)?;
+                let rows = self.hybrid.tier_rows_of(key, STAGE_TIER)?;
                 self.ffn.enqueue_batch_acc_tier(
                     gpu,
                     &mut batch.ffn,

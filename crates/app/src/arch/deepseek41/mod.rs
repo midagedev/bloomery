@@ -74,8 +74,8 @@ impl Open for Body {
             .map_err(|e| GpuError::plan(WHAT, e))
     }
 
-    /// The stage card, card 0, and the plan's expert tier card when it
-    /// names one ([`tier_of`]).
+    /// The stage card, card 0, and the plan's expert tier cards
+    /// ([`tier_of`]).
     fn open(
         file: Split,
         inputs: &PlanInputs,
@@ -86,7 +86,7 @@ impl Open for Body {
             hp: inputs.hp.clone(),
             levers: cfg.open.body,
         };
-        Body::open_placed_tiered(file, plan, 0, tier_of(plan.machine)?, &meta)
+        Body::open_placed_tiered(file, plan, 0, tier_of(plan.machine), &meta)
     }
 
     /// The batch's buffers under the batched schedule (with the card-timing
@@ -104,25 +104,21 @@ impl Open for Body {
     }
 }
 
-/// The expert tier card `machine` names, as the body opens it: its index in
-/// [`Machine::all_cards`] (after the one stage card) and its name, by which
-/// the card is found. `None` without a tier; more than one is refused by
-/// name, since the host tier holds one.
-pub fn tier_of(machine: &Machine) -> Result<Option<TierOpen>, GpuError> {
-    match machine.tiers.as_slice() {
-        [] => Ok(None),
-        [t] => Ok(Some(TierOpen {
-            card: machine.cards.len(),
+/// The expert tier cards `machine` names, as the body opens them, in tier
+/// order: each card's index in [`Machine::all_cards`] (after the one stage
+/// card) and its name, by which the card is found. Empty without a tier; the
+/// body refuses more than the host tier serves by name, before any upload.
+#[must_use]
+pub fn tier_of(machine: &Machine) -> Vec<TierOpen> {
+    machine
+        .tiers
+        .iter()
+        .enumerate()
+        .map(|(i, t)| TierOpen {
+            card: machine.cards.len() + i,
             name: t.name.clone(),
-        })),
-        more => Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!(
-                "the placement names {} expert tier cards; the host tier holds one",
-                more.len()
-            ),
-        }),
-    }
+        })
+        .collect()
 }
 
 impl Prompt for Body {

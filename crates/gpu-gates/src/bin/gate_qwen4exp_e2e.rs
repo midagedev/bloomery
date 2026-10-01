@@ -217,7 +217,7 @@ mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::host::batch::HOT_COLS;
     use bloomery_gpu::host::handoff::{HandoffKernels, Places};
-    use bloomery_gpu::hybrid::{HOST, SlotMap, TIER};
+    use bloomery_gpu::hybrid::{HOST, Slot, SlotMap};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::flip::{self, Flip};
@@ -2638,7 +2638,7 @@ mod gate {
             entries[7 * N_EXPERT + 3] = entry;
             Ok(SlotMap::from_rows(0..N_LAYER, N_EXPERT, entries)?)
         };
-        let tier = planted(TIER)?;
+        let tier = planted(Slot::Tier { tier: 0, slot: 0 }.entry()?)?;
         let cases = [
             (Walk::Step, &tier, "tier card", "tier leg"),
             (Walk::Pass, &tier, "tier card", "tier leg"),

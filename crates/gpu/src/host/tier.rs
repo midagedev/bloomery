@@ -1,5 +1,5 @@
-//! The expert tier: a second card hung under the host tier ([`TierCard`]).
-//! The stage card keeps its plan byte for byte; per hybrid layer the tier
+//! The expert tiers: further cards hung under the host tier ([`TierCard`]).
+//! The stage card keeps its plan byte for byte; per hybrid layer each tier
 //! card computes the routed experts its [`TierSet`] names, in the host leg's
 //! shadow, and the stage card's join reads their rows through the mapping.
 //!
@@ -10,32 +10,35 @@
 //! tier:  wait tier go, −1 → copy x, places in → [gate·up → h q8_1 → down → rows] → barrier → cnt +1, prog +1
 //! ```
 //!
-//! The tier's words live in its own host-mapped page ([`TierLayout`]): per
-//! row a go counter the stage card adds one to and the tier takes back, and
-//! a counter the tier adds one to and the stage card's wait takes back — the
-//! host tier's counter rule, one writer at a time — then the progress word,
-//! which the tier adds one to per layer served and the host reads, and the
-//! tier's fault copy. Per row the page holds the image the stage card's
-//! handoff writes — the tier's places of the routed slots, the stage card's
-//! q8_1 activation — and the rows the tier's down writes, one per routed
-//! slot, which the stage card's join reads in place.
+//! The tiers' words live in one host-mapped page ([`TierPage`], laid out by
+//! [`TierLayout`]) the host tier owns. Per tier it holds that tier's flag
+//! lines: per row a go counter the stage card adds one to and the tier takes
+//! back, and a counter the tier adds one to and the stage card's wait takes
+//! back — the host tier's counter rule, one writer at a time — then the
+//! progress word, which the tier adds one to per layer served and the host
+//! reads, and the tier's fault copy. Per row it holds the image the stage
+//! card's handoff writes — each tier's places of the routed slots, then the
+//! stage card's q8_1 activation, which every tier reads — and the rows the
+//! tiers' downs write, one per routed slot, each tier its own slots, which
+//! the stage card's join reads in place.
 //!
-//! The host thread never drives the tier per layer: a captured chain's tier
-//! work is one graph per chain kind ([`Chain::Step`], [`Chain::Pair`]),
-//! captured from the stage capture's go order at its first replay and
-//! launched on the tier's stream before the host serves the replay. Its
-//! last layer copies the tier's fault word into the page before its signal.
-//! After the host has served the replay's last layer it waits for the tier's
-//! progress under the go deadline and reads the copy: a raised word is the
-//! step's fault, merged with the stage card's ([`crate::fault::read_cards`],
-//! the first layer wins). An eager chain enqueues each tier layer as the
-//! host serves it and settles it after, the copy taken each layer.
+//! The host thread never drives a tier per layer: a captured chain's tier
+//! work is one graph per tier and chain kind ([`Chain::Step`],
+//! [`Chain::Pair`]), captured from the stage capture's go order at its first
+//! replay and launched on the tier's stream before the host serves the
+//! replay. Its last layer copies the tier's fault word into the page before
+//! its signal. After the host has served the replay's last layer it waits for
+//! each tier's progress under the go deadline and reads the copies: a raised
+//! word is the step's fault, merged with the stage card's
+//! ([`crate::fault::read_cards`], the first layer wins). An eager chain
+//! enqueues each tier layer as the host serves it and settles it after, the
+//! copy taken each layer.
 //!
 //! A tier that stops signalling is a lost card: the host's go deadline, or
-//! the settle's, names the tier when its progress is the one behind, the
-//! host tier is poisoned as [`super::PoisonKind::CardLost`], which a reset
-//! does not lift, and the release writes [`RELEASE`] to the tier's counters
-//! and go counters too, so both streams drain.
+//! the settle's, names each tier whose progress is behind, the host tier is
+//! poisoned as [`super::PoisonKind::CardLost`], which a reset does not lift,
+//! and the release writes [`RELEASE`] to every tier's counters and go
+//! counters too, so every stream drains.
 
 use std::mem::ManuallyDrop;
 use std::ops::Range;
@@ -48,7 +51,7 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread}
 use cuda_host::cuda_module;
 
 use super::page::MAX_ROWS;
-use super::slots::{Slot, SlotMap};
+use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
 use crate::fault::{FAULT_NONE, Fault};
 use crate::graph::{Graph, MappedHost, cu, mem_batch, op_add, op_barrier_sys, op_wait_geq};
@@ -69,12 +72,12 @@ pub(super) const TIER_GRACE: Duration = Duration::from_millis(100);
 
 // ------------------------------------------------------------------ set
 
-/// Which experts of each hybrid layer the tier card holds: per layer of
+/// Which experts of each hybrid layer a tier card holds: per layer of
 /// `layers`, its expert ids in tier-slot order (ascending, each once, each
 /// below `n_expert`) — slot `s` of the tier's routed stacks holds `ids[s]`.
 /// A layer may hold none; the tier then does nothing for it. A copy of the
-/// slot map's tier rows ([`TierSet::of_map`]), made before the tier card
-/// loads its stacks.
+/// slot map's rows of one tier ([`TierSet::of_map`]), made before the tier
+/// card loads its stacks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TierSet {
     layers: Range<usize>,
@@ -121,23 +124,25 @@ impl TierSet {
         })
     }
 
-    /// The tier's set as `map` holds it: per layer of the map, the ids of
-    /// its tier entries (`TIER | s`) in tier-slot order. The map is the one
-    /// owner of where an expert runs; the set is a copy of its tier rows the
-    /// tier card keeps.
-    pub fn of_map(map: &SlotMap) -> Result<TierSet, GpuError> {
+    /// Tier `tier`'s set as `map` holds it: per layer of the map, the ids of
+    /// that tier's entries in its slot order. The map is the one owner of
+    /// where an expert runs; the set is a copy of one tier's rows the tier
+    /// card keeps. A tier the map does not name is refused by name.
+    pub fn of_map(map: &SlotMap, tier: usize) -> Result<TierSet, GpuError> {
         const WHAT: &str = "TierSet::of_map";
         let layers = map.layers();
         let n = u32::try_from(map.n_expert())
             .map_err(|_| GpuError::shape(WHAT, "the map's experts pass u32"))?;
         let mut rows = Vec::with_capacity(layers.len());
         for l in layers.clone() {
-            let k = map.on_tier(l)?;
+            let k = map.on_tier_of(tier, l)?;
             let mut ids = vec![u32::MAX; k];
             for id in 0..n {
-                if let Some(Slot::Tier(s)) = map.slot(l, id) {
+                if let Some(Slot::Tier { tier: t, slot: s }) = map.slot(l, id)
+                    && t == tier
+                {
                     let at = ids.get_mut(s as usize).ok_or_else(|| {
-                        GpuError::shape(WHAT, format!("layer {l}: tier slot {s} of {k}"))
+                        GpuError::shape(WHAT, format!("layer {l}: tier {tier} slot {s} of {k}"))
                     })?;
                     *at = id;
                 }
@@ -190,7 +195,8 @@ impl TierSet {
 
 // ------------------------------------------------------------------ page
 
-/// The tier page's flag words, one 64-byte line each.
+/// One tier's flag words on the page, one 64-byte line each, from the
+/// tier's first line ([`TierLayout::word_off`]).
 #[derive(Clone, Copy, Debug)]
 enum TWord {
     /// Row `.0`'s go counter: the stage card adds one per go of a tier
@@ -216,15 +222,17 @@ impl TWord {
     }
 }
 
-/// Byte offset of row 0's image: past every flag word.
-const TIER_PAYLOAD_OFF: usize = (128 * MAX_ROWS + 128).next_multiple_of(256);
+/// Bytes of one tier's flag lines: tier `t`'s start at `t · TIER_FLAGS`.
+const TIER_FLAGS: usize = 128 * MAX_ROWS + 128;
 
-const _: () = assert!(TWord::Fault.offset() + 8 <= TIER_PAYLOAD_OFF);
+const _: () = assert!(TWord::Fault.offset() + 8 <= TIER_FLAGS);
 
-/// One row's tier image, in words from its start: the tier's places of the
-/// routed slots (`n_used`), the stage card's q8_1 activation codes
-/// (`q3_words` u32: the u64 codes as word pairs) and its block scales
-/// (`d8` f32), each field at a 256-byte boundary.
+/// One row's tier image as one tier reads it, in words from its start: that
+/// tier's places of the routed slots (`n_used` at `sel`), the stage card's
+/// q8_1 activation codes (`q3_words` u32 at `q3`: the u64 codes as word
+/// pairs) and its block scales (`d8_len` f32 at `d8`), each field at a
+/// 256-byte boundary. Every tier's image of a row has the same `q3` and `d8`
+/// and its own `sel` ([`TierLayout::image`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierImageLayout {
     pub sel: usize,
@@ -238,43 +246,59 @@ pub struct TierImageLayout {
 }
 
 impl TierImageLayout {
-    /// Words of the image.
+    /// Words of the row's image, every tier's places with it.
     #[must_use]
     pub fn words(&self) -> usize {
         self.d8 + self.d8_len
     }
 }
 
-/// The tier page's layout: the flag words, then per row its image, then per
-/// row its routed rows (`n_used · hidden` f32).
+/// The tier page's layout over `tiers` tiers: each tier's flag lines, then
+/// per row its image (each tier's places, the shared q8_1 activation), then
+/// per row its routed rows (`n_used · hidden` f32), which every tier writes
+/// its own slots of. With one tier every offset is the one-tier page's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierLayout {
+    tiers: usize,
     rows: usize,
+    /// Tier 0's image of a row; tier `t`'s has `sel` at `t · sel_stride`.
     image: TierImageLayout,
+    sel_stride: usize,
     image_stride: usize,
     rows_stride: usize,
 }
 
 impl TierLayout {
     /// The layout of `shape`'s rows over an activation whose q8_1 codes are
-    /// `q3_u64` u64 and its scales `d8_len` f32; a size past `usize` or a
-    /// row count outside `1..=MAX_ROWS` is refused by name.
-    pub fn new(shape: TierShape, q3_u64: usize, d8_len: usize) -> Result<TierLayout, GpuError> {
+    /// `q3_u64` u64 and its scales `d8_len` f32, for `tiers` tiers; a size
+    /// past `usize`, a row count outside `1..=MAX_ROWS` and a tier count
+    /// outside `1..=MAX_TIERS` are refused by name.
+    pub fn new(
+        shape: TierShape,
+        q3_u64: usize,
+        d8_len: usize,
+        tiers: usize,
+    ) -> Result<TierLayout, GpuError> {
         const WHAT: &str = "TierLayout::new";
         let TierShape {
             hidden,
             n_used,
             rows,
         } = shape;
-        if !(1..=MAX_ROWS).contains(&rows) || hidden == 0 || n_used == 0 {
+        if !(1..=MAX_ROWS).contains(&rows)
+            || !(1..=MAX_TIERS).contains(&tiers)
+            || hidden == 0
+            || n_used == 0
+        {
             return Err(GpuError::shape(
                 WHAT,
-                format!("{rows} rows of {hidden} values, {n_used} slots"),
+                format!("{rows} rows of {hidden} values, {n_used} slots, {tiers} tiers"),
             ));
         }
         let o = || GpuError::shape(WHAT, "the page's size passes usize");
         let q3_words = q3_u64.checked_mul(2).ok_or_else(o)?;
-        let q3 = n_used.next_multiple_of(64);
+        let sel_stride = n_used.next_multiple_of(64);
+        let q3 = sel_stride.checked_mul(tiers).ok_or_else(o)?;
         let d8 = q3
             .checked_add(q3_words)
             .map(|w| w.next_multiple_of(64))
@@ -299,8 +323,10 @@ impl TierLayout {
             .map(|b| b.next_multiple_of(256))
             .ok_or_else(o)?;
         let l = TierLayout {
+            tiers,
             rows,
             image,
+            sel_stride,
             image_stride,
             rows_stride,
         };
@@ -308,10 +334,20 @@ impl TierLayout {
         Ok(l)
     }
 
-    /// One row's image layout.
+    /// Tier `tier`'s image of a row: its own places, the shared activation.
+    /// A tier the page does not carry is refused by name.
+    pub fn image(&self, tier: usize) -> Result<TierImageLayout, GpuError> {
+        self.check_tier(tier)?;
+        Ok(TierImageLayout {
+            sel: tier * self.sel_stride,
+            ..self.image
+        })
+    }
+
+    /// Tiers the page carries.
     #[must_use]
-    pub fn image(&self) -> TierImageLayout {
-        self.image
+    pub fn tiers(&self) -> usize {
+        self.tiers
     }
 
     /// Rows the page carries.
@@ -320,21 +356,42 @@ impl TierLayout {
         self.rows
     }
 
+    fn check_tier(&self, tier: usize) -> Result<(), GpuError> {
+        if tier < self.tiers {
+            Ok(())
+        } else {
+            Err(GpuError::shape(
+                "TierLayout",
+                format!("tier {tier} of a tier page of {} tiers", self.tiers),
+            ))
+        }
+    }
+
+    /// Byte offset of tier `tier`'s word `w`.
+    const fn word_off(&self, tier: usize, w: TWord) -> usize {
+        tier * TIER_FLAGS + w.offset()
+    }
+
+    /// Byte offset of row 0's image: past every tier's flag lines.
+    const fn payload_off(&self) -> usize {
+        (self.tiers * TIER_FLAGS).next_multiple_of(256)
+    }
+
     /// Byte offset of row `row`'s image.
     fn image_off(&self, row: usize) -> usize {
-        TIER_PAYLOAD_OFF + row * self.image_stride
+        self.payload_off() + row * self.image_stride
     }
 
     /// Byte offset of row `row`'s routed rows.
     fn rows_off(&self, row: usize) -> usize {
-        TIER_PAYLOAD_OFF + self.rows * self.image_stride + row * self.rows_stride
+        self.payload_off() + self.rows * self.image_stride + row * self.rows_stride
     }
 
     /// Bytes the page holds.
     fn bytes(&self) -> Option<usize> {
         self.rows
             .checked_mul(self.image_stride + self.rows_stride)?
-            .checked_add(TIER_PAYLOAD_OFF)
+            .checked_add(self.payload_off())
     }
 }
 
@@ -345,6 +402,236 @@ pub struct TierShape {
     pub hidden: usize,
     pub n_used: usize,
     pub rows: usize,
+}
+
+/// One row's windows over the page as the stage card's launches address
+/// them (the stage card's context): the image its handoff writes, the routed
+/// rows its join reads.
+struct StageRow {
+    image: ManuallyDrop<DeviceBuffer<u32>>,
+    rows: ManuallyDrop<DeviceBuffer<f32>>,
+}
+
+impl Drop for StageRow {
+    fn drop(&mut self) {
+        // SAFETY: each window is taken once, here, and never read again; its
+        // raw parts are dropped (the context handle with them) and no memory
+        // is freed — the page frees its allocation after the rows.
+        unsafe {
+            drop(ManuallyDrop::take(&mut self.image).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.rows).into_raw_parts());
+        }
+    }
+}
+
+/// The tier page: the host-mapped memory every tier card and the stage card
+/// reach at one address ([`TierLayout`]), allocated in the stage card's
+/// context, and the stage card's windows over it. The host tier owns it and
+/// drops it after its tier cards, whose graphs and windows address it.
+///
+/// Field order is drop order: the windows before the page.
+pub struct TierPage {
+    stage: Vec<StageRow>,
+    page: MappedHost,
+    layout: TierLayout,
+}
+
+impl TierPage {
+    /// The page laid out by `layout`, in `stage`'s context, every tier's
+    /// fault copy clean, with the stage card's windows. Load-time only;
+    /// `stage`'s context is current on return.
+    pub(super) fn new(stage: &Gpu, layout: TierLayout) -> Result<TierPage, GpuError> {
+        let ctx = stage.context();
+        let bytes = layout
+            .bytes()
+            .ok_or_else(|| GpuError::shape("TierPage::new", "the page's size passes usize"))?;
+        let page = MappedHost::new(ctx, bytes, "cuMemHostAlloc (tier page)")?;
+        for t in 0..layout.tiers {
+            // SAFETY: tier t's fault copy's two words lie in its flag lines,
+            // inside the page.
+            unsafe {
+                page.host_at(layout.word_off(t, TWord::Fault))
+                    .cast::<u32>()
+                    .write_volatile(FAULT_NONE);
+            }
+        }
+        let img = layout.image;
+        let stage_rows = (0..layout.rows)
+            .map(|r| {
+                // SAFETY: row r's image (`img.words()` words, every tier's
+                // places with it) and its routed rows (`n_used · hidden` f32)
+                // lie inside the page, apart from each other and from every
+                // other row's (the layout's strides); the windows drop before
+                // the page (field order).
+                unsafe {
+                    StageRow {
+                        image: window::<u32>(page.dev_at(layout.image_off(r)), img.words(), ctx),
+                        rows: window::<f32>(
+                            page.dev_at(layout.rows_off(r)),
+                            img.n_used * img.hidden,
+                            ctx,
+                        ),
+                    }
+                }
+            })
+            .collect();
+        Ok(TierPage {
+            stage: stage_rows,
+            page,
+            layout,
+        })
+    }
+
+    /// The page's layout.
+    #[must_use]
+    pub fn layout(&self) -> TierLayout {
+        self.layout
+    }
+
+    /// Row `row`'s image as tier `tier` reads it and the routed rows, for
+    /// the stage card's handoff and join; a row or a tier the page does not
+    /// carry is refused by name.
+    pub(super) fn target_of(
+        &mut self,
+        row: usize,
+        tier: usize,
+    ) -> Result<TierTarget<'_>, GpuError> {
+        let layout = self.layout.image(tier)?;
+        let n = self.stage.len();
+        let r = self.stage.get_mut(row).ok_or_else(|| {
+            GpuError::shape(WHAT, format!("row {row} of a tier page of {n} rows"))
+        })?;
+        Ok(TierTarget {
+            image: &mut r.image,
+            rows: &r.rows,
+            layout,
+        })
+    }
+
+    /// Row `row`'s routed rows as the stage card's join reads them; a row
+    /// the page does not carry is refused by name.
+    pub(super) fn rows_of(&self, row: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
+        let n = self.stage.len();
+        self.stage
+            .get(row)
+            .map(|r| &*r.rows)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("row {row} of a tier page of {n} rows")))
+    }
+
+    fn check_row(&self, row: usize, what: &'static str) -> Result<(), GpuError> {
+        if row < self.layout.rows {
+            Ok(())
+        } else {
+            Err(GpuError::shape(
+                what,
+                format!("row {row} of a tier page of {} rows", self.layout.rows),
+            ))
+        }
+    }
+
+    /// Enqueue on the stage card's `stream` the go of layer `layer` of row
+    /// `row` for a tier layer: the host tier's go batch
+    /// ([`Boundary::enqueue_go_of`]) with one added to the row's go counter
+    /// of each tier of `tiers` — the tiers that hold experts of the layer, in
+    /// tier order — after the first system barrier, so each tier, like the
+    /// host, starts only once the image has landed. One batch, whatever the
+    /// tier count; an empty `tiers` is refused by name.
+    pub(super) fn enqueue_go_of(
+        &self,
+        stream: &CudaStream,
+        boundary: &Boundary,
+        layer: usize,
+        row: usize,
+        tiers: &[usize],
+    ) -> Result<(), GpuError> {
+        let what = "TierCard::enqueue_go";
+        let layer = u32::try_from(layer).map_err(|_| GpuError::shape(what, "layer passes u32"))?;
+        self.check_row(row, what)?;
+        let k = self.check_tiers(tiers, layer as usize, what)?;
+        let (lyr, gen_, seq) = boundary.go_words(row, what)?;
+        let mut ops = [op_barrier_sys(); 5 + MAX_TIERS];
+        ops[1] = crate::graph::op_write(lyr, layer);
+        for (op, &t) in ops[2..].iter_mut().zip(tiers) {
+            *op = op_add(self.page.dev_at(self.layout.word_off(t, TWord::Go(row))), 1);
+        }
+        ops[3 + k] = op_add(gen_, 1);
+        ops[4 + k] = op_add(seq, 1);
+        mem_batch(
+            stream,
+            &mut ops[..5 + k],
+            "cuStreamBatchMemOp_v2 (hybrid go, tier)",
+        )
+    }
+
+    /// Enqueue on the stage card's `stream` the wait of row `row` for a
+    /// tier layer whose experts the tiers `tiers` hold: until the host's
+    /// counter and each of those tiers' counters are at least one, then minus
+    /// one from each. The settle rule: a tier graph serves each of its layers
+    /// every step, its go count fixed when it was captured, so layer `l`'s
+    /// wait waits for every tier `t` with `kₜ(l) > 0` and for no other. One
+    /// batch, whatever the tier count; an empty `tiers` is refused by name.
+    pub(super) fn enqueue_back_of(
+        &self,
+        stream: &CudaStream,
+        boundary: &Boundary,
+        layer: usize,
+        row: usize,
+        tiers: &[usize],
+    ) -> Result<(), GpuError> {
+        let what = "TierCard::enqueue_back";
+        self.check_row(row, what)?;
+        let k = self.check_tiers(tiers, layer, what)?;
+        let host = boundary.cnt_word(row, what)?;
+        let mut ops = [op_wait_geq(host, 1); 2 + 2 * MAX_TIERS];
+        ops[1 + k] = op_add(host, u32::MAX);
+        for (i, &t) in tiers.iter().enumerate() {
+            let cnt = self.page.dev_at(self.layout.word_off(t, TWord::Cnt(row)));
+            ops[1 + i] = op_wait_geq(cnt, 1);
+            ops[2 + k + i] = op_add(cnt, u32::MAX);
+        }
+        mem_batch(
+            stream,
+            &mut ops[..2 + 2 * k],
+            "cuStreamBatchMemOp_v2 (hybrid wait, tier)",
+        )
+    }
+
+    /// The count of `tiers`, each a tier of the page, ascending, at least
+    /// one; refused by name as `what` at `layer` otherwise.
+    fn check_tiers(
+        &self,
+        tiers: &[usize],
+        layer: usize,
+        what: &'static str,
+    ) -> Result<usize, GpuError> {
+        let ascending = tiers.windows(2).all(|w| w[0] < w[1]);
+        match tiers.last() {
+            Some(&t) if ascending && t < self.layout.tiers => Ok(tiers.len()),
+            _ => Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {layer}: the tiers {tiers:?} of a tier page of {} tiers",
+                    self.layout.tiers
+                ),
+            )),
+        }
+    }
+
+    /// The device address of tier `tier`'s word `w`.
+    fn dev(&self, tier: usize, w: TWord) -> sys::CUdeviceptr {
+        self.page.dev_at(self.layout.word_off(tier, w))
+    }
+
+    /// Tier `tier`'s word `w` as the host reads and writes it.
+    fn word(&self, tier: usize, w: TWord) -> &AtomicU32 {
+        self.word_at(self.layout.word_off(tier, w))
+    }
+
+    fn word_at(&self, off: usize) -> &AtomicU32 {
+        self.page
+            .atomic_u32(off)
+            .expect("every tier flag word lies in the page's flag lines")
+    }
 }
 
 // ------------------------------------------------------------ the kernels
@@ -433,8 +720,9 @@ pub struct TierBlock<'a> {
 }
 
 /// What the stage card's handoff writes into a row's tier image and its
-/// join reads back ([`TierCard::target_of`]): the image, the routed rows the
-/// tier writes, as windows of the stage card's context, and the layout.
+/// join reads back ([`TierPage::target_of`]): the image, the routed rows the
+/// tiers write, as windows of the stage card's context, and the layout of
+/// one tier's image.
 pub struct TierTarget<'a> {
     pub image: &'a mut DeviceBuffer<u32>,
     pub rows: &'a DeviceBuffer<f32>,
@@ -457,26 +745,16 @@ pub struct TierStats {
     pub settle_early: u64,
 }
 
-/// One row's windows over the tier page.
-struct TierRow {
-    /// The image and the routed rows, as the stage card's launches address
-    /// them (the stage card's context).
-    image: ManuallyDrop<DeviceBuffer<u32>>,
-    rows_stage: ManuallyDrop<DeviceBuffer<f32>>,
-    /// The routed rows as the tier's down writes them (the tier's context).
-    rows_tier: ManuallyDrop<DeviceBuffer<f32>>,
-}
+/// One row's routed rows on the page as the tier's down writes them (the
+/// tier's context).
+struct TierRows(ManuallyDrop<DeviceBuffer<f32>>);
 
-impl Drop for TierRow {
+impl Drop for TierRows {
     fn drop(&mut self) {
-        // SAFETY: each window is taken once, here, and never read again; its
+        // SAFETY: the window is taken once, here, and never read again; its
         // raw parts are dropped (the context handle with them) and no memory
-        // is freed — the tier's page frees its allocation after the rows.
-        unsafe {
-            drop(ManuallyDrop::take(&mut self.image).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.rows_stage).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.rows_tier).into_raw_parts());
-        }
+        // is freed — the host tier frees the page after its tier cards.
+        unsafe { drop(ManuallyDrop::take(&mut self.0).into_raw_parts()) };
     }
 }
 
@@ -487,13 +765,14 @@ struct Stage {
     fault: Arc<DeviceBuffer<u32>>,
 }
 
-/// The expert tier's card: its `Gpu` (its own stream and fault word), its
-/// resident stacks, its page, one captured graph per chain kind, and the
-/// architecture's computation. Owned by the host tier
-/// ([`super::HostTier::attach_tier`]).
+/// An expert tier's card: its `Gpu` (its own stream and fault word), its
+/// resident stacks, its tier on the host tier's page, one captured graph per
+/// chain kind, and the architecture's computation. Owned by the host tier
+/// ([`super::HostTier::attach_tiers`]), which binds it to the page; every
+/// call that reads or writes the page takes it.
 ///
 /// Field order is drop order: the graphs before the buffers they address,
-/// the windows before the page, the page and the weights before the card.
+/// the windows and the weights before the card.
 pub struct TierCard {
     graphs: [Option<Graph>; 2],
     /// Per chain kind, the (layer, row) services its graph was captured
@@ -505,9 +784,12 @@ pub struct TierCard {
     /// from the row's image.
     act: Q8Act,
     sel: DeviceBuffer<u32>,
-    rows: Vec<TierRow>,
-    page: MappedHost,
-    layout: TierLayout,
+    /// Per row, the page's routed rows in this card's context: made when the
+    /// host tier binds the card to its page ([`TierCard::bind`]).
+    rows: Vec<TierRows>,
+    /// The card's tier on the page: its index in the host tier's tiers.
+    index: usize,
+    shape: TierShape,
     set: TierSet,
     weights: Weights,
     stage: Option<Stage>,
@@ -522,8 +804,9 @@ pub struct TierCard {
 impl TierCard {
     /// The tier on `gpu` (the card named `name`), with `weights` its
     /// resident routed stacks for `set`, `experts` the architecture's
-    /// computation, cut for `shape`. Load-time only. Its stage-side windows
-    /// are made when the host tier takes it ([`super::HostTier::attach_tier`]).
+    /// computation, cut for `shape`. Load-time only. Its windows over the
+    /// page are made when the host tier takes it
+    /// ([`super::HostTier::attach_tiers`]).
     pub fn open(
         gpu: Gpu,
         name: String,
@@ -536,42 +819,9 @@ impl TierCard {
         ctx.bind_to_thread()?;
         let stream = gpu.stream();
         let act = Q8Act::with_k(stream, 1, shape.hidden)?;
-        let layout = TierLayout::new(shape, act.q3.len(), act.d8.len())?;
-        let bytes = layout
-            .bytes()
-            .ok_or_else(|| GpuError::shape(WHAT, "the page's size passes usize"))?;
-        let page = MappedHost::new(&ctx, bytes, "cuMemHostAlloc (tier page)")?;
-        // SAFETY: the fault copy's two words lie in the page's flag lines.
-        unsafe {
-            page.host_at(TWord::Fault.offset())
-                .cast::<u32>()
-                .write_volatile(FAULT_NONE);
-        }
-        let img = layout.image();
-        let rows = (0..shape.rows)
-            .map(|r| {
-                // SAFETY: row r's image (`img.words()` words) and its routed
-                // rows (`n_used · hidden` f32) lie inside the page, apart from
-                // each other and from every other row's (the layout's
-                // strides); the page moves into the card beside the windows
-                // and is freed only after them.
-                unsafe {
-                    TierRow {
-                        image: window::<u32>(page.dev_at(layout.image_off(r)), img.words(), &ctx),
-                        rows_stage: window::<f32>(
-                            page.dev_at(layout.rows_off(r)),
-                            img.n_used * img.hidden,
-                            &ctx,
-                        ),
-                        rows_tier: window::<f32>(
-                            page.dev_at(layout.rows_off(r)),
-                            img.n_used * img.hidden,
-                            &ctx,
-                        ),
-                    }
-                }
-            })
-            .collect();
+        // The shape is checked once here, as the page the card binds to
+        // will be laid out.
+        TierLayout::new(shape, act.q3.len(), act.d8.len(), 1)?;
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; its launcher checks the launch contract.
         let module = unsafe { tier_kernels::load(&ctx)? };
@@ -583,9 +833,9 @@ impl TierCard {
             module,
             sel: DeviceBuffer::zeroed(stream, shape.n_used)?,
             act,
-            rows,
-            page,
-            layout,
+            rows: Vec::new(),
+            index: 0,
+            shape,
             set,
             weights,
             stage: None,
@@ -630,10 +880,9 @@ impl TierCard {
         &self.weights
     }
 
-    /// The page's layout.
-    #[must_use]
-    pub fn layout(&self) -> TierLayout {
-        self.layout
+    /// The layout of a page of `tiers` tiers this card's staging reads.
+    pub(super) fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
+        TierLayout::new(self.shape, self.act.q3.len(), self.act.d8.len(), tiers)
     }
 
     /// What the tier has done since load.
@@ -656,21 +905,6 @@ impl TierCard {
         1 + 3 + launches + 1
     }
 
-    /// Row `row`'s image and routed rows for the stage card's handoff and
-    /// join; a row the page does not carry is refused by name.
-    pub fn target_of(&mut self, row: usize) -> Result<TierTarget<'_>, GpuError> {
-        let layout = self.layout.image();
-        let n = self.rows.len();
-        let r = self.rows.get_mut(row).ok_or_else(|| {
-            GpuError::shape(WHAT, format!("row {row} of a tier page of {n} rows"))
-        })?;
-        Ok(TierTarget {
-            image: &mut r.image,
-            rows: &r.rows_stage,
-            layout,
-        })
-    }
-
     /// Nodes of `chain`'s captured tier graph; `None` before its first
     /// replay captured it, or for a chain the tier does not serve.
     #[must_use]
@@ -679,23 +913,12 @@ impl TierCard {
         self.graphs[i].as_ref().map(Graph::node_count)
     }
 
-    /// Row `row`'s routed rows as the stage card's join reads them; a row
-    /// the page does not carry is refused by name.
-    pub fn rows_of(&self, row: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
-        let n = self.rows.len();
-        self.rows
-            .get(row)
-            .map(|r| &*r.rows_stage)
-            .ok_or_else(|| GpuError::shape(WHAT, format!("row {row} of a tier page of {n} rows")))
-    }
-
-    /// The tier's fault copy as the page holds it: what the tier's last
-    /// fault copy saw.
-    #[must_use]
-    pub fn fault_copy(&self) -> Option<Fault> {
+    /// The tier's fault copy as `page` holds it: what the tier's last fault
+    /// copy saw.
+    pub(super) fn fault_copy(&self, page: &TierPage) -> Option<Fault> {
         let (w, s) = (
-            self.word(TWord::Fault).load(Ordering::Acquire),
-            self.word_at(TWord::Fault.offset() + 4)
+            page.word(self.index, TWord::Fault).load(Ordering::Acquire),
+            page.word_at(page.layout.word_off(self.index, TWord::Fault) + 4)
                 .load(Ordering::Acquire),
         );
         Fault::from_words(w, s)
@@ -721,134 +944,84 @@ impl TierCard {
             .enqueue_block(&self.gpu, &self.weights, layer, io)
     }
 
-    /// Make the stage-side windows in `stage`'s context and keep its
-    /// stream and fault word. The windows and the stage card's waits on the
-    /// tier's counters take the page's device address from the tier's
-    /// context, so the page must sit at that address in `stage`'s context
-    /// too (unified addressing), else the call is refused by name. The
-    /// host tier's load-time call; `stage`'s context is current on return.
-    pub(super) fn bind_stage(&mut self, stage: &Gpu) -> Result<(), GpuError> {
-        const BIND: &str = "TierCard::bind_stage";
-        let ctx = stage.context();
-        ctx.bind_to_thread()?;
-        let mut dev: sys::CUdeviceptr = 0;
-        // SAFETY: `stage`'s context is current on this thread (bound above),
-        // `dev` is a live local the call writes, and the page's first byte is
-        // the start of its live mapped allocation; the flags must be 0.
-        let rc =
-            unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, self.page.host_at(0).cast(), 0) };
-        cu(
-            rc,
-            "cuMemHostGetDevicePointer_v2 (tier page, stage context)",
-        )?;
-        if dev != self.page.dev_at(0) {
+    /// Bind the card to `page` as tier `index`: its windows over the page's
+    /// routed rows in its own context, and `stage`'s stream and fault word
+    /// kept. The page was allocated in `stage`'s context, and the card's
+    /// staging copies and its waits take the page's device address from
+    /// there, so the page must sit at that address in this card's context too
+    /// (unified addressing), else the call is refused by name; a page laid
+    /// out for another shape is refused too. The host tier's load-time call;
+    /// `stage`'s context is current on return.
+    pub(super) fn bind(
+        &mut self,
+        page: &TierPage,
+        index: usize,
+        stage: &Gpu,
+    ) -> Result<(), GpuError> {
+        const BIND: &str = "TierCard::bind";
+        let layout = page.layout();
+        if layout != self.page_layout(layout.tiers)? || index >= layout.tiers {
             return Err(GpuError::shape(
                 BIND,
                 format!(
-                    "the tier page is at {:#x} in the tier's context and at {dev:#x} in the stage \
-                     card's: its windows and the stage's waits need one address",
-                    self.page.dev_at(0)
+                    "the tier {} as tier {index} of a page of {} tiers laid out for another shape",
+                    self.name, layout.tiers
                 ),
             ));
         }
-        let img = self.layout.image();
-        for (r, row) in self.rows.iter_mut().enumerate() {
-            // SAFETY: as in `open`: row r's image and routed rows lie inside
-            // the page, which outlives the windows; the windows they replace
-            // are given back first, their raw parts dropped and nothing freed.
-            unsafe {
-                drop(ManuallyDrop::take(&mut row.image).into_raw_parts());
-                drop(ManuallyDrop::take(&mut row.rows_stage).into_raw_parts());
-                row.image =
-                    window::<u32>(self.page.dev_at(self.layout.image_off(r)), img.words(), ctx);
-                row.rows_stage = window::<f32>(
-                    self.page.dev_at(self.layout.rows_off(r)),
-                    img.n_used * img.hidden,
-                    ctx,
-                );
-            }
+        let ctx = self.gpu.context();
+        ctx.bind_to_thread()?;
+        let mut dev: sys::CUdeviceptr = 0;
+        // SAFETY: this card's context is current on this thread (bound
+        // above), `dev` is a live local the call writes, and the page's first
+        // byte is the start of its live mapped allocation; the flags must be 0.
+        let rc =
+            unsafe { sys::cuMemHostGetDevicePointer_v2(&mut dev, page.page.host_at(0).cast(), 0) };
+        cu(rc, "cuMemHostGetDevicePointer_v2 (tier page, tier context)")?;
+        if dev != page.page.dev_at(0) {
+            return Err(GpuError::shape(
+                BIND,
+                format!(
+                    "the tier page is at {:#x} in the stage card's context and at {dev:#x} in the \
+                     tier {}'s: the tier's copies and the stage's waits need one address",
+                    page.page.dev_at(0),
+                    self.name
+                ),
+            ));
         }
+        let img = layout.image;
+        self.rows = (0..layout.rows)
+            .map(|r| {
+                // SAFETY: row r's routed rows (`n_used · hidden` f32) lie
+                // inside the page, apart from every other row's (the layout's
+                // strides); the host tier frees the page only after its cards.
+                TierRows(unsafe {
+                    window::<f32>(
+                        page.page.dev_at(layout.rows_off(r)),
+                        img.n_used * img.hidden,
+                        ctx,
+                    )
+                })
+            })
+            .collect();
+        self.index = index;
         self.stage = Some(Stage {
             stream: stage.stream_handle(),
             fault: Arc::clone(stage.fault_word()),
         });
+        stage.context().bind_to_thread()?;
         Ok(())
     }
 
-    /// Enqueue on the stage card's `stream` the go of layer `layer` of row
-    /// `row` for a tier layer: the host tier's go batch
-    /// ([`Boundary::enqueue_go_of`]) with one added to the row's tier go
-    /// counter after the first system barrier, so the tier, like the host,
-    /// starts only once the image has landed. One batch.
-    pub(super) fn enqueue_go_of(
-        &self,
-        stream: &CudaStream,
-        boundary: &Boundary,
-        layer: usize,
-        row: usize,
-    ) -> Result<(), GpuError> {
-        let what = "TierCard::enqueue_go";
-        let layer = u32::try_from(layer).map_err(|_| GpuError::shape(what, "layer passes u32"))?;
-        self.check_row(row, what)?;
-        let (lyr, gen_, seq) = boundary.go_words(row, what)?;
-        mem_batch(
-            stream,
-            &mut [
-                op_barrier_sys(),
-                crate::graph::op_write(lyr, layer),
-                op_add(self.page.dev_at(TWord::Go(row).offset()), 1),
-                op_barrier_sys(),
-                op_add(gen_, 1),
-                op_add(seq, 1),
-            ],
-            "cuStreamBatchMemOp_v2 (hybrid go, tier)",
-        )
-    }
-
-    /// Enqueue on the stage card's `stream` the wait of row `row` for a
-    /// tier layer: until the host's counter and the tier's are each at
-    /// least one, then minus one from each. One batch.
-    pub(super) fn enqueue_back_of(
-        &self,
-        stream: &CudaStream,
-        boundary: &Boundary,
-        row: usize,
-    ) -> Result<(), GpuError> {
-        let what = "TierCard::enqueue_back";
-        self.check_row(row, what)?;
-        let host = boundary.cnt_word(row, what)?;
-        let tier = self.page.dev_at(TWord::Cnt(row).offset());
-        mem_batch(
-            stream,
-            &mut [
-                op_wait_geq(host, 1),
-                op_wait_geq(tier, 1),
-                op_add(host, u32::MAX),
-                op_add(tier, u32::MAX),
-            ],
-            "cuStreamBatchMemOp_v2 (hybrid wait, tier)",
-        )
-    }
-
-    fn check_row(&self, row: usize, what: &'static str) -> Result<(), GpuError> {
-        if row < self.rows.len() {
-            Ok(())
-        } else {
-            Err(GpuError::shape(
-                what,
-                format!("row {row} of a tier page of {} rows", self.rows.len()),
-            ))
-        }
-    }
-
     /// Launch `chain`'s tier graph for the services `list` (the stage
-    /// capture's tier layers, in go order) on the tier's stream when one is
-    /// held for that list ([`Pass::Graph`]); the host then expects the tier to
-    /// serve `list.len()` layers more. With none held nothing is enqueued and
-    /// the host feeds the pass a layer at a time ([`Pass::Feed`]), then
-    /// captures the graph once it has settled ([`TierCard::capture`]): an
-    /// instantiation may wait for the card, and the stage card's launched
-    /// chain waits for the host, so none is made while that chain runs.
+    /// capture's tier layers of this tier, in go order) on the tier's stream
+    /// when one is held for that list ([`Pass::Graph`]); the host then
+    /// expects the tier to serve `list.len()` layers more. With none held
+    /// nothing is enqueued and the host feeds the pass a layer at a time
+    /// ([`Pass::Feed`]), then captures the graph once it has settled
+    /// ([`TierCard::capture`]): an instantiation may wait for the card, and
+    /// the stage card's launched chain waits for the host, so none is made
+    /// while that chain runs.
     pub(super) fn replay(
         &mut self,
         chain: Chain,
@@ -868,11 +1041,12 @@ impl TierCard {
         Ok(Pass::Graph)
     }
 
-    /// Capture `chain`'s tier graph for `list`, replacing the one held, after
-    /// a fed pass has settled: the stage card's chain waits on neither the
-    /// host nor the tier any more. Nothing is launched.
+    /// Capture `chain`'s tier graph for `list` over `page`, replacing the
+    /// one held, after a fed pass has settled: the stage card's chain waits
+    /// on neither the host nor the tier any more. Nothing is launched.
     pub(super) fn capture(
         &mut self,
+        page: &TierPage,
         chain: Chain,
         list: &[(usize, usize)],
     ) -> Result<(), GpuError> {
@@ -883,29 +1057,7 @@ impl TierCard {
             return Ok(());
         };
         self.gpu.context().bind_to_thread()?;
-        let TierCard {
-            experts,
-            module,
-            act,
-            sel,
-            rows,
-            page,
-            layout,
-            weights,
-            gpu,
-            ..
-        } = self;
-        let mut parts = Parts {
-            experts: &mut **experts,
-            module,
-            act,
-            sel,
-            rows,
-            page,
-            layout: *layout,
-            weights,
-            gpu,
-        };
+        let mut parts = self.parts(page);
         let graph = Graph::capture(parts.gpu.stream(), |_| {
             for (k, &(layer, row)) in list.iter().enumerate() {
                 parts.enqueue_layer(layer, row, k == last)?;
@@ -920,16 +1072,27 @@ impl TierCard {
     /// Enqueue layer `layer` of row `row` on the tier's stream now, for an
     /// eager chain or a fed pass ([`Pass::Feed`]), its fault copy with it;
     /// the host then expects one layer more.
-    pub(super) fn enqueue_eager(&mut self, layer: usize, row: usize) -> Result<(), GpuError> {
+    pub(super) fn enqueue_eager(
+        &mut self,
+        page: &TierPage,
+        layer: usize,
+        row: usize,
+    ) -> Result<(), GpuError> {
         self.gpu.context().bind_to_thread()?;
+        self.parts(page).enqueue_layer(layer, row, true)?;
+        self.issue(1);
+        self.rebind_stage()
+    }
+
+    /// The parts one tier layer's enqueue reads and writes, over `page`.
+    fn parts<'a>(&'a mut self, page: &'a TierPage) -> Parts<'a> {
         let TierCard {
             experts,
             module,
             act,
             sel,
             rows,
-            page,
-            layout,
+            index,
             weights,
             gpu,
             ..
@@ -941,13 +1104,10 @@ impl TierCard {
             sel,
             rows,
             page,
-            layout: *layout,
+            index: *index,
             weights,
             gpu,
         }
-        .enqueue_layer(layer, row, true)?;
-        self.issue(1);
-        self.rebind_stage()
     }
 
     /// Make the stage card's context current again after tier work, so the
@@ -976,10 +1136,10 @@ impl TierCard {
         }
     }
 
-    /// The layers the tier has served since load, as its progress word says.
-    #[must_use]
-    pub fn progress(&self) -> u32 {
-        self.word(TWord::Prog).load(Ordering::Acquire)
+    /// The layers the tier has served since load, as its progress word on
+    /// `page` says.
+    pub(super) fn progress(&self, page: &TierPage) -> u32 {
+        page.word(self.index, TWord::Prog).load(Ordering::Acquire)
     }
 
     /// Layers the host asked of the tier since load.
@@ -989,23 +1149,22 @@ impl TierCard {
     }
 
     /// Whether the tier has served fewer than `want` layers.
-    pub(super) fn behind_of(&self, want: u32) -> bool {
-        let p = self.progress();
+    pub(super) fn behind_of(&self, page: &TierPage, want: u32) -> bool {
+        let p = self.progress(page);
         p != want && want.wrapping_sub(p) < 1 << 31
     }
 
     /// Whether the tier has served fewer layers than the host asked of it.
-    #[must_use]
-    pub fn behind(&self) -> bool {
-        self.behind_of(self.issued)
+    pub(super) fn behind(&self, page: &TierPage) -> bool {
+        self.behind_of(page, self.issued)
     }
 
     /// Wait until the tier has served every layer the host asked of it, or
     /// `deadline` has passed; `true` when it has.
-    pub(super) fn wait_caught_up(&mut self, deadline: Instant) -> bool {
+    pub(super) fn wait_caught_up(&mut self, page: &TierPage, deadline: Instant) -> bool {
         let t0 = Instant::now();
-        let early = !self.behind();
-        if !self.wait_for(self.issued, deadline) {
+        let early = !self.behind(page);
+        if !self.wait_for(page, self.issued, deadline) {
             return false;
         }
         let s = &mut self.stats;
@@ -1017,9 +1176,9 @@ impl TierCard {
 
     /// Wait until the tier has served `want` layers since load, or
     /// `deadline` has passed; `true` when it has.
-    pub(super) fn wait_for(&self, want: u32, deadline: Instant) -> bool {
+    pub(super) fn wait_for(&self, page: &TierPage, want: u32, deadline: Instant) -> bool {
         let mut spins = 0u32;
-        while self.behind_of(want) {
+        while self.behind_of(page, want) {
             spins = spins.wrapping_add(1);
             if spins.is_multiple_of(DEADLINE_POLL) && Instant::now() > deadline {
                 return false;
@@ -1031,72 +1190,59 @@ impl TierCard {
 
     /// The loss of the tier as an error's detail: how far it got, and how
     /// long the host `waited` for it.
-    pub(super) fn lost_detail(&self, waited: Duration) -> String {
+    pub(super) fn lost_detail(&self, page: &TierPage, waited: Duration) -> String {
         format!(
             "the expert tier on {} served {} of the {} layers asked of it and signalled nothing more in {waited:.1?}: the card is lost",
             self.name,
-            self.progress(),
+            self.progress(page),
             self.issued
         )
     }
 
-    /// The step's fault once the tier raised one: its copy merged with the
-    /// stage card's word, read once the stage card's stream drained — the
-    /// first layer wins. `None` while the copy is clean.
-    pub(super) fn merged_fault(&self) -> Result<Option<Fault>, GpuError> {
-        let Some(tier) = self.fault_copy() else {
-            return Ok(None);
-        };
-        let stage = match &self.stage {
-            Some(s) => {
-                s.stream.synchronize()?;
-                crate::fault::read(&s.fault)?
-            }
-            None => None,
-        };
-        Ok(crate::fault::read_cards(&[stage, Some(tier)]))
-    }
-
-    /// Release every wait of both cards that is still pending, for good:
-    /// the tier's counters and go counters go far past anything a step
-    /// subtracts.
-    pub(super) fn release(&self) {
-        for r in 0..self.rows.len() {
-            self.word(TWord::Go(r)).store(RELEASE, Ordering::Release);
-            self.word(TWord::Cnt(r)).store(RELEASE, Ordering::Release);
+    /// Release every wait of both cards on this tier's words that is still
+    /// pending, for good: the tier's counters and go counters go far past
+    /// anything a step subtracts.
+    pub(super) fn release(&self, page: &TierPage) {
+        for r in 0..page.layout.rows {
+            page.word(self.index, TWord::Go(r))
+                .store(RELEASE, Ordering::Release);
+            page.word(self.index, TWord::Cnt(r))
+                .store(RELEASE, Ordering::Release);
         }
     }
 
     /// Whether the tier's words hold what a drained step leaves: no go and
     /// no signal pending, every layer asked of it served.
-    #[must_use]
-    pub fn at_rest(&self) -> bool {
-        (0..self.rows.len()).all(|r| {
-            self.word(TWord::Go(r)).load(Ordering::Acquire) == 0
-                && self.word(TWord::Cnt(r)).load(Ordering::Acquire) == 0
-        }) && !self.behind()
+    pub(super) fn at_rest(&self, page: &TierPage) -> bool {
+        (0..page.layout.rows).all(|r| {
+            page.word(self.index, TWord::Go(r)).load(Ordering::Acquire) == 0
+                && page.word(self.index, TWord::Cnt(r)).load(Ordering::Acquire) == 0
+        }) && !self.behind(page)
     }
 
     /// Back to a fresh tier's words once the tier's stream has drained:
     /// counters and go counters at 0, the host's count at the tier's
     /// progress, the tier's fault word and its copy clean. The host tier's
     /// reset calls it.
-    pub(super) fn reset(&mut self) -> Result<(), GpuError> {
+    pub(super) fn reset(&mut self, page: &TierPage) -> Result<(), GpuError> {
         self.gpu.stream().synchronize()?;
-        for r in 0..self.rows.len() {
-            self.word(TWord::Go(r)).store(0, Ordering::Release);
-            self.word(TWord::Cnt(r)).store(0, Ordering::Release);
+        for r in 0..page.layout.rows {
+            page.word(self.index, TWord::Go(r))
+                .store(0, Ordering::Release);
+            page.word(self.index, TWord::Cnt(r))
+                .store(0, Ordering::Release);
         }
-        self.issued = self.progress();
-        self.clear_fault()
+        self.issued = self.progress(page);
+        self.clear_fault(page)
     }
 
     /// The tier's fault word and its copy back to clean.
-    pub(super) fn clear_fault(&mut self) -> Result<(), GpuError> {
+    pub(super) fn clear_fault(&mut self, page: &TierPage) -> Result<(), GpuError> {
         self.gpu.clear_fault()?;
         self.gpu.stream().synchronize()?;
-        self.word(TWord::Fault).store(FAULT_NONE, Ordering::Release);
-        self.word_at(TWord::Fault.offset() + 4)
+        page.word(self.index, TWord::Fault)
+            .store(FAULT_NONE, Ordering::Release);
+        page.word_at(page.layout.word_off(self.index, TWord::Fault) + 4)
             .store(0, Ordering::Release);
         self.rebind_stage()
     }
@@ -1111,19 +1257,37 @@ impl TierCard {
             self.captured[i].clear();
         }
     }
-
-    fn word(&self, w: TWord) -> &AtomicU32 {
-        self.word_at(w.offset())
-    }
-
-    fn word_at(&self, off: usize) -> &AtomicU32 {
-        self.page
-            .atomic_u32(off)
-            .expect("every tier flag word lies in the page's first TIER_PAYLOAD_OFF bytes")
-    }
 }
 
-/// How a replay of a captured chain reaches the tier
+/// The step's fault once a tier of `tiers` whose bit is set in `mask` raised
+/// one, over `page`: those tiers' copies merged with the stage card's word,
+/// read once the stage card's stream drained — the first layer wins. `None`
+/// while every copy is clean.
+pub(super) fn merged_fault(
+    page: &TierPage,
+    tiers: &[TierCard],
+    mask: u32,
+) -> Result<Option<Fault>, GpuError> {
+    let mut cards = [None; 1 + MAX_TIERS];
+    let mut n = 1;
+    for t in tiers.iter().enumerate().filter(|(i, _)| mask >> i & 1 == 1) {
+        cards[n] = t.1.fault_copy(page);
+        n += 1;
+    }
+    if cards[1..n].iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    cards[0] = match tiers.iter().find_map(|t| t.stage.as_ref()) {
+        Some(s) => {
+            s.stream.synchronize()?;
+            crate::fault::read(&s.fault)?
+        }
+        None => None,
+    };
+    Ok(crate::fault::read_cards(&cards[..n]))
+}
+
+/// How a replay of a captured chain reaches a tier
 /// ([`TierCard::replay`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pass {
@@ -1155,9 +1319,9 @@ struct Parts<'a> {
     module: &'a tier_kernels::LoadedModule,
     act: &'a mut Q8Act,
     sel: &'a mut DeviceBuffer<u32>,
-    rows: &'a mut [TierRow],
-    page: &'a MappedHost,
-    layout: TierLayout,
+    rows: &'a mut [TierRows],
+    page: &'a TierPage,
+    index: usize,
     weights: &'a Weights,
     gpu: &'a Gpu,
 }
@@ -1165,10 +1329,10 @@ struct Parts<'a> {
 impl Parts<'_> {
     /// Layer `layer` of row `row` on the tier's stream: wait for the row's
     /// go and take it back, copy the row's image — the q8_1 codes, their
-    /// scales, the places — into the staging, the architecture's launches
-    /// into the row's routed rows, then (when `copy_fault`) the fault copy,
-    /// a system barrier and the row's counter and the progress word each
-    /// plus one.
+    /// scales, this tier's places — into the staging, the architecture's
+    /// launches into the row's routed rows, then (when `copy_fault`) the
+    /// fault copy, a system barrier and the row's counter and the progress
+    /// word each plus one.
     fn enqueue_layer(
         &mut self,
         layer: usize,
@@ -1176,21 +1340,21 @@ impl Parts<'_> {
         copy_fault: bool,
     ) -> Result<(), GpuError> {
         let stream = self.gpu.stream();
-        let page = self.page;
-        let img = self.layout.image();
+        let (page, t) = (self.page, self.index);
+        let img = page.layout.image(t)?;
         if row >= self.rows.len() {
             return Err(GpuError::shape(
                 WHAT,
                 format!("row {row} of a tier page of {} rows", self.rows.len()),
             ));
         }
-        let go = page.dev_at(TWord::Go(row).offset());
+        let go = page.dev(t, TWord::Go(row));
         mem_batch(
             stream,
             &mut [op_wait_geq(go, 1), op_add(go, u32::MAX)],
             "cuStreamBatchMemOp_v2 (tier go)",
         )?;
-        let at = self.layout.image_off(row);
+        let at = page.layout.image_off(row);
         if self.act.q3.len() * 2 != img.q3_words
             || self.act.d8.len() != img.d8_len
             || self.sel.len() != img.n_used
@@ -1203,19 +1367,19 @@ impl Parts<'_> {
         copy_in(
             stream,
             self.act.q3.cu_deviceptr(),
-            page.dev_at(at + 4 * img.q3),
+            page.page.dev_at(at + 4 * img.q3),
             4 * img.q3_words,
         )?;
         copy_in(
             stream,
             self.act.d8.cu_deviceptr(),
-            page.dev_at(at + 4 * img.d8),
+            page.page.dev_at(at + 4 * img.d8),
             4 * img.d8_len,
         )?;
         copy_in(
             stream,
             self.sel.cu_deviceptr(),
-            page.dev_at(at + 4 * img.sel),
+            page.page.dev_at(at + 4 * img.sel),
             4 * img.n_used,
         )?;
         let r = &mut self.rows[row];
@@ -1226,15 +1390,15 @@ impl Parts<'_> {
             TierIo {
                 act: self.act,
                 sel: self.sel,
-                rows: &mut r.rows_tier,
+                rows: &mut r.0,
             },
         )?;
         if copy_fault {
             let ctx = self.gpu.context();
-            // SAFETY: the fault copy's two words lie in the page's flag
+            // SAFETY: the fault copy's two words lie in this tier's flag
             // lines; the window is used for this launch only and never
             // dropped as a buffer (its raw parts are, below).
-            let mut out = unsafe { window::<u32>(page.dev_at(TWord::Fault.offset()), 2, ctx) };
+            let mut out = unsafe { window::<u32>(page.dev(t, TWord::Fault), 2, ctx) };
             let prep = self
                 .module
                 .prepare_tier_fault_copy(LaunchConfig1D::new(1, 32, 0))?;
@@ -1250,8 +1414,8 @@ impl Parts<'_> {
             stream,
             &mut [
                 op_barrier_sys(),
-                op_add(page.dev_at(TWord::Cnt(row).offset()), 1),
-                op_add(page.dev_at(TWord::Prog.offset()), 1),
+                op_add(page.dev(t, TWord::Cnt(row)), 1),
+                op_add(page.dev(t, TWord::Prog), 1),
             ],
             "cuStreamBatchMemOp_v2 (tier signal)",
         )
@@ -1267,7 +1431,7 @@ fn copy_in(
     bytes: usize,
 ) -> Result<(), GpuError> {
     // SAFETY: both spans are the caller's: `dst` a device buffer of the
-    // tier's context of at least `bytes`, `src` a span of the tier's page
+    // tier's context of at least `bytes`, `src` a span of the tier page
     // inside its allocation; both outlive every graph that captured the copy.
     let rc = unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, bytes, stream.cu_stream()) };
     cu(rc, "cuMemcpyDtoDAsync_v2 (tier stage-in)")
@@ -1275,23 +1439,27 @@ fn copy_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{TIER_PAYLOAD_OFF, TWord, TierLayout, TierSet, TierShape};
-    use crate::host::slots::{HOST, SlotMap, TIER};
+    use super::{TIER_FLAGS, TWord, TierLayout, TierSet, TierShape};
+    use crate::host::slots::{HOST, Slot, SlotMap, TIER};
 
     /// A set's rows are ascending ids below the stack, each once; a map's
-    /// set is its tier entries in tier-slot order, and a layer outside it is
-    /// refused.
+    /// set of a tier is that tier's entries in its slot order, and a layer
+    /// outside it is refused.
     #[test]
     fn a_set_is_the_maps_tier_rows() {
         let rows = vec![0, HOST, TIER, HOST, HOST, TIER, 0, TIER | 1];
         let map = SlotMap::from_rows(3..5, 4, rows).expect("two rows of 4");
-        let set = TierSet::of_map(&map).expect("the map's set");
+        let set = TierSet::of_map(&map, 0).expect("the map's set");
         assert_eq!(set.ids(3), Some(&[2][..]));
         assert_eq!(set.ids(4), Some(&[1, 3][..]));
         assert_eq!(set.on_tier(3).expect("layer 3"), 1);
         assert_eq!(set.on_tier(4).expect("layer 4"), 2);
         assert!(set.on_tier(5).is_err());
         assert_eq!(set.experts(), 3);
+        assert!(
+            TierSet::of_map(&map, 1).is_err(),
+            "a tier the map does not name"
+        );
         let set = TierSet::new(3..5, 8, vec![vec![2, 5], vec![]]).expect("a set");
         assert_eq!(set.on_tier(4).expect("layer 4"), 0);
         assert!(TierSet::new(0..1, 8, vec![vec![3, 3]]).is_err());
@@ -1300,31 +1468,86 @@ mod tests {
         assert!(TierSet::new(0..2, 8, vec![vec![1]]).is_err());
     }
 
-    /// V4.1's tier page: two rows of six slots over 4096 values, the q8_1
-    /// codes of 16 super-blocks (512 u64) and their 32 scales; every field
-    /// apart and inside the page, the flag words each on a line of its own.
+    /// Each tier's set is its own entries alone: tier 1's ids are not tier
+    /// 0's.
+    #[test]
+    fn each_tiers_set_is_its_own() {
+        let t = |tier: usize, slot: u32| Slot::Tier { tier, slot }.entry().expect("a tier slot");
+        let map = SlotMap::from_rows(0..1, 5, vec![t(1, 0), 0, t(0, 0), t(1, 1), HOST])
+            .expect("a row over two tiers");
+        assert_eq!(
+            TierSet::of_map(&map, 0).expect("tier 0").ids(0),
+            Some(&[2][..])
+        );
+        assert_eq!(
+            TierSet::of_map(&map, 1).expect("tier 1").ids(0),
+            Some(&[0, 3][..])
+        );
+    }
+
+    const V41: TierShape = TierShape {
+        hidden: 4096,
+        n_used: 6,
+        rows: 2,
+    };
+
+    /// V4.1's tier page of one tier: two rows of six slots over 4096 values,
+    /// the q8_1 codes of 16 super-blocks (512 u64) and their 32 scales; every
+    /// field apart and inside the page, the flag words each on a line of
+    /// their own — and every offset the one-tier page's: the flag words at
+    /// 0, 64, 128, 192, 256 and 320, the images from byte 512.
     #[test]
     fn v41_tier_page_keeps_its_fields_apart() {
-        let shape = TierShape {
-            hidden: 4096,
-            n_used: 6,
-            rows: 2,
-        };
-        let l = TierLayout::new(shape, 512, 32).expect("V4.1's tier page");
-        let i = l.image();
+        let l = TierLayout::new(V41, 512, 32, 1).expect("V4.1's tier page");
+        let i = l.image(0).expect("tier 0");
         assert_eq!((i.sel, i.q3, i.d8), (0, 64, 64 + 1024));
         assert!(i.sel + i.n_used <= i.q3 && i.q3 + i.q3_words <= i.d8);
+        assert_eq!(l.payload_off(), 512);
         assert!(l.image_off(1) >= l.image_off(0) + 4 * i.words());
         assert!(l.rows_off(0) >= l.image_off(1) + 4 * i.words());
         assert!(l.rows_off(1) >= l.rows_off(0) + 4 * 6 * 4096);
         assert!(l.bytes().unwrap() >= l.rows_off(1) + 4 * 6 * 4096);
-        let mut offs = vec![TWord::Prog.offset(), TWord::Fault.offset()];
+        let mut offs = vec![l.word_off(0, TWord::Prog), l.word_off(0, TWord::Fault)];
         for r in 0..2 {
-            offs.extend([TWord::Go(r).offset(), TWord::Cnt(r).offset()]);
+            offs.extend([l.word_off(0, TWord::Go(r)), l.word_off(0, TWord::Cnt(r))]);
         }
         offs.sort_unstable();
-        assert!(offs.windows(2).all(|w| w[1] - w[0] >= 64));
-        assert!(offs.iter().all(|&o| o + 64 <= TIER_PAYLOAD_OFF));
-        assert!(TierLayout::new(TierShape { rows: 3, ..shape }, 512, 32).is_err());
+        assert_eq!(offs, [0, 64, 128, 192, 256, 320]);
+        assert!(offs.iter().all(|&o| o + 64 <= l.payload_off()));
+        assert!(l.image(1).is_err());
+        assert!(TierLayout::new(TierShape { rows: 3, ..V41 }, 512, 32, 1).is_err());
+        assert!(TierLayout::new(V41, 512, 32, 0).is_err());
+        assert!(TierLayout::new(V41, 512, 32, 9).is_err());
+    }
+
+    /// A page of three tiers: each tier's flag lines its own, past the
+    /// last of them the images; each tier's places apart from every other
+    /// tier's and before the shared activation, which every tier reads at
+    /// one offset.
+    #[test]
+    fn a_page_of_three_tiers_keeps_each_tiers_fields_apart() {
+        let l = TierLayout::new(V41, 512, 32, 3).expect("three tiers");
+        let mut offs = Vec::new();
+        for t in 0..3 {
+            offs.extend([l.word_off(t, TWord::Prog), l.word_off(t, TWord::Fault)]);
+            for r in 0..2 {
+                offs.extend([l.word_off(t, TWord::Go(r)), l.word_off(t, TWord::Cnt(r))]);
+            }
+        }
+        offs.sort_unstable();
+        assert!(offs.windows(2).all(|w| w[1] - w[0] >= 64), "{offs:?}");
+        assert!(offs.iter().all(|&o| o + 64 <= l.payload_off()));
+        assert_eq!(l.word_off(2, TWord::Go(0)), 2 * TIER_FLAGS);
+        let images: Vec<_> = (0..3).map(|t| l.image(t).expect("a tier")).collect();
+        for (t, i) in images.iter().enumerate() {
+            assert_eq!((i.q3, i.d8), (images[0].q3, images[0].d8), "tier {t}");
+            assert!(i.sel + i.n_used <= i.q3, "tier {t}");
+        }
+        assert!(
+            images
+                .windows(2)
+                .all(|w| w[0].sel + w[0].n_used <= w[1].sel)
+        );
+        assert!(l.image(3).is_err());
     }
 }

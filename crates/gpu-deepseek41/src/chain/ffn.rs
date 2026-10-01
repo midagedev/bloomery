@@ -107,7 +107,7 @@ pub use batch::{
     BatchLayer, BlockIo, CardAcc, CardGather, ChunkIo, FfnBatch, FfnBatchKernels, JoinIo, Places,
     TiledGateUp,
 };
-pub use tier::{Ds41Tier, TierPiece};
+pub use tier::{Ds41Tier, STAGE_TIER, TierPiece};
 
 /// What the enqueue path's errors name.
 const ENQUEUE: &str = "FfnPiece::enqueue";
