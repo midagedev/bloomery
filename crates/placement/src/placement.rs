@@ -97,7 +97,7 @@ pub struct ModelTensors {
 /// card ([`Machine::tiers`]), which runs no stage: its `layers` are empty and
 /// `head` and `token_embedding` are false, and the plan refuses a tier that
 /// says otherwise.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Card {
     pub name: String,
     /// What the driver leaves for us.
@@ -142,7 +142,7 @@ impl Card {
 }
 
 /// The host tier: its usable bytes and what is set aside before any tensor.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Host {
     pub usable_bytes: u64,
     /// Fixed reserves, by what they are for.
@@ -152,7 +152,7 @@ pub struct Host {
 /// The devices: the cards in stage order, the expert tier cards and the
 /// host. The NVMe tier has no figure here — it holds its tensors in place and
 /// never loads them.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machine {
     pub cards: Vec<Card>,
     /// Expert tier cards: no stage, only routed experts, planned after every
@@ -782,6 +782,38 @@ pub enum PlacementError {
     /// the token embedding.
     #[error("tier card {card}: {detail}; a tier card runs no stage")]
     Tier { card: String, detail: String },
+    /// Cards of one name — one device, as a plan finds its cards by name —
+    /// whose budgets (each card's usable bytes, under a card budget the
+    /// capped ones) sum past that device's usable bytes: one device's
+    /// budget counted twice.
+    #[error(
+        "card {card}: {cards} plan cards are this one device, and their budgets sum to {budgets} \
+         B, past its usable {usable} B: one device's budget counted twice (a card budget that \
+         splits the device between them is planned)"
+    )]
+    DeviceTwice {
+        card: String,
+        cards: usize,
+        budgets: u64,
+        usable: u64,
+    },
+    /// An expert tier card left with no expert, because the cards before it
+    /// already hold every routed expert of the model: a tier the plan does
+    /// not need.
+    #[error(
+        "tier card {card} (tier {tier}) holds no expert: the cards before it hold every routed \
+         expert of the model; plan without it"
+    )]
+    IdleTier { card: String, tier: usize },
+    /// A draft reserve on a tier the plan does not have.
+    #[error(
+        "the draft's reserve is on tier {on}, and the plan has {tiers} tier cards: the draft's \
+         card is outside the plan"
+    )]
+    DraftOffPlan { on: usize, tiers: usize },
+    /// The tiers' prompt-batch host rows, one set a tier, summed past u64.
+    #[error("{tiers} tier cards' prompt-batch host rows of {bytes} B each pass u64 bytes")]
+    TierBatchHost { tiers: usize, bytes: u64 },
     /// Features of the file the engine does not run yet — every one, each with
     /// the layer it is on, or none for a model-wide one.
     #[error("{} feature(s) of this file are not implemented: {}", .0.len(), unimplemented_list(.0))]
@@ -1462,7 +1494,10 @@ fn capped(card: &Card, budget: Option<u64>) -> u64 {
 /// `card_budget`, every card plans
 /// with `min(usable, budget)` usable bytes, and a card whose dense tensors,
 /// KV, context, scratch and margin pass that is refused
-/// ([`PlacementError::CardBudgetFloor`]).
+/// ([`PlacementError::CardBudgetFloor`]). Cards of one name whose budgets sum
+/// past that device's usable bytes ([`PlacementError::DeviceTwice`]) and a
+/// tier left with nothing to hold ([`PlacementError::IdleTier`]) are refused
+/// too.
 pub fn plan_with<'a>(
     model: &'a ModelTensors,
     machine: &'a Machine,
@@ -1583,6 +1618,7 @@ fn plan_rule<'a>(
         }
     }
     check_tiers(&machine.tiers)?;
+    check_devices(machine, card_budget)?;
     let mut n_l = vec![0u64; model.layers];
     let none_held = vec![0u64; model.layers];
     let mut kv_bytes = Vec::with_capacity(machine.cards.len() + machine.tiers.len());
@@ -1629,6 +1665,15 @@ fn plan_rule<'a>(
         };
         let mut own = vec![0u64; model.layers];
         fill.run(&mut own, &held)?;
+        let left = (0..model.layers)
+            .filter(|&l| !stacks[l].is_empty())
+            .any(|l| held[l] < model.experts);
+        if !left && own.iter().all(|&n| n == 0) {
+            return Err(PlacementError::IdleTier {
+                card: tier.name.clone(),
+                tier: t,
+            });
+        }
         tier_n_l.push(own);
         kv_bytes.push((kv_tier, shadow));
     }
@@ -1701,6 +1746,35 @@ fn check_tiers(tiers: &[Card]) -> Result<(), PlacementError> {
             card: t.name.clone(),
             detail,
         });
+    }
+    Ok(())
+}
+
+/// Refuse cards of one name (one device) whose budgets under
+/// `card_budget` sum past the device's usable bytes
+/// ([`PlacementError::DeviceTwice`]).
+fn check_devices(machine: &Machine, card_budget: Option<u64>) -> Result<(), PlacementError> {
+    let cards: Vec<&Card> = machine.all_cards().collect();
+    for (i, card) in cards.iter().enumerate() {
+        if cards[..i].iter().any(|c| c.name == card.name) {
+            continue;
+        }
+        let same: Vec<&&Card> = cards.iter().filter(|c| c.name == card.name).collect();
+        if same.len() < 2 {
+            continue;
+        }
+        let usable = same.iter().map(|c| c.usable_bytes).max().unwrap_or(0);
+        let budgets = same
+            .iter()
+            .try_fold(0u64, |sum, c| sum.checked_add(capped(c, card_budget)));
+        if budgets.is_none_or(|b| b > usable) {
+            return Err(PlacementError::DeviceTwice {
+                card: card.name.clone(),
+                cards: same.len(),
+                budgets: budgets.unwrap_or(u64::MAX),
+                usable,
+            });
+        }
     }
     Ok(())
 }
@@ -2056,6 +2130,152 @@ mod tests {
             refused([true, true]),
             "2 cards hold the token embedding, not one"
         );
+    }
+
+    /// A model of `layers` layers, each one routed q4_K stack of 8 experts of
+    /// four 256-value rows (576 B an expert), with a q8_0 token embedding and
+    /// head of 16 rows (4,352 B).
+    fn layered(layers: usize) -> ModelTensors {
+        let tensor = |name: String, layer, role, ty: GgmlType, rows: &[u64]| {
+            let mut dims = vec![256];
+            dims.extend_from_slice(rows);
+            let blocks = 256 / ty.blck_size().expect("a sized type");
+            ModelTensor {
+                name,
+                shard: 0,
+                layer,
+                role,
+                ty,
+                dims,
+                file_bytes: ty.type_size().expect("a sized type")
+                    * blocks
+                    * rows.iter().product::<u64>(),
+                gathered_rows: (role == Role::TokenEmbedding).then_some(1),
+            }
+        };
+        let mut tensors = vec![tensor(
+            "embedding".into(),
+            None,
+            Role::TokenEmbedding,
+            GgmlType::Q8_0,
+            &[16],
+        )];
+        for l in 0..layers {
+            tensors.push(tensor(
+                format!("experts {l}"),
+                Some(l),
+                Role::RoutedExperts,
+                GgmlType::Q4_K,
+                &[4, 8],
+            ));
+        }
+        tensors.push(tensor(
+            "head".into(),
+            None,
+            Role::Head,
+            GgmlType::Q8_0,
+            &[16],
+        ));
+        ModelTensors {
+            tensors,
+            layers,
+            experts: 8,
+            experts_used: 2,
+        }
+    }
+
+    struct NoKv;
+
+    impl KvBytes for NoKv {
+        fn layer_bytes(&self, _layer: usize, _ctx_max: u64) -> u64 {
+            0
+        }
+    }
+
+    const HEAD: u64 = 4_352;
+    const EXPERT: u64 = 576;
+
+    /// A card of `usable` bytes and nothing else set aside.
+    fn bytes_card(name: &str, usable: u64, layers: Range<usize>) -> Card {
+        Card {
+            usable_bytes: usable,
+            ..card(name, layers.clone(), !layers.is_empty(), false)
+        }
+    }
+
+    fn host() -> Host {
+        Host {
+            usable_bytes: 1 << 40,
+            reserves: Vec::new(),
+        }
+    }
+
+    /// A tier after a stage card that holds every expert is refused by name;
+    /// a tier with experts left to take, one whose budget leaves it none
+    /// while the host keeps the rest, and one beside a planner that puts
+    /// every routed stack on the host plan.
+    #[test]
+    fn a_tier_with_nothing_left_is_refused() {
+        let model = layered(3);
+        let machine = |stage: u64, tier: u64| Machine {
+            cards: vec![bytes_card("stage", HEAD + stage * EXPERT, 0..3)],
+            tiers: vec![bytes_card("tier", tier * EXPERT, 0..0)],
+            host: host(),
+        };
+        let whole = machine(24, 4);
+        match plan_with(&model, &whole, 4096, &NoKv, None) {
+            Err(e @ PlacementError::IdleTier { .. }) => assert_eq!(
+                e.to_string(),
+                "tier card tier (tier 0) holds no expert: the cards before it hold every routed \
+                 expert of the model; plan without it"
+            ),
+            Err(e) => panic!("{e}, not IdleTier"),
+            Ok(_) => panic!("the idle tier was planned"),
+        }
+        let part = machine(5, 4);
+        let plan = plan_with(&model, &part, 4096, &NoKv, None).expect("a tier with work");
+        assert_eq!(plan.tier_n_l, vec![vec![1, 1, 2]]);
+        let small = machine(5, 0);
+        let plan = plan_with(&model, &small, 4096, &NoKv, None).expect("a tier too small");
+        assert_eq!(plan.tier_n_l, vec![vec![0, 0, 0]]);
+        assert!(plan.host.experts > 0);
+        let plan = plan_host_routed(&model, &whole, 4096, &NoKv, &PlanLevers::default())
+            .expect("every stack on the host");
+        assert_eq!(plan.host.experts, 24);
+    }
+
+    /// Two plan cards of one name are one device: their budgets past its
+    /// usable bytes are refused by name, and a card budget that splits the
+    /// device between them plans.
+    #[test]
+    fn one_device_counted_twice_is_refused() {
+        let model = layered(3);
+        let usable = HEAD + 24 * EXPERT;
+        let machine = Machine {
+            cards: vec![bytes_card("dev", usable, 0..3)],
+            tiers: vec![bytes_card("dev", usable, 0..0)],
+            host: host(),
+        };
+        match plan_with(&model, &machine, 4096, &NoKv, None) {
+            Err(e @ PlacementError::DeviceTwice { .. }) => assert_eq!(
+                e.to_string(),
+                format!(
+                    "card dev: 2 plan cards are this one device, and their budgets sum to {} B, \
+                     past its usable {usable} B: one device's budget counted twice (a card \
+                     budget that splits the device between them is planned)",
+                    2 * usable
+                )
+            ),
+            Err(e) => panic!("{e}, not DeviceTwice"),
+            Ok(_) => panic!("one device was planned twice"),
+        }
+        let half = usable / 2;
+        let plan = plan_with(&model, &machine, 4096, &NoKv, Some(half)).expect("split budgets");
+        assert!(plan.tier_n_l[0].iter().sum::<u64>() > 0);
+        assert!(matches!(
+            plan_with(&model, &machine, 4096, &NoKv, Some(half + 1)),
+            Err(PlacementError::DeviceTwice { cards: 2, .. })
+        ));
     }
 
     /// The list type itself: sorted on construction, duplicates and ids past

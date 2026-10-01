@@ -2,10 +2,10 @@
 //! its timing ruler: `generate`'s shape over `bloomery_gpu_deepseek41::body`.
 //!
 //!     generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N]
-//!                   [--ctx C] [--place a|gate|bp] [--mode eager|graph]
+//!                   [--ctx C] [--place PLACE] [--mode eager|graph]
 //!                   [--time [--warm W]] [--plan] [--logits]
 //!     generate_ds41 --arm SPEC [--arm SPEC ...] [--arm-sync] [-n N] [--ctx C]
-//!                   [--place a|gate|bp] [--mode eager|graph] [--time [--warm W]]
+//!                   [--place PLACE] [--mode eager|graph] [--time [--warm W]]
 //!                   [--logits]
 //!     generate_ds41 --records-schema
 //!
@@ -45,7 +45,12 @@
 //! call under `bp` is fed as `BLOOMERY_PREFILL` says, as under `a`, the tier
 //! serving its experts' slots of each batch. The `load` line's `cards=`
 //! names every card the placement loaded and, under `bp`, the tier's experts
-//! and resident bytes (`tier_experts=`, `tier_bytes=`). A lost tier card (it
+//! and resident bytes (`tier_experts=`, `tier_bytes=`). `PLACE` may also be
+//! a card list `<stage>[+<tier>…]` of `workstation::CARDS` names
+//! (`generate::Place`): `a6000+3090` is `bp`, `a6000` is `a`, `3090` is
+//! `gate`; a list whose stage card is not the A6000 (no gate runs another
+//! stage) and a list of more tier cards than the V4.1 body serves are refused
+//! by name before any plan. A lost tier card (it
 //! stops signalling within the go deadline) is the step's or the call's named
 //! error and ends the run with a nonzero exit. The card is found by name, so
 //! the box's card pin decides which placements can load. The ring
@@ -286,7 +291,8 @@ mod drive {
     use crate::{dspark, finite, place, split};
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
-                         [-n N] [--ctx C] [--place a|gate|bp] [--mode eager|graph] \
+                         [-n N] [--ctx C] [--place a|gate|bp|<stage>[+<tier>…]] \
+                         [--mode eager|graph] \
                          [--time [--warm W]] [--plan] [--logits], or --arm SPEC [--arm SPEC ...] \
                          [--arm-sync] in place of the prompt flags";
 
@@ -426,7 +432,7 @@ mod drive {
                 "-n" => a.n_gen = v.parse()?,
                 "--ctx" => a.ctx = v.parse()?,
                 "--warm" => a.warm = Some(v.parse()?),
-                "--place" => a.place = Place::parse(&v)?,
+                "--place" => a.place = place::parse(&v)?,
                 "--mode" => {
                     a.mode = match v.as_str() {
                         "graph" => StepMode::Graph,

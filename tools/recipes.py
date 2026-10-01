@@ -5626,7 +5626,7 @@ def self_test() -> int:
     # records.py, which loads the schema (the scan reaches records.py by routes.py's chain of tools)
     weeklies = [n for n in recipes if n.startswith(WEEKLY_PREFIX)]
     schema = sel("tools/bloomery/schema/generate_ds41.jsonl") | {n for n in weeklies if graph.inputs(n).match("tools/bloomery/schema/generate_ds41.jsonl")}
-    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    expect(schema == {"gate-gpu-gates-lib", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
     for n in ("check", "lint"):
         expect(graph.inputs(n).match("tools/levers-direct.txt") is not None, f"{n} (--all-targets) does not read tools/levers-direct.txt")
 

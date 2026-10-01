@@ -1019,6 +1019,13 @@ gate-gpu-ds41-lib:
 gate-ds41-bind:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- bind::'
 
+# The V4.1 binaries' `--place` word (`generate::Place`, behind the deepseek41 feature like bind): each alias and its card
+# list (`a6000+3090` is `bp`) planning the machine its plan function makes, a list word planning its own cards, and every
+# refusal by name before any plan. Host only, no card or gate lock.
+[group('host')]
+gate-ds41-place:
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- generate::'
+
 # ik의 KLD 기준 파일(ik-ppl --kld-base)이 그것을 쓴 실행과 맞는지 본다: 헤더의 ctx·청크 수와 파일 크기가 실행의 결과
 # 줄과 같고, 기록마다 ik 양자화기가 쓸 수 있는 모양이며, 파일에서 다시 잰 PPL이 실행이 찍은 PPL과 양자화 밴드 안에서
 # 같다. 기본은 kldbase-c2048x4와 kldbase-c512x16이다. 어휘 수를 모델 파일에서 읽으므로 V4.1 프로필로 돈다. 호스트

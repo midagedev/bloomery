@@ -4,8 +4,13 @@
 //! ds41` are each one call of [`run`], which takes the process's arguments
 //! (`--model` already taken out by the one-binary server).
 //!
-//!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place a|gate|bp]
+//!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place PLACE]
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
+//!
+//! `PLACE` is `a`, `gate`, `bp` or a card list `<stage>[+<tier>…]`
+//! (`generate::Place`, as `generate_ds41` takes it); a list whose stage card
+//! is not the A6000 and a list of more tier cards than the V4.1 body serves
+//! are refused by name before any plan.
 //!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
 //! the chat template (`tokenizer.chat_template`) and the default alias
@@ -122,8 +127,9 @@ use tokenizer::Tokenizer;
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
 
-const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] [--place a|gate|bp] \
-                     [--ctx C] [--alias NAME] [--cache-ram MIB]";
+const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
+                     [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
+                     [--cache-ram MIB]";
 
 /// The token V4.1's chat template opens every user and tool message with.
 pub const USER_START: &str = "<｜User｜>";
@@ -170,7 +176,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         match flag {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = v.parse()?,
-            "--place" => a.place = Place::parse(v)?,
+            "--place" => a.place = place::parse(v)?,
             "--ctx" => a.ctx = v.parse()?,
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => {

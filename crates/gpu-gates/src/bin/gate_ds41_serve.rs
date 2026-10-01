@@ -356,6 +356,13 @@ mod gate {
                         )
                         .into());
                     }
+                    other => {
+                        return Err(format!(
+                            "--place {}: this gate runs the server under gate or bp: {USAGE}",
+                            other.name()
+                        )
+                        .into());
+                    }
                 },
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }

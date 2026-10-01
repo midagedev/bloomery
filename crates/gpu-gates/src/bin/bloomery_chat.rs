@@ -168,7 +168,7 @@ mod drive {
                     false
                 }
                 "--place" => {
-                    a.place = Place::parse(&v)?;
+                    a.place = place::parse(&v)?;
                     false
                 }
                 "--ctx" => {

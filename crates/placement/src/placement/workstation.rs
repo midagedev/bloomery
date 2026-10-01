@@ -9,13 +9,13 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Range;
 
-use super::{Card, Host, Machine, Plan};
+use super::{Card, Host, Machine, PlacementError, Plan};
 
 pub const MIB: u64 = 1 << 20;
 
 /// One card as `nvidia-smi` reports it with no process on it [measured]: its
 /// memory and the part the driver keeps.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardSpec {
     /// The name a plan gives the card; the CUDA device name contains it.
     pub name: &'static str,
@@ -44,6 +44,10 @@ pub const RTX_3090: CardSpec = CardSpec {
     total_bytes: 24_576 * MIB,
     driver_reserve_bytes: 400 * MIB,
 };
+
+/// Every card a plan here names, one device each: the cards a `--place`
+/// word lists ([`word_cards`]) and [`spec_of`] finds.
+pub const CARDS: [CardSpec; 2] = [A6000, RTX_3090];
 
 /// Per card: the CUDA context and the m = 1 scratch [assumed], and the margin
 /// the expert rule leaves free.
@@ -115,14 +119,20 @@ pub fn host() -> Host {
     }
 }
 
-/// Design §5 (a): the A6000 runs all `layers` and the head; the 3090 is idle.
+/// `spec` runs all `layers` and the head, beside the host tier alone.
 #[must_use]
-pub fn plan_a(layers: usize) -> Machine {
+pub fn plan_on(spec: CardSpec, layers: usize) -> Machine {
     Machine {
-        cards: vec![card(A6000, 0..layers, true)],
+        cards: vec![card(spec, 0..layers, true)],
         tiers: Vec::new(),
         host: host(),
     }
+}
+
+/// Design §5 (a): the A6000 runs all `layers` and the head; the 3090 is idle.
+#[must_use]
+pub fn plan_a(layers: usize) -> Machine {
+    plan_on(A6000, layers)
 }
 
 /// Design §5 (b): the A6000 runs the layers below [`CUT`], the 3090 the rest
@@ -255,22 +265,196 @@ pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> T
 /// (`model::arch::dspark::card_bytes`), when the draft lives there — as a
 /// named reserve, and the tier's prompt-batch service `batch`
 /// ([`tier_batch_bytes`]) as named reserves on the tier and the host.
+/// It is [`plan_tiers`] of the A6000 over the one tier card, the 3090.
 #[must_use]
 pub fn plan_bp(layers: usize, draft_bytes: Option<u64>, batch: TierBatchBytes) -> Machine {
-    let mut t = tier(RTX_3090);
-    t.reserves
-        .extend(draft_bytes.map(|b| (DRAFT_RESERVE.to_string(), b)));
-    t.reserves
-        .push((TIER_BATCH_RESERVE.to_string(), batch.card()));
+    let draft = draft_bytes.map(|bytes| TierDraft { on: 0, bytes });
+    tiered(layers, A6000, &[RTX_3090], draft, batch, batch.host)
+}
+
+/// A draft model's resident bytes on one of plan (b′)'s tier cards: the
+/// tier's index in the plan's tier list, and the bytes its plan reserves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierDraft {
+    pub on: usize,
+    pub bytes: u64,
+}
+
+/// Plan (b′) over `tiers`: `stage` runs all `layers` and the head as in
+/// [`plan_on`]; each tier card, in order, is an expert tier beside the host
+/// holding each layer's next ids after the cards before it
+/// ([`super::Machine::tiers`]), with the prompt-batch service `batch`
+/// ([`tier_batch_bytes`]) reserved on it, and `draft` on the tier it names;
+/// the host reserves the batch's rows once per tier. A card listed twice
+/// ([`PlacementError::DeviceTwice`]) and a draft on a tier past the list
+/// ([`PlacementError::DraftOffPlan`]) are refused ([`check_tiers`]). With no
+/// tier it is [`plan_on`].
+pub fn plan_tiers(
+    layers: usize,
+    stage: CardSpec,
+    tiers: &[CardSpec],
+    draft: Option<TierDraft>,
+    batch: TierBatchBytes,
+) -> Result<Machine, PlacementError> {
+    let host_rows = check_tiers(stage, tiers, draft, batch)?;
+    Ok(tiered(layers, stage, tiers, draft, batch, host_rows))
+}
+
+/// What [`plan_tiers`] refuses of its cards, before any layer count: a card
+/// listed twice — one device, whose usable bytes the plan would count once a
+/// listing — and a draft on a tier past the list. Returns the host's
+/// prompt-batch rows, one set a tier.
+pub fn check_tiers(
+    stage: CardSpec,
+    tiers: &[CardSpec],
+    draft: Option<TierDraft>,
+    batch: TierBatchBytes,
+) -> Result<u64, PlacementError> {
+    let all: Vec<CardSpec> = std::iter::once(stage)
+        .chain(tiers.iter().copied())
+        .collect();
+    for (i, spec) in all.iter().enumerate() {
+        let n = all.iter().filter(|s| s.name == spec.name).count();
+        if n > 1 && !all[..i].iter().any(|s| s.name == spec.name) {
+            let usable = spec.usable_bytes();
+            return Err(PlacementError::DeviceTwice {
+                card: spec.name.to_string(),
+                cards: n,
+                budgets: u64::try_from(n)
+                    .ok()
+                    .and_then(|n| usable.checked_mul(n))
+                    .unwrap_or(u64::MAX),
+                usable,
+            });
+        }
+    }
+    if let Some(d) = draft.filter(|d| d.on >= tiers.len()) {
+        return Err(PlacementError::DraftOffPlan {
+            on: d.on,
+            tiers: tiers.len(),
+        });
+    }
+    u64::try_from(tiers.len())
+        .ok()
+        .and_then(|k| batch.host.checked_mul(k))
+        .ok_or(PlacementError::TierBatchHost {
+            tiers: tiers.len(),
+            bytes: batch.host,
+        })
+}
+
+/// [`plan_tiers`]'s machine once [`check_tiers`] passed, `host_rows` its
+/// sum.
+fn tiered(
+    layers: usize,
+    stage: CardSpec,
+    tiers: &[CardSpec],
+    draft: Option<TierDraft>,
+    batch: TierBatchBytes,
+    host_rows: u64,
+) -> Machine {
+    let tiers: Vec<Card> = tiers
+        .iter()
+        .enumerate()
+        .map(|(i, &spec)| {
+            let mut t = tier(spec);
+            t.reserves.extend(
+                draft
+                    .filter(|d| d.on == i)
+                    .map(|d| (DRAFT_RESERVE.to_string(), d.bytes)),
+            );
+            t.reserves
+                .push((TIER_BATCH_RESERVE.to_string(), batch.card()));
+            t
+        })
+        .collect();
     let mut h = host();
-    h.reserves
-        .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
+    if !tiers.is_empty() {
+        h.reserves
+            .push((TIER_BATCH_HOST_RESERVE.to_string(), host_rows));
+    }
     Machine {
-        cards: vec![card(A6000, 0..layers, true)],
-        tiers: vec![t],
+        cards: vec![card(stage, 0..layers, true)],
+        tiers,
         host: h,
     }
 }
+
+/// The cards a `--place` list word names: `<stage>[+<tier>…]`, each a
+/// [`CARDS`] name in any ASCII case, the stage card first and the tier cards
+/// in tier order (`a6000+3090` is plan (b′)'s). A word of more than
+/// `max_tiers` tier cards, a name no card has and a card named twice are
+/// refused by name, in that order.
+pub fn word_cards(word: &str, max_tiers: usize) -> Result<Vec<CardSpec>, WordError> {
+    let names: Vec<&str> = word.split('+').collect();
+    if names.len() - 1 > max_tiers {
+        return Err(WordError::TooManyTiers {
+            word: word.to_string(),
+            tiers: names.len() - 1,
+            max: max_tiers,
+        });
+    }
+    let mut specs: Vec<CardSpec> = Vec::with_capacity(names.len());
+    for name in names {
+        let spec = CARDS
+            .into_iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| WordError::UnknownCard {
+                word: word.to_string(),
+                name: name.to_string(),
+            })?;
+        if specs.contains(&spec) {
+            return Err(WordError::CardTwice {
+                word: word.to_string(),
+                card: spec.name,
+            });
+        }
+        specs.push(spec);
+    }
+    Ok(specs)
+}
+
+/// A `--place` list word [`word_cards`] refuses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WordError {
+    TooManyTiers {
+        word: String,
+        tiers: usize,
+        max: usize,
+    },
+    UnknownCard {
+        word: String,
+        name: String,
+    },
+    CardTwice {
+        word: String,
+        card: &'static str,
+    },
+}
+
+impl fmt::Display for WordError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = CARDS.iter().map(|c| c.name).collect();
+        match self {
+            WordError::TooManyTiers { word, tiers, max } => write!(
+                f,
+                "{word} names {tiers} tier cards, past the {max} a plan's slot map can name"
+            ),
+            WordError::UnknownCard { word, name } => write!(
+                f,
+                "{word} names the card {name:?}, which is none of this workstation's cards \
+                 {names:?}"
+            ),
+            WordError::CardTwice { word, card } => write!(
+                f,
+                "{word} names the card {card} twice: a plan finds each card by its name, one \
+                 device each"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WordError {}
 
 /// The gate placement: the 3090 runs all `layers` and the head, so the V4.1
 /// body gates run on the gate card while the A6000 takes timing runs. Its
@@ -279,17 +463,13 @@ pub fn plan_bp(layers: usize, draft_bytes: Option<u64>, batch: TierBatchBytes) -
 /// margin arithmetic as [`plan_a`]'s card.
 #[must_use]
 pub fn plan_gate(layers: usize) -> Machine {
-    Machine {
-        cards: vec![card(RTX_3090, 0..layers, true)],
-        tiers: Vec::new(),
-        host: host(),
-    }
+    plan_on(RTX_3090, layers)
 }
 
 /// The card spec a plan's card is named after.
 #[must_use]
 pub fn spec_of(card: &Card) -> Option<CardSpec> {
-    [A6000, RTX_3090].into_iter().find(|s| s.name == card.name)
+    CARDS.into_iter().find(|s| s.name == card.name)
 }
 
 /// The one visible device a plan's card `card` runs on: the index in `seen`
@@ -493,8 +673,208 @@ pub fn mem_available(meminfo: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, CardNotInView, HostNeed, RTX_3090, card_on_host, mem_available, tier_batch_bytes,
+        A6000, CardNotInView, CardSpec, DRAFT_RESERVE, HostNeed, Machine, PlacementError, RTX_3090,
+        TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, WordError, card,
+        card_on_host, host, mem_available, plan_a, plan_bp, plan_gate, plan_tiers, tier,
+        tier_batch_bytes, word_cards,
     };
+
+    /// Plan (a), the gate plan and plan (b′) as their own bodies built them
+    /// before [`plan_tiers`]: the references the refactored plans must equal
+    /// field for field.
+    fn base_one(spec: CardSpec, layers: usize) -> Machine {
+        Machine {
+            cards: vec![card(spec, 0..layers, true)],
+            tiers: Vec::new(),
+            host: host(),
+        }
+    }
+
+    fn base_bp(layers: usize, draft_bytes: Option<u64>, batch: TierBatchBytes) -> Machine {
+        let mut t = tier(RTX_3090);
+        t.reserves
+            .extend(draft_bytes.map(|b| (DRAFT_RESERVE.to_string(), b)));
+        t.reserves
+            .push((TIER_BATCH_RESERVE.to_string(), batch.card()));
+        let mut h = host();
+        h.reserves
+            .push((TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
+        Machine {
+            cards: vec![card(A6000, 0..layers, true)],
+            tiers: vec![t],
+            host: h,
+        }
+    }
+
+    /// Every layer count and batch the plans are built with (V4.1's 43
+    /// layers and its tier batch, GLM-5.3-Flash's and Qwen3.8's shapes, and
+    /// edge counts), with and without a draft: `plan_a`, `plan_gate` and
+    /// `plan_bp` equal the bodies they had, and `plan_tiers` of the same
+    /// cards equals each.
+    #[test]
+    fn plan_tiers_is_plan_bp_a_and_gate() {
+        let batches = [
+            tier_batch_bytes(5120, 2304, 6, 512),
+            tier_batch_bytes(4096, 1536, 8, 512),
+            tier_batch_bytes(2048, 768, 8, 4096),
+            TierBatchBytes {
+                staging: 1,
+                scratch: 2,
+                host: 3,
+            },
+        ];
+        for layers in [0, 1, 20, 43, 47, 48, 61, 78] {
+            assert_eq!(plan_a(layers), base_one(A6000, layers));
+            assert_eq!(plan_gate(layers), base_one(RTX_3090, layers));
+            for batch in batches {
+                let tiers = plan_tiers(layers, A6000, &[], None, batch).expect("no tier");
+                assert_eq!(tiers, plan_a(layers));
+                let tiers = plan_tiers(layers, RTX_3090, &[], None, batch).expect("no tier");
+                assert_eq!(tiers, plan_gate(layers));
+                for draft in [None, Some(1), Some(1_843_200_000), Some(u64::MAX)] {
+                    let base = base_bp(layers, draft, batch);
+                    assert_eq!(plan_bp(layers, draft, batch), base, "{layers} {draft:?}");
+                    let on = draft.map(|bytes| TierDraft { on: 0, bytes });
+                    let tiers = plan_tiers(layers, A6000, &[RTX_3090], on, batch)
+                        .unwrap_or_else(|e| panic!("{layers} {draft:?}: {e}"));
+                    assert_eq!(tiers, base, "{layers} {draft:?}");
+                }
+            }
+        }
+    }
+
+    /// `plan_tiers` refuses a card listed twice and a draft on a tier past
+    /// the list by name; the 3090 as the stage with the A6000 its tier plans.
+    #[test]
+    fn plan_tiers_refuses_by_name() {
+        let batch = tier_batch_bytes(5120, 2304, 6, 512);
+        let draft = |on| Some(TierDraft { on, bytes: 7 });
+        match plan_tiers(43, A6000, &[A6000], None, batch) {
+            Err(PlacementError::DeviceTwice {
+                card,
+                cards,
+                budgets,
+                usable,
+            }) => {
+                assert_eq!((card.as_str(), cards), (A6000.name, 2));
+                assert_eq!(
+                    (budgets, usable),
+                    (2 * A6000.usable_bytes(), A6000.usable_bytes())
+                );
+            }
+            other => panic!("{other:?}, not DeviceTwice"),
+        }
+        assert!(matches!(
+            plan_tiers(43, A6000, &[RTX_3090, RTX_3090], None, batch),
+            Err(PlacementError::DeviceTwice { cards: 2, .. })
+        ));
+        match plan_tiers(43, A6000, &[RTX_3090], draft(1), batch) {
+            Err(e @ PlacementError::DraftOffPlan { on: 1, tiers: 1 }) => assert_eq!(
+                e.to_string(),
+                "the draft's reserve is on tier 1, and the plan has 1 tier cards: the draft's \
+                 card is outside the plan"
+            ),
+            other => panic!("{other:?}, not DraftOffPlan"),
+        }
+        assert!(matches!(
+            plan_tiers(43, A6000, &[], draft(0), batch),
+            Err(PlacementError::DraftOffPlan { on: 0, tiers: 0 })
+        ));
+        let swapped = plan_tiers(43, RTX_3090, &[A6000], draft(0), batch).expect("3090+a6000");
+        assert_eq!(swapped.cards[0].name, RTX_3090.name);
+        assert_eq!(swapped.tiers.len(), 1);
+        assert_eq!(swapped.tiers[0].name, A6000.name);
+        assert_eq!(swapped.tiers[0].reserve_bytes(), 7 + batch.card());
+    }
+
+    /// The host reserves the prompt batch's rows once per tier, in one row.
+    #[test]
+    fn plan_tiers_sums_the_host_rows_per_tier() {
+        // Two tier specs of other names: the workstation has two cards, and
+        // the rule is the sum over however many tiers a plan lists.
+        let t1 = CardSpec {
+            name: "t1",
+            ..RTX_3090
+        };
+        let t2 = CardSpec {
+            name: "t2",
+            ..RTX_3090
+        };
+        let batch = TierBatchBytes {
+            staging: 10,
+            scratch: 5,
+            host: 100,
+        };
+        let m = plan_tiers(4, A6000, &[t1, t2], None, batch).expect("two tiers");
+        let rows: Vec<&(String, u64)> = m
+            .host
+            .reserves
+            .iter()
+            .filter(|(n, _)| n == TIER_BATCH_HOST_RESERVE)
+            .collect();
+        assert_eq!(rows, vec![&(TIER_BATCH_HOST_RESERVE.to_string(), 200)]);
+        assert!(m.tiers.iter().all(|t| t.reserve_bytes() == 15));
+        let huge = TierBatchBytes {
+            host: u64::MAX / 2 + 1,
+            ..batch
+        };
+        assert!(matches!(
+            plan_tiers(4, A6000, &[t1, t2], None, huge),
+            Err(PlacementError::TierBatchHost { tiers: 2, .. })
+        ));
+    }
+
+    /// The list word: names in any case, the stage first; more tiers than
+    /// the slot map names, a name no card has and a card named twice are
+    /// refused by name, the count first.
+    #[test]
+    fn word_cards_reads_the_list_word() {
+        assert_eq!(word_cards("a6000+3090", 8), Ok(vec![A6000, RTX_3090]));
+        assert_eq!(word_cards("A6000+3090", 8), Ok(vec![A6000, RTX_3090]));
+        assert_eq!(word_cards("3090+a6000", 8), Ok(vec![RTX_3090, A6000]));
+        assert_eq!(word_cards("3090", 8), Ok(vec![RTX_3090]));
+        assert_eq!(word_cards("a6000", 0), Ok(vec![A6000]));
+        let many = ["a6000"; 10].join("+");
+        assert_eq!(
+            word_cards(&many, 8),
+            Err(WordError::TooManyTiers {
+                word: many.clone(),
+                tiers: 9,
+                max: 8
+            })
+        );
+        assert!(matches!(
+            word_cards("a6000+3090", 0),
+            Err(WordError::TooManyTiers {
+                tiers: 1,
+                max: 0,
+                ..
+            })
+        ));
+        for (word, name) in [("a6000+4090", "4090"), ("b", "b"), ("a6000+", "")] {
+            assert_eq!(
+                word_cards(word, 8),
+                Err(WordError::UnknownCard {
+                    word: word.to_string(),
+                    name: name.to_string()
+                }),
+                "{word}"
+            );
+        }
+        assert_eq!(
+            word_cards("3090+3090", 8),
+            Err(WordError::CardTwice {
+                word: "3090+3090".to_string(),
+                card: RTX_3090.name
+            })
+        );
+        let e = word_cards("a6000+A6000", 8).expect_err("twice");
+        assert_eq!(
+            e.to_string(),
+            "a6000+A6000 names the card A6000 twice: a plan finds each card by its name, one \
+             device each"
+        );
+    }
 
     /// V4.1's tier batch at the host union's 512 columns: the allocation
     /// sizes of the tier's staging and tile scratch, summed by hand.
