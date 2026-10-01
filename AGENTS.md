@@ -229,6 +229,8 @@ A quiet agent is a symptom: the first suspect is a hung gate on the box.
   seats, placement sizing, drafts, residency glue) has one common owner. A model's own code holds only what an
   architecture fact forces (tensor shapes, the recurrent state, the attention kind, the quant), and its spec names that
   fact. A per-model copy of shared logic stays only for a large measured speed gain, named in the code beside it.
+  Lift what two models already do the same way, not what a future model might need. A common owner that grows a
+  branch, flag or trait method per model is the wrong cut; the model-specific part goes back to the model.
 - **Code shape** is judged by `docs/rust-quality.md` (R1–R29); review reports cite rule numbers.
 - **Comments state what is true now.** Keep `// SAFETY:` (the invariant), one line of why for a non-obvious choice,
   "this order is the gate" on a load-bearing float reduction, a caller's contract. Remove issue numbers, dates, measured
