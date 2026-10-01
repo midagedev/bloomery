@@ -9,6 +9,14 @@
 //! and its parts timed sets a [`LegTimer`] on its leg
 //! ([`BatchLeg::set_timer`]) — the architecture's adapter; without one the
 //! leg runs the exchange alone.
+//! A batch walk may hold several units (a prompt group's batches): the
+//! port's two exchange sets are taken in turn by its downloads, serves and
+//! uploads, a serve taking the oldest download not served, so the walk's
+//! order — the next item's front ahead of this item's serve — keeps at most
+//! two layer-batches in flight. The leg's one `hsum` holds one item's sums
+//! at a time: item `x + 1`'s upload is enqueued after item `x`'s back read
+//! them (`runtime::sched`'s batch order puts `x`'s back before `x + 1`'s
+//! serve and, for a tiered layer, before `x + 1`'s join).
 //! A batch walk whose layer's card sum reads the tier's rows (GLM) leaves
 //! the upload to its join ([`BatchLeg::join_tiered`]): the serve does not
 //! upload a tier layer, and the join settles the tiers, enqueues the sum over
@@ -80,7 +88,7 @@ pub struct ServeNote {
     pub layer: usize,
     /// The served unit of the walk.
     pub unit: usize,
-    /// The open walk's columns.
+    /// The served unit's columns.
     pub cols: usize,
     /// Host slots the union listed.
     pub slots: u64,
@@ -125,6 +133,45 @@ pub trait LegTimer {
     fn end_walk(&mut self) -> Result<(), GpuError>;
 }
 
+/// `at`'s exchange key over `cols` columns: the unit the batch's label
+/// within its group ([`BatchKey::set`]), its tokens `0 .. cols`.
+fn batch_key(at: At, cols: usize) -> BatchKey {
+    BatchKey {
+        layer: at.layer,
+        set: at.unit,
+        at: 0,
+        u: cols,
+    }
+}
+
+/// What [`BatchLeg`]'s [`Port::open`] refuses by name: no unit, a walk's
+/// columns outside `1..=cap`, or units' own columns (`unit_cols`) that are not
+/// one entry a unit, each in `1..=` the walk's columns.
+fn refuse_open(o: Overlap, cap: usize, unit_cols: Option<&[usize]>) -> Result<(), GpuError> {
+    if o.units == 0 || !(1..=cap).contains(&o.cols) {
+        return Err(GpuError::Shape {
+            what: WHAT_BATCH,
+            detail: format!(
+                "{} units of {} columns; the batch leg walks one unit or more of 1..={cap} \
+                 columns",
+                o.units, o.cols
+            ),
+        });
+    }
+    if let Some(c) = unit_cols
+        && (c.len() != o.units || c.iter().any(|&n| !(1..=o.cols).contains(&n)))
+    {
+        return Err(GpuError::Shape {
+            what: WHAT_BATCH,
+            detail: format!(
+                "units of {c:?} columns for a walk of {} units of up to {} columns",
+                o.units, o.cols
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// `d` in whole nanoseconds, saturating.
 fn nanos(d: Duration) -> u64 {
     u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
@@ -134,9 +181,11 @@ fn nanos(d: Duration) -> u64 {
 /// tier whose batch port serves their routed experts, the card buffer each
 /// layer's host sums land in, and the most columns a unit may hold (the
 /// port's sets and the host's union were made for them). Unit `u` of layer
-/// `l` over `cols` columns is the key `(l, u, 0 .. cols)` ([`BatchLeg::key`]):
-/// the program's download names it, the walk's serve serves it and uploads
-/// its sums.
+/// `l` over its `cols` columns is the key `(l, u, 0 .. cols)`
+/// ([`BatchLeg::key`]): the program's download names it, the walk's serve
+/// serves it and uploads its sums. A unit's columns are the walk's unless
+/// the walk set each unit's own ([`BatchLeg::set_unit_cols`]: a group's last
+/// batch may be shorter).
 pub struct BatchLeg<'a, H: HostExperts> {
     stream: &'a CudaStream,
     hybrid: &'a mut HostTier<H>,
@@ -144,6 +193,8 @@ pub struct BatchLeg<'a, H: HostExperts> {
     cap: usize,
     /// The open walk's columns.
     cols: usize,
+    /// Each unit's columns, when the walk set them.
+    unit_cols: Option<&'a [usize]>,
     /// The walk's timing, when it set one ([`BatchLeg::set_timer`]).
     timer: Option<&'a mut dyn LegTimer>,
 }
@@ -164,6 +215,7 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
             hsum,
             cap,
             cols: 0,
+            unit_cols: None,
             timer: None,
         }
     }
@@ -172,6 +224,21 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
     /// parts marked — or none, which runs the exchange alone.
     pub fn set_timer<T: LegTimer + 'a>(&mut self, timer: Option<&'a mut T>) {
         self.timer = timer.map(|t| t as &mut dyn LegTimer);
+    }
+
+    /// Each unit's own columns, unit `u` the `u`-th: the next walk's
+    /// [`Port::open`] refuses by name a list that is not one entry a unit,
+    /// each in `1..=` the walk's columns.
+    pub fn set_unit_cols(&mut self, cols: &'a [usize]) {
+        self.unit_cols = Some(cols);
+    }
+
+    /// Unit `unit`'s columns: its own when the walk set them, else the
+    /// walk's.
+    fn cols_of(&self, unit: usize) -> usize {
+        self.unit_cols
+            .and_then(|c| c.get(unit).copied())
+            .unwrap_or(self.cols)
     }
 
     /// The tier, for a layer program's download.
@@ -189,15 +256,11 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
         self.hsum
     }
 
-    /// `at`'s exchange key over the open walk's columns.
+    /// `at`'s exchange key over its unit's columns: the unit is the batch's
+    /// label within its group, and the port picks its exchange set in turn.
     #[must_use]
     pub fn key(&self, at: At) -> BatchKey {
-        BatchKey {
-            layer: at.layer,
-            set: at.unit,
-            at: 0,
-            u: self.cols,
-        }
+        batch_key(at, self.cols_of(at.unit))
     }
 
     /// Mark `site` of `at`'s part on the stream, in the architecture's own
@@ -288,20 +351,13 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
     type Error = GpuError;
     const KIND: PortKind = PortKind::Batch;
 
-    /// One unit of `1..=cap` columns, both sets of the port free
-    /// ([`HostTier::begin_group`]: the walk is eager, and its caller leaves
-    /// nothing of an earlier walk in flight); any other point is refused by
-    /// name.
+    /// One unit or more of `1..=cap` columns — each unit's own columns, when
+    /// the walk set them, one a unit in `1..=` the walk's — both sets of the
+    /// port free ([`HostTier::begin_group`], once a walk: the walk is eager,
+    /// and its caller leaves nothing of an earlier walk in flight); any other
+    /// point is refused by name.
     fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
-        if o.units != 1 || !(1..=self.cap).contains(&o.cols) {
-            return Err(GpuError::Shape {
-                what: WHAT_BATCH,
-                detail: format!(
-                    "{} units of {} columns; the batch leg walks one unit of 1..={} columns",
-                    o.units, o.cols, self.cap
-                ),
-            });
-        }
+        refuse_open(o, self.cap, self.unit_cols)?;
         self.cols = o.cols;
         self.hybrid.begin_group()
     }
@@ -334,7 +390,7 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
         t.served(ServeNote {
             layer: at.layer,
             unit: at.unit,
-            cols: self.cols,
+            cols: key.u,
             slots: after
                 .batch_host_slots
                 .saturating_sub(before.batch_host_slots),
@@ -351,5 +407,189 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
             what: WHAT_BATCH,
             detail: why.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::batch::BatchPort;
+    use super::*;
+    use cuda_core::CudaContext;
+    use runtime::sched::{self, LayerProgram};
+
+    /// The batch port's exchange under a walk's order, keyed as the leg keys
+    /// it: each front downloads its item, each serve serves and uploads it,
+    /// each back reads the sums the upload sent.
+    struct Exchange<'a> {
+        stream: &'a CudaStream,
+        port: &'a mut BatchPort,
+        hsum: &'a mut DeviceBuffer<f32>,
+        cols: &'a [usize],
+    }
+
+    impl Port for Exchange<'_> {
+        type Error = GpuError;
+        const KIND: PortKind = PortKind::Batch;
+
+        fn open(&mut self, _: Overlap) -> Result<(), GpuError> {
+            self.port.begin();
+            Ok(())
+        }
+
+        fn serve(&mut self, at: At) -> Result<(), GpuError> {
+            let key = batch_key(at, self.cols[at.unit]);
+            self.port.serve(key, |layer, x, _, _, sums| {
+                // Each sum is the row's own value plus the layer: the back
+                // reads which item's sums it got.
+                for (s, v) in sums.iter_mut().zip(x.data()) {
+                    *s = v + layer as f32;
+                }
+                Ok(())
+            })?;
+            self.port.upload(self.stream, self.hsum, key)
+        }
+
+        fn refused(why: Refused) -> GpuError {
+            GpuError::shape(WHAT_BATCH, why.to_string())
+        }
+    }
+
+    /// Each item's rows, `unit + 1` everywhere, and the sums each back read.
+    struct Items<'a> {
+        x: [DeviceBuffer<f32>; 3],
+        w: DeviceBuffer<f32>,
+        ids: DeviceBuffer<u32>,
+        backs: Vec<(At, Vec<f32>)>,
+        port: std::marker::PhantomData<Exchange<'a>>,
+    }
+
+    impl<'a> LayerProgram for Items<'a> {
+        type Port = Exchange<'a>;
+
+        fn front(&mut self, port: &mut Exchange<'a>, at: At) -> Result<(), GpuError> {
+            let key = batch_key(at, port.cols[at.unit]);
+            port.port
+                .download(port.stream, [&self.x[at.unit], &self.w], &self.ids, key)
+        }
+
+        fn back(&mut self, port: &mut Exchange<'a>, at: At) -> Result<(), GpuError> {
+            let n = 2 * port.cols[at.unit];
+            let got = port.hsum.to_host_vec(port.stream)?;
+            self.backs.push((at, got[..n].to_vec()));
+            Ok(())
+        }
+    }
+
+    /// The leg opens a walk of one unit or more, each unit's own columns
+    /// in `1..=` the walk's, and refuses by name no unit, columns outside
+    /// `1..=cap`, and a units' list of another length or with an entry
+    /// outside the walk's columns.
+    #[test]
+    fn open_takes_one_unit_or_more_and_refuses_the_rest() {
+        let walk = |units, cols| Overlap {
+            units,
+            cols,
+            port: PortKind::Batch,
+        };
+        for units in [1, 2, 3, 8] {
+            refuse_open(walk(units, 512), 512, None)
+                .unwrap_or_else(|e| panic!("a walk of {units} units: {e}"));
+        }
+        refuse_open(walk(3, 512), 512, Some(&[512, 512, 1]))
+            .expect("three units, the last of one column");
+        let refused = [
+            (walk(0, 512), None, "0 units of 512 columns"),
+            (walk(2, 0), None, "2 units of 0 columns"),
+            (walk(2, 513), None, "2 units of 513 columns"),
+            (
+                walk(3, 512),
+                Some(&[512, 512][..]),
+                "units of [512, 512] columns",
+            ),
+            (
+                walk(2, 512),
+                Some(&[512, 0][..]),
+                "units of [512, 0] columns",
+            ),
+            (
+                walk(2, 256),
+                Some(&[256, 512][..]),
+                "units of [256, 512] columns",
+            ),
+        ];
+        for (o, cols, want) in refused {
+            let e = refuse_open(o, 512, cols).expect_err(want);
+            assert!(e.to_string().contains(want), "{want}: {e}");
+        }
+    }
+
+    /// A three-unit group walked across a layer boundary — unit 2 of layer
+    /// 0 then unit 0 of layer 1, which an odd group puts in one set in turn
+    /// — through the port's two sets: every serve takes the oldest download
+    /// not served (the port refuses any other by name), no download meets a
+    /// set still held, and each back reads its own item's sums. A third
+    /// download while two sets are in flight is refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_three_units_across_a_layer_take_the_sets_in_turn() {
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let stream = ctx.new_stream().expect("a stream");
+        let (n_embd, cap) = (2, 4);
+        let mut port = BatchPort::new(&ctx, n_embd, 1, cap).expect("a batch port");
+        let mut hsum = DeviceBuffer::<f32>::zeroed(&stream, cap * n_embd).expect("hsum");
+        let x = |u: usize| {
+            DeviceBuffer::from_host(&stream, &vec![(u + 1) as f32; cap * n_embd]).expect("x")
+        };
+        let cols = [4, 4, 3];
+        let (backs, items_x, w, ids) = {
+            let mut items = Items {
+                x: [x(0), x(1), x(2)],
+                w: DeviceBuffer::from_host(&stream, &[1.0f32; 4]).expect("w"),
+                ids: DeviceBuffer::from_host(&stream, &[0u32; 4]).expect("ids"),
+                backs: Vec::new(),
+                port: std::marker::PhantomData,
+            };
+            let mut ex = Exchange {
+                stream: &stream,
+                port: &mut port,
+                hsum: &mut hsum,
+                cols: &cols,
+            };
+            let o = Overlap {
+                units: 3,
+                cols: 4,
+                port: PortKind::Batch,
+            };
+            sched::walk(o, 2, &mut ex, &mut items).expect("a three-unit walk over two layers");
+            (items.backs, items.x, items.w, items.ids)
+        };
+        let want: Vec<(At, Vec<f32>)> = (0..2)
+            .flat_map(|layer| (0..3).map(move |unit| At { unit, layer }))
+            .map(|at| {
+                let v = (at.unit + 1 + at.layer) as f32;
+                (at, vec![v; n_embd * cols[at.unit]])
+            })
+            .collect();
+        assert_eq!(backs, want);
+        port.begin();
+        for (unit, x) in items_x.iter().take(2).enumerate() {
+            port.download(&stream, [x, &w], &ids, batch_key(At { unit, layer: 0 }, 4))
+                .expect("a download into a free set");
+        }
+        let third = port
+            .download(
+                &stream,
+                [&items_x[2], &w],
+                &ids,
+                batch_key(At { unit: 2, layer: 0 }, 4),
+            )
+            .expect_err("a third download while two sets are in flight");
+        assert!(
+            third
+                .to_string()
+                .contains("both sets hold a layer not uploaded yet"),
+            "{third}"
+        );
+        stream.synchronize().expect("the stream");
     }
 }

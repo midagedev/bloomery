@@ -43,6 +43,9 @@ pub struct GlmCfg {
     pub host: HostCfg,
     /// How a prompt is fed: in batches, or one decode step per id.
     pub prefill: PrefillMode,
+    /// Batches a prompt group runs layer by layer
+    /// (`BLOOMERY_PREFILL_GROUP`, [`bloomery_gpu_glm5next::set_prefill_group`]).
+    pub group: usize,
 }
 
 impl Open for Body {
@@ -94,9 +97,11 @@ impl Open for Body {
         Body::open_placed(file, plan, inputs, 0, cfg.host)
     }
 
-    /// The configuration's feed; the batch feed's buffers made here.
+    /// The configuration's feed and group; the batch feed's buffers made
+    /// here, for the group's units.
     fn prepare(m: &mut GpuModel<Body>, cfg: &GlmCfg) -> Result<bool, GpuError> {
-        bloomery_gpu_glm5next::set_prefill(m, cfg.prefill)
+        let grew = bloomery_gpu_glm5next::set_prefill_group(m, cfg.group)?;
+        Ok(bloomery_gpu_glm5next::set_prefill(m, cfg.prefill)? || grew)
     }
 }
 

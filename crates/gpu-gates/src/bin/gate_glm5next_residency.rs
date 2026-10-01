@@ -241,6 +241,7 @@ mod gate {
             place: PlanLevers::from_levers(levers)?,
             host: levers.host(),
             prefill: PrefillMode::Batch,
+            group: 1,
         };
         let loaded = Loaded::<Body>::from_model(m, cfg, ctx);
         loaded.ready(&mut Quiet).map_err(Into::into)
@@ -572,6 +573,7 @@ mod gate {
                 place: PlanLevers::from_levers(levers)?,
                 host: levers.host(),
                 prefill: PrefillMode::Batch,
+                group: 1,
             },
         };
         open_nextn(file, args, residency, &mut Quiet)?

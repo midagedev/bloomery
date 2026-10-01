@@ -136,10 +136,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             trim: false,
         },
         default: Unset::Is("2"),
-        doc: "V4.1: the batches a prompt group runs layer by layer, each layer-batch's \
-              route enqueued ahead of the previous one's host serve; 1 runs each batch \
-              alone, the same-binary arm, and both write the same bits. The `load` line \
-              prints `group=`.",
+        doc: "V4.1 and GLM-5.3: the batches a prompt group runs layer by layer, each \
+              layer-batch's route enqueued ahead of the previous one's host serve; 1 runs \
+              each batch alone, the same-binary arm, and both write the same bits. The \
+              `load` line prints `group=`. GLM-5.3 unset runs 1: 2 or more is opt-in, its \
+              units past the first (each about two stream buffers) not reserved by the plan \
+              yet, so they come out of the card's margin, refused by name past its free \
+              bytes; the `prefill units` line prints what they took and what stayed free.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

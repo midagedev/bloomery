@@ -120,7 +120,11 @@
 //!   step) and a cut to 512 (below the abandoned point, then a prompt call:
 //!   the copy back runs in its first take) then a tail of 64 ids each give
 //!   the logits plain steps of the same ids from a reset give, bit for bit;
-//!   and a prompt call's takes leave those logits as they are.
+//!   and a prompt call's takes leave those logits as they are. All of it
+//!   twice: on the steps feed, then on the batch feed in groups of two
+//!   batches (`set_prefill_group`), where the prompt of [`A`] ids is one
+//!   group whose take at 512 is opened before it and filled layer by layer
+//!   inside it: the same points and the same logits.
 //! - (pb-long) the prompt batch past the positions the latent layers attend
 //!   whole, on the same load: [`LONG`] lcg ids as plain steps from a reset,
 //!   then as two batch calls from a reset, the first of [`LONG_CUT`] ids so
@@ -142,7 +146,9 @@
 //!   run's.
 //! - (pb) one run of plain steps over [`CTX_PP`] lcg ids from a reset, every
 //!   store digested and the logits and argmax kept after each of [`PP`]
-//!   positions; then for each, a batch call of that many ids from a reset:
+//!   positions; then at each group of [`GROUPS`] batches
+//!   (`set_prefill_group` on the one load) and for each, a batch call of that
+//!   many ids from a reset:
 //!   every KDA layer's state and conv ring, every latent layer's latent and
 //!   index rows and pool plane, the last logits and the argmax bit for bit
 //!   the steps', and
@@ -151,17 +157,29 @@
 //! - (pr) a call one position past the stores is refused by name before any
 //!   launch, on either feed: the model stands at 0 and every store digests
 //!   as the reset's.
-//! - (pf) `blk.0.attn_norm.weight[0]` set to NaN: a step and a batch call of
-//!   nine ids each end in the same fault, at layer 0, the model poisoned and
-//!   the next call refused as such; a call of 513 ids (two batches) ends in
-//!   it after its first batch, no checkpoint taken of the faulted state; the
-//!   weight put back, a reset and the call give (pb)'s argmax.
+//! - (pf) `blk.0.attn_norm.weight[0]` set to NaN, at groups of one and of
+//!   two batches: a step and a batch call of nine ids each end in the same
+//!   fault, at layer 0, the model poisoned and the next call refused as
+//!   such; a call of 513 ids (two batches) ends in it after the group that
+//!   holds its first batch (that batch alone at a group of one), no
+//!   checkpoint taken or sealed of the faulted state — also with the NaN in
+//!   the last KDA layer's norm instead, where the first batch's every store
+//!   has reached its take before the fault is read; the weight put back, a
+//!   reset and the call give (pb)'s argmax.
+//!   PIN(2026-10-02): the fault point moved from the first batch to the
+//!   group that holds it, as a group reads the fault word once.
+//! - (pg) a failure that is no fault, planted in a group's walk at its
+//!   second unit (`Plant::Group(1)`), at groups of two: after a call of 513
+//!   ids, a call of the next 517 ids (one group of two batches, the mark at
+//!   1024 inside it) fails by name; the model stands at 513, the points from
+//!   before the call (512, 513) stand, and the call again gives (pb)'s
+//!   stores, logits and argmax at 1030, its points 512, 513, 1024, 1030.
 //!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
 //! at [`CTX`] of one lane, `--only verify` (s) and (v) alone on a load at
 //! [`CTX`] of two (the plain graph run of the batch set they compare against
-//! included).
+//! included), `--only keep` (k) alone on a load at [`CTX`] of two.
 //! `--step-sets short` takes (t)'s two 4-token sets only,
 //! `--step-sets long` the 1,024- and 3,070-position sets only, `--step-sets
 //! all` (the default) all four; it names the sets of the load at [`CTX`], so
@@ -211,8 +229,8 @@ mod gate {
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
-        Body, Glm5nextModel, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill, set_taps,
-        step_launches, store_digests,
+        Body, Glm5nextModel, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill,
+        set_prefill_group, set_taps, step_launches, store_digests,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -242,6 +260,12 @@ mod gate {
     /// one past it; a batch whole and one past it; a mark with a short tail
     /// after it; every position the stores hold.
     const PP: [usize; 8] = [1, 7, 8, 9, 512, 513, 1030, CTX_PP];
+
+    /// (pb)'s prompt groups, in batches: each alone, then two and four
+    /// batches a group (513, 1030 and [`CTX_PP`] are two, three and five
+    /// batches: a group of two, one of three, a group of four and its lone
+    /// last batch joined).
+    const GROUPS: [usize; 3] = [1, 2, 4];
 
     /// (pb-long)'s prompt: past [`CTX_PP`] by more than a batch's chunk, and
     /// not a whole number of pools of four, so it ends inside one.
@@ -483,6 +507,7 @@ mod gate {
             place: PlanLevers::from_levers(levers)?,
             host: levers.host(),
             prefill,
+            group: 1,
         };
         let budgeted = cfg.place.card_budget_bytes.is_some();
         let mut log = Log {
@@ -1662,7 +1687,22 @@ mod gate {
         }
     }
 
-    fn keep(s: &mut Session<Body>) -> Result<bool, GateError> {
+    /// (k) on the steps feed, then on the batch feed at groups of two
+    /// batches; the session left on the steps feed at groups of one.
+    fn keep_groups(s: &mut Session<Body>) -> Result<bool, GateError> {
+        let mut ok = keep(s, "steps")?;
+        let m = s.model_mut();
+        set_prefill(m, PrefillMode::Batch)?;
+        set_prefill_group(m, 2)?;
+        ok &= keep(s, "batches, groups of 2")?;
+        let m = s.model_mut();
+        set_prefill_group(m, 1)?;
+        set_prefill(m, PrefillMode::Steps)?;
+        s.reset()?;
+        Ok(ok)
+    }
+
+    fn keep(s: &mut Session<Body>, feed: &str) -> Result<bool, GateError> {
         let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
         let (_, _, prefill) = man.step()?;
         let ids = prefill.to_vec();
@@ -1687,7 +1727,7 @@ mod gate {
             *ms = t.elapsed().as_secs_f64() * 1e3;
         }
         println!(
-            "keep: a checkpoint's take {:.2} ms with its slot made, {:.2} ms into a reused slot \
+            "keep ({feed}): a checkpoint's take {:.2} ms with its slot made, {:.2} ms into a reused slot \
              (runtime values)",
             take_ms[0], take_ms[1]
         );
@@ -1708,7 +1748,7 @@ mod gate {
             && (k500.at, k500.why.code()) == (0, "no-checkpoint")
             && refused.contains("checkpoint: the recurrent state copied back at 512");
         println!(
-            "keep: prompt of {A} ({first:.1} s, runtime value) and 2 steps; points {p1:?} (want \
+            "keep ({feed}): prompt of {A} ({first:.1} s, runtime value) and 2 steps; points {p1:?} (want \
              [512, {A}]); kept(600) = {k600}; kept(500) = {k500}; cut(600): {refused} {}",
             verdict(first_ok)
         );
@@ -1728,7 +1768,7 @@ mod gate {
         let l512 = row(s.prompt(e, Want::Logits)?)?;
         let branch_ok = p2 == [512, 712] && k700.at == 512;
         println!(
-            "keep: cut to 512, branch of {}: points {p2:?} (want [512, 712]); kept(700) = {k700} \
+            "keep ({feed}): cut to 512, branch of {}: points {p2:?} (want [512, 712]); kept(700) = {k700} \
              {}",
             d.len(),
             verdict(branch_ok)
@@ -1748,7 +1788,7 @@ mod gate {
         let t512 = row(s.prompt(&[&a[..512], e].concat(), Want::Logits)?)?;
         let read_only = same_bits(&t512, &f512);
         println!(
-            "keep: a prompt call's takes leave the logits of plain steps, bit for bit: \
+            "keep ({feed}): a prompt call's takes leave the logits of plain steps, bit for bit: \
              {read_only} {}",
             verdict(read_only)
         );
@@ -1756,7 +1796,7 @@ mod gate {
         let bits = same_bits(&l712, &f712) && same_bits(&l512, &f512);
         let c = s.model().body("keep")?.checkpoints();
         println!(
-            "keep: restored at 712 and at 512, a tail of {} each, against plain steps of the \
+            "keep ({feed}): restored at 712 and at 512, a tail of {} each, against plain steps of the \
              same ids from a reset: logits bit for bit {bits} (argmax {} / {} and {} / {}); {} \
              taken, {} restored, {} dropped, {} evicted before the references; {} slots made of \
              {}, {} bytes a checkpoint {}",
@@ -1791,6 +1831,8 @@ mod gate {
         PpLong,
         /// (s) and (v) alone, on a load at [`CTX`].
         Verify,
+        /// (k) alone, on a load at [`CTX`].
+        Keep,
     }
 
     /// Which of (t)'s step sets the load at [`CTX`] runs.
@@ -1849,8 +1891,8 @@ mod gate {
         Ok(sets)
     }
 
-    /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, or every
-    /// clause.
+    /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, `--only
+    /// keep`, or every clause.
     fn only() -> Result<Only, GateError> {
         let args: Vec<String> = std::env::args().collect();
         match args.iter().position(|a| a == "--only") {
@@ -1860,7 +1902,10 @@ mod gate {
                 Some("pp") => Ok(Only::Pp),
                 Some("pplong") => Ok(Only::PpLong),
                 Some("verify") => Ok(Only::Verify),
-                other => Err(format!("--only is main, pp, pplong or verify, not {other:?}").into()),
+                Some("keep") => Ok(Only::Keep),
+                other => {
+                    Err(format!("--only is main, pp, pplong, verify or keep, not {other:?}").into())
+                }
             },
         }
     }
@@ -1875,6 +1920,10 @@ mod gate {
         }
         if only == Only::Verify {
             ok &= verify_only(&levers)?;
+        }
+        if only == Only::Keep {
+            let (mut s, _) = open(&levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
+            ok &= keep_groups(&mut s)?;
         }
         if only == Only::PpLong {
             let (mut s, _) = open(&levers, CTX, PrefillMode::Steps, KdaLanes::One)?;
@@ -1931,7 +1980,7 @@ mod gate {
             sets.name(),
             ran.join(" ")
         );
-        ok &= keep(&mut s)?;
+        ok &= keep_groups(&mut s)?;
         ok &= prompt_long(s.model_mut())?;
         ok &= verify_clause(s.model_mut(), &toks, &graph, opened.nodes);
         Ok(ok)
@@ -2148,47 +2197,121 @@ mod gate {
             t.elapsed().as_secs_f64(),
             after.first().map_or(0, |a| a.stores.len())
         );
-        for a in &after {
-            m.reset()?;
-            let t = Instant::now();
-            let got = prefill(m, &ids[..a.p]);
-            let secs = t.elapsed().as_secs_f64();
-            let (argmax, stores, logits) = match got {
-                Ok(tok) => (tok, store_digests(m)?, fnv_row(&m.logits()?)),
-                Err(e) => {
-                    println!("prompt batch P={}: error \"{e}\" {}", a.p, verdict(false));
-                    ok = false;
-                    continue;
-                }
-            };
-            let points = m.body("prompt batch")?.checkpoints().positions();
-            let diff = first_store_diff(&stores, &a.stores);
-            let pass = diff.is_none()
-                && logits == a.logits
-                && argmax == a.argmax
-                && m.pos() as usize == a.p
-                && points == marks(a.p);
-            println!(
-                "prompt batch P={}: stores {} logits {} argmax {argmax} (steps {}) pos {} \
+        for g in GROUPS {
+            set_prefill_group(m, g)?;
+            for a in &after {
+                m.reset()?;
+                let t = Instant::now();
+                let got = prefill(m, &ids[..a.p]);
+                let secs = t.elapsed().as_secs_f64();
+                let (argmax, stores, logits) = match got {
+                    Ok(tok) => (tok, store_digests(m)?, fnv_row(&m.logits()?)),
+                    Err(e) => {
+                        println!(
+                            "prompt batch G={g} P={}: error \"{e}\" {}",
+                            a.p,
+                            verdict(false)
+                        );
+                        ok = false;
+                        continue;
+                    }
+                };
+                let points = m.body("prompt batch")?.checkpoints().positions();
+                let diff = first_store_diff(&stores, &a.stores);
+                let pass = diff.is_none()
+                    && logits == a.logits
+                    && argmax == a.argmax
+                    && m.pos() as usize == a.p
+                    && points == marks(a.p);
+                println!(
+                    "prompt batch G={g} P={}: stores {} logits {} argmax {argmax} (steps {}) pos {} \
                  checkpoints {points:?} (want {:?}), {secs:.2} s (runtime value) {}",
-                a.p,
-                diff.as_deref()
-                    .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
-                if logits == a.logits {
-                    "bit for bit"
-                } else {
-                    "differ"
-                },
-                a.argmax,
-                m.pos(),
-                marks(a.p),
-                verdict(pass)
-            );
-            ok &= pass;
+                    a.p,
+                    diff.as_deref()
+                        .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
+                    if logits == a.logits {
+                        "bit for bit"
+                    } else {
+                        "differ"
+                    },
+                    a.argmax,
+                    m.pos(),
+                    marks(a.p),
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
         }
+        set_prefill_group(m, 1)?;
         ok &= refused_past(m, &ids)?;
+        set_prefill_group(m, 2)?;
+        ok &= planted_group(m, &ids, after.iter().find(|a| a.p == 1030))?;
         let clean = after.iter().find(|a| a.p == 9).map(|a| a.argmax);
-        ok &= batch_fault(m, &ids[..9], &ids[..513], clean)?;
+        for g in [1, 2] {
+            set_prefill_group(m, g)?;
+            ok &= batch_fault(m, &ids[..9], &ids[..513], clean, g)?;
+        }
+        set_prefill_group(m, 1)?;
+        Ok(ok)
+    }
+
+    /// (pg) at the load's group of two: after a call of 513 ids, a call of
+    /// the next 517 — one group of two batches, the mark at 1024 inside it —
+    /// with [`Plant::Group`]`(1)` planted fails by name, the model standing at
+    /// 513 and the points from before it (512, 513) standing; the call again
+    /// gives `want`'s stores, logits and argmax (the steps' at 1030), its
+    /// points 512, 513, 1024 and 1030. The model left reset.
+    fn planted_group(
+        m: &mut Glm5nextModel,
+        ids: &[u32],
+        want: Option<&After>,
+    ) -> Result<bool, GateError> {
+        let Some(want) = want.filter(|w| w.p == 1030) else {
+            return Err("(pg) needs (pb)'s record at 1030".into());
+        };
+        m.reset()?;
+        prefill(m, &ids[..513])?;
+        let before = m.body("planted group")?.checkpoints().positions();
+        m.body_parts("planted group")?.2.plant(Plant::Group(1));
+        let failed = prefill(m, &ids[513..1030]);
+        let named = matches!(&failed, Err(GpuError::State { missing, .. })
+            if missing.contains("the planted failure in a prompt group's walk"));
+        let (pos, points) = (m.pos(), m.body("planted group")?.checkpoints().positions());
+        let again = prefill(m, &ids[513..1030]);
+        let (stores, logits) = (store_digests(m)?, fnv_row(&m.logits()?));
+        let after_points = m.body("planted group")?.checkpoints().positions();
+        m.reset()?;
+        let diff = first_store_diff(&stores, &want.stores);
+        let ok = named
+            && before == [512, 513]
+            && pos == 513
+            && points == before
+            && matches!(again, Ok(t) if t == want.argmax)
+            && diff.is_none()
+            && logits == want.logits
+            && after_points == [512, 513, 1024, 1030];
+        println!(
+            "planted group: after 513 ids (points {before:?}) a call of 517 at groups of 2 with \
+             a failure planted at unit 1: {}; the model at {pos} (want 513), points {points:?} \
+             (want {before:?}); the call again: {}, stores {}, logits {}, points \
+             {after_points:?} (want [512, 513, 1024, 1030]) {}",
+            match &failed {
+                Ok(t) => format!("token {t}"),
+                Err(e) => format!("error \"{e}\""),
+            },
+            match &again {
+                Ok(t) => format!("token {t} (steps {})", want.argmax),
+                Err(e) => format!("error \"{e}\""),
+            },
+            diff.as_deref()
+                .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
+            if logits == want.logits {
+                "bit for bit"
+            } else {
+                "differ"
+            },
+            verdict(ok)
+        );
         Ok(ok)
     }
 
@@ -2280,9 +2403,13 @@ mod gate {
         Ok(ok)
     }
 
-    /// The first layer's attention norm, whose first value (pf) sets to NaN.
-    fn patch_attn_norm(m: &mut Glm5nextModel, bytes: [u8; 4]) -> Result<[u8; 4], GateError> {
-        let name = names::attn_norm(0);
+    /// Layer `l`'s attention norm, whose first value (pf) sets to NaN.
+    fn patch_attn_norm(
+        m: &mut Glm5nextModel,
+        l: usize,
+        bytes: [u8; 4],
+    ) -> Result<[u8; 4], GateError> {
+        let name = names::attn_norm(l);
         let (gpu, w, _) = m.body_parts("gate_glm5next_e2e patch_attn_norm")?;
         let Some(DevWeight::F32 { w: gain, .. }) = w.get(&name) else {
             return Err(format!("{name} is not resident as F32").into());
@@ -2290,9 +2417,12 @@ mod gate {
         patch_bytes(gpu.stream(), gain.buf(), 0, bytes)
     }
 
-    /// (pf): a NaN in layer 0's norm; a step and a batch call end in the same
-    /// fault at layer 0, the model poisoned; a call of two batches ends in it
-    /// after its first, with no checkpoint taken of the faulted state; the
+    /// (pf) at groups of `g`: a NaN in layer 0's norm; a step and a batch
+    /// call end in the same fault at layer 0, the model poisoned; a call of
+    /// two batches ends in it after the group that holds its first, with no
+    /// checkpoint taken or sealed of the faulted state, and so does that call
+    /// with the NaN in the last KDA layer's norm instead (the fault at that
+    /// layer, after every store of the first batch reached its take); the
     /// weight put back, a reset and the batch call give `clean`, (pb)'s argmax
     /// at nine positions.
     fn batch_fault(
@@ -2300,9 +2430,10 @@ mod gate {
         ids: &[u32],
         two: &[u32],
         clean: Option<u32>,
+        g: usize,
     ) -> Result<bool, GateError> {
         m.reset()?;
-        let old = patch_attn_norm(m, f32::NAN.to_le_bytes())?;
+        let old = patch_attn_norm(m, 0, f32::NAN.to_le_bytes())?;
         let step = m.step(&ids[..1]);
         let step_poison = m.poisoned();
         m.reset()?;
@@ -2313,7 +2444,20 @@ mod gate {
         let zero_points = m.body("batch fault")?.checkpoints().positions();
         let long = prefill(m, two);
         let long_points = m.body("batch fault")?.checkpoints().positions();
-        patch_attn_norm(m, old)?;
+        patch_attn_norm(m, 0, old)?;
+        // The same call with the NaN in the last KDA layer's norm: the fault
+        // comes after the first batch's every store reached its take.
+        let last_kda = m
+            .body("batch fault")?
+            .kinds()
+            .iter()
+            .rposition(|k| k.mixer == MixerKind::DeltaRule)
+            .ok_or("no KDA layer")?;
+        m.reset()?;
+        let old_late = patch_attn_norm(m, last_kda, f32::NAN.to_le_bytes())?;
+        let late = prefill(m, two);
+        let late_points = m.body("batch fault")?.checkpoints().positions();
+        patch_attn_norm(m, last_kda, old_late)?;
         m.reset()?;
         let restored = prefill(m, ids);
         m.reset()?;
@@ -2323,6 +2467,8 @@ mod gate {
         };
         let (fs, fb) = (fault_of(&step), fault_of(&batch));
         let early = fault_of(&long) == fs && long_points == zero_points;
+        let late_ok = fault_of(&late).is_some_and(|f| f.layer as usize == last_kda)
+            && late_points == zero_points;
         let named = fs.is_some()
             && fs == fb
             && fs.is_some_and(|f| f.layer == 0)
@@ -2330,16 +2476,18 @@ mod gate {
             && batch_poison == fb;
         let refused = matches!(again, Err(GpuError::Poisoned { .. }));
         let back = clean.is_some() && matches!(restored, Ok(t) if Some(t) == clean);
-        let ok = named && early && refused && back;
+        let ok = named && early && late_ok && refused && back;
         let show = |r: &Result<u32, GpuError>| match r {
             Ok(t) => format!("token {t}"),
             Err(e) => format!("error \"{e}\""),
         };
         println!(
-            "batch fault: NaN in blk.0.attn_norm.weight[0]: a step: {}; a batch of {}: {}; \
+            "batch fault (groups of {g}): NaN in blk.0.attn_norm.weight[0]: a step: {}; a batch \
+             of {}: {}; \
              poisoned {} / {}; the next call: {}; a call of {}: {}, checkpoints {long_points:?} \
-             (the reset's {zero_points:?}); the weight put back and a reset: {} (want token {}) \
-             {}",
+             (the reset's {zero_points:?}); with the NaN in layer {last_kda}'s norm instead, a \
+             call of {}: {}, checkpoints {late_points:?}; the weight put back and a reset: {} \
+             (want token {}) {}",
             show(&step),
             ids.len(),
             show(&batch),
@@ -2348,6 +2496,8 @@ mod gate {
             show(&again),
             two.len(),
             show(&long),
+            two.len(),
+            show(&late),
             show(&restored),
             clean.map_or_else(|| "none".to_string(), |t| t.to_string()),
             verdict(ok)

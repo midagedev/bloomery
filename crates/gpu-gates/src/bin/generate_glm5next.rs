@@ -99,8 +99,16 @@
 //! `BLOOMERY_STEP_STATS=1` reads the host tier before the first generated
 //! step and after each (`host_stats::Probe`) and prints, after `SMOKE`, a
 //! `stat step` record a step past `--warm` and one `stat summary` (kinds
-//! `stat_step_host`, `stat_summary_host`: each step's host leg, served slots, straggle and go-wait gaps). Refused
+//! `stat_step_host`, `stat_summary_host`: each step's host leg, served slots, straggle and go-wait gaps). It also arms the batch walks' timing
+//! (`bloomery_gpu_glm5next::set_prompt_stats`): after a batched prompt's
+//! `step 0` line, one `stat prompt lb` a routed layer-batch and the `stat
+//! prompt split` over them (`record::prompt_stats`; its `fault_ms` and
+//! `ckpt_ms` the call's fault reads and checkpoint waits). Refused
 //! by name beside the MTP draft.
+//!
+//! `BLOOMERY_PREFILL_GROUP` sets the batches a prompt group runs layer by
+//! layer (`bloomery_gpu_glm5next::set_prefill_group`), 1 unset; the `load`
+//! line prints it as `group=`.
 //!
 //! `BLOOMERY_ROUTE_TRACE=<dir>` writes the engine's route trace of the run
 //! into `dir`, a new directory made before the load
@@ -140,10 +148,10 @@ mod cli {
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
     use bloomery_gpu_gates::{GateError, ref_model_path};
-    use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
+    use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, prompt_bytes};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, R8, RESIDENCY, ROUTE_TRACE,
-        ResidencyPick, ResidencyWhy, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, PREFILL_GROUP, R8, RESIDENCY,
+        ROUTE_TRACE, ResidencyPick, ResidencyWhy, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
@@ -162,6 +170,7 @@ mod cli {
         DRAFT,
         RESIDENCY,
         STEP_STATS,
+        PREFILL_GROUP,
     ];
 
     /// The drafted window's verify: the target's next token and the draft's
@@ -209,6 +218,8 @@ mod cli {
         place: &'static str,
         mode: StepMode,
         prefill: PrefillMode,
+        /// Batches a prompt group runs.
+        group: usize,
         ctx: usize,
         stop_at_plan: bool,
         t: Instant,
@@ -252,6 +263,7 @@ mod cli {
                 .u("shadow_bytes", 0)
                 .u("unified_addressing", 0)
                 .w("prefill", self.prefill.name())
+                .u("group", self.group)
                 .w("mode", mode_name(self.mode))
                 .w("place", self.place)
                 .w("pin_main", "off")
@@ -273,7 +285,16 @@ mod cli {
             Ok(())
         }
 
-        fn prompt_buffers(&mut self, _m: &Glm5nextModel) -> Result<(), SessionError> {
+        fn prompt_buffers(&mut self, m: &Glm5nextModel) -> Result<(), SessionError> {
+            if let Some(b) = prompt_bytes(m)? {
+                Record::new(&record::PROMPT_UNITS)
+                    .u("shared_bytes", b.shared)
+                    .u("unit_bytes", b.unit)
+                    .u("units", b.units)
+                    .u("hsum_bytes", b.hsum)
+                    .u("free_bytes", b.free)
+                    .print();
+            }
             Ok(())
         }
     }
@@ -420,12 +441,14 @@ mod cli {
             place: PlanLevers::from_levers(&levers)?,
             host: levers.host(),
             prefill,
+            group: levers.prefill_group_set().unwrap_or(1),
         };
         let mut log = Log {
             top_k: 0,
             place,
             mode,
             prefill,
+            group: levers.prefill_group_set().unwrap_or(1),
             ctx,
             stop_at_plan: has("--plan"),
             t,
@@ -492,6 +515,9 @@ mod cli {
             };
             return drafted_run(&mut s, &arm);
         }
+        if levers.step_stats() {
+            bloomery_gpu_glm5next::set_prompt_stats(s.model_mut(), true)?;
+        }
         fed(&ids);
         let t_feed = Instant::now();
         if prefill == PrefillMode::Steps {
@@ -510,6 +536,11 @@ mod cli {
             .u("fed", ids.len())
             .f("feed_s", feed.as_secs_f64())
             .print();
+        if let Some(st) = bloomery_gpu_glm5next::take_prompt_stats(s.model_mut())? {
+            for r in record::prompt_stats(&st) {
+                r.print();
+            }
+        }
         let fed_end = s.pos();
         let mut tokens = vec![next];
         // (i, pos, token, ms): printed after the last step.

@@ -26,7 +26,9 @@
 //! - (p) the pairing: the hidden rows a walk fed the target's arenas reads
 //!   (`bloomery_gpu_glm5next::nextn_hidden`, the walk's own gather): the
 //!   set's prompt in batches and by steps leaves the same rows in the
-//!   prompt-batch and step arenas, bit for bit; each value of every row
+//!   prompt-batch and step arenas, bit for bit, and so does a prompt of
+//!   [`GROUPED`] of its ids cycled (two batches) at groups of two, every
+//!   unit's rows read after the group; each value of every row
 //!   within its derived bound of the f64 replica of the gather — the four
 //!   streams' mean, then `output_norm`'s RMS at the file's eps — on the
 //!   target streams the row was made from (`nextn_target_streams`; the
@@ -95,7 +97,7 @@ mod gate {
     use bloomery_gpu_glm5next::{
         Body, Glm5nextModel, GlmArena, GlmPromptSink, NextnFeed, NextnHead, NextnHidden, NextnMode,
         PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden, nextn_logits,
-        nextn_target_streams, nextn_walk, prompt_with, set_prefill,
+        nextn_target_streams, nextn_walk, prompt_with, set_prefill, set_prefill_group,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
@@ -108,6 +110,8 @@ mod gate {
 
     /// Cache rows: the e2e gate's main load.
     const CTX: usize = 3136;
+    /// (p)'s grouped prompt: two batches, the second short.
+    const GROUPED: usize = 600;
     /// (f)'s prompt in one batch: its rows are the prompt-batch arena's.
     const FED: usize = 12;
     /// Generated ids a plain or drafted run holds: the set's.
@@ -689,6 +693,25 @@ mod gate {
         println!(
             "(p) the prompt's {n} units' hidden rows, in batches = by steps, bit for bit {}",
             verdict(same)
+        );
+        // Two batches in one group: the sink reads each unit's own final
+        // streams after the group.
+        let two: Vec<u32> = prompt.iter().copied().cycle().take(GROUPED).collect();
+        set_prefill_group(m, 2)?;
+        let grouped = unit_rows(m, &two, PrefillMode::Batch);
+        set_prefill_group(m, 1)?;
+        let (grouped, _) = grouped?;
+        let (stepped, _) = unit_rows(m, &two, PrefillMode::Steps)?;
+        let same2 = grouped.len() == GROUPED * hidden
+            && grouped
+                .iter()
+                .map(|x| x.to_bits())
+                .eq(stepped.iter().map(|x| x.to_bits()));
+        ok &= same2;
+        println!(
+            "(p) {GROUPED} ids (two batches) at groups of two: every unit's hidden rows = by \
+             steps, bit for bit {}",
+            verdict(same2)
         );
         let warm = IkGraph::read(set, -1, Graph::Warmup, hidden)?;
         let pos_ok = warm.tokens == prompt && warm.pos.iter().copied().eq(0..n as u32);

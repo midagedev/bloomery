@@ -490,6 +490,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             place: plan_levers,
             host: levers.host(),
             prefill: a.prefill,
+            group: 1,
         },
         pin_main: levers.pin_main(),
         path: path.clone(),

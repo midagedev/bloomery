@@ -90,6 +90,35 @@ pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
     }
 }
 
+/// Batches a prompt group holds at most under a group lever of `g`
+/// (`BLOOMERY_PREFILL_GROUP`): `g`, and one more from 2 on — a call's lone
+/// last batch joins the group before it ([`groups`]). The prompt batch's
+/// per-unit buffers are made for this many.
+#[must_use]
+pub const fn group_sets(g: usize) -> usize {
+    if g >= 2 { g + 1 } else { 1 }
+}
+
+/// The groups of a call of `k` batches under a lever of `g`: runs of `g`
+/// consecutive batches, where a lone last batch joins the run before it —
+/// a group of one runs no route under another batch's union. A call of one
+/// batch is one group of one.
+#[must_use]
+pub fn groups(k: usize, g: usize) -> Vec<std::ops::Range<usize>> {
+    let g = g.max(1);
+    let mut out: Vec<std::ops::Range<usize>> =
+        (0..k).step_by(g).map(|s| s..(s + g).min(k)).collect();
+    if g >= 2
+        && out.len() >= 2
+        && out.last().is_some_and(|r| r.len() == 1)
+        && let Some(tail) = out.pop()
+        && let Some(prev) = out.last_mut()
+    {
+        prev.end = tail.end;
+    }
+    out
+}
+
 /// What a plan of a glm5next file is made from, read from its headers.
 #[derive(Debug)]
 pub struct PlanInputs {
@@ -657,7 +686,39 @@ impl KvBytes for KvLayout {
 
 #[cfg(test)]
 mod tests {
-    use super::{KdaLanes, Kind, KvBytes, KvLayout, recurrent_bytes, row_bytes};
+    use super::{
+        KdaLanes, Kind, KvBytes, KvLayout, group_sets, groups, recurrent_bytes, row_bytes,
+    };
+
+    /// A call's batches cut into groups: runs of `g`, a lone last batch
+    /// joining the run before it (never at a lever of 1, never a call of one
+    /// batch), and no group past `group_sets(g)` batches.
+    #[test]
+    fn groups_join_a_lone_last_batch() {
+        assert_eq!(groups(1, 2), vec![0..1]);
+        assert_eq!(groups(2, 2), vec![0..2]);
+        assert_eq!(groups(3, 2), vec![0..3]);
+        assert_eq!(groups(5, 2), vec![0..2, 2..5]);
+        assert_eq!(groups(4, 2), vec![0..2, 2..4]);
+        assert_eq!(groups(5, 4), vec![0..5]);
+        assert_eq!(groups(6, 4), vec![0..4, 4..6]);
+        assert_eq!(groups(3, 1), vec![0..1, 1..2, 2..3]);
+        assert_eq!(groups(0, 2), Vec::<std::ops::Range<usize>>::new());
+        assert_eq!((group_sets(1), group_sets(2), group_sets(8)), (1, 3, 9));
+        for g in 1..=8 {
+            for k in 1..=20 {
+                let cut = groups(k, g);
+                assert_eq!(cut.first().map(|r| r.start), Some(0));
+                assert_eq!(cut.last().map(|r| r.end), Some(k));
+                assert!(cut.windows(2).all(|w| w[0].end == w[1].start));
+                assert!(
+                    cut.iter()
+                        .all(|r| !r.is_empty() && r.len() <= group_sets(g)),
+                    "{k} batches at {g}: {cut:?}"
+                );
+            }
+        }
+    }
 
     /// GLM-5.3-Flash's sizes: a KDA layer holds one lane of 64 heads of 128
     /// × 128 f32 and its u32 stamp, or two lanes and two stamps on a load

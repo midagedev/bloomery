@@ -34,7 +34,10 @@ gguf 9 2 0
 # PIN(2026-10-02): gpu 1381 -> 1393 blocks, 145 -> 146 fns, two new kernel entries, not old code relaxed:
 # ds41_ffn_handoff_10_cols_tier (handoff.rs: its entry's block and its helper handoff_cols_tier_at, the one unsafe
 # fn, with five) and q38_card_tier_shared_add (q38.rs: six), Qwen3.8's tier handoff and join, each with its SAFETY line.
-gpu 1393 146 6
+# PIN(2026-10-02): gpu 1393 -> 1394 blocks, new code, not old code relaxed: Checkpoints::copy (checkpoint.rs, a
+# prompt group's take store by store) enqueues one store's copy into its open take's pinned slot, one block with its
+# SAFETY line.
+gpu 1394 146 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

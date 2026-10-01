@@ -10,6 +10,14 @@
 //! ([`Checkpoints::apply`]), since a cut has no stream; a take carries out
 //! a waiting cut first.
 //!
+//! A prompt group's inner marks are taken store by store: a take opened
+//! before the group ([`Checkpoints::open_take`]) gets each store's copy
+//! enqueued where that store holds the mark's state ([`Checkpoints::copy`]),
+//! and is sealed once the group's walk is waited for and found sound
+//! ([`Checkpoints::seal`]) or abandoned ([`Checkpoints::abandon`]). Its
+//! copies are in flight between the open and the seal or abandon, and its
+//! slot is the open take's alone until then.
+//!
 //! A slot is made (pinned and zeroed) the first time a checkpoint needs it,
 //! and kept for the load. Each slot records the position its last finished
 //! copy holds, apart from the ledger: a restore reads a slot only as that
@@ -38,6 +46,26 @@ struct Slot {
     holds: Option<u32>,
 }
 
+/// A take opened inside a prompt group ([`Checkpoints::open_take`]): the
+/// mark it is of, its slot, and which stores' copies are enqueued. Sealed or
+/// abandoned, never dropped: a take neither seals is a slot holding nothing
+/// that no restore reads.
+#[must_use]
+#[derive(Debug)]
+pub struct Pending {
+    at: u32,
+    slot: usize,
+    sent: Vec<bool>,
+}
+
+impl Pending {
+    /// The mark the take is of.
+    #[must_use]
+    pub fn at(&self) -> u32 {
+        self.at
+    }
+}
+
 /// One model's checkpoints: the ledger, the stores' lengths, the slots.
 pub struct Checkpoints {
     ledger: Ledger,
@@ -47,6 +75,9 @@ pub struct Checkpoints {
     /// The ledger's points and the slot each fills, ascending by position:
     /// the ledger's own map, kept beside it from what its calls return.
     points: Vec<(u32, usize)>,
+    /// Takes opened and neither sealed nor abandoned: copies may be in
+    /// flight into their slots.
+    open: usize,
     /// The spacing of a prompt call's inner checkpoints (`seqstate::marks`).
     every: u32,
     ctx: Arc<CudaContext>,
@@ -69,6 +100,7 @@ impl Checkpoints {
             lens,
             slots: Vec::new(),
             points: Vec::new(),
+            open: 0,
             every,
             ctx: Arc::clone(ctx),
         })
@@ -198,20 +230,7 @@ impl Checkpoints {
         self.check(stores)?;
         let take = self.ledger.take(at).map_err(refused)?;
         if let Take::Copy { slot, new, evicted } = take {
-            if new {
-                if slot != self.slots.len() {
-                    return Err(GpuError::State {
-                        what: WHAT,
-                        missing: "the ledger's new slot next to the made ones",
-                    });
-                }
-                let bufs = self
-                    .lens
-                    .iter()
-                    .map(|&n| PinnedHostBuffer::<f32>::zeroed(&self.ctx, n))
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.slots.push(Slot { bufs, holds: None });
-            }
+            self.make_slot(slot, new)?;
             self.took(at, slot, evicted);
             if let Err(e) = self.copy_into(stream, slot, at, stores) {
                 // The slot holds part of a copy: no point may name it.
@@ -220,6 +239,151 @@ impl Checkpoints {
             }
         }
         Ok(take)
+    }
+
+    /// Slot `slot` made (pinned and zeroed) when the ledger names it `new`:
+    /// next to the made ones.
+    fn make_slot(&mut self, slot: usize, new: bool) -> Result<(), GpuError> {
+        if !new {
+            return Ok(());
+        }
+        if slot != self.slots.len() {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "the ledger's new slot next to the made ones",
+            });
+        }
+        let bufs = self
+            .lens
+            .iter()
+            .map(|&n| PinnedHostBuffer::<f32>::zeroed(&self.ctx, n))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.slots.push(Slot { bufs, holds: None });
+        Ok(())
+    }
+
+    /// A take of the mark `at` opened ahead of the stores reaching it, after
+    /// any waiting cut on `stores` (which hold the model's position): the
+    /// ledger's point at `at` and its slot, which holds nothing until the
+    /// take is sealed. `None` where one stands or at 0 (nothing to copy).
+    /// Refused by name as [`Checkpoints::take`] refuses.
+    pub fn open_take(
+        &mut self,
+        stream: &CudaStream,
+        at: u32,
+        stores: &mut [&mut DeviceBuffer<f32>],
+    ) -> Result<Option<Pending>, GpuError> {
+        self.apply(stream, stores)?;
+        self.check(stores)?;
+        let Take::Copy { slot, new, evicted } = self.ledger.take(at).map_err(refused)? else {
+            return Ok(None);
+        };
+        if let Err(e) = self.make_slot(slot, new) {
+            // The point names a slot that was not made: no point may name it.
+            self.clear();
+            return Err(e);
+        }
+        self.took(at, slot, evicted);
+        self.slots[slot].holds = None;
+        self.open += 1;
+        Ok(Some(Pending {
+            at,
+            slot,
+            sent: vec![false; self.lens.len()],
+        }))
+    }
+
+    /// Enqueue store `i`'s copy, `store` holding the open take's mark, into
+    /// its slot. Refused by name for a store past the list, of another
+    /// length, or copied already.
+    pub fn copy(
+        &mut self,
+        stream: &CudaStream,
+        pending: &mut Pending,
+        i: usize,
+        store: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let len = self.lens.get(i).copied();
+        if len != Some(store.len()) || pending.sent.get(i) != Some(&false) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "store {i}'s copy of {} f32s into the take at {}: the checkpoints copy {}                      stores of {:?}, and store {i} is {}",
+                    store.len(),
+                    pending.at,
+                    self.lens.len(),
+                    self.lens,
+                    if pending.sent.get(i) == Some(&true) {
+                        "copied already"
+                    } else {
+                        "not one of them or of another length"
+                    }
+                ),
+            });
+        }
+        let dst = self
+            .slots
+            .get_mut(pending.slot)
+            .and_then(|s| s.bufs.get_mut(i))
+            .ok_or(GpuError::State {
+                what: WHAT,
+                missing: "the open take's slot",
+            })?;
+        // SAFETY: `dst` is the open take's slot's, which nothing else reads,
+        // writes or frees until the take is sealed or abandoned — both
+        // synchronize the stream first — or the checkpoints drop, which waits
+        // for the context while a take is open.
+        unsafe { store.copy_to_pinned_host_async(stream, dst)? };
+        pending.sent[i] = true;
+        Ok(())
+    }
+
+    /// The open take sealed: its copies waited for, its slot holding its
+    /// mark. A take a later open evicted (a budget of fewer slots than the
+    /// group's marks) is sealed as nothing, as the steps' take would have
+    /// been evicted there. Refused by name, the take given back, when a store
+    /// was not copied.
+    pub fn seal(&mut self, stream: &CudaStream, pending: Pending) -> Result<(), GpuError> {
+        let synced = stream.synchronize();
+        self.open = self.open.saturating_sub(1);
+        let Pending { at, slot, sent } = pending;
+        if !self.points.contains(&(at, slot)) {
+            synced?;
+            return Ok(());
+        }
+        if let Err(e) = synced {
+            self.forget(at)?;
+            return Err(e.into());
+        }
+        if let Some(i) = sent.iter().position(|s| !s) {
+            self.forget(at)?;
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!("the take at {at} sealed with store {i} not copied"),
+            });
+        }
+        self.slots[slot].holds = Some(at);
+        Ok(())
+    }
+
+    /// The open take given back: its copies waited for, its point forgotten
+    /// ([`Ledger::forget`]) and every other point left as it stands.
+    pub fn abandon(&mut self, stream: &CudaStream, pending: Pending) -> Result<(), GpuError> {
+        let synced = stream.synchronize();
+        self.open = self.open.saturating_sub(1);
+        if self.points.contains(&(pending.at, pending.slot)) {
+            self.forget(pending.at)?;
+        }
+        synced?;
+        Ok(())
+    }
+
+    /// The point at `at` given back to the ledger ([`Ledger::forget`]) and
+    /// out of the points beside it; every other point stands.
+    fn forget(&mut self, at: u32) -> Result<(), GpuError> {
+        self.ledger.forget(at).map_err(refused)?;
+        self.points.retain(|&(p, _)| p != at);
+        Ok(())
     }
 
     /// The ledger's new point at `at` in `slot`, which the point at
@@ -398,6 +562,16 @@ impl Checkpoints {
     }
 }
 
+impl Drop for Checkpoints {
+    /// With a take open, its copies may still write its slot: the context is
+    /// waited for before the slots are freed.
+    fn drop(&mut self) {
+        if self.open > 0 {
+            let _ = self.ctx.synchronize();
+        }
+    }
+}
+
 fn refused(e: seqstate::CheckpointError) -> GpuError {
     GpuError::Shape {
         what: WHAT,
@@ -467,5 +641,66 @@ mod tests {
         c.apply(&stream, &mut [&mut a, &mut b])
             .expect("a restore of the copied slot");
         assert_eq!(a.to_host_vec(&stream).expect("a"), [0.0; 4]);
+    }
+
+    /// A group's take store by store: open, one copy a store, seal leaves
+    /// the slot holding the mark, and a restore of it gives the stores the
+    /// copied bits; a seal with a store not copied is refused by name and
+    /// leaves no point; an abandon gives back its own point alone — on an
+    /// empty ledger the ledger is empty again, every earlier point stands.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_open_copy_seal_and_abandon() {
+        let ctx = CudaContext::new(0).expect("CUDA device 0");
+        let stream = ctx.new_stream().expect("a stream");
+        let mut c = Checkpoints::new(&ctx, vec![4, 3], 1 << 20, 512).expect("checkpoints");
+        let mut a = DeviceBuffer::from_host(&stream, &[1.0f32; 4]).expect("a store");
+        let mut b = DeviceBuffer::from_host(&stream, &[2.0f32; 3]).expect("a store");
+        let p = c
+            .open_take(&stream, 9, &mut [&mut a, &mut b])
+            .expect("an open take at 9")
+            .expect("a copy at 9");
+        assert_eq!(p.at(), 9);
+        c.abandon(&stream, p).expect("an abandon");
+        assert!(c.positions().is_empty(), "{:?}", c.positions());
+        let mut p = c
+            .open_take(&stream, 5, &mut [&mut a, &mut b])
+            .expect("an open take at 5")
+            .expect("a copy at 5");
+        let slot = p.slot;
+        c.copy(&stream, &mut p, 0, &a).expect("store 0's copy");
+        let again = c.copy(&stream, &mut p, 0, &a).expect_err("store 0 twice");
+        assert!(again.to_string().contains("copied already"), "{again}");
+        c.copy(&stream, &mut p, 1, &b).expect("store 1's copy");
+        a.copy_from_host(&stream, &[7.0; 4]).expect("a");
+        c.seal(&stream, p).expect("a seal");
+        assert_eq!(c.slots[slot].holds, Some(5));
+        assert_eq!(c.positions(), vec![5]);
+        let mut p = c
+            .open_take(&stream, 9, &mut [&mut a, &mut b])
+            .expect("an open take at 9")
+            .expect("a copy at 9");
+        c.copy(&stream, &mut p, 0, &a).expect("store 0's copy");
+        let short = c
+            .seal(&stream, p)
+            .expect_err("a seal with store 1 not copied");
+        assert!(
+            short
+                .to_string()
+                .contains("the take at 9 sealed with store 1 not copied"),
+            "{short}"
+        );
+        assert_eq!(c.positions(), vec![5]);
+        let p = c
+            .open_take(&stream, 9, &mut [&mut a, &mut b])
+            .expect("an open take at 9")
+            .expect("a copy at 9");
+        c.abandon(&stream, p).expect("an abandon");
+        assert_eq!(c.positions(), vec![5]);
+        c.cut(5, 9).expect("a cut to 5");
+        c.apply(&stream, &mut [&mut a, &mut b])
+            .expect("a restore of the sealed take");
+        assert_eq!(a.to_host_vec(&stream).expect("a"), [1.0; 4]);
+        assert_eq!(b.to_host_vec(&stream).expect("b"), [2.0; 3]);
     }
 }

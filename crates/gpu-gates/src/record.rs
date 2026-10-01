@@ -534,7 +534,7 @@ pub static LOAD: Kind = Kind {
 pub static LOAD_GENERATOR: Kind = Kind {
     name: "load_generator",
     head: "load",
-    doc: "The load a decode loop opened: device bytes, the context, the body's fields, the cards it loaded (a V4.1 binary's; an expert tier card's experts and resident bytes), the step mode and the pin.",
+    doc: "The load a decode loop opened: device bytes, the context, the body's fields, the cards it loaded (a V4.1 binary's; an expert tier card's experts and resident bytes), the prompt feed, a GLM-5.3 load's prompt group, the step mode and the pin.",
     parts: &[
         key("resident_bytes", U64, "B"),
         key("ctx", U64, "positions"),
@@ -548,6 +548,7 @@ pub static LOAD_GENERATOR: Kind = Kind {
         opt("tier_experts", U64, "experts"),
         opt("tier_bytes", U64, "B"),
         opt("prefill", Word, ""),
+        opt("group", U64, "batches"),
         key("mode", Word, ""),
         key("place", Word, ""),
         key("pin_main", Word, ""),
@@ -673,6 +674,20 @@ pub static PREFILL_BYTES: Kind = Kind {
         key("proj_bytes", U64, "B"),
         key("group", U64, "batches"),
         key("group_bytes", U64, "B"),
+    ],
+};
+
+/// A GLM-5.3 prompt batch's device bytes, as `generate_glm5next` writes them.
+pub static PROMPT_UNITS: Kind = Kind {
+    name: "prompt_units",
+    head: "prefill units",
+    doc: "A GLM-5.3 prompt batch's device bytes once made: the buffers a group's units share, one unit's own, the units made (one a batch of a group), the host sums', and the card's free bytes after them. The plan reserves nothing for a group's units past the first: they come out of the card's margin.",
+    parts: &[
+        key("shared_bytes", U64, "B"),
+        key("unit_bytes", U64, "B"),
+        key("units", U64, ""),
+        key("hsum_bytes", U64, "B"),
+        key("free_bytes", U64, "B"),
     ],
 };
 
@@ -1849,8 +1864,11 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &HOST_LOCK,
     &CAPTURE,
     &CAPTURE_PAIR,
+    &PROMPT_UNITS,
     &FED,
     &STEP0,
+    &STAT_PROMPT_LB,
+    &STAT_PROMPT_SPLIT,
     &TIME_PROMPT,
     &STEP,
     &TIME_STEP,

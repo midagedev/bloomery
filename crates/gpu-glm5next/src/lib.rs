@@ -46,8 +46,9 @@ pub use body::nextn::{
     nextn_hidden, nextn_logits, nextn_store, nextn_target_streams, nextn_walk,
 };
 pub use body::prefill::{
-    CHUNK, GlmPromptSink, PrefillMode, StoreDigest, T_MAX, batches_of, call_batches, feed, prefill,
-    prefill_mode, prompt_with, set_prefill, store_digests,
+    CHUNK, GlmPromptSink, PrefillMode, PromptBytes, StoreDigest, T_MAX, batches_of, call_batches,
+    feed, prefill, prefill_group, prefill_mode, prompt_bytes, prompt_with, set_prefill,
+    set_prefill_group, set_prompt_stats, store_digests, take_prompt_stats,
 };
 pub use body::{
     Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, PAIR_ROWS, Plant, TIER_BEFORE_UPLOAD, prompt,

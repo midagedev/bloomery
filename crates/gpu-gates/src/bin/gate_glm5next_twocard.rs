@@ -44,12 +44,20 @@
 //!   tier serves the slots of its experts from the batch), its token and
 //!   logits row read.
 //!
+//! The two cards' load then runs a group leg, from a reset each: the first
+//! [`GROUP_PROMPT`] ids (two batches) as one prompt call at groups of one
+//! batch and at groups of two (`set_prefill_group`), each call's token and
+//! logits row read.
+//!
 //! Clauses, against the reference:
 //! - decode bits: the step and pair legs' tokens, kept counts and logits
 //!   rows bit for bit the reference's;
 //! - call bits: the call leg's token and logits row bit for bit the
 //!   reference's (no decode step follows the call, so a decode defect cannot
 //!   turn this clause red);
+//! - group bits: the group leg's call at groups of two bit for bit its call
+//!   at groups of one — a tiered layer's join reads its unit's route weights
+//!   and tier places after the next unit's front has routed;
 //! - structure: the stage's captured step graph holds the reference's node
 //!   count;
 //! - precondition: every layer the tier holds experts of was sent at least
@@ -86,7 +94,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir};
-    use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, feed};
+    use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, feed, set_prefill_group};
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
     use gguf::Split;
     use model::arch::glm5next::place::{self, KdaLanes, PlanInputs};
@@ -113,6 +121,9 @@ mod gate {
     /// (`prefill::T_MAX`): with each layer's tier on the ids after its stage
     /// prefix, the call's routing must reach every tier layer.
     const CALL_PROMPT: usize = 512;
+    /// Prompt positions of the group leg's calls: two whole batches, one
+    /// group at groups of two.
+    const GROUP_PROMPT: usize = 1024;
     /// The vocabulary: a wrong draft is the right one plus one, within it.
     const N_VOCAB: u32 = 154_880;
 
@@ -120,7 +131,7 @@ mod gate {
     fn prompt() -> Result<Vec<u32>, GateError> {
         let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
         let (_, _, prefill) = man.step()?;
-        let n = PROMPT.max(CALL_PROMPT);
+        let n = PROMPT.max(CALL_PROMPT).max(GROUP_PROMPT);
         if prefill.len() < n {
             return Err(format!("{D1K}: {} prefill ids, the gate reads {n}", prefill.len()).into());
         }
@@ -461,6 +472,24 @@ mod gate {
         })
     }
 
+    /// The group leg on `s`: the first [`GROUP_PROMPT`] ids of `prompt` as one
+    /// call at groups of one batch, then at groups of two, each from a
+    /// reset, its token and logits row; the session left at groups of one.
+    fn group_leg(s: &mut Session<Body>, prompt: &[u32]) -> Result<[Leg; 2], GateError> {
+        let m = s.model_mut();
+        let mut out = [Leg::default(), Leg::default()];
+        for (leg, g) in out.iter_mut().zip([1, 2]) {
+            set_prefill_group(m, g)?;
+            m.reset()?;
+            let tok = feed(m, &prompt[..GROUP_PROMPT])?;
+            leg.tokens.push(tok);
+            leg.logits.push(m.logits()?);
+        }
+        set_prefill_group(m, 1)?;
+        m.reset()?;
+        Ok(out)
+    }
+
     /// Whether leg `got` is `want` bit for bit; prints the first difference.
     fn same(what: &str, want: &Leg, got: &Leg) -> bool {
         if want.tokens != got.tokens || want.kept != got.kept {
@@ -565,6 +594,7 @@ mod gate {
             place: place_levers,
             host: levers.host(),
             prefill: PrefillMode::Batch,
+            group: 1,
         };
         let inputs =
             PlanInputs::read(&Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?)?;
@@ -636,13 +666,15 @@ mod gate {
             let mut s = open_union(&uplan, &inputs, &cfg)?;
             legs(&mut s, &prompt)?
         };
-        let got = {
+        let (got, [g1, g2]) = {
             let mut s = open_two(bp, &cfg)?;
-            legs(&mut s, &prompt)?
+            let run = legs(&mut s, &prompt)?;
+            (run, group_leg(&mut s, &prompt)?)
         };
         pass &= same("decode bits: step", &want.step, &got.step);
         pass &= same("decode bits: pair", &want.pair, &got.pair);
         pass &= same("call bits", &want.call, &got.call);
+        pass &= same("group bits: groups of two against groups of one", &g1, &g2);
         if got.stage_nodes == want.stage_nodes {
             println!(
                 "ok structure: stage graph of {} nodes, the reference's",

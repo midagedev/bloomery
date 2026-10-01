@@ -212,6 +212,8 @@ pub enum CheckpointError {
         at: u32,
         holds: Option<u32>,
     },
+    /// A forget of position `at`, where no checkpoint stands.
+    Unknown { at: u32 },
 }
 
 impl fmt::Display for CheckpointError {
@@ -249,6 +251,9 @@ impl fmt::Display for CheckpointError {
                     "a restore of position {at} from slot {slot}, which no copy has finished"
                 ),
             },
+            CheckpointError::Unknown { at } => {
+                write!(f, "a forget of position {at}, where no checkpoint stands")
+            }
         }
     }
 }
@@ -472,6 +477,22 @@ impl Ledger {
         });
         self.stats.taken += 1;
         Ok(Take::Copy { slot, new, evicted })
+    }
+
+    /// The point at `at` given back, its slot free and its take uncounted:
+    /// a take whose copy never finished. Every other point stays, and a
+    /// point the take evicted stays evicted. Refused by name where no point
+    /// stands.
+    pub fn forget(&mut self, at: u32) -> Result<(), CheckpointError> {
+        let i = self
+            .points
+            .iter()
+            .position(|p| p.pos == at)
+            .ok_or(CheckpointError::Unknown { at })?;
+        let p = self.points.remove(i);
+        self.free.push(p.slot);
+        self.stats.taken = self.stats.taken.saturating_sub(1);
+        Ok(())
     }
 
     /// Every point dropped and no cut waiting: the model is empty.
@@ -1299,6 +1320,36 @@ mod tests {
                 .contains("holds position 100")
         );
         assert_eq!(restorable(1, Some(512), 512), Ok(()));
+    }
+
+    /// A forget gives back the point at its position alone: the slot is free
+    /// for the next take, every earlier point stands, and a position where no
+    /// point stands is refused by name.
+    #[test]
+    fn forget_gives_back_one_take() {
+        let mut l = Ledger::new(4).unwrap();
+        let a = copy(l.take(512).unwrap());
+        let b = copy(l.take(1024).unwrap());
+        assert_ne!(a, b);
+        assert_eq!(l.stats().taken, 2);
+        assert_eq!(l.forget(1024), Ok(()));
+        assert_eq!(l.positions(), vec![512]);
+        assert_eq!(l.stats().taken, 1);
+        assert_eq!(l.keep(1000, 1100).at, 512);
+        assert_eq!(
+            l.take(1024),
+            Ok(Take::Copy {
+                slot: b,
+                new: false,
+                evicted: None
+            })
+        );
+        assert_eq!(l.forget(700), Err(CheckpointError::Unknown { at: 700 }));
+        assert_eq!(
+            CheckpointError::Unknown { at: 700 }.to_string(),
+            "a forget of position 700, where no checkpoint stands"
+        );
+        assert_eq!(l.positions(), vec![512, 1024]);
     }
 
     #[test]

@@ -1617,6 +1617,7 @@ impl Body {
                 missing: match at {
                     Plant::BeforeLaunch => "the planted failure before the launch",
                     Plant::AfterLaunch => "the planted failure after the launch",
+                    Plant::Group(_) => "the planted failure in a prompt group's walk",
                 },
             });
         }
@@ -1624,13 +1625,17 @@ impl Body {
     }
 }
 
-/// Where a gate plants a step's failure ([`Body::plant`]): in its refresh,
-/// before any input reaches the card, or once its chain has run and its
-/// host legs been served.
+/// Where a gate plants a failure ([`Body::plant`]): a step's in its
+/// refresh, before any input reaches the card, or once its chain has run and
+/// its host legs been served; or a prompt group's walk at the front of unit
+/// `u`'s first routed layer (`Group(u)`, taken by the next group that holds
+/// that unit), after the units before it and the dense lead of every unit
+/// have run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plant {
     BeforeLaunch,
     AfterLaunch,
+    Group(usize),
 }
 
 /// Arm (or disarm) `m`'s per-layer taps ([`Body::taps`] reads them back),

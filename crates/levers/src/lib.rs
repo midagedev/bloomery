@@ -693,6 +693,16 @@ impl Levers {
         Levers::usize_of(PREFILL_GROUP, n)
     }
 
+    /// `BLOOMERY_PREFILL_GROUP` as set, `None` unset: a binary whose own
+    /// default differs from the row's (GLM-5.3's 1) reads it here.
+    #[must_use]
+    pub fn prefill_group_set(&self) -> Option<usize> {
+        self.entry(PREFILL_GROUP)
+            .set
+            .as_ref()
+            .map(|_| self.prefill_group())
+    }
+
     /// `BLOOMERY_ENGRAM_HELPER`: V4.1 step rows read by a helper thread.
     #[must_use]
     pub fn engram_helper(&self) -> bool {
