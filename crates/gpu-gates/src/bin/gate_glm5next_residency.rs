@@ -83,8 +83,9 @@
 //!   the tally refuses a note of that layer by name, and the history ends in
 //!   that error).
 //! - `c1-mtp`: the drafted history twice, a residency reset between, gives
-//!   the same ids, windows and flips, flips landed (mutant: the staging
-//!   thread stages an expert's first part alone).
+//!   the same ids, windows and flips, flips landed (mutant: the walk reads
+//!   one NextN key past its position, so the second history reads a row the
+//!   first left behind).
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -968,8 +969,8 @@ mod gate {
             }
             Err(e) => {
                 println!(
-                    "pair-fold: the drafted history: error \"{e}\": {}; draft-quiet and c1-mtp \
-                     not run",
+                    "pair-fold, draft-quiet: the drafted history: error \"{e}\": {}; draft-quiet \
+                     and c1-mtp not run",
                     verdict(false)
                 );
                 ok = false;
