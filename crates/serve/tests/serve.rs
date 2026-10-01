@@ -639,6 +639,149 @@ fn hw_tokenize_answers_while_a_generation_holds_the_engine() {
     assert_eq!(done.json()["choices"][0]["message"]["content"], "abc");
 }
 
+/// The prompt entries the engine saw, in order, and the flag that ends the
+/// hold on the slot: until it is set every entry blocks where it is.
+#[derive(Default)]
+struct EntryLog {
+    state: std::sync::Mutex<(Vec<String>, bool)>,
+    cv: std::sync::Condvar,
+}
+
+impl EntryLog {
+    fn enter(&self, prompt: String) {
+        let mut g = self.state.lock().expect("entry log");
+        g.0.push(prompt);
+        self.cv.notify_all();
+        while !g.1 {
+            g = self.cv.wait(g).expect("entry log");
+        }
+    }
+
+    fn len_reached(&self, n: usize, bound: std::time::Duration) -> bool {
+        let g = self.state.lock().expect("entry log");
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, bound, |s| s.0.len() < n)
+            .expect("entry log");
+        g.0.len() >= n
+    }
+
+    fn release(&self) {
+        self.state.lock().expect("entry log").1 = true;
+        self.cv.notify_all();
+    }
+
+    fn prompts(&self) -> Vec<String> {
+        self.state.lock().expect("entry log").0.clone()
+    }
+}
+
+/// The mock engine with [`EntryLog`] in `prefill`: every prompt's entry is
+/// recorded in order and, until the log is released, blocks there, so one
+/// request holds the slot while later ones queue behind it.
+struct Queued {
+    inner: serve::MockEngine,
+    log: std::sync::Arc<EntryLog>,
+}
+
+impl Queued {
+    fn new(ctx: usize, log: std::sync::Arc<EntryLog>) -> Queued {
+        Queued {
+            inner: serve::MockEngine::new(ctx),
+            log,
+        }
+    }
+}
+
+impl serve::Engine for Queued {
+    fn tokenizer(&self) -> std::sync::Arc<dyn serve::Tokenizer> {
+        self.inner.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), serve::EngineError> {
+        self.log.enter(self.inner.tokenizer().decode(ids));
+        self.inner.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, serve::EngineError> {
+        self.inner.next(last, out)
+    }
+    fn reset(&mut self) -> Result<(), serve::EngineError> {
+        self.inner.reset()
+    }
+    fn ctx_max(&self) -> usize {
+        self.inner.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+/// Waits until `requests_deferred` reaches `n`: `n` requests have drawn a
+/// ticket and not got the slot.
+fn wait_deferred(addr: std::net::SocketAddr, n: usize, bound: std::time::Duration) {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let deferred = metric(&get(addr, "/metrics").body, "requests_deferred");
+        if deferred as usize >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "requests_deferred never reached {n} (now {deferred}): a request never queued"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Requests queued behind a held slot get it in the order they arrived: the
+/// order their tickets were drawn.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_queued_requests_get_the_slot_in_arrival_order() {
+    const QUEUED: usize = 4;
+    let log = std::sync::Arc::new(EntryLog::default());
+    let addr = common::start_with(Box::new(Queued::new(4096, log.clone())));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut workers = Vec::new();
+    for i in 0..=QUEUED {
+        let (tx, addr) = (tx.clone(), addr);
+        workers.push(std::thread::spawn(move || {
+            // Two tokens: `prefill` sees the prompt less its last token, so a
+            // one-token prompt would arrive there empty.
+            let body = json!({"prompt": format!("{i}a"), "n_predict": 1, "temperature": 0});
+            let r = post(addr, "/completion", &body);
+            let _ = tx.send((i, r.status));
+        }));
+        if i == 0 {
+            assert!(
+                log.len_reached(1, std::time::Duration::from_secs(10)),
+                "the first request never reached the engine; entries so far: {:?}",
+                log.prompts()
+            );
+        } else {
+            // Confirmed queued before the next starts, so the arrival order
+            // is the spawn order.
+            wait_deferred(addr, i, std::time::Duration::from_secs(10));
+        }
+    }
+    log.release();
+    for _ in 0..=QUEUED {
+        let (i, status) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "a request never finished ({e}); entries so far: {:?}",
+                    log.prompts()
+                )
+            });
+        assert_eq!(status, 200, "request {i}");
+    }
+    for w in workers {
+        w.join().expect("worker");
+    }
+    let want: Vec<String> = (0..=QUEUED).map(|i| i.to_string()).collect();
+    assert_eq!(log.prompts(), want, "the slot must pass in arrival order");
+}
+
 /// A spawned server, killed and reaped if the test panics before it exits.
 struct Reaped(std::process::Child);
 

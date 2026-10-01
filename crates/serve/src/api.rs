@@ -1,9 +1,10 @@
 //! Routes and JSON shapes. The field names, defaults and stream framing follow
 //! llama-server (ik_llama.cpp `examples/server`) so its clients work unchanged.
 //!
-//! One slot: the engine sits behind a mutex and a second generation waits for
-//! the first. `/health`, `/props`, `/slots`, `/metrics`, `/v1/models` and the
-//! tokenizer endpoints never take that mutex.
+//! One slot: the engine sits behind a mutex that a FIFO ticket gate hands out
+//! in arrival order, and a second generation waits for the first. `/health`,
+//! `/props`, `/slots`, `/metrics`, `/v1/models` and the tokenizer endpoints
+//! never take that mutex.
 //!
 //! No request takes the engine past [`Engine::ctx_max`], as llama-server's
 //! slots do not pass `n_ctx`: a prompt of `ctx_max` tokens or more is a 400
@@ -36,9 +37,10 @@
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -193,6 +195,7 @@ impl Server {
         let (end_tx, ended) = mpsc::channel();
         let state = State {
             slot_engine: Mutex::new(Slot::new(engine)),
+            queue: SlotQueue::default(),
             tok,
             fatal: Mutex::new(None),
             end: end_tx,
@@ -330,6 +333,8 @@ struct SlotView {
 struct State {
     /// The engine and the ids its cache holds, under one lock.
     slot_engine: Mutex<Slot>,
+    /// The ticket gate that hands `slot_engine` out in arrival order.
+    queue: SlotQueue,
     /// The engine's vocabulary, read without the engine lock.
     tok: Arc<dyn Tokenizer>,
     /// Set by the request that met an engine error; the reason `/health` gives.
@@ -359,13 +364,141 @@ fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The one slot's FIFO gate: tickets drawn in arrival order, the turn passed
+/// to the next ticket when the slot's holder releases it.
+///
+/// `serving` is the ticket whose turn it is, `next` the next ticket to hand
+/// out. The engine mutex is locked only by the holder of the serving ticket,
+/// and a holder releases it before passing the turn, so the woken ticket
+/// finds it uncontended. `serving == next` is the idle state: every ticket
+/// handed out has been served, nothing is queued, and the engine mutex is
+/// free. A poisoned lock is recovered as everywhere here: a panic in one run
+/// must not wedge the queue.
+#[derive(Default)]
+struct SlotQueue {
+    state: Mutex<QueueState>,
+    turn: Condvar,
+}
+
+#[derive(Default)]
+struct QueueState {
+    /// The next ticket to hand out. Arrival order is the order tickets are
+    /// drawn; a u64 cannot run out in a process's life.
+    next: u64,
+    /// The ticket whose turn it is.
+    serving: u64,
+}
+
+impl SlotQueue {
+    /// Draws the next ticket.
+    fn draw(&self) -> u64 {
+        let mut q = relock(&self.state);
+        let ticket = q.next;
+        q.next = ticket + 1;
+        ticket
+    }
+
+    /// Waits until `ticket`'s turn comes.
+    fn wait_for(&self, ticket: u64) {
+        let mut q = relock(&self.state);
+        while q.serving != ticket {
+            q = self.turn.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Passes the turn to the ticket after `ticket`; the caller has already
+    /// released the engine mutex. Every waiter rechecks its own ticket, so
+    /// all are woken, not one picked for it.
+    fn pass(&self, ticket: u64) {
+        let mut q = relock(&self.state);
+        q.serving = ticket + 1;
+        self.turn.notify_all();
+    }
+
+    /// Draws a ticket only when the queue is idle (`serving == next`: the
+    /// slot is free and no ticket waits), so a caller that never waits cannot
+    /// jump ahead of queued requests; `None` is that refusal.
+    fn try_draw(&self) -> Option<u64> {
+        let mut q = relock(&self.state);
+        (q.serving == q.next).then(|| {
+            let ticket = q.next;
+            q.next = ticket + 1;
+            ticket
+        })
+    }
+}
+
+/// The slot for one run: the engine mutex plus the turn it holds. The fields
+/// drop in declaration order, so the engine mutex releases before the turn
+/// passes and the next ticket wakes to a free slot — on a normal return and
+/// on an unwinding panic alike, which drops this guard all the same.
+struct SlotGuard<'a> {
+    slot: MutexGuard<'a, Slot>,
+    #[allow(
+        dead_code,
+        reason = "the drop is the use: it passes the turn once the slot releases"
+    )]
+    turn: TurnGuard<'a>,
+}
+
+/// The turn of one ticket, given back when the holder is done.
+struct TurnGuard<'a> {
+    queue: &'a SlotQueue,
+    ticket: u64,
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        self.queue.pass(self.ticket);
+    }
+}
+
+impl Deref for SlotGuard<'_> {
+    type Target = Slot;
+
+    fn deref(&self) -> &Slot {
+        &self.slot
+    }
+}
+
+impl DerefMut for SlotGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Slot {
+        &mut self.slot
+    }
+}
+
 impl State {
-    /// Waits for the one slot (counted in `requests_deferred` while waiting).
-    fn engine(&self) -> MutexGuard<'_, Slot> {
+    /// Waits for the one slot, in arrival order: of the requests waiting, the
+    /// one that drew the earlier ticket gets the slot first (counted in
+    /// `requests_deferred` from its ticket to its slot).
+    fn engine(&self) -> SlotGuard<'_> {
+        let ticket = self.queue.draw();
         self.waiting.fetch_add(1, Ordering::SeqCst);
-        let g = relock(&self.slot_engine);
+        self.queue.wait_for(ticket);
+        let slot = relock(&self.slot_engine);
         self.waiting.fetch_sub(1, Ordering::SeqCst);
-        g
+        SlotGuard {
+            slot,
+            turn: TurnGuard {
+                queue: &self.queue,
+                ticket,
+            },
+        }
+    }
+
+    /// Takes the slot without waiting, out of the queue's order only when the
+    /// queue is idle; `None` while a request runs on the slot or one waits
+    /// behind it. The ticket is the serving one already, so the engine mutex
+    /// is uncontended.
+    fn engine_try(&self) -> Option<SlotGuard<'_>> {
+        let ticket = self.queue.try_draw()?;
+        Some(SlotGuard {
+            slot: relock(&self.slot_engine),
+            turn: TurnGuard {
+                queue: &self.queue,
+                ticket,
+            },
+        })
     }
 
     fn next_id(&self) -> u64 {
@@ -1261,9 +1394,10 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError
 
 /// Holds the slot for one generation: busy flag, slot view, counters. Dropped
 /// after the response is written; an engine failure it met is signalled then.
+/// Dropping it also gives the slot's turn to the next queued request.
 struct Run<'a> {
     state: &'a State,
-    engine: MutexGuard<'a, Slot>,
+    engine: SlotGuard<'a>,
     failure: Option<EngineFailure>,
 }
 
@@ -1281,23 +1415,21 @@ impl<'a> Run<'a> {
         Self::hold(state, state.engine())
     }
 
-    /// Takes the slot if it is free: a request running on it is a 503.
+    /// Takes the slot if it is free and no ticket is waiting: a request
+    /// running on it, or one queued behind such a request, is a 503. The slot
+    /// action never waits and never jumps ahead of queued requests.
     fn try_begin(state: &'a State) -> Result<Self, ApiError> {
-        let engine = match state.slot_engine.try_lock() {
-            Ok(g) => g,
-            Err(TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                return Err(ApiError {
-                    code: 503,
-                    kind: "unavailable_error",
-                    message: "slot 0 is processing a request".to_owned(),
-                });
-            }
+        let Some(engine) = state.engine_try() else {
+            return Err(ApiError {
+                code: 503,
+                kind: "unavailable_error",
+                message: "slot 0 is processing a request".to_owned(),
+            });
         };
         Self::hold(state, engine)
     }
 
-    fn hold(state: &'a State, engine: MutexGuard<'a, Slot>) -> Result<Self, ApiError> {
+    fn hold(state: &'a State, engine: SlotGuard<'a>) -> Result<Self, ApiError> {
         if let Some(reason) = relock(&state.fatal).as_deref() {
             return Err(dead_engine(reason));
         }
@@ -2066,7 +2198,9 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, after_accept_error};
+    use super::{
+        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, SlotQueue, after_accept_error,
+    };
     use std::io;
     use std::time::Duration;
 
@@ -2090,5 +2224,25 @@ mod tests {
             let e = io::Error::from_raw_os_error(raw);
             assert_eq!(after_accept_error(&e, true, 0), None, "{e}");
         }
+    }
+
+    /// A try-draw never jumps ahead of queued tickets: while any handed-out
+    /// ticket is unserved the queue answers `None`; idle, it answers the
+    /// ticket a waiting caller would have drawn.
+    #[test]
+    fn try_draw_refuses_while_a_ticket_waits() {
+        let q = SlotQueue::default();
+        assert_eq!(q.try_draw(), Some(0), "idle: the ticket is the holder's");
+        assert_eq!(q.draw(), 1, "drawn after the try-drawn ticket");
+        assert_eq!(q.draw(), 2);
+        assert_eq!(
+            q.try_draw(),
+            None,
+            "two tickets wait: a try must not jump ahead"
+        );
+        q.pass(1);
+        assert_eq!(q.try_draw(), None, "one ticket still waits");
+        q.pass(2);
+        assert_eq!(q.try_draw(), Some(3), "idle again after every turn passed");
     }
 }
