@@ -1,8 +1,10 @@
 # The GLM-5.3-Flash clip's toktape tapes: one engine per hold, the clip41 prompts (the RateLimiter review 1500 out,
-# the Rust and Korean chats 400 out), greedy, thinking off, one discarded warm-up. bloomery-serve --model glm
+# the Rust and Korean chats, here 2000 and 1000 out), greedy, reasoning_effort low (GLM-5.3's template always opens
+# <think>), one discarded warm-up. bloomery-serve --model glm
 # --place a (the A6000 alone, the serving defaults: adaptive residency mid-p0-s1 and the NextN MTP draft);
 # llama.cpp PR #27754's llama-server on the A6000 alone at the profile's MTP placement (models/glm5next.sh:
-# --n-cpu-moe GLM_NCMOE_MTP, -fa off, GLM_MTP_FLAGS, NVIDIA_TF32_OVERRIDE=0), op offload at its default, same file.
+# --n-cpu-moe 38, one past GLM_NCMOE_MTP: at 37 the MTP context's compute buffer does not fit at -c 4096;
+# -fa off, -nopo 1, GLM_MTP_FLAGS, NVIDIA_TF32_OVERRIDE=0), same file.
 # The tapes are the clip's evidence; the table numbers stay the depth runner's.
 kind: exclusive
 reason: a 186 GB host set plus a card load and three timed requests per engine; per-token times are the clip, so
