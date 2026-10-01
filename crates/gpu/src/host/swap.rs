@@ -263,6 +263,9 @@ pub struct Tally {
     ids: Vec<u32>,
     /// Per (row, layer), a bit per slot noted this pass.
     filled: Vec<u64>,
+    /// Per layer: no pass routes it, so no note of it is taken
+    /// ([`MachineCfg::unrouted`]).
+    unrouted: Vec<bool>,
 }
 
 impl Tally {
@@ -272,7 +275,7 @@ impl Tally {
         Tally::default()
     }
 
-    fn new(layers: Range<usize>, top_k: usize, max_rows: usize) -> Tally {
+    fn new(layers: Range<usize>, top_k: usize, max_rows: usize, unrouted: Vec<bool>) -> Tally {
         let cells = layers.len() * max_rows;
         Tally {
             on: true,
@@ -281,6 +284,7 @@ impl Tally {
             max_rows,
             ids: vec![0; cells * top_k],
             filled: vec![0; cells],
+            unrouted,
         }
     }
 
@@ -293,8 +297,9 @@ impl Tally {
 
     /// Slot `k` of row `row`'s routing at layer `layer` is `id`. A tally that
     /// is off notes nothing. Refused by name: a layer it does not cover
-    /// ([`Tally::covers`]), a row or a slot past its shape, and a slot noted
-    /// twice in one pass.
+    /// ([`Tally::covers`]), a row or a slot past its shape, a slot noted
+    /// twice in one pass, and a layer no pass routes
+    /// ([`MachineCfg::unrouted`]).
     pub fn note(&mut self, layer: usize, row: usize, k: usize, id: u32) -> Result<(), GpuError> {
         const WHAT: &str = "Tally::note";
         if !self.on {
@@ -307,6 +312,15 @@ impl Tally {
                     "layer {layer} row {row} slot {k}: the tally holds layers {:?}, {} rows, \
                      top-{}",
                     self.layers, self.max_rows, self.top_k
+                ),
+            ));
+        }
+        if self.unrouted[layer - self.layers.start] {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer} row {row}: a layer no pass routes (MachineCfg::unrouted); its \
+                     routing is not the rule's"
                 ),
             ));
         }
@@ -1128,6 +1142,12 @@ pub struct MachineCfg {
     pub top_k: usize,
     /// The most rows one pass runs.
     pub max_rows: usize,
+    /// Layers of the map no pass routes (a draft layer whose experts the
+    /// host serves beside the chain): each has no card slot, a note of it is
+    /// refused by name, and a kept row needs none of it
+    /// ([`runtime::swaprule::SwapRule::with_unrouted`]). Empty for a load
+    /// whose passes route every layer of its map.
+    pub unrouted: Vec<usize>,
     /// The bound on every host wait the machine makes: a wait past it is a
     /// named error, never a hang. Each wait is counted from the call that
     /// makes it, and a landing's or a reset's wait includes the rest of the
@@ -1304,13 +1324,30 @@ impl SwapMachine {
             ));
         }
         let layout = SwapMachine::layout(slots, &cfg.pinned, cfg.params.spares)?;
+        let mut unrouted = Vec::with_capacity(cfg.unrouted.len());
+        for &l in &cfg.unrouted {
+            let cap = match layers.contains(&l) {
+                true => slots.capacity(l)?,
+                false => 0,
+            };
+            if !layers.contains(&l) || cap != 0 {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l} listed as routed by no pass: it must be a layer of the map \
+                         {layers:?} with no card slot, and holds {cap}"
+                    ),
+                ));
+            }
+            unrouted.push(l - layers.start);
+        }
         for &(l, id) in &layout.freed {
             source.prepare_victim(l, id)?;
             if !source.host_resident(l, id)? {
                 return Err(not_resident(WHAT, l, id, "a spare slot's expert"));
             }
         }
-        let rule = SwapMachine::rule_of(&layout, &cfg, n_expert)?;
+        let rule = SwapMachine::rule_of(&layout, &cfg, n_expert, &unrouted)?;
         let events = (0..layers.len() * cfg.params.spares)
             .map(|_| ctx.new_event(None))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1433,8 +1470,14 @@ impl SwapMachine {
     }
 
     /// The rule over `layout`: each layer's seed its slot order, its card set
-    /// the seed less its spares, its tier experts away.
-    fn rule_of(layout: &Layout, cfg: &MachineCfg, n_expert: usize) -> Result<SwapRule, GpuError> {
+    /// the seed less its spares, its tier experts away, the layers
+    /// `unrouted` (the rule's numbering) routed by no pass.
+    fn rule_of(
+        layout: &Layout,
+        cfg: &MachineCfg,
+        n_expert: usize,
+        unrouted: &[usize],
+    ) -> Result<SwapRule, GpuError> {
         let seed: Vec<&[u32]> = layout.order.iter().map(Vec::as_slice).collect();
         let away: Vec<&[u32]> = layout.tier.iter().map(Vec::as_slice).collect();
         let capacity: Vec<usize> = layout
@@ -1448,6 +1491,7 @@ impl SwapMachine {
             max_rows: cfg.max_rows,
         };
         SwapRule::new_placed(cfg.params, shape, &seed, &capacity, &layout.pinned, &away)
+            .and_then(|r| r.with_unrouted(unrouted))
             .map_err(|e| rule_err("SwapMachine::new", e))
     }
 
@@ -1533,7 +1577,12 @@ impl SwapMachine {
     #[must_use]
     pub fn tally(&self) -> Tally {
         let r = self.rule_shape;
-        Tally::new(self.layers.clone(), r.top_k, r.max_rows)
+        Tally::new(
+            self.layers.clone(),
+            r.top_k,
+            r.max_rows,
+            self.rule.unrouted().to_vec(),
+        )
     }
 
     /// The slot ledger.
@@ -1745,18 +1794,18 @@ impl SwapMachine {
         Ok(())
     }
 
-    /// `tally` holds, for each row below `kept`, every slot of every layer,
-    /// and for each other row every slot of a layer or none; every noted row
-    /// names distinct ids below the experts.
+    /// `tally` holds, for each row below `kept`, every slot of every layer
+    /// but the ones no pass routes, and for each other row every slot of a
+    /// layer or none; every noted row names distinct ids below the experts.
     fn check_tally(&self, t: &Tally, kept: usize, what: &'static str) -> Result<(), GpuError> {
         let n = self.layers.len();
         let full = t.full();
         for row in 0..t.max_rows {
-            for l in 0..n {
+            for (l, &unrouted) in self.rule.unrouted().iter().enumerate().take(n) {
                 let cell = row * n + l;
                 let mask = t.filled[cell];
                 let layer = self.layers.start + l;
-                if mask == 0 && row >= kept {
+                if mask == 0 && (row >= kept || unrouted) {
                     continue;
                 }
                 if mask != full {
@@ -2989,13 +3038,18 @@ mod tests {
         );
     }
 
-    /// An off tally notes nothing; a live one refuses a slot noted twice and
-    /// a note outside its shape, by name.
+    /// An off tally notes nothing; a live one refuses a slot noted twice, a
+    /// note outside its shape and a note of a layer no pass routes, by name.
     #[test]
     fn a_tally_refuses_a_double_and_an_out_of_shape_note() {
         let mut off = Tally::off();
         assert!(off.note(9, 9, 9, 1).is_ok() && !off.covers(0));
-        let mut t = Tally::new(2..4, 3, 2);
+        let mut t = Tally::new(2..4, 3, 2, vec![false, true]);
+        let unrouted = t.note(3, 0, 0, 1).expect_err("a layer no pass routes");
+        assert!(
+            unrouted.to_string().contains("no pass routes"),
+            "{unrouted}"
+        );
         t.note(2, 0, 1, 7).expect("a first note");
         let twice = t.note(2, 0, 1, 8).expect_err("a slot twice");
         assert!(twice.to_string().contains("noted twice"), "{twice}");

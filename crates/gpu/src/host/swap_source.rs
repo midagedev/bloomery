@@ -73,6 +73,14 @@ pub trait FileStacks: Send + Sync {
         None
     }
 
+    /// The map's layers no pass routes, by their model numbers
+    /// ([`super::swap::MachineCfg::unrouted`]): a draft layer the host tier
+    /// serves beside the chain, with no card slot. Empty by default: every
+    /// layer of the map is routed by the passes.
+    fn unrouted(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
     /// The load's convert step over the stacks the load found: `dims` the
     /// first card layer's first stack's dims, `parts` that layer's parts,
     /// each part's bytes an expert, `sidecar` whether the host reads the r8

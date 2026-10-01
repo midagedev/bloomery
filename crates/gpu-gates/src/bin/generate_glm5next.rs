@@ -86,8 +86,13 @@
 //! word refused by name when the plan's fewest card experts a layer leave
 //! no room for P pinned, S spares and one that moves; after the run's
 //! lines, the `residency pass` record of every boundary (the prompt call's,
-//! then each step's), none between two timed steps. Refused by name beside
-//! the MTP draft, `--pair`, the route trace and `--prefill steps`.
+//! then each step's), none between two timed steps. Beside the MTP draft the
+//! NextN load runs under it (`open_nextn` with the word): each window's
+//! boundary ends a `pair` pass keeping the rows its commit accepted, or a
+//! `step` pass for a window with no proposal, the draft's walks between a
+//! commit and the next boundary noting no id; the next-token layer stays on
+//! the host. Refused by name beside `--pair`, the route trace and
+//! `--prefill steps`.
 //!
 //! `BLOOMERY_STEP_STATS=1` reads the host tier before the first generated
 //! step and after each (`host_stats::Probe`) and prints, after `SMOKE`, a
@@ -205,9 +210,16 @@ mod cli {
         t: Instant,
         /// `BLOOMERY_RESIDENCY` set to `mid-…`: its parse and its word.
         residency: Option<(Residency, &'static str)>,
+        /// The host bytes the load holds beside the plan's: the NextN
+        /// layer's host experts on a drafted load, else 0.
+        beside: u64,
     }
 
     impl OpenLog<Body> for Log {
+        fn beside(&mut self, bytes: u64) {
+            self.beside = bytes;
+        }
+
         fn plan(
             &mut self,
             place: &'static str,
@@ -219,7 +231,7 @@ mod cli {
             self.top_k = inputs.hp.indexer.top_k;
             if let Some((r, word)) = self.residency {
                 residency_room(plan, r, word).map_err(SessionError::Caller)?;
-                residency_set(plan, GLM_CARD, r, word, 0, Record::print)
+                residency_set(plan, GLM_CARD, r, word, self.beside, Record::print)
                     .map_err(SessionError::Caller)?;
             }
             Ok(!self.stop_at_plan)
@@ -349,7 +361,7 @@ mod cli {
             Some(p) => PrefillMode::from_name(&p)
                 .ok_or_else(|| format!("--prefill is batch or steps, not {p}"))?,
         };
-        let residency = residency_of(&levers, drafted, pair, prefill)?;
+        let residency = residency_of(&levers, pair, prefill)?;
         if has("--model") {
             return Err(
                 "--model is not a flag: the file is $BLOOMERY_REF_MODEL, which \
@@ -404,6 +416,7 @@ mod cli {
             stop_at_plan: has("--plan"),
             t,
             residency,
+            beside: 0,
         };
         let args = OpenArgs {
             place,
@@ -413,7 +426,8 @@ mod cli {
             cfg,
         };
         let mut s = if drafted {
-            let Some(s) = open_nextn(file, args, &mut log)? else {
+            let lever = residency.map_or(Residency::Off, |(r, _)| r);
+            let Some(s) = open_nextn(file, args, lever, &mut log)? else {
                 return Ok(());
             };
             s
@@ -690,7 +704,7 @@ mod cli {
     /// prompt fed with the draft's
     /// store walked over its units, then windows until `-n` tokens are out,
     /// every kept token the target's own argmax; the lines the module doc
-    /// names.
+    /// names, the `residency pass` records last.
     fn drafted_run(s: &mut Session<Body>, a: &Arm<'_>) -> Result<(), GateError> {
         let draft = MtpDraft::open(s.model(), a.prefill, StepMode::Eager)?;
         let mut spec = s.with_draft::<MtpDraft<Body>, VERIFY_ROWS>(draft, &mut PairCapture)?;
@@ -797,6 +811,14 @@ mod cli {
                 .f("tok/s(positions)", rate)
                 .print();
         }
+        for (kind, r) in s
+            .model_mut()
+            .body_parts("generate_glm5next")?
+            .2
+            .take_residency_passes()
+        {
+            record::residency_pass_of(kind, &r).print();
+        }
         Ok(())
     }
 
@@ -844,14 +866,13 @@ mod cli {
 
     /// `BLOOMERY_RESIDENCY` as this run takes it: unset or `off`, `None` (the
     /// plain load); set to `mid-…`, its parse and word, its `residency lever`
-    /// record printed. Refused by name beside the MTP draft (the NextN load
-    /// runs no residency machine), `--pair` (its verifies run after a cut
-    /// back to the prompt's end), the route trace (a fixed placement's
-    /// routing) and the steps feed (each prompt id would end a pass the rule
-    /// counts; the body refuses it at the feed, this before the load).
+    /// record printed. Refused by name beside `--pair` (its verifies run
+    /// after a cut back to the prompt's end), the route trace (a fixed
+    /// placement's routing) and the steps feed (each prompt id would end a
+    /// pass the rule counts; the body refuses it at the feed, this before the
+    /// load). Beside the MTP draft the NextN load takes it.
     fn residency_of(
         levers: &bloomery_levers::Levers,
-        drafted: bool,
         pair: bool,
         prefill: PrefillMode,
     ) -> Result<Option<(Residency, &'static str)>, GateError> {
@@ -867,9 +888,7 @@ mod cli {
         if r == Residency::Off {
             return Ok(None);
         }
-        let beside = if drafted {
-            Some("BLOOMERY_DRAFT=mtp (the NextN load runs no residency machine)")
-        } else if pair {
+        let beside = if pair {
             Some("--pair (its verifies run after a cut back to the prompt's end)")
         } else if levers.route_trace().is_some() {
             Some("BLOOMERY_ROUTE_TRACE (the trace records a fixed placement's routing)")

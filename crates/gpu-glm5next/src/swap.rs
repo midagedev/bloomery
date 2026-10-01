@@ -78,18 +78,27 @@ pub struct Glm5Stacks {
     /// Per trunk layer, its three stacks' types in stack order; `None` on a
     /// layer that holds none of them (a dense block).
     types: Vec<Option<[GgmlType; 3]>>,
-    /// The layers the body's slot map holds (the host tier's run, every
-    /// routed layer): the machine's per-layer lists cover these, not the
-    /// card's whole range the dense lead is part of.
+    /// The layers the body's slot map holds (the host tier's run: every
+    /// routed layer, and on a NextN load the next-token layer after them):
+    /// the machine's per-layer lists cover these, not the card's whole range
+    /// the dense lead is part of.
     map_layers: usize,
+    /// The next-token layer on a NextN load: the map's last layer, which no
+    /// pass routes (the draft's walks serve it through the batch port, which
+    /// notes no id) and which holds no card slot.
+    nextn: Option<usize>,
 }
 
 impl Glm5Stacks {
     /// The stacks of the layers `inputs` describes, their types read from
-    /// its tensors, for a body whose slot map holds `map_layers` layers.
-    /// Refused by name: a layer that holds some of its three stacks but not
-    /// all.
-    pub fn of(inputs: &PlanInputs, map_layers: usize) -> Result<Glm5Stacks, GpuError> {
+    /// its tensors, for a body whose slot map holds `map_layers` layers, the
+    /// last of them the next-token layer `nextn` on a NextN load. Refused by
+    /// name: a layer that holds some of its three stacks but not all.
+    pub fn of(
+        inputs: &PlanInputs,
+        map_layers: usize,
+        nextn: Option<usize>,
+    ) -> Result<Glm5Stacks, GpuError> {
         const WHAT: &str = "Glm5Stacks::of";
         let find = |name: &str| {
             inputs
@@ -124,7 +133,11 @@ impl Glm5Stacks {
                 }
             });
         }
-        Ok(Glm5Stacks { types, map_layers })
+        Ok(Glm5Stacks {
+            types,
+            map_layers,
+            nextn,
+        })
     }
 }
 
@@ -146,6 +159,10 @@ impl FileStacks for Glm5Stacks {
 
     fn map_layers(&self) -> Option<usize> {
         Some(self.map_layers)
+    }
+
+    fn unrouted(&self) -> Vec<usize> {
+        self.nextn.into_iter().collect()
     }
 
     fn open(

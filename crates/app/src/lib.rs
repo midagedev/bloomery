@@ -228,6 +228,11 @@ pub trait OpenLog<B: Open> {
         plan: &Plan<'_>,
     ) -> Result<bool, SessionError>;
 
+    /// The host bytes the load holds beside the plan's own (a next-token
+    /// layer's host experts), told before [`OpenLog::plan`]; a load with
+    /// none never calls it.
+    fn beside(&mut self, _bytes: u64) {}
+
     /// The model loaded by that plan, in its step mode, nothing captured.
     fn load(&mut self, m: &GpuModel<B>) -> Result<(), SessionError>;
 

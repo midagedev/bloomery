@@ -610,7 +610,8 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// [`GpuModel::load_placed_with`] whose host set also holds `hosted` (its
-    /// runs and their file bytes, which the host need counts):
+    /// runs and their file bytes, which the host need counts, and which the
+    /// churn pool's check takes out of the plan's host headroom first):
     /// per entry, the experts of the plan's model tensor at that index the
     /// host tier serves though the plan places the tensor nowhere (a draft
     /// layer the body loads beside the plan's own), read in and locked with
@@ -642,8 +643,11 @@ impl<B: ChainBody> GpuModel<B> {
                 Some(ChurnPool::of(plan, card, pinned).map_err(|e| GpuError::plan(WHAT, e))?)
             }
         };
+        // The host set holds `hosted` beside the plan's own segments, out of
+        // the same headroom the pool must fit.
         if let Some(p) = &churn {
-            p.check(plan).map_err(|e| GpuError::plan(WHAT, e))?;
+            p.check_beside(plan, hosted.1)
+                .map_err(|e| GpuError::plan(WHAT, e))?;
         }
         let pool = churn
             .as_ref()
@@ -685,6 +689,7 @@ impl<B: ChainBody> GpuModel<B> {
                         ],
                         top_k: residency.top_k,
                         max_rows: residency.max_rows,
+                        unrouted: residency.stacks.unrouted(),
                         deadline: residency.deadline,
                     },
                 )
