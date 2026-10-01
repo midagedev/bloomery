@@ -54,7 +54,12 @@
 #   place-gate   BLOOMERY_GEN_PLACE=gate with the 3090 as the timing card, 6: `--place gate` on the stub's
 #                command line, the row's `place gate`; the load line naming place=a (STUB_GEN_PLACE_RAN): a
 #                FAIL row naming both, rc 1; gate with the A6000 as the timing card: refused by name, rc 64.
-#   mtp          STUB_GEN_MTP=1, 6: the row's `mtp E(4) 2.500 = positions 10 / passes 4, kept [1, 1, 1, 1]`.
+#   mtp          STUB_GEN_MTP=1, 6: the row's `mtp E(4) 2.500 = positions 10 / passes 4, kept [1, 1, 1, 1]` and
+#                its pass time from the SMOKE line, `ms/pass 12.5000 (mean_ms × steps 10 / passes 4)`.
+#   mtp-pass-ratio  STUB_GEN_MTP=1, 6 6@STUB_GEN_PASSES=5, two rounds: one `mean pass` line a label (12.5 and
+#                10.0 ms a pass) and `ratio pass d=6 ours/ours@STUB_GEN_PASSES=5 mean 0.8000`, the passes a second
+#                80 / 100, beside the decode ratio 1.0000 the two arms' equal tok/s give.
+#   mtp-pass-bad STUB_GEN_MTP=1 STUB_GEN_PASSES=0, 6: a SMOKE line with passes=0 is a FAIL row naming it, rc 1.
 #   res-sums     generate_qwen3moe's schema with the residency kinds (the stub tree's copy, its own residency
 #                rows replaced by generate_ds41's), STUB_GEN_RES=mid-p148-s1, 6@BLOOMERY_RESIDENCY=mid-p148-s1: the row's
 #                `residency mid-p148-s1 (set) passes 3 kept 30 landed 3 late 1 made 3 bytes 12288` (the none and
@@ -131,6 +136,9 @@ cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/
 # written, so they are newer than every crates/ source).
 mkdir -p "$T/crates/levers/src"
 cp "$ROOT/crates/levers/src/registry.rs" "$T/crates/levers/src/"
+# The copy's one row of its own, STUB_GEN_PASSES (the stub engine's pass count): a lever arm sets a registry
+# row, and the mtp-pass-ratio case's lever arm sets this one.
+echo '// LeverSpec { name: "STUB_GEN_PASSES", site: Site::Parsed } (the stub test'"'"'s own row)' >> "$T/crates/levers/src/registry.rs"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
 # STUB_CPU_BUSY=1: every CPU sample reads 99 % of one cpu from a stub process (the cpu-guard case).
 # shellcheck disable=SC2016 # written into the stub tree's lease.sh, expanded there
@@ -284,8 +292,10 @@ touch "$T/Cargo.toml"
 # STUB_GEN_FAIL_DEPTH ends the process at rc 3 the first time (a marker file), after its prompt ids. Its
 # load line names --place's placement (a when none; STUB_GEN_PLACE_RAN in its stead), each arm ends with
 # its `tokens` line (token 0 STUB_GEN_TOKEN0, 1000 by default, then the step lines' ids), and under
-# STUB_GEN_MTP an `mtp summary` of 10 positions in 4 passes. Every process appends its --place to
-# $TMPDIR/stub-gen-place (`-` when none).
+# STUB_GEN_MTP an `mtp summary` of 10 positions in 4 passes and the MTP form of the SMOKE line (steps= the
+# summary's positions, passes= its passes, no seeded=): STUB_GEN_PASSES=5 is 10 positions in 5 passes, 0 none
+# in none, any other value an error. Every process appends its --place to $TMPDIR/stub-gen-place (`-` when
+# none).
 cat > "$T/target/release/generate_qwen3moe" << 'EOF'
 #!/usr/bin/env bash
 tokens='' n=32 ctx=0 sync='' arms=() place=''
@@ -329,7 +339,16 @@ for k in "${!arms[@]}"; do
   echo "stat prompt ubatch_tokens=0 (no ubatch ran)"
   for i in $(seq 1 $((n - 1))); do echo "step $i $((depth + i)) $((1000 + i))"; echo "time step $i ms=5.0000"; done
   echo "tokens [$(for i in $(seq 0 $((n - 1))); do [ "$i" = 0 ] && printf '%s' "${STUB_GEN_TOKEN0:-1000}" || printf ', %s' $((1000 + i)); done)]"
-  [ -z "${STUB_GEN_MTP:-}" ] || echo "mtp summary proposals=3 kept=[1, 1, 1, 1] positions=10 passes=4 tok/s(positions)=200.00"
+  if [ -n "${STUB_GEN_MTP:-}" ]; then
+    # kept[k - 1] passes kept k positions: the histogram sums to the passes, its weighted sum to the positions.
+    case ${STUB_GEN_PASSES:-4} in
+      4) mq=4 mp=10 mk='1, 1, 1, 1' mr=200.00 ;;
+      5) mq=5 mp=10 mk='2, 2, 0, 1' mr=200.00 ;;
+      0) mq=0 mp=0 mk='0, 0, 0, 0' mr=0.00 ;;
+      *) echo "error: the stub has no kept histogram for STUB_GEN_PASSES=$STUB_GEN_PASSES" >&2; exit 64 ;;
+    esac
+    echo "mtp summary proposals=$((mq > 0 ? mq - 1 : 0)) kept=[$mk] positions=$mp passes=$mq tok/s(positions)=$mr"
+  fi
   [ -z "${STUB_GEN_STATS:-}" ] || echo "stat summary steps=$((n - 1)) leg_us_mean=1.0 leg_us_p50=1.0 straggle_us_max=1.0 host_slots_mean=3.4 majflt=0 minflt=0 vram_free_load=1 vram_free_min=1"
   if [ -n "${STUB_GEN_RES:-}" ]; then
     rp() { echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=$5 made=$6 in_flight=0 bytes=$7 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
@@ -337,7 +356,11 @@ for k in "${!arms[@]}"; do
     rp prompt 1 99 1 0 1 4096
     for i in $(seq 1 $((n - 1))); do rp step $((i + 1)) 10 1 $((i == 1 ? 1 : 0)) 1 4096; done
   fi
-  echo "SMOKE mode=graph prompt_tokens=$depth depth=$depth seeded=false generated=$n warm=0 steps=$((n - 1)) p50_ms=5.0000 mean_ms=5.0000 tok/s(p50)=200.00 ctx=$ctx"
+  if [ -n "${STUB_GEN_MTP:-}" ]; then
+    echo "SMOKE mode=graph prompt_tokens=$depth depth=$depth generated=$n warm=0 steps=$mp passes=$mq p50_ms=5.0000 mean_ms=5.0000 tok/s(p50)=200.00 tok/s(mean)=200.00 ctx=$ctx"
+  else
+    echo "SMOKE mode=graph prompt_tokens=$depth depth=$depth seeded=false generated=$n warm=0 steps=$((n - 1)) p50_ms=5.0000 mean_ms=5.0000 tok/s(p50)=200.00 ctx=$ctx"
+  fi
 done
 EOF
 cp "$T/target/release/generate_qwen3moe" "$T/base/target/release/generate_qwen3moe"
@@ -418,7 +441,8 @@ elif want fields "$L" 2 "^ROW r[12] ours d=6 n=4 ctx=256 \| tok/s\(mean\) 200.00
   want fields "$L" 2 "^ROW r[12] mrs d=6 n=4 \| tok/s 50.0 @ n=4, depth 6, A6000 \(stub\) \| build mistralrs 0.0.0-stub \| device layers 0-1: cuda\[0\] $END" &&
   want fields "$L" 2 "^ROW r[12] mrspp p=4 n=0 \| tok/s\(pp\) 400.0 @ n=0, prompt 4, A6000 \(stub\) \| scheduler defaults: [^|]* \| build mistralrs 0.0.0-stub \| device layers 0-1: cuda\[0\] $END" &&
   want fields "$L" 1 '^ratio d=6 +ours/lcpp +mean 1[0-9.]+ ' &&
-  want fields "$L" 1 '^other-busy rows: 0 of 14 '; then
+  want fields "$L" 1 '^other-busy rows: 0 of 14 ' &&
+  want fields "$L" 0 'ms/pass|^=== pass time|^mean pass |^ratio pass '; then
   pass fields
 fi
 
@@ -977,8 +1001,40 @@ L=$tmp/mtp.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_MTP=1 -- 6
 if [ "$RC" != 0 ]; then
   fail mtp "rc $RC, want 0" "$L"
-elif want mtp "$L" 1 '^ROW r1 ours d=6 .* \| mtp E\(4\) 2\.500 = positions 10 / passes 4, kept \[1, 1, 1, 1\] \| '; then
+elif want mtp "$L" 1 '^ROW r1 ours d=6 .* \| mtp E\(4\) 2\.500 = positions 10 / passes 4, kept \[1, 1, 1, 1\] \| ' &&
+  want mtp "$L" 1 '^ROW r1 ours d=6 .* \| ms/pass 12\.5000 \(mean_ms × steps 10 / passes 4\) \| '; then
   pass mtp
+fi
+
+# Two MTP arms whose passes differ, their tok/s alike: ours keeps 10 positions in 4 passes, the lever arm in 5,
+# both at mean_ms 5, so ms/pass is 5 × 10 / 4 = 12.5 and 5 × 10 / 5 = 10.0. The ratio is over passes a second,
+# 1000 / 12.5 = 80 and 1000 / 10 = 100, ours over the arm: 80 / 100 = 0.8000 in each round (above 1 would be
+# ours faster, as in the decode table, whose ratio for the pair is 200 / 200 = 1.0000).
+L=$tmp/mtp-pass-ratio.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 STUB_GEN_MTP=1 -- 6 6@STUB_GEN_PASSES=5
+if [ "$RC" != 0 ]; then
+  fail mtp-pass-ratio "rc $RC, want 0" "$L"
+elif want mtp-pass-ratio "$L" 2 '^ROW r[12] ours d=6 .* \| ms/pass 12\.5000 \(mean_ms × steps 10 / passes 4\) \| ' &&
+  want mtp-pass-ratio "$L" 2 '^ROW r[12] ours@STUB_GEN_PASSES=5 d=6 .* \| mtp E\(4\) 2\.000 = positions 10 / passes 5, kept \[2, 2, 0, 1\] \| ms/pass 10\.0000 \(mean_ms × steps 10 / passes 5\) \| ' &&
+  want mtp-pass-ratio "$L" 1 '^=== pass time per arm ' &&
+  want mtp-pass-ratio "$L" 2 '^mean pass ' &&
+  want mtp-pass-ratio "$L" 1 '^mean pass ours d=6 +12\.5000 ms/pass  \[12\.5000\.\.12\.5000\]  \(n=2\)  \[cold [0-2]/2\]$' &&
+  want mtp-pass-ratio "$L" 1 '^mean pass ours@STUB_GEN_PASSES=5 d=6 +10\.0000 ms/pass  \[10\.0000\.\.10\.0000\]  \(n=2\)  \[cold [0-2]/2\]$' &&
+  want mtp-pass-ratio "$L" 1 '^ratio pass ' &&
+  want mtp-pass-ratio "$L" 1 '^ratio pass d=6 +ours/ours@STUB_GEN_PASSES=5 +mean 0\.8000 ± 0\.0000 \(n=2\)  of means 0\.8000  per round: r1 0\.8000 r2 0\.8000  cpu-busy: ours 0/2, ours@STUB_GEN_PASSES=5 0/2  cold: ours [0-2]/2, ours@STUB_GEN_PASSES=5 [0-2]/2$' &&
+  want mtp-pass-ratio "$L" 1 '^ratio d=6 +ours/ours@STUB_GEN_PASSES=5 +mean 1\.0000 '; then
+  pass mtp-pass-ratio
+fi
+
+L=$tmp/mtp-pass-bad.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_MTP=1 STUB_GEN_PASSES=0 -- 6
+if [ "$RC" != 1 ]; then
+  fail mtp-pass-bad "rc $RC, want 1" "$L"
+elif want mtp-pass-bad "$L" 1 "^FAIL r1 ours d=6 rc=0 \| its SMOKE line carries passes= and no pass time can be read from it \(passes='0' steps='0'; " &&
+  want mtp-pass-bad "$L" 0 '^ROW ' &&
+  want mtp-pass-bad "$L" 0 '^mean pass ' &&
+  want mtp-pass-bad "$L" 1 '^failed arms: r1 ours d=6 rc=0; $'; then
+  pass mtp-pass-bad
 fi
 
 L=$tmp/warm.log
@@ -1009,7 +1065,7 @@ if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
     "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
-    "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp.log "$tmp"/cpu-guard.log "$tmp"/warm.log; do
+    "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/cpu-guard.log "$tmp"/warm.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done

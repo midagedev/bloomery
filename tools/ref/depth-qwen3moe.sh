@@ -292,12 +292,17 @@
 #
 # Records in the row. Our row reads its engine's records through tools/bloomery/records.py by kind and
 # field (--bin generate_qwen3moe): under BLOOMERY_DRAFT=mtp the `mtp summary` (` | mtp E(4) <positions /
-# passes> = positions P / passes Q, kept [..]`), under BLOOMERY_STEP_STATS=1 the `stat summary`'s host slots
-# a token (` | host slots/token X`), and under adaptive residency the `residency lever` word and why and the
-# timed passes' `residency pass` fields (cold-blocks.sh's residency sums: ` | residency <word> (<why>)
-# passes n kept k landed l late t made m bytes b`), with each label's per-pass means after the tables. A
-# checked-in schema that declares no residency record reads none, and an arm that sets BLOOMERY_RESIDENCY
-# under it is a FAIL row naming the schema.
+# passes> = positions P / passes Q, kept [..]`) and, from the SMOKE line's `passes=` (which a plain run's
+# lacks), the wall of one verify pass (` | ms/pass X (mean_ms × steps S / passes Q)`: the counted passes'
+# wall over their number; `passes=` with a zero or unreadable pass or step count is a FAIL row), which
+# the tables after the decode ratios sum per label (`mean pass`) and compare as passes a second (`ratio
+# pass d=`, `ratio pass prose d=`): two builds' MTP rows can generate different text, so their tok/s
+# ratio carries E(4) on different text and their pass-time ratio does not; under BLOOMERY_STEP_STATS=1
+# the `stat summary`'s host slots a token (` | host slots/token X`), and under adaptive residency the
+# `residency lever` word and why and the timed passes' `residency pass` fields (cold-blocks.sh's
+# residency sums: ` | residency <word> (<why>) passes n kept k landed l late t made m bytes b`), with each
+# label's per-pass means after the tables. A checked-in schema that declares no residency record reads
+# none, and an arm that sets BLOOMERY_RESIDENCY under it is a FAIL row naming the schema.
 # Co-tenants. A compute process on the other card is recorded ([other-busy], timing-card.sh), and
 # the arm's row ends in ` [other-busy]`; the closing summary counts those rows. The CPU is checked before
 # and after every arm (guard_cpu, lease.sh, as depth-ds41.sh does: builds and the engines this runner did
@@ -1259,6 +1264,20 @@ ours_post() {
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its SMOKE line has no p50_ms or mean_ms" "$out"
     return 0
   fi
+  # An MTP run's SMOKE line carries passes=: its steps are the positions the counted passes kept and its
+  # mean_ms their wall over those positions, so mean_ms × steps / passes is the wall of one verify pass.
+  # A plain run's has no passes= and gets no column.
+  local passes='' steps='' passcol='' pps=''
+  if [[ " $(head -n 1 <<< "$smoke")" == *" passes="* ]]; then
+    passes=$(head -n 1 <<< "$smoke" | sed -n 's/.* passes=\([0-9]*\).*/\1/p')
+    steps=$(head -n 1 <<< "$smoke" | sed -n 's/.* steps=\([0-9]*\).*/\1/p')
+    if ! [[ $passes =~ ^[0-9]+$ && $steps =~ ^[0-9]+$ ]] || [ "$((10#$passes))" = 0 ] || [ "$((10#$steps))" = 0 ]; then
+      arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its SMOKE line carries passes= and no pass time can be read from it (passes='$passes' steps='$steps'; ms/pass is mean_ms × steps / passes, each a positive count)" "$out"
+      return 0
+    fi
+    read -r passcol pps < <(awk -v m="$mean" -v s="$steps" -v q="$passes" 'BEGIN { printf "%.4f %.6f\n", m * s / q, 1e3 * q / (m * s) }')
+    passcol=" | ms/pass $passcol (mean_ms × steps $steps / passes $passes)"
+  fi
   pp_col "${A_KIND[$i]}" "$out" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"; return 0; }
   # The placement it was given: its own `load` line, or its load's (LG_HEADER).
   if [ -n "$PLACE" ]; then
@@ -1282,6 +1301,7 @@ ours_post() {
     [ -n "$MK" ] && [ -n "$MP" ] && [ -n "$MQ" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its mtp summary record has no kept, positions or passes (kept='$MK' positions='$MP' passes='$MQ')" "$out"; return 0; }
     mtp=" | mtp E(4) $(awk -v p="$MP" -v q="$MQ" 'BEGIN { printf "%.3f", (q > 0) ? p / q : 0 }') = positions $MP / passes $MQ, kept $MK"
   fi
+  mtp+=$passcol
   [ -z "$HS" ] || mtp+=" | host slots/token $HS"
   # The residency records: the lever and the timed passes' sums (cold-blocks.sh's residency sums).
   RS_WORD='' RS_COL=''
@@ -1327,6 +1347,7 @@ ours_post() {
   counted || return 0
   count_row
   sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
+  [ -z "$pps" ] || pass_sums+=("$label|$dep|$r|$pps|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
   res_sums_add "$label" "$dep" "$r"
   # The greedy cross-check's ours side: the plain rows (no NAME=VALUE list) of this tree's binary.
@@ -1630,7 +1651,7 @@ guard_other
 guard_timing
 guard_cpu pre
 
-sums=() pp_sums=()
+sums=() pp_sums=() pass_sums=()
 n_rows=0 busy_rows=0 other_rows=0 cold_rows=0
 if [ "$ORDER" = rotate ]; then
   if [ "$AB_WARMUP" = 1 ]; then
@@ -1655,6 +1676,8 @@ xc_table
 [ ${#XC_DROP[@]} -eq 0 ] || FAILED_KEYS+=("${XC_DROP[@]}")
 # A failed arm drops out at its depth or P (cold-blocks.sh).
 failed_tally
+# failed_tally drops from sums and pp_sums; the pass records drop the same label|key pairs here.
+[ ${#pass_sums[@]} -eq 0 ] || mapfile -t pass_sums < <(printf '%s\n' "${pass_sums[@]}" | drop_failed)
 echo "=== per-arm means (tok/s @ n=$N, $CARD_NAME). First column: ours from mean_ms, the references"
 echo "    their bench's own mean (llama-bench over the N steps, mistralrs bench over N - 1 intervals)"
 echo "    — the cross-engine ratio reads these. The p50 column is ours only. ==="
@@ -1680,6 +1703,26 @@ if [ -n "$prose_refs" ]; then
   echo
   echo "=== the prose prompt: ours@prose / each arm on the prose ids per P, the same statistics ==="
   printf '%s\n' "${sums[@]}" | ratio_table "ratio prose d=" "$deps" "$prose_refs" 0 6 ours@prose
+fi
+# The pass time of the MTP rows: a row's tok/s is its pass time over E(4), and E(4) moves with the text
+# two builds generate, so a code change is read on the pass time. The records hold passes a second
+# (1000 / ms a pass), so a ratio above 1 means ours passes faster, as in the decode table.
+if [ ${#pass_sums[@]} -gt 0 ]; then
+  echo
+  echo "=== pass time per arm (ms a verify pass under MTP, mean_ms × steps / passes of the row's SMOKE line:"
+  echo "    the counted passes' wall over their number, $CARD_NAME). The ratios below are over passes a"
+  echo "    second, 1000 / ms, the decode table's statistics ==="
+  printf '%s\n' "${pass_sums[@]}" | awk -F'|' '{
+    k = $1 " d=" $2; ms = 1e3 / $4; s[k] += ms; n[k]++
+    if ($5 ~ /cold/) c[k]++
+    if (mn[k] == "" || ms < mn[k] + 0) mn[k] = ms; if (mx[k] == "" || ms > mx[k] + 0) mx[k] = ms
+  } END { for (k in s) printf "mean pass %-14s %9.4f ms/pass  [%.4f..%.4f]  (n=%d)  [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], n[k], c[k], n[k] }' | sort
+  printf '%s\n' "${pass_sums[@]}" | ratio_table "ratio pass d=" "$deps" "$refs" 0 5
+  if [ -n "$prose_refs" ]; then
+    echo
+    echo "=== the prose prompt's pass time: ours@prose / each arm on the prose ids per P, the same statistics ==="
+    printf '%s\n' "${pass_sums[@]}" | ratio_table "ratio pass prose d=" "$deps" "$prose_refs" 0 5 ours@prose
+  fi
 fi
 if [ ${#pp_sums[@]} -gt 0 ]; then
   echo
