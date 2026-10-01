@@ -26,7 +26,7 @@
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub mod arch;
 pub mod cand;
@@ -1830,17 +1830,40 @@ pub fn role_stream(ctx: &Arc<CudaContext>, role: StreamRole) -> Result<Arc<CudaS
     Ok(ctx.new_stream_with_priority(priority)?)
 }
 
+/// One primary-context handle per device, held for the process's life.
+static CONTEXTS: Mutex<Vec<Option<Arc<CudaContext>>>> = Mutex::new(Vec::new());
+
+/// Device `device`'s primary context, retained once on first use and released
+/// only when the process exits: every `Gpu` on a device shares the handle.
+/// Releasing it mid-run is what crashes — the A6000's final release after the
+/// 3090's, once an expert tier had run across the two, faults inside
+/// `cuDevicePrimaryCtxRelease` with every stream idle and every free bound to
+/// its own context. Card memory still comes back as each owner drops.
+fn primary_context(device: usize) -> Result<Arc<CudaContext>, GpuError> {
+    let mut held = CONTEXTS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(Some(ctx)) = held.get(device) {
+        return Ok(Arc::clone(ctx));
+    }
+    let ctx = CudaContext::new(device)?;
+    if held.len() <= device {
+        held.resize(device + 1, None);
+    }
+    held[device] = Some(Arc::clone(&ctx));
+    Ok(ctx)
+}
+
 impl Gpu {
     /// `with_device(0)`: under the box environment device 0 is the dev card.
     pub fn new() -> Result<Gpu, GpuError> {
         Gpu::with_device(0)
     }
 
-    /// Create the context on CUDA device `device`, the engine stream, and
-    /// load every device module of this crate into that context — the
-    /// K-quant module here and one per kernel file. Load-time only.
+    /// Take device `device`'s primary context ([`primary_context`]), make
+    /// the engine stream, and load every device module of this crate into
+    /// that context — the K-quant module here and one per kernel file.
+    /// Load-time only.
     pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
-        let ctx = CudaContext::new(device)?;
+        let ctx = primary_context(device)?;
         let stream = role_stream(&ctx, StreamRole::Engine)?;
         // First: the modules below that raise are given it at load.
         let fault = Arc::new(DeviceBuffer::from_host(&stream, &clean_fault_words())?);
@@ -2562,5 +2585,31 @@ impl Gpu {
             y,
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::Gpu;
+    use std::sync::Arc;
+
+    /// Every `Gpu` on a device takes the one primary-context handle the
+    /// process holds, and a dropped `Gpu` leaves it in place for the next.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_gpus_on_a_device_share_its_primary_context() {
+        let a = Gpu::with_device(0).expect("a Gpu on device 0");
+        let b = Gpu::with_device(0).expect("a second Gpu on device 0");
+        assert!(
+            Arc::ptr_eq(a.context(), b.context()),
+            "two Gpus on device 0 hold different context handles"
+        );
+        let held = Arc::clone(a.context());
+        drop((a, b));
+        let c = Gpu::with_device(0).expect("a Gpu on device 0 after both dropped");
+        assert!(
+            Arc::ptr_eq(&held, c.context()),
+            "a Gpu after the first two dropped took a new context handle"
+        );
     }
 }
