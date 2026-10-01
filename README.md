@@ -15,17 +15,18 @@ DeepSeek-V4.1-Flash `Q3_K_M` on an RTX A6000 and a 32-core CPU: 29.66 tok/s deco
 - Experts on the GPU and the AVX2 CPU in one CUDA graph step.
 - Adaptive residency: routed experts move between the card and the host by the engine's own routing as it runs.
 - Speculative decoding with greedy output unchanged: DSpark for V4.1 (the draft on a second card), the MTP head for Qwen3.8 and GLM-5.3.
+- A second card as an expert tier: V4.1, Qwen3.8 and GLM-5.3 put more routed experts on the RTX 3090 beside the A6000 (`--place bp`).
 - V4.1's batched prompts leave the state of one step per token, bit for bit.
-- A llama-server-compatible HTTP API.
+- A llama-server-compatible HTTP API for V4.1, Qwen3.8 and GLM-5.3, from one binary.
 - Every number comes from a runner and links its log.
 
 ## Models
 
 | Model | File | Runs as |
 |---|---|---|
-| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | [`Q3_K_M`](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF) (vcruz305) | GPU + CPU experts; `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` |
-| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts; sparse attention past 2,051 positions; `generate_glm5next` |
-| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (unsloth) | GPU + CPU experts; `generate_qwen3moe`, `bloomery-serve-qwen38` |
+| [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | [`Q3_K_M`](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF) (vcruz305) | GPU + CPU experts; `generate_ds41`, `bloomery-chat`, `bloomery-serve --model ds41` |
+| [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts; sparse attention past 2,051 positions; `generate_glm5next`, `bloomery-serve --model glm` |
+| [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (unsloth) | GPU + CPU experts; `generate_qwen3moe`, `bloomery-serve --model qwen38` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole model on one GPU; `generate_qwen3moe` |
 | [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole model on one GPU; `generate_qwen3moe` |
 | [DeepSeek-V2-Lite-Chat](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat) | [`Q3_K_M`](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) (mradermacher) | CPU or GPU; the first model, still gated |
@@ -36,11 +37,11 @@ The DSpark draft for V4.1 speculative decoding is not a public upload: it is con
 
 ## How it works
 
-- **Placement.** Each layer starts with a fixed number of routed experts on the card, the lowest ids. With `--place bp`, V4.1 puts the model on the A6000 and more routed experts (and the DSpark draft) on the 3090. Qwen3.8 runs its card share of the experts on the card (`BLOOMERY_QWEN38_EXPERTS=card`, the default).
-- **Adaptive residency.** Under V4.1's serving placements (`--place a` and `bp`) and Qwen3.8's `--place a` the engine counts its own routing and swaps experts between the card and the host between steps (`BLOOMERY_RESIDENCY`, on by default there; GLM-5.3 takes it when set). A prompt call also streams its hottest host experts into the card's pool (`BLOOMERY_HOSTSTREAM`, V4.1 and Qwen3.8), so decode starts on experts that fit the prompt.
+- **Placement.** Each layer starts with a fixed number of routed experts on the card, the lowest ids. With `--place bp`, V4.1 puts the model on the A6000 and more routed experts (and the DSpark draft) on the 3090. Qwen3.8 runs its card share of the experts on the card (`BLOOMERY_QWEN38_EXPERTS=card`, the default); under `--place bp` its decode also serves routed experts from the 3090 as an expert tier. GLM-5.3's `generate_glm5next --place bp` serves routed experts from the 3090 the same way, without its draft or residency for now.
+- **Adaptive residency.** Under V4.1's serving placements (`--place a` and `bp`), Qwen3.8's `--place a` and GLM-5.3's server at `--place a`, the engine counts its own routing and swaps experts between the card and the host between steps (`BLOOMERY_RESIDENCY`, on by default there; `generate_glm5next` takes it when set). A prompt call also streams its hottest host experts into the card's pool (`BLOOMERY_HOSTSTREAM`, V4.1 and Qwen3.8), so decode starts on experts that fit the prompt.
 - **Engram rows from NVMe.** V4.1's engram table is read from NVMe, 48 rows a token, prefetched by a helper thread.
 - **Skewed pass.** Speculative decoding runs two positions one layer apart in one step and verifies a draft token: the DSpark draft (`BLOOMERY_DRAFT=dspark`) or an n-gram lookup (`BLOOMERY_DRAFT=lookup`).
-- **MTP drafts.** Qwen3.8's MTP head drafts a window of four rows and verifies it in one pass (`BLOOMERY_DRAFT=mtp`, on by default under `--place a`); GLM-5.3's next-token layer drafts one token for a two-row verify (`BLOOMERY_DRAFT=mtp`, off by default).
+- **MTP drafts.** Qwen3.8's MTP head drafts a window of four rows and verifies it in one pass (`BLOOMERY_DRAFT=mtp`, on by default under `--place a`); GLM-5.3's next-token layer drafts one token for a two-row verify (`BLOOMERY_DRAFT=mtp`, on by default in its server at `--place a`; `generate_glm5next` takes it when set).
 - **Batched prompts.** V4.1 runs a prompt in batches of up to 512 positions, each expert over all its tokens at once, two batches in flight so the card and the CPU overlap. Qwen3-30B and Qwen3.6 run ubatches of up to 4096 tokens through an int8 tensor-core GEMM; Qwen3.8 runs ubatches of up to 4096 with its card experts beside the host tier; GLM-5.3 runs its prompt in batches, its sparse-attention selector included.
 - **Loading.** A load streams the file's bytes to the card through a pinned ring with one sync; a warm V4.1 load takes about 16 s ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#v41-load-upload)).
 
@@ -54,9 +55,9 @@ Adaptive residency on one A6000, V4.1-Flash `Q3_K_M`, 96 decode steps after a 51
 
 ## Status
 
-V4.1 runs on the public `Q3_K_M` file as uploaded. `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat` streams text; `bloomery-serve-ds41` and `bloomery-serve-qwen38` serve llama-server's HTTP API, streaming, one request at a time. The V4.1 server also reuses a cached prompt prefix, splits reasoning and returns tool calls; the Qwen3.8 server keeps no prefix (every request prefills from a reset). GLM-5.3 and Qwen3.6 run from their generator bins and have no server yet.<!-- pending: no-glm-qwen36-server --> The Qwen and GLM chat templates render as jinja2 does on their gates' cases, and the tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
+V4.1 runs on the public `Q3_K_M` file as uploaded. `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat` streams text. `bloomery-serve --model ds41|qwen38|glm` serves llama-server's HTTP API, streaming, one request at a time; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are its V4.1 and Qwen3.8 seats alone. The V4.1 server reuses a cached prompt prefix, splits reasoning and returns tool calls. The Qwen3.8 server keeps the longest prefix a request shares with its slot, back to the recurrent layers' last checkpoint, and holds another session's state in its host prompt cache (`--cache-ram`). The GLM-5.3 server keeps a slot's prefix back to its last checkpoint (every 512 positions) and has no host prompt cache. Qwen3.6 runs from its generator bin and has no server yet.<!-- pending: no-qwen36-server --> The Qwen and GLM chat templates render as jinja2 does on their gates' cases, and the tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
 
-In progress: the warm re-measure against llama.cpp (below); GLM-5.3's prompt speed since batching, and its MTP draft and adaptive residency speed; faster V4.1 host experts; DeepSeek-V4-Flash-0731.
+In progress: the warm re-measure against llama.cpp (below); GLM-5.3's prompt front on the GEMM path; serving on N cards (two today) for every model, and Qwen3.8's prompt on the 3090 tier; concurrent batched decode across slots; faster V4.1 host experts; DeepSeek-V4-Flash-0731.
 
 ## Measured numbers
 
@@ -87,7 +88,7 @@ This table is provisional. llama.cpp ran through `llama-bench`, which feeds new 
 
 - "vs llama.cpp" is the direction in the same window as the linked rig-log entry (decode and prompt alike unless it says otherwise): mainline llama.cpp, or the model's llama.cpp pull request. "Not measured" means that window had no llama.cpp rows. The rows from 2026-09-28 are provisional, as above.
 - The V4.1 row is a two-round window of bloomery alone and the Qwen3.8 row a six-round one; decode follows the prompt it names. Qwen3.8 with card experts alone ran 53.85 / 53.47 decode and 659.2 / 618.2 prompt on 2026-09-29 ([q38prose-pp](https://github.com/midagedev/rig-log/blob/main/log/2026-09-29.md#q38prose-pp)); on 2026-09-28, with every routed expert on the CPU, it ran 40.46 decode and 104.0 prompt at P = 4096, slower than llama.cpp in that window.
-- GLM-5.3's row fed its prompt one step per token (about 21 tok/s); its batched prompt, its MTP draft and its adaptive residency have landed since and are not measured yet.
+- GLM-5.3's row fed its prompt one step per token (about 21 tok/s). Its batched prompt, its MTP draft and its adaptive residency have landed since; the draft and residency are its server's defaults at `--place a`. No runner has measured them yet; a recording of the server is under [More](#more).
 
 ### On two cards: DeepSeek-V4.1-Flash
 
@@ -121,8 +122,9 @@ Every throughput number in this README ran on the A6000: the one-card rows on th
 
 - **sm_86 only.** The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remote workstation; [`docs/BUILD.md`](docs/BUILD.md) gives the direct commands for your own host.
 - **A pinned nightly** (`nightly-2026-08-28`) with a pinned cuda-oxide revision from our fork, where fixes wait for upstream (`THIRD_PARTY_NOTICES.md`).
-- **V4.1 prompts are bound by the CPU expert tier**: the host experts are most of each layer-batch. The V4.1 server reuses a cached prompt prefix; the Qwen3.8 server does not.
-- **One request at a time** in both servers. GLM-5.3 and Qwen3.6 have no server yet.<!-- pending: no-glm-qwen36-server -->
+- **V4.1 prompts are bound by the CPU expert tier**: the host experts are most of each layer-batch.
+- **One request at a time** in every server, one slot each. Qwen3.6 has no server yet.<!-- pending: no-qwen36-server -->
+- **One tier card.** The host tier serves at most one expert tier card today; the N-card structure is in progress. GLM-5.3's tier runs without its draft and residency.
 - **Qwen3.8** keeps the routed experts past its card share on the CPU, where adaptive residency moves them as it runs. Its MTP draft costs the prompt 3.1 % at P = 512 and 6.1 % at P = 4096 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#q38mtp-wide)).
 
 ## Build
@@ -139,7 +141,9 @@ See [`docs/BUILD.md`](docs/BUILD.md): the toolchain, one command block per model
 
 - How bloomery uses cuda-oxide (layout, launch contracts, pinning): [`docs/cuda-oxide.md`](docs/cuda-oxide.md).
 - Measurements and command lines: [rig-log](https://github.com/midagedev/rig-log) (Korean).
-- A recorded session, V4.1 on two cards answering a coding review (507 prompt tokens, 1,500 generated): [toktape](https://tape.midagedev.com/r/6w4t9r5nqwtt5c9sagn3). A recording, not a benchmark row.
+- Recorded sessions, not benchmark rows:
+  - V4.1 on two cards answering a coding review (507 prompt tokens, 1,500 generated): [toktape](https://tape.midagedev.com/r/6w4t9r5nqwtt5c9sagn3).
+  - GLM-5.3's server on the A6000 alone, at its defaults (adaptive residency and the MTP draft), answering a coding review (497 prompt tokens, 2,000 generated): [toktape](https://tape.midagedev.com/r/xj9c5tmpu63fbhbwtg6f). The same prompt through llama.cpp's GLM pull request with its MTP draft on the same card: [toktape](https://tape.midagedev.com/r/39cmzgqpsphp5dmkjxyr).
 - Plan and cost models: [`docs/plan.md`](docs/plan.md); GPU design: [`docs/gpu-design.md`](docs/gpu-design.md); placement: [`docs/v41-placement.md`](docs/v41-placement.md) (Korean).
 - Working contract: [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md).
 

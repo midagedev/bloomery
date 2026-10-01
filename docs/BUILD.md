@@ -64,6 +64,7 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 |---|---|---|
 | `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` | `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
 | `bloomery-serve-qwen38` | the same, `--features deepseek41` (the feature scopes the server code; it runs no V4.1 code) | Qwen3.8-Flash-Next |
+| `bloomery-serve` | `… --features glm5next --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm`; the ds41 and qwen38 seats are the two binaries above) | all three |
 | `generate_qwen3moe` | `… --features gpu --release --bin generate_qwen3moe` | Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
 | `generate_glm5next` | `… --features glm5next --release --bin generate_glm5next` | GLM-5.3-Flash |
 | `r8conv` | `cargo build --release -p bloomery-model --bin r8conv` | the V4.1 sidecar |
@@ -78,8 +79,9 @@ The placement plans are built from the development machine's two cards and its R
 | Binary | `--place` takes | Default |
 |---|---|---|
 | `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` | `a`, `gate`, `bp` | `a` |
-| `generate_qwen3moe` on a Qwen3.8 file, `bloomery-serve-qwen38` | `a`, `gate` | `a` |
-| `generate_glm5next` | `a`, `gate` | `gate` |
+| `generate_qwen3moe` on a Qwen3.8 file, `bloomery-serve-qwen38` | `a`, `gate`, `bp` | `a` |
+| `generate_glm5next` | `a`, `gate`, `bp` | `gate` |
+| `bloomery-serve --model glm` | `a`, `gate` | `a` |
 | `generate_qwen3moe` on a Qwen3.6 or Qwen3-30B file | refused | CUDA device 0 |
 
 <!-- pending: default-place-a — every binary above but generate_glm5next defaults to --place a (a card named A6000), so on a host with only a 3090 pass --place gate; generate_glm5next is the opposite, its default is gate and an A6000-only host passes --place a -->
@@ -199,8 +201,14 @@ target/release/bloomery-tokenize -m "$M" --decode -p "$(sed -n 's/^tokens //p' g
 
 Flags: `-n N` (default 16), `--ctx C` (default 2048, at most 16,384), `--place a|gate` (default `gate`), `--prefill batch|steps` (default `batch`), `--mode graph|eager`, `--plan` (print the plan and exit before the load), `--logits`, `--time [--warm W]`.
 
-<!-- pending: no-glm-qwen36-server — there is no HTTP server for GLM-5.3 or Qwen3.6 -->
-There is no HTTP server for GLM-5.3 yet.
+The server is `bloomery-serve --model glm` (build it with `--features glm5next --bin bloomery-serve`). At `--place a` it runs adaptive residency and the MTP draft by default (`BLOOMERY_RESIDENCY=off` and `BLOOMERY_DRAFT=off` turn them off), and `--plan` prints the plan and those choices and exits before any card is opened:
+
+```sh
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin bloomery-serve
+BLOOMERY_REF_MODEL="$M" target/release/bloomery-serve --model glm --place a --ctx 4096 --host 127.0.0.1 --port 8080
+```
+
+It serves one request at a time. A request keeps the slot's prefix back to its last checkpoint (every 512 positions); there is no host prompt cache, and slot save and restore answer 501. GLM-5.3's chat template always opens a thinking span; `chat_template_kwargs: {"reasoning_effort": "low"}` (or `"high"`) makes it shorter than the template's default, `max`.
 
 ## Qwen3.8-Flash-Next
 
@@ -221,7 +229,7 @@ BLOOMERY_REF_MODEL="$M" target/release/bloomery-serve-qwen38 --host 127.0.0.1 --
 `generate_qwen3moe` reads the architecture from the file's header and opens a Qwen3.8, Qwen3.6 or Qwen3-30B file; it takes exactly one of `--prompt TEXT` (tokenized with the file's vocabulary, no BOS, no chat template) and `--tokens a,b,c`, and prints the ids and the generated text. Flags: `-n N` (default 32), `--ctx C` (default 4096), `--place a|gate` (Qwen3.8 only, default `a`), `--prefill auto|pass|gemm|step`, `--mode graph|eager`, `--time [--warm W]`, `--logits`. Each layer's routed expert prefix goes on the card as its budget holds and the rest on the host (`BLOOMERY_QWEN38_EXPERTS=card`, the default; `host` puts every routed expert on the host).
 
 <!-- pending: default-place-a -->
-`bloomery-serve-qwen38` speaks the same llama-server API as `bloomery-serve-ds41` (the think-span split and the DSML tool calls above are V4.1's), with these differences: `--place a|gate` only (default `a`), `--ctx-size C` (or `--ctx`, default 4096) sizes the stores, a prompt that fills them is a 400 and generation stops there, `--chat-template-file PATH` replaces the file's template, and a request keeps no prefix of another's: the recurrent layers hold no state for an earlier position, so every request prefills from a reset and the host prompt cache is off. It serves one request at a time.
+`bloomery-serve-qwen38` speaks the same llama-server API as `bloomery-serve-ds41` (the think-span split and the DSML tool calls above are V4.1's), with these differences: `--place a|gate|bp` (default `a`; `bp` serves routed experts from the 3090 as an expert tier in decode), `--ctx-size C` (or `--ctx`) sizes the stores, a prompt that fills them is a 400 and generation stops there, and `--chat-template-file PATH` replaces the file's template. A request keeps the longest prefix it shares with the slot that the recurrent layers can stand at: every held position, or the nearest checkpoint at or below it. The host prompt cache (`--cache-ram MIB`, 0 off) holds a session's state while another session's request takes the slot. It serves one request at a time.
 
 <!-- pending: mtp-draft-path — the MTP draft path is fixed at /models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf (crates/refset/src/arch/qwen4exp/mtp.rs) with no lever to move it -->
 **The MTP draft** (`BLOOMERY_DRAFT=mtp`, both binaries) opens the draft file at one fixed path, `/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`; no lever moves it. To use it, download `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same upload and put the file, or a symbolic link to it, at that path. The greedy ids with the draft are the plain run's; its speed is not measured yet.
