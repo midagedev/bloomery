@@ -65,13 +65,15 @@ mod gate {
     use crate::{dspark, finite};
 
     const NAME: &str = "gate_deepseek41_dsloop";
-    /// PIN(2026-09-25): the step captured with the tl37 draft's tap: the
-    /// plain step's 1169 nodes (1167 before the engram rows' wait and copy
-    /// nodes) and one `ds41_hc_mean` per tapped layer.
-    const TAP_STEP_NODES: usize = 1172;
-    /// PIN(2026-09-25): the pair pass with the same tap: twice the plain
-    /// step's nodes and one `ds41_hc_mean` per tapped layer and row.
-    const TAP_PAIR_NODES: usize = 2344;
+    /// PIN(2026-10-02): the step captured with the tl37 draft's tap: the
+    /// plain step's 1179 nodes (1169 before the candidate mask's 2 + 4 × 2 =
+    /// 10 launches, 1167 before the engram rows' wait and copy nodes) and one
+    /// `ds41_hc_mean` per tapped layer.
+    const TAP_STEP_NODES: usize = 1182;
+    /// PIN(2026-10-02): the pair pass with the same tap: twice the plain
+    /// step's nodes (each row runs its own ten candidate launches) and one
+    /// `ds41_hc_mean` per tapped layer and row.
+    const TAP_PAIR_NODES: usize = 2364;
     /// Positions the greedy run stands at before the checks.
     const RUN: u32 = 144;
     /// The positions checked: even, so a rollback to them is granted

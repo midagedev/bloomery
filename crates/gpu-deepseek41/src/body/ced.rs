@@ -26,17 +26,22 @@
 //! image and words are laid out from its first position, so a layer runs
 //! whole chunks, and running a position no reader needs changes nothing. The
 //! lists need no term: a layer reads the list its top-k source (at or below
-//! it) wrote at the same position, where that layer's block ran too.
+//! it) wrote at the same position, where that layer's block ran too. Nor do
+//! the candidate mask's kept lists: a consumer's top-k at a position reads
+//! the kept blocks its candidate source (below it) selected at the same
+//! position, in that layer's block — which ran wherever the consumer's does,
+//! since block starts only rise with the layer.
 //!
 //! The walk needs two facts of the file, checked at load ([`exact`]): every
-//! source a layer reads is at or below it, and index keys sit only on a
-//! compressor's layer, whose latent part writes them. A file that breaks one
-//! runs every layer at every position.
+//! source a layer reads — rows, index keys, list, candidate blocks — is at or
+//! below it, and index keys sit only on a compressor's layer, whose latent
+//! part writes them. A file that breaks one runs every layer at every
+//! position.
 
 use std::ops::Range;
 
-use model::arch::deepseek41::hparams::LayerKind;
-use model::arch::models::LayerSpec;
+use model::arch::deepseek41::hparams::{CandidateRole, Hparams, LayerKind};
+use model::arch::models::{LayerSpec, Selector, Source};
 
 use super::prefill::CHUNK;
 
@@ -152,17 +157,21 @@ impl Need {
 }
 
 /// One layer as the walk sees it: whether it owns a compressor and index
-/// keys, and the sources of its stream (rows, index keys, list).
+/// keys, the sources of its stream (rows, index keys, list), and on a
+/// consumer of the candidate mask the layer whose kept blocks its top-k is
+/// taken among.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CedLayer {
     pub compressor: bool,
     pub index_keys: bool,
     pub sources: Option<[usize; 3]>,
+    pub candidates: Option<usize>,
 }
 
 /// A layer as the walk can read it: the model's description ([`LayerSpec`])
-/// or the programs' layer table ([`LayerKind`]), which say the same three
-/// facts.
+/// or the programs' layer table ([`LayerKind`]), which say the same facts —
+/// a `LayerKind` but the candidate mask, which is the model's
+/// ([`CedLayer::table`]).
 pub trait CedSource {
     /// Layer `l`'s facts, `l` being this layer's index.
     fn ced(&self, l: usize) -> CedLayer;
@@ -176,6 +185,7 @@ impl CedSource for LayerKind {
             sources: self
                 .stream
                 .map(|s| [s.kv_source, s.index_key_source, s.topk_source]),
+            candidates: None,
         }
     }
 }
@@ -187,6 +197,14 @@ impl CedSource for LayerSpec {
             compressor: self.owns_rows(),
             index_keys: self.owns_keys(),
             sources: self.sources(at).map(|s| s.map(|x| x as usize)),
+            candidates: match self.latent().and_then(|a| a.select.as_ref()) {
+                Some(Selector::StreamTopK {
+                    list: Source::Own(()),
+                    candidates: Some(c),
+                    ..
+                }) => Some(c.source as usize),
+                _ => None,
+            },
         }
     }
 }
@@ -196,6 +214,22 @@ impl CedLayer {
     #[must_use]
     pub fn of(kind: &impl CedSource, l: usize) -> CedLayer {
         kind.ced(l)
+    }
+
+    /// Every layer of `hp`, from 0: its kind's facts, and on each consumer
+    /// of the candidate mask its source layer.
+    #[must_use]
+    pub fn table(hp: &Hparams) -> Vec<CedLayer> {
+        let source = hp.candidates.map(|c| c.source_layer);
+        hp.layers
+            .iter()
+            .enumerate()
+            .map(|(l, k)| CedLayer {
+                candidates: source
+                    .filter(|_| hp.candidate_role(l) == Some(CandidateRole::Consumer)),
+                ..CedLayer::of(k, l)
+            })
+            .collect()
     }
 }
 
@@ -209,6 +243,11 @@ pub fn exact(layers: &[CedLayer]) -> Result<(), &'static str> {
         }
         if c.sources.is_some_and(|s| s.iter().any(|&src| src > l)) {
             return Err("a layer reads the stream, keys or list of a layer above it");
+        }
+        if c.candidates.is_some_and(|src| src >= l) {
+            return Err(
+                "a layer takes its top-k among the candidate blocks of a layer at or above it",
+            );
         }
     }
     Ok(())
@@ -239,17 +278,13 @@ pub(super) struct Ced {
 }
 
 impl Ced {
-    /// The walk for `kinds` (every layer of the model, the card's from 0)
-    /// over rings of `slots` rows, `on` the `BLOOMERY_CED` lever: unset or
-    /// `on` runs the triangle where the file allows it, `off` runs every layer
-    /// at every position — the same-binary arm the triangle is timed against.
-    pub(super) fn new(kinds: &[impl CedSource], slots: usize, on: bool) -> Ced {
-        let facts: Vec<CedLayer> = kinds
-            .iter()
-            .enumerate()
-            .map(|(l, k)| CedLayer::of(k, l))
-            .collect();
-        let state = match (on, exact(&facts)) {
+    /// The walk for `facts` (every layer of the model, the card's from 0,
+    /// [`CedLayer::table`]) over rings of `slots` rows, `on` the
+    /// `BLOOMERY_CED` lever: unset or `on` runs the triangle where the file
+    /// allows it, `off` runs every layer at every position — the same-binary
+    /// arm the triangle is timed against.
+    pub(super) fn new(facts: &[CedLayer], slots: usize, on: bool) -> Ced {
+        let state = match (on, exact(facts)) {
             (false, _) => CedState::Off("BLOOMERY_CED=off"),
             (true, Err(why)) => CedState::Off(why),
             (true, Ok(())) if slots == 0 => CedState::Off("a window ring of no rows"),
@@ -337,6 +372,7 @@ mod tests {
                     compressor: sources.contains(&l),
                     index_keys: sources.contains(&l),
                     sources: src.map(|s| [s, s, s]),
+                    candidates: None,
                 }
             })
             .collect()
@@ -479,6 +515,19 @@ mod tests {
         let mut above = v41();
         above[25].sources = Some([20, 20, 26]);
         assert!(exact(&above).is_err());
+        // A consumer of the candidate mask whose source sits above it, or is
+        // itself, is refused by name; one below it is exact.
+        let mut cand = v41();
+        cand[24].candidates = Some(20);
+        assert_eq!(exact(&cand), Ok(()));
+        for src in [24, 30] {
+            cand[24].candidates = Some(src);
+            assert_eq!(
+                exact(&cand),
+                Err("a layer takes its top-k among the candidate blocks of a layer at or above it")
+            );
+            assert!(matches!(walk(&cand, 128).state, CedState::Off(_)));
+        }
         let c = walk(&above, 128);
         assert!(matches!(c.state, CedState::Off(_)));
         let need = c.need(0, 4096, &[0], None);

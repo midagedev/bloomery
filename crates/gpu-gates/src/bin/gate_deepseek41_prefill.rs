@@ -141,6 +141,17 @@
 //!   steps to 1100 give its logits at 1099 (the ring rows restored from the
 //!   saved shadow).
 //!
+//! `--cand` (G2b, weekly — `just weekly-gpu-ds41-cand`; it runs nothing
+//! else): after the load and the capture, a prompt call of the first
+//! [`CAND_FIRST`] prose ids, whose end `keep_point` grants; then positions
+//! [`CAND_FIRST`]`..`[`CAND_END`], across the 16,384 positions past which the
+//! candidate mask selects, as one batch call, and — taken back to
+//! [`CAND_FIRST`] — as one decode step each: every layer's window ring and
+//! compressor state, the compressed rows and index keys below the end, and
+//! the last logits bit for bit the same. The batch's chunks keep their
+//! candidate blocks per row of words, its steps per pass: the two paths
+//! share only the kernels.
+//!
 //! `--cases a,b,…` runs those `P` only (the oracle then stops at the largest
 //! one's `P + 1`); `--split` / `--no-split` turns the splits on or off, and
 //! `--no-extra` the wide-taps and rollback cases: the FAIL-first runs use a
@@ -276,6 +287,9 @@ mod gate {
     const WIDE: (usize, usize) = (1100, 300);
     /// The rollback case's `P` and the refused cut inside it.
     const CUT: (usize, usize) = (1100, 600);
+    /// G2b's call before the crossing, and the crossing's end (module doc).
+    const CAND_FIRST: usize = 16_300;
+    const CAND_END: usize = 16_500;
     /// The fault-reset case's poisoned prefill: one whole batch, every column
     /// of the batch's scratch.
     const FAULT_P: usize = body::T_MAX;
@@ -316,16 +330,18 @@ mod gate {
         split: bool,
         extra: bool,
         seams: Option<usize>,
+        cand: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_prefill [--cases P,P,…] [--split|--no-split] \
-                             [--no-extra] [--seams P]";
+                             [--no-extra] [--seams P] [--cand]";
         let mut a = Args {
             cases: CASES.to_vec(),
             split: true,
             extra: true,
             seams: None,
+            cand: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -341,6 +357,7 @@ mod gate {
                 "--split" => a.split = true,
                 "--no-split" => a.split = false,
                 "--no-extra" => a.extra = false,
+                "--cand" => a.cand = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
@@ -445,6 +462,14 @@ mod gate {
             return seams(&mut m, &ids);
         }
         m.capture_step()?;
+        if args.cand {
+            return if cand_case(&mut m, &hp)? {
+                println!("PASSED: {NAME} --cand");
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
         let clear_t = Instant::now();
         let mut s = Session::from_model(m, u32::try_from(workstation::CTX_MAX)?);
         let mut pass = clear_case(&mut s, &hp)?;
@@ -2710,6 +2735,59 @@ mod gate {
             verdict(refused),
             verdict(at_end),
             verdict(next),
+            t.elapsed().as_secs_f64(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// G2b (module doc): the crossing as one batch call and as steps from
+    /// the same keep point.
+    fn cand_case(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+        let t = Instant::now();
+        let ids = corpus("prose", CAND_END)?;
+        m.reset()?;
+        body::prefill(m, &ids[..CAND_FIRST])?;
+        let keep = m.body(NAME)?.keep_point(CAND_FIRST);
+        if keep != CAND_FIRST {
+            println!(
+                "{NAME}: cand: keep_point({CAND_FIRST}) after a call to {CAND_FIRST} is {keep}: FAIL"
+            );
+            return Ok(false);
+        }
+        let mut arms = Vec::new();
+        for batch in [true, false] {
+            m.rollback(u32::try_from(CAND_FIRST)?)?;
+            if batch {
+                body::prefill(m, &ids[CAND_FIRST..])?;
+            } else {
+                for &id in &ids[CAND_FIRST..] {
+                    m.step(&[id])?;
+                }
+            }
+            let mut snap = live(m)?;
+            snap.logits = bits(&m.logits()?);
+            written_rows(m, hp, CAND_END, &mut snap)?;
+            arms.push(snap);
+        }
+        let (a, b) = (&arms[0], &arms[1]);
+        let fields = [
+            ("ring", a.ring == b.ring),
+            ("state", a.state == b.state),
+            ("rows", a.rows == b.rows),
+            ("keys", a.keys == b.keys),
+            ("logits", a.logits == b.logits),
+        ];
+        let ok = fields.iter().all(|&(_, same)| same);
+        println!(
+            "{NAME}: case cand: ids {CAND_FIRST}..{CAND_END} as one batch call ({:?}) against \
+             steps from the keep point {CAND_FIRST}: {} | {:.1} s: {}",
+            body::batches(CAND_FIRST, CAND_END - CAND_FIRST),
+            fields
+                .iter()
+                .map(|(f, same)| format!("{f} {}", verdict(*same)))
+                .collect::<Vec<_>>()
+                .join(" "),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );

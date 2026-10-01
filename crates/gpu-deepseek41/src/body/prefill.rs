@@ -303,7 +303,7 @@ impl BodyLevers {
     #[must_use]
     pub fn call_plan(&self, hp: &Hparams, ctx_max: usize, first: usize, n: usize) -> CallPlan {
         let ring = ctx_max.min(hp.window);
-        let ced = Ced::new(&hp.layers, ring, self.ced);
+        let ced = Ced::new(&super::ced::CedLayer::table(hp), ring, self.ced);
         CallPlan::new(&ced, ring, self.group, first, n)
     }
 }
@@ -937,11 +937,13 @@ impl Batch {
     /// Of [`Batch::device_bytes`], what each batch past a group's first holds
     /// for itself: its [`BatchSet`], and its share of the buffers laid out a
     /// batch at a time — the images' card copy, the attention's rows of
-    /// words, the rope tables and the HC_PRE results.
+    /// words and its kept candidate lists, the rope tables and the HC_PRE
+    /// results.
     fn group_bytes(&self) -> usize {
         let sets = self.sets.len();
         let shared = self.params.num_bytes()
             + self.attn.words_bytes()
+            + self.attn.kept_bytes()
             + self.proj.tables_bytes()
             + self.ffn.hc_bytes();
         let own = self.sets.first().map_or(0, BatchSet::device_bytes);
@@ -1444,9 +1446,8 @@ impl Body {
     /// `starts`, whose reader keeps the features of its last `window`
     /// positions when `window` is given: its needs ([`super::ced`]), kept for
     /// the batches and [`Body::prefill_need`]. Its hole is recorded when its
-    /// first group has planned ([`Body::plan_group`]). Refused past the
-    /// positions the body computes the reference at ([`Body::check_defined`]),
-    /// with a window and no tap, and on a card that does not run every layer.
+    /// first group has planned ([`Body::plan_group`]). Refused with a window
+    /// and no tap, and on a card that does not run every layer.
     fn begin_call(
         &mut self,
         first: usize,
@@ -1454,7 +1455,6 @@ impl Body {
         starts: &[usize],
         window: Option<usize>,
     ) -> Result<(), GpuError> {
-        self.check_defined(WHAT, end)?;
         if self.layers.start != 0 || self.layers.end != self.hp.n_layer {
             return Err(GpuError::State {
                 what: WHAT,

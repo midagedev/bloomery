@@ -381,7 +381,6 @@ impl Body {
                 ),
             });
         }
-        self.check_defined(WHAT, n)?;
         for (l, saved) in self.kv.iter_mut().zip(&s.kv) {
             write(gpu, l.ring.buf_mut(), &saved.ring)?;
             if let Some(t) = l.rows.as_mut() {

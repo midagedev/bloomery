@@ -21,10 +21,11 @@
 //! - the same `/completion` sampled (temperature above 0), which reads the
 //!   logits row every token: one seed twice gives the same ids, and `top_k` 1
 //!   gives the greedy ids;
-//! - the positions the server serves: `/props`' `n_ctx` is the lesser of the
-//!   server's default context and the positions V4.1 is computed at
-//!   (`Hparams::candidate_free_positions`); a prompt of that many ids is a 400
-//!   (`exceed_context_size_error`, naming it) and the server stays up;
+//! - the positions the server serves: `/props`' `n_ctx` is the server's
+//!   default context (`workstation::CTX_MAX`); a prompt of that many ids,
+//!   which leaves no position for the token it asks for, is a 400
+//!   (`exceed_context_size_error`, naming it) refused before the engine, and
+//!   the server stays up;
 //! - `/v1/chat/completions` of one user turn at temperature 0: the streamed
 //!   deltas concatenate to the non-streamed content, and the stream ends with
 //!   `data: [DONE]`;
@@ -244,13 +245,9 @@ mod gate {
         })
     }
 
-    /// The positions the server serves at its default context: the lesser of
-    /// that context and the positions the file's model is computed at.
+    /// The positions the server serves at its default context: all of them.
     fn served_positions() -> Result<usize, GateError> {
-        let path = workstation::model_v41();
-        let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let defined = Hparams::read(&split)?.candidate_free_positions();
-        Ok(usize::try_from(workstation::CTX_MAX)?.min(defined))
+        Ok(usize::try_from(workstation::CTX_MAX)?)
     }
 
     /// `/completion` of `prompt` sampled at [`SAMPLED_TEMPERATURE`] with

@@ -585,6 +585,7 @@ impl BatchCx<'_> {
             k: self.k,
             d: self.d,
             words: self.words.of(self.row + k)?,
+            row: self.row + k,
             layer: self.layer,
             fault: self.fault,
             m: self.cuts[k].len(),
@@ -1242,9 +1243,10 @@ fn chunk_rows(
                 (cx.qkv_rows() * o + w_at * m) * size_of::<f32>(),
                 w_rows * m,
             )?;
-            // The indexer's score and its top-k.
+            // The indexer's score and top-k passes, with the candidate
+            // mask's two launches around them on a layer that carries a role.
             ent.of(
-                2,
+                2 + 2 * u64::from(lp.cand.is_some()),
                 enqueue_select(
                     &ccx,
                     lp,

@@ -38,9 +38,8 @@ const IK_SQRT_SOFTPLUS: u64 = 4;
 /// layer after the source layer takes its index top-k among the
 /// [`CANDIDATE_TOPK_BLOCKS`] blocks of [`CANDIDATE_BLOCK_SIZE`] compressed rows
 /// that the source layer's index scores rank first. The three constants are
-/// the defaults of the file's keys ([`CandidateMask`]).
-/// [`Hparams::candidate_free_positions`] bounds where the mask changes
-/// nothing.
+/// the defaults of the file's keys ([`CandidateMask`]);
+/// [`Hparams::candidate_role`] names each layer's part in it.
 pub const CANDIDATE_SOURCE_LAYER: usize = 20;
 /// Blocks the candidate mask keeps ([`CANDIDATE_SOURCE_LAYER`]).
 pub const CANDIDATE_TOPK_BLOCKS: usize = 2048;
@@ -249,8 +248,7 @@ impl CandidateMask {
     /// one. A source layer the file names (`source`: its layer count, and
     /// whether layer `l` runs the indexer) must be one of its indexer layers;
     /// the default names none, and a file without that layer (the gate
-    /// fixture's nine) keeps the mask's reach unknown
-    /// ([`Hparams::candidate_free_positions`] is then 0).
+    /// fixture's nine) has no layer the mask gives a role.
     fn checked(
         mask: CandidateMask,
         source: Option<(usize, &dyn Fn(usize) -> bool)>,
@@ -667,32 +665,45 @@ impl Hparams {
         Ok(self)
     }
 
-    /// The positions at which an index top-k over every compressed row is
-    /// the reference's. V4.1's candidate mask keeps every block while the
-    /// source layer's stream holds at most `topk_blocks · block_size` rows,
-    /// and a query at position `p` reaches `(p + 1) / ratio` of them
-    /// (model.py:562-567): so the first `blocks · size · ratio` positions,
-    /// exact at ratio 1 (the V4.1 file's) and a bound below the exact end
-    /// above it. `usize::MAX` for V4, which has no mask; 0 for a file without
-    /// the source layer (the gate fixture's nine layers) or whose source
-    /// layer compresses nothing, where the mask's reach is unknown.
-    pub fn candidate_free_positions(&self) -> usize {
-        candidate_free_positions(
+    /// Layer `l`'s part in the candidate mask: the source layer, every
+    /// indexer layer above it a consumer (the reference's `uses_candidates`,
+    /// model.py:503), `None` for any other layer and for V4, which has no
+    /// mask. Whether the source can rank the blocks — it runs the indexer
+    /// over the ratio-1 rows and index keys it owns — and every consumer
+    /// reads its stream is the loader's to check.
+    #[must_use]
+    pub fn candidate_role(&self, l: usize) -> Option<CandidateRole> {
+        candidate_role(
             self.candidates,
-            self.candidates
-                .and_then(|c| self.layers.get(c.source_layer))
-                .map(LayerKind::ratio),
+            |i| self.layers.get(i).is_some_and(|k| k.indexer),
+            l,
         )
     }
 }
 
-/// [`Hparams::candidate_free_positions`] for the mask `mask` (`None`: the
-/// model has none) whose source layer compresses at `source_ratio` (`None`:
-/// the file has no such layer).
-fn candidate_free_positions(mask: Option<CandidateMask>, source_ratio: Option<u32>) -> usize {
-    match mask {
-        None => usize::MAX,
-        Some(c) => c.topk_blocks * c.block_size * source_ratio.unwrap_or(0) as usize,
+/// A layer's part in V4.1's candidate mask ([`Hparams::candidate_role`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateRole {
+    /// The source layer: its index scores rank the blocks before its own
+    /// top-k, which the mask leaves alone.
+    Source,
+    /// An indexer layer above the source: its top-k is taken among the rows
+    /// of the blocks the source kept.
+    Consumer,
+}
+
+/// [`Hparams::candidate_role`] for the mask `mask` (`None`: the model has
+/// none) over layers of which `indexes(i)` says whether `i` runs the indexer.
+fn candidate_role(
+    mask: Option<CandidateMask>,
+    indexes: impl Fn(usize) -> bool,
+    l: usize,
+) -> Option<CandidateRole> {
+    let src = mask?.source_layer;
+    match l.cmp(&src) {
+        std::cmp::Ordering::Equal => Some(CandidateRole::Source),
+        std::cmp::Ordering::Greater if indexes(l) => Some(CandidateRole::Consumer),
+        _ => None,
     }
 }
 
@@ -1704,20 +1715,28 @@ mod tests {
         );
     }
 
-    /// V4.1's served table computes the reference for exactly the first
-    /// 16,384 positions (its source layer 20 compresses at ratio 1: 2,048
-    /// blocks of 8 rows); a ratio scales the bound; a missing or uncompressed
-    /// source layer computes none; V4 has no mask.
+    /// V4.1's served table: layer 20 is the mask's source, the indexer
+    /// layers above it (24, 28, 32, 36) its consumers, every other layer —
+    /// the ratio-2 indexers 2, 8 and 14 among them — has no part; V4 has no
+    /// mask.
     #[test]
-    fn candidate_mask_bounds_the_positions() {
-        let (_, ratios) = served();
-        let source = ratios.get(CANDIDATE_SOURCE_LAYER).copied();
-        let mask = Some(DEFAULT_MASK);
-        assert_eq!(candidate_free_positions(mask, source), 16_384);
-        assert_eq!(candidate_free_positions(mask, Some(2)), 32_768);
-        assert_eq!(candidate_free_positions(mask, Some(0)), 0);
-        assert_eq!(candidate_free_positions(mask, None), 0);
-        assert_eq!(candidate_free_positions(None, source), usize::MAX);
+    fn candidate_roles_of_the_served_table() {
+        let (c, _) = served();
+        let indexes = |l: usize| c.get(l).is_some_and(|k| k.indexer);
+        let roles: Vec<(usize, CandidateRole)> = (0..c.len())
+            .filter_map(|l| candidate_role(Some(DEFAULT_MASK), indexes, l).map(|r| (l, r)))
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                (20, CandidateRole::Source),
+                (24, CandidateRole::Consumer),
+                (28, CandidateRole::Consumer),
+                (32, CandidateRole::Consumer),
+                (36, CandidateRole::Consumer),
+            ]
+        );
+        assert!((0..c.len()).all(|l| candidate_role(None, indexes, l).is_none()));
     }
 
     /// The reference's values, the defaults of the three keys.

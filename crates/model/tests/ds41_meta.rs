@@ -47,7 +47,7 @@ use std::path::Path;
 
 use gguf::Split;
 use model::arch::deepseek41::hparams::{
-    CandidateMask, Collapse, Hparams, LayerKind, Model, Rope, Score,
+    CandidateMask, CandidateRole, Collapse, Hparams, LayerKind, Model, Rope, Score,
 };
 use model::arch::deepseek41::names;
 use model::placement::workstation;
@@ -288,10 +288,18 @@ fn hw_ds41_hparams_match_ik() {
     row(
         o,
         b,
-        "candidate_free_positions",
-        hp.candidate_free_positions(),
-        16_384,
-        "2048 blocks x 8 rows x layer 20's ratio 1",
+        "candidate roles",
+        (0..hp.n_layer)
+            .filter_map(|l| hp.candidate_role(l).map(|r| (l, r)))
+            .collect::<Vec<_>>(),
+        vec![
+            (20, CandidateRole::Source),
+            (24, CandidateRole::Consumer),
+            (28, CandidateRole::Consumer),
+            (32, CandidateRole::Consumer),
+            (36, CandidateRole::Consumer),
+        ],
+        "the source layer and the indexer layers above it; model.py:503 uses_candidates",
     );
 
     let _ = writeln!(o, "hyper-connections");

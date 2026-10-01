@@ -32,7 +32,24 @@
 //!   layer kind's launches plus the step's gather;
 //! - **rule**, on a layer whose projections are Q3_K: ik's q8_K × Q3_K dot
 //!   (`act_rule`) on ik's own inputs gives each projection's output in the
-//!   dump bit for bit — the codes the deviation reads ik's rounding from.
+//!   dump bit for bit — the codes the deviation reads ik's rounding from;
+//! - **candidates (G2s)**, after the layers, on a piece of its own over the
+//!   serving context (`workstation::CTX_MAX`; the sets' context holds 512
+//!   positions) with two rows of words, the candidate tap armed, the file's
+//!   weights of the mask's source layer and its first consumer: synthetic
+//!   compressed rows and index keys of the ratio-1 stream (random keys, each
+//!   odd block a copy of the one before it, the newest block's synthetic rows
+//!   zero) and synthetic inputs, row 1 one position after row 0 at 16,384 /
+//!   16,385, 24,575 / 24,576 and 32,767 / 32,768 visible rows; the source of
+//!   each row, then the consumer of each — the pair pass's order, so each
+//!   consumer reads its own row's kept blocks through the piece's buffer.
+//!   Per row (`shared/ds41_cand.rs`): the kept blocks are the reference's
+//!   selection over the card's own source scores, the compaction moved each
+//!   candidate row's score, the consumer's list is the exact top-k of its
+//!   scores over the kept blocks' rows, and at 16,384 nothing selects and the
+//!   list is the unmasked one. Red too when no row of the cases sees a pin,
+//!   a tie at the last kept place, a list the mask changed, or two rows of a
+//!   pass with different kept blocks, and on any fault.
 //!
 //! The five projections (q_a, q_b, kv, wo_a, wo_b) are Q8_0 or Q3_K — the
 //! file's format picks each side's rule; any other format is refused at load
@@ -86,6 +103,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_cand.rs"]
+mod cand;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::BTreeSet;
 
@@ -104,16 +125,20 @@ mod gate {
     use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::{
-        GateError, NAN_F16, RefManifest, RefRow, checks_failed, max_rel_err, ref_model_path,
-        ref_tensor_logical_in, ref_tensor_of_in, split_f32, verdict, widened_f16_rows_in,
+        GateError, NAN_F16, RefManifest, RefRow, activations, checks_failed, max_rel_err,
+        ref_model_path, ref_tensor_logical_in, ref_tensor_of_in, split_f32, verdict,
+        widened_f16_rows_in,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
-    use gguf::quant::{GgmlType, Q8Block, dequant_row, half_to_f32};
+    use gguf::quant::{GgmlType, Q8Block, dequant_row, f32_to_f16_bits, half_to_f32};
     use model::arch::Arch;
-    use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::deepseek41::hparams::{CandidateRole, Hparams};
     use model::arch::deepseek41::names;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
+    use model::placement::workstation;
+
+    use crate::cand;
 
     /// f32's unit roundoff.
     const U: f64 = f32::EPSILON as f64 / 2.0;
@@ -204,6 +229,8 @@ mod gate {
         /// (above ratio 1), whether it owns index keys.
         source: Option<(bool, bool)>,
         indexer: bool,
+        /// It has a part in the candidate mask (`Hparams::candidate_role`).
+        cand: bool,
         quant: Quant,
         joins: Joins,
     }
@@ -275,6 +302,7 @@ mod gate {
                 stream: planner.layer_stream(l),
                 source: kind.compressor.map(|c| (c.gated, kind.index_keys)),
                 indexer: kind.indexer,
+                cand: hp.candidate_role(l).is_some(),
                 quant: Quant::of(split, l)?,
                 joins: Joins::of(split, l, kind.indexer, gated)?,
             })
@@ -297,11 +325,14 @@ mod gate {
         /// projections, the row launch and the index key's three, and on an
         /// indexer layer its two projections, the score and top-k passes and,
         /// without a compressor and without the norm's q8_1 form, the q8_1 of
-        /// the normed input — less one launch per member a join
+        /// the normed input, and on a layer the candidate mask gives a role
+        /// its two (the source's block keys and selection, a consumer's
+        /// compaction and remap) — less one launch per member a join
         /// folds into another: kv (and the indexer's weights projection) into
         /// q_a's, the indexer's query into q_b's, the gate into the
         /// compressor's kv.
         // PIN(2026-09-24): the joins of `join_projections` (ds41dense) fold launches into others.
+        // PIN(2026-10-02): the candidate mask's two a role layer (candwire): 2 + 4 × 2 = 10 a pass.
         fn launches(&self) -> usize {
             let folded = usize::from(self.joins.qkv) * (1 + usize::from(self.indexer))
                 + usize::from(self.joins.query)
@@ -317,6 +348,7 @@ mod gate {
                 } else {
                     0
                 }
+                + 2 * usize::from(self.cand)
         }
     }
 
@@ -1897,6 +1929,216 @@ mod gate {
         }
     }
 
+    // ----------------------------------------------------------------- G2s
+
+    /// G2s's cases (module doc): the two rows' visible counts of the ratio-1
+    /// stream, row 1 one position after row 0 as in the pair pass — at the
+    /// bound and one past it, then two depths that drop a third and half of
+    /// the blocks.
+    const CAND_CASES: [[usize; 2]; 3] = [[16_384, 16_385], [24_575, 24_576], [32_767, 32_768]];
+    /// The synthetic index keys' scale: their scores stand well above the
+    /// rows the step itself writes, so the newest block ranks low unless
+    /// pinned.
+    const CAND_KEY_SCALE: f32 = 16.0;
+
+    /// The synthetic index keys of a case whose rows sit at `p0` and `p0 +
+    /// 1`: random values, each odd block below `p0` the copy of the block
+    /// before it (equal keys, which the rule breaks to the lower block), and
+    /// the synthetic rows of row 1's newest block zero (that block's rows
+    /// below `p0` the lowest scores, so it ranks low unless pinned).
+    fn cand_keys(rows: usize, width: usize, p0: usize, block: usize, seed: u32) -> Vec<u16> {
+        let vals = activations(width, rows, seed);
+        let mut keys: Vec<u16> = vals
+            .iter()
+            .map(|&v| f32_to_f16_bits(v.clamp(-1.0, 1.0) * CAND_KEY_SCALE))
+            .collect();
+        let row_len = block * width;
+        for b in (1..p0 / block).step_by(2) {
+            let (lo, hi) = keys.split_at_mut(b * row_len);
+            hi[..row_len].copy_from_slice(&lo[(b - 1) * row_len..]);
+        }
+        let pin = ((p0 + 2).div_ceil(block) - 1) * block;
+        if pin < p0 {
+            keys[pin * width..p0 * width].fill(0);
+        }
+        keys
+    }
+
+    /// G2s (module doc): the candidate mask's wiring on the piece's real
+    /// select path at depth, on synthetic rows and keys.
+    fn cand_wire(cx: &Cx<'_>, tally: &mut Tally) -> Result<(), GateError> {
+        let (gpu, hp, split) = (cx.gpu, cx.hp, cx.split);
+        let stream = gpu.stream();
+        let mask = hp
+            .candidates
+            .ok_or("cand: the file carries no candidate mask")?;
+        let src = mask.source_layer;
+        let consumer = (src + 1..hp.n_layer)
+            .find(|&l| hp.candidate_role(l) == Some(CandidateRole::Consumer))
+            .ok_or("cand: no consumer above the source layer")?;
+        let planner = Planner::from_file(split, hp, workstation::CTX_MAX)?;
+        let layout = ImageLayout::new(ImageDims::of(
+            hp,
+            &planner,
+            STEP_TOKENS,
+            engram_row_bytes(split, hp)?,
+        ))?;
+        let (window, yarn) = rope_specs(hp)?;
+        let mut piece = AttnChain::with_rows(gpu, hp, 0..hp.n_layer, &layout, &planner, 2)?;
+        piece.arm_cand_tap(gpu, true)?;
+        let top_k = piece.top_k();
+        let mut bufs = Bufs::new(stream, hp, &planner, layout.words(), piece.list_len())?;
+        let kinds = [
+            Kind::of(hp, &planner, split, src)?,
+            Kind::of(hp, &planner, split, consumer)?,
+        ];
+        let st = match (kinds[0].stream, kinds[1].stream) {
+            (Some(a), Some(b)) if a == b => a,
+            other => {
+                return Err(format!(
+                    "cand: layers {src} and {consumer} attend streams {other:?}, not one"
+                )
+                .into());
+            }
+        };
+        let mut keep = resident_names(src, &kinds[0]);
+        keep.extend(resident_names(consumer, &kinds[1]));
+        let mut w = Weights::load_where(stream, split, |n| keep.contains(n))?;
+        join_projections(stream, hp, src..src + 1, &mut w)?;
+        join_projections(stream, hp, consumer..consumer + 1, &mut w)?;
+        let (blocks, block) = (mask.topk_blocks, mask.block_size);
+        let n_rows = bufs.rows[st].rows();
+        let latent: Vec<u16> = activations(hp.head_dim, n_rows, 7301)
+            .iter()
+            .map(|&v| f32_to_f16_bits(v.clamp(-1.0, 1.0) * 0.5))
+            .collect();
+        bufs.rows[st].buf_mut().copy_from_host(stream, &latent)?;
+        let before = vec![1u32; planner.ngram()];
+        gpu.clear_fault()?;
+        let (mut pin_seen, mut tie_seen, mut changed, mut differ) = (false, false, 0, false);
+        let mut all_ok = true;
+        for (case, ns) in CAND_CASES.iter().enumerate() {
+            let p0 = ns[0] - 1;
+            let keys = cand_keys(n_rows, hp.indexer.head_dim, p0, block, 7400 + case as u32);
+            bufs.keys[st].buf_mut().copy_from_host(stream, &keys)?;
+            for (r, &n) in ns.iter().enumerate() {
+                let mut plan = StepPlan::default();
+                planner.plan_into(&[1], u32::try_from(n - 1)?, &before, &mut plan)?;
+                let mut image = StepImage::new(layout.clone(), &window, &yarn)?;
+                let embd = vec![0u8; STEP_TOKENS * layout.dims().embd_bytes];
+                let engram = vec![0u8; STEP_TOKENS * layout.dims().engram_bytes];
+                image.build(&plan, &embd, &engram)?;
+                bufs.image.copy_from_host(stream, image.words())?;
+                piece.enqueue_step_of(gpu, &bufs.image, r)?;
+            }
+            // The rows in the pair pass's order: the source of each row,
+            // then the consumer of each, which reads its own row's kept
+            // blocks through the piece.
+            let mut source = Vec::new();
+            for (r, &n) in ns.iter().enumerate() {
+                let seed = 7500 + 10 * case as u32 + r as u32;
+                bufs.streams_in
+                    .copy_from_host(stream, &activations(4 * hp.n_embd, 1, seed))?;
+                bufs.fold_in
+                    .copy_from_host(stream, &activations(hp.n_embd, 1, seed + 5))?;
+                piece.enqueue_layer_of(gpu, &w, src, r, bufs.io(&kinds[0]))?;
+                stream.synchronize()?;
+                let taps = piece.taps();
+                let sel = taps
+                    .select
+                    .ok_or("cand: the source left no selection taps")?;
+                let scores = sel.scores.to_host_vec(stream)?;
+                let kept = sel
+                    .kept
+                    .ok_or("cand: the source layer's taps carry no kept blocks")?
+                    .to_host_vec(stream)?;
+                source.push((scores[..n].to_vec(), kept));
+            }
+            for (r, &n) in ns.iter().enumerate() {
+                let seed = 7600 + 10 * case as u32 + r as u32;
+                bufs.streams_in
+                    .copy_from_host(stream, &activations(4 * hp.n_embd, 1, seed))?;
+                bufs.fold_in
+                    .copy_from_host(stream, &activations(hp.n_embd, 1, seed + 5))?;
+                let poison = vec![u32::MAX; bufs.lists[st].len()];
+                bufs.lists[st].copy_from_host(stream, &poison)?;
+                piece.enqueue_layer_of(gpu, &w, consumer, r, bufs.io(&kinds[1]))?;
+                stream.synchronize()?;
+                let taps = piece.taps();
+                let sel = taps
+                    .select
+                    .ok_or("cand: the consumer left no selection taps")?;
+                let compacted = sel.scores.to_host_vec(stream)?;
+                let unmasked = sel
+                    .unmasked
+                    .ok_or("cand: the consumer's taps carry no unmasked scores (tap not armed)")?
+                    .to_host_vec(stream)?;
+                let list = bufs.lists[st].to_host_vec(stream)?;
+                let (scores, kept) = &source[r];
+                let row = cand::check(&cand::Card {
+                    n,
+                    top_k,
+                    blocks,
+                    block,
+                    source: scores,
+                    kept,
+                    unmasked: &unmasked,
+                    compacted: &compacted,
+                    list: &list,
+                });
+                let at_bound = n <= blocks * block;
+                let pass = row.pass() && row.selects != at_bound;
+                println!(
+                    "cand case {case} row {r} layers {src}→{consumer}: {} — {}",
+                    row.line(),
+                    verdict(pass)
+                );
+                tally.check(pass, format!("cand case {case} row {r}"));
+                all_ok &= pass;
+                pin_seen |= row.pin_below;
+                tie_seen |= row.tie;
+                changed += row.changed;
+                if r == 1 && row.selects {
+                    differ |= source[0].1[..blocks] != source[1].1[..blocks];
+                }
+            }
+        }
+        piece.arm_cand_tap(gpu, false)?;
+        let fault = gpu.fault()?;
+        let clean = fault.is_none();
+        println!(
+            "cand: fault word after the cases {fault:?} — {}",
+            verdict(clean)
+        );
+        tally.check(clean, "cand fault word".to_string());
+        // What the data lets the checks see (`shared/ds41_cand.rs`).
+        for (seen, what) in [
+            (
+                pin_seen,
+                "a row whose newest block falls out without its pin",
+            ),
+            (
+                tie_seen,
+                "equal block keys on both sides of the last kept place",
+            ),
+            (changed > 0, "a consumer list the mask changed"),
+            (differ, "two rows of one pass with different kept blocks"),
+        ] {
+            println!("cand witness: {what}: {seen} — {}", verdict(seen));
+            tally.check(seen, format!("cand witness: {what}"));
+        }
+        println!(
+            "cand: {} rows {}, {changed} list entries the mask changed",
+            2 * CAND_CASES.len(),
+            if all_ok {
+                "to the rule"
+            } else {
+                "OFF the rule"
+            }
+        );
+        Ok(())
+    }
+
     // -------------------------------------------------------------- the run
 
     /// What the layers read besides their own weights.
@@ -2020,6 +2262,9 @@ mod gate {
         for l in layer_filter(hp.n_layer)? {
             gate_layer(&cx, &mut piece, &mut bufs, &sets, l, &mut tally)?;
         }
+        drop(bufs);
+        drop(piece);
+        cand_wire(&cx, &mut tally)?;
         let pass = tally.failed.is_empty();
         println!(
             "gate_deepseek41_chain_attn: {} checks, {} failed{} — {}",

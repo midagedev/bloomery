@@ -210,6 +210,10 @@ IDX_ONLY = frozenset(x["l"] for x in _LAYERS if x["indexer"]) - SOURCES
 INDEXERS = SOURCES | IDX_ONLY
 ENGRAM = frozenset(x["l"] for x in _LAYERS if x["engram"])
 _RATIO = {x["l"]: x["ratio"] for x in _LAYERS}
+# The candidate mask (gpu-deepseek41 chain/attn.rs enqueue_select): the ratio-1 stream's compressor layer is its
+# source (20), the indexer layers that read that stream its consumers (24, 28, 32, 36).
+CAND_SOURCE = frozenset(l for l in SOURCES if _RATIO[l] == 1)
+CAND_CONSUMERS = frozenset(l for l in IDX_ONLY if _RATIO[l] == 1)
 # The two layers whose routed down is Q5_K (docs/facts.md 「이 모델에 실제로 들어 있는 것」 row Q5_K (13); docs/plan-ledger.md 「「지금」에서 옮긴 것 (2026-09-23)」 row b5host '0·1층 q5_K'): their
 # experts are expert_gu_bytes + expert_down_q5_bytes, the ring's largest slot.
 Q5_LAYERS = frozenset({0, 1})
@@ -324,6 +328,13 @@ def attn_kernels(l):
     rope back, quantize, wo_a, quantize, wo_b + transpose, hc_post = 20; the indexer adds 2 and a
     source's compressor and index key 8 (7 ungated) (docs/research/cardroute-design-report.md 「1. 분해와 판정」 '항목 수. P 512' table, '청크 커널 21.2는 층 종류별 커널 수의 평균이다')."""
     return 30 if l in SRC_GATED else 29 if l in SRC_PLAIN else 22 if l in IDX_ONLY else 20
+
+
+def cand_acts(l):
+    """The candidate mask's launches in a full chunk (chain/attn.rs enqueue_select): the source's block keys and
+    selection, each consumer's compaction and remap, 2 a layer and a no-op below the mask's bound. Only a config with
+    `cand` issues them (the engine from candwire on)."""
+    return 2 if l in CAND_SOURCE | CAND_CONSUMERS else 0
 
 
 FORK_EVENTS = 4                # gpu/src/graph.rs Branch::fork, Forked::join: record + wait, twice (chain/attn.rs)
@@ -938,6 +949,7 @@ def route_lb(p, cfg, lb):
     bulk = cfg.get("route", "bulk") == "bulk"
     timed = cfg.get("timed", False)
     l, g, sk = lb.l, p["gap_act"] / 1000.0, p["small_k"]
+    ca = cand_acts(l) if cfg.get("cand") else 0
     terms, acts, ev = {}, 0, (TIMED_ROUTE_EVENTS if timed else 0)
     eg = 0.0
     for _, m in lb.engram:
@@ -971,12 +983,12 @@ def route_lb(p, cfg, lb):
         spec += special_chunk(p, l, pos, m) / 1000.0
         nq += p["route_nq"] / 1000.0
         if b1:
-            a, e = b1_chunk_acts(l), 0
+            a, e = b1_chunk_acts(l) + ca, 0
         else:
             proj += proj_chunk(p, l, m) / 1000.0
             small += p["small_chunk"] / 1000.0
             ovl -= p["fork_overlap"] / 1000.0
-            a, e = full_acts(l), FORK_EVENTS
+            a, e = full_acts(l) + ca, FORK_EVENTS
         if not bulk:
             a += m + 1                     # a one-token router launch per token and a places launch
         acts += a
@@ -1818,6 +1830,12 @@ CONFIGS = {
                 marks4=True),
     "PG2": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
                 wrap=True, marks4=True),
+    # the engine from candwire on: PG1 / PG2's flow with the candidate mask's launches (cand_acts) in every full chunk
+    # of its source and consumers; what --counts holds a counter log of today's tree to
+    "CW1": dict(commit="candwire", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True,
+                marks4=True, cand=True),
+    "CW2": dict(commit="candwire", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
+                wrap=True, marks4=True, cand=True),
     # the r8host lease (09-27#r8host-pp): bloomery 6ffed9e (r8host, landed as r8land 1ad6599), frequency list 384, CED on, G 2
     # (prefillgroup's default), BLOOMERY_STEP_STATS=1, BLOOMERY_R8=on (the default) against =off, one binary; the release
     # sitting (09-28#v41-release): main 53e2def, the same flow, lcg at the id prefix, no STEP_STATS (no card marks)
@@ -3314,7 +3332,7 @@ def counts(P, cname="PG2", ced=True):
 def check_counts(path):
     """--counts LOG: a generate_ds41 run's counter (`stat prefill front` a batch, `stat prefill lb` a layer-batch,
     printed under BLOOMERY_STEP_STATS=1) against counts() for the same call, which its `call plan` record names (P,
-    CED, G: PG1 or PG2), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
+    CED, G: CW1 or CW2, the tree's flow), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
     cannot be compared."""
     recs = records.read(path)
     cp = records.first(recs, "call_plan")
@@ -3328,9 +3346,9 @@ def check_counts(path):
     P, ced, G = cp["end"] - cp["first"], cp["ced"] == "on", cp["group"]
     if cp["first"] != 0 or G not in (1, 2):
         print(f"{path}: a call at {cp['first']}..{cp['end']} under G {G}; the model's configs run a call from position 0 "
-              f"under G 1 (PG1) or 2 (PG2)")
+              f"under G 1 (CW1) or 2 (CW2)")
         return 64
-    cname = "PG2" if G == 2 else "PG1"
+    cname = "CW2" if G == 2 else "CW1"
     want_front, want = counts(P, cname, ced)
     df = {b: front.get(b, 0) - want_front.get(b, 0) for b in sorted(set(front) | set(want_front))}
     rows = [(k, got.get(k, (0, 0)), want.get(k, (0, 0))) for k in sorted(set(got) | set(want))]
@@ -3511,6 +3529,15 @@ def self_test():
         front, lbs = counts(P)
         got = (sum(front.values()), sum(r for r, _ in lbs.values()), sum(s for _, s in lbs.values()))
         check(f"PG2's calls at P {P} = the counter's first steps, route and shadow {want}", got == want, str(got))
+        # the candidate mask adds its 2 a full chunk on the route of its source and consumers, nothing else
+        cfront, clbs = counts(P, "CW2")
+        role = sum(2 * len(x["lb"].full) for x in evaluate(central(), dict(CONFIGS["PG2"], ced=True), P)["recs"]
+                   if cand_acts(x["lb"].l))
+        moved = {k: (clbs[k][0] - lbs[k][0], clbs[k][1] - lbs[k][1]) for k in lbs}
+        check(f"CW2 at P {P} = PG2 + the mask's 2 a full chunk on layers 20, 24, 28, 32, 36 ({role} route entries)",
+              cfront == front and clbs.keys() == lbs.keys() and role > 0
+              and sum(r for r, _ in moved.values()) == role and all(s == 0 for _, s in moved.values()),
+              str(sum(r for r, _ in moved.values())))
     cfg, rn = row_cfg(p, "B1prose", {"rt": "prose"})
     got = evaluate(p, cfg, 512, rn)["agg"]["host_slots"]
     check("the prose routing reproduces its anchor: 52,189 host slots at P 512 (0.1 %)", abs(got - 52189) / 52189 < 1e-3,

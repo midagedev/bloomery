@@ -28,7 +28,14 @@
 //! 6. on a layer that runs the indexer: the query's projection of q_a's norm,
 //!    the weights' projection of the normed input (in q8_1, quantized here on
 //!    a layer that owns no compressor), the score pass and the top-k pass,
-//!    which write the stream's list;
+//!    which write the stream's list — around them, on a file with a candidate
+//!    mask, the mask's launches (`bloomery_gpu::cand`): the source layer's
+//!    block keys and selection into its row's kept lists after its own
+//!    top-k, each consumer's compaction over that row's kept lists between
+//!    its passes and the remap of its list's slots after them. The kept
+//!    lists are the piece's, one set a row of words like the words
+//!    themselves, so a row's consumers read what its source wrote this pass
+//!    whatever the other rows run between them;
 //! 7. the attention over the window ⧺ the stream's compressed rows read
 //!    through the list, then the inverse rope of its output;
 //! 8. wo_a, its groups in one launch (`q8_0_gemv_heads`, or the q8_1 form of
@@ -68,13 +75,16 @@
 use std::mem::{ManuallyDrop, size_of};
 use std::ops::Range;
 
+use bloomery_gpu::cand::{CandKernels, CandScratch, CandShape, CompactArgs, RemapArgs, SelectArgs};
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{Branch, DeviceTensor, FaultSink, Gpu, GpuError, PartedBuffer, Q8Act, Window};
+use bloomery_gpu::{
+    Branch, DeviceTensor, FaultSink, Gpu, GpuError, PartedBuffer, Q8Act, Window, capturing,
+};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::quant::GgmlType;
-use model::arch::deepseek41::hparams::Hparams;
+use model::arch::deepseek41::hparams::{CandidateRole, Hparams, LayerKind};
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::Planner;
 
@@ -249,8 +259,16 @@ pub struct SelectTaps<'a> {
     pub q: &'a DeviceBuffer<f32>,
     /// The scaled weights, `HEADS`.
     pub w: &'a DeviceBuffer<f32>,
-    /// The scores of the rows below `n_vis`, on a layer that selected.
+    /// The scores of the rows below `n_vis`, on a layer that selected; on a
+    /// consumer of the candidate mask, a selecting token's first `n_c` in
+    /// slot order (its compaction's).
     pub scores: &'a DeviceBuffer<f32>,
+    /// On a layer the candidate mask gives a role: its row's kept lists,
+    /// `blocks` entries a token.
+    pub kept: Option<&'a DeviceBuffer<u32>>,
+    /// On a consumer, with the tap armed ([`AttnChain::arm_cand_tap`]): its
+    /// scores before the compaction.
+    pub unmasked: Option<&'a DeviceBuffer<f32>>,
 }
 
 /// A compressor layer's intermediate buffers.
@@ -548,6 +566,9 @@ struct LayerPlan {
     stream: Option<usize>,
     source: Option<SourcePlan>,
     indexer: Option<IndexerPlan>,
+    /// The layer's part in the candidate mask, `None` where the load carries
+    /// none or the layer reads no kept list.
+    cand: Option<CandidateRole>,
     /// Word offsets of its forward and back rope tables: YaRN on a layer
     /// with a stream, the window rope otherwise.
     forward: usize,
@@ -579,8 +600,45 @@ struct SelectScratch {
     /// Per token count, per plan stream whose keys a layer scores: the score
     /// and top-k passes' scratch over the stream's rows.
     streams: Vec<Vec<Option<IndexerScratch>>>,
-    /// The token count and the stream of the last indexer layer enqueued.
-    last: Option<(usize, usize)>,
+    /// The candidate mask's side, present when a layer of the card carries a
+    /// role.
+    cand: Option<CandSel>,
+    /// The last indexer layer enqueued.
+    last: Option<LastSelect>,
+}
+
+/// What the last indexer layer enqueued ran over: its token count, plan
+/// stream and row, and its part in the candidate mask.
+#[derive(Clone, Copy)]
+struct LastSelect {
+    m: usize,
+    stream: usize,
+    row: usize,
+    role: Option<CandidateRole>,
+}
+
+/// The candidate mask's side: the family's kernels, the source's own
+/// scratch per token count, the counts view every consumer's compaction
+/// writes and its top-k and remap read — one buffer, the passes of a piece
+/// running in order on one stream — and per row of words the kept lists the
+/// source writes and the consumers of the same row read, which live from the
+/// source's layer to the last consumer's.
+struct CandSel {
+    kernels: CandKernels,
+    shape: CandShape,
+    /// Per token count 1..=the image's: the source's scratch over the source
+    /// stream's rows.
+    scratch: Vec<CandScratch>,
+    /// `[tokens + 1]`: the counts view [`CandSel::kernels`]'s compaction
+    /// writes.
+    counts: DeviceBuffer<u32>,
+    /// Per row of words: `[tokens × blocks]`, token `t`'s kept blocks at
+    /// `t · blocks`.
+    kept: Vec<DeviceBuffer<u32>>,
+    /// Armed by [`AttnChain::arm_cand_tap`] alone, per token count: a
+    /// consumer's scores before its compaction, the last consumer's. Never
+    /// in a captured step.
+    tap: Option<Vec<DeviceBuffer<f32>>>,
 }
 
 /// A compressor layer's scratch.
@@ -875,9 +933,30 @@ impl AttnChain {
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // The candidate mask's side, per token count over the source
+            // stream's rows, and the counts view its consumers share.
+            let cand = match cand_plan(hp, &plans, layers.start)? {
+                None => None,
+                Some((shape, st)) => {
+                    let n_rows = words.layout.streams[st].geom.rows;
+                    Some(CandSel {
+                        kernels: CandKernels::load(ctx)?,
+                        shape,
+                        scratch: (1..=m)
+                            .map(|c| CandScratch::new(stream, shape, c, n_rows))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        counts: DeviceBuffer::zeroed(stream, m + 1)?,
+                        kept: (0..rows)
+                            .map(|_| DeviceBuffer::zeroed(stream, m * shape.blocks()))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        tap: None,
+                    })
+                }
+            };
             Some(SelectScratch {
                 act: Q8Act::with_k(stream, 1, hp.n_embd)?,
                 streams,
+                cand,
                 last: None,
             })
         } else {
@@ -985,6 +1064,73 @@ impl AttnChain {
         self.top_k
     }
 
+    /// Row `row`'s kept candidate lists (`[tokens × blocks]`, token `t`'s at
+    /// `t · blocks`) and `blocks`, as the source layer's last pass of that
+    /// row left them; `None` on a piece whose layers the candidate mask gives
+    /// no role.
+    #[must_use]
+    pub fn cand_kept(&self, row: usize) -> Option<(&DeviceBuffer<u32>, usize)> {
+        let c = self.scratch.select.as_ref()?.cand.as_ref()?;
+        Some((c.kept.get(row)?, c.shape.blocks()))
+    }
+
+    /// Of [`AttnChain::device_bytes`], the kept candidate lists: one set a
+    /// row of words, laid out like them.
+    #[must_use]
+    pub fn kept_bytes(&self) -> usize {
+        self.scratch
+            .select
+            .as_ref()
+            .and_then(|s| s.cand.as_ref())
+            .map_or(0, |c| c.kept.iter().map(DeviceBuffer::num_bytes).sum())
+    }
+
+    /// Arm (`on`) or drop the candidate tap, for a gate: each consumer's
+    /// scores copied before its compaction, the last one's shown as
+    /// [`SelectTaps::unmasked`]. One copy a consumer layer, so a pass with
+    /// the tap armed is not the step's launches, and capturing one is
+    /// refused by name. Refused on a piece the mask gives no role.
+    /// Allocates: load-time only.
+    pub fn arm_cand_tap(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
+        let sel = self.scratch.select.as_mut();
+        let Some(SelectScratch {
+            streams,
+            cand: Some(c),
+            ..
+        }) = sel
+        else {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a layer the candidate mask gives a role, for its tap",
+            });
+        };
+        c.tap = None;
+        if on {
+            let st = self
+                .plans
+                .iter()
+                .find(|p| p.cand == Some(CandidateRole::Source))
+                .and_then(|p| p.stream)
+                .ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the candidate mask's source layer on the piece",
+                })?;
+            c.tap = Some(
+                streams
+                    .iter()
+                    .map(|by_stream| {
+                        let n = by_stream
+                            .get(st)
+                            .and_then(Option::as_ref)
+                            .map_or(0, |x| x.scores.len());
+                        DeviceBuffer::zeroed(gpu.stream(), n).map_err(GpuError::from)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(())
+    }
+
     /// Select `top_k` rows instead of the file's, as ik's
     /// `--override-kv <arch>.attention.indexer.top_k` does: at least 1, at
     /// most [`list_len`](Self::list_len). Load-time only — one host-to-device
@@ -1062,6 +1208,19 @@ impl AttnChain {
                     .flatten()
                     .map(IndexerScratch::device_bytes)
                     .sum::<usize>()
+                + x.cand.as_ref().map_or(0, |c| {
+                    c.scratch
+                        .iter()
+                        .map(CandScratch::device_bytes)
+                        .sum::<usize>()
+                        + c.counts.num_bytes()
+                        + c.kept.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
+                        + c.tap
+                            .iter()
+                            .flatten()
+                            .map(DeviceBuffer::num_bytes)
+                            .sum::<usize>()
+                })
         });
         let a = &s.acts;
         let acts = q8act_bytes(a.normed.m(), d.n_embd)
@@ -1131,13 +1290,18 @@ impl AttnChain {
                 key: &x.key,
             }),
             select: s.select.as_ref().and_then(|x| {
-                let (m, stream) = x.last?;
-                let scratch = x.streams.get(m - 1)?.get(stream)?.as_ref()?;
+                let last = x.last?;
+                let scratch = x.streams.get(last.m - 1)?.get(last.stream)?.as_ref()?;
+                let cand = last.role.and(x.cand.as_ref());
                 Some(SelectTaps {
-                    stream,
+                    stream: last.stream,
                     q: &scratch.q,
                     w: &scratch.w,
                     scores: &scratch.scores,
+                    kept: cand.and_then(|c| c.kept.get(last.row)),
+                    unmasked: cand
+                        .filter(|_| last.role == Some(CandidateRole::Consumer))
+                        .and_then(|c| c.tap.as_ref()?.get(last.m - 1)),
                 })
             }),
         }
@@ -1230,6 +1394,7 @@ impl AttnChain {
             k: &self.kernels,
             d: &self.dims,
             words: self.words.of(row)?,
+            row,
             layer,
             fault: gpu.layer_sink(layer)?,
             m: 1,
@@ -1532,6 +1697,8 @@ struct Cx<'a> {
     k: &'a Kernels,
     d: &'a Dims,
     words: RowWords<'a>,
+    /// The row of words, and of the kept candidate lists, the pass reads.
+    row: usize,
     /// The model layer the launches belong to, and its fault sink.
     layer: usize,
     fault: FaultSink,
@@ -1763,7 +1930,16 @@ fn enqueue_indexer(
 
 /// The indexer's score and top-k passes of the pass's tokens into the list,
 /// from its two projections in the gemvs' layout, a token per column: `q_in`
-/// the query's, `w_in` the weights'.
+/// the query's, `w_in` the weights'. On a layer the candidate mask gives a
+/// role ([`CandidateRole`]) the mask's launches go around them, all on the one
+/// stream, since the scores are the stream's shared scratch: the source's
+/// block keys and selection into its row's kept lists after its own top-k;
+/// a consumer's compaction over the kept lists its row's source wrote this
+/// pass between the passes, its top-k over the counts view the compaction
+/// wrote, and the remap of its list's slots to rows. Below the mask's bound
+/// every candidate launch leaves its buffers as it found them and the view
+/// holds the step words' counts, so the passes are the plain ones' bit for
+/// bit.
 fn enqueue_select(
     cx: &Cx<'_>,
     lp: &LayerPlan,
@@ -1773,33 +1949,161 @@ fn enqueue_select(
     w_in: &DeviceBuffer<f32>,
     io: IndexerIo<'_>,
 ) -> Result<(), GpuError> {
-    let (d, m) = (cx.d, cx.m);
+    let (d, m, stream) = (cx.d, cx.m, cx.gpu.stream());
     let words = cx.words.view::<u32>(0, cx.words.layout.len)?;
-    let scratch = count_of(&mut sel.streams, m)?[io.stream]
+    let IndexerIo {
+        stream: st,
+        keys,
+        list,
+        top_k,
+    } = io;
+    let (n_at, top_k_at) = (cx.words.layout.streams[st].nvis, cx.words.layout.top_k);
+    let SelectScratch {
+        streams,
+        cand,
+        last,
+        ..
+    } = sel;
+    let scratch = count_of(streams, m)?[st]
         .as_mut()
         .ok_or_else(|| GpuError::Shape {
             what: WHAT,
             detail: "an indexer layer's stream has no indexer scratch".to_string(),
         })?;
-    kernels.enqueue(
-        cx.gpu.stream(),
-        IndexerArgs {
-            q: q_in,
-            w: w_in,
-            ints: &words,
-            n_vis_at: cx.words.layout.streams[io.stream].nvis,
-            top_k_at: cx.words.layout.top_k,
-            tables: &words,
-            rope_at: lp.forward,
-            rope_stride: d.rope_dims,
-            keys: io.keys,
-            tokens: m,
-            scratch,
-            list: io.list,
-            stride: io.top_k,
-        },
-    )?;
-    sel.last = Some((m, io.stream));
+    let rows = keys.rows();
+    let mut a = IndexerArgs {
+        q: q_in,
+        w: w_in,
+        ints: &words,
+        n_vis_at: n_at,
+        top_k_at,
+        tables: &words,
+        rope_at: lp.forward,
+        rope_stride: d.rope_dims,
+        keys,
+        tokens: m,
+        scratch,
+        list,
+        stride: top_k,
+    };
+    kernels.enqueue_score(stream, &mut a)?;
+    let side = match lp.cand {
+        None => None,
+        Some(role) => Some((
+            role,
+            cand.as_mut().ok_or(GpuError::State {
+                what: WHAT,
+                missing: "the candidate mask's kernels and kept lists on a layer the mask gives \
+                          a role",
+            })?,
+        )),
+    };
+    let Some((role, side)) = side else {
+        kernels.enqueue_topk(stream, &mut a, &words, n_at, top_k_at)?;
+        *last = Some(LastSelect {
+            m,
+            stream: st,
+            row: cx.row,
+            role: None,
+        });
+        return Ok(());
+    };
+    let CandSel {
+        kernels: ck,
+        shape,
+        scratch: by_count,
+        counts,
+        kept,
+        tap,
+    } = side;
+    let shape = *shape;
+    let kstride = shape.blocks();
+    let n_kept = kept.len();
+    let kept = kept.get_mut(cx.row).ok_or_else(|| GpuError::Shape {
+        what: WHAT,
+        detail: format!(
+            "row {} of a piece whose kept candidate lists serve {n_kept} rows",
+            cx.row
+        ),
+    })?;
+    match role {
+        CandidateRole::Source => {
+            kernels.enqueue_topk(stream, &mut a, &words, n_at, top_k_at)?;
+            let source = count_of(by_count, m)?;
+            ck.enqueue_select(
+                stream,
+                SelectArgs {
+                    ints: &words,
+                    n_at,
+                    scores: &a.scratch.scores,
+                    score_k: top_k,
+                    rows,
+                    tokens: m,
+                    shape,
+                    fault: cx.fault,
+                    scratch: source,
+                    kept,
+                    kstride,
+                },
+            )?;
+        }
+        CandidateRole::Consumer => {
+            if let Some(tap) = tap.as_mut() {
+                if capturing(stream)? {
+                    return Err(GpuError::State {
+                        what: WHAT,
+                        missing: "an eager pass: the candidate tap is armed \
+                                  (AttnChain::arm_cand_tap), and a captured step holds no tap",
+                    });
+                }
+                count_of(tap, m)?.copy_from_device_async(&a.scratch.scores, stream)?;
+            }
+            ck.enqueue_compact(
+                stream,
+                CompactArgs {
+                    ints: &words,
+                    n_at,
+                    top_k_at,
+                    kept,
+                    kstride,
+                    rows,
+                    tokens: m,
+                    stride: top_k,
+                    shape,
+                    fault: cx.fault,
+                    scores: &mut a.scratch.scores,
+                    hist: &mut a.scratch.hist,
+                    counts,
+                    counts_at: 0,
+                },
+            )?;
+            // The counts view: `n_c` (or `n`) per token, `top_k` behind them.
+            kernels.enqueue_topk(stream, &mut a, counts, 0, m)?;
+            ck.enqueue_remap(
+                stream,
+                RemapArgs {
+                    ints: &words,
+                    n_at,
+                    kept,
+                    kstride,
+                    counts,
+                    counts_at: 0,
+                    rows,
+                    tokens: m,
+                    shape,
+                    fault: cx.fault,
+                    list: &mut *a.list,
+                    stride: top_k,
+                },
+            )?;
+        }
+    }
+    *last = Some(LastSelect {
+        m,
+        stream: st,
+        row: cx.row,
+        role: Some(role),
+    });
     Ok(())
 }
 
@@ -2163,6 +2467,7 @@ fn layer_plan(
         }
         _ => None,
     };
+    let cand = cand_role(hp, words, l, kind, stream, source.as_ref())?;
     let tables = match stream {
         Some(_) => (Table::YarnForward, Table::YarnBack),
         None => (Table::WindowForward, Table::WindowBack),
@@ -2189,10 +2494,122 @@ fn layer_plan(
         stream,
         source,
         indexer,
+        cand,
         forward,
         back,
         tables,
     })
+}
+
+/// Layer `l`'s part in the candidate mask ([`Hparams::candidate_role`]),
+/// with the load-time invariant the mask's wiring rests on: the source runs
+/// the indexer over a ratio-1 stream whose compressor and index keys it owns
+/// — the blocks are rows of one position each, and the kept list is made
+/// from its own scores — and every consumer reads that stream's rows and
+/// keys. A file that breaks it is refused by name: the engine builds the
+/// mask or says why it cannot, never another model.
+fn cand_role(
+    hp: &Hparams,
+    words: &WordsLayout,
+    l: usize,
+    kind: &LayerKind,
+    stream: Option<usize>,
+    source: Option<&SourcePlan>,
+) -> Result<Option<CandidateRole>, GpuError> {
+    let Some(role) = hp.candidate_role(l) else {
+        return Ok(None);
+    };
+    let refuse = |detail: String| GpuError::Shape {
+        what: WHAT,
+        detail: format!("layer {l}: the candidate mask's {role:?}: {detail}"),
+    };
+    let (st, ks) = match (kind.indexer, stream, kind.stream) {
+        (true, Some(st), Some(ks)) => (st, ks),
+        _ => {
+            return Err(refuse(
+                "it runs no indexer over a compressed stream".to_string(),
+            ));
+        }
+    };
+    match role {
+        CandidateRole::Source => {
+            if words.streams[st].geom.ratio != 1 {
+                return Err(refuse(format!(
+                    "its stream compresses at ratio {}, and a block's rows are one position each",
+                    words.streams[st].geom.ratio
+                )));
+            }
+            if ks.kv_source != l || source.is_none_or(|s| s.keys.is_none()) {
+                return Err(refuse(
+                    "it owns neither its stream's compressor nor its index keys".to_string(),
+                ));
+            }
+        }
+        CandidateRole::Consumer => {
+            let src = hp.candidates.map_or(l, |c| c.source_layer);
+            if ks.kv_source != src || ks.index_key_source != src {
+                return Err(refuse(format!(
+                    "it reads the rows of layer {} and the keys of layer {}, not those of the \
+                     source layer {src}, whose kept blocks it ranks among",
+                    ks.kv_source, ks.index_key_source
+                )));
+            }
+        }
+    }
+    Ok(Some(role))
+}
+
+/// The candidate mask over the card's layers: its shape and the plan stream
+/// of its source layer, `None` where the load carries no mask or no layer of
+/// the card reads a kept list. Every consumer — an indexer layer above the
+/// source — must attend the source's own stream: the kept list a consumer
+/// reads is the one its source wrote this pass, and a load that cannot
+/// promise that is refused by name.
+fn cand_plan(
+    hp: &Hparams,
+    plans: &[LayerPlan],
+    first: usize,
+) -> Result<Option<(CandShape, usize)>, GpuError> {
+    let Some(mask) = hp.candidates else {
+        return Ok(None);
+    };
+    if !plans.iter().any(|p| p.cand.is_some()) {
+        return Ok(None);
+    }
+    let shape = CandShape::new(mask.topk_blocks, mask.block_size).map_err(|e| GpuError::Shape {
+        what: WHAT,
+        detail: format!(
+            "the file's candidate mask (layer {}): {e}",
+            mask.source_layer
+        ),
+    })?;
+    let (src_l, src_stream) = plans
+        .iter()
+        .enumerate()
+        .find(|(_, p)| p.cand == Some(CandidateRole::Source))
+        .and_then(|(i, p)| Some((first + i, p.stream?)))
+        .ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the card's layers {first}..{} hold an indexer layer the candidate mask of layer \
+                 {} serves, and not that layer, whose kept list they read",
+                first + plans.len(),
+                mask.source_layer
+            ),
+        })?;
+    for (i, p) in plans.iter().enumerate() {
+        if p.cand == Some(CandidateRole::Consumer) && p.stream != Some(src_stream) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {}: its candidate source layer {src_l} attends another stream, and the \
+                     kept list it reads is its own stream's source's",
+                    first + i
+                ),
+            });
+        }
+    }
+    Ok(Some((shape, src_stream)))
 }
 
 /// The derived names [`join_projections`] files layer `l`'s row joins

@@ -834,28 +834,27 @@ impl IndexerKernels {
         self.scale
     }
 
-    /// Enqueue one indexer step: the score pass, then the top-k pass. Two
-    /// launches whose grids come from the token count and the device, not
-    /// from the counts, so a captured graph replays them at any `n_vis` and
-    /// `top_k`. Asynchronous, allocation-free, capturable.
-    pub fn enqueue(&self, stream: &CudaStream, a: IndexerArgs<'_>) -> Result<(), GpuError> {
-        let what = "ds41 IndexerKernels::enqueue";
-        let IndexerArgs {
-            q,
-            w,
-            ints,
-            n_vis_at,
-            top_k_at,
-            tables,
-            rope_at,
-            rope_stride,
-            keys,
-            tokens,
-            scratch,
-            list,
-            stride,
-        } = a;
+    /// Enqueue one indexer step: the score pass, then the top-k pass over the
+    /// same counts. Two launches whose grids come from the token count and
+    /// the device, not from the counts, so a captured graph replays them at
+    /// any `n_vis` and `top_k`. Asynchronous, allocation-free, capturable.
+    pub fn enqueue(&self, stream: &CudaStream, mut a: IndexerArgs<'_>) -> Result<(), GpuError> {
+        self.enqueue_score(stream, &mut a)?;
+        let (ints, n_vis_at, top_k_at) = (a.ints, a.n_vis_at, a.top_k_at);
+        self.enqueue_topk(stream, &mut a, ints, n_vis_at, top_k_at)
+    }
+
+    /// The score pass of [`IndexerKernels::enqueue`]: every visible row's
+    /// score into `a.scratch`, and the histogram the top-k pass reads.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_score(
+        &self,
+        stream: &CudaStream,
+        a: &mut IndexerArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41 IndexerKernels::enqueue_score";
         let shape = |detail: String| GpuError::Shape { what, detail };
+        let (tokens, keys) = (a.tokens, a.keys);
         let rows = keys.rows();
         if tokens == 0 || keys.cols() != HEAD_DIM || rows == 0 {
             return Err(shape(format!(
@@ -863,20 +862,14 @@ impl IndexerKernels {
                 keys.cols()
             )));
         }
-        if scratch.tokens != tokens || scratch.rows != rows {
-            return Err(shape(format!(
-                "the scratch serves {} tokens over {} rows, the launch {tokens} over {rows}",
-                scratch.tokens, scratch.rows
-            )));
-        }
-        let last_table = rope_at + (tokens - 1) * rope_stride + self.n_dims;
+        check_scratch(what, a.scratch, tokens, rows)?;
+        let last_table = a.rope_at + (tokens - 1) * a.rope_stride + self.n_dims;
         for (name, have, want) in [
-            ("q", q.len(), tokens * HEADS * HEAD_DIM),
-            ("w", w.len(), tokens * HEADS),
-            ("ints (n_vis)", ints.len(), n_vis_at + tokens),
-            ("ints (top_k)", ints.len(), top_k_at + 1),
-            ("tables", tables.len(), last_table),
-            ("list", list.len(), tokens * stride),
+            ("q", a.q.len(), tokens * HEADS * HEAD_DIM),
+            ("w", a.w.len(), tokens * HEADS),
+            ("ints (n_vis)", a.ints.len(), a.n_vis_at + tokens),
+            ("ints (top_k)", a.ints.len(), a.top_k_at + 1),
+            ("tables", a.tables.len(), last_table),
         ] {
             if have < want {
                 return Err(shape(format!("{name} holds {have}, want >= {want}")));
@@ -886,54 +879,106 @@ impl IndexerKernels {
         let prep =
             self.module
                 .prepare_ds41_indexer_score(LaunchConfig1D::new(grid, SCORE_THREADS, 0))?;
-        let tokens_u = launch_u32(what, "tokens", tokens)?;
-        let rows_u = launch_u32(what, "rows", rows)?;
-        let stride_u = launch_u32(what, "stride", stride)?;
-        let n_vis_u = launch_u32(what, "n_vis_at", n_vis_at)?;
-        let top_k_u = launch_u32(what, "top_k_at", top_k_at)?;
+        let scratch = &mut *a.scratch;
         self.module.ds41_indexer_score(
             stream,
             &prep,
-            q,
-            w,
-            ints,
-            tables,
+            a.q,
+            a.w,
+            a.ints,
+            a.tables,
             keys.buf(),
-            tokens_u,
+            launch_u32(what, "tokens", tokens)?,
             launch_u32(what, "blocks", self.blocks)?,
-            n_vis_u,
-            top_k_u,
-            launch_u32(what, "rope_at", rope_at)?,
-            launch_u32(what, "rope_stride", rope_stride)?,
+            launch_u32(what, "n_vis_at", a.n_vis_at)?,
+            launch_u32(what, "top_k_at", a.top_k_at)?,
+            launch_u32(what, "rope_at", a.rope_at)?,
+            launch_u32(what, "rope_stride", a.rope_stride)?,
             launch_u32(what, "n_dims", self.n_dims)?,
-            rows_u,
-            stride_u,
+            launch_u32(what, "rows", rows)?,
+            launch_u32(what, "stride", a.stride)?,
             self.scale,
             &mut scratch.q,
             &mut scratch.w,
             &mut scratch.scores,
             &mut scratch.hist,
         )?;
+        Ok(())
+    }
+
+    /// The top-k pass of [`IndexerKernels::enqueue`] over the scores and
+    /// histogram in `a.scratch`, into `a.list`, reading token `t`'s visible
+    /// count at `ints[n_vis_at + t]` and `top_k` at `ints[top_k_at]`: the
+    /// args' own words, or the counts view a consumer's `cand_compact`
+    /// (`bloomery_gpu::cand`) wrote. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_topk(
+        &self,
+        stream: &CudaStream,
+        a: &mut IndexerArgs<'_>,
+        ints: &DeviceBuffer<u32>,
+        n_vis_at: usize,
+        top_k_at: usize,
+    ) -> Result<(), GpuError> {
+        let what = "ds41 IndexerKernels::enqueue_topk";
+        let shape = |detail: String| GpuError::Shape { what, detail };
+        let (tokens, rows) = (a.tokens, a.keys.rows());
+        if tokens == 0 || rows == 0 {
+            return Err(shape(format!(
+                "a top-k of {tokens} tokens over {rows} rows: at least one of each"
+            )));
+        }
+        check_scratch(what, a.scratch, tokens, rows)?;
+        for (name, have, want) in [
+            ("ints (n_vis)", ints.len(), n_vis_at + tokens),
+            ("ints (top_k)", ints.len(), top_k_at + 1),
+            ("list", a.list.len(), tokens * a.stride),
+        ] {
+            if have < want {
+                return Err(shape(format!("{name} holds {have}, want >= {want}")));
+            }
+        }
+        let tokens_u = launch_u32(what, "tokens", tokens)?;
         let prep = self.module.prepare_ds41_indexer_topk(LaunchConfig1D::new(
             tokens_u,
             TOPK_THREADS,
             0,
         ))?;
+        let scratch = &mut *a.scratch;
         self.module.ds41_indexer_topk(
             stream,
             &prep,
             ints,
             &scratch.scores,
             tokens_u,
-            n_vis_u,
-            top_k_u,
-            rows_u,
-            stride_u,
+            launch_u32(what, "n_vis_at", n_vis_at)?,
+            launch_u32(what, "top_k_at", top_k_at)?,
+            launch_u32(what, "rows", rows)?,
+            launch_u32(what, "stride", a.stride)?,
             &mut scratch.hist,
-            list,
+            &mut *a.list,
         )?;
         Ok(())
     }
+}
+
+/// `scratch` against a launch of `tokens` tokens over `rows` key rows.
+fn check_scratch(
+    what: &'static str,
+    scratch: &IndexerScratch,
+    tokens: usize,
+    rows: usize,
+) -> Result<(), GpuError> {
+    if scratch.tokens != tokens || scratch.rows != rows {
+        return Err(GpuError::Shape {
+            what,
+            detail: format!(
+                "the scratch serves {} tokens over {} rows, the launch {tokens} over {rows}",
+                scratch.tokens, scratch.rows
+            ),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

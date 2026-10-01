@@ -34,6 +34,17 @@
 //!   (`BLOOMERY_HOST_LOCK=1`, which the recipe sets) a step touches no host
 //!   page the load did not map and keep. Populated but not locked, another
 //!   process's reads reclaim pages between the load and the step.
+//! - `--candidates` (G2, weekly; by name only, after `--faults`): the first
+//!   [`CAND_PROMPT`] ids of `$BLOOMERY_DATA/engram/corpus-prose.ids` through
+//!   the prompt batch, then [`CAND_STEPS`] eager steps, each observed with
+//!   the attention piece's candidate tap armed, then taken back and stepped
+//!   through the engine's graph, whose token is the next. At every step, past the
+//!   16,384 positions where the candidate mask first selects: the source
+//!   layer's kept blocks are the reference's selection over its own scores,
+//!   and each consumer's compaction and list hold to them
+//!   (`shared/ds41_cand.rs`, G2s's rule on the live model); red too when no
+//!   step's list of any consumer was changed by the mask, and on a
+//!   non-finite seam.
 //!
 //! Red on any of: a position whose streams hold a NaN or an infinity at any
 //! seam (the engine's step refuses it too, with the fault word's layer and
@@ -64,6 +75,10 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_finite.rs"]
 mod finite;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_cand.rs"]
+mod cand;
 
 /// The longest stretch of `tokens` that repeats with one of `periods`
 /// (`tokens[i] == tokens[i - p]` all through it), as `(length, start,
@@ -133,6 +148,7 @@ fn collapse_self_check(periods: &[usize], collapse: usize) -> bool {
 mod gate {
     use bloomery_gpu::head::Head;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu_deepseek41::body::Seam;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
     use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
     use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
@@ -140,11 +156,11 @@ mod gate {
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HostCfg, R8,
     };
     use gguf::Split;
-    use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::deepseek41::hparams::{CandidateRole, Hparams};
     use model::placement::workstation;
     use refset::arch::deepseek41::{GREEDY, GREEDY_P7};
 
-    use crate::finite;
+    use crate::{cand, finite};
 
     /// The serving context, the gate placement's.
     const CTX_MAX: u64 = workstation::CTX_MAX;
@@ -165,6 +181,11 @@ mod gate {
     const COLLAPSE_PERIODS: [usize; 2] = [1, 2];
     /// Generated tokens of the faults arm.
     const FAULT_STEPS: usize = 32;
+    /// The candidates arm's prompt, fed through the prompt batch: past the
+    /// 16,384 positions the mask keeps whole, by eight blocks.
+    const CAND_PROMPT: usize = 16_448;
+    /// The candidates arm's eager steps after its prompt.
+    const CAND_STEPS: usize = 32;
     /// The most minor faults a step from the second on may take outside the
     /// engram helper.
     /// PIN(2026-09-25): measured 2 at generated step 26 and 0 at every other
@@ -204,15 +225,18 @@ mod gate {
         free: bool,
         trigger: bool,
         faults: bool,
+        candidates: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_deepseek41_long [--free] [--trigger] [--faults] [-n N]";
+        const USAGE: &str =
+            "usage: gate_deepseek41_long [--free] [--trigger] [--faults] [--candidates] [-n N]";
         let mut a = Args {
             n_gen: FREE_N,
             free: false,
             trigger: false,
             faults: false,
+            candidates: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -220,6 +244,7 @@ mod gate {
                 "--free" => a.free = true,
                 "--trigger" => a.trigger = true,
                 "--faults" => a.faults = true,
+                "--candidates" => a.candidates = true,
                 "-n" => {
                     a.n_gen = it
                         .next()
@@ -229,7 +254,7 @@ mod gate {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.free || a.trigger || a.faults) {
+        if !(a.free || a.trigger || a.faults || a.candidates) {
             (a.free, a.trigger) = (true, true);
         }
         if a.n_gen < 2 {
@@ -266,6 +291,9 @@ mod gate {
             &cfg,
         )?;
         m.set_mode(StepMode::Graph);
+        if args.candidates {
+            body::prepare_prefill(&mut m)?;
+        }
         let mut head = {
             let (gpu, w, body) = m.body_parts("gate_deepseek41_long")?;
             let map = body.slot_map();
@@ -293,6 +321,9 @@ mod gate {
         let mut pass = true;
         if args.faults {
             pass &= faults_arm(&mut m, &prompt, cfg.body.host)?;
+        }
+        if args.candidates {
+            pass &= candidates_arm(&mut m, &mut head, &hp)?;
         }
         if args.free {
             // Prompt 7: ik's greedy ids for it run tens of ids before its
@@ -467,6 +498,157 @@ mod gate {
         );
         println!("faults: tokens {tokens:?}");
         Ok(ok)
+    }
+
+    /// The first `n` ids of `$BLOOMERY_DATA/engram/corpus-prose.ids`.
+    fn prose(n: usize) -> Result<Vec<u32>, GateError> {
+        let path = data_dir().join("engram").join("corpus-prose.ids");
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let ids = text
+            .split_whitespace()
+            .take(n)
+            .map(str::parse::<u32>)
+            .collect::<Result<Vec<_>, _>>()?;
+        if ids.len() < n {
+            return Err(
+                format!("{}: {} ids, the gate reads {n}", path.display(), ids.len()).into(),
+            );
+        }
+        Ok(ids)
+    }
+
+    /// The candidates arm (module doc): the prompt through the batch, then
+    /// eager steps whose seams the candidate rule checks.
+    fn candidates_arm(
+        m: &mut Deepseek41Model,
+        head: &mut Head,
+        hp: &Hparams,
+    ) -> Result<bool, GateError> {
+        let mask = hp
+            .candidates
+            .ok_or("candidates: the file carries no candidate mask")?;
+        let (blocks, block) = (mask.topk_blocks, mask.block_size);
+        let ids = prose(CAND_PROMPT)?;
+        m.reset()?;
+        let mut next = body::prefill(m, &ids)?;
+        let top_k = m.body("candidates")?.indexer_top_k();
+        {
+            let (gpu, _, b) = m.body_parts("candidates")?;
+            b.arm_cand_tap(gpu, true)?;
+        }
+        let (mut ok, mut changed, mut rows) = (true, 0usize, 0usize);
+        let mut nonfinite = 0;
+        for _ in 0..CAND_STEPS {
+            let pos = m.pos();
+            let n = pos as usize + 1;
+            let mut source: Option<(Vec<f32>, Vec<u32>)> = None;
+            let mut found: Vec<(usize, cand::Row)> = Vec::new();
+            let mut hook = |gpu: &bloomery_gpu::Gpu, seam: &Seam<'_>, _: &[f32]| {
+                let Seam::Attn {
+                    layer, taps, list, ..
+                } = seam
+                else {
+                    return Ok(());
+                };
+                let Some(role) = hp.candidate_role(*layer) else {
+                    return Ok(());
+                };
+                let missing = |what: &'static str| bloomery_gpu::GpuError::State {
+                    what: "gate_deepseek41_long --candidates",
+                    missing: what,
+                };
+                let sel = taps
+                    .select
+                    .as_ref()
+                    .ok_or(missing("the layer's selection taps"))?;
+                let stream = gpu.stream();
+                match role {
+                    CandidateRole::Source => {
+                        let scores = sel.scores.to_host_vec(stream)?;
+                        let kept = sel
+                            .kept
+                            .ok_or(missing("the source's kept blocks"))?
+                            .to_host_vec(stream)?;
+                        source = Some((scores[..n].to_vec(), kept));
+                    }
+                    CandidateRole::Consumer => {
+                        let (scores, kept) = source
+                            .as_ref()
+                            .ok_or(missing("the source's seam before it"))?;
+                        let unmasked = sel
+                            .unmasked
+                            .ok_or(missing("the consumer's unmasked scores (the armed tap)"))?
+                            .to_host_vec(stream)?;
+                        let compacted = sel.scores.to_host_vec(stream)?;
+                        let list = list
+                            .ok_or(missing("the consumer's list"))?
+                            .to_host_vec(stream)?;
+                        found.push((
+                            *layer,
+                            cand::check(&cand::Card {
+                                n,
+                                top_k,
+                                blocks,
+                                block,
+                                source: scores,
+                                kept,
+                                unmasked: &unmasked,
+                                compacted: &compacted,
+                                list: &list,
+                            }),
+                        ));
+                    }
+                }
+                Ok(())
+            };
+            let o = finite::observed_step(m, head, next, pos, &mut hook)?;
+            if o.first_nonfinite().is_some() {
+                nonfinite += 1;
+                println!("candidates position {pos}: {}", o.describe());
+            }
+            if found.is_empty() {
+                println!("candidates position {pos}: no consumer seam was checked: FAIL");
+                ok = false;
+            }
+            for (layer, row) in &found {
+                let pass = row.pass() && row.selects;
+                ok &= pass;
+                rows += 1;
+                changed += row.changed;
+                println!(
+                    "candidates position {pos} layer {layer}: {} — {}",
+                    row.line(),
+                    verdict(pass)
+                );
+            }
+            // The probe stepped the body alone: the position is taken back
+            // and the token stepped through the engine, as `checked` does.
+            m.rollback(pos)?;
+            let engine = m.step(&[next])?;
+            if engine != o.token() {
+                println!(
+                    "candidates position {pos}: eager argmax {} is not the engine's token \
+                     {engine}: FAIL",
+                    o.token()
+                );
+                ok = false;
+            }
+            next = engine;
+        }
+        {
+            let (gpu, _, b) = m.body_parts("candidates")?;
+            b.arm_cand_tap(gpu, false)?;
+        }
+        let witness = changed > 0;
+        println!(
+            "candidates: {CAND_PROMPT} prompt ids, {CAND_STEPS} eager steps, {rows} consumer rows \
+             checked, {changed} list entries the mask changed (witness) {}, {nonfinite} \
+             positions with a non-finite seam: {}",
+            verdict(witness),
+            verdict(ok && witness && nonfinite == 0)
+        );
+        Ok(ok && witness && nonfinite == 0)
     }
 
     /// Feed `fed` from a reset, then greedy tokens, every position through

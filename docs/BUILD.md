@@ -153,7 +153,7 @@ The commands above use the default `--place a`, an A6000. On a single RTX 3090, 
 | `--place a` | plan (a), the default: all layers and the head on a card named `A6000`, each routed layer's expert prefix the budget allows, the rest on the host |
 | `--place gate` | the same shape on a card named `3090` |
 | `--place bp` | plan (b′): plan (a) on the A6000, and the 3090 as an expert tier under the host tier |
-| `--ctx C` | context length (default 32,768); a call past position 16,384 is refused by name — from there the V4.1 reference picks each index top-k inside a two-level candidate mask, which bloomery does not build |
+| `--ctx C` | context length (default 32,768); a call past it is refused by name. From position 16,384 on, each index top-k of layers 24, 28, 32 and 36 is taken inside the two-level candidate mask layer 20 ranks, as in the V4.1 reference |
 | `--depth D` | feed a fixed synthetic id sequence to depth D before generating; used by the timing tables |
 | `--time` | per-step timing. The binary does not require the lease; the maintainers' numbers come only from runs under it |
 

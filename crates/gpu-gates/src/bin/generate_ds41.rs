@@ -68,7 +68,9 @@
 //!
 //! Any depth up to `--ctx` runs: every indexer layer selects its stream's
 //! list at every position (the identity while the visible rows fit in
-//! `top_k`, the indexer's top-k after). The run selects with the file's
+//! `top_k`, the indexer's top-k after; past 16,384 positions layers 24, 28,
+//! 32 and 36 take it inside the candidate mask layer 20 ranks). The run
+//! selects with the file's
 //! `top_k`, the model's own; the load line prints it, and a body that
 //! loaded with another is refused before the first step.
 //!

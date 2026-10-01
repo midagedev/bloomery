@@ -1176,6 +1176,21 @@ gate-gpu-ds41-callstream *ARGS:
 gate-gpu-ds41-long *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} bash tools/gpu-gate.sh gate_deepseek41_long --faults --free --trigger {{ARGS}}'
 
+# The candidate mask past the 16,384 positions where it first selects, on the live model at the serving context (gate
+# placement, 3090), two loads one after the other. G2, gate_deepseek41_long --candidates: 16,448 prose ids through the
+# prompt batch, then 32 eager steps with the attention piece's candidate tap armed; at every step layer 20's kept blocks
+# are the reference's selection over its own scores and each consumer's compaction and list hold to them, and some list
+# the mask changed. G2b, gate_deepseek41_prefill --cand: positions 16,300-16,500 as one batch call and as 200 steps
+# from the same keep point, every ring, compressor state, compressed row, index key and the last logits bit for bit.
+# The landing batch runs no model-load prefill past 16,384: the wiring at depth lands on gate-gpu-ds41-chain-attn's
+# synthetic G2s, and below the bound every candidate launch is a no-op, so the batch-set indexing past it is proved
+# here alone. Weekly: `just weekly` runs it, and `just affected` names it when a file its triggers in
+# tools/gate-paths.tsv match changes. Alone in a batch.
+[group('solo')]
+[group('v41-load')]
+weekly-gpu-ds41-cand:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long --bin gate_deepseek41_prefill && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} bash tools/gpu-gate.sh gate_deepseek41_long --candidates && __s=$(. tools/ref/ref-paths.sh && printf %s "$DSPARK_MODEL") && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_prefill --cand'
+
 # ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — long 게이트
 # --free의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
 ik-greedy-ds41 PROMPT='0':

@@ -87,9 +87,7 @@ use bloomery_levers::{HostCfg, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::deepseek41::hparams::{
-    CANDIDATE_BLOCK_SIZE, CANDIDATE_SOURCE_LAYER, CANDIDATE_TOPK_BLOCKS, Hparams,
-};
+use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
@@ -770,10 +768,6 @@ pub struct Body {
     params_ns: u64,
     /// The tokens decoded so far, one per position: `ctx_max` reserved.
     history: Vec<u32>,
-    /// The positions this body computes the reference at
-    /// ([`Hparams::candidate_free_positions`]); [`Body::check_defined`]
-    /// refuses a call past them.
-    defined: usize,
     /// Which position's row each ring slot and each compressor state slot
     /// holds, as the steps refreshed since the last known state left them.
     holds: Holds,
@@ -1083,27 +1077,6 @@ impl Body {
         Ok(())
     }
 
-    /// Err when a call of `what` would leave positions up to `end`
-    /// (exclusive) past the ones this body computes the reference at: from
-    /// there each layer after the candidate source layer takes its index
-    /// top-k inside the reference's candidate mask, which this engine does
-    /// not build, so its steps would compute another model.
-    fn check_defined(&self, what: &'static str, end: usize) -> Result<(), GpuError> {
-        if end <= self.defined {
-            return Ok(());
-        }
-        Err(GpuError::Shape {
-            what,
-            detail: format!(
-                "positions up to {end}: past {} positions V4.1 takes each index top-k inside \
-                 its two-level candidate mask ({CANDIDATE_TOPK_BLOCKS} blocks of \
-                 {CANDIDATE_BLOCK_SIZE} rows ranked by layer {CANDIDATE_SOURCE_LAYER}), which \
-                 this engine does not build",
-                self.defined
-            ),
-        })
-    }
-
     /// The file the body keeps for the tensors the plan leaves on the host.
     #[must_use]
     pub fn file(&self) -> &Split {
@@ -1116,7 +1089,6 @@ impl Body {
     /// ring shadow holds none of those positions, so no cut reaches a ring
     /// row below them.
     pub fn set_history(&mut self, history: &[u32]) -> Result<(), GpuError> {
-        self.check_defined("deepseek41 Body::set_history", history.len())?;
         if history.len() >= self.positions() {
             return Err(GpuError::Shape {
                 what: "deepseek41 Body::set_history",
@@ -1173,6 +1145,15 @@ impl Body {
             Some(b) => b.set_top_k(gpu, top_k),
             None => Ok(()),
         }
+    }
+
+    /// Arm (`on`) or drop the attention piece's candidate tap
+    /// ([`AttnChain::arm_cand_tap`]), for a gate that holds a consumer's list
+    /// to its unmasked scores: an observed eager step then shows them at the
+    /// consumer's attention seam. Capturing a step while it is armed is
+    /// refused by name. Allocates: load-time only.
+    pub fn arm_cand_tap(&mut self, gpu: &Gpu, on: bool) -> Result<(), GpuError> {
+        self.attn.arm_cand_tap(gpu, on)
     }
 
     /// Layer `layer`'s ring shadow as the host holds it, once the engine
@@ -1351,7 +1332,6 @@ impl Body {
                 missing: "a second row of buffers",
             });
         }
-        self.check_defined("deepseek41 Body::decode_pair", pos as usize + PAIR_ROWS)?;
         for (row, (token, pos)) in tokens.into_iter().zip(pos..).enumerate() {
             let input = self.decode_input(token, pos)?;
             self.refresh_row(stream, &input, row)?;
@@ -2361,7 +2341,7 @@ impl Body {
         };
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
         let holds = Holds::new(ring_rows, planner.stream_ratios());
-        let ced = ced::Ced::new(&hp.layers, ring_rows, cfg.ced);
+        let ced = ced::Ced::new(&CedLayer::table(hp), ring_rows, cfg.ced);
 
         let mut body = Body {
             layers,
@@ -2384,7 +2364,6 @@ impl Body {
             rows_failed: false,
             params_ns: 0,
             history: Vec::with_capacity(ctx_max),
-            defined: hp.candidate_free_positions(),
             holds,
             shadow_from: 0,
             holes: Vec::new(),
@@ -2480,7 +2459,6 @@ impl ChainBody for Body {
                 ),
             });
         }
-        self.check_defined(WHAT, pos as usize + 1)?;
         self.planner
             .plan_into(&[token], pos, &self.history, &mut self.plan)
             .map_err(|e| GpuError::plan(WHAT, e))?;

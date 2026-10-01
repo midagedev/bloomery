@@ -31,9 +31,8 @@
 //! batch, and a lost tier card is an engine error like any other: the
 //! request's 500 and `/health`'s 503 carry its message, which names the card.
 //!
-//! The server serves the lesser of `--ctx` and the positions V4.1 is computed
-//! at (`Hparams::candidate_free_positions`): `/props`' `n_ctx` is that number,
-//! a prompt that long is a 400 before it reaches the engine, and generation
+//! The server serves `--ctx` positions: `/props`' `n_ctx` is that number, a
+//! prompt that long is a 400 before it reaches the engine, and generation
 //! stops there with `truncated`.
 //!
 //! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
@@ -286,7 +285,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let engine = SeatEngine::spawn(
         move || V41::open(open),
-        inputs.hp.candidate_free_positions(),
+        a.ctx,
         vocab,
         card,
         props,

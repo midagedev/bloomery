@@ -202,7 +202,7 @@ mod gate {
     use gguf::{GgmlType, Split};
     use model::Tensor2;
     use model::arch::Arch;
-    use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::deepseek41::hparams::{CandidateRole, Hparams};
     use model::arch::deepseek41::names;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
@@ -1353,7 +1353,9 @@ mod gate {
     /// or its row at ratio 1, and three for index keys; on an indexer layer
     /// its two projections and the score and top-k passes, and without a
     /// compressor the q8_1 of the normed input its weights read unless q_a
-    /// or kv, being K-quants, already had the norm leave it; one more for the
+    /// or kv, being K-quants, already had the norm leave it; two more on a
+    /// layer the candidate mask gives a role — the source's block keys and
+    /// selection, a consumer's compaction and remap; one more for the
     /// q8_1 of the heads when wo_a is a K-quant and one for wo_a's when wo_b
     /// is a q3_K/q4_K) and the MoE sub-layer's (its own count: ten with card
     /// experts, seven without, one more for a q8_1 shared down projection);
@@ -1407,6 +1409,9 @@ mod gate {
                     (true, None) if normed_q8_1 => 4,
                     (true, None) => 5,
                 }
+                // PIN(2026-10-02): the candidate mask's launches (candwire): two on its
+                // source and two on each consumer, 2 + 4 × 2 = 10 a step on the V4.1 file.
+                + 2 * usize::from(hp.candidate_role(l).is_some())
                 + usize::from(kquant(ty(names::attn_output_a(l))?))
                 + usize::from(q8_1(ty(names::attn_output_b(l))?));
             let ffn = body
@@ -1415,13 +1420,18 @@ mod gate {
             attn_total += attn;
             ffn_total += ffn;
             let name = format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}",
                 match (k.stream, own) {
                     (None, _) => "window".to_string(),
                     (Some(s), Some(_)) => format!("source-r{}", s.ratio),
                     (Some(s), None) => format!("reader-r{}", s.ratio),
                 },
                 if k.indexer { "+indexer" } else { "" },
+                match hp.candidate_role(l) {
+                    Some(CandidateRole::Source) => "+cand-source",
+                    Some(CandidateRole::Consumer) => "+cand-consumer",
+                    None => "",
+                },
                 if k.engram.is_some() { "+engram" } else { "" },
                 if ffn > 7 { "+card" } else { "+host-only" }
             );
