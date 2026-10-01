@@ -1,0 +1,65 @@
+# Round q38draft (idea A, docs/plan-triage.md idea ledger, TensorFold): Qwen3.8's MTP draft with a reduced head
+# (BLOOMERY_MTP_HEAD_ROWS) against the full head, same binary, the shipped default otherwise (residency, the MTP
+# draft and host streaming unset: mid-p121-s1, mtp, on).
+# The lists are tools/ref/draft-vocab.py's, from text disjoint from the measured prompt (corpus-prose.ids is not a
+# source): the Qwen3.8 vocabulary's ids of tokenizer-qwen3moe/code.txt (810,164 ids) and threads.txt (5,049,361 ids,
+# ik's github-data threads; prose-all is not a source, its head is the prose set), under ik-idxkey's llama-tokenize
+# (md5 8dd4fe8a...; it gives corpus-prose.ids byte for byte from prose.txt), with --fill-ids: the two name only
+# 23,899 distinct ids, so the rest of each list is the lowest ids not named (BPE merge order, a prior from no input of
+# ours). $BLOOMERY_DATA/qwen4exp/heldout/mtp-head-rows-65536.txt (41,635 filled) and -98304.txt (74,403 filled).
+# Held-out coverage of corpus-prose.ids: 0.99268 / 0.99959. Korean (this repo's docs, 1,119,305 ids): 0.761 / 0.800.
+#
+# [derived] Term: the head bytes a window. The full head is the target's Q8_0 `output`, 248,320 rows x 2,720 B =
+# 675.43 MB a walk, three walks a window (the refresh and two own walks), 2.026 GB. A list reads N x 2,720 B a walk:
+# 178.26 MB (65,536) and 267.39 MB (98,304), saving 1.492 / 1.224 GB a window, 2.19-2.43 / 1.80-1.99 ms at
+# 615-680 GB/s. The chain runs on the card while the host waits, so the saving is on the window's path. The list is a
+# gathered copy (the full head borrows the target's buffer): the plan's card experts fall 11,680 -> 11,616 (65,536)
+# and 11,594 (98,304) (functional loads below), against q38hol's 1,462 fewer costing 0.9..2.0 ms a window:
+# +0.04..+0.12 ms. Windows 38.35 ms (P 512) and 37.11 ms (P 4096), rig-log 10-01#q38hol-ab. A drafted pass's time:
+# 65,536 -5.4..-6.3 % (P 512), -5.6..-6.4 % (P 4096); 98,304 -4.4..-5.1 %, -4.5..-5.3 %. Band -7..-4.
+#
+# Why the term is the pass's time and not tok/s: the list moves the emitted ids. Functional runs (this binary,
+# --place a, A6000, ctx 4352, the A/B's two prose arms at -n 96 in one load, untimed, BLOOMERY_MTP_WINDOWS=1): three
+# full-head processes print one tokens line per P, bit for bit; both lists print one other line, which parts from the
+# full head's at generated token 72 (P 512) and 8 (P 4096), q38hol-ab's two diverging points. The list's copy moves
+# the plan's card experts, so experts move between card and host and the target's bits move at near ties. Over 96
+# tokens E(4) = 3.692 / 3.097 (full head), 3.593 / 3.065 (65,536), 3.593 / 2.969 (98,304), on partly other text.
+# The tok/s effect is then the pass's -dW and that E move: 65,536 +2.9..+3.8 % (P 512), +4.8..+5.7 % (P 4096);
+# 98,304 +1.8..+2.6 %, +0.4..+1.2 % [derived] — 98,304 at P 4096 sits inside the ruler; read tok/s beside the term,
+# never as it.
+# The term is read from each arm's `time pass` rows of kind=mtp, warm passes left out: their mean ms (the runner's
+# ratio table is tok/s; mean_ms x E(4) of SMOKE and mtp summary gives the same mean).
+# Runner (lead, from the q38draft tree, the full output to a file first):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38head-ab.card BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=6
+# just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_MTP_HEAD_ROWS=/root/bloomery-data/qwen4exp/heldout/mtp-head-rows-65536.txt
+#   prose:512@BLOOMERY_MTP_HEAD_ROWS=/root/bloomery-data/qwen4exp/heldout/mtp-head-rows-98304.txt prose:4096
+#   prose:4096@BLOOMERY_MTP_HEAD_ROWS=/root/bloomery-data/qwen4exp/heldout/mtp-head-rows-65536.txt
+#   prose:4096@BLOOMERY_MTP_HEAD_ROWS=/root/bloomery-data/qwen4exp/heldout/mtp-head-rows-98304.txt
+# (`depth-qwen3moe.sh --parse-arms` on these arms: three load groups, each its two P in one process, rotated.)
+# Rounds: sd 1.0 %, from q38seed-mtp's same-binary MTP pairs: 6 rounds gave +-1.3 % (P 512) and +-0.9 % (P 4096),
+# sd = 1.3 / (t(0.975, 10) x sqrt(2/6)). 6 rounds give h 1.3 %, under the band's edge 4.
+# Wall [derived]: 3 load groups x 6 rounds = 18 Qwen3.8 loads with the draft (31-49 s each in the functional runs),
+# the two prompts (0.5 + 3.4 s) and 2 x 96 tokens a load: 15-22 min.
+kind: ab
+question: does a reduced MTP head (BLOOMERY_MTP_HEAD_ROWS, a held-out list) shorten Qwen3.8's drafted pass by the
+  head bytes it stops reading?
+term: ms per drafted pass (time pass rows, kind=mtp, warm left out) @ n=96, prose:512 and prose:4096, ctx 4352,
+  A6000, plan a, residency, draft and host streaming unset (mtp), BLOOMERY_MTP_HEAD_ROWS=heldout/mtp-head-rows-65536.txt
+  and -98304.txt against unset, same binary, paired by round
+unit: %
+predict: -7..-4
+rounds: 6
+sd: 1.0 % q38seed-mtp's same-binary MTP pairs (rig-log 09-30#q38seed-ab, 6 rounds, +-1.3 % / +-0.9 %)
+condition: one binary, every arm of a P in one lease, a fresh process per load group, the host set and the PLE
+  table warm, no [cpu-busy] or [other-busy] row; each arm's load line names draft=mtp and head=full or head=rows=N,
+  its plan line card_experts 11680 (full), 11616 (65,536), 11594 (98,304); each arm's tokens line the functional
+  run's for its head (the two lists one line, the full head another, parting at token 72 / 8); each arm's mtp
+  summary E(4) and tok/s read beside its pass time
+decide-in: the head is on the pass's path at its bytes: build a list with Korean text among its sources (these
+  cover 0.76-0.80 of Korean ids), check its coverage of a chat set, then propose it as the Qwen3.8 MTP default
+  with this row and the tok/s and E(4) beside it
+decide-below: the pass shortened less than the bytes: one nsys window of a drafted pass, the head kernel's time
+  at each N against 615-680 GB/s, before any change
+decide-above: the pass shortened by more than the head's bytes: the card experts or the different text moved
+  the host union too; read each arm's host slots from one BLOOMERY_STEP_STATS functional run per head before
+  proposing a default
