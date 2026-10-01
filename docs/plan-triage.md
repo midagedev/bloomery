@@ -176,6 +176,20 @@ breaks even against the plain path at about 10 output tokens at P 512 and about 
 - **callstream teardown segfault (M)**: after a device fault with residency on, the process ends with rc 139
   while the model is dropped. The gate prints the clause error before its teardown, so no verdict is lost.
   The crash still needs a fix. (`gmerge`)
+- **stagewin teardown segfault (M, fix on branch `swteardown`, landing)**: on T3 (`9aaa9446`) three two-card V4.1
+  runs with the DSpark draft ended rc 139 after their last clause — gate-gpu-ds41-twocard, weekly-gpu-ds41-lost, and
+  the serve recipe's `generate_ds41 --place bp` step (its stdout goes to `gen.log`, so the crash reads as mid-load in
+  the recipe log). Stagewin closed the draft View's `Arc<CudaContext>` leak, so the draft's 3090 context was
+  released at teardown for the first time. gdb (`BLOOMERY_GATE_GDB=1` from `swteardown` on) put the fault inside
+  `cuDevicePrimaryCtxRelease_v2`: the A6000's final release, after the 3090's, from the CardDraft's handle on its
+  target. Every stream was idle at its destroy, binding each raw free to its own context did not help, and the same
+  release order without a tier did not fault. `swteardown` retains each device's primary context once for the
+  process (FAIL-first: the three runs 139 → 0). Whether the callstream item below is the same class is read from
+  that landing batch.
+- **t2review leftovers (S each, report `t2review`)**: `crates/gpu/src/tensor.rs` `DeviceTensor::window`'s
+  `rows * cols` is unchecked; host_stats' p50 convention; `crates/gpu/src/arch/deepseek2/scratch.rs:698-701` `into_handle` leaks
+  a handle when a later window of the four fails; `tools/check-unsafe.sh` misses an unquoted `unsafe extern {` and `build.rs`; the
+  residency refusal text differs between its two owners.
 - **callstream mutant s3-drop-admitted (S)**: it is caught by s2 and s4, not by s3, and its output is
   byte-identical to s2-acc-first's, so its site may be wrong. (`gmerge`)
 - **Qwen3.8 MTP prompt cost after `mtpcost` (M, a placement round)**: at P 4096 the MTP arm's prompt is
