@@ -156,7 +156,7 @@ See [`docs/BUILD.md`](docs/BUILD.md): the toolchain, one command block per model
 - Measurements and command lines: [rig-log](https://github.com/midagedev/rig-log) (Korean).
 - Recorded sessions, not benchmark rows:
   - V4.1 on two cards answering a coding review (507 prompt tokens, 1,500 generated): [toktape](https://tape.midagedev.com/r/6w4t9r5nqwtt5c9sagn3).
-  - GLM-5.3's server on the A6000 alone, at its defaults (adaptive residency and the MTP draft), answering a coding review (497 prompt tokens, 2,000 generated): [toktape](https://tape.midagedev.com/r/xj9c5tmpu63fbhbwtg6f). The same prompt through llama.cpp's GLM pull request with its MTP draft on the same card: [toktape](https://tape.midagedev.com/r/39cmzgqpsphp5dmkjxyr).
+  - GLM-5.3's server on the A6000 alone, at its defaults (adaptive residency and the MTP draft), answering a coding review (497 prompt tokens, 2,000 generated): [toktape](https://tape.midagedev.com/r/6kf3sxuqpza6m7k7iwi6). The same prompt through llama.cpp's GLM pull request with its MTP draft on the same card: [toktape](https://tape.midagedev.com/r/6nn6grc6hztpssp88hz5).
   - Clef-Flash on the A6000 (a `Q4_K_M` converted from the release) answering seven Korean SystemOne requests, 63 requests in all: 93.6 ms end to end at the median, 0 top options flipped against the release: [toktape](https://tape.midagedev.com/r/zd3asiqegffcmvky9hti).
 - Plan and cost models: [`docs/plan.md`](docs/plan.md); GPU design: [`docs/gpu-design.md`](docs/gpu-design.md); placement: [`docs/v41-placement.md`](docs/v41-placement.md) (Korean).
 - Working contract: [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md).
