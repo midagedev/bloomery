@@ -972,6 +972,35 @@ pub static STAT_PREFILL_LB: Kind = Kind {
 };
 
 /// The prompt feed's wall.
+/// `clef_hidden`'s prompt call: the positions it fed, the model's width, the
+/// hidden-state bytes it wrote, and the call's wall from the first id's
+/// upload to the last row's readback.
+pub static CLEF_HIDDEN: Kind = Kind {
+    name: "clef_hidden",
+    head: "clef hidden",
+    doc: "The prompt call's final-norm hidden states: positions fed, the model's width, the f32 bytes written, and the call's wall from the ids' upload to the last row's readback.",
+    parts: &[
+        key("n", U64, "positions"),
+        key("width", U64, ""),
+        key("bytes", U64, "B"),
+        key("ms", F64(1), "ms"),
+        key("tok/s", F64(1), "tok/s"),
+    ],
+};
+
+/// `clef_hidden`'s output-embedding rows: the ids read, the width, and the
+/// f32 bytes written.
+pub static CLEF_ROWS: Kind = Kind {
+    name: "clef_rows",
+    head: "clef rows",
+    doc: "The output embedding's rows for the given ids, dequantized on the host: ids read, the width, and the f32 bytes written.",
+    parts: &[
+        key("ids", U64, ""),
+        key("width", U64, ""),
+        key("bytes", U64, "B"),
+    ],
+};
+
 pub static TIME_PROMPT: Kind = Kind {
     name: "time_prompt",
     head: "time prompt",
@@ -1950,6 +1979,10 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &CALL_STREAM_END,
 ];
 
+/// The records `clef_hidden` prints: the prompt call's, then, given row ids,
+/// the output rows'.
+pub static CLEF_HIDDEN_BIN: &[&Kind] = &[&CLEF_HIDDEN, &CLEF_ROWS];
+
 /// The record `gate_deepseek41_prefill` prints inside its own lines, after
 /// its name and the case's.
 pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
@@ -2476,6 +2509,11 @@ mod tests {
                 "generate_glm5next",
                 GENERATE_GLM5NEXT,
                 include_str!("../../../tools/bloomery/schema/generate_glm5next.jsonl"),
+            ),
+            (
+                "clef_hidden",
+                CLEF_HIDDEN_BIN,
+                include_str!("../../../tools/bloomery/schema/clef_hidden.jsonl"),
             ),
             (
                 "generate_qwen3moe",

@@ -1,10 +1,13 @@
-//! The qwen35moe reader's [`ModelSpec`], for both variants. A GDN layer is a
+//! The qwen35moe reader's [`ModelSpec`], for every variant. A GDN layer is a
 //! [`Mixer::DeltaRule`] whose value head `j` reads key head `j mod k_heads`
 //! (the converter tiles them, llama.cpp `convert_hf_to_gguf.py`); a GQA layer
 //! rotates `rope.dimension_count` of its head values by IMROPE sections, and
 //! its `attn_q` writes a per-head gate beside the query when it is twice the
 //! query's width. The file folds the norms' `+1` offset into their gains, so
-//! every norm is a plain RMS norm. No chat parser is bound for this family.
+//! every norm is a plain RMS norm. A layer's feed-forward block is the routed
+//! experts or, on a qwen35 file, one SwiGLU block of `feed_forward_length`
+//! (qwen35.cpp:470-480), as its tensors say. No chat parser is bound for this
+//! family.
 //!
 //! What qwen4exp changes, by its architecture and not by a key (llama.cpp
 //! `src/models/qwen4exp.cpp`): the GDN output gate is a sigmoid (:476-486);
@@ -22,7 +25,7 @@ use models::{
     Router, Score, Selector, Shared,
 };
 
-use super::hparams::{Hparams, Kind, Variant};
+use super::hparams::{FfnKind, Hparams, Kind, Variant};
 use super::roles;
 use crate::arch::{Read, chat_of, spec_u32};
 use crate::placement::{ModelTensors, PlacementError, Role};
@@ -56,6 +59,7 @@ pub fn spec_of(
     let head_dim = spec_u32("attention.key_length", hp.head_dim)?;
     let arch = match hp.variant {
         Variant::Qwen35Moe => Arch::Qwen35Moe,
+        Variant::Qwen35 => Arch::Qwen35,
         Variant::Qwen4Exp => Arch::Qwen4Exp,
     };
     let exp = hp.exp.as_ref();
@@ -74,7 +78,7 @@ pub fn spec_of(
                     kind: DeltaKind::Gdn {
                         khead_map: KHeadMap::Tiled,
                         gate: match hp.variant {
-                            Variant::Qwen35Moe => GdnGate::Silu,
+                            Variant::Qwen35Moe | Variant::Qwen35 => GdnGate::Silu,
                             Variant::Qwen4Exp => GdnGate::Sigmoid,
                         },
                     },
@@ -108,40 +112,22 @@ pub fn spec_of(
                     })
                 }
             };
-            let shexp = tensors
-                .tensors
-                .iter()
-                .any(|t| t.layer == Some(l) && t.role == Role::SharedExpert);
-            let shared = match (shexp, hp.shared_ff) {
-                (false, _) => None,
-                (true, Some(ff)) => Some(Shared {
-                    ff: spec_u32("expert_shared_feed_forward_length", ff)?,
-                    act: Act::SwiGlu { limit: None },
-                    sigmoid_gate: has(format!("blk.{l}.ffn_gate_inp_shexp.weight")),
-                }),
-                (true, None) => {
-                    return Err(PlacementError::Metadata {
-                        key: format!("{}.expert_shared_feed_forward_length", arch.name()),
-                        detail: format!("is absent, and layer {l} carries a shared expert"),
-                    });
+            let ffn = match hp.ffns[l] {
+                FfnKind::Routed => routed(hp, tensors, arch, l, &has)?,
+                FfnKind::Dense => {
+                    let ff = hp.ff.ok_or_else(|| PlacementError::Metadata {
+                        key: format!("{}.feed_forward_length", arch.name()),
+                        detail: format!("is absent, and layer {l} is dense"),
+                    })?;
+                    Ffn::Dense {
+                        ff: spec_u32("feed_forward_length", ff)?,
+                        act: Act::SwiGlu { limit: None },
+                    }
                 }
             };
             Ok(LayerSpec {
                 mixer,
-                ffn: Ffn::Moe(Moe {
-                    experts: spec_u32("expert_count", hp.n_expert)?,
-                    top_k: spec_u32("expert_used_count", hp.n_used)?,
-                    expert_ff: spec_u32("expert_feed_forward_length", hp.expert_ff)?,
-                    act: Act::SwiGlu { limit: None },
-                    router: Router {
-                        score: Score::Softmax,
-                        bias: false,
-                        norm: true,
-                        scale: 1.0,
-                        hash: false,
-                    },
-                    shared,
-                }),
+                ffn,
                 residual: if exp.is_some() {
                     Residual::Hc
                 } else {
@@ -190,6 +176,49 @@ pub fn spec_of(
         engram,
         chat,
     })
+}
+
+/// Layer `l`'s routed experts: softmax, renormalized at scale 1
+/// (qwen35moe.cpp:499-508), with the shared expert its tensors carry.
+fn routed(
+    hp: &Hparams,
+    tensors: &ModelTensors,
+    arch: Arch,
+    l: usize,
+    has: &dyn Fn(String) -> bool,
+) -> Result<Ffn, PlacementError> {
+    let shexp = tensors
+        .tensors
+        .iter()
+        .any(|t| t.layer == Some(l) && t.role == Role::SharedExpert);
+    let shared = match (shexp, hp.shared_ff) {
+        (false, _) => None,
+        (true, Some(ff)) => Some(Shared {
+            ff: spec_u32("expert_shared_feed_forward_length", ff)?,
+            act: Act::SwiGlu { limit: None },
+            sigmoid_gate: has(format!("blk.{l}.ffn_gate_inp_shexp.weight")),
+        }),
+        (true, None) => {
+            return Err(PlacementError::Metadata {
+                key: format!("{}.expert_shared_feed_forward_length", arch.name()),
+                detail: format!("is absent, and layer {l} carries a shared expert"),
+            });
+        }
+    };
+    Ok(Ffn::Moe(Moe {
+        experts: spec_u32("expert_count", hp.n_expert)?,
+        top_k: spec_u32("expert_used_count", hp.n_used)?,
+        expert_ff: spec_u32("expert_feed_forward_length", hp.expert_ff)?,
+        act: Act::SwiGlu { limit: None },
+        router: Router {
+            score: Score::Softmax,
+            bias: false,
+            norm: true,
+            scale: 1.0,
+            hash: false,
+        },
+        shared,
+    }))
 }
 
 /// Whether an attention layer's `attn_q` (`q`, writing `rows`) writes a

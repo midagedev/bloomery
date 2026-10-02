@@ -230,7 +230,7 @@ impl Body35 {
         let mut ids = r.ids.to_host_vec(stream)?;
         ids.truncate(m * slots);
         Ok(Ffn35Run {
-            logits: head_of(stream, &r.logits, m * a.dims.router.logits())?,
+            logits: head_of(stream, &r.logits, m * r.dims().logits())?,
             ids,
             weights: head_of(stream, &r.weights, m * slots)?,
             l_out: head_of(stream, &a.x, m * hidden)?,

@@ -30,7 +30,7 @@ pub fn spec(split: &Split) -> Result<Read, ModelError> {
     Ok(match split.architecture() {
         Some("deepseek41" | DEEPSEEK4) => deepseek41::spec::read(split)?,
         Some("qwen3moe") => qwen3moe::spec::read(split)?,
-        Some("qwen35moe" | "qwen4exp") => qwen35moe::spec::read(split)?,
+        Some("qwen35moe" | "qwen35" | "qwen4exp") => qwen35moe::spec::read(split)?,
         Some("glm5next") => glm5next::spec::read(split)?,
         other => {
             return Err(ModelError::UnknownArchitecture(
@@ -85,11 +85,12 @@ pub fn qwen35moe_variant(split: &Split) -> Result<qwen35moe::hparams::Variant, P
     use qwen35moe::hparams::Variant;
     match split.architecture() {
         Some("qwen35moe") => Ok(Variant::Qwen35Moe),
+        Some("qwen35") => Ok(Variant::Qwen35),
         Some("qwen4exp") => Ok(Variant::Qwen4Exp),
         other => Err(PlacementError::Metadata {
             key: "general.architecture".to_string(),
             detail: format!(
-                "is {:?}; the qwen35moe module reads qwen35moe and qwen4exp",
+                "is {:?}; the qwen35moe module reads qwen35moe, qwen35 and qwen4exp",
                 other.unwrap_or("<missing>")
             ),
         }),

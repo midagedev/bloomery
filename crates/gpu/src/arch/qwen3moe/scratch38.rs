@@ -210,7 +210,7 @@ pub(super) fn dims(router: RouterDims, ctx: usize) -> Dims {
         head: geo::HEAD,
         q_rows: geo::Q_ROWS,
         ff: geo::FF,
-        router,
+        router: Some(router),
         lin: Some(GDN),
         ctx,
     }

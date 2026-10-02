@@ -1,7 +1,10 @@
-//! The Qwen3.6-35B-A3B (`qwen35moe`) `ChainBody`: the family's one layer
-//! body (`dispatch::layer`) over plans that interleave gated-delta-rule
-//! layers with gated GQA layers at head 256, every layer's experts carrying
-//! the sigmoid-gated shared expert as one more slot of joined stacks.
+//! The Qwen3.6-35B-A3B (`qwen35moe`) and Qwen3.5-27B (`qwen35`, the Clef
+//! backbone) `ChainBody`: the family's one layer body (`dispatch::layer`)
+//! over plans that interleave gated-delta-rule layers with gated GQA layers
+//! at head 256 — every routed layer's experts carrying the sigmoid-gated
+//! shared expert as one more slot of joined stacks, every dense layer's FFN a
+//! stack of one expert on the arena's fixed one-slot route. The head counts
+//! are the file's; their group selects the flash (eight a block, or pairs).
 //!
 //! Load reads the file's description once (`model::arch::qwen35moe`): each
 //! layer's kind from its tensors, never from its number, checked against
@@ -26,15 +29,17 @@
 //! ubatch arena, eager in either step mode; a unit of more than
 //! [`GEMV_COLS`] rows takes each op's wide arm (`wide`), one of at most
 //! that many the gemv arm, bit for bit the decode steps. The last unit ends
-//! in its last row's head ([`Tail::Last`]).
+//! in its last row's head ([`Tail::Last`]). The hidden-state call
+//! ([`GpuModel::prefill_hidden`]) walks the same units and ends each in the
+//! final norm of its rows ([`Tail::Hidden`]).
 
 use super::body::{Kernels, TapRows, f32_site, kq_site};
 use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::image::{ImageWrite, PromptImage};
 use super::plan::{
-    DeltaPlan, GqaKind, GqaPlan, Kind35, Kq, LayerPlan, MixerPlan, MoePlan, SharedPlan, kinds35,
-    moe_fits, q35,
+    DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kind35, Kq, LayerPlan, MixerPlan,
+    SharedPlan, kinds35, moe_fits, q35,
 };
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep};
 use super::program::{Program, Tail};
@@ -44,7 +49,7 @@ use super::scratch::{
 };
 use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
-use crate::flash_gqa::{GROUP, HEAD_256};
+use crate::flash_gqa::HEAD_256;
 use crate::head::Head;
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
@@ -57,7 +62,7 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
-use model::arch::models::{Mixer, ModelSpec};
+use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -96,9 +101,9 @@ fn prompt_rows(u: usize, ctx: usize) -> usize {
 }
 
 /// `u` as a ubatch size of `d`, or a named refusal outside
-/// `1..=d.router.ubatch()`.
+/// `1..=d.ubatch_most()`.
 fn ubatch_of(d: &Dims, u: usize) -> Result<NonZeroUsize, GpuError> {
-    let most = d.router.ubatch();
+    let most = d.ubatch_most();
     NonZeroUsize::new(u)
         .filter(|u| u.get() <= most)
         .ok_or_else(|| {
@@ -293,59 +298,82 @@ fn joint(l: usize, part: &str) -> String {
     format!("derived.blk.{l}.ffn_{part}_exps_sh")
 }
 
-/// Layer `l`'s routed FFN with the shared expert folded in: the three
-/// stacks joined with their shared expert as expert `n` (the routed count),
-/// the router with the shared gate as row `n`, each checked against the
-/// shape and type its launch takes.
+/// Layer `l`'s FFN by its description `spec`: a routed one with the shared
+/// expert folded in — the three stacks joined with their shared expert as
+/// expert `n` (the routed count), the router with the shared gate as row `n`
+/// — or a dense one, its three matrices a stack of one expert on the
+/// arena's fixed route; each weight checked against the shape and type its
+/// launch takes.
 fn resolve_ffn(
     stream: &CudaStream,
     w: &mut Weights,
     d: &Dims,
+    spec: &LayerSpec,
     l: usize,
-) -> Result<MoePlan, GpuError> {
+) -> Result<FfnPlan, GpuError> {
     let (h, ff) = (d.hidden, d.ff);
-    for part in ["gate", "up", "down"] {
-        w.join_rows(
-            stream,
-            &[
-                blk(l, &format!("ffn_{part}_exps.weight")).as_str(),
-                blk(l, &format!("ffn_{part}_shexp.weight")).as_str(),
-            ],
-            joint(l, part),
-        )?;
-    }
-    let router = format!("derived.blk.{l}.ffn_gate_inp_sh");
-    w.join_rows(
-        stream,
-        &[
-            blk(l, "ffn_gate_inp.weight").as_str(),
-            blk(l, "ffn_gate_inp_shexp.weight").as_str(),
-        ],
-        router.clone(),
-    )?;
-    let e = d.router.logits();
-    let f = MoePlan {
-        ffn_norm: blk(l, "post_attention_norm.weight"),
-        ffn_gate_inp: router,
-        ffn_gate_exps: joint(l, "gate"),
-        ffn_up_exps: joint(l, "up"),
-        ffn_down_exps: joint(l, "down"),
-        down_ty: Kq::Q4K,
-        shared: Some(SharedPlan),
+    let (f, e) = match &spec.ffn {
+        Ffn::Moe(_) => {
+            for part in ["gate", "up", "down"] {
+                w.join_rows(
+                    stream,
+                    &[
+                        blk(l, &format!("ffn_{part}_exps.weight")).as_str(),
+                        blk(l, &format!("ffn_{part}_shexp.weight")).as_str(),
+                    ],
+                    joint(l, part),
+                )?;
+            }
+            let router = format!("derived.blk.{l}.ffn_gate_inp_sh");
+            w.join_rows(
+                stream,
+                &[
+                    blk(l, "ffn_gate_inp.weight").as_str(),
+                    blk(l, "ffn_gate_inp_shexp.weight").as_str(),
+                ],
+                router.clone(),
+            )?;
+            let e = d.routed(WHAT)?.logits();
+            f32_site(w, &router, e, h)?;
+            let f = FfnPlan {
+                ffn_norm: blk(l, "post_attention_norm.weight"),
+                route: FfnRoute::Router {
+                    gate_inp: router,
+                    shared: Some(SharedPlan),
+                },
+                gate: joint(l, "gate"),
+                up: joint(l, "up"),
+                down: joint(l, "down"),
+                down_ty: Kq::Q4K,
+            };
+            (f, e)
+        }
+        Ffn::Dense { .. } => {
+            let f = FfnPlan {
+                ffn_norm: blk(l, "post_attention_norm.weight"),
+                route: FfnRoute::Dense,
+                gate: blk(l, "ffn_gate.weight"),
+                up: blk(l, "ffn_up.weight"),
+                down: blk(l, "ffn_down.weight"),
+                down_ty: Kq::Q4K,
+            };
+            (f, 1)
+        }
     };
     f32_site(w, &f.ffn_norm, 1, h)?;
-    f32_site(w, &f.ffn_gate_inp, e, h)?;
-    kq_site(w, &f.ffn_gate_exps, e * ff, h, &[Kq::Q4K])?;
-    kq_site(w, &f.ffn_up_exps, e * ff, h, &[Kq::Q4K])?;
-    let down_ty = kq_site(w, &f.ffn_down_exps, e * h, ff, &[Kq::Q4K, Kq::Q6K])?;
-    Ok(MoePlan { down_ty, ..f })
+    kq_site(w, &f.gate, e * ff, h, &[Kq::Q4K])?;
+    kq_site(w, &f.up, e * ff, h, &[Kq::Q4K])?;
+    let down_ty = kq_site(w, &f.down, e * h, ff, &[Kq::Q4K, Kq::Q6K])?;
+    Ok(FfnPlan { down_ty, ..f })
 }
 
-/// Layer `l`'s gated attention, every weight checked.
-fn resolve_gqa(w: &Weights, d: &Dims, l: usize) -> Result<GqaPlan, GpuError> {
+/// Layer `l`'s gated attention over the flash `flash` its group selects,
+/// every weight checked.
+fn resolve_gqa(w: &Weights, d: &Dims, l: usize, flash: Flash) -> Result<GqaPlan, GpuError> {
     let (h, kv, att) = (d.hidden, d.kv_len(), d.attn_len());
     let g = GqaPlan {
         kind: GqaKind::Gated256,
+        flash,
         attn_norm: blk(l, "attn_norm.weight"),
         attn_q: blk(l, "attn_q.weight"),
         attn_k: blk(l, "attn_k.weight"),
@@ -401,14 +429,17 @@ fn resolve_delta(
 }
 
 /// The arena's dims of `spec`, whose kinds `kinds` the plan checked: the
-/// attention layers' head of 256 with a gate beside each query, the router
-/// the routed shape selects (every layer of a file shares it), and the delta
-/// layers' one shape (every delta layer of a file shares it). A delta layer's gated norm writes the attention rows' buffer,
-/// so the two widths must agree.
+/// attention layers' head of 256 with a gate beside each query (every
+/// attention layer of a file shares one head count), the FFN's — the router
+/// the routed shape selects (every layer of a file shares it), or a dense
+/// width every layer shares, never both kinds in one file — and the delta
+/// layers' one shape (every delta layer of a file shares it). A delta
+/// layer's gated norm writes the attention rows' buffer, so the two widths
+/// must agree.
 fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError> {
     let mut shapes = kinds.iter().filter_map(|k| match k {
         Kind35::Delta(s) => Some(*s),
-        Kind35::Gqa => None,
+        Kind35::Gqa(_) => None,
     });
     let lin = shapes.next();
     if let Some(s) = lin
@@ -419,30 +450,30 @@ fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError
             format!("two delta shapes, {s:?} and {other:?}; one arena serves one"),
         ));
     }
-    let mut routed = spec.layers.iter().filter_map(|l| l.moe());
-    let first = routed.next().ok_or(GpuError::shape(
+    let mut heads = spec.layers.iter().filter_map(|l| match &l.mixer {
+        Mixer::Gqa(g) => Some((g.heads as usize, g.kv_heads as usize)),
+        _ => None,
+    });
+    let (n_head, n_kv) = heads.next().ok_or(GpuError::shape(
         WHAT,
-        "no routed layer to size the router for",
+        "no attention layer to size the attention rows for",
     ))?;
-    if let Some(other) = routed.find(|m| MoeShape::of(m) != MoeShape::of(first)) {
+    if let Some(other) = heads.find(|o| *o != (n_head, n_kv)) {
         return Err(GpuError::shape(
             WHAT,
             format!(
-                "two routed shapes, {:?} and {:?}; one arena serves one",
-                MoeShape::of(first),
-                MoeShape::of(other)
+                "two attention head counts, {n_head}/{n_kv} and {other:?}; one arena serves one"
             ),
         ));
     }
-    let router = moe_fits(first).map_err(|e| GpuError::shape(WHAT, e))?;
-    let (n_head, n_kv) = (q35::HEADS as usize, q35::KV_HEADS as usize);
+    let (router, ff) = ffn_dims(spec)?;
     let d = Dims {
         hidden: spec.hidden as usize,
         n_head,
         n_kv,
         head: HEAD_256,
         q_rows: 2 * n_head * HEAD_256,
-        ff: q35::EXPERT_FF as usize,
+        ff,
         router,
         lin,
         ctx,
@@ -459,17 +490,53 @@ fn dims(spec: &ModelSpec, kinds: &[Kind35], ctx: usize) -> Result<Dims, GpuError
             ),
         ));
     }
-    if n_head / n_kv != GROUP || !d.hidden.is_multiple_of(256) {
+    if !d.hidden.is_multiple_of(256) {
         return Err(GpuError::shape(
             WHAT,
-            format!(
-                "{n_head}/{n_kv} heads (the flash's group is {GROUP}), hidden {} (whole K-quant \
-                 super-blocks)",
-                d.hidden
-            ),
+            format!("hidden {} (whole K-quant super-blocks)", d.hidden),
         ));
     }
     Ok(d)
+}
+
+/// The FFN's part of the dims of `spec`: the router of its routed layers
+/// (one shape, [`moe_fits`]) and the expert width, or no router and the
+/// dense width its dense layers share. A file with both kinds, or neither,
+/// is refused by name.
+fn ffn_dims(spec: &ModelSpec) -> Result<(Option<super::router::RouterDims>, usize), GpuError> {
+    let mut routed = spec.layers.iter().filter_map(|l| l.moe());
+    let mut dense = spec.layers.iter().filter_map(|l| match l.ffn {
+        Ffn::Dense { ff, .. } => Some(ff as usize),
+        Ffn::Moe(_) => None,
+    });
+    match (routed.next(), dense.next()) {
+        (Some(first), None) => {
+            if let Some(other) = routed.find(|m| MoeShape::of(m) != MoeShape::of(first)) {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "two routed shapes, {:?} and {:?}; one arena serves one",
+                        MoeShape::of(first),
+                        MoeShape::of(other)
+                    ),
+                ));
+            }
+            let router = moe_fits(first).map_err(|e| GpuError::shape(WHAT, e))?;
+            Ok((Some(router), q35::EXPERT_FF as usize))
+        }
+        (None, Some(ff)) => match dense.find(|&o| o != ff) {
+            Some(other) => Err(GpuError::shape(
+                WHAT,
+                format!("two dense widths, {ff} and {other}; one arena serves one"),
+            )),
+            None => Ok((None, ff)),
+        },
+        (Some(_), Some(_)) => Err(GpuError::shape(
+            WHAT,
+            "routed and dense layers in one file; one arena serves one FFN kind",
+        )),
+        (None, None) => Err(GpuError::shape(WHAT, "no layer to size the FFN for")),
+    }
 }
 
 impl GpuModel<Body35> {
@@ -520,13 +587,23 @@ impl Body35 {
                 WHAT,
                 "no attention layer to read the rope base from",
             ))?;
+        if mma && kinds.contains(&Kind35::Gqa(Flash::Pairs)) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tensor-core decode flash at {}/{} heads: the pairs' pass is scalar only \
+                     (open with mma false)",
+                    d.n_head, d.n_kv
+                ),
+            ));
+        }
         let stream = gpu.stream();
         let (mut plans, mut stores) = (Vec::new(), Vec::new());
-        for (l, kind) in kinds.iter().enumerate() {
-            let ffn = resolve_ffn(stream, w, &d, l)?;
+        for (l, (kind, layer)) in kinds.iter().zip(&spec.layers).enumerate() {
+            let ffn = resolve_ffn(stream, w, &d, layer, l)?;
             let (mixer, store) = match *kind {
-                Kind35::Gqa => (
-                    MixerPlan::Gqa(resolve_gqa(w, &d, l)?),
+                Kind35::Gqa(flash) => (
+                    MixerPlan::Gqa(resolve_gqa(w, &d, l, flash)?),
                     LayerStore::Kv(KvPlanes::new(stream, &d)?),
                 ),
                 Kind35::Delta(shape) => (
@@ -720,18 +797,27 @@ fn enqueue_rows(
     .walk()
 }
 
+/// What a prompt unit's walk ends in.
+enum UnitEnd<'a> {
+    /// Nothing: the next unit reads the arena's `x`.
+    Pass,
+    /// The head of its last row.
+    Head(&'a mut Head),
+    /// The final norm of every row into the arena's `normed`.
+    Hidden,
+}
+
 impl Body35 {
     /// Enqueue the unit of the image's `tokens`, standing at position `pos`
     /// (the image's position for its first token, else refused): the walk
-    /// `(1, t, Step)` over the ubatch arena, ending in the head of its last
-    /// row when `head` is given.
+    /// `(1, t, Step)` over the ubatch arena, ending as `end` says.
     fn walk_unit(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
         tokens: Range<usize>,
         pos: u32,
-        head: Option<&mut Head>,
+        end: UnitEnd<'_>,
     ) -> Result<(), GpuError> {
         const WHAT_UNIT: &str = "qwen35moe::walk_unit";
         let want = u32::try_from(tokens.start)
@@ -765,12 +851,13 @@ impl Body35 {
             eps: *eps,
             table: &rope.table,
         };
-        let tail = match head {
-            Some(head) => Tail::Last {
+        let tail = match end {
+            UnitEnd::Head(head) => Tail::Last {
                 head,
                 state: head_state,
             },
-            None => Tail::Pass,
+            UnitEnd::Pass => Tail::Pass,
+            UnitEnd::Hidden => Tail::Hidden,
         };
         Program {
             c: &c,
@@ -861,11 +948,79 @@ impl GpuModel<Body35> {
             let unit = at..at + t;
             at += t;
             next = self.run_rows(t, WHAT_P, |gpu, w, body, head, pos| {
-                body.walk_unit(gpu, w, unit, pos, last.then_some(head))?;
+                let end = if last {
+                    UnitEnd::Head(head)
+                } else {
+                    UnitEnd::Pass
+                };
+                body.walk_unit(gpu, w, unit, pos, end)?;
                 Ok(last)
             })?;
         }
         next.ok_or(GpuError::state(WHAT_P, "a token read after the last unit"))
+    }
+
+    /// Feed `tokens` through the chain by the plan of `path`, as
+    /// [`GpuModel::prefill_with`] does, and return every position's
+    /// final-norm hidden state — the last layer's output RMS-normed by
+    /// `output_norm`, llama.cpp's `result_norm` and HF's `last_hidden_state`
+    /// — `tokens.len()` rows of the model's width, row `t` at `t · hidden`.
+    /// No head runs: no output projection, no logits. Each unit ends in the
+    /// norm of its rows ([`Tail::Hidden`]), copied to the host before the next
+    /// unit overwrites them, and the fault word is read after each unit: a
+    /// raised fault is [`GpuError::Fault`] and leaves the model poisoned.
+    /// The layer taps must be off, and every id must be below the
+    /// vocabulary; a prompt past the cache is refused before any launch.
+    pub fn prefill_hidden(
+        &mut self,
+        tokens: &[u32],
+        path: PrefillPath,
+    ) -> Result<Vec<f32>, GpuError> {
+        const WHAT_H: &str = "qwen35moe::prefill_hidden";
+        if tokens.is_empty() {
+            return Err(GpuError::shape(WHAT_H, "empty token slice"));
+        }
+        let pos0 = self.pos();
+        self.check_pos(
+            pos0 + launch_u32(WHAT_H, "tokens", tokens.len())? - 1,
+            WHAT_H,
+        )?;
+        let plan = self.prefill_plan(tokens.len(), path)?;
+        let hidden = {
+            let (gpu, _, body) = self.body_parts(WHAT_H)?;
+            if body.taps.is_some() {
+                return Err(GpuError::state(
+                    WHAT_H,
+                    "layer taps off (a prompt unit writes none)",
+                ));
+            }
+            super::refuse_past_vocab(WHAT_H, tokens, body.vocab)?;
+            body.img.write(gpu.stream(), tokens, pos0)?;
+            body.u.dims.hidden
+        };
+        let mut out = Vec::with_capacity(tokens.len() * hidden);
+        let mut at = 0usize;
+        for &step in &plan.steps {
+            let t = match step {
+                PrefillStep::Ubatch(t) | PrefillStep::Pass(t) => t,
+            };
+            let unit = at..at + t;
+            at += t;
+            let out = &mut out;
+            self.run_rows(t, WHAT_H, |gpu, w, body, _, pos| {
+                body.walk_unit(gpu, w, unit, pos, UnitEnd::Hidden)?;
+                if let Some(f) = gpu.fault()? {
+                    return Err(GpuError::fault(WHAT_H, f));
+                }
+                // SAFETY: rows `0..t` of `normed` span `t · hidden` values
+                // inside it (`rows · hidden`, `t <= rows` by the walk's
+                // refusal), and the arena stays in place for the copy.
+                let rows = unsafe { super::scratch::f32_view(&body.u.normed, 0, t * hidden) };
+                out.extend_from_slice(&rows.to_host_vec(gpu.stream())?);
+                Ok(false)
+            })?;
+        }
+        Ok(out)
     }
 }
 

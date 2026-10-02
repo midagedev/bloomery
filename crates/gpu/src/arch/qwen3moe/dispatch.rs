@@ -20,7 +20,7 @@ use super::body::{ATTN_SCALE, ATTN_SCALE_256, Body, Kernels};
 use super::delta;
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
-use super::plan::{GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan, MoePlan};
+use super::plan::{FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan};
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
 use super::scratch::{Arena, Io, KvPlanes, StoreMut};
@@ -242,6 +242,8 @@ pub(super) fn enqueue_pass(
 ///   gate·up, one quantizer over every token's slots, the down `_sel` over
 ///   every token's slots, and the combine — 5 or 6.
 ///
+/// - A dense FFN: `norm_quant` and the four launches after the router — 5.
+///
 /// So a qwen3moe layer is 12 or 13 launches at one row and 13 or 15 at
 /// every `m` from two to [`GEMV_COLS`]. Past it (the wide arm, `wide`) the
 /// embedding is followed by the unit's dense route table, and a layer is
@@ -249,7 +251,8 @@ pub(super) fn enqueue_pass(
 /// prefill flash, gated quantizer, output GEMM and residual add, 10; the
 /// delta rule's 12 ([`delta::launches`]) — and the FFN's norm, quantizer,
 /// router logits and routing, route table, gate, up, SwiGLU quantizer, down
-/// and combine, 10.
+/// and combine, 10; a dense FFN's norm, quantizer, gate, up, SwiGLU
+/// quantizer, down and combine, 7.
 pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
     let wide = m > GEMV_COLS;
     let many = usize::from(m > 1);
@@ -259,7 +262,13 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
             MixerPlan::Gqa(g) => 7 + usize::from(g.v_ty == Kq::Q6K) * (1 + many),
             MixerPlan::Delta(d) => delta::launches(d, m),
         };
-        mixer + if wide { 10 } else { 5 + many }
+        let ffn = match (&p.ffn.route, wide) {
+            (FfnRoute::Router { .. }, true) => 10,
+            (FfnRoute::Router { .. }, false) => 5 + many,
+            (FfnRoute::Dense, true) => 7,
+            (FfnRoute::Dense, false) => 5,
+        };
+        mixer + ffn
     };
     1 + usize::from(wide) + plans.iter().map(per_layer).sum::<usize>()
 }
@@ -506,24 +515,26 @@ fn gated_256(
             cache_v: &mut kv.v,
         },
     )?;
-    k.flash.enqueue_pass_256(
-        stream,
-        GqaArgs {
-            q: q_out,
-            kc: &kv.k,
-            vc: &kv.v,
-            n_keys: &s.n_keys,
-            scale: ATTN_SCALE_256,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m,
-            part_v: &mut s.part_v,
-            part_ms: &mut s.part_ms,
-            fault: c.sink,
-            y: &mut s.attn,
-        },
-        c.mma,
-    )?;
+    let args = GqaArgs {
+        q: q_out,
+        kc: &kv.k,
+        vc: &kv.v,
+        n_keys: &s.n_keys,
+        scale: ATTN_SCALE_256,
+        n_kv: d.n_kv,
+        ctx: d.ctx,
+        m,
+        part_v: &mut s.part_v,
+        part_ms: &mut s.part_ms,
+        fault: c.sink,
+        y: &mut s.attn,
+    };
+    match n.flash {
+        Flash::Group => k.flash.enqueue_pass_256(stream, args, c.mma)?,
+        Flash::Quads => k.flash.enqueue_pass_256_p4(stream, args, d.n_head, c.mma)?,
+        // The pairs' pass is scalar: the load refuses the tensor-core one.
+        Flash::Pairs => k.flash.enqueue_pass_256_p2(stream, args, d.n_head)?,
+    }
     q35.gated.enqueue_q8act(
         stream,
         (&s.attn, &s.q),
@@ -539,13 +550,15 @@ fn gated_256(
     )
 }
 
-/// The routed FFN half: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
+/// The FFN half: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
 /// down_s(swiglu(gate_s, up_s))` over each token's slots out, into `out`
 /// (`None`: into `x`). A plan without a shared expert routes `k` slots a
-/// token (the file's `top_k`); with one ([`MoePlan::shared`]) the gated
-/// router adds one more, the shared expert's id in the joined stacks
-/// weighted by the sigmoid of the router's last row, and every launch after
-/// it runs `k + 1` slots a token.
+/// token (the file's `top_k`); with one ([`FfnRoute::Router`]'s `shared`)
+/// the gated router adds one more, the shared expert's id in the joined
+/// stacks weighted by the sigmoid of the router's last row, and every launch
+/// after it runs `k + 1` slots a token. A dense FFN ([`FfnRoute::Dense`])
+/// launches no router: its norm is `norm_quant` at every `m`, and the launches
+/// after it run its one slot a token from the arena's fixed route.
 /// The down `_sel` runs every token's slots in one launch: slot `t · slots
 /// + j` is token `t`'s slot `j`, its id, its q8_1 column and its down rows
 /// all at that index, so each slot's row is the row a one-token launch
@@ -556,7 +569,7 @@ fn gated_256(
 /// `norm_quant` and the `m`-token router.
 pub(super) fn ffn(
     c: &Ctx<'_>,
-    n: &MoePlan,
+    n: &FfnPlan,
     s: &mut Arena,
     m: usize,
     out: Option<&mut DeviceBuffer<f32>>,
@@ -567,11 +580,25 @@ pub(super) fn ffn(
     }
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
-    let d = s.dims;
     let i = s.col(m)?;
-    let router = f32_tensor(w, &n.ffn_gate_inp)?;
     let gain = f32_gain(w, &n.ffn_norm)?;
-    match n.shared {
+    let (gate_inp, shared) = match &n.route {
+        FfnRoute::Router { gate_inp, shared } => (gate_inp, shared),
+        FfnRoute::Dense => {
+            gpu.fused().enqueue_norm_quant(
+                stream,
+                &s.ffn_inp,
+                gain,
+                c.eps,
+                &mut s.act_ffn[i],
+                &mut s.normed,
+                c.sink,
+            )?;
+            return slots_down(c, n, s, m, out);
+        }
+    };
+    let router = f32_tensor(w, gate_inp)?;
+    match shared {
         None if m == 1 => k.router.enqueue_norm_fused(
             stream,
             router,
@@ -625,20 +652,39 @@ pub(super) fn ffn(
             )?;
         }
     }
+    slots_down(c, n, s, m, out)
+}
+
+/// The FFN half after its slots are picked: the gate·up·SwiGLU of every
+/// token's slots, one quantizer over them, the down `_sel` and the combine
+/// ([`ffn`]'s doc).
+fn slots_down(
+    c: &Ctx<'_>,
+    n: &FfnPlan,
+    s: &mut Arena,
+    m: usize,
+    out: Option<&mut DeviceBuffer<f32>>,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "qwen3moe::ffn";
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let stream = gpu.stream();
+    let d = s.dims;
+    let i = s.col(m)?;
     let slots = d.slots();
-    if slots != c.p.slots(d.router.used()) {
+    let used = d.router.map_or(0, |r| r.used());
+    if slots != c.p.slots(used) {
         return Err(GpuError::shape(
             WHAT,
             format!(
                 "layer {}: the arena is cut for {slots} slots a token, the plan routes {}",
                 c.layer,
-                c.p.slots(d.router.used())
+                c.p.slots(used)
             ),
         ));
     }
     let gate_up = GateUpArgs {
-        wg: kq_weight(w, &n.ffn_gate_exps)?,
-        wu: kq_weight(w, &n.ffn_up_exps)?,
+        wg: kq_weight(w, &n.gate)?,
+        wu: kq_weight(w, &n.up)?,
         act: &s.act_ffn[i],
         sel: s.route.ids(),
         n_slots: m * slots,
@@ -647,7 +693,7 @@ pub(super) fn ffn(
         h: &mut s.h,
     };
     k.experts.enqueue_gate_up(stream, gate_up)?;
-    let wd = kq_weight(w, &n.ffn_down_exps)?;
+    let wd = kq_weight(w, &n.down)?;
     gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;
     let act_h = &s.act_h[i];
     match n.down_ty {

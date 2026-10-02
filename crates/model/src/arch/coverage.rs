@@ -45,7 +45,7 @@ pub enum Program {
 pub fn program_of(arch: Arch) -> Option<Program> {
     match arch {
         Arch::Deepseek41 | Arch::Deepseek4 => Some(Program::Deepseek41Chain),
-        Arch::Qwen3Moe | Arch::Qwen35Moe => Some(Program::Qwen3moeBody),
+        Arch::Qwen3Moe | Arch::Qwen35Moe | Arch::Qwen35 => Some(Program::Qwen3moeBody),
         Arch::Glm5Next => Some(Program::Glm5nextBody),
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
     }
@@ -192,6 +192,11 @@ pub const AVAILABLE: &[Available] = &[
         program: Program::Qwen3moeBody,
         at: "gpu/src/arch/qwen3moe/dispatch.rs gated_256 (Body35's output gate)",
         runs: |n| matches!(n, Need::OutGate),
+    },
+    Available {
+        program: Program::Qwen3moeBody,
+        at: "gpu/src/arch/qwen3moe/plan.rs dense_fits (Body35's dense FFN: one expert, one slot)",
+        runs: |n| matches!(n, Need::DenseFfn { ff } if ff.is_multiple_of(256)),
     },
     Available {
         program: Program::Qwen3moeBody,
@@ -479,6 +484,22 @@ const TYPE_PINS: &[TypePin] = &[
         matrices: true,
         names: None,
         what: "attention matrices (the body reads q4_K and q6_K)",
+        reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
+    },
+    TypePin {
+        program: Program::Qwen3moeBody,
+        role: Role::DenseFfn,
+        matrices: true,
+        names: Some(|n| !n.ends_with(".ffn_down.weight")),
+        what: "dense FFN gate and up (the body reads q4_K)",
+        reads: &[GgmlType::Q4_K],
+    },
+    TypePin {
+        program: Program::Qwen3moeBody,
+        role: Role::DenseFfn,
+        matrices: true,
+        names: Some(|n| n.ends_with(".ffn_down.weight")),
+        what: "dense FFN down (the body reads q4_K and q6_K)",
         reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
     },
     TypePin {

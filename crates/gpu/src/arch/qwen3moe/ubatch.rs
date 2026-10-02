@@ -47,7 +47,7 @@ use super::body::{ATTN_SCALE, Body, Kernels};
 use super::experts::CombineArgs;
 pub use super::image::ImageWrite;
 use super::image::PromptImage;
-use super::plan::{GqaPlan, Kq, LayerPlan, MoePlan};
+use super::plan::{FfnPlan, FfnRoute, GqaPlan, Kq, LayerPlan};
 use super::router::RouterOut;
 use super::scratch::{Dims, KvPlanes, f32_view};
 use crate::elem::EmbedRowsArgs;
@@ -183,6 +183,7 @@ impl UbArena {
                 ),
             ));
         }
+        let r = d.routed(WHAT)?;
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         Ok(UbArena {
             x: f(rows * d.hidden)?,
@@ -197,9 +198,9 @@ impl UbArena {
             act_attn: GemmAct::new(stream, rows, q_len)?,
             attn_o: f(rows * d.hidden)?,
             ffn_inp: f(rows * d.hidden)?,
-            route: RouterOut::for_ubatch(stream, d.router, rows)?,
+            route: RouterOut::for_ubatch(stream, r, rows)?,
             dense: GemmRoute::new(stream, rows, 1)?,
-            moe: GemmRoute::new(stream, slots, d.router.experts())?,
+            moe: GemmRoute::new(stream, slots, r.experts())?,
             gate: f(slots * d.ff)?,
             up: f(slots * d.ff)?,
             act_h: GemmAct::new(stream, slots, d.ff)?,
@@ -507,15 +508,23 @@ fn attention(
 /// `x`.
 fn ffn(
     c: &UbCtx<'_>,
-    n: &MoePlan,
+    n: &FfnPlan,
     a: &mut UbArena,
     t: usize,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
+    const WHAT_FFN: &str = "qwen3moe::ubatch::ffn";
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let d = a.dims;
     let slots = t * d.slots();
+    let FfnRoute::Router { gate_inp, .. } = &n.route else {
+        return Err(GpuError::shape(
+            WHAT_FFN,
+            "a dense FFN (Qwen3's ubatch routes every layer)",
+        ));
+    };
+    let used = d.routed(WHAT_FFN)?.used();
     gpu.elem().enqueue_rms_norm(
         stream,
         &a.ffn_inp,
@@ -528,7 +537,7 @@ fn ffn(
     gpu.enqueue_quantize_gemm(&a.normed, t, &mut a.act_hid, sink)?;
     k.router.enqueue_ubatch(
         stream,
-        f32_tensor(w, &n.ffn_gate_inp)?,
+        f32_tensor(w, gate_inp)?,
         &a.normed,
         t,
         sink,
@@ -536,7 +545,7 @@ fn ffn(
     )?;
     k.gemm
         .enqueue_route(stream, &a.route.ids, slots, &mut a.moe, sink)?;
-    for (name, y) in [(&n.ffn_gate_exps, &mut a.gate), (&n.ffn_up_exps, &mut a.up)] {
+    for (name, y) in [(&n.gate, &mut a.gate), (&n.up, &mut a.up)] {
         k.gemm.enqueue_gemm(
             stream,
             GemmArgs {
@@ -545,9 +554,7 @@ fn ffn(
                 rows_per_expert: d.ff,
                 act: &a.act_hid,
                 route: &a.moe,
-                input: GemmInput::Shared {
-                    top_k: d.router.used(),
-                },
+                input: GemmInput::Shared { top_k: used },
                 y,
             },
         )?;
@@ -558,7 +565,7 @@ fn ffn(
         stream,
         GemmArgs {
             ty: gemm_ty(n.down_ty),
-            w: kq_weight(w, &n.ffn_down_exps)?,
+            w: kq_weight(w, &n.down)?,
             rows_per_expert: d.hidden,
             act: &a.act_h,
             route: &a.moe,

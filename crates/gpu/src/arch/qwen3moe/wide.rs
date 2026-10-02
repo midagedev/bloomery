@@ -9,7 +9,8 @@
 //! through the grouped int8 GEMM over a one-expert table ([`route_dense`],
 //! filled once per unit after its embedding), the routed experts through one
 //! table per layer (gate and up reading each token's column, down each
-//! slot's own); the norms, the quantizers, the rope with the cache append,
+//! slot's own), a dense FFN's three matrices through the one-expert table
+//! (its one slot a token is the token's column); the norms, the quantizers, the rope with the cache append,
 //! the prefill flash, the router's two launches, the SwiGLU quantizer and
 //! the combine run over the unit's rows. The conv, the delta step and the
 //! gated norm are the gemv arm's own launches: they already take any row
@@ -27,7 +28,7 @@
 use super::body::ATTN_SCALE_256;
 use super::dispatch::Ctx;
 use super::experts::CombineArgs;
-use super::plan::{DeltaPlan, GqaKind, GqaPlan, Kq, MoePlan};
+use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kq};
 use super::router::MAX_TOKENS;
 use super::scratch::{Arena, Dims, GdnArena, KvPlanes};
 use crate::GpuError;
@@ -68,8 +69,9 @@ pub(super) struct Wide {
     dense: GemmRoute,
     /// The layer's expert table over `t · slots` slots, `slots` the
     /// router's per token (a folded shared expert's among them), over the
-    /// joined stacks' `logits()` experts.
-    moe: GemmRoute,
+    /// joined stacks' `logits()` experts; `None` for a dense chain, whose
+    /// FFN reads `dense`.
+    moe: Option<GemmRoute>,
 }
 
 impl Wide {
@@ -95,7 +97,10 @@ impl Wide {
             up: f(slots * d.ff)?,
             attn_o: f(rows * d.hidden)?,
             dense: GemmRoute::new(stream, rows, 1)?,
-            moe: GemmRoute::new(stream, slots, d.router.logits())?,
+            moe: d
+                .router
+                .map(|r| GemmRoute::new(stream, slots, r.logits()))
+                .transpose()?,
         })
     }
 
@@ -107,7 +112,7 @@ impl Wide {
             + self.up.num_bytes()
             + self.attn_o.num_bytes()
             + self.dense.bytes()
-            + self.moe.bytes()
+            + self.moe.as_ref().map_or(0, GemmRoute::bytes)
     }
 }
 
@@ -163,15 +168,17 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize) -> usize {
             m * (2 * act_col_bytes(d.hidden) + act_col_bytes(att)) + m * slots * act_col_bytes(d.ff)
         })
         .sum();
-    let r = d.router;
-    let route = (rows * (r.logits() + r.experts() + 2 * slots) + 1) * 4;
+    let route = match d.router {
+        Some(r) => (rows * (r.logits() + r.experts() + 2 * slots) + 1) * 4,
+        None => 2 * rows * 4,
+    };
     let wide = if rows > GEMV_COLS {
         let s = rows * slots;
         rows * (act_col_bytes(d.hidden) + act_col_bytes(att))
             + s * act_col_bytes(d.ff)
             + (s * d.ff + rows * d.hidden) * 4
             + route_bytes(rows, 1)
-            + route_bytes(s, r.logits())
+            + d.router.map_or(0, |r| route_bytes(s, r.logits()))
     } else {
         0
     };
@@ -333,22 +340,24 @@ pub(super) fn attention(
             cache_v: &mut kv.v,
         },
     )?;
-    k.prefill.enqueue_256(
-        stream,
-        GqaPrefillArgs {
-            q: q_out,
-            kc: &kv.k,
-            vc: &kv.v,
-            n_keys,
-            scale: ATTN_SCALE_256,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            t: m,
-            fault: c.sink,
-            y: attn,
-        },
-    )?;
+    let args = GqaPrefillArgs {
+        q: q_out,
+        kc: &kv.k,
+        vc: &kv.v,
+        n_keys,
+        scale: ATTN_SCALE_256,
+        n_head: d.n_head,
+        n_kv: d.n_kv,
+        ctx: d.ctx,
+        t: m,
+        fault: c.sink,
+        y: attn,
+    };
+    match n.flash {
+        Flash::Group => k.prefill.enqueue_256(stream, args)?,
+        Flash::Quads => k.prefill.enqueue_256_p4(stream, args)?,
+        Flash::Pairs => k.prefill.enqueue_256_p2(stream, args)?,
+    }
     q35.gated.enqueue_gemm(
         stream,
         (attn, q),
@@ -463,15 +472,17 @@ pub(super) fn delta_out(
         .enqueue_add(stream, x, attn_o, m * hidden, ffn_inp)
 }
 
-/// The routed FFN half at `m` rows: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
+/// The FFN half at `m` rows: `ffn_inp` in, `ffn_inp + Σ_s w_s ·
 /// down_s(swiglu(gate_s, up_s))` over each token's slots out, into `out`
-/// (`None`: into `x`). The gated router's slots only (the shared expert the
-/// last of each token's, its id the joined stacks' last expert); Qwen3's
-/// plain router takes its wide rows through `ubatch.rs` and is refused here
-/// by name.
+/// (`None`: into `x`). The gated router's slots (the shared expert the last
+/// of each token's, its id the joined stacks' last expert) through the
+/// layer's expert table, or a dense FFN's one slot a token through the
+/// unit's one-expert table at the arena's fixed weight 1; Qwen3's plain
+/// router takes its wide rows through `ubatch.rs` and is refused here by
+/// name.
 pub(super) fn ffn(
     c: &Ctx<'_>,
-    n: &MoePlan,
+    n: &FfnPlan,
     s: &mut Arena,
     m: usize,
     out: Option<&mut DeviceBuffer<f32>>,
@@ -481,7 +492,7 @@ pub(super) fn ffn(
     let stream = gpu.stream();
     let d = s.dims;
     let slots = d.slots();
-    if n.shared.is_none() {
+    if let FfnRoute::Router { shared: None, .. } = n.route {
         return Err(GpuError::shape(
             WHAT_FFN,
             format!(
@@ -491,17 +502,17 @@ pub(super) fn ffn(
             ),
         ));
     }
-    if slots != c.p.slots(d.router.used()) {
+    let used = d.router.map_or(0, |r| r.used());
+    if slots != c.p.slots(used) {
         return Err(GpuError::shape(
             WHAT_FFN,
             format!(
                 "layer {}: the arena is cut for {slots} slots a token, the plan routes {}",
                 c.layer,
-                c.p.slots(d.router.used())
+                c.p.slots(used)
             ),
         ));
     }
-    let q35 = k.q35(WHAT_FFN)?;
     let Arena {
         x,
         normed,
@@ -523,28 +534,44 @@ pub(super) fn ffn(
         normed,
     )?;
     gpu.enqueue_quantize_gemm(normed, m, &mut wd.act_hid, c.sink)?;
-    q35.router.enqueue_ubatch(
-        stream,
-        f32_tensor(w, &n.ffn_gate_inp)?,
-        normed,
-        m,
-        c.sink,
-        route.gated(WHAT_FFN)?,
-    )?;
+    let Wide {
+        act_hid,
+        act_h,
+        up,
+        dense,
+        moe,
+        ..
+    } = wd;
+    let (table, input): (&GemmRoute, GemmInput) = match &n.route {
+        FfnRoute::Router { gate_inp, .. } => {
+            k.q35(WHAT_FFN)?.router.enqueue_ubatch(
+                stream,
+                f32_tensor(w, gate_inp)?,
+                normed,
+                m,
+                c.sink,
+                route.gated(WHAT_FFN)?,
+            )?;
+            let moe = moe.as_mut().ok_or(GpuError::state(
+                WHAT_FFN,
+                "the wide part's expert table (a routed chain's)",
+            ))?;
+            k.gemm
+                .enqueue_route(stream, route.ids(), m * slots, moe, c.sink)?;
+            (moe, GemmInput::Shared { top_k: slots })
+        }
+        FfnRoute::Dense => (dense, GemmInput::PerSlot),
+    };
+    gemm(c, (Kq::Q4K, &n.gate), d.ff, act_hid, table, input, h)?;
+    gemm(c, (Kq::Q4K, &n.up), d.ff, act_hid, table, input, up)?;
     k.gemm
-        .enqueue_route(stream, route.ids(), m * slots, &mut wd.moe, c.sink)?;
-    let shared = GemmInput::Shared { top_k: slots };
-    let (a, t) = (&wd.act_hid, &wd.moe);
-    gemm(c, (Kq::Q4K, &n.ffn_gate_exps), d.ff, a, t, shared, h)?;
-    gemm(c, (Kq::Q4K, &n.ffn_up_exps), d.ff, a, t, shared, &mut wd.up)?;
-    k.gemm
-        .enqueue_swiglu_quant(stream, h, &wd.up, m * slots, &mut wd.act_h, c.sink)?;
+        .enqueue_swiglu_quant(stream, h, up, m * slots, act_h, c.sink)?;
     gemm(
         c,
-        (n.down_ty, &n.ffn_down_exps),
+        (n.down_ty, &n.down),
         d.hidden,
-        &wd.act_h,
-        &wd.moe,
+        act_h,
+        table,
         GemmInput::PerSlot,
         down,
     )?;

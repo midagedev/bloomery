@@ -15,9 +15,11 @@
 //! live key count.
 
 use super::router::{MAX_TOKENS, RouterDims, RouterOut};
+use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
 use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
+use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
 use crate::rope_table::{Direction, RopeTable};
 use crate::tensor::{Q8Act, window};
@@ -191,10 +193,12 @@ pub(super) struct Dims {
     /// Rows the query projection writes a token: `n_head · head`, twice that
     /// when it writes a gate beside each head's query.
     pub(super) q_rows: usize,
+    /// A routed expert's values, or a dense FFN's.
     pub(super) ff: usize,
     /// The router's instance and the experts a token keeps, from the file's
-    /// routed shape.
-    pub(super) router: RouterDims,
+    /// routed shape; `None` for a chain of dense FFNs, whose one slot a token
+    /// is the arena's fixed route ([`Route::Dense`]).
+    pub(super) router: Option<RouterDims>,
     /// The delta layers' head counts; `None` when the chain has none.
     pub(super) lin: Option<LinearShape>,
     pub(super) ctx: usize,
@@ -218,7 +222,7 @@ impl Dims {
             head: HEAD,
             q_rows: n_head * HEAD,
             ff,
-            router,
+            router: Some(router),
             lin: None,
             ctx,
         }
@@ -235,9 +239,26 @@ impl Dims {
     }
 
     /// Expert slots a token takes: the routed ones, plus a folded shared
-    /// expert's.
+    /// expert's; a dense FFN's one.
     pub(super) fn slots(&self) -> usize {
-        self.router.slots()
+        self.router.map_or(1, |r| r.slots())
+    }
+
+    /// The router's dims, or a named refusal on a chain of dense FFNs: what a
+    /// routed op takes.
+    pub(super) fn routed(&self, what: &'static str) -> Result<RouterDims, GpuError> {
+        self.router.ok_or(GpuError::state(
+            what,
+            "a router (this chain's FFNs are dense)",
+        ))
+    }
+
+    /// The most tokens a ubatch may hold: the router's
+    /// ([`RouterDims::ubatch`]), or for a dense chain at most [`UBATCH`] and
+    /// one slot each in one GEMM route table.
+    pub(super) fn ubatch_most(&self) -> usize {
+        self.router
+            .map_or(UBATCH.min(GEMM_MAX_SLOTS), |r| r.ubatch())
     }
 }
 
@@ -330,11 +351,32 @@ pub(super) struct Arena {
     pub(super) wide: Option<Wide>,
 }
 
-/// Where a router launch leaves its results: the plain router's `k` slots a
-/// token, or the gated router's `k + 1` (the shared expert's last).
+/// Where the FFN's slots come from: a router launch's results — the plain
+/// router's `k` slots a token, or the gated router's `k + 1` (the shared
+/// expert's last) — or a dense chain's fixed route.
 pub(super) enum Route {
     Plain(RouterOut),
     Gated(RouterOut),
+    Dense(DenseRoute),
+}
+
+/// A dense FFN's slots: token `t`'s one slot is slot `t`, on expert 0 of the
+/// one-expert stacks at weight 1, written once at load and never again. So
+/// the routed launches after the router run a dense FFN as they run a routed
+/// one, and the combine's `1·down + resid` is `down + resid` exactly.
+pub(super) struct DenseRoute {
+    ids: DeviceBuffer<u32>,
+    weights: DeviceBuffer<f32>,
+}
+
+impl DenseRoute {
+    /// The route of `rows` tokens. Load-time only.
+    fn new(stream: &CudaStream, rows: usize) -> Result<DenseRoute, GpuError> {
+        Ok(DenseRoute {
+            ids: DeviceBuffer::zeroed(stream, rows)?,
+            weights: DeviceBuffer::from_host(stream, &vec![1.0f32; rows])?,
+        })
+    }
 }
 
 impl Route {
@@ -343,6 +385,7 @@ impl Route {
         match self {
             Route::Plain(r) => &r.ids,
             Route::Gated(r) => &r.ids,
+            Route::Dense(r) => &r.ids,
         }
     }
 
@@ -351,6 +394,7 @@ impl Route {
         match self {
             Route::Plain(r) => &r.weights,
             Route::Gated(r) => &r.weights,
+            Route::Dense(r) => &r.weights,
         }
     }
 
@@ -358,7 +402,9 @@ impl Route {
     pub(super) fn plain(&mut self, what: &'static str) -> Result<&mut RouterOut, GpuError> {
         match self {
             Route::Plain(r) => Ok(r),
-            Route::Gated(_) => Err(GpuError::state(what, "the plain router's buffers")),
+            Route::Gated(_) | Route::Dense(_) => {
+                Err(GpuError::state(what, "the plain router's buffers"))
+            }
         }
     }
 
@@ -366,7 +412,9 @@ impl Route {
     pub(super) fn gated(&mut self, what: &'static str) -> Result<&mut RouterOut, GpuError> {
         match self {
             Route::Gated(r) => Ok(r),
-            Route::Plain(_) => Err(GpuError::state(what, "the gated router's buffers")),
+            Route::Plain(_) | Route::Dense(_) => {
+                Err(GpuError::state(what, "the gated router's buffers"))
+            }
         }
     }
 
@@ -374,6 +422,7 @@ impl Route {
         match self {
             Route::Plain(r) => r.bytes(),
             Route::Gated(r) => r.bytes(),
+            Route::Dense(r) => r.ids.num_bytes() + r.weights.num_bytes(),
         }
     }
 }
@@ -679,15 +728,20 @@ impl Arena {
         };
         let x = f(rows * d.hidden)?;
         let qkv = f(rows * (q_len + 2 * kv_len))?;
-        let bufs = if rows > MAX_TOKENS {
-            RouterOut::for_ubatch(stream, d.router, rows)?
-        } else {
-            RouterOut::with_tokens(stream, d.router, rows)?
-        };
-        let route = if d.router.gated() {
-            Route::Gated(bufs)
-        } else {
-            Route::Plain(bufs)
+        let route = match d.router {
+            None => Route::Dense(DenseRoute::new(stream, rows)?),
+            Some(r) => {
+                let bufs = if rows > MAX_TOKENS {
+                    RouterOut::for_ubatch(stream, r, rows)?
+                } else {
+                    RouterOut::with_tokens(stream, r, rows)?
+                };
+                if r.gated() {
+                    Route::Gated(bufs)
+                } else {
+                    Route::Plain(bufs)
+                }
+            }
         };
         let part_v = if d.head == HEAD_256 {
             partials_v_len_256(narrow, d.n_head, d.ctx)

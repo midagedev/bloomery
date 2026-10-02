@@ -1,9 +1,11 @@
-//! Every `<architecture>.*` key the description reads, and each layer's kind
-//! from the tensors it carries. Required keys are llama.cpp's required set; a
-//! key it reads as optional keeps its reading of the absence, and every
-//! default taken is recorded ([`Hparams::defaults`]) with the line that sets
-//! it. The qwen4exp keys ([`Exp`]) are read for that variant only, and its
-//! tensors are checked against its layers' kinds ([`Hparams::read`]).
+//! Every `<architecture>.*` key the description reads, and each layer's mixer
+//! and feed-forward kind from the tensors it carries. Required keys are
+//! llama.cpp's required set; a key it reads as optional keeps its reading of
+//! the absence, and every default taken is recorded ([`Hparams::defaults`])
+//! with the line that sets it. The expert keys are read when a layer routes,
+//! the dense width when a layer is dense. The qwen4exp keys ([`Exp`]) are read
+//! for that variant only, and its tensors are checked against its layers'
+//! kinds ([`Hparams::read`]).
 
 use gguf::{Split, Value};
 
@@ -23,6 +25,10 @@ const MAX_PLE_HEADS: usize = 64;
 pub enum Variant {
     /// `qwen35moe`: Qwen3.5/3.6.
     Qwen35Moe,
+    /// `qwen35`: the dense Qwen3.5 trunk — qwen35moe's layers with a SwiGLU
+    /// FFN of `feed_forward_length` in place of the routed experts
+    /// (qwen35.cpp:470-480).
+    Qwen35,
     /// `qwen4exp`: Qwen3.8-Flash-Next — gated-residual hyper-connections and no
     /// block norm, a sigmoid GDN output gate, a mean-pool selector on the
     /// attention layers, a PLE site.
@@ -35,6 +41,7 @@ impl Variant {
     fn router_lines(self) -> &'static str {
         match self {
             Variant::Qwen35Moe => "qwen35moe.cpp:499-508",
+            Variant::Qwen35 => "qwen35.cpp, which routes no layer",
             Variant::Qwen4Exp => "qwen4exp.cpp:992-1001",
         }
     }
@@ -43,7 +50,18 @@ impl Variant {
     fn interval_lines(self) -> &'static str {
         match self {
             Variant::Qwen35Moe => "qwen35moe.cpp:21-25",
+            Variant::Qwen35 => "qwen35.cpp:18-24",
             Variant::Qwen4Exp => "qwen4exp.cpp:128-134",
+        }
+    }
+
+    /// The feed-forward kind every layer of the variant has: llama.cpp's
+    /// builder asserts a router on every qwen35moe and qwen4exp layer and none
+    /// on a qwen35 one (qwen35moe.cpp:496, qwen35.cpp:472).
+    fn ffn(self) -> FfnKind {
+        match self {
+            Variant::Qwen35Moe | Variant::Qwen4Exp => FfnKind::Routed,
+            Variant::Qwen35 => FfnKind::Dense,
         }
     }
 }
@@ -55,6 +73,15 @@ pub enum Kind {
     DeltaRule,
     /// `attn_q`: a gated GQA layer.
     Attention,
+}
+
+/// What a trunk layer's feed-forward block is, from the tensors it carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfnKind {
+    /// `ffn_gate_inp`: routed experts.
+    Routed,
+    /// `ffn_gate`: one SwiGLU block of `feed_forward_length`.
+    Dense,
 }
 
 /// The keys only a qwen4exp file carries.
@@ -130,14 +157,18 @@ pub struct Hparams {
     pub n_vocab: usize,
     /// `context_length`.
     pub n_ctx_train: usize,
-    /// `expert_count`.
+    /// `expert_count`; 0 on a file no layer of which routes (no expert key is
+    /// read there).
     pub n_expert: usize,
-    /// `expert_used_count`.
+    /// `expert_used_count`; 0 where `n_expert` is.
     pub n_used: usize,
-    /// `expert_feed_forward_length`.
+    /// `expert_feed_forward_length`; 0 where `n_expert` is.
     pub expert_ff: usize,
     /// `expert_shared_feed_forward_length`; `None` when the file has no shared expert.
     pub shared_ff: Option<usize>,
+    /// `feed_forward_length`, the dense layers' width; `None` on a file no
+    /// layer of which is dense (the key is not read there).
+    pub ff: Option<usize>,
     /// `ssm.conv_kernel`.
     pub conv: usize,
     /// `ssm.state_size`: values per key and value head.
@@ -150,6 +181,8 @@ pub struct Hparams {
     pub interval: usize,
     /// Every layer's kind, in order.
     pub kinds: Vec<Kind>,
+    /// Every layer's feed-forward kind, in order.
+    pub ffns: Vec<FfnKind>,
     /// `Some` for a qwen4exp file, `None` for a qwen35moe one.
     pub exp: Option<Exp>,
     /// The keys this read took a default for: the key, the value, the line.
@@ -260,31 +293,42 @@ impl Hparams {
             return Err(metadata(split, "full_attention_interval", "is 0"));
         }
         let kinds = kinds(split, n_layer, interval)?;
-        let n_expert = meta_usize(split, "expert_count")?;
-        let n_used = meta_usize(split, "expert_used_count")?;
-        if n_expert == 0 || n_used == 0 || n_used > n_expert {
-            return Err(metadata(
-                split,
-                "expert_used_count",
-                format!("is {n_used} of expert_count {n_expert}"),
-            ));
-        }
-        let expert_ff = expert_ff(split)?;
-        refuse_unless(split, "expert_gating_func", |v| v.as_u64() == Some(SOFTMAX))?;
-        refuse_unless(split, "expert_weights_norm", |v| v.as_bool() == Some(true))?;
-        refuse_unless(split, "expert_weights_scale", |v| v.as_f32() == Some(1.0))?;
-        for (key, value) in [
-            ("expert_gating_func", "softmax"),
-            ("expert_weights_norm", "true"),
-            ("expert_weights_scale", "1"),
-        ] {
-            if split.value(&split.arch_key(key)).is_none() {
-                defaults.push(format!("{key} = {value} ({})", variant.router_lines()));
+        let ffns = ffn_kinds(split, n_layer, variant)?;
+        let (n_expert, n_used, expert_ff) = if ffns.contains(&FfnKind::Routed) {
+            let n_expert = meta_usize(split, "expert_count")?;
+            let n_used = meta_usize(split, "expert_used_count")?;
+            if n_expert == 0 || n_used == 0 || n_used > n_expert {
+                return Err(metadata(
+                    split,
+                    "expert_used_count",
+                    format!("is {n_used} of expert_count {n_expert}"),
+                ));
             }
-        }
+            let expert_ff = expert_ff(split)?;
+            refuse_unless(split, "expert_gating_func", |v| v.as_u64() == Some(SOFTMAX))?;
+            refuse_unless(split, "expert_weights_norm", |v| v.as_bool() == Some(true))?;
+            refuse_unless(split, "expert_weights_scale", |v| v.as_f32() == Some(1.0))?;
+            for (key, value) in [
+                ("expert_gating_func", "softmax"),
+                ("expert_weights_norm", "true"),
+                ("expert_weights_scale", "1"),
+            ] {
+                if split.value(&split.arch_key(key)).is_none() {
+                    defaults.push(format!("{key} = {value} ({})", variant.router_lines()));
+                }
+            }
+            (n_expert, n_used, expert_ff)
+        } else {
+            (0, 0, 0)
+        };
+        let ff = if ffns.contains(&FfnKind::Dense) {
+            Some(dense_ff(split)?)
+        } else {
+            None
+        };
         let n_vocab = n_vocab(split)?;
         let exp = match variant {
-            Variant::Qwen35Moe => None,
+            Variant::Qwen35Moe | Variant::Qwen35 => None,
             Variant::Qwen4Exp => Some(exp(split, n_embd, n_vocab, &kinds, &mut defaults)?),
         };
         let hp = Hparams {
@@ -304,12 +348,14 @@ impl Hparams {
             n_used,
             expert_ff,
             shared_ff: optional_usize(split, "expert_shared_feed_forward_length")?,
+            ff,
             conv,
             state,
             v_heads,
             k_heads,
             interval,
             kinds,
+            ffns,
             exp,
             defaults,
         };
@@ -339,6 +385,70 @@ pub(super) fn expert_ff(split: &Split) -> Result<usize, PlacementError> {
         0 => Err(metadata(split, key, "is 0")),
         v => Ok(v),
     }
+}
+
+/// `feed_forward_length`, one width for every dense layer: a per-layer array
+/// (llama.cpp's `get_key_or_arr`) is refused by name, as 0 is.
+fn dense_ff(split: &Split) -> Result<usize, PlacementError> {
+    let key = "feed_forward_length";
+    if let Some(Value::Array(items)) = split.value(&split.arch_key(key)) {
+        return Err(metadata(
+            split,
+            key,
+            format!(
+                "is a per-layer array of {} values; this reader reads one dense width",
+                items.len()
+            ),
+        ));
+    }
+    match meta_usize(split, key)? {
+        0 => Err(metadata(split, key, "is 0")),
+        v => Ok(v),
+    }
+}
+
+/// Every layer's feed-forward kind from its tensors — `ffn_gate_inp` routes,
+/// `ffn_gate` is dense, exactly one of the two — held to the kind `variant`'s
+/// builder asserts on every layer ([`Variant::ffn`]); the first layer that
+/// disagrees is refused by name.
+fn ffn_kinds(
+    split: &Split,
+    n_layer: usize,
+    variant: Variant,
+) -> Result<Vec<FfnKind>, PlacementError> {
+    (0..n_layer)
+        .map(|l| {
+            let router = format!("blk.{l}.ffn_gate_inp.weight");
+            let gate = format!("blk.{l}.ffn_gate.weight");
+            let kind = match (split.find(&router).is_some(), split.find(&gate).is_some()) {
+                (true, false) => FfnKind::Routed,
+                (false, true) => FfnKind::Dense,
+                (both, _) => {
+                    return Err(PlacementError::Tensor {
+                        name: gate,
+                        detail: format!(
+                            "is {} the file, and so is {router}: layer {l} needs exactly one",
+                            if both { "in" } else { "not in" }
+                        ),
+                    });
+                }
+            };
+            if kind != variant.ffn() {
+                let found = match kind {
+                    FfnKind::Routed => router,
+                    FfnKind::Dense => gate,
+                };
+                return Err(PlacementError::Tensor {
+                    name: found,
+                    detail: format!(
+                        "makes layer {l} {kind:?}, and a {variant:?} file runs every layer {:?}",
+                        variant.ffn()
+                    ),
+                });
+            }
+            Ok(kind)
+        })
+        .collect()
 }
 
 /// The qwen4exp keys (qwen4exp.cpp:26-147), each required where that loader
@@ -831,8 +941,8 @@ pub(super) fn refuse_unless(
 #[cfg(test)]
 pub(super) mod tests {
     use super::{
-        ATTN_STEMS, EXP_LAYER_STEMS, EXP_MODEL_TENSORS, GDN_STEMS, Hparams, Kind, PLE_STEMS, Ple,
-        Variant,
+        ATTN_STEMS, EXP_LAYER_STEMS, EXP_MODEL_TENSORS, FfnKind, GDN_STEMS, Hparams, Kind,
+        NORM_STEMS, PLE_STEMS, Ple, Variant,
     };
     use crate::arch::synthetic::{V, header_shaped};
 
@@ -1098,6 +1208,7 @@ pub(super) mod tests {
                 Kind::Attention => "attn_q.weight",
             };
             t.push((format!("blk.{l}.{marker}"), vec![1]));
+            t.push((format!("blk.{l}.ffn_gate_inp.weight"), vec![1]));
         }
         t.push(("blk.0.hc_attn_norm.weight".to_string(), vec![1]));
         let path = header_shaped("q35-hc", "qwen35moe", &kv, &[], &t);
@@ -1108,6 +1219,142 @@ pub(super) mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(
             err.contains("1 tensors have no role: blk.0.hc_attn_norm.weight"),
+            "{err}"
+        );
+    }
+
+    /// The qwen35 keys: qwen35moe's trunk keys, no expert key, and the dense
+    /// width.
+    fn qwen35_keys() -> Vec<(&'static str, V)> {
+        keys()
+            .into_iter()
+            .filter(|(k, _)| {
+                !k.starts_with("hyper_connection.")
+                    && !k.starts_with("attention.indexer.")
+                    && !k.starts_with("ple.")
+                    && !k.starts_with("expert_")
+                    && !matches!(
+                        *k,
+                        "attention.compress_ratios" | "embedding_length_per_layer_input"
+                    )
+            })
+            .chain([("feed_forward_length", V::U32(48))])
+            .collect()
+    }
+
+    /// A qwen35 layer's tensors: its mixer's, the two block norms and the
+    /// dense FFN's three matrices.
+    fn qwen35_tensors() -> Vec<(String, Vec<u64>)> {
+        let mut t: Vec<(String, Vec<u64>)> =
+            ["token_embd.weight", "output_norm.weight", "output.weight"]
+                .iter()
+                .map(|n| ((*n).to_string(), vec![1]))
+                .collect();
+        for (l, kind) in KINDS.iter().enumerate() {
+            let mixer: &[&str] = match kind {
+                Kind::DeltaRule => GDN_STEMS,
+                Kind::Attention => &ATTN_STEMS[..6],
+            };
+            let stems = mixer.iter().chain(NORM_STEMS).chain(&[
+                "ffn_gate.weight",
+                "ffn_up.weight",
+                "ffn_down.weight",
+            ]);
+            // The query projection writes each of the 4 heads' 16 values and
+            // its gate beside them.
+            let dims = |s: &str| {
+                if s == "attn_q.weight" {
+                    vec![64, 128]
+                } else {
+                    vec![1]
+                }
+            };
+            t.extend(stems.map(|s| (format!("blk.{l}.{s}"), dims(s))));
+        }
+        t
+    }
+
+    /// A dense qwen35 header reads with every layer's FFN dense at
+    /// `feed_forward_length`, no expert key read, and its description gives
+    /// each layer `Ffn::Dense` and each FFN matrix the dense role.
+    #[test]
+    fn a_small_qwen35_header_reads_dense() {
+        let hp =
+            read("q35d-ok", "qwen35", &qwen35_keys(), &qwen35_tensors()).expect("the header reads");
+        assert_eq!(hp.variant, Variant::Qwen35);
+        assert_eq!(hp.kinds, KINDS);
+        assert_eq!(hp.ffns, [FfnKind::Dense; 4]);
+        assert_eq!(hp.ff, Some(48));
+        assert_eq!((hp.n_expert, hp.n_used, hp.expert_ff), (0, 0, 0));
+        assert!(hp.exp.is_none());
+        let path = header_shaped(
+            "q35d-spec",
+            "qwen35",
+            &qwen35_keys(),
+            &[("tokenizer.ggml.pre", V::Str("qwen35"))],
+            &qwen35_tensors(),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let read = crate::arch::spec(&split);
+        let _ = std::fs::remove_file(&path);
+        let read = read.expect("the description reads");
+        assert_eq!(read.spec.arch, models::Arch::Qwen35);
+        for l in &read.spec.layers {
+            assert_eq!(
+                l.ffn,
+                models::Ffn::Dense {
+                    ff: 48,
+                    act: models::Act::SwiGlu { limit: None }
+                }
+            );
+        }
+        let dense = read
+            .tensors
+            .tensors
+            .iter()
+            .filter(|t| t.role == crate::placement::Role::DenseFfn)
+            .count();
+        assert_eq!(dense, 3 * KINDS.len());
+    }
+
+    /// A qwen35 layer that routes is refused by name: the architecture's
+    /// builder asserts no router on any layer.
+    #[test]
+    fn a_routed_layer_in_a_qwen35_file_is_refused() {
+        let t: Vec<(String, Vec<u64>)> = qwen35_tensors()
+            .into_iter()
+            .map(|(n, d)| match n.as_str() {
+                "blk.2.ffn_gate.weight" => ("blk.2.ffn_gate_inp.weight".to_string(), d),
+                _ => (n, d),
+            })
+            .collect();
+        let err = read("q35d-route", "qwen35", &qwen35_keys(), &t).expect_err("refused");
+        assert!(
+            err.contains("blk.2.ffn_gate_inp.weight") && err.contains("Qwen35"),
+            "{err}"
+        );
+    }
+
+    /// A qwen35 layer with no FFN, and a per-layer dense width, are refused by
+    /// name.
+    #[test]
+    fn a_dense_layer_without_its_gate_or_width_is_refused() {
+        let t: Vec<(String, Vec<u64>)> = qwen35_tensors()
+            .into_iter()
+            .filter(|(n, _)| n != "blk.1.ffn_gate.weight")
+            .collect();
+        let err = read("q35d-gate", "qwen35", &qwen35_keys(), &t).expect_err("refused");
+        assert!(err.contains("blk.1.ffn_gate.weight"), "{err}");
+        let kv: Vec<(&str, V)> = qwen35_keys()
+            .into_iter()
+            .map(|(k, v)| match k {
+                "feed_forward_length" => (k, V::I32s(vec![48; 4])),
+                _ => (k, v),
+            })
+            .collect();
+        let err = read("q35d-ff", "qwen35", &kv, &qwen35_tensors()).expect_err("refused");
+        assert!(
+            err.contains("qwen35.feed_forward_length: is a per-layer array of 4 values"),
             "{err}"
         );
     }

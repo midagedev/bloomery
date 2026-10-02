@@ -6,7 +6,7 @@
 use super::dispatch;
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
-use super::plan::{GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan, MoePlan};
+use super::plan::{FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan};
 use super::prefill::Prefill;
 use super::proj::ProjKernels;
 use super::router::{RouterDims, RouterKernels, gated};
@@ -260,6 +260,7 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
     let e = hp.experts.n_expert;
     let mut g = GqaPlan {
         kind: GqaKind::Neox128,
+        flash: Flash::Group,
         attn_norm: names::attn_norm(l),
         attn_q: names::attn_q(l),
         attn_k: names::attn_k(l),
@@ -269,14 +270,17 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
         attn_output: names::attn_output(l),
         v_ty: Kq::Q4K,
     };
-    let mut f = MoePlan {
+    let router = names::ffn_gate_inp(l);
+    let mut f = FfnPlan {
         ffn_norm: names::ffn_norm(l),
-        ffn_gate_inp: names::ffn_gate_inp(l),
-        ffn_gate_exps: names::ffn_gate_exps(l),
-        ffn_up_exps: names::ffn_up_exps(l),
-        ffn_down_exps: names::ffn_down_exps(l),
+        route: FfnRoute::Router {
+            gate_inp: router.clone(),
+            shared: None,
+        },
+        gate: names::ffn_gate_exps(l),
+        up: names::ffn_up_exps(l),
+        down: names::ffn_down_exps(l),
         down_ty: Kq::Q4K,
-        shared: None,
     };
     for (name, len) in [
         (&g.attn_norm, h),
@@ -286,14 +290,14 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
     ] {
         f32_site(w, name, 1, len)?;
     }
-    f32_site(w, &f.ffn_gate_inp, e, h)?;
+    f32_site(w, &router, e, h)?;
     kq_site(w, &g.attn_q, q, h, &[Kq::Q4K])?;
     kq_site(w, &g.attn_k, kv, h, &[Kq::Q4K])?;
     g.v_ty = kq_site(w, &g.attn_v, kv, h, &[Kq::Q4K, Kq::Q6K])?;
     kq_site(w, &g.attn_output, h, q, &[Kq::Q4K])?;
-    kq_site(w, &f.ffn_gate_exps, e * ff, h, &[Kq::Q4K])?;
-    kq_site(w, &f.ffn_up_exps, e * ff, h, &[Kq::Q4K])?;
-    f.down_ty = kq_site(w, &f.ffn_down_exps, e * h, ff, &[Kq::Q4K, Kq::Q6K])?;
+    kq_site(w, &f.gate, e * ff, h, &[Kq::Q4K])?;
+    kq_site(w, &f.up, e * ff, h, &[Kq::Q4K])?;
+    f.down_ty = kq_site(w, &f.down, e * h, ff, &[Kq::Q4K, Kq::Q6K])?;
     Ok(LayerPlan {
         mixer: MixerPlan::Gqa(g),
         ffn: f,

@@ -505,6 +505,17 @@ dump-ref-qwen3moe-cuda:
 dump-ref-qwen35moe *VARIANT:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
+# The Qwen3.5 dense (qwen35, Clef's backbone) hidden-state oracle: hidden_ref linked against llama.cpp mainline's build
+# (tools/ref/build-hidden.sh), then llama.cpp's result_norm of every position of the first 64, 600 and 4,096 prose ids
+# into $BLOOMERY_DATA/ref_qwen35_hidden_p{64,600,4096}/ (refset family hidden-qwen35; tools/ref/hidden.sh). The dump
+# puts the whole 16.5 GB file on the card box.sh puts in view; no lease (a functional oracle). `--cpu-twin` writes each
+# set's CPU twin into <set>.cpu/ instead (no card, 16 threads): the oracle's own floor the gate's bands come from.
+build-ref-hidden:
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/build-hidden.sh'
+
+dump-hidden-qwen35 *SETS:
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/hidden.sh {{SETS}}'
+
 # GLM-5.3-Flash(glm5next) 오라클: 같은 덤프 도구를 glm5next 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
 # $BLOOMERY_DATA/ref_glm5next/에 뜬다. VARIANT(step4, d1k, d3kdsa, d16kdsa와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
 # 제 세트로 뜬다 — models/glm5next.sh. d1k는 $BLOOMERY_DATA/glm5next/corpus-prose.ids의 첫 1,025개 id를 읽는다(sha256 핀).
@@ -680,6 +691,19 @@ gate-gpu-qwen35moe-moe *ARGS:
 # step4·d1k 세트는 ik의 프리필 상태(cache_s·cache_k·cache_v)를 실어 한 스텝을 댄다.
 gate-gpu-qwen35moe-e2e:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
+
+# The Clef backbone (Qwen3.5 dense, qwen35) gate: the tensor-core decode flash refused at group 6, then the prompt
+# call's final-norm hidden states (Tail::Hidden) of the first 64, 600 and 4,096 prose ids, each from a reset as one
+# GEMM ubatch (the 64 also as eight passes: the gemv arm), against llama.cpp mainline's result_norm on the same file
+# (`just dump-hidden-qwen35`), every position within the derived band. Loads the 16.5 GB file twice (the refusal
+# uploads it first); fits either card.
+gate-gpu-clef-hidden:
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_hidden'
+
+# clef_hidden on the box (ARGS as its doc: --model, --ids, --out, ...): a qwen35 file's prompt-only pass, every
+# position's final-norm hidden state to a file and a `clef hidden` record with the call's functional wall.
+clef-hidden *ARGS:
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh clef_hidden {{ARGS}}'
 
 # Qwen3.8-Flash-Next (qwen4exp) whole-program gate on the 3090 (its plan's card): the step's node count, graph = eager =
 # one pass (logits and every store bit for bit), reset clears, every layer's streams on the batch set within the borrowed
@@ -1215,7 +1239,7 @@ gen-ds41 *ARGS:
 # (generate_ds41 --plan, placement (a), P 128/256/384/512/1536/4096/16384, CED on and off) into tools/flow/plans/:
 # P 1536 is weekly-gpu-ds41-flowcounts' three-batch arm, P 16384 the prefill headline's prompt. Loads nothing onto a card.
 records-refresh:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat --bin bloomery-serve-ds41 --bin bloomery-serve-qwen38 --bin gate_deepseek41_prefill >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin generate_glm5next >&2 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe --bin clef_hidden >&2 && for b in generate_ds41 bloomery-chat bloomery-serve-ds41 bloomery-serve-qwen38 gate_deepseek41_prefill generate_glm5next generate_qwen3moe clef_hidden; do target/release/$b --records-schema; done && for P in 128 256 384 512 1536 4096 16384; do for c in on off; do echo "#> tools/flow/plans/ds41-p$P-ced-$c.rec generate_ds41 --plan --depth $P --place a under BLOOMERY_CED=$c" && BLOOMERY_CED=$c target/release/generate_ds41 --plan --depth $P --place a; done; done' | python3 tools/bloomery/records.py refresh
 
 # The flow model's queue entries held to the engine's (3090, placement gate): generate_ds41 -n 2 under
 # BLOOMERY_STEP_STATS=1 prints its counter (`stat prefill front`, `stat prefill lb`), at --depth 512 once at the default

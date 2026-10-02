@@ -65,7 +65,7 @@ crates/refset/src/arch/qwen4exp/**	gate-ds41-bind gate-ds41-kld gate-ds41-load g
 crates/model/src/arch/**	*	arch::read runs the family reader of whatever model file a gate opens
 
 # crates/gpu's per-arch bodies: GpuModel<B> is generic; a body's impls run where B is that body.
-crates/gpu/src/arch/qwen3moe/**	gate-ds41-bind gate-gpu-e2e gate-gpu-gemm gate-gpu-glm5next-serve gate-gpu-qwen35moe-e2e gate-gpu-qwen35moe-moe gate-gpu-qwen38-residency gate-gpu-qwen38-serve gate-gpu-qwen38-twocard gate-gpu-qwen3moe-e2e gate-gpu-qwen3moe-experts gate-gpu-qwen3moe-head gate-gpu-qwen3moe-router gate-gpu-qwen4exp-e2e gate-gpu-qwen4exp-mtp	the Qwen3, Qwen3.5 and Qwen4 bodies: the bins that name them (the qwen gates, gate_gemm) and AnyEngine (gate_e2e; bind's tests build it under deepseek41)
+crates/gpu/src/arch/qwen3moe/**	gate-ds41-bind gate-gpu-clef-hidden gate-gpu-e2e gate-gpu-gemm gate-gpu-glm5next-serve gate-gpu-qwen35moe-e2e gate-gpu-qwen35moe-moe gate-gpu-qwen38-residency gate-gpu-qwen38-serve gate-gpu-qwen38-twocard gate-gpu-qwen3moe-e2e gate-gpu-qwen3moe-experts gate-gpu-qwen3moe-head gate-gpu-qwen3moe-router gate-gpu-qwen4exp-e2e gate-gpu-qwen4exp-mtp	the Qwen3, Qwen3.5 and Qwen4 bodies: the bins that name them (the qwen gates, gate_gemm) and AnyEngine (gate_e2e; bind's tests build it under deepseek41)
 crates/gpu/src/arch/deepseek2/**	gate-ds41-bind gate-gpu-e2e gate-gpu-hybrid gate-gpu-moe gate-gpu-p0b gate-gpu-p10 gate-gpu-p4 gate-gpu-p8 gate-gpu-p8b	the V2-Lite body: the V2-Lite GPU gates and AnyEngine (gate_e2e)
 
 # The weekly tier's triggers (`just weekly` runs every weekly-* recipe). A weekly-* name in a row is a trigger: a

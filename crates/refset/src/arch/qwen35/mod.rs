@@ -1,0 +1,104 @@
+//! The Qwen3.5 dense (Clef backbone) families. The hidden-state sets are
+//! llama.cpp mainline's `result_norm` of every position, written by
+//! `tools/ref/hidden_ref.cpp` in the node dumps' set format from the
+//! Q4_K_M file [`MODEL`] by the mainline tree [`LCPP_BUILD`]
+//! (`tools/ref/models/qwen35.sh`).
+
+use crate::family::{Build, Family, Identity};
+
+/// The file every qwen35 set is dumped from and the tree runs: Clef's text
+/// backbone through mainline's converter and `llama-quantize` Q4_K_M.
+pub const MODEL: &str = "/models/clef-27b/clef-27b-Q4_K_M.gguf";
+
+/// The mainline commit every qwen35 set names in its `# build` line.
+// PIN(2026-10-02): /home/user/llama.cpp-mainline at its HEAD, the tree that
+// converted and quantized MODEL and that hidden_ref links against.
+pub const LCPP_BUILD: &str = "53ed051ce";
+
+/// The architecture every qwen35 manifest names in its `# arch` line.
+pub const ARCH: &str = "qwen35";
+
+/// The first 64, 600 and 4,096 ids of the prose corpus under this
+/// vocabulary (`$BLOOMERY_DATA/qwen35/corpus-prose.ids`).
+pub const P64: &str = "ref_qwen35_hidden_p64";
+pub const P600: &str = "ref_qwen35_hidden_p600";
+pub const P4096: &str = "ref_qwen35_hidden_p4096";
+
+/// The sets, shortest first.
+pub const HIDDEN_SETS: &[&str] = &[P64, P600, P4096];
+
+/// [`MODEL`], as a family's `runs`.
+fn model() -> String {
+    MODEL.to_string()
+}
+
+/// llama.cpp mainline's final-norm hidden states.
+pub static HIDDEN: Family = Family {
+    name: "hidden-qwen35",
+    sets: HIDDEN_SETS,
+    resolve: None,
+    recipe: "just dump-hidden-qwen35",
+    identity: Identity::Manifest,
+    arch: Some(ARCH),
+    build: Some(Build::Is(LCPP_BUILD)),
+    runs: Some(model),
+    draft_runs: None,
+    consumers: &["gate-gpu-clef-hidden"],
+};
+
+/// The architecture's families, in the order `refset-check` lists them.
+pub static FAMILIES: &[&Family] = &[&HIDDEN];
+
+#[cfg(test)]
+mod tests {
+    use super::{ARCH, HIDDEN, LCPP_BUILD, MODEL};
+    use crate::RefError;
+    use std::path::Path;
+
+    /// A set of hidden_ref's shape at `dir` with these header lines.
+    fn write_set(dir: &Path, model: &str, build: &str, arch: &str, complete: bool) {
+        let mut lines = vec![
+            "# hidden_ref — llama.cpp mainline result_norm of every position".to_string(),
+            format!("# model\t{model}"),
+            format!("# build\t{build}"),
+            format!("# arch\t{arch}"),
+            "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1"
+                .to_string(),
+            "tensor\tresult_norm\t0\tf32\t1\t1\t1\t1\t4\t0\tRMS_NORM\t1\t0\t-\t-".to_string(),
+        ];
+        if complete {
+            lines.push("# complete\t1\t0".to_string());
+        }
+        let path = dir.join("MANIFEST.tsv");
+        std::fs::write(&path, lines.join("\n") + "\n")
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    }
+
+    /// The family takes a complete set of the Q4_K_M file, the pinned
+    /// mainline commit and this architecture, and refuses by name the BF16
+    /// file it was quantized from, an ik build, the MoE architecture, and a
+    /// set without its trailer.
+    #[test]
+    fn the_family_refuses_a_set_of_another_file_build_or_arch() -> Result<(), RefError> {
+        let dir =
+            std::env::temp_dir().join(format!("bloomery-refset-qwen35-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+        write_set(&dir, MODEL, LCPP_BUILD, ARCH, true);
+        let p = HIDDEN.check_set(&dir)?;
+        assert_eq!(p.dumped_from, MODEL);
+        let bf16 = "/models/clef-27b/clef-27b-bf16.gguf";
+        let cases = [
+            (bf16, LCPP_BUILD, ARCH, true, "dumped from"),
+            (MODEL, "db517b69", ARCH, true, "build"),
+            (MODEL, LCPP_BUILD, "qwen35moe", true, "arch"),
+            (MODEL, LCPP_BUILD, ARCH, false, "no `# complete` trailer"),
+        ];
+        for (model, build, arch, complete, want) in cases {
+            write_set(&dir, model, build, arch, complete);
+            let e = HIDDEN.check_set(&dir).expect_err("refused").to_string();
+            assert!(e.contains(want), "{model} {build} {arch} {complete}: {e}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

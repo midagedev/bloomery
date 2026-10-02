@@ -4,13 +4,16 @@
 //! A layer has no host leg, so its front is the whole layer
 //! ([`dispatch::layer`]) and its shadow and back are empty; its port
 //! ([`NoLeg`]) exchanges nothing and refuses by name a point the arena
-//! cannot hold. What follows the last layer is the walk's [`Tail`].
+//! cannot hold. What follows the last layer is the walk's [`Tail`]: a head,
+//! nothing, or the final norm of every row (a prompt call that returns
+//! hidden states).
 
 use super::body::{Kernels, TapRows};
 use super::dispatch::{self, Ctx, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, f32_view};
 use crate::head::Head;
+use crate::model::lookup::f32_gain;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
@@ -60,6 +63,10 @@ pub(super) enum Tail<'a> {
         head: &'a mut Head,
         state: &'a mut HeadArgmaxState,
     },
+    /// A prompt unit whose every row's final-norm hidden state is the output:
+    /// `output_norm` over the `m` rows of the arena's `x` into its `normed`
+    /// ([`enqueue_hidden`]); no head, no logits.
+    Hidden,
 }
 
 /// One walk of a qwen3moe chain: every layer at `m` rows over arena `s`
@@ -145,6 +152,7 @@ impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
             }
             Tail::Pass => Ok(()),
             Tail::Last { head, state } => enqueue_last(gpu, w, k, state, s, *m, head),
+            Tail::Hidden => enqueue_hidden(gpu, w, c.eps, s, *m),
         }
     }
 }
@@ -175,6 +183,35 @@ pub(super) fn enqueue_last(
     head.input_mut()
         .copy_from_device_async(&row, gpu.stream())?;
     dispatch::enqueue_head(gpu, w, k, state, head)
+}
+
+/// Enqueue the final norm of a unit of `m` rows over arena `s`: rows `0..m`
+/// of `x`, the last layer's output, RMS-normed by `output_norm.weight` with
+/// epsilon `eps` into rows `0..m` of `normed` — llama.cpp's `result_norm`
+/// for each row. A unit of no row, or of more rows than the arena holds, is
+/// refused by name.
+pub(super) fn enqueue_hidden(
+    gpu: &Gpu,
+    w: &Weights,
+    eps: f32,
+    s: &mut Arena,
+    m: usize,
+) -> Result<(), GpuError> {
+    if m == 0 || m > s.rows {
+        return Err(GpuError::shape(
+            "qwen3moe::enqueue_hidden",
+            format!("a unit of {m} rows on a {}-row arena", s.rows),
+        ));
+    }
+    gpu.elem().enqueue_rms_norm(
+        gpu.stream(),
+        &s.x,
+        f32_gain(w, "output_norm.weight")?,
+        eps,
+        s.dims.hidden,
+        m,
+        &mut s.normed,
+    )
 }
 
 /// The port of a chain with no host leg: it exchanges nothing, and opens

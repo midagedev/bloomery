@@ -65,6 +65,13 @@
 //! arithmetic is the `_256` pass's; the merge is `gqa_flash_merge_256`. They
 //! are instances of the PACK-generic copies `seg_scalar_p` and `seg_mma_p`.
 //!
+//! The `_p2` entry ([`FlashGqaKernels::enqueue_pass_256_p2`]) is the `_p4`
+//! scalar pass in blocks of [`PACK_2`] query heads — two warps — for a group
+//! that is a multiple of two and not of four (Qwen3.5-27B's 24/4): an
+//! instance of the same `seg_scalar_p`. The tensor-core body needs four warps
+//! a tile, so no `_p2` tensor-core pass exists and a call asking for one is
+//! refused by name.
+//!
 //! The `_p4_sel` entries ([`FlashGqaKernels::enqueue_pass_256_p4_sel`]) walk
 //! each row's own list of cache rows (a token-pool selector's, `qsa`) instead
 //! of the rows below its count: `seg_scalar_ps` and `seg_mma_ps`, copies of
@@ -941,6 +948,15 @@ const fn seg_blocks_hold<const PACK: usize>(
     seg_block::<PACK>(blocks, rows, nkv, packs, n_seg).is_none()
 }
 
+/// Query heads one block of the `_p2` entry takes
+/// ([`FlashGqaKernels::enqueue_pass_256_p2`]): a group of any even count of
+/// query heads per key head runs as `group / 2` blocks per key head.
+pub const PACK_2: usize = 2;
+const THREADS_P2: usize = PACK_2 * 32;
+const THREADS_P2_U32: u32 = THREADS_P2 as u32;
+// The `_p2` launch contract spells PACK_2 and its block out as 2 and 64.
+const _: () = assert!(PACK_2 == 2 && THREADS_P2_U32 == 64);
+
 // The block maps: at `GROUP` and `packs = 1` the map the eight-head passes
 // compute inline, and the `_p4` entries' packs of four at groups 4, 8 and 12
 // (Qwen3.8's 24/2), over several rows and segments.
@@ -949,6 +965,9 @@ const _: () =
     assert!(seg_blocks_hold::<PACK_4>(3, 2, 3, 4) && seg_blocks_hold::<PACK_4>(2, 3, 2, 3));
 const _: () =
     assert!(seg_blocks_hold::<PACK_4>(1, 2, 1, 5) && seg_blocks_hold::<PACK_4>(2, 1, 3, 7));
+// The `_p2` entry's packs of two at group 6 (Qwen3.5-27B's 24/4) and 2.
+const _: () =
+    assert!(seg_blocks_hold::<PACK_2>(3, 4, 3, 4) && seg_blocks_hold::<PACK_2>(2, 3, 1, 5));
 
 /// [`seg_scalar`] in blocks of `PACK` query heads — the `_256` entries keep
 /// their own body, and this PACK-generic copy serves the `_p4` entries. The
@@ -2762,6 +2781,75 @@ mod flash_gqa_kernels {
         };
     }
 
+    /// [`gqa_flash_seg_256`] in blocks of [`PACK_2`] query heads, `packs` of
+    /// them per key head (`seg_scalar_p` at `PACK_2`): block `b = ((seg·n_kv +
+    /// kh)·packs + p)·m + t`, warp `w` query head `(kh·packs + p)·2 + w`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(64)]
+    #[launch_contract(
+        domain = 1,
+        block = (64, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs * seg_keys >= ctx,
+            q.len() >= m * n_kv * packs * 2 * 256,
+            kc.len() >= n_kv * ctx * 256,
+            vc.len() >= n_kv * ctx * 256,
+            part_v.len() >= m * n_kv * packs * 2 * segs * 256,
+            part_ms.len() >= m * n_kv * packs * 2 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_256_p2(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        packs: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { PACK_2 * HEAD_256 }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE_256 }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS_256 }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { PACK_2 * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for HEAD_256 and PACK_2; the raw form reaches it
+        // without a reference. The launch contract is `seg_scalar_p`'s at
+        // HEAD_256 and `packs · PACK_2` heads per key head.
+        unsafe {
+            seg_scalar_p::<HEAD_256, QW_256, PACK_2>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                packs as usize,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
     /// [`gqa_flash_seg_mma_256`] in blocks of [`PACK_4`] query heads
     /// (`seg_mma_p` at `PACK_4`): the pack's heads are rows `0..4` of the 16-row query tile
     /// and all four warps take a tile's keys; the block map is
@@ -2994,6 +3082,24 @@ mod flash_gqa_kernels {
                 SharedArray::as_raw_mut_ptr(&raw mut WS),
             )
         };
+    }
+}
+
+/// The segment entry of a packed pass: the pack's scalar or tensor-core body.
+#[derive(Clone, Copy)]
+enum PackedSeg {
+    Scalar4,
+    Mma4,
+    Scalar2,
+}
+
+impl PackedSeg {
+    /// Query heads one block takes.
+    fn pack(self) -> usize {
+        match self {
+            PackedSeg::Scalar4 | PackedSeg::Mma4 => PACK_4,
+            PackedSeg::Scalar2 => PACK_2,
+        }
     }
 }
 
@@ -3233,7 +3339,46 @@ impl FlashGqaKernels {
         n_head: usize,
         mma: bool,
     ) -> Result<(), GpuError> {
-        let what = "flash_gqa::enqueue_256_p4";
+        let seg = if mma {
+            PackedSeg::Mma4
+        } else {
+            PackedSeg::Scalar4
+        };
+        self.pass_packed("flash_gqa::enqueue_256_p4", stream, args, n_head, seg)
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass_256_p4`]'s scalar pass in blocks of
+    /// [`PACK_2`]: `n_head` a nonzero multiple of `2 · n_kv` (refused by name
+    /// otherwise), `gqa_flash_seg_256_p2` (`m · n_head / 2 · segments_for(ctx)`
+    /// blocks of 64 threads) and `gqa_flash_merge_256`: two launches, the
+    /// refusals of `enqueue_pass_256`. Every row's bits are the `_256` scalar
+    /// pass's. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pass_256_p2(
+        &self,
+        stream: &CudaStream,
+        args: GqaArgs<'_>,
+        n_head: usize,
+    ) -> Result<(), GpuError> {
+        self.pass_packed(
+            "flash_gqa::enqueue_256_p2",
+            stream,
+            args,
+            n_head,
+            PackedSeg::Scalar2,
+        )
+    }
+
+    /// The packed passes' one body: the group refused unless a nonzero
+    /// multiple of `seg`'s pack, the buffers checked, then `seg`'s segment
+    /// entry and the merge.
+    fn pass_packed(
+        &self,
+        what: &'static str,
+        stream: &CudaStream,
+        args: GqaArgs<'_>,
+        n_head: usize,
+        seg: PackedSeg,
+    ) -> Result<(), GpuError> {
         let GqaArgs {
             q,
             kc,
@@ -3254,16 +3399,17 @@ impl FlashGqaKernels {
                 format!("need n_kv, ctx and m >= 1, got n_kv={n_kv} ctx={ctx} m={m}"),
             ));
         }
-        if n_head == 0 || !n_head.is_multiple_of(n_kv * PACK_4) {
+        let pack = seg.pack();
+        if n_head == 0 || !n_head.is_multiple_of(n_kv * pack) {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "the kernel packs {PACK_4} query heads a block, so the group must be a \
-                     multiple of {PACK_4}; got {n_head} heads over {n_kv}"
+                    "the kernel packs {pack} query heads a block, so the group must be a \
+                     multiple of {pack}; got {n_head} heads over {n_kv}"
                 ),
             ));
         }
-        let packs = n_head / (n_kv * PACK_4);
+        let packs = n_head / (n_kv * pack);
         let segs = segments_for(ctx);
         let lens = [
             ("q", q.len(), m * n_head * HEAD_256),
@@ -3289,19 +3435,31 @@ impl FlashGqaKernels {
         let segs = launch_u32(what, "segs", segs)?;
         let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
         let m = launch_u32(what, "m", m)?;
-        let cfg = LaunchConfig1D::new(grid, THREADS_P4_U32, 0);
-        if mma {
-            let prep = self.module.prepare_gqa_flash_seg_mma_256_p4(cfg)?;
-            self.module.gqa_flash_seg_mma_256_p4(
-                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, packs,
-                part_v, part_ms,
-            )?;
-        } else {
-            let prep = self.module.prepare_gqa_flash_seg_256_p4(cfg)?;
-            self.module.gqa_flash_seg_256_p4(
-                stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, packs,
-                part_v, part_ms,
-            )?;
+        match seg {
+            PackedSeg::Mma4 => {
+                let cfg = LaunchConfig1D::new(grid, THREADS_P4_U32, 0);
+                let prep = self.module.prepare_gqa_flash_seg_mma_256_p4(cfg)?;
+                self.module.gqa_flash_seg_mma_256_p4(
+                    stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, packs,
+                    part_v, part_ms,
+                )?;
+            }
+            PackedSeg::Scalar4 => {
+                let cfg = LaunchConfig1D::new(grid, THREADS_P4_U32, 0);
+                let prep = self.module.prepare_gqa_flash_seg_256_p4(cfg)?;
+                self.module.gqa_flash_seg_256_p4(
+                    stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, packs,
+                    part_v, part_ms,
+                )?;
+            }
+            PackedSeg::Scalar2 => {
+                let cfg = LaunchConfig1D::new(grid, THREADS_P2_U32, 0);
+                let prep = self.module.prepare_gqa_flash_seg_256_p2(cfg)?;
+                self.module.gqa_flash_seg_256_p2(
+                    stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, segs, seg_keys, m, packs,
+                    part_v, part_ms,
+                )?;
+            }
         }
         let prep = self
             .module

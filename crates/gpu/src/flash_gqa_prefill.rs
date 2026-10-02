@@ -78,10 +78,14 @@
 //! positions × four heads, and a key head's group is `group / 4` blocks; a
 //! row's bits are the eight-head kernel's for the same row. Its body is
 //! `prefill_256_p`, a PACK-generic copy of the eight-head kernel's.
+//! [`FlashGqaPrefill::enqueue_256_p2`] runs the same body in packs of two
+//! (`gqa_prefill_flash_256_p2`) for a group that is even and not a multiple of
+//! four (Qwen3.5-27B's 24/4): a block takes two heads of thirty-two positions,
+//! an m16 fragment eight positions × two heads.
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{dev_exp, f32x2_to_f16x2_bits};
-use crate::flash_gqa::{GROUP, HEAD, PACK_4};
+use crate::flash_gqa::{GROUP, HEAD, PACK_2, PACK_4};
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
@@ -481,12 +485,18 @@ const fn pack_rows_hold<const PACK: usize>() -> bool {
 
 const _: () = assert!(Q_OCT_PASSES_256 * Q_ROW_STEP_256 == 8);
 const _: () = assert!(q_oct_hold());
-// The `_p4` layout, and at `GROUP` the eight-head entry's staged rows.
-const _: () = assert!(pack_rows_hold::<GROUP>() && pack_rows_hold::<PACK_4>());
+// The `_p4` and `_p2` layouts, and at `GROUP` the eight-head entry's staged
+// rows.
+const _: () =
+    assert!(pack_rows_hold::<GROUP>() && pack_rows_hold::<PACK_4>() && pack_rows_hold::<PACK_2>());
 // The `_p4` instance of `prefill_256_p` (its generic const blocks run only
 // when the device build instantiates it, this one in every check).
 const _: () = assert!(
     SLICE_ROWS.is_multiple_of(PACK_4) && SLICES_256 * (SLICE_ROWS / PACK_4) == Q_ROWS_256 / PACK_4
+);
+// The `_p2` instance's, likewise.
+const _: () = assert!(
+    SLICE_ROWS.is_multiple_of(PACK_2) && SLICES_256 * (SLICE_ROWS / PACK_2) == Q_ROWS_256 / PACK_2
 );
 
 /// The attention of the module doc over heads of [`HEAD_256`] values, eight
@@ -2029,6 +2039,60 @@ mod flash_gqa_prefill_kernels {
             )
         };
     }
+
+    /// [`gqa_prefill_flash_256`] in blocks of [`PACK_2`] query heads, `packs`
+    /// of them per key head ([`prefill_256_p`] at `PACK_2`): a block is 32
+    /// positions × two heads, a row slice eight positions × two heads.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        dynamic_shared = 98304,
+        requires = (
+            n_keys_buf.len() >= t_rows,
+            q.len() >= t_rows * n_kv * packs * 2 * 256,
+            kc.len() >= n_kv * ctx * 256,
+            vc.len() >= n_kv * ctx * 256,
+            y.len() >= t_rows * n_kv * packs * 2 * 256
+        )
+    )]
+    pub fn gqa_prefill_flash_256_p2(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        t_rows: u32,
+        packs: u32,
+        fault: FaultSink,
+        y: DisjointSlice<f32>,
+    ) {
+        // SAFETY: the launch contract is `prefill_256_p`'s at `packs · PACK_2`
+        // heads per key head, and the block is THREADS_256 threads with
+        // DYN_BYTES_256 bytes of dynamic shared memory.
+        unsafe {
+            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                t_rows,
+                packs as usize,
+                fault,
+                y,
+            )
+        };
+    }
 }
 
 /// [`FlashGqaPrefill::enqueue`]'s arguments: `t` rows of `n_head` query heads
@@ -2248,7 +2312,31 @@ impl FlashGqaPrefill {
         stream: &CudaStream,
         args: GqaPrefillArgs<'_>,
     ) -> Result<(), GpuError> {
-        let what = "flash_gqa_prefill::enqueue_256_p4";
+        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p4", stream, args, PACK_4)
+    }
+
+    /// [`FlashGqaPrefill::enqueue_256_p4`] in blocks of [`PACK_2`]: `n_head` a
+    /// nonzero multiple of `2 · n_kv` (refused by name otherwise). One launch
+    /// of `⌈t / 32⌉ · n_head / 2` blocks of 256 threads with the same dynamic
+    /// shared memory. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_256_p2(
+        &self,
+        stream: &CudaStream,
+        args: GqaPrefillArgs<'_>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_packed("flash_gqa_prefill::enqueue_256_p2", stream, args, PACK_2)
+    }
+
+    /// The packed entries' one launcher: the group refused unless a nonzero
+    /// multiple of `pack` ([`PACK_4`] or [`PACK_2`]), the buffers and their
+    /// alignment checked, then that pack's entry.
+    fn enqueue_packed(
+        &self,
+        what: &'static str,
+        stream: &CudaStream,
+        args: GqaPrefillArgs<'_>,
+        pack: usize,
+    ) -> Result<(), GpuError> {
         let GqaPrefillArgs {
             q,
             kc,
@@ -2268,16 +2356,16 @@ impl FlashGqaPrefill {
                 format!("need n_kv, ctx and t >= 1, got n_kv={n_kv} ctx={ctx} t={t}"),
             ));
         }
-        if n_head == 0 || !n_head.is_multiple_of(n_kv * PACK_4) {
+        if n_head == 0 || !n_head.is_multiple_of(n_kv * pack) {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "the kernel packs {PACK_4} query heads a block, so the group must be a \
-                     multiple of {PACK_4}; got {n_head} heads over {n_kv}"
+                    "the kernel packs {pack} query heads a block, so the group must be a \
+                     multiple of {pack}; got {n_head} heads over {n_kv}"
                 ),
             ));
         }
-        let packs = n_head / (n_kv * PACK_4);
+        let packs = n_head / (n_kv * pack);
         let lens = [
             ("q", q.len(), t * n_head * HEAD_256),
             ("kc", kc.len(), n_kv * ctx * HEAD_256),
@@ -2313,21 +2401,32 @@ impl FlashGqaPrefill {
                 format!("ctx = {ctx}: the key walk counts to ctx + {KEY_TILE} in u32"),
             ));
         }
-        let grid = launch_u32(what, "grid", t.div_ceil(Q_ROWS_256 / PACK_4) * n_kv * packs)?;
+        let grid = launch_u32(what, "grid", t.div_ceil(Q_ROWS_256 / pack) * n_kv * packs)?;
         let packs = launch_u32(what, "packs", packs)?;
         let n_kv = launch_u32(what, "n_kv", n_kv)?;
         let ctx = launch_u32(what, "ctx", ctx)?;
         let t = launch_u32(what, "t", t)?;
-        let prep = self
-            .module
-            .prepare_gqa_prefill_flash_256_p4(LaunchConfig1D::new(
-                grid,
-                THREADS_256_U32,
-                DYN_BYTES_256_U32,
-            ))?;
-        self.module.gqa_prefill_flash_256_p4(
-            stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
-        )?;
+        let cfg = LaunchConfig1D::new(grid, THREADS_256_U32, DYN_BYTES_256_U32);
+        match pack {
+            PACK_2 => {
+                let prep = self.module.prepare_gqa_prefill_flash_256_p2(cfg)?;
+                self.module.gqa_prefill_flash_256_p2(
+                    stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
+                )?;
+            }
+            PACK_4 => {
+                let prep = self.module.prepare_gqa_prefill_flash_256_p4(cfg)?;
+                self.module.gqa_prefill_flash_256_p4(
+                    stream, &prep, q, kc, vc, n_keys, scale, n_kv, ctx, t, packs, fault, y,
+                )?;
+            }
+            _ => {
+                return Err(GpuError::shape(
+                    what,
+                    format!("no entry packs {pack} query heads a block"),
+                ));
+            }
+        }
         Ok(())
     }
 }

@@ -1,17 +1,18 @@
-//! The role of every tensor in a qwen35moe or qwen4exp file, by exact name:
-//! the model-level names, then the per-layer stems, one table per variant (a
-//! stem one variant carries is unclassified in the other). A name the table
-//! does not hold fails the file with every such name listed.
+//! The role of every tensor in a qwen35moe, qwen35 or qwen4exp file, by exact
+//! name: the model-level names, then the per-layer stems, one table per
+//! variant (a stem one variant carries is unclassified in the others; qwen35
+//! is qwen35moe's mixer and norm stems with a dense FFN's in place of the
+//! routed ones). A name the table does not hold fails the file with every
+//! such name listed.
 
 use gguf::Split;
 
 use super::hparams::{Hparams, Variant};
 use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
 
-/// The role of a qwen35moe stem: the GDN layers' mixer, the GQA layers'
-/// mixer, the post-attention (pre-FFN) norm, the router, the shared expert
-/// with its gate, the routed stacks.
-fn qwen35moe_role(stem: &str) -> Option<Role> {
+/// The role of a stem qwen35moe and qwen35 share: the GDN layers' mixer, the
+/// GQA layers' mixer, the post-attention (pre-FFN) norm.
+fn trunk_role(stem: &str) -> Option<Role> {
     match stem {
         "attn_norm.weight" | "attn_qkv.weight" | "attn_gate.weight" | "ssm_conv1d.weight"
         | "ssm_dt.bias" | "ssm_a" | "ssm_alpha.weight" | "ssm_beta.weight" | "ssm_norm.weight"
@@ -20,6 +21,14 @@ fn qwen35moe_role(stem: &str) -> Option<Role> {
             Some(Role::Attention)
         }
         "post_attention_norm.weight" => Some(Role::FfnNorm),
+        _ => None,
+    }
+}
+
+/// The role of a qwen35moe stem: the trunk's ([`trunk_role`]), the router,
+/// the shared expert with its gate, the routed stacks.
+fn qwen35moe_role(stem: &str) -> Option<Role> {
+    match stem {
         "ffn_gate_inp.weight" => Some(Role::Router),
         "ffn_gate_inp_shexp.weight"
         | "ffn_gate_shexp.weight"
@@ -28,7 +37,16 @@ fn qwen35moe_role(stem: &str) -> Option<Role> {
         "ffn_gate_exps.weight" | "ffn_up_exps.weight" | "ffn_down_exps.weight" => {
             Some(Role::RoutedExperts)
         }
-        _ => None,
+        _ => trunk_role(stem),
+    }
+}
+
+/// The role of a qwen35 stem: the trunk's ([`trunk_role`]) and the dense
+/// FFN's three matrices.
+fn qwen35_role(stem: &str) -> Option<Role> {
+    match stem {
+        "ffn_gate.weight" | "ffn_up.weight" | "ffn_down.weight" => Some(Role::DenseFfn),
+        _ => trunk_role(stem),
     }
 }
 
@@ -102,10 +120,10 @@ fn role(name: &str, hp: &Hparams) -> Option<(Role, Option<usize>)> {
     }
     let (layer, stem) = name.strip_prefix("blk.")?.split_once('.')?;
     let layer: usize = layer.parse().ok().filter(|&l| l < hp.n_layer)?;
-    let role = if exp {
-        qwen4exp_role(stem)
-    } else {
-        qwen35moe_role(stem)
+    let role = match hp.variant {
+        Variant::Qwen35Moe => qwen35moe_role(stem),
+        Variant::Qwen35 => qwen35_role(stem),
+        Variant::Qwen4Exp => qwen4exp_role(stem),
     };
     role.map(|r| (r, Some(layer)))
 }

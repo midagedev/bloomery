@@ -1,0 +1,3 @@
+{"records":1,"bin":"clef_hidden","kinds":2}
+{"kind":"clef_hidden","head":"clef hidden","doc":"The prompt call's final-norm hidden states: positions fed, the model's width, the f32 bytes written, and the call's wall from the ids' upload to the last row's readback.","parts":[{"key":"n","ty":"u64","unit":"positions"},{"key":"width","ty":"u64","unit":""},{"key":"bytes","ty":"u64","unit":"B"},{"key":"ms","ty":"f64.1","unit":"ms"},{"key":"tok/s","ty":"f64.1","unit":"tok/s"}]}
+{"kind":"clef_rows","head":"clef rows","doc":"The output embedding's rows for the given ids, dequantized on the host: ids read, the width, and the f32 bytes written.","parts":[{"key":"ids","ty":"u64","unit":""},{"key":"width","ty":"u64","unit":""},{"key":"bytes","ty":"u64","unit":"B"}]}

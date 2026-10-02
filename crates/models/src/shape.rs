@@ -478,6 +478,12 @@ pub const GQA: &[GqaInst] = &[
         group: GroupRule::Packs,
         at: "gpu/src/flash_gqa.rs PACK_4 (the _256_p4 entries)",
     },
+    GqaInst {
+        head: 256,
+        pack: 2,
+        group: GroupRule::Packs,
+        at: "gpu/src/flash_gqa.rs PACK_2 (the _256_p2 entries, scalar pass only)",
+    },
 ];
 
 /// The first GQA row, in [`GQA`]'s order, built for `s.head` that takes its
@@ -702,13 +708,15 @@ mod tests {
     }
 
     /// Qwen3 32/4 × 128 (qwen3moe_meta.rs:409), Qwen3.6 16/2 × 256
-    /// (qwen35moe_meta.rs:34), Qwen3.8 24/2 × 256 (q38gqa, 9e5b716).
+    /// (qwen35moe_meta.rs:34), Qwen3.8 24/2 × 256 (q38gqa, 9e5b716),
+    /// Qwen3.5-27B 24/4 × 256 (the Clef backbone's config).
     #[test]
     fn every_attention_the_tree_runs_selects_its_flash() {
         for (name, s, head, pack, packs) in [
             ("Qwen3", attn(32, 4, 128), 128, 8, 1),
             ("Qwen3.6", attn(16, 2, 256), 256, 8, 1),
             ("Qwen3.8", attn(24, 2, 256), 256, 4, 3),
+            ("Qwen3.5-27B", attn(24, 4, 256), 256, 2, 3),
         ] {
             let row = select_gqa(s).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!((row.head, row.pack), (head, pack), "{name}");
@@ -736,8 +744,8 @@ mod tests {
         for s in [attn(24, 5, 256), attn(24, 0, 256), attn(0, 2, 256)] {
             assert_eq!(select_gqa(s).expect_err("ungrouped").why, Refusal::Group);
         }
-        let e = select_gqa(attn(12, 2, 256)).expect_err("group 6");
-        assert!(e.to_string().contains("group 6"), "{e}");
+        let e = select_gqa(attn(24, 8, 256)).expect_err("group 3");
+        assert!(e.to_string().contains("group 3"), "{e}");
     }
 
     #[test]

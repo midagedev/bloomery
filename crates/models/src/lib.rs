@@ -54,6 +54,8 @@ pub enum Arch {
     Deepseek4,
     Qwen3Moe,
     Qwen35Moe,
+    /// Qwen3.5's dense trunk: the qwen35moe layers with a dense FFN.
+    Qwen35,
     Qwen4Exp,
     Glm5Next,
 }
@@ -67,6 +69,7 @@ impl Arch {
             Arch::Deepseek4 => "deepseek4",
             Arch::Qwen3Moe => "qwen3moe",
             Arch::Qwen35Moe => "qwen35moe",
+            Arch::Qwen35 => "qwen35",
             Arch::Qwen4Exp => "qwen4exp",
             Arch::Glm5Next => "glm5next",
         }

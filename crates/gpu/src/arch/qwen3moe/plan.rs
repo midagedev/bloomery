@@ -3,21 +3,25 @@
 //! name, the quantization of each mixed site, the kernels' shape — so the
 //! enqueue reads names and never decides a layer's kind. One layer body
 //! (`dispatch::layer`) runs every plan: the mixer is a `match` on
-//! [`MixerPlan`], the shared expert an `Option` of [`MoePlan`].
+//! [`MixerPlan`], how a token's FFN slots are picked a `match` on
+//! [`FfnRoute`].
 //!
 //! Qwen3-30B-A3B's layers are all [`MixerPlan::Gqa`] at head 128 with no
 //! shared expert. Qwen3.6-35B-A3B interleaves [`MixerPlan::Delta`] (gated
 //! delta rule) with gated GQA at head 256, each followed by 256 routed
 //! experts and a sigmoid-gated shared expert folded in as one more slot of
-//! joined stacks. A Qwen3.6 layer's kind comes from its [`LayerSpec`] — the
-//! file's tensors, cross-checked with its interval key by the reader —
-//! never from the layer's number.
+//! joined stacks. Qwen3.5-27B has the same mixers and a dense SwiGLU FFN,
+//! which runs as a stack of one expert, every token's one slot on it at
+//! weight 1 ([`FfnRoute::Dense`]): the routed FFN's launches without the
+//! router. A layer's kind comes from its [`LayerSpec`] — the file's tensors,
+//! cross-checked with its interval key by the reader — never from the
+//! layer's number.
 
 use super::router::RouterDims;
 use crate::GpuError;
 use crate::linear::{self, LinearShape};
 use model::arch::coverage::turns_as_neox;
-use model::arch::models::shape::MoeShape;
+use model::arch::models::shape::{AttnShape, GroupRule, MoeShape, select_gqa};
 use model::arch::models::{
     Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe,
 };
@@ -34,7 +38,7 @@ pub(super) enum Kq {
 /// One layer's plan.
 pub(super) struct LayerPlan {
     pub(super) mixer: MixerPlan,
-    pub(super) ffn: MoePlan,
+    pub(super) ffn: FfnPlan,
 }
 
 /// What a layer mixes its tokens with.
@@ -56,9 +60,25 @@ pub(super) enum GqaKind {
     Gated256,
 }
 
+/// How the head-256 flash entries cover a key head's group of query heads:
+/// the shape table's row (`models::shape::GQA`) the layer selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Flash {
+    /// One block of eight query heads a key head (the `_256` entries; and
+    /// the head-128 entries' only form).
+    Group,
+    /// Blocks of four query heads, `group / 4` a key head (the `_256_p4`
+    /// entries): the scalar and the tensor-core segment pass.
+    Quads,
+    /// Blocks of two query heads, `group / 2` a key head (the `_256_p2`
+    /// entries): the scalar segment pass only.
+    Pairs,
+}
+
 /// A GQA layer's names, types and geometry.
 pub(super) struct GqaPlan {
     pub(super) kind: GqaKind,
+    pub(super) flash: Flash,
     pub(super) attn_norm: String,
     pub(super) attn_q: String,
     pub(super) attn_k: String,
@@ -91,18 +111,31 @@ pub(super) struct DeltaPlan {
     pub(super) shape: LinearShape,
 }
 
-/// A routed FFN's names and types.
-pub(super) struct MoePlan {
+/// An FFN's names and types: the three stacks every slot reads (a routed
+/// layer's experts, or a dense layer's matrices as one expert) and how a
+/// token's slots are picked.
+pub(super) struct FfnPlan {
     pub(super) ffn_norm: String,
-    /// The router weight: the file's, or the joined one with the shared
-    /// expert's gate as its last row.
-    pub(super) ffn_gate_inp: String,
-    pub(super) ffn_gate_exps: String,
-    pub(super) ffn_up_exps: String,
-    pub(super) ffn_down_exps: String,
+    pub(super) route: FfnRoute,
+    pub(super) gate: String,
+    pub(super) up: String,
+    pub(super) down: String,
     pub(super) down_ty: Kq,
-    /// The shared expert, when the stacks above are the joined ones.
-    pub(super) shared: Option<SharedPlan>,
+}
+
+/// How a token's FFN slots are picked.
+pub(super) enum FfnRoute {
+    /// By the router.
+    Router {
+        /// The router weight: the file's, or the joined one with the shared
+        /// expert's gate as its last row.
+        gate_inp: String,
+        /// The shared expert, when the stacks are the joined ones.
+        shared: Option<SharedPlan>,
+    },
+    /// A dense FFN: one slot a token, on expert 0 of the one-expert stacks,
+    /// at weight 1 — the arena's fixed dense route (`scratch::Route::Dense`).
+    Dense,
 }
 
 /// A shared expert folded into the routed stacks as their last expert (id
@@ -124,31 +157,36 @@ impl LayerPlan {
         }
     }
 
-    /// Slots a token takes in the routed FFN: the routed ones, plus one for
-    /// a folded shared expert.
+    /// Slots a token takes in the FFN: the routed ones, plus one for a
+    /// folded shared expert; a dense FFN's one.
     pub(super) fn slots(&self, n_used: usize) -> usize {
-        n_used + usize::from(self.ffn.shared.is_some())
+        match &self.ffn.route {
+            FfnRoute::Router { shared, .. } => n_used + usize::from(shared.is_some()),
+            FfnRoute::Dense => 1,
+        }
     }
 }
 
-/// A Qwen3.6 layer's mixer kind, from its description.
+/// A Body35 layer's mixer kind, from its description.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Kind35 {
-    Gqa,
+    Gqa(Flash),
     Delta(LinearShape),
 }
 
-/// The Qwen3.6 geometry the chain's kernels are built for: 16/2 query/key
-/// heads of 256, 64 values turned, 16/32 delta heads of 128 with a 4-tap
-/// conv, and experts of 512 with a sigmoid-gated shared expert of 512. The
-/// routed experts' count and the experts a token keeps are the router
-/// instance's the file's shape selects ([`RouterDims::of`]).
+/// The geometry the chain's kernels are built for: query heads of 256 with
+/// 64 values turned, in groups the shape table's head-256 rows of eight or
+/// of pairs take; delta heads of 128 with a 4-tap conv; experts of 512 with
+/// a sigmoid-gated shared expert of 512, or a dense FFN of whole K-quant
+/// super-blocks. The routed experts' count and the experts a token keeps are
+/// the router instance's the file's shape selects ([`RouterDims::of`]); the
+/// head counts are the file's.
 pub(super) mod q35 {
-    pub(in super::super) const HEADS: u32 = 16;
-    pub(in super::super) const KV_HEADS: u32 = 2;
     pub(in super::super) const HEAD_DIM: u32 = 256;
     pub(in super::super) const ROPE_DIMS: u32 = 64;
     pub(in super::super) const EXPERT_FF: u32 = 512;
+    /// Values of a K-quant super-block: a dense width's unit.
+    pub(in super::super) const SUPER_BLOCK: u32 = 256;
 }
 
 /// Layer `l`'s mixer kind from its description `s`, checked against the
@@ -158,10 +196,7 @@ pub(super) fn kind35(s: &LayerSpec, l: usize) -> Result<Kind35, GpuError> {
     const WHAT: &str = "qwen35moe plan";
     let refuse = |d: String| GpuError::shape(WHAT, format!("layer {l}: {d}"));
     let kind = match &s.mixer {
-        Mixer::Gqa(g) => {
-            gqa_fits(g).map_err(refuse)?;
-            Kind35::Gqa
-        }
+        Mixer::Gqa(g) => Kind35::Gqa(gqa_fits(g).map_err(refuse)?),
         Mixer::DeltaRule(d) => Kind35::Delta(delta_shape(d).map_err(refuse)?),
         Mixer::Latent(_) => {
             return Err(refuse(
@@ -173,7 +208,7 @@ pub(super) fn kind35(s: &LayerSpec, l: usize) -> Result<Kind35, GpuError> {
         Ffn::Moe(m) => {
             moe_fits(m).map_err(refuse)?;
         }
-        Ffn::Dense { .. } => return Err(refuse("a dense FFN, which no kernel here runs".into())),
+        Ffn::Dense { ff, act } => dense_fits(*ff, *act).map_err(refuse)?,
     }
     Ok(kind)
 }
@@ -187,26 +222,49 @@ pub(super) fn kinds35(layers: &[LayerSpec]) -> Result<Vec<Kind35>, GpuError> {
         .collect()
 }
 
-/// Ok when `g` is the gated attention the head-256 kernels run.
-fn gqa_fits(g: &Gqa) -> Result<(), String> {
-    use q35::{HEAD_DIM, HEADS, KV_HEADS, ROPE_DIMS};
+/// The flash of `g` when it is the gated attention the head-256 kernels run:
+/// the shape table's row for its group ([`select_gqa`]), one of eight or of
+/// pairs.
+fn gqa_fits(g: &Gqa) -> Result<Flash, String> {
+    use q35::{HEAD_DIM, ROPE_DIMS};
     let rope_ok = turns_as_neox(g.rope.mode, g.rope.dims);
-    let fits = g.heads == HEADS
-        && g.kv_heads == KV_HEADS
-        && g.head_dim == HEAD_DIM
+    let fits = g.head_dim == HEAD_DIM
         && g.rope.dims == ROPE_DIMS
         && g.rope.yarn.is_none()
         && rope_ok
         && g.qk_norm
         && g.out_gate
         && g.select.is_none();
-    if fits {
+    if !fits {
+        return Err(format!(
+            "attention {g:?}; the kernels take heads of {HEAD_DIM}, the first {ROPE_DIMS} values \
+             turned by NEOX (IMROPE sections covering them), q/k norms, the output gate and no \
+             key selection"
+        ));
+    }
+    let row = select_gqa(AttnShape::of(g)).map_err(|e| e.to_string())?;
+    match (row.pack, row.group) {
+        (8, GroupRule::One) => Ok(Flash::Group),
+        (4, GroupRule::Packs) => Ok(Flash::Quads),
+        (2, GroupRule::Packs) => Ok(Flash::Pairs),
+        _ => Err(format!(
+            "attention {}/{} heads selects {}, which this body does not launch",
+            g.heads, g.kv_heads, row.at
+        )),
+    }
+}
+
+/// Ok when a dense FFN of `ff` values with `act` is the one the body runs:
+/// SwiGLU with no limit through the routed launches at one slot (Q4_K gate
+/// and up, the `_sel` down), `ff` whole K-quant super-blocks.
+fn dense_fits(ff: u32, act: Act) -> Result<(), String> {
+    if ff > 0 && ff.is_multiple_of(q35::SUPER_BLOCK) && matches!(act, Act::SwiGlu { limit: None }) {
         Ok(())
     } else {
         Err(format!(
-            "attention {g:?}; the kernels take {HEADS}/{KV_HEADS} heads of {HEAD_DIM}, the first \
-             {ROPE_DIMS} values turned by NEOX (IMROPE sections covering them), q/k norms, the \
-             output gate and no key selection"
+            "a dense FFN of {ff} values with {act:?}; the body runs SwiGLU without a limit over \
+             whole super-blocks of {}",
+            q35::SUPER_BLOCK
         ))
     }
 }
@@ -271,17 +329,22 @@ pub(super) fn moe_fits(m: &Moe) -> Result<RouterDims, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind35, kinds35, q35};
+    use super::{Flash, Kind35, kinds35, q35};
     use crate::linear::{KHeadMap as LinearMap, LinearShape};
     use model::arch::models::{
         Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, Residual,
         Rope, RopeMode, Router, Score, Shared,
     };
 
+    /// Qwen3.6's 16/2 heads.
     fn gqa() -> Mixer {
+        gqa_of(16, 2)
+    }
+
+    fn gqa_of(heads: u32, kv_heads: u32) -> Mixer {
         Mixer::Gqa(Gqa {
-            heads: q35::HEADS,
-            kv_heads: q35::KV_HEADS,
+            heads,
+            kv_heads,
             head_dim: q35::HEAD_DIM,
             rope: Rope {
                 mode: RopeMode::Imrope {
@@ -355,7 +418,7 @@ mod tests {
         let want: Vec<Kind35> = (0..8)
             .map(|l| {
                 if attn.contains(&l) {
-                    Kind35::Gqa
+                    Kind35::Gqa(Flash::Group)
                 } else {
                     Kind35::Delta(shape)
                 }
@@ -403,6 +466,50 @@ mod tests {
         }
         for (at, bad) in [(1usize, narrow), (2, bare)] {
             let mut layers = vec![layer(delta()), layer(delta()), layer(delta())];
+            layers[at] = bad;
+            match kinds35(&layers) {
+                Err(e) => assert!(e.to_string().contains(&format!("layer {at}:")), "{e}"),
+                Ok(k) => panic!("layer {at} accepted: {k:?}"),
+            }
+        }
+    }
+
+    /// Qwen3.5-27B's layers run: 24/4 heads take the pairs flash, 16/48
+    /// delta heads the delta shape, and a dense FFN of 17408 the one-slot
+    /// route; a group the body launches no flash for (12, the `_p4` row's) and
+    /// a dense width of no whole super-block are refused by name.
+    #[test]
+    fn a_dense_qwen35_layer_runs_and_its_misfits_are_refused() {
+        let dense = |mixer: Mixer, ff: u32| LayerSpec {
+            ffn: Ffn::Dense {
+                ff,
+                act: Act::SwiGlu { limit: None },
+            },
+            ..layer(mixer)
+        };
+        let wide = Mixer::DeltaRule(DeltaRule {
+            kind: DeltaKind::Gdn {
+                khead_map: KHeadMap::Tiled,
+                gate: GdnGate::Silu,
+            },
+            k_heads: 16,
+            v_heads: 48,
+            d: 128,
+            conv: 4,
+        });
+        let got = kinds35(&[dense(wide.clone(), 17408), dense(gqa_of(24, 4), 17408)])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let shape = LinearShape {
+            n_k: 16,
+            n_v: 48,
+            map: LinearMap::Tiled,
+        };
+        assert_eq!(got, [Kind35::Delta(shape), Kind35::Gqa(Flash::Pairs)]);
+        for (at, bad) in [
+            (0usize, dense(gqa_of(24, 2), 17408)),
+            (1, dense(wide, 17400)),
+        ] {
+            let mut layers = vec![dense(gqa_of(24, 4), 17408), dense(gqa_of(24, 4), 17408)];
             layers[at] = bad;
             match kinds35(&layers) {
                 Err(e) => assert!(e.to_string().contains(&format!("layer {at}:")), "{e}"),
