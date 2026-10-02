@@ -38,6 +38,14 @@ pub const D2_UNFUSED: &str = "ref_deepseek41_d2_unfused_every_node";
 /// equal results names the set read first.
 pub const STEP_SETS: &[&str] = &[STEP4, D1N, D1, D1_UNFUSED, D2, D2_UNFUSED];
 
+/// The deepest context our numbers are held to ik's at: [`D2`]'s decode step
+/// at position 1,025, which reads 1,026 positions. ik builds no candidate
+/// mask, so past 16,384 positions no ik set can hold ours; there the mask is
+/// held to the reference's rule (`gate_deepseek41_chain_attn`'s candidate
+/// clause, `weekly-gpu-ds41-cand`). A load prints it beside the context it
+/// serves; it does not bound that context.
+pub const VERIFIED_POSITIONS: u64 = 1026;
+
 /// ik's node dumps: the batch set and the decode-step sets. Each name
 /// resolves to the set dumped from the file the tree runs
 /// ([`gguf::v41::set`]).

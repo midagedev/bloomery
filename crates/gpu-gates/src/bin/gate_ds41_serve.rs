@@ -13,7 +13,8 @@
 //!   shards, bytes on disk and counts as the header states them; a card
 //!   `GPU<n>` and the host `CPU`, each device's `bytes` the sum of its classes
 //!   and equal to the plan's card (dense + experts) and host (experts +
-//!   tables) bytes; the cards' KV bytes; no draft;
+//!   tables) bytes; the cards' KV bytes; `ctx_verified` the deepest reference
+//!   set's (`refset::arch::deepseek41::VERIFIED_POSITIONS`); no draft;
 //! - `/completion` of `--prompt` at temperature 0 with `return_tokens`: its
 //!   ids are `generate_ds41 --tokens <--ids> -n 16`'s `tokens` line — all 16,
 //!   or a prefix ending in the end-of-generation id when the server stopped
@@ -161,6 +162,7 @@ mod gate {
     use model::arch::deepseek41::place::{self, PlanInputs};
     use model::arch::deepseek41::plan::Planner;
     use model::placement::{PlanLevers, workstation};
+    use refset::arch::deepseek41::VERIFIED_POSITIONS;
     use serde_json::{Value, json};
 
     use crate::dspark;
@@ -959,6 +961,11 @@ mod gate {
             &mut ok,
             "props_engine_vram_kv",
             e["placement"]["vram_kv_bytes"] == json!(kv),
+        );
+        check(
+            &mut ok,
+            "props_engine_ctx_verified",
+            e["ctx_verified"] == json!(VERIFIED_POSITIONS),
         );
         check(&mut ok, "props_engine_no_draft", e.get("draft").is_none());
         Ok(ok)

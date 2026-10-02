@@ -33,7 +33,9 @@
 //!
 //! The server serves `--ctx` positions: `/props`' `n_ctx` is that number, a
 //! prompt that long is a 400 before it reaches the engine, and generation
-//! stops there with `truncated`.
+//! stops there with `truncated`. `/props`' `engine.ctx_verified` is the
+//! deepest context the reference sets hold our numbers to ik's at
+//! (`refset::arch::deepseek41::VERIFIED_POSITIONS`), which bounds nothing.
 //!
 //! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
 //! holds the body's saved sequence states in host RAM. Its default is the
@@ -116,6 +118,7 @@ use model::arch::deepseek41::place::PlanInputs;
 use model::arch::dspark::DraftHparams;
 use model::placement::workstation::{self, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
+use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::{Committed, Lookup, Speculative, Target, Want};
 use serve::{
     CacheNote, DeviceProps, DraftProps, Drafted, EngineProps, FATAL_LINGER, PlacementProps,
@@ -267,6 +270,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let props = EngineProps {
         model: Some(model),
         placement,
+        ctx_verified: Some(VERIFIED_POSITIONS),
         ..EngineProps::default()
     };
     let open = SeatArgs {
