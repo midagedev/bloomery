@@ -117,7 +117,7 @@ mod gate {
         print_plan(&path, &plan);
 
         let card = &plan.machine.cards[0];
-        let probe = Gpu::for_card(&card.name).map_err(|e| {
+        let probe = Gpu::open_card(&card.name, card.device).map_err(|e| {
             format!(
                 "refusing before any upload: card {} is not here: {e}",
                 card.name

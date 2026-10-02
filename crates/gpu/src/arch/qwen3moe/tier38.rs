@@ -539,7 +539,7 @@ pub(super) fn open_tier(
             ),
         ));
     }
-    let gpu = Gpu::for_card(&t.name)?;
+    let gpu = Gpu::open_card(&t.name, t.device)?;
     let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
     let set = TierSet::of_map(map, tier)?;
     let experts = Tier38::new(&gpu, &w, stacks, &set, layers, block)?;

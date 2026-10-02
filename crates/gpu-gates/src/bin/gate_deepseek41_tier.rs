@@ -616,9 +616,11 @@ mod gate {
             levers: cfg.body,
         };
         let card = machine.cards[0].name.clone();
+        let device = machine.cards[0].device;
         let tier_open = || TierOpen {
             card: TIER_DEVICE,
             name: card.clone(),
+            device,
         };
         let tmachine = tier_machine(&machine, &inputs.hp)?;
         let tplan = tiered(&plan, &tmachine, K3, false)?;

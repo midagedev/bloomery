@@ -295,9 +295,9 @@ mod cli {
     use model::arch::Arch;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, PlanInputs, machine_bp, machine_for_experts, serve_ctx, tier_batch,
+        Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
     };
-    use model::placement::workstation::{A6000, CardSpec, RTX_3090};
+    use model::placement::workstation::{self, CardSpec};
     use model::placement::{Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
@@ -719,59 +719,79 @@ mod cli {
         .into()
     }
 
-    /// Where `--place` puts a qwen4exp plan's stage card, and its expert
-    /// tier card when it has one.
+    /// Which placement `--place` names.
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Place38 {
-        /// The A6000, the timing card (the default).
+    enum Kind38 {
+        /// The stage on the largest visible card (the A6000 here, the timing
+        /// card; the default).
         A,
         /// The 3090, the gate card.
         Gate,
-        /// Plan (b′): the A6000 as under `a`, the 3090 its expert tier
-        /// (`place::machine_bp`).
+        /// Plan (b′): the stage as under `a`, the next-largest card its
+        /// expert tier (`place::machine_bp_on`).
         Bp,
+    }
+
+    /// Where `--place` puts a qwen4exp plan's stage card, and its expert
+    /// tier card when it has one: the kind, and the cards its alias resolved
+    /// to on this process's devices (`workstation::resolve` of the census).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct Place38 {
+        kind: Kind38,
+        stage: CardSpec,
+        tier: Option<CardSpec>,
     }
 
     impl Place38 {
         fn parse(arg: Option<&str>) -> Result<Place38, GateError> {
-            match arg {
-                None | Some("a") => Ok(Place38::A),
-                Some("gate") => Ok(Place38::Gate),
-                Some("bp") => Ok(Place38::Bp),
-                Some(o) => Err(format!(
-                    "--place is a, gate or bp (plan (b′): the 3090 as the A6000's expert tier), \
-                     not {o}"
-                )
-                .into()),
-            }
+            let (kind, word) = match arg {
+                None | Some("a") => (Kind38::A, "a"),
+                Some("gate") => (Kind38::Gate, "gate"),
+                Some("bp") => (Kind38::Bp, "bp"),
+                Some(o) => {
+                    return Err(format!(
+                        "--place is a, gate or bp (plan (b′): the next-largest card as the \
+                         largest's expert tier), not {o}"
+                    )
+                    .into());
+                }
+            };
+            let (_, picks) = workstation::ALIASES
+                .iter()
+                .find(|(w, _)| *w == word)
+                .ok_or_else(|| format!("--place {word}: no alias of that word"))?;
+            let specs = workstation::resolve(picks, &bloomery_gpu::census()?)
+                .map_err(|e| format!("--place {word}: {e}"))?;
+            Ok(Place38 {
+                kind,
+                stage: specs[0],
+                tier: specs.get(1).copied(),
+            })
         }
 
         fn name(self) -> &'static str {
-            match self {
-                Place38::A => "a",
-                Place38::Gate => "gate",
-                Place38::Bp => "bp",
+            match self.kind {
+                Kind38::A => "a",
+                Kind38::Gate => "gate",
+                Kind38::Bp => "bp",
             }
         }
 
         /// The stage card's spec.
         fn card(self) -> CardSpec {
-            match self {
-                Place38::A | Place38::Bp => A6000,
-                Place38::Gate => RTX_3090,
-            }
+            self.stage
         }
 
         /// The stage card is the A6000: the placement the Qwen3.8 defaults
         /// (residency, the MTP draft, host streaming) treat as plan (a).
         fn stage_a(self) -> bool {
-            matches!(self, Place38::A | Place38::Bp)
+            matches!(self.kind, Kind38::A | Kind38::Bp)
         }
 
         /// The machine a plan of `inputs` at ubatches of `ub` positions
         /// under `experts` runs on; `draft` the MTP draft's card bytes when
         /// the draft runs beside the target, which plan (b′) reserves on its
-        /// stage card (`place::machine_bp`) and the one-card plans count in
+        /// stage card (`place::machine_bp_on`) and the one-card plans count in
         /// `plan_mtp_with` instead.
         fn machine(
             self,
@@ -781,15 +801,22 @@ mod cli {
             draft: Option<u64>,
         ) -> Machine {
             let layers = inputs.spec.layers.len();
-            match self {
-                Place38::A | Place38::Gate => machine_for_experts(self.card(), layers, ub, experts),
-                Place38::Bp => machine_bp(layers, ub, draft, tier_batch(&inputs.hp, ub)),
+            match (self.kind, self.tier) {
+                (Kind38::Bp, Some(tier)) => machine_bp_on(
+                    (self.stage, tier),
+                    layers,
+                    ub,
+                    draft,
+                    tier_batch(&inputs.hp, ub),
+                ),
+                _ => machine_for_experts(self.card(), layers, ub, experts),
             }
         }
     }
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage
-    /// card's experts, and the tier card's when the plan has one.
+    /// card's experts, the tier card's when the plan has one, and each plan
+    /// card's device (`record::plan_devices`).
     fn plan38_line(place: Place38, experts: Experts, plan: &Plan<'_>) -> String {
         let r = Record::new(&record::PLAN38)
             .w("place", place.name())
@@ -798,13 +825,15 @@ mod cli {
             .u("ctx_max", plan.ctx_max)
             .u("host_experts", plan.host.experts)
             .u("card_experts", plan.cards[0].experts);
-        match (plan.machine.tiers.first(), plan.tier_n_l.first()) {
+        let r = match (plan.machine.tiers.first(), plan.tier_n_l.first()) {
             (Some(t), Some(n)) => r
                 .w("tier", &t.name)
-                .u("tier_experts", n.iter().sum::<u64>())
-                .line(),
-            _ => r.line(),
-        }
+                .u("tier_experts", n.iter().sum::<u64>()),
+            _ => r,
+        };
+        r.csv("devices", record::plan_devices(plan.machine))
+            .w("cuda_order", record::cuda_order())
+            .line()
     }
 
     /// One pass of `rows` ids on the Qwen3.6 model: the argmax after the last.
@@ -1682,9 +1711,9 @@ mod cli {
         })?;
         let mtp = MtpInputs::read(&draft_split, &file, &inputs, rows)?;
         let ctx_max = u64::try_from(ctx)?;
-        let reserve = match place {
-            Place38::Bp => Some(mtp.card_bytes(ctx_max)?),
-            Place38::A | Place38::Gate => None,
+        let reserve = match place.kind {
+            Kind38::Bp => Some(mtp.card_bytes(ctx_max)?),
+            Kind38::A | Kind38::Gate => None,
         };
         let machine = place.machine(&inputs, u64::try_from(ub)?, experts, reserve);
         let plan = inputs.plan_mtp_with(

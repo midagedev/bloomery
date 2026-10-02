@@ -562,8 +562,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// ([`HostResidency::at_load`]), so that no step takes the first touch of
     /// a host expert page; `host` also says whether
     /// the card segments' file pages are released once uploaded. The caches hold the plan's `ctx_max` rows, the
-    /// context its budget was made for. The card is found by its name in the
-    /// plan ([`Gpu::for_card`]), never by ordinal. A load under adaptive
+    /// context its budget was made for. The card opens on the device the plan
+    /// resolved it to, or by its name on a census-free plan
+    /// ([`Gpu::open_card`]), never by an ordinal from outside the process. A load under adaptive
     /// residency goes through [`GpuModel::load_placed_with`], which hands the
     /// body the file as one `Arc` the machine's source shares.
     pub fn load_placed(
@@ -1253,7 +1254,7 @@ impl<B: ChainBody> GpuModel<B> {
 /// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
 /// bytes) beside it. The pieces, and the host set. Every placed load passes
 /// here, so the two refusals before any upload are made once: a plan's card
-/// that is not one visible device ([`workstation::card_on_host`]), and a
+/// that is not one visible device ([`Gpu::open_card`]), and a
 /// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
 fn placed_pre(
     file: &Split,
@@ -1276,7 +1277,7 @@ fn placed_pre(
     let layers = spec.layers.clone();
     let (extra, extra_bytes) = extra;
     let t = Instant::now();
-    let gpu = Gpu::for_card(&spec.name).map_err(|e| card_refusal(what, &spec.name, e))?;
+    let gpu = Gpu::open_card(&spec.name, spec.device)?;
     let context = t.elapsed();
     let available = workstation::host_available().map_err(|e| GpuError::plan(what, e))?;
     HostNeed::of(plan, extra_bytes)
@@ -1310,24 +1311,6 @@ fn placed_pre(
         },
         residency,
     ))
-}
-
-/// [`Gpu::for_card`]'s error `e` for the plan's card `name`, as the host
-/// shows it: the visible devices and the placement that fits them
-/// ([`workstation::card_on_host`]). When the devices cannot be listed, or
-/// exactly one is named like the card, the error is `e` itself.
-fn card_refusal(what: &'static str, name: &str, e: GpuError) -> GpuError {
-    let seen = (|| -> Result<Vec<String>, GpuError> {
-        let n = usize::try_from(cuda_core::Device::device_count()?)
-            .map_err(|_| GpuError::shape(what, "negative device count"))?;
-        (0..n)
-            .map(|o| crate::raw_device_name(cuda_core::Device::raw_device(o)?))
-            .collect()
-    })();
-    match seen.map(|seen| workstation::card_on_host(name, &seen)) {
-        Ok(Err(r)) => GpuError::plan(what, r),
-        Ok(Ok(_)) | Err(_) => e,
-    }
 }
 
 /// The placed load after its body, which took `built`: the output head the

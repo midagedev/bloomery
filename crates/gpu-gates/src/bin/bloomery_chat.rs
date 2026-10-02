@@ -225,6 +225,7 @@ mod drive {
         if a.n_gen == 0 {
             return Err("-n wants at least one generated token".into());
         }
+        a.place = a.place.on_host()?;
         Ok(a)
     }
 

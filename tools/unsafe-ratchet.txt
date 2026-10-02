@@ -51,7 +51,10 @@ gguf 9 2 0
 # embed_rows_q5k and embed_rows_q6k (one each) over embed_rows_sb (five: the ids, pos0, pos/n_keys, value and y
 # reaches), the EmbedSb trait's value with its Q5_K and Q6_K bodies (one each) and stream_byte (one), each with its
 # SAFETY line.
-gpu 1424 151 6
+# PIN(2026-10-02): gpu 1424 -> 1427 blocks, new code, not old code relaxed: the device census (lib.rs `census`) asks
+# the driver for each device's total memory, PCI bus id and UUID without a context, one call each, each with its
+# SAFETY line.
+gpu 1427 151 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

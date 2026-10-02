@@ -105,20 +105,11 @@ impl Open for Body {
 }
 
 /// The expert tier cards `machine` names, as the body opens them, in tier
-/// order: each card's index in [`Machine::all_cards`] (after the one stage
-/// card) and its name, by which the card is found. Empty without a tier; the
-/// body refuses more than the host tier serves by name, before any upload.
+/// order ([`TierOpen::of_machine`]). Empty without a tier; the body refuses
+/// more than the host tier serves by name, before any upload.
 #[must_use]
 pub fn tier_of(machine: &Machine) -> Vec<TierOpen> {
-    machine
-        .tiers
-        .iter()
-        .enumerate()
-        .map(|(i, t)| TierOpen {
-            card: machine.cards.len() + i,
-            name: t.name.clone(),
-        })
-        .collect()
+    TierOpen::of_machine(machine)
 }
 
 impl Prompt for Body {

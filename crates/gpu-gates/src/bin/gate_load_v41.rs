@@ -4,8 +4,8 @@
 //!
 //! The plan is built from `model::placement::workstation`, the figures gate ①
 //! plans from. Before any upload every plan card is found by name
-//! (`Gpu::for_card` — never by ordinal: `BLOOMERY_CARD=both` exposes the 3090
-//! first) and must have free, once its context exists, the bytes the plan puts
+//! (`Gpu::open_card` of a census-free plan's card — never by ordinal:
+//! `BLOOMERY_CARD=both` exposes the 3090 first) and must have free, once its context exists, the bytes the plan puts
 //! on it besides the context; a missing card or a short one refuses the run.
 //! Then, per card in stage order:
 //!
@@ -334,7 +334,7 @@ mod gate {
         let mut out = Vec::with_capacity(plan.cards.len());
         let mut short = Vec::new();
         for (card, t) in plan.machine.all_cards().zip(&plan.cards) {
-            let gpu = Gpu::for_card(&card.name).map_err(|e| {
+            let gpu = Gpu::open_card(&card.name, card.device).map_err(|e| {
                 format!(
                     "refusing before any upload: plan card {} is not here: {e}",
                     card.name

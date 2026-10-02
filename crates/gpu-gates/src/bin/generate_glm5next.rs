@@ -402,7 +402,8 @@ mod cli {
         let placement = match flag("--place")? {
             None => Place::Gate,
             Some(v) => glm_place::parse(&v)?,
-        };
+        }
+        .on_host()?;
         let place = placement.name();
         let mode = match flag("--mode")?.as_deref() {
             None | Some("graph") => StepMode::Graph,

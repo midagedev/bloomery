@@ -22,83 +22,92 @@ use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::Machine;
-use model::placement::workstation::{self, CardSpec, TierBatchBytes, TierDraft};
+use model::placement::workstation::{
+    self, CardSpec, DeviceId, DeviceInfo, Pick, TierBatchBytes, TierDraft,
+};
 
 use crate::record::{self, Record};
 use crate::{GateError, ref_model_path};
 
 /// Which placement the engine loads by: a stage card that runs every layer
-/// and the head, then the expert tier cards beside the host tier, each one
-/// of `workstation::CARDS`. The flag word is an alias — `a`, `gate`, `bp` —
-/// or the list `<stage>[+<tier>…]` of card names (`workstation::word_cards`);
-/// a list of an alias's cards is that alias, name and all, and any other list
-/// has the A6000 as its stage card.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// and the head, then the expert tier cards beside the host tier. The flag
+/// word is an alias — `a` (the stage on the largest visible card), `bp`
+/// (that stage and the next-largest as its tier), `gate` (the card named
+/// 3090, alone) — or the list `<stage>[+<tier>…]` of card names and device
+/// ordinals (`workstation::word_picks`); a list of an alias's cards on this
+/// workstation by name prints as that alias.
+///
+/// A parsed placement is this workstation's by name, with no census: its
+/// cards are `workstation::CARDS` ([`workstation::workstation_spec`]), each
+/// opened by its name — the gates' machines. A binary resolves it against
+/// this process's devices ([`Place::on_host`]) before it plans: then each
+/// card is the spec of the device it picked and opens on that device.
+#[derive(Debug, Clone, Copy)]
 pub struct Place {
     /// The flag value as the records print it.
     word: &'static str,
-    /// The stage card, then the tier cards in tier order, as indices into
-    /// `workstation::CARDS`; the first `n` are the placement's.
-    cards: [u8; 1 + MAX_TIERS],
+    /// How each card is found, the stage then the tiers in tier order; the
+    /// first `n` are the placement's.
+    picks: [Pick; 1 + MAX_TIERS],
     n: u8,
+    /// Each card's spec: this workstation's by name before
+    /// [`Place::on`] (`None` for an ordinal, which names no card without a
+    /// census), the device's after.
+    specs: [Option<CardSpec>; 1 + MAX_TIERS],
+    resolved: bool,
 }
 
-/// A placement of `n` cards, indices into `workstation::CARDS`, by `word`.
-const fn alias(word: &'static str, list: &[u8]) -> Place {
-    let mut cards = [0u8; 1 + MAX_TIERS];
-    let mut i = 0;
-    while i < list.len() {
-        cards[i] = list[i];
-        i += 1;
+/// Two placements are one when they print the same word: the word is what
+/// the records and the binaries' checks read (`place == Place::Gate`), the
+/// same before and after [`Place::on`].
+impl PartialEq for Place {
+    fn eq(&self, other: &Place) -> bool {
+        self.word == other.word
+    }
+}
+
+impl Eq for Place {}
+
+/// The alias `ALIASES[i]` as a placement, this workstation's by name.
+const fn alias(i: usize) -> Place {
+    let (word, list) = workstation::ALIASES[i];
+    let mut picks = [Pick::Rank(0); 1 + MAX_TIERS];
+    let mut specs = [None; 1 + MAX_TIERS];
+    let mut k = 0;
+    while k < list.len() {
+        picks[k] = list[k];
+        specs[k] = workstation::workstation_spec(list[k]);
+        k += 1;
     }
     Place {
         word,
-        cards,
+        picks,
         n: list.len() as u8,
+        specs,
+        resolved: false,
     }
 }
-
-/// Whether two card names are one, at compile time.
-const fn same_name(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
-// The aliases' indices are the A6000's and the 3090's in `workstation::CARDS`.
-const _: () = assert!(
-    same_name(workstation::CARDS[0].name, workstation::A6000.name)
-        && same_name(workstation::CARDS[1].name, workstation::RTX_3090.name)
-);
 
 #[allow(
     non_upper_case_globals,
     reason = "the aliases keep the names callers match on: Place::A, Place::Gate, Place::Bp"
 )]
 impl Place {
-    /// The serving plan (`workstation::plan_a`), on the A6000.
-    pub const A: Place = alias("a", &[0]);
+    /// The serving plan: the stage on the largest visible card
+    /// (`workstation::plan_a` on this workstation, the A6000).
+    pub const A: Place = alias(0);
     /// The step gate's plan (`workstation::plan_gate`), on the 3090.
-    pub const Gate: Place = alias("gate", &[1]);
-    /// Plan (b′) (`workstation::plan_bp`): plan (a) on the A6000, the 3090
-    /// an expert tier under the host tier, holding the DSpark draft's
-    /// reserve when a draft is served there.
-    pub const Bp: Place = alias("bp", &[0, 1]);
+    pub const Gate: Place = alias(1);
+    /// Plan (b′): plan (a)'s stage, the next-largest card an expert tier
+    /// under the host tier (`workstation::plan_bp` on this workstation, the
+    /// 3090 under the A6000), holding the DSpark draft's reserve when a
+    /// draft is served there.
+    pub const Bp: Place = alias(2);
 
-    /// The flag value's placement: an alias, or a list word whose cards are
+    /// The flag value's placement: an alias, or a list word whose parts are
     /// refused by name when there are more tiers than a slot map names
-    /// (`MAX_TIERS`), a name no card has, or a card named twice. A list word
-    /// that is no alias's cards is refused unless its stage card is the
-    /// A6000: no gate runs another stage.
+    /// (`MAX_TIERS`), a part that is no card name and no ordinal, or a name
+    /// or ordinal given twice. Any card may be the stage.
     pub fn parse(v: &str) -> Result<Place, GateError> {
         match v {
             "a" => return Ok(Place::A),
@@ -106,61 +115,114 @@ impl Place {
             "bp" => return Ok(Place::Bp),
             _ => {}
         }
-        let specs = workstation::word_cards(v, MAX_TIERS).map_err(|e| {
+        let list = workstation::word_picks(v, MAX_TIERS).map_err(|e| {
             format!(
-                "--place is a, gate, bp (plan (b′): the 3090 as the A6000's expert tier) or a \
-                 card list <stage>[+<tier>…]: {e}"
+                "--place is a, gate, bp (plan (b′): the next-largest card as the largest's \
+                 expert tier) or a card list <stage>[+<tier>…] of card names and device \
+                 ordinals: {e}"
             )
         })?;
-        let mut list = Vec::with_capacity(specs.len());
-        for spec in &specs {
-            let i = workstation::CARDS
-                .iter()
-                .position(|c| c == spec)
-                .ok_or_else(|| format!("--place {v}: the card {} is not listed", spec.name))?;
-            list.push(u8::try_from(i)?);
+        let mut picks = [Pick::Rank(0); 1 + MAX_TIERS];
+        let mut specs = [None; 1 + MAX_TIERS];
+        for (i, &p) in list.iter().enumerate() {
+            picks[i] = p;
+            specs[i] = workstation::workstation_spec(p);
         }
-        if let Some(p) = [Place::A, Place::Gate, Place::Bp]
+        let named = list.iter().all(|p| matches!(p, Pick::Name(_)));
+        let alias = [Place::A, Place::Gate, Place::Bp]
             .into_iter()
-            .find(|p| p.indices() == list.as_slice())
-        {
-            return Ok(p);
-        }
-        if specs[0] != workstation::A6000 {
-            return Err(format!(
-                "--place {v}: the stage card is the A6000; another stage has no gate yet (the \
-                 3090 alone is --place gate)"
-            )
-            .into());
-        }
-        let names: Vec<String> = specs.iter().map(|s| s.name.to_ascii_lowercase()).collect();
+            .find(|a| named && a.specs[..usize::from(a.n)] == specs[..list.len()]);
         // A list word that is no alias is spelled once per parse and kept for
         // the process: the records and the open take the name as `'static`.
-        let word: &'static str = Box::leak(names.join("+").into_boxed_str());
-        let mut cards = [0u8; 1 + MAX_TIERS];
-        cards[..list.len()].copy_from_slice(&list);
+        let word: &'static str = match alias {
+            Some(a) => a.word,
+            None => Box::leak(v.to_ascii_lowercase().into_boxed_str()),
+        };
         Ok(Place {
             word,
-            cards,
+            picks,
             n: u8::try_from(list.len())?,
+            specs,
+            resolved: false,
         })
     }
 
-    /// The placement's cards as indices into `workstation::CARDS`.
-    fn indices(&self) -> &[u8] {
-        &self.cards[..usize::from(self.n)]
+    /// The placement on this process's devices ([`bloomery_gpu::census`]):
+    /// [`Place::on`] of the census.
+    pub fn on_host(self) -> Result<Place, GateError> {
+        self.on(&bloomery_gpu::census()?)
     }
 
-    /// The stage card's spec.
-    fn stage(self) -> CardSpec {
-        workstation::CARDS[usize::from(self.cards[0])]
+    /// The placement resolved against `census`: each card the spec of the
+    /// device its pick finds ([`workstation::resolve`]), refused by name with
+    /// every visible device when a pick finds none, several, or a device an
+    /// earlier card is. A list of names spelled as an alias that lands on
+    /// other devices than the alias does here prints as its names.
+    pub fn on(self, census: &[DeviceInfo]) -> Result<Place, GateError> {
+        let resolved = workstation::resolve(self.picks(), census)
+            .map_err(|e| format!("--place {}: {e}", self.spelled()))?;
+        let mut specs = [None; 1 + MAX_TIERS];
+        for (i, s) in resolved.iter().enumerate() {
+            specs[i] = Some(*s);
+        }
+        let devices = |s: &[CardSpec]| s.iter().map(|c| c.device).collect::<Vec<_>>();
+        let mut word = self.word;
+        if let Some((_, alias)) = workstation::ALIASES.iter().find(|(w, _)| *w == self.word)
+            && *alias != self.picks()
+            && workstation::resolve(alias, census)
+                .ok()
+                .is_none_or(|theirs| devices(&theirs) != devices(&resolved))
+        {
+            let names: Vec<String> = resolved
+                .iter()
+                .map(|s| s.name.to_ascii_lowercase())
+                .collect();
+            word = Box::leak(names.join("+").into_boxed_str());
+        }
+        Ok(Place {
+            word,
+            specs,
+            resolved: true,
+            ..self
+        })
     }
 
-    /// The tier cards' specs, in tier order.
-    fn tier_specs(self) -> Vec<CardSpec> {
-        self.indices()[1..]
+    /// The word as typed: an alias's own word, or the picks of a list
+    /// spelled as an alias (`a6000` for `a`).
+    fn spelled(&self) -> String {
+        let alias = workstation::ALIASES.iter().find(|(w, _)| *w == self.word);
+        match alias {
+            Some((_, picks)) if *picks != self.picks() => self
+                .picks()
+                .iter()
+                .map(|p| p.to_string().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join("+"),
+            _ => self.word.to_string(),
+        }
+    }
+
+    /// How the placement's cards are found.
+    fn picks(&self) -> &[Pick] {
+        &self.picks[..usize::from(self.n)]
+    }
+
+    /// The placement's card specs, the stage first; a card an ordinal names
+    /// before [`Place::on`] is refused by name.
+    pub fn card_specs(self) -> Result<Vec<CardSpec>, GateError> {
+        self.specs[..usize::from(self.n)]
             .iter()
-            .map(|&i| workstation::CARDS[usize::from(i)])
+            .zip(self.picks())
+            .map(|(s, p)| {
+                s.ok_or_else(|| {
+                    format!(
+                        "--place {}: {p} is a device of this process's census, and the \
+                         placement was not resolved against it (Place::on_host)",
+                        self.word
+                    )
+                    .into()
+                })
+            })
             .collect()
     }
 
@@ -198,6 +260,8 @@ impl Place {
             )
             .into());
         }
+        let specs = self.card_specs()?;
+        let (stage, tiers) = (specs[0], &specs[1..]);
         let tiered = self.n > 1;
         let draft = draft_bytes.map(|bytes| TierDraft { on: 0, bytes });
         match batch {
@@ -210,7 +274,7 @@ impl Place {
                 .into());
             }
             Some(b) => {
-                workstation::check_tiers(self.stage(), &self.tier_specs(), draft, b)?;
+                workstation::check_tiers(stage, tiers, draft, b)?;
             }
             None if tiered => {
                 return Err(format!(
@@ -222,9 +286,12 @@ impl Place {
             }
             None => {}
         }
+        let mut tier_specs = [stage; MAX_TIERS];
+        tier_specs[..tiers.len()].copy_from_slice(tiers);
+        let k = tiers.len();
         Ok(move |layers| match batch {
-            None => workstation::plan_on(self.stage(), layers),
-            Some(b) => workstation::plan_tiers(layers, self.stage(), &self.tier_specs(), draft, b)
+            None => workstation::plan_on(stage, layers),
+            Some(b) => workstation::plan_tiers(layers, stage, &tier_specs[..k], draft, b)
                 .expect("Place::machine checked the placement's cards before planning"),
         })
     }
@@ -235,17 +302,22 @@ impl Place {
     }
 
     /// The cards the placement loads, the stage card then the tiers, by the
-    /// names the engine finds them by; each device the `load` record's
-    /// `cards` names must hold its name.
+    /// names the plan gives them (an ordinal before [`Place::on`] as
+    /// `cuda<N>`).
     pub fn cards(self) -> Vec<&'static str> {
-        self.indices()
+        self.specs[..usize::from(self.n)]
             .iter()
-            .map(|&i| workstation::CARDS[usize::from(i)].name)
+            .zip(self.picks())
+            .map(|(s, p)| match (s, p) {
+                (Some(s), _) => s.name,
+                (None, Pick::Ordinal(o)) => ordinal_word(*o),
+                (None, _) => "?",
+            })
             .collect()
     }
 
-    /// The placement's expert tier cards in tier order, by the names the
-    /// engine finds them by: the 3090 under `bp`, none under `a` and `gate`.
+    /// The placement's expert tier cards in tier order, by name: the 3090
+    /// under `bp` on this workstation, none under `a` and `gate`.
     pub fn tier_cards(self) -> Vec<&'static str> {
         self.cards()[1..].to_vec()
     }
@@ -256,6 +328,28 @@ impl Place {
     pub fn draft_card(self) -> Option<&'static str> {
         self.tier_cards().first().copied()
     }
+
+    /// The device of the draft's card ([`Place::draft_card`]) once resolved.
+    pub fn draft_device(self) -> Option<DeviceId> {
+        (self.n > 1)
+            .then_some(self.specs[1])
+            .flatten()
+            .and_then(|s| s.device)
+    }
+}
+
+/// `cuda<o>` as a `'static` word, spelled once per ordinal.
+fn ordinal_word(o: u32) -> &'static str {
+    static WORDS: std::sync::Mutex<Vec<(u32, &'static str)>> = std::sync::Mutex::new(Vec::new());
+    let mut w = WORDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, s)) = w.iter().find(|(k, _)| *k == o) {
+        return s;
+    }
+    let s: &'static str = Box::leak(format!("cuda{o}").into_boxed_str());
+    w.push((o, s));
+    s
 }
 
 /// `r`, a `load` record ([`record::LOAD_GENERATOR`]) written up to its
@@ -263,28 +357,45 @@ impl Place {
 /// the stage card `stage`, then the expert tier cards `tiers`), by the names
 /// their drivers report — each space written `_`, since the field is one
 /// word — and, when the placement has an expert tier card, the tier's
-/// experts and resident bytes. A device whose name does not hold the
-/// placement's card name, tiers that do not match the placement's — another
-/// count, or a tier on another card — and more than the one tier the
-/// record's fields hold are refused by name. Every body's load record names
-/// its cards here.
+/// experts and resident bytes. A device that is not the placement's card —
+/// of a resolved placement, another device; of a census-free one, a name
+/// that does not hold the card's —, tiers that do not match the placement's
+/// — another count, or a tier on another card — and more than the one tier
+/// the record's fields hold are refused by name. Every body's load record
+/// names its cards here.
 pub fn with_cards(
     r: Record,
     place: Place,
     stage: &Gpu,
     tiers: &[TierCard],
 ) -> Result<Record, GateError> {
-    let mut devices = vec![stage.device_name()?];
-    for t in tiers {
-        devices.push(t.gpu().device_name()?);
+    let mut gpus = vec![stage];
+    gpus.extend(tiers.iter().map(TierCard::gpu));
+    let mut devices = Vec::with_capacity(gpus.len());
+    let mut ids = Vec::with_capacity(gpus.len());
+    for g in &gpus {
+        devices.push(g.device_name()?);
+        ids.push(g.device_id()?);
     }
     let planned = place.cards();
-    let named =
-        devices.len() == planned.len() && devices.iter().zip(&planned).all(|(d, p)| d.contains(p));
+    let named = devices.len() == planned.len()
+        && if place.resolved {
+            let specs = place.card_specs()?;
+            ids.iter()
+                .zip(&specs)
+                .all(|(id, s)| s.device.is_some_and(|d| d.uuid == id.uuid))
+        } else {
+            devices.iter().zip(&planned).all(|(d, p)| d.contains(p))
+        };
     if !named {
         return Err(format!(
-            "--place {}: the model runs on {devices:?}, the placement's cards are {planned:?}",
-            place.name()
+            "--place {}: the model runs on {devices:?} ({}), the placement's cards are \
+             {planned:?}",
+            place.name(),
+            ids.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
         )
         .into());
     }
@@ -477,7 +588,8 @@ pub fn mode_name(mode: StepMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use model::placement::workstation::{self, A6000, RTX_3090, TierBatchBytes};
+    use model::placement::Machine;
+    use model::placement::workstation::{self, A6000, DeviceInfo, RTX_3090, TierBatchBytes};
 
     use super::Place;
 
@@ -522,19 +634,122 @@ mod tests {
         }
     }
 
-    /// A list word whose stage card is not the A6000, and that is no
-    /// alias's cards, is refused by name: no gate runs another stage.
+    /// Any card may be the stage: a list word of this workstation's names
+    /// plans its stage on its first card, and a list of ordinals plans
+    /// only once resolved.
     #[test]
-    fn another_stage_is_refused() {
+    fn any_card_is_the_stage() {
         for w in ["3090+a6000", "3090+A6000"] {
+            let p = Place::parse(w).unwrap_or_else(|e| panic!("{w}: {e}"));
+            assert_eq!(p.name(), "3090+a6000");
+            let m = p.machine(None, Some(BATCH)).expect("3090+a6000");
             assert_eq!(
-                Place::parse(w).expect_err(w).to_string(),
-                format!(
-                    "--place {w}: the stage card is the A6000; another stage has no gate yet (the \
-                     3090 alone is --place gate)"
-                )
+                m(43),
+                workstation::plan_tiers(43, RTX_3090, &[A6000], None, BATCH).expect("plan")
             );
         }
+        let ordinals = Place::parse("cuda1+0").expect("ordinals");
+        assert_eq!(ordinals.cards(), vec!["cuda1", "cuda0"]);
+        let unresolved = match ordinals.machine(None, Some(BATCH)) {
+            Ok(_) => panic!("an unresolved ordinal was planned"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            unresolved.contains("cuda1 is a device of this process's census"),
+            "{unresolved}"
+        );
+    }
+
+    /// On this workstation's census, in both of its enumeration orders, the
+    /// aliases resolve to the cards they name with no census, each now
+    /// naming its device; a list of ordinals plans the cards it numbers.
+    /// Names that spell an alias but land elsewhere print as their names.
+    #[test]
+    fn resolved_on_the_box_plans_as_before() {
+        let strip = |mut m: Machine| {
+            for c in m.cards.iter_mut().chain(m.tiers.iter_mut()) {
+                c.device = None;
+            }
+            m
+        };
+        for order in [["3090", "A6000"], ["A6000", "3090"]] {
+            let census = census(&order);
+            let a6000 = u32::try_from(order.iter().position(|n| *n == "A6000").expect("A6000"))
+                .expect("small");
+            let a = Place::A.on(&census).expect("a");
+            assert_eq!((a, a.name(), a.cards()), (Place::A, "a", vec![A6000.name]));
+            let m = a.machine(None, None).expect("a")(43);
+            assert_eq!(m.cards[0].device.map(|d| d.ordinal), Some(a6000));
+            assert_eq!(strip(m), workstation::plan_a(43));
+            let bp = Place::Bp.on(&census).expect("bp");
+            assert_eq!(bp.draft_device().map(|d| d.ordinal), Some(1 - a6000));
+            let m = bp.machine(None, Some(BATCH)).expect("bp")(43);
+            assert_eq!(strip(m), workstation::plan_bp(43, None, BATCH));
+            let gate = Place::Gate.on(&census).expect("gate");
+            assert_eq!(
+                strip(gate.machine(None, None).expect("gate")(43)),
+                workstation::plan_gate(43)
+            );
+            let w = format!("{a6000}+{}", 1 - a6000);
+            let list = Place::parse(&w)
+                .expect("ordinals")
+                .on(&census)
+                .expect("resolved");
+            assert_eq!(
+                (list.name(), list.cards()),
+                (w.as_str(), vec!["A6000", "3090"])
+            );
+            let m = list.machine(None, Some(BATCH)).expect("list")(43);
+            assert_eq!(strip(m), workstation::plan_bp(43, None, BATCH));
+        }
+        let ada = census(&["NVIDIA RTX 6000 Ada Generation", "A6000"]);
+        let named = Place::parse("a6000").expect("a6000");
+        assert_eq!(named.name(), "a");
+        let on = named.on(&ada).expect("the A6000");
+        assert_eq!((on.name(), on.cards()), ("a6000", vec!["A6000"]));
+        let e = named
+            .on(&census(&["3090"]))
+            .expect_err("no A6000")
+            .to_string();
+        assert!(
+            e.starts_with("--place a6000: no visible device is A6000 (visible: cuda0"),
+            "{e}"
+        );
+        let largest = Place::A.on(&ada).expect("a");
+        assert_eq!(largest.cards(), vec!["RTX_6000_Ada_Generation"]);
+        let two = census(&["3090", "3090"]);
+        let e = Place::Gate.on(&two).expect_err("two 3090s").to_string();
+        assert!(
+            e.starts_with("--place gate: 2 visible devices carry the name 3090"),
+            "{e}"
+        );
+        let bp = Place::Bp.on(&two).expect("two 3090s");
+        assert_eq!(bp.cards(), vec!["3090", "3090"]);
+        let m = bp.machine(None, Some(BATCH)).expect("stage + tier")(43);
+        assert_eq!(m.tiers[0].device.map(|d| d.ordinal), Some(1));
+    }
+
+    /// A fake census of devices by short name, each its measured total
+    /// (the A6000's and the 3090's) or twice the A6000's.
+    fn census(names: &[&str]) -> Vec<DeviceInfo> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let (name, total_bytes) = match *n {
+                    "3090" => ("NVIDIA GeForce RTX 3090".to_string(), 25_351_356_416),
+                    "A6000" => ("NVIDIA RTX A6000".to_string(), 50_952_536_064),
+                    other => (other.to_string(), 2 * 50_952_536_064),
+                };
+                DeviceInfo {
+                    ordinal: u32::try_from(i).expect("small"),
+                    name,
+                    total_bytes,
+                    uuid: [u8::try_from(i).expect("small") + 1; 16],
+                    pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
+                }
+            })
+            .collect()
     }
 
     /// The word's refusals, each by name before any plan: more tiers than a

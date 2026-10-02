@@ -346,9 +346,9 @@ mod gate {
                 "--dir" => dir = Some(PathBuf::from(v)),
                 "--plain" => plain = Some(PathBuf::from(v)),
                 "--place" => match Place::parse(&v)? {
-                    Place::Bp => bp = true,
-                    Place::Gate => bp = false,
-                    Place::A => {
+                    p if p == Place::Bp => bp = true,
+                    p if p == Place::Gate => bp = false,
+                    p if p == Place::A => {
                         return Err(format!(
                             "--place a: this gate runs the server on the gate card, or on both \
                              under bp: {USAGE}"

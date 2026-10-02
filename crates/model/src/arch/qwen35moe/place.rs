@@ -764,6 +764,7 @@ pub fn machine_for_experts(
     Machine {
         cards: vec![Card {
             name: card.name.to_string(),
+            device: card.device,
             usable_bytes: card.usable_bytes(),
             context_bytes: CONTEXT,
             scratch_bytes: card_scratch_bytes(ubatch) + route,
@@ -859,14 +860,28 @@ pub fn machine_bp(
     draft: Option<u64>,
     batch: TierBatchBytes,
 ) -> Machine {
-    let mut m = machine_for_experts(A6000, layers, ubatch, Experts::Card);
+    machine_bp_on((A6000, RTX_3090), layers, ubatch, draft, batch)
+}
+
+/// [`machine_bp`] with `stage` the stage card and `tier` its expert tier
+/// card: the cards a placement resolved on this process's devices.
+#[must_use]
+pub fn machine_bp_on(
+    (stage, tier): (CardSpec, CardSpec),
+    layers: usize,
+    ubatch: u64,
+    draft: Option<u64>,
+    batch: TierBatchBytes,
+) -> Machine {
+    let mut m = machine_for_experts(stage, layers, ubatch, Experts::Card);
     m.cards[0].scratch_bytes += card_tier_join_bytes(ubatch);
     m.cards[0]
         .reserves
         .extend(draft.map(|b| (MTP_RESERVE.to_string(), b)));
     m.tiers.push(Card {
-        name: RTX_3090.name.to_string(),
-        usable_bytes: RTX_3090.usable_bytes(),
+        name: tier.name.to_string(),
+        device: tier.device,
+        usable_bytes: tier.usable_bytes(),
         context_bytes: CONTEXT,
         scratch_bytes: SCRATCH,
         margin_bytes: MARGIN,
@@ -1403,6 +1418,7 @@ fn draft_machine() -> Machine {
     Machine {
         cards: vec![Card {
             name: "mtp draft".to_string(),
+            device: None,
             usable_bytes: u64::MAX,
             context_bytes: 0,
             scratch_bytes: 0,
@@ -1818,6 +1834,7 @@ mod tests {
             Machine {
                 cards: vec![Card {
                     name: "card".to_string(),
+                    device: None,
                     usable_bytes: usable,
                     context_bytes: 0,
                     scratch_bytes: 0,

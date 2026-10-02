@@ -460,7 +460,7 @@ use Ty::{Bool, Csv, F64, I64, List, Text, U64, Word};
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, and where the experts sit.",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force.",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -480,6 +480,8 @@ pub static PLAN: Kind = Kind {
         pos("n_l_layers", U64, "layers"),
         lit(" layers"),
         key("card_budget", Word, "B"),
+        opt("devices", Csv, ""),
+        opt("cuda_order", Word, ""),
     ],
 };
 
@@ -487,7 +489,7 @@ pub static PLAN: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "The qwen4exp placement the engine is about to load by: its card, the expert rule (host or card), the context, and where the routed experts sit (each layer's id prefix on the card; under plan (b′) the expert tier card and the next ids it holds).",
+    doc: "The qwen4exp placement the engine is about to load by: its card, the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card; under plan (b′) the expert tier card and the next ids it holds), and each plan card's device as the plan record names them.",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -497,6 +499,8 @@ pub static PLAN38: Kind = Kind {
         key("card_experts", U64, "experts"),
         opt("tier", Word, ""),
         opt("tier_experts", U64, "experts"),
+        opt("devices", Csv, ""),
+        opt("cuda_order", Word, ""),
     ],
 };
 
@@ -2121,6 +2125,43 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
             plan.card_budget
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
         )
+        .csv("devices", plan_devices(machine))
+        .w("cuda_order", cuda_order())
+}
+
+/// Each card of `machine` as the `plan` record's `devices` field names it:
+/// `stage` or `tier<i>`, its name, its ordinal (`by-name` for a card a
+/// census-free plan opens by its name), its usable bytes. The UUID stays in
+/// the process: the open checks it, no record prints it.
+#[must_use]
+pub fn plan_devices(machine: &Machine) -> Vec<String> {
+    let role = |i: usize| {
+        if i < machine.cards.len() {
+            "stage".to_string()
+        } else {
+            format!("tier{}", i - machine.cards.len())
+        }
+    };
+    machine
+        .all_cards()
+        .enumerate()
+        .map(|(i, c)| {
+            let at = c
+                .device
+                .map_or_else(|| "by-name".to_string(), |d| format!("cuda{}", d.ordinal));
+            format!("{}:{}:{at}:{}", role(i), c.name, c.usable_bytes)
+        })
+        .collect()
+}
+
+/// The order this process's CUDA ordinals follow: `CUDA_DEVICE_ORDER`, or
+/// the driver's default when it is unset.
+#[must_use]
+pub fn cuda_order() -> String {
+    match std::env::var("CUDA_DEVICE_ORDER") {
+        Ok(v) if !v.trim().is_empty() => v.split_whitespace().collect::<Vec<_>>().join("_"),
+        _ => "unset(FASTEST_FIRST)".to_string(),
+    }
 }
 
 /// The load's phases record: `open` the file's headers' wall, `plan` the

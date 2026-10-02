@@ -379,6 +379,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     if a.ctx == 0 {
         return Err("--ctx 0: the stores hold no position".into());
     }
+    a.place = a.place.on_host()?;
     Ok(a)
 }
 

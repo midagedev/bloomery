@@ -39,6 +39,7 @@ crates/engram-lab/src/bin/engram-rate.rs	BLOOMERY_ENGRAM_LEASE	TL-7
 # Not levers, and they stay.
 crates/gpu-gates/src/bind.rs	CUDA_VISIBLE_DEVICES	stays: the driver's card list
 crates/gpu-gates/src/bin/soak_ds41_serve.rs	CUDA_VISIBLE_DEVICES	stays: the driver's card list (the soak checks the card it was given)
+crates/gpu-gates/src/record.rs	CUDA_DEVICE_ORDER	stays: the driver's ordinal order, which the plan record prints beside the ordinals
 crates/gpu-gates/src/bin/gate_deepseek41_chain_attn.rs	BLOOMERY_CHAIN_ATTN_MUTATE,BLOOMERY_CHAIN_ATTN_LAYERS	stays: the gate's FAIL-first tool
 # Harness and data paths — stay: a test binary's or a build script's own reads.
 crates/engram-lab/tests/lab.rs	BLOOMERY_DATA	stays: the data directory

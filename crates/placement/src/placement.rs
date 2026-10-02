@@ -33,6 +33,7 @@ use gguf::GgmlType;
 
 pub mod card_budget;
 pub mod churn;
+pub mod devices;
 pub mod workstation;
 
 pub use models::{Role, Unimplemented};
@@ -99,7 +100,11 @@ pub struct ModelTensors {
 /// says otherwise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Card {
+    /// The name the plan and its records give the card.
     pub name: String,
+    /// The device the card was resolved to ([`devices::resolve`]); `None`
+    /// on a census-free plan, whose card the open finds by `name`.
+    pub device: Option<devices::DeviceId>,
     /// What the driver leaves for us.
     pub usable_bytes: u64,
     pub context_bytes: u64,
@@ -125,6 +130,16 @@ pub struct Card {
 }
 
 impl Card {
+    /// Whether `self` and `other` are one device: by device when both were
+    /// resolved, else by name.
+    #[must_use]
+    pub fn same_device(&self, other: &Card) -> bool {
+        match (self.device, other.device) {
+            (Some(a), Some(b)) => a.uuid == b.uuid,
+            _ => self.name == other.name,
+        }
+    }
+
     /// The reserves' bytes.
     #[must_use]
     pub fn reserve_bytes(&self) -> u64 {
@@ -782,8 +797,7 @@ pub enum PlacementError {
     /// the token embedding.
     #[error("tier card {card}: {detail}; a tier card runs no stage")]
     Tier { card: String, detail: String },
-    /// Cards of one name — one device, as a plan finds its cards by name —
-    /// whose budgets (each card's usable bytes, under a card budget the
+    /// Cards of one device ([`Card::same_device`]) whose budgets (each card's usable bytes, under a card budget the
     /// capped ones) sum past that device's usable bytes: one device's
     /// budget counted twice.
     #[error(
@@ -1750,16 +1764,16 @@ fn check_tiers(tiers: &[Card]) -> Result<(), PlacementError> {
     Ok(())
 }
 
-/// Refuse cards of one name (one device) whose budgets under
+/// Refuse cards of one device ([`Card::same_device`]) whose budgets under
 /// `card_budget` sum past the device's usable bytes
 /// ([`PlacementError::DeviceTwice`]).
 fn check_devices(machine: &Machine, card_budget: Option<u64>) -> Result<(), PlacementError> {
     let cards: Vec<&Card> = machine.all_cards().collect();
     for (i, card) in cards.iter().enumerate() {
-        if cards[..i].iter().any(|c| c.name == card.name) {
+        if cards[..i].iter().any(|c| c.same_device(card)) {
             continue;
         }
-        let same: Vec<&&Card> = cards.iter().filter(|c| c.name == card.name).collect();
+        let same: Vec<&&Card> = cards.iter().filter(|c| c.same_device(card)).collect();
         if same.len() < 2 {
             continue;
         }
@@ -2085,6 +2099,7 @@ mod tests {
     fn card(name: &str, layers: Range<usize>, head: bool, token_embedding: bool) -> Card {
         Card {
             name: name.to_string(),
+            device: None,
             usable_bytes: 0,
             context_bytes: 0,
             scratch_bytes: 0,
@@ -2274,6 +2289,34 @@ mod tests {
         assert!(plan.tier_n_l[0].iter().sum::<u64>() > 0);
         assert!(matches!(
             plan_with(&model, &machine, 4096, &NoKv, Some(half + 1)),
+            Err(PlacementError::DeviceTwice { cards: 2, .. })
+        ));
+    }
+
+    /// Two plan cards of one name resolved to two devices (two 3090s) are
+    /// two devices: each keeps its whole budget. The same device under both
+    /// is still one device counted twice.
+    #[test]
+    fn two_devices_of_one_name_plan() {
+        let model = layered(3);
+        let usable = HEAD + 5 * EXPERT;
+        let dev = |ordinal: u32| {
+            Some(devices::DeviceId {
+                ordinal,
+                uuid: [u8::try_from(ordinal).expect("small") + 1; 16],
+            })
+        };
+        let on = |c: Card, d| Card { device: d, ..c };
+        let machine = |a, b| Machine {
+            cards: vec![on(bytes_card("3090", usable, 0..3), a)],
+            tiers: vec![on(bytes_card("3090", usable, 0..0), b)],
+            host: host(),
+        };
+        let two = machine(dev(0), dev(1));
+        let plan = plan_with(&model, &two, 4096, &NoKv, None).expect("two 3090s");
+        assert!(plan.tier_n_l[0].iter().sum::<u64>() > 0);
+        assert!(matches!(
+            plan_with(&model, &machine(dev(0), dev(0)), 4096, &NoKv, None),
             Err(PlacementError::DeviceTwice { cards: 2, .. })
         ));
     }

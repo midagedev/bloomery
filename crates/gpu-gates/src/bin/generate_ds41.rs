@@ -474,6 +474,7 @@ mod drive {
         for arm in &a.arms {
             check_counts(&a.for_arm(arm))?;
         }
+        a.place = a.place.on_host()?;
         Ok(a)
     }
 

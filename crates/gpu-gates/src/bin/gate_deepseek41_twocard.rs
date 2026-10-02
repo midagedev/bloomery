@@ -397,7 +397,7 @@ mod gate {
             &draft.0,
             &draft.1,
             target,
-            workstation::RTX_3090.name,
+            (workstation::RTX_3090.name, None),
         )?;
         let mut s = loaded.ready(&mut Quiet)?;
         let spec = s.with_draft::<_, PAIR_ROWS>(d, &mut Quiet)?;

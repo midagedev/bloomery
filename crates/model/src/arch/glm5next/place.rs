@@ -513,6 +513,7 @@ fn nextn_machine() -> Machine {
     Machine {
         cards: vec![Card {
             name: "nextn".to_string(),
+            device: None,
             usable_bytes: u64::MAX,
             context_bytes: 0,
             scratch_bytes: 0,

@@ -191,6 +191,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
+    a.place = a.place.on_host()?;
     Ok(a)
 }
 
@@ -201,7 +202,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     record::at_main("bloomery-serve-ds41", record::BLOOMERY_SERVE_DS41);
     let a = parse_args(args)?;
     let at = ResidencyAt {
-        serving_place: !matches!(a.place, Place::Gate),
+        serving_place: a.place != Place::Gate,
         check_finite: false,
         route_trace: levers.route_trace().is_some(),
         prefill_steps: body::PrefillMode::from_name(levers.prefill())
@@ -210,7 +211,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let residency = levers.residency_at(at);
     record::residency_lever(residency).eprint();
     let cfg = body::OpenCfg::from_levers_at(&levers, at)?;
-    if cfg.body.residency != Residency::Off && matches!(a.place, Place::Gate) {
+    if cfg.body.residency != Residency::Off && a.place == Place::Gate {
         return Err(format!(
             "BLOOMERY_RESIDENCY={} under --place gate: the residency machine runs under \
              --place a and bp only",

@@ -9,18 +9,29 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::ops::Range;
 
+pub use super::devices::{
+    ALIASES, CardNotInView, DeviceId, DeviceInfo, ORDINALS, Pick, PickError, PickWhy, WordError,
+    census_usable, device_on_host, label, resolve, spec_of_device, visible, word_picks,
+    workstation_spec,
+};
 use super::{Card, Host, Machine, PlacementError, Plan};
 
 pub const MIB: u64 = 1 << 20;
 
-/// One card as `nvidia-smi` reports it with no process on it [measured]: its
-/// memory and the part the driver keeps.
+/// One card as `nvidia-smi` reports it with no process on it [measured], or
+/// as the census gives a device ([`spec_of_device`]): its memory, the part
+/// the driver keeps, and the device it is when it was resolved against this
+/// process's devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardSpec {
-    /// The name a plan gives the card; the CUDA device name contains it.
+    /// The name a plan and its records give the card; a known card's driver
+    /// name contains it.
     pub name: &'static str,
     pub total_bytes: u64,
     pub driver_reserve_bytes: u64,
+    /// The device, when resolved ([`resolve`]); `None` for a card of this
+    /// workstation by name, which the open finds by that name.
+    pub device: Option<DeviceId>,
 }
 
 impl CardSpec {
@@ -29,6 +40,16 @@ impl CardSpec {
     pub const fn usable_bytes(&self) -> u64 {
         self.total_bytes - self.driver_reserve_bytes
     }
+
+    /// Whether `self` and `other` are one device: by device when both were
+    /// resolved, else by name.
+    #[must_use]
+    pub fn same_device(&self, other: &CardSpec) -> bool {
+        match (self.device, other.device) {
+            (Some(a), Some(b)) => a.uuid == b.uuid,
+            _ => self.name == other.name,
+        }
+    }
 }
 
 /// The RTX A6000 [measured, `nvidia-smi`].
@@ -36,6 +57,7 @@ pub const A6000: CardSpec = CardSpec {
     name: "A6000",
     total_bytes: 49_140 * MIB,
     driver_reserve_bytes: 548 * MIB,
+    device: None,
 };
 
 /// The RTX 3090 [measured, `nvidia-smi`].
@@ -43,11 +65,15 @@ pub const RTX_3090: CardSpec = CardSpec {
     name: "3090",
     total_bytes: 24_576 * MIB,
     driver_reserve_bytes: 400 * MIB,
+    device: None,
 };
 
-/// Every card a plan here names, one device each: the cards a `--place`
-/// word lists ([`word_cards`]) and [`spec_of`] finds.
+/// Every card a plan names by name, the most usable bytes first: the names
+/// a `--place` word takes ([`word_picks`]), and this workstation's cards by
+/// size ([`Pick::Rank`] on a census-free plan).
 pub const CARDS: [CardSpec; 2] = [A6000, RTX_3090];
+
+const _: () = assert!(A6000.usable_bytes() > RTX_3090.usable_bytes());
 
 /// Per card: the CUDA context and the m = 1 scratch [assumed], and the margin
 /// the expert rule leaves free.
@@ -89,6 +115,7 @@ pub fn model_v41() -> String {
 fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
     Card {
         name: spec.name.to_string(),
+        device: spec.device,
         usable_bytes: spec.usable_bytes(),
         context_bytes: CONTEXT,
         scratch_bytes: SCRATCH,
@@ -301,8 +328,8 @@ pub fn plan_tiers(
 }
 
 /// What [`plan_tiers`] refuses of its cards, before any layer count: a card
-/// listed twice — one device, whose usable bytes the plan would count once a
-/// listing — and a draft on a tier past the list. Returns the host's
+/// listed twice — one device ([`CardSpec::same_device`]), whose usable bytes
+/// the plan would count once a listing — and a draft on a tier past the list. Returns the host's
 /// prompt-batch rows, one set a tier.
 pub fn check_tiers(
     stage: CardSpec,
@@ -314,8 +341,8 @@ pub fn check_tiers(
         .chain(tiers.iter().copied())
         .collect();
     for (i, spec) in all.iter().enumerate() {
-        let n = all.iter().filter(|s| s.name == spec.name).count();
-        if n > 1 && !all[..i].iter().any(|s| s.name == spec.name) {
+        let n = all.iter().filter(|s| s.same_device(spec)).count();
+        if n > 1 && !all[..i].iter().any(|s| s.same_device(spec)) {
             let usable = spec.usable_bytes();
             return Err(PlacementError::DeviceTwice {
                 card: spec.name.to_string(),
@@ -380,82 +407,6 @@ fn tiered(
     }
 }
 
-/// The cards a `--place` list word names: `<stage>[+<tier>…]`, each a
-/// [`CARDS`] name in any ASCII case, the stage card first and the tier cards
-/// in tier order (`a6000+3090` is plan (b′)'s). A word of more than
-/// `max_tiers` tier cards, a name no card has and a card named twice are
-/// refused by name, in that order.
-pub fn word_cards(word: &str, max_tiers: usize) -> Result<Vec<CardSpec>, WordError> {
-    let names: Vec<&str> = word.split('+').collect();
-    if names.len() - 1 > max_tiers {
-        return Err(WordError::TooManyTiers {
-            word: word.to_string(),
-            tiers: names.len() - 1,
-            max: max_tiers,
-        });
-    }
-    let mut specs: Vec<CardSpec> = Vec::with_capacity(names.len());
-    for name in names {
-        let spec = CARDS
-            .into_iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| WordError::UnknownCard {
-                word: word.to_string(),
-                name: name.to_string(),
-            })?;
-        if specs.contains(&spec) {
-            return Err(WordError::CardTwice {
-                word: word.to_string(),
-                card: spec.name,
-            });
-        }
-        specs.push(spec);
-    }
-    Ok(specs)
-}
-
-/// A `--place` list word [`word_cards`] refuses.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WordError {
-    TooManyTiers {
-        word: String,
-        tiers: usize,
-        max: usize,
-    },
-    UnknownCard {
-        word: String,
-        name: String,
-    },
-    CardTwice {
-        word: String,
-        card: &'static str,
-    },
-}
-
-impl fmt::Display for WordError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let names: Vec<&str> = CARDS.iter().map(|c| c.name).collect();
-        match self {
-            WordError::TooManyTiers { word, tiers, max } => write!(
-                f,
-                "{word} names {tiers} tier cards, past the {max} a plan's slot map can name"
-            ),
-            WordError::UnknownCard { word, name } => write!(
-                f,
-                "{word} names the card {name:?}, which is none of this workstation's cards \
-                 {names:?}"
-            ),
-            WordError::CardTwice { word, card } => write!(
-                f,
-                "{word} names the card {card} twice: a plan finds each card by its name, one \
-                 device each"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for WordError {}
-
 /// The gate placement: the 3090 runs all `layers` and the head, so the V4.1
 /// body gates run on the gate card while the A6000 takes timing runs. Its
 /// expert prefixes are the largest the card's budget allows — the expert
@@ -471,73 +422,6 @@ pub fn plan_gate(layers: usize) -> Machine {
 pub fn spec_of(card: &Card) -> Option<CardSpec> {
     CARDS.into_iter().find(|s| s.name == card.name)
 }
-
-/// The one visible device a plan's card `card` runs on: the index in `seen`
-/// (the visible devices' names, by ordinal) of the one whose name contains
-/// the card's, as the GPU loader finds its card. None or several is
-/// refused, naming what is in view and the placement that fits it.
-pub fn card_on_host(card: &str, seen: &[String]) -> Result<usize, CardNotInView> {
-    let named: Vec<usize> = (0..seen.len())
-        .filter(|&i| seen[i].contains(card))
-        .collect();
-    match named.as_slice() {
-        &[i] => Ok(i),
-        _ => Err(CardNotInView {
-            card: card.to_string(),
-            seen: seen.to_vec(),
-            named: named.len(),
-        }),
-    }
-}
-
-/// A plan's card that is not exactly one visible device ([`card_on_host`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CardNotInView {
-    pub card: String,
-    /// The visible devices' names, by ordinal.
-    pub seen: Vec<String>,
-    /// How many of them are named like the card.
-    pub named: usize,
-}
-
-impl fmt::Display for CardNotInView {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let CardNotInView { card, seen, named } = self;
-        if *named > 1 {
-            return write!(
-                f,
-                "{named} visible devices are named like the plan's card {card} ({seen:?}): a plan \
-                 finds each card by its name, so one device of a name may be in view; two 3090s \
-                 are not a host this tree runs on (CUDA_VISIBLE_DEVICES keeps one in view)"
-            );
-        }
-        write!(
-            f,
-            "no visible device is the plan's card {card} (visible: {seen:?})"
-        )?;
-        if card == A6000.name {
-            write!(
-                f,
-                ". --place a, the default, runs the whole model on the A6000; this tree runs on \
-                 an A6000, or an A6000 with a 3090, and not on two 3090s. On one 3090, --place \
-                 gate plans the whole model on that card (its plan refuses by name when the card \
-                 and the host cannot hold the model); an A6000 out of view \
-                 (CUDA_VISIBLE_DEVICES) must be put in view"
-            )
-        } else if card == RTX_3090.name {
-            write!(
-                f,
-                ". --place gate runs the whole model on a 3090 and --place bp puts one under the \
-                 A6000's host tier; on an A6000 alone, --place a runs the model; a 3090 out of \
-                 view (CUDA_VISIBLE_DEVICES) must be put in view"
-            )
-        } else {
-            Ok(())
-        }
-    }
-}
-
-impl std::error::Error for CardNotInView {}
 
 /// What a placed load needs of the host's memory, which `MemAvailable` must
 /// cover ([`HostNeed::check`]): the plan's host experts and tables, the
@@ -673,10 +557,9 @@ pub fn mem_available(meminfo: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, CardNotInView, CardSpec, DRAFT_RESERVE, HostNeed, Machine, PlacementError, RTX_3090,
-        TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, WordError, card,
-        card_on_host, host, mem_available, plan_a, plan_bp, plan_gate, plan_tiers, tier,
-        tier_batch_bytes, word_cards,
+        A6000, CardSpec, DRAFT_RESERVE, HostNeed, Machine, PlacementError, RTX_3090,
+        TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, card, host,
+        mem_available, plan_a, plan_bp, plan_gate, plan_tiers, tier, tier_batch_bytes,
     };
 
     /// Plan (a), the gate plan and plan (b′) as their own bodies built them
@@ -824,58 +707,6 @@ mod tests {
         ));
     }
 
-    /// The list word: names in any case, the stage first; more tiers than
-    /// the slot map names, a name no card has and a card named twice are
-    /// refused by name, the count first.
-    #[test]
-    fn word_cards_reads_the_list_word() {
-        assert_eq!(word_cards("a6000+3090", 8), Ok(vec![A6000, RTX_3090]));
-        assert_eq!(word_cards("A6000+3090", 8), Ok(vec![A6000, RTX_3090]));
-        assert_eq!(word_cards("3090+a6000", 8), Ok(vec![RTX_3090, A6000]));
-        assert_eq!(word_cards("3090", 8), Ok(vec![RTX_3090]));
-        assert_eq!(word_cards("a6000", 0), Ok(vec![A6000]));
-        let many = ["a6000"; 10].join("+");
-        assert_eq!(
-            word_cards(&many, 8),
-            Err(WordError::TooManyTiers {
-                word: many.clone(),
-                tiers: 9,
-                max: 8
-            })
-        );
-        assert!(matches!(
-            word_cards("a6000+3090", 0),
-            Err(WordError::TooManyTiers {
-                tiers: 1,
-                max: 0,
-                ..
-            })
-        ));
-        for (word, name) in [("a6000+4090", "4090"), ("b", "b"), ("a6000+", "")] {
-            assert_eq!(
-                word_cards(word, 8),
-                Err(WordError::UnknownCard {
-                    word: word.to_string(),
-                    name: name.to_string()
-                }),
-                "{word}"
-            );
-        }
-        assert_eq!(
-            word_cards("3090+3090", 8),
-            Err(WordError::CardTwice {
-                word: "3090+3090".to_string(),
-                card: RTX_3090.name
-            })
-        );
-        let e = word_cards("a6000+A6000", 8).expect_err("twice");
-        assert_eq!(
-            e.to_string(),
-            "a6000+A6000 names the card A6000 twice: a plan finds each card by its name, one \
-             device each"
-        );
-    }
-
     /// V4.1's tier batch at the host union's 512 columns: the allocation
     /// sizes of the tier's staging and tile scratch, summed by hand.
     #[test]
@@ -931,27 +762,5 @@ mod tests {
         ] {
             assert!(text.contains(part), "{part:?} in {text}");
         }
-    }
-
-    /// The card is the one visible device named like it; none or two is
-    /// refused, and with no A6000 the refusal names `--place gate`.
-    #[test]
-    fn card_on_host_names_the_placement_that_fits() {
-        let one = ["NVIDIA GeForce RTX 3090".to_string()];
-        let both = [
-            "NVIDIA GeForce RTX 3090".to_string(),
-            "NVIDIA RTX A6000".to_string(),
-        ];
-        assert_eq!(card_on_host(A6000.name, &both), Ok(1));
-        assert_eq!(card_on_host(RTX_3090.name, &both), Ok(0));
-        let no_a6000 = card_on_host(A6000.name, &one).expect_err("no A6000 in view");
-        assert_eq!(no_a6000.named, 0);
-        assert!(no_a6000.to_string().contains("--place gate"), "{no_a6000}");
-        let no_3090 = card_on_host(RTX_3090.name, &both[1..]).expect_err("no 3090 in view");
-        assert!(no_3090.to_string().contains("--place a"), "{no_3090}");
-        let two = [one[0].clone(), one[0].clone()];
-        let e: CardNotInView = card_on_host(RTX_3090.name, &two).expect_err("two 3090s");
-        assert_eq!(e.named, 2);
-        assert!(e.to_string().contains("two 3090s"), "{e}");
     }
 }

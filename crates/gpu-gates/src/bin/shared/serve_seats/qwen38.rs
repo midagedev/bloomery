@@ -177,6 +177,7 @@ use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
 };
+use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::nodes::count_kinds;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{CARD38, Lever38, residency38};
@@ -190,10 +191,10 @@ use gguf::Split;
 use model::arch::models::Mixer;
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
-    Experts, MtpInputs, PlanInputs, machine_bp, machine_for_experts, serve_ctx, tier_batch,
+    Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{A6000, CardSpec, HostNeed, MARGIN, RTX_3090, host_available};
+use model::placement::workstation::{CardSpec, HostNeed, MARGIN, host_available};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
@@ -278,9 +279,9 @@ impl BreakEven {
     /// rates), a plain step's under `bp`, whose prompt runs by steps.
     fn of(place: Place38) -> BreakEven {
         let gain = 1.0 / PLAIN_TPS - 1.0 / DRAFTED_TPS;
-        let rate = match place {
-            Place38::A | Place38::Gate => PROMPT_IDS_PER_S,
-            Place38::Bp => PLAIN_TPS,
+        let rate = match place.kind {
+            Kind38::A | Kind38::Gate => PROMPT_IDS_PER_S,
+            Kind38::Bp => PLAIN_TPS,
         };
         BreakEven {
             per_token: gain * rate,
@@ -309,60 +310,77 @@ struct Branch38 {
     reply: usize,
 }
 
-/// Where `--place` puts the plan's stage card, and its expert tier card
-/// when it has one, as `generate_qwen3moe` takes it.
-#[derive(Clone, Copy)]
-enum Place38 {
-    /// The A6000, the timing card (the default).
+/// Which placement `--place` names, as `generate_qwen3moe` takes it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind38 {
+    /// The stage on the largest visible card (the A6000 here, the timing
+    /// card; the default).
     A,
     /// The 3090, the gate card.
     Gate,
-    /// Plan (b′): the A6000 as under `a`, the 3090 its expert tier
-    /// (`place::machine_bp`); the load refuses it by name, since `Body38`
-    /// has no tier leg yet.
+    /// Plan (b′): the stage as under `a`, the next-largest card its expert
+    /// tier (`place::machine_bp_on`).
     Bp,
 }
 
+/// Where `--place` puts the plan's stage card, and its expert tier card
+/// when it has one: the kind, and its cards (`generate::Place`), resolved
+/// against this process's devices once the arguments are read.
+#[derive(Clone, Copy)]
+struct Place38 {
+    kind: Kind38,
+    cards: Place,
+}
+
 impl Place38 {
+    const A: Place38 = Place38 {
+        kind: Kind38::A,
+        cards: Place::A,
+    };
+
     fn parse(v: &str) -> Result<Place38, GateError> {
-        match v {
-            "a" => Ok(Place38::A),
-            "gate" => Ok(Place38::Gate),
-            "bp" => Ok(Place38::Bp),
-            other => Err(format!(
-                "--place is a, gate or bp (plan (b′): the 3090 as the A6000's expert tier), not \
-                 {other}"
-            )
-            .into()),
-        }
+        let (kind, cards) = match v {
+            "a" => (Kind38::A, Place::A),
+            "gate" => (Kind38::Gate, Place::Gate),
+            "bp" => (Kind38::Bp, Place::Bp),
+            other => {
+                return Err(format!(
+                    "--place is a, gate or bp (plan (b′): the next-largest card as the \
+                     largest's expert tier), not {other}"
+                )
+                .into());
+            }
+        };
+        Ok(Place38 { kind, cards })
+    }
+
+    /// The placement on this process's devices (`Place::on_host`).
+    fn on_host(self) -> Result<Place38, GateError> {
+        Ok(Place38 {
+            cards: self.cards.on_host()?,
+            ..self
+        })
     }
 
     fn name(self) -> &'static str {
-        match self {
-            Place38::A => "a",
-            Place38::Gate => "gate",
-            Place38::Bp => "bp",
-        }
+        self.cards.name()
     }
 
     /// The stage card's spec.
-    fn spec(self) -> CardSpec {
-        match self {
-            Place38::A | Place38::Bp => A6000,
-            Place38::Gate => RTX_3090,
-        }
+    fn spec(self) -> Result<CardSpec, GateError> {
+        Ok(self.cards.card_specs()?[0])
     }
 
-    /// The stage card is the A6000: the placement the Qwen3.8 defaults
+    /// The stage card is plan (a)'s: the placement the Qwen3.8 defaults
     /// treat as plan (a).
     fn stage_a(self) -> bool {
-        matches!(self, Place38::A | Place38::Bp)
+        matches!(self.kind, Kind38::A | Kind38::Bp)
     }
 
     /// The machine a plan of `inputs` at `ctx` positions and ubatches of
     /// `ub` runs on under `experts`, `mtp` the draft when it runs beside
     /// the target: plan (b′) reserves the draft's card bytes at `ctx` on its
-    /// stage card (`place::machine_bp`), the one-card plans count them in
+    /// stage card (`place::machine_bp_on`), the one-card plans count them in
     /// `plan_mtp_with`.
     fn machine(
         self,
@@ -372,11 +390,18 @@ impl Place38 {
         mtp: Option<&MtpInputs>,
     ) -> Result<Machine, GateError> {
         let layers = inputs.spec.layers.len();
-        Ok(match self {
-            Place38::A | Place38::Gate => machine_for_experts(self.spec(), layers, ub, experts),
-            Place38::Bp => {
+        Ok(match self.kind {
+            Kind38::A | Kind38::Gate => machine_for_experts(self.spec()?, layers, ub, experts),
+            Kind38::Bp => {
+                let cards = self.cards.card_specs()?;
                 let draft = mtp.map(|m| m.card_bytes(ctx)).transpose()?;
-                machine_bp(layers, ub, draft, tier_batch(&inputs.hp, ub))
+                machine_bp_on(
+                    (cards[0], cards[1]),
+                    layers,
+                    ub,
+                    draft,
+                    tier_batch(&inputs.hp, ub),
+                )
             }
         })
     }
@@ -832,6 +857,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     if a.ctx == Some(0) {
         return Err("--ctx-size 0: the stores hold no position".into());
     }
+    a.place = a.place.on_host()?;
     Ok(a)
 }
 
@@ -997,13 +1023,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .u("ctx_max", plan.ctx_max)
         .u("host_experts", plan.host.experts)
         .u("card_experts", plan.cards[0].experts);
-    match (machine.tiers.first(), plan.tier_n_l.first()) {
+    let line = match (machine.tiers.first(), plan.tier_n_l.first()) {
         (Some(t), Some(n)) => line
             .w("tier", t.name.as_str())
-            .u("tier_experts", n.iter().sum::<u64>())
-            .eprint(),
-        _ => line.eprint(),
-    }
+            .u("tier_experts", n.iter().sum::<u64>()),
+        _ => line,
+    };
+    line.csv("devices", record::plan_devices(&machine))
+        .w("cuda_order", record::cuda_order())
+        .eprint();
     let residency = residency38_at(&plan, a.place, set)?;
     let gpu = machine
         .all_cards()

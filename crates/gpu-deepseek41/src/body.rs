@@ -2406,7 +2406,7 @@ fn open_tier(
     map: &SlotMap,
     card_dontneed: bool,
 ) -> Result<TierCard, GpuError> {
-    let gpu = Gpu::for_card(&t.name)?;
+    let gpu = Gpu::open_card(&t.name, t.device)?;
     let w = Weights::load_placed(gpu.stream(), file, plan, t.card, card_dontneed)?;
     let set = TierSet::of_map(map, tier)?;
     let experts = Ds41Tier::new(&gpu, hp, &set, &w)?;

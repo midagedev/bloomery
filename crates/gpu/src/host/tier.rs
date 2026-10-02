@@ -202,18 +202,20 @@ impl TierSet {
 }
 
 /// A tier card a placed load hangs under the host tier: the plan's device
-/// index its routed segments sit on (`Device::Card(card)`), and the card's
-/// name, by which the card is found ([`Gpu::for_card`]).
+/// index its routed segments sit on (`Device::Card(card)`), the card's name,
+/// and the device the plan resolved it to, by which it opens
+/// ([`Gpu::open_card`]).
 #[derive(Clone, Debug)]
 pub struct TierOpen {
     pub card: usize,
     pub name: String,
+    pub device: Option<model::placement::workstation::DeviceId>,
 }
 
 impl TierOpen {
     /// The expert tier cards `machine` names, in tier order: each card's
-    /// index in [`Machine::all_cards`] (after the stage cards) and its name.
-    /// Empty without a tier.
+    /// index in [`Machine::all_cards`] (after the stage cards), its name and
+    /// its device. Empty without a tier.
     #[must_use]
     pub fn of_machine(machine: &Machine) -> Vec<TierOpen> {
         machine
@@ -223,6 +225,7 @@ impl TierOpen {
             .map(|(i, t)| TierOpen {
                 card: machine.cards.len() + i,
                 name: t.name.clone(),
+                device: t.device,
             })
             .collect()
     }

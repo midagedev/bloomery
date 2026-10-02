@@ -1713,8 +1713,56 @@ fn raw_device_name(dev: cuda_core::sys::CUdevice) -> Result<String, GpuError> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// A CUDA context on one device ([`Gpu::new`]: device 0; [`Gpu::for_card`]: the
-/// card a name picks) with this crate's device module loaded and one
+/// Device `dev`'s UUID, asked of the driver without a context.
+fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16], GpuError> {
+    let mut uuid = cuda_core::sys::CUuuid { bytes: [0; 16] };
+    // SAFETY: `uuid` is a live, writable CUuuid for the call.
+    let rc = unsafe { cuda_core::sys::cuDeviceGetUuid_v2(&mut uuid, dev) };
+    graph::cu(rc, "cuDeviceGetUuid")?;
+    Ok(uuid.bytes.map(|c| c.to_ne_bytes()[0]))
+}
+
+/// The visible devices as this process's driver enumerates them, each read
+/// without a context: ordinal, name, `cuDeviceTotalMem`, UUID and PCI bus
+/// id — the census a plan resolves its cards against
+/// ([`::model::placement::workstation::resolve`]) and an open checks them
+/// against ([`Gpu::open_card`]). No device is an empty census, not an error.
+pub fn census() -> Result<Vec<::model::placement::workstation::DeviceInfo>, GpuError> {
+    let n = usize::try_from(cuda_core::Device::device_count()?)
+        .map_err(|_| GpuError::shape("census", "negative device count"))?;
+    let mut out = Vec::with_capacity(n);
+    for ordinal in 0..n {
+        let dev = cuda_core::Device::raw_device(ordinal)?;
+        let mut total = 0usize;
+        // SAFETY: `total` is a live out-pointer for the call and `dev` a
+        // device handle the driver just returned.
+        let rc = unsafe { cuda_core::sys::cuDeviceTotalMem_v2(&mut total, dev) };
+        graph::cu(rc, "cuDeviceTotalMem")?;
+        let mut bus: [std::ffi::c_char; 32] = [0; 32];
+        let len = std::ffi::c_int::try_from(bus.len()).expect("32 fits a c_int");
+        // SAFETY: `bus` is a live, writable buffer of `len` bytes for the
+        // call, and the driver writes at most that many, a NUL included.
+        let rc = unsafe { cuda_core::sys::cuDeviceGetPCIBusId(bus.as_mut_ptr(), len, dev) };
+        graph::cu(rc, "cuDeviceGetPCIBusId")?;
+        let bus: Vec<u8> = bus
+            .iter()
+            .take_while(|&&c| c != 0)
+            .map(|&c| c.to_ne_bytes()[0])
+            .collect();
+        out.push(::model::placement::workstation::DeviceInfo {
+            ordinal: u32::try_from(ordinal)
+                .map_err(|_| GpuError::shape("census", "an ordinal past u32"))?,
+            name: raw_device_name(dev)?,
+            total_bytes: total as u64,
+            uuid: raw_device_uuid(dev)?,
+            pci_bus: String::from_utf8_lossy(&bus).into_owned(),
+        });
+    }
+    Ok(out)
+}
+
+/// A CUDA context on one device ([`Gpu::new`]: device 0; [`Gpu::open_card`]:
+/// the device a plan's card is) with this crate's device module loaded and one
 /// non-blocking stream that every launch and copy of this engine goes on.
 ///
 /// The stream is a real `cuStreamCreate` stream, not the legacy default: the
@@ -1977,32 +2025,31 @@ impl Gpu {
         Ok(f)
     }
 
-    /// `with_device` on the one visible CUDA device whose name contains
-    /// `name` — a placement card's name. A plan names its cards and
-    /// `CUDA_VISIBLE_DEVICES` orders them, so a card is never found by
-    /// ordinal. No device, or two, is an error that says so.
-    pub fn for_card(name: &str) -> Result<Gpu, GpuError> {
-        let n = usize::try_from(cuda_core::Device::device_count()?)
-            .map_err(|_| GpuError::shape("Gpu::for_card", "negative device count"))?;
-        let mut named = Vec::new();
-        let mut seen = Vec::with_capacity(n);
-        for ordinal in 0..n {
-            let full = raw_device_name(cuda_core::Device::raw_device(ordinal)?)?;
-            if full.contains(name) {
-                named.push(ordinal);
-            }
-            seen.push(full);
-        }
-        match named.as_slice() {
-            &[ordinal] => Gpu::with_device(ordinal),
-            _ => Err(GpuError::shape(
-                "Gpu::for_card",
-                format!(
-                    "{} visible devices are named like {name:?}, not one: {seen:?}",
-                    named.len()
-                ),
-            )),
-        }
+    /// `with_device` on the visible device a plan's card is: its `device`
+    /// when the plan resolved one — the census device of that UUID, at the
+    /// plan's ordinal, checked against this process's census again — else
+    /// the one visible device whose name holds `name`
+    /// ([`::model::placement::workstation::device_on_host`]). Never an
+    /// ordinal from outside the process. A device not in view, or a name
+    /// none or several devices carry, is refused by name with the census.
+    pub fn open_card(
+        name: &str,
+        device: Option<::model::placement::workstation::DeviceId>,
+    ) -> Result<Gpu, GpuError> {
+        let seen = census()?;
+        let ordinal = ::model::placement::workstation::device_on_host(name, device, &seen)
+            .map_err(|e| GpuError::plan("Gpu::open_card", e))?;
+        Gpu::with_device(usize::try_from(ordinal).expect("a u32 ordinal fits usize"))
+    }
+
+    /// This context's device as the census names it: ordinal and UUID.
+    pub fn device_id(&self) -> Result<::model::placement::workstation::DeviceId, GpuError> {
+        let ordinal = self.ctx.ordinal();
+        Ok(::model::placement::workstation::DeviceId {
+            ordinal: u32::try_from(ordinal)
+                .map_err(|_| GpuError::shape("Gpu::device_id", "an ordinal past u32"))?,
+            uuid: raw_device_uuid(self.ctx.cu_device())?,
+        })
     }
 
     /// The device's name as the driver reports it.

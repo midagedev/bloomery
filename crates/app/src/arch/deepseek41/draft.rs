@@ -41,6 +41,7 @@ use cuda_core::CudaContext;
 use gguf::Split;
 use model::arch::deepseek41::spec::draft_of;
 use model::arch::dspark::DraftHparams;
+use model::placement::workstation::DeviceId;
 use runtime::{Draft, Program, TapNeed, Tapped, Target};
 
 use crate::{Loaded, Session, SessionError};
@@ -64,8 +65,9 @@ pub struct CardDraft<D> {
 }
 
 impl CardDraft<DraftBody> {
-    /// The draft of `draft` on card `card`, borrowing `target_file`'s head and
-    /// embedding rows, and the loaded target's feature tap built for the
+    /// The draft of `draft` on card `card` — its plan's device `device` when
+    /// the placement resolved one, else the one device of that name —
+    /// borrowing `target_file`'s head and embedding rows, and the loaded target's feature tap built for the
     /// draft's target layers — before the target captures anything, which
     /// [`Loaded`] guarantees. Load-time only.
     pub fn open(
@@ -73,7 +75,7 @@ impl CardDraft<DraftBody> {
         draft: &Split,
         hp: &DraftHparams,
         target_file: Arc<Split>,
-        card: &'static str,
+        (card, device): (&'static str, Option<DeviceId>),
     ) -> Result<CardDraft<DraftBody>, SessionError> {
         let m = target.model_mut();
         let desc = draft_of(hp)
@@ -84,7 +86,7 @@ impl CardDraft<DraftBody> {
         body::attach_features(m, &taps)?;
         let ctx = m.gpu().context().clone();
         let width = m.body(WHAT)?.feature_width();
-        let gpu = Gpu::for_card(card)?;
+        let gpu = Gpu::open_card(card, device)?;
         let loaded = (|| {
             let (free, _) = gpu.mem_info()?;
             let w = DraftWeights::load(gpu.stream(), draft, &target_file)?;
