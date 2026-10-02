@@ -5,7 +5,7 @@
 //! in f64 on the CPU, the `systemone()` body), `edge.jsonl` (6 encode-only requests) and, per suite
 //! request, `<id>.hidden.f32` and `<id>.lexical.{f32,ids}`. The requests themselves are
 //! `tools/ref/clef/{suite,edge}.jsonl`. The tokenizer is the Flash GGUF [`CLEF_GGUF`]; the head is
-//! the snapshot's `joint_head.safetensors` with its `joint_head_config.json`.
+//! the snapshot's `joint_head.safetensors` with its `joint_head_config.json` ([`CLEF_HEAD`]).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,6 +28,9 @@ fn requests_dir() -> PathBuf {
 
 /// The Flash GGUF `tools/ref/clef_ref.py`'s round quantized; the tokenizer reads its header only.
 const CLEF_GGUF: &str = "/models/clef-flash/clef-flash-Q4_K_M.gguf";
+
+/// The release snapshot's head, beside the model files.
+const CLEF_HEAD: &str = "/models/clef-flash/hf/joint_head.safetensors";
 
 fn jsonl(path: &PathBuf) -> Vec<Json> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -155,7 +158,7 @@ fn hw_clef_ids_equal_the_release() {
 }
 
 fn load_head() -> ClefHead {
-    let path = data().join("hf/joint_head.safetensors");
+    let path = PathBuf::from(CLEF_HEAD);
     ClefHead::open(&path, None).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
