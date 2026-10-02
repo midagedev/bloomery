@@ -6,6 +6,10 @@
 # unsafe the code needs, with a `PIN(YYYY-MM-DD):` line above the crate's line naming it and the block's
 # own `// SAFETY:`; never to let existing code off.
 app 0 0 0
+# PIN(2026-10-02): decision 0 -> 2 blocks, new code, not old code relaxed: ops.rs sgemm's call into matrixmultiply
+# (bounds asserted before it) and pool.rs's lifetime erasure of a task the caller joins before returning, each with
+# its SAFETY line.
+decision 2 0 0
 engram 6 0 0
 engram-lab 0 0 0
 gguf 9 2 0

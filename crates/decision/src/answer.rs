@@ -1,0 +1,247 @@
+//! Logits to the SystemOne response body, as the release's `systemone` and `systemone_answer` build it.
+//!
+//! Per question, the softmax runs in f32 over the options in span order; each probability is then the
+//! f64 of that f32 (torch's `.tolist()`), and every printed number is Python's `round(x, 4)`. A `choice`
+//! answer lists its options in the request's criteria order and picks the first highest there; a
+//! `score` is `sum(i · p_i)` as Python 3.12's `sum` adds floats (Neumaier-compensated).
+
+use crate::Error;
+use crate::encode::Encoded;
+use crate::json::Json;
+use crate::request::{Kind, Request};
+
+/// Python's `round(x, 4)` of a finite f64: the correctly rounded 4-decimal value (ties to even on the
+/// exact binary value), read back as the nearest f64.
+#[must_use]
+pub fn round4(x: f64) -> f64 {
+    format!("{x:.4}")
+        .parse()
+        .expect("a formatted f64 reads back")
+}
+
+/// CPython 3.12's `sum` over floats starting from the int 0.
+fn python_sum(values: impl Iterator<Item = f64>) -> f64 {
+    let (mut s, mut c) = (0.0f64, 0.0f64);
+    for x in values {
+        let t = s + x;
+        c += if s.abs() >= x.abs() {
+            (s - t) + x
+        } else {
+            (x - t) + s
+        };
+        s = t;
+    }
+    if c != 0.0 && c.is_finite() { s + c } else { s }
+}
+
+/// The f32 softmax of one question's logits.
+#[must_use]
+pub fn probabilities(logits: &[f32]) -> Vec<f32> {
+    let mut p = logits.to_vec();
+    crate::ops::softmax(&mut p);
+    p
+}
+
+fn num(x: f64) -> Json {
+    Json::Float(x)
+}
+
+/// The response body for `req`, encoded as `enc`, with `logits` from the head.
+pub fn answer(req: &Request, enc: &Encoded, logits: &[Vec<f32>]) -> Result<Json, Error> {
+    if logits.len() != enc.questions.len() || req.questions.len() != enc.questions.len() {
+        return Err(Error::Logits(format!(
+            "{} logit rows for {} questions",
+            logits.len(),
+            enc.questions.len()
+        )));
+    }
+    let mut answers = Vec::with_capacity(logits.len());
+    for ((q, eq), l) in req.questions.iter().zip(&enc.questions).zip(logits) {
+        if l.len() != eq.option_ids.len() || q.id != eq.id {
+            return Err(Error::Logits(format!(
+                "{}: {} logits for {} options",
+                eq.id,
+                l.len(),
+                eq.option_ids.len()
+            )));
+        }
+        let p32 = probabilities(l);
+        let p = |id: &str| -> f64 {
+            let i = eq
+                .option_ids
+                .iter()
+                .position(|o| o == id)
+                .expect("every option id has a logit");
+            f64::from(p32[i])
+        };
+        let body = match q.kind {
+            Kind::Noul => vec![
+                ("type".into(), Json::Str("noul".into())),
+                ("noul".into(), num(round4(p("true")))),
+            ],
+            Kind::Choice => {
+                let Some(Json::Object(criteria)) = &q.criteria else {
+                    unreachable!("a validated choice question has object criteria")
+                };
+                let order: Vec<&str> = criteria.iter().map(|(k, _)| k.as_str()).collect();
+                let mut best = order[0];
+                for &o in &order[1..] {
+                    if p(o) > p(best) {
+                        best = o;
+                    }
+                }
+                vec![
+                    ("type".into(), Json::Str("choice".into())),
+                    ("choice".into(), Json::Str(best.into())),
+                    ("confidence".into(), num(round4(p(best)))),
+                    (
+                        "probabilities".into(),
+                        Json::Object(
+                            order
+                                .iter()
+                                .map(|&o| (o.to_string(), num(round4(p(o)))))
+                                .collect(),
+                        ),
+                    ),
+                ]
+            }
+            Kind::Score => {
+                let Some(Json::Array(levels)) = &q.criteria else {
+                    unreachable!("a validated score question has array criteria")
+                };
+                let ids: Vec<String> = (0..levels.len()).map(|i| i.to_string()).collect();
+                let score = python_sum(ids.iter().enumerate().map(|(i, id)| i as f64 * p(id)));
+                let top = ids.iter().map(|id| p(id)).fold(f64::NEG_INFINITY, f64::max);
+                vec![
+                    ("type".into(), Json::Str("score".into())),
+                    ("score".into(), num(round4(score))),
+                    ("confidence".into(), num(round4(top))),
+                    (
+                        "legend".into(),
+                        Json::Object(ids.iter().cloned().zip(levels.iter().cloned()).collect()),
+                    ),
+                    (
+                        "probabilities".into(),
+                        Json::Object(
+                            ids.iter()
+                                .map(|id| (id.clone(), num(round4(p(id)))))
+                                .collect(),
+                        ),
+                    ),
+                ]
+            }
+        };
+        answers.push((q.id.clone(), Json::Object(body)));
+    }
+    Ok(Json::Object(vec![
+        ("model".into(), Json::Str(req.model.clone())),
+        ("answers".into(), Json::Object(answers)),
+        (
+            "usage".into(),
+            Json::Object(vec![
+                ("input_tokens".into(), Json::Int(enc.ids.len().to_string())),
+                ("output_tokens".into(), Json::Int("0".into())),
+            ]),
+        ),
+    ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::encode_with;
+    use crate::json::parse;
+    use crate::render::dumps;
+
+    /// Each right side is CPython's `round(left, 4)`.
+    #[test]
+    fn round4_is_pythons() {
+        for (x, want) in [
+            (0.12345, 0.1235), // 0.12345 is stored as 0.123450000000000004174…
+            (0.00005, 0.0001), // stored as 5.00000000000000023960…e-05
+            (0.00015, 0.0001), // stored as 1.49999999999999993…e-04
+            (2.675e-5, 0.0),
+            (0.99995, 1.0), // stored as 0.999950000000000027…
+            (0.5, 0.5),
+            (1.0 / 3.0, 0.3333),
+            (f64::from(0.734_521_9f32), 0.7345),
+        ] {
+            assert_eq!(round4(x), want, "{x:e}");
+        }
+    }
+
+    #[test]
+    fn neumaier_sum_matches_python() {
+        // sum([0.1] * 10) == 1.0 in Python 3.12 (plain left-to-right addition gives 0.9999999999999999).
+        assert_eq!(python_sum(std::iter::repeat_n(0.1, 10)), 1.0);
+        assert_eq!(python_sum([1e100, 1.0, -1e100].into_iter()), 1.0);
+    }
+
+    fn body(text: &str, logits: &[Vec<f32>]) -> (String, usize) {
+        let req = Request::from_json(&parse(text).unwrap()).unwrap();
+        let enc = encode_with(
+            &mut |t: &str| t.bytes().map(u32::from).collect(),
+            &req,
+            16384,
+        )
+        .unwrap();
+        (
+            dumps(&answer(&req, &enc, logits).unwrap(), false),
+            enc.ids.len(),
+        )
+    }
+
+    #[test]
+    fn the_body_has_the_release_shape() {
+        // Logits arrive in span order: choice options sorted (billing, technical), noul (true, false).
+        let (got, n) = body(
+            r#"{"model":"clef-flash","state":"s","questions":{
+               "department":{"type":"choice","criteria":{"technical":"Bugs","billing":"Pay"}},
+               "urgency":{"type":"score","criteria":["Can wait","This week","Today"]},
+               "outage":{"type":"noul"}}}"#,
+            &[vec![0.0, 2.0], vec![0.0, 1.0, 0.5], vec![1.0, -1.0]],
+        );
+        // p(technical) = 1/(1+e⁻²) = 0.880797; urgency p = softmax(0, 1, 0.5) = (0.186324, 0.506480,
+        // 0.307196); score = 0.506480 + 2·0.307196 = 1.120872.
+        let want = format!(
+            "{}{}{}{}{}",
+            r#"{"model":"clef-flash","answers":{"department":{"type":"choice","choice":"technical","confidence":0.8808,"#,
+            r#""probabilities":{"technical":0.8808,"billing":0.1192}},"#,
+            r#""urgency":{"type":"score","score":1.1209,"confidence":0.5065,"legend":{"0":"Can wait","1":"This week","2":"Today"},"#,
+            r#""probabilities":{"0":0.1863,"1":0.5065,"2":0.3072}},"outage":{"type":"noul","noul":0.8808}},"#,
+            format_args!(r#""usage":{{"input_tokens":{n},"output_tokens":0}}}}"#),
+        );
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_first_option_in_request_order() {
+        let (got, _) = body(
+            r#"{"model":"m","state":"s","questions":{"q":{"type":"choice","criteria":{"b":"B","a":"A"}}}}"#,
+            &[vec![0.0, 0.0]],
+        );
+        assert!(
+            got.contains(r#""choice":"b","confidence":0.5,"probabilities":{"b":0.5,"a":0.5}"#),
+            "{got}"
+        );
+    }
+
+    #[test]
+    fn mismatched_logits_are_refused() {
+        let req = Request::from_json(
+            &parse(r#"{"model":"m","state":"s","questions":{"q":{"type":"noul"}}}"#).unwrap(),
+        )
+        .unwrap();
+        let enc = encode_with(
+            &mut |t: &str| t.bytes().map(u32::from).collect(),
+            &req,
+            16384,
+        )
+        .unwrap();
+        assert!(matches!(
+            answer(&req, &enc, &[vec![0.0]]),
+            Err(Error::Logits(_))
+        ));
+        assert!(matches!(answer(&req, &enc, &[]), Err(Error::Logits(_))));
+    }
+}

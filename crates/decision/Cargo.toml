@@ -1,0 +1,27 @@
+[package]
+name = "bloomery-decision"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "A decision model's request encoder and joint schema head (Clef's), on the host in f32"
+
+[lib]
+name = "decision"
+
+[[bin]]
+name = "decision_encode"
+path = "src/bin/decision_encode.rs"
+
+[[bin]]
+name = "decision_answer"
+path = "src/bin/decision_answer.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gguf = { path = "../gguf" }
+bloomery-tokenizer = { path = "../tokenizer" }
+thiserror.workspace = true
+matrixmultiply.workspace = true

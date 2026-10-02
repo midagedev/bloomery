@@ -892,6 +892,11 @@ gate-engram:
 # (ik main + `~`를 S에 넣는 한 줄, ik#2528)이고, 참조의 `~/`가 [71520]이 아니면 거부한다 — #2528이 들어가면 되돌린다.
 gate-tokenizer:
     ./tools/box.sh 'timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf TOKENIZER_SET=tokenizer-qwen3moe timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && TOKENIZE=/home/user/ik-tokref/build/bin/llama-tokenize TOKENIZER_VOCAB=/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf TOKENIZER_SET=tokenizer-glm5next timeout --kill-after=10 300 bash crates/tokenizer/tools/oracle.sh && bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
+# Clef's request encoder, joint schema head and SystemOne answer (crates/decision, host only) against the
+# release's own Python (tools/ref/clef_ref.py's files under $BLOOMERY_DATA/clef/flash/ref): ids and spans
+# exact, f32 logits inside the derived band of the f64 referee, the body's shape and top options.
+gate-decision-clef:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --lib --test clef -- --include-ignored --nocapture'
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙(정지 id 목록 전부), V4.1·GLM 채팅 템플릿 렌더링,
 # GLM 도구 호출 파서(glmxml), 연결 상한·유휴 연결 종료·컨텍스트 끝의 정지(limits). 박스 자원 불필요.
 gate-serve:

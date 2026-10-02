@@ -57,4 +57,5 @@ crates/model/tests/union.rs	BLOOMERY_MODEL	stays: the model file the harness ope
 crates/qdot/tests/qdot.rs	BLOOMERY_MODEL,BLOOMERY_DATA,BLOOMERY_Q5K_MODEL,BLOOMERY_V4_MODEL	stays: the model files and the data directory
 crates/serve/build.rs	CARGO_MANIFEST_DIR,BLOOMERY_GIT_COMMIT	stays: cargo's crate directory and the synced tree's commit
 crates/tokenizer/tests/tokenizer.rs	BLOOMERY_QWEN3MOE_VOCAB,BLOOMERY_DATA	stays: the vocabulary file and the data directory
+crates/decision/tests/clef.rs	BLOOMERY_DATA	stays: the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set
