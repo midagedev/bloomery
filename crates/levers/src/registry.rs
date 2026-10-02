@@ -1201,6 +1201,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "Seconds `tools/ref/build-dump-draft.sh` lets the reference build run.",
     ),
     runner(
+        "BLOOMERY_BUILD_COMMIT",
+        Some("release/build.sh"),
+        "The commit a release build's `--version` names, read by cargo at build time \
+         (`model_file::version`); `unknown` when unset. A running binary never reads it.",
+    ),
+    runner(
         "BLOOMERY_BUNDLE_BAND_DUMP",
         None,
         "The model attention gate's handshake with the child it runs of its own test \
