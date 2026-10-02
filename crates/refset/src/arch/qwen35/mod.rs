@@ -1,8 +1,10 @@
 //! The Qwen3.5 dense (Clef backbone) families. The hidden-state sets are
 //! llama.cpp mainline's `result_norm` of every position, written by
-//! `tools/ref/hidden_ref.cpp` in the node dumps' set format from the
-//! Q4_K_M file [`MODEL`] by the mainline tree [`LCPP_BUILD`]
-//! (`tools/ref/models/qwen35.sh`).
+//! `tools/ref/hidden_ref.cpp` in the node dumps' set format by the mainline
+//! tree [`LCPP_BUILD`] (`tools/ref/models/qwen35.sh`): [`HIDDEN`] from the
+//! 27B Q4_K_M file [`MODEL`], [`HIDDEN_FLASH_Q8`] from Clef-Flash's published
+//! Q8_0 file [`MODEL_FLASH_Q8`] — one family a file, so a set of one is
+//! refused by name where the other is read.
 
 use crate::family::{Build, Family, Identity};
 
@@ -27,9 +29,27 @@ pub const P4096: &str = "ref_qwen35_hidden_p4096";
 /// The sets, shortest first.
 pub const HIDDEN_SETS: &[&str] = &[P64, P600, P4096];
 
+/// Clef-Flash (32 layers, width 4,096) as bartowski publishes it at Q8_0:
+/// every projection Q8_0, β and α F32.
+pub const MODEL_FLASH_Q8: &str = "/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf";
+
+/// The same 64, 600 and 4,096 prose ids (Clef-Flash's tokenizer is the
+/// 27B's, byte for byte) through [`MODEL_FLASH_Q8`].
+pub const FLASH_Q8_P64: &str = "ref_qwen35_flashq8_hidden_p64";
+pub const FLASH_Q8_P600: &str = "ref_qwen35_flashq8_hidden_p600";
+pub const FLASH_Q8_P4096: &str = "ref_qwen35_flashq8_hidden_p4096";
+
+/// The Flash Q8_0 sets, shortest first.
+pub const FLASH_Q8_SETS: &[&str] = &[FLASH_Q8_P64, FLASH_Q8_P600, FLASH_Q8_P4096];
+
 /// [`MODEL`], as a family's `runs`.
 fn model() -> String {
     MODEL.to_string()
+}
+
+/// [`MODEL_FLASH_Q8`], as a family's `runs`.
+fn model_flash_q8() -> String {
+    MODEL_FLASH_Q8.to_string()
 }
 
 /// llama.cpp mainline's final-norm hidden states.
@@ -46,12 +66,26 @@ pub static HIDDEN: Family = Family {
     consumers: &["gate-gpu-clef-hidden"],
 };
 
+/// llama.cpp mainline's final-norm hidden states of Clef-Flash at Q8_0.
+pub static HIDDEN_FLASH_Q8: Family = Family {
+    name: "hidden-qwen35-flash-q8",
+    sets: FLASH_Q8_SETS,
+    resolve: None,
+    recipe: "just dump-hidden-qwen35",
+    identity: Identity::Manifest,
+    arch: Some(ARCH),
+    build: Some(Build::Is(LCPP_BUILD)),
+    runs: Some(model_flash_q8),
+    draft_runs: None,
+    consumers: &["gate-gpu-clef-hidden"],
+};
+
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&HIDDEN];
+pub static FAMILIES: &[&Family] = &[&HIDDEN, &HIDDEN_FLASH_Q8];
 
 #[cfg(test)]
 mod tests {
-    use super::{ARCH, HIDDEN, LCPP_BUILD, MODEL};
+    use super::{ARCH, HIDDEN, HIDDEN_FLASH_Q8, LCPP_BUILD, MODEL, MODEL_FLASH_Q8};
     use crate::RefError;
     use std::path::Path;
 
@@ -98,6 +132,29 @@ mod tests {
             let e = HIDDEN.check_set(&dir).expect_err("refused").to_string();
             assert!(e.contains(want), "{model} {build} {arch} {complete}: {e}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Each file's sets open through its own family only: a Flash Q8_0 set
+    /// is read by its family and refused by the 27B's, and the other way.
+    #[test]
+    fn a_set_opens_through_its_files_family_only() -> Result<(), RefError> {
+        let dir = std::env::temp_dir().join(format!(
+            "bloomery-refset-qwen35-flash-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).map_err(|e| RefError::missing(&dir, e.to_string()))?;
+        write_set(&dir, MODEL_FLASH_Q8, LCPP_BUILD, ARCH, true);
+        assert_eq!(HIDDEN_FLASH_Q8.check_set(&dir)?.dumped_from, MODEL_FLASH_Q8);
+        let e = HIDDEN.check_set(&dir).expect_err("refused").to_string();
+        assert!(e.contains("dumped from"), "{e}");
+        write_set(&dir, MODEL, LCPP_BUILD, ARCH, true);
+        let e = HIDDEN_FLASH_Q8
+            .check_set(&dir)
+            .expect_err("refused")
+            .to_string();
+        assert!(e.contains("dumped from"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

@@ -282,6 +282,56 @@ impl KvPlanes {
     }
 }
 
+/// What an arena holds beyond the K-quant chain's buffers, from the sites
+/// its plans launch (`Forms::of`): the wide arm's activation forms — each
+/// input's q8_1 blocks of 128 for a K-quant site, its q8 blocks of 32 for a
+/// Q8_0 site — and on the gemv arm the gate and up rows of an unfused
+/// gate·up, and the row-major output of a K-quant site launched alone at
+/// more than one row (`cols` values a column). [`Forms::KQUANT`] is a chain
+/// of fused Q4_K and Q6_K sites: the buffers the arena held before any other
+/// type ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Forms {
+    pub(super) hid: Wants,
+    pub(super) attn: Wants,
+    pub(super) h: Wants,
+    pub(super) glu: bool,
+    pub(super) cols: usize,
+}
+
+/// Which quantized forms of one wide input the sites read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Wants {
+    pub(super) q128: bool,
+    pub(super) q32: bool,
+}
+
+impl Forms {
+    pub(super) const KQUANT: Forms = Forms {
+        hid: Wants {
+            q128: true,
+            q32: false,
+        },
+        attn: Wants {
+            q128: true,
+            q32: false,
+        },
+        h: Wants {
+            q128: true,
+            q32: false,
+        },
+        glu: false,
+        cols: 0,
+    };
+}
+
+/// The gemv arm's gate and up rows of an unfused gate·up, `slots · ff` a
+/// token each: the SwiGLU reads both into `h`.
+pub(super) struct Glu {
+    pub(super) g: DeviceBuffer<f32>,
+    pub(super) u: DeviceBuffer<f32>,
+}
+
 /// The arena, in chain order: every intermediate of one layer for up to
 /// `rows` tokens, token-major, shared by all layers (they run in turn). The
 /// decode step's arena has one row, a pass's [`GEMV_COLS`], a prompt's up to
@@ -349,6 +399,12 @@ pub(super) struct Arena {
     pub(super) gdn: Option<GdnArena>,
     /// What the ops' wide arm reads; `Some` iff `rows > GEMV_COLS`.
     pub(super) wide: Option<Wide>,
+    /// The gemv arm's unfused gate·up rows (`Forms::glu`).
+    pub(super) glu: Option<Glu>,
+    /// The gemv arm's row-major output of a K-quant site launched alone, at
+    /// more than one row (`Forms::cols` values a column); `None` on a
+    /// one-row arena.
+    pub(super) cols: Option<DeviceBuffer<f32>>,
 }
 
 /// Where the FFN's slots come from: a router launch's results — the plain
@@ -714,9 +770,20 @@ pub(super) unsafe fn f32_view(
 }
 
 impl Arena {
-    /// Allocate the arena for `d` and up to `rows` tokens: `wide::arena_bytes`
-    /// device bytes. Load-time only.
+    /// Allocate the arena of a chain of fused K-quant sites for `d` and up
+    /// to `rows` tokens ([`Forms::KQUANT`]). Load-time only.
     pub(super) fn new(stream: &CudaStream, d: Dims, rows: usize) -> Result<Arena, GpuError> {
+        Arena::with(stream, d, rows, Forms::KQUANT)
+    }
+
+    /// Allocate the arena for `d`, up to `rows` tokens and the sites' forms
+    /// `forms`: `wide::arena_bytes` device bytes. Load-time only.
+    pub(super) fn with(
+        stream: &CudaStream,
+        d: Dims,
+        rows: usize,
+        forms: Forms,
+    ) -> Result<Arena, GpuError> {
         let (q_len, kv_len, attn_len) = (d.q_rows, d.kv_len(), d.attn_len());
         let gated = q_len != attn_len;
         let narrow = rows.min(GEMV_COLS);
@@ -793,7 +860,19 @@ impl Arena {
                 .map(|shape| GdnArena::new(stream, shape, rows))
                 .transpose()?,
             wide: (rows > GEMV_COLS)
-                .then(|| Wide::new(stream, &d, rows))
+                .then(|| Wide::new(stream, &d, rows, forms))
+                .transpose()?,
+            glu: forms
+                .glu
+                .then(|| {
+                    Ok::<_, GpuError>(Glu {
+                        g: f(narrow * d.slots() * d.ff)?,
+                        u: f(narrow * d.slots() * d.ff)?,
+                    })
+                })
+                .transpose()?,
+            cols: (rows > 1 && forms.cols > 0)
+                .then(|| f(narrow * forms.cols))
                 .transpose()?,
             dims: d,
             rows,
@@ -847,6 +926,11 @@ impl Arena {
             + self.q_out.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.gdn.as_ref().map_or(0, GdnArena::bytes)
             + self.wide.as_ref().map_or(0, Wide::bytes)
+            + self
+                .glu
+                .as_ref()
+                .map_or(0, |g| g.g.num_bytes() + g.u.num_bytes())
+            + self.cols.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.route.bytes()
             + acts.map(act_bytes).sum::<usize>()
     }

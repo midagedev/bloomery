@@ -270,7 +270,7 @@ impl GpuModel<Body35> {
         b.rp.write(stream, &vec![0; m], pos)?;
         {
             let io = b.rp.io(m)?;
-            dispatch::embed_rows(gpu, w, &io, &mut b.a)?;
+            dispatch::embed_rows(gpu, w, &b.k, &io, &mut b.a)?;
         }
         // `x_in` replaces the embedding rows the front wrote; the window
         // lives for this copy alone.

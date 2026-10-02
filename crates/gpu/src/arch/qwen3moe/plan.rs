@@ -26,14 +26,7 @@ use model::arch::models::{
     Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe,
 };
 
-/// The two K-quants a mixed site comes in: a value projection, an experts'
-/// down stack or a delta layer's q·k·v projection is Q4_K on some layers
-/// and Q6_K on the rest; every other projection is Q4_K.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kq {
-    Q4K,
-    Q6K,
-}
+pub(super) use crate::site::{Form, SiteTy};
 
 /// One layer's plan.
 pub(super) struct LayerPlan {
@@ -86,15 +79,18 @@ pub(super) struct GqaPlan {
     pub(super) attn_q_norm: String,
     pub(super) attn_k_norm: String,
     pub(super) attn_output: String,
-    pub(super) v_ty: Kq,
+    /// The file's types of `attn_q`, `attn_k`, `attn_v` and `attn_output`.
+    pub(super) q_ty: SiteTy,
+    pub(super) k_ty: SiteTy,
+    pub(super) v_ty: SiteTy,
+    pub(super) o_ty: SiteTy,
 }
 
 /// A gated-delta-rule layer's names, types and head counts.
 pub(super) struct DeltaPlan {
     pub(super) attn_norm: String,
-    /// The q·k·v channels' projection (`attn_qkv`), Q4_K or Q6_K.
+    /// The q·k·v channels' projection (`attn_qkv`).
     pub(super) qkv: String,
-    pub(super) qkv_ty: Kq,
     /// The output gate's projection `z` (`attn_gate`).
     pub(super) gate: String,
     /// The β and α projections, one value per value head.
@@ -109,6 +105,12 @@ pub(super) struct DeltaPlan {
     /// The output projection back to the residual.
     pub(super) ssm_out: String,
     pub(super) shape: LinearShape,
+    /// The file's types of `attn_qkv`, `attn_gate`, β, α and `ssm_out`.
+    pub(super) qkv_ty: SiteTy,
+    pub(super) gate_ty: SiteTy,
+    pub(super) beta_ty: SiteTy,
+    pub(super) alpha_ty: SiteTy,
+    pub(super) out_ty: SiteTy,
 }
 
 /// An FFN's names and types: the three stacks every slot reads (a routed
@@ -120,7 +122,10 @@ pub(super) struct FfnPlan {
     pub(super) gate: String,
     pub(super) up: String,
     pub(super) down: String,
-    pub(super) down_ty: Kq,
+    /// The file's types of the three stacks.
+    pub(super) gate_ty: SiteTy,
+    pub(super) up_ty: SiteTy,
+    pub(super) down_ty: SiteTy,
 }
 
 /// How a token's FFN slots are picked.
@@ -164,6 +169,50 @@ impl LayerPlan {
             FfnRoute::Router { shared, .. } => n_used + usize::from(shared.is_some()),
             FfnRoute::Dense => 1,
         }
+    }
+}
+
+/// Whether every one of `tys` is Q4_K: a fused group of Q4_K launches
+/// (one launch over several matrices, or a projection with its neighbour
+/// folded in) runs only then.
+fn all_q4k(tys: &[SiteTy]) -> bool {
+    tys.iter().all(|t| *t == SiteTy::Q4K)
+}
+
+impl GqaPlan {
+    /// The gemv arm's fused q·k·v: Q4_K q and k with a K-quant v (a Q6_K v
+    /// in its own gemv); otherwise each projection launches alone.
+    pub(super) fn qkv_fused(&self) -> bool {
+        all_q4k(&[self.q_ty, self.k_ty]) && self.v_ty.kquant()
+    }
+
+    /// The gemv arm's output projection with the residual add folded in: a
+    /// Q4_K `attn_output`.
+    pub(super) fn o_fused(&self) -> bool {
+        all_q4k(&[self.o_ty])
+    }
+}
+
+impl DeltaPlan {
+    /// The gemv arm's two input launches: a K-quant q·k·v projection
+    /// (a Q6_K one in its own gemv) and Q4_K `z`, β and α; otherwise each
+    /// projection launches alone.
+    pub(super) fn input_fused(&self) -> bool {
+        self.qkv_ty.kquant() && all_q4k(&[self.gate_ty, self.beta_ty, self.alpha_ty])
+    }
+
+    /// The gemv arm's output projection with the residual add folded in: a
+    /// Q4_K `ssm_out`.
+    pub(super) fn out_fused(&self) -> bool {
+        all_q4k(&[self.out_ty])
+    }
+}
+
+impl FfnPlan {
+    /// The gemv arm's gate·up·SwiGLU in one launch: Q4_K gate and up;
+    /// otherwise each launches alone and the SwiGLU after them.
+    pub(super) fn gate_up_fused(&self) -> bool {
+        all_q4k(&[self.gate_ty, self.up_ty])
     }
 }
 
@@ -255,8 +304,8 @@ fn gqa_fits(g: &Gqa) -> Result<Flash, String> {
 }
 
 /// Ok when a dense FFN of `ff` values with `act` is the one the body runs:
-/// SwiGLU with no limit through the routed launches at one slot (Q4_K gate
-/// and up, the `_sel` down), `ff` whole K-quant super-blocks.
+/// SwiGLU with no limit through the routed launches at one slot, `ff` whole
+/// K-quant super-blocks.
 fn dense_fits(ff: u32, act: Act) -> Result<(), String> {
     if ff > 0 && ff.is_multiple_of(q35::SUPER_BLOCK) && matches!(act, Act::SwiGlu { limit: None }) {
         Ok(())
@@ -476,8 +525,9 @@ mod tests {
 
     /// Qwen3.5-27B's layers run: 24/4 heads take the pairs flash, 16/48
     /// delta heads the delta shape, and a dense FFN of 17408 the one-slot
-    /// route; a group the body launches no flash for (12, the `_p4` row's) and
-    /// a dense width of no whole super-block are refused by name.
+    /// route; a group the body launches no flash for (3: neither eight nor a
+    /// whole number of pairs) and a dense width of no whole super-block are
+    /// refused by name.
     #[test]
     fn a_dense_qwen35_layer_runs_and_its_misfits_are_refused() {
         let dense = |mixer: Mixer, ff: u32| LayerSpec {
@@ -506,7 +556,7 @@ mod tests {
         };
         assert_eq!(got, [Kind35::Delta(shape), Kind35::Gqa(Flash::Pairs)]);
         for (at, bad) in [
-            (0usize, dense(gqa_of(24, 2), 17408)),
+            (0usize, dense(gqa_of(24, 8), 17408)),
             (1, dense(wide, 17400)),
         ] {
             let mut layers = vec![dense(gqa_of(24, 4), 17408), dense(gqa_of(24, 4), 17408)];

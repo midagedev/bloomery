@@ -6,11 +6,15 @@
 //! columns.
 //!
 //! A wide op reads each weight once for the unit: every projection runs
-//! through the grouped int8 GEMM over a one-expert table ([`route_dense`],
-//! filled once per unit after its embedding), the routed experts through one
-//! table per layer (gate and up reading each token's column, down each
-//! slot's own), a dense FFN's three matrices through the one-expert table
-//! (its one slot a token is the token's column); the norms, the quantizers, the rope with the cache append,
+//! through the GEMM its file type picks (`crate::site::gemm`: a K-quant the
+//! grouped int8 GEMM over q8_1 blocks of 128, a Q8_0 the 32-value GEMM over
+//! q8 blocks of 32, an F32 the F32 tile) over a one-expert table
+//! ([`route_dense`], filled once per unit after its embedding), the routed
+//! experts through one table per layer (gate and up reading each token's
+//! column, down each slot's own), a dense FFN's three matrices through the
+//! one-expert table (its one slot a token is the token's column). A unit's
+//! rows are quantized into exactly the forms the sites reading them take;
+//! the norms, the quantizers, the rope with the cache append,
 //! the prefill flash, the router's two launches, the SwiGLU quantizer and
 //! the combine run over the unit's rows. The conv, the delta step and the
 //! gated norm are the gemv arm's own launches: they already take any row
@@ -28,18 +32,20 @@
 use super::body::ATTN_SCALE_256;
 use super::dispatch::Ctx;
 use super::experts::CombineArgs;
-use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kq};
+use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, SiteTy};
 use super::router::MAX_TOKENS;
-use super::scratch::{Arena, Dims, GdnArena, KvPlanes};
+use super::scratch::{Arena, Dims, Forms, GdnArena, KvPlanes, Wants};
 use crate::GpuError;
 use crate::flash_gqa::{HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
 use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gated_quant::GateLayout;
-use crate::gemm::{GEMM_BN, GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
+use crate::gemm::{GEMM_BN, GEMM_MAX_SLOTS, GEMM32_STEP, GemmAct, GemmAct32, GemmInput, GemmRoute};
 use crate::linear::{self, LinearShape};
 use crate::model::MAX_PASS_ROWS;
-use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
+use crate::model::lookup::{f32_gain, f32_tensor};
+use crate::q38::OutGateArgs;
 use crate::rope_neox::PartialNeoxArgs;
+use crate::site::{self, WideIn, WideKernels};
 use cuda_core::{CudaStream, DeviceBuffer};
 
 /// The most rows an op runs through its gemv arm — ik's matrix-vector cut
@@ -49,18 +55,84 @@ const _: () = assert!(GEMV_COLS == MAX_TOKENS);
 
 const WHAT: &str = "qwen3moe::wide";
 
+/// One wide input's quantized forms, each held when a site reads it
+/// ([`Wants`]): q8_1 blocks of 128 for a K-quant site, q8 blocks of 32 for a
+/// Q8_0 site.
+struct Acts {
+    q128: Option<GemmAct>,
+    q32: Option<GemmAct32>,
+}
+
+impl Acts {
+    fn new(stream: &CudaStream, want: Wants, cols: usize, k: usize) -> Result<Acts, GpuError> {
+        Ok(Acts {
+            q128: want
+                .q128
+                .then(|| GemmAct::new(stream, cols, k))
+                .transpose()?,
+            q32: want
+                .q32
+                .then(|| GemmAct32::new(stream, cols, k))
+                .transpose()?,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.q128.as_ref().map_or(0, GemmAct::bytes) + self.q32.as_ref().map_or(0, GemmAct32::bytes)
+    }
+
+    /// The forms `x`'s first `m` columns are quantized into for sites of
+    /// types `tys`: each form one of them reads, and nothing else.
+    fn quantize(
+        &mut self,
+        c: &Ctx<'_>,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        tys: &[SiteTy],
+    ) -> Result<(), GpuError> {
+        const WHAT_Q: &str = "qwen3moe::wide::quantize";
+        let reads = |f: Form| tys.iter().any(|t| t.reads() == f);
+        if reads(Form::Q8x128) {
+            let a = self.q128.as_mut().ok_or(GpuError::state(
+                WHAT_Q,
+                "the wide part's q8_1 blocks of 128 (a K-quant site reads them)",
+            ))?;
+            c.gpu.enqueue_quantize_gemm(x, m, a, c.sink)?;
+        }
+        if reads(Form::Q8x32) {
+            let a = self.q32.as_mut().ok_or(GpuError::state(
+                WHAT_Q,
+                "the wide part's q8 blocks of 32 (a Q8_0 site reads them)",
+            ))?;
+            c.k.q35(WHAT_Q)?
+                .g32
+                .enqueue_quantize_gemm32(c.gpu.stream(), x, m, a, c.sink)?;
+        }
+        Ok(())
+    }
+
+    /// The forms beside the f32 rows `f32` a site picks from.
+    fn input<'a>(&'a self, f32: &'a DeviceBuffer<f32>) -> WideIn<'a> {
+        WideIn {
+            q128: self.q128.as_ref(),
+            q32: self.q32.as_ref(),
+            f32: Some(f32),
+        }
+    }
+}
+
 /// The wide part of an arena of `rows > GEMV_COLS` rows: the GEMMs'
 /// activations, the second SwiGLU operand, the output projection's rows and
 /// the two route tables.
 pub(super) struct Wide {
-    /// q8_1 of the normed rows (`hidden` a token): the mixer's projections'
-    /// input, then the experts' gate·up input.
-    act_hid: GemmAct,
-    /// q8_1 of the attention rows (or a delta layer's gated norm): the
-    /// output projection's input.
-    act_attn: GemmAct,
-    /// q8_1 of the slots' SwiGLU, one column per slot: the down's input.
-    act_h: GemmAct,
+    /// The normed rows (`hidden` a token): the mixer's projections' input,
+    /// then the experts' gate·up input.
+    act_hid: Acts,
+    /// The attention rows (or a delta layer's gated norm): the output
+    /// projection's input.
+    act_attn: Acts,
+    /// The slots' SwiGLU, one column per slot: the down's input.
+    act_h: Acts,
     /// The up rows, per slot `ff` values; the gate rows are the arena's `h`.
     up: DeviceBuffer<f32>,
     /// The output projection's rows; the residual add reads them.
@@ -75,9 +147,15 @@ pub(super) struct Wide {
 }
 
 impl Wide {
-    /// The wide part for `rows` tokens of `d`, or a named refusal when their
-    /// slots pass the GEMM's route table. Load-time only.
-    pub(super) fn new(stream: &CudaStream, d: &Dims, rows: usize) -> Result<Wide, GpuError> {
+    /// The wide part for `rows` tokens of `d` and the sites' forms `forms`,
+    /// or a named refusal when their slots pass the GEMM's route table.
+    /// Load-time only.
+    pub(super) fn new(
+        stream: &CudaStream,
+        d: &Dims,
+        rows: usize,
+        forms: Forms,
+    ) -> Result<Wide, GpuError> {
         let slots = rows * d.slots();
         if slots > GEMM_MAX_SLOTS {
             return Err(GpuError::shape(
@@ -91,9 +169,9 @@ impl Wide {
         }
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         Ok(Wide {
-            act_hid: GemmAct::new(stream, rows, d.hidden)?,
-            act_attn: GemmAct::new(stream, rows, d.attn_len())?,
-            act_h: GemmAct::new(stream, slots, d.ff)?,
+            act_hid: Acts::new(stream, forms.hid, rows, d.hidden)?,
+            act_attn: Acts::new(stream, forms.attn, rows, d.attn_len())?,
+            act_h: Acts::new(stream, forms.h, slots, d.ff)?,
             up: f(slots * d.ff)?,
             attn_o: f(rows * d.hidden)?,
             dense: GemmRoute::new(stream, rows, 1)?,
@@ -126,6 +204,17 @@ fn act_col_bytes(k: usize) -> usize {
         + 10 * n_sb * 4
 }
 
+/// Bytes of one `GemmAct32` column of `k` values: per 64-value step sixteen
+/// code words, two scales and two sums.
+fn act32_col_bytes(k: usize) -> usize {
+    k.div_ceil(GEMM32_STEP) * (16 + 2 + 2) * 4
+}
+
+/// Bytes of one wide input's forms `want` over `cols` columns of `k`.
+fn wants_bytes(want: Wants, cols: usize, k: usize) -> usize {
+    cols * (usize::from(want.q128) * act_col_bytes(k) + usize::from(want.q32) * act32_col_bytes(k))
+}
+
 /// Bytes of a route table for `slots` slots over `experts` experts.
 fn route_bytes(slots: usize, experts: usize) -> usize {
     let tiles = slots / GEMM_BN + experts.min(slots);
@@ -143,10 +232,11 @@ fn gdn_bytes(s: LinearShape, rows: usize) -> usize {
     (rows * (c + zl + 2 * nv) + rows * c + 2 * rows * nv + rows * zl + cols) * 4
 }
 
-/// The device bytes `Arena::new(d, rows)` allocates, from `d` and `rows`
-/// alone: what a load checks against the card's free bytes before it
-/// allocates the arena, and what the arena it then allocates must hold.
-pub(super) fn arena_bytes(d: &Dims, rows: usize) -> usize {
+/// The device bytes `Arena::with(d, rows, forms)` allocates, from `d`, `rows`
+/// and `forms` alone: what a load checks against the card's free bytes
+/// before it allocates the arena, and what the arena it then allocates must
+/// hold.
+pub(super) fn arena_bytes(d: &Dims, rows: usize, forms: Forms) -> usize {
     let n = rows.min(GEMV_COLS);
     let (q_len, kv_len, att, slots) = (d.q_rows, d.kv_len(), d.attn_len(), d.slots());
     let part_v = if d.head == HEAD_256 {
@@ -161,7 +251,9 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize) -> usize {
         + part_v
         + partials_ms_len(n, d.n_head, d.ctx)
         + rows * att
-        + rows * slots * (d.ff + d.hidden);
+        + rows * slots * (d.ff + d.hidden)
+        + if forms.glu { 2 * n * slots * d.ff } else { 0 }
+        + if rows > 1 { n * forms.cols } else { 0 };
     let u32s = 2 * rows;
     let acts: usize = (1..=n)
         .map(|m| {
@@ -174,8 +266,9 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize) -> usize {
     };
     let wide = if rows > GEMV_COLS {
         let s = rows * slots;
-        rows * (act_col_bytes(d.hidden) + act_col_bytes(att))
-            + s * act_col_bytes(d.ff)
+        wants_bytes(forms.hid, rows, d.hidden)
+            + wants_bytes(forms.attn, rows, att)
+            + wants_bytes(forms.h, s, d.ff)
             + (s * d.ff + rows * d.hidden) * 4
             + route_bytes(rows, 1)
             + d.router.map_or(0, |r| route_bytes(s, r.logits()))
@@ -183,14 +276,6 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize) -> usize {
         0
     };
     (f32s + u32s) * 4 + acts + route + d.lin.map_or(0, |s| gdn_bytes(s, rows)) + wide
-}
-
-/// The GEMM's type for a projection of `kq`.
-fn gemm_ty(kq: Kq) -> GemmWeight {
-    match kq {
-        Kq::Q4K => GemmWeight::Q4K,
-        Kq::Q6K => GemmWeight::Q6K,
-    }
 }
 
 /// The arena's wide part, or a named refusal (an arena of at most
@@ -202,29 +287,27 @@ fn wide_of<'a>(w: &'a mut Option<Wide>, what: &'static str) -> Result<&'a mut Wi
     ))
 }
 
-/// Enqueue `y = W · x` for `rows` rows of weight `name` (of type `kq`) over
-/// the columns `route` holds, `input` picking each slot's column of `act`.
+/// Enqueue `y = W · x` for `rows` rows of weight `name` (of type `ty`) over
+/// the columns `route` holds, `input` picking each slot's column of the
+/// forms `x` holds, `m` the unit's rows.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one site's context, weight, rows, inputs, table, width and output (rust-quality R8)"
+)]
 fn gemm(
     c: &Ctx<'_>,
-    (kq, name): (Kq, &str),
+    (ty, name): (SiteTy, &str),
     rows: usize,
-    act: &GemmAct,
-    route: &GemmRoute,
-    input: GemmInput,
+    x: &WideIn<'_>,
+    (route, input): (&GemmRoute, GemmInput),
+    m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    c.k.gemm.enqueue_gemm(
-        c.gpu.stream(),
-        GemmArgs {
-            ty: gemm_ty(kq),
-            w: kq_weight(c.w, name)?,
-            rows_per_expert: rows,
-            act,
-            route,
-            input,
-            y,
-        },
-    )
+    let k = WideKernels {
+        gemm: &c.k.gemm,
+        g32: &c.k.q35(WHAT)?.g32,
+    };
+    site::gemm(c.gpu, &k, (ty, c.w, name), rows, x, (route, input), m, y)
 }
 
 /// The one-expert table of a unit of `m` rows: `m` slots on expert 0, slot
@@ -238,8 +321,11 @@ pub(super) fn route_dense(c: &Ctx<'_>, s: &mut Arena, m: usize) -> Result<(), Gp
 
 /// The attention half at `m` rows: `x` in, `ffn_inp = x + W_o · (flash ⊙
 /// σ(gate))` out, the unit's K/V rows appended to the layer's planes at the
-/// rows' positions. Qwen3's head-128 attention takes its wide rows through
-/// `ubatch.rs` and is refused here by name.
+/// rows' positions. A K-quant `attn_output` reads the gated rows quantized
+/// in one launch; any other type reads them as f32 rows (the out gate into
+/// the free query buffer), quantized as it takes them. Qwen3's head-128
+/// attention takes its wide rows through `ubatch.rs` and is refused here by
+/// name.
 pub(super) fn attention(
     c: &Ctx<'_>,
     n: &GqaPlan,
@@ -290,35 +376,13 @@ pub(super) fn attention(
         m,
         normed,
     )?;
-    gpu.enqueue_quantize_gemm(normed, m, &mut wd.act_hid, c.sink)?;
-    let dense = GemmInput::PerSlot;
-    gemm(
-        c,
-        (Kq::Q4K, &n.attn_q),
-        d.q_rows,
-        &wd.act_hid,
-        &wd.dense,
-        dense,
-        q,
-    )?;
-    gemm(
-        c,
-        (Kq::Q4K, &n.attn_k),
-        d.kv_len(),
-        &wd.act_hid,
-        &wd.dense,
-        dense,
-        kr,
-    )?;
-    gemm(
-        c,
-        (n.v_ty, &n.attn_v),
-        d.kv_len(),
-        &wd.act_hid,
-        &wd.dense,
-        dense,
-        v,
-    )?;
+    wd.act_hid
+        .quantize(c, normed, m, &[n.q_ty, n.k_ty, n.v_ty])?;
+    let table = (&wd.dense, GemmInput::PerSlot);
+    let hid = wd.act_hid.input(normed);
+    gemm(c, (n.q_ty, &n.attn_q), d.q_rows, &hid, table, m, q)?;
+    gemm(c, (n.k_ty, &n.attn_k), d.kv_len(), &hid, table, m, kr)?;
+    gemm(c, (n.v_ty, &n.attn_v), d.kv_len(), &hid, table, m, v)?;
     k.neox.enqueue_head_norm_neox_append_256(
         stream,
         PartialNeoxArgs {
@@ -358,41 +422,65 @@ pub(super) fn attention(
         Flash::Quads => k.prefill.enqueue_256_p4(stream, args)?,
         Flash::Pairs => k.prefill.enqueue_256_p2(stream, args)?,
     }
-    q35.gated.enqueue_gemm(
-        stream,
-        (attn, q),
-        GateLayout {
-            head: d.head,
-            head_stride: 2 * d.head,
-            offset: d.head,
-            col_stride: d.q_rows,
-        },
-        &mut wd.act_attn,
-        m,
-        c.sink,
-    )?;
     let Wide {
         act_attn,
-        dense: table,
+        dense,
         attn_o,
         ..
     } = wd;
+    let gated: &DeviceBuffer<f32> = if n.o_ty.kquant() {
+        let a = act_attn.q128.as_mut().ok_or(GpuError::state(
+            WHAT_ATTN,
+            "the wide part's q8_1 blocks of the attention rows",
+        ))?;
+        q35.gated.enqueue_gemm(
+            stream,
+            (attn, q),
+            GateLayout {
+                head: d.head,
+                head_stride: 2 * d.head,
+                offset: d.head,
+                col_stride: d.q_rows,
+            },
+            a,
+            m,
+            c.sink,
+        )?;
+        attn
+    } else {
+        // The flash has read the queries: their buffer takes the gated rows.
+        q35.q38.enqueue_out_gate(
+            stream,
+            OutGateArgs {
+                attn,
+                qg: q,
+                n_head: d.n_head,
+                m,
+                fault: c.sink,
+                y: q_out,
+            },
+        )?;
+        act_attn.quantize(c, q_out, m, &[n.o_ty])?;
+        q_out
+    };
+    let input = act_attn.input(gated);
     gemm(
         c,
-        (Kq::Q4K, &n.attn_output),
+        (n.o_ty, &n.attn_output),
         d.hidden,
-        act_attn,
-        table,
-        dense,
+        &input,
+        (dense, GemmInput::PerSlot),
+        m,
         attn_o,
     )?;
     gpu.elem()
         .enqueue_add(stream, x, attn_o, m * d.hidden, ffn_inp)
 }
 
-/// A delta layer's input half at `m` rows: `x` normed and quantized, then
-/// its four projections — `attn_qkv`, `attn_gate`, β and α — into the
-/// arena's `[x | z | b | a]` blocks, each a GEMM of its own.
+/// A delta layer's input half at `m` rows: `x` normed and quantized into the
+/// forms its projections read, then its four projections — `attn_qkv`,
+/// `attn_gate`, β and α — into the arena's `[x | z | b | a]` blocks, each a
+/// GEMM of its type.
 pub(super) fn delta_in(
     c: &Ctx<'_>,
     d: &DeltaPlan,
@@ -423,17 +511,19 @@ pub(super) fn delta_in(
         m,
         normed,
     )?;
-    gpu.enqueue_quantize_gemm(normed, m, &mut wd.act_hid, c.sink)?;
-    let (a, t, p) = (&wd.act_hid, &wd.dense, GemmInput::PerSlot);
+    wd.act_hid
+        .quantize(c, normed, m, &[d.qkv_ty, d.gate_ty, d.beta_ty, d.alpha_ty])?;
+    let (a, t) = (wd.act_hid.input(normed), (&wd.dense, GemmInput::PerSlot));
     let (ch, zl, nv) = (d.shape.channels(), d.shape.n_v * linear::HEAD, d.shape.n_v);
-    gemm(c, (d.qkv_ty, &d.qkv), ch, a, t, p, &mut g.x)?;
-    gemm(c, (Kq::Q4K, &d.gate), zl, a, t, p, &mut g.z)?;
-    gemm(c, (Kq::Q4K, &d.beta), nv, a, t, p, &mut g.b)?;
-    gemm(c, (Kq::Q4K, &d.alpha), nv, a, t, p, &mut g.a)
+    gemm(c, (d.qkv_ty, &d.qkv), ch, &a, t, m, &mut g.x)?;
+    gemm(c, (d.gate_ty, &d.gate), zl, &a, t, m, &mut g.z)?;
+    gemm(c, (d.beta_ty, &d.beta), nv, &a, t, m, &mut g.b)?;
+    gemm(c, (d.alpha_ty, &d.alpha), nv, &a, t, m, &mut g.a)
 }
 
 /// A delta layer's output half at `m` rows: the gated norm's rows (the
-/// arena's `attn`) quantized, `ssm_out`, then `ffn_inp = x + ssm_out(·)`.
+/// arena's `attn`) quantized into the form `ssm_out` reads, `ssm_out`, then
+/// `ffn_inp = x + ssm_out(·)`.
 pub(super) fn delta_out(
     c: &Ctx<'_>,
     d: &DeltaPlan,
@@ -452,7 +542,7 @@ pub(super) fn delta_out(
         ..
     } = s;
     let wd = wide_of(wide, WHAT_OUT)?;
-    gpu.enqueue_quantize_gemm(attn, m, &mut wd.act_attn, c.sink)?;
+    wd.act_attn.quantize(c, attn, m, &[d.out_ty])?;
     let Wide {
         act_attn,
         dense,
@@ -461,11 +551,11 @@ pub(super) fn delta_out(
     } = wd;
     gemm(
         c,
-        (Kq::Q4K, &d.ssm_out),
+        (d.out_ty, &d.ssm_out),
         hidden,
-        act_attn,
-        dense,
-        GemmInput::PerSlot,
+        &act_attn.input(attn),
+        (dense, GemmInput::PerSlot),
+        m,
         attn_o,
     )?;
     gpu.elem()
@@ -477,9 +567,9 @@ pub(super) fn delta_out(
 /// (`None`: into `x`). The gated router's slots (the shared expert the last
 /// of each token's, its id the joined stacks' last expert) through the
 /// layer's expert table, or a dense FFN's one slot a token through the
-/// unit's one-expert table at the arena's fixed weight 1; Qwen3's plain
-/// router takes its wide rows through `ubatch.rs` and is refused here by
-/// name.
+/// unit's one-expert table at the arena's fixed weight 1; the SwiGLU's
+/// quantizer is the one the down's type reads. Qwen3's plain router takes
+/// its wide rows through `ubatch.rs` and is refused here by name.
 pub(super) fn ffn(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -533,7 +623,7 @@ pub(super) fn ffn(
         m,
         normed,
     )?;
-    gpu.enqueue_quantize_gemm(normed, m, &mut wd.act_hid, c.sink)?;
+    wd.act_hid.quantize(c, normed, m, &[n.gate_ty, n.up_ty])?;
     let Wide {
         act_hid,
         act_h,
@@ -562,17 +652,45 @@ pub(super) fn ffn(
         }
         FfnRoute::Dense => (dense, GemmInput::PerSlot),
     };
-    gemm(c, (Kq::Q4K, &n.gate), d.ff, act_hid, table, input, h)?;
-    gemm(c, (Kq::Q4K, &n.up), d.ff, act_hid, table, input, up)?;
-    k.gemm
-        .enqueue_swiglu_quant(stream, h, up, m * slots, act_h, c.sink)?;
+    let hid = act_hid.input(normed);
+    gemm(c, (n.gate_ty, &n.gate), d.ff, &hid, (table, input), m, h)?;
+    gemm(c, (n.up_ty, &n.up), d.ff, &hid, (table, input), m, up)?;
+    let n_slots = m * slots;
+    match n.down_ty.reads() {
+        Form::Q8x128 => {
+            let a = act_h.q128.as_mut().ok_or(GpuError::state(
+                WHAT_FFN,
+                "the wide part's q8_1 blocks of the SwiGLU rows",
+            ))?;
+            k.gemm
+                .enqueue_swiglu_quant(stream, h, up, n_slots, a, c.sink)?;
+        }
+        Form::Q8x32 => {
+            let a = act_h.q32.as_mut().ok_or(GpuError::state(
+                WHAT_FFN,
+                "the wide part's q8 blocks of the SwiGLU rows",
+            ))?;
+            k.q35(WHAT_FFN)?
+                .g32
+                .enqueue_swiglu_quant32(stream, h, up, n_slots, a, c.sink)?;
+        }
+        Form::F32 => {
+            return Err(GpuError::shape(
+                WHAT_FFN,
+                format!(
+                    "layer {}: an F32 down, which the load refuses (no SwiGLU writes its rows)",
+                    c.layer
+                ),
+            ));
+        }
+    }
     gemm(
         c,
         (n.down_ty, &n.down),
         d.hidden,
-        act_h,
-        table,
-        GemmInput::PerSlot,
+        &act_h.input(h),
+        (table, GemmInput::PerSlot),
+        n_slots,
         down,
     )?;
     let y = match out {

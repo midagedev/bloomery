@@ -6,7 +6,7 @@
 use super::dispatch;
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
-use super::plan::{FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Kq, LayerPlan, MixerPlan};
+use super::plan::{FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy};
 use super::prefill::Prefill;
 use super::proj::ProjKernels;
 use super::router::{RouterDims, RouterKernels, gated};
@@ -15,11 +15,12 @@ use super::ubatch::{Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gated_quant::GatedQuantKernels;
-use crate::gemm::GemmKernels;
+use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
 use crate::linear::LinearKernels;
 use crate::model::{ChainBody, GpuModel, Instrumented, NoHost, block_count};
 use crate::q6k_sel::Q6kSelKernels;
+use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::window;
@@ -46,11 +47,17 @@ pub(super) const ATTN_SCALE_256: f32 = 0.0625;
 const _: () = assert!(crate::flash_gqa::HEAD_256 == 256);
 
 /// The kernels only Qwen3.6's layers launch: the delta rule's three, the
-/// gated router and the gated output projection's quantizer.
+/// gated router and the gated output projection's quantizer; and what a
+/// site of a type other than the K-quants launches — the 32-value GEMM
+/// family with its quantizers and the F32 tile, and the Q8_0 embedding and
+/// the f32 out gate (a Q8_0 or F32 `attn_output` reads the gated rows as
+/// f32).
 pub(super) struct Q35Kernels {
     pub(super) linear: LinearKernels,
     pub(super) router: gated::RouterKernels,
     pub(super) gated: GatedQuantKernels,
+    pub(super) g32: Gemm32Kernels,
+    pub(super) q38: Q38Kernels,
 }
 
 /// The kernels the chain launches beyond the crate's shared modules.
@@ -92,6 +99,8 @@ impl Kernels {
                     linear: LinearKernels::load(ctx)?,
                     router: gated::RouterKernels::load(ctx)?,
                     gated: GatedQuantKernels::load(ctx)?,
+                    g32: Gemm32Kernels::load(ctx)?,
+                    q38: Q38Kernels::load(ctx)?,
                 })
             } else {
                 None
@@ -200,8 +209,8 @@ pub(super) fn kq_site(
     name: &str,
     rows: usize,
     k: usize,
-    allowed: &[Kq],
-) -> Result<Kq, GpuError> {
+    allowed: &[SiteTy],
+) -> Result<SiteTy, GpuError> {
     let what = "qwen3moe::Body::load";
     let Some(DevWeight::KQuant { ty, w: t, k: wk }) = w.get(name) else {
         return Err(GpuError::tensor(
@@ -211,8 +220,8 @@ pub(super) fn kq_site(
         ));
     };
     let kq = match ty {
-        GgmlType::Q4_K => Kq::Q4K,
-        GgmlType::Q6_K => Kq::Q6K,
+        GgmlType::Q4_K => SiteTy::Q4K,
+        GgmlType::Q6_K => SiteTy::Q6K,
         _ => {
             return Err(GpuError::shape(
                 what,
@@ -268,7 +277,10 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
         attn_q_norm: names::attn_q_norm(l),
         attn_k_norm: names::attn_k_norm(l),
         attn_output: names::attn_output(l),
-        v_ty: Kq::Q4K,
+        q_ty: SiteTy::Q4K,
+        k_ty: SiteTy::Q4K,
+        v_ty: SiteTy::Q4K,
+        o_ty: SiteTy::Q4K,
     };
     let router = names::ffn_gate_inp(l);
     let mut f = FfnPlan {
@@ -280,7 +292,9 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
         gate: names::ffn_gate_exps(l),
         up: names::ffn_up_exps(l),
         down: names::ffn_down_exps(l),
-        down_ty: Kq::Q4K,
+        gate_ty: SiteTy::Q4K,
+        up_ty: SiteTy::Q4K,
+        down_ty: SiteTy::Q4K,
     };
     for (name, len) in [
         (&g.attn_norm, h),
@@ -291,13 +305,13 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
         f32_site(w, name, 1, len)?;
     }
     f32_site(w, &router, e, h)?;
-    kq_site(w, &g.attn_q, q, h, &[Kq::Q4K])?;
-    kq_site(w, &g.attn_k, kv, h, &[Kq::Q4K])?;
-    g.v_ty = kq_site(w, &g.attn_v, kv, h, &[Kq::Q4K, Kq::Q6K])?;
-    kq_site(w, &g.attn_output, h, q, &[Kq::Q4K])?;
-    kq_site(w, &f.gate, e * ff, h, &[Kq::Q4K])?;
-    kq_site(w, &f.up, e * ff, h, &[Kq::Q4K])?;
-    f.down_ty = kq_site(w, &f.down, e * h, ff, &[Kq::Q4K, Kq::Q6K])?;
+    kq_site(w, &g.attn_q, q, h, &[SiteTy::Q4K])?;
+    kq_site(w, &g.attn_k, kv, h, &[SiteTy::Q4K])?;
+    g.v_ty = kq_site(w, &g.attn_v, kv, h, &[SiteTy::Q4K, SiteTy::Q6K])?;
+    kq_site(w, &g.attn_output, h, q, &[SiteTy::Q4K])?;
+    kq_site(w, &f.gate, e * ff, h, &[SiteTy::Q4K])?;
+    kq_site(w, &f.up, e * ff, h, &[SiteTy::Q4K])?;
+    f.down_ty = kq_site(w, &f.down, e * h, ff, &[SiteTy::Q4K, SiteTy::Q6K])?;
     Ok(LayerPlan {
         mixer: MixerPlan::Gqa(g),
         ffn: f,

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Write the qwen35 profile's hidden-state oracle sets (tools/ref/models/qwen35.sh HIDDEN_SETS): for each `<set>:<P>`,
-# llama.cpp mainline's result_norm of every position of the first P ids of PROSE_IDS, through hidden_ref
-# (tools/ref/hidden_ref.cpp), into $BLOOMERY_DATA/<set>/ — the sets the refset family hidden-qwen35 checks and
-# gate-gpu-clef-hidden reads.
+# Write the qwen35 profile's hidden-state oracle sets (tools/ref/models/qwen35.sh HIDDEN_SETS): for each
+# `<set>:<P>[:<file>]`, llama.cpp mainline's result_norm of every position of the first P ids of PROSE_IDS through
+# <file> (the profile's MODEL when absent), by hidden_ref (tools/ref/hidden_ref.cpp), into $BLOOMERY_DATA/<set>/ — the
+# sets the refset families hidden-qwen35 and hidden-qwen35-flash-q8 check and gate-gpu-clef-hidden reads.
 #
 # The binary must be the one built from this tree's hidden_ref.cpp (its .build record's source sha256) against the
 # profile's LCPP at its current commit, and the ids file must have the profile's sha256: either refused names what
@@ -37,17 +37,19 @@ got_sha=$(sha256sum "$PROSE_IDS" | cut -d' ' -f1)
 [ "$got_sha" = "$PROSE_SHA256" ] ||
   { echo "hidden.sh: $PROSE_IDS has sha256 $got_sha, the profile pins $PROSE_SHA256" >&2; exit 2; }
 ctx=0
-for s in "${HIDDEN_SETS[@]}"; do p=${s#*:}; [ "$p" -gt "$ctx" ] && ctx=$p; done
+for s in "${HIDDEN_SETS[@]}"; do IFS=: read -r _ p _ <<<"$s"; [ "$p" -gt "$ctx" ] && ctx=$p; done
 rc=0
 for s in "${HIDDEN_SETS[@]}"; do
-  set_name=${s%%:*} p=${s#*:}
+  IFS=: read -r set_name p file <<<"$s"
+  file=${file:-$MODEL}
+  [ -f "$file" ] || { echo "hidden.sh: $set_name names $file, which is not there" >&2; rc=2; continue; }
   if [ $# -gt 0 ] && ! printf '%s\n' "$@" | grep -qx "$set_name"; then continue; fi
   dir=$BLOOMERY_DATA/$set_name
   where=(-ngl 99) run=(env)
   if [ "$twin" = 1 ]; then dir=$dir.cpu where=(-ngl 0 -t 16) run=(env CUDA_VISIBLE_DEVICES=); fi
   rm -rf "$dir.staging"
   if "${run[@]}" BLOOMERY_REF_BUILD="$want_commit" BLOOMERY_REF_TOKENS_SHA256="$PROSE_SHA256" \
-      timeout --kill-after=10 900 "$BIN" -m "$MODEL" --tokens-file "$PROSE_IDS" --tokens-count "$p" \
+      timeout --kill-after=10 900 "$BIN" -m "$file" --tokens-file "$PROSE_IDS" --tokens-count "$p" \
       --out "$dir.staging" -c "$ctx" -ub 512 "${where[@]}"; then
     rm -rf "$dir"
     mv "$dir.staging" "$dir"

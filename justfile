@@ -507,8 +507,9 @@ dump-ref-qwen35moe *VARIANT:
 
 # The Qwen3.5 dense (qwen35, Clef's backbone) hidden-state oracle: hidden_ref linked against llama.cpp mainline's build
 # (tools/ref/build-hidden.sh), then llama.cpp's result_norm of every position of the first 64, 600 and 4,096 prose ids
-# into $BLOOMERY_DATA/ref_qwen35_hidden_p{64,600,4096}/ (refset family hidden-qwen35; tools/ref/hidden.sh). The dump
-# puts the whole 16.5 GB file on the card box.sh puts in view; no lease (a functional oracle). `--cpu-twin` writes each
+# into $BLOOMERY_DATA/ref_qwen35_hidden_p{64,600,4096}/ (the 27B Q4_K_M file; refset family hidden-qwen35) and
+# $BLOOMERY_DATA/ref_qwen35_flashq8_hidden_p{64,600,4096}/ (Clef-Flash at bartowski's Q8_0; hidden-qwen35-flash-q8),
+# tools/ref/hidden.sh. Each dump puts its whole file on the card box.sh puts in view; no lease (a functional oracle). `--cpu-twin` writes each
 # set's CPU twin into <set>.cpu/ instead (no card, 16 threads): the oracle's own floor the gate's bands come from.
 build-ref-hidden:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/build-hidden.sh'
@@ -692,11 +693,11 @@ gate-gpu-qwen35moe-moe *ARGS:
 gate-gpu-qwen35moe-e2e:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
 
-# The Clef backbone (Qwen3.5 dense, qwen35) gate: the tensor-core decode flash refused at group 6, then the prompt
-# call's final-norm hidden states (Tail::Hidden) of the first 64, 600 and 4,096 prose ids, each from a reset as one
-# GEMM ubatch (the 64 also as eight passes: the gemv arm), against llama.cpp mainline's result_norm on the same file
-# (`just dump-hidden-qwen35`), every position within the derived band. Loads the 16.5 GB file twice (the refusal
-# uploads it first); fits either card.
+# The Clef backbone (Qwen3.5 dense, qwen35) gate: the tensor-core decode flash refused at group 6 before any upload,
+# then the prompt call's final-norm hidden states (Tail::Hidden) of the first 64, 600 and 4,096 prose ids, each from a
+# reset as one GEMM ubatch (the 64 also as eight passes: the gemv arm), against llama.cpp mainline's result_norm on the
+# same file (`just dump-hidden-qwen35`), every position within the derived band: the 27B Q4_K_M file (16.5 GB), then
+# Clef-Flash at bartowski's Q8_0 (9.5 GB: every site through the launch its type picks). Fits either card.
 gate-gpu-clef-hidden:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_clef_hidden && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_hidden'
 

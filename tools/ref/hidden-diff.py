@@ -40,8 +40,9 @@ class DiffError(ValueError):
     pass
 
 
-def side(path):
-    """The rows of one side, `[positions, width]` f32, and its width's source."""
+def side(path, width=RAW_WIDTH):
+    """The rows of one side, `[positions, width]` f32: a set's width is its `result_norm` row's ne0,
+    a raw file's `width`."""
     if os.path.isdir(path):
         m = manifest.read(path)
         rows = [r for r in m.rows("tensor") if r["name"] == "result_norm"]
@@ -50,7 +51,6 @@ def side(path):
         width = int(rows[0]["ne0"])
         data = np.fromfile(os.path.join(path, "result_norm.0.f32"), dtype="<f4")
     else:
-        width = RAW_WIDTH
         data = np.fromfile(path, dtype="<f4")
     if data.size == 0 or data.size % width:
         raise DiffError(f"{path}: {data.size} values are not whole rows of {width}")
@@ -117,6 +117,9 @@ def self_test():
             fh.write("tensor\tresult_norm\t0\tf32\t4\t8\t1\t1\t128\t0\tRMS_NORM\t1\t0\t-\t-\n")
             fh.write("# complete\t1\t0\n")
         assert side(d).shape == (8, 4)
+        raw4 = os.path.join(t, "y.f32")
+        b.tofile(raw4)
+        assert raw_width([raw4, d]) == 4 and side(raw4, raw_width([raw4, d])).shape == (8, 4)
         try:
             distances(side(d), b[:7])
             raise AssertionError("sides of two lengths were compared")
@@ -124,6 +127,14 @@ def self_test():
             assert "hold" in str(e), e
     print("hidden-diff self-test: ok")
     return 0
+
+
+def raw_width(paths):
+    """The width a raw side is read at: the first set's among `paths`, else RAW_WIDTH."""
+    for p in paths:
+        if os.path.isdir(p):
+            return side(p).shape[1]
+    return RAW_WIDTH
 
 
 def main(argv):
@@ -142,10 +153,11 @@ def main(argv):
         print(__doc__, file=sys.stderr)
         return 64
     try:
-        a, b = side(args[0]), side(args[1])
+        w = raw_width(args + ([other] if other is not None else []))
+        a, b = side(args[0], w), side(args[1], w)
         lines = report(a, b, top)
         if other is not None:
-            lines += overlap(a, side(other), b)
+            lines += overlap(a, side(other, w), b)
         for line in lines:
             print(line)
     except (DiffError, manifest.ManifestError, OSError) as e:

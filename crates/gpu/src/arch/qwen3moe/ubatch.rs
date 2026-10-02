@@ -47,7 +47,7 @@ use super::body::{ATTN_SCALE, Body, Kernels};
 use super::experts::CombineArgs;
 pub use super::image::ImageWrite;
 use super::image::PromptImage;
-use super::plan::{FfnPlan, FfnRoute, GqaPlan, Kq, LayerPlan};
+use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
 use super::router::RouterOut;
 use super::scratch::{Dims, KvPlanes, f32_view};
 use crate::elem::EmbedRowsArgs;
@@ -115,11 +115,16 @@ pub fn ubatch_for(ctx: usize) -> Result<usize, GpuError> {
 // The default ubatch is the one a default qwen4exp machine counts.
 const _: () = assert!(UBATCH as u64 == model::arch::qwen35moe::place::UBATCH_PLANNED);
 
-/// The GEMM's type for a qwen3moe projection.
-fn gemm_ty(kq: Kq) -> GemmWeight {
-    match kq {
-        Kq::Q4K => GemmWeight::Q4K,
-        Kq::Q6K => GemmWeight::Q6K,
+/// The GEMM's type for a qwen3moe projection, a K-quant (the qwen3moe load
+/// admits no other); another type is refused by name.
+fn gemm_ty(ty: SiteTy) -> Result<GemmWeight, GpuError> {
+    match ty {
+        SiteTy::Q4K => Ok(GemmWeight::Q4K),
+        SiteTy::Q6K => Ok(GemmWeight::Q6K),
+        SiteTy::Q8_0 | SiteTy::F32 => Err(GpuError::shape(
+            "qwen3moe::ubatch",
+            format!("a {ty} projection; the qwen3moe ubatch runs K-quants"),
+        )),
     }
 }
 
@@ -433,14 +438,14 @@ fn attention(
     )?;
     gpu.enqueue_quantize_gemm(&a.normed, t, &mut a.act_hid, sink)?;
     for (name, ty, rows, y) in [
-        (&n.attn_q, Kq::Q4K, q_len, &mut a.q),
-        (&n.attn_k, Kq::Q4K, kv_len, &mut a.k),
+        (&n.attn_q, SiteTy::Q4K, q_len, &mut a.q),
+        (&n.attn_k, SiteTy::Q4K, kv_len, &mut a.k),
         (&n.attn_v, n.v_ty, kv_len, &mut a.v),
     ] {
         k.gemm.enqueue_gemm(
             stream,
             GemmArgs {
-                ty: gemm_ty(ty),
+                ty: gemm_ty(ty)?,
                 w: kq_weight(w, name)?,
                 rows_per_expert: rows,
                 act: &a.act_hid,
@@ -564,7 +569,7 @@ fn ffn(
     k.gemm.enqueue_gemm(
         stream,
         GemmArgs {
-            ty: gemm_ty(n.down_ty),
+            ty: gemm_ty(n.down_ty)?,
             w: kq_weight(w, &n.down)?,
             rows_per_expert: d.hidden,
             act: &a.act_h,
