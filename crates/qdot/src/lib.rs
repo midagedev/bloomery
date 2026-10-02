@@ -79,6 +79,9 @@ pub enum QdotError {
         have: usize,
         need: usize,
     },
+    /// The weight type has no Q4_K/Q5_K row-lane kernel on this machine
+    /// ([`has_lanes`]).
+    NoLanes(GgmlType),
 }
 
 impl fmt::Display for QdotError {
@@ -126,6 +129,13 @@ impl fmt::Display for QdotError {
                 write!(
                     f,
                     "row-lane {buf} is {have} bytes, its rows and k make {need}"
+                )
+            }
+            QdotError::NoLanes(w) => {
+                write!(
+                    f,
+                    "no row-lane qdot kernel for weight type {w:?} on this machine \
+                     (Q4_K and Q5_K with AVX2+FMA+F16C)"
                 )
             }
         }
@@ -779,6 +789,160 @@ fn r8_tile<const C: usize>(
     // SAFETY: the caller saw AVX2+F16C (has_features(Q3_K)); check_r8 sized
     // the group for nb super-blocks and every column for nb Q8_K blocks.
     let v = unsafe { dot_q3k_r8_tile_avx2::<C>(group, &cols, nb) };
+    out.copy_from_slice(&v);
+}
+
+/// Rows one Q4_K or Q5_K row-lane group holds ([`pack_lanes`]).
+pub const LANE_ROWS: usize = 8;
+
+/// Columns one row-lane kernel call runs at once: its accumulators, one a
+/// column, stay in registers beside a sub-block's four code vectors.
+/// [`dot_lanes_cols`] takes up to [`TILE_COLS`] and runs them in calls of
+/// this many.
+const LANE_COLS: usize = 4;
+
+/// Bytes of one packed super-block of a row-lane group: 64 code vectors of
+/// 32 bytes, then the eight scale vectors and the eight min vectors, eight
+/// f32 each.
+const LANE_SB_BYTES: usize = LANE_MN + 8 * 32;
+/// Where a packed super-block's scale vectors start.
+const LANE_SC: usize = 64 * 32;
+/// Where a packed super-block's min vectors start.
+const LANE_MN: usize = LANE_SC + 8 * 32;
+
+/// Whether `w` runs row lanes on this machine ([`pack_lanes`],
+/// [`dot_lanes_cols`]): Q4_K and Q5_K with their one-column kernel's ISA.
+#[must_use]
+pub fn has_lanes(w: GgmlType) -> bool {
+    matches!(w, GgmlType::Q4_K | GgmlType::Q5_K) && has_features(w)
+}
+
+/// Bytes [`pack_lanes`] writes for one group of `k`-value rows: `k / 256`
+/// packed super-blocks.
+#[must_use]
+pub fn lane_pack_bytes(k: usize) -> usize {
+    k / 256 * LANE_SB_BYTES
+}
+
+/// [`LANE_ROWS`] Q4_K or Q5_K rows of `k` values (`rows`, row after row, each
+/// its type's row bytes) unpacked into one row-lane group in `packed`, which
+/// is exactly [`lane_pack_bytes`] long — the layout [`dot_lanes_cols`] reads.
+///
+/// Per super-block `i`, 2,560 bytes at `2,560 i`: code vector `(s, g)` at
+/// `32 (8 s + g)` holds at byte `b` row `b / 4`'s code (0..15; Q5_K with its
+/// high bit, 0..31) of sub-block `s`, value `4 g + b % 4`; then at
+/// `2,048 + 32 s` lane `r` is row `r`'s `d · sc_s`, and at `2,304 + 32 s`
+/// row `r`'s `−dmin · m_s` — the f32 products the one-column kernel forms,
+/// one rounding each.
+///
+/// A type without row lanes ([`QdotError::NoLanes`]), a `k` off the
+/// 256-value grid and a `rows` or `packed` of another length
+/// ([`QdotError::RowGroupBytes`]) are named errors, and none writes to
+/// `packed`. `k = 0` is `Ok` with both buffers empty.
+pub fn pack_lanes(w: GgmlType, rows: &[u8], k: usize, packed: &mut [u8]) -> Result<(), QdotError> {
+    if !has_lanes(w) {
+        return Err(QdotError::NoLanes(w));
+    }
+    if !k.is_multiple_of(256) {
+        return Err(QdotError::UnalignedK { k, gran: 256 });
+    }
+    let nb = k / 256;
+    let block = if w == GgmlType::Q5_K {
+        Q5K_BLOCK
+    } else {
+        Q4K_BLOCK
+    };
+    for (buf, have, need) in [
+        ("lane rows", rows.len(), LANE_ROWS * nb * block),
+        ("lane group", packed.len(), lane_pack_bytes(k)),
+    ] {
+        if have != need {
+            return Err(QdotError::RowGroupBytes { buf, have, need });
+        }
+    }
+    if w == GgmlType::Q5_K {
+        // SAFETY: has_lanes saw AVX2+FMA+F16C; `rows` holds LANE_ROWS rows of nb
+        // Q5_K blocks and `packed` nb packed super-blocks (checked above).
+        unsafe { pack_lanes_avx2::<true>(rows, nb, packed) };
+    } else {
+        // SAFETY: as the Q5_K arm, for Q4_K blocks.
+        unsafe { pack_lanes_avx2::<false>(rows, nb, packed) };
+    }
+    Ok(())
+}
+
+/// One row-lane group ([`pack_lanes`]'s `packed`) against up to
+/// [`TILE_COLS`] columns of `k` values in `w`'s activation encoding:
+/// `out[c][r]` is `dot_row(w, row r, acols[c], k)` bit for bit.
+///
+/// Every (row, column) keeps the one-column kernel's eight float lanes: lane
+/// `t + 4 h` takes, super-block by super-block, the min term, then sub-block
+/// `t`'s and then sub-block `4 + t`'s half `h` (16 values) — the same
+/// integer sum, the same f32 products and the same fused adds in the same
+/// order — and the lanes are summed as the one-column kernel sums them. Only
+/// where the integer sums are formed moves: a ymm lane is a row, so a
+/// column's activation bytes are read once for the group's eight rows.
+///
+/// A type without row lanes ([`QdotError::NoLanes`]), a column count outside
+/// `1..=TILE_COLS` or an `out` of another length ([`QdotError::TileShape`]),
+/// a `k` off the 256-value grid, a `packed` of another length
+/// ([`QdotError::RowGroupBytes`]) and a short column are named errors.
+pub fn dot_lanes_cols(
+    w: GgmlType,
+    packed: &[u8],
+    acols: &[&[u8]],
+    k: usize,
+    out: &mut [[f32; LANE_ROWS]],
+) -> Result<(), QdotError> {
+    if !has_lanes(w) {
+        return Err(QdotError::NoLanes(w));
+    }
+    let c = acols.len();
+    if c == 0 || c > TILE_COLS || out.len() != c {
+        return Err(QdotError::TileShape {
+            cols: c,
+            outs: out.len(),
+        });
+    }
+    if !k.is_multiple_of(256) {
+        return Err(QdotError::UnalignedK { k, gran: 256 });
+    }
+    let need = lane_pack_bytes(k);
+    if packed.len() != need {
+        return Err(QdotError::RowGroupBytes {
+            buf: "lane group",
+            have: packed.len(),
+            need,
+        });
+    }
+    let need_a = col_bytes(w, k);
+    if let Some(a) = acols.iter().find(|a| a.len() < need_a) {
+        return Err(QdotError::ShortActivationCol {
+            have: a.len(),
+            need: need_a,
+            k,
+        });
+    }
+    let nb = k / 256;
+    for (cols, out) in acols.chunks(LANE_COLS).zip(out.chunks_mut(LANE_COLS)) {
+        match cols.len() {
+            1 => lanes::<1>(packed, cols, nb, out),
+            2 => lanes::<2>(packed, cols, nb, out),
+            3 => lanes::<3>(packed, cols, nb, out),
+            _ => lanes::<4>(packed, cols, nb, out),
+        }
+    }
+    Ok(())
+}
+
+/// The `C`-column row-lane kernel over validated inputs: `packed` holds `nb`
+/// packed super-blocks, `acols` `C` columns of at least `nb` super-blocks'
+/// x4 groups, `out` `C` values.
+fn lanes<const C: usize>(packed: &[u8], acols: &[&[u8]], nb: usize, out: &mut [[f32; LANE_ROWS]]) {
+    let cols: [*const u8; C] = std::array::from_fn(|j| acols[j].as_ptr());
+    // SAFETY: the caller saw AVX2+FMA+F16C (has_lanes); it sized `packed` for
+    // nb packed super-blocks and every column for nb super-blocks.
+    let v = unsafe { dot_lanes_avx2::<C>(packed, &cols, nb) };
     out.copy_from_slice(&v);
 }
 
@@ -3001,6 +3165,301 @@ unsafe fn dot_q45k_q82x4_tile_avx2<const C: usize, const Q5: bool>(
         let mut out = [0.0f32; C];
         for (o, acc) in out.iter_mut().zip(&accd) {
             *o = hsum_float_8(*acc);
+        }
+        out
+    }
+}
+
+// ------------------------------------------- Q4_K/Q5_K row lanes x Q8_2_X4
+
+/// The 8×8 transpose of 32-bit lanes: lane `r` of output `g` is lane `g` of
+/// input `r`.
+///
+/// # Safety
+/// AVX2 must be present.
+#[inline(always)]
+unsafe fn transpose8_epi32(v: [__m256i; 8]) -> [__m256i; 8] {
+    // SAFETY: register-only AVX2 shuffles.
+    unsafe {
+        let t0 = _mm256_unpacklo_epi32(v[0], v[1]);
+        let t1 = _mm256_unpackhi_epi32(v[0], v[1]);
+        let t2 = _mm256_unpacklo_epi32(v[2], v[3]);
+        let t3 = _mm256_unpackhi_epi32(v[2], v[3]);
+        let t4 = _mm256_unpacklo_epi32(v[4], v[5]);
+        let t5 = _mm256_unpackhi_epi32(v[4], v[5]);
+        let t6 = _mm256_unpacklo_epi32(v[6], v[7]);
+        let t7 = _mm256_unpackhi_epi32(v[6], v[7]);
+        let u0 = _mm256_unpacklo_epi64(t0, t2);
+        let u1 = _mm256_unpackhi_epi64(t0, t2);
+        let u2 = _mm256_unpacklo_epi64(t1, t3);
+        let u3 = _mm256_unpackhi_epi64(t1, t3);
+        let u4 = _mm256_unpacklo_epi64(t4, t6);
+        let u5 = _mm256_unpackhi_epi64(t4, t6);
+        let u6 = _mm256_unpacklo_epi64(t5, t7);
+        let u7 = _mm256_unpackhi_epi64(t5, t7);
+        [
+            _mm256_permute2x128_si256::<0x20>(u0, u4),
+            _mm256_permute2x128_si256::<0x20>(u1, u5),
+            _mm256_permute2x128_si256::<0x20>(u2, u6),
+            _mm256_permute2x128_si256::<0x20>(u3, u7),
+            _mm256_permute2x128_si256::<0x31>(u0, u4),
+            _mm256_permute2x128_si256::<0x31>(u1, u5),
+            _mm256_permute2x128_si256::<0x31>(u2, u6),
+            _mm256_permute2x128_si256::<0x31>(u3, u7),
+        ]
+    }
+}
+
+/// [`transpose8_epi32`] of f32 lanes; the bits move unchanged.
+///
+/// # Safety
+/// AVX2 must be present.
+#[inline(always)]
+unsafe fn transpose8_ps(v: [__m256; 8]) -> [__m256; 8] {
+    // SAFETY: register-only casts and AVX2 shuffles.
+    unsafe {
+        let mut x = [_mm256_setzero_si256(); 8];
+        for (x, v) in x.iter_mut().zip(v) {
+            *x = _mm256_castps_si256(v);
+        }
+        let t = transpose8_epi32(x);
+        let mut out = [_mm256_setzero_ps(); 8];
+        for (o, t) in out.iter_mut().zip(t) {
+            *o = _mm256_castsi256_ps(t);
+        }
+        out
+    }
+}
+
+/// One 32-byte chunk `c4` of the eight rows' code bytes as packed code
+/// vectors: the chunk transposed in dwords, then its low nibbles as sub-block
+/// `2 c4` and its high nibbles as sub-block `2 c4 + 1` — with Q5_K's high bit
+/// from the transposed `qh` (`hb`: `qh` for chunks 0 and 1, `qh >> 4` per
+/// 16-bit lane for 2 and 3), shifted to bit 4 by `LO` and `HI` as the
+/// one-column kernel shifts it — stored at code vectors `(2 c4, g)` and
+/// `(2 c4 + 1, g)` of the super-block at `dst`. Every operation is per byte,
+/// so the transpose, which moves whole dwords, commutes with it.
+///
+/// # Safety
+/// AVX2 must be present; `dst` must be writable for one packed super-block.
+#[inline(always)]
+unsafe fn lane_codes<const Q5: bool, const LO: i32, const HI: i32>(
+    chunk: [__m256i; 8],
+    hb: [__m256i; 8],
+    c4: usize,
+    dst: *mut u8,
+) {
+    // SAFETY: AVX2 present; the stores stay inside the super-block at `dst`.
+    unsafe {
+        let ml = _mm256_set1_epi8(0xF);
+        let mh = _mm256_set1_epi8(0x10);
+        let t = transpose8_epi32(chunk);
+        for g in 0..8 {
+            let mut lo = _mm256_and_si256(t[g], ml);
+            let mut hi = _mm256_and_si256(_mm256_srli_epi16::<4>(t[g]), ml);
+            if Q5 {
+                lo = _mm256_or_si256(lo, _mm256_and_si256(_mm256_slli_epi16::<LO>(hb[g]), mh));
+                hi = _mm256_or_si256(hi, _mm256_and_si256(_mm256_slli_epi16::<HI>(hb[g]), mh));
+            }
+            _mm256_storeu_si256(dst.add(32 * (8 * (2 * c4) + g)) as *mut __m256i, lo);
+            _mm256_storeu_si256(dst.add(32 * (8 * (2 * c4 + 1) + g)) as *mut __m256i, hi);
+        }
+    }
+}
+
+/// AVX2 pack of [`LANE_ROWS`] Q4_K (or, with `Q5`, Q5_K) rows of `nb` blocks
+/// into [`pack_lanes`]' layout.
+///
+/// # Safety
+/// AVX2+FMA+F16C must be present; `rows` must hold [`LANE_ROWS`] rows of `nb`
+/// blocks and `packed` `nb` packed super-blocks.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn pack_lanes_avx2<const Q5: bool>(rows: &[u8], nb: usize, packed: &mut [u8]) {
+    // SAFETY: AVX2+FMA+F16C present; every read lies inside a row's block and
+    // every write inside the super-block's 2,560 bytes (the caller's sizes).
+    unsafe {
+        let (block, qs_off) = if Q5 { (Q5K_BLOCK, 48) } else { (Q4K_BLOCK, 16) };
+        let row_bytes = nb * block;
+        for i in 0..nb {
+            let dst = packed.as_mut_ptr().add(i * LANE_SB_BYTES);
+            let wb: [*const u8; LANE_ROWS] =
+                std::array::from_fn(|r| rows.as_ptr().add(r * row_bytes + i * block));
+            let mut sc = [_mm256_setzero_ps(); LANE_ROWS];
+            let mut mn = [_mm256_setzero_ps(); LANE_ROWS];
+            for r in 0..LANE_ROWS {
+                let b = std::slice::from_raw_parts(wb[r], block);
+                let d = f16c_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                let dmin = f16c_to_f32(u16::from_le_bytes([b[2], b[3]]));
+                let utmp = make_q4_scales(&b[4..16]);
+                // SAFETY: 8 readable bytes inside the local u32[4], twice.
+                sc[r] = _mm256_mul_ps(
+                    _mm256_set1_ps(d),
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                        utmp.as_ptr() as *const __m128i
+                    ))),
+                );
+                mn[r] = _mm256_mul_ps(
+                    _mm256_set1_ps(-dmin),
+                    _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(
+                        utmp.as_ptr().add(2) as *const __m128i
+                    ))),
+                );
+            }
+            let sc = transpose8_ps(sc);
+            let mn = transpose8_ps(mn);
+            for s in 0..8 {
+                _mm256_storeu_ps(dst.add(LANE_SC + 32 * s) as *mut f32, sc[s]);
+                _mm256_storeu_ps(dst.add(LANE_MN + 32 * s) as *mut f32, mn[s]);
+            }
+            let mut hb0 = [_mm256_setzero_si256(); 8];
+            let mut hb1 = [_mm256_setzero_si256(); 8];
+            if Q5 {
+                let mut qh = [_mm256_setzero_si256(); 8];
+                for (q, &w) in qh.iter_mut().zip(&wb) {
+                    // SAFETY: the 32 high-bit bytes at 16 of each Q5_K block.
+                    *q = _mm256_loadu_si256(w.add(16) as *const __m256i);
+                }
+                hb0 = transpose8_epi32(qh);
+                for (h1, &h0) in hb1.iter_mut().zip(&hb0) {
+                    *h1 = _mm256_srli_epi16::<4>(h0);
+                }
+            }
+            let mut chunk = [[_mm256_setzero_si256(); 8]; 4];
+            for (c4, chunk) in chunk.iter_mut().enumerate() {
+                for (v, &w) in chunk.iter_mut().zip(&wb) {
+                    // SAFETY: a 32-byte load inside the row's 128 code bytes.
+                    *v = _mm256_loadu_si256(w.add(qs_off + 32 * c4) as *const __m256i);
+                }
+            }
+            lane_codes::<Q5, 4, 3>(chunk[0], hb0, 0, dst);
+            lane_codes::<Q5, 2, 1>(chunk[1], hb0, 1, dst);
+            lane_codes::<Q5, 4, 3>(chunk[2], hb1, 2, dst);
+            lane_codes::<Q5, 2, 1>(chunk[3], hb1, 3, dst);
+        }
+    }
+}
+
+/// Super-blocks one pass of [`dot_lanes_avx2`] walks before it moves to the
+/// next lane: their packed codes (10 KB) and the columns' activation bytes
+/// stay in L1 across the eight lanes.
+const LANE_CHUNK: usize = 4;
+
+/// AVX2 row-lane kernel: one packed group ([`pack_lanes`]) against `C`
+/// Q8_2_X4 columns; `out[c][r]` equals `dot_q4k_q82x4_avx2` (or the Q5_K
+/// kernel) of row `r` and column `c` bit for bit.
+///
+/// The one-column kernel's accumulator lane `l = t + 4 h` takes, per
+/// super-block, `fma(my_l, min_l)`, then `fma(d·sc_s · d8_s, Σ)` for sub-block
+/// `s = t` and then `s = 4 + t`, `Σ` the integer dot of the sub-block's half
+/// `h`. Here the eight lanes are eight passes over a chunk of super-blocks,
+/// each holding lane `l` of every row (a ymm lane is a row) for the `C`
+/// columns, so each (row, column) gets the same fused adds in the same order;
+/// the column's `d8` and `my` vectors are the one-column kernel's, formed once
+/// a chunk. The integer dot of a half is four maddubs of the rows' code
+/// dwords against a broadcast activation dword (codes ≤ 31 against |q| ≤ 127:
+/// four pairs of an i16 lane sum to at most 8 · 31 · 127 = 31,496, so nothing
+/// saturates) and one madd: the same integer. At the end lane `l` of a row
+/// is transposed back and summed by `hsum_float_8`.
+///
+/// # Safety
+/// AVX2+FMA+F16C must be present; `packed` must hold `nb` packed
+/// super-blocks and every column `nb` super-blocks' Q8_2_X4 groups.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn dot_lanes_avx2<const C: usize>(
+    packed: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [[f32; LANE_ROWS]; C] {
+    // SAFETY: AVX2+FMA+F16C present; every read lies inside a packed
+    // super-block or a column's validated groups (the caller's sizes).
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [[_mm256_setzero_ps(); C]; 8];
+        let mut i0 = 0;
+        while i0 < nb {
+            let n = (nb - i0).min(LANE_CHUNK);
+            // Column c's d8 and my vectors of super-block i0 + ii at [c][ii]:
+            // the one-column kernel's `dy` and `my`.
+            let mut dy = [[[0.0f32; 8]; LANE_CHUNK]; C];
+            let mut my = [[[0.0f32; 8]; LANE_CHUNK]; C];
+            for c in 0..C {
+                for ii in 0..n {
+                    let i = i0 + ii;
+                    let g0 = acols[c].add((2 * i) * Q82X4_STRIDE);
+                    let g1 = acols[c].add((2 * i + 1) * Q82X4_STRIDE);
+                    let d4_1 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g0 as *const __m128i));
+                    let d4_2 = _mm_cvtepu16_epi32(_mm_loadl_epi64(g1 as *const __m128i));
+                    let dyv =
+                        _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_set_m128i(d4_2, d4_1), 16));
+                    let m4_1 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g0.add(8) as *const __m128i));
+                    let m4_2 = _mm_cvtepi16_epi32(_mm_loadl_epi64(g1.add(8) as *const __m128i));
+                    let myv = _mm256_mul_ps(dyv, _mm256_cvtepi32_ps(_mm256_set_m128i(m4_2, m4_1)));
+                    _mm256_storeu_ps(dy[c][ii].as_mut_ptr(), dyv);
+                    _mm256_storeu_ps(my[c][ii].as_mut_ptr(), myv);
+                }
+            }
+            for l in 0..8 {
+                let (t, h) = (l % 4, l / 4);
+                let mut a = acc[l];
+                for ii in 0..n {
+                    let i = i0 + ii;
+                    let base = packed.as_ptr().add(i * LANE_SB_BYTES);
+                    let mins = _mm256_loadu_ps(base.add(LANE_MN + 32 * l) as *const f32);
+                    for c in 0..C {
+                        a[c] = _mm256_fmadd_ps(_mm256_set1_ps(my[c][ii][l]), mins, a[c]);
+                    }
+                    for j in 0..2 {
+                        let s = 4 * j + t;
+                        let sc = _mm256_loadu_ps(base.add(LANE_SC + 32 * s) as *const f32);
+                        let mut w = [_mm256_setzero_si256(); 4];
+                        for (g, w) in w.iter_mut().enumerate() {
+                            *w = _mm256_loadu_si256(
+                                base.add(32 * (8 * s + 4 * h + g)) as *const __m256i
+                            );
+                        }
+                        for c in 0..C {
+                            let q = acols[c].add((2 * i + j) * Q82X4_STRIDE + 16 + 32 * t + 16 * h)
+                                as *const i32;
+                            let p0 =
+                                _mm256_maddubs_epi16(w[0], _mm256_set1_epi32(q.read_unaligned()));
+                            let p1 = _mm256_maddubs_epi16(
+                                w[1],
+                                _mm256_set1_epi32(q.add(1).read_unaligned()),
+                            );
+                            let p2 = _mm256_maddubs_epi16(
+                                w[2],
+                                _mm256_set1_epi32(q.add(2).read_unaligned()),
+                            );
+                            let p3 = _mm256_maddubs_epi16(
+                                w[3],
+                                _mm256_set1_epi32(q.add(3).read_unaligned()),
+                            );
+                            let sumi = _mm256_madd_epi16(
+                                _mm256_add_epi16(
+                                    _mm256_add_epi16(p0, p1),
+                                    _mm256_add_epi16(p2, p3),
+                                ),
+                                ones,
+                            );
+                            let d4d8 = _mm256_mul_ps(sc, _mm256_set1_ps(dy[c][ii][s]));
+                            a[c] = _mm256_fmadd_ps(d4d8, _mm256_cvtepi32_ps(sumi), a[c]);
+                        }
+                    }
+                }
+                acc[l] = a;
+            }
+            i0 += n;
+        }
+        let mut out = [[0.0f32; LANE_ROWS]; C];
+        for (c, o) in out.iter_mut().enumerate() {
+            let mut lanes = [_mm256_setzero_ps(); 8];
+            for (x, a) in lanes.iter_mut().zip(&acc) {
+                *x = a[c];
+            }
+            let rows = transpose8_ps(lanes);
+            for (o, &v) in o.iter_mut().zip(&rows) {
+                *o = hsum_float_8(v);
+            }
         }
         out
     }

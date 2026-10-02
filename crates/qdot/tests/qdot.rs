@@ -4092,3 +4092,400 @@ fn q3k_r8_unpack_refuses_bad_shapes() {
         "{e}"
     );
 }
+
+// ------------------------------------------- Q4_K/Q5_K row lanes
+// `pack_lanes` then `dot_lanes_cols` against `dot_row` per (row, column), bit
+// for bit, at every column count 1..=TILE_COLS and every slot a column can sit
+// in. The bit contract holds by construction — the same integer sum per half
+// sub-block, the same f32 products, the same fused adds per (row, column)
+// lane and the same lane sum — so any differing value is a bug.
+
+/// `rows` synthetic rows of `ty` (Q4_K or Q5_K), `k` values each: every byte
+/// of every block from the generator, then `d` and `dmin` finite normal f16
+/// of either sign (exponents 2^-10 .. 2^5), so the codes, the high bits, the
+/// six-bit scales and mins and the products all vary.
+fn lane_rows(ty: GgmlType, k: usize, rows: usize, seed: u64) -> Vec<u8> {
+    let block = match ty {
+        GgmlType::Q4_K => 144,
+        GgmlType::Q5_K => 176,
+        _ => panic!("no row-lane rows for {ty:?}"),
+    };
+    let mut rng = Lcg(seed);
+    let mut out = vec![0u8; rows * k / 256 * block];
+    for b in out.chunks_exact_mut(block) {
+        for x in b.iter_mut() {
+            *x = rng.next_u32() as u8;
+        }
+        for at in [0, 2] {
+            let sign = (rng.next_u32() & 1) as u16;
+            let exp = 5 + (rng.next_u32() % 16) as u16;
+            let mant = (rng.next_u32() & 0x3ff) as u16;
+            b[at..at + 2].copy_from_slice(&(sign << 15 | exp << 10 | mant).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// One 8-row group at the top of every code: each byte 0xFF (codes 15, Q5_K
+/// 31 with every high bit set, scales and mins 63), `d` and `dmin` row `r`'s
+/// [`R8_D`] — on the all-(+127) and all-(−127) columns each lane's i16 sum of
+/// four maddubs reaches 8 · 31 · 127 = 31,496 for Q5_K.
+fn lane_ends(ty: GgmlType, k: usize) -> Vec<u8> {
+    let block = match ty {
+        GgmlType::Q4_K => 144,
+        GgmlType::Q5_K => 176,
+        _ => panic!("no row-lane rows for {ty:?}"),
+    };
+    let nb = k / 256;
+    let mut out = vec![0xFFu8; 8 * nb * block];
+    for (i, b) in out.chunks_exact_mut(block).enumerate() {
+        let d = R8_D[(i / nb) % 8];
+        b[0..2].copy_from_slice(&d.to_le_bytes());
+        b[2..4].copy_from_slice(&R8_D[(i / nb + 3) % 8].to_le_bytes());
+    }
+    out
+}
+
+/// Clause of one row set (a whole number of 8-row groups): every group packed
+/// ([`qdot::pack_lanes`], into a buffer prefilled with 0xA5), then for c =
+/// 1..=TILE_COLS and every starting column of the cyclic list `acols`, the
+/// group's lanes over the c columns from there equal `dot_row` per (row,
+/// column), bit for bit — on the packed group and the columns in place, then
+/// on copies of both at [`MISALIGN`] bytes past a 16-byte boundary. The
+/// outputs start as a NaN canary and the call's slice is followed by one more
+/// canary column, so an unwritten value and a write past the c columns both
+/// fail. Returns the calls made.
+fn assert_lanes_match(
+    ty: GgmlType,
+    label: &str,
+    k: usize,
+    row_bytes: usize,
+    bytes: &[u8],
+    acols: &[Vec<u8>],
+) -> usize {
+    const L: usize = qdot::LANE_ROWS;
+    assert!(
+        qdot::has_lanes(ty),
+        "{label}: {ty:?} has no row lanes on this CPU — the clause would compare nothing"
+    );
+    let rows = bytes.len() / row_bytes;
+    assert!(
+        rows.is_multiple_of(L) && rows * row_bytes == bytes.len(),
+        "{label}: {rows} rows"
+    );
+    let n = acols.len();
+    assert!(
+        n >= qdot::TILE_COLS,
+        "{label}: {n} columns cannot fill a call"
+    );
+    let mut want = vec![0.0f32; rows * n];
+    for r in 0..rows {
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        for (j, a) in acols.iter().enumerate() {
+            want[r * n + j] = dot_row(ty, src, a, k).unwrap();
+        }
+    }
+    let moved_cols: Vec<(Vec<u8>, usize)> = acols
+        .iter()
+        .map(|a| misaligned_copy(a.as_slice()))
+        .collect();
+    let moved_cols: Vec<&[u8]> = moved_cols
+        .iter()
+        .zip(acols)
+        .map(|((b, at), a)| &b[*at..*at + a.len()])
+        .collect();
+    let group_bytes = L * row_bytes;
+    let canary = f32::from_bits(0x7fc0_dead);
+    let mut packed = vec![0xA5u8; qdot::lane_pack_bytes(k)];
+    let mut calls = 0;
+    for g in 0..rows / L {
+        packed.fill(0xA5);
+        qdot::pack_lanes(
+            ty,
+            &bytes[g * group_bytes..(g + 1) * group_bytes],
+            k,
+            &mut packed,
+        )
+        .unwrap();
+        let (moved, at) = misaligned_copy(&packed);
+        let moved = &moved[at..at + packed.len()];
+        for c in 1..=qdot::TILE_COLS {
+            for s in 0..n {
+                let idx: Vec<usize> = (0..c).map(|i| (s + i) % n).collect();
+                let cols: Vec<&[u8]> = idx.iter().map(|&j| acols[j].as_slice()).collect();
+                let moved_c: Vec<&[u8]> = idx.iter().map(|&j| moved_cols[j]).collect();
+                for (path, grp, cs) in [
+                    ("in place", packed.as_slice(), &cols),
+                    ("misaligned", moved, &moved_c),
+                ] {
+                    let mut buf = vec![[canary; L]; qdot::TILE_COLS + 1];
+                    qdot::dot_lanes_cols(ty, grp, cs, k, &mut buf[..c]).unwrap();
+                    for (slot, &j) in idx.iter().enumerate() {
+                        for r in 0..L {
+                            let (got, w) = (buf[slot][r], want[(L * g + r) * n + j]);
+                            assert_eq!(
+                                got.to_bits(),
+                                w.to_bits(),
+                                "{label} ({path}): group {g} row {r}, c = {c}, slot {slot} \
+                                 (column {j}): lanes {got:e} (bits {:#x}) vs dot_row {w:e} (bits {:#x})",
+                                got.to_bits(),
+                                w.to_bits()
+                            );
+                        }
+                    }
+                    for (t, extra) in buf[c..].iter().enumerate() {
+                        assert!(
+                            extra.iter().all(|v| v.to_bits() == canary.to_bits()),
+                            "{label} ({path}): group {g}, c = {c}: output column {} past the \
+                             call's columns was written: {extra:?}",
+                            c + t
+                        );
+                    }
+                    calls += 1;
+                }
+            }
+        }
+    }
+    calls
+}
+
+/// The seeded columns of [`coded_columns`] for `ty` plus an all-(+3.0) and an
+/// all-(−3.0) column (codes +127 and −127 throughout).
+fn lane_columns(ty: GgmlType, k: usize) -> Vec<Vec<u8>> {
+    let ends = [3.0f32, -3.0]
+        .iter()
+        .map(|&v| {
+            let mut a = vec![0u8; col_bytes(ty, k)];
+            quantize_col(ty, &vec![v; k], &mut a);
+            a
+        })
+        .collect();
+    coded_columns(ty, k, ends)
+}
+
+/// Row-lane clause on synthetic rows: for Q4_K and Q5_K, groups of seeded
+/// rows at k = 256 (one super-block, a short chunk), 2,048 and 4,096 (GLM's
+/// routed down and gate/up widths: two and four whole chunks) and 2,304 (two
+/// chunks and a one-super-block tail), and the 0xFF group ([`lane_ends`]) at
+/// 4,096 — lanes = `dot_row` per (row, column), bit for bit
+/// ([`assert_lanes_match`]).
+#[test]
+#[ignore = "hw: the box's CPU (the row lanes run on AVX2); reads no model file"]
+fn hw_lanes_match_dot_row_synthetic() {
+    for ty in [GgmlType::Q4_K, GgmlType::Q5_K] {
+        let block = if ty == GgmlType::Q4_K { 144 } else { 176 };
+        for (k, rows, seed) in [
+            (256usize, 16usize, 0x1a2e_0001u64),
+            (2048, 16, 0x1a2e_0002),
+            (2304, 16, 0x1a2e_0003),
+            (4096, 24, 0x1a2e_0004),
+        ] {
+            let bytes = lane_rows(ty, k, rows, seed);
+            let calls = assert_lanes_match(
+                ty,
+                "seeded rows",
+                k,
+                k / 256 * block,
+                &bytes,
+                &lane_columns(ty, k),
+            );
+            eprintln!(
+                "{ty:?} lanes: seeded rows (k = {k}, {rows} rows): {calls} calls, bit-identical"
+            );
+        }
+        let k = 4096;
+        let calls = assert_lanes_match(
+            ty,
+            "0xFF group",
+            k,
+            k / 256 * block,
+            &lane_ends(ty, k),
+            &lane_columns(ty, k),
+        );
+        eprintln!("{ty:?} lanes: 0xFF group (k = {k}): {calls} calls, bit-identical");
+    }
+}
+
+/// Row-lane clause on the V4.1 set's first Q4_K and first Q5_K routed down
+/// stacks ([`TILE_ROWS`] rows each) against the seeded columns — lanes =
+/// `dot_row` per (row, column), bit for bit.
+#[test]
+#[ignore = "hw: needs the box and the V4.1 shards"]
+fn hw_lanes_match_dot_row_v41() {
+    for ty in [GgmlType::Q4_K, GgmlType::Q5_K] {
+        let (name, k, row_bytes, bytes) = v41_rows(ty, "ffn_down_exps", TILE_ROWS);
+        let calls = assert_lanes_match(ty, &name, k, row_bytes, &bytes, &lane_columns(ty, k));
+        eprintln!("{ty:?} lanes: {name} (k = {k}, {TILE_ROWS} rows): {calls} calls, bit-identical");
+    }
+}
+
+/// The row lanes refuse, by name and with their outputs left as they were: a
+/// type without lanes, a `k` off the 256-value grid, a pack's rows or group of
+/// another length, a column count outside `1..=TILE_COLS`, an `out` of
+/// another length, a group of another length and a short column. `k = 0`
+/// packs nothing.
+#[test]
+#[ignore = "hw: the box's CPU (a type has row lanes only with AVX2+FMA+F16C)"]
+fn hw_lanes_refuse_bad_shapes() {
+    let ty = GgmlType::Q4_K;
+    let k = 256;
+    let rows = vec![0u8; 8 * 144];
+    let need = qdot::lane_pack_bytes(k);
+    assert_eq!(need, 2560, "one packed super-block");
+    let a = vec![0u8; col_bytes(ty, k)];
+    let short = &a[..a.len() - 1];
+    let canary_b = 0x5Au8;
+    let mut packed = vec![canary_b; need + 1];
+    let mut pack = |w: GgmlType, rows: &[u8], k: usize, len: usize, want: QdotError| {
+        assert_eq!(qdot::pack_lanes(w, rows, k, &mut packed[..len]), Err(want));
+        assert!(
+            packed.iter().all(|&b| b == canary_b),
+            "the refusal {want:?} wrote into packed"
+        );
+    };
+    pack(
+        GgmlType::Q6_K,
+        &rows,
+        k,
+        need,
+        QdotError::NoLanes(GgmlType::Q6_K),
+    );
+    pack(
+        GgmlType::Q3_K,
+        &rows,
+        k,
+        need,
+        QdotError::NoLanes(GgmlType::Q3_K),
+    );
+    pack(
+        ty,
+        &rows,
+        100,
+        need,
+        QdotError::UnalignedK { k: 100, gran: 256 },
+    );
+    pack(
+        ty,
+        &rows[..rows.len() - 1],
+        k,
+        need,
+        QdotError::RowGroupBytes {
+            buf: "lane rows",
+            have: 8 * 144 - 1,
+            need: 8 * 144,
+        },
+    );
+    pack(
+        GgmlType::Q5_K,
+        &rows,
+        k,
+        need,
+        QdotError::RowGroupBytes {
+            buf: "lane rows",
+            have: 8 * 144,
+            need: 8 * 176,
+        },
+    );
+    pack(
+        ty,
+        &rows,
+        k,
+        need + 1,
+        QdotError::RowGroupBytes {
+            buf: "lane group",
+            have: need + 1,
+            need,
+        },
+    );
+    assert_eq!(qdot::pack_lanes(ty, &[], 0, &mut []), Ok(()), "k = 0");
+
+    let group = vec![0u8; need];
+    let many: Vec<&[u8]> = vec![a.as_slice(); qdot::TILE_COLS + 1];
+    let canary = f32::from_bits(0x7fc0_dead);
+    let mut out = vec![[canary; qdot::LANE_ROWS]; qdot::TILE_COLS + 1];
+    let mut dot =
+        |w: GgmlType, group: &[u8], cols: &[&[u8]], k: usize, outs: usize, want: QdotError| {
+            assert_eq!(
+                qdot::dot_lanes_cols(w, group, cols, k, &mut out[..outs]),
+                Err(want)
+            );
+            assert!(
+                out.iter()
+                    .flatten()
+                    .all(|v| v.to_bits() == canary.to_bits()),
+                "the refusal {want:?} wrote into out"
+            );
+        };
+    dot(
+        GgmlType::Q6_K,
+        &group,
+        &many[..1],
+        k,
+        1,
+        QdotError::NoLanes(GgmlType::Q6_K),
+    );
+    dot(
+        ty,
+        &group,
+        &[],
+        k,
+        0,
+        QdotError::TileShape { cols: 0, outs: 0 },
+    );
+    dot(
+        ty,
+        &group,
+        &many,
+        k,
+        qdot::TILE_COLS + 1,
+        QdotError::TileShape {
+            cols: qdot::TILE_COLS + 1,
+            outs: qdot::TILE_COLS + 1,
+        },
+    );
+    dot(
+        ty,
+        &group,
+        &many[..2],
+        k,
+        1,
+        QdotError::TileShape { cols: 2, outs: 1 },
+    );
+    dot(
+        ty,
+        &group,
+        &many[..1],
+        100,
+        1,
+        QdotError::UnalignedK { k: 100, gran: 256 },
+    );
+    dot(
+        ty,
+        &group[..need - 1],
+        &many[..1],
+        k,
+        1,
+        QdotError::RowGroupBytes {
+            buf: "lane group",
+            have: need - 1,
+            need,
+        },
+    );
+    dot(
+        ty,
+        &group,
+        &[a.as_slice(), short],
+        k,
+        2,
+        QdotError::ShortActivationCol {
+            have: short.len(),
+            need: a.len(),
+            k,
+        },
+    );
+    let e = QdotError::NoLanes(GgmlType::Q6_K).to_string();
+    assert!(
+        e.contains("no row-lane qdot kernel for weight type Q6_K"),
+        "{e}"
+    );
+}

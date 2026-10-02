@@ -1,0 +1,51 @@
+# Round glmunion: GLM-5.3-Flash's prompt batch with the host union's Q4_K and Q5_K rows through qdot's row lanes
+# (pack_lanes, dot_lanes_cols): each 8-row group of an expert's gate, up or down unpacked once into the
+# participant's buffer, a ymm lane a row, so a column's activation bytes are read once for eight rows and a half
+# sub-block's integer sum is four maddubs and a madd with no shuffle tree; every (row, column) keeps the one-column
+# kernel's eight float lanes and their order, so the bits are dot_row's (qdot hw_lanes_* and the union gates hold
+# it); only calls wider than 8 columns (a prompt batch's) take them. Against the base e08c399a (glmgemm2), whose union runs dot_row_cols (one row against up to 8 columns, the
+# row's activation columns re-read from L2 for every row). Q6_K downs (layers 11, 12, 44) keep the old path.
+# Decomposition [derived, round report section 1]. Base per 512-position batch from glmgemm2's sitting (A6000,
+# place a, G1): pp512 145.30 -> 3.524 s, pp4096 141.57 -> 3.617 s. At G1 every routed layer-batch is the card
+# front, then max(host union + exchange 1.1, card shadow), then the next layer: the union pays in full until it
+# meets the shadow (32.9 ms mean a layer-batch, 9 ms on the Q6_K layers).
+# - Today's union: 21.0 us a host slot + 13.8 us per 1,000 m^2 (hot experts), no term in the expert count (fit to
+#   glmgroup's 39 stat prompt lb rows, rms 1.7 ms; runtime values): compute, not DRAM (19 ms of bytes against 73.7).
+#   A slot is 98,304 row super-blocks: ~27 cycles each at 3.96 GHz on 32 threads for ~51 instructions (IPC ~1.9).
+# - Row lanes: ~38 instructions a (row, column, super-block) counted off the kernel (0.75 of the tile's), at an
+#   IPC of 2.5..3.5 (the ports allow ~4: 250 ALU ops a group super-block over four pipes) -> rc = 0.37..0.57 of
+#   today's slot cost; plus the pack, ~600 instructions an 8-row group super-block, ~23 us an expert (~3.8 ms a
+#   layer-batch); the DRAM term (experts x 15.2 MB / 135 GB/s) under it with 30 % of it not hidden.
+# Per layer-batch union 73.7 -> 39..53 ms; with the shadow max, -0.83..-1.35 s a batch: pp4096 3.62 -> 2.27..2.78 s
+# = 184..226 tok/s (+30..+59 %); pp512 3.52 -> 2.17..2.66 s = 193..236 tok/s (+32..+62 %).
+# pp512 is one batch, so the term reads pp4096; pp512 is printed beside it with the same bands.
+kind: ab
+question: does the union's per-slot cost fall to the row lanes' instruction and port bound once a column's
+  activation bytes are read once per eight rows and the shuffle tree is gone?
+term: pp tok/s @ P = 4096, prose prompt (GLM_PROSE from GLM_PROSE_FROM), A6000, plan (a), --ctx 4352, groups of
+  one (BLOOMERY_PREFILL_GROUP unset) - (union - base) / base, paired by round across the two invocations
+unit: %
+predict: +30..+59
+rounds: 2
+condition: one hold, two runner invocations back to back, each carrying this card: the base from a tree at
+  e08c399a (glmgemm2, /Users/hckim/repo/bloomery-unionbase, its own remote dir), then this round's from /Users/hckim/repo/bloomery-glmunion
+  (BLOOMERY_REMOTE='~/repo/bloomery-glmunion'), each BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4352 BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmunion-pp.card'
+  just depth-gpu-glm5next 512 4096. Every row's time prompt record names kind=batch and 1 pass at P = 512, 8 at
+  4096; a row marked [cold], [cpu-busy] or [other-busy] is void, and so is a window whose card witness or
+  cpu-freq differs between the two invocations. Both arms hold the same plan (no card byte moved: the row lanes
+  are host code), so their plan lines print the same card_experts and their decode rows must agree within the
+  window's ~5 % (a decode, verify or draft call of at most 8 columns keeps the one-row tile: the lanes run only
+  past DEFER_MAX_COLS). The effect predicted is far outside the ~5 % a window moves, so pairing
+  across the two invocations decides it. Box time ~14..20 min [derived: per invocation two warm-up processes and
+  four rows, six loads at 45..75 s, 2 x (4 + 25..33) s of prompt; plus the two builds]
+decide-in: land it; the G1 floor then is the card shadow on most routed layers (max(union, shadow) per layer):
+  the next prompt terms are the shadow (card experts and the shared expert, ~33 ms a layer-batch), the Q6_K
+  layers' downs (a row-lane Q6_K kernel, ~45 ms a batch each of 11, 12, 44), and at G >= 2 the card fronts
+decide-below: under +30 %: the lanes ran slower than the 2.5 IPC the band's top assumed, or the pack costs more
+  than 23 us an expert: read union_ms per layer-batch from one run's stat prompt lb rows (BLOOMERY_STEP_STATS=1)
+  against glmgroup's, split by m_max (the hot rows) and by the Q6_K layers, before landing; then a perf annotate
+  of dot_lanes_avx2 names the stalled port
+decide-above: past +59 %: the union fell under the shadow on more layers than the fit says, or the m^2 term was
+  the act-reread the lanes remove rather than the steal tails; re-derive the shadow-bound floor from the stat
+  prompt lb rows and price the shadow's own terms next

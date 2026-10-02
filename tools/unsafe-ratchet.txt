@@ -67,10 +67,16 @@ gpu-glm5next 4 0 0
 gpu-vision 48 0 0
 hf 0 0 0
 levers 0 0 0
-model 112 29 11
+# PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
+# (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
+# cells, two blocks, each with its SAFETY line.
+model 114 30 11
 models 0 0 0
 placement 0 0 0
-qdot 69 36 0
+# PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
+# lanes (pack_lanes_avx2, dot_lanes_avx2 and their helpers transpose8_epi32, transpose8_ps, lane_codes: five
+# unsafe fns, one block each) and the three calls into them (pack_lanes' two arms, lanes), each with its SAFETY line.
+qdot 77 41 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

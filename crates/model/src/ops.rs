@@ -2283,6 +2283,93 @@ impl<'a> PairWork<'a> {
         }
         Ok(())
     }
+
+    /// Rows `rows` — whole groups of [`qdot::LANE_ROWS`] — of a Q4_K or Q5_K
+    /// pair read row after row, across every token column, through qdot's row
+    /// lanes: each group unpacked once into this participant's [`LANE_BUF`]
+    /// ([`qdot::pack_lanes`]), then dotted with the columns in runs of up to
+    /// [`qdot::TILE_COLS`] ([`qdot::dot_lanes_cols`]), which writes each (row,
+    /// column)'s `dot_row` value bit for bit.
+    ///
+    /// # Safety
+    ///
+    /// [`PairWork::compute_rows`]' contract, with `rows` in whole groups.
+    unsafe fn compute_lanes(
+        &self,
+        rows: Range<usize>,
+        lvl: u8,
+        acc: &mut profile::CallAcc,
+    ) -> Result<(), crate::ModelError> {
+        const G: usize = qdot::LANE_ROWS;
+        assert!(
+            rows.start.is_multiple_of(G) && rows.end.is_multiple_of(G),
+            "a row-lane pair's rows {rows:?} run in whole groups of {G}"
+        );
+        assert!(
+            self.layout == RowLayout::Rows,
+            "row lanes read a stack's rows row after row"
+        );
+        let Some((cb, aptr)) = self.fused_cols else {
+            panic!("row lanes read quantized columns: the pair has f32 columns");
+        };
+        if let Some(defer) = self.defer {
+            defer.wait_ready(self.slot);
+        }
+        if self.ne1 == 0 {
+            return Ok(());
+        }
+        // SAFETY: the slot's buffer is `src_ne1 * cb` bytes as allocated, and
+        // its writes happen before this read (`compute_rows`' `# Safety`).
+        let acol = unsafe { std::slice::from_raw_parts(aptr, self.src_ne1 * cb) };
+        let (ty, k, n) = (self.ty, self.k, self.n);
+        let group_bytes = G * self.row_bytes;
+        LANE_BUF.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            let len = qdot::lane_pack_bytes(k);
+            if buf.len() < len {
+                buf.resize(len, 0);
+            }
+            let packed = &mut buf[..len];
+            for g in rows.start / G..rows.end / G {
+                let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
+                qdot::pack_lanes(
+                    ty,
+                    &self.bytes[g * group_bytes..(g + 1) * group_bytes],
+                    k,
+                    packed,
+                )?;
+                let mut t0 = 0;
+                while t0 < self.ne1 {
+                    let m = (self.ne1 - t0).min(qdot::TILE_COLS);
+                    let cols: [&[u8]; qdot::TILE_COLS] = std::array::from_fn(|i| {
+                        let c = self.col(t0 + i.min(m - 1));
+                        &acol[c * cb..(c + 1) * cb]
+                    });
+                    let mut v = [[0.0f32; G]; qdot::TILE_COLS];
+                    qdot::dot_lanes_cols(ty, packed, &cols[..m], k, &mut v[..m])?;
+                    for (i, col) in v[..m].iter().enumerate() {
+                        for (r, &val) in col.iter().enumerate() {
+                            // SAFETY: row `g·G + r` is inside `rows`, whole groups
+                            // of this chunk's own (the assert above) — see the
+                            // SharedOut construction site.
+                            unsafe { self.out.write((t0 + i) * n + g * G + r, val) };
+                        }
+                    }
+                    t0 += m;
+                }
+                if let Some(t_dot) = t_dot {
+                    acc.add_dot(t_dot.elapsed().as_nanos() as u64);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
+// Per-thread row-lane group of the union's Q4_K and Q5_K passes
+// ([`PairWork::compute_lanes`]), grown to the widest `k` seen.
+thread_local! {
+    static LANE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Shape contract of a batch: equal-length lists; every `W_i` agrees on
@@ -2945,6 +3032,33 @@ fn r8_tile_cost(k: usize, ne1: usize) -> Option<u64> {
     let m = ne1.max(1) as u64;
     let sb = (k / 256) as u64;
     Some(sb * (m.div_ceil(qdot::TILE_COLS as u64) * fixed + m * per_col))
+}
+
+/// Instructions per group super-block of qdot's Q4_K and Q5_K row lanes, in
+/// [`tile_units`]' half-instruction units, counted off the kernels' source:
+/// the pack of one 8-row group (`pack_lanes`: the rows' scales and mins, the
+/// transposes, the codes' nibbles; Q5_K's high bits on top), once a group,
+/// and each column's share (`dot_lanes_cols`: eight lanes of a min fma and
+/// two halves of four maddubs, a madd and a scaled fma). Its unit is a group
+/// and [`tile_units`]' a row, so one lane cut weighs both.
+fn lane_units(ty: GgmlType) -> Option<(u64, u64)> {
+    match ty {
+        GgmlType::Q4_K => Some((1184, 612)),
+        GgmlType::Q5_K => Some((1648, 612)),
+        _ => None,
+    }
+}
+
+/// The cost of one row-lane group of `ty` over `k` values against `ne1`
+/// columns, as `PairWork::compute_lanes` walks it: the pack once, then every
+/// column's share; `None` where qdot runs no row lanes for `ty`.
+fn lane_tile_cost(ty: GgmlType, k: usize, ne1: usize) -> Option<u64> {
+    if !qdot::has_lanes(ty) {
+        return None;
+    }
+    let (fixed, per_col) = lane_units(ty)?;
+    let sb = (k / 256) as u64;
+    Some(sb * (fixed + ne1.max(1) as u64 * per_col))
 }
 
 /// [`tile_cost`] of a fused row of `ty` over `k` values against `ne1` columns.
@@ -3643,11 +3757,6 @@ impl UnionStack {
         }
     }
 
-    /// Units of one expert's matrix: its rows, or its row-lane groups.
-    fn units(&self) -> usize {
-        self.n / self.layout.grain()
-    }
-
     /// A unit's lane cost against `m` columns: the tile's with `tile`, else
     /// its bytes once per column ([`row_cost`]).
     fn cost(&self, m: usize, tile: bool) -> u64 {
@@ -3657,6 +3766,26 @@ impl UnionStack {
         {
             Some(c) => c,
             None => (self.row_bytes * self.layout.grain()) as u64 * m.max(1) as u64,
+        }
+    }
+
+    /// Whether a union pass can run this stack through qdot's row lanes
+    /// ([`PairWork::compute_lanes`]): a Q4_K or Q5_K stack read row after
+    /// row, its rows whole groups of [`qdot::LANE_ROWS`], on a CPU with the
+    /// lane kernels.
+    fn lanes(&self) -> bool {
+        self.layout == RowLayout::Rows
+            && qdot::has_lanes(self.ty)
+            && self.n.is_multiple_of(qdot::LANE_ROWS)
+    }
+
+    /// [`UnionStack::cost`] of one row-lane group of [`qdot::LANE_ROWS`] rows
+    /// against `m` columns: [`lane_tile_cost`] with `tile`, else the group's
+    /// bytes once per column.
+    fn lane_cost(&self, m: usize, tile: bool) -> u64 {
+        match tile.then(|| lane_tile_cost(self.ty, self.k, m)).flatten() {
+            Some(c) => c,
+            None => (self.row_bytes * qdot::LANE_ROWS) as u64 * m.max(1) as u64,
         }
     }
 }
@@ -3856,6 +3985,10 @@ struct UnionRows<'p, 'w> {
     /// The output slab's first cell; the slab holds every slot of the plan.
     out: SharedOut,
     claims: UnionClaims<'p>,
+    /// Whether the pass runs its rows through qdot's row lanes
+    /// ([`UnionCall::lanes`]). A unit is then a group of [`qdot::LANE_ROWS`]
+    /// rows.
+    lanes: bool,
 }
 
 impl UnionRows<'_, '_> {
@@ -3867,9 +4000,18 @@ impl UnionRows<'_, '_> {
         }
     }
 
+    /// Rows of one unit: a row-lane group, or the stacks' layout's unit.
+    fn grain(&self) -> usize {
+        if self.lanes {
+            qdot::LANE_ROWS
+        } else {
+            self.stacks[0].layout.grain()
+        }
+    }
+
     /// Units of every pair.
     fn units(&self) -> usize {
-        self.stacks[0].units()
+        self.stacks[0].n / self.grain()
     }
 }
 
@@ -3894,17 +4036,26 @@ impl RowSet for UnionRows<'_, '_> {
 
     fn cost(&self, p: usize, tile: bool) -> u64 {
         let (d, s) = self.split(p);
-        self.stacks[s].cost(self.plan.off[d + 1] - self.plan.off[d], tile)
+        let m = self.plan.off[d + 1] - self.plan.off[d];
+        if self.lanes {
+            self.stacks[s].lane_cost(m, tile)
+        } else {
+            self.stacks[s].cost(m, tile)
+        }
     }
 
     fn tile_costs(&self) -> bool {
-        self.stacks
-            .iter()
-            .all(|s| unit_tile_cost(s.ty, s.layout, s.k, 1).is_some())
+        self.stacks.iter().all(|s| {
+            if self.lanes {
+                lane_tile_cost(s.ty, s.k, 1).is_some()
+            } else {
+                unit_tile_cost(s.ty, s.layout, s.k, 1).is_some()
+            }
+        })
     }
 
     fn block_cap(&self) -> Option<usize> {
-        Some(UNION_BLOCK_ROWS / self.stacks[0].layout.grain())
+        Some(UNION_BLOCK_ROWS / self.grain())
     }
 
     fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc) {
@@ -3948,16 +4099,18 @@ impl RowSet for UnionRows<'_, '_> {
         // cells each are pair `p`'s, inside the output slab, which holds every
         // slot of the plan (asserted where the pass is built).
         let out = unsafe { self.out.offset(first * st.n) };
-        let g = st.layout.grain();
+        let g = self.grain();
+        let work = PairWork::at((out, m), bytes, src, st.meta(), 0, None);
+        let rows = units.start * g..units.end * g;
         // SAFETY: the units are pair `p`'s and this participant's alone (this
         // fn's `# Safety`); the input columns were written before this read,
         // by the caller or by the claim waited for above.
         unsafe {
-            PairWork::at((out, m), bytes, src, st.meta(), 0, None).compute_rows(
-                units.start * g..units.end * g,
-                lvl,
-                acc,
-            )
+            if self.lanes {
+                work.compute_lanes(rows, lvl, acc)
+            } else {
+                work.compute_rows(rows, lvl, acc)
+            }
         }
     }
 }
@@ -4170,6 +4323,15 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         Ok(())
     }
 
+    /// Whether a pass over `stacks` runs qdot's row lanes: a call wider than
+    /// [`DEFER_MAX_COLS`] columns — a prompt batch's, whose experts' columns
+    /// pay the group's pack back; the decode, verify and draft calls keep the
+    /// one-row tile — over stacks that can ([`UnionStack::lanes`]). Either way
+    /// every value is `dot_row`'s.
+    fn lanes(&self, stacks: &[UnionStack]) -> bool {
+        self.x.ne1() > DEFER_MAX_COLS && stacks.iter().all(UnionStack::lanes)
+    }
+
     /// x quantized over the pool, one dispatch: in the gate's encoding into
     /// `xq`, and in the up's into `xq_up` when the up reads other bytes.
     fn quantize_x(&self, xq: &mut [u8], xq_up: Option<&mut [u8]>) {
@@ -4231,6 +4393,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             } else {
                 UnionClaims::None
             },
+            lanes: self.lanes(&[self.gate, self.up]),
         };
         let mut pacc = profile::CallAcc::new();
         let t0 = if lvl > 0 { Some(Instant::now()) } else { None };
@@ -4344,6 +4507,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             } else {
                 UnionClaims::None
             },
+            lanes: self.lanes(&[self.down]),
         };
         let mut pacc = profile::CallAcc::new();
         let t0 = if lvl > 0 { Some(Instant::now()) } else { None };
