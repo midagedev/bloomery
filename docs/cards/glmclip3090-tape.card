@@ -1,0 +1,14 @@
+# The GLM-5.3-Flash clip's toktape tapes on the RTX 3090 alone (250 W cap): one engine per hold, the clip41 prompts
+# (the RateLimiter review 2000 out, the Rust and Korean chats 1000 out), greedy, reasoning_effort low (GLM-5.3's
+# template always opens <think>), one discarded warm-up. bloomery-serve --model glm --place gate (the 3090 alone)
+# with adaptive residency mid-p0-s1 and the NextN MTP draft set by lever (both off by default under gate);
+# llama.cpp PR #27754's llama-server on the 3090 alone with its MTP draft (models/glm5next.sh at the 3090's
+# GLM_NCMOE 42: --n-cpu-moe GLM_NCMOE_MTP, one or two more only if it does not come up; -fa off, -nopo 1,
+# GLM_MTP_FLAGS, NVIDIA_TF32_OVERRIDE=0, -np 1 -ctxcp 0 --cache-ram 0), same file, its shards read once before the
+# load and two warm-ups discarded.
+# The tapes are the clip's evidence; the table numbers stay the depth runner's.
+kind: exclusive
+reason: a 186 GB host set plus a card load and three timed requests per engine; per-token times are the clip, so
+  the box must be quiet (a build or a load beside it moves them, and memory pressure re-reads the churn pool);
+  why now: the user asked for a GLM-5.3-Flash clip on the RTX 3090 (2026-10-02)
+minutes: 10..20
