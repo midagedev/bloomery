@@ -1632,6 +1632,97 @@ pub static LISTENING_GLM: Kind = Kind {
     ],
 };
 
+/// The Qwen3 seat's address.
+pub static LISTENING_QWEN3: Kind = Kind {
+    name: "listening_qwen3",
+    head: "bloomery-serve-qwen3:",
+    doc: "The Qwen3 seat's architecture, context and the address it listens on.",
+    parts: &[
+        key("arch", Word, ""),
+        key("ctx", U64, "positions"),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
+/// The Qwen3 seat's load.
+pub static LOAD_QWEN3: Kind = Kind {
+    name: "load_qwen3",
+    head: "load",
+    doc: "The Qwen3 seat's model on device 0: its architecture, resident bytes, context, layers, the prompt ubatch and the step graph's nodes, and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("layers", U64, ""),
+        key("ubatch", U64, "positions"),
+        key("graph_nodes", U64, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The GGUF set a `--hf` quant picked.
+pub static HF_SET: Kind = Kind {
+    name: "hf_set",
+    head: "hf set",
+    doc: "The GGUF set `--hf <repo>[:<quant>]` picked in the repo's listing: its name, its tag, its files and their bytes.",
+    parts: &[
+        key("repo", Word, ""),
+        key("set", Word, ""),
+        key("tag", Word, ""),
+        key("files", U64, ""),
+        key("bytes", U64, "B"),
+    ],
+};
+
+/// A file of a `--hf` fetch before it runs.
+pub static HF_FILE: Kind = Kind {
+    name: "hf_file",
+    head: "hf file",
+    doc: "A file of a `--hf` fetch: its path in the repo, its bytes, what the cache held (cached: checked, nothing fetched; fetch: from byte 0; resume: a partial file fetched from its end; stale: a cached file whose content is not the listing's, fetched again; offline-cached: a verified file used with no listing, after an `hf offline` line) and the byte the fetch starts at.",
+    parts: &[
+        key("file", Word, ""),
+        key("bytes", U64, "B"),
+        key("state", Word, ""),
+        key("from", U64, "B"),
+    ],
+};
+
+/// A `--hf` start the network refused, the cache standing in.
+pub static HF_OFFLINE: Kind = Kind {
+    name: "hf_offline",
+    head: "hf offline",
+    doc: "A `--hf` start whose listing failed at the network (no host, no connection, a timeout, no TLS, no reply; not an HTTP status): the cache's one verified set the quant names is used, its files `offline-cached`, and the network's reason.",
+    parts: &[key("repo", Word, ""), key("reason", Text, "")],
+};
+
+/// A running `--hf` download.
+pub static HF_PROGRESS: Kind = Kind {
+    name: "hf_progress",
+    head: "hf progress",
+    doc: "A running `--hf` download's bytes on disk, every few seconds.",
+    parts: &[
+        key("file", Word, ""),
+        key("have", U64, "B"),
+        key("of", U64, "B"),
+    ],
+};
+
+/// A `--hf` file checked.
+pub static HF_DONE: Kind = Kind {
+    name: "hf_done",
+    head: "hf done",
+    doc: "A `--hf` file checked against the listing: the bytes this run fetched, the check (the LFS sha256, or the git blob sha1 of a file stored in git) and its digest.",
+    parts: &[
+        key("file", Word, ""),
+        key("fetched_bytes", U64, "B"),
+        key("check", Word, ""),
+        key("digest", Word, ""),
+    ],
+};
+
 /// The GLM seat's NextN draft, loaded beside the target.
 pub static LOAD_DRAFT_GLM: Kind = Kind {
     name: "load_draft_glm",
@@ -1915,6 +2006,20 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+];
+
+/// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: a `--hf`
+/// fetch's lines (printed by the server before the seat registers), the
+/// load, the address and each request's note of the prefix it kept none of.
+pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
+    &HF_OFFLINE,
+    &HF_SET,
+    &HF_FILE,
+    &HF_PROGRESS,
+    &HF_DONE,
+    &LOAD_QWEN3,
+    &LISTENING_QWEN3,
+    &CACHE_REUSE,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
@@ -2323,6 +2428,7 @@ mod tests {
             BLOOMERY_CHAT,
             BLOOMERY_SERVE_DS41,
             BLOOMERY_SERVE_QWEN38,
+            BLOOMERY_SERVE_QWEN3,
             GENERATE_GLM5NEXT,
             GENERATE_QWEN3MOE,
             GATE_DEEPSEEK41_PREFILL,

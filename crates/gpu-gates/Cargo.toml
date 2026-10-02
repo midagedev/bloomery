@@ -16,6 +16,8 @@ bloomery-gguf = { path = "../gguf" }
 # node dumps' manifest (re-exported from `lib.rs`), the draft sets, greedy files, KLD bases and
 # the vision set.
 bloomery-refset = { path = "../refset" }
+# Host only: a server's `--hf <repo>[:<quant>]`, the repo's GGUF set fetched into a local cache.
+bloomery-hf = { path = "../hf" }
 # Host only: the lever registry, which the binaries parse once at `main`.
 bloomery-levers = { path = "../levers" }
 # Host-only edge, live with the `gpu` feature off: the oracle table's `Arch`, and the
@@ -128,6 +130,10 @@ required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_qwen38_serve"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_qwen3_serve"
 required-features = ["deepseek41"]
 
 [[bin]]

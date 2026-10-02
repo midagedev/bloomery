@@ -1005,6 +1005,14 @@ gate-gpu-gates-lib:
 gate-ds41-oracle:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_oracle --nocapture --test-threads=1'
 
+# The --hf resolver (crates/hf, host only): the repo string, set selection from captured API listings (a split-file
+# repo, mmproj and imatrix left out, zero and two matches refused), cache paths, the model named once, and the fetch
+# through curl on file:// URLs (a resume from a truncated file, a refetch-free second start, size and digest refusals),
+# and the offline start (a refused connection lets the one verified cached set stand in; zero or two, or an HTTP error
+# from a local port, are refused). No network, no card.
+gate-hf:
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-hf --lib -- --nocapture'
+
 # Reference sets (crates/refset, host only): the readers' unit tests, then every family's sets in place
 # against the family table — each complete, dumped from the file the tree runs, of the family's ik build.
 # The draft set's family needs the profile's DSPARK_MODEL, exported as the dspark recipes do.
@@ -1370,6 +1378,16 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
 [group('v41-load')]
 gate-gpu-qwen38-serve:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_qwen3moe --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D'
+
+# The qwen3 seat of bloomery-serve (--model qwen3 -m <file>) against generate_qwen3moe, on the qwen3moe profile's file
+# (Qwen3-30B-A3B, the MODEL box.sh exports under BLOOMERY_MODEL=qwen3moe) and the qwen35moe profile's (Qwen3.6-35B-A3B,
+# that profile's default MODEL, read from tools/ref/models/qwen35moe.sh): per file, one server, then one CLI, one process
+# at a time under one gate-lock hold. The server's /completion of a chat turn rendered by its own template (past the
+# eight ids a pass takes) gives generate_qwen3moe --tokens <those ids> -n 64 --last-step's ids, and its
+# /v1/chat/completions of the same turn is those ids (gate_qwen3_serve's header has the clauses). Logs in
+# target/qwen3-serve-gate/<n>/. The build takes glm5next: bloomery-serve links every seat's device bundle.
+gate-gpu-qwen3-serve:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin bloomery-serve --bin generate_qwen3moe --bin gate_qwen3_serve && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --dir $D'
 
 # bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
 # default (SERVE_PLACE=gate for the 3090), the port 8080 unless SERVE_PORT, a four-hour gate bound unless

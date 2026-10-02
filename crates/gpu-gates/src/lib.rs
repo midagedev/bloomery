@@ -28,6 +28,7 @@ pub mod host_stats;
 pub mod ik_norm;
 pub mod ik_q8_2;
 pub mod kld;
+pub mod model_file;
 #[cfg(feature = "gpu")]
 pub mod nodes;
 pub mod oracle;
@@ -90,21 +91,21 @@ pub fn checks_failed() -> GateError {
     "FAILED: one or more checks above did not pass".into()
 }
 
-/// The model file every gate opens: `$BLOOMERY_REF_MODEL`, with no default
-/// here. The file is a property of the model profile
-/// (`tools/ref/models/<architecture>.sh`); `tools/box.sh` exports it into
-/// every box command, the same value the runners and the C++ harnesses
-/// read. An empty value counts as unset, as in the profile. `open_model` and
-/// any gate that prints the path read it here, so the printed name is the
-/// file that was opened.
+/// The model file every gate and server opens: the one a server named on
+/// its command line (`-m`, `--hf`: [`model_file`]), else
+/// `$BLOOMERY_REF_MODEL`, with no default here. The variable's file is a
+/// property of the model profile (`tools/ref/models/<architecture>.sh`);
+/// `tools/box.sh` exports it into every box command, the same value the
+/// runners and the C++ harnesses read. An empty value counts as unset, as in
+/// the profile. `open_model` and any gate that prints the path read it here,
+/// so the printed name is the file that was opened.
 pub fn ref_model_path() -> Result<PathBuf, GateError> {
+    if let Some(p) = model_file::model_file() {
+        return Ok(p.clone());
+    }
     match std::env::var_os("BLOOMERY_REF_MODEL") {
         Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
-        _ => Err(
-            "BLOOMERY_REF_MODEL unset — run through tools/box.sh or the just recipes, \
-                  which export it from the model profile"
-                .into(),
-        ),
+        _ => Err(hf::source::NONE.into()),
     }
 }
 

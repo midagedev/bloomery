@@ -2,15 +2,29 @@
 //! decision server of `serve::decide` on Clef's backbone (a `qwen35` file on
 //! one card) and its joint schema head (`crates/decision`, on the host).
 //!
-//!     bloomery_serve_clef --model <gguf> --head <joint_head.safetensors>
-//!                         [--head-config <json>] [--host H] [--port P] [--ctx C]
+//!     bloomery_serve_clef (--model <gguf> | --hf <repo>[:<quant>])
+//!                         [--head <joint_head.safetensors>] [--head-config <json>]
+//!                         [--host H] [--port P] [--ctx C]
+//!     bloomery_serve_clef --version
+//!
+//! The backbone is `--model` (`-m`, `--model-file`), or `--hf`: the repo's
+//! GGUF set of that quant tag fetched into the cache (`$BLOOMERY_CACHE`, else
+//! `~/.cache/bloomery/hf`; `bloomery_gpu_gates::model_file`, its `hf`
+//! records on stderr), e.g. `--hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M`.
+//! Under `--hf` with no `--head`, the head and its config
+//! (`joint_head.safetensors`, `joint_head_config.json`) are fetched from
+//! the release's repo, `Cloudflare/clef-flash`; without `--hf`, `--head` is required.
+//! The model named twice (two of its spellings, or one beside `--hf`) is
+//! refused by name. `--version` prints this crate's version and the build's
+//! commit and exits.
 //!
 //! Defaults: the head's config `joint_head_config.json` beside `--head`, H
 //! `127.0.0.1`, P 8091, C 16384 (the release's `max_length`); prompt ubatches
 //! of `UBATCH` ids clipped to C, as `clef_hidden`. Startup opens the backbone
 //! and the head once, on a worker thread that owns the card, refuses a head
 //! whose `hidden_size` is not the backbone's width, then binds and prints one
-//! line, `bloomery_serve_clef: listening on http://H:P (model …, quant …)`.
+//! line, `bloomery_serve_clef: listening on http://H:P (model …, quant …)`,
+//! P the bound port (`--port 0` binds a free one).
 //!
 //! Each request: the decision crate parses, validates and encodes it at the
 //! release's `max_length` (an encoding past C is a 400 by name), the backbone
@@ -19,9 +33,9 @@
 //! request the decision crate refuses is a 400 with its message; a backbone
 //! or head failure is a 500. `/props` names the engine, the build's commit, the
 //! model and head file names, and the quant: the GGUF's `general.file_type`,
-//! or the census of its tensor types when the file names none. A flag given
-//! twice takes its last value; an unknown flag or a missing value is refused
-//! by name.
+//! or the census of its tensor types when the file names none. Any other
+//! flag given twice takes its last value; an unknown flag or a missing value
+//! is refused by name.
 
 #[cfg(not(feature = "clef"))]
 fn main() {
@@ -31,6 +45,13 @@ fn main() {
 
 #[cfg(feature = "clef")]
 fn main() -> std::process::ExitCode {
+    if std::env::args().skip(1).any(|a| a == "--version") {
+        println!(
+            "{}",
+            bloomery_gpu_gates::model_file::version("bloomery_serve_clef")
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
     bloomery_gpu_gates::exit_with("bloomery_serve_clef", run::run())
 }
 
@@ -47,7 +68,7 @@ mod run {
     use super::clef;
     use bloomery_gpu::arch::qwen3moe::PrefillPath;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
-    use bloomery_gpu_gates::GateError;
+    use bloomery_gpu_gates::{GateError, model_file};
     use decision::Error as DError;
     use decision::answer::answer;
     use decision::encode::{MAX_LENGTH, encode};
@@ -64,6 +85,16 @@ mod run {
     use std::time::Instant;
     use tokenizer::Tokenizer;
 
+    /// The repo `--hf` fetches the joint head from when `--head` is not
+    /// given: the release's.
+    const HEAD_REPO: &str = "Cloudflare/clef-flash";
+
+    /// The head's files in [`HEAD_REPO`], the weights first.
+    const HEAD_FILES: &[&str] = &["joint_head.safetensors", "joint_head_config.json"];
+
+    /// The spellings of the backbone's path flag.
+    const MODEL_FLAGS: &[&str] = &["--model", "-m", "--model-file"];
+
     struct Args {
         model: PathBuf,
         head: PathBuf,
@@ -74,15 +105,16 @@ mod run {
     }
 
     fn parse() -> Result<Args, GateError> {
-        let mut a = std::env::args().skip(1);
-        let (mut model, mut head, mut head_config) = (None, None, None);
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let (flags, rest) = model_file::take(&args, MODEL_FLAGS)?;
+        let mut a = rest.into_iter();
+        let (mut head, mut head_config) = (None, None);
         let (mut host, mut port, mut ctx) = ("127.0.0.1".to_owned(), 8091u16, MAX_LENGTH);
         while let Some(flag) = a.next() {
             let value = a
                 .next()
                 .ok_or_else(|| format!("{flag}: a value is due after it"))?;
             match flag.as_str() {
-                "--model" => model = Some(PathBuf::from(value)),
                 "--head" => head = Some(PathBuf::from(value)),
                 "--head-config" => head_config = Some(PathBuf::from(value)),
                 "--host" => host = value,
@@ -103,12 +135,24 @@ mod run {
                 _ => return Err(format!("unknown flag {flag:?}").into()),
             }
         }
-        let need = |v: Option<PathBuf>, flag: &str| {
-            v.ok_or_else(|| GateError::from(format!("{flag} is required")))
+        if head.is_none() && flags.hf.is_none() {
+            return Err(
+                format!("--head is required, unless --hf fetches it from {HEAD_REPO}").into(),
+            );
+        }
+        let model = model_file::resolve(&flags, None)?.ok_or_else(|| {
+            GateError::from("the backbone is required: --model PATH (-m) or --hf <repo>[:<quant>]")
+        })?;
+        let head = match head {
+            Some(h) => h,
+            None => model_file::fetch_exact(HEAD_REPO, HEAD_FILES)?
+                .into_iter()
+                .next()
+                .ok_or("the head's fetch returned no file")?,
         };
         Ok(Args {
-            model: need(model, "--model")?,
-            head: need(head, "--head")?,
+            model,
+            head,
             head_config,
             host,
             port,
@@ -339,7 +383,9 @@ mod run {
         });
         let server = DecideServer::bind(addr.as_str(), Box::new(Clef { jobs, props }))
             .map_err(|e| format!("bind {addr}: {e}"))?;
-        println!("bloomery_serve_clef: listening on http://{addr} (model {model}, quant {quant})");
-        Err(format!("serving {addr}: {}", server.run()).into())
+        // The bound address: `--port 0` binds a free port.
+        let bound = server.local_addr()?;
+        println!("bloomery_serve_clef: listening on http://{bound} (model {model}, quant {quant})");
+        Err(format!("serving {bound}: {}", server.run()).into())
     }
 }

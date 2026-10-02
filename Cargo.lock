@@ -162,6 +162,7 @@ dependencies = [
  "bloomery-gpu-deepseek41",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-vision",
+ "bloomery-hf",
  "bloomery-levers",
  "bloomery-model",
  "bloomery-qdot",
@@ -205,6 +206,16 @@ dependencies = [
  "cuda-core",
  "cuda-device",
  "cuda-host",
+]
+
+[[package]]
+name = "bloomery-hf"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha1",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -887,6 +898,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

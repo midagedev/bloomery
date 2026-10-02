@@ -59,3 +59,5 @@ crates/serve/build.rs	CARGO_MANIFEST_DIR,BLOOMERY_GIT_COMMIT	stays: cargo's crat
 crates/tokenizer/tests/tokenizer.rs	BLOOMERY_QWEN3MOE_VOCAB,BLOOMERY_DATA	stays: the vocabulary file and the data directory
 crates/decision/tests/clef.rs	BLOOMERY_DATA	stays: the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set
+crates/gpu-gates/src/model_file.rs	BLOOMERY_CACHE,BLOOMERY_REF_MODEL,HOME	stays: a server's --hf cache, and the model named once beside the gates' variable
+crates/hf/src/fetch.rs	HF_TOKEN,HOME	stays: the hub token for a gated repo, and its file

@@ -62,6 +62,7 @@ gpu-deepseek41 464 52 0
 gpu-gates 61 5 1
 gpu-glm5next 4 0 0
 gpu-vision 48 0 0
+hf 0 0 0
 levers 0 0 0
 model 112 29 11
 models 0 0 0

@@ -7,7 +7,7 @@
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
 //!                       [-n N] [--ctx C] [--mode eager|graph]
 //!                       [--prefill auto|pass|gemm|step] [--place a|gate|bp]
-//!                       [--time [--warm W]] [--logits]
+//!                       [--time [--warm W]] [--logits] [--last-step]
 //!     generate_qwen3moe --arm a,b,c[/N] [--arm ...] [--arm-sync] [-n N] [--ctx C] ...
 //!     generate_qwen3moe --dump-taps DIR --tokens-file F [--tokens-file F ...]
 //!                       --seqs S --prompt-len P [-n N] [--ctx C]
@@ -16,6 +16,14 @@
 //! takes its last value. `--prompt` tokenizes the text with the file's own vocabulary
 //! (`tokenizer`, no BOS: the file sets `add_bos_token` false; no
 //! chat template) and prints the generated text after the ids.
+//!
+//! `--last-step` (a qwen3moe or qwen35moe file, refused by name on a
+//! qwen4exp one and beside `--time` and `--seed-depth`) feeds the prompt
+//! less its last id by `--prefill`, then the last id as one step, whose
+//! argmax is generated token 0: the server's cut (`bloomery-serve --model
+//! qwen3` prefills a request's prompt less its last id, then steps it), so
+//! the two print the same greedy ids past eight prompt ids, where the
+//! ubatch and the step compute the last position by different arms.
 //!
 //! The prompt is prefilled (`Qwen3moeModel::prefill_with` by the `--prefill`
 //! path: `auto` takes one pass for a prompt of up to eight ids and GEMM
@@ -832,6 +840,8 @@ mod cli {
         stats: bool,
         /// `BLOOMERY_MTP_WINDOWS`, as the levers hold it.
         windows: bool,
+        /// `--last-step`: the prompt's last id is a step of its own.
+        last_step: bool,
     }
 
     /// A prompt call's streaming picks, each with its ubatch, and its end.
@@ -917,6 +927,7 @@ mod cli {
         let timed = std::env::args().any(|a| a == "--time");
         let sync = std::env::args().any(|a| a == "--arm-sync");
         let logits = std::env::args().any(|a| a == "--logits");
+        let last_step = std::env::args().any(|a| a == "--last-step");
         let n_gen: usize = flag("-n")?.map_or(Ok(32), |s| s.parse())?;
         let ctx: usize = flag("--ctx")?.map_or(Ok(4096), |s| s.parse())?;
         let warm: usize = flag("--warm")?.map_or(Ok(0), |s| s.parse())?;
@@ -1009,6 +1020,14 @@ mod cli {
             Chosen::Qwen38(_, _, d) => d,
             Chosen::Qwen3(_) | Chosen::Qwen35(_) => Draft38::Off,
         };
+        if last_step && (family == Family::Qwen38 || timed || seed_depth.is_some()) {
+            return Err(
+                "--last-step feeds a qwen3moe or qwen35moe prompt's last id as a step, the \
+                 server's cut; it is refused on a qwen4exp file and beside --time and \
+                 --seed-depth"
+                    .into(),
+            );
+        }
         if family != Family::Qwen38 && place.is_some() {
             return Err(
                 "--place picks a qwen4exp plan's card; a qwen3moe or qwen35moe file runs on the \
@@ -1129,6 +1148,7 @@ mod cli {
             ctx,
             stats: levers.step_stats(),
             windows: levers.mtp_windows(),
+            last_step,
         };
         match chosen {
             Chosen::Qwen3(path) => drive(
@@ -2204,10 +2224,23 @@ mod cli {
             println!("seed rows={} pos={}", d - 1, m.pos());
         }
         let depth = run.seed_depth.unwrap_or(ids.len());
+        // Under `--last-step` the prompt call takes all but the last id.
+        let (fed, last) = match ids.split_last() {
+            Some((&l, head)) if run.last_step => (head, Some(l)),
+            _ => (ids.as_slice(), None),
+        };
         B::mark_prompt(m, m.pos(), ids.len())?;
-        let plan = B::plan(m, ids.len(), path)?;
+        let plan = B::plan(m, fed.len().max(1), path)?;
         let t = Instant::now();
-        let mut next = B::prefill(m, ids, path)?;
+        let mut next = match (fed.is_empty(), last) {
+            (false, None) => B::prefill(m, fed, path)?,
+            (false, Some(l)) => {
+                B::prefill(m, fed, path)?;
+                m.step(&[l])?
+            }
+            (true, Some(l)) => m.step(&[l])?,
+            (true, None) => return Err("the prompt has no ids".into()),
+        };
         let prefill_wall = t.elapsed();
         let image = B::image(m, &plan)?;
         println!(

@@ -912,6 +912,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          directory named by the profile when unset.",
     ),
     path(
+        "BLOOMERY_CACHE",
+        None,
+        "The directory a server's `--hf <repo>[:<quant>]` fetches into, \
+         `<dir>/<owner>/<name>/<file>`; `~/.cache/bloomery/hf` when unset.",
+    ),
+    path(
         "BLOOMERY_DATA",
         Some("ref/ref-paths.sh"),
         "The data directory: reference sets, dumps, corpora and the reference binaries. \

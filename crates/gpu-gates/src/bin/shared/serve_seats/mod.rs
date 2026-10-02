@@ -3,12 +3,14 @@
 //! behind [`bloomery_gpu_gates::bind::Seat`], with a `run(&args)` a binary
 //! calls once. The per-model binaries (`bloomery-serve-ds41`,
 //! `bloomery-serve-qwen38`) include their one seat directly; the one-binary
-//! server (`bloomery-serve --model ds41|qwen38|glm`) includes this registry
-//! and is one call into the seat the model names.
+//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3`) includes this
+//! registry and is one call into the seat the model names.
 //!
 //! A seat's module is its contract's owner: read it for the flags, the
 //! records, the keep rule and the prompt cache. [`glm`] is the GLM-5.3-Flash
-//! seat, opened as `generate_glm5next` opens the model. `drafted` is the
+//! seat, opened as `generate_glm5next` opens the model; [`qwen3`] the
+//! single-card Qwen seat (qwen3moe, qwen35moe), opened as
+//! `generate_qwen3moe` opens them. `drafted` is the
 //! seats' shared MTP draft driver, one file a seat's per-model binary
 //! includes beside the seat.
 
@@ -23,3 +25,6 @@ pub mod glm;
 // as its per-model binary's doc says.
 #[cfg(feature = "deepseek41")]
 pub mod qwen38;
+// The qwen3 seat sits behind the same server-surface feature.
+#[cfg(feature = "deepseek41")]
+pub mod qwen3;

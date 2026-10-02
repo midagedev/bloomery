@@ -1,5 +1,6 @@
-//! The HTTP side of the binaries that drive `bloomery-serve-ds41`
-//! (`gate_ds41_serve`, `soak_ds41_serve`): the server started beside the
+//! The HTTP side of the binaries that drive a server (`gate_ds41_serve`,
+//! `soak_ds41_serve` on `bloomery-serve-ds41`, `gate_qwen3_serve` on
+//! `bloomery-serve`): the server started beside the
 //! calling binary and killed by its handle on every way out, its address read
 //! from its stderr, and one request through curl.
 
@@ -25,8 +26,13 @@ impl Served {
     /// killed when this process dies, so a runner's bound that ends this
     /// process does not leave the server holding a card.
     pub fn spawn(args: &[&str], dir: &Path) -> Result<Served, GateError> {
-        let exe = Self::exe()?;
-        let mut cmd = Command::new(&exe);
+        Self::spawn_cmd(Command::new(Self::exe()?), args, dir)
+    }
+
+    /// [`Served::spawn`] of `cmd`: another server binary, or one with the
+    /// environment the caller set on it.
+    pub fn spawn_cmd(mut cmd: Command, args: &[&str], dir: &Path) -> Result<Served, GateError> {
+        let exe = PathBuf::from(cmd.get_program());
         cmd.args(args)
             .stdin(Stdio::null())
             .stdout(File::create(dir.join("server.out"))?)
