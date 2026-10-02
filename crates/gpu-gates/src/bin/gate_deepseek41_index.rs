@@ -50,6 +50,30 @@
 //! - (vi) reruns bit-identical; one captured graph replayed over rewritten
 //!   counts (`n_vis` and `top_k`, selecting and identity), each replay
 //!   bit-identical to an eager run; no local depot in either entry.
+//! - (vii) the candidate mask against ik's (the `cand-deepseek41` set
+//!   `…_d1c_unfused_every_node`: position 301, top_k 64, 16 kept blocks of 8, ik's
+//!   separate V4.1 graph). ik's graph applies no Hadamard transform to the
+//!   indexer's query and keys, ours to both; the transform is orthonormal, so
+//!   the gate turns ik's keys into our basis (`fast_ht`, then f16) and holds
+//!   the scores to ik's exact rule within the transform's and the f16's
+//!   roundings ([`Basis`]) besides the kernel's and ik's own bands. Three
+//!   checks, each with its tie band counted and printed:
+//!   1. the rule against ik: `ds41_cand::kept_rule` over ik's
+//!      `cand_block_score-20` (the pool-max of its masked scores; the blocks
+//!      ik pads past the visible rows hold the pool's seed, `−f32::MAX`) gives ik's `cand_block_top_k-20`
+//!      as a set and `cand_keep-20`'s 0 / −inf pattern, outside equal keys at
+//!      the last kept place;
+//!   2. our kernels on ik's inputs: layer 20's score pass and
+//!      `CandKernels::enqueue_select` keep ik's blocks outside the band of the
+//!      last kept block's key, and exactly the rule's blocks of our own
+//!      scores;
+//!   3. the consumers (24, 28, 32, 36): score, compaction over our kept
+//!      blocks, the top-k over the counts view and the remap give the
+//!      rule's list exactly (`ds41_cand::check`), and ik's `lid_top_k`
+//!      outside the tie band of the k-th candidate row; ik's own mask hides
+//!      exactly the rows outside its kept blocks. Red when no consumer's list
+//!      differs from the unmasked top-k of its scores: such data could not
+//!      see a consumer that ignores the mask.
 //!
 //! Every output is poisoned before a launch (NaN query, weights and scores,
 //! `u32::MAX` list entries), so a slot written where it should not be, or
@@ -69,10 +93,17 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_cand.rs"]
+mod ds41_cand;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::collections::HashMap;
     use std::f32::consts::FRAC_1_SQRT_2;
 
+    use bloomery_gpu::cand::{
+        CandKernels, CandScratch, CandShape, CompactArgs, RemapArgs, SelectArgs,
+    };
     use bloomery_gpu::weights::{DevWeight, q8_0_planes, upload_file_tensor};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
     use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT, SelectedRows};
@@ -95,8 +126,11 @@ mod gate {
     use gguf::Split;
     use gguf::quant::{GgmlType, Q8Block, f32_to_f16_bits, half_to_f32};
     use model::arch::Arch;
-    use model::arch::deepseek41::hparams::Hparams;
+    use model::arch::deepseek41::hparams::{CandidateRole, Hparams};
     use model::arch::deepseek41::plan::{Planner, StepPlan};
+    use refset::arch::deepseek41::{CAND, D1C};
+
+    use super::ds41_cand;
 
     /// f32's unit roundoff, 2⁻²⁴.
     const U: f64 = f32::EPSILON as f64 / 2.0;
@@ -150,7 +184,13 @@ mod gate {
     /// The top-k override in a set's `# flags` — ik's `--override-kv
     /// <arch>.attention.indexer.top_k=int:<n>` — if there is one.
     fn top_k_override(flags: &str) -> Result<Option<usize>, GateError> {
-        let key = format!("{}.attention.indexer.top_k=int:", Arch::Deepseek41.name());
+        kv_override(flags, "attention.indexer.top_k")
+    }
+
+    /// The integer override of key `<arch>.<suffix>` in a set's `# flags`
+    /// (`--override-kv <arch>.<suffix>=int:<n>`), if there is one.
+    fn kv_override(flags: &str, suffix: &str) -> Result<Option<usize>, GateError> {
+        let key = format!("{}.{suffix}=int:", Arch::Deepseek41.name());
         let mut it = flags.split_whitespace();
         let mut found = None;
         while let Some(tok) = it.next() {
@@ -638,29 +678,31 @@ mod gate {
             Ok(())
         }
 
+        /// The launch's arguments: its own counts, table, keys and outputs.
+        fn args(&mut self) -> IndexerArgs<'_> {
+            IndexerArgs {
+                q: &self.q,
+                w: &self.w,
+                ints: &self.ints,
+                n_vis_at: N_VIS_AT,
+                top_k_at: N_VIS_AT + self.tokens,
+                tables: &self.tables,
+                rope_at: ROPE_AT,
+                rope_stride: self.n_dims,
+                keys: &self.keys,
+                tokens: self.tokens,
+                scratch: &mut self.scratch,
+                list: &mut self.list,
+                stride: self.stride,
+            }
+        }
+
         fn enqueue(
             &mut self,
             kernels: &IndexerKernels,
             stream: &CudaStream,
         ) -> Result<(), GpuError> {
-            kernels.enqueue(
-                stream,
-                IndexerArgs {
-                    q: &self.q,
-                    w: &self.w,
-                    ints: &self.ints,
-                    n_vis_at: N_VIS_AT,
-                    top_k_at: N_VIS_AT + self.tokens,
-                    tables: &self.tables,
-                    rope_at: ROPE_AT,
-                    rope_stride: self.n_dims,
-                    keys: &self.keys,
-                    tokens: self.tokens,
-                    scratch: &mut self.scratch,
-                    list: &mut self.list,
-                    stride: self.stride,
-                },
-            )
+            kernels.enqueue(stream, self.args())
         }
 
         fn read(&self, stream: &CudaStream) -> Result<Out, GateError> {
@@ -702,6 +744,7 @@ mod gate {
         gpu: Gpu,
         kernels: IndexerKernels,
         attn: AttnKernels,
+        cand: CandKernels,
         split: Split,
         hp: Hparams,
         yarn: RopeSpec,
@@ -788,6 +831,7 @@ mod gate {
         let gpu = Gpu::new()?;
         let kernels = IndexerKernels::load(gpu.context(), &hp)?;
         let attn = AttnKernels::load(gpu.context())?;
+        let cand = CandKernels::load(gpu.context())?;
         let emitting: Vec<usize> = (0..hp.layers.len())
             .filter(|&l| hp.layers[l].indexer)
             .collect();
@@ -807,6 +851,7 @@ mod gate {
             gpu,
             kernels,
             attn,
+            cand,
             split,
             hp,
             yarn,
@@ -831,10 +876,11 @@ mod gate {
         }
         ok &= clustered_case(&cx, 32_768, 13)?;
         ok &= replay(&cx)?;
+        ok &= cand_set(&mut cx)?;
         ok &= failed == 0;
         println!(
             "gate_deepseek41_index: {layers} layer cases, {failed} failed; identity, attention, depth \
-             and replay checks above — {}",
+             replay and candidate-mask checks above — {}",
             verdict(ok)
         );
         if ok { Ok(()) } else { Err(checks_failed()) }
@@ -1688,5 +1734,697 @@ mod gate {
             verdict(pass)
         );
         Ok(pass)
+    }
+
+    // ------------------------------------------------------- candidate mask
+
+    /// f16's unit roundoff, 2⁻¹¹, and its smallest subnormal step's half,
+    /// 2⁻²⁵: `|f16(y) − y| <= 2⁻¹¹·|y| + 2⁻²⁵`.
+    const F16_U: f64 = 1.0 / 2048.0;
+    const F16_SUB: f64 = 1.0 / 33_554_432.0;
+
+    /// One indexer layer's inputs from the candidate set: ik's projections
+    /// (`lid_q`, `lid_weights`) as our score pass takes them, ik's own roped
+    /// query and scaled weights, and its index keys of the visible rows.
+    struct CandInputs {
+        q_raw: Vec<f32>,
+        w_raw: Vec<f32>,
+        q_roped: Vec<f32>,
+        w_scaled: Vec<f32>,
+        keys: Vec<u16>,
+    }
+
+    fn cand_inputs(man: &RefManifest, l: usize, n_vis: usize) -> Result<CandInputs, GateError> {
+        let dir = &man.dir;
+        let (_, q_row) = node(man, &format!("lid_q-{l}"), "MUL_MAT")?;
+        let q_name = format!("blk.{l}.indexer.attn_q_b.weight");
+        if q_row.src0.as_deref() != Some(q_name.as_str()) {
+            return Err(format!("lid_q-{l} multiplies {:?}, want {q_name}", q_row.src0).into());
+        }
+        let (at_w, w_row) = node(man, &format!("lid_weights-{l}"), "MUL_MAT")?;
+        let scale_row = man.tensors[at_w..]
+            .iter()
+            .find(|r| r.op == "SCALE" && r.src0.as_deref() == Some(w_row.name.as_str()))
+            .ok_or_else(|| format!("no SCALE of lid_weights-{l}"))?;
+        let (_, roped_row) = node(man, &format!("indexer_q-{l}"), "ROPE")?;
+        let (_, k_row) = man.tensor_at(&format!("lid_k-{l}"), 0)?;
+        if k_row.ty != "f16" || k_row.ne[0] != HEAD_DIM as u64 {
+            return Err(format!(
+                "lid_k-{l} is {} with rows of {}, want f16 rows of {HEAD_DIM}",
+                k_row.ty, k_row.ne[0]
+            )
+            .into());
+        }
+        let keys = widened_f16_rows_in(dir, k_row)?;
+        if keys.len() < n_vis * HEAD_DIM {
+            return Err(format!(
+                "lid_k-{l} holds {} rows, the plan sees {n_vis}",
+                keys.len() / HEAD_DIM
+            )
+            .into());
+        }
+        let inputs = CandInputs {
+            q_raw: ref_tensor_logical_in(dir, q_row)?,
+            w_raw: ref_tensor_logical_in(dir, w_row)?,
+            q_roped: ref_tensor_logical_in(dir, roped_row)?,
+            w_scaled: ref_tensor_logical_in(dir, scale_row)?,
+            keys: keys[..n_vis * HEAD_DIM].to_vec(),
+        };
+        let nq = HEADS * HEAD_DIM;
+        if [inputs.q_raw.len(), inputs.q_roped.len()] != [nq; 2]
+            || [inputs.w_raw.len(), inputs.w_scaled.len()] != [HEADS; 2]
+        {
+            return Err(
+                format!("layer {l}: the query chain is not {HEADS} heads of {HEAD_DIM}").into(),
+            );
+        }
+        Ok(inputs)
+    }
+
+    /// The bound on one value of `fast_ht` over `x` against the exact
+    /// orthonormal transform: seven butterfly levels and the scale's rounding
+    /// (`γ(8)` of `HT_SCALE·Σ|x|`, one more rounding for the f64 reference the
+    /// gate compares with), and the f32 scale's distance to `2^-3.5`.
+    fn ht_bound(x: &[f32]) -> f64 {
+        let sum: f64 = x.iter().map(|&v| f64::from(v).abs()).sum();
+        let exact = (HEAD_DIM as f64).sqrt().recip();
+        let ds = (f64::from(HT_SCALE) - exact).abs();
+        gamma(9) * f64::from(HT_SCALE) * sum + ds * sum
+    }
+
+    /// The exact orthonormal transform of `x` in f64: `fast_ht`'s butterflies
+    /// with the scale `1/√n`.
+    fn ht_exact(x: &[f32]) -> Vec<f64> {
+        let mut v: Vec<f64> = x.iter().map(|&a| f64::from(a)).collect();
+        let n = v.len();
+        let mut h = 1;
+        while h < n {
+            for i in (0..n).step_by(2 * h) {
+                for j in i..i + h {
+                    let (a, b) = (v[j], v[j + h]);
+                    v[j] = a + b;
+                    v[j + h] = a - b;
+                }
+            }
+            h <<= 1;
+        }
+        let s = (n as f64).sqrt().recip();
+        v.iter().map(|a| a * s).collect()
+    }
+
+    /// ik's keys in our basis: per row `f16(fast_ht(k))`, the transform our
+    /// index-key kernel applies before its f16 store.
+    fn keys_in_our_basis(keys: &[u16]) -> Vec<u16> {
+        keys.chunks(HEAD_DIM)
+            .flat_map(|r| {
+                let mut v: Vec<f32> = r.iter().map(|&b| half_to_f32(b)).collect();
+                fast_ht(&mut v);
+                v.into_iter().map(f32_to_f16_bits).collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// What the basis change costs a row's score, and ik's exact rule.
+    struct Basis {
+        /// ik's exact score of the row: `Σ_h w_h · relu(Σ_d q_d·k_d)`, ik's
+        /// roped query and scaled weights and its f16 keys, summed in f64.
+        exact: Vec<f64>,
+        /// ik's distance to `exact` (`Rule::ik`'s form over ik's operands).
+        ik: Vec<f64>,
+        /// The distance of our f32 query and our-basis keys' exact score to
+        /// `exact`: per head `Σ_d bq_d·|k''_d| + (|q_d| + bq_d)·bk_d`, `bq` the
+        /// transform's bound on a query value, `bk` the transform's and the
+        /// f16 store's on a key value, carried by `|w_h|`.
+        basis: Vec<f64>,
+        /// Query and key values farther from the exact transform of ik's than
+        /// their bound: a basis the gate built wrong.
+        over: usize,
+    }
+
+    /// [`Basis`] of `n` rows: `q` our kernel's query (after its transform),
+    /// `keys` our-basis keys, `inp` ik's operands.
+    fn basis(q: &[f32], keys: &[u16], inp: &CandInputs, n: usize) -> Basis {
+        let mut over = 0usize;
+        let mut bq = vec![0.0f64; HEADS * HEAD_DIM];
+        for h in 0..HEADS {
+            let x = &inp.q_roped[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+            let (exact, b) = (ht_exact(x), ht_bound(x));
+            for (d, &e) in exact.iter().enumerate() {
+                let i = h * HEAD_DIM + d;
+                bq[i] = b;
+                over += usize::from(outside((f64::from(q[i]) - e).abs(), b));
+            }
+        }
+        let w: Vec<f64> = inp.w_scaled.iter().map(|&v| f64::from(v)).collect();
+        let mut out = Basis {
+            exact: Vec::with_capacity(n),
+            ik: Vec::with_capacity(n),
+            basis: Vec::with_capacity(n),
+            over: 0,
+        };
+        for t in 0..n {
+            let kr: Vec<f32> = inp.keys[t * HEAD_DIM..(t + 1) * HEAD_DIM]
+                .iter()
+                .map(|&b| half_to_f32(b))
+                .collect();
+            let (kx, kb) = (ht_exact(&kr), ht_bound(&kr));
+            let ko: Vec<f64> = keys[t * HEAD_DIM..(t + 1) * HEAD_DIM]
+                .iter()
+                .map(|&b| f64::from(half_to_f32(b)))
+                .collect();
+            let bk: Vec<f64> = kx
+                .iter()
+                .map(|&y| kb + F16_U * (y.abs() + kb) + F16_SUB)
+                .collect();
+            over += ko
+                .iter()
+                .zip(&kx)
+                .zip(&bk)
+                .filter(|&((&a, &e), &b)| outside((a - e).abs(), b))
+                .count();
+            let (mut ex, mut ikb, mut smag, mut bs) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            for (h, &wh) in w.iter().enumerate() {
+                let (mut dot, mut pq, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+                for d in 0..HEAD_DIM {
+                    let i = h * HEAD_DIM + d;
+                    let qr = f64::from(inp.q_roped[i]);
+                    let kv = f64::from(kr[d]);
+                    dot += qr * kv;
+                    pq += (qr * kv).abs();
+                    let qo = f64::from(q[i]).abs();
+                    bb += bq[i] * ko[d].abs() + (qo + bq[i]) * bk[d];
+                }
+                let relu = dot.max(0.0);
+                ex += wh * relu;
+                smag += wh.abs() * relu;
+                ikb += wh.abs() * gamma(HEAD_DIM) * pq;
+                bs += wh.abs() * bb;
+            }
+            out.exact.push(ex);
+            out.ik.push(ikb + gamma(HEADS) * smag + U * ex.abs());
+            out.basis.push(bs);
+        }
+        out.over = over;
+        out
+    }
+
+    /// A list `ids` of rows of `cand` (ascending rows) against the rule's
+    /// selection of `k` among them by `score`, outside the tie band
+    /// ([`ids_vs_rule`] over the candidate rows): (disagreeing rows, rows in
+    /// the band). An id outside `cand` disagrees.
+    fn ids_vs_rule_among(
+        ids: &[u32],
+        cand: &[usize],
+        score: &[f64],
+        beta: &[f64],
+        k: usize,
+    ) -> (usize, usize) {
+        let sub: Vec<f64> = cand.iter().map(|&r| score[r]).collect();
+        let sb: Vec<f64> = cand.iter().map(|&r| beta[r]).collect();
+        let mut foreign = 0usize;
+        let slots: Vec<u32> = ids
+            .iter()
+            .filter_map(|&i| match cand.binary_search(&(i as usize)) {
+                Ok(s) => u32::try_from(s).ok(),
+                Err(_) => {
+                    foreign += 1;
+                    None
+                }
+            })
+            .collect();
+        let (off, band) = ids_vs_rule(&slots, &sub, &sb, k);
+        (off + foreign, band)
+    }
+
+    /// The rows of blocks `kept` (of `block` rows) below `n`, ascending.
+    fn rows_of(kept: &[u32], block: usize, n: usize) -> Vec<usize> {
+        let mut r: Vec<usize> = kept
+            .iter()
+            .flat_map(|&b| {
+                let b = b as usize;
+                b * block..((b + 1) * block).min(n)
+            })
+            .collect();
+        r.sort_unstable();
+        r
+    }
+
+    /// A tensor row's integers as distinct ascending `u32`s, refused by name
+    /// unless there are `k` of them, distinct, below `n`.
+    fn int_set(man: &RefManifest, name: &str, k: usize, n: usize) -> Result<Vec<u32>, GateError> {
+        let v: Vec<u32> = ref_ints(man, name, 0, RowKind::Tensor, Layout::Flat)?
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<Result<_, _>>()?;
+        let mut s = v.clone();
+        s.sort_unstable();
+        s.dedup();
+        if v.len() != k || s.len() != k || s.iter().any(|&i| i as usize >= n) {
+            return Err(format!("{name}: {v:?} is not {k} distinct entries below {n}").into());
+        }
+        Ok(s)
+    }
+
+    fn symdiff(a: &[u32], b: &[u32]) -> usize {
+        a.iter().filter(|i| b.binary_search(i).is_err()).count()
+            + b.iter().filter(|i| a.binary_search(i).is_err()).count()
+    }
+
+    /// (vii) The candidate mask against ik's at `…_d1c_unfused_every_node`.
+    fn cand_set(cx: &mut Cx) -> Result<bool, GateError> {
+        let dir = CAND.path(D1C);
+        let man = RefManifest::open(&dir, &CAND)?;
+        let info = set_info(cx, &man)?;
+        let flags = man.header.flags.as_deref().unwrap_or("");
+        let blocks = kv_override(flags, "attention.candidate_topk_blocks")?.ok_or_else(|| {
+            format!(
+                "{}: no candidate_topk_blocks override in # flags",
+                dir.display()
+            )
+        })?;
+        // The separate graph's marks: its candidate nodes, and no indexer
+        // Hadamard (a dump without V41_SEPARATE has the latter, not the former).
+        if let Some(r) = man
+            .tensors
+            .iter()
+            .find(|r| r.name.starts_with("lid_q_hadamard-"))
+        {
+            return Err(format!(
+                "{}: holds {} — dumped without ik's separate graph (V41_SEPARATE)",
+                dir.display(),
+                r.name
+            )
+            .into());
+        }
+        let hp = cx
+            .hp
+            .clone()
+            .with_indexer_top_k(info.top_k)
+            .with_candidate_topk_blocks(blocks)?;
+        let mask = hp
+            .candidates
+            .ok_or("the model has no candidate mask to hold to ik's")?;
+        let (src, block, k) = (mask.source_layer, mask.block_size, info.top_k);
+        let consumers: Vec<usize> = (0..hp.layers.len())
+            .filter(|&l| hp.candidate_role(l) == Some(CandidateRole::Consumer))
+            .collect();
+        let (n, rows) = layer_rows(&info, src)?;
+        let nb = n.div_ceil(block);
+        println!(
+            "set cand: {} (build {}) — position {}, top_k {k}, {blocks} blocks of {block}, source layer \
+             {src} ({n} visible rows, {nb} blocks), consumers {}",
+            man.dir.display(),
+            man.build.as_deref().unwrap_or("-"),
+            info.pos,
+            list(&consumers)
+        );
+        if nb <= blocks || n <= k {
+            return Err(format!(
+                "cand: {n} rows in {nb} blocks select nothing at {blocks} blocks, top_k {k}"
+            )
+            .into());
+        }
+        let mut ok = true;
+
+        // 1. The rule against ik, on ik's own data.
+        let (_, s_row) = node(&man, &format!("lid_score_chunk-{src}"), "ADD")?;
+        let ik_scores = raw_f32(&man, s_row)?;
+        let (_, bs_row) = node(&man, &format!("cand_block_score-{src}"), "POOL_2D")?;
+        let bs = raw_f32(&man, bs_row)?;
+        let (_, pin_row) = node(&man, &format!("cand_block_score_pin-{src}"), "ADD")?;
+        let bs_pin = raw_f32(&man, pin_row)?;
+        let (_, keep_row) = man.tensor_at(&format!("cand_keep-{src}"), 0)?;
+        // A view of the whole keep tensor: its plain file is the tensor, −inf kept.
+        if keep_row.contig != Some(1) {
+            return Err(format!(
+                "cand_keep-{src} is not contiguous: its plain file is not the tensor"
+            )
+            .into());
+        }
+        let keep = raw_f32(&man, keep_row)?;
+        let nb_ik = bs.len();
+        if ik_scores.len() != nb_ik * block || nb_ik < nb || bs_pin.len() != nb_ik {
+            return Err(format!(
+                "cand: ik ranks {nb_ik} blocks of {block} over {} scores, the plan {nb} blocks",
+                ik_scores.len()
+            )
+            .into());
+        }
+        let ik_kept = int_set(&man, &format!("cand_block_top_k-{src}"), blocks, nb)?;
+        // ggml's POOL_MAX: seeded with −f32::MAX, a value taken only when it
+        // is larger, so a block of masked rows keeps the seed.
+        let pool_max = (0..nb_ik).all(|b| {
+            let m = ik_scores[b * block..(b + 1) * block]
+                .iter()
+                .fold(f32::MIN, |m, &v| if v > m { v } else { m });
+            m.to_bits() == bs[b].to_bits()
+        });
+        let masked = ik_scores[n..].iter().all(|&v| v == f32::NEG_INFINITY)
+            && ik_scores[..n].iter().all(|v| v.is_finite());
+        let padded = bs[nb..].iter().all(|&v| v == f32::MIN);
+        let pin_ok = (0..nb_ik).all(|b| {
+            if b == nb - 1 {
+                bs_pin[b] == f32::INFINITY
+            } else {
+                bs_pin[b].to_bits() == bs[b].to_bits()
+            }
+        });
+        let ik_rule = ds41_cand::kept_rule(&bs[..nb], nb, blocks, 1)
+            .ok_or("cand: the rule keeps every block")?;
+        // Equal keys at the last kept place of the others: ik's top-k breaks
+        // their tie in an order of its own.
+        let others: Vec<usize> = (0..nb - 1).collect();
+        let mut order = others.clone();
+        order.sort_by(|&a, &b| {
+            ds41_cand::key_of(bs[b])
+                .cmp(&ds41_cand::key_of(bs[a]))
+                .then(a.cmp(&b))
+        });
+        let last = ds41_cand::key_of(bs[order[blocks - 2]]);
+        let tied: Vec<u32> = if ik_rule.tie {
+            others
+                .iter()
+                .filter(|&&b| ds41_cand::key_of(bs[b]) == last)
+                .map(|&b| u32::try_from(b).unwrap_or(u32::MAX))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let rule_off = (0..nb)
+            .map(|b| u32::try_from(b).unwrap_or(u32::MAX))
+            .filter(|b| tied.binary_search(b).is_err())
+            .filter(|b| ik_kept.binary_search(b).is_ok() != ik_rule.kept.binary_search(b).is_ok())
+            .count();
+        let keep_ok = keep.len() == nb_ik
+            && keep.iter().enumerate().all(|(b, &v)| {
+                let kept = u32::try_from(b).is_ok_and(|b| ik_kept.binary_search(&b).is_ok());
+                if kept {
+                    v == 0.0
+                } else {
+                    v == f32::NEG_INFINITY
+                }
+            });
+        let pass1 = pool_max && masked && padded && pin_ok && rule_off == 0 && keep_ok;
+        ok &= pass1;
+        println!(
+            "cand 1 rule-vs-ik layer={src} blocks={nb}/{nb_ik} kept={blocks} ik_kept={} pool_max_of_scores={pool_max} \
+             rows_from_n_masked={masked} padded_blocks_pool_seed={padded} pin_on_newest={pin_ok} \
+             rule_vs_ik_off={rule_off} tie_band_blocks={} keep_pattern={keep_ok} {}",
+            list(&ik_kept),
+            tied.len(),
+            verdict(pass1)
+        );
+
+        // 2. Our kernels on ik's inputs of the source layer.
+        let stream = cx.gpu.stream();
+        cx.gpu.clear_fault()?;
+        let (cs, cs_ik) = cx.tables(info.pos)?;
+        let tables_same = bits_equal(&cs, &cs_ik);
+        let stride = k + LIST_SLACK;
+        let nv = [u32::try_from(n)?];
+        let shape = CandShape::new(blocks, block)?;
+        let launch_keys = |inp: &CandInputs| {
+            let mut keys = vec![NAN_F16; rows * HEAD_DIM];
+            keys[..n * HEAD_DIM].copy_from_slice(&keys_in_our_basis(&inp.keys));
+            keys
+        };
+        let si = cand_inputs(&man, src, n)?;
+        let src_keys = launch_keys(&si);
+        let mut sl = Launch::new(stream, &si.q_raw, &si.w_raw, &nv, k, &cs, &src_keys, stride)?;
+        sl.poison(stream)?;
+        sl.enqueue(&cx.kernels, stream)?;
+        let mut scratch = CandScratch::new(stream, shape, 1, rows)?;
+        let mut kept_dev = DeviceBuffer::from_host(stream, &vec![LIST_POISON; blocks])?;
+        cx.cand.enqueue_select(
+            stream,
+            SelectArgs {
+                ints: &sl.ints,
+                n_at: N_VIS_AT,
+                scores: &sl.scratch.scores,
+                score_k: k,
+                rows,
+                tokens: 1,
+                shape,
+                fault: cx.gpu.unlabelled_sink(),
+                scratch: &mut scratch,
+                kept: &mut kept_dev,
+                kstride: blocks,
+            },
+        )?;
+        let so = sl.read(stream)?;
+        let ours_kept = kept_dev.to_host_vec(stream)?;
+        let q_is_ik = bits_equal(&so.q[..HEADS * HEAD_DIM], &query(&si.q_roped, &[]))
+            && bits_equal(&so.w[..HEADS], &si.w_scaled);
+        let sr = rule(&so.q[..HEADS * HEAD_DIM], &so.w[..HEADS], &src_keys, n);
+        let sb = basis(&so.q[..HEADS * HEAD_DIM], &src_keys, &si, n);
+        let (mut ours_over, mut ik_over, mut dump_over) = (0usize, 0usize, 0usize);
+        let beta: Vec<f64> = (0..n)
+            .map(|t| sr.kernel[t] + sr.rep[t] + sb.basis[t] + sb.ik[t])
+            .collect();
+        for t in 0..n {
+            let (g, s) = (f64::from(so.scores[t]), f64::from(ik_scores[t]));
+            ours_over += usize::from(outside(
+                (g - sb.exact[t]).abs(),
+                sr.kernel[t] + sr.rep[t] + sb.basis[t],
+            ));
+            ik_over += usize::from(outside((s - sb.exact[t]).abs(), sb.ik[t]));
+            dump_over += usize::from(outside((g - s).abs(), beta[t]));
+        }
+        let past = so.scores[n..]
+            .iter()
+            .all(|v| v.to_bits() == POISON.to_bits());
+        let own_rule = ds41_cand::kept_rule(&so.scores[..n], n, blocks, block)
+            .is_some_and(|r| r.kept == ours_kept);
+        // The rule's kept blocks by ik's exact scores, each block's key its
+        // largest row and its band its rows' largest: the pin and the
+        // `blocks − 1` best others, outside the band of the last kept key.
+        let bkey: Vec<f64> = (0..nb)
+            .map(|b| {
+                (b * block..((b + 1) * block).min(n))
+                    .map(|t| sb.exact[t])
+                    .fold(f64::NEG_INFINITY, f64::max)
+            })
+            .collect();
+        let bbeta: Vec<f64> = (0..nb)
+            .map(|b| {
+                (b * block..((b + 1) * block).min(n))
+                    .map(|t| beta[t])
+                    .fold(0.0, f64::max)
+            })
+            .collect();
+        let pin = u32::try_from(nb - 1)?;
+        let others_of =
+            |kept: &[u32]| -> Vec<u32> { kept.iter().copied().filter(|&b| b != pin).collect() };
+        let (dev_off, block_band) = ids_vs_rule(
+            &others_of(&ours_kept),
+            &bkey[..nb - 1],
+            &bbeta[..nb - 1],
+            blocks - 1,
+        );
+        let (ik_off, _) = ids_vs_rule(
+            &others_of(&ik_kept),
+            &bkey[..nb - 1],
+            &bbeta[..nb - 1],
+            blocks - 1,
+        );
+        let ours_shape =
+            ours_kept.windows(2).all(|p| p[0] < p[1]) && ours_kept.last() == Some(&pin);
+        let kept_symdiff = symdiff(&ours_kept, &ik_kept);
+        let pass2 = q_is_ik
+            && tables_same
+            && sb.over == 0
+            && ours_over == 0
+            && ik_over == 0
+            && dump_over == 0
+            && past
+            && own_rule
+            && ours_shape
+            && dev_off == 0
+            && ik_off == 0
+            && so.hist_zero;
+        ok &= pass2;
+        println!(
+            "cand 2 kernels-on-ik layer={src} n_vis={n} rows={rows} kept={} q_w_are_ik={q_is_ik} \
+             table_is_ggml={tables_same} basis_over={} ours_vs_exact_over={ours_over}/{n} \
+             ik_vs_exact_over={ik_over}/{n} ours_vs_ik_over={dump_over}/{n} past_n_vis_untouched={past} \
+             kept_is_rule_of_ours={own_rule} kept_shape={ours_shape} ours_vs_rule_off={dev_off} \
+             ik_vs_rule_off={ik_off} tie_band_blocks={block_band} ours_vs_ik_symdiff={kept_symdiff} \
+             hist_zero={} {}",
+            list(&ours_kept),
+            sb.over,
+            so.hist_zero,
+            verdict(pass2)
+        );
+
+        // 3. The consumers, over our kept blocks.
+        let mut counts = DeviceBuffer::from_host(stream, &[LIST_POISON; 2])?;
+        let mut changed_total = 0usize;
+        for &l in &consumers {
+            let (nl, rl) = layer_rows(&info, l)?;
+            if (nl, rl) != (n, rows) {
+                return Err(format!(
+                    "cand: consumer {l} sees {nl} of {rl} rows, the source {n} of {rows}"
+                )
+                .into());
+            }
+            let ci = cand_inputs(&man, l, n)?;
+            let keys = launch_keys(&ci);
+            let mut cl = Launch::new(stream, &ci.q_raw, &ci.w_raw, &nv, k, &cs, &keys, stride)?;
+            cl.poison(stream)?;
+            cx.kernels.enqueue_score(stream, &mut cl.args())?;
+            stream.synchronize()?;
+            let unmasked = cl.scratch.scores.to_host_vec(stream)?;
+            cx.cand.enqueue_compact(
+                stream,
+                CompactArgs {
+                    ints: &cl.ints,
+                    n_at: N_VIS_AT,
+                    top_k_at: N_VIS_AT + 1,
+                    kept: &kept_dev,
+                    kstride: blocks,
+                    rows,
+                    tokens: 1,
+                    stride,
+                    shape,
+                    fault: cx.gpu.unlabelled_sink(),
+                    scores: &mut cl.scratch.scores,
+                    hist: &mut cl.scratch.hist,
+                    counts: &mut counts,
+                    counts_at: 0,
+                },
+            )?;
+            stream.synchronize()?;
+            let compacted = cl.scratch.scores.to_host_vec(stream)?;
+            cx.kernels
+                .enqueue_topk(stream, &mut cl.args(), &counts, 0, 1)?;
+            cx.cand.enqueue_remap(
+                stream,
+                RemapArgs {
+                    ints: &cl.ints,
+                    n_at: N_VIS_AT,
+                    kept: &kept_dev,
+                    kstride: blocks,
+                    counts: &counts,
+                    counts_at: 0,
+                    rows,
+                    tokens: 1,
+                    shape,
+                    fault: cx.gpu.unlabelled_sink(),
+                    list: &mut cl.list,
+                    stride,
+                },
+            )?;
+            let co = cl.read(stream)?;
+            let row = ds41_cand::check(&ds41_cand::Card {
+                n,
+                top_k: k,
+                blocks,
+                block,
+                source: &so.scores[..n],
+                kept: &ours_kept,
+                unmasked: &unmasked,
+                compacted: &compacted,
+                list: &co.list,
+            });
+            changed_total += row.changed;
+            let list_shape_ok = co.list[k..].iter().all(|&i| i == LIST_POISON);
+            // Against ik: its list among its own kept blocks' rows, ours among
+            // ours, each outside the tie band of the k-th candidate row.
+            let cr = rule(&co.q[..HEADS * HEAD_DIM], &co.w[..HEADS], &keys, n);
+            let cb = basis(&co.q[..HEADS * HEAD_DIM], &keys, &ci, n);
+            let cbeta: Vec<f64> = (0..n)
+                .map(|t| cr.kernel[t] + cr.rep[t] + cb.basis[t] + cb.ik[t])
+                .collect();
+            let ours_over = (0..n)
+                .filter(|&t| {
+                    outside(
+                        (f64::from(unmasked[t]) - cb.exact[t]).abs(),
+                        cr.kernel[t] + cr.rep[t] + cb.basis[t],
+                    )
+                })
+                .count();
+            let ik_ids = int_set(&man, &format!("lid_top_k-{l}"), k, n)?;
+            let ours_ids: Vec<u32> = co.list[..k].to_vec();
+            let (dev_off, band) = ids_vs_rule_among(
+                &ours_ids,
+                &rows_of(&ours_kept, block, n),
+                &cb.exact,
+                &cbeta,
+                k,
+            );
+            let (ik_off, _) =
+                ids_vs_rule_among(&ik_ids, &rows_of(&ik_kept, block, n), &cb.exact, &cbeta, k);
+            let q_is_ik = bits_equal(&co.q[..HEADS * HEAD_DIM], &query(&ci.q_roped, &[]))
+                && bits_equal(&co.w[..HEADS], &ci.w_scaled);
+            // ik's own mask: 0 on its kept blocks' visible rows, −inf elsewhere.
+            let (_, m_row) = node(&man, &format!("lid_mask_cand-{l}"), "ADD")?;
+            let ik_mask = raw_f32(&man, m_row)?;
+            let ik_rows = rows_of(&ik_kept, block, n);
+            let ik_mask_ok = ik_mask.len() >= n
+                && ik_mask.iter().enumerate().all(|(t, &v)| {
+                    if ik_rows.binary_search(&t).is_ok() {
+                        v == 0.0
+                    } else {
+                        v == f32::NEG_INFINITY
+                    }
+                });
+            // ik's scores of the layer (the unfused set's node): its exact rule
+            // within its band on its kept blocks' rows, −inf on every other row,
+            // and ours within both bands of them.
+            let (_, cs_row) = node(&man, &format!("lid_score_chunk-{l}"), "ADD")?;
+            let ik_sc = raw_f32(&man, cs_row)?;
+            let (mut ik_over, mut ours_vs_ik) = (0usize, 0usize);
+            let mut ik_hidden = ik_sc.len() >= n;
+            for (t, &v) in ik_sc.iter().enumerate() {
+                if t < n && ik_rows.binary_search(&t).is_ok() {
+                    let e = cb.exact[t];
+                    ik_over += usize::from(outside((f64::from(v) - e).abs(), cb.ik[t]));
+                    ours_vs_ik += usize::from(outside(
+                        (f64::from(unmasked[t]) - f64::from(v)).abs(),
+                        cbeta[t],
+                    ));
+                } else {
+                    ik_hidden &= v == f32::NEG_INFINITY;
+                }
+            }
+            let pass = row.pass()
+                && row.selects
+                && list_shape_ok
+                && q_is_ik
+                && ik_over == 0
+                && ours_vs_ik == 0
+                && ik_hidden
+                && cb.over == 0
+                && ours_over == 0
+                && dev_off == 0
+                && ik_off == 0
+                && ik_mask_ok
+                && co.hist_zero;
+            ok &= pass;
+            println!(
+                "cand 3 consumer layer={l} {} | q_w_are_ik={q_is_ik} basis_over={} \
+                 ours_vs_exact_over={ours_over}/{n} ours_vs_rule_off={dev_off} ik_vs_rule_off={ik_off} \
+                 ik_vs_exact_over={ik_over}/{} ours_vs_ik_over={ours_vs_ik} ik_hides_the_rest={ik_hidden} \
+                 tie_band_rows={band} ours_vs_ik_symdiff={} ik_mask_is_its_kept={ik_mask_ok} \
+                 list_rest_untouched={list_shape_ok} hist_zero={} {}",
+                row.line(),
+                cb.over,
+                ik_rows.len(),
+                symdiff(&ours_ids, &ik_ids),
+                co.hist_zero,
+                verdict(pass)
+            );
+        }
+        let witness = changed_total > 0;
+        let fault = cx.gpu.fault()?;
+        let clean = fault.is_none();
+        ok &= witness && clean;
+        println!(
+            "cand witness: entries the mask changed over {} consumers {changed_total} (a consumer that \
+             ignores the mask is visible only when > 0); fault word {fault:?} — {}",
+            consumers.len(),
+            verdict(witness && clean)
+        );
+        Ok(ok)
     }
 }

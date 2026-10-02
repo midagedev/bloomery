@@ -27,7 +27,11 @@
 #                   fix (PR #2507) on the local branch v41/idxkey-fix, a worktree of the V2-Lite
 #                   profile's tree; its V4.1 path has only run on the CPU (-ngl 0). The two profiles'
 #                   trees differ, so dump.sh refuses a dump_ref built against the other one ([foreign-lib])
-#   REF_CTX         the one context the reference files are produced at
+#   CAND_IK         the candidate oracle tree, /home/user/ik-cand: ik main at ed27bf7e (it has the separate V4.1
+#                   graph, which builds the candidate mask under V41_SEPARATE) with #2507's fix (49ef19d0)
+#                   cherry-picked, a worktree of /home/user/ik_llama.cpp; the `-sep` variants and d1c are
+#                   dumped from it with their own dump_ref (ref_step_variant below, tools/ref/build-ik-cand.sh)
+#   REF_CTX        the one context the reference files are produced at
 #   REF_SET_CPU     ref_deepseek41 (+ V41_SET_SUFFIX) under $BLOOMERY_DATA — flat, a sibling of ref,
 #                   ref_cuda and ref_cuda_v2, because every reader resolves a set as $BLOOMERY_DATA/<one
 #                   name> (dump.sh's staging and .old siblings, the gates' BLOOMERY_REF_SET)
@@ -197,6 +201,8 @@
 # shellcheck disable=SC2034
 MODEL_NAME=deepseek41
 : "${IK:=/home/user/ik-idxkey}"
+# The candidate oracle tree (the `-sep` variants and d1c, below; tools/ref/build-ik-cand.sh builds it).
+CAND_IK=/home/user/ik-cand
 V41_PUBLIC=/models/DeepSeek-V4.1-Flash-Q3_K_M/DeepSeek-V4.1-Flash-Q3_K_M-00001-of-00009.gguf
 V41_MODEL=${BLOOMERY_V41_MODEL:-$V41_PUBLIC}
 V41_DIR=${V41_MODEL%/*}
@@ -272,7 +278,11 @@ RESIDENCY_RESET_DROPPED_BYTES=0
 # so the indexer's scores and its TOP_K are nodes; `-every-node` runs the prefill under the dumped
 # schedule instead of the fused one (--prefill-every-node), so the caches the step reads carry a
 # dumped prefill's arithmetic — step4-every-node is the variant a batch set's last token can check.
-# Every set name then ends in V41_SET_SUFFIX.
+# A third suffix, `-sep`, dumps the variant from the candidate oracle tree instead: STEP_IK (CAND_IK,
+# ik ed27bf7e with #2507's fix cherry-picked, `just build-ref-ik-cand`), its own dump_ref under
+# STEP_BIN_DIR, and STEP_ENV (V41_SEPARATE=1, ik's separate V4.1 graph, the one that builds the candidate
+# mask; it carries no indexer Hadamard), adding _sep to the set name; dump.sh exports STEP_ENV and switches
+# IK and the binary to them. Every set name then ends in V41_SET_SUFFIX.
 #   step4  the oracle's five ids: a quiet prefill of 4, the step at position 4, -c 512
 #   d1     the indexer top-k overridden to 64, so the indexer, the row gather and mask_to_idx run at a
 #          short prefix: prefill 301, the step at 301 (a csa group completes there), -c 512
@@ -280,31 +290,43 @@ RESIDENCY_RESET_DROPPED_BYTES=0
 #          (top_k >= pad256(n_vis) for csa and hca) while the window mask already hides keys older than 128 —
 #          the step set of a chain that has no indexer yet
 #   d2     the model's own top-k: prefill 1,025, the step at 1,025, -c 2048
-# d1, d1n and d2 read the prose stream the router trace ran over (router/prose/MANIFEST.tsv names it):
+#   d1c    d1 with the candidate mask keeping 16 blocks (--override-kv
+#          deepseek41.attention.candidate_topk_blocks=int:16), always from the candidate tree (`-sep` is
+#          implied, the set name carries d1c instead of _sep): ik pads the ratio-1 stream's 302 rows to 512,
+#          64 blocks of 8 > 16, so layer 20 ranks blocks and layers 24-36 take their top-k among the kept
+#          blocks' rows (refset family cand-deepseek41)
+# d1, d1c, d1n and d2 read the prose stream the router trace ran over (router/prose/MANIFEST.tsv names it):
 # /root/bloomery-data/engram/corpus-prose-all.ids, 4,670,384 lines, sha256
-# f7785d0fc84a4a7e3673a220120be8c6735ab226084b2a506d16412ec64f71a0 — d1 and d1n its first 302 ids, d2 its
-# first 1,026.
+# f7785d0fc84a4a7e3673a220120be8c6735ab226084b2a506d16412ec64f71a0 — d1, d1c and d1n its first 302 ids, d2
+# its first 1,026.
 ref_step_variant() {
-  local name=$1 unfused=0 every_node=0
+  local name=$1 unfused=0 every_node=0 sep=0
   while :; do
     case $name in
       *-unfused)    unfused=1;    name=${name%-unfused} ;;
       *-every-node) every_node=1; name=${name%-every-node} ;;
+      *-sep)        sep=1;        name=${name%-sep} ;;
       *) break ;;
     esac
   done
   STEP_TOKENS='' STEP_TOKENS_FILE='' STEP_TOKENS_SHA256=''
   STEP_ARGS=()
+  STEP_IK='' STEP_BIN_DIR=''
+  STEP_ENV=()
   case $name in
     step4) STEP_SET=ref_deepseek41_step4; STEP_CTX=512;  STEP_PREFILL=4; STEP_TOKENS=$REF_TOKENS ;;
     d1)    STEP_SET=ref_deepseek41_d1;    STEP_CTX=512;  STEP_PREFILL=301
            STEP_ARGS=(--override-kv deepseek41.attention.indexer.top_k=int:64) ;;
     d1n)   STEP_SET=ref_deepseek41_d1n;   STEP_CTX=512;  STEP_PREFILL=301 ;;
     d2)    STEP_SET=ref_deepseek41_d2;    STEP_CTX=2048; STEP_PREFILL=1025 ;;
+    d1c)   [ "$sep" = 0 ] || return 1
+           STEP_SET=ref_deepseek41_d1c;   STEP_CTX=512;  STEP_PREFILL=301
+           STEP_ARGS=(--override-kv deepseek41.attention.indexer.top_k=int:64
+                      --override-kv deepseek41.attention.candidate_topk_blocks=int:16) ;;
     *)     return 1 ;;
   esac
   case $name in
-    d1|d1n|d2) STEP_TOKENS_FILE=$BLOOMERY_DATA/engram/corpus-prose-all.ids
+    d1|d1c|d1n|d2) STEP_TOKENS_FILE=$BLOOMERY_DATA/engram/corpus-prose-all.ids
                STEP_TOKENS_SHA256=f7785d0fc84a4a7e3673a220120be8c6735ab226084b2a506d16412ec64f71a0 ;;
   esac
   if [ "$unfused" = 1 ]; then
@@ -314,6 +336,12 @@ ref_step_variant() {
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node
     STEP_ARGS+=(--prefill-every-node)
+  fi
+  if [ "$sep" = 1 ]; then STEP_SET=${STEP_SET}_sep; fi
+  if [ "$sep" = 1 ] || [ "$name" = d1c ]; then
+    STEP_IK=$CAND_IK
+    STEP_BIN_DIR=$BLOOMERY_DATA/bin-cand
+    STEP_ENV=(V41_SEPARATE=1)
   fi
   STEP_SET=${STEP_SET}${V41_SET_SUFFIX}
 }

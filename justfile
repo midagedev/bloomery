@@ -574,6 +574,13 @@ dump-ref-qwen4exp *VARIANT:
 build-ref-dump-draft:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/build-dump-draft.sh'
 
+# The V4.1 candidate-mask oracle: ik ed27bf7e (its separate V4.1 graph, V41_SEPARATE) with #2507's fix cherry-picked, at
+# /home/user/ik-cand, and a dump_ref linked against it in $BLOOMERY_DATA/bin-cand; the ik build runs under the CPU lease
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/candref-build.card'). `just dump-ref-v41 d1c-unfused-every-node` and the
+# `-sep` variants dump from it (tools/ref/models/deepseek41.sh).
+build-ref-ik-cand:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/build-ik-cand.sh'
+
 # draft를 켠 greedy 디코드에서 draft 컨텍스트의 노드 전부를 $BLOOMERY_DATA/ref-draft/<세트>/에 쓴다(코드 코퍼스 64 + 32 위치,
 # 블록 폭 3). 3090 게이트 락 + CPU 임대; 세트는 staging 뒤 `# complete` 트레일러가 있을 때만 설치된다.
 dump-ref-draft:

@@ -1,0 +1,9 @@
+# Round candref (c): `just dump-ref-v41 d1c-unfused-every-node`: d1 with the candidate mask at 16 blocks
+# (--override-kv deepseek41.attention.candidate_topk_blocks=int:16) from /home/user/ik-cand under
+# V41_SEPARATE=1, into ref_deepseek41_d1c_unfused_every_node_plain (refset family cand-deepseek41). Nothing is timed.
+# Minutes [derived]: as candref-dump-d1sep.card, the same prefill and step.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and pages the V4.1 split set in, so it holds the lease; why
+  now: the engine's V4.1 candidate mask is held only to our own transcription of the reference rule, and
+  this set is ik's mask at a depth a dump reaches
+minutes: 5..20

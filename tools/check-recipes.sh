@@ -271,6 +271,7 @@ selftests=(
   "tools/ref/route-trace-chat.py --self-test"
   "tools/ref/router-coverage.py --self-test"
   "tools/ref/router-residency.py --self-test"
+  "tools/ref/set-diff.py --self-test"
   "tools/ref/window-union.py --self-test"
   "tools/verdict-diff.py --self-test"
 )

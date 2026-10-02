@@ -38,7 +38,10 @@
 #   dump.sh <variant>   one decode step after a quiet prefill (dump_ref.cpp, --decode-step), into the
 #                       set the profile's ref_step_variant names for it, with its context, ids and
 #                       flags (models/deepseek41.sh lists them). CPU only; BLOOMERY_REF_SET still
-#                       renames the destination, BLOOMERY_REF_TOKENS is refused.
+#                       renames the destination, BLOOMERY_REF_TOKENS is refused. A variant that names
+#                       its own tree (STEP_IK) is dumped from that tree by the dump_ref under its
+#                       STEP_BIN_DIR, with its STEP_ENV exported: the installed dump_ref is linked
+#                       against $IK and stays the other sets' binary.
 #
 # A decode-step set never takes the name of the profile's batch sets (REF_SET_CPU, REF_SET_CUDA),
 # and the swap never replaces a set of the other kind, told apart by the `# prefill` header line
@@ -61,6 +64,7 @@ case $BACKEND in
 esac
 VARIANT=${1:-}
 CTX=$REF_CTX
+BIN_DIR=$BLOOMERY_DATA/bin
 TOKENS_SHA256=
 STEP_ARGS=()
 if [ -z "$VARIANT" ]; then
@@ -76,6 +80,11 @@ else
   ref_step_variant "$VARIANT" || { echo "dump.sh: the $MODEL_NAME profile has no variant '$VARIANT'" >&2; exit 2; }
   SET=$STEP_SET
   CTX=$STEP_CTX
+  if [ -n "${STEP_IK:-}" ]; then
+    IK=$STEP_IK
+    BIN_DIR=$STEP_BIN_DIR
+    for kv in "${STEP_ENV[@]}"; do export "${kv?}"; done
+  fi
   if [ -n "$STEP_TOKENS_FILE" ]; then
     [ -f "$STEP_TOKENS_FILE" ] || { echo "dump.sh: no ids file at $STEP_TOKENS_FILE" >&2; exit 2; }
     TOKENS_SHA256=$(sha256sum "$STEP_TOKENS_FILE" | cut -d' ' -f1)
@@ -119,8 +128,8 @@ LEASE=${REF_DUMP_LEASE:-0}
 # five times the one V4.1 CPU dump on record, 356 s with the whole file set read cold (rig-log
 # 2026-09-23); BLOOMERY_DUMP_BOUND overrides it for a longer set.
 DUMP_BOUND=${BLOOMERY_DUMP_BOUND:-1800}
-BIN="$BLOOMERY_DATA/bin/dump_ref"
-[ -x "$BIN" ] || { echo "no dump_ref at $BIN — run: just build-ref-dump" >&2; exit 2; }
+BIN="$BIN_DIR/dump_ref"
+[ -x "$BIN" ] || { echo "no dump_ref at $BIN — run: IK=$IK DUMP_OUT=$BIN_DIR bash tools/ref/build-dump.sh" >&2; exit 2; }
 # One dump_ref serves every profile, and the manifest's `# build` names $IK: a binary linked against
 # another ik tree would write that tree's answer under this tree's name. It must load both libraries
 # from $IK's build.
@@ -131,7 +140,7 @@ for lib in libllama.so libggml.so; do
   case $(readlink -f "$got" 2>/dev/null) in
     "$IK_REAL"/build/*) LIBS+=("$(readlink -f "$got")") ;;
     *) echo "[foreign-lib] $BIN loads $lib from '${got:-nowhere}', not from $IK/build —" \
-         "rebuild it: IK=$IK bash tools/ref/build-dump.sh" >&2; exit 3 ;;
+         "rebuild it: IK=$IK DUMP_OUT=$BIN_DIR bash tools/ref/build-dump.sh" >&2; exit 3 ;;
   esac
 done
 # The binary must be this tree's dump_ref.cpp, and no older than the ik libraries it loads. The
@@ -157,7 +166,7 @@ done
 if [ ${#stale[@]} -gt 0 ]; then
   echo "[stale-binary] $BIN (sha256 $BIN_SHA, mtime $BIN_MTIME) is older than its sources:" >&2
   printf '    %s\n' "${stale[@]}" >&2
-  echo "    rebuild it with IK=$IK bash tools/ref/build-dump.sh (just build-ref-dump) and rerun; a set" \
+  echo "    rebuild it with IK=$IK DUMP_OUT=$BIN_DIR bash tools/ref/build-dump.sh and rerun; a set" \
     "dumped by this one would be a wrong answer, not a missing one." >&2
   exit 3
 fi

@@ -1,0 +1,10 @@
+# Round candref (a): the candidate-mask oracle tree, /home/user/ik-cand (ik ed27bf7e + 49ef19d0 as
+# 9d213966), built with --target llama common under the configure of /home/user/ik-idxkey, then dump_ref
+# linked against it into $BLOOMERY_DATA/bin-cand (tools/ref/build-ik-cand.sh). Nothing is timed.
+# Minutes [derived]: /home/user/ik-dspark-draft's full build wrote its 255 ggml objects within 186 s
+# (their mtimes), ccache present; a newer tree with more CUDA sources: 3-10 min, the link of dump_ref < 1.
+kind: exclusive
+reason: the ik build runs cmake --build -j 64 for minutes; beside a timed run or a gate batch it would
+  take their cores, so it holds the lease; why now: no ik tree on the box builds the V4.1 candidate mask
+  with the index-key fix, so the mask has no external oracle
+minutes: 3..12

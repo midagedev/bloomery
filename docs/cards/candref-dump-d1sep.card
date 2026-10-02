@@ -1,0 +1,11 @@
+# Round candref (b): the candidate tree's own consistency set, `just dump-ref-v41 d1-unfused-every-node-sep`
+# (or d1-every-node-sep): d1 (a quiet prefill of 301 prose ids run node by node, the step at 301, -c 512,
+# indexer top_k 64) from /home/user/ik-cand under V41_SEPARATE=1, into ref_deepseek41_d1_*_sep_plain, to
+# compare with the db517b69 d1 set. Nothing is timed.
+# Minutes [derived]: the V4.1 batch dump's 356 s cold (dump.sh's bound comment); a 301-position
+# every-node prefill adds per-node graph launches over 40 layers: 5-15 min warm, up to 20 cold.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and pages the V4.1 split set in; beside a timed run or a gate
+  batch it would take their cores and page cache, so it holds the lease; why now: the candidate tree must
+  reproduce the db517b69 d1 set before its d1c set can hold the engine's mask
+minutes: 5..20

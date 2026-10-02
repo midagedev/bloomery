@@ -1,6 +1,7 @@
 //! The DeepSeek-V4.1-Flash families. Every one is dumped from the V4.1 file
 //! the tree runs ([`gguf::v41::model`]); the node dumps, the draft set and the
-//! KLD bases by the sink-fixed ik tree, [`IK_BUILD`].
+//! KLD bases by the sink-fixed ik tree, [`IK_BUILD`], the candidate-mask sets
+//! by the tree with ik's separate V4.1 graph, [`CAND_BUILD`].
 
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
@@ -39,11 +40,12 @@ pub const D2_UNFUSED: &str = "ref_deepseek41_d2_unfused_every_node";
 pub const STEP_SETS: &[&str] = &[STEP4, D1N, D1, D1_UNFUSED, D2, D2_UNFUSED];
 
 /// The deepest context our numbers are held to ik's at: [`D2`]'s decode step
-/// at position 1,025, which reads 1,026 positions. ik builds no candidate
-/// mask, so past 16,384 positions no ik set can hold ours; there the mask is
-/// held to the reference's rule (`gate_deepseek41_chain_attn`'s candidate
-/// clause, `weekly-gpu-ds41-cand`). A load prints it beside the context it
-/// serves; it does not bound that context.
+/// at position 1,025, which reads 1,026 positions. Past 16,384 positions,
+/// where the file's mask of 2,048 blocks selects, no ik set holds ours; there
+/// the mask is held to the reference's rule (`gate_deepseek41_chain_attn`'s
+/// candidate clause, `weekly-gpu-ds41-cand`), and the mask itself to ik's
+/// at 16 blocks ([`CAND`]). A load prints it beside the context it serves; it
+/// does not bound that context.
 pub const VERIFIED_POSITIONS: u64 = 1026;
 
 /// ik's node dumps: the batch set and the decode-step sets. Each name
@@ -80,6 +82,39 @@ pub static IK: Family = Family {
         "gate-gpu-ds41-chain-glue",
         "gate-gpu-ds41-step",
     ],
+};
+
+/// The ik tree the candidate-mask sets are dumped from (`tools/ref/build-ik-cand.sh`):
+/// ik main at `ed27bf7e`, whose separate V4.1 graph (`V41_SEPARATE`) builds the
+/// candidate mask, with the index-key fix the node dumps' tree carries
+/// (`49ef19d0`) cherry-picked. Its graph is not [`IK_BUILD`]'s: besides the
+/// mask, it applies no Hadamard transform to the indexer's query and keys.
+/// The hash is `/home/user/ik-cand`'s HEAD, the cherry-pick's commit.
+pub const CAND_BUILD: &str = "9d213966";
+
+/// Step 301 under the dumped schedule, as [`D1_UNFUSED`] (ik's scores are
+/// nodes, so every tie band comes from its own scores), with the candidate mask
+/// keeping 16 blocks of 8 (`--override-kv
+/// deepseek41.attention.candidate_topk_blocks=int:16`): ik pads the ratio-1
+/// stream's 302 rows to 512, so layer 20 ranks 64 blocks and layers 24, 28,
+/// 32 and 36 take their top-k among the kept blocks' rows.
+pub const D1C: &str = "ref_deepseek41_d1c_unfused_every_node";
+
+/// ik's candidate-mask sets, from the file the tree runs, by [`CAND_BUILD`]
+/// under `V41_SEPARATE=1`. Its gate refuses a set of this family that holds
+/// no candidate node or still holds the indexer Hadamard, the marks of a dump
+/// without the separate graph.
+pub static CAND: Family = Family {
+    name: "cand-deepseek41",
+    sets: &[D1C],
+    resolve: Some(gguf::v41::set),
+    recipe: "just dump-ref-v41 d1c-unfused-every-node",
+    identity: Identity::Manifest,
+    arch: Some(ARCH),
+    build: Some(Build::Is(CAND_BUILD)),
+    runs: Some(gguf::v41::model),
+    draft_runs: None,
+    consumers: &["gate-gpu-ds41-index"],
 };
 
 /// The DSpark draft set: every node ik's draft computes while the target
@@ -161,4 +196,7 @@ pub static KLD: Family = Family {
 };
 
 /// The architecture's families, in the order `refset-check` lists them.
-pub static FAMILIES: &[&Family] = &[&IK, &DSREF, &GREEDY, &KLD];
+pub static FAMILIES: &[&Family] = &[&IK, &CAND, &DSREF, &GREEDY, &KLD];
+
+#[cfg(test)]
+mod tests;
