@@ -1,15 +1,19 @@
 //! Routes and JSON shapes. The field names, defaults and stream framing follow
 //! llama-server (ik_llama.cpp `examples/server`) so its clients work unchanged.
 //!
-//! One slot: the engine sits behind a mutex that a FIFO ticket gate hands out
-//! in arrival order, and a second generation waits for the first. `/health`,
-//! `/props`, `/slots`, `/metrics`, `/v1/models` and the tokenizer endpoints
-//! never take that mutex.
+//! N slots (`--parallel N`, [`SlotConfig`]): the engine runs on an engine
+//! thread of its own ([`crate::worker`]), and an HTTP thread hands it a
+//! request through the board ([`crate::sched`]), which gives the requests
+//! slots in arrival order, then waits for the request's events on a channel.
+//! A request that would wait past the queue's depth is a 503 with
+//! `Retry-After` at once. `/health`, `/props`, `/slots`, `/metrics`,
+//! `/v1/models` and the tokenizer endpoints never wait for the engine.
 //!
 //! No request takes the engine past [`Engine::ctx_max`], as llama-server's
 //! slots do not pass `n_ctx`: a prompt of `ctx_max` tokens or more is a 400
 //! before it reaches the engine, and generation stops at `ctx_max` with
-//! `truncated`, whatever `max_tokens` asked.
+//! `truncated`, whatever `max_tokens` asked. Every slot has the whole
+//! `ctx_max`; it is not split among them.
 //!
 //! At most [`MAX_CONNECTIONS`] connections are served at once, one thread each;
 //! a connection past them gets a 503 with `Retry-After` and is closed. A
@@ -18,29 +22,30 @@
 //! while the listener still stands is a named line on stderr and the loop goes
 //! on; a listener that no longer stands ends [`Server::run`].
 //!
-//! An engine error is fatal: the request that met it gets a 500 carrying the
+//! An engine error is fatal: the requests that met it get a 500 carrying the
 //! engine's message, every later generation and `/health` a 503 with the reason,
 //! and after [`ServerConfig::fatal_linger`] [`Server::run`] returns
 //! [`ServeError::Engine`] so the process exits instead of holding the port with a
 //! dead engine behind it.
 //!
-//! `POST /slots/0?action=save|restore|erase` answers as llama-server's handlers
-//! do, with one difference: an action on a slot that is running a request is a
-//! 503 at once where llama-server defers it until the slot is free. Save and
-//! restore take `{"filename": "<base name>"}` under
-//! [`ServerConfig::slot_save_path`]; the file is [`crate::slotfile`]'s.
+//! `POST /slots/{id}?action=save|restore|erase` answers as llama-server's
+//! handlers do, with one difference: an action on a slot that is running a
+//! request, or while a request waits for a slot, is a 503 at once where
+//! llama-server defers it until the slot is free. Save and restore take
+//! `{"filename": "<base name>"}` under [`ServerConfig::slot_save_path`]; the
+//! file is [`crate::slotfile`]'s.
 //!
 //! `POST /residency/reset` is bloomery's own: the engine's adaptive expert
 //! residency back to its load's placement ([`Engine::residency_reset`]), the
-//! one call that does it — a request never resets it.
+//! one call that does it — a request never resets it. It runs while every slot
+//! is free and no request waits.
 
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,8 +61,10 @@ use crate::glmxml::{ArgTypes, GlmXmlError};
 use crate::http::{self, EventStream, Request};
 use crate::reasoning::ReasoningFormat;
 use crate::sampling;
+use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
 use crate::template::{ChatTemplate, TemplateError};
+use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 
 /// What the server says about itself and how it samples.
 pub struct ServerConfig {
@@ -78,15 +85,15 @@ pub struct ServerConfig {
     pub slot_save_path: Option<PathBuf>,
 }
 
-/// Connections served at once, each on a thread of its own. The engine runs one
-/// request at a time, so past the one generating these hold requests waiting for
-/// the slot, streams, keep-alive clients and the cheap endpoints' pollers; a
-/// connection past them is refused, never queued. An idle connection keeps its
-/// place for [`KEEP_ALIVE_IDLE`] at most.
+/// Connections served at once, each on a thread of its own. Past the requests
+/// generating, these hold requests waiting for a slot, streams, keep-alive
+/// clients and the cheap endpoints' pollers; a connection past them is
+/// refused, never queued. An idle connection keeps its place for
+/// [`KEEP_ALIVE_IDLE`] at most.
 pub const MAX_CONNECTIONS: usize = 64;
 
-/// What a refused connection's 503 tells the client to wait, in seconds: a place
-/// frees when any request ends.
+/// What a refused connection's or request's 503 tells the client to wait, in
+/// seconds: a place frees when any request ends.
 const RETRY_AFTER_SECS: &str = "1";
 
 /// How long a connection may send nothing of its next request (its first one
@@ -154,10 +161,13 @@ pub enum ServeError {
     /// The engine's vocabulary names no id that ends a generation.
     #[error("the engine's vocabulary names no stop id")]
     NoStops,
+    /// A slot count or queue depth the server or the engine cannot serve.
+    #[error("{0}")]
+    Slots(String),
 }
 
 /// Why the accept loop ended.
-enum End {
+pub(crate) enum End {
     Io(io::Error),
     Engine(EngineFailure),
 }
@@ -167,19 +177,73 @@ pub struct Server {
     listener: TcpListener,
     state: Arc<State>,
     ended: mpsc::Receiver<End>,
+    /// The engine and its slots, until [`Server::run`] starts their thread.
+    slot: Slot,
+}
+
+/// The slot count `slots` asks of `engine`, or why it cannot be served.
+fn check_slots(engine: &dyn Engine, slots: &SlotConfig) -> Result<usize, ServeError> {
+    let n = slots.parallel;
+    let refuse = |why: String| Err(ServeError::Slots(why));
+    if n == 0 {
+        return refuse("--parallel 0: the server needs one slot".to_owned());
+    }
+    if n > MAX_CONNECTIONS {
+        return refuse(format!(
+            "--parallel {n}: past the {MAX_CONNECTIONS} connections the server serves at once, \
+             each running request holds one"
+        ));
+    }
+    let declared = engine.slots();
+    if n > declared {
+        return refuse(format!(
+            "--parallel {n}: this engine serves {declared} slot(s) at once"
+        ));
+    }
+    let rows = engine.advance_rows();
+    if n > 1 && rows > 1 {
+        return refuse(format!(
+            "--parallel {n}: this engine drafts ({rows} rows a pass), and a step of several \
+             slots does not draft"
+        ));
+    }
+    let most = default_depth(MAX_CONNECTIONS, n);
+    let depth = slots.queue_depth.unwrap_or(most);
+    if depth > most {
+        return refuse(format!(
+            "--queue-depth {depth}: past the {most} requests that can wait at once beside {n} \
+             running under the {MAX_CONNECTIONS}-connection limit"
+        ));
+    }
+    Ok(depth)
 }
 
 impl Server {
-    /// Binds `addr` and takes ownership of the engine.
+    /// Binds `addr` and takes ownership of the engine: one slot, the queue at
+    /// its default depth.
     pub fn bind(
         addr: impl ToSocketAddrs,
         engine: Box<dyn Engine>,
         config: ServerConfig,
     ) -> Result<Self, ServeError> {
+        Server::bind_with(addr, engine, config, SlotConfig::default())
+    }
+
+    /// Binds `addr` and takes ownership of the engine, serving the slots
+    /// `slots` asks for. A slot count the engine does not declare
+    /// ([`Engine::slots`]), several slots on an engine that drafts, and a
+    /// depth no queue can reach are refused by name ([`ServeError::Slots`]).
+    pub fn bind_with(
+        addr: impl ToSocketAddrs,
+        engine: Box<dyn Engine>,
+        config: ServerConfig,
+        slots: SlotConfig,
+    ) -> Result<Self, ServeError> {
         let template = ChatTemplate::parse(&config.chat_template)?;
         if let Some(dir) = config.slot_save_path.as_ref().filter(|d| !d.is_dir()) {
             return Err(ServeError::SlotSavePath(dir.clone()));
         }
+        let depth = check_slots(&*engine, &slots)?;
         let listener = TcpListener::bind(addr)?;
         let tok = engine.tokenizer();
         if tok.stops().is_empty() {
@@ -193,12 +257,16 @@ impl Server {
             eos_text: tok.decode(&[tok.eos()]),
         };
         let (end_tx, ended) = mpsc::channel();
+        let parallel = slots.parallel;
+        let shared = Shared::new(
+            Board::new(parallel, depth, slots.picker),
+            end_tx,
+            config.sampler.unwrap_or_else(sampling::reference_factory),
+        );
         let state = State {
-            slot_engine: Mutex::new(Slot::new(engine)),
-            queue: SlotQueue::default(),
+            shared: Arc::new(shared),
+            parallel,
             tok,
-            fatal: Mutex::new(None),
-            end: end_tx,
             fatal_linger: config.fatal_linger,
             tool_format: ToolFormat::of_template(template.source()),
             template,
@@ -206,19 +274,14 @@ impl Server {
             model_path: config.model_path,
             engine_props,
             slot_save_path: config.slot_save_path,
-            sampler: config.sampler.unwrap_or_else(sampling::reference_factory),
             info,
-            busy: AtomicBool::new(false),
-            waiting: AtomicUsize::new(0),
-            stats: Mutex::new(Stats::default()),
-            slot: Mutex::new(SlotView::default()),
             start_unix: unix_now(),
-            ids: AtomicU64::new(0),
         };
         Ok(Server {
             listener,
             state: Arc::new(state),
             ended,
+            slot: Slot::with_slots(engine, parallel),
         })
     }
 
@@ -227,14 +290,23 @@ impl Server {
         self.listener.local_addr()
     }
 
-    /// Accepts connections, one thread each and at most [`MAX_CONNECTIONS`] at
-    /// once, until the listener fails or the engine does, and returns why.
-    pub fn run(self) -> ServeError {
+    /// Starts the engine thread and the accept loop, which serves connections,
+    /// one thread each and at most [`MAX_CONNECTIONS`] at once, until the
+    /// listener fails; returns the server's state and what ends it.
+    fn start(self) -> io::Result<(Arc<State>, mpsc::Receiver<End>)> {
         let Server {
             listener,
             state,
             ended,
+            slot,
         } = self;
+        let shared = Arc::clone(&state.shared);
+        thread::Builder::new()
+            .name("serve-engine".to_owned())
+            .spawn(move || worker::serve(slot, shared))
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("cannot start the engine thread: {e}"))
+            })?;
         let accept_state = Arc::clone(&state);
         let port = listener.local_addr().map_or(0, |a| a.port());
         let live = Arc::new(AtomicUsize::new(0));
@@ -256,7 +328,7 @@ impl Server {
                                      (it stands: {stands})"
                                 ),
                             );
-                            let _ = accept_state.end.send(End::Io(gone));
+                            let _ = accept_state.shared.end.send(End::Io(gone));
                             return;
                         };
                         eprintln!(
@@ -269,6 +341,15 @@ impl Server {
                 }
             }
         });
+        Ok((state, ended))
+    }
+
+    /// Serves until the listener fails or the engine does, and returns why.
+    pub fn run(self) -> ServeError {
+        let (state, ended) = match self.start() {
+            Ok(s) => s,
+            Err(e) => return ServeError::Io(e),
+        };
         match ended.recv() {
             Ok(End::Io(e)) => ServeError::Io(e),
             Ok(End::Engine(f)) => {
@@ -280,10 +361,12 @@ impl Server {
         }
     }
 
-    /// Runs the accept loop on a background thread and returns the address.
+    /// Serves in the background and returns the address. What ends the
+    /// server is not waited for: after an engine failure it answers 503 for
+    /// as long as the process lives.
     pub fn spawn(self) -> io::Result<SocketAddr> {
         let addr = self.local_addr()?;
-        thread::spawn(move || self.run());
+        self.start()?;
         Ok(addr)
     }
 }
@@ -295,51 +378,14 @@ struct ModelInfo {
     eos_text: String,
 }
 
-#[derive(Default)]
-struct Stats {
-    /// Prompt tokens evaluated: the prompt less what the cache kept.
-    n_prompt_total: u64,
-    /// Prompt tokens the cache kept instead (every request's `cache_n`).
-    n_prompt_cached_total: u64,
-    t_prompt_ms_total: f64,
-    n_predicted_total: u64,
-    t_predicted_ms_total: f64,
-    n_decode_total: u64,
-    n_busy_slots_total: u64,
-    /// The longest a request's sequence grew (prompt and generation, `n_past`).
-    n_tokens_max: u64,
-    /// The ids the draft proposed, the ones kept, and the passes that verified
-    /// a proposal.
-    n_draft_total: u64,
-    n_draft_accepted_total: u64,
-    n_draft_passes_total: u64,
-}
-
-#[derive(Default)]
-struct SlotView {
-    id_task: u64,
-    prompt: Value,
-    settings: Value,
-    /// The running request's `n_predict` (`-1` unbounded).
-    n_predict: i64,
-    n_past: usize,
-    n_decoded: usize,
-    stopped_eos: bool,
-    stopped_word: bool,
-    stopped_limit: bool,
-    stopping_word: String,
-}
-
 struct State {
-    /// The engine and the ids its cache holds, under one lock.
-    slot_engine: Mutex<Slot>,
-    /// The ticket gate that hands `slot_engine` out in arrival order.
-    queue: SlotQueue,
-    /// The engine's vocabulary, read without the engine lock.
+    /// The board, the counters and the engine's failure, which the engine
+    /// thread shares.
+    shared: Arc<Shared>,
+    /// Slots.
+    parallel: usize,
+    /// The engine's vocabulary, read without the engine.
     tok: Arc<dyn Tokenizer>,
-    /// Set by the request that met an engine error; the reason `/health` gives.
-    fatal: Mutex<Option<String>>,
-    end: mpsc::Sender<End>,
     fatal_linger: Duration,
     template: ChatTemplate,
     /// The tool-call markup the template teaches, read from its source once.
@@ -350,34 +396,24 @@ struct State {
     engine_props: Value,
     /// Where slot files live; `None` refuses slot actions.
     slot_save_path: Option<PathBuf>,
-    sampler: SamplerFactory,
     info: ModelInfo,
-    busy: AtomicBool,
-    waiting: AtomicUsize,
-    stats: Mutex<Stats>,
-    slot: Mutex<SlotView>,
     start_unix: u64,
-    ids: AtomicU64,
 }
 
-fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn relock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The one slot's FIFO gate: tickets drawn in arrival order, the turn passed
-/// to the next ticket when the slot's holder releases it.
+/// The arrival tickets of the board ([`crate::sched::Board`]): drawn in
+/// arrival order, the turn passed on as each takes its slot.
 ///
-/// `serving` is the ticket whose turn it is, `next` the next ticket to hand
-/// out. The engine mutex is locked only by the holder of the serving ticket,
-/// and a holder releases it before passing the turn, so the woken ticket
-/// finds it uncontended. `serving == next` is the idle state: every ticket
-/// handed out has been served, nothing is queued, and the engine mutex is
-/// free. A poisoned lock is recovered as everywhere here: a panic in one run
-/// must not wedge the queue.
+/// `serving` is the oldest ticket whose turn has not come, `next` the next
+/// ticket to hand out. `serving == next` is the idle state: every ticket
+/// handed out has been served and nothing is queued. A poisoned lock is
+/// recovered as everywhere here: a panic in one run must not wedge the queue.
 #[derive(Default)]
-struct SlotQueue {
+pub(crate) struct SlotQueue {
     state: Mutex<QueueState>,
-    turn: Condvar,
 }
 
 #[derive(Default)]
@@ -391,34 +427,27 @@ struct QueueState {
 
 impl SlotQueue {
     /// Draws the next ticket.
-    fn draw(&self) -> u64 {
+    pub(crate) fn draw(&self) -> u64 {
         let mut q = relock(&self.state);
         let ticket = q.next;
         q.next = ticket + 1;
         ticket
     }
 
-    /// Waits until `ticket`'s turn comes.
-    fn wait_for(&self, ticket: u64) {
-        let mut q = relock(&self.state);
-        while q.serving != ticket {
-            q = self.turn.wait(q).unwrap_or_else(|e| e.into_inner());
-        }
+    /// The ticket whose turn it is.
+    pub(crate) fn serving(&self) -> u64 {
+        relock(&self.state).serving
     }
 
-    /// Passes the turn to the ticket after `ticket`; the caller has already
-    /// released the engine mutex. Every waiter rechecks its own ticket, so
-    /// all are woken, not one picked for it.
-    fn pass(&self, ticket: u64) {
-        let mut q = relock(&self.state);
-        q.serving = ticket + 1;
-        self.turn.notify_all();
+    /// Passes the turn to the ticket after `ticket`.
+    pub(crate) fn pass(&self, ticket: u64) {
+        relock(&self.state).serving = ticket + 1;
     }
 
-    /// Draws a ticket only when the queue is idle (`serving == next`: the
-    /// slot is free and no ticket waits), so a caller that never waits cannot
-    /// jump ahead of queued requests; `None` is that refusal.
-    fn try_draw(&self) -> Option<u64> {
+    /// Draws a ticket only when the queue is idle (`serving == next`: no
+    /// ticket waits), so a caller that never waits cannot jump ahead of
+    /// queued requests; `None` is that refusal.
+    pub(crate) fn try_draw(&self) -> Option<u64> {
         let mut q = relock(&self.state);
         (q.serving == q.next).then(|| {
             let ticket = q.next;
@@ -428,81 +457,9 @@ impl SlotQueue {
     }
 }
 
-/// The slot for one run: the engine mutex plus the turn it holds. The fields
-/// drop in declaration order, so the engine mutex releases before the turn
-/// passes and the next ticket wakes to a free slot — on a normal return and
-/// on an unwinding panic alike, which drops this guard all the same.
-struct SlotGuard<'a> {
-    slot: MutexGuard<'a, Slot>,
-    #[allow(
-        dead_code,
-        reason = "the drop is the use: it passes the turn once the slot releases"
-    )]
-    turn: TurnGuard<'a>,
-}
-
-/// The turn of one ticket, given back when the holder is done.
-struct TurnGuard<'a> {
-    queue: &'a SlotQueue,
-    ticket: u64,
-}
-
-impl Drop for TurnGuard<'_> {
-    fn drop(&mut self) {
-        self.queue.pass(self.ticket);
-    }
-}
-
-impl Deref for SlotGuard<'_> {
-    type Target = Slot;
-
-    fn deref(&self) -> &Slot {
-        &self.slot
-    }
-}
-
-impl DerefMut for SlotGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Slot {
-        &mut self.slot
-    }
-}
-
 impl State {
-    /// Waits for the one slot, in arrival order: of the requests waiting, the
-    /// one that drew the earlier ticket gets the slot first (counted in
-    /// `requests_deferred` from its ticket to its slot).
-    fn engine(&self) -> SlotGuard<'_> {
-        let ticket = self.queue.draw();
-        self.waiting.fetch_add(1, Ordering::SeqCst);
-        self.queue.wait_for(ticket);
-        let slot = relock(&self.slot_engine);
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
-        SlotGuard {
-            slot,
-            turn: TurnGuard {
-                queue: &self.queue,
-                ticket,
-            },
-        }
-    }
-
-    /// Takes the slot without waiting, out of the queue's order only when the
-    /// queue is idle; `None` while a request runs on the slot or one waits
-    /// behind it. The ticket is the serving one already, so the engine mutex
-    /// is uncontended.
-    fn engine_try(&self) -> Option<SlotGuard<'_>> {
-        let ticket = self.queue.try_draw()?;
-        Some(SlotGuard {
-            slot: relock(&self.slot_engine),
-            turn: TurnGuard {
-                queue: &self.queue,
-                ticket,
-            },
-        })
-    }
-
     fn next_id(&self) -> u64 {
-        self.ids.fetch_add(1, Ordering::SeqCst)
+        self.shared.next_id()
     }
 
     /// A 32-hex-digit id, unique per process.
@@ -516,6 +473,10 @@ impl State {
             mix(t ^ n),
             mix(n.wrapping_add(0x5bd1_e995))
         )
+    }
+
+    fn fatal(&self) -> Option<String> {
+        relock(&self.shared.fatal).clone()
     }
 }
 
@@ -702,10 +663,13 @@ struct ApiError {
     code: u16,
     kind: &'static str,
     message: String,
+    /// Sent with `Retry-After`: the request may succeed later as it is.
+    retry_after: bool,
 }
 
 fn invalid(message: impl Into<String>) -> ApiError {
     ApiError {
+        retry_after: false,
         code: 400,
         kind: "invalid_request_error",
         message: message.into(),
@@ -722,7 +686,11 @@ fn send_json(w: &mut TcpStream, req: &Request, status: u16, v: &Value) -> io::Re
 }
 
 fn send_error(w: &mut TcpStream, req: &Request, e: &ApiError) -> io::Result<bool> {
-    send_json(w, req, e.code, &error_body(e.code, e.kind, &e.message))
+    let body = error_body(e.code, e.kind, &e.message).to_string();
+    let retry = [("Retry-After", RETRY_AFTER_SECS.to_owned())];
+    let headers: &[(&str, String)] = if e.retry_after { &retry } else { &[] };
+    http::respond(w, req, e.code, JSON, headers, body.as_bytes())?;
+    Ok(true)
 }
 
 /// Dispatches one request; `Ok(true)` when the connection may carry another.
@@ -760,6 +728,7 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             return Ok(true);
         }
         _ => Err(ApiError {
+            retry_after: false,
             code: 404,
             kind: "not_found_error",
             message: "File Not Found".to_owned(),
@@ -954,19 +923,19 @@ fn default_params() -> GenParams {
 // ---------------------------------------------------------------- read-only endpoints
 
 fn health(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    if let Some(reason) = relock(&state.fatal).clone() {
+    if let Some(reason) = state.fatal() {
         let mut v = error_body(503, "unavailable_error", &reason);
         v["status"] = json!("error");
         v["reason"] = json!(reason);
         return send_json(w, req, 503, &v);
     }
-    let busy = state.busy.load(Ordering::SeqCst);
+    let idle = relock(&state.shared.board).free();
     let v = json!({
-        "status": if busy { "no slot available" } else { "ok" },
-        "slots_idle": i32::from(!busy),
-        "slots_processing": i32::from(busy),
+        "status": if idle == 0 { "no slot available" } else { "ok" },
+        "slots_idle": idle,
+        "slots_processing": state.parallel - idle,
     });
-    let status = if busy && req.has_query("fail_on_no_slot") {
+    let status = if idle == 0 && req.has_query("fail_on_no_slot") {
         503
     } else {
         200
@@ -995,7 +964,7 @@ fn props(state: &State) -> Value {
         "model_path": state.model_path,
         "model_name": state.alias,
         "default_generation_settings": generation_settings(state, &default_params()),
-        "total_slots": 1,
+        "total_slots": state.parallel,
         "chat_template": state.template.source(),
         "chat_template_caps": {},
         "bos_token": state.info.bos_text,
@@ -1105,54 +1074,66 @@ fn draft_object(d: &DraftProps) -> Value {
 }
 
 fn slots(state: &State) -> Value {
-    let busy = state.busy.load(Ordering::SeqCst);
-    let s = relock(&state.slot);
-    // llama-server's count of tokens left: only a bounded request that is running has one.
-    let n_remain = if busy && s.n_predict >= 0 {
-        let done = i64::try_from(s.n_decoded).unwrap_or(i64::MAX);
-        s.n_predict.saturating_sub(done).max(0)
-    } else {
-        -1
-    };
-    let mut v = match &s.settings {
-        Value::Object(_) => s.settings.clone(),
-        _ => generation_settings(state, &default_params()),
-    };
-    if let Value::Object(m) = &mut v {
-        m.insert("id".into(), json!(0));
-        m.insert("id_task".into(), json!(s.id_task));
-        m.insert("task_id".into(), json!(s.id_task));
-        m.insert("state".into(), json!(i32::from(busy)));
-        m.insert("is_processing".into(), json!(busy));
-        m.insert("n_past".into(), json!(s.n_past));
-        m.insert("prompt".into(), s.prompt.clone());
-        m.insert(
-            "next_token".into(),
-            json!({
-                "has_next_token": busy,
-                "n_remain": n_remain,
-                "n_decoded": s.n_decoded,
-                "stopped_eos": s.stopped_eos,
-                "stopped_word": s.stopped_word,
-                "stopped_limit": s.stopped_limit,
-                "stopping_word": s.stopping_word,
-            }),
-        );
-    }
-    Value::Array(vec![v])
+    let b = relock(&state.shared.board);
+    let list = b
+        .slots()
+        .iter()
+        .enumerate()
+        .map(|(id, slot)| {
+            let busy = slot.state != Use::Free;
+            let s = &slot.view;
+            // llama-server's count of tokens left: only a bounded request that is running has one.
+            let n_remain = if busy && s.n_predict >= 0 {
+                let done = i64::try_from(s.n_decoded).unwrap_or(i64::MAX);
+                s.n_predict.saturating_sub(done).max(0)
+            } else {
+                -1
+            };
+            let mut v = match &s.settings {
+                Value::Object(_) => s.settings.clone(),
+                _ => generation_settings(state, &default_params()),
+            };
+            if let Value::Object(m) = &mut v {
+                m.insert("id".into(), json!(id));
+                m.insert("id_task".into(), json!(s.id_task));
+                m.insert("task_id".into(), json!(s.id_task));
+                m.insert("state".into(), json!(i32::from(busy)));
+                m.insert("is_processing".into(), json!(busy));
+                m.insert("n_past".into(), json!(s.n_past));
+                m.insert("prompt".into(), s.prompt.clone());
+                m.insert(
+                    "next_token".into(),
+                    json!({
+                        "has_next_token": busy,
+                        "n_remain": n_remain,
+                        "n_decoded": s.n_decoded,
+                        "stopped_eos": s.stopped_eos,
+                        "stopped_word": s.stopped_word,
+                        "stopped_limit": s.stopped_limit,
+                        "stopping_word": s.stopping_word,
+                    }),
+                );
+            }
+            v
+        })
+        .collect();
+    Value::Array(list)
 }
 
 fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let busy = state.busy.load(Ordering::SeqCst);
-    let deferred = state.waiting.load(Ordering::SeqCst);
-    let n_past = relock(&state.slot).n_past;
-    let kv_ratio = if state.info.ctx_max > 0 {
-        n_past as f64 / state.info.ctx_max as f64
+    let (busy, deferred, n_past) = {
+        let b = relock(&state.shared.board);
+        let n_past: usize = b.slots().iter().map(|s| s.view.n_past).sum();
+        (state.parallel - b.free(), b.waiting(), n_past)
+    };
+    let room = state.info.ctx_max * state.parallel;
+    let kv_ratio = if room > 0 {
+        n_past as f64 / room as f64
     } else {
         0.0
     };
     let text = {
-        let s = relock(&state.stats);
+        let s = relock(&state.shared.stats);
         // Throughput since start: the ratio of the matching `*_total` counters, so a
         // scrape never changes it and any other window is `rate()` on those counters.
         let rate = |n: u64, ms: f64| {
@@ -1262,7 +1243,7 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "gauge",
                 "requests_processing",
                 "Number of request processing.",
-                u8::from(busy).to_string(),
+                busy.to_string(),
             ),
             (
                 "gauge",
@@ -1386,6 +1367,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError
         vars.extend(kw.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
     state.template.render(&vars).map_err(|e| ApiError {
+        retry_after: false,
         code: 500,
         kind: "server_error",
         message: e.to_string(),
@@ -1394,157 +1376,108 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError
 
 // ---------------------------------------------------------------- generation endpoints
 
-/// Holds the slot for one generation: busy flag, slot view, counters. Dropped
-/// after the response is written; an engine failure it met is signalled then.
-/// Dropping it also gives the slot's turn to the next queued request.
-struct Run<'a> {
-    state: &'a State,
-    engine: SlotGuard<'a>,
-    failure: Option<EngineFailure>,
-}
-
 fn dead_engine(reason: &str) -> ApiError {
     ApiError {
+        retry_after: false,
         code: 503,
         kind: "unavailable_error",
         message: format!("the engine failed and the server is stopping: {reason}"),
     }
 }
 
-impl<'a> Run<'a> {
-    /// Waits for the slot; refuses once the engine has failed.
-    fn begin(state: &'a State) -> Result<Self, ApiError> {
-        Self::hold(state, state.engine())
-    }
-
-    /// Takes the slot if it is free and no ticket is waiting: a request
-    /// running on it, or one queued behind such a request, is a 503. The slot
-    /// action never waits and never jumps ahead of queued requests.
-    fn try_begin(state: &'a State) -> Result<Self, ApiError> {
-        let Some(engine) = state.engine_try() else {
-            return Err(ApiError {
-                code: 503,
-                kind: "unavailable_error",
-                message: "slot 0 is processing a request".to_owned(),
-            });
-        };
-        Self::hold(state, engine)
-    }
-
-    fn hold(state: &'a State, engine: SlotGuard<'a>) -> Result<Self, ApiError> {
-        if let Some(reason) = relock(&state.fatal).as_deref() {
-            return Err(dead_engine(reason));
-        }
-        state.busy.store(true, Ordering::SeqCst);
-        Ok(Run {
-            state,
-            engine,
-            failure: None,
-        })
-    }
-
-    /// Records an engine failure: every later request and `/health` see it, and
-    /// the server ends once this run's response is out.
-    fn fail(&mut self, e: &EngineError) {
-        let f = EngineFailure {
-            engine: self.engine.engine.describe(),
-            error: e.to_string(),
-        };
-        *relock(&self.state.fatal) = Some(f.error.clone());
-        self.failure = Some(f);
-    }
-
-    /// Validates the prompt and runs the loop, then books the counters.
-    fn go(
-        &mut self,
-        ids: &[u32],
-        prompt: Value,
-        p: &GenParams,
-        sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
-    ) -> Result<Result<Outcome, GenError>, ApiError> {
-        if ids.is_empty() {
-            return Err(invalid("the prompt is empty"));
-        }
-        if ids.len() >= self.state.info.ctx_max {
-            return Err(ApiError {
-                code: 400,
-                kind: "exceed_context_size_error",
-                message: format!(
-                    "the prompt has {} tokens and the context holds {}",
-                    ids.len(),
-                    self.state.info.ctx_max
-                ),
-            });
-        }
-        {
-            let mut s = relock(&self.state.slot);
-            *s = SlotView {
-                id_task: self.state.next_id(),
-                prompt,
-                settings: generation_settings(self.state, p),
-                n_predict: p.n_predict,
-                ..SlotView::default()
-            };
-        }
-        let state = self.state;
-        let mut tick = |t: &Timings| {
-            let mut v = relock(&state.slot);
-            v.n_decoded = t.predicted_n;
-            v.n_past = t.n_past;
-        };
-        let mut tim = Timings::default();
-        let r = genloop::generate(
-            &mut self.engine,
-            &self.state.sampler,
-            ids,
-            p,
-            sink,
-            &mut tick,
-            &mut tim,
-        );
-        self.book(&tim, r.as_ref().ok());
-        if let Err(GenError::Engine(e)) = &r {
-            self.fail(e);
-        }
-        Ok(r)
-    }
-
-    fn book(&self, t: &Timings, o: Option<&Outcome>) {
-        let mut s = relock(&self.state.stats);
-        let (pn, dn) = (t.prompt_n as u64, t.predicted_n as u64);
-        s.n_prompt_total += pn;
-        s.n_prompt_cached_total += t.cache_n as u64;
-        s.n_tokens_max = s.n_tokens_max.max(t.n_past as u64);
-        s.t_prompt_ms_total += t.prompt_ms;
-        s.n_predicted_total += dn;
-        s.t_predicted_ms_total += t.predicted_ms;
-        // Engine calls: one for the prompt, whose logits give the first
-        // generated token, then a step or a pass each (the last token is never
-        // fed back).
-        let decodes = if pn == 0 { 0 } else { 1 + t.decodes as u64 };
-        s.n_decode_total += decodes;
-        s.n_busy_slots_total += decodes;
-        s.n_draft_total += t.draft_n as u64;
-        s.n_draft_accepted_total += t.draft_n_accepted as u64;
-        s.n_draft_passes_total += t.draft_passes as u64;
-        drop(s);
-        let mut v = relock(&self.state.slot);
-        v.n_past = t.n_past;
-        v.n_decoded = t.predicted_n;
-        if let Some(o) = o {
-            v.stopped_eos = o.stop == genloop::StopKind::Eos;
-            v.stopped_word = o.stop == genloop::StopKind::Word;
-            v.stopped_limit = o.stop == genloop::StopKind::Limit;
-            v.stopping_word = o.stopping_word.clone();
-        }
+/// The answer to a request or an action the board did not take.
+fn refused(state: &State, r: Refusal, what: &str) -> ApiError {
+    match r {
+        Refusal::Full { depth } => ApiError {
+            retry_after: true,
+            code: 503,
+            kind: "unavailable_error",
+            message: format!(
+                "every one of the {} slots is busy and {depth} requests wait, the queue's depth",
+                state.parallel
+            ),
+        },
+        Refusal::Busy => ApiError {
+            retry_after: false,
+            code: 503,
+            kind: "unavailable_error",
+            message: format!("{what} is processing a request"),
+        },
+        Refusal::Dead(reason) => dead_engine(&reason),
     }
 }
 
-impl Drop for Run<'_> {
-    fn drop(&mut self) {
-        self.state.busy.store(false, Ordering::SeqCst);
-        if let Some(f) = self.failure.take() {
-            let _ = self.state.end.send(End::Engine(f));
+/// What a request's HTTP thread hears when the engine thread closed its
+/// channel without a last message: the failure that ended it, a 500 for a
+/// request that had started, else a 503.
+fn engine_gone(state: &State, started: bool) -> ApiError {
+    let reason = state
+        .fatal()
+        .unwrap_or_else(|| "the engine thread ended".to_owned());
+    if started {
+        engine_error(&reason)
+    } else {
+        dead_engine(&reason)
+    }
+}
+
+/// Validates the prompt, hands the request to the engine thread, and passes
+/// its events to `sink` with the slot it took. Returns the outcome and the
+/// slot; an error before any event is the request's answer. A sink that fails
+/// ends the request: the engine thread sees its channel closed.
+fn run_gen(
+    state: &State,
+    ids: &[u32],
+    prompt: Value,
+    p: &GenParams,
+    sink: &mut dyn FnMut(Event<'_>, usize) -> io::Result<()>,
+) -> Result<(Result<Outcome, GenError>, usize), ApiError> {
+    if let Some(reason) = state.fatal() {
+        return Err(dead_engine(&reason));
+    }
+    if ids.is_empty() {
+        return Err(invalid("the prompt is empty"));
+    }
+    if ids.len() >= state.info.ctx_max {
+        return Err(ApiError {
+            retry_after: false,
+            code: 400,
+            kind: "exceed_context_size_error",
+            message: format!(
+                "the prompt has {} tokens and the context holds {}",
+                ids.len(),
+                state.info.ctx_max
+            ),
+        });
+    }
+    let (events, rx) = mpsc::channel();
+    let submit = Submit {
+        p: p.clone(),
+        prompt,
+        settings: generation_settings(state, p),
+        events,
+    };
+    relock(&state.shared.board)
+        .enqueue(ids.to_vec(), submit)
+        .map_err(|r| refused(state, r, "the slot"))?;
+    state.shared.work.notify_one();
+    let mut slot = None;
+    loop {
+        let Ok(m) = rx.recv() else {
+            return Err(engine_gone(state, slot.is_some()));
+        };
+        let at = slot.unwrap_or(0);
+        let sent = match m {
+            Msg::Started(s) => {
+                slot = Some(s);
+                Ok(())
+            }
+            Msg::Prompt(t) => sink(Event::Prompt(&t), at),
+            Msg::Text(text, t) => sink(Event::Text(&text, &t), at),
+            Msg::Done(r) => return Ok((r, at)),
+        };
+        if let Err(e) = sent {
+            return Ok((Err(GenError::Client(e)), at));
         }
     }
 }
@@ -1557,54 +1490,88 @@ enum SlotAction {
     Erase,
 }
 
-/// `POST /residency/reset`: the engine's adaptive expert residency back to
-/// its load's placement ([`Engine::residency_reset`]), on a free slot (a slot
-/// running a request is a 503 at once). An engine with no residency is a 501;
-/// an engine that fails is fatal, as any engine error.
-fn residency_reset(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
-    let mut run = match Run::try_begin(state) {
-        Ok(r) => r,
-        Err(e) => return send_error(w, req, &e),
+/// Runs `run` on the engine thread once the board reserves `what` (free, no
+/// request waiting; else a 503 at once naming `who`), and answers with what it
+/// returns.
+fn on_engine(
+    state: &State,
+    what: Reserve,
+    who: &str,
+    run: impl FnOnce(&mut Slot) -> (Result<Value, ApiError>, Option<EngineError>) + Send + 'static,
+) -> Result<Value, ApiError> {
+    if let Some(reason) = state.fatal() {
+        return Err(dead_engine(&reason));
+    }
+    let (tx, rx) = mpsc::channel();
+    let action = Action {
+        run: Box::new(move |slot: &mut Slot| {
+            let (answer, failure) = run(slot);
+            Acted {
+                failure,
+                reply: Box::new(move || {
+                    let _ = tx.send(answer);
+                }),
+            }
+        }),
     };
-    let t0 = Instant::now();
-    match run.engine.engine.residency_reset() {
-        Ok(Some(r)) => send_json(
-            w,
-            req,
-            200,
-            &json!({
-                "cancelled": r.cancelled,
-                "copies": r.copies,
-                "diff": r.diff,
-                "dropped_bytes": r.dropped_bytes,
-                "timings": { "reset_ms": ms_since(t0) },
-            }),
-        ),
-        Ok(None) => send_error(
-            w,
-            req,
-            &ApiError {
-                code: 501,
-                kind: "not_supported_error",
-                message: "this engine runs no adaptive expert residency".to_owned(),
-            },
-        ),
-        Err(e) => {
-            run.fail(&e);
-            send_error(w, req, &engine_error(&e))
+    relock(&state.shared.board)
+        .reserve(what, action)
+        .map_err(|r| refused(state, r, who))?;
+    state.shared.work.notify_one();
+    rx.recv().unwrap_or_else(|_| Err(engine_gone(state, true)))
+}
+
+/// `POST /residency/reset`: the engine's adaptive expert residency back to
+/// its load's placement ([`Engine::residency_reset`]), while every slot is
+/// free and no request waits (else a 503 at once). An engine with no
+/// residency is a 501; an engine that fails is fatal, as any engine error.
+fn residency_reset(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
+    let who = if state.parallel == 1 {
+        "slot 0"
+    } else {
+        "a slot"
+    };
+    let r = on_engine(state, Reserve::All, who, |slot| {
+        let t0 = Instant::now();
+        match slot.engine.residency_reset() {
+            Ok(Some(r)) => (
+                Ok(json!({
+                    "cancelled": r.cancelled,
+                    "copies": r.copies,
+                    "diff": r.diff,
+                    "dropped_bytes": r.dropped_bytes,
+                    "timings": { "reset_ms": ms_since(t0) },
+                })),
+                None,
+            ),
+            Ok(None) => (
+                Err(ApiError {
+                    retry_after: false,
+                    code: 501,
+                    kind: "not_supported_error",
+                    message: "this engine runs no adaptive expert residency".to_owned(),
+                }),
+                None,
+            ),
+            Err(e) => (Err(engine_error(&e)), Some(e)),
         }
+    });
+    match r {
+        Ok(v) => send_json(w, req, 200, &v),
+        Err(e) => send_error(w, req, &e),
     }
 }
 
 /// `POST /slots/{id}?action=…`, checked in llama-server's order: a save
-/// directory, an integer id, the action, the file name, then that the id is the
-/// one slot's; last the slot itself, which must be free.
+/// directory, an integer id, the action, the file name, then that the id is
+/// one of the slots'; last the slot itself, which must be free.
 fn slot_action(state: &State, req: &Request, w: &mut TcpStream, id: &str) -> io::Result<bool> {
-    let Some(dir) = state.slot_save_path.as_deref() else {
+    let Some(dir) = state.slot_save_path.clone() else {
         return send_error(
             w,
             req,
             &ApiError {
+                retry_after: false,
                 code: 501,
                 kind: "not_supported_error",
                 message: "This server does not support slots action. Start it with \
@@ -1613,23 +1580,24 @@ fn slot_action(state: &State, req: &Request, w: &mut TcpStream, id: &str) -> io:
             },
         );
     };
-    let parsed = slot_request(req, id);
-    let action = match parsed {
+    let (id, action) = match slot_request(req, id, state.parallel) {
         Ok(a) => a,
         Err(e) => return send_error(w, req, &e),
     };
-    let mut run = match Run::try_begin(state) {
-        Ok(r) => r,
-        Err(e) => return send_error(w, req, &e),
-    };
-    match run.slot(dir, action) {
+    let r = on_engine(
+        state,
+        Reserve::One(id),
+        &format!("slot {id}"),
+        move |slot| slot_job(slot, id, &dir, action),
+    );
+    match r {
         Ok(v) => send_json(w, req, 200, &v),
         Err(e) => send_error(w, req, &e),
     }
 }
 
-/// The action and its file name; every refusal is a 400.
-fn slot_request(req: &Request, id: &str) -> Result<SlotAction, ApiError> {
+/// The slot id and the action with its file name; every refusal is a 400.
+fn slot_request(req: &Request, id: &str, slots: usize) -> Result<(usize, SlotAction), ApiError> {
     let id: i64 = id.parse().map_err(|_| invalid("Invalid slot ID"))?;
     let action = req.query_value("action").unwrap_or_default();
     let filename = || -> Result<String, ApiError> {
@@ -1650,85 +1618,86 @@ fn slot_request(req: &Request, id: &str) -> Result<SlotAction, ApiError> {
         "erase" => SlotAction::Erase,
         _ => return Err(invalid("Invalid action")),
     };
-    if id != 0 {
-        return Err(invalid("Invalid slot ID"));
+    match usize::try_from(id) {
+        Ok(i) if i < slots => Ok((i, a)),
+        _ => Err(invalid(format!(
+            "Invalid slot ID {id}: the server runs slots 0 to {}",
+            slots - 1
+        ))),
     }
-    Ok(a)
 }
 
-impl Run<'_> {
-    /// Runs a slot action and answers with llama-server's object for it.
-    fn slot(&mut self, dir: &Path, action: SlotAction) -> Result<Value, ApiError> {
-        let t0 = Instant::now();
-        match action {
-            SlotAction::Erase => match self.engine.erase() {
-                Ok(n) => {
-                    relock(&self.state.slot).n_past = 0;
-                    Ok(json!({ "id_slot": 0, "n_erased": n }))
-                }
-                Err(e) => {
-                    self.fail(&e);
-                    Err(engine_error(&e))
-                }
-            },
-            SlotAction::Save(f) => match self.engine.save(&dir.join(&f)) {
-                Ok((n, bytes)) => Ok(json!({
-                    "id_slot": 0,
+/// Runs a slot action on the selected slot and answers with llama-server's
+/// object for it, and the engine error it met, which is fatal.
+fn slot_job(
+    slot: &mut Slot,
+    id: usize,
+    dir: &Path,
+    action: SlotAction,
+) -> (Result<Value, ApiError>, Option<EngineError>) {
+    let t0 = Instant::now();
+    match action {
+        SlotAction::Erase => match slot.erase() {
+            Ok(n) => (Ok(json!({ "id_slot": id, "n_erased": n })), None),
+            Err(e) => (Err(engine_error(&e)), Some(e)),
+        },
+        SlotAction::Save(f) => match slot.save(&dir.join(&f)) {
+            Ok((n, bytes)) => (
+                Ok(json!({
+                    "id_slot": id,
                     "filename": f,
                     "n_saved": n,
                     "n_written": bytes,
                     "timings": { "save_ms": ms_since(t0) },
                 })),
-                Err(e) => Err(self.state_error(e, "Unable to save slot", 500, "server_error")),
-            },
-            SlotAction::Restore(f) => {
-                let r = self.engine.restore(&dir.join(&f));
-                // A restore that failed may have emptied the cache.
-                relock(&self.state.slot).n_past = self.engine.held_len();
-                match r {
-                    Ok((n, bytes)) => Ok(json!({
-                        "id_slot": 0,
-                        "filename": f,
-                        "n_restored": n,
-                        "n_read": bytes,
-                        "timings": { "restore_ms": ms_since(t0) },
-                    })),
-                    Err(e) => Err(self.state_error(
-                        e,
-                        "Unable to restore slot",
-                        400,
-                        "invalid_request_error",
-                    )),
-                }
-            }
-        }
+                None,
+            ),
+            Err(e) => state_error(e, "Unable to save slot", 500, "server_error"),
+        },
+        SlotAction::Restore(f) => match slot.restore(&dir.join(&f)) {
+            Ok((n, bytes)) => (
+                Ok(json!({
+                    "id_slot": id,
+                    "filename": f,
+                    "n_restored": n,
+                    "n_read": bytes,
+                    "timings": { "restore_ms": ms_since(t0) },
+                })),
+                None,
+            ),
+            Err(e) => state_error(e, "Unable to restore slot", 400, "invalid_request_error"),
+        },
     }
+}
 
-    /// A refused engine is a 501, a failed one fatal (500), anything else
-    /// `code` with `what` before the reason.
-    fn state_error(
-        &mut self,
-        e: StateError,
-        what: &str,
-        code: u16,
-        kind: &'static str,
-    ) -> ApiError {
-        match e {
-            StateError::Unsupported(_) => ApiError {
+/// A refused engine is a 501, a failed one fatal (500), anything else `code`
+/// with `what` before the reason.
+fn state_error(
+    e: StateError,
+    what: &str,
+    code: u16,
+    kind: &'static str,
+) -> (Result<Value, ApiError>, Option<EngineError>) {
+    match e {
+        StateError::Unsupported(_) => (
+            Err(ApiError {
+                retry_after: false,
                 code: 501,
                 kind: "not_supported_error",
                 message: e.to_string(),
-            },
-            StateError::Engine(e) => {
-                self.fail(&e);
-                engine_error(&e)
-            }
-            StateError::Format(_) | StateError::Io(_) => ApiError {
+            }),
+            None,
+        ),
+        StateError::Engine(e) => (Err(engine_error(&e)), Some(e)),
+        StateError::Format(_) | StateError::Io(_) => (
+            Err(ApiError {
+                retry_after: false,
                 code,
                 kind,
                 message: format!("{what}: {e}"),
-            },
-        }
+            }),
+            None,
+        ),
     }
 }
 
@@ -1770,11 +1739,12 @@ fn completion_final(
     p: &GenParams,
     prompt: &Value,
     return_tokens: bool,
+    slot: usize,
 ) -> Value {
     let mut v = json!({
         "content": if p.stream { "" } else { o.content.as_str() },
         "generated_text": o.content,
-        "id_slot": 0,
+        "id_slot": slot,
         "stop": true,
         "model": state.alias,
         "tokens_predicted": o.timings.predicted_n,
@@ -1803,6 +1773,7 @@ fn sse(s: &mut EventStream<'_>, v: &Value) -> io::Result<()> {
 /// A 500 carrying `e`'s message.
 fn engine_error(e: &dyn fmt::Display) -> ApiError {
     ApiError {
+        retry_after: false,
         code: 500,
         kind: "server_error",
         message: e.to_string(),
@@ -1820,20 +1791,16 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         Err(e) => return send_error(w, req, &e),
     };
     let return_tokens = get_b(&b, "return_tokens").unwrap_or(false);
-    let mut run = match Run::begin(state) {
-        Ok(r) => r,
-        Err(e) => return send_error(w, req, &e),
-    };
     let prompt = b.get("prompt").cloned().unwrap_or(Value::Null);
     if !p.stream {
-        return match run.go(&ids, prompt.clone(), &p, &mut |_| Ok(())) {
+        return match run_gen(state, &ids, prompt.clone(), &p, &mut |_, _| Ok(())) {
             Err(e) => send_error(w, req, &e),
-            Ok(Err(e)) => send_error(w, req, &engine_error(&e)),
-            Ok(Ok(o)) => send_json(
+            Ok((Err(e), _)) => send_error(w, req, &engine_error(&e)),
+            Ok((Ok(o), slot)) => send_json(
                 w,
                 req,
                 200,
-                &completion_final(state, &o, &p, &prompt, return_tokens),
+                &completion_final(state, &o, &p, &prompt, return_tokens, slot),
             ),
         };
     }
@@ -1841,7 +1808,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
     let mut w_opt = Some(w);
     let tpt = p.timings_per_token;
     let r = {
-        let mut sink = |ev: Event<'_>| -> io::Result<()> {
+        let mut sink = |ev: Event<'_>, slot: usize| -> io::Result<()> {
             if stream.is_none() {
                 let w = w_opt
                     .take()
@@ -1853,11 +1820,11 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
                 .ok_or_else(|| io::Error::other("no stream"))?;
             let v = match ev {
                 Event::Prompt(t) => json!({
-                    "content": "", "stop": false, "id_slot": 0, "multimodal": false,
+                    "content": "", "stop": false, "id_slot": slot, "multimodal": false,
                     "prompt_progress": progress(t),
                 }),
                 Event::Text(text, t) => {
-                    let mut v = json!({ "content": text, "stop": false, "id_slot": 0, "multimodal": false });
+                    let mut v = json!({ "content": text, "stop": false, "id_slot": slot, "multimodal": false });
                     if tpt {
                         v["timings"] = t.to_json();
                     }
@@ -1866,10 +1833,14 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
             };
             sse(s, &v)
         };
-        run.go(&ids, prompt.clone(), &p, &mut sink)
+        run_gen(state, &ids, prompt.clone(), &p, &mut sink)
     };
-    finish_stream(req, stream, w_opt, r, |s, o| {
-        sse(s, &completion_final(state, o, &p, &prompt, return_tokens))
+    let slot = r.as_ref().map_or(0, |(_, slot)| *slot);
+    finish_stream(req, stream, w_opt, r.map(|(o, _)| o), |s, o| {
+        sse(
+            s,
+            &completion_final(state, o, &p, &prompt, return_tokens, slot),
+        )
     })
 }
 
@@ -2001,6 +1972,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
         ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(b.get("tools"))),
         ToolFormat::Unparsed => {
             return Err(ApiError {
+                retry_after: false,
                 code: 501,
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
@@ -2016,6 +1988,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
 /// as llama-server answers output its chat parser refuses.
 fn tool_markup_error(e: &GlmXmlError) -> ApiError {
     ApiError {
+        retry_after: false,
         code: 500,
         kind: "server_error",
         message: format!("tool-call markup: {e}"),
@@ -2053,16 +2026,12 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     };
     let ids = state.tok.encode(&text);
     let mut parser = ChatParser::with_tools(&text, format, tools);
-    let mut run = match Run::begin(state) {
-        Ok(r) => r,
-        Err(e) => return send_error(w, req, &e),
-    };
     let prompt = Value::String(text);
     if !p.stream {
-        return match run.go(&ids, prompt, &p, &mut |_| Ok(())) {
+        return match run_gen(state, &ids, prompt, &p, &mut |_, _| Ok(())) {
             Err(e) => send_error(w, req, &e),
-            Ok(Err(e)) => send_error(w, req, &engine_error(&e)),
-            Ok(Ok(o)) => match parser
+            Ok((Err(e), _)) => send_error(w, req, &engine_error(&e)),
+            Ok((Ok(o), _)) => match parser
                 .try_push(&o.content)
                 .and_then(|_| parser.try_finish())
             {
@@ -2079,7 +2048,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let mut markup: Option<GlmXmlError> = None;
     let r = {
         let meta = &ids_meta;
-        let mut sink = |ev: Event<'_>| -> io::Result<()> {
+        let mut sink = |ev: Event<'_>, _slot: usize| -> io::Result<()> {
             if stream.is_none() {
                 let w = w_opt
                     .take()
@@ -2125,7 +2094,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }
             }
         };
-        run.go(&ids, prompt, &p, &mut sink)
+        run_gen(state, &ids, prompt, &p, &mut sink).map(|(o, _)| o)
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),

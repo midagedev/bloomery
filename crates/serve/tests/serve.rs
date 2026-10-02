@@ -7,6 +7,7 @@
 //! yields `a`, `b`, `c`, EOS.
 
 mod common;
+mod slots;
 
 use common::{assert_keys, call, fixture_keys, get, post, start};
 use serde_json::{Value, json};

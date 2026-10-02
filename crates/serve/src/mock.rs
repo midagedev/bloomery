@@ -16,6 +16,10 @@
 //! [`MockEngine::failing_at`] makes the `k`-th `next` of the engine's life an
 //! error, for the crash-path gate.
 //!
+//! [`MockEngine::with_slots`] serves several slots, each a context of its own
+//! of `ctx_max` positions, so a slot's ids are what it would give alone; its
+//! steps of several slots are [`Engine::step_slots`]'s default.
+//!
 //! [`DraftMock`] is the same engine behind a draft of one id: each pass
 //! verifies a proposal after `last`, the mock's own next token on two passes of
 //! three and another id on the third, and keeps what the target agrees with.
@@ -57,7 +61,11 @@ const FLOOR: f32 = -8.0;
 /// The mock engine. `ctx_max` is chosen by the caller so the gate can hit the
 /// context limit cheaply.
 pub struct MockEngine {
+    /// The selected slot's context.
     ctx: Vec<u32>,
+    /// Every slot's context; the selected slot's entry is empty.
+    parked: Vec<Vec<u32>>,
+    cur: usize,
     ctx_max: usize,
     tok: Arc<MockTokenizer>,
     nexts: usize,
@@ -73,6 +81,8 @@ impl MockEngine {
     pub fn new(ctx_max: usize) -> Self {
         MockEngine {
             ctx: Vec::new(),
+            parked: vec![Vec::new()],
+            cur: 0,
             ctx_max,
             tok: Arc::new(MockTokenizer),
             nexts: 0,
@@ -98,6 +108,20 @@ impl MockEngine {
         MockEngine {
             fail_at: Some(k),
             ..MockEngine::new(ctx_max)
+        }
+    }
+
+    /// The same mock serving `n` slots (at least 1).
+    ///
+    /// # Panics
+    ///
+    /// When `n` is 0.
+    #[must_use]
+    pub fn with_slots(self, n: usize) -> Self {
+        assert!(n > 0, "a mock of no slots");
+        MockEngine {
+            parked: vec![Vec::new(); n],
+            ..self
         }
     }
 
@@ -250,6 +274,25 @@ impl Engine for MockEngine {
 
     fn ctx_max(&self) -> usize {
         self.ctx_max
+    }
+
+    fn slots(&self) -> usize {
+        self.parked.len()
+    }
+
+    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+        if slot >= self.parked.len() {
+            return Err(EngineError(format!(
+                "mock: slot {slot} of {} slots",
+                self.parked.len()
+            )));
+        }
+        if slot != self.cur {
+            let parked = std::mem::take(&mut self.parked[slot]);
+            self.parked[self.cur] = std::mem::replace(&mut self.ctx, parked);
+            self.cur = slot;
+        }
+        Ok(())
     }
 
     fn residency_reset(&mut self) -> Result<Option<ResidencyReset>, EngineError> {

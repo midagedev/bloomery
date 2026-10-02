@@ -3,6 +3,7 @@
 //!   bloomery-serve [--host 127.0.0.1] [--port 8080] [--model <first.gguf>]
 //!                  [--chat-template-file <path>] [--alias <name>] [--ctx-size <n>]
 //!                  [--print-template] [--mock-fail-at <k>] [--slot-save-path <dir>]
+//!                  [--parallel <n>] [--queue-depth <q>]
 //!
 //! `--model` reads `tokenizer.chat_template` and `general.name` from the GGUF
 //! header only; the engine is always the mock here. The binding to the GPU
@@ -11,13 +12,19 @@
 //! `--mock-fail-at k` makes the mock's `k`-th `next` an engine error: the crash
 //! path's gate. The process then prints the crash block and exits 70.
 //!
-//! `--slot-save-path dir` enables `POST /slots/0?action=save|restore` on files
-//! in `dir`, which must exist (the process exits 64 otherwise).
+//! `--slot-save-path dir` enables `POST /slots/{id}?action=save|restore` on
+//! files in `dir`, which must exist (the process exits 64 otherwise).
+//!
+//! `--parallel n` (`-np n`) serves `n` slots, each with the whole `--ctx-size`,
+//! on a mock of `n` slots; `--queue-depth q` lets at most `q` requests wait past
+//! the free slots (`serve::SlotConfig`). A value the server refuses exits 64.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use serve::{FATAL_LINGER, MockEngine, ServeError, Server, ServerConfig};
+use serve::{
+    FATAL_LINGER, MAX_CONNECTIONS, MockEngine, ServeError, Server, ServerConfig, SlotConfig,
+};
 
 /// Used when neither `--model` nor `--chat-template-file` gives one.
 const FALLBACK_TEMPLATE: &str = "{{- bos_token -}}{%- for m in messages -%}<|{{ m['role'] }}|>{{ m['content'] or '' }}\n{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
@@ -32,6 +39,8 @@ struct Args {
     print_template: bool,
     fail_at: Option<usize>,
     slot_save_path: Option<PathBuf>,
+    parallel: usize,
+    queue_depth: Option<usize>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -45,6 +54,8 @@ fn parse_args() -> Result<Args, String> {
         print_template: false,
         fail_at: None,
         slot_save_path: None,
+        parallel: 1,
+        queue_depth: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -63,10 +74,16 @@ fn parse_args() -> Result<Args, String> {
                 a.fail_at = Some(val()?.parse().map_err(|e| format!("--mock-fail-at: {e}"))?)
             }
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(val()?)),
+            "--parallel" | "-np" => {
+                a.parallel = val()?.parse().map_err(|e| format!("--parallel: {e}"))?
+            }
+            "--queue-depth" => {
+                a.queue_depth = Some(val()?.parse().map_err(|e| format!("--queue-depth: {e}"))?)
+            }
             "--help" | "-h" => {
                 return Err("usage: bloomery-serve [--host H] [--port P] [--model GGUF] \
                             [--chat-template-file PATH] [--alias NAME] [--ctx-size N] [--print-template] \
-                            [--mock-fail-at K] [--slot-save-path DIR]"
+                            [--mock-fail-at K] [--slot-save-path DIR] [--parallel N] [--queue-depth Q]"
                     .to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
@@ -129,9 +146,23 @@ fn main() -> ExitCode {
         Some(k) => MockEngine::failing_at(args.ctx, k),
         None => MockEngine::new(args.ctx),
     };
-    let server = match Server::bind((args.host.as_str(), args.port), Box::new(engine), config) {
+    // --parallel 0, or past the connection limit, is the server's refusal,
+    // which it makes before it asks the engine's slots.
+    let mock_slots = if (1..=MAX_CONNECTIONS).contains(&args.parallel) {
+        args.parallel
+    } else {
+        1
+    };
+    let engine = engine.with_slots(mock_slots);
+    let slots = SlotConfig {
+        parallel: args.parallel,
+        queue_depth: args.queue_depth,
+        ..SlotConfig::default()
+    };
+    let addr = (args.host.as_str(), args.port);
+    let server = match Server::bind_with(addr, Box::new(engine), config, slots) {
         Ok(s) => s,
-        Err(e @ ServeError::SlotSavePath(_)) => {
+        Err(e @ (ServeError::SlotSavePath(_) | ServeError::Slots(_))) => {
             eprintln!("{e}");
             return ExitCode::from(64);
         }
@@ -152,6 +183,7 @@ fn main() -> ExitCode {
         ServeError::Io(_)
         | ServeError::Template(_)
         | ServeError::SlotSavePath(_)
-        | ServeError::NoStops => ExitCode::from(1),
+        | ServeError::NoStops
+        | ServeError::Slots(_) => ExitCode::from(1),
     }
 }

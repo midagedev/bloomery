@@ -1,8 +1,15 @@
 //! The engine contract the server drives, and the sampler hook it calls.
 //!
-//! The server owns one `Engine` behind a mutex (one slot) and the engine's
-//! [`Tokenizer`] outside it: `/tokenize`, `/detokenize` and prompt encoding never
-//! wait for a generation. A request keeps the longest prefix `k` of its ids the
+//! The server owns one `Engine` on an engine thread of its own and the
+//! engine's [`Tokenizer`] outside it: `/tokenize`, `/detokenize` and prompt
+//! encoding never wait for a generation. The engine serves
+//! [`Engine::slots`] sequences at once, each with its own cache of
+//! [`Engine::ctx_max`] positions; [`Engine::select_slot`] picks the one every
+//! per-slot call below acts on, and [`Engine::step_slots`] steps several in
+//! one call. An engine that declares one slot (the default) is never asked to
+//! select and never steps more than one row.
+//!
+//! On the selected slot, a request keeps the longest prefix `k` of its ids the
 //! cache already holds and the engine can keep ([`Engine::keepable`]): `cut(k)`,
 //! or `reset` when `k` is 0; then `prefill(ids[k..n-1])`, and `next(ids[n-1])`
 //! yields the first generated token and every later `next(prev)` the one after
@@ -15,7 +22,7 @@
 //! `/health` answers 503, and [`crate::Server::run`] returns the error so the
 //! process exits instead of serving an engine in an unknown state.
 //!
-//! Slot persistence (`POST /slots/0?action=save|restore|erase`): the server owns
+//! Slot persistence (`POST /slots/{id}?action=save|restore|erase`): the server owns
 //! the file, its header and the slot's ids, and hands the engine the stream
 //! after them ([`Engine::save_state`], [`Engine::restore_state`]); the engine's
 //! bytes run to the end of the file. Erase needs no engine call: it is
@@ -23,8 +30,9 @@
 //! [`StateError::Unsupported`], which is not fatal: the server answers 501 and
 //! keeps serving.
 //!
-//! The host prompt cache (llama-server's `--cache-ram`): before a request
-//! drops most of what the slot holds, the server takes the engine's state as a
+//! The host prompt cache (llama-server's `--cache-ram`), one for every slot:
+//! before a request drops most of what its slot holds, the server takes the
+//! slot's state as a
 //! value ([`Engine::snapshot`]) into a host-RAM LRU of [`Engine::cache_ram`]
 //! bytes, keyed by the ids it covers; a later request that one of those states
 //! serves better than the slot does gets it back ([`Engine::resume`]). What
@@ -143,6 +151,42 @@ pub trait Engine: Send {
     /// the target's row of the step it ran.
     fn advance_rows(&self) -> usize {
         1
+    }
+    /// The sequences this engine serves at once, each with a cache of its own
+    /// of [`Engine::ctx_max`] positions: the most `--parallel` it takes. The
+    /// default is 1.
+    fn slots(&self) -> usize {
+        1
+    }
+    /// Makes `slot` (below [`Engine::slots`]) the one every per-slot call
+    /// acts on until the next select: `prefill`, `next`, `advance`, `reset`,
+    /// `will_reply`, `keepable`, `cut`, `keep_limit`, `save_state`,
+    /// `restore_state`, `snapshot`, `resume` and `prefill_splits`. Slot 0 is selected from the
+    /// start; the server selects before a per-slot call only when the slot
+    /// changes. The default serves slot 0 alone and refuses any other by name.
+    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+        if slot == 0 {
+            Ok(())
+        } else {
+            Err(EngineError(format!(
+                "slot {slot}: this engine serves slot 0 alone"
+            )))
+        }
+    }
+    /// One step of several slots in one call: each row evaluates its `last`
+    /// on its own `slot` (distinct, each below [`Engine::slots`]) at that
+    /// slot's own position, and its `next` is set to the argmax of the
+    /// position after, as [`Engine::next`] gives it; a row with `logits` gets
+    /// that position's logits written there too. Afterwards the selected slot
+    /// is unspecified: the server selects before its next per-slot call. The
+    /// server calls this only with two rows or more (one row is a `next`).
+    /// The default is a select and a `next` a row, in order.
+    fn step_slots(&mut self, rows: &mut [SlotRow<'_>]) -> Result<(), EngineError> {
+        for row in rows {
+            self.select_slot(row.slot)?;
+            row.next = self.next(row.last, row.logits.as_deref_mut())?;
+        }
+        Ok(())
     }
     /// Drops the whole cache; the next `prefill` starts at position 0.
     fn reset(&mut self) -> Result<(), EngineError>;
@@ -271,6 +315,18 @@ pub trait Engine: Send {
     fn note(&self, note: &CacheNote) {
         eprintln!("bloomery-serve: {note}");
     }
+}
+
+/// One row of [`Engine::step_slots`]: the slot, the id it evaluates, and the
+/// logits buffer (length `n_vocab`) of a row that needs them. `next` is the
+/// engine's answer; the server sets it past the vocabulary before the call,
+/// and a row still past it afterwards is the engine's error.
+#[derive(Debug)]
+pub struct SlotRow<'a> {
+    pub slot: usize,
+    pub last: u32,
+    pub logits: Option<&'a mut [f32]>,
+    pub next: u32,
 }
 
 /// What one [`Engine::advance`] drafted: the ids its draft proposed (0 for a

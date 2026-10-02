@@ -16,6 +16,11 @@
 //! and kept. A request that samples or bans an id reads the logits row every
 //! token, which a pass does not give, so on the same engine it takes one
 //! [`Engine::next`] a token and carries no draft counts.
+//!
+//! A request runs as a [`Gen`], one engine call at a time, so the engine
+//! thread can make one call of several slots' steps: each running request's
+//! next step is a row of one [`Engine::step_slots`]. A drafting engine serves
+//! one slot.
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -27,8 +32,8 @@ use std::time::Instant;
 use serde_json::{Value, json};
 
 use crate::engine::{
-    CacheNote, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplingParams, Saved,
-    StateError, Tokenizer,
+    CacheNote, Decoder, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplingParams,
+    Saved, SlotRow, StateError, Tokenizer,
 };
 use crate::promptcache::{self, PromptCache};
 use crate::sampling;
@@ -74,9 +79,6 @@ pub(crate) struct Timings {
     /// The passes that verified a proposal (llama-server's
     /// `n_draft_verif_steps`; not a `timings` field).
     pub draft_passes: usize,
-    /// The engine calls after the first token's, a step or a pass each (not a
-    /// `timings` field).
-    pub decodes: usize,
 }
 
 impl Timings {
@@ -203,25 +205,107 @@ fn choose(
     }
 }
 
-/// The one slot: the engine, the ids its cache holds, one per position, and
-/// the host prompt cache of states it held before ([`PromptCache`]).
+/// The engine and its slots: the ids each slot's cache holds, one per
+/// position, and the host prompt cache of states the slots held before
+/// ([`PromptCache`]), one for every slot. Every method but [`Slot::select`],
+/// [`Slot::held_of`] and [`Slot::step_slots`] acts on the selected slot.
 pub(crate) struct Slot {
     pub engine: Box<dyn Engine>,
     vocab: Arc<dyn Tokenizer>,
-    /// Every id the engine has evaluated since its last reset, in order. The
-    /// last generated id of a request is not in it: it is never fed back.
+    /// Every id the selected slot has evaluated since its last reset, in
+    /// order. The last generated id of a request is not in it: it is never
+    /// fed back.
     held: Vec<u32>,
+    /// The other slots' ids; the selected slot's entry is empty.
+    parked: Vec<Vec<u32>>,
+    /// The slot whose ids `held` is.
+    cur: usize,
+    /// The slot the engine has selected: `None` after a call of several.
+    selected: Option<usize>,
     cache: PromptCache,
 }
 
 impl Slot {
+    /// The engine with one slot.
+    #[cfg(test)]
     pub(crate) fn new(engine: Box<dyn Engine>) -> Slot {
+        Slot::with_slots(engine, 1)
+    }
+
+    /// The engine with `n` slots (at least 1, at most what it declares).
+    pub(crate) fn with_slots(engine: Box<dyn Engine>, n: usize) -> Slot {
         Slot {
             vocab: engine.tokenizer(),
             cache: PromptCache::new(engine.cache_ram()),
             engine,
             held: Vec::new(),
+            parked: vec![Vec::new(); n],
+            cur: 0,
+            selected: Some(0),
         }
+    }
+
+    /// Makes `slot` the selected one, on the engine too when it changes.
+    pub(crate) fn select(&mut self, slot: usize) -> Result<(), EngineError> {
+        if self.selected != Some(slot) {
+            self.engine.select_slot(slot)?;
+            self.selected = Some(slot);
+        }
+        if self.cur != slot {
+            let parked = std::mem::take(&mut self.parked[slot]);
+            self.parked[self.cur] = std::mem::replace(&mut self.held, parked);
+            self.cur = slot;
+        }
+        Ok(())
+    }
+
+    /// The ids `slot`'s cache holds.
+    pub(crate) fn held_of(&self, slot: usize) -> &[u32] {
+        if slot == self.cur {
+            &self.held
+        } else {
+            &self.parked[slot]
+        }
+    }
+
+    fn held_mut(&mut self, slot: usize) -> &mut Vec<u32> {
+        if slot == self.cur {
+            &mut self.held
+        } else {
+            &mut self.parked[slot]
+        }
+    }
+
+    /// One step of several slots ([`Engine::step_slots`]) that books what
+    /// each fed. While the call is in flight the rows' ids are empty, so a
+    /// failed call leaves no claim about their caches. A row the engine
+    /// answers with no id of the vocabulary (its `next` left as it was) is the
+    /// engine's error.
+    pub(crate) fn step_slots(&mut self, rows: &mut [SlotRow<'_>]) -> Result<(), EngineError> {
+        let held: Vec<Vec<u32>> = rows
+            .iter()
+            .map(|r| std::mem::take(self.held_mut(r.slot)))
+            .collect();
+        self.selected = None;
+        for r in rows.iter_mut() {
+            r.next = u32::MAX;
+        }
+        self.engine.step_slots(rows)?;
+        let n_vocab = self.vocab.n_vocab();
+        if let Some(r) = rows.iter().find(|r| r.next as usize >= n_vocab) {
+            return Err(EngineError(format!(
+                "a step of {} slots answered slot {} with id {}, past the vocabulary's {n_vocab}",
+                rows.len(),
+                r.slot,
+                r.next
+            )));
+        }
+        for (r, h) in rows.iter().zip(held) {
+            let ids = self.held_mut(r.slot);
+            *ids = h;
+            ids.push(r.last);
+        }
+        Ok(())
     }
 
     /// Brings the cache to the longest prefix of `ids` it can keep, leaving at
@@ -406,7 +490,11 @@ impl Slot {
     }
 
     /// `next` that books what it fed.
-    fn next(&mut self, last: u32, logits: Option<&mut [f32]>) -> Result<u32, EngineError> {
+    pub(crate) fn next(
+        &mut self,
+        last: u32,
+        logits: Option<&mut [f32]>,
+    ) -> Result<u32, EngineError> {
         let held = std::mem::take(&mut self.held);
         let g = self.engine.next(last, logits)?;
         self.held = held;
@@ -418,7 +506,11 @@ impl Slot {
     /// last. `out` is cleared first. A pass that kept no token, more than the
     /// engine's rows, or other than one more than its draft's accepted ids is
     /// the engine's error.
-    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+    pub(crate) fn advance(
+        &mut self,
+        last: u32,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, EngineError> {
         let held = std::mem::take(&mut self.held);
         out.clear();
         let d = self.engine.advance(last, out)?;
@@ -439,11 +531,6 @@ impl Slot {
         self.held.push(last);
         self.held.extend_from_slice(&out[..out.len() - 1]);
         Ok(d)
-    }
-
-    /// Positions the cache holds.
-    pub(crate) fn held_len(&self) -> usize {
-        self.held.len()
     }
 
     /// Writes the slot to `path` ([`slotfile`]'s layout): the file is written
@@ -568,11 +655,296 @@ fn partial_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".bloomery-slot-{}-{n}:partial", std::process::id()))
 }
 
-/// Runs one request on the slot. `ids` is non-empty and shorter than the context.
-/// `timings` in the returned outcome are filled even when the sink failed midway
-/// (the caller's counters still see the work done). A greedy request never asks the
-/// engine for its logits, and takes its tokens after the first through the
-/// engine's passes. `tick` sees the timings after every generated token.
+/// What a generation needs next ([`Gen::pump`]).
+pub(crate) enum Need {
+    /// One step from this id: [`Engine::next`], or a row of
+    /// [`Engine::step_slots`], whose answer goes to [`Gen::stepped`].
+    Step(u32),
+    /// One drafted pass from this id ([`Engine::advance`] into
+    /// [`Gen::kept_mut`]), whose count goes to [`Gen::advanced`].
+    Advance(u32),
+    /// Nothing more: [`Gen::finish`] ends it.
+    Done,
+}
+
+/// One request's generation on its slot, run a call at a time so the engine
+/// thread can step several slots' generations in one engine call. `ids` is
+/// non-empty and shorter than the context. [`Gen::timings`] are filled even
+/// when the sink failed midway (the caller's counters still see the work
+/// done). A greedy request never asks the engine for its logits, and takes its
+/// tokens after the first through the engine's passes. `tick` sees the timings
+/// after every generated token.
+pub(crate) struct Gen {
+    n: usize,
+    ctx_max: usize,
+    sampler: Option<Sampler>,
+    stops: Vec<u32>,
+    /// The stop ids under `ignore_eos`, else empty.
+    banned: Vec<u32>,
+    /// The engine's logits row, or empty on a greedy request.
+    logits: Vec<f32>,
+    tim: Timings,
+    t1: Instant,
+    budget: usize,
+    scan: StopScan,
+    dec: Box<dyn Decoder>,
+    generated: Vec<u32>,
+    stop: StopKind,
+    stopping_word: String,
+    truncated: bool,
+    /// A pass's rows; 1 steps. Only a greedy request with no banned id passes.
+    rows: usize,
+    /// The last pass's kept tokens, and how many of them the loop has taken.
+    kept: Vec<u32>,
+    taken: usize,
+    /// The token the loop takes next; `None` once there is none.
+    tok: Option<u32>,
+}
+
+impl Gen {
+    /// A generation of `p` for a prompt of `n` ids on `slot`'s engine; nothing
+    /// runs yet.
+    pub(crate) fn new(slot: &Slot, factory: &SamplerFactory, n: usize, p: &GenParams) -> Gen {
+        let sampler = (p.sampling.temperature > 0.0).then(|| factory(&p.sampling));
+        let stops = slot.vocab.stops();
+        let banned = if p.ignore_eos {
+            stops.clone()
+        } else {
+            Vec::new()
+        };
+        // A greedy request reads the logits only to step past a banned argmax.
+        let logits = vec![
+            0.0f32;
+            if sampler.is_some() || !banned.is_empty() {
+                slot.vocab.n_vocab()
+            } else {
+                0
+            }
+        ];
+        let rows = if sampler.is_none() && banned.is_empty() {
+            slot.engine.advance_rows()
+        } else {
+            1
+        };
+        Gen {
+            n,
+            ctx_max: slot.engine.ctx_max(),
+            sampler,
+            stops,
+            banned,
+            logits,
+            tim: Timings::default(),
+            t1: Instant::now(),
+            budget: usize::try_from(p.n_predict).unwrap_or(usize::MAX),
+            scan: StopScan::new(p.stop.clone()),
+            dec: slot.vocab.decoder(),
+            generated: Vec::new(),
+            stop: StopKind::Limit,
+            stopping_word: String::new(),
+            truncated: false,
+            rows,
+            kept: Vec::with_capacity(rows),
+            taken: 0,
+            tok: None,
+        }
+    }
+
+    /// The timings so far.
+    pub(crate) fn timings(&self) -> &Timings {
+        &self.tim
+    }
+
+    /// The buffer a pass's kept tokens go to.
+    pub(crate) fn kept_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.kept
+    }
+
+    /// The logits buffer a step writes, or `None` on a greedy request.
+    pub(crate) fn logits_out(&mut self) -> Option<&mut [f32]> {
+        out(&mut self.logits)
+    }
+
+    /// The prompt on the selected slot: what the cache keeps of `ids`, the
+    /// rest fed, and the first token's logits read.
+    pub(crate) fn prompt(
+        &mut self,
+        slot: &mut Slot,
+        ids: &[u32],
+        p: &GenParams,
+        sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+    ) -> Result<(), GenError> {
+        let n = self.n;
+        // Only a greedy request with no banned id passes, and its first token is
+        // the prompt's step: the passes make at most the rest.
+        let passes = self.sampler.is_none() && self.banned.is_empty();
+        slot.engine.will_reply(match usize::try_from(p.n_predict) {
+            Ok(n) if passes => Some(n.saturating_sub(1)),
+            Err(_) if passes => None,
+            _ => Some(0),
+        });
+        let cache_n = slot.reuse(ids, p.cache_prompt)?;
+        let t0 = Instant::now();
+        slot.prefill_marked(ids, cache_n, n - 1)?;
+        let greedy = slot.next(ids[n - 1], out(&mut self.logits))?;
+        self.tim = Timings {
+            prompt_n: n - cache_n,
+            prompt_ms: ms_since(t0),
+            n_ctx: self.ctx_max,
+            n_past: n,
+            cache_n,
+            n_prompt: n,
+            ..Timings::default()
+        };
+        self.t1 = Instant::now();
+        if p.return_progress {
+            sink(Event::Prompt(&self.tim))?;
+        }
+        if self.budget > 0 {
+            self.tok = Some(choose(
+                &mut self.sampler,
+                greedy,
+                &mut self.logits,
+                &self.generated,
+                &self.banned,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Takes the tokens in hand, one at a time, until the generation stops or
+    /// needs the engine.
+    pub(crate) fn pump(
+        &mut self,
+        sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+        tick: &mut dyn FnMut(&Timings),
+    ) -> Result<Need, GenError> {
+        while let Some(tok) = self.tok.take() {
+            if self.banned.contains(&tok) {
+                return Err(GenError::Banned(tok));
+            }
+            self.generated.push(tok);
+            self.tim.predicted_n = self.generated.len();
+            self.tim.predicted_ms = ms_since(self.t1);
+            tick(&self.tim);
+            if self.stops.contains(&tok) {
+                self.stop = StopKind::Eos;
+                break;
+            }
+            if let Some(piece) = self.dec.push(tok) {
+                let pushed = self.scan.push(&piece);
+                if !pushed.send.is_empty() {
+                    sink(Event::Text(&pushed.send, &self.tim))?;
+                }
+                if let Some(w) = pushed.stopped {
+                    self.stop = StopKind::Word;
+                    self.stopping_word = w;
+                    break;
+                }
+            }
+            if self.generated.len() >= self.budget {
+                break;
+            }
+            // The last pass evaluated this token already.
+            if let Some(&t) = self.kept.get(self.taken) {
+                self.taken += 1;
+                self.tok = Some(t);
+                continue;
+            }
+            let (n, len) = (self.n, self.generated.len());
+            // Feeding `tok` takes position n + len - 1; the cache holds ctx_max.
+            if n + len > self.ctx_max {
+                self.truncated = true;
+                break;
+            }
+            // A pass takes `rows` positions from there.
+            if self.rows > 1 && n + len + self.rows - 1 <= self.ctx_max {
+                return Ok(Need::Advance(tok));
+            }
+            return Ok(Need::Step(tok));
+        }
+        Ok(Need::Done)
+    }
+
+    /// The engine's answer `g` to a [`Need::Step`].
+    pub(crate) fn stepped(&mut self, g: u32) {
+        self.tim.n_past = self.n + self.generated.len();
+        self.tok = Some(choose(
+            &mut self.sampler,
+            g,
+            &mut self.logits,
+            &self.generated,
+            &self.banned,
+        ));
+    }
+
+    /// What a [`Need::Advance`] drafted; its tokens are in [`Gen::kept_mut`].
+    pub(crate) fn advanced(&mut self, d: Drafted) {
+        self.tim.book(d);
+        self.tim.n_past = self.n + self.generated.len() + self.kept.len() - 1;
+        self.tok = Some(self.kept[0]);
+        self.taken = 1;
+    }
+
+    /// The text still held, and the outcome.
+    pub(crate) fn finish(
+        &mut self,
+        sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+    ) -> Result<Outcome, GenError> {
+        if self.stop != StopKind::Word {
+            let tail = self.dec.flush();
+            let pushed = self.scan.push(&tail);
+            let mut rest = pushed.send;
+            if let Some(w) = pushed.stopped {
+                self.stop = StopKind::Word;
+                self.stopping_word = w;
+            } else {
+                rest.push_str(&self.scan.finish());
+            }
+            if !rest.is_empty() {
+                sink(Event::Text(&rest, &self.tim))?;
+            }
+        }
+        self.tim.predicted_ms = ms_since(self.t1);
+        Ok(Outcome {
+            content: self.scan.text().to_owned(),
+            tokens: std::mem::take(&mut self.generated),
+            stop: self.stop,
+            stopping_word: std::mem::take(&mut self.stopping_word),
+            truncated: self.truncated,
+            timings: self.tim.clone(),
+        })
+    }
+
+    /// The whole generation on `slot` alone, its calls one at a time.
+    #[cfg(test)]
+    fn run(
+        &mut self,
+        slot: &mut Slot,
+        ids: &[u32],
+        p: &GenParams,
+        sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+        tick: &mut dyn FnMut(&Timings),
+    ) -> Result<Outcome, GenError> {
+        self.prompt(slot, ids, p, sink)?;
+        loop {
+            match self.pump(sink, tick)? {
+                Need::Done => return self.finish(sink),
+                Need::Step(t) => {
+                    let g = slot.next(t, out(&mut self.logits))?;
+                    self.stepped(g);
+                }
+                Need::Advance(t) => {
+                    let d = slot.advance(t, &mut self.kept)?;
+                    self.advanced(d);
+                }
+            }
+        }
+    }
+}
+
+/// Runs one request on the slot alone ([`Gen`]); `timings_out` gets its
+/// timings whether it ends or fails.
+#[cfg(test)]
 pub(crate) fn generate(
     slot: &mut Slot,
     factory: &SamplerFactory,
@@ -582,140 +954,10 @@ pub(crate) fn generate(
     tick: &mut dyn FnMut(&Timings),
     timings_out: &mut Timings,
 ) -> Result<Outcome, GenError> {
-    let n = ids.len();
-    let ctx_max = slot.engine.ctx_max();
-    let vocab = Arc::clone(&slot.vocab);
-    let mut sampler = (p.sampling.temperature > 0.0).then(|| factory(&p.sampling));
-    let stops = vocab.stops();
-    let banned: &[u32] = if p.ignore_eos { &stops } else { &[] };
-    // A greedy request reads the logits only to step past a banned argmax.
-    let mut logits = vec![
-        0.0f32;
-        if sampler.is_some() || !banned.is_empty() {
-            vocab.n_vocab()
-        } else {
-            0
-        }
-    ];
-    // Only a greedy request with no banned id passes, and its first token is
-    // the prompt's step: the passes make at most the rest.
-    let passes = sampler.is_none() && banned.is_empty();
-    slot.engine.will_reply(match usize::try_from(p.n_predict) {
-        Ok(n) if passes => Some(n.saturating_sub(1)),
-        Err(_) if passes => None,
-        _ => Some(0),
-    });
-    let cache_n = slot.reuse(ids, p.cache_prompt)?;
-    let t0 = Instant::now();
-    slot.prefill_marked(ids, cache_n, n - 1)?;
-    let greedy = slot.next(ids[n - 1], out(&mut logits))?;
-    let tim = timings_out;
-    *tim = Timings {
-        prompt_n: n - cache_n,
-        prompt_ms: ms_since(t0),
-        n_ctx: ctx_max,
-        n_past: n,
-        cache_n,
-        n_prompt: n,
-        ..Timings::default()
-    };
-    let t1 = Instant::now();
-    if p.return_progress {
-        sink(Event::Prompt(tim))?;
-    }
-    let budget = usize::try_from(p.n_predict).unwrap_or(usize::MAX);
-    let mut scan = StopScan::new(p.stop.clone());
-    let mut dec = vocab.decoder();
-    let mut generated: Vec<u32> = Vec::new();
-    let mut stop = StopKind::Limit;
-    let mut stopping_word = String::new();
-    let mut truncated = false;
-    // A pass's rows; 1 steps. Only a greedy request with no banned id passes.
-    let rows = if sampler.is_none() && banned.is_empty() {
-        slot.engine.advance_rows()
-    } else {
-        1
-    };
-    // The last pass's kept tokens, and how many of them the loop has taken.
-    let mut kept: Vec<u32> = Vec::with_capacity(rows);
-    let mut taken = 0;
-    if budget > 0 {
-        let mut tok = choose(&mut sampler, greedy, &mut logits, &generated, banned);
-        loop {
-            if banned.contains(&tok) {
-                return Err(GenError::Banned(tok));
-            }
-            generated.push(tok);
-            tim.predicted_n = generated.len();
-            tim.predicted_ms = ms_since(t1);
-            tick(tim);
-            if stops.contains(&tok) {
-                stop = StopKind::Eos;
-                break;
-            }
-            if let Some(piece) = dec.push(tok) {
-                let pushed = scan.push(&piece);
-                if !pushed.send.is_empty() {
-                    sink(Event::Text(&pushed.send, tim))?;
-                }
-                if let Some(w) = pushed.stopped {
-                    stop = StopKind::Word;
-                    stopping_word = w;
-                    break;
-                }
-            }
-            if generated.len() >= budget {
-                break;
-            }
-            // The last pass evaluated this token already.
-            if let Some(&t) = kept.get(taken) {
-                taken += 1;
-                tok = t;
-                continue;
-            }
-            // Feeding `tok` takes position n + len - 1; the cache holds ctx_max.
-            if n + generated.len() > ctx_max {
-                truncated = true;
-                break;
-            }
-            tim.decodes += 1;
-            // A pass takes `rows` positions from there.
-            if rows > 1 && n + generated.len() + rows - 1 <= ctx_max {
-                let d = slot.advance(tok, &mut kept)?;
-                tim.book(d);
-                tim.n_past = n + generated.len() + kept.len() - 1;
-                tok = kept[0];
-                taken = 1;
-                continue;
-            }
-            let g = slot.next(tok, out(&mut logits))?;
-            tim.n_past = n + generated.len();
-            tok = choose(&mut sampler, g, &mut logits, &generated, banned);
-        }
-    }
-    if stop != StopKind::Word {
-        let tail = dec.flush();
-        let pushed = scan.push(&tail);
-        let mut rest = pushed.send;
-        if let Some(w) = pushed.stopped {
-            stop = StopKind::Word;
-            stopping_word = w;
-        } else {
-            rest.push_str(&scan.finish());
-        }
-        if !rest.is_empty() {
-            sink(Event::Text(&rest, tim))?;
-        }
-    }
-    tim.predicted_ms = ms_since(t1);
-    Ok(Outcome {
-        content: scan.text().to_owned(),
-        tokens: generated,
-        stop,
-        stopping_word,
-        truncated,
-        timings: tim.clone(),
-    })
+    let mut g = Gen::new(slot, factory, ids.len(), p);
+    let r = g.run(slot, ids, p, sink, tick);
+    timings_out.clone_from(g.timings());
+    r
 }
 
 #[cfg(test)]
@@ -1209,5 +1451,73 @@ mod cache_tests {
         )
         .expect("a generation");
         assert_eq!(log.lock().expect("log").replies, [Some(7), Some(0)]);
+    }
+}
+
+#[cfg(test)]
+mod slot_tests {
+    use std::sync::Arc;
+
+    use super::Slot;
+    use crate::engine::{Engine, EngineError, SlotRow, Tokenizer};
+    use crate::mock::MockEngine;
+
+    /// The two-slot mock whose steps of several slots answer nothing.
+    struct Mute(MockEngine);
+
+    impl Engine for Mute {
+        fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+            self.0.tokenizer()
+        }
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+            self.0.prefill(ids)
+        }
+        fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+            self.0.next(last, out)
+        }
+        fn reset(&mut self) -> Result<(), EngineError> {
+            self.0.reset()
+        }
+        fn ctx_max(&self) -> usize {
+            self.0.ctx_max()
+        }
+        fn describe(&self) -> String {
+            self.0.describe()
+        }
+        fn slots(&self) -> usize {
+            self.0.slots()
+        }
+        fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+            self.0.select_slot(slot)
+        }
+        fn step_slots(&mut self, _rows: &mut [SlotRow<'_>]) -> Result<(), EngineError> {
+            Ok(())
+        }
+    }
+
+    fn rows() -> Vec<SlotRow<'static>> {
+        (0..2)
+            .map(|slot| SlotRow {
+                slot,
+                last: 10,
+                logits: None,
+                next: 0,
+            })
+            .collect()
+    }
+
+    /// A step of several slots books each row's id on its own slot, and a
+    /// row the engine leaves unanswered is a named error, never id 0.
+    #[test]
+    fn a_step_of_several_slots_books_each_and_names_a_row_left_unanswered() {
+        let mut slot = Slot::with_slots(Box::new(MockEngine::new(64).with_slots(2)), 2);
+        let mut r = rows();
+        slot.step_slots(&mut r).expect("the mock answers");
+        assert_eq!((slot.held_of(0), slot.held_of(1)), (&[10][..], &[10][..]));
+        let mut mute = Slot::with_slots(Box::new(Mute(MockEngine::new(64).with_slots(2))), 2);
+        let e = mute
+            .step_slots(&mut rows())
+            .expect_err("a row left unanswered");
+        assert!(e.0.contains("answered slot 0 with id 4294967295"), "{e}");
     }
 }
