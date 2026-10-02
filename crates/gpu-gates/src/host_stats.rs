@@ -133,7 +133,7 @@ pub fn print_stats(probes: &[Probe], warm: usize) {
     Record::new(&record::STAT_SUMMARY_HOST)
         .u("steps", n)
         .f("leg_us_mean", mean)
-        .f("leg_us_p50", legs[n / 2])
+        .f("leg_us_p50", lower_median(&legs))
         .f("straggle_us_max", straggle_max)
         .f("host_slots_mean", slots as f64 / n as f64)
         .u("majflt", majflt)
@@ -141,4 +141,13 @@ pub fn print_stats(probes: &[Probe], warm: usize) {
         .u("vram_free_load", probes[0].vram_free)
         .u("vram_free_min", vram_free_min)
         .print();
+}
+
+/// The lower median of `sorted` (ascending, at least one value): the value at
+/// `(n − 1) / 2`, the convention of the go waits' p50 ([`GapSummary`]), so a
+/// summary's `_p50` fields mean one thing.
+#[must_use]
+pub fn lower_median(sorted: &[f64]) -> f64 {
+    assert!(!sorted.is_empty(), "lower_median of no values");
+    sorted[(sorted.len() - 1) / 2]
 }

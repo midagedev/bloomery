@@ -2243,7 +2243,10 @@ mod drive {
         Record::new(&record::STAT_SUMMARY)
             .u("steps", n)
             .f("leg_us_mean", mean)
-            .f("leg_us_p50", legs[n / 2])
+            .f(
+                "leg_us_p50",
+                bloomery_gpu_gates::host_stats::lower_median(&legs),
+            )
             .f("straggle_us_max", straggle_max)
             .f("host_slots_mean", slots as f64 / n as f64)
             .f("phi_mean", phi_mean)
