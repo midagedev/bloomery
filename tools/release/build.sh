@@ -26,7 +26,7 @@ fi
 
 GLIBC_FLOOR=2.34
 BINS=(bloomery-serve bloomery_serve_clef)
-DISPATCHED='^sha2::sha256::x86::digest_blocks$'
+DISPATCHED='^(sha2::sha256::x86::digest_blocks|sha1::compress::x86::digest_blocks)$'
 ALLOWED_NEEDED='^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2)$'
 if [ -n "$CHECK_ONLY" ]; then
   BIN_DIR=$CHECK_ONLY
@@ -61,7 +61,7 @@ for b in "${BINS[@]}"; do
     fail=1
   fi
 
-  # Instructions past x86-64-v3 may sit only in functions that run behind a runtime CPU check (sha2's SHA-NI arm,
+  # Instructions past x86-64-v3 may sit only in functions that run behind a runtime CPU check (sha2's and sha1's SHA-NI arms,
   # selected by cpufeatures); anywhere else they mean the host code was built for this box's CPU.
   past_v3=$(objdump -d --no-show-raw-insn -C "$f" | awk -v allow="$DISPATCHED" '
     /^[0-9a-f]+ <.*>:$/ { fn = $0; sub(/^[0-9a-f]+ </, "", fn); sub(/>:$/, "", fn); next }
