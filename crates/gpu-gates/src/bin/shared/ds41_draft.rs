@@ -74,17 +74,14 @@ pub fn open_dspark(
     let (draft_split, hp) = file;
     let target =
         Arc::new(Split::open(target).map_err(|e| format!("open {}: {e}", target.display()))?);
-    // The draft on the placement's tier card opens on that card's device.
-    let device = (place.draft_card() == Some(card))
-        .then(|| place.draft_device())
-        .flatten();
-    let mut d = CardDraft::open(loaded, draft_split, hp, target, (card, device))?;
+    let mut d = CardDraft::open(loaded, draft_split, hp, target, (card.name, card.device))?;
     let (free, total) = d.mem_info()?;
     let resident = d.resident_bytes() as u64;
     if let Some(reserve) = reserve.filter(|&r| resident > r) {
         return Err(format!(
-            "the DSpark draft took {resident} B on {card}, past the {reserve} B its plan reserved \
+            "the DSpark draft took {resident} B on {}, past the {reserve} B its plan reserved \
              there under --place {}",
+            card.name,
             place.name()
         )
         .into());

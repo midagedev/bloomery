@@ -39,6 +39,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 use gguf::Split;
+use model::placement::workstation::{self, DeviceId};
 use model::placement::{Device, ModelTensors, Plan, Role};
 use sampler::{Sampler, SamplerParams};
 use serve::{
@@ -335,46 +336,23 @@ pub fn placement_props(plan: &Plan<'_>, gpus: &[String]) -> Result<PlacementProp
     })
 }
 
-/// The nvidia-smi index of the card this process opens by the placement name
-/// `name` (a device whose name contains it, as the GPU loader finds its
-/// card): among nvidia-smi's devices, those so named, narrowed to
-/// `CUDA_VISIBLE_DEVICES` when it lists UUIDs. Exactly one, or an error that
-/// says what nvidia-smi listed.
-pub fn nvidia_smi_index(name: &str) -> Result<u32, String> {
+/// The nvidia-smi index of the card a plan's card `name` (resolved to
+/// `device` when the plan was, else found by `name`) opens on: the one
+/// visible device of this process's census, matched to nvidia-smi's list by
+/// its PCI bus id ([`workstation::listed_index`]).
+/// Two cards of one name are two buses, so each plan card names its own
+/// index; a card not in view, or a bus nvidia-smi does not list once, is an
+/// error that says what was listed.
+pub fn nvidia_smi_index(name: &str, device: Option<DeviceId>) -> Result<u32, String> {
+    let census = bloomery_gpu::census().map_err(|e| format!("the device census: {e}"))?;
     let out = Command::new("nvidia-smi")
-        .args(["--query-gpu=index,name,uuid", "--format=csv,noheader"])
+        .args(["--query-gpu=index,pci.bus_id", "--format=csv,noheader"])
         .output()
         .map_err(|e| format!("nvidia-smi: {e}"))?;
     if !out.status.success() {
         return Err(format!("nvidia-smi: {}", out.status));
     }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let visible: Option<Vec<String>> = std::env::var("CUDA_VISIBLE_DEVICES").ok().and_then(|v| {
-        let ids: Vec<String> = v.split(',').map(|s| s.trim().to_owned()).collect();
-        ids.iter().all(|s| s.starts_with("GPU-")).then_some(ids)
-    });
-    let named: Vec<u32> = text
-        .lines()
-        .filter_map(|line| {
-            let (index, rest) = line.split_once(',')?;
-            let (gpu_name, uuid) = rest.rsplit_once(',')?;
-            let uuid = uuid.trim();
-            let shown = visible
-                .as_ref()
-                .is_none_or(|v| v.iter().any(|id| uuid.starts_with(id.as_str())));
-            if !(gpu_name.contains(name) && shown) {
-                return None;
-            }
-            index.trim().parse().ok()
-        })
-        .collect();
-    match named.as_slice() {
-        &[index] => Ok(index),
-        _ => Err(format!(
-            "{} devices named like {name:?} are visible, not one; nvidia-smi listed:\n{text}",
-            named.len()
-        )),
-    }
+    workstation::listed_index(name, device, &census, &String::from_utf8_lossy(&out.stdout))
 }
 
 /// What the engine thread is asked to do.

@@ -14,7 +14,7 @@
 //!    the same plan with the tier card renamed to the A6000, so the stage and
 //!    the tier are two `Gpu`s on one card and the tier's rows cross no link;
 //! 3. the two cards, through the binaries' own open (`app::Loaded` over
-//!    `app::arch::deepseek41`'s `Open`, whose `tier_of` hangs the plan's tier
+//!    `app::arch::deepseek41`'s `Open`, whose `TierOpen::of_machine` hangs the plan's tier
 //!    card under the host tier).
 //!
 //! The loopback plan is refused unless every row's segments sit on the same

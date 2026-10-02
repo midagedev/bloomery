@@ -276,7 +276,8 @@ impl BreakEven {
     /// The break-even at `place`: the draft's gain a token times the rate a
     /// reset re-prefills at — the ubatch walk's under `a` and `gate` (plan
     /// (a)'s stands for the 3090's: the product is a ratio of one card's own
-    /// rates), a plain step's under `bp`, whose prompt runs by steps.
+    /// rates), a plain step's under `bp`, whose prompt runs ubatches too
+    /// (`Body38::resolve_prompt`) at a rate this table does not hold.
     fn of(place: Place38) -> BreakEven {
         let gain = 1.0 / PLAIN_TPS - 1.0 / DRAFTED_TPS;
         let rate = match place.kind {
@@ -1035,7 +1036,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let residency = residency38_at(&plan, a.place, set)?;
     let gpu = machine
         .all_cards()
-        .map(|c| nvidia_smi_index(&c.name).map(|i| format!("GPU{i}")))
+        .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
         .collect::<Result<Vec<_>, _>>()
         .and_then(|g| placement_props(&plan, &g));
     if let Err(e) = &gpu {

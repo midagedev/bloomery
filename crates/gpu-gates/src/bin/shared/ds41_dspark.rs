@@ -2,11 +2,13 @@
 //! (`BLOOMERY_DSPARK_MODEL`) and its card (`BLOOMERY_DSPARK_CARD`). The draft
 //! itself is the session's (`app::arch::deepseek41::CardDraft`).
 //!
-//! The draft's card is a placement card name, the 3090 when unset — plan
-//! (a)'s idle card. It may be the target's own card (the gate runs both on
-//! the 3090 under a card budget). Under a placement with an expert tier card
-//! (`--place bp`) the draft sits on the tier card, whose plan reserves its
-//! bytes ([`draft_reserve`]): the lever may only name that card.
+//! The draft's card is one card as a `--place` list word names it, found
+//! among this process's visible devices (`Place::draft_spec`): unset, the
+//! device of the fewest usable bytes — the 3090, plan (a)'s idle card. It
+//! may be the target's own card (the gate runs both on the 3090 under a card
+//! budget). Under a placement with an expert tier card (`--place bp`) the
+//! draft sits on the tier card, whose plan reserves its bytes
+//! ([`draft_reserve`]): the lever may only name that device.
 
 use std::path::PathBuf;
 
@@ -16,7 +18,7 @@ use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
 use model::arch::dspark::{self, DraftHparams};
-use model::placement::workstation;
+use model::placement::workstation::{self, CardSpec};
 
 /// The draft file: `$BLOOMERY_DSPARK_MODEL`, which the recipes export from
 /// the V4.1 profile's `DSPARK_MODEL` (`tools/ref/models/deepseek41.sh`).
@@ -40,32 +42,18 @@ pub fn draft_hparams() -> Result<(Split, DraftHparams), GateError> {
     Ok((draft, hp))
 }
 
-/// The draft's card under `place`: its tier card when it has one
-/// ([`Place::draft_card`]), which `BLOOMERY_DSPARK_CARD` may name and no
-/// other card; otherwise `BLOOMERY_DSPARK_CARD`, a placement card name, unset
-/// the 3090.
-pub fn draft_card(place: Place) -> Result<&'static str, GateError> {
-    let cards = [workstation::RTX_3090.name, workstation::A6000.name];
+/// The draft's card under `place` on this process's devices
+/// ([`Place::draft_spec`] of `BLOOMERY_DSPARK_CARD` and the census): the
+/// tier card when the placement has one, which the lever may name and no
+/// other device; otherwise the lever's card, unset the device of the fewest
+/// usable bytes (the 3090 here). The spec names its device.
+pub fn draft_card(place: Place) -> Result<CardSpec, GateError> {
     let set = match std::env::var("BLOOMERY_DSPARK_CARD") {
         Err(std::env::VarError::NotPresent) => None,
         Ok(v) => Some(v),
         Err(e) => return Err(format!("BLOOMERY_DSPARK_CARD: {e}").into()),
     };
-    match (place.draft_card(), set) {
-        (Some(tier), None) => Ok(tier),
-        (Some(tier), Some(v)) if v == tier => Ok(tier),
-        (Some(tier), Some(v)) => Err(format!(
-            "BLOOMERY_DSPARK_CARD={v:?} under --place {}: the draft sits on the tier card {tier}, \
-             whose plan reserves its bytes; unset the lever or name {tier}",
-            place.name()
-        )
-        .into()),
-        (None, None) => Ok(workstation::RTX_3090.name),
-        (None, Some(v)) => cards
-            .into_iter()
-            .find(|c| *c == v)
-            .ok_or_else(|| format!("BLOOMERY_DSPARK_CARD is one of {cards:?}, not {v:?}").into()),
-    }
+    place.draft_spec(set.as_deref(), &bloomery_gpu::census()?)
 }
 
 /// The reserve `place`'s plan makes for the DSpark draft `draft` on its

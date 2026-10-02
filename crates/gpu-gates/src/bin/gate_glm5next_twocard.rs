@@ -117,7 +117,11 @@
 //! 2`) names the cards the model runs on — `cards` the A6000 alone under
 //! `--place a` with no tier fields, the A6000 then the 3090 under `--place bp`
 //! with the tier's experts (`tier_experts` > 0) — as a V4.1 binary's load
-//! record names them (`generate::with_cards`). Two loads, one a process.
+//! record names them (`generate::with_cards`): the field read as
+//! `tools/bloomery/records.py` reads a csv field, each item exactly the
+//! driver name of the device the placement resolves to; the same check on
+//! the line with its first card's name grown by a letter inside the brackets
+//! is red. Two loads, one a process.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -1382,37 +1386,89 @@ mod gate {
             .find_map(|w| w.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
     }
 
+    /// The items of the csv field `key` on a record line, read by
+    /// `tools/bloomery/records.py`'s rule: the value is `[` items `]`, the
+    /// items split on `,` and trimmed, `[]` none; a line with no such field,
+    /// or a value not in brackets, is refused by name.
+    fn csv_field<'a>(line: &'a str, key: &str) -> Result<Vec<&'a str>, String> {
+        let v = field(line, key).ok_or_else(|| format!("no {key}= field"))?;
+        let inner = v
+            .strip_prefix('[')
+            .and_then(|v| v.strip_suffix(']'))
+            .ok_or_else(|| format!("{key}={v} is not a [..] csv value"))?
+            .trim();
+        Ok(if inner.is_empty() {
+            Vec::new()
+        } else {
+            inner.split(',').map(str::trim).collect()
+        })
+    }
+
+    /// Whether `line`'s `cards` are exactly `want`, in order: each the
+    /// driver's name of the device the placement resolved, each space
+    /// written `_` (`generate::with_cards`).
+    fn cards_named(line: &str, want: &[String]) -> Result<bool, String> {
+        Ok(csv_field(line, "cards")? == want.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    /// The record words of `place`'s cards on this process's devices: the
+    /// driver's name of each device it resolves to, spaces written `_`.
+    fn card_words(place: Place) -> Result<Vec<String>, GateError> {
+        let census = bloomery_gpu::census()?;
+        place
+            .on(&census)?
+            .card_specs()?
+            .iter()
+            .map(|s| {
+                census
+                    .iter()
+                    .find(|d| s.device.is_some_and(|dev| dev.uuid == d.uuid))
+                    .map(|d| d.name.replace(' ', "_"))
+                    .ok_or_else(|| format!("{}: no census device is the plan's", s.name).into())
+            })
+            .collect()
+    }
+
     /// `records` (module header): the cards each placement's load record
-    /// names, against the placement's card names in order.
+    /// names, read as records.py reads a csv field, against the driver names
+    /// of the devices the placement resolves to, in order; and the same
+    /// check on the line with its first card's name grown by one letter
+    /// inside the brackets, which must be red.
     fn records_arm() -> Result<bool, GateError> {
         let prompt = prompt()?;
         let ids = &prompt[..RECORD_TOKENS];
         let mut pass = true;
         for place in [Place::A, Place::Bp] {
-            let line = held("records", load_line(place.name(), ids).map(|l| {
-                let cards: Vec<&str> = field(&l, "cards").map_or_else(Vec::new, |c| c.split(',').collect());
-                let named = cards.len() == place.cards().len()
-                    && cards
-                        .iter()
-                        .zip(place.cards())
-                        .all(|(c, want)| c.contains(&want.replace(' ', "_")));
-                let tier = field(&l, "tier_experts").and_then(|v| v.parse::<u64>().ok());
-                let tier_ok = match place.tier_cards().is_empty() {
-                    true => tier.is_none() && field(&l, "tier_bytes").is_none(),
-                    false => tier.is_some_and(|n| n > 0),
-                };
-                let ok = named && tier_ok;
-                println!(
-                    "records --place {}: cards {cards:?} (want {:?}), tier_experts {tier:?}: {}",
-                    place.name(),
-                    place.cards(),
-                    verdict(ok)
-                );
-                if !ok {
-                    println!("  {l}");
-                }
-                ok
-            }));
+            let want = card_words(place)?;
+            let line = held(
+                "records",
+                load_line(place.name(), ids).map(|l| {
+                    let named = cards_named(&l, &want);
+                    let mutant = l.replacen(
+                        &format!("cards=[{}", want[0]),
+                        &format!("cards=[{}X", want[0]),
+                        1,
+                    );
+                    let mutant_red = mutant != l && cards_named(&mutant, &want) == Ok(false);
+                    let tier = field(&l, "tier_experts").and_then(|v| v.parse::<u64>().ok());
+                    let tier_ok = match place.tier_cards().is_empty() {
+                        true => tier.is_none() && field(&l, "tier_bytes").is_none(),
+                        false => tier.is_some_and(|n| n > 0),
+                    };
+                    let ok = named == Ok(true) && mutant_red && tier_ok;
+                    println!(
+                        "records --place {}: cards {:?} (want {want:?}), a mutant first card red \
+                     {mutant_red}, tier_experts {tier:?}: {}",
+                        place.name(),
+                        csv_field(&l, "cards"),
+                        verdict(ok)
+                    );
+                    if !ok {
+                        println!("  {l}");
+                    }
+                    ok
+                }),
+            );
             pass &= line;
         }
         Ok(pass)

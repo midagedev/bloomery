@@ -449,7 +449,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     }
     let gpu = machine
         .all_cards()
-        .map(|c| nvidia_smi_index(&c.name).map(|i| format!("GPU{i}")))
+        .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
         .collect::<Result<Vec<String>, String>>()
         .and_then(|g| placement_props(&plan, &g));
     if let Err(e) = &gpu {

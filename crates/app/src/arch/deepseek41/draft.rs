@@ -184,6 +184,11 @@ impl CardDraft<DraftBody> {
         self.card
     }
 
+    /// The device the draft runs on, as this process's census names it.
+    pub fn device(&self) -> Result<DeviceId, GpuError> {
+        self.gpu.device_id()
+    }
+
     /// `(free, total)` device bytes of the draft's card.
     pub fn mem_info(&mut self) -> Result<(usize, usize), GpuError> {
         self.on_card(|gpu, _| gpu.mem_info())

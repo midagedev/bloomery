@@ -17,10 +17,12 @@
 #   PLACE_LOAD_BIN   (place_arm_cards, optional) the binary whose checked-in schema reads it, default
 #                    records.py's (generate_ds41)
 #
-# The words: a is plan (a), on the card named A6000 (workstation::plan_a); gate the gate plan, on the 3090
-# (plan_gate); bp plan (b′), plan (a) on the A6000 with the 3090 its expert tier (plan_bp). One card (no
-# BLOOMERY_TIMING_CARDS) times the timing card alone, so a needs the A6000 as the timing card, gate the 3090,
-# and bp is refused. The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090) shows both cards to every arm: bp
+# The words: a is plan (a), on the largest visible card (workstation::ALIASES: the binary finds its cards by
+# device); gate the gate plan, on the one device named 3090 (plan_gate); bp plan (b′), plan (a) with the
+# next-largest card its expert tier (plan_bp): on this box the A6000, then the 3090. One card (no
+# BLOOMERY_TIMING_CARDS) times the timing card alone, and the protocol's a rows are the A6000's: a needs the
+# A6000 as the timing card (on the 3090 alone it would plan the gate plan's card under a's label), gate the
+# 3090 (on the A6000 alone the binary finds no 3090), and bp is refused. The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090) shows both cards to every arm: bp
 # loads both, a loads the A6000 and leaves the 3090 idle (place_arm_cards holds each a arm's load record to
 # the A6000 alone), and gate, a 3090-only row in the A6000+3090 table, is refused.
 
@@ -94,7 +96,7 @@ place_check() {
       [ -n "$GPU_A6000" ] || place_refuse "$a" "$what is plan (a), which loads on the A6000, and tools/ref/cards.sh resolved no A6000 UUID (${CARDS_ERROR:-no reason given})"
       if [ "$TIMING_GPU" != "$GPU_A6000" ]; then
         if [ -n "$GPU_3090" ] && [ "$TIMING_GPU" = "$GPU_3090" ]; then
-          place_refuse "$a" "$what is plan (a), which loads on the A6000, and the timing card is the 3090 (BLOOMERY_TIMING_GPU=$TIMING_GPU): $PLACE_BIN would refuse the arm; run it at gate"
+          place_refuse "$a" "$what is plan (a), which loads on the A6000, and the timing card is the 3090 (BLOOMERY_TIMING_GPU=$TIMING_GPU): $PLACE_BIN would plan a on the largest card in view, the 3090, the gate plan's card under a's label; run it at gate"
         fi
         place_refuse "$a" "$what is plan (a), which loads on the A6000, and the timing card is $TIMING_GPU, not the A6000 ($GPU_A6000)"
       fi

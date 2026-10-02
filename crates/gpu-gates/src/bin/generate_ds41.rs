@@ -37,7 +37,7 @@
 //! (`workstation::plan_gate`, the same on the 3090); `bp` is plan (b′)
 //! (`workstation::plan_bp`): plan (a) on the A6000 byte for byte, and the
 //! 3090 an expert tier under the host tier holding each layer's next ids
-//! (`app::arch::deepseek41::tier_of`), with the DSpark draft's reserve
+//! (`bloomery_gpu::host::tier::TierOpen::of_machine`), with the DSpark draft's reserve
 //! when the draft runs (its header's bytes, read before the load; the draft
 //! then sits on the 3090, and a `BLOOMERY_DSPARK_CARD` naming another card is
 //! refused), and the tier's prompt-batch bytes (its staging and tile scratch

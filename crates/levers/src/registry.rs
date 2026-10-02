@@ -869,10 +869,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         kind: Kind::Text,
         default: Unset::Means("the 3090"),
         doc: "`generate_ds41` and `bloomery-serve-ds41` under `BLOOMERY_DRAFT=dspark`: the \
-              placement card the DSpark draft loads on, by its name; it may be the target's \
-              own card. Any other name is refused by name. Under `--place bp` the draft sits \
-              on the expert tier card (the 3090), whose plan reserves its bytes, and a name \
-              other than that card's is refused.",
+              card the DSpark draft loads on, one card as a `--place` list word names it (a \
+              CUDA ordinal, `1` or `cuda1`, or a card name exactly one visible device \
+              carries); it may be the target's own card. Unset, the visible device of the \
+              fewest usable bytes (the 3090). A word no visible device answers, or a name two \
+              carry, is refused by name. Under `--place bp` the draft sits on the expert tier \
+              card (the 3090), whose plan reserves its bytes, and a word naming another device \
+              is refused.",
         site: Site::Direct {
             at: &[InPlace {
                 file: "crates/gpu-gates/src/bin/shared/ds41_dspark.rs",

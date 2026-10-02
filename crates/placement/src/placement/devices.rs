@@ -478,6 +478,53 @@ pub fn device_on_host(
     }
 }
 
+/// The index `nvidia-smi --query-gpu=index,pci.bus_id --format=csv,noheader`
+/// lists (`listed`) for the device a plan's card opens on in `census`
+/// ([`device_on_host`]): the one line whose bus id is that device's
+/// (`cuDeviceGetPCIBusId`), compared as numbers — the driver writes a
+/// four-digit domain (`0000:01:00.0`), nvidia-smi eight, in either case.
+/// Two cards of one name sit on two buses, so each card names its own
+/// index. A card not in view, and a bus nvidia-smi lists none or several
+/// times, are refused naming what was listed.
+pub fn listed_index(
+    name: &str,
+    device: Option<DeviceId>,
+    census: &[DeviceInfo],
+    listed: &str,
+) -> Result<u32, String> {
+    let ordinal = device_on_host(name, device, census).map_err(|e| e.to_string())?;
+    let bus = census
+        .iter()
+        .find(|d| d.ordinal == ordinal)
+        .map_or("", |d| d.pci_bus.as_str());
+    let key =
+        pci_key(bus).ok_or_else(|| format!("cuda{ordinal}'s PCI bus id {bus:?} reads as none"))?;
+    let at: Vec<u32> = listed
+        .lines()
+        .filter_map(|line| {
+            let (index, id) = line.split_once(',')?;
+            (pci_key(id) == Some(key)).then(|| index.trim().parse().ok())?
+        })
+        .collect();
+    match at.as_slice() {
+        &[index] => Ok(index),
+        _ => Err(format!(
+            "{} nvidia-smi devices are on cuda{ordinal}'s bus {bus} ({name}), not one; it \
+             listed:\n{listed}",
+            at.len()
+        )),
+    }
+}
+
+/// A PCI bus id `domain:bus:device.function` as its four hex numbers.
+fn pci_key(id: &str) -> Option<(u32, u32, u32, u32)> {
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+    let (domain, rest) = id.trim().split_once(':')?;
+    let (bus, rest) = rest.split_once(':')?;
+    let (dev, func) = rest.split_once('.')?;
+    Some((hex(domain)?, hex(bus)?, hex(dev)?, hex(func)?))
+}
+
 /// A plan's card that is not one visible device ([`device_on_host`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CardNotInView {
@@ -556,7 +603,7 @@ impl std::error::Error for CardNotInView {}
 mod tests {
     use super::{
         ALIASES, CardNotInView, DeviceInfo, Pick, PickError, PickWhy, WordError, census_usable,
-        device_on_host, resolve, spec_of_device, word_picks, workstation_spec,
+        device_on_host, listed_index, resolve, spec_of_device, word_picks, workstation_spec,
     };
     use crate::placement::PlacementError;
     use crate::placement::workstation::{
@@ -931,6 +978,41 @@ mod tests {
                 "the plan's device cuda1 (A6000) is not in view (visible: cuda0 {NAME_3090} \
                  0000:41:00.0"
             )),
+            "{e}"
+        );
+    }
+
+    /// Two cards of one name: the census's two devices with the driver's bus
+    /// ids (four-digit domain, upper-case hex), and nvidia-smi's list of the
+    /// same buses (eight-digit domain, lower case) in its own order.
+    fn twins() -> (Vec<DeviceInfo>, &'static str) {
+        let mut c = census(&[(NAME_3090, TOTAL_3090), (NAME_3090, TOTAL_3090)]);
+        c[0].pci_bus = "0000:4B:00.0".to_string();
+        c[1].pci_bus = "0000:01:00.0".to_string();
+        (c, "0, 00000000:01:00.0\n1, 00000000:4b:00.0\n")
+    }
+
+    /// Each card of two of one name names its own nvidia-smi index, by its
+    /// device's bus: cuda0 is nvidia-smi's 1 and cuda1 its 0.
+    #[test]
+    fn the_listed_index_follows_the_device_bus() {
+        let (c, listed) = twins();
+        let at = |o: usize| listed_index("3090", Some(c[o].device()), &c, listed);
+        assert_eq!(at(0), Ok(1));
+        assert_eq!(at(1), Ok(0));
+    }
+
+    /// A census-free card of a name two devices carry, and a bus nvidia-smi
+    /// does not list, are refused by name.
+    #[test]
+    fn an_ambiguous_name_and_an_unlisted_bus_are_refused() {
+        let (c, listed) = twins();
+        let e = listed_index("3090", None, &c, listed).expect_err("two of one name");
+        assert!(e.contains("3090"), "{e}");
+        let e = listed_index("3090", Some(c[0].device()), &c, "0, 00000000:01:00.0\n")
+            .expect_err("bus 4b unlisted");
+        assert!(
+            e.starts_with("0 nvidia-smi devices are on cuda0's bus 0000:4B:00.0"),
             "{e}"
         );
     }

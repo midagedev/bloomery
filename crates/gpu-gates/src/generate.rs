@@ -809,3 +809,197 @@ mod tests {
         );
     }
 }
+
+/// The DSpark draft's card, by device.
+impl Place {
+    /// The card a DSpark draft loads on under this placement, on `census`:
+    /// `set` (`BLOOMERY_DSPARK_CARD`) is one card as a `--place` list word
+    /// names one — a CUDA ordinal (`1`, `cuda1`) or a card name exactly one
+    /// visible device carries ([`workstation::resolve`]). Under a placement
+    /// with a tier card the draft sits on the first tier card, whose plan
+    /// reserves its bytes: `set` may name that device and no other. With no
+    /// tier, `set`'s card, it may be the stage's own; unset, the visible
+    /// device of the fewest usable bytes, ties to the higher ordinal — the
+    /// 3090 on this workstation wherever it is in view (beside the A6000
+    /// under `a`, the stage itself under `gate`), and on two cards of one
+    /// name the one that is not plan (a)'s stage. Each refusal by name.
+    pub fn draft_spec(
+        self,
+        set: Option<&str>,
+        census: &[DeviceInfo],
+    ) -> Result<CardSpec, GateError> {
+        let lever = |v: &str, e: &dyn std::fmt::Display| -> GateError {
+            format!("BLOOMERY_DSPARK_CARD={v:?}: {e}").into()
+        };
+        let named = match set {
+            None => None,
+            Some(v) => {
+                let picks = workstation::word_picks(v, 0).map_err(|e| match e {
+                    workstation::WordError::TooManyTiers { .. } => lever(
+                        v,
+                        &"the lever names one card (a CUDA ordinal or a card name), not a list",
+                    ),
+                    e => lever(v, &e),
+                })?;
+                let spec = workstation::resolve(&picks, census).map_err(|e| lever(v, &e))?;
+                Some((v, spec[0]))
+            }
+        };
+        let on = |s: CardSpec| s.device.map_or_else(|| "?".to_string(), |d| d.to_string());
+        if self.n > 1 {
+            let placed = if self.resolved {
+                self
+            } else {
+                self.on(census)?
+            };
+            let tier = placed.card_specs()?[1];
+            return match named {
+                None => Ok(tier),
+                Some((_, s)) if s.device == tier.device => Ok(tier),
+                Some((v, s)) => Err(format!(
+                    "BLOOMERY_DSPARK_CARD={v:?} is {} ({}) under --place {}: the draft sits on \
+                     the tier card {} ({}), whose plan reserves its bytes; unset the lever or \
+                     name that card",
+                    on(s),
+                    s.name,
+                    self.name(),
+                    on(tier),
+                    tier.name
+                )
+                .into()),
+            };
+        }
+        if let Some((_, s)) = named {
+            return Ok(s);
+        }
+        let last = census
+            .len()
+            .checked_sub(1)
+            .and_then(|k| u8::try_from(k).ok())
+            .ok_or_else(|| {
+                format!(
+                    "the DSpark draft's card: {} visible devices (visible: {})",
+                    census.len(),
+                    workstation::visible(census)
+                )
+            })?;
+        let spec = workstation::resolve(&[Pick::Rank(last)], census)
+            .map_err(|e| format!("the DSpark draft's card: {e}"))?;
+        Ok(spec[0])
+    }
+}
+
+#[cfg(test)]
+mod draft_card_tests {
+    use model::placement::workstation::{A6000, DeviceInfo, RTX_3090};
+
+    use super::Place;
+
+    /// A fake census of devices by short name, each its measured total.
+    fn census(names: &[&str]) -> Vec<DeviceInfo> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let (name, total_bytes) = match *n {
+                    "3090" => ("NVIDIA GeForce RTX 3090", 25_351_356_416),
+                    "A6000" => ("NVIDIA RTX A6000", 50_952_536_064),
+                    other => panic!("no fake device {other}"),
+                };
+                DeviceInfo {
+                    ordinal: u32::try_from(i).expect("small"),
+                    name: name.to_string(),
+                    total_bytes,
+                    uuid: [u8::try_from(i).expect("small") + 1; 16],
+                    pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
+                }
+            })
+            .collect()
+    }
+
+    /// `BLOOMERY_DSPARK_CARD`'s card on a census ([`Place::draft_spec`]):
+    /// unset, the 3090 wherever it is in view (beside the A6000 under `a`,
+    /// the stage under `gate`, the tier under `bp`), in both enumeration
+    /// orders; set, an ordinal or a name one device carries, the tier's
+    /// device alone under `bp`; on two cards of one name, the non-stage one
+    /// unset and either by its ordinal.
+    #[test]
+    fn the_draft_card_is_found_by_device() {
+        let at = |p: Place, set: Option<&str>, c: &[DeviceInfo]| {
+            p.draft_spec(set, c)
+                .map(|s| (s.name, s.device.map(|d| d.ordinal)))
+                .map_err(|e| e.to_string())
+        };
+        for order in [["3090", "A6000"], ["A6000", "3090"]] {
+            let c = census(&order);
+            let o = |n: &str| {
+                Some(u32::try_from(order.iter().position(|m| *m == n).expect(n)).expect("small"))
+            };
+            for p in [Place::A, Place::Gate, Place::Bp] {
+                assert_eq!(
+                    at(p, None, &c),
+                    Ok((RTX_3090.name, o("3090"))),
+                    "{}",
+                    p.name()
+                );
+            }
+            assert_eq!(
+                at(Place::A, Some("A6000"), &c),
+                Ok((A6000.name, o("A6000")))
+            );
+            assert_eq!(
+                at(Place::Gate, Some("a6000"), &c),
+                Ok((A6000.name, o("A6000")))
+            );
+            let ordinal = format!("cuda{}", o("A6000").expect("A6000"));
+            assert_eq!(
+                at(Place::A, Some(&ordinal), &c),
+                Ok((A6000.name, o("A6000")))
+            );
+            let tier = o("3090").expect("3090").to_string();
+            assert_eq!(
+                at(Place::Bp, Some(&tier), &c),
+                Ok((RTX_3090.name, o("3090")))
+            );
+            assert_eq!(
+                at(Place::Bp.on(&c).expect("bp"), Some("3090"), &c),
+                Ok((RTX_3090.name, o("3090")))
+            );
+            let e = at(Place::Bp, Some("A6000"), &c).expect_err("the stage under bp");
+            assert!(
+                e.starts_with("BLOOMERY_DSPARK_CARD=\"A6000\" is cuda")
+                    && e.contains("the draft sits on the tier card"),
+                "{e}"
+            );
+        }
+        let one = census(&["3090"]);
+        assert_eq!(at(Place::Gate, None, &one), Ok((RTX_3090.name, Some(0))));
+        assert_eq!(at(Place::A, None, &one), Ok((RTX_3090.name, Some(0))));
+        let e = at(Place::A, Some("A6000"), &one).expect_err("no A6000");
+        assert!(
+            e.starts_with("BLOOMERY_DSPARK_CARD=\"A6000\": no visible device is A6000"),
+            "{e}"
+        );
+        let two = census(&["3090", "3090"]);
+        assert_eq!(at(Place::A, None, &two), Ok((RTX_3090.name, Some(1))));
+        assert_eq!(at(Place::A, Some("0"), &two), Ok((RTX_3090.name, Some(0))));
+        assert_eq!(
+            at(Place::Bp, Some("cuda1"), &two),
+            Ok((RTX_3090.name, Some(1)))
+        );
+        let e = at(Place::A, Some("3090"), &two).expect_err("two of one name");
+        assert!(e.contains("2 visible devices carry the name 3090"), "{e}");
+        let e = at(Place::Bp, Some("cuda0"), &two).expect_err("the stage of two");
+        assert!(e.contains("the draft sits on the tier card"), "{e}");
+        for (v, want) in [
+            ("a6000+3090", "the lever names one card"),
+            ("4090", "names the card \"4090\""),
+            ("cuda7", "no visible device is cuda7"),
+        ] {
+            let e = at(Place::A, Some(v), &census(&["A6000", "3090"])).expect_err(v);
+            assert!(e.contains(want), "{v}: {e}");
+        }
+        let e = at(Place::A, None, &[]).expect_err("no device");
+        assert!(e.contains("0 visible devices"), "{e}");
+    }
+}

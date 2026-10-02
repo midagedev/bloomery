@@ -11,8 +11,8 @@ use std::ops::Range;
 
 pub use super::devices::{
     ALIASES, CardNotInView, DeviceId, DeviceInfo, ORDINALS, Pick, PickError, PickWhy, WordError,
-    census_usable, device_on_host, label, resolve, spec_of_device, visible, word_picks,
-    workstation_spec,
+    census_usable, device_on_host, label, listed_index, resolve, spec_of_device, visible,
+    word_picks, workstation_spec,
 };
 use super::{Card, Host, Machine, PlacementError, Plan};
 

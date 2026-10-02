@@ -75,7 +75,7 @@ impl Open for Body {
     }
 
     /// The stage card, card 0, and the plan's expert tier cards
-    /// ([`tier_of`]).
+    /// ([`TierOpen::of_machine`]).
     fn open(
         file: Split,
         inputs: &PlanInputs,
@@ -86,7 +86,7 @@ impl Open for Body {
             hp: inputs.hp.clone(),
             levers: cfg.open.body,
         };
-        Body::open_placed_tiered(file, plan, 0, tier_of(plan.machine), &meta)
+        Body::open_placed_tiered(file, plan, 0, TierOpen::of_machine(plan.machine), &meta)
     }
 
     /// The batch's buffers under the batched schedule (with the card-timing
@@ -102,14 +102,6 @@ impl Open for Body {
         }
         Ok(true)
     }
-}
-
-/// The expert tier cards `machine` names, as the body opens them, in tier
-/// order ([`TierOpen::of_machine`]). Empty without a tier; the body refuses
-/// more than the host tier serves by name, before any upload.
-#[must_use]
-pub fn tier_of(machine: &Machine) -> Vec<TierOpen> {
-    TierOpen::of_machine(machine)
 }
 
 impl Prompt for Body {

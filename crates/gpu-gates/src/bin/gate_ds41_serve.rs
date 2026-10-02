@@ -161,7 +161,7 @@ mod gate {
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::{self, PlanInputs};
     use model::arch::deepseek41::plan::Planner;
-    use model::placement::{PlanLevers, workstation};
+    use model::placement::{Card, PlanLevers, workstation};
     use refset::arch::deepseek41::VERIFIED_POSITIONS;
     use serde_json::{Value, json};
 
@@ -1079,10 +1079,14 @@ mod gate {
         let (_, hp) = dspark::draft_hparams()?;
         let draft_path = dspark::draft_path()?;
         let draft_card = dspark::draft_card(Place::Gate)?;
-        let draft_device = format!("GPU{}", nvidia_smi_index(draft_card)?);
+        let draft_device = format!(
+            "GPU{}",
+            nvidia_smi_index(draft_card.name, draft_card.device)?
+        );
         println!(
-            "draft {} on {draft_card} ({draft_device}), window {}",
+            "draft {} on {} ({draft_device}), window {}",
             draft_path.display(),
+            draft_card.name,
             hp.window
         );
         std::fs::create_dir_all(&a.dir)?;
@@ -1330,10 +1334,10 @@ mod gate {
         ) else {
             return Err("plan (b′) is not one stage card and one tier card".into());
         };
-        let gpu = |name: &str| -> Result<String, GateError> {
-            Ok(format!("GPU{}", nvidia_smi_index(name)?))
+        let gpu = |c: &Card| -> Result<String, GateError> {
+            Ok(format!("GPU{}", nvidia_smi_index(&c.name, c.device)?))
         };
-        let (stage_device, tier_device) = (gpu(&stage.name)?, gpu(&tier.name)?);
+        let (stage_device, tier_device) = (gpu(stage)?, gpu(tier)?);
         let stage_bytes = card.dense_bytes + card.expert_bytes;
         let tier_bytes = tcard.dense_bytes + tcard.expert_bytes;
         let host_bytes = plan.host.expert_bytes + plan.host.table_bytes;

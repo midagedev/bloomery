@@ -994,6 +994,7 @@ mod soak {
     }
 
     /// The card `CUDA_VISIBLE_DEVICES` names, refused unless it is one A6000.
+    /// The A6000 is the protocol's card (its plan (a) is what the soak samples), not a plan pick.
     fn a6000_uuid() -> Result<String, GateError> {
         let want = std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default();
         let out = Command::new("nvidia-smi")

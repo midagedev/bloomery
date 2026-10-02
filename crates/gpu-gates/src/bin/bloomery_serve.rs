@@ -19,9 +19,10 @@
 //! another file — is refused by name (`bloomery_gpu_gates::model_file`).
 //! With no `--model`, the architecture of the file's first shard picks the
 //! seat: deepseek41 and deepseek4 the ds41 seat, qwen4exp the qwen38 seat,
-//! qwen3moe and qwen35moe the qwen3 seat, glm5next the glm seat; a file
-//! whose architecture does not match an explicit `--model` is refused by
-//! name before any load. `--version` prints this crate's version and the
+//! qwen3moe and qwen35moe the qwen3 seat, glm5next the glm seat; a qwen35
+//! file (Clef's backbone) is refused naming `bloomery_serve_clef`, which
+//! serves it with its head, and a file whose architecture does not match an
+//! explicit `--model` is refused by name before any load. `--version` prints this crate's version and the
 //! build's commit and exits. Each seat's flags, records, `/props` fields
 //! and exit codes are its module's doc; `bloomery-serve-ds41` and
 //! `bloomery-serve-qwen38` are this binary's ds41 and qwen38 seats alone.
@@ -153,15 +154,27 @@ mod drive {
     /// The seat the model file's ([`ref_model_path`]) first shard holds,
     /// with its `general.architecture` string: `qwen4exp` by its name (which
     /// [`Arch`] does not list), else [`Arch::detect`]'s. Any other file is
-    /// refused by name — this server serves four seats. A qwen35moe file
-    /// (Qwen3.6) is the qwen3 seat's: the qwen38 seat's body is qwen4exp's,
-    /// whose plan refuses its geometry by name before the server listens.
+    /// refused by name — this server serves four seats; a `qwen35` file
+    /// (Clef's backbone) naming the binary that serves it,
+    /// `bloomery_serve_clef`. A qwen35moe file (Qwen3.6) is the qwen3 seat's:
+    /// the qwen38 seat's body is qwen4exp's, whose plan refuses its geometry
+    /// by name before the server listens.
     fn seat_of_file() -> Result<(Model, String), GateError> {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let arch = split.architecture().map(str::to_owned);
         let seat = match arch.as_deref() {
             Some("qwen4exp") => Model::Qwen38,
+            Some("qwen35") => {
+                return Err(format!(
+                    "{} is a qwen35 file, Clef's backbone, which {NAME} does not serve: \
+                     bloomery_serve_clef serves it with Clef's joint schema head \
+                     (bloomery_serve_clef --model <gguf> --head <joint_head.safetensors>, or \
+                     --hf <repo>[:<quant>], which fetches the head)",
+                    path.display()
+                )
+                .into());
+            }
             _ => {
                 let first = split
                     .shard(0)

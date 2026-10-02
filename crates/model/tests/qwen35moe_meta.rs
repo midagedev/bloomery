@@ -64,11 +64,16 @@ const COVERAGE_Q4KM: &[&str] = &["a tool-call parser for this template"];
 
 // PIN(2026-09-27): the same for the UD-Q4_K_XL file, with its Q8_0 and Q5_K format items, which
 // Body35 does not read.
+// PIN(2026-10-03): the type pins split by body (Body35 its own program, its pins its sites' types,
+// gpu/src/arch/qwen3moe/body35.rs PROJ, EMBED, HEAD_TY, ROUTED, ROUTED_DOWN): Body35 launches q8_0
+// at the head, the embedding and every attention and delta-rule matrix, so those three items left;
+// it joins each shared expert into its layer's routed stacks, of one type, q4_K gate and up and
+// q4_K or q6_K down, so this file's q8_0 shared experts on every layer are two items. Red on the
+// tree before the split: it lists the three q8_0 items and not the shared expert's two.
 const COVERAGE_UD: &[&str] = &[
-    "q8_0 output head (the head reads q6_K)",
-    "q8_0 token embedding (the card reads q4_K rows)",
-    "q8_0 attention matrices (the body reads q4_K and q6_K): 0-39",
     "q5_K routed experts on a card: 0-33,35-37",
+    "q8_0 shared expert down, joined into the routed stack (the body reads q4_K and q6_K): 0-39",
+    "q8_0 shared expert gate and up, joined into the routed stacks (the body reads q4_K): 0-39",
     "a tool-call parser for this template",
 ];
 

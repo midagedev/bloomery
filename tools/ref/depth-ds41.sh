@@ -139,15 +139,17 @@
 # A place= on a reference or server arm, a word outside a|gate|bp, an empty one and place given twice are
 # refused by name before anything runs (tools/ref/arm-place.sh, shared with depth-glm5next.sh). The
 # [config] line names the placements (with a place= arm, a `placements` line), every such row names its
-# arm's (`place <p>`), and a row whose SMOKE footer names another placement is a FAIL row. Plan (a) loads
-# on the card named A6000 and the gate plan on the one named 3090 (workstation::plan_a, plan_gate: the card
-# is found by name), and under one card the arms see the timing card only, so a placement whose card is not
-# the timing card (BLOOMERY_TIMING_GPU, timing-card.sh) is refused (64) before the lease and before a dry
-# run's command lines; a and gate arms cannot share one such run. With the 3090 as the timing card the
+# arm's (`place <p>`), and a row whose SMOKE footer names another placement is a FAIL row. The binary finds
+# its cards by device (workstation::ALIASES): plan (a) on the largest visible card, the gate plan on the one
+# device named 3090. Under one card the arms see the timing card only, so a plans on whichever card that
+# is; the protocol's a rows are the A6000's and its gate rows the 3090's, so a placement whose protocol card
+# is not the timing card (BLOOMERY_TIMING_GPU, timing-card.sh) is refused (64) before the lease and before a
+# dry run's command lines: a under the 3090 would be the gate plan's card under a's label, gate under the
+# A6000 finds no 3090. a and gate arms cannot share one such run. With the 3090 as the timing card the
 # profile sizes the references' --n-cpu-moe for its 24 GB (tools/ref/models/deepseek41.sh, LCPP_NCMOE). bp
-# is plan (b′) (workstation::plan_bp: plan (a) on the A6000, the 3090 its expert tier, the DSpark draft
-# beside the tier), which loads both cards: it runs only in the two-card mode (Two cards, below), and
-# outside it is refused (64). What follows describes plan (a).
+# is plan (b′) (workstation::plan_bp: plan (a) on the largest card, the next-largest its expert tier, the
+# DSpark draft beside the tier; here the A6000 and the 3090), which loads both cards: it runs only in the
+# two-card mode (Two cards, below), and outside it is refused (64). What follows describes plan (a).
 # Ours is plan (a): every layer and the head on the A6000, each routed layer's experts
 # [0, n_l) on the card (n_l 63-64 of 384, the budget's), the rest on the host tier — the plan line
 # generate_ds41 prints. ik moves experts by tensor, and a layer's 384 experts are one tensor, so it

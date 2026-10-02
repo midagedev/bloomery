@@ -421,7 +421,7 @@ fn print_plan(
     }
     let gpus: Result<Vec<String>, String> = machine
         .all_cards()
-        .map(|c| nvidia_smi_index(&c.name).map(|i| format!("GPU{i}")))
+        .map(|c| nvidia_smi_index(&c.name, c.device).map(|i| format!("GPU{i}")))
         .collect();
     let placement = gpus.and_then(|g| placement_props(&plan, &g));
     if let Err(e) = &placement {
@@ -797,7 +797,11 @@ impl Seat for V41 {
             }
             Served::Dspark(spec) => {
                 let d = spec.draft();
-                let device = nvidia_smi_index(d.card()).ok().map(|i| format!("GPU{i}"));
+                let device = d
+                    .device()
+                    .ok()
+                    .and_then(|dev| nvidia_smi_index(d.card(), Some(dev)).ok())
+                    .map(|i| format!("GPU{i}"));
                 let path = dspark::draft_path().ok();
                 let file = path
                     .as_deref()
