@@ -1,7 +1,8 @@
 //! The GPU output head: `result_norm → lm_head → argmax` as one capturable
 //! sequence over resident scratch (docs/gpu-design.md decisions 4 and 6). No
 //! kernels of its own — the chain is the gated `rms_norm`, then for a Q6_K
-//! lm_head the shared q8_1 quantizer and the Q6_K gemv, then `argmax_fault`,
+//! or Q4_K lm_head the shared q8_1 quantizer and that type's gemv, then
+//! `argmax_fault`,
 //! for a Q8_0 one the f32-activation Q8_0 gemv, then `argmax_finite_fault`,
 //! exactly as the block path launches them, so their gates are this chain's
 //! gates. The Q6_K head's quantizer refuses a non-finite input; the Q8_0 head
@@ -47,9 +48,11 @@ fn head_gain(w: &Weights) -> Result<&DeviceBuffer<f32>, GpuError> {
 }
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
-/// Q6_K word plane over q8_1 rows, or Q8_0's two planes over the f32 rows.
+/// Q6_K or Q4_K word plane over q8_1 rows, or Q8_0's two planes over the
+/// f32 rows.
 enum OutW<'a> {
     Q6K(&'a DeviceTensor<u32>),
+    Q4K(&'a DeviceTensor<u32>),
     Q8_0 {
         qs: &'a DeviceTensor<u32>,
         d: &'a DeviceTensor<u16>,
@@ -60,7 +63,7 @@ impl OutW<'_> {
     /// Its rows: the vocabulary.
     fn rows(&self) -> usize {
         match self {
-            OutW::Q6K(w) => w.rows(),
+            OutW::Q6K(w) | OutW::Q4K(w) => w.rows(),
             OutW::Q8_0 { d, .. } => d.rows(),
         }
     }
@@ -71,18 +74,17 @@ impl OutW<'_> {
 /// different gemv, and a silent plane reuse would misread its bytes.
 fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
     match w.get("output.weight") {
-        Some(DevWeight::KQuant { ty, w, k }) => {
-            if *ty != GgmlType::Q6_K {
-                return Err(GpuError::shape(
-                    "head_out_w",
-                    format!(
-                        "output.weight is {ty}, want Q6_K or Q8_0 (the gemvs \
-                     this head launches read those rows)"
-                    ),
-                ));
-            }
-            Ok((OutW::Q6K(w), *k))
-        }
+        Some(DevWeight::KQuant { ty, w, k }) => match ty {
+            GgmlType::Q6_K => Ok((OutW::Q6K(w), *k)),
+            GgmlType::Q4_K => Ok((OutW::Q4K(w), *k)),
+            _ => Err(GpuError::shape(
+                "head_out_w",
+                format!(
+                    "output.weight is {ty}, want Q6_K, Q4_K or Q8_0 (the gemvs \
+                 this head launches read those rows)"
+                ),
+            )),
+        },
         Some(DevWeight::Q8_0 { qs, d, k }) => Ok((OutW::Q8_0 { qs, d }, *k)),
         Some(_) => Err(GpuError::tensor(
             "head_out_w",
@@ -103,7 +105,7 @@ fn head_out_w(w: &Weights) -> Result<(OutW<'_>, usize), GpuError> {
 fn head_q6k_w(w: &Weights) -> Result<&DeviceTensor<u32>, GpuError> {
     match head_out_w(w)?.0 {
         OutW::Q6K(w) => Ok(w),
-        OutW::Q8_0 { .. } => Err(GpuError::tensor(
+        OutW::Q4K(_) | OutW::Q8_0 { .. } => Err(GpuError::tensor(
             "head_q6k_w",
             "output.weight",
             "a Q6_K word plane: the tail this chain hands the head reads Q6_K rows",
@@ -285,7 +287,8 @@ impl Head {
     }
 
     /// Enqueue the whole head for the rows in `x`: rms_norm → quantize_q8_1
-    /// → gemv_q6k → argmax_fault (`argmax_rows_fault` when `m > 1`), or for
+    /// → gemv_q6k (gemv_q4k for a Q4_K lm_head) → argmax_fault
+    /// (`argmax_rows_fault` when `m > 1`), or for
     /// a Q8_0 lm_head q8_0_gemv over the normed f32 rows → argmax_finite_fault
     /// (`argmax_rows_finite_fault` when `m > 1`), the argmax copying the fault
     /// word after the tokens. Pure enqueues — no allocation, no
@@ -299,6 +302,10 @@ impl Head {
             OutW::Q6K(out_w) => {
                 gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
                 gpu.enqueue_gemv_q6k(out_w, &self.act, &mut self.logits)?;
+            }
+            OutW::Q4K(out_w) => {
+                gpu.enqueue_quantize_q8_1_head(rows, &mut self.act)?;
+                gpu.enqueue_gemv_q4k(out_w, &self.act, &mut self.logits)?;
             }
             OutW::Q8_0 { qs, d } => {
                 gpu.q8f32()

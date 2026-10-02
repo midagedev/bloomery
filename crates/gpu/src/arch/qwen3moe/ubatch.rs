@@ -118,14 +118,12 @@ const _: () = assert!(UBATCH as u64 == model::arch::qwen35moe::place::UBATCH_PLA
 /// The GEMM's type for a qwen3moe projection, a K-quant (the qwen3moe load
 /// admits no other); another type is refused by name.
 fn gemm_ty(ty: SiteTy) -> Result<GemmWeight, GpuError> {
-    match ty {
-        SiteTy::Q4K => Ok(GemmWeight::Q4K),
-        SiteTy::Q6K => Ok(GemmWeight::Q6K),
-        SiteTy::Q8_0 | SiteTy::F32 => Err(GpuError::shape(
+    ty.gemm_weight().ok_or_else(|| {
+        GpuError::shape(
             "qwen3moe::ubatch",
             format!("a {ty} projection; the qwen3moe ubatch runs K-quants"),
-        )),
-    }
+        )
+    })
 }
 
 /// The ubatch arena, in chain order: every intermediate of one layer for up

@@ -271,7 +271,7 @@ curl -s http://127.0.0.1:8091/v1/systemone -d '{"model": "clef-flash",
                  "calendar": "Read or write events", "none": "Answer directly"}}}}'
 ```
 
-`Cloudflare_clef-flash-Q4_K_M.gguf` from the same upload runs too (smaller, a faster prompt, a little further from the release's probabilities). The backbone reads Q4_K, Q6_K, Q8_0 and F32 weights; the upload's smaller files carry other types (Q5_K, Q3_K, the IQ types), which it refuses by name before loading.
+Every K-quant file of the same upload runs too, down to `Cloudflare_clef-flash-Q3_K_S.gguf` (4.26 GB); how close each one's answers are to the release's: [`tools/ref/clef/agreement.md`](../tools/ref/clef/agreement.md). The backbone reads Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 weights; the upload's IQ, Q2_K and Q4_0/Q4_1 files carry other types, which it refuses by name before loading.
 
 The request and the response are the release's SystemOne format (its `README.md`): question types `choice`, `noul` and `score`, and per question the chosen option with its probabilities. Each response adds `timings` (`prompt_n`, `prompt_ms`, `head_ms`, `cache_n`). `GET /props` names the engine, the build, the model file, its quant and the head file. Flags: `--host` (default `127.0.0.1`), `--port` (default 8091), `--ctx` (default 16384, the release's `max_length`), `--head-config` (default: `joint_head_config.json` beside `--head`). It serves one request at a time and takes text states only.
 

@@ -179,11 +179,17 @@ fn all_q4k(tys: &[SiteTy]) -> bool {
     tys.iter().all(|t| *t == SiteTy::Q4K)
 }
 
+/// Whether `ty` is Q4_K or Q6_K: the two types the fused groups' lead
+/// matrix (a q·k·v's v, a delta q·k·v) and the slots' down `_sel` launch.
+fn q4k_or_q6k(ty: SiteTy) -> bool {
+    matches!(ty, SiteTy::Q4K | SiteTy::Q6K)
+}
+
 impl GqaPlan {
-    /// The gemv arm's fused q·k·v: Q4_K q and k with a K-quant v (a Q6_K v
-    /// in its own gemv); otherwise each projection launches alone.
+    /// The gemv arm's fused q·k·v: Q4_K q and k with a Q4_K or Q6_K v (a
+    /// Q6_K v in its own gemv); otherwise each projection launches alone.
     pub(super) fn qkv_fused(&self) -> bool {
-        all_q4k(&[self.q_ty, self.k_ty]) && self.v_ty.kquant()
+        all_q4k(&[self.q_ty, self.k_ty]) && q4k_or_q6k(self.v_ty)
     }
 
     /// The gemv arm's output projection with the residual add folded in: a
@@ -194,11 +200,11 @@ impl GqaPlan {
 }
 
 impl DeltaPlan {
-    /// The gemv arm's two input launches: a K-quant q·k·v projection
+    /// The gemv arm's two input launches: a Q4_K or Q6_K q·k·v projection
     /// (a Q6_K one in its own gemv) and Q4_K `z`, β and α; otherwise each
     /// projection launches alone.
     pub(super) fn input_fused(&self) -> bool {
-        self.qkv_ty.kquant() && all_q4k(&[self.gate_ty, self.beta_ty, self.alpha_ty])
+        q4k_or_q6k(self.qkv_ty) && all_q4k(&[self.gate_ty, self.beta_ty, self.alpha_ty])
     }
 
     /// The gemv arm's output projection with the residual add folded in: a
@@ -213,6 +219,13 @@ impl FfnPlan {
     /// otherwise each launches alone and the SwiGLU after them.
     pub(super) fn gate_up_fused(&self) -> bool {
         all_q4k(&[self.gate_ty, self.up_ty])
+    }
+
+    /// The gemv arm's down as the slots' `_sel` over their ids: a Q4_K or
+    /// Q6_K down; otherwise a dense FFN's one slot a token runs it as a
+    /// plain projection (`dispatch::site_gemv`).
+    pub(super) fn down_sel(&self) -> bool {
+        q4k_or_q6k(self.down_ty)
     }
 }
 

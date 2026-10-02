@@ -23,6 +23,7 @@ use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
 use crate::rope_table::{RopeSpec, RopeTable};
+use crate::site::KGemvKernels;
 use crate::tensor::window;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
@@ -58,6 +59,8 @@ pub(super) struct Q35Kernels {
     pub(super) gated: GatedQuantKernels,
     pub(super) g32: Gemm32Kernels,
     pub(super) q38: Q38Kernels,
+    /// A K-quant site's gemv beyond the `Gpu`'s own (the Q5_K one).
+    pub(super) kgemv: KGemvKernels,
 }
 
 /// The kernels the chain launches beyond the crate's shared modules.
@@ -101,6 +104,7 @@ impl Kernels {
                     gated: GatedQuantKernels::load(ctx)?,
                     g32: Gemm32Kernels::load(ctx)?,
                     q38: Q38Kernels::load(ctx)?,
+                    kgemv: KGemvKernels::load(gpu)?,
                 })
             } else {
                 None

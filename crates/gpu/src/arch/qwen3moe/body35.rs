@@ -55,7 +55,7 @@ use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
 use crate::model::{ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, NoHost, Rows, block_count};
 use crate::rope_table::{RopeSpec, RopeTable};
-use crate::site::{self, file_site};
+use crate::site::{self, Order, file_site};
 use crate::tensor::window;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
@@ -305,16 +305,29 @@ fn joint(l: usize, part: &str) -> String {
 }
 
 /// The types each site launches (`crate::site`): a projection of the normed
-/// rows or an output projection, Q4_K, Q6_K or Q8_0; β and α also F32; a
+/// rows or an output projection, a K-quant or Q8_0; β and α also F32; a
 /// routed layer's stacks, the Q4_K gate and up and a K-quant down the routed
-/// launches take; the embedding Q4_K rows or Q8_0 planes; the head Q6_K or
-/// Q8_0 (`Head`).
-const PROJ: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q6K, SiteTy::Q8_0];
-const BETA_ALPHA: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q6K, SiteTy::Q8_0, SiteTy::F32];
+/// launches take; the embedding Q4_K, Q5_K or Q6_K rows or Q8_0 planes; the head Q6_K,
+/// Q4_K or Q8_0 (`Head`).
+const PROJ: &[SiteTy] = &[
+    SiteTy::Q3K,
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::Q8_0,
+];
+const BETA_ALPHA: &[SiteTy] = &[
+    SiteTy::Q3K,
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::Q8_0,
+    SiteTy::F32,
+];
 const ROUTED: &[SiteTy] = &[SiteTy::Q4K];
 const ROUTED_DOWN: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q6K];
-const EMBED: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q8_0];
-const HEAD_TY: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q8_0];
+const EMBED: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K, SiteTy::Q8_0];
+const HEAD_TY: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q4K, SiteTy::Q8_0];
 
 /// The type of site `name` (`rows` rows of `k`) from `file`'s header.
 fn ty_of(
@@ -549,12 +562,12 @@ impl Forms {
     /// What the arena of a chain of `plans` holds beyond a fused K-quant
     /// chain's buffers (`Forms`'s doc), `d` its dims: every form one of the
     /// sites reads, the gate and up rows of an unfused gate·up, and the
-    /// longest output of a K-quant site launched alone.
+    /// longest row-major output of a K-quant site launched alone.
     fn of(plans: &[LayerPlan], d: &Dims) -> Forms {
         let mut hid: Vec<SiteTy> = Vec::new();
         let (mut attn, mut h, mut glu, mut cols) = (Vec::new(), Vec::new(), false, 0usize);
         let mut alone = |ty: SiteTy, rows: usize| {
-            if ty.kquant() {
+            if ty.kgemv_order() == Some(Order::RowMajor) {
                 cols = cols.max(rows);
             }
         };
@@ -593,6 +606,9 @@ impl Forms {
                 glu = true;
                 alone(f.gate_ty, d.slots() * d.ff);
                 alone(f.up_ty, d.slots() * d.ff);
+            }
+            if !f.down_sel() {
+                alone(f.down_ty, d.hidden);
             }
         }
         let wants = |tys: &[SiteTy]| Wants {

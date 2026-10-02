@@ -12,7 +12,7 @@
 //! v`, the layout of the reference dump's `q_rope`/`k_rope` views);
 //! `weighted_sum` on `[rows, n_exp, m]` down-projections with `[n_exp, m]`
 //! weights; the embedding table is Q3_K rows of 2048 values (880 bytes = 220
-//! u32 words each) or Q4_K rows of whole super-blocks (36 words each).
+//! u32 words each) or Q4_K, Q5_K or Q6_K rows of whole super-blocks.
 //! Extents are launch arguments, never buffer lengths: scratch buffers may
 //! be larger than the shape in flight.
 
@@ -198,6 +198,177 @@ pub(crate) unsafe fn q4k_embed_value(w: &[u32], wk: usize, v: usize) -> f32 {
     let d1 = d * sc as f32;
     let m1 = dmin * mi as f32;
     q as f32 * d1 - m1
+}
+
+/// The byte `x` of the byte stream `w` holds.
+///
+/// # Safety
+///
+/// `x < 4 * w.len()`.
+#[inline(always)]
+unsafe fn stream_byte(w: &[u32], x: usize) -> u32 {
+    // SAFETY: x >> 2 < w.len() by this fn's `# Safety`.
+    (unsafe { *w.get_unchecked(x >> 2) } >> (8 * (x & 3))) & 0xff
+}
+
+/// A K-quant super-block as an embedding row reads it: its bytes in the
+/// file, and the f32 value of weight `v` (0..256) of the super-block at byte
+/// `base` of the row stream `w`, bit-identical to `gguf::quant::dequant_row`.
+pub(crate) trait EmbedSb {
+    /// Bytes of one super-block (ggml's `block_q*_K`).
+    const BYTES: usize;
+
+    /// # Safety
+    ///
+    /// `base + BYTES <= 4 * w.len()`, `base` a multiple of 4 where the type's
+    /// super-block is whole words, and `v < 256`.
+    unsafe fn value(w: &[u32], base: usize, v: usize) -> f32;
+}
+
+/// Q5_K (176 bytes: `d`, `dmin`, 12 scale bytes, the 32 `qh` bytes, 128
+/// nibble bytes; whole words): sub-block `2j + h` (`j = v / 64`, `h` the
+/// nibble half) takes `d1 = d · sc`, `m1 = dmin · m` from
+/// `get_scale_min_k4`, its code is the nibble of qs byte `32j + v % 32` plus
+/// 16 when bit `2j + h` of qh byte `v % 32` is set, and the value is
+/// `q · d1 − m1`. `q · d1` holds at most 22 significant bits, exact in f32,
+/// so a fused or unfused subtraction rounds alike.
+pub(crate) struct Q5kRows;
+
+impl EmbedSb for Q5kRows {
+    const BYTES: usize = 176;
+
+    #[inline(always)]
+    unsafe fn value(w: &[u32], base: usize, v: usize) -> f32 {
+        let wk = base >> 2;
+        let j = v >> 6;
+        let h = (v >> 5) & 1;
+        let l = v & 31;
+        let qb = 32 * j + l;
+        // SAFETY: every index is wk + 0..=43 (the qh words 4..=11, the qs
+        // words 12..=43), inside `w` by this fn's `# Safety`.
+        let (w0, w1, w2, w3, hw, qw) = unsafe {
+            (
+                *w.get_unchecked(wk),
+                *w.get_unchecked(wk + 1),
+                *w.get_unchecked(wk + 2),
+                *w.get_unchecked(wk + 3),
+                *w.get_unchecked(wk + 4 + (l >> 2)),
+                *w.get_unchecked(wk + 12 + (qb >> 2)),
+            )
+        };
+        let byte = (qw >> (8 * (qb & 3) as u32)) & 0xff;
+        let nib = if h == 0 { byte & 0x0f } else { byte >> 4 };
+        let hb = (hw >> (8 * (l & 3) as u32)) & 0xff;
+        let q = nib + if (hb >> (2 * j + h)) & 1 != 0 { 16 } else { 0 };
+        let (sc, mi) = q4k_scale_min(2 * j + h, w1, w2, w3);
+        let d = half_to_f32((w0 & 0xffff) as u16);
+        let dmin = half_to_f32((w0 >> 16) as u16);
+        let d1 = d * sc as f32;
+        let m1 = dmin * mi as f32;
+        q as f32 * d1 - m1
+    }
+}
+
+/// Q6_K (210 bytes: 128 `ql` bytes, 64 `qh` bytes, 16 int8 scales, the f16
+/// `d`; a super-block may start 2 mod 4, so every field is read by byte):
+/// value `128c + 32a + l` takes the nibble `a / 2` of ql byte `64c + 32(a %
+/// 2) + l`, bits `2a..2a+1` of qh byte `32c + l` as its high two bits, and
+/// scale `8c + l / 16 + 2a`; the value is `(d · sc) · (q − 32)`, two
+/// roundings in the reference's order.
+pub(crate) struct Q6kRows;
+
+impl EmbedSb for Q6kRows {
+    const BYTES: usize = 210;
+
+    #[inline(always)]
+    unsafe fn value(w: &[u32], base: usize, v: usize) -> f32 {
+        let c = v >> 7;
+        let a = (v >> 5) & 3;
+        let l = v & 31;
+        // SAFETY: every byte is base + 0..=209 < 4 * w.len() by this fn's
+        // `# Safety`.
+        let (ql, qh, sc, d0, d1) = unsafe {
+            (
+                stream_byte(w, base + 64 * c + 32 * (a & 1) + l),
+                stream_byte(w, base + 128 + 32 * c + l),
+                stream_byte(w, base + 192 + 8 * c + (l >> 4) + 2 * a),
+                stream_byte(w, base + 208),
+                stream_byte(w, base + 209),
+            )
+        };
+        let nib = if a >= 2 { ql >> 4 } else { ql & 0x0f };
+        let q = (nib | (((qh >> (2 * a)) & 3) << 4)) as i32;
+        let d = half_to_f32((d0 | (d1 << 8)) as u16);
+        (d * (sc as u8 as i8) as f32) * (q - 32) as f32
+    }
+}
+
+/// The body of an embedding entry over super-blocks of type `S`, for thread
+/// `i` of the grid: row `t = i / width` of `y` (`width = 256 · n_sb`) takes
+/// value `i % width` of table row `ids[t]`, an id past the table's `n_rows`
+/// rows raising [`FaultSite::TokenId`] (thread of value 0) and writing NaN;
+/// threads `i < ids.len()` also write row `i`'s position `pos0[0] + first +
+/// i` and live key count one more through [`position_word`] — the Q4_K
+/// entry's work for any `S`.
+///
+/// # Safety
+///
+/// The entry's launch contract: `4 · w.len() >= S::BYTES · n_sb · n_rows`,
+/// `y.len() >= 256 · n_sb · ids.len()`, `pos0.len() >= 1`, `pos.len()` and
+/// `n_keys.len() >= ids.len()`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) unsafe fn embed_rows_sb<S: EmbedSb>(
+    i: usize,
+    (w, ids, pos0): (&[u32], &[u32], &[u32]),
+    (first, n_rows, n_sb): (u32, u32, u32),
+    fault: FaultSink,
+    y: &mut DisjointSlice<f32>,
+    pos: &mut DisjointSlice<u32>,
+    n_keys: &mut DisjointSlice<u32>,
+) {
+    if i < ids.len() {
+        // SAFETY: pos0 holds a word by this fn's `# Safety`.
+        let p = unsafe { *pos0.get_unchecked(0) } as usize + first as usize + i;
+        // SAFETY: i < ids.len() <= pos.len(), n_keys.len(); thread i owns
+        // entry i of both.
+        unsafe {
+            *pos.get_unchecked_mut(i) = position_word(p);
+            *n_keys.get_unchecked_mut(i) = position_word(p + 1);
+        }
+    }
+    let width = 256 * n_sb as usize;
+    if i >= ids.len() * width {
+        return;
+    }
+    let t = i / width;
+    let k = i % width;
+    // SAFETY: t < ids.len() by the guard.
+    let id = unsafe { *ids.get_unchecked(t) };
+    let v = if id < n_rows {
+        // SAFETY: id < n_rows and k >> 8 < n_sb, so the super-block ends at
+        // byte <= S::BYTES·n_sb·n_rows <= 4·w.len(); the base is a multiple
+        // of S::BYTES, so of 4 for a whole-word type; k & 255 < 256.
+        unsafe {
+            S::value(
+                w,
+                (id as usize * n_sb as usize + (k >> 8)) * S::BYTES,
+                k & 255,
+            )
+        }
+    } else {
+        if k == 0 {
+            fault.raise(FaultSite::TokenId);
+        }
+        f32::NAN
+    };
+    // SAFETY: i < ids.len() * width <= y.len() by this fn's `# Safety`.
+    unsafe {
+        *y.get_unchecked_mut(i) = v;
+    }
 }
 
 /// `v` as a position or live key count word: `v` while it fits a u32, else
@@ -502,6 +673,102 @@ mod elem_kernels {
         // SAFETY: i < ids.len() * width <= y.len() by the launch contract.
         unsafe {
             *y.get_unchecked_mut(i) = v;
+        }
+    }
+
+    /// Dequantize `ids.len()` rows of the Q5_K embedding table `w` (`44 ·
+    /// n_sb` u32 words per row) into `y` with their positions and live key
+    /// counts ([`embed_rows_sb`] over [`Q5kRows`]), as `embed_rows_q4k`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= 176 * n_sb * n_rows,
+            y.len() >= 256 * n_sb * ids.len(),
+            pos0.len() >= 1,
+            pos.len() >= ids.len(),
+            n_keys.len() >= ids.len()
+        )
+    )]
+    pub fn embed_rows_q5k(
+        w: &[u32],
+        ids: &[u32],
+        pos0: &[u32],
+        first: u32,
+        n_rows: u32,
+        n_sb: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut pos: DisjointSlice<u32>,
+        mut n_keys: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: the launch contract is the body's (176 = Q5kRows::BYTES,
+        // whole words).
+        unsafe {
+            embed_rows_sb::<Q5kRows>(
+                i,
+                (w, ids, pos0),
+                (first, n_rows, n_sb),
+                fault,
+                &mut y,
+                &mut pos,
+                &mut n_keys,
+            );
+        }
+    }
+
+    /// Dequantize `ids.len()` rows of the Q6_K embedding table `w` (`210 ·
+    /// n_sb` bytes per row, a whole number of words) into `y` with their
+    /// positions and live key counts ([`embed_rows_sb`] over [`Q6kRows`]),
+    /// as `embed_rows_q4k`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= 210 * n_sb * n_rows,
+            y.len() >= 256 * n_sb * ids.len(),
+            pos0.len() >= 1,
+            pos.len() >= ids.len(),
+            n_keys.len() >= ids.len()
+        )
+    )]
+    pub fn embed_rows_q6k(
+        w: &[u32],
+        ids: &[u32],
+        pos0: &[u32],
+        first: u32,
+        n_rows: u32,
+        n_sb: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut pos: DisjointSlice<u32>,
+        mut n_keys: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: the launch contract is the body's (210 = Q6kRows::BYTES).
+        unsafe {
+            embed_rows_sb::<Q6kRows>(
+                i,
+                (w, ids, pos0),
+                (first, n_rows, n_sb),
+                fault,
+                &mut y,
+                &mut pos,
+                &mut n_keys,
+            );
         }
     }
 
@@ -1303,6 +1570,122 @@ impl ElemKernels {
             pos,
             n_keys,
         )?;
+        Ok(())
+    }
+
+    /// Enqueue the embedding lookup of one unit of rows from a K-quant table
+    /// of type `ty`, as [`Self::enqueue_embed_rows_q4k`] does for Q4_K: the
+    /// rows dequantized token-major into `args.y`, bit-identical to
+    /// `gguf::quant::dequant_row`, with each row's position and live key
+    /// count. Q4_K runs `embed_rows_q4k`, Q5_K `embed_rows_q5k` (44 words a
+    /// super-block), Q6_K `embed_rows_q6k` (210 bytes a super-block, an even
+    /// count of them a row so a row is whole words); any other type, or a
+    /// table whose rows are not whole super-blocks of it, is refused by name.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_embed_rows_kquant(
+        &self,
+        stream: &CudaStream,
+        ty: gguf::quant::GgmlType,
+        args: EmbedRowsArgs<'_>,
+    ) -> Result<(), GpuError> {
+        use gguf::quant::GgmlType;
+        let what = "enqueue_embed_rows_kquant";
+        let sb_bytes = match ty {
+            GgmlType::Q4_K => return self.enqueue_embed_rows_q4k(stream, args),
+            GgmlType::Q5_K => Q5kRows::BYTES,
+            GgmlType::Q6_K => Q6kRows::BYTES,
+            other => {
+                return Err(GpuError::shape(
+                    what,
+                    format!("a {other} table: the embedding lookups read Q4_K, Q5_K and Q6_K rows"),
+                ));
+            }
+        };
+        let EmbedRowsArgs {
+            w,
+            ids,
+            pos0,
+            first,
+            y,
+            pos,
+            n_keys,
+        } = args;
+        let row_bytes = 4 * w.cols();
+        if w.rows() == 0 || row_bytes == 0 || !row_bytes.is_multiple_of(sb_bytes) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a {ty} table's rows are whole {sb_bytes}-byte super-blocks in whole words, \
+                     got {}x{} words",
+                    w.rows(),
+                    w.cols()
+                ),
+            ));
+        }
+        let n_sb = row_bytes / sb_bytes;
+        if ids.is_empty() {
+            return Err(GpuError::shape(what, "empty ids"));
+        }
+        if y.len() < 256 * n_sb * ids.len() {
+            return Err(GpuError::shape(
+                what,
+                format!("y.len() {} < {}*{}", y.len(), 256 * n_sb, ids.len()),
+            ));
+        }
+        if pos0.is_empty() || pos.len() < ids.len() || n_keys.len() < ids.len() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "pos0 holds {} words (want 1), pos {} and n_keys {} (want {} each)",
+                    pos0.len(),
+                    pos.len(),
+                    n_keys.len(),
+                    ids.len()
+                ),
+            ));
+        }
+        let cfg = LaunchConfig1D::new(
+            launch_u32(what, "grid", (ids.len() * 256 * n_sb).div_ceil(256))?,
+            256,
+            0,
+        );
+        let first = launch_u32(what, "first", first)?;
+        let n_rows = launch_u32(what, "w.rows()", w.rows())?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let fault = crate::sink_over(&self.fault, LAYER_NONE);
+        if ty == GgmlType::Q5_K {
+            let prep = self.module.prepare_embed_rows_q5k(cfg)?;
+            self.module.embed_rows_q5k(
+                stream,
+                &prep,
+                w.buf(),
+                ids,
+                pos0,
+                first,
+                n_rows,
+                n_sb,
+                fault,
+                y,
+                pos,
+                n_keys,
+            )?;
+        } else {
+            let prep = self.module.prepare_embed_rows_q6k(cfg)?;
+            self.module.embed_rows_q6k(
+                stream,
+                &prep,
+                w.buf(),
+                ids,
+                pos0,
+                first,
+                n_rows,
+                n_sb,
+                fault,
+                y,
+                pos,
+                n_keys,
+            )?;
+        }
         Ok(())
     }
 

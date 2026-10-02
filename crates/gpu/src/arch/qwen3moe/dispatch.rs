@@ -32,11 +32,12 @@ use crate::head::Head;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q38::{EmbedQ8Args, OutGateArgs};
 use crate::rope_neox::{NeoxArgs, PartialNeoxArgs};
-use crate::site;
+use crate::site::{self, Order};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
+use gguf::quant::GgmlType;
 use model::arch::qwen3moe::names::token_embd;
 
 /// What every launch of one layer reads besides the arena and the store:
@@ -133,9 +134,10 @@ pub(super) fn enqueue_chain(
 /// Enqueue the one-row head: its norm and quantization, then the Q6_K
 /// projection with the argmax folded in (`head_argmax`) in place of the
 /// shared head's gemv and `argmax_fault` — the same logits and the same
-/// (token, fault word) readback. A Q8_0 head (the head's type the load read
-/// from the file) runs the shared head's own Q8_0 arm: the norm, the q8f32
-/// gemv and the argmax, three launches as the fused head's.
+/// (token, fault word) readback. A head of another type (the type the load
+/// read from the file) runs the shared head's own arm: a Q8_0 one the norm,
+/// the q8f32 gemv and the argmax, three launches as the fused head's; a Q4_K
+/// one the norm, the quantizer, the Q4_K gemv and the argmax.
 pub(super) fn enqueue_head(
     gpu: &Gpu,
     w: &Weights,
@@ -143,7 +145,13 @@ pub(super) fn enqueue_head(
     state: &mut HeadArgmaxState,
     head: &mut Head,
 ) -> Result<(), GpuError> {
-    if let Some(DevWeight::Q8_0 { .. }) = w.get("output.weight") {
+    if !matches!(
+        w.get("output.weight"),
+        Some(DevWeight::KQuant {
+            ty: GgmlType::Q6_K,
+            ..
+        })
+    ) {
         return head.enqueue(gpu, w);
     }
     let stream = gpu.stream();
@@ -255,8 +263,9 @@ pub(super) fn enqueue_pass(
 ///   every token's slots, and the combine — 5 or 6.
 ///
 /// - A dense FFN: `norm_quant` and the four launches after the router — 5;
-///   an unfused gate·up is the gate, the up and the SwiGLU, and a Q8_0 down
-///   one launch with no quantizer.
+///   an unfused gate·up is the gate, the up and the SwiGLU; a Q8_0 down is
+///   one launch with no quantizer, a Q3_K or Q5_K one the quantizer and its
+///   projection ([`site_launches`]).
 ///
 /// So a qwen3moe layer is 12 or 13 launches at one row and 13 or 15 at
 /// every `m` from two to [`GEMV_COLS`]. Past it (the wide arm, `wide`) the
@@ -310,7 +319,11 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 } else {
                     site(f.gate_ty) + site(f.up_ty) + 1
                 };
-                let down = if f.down_ty.kquant() { 2 } else { 1 };
+                let down = if f.down_sel() {
+                    2
+                } else {
+                    usize::from(f.down_ty.kquant()) + site(f.down_ty)
+                };
                 2 + gate_up + down
             }
         };
@@ -396,7 +409,8 @@ pub(super) fn layer(
 /// A unit's front, one launch: the embedding rows of `io`'s ids into `s.x`
 /// and each row's position and live key count into `s.pos` and `s.n_keys` —
 /// the rows every later launch of the unit reads. The table's resident type
-/// picks the lookup: Q4_K rows, or Q8_0 planes (the load admits only these).
+/// picks the lookup: Q4_K, Q5_K or Q6_K rows, or Q8_0 planes (the load admits
+/// only these).
 pub(super) fn embed_rows(
     gpu: &Gpu,
     w: &Weights,
@@ -422,8 +436,13 @@ pub(super) fn embed_rows(
             },
         );
     }
-    gpu.elem().enqueue_embed_rows_q4k(
+    let ty = match w.get(&name) {
+        Some(DevWeight::KQuant { ty, .. }) => *ty,
+        _ => return Err(GpuError::tensor(WHAT, &name, "K-quant rows or Q8_0 planes")),
+    };
+    gpu.elem().enqueue_embed_rows_kquant(
         gpu.stream(),
+        ty,
         EmbedRowsArgs {
             w: kq_weight(w, &name)?,
             ids: io.ids,
@@ -437,16 +456,16 @@ pub(super) fn embed_rows(
 }
 
 /// The launches [`site_gemv`] makes for a site of type `ty` at `m` rows: a
-/// K-quant's gemv, and past one row its token-major copy; any other type's
-/// one launch.
+/// K-quant's gemv, and past one row the token-major copy of a row-major one;
+/// any other type's one launch.
 pub(super) fn site_launches(ty: SiteTy, m: usize) -> usize {
-    1 + usize::from(ty.kquant() && m > 1)
+    1 + usize::from(ty.kgemv_order() == Some(Order::RowMajor) && m > 1)
 }
 
 /// `y = W · x` for site `name` of type `ty`, `rows` rows, at `m <=
-/// GEMV_COLS` rows, token-major: a K-quant's gemv on the q8_1 rows `act`
-/// (past one row row-major into `cols`, then copied token-major), any other
-/// type's `site::gemv` on the f32 rows `x`.
+/// GEMV_COLS` rows, token-major: a K-quant's `site::kgemv` on the q8_1 rows
+/// `act` (a row-major one past one row into `cols`, then copied
+/// token-major), any other type's `site::gemv` on the f32 rows `x`.
 #[allow(
     clippy::too_many_arguments,
     reason = "one site's context, weight, rows, two input forms, width, scratch and output (rust-quality R8)"
@@ -462,15 +481,14 @@ pub(super) fn site_gemv(
 ) -> Result<(), GpuError> {
     const WHAT: &str = "qwen3moe::site_gemv";
     let gpu = c.gpu;
-    if !ty.kquant() {
-        return site::gemv(gpu, &c.k.q35(WHAT)?.g32, (ty, c.w, name), x, m, y);
-    }
-    let wt = kq_weight(c.w, name)?;
-    let gemv = |out: &mut DeviceBuffer<f32>| match ty {
-        SiteTy::Q6K => gpu.enqueue_gemv_q6k(wt, act, out),
-        _ => gpu.enqueue_gemv_q4k(wt, act, out),
+    let q35 = c.k.q35(WHAT)?;
+    let Some(order) = ty.kgemv_order() else {
+        return site::gemv(gpu, &q35.g32, (ty, c.w, name), x, m, y);
     };
-    if m == 1 {
+    let gemv = |out: &mut DeviceBuffer<f32>| {
+        site::kgemv(gpu, &q35.kgemv, (ty, c.w, name), act, c.sink, out)
+    };
+    if m == 1 || order == Order::TokenMajor {
         return gemv(y);
     }
     let cols = cols.ok_or(GpuError::state(
@@ -926,43 +944,53 @@ fn slots_down(
         gpu.elem()
             .enqueue_swiglu(stream, &g.g, &g.u, m * slots * d.ff, h)?;
     }
-    match n.down_ty {
-        SiteTy::Q4K | SiteTy::Q6K => {
-            let wd = kq_weight(w, &n.down)?;
-            gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;
-            let act_h = &s.act_h[i];
-            if n.down_ty == SiteTy::Q4K {
-                gpu.q4k_sel().enqueue_gemv_q4k_sel(
-                    stream,
-                    wd,
-                    act_h,
-                    s.route.ids(),
-                    m * slots,
-                    d.hidden,
-                    &mut s.down,
-                )?;
-            } else {
-                k.q6_sel.enqueue_gemv_q6k_sel(
-                    stream,
-                    wd,
-                    act_h,
-                    s.route.ids(),
-                    m * slots,
-                    d.hidden,
-                    &mut s.down,
-                )?;
-            }
+    if n.down_sel() {
+        let wd = kq_weight(w, &n.down)?;
+        gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;
+        let act_h = &s.act_h[i];
+        if n.down_ty == SiteTy::Q4K {
+            gpu.q4k_sel().enqueue_gemv_q4k_sel(
+                stream,
+                wd,
+                act_h,
+                s.route.ids(),
+                m * slots,
+                d.hidden,
+                &mut s.down,
+            )?;
+        } else {
+            k.q6_sel.enqueue_gemv_q6k_sel(
+                stream,
+                wd,
+                act_h,
+                s.route.ids(),
+                m * slots,
+                d.hidden,
+                &mut s.down,
+            )?;
         }
+    } else {
         // A dense FFN's one slot a token: the down over the token's SwiGLU
         // row is the plain projection, token-major.
-        SiteTy::Q8_0 | SiteTy::F32 => site::gemv(
-            gpu,
-            &k.q35(WHAT)?.g32,
-            (n.down_ty, w, &n.down),
-            &s.h,
+        if n.down_ty.kquant() {
+            gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;
+        }
+        let Arena {
+            h,
+            act_h,
+            cols,
+            down,
+            ..
+        } = s;
+        site_gemv(
+            c,
+            (n.down_ty, &n.down),
+            d.hidden,
+            (&act_h[i], h),
             m * slots,
-            &mut s.down,
-        )?,
+            cols.as_mut(),
+            down,
+        )?;
     }
     let y = match out {
         Some(y) => y,
