@@ -76,7 +76,10 @@ placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
 # lanes (pack_lanes_avx2, dot_lanes_avx2 and their helpers transpose8_epi32, transpose8_ps, lane_codes: five
 # unsafe fns, one block each) and the three calls into them (pack_lanes' two arms, lanes), each with its SAFETY line.
-qdot 77 41 0
+# PIN(2026-10-03): qdot 77 -> 80 blocks, 41 -> 43 fns, new kernels, not old code relaxed: the Q6_K row lanes
+# (pack_lanes_q6k_avx2, dot_lanes_q6k_avx2: two unsafe fns, one block each) and pack_lanes' Q6_K arm, each with its
+# SAFETY line; lanes keeps its one block for both kernels.
+qdot 80 43 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

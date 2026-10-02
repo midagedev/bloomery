@@ -1,0 +1,47 @@
+# Round glmlane2: GLM-5.3-Flash's prompt batch with the host union's Q6_K downs (layers 11, 12, 44) through qdot's
+# row lanes (pack_lanes_q6k_avx2, dot_lanes_q6k_avx2): each 8-row group unpacked once into the participant's buffer,
+# a ymm lane a row, the column's activation bytes read once for eight rows; every (row, column) keeps
+# dot_q6k_q82x4_avx2's eight float lanes and their order, and its integer sum sum((c - 32) q) is formed exactly as
+# sum(c q) - 32 sum(q), so the bits are dot_row's (qdot hw_lanes_*, union hw_union_q6_k_down_* hold it). Only calls
+# wider than 8 columns (a prompt batch's) take lanes; Q4_K/Q5_K lanes are unchanged (same kernel, same asm body).
+# Against the base, glmpp3's landed commit (<lead fills the hash>).
+# Decomposition [derived, round report section 1], from one perf window (3090, place gate, P = 768, G2,
+# runtime values): dot_q6k_q82x4_avx2 4.36 % of the union window's samples = 170 ms a 768-token prompt over
+# 18,432 Q6_K slots (296 us of thread time a slot, IPC 2.9 on 3.44M instructions). Row lanes: 434 instructions a
+# (column, group super-block) at the Q4_K/Q5_K dot's measured IPC (2.9..3.3) -> 136..155 us a slot. The pack: 797
+# instructions a group super-block at the Q5_K pack's IPC (1.36..1.49) gives 17..19 us a Q6_K expert, but the
+# same perf puts the pack's time on its loads, so it is also priced by bytes: 8 x 210 = 1,680 B a group
+# super-block at the Q5_K pack's ~168 ns for 1,408 B -> ~200 ns, 26 us an expert. Band 17..26 us.
+# Per 512-position batch (12,288 Q6_K slots, ~800 Q6_K expert-calls, the Q6_K layers host-bound at G1 and G2: no
+# card experts, shadow 9 ms): dot -54..-61 ms, pack +14..+21 ms, net -33..-47 ms. pp4096 2427..2561 ms a batch
+# (glmpp3's band) -> +1.3..+1.9 %; pp512 2663 ms -> +1.2..+1.8 %, printed beside it.
+kind: ab
+question: do the Q6_K layers' downs fall to the row lanes' instruction cost once a column's activation bytes are
+  read once per eight rows, as the Q4_K and Q5_K downs did?
+term: pp tok/s @ P = 4096, prose prompt (GLM_PROSE from GLM_PROSE_FROM), A6000, plan (a), --ctx 4352, each arm's
+  default group (BLOOMERY_PREFILL_GROUP unset: 2 in both) - (glmlane2 - base) / base, paired by round across the
+  two invocations
+unit: %
+predict: +1.3..+1.9
+rounds: 4
+condition: one hold, two runner invocations back to back, each carrying this card: the base from a tree at
+  glmpp3's landed commit (its own remote dir), then this round's from /Users/hckim/repo/bloomery-glmlane2
+  (BLOOMERY_REMOTE='~/repo/bloomery-glmlane2'), each BLOOMERY_AB_ROUNDS=4
+  BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4352 BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmlane2-pp.card'
+  just depth-gpu-glm5next 512 4096. Every row's load line prints group=2 and its time prompt record kind=batch
+  with 1 pass at P = 512 and 8 at 4096; both arms' plan lines print the same card_experts (host code only). A row
+  marked [cold], [cpu-busy] or [other-busy] is void, and so is a window whose card witness or cpu-freq differs
+  between the two invocations. Decode cannot move: a decode, verify or draft call of at most 8 columns keeps the
+  one-row path (lanes run only past DEFER_MAX_COLS) and no host layout changed, so the decode rows must agree
+  within the window's ~5 %. Box time ~25..35 min [derived: per invocation two warm-up processes and eight rows,
+  ten loads at 45..75 s, 4 x (4 + 22..25) s of prompt; plus the two builds]: the lead asks the user past 30
+decide-in: land it; the Q6_K layers then cost the lane law like the others, and the next host-union term is the
+  pack's load stall (50 us an expert against ~21 at the dot's IPC: the next group's rows prefetched under this
+  group's dot, its own piece and sitting)
+decide-below: under +1.3 %: the Q6_K lanes run below the Q4_K/Q5_K lanes' IPC (the extra madd, add and subtract a
+  half) or the Q6_K pack stalls longer than the Q5_K pack: run one BLOOMERY_STEP_STATS=1 P = 768 3090 row and a
+  perf window on this tree and read the Q6_K layers' union_ms and the dot_lanes_cols / pack_lanes shares before
+  landing (land if > 0: the bits are dot_row's)
+decide-above: past +1.9 %: the Q6_K layers' excess held more than the dot_q6k samples (the fit's 1.43x said
+  118 ms a 768 prompt against 64 here: the old path's thread split by bytes), so re-derive the down pass's split
+  cost from lane_units and land

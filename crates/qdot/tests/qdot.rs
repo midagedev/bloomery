@@ -2922,6 +2922,7 @@ fn v41_rows(ty: GgmlType, prefer: &str, rows: usize) -> (String, usize, usize, V
         GgmlType::Q3_K => 110,
         GgmlType::Q4_K => 144,
         GgmlType::Q5_K => 176,
+        GgmlType::Q6_K => 210,
         _ => panic!("no tile row source for {ty:?}"),
     };
     for path in &shards {
@@ -4093,30 +4094,38 @@ fn q3k_r8_unpack_refuses_bad_shapes() {
     );
 }
 
-// ------------------------------------------- Q4_K/Q5_K row lanes
+// --------------------------------------- Q4_K/Q5_K/Q6_K row lanes
 // `pack_lanes` then `dot_lanes_cols` against `dot_row` per (row, column), bit
 // for bit, at every column count 1..=TILE_COLS and every slot a column can sit
 // in. The bit contract holds by construction — the same integer sum per half
 // sub-block, the same f32 products, the same fused adds per (row, column)
 // lane and the same lane sum — so any differing value is a bug.
 
-/// `rows` synthetic rows of `ty` (Q4_K or Q5_K), `k` values each: every byte
-/// of every block from the generator, then `d` and `dmin` finite normal f16
-/// of either sign (exponents 2^-10 .. 2^5), so the codes, the high bits, the
-/// six-bit scales and mins and the products all vary.
-fn lane_rows(ty: GgmlType, k: usize, rows: usize, seed: u64) -> Vec<u8> {
-    let block = match ty {
-        GgmlType::Q4_K => 144,
-        GgmlType::Q5_K => 176,
+/// Bytes of one super-block of a row-lane type, and where its f16 scales
+/// sit: Q4_K and Q5_K's `d` and `dmin` at 0 and 2, Q6_K's `d` at 208.
+fn lane_block(ty: GgmlType) -> (usize, &'static [usize]) {
+    match ty {
+        GgmlType::Q4_K => (144, &[0, 2]),
+        GgmlType::Q5_K => (176, &[0, 2]),
+        GgmlType::Q6_K => (210, &[208]),
         _ => panic!("no row-lane rows for {ty:?}"),
-    };
+    }
+}
+
+/// `rows` synthetic rows of `ty` (Q4_K, Q5_K or Q6_K), `k` values each: every
+/// byte of every block from the generator, then its f16 scales (`d` and
+/// `dmin`, or Q6_K's `d`) finite normal of either sign (exponents 2^-10 ..
+/// 2^5), so the codes, the high bits, the scales and mins and the products all
+/// vary.
+fn lane_rows(ty: GgmlType, k: usize, rows: usize, seed: u64) -> Vec<u8> {
+    let (block, scales) = lane_block(ty);
     let mut rng = Lcg(seed);
     let mut out = vec![0u8; rows * k / 256 * block];
     for b in out.chunks_exact_mut(block) {
         for x in b.iter_mut() {
             *x = rng.next_u32() as u8;
         }
-        for at in [0, 2] {
+        for &at in scales {
             let sign = (rng.next_u32() & 1) as u16;
             let exp = 5 + (rng.next_u32() % 16) as u16;
             let mant = (rng.next_u32() & 0x3ff) as u16;
@@ -4126,22 +4135,26 @@ fn lane_rows(ty: GgmlType, k: usize, rows: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-/// One 8-row group at the top of every code: each byte 0xFF (codes 15, Q5_K
-/// 31 with every high bit set, scales and mins 63), `d` and `dmin` row `r`'s
-/// [`R8_D`] — on the all-(+127) and all-(−127) columns each lane's i16 sum of
-/// four maddubs reaches 8 · 31 · 127 = 31,496 for Q5_K.
-fn lane_ends(ty: GgmlType, k: usize) -> Vec<u8> {
-    let block = match ty {
-        GgmlType::Q4_K => 144,
-        GgmlType::Q5_K => 176,
-        _ => panic!("no row-lane rows for {ty:?}"),
-    };
+/// One 8-row group with every code and scale byte `fill`, its f16 scales row
+/// `r`'s [`R8_D`] (`dmin`, where the type has one, row `r + 3`'s). 0xFF puts
+/// every code at its top: Q4_K 15, Q5_K 31 with every high bit set (scales
+/// and mins 63) — on the all-(+127) and all-(−127) columns each lane's i16 sum
+/// of four maddubs reaches 8 · 31 · 127 = 31,496 — and Q6_K 63 (scales −1),
+/// where each pair of maddubs reaches 4 · 63 · 127 = 32,004. 0x00 puts every
+/// Q6_K code at −32 after its offset, the one-column kernel's widest
+/// sign-folded sum, 8 · 32 · 127 = 32,512; its scales are set to 127 so no
+/// product is zero.
+fn lane_fill(ty: GgmlType, k: usize, fill: u8) -> Vec<u8> {
+    let (block, scales) = lane_block(ty);
     let nb = k / 256;
-    let mut out = vec![0xFFu8; 8 * nb * block];
+    let mut out = vec![fill; 8 * nb * block];
     for (i, b) in out.chunks_exact_mut(block).enumerate() {
-        let d = R8_D[(i / nb) % 8];
-        b[0..2].copy_from_slice(&d.to_le_bytes());
-        b[2..4].copy_from_slice(&R8_D[(i / nb + 3) % 8].to_le_bytes());
+        for (j, &at) in scales.iter().enumerate() {
+            b[at..at + 2].copy_from_slice(&R8_D[(i / nb + 3 * j) % 8].to_le_bytes());
+        }
+        if ty == GgmlType::Q6_K && fill == 0 {
+            b[192..208].fill(0x7F);
+        }
     }
     out
 }
@@ -4263,17 +4276,17 @@ fn lane_columns(ty: GgmlType, k: usize) -> Vec<Vec<u8>> {
     coded_columns(ty, k, ends)
 }
 
-/// Row-lane clause on synthetic rows: for Q4_K and Q5_K, groups of seeded
-/// rows at k = 256 (one super-block, a short chunk), 2,048 and 4,096 (GLM's
-/// routed down and gate/up widths: two and four whole chunks) and 2,304 (two
-/// chunks and a one-super-block tail), and the 0xFF group ([`lane_ends`]) at
-/// 4,096 — lanes = `dot_row` per (row, column), bit for bit
-/// ([`assert_lanes_match`]).
+/// Row-lane clause on synthetic rows: for Q4_K, Q5_K and Q6_K, groups of
+/// seeded rows at k = 256 (one super-block, a short chunk), 2,048 and 4,096
+/// (GLM's routed down and gate/up widths: two and four whole chunks) and
+/// 2,304 (two chunks and a one-super-block tail), and the 0xFF group
+/// ([`lane_fill`]) at 4,096, with Q6_K's 0x00 group beside it — lanes =
+/// `dot_row` per (row, column), bit for bit ([`assert_lanes_match`]).
 #[test]
 #[ignore = "hw: the box's CPU (the row lanes run on AVX2); reads no model file"]
 fn hw_lanes_match_dot_row_synthetic() {
-    for ty in [GgmlType::Q4_K, GgmlType::Q5_K] {
-        let block = if ty == GgmlType::Q4_K { 144 } else { 176 };
+    for ty in [GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K] {
+        let (block, _) = lane_block(ty);
         for (k, rows, seed) in [
             (256usize, 16usize, 0x1a2e_0001u64),
             (2048, 16, 0x1a2e_0002),
@@ -4294,26 +4307,38 @@ fn hw_lanes_match_dot_row_synthetic() {
             );
         }
         let k = 4096;
-        let calls = assert_lanes_match(
-            ty,
-            "0xFF group",
-            k,
-            k / 256 * block,
-            &lane_ends(ty, k),
-            &lane_columns(ty, k),
-        );
-        eprintln!("{ty:?} lanes: 0xFF group (k = {k}): {calls} calls, bit-identical");
+        let fills: &[(u8, &str)] = if ty == GgmlType::Q6_K {
+            &[(0xFF, "0xFF group"), (0x00, "0x00 group")]
+        } else {
+            &[(0xFF, "0xFF group")]
+        };
+        for &(fill, label) in fills {
+            let calls = assert_lanes_match(
+                ty,
+                label,
+                k,
+                k / 256 * block,
+                &lane_fill(ty, k, fill),
+                &lane_columns(ty, k),
+            );
+            eprintln!("{ty:?} lanes: {label} (k = {k}): {calls} calls, bit-identical");
+        }
     }
 }
 
 /// Row-lane clause on the V4.1 set's first Q4_K and first Q5_K routed down
-/// stacks ([`TILE_ROWS`] rows each) against the seeded columns — lanes =
-/// `dot_row` per (row, column), bit for bit.
+/// stacks and its one Q6_K tensor, `output.weight` ([`TILE_ROWS`] rows each),
+/// against the seeded columns — lanes = `dot_row` per (row, column), bit for
+/// bit.
 #[test]
 #[ignore = "hw: needs the box and the V4.1 shards"]
 fn hw_lanes_match_dot_row_v41() {
-    for ty in [GgmlType::Q4_K, GgmlType::Q5_K] {
-        let (name, k, row_bytes, bytes) = v41_rows(ty, "ffn_down_exps", TILE_ROWS);
+    for (ty, prefer) in [
+        (GgmlType::Q4_K, "ffn_down_exps"),
+        (GgmlType::Q5_K, "ffn_down_exps"),
+        (GgmlType::Q6_K, "output"),
+    ] {
+        let (name, k, row_bytes, bytes) = v41_rows(ty, prefer, TILE_ROWS);
         let calls = assert_lanes_match(ty, &name, k, row_bytes, &bytes, &lane_columns(ty, k));
         eprintln!("{ty:?} lanes: {name} (k = {k}, {TILE_ROWS} rows): {calls} calls, bit-identical");
     }
@@ -4344,11 +4369,11 @@ fn hw_lanes_refuse_bad_shapes() {
         );
     };
     pack(
-        GgmlType::Q6_K,
+        GgmlType::Q5_0,
         &rows,
         k,
         need,
-        QdotError::NoLanes(GgmlType::Q6_K),
+        QdotError::NoLanes(GgmlType::Q5_0),
     );
     pack(
         GgmlType::Q3_K,
@@ -4387,6 +4412,17 @@ fn hw_lanes_refuse_bad_shapes() {
         },
     );
     pack(
+        GgmlType::Q6_K,
+        &rows,
+        k,
+        need,
+        QdotError::RowGroupBytes {
+            buf: "lane rows",
+            have: 8 * 144,
+            need: 8 * 210,
+        },
+    );
+    pack(
         ty,
         &rows,
         k,
@@ -4417,12 +4453,12 @@ fn hw_lanes_refuse_bad_shapes() {
             );
         };
     dot(
-        GgmlType::Q6_K,
+        GgmlType::Q5_0,
         &group,
         &many[..1],
         k,
         1,
-        QdotError::NoLanes(GgmlType::Q6_K),
+        QdotError::NoLanes(GgmlType::Q5_0),
     );
     dot(
         ty,
@@ -4483,9 +4519,9 @@ fn hw_lanes_refuse_bad_shapes() {
             k,
         },
     );
-    let e = QdotError::NoLanes(GgmlType::Q6_K).to_string();
+    let e = QdotError::NoLanes(GgmlType::Q5_0).to_string();
     assert!(
-        e.contains("no row-lane qdot kernel for weight type Q6_K"),
+        e.contains("no row-lane qdot kernel for weight type Q5_0"),
         "{e}"
     );
 }

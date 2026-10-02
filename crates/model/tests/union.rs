@@ -82,6 +82,12 @@
 //! makes), and the union call at k = 1, 8 and 10 equal to `experts_into` of every column, bit
 //! for bit, under both deferral arms, in its dispatches.
 //!
+//! The Q6_K down lane — a routed layer whose down is Q6_K, as GLM-5.3's layers 11, 12 and 44
+//! are — is held on a synthetic layer (Q4_K gate and up, a Q6_K down of two super-blocks a
+//! row): the union call at k = 1, 8 and 10 — the last through qdot's row lanes, the down's
+//! included, with one expert in every column (more than one lane run's columns) — equal to
+//! `experts_into` of every column, bit for bit, under both deferral arms, in its dispatches.
+//!
 //! PIN(2026-09-26): the four-expert routing runs whole — the scratch's slabs
 //! are indexed by slot, so no expert's column count bounds a call.
 //!
@@ -1246,8 +1252,8 @@ const Q8_DOWN: &str = "blk.0.ffn_down_exps.weight";
 /// f32's unit roundoff.
 const U: f64 = 1.0 / 16_777_216.0;
 
-/// One routed layer — Q4_K gate and up, a Q8_0 down — written with `gguf::write` into its own
-/// directory (removed on drop), and the stacks' bytes the file holds.
+/// One routed layer — Q4_K gate and up, a Q8_0 or Q6_K down — written with `gguf::write` into
+/// its own directory (removed on drop), and the stacks' bytes the file holds.
 struct Q8Layer {
     dir: std::path::PathBuf,
     source: std::path::PathBuf,
@@ -1257,9 +1263,9 @@ struct Q8Layer {
 }
 
 impl Q8Layer {
-    fn write(embd: usize, ff: usize, n_expert: usize) -> Q8Layer {
+    fn write(embd: usize, ff: usize, n_expert: usize, down_ty: GgmlType) -> Q8Layer {
         use gguf::write::{Layout, TensorDecl, Writer};
-        let dir = std::env::temp_dir().join(format!("q8layer-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("q8layer-{down_ty}-{}", std::process::id()));
         if dir.exists() {
             std::fs::remove_dir_all(&dir).unwrap();
         }
@@ -1267,11 +1273,11 @@ impl Q8Layer {
         let source = dir.join("layer.gguf");
         let gate = q8_stack(GgmlType::Q4_K, [embd, ff, n_expert], 0x6a7e);
         let up = q8_stack(GgmlType::Q4_K, [embd, ff, n_expert], 0x0b);
-        let down = q8_stack(GgmlType::Q8_0, [ff, embd, n_expert], 0xd0);
+        let down = q8_stack(down_ty, [ff, embd, n_expert], 0xd0);
         let stacks = [
             (Q8_GATE, GgmlType::Q4_K, [embd, ff, n_expert], &gate),
             (Q8_UP, GgmlType::Q4_K, [embd, ff, n_expert], &up),
-            (Q8_DOWN, GgmlType::Q8_0, [ff, embd, n_expert], &down),
+            (Q8_DOWN, down_ty, [ff, embd, n_expert], &down),
         ];
         let decls: Vec<TensorDecl> = stacks
             .iter()
@@ -1305,8 +1311,9 @@ impl Drop for Q8Layer {
     }
 }
 
-/// A stack `[k, n, n_expert]` of `ty` (Q4_K or Q8_0): xorshift bytes, each block's scales set
-/// finite — Q4_K's `d` 2^-7 and `dmin` 2^-8, Q8_0's `d` of either sign at 2^-7 .. 2^-3.
+/// A stack `[k, n, n_expert]` of `ty` (Q4_K, Q6_K or Q8_0): xorshift bytes, each block's scales
+/// set finite — Q4_K's `d` 2^-7 and `dmin` 2^-8, Q6_K's `d` 2^-10 (its sixteen i8 scales the
+/// xorshift's), Q8_0's `d` of either sign at 2^-7 .. 2^-3.
 fn q8_stack(ty: GgmlType, [k, n, n_expert]: [usize; 3], seed: u64) -> Vec<u8> {
     let (bs, ts) = (
         ty.blck_size().unwrap() as usize,
@@ -1328,6 +1335,7 @@ fn q8_stack(ty: GgmlType, [k, n, n_expert]: [usize; 3], seed: u64) -> Vec<u8> {
                 blk[0..2].copy_from_slice(&0x2000u16.to_le_bytes());
                 blk[2..4].copy_from_slice(&0x1C00u16.to_le_bytes());
             }
+            GgmlType::Q6_K => blk[208..210].copy_from_slice(&0x1400u16.to_le_bytes()),
             GgmlType::Q8_0 => {
                 let r = next();
                 let (exp, mant, sign) = (
@@ -1370,7 +1378,7 @@ fn gamma(n: f64) -> f64 {
 #[ignore = "hw: the box's CPU (qdot's fused kernels run on AVX2); reads no model file"]
 fn hw_union_q8_0_down_matches_dequant() {
     let (embd, ff, n_expert) = Q8_LAYER;
-    let layer = Q8Layer::write(embd, ff, n_expert);
+    let layer = Q8Layer::write(embd, ff, n_expert, GgmlType::Q8_0);
     let split = Split::open(&layer.source).unwrap();
     let src = R8Source::rows(&split);
     let spec = HostLayerSpec {
@@ -1499,5 +1507,104 @@ fn hw_union_q8_0_down_matches_dequant() {
         "PASSED: union q8_0 down — a Q8_0 down served for {k} slots within the derived band of the \
          f64 dequant dot, and the union call at k = 1, 8, 10 equal to experts_into bit for bit \
          under both deferral arms"
+    );
+}
+
+/// The Q6_K down lane's synthetic layer: `embd`, `ff` and experts. A down row of `ff` = 512
+/// values is two Q6_K super-blocks; its `embd` = 512 rows are 64 row-lane groups.
+const Q6_LAYER: (usize, usize, usize) = (512, 512, 4);
+
+/// The Q6_K lane's ten columns' lists: column `j` lists experts `j % 4` at 1.0, `(j + 1) % 4`
+/// at 0.5 and 0 at −0.25, so expert 0 carries every column (twice where `j % 4` is 0) — more
+/// than one lane run of the down's — and the others five or six.
+fn q6_lists() -> Vec<Vec<(u32, f32)>> {
+    (0..10u32)
+        .map(|j| vec![(j % 4, 1.0f32), ((j + 1) % 4, 0.5), (0, -0.25)])
+        .collect()
+}
+
+/// The Q6_K down lane: the union call at k = 1, 8 and 10 against `experts_into` of every
+/// column, bit for bit, under both deferral arms, in its dispatches.
+#[test]
+#[ignore = "hw: the box's CPU (qdot's fused kernels run on AVX2); reads no model file"]
+fn hw_union_q6_k_down_matches_per_column() {
+    let (embd, ff, n_expert) = Q6_LAYER;
+    let layer = Q8Layer::write(embd, ff, n_expert, GgmlType::Q6_K);
+    let split = Split::open(&layer.source).unwrap();
+    let src = R8Source::rows(&split);
+    let spec = HostLayerSpec {
+        gate: Q8_GATE,
+        up: Q8_UP,
+        down: Q8_DOWN,
+        n_expert,
+        embd,
+        ff,
+        swiglu_limit: 0.0,
+    };
+    let host_layer =
+        HostLayer::build(src, &spec).unwrap_or_else(|e| panic!("a Q6_K down must build: {e}"));
+    let lists = q6_lists();
+    let k = lists.len();
+    let x_all: Vec<f32> = (0..k)
+        .flat_map(|j| seeded(embd, 0x0600 + j as u64))
+        .collect();
+    let case = Case {
+        x: Tensor2::from_vec(embd, k, x_all),
+        lists,
+    };
+    let mut host = HostScratch::new(embd, ff, LIST).expect("a scratch of LIST experts");
+    let want = per_column(&host_layer, src, &case, &mut host);
+    assert!(
+        want.iter().all(|v| v.is_finite()),
+        "every experts_into cell of the Q6_K layer is finite"
+    );
+
+    let mut us = UnionScratch::new_routed(embd, ff, k, LIST).expect("a scratch of ten columns");
+    let mut failed: Vec<(usize, &str)> = Vec::new();
+    let mut miscounted: Vec<(usize, &str)> = Vec::new();
+    for kk in Q8_KS {
+        let sub = Case {
+            x: Tensor2::from_vec(embd, kk, case.x.data[..kk * embd].to_vec()),
+            lists: case.lists[..kk].to_vec(),
+        };
+        let lists = sub.slices();
+        let mut line = format!(
+            "q6_K down k={kk} slots={} union={}",
+            sub.slots(),
+            sub.union()
+        );
+        for (arm, on) in ARMS {
+            ops::set_defer_quant(Some(on));
+            let mut got = vec![f32::NAN; embd * kk];
+            let (r, ds, dp) = dispatched(&mut us, |us| {
+                host_layer.experts_union_into(src, &sub.x, &lists, &mut got, us)
+            });
+            ops::set_defer_quant(None);
+            r.unwrap_or_else(|e| panic!("q6_K down k {kk} {arm}: {e}"));
+            let d = diff_cells(&got, &want[..kk * embd]);
+            let want_d = call_dispatches(kk, sub.slots(), on);
+            line += &format!(" {arm}: diff_cells={d} {}", dispatch_note(ds, dp, want_d));
+            if d != 0 {
+                failed.push((kk, arm));
+            }
+            if !dispatches_ok(ds, dp, want_d) {
+                miscounted.push((kk, arm));
+            }
+        }
+        println!("{line}");
+    }
+    assert!(
+        failed.is_empty(),
+        "{} (k, arm) Q6_K union calls differ from experts_into: {failed:?}",
+        failed.len()
+    );
+    assert!(
+        miscounted.is_empty(),
+        "{} (k, arm) Q6_K union calls issued other than their dispatches: {miscounted:?}",
+        miscounted.len()
+    );
+    println!(
+        "PASSED: union q6_K down — the union call at k = 1, 8, 10 (the last through the row \
+         lanes, its Q6_K down included) equal to experts_into bit for bit under both deferral arms"
     );
 }

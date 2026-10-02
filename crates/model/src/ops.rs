@@ -2284,8 +2284,8 @@ impl<'a> PairWork<'a> {
         Ok(())
     }
 
-    /// Rows `rows` — whole groups of [`qdot::LANE_ROWS`] — of a Q4_K or Q5_K
-    /// pair read row after row, across every token column, through qdot's row
+    /// Rows `rows` — whole groups of [`qdot::LANE_ROWS`] — of a Q4_K, Q5_K or
+    /// Q6_K pair read row after row, across every token column, through qdot's row
     /// lanes: each group unpacked once into this participant's [`LANE_BUF`]
     /// ([`qdot::pack_lanes`]), then dotted with the columns in runs of up to
     /// [`qdot::TILE_COLS`] ([`qdot::dot_lanes_cols`]), which writes each (row,
@@ -2366,7 +2366,7 @@ impl<'a> PairWork<'a> {
     }
 }
 
-// Per-thread row-lane group of the union's Q4_K and Q5_K passes
+// Per-thread row-lane group of the union's row-lane passes
 // ([`PairWork::compute_lanes`]), grown to the widest `k` seen.
 thread_local! {
     static LANE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -3034,17 +3034,23 @@ fn r8_tile_cost(k: usize, ne1: usize) -> Option<u64> {
     Some(sb * (m.div_ceil(qdot::TILE_COLS as u64) * fixed + m * per_col))
 }
 
-/// Instructions per group super-block of qdot's Q4_K and Q5_K row lanes, in
-/// [`tile_units`]' half-instruction units, counted off the kernels' source:
-/// the pack of one 8-row group (`pack_lanes`: the rows' scales and mins, the
-/// transposes, the codes' nibbles; Q5_K's high bits on top), once a group,
-/// and each column's share (`dot_lanes_cols`: eight lanes of a min fma and
-/// two halves of four maddubs, a madd and a scaled fma). Its unit is a group
-/// and [`tile_units`]' a row, so one lane cut weighs both.
+/// Instructions per group super-block of qdot's row lanes, in
+/// [`tile_units`]' half-instruction units: the pack of one 8-row group
+/// (`pack_lanes`), once a group, and each column's share (`dot_lanes_cols`).
+/// Q4_K and Q5_K are counted off the kernels' source: the pack's scales and
+/// mins, transposes and code nibbles (Q5_K's high bits on top), and a
+/// column's eight lanes of a min fma and two halves of four maddubs, a madd
+/// and a scaled fma. Q6_K is counted off the release disassembly: the pack's
+/// super-block loop (scales, transposes, six-bit codes), and a column's share
+/// of the four-column kernel — eight lanes of two halves of four maddubs, two
+/// madds, an add, the code-sum subtract and a scaled fma, and the column's
+/// `dy` and code sums. Its unit is a group and [`tile_units`]' a row, so one
+/// lane cut weighs both.
 fn lane_units(ty: GgmlType) -> Option<(u64, u64)> {
     match ty {
         GgmlType::Q4_K => Some((1184, 612)),
         GgmlType::Q5_K => Some((1648, 612)),
+        GgmlType::Q6_K => Some((1594, 868)),
         _ => None,
     }
 }
@@ -3770,9 +3776,9 @@ impl UnionStack {
     }
 
     /// Whether a union pass can run this stack through qdot's row lanes
-    /// ([`PairWork::compute_lanes`]): a Q4_K or Q5_K stack read row after
-    /// row, its rows whole groups of [`qdot::LANE_ROWS`], on a CPU with the
-    /// lane kernels.
+    /// ([`PairWork::compute_lanes`]): a Q4_K, Q5_K or Q6_K stack read row
+    /// after row, its rows whole groups of [`qdot::LANE_ROWS`], on a CPU with
+    /// the lane kernels.
     fn lanes(&self) -> bool {
         self.layout == RowLayout::Rows
             && qdot::has_lanes(self.ty)
