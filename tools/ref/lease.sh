@@ -79,10 +79,10 @@ unset __lease_dir
 # BLOOMERY_BOX_ENV: tools/box.sh does not carry it otherwise. card.py checks it before the lease file
 # is opened and prints its path, sha256 and body as [lease] lines, so the log carries the card ahead
 # of the run; a missing or refused card exits with card.py's code (card.py lists them; never 75).
-# A runner that runs its arms in rounds sets ROUNDS before lease_take, and an ab card is checked at
+# A runner that runs its arms in rounds sets ROUNDS before lease_take, and an ab or noninf card is checked at
 # that count; with no ROUNDS, at BLOOMERY_AB_ROUNDS (the count of a caller that starts this runner
 # once per arm, like tools/gpu-ab.py); else at the card's own `rounds`. ROUND_MINUTES, a runner's box
-# minutes per round, prices a ruler refusal.
+# minutes per round, prices a ruler or margin refusal.
 # BLOOMERY_LEASE_LOCK names another lock file, for the Mac stub tests (tools/ref/card-tests/run.sh).
 # A run under any other file holds no machine lease, so where /root/bloomery-cpu.lock exists (the box)
 # lease_take refuses the override (exit 64): a fake lock during a real sitting would contaminate it.

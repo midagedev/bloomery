@@ -53,7 +53,9 @@
 #             read only when an arm has an `@`); a name given twice; a value holding `,`, `@`, `|` or
 #             white space; a name the runner's own environment already sets (BLOOMERY_BOX_ENV reaches
 #             every arm, so the plain rows' labels would hide it); and `@` on a reference, server or bin:
-#             arm — a lever of ours is not a reference's.
+#             arm — a lever of ours is not a reference's. The item place=<a|gate|bp> is no lever: it is the
+#             arm's placement (Placement below), in its load key and its --place, never a variable its
+#             process gets; the label keeps it.
 #             `depth-qwen3moe.sh --parse-arms [--registry <registry.rs>] <arms...>` parses the arms as a
 #             run does and prints each arm's kind, depth, label, variables and load key — a prose arm's
 #             line also its corpus path and the file's first three ids (`-` when the file is not readable
@@ -331,7 +333,8 @@
 # may run, default 900: a hung arm ends at rc 124/137 as a FAIL row instead of holding the lease; a
 # shared load's process has that bound per arm and one more for its load, and one that prints nothing
 # for that long is killed),
-# BLOOMERY_GEN_PLACE (Qwen3.8 only: a or gate, passed as --place; unset passes none, the binary's a),
+# BLOOMERY_GEN_PLACE (Qwen3.8 only: a, gate or bp, passed as --place; unset passes none, the binary's a;
+# Placement below),
 # BLOOMERY_AB_ORDER, BLOOMERY_AB_WARMUP and BLOOMERY_WARM_ROWS (above), BLOOMERY_DRY=1 (print each arm's command line,
 # the binaries' tree lines and the rotation, or the blocks and their discards, then exit 0 before the
 # lease: nothing is loaded and nothing is timed).
@@ -355,6 +358,16 @@
 # `plan=` in its `time prompt` row), and `--seed-depth` is refused. Its reference is mainline llama.cpp at
 # its profile's hand-set -ncmoe placement and llama-bench's fit (models/qwen4exp.sh).
 #
+# Placement. A qwen4exp arm's own list may name its placement, `place=<a|gate|bp>` among its NAME=VALUE
+# items (`prose:512@place=bp`, `6@place=a,BLOOMERY_QWEN38_EXPERTS=host`): that arm runs at --place <word>
+# over BLOOMERY_GEN_PLACE, in a load of its own (the place is in the load key); the label keeps it
+# (`ours@prose@place=bp`), so `prose:512 prose:512@place=bp` is the same-binary placement A/B in the prose
+# table. place= on another profile, on a reference or server arm, a word outside a|gate|bp, an empty one
+# and place given twice are refused by name before anything runs (tools/ref/arm-place.sh, shared with
+# depth-ds41.sh and depth-glm5next.sh, its refusals one text in all three). Under one card a placement whose
+# card is not the timing card is refused (64), bp too; every row of an arm with a --place names it (`place
+# <p>`), and one whose load line names another placement is a FAIL row.
+#
 # Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh has the mode) runs the arms on both cards,
 # the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table (AGENTS.md, user
 # 2026-09-28: a model that does not fit one card; the reference on the same two cards, in the same
@@ -362,9 +375,13 @@
 # reads `A6000+3090`, so no reader puts it in the A6000 table. Only a profile with a two-card line
 # (TWO_CARD_PLACEMENT, models/qwen4exp.sh: its LCPP_GPU_FLAGS then carry -ts) runs in the mode, and only
 # its llama.cpp arms: lcpp, lcpppp[<U>] at the profile's split, the fit arms, whose fit places over
-# both cards, and the server arms lcppsrv… on the same flags in the server's spellings. An ours or bin: arm is refused by name before anything runs (generate_qwen3moe loads one
-# card; --place b is its expected two-card interface), and so are ik and mistral.rs arms (no two-card
-# line). Before the lease a card that does not answer, a 3090 off its cap or an unpatched lease.sh
+# both cards, and the server arms lcppsrv… on the same flags in the server's spellings, and the ours and
+# bin: arms at bp or a, each by its placement (Placement above; no --place runs a): a bp arm loads both cards,
+# an a arm plan (a) on the A6000 with the 3090 idle, its row in the A6000+3090 table all the same, and a gate
+# arm (a 3090-only row) is refused by name. After each of our arms the `cards=` field of its load line
+# (tools/ref/arm-place.sh place_arm_cards) must name the A6000 and the 3090 under bp and the A6000 alone
+# under a, or the arm is a FAIL row; a load line with no cards= field (generate_qwen3moe's prints none
+# today) is one too. ik and mistral.rs arms are refused by name (no two-card line). Before the lease a card that does not answer, a 3090 off its cap or an unpatched lease.sh
 # refuses the run; after every arm an Xid since the last arm, a card lost or off its cap, or a
 # llama-bench or llama-server that did not see both cards (its ggml_cuda_init lines) makes the arm a FAIL
 # row. A compute
@@ -534,7 +551,24 @@ q3_self_test() {
   want place-gate 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256|place=gate" \
     "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --place gate --time --arm-sync"
   run_parse BLOOMERY_GEN_PLACE=b -- 6
-  want place-bad 64 "BLOOMERY_GEN_PLACE is a (the A6000's plan) or gate (the 3090's)"
+  want place-bad 64 "BLOOMERY_GEN_PLACE is a (the A6000's plan), gate (the 3090's) or bp"
+  # An arm's place= (tools/ref/arm-place.sh): a qwen4exp file's only, the arm's own load key and --place,
+  # never a variable of its process; the lever list beside it still gated by the registry.
+  run_parse -- 6@place=a
+  want place-arm-other-file 64 "depth-qwen3moe.sh: arm '6@place=a': place=a: only a qwen4exp file takes --place"
+  out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen4exp BLOOMERY_AB_ROUNDS=2 "$BASH" "$me" --parse-arms 6 6@place=gate 6@place=gate,BLOOMERY_QWEN38_EXPERTS=host 2>&1)
+  rc=$?
+  want place-arm 0 "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256" \
+    "[parse] 6@place=gate: kind=ours depth=6 label=ours@place=gate env=- load=$bin|ctx=256|place=gate" \
+    "[parse] 6@place=gate,BLOOMERY_QWEN38_EXPERTS=host: kind=ours depth=6 label=ours@place=gate,BLOOMERY_QWEN38_EXPERTS=host env=BLOOMERY_QWEN38_EXPERTS=host load=$bin|ctx=256|place=gate|BLOOMERY_QWEN38_EXPERTS=host" \
+    "[parse] load: $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --place gate --time --arm-sync"
+  out=$(env -i PATH="$PATH" BLOOMERY_MODEL=qwen4exp BLOOMERY_AB_ROUNDS=2 "$BASH" "$me" --parse-arms 6@place=b2 2>&1)
+  rc=$?
+  want place-arm-word 64 "depth-qwen3moe.sh: arm '6@place=b2': place=b2: generate_qwen3moe takes --place a, gate or bp in this runner"
+  run_parse -- lcpp:6@place=a
+  want place-arm-ref 64 "depth-qwen3moe.sh: arm 'lcpp:6@place=a': place= sets generate_qwen3moe's --place, and lcpp is a reference engine's arm, which takes no placement of ours"
+  run_parse -- 6@place=a,FOO=1
+  want place-arm-lever 64 "FOO is no row of the lever registry"
   run_parse BLOOMERY_DATA="$pt/data" -- prose:4 bin:/root/r/t/target/release/generate_qwen3moe:prose:4
   want prose-bin 0 \
     "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:4: kind=bin depth=4 label=bin:t@prose env=- load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
@@ -587,10 +621,10 @@ PLACE=${BLOOMERY_GEN_PLACE:-}
 DRY=${BLOOMERY_DRY:-}
 case $PLACE in
   '') ;;
-  a | gate)
+  a | gate | bp)
     [ "$MODEL_NAME" = qwen4exp ] || { echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=$PLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)" >&2; exit 64; }
     ;;
-  *) echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE is a (the A6000's plan) or gate (the 3090's), or unset (no --place: the binary's a), got '$PLACE'" >&2; exit 64 ;;
+  *) echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE is a (the A6000's plan), gate (the 3090's) or bp (plan (b′), the two-card mode's), or unset (no --place: the binary's a), got '$PLACE'" >&2; exit 64 ;;
 esac
 case $GEN_CTX in
   *[!0-9]* | 0) echo "depth-qwen3moe.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
@@ -616,8 +650,12 @@ ours=0 ik=0 lcpp=0 lcppfit=0 mrs=0 srv=0
 # Per arm, by its index in ARMS: the kind (ours, ref, srv or bin), the depth, the row label, the engine
 # (ours, bin, or the reference's), the binary (ours and bin) and a server arm's ids (lcg).
 A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_IDS=()
-# A lever arm's NAME=VALUE list as given (comma-separated; empty for every other arm).
+# A lever arm's NAME=VALUE list as given less its place= item (comma-separated; empty for every other
+# arm): the variables its process gets.
 A_ENV=()
+# An ours or bin: arm's placement (its place= word, else BLOOMERY_GEN_PLACE; empty: no --place) and whether
+# place= set it (1, or empty); empty for a reference or server arm.
+A_PLACE=() A_PLACE_SET=()
 # A prose arm's prompt, the corpus's first P ids comma-separated as --tokens takes them (empty for
 # every other arm); under --parse-arms the placeholder `<prose_prompt P>` its load lines print.
 A_TOK=()
@@ -666,6 +704,24 @@ corpus_ids() {
 LEVER_ARM_RUNNER=depth-qwen3moe.sh LEVER_ARM_PASS=BLOOMERY_AB_LOAD=arm
 # shellcheck source=tools/ref/lever-arms.sh
 source "${BASH_SOURCE[0]%/*}/lever-arms.sh" || exit 2
+# An ours arm's place= (the header's Placement): tools/ref/arm-place.sh, shared with depth-ds41.sh and
+# depth-glm5next.sh. generate_qwen3moe's load line is no records.py kind: its cards are read from it here.
+# shellcheck disable=SC2034 # read by tools/ref/arm-place.sh
+PLACE_RUNNER=depth-qwen3moe.sh PLACE_BIN=generate_qwen3moe PLACE_WORDS='a gate bp'
+# shellcheck source=tools/ref/arm-place.sh
+source "${BASH_SOURCE[0]%/*}/arm-place.sh" || exit 2
+# split_at <arm> <list>: an ours arm's @ list into AT (as given: its label's), ENVS (its lever list, checked
+# by lever-arms.sh) and APLACE (its place= word, empty without one), which only a qwen4exp file takes.
+split_at() {
+  AT=$2
+  [ -n "$2" ] || arm_envs_ok "$1" "$2"
+  arm_place_split "$1" "$2"
+  ENVS=$ARM_REST APLACE=$ARM_PLACE
+  [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
+  if [ -n "$APLACE" ] && [ "$MODEL_NAME" != qwen4exp ]; then
+    place_refuse "$1" "place=$APLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)"
+  fi
+}
 # A prefill arm's engine (ikpp[<U>], lcpppp[<U>], lcppppfit[<U>], mrspp), and its ubatch lever U (empty:
 # the default).
 pp_eng() { case $1 in ikpp* | lcpppp* | mrspp) return 0 ;; *) return 1 ;; esac; }
@@ -677,14 +733,17 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 # shellcheck source=tools/ref/lcpp-warm.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE=''
   # `@` is ours only (a <D> arm's or a prose arm's list): split at it first, so a value with a `:` is
-  # not read as a reference's arm.
+  # not read as a reference's arm. place= on a reference arm is refused by name (the header's Placement).
   case ${a%%@*} in
     "$a") ;;
     prose:*) ;;
     bin:*) arm_refuse "$a" "'@' sets a lever of this tree's binary, and a bin: arm is another build, run as it is" ;;
-    *:*) arm_refuse "$a" "'@' sets a lever of ours, and ${a%%:*}: is a reference engine's arm — a lever of ours is not a reference's" ;;
+    *:*)
+      ! arm_has_place "${a#*@}" || place_ref_refuse "$a" "${eng%%+*}"
+      arm_refuse "$a" "'@' sets a lever of ours, and ${a%%:*}: is a reference engine's arm — a lever of ours is not a reference's"
+      ;;
   esac
   if srv_eng "$eng"; then
     ids=lcg label=$eng
@@ -701,6 +760,7 @@ for a in "${ARMS[@]}"; do
     srv_check_arm "$a" || { echo "depth-qwen3moe.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     srv=1
     A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_IDS+=("$ids") A_ENV+=('') A_TOK+=("$tok")
+    A_PLACE+=('') A_PLACE_SET+=('')
     continue
   fi
   case $a in
@@ -730,15 +790,16 @@ for a in "${ARMS[@]}"; do
       kind=ours eng=prose bin=$BIN
       dep=${a#prose:}
       label=ours@prose
-      case $dep in *@*) envs=${dep#*@} dep=${dep%%@*} label=ours@prose@$envs && arm_envs_ok "$a" "$envs" ;; esac
+      case $dep in *@*) split_at "$a" "${dep#*@}" && envs=$ENVS dep=${dep%%@*} label=ours@prose@$AT ;; esac
       case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
       corpus_check "$a" "$dep"
       tok=$(corpus_ids "$dep")
       ours=1
       ;;
     *@*)
-      kind=ours eng=ours dep=${a%%@*} envs=${a#*@} bin=$BIN label=ours@${a#*@} ours=1
-      arm_envs_ok "$a" "$envs"
+      kind=ours eng=ours dep=${a%%@*} bin=$BIN label=ours@${a#*@} ours=1
+      split_at "$a" "${a#*@}"
+      envs=$ENVS
       ;;
     *:*)
       case $dep in prose:*) arm_refuse "$a" "prose:<P> is ours on the corpus's first P ids, and ${eng}: is a reference engine, which feeds its own prompt ids" ;; esac
@@ -781,6 +842,8 @@ for a in "${ARMS[@]}"; do
     exit 64
   fi
   A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok")
+  # An ours or bin: arm's placement: its place=, else BLOOMERY_GEN_PLACE (empty: no --place, the binary's a).
+  if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
 # The load keys (tools/ref/load-groups.sh): an ours arm's binary and its --ctx, the cache height and the
 # flash grid the load fixes, so ours arms share a load when they share C (BLOOMERY_GEN_CTX, or one D).
@@ -808,7 +871,7 @@ arm_env_list() {
 for i in "${!ARMS[@]}"; do
   LG_KEY[i]=
   [ "${A_KIND[$i]}" = ours ] || continue
-  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")${PLACE:+|place=$PLACE}"
+  LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")${A_PLACE[$i]:+|place=${A_PLACE[$i]}}"
   [ -n "${A_ENV[$i]}" ] || continue
   env_key=$(lg_env_key "$(arm_env_list "$i")")
   [ -z "$env_key" ] || LG_KEY[i]+="|$env_key"
@@ -831,7 +894,7 @@ lg_cmd() {
   LG_CMD=("$BIN")
   for i in "$@"; do LG_CMD+=(--arm "$(arm_prompt "$i")"); done
   # shellcheck disable=SC2206 # an empty WARM adds nothing
-  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" ${PLACE:+--place "$PLACE"} --time ${WARM:+--warm "$WARM"} --arm-sync)
+  LG_CMD+=(-n "$N" --ctx "$(arm_ctx "$1")" ${A_PLACE[$1]:+--place "${A_PLACE[$1]}"} --time ${WARM:+--warm "$WARM"} --arm-sync)
 }
 # srv_ctx_of <i> <n_predict>: a server arm's -c, ours' context at its D or P (lcpp-warm.sh's Context).
 srv_ctx_of() { echo "${GEN_CTX:-$(((A_DEP[$1] + N + 255) / 256 * 256))}"; }
@@ -882,23 +945,29 @@ TIMING_CARDS_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 timing_cards_mode || exit $?
+# The reference and server arms' two-card lines (timing-card.sh); our arms are held to their placements
+# below.
 TC_ARMS=()
-for i in "${!ARMS[@]}"; do TC_ARMS+=("${ARMS[$i]}" "${A_KIND[$i]}" "${A_ENG[$i]}"); done
-timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
-# Qwen3.8's placement names its card (workstation::plan_a, plan_gate: the card found by name), and the arms
-# see the timing card only.
-if [ "$ours" = 1 ] && [ -n "$PLACE" ]; then
-  want=$GPU_A6000
-  [ "$PLACE" = a ] || want=$GPU_3090
-  if [ -z "$want" ]; then
-    echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=$PLACE loads on the $([ "$PLACE" = a ] && echo A6000 || echo 3090), and tools/ref/cards.sh resolved no UUID for it (${CARDS_ERROR:-no reason given})" >&2
-    exit 64
+for i in "${!ARMS[@]}"; do
+  case ${A_KIND[$i]} in ref | srv) TC_ARMS+=("${ARMS[$i]}" "${A_KIND[$i]}" "${A_ENG[$i]}") ;; esac
+done
+timing_cards_arms "$BIN" ${TC_ARMS[@]+"${TC_ARMS[@]}"} || exit $?
+# Each ours and bin: arm's placement against the mode and the timing card (tools/ref/arm-place.sh): Qwen3.8's
+# placement names its card (workstation::plan_a, plan_gate: the card found by name; plan_bp both);
+# BLOOMERY_GEN_PLACE once for the arms that follow it, an arm's place= for that arm. With no --place the
+# binary runs a, which the two-card mode checks as a; under one card it is not checked, as before.
+PLACE_SEEN=0 PLACES_SET='' PLACE_ARMS=()
+for i in "${!ARMS[@]}"; do
+  case ${A_KIND[$i]} in ours | bin) ;; *) continue ;; esac
+  PLACE_ARMS+=("$i")
+  if [ -n "${A_PLACE_SET[$i]}" ]; then
+    PLACES_SET=1
+    place_check "${ARMS[$i]}" "${A_PLACE[$i]}"
+  elif [ "$PLACE_SEEN" = 0 ] && { [ -n "$PLACE" ] || [ -n "$TIMING_CARDS" ]; }; then
+    place_check '' "${PLACE:-a}"
+    PLACE_SEEN=1
   fi
-  [ "$TIMING_GPU" = "$want" ] || {
-    echo "depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=$PLACE loads on the $([ "$PLACE" = a ] && echo A6000 || echo 3090), and the timing card is $TIMING_GPU (BLOOMERY_TIMING_GPU): generate_qwen3moe would refuse every arm" >&2
-    exit 64
-  }
-fi
+done
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
@@ -1232,7 +1301,7 @@ ours_arm() {
   ours_pre "$i" "$r"
   t0=$(date +%s)
   f0=$(majflt_now)
-  out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${PLACE:+--place "$PLACE"} --time ${WARM:+--warm "$WARM"} 2>&1)
+  out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
   rc=$?
   f1=$(majflt_now)
   t1=$(date +%s)
@@ -1280,9 +1349,17 @@ ours_post() {
   fi
   pp_col "${A_KIND[$i]}" "$out" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"; return 0; }
   # The placement it was given: its own `load` line, or its load's (LG_HEADER).
-  if [ -n "$PLACE" ]; then
+  if [ -n "${A_PLACE[$i]}" ]; then
     ran=$(printf '%s\n%s\n' "$out" "${LG_HEADER:-}" | sed -n 's/^load .* place=\([a-z]*\).*/\1/p' | head -n 1)
-    [ "$ran" = "$PLACE" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its load line names place=${ran:-none}; the runner passed --place $PLACE" "$out"; return 0; }
+    [ "$ran" = "${A_PLACE[$i]}" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its load line names place=${ran:-none}; the runner passed --place ${A_PLACE[$i]}" "$out"; return 0; }
+  fi
+  # Two cards: an Xid, a card lost or off its cap, or a load whose cards are not its placement's (bp both
+  # cards, a the A6000 alone; no --place is a) fails the arm. The cards are the load line's `cards=` field
+  # (tools/ref/arm-place.sh place_arm_cards), none when it has no such field.
+  if [ -n "$TIMING_CARDS" ]; then
+    local lcards
+    lcards=$(printf '%s\n%s\n' "$out" "${LG_HEADER:-}" | sed -n 's/^load .* cards=\(\[[^]]*\]\).*/\1/p' | head -n 1)
+    place_arm_cards "$out" "${A_PLACE[$i]:-a}" "$lcards" || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "two cards: $TWOCARD_WHY" "$out"; return 0; }
   fi
   # Under BLOOMERY_DRAFT=mtp the `mtp summary` record: E(4), the positions a four-row window kept on
   # average, beside the per-position rate the SMOKE mean already is. Under BLOOMERY_STEP_STATS=1 the
@@ -1343,7 +1420,10 @@ ours_post() {
     timed='? (a one-arm run prints its prompt ids before its load: the whole process)'
   fi
   cold_verdict "$r" "$label" "d=$dep" "${MAJ_TIMED:-$MAJ_WHOLE}" "$win" || return 0
-  echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${PLACE:+ | place $PLACE} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
+  # The row names its placement: the arm's --place, or a in the two-card mode with none (the binary's).
+  local rowplace=${A_PLACE[$i]}
+  [ -n "$rowplace" ] || [ -z "$TIMING_CARDS" ] || rowplace=a
+  echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
   counted || return 0
   count_row
   sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
@@ -1538,9 +1618,9 @@ dry_cmd() {
   fi
   if lg_grouped "$i"; then
     arm_envs "$i"
-    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${PLACE:+ --place $PLACE} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
+    echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
   else
-    echo "timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${PLACE:+ --place $PLACE} --time${WARM:+ --warm $WARM}$note"
+    echo "timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM}$note"
   fi
 }
 
@@ -1591,6 +1671,7 @@ ratio_table() {
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s timing_gpu=$TIMING_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
   echo "[dry] place: ${PLACE:-unset, the binary default a}"
+  [ -z "$PLACES_SET" ] || echo "[dry] placements: $(place_line "${PLACE_ARMS[@]}")"
   echo "[dry] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0} now: $(cpu_busy_reading)"
   if [ -n "$TIMING_CARDS" ]; then
     echo "[dry] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
@@ -1629,6 +1710,7 @@ timing_cards_start
 [ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}${PLACE:+ --place $PLACE}"
+[ -z "$PLACES_SET" ] || echo "[config] placements: $(place_line "${PLACE_ARMS[@]}")"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 [ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $(corpus_file) (${PROSE_N} ids), in prose's own tables"
 blocks_config

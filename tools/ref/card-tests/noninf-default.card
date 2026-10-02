@@ -1,0 +1,11 @@
+# Fixture: the same band at the default margin 1.0 %: its lower edge -1 % sits on -margin, so no round count clears it.
+kind: noninf
+question: is the fixture placement no slower than the base by more than the margin?
+term: decode tok/s @ n=96, depth 512, A6000+3090 — (changed − base) / base, paired by round
+unit: %
+predict: -1..+5
+rounds: 10
+condition: both arms alternate in one lease, the order rotated every round; no row carries [cpu-busy] or [other-busy]
+decide-in: flip the default on a pass
+decide-below: keep the base and find the wrong term
+decide-above: flip on a pass and re-derive the term the model understated

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The depth-ds41.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_DS41_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
-# timing-card.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh, lcpp-fit.sh,
+# timing-card.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh, lcpp-fit.sh, arm-place.sh,
 # cold-blocks.sh, lcpp-warm.sh and tools/bloomery, and a copy of lease.sh whose lease_take is replaced by a
 # line that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs; ref-paths.sh there
 # is a stub
@@ -67,8 +67,15 @@
 #   twocard      lcpp:6 lcpppp:4, one round, the preheat on: the decode row and the json prefill row (its
 #                device lines on stderr) carry `A6000+3090` and both cards, the stub llama-bench got -ts
 #                1.5/1.5, the witness's two-card lines; rc 0.
-#   twocard-arms 6, code:4 and ik:6 each refused by name before anything runs (rc 64); ours under
-#                --place a naming its two-card placement, bp.
+#   twocard-arms 6@place=gate, code:4@place=gate, prose:4@place=a,BLOOMERY_DRAFT=dspark and ik:6 each
+#                refused by name before anything runs (rc 64): the gate plan loads the 3090 alone, an a
+#                arm's DSpark draft would load the 3090, ik has no two-card arm.
+#   twocard-place  BLOOMERY_GEN_PLACE=bp, prose:4 prose:4@place=a lcpp:6, one round: each placement its own
+#                load (--place bp, --place a), its row `place <p>` and `A6000+3090`, the a arm's load record
+#                the A6000 alone, the ratio prose/prose@place=a, the [config] placements line; rc 0.
+#   twocard-place-3090  an a arm whose load record names the 3090 (STUB_GEN_CARDS_A): its FAIL row naming
+#                the cards, the bp row; rc 1.
+#   twocard-place-dry  the dry run: each arm's --place and load key, the placements line, no `env place=`.
 #   twocard-srv  lcppsrv:6 lcppsrvpp:4, one round: the server arms run in the mode, the profile's -ts in each
 #                server's command line, each row `A6000+3090` and both cards as its device; rc 0.
 #   twocard-srv-one, twocard-srv-xid  a server that saw one CUDA device, one during which an Xid 79 line
@@ -78,6 +85,13 @@
 #   twocard-bp-one  the same with a load record naming the A6000 alone (STUB_GEN_CARDS): ours is a FAIL row
 #                naming the cards it saw; rc 1.
 #   bp-onecard   BLOOMERY_GEN_PLACE=bp outside the two-card mode: refused by name, rc 64.
+# An arm's place= (`<arm>@place=<a|gate|bp>`, red on the runner before it: it passes `place` to the binary as
+# a variable, which the stub refuses at rc 9, or refuses the arm as arm usage):
+#   bp-onecard-arm  6@place=bp outside the two-card mode: refused by name, rc 64.
+#   place-ref, place-ref-srv  lcpp:6@place=a, lcppsrv:6@place=a: place= on a reference arm, refused by name.
+#   place-word, place-twice  place=b2, place given twice: refused by name, rc 64.
+#   place-card   6@place=gate with the A6000 as the timing card: refused by name, rc 64.
+#   place-one    6 6@place=a 6@place=a,STUB_X=1, one card: three rows at place a, the ratio ours/ours@place=a.
 #   twocard-xid  lcpp:6 lcpppp:4, an Xid during the prefill arm: its FAIL row naming it, the decode row; rc 1.
 #   twocard-dry  the dry run: the two-card lines, the precheck's `ok`, the lcpp line with -ts.
 #   twocard-own  BLOOMERY_GEN_PLACE=bp, 6 4, one round: one load of both ours arms in one process, and a
@@ -194,7 +208,8 @@ mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/bin" "$T/dat
 cp "$RUNNER" "$T/tools/ref/depth-ds41.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" \
-  "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" \
+  "$ROOT/tools/ref/arm-place.sh" "$T/tools/ref/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
@@ -310,8 +325,11 @@ cp "$T/bin/bench" "$T/bin/ik-bench"
 mv "$T/bin/bench" "$T/bin/lcpp-bench"
 touch "$T/Cargo.toml"
 # The stub generate_ds41: refuses depth STUB_GEN_FAIL_DEPTH the first time (a marker file), and names
-# STUB_GEN_PLACE in its SMOKE footer when set. Under --place bp, or with STUB_GEN_CARDS, its load line
-# names the cards (`cards=`, both under bp unless STUB_GEN_CARDS says otherwise). Under --arm it runs the list after one `load` line, each
+# STUB_GEN_PLACE in its SMOKE footer when set. Under --place bp, under two visible cards (the two-card
+# mode's CUDA_VISIBLE_DEVICES) or with STUB_GEN_CARDS, its load line names the cards it loaded as
+# generate_ds41's does (`cards=`: the A6000 under a, the 3090 under gate, both under bp), STUB_GEN_CARDS in
+# their stead, STUB_GEN_CARDS_A under --place a alone. A variable named `place` in its environment (an
+# arm's place= item passed as a variable) ends it at rc 9. Under --arm it runs the list after one `load` line, each
 # arm opening with its `arm` record and, under --arm-sync, waiting for a line on stdin; every process
 # appends a line to $TMPDIR/stub-gen-loads. BLOOMERY_RESIDENCY unset is off, as in a binary from before the
 # placement default (a bin: base); under STUB_RES_UNSET=place it resolves as generate_ds41 does — mid-p40-s1
@@ -329,6 +347,10 @@ touch "$T/Cargo.toml"
 # STUB_GEN_TOKEN0 (1000) and then 1001, 1002, ... as the step lines.
 cat > "$T/target/release/generate_ds41" << 'EOF'
 #!/usr/bin/env bash
+if printenv place > /dev/null; then
+  echo "error: a variable named place reached the binary (place=$(printenv place)): the runner passed an arm's place= item as a variable" >&2
+  exit 9
+fi
 depth='' n=32 place=a tokens='' sync='' arms=() plan=''
 while [ $# -gt 0 ]; do
   case $1 in
@@ -348,7 +370,16 @@ echo $$ >> "${TMPDIR:-/tmp}/stub-gen-pids"
 [ ${#arms[@]} -gt 0 ] || arms=("$depth")
 echo "plan place=$place (stub)"
 cards=${STUB_GEN_CARDS:-}
-[ -n "$cards" ] || [ "$place" != bp ] || cards='[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]'
+[ "$place" != a ] || [ -z "${STUB_GEN_CARDS_A:-}" ] || cards=$STUB_GEN_CARDS_A
+case $place:${CUDA_VISIBLE_DEVICES:-} in
+  bp:* | *:*,*)
+    case $place in
+      a) [ -n "$cards" ] || cards='[NVIDIA_RTX_A6000]' ;;
+      gate) [ -n "$cards" ] || cards='[NVIDIA_GeForce_RTX_3090]' ;;
+      *) [ -n "$cards" ] || cards='[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' ;;
+    esac
+    ;;
+esac
 if [ -n "$cards" ]; then
   echo "load resident_bytes=0 place=$place cards=$cards arms=${#arms[@]} ctx=$lctx (stub)"
 else
@@ -771,9 +802,53 @@ twocard_refused() {
     pass "$name"
   fi
 }
-twocard_refused twocard-arms "^depth-ds41.sh: arm '6': generate_ds41 under --place a loads one card; its two-card placement is --place bp \(BLOOMERY_GEN_PLACE=bp\)$" lcpp:6 6
-twocard_refused twocard-arms-code "^depth-ds41.sh: arm 'code:4': generate_ds41 under --place a loads one card; " lcpp:6 code:4
+# The gate plan in the mode (re-pinned 2026-10-02, round armplace: these two cases held `a` refused in the
+# mode, and an `a` arm now runs there with the 3090 idle, twocard-place below; the placement the mode
+# refuses is the gate plan, a 3090-only row in the A6000+3090 table).
+twocard_refused twocard-arms "^depth-ds41.sh: arm '6@place=gate': place=gate is the gate plan, which loads the 3090 alone; the two-card mode times a \(plan \(a\) on the A6000, the 3090 idle\) or bp \(plan \(b′\), both cards\)$" lcpp:6 6@place=gate
+twocard_refused twocard-arms-code "^depth-ds41.sh: arm 'code:4@place=gate': place=gate is the gate plan, which loads the 3090 alone; " lcpp:6 code:4@place=gate
+twocard_refused twocard-arms-dspark "^depth-ds41.sh: arm 'prose:4@place=a,BLOOMERY_DRAFT=dspark': BLOOMERY_DRAFT=dspark puts the draft on the 3090, and in the two-card mode an a arm keeps the 3090 idle: run the draft under place=bp$" prose:4@place=a,BLOOMERY_DRAFT=dspark
 twocard_refused twocard-arms-ik "^depth-ds41.sh: arm 'ik:6': the two-card table.s reference is mainline llama.cpp .*; ik has no two-card arm$" lcpp:6 ik:6
+
+# A per-arm placement (red on the runner before it, which passes `place=` to the binary as a variable: the
+# stub exits 9). a and bp arms in one two-card run: each its own load, its row `place <p>` and the mode's
+# card field, the a arm's load record the A6000 alone, the ratio table prose (bp) / prose@place=a.
+L=$tmp/twocard-place.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp -- prose:4 prose:4@place=a lcpp:6
+if [ "$RC" != 0 ]; then
+  fail twocard-place "rc $RC, want 0" "$L"
+elif want twocard-place "$L" 1 '^ROW r1 prose d=4 n=4 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 4, A6000\+3090 \| place bp \| ' &&
+  want twocard-place "$L" 1 '^ROW r1 prose@place=a d=4 n=4 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 4, A6000\+3090 \| place a \| ' &&
+  want twocard-place "$L" 1 '^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 ' &&
+  want twocard-place "$L" 1 '^    load resident_bytes=0 place=a cards=\[NVIDIA_RTX_A6000\] ' &&
+  want twocard-place "$L" 1 '^    load resident_bytes=0 place=bp cards=\[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090\] ' &&
+  want twocard-place "$L" 1 '^ratio prose d=4 +prose/prose@place=a ' &&
+  want twocard-place "$L" 1 '^\[config\] placements: prose:4 bp, prose:4@place=a a \(an arm.s place= over BLOOMERY_GEN_PLACE=bp\)$' &&
+  want twocard-place "$L" 0 '^FAIL '; then
+  pass twocard-place
+fi
+# An a arm whose load record names the 3090: a FAIL row naming the cards.
+L=$tmp/twocard-place-3090.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp \
+  'STUB_GEN_CARDS_A=[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' -- prose:4 prose:4@place=a
+if [ "$RC" != 1 ]; then
+  fail twocard-place-3090 "rc $RC, want 1" "$L"
+elif want twocard-place-3090 "$L" 1 "^FAIL r1 prose@place=a d=4 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090\], and --place a loads the A6000 alone: the 3090 must stay idle; last line: " &&
+  want twocard-place-3090 "$L" 1 '^ROW r1 prose d=4 .* \| place bp \| ' &&
+  want twocard-place-3090 "$L" 1 '^failed arms: r1 prose@place=a d=4 rc=0; $'; then
+  pass twocard-place-3090
+fi
+# The dry run: each arm's --place, the load keys apart, the placements line.
+L=$tmp/twocard-place-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 "$TC" BLOOMERY_GEN_PLACE=bp -- prose:4 prose:4@place=a
+if [ "$RC" != 0 ]; then
+  fail twocard-place-dry "rc $RC, want 0" "$L"
+elif want twocard-place-dry "$L" 1 "^\[dry\] prose:4@place=a: one arm of a load: .*/generate_ds41 --arm prose:4 -n 4 --place a --time --arm-sync   # row label 'prose@place=a', load key [^ ]*\|place=a\|$" &&
+  want twocard-place-dry "$L" 1 "^\[dry\] prose:4: one arm of a load: .*/generate_ds41 --arm prose:4 -n 4 --place bp --time --arm-sync   # row label 'prose', load key [^ ]*\|place=bp\|$" &&
+  want twocard-place-dry "$L" 1 '^\[dry\] placements: prose:4 bp, prose:4@place=a a \(an arm.s place= over BLOOMERY_GEN_PLACE=bp\)$' &&
+  want twocard-place-dry "$L" 0 'env place='; then
+  pass twocard-place-dry
+fi
 
 L=$tmp/twocard-srv.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" -- lcppsrv:6 lcppsrvpp:4
@@ -835,6 +910,41 @@ if [ "$RC" != 64 ]; then
 elif want bp-onecard "$L" 1 '^depth-ds41.sh: BLOOMERY_GEN_PLACE=bp is plan \(b′\), which loads on both cards .* it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000\+3090$' &&
   want bp-onecard "$L" 0 '^(ROW|FAIL) |^\[stub\] no lease'; then
   pass bp-onecard
+fi
+
+# place_refused <name> <pattern> <env…> -- <arms…>: the run refused before anything runs, rc 64, the pattern on
+# one line, no row, witness or lease.
+place_refused() {
+  local name=$1 pat=$2
+  shift 2
+  L=$tmp/$name.log
+  stub_run "$L" "$@"
+  if [ "$RC" != 64 ]; then
+    fail "$name" "rc $RC, want 64" "$L"
+  elif want "$name" "$L" 1 "$pat" && want "$name" "$L" 0 '^(ROW|FAIL|DISCARD|WARMUP) |^--- witness|^\[stub\] no lease'; then
+    pass "$name"
+  fi
+}
+# An arm's place= (red on the runner before it: it runs the arm with a variable named place, or refuses it
+# as arm usage).
+place_refused bp-onecard-arm "^depth-ds41.sh: arm '6@place=bp': place=bp is plan \(b′\), which loads on both cards \(the A6000 and its 3090 expert tier\); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000\+3090$" -- 6 6@place=bp
+place_refused place-ref "^depth-ds41.sh: arm 'lcpp:6@place=a': place= sets generate_ds41's --place, and lcpp is a reference engine's arm, which takes no placement of ours$" -- 6 lcpp:6@place=a
+place_refused place-ref-srv "^depth-ds41.sh: arm 'lcppsrv:6@place=a': place= sets generate_ds41's --place, and lcppsrv is a reference engine's arm, " -- 6 lcppsrv:6@place=a
+place_refused place-word "^depth-ds41.sh: arm '6@place=b2': place=b2: generate_ds41 takes --place a, gate or bp in this runner$" -- 6 6@place=b2
+place_refused place-twice "^depth-ds41.sh: arm '6@place=a,place=a': place is given twice$" -- 6 6@place=a,place=a
+place_refused place-card "^depth-ds41.sh: arm '6@place=gate': place=gate is the gate plan, which loads on the 3090, and the timing card is " -- 6 6@place=gate
+# One card: an arm whose list holds place= alone, beside a lever: both run at --place a, no variable named
+# place reaches the binary.
+L=$tmp/place-one.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- 6 6@place=a 6@place=a,STUB_X=1
+if [ "$RC" != 0 ]; then
+  fail place-one "rc $RC, want 0" "$L"
+elif want place-one "$L" 1 '^ROW r1 ours d=6 .* \| place a \| ' &&
+  want place-one "$L" 1 '^ROW r1 ours@place=a d=6 .* \| place a \| ' &&
+  want place-one "$L" 1 '^ROW r1 ours@place=a,STUB_X=1 d=6 .* \| place a \| ' &&
+  want place-one "$L" 1 '^ratio d=6 +ours/ours@place=a ' &&
+  want place-one "$L" 0 '^FAIL '; then
+  pass place-one
 fi
 
 L=$tmp/twocard-xid.log
@@ -1422,7 +1532,7 @@ if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
     "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
     "$tmp"/solo.log "$tmp"/grouped-dry.log "$tmp"/fit.log "$tmp"/fit-preheat.log "$tmp"/fit-nobench.log \
-    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/bp-onecard.log "$tmp"/srv*.log "$tmp"/warm*.log \
+    "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/bp-onecard*.log "$tmp"/place-*.log "$tmp"/srv*.log "$tmp"/warm*.log \
     "$tmp"/res-*.log "$tmp"/bin-*.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"

@@ -12,6 +12,7 @@ The card changes when a run may start, never what a runner measures.
 
   card.py check <file> [--rounds N] [--round-minutes M]
   card.py lease <path> [--rounds N] [--round-minutes M]
+  card.py verdict <file> <ratio>...
 
 check   validates <file>, any path, and prints `card: ok …`, or `card: refused <NAME> (rc <n>): …` on
         stderr with the exit code below.
@@ -20,8 +21,17 @@ lease   what lease_take runs. <path> is tree-relative, docs/cards/<slug>.card (s
         documentation, not a run's card, and are refused. After the same checks it prints the card's
         path, sha256 and body as `[lease]` lines, so the run's log carries its prediction before
         the measurement starts.
---rounds N         the runner's actual round count: an ab card is checked at N instead of its own
-                   `rounds`, and a difference is printed. The other kinds take no rounds and ignore it.
+verdict a noninf card's outcome after its sitting: <ratio>... are the per-round ratios changed / base,
+        as the depth runners' ratio line prints them after `per round:` (`r1 1.0123 r2 0.9987 …`; an
+        `r<k>` label must be followed by its number, and bare numbers are taken too). It prints their
+        mean ± the 95 % half-interval exactly as that line does (Student t at n - 1 df, 4 digits), the
+        effect and its lower bound in percent, pass or fail against -margin, the band region the mean
+        falls in, and that region's decision. Exit 0 on pass, 1 on fail. The runners' line is
+        <bare arm> / <arm with an @ list>, so the changed arm is the bare one: a placement A/B sets
+        the changed placement in BLOOMERY_GEN_PLACE and the base as the other arms' @place=.
+--rounds N         the runner's actual round count: an ab or noninf card is checked at N instead of
+                   its own `rounds`, and a difference is printed. The other kinds take no rounds and
+                   ignore it.
 --round-minutes M  the runner's box minutes per round: a ruler refusal then prices the rounds that
                    would resolve it.
 
@@ -31,17 +41,20 @@ the line right above it (a key line or another continuation), joined with one sp
 An unknown key, a key the card's kind does not take, a missing or empty required key, or a value
 that does not parse is CARD_MALFORMED.
 
-  kind          ab | profile | calibration | baseline | exclusive
+  kind          ab | noninf | profile | calibration | baseline | exclusive
   question      what the run answers
   term          the one term the run measures, with its conditions (`tok/s @ n=N, depth D, card`)
-  unit          the unit of `predict`; `%` for ab
+  unit          the unit of `predict`; `%` for ab and noninf
   predict       the band the derivation gives: `lo..hi`, decimal numbers with lo <= hi, optionally
-                followed by the unit. For ab it is the effect in percent, signed: (changed - base) /
-                base of `term`, so + means the changed arm's value is the larger one
-  rounds        ab only, required: rounds per arm; a round runs every arm once
-  sd            ab only, optional: the scatter of one run in percent, then where it comes from, e.g.
-                `sd: 0.45 % <rig-log entry>, paired ratio SD over 5 rounds`; a number with no source
-                is malformed. Default: 0.6 %, AGENTS.md 「Know the ruler」
+                followed by the unit. For ab and noninf it is the effect in percent, signed: (changed -
+                base) / base of `term`, so + means the changed arm's value is the larger one
+  rounds        ab and noninf only, required: rounds per arm; a round runs every arm once
+  sd            ab and noninf only, optional: the scatter of one run in percent, then where it comes
+                from, e.g. `sd: 0.45 % <rig-log entry>, paired ratio SD over 5 rounds`; a number with
+                no source is malformed. Default: 0.6 %, AGENTS.md 「Know the ruler」
+  margin        noninf only, optional: the loss the changed arm may show and still pass, in percent,
+                then the reason for it, e.g. `margin: 2.0 % <why this loss is acceptable>`; a number
+                with no reason is malformed. Default: 1.0 %, about the ruler's spread at 4-6 rounds
   condition     what must happen inside the measured window, and how the run ensures it
   decide-in     the next action when the measured value falls inside the band
   decide-below  the next action when it falls below lo
@@ -56,6 +69,11 @@ An exclusive card takes kind, reason and minutes and nothing else: it predicts n
 prediction, decision or ruler check. Every other kind takes kind, question, term, unit, predict,
 condition and the three decisions, plus the keys named above for it.
 
+A noninf card asks whether the changed arm is not slower than the base by more than its margin: a
+band that holds 0 (a placement change whose derivation allows a small loss) is decidable this way, where
+an ab card at any round count is not. Its decisions should follow the verdict's pass or fail, and the
+band region name which term to re-derive.
+
 Checks, in this order. The text parses (CARD_MALFORMED). At least two of the three decisions differ,
 compared with case and whitespace folded (CARD_UNDECIDABLE). An ab card meets the ruler: the 95 %
 half-width of a difference of two arm means at N rounds per arm,
@@ -67,7 +85,17 @@ tools/ref/tdist.py), which is the form that gives AGENTS.md's ±1.0 % at four ro
 six with sd 0.6 % — the normal quantile 1.96 in place of t gives 0.83 % and 0.68 %. The card is
 refused (CARD_UNDER_RULER) when the band's edge nearest zero is inside h, |edge| <= h; a band that
 contains 0 has its nearest edge at 0, and no round count resolves it. The refusal names the smallest
-N that resolves the band and, given --round-minutes, the box minutes those rounds cost.
+N that resolves the band and, given --round-minutes, the box minutes those rounds cost. A noninf card
+meets its margin instead: the ruler is the depth runners' paired interval on the per-round ratio
+(tools/ref/depth-ds41.sh ratio_table), whose SD is sqrt(2) * sd for two independent runs,
+
+    h_p = t(0.975, N - 1) * sd * sqrt(2 / N)
+
+and the card is refused (CARD_UNDER_MARGIN) unless lo - h_p > -margin: the band's lower edge, less the
+interval the sitting will print, must clear the margin, or a prediction that comes true could still
+fail the sitting. The refusal names the smallest N that clears it, or that none does when lo <= -margin,
+and the margin the card would need at its N. The sitting passes (verdict) when the measured lower
+bound, (mean - half-interval - 1) * 100, is above -margin.
 
 Exit codes (never 75, which is lease contention):
    0  the card passes
@@ -78,6 +106,10 @@ Exit codes (never 75, which is lease contention):
   67  CARD_UNDECIDABLE  the three decisions are one action
   68  CARD_UNDER_RULER  an ab card's predicted effect is inside the ruler at its rounds
   70  the t table in tools/ref/tdist.py does not load
+  71  CARD_UNDER_MARGIN a noninf card's lower edge less the paired interval at its rounds does not
+                        clear -margin
+verdict: 0 the sitting passes, 1 it fails, 64 a bad ratio list or a card that is not noninf, and the
+check's codes for the card itself.
 """
 import hashlib
 import importlib.util
@@ -88,21 +120,24 @@ import sys
 
 TREE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-USAGE, MALFORMED, ABSENT, UNDECIDABLE, UNDER_RULER, SOFTWARE = 64, 65, 66, 67, 68, 70
+USAGE, MALFORMED, ABSENT, UNDECIDABLE, UNDER_RULER, SOFTWARE, UNDER_MARGIN = 64, 65, 66, 67, 68, 70, 71
 NAMES = {MALFORMED: 'CARD_MALFORMED', ABSENT: 'CARD_ABSENT', UNDECIDABLE: 'CARD_UNDECIDABLE',
-         UNDER_RULER: 'CARD_UNDER_RULER'}
+         UNDER_RULER: 'CARD_UNDER_RULER', UNDER_MARGIN: 'CARD_UNDER_MARGIN'}
 
-KINDS = ('ab', 'profile', 'calibration', 'baseline', 'exclusive')
+KINDS = ('ab', 'noninf', 'profile', 'calibration', 'baseline', 'exclusive')
 PREDICTION = ('question', 'term', 'unit', 'predict', 'condition', 'decide-in', 'decide-below',
               'decide-above')
-REQUIRED = {'ab': ('kind',) + PREDICTION + ('rounds',), 'profile': ('kind',) + PREDICTION,
+REQUIRED = {'ab': ('kind',) + PREDICTION + ('rounds',), 'noninf': ('kind',) + PREDICTION + ('rounds',),
+            'profile': ('kind',) + PREDICTION,
             'calibration': ('kind',) + PREDICTION + ('reason',),
             'baseline': ('kind',) + PREDICTION + ('reason',),
             'exclusive': ('kind', 'reason', 'minutes')}
-OPTIONAL = {'ab': ('sd',)}
-KEYS = {'kind', 'rounds', 'sd', 'reason', 'minutes'} | set(PREDICTION)
+OPTIONAL = {'ab': ('sd',), 'noninf': ('sd', 'margin')}
+KEYS = {'kind', 'rounds', 'sd', 'margin', 'reason', 'minutes'} | set(PREDICTION)
+RULED = ('ab', 'noninf')
 DECISIONS = ('decide-in', 'decide-below', 'decide-above')
 SD_DEFAULT = (0.6, 'the default, AGENTS.md 「Know the ruler」: same-binary runs scatter with SD 0.6 % (18 runs)')
+MARGIN_DEFAULT = (1.0, 'the default: about the ruler\'s spread at 4-6 rounds')
 ROUNDS_CAP = 100000
 
 NUM = r'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?'
@@ -189,19 +224,19 @@ def validate(fields):
             errors.append(f'line {at}: kind {kind} takes no `{k}`')
     card = {'kind': kind, 'value': value}
     unit = value.get('unit', '')
-    if kind == 'ab' and unit and unit != '%':
-        errors.append(f'line {fields["unit"][0]}: an ab card predicts its effect in percent (`unit: %`), got {unit!r}')
+    if kind in RULED and unit and unit != '%':
+        errors.append(f'line {fields["unit"][0]}: an {kind} card predicts its effect in percent (`unit: %`), got {unit!r}')
     if 'predict' in allowed and value.get('predict'):
         card['band'], err = band(value['predict'], unit)
         if err:
             errors.append(f'line {fields["predict"][0]}: {err}')
-    if kind == 'ab' and value.get('rounds'):
+    if kind in RULED and value.get('rounds'):
         r = value['rounds']
         if re.fullmatch(r'\d+', r) and int(r) >= 1:
             card['rounds'] = int(r)
         else:
             errors.append(f'line {fields["rounds"][0]}: `rounds: {r}` is not a positive integer')
-    if kind == 'ab':
+    if kind in RULED:
         card['sd'] = SD_DEFAULT
         if 'sd' in value:
             m = SD.fullmatch(value['sd'])
@@ -211,6 +246,18 @@ def validate(fields):
                 errors.append(f'line {fields["sd"][0]}: `sd: {value["sd"]}` names no source (an override says where it comes from)')
             else:
                 card['sd'] = (float(m.group(1)), m.group(3).strip())
+    if kind == 'noninf':
+        card['margin'] = MARGIN_DEFAULT
+        if 'margin' in value:
+            m = SD.fullmatch(value['margin'])
+            if not m or float(m.group(1)) <= 0:
+                errors.append(f'line {fields["margin"][0]}: `margin: {value["margin"]}` is not a positive '
+                              'percentage and its reason')
+            elif not m.group(3).strip():
+                errors.append(f'line {fields["margin"][0]}: `margin: {value["margin"]}` names no reason '
+                              '(an override says why that loss is acceptable)')
+            else:
+                card['margin'] = (float(m.group(1)), m.group(3).strip())
     if kind == 'exclusive' and value.get('minutes'):
         m = MINUTES.fullmatch(value['minutes'])
         lo = float(m.group(1)) if m else 0.0
@@ -283,6 +330,49 @@ def ruler(card, runner_rounds, round_minutes):
     raise Refused(UNDER_RULER, lines)
 
 
+def paired_half_width(t975, sd, n):
+    return t975(n - 1) * sd * math.sqrt(2 / n), t975(n - 1), n - 1
+
+
+def margin_ruler(card, runner_rounds, round_minutes):
+    """The noninf card's margin line, or Refused(CARD_UNDER_MARGIN) with the rounds or the margin that clear it."""
+    notes = []
+    n = card['rounds']
+    source = 'the card'
+    if runner_rounds is not None:
+        if runner_rounds != n:
+            notes.append(f'note: the runner runs {runner_rounds} rounds and the card says {n}: checked at {runner_rounds}')
+        n, source = runner_rounds, 'the runner'
+    sd, sd_source = card['sd']
+    margin, margin_source = card['margin']
+    lo, _ = card['band']
+    if n < 2:
+        raise Refused(UNDER_MARGIN, notes + [f'{n} round has no interval: a noninf run needs 2 rounds or more'])
+    t975 = t_table()
+    h, t, df = paired_half_width(t975, sd, n)
+    ruler_text = (f'h_p = {h:.3f} % at {n} rounds ({source}; paired, t {t:.3f}, df {df}; sd {sd:g} % — {sd_source}); '
+                  f'margin {margin:g} % — {margin_source}')
+    if lo - h > -margin:
+        return notes, f'{ruler_text}; lo - h_p = {lo - h:.3f} % > -{margin:g} %'
+    lines = notes + [f'{ruler_text}: lo - h_p = {lo:g} - {h:.3f} = {lo - h:.3f} % <= -{margin:g} %: a prediction that '
+                     'comes true could still fail the sitting']
+    lines.append(f'at {n} rounds the card would need a margin above {h - lo:.3f} %')
+    if lo <= -margin:
+        lines.append(f'the band\'s lower edge {lo:g} % is at or below -{margin:g} %: no round count clears it')
+        raise Refused(UNDER_MARGIN, lines)
+    need = next((m for m in range(2, ROUNDS_CAP + 1) if lo - paired_half_width(t975, sd, m)[0] > -margin), None)
+    if need is None:
+        lines.append(f'more than {ROUNDS_CAP} rounds would be needed to clear -{margin:g} %')
+        raise Refused(UNDER_MARGIN, lines)
+    lines.append(f'clears at {need} rounds: lo - h_p = {lo - paired_half_width(t975, sd, need)[0]:.3f} % > -{margin:g} %')
+    if round_minutes is None:
+        lines.append('box minutes: unknown — the runner does not state its minutes per round (ROUND_MINUTES, --round-minutes)')
+    else:
+        lines.append(f'box minutes at {need} rounds: {need} x {round_minutes:g} = {need * round_minutes:g} min '
+                     '(the runner\'s minutes per round)')
+    raise Refused(UNDER_MARGIN, lines)
+
+
 def check(text, runner_rounds, round_minutes):
     """(notes, verdict) for a card that passes; Refused otherwise."""
     card = validate(parse(text))
@@ -297,10 +387,59 @@ def check(text, runner_rounds, round_minutes):
     if len({fold(card['value'][k]) for k in DECISIONS}) < 2:
         raise Refused(UNDECIDABLE, ['decide-in, decide-below and decide-above are one action: '
                                     'no outcome of this run changes what happens next'])
+    if card['kind'] == 'noninf':
+        notes, line = margin_ruler(card, runner_rounds, round_minutes)
+        return notes, f'ok kind=noninf {line}'
     if card['kind'] != 'ab':
         return [], f'ok kind={card["kind"]} (no ruler: not an ab card)'
     notes, line = ruler(card, runner_rounds, round_minutes)
     return notes, f'ok kind=ab {line}'
+
+
+RATIO_LABEL = re.compile(r'r\d+')
+
+
+def ratios(tokens):
+    """The per-round ratios from `r1 q1 r2 q2 …` or bare numbers, or (None, why)."""
+    out, rest = [], list(tokens)
+    while rest:
+        tok = rest.pop(0)
+        if RATIO_LABEL.fullmatch(tok):
+            if not rest:
+                return None, f'the label {tok!r} is followed by no ratio'
+            tok = rest.pop(0)
+        try:
+            q = float(tok)
+        except ValueError:
+            return None, f'{tok!r} is not a ratio (a positive number, or an r<k> label followed by one)'
+        if not q > 0 or math.isinf(q):
+            return None, f'{tok!r} is not a positive finite ratio'
+        out.append(q)
+    if len(out) < 2:
+        return None, f'{len(out)} ratio(s): an interval needs 2 rounds or more'
+    return out, None
+
+
+def noninf_verdict(card, qs):
+    """(lines, rc) of a noninf sitting: the interval as the depth runners' ratio line prints it, then pass or fail."""
+    n = len(qs)
+    m = sum(qs) / n
+    ss = sum((q - m) ** 2 for q in qs)
+    ci = t_table()(n - 1) * math.sqrt(ss / (n - 1)) / math.sqrt(n)
+    margin, _ = card['margin']
+    lo, hi = card['band']
+    effect, lower = (m - 1) * 100, (m - ci - 1) * 100
+    lines = []
+    if n != card['rounds']:
+        lines.append(f'note: {n} ratios and the card says {card["rounds"]} rounds')
+    lines.append(f'mean {m:.4f} ± {ci:.4f} (n={n}): effect {effect:+.3f} %, lower bound {lower:+.3f} %')
+    region = 'decide-in' if lo <= effect <= hi else 'decide-below' if effect < lo else 'decide-above'
+    where = {'decide-in': 'inside', 'decide-below': 'below', 'decide-above': 'above'}[region]
+    ok = lower > -margin
+    lines.append(f'verdict: {"pass" if ok else "fail"}: the lower bound {lower:+.3f} % is '
+                 f'{"above" if ok else "at or below"} -{margin:g} %')
+    lines.append(f'band: the effect {effect:+.3f} % is {where} {lo:g}..{hi:g}: {region}: {card["value"][region]}')
+    return lines, 0 if ok else 1
 
 
 def refuse(e, where, pre):
@@ -348,11 +487,34 @@ def lease_path(arg):
 def main(argv):
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding='utf-8')
-    usage = 'usage: card.py check <file> | lease <docs/cards/<slug>.card> [--rounds N] [--round-minutes M]'
-    if len(argv) < 2 or argv[0] not in ('check', 'lease'):
+    usage = ('usage: card.py check <file> | lease <docs/cards/<slug>.card> [--rounds N] [--round-minutes M]'
+             ' | verdict <file> <ratio>...')
+    if len(argv) < 2 or argv[0] not in ('check', 'lease', 'verdict'):
         print(usage, file=sys.stderr)
         return USAGE
     mode, target, rest = argv[0], argv[1], argv[2:]
+    if mode == 'verdict':
+        qs, why = ratios(rest)
+        if qs is None:
+            print(f'card.py: verdict: {why}; {usage}', file=sys.stderr)
+            return USAGE
+        try:
+            data, text = read(target)
+            card = validate(parse(text))
+            if card['kind'] != 'noninf':
+                print(f'card.py: verdict reads a noninf card; {target} is kind {card["kind"]}', file=sys.stderr)
+                return USAGE
+            notes, line = check(text, None, None)
+        except Refused as e:
+            return refuse(e, target, '')
+        print(f'card: {target} sha256={hashlib.sha256(data).hexdigest()}')
+        for note in notes:
+            print(f'card: {note}')
+        print(f'card: {line}')
+        lines, rc = noninf_verdict(card, qs)
+        for out in lines:
+            print(f'card: {out}')
+        return rc
     rounds = minutes = None
     while rest:
         opt = rest.pop(0)

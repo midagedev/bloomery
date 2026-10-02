@@ -91,7 +91,8 @@
 #            is a [xcheck-tail] line and stays.
 #   <D>@NAME=VALUE[,NAME=VALUE...]  ours at depth D with those variables set (`env NAME=VALUE ...`):
 #            a lever arm of the same binary, row label `ours@NAME=VALUE[,...]`. Beside a plain `<D>`
-#            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_PIN_MAIN=0`.
+#            arm it is the same-binary A/B, e.g. `6 6@BLOOMERY_PIN_MAIN=0`. The item place=<a|gate|bp>
+#            is the arm's placement, not a variable (Placement below); every @ list below takes it.
 #            An arm with BLOOMERY_DRAFT=dspark also sees the other card, where the draft runs, and
 #            gets the profile's DSPARK_MODEL unless it names one (timing-card.sh dspark_env).
 #   prose:<P>[@NAME=VALUE[,NAME=VALUE...]]  ours fed the first P ids of
@@ -130,17 +131,23 @@
 # position); generate_ds41 refuses only D + N - 1 > --ctx, and a refused arm is a FAIL row (Failures).
 #
 # Placement. BLOOMERY_GEN_PLACE (a, the default, gate or bp; anything else is refused) is the placement
-# every generate_ds41 arm — ours, the corpus arms, bin: — loads by, passed as --place; the [config]
-# line and every such row name it (`place <p>`), and a row whose SMOKE footer names another placement
-# is a FAIL row. Plan (a) loads on the card named A6000 and the gate plan on the one named 3090
-# (workstation::plan_a, plan_gate: the card is found by name), and the arms see the timing card only,
-# so a placement whose card is not the timing card (BLOOMERY_TIMING_GPU, timing-card.sh) is refused
-# (64) before the lease and before a dry run's command lines — when an arm runs generate_ds41. With the
-# 3090 as the timing card the profile sizes the references' --n-cpu-moe for its 24 GB
-# (tools/ref/models/deepseek41.sh, LCPP_NCMOE). bp is plan (b′) (workstation::plan_bp: plan (a) on the
-# A6000, the 3090 its expert tier, the DSpark draft beside the tier), which loads both cards: it runs only
-# in the two-card mode (Two cards, below), and outside it is refused (64) as a and gate are inside it.
-# What follows describes plan (a).
+# every generate_ds41 arm — ours, the corpus arms, bin: — loads by, passed as --place, unless the arm's own
+# list names one: `place=<a|gate|bp>` among its NAME=VALUE items (`prose:512@place=a`,
+# `6@place=bp,BLOOMERY_RESIDENCY=off`) runs that arm at that placement, in a load of its own (the place is
+# in the load key), and is the runner's item, never a variable the binary sees; the label keeps it
+# (`prose@place=a`), so `prose:512 prose:512@place=a` is the same-binary placement A/B in the prose table.
+# A place= on a reference or server arm, a word outside a|gate|bp, an empty one and place given twice are
+# refused by name before anything runs (tools/ref/arm-place.sh, shared with depth-glm5next.sh). The
+# [config] line names the placements (with a place= arm, a `placements` line), every such row names its
+# arm's (`place <p>`), and a row whose SMOKE footer names another placement is a FAIL row. Plan (a) loads
+# on the card named A6000 and the gate plan on the one named 3090 (workstation::plan_a, plan_gate: the card
+# is found by name), and under one card the arms see the timing card only, so a placement whose card is not
+# the timing card (BLOOMERY_TIMING_GPU, timing-card.sh) is refused (64) before the lease and before a dry
+# run's command lines; a and gate arms cannot share one such run. With the 3090 as the timing card the
+# profile sizes the references' --n-cpu-moe for its 24 GB (tools/ref/models/deepseek41.sh, LCPP_NCMOE). bp
+# is plan (b′) (workstation::plan_bp: plan (a) on the A6000, the 3090 its expert tier, the DSpark draft
+# beside the tier), which loads both cards: it runs only in the two-card mode (Two cards, below), and
+# outside it is refused (64). What follows describes plan (a).
 # Ours is plan (a): every layer and the head on the A6000, each routed layer's experts
 # [0, n_l) on the card (n_l 63-64 of 384, the budget's), the rest on the host tier — the plan line
 # generate_ds41 prints. ik moves experts by tensor, and a layer's 384 experts are one tensor, so it
@@ -410,9 +417,12 @@
 # (TWO_CARD_PLACEMENT, models/deepseek41.sh, V41_PUBLIC only) gives mainline its --n-cpu-moe and -ts;
 # the lcpp arms run (lcpp, lcpp<K>, lcpppp[<U>], the fit arms, whose fit places over both cards, and the
 # server arms lcppsrv…, the same flags in the server's spellings), and
-# ours, corpus and bin: arms under BLOOMERY_GEN_PLACE=bp; under a or gate they are refused by name before
-# anything runs, with the hint to set bp (timing-card.sh's TIMING_CARDS_PLACE). After each of our arms its
-# `load` record's `cards` must name the A6000 and the 3090 (records.py), or the arm is a FAIL row. An ik
+# ours, corpus and bin: arms at bp or a, each by its placement (Placement above): a bp arm loads both cards,
+# an a arm plan (a) on the A6000 with the 3090 idle — the same lease's one-card arm beside the two-card one,
+# its row in the A6000+3090 table all the same. A gate arm (a 3090-only row) and an a arm under
+# BLOOMERY_DRAFT=dspark (its draft runs on the 3090) are refused by name before anything runs. After each of
+# our arms its `load` record's `cards` (records.py) must name the A6000 and the 3090 under bp and the A6000
+# alone under a (tools/ref/arm-place.sh place_arm_cards), or the arm is a FAIL row. An ik
 # arm is refused by name (ik's -ts is a
 # byte split over its own layer sizes, src/llama.cpp get_layer_sizes, which nobody has read against this
 # placement; the public reference is llama.cpp). Before the lease a card that does not answer, a 3090 off
@@ -458,15 +468,16 @@ pp_col() {
 # ours_row <arm kind> <label> <depth> <round> <output> <wall s>: an ours or bin arm's lines — the
 # records it echoes, then its row — from its output; into TPS_MEAN, TPS_P50 and DRAFT for the sums.
 # The majflt column and the cold tag come from MAJ_WHOLE and MAJ_TIMED (ours_arm; empty under
-# --parse: no column). An output with no row, or one that ran another placement than PLACE, prints
+# --parse: no column). An output with no row, or one that ran another placement than PLACE_ARM (the arm's,
+# ours_post; `-` under --parse), prints
 # nothing and returns non-zero with FAIL_WHY set; 3 is a warm-rows retry that was cold again, its FAIL row
 # printed.
 ours_row() {
   local kind=$1 label=$2 dep=$3 r=$4 out=$5 wall=$6 h10 t10 uniq_tok win
   ours_parse <<< "$out" || return
   [ -n "$P50" ] || { FAIL_WHY="no SMOKE line"; return 1; }
-  if [ "$PLACE" != - ] && [ -n "$PLACE_RAN" ] && [ "$PLACE_RAN" != "$PLACE" ]; then
-    FAIL_WHY="its SMOKE footer names place=$PLACE_RAN; the runner passed --place $PLACE"
+  if [ "$PLACE_ARM" != - ] && [ -n "$PLACE_RAN" ] && [ "$PLACE_RAN" != "$PLACE_ARM" ]; then
+    FAIL_WHY="its SMOKE footer names place=$PLACE_RAN; the runner passed --place $PLACE_ARM"
     return 1
   fi
   pp_col "$kind" || return
@@ -489,7 +500,7 @@ ours_row() {
     # 3: a retry cold again, whose FAIL row cold_verdict printed (cold-blocks.sh).
     cold_verdict "$r" "$label" "d=$dep" "${MAJ_TIMED:-$MAJ_WHOLE}" "$win" || return 3
   fi
-  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
+  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE_ARM} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
 }
 # The residency seed condition and curve (the header's Residency). RES_WINDOW: the passes a curve window
 # holds.
@@ -611,7 +622,7 @@ if [ "${1:-}" = --parse ]; then
   [ $# -eq 2 ] || { echo "usage: depth-ds41.sh --parse FILE" >&2; exit 64; }
   out=$(cat -- "$2") || exit 2
   ours_parse <<< "$out" || { echo "$2: $FAIL_WHY" >&2; exit 2; }
-  ROW_TAG=ROW N=${GEN:--} CARD_NAME=- CPU_BUSY_TAG='' OTHER_BUSY_TAG='' PLACE=-
+  ROW_TAG=ROW N=${GEN:--} CARD_NAME=- CPU_BUSY_TAG='' OTHER_BUSY_TAG='' PLACE_ARM=-
   ours_row ours ours "${DEPTH:--}" - "$out" - || { echo "$2: $FAIL_WHY" >&2; exit 1; }
   # No arm environment here: the curve without the seed verdict.
   res_read "$out" || { echo "$2: $RES_WHY" >&2; exit 2; }
@@ -669,6 +680,10 @@ ours=0 gen=0 ik=0 lcpp=0 lcppfit=0 srv=0
 # reference engine (ref and srv; the corpus name for a corpus arm), the binary (ours, corpus and bin), the
 # NAME=VALUE list (comma-separated) and a server arm's ids (lcg, or the corpus's name).
 A_KIND=() A_DEP=() A_LABEL=() A_ENG=() A_BIN=() A_ENV=() A_IDS=()
+# A generate_ds41 arm's @ list as given (its label's; empty without one), its placement (its place= word,
+# else BLOOMERY_GEN_PLACE; empty for a reference arm) and whether place= set it (1, or empty). A_ENV holds
+# the list less its place= item: the variables the arm's process gets.
+A_AT=() A_PLACE=() A_PLACE_SET=()
 # A corpus arm's prompt, the ids as generate_ds41 --tokens takes them (empty for every other arm).
 A_TOK=()
 # The corpus arms' names: corpus-<name>.ids under $BLOOMERY_DATA/engram, one id per line; each file's
@@ -683,6 +698,15 @@ arm_usage() {
   echo "depth-ds41.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], code:<P>[@NAME=VALUE,...], ik:<D>, lcpp:<D>, lcpp<K>:<D>, lcppfit:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, lcppsrv[fit]:[prose:|code:]<D>, lcppsrvpp[fit][<U>]:[prose:|code:]<P> or bin:<path>:[prose:|code:]<D>[@NAME=VALUE,...]" >&2
   exit 64
 }
+# arm_refuse <arm> <why>: an arm refused by name, exit 64 (tools/ref/arm-place.sh's refusals take this shape).
+arm_refuse() {
+  echo "depth-ds41.sh: arm '$1': $2" >&2
+  exit 64
+}
+# An arm's place= (the header's Placement): tools/ref/arm-place.sh, shared with depth-glm5next.sh.
+PLACE_RUNNER=depth-ds41.sh PLACE_BIN=generate_ds41 PLACE_WORDS='a gate bp'
+# shellcheck source=tools/ref/arm-place.sh
+source "${BASH_SOURCE[0]%/*}/arm-place.sh" || exit 2
 # arm_envs_ok <arm> <NAME=VALUE list>: the list is one or more NAME=VALUE, no spaces or commas in a value.
 arm_envs_ok() {
   local -a kv
@@ -705,8 +729,23 @@ corpus_check() {
     exit 64
   fi
 }
+# split_at <arm> <list>: an arm's @ list into AT (as given: its label's), ENVS (the variables its process
+# gets) and APLACE (its place= word, empty without one; tools/ref/arm-place.sh).
+split_at() {
+  [ -n "$2" ] || arm_usage "$1"
+  AT=$2
+  arm_place_split "$1" "$2"
+  ENVS=$ARM_REST APLACE=$ARM_PLACE
+  [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
+}
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' ids=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' ids='' AT='' APLACE=''
+  # place= on a reference or server arm is refused by name (the header's Placement); any other @ there is
+  # arm usage, below.
+  case $a in
+    prose:* | code:* | bin:*) ;;
+    *:*@*) ! arm_has_place "${a#*@}" || place_ref_refuse "$a" "${eng%%+*}" ;;
+  esac
   if srv_eng "$eng"; then
     kind=srv srv=1 ids=lcg label=$eng
     case $dep in
@@ -722,12 +761,13 @@ for a in "${ARMS[@]}"; do
     [ "$dep" -ge 1 ] || { echo "depth-ds41.sh: arm '$a': a server arm sends at least one id" >&2; exit 64; }
     srv_check_arm "$a" || { echo "depth-ds41.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_ENV+=('') A_TOK+=("$tok") A_IDS+=("$ids")
+    A_AT+=('') A_PLACE+=('') A_PLACE_SET+=('')
     continue
   fi
   case $a in
     prose:* | code:*)
       kind=corpus bin=$BIN label=$eng
-      case $dep in *@*) envs=${dep#*@} dep=${dep%%@*} label=$eng@$envs && arm_envs_ok "$a" "$envs" ;; esac
+      case $dep in *@*) split_at "$a" "${dep#*@}" && envs=$ENVS dep=${dep%%@*} label=$eng@$AT ;; esac
       case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
       corpus_check "$a" "$eng" "$dep"
       tok=$(head -n "$dep" "$(corpus_file "$eng")" | paste -sd, -)
@@ -737,14 +777,14 @@ for a in "${ARMS[@]}"; do
       # bin:<path>:[<corpus>:]<D>[@NAME=VALUE,...]: the variables first (a path carries no @), then the
       # depth and the corpus from the right, so a colon inside the path is kept.
       kind=bin eng=bin bin=${a#bin:}
-      case $bin in *@*) envs=${bin#*@} bin=${bin%%@*} && arm_envs_ok "$a" "$envs" ;; esac
+      case $bin in *@*) split_at "$a" "${bin#*@}" && envs=$ENVS bin=${bin%%@*} ;; esac
       dep=${bin##*:} bin=${bin%:*}
       case " $CORPORA " in *" ${bin##*:} "*) ids=${bin##*:} bin=${bin%:*} ;; esac
       case $bin in /*) ;; *) arm_usage "$a" ;; esac
       case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
       tree=${bin%/target/*}
       [ "$tree" != "$bin" ] || tree=${bin%/*}
-      label=bin:${tree##*/}${ids:+@$ids}${envs:+@$envs}
+      label=bin:${tree##*/}${ids:+@$ids}${AT:+@$AT}
       if [ -n "$ids" ]; then
         corpus_check "$a" "$ids" "$dep"
         tok=$(head -n "$dep" "$(corpus_file "$ids")" | paste -sd, -)
@@ -752,8 +792,9 @@ for a in "${ARMS[@]}"; do
       gen=1
       ;;
     *@*)
-      kind=ours eng=ours dep=${a%%@*} envs=${a#*@} bin=$BIN label=ours@$envs
-      arm_envs_ok "$a" "$envs"
+      kind=ours eng=ours dep=${a%%@*} bin=$BIN
+      split_at "$a" "${a#*@}"
+      envs=$ENVS label=ours@$AT
       ours=1 gen=1
       ;;
     *:*)
@@ -788,6 +829,9 @@ for a in "${ARMS[@]}"; do
     fi
   fi
   A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs") A_TOK+=("$tok") A_IDS+=("$ids")
+  # A generate_ds41 arm's placement: its place=, else BLOOMERY_GEN_PLACE; none for a reference arm.
+  A_AT+=("$AT")
+  if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
 # The load keys (the header's Loads): an ours, corpus or bin: arm's binary, placement and variables, the
 # solo marker left out; `|solo` on an arm that runs alone. A reference or server arm has none, and neither
@@ -801,7 +845,7 @@ for i in "${!ARMS[@]}"; do
   fi
   case ${A_KIND[$i]} in
     ours | corpus | bin)
-      LG_KEY[i]="${A_BIN[$i]}|place=$PLACE|$(lg_env_key "$(lg_strip_solo "${A_ENV[$i]}")")"
+      LG_KEY[i]="${A_BIN[$i]}|place=${A_PLACE[$i]}|$(lg_env_key "$(lg_strip_solo "${A_ENV[$i]}")")"
       if lg_is_solo "${A_ENV[$i]}" || [[ ,${A_ENV[$i]}, =~ ,BLOOMERY_(DRAFT|CHECK_FINITE)= ]]; then
         LG_KEY[i]+='|solo'
       fi
@@ -844,37 +888,36 @@ TIMING_CARDS_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 timing_cards_mode || exit $?
+# The reference and server arms' two-card lines (timing-card.sh); our arms are held to their placements
+# below.
 TC_ARMS=()
-for i in "${!ARMS[@]}"; do TC_ARMS+=("${ARMS[$i]}" "${A_KIND[$i]}" "${A_ENG[$i]}"); done
-# shellcheck disable=SC2034 # read by timing_cards_arms (timing-card.sh)
-TIMING_CARDS_PLACE=bp TIMING_CARDS_PLACE_RAN=$PLACE
-timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
-# The placement's card must be the timing card, the only one the arms see: plan (a) loads on the card
-# named A6000, the gate plan on the one named 3090 (workstation::plan_a, plan_gate).
-if [ "$gen" = 1 ]; then
-  # The placement checks below compare the timing card with the 3090's UUID; a card cards.sh
-  # could not name makes that undecidable unless the timing card is the resolved A6000.
-  if [ "$PLACE" != bp ] && [ -z "$GPU_3090" ] && [ "$TIMING_GPU" != "$GPU_A6000" ]; then
-    echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=$PLACE loads on a named card, and tools/ref/cards.sh resolved no 3090 UUID (${CARDS_ERROR:-no reason given}): whether the timing card is the 3090 cannot be told" >&2
-    exit 64
+for i in "${!ARMS[@]}"; do
+  case ${A_KIND[$i]} in ref | srv) TC_ARMS+=("${ARMS[$i]}" "${A_KIND[$i]}" "${A_ENG[$i]}") ;; esac
+done
+timing_cards_arms "$BIN" ${TC_ARMS[@]+"${TC_ARMS[@]}"} || exit $?
+# Each generate_ds41 arm's placement against the mode and the timing card (the header's Placement and Two
+# cards; tools/ref/arm-place.sh): BLOOMERY_GEN_PLACE once for the arms that follow it, an arm's place= for
+# that arm. In the two-card mode an a arm keeps the 3090 idle, so its DSpark draft, which runs there, is
+# refused.
+PLACE_SEEN=0
+for i in "${!ARMS[@]}"; do
+  [ -n "${A_PLACE[$i]}" ] || continue
+  if [ -n "${A_PLACE_SET[$i]}" ]; then
+    place_check "${ARMS[$i]}" "${A_PLACE[$i]}"
+  elif [ "$PLACE_SEEN" = 0 ]; then
+    place_check '' "$PLACE"
+    PLACE_SEEN=1
   fi
-  if [ "$PLACE" = a ] && [ "$TIMING_GPU" = "$GPU_3090" ]; then
-    echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=a is plan (a), which loads on the A6000, and the timing card is the 3090 (BLOOMERY_TIMING_GPU=$TIMING_GPU): generate_ds41 would refuse every arm; set BLOOMERY_GEN_PLACE=gate" >&2
-    exit 64
+  if [ -n "$TIMING_CARDS" ] && [ "${A_PLACE[$i]}" = a ] && [[ ,${A_ENV[$i]}, == *,BLOOMERY_DRAFT=dspark,* ]]; then
+    if [ -n "${A_PLACE_SET[$i]}" ]; then hint=place=bp; else hint=BLOOMERY_GEN_PLACE=bp; fi
+    arm_refuse "${ARMS[$i]}" "BLOOMERY_DRAFT=dspark puts the draft on the 3090, and in the two-card mode an a arm keeps the 3090 idle: run the draft under $hint"
   fi
-  if [ "$PLACE" = bp ] && [ -z "$TIMING_CARDS" ]; then
-    echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=bp is plan (b′), which loads on both cards (the A6000 and its 3090 expert tier); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000+3090" >&2
-    exit 64
-  fi
-  if [ "$PLACE" = gate ] && [ "$TIMING_GPU" != "$GPU_3090" ]; then
-    if [ -n "$GPU_3090" ]; then
-      echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads on the 3090, and the timing card is $TIMING_GPU, not the 3090 ($GPU_3090): name the 3090 in BLOOMERY_TIMING_GPU, or leave BLOOMERY_GEN_PLACE at a" >&2
-    else
-      echo "depth-ds41.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads on the 3090, and the timing card is the A6000 while tools/ref/cards.sh cannot name the 3090 (${CARDS_ERROR:-no reason given}): leave BLOOMERY_GEN_PLACE at a, or wait for the 3090" >&2
-    fi
-    exit 64
-  fi
-fi
+done
+# The placements the arms run at, for the [config] and [dry] lines when an arm's place= sets one.
+PLACE_ARMS=()
+for i in "${!ARMS[@]}"; do [ -z "${A_PLACE[$i]}" ] || PLACE_ARMS+=("$i"); done
+PLACES_SET=''
+for i in "${!ARMS[@]}"; do [ -z "${A_PLACE_SET[$i]}" ] || PLACES_SET=1; done
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
@@ -899,24 +942,36 @@ fi
 # A server arm needs the tree's llama-server, every flag it passes in that server's --help (run with no
 # card), and curl; the server is a reference engine to the CPU guard.
 SRVBIN=
-# The server arms' -c (the header's A server arm's -c): the plan's ctx_max at this run's --place, from
-# this tree's binary's --plan, which loads nothing. SRV_CTX_PLAN stays empty when no server arm runs.
+# The server arms' -c (the header's A server arm's -c): the plan's ctx_max at the generate_ds41 arms'
+# placements (BLOOMERY_GEN_PLACE without one), from this tree's binary's --plan, which loads nothing; two
+# placements whose plans hold another ctx_max leave the servers no one context, and are refused by name.
+# SRV_CTX_PLAN stays empty when no server arm runs.
 SRV_CTX_PLAN=
-SRV_CTX_SRC="generate_ds41 --plan --place $PLACE: its plan record's ctx_max"
+SRV_PLACES=$(for i in "${!ARMS[@]}"; do [ -z "${A_PLACE[$i]}" ] || echo "${A_PLACE[$i]}"; done | awk '!seen[$0]++' | paste -sd' ' -)
+[ -n "$SRV_PLACES" ] || SRV_PLACES=$PLACE
+SRV_CTX_SRC="generate_ds41 --plan --place ${SRV_PLACES// / and --place }: its plan record's ctx_max"
 srv_ctx_of() { echo "$SRV_CTX_PLAN"; }
 if [ "$srv" = 1 ]; then
   if [ -x "$BIN" ]; then
     # A real run reads the context from a binary no older than its sources, as an ours arm's run does.
     if [ -z "$DRY" ]; then assert_fresh_binary "$BIN" || exit $?; fi
-    plan_out=$(timeout --kill-after=10 300 "$BIN" --plan --depth 512 --place "$PLACE" 2>&1) || {
-      rc=$?
-      echo "depth-ds41.sh: the server arms' -c is the plan's ctx_max, and $BIN --plan --depth 512 --place $PLACE exited $rc: ${plan_out##*$'\n'}" >&2
-      exit 2
-    }
-    plan_rec=$(python3 "$RECORDS" sh - 'SRV_CTX_PLAN=plan.ctx_max' <<< "$plan_out") && eval "$plan_rec" || SRV_CTX_PLAN=''
-    case $SRV_CTX_PLAN in
-      '' | *[!0-9]*) echo "depth-ds41.sh: $BIN --plan --place $PLACE printed no plan record with a ctx_max (got '$SRV_CTX_PLAN'): the server arms have no -c" >&2; exit 2 ;;
-    esac
+    srv_ctx_first='' srv_ctx_place=''
+    for p in $SRV_PLACES; do
+      plan_out=$(timeout --kill-after=10 300 "$BIN" --plan --depth 512 --place "$p" 2>&1) || {
+        rc=$?
+        echo "depth-ds41.sh: the server arms' -c is the plan's ctx_max, and $BIN --plan --depth 512 --place $p exited $rc: ${plan_out##*$'\n'}" >&2
+        exit 2
+      }
+      plan_rec=$(python3 "$RECORDS" sh - 'SRV_CTX_PLAN=plan.ctx_max' <<< "$plan_out") && eval "$plan_rec" || SRV_CTX_PLAN=''
+      case $SRV_CTX_PLAN in
+        '' | *[!0-9]*) echo "depth-ds41.sh: $BIN --plan --place $p printed no plan record with a ctx_max (got '$SRV_CTX_PLAN'): the server arms have no -c" >&2; exit 2 ;;
+      esac
+      if [ -n "$srv_ctx_first" ] && [ "$SRV_CTX_PLAN" != "$srv_ctx_first" ]; then
+        echo "depth-ds41.sh: the server arms' -c is the plan's ctx_max, and --place $srv_ctx_place plans ctx_max $srv_ctx_first where --place $p plans $SRV_CTX_PLAN: the servers have no one context beside both placements" >&2
+        exit 64
+      fi
+      srv_ctx_first=$SRV_CTX_PLAN srv_ctx_place=$p
+    done
   else
     echo "depth-ds41.sh: the server arms' -c is the plan's ctx_max, which $BIN --plan prints, and there is no binary at $BIN (a dry run too: build it first; the recipe builds it only for an ours arm)" >&2
     exit 2
@@ -1291,7 +1346,7 @@ arm_corpus() {
     bin) echo "${A_IDS[$1]}" ;;
   esac
 }
-# One arm of a generate_ds41 at --place PLACE in a process of its own, with the one-arm command line:
+# One arm of a generate_ds41 at its placement (A_PLACE) in a process of its own, with the one-arm command line:
 # a bin: arm whose @ list holds BLOOMERY_AB_LOAD=arm (a base binary that may know no --arm). The row and the sum under the arm's label, or
 # a FAIL row (ours_post). The output passes through majflt_mark on its way into `out`, so the fault
 # count at the prompt timer's start is known: MAJ_WHOLE over the process, MAJ_TIMED from the fed line on.
@@ -1309,9 +1364,9 @@ ours_arm() {
   t0=$(date +%s)
   f0=$(majflt_now)
   if [ ${#envs[@]} -eq 0 ]; then
-    out=$(timeout --kill-after=10 "$BOUND" "$bin" "${feed[@]}" -n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} 2>&1 | majflt_mark "$fedf" '^fed '; exit "${PIPESTATUS[0]}")
+    out=$(timeout --kill-after=10 "$BOUND" "$bin" "${feed[@]}" -n "$N" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} 2>&1 | majflt_mark "$fedf" '^fed '; exit "${PIPESTATUS[0]}")
   else
-    out=$(timeout --kill-after=10 "$BOUND" env "${envs[@]}" "$bin" "${feed[@]}" -n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} 2>&1 | majflt_mark "$fedf" '^fed '; exit "${PIPESTATUS[0]}")
+    out=$(timeout --kill-after=10 "$BOUND" env "${envs[@]}" "$bin" "${feed[@]}" -n "$N" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} 2>&1 | majflt_mark "$fedf" '^fed '; exit "${PIPESTATUS[0]}")
   fi
   rc=$?
   f1=$(majflt_now)
@@ -1342,7 +1397,7 @@ ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N"; }
 # `arm` record (an --arm list's) gives the row its slot in the load.
 ours_post() {
   local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label tags a slot
-  dep=${A_DEP[$i]} label=${A_LABEL[$i]}
+  dep=${A_DEP[$i]} label=${A_LABEL[$i]} PLACE_ARM=${A_PLACE[$i]}
   keep_out "$label" "$r" "$out"
   witness "post r$r $label d=$dep n=$N"
   guard_cpu "post r$r $label d=$dep"
@@ -1353,9 +1408,9 @@ ours_post() {
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "exited $rc" "$out"
     return 0
   fi
-  # Two cards: an Xid, a card lost or off its cap, or a load that did not name both cards fails the arm
-  # (a grouped arm's load record is its load's header).
-  if ! timing_cards_arm "$out"$'\n'"${LG_HEADER:-}" ours; then
+  # Two cards: an Xid, a card lost or off its cap, or a load whose cards are not its placement's (bp both
+  # cards, a the A6000 alone) fails the arm (a grouped arm's load record is its load's header).
+  if ! place_arm_cards "$out"$'\n'"${LG_HEADER:-}" "${A_PLACE[$i]}"; then
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "two cards: $TWOCARD_WHY" "$out"
     return 0
   fi
@@ -1412,14 +1467,15 @@ lg_cmd() {
   local i c
   arm_envs "$1"
   LG_ENV=("${ARM_ENVS[@]}")
-  # The unit's arms share a load key, which holds the binary: the first arm's is every arm's.
+  # The unit's arms share a load key, which holds the binary and the placement: the first arm's are every
+  # arm's.
   LG_CMD=("${A_BIN[$1]}")
   for i in "$@"; do
     c=$(arm_corpus "$i")
     LG_CMD+=(--arm "${c:+$c:}${A_DEP[$i]}")
   done
   # shellcheck disable=SC2206 # an empty WARM adds nothing
-  LG_CMD+=(-n "$N" --place "$PLACE" --time ${WARM:+--warm "$WARM"} --arm-sync)
+  LG_CMD+=(-n "$N" --place "${A_PLACE[$1]}" --time ${WARM:+--warm "$WARM"} --arm-sync)
 }
 lg_pre() {
   prime_tag "$1"
@@ -1483,23 +1539,24 @@ ratio_table() {
 }'
 }
 
-# xbin_pairs: every bin: arm with variables and this binary's arm on the same prompt (the corpus, or the
-# LCG walk) with the same variables, compared as a sorted list (the header's pairing), into XB_PAIRS, one
+# xbin_pairs: every bin: arm with variables (or a place=) and this binary's arm on the same prompt (the
+# corpus, or the LCG walk) with the same @ list, compared as a sorted list (the header's pairing), into
+# XB_PAIRS, one
 # `<prompt>|<this binary's label>|<the bin: label>` a pair (`ours` for the LCG walk), and XB_NONE, the bin:
 # labels with no such arm.
 xbin_pairs() {
   local i j c key base pair
   XB_PAIRS=() XB_NONE=()
   for i in "${!ARMS[@]}"; do
-    [ "${A_KIND[$i]}" = bin ] && [ -n "${A_ENV[$i]}" ] || continue
-    c=${A_IDS[$i]:-ours} key=$(lg_env_key "${A_ENV[$i]}") base=''
+    [ "${A_KIND[$i]}" = bin ] && [ -n "${A_AT[$i]}" ] || continue
+    c=${A_IDS[$i]:-ours} key=$(lg_env_key "${A_AT[$i]}") base=''
     for j in "${!ARMS[@]}"; do
       case ${A_KIND[$j]} in
         ours) [ "$c" = ours ] || continue ;;
         corpus) [ "${A_ENG[$j]}" = "$c" ] || continue ;;
         *) continue ;;
       esac
-      [ -n "${A_ENV[$j]}" ] && [ "$(lg_env_key "${A_ENV[$j]}")" = "$key" ] && base=${A_LABEL[$j]}
+      [ -n "${A_AT[$j]}" ] && [ "$(lg_env_key "${A_AT[$j]}")" = "$key" ] && base=${A_LABEL[$j]}
     done
     if [ -z "$base" ]; then
       [[ " ${XB_NONE[*]} " == *" ${A_LABEL[$i]} "* ]] || XB_NONE+=("${A_LABEL[$i]}")
@@ -1553,7 +1610,7 @@ dry_cmd() {
     note="$note, $dep of the file's ${!var} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
   fi
   arm_envs "$i"
-  echo "timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} $feedline -n $N --place $PLACE --time${WARM:+ --warm $WARM}$note"
+  echo "timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} $feedline -n $N --place ${A_PLACE[$i]} --time${WARM:+ --warm $WARM}$note"
 }
 # run_unit <round> <index...>: one unit of a round (tools/ref/load-groups.sh): the arms of one load key
 # in one process through the driver, or one reference or bin: arm after the contention guards; into
@@ -1681,6 +1738,7 @@ if [ -n "$DRY" ]; then
     echo "[dry] preheat: $(preheat_off)"
   fi
   [ "$WARM_ROWS" = 0 ] || echo "[dry] warm rows: each of our arms after a same-id PRIME in its load; a counted row tagged [cold] prints as COLD and runs once more (cold-blocks.sh)"
+  [ -z "$PLACES_SET" ] || echo "[dry] placements: $(place_line "${PLACE_ARMS[@]}")"
   [ "$gen" = 0 ] || echo "[dry] $(res_config)"
   [ -z "$SRV_CTX_PLAN" ] || echo "[dry] server context: -c $SRV_CTX_PLAN ($SRV_CTX_SRC); each ours row's load record must name it"
   xbin_pairs
@@ -1716,7 +1774,12 @@ lease_take
 timing_cards_start
 [ -z "$TIMING_CARDS" ] || echo "[config] two cards: $TIMING_CARDS_NAME, the profile's two-card line: $TWO_CARD_PLACEMENT"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s warmup=$AB_WARMUP"
-echo "[config] ours: $BIN (--place $PLACE, default ctx)"
+if [ -n "$PLACES_SET" ]; then
+  echo "[config] ours: $BIN (--place $PLACE unless an arm's place= names another, default ctx)"
+else
+  echo "[config] ours: $BIN (--place $PLACE, default ctx)"
+fi
+[ -z "$PLACES_SET" ] || echo "[config] placements: $(place_line "${PLACE_ARMS[@]}")"
 for c in $CORPORA; do
   var=CORPUS_N_$c
   [ -z "${!var:-}" ] || echo "[config] $c: the first P ids of $(corpus_file "$c") (${!var} ids)"

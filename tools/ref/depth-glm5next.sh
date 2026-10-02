@@ -39,14 +39,15 @@
 #             none reads none, the row carries nothing for it, and the [config] (or [dry]) `oursmtp:` line
 #             says which. Its row's tok/s is the SMOKE mean's, as ours'. After the tables, `ratio mtp d=`:
 #             ours / oursmtp per depth, paired by round (below 1: the draft is faster); oursmtp is in no
-#             other ratio table.
+#             other ratio table but the placement pairs' (Placement below).
 #   <D>@NAME=VALUE[,NAME=VALUE...], oursmtp:<D>@NAME=VALUE[,...]   ours (or oursmtp) with those
 #             variables set for this arm's process only (`env NAME=VALUE ... <binary>`, after oursmtp's
-#             BLOOMERY_DRAFT=mtp): a lever arm, row label `ours@NAME=VALUE[,...]` (`oursmtp@…`), so two
-#             arms of one depth are two rows and two means. Beside a plain `<D>` arm it is the same-binary
+#             BLOOMERY_DRAFT=mtp; the item place=<a|gate|bp> is the arm's placement, Placement below):
+#             a lever arm, row label `ours@NAME=VALUE[,...]` (`oursmtp@…`), so two arms of one depth are
+#             two rows and two means. Beside a plain `<D>` arm it is the same-binary
 #             A/B, paired by round in the ratio table's `ours/ours@…` line, e.g. `512
 #             512@BLOOMERY_RESIDENCY=mid-p40-s1`; an oursmtp lever arm is in no ratio table, as oursmtp is
-#             in none but its own. Every arm here is a process of its own, so arms whose variables differ
+#             in none but its own and the placement pairs'. Every arm here is a process of its own, so arms whose variables differ
 #             never share one. The list is checked as depth-qwen3moe.sh's is (tools/ref/lever-arms.sh), each
 #             refusal by name before anything runs: an empty list, item, name or value; white space; an
 #             item that is no NAME=VALUE; a bad variable name; `@` or `|` in a value; a name given twice; a
@@ -164,6 +165,39 @@
 # right away (its preheat included); a second [cold] prints `FAIL-cold r<r> …`, stays out of the means
 # and the ratios, and joins the failed list (docs/fair-measure.md 2.3). Warm-up rows are not re-run.
 #
+# Placement. BLOOMERY_GEN_PLACE (a, the default; gate; bp) is the --place every ours and oursmtp arm runs
+# at, unless the arm's own list names one: `place=<a|gate|bp>` among its NAME=VALUE items (`512@place=bp`,
+# `512@place=a,BLOOMERY_RESIDENCY=mid-p33-s1`) runs that arm at that placement. The item is the runner's,
+# never a variable the binary sees and no lever row (lever-arms.sh never reads it); the label keeps it
+# (`ours@place=bp`), so `512 512@place=bp` is the same-binary placement A/B in the `ratio d=` table (ours /
+# ours@place=bp), whose direction follows the arms' order. Any two arms of one engine whose variables are the
+# same, in any order, and whose placements differ (`oursmtp:512 oursmtp:512@place=a`;
+# `512@place=a,BLOOMERY_RESIDENCY=mid-p40-s1` and `512@BLOOMERY_RESIDENCY=mid-p40-s1,place=bp`) are paired by
+# round in the `ratio place d=` table (`ratio place pp p=` for their prefill), ordered by placement alone: the
+# later placement over the earlier (bp / a, gate / a), whatever the arms' order or BLOOMERY_GEN_PLACE, so its
+# per-round list is what `tools/ref/card.py verdict` reads for a bp-against-a card. place= on a reference arm, a word outside a|gate|bp, an empty one and place given twice are
+# refused by name before anything runs (tools/ref/arm-place.sh, shared with depth-ds41.sh). Plan (a) loads
+# on the card named A6000, the gate plan on the 3090 (workstation::plan_a, plan_gate), plan (b′) on both
+# (plan_bp: the 3090 the host tier's expert tier). Under one card the arms see the timing card alone, so a
+# placement whose card is not the timing card is refused (64) before the lease, and bp is refused outside
+# the two-card mode. Every ours row names its placement (`place <p>`), one whose SMOKE names another is a
+# FAIL row, and with a place= arm the [config] line has a `placements` line.
+#
+# Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh's mode, depth-ds41.sh's) shows both cards to
+# every ours arm, the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table: every
+# row's card field reads `A6000+3090`, so no reader puts it in the A6000 table. An ours arm at bp loads both
+# cards; one at a loads plan (a) on the A6000 and leaves the 3090 idle; gate (a 3090-only row) is refused by
+# name. After each ours arm that exited 0 its load record's `cards` (records.py, generate_glm5next's
+# load_generator record; tools/ref/arm-place.sh place_arm_cards) must name the A6000 and the 3090 under bp and the A6000 alone under a, or the arm
+# is a FAIL row; a load record with no cards field is one too. The reference arms stay on the A6000 alone:
+# each runs with CUDA_VISIBLE_DEVICES the A6000's UUID, and a llama-bench or llama-server log that shows
+# other than that one device is a FAIL row (exllamav3 prints no device lines; its CUDA_VISIBLE_DEVICES is
+# the check). No reference arm here splits over both cards (no -ts arm for this model): the [config] line
+# says so. The witness is depth-ds41.sh's: before the lease a card that does not answer, a 3090 off its
+# 250 W cap or an unreadable kernel journal refuses the run; after every arm an Xid since the last arm, a
+# card lost or off its cap fails the arm; a compute process on either card as an arm starts is waited out
+# (10 minutes, then rc 75). A dry run prints the pre-lease checks' verdict and goes on.
+#
 # Contention. Before every arm: the other card (guard_other, ` [other-busy]`), the timing card
 # (guard_timing: waits for another round's process on it, rc 75 after 10 minutes) and the CPU
 # (guard_cpu, before and after, ` [cpu-busy]`: every engine here runs routed experts on the host
@@ -176,7 +210,8 @@
 #
 # Environment: BLOOMERY_DECODE_N (N, default 96), BLOOMERY_AB_ROUNDS (default 2), BLOOMERY_GEN_WARM
 # (--warm), BLOOMERY_GEN_CTX (C), BLOOMERY_GEN_BIN (default target/release/generate_glm5next),
-# BLOOMERY_GEN_PLACE (a, the default, needs the A6000 as the timing card; gate the 3090),
+# BLOOMERY_GEN_PLACE (a, the default, needs the A6000 as the timing card; gate the 3090; bp the two-card
+# mode, BLOOMERY_TIMING_CARDS=a6000+3090: Placement and Two cards above),
 # BLOOMERY_GEN_PAIR (1 passes --pair to our arms; unset or empty passes nothing),
 # BLOOMERY_AB_WARMUP (1 or 0), BLOOMERY_PREHEAT (1 or 0, above), BLOOMERY_ARM_BOUND (seconds one
 # arm, or one preheat, may run, default 900), BLOOMERY_DRY=1 (every arm's command line and preheat,
@@ -212,7 +247,7 @@ case $PROSE_FROM in '' | *[!0-9]*) echo "depth-glm5next.sh: GLM_PROSE_FROM is an
 for v in N:$N ROUNDS:$ROUNDS CTX:$CTX BOUND:$BOUND; do
   case ${v#*:} in '' | *[!0-9]* | 0*) echo "depth-glm5next.sh: ${v%%:*} is a positive integer, got '${v#*:}'" >&2; exit 64 ;; esac
 done
-case $PLACE in a | gate) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_PLACE is a or gate, got '$PLACE'" >&2; exit 64 ;; esac
+case $PLACE in a | gate | bp) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_PLACE is a (the default), gate or bp (the two-card mode's), got '$PLACE'" >&2; exit 64 ;; esac
 case $PAIR in '' | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_GEN_PAIR is 1 or unset, got '$PAIR'" >&2; exit 64 ;; esac
 case $WARMUP in 0 | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_AB_WARMUP is 0 or 1, got '$WARMUP'" >&2; exit 64 ;; esac
 case $PREHEAT in 0 | 1) ;; *) echo "depth-glm5next.sh: BLOOMERY_PREHEAT is 1 (read each GGUF arm's host set before it, the default) or 0, got '$PREHEAT'" >&2; exit 64 ;; esac
@@ -224,6 +259,9 @@ ARMS=("$@")
 # ubatch lever, its depth or prompt length, its row label (a prefill arm's names its ubatch, a lever arm's
 # its variables) and a lever arm's NAME=VALUE list as given (comma-separated; empty for every other arm).
 A_ENG=() A_PP=() A_UB=() A_DEP=() A_LABEL=() A_ENV=()
+# An ours arm's placement (its place= item, else BLOOMERY_GEN_PLACE; empty for a reference arm) and whether
+# place= set it (1, or empty). A_ENV is the arm's list less its place= item: the variables its process gets.
+A_PLACE=() A_PLACE_SET=()
 ours=0 ours_mtp=0 lcpp=0 exl3=0 gguf=0 srv=0 fit27752=0 fit27754=0 levers=0
 usage() {
   echo "depth-glm5next.sh: arm '$1' is <D>[@NAME=VALUE,...], oursmtp:<D>[@NAME=VALUE,...], lcpp27752[fit]:<D>, lcpp27754[fit]:<D>, lcpp27752pp[fit][<U>]:<P>, lcpp27754pp[fit][<U>]:<P>, lcpp2775{2,4}{srv,mtp}[+t<N>][+nopo<0|1>][+k<K>]:<D>, lcpp2775{2,4}srvpp[<U>][+…]:<P>, exl3:<D> or exl3pp:<P>${2:+ — $2}" >&2
@@ -236,6 +274,12 @@ LEVER_ARM_RUNNER=depth-glm5next.sh
 LEVER_REGISTRY=${BASH_SOURCE[0]%/*}/../../crates/levers/src/registry.rs
 # shellcheck source=tools/ref/lever-arms.sh
 source "${BASH_SOURCE[0]%/*}/lever-arms.sh" || exit 2
+# An ours arm's place= (the header's Placement): tools/ref/arm-place.sh, shared with depth-ds41.sh and
+# depth-qwen3moe.sh; our load record is generate_glm5next's kind, read by its schema.
+# shellcheck disable=SC2034 # read by tools/ref/arm-place.sh
+PLACE_RUNNER=depth-glm5next.sh PLACE_BIN=generate_glm5next PLACE_WORDS='a gate bp' PLACE_LOAD_KIND=load_generator PLACE_LOAD_BIN=generate_glm5next
+# shellcheck source=tools/ref/arm-place.sh
+source "${BASH_SOURCE[0]%/*}/arm-place.sh" || exit 2
 # The fit arms' flags, probe and column (lcpp-fit.sh); fit_eng names this runner's fit engines.
 # shellcheck source=tools/ref/lcpp-fit.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
@@ -249,13 +293,23 @@ fit_eng() { case $1 in lcpp2775[24]fit | lcpp2775[24]ppfit | lcpp2775[24]ppfit[1
 gpu_flags() { case $1 in lcpp27752*) echo "$LCPP27752_GPU_FLAGS" ;; *) echo "$LCPP27754_GPU_FLAGS" ;; esac; }
 for a in "${ARMS[@]}"; do
   # `@` is ours only: split at it first, so a value with a `:` is not read as an engine's arm.
-  arm_head=${a%%@*} envs=''
+  arm_head=${a%%@*} envs='' at='' aplace=''
   eng=${arm_head%%:*} dep=${arm_head#*:} pp=0 ub=''
   [ "$arm_head" != "$eng" ] || { eng=ours dep=$arm_head; }
   if [ "$arm_head" != "$a" ]; then
-    case $eng in ours | oursmtp) ;; *) arm_refuse "$a" "'@' sets a lever of ours, and $eng: is a reference engine's arm — a lever of ours is not a reference's" ;; esac
-    envs=${a#*@}
-    arm_envs_ok "$a" "$envs"
+    at=${a#*@}
+    case $eng in
+      ours | oursmtp) ;;
+      *)
+        ! arm_has_place "$at" || place_ref_refuse "$a" "${eng%%+*}"
+        arm_refuse "$a" "'@' sets a lever of ours, and $eng: is a reference engine's arm — a lever of ours is not a reference's"
+        ;;
+    esac
+    # The place= item is the runner's (tools/ref/arm-place.sh); the rest is the lever list, checked as before.
+    [ -n "$at" ] || arm_envs_ok "$a" "$at"
+    arm_place_split "$a" "$at"
+    envs=$ARM_REST aplace=$ARM_PLACE
+    [ -z "$envs" ] || arm_envs_ok "$a" "$envs"
     case ,$envs in
       *,BLOOMERY_DRAFT=*)
         if [ "$eng" = oursmtp ]; then
@@ -265,7 +319,7 @@ for a in "${ARMS[@]}"; do
         fi
         ;;
     esac
-    levers=1
+    [ -z "$envs" ] || levers=1
   fi
   case $dep in '' | *[!0-9]*) usage "$a" ;; esac
   if [ "${eng%%+*}" != "$eng" ]; then
@@ -317,7 +371,8 @@ for a in "${ARMS[@]}"; do
     case $eng in lcpp27752*) fit27752=1 ;; *) fit27754=1 ;; esac
   fi
   case $eng in exl3*) ;; *) gguf=1 ;; esac
-  A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng${envs:+@$envs}") A_ENV+=("$envs")
+  A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng${at:+@$at}") A_ENV+=("$envs")
+  case $eng in ours | oursmtp) A_PLACE+=("${aplace:-$PLACE}") A_PLACE_SET+=("${aplace:+1}") ;; *) A_PLACE+=('') A_PLACE_SET+=('') ;; esac
 done
 # The draft is the oursmtp arm's alone: set here, every ours arm would draft and their ratio would read 1.
 if [ "$ours" = 1 ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
@@ -325,8 +380,12 @@ if [ "$ours" = 1 ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
   exit 64
 fi
 
+# The card pin, the witness, the other-card guard; this runner has the two-card mode (the header's Two
+# cards).
+TIMING_CARDS_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
+timing_cards_mode || exit $?
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
 CPU_BUSY_COMMS=${BLOOMERY_CPU_BUSY_COMMS:-$CPU_BUSY_COMMS generate_glm5next generate_qwen3moe llama-server python3}
@@ -335,20 +394,35 @@ T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
   echo "depth-glm5next.sh: tools/ref/tdist.py gave no t quantiles for ROUNDS=$ROUNDS" >&2
   exit 2
 }
-# Plan (a) is made for the card named A6000, the gate plan for the 3090; the arms see the timing card only.
-if [ "$ours" = 1 ]; then
-  want=$GPU_A6000
-  [ "$PLACE" = a ] || want=$GPU_3090
-  if [ -z "$want" ]; then
-    echo "depth-glm5next.sh: --place $PLACE loads on the $([ "$PLACE" = a ] && echo A6000 || echo 3090), and tools/ref/cards.sh resolved no $([ "$PLACE" = a ] && echo A6000 || echo 3090) UUID (${CARDS_ERROR:-no reason given})" >&2
-    exit 64
+# Each ours arm's placement against the mode and the timing card (tools/ref/arm-place.sh): plan (a) is made
+# for the card named A6000, the gate plan for the 3090, plan (b′) for both in the two-card mode;
+# BLOOMERY_GEN_PLACE once for the arms that follow it, an arm's place= for that arm.
+PLACE_SEEN=0 PLACES_SET='' PLACE_ARMS=()
+for i in "${!ARMS[@]}"; do
+  [ -n "${A_PLACE[$i]}" ] || continue
+  PLACE_ARMS+=("$i")
+  if [ -n "${A_PLACE_SET[$i]}" ]; then
+    PLACES_SET=1
+    place_check "${ARMS[$i]}" "${A_PLACE[$i]}"
+  elif [ "$PLACE_SEEN" = 0 ]; then
+    place_check '' "$PLACE"
+    PLACE_SEEN=1
   fi
-  [ "$TIMING_GPU" = "$want" ] || {
-    echo "depth-glm5next.sh: --place $PLACE loads on the $([ "$PLACE" = a ] && echo A6000 || echo 3090), but the timing card is $TIMING_GPU (BLOOMERY_TIMING_GPU)" >&2
-    exit 64
-  }
+done
+# The reference arms stay on the A6000 alone in the two-card mode (no -ts arm for this model): their
+# processes get the A6000 alone as CUDA_VISIBLE_DEVICES (REF_PIN, REF_CVD), and their logs are held to one
+# device, the A6000.
+REF_PIN=() REF_CVD=$CUDA_VISIBLE_DEVICES
+if [ -n "$TIMING_CARDS" ]; then
+  REF_PIN=("CUDA_VISIBLE_DEVICES=$GPU_A6000") REF_CVD=$GPU_A6000
+  CARD_NAME=$TIMING_CARDS_NAME
+else
+  CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
 fi
-CARD_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader -i "$TIMING_GPU" | sed 's/^NVIDIA //; s/^GeForce //; s/^RTX //')
+# tc_config: the two-card mode's [config] and [dry] line.
+tc_config() {
+  echo "two cards: $TIMING_CARDS_NAME, our arms at their placements; the reference arms on the A6000 alone (CUDA_VISIBLE_DEVICES=$GPU_A6000), no -ts arm for this model"
+}
 
 # What every arm needs, checked before the lease (a dry run prints the findings and goes on). Ours:
 # a binary no older than its sources that declares the timing records, the prose ids at their sha256.
@@ -496,7 +570,7 @@ arm_cmd() {
   CMD=() LABEL_TEST='' BATCH='' FIT_NOTE='' SRV_ENVS=() SRV_NP=$N
   case ${eng%%+*} in
     ours | oursmtp)
-      CMD=("$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "$PLACE" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
+      CMD=("$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
       # A lever arm's variables, after oursmtp's draft.
       arm_envs "$i"
       [ ${#ARM_ENVS[@]} -eq 0 ] || CMD=("${ARM_ENVS[@]}" "${CMD[@]}")
@@ -513,6 +587,7 @@ arm_cmd() {
         lcpp27752*) server=$LCPP27752SRV ;;
         *) server=$LCPP27754SRV && read -r -a SRV_ENVS <<< "$LCPP27754_ENV" ;;
       esac
+      SRV_ENVS=(${REF_PIN[@]+"${REF_PIN[@]}"} ${SRV_ENVS[@]+"${SRV_ENVS[@]}"})
       flags=$(gpu_flags "$eng")
       case ${eng%%+*} in *mtp) flags=$(with_ncmoe "$flags" "$GLM_NCMOE_MTP") ;; esac
       srv_mods_split "$eng"
@@ -532,7 +607,7 @@ arm_cmd() {
       ;;
     lcpp*)
       # shellcheck disable=SC2206 # the profile's NAME=VALUE words
-      case $eng in lcpp27752*) CMD=(env "$LCPP27752BIN") flags=$LCPP27752_GPU_FLAGS ;; *) CMD=(env $LCPP27754_ENV "$LCPP27754BIN") flags=$LCPP27754_GPU_FLAGS ;; esac
+      case $eng in lcpp27752*) CMD=(env ${REF_PIN[@]+"${REF_PIN[@]}"} "$LCPP27752BIN") flags=$LCPP27752_GPU_FLAGS ;; *) CMD=(env ${REF_PIN[@]+"${REF_PIN[@]}"} $LCPP27754_ENV "$LCPP27754BIN") flags=$LCPP27754_GPU_FLAGS ;; esac
       if fit_eng "$eng"; then
         lcpp_fit_flags "$flags"
         flags=$FIT_FLAGS
@@ -551,12 +626,12 @@ arm_cmd() {
       ;;
     exl3)
       # shellcheck disable=SC2206
-      CMD=(sudo -u user env --chdir=/ "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" "$EXL3_PY" "$EXL3/eval/perf.py" -m "$EXL3_MODEL" -spf --max_length "$((dep + 256))" $EXL3_FLAGS)
+      CMD=(sudo -u user env --chdir=/ "CUDA_VISIBLE_DEVICES=$REF_CVD" "$EXL3_PY" "$EXL3/eval/perf.py" -m "$EXL3_MODEL" -spf --max_length "$((dep + 256))" $EXL3_FLAGS)
       LABEL_TEST="Context $dep:"
       ;;
     exl3pp)
       # shellcheck disable=SC2206
-      CMD=(sudo -u user env --chdir=/ "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES" "$EXL3_PY" "$EXL3/eval/perf.py" -m "$EXL3_MODEL" -sg --max_length "$dep" $EXL3_FLAGS)
+      CMD=(sudo -u user env --chdir=/ "CUDA_VISIBLE_DEVICES=$REF_CVD" "$EXL3_PY" "$EXL3/eval/perf.py" -m "$EXL3_MODEL" -sg --max_length "$dep" $EXL3_FLAGS)
       LABEL_TEST="Length $dep:"
       ;;
   esac
@@ -675,6 +750,17 @@ preheat_arm() {
 if [ -n "$DRY" ]; then
   echo "[dry] model=$MODEL n=$N rounds=$ROUNDS ctx=$CTX place=$PLACE warm=${WARM:-0} card=$CARD_NAME timing_gpu=$TIMING_GPU arm_bound=${BOUND}s warmup=$WARMUP cold_us=$COLD_US"
   echo "[dry] ours: $BIN prose=$PROSE"
+  [ -z "$PLACES_SET" ] || echo "[dry] placements: $(place_line "${PLACE_ARMS[@]}")"
+  if [ -n "$TIMING_CARDS" ]; then
+    echo "[dry] $(tc_config)"
+    tc_rc=0
+    timing_cards_precheck '[dry] ' || tc_rc=$?
+    if [ "$tc_rc" = 0 ]; then
+      echo "[dry] two-card precheck: ok"
+    else
+      echo "[dry] two-card precheck: refused (rc $tc_rc): $TWOCARD_WHY — a real run stops here, before the lease"
+    fi
+  fi
   [ "$ours_mtp" = 0 ] || echo "[dry] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; ${MTP_NOTE:-the schema of the mtp summary record was not read (the check lines)}"
   [ -z "$RS_NOTE" ] || echo "[dry] residency: $RS_NOTE"
   echo "[dry] prompt: GLM_PROSE ids from index $PROSE_FROM"
@@ -801,7 +887,8 @@ run_arm() {
   local tag=$1 r=$2 i=$3 eng=${A_ENG[$3]} dep=${A_DEP[$3]} label=${A_LABEL[$3]} out rc t0 t1 m0 m1 val w rowtags why line markf mark
   CPU_BUSY_TAG='' FIT_COL='' FIT_LINES=''
   guard_other
-  guard_timing
+  # The two-card mode's guard_other waits on both cards (guard_cards); one card's waits on the timing card.
+  [ -n "$TIMING_CARDS" ] || guard_timing
   preheat_arm "$i" || {
     rc=$?
     [ "$tag" != ROW ] || n_rows=$((n_rows + 1))
@@ -839,8 +926,26 @@ run_arm() {
     [ -z "$CPU_BUSY_TAG" ] || busy_rows=$((busy_rows + 1))
     [ -z "$OTHER_BUSY_TAG" ] || other_rows=$((other_rows + 1))
   }
-  local r_tag=r$r
+  local r_tag=r$r tc
   [ "$tag" = ROW ] || r_tag=r0
+  # Two cards: an Xid, a card lost or off its cap, or an engine off the cards it was given fails the arm.
+  # Ours is held to its load record's cards (bp both, a the A6000 alone) once it exited 0; a reference,
+  # given the A6000 alone, to its log's one device (exllamav3 prints none: its CUDA_VISIBLE_DEVICES is the
+  # check).
+  if [ -n "$TIMING_CARDS" ]; then
+    case ${eng%%+*} in
+      ours | oursmtp)
+        if [ "$rc" = 0 ] && ! place_arm_cards "$out" "${A_PLACE[$i]}"; then
+          fail_row "" "${r_tag#r}" "$i" "$rc" "two cards: $TWOCARD_WHY" "$out"
+          return
+        fi
+        ;;
+      *)
+        case $eng in exl3*) tc=none ;; *) tc=stage ;; esac
+        timing_cards_arm "$out" "$tc" || { fail_row "" "${r_tag#r}" "$i" "$rc" "two cards: $TWOCARD_WHY" "$out"; return; }
+        ;;
+    esac
+  fi
   # A fit arm's loader lines say what the fit chose; a fit that failed or never ran fails the arm by
   # name, whatever llama-bench measured or how it exited after it.
   if fit_eng "$eng" && ! lcpp_fit_col "$out"; then
@@ -859,7 +964,7 @@ run_arm() {
         HOST_EXP=plan.host_experts XTOK=tokens.tokens LCTX=load_generator.ctx <<< "$out") || { fail_row "" "${r_tag#r}" "$i" 0 "records.py did not read the output" "$out"; return; }
       eval "$rec"
       [ -n "$P50" ] && [ -n "$PP_N" ] || { fail_row "" "${r_tag#r}" "$i" 0 "no SMOKE or time prompt record" "$out"; return; }
-      [ "$PLACE_RAN" = "$PLACE" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its SMOKE names place=$PLACE_RAN; the runner passed --place $PLACE" "$out"; return; }
+      [ "$PLACE_RAN" = "${A_PLACE[$i]}" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its SMOKE names place=$PLACE_RAN; the runner passed --place ${A_PLACE[$i]}" "$out"; return; }
       # The context the servers are given is the one this load made (docs/fair-measure.md 1.5).
       [ "$LCTX" = "$CTX" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its load record names ctx=${LCTX:-none}, and the server arms run at -c $CTX (BLOOMERY_GEN_CTX, ours' --ctx)" "$out"; return; }
       # The oursmtp row's draft fields: the mtp summary record, when the schema declares it (MTP_REC).
@@ -1001,21 +1106,22 @@ run_row() {
   COLD_PASS=0
 }
 
-# ratio_table <prefix> <keys> <labels>: records `label|key|round|value` on stdin; for every key and
-# every label, each round's ours / label ratio, their mean with its 95 % interval (Student t at rounds
-# - 1 degrees of freedom) and the ratio of the arm means (depth-qwen3moe.sh's table).
+# ratio_table <prefix> <keys> <labels> [base]: records `label|key|round|value` on stdin; for every key and
+# every label, each round's base / label ratio (the base ours, the default, or the label given), their
+# mean with its 95 % interval (Student t at rounds - 1 degrees of freedom) and the ratio of the arm means
+# (depth-qwen3moe.sh's table).
 ratio_table() {
-  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v rounds="$ROUNDS" -v t975="$T975" '{
+  awk -F'|' -v prefix="$1" -v deps="$2" -v refs="$3" -v base="${4:-ours}" -v rounds="$ROUNDS" -v t975="$T975" '{
   k = $1 SUBSEP $2 SUBSEP $3; rs[k] += $4; rn[k]++
   a = $1 SUBSEP $2; as[a] += $4; an[a]++
 } END {
   nt = split(t975, t, " "); nd = split(deps, d, " "); nr = split(refs, rf, " ")
   for (i = 1; i <= nd; i++) for (j = 1; j <= nr; j++) {
     ref = rf[j]
-    if (!(("ours" SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
+    if (!((base SUBSEP d[i]) in an) || !((ref SUBSEP d[i]) in an)) continue
     c = 0; m = 0; list = ""
     for (r = 1; r <= rounds; r++) {
-      ko = "ours" SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
+      ko = base SUBSEP d[i] SUBSEP r; kr = ref SUBSEP d[i] SUBSEP r
       if (!(ko in rn) || !(kr in rn)) continue
       q = (rs[ko] / rn[ko]) / (rs[kr] / rn[kr]); c++; v[c] = q; m += q
       list = list sprintf(" r%d %.4f", r, q)
@@ -1026,9 +1132,36 @@ ratio_table() {
     if (c < 2) ci = "(one round: no interval)"
     else if (c - 1 > nt) ci = sprintf("(no t quantile for df %d)", c - 1)
     else ci = sprintf("± %.4f", t[c - 1] * sqrt(ss / (c - 1)) / sqrt(c))
-    printf "%s%-5s ours/%-16s mean %.4f %s (n=%d)  of means %.4f  per round:%s\n", prefix, d[i], ref, m, ci, c, (as["ours" SUBSEP d[i]] / an["ours" SUBSEP d[i]]) / (as[ref SUBSEP d[i]] / an[ref SUBSEP d[i]]), list
+    printf "%s%-5s %s/%-16s mean %.4f %s (n=%d)  of means %.4f  per round:%s\n", prefix, d[i], base, ref, m, ci, c, (as[base SUBSEP d[i]] / an[base SUBSEP d[i]]) / (as[ref SUBSEP d[i]] / an[ref SUBSEP d[i]]), list
   }
 }'
+}
+# place_rank <word>: the word's position in PLACE_WORDS (a 0, gate 1, bp 2).
+place_rank() {
+  local w r=0
+  for w in $PLACE_WORDS; do
+    [ "$w" != "$1" ] || { echo "$r"; return; }
+    r=$((r + 1))
+  done
+}
+# place_pairs: every two of our arms of one engine (ours or oursmtp) whose variables are the same, in any
+# order, and whose placements differ, as `<numerator label>|<denominator label>` into PL_PAIRS, once a pair
+# of labels. The pair is ordered by placement, never by the arms' order or which one names place=: the
+# denominator is the placement first in PLACE_WORDS (a before bp), so a two-card pair reads bp / a.
+place_pairs() {
+  local i j n d p ki
+  PL_PAIRS=()
+  for i in "${!A_LABEL[@]}"; do
+    case ${A_ENG[$i]} in ours | oursmtp) ;; *) continue ;; esac
+    ki=$(tr , '\n' <<< "${A_ENV[$i]}" | sort | paste -sd, -)
+    for j in "${!A_LABEL[@]}"; do
+      [ "$j" -gt "$i" ] && [ "${A_ENG[$j]}" = "${A_ENG[$i]}" ] && [ "${A_PLACE[$j]}" != "${A_PLACE[$i]}" ] || continue
+      [ "$(tr , '\n' <<< "${A_ENV[$j]}" | sort | paste -sd, -)" = "$ki" ] || continue
+      if [ "$(place_rank "${A_PLACE[$i]}")" -gt "$(place_rank "${A_PLACE[$j]}")" ]; then n=${A_LABEL[$i]} d=${A_LABEL[$j]}; else n=${A_LABEL[$j]} d=${A_LABEL[$i]}; fi
+      p="$n|$d"
+      [[ " ${PL_PAIRS[*]+${PL_PAIRS[*]}} " == *" $p "* ]] || PL_PAIRS+=("$p")
+    done
+  done
 }
 means() { # means <unit>: `label|key|round|value` on stdin, one mean line per label and key
   awk -F'|' -v unit="$1" '{
@@ -1038,9 +1171,17 @@ means() { # means <unit>: `label|key|round|value` on stdin, one mean line per la
 }
 
 majflt_require depth-glm5next.sh
+timing_cards_precheck || {
+  rc=$?
+  echo "depth-glm5next.sh: two cards, refused before the lease: $TWOCARD_WHY" >&2
+  exit "$rc"
+}
 lease_take
+timing_cards_start
+[ -z "$TIMING_CARDS" ] || echo "[config] $(tc_config)"
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS card=$CARD_NAME timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU arm_bound=${BOUND}s cold_us=$COLD_US"
 [ "$ours" = 0 ] || echo "[config] ours: $BIN --ctx $CTX --place $PLACE warm=${WARM:-0} prose=$PROSE"
+[ -z "$PLACES_SET" ] || echo "[config] placements: $(place_line "${PLACE_ARMS[@]}")"
 [ "$ours_mtp" = 0 ] || echo "[config] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; $MTP_NOTE"
 [ -z "$RS_NOTE" ] || echo "[config] residency: $RS_NOTE"
 [ "$ours$srv" = 00 ] || echo "[config] prompt: GLM_PROSE ids from index $PROSE_FROM"
@@ -1117,6 +1258,18 @@ if [[ " ${sums[*]+${sums[*]}}" == *" oursmtp|"* ]]; then
   echo "=== ours / oursmtp per depth (below 1: the MTP draft is faster): each round's ratio, their mean ± 95 % (t, rounds - 1 df) ==="
   keys=$(printf '%s\n' "${sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
   printf '%s\n' "${sums[@]}" | ratio_table "ratio mtp d=" "$keys" oursmtp
+fi
+# One arm at two placements: the same engine and variables, the --place the one difference.
+place_pairs
+if [ ${#PL_PAIRS[@]} -gt 0 ]; then
+  for what in decode prefill; do
+    if [ "$what" = decode ]; then recs=(${sums[@]+"${sums[@]}"}) pre="ratio place d="; else recs=(${pp_sums[@]+"${pp_sums[@]}"}) pre="ratio place pp p="; fi
+    [ ${#recs[@]} -gt 0 ] || continue
+    echo
+    echo "=== one arm at two placements, $what per $([ "$what" = decode ] && echo depth || echo 'prompt length'): the later placement / the earlier (bp / a), each round's ratio, their mean ± 95 % (t, rounds - 1 df) ==="
+    keys=$(printf '%s\n' "${recs[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
+    for p in "${PL_PAIRS[@]}"; do printf '%s\n' "${recs[@]}" | ratio_table "$pre" "$keys" "${p#*|}" "${p%%|*}"; done
+  done
 fi
 res_sums_table
 witness post

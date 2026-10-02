@@ -1,0 +1,57 @@
+# Round v41ab (ncard's plan, step 3; the runner gap closed by round armplace): V4.1 decode at --place bp, plan (b′):
+# plan (a) on the A6000 with the 3090 as its expert tier, against --place a, the same binary in one two-card lease,
+# at the serving defaults (residency unset: mid-p40-s1 under both placements; host streaming unset follows the
+# residency; no draft). Its verdict decides whether bp becomes the ds41 seat's default: a default flips only when two
+# cards are not slower than one (user, 2026-10-02).
+#
+# [derived] The prediction is ncard's (its report §2, V4.1 row), not re-derived here. The step is a serial chain per
+# layer: the card's front, then max(host leg, card experts + tier), then the join, 22.6-26.7 ms. The host leg is
+# 130 slots a step x 126 us = 16.41 ms (rig-log 09-29#odswap-ab). The tier holds 1,392 experts (34.8 of 384 a layer,
+# 09-29#chatlist-clip) and takes about 11 % of the host's routed mass, so the share on the path is 0.13..1.0. The
+# two-card fixed term c_two is +1.9..+2.5 ms a step (docs/plan-triage.md:228; its source is unknown). Window-apart
+# rows read +2.3 % / +1.8 % at P 512 / 4096 (09-30#callstream-pp-bp against callstream-pp-a), inside the ~5 %
+# swing between windows, so they are no verdict. Band: -1..+5 %.
+#
+# Why noninf, not ab: the band holds 0, so an ab card is refused at any round count (its edge nearest 0 is 0). The
+# question is the default flip's, "bp no slower than a by more than the margin", which card.py's noninf kind asks:
+# runnable when lo - h_p > -margin, h_p = t(0.975, N - 1) x 0.6 % x sqrt(2 / N), the paired interval the runner's
+# ratio line prints; the sitting passes when the measured lower bound is above -margin (card.py verdict).
+# At the default margin 1.0 % no N clears it: the lower edge is -1 %, so lo - h_p < -1 % for every N. The margin
+# below is a decision threshold for the flip, not a derived or measured number; the lead or the user may set another
+# (card.py check at each pair, the wall at 2.6..4.3 min a round plus a 1.1..2.0 min warm-up, both [derived]):
+#   margin 1.5 %  N 14  lo - h_p = -1.490 %  wall 37..62 min (past 30: the user's approval)
+#   margin 2.0 %  N 6   lo - h_p = -1.891 %  wall 17..28 min   <- this card
+#   margin 2.0 %  N 5   lo - h_p = -2.053 %  refused (CARD_UNDER_MARGIN)
+#   margin 2.5 %  N 4   lo - h_p = -2.350 %  wall 12..19 min
+#
+# Runner (lead, on its go; the full output to a file first):
+# BLOOMERY_BOX_ENV='BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_GEN_PLACE=bp BLOOMERY_LEASE_CARD=docs/cards/v41bp-ab.card'
+# BLOOMERY_AB_ROUNDS=6 just depth-gpu-ds41 prose:512 prose:4096 prose:512@place=a prose:4096@place=a
+# The bare arms run at bp, the @place=a arms at a. Each placement is its own load key, so a round is 2 loads of
+# 2 arms. The prose table's `ratio prose d=<P>` line prose/prose@place=a is bp/a; the term is that ratio - 1. Its
+# per-round list goes to `python3 tools/ref/card.py verdict docs/cards/v41bp-ab.card r1 … r6`, once per P; the flip
+# needs a pass at both. The pp table reads beside it (`ratio pp prose p=`).
+# Wall [derived]: 6 rounds x (2 loads x 60..110 s, a two-card load not measured, + 4 arms x (prompt 2.5 / 10.5 s +
+# 96 steps 2.2 / 2.6 s)) + the warm-up arm, about 17..28 min. A two-card load past 110 s takes it past 30 minutes.
+kind: noninf
+question: is V4.1's served decode at --place bp (plan (b′), the 3090 the A6000's expert tier) no slower than at
+  --place a by more than the margin, in one two-card lease, so the seat's default may move to bp?
+term: decode tok/s(mean) @ n=96, prose:512 and prose:4096 (the first P ids of corpus-prose.ids), A6000+3090 (the
+  3090 at its 250 W cap), --place bp against --place a, residency and host streaming unset, no draft, the same
+  generate_ds41 - (bp - a) / a, paired by round
+unit: %
+predict: -1..+5
+rounds: 6
+margin: 2.0 % a decision threshold for the default flip, not derived: ncard's lower edge -1 % plus the paired
+  ruler at 6 rounds (0.891 %) with 0.109 % to spare; at the default 1.0 % no round count clears a -1 % edge
+condition: one binary, every arm in one lease, a fresh process per placement and round, the order rotated every round;
+  each bp row's load record names the A6000 and the 3090 and each a row's the A6000 alone (the runner fails any
+  other); no Xid in any witness block, the 3090 at 250 W in each; no row carries [cpu-busy], [other-busy] or [cold]
+decide-in: on a verdict pass at P 512 and 4096, write both tables (decode and pp) to rig-log's A6000+3090 table and
+  propose bp as the ds41 seat's default in a round of its own (the serve gate's default arm re-pinned); on a fail,
+  keep a and read the rows' paired SD against the card's 0.6 % before any re-sit
+decide-below: on a fail, keep a as the default and open one nsys window of a bp decode step against an a step on
+  paper first, to find where c_two (+1.9..+2.5 ms a step) sits; on a pass, propose bp as in decide-in and re-derive
+  the term the model understated (c_two or the tier's share) before the public row
+decide-above: propose bp as the default as in decide-in, and re-derive the tier's share of the host slots, which
+  the model understated, from one BLOOMERY_STEP_STATS=1 functional run per placement

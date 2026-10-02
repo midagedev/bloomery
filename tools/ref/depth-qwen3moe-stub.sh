@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The depth-qwen3moe.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_QWEN3MOE_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
-# timing-card.sh, lease-probe.sh, tdist.py, load-groups.sh, lcpp-fit.sh, cold-blocks.sh, lever-arms.sh and
-# lcpp-warm.sh, and a copy of lease.sh whose lease_take is replaced by a line that takes nothing; cards.sh
+# timing-card.sh, lease-probe.sh, tdist.py, load-groups.sh, lcpp-fit.sh, cold-blocks.sh, lever-arms.sh,
+# arm-place.sh and lcpp-warm.sh, and a copy of lease.sh whose lease_take is replaced by a line that takes nothing; cards.sh
 # there is depth-stub-cards.sh's, two made-up UUIDs;
 # ref-paths.sh there is a stub qwen4exp profile whose engines are stub scripts (llama-bench as lcpp and ik,
 # llama-server, generate_qwen3moe, mistralrs, nvidia-smi). Nothing it starts loads a model or touches a
@@ -93,8 +93,21 @@
 #   twocard-srv  lcppsrv:6 lcppsrvpp:4, one round: the server arms in the mode, the profile's -ts in each
 #                server's command line, each row `A6000+3090` with both cards as its device, no server left up;
 #                rc 0 (depth-ds41-stub.sh has the one-card and Xid failures of a server arm).
-#   twocard-arms[-bin|-ik|-mrs]  6, bin:<base>:6, ik:6 and mrs:6 each refused by name before anything
-#                runs (rc 64); ours naming --place b as the expected interface.
+#   twocard-arms[-bin|-ik|-mrs]  6@place=gate, bin:<base>:6 under BLOOMERY_GEN_PLACE=gate, ik:6 and mrs:6
+#                each refused by name before anything runs (rc 64): the gate plan loads the 3090 alone, ik
+#                and mistral.rs have no two-card line.
+#   twocard-place  BLOOMERY_GEN_PLACE=bp, 6 6@place=a lcpp:6, one round, the stub naming its load's cards
+#                (STUB_GEN_CARDS_ON): each placement its own load (--place bp, --place a), the ours rows
+#                `place bp` and `place a` with the mode's card field, the [config] placements line; rc 0.
+#   twocard-place-3090  an a arm whose load line names the 3090 (STUB_GEN_CARDS_A): its FAIL row; rc 1.
+#   twocard-nocards  a load line with no cards= field, as generate_qwen3moe's is today: the FAIL row; rc 1.
+#   twocard-place-dry  the dry run: each arm's --place and load key, the placements line.
+# An arm's place= under one card (red on the runner before it, which reads place= as a lever and refuses
+# it as no registry row, rc 64 with another text):
+#   bp-onecard-arm, place-ref, place-word, place-twice, place-card-arm  6@place=bp, lcpp:6@place=a, 6@place=b2,
+#                6@place=a,place=a and 6@place=gate with the A6000 the timing card: each refused by name, rc 64.
+#   place-one    6 6@place=a: two rows at `place a` (one load: the same key), no variable named place in
+#                the binary's environment.
 #   twocard-profile  a profile with no two-card line (TWO_CARD_PLACEMENT empty): refused by name, rc 64.
 #   twocard-cap  the 3090 at 300 W: refused before the lease, rc 78, no row.
 #   twocard-gone the 3090 not answering nvidia-smi: refused before the lease, rc 69.
@@ -128,7 +141,8 @@ mkdir -p "$T/tools/ref" "$T/tools/bloomery" "$T/target/release" "$T/base/target/
 cp "$RUNNER" "$T/tools/ref/depth-qwen3moe.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/load-groups.sh" \
-  "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$ROOT/tools/ref/lever-arms.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" "$ROOT/tools/ref/lever-arms.sh" \
+  "$ROOT/tools/ref/arm-place.sh" "$T/tools/ref/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
 # records.py and the checked-in schemas: the runner reads the arm's residency, mtp and stat records by kind.
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
@@ -295,9 +309,15 @@ touch "$T/Cargo.toml"
 # STUB_GEN_MTP an `mtp summary` of 10 positions in 4 passes and the MTP form of the SMOKE line (steps= the
 # summary's positions, passes= its passes, no seeded=): STUB_GEN_PASSES=5 is 10 positions in 5 passes, 0 none
 # in none, any other value an error. Every process appends its --place to $TMPDIR/stub-gen-place (`-` when
-# none).
+# none). A variable named `place` in its environment ends it at rc 9. Its load line names no cards, as
+# generate_qwen3moe's does not; under STUB_GEN_CARDS_ON=1 it names the cards its --place loads (`cards=`:
+# the A6000 under a or none, STUB_GEN_CARDS_A in their stead; the 3090 under gate; both under bp).
 cat > "$T/target/release/generate_qwen3moe" << 'EOF'
 #!/usr/bin/env bash
+if printenv place > /dev/null; then
+  echo "error: a variable named place reached the binary (place=$(printenv place)): the runner passed an arm's place= item as a variable" >&2
+  exit 9
+fi
 tokens='' n=32 ctx=0 sync='' arms=() place=''
 while [ $# -gt 0 ]; do
   case $1 in
@@ -312,7 +332,15 @@ listed=1
 if [ ${#arms[@]} -eq 0 ]; then listed='' arms=("$tokens"); echo "prompt_ids [$tokens]"; fi
 echo "$(for a in "${arms[@]}"; do printf '%s ' "$(count "$a")"; done)" >> "${TMPDIR:-/tmp}/stub-gen-loads"
 [ -z "${STUB_GEN_RES:-}" ] || echo "residency lever residency=$STUB_GEN_RES why=set"
-echo "load arch=stub ctx=$ctx place=${STUB_GEN_PLACE_RAN:-${place:-a}} (stub)"
+cards=''
+if [ -n "${STUB_GEN_CARDS_ON:-}" ]; then
+  case ${place:-a} in
+    a) cards=${STUB_GEN_CARDS_A:-[NVIDIA_RTX_A6000]} ;;
+    gate) cards='[NVIDIA_GeForce_RTX_3090]' ;;
+    *) cards='[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' ;;
+  esac
+fi
+echo "load arch=stub ctx=$ctx place=${STUB_GEN_PLACE_RAN:-${place:-a}}${cards:+ cards=$cards} (stub)"
 echo "capture graph_nodes=10"
 for k in "${!arms[@]}"; do
   depth=$(count "${arms[$k]}")
@@ -766,10 +794,13 @@ twocard_refused() {
     pass "$name"
   fi
 }
-twocard_refused twocard-arms 64 "^depth-qwen3moe.sh: arm '6': generate_qwen3moe loads one card \(--place a\|gate\); its two-card placement, plan \(b\) \(workstation::plan_b\), is expected as --place b and does not exist yet" \
-  "$TC" -- lcpp:6 6
-twocard_refused twocard-arms-bin 64 "^depth-qwen3moe.sh: arm 'bin:[^']*:6': generate_qwen3moe loads one card " \
-  "$TC" -- lcpp:6 "bin:$BASEBIN:6"
+# The gate plan in the mode (re-pinned 2026-10-02, round armplace: twocard-arms and twocard-arms-bin held
+# every ours and bin: arm refused in the mode, and an a or bp arm now runs there, twocard-place below; the
+# placement the mode refuses is the gate plan, a 3090-only row in the A6000+3090 table).
+twocard_refused twocard-arms 64 "^depth-qwen3moe.sh: arm '6@place=gate': place=gate is the gate plan, which loads the 3090 alone; the two-card mode times a \(plan \(a\) on the A6000, the 3090 idle\) or bp \(plan \(b′\), both cards\)$" \
+  "$TC" -- lcpp:6 6@place=gate
+twocard_refused twocard-arms-bin 64 "^depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads the 3090 alone; " \
+  "$TC" BLOOMERY_GEN_PLACE=gate -- lcpp:6 "bin:$BASEBIN:6"
 twocard_refused twocard-arms-ik 64 "^depth-qwen3moe.sh: arm 'ik:6': the two-card table.s reference is mainline llama.cpp \(the profile.s two-card line: [^)]*\); ik has no two-card arm$" \
   "$TC" -- lcpp:6 ik:6
 twocard_refused twocard-arms-mrs 64 "^depth-qwen3moe.sh: arm 'mrs:6': .*; mrs has no two-card arm$" \
@@ -784,6 +815,70 @@ twocard_refused twocard-lease 64 "^depth-qwen3moe.sh: two cards, refused before 
   "$TC" STUB_ONE_CARD_LEASE=1 -- lcpp:6
 twocard_refused twocard-value 64 "^depth-qwen3moe.sh: BLOOMERY_TIMING_CARDS is a6000\+3090 \(the two-card mode\) or unset \(one card\), got 'both'$" \
   BLOOMERY_TIMING_CARDS=both -- lcpp:6
+
+# A per-arm placement in the mode: a and bp arms in one run.
+L=$tmp/twocard-place.log
+: > "$tmp/tmp/stub-gen-place"
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" BLOOMERY_GEN_PLACE=bp STUB_GEN_CARDS_ON=1 -- 6 6@place=a lcpp:6
+if [ "$RC" != 0 ]; then
+  fail twocard-place "rc $RC, want 0" "$L"
+elif [ "$(sort "$tmp/tmp/stub-gen-place" | paste -sd' ' -)" != "a bp" ]; then
+  fail twocard-place "the processes' --place: $(paste -sd' ' - < "$tmp/tmp/stub-gen-place"), want a and bp (a load each)" "$L"
+elif want twocard-place "$L" 1 '^ROW r1 ours d=6 n=4 ctx=256 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000\+3090 \| place bp \| ' &&
+  want twocard-place "$L" 1 '^ROW r1 ours@place=a d=6 n=4 ctx=256 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000\+3090 \| place a \| ' &&
+  want twocard-place "$L" 1 '^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 ' &&
+  want twocard-place "$L" 1 '^ratio d=6 +ours/ours@place=a +mean ' &&
+  want twocard-place "$L" 1 '^\[config\] placements: 6 bp, 6@place=a a \(an arm.s place= over BLOOMERY_GEN_PLACE=bp\)$' &&
+  want twocard-place "$L" 0 '^FAIL '; then
+  pass twocard-place
+fi
+L=$tmp/twocard-place-3090.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" STUB_GEN_CARDS_ON=1 \
+  'STUB_GEN_CARDS_A=[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' -- 6@place=a
+if [ "$RC" != 1 ]; then
+  fail twocard-place-3090 "rc $RC, want 1" "$L"
+elif want twocard-place-3090 "$L" 1 "^FAIL r1 ours@place=a d=6 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090\], and --place a loads the A6000 alone: the 3090 must stay idle; last line: " &&
+  want twocard-place-3090 "$L" 0 '^ROW '; then
+  pass twocard-place-3090
+fi
+L=$tmp/twocard-nocards.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" -- 6
+if [ "$RC" != 1 ]; then
+  fail twocard-nocards "rc $RC, want 1" "$L"
+elif want twocard-nocards "$L" 1 "^FAIL r1 ours d=6 rc=0 \| two cards: the engine.s load record names no cards: which cards it loaded cannot be told; last line: " &&
+  want twocard-nocards "$L" 0 '^ROW '; then
+  pass twocard-nocards
+fi
+L=$tmp/twocard-place-dry.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 "$TC" BLOOMERY_GEN_PLACE=bp -- 6 6@place=a
+if [ "$RC" != 0 ]; then
+  fail twocard-place-dry "rc $RC, want 0" "$L"
+elif want twocard-place-dry "$L" 1 '^\[dry\] 6@place=a: one arm of a load: .* --ctx 256 --place a --time --arm-sync   # load key [^ ]*\|ctx=256\|place=a$' &&
+  want twocard-place-dry "$L" 1 '^\[dry\] 6: one arm of a load: .* --ctx 256 --place bp --time --arm-sync   # load key [^ ]*\|ctx=256\|place=bp$' &&
+  want twocard-place-dry "$L" 1 '^\[dry\] placements: 6 bp, 6@place=a a \(an arm.s place= over BLOOMERY_GEN_PLACE=bp\)$' &&
+  want twocard-place-dry "$L" 0 'env place='; then
+  pass twocard-place-dry
+fi
+# One card.
+twocard_refused bp-onecard-arm 64 "^depth-qwen3moe.sh: arm '6@place=bp': place=bp is plan \(b′\), which loads on both cards \(the A6000 and its 3090 expert tier\); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000\+3090$" \
+  -- 6 6@place=bp
+twocard_refused place-ref 64 "^depth-qwen3moe.sh: arm 'lcpp:6@place=a': place= sets generate_qwen3moe's --place, and lcpp is a reference engine's arm, which takes no placement of ours$" \
+  -- 6 lcpp:6@place=a
+twocard_refused place-word 64 "^depth-qwen3moe.sh: arm '6@place=b2': place=b2: generate_qwen3moe takes --place a, gate or bp in this runner$" \
+  -- 6 6@place=b2
+twocard_refused place-twice 64 "^depth-qwen3moe.sh: arm '6@place=a,place=a': place is given twice$" \
+  -- 6 6@place=a,place=a
+twocard_refused place-card-arm 64 "^depth-qwen3moe.sh: arm '6@place=gate': place=gate is the gate plan, which loads on the 3090, and the timing card is " \
+  -- 6 6@place=gate
+L=$tmp/place-one.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 -- 6 6@place=a
+if [ "$RC" != 0 ]; then
+  fail place-one "rc $RC, want 0" "$L"
+elif want place-one "$L" 1 '^ROW r1 ours d=6 ' &&
+  want place-one "$L" 1 '^ROW r1 ours@place=a d=6 .* \| place a \| ' &&
+  want place-one "$L" 0 '^FAIL '; then
+  pass place-one
+fi
 
 L=$tmp/twocard-xid.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 "$TC" STUB_BENCH_XID=pp4 -- lcpp:6 lcpppp:4 lcpp:5
@@ -919,7 +1014,9 @@ L=$tmp/place-card.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_PLACE=gate BLOOMERY_TIMING_GPU="$STUB_GPU_A6000" -- 6
 if [ "$RC" != 64 ]; then
   fail place-card "rc $RC, want 64" "$L"
-elif want place-card "$L" 1 '^depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=gate loads on the 3090, and the timing card is '; then
+# Re-pinned 2026-10-02 (round armplace): the refusal is tools/ref/arm-place.sh's one text in every runner,
+# which names the plan before the card; the case still pins the gate word, the 3090 and the timing card.
+elif want place-card "$L" 1 '^depth-qwen3moe.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads on the 3090, and the timing card is '; then
   pass place-card
 fi
 

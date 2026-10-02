@@ -188,6 +188,31 @@ card ab-unit.card 65 'an ab card predicts its effect in percent'
 card continuation.card 0 'ok kind=ab'
 card orphan-indent.card 65 'continues no key line above it'
 card missing.card 66 'refused CARD_ABSENT'
+card noninf-valid.card 0 'ok kind=noninf h_p = 0\.891 % at 6 rounds \(the card; paired, t 2\.571, df 5;.*margin 2 % — the fixture.s flip threshold; lo - h_p = -1\.891 % > -2 %'
+card noninf-default.card 71 'refused CARD_UNDER_MARGIN \(rc 71\)'
+card noninf-default.card 71 'the band.s lower edge -1 % is at or below -1 %: no round count clears it'
+card noninf-rounds.card 71 'at 3 rounds the card would need a margin above 2\.608 %'
+card noninf-rounds.card 71 'clears at 14 rounds: lo - h_p = -0\.990 % > -1 %'
+card noninf-rounds.card 71 'box minutes at 14 rounds: 14 x 3 = 42 min' --round-minutes 3
+card noninf-rounds.card 0 'the runner runs 14 rounds and the card says 3: checked at 14' --rounds 14
+card noninf-margin-no-reason.card 65 'names no reason'
+# card.py verdict on synthetic ratio lists: the interval is ratio_table's (tools/ref/depth-ds41.sh) to 4 digits.
+run 'verdict pass' 0 '^card: verdict: pass: the lower bound -0\.381 % is above -2 %$' \
+  python3 "$ROOT/tools/ref/card.py" verdict "$HERE/noninf-valid.card" r1 1.010 r2 1.000 r3 0.995 r4 1.005 r5 1.012 r6 0.998
+run 'verdict pass: the ratio line' 0 '^card: mean 1\.0033 ± 0\.0071 \(n=6\): effect \+0\.333 %, lower bound -0\.381 %$' \
+  python3 "$ROOT/tools/ref/card.py" verdict "$HERE/noninf-valid.card" r1 1.010 r2 1.000 r3 0.995 r4 1.005 r5 1.012 r6 0.998
+run 'verdict fail' 1 '^card: verdict: fail: the lower bound -3\.065 % is at or below -2 %$' \
+  python3 "$ROOT/tools/ref/card.py" verdict "$HERE/noninf-valid.card" 0.970 0.975 0.980 0.972 0.978 0.969
+run 'verdict fail: the band region' 1 '^card: band: the effect -2\.600 % is below -1\.\.5: decide-below: ' \
+  python3 "$ROOT/tools/ref/card.py" verdict "$HERE/noninf-valid.card" 0.970 0.975 0.980 0.972 0.978 0.969
+run 'verdict on an ab card' 64 'verdict reads a noninf card; .*valid-ab\.card is kind ab' \
+  python3 "$ROOT/tools/ref/card.py" verdict "$HERE/valid-ab.card" 1.01 1.02
+run 'verdict on a label with no ratio' 64 "the label 'r2' is followed by no ratio" \
+  python3 "$ROOT/tools/ref/card.py" verdict "$HERE/noninf-valid.card" r1 1.01 r2
+run 'verdict on one ratio' 64 'an interval needs 2 rounds or more' \
+  python3 "$ROOT/tools/ref/card.py" verdict "$HERE/noninf-valid.card" 1.01
+run 'verdict on a refused card' 71 'refused CARD_UNDER_MARGIN' \
+  python3 "$ROOT/tools/ref/card.py" verdict "$HERE/noninf-default.card" 1.01 1.02
 run 'check usage' 64 'usage' python3 "$ROOT/tools/ref/card.py" check
 run 'check bad --rounds' 64 '--rounds takes a positive integer' python3 "$ROOT/tools/ref/card.py" check "$HERE/valid-ab.card" --rounds three
 

@@ -1,0 +1,12 @@
+# Fixture: a noninf card whose band holds 0: lo - h_p = -1 - 0.891 = -1.891 % > -2 % at six rounds.
+kind: noninf
+question: is the fixture placement no slower than the base by more than the margin?
+term: decode tok/s @ n=96, depth 512, A6000+3090 — (changed − base) / base, paired by round
+unit: %
+predict: -1..+5
+rounds: 6
+margin: 2.0 % the fixture's flip threshold
+condition: both arms alternate in one lease, the order rotated every round; no row carries [cpu-busy] or [other-busy]
+decide-in: flip the default on a pass
+decide-below: keep the base and find the wrong term
+decide-above: flip on a pass and re-derive the term the model understated

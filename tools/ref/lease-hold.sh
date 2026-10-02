@@ -8,7 +8,7 @@
 #
 # The card goes through lease_take (tools/ref/lease.sh), the same check every runner gets: its path,
 # sha256 and body go into the log as [lease] lines, and a missing or refused card exits with
-# tools/ref/card.py's code before the lease is taken. An ab card is checked at its own `rounds` (or
+# tools/ref/card.py's code before the lease is taken. An ab or noninf card is checked at its own `rounds` (or
 # BLOOMERY_AB_ROUNDS): the command's arms are its own to count. The lease is held on descriptor 9 for
 # the command's life, `witness pre` and `witness post` bracket the command, and the command's exit
 # code is this script's. The command inherits descriptor 9, like every runner's child: a process it

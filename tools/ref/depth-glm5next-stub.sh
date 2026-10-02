@@ -2,7 +2,7 @@
 # The depth-glm5next.sh stub test: the runner's arms with no lease, no card and no model. It copies the
 # runner (DEPTH_GLM5NEXT_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
 # ref-paths.sh, models/glm5next.sh (the real profile: the arms run at its flags),
-# timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, lcpp-warm.sh, cold-blocks.sh, lever-arms.sh, gguf-ranges.py,
+# timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, lcpp-warm.sh, cold-blocks.sh, lever-arms.sh, arm-place.sh, gguf-ranges.py,
 # records.py with generate_glm5next's checked-in schema, the lever registry, and a copy of lease.sh whose lease_take is replaced by a line
 # that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs. The profile keeps a
 # caller's values, so the two PR trees' llama-bench and generate_glm5next are stub scripts here, their
@@ -85,16 +85,17 @@
 #                the dry run of 2044 and oursmtp:2043 beside it: rc 0, both arms' lines.
 #   mtp-env      BLOOMERY_DRAFT=mtp in the runner's environment beside an ours arm: refused by name, rc 64.
 #   mtp-dry      6 oursmtp:6's dry run: the oursmtp command line is ours' under env BLOOMERY_DRAFT=mtp, the
-#                ours one carries no env, and the `[dry] oursmtp:` line says the schema declares no mtp
-#                summary record.
+#                ours one carries no env, and the `[dry] oursmtp:` line says the checked-in schema declares
+#                the mtp summary record (generate_glm5next registers mtp_summary).
 #   mtp          6 oursmtp:6 lcpp27752srv:6, two rounds, preheat on at GLM_PREHEAT_K 2 on the fixture (needs
 #                the prose ids): the stub generate_glm5next times its steps at half under BLOOMERY_DRAFT=mtp
-#                and logs each run's BLOOMERY_DRAFT ($TMPDIR/stub-gen-draft): three runs of each arm, the
-#                oursmtp ones alone under mtp; oursmtp's warm-up and rows, its K=2 preheats, its decode and
-#                prefill means under its own label, no draft fields in its row, its xcheck against ours;
+#                and logs each run's BLOOMERY_DRAFT ($TMPDIR/stub-gen-draft), printing the mtp summary record
+#                (STUB_GEN_MTP_REC=1): three runs of each arm, the oursmtp ones alone under mtp; oursmtp's
+#                warm-up and rows, its K=2 preheats, its decode and prefill means under its own label, the
+#                draft fields in its two rows and none in ours', its xcheck against ours;
 #                `ratio mtp d=6 ours/oursmtp mean 0.4999 ± 0.0000 (n=2)`, and oursmtp in no other ratio
 #                table (the decode and prefill tables hold ours/lcpp27752srv alone).
-#   mtp-rec      a schema copy that declares the mtp summary record (generate_qwen3moe's): with the stub
+#   mtp-rec      the checked-in schema's mtp summary record: with the stub
 #                printing one under mtp (STUB_GEN_MTP_REC=1) the oursmtp row carries `mtp positions/pass
 #                2.500 = positions 10 / passes 4, kept [1, 1, 1, 1]` and the ours row nothing; printing
 #                none, the oursmtp row is a FAIL row naming it, rc 1.
@@ -107,23 +108,52 @@
 #   lever-dry    512 512@BLOOMERY_RESIDENCY=mid-p33-s1 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1,BLOOMERY_R8=off's
 #                dry run: the lever arms' command lines under env with their variables (oursmtp's after
 #                BLOOMERY_DRAFT=mtp), the plain one with none, and the `[dry] residency:` line saying the
-#                checked-in schema declares no residency lever record.
-#   lever-pair   512 512@BLOOMERY_RESIDENCY=mid-p33-s1, two rounds, no warm-up, on a schema copy that
-#                declares the residency lever and host records (generate_qwen3moe's): four processes, the
+#                checked-in schema declares the residency records (residency_lever and residency_pass).
+#   lever-pair   512 512@BLOOMERY_RESIDENCY=mid-p33-s1, two rounds, no warm-up, on the checked-in schema
+#                (it declares the residency lever and pass records): four processes, the
 #                stub engine seeing the variable in the lever arm's alone, in the rotation's order (none,
 #                mid, mid, none); the lever rows' residency column (three step passes, kept 30), the plain
 #                rows' none; two means with distinct labels, the ratio line ours/ours@… 1.0000 over two
 #                rounds, the residency mean line of the lever label alone, no xcheck line for it; rc 0.
 #                Needs the prose ids, as ours-timed; so do the three below.
-#   lever-res-nolever  the same arms on that schema copy, the stub printing no residency lever record
+#   lever-res-nolever  the same arms on the checked-in schema, the stub printing no residency lever record
 #                (STUB_GEN_NORESLEVER=1): the lever row a FAIL row naming it, the plain row a ROW, rc 1.
-#   lever-res-none  the same arms on the checked-in schema (no residency lever record): each lever row a FAIL
-#                row naming the schema, the plain row a ROW, rc 1.
-#   mtp-lever-arm  512 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1 on the residency schema copy: the stub engine
+#   lever-res-none  the same arms on a copy of the checked-in schema without its residency lever record (the
+#                schema before generate_glm5next registered it): each lever row a FAIL row naming the schema,
+#                the plain row a ROW, rc 1.
+#   mtp-lever-arm  512 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1 on the checked-in schema, the stub printing
+#                the mtp summary record (STUB_GEN_MTP_REC=1): the stub engine
 #                sees both BLOOMERY_DRAFT=mtp and the variable in the oursmtp process; its row under its label,
 #                with its residency column; no ratio line and no xcheck line for it; rc 0.
 #   lever-levers a generate_glm5next whose --levers refuses BLOOMERY_R8 (STUB_GEN_REFUSE): 512@BLOOMERY_R8=off
 #                refused before the lease by name with the binary's line, rc 2, no row.
+# An ours arm's place= and the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090; depth-stub-cards.sh's
+# nvidia-smi and journalctl first on PATH; red on the runner before them, which has no two-card mode, refuses
+# place= as no lever row and BLOOMERY_GEN_PLACE=bp as no word):
+#   bp-onecard, bp-onecard-arm  BLOOMERY_GEN_PLACE=bp and 6@place=bp under one card: refused by name, rc 64.
+#   place-ref, place-word, place-twice, place-card  place= on lcpp27752:6, place=b2, place given twice,
+#                6@place=gate with the A6000 the timing card: each refused by name, rc 64.
+#   twocard-gate 6@place=gate in the two-card mode: refused by name, rc 64.
+#   twocard-place  BLOOMERY_GEN_PLACE=bp, 6 6@place=a lcpp27752:6, one round, the stub naming its load's cards
+#                (STUB_GEN_CARDS_ON): the two ours rows at `place bp` and `place a`, every row `A6000+3090`,
+#                the reference bench run with the A6000 alone as CUDA_VISIBLE_DEVICES and its row's device
+#                that card, the ratio ours/ours@place=a, the [config] placements and two-card lines, the
+#                witness's 3090 cap and Xid lines in each of its eight blocks, the `ratio place d=6
+#                ours/ours@place=a` line; rc 0. Needs the prose ids, as ours-timed; so do the five below.
+#   twocard-place-mtp  6 6@place=a oursmtp:6 oursmtp:6@place=a, two rounds (STUB_GEN_MTP_REC): the oursmtp
+#                rows at bp and a, their `ratio place d=6 oursmtp/oursmtp@place=a` and `ratio place pp p=6`
+#                lines beside ours' pair, four lines in that table; rc 0 (red on the runner before the
+#                placement pairs, which prints no table for an oursmtp arm with an @ list).
+#   twocard-place-order  oursmtp:512@place=a,BLOOMERY_RESIDENCY=mid-p33-s1 and
+#                oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1,place=bp, two rounds, bp's steps at 15 ms
+#                (STUB_GEN_SMS_BP) against a's 16.5: `ratio place d=512 <bp arm>/<a arm> mean 1.1000` by
+#                round with the arms in either order; rc 0 (red on a pairing by the arms' order, which reads
+#                a / bp = 0.9091 when the a arm comes first).
+#   twocard-place-3090  an a arm whose load record names the 3090 (STUB_GEN_CARDS_A): its FAIL row; rc 1.
+#   twocard-nocards  a load record with no cards field, as generate_glm5next's is today: the FAIL row
+#                naming it; rc 1.
+#   twocard-place-dry  the dry run: each ours arm's --place, the reference's CUDA_VISIBLE_DEVICES, the
+#                precheck's ok, the placements line.
 #   dry-same     DEPTH_GLM5NEXT_BASE set: the dry run of every arm kind the base runner knows, under the
 #                base and under the runner tested, byte for byte less the lines this runner changed on
 #                purpose: `[dry] preheat:`, `[dry] prompt:`, `[dry] WARMUP r0:`, `[dry] server arms:`, the
@@ -144,7 +174,7 @@ cp "$RUNNER" "$T/tools/ref/depth-glm5next.sh"
 cp "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/timing-card.sh" \
   "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/lcpp-warm.sh" "$ROOT/tools/ref/cold-blocks.sh" \
-  "$ROOT/tools/ref/gguf-ranges.py" "$ROOT/tools/ref/lever-arms.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/gguf-ranges.py" "$ROOT/tools/ref/lever-arms.sh" "$ROOT/tools/ref/arm-place.sh" "$T/tools/ref/"
 cp "$ROOT/tools/ref/models/glm5next.sh" "$T/tools/ref/models/"
 cp "$ROOT/tools/bloomery/records.py" "$T/tools/bloomery/"
 # The lever registry, which a lever arm's NAME=VALUE list is checked against (before the stub binaries are
@@ -173,7 +203,9 @@ esac
 EOF
 # The stub llama-bench, one copy a PR tree (the tree is its directory's name). Its table's model column
 # echoes what it was given: -ngl, --n-cpu-moe, -fa, -fitt, -v, -ub and NVIDIA_TF32_OVERRIDE. It refuses
-# --n-cpu-moe STUB_BENCH_FAIL_K. It removes the file STUB_BENCH_RM names. --help lists --fit-target unless its tree is in STUB_BENCH_NO_FIT. Under
+# --n-cpu-moe STUB_BENCH_FAIL_K. It removes the file STUB_BENCH_RM names. It appends its CUDA_VISIBLE_DEVICES
+# to $TMPDIR/stub-bench-cvd, and under STUB_BENCH_DEVLINES=1 prints ggml_cuda_init's device lines for the
+# cards that variable names (two: the A6000 and the 3090; one: the A6000). --help lists --fit-target unless its tree is in STUB_BENCH_NO_FIT. Under
 # -fitt it prints common_fit_params' failure warning when STUB_BENCH_FIT_FAIL is set, and then exits 1
 # when STUB_BENCH_FIT_EXIT is set too; under -fitt -v it prints two model loads, the fit's measuring
 # one and the real one with two expert tensors of blk 1 overridden to the host.
@@ -216,6 +248,20 @@ if [ -n "$fitt" ]; then
   fi
 fi
 [ -z "${STUB_BENCH_RM:-}" ] || rm -f "$STUB_BENCH_RM"
+echo "${CUDA_VISIBLE_DEVICES:-}" >> "${TMPDIR:-/tmp}/stub-bench-cvd"
+if [ -n "${STUB_BENCH_DEVLINES:-}" ]; then
+  case ${CUDA_VISIBLE_DEVICES:-} in
+    *,*)
+      echo "ggml_cuda_init: found 2 CUDA devices (Total VRAM: 72663 MiB):"
+      echo "  Device 0: NVIDIA RTX A6000 (stub), compute capability 8.6, VMM: yes, VRAM: 48539 MiB"
+      echo "  Device 1: NVIDIA GeForce RTX 3090 (stub), compute capability 8.6, VMM: yes, VRAM: 24124 MiB"
+      ;;
+    *)
+      echo "ggml_cuda_init: found 1 CUDA devices (Total VRAM: 48539 MiB):"
+      echo "  Device 0: NVIDIA RTX A6000 (stub), compute capability 8.6, VMM: yes, VRAM: 48539 MiB"
+      ;;
+  esac >&2
+fi
 if [ -n "$k" ] && [ "$k" = "${STUB_BENCH_FAIL_K:-none}" ]; then
   echo "llama_init_from_model: failed to create context (stub: --n-cpu-moe $k)" >&2
   exit 1
@@ -230,14 +276,18 @@ cp "$T/pr27752/llama-bench" "$T/pr27754/llama-bench"
 # The stub llama-server: tools/ref/stub-llama-server.py (its docstring has what it answers).
 cp "$ROOT/tools/ref/stub-llama-server.py" "$T/pr27752/llama-server"
 cp "$T/pr27752/llama-server" "$T/pr27754/llama-server"
-# The stub generate_glm5next: --records-schema prints the checked-in schema; --levers prints a line, or
+# The stub generate_glm5next: a variable named `place` in its environment (an arm's place= item passed as a
+# variable) ends it at rc 9. Its load record names no cards, as generate_glm5next's does not; under
+# STUB_GEN_CARDS_ON=1 it names the cards its --place loads (the A6000 under a, STUB_GEN_CARDS_A in their
+# stead; the 3090 under gate; both under bp). --records-schema prints the checked-in schema; --levers prints a line, or
 # under STUB_GEN_NODRAFT=1 with BLOOMERY_DRAFT set refuses it (exit 1), as a run does then, and so for the
 # variable STUB_GEN_REFUSE names when it is set; a run appends
 # `draft=<BLOOMERY_DRAFT or none> depth=<ids>` to $TMPDIR/stub-gen-draft and `draft=<…> residency=<BLOOMERY_RESIDENCY
 # or none> depth=<ids>` to $TMPDIR/stub-gen-env; under BLOOMERY_RESIDENCY it prints a `residency lever`
 # record (why=set) before its plan (none under STUB_GEN_NORESLEVER=1), a `residency pass` of pass none before its feed and one of pass step
 # (kept 10, landed 1, late 0, made 1, bytes 100) after each timed step; it times its steps at half under
-# BLOOMERY_DRAFT=mtp, and prints there an `mtp summary` record when STUB_GEN_MTP_REC=1; it prints the
+# BLOOMERY_DRAFT=mtp (at STUB_GEN_SMS_BP ms under --place bp when that is set), and prints there an `mtp
+# summary` record when STUB_GEN_MTP_REC=1; it prints the
 # records a timed run prints, the `fed` line left out under
 # STUB_GEN_NOFED=1; its load record names --ctx (STUB_GEN_LOAD_CTX in its stead), its tokens record token 0
 # STUB_GEN_TOKEN0 (1000 by default) and then the step lines' ids. Under STUB_GEN_FAULT=<file> it takes major faults after its `fed` line (the file
@@ -247,6 +297,10 @@ G=$T/target/release/generate_glm5next
 # shellcheck disable=SC2016 # ${1:-} is the stub's own argument
 printf '#!/usr/bin/env bash\n[ "${1:-}" != --records-schema ] || exec cat %q\n' "$T/tools/bloomery/schema/generate_glm5next.jsonl" > "$G"
 cat >> "$G" << 'EOF'
+if printenv place > /dev/null; then
+  echo "error: a variable named place reached the binary (place=$(printenv place)): the runner passed an arm's place= item as a variable" >&2
+  exit 9
+fi
 if [ -n "${STUB_GEN_NODRAFT:-}" ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
   echo "Error: BLOOMERY_DRAFT is set, and generate_glm5next does not act on it (stub)" >&2
   exit 1
@@ -269,12 +323,21 @@ echo "draft=${BLOOMERY_DRAFT:-none} residency=${BLOOMERY_RESIDENCY:-none} depth=
 rp() { [ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=0 made=$4 in_flight=0 bytes=$5 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
 [ -z "${BLOOMERY_RESIDENCY:-}" ] || [ -n "${STUB_GEN_NORESLEVER:-}" ] || echo "residency lever residency=$BLOOMERY_RESIDENCY why=set"
 echo "plan place=$place card=A6000 ctx_max=2048 card_experts=2627 (39941832704 B) host_experts=9469 (145536581632 B) host_shadow=0 B n_l=67..68 on 39 layers card_budget=none"
-echo "load resident_bytes=0 ctx=${STUB_GEN_LOAD_CTX:-$ctx} (stub)"
+cards=''
+if [ -n "${STUB_GEN_CARDS_ON:-}" ]; then
+  case $place in
+    a) cards=${STUB_GEN_CARDS_A:-[NVIDIA_RTX_A6000]} ;;
+    gate) cards='[NVIDIA_GeForce_RTX_3090]' ;;
+    *) cards='[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' ;;
+  esac
+fi
+echo "load resident_bytes=0 ctx=${STUB_GEN_LOAD_CTX:-$ctx}${cards:+ cards=$cards} (stub)"
 echo "capture graph_nodes=1348"
 rp none 0 0 0 0
 [ -n "${STUB_GEN_NOFED:-}" ] || echo "fed ids=$depth first=[1, 2, 3, 4] last=[5, 6, 7, 8] depth_sequence_from=$depth"
 pms=100.0000 sms=33.0000
 [ "${BLOOMERY_DRAFT:-}" != mtp ] || sms=16.5000
+[ -z "${STUB_GEN_SMS_BP:-}" ] || [ "$place" != bp ] || sms=$STUB_GEN_SMS_BP
 if [ -n "${STUB_GEN_FAULT:-}" ] && { [ -z "${STUB_GEN_FAULT_ONCE:-}" ] || [ ! -e "$STUB_GEN_FAULT.done" ]; }; then
   touch "$STUB_GEN_FAULT.done"
   pms=0.0100 sms=0.0100
@@ -546,7 +609,7 @@ if [ "$RC" != 0 ]; then
 elif want mtp-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_DRAFT=mtp target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place a --time $' &&
   want mtp-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place a --time $' &&
   want mtp-dry "$L" 2 'BLOOMERY_DRAFT' &&
-  want mtp-dry "$L" 1 "^\[dry\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares no mtp summary record: the oursmtp rows carry no draft fields$" &&
+  want mtp-dry "$L" 1 "^\[dry\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares the mtp summary record: each oursmtp row carries its positions, passes and kept, and one that prints none is a FAIL row$" &&
   want mtp-dry "$L" 1 '^\[dry\] round 1 gguf order: 6 oursmtp:6 $'; then
   pass mtp-dry
 fi
@@ -596,10 +659,40 @@ elif want lever-dry "$L" 1 '^\[dry\] 512@BLOOMERY_RESIDENCY=mid-p33-s1:$' &&
   want lever-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_RESIDENCY=mid-p33-s1 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50511> -n 4 --ctx 2048 --place a --time $' &&
   want lever-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 env BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=mid-p33-s1 BLOOMERY_R8=off target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50511> -n 4 --ctx 2048 --place a --time $' &&
   want lever-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50511> -n 4 --ctx 2048 --place a --time $' &&
-  want lever-dry "$L" 1 "^\\[dry\\] residency: generate_glm5next's checked-in schema declares no residency lever record: every row of an arm that runs BLOOMERY_RESIDENCY is a FAIL row naming it$" &&
+  want lever-dry "$L" 1 "^\\[dry\\] residency: generate_glm5next's checked-in schema declares the residency records: each ours row carries its residency lever and passes$" &&
   want lever-dry "$L" 1 '^\[dry\] round 1 gguf order: 512 512@BLOOMERY_RESIDENCY=mid-p33-s1 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1,BLOOMERY_R8=off $'; then
   pass lever-dry
 fi
+# The two-card mode's stubs, apart from this test's one-card nvidia-smi: depth-stub-cards.sh's nvidia-smi
+# (the cards by UUID, their power limits and buses) and journalctl (the Xid lines) under $TCB/bin, first on
+# PATH in the two-card cases only.
+TCB=$tmp/tcbin
+mkdir -p "$TCB/bin" "$TCB/tools/ref"
+(T=$TCB && . "$HERE/depth-stub-cards.sh")
+chmod +x "$TCB/bin/"*
+TC=(BLOOMERY_TIMING_CARDS=a6000+3090 PATH="$TCB/bin:$T/bin:$PATH")
+# place_refused <name> <pattern> <env…> -- <arms…>: the run refused before anything runs, rc 64, the pattern
+# on one line, no row, witness or lease. Red on the runner before a per-arm placement: it refuses `place` as
+# no lever row, BLOOMERY_GEN_PLACE=bp as no word, and runs `gate` in the mode on one card.
+place_refused() {
+  local name=$1 pat=$2
+  shift 2
+  L=$tmp/$name.log
+  stub_run "$L" "$@"
+  if [ "$RC" != 64 ]; then
+    fail "$name" "rc $RC, want 64" "$L"
+  elif want "$name" "$L" 1 "$pat" && want "$name" "$L" 0 '^(ROW|FAIL|DISCARD|WARMUP) |^--- witness|^\[stub\] no lease'; then
+    pass "$name"
+  fi
+}
+place_refused bp-onecard "^depth-glm5next.sh: BLOOMERY_GEN_PLACE=bp is plan \(b′\), which loads on both cards \(the A6000 and its 3090 expert tier\); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000\+3090$" BLOOMERY_GEN_PLACE=bp -- 6
+place_refused bp-onecard-arm "^depth-glm5next.sh: arm '6@place=bp': place=bp is plan \(b′\), which loads on both cards \(the A6000 and its 3090 expert tier\); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000\+3090$" -- 6 6@place=bp
+place_refused place-ref "^depth-glm5next.sh: arm 'lcpp27752:6@place=a': place= sets generate_glm5next's --place, and lcpp27752 is a reference engine's arm, which takes no placement of ours$" -- 6 lcpp27752:6@place=a
+place_refused place-word "^depth-glm5next.sh: arm '6@place=b2': place=b2: generate_glm5next takes --place a, gate or bp in this runner$" -- 6 6@place=b2
+place_refused place-twice "^depth-glm5next.sh: arm '6@place=a,place=a': place is given twice$" -- 6 6@place=a,place=a
+place_refused place-card "^depth-glm5next.sh: arm '6@place=gate': place=gate is the gate plan, which loads on the 3090, and the timing card is " -- 6 6@place=gate
+place_refused twocard-gate "^depth-glm5next.sh: arm '6@place=gate': place=gate is the gate plan, which loads the 3090 alone; the two-card mode times a \(plan \(a\) on the A6000, the 3090 idle\) or bp \(plan \(b′\), both cards\)$" "${TC[@]}" -- 6 6@place=gate
+
 PROSE_SRC=${BLOOMERY_DATA:-/root/bloomery-data}/glm5next/corpus-prose.ids
 if [ -f "$PROSE_SRC" ]; then
   mkdir -p "$T/data/glm5next"
@@ -748,17 +841,18 @@ if [ -f "$PROSE_SRC" ]; then
   # The MTP arm: ours under BLOOMERY_DRAFT=mtp, its rows, preheat, xcheck and the ours / oursmtp table.
   L=$tmp/mtp.log
   : > "$tmp/tmp/stub-gen-draft"
-  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_TIMING_GPU="$GPU_A" "${PH_ENV[@]}" -- 6 oursmtp:6 lcpp27752srv:6
+  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 "${PH_ENV[@]}" -- 6 oursmtp:6 lcpp27752srv:6
   if [ "$RC" != 0 ]; then
     fail mtp "rc $RC, want 0" "$L"
   elif want mtp "$L" 1 '^WARMUP r0 oursmtp d=6 n=4 ctx=2048 \| ' &&
-    want mtp "$L" 1 '^ROW r1 oursmtp d=6 n=4 ctx=2048 \| tok/s\(mean\) 60\.61 @ n=4, depth 6, A6000 \(stub\) \| .*\| prompt ids 50000\.\.50005 \| .*\| pp_tok/s 60\.00 \(n=6, passes=6, kind=steps\) \| majflt [0-9]+ \(timed, from the fed line; ' &&
+    want mtp "$L" 1 '^ROW r1 oursmtp d=6 n=4 ctx=2048 \| tok/s\(mean\) 60\.61 @ n=4, depth 6, A6000 \(stub\) \| .*\| prompt ids 50000\.\.50005 \| .*\| pp_tok/s 60\.00 \(n=6, passes=6, kind=steps\) \| mtp positions/pass 2\.500 = positions 10 / passes 4, kept \[1, 1, 1, 1\] \| majflt [0-9]+ \(timed, from the fed line; ' &&
     want mtp "$L" 1 '^ROW r2 oursmtp d=6 ' &&
     want mtp "$L" 1 '^ROW r1 ours d=6 n=4 ctx=2048 \| tok/s\(mean\) 30\.30 @ ' &&
-    want mtp "$L" 0 '\| mtp positions/pass ' &&
+    want mtp "$L" 2 '^ROW r[12] oursmtp d=6 .*\| mtp positions/pass ' &&
+    want mtp "$L" 0 '^ROW r[12] ours d=6 .*\| mtp positions/pass ' &&
     want mtp "$L" 3 '^preheat oursmtp K=2 bytes=2136 ' &&
     want mtp "$L" 3 '^preheat ours K=2 bytes=2136 ' &&
-    want mtp "$L" 1 "^\[config\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares no mtp summary record: the oursmtp rows carry no draft fields$" &&
+    want mtp "$L" 1 "^\[config\] oursmtp: ours' command under env BLOOMERY_DRAFT=mtp; generate_glm5next's checked-in schema declares the mtp summary record: each oursmtp row carries its positions, passes and kept, and one that prints none is a FAIL row$" &&
     want mtp "$L" 1 '^mean oursmtp 6 +60\.61 tok/s ' &&
     want mtp "$L" 1 '^mean ours 6 +30\.30 tok/s ' &&
     want mtp "$L" 1 '^mean oursmtp 6 +60\.00 tok/s\(pp\) ' &&
@@ -777,24 +871,13 @@ if [ -f "$PROSE_SRC" ]; then
     pass mtp
   fi
 
-  # The mtp summary record, when the schema declares it: a schema copy with generate_qwen3moe's kind.
+  # The mtp summary record the checked-in schema declares: printed, its fields; not printed, a FAIL row.
   SCH=$T/tools/bloomery/schema/generate_glm5next.jsonl
-  cp "$SCH" "$tmp/schema-glm5next.jsonl"
-  python3 - "$tmp/schema-glm5next.jsonl" "$ROOT/tools/bloomery/schema/generate_qwen3moe.jsonl" "$SCH" << 'PY'
-import json, sys
-glm, qwen, out = sys.argv[1:]
-lines = open(glm).read().splitlines()
-head = json.loads(lines[0])
-kind = next(l for l in open(qwen).read().splitlines() if json.loads(l).get("kind") == "mtp_summary")
-head["kinds"] += 1
-open(out, "w").write("\n".join([json.dumps(head, separators=(",", ":"))] + lines[1:] + [kind]) + "\n")
-PY
   L=$tmp/mtp-rec.log
   stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 -- 6 oursmtp:6
   L2=$tmp/mtp-rec-none.log
   RC1=$RC
   stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 6 oursmtp:6
-  cp "$tmp/schema-glm5next.jsonl" "$SCH"
   if [ "$RC1" != 0 ] || [ "$RC" != 1 ]; then
     fail mtp-rec "rc $RC1 (a record) and $RC (none), want 0 and 1" "$L"
   elif want mtp-rec "$L" 1 '^ROW r1 oursmtp d=6 .*\| pp_tok/s 60\.00 \(n=6, passes=6, kind=steps\) \| mtp positions/pass 2\.500 = positions 10 / passes 4, kept \[1, 1, 1, 1\] \| majflt ' &&
@@ -816,21 +899,9 @@ PY
     pass mtp-lever
   fi
 
-  # The lever arms. A schema copy that declares the residency lever and host records (generate_qwen3moe's)
-  # for lever-pair and mtp-lever-arm; the checked-in one, which declares no residency lever, for lever-res-none.
-  cp "$SCH" "$tmp/schema-glm5next.jsonl"
-  python3 - "$tmp/schema-glm5next.jsonl" "$ROOT/tools/bloomery/schema/generate_qwen3moe.jsonl" "$tmp/schema-glm5next-res.jsonl" << 'PY'
-import json, sys
-glm, qwen, out = sys.argv[1:]
-lines = open(glm).read().splitlines()
-head = json.loads(lines[0])
-have = {json.loads(l).get("kind") for l in lines[1:]}
-kinds = [l for l in open(qwen).read().splitlines()
-         if json.loads(l).get("kind") in ("residency_lever", "residency_host") and json.loads(l).get("kind") not in have]
-head["kinds"] += len(kinds)
-open(out, "w").write("\n".join([json.dumps(head, separators=(",", ":"))] + lines[1:] + kinds) + "\n")
-PY
-  cp "$tmp/schema-glm5next-res.jsonl" "$SCH"
+  # The lever arms on the checked-in schema, which declares the residency lever and pass records; for
+  # lever-res-none a copy without the residency lever record, the schema as it was before generate_glm5next
+  # registered it.
   L=$tmp/lever-pair.log
   : > "$tmp/tmp/stub-gen-env"
   stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
@@ -838,13 +909,12 @@ PY
   L2=$tmp/mtp-lever-arm.log
   RC1=$RC
   : > "$tmp/tmp/stub-gen-env"
-  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 512 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1
+  stub_run "$L2" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_MTP_REC=1 -- 512 oursmtp:512@BLOOMERY_RESIDENCY=mid-p33-s1
   cp "$tmp/tmp/stub-gen-env" "$tmp/mtp-lever-arm-env.txt"
   RC2=$RC
   L3=$tmp/lever-res-nolever.log
   stub_run "$L3" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" STUB_GEN_NORESLEVER=1 -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
   RC3=$RC
-  cp "$tmp/schema-glm5next.jsonl" "$SCH"
   LV=ours@BLOOMERY_RESIDENCY=mid-p33-s1
   if [ "$RC1" != 0 ]; then
     fail lever-pair "rc $RC1, want 0" "$L"
@@ -886,7 +956,20 @@ PY
   fi
 
   L=$tmp/lever-res-none.log
+  cp "$SCH" "$tmp/schema-glm5next.jsonl"
+  python3 - "$tmp/schema-glm5next.jsonl" "$SCH" << 'PY'
+import json, sys
+src, out = sys.argv[1:]
+lines = open(src).read().splitlines()
+head = json.loads(lines[0])
+kept = [l for l in lines[1:] if json.loads(l).get("kind") != "residency_lever"]
+if len(kept) != len(lines) - 2:
+    sys.exit(f"schema-glm5next: {len(lines) - 1 - len(kept)} residency_lever kinds, want 1")
+head["kinds"] -= 1
+open(out, "w").write("\n".join([json.dumps(head, separators=(",", ":"))] + kept) + "\n")
+PY
   stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 512 512@BLOOMERY_RESIDENCY=mid-p33-s1
+  cp "$tmp/schema-glm5next.jsonl" "$SCH"
   if [ "$RC" != 1 ]; then
     fail lever-res-none "rc $RC, want 1" "$L"
   elif want lever-res-none "$L" 1 "^FAIL r1 $LV d=512 rc=0 \\| the arm runs BLOOMERY_RESIDENCY=mid-p33-s1, and generate_glm5next's checked-in schema \\(tools/bloomery/schema/generate_glm5next\\.jsonl\\) declares no residency record, so its row cannot carry them: " &&
@@ -906,8 +989,104 @@ PY
     want lever-levers "$tmp/tmp/stub-gen-env" 0 '.'; then
     pass lever-levers
   fi
+
+  # The two-card mode (red on the runner before it, which has none: timing-card.sh refuses the mode and the
+  # lever check refuses place=): a and bp arms in one run, each row the mode's card field and its place, the
+  # a arm's load record the A6000 alone; the reference arm on the A6000 alone, its log one device.
+  L=$tmp/twocard-place.log
+  : > "$tmp/tmp/stub-bench-cvd"
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${TC[@]}" BLOOMERY_GEN_PLACE=bp STUB_GEN_CARDS_ON=1 \
+    STUB_BENCH_DEVLINES=1 -- 6 6@place=a lcpp27752:6
+  if [ "$RC" != 0 ]; then
+    fail twocard-place "rc $RC, want 0" "$L"
+  elif [ "$(sort -u "$tmp/tmp/stub-bench-cvd")" != "$STUB_GPU_A6000" ]; then
+    fail twocard-place "the reference bench saw CUDA_VISIBLE_DEVICES $(sort -u "$tmp/tmp/stub-bench-cvd" | paste -sd'|' -), want the A6000 alone ($STUB_GPU_A6000)" "$L"
+  elif want twocard-place "$L" 1 '^ROW r1 ours d=6 n=4 ctx=2048 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000\+3090 \| place bp ' &&
+    want twocard-place "$L" 1 '^ROW r1 ours@place=a d=6 n=4 ctx=2048 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000\+3090 \| place a ' &&
+    want twocard-place "$L" 1 '^ROW r1 lcpp27752 d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, A6000\+3090 \| build stub \(0\) \| device NVIDIA RTX A6000 \(stub\) \| ' &&
+    want twocard-place "$L" 1 '^ratio d=6 +ours/ours@place=a +mean ' &&
+    want twocard-place "$L" 1 '^\[config\] placements: 6 bp, 6@place=a a \(an arm.s place= over BLOOMERY_GEN_PLACE=bp\)$' &&
+    want twocard-place "$L" 1 '^\[config\] two cards: A6000\+3090, our arms at their placements; the reference arms on the A6000 alone \(CUDA_VISIBLE_DEVICES=GPU-0+-0000-0000-0000-0+\), no -ts arm for this model$' &&
+    want twocard-place "$L" 8 '^    3090 cap: ok ' &&
+    want twocard-place "$L" 8 '^    xid: 0 NVRM Xid line\(s\) since the lease was taken ' &&
+    want twocard-place "$L" 1 '^ratio place d=6 +ours/ours@place=a +mean ' &&
+    want twocard-place "$L" 2 '^ratio place ' &&
+    want twocard-place "$L" 0 '^FAIL '; then
+    pass twocard-place
+  fi
+  # One drafted arm at two placements: oursmtp and oursmtp@place=a paired by round in the placement table,
+  # decode and prefill, bp over a; ours and ours@place=a too.
+  L=$tmp/twocard-place-mtp.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 "${TC[@]}" BLOOMERY_GEN_PLACE=bp STUB_GEN_CARDS_ON=1 \
+    STUB_GEN_MTP_REC=1 -- 6 6@place=a oursmtp:6 oursmtp:6@place=a
+  if [ "$RC" != 0 ]; then
+    fail twocard-place-mtp "rc $RC, want 0" "$L"
+  elif want twocard-place-mtp "$L" 2 '^ROW r[12] oursmtp d=6 n=4 ctx=2048 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000\+3090 \| place bp ' &&
+    want twocard-place-mtp "$L" 2 '^ROW r[12] oursmtp@place=a d=6 n=4 ctx=2048 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000\+3090 \| place a ' &&
+    want twocard-place-mtp "$L" 1 '^ratio place d=6 +oursmtp/oursmtp@place=a +mean 1\.0000 ± 0\.0000 \(n=2\)  of means 1\.0000  per round: r1 1\.0000 r2 1\.0000$' &&
+    want twocard-place-mtp "$L" 1 '^ratio place pp p=6 +oursmtp/oursmtp@place=a +mean ' &&
+    want twocard-place-mtp "$L" 1 '^ratio place d=6 +ours/ours@place=a +mean ' &&
+    want twocard-place-mtp "$L" 4 '^ratio place ' &&
+    want twocard-place-mtp "$L" 1 '^ratio d=6 +ours/ours@place=a +mean ' &&
+    want twocard-place-mtp "$L" 0 '^FAIL '; then
+    pass twocard-place-mtp
+  fi
+  # A lever arm at two placements, both naming place= (BLOOMERY_GEN_PLACE unset), bp's steps faster (15 ms
+  # against 16.5): bp / a = 1.1000 by round, in either order of the arms and of their items.
+  LP=oursmtp@BLOOMERY_RESIDENCY=mid-p33-s1,place=bp LA=oursmtp@place=a,BLOOMERY_RESIDENCY=mid-p33-s1
+  L=$tmp/twocard-place-order.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 "${TC[@]}" STUB_GEN_CARDS_ON=1 STUB_GEN_MTP_REC=1 \
+    STUB_GEN_SMS_BP=15.0000 -- "oursmtp:512@${LA#oursmtp@}" "oursmtp:512@${LP#oursmtp@}"
+  RC1=$RC
+  L2=$tmp/twocard-place-order2.log
+  stub_run "$L2" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 "${TC[@]}" STUB_GEN_CARDS_ON=1 STUB_GEN_MTP_REC=1 \
+    STUB_GEN_SMS_BP=15.0000 -- "oursmtp:512@${LP#oursmtp@}" "oursmtp:512@${LA#oursmtp@}"
+  if [ "$RC1" != 0 ] || [ "$RC" != 0 ]; then
+    fail twocard-place-order "rc $RC1 (a first) and $RC (bp first), want 0 and 0" "$L"
+  elif want twocard-place-order "$L" 2 "^ROW r[12] $LP d=512 .*\| place bp " &&
+    want twocard-place-order "$L" 2 "^ROW r[12] $LA d=512 .*\| place a " &&
+    want twocard-place-order "$L" 1 "^ratio place d=512 +$LP/$LA +mean 1\.1000 ± 0\.0000 \(n=2\)  of means 1\.1000  per round: r1 1\.1000 r2 1\.1000$" &&
+    want twocard-place-order "$L2" 1 "^ratio place d=512 +$LP/$LA +mean 1\.1000 ± 0\.0000 \(n=2\)  of means 1\.1000  per round: r1 1\.1000 r2 1\.1000$" &&
+    want twocard-place-order "$L" 1 "^ratio place pp p=512 +$LP/$LA +mean " &&
+    want twocard-place-order "$L" 2 '^ratio place ' &&
+    want twocard-place-order "$L2" 2 '^ratio place ' &&
+    want twocard-place-order "$L" 0 '^FAIL ' &&
+    want twocard-place-order "$L2" 0 '^FAIL '; then
+    pass twocard-place-order
+  fi
+  # An a arm whose load record names the 3090: a FAIL row naming the cards.
+  L=$tmp/twocard-place-3090.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${TC[@]}" STUB_GEN_CARDS_ON=1 \
+    'STUB_GEN_CARDS_A=[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' -- 6@place=a
+  if [ "$RC" != 1 ]; then
+    fail twocard-place-3090 "rc $RC, want 1" "$L"
+  elif want twocard-place-3090 "$L" 1 "^FAIL r1 ours@place=a d=6 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090\], and --place a loads the A6000 alone: the 3090 must stay idle \| full output: " &&
+    want twocard-place-3090 "$L" 0 '^ROW '; then
+    pass twocard-place-3090
+  fi
+  # generate_glm5next's load record as it is today, with no cards field: every ours row a FAIL row naming it.
+  L=$tmp/twocard-nocards.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${TC[@]}" -- 6
+  if [ "$RC" != 1 ]; then
+    fail twocard-nocards "rc $RC, want 1" "$L"
+  elif want twocard-nocards "$L" 1 "^FAIL r1 ours d=6 rc=0 \| two cards: the engine.s load record names no cards: which cards it loaded cannot be told \| full output: " &&
+    want twocard-nocards "$L" 0 '^ROW '; then
+    pass twocard-nocards
+  fi
+  # The dry run: each ours arm's --place, the reference's CUDA_VISIBLE_DEVICES, the precheck, the placements.
+  L=$tmp/twocard-place-dry.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 "${TC[@]}" BLOOMERY_GEN_PLACE=bp -- 6 6@place=a lcpp27752:6
+  if [ "$RC" != 0 ]; then
+    fail twocard-place-dry "rc $RC, want 0" "$L"
+  elif want twocard-place-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place bp --time $' &&
+    want twocard-place-dry "$L" 1 '^\[dry\]     timeout --kill-after=10 60 target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\.\.50005> -n 4 --ctx 2048 --place a --time $' &&
+    want twocard-place-dry "$L" 1 "^\[dry\]     timeout --kill-after=10 60 env CUDA_VISIBLE_DEVICES=$STUB_GPU_A6000 [^ ]*/pr27752/llama-bench -m " &&
+    want twocard-place-dry "$L" 1 '^\[dry\] two-card precheck: ok$' &&
+    want twocard-place-dry "$L" 1 '^\[dry\] placements: 6 bp, 6@place=a a \(an arm.s place= over BLOOMERY_GEN_PLACE=bp\)$'; then
+    pass twocard-place-dry
+  fi
 else
-  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none and lever-levers: no prose ids at $PROSE_SRC (the profile pins their sha256)"
+  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none, lever-levers, twocard-place, twocard-place-mtp, twocard-place-order, twocard-place-3090, twocard-nocards and twocard-place-dry: no prose ids at $PROSE_SRC (the profile pins their sha256)"
 fi
 
 # same_view: a dry run less the lines this runner changes on purpose (dry-same).
