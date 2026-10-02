@@ -18,6 +18,7 @@ DeepSeek-V4.1-Flash `Q3_K_M` on an RTX A6000 and a 32-core CPU: 29.66 tok/s deco
 - A second card as an expert tier: V4.1, Qwen3.8 and GLM-5.3 put more routed experts on the RTX 3090 beside the A6000 (`--place bp`).
 - V4.1's batched prompts leave the state of one step per token, bit for bit.
 - A llama-server-compatible HTTP API for V4.1, Qwen3.8 and GLM-5.3, from one binary.
+- A decision model: Cloudflare's Clef-Flash answers SystemOne requests (`POST /v1/systemone`), its backbone on the card and its joint schema head on the host.
 - Every number comes from a runner and links its log.
 
 ## Models
@@ -29,9 +30,10 @@ DeepSeek-V4.1-Flash `Q3_K_M` on an RTX A6000 and a 32-core CPU: 29.66 tok/s deco
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (unsloth) | GPU + CPU experts; `generate_qwen3moe`, `bloomery-serve --model qwen38` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole model on one GPU; `generate_qwen3moe` |
 | [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole model on one GPU; `generate_qwen3moe` |
+| [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) (Cloudflare, a decision model) | `Q4_K_M` converted from the release ([how](docs/BUILD.md#clef-flash)) | whole model on one GPU, its head on the CPU; `bloomery_serve_clef` (`POST /v1/systemone`) |
 | [DeepSeek-V2-Lite-Chat](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat) | [`Q3_K_M`](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) (mradermacher) | CPU or GPU; the first model, still gated |
 
-Each file is the public upload as downloaded. For GLM-5.3, Qwen3.8 and Qwen3.6 the files were checked against the uploads on 2026-09-28 (every shard's size, the first shard's sha256); the others have no recorded sha256 check yet.
+Each file is the public upload as downloaded. For GLM-5.3, Qwen3.8 and Qwen3.6 the files were checked against the uploads on 2026-09-28 (every shard's size, the first shard's sha256); the others have no recorded sha256 check yet. Clef-Flash is the one file that is not an upload: bloomery reads its backbone's Q4_K and Q6_K weights only, while the published Clef GGUFs carry Q8_0 sites, so the file is converted from Cloudflare's BF16 release with llama.cpp mainline.
 
 The DSpark draft for V4.1 speculative decoding is not a public upload: it is converted from DeepSeek's V4.1 checkpoint with the converter in llama.cpp's V4.1 pull request, with `dflash.target_layers` set to [37, 38, 39] (the converter writes V4's [38, 39, 40]).
 
@@ -55,9 +57,9 @@ Adaptive residency on one A6000, V4.1-Flash `Q3_K_M`, 96 decode steps after a 51
 
 ## Status
 
-V4.1 runs on the public `Q3_K_M` file as uploaded. `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat` streams text. `bloomery-serve --model ds41|qwen38|glm` serves llama-server's HTTP API, streaming, one request at a time; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are its V4.1 and Qwen3.8 seats alone. The V4.1 server reuses a cached prompt prefix, splits reasoning and returns tool calls. The Qwen3.8 server keeps the longest prefix a request shares with its slot, back to the recurrent layers' last checkpoint, and holds another session's state in its host prompt cache (`--cache-ram`). The GLM-5.3 server keeps a slot's prefix back to its last checkpoint (every 512 positions) and has no host prompt cache. Qwen3.6 runs from its generator bin and has no server yet.<!-- pending: no-qwen36-server --> The Qwen and GLM chat templates render as jinja2 does on their gates' cases, and the tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
+V4.1 runs on the public `Q3_K_M` file as uploaded. `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat` streams text. `bloomery-serve --model ds41|qwen38|glm` serves llama-server's HTTP API, streaming, one request at a time; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are its V4.1 and Qwen3.8 seats alone. The V4.1 server reuses a cached prompt prefix, splits reasoning and returns tool calls. The Qwen3.8 server keeps the longest prefix a request shares with its slot, back to the recurrent layers' last checkpoint, and holds another session's state in its host prompt cache (`--cache-ram`). The GLM-5.3 server keeps a slot's prefix back to its last checkpoint (every 512 positions) and has no host prompt cache. Qwen3.6 runs from its generator bin and has no server yet.<!-- pending: no-qwen36-server --> `bloomery_serve_clef` answers Clef-Flash's SystemOne requests (text states), one at a time, and each response carries `timings` (`prompt_n`, `prompt_ms`, `head_ms`). The Qwen and GLM chat templates render as jinja2 does on their gates' cases, and the tokenizer is bit-identical to `llama-tokenize` on its gate's corpora.
 
-In progress: the warm re-measure against llama.cpp (below); GLM-5.3's prompt front on the GEMM path; serving on N cards (two today) for every model, and Qwen3.8's prompt on the 3090 tier; concurrent batched decode across slots; faster V4.1 host experts; DeepSeek-V4-Flash-0731.
+In progress: the warm re-measure against llama.cpp (below); GLM-5.3's prompt front on the GEMM path; serving on N cards (two today) for every model, and Qwen3.8's prompt on the 3090 tier; concurrent batched decode across slots; Clef from the published GGUFs (Q8_0 and mixed quants); faster V4.1 host experts; DeepSeek-V4-Flash-0731.
 
 ## Measured numbers
 
@@ -116,6 +118,7 @@ Every throughput number in this README ran on the A6000: the one-card rows on th
 - **Against ik_llama.cpp.** Intermediate tensors are dumped from ik_llama.cpp's CPU backend and compared per layer. Integer outputs (router ids, engram rows, indexer top-k) must match exactly outside tie bands; float outputs stay inside bands derived from both engines' rounding.
 - **Bit gates.** Graph replay equals eager execution; the skewed pass equals two single steps; a rollback and a V4.1 batched prompt leave the same state as one step per token.
 - **PPL and KLD** on the public V4.1 file (wikitext-2, 2048 context, 4 chunks, RTX 3090): PPL 2.2401 against ik_llama.cpp's 2.2378; KLD 0.00987 ± 0.00049; same top token 97.46 % ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#sit10)).
+- **Clef against Cloudflare's own Python.** The request encoder's token ids and spans equal the release's `encode_record` on 14 requests (8 in the suite, 6 edge cases); the head's logits stay within 2e-5 of an f64 copy of the release's head on the release's own hidden states (`just gate-decision-clef`, references from [`tools/ref/clef_ref.py`](tools/ref/clef_ref.py)). The backbone's hidden states are gated against llama.cpp mainline's final-norm rows (`just gate-gpu-clef-hidden`). End to end, the `Q4_K_M` file's top option equals the BF16 release's on 30 of 31 questions (the one miss is at p = 0.51 in the release) and on all 15 of the Korean requests.
 - **Each gate is shown to fail** on its defect before the fix lands. Bands are not relaxed to pass.
 
 ## Limits
@@ -124,6 +127,7 @@ Every throughput number in this README ran on the A6000: the one-card rows on th
 - **A pinned nightly** (`nightly-2026-08-28`) with a pinned cuda-oxide revision from our fork, where fixes wait for upstream (`THIRD_PARTY_NOTICES.md`).
 - **V4.1 prompts are bound by the CPU expert tier**: the host experts are most of each layer-batch.
 - **One request at a time** in every server, one slot each. Qwen3.6 has no server yet.<!-- pending: no-qwen36-server -->
+- **Clef** takes text states only (no images or video), reads backbone files of Q4_K and Q6_K weights, and runs its head on the CPU.
 - **One tier card.** The host tier serves at most one expert tier card today; the N-card structure is in progress.
 - **Qwen3.8** keeps the routed experts past its card share on the CPU, where adaptive residency moves them as it runs. Its MTP draft costs the prompt 3.1 % at P = 512 and 6.1 % at P = 4096 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#q38mtp-wide)).
 
@@ -144,6 +148,7 @@ See [`docs/BUILD.md`](docs/BUILD.md): the toolchain, one command block per model
 - Recorded sessions, not benchmark rows:
   - V4.1 on two cards answering a coding review (507 prompt tokens, 1,500 generated): [toktape](https://tape.midagedev.com/r/6w4t9r5nqwtt5c9sagn3).
   - GLM-5.3's server on the A6000 alone, at its defaults (adaptive residency and the MTP draft), answering a coding review (497 prompt tokens, 2,000 generated): [toktape](https://tape.midagedev.com/r/xj9c5tmpu63fbhbwtg6f). The same prompt through llama.cpp's GLM pull request with its MTP draft on the same card: [toktape](https://tape.midagedev.com/r/39cmzgqpsphp5dmkjxyr).
+  - Clef-Flash on the A6000 (`Q4_K_M`) answering seven Korean SystemOne requests, 63 requests in all: 93.6 ms end to end at the median, 0 top options flipped against the release: [toktape](https://tape.midagedev.com/r/zd3asiqegffcmvky9hti).
 - Plan and cost models: [`docs/plan.md`](docs/plan.md); GPU design: [`docs/gpu-design.md`](docs/gpu-design.md); placement: [`docs/v41-placement.md`](docs/v41-placement.md) (Korean).
 - Working contract: [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
