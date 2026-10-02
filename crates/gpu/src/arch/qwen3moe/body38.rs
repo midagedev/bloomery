@@ -96,7 +96,7 @@ use super::scratch38::{
 };
 use super::swap38::{DEADLINE, LIVE_DELAY, Qwen38Stacks};
 use super::tier38::{TierSide38, open_tier};
-use super::ubatch::{UBATCH as UBATCH_MOST, UBATCH_ENV};
+use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
     Gemm38, STREAM_FLOOR, Stream38, Wide38, WideForce, WideParts, WideTaps, dense_rows,
     route_taps_host,
@@ -919,19 +919,6 @@ impl Body38 {
         let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
         let map = SlotMap::of_plan_tiers(plan, 0, &tier_cards, run.clone(), geo::EXPERTS)?;
         let card_leg = MapCheck::of(&map, !tiers.is_empty())?;
-        // The batch port's tier legs quantize a block of `host_cols` tokens
-        // per slot, which a per-slot Q8Act caps.
-        if !tiers.is_empty() && host_cols > crate::tensor::Q8ACT_MAX_SLOTS {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a load with an expert tier takes a ubatch of at most {} tokens (its batch \
-                     port's tier legs quantize a block per slot); this load's is {host_cols}: \
-                     open it at a smaller context or under {UBATCH_ENV}",
-                    crate::tensor::Q8ACT_MAX_SLOTS
-                ),
-            ));
-        }
         let slots = Arc::new(DeviceTensor::upload(
             stream,
             &map.stage_view(),
@@ -958,7 +945,7 @@ impl Body38 {
         let tier = (!tiers.is_empty())
             .then(|| TierSide38::new(gpu, &map))
             .transpose()?;
-        let wide = Wide38::new(stream, ub, &card)?;
+        let wide = Wide38::new(stream, ub, &card, tier.is_some())?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
         if wide_bytes > counted {
             return Err(GpuError::shape(
@@ -987,11 +974,12 @@ impl Body38 {
             model::arch::qwen35moe::host::layers(src, hp, run.clone())
         })?;
         experts.prepare_union(host_cols)?;
-        // The plan reserves the tier's block scratch at the load's ubatch:
-        // the card route's bytes there.
-        let block = usize::try_from(model::arch::qwen35moe::place::card_route_scratch_bytes(
-            ub as u64,
+        // The plan reserves the tier's block scratch for blocks of the batch
+        // port's columns: the block route's bytes there.
+        let block = usize::try_from(model::arch::qwen35moe::place::tier_route_scratch_bytes(
+            host_cols as u64,
         ))
+        .map(|b| (host_cols, b))
         .map_err(|_| GpuError::shape(WHAT, "the tier's block scratch passes usize"))?;
         let tier_cards = tiers
             .iter()
@@ -2113,6 +2101,7 @@ impl Body38 {
             k,
             slots,
             card,
+            tier,
             eps,
             ctx,
             plant,
@@ -2136,6 +2125,7 @@ impl Body38 {
                 io: &io,
                 slots,
                 card,
+                tier: tier.as_ref(),
                 m,
                 pos0: pos as usize,
                 dense,
@@ -2151,6 +2141,18 @@ impl Body38 {
         match head {
             Some(h) => prog.head(h),
             None => Ok(()),
+        }
+    }
+
+    /// The path a prompt of `n` ids runs on this load: `path` resolved
+    /// ([`Prompt38::resolve`]), but `Auto` runs ubatches at every length on a
+    /// load with an expert tier, whose pass walk has no tier leg (`card38`'s
+    /// `MapCheck` refuses it by name).
+    #[must_use]
+    pub fn resolve_prompt(&self, path: Prompt38, n: usize) -> Prompt38 {
+        match path {
+            Prompt38::Auto if self.tier.is_some() => Prompt38::Gemm,
+            p => p.resolve(n),
         }
     }
 
@@ -2386,7 +2388,7 @@ impl GpuModel<Body38> {
                 ),
             ));
         }
-        let resolved = path.resolve(tokens.len());
+        let resolved = body.resolve_prompt(path, tokens.len());
         if resolved == Prompt38::Step && body.hybrid().swap().is_some() {
             return Err(GpuError::shape(
                 WHAT_P,

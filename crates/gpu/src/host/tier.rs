@@ -822,6 +822,27 @@ pub trait TierExperts {
     /// Device bytes of the scratch [`TierExperts::enqueue_block`] made at
     /// load: part of the tier card's prompt-batch reserve.
     fn block_bytes(&self) -> usize;
+
+    /// Where a block's tier rows reach the stage card ([`BlockRows`]): by
+    /// default the batch service's copy of the block's down outputs.
+    fn block_rows(&self) -> BlockRows {
+        BlockRows::Staged
+    }
+}
+
+/// Where the rows of a prompt batch's block that the tier computed reach the
+/// set's host-mapped rows the stage card's join reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockRows {
+    /// The batch service copies the block's down outputs ([`TierBlock::down`])
+    /// to the set's rows whole, every slot's row, after the block.
+    Staged,
+    /// The block packs its tier slots' rows at the front of the down outputs
+    /// in slot order — the tier slot with `k` tier slots before it at row
+    /// `k` — and the batch service copies those rows alone, a row for each
+    /// slot the block's places do not leave to the host: a block whose tier
+    /// slots are a small share of its slots moves only theirs over the bus.
+    Packed,
 }
 
 /// A block of a prompt batch as the tier's batch service hands it to the
@@ -829,8 +850,9 @@ pub trait TierExperts {
 /// from column 0 in f32 (`x`, `hidden` a column) and in q8_1 form (`act`,
 /// the quantizer's over `x`), each of its `n_used · cols` slots' tier place
 /// (a tier slot, or [`super::slots::HOST`] for a slot the tier does not
-/// compute), and the down outputs, slot-major (`hidden` a slot), of which
-/// the tier's slots' rows are written and no other.
+/// compute), and the down outputs (`hidden` a slot) — slot-major, of which
+/// the tier's slots' rows are written and no other, or packed
+/// ([`BlockRows::Packed`]).
 pub struct TierBlock<'a> {
     pub x: &'a DeviceBuffer<f32>,
     pub act: &'a Q8Act,
@@ -1020,6 +1042,13 @@ impl TierCard {
     #[must_use]
     pub fn block_bytes(&self) -> usize {
         self.experts.block_bytes()
+    }
+
+    /// Where the architecture's block rows reach the set's rows
+    /// ([`TierExperts::block_rows`]).
+    #[must_use]
+    pub fn block_rows(&self) -> BlockRows {
+        self.experts.block_rows()
     }
 
     /// Which experts the tier holds.

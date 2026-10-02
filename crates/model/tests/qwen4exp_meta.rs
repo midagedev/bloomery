@@ -1027,24 +1027,28 @@ fn hw_qwen4exp_card_plan() {
 /// the first `total_at_high`, one fewer on the rest), the tier's experts,
 /// expert bytes and rounding bytes.
 type BpRow = (u64, usize, u64, u64, usize, u64, u64, u64);
-// PIN(2026-10-01): plan (b′) (`place::machine_bp`, `--place bp`), plain, at 4,096 positions and
+// PIN(2026-10-02): plan (b′) (`place::machine_bp`, `--place bp`), plain, at 4,096 positions and
 // U 4,096. The split [derived: per routed slot of a decode pass the A6000's card leg reads an expert
 // of 3,072,000 B, ~5.3 µs at 575 GB/s, the 3090's ~4.4 µs at 700 GB/s, the host's union 23.6 µs
 // (rig-log 09-30#q38res-hit); residency holds the tier's ids away for the load's life, so the
 // tier's share of the routed mass is its ids' — ~k/512 under the id prefix — whatever the A6000
 // keeps, and an expert the A6000 gave up past its budget would go to the host (the tier is at its
 // own), at ~4.5 A6000 slots' time; so both cards plan to their budgets and the A6000 keeps plan (a)'s
-// row byte for byte (CARD_PLANS' first: 262 on the first 40 layers, 261 on the rest)]. The tier
-// [derived: budget 25,350,373,376 usable − 536,870,912 context − 67,108,864 scratch − 887,570,432
-// tier prompt batch (`place::tier_batch` at U 4,096: staging 496,730,112, the card route's
-// 390,840,320) − 1,073,741,824 margin = 22,785,081,344 B; the spread over all 48 layers beside the
-// A6000's counts, the layer with the fewest on both cards first, each stack in whole 2 MiB granules
-// (a gate or up 921,600 B an expert, 1,126,400 on layer 2; a down 1,228,800, 1,740,800 on layers 2,
-// 4, 30, 46 and 47), by a replica that first reproduced CARD_PLANS' four A6000 rows at 4k exactly:
-// both cards 413 on the first 21 layers and 412 on the rest, the tier 151 on layers 0-20 and 40-47
-// and 150 on 21-39, 7,229 experts, 22,655,385,600 B of experts and 123,879,424 B of rounding; the
-// host 99 or 100 a layer, 4,779 experts].
-const BP_PLAIN: BpRow = (262, 40, 261, 413, 21, 7_229, 22_655_385_600, 123_879_424);
+// row at its budget less the tier join's unit-wide card rows, places and ranks
+// (`place::card_tier_join_bytes`, 210,124,800 B at U 4,096), byte for byte: 12,534 experts, 262 on
+// the first 6 layers and 261 on the rest, 34 fewer than the row before the join's 12,568 (the
+// drafted row loses 72)]. The tier [derived: budget 25,350,373,376 usable − 536,870,912 context −
+// 67,108,864 scratch − 845,710,360 tier prompt batch (`place::tier_batch` at U 4,096: staging
+// 496,730,112, the block route's 348,980,248, `place::tier_route_scratch_bytes`, which holds the
+// run's down rows the pack reads, 209,715,200, and the block's ranks, 163,840) − 1,073,741,824
+// margin = 22,826,941,416 B; the spread over all 48 layers beside the A6000's counts, the layer with
+// the fewest on both cards first, each stack in whole 2 MiB granules: both cards 412 on the first
+// 42 layers and 411 on the rest, the tier 150 on layers 0-5 and 42-47 and 151 on 6-41, 7,236
+// experts, 22,674,944,000 B of experts and 148,361,216 B of rounding (22,823,305,216 B, 3,636,200
+// under the budget); the host 100 or 101 a layer, 4,806 experts: the run's down rows move 68 tier
+// experts to the host]. The tier's spread and the host's count are what the box's planner printed
+// in q38tier2b's red run, the A6000's split their remainder.
+const BP_PLAIN: BpRow = (262, 6, 261, 412, 42, 7_236, 22_674_944_000, 148_361_216);
 
 /// Plan (b′) of the Qwen3.8 file without the draft (`place::machine_bp`,
 /// `plan_with` under `Experts::Card`): the A6000's counts and card bytes
@@ -1077,7 +1081,10 @@ fn hw_qwen4exp_bp_plan() {
     let levers = PlanLevers::default();
     let batch = tier_batch(&inputs.hp, u);
     let machine = machine_bp(n, u, None, batch);
-    let a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
+    // Plan (a)'s rule at the A6000's budget less the tier join's scratch
+    // (`place::card_tier_join_bytes`), which plan (b′) adds to its scratch.
+    let mut a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
+    a_machine.cards[0].scratch_bytes += place::card_tier_join_bytes(u);
     let a = inputs
         .plan_with(&a_machine, ctx, &levers, Experts::Card)
         .unwrap_or_else(|e| panic!("plan (a): {e}"));
@@ -1106,9 +1113,10 @@ fn hw_qwen4exp_bp_plan() {
             check(
                 &mut o,
                 format!(
-                    "the A6000 {high} on the first {at_high}, {low} on the rest ({}), plan (a)'s \
-                     counts and card bytes ({stage_same}); headroom {}",
+                    "the A6000 {high} on the first {at_high}, {low} on the rest ({}: {:?}), plan \
+                     (a)'s counts and card bytes ({stage_same}); headroom {}",
                     plan.n_l == stage,
+                    plan.n_l,
                     s.headroom_bytes
                 ),
                 plan.n_l == stage && stage_same,

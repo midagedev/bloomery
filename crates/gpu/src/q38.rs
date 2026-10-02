@@ -36,6 +36,21 @@
 //!   rows through the mapping, then `q38_card_shared_add`'s combine of it —
 //!   with the union of both cards' experts on one card the two launches
 //!   read the same values in the same order, so the two agree bit for bit.
+//! - [`q38_kernels::q38_card_tier_acc`] — that join's sum alone, into the
+//!   card sum `q38_card_shared_add` combines: a ubatch's tier layer, whose
+//!   host sums are uploaded only after the tier's rows are joined; a tier
+//!   slot's row is read at its rank (`q38_tier_rank`).
+//! - [`q38_kernels::q38_tier_ids`] — one thread per slot, on the tier card:
+//!   a tier place as the remapped route's expert id, [`HOST`] as the one id
+//!   past the tier's experts, which the route's map sends to the host.
+//! - [`q38_kernels::q38_tier_rank`] — one block, on either card: each tier
+//!   slot's rank among a block's tier slots in slot order, the row its down
+//!   output takes packed; the same places give the same ranks on both cards.
+//! - [`q38_kernels::q38_tier_rows_pack`] — one thread per value, on the tier
+//!   card: a run's tier slots' down rows into the block's down outputs at
+//!   their ranks, packed, which the batch service copies to the set's rows
+//!   alone (`crate::host::tier::BlockRows::Packed`), so only the tier's rows
+//!   cross the bus, by the copy engine.
 //!
 //! The card sum runs in the layer's host-leg shadow and the combine after the
 //! wait in `q38_shared_add`'s place, so the card leg adds no launch after the
@@ -64,7 +79,9 @@ use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
-use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
+use cuda_device::{
+    DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
+};
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
@@ -73,8 +90,12 @@ use std::sync::Arc;
 pub const HEAD: usize = 256;
 /// Values of an indexer key.
 pub const DIM: usize = crate::qsa::DIM;
-/// Threads per block of every kernel here.
+/// Threads per block of every kernel here but [`q38_kernels::q38_tier_rank`].
 const THREADS: u32 = 256;
+/// Warps of [`q38_kernels::q38_tier_rank`]'s one block, whose launch contract
+/// spells its 1,024 threads as a literal.
+const RANK_WARPS: usize = 32;
+const _: () = assert!(RANK_WARPS * 32 == 1024);
 const _: () = assert!(HEAD == 256 && DIM == 128);
 /// Routed slots a token: the card sum's slot count, which its launch
 /// contract spells as a literal.
@@ -565,6 +586,266 @@ mod q38_kernels {
             *y.get_unchecked_mut(i) = out;
         }
     }
+
+    /// [`q38_card_tier_shared_add`]'s sum alone over `m` tokens of `n`
+    /// values, one thread a value, into `acc`: from zero over the slots on
+    /// the card — place `sel[10t + j]` below `n_card`, its row `down`'s — or,
+    /// on a slot the card does not hold ([`HOST`] there), on the tier — tier
+    /// place `tsel[10t + j]` below `n_tier`, its row `trows`' at the slot's
+    /// rank `trank[10t + j]` ([`q38_tier_rank`]: the tier's rows come packed)
+    /// — in ascending `j < 10`, each by a fused multiply-add of the router's
+    /// weight, this order the gate. A ubatch's join, after which
+    /// [`q38_card_shared_add`] combines it as it combines [`q38_card_acc`]'s
+    /// sum. A slot [`HOST`] in both places is the host's; a place in
+    /// `[n_card, HOST)`, a tier place in `[n_tier, HOST)` on a host slot of
+    /// the card, or a tier slot's rank at or past `10m`, raises
+    /// [`FaultSite::ExpertId`] and its token's sum is NaN.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 10 * n * m,
+            trows.len() >= 10 * n * m,
+            w.len() >= 11 * m,
+            sel.len() >= 10 * m,
+            tsel.len() >= 10 * m,
+            trank.len() >= 10 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn q38_card_tier_acc(
+        down: &[f32],
+        trows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        trank: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        n_tier: u32,
+        fault: FaultSink,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let (t, d) = (i / n, i % n);
+        let mut a = 0.0f32;
+        for j in 0..SLOTS {
+            cuda_device::thread::__unroll_config::<0>();
+            let s = t * SLOTS + j;
+            // SAFETY: t < m and j < 10 put s below 10m <= sel.len() and
+            // tsel.len() by the launch contract.
+            let (place, tplace) = unsafe { (*sel.get_unchecked(s), *tsel.get_unchecked(s)) };
+            // SAFETY: t < m and j < 10 put 11t + j below 11m <= w.len() by
+            // the launch contract.
+            let ws = unsafe { *w.get_unchecked(t * W_PITCH + j) };
+            if place < n_card {
+                // SAFETY: s·n + d < 10nm <= down.len() by the launch contract.
+                let ds = unsafe { *down.get_unchecked(s * n + d) };
+                a = ds.mul_add(ws, a);
+            } else if place != HOST {
+                if d == 0 {
+                    fault.raise(FaultSite::ExpertId);
+                }
+                a = f32::NAN;
+            } else if tplace < n_tier {
+                // SAFETY: s < 10m <= trank.len() by the launch contract.
+                let r = unsafe { *trank.get_unchecked(s) } as usize;
+                if r < SLOTS * m {
+                    // SAFETY: r < 10m puts r·n + d below 10nm <= trows.len()
+                    // by the launch contract.
+                    let ds = unsafe { *trows.get_unchecked(r * n + d) };
+                    a = ds.mul_add(ws, a);
+                } else {
+                    if d == 0 {
+                        fault.raise(FaultSite::ExpertId);
+                    }
+                    a = f32::NAN;
+                }
+            } else if tplace != HOST {
+                if d == 0 {
+                    fault.raise(FaultSite::ExpertId);
+                }
+                a = f32::NAN;
+            }
+        }
+        // SAFETY: i < n·m <= acc.len() by the launch contract; thread i is
+        // acc[i]'s only writer.
+        unsafe {
+            *acc.get_unchecked_mut(i) = a;
+        }
+    }
+
+    /// The expert ids of a tier's remapped route from its places, one thread
+    /// a slot of `slots`: a tier place `sel[i]` as it is, [`HOST`] as
+    /// `n_tier` — the one id past the tier's experts, which the route's map
+    /// (`0 .. n_tier`, then [`HOST`]) sends to the host. A place in
+    /// `[n_tier, HOST)` stays itself, past the map, so the route raises
+    /// [`FaultSite::ExpertId`] for it and its slot's outputs are NaN.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (sel.len() >= slots, ids.len() >= slots)
+    )]
+    pub fn q38_tier_ids(sel: &[u32], slots: u32, n_tier: u32, mut ids: DisjointSlice<u32>) {
+        let i = thread::index_1d().get();
+        if i >= slots as usize {
+            return;
+        }
+        // SAFETY: i < slots <= sel.len() by the launch contract.
+        let p = unsafe { *sel.get_unchecked(i) };
+        // SAFETY: i < slots <= ids.len() by the launch contract; thread i is
+        // ids[i]'s only writer.
+        unsafe {
+            *ids.get_unchecked_mut(i) = if p == HOST { n_tier } else { p };
+        }
+    }
+
+    /// Each tier slot's rank among the first `slots` places — the count of
+    /// the slots before it whose place `sel[i]` is below `n_tier` — into
+    /// `rank`, and [`HOST`] for every other slot: one block of
+    /// [`RANK_WARPS`] warps, each warp a run of the slots in order, counted,
+    /// then the warps' counts summed in warp order, then ranked; integer
+    /// sums, so the same places give the same ranks on any card. A block
+    /// past the first does nothing.
+    #[kernel]
+    #[launch_bounds(1024)]
+    #[launch_contract(
+        domain = 1,
+        block = (1024, 1, 1),
+        requires = (sel.len() >= slots, rank.len() >= slots)
+    )]
+    pub fn q38_tier_rank(sel: &[u32], slots: u32, n_tier: u32, mut rank: DisjointSlice<u32>) {
+        static mut WTOT: SharedArray<u32, RANK_WARPS> = SharedArray::UNINIT;
+        if thread::blockIdx_x() != 0 {
+            return; // block-uniform
+        }
+        let slots = slots as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id();
+        let wid = tid / 32;
+        // SAFETY: a block-shared static; the raw form reaches it without a
+        // reference, and every access below is bounded and barrier-ordered.
+        let wtot = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WTOT) };
+        let chunk = slots.div_ceil(32 * RANK_WARPS) * 32;
+        let c0 = (wid * chunk).min(slots);
+        let c1 = (c0 + chunk).min(slots);
+        let l = lane as usize;
+        let mut tot = 0u32;
+        let mut base = c0;
+        while base < c1 {
+            let i = base + l;
+            // SAFETY: i < c1 <= slots <= sel.len() by the launch contract.
+            let mine = i < c1 && unsafe { *sel.get_unchecked(i) } < n_tier;
+            tot += warp::ballot(mine).count_ones();
+            base += 32;
+        }
+        if lane == 0 {
+            // SAFETY: wid < RANK_WARPS bounds the slot; lane 0 of warp wid is
+            // its only writer, before the barrier.
+            unsafe { *wtot.add(wid) = tot };
+        }
+        thread::sync_threads();
+        let mut off = 0u32;
+        for w in 0..RANK_WARPS {
+            thread::__unroll_config::<0>();
+            if w < wid {
+                // SAFETY: w < RANK_WARPS; published by the barrier above.
+                off += unsafe { *wtot.add(w) };
+            }
+        }
+        let lt = warp::lanemask_lt();
+        let mut base = c0;
+        while base < c1 {
+            let i = base + l;
+            // SAFETY: i < c1 <= slots <= sel.len() by the launch contract.
+            let mine = i < c1 && unsafe { *sel.get_unchecked(i) } < n_tier;
+            let mask = warp::ballot(mine);
+            if i < c1 {
+                let r = if mine {
+                    off + (mask & lt).count_ones()
+                } else {
+                    HOST
+                };
+                // SAFETY: i < c1 <= slots <= rank.len() by the launch
+                // contract; the lane at slot i is rank[i]'s only writer.
+                unsafe { *rank.get_unchecked_mut(i) = r };
+            }
+            off += mask.count_ones();
+            base += 32;
+        }
+    }
+
+    /// A run of a tier block's rows packed into the block's down outputs,
+    /// one thread a value of the run's `slots` slots of `n`: slot `s`'s row
+    /// of `down` (the run's, slot-major) into row `rank[s]` of `rows` when its
+    /// tier place `sel[s]` is below `n_tier`; no other value is written. A
+    /// tier slot's rank at or past `rows_cap` raises [`FaultSite::ExpertId`]
+    /// and writes nothing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= n * slots,
+            sel.len() >= slots,
+            rank.len() >= slots,
+            rows.len() >= n * rows_cap
+        )
+    )]
+    pub fn q38_tier_rows_pack(
+        down: &[f32],
+        sel: &[u32],
+        rank: &[u32],
+        n: u32,
+        slots: u32,
+        n_tier: u32,
+        rows_cap: u32,
+        fault: FaultSink,
+        mut rows: DisjointSlice<f32>,
+    ) {
+        let (n, slots) = (n as usize, slots as usize);
+        let i = thread::index_1d().get();
+        if i >= n * slots {
+            return;
+        }
+        let (s, d) = (i / n, i % n);
+        // SAFETY: s < slots <= sel.len() and rank.len() by the launch
+        // contract.
+        let (p, r) = unsafe { (*sel.get_unchecked(s), *rank.get_unchecked(s) as usize) };
+        if p >= n_tier {
+            return;
+        }
+        if r >= rows_cap as usize {
+            if d == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        // SAFETY: i < n·slots <= down.len(), and r < rows_cap puts r·n + d
+        // below n·rows_cap <= rows.len(), by the launch contract; a rank names
+        // one tier slot, so thread i is rows[r·n + d]'s only writer.
+        unsafe {
+            *rows.get_unchecked_mut(r * n + d) = *down.get_unchecked(i);
+        }
+    }
 }
 
 /// [`Q38Kernels::enqueue_embed_rows`]'s arguments: the Q8_0 table's planes,
@@ -652,6 +933,41 @@ pub struct CardTierSharedAddArgs<'a> {
     pub n_tier: usize,
     pub fault: FaultSink,
     pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`Q38Kernels::enqueue_card_tier_acc`]'s arguments: [`CardTierSharedAddArgs`]'s
+/// slots — the card's down outputs and the tier's rows, slot-major, the
+/// router's weights, the card and the tier places — over `m` tokens of `n`
+/// values, the sink and the sum.
+pub struct CardTierAccArgs<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub trows: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub tsel: &'a DeviceBuffer<u32>,
+    pub trank: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub m: usize,
+    pub n_card: usize,
+    pub n_tier: usize,
+    pub fault: FaultSink,
+    pub acc: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`Q38Kernels::enqueue_tier_rows_pack`]'s arguments: a run's down outputs
+/// (slot-major), tier places and ranks over `slots` slots of `n` values, the
+/// tier's expert count, and the block's down outputs the run packs into, of
+/// `rows_cap` rows.
+pub struct TierRowsPackArgs<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub rank: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub slots: usize,
+    pub n_tier: usize,
+    pub rows_cap: usize,
+    pub fault: FaultSink,
+    pub rows: &'a mut DeviceBuffer<f32>,
 }
 
 /// [`Q38Kernels::enqueue_out_gate`]'s arguments: the attention output and
@@ -1058,6 +1374,185 @@ impl Q38Kernels {
             launch_u32(what, "n_tier", a.n_tier)?,
             a.fault,
             a.y,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue a ubatch tier layer's join sum ([`CardTierAccArgs`],
+    /// `q38_card_tier_acc`): the card's and the tier's slots in slot order
+    /// into `acc`, which [`Q38Kernels::enqueue_card_shared_add`] then
+    /// combines. `down` and `trows` `SLOTS·n·m` values, `w` `W_PITCH·m`,
+    /// `sel`, `tsel` and `trank` `SLOTS·m`, `acc` `n·m`. A layer with no card or no
+    /// tier expert is refused by name. One launch. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_card_tier_acc(
+        &self,
+        stream: &CudaStream,
+        a: CardTierAccArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "q38::enqueue_card_tier_acc";
+        let nm = a.n * a.m;
+        if nm == 0 || a.n_card == 0 || a.n_tier == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} values of {} tokens over a card of {} experts and a tier of {}: at least \
+                     one of each",
+                    a.n, a.m, a.n_card, a.n_tier
+                ),
+            ));
+        }
+        short(
+            what,
+            &[
+                ("down", a.down.len(), SLOTS * nm),
+                ("trows", a.trows.len(), SLOTS * nm),
+                ("w", a.w.len(), W_PITCH * a.m),
+                ("sel", a.sel.len(), SLOTS * a.m),
+                ("tsel", a.tsel.len(), SLOTS * a.m),
+                ("trank", a.trank.len(), SLOTS * a.m),
+                ("acc", a.acc.len(), nm),
+            ],
+        )?;
+        let cfg = grid(what, nm)?;
+        let prep = self.module.prepare_q38_card_tier_acc(cfg)?;
+        self.module.q38_card_tier_acc(
+            stream,
+            &prep,
+            a.down,
+            a.trows,
+            a.w,
+            a.sel,
+            a.tsel,
+            a.trank,
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "m", a.m)?,
+            launch_u32(what, "n_card", a.n_card)?,
+            launch_u32(what, "n_tier", a.n_tier)?,
+            a.fault,
+            a.acc,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue a tier route's expert ids from its first `slots` places
+    /// (`q38_tier_ids`): a tier place as it is, [`HOST`] as `n_tier`. A
+    /// tier of no expert, no slot, and buffers short of `slots` are refused
+    /// by name. One launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_tier_ids(
+        &self,
+        stream: &CudaStream,
+        sel: &DeviceBuffer<u32>,
+        (slots, n_tier): (usize, usize),
+        ids: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "q38::enqueue_tier_ids";
+        if slots == 0 || n_tier == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("{slots} slots over a tier of {n_tier} experts: at least one of each"),
+            ));
+        }
+        short(
+            what,
+            &[("sel", sel.len(), slots), ("ids", ids.len(), slots)],
+        )?;
+        let cfg = grid(what, slots)?;
+        let prep = self.module.prepare_q38_tier_ids(cfg)?;
+        self.module.q38_tier_ids(
+            stream,
+            &prep,
+            sel,
+            launch_u32(what, "slots", slots)?,
+            launch_u32(what, "n_tier", n_tier)?,
+            ids,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the ranks of the first `slots` places' tier slots
+    /// (`q38_tier_rank`): a tier slot's rank among them, [`HOST`] for every
+    /// other slot. A tier of no expert, no slot, and buffers short of `slots`
+    /// are refused by name. One launch of one block. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_tier_rank(
+        &self,
+        stream: &CudaStream,
+        sel: &DeviceBuffer<u32>,
+        (slots, n_tier): (usize, usize),
+        rank: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "q38::enqueue_tier_rank";
+        if slots == 0 || n_tier == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!("{slots} slots over a tier of {n_tier} experts: at least one of each"),
+            ));
+        }
+        short(
+            what,
+            &[("sel", sel.len(), slots), ("rank", rank.len(), slots)],
+        )?;
+        let threads = launch_u32(what, "threads", 32 * RANK_WARPS)?;
+        let prep = self
+            .module
+            .prepare_q38_tier_rank(LaunchConfig1D::new(1, threads, 0))?;
+        self.module.q38_tier_rank(
+            stream,
+            &prep,
+            sel,
+            launch_u32(what, "slots", slots)?,
+            launch_u32(what, "n_tier", n_tier)?,
+            rank,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue a run's tier slots' rows packed into the block's down outputs
+    /// at their ranks ([`TierRowsPackArgs`], `q38_tier_rows_pack`): `down`
+    /// `n·slots` values, `sel` and `rank` `slots`, `rows` `n·rows_cap`. A
+    /// tier of no expert, no value, and buffers short of them are refused by
+    /// name. One launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_tier_rows_pack(
+        &self,
+        stream: &CudaStream,
+        a: TierRowsPackArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "q38::enqueue_tier_rows_pack";
+        let ns = a.n * a.slots;
+        if ns == 0 || a.n_tier == 0 || a.rows_cap == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{} slots of {} values over a tier of {} experts into {} rows: at least one \
+                     of each",
+                    a.slots, a.n, a.n_tier, a.rows_cap
+                ),
+            ));
+        }
+        short(
+            what,
+            &[
+                ("down", a.down.len(), ns),
+                ("sel", a.sel.len(), a.slots),
+                ("rank", a.rank.len(), a.slots),
+                ("rows", a.rows.len(), a.n * a.rows_cap),
+            ],
+        )?;
+        let cfg = grid(what, ns)?;
+        let prep = self.module.prepare_q38_tier_rows_pack(cfg)?;
+        self.module.q38_tier_rows_pack(
+            stream,
+            &prep,
+            a.down,
+            a.sel,
+            a.rank,
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "slots", a.slots)?,
+            launch_u32(what, "n_tier", a.n_tier)?,
+            launch_u32(what, "rows_cap", a.rows_cap)?,
+            a.fault,
+            a.rows,
         )?;
         Ok(())
     }

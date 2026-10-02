@@ -23,7 +23,16 @@
 //! token and every logits row read.
 //!
 //! - `--union` (residency off): the tier load's history bit for bit the
-//!   reference's, every token and logits row. Structure [derived]: the
+//!   reference's, every token and logits row; then, from a clear, the first
+//!   [`PROMPT_U`] ids as one prompt call (one ubatch walk, the tier serving
+//!   its slots through the batch port) and [`PROMPT_STEPS`] greedy steps: the
+//!   prompt's last logits row, every step's row and every greedy id bit for
+//!   bit the reference's; the tier's batch services served every tier layer
+//!   (precondition); then a [`PROMPT_SHORT`]-id prompt call the same way, the
+//!   tier serving at least one layer — a tier load runs every prompt by
+//!   ubatches — and an explicit pass prompt call refused by name before
+//!   anything moves. Each precondition line prints the host's wall waiting
+//!   for the tier, not a clause. Structure [derived]: the
 //!   tier's stage step graph and each verify graph hold the reference's
 //!   nodes less one a tier layer (its card leg drops the card sum, which the
 //!   join takes after the wait); the tier's graph of the step and of each
@@ -38,10 +47,19 @@
 //!   prompt's last logits row within
 //!   [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN) of the off run's,
 //!   the greedy ids equal or parted first at the on run's near tie;
-//!   after it the tier's set is the live slot map's tier rows (`tier`), and
-//!   no tier expert's file bytes are in the load's host set (`host`, by
-//!   [`HostSet::holds`]). The union bit rule cannot hold here: the union's
-//!   machine would move tier ids, and its pinned count is the union's.
+//!   then the [`PROMPT_U`]-id prompt call with host streaming on against
+//!   the residency-off tier run's by the same stream rule (the call's picks
+//!   move host experts onto the stage card only); after it the tier's set
+//!   is the live slot map's tier rows (`tier`), and no tier expert's file
+//!   bytes are in the load's host set (`host`, by [`HostSet::holds`]). The
+//!   union bit rule cannot hold here: the union's machine would move tier
+//!   ids, and its pinned count is the union's.
+//! - `--prompt4k` (residency off): plan (b′) and its union reference at
+//!   [`CTX_4K`] positions, whose ubatch is the full [`PROMPT_4K`] window;
+//!   from a clear the first [`PROMPT_4K`] ids as one prompt call (one ubatch
+//!   of two card-route runs, the tier's block route over both) and
+//!   [`PROMPT_STEPS`] greedy steps, bit for bit the reference's as under
+//!   `--union`.
 //! - `--lost`: on the last load, the tier's stream held behind a host flag
 //!   before a step — the tier stops signalling: within the go deadline and
 //!   its grace the step fails naming the lost card, the host tier is
@@ -71,7 +89,7 @@ mod gate {
     use app::Session;
     use bloomery_gpu::HostFlags;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model};
+    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model};
     use bloomery_gpu::host::swap::{PassReport, Residency};
     use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet};
     use bloomery_gpu::host::{PassKind, PoisonKind};
@@ -93,6 +111,18 @@ mod gate {
     const PROMPT: usize = 32;
     /// Greedy steps before the verifies and after them.
     const STEPS: usize = 24;
+    /// The prompt call's ids under `--union` and `--residency`: one ubatch
+    /// at [`CTX`].
+    const PROMPT_U: usize = 600;
+    /// `--union`'s short prompt call: under the pass walk's eight rows, which
+    /// a tier load runs as one ubatch (`Body38::resolve_prompt`).
+    const PROMPT_SHORT: usize = 5;
+    /// The greedy steps after a prompt call.
+    const PROMPT_STEPS: usize = 8;
+    /// `--prompt4k`'s stores and prompt: the full ubatch window, with room
+    /// for the steps after it.
+    const CTX_4K: usize = 4352;
+    const PROMPT_4K: usize = 4096;
     /// The card budgets tried, largest first, GiB.
     const BUDGETS: [u64; 10] = [26, 25, 24, 23, 22, 21, 20, 19, 18, 16];
     /// The go deadline and the grace a lost card is named within, plus room.
@@ -105,24 +135,28 @@ mod gate {
         union: bool,
         residency: bool,
         lost: bool,
+        prompt4k: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_qwen38_twocard [--union] [--residency] [--lost]";
+        const USAGE: &str =
+            "usage: gate_qwen38_twocard [--union] [--residency] [--lost] [--prompt4k]";
         let mut a = Args {
             union: false,
             residency: false,
             lost: false,
+            prompt4k: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
                 "--union" => a.union = true,
                 "--residency" => a.residency = true,
                 "--lost" => a.lost = true,
+                "--prompt4k" => a.prompt4k = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.union || a.residency || a.lost) {
+        if !(a.union || a.residency || a.lost || a.prompt4k) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -240,12 +274,13 @@ mod gate {
         Ok(out)
     }
 
-    /// A load of `plan` under `residency`.
+    /// A load of `plan` under `residency`, its session over `ctx`
+    /// positions.
     fn open(
         path: &Path,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
-        (host, ub): (HostCfg, usize),
+        (host, ub, ctx): (HostCfg, usize, usize),
         residency: Residency,
     ) -> Result<Session<Body38>, GateError> {
         let t0 = Instant::now();
@@ -267,7 +302,7 @@ mod gate {
             m.gpu().device_name()?,
             m.resident_bytes()
         );
-        let mut s = Session::from_model(m, CTX as u32);
+        let mut s = Session::from_model(m, u32::try_from(ctx)?);
         s.model_mut().body_parts(NAME)?.2.log_residency(0);
         Ok(s)
     }
@@ -477,8 +512,8 @@ mod gate {
     /// `plan` the tier load's plan.
     fn residency_clauses(
         s: &mut Session<Body38>,
-        ids: &[u32],
-        off: Option<&Run>,
+        (ids, prompt_ids): (&[u32], &[u32]),
+        (off, off_prompt): (Option<&Run>, Option<&Run>),
         (split, plan): (&Split, &Plan<'_>),
     ) -> Result<bool, GateError> {
         let first = history(s, ids)?;
@@ -536,14 +571,18 @@ mod gate {
             );
             ok &= near_ok;
         }
+        if let Some(off) = off_prompt {
+            let on = prompt_run(s, prompt_ids, true)?;
+            ok &= stream_rule(&format!("a {PROMPT_U}-id prompt call streaming"), off, &on);
+        }
         let body = s.model().body(NAME)?;
         let hybrid = body.hybrid();
         let tier = hybrid.tiers().first().ok_or("the load holds no tier")?;
         let live = TierSet::of_map(hybrid.slots(), 0)?;
         let set_ok = &live == tier.set();
         println!(
-            "tier: after the histories the live slot map's tier rows are the tier card's set \
-             ({} experts): {}",
+            "tier: after the histories and the prompt call the live slot map's tier rows are the \
+             tier card's set ({} experts): {}",
             tier.set().experts(),
             verdict(set_ok)
         );
@@ -676,6 +715,229 @@ mod gate {
         Ok(ok)
     }
 
+    /// Plan (b′) on `bp` at `ctx` positions under the largest budget of
+    /// [`BUDGETS`] that fits the gate ([`unfit`]), printed with why each
+    /// larger one did not.
+    fn chosen_plan<'a>(
+        inputs: &'a PlanInputs,
+        bp: &'a Machine,
+        ctx: usize,
+    ) -> Result<Plan<'a>, GateError> {
+        for gib in BUDGETS {
+            let levers = PlanLevers {
+                card_budget_bytes: Some(gib << 30),
+            };
+            let plan = inputs
+                .plan_with(bp, ctx as u64, &levers, Experts::Card)
+                .map_err(|e| format!("plan (b′) under {gib} GiB: {e}"))?;
+            if let Some(why) = unfit(&plan) {
+                println!("budget {gib} GiB at {ctx} positions: {why}; next");
+                continue;
+            }
+            let held = |v: &[u64]| {
+                (
+                    v.iter().copied().min().unwrap_or(0),
+                    v.iter().copied().max().unwrap_or(0),
+                )
+            };
+            println!(
+                "plan (b′) at {ctx} positions under a card budget of {gib} GiB: stage {} experts \
+                 (a layer {:?}), tier {} experts (a layer {:?}) on {} layers, host {} experts",
+                plan.cards[0].experts,
+                held(&plan.n_l),
+                plan.cards.get(1).map_or(0, |c| c.experts),
+                held(plan.tier_n_l.first().map_or(&[][..], Vec::as_slice)),
+                tier_layers(&plan).len(),
+                plan.host.experts
+            );
+            return Ok(plan);
+        }
+        Err(format!("no budget of BUDGETS fits the gate at {ctx} positions").into())
+    }
+
+    /// From a clear, `ids` as one prompt call (the session's path: ubatches
+    /// for a prompt this long) with the call's host streaming `stream`, then
+    /// [`PROMPT_STEPS`] greedy steps: the prompt's last logits row and its
+    /// argmax first, then every step's.
+    fn prompt_run(s: &mut Session<Body38>, ids: &[u32], stream: bool) -> Result<Run, GateError> {
+        s.clear()?;
+        take_passes(s)?;
+        s.model_mut().body_parts(NAME)?.2.set_hoststream(stream)?;
+        let mut run = Run::default();
+        let out = s.prompt(ids, Want::Logits)?;
+        let Out::Logits { argmax, row } = out else {
+            return Err("a prompt call asked for its logits gave the argmax alone".into());
+        };
+        run.tokens.push(argmax);
+        run.logits.push(row.to_vec());
+        let mut next = argmax;
+        for _ in 0..PROMPT_STEPS {
+            next = step(s, &mut run, next)?;
+        }
+        s.model_mut().body_parts(NAME)?.2.set_hoststream(false)?;
+        run.landed = take_passes(s)?.iter().map(|(_, r)| r.landed).sum();
+        Ok(run)
+    }
+
+    /// From a clear, `ids` as one explicit ubatch prompt call
+    /// ([`Prompt38::Gemm`]: the reference load would take the pass below
+    /// eight ids) and [`PROMPT_STEPS`] greedy steps: the call's argmax, then
+    /// every step's token and row (the call's own row is not read).
+    fn gemm_run(s: &mut Session<Body38>, ids: &[u32]) -> Result<Run, GateError> {
+        s.clear()?;
+        take_passes(s)?;
+        let mut run = Run::default();
+        let mut next = s.model_mut().prompt38(ids, Prompt38::Gemm)?;
+        run.tokens.push(next);
+        for _ in 0..PROMPT_STEPS {
+            next = step(s, &mut run, next)?;
+        }
+        take_passes(s)?;
+        Ok(run)
+    }
+
+    /// A prompt call's tier batch services: served, settled, settled with
+    /// the rows already in, and the host's wall waiting for the rest.
+    type Served = (u64, u64, u64, u64);
+
+    /// [`prompt_run`] unstreamed on the tier load `s`, with the tier's batch
+    /// services over it ([`Served`]).
+    fn served_prompt(s: &mut Session<Body38>, ids: &[u32]) -> Result<(Run, Served), GateError> {
+        let stats = |s: &Session<Body38>| -> Result<Served, GateError> {
+            let st = s.model().body(NAME)?.hybrid().tier_batch_stats();
+            let t = st.first().ok_or("the load holds no tier batch leg")?;
+            Ok((t.served, t.settles, t.settle_early, t.settle_ns))
+        };
+        let before = stats(s)?;
+        let run = prompt_run(s, ids, false)?;
+        let after = stats(s)?;
+        Ok((
+            run,
+            (
+                after.0 - before.0,
+                after.1 - before.1,
+                after.2 - before.2,
+                after.3 - before.3,
+            ),
+        ))
+    }
+
+    /// The precondition of a tier prompt call's bit clause: its one walk's
+    /// tier services, one a tier layer (`layers`; a call too short to route
+    /// a slot to every tier layer: at least one, `None`), each waited for (a
+    /// call whose tier served nothing would agree with the reference
+    /// trivially on any layer the tier holds no routed slot of). The host's
+    /// wall in the waits is printed beside it, not a clause.
+    fn batch_precondition(
+        (served, settles, early, wait_ns): Served,
+        layers: Option<&[usize]>,
+    ) -> bool {
+        let (ok, want) = match layers {
+            Some(l) => (
+                served == l.len() as u64,
+                format!("one a tier layer, {}", l.len()),
+            ),
+            None => (served > 0, "at least one".to_string()),
+        };
+        let ok = ok && settles == served;
+        println!(
+            "precondition: the prompt call's tier services {served} ({want}), each waited for \
+             ({settles} settles, {early} with the rows already in, {:.2} ms waiting): {}",
+            wait_ns as f64 / 1e6,
+            verdict(ok)
+        );
+        ok
+    }
+
+    /// An explicit `--prefill pass` on the tier load `s`: refused by name
+    /// (the pass walk has no tier leg), the model where it stood.
+    fn pass_refused(s: &mut Session<Body38>, ids: &[u32]) -> Result<bool, GateError> {
+        s.clear()?;
+        let r = s.model_mut().prompt38(ids, Prompt38::Pass);
+        let at = s.pos();
+        let ok = match &r {
+            Err(e) => e.to_string().contains("the pass walk has no tier leg") && at == 0,
+            Ok(_) => false,
+        };
+        println!(
+            "pass: an explicit pass prompt call of {} ids on the tier load is refused by name \
+             ({}), the session at position {at}: {}",
+            ids.len(),
+            match &r {
+                Err(e) => e.to_string(),
+                Ok(t) => format!("ran, next {t}"),
+            },
+            verdict(ok)
+        );
+        s.clear()?;
+        Ok(ok)
+    }
+
+    /// `gate_qwen38_residency`'s stream rule between the residency-off tier
+    /// run `off` and `on`, each a prompt call's row then its steps': the
+    /// prompt's row within [`GREEDY_MARGIN`] of the off run's, the greedy
+    /// ids equal or parted first at the on run's near tie.
+    fn stream_rule(what: &str, off: &Run, on: &Run) -> bool {
+        let dlogit = match (off.logits.first(), on.logits.first()) {
+            (Some(a), Some(b)) if a.len() == b.len() => a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max),
+            _ => f32::INFINITY,
+        };
+        let parted = off.tokens.iter().zip(&on.tokens).position(|(a, b)| a != b);
+        let near =
+            parted.is_none_or(|i| on.logits.get(i).is_some_and(|r| margin(r) < GREEDY_MARGIN));
+        let ok = near
+            && dlogit < GREEDY_MARGIN
+            && off.tokens.len() == on.tokens.len()
+            && off.logits.len() == on.logits.len();
+        println!(
+            "residency: {what} against the residency-off tier run: the prompt's last logits row \
+             max|diff| {dlogit} (under {GREEDY_MARGIN}), the ids parted at {parted:?} (a near tie \
+             {near}), flips landed {}: {}",
+            on.landed,
+            verdict(ok)
+        );
+        ok
+    }
+
+    /// `--prompt4k` (module doc): plan (b′) and its union at [`CTX_4K`]
+    /// positions, a [`PROMPT_4K`]-id prompt call on each.
+    fn prompt4k(path: &Path, inputs: &PlanInputs, host: HostCfg) -> Result<bool, GateError> {
+        let ub = ubatch_for(CTX_4K)?;
+        if ub != PROMPT_4K {
+            return Err(format!(
+                "a ubatch of {ub} at {CTX_4K} positions: --prompt4k walks the full {PROMPT_4K} \
+                 window (unset BLOOMERY_QWEN3_UBATCH)"
+            )
+            .into());
+        }
+        let layers = inputs.spec.layers.len();
+        let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
+        let plan = chosen_plan(inputs, &bp, CTX_4K)?;
+        let tl = tier_layers(&plan);
+        let ids = prose38(PROMPT_4K)?;
+        let mut um = bp.clone();
+        um.tiers.clear();
+        let uplan = union_plan(&plan, &um)?;
+        let mut r = open(path, &uplan, inputs, (host, ub, CTX_4K), Residency::Off)?;
+        if !r.model().body(NAME)?.hybrid().tiers().is_empty() {
+            return Err("the reference load holds a tier card".into());
+        }
+        let want = prompt_run(&mut r, &ids, false)?;
+        drop(r);
+        let mut t = open(path, &plan, inputs, (host, ub, CTX_4K), Residency::Off)?;
+        let (got, served) = served_prompt(&mut t, &ids)?;
+        let ok = same(
+            &format!("two cards, a {PROMPT_4K}-id prompt call at {CTX_4K} positions"),
+            &want,
+            &got,
+        );
+        Ok(batch_precondition(served, Some(&tl)) && ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
         let host = levers.host();
@@ -686,42 +948,11 @@ mod gate {
         let ub = ubatch_for(CTX)?;
         let layers = inputs.spec.layers.len();
         let bp = machine_bp(layers, ub as u64, None, tier_batch(&inputs.hp, ub as u64));
-        let mut chosen = None;
-        for gib in BUDGETS {
-            let levers = PlanLevers {
-                card_budget_bytes: Some(gib << 30),
-            };
-            let plan = inputs
-                .plan_with(&bp, CTX as u64, &levers, Experts::Card)
-                .map_err(|e| format!("plan (b′) under {gib} GiB: {e}"))?;
-            match unfit(&plan) {
-                None => {
-                    chosen = Some((gib, levers));
-                    break;
-                }
-                Some(why) => println!("budget {gib} GiB: {why}; next"),
-            }
-        }
-        let (gib, levers) = chosen.ok_or("no budget of BUDGETS fits the gate")?;
-        let plan = inputs.plan_with(&bp, CTX as u64, &levers, Experts::Card)?;
+        let plan = chosen_plan(&inputs, &bp, CTX)?;
         let tl = tier_layers(&plan);
-        let held = |v: &[u64]| {
-            (
-                v.iter().copied().min().unwrap_or(0),
-                v.iter().copied().max().unwrap_or(0),
-            )
-        };
-        println!(
-            "plan (b′) under a card budget of {gib} GiB: stage {} experts (a layer {:?}), tier {} \
-             experts (a layer {:?}) on {} layers, host {} experts",
-            plan.cards[0].experts,
-            held(&plan.n_l),
-            plan.cards.get(1).map_or(0, |c| c.experts),
-            held(plan.tier_n_l.first().map_or(&[][..], Vec::as_slice)),
-            tl.len(),
-            plan.host.experts
-        );
         let ids = prose38(PROMPT + 32)?;
+        let prompt_ids = prose38(PROMPT_U)?;
+        let mut off_prompt = None;
         let mut pass = true;
         let mut last: Option<Session<Body38>> = None;
         let mut off_run = None;
@@ -733,16 +964,38 @@ mod gate {
                 "reference: the A6000 holds {} experts, the union of the stage's and the tier's",
                 uplan.n_l.iter().sum::<u64>()
             );
-            let mut r = open(path, &uplan, &inputs, (host, ub), Residency::Off)?;
+            let mut r = open(path, &uplan, &inputs, (host, ub, CTX), Residency::Off)?;
             if !r.model().body(NAME)?.hybrid().tiers().is_empty() {
                 return Err("the reference load holds a tier card".into());
             }
             let want = history(&mut r, &ids)?;
+            let want_prompt = prompt_run(&mut r, &prompt_ids, false)?;
+            let want_short = gemm_run(&mut r, &prompt_ids[..PROMPT_SHORT])?;
             drop(r);
-            let mut t = open(path, &plan, &inputs, (host, ub), Residency::Off)?;
+            let mut t = open(path, &plan, &inputs, (host, ub, CTX), Residency::Off)?;
             let got = history(&mut t, &ids)?;
             pass &= same("two cards", &want, &got);
             pass &= structure(&t, &want, &got, &tl)?;
+            let (got_prompt, served) = served_prompt(&mut t, &prompt_ids)?;
+            pass &= same(
+                &format!("two cards, a {PROMPT_U}-id prompt call"),
+                &want_prompt,
+                &got_prompt,
+            );
+            pass &= batch_precondition(served, Some(&tl));
+            let (mut got_short, served) = served_prompt(&mut t, &prompt_ids[..PROMPT_SHORT])?;
+            got_short.logits.remove(0);
+            pass &= same(
+                &format!(
+                    "two cards, a {PROMPT_SHORT}-id prompt call by the session's path (the \
+                     reference's an explicit ubatch call; the steps' rows)"
+                ),
+                &want_short,
+                &got_short,
+            );
+            pass &= batch_precondition(served, None);
+            pass &= pass_refused(&mut t, &prompt_ids[..PROMPT_SHORT])?;
+            off_prompt = Some(got_prompt);
             off_run = Some(got);
             last = Some(t);
         }
@@ -763,16 +1016,25 @@ mod gate {
                 "residency: mid-p{}-s1 over the plan's {slots} stage experts a layer at least",
                 slots / 2
             );
-            let mut t = open(path, &plan, &inputs, (host, ub), residency)?;
-            pass &= residency_clauses(&mut t, &ids, off_run.as_ref(), (&split, &plan))?;
+            let mut t = open(path, &plan, &inputs, (host, ub, CTX), residency)?;
+            pass &= residency_clauses(
+                &mut t,
+                (&ids, &prompt_ids),
+                (off_run.as_ref(), off_prompt.as_ref()),
+                (&split, &plan),
+            )?;
             last = Some(t);
         }
         if args.lost {
             let mut s = match last.take() {
                 Some(s) => s,
-                None => open(path, &plan, &inputs, (host, ub), Residency::Off)?,
+                None => open(path, &plan, &inputs, (host, ub, CTX), Residency::Off)?,
             };
             pass &= lost_case(s.model_mut(), &ids)?;
+        }
+        if args.prompt4k {
+            drop(last.take());
+            pass &= prompt4k(path, &inputs, host)?;
         }
         if !pass {
             return Err(checks_failed());

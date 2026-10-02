@@ -422,17 +422,19 @@ fn hw_qwen4exp_mtp_plan() {
     );
 }
 
-// PIN(2026-10-01): plan (b′) (`place::machine_bp`, `--place bp`) with the shared draft (full head)
-// at 4,096 positions and U 4,096: the A6000 keeps plan (a)'s drafted row byte for byte — 244 on the
-// first 18 layers, 243 on the rest (qwen4exp_meta's CARD_PLANS) — the draft's card bytes now the
-// A6000's "MTP draft" reserve, which the tier's budget does not see; the split's derivation is
-// qwen4exp_meta's BP_PLAIN [derived: the tier's budget is BP_PLAIN's, 22,785,081,344 B; the same
-// replica's spread beside 244/243: both cards 394 on the first 47 layers and 393 on layer 47, so the
-// tier holds 150 on layers 0-17 and 47 and 151 on 18-46, 7,229 experts, 22,653,952,000 B of experts
-// and 125,313,024 B of rounding; the host 118 or 119 a layer, 5,665 experts]. Row: the A6000's
-// (high, at_high, low), both cards' (high, at_high), the tier's experts, expert bytes, rounding.
+// PIN(2026-10-02): plan (b′) (`place::machine_bp`, `--place bp`) with the shared draft (full head)
+// at 4,096 positions and U 4,096: the A6000 keeps plan (a)'s drafted row at its budget less the tier
+// join's card rows (`place::card_tier_join_bytes`) byte for byte — 242 on the first 42 layers, 241
+// on the rest, 11,610 experts, 72 fewer than the row before the join's 244/18/243 — the draft's card
+// bytes the A6000's "MTP draft" reserve, which the tier's budget does not see; the split's
+// derivation is qwen4exp_meta's BP_PLAIN [derived: the tier's budget is BP_PLAIN's, 22,826,941,416
+// B; the same spread beside 242/241: both cards 393 on the first 30 layers and 392 on the rest, so
+// the tier holds 151 on layers 0-29 and 42-47 and 150 on 30-41, 7,236 experts, 22,676,889,600 B of
+// experts and 146,415,616 B of rounding; the host 119 or 120 a layer, 5,730 experts]. Row: the
+// A6000's (high, at_high, low), both cards' (high, at_high), the tier's experts, expert bytes,
+// rounding.
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (244, 18, 243, 394, 47, 7_229, 22_653_952_000, 125_313_024);
+    (242, 42, 241, 393, 30, 7_236, 22_676_889_600, 146_415_616);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`
@@ -473,7 +475,10 @@ fn hw_qwen4exp_bp_mtp_plan() {
         .card_bytes(ctx)
         .unwrap_or_else(|e| panic!("card_bytes: {e}"));
     let machine = machine_bp(n, u, Some(bytes), batch);
-    let a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
+    // Plan (a)'s rule at the A6000's budget less the tier join's scratch
+    // (`place::card_tier_join_bytes`), which plan (b′) adds to its scratch.
+    let mut a_machine = place::machine_for_experts(A6000, n, u, Experts::Card);
+    a_machine.cards[0].scratch_bytes += place::card_tier_join_bytes(u);
     let a = inputs
         .plan_mtp_with(&a_machine, ctx, &levers, &mtp, Experts::Card)
         .unwrap_or_else(|e| panic!("plan (a) with the draft: {e}"));
@@ -516,10 +521,11 @@ fn hw_qwen4exp_bp_mtp_plan() {
             check(
                 &mut o,
                 format!(
-                    "the A6000 {high} on the first {at_high}, {low} on the rest ({}), plan (a)'s \
-                     drafted counts, card bytes, headroom and draft plan, its reserve {} the \
+                    "the A6000 {high} on the first {at_high}, {low} on the rest ({}: {:?}), plan \
+                     (a)'s drafted counts, card bytes, headroom and draft plan, its reserve {} the \
                      draft's {bytes} ({stage_same}); headroom {} ((a) {})",
                     plan.n_l == stage,
+                    plan.n_l,
                     s.reserve_bytes,
                     m.headroom_bytes,
                     a.headroom_bytes

@@ -22,7 +22,7 @@
 
 use super::slots::{HOST, MAX_TIERS, Slot, SlotMap};
 use super::step::GO_DEADLINE;
-use super::tier::{TierBlock, TierCard};
+use super::tier::{BlockRows, TierBlock, TierCard};
 use super::{Health, HostExperts, HostTier, Refusal, name_refusal, nanos, non_finite, unknown_id};
 use crate::fault::Fault;
 use crate::graph::{MappedHost, cu};
@@ -124,8 +124,9 @@ enum Leg {
 
 /// A set's tier leg: the slots' tier places the route downloads, the rows
 /// the tier's down writes back (host-mapped, slot-major from the block's
-/// first slot) as the stage card's card sum reads them, the event the
-/// tier's service completes at (the tier's context), and its stage.
+/// first slot, or packed: [`BlockRows::Packed`]) as the stage card's card
+/// sum reads them, the event the tier's service completes at (the tier's
+/// context), and its stage.
 ///
 /// Field order is drop order: the window before the allocation it views.
 struct TierLeg {
@@ -295,7 +296,7 @@ impl BatchPort {
             legs,
             x: DeviceBuffer::zeroed(ts, cap * n)?,
             tsel: DeviceBuffer::zeroed(ts, slots)?,
-            act: Q8Act::with_slots(ts, cap, n)?,
+            act: Q8Act::with_tier_cols(ts, cap, n)?,
             y: DeviceBuffer::zeroed(ts, row_values)?,
             stats: TierBatchStats::default(),
         };
@@ -393,6 +394,22 @@ impl BatchPort {
         key: BatchKey,
     ) -> Result<(), GpuError> {
         self.download_with(stream, xw, ids, self.n_used, tsels, key)
+    }
+
+    /// [`BatchPort::download_tiered`] from routing buffers of `pitch`
+    /// entries a token whose first `n_used` are the routed slots
+    /// ([`BatchPort::download_pitched`]); the tier places stay `n_used` a
+    /// token.
+    pub fn download_tiered_pitched(
+        &mut self,
+        stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        pitch: usize,
+        tsels: &[(usize, &DeviceBuffer<u32>)],
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
+        self.download_with(stream, xw, ids, pitch, tsels, key)
     }
 
     fn download_with(
@@ -944,7 +961,10 @@ fn enqueue_tier_service(
 /// column 0; their q8_1 form, the bytes the stage card's fused norm wrote
 /// for the same columns (its q8_1 output is the quantizer's over its f32
 /// output); the tier's experts over the block by the tile path into the
-/// down outputs by slot; those copied into the set's rows; the set's event.
+/// down outputs by slot, and those copied into the set's rows — or, for a
+/// [`BlockRows::Packed`] tier, its slots' rows packed at their front and
+/// those alone copied, one row for each slot the places do not leave to the
+/// host; the set's event.
 /// Each copy's source was complete when the host enqueued it: the host has
 /// waited for the set's route copies.
 fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuError> {
@@ -968,7 +988,8 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
         what: PORT,
         detail: format!("the tier places of {key:?} from a set of {}", tsel.len()),
     })?;
-    tier.hit(layer, places.iter().filter(|&&p| p != HOST).count() as u64);
+    let on_tier = places.iter().filter(|&&p| p != HOST).count();
+    tier.hit(layer, on_tier as u64);
     {
         let g = tier.gpu();
         g.context().bind_to_thread()?;
@@ -981,6 +1002,10 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
         }
         g.enqueue_quantize_q8_1_cols(stage_x, act, cols, layer)?;
     }
+    let copied = match tier.block_rows() {
+        BlockRows::Staged => cols * s,
+        BlockRows::Packed => on_tier,
+    };
     tier.enqueue_block(
         layer,
         TierBlock {
@@ -992,10 +1017,12 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
         },
     )?;
     let stream = tier.gpu().stream();
-    // SAFETY: `rows_len` is the rows' allocation's length (their window spans
-    // all of it); the stage card reads them only after the host has seen the
-    // event recorded below complete.
-    unsafe { dtoh_mapped(stream, (rows, rows_len), y, cols * s * n)? };
+    if copied > 0 {
+        // SAFETY: `rows_len` is the rows' allocation's length (their window
+        // spans all of it); the stage card reads them only after the host
+        // has seen the event recorded below complete.
+        unsafe { dtoh_mapped(stream, (rows, rows_len), y, copied * n)? };
+    }
     done.record(stream)?;
     Ok(())
 }
@@ -1119,6 +1146,23 @@ impl<H: HostExperts> HostTier<H> {
         tsels: &[&DeviceBuffer<u32>],
         key: BatchKey,
     ) -> Result<(), GpuError> {
+        let pitch = self.step.boundary.layout.handoff().n_used;
+        self.enqueue_download_tiered_pitched(stream, xw, ids, pitch, tsels, key)
+    }
+
+    /// [`HostTier::enqueue_download_tiered`] from routing buffers of `pitch`
+    /// entries a token whose first `n_used` are the routed slots
+    /// ([`BatchPort::download_tiered_pitched`]); the tier places stay
+    /// `n_used` a token.
+    pub fn enqueue_download_tiered_pitched(
+        &mut self,
+        stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        pitch: usize,
+        tsels: &[&DeviceBuffer<u32>],
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::enqueue_download_tiered";
         let mask = self.tier_mask(key.layer)?;
         if mask == 0 {
@@ -1148,7 +1192,7 @@ impl<H: HostExperts> HostTier<H> {
             k += 1;
         }
         self.port_mut(WHAT)?
-            .download_tiered(stream, xw, ids, &routed[..k], key)
+            .download_tiered_pitched(stream, xw, ids, pitch, &routed[..k], key)
     }
 
     /// The oldest download not served yet — `key`'s, else refused by name —

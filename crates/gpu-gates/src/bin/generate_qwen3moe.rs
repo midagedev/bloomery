@@ -54,9 +54,10 @@
 //! names — `a` the A6000 (the default), `gate` the 3090, `bp` plan (b′):
 //! the A6000 as under `a` with the 3090 as its expert tier
 //! (`place::machine_bp`, the tier's experts printed as the `plan` line's
-//! `tier=` and `tier_experts=`; the load then refuses it by name, since
-//! `Body38` has no tier leg yet) — and printed as a `plan` line. Its `--prefill` is `auto` (the default: `gemm` for a prompt
-//! of nine positions or more, `pass` below), `gemm` (ubatches of up to the
+//! `tier=` and `tier_experts=`; the tier serves the decode walks and the
+//! ubatch walk, not the pass) — and printed as a `plan` line. Its `--prefill` is `auto` (the default: `gemm` for a prompt
+//! of nine positions or more, `pass` below; `gemm` at every length under
+//! `bp`), `gemm` (ubatches of up to the
 //! load's size through the host tier's batch port at their width, the Q8_0
 //! projections on q8 activations), `pass` (eager passes of up to eight
 //! positions through the same port) or `step` (one captured step a
@@ -595,9 +596,9 @@ mod cli {
 
         /// `step:1x<n>` — one captured step a position — the pass cut
         /// `pass:<sizes>`, or the ubatch cut `ubatch:<sizes>`; the kind is
-        /// the path `auto` resolves to.
+        /// the path `auto` resolves to on this load (`Body38::resolve_prompt`).
         fn plan(m: &Qwen38Model, n: usize, path: Prompt38) -> Result<Units, GateError> {
-            let path = path.resolve(n);
+            let path = m.body("plan")?.resolve_prompt(path, n);
             Ok(match path {
                 Prompt38::Gemm => {
                     let plan = PrefillPlan {

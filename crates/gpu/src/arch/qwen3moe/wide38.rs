@@ -49,9 +49,23 @@
 //! so the two card legs differ only in their sums' order.
 //!
 //! The walk runs the card route ([`CardRoute38`]) on a layer with card
-//! experts, and holds no card buffers on a map without them: a slot map with
-//! an expert on a tier card is refused by name at its entry (`card38`),
-//! before anything moves.
+//! experts, and holds no card buffers on a map without them.
+//!
+//! On a load with an expert tier (plan (b′)'s 3090, `tier38`) a layer the
+//! tier holds experts of downloads the unit's tier places beside its
+//! routing, and the batch port's tier leg runs the tier's block route over
+//! the tier slots in the host union's shadow, their rows packed by rank and
+//! copied into the set's host-mapped rows by the tier's copy engine. The
+//! card route there keeps its card slots' down rows and places for the whole
+//! unit and sums nothing; the back, once the host has seen the tier's service
+//! complete ([`BatchLeg::join_tiered`]), ranks the same places
+//! (`q38_tier_rank`) and sums the card's and the tier's slots in slot order
+//! (`q38_card_tier_acc`),
+//! then the host sums are uploaded and combined as on any card layer. With
+//! the union of both cards' experts on one card the same launches read the
+//! same values in the same order, so the two loads agree bit for bit. A slot
+//! map with an expert on a tier card on a load that hung no tier is refused
+//! by name at the walk's entry (`card38`), before anything moves.
 //!
 //! Under host streaming (`BLOOMERY_HOSTSTREAM=on`, a residency machine, a
 //! prompt call fed by ubatches: V4.1's `body::prefill` flow at one ubatch a
@@ -76,6 +90,7 @@ use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_s
 use super::program38::{Ctx38, q8};
 use super::scratch::{Io, KvPlanes, RecStore, f32_view, param_view};
 use super::scratch38::{Arena38, ROUTE_ROWS, SELECT_ROWS, Store38};
+use super::tier38::TierSide38;
 use crate::GpuError;
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaSelArgs;
@@ -96,7 +111,8 @@ use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::prompt_timing::Mark;
 use crate::q38::{
-    CardAccArgs, CardSharedAddArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, SharedAddArgs,
+    CardAccArgs, CardSharedAddArgs, CardTierAccArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs,
+    SharedAddArgs,
 };
 use crate::qsa::{self, PoolArgs, SelectArgs};
 use crate::rope_neox::PartialNeoxArgs;
@@ -282,8 +298,9 @@ pub(super) struct CardRoute38 {
     /// the walk's ids (a pitch of eleven) with an identity map, whose bytes
     /// are the remapped route's input.
     ids: DeviceBuffer<u32>,
-    /// The slots' places, ten a run token: the places launch over the same
-    /// ids with the slot map's layer row.
+    /// The slots' places, ten a run token — ten a token of the whole unit on
+    /// a load with an expert tier: the places launch over the same ids with
+    /// the slot map's layer row.
     sel: DeviceBuffer<u32>,
     /// The run's normed rows (`[run][HIDDEN]`) in the K-quant GEMM's
     /// activation form — the same q8_1 bytes a `Q8Act` of the same values
@@ -298,10 +315,18 @@ pub(super) struct CardRoute38 {
     /// read (the route leaves it to the host tier).
     act: GemmAct32,
     /// The down GEMM's output, ten slots a run token of [`geo::HIDDEN`]
-    /// values, slot-major.
+    /// values, slot-major — a token of the whole unit on a load with an
+    /// expert tier, whose join reads every run's rows after the host's wait.
     down: DeviceBuffer<f32>,
     /// The card slots' weighted sums, a row a token of the whole unit.
     acc: DeviceBuffer<f32>,
+    /// On a load with an expert tier, the unit's tier places, ten a token:
+    /// each slot's place on the tier ([`crate::hybrid::HOST`] off it), which
+    /// the front downloads beside the routing and the join reads.
+    tsel: Option<DeviceBuffer<u32>>,
+    /// Beside the tier places, each slot's rank among the unit's tier slots
+    /// (`q38_tier_rank`): the row of the tier's packed rows the join reads.
+    trank: Option<DeviceBuffer<u32>>,
     /// One route table per distinct card count, in `counts`' order.
     routes: Vec<GemmRoute>,
     counts: Vec<usize>,
@@ -314,11 +339,15 @@ impl CardRoute38 {
     /// The route's buffers for ubatches of up to `rows` tokens over `card`'s
     /// card experts: a run of `min(rows, ROUTE_ROWS)` tokens, the sums a
     /// token of the whole unit, and one route table per distinct card count
-    /// (refused by name past two, naming them). Load-time only.
+    /// (refused by name past two, naming them); `tiered`, a load with an
+    /// expert tier, the places and the down rows a token of the whole unit
+    /// and the unit's tier places beside them
+    /// (`place::card_tier_join_bytes`). Load-time only.
     pub(super) fn new(
         stream: &CudaStream,
         rows: usize,
         card: &Card38,
+        tiered: bool,
     ) -> Result<CardRoute38, GpuError> {
         let run = rows.min(ROUTE_ROWS);
         let counts = card.card_counts();
@@ -334,16 +363,23 @@ impl CardRoute38 {
             ));
         }
         let slots = run * geo::N_USED;
+        let kept = if tiered { rows * geo::N_USED } else { slots };
         Ok(CardRoute38 {
             run,
             ids: DeviceBuffer::zeroed(stream, slots)?,
-            sel: DeviceBuffer::zeroed(stream, slots)?,
+            sel: DeviceBuffer::zeroed(stream, kept)?,
             x: GemmAct::new(stream, run, geo::HIDDEN)?,
             g: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
             u: DeviceBuffer::zeroed(stream, slots * geo::FF)?,
             act: GemmAct32::new(stream, slots, geo::FF)?,
-            down: DeviceBuffer::zeroed(stream, slots * geo::HIDDEN)?,
+            down: DeviceBuffer::zeroed(stream, kept * geo::HIDDEN)?,
             acc: DeviceBuffer::zeroed(stream, rows * geo::HIDDEN)?,
+            tsel: tiered
+                .then(|| DeviceBuffer::zeroed(stream, rows * geo::N_USED))
+                .transpose()?,
+            trank: tiered
+                .then(|| DeviceBuffer::zeroed(stream, rows * geo::N_USED))
+                .transpose()?,
             routes: counts
                 .iter()
                 .map(|&n| GemmRoute::new(stream, slots, n))
@@ -366,6 +402,8 @@ impl CardRoute38 {
             + self.act.bytes()
             + self.down.num_bytes()
             + self.acc.num_bytes()
+            + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.trank.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.routes.iter().map(GemmRoute::bytes).sum::<usize>()
             + self.ids_map.num_bytes()
     }
@@ -396,9 +434,12 @@ impl CardRoute38 {
     /// (Q4_K or Q5_K) over the unit's ten slots a token, the card slots'
     /// SwiGLU, the down GEMM of its type (the file's Q5_1 or Q8_0 blocks) and
     /// the card sum by the router's weights (`weights`, eleven a token)
-    /// into the unit-wide acc's rows for the run. Nine launches a run.
-    /// Refused by name on a layer without card experts. Asynchronous,
-    /// allocation-free, capturable.
+    /// into the unit-wide acc's rows for the run. Nine launches a run. On a
+    /// tier layer (`tiered`) the card sum is the join's
+    /// ([`CardRoute38::enqueue_tier_acc`]): eight launches a run, the places
+    /// and the down rows kept at the run's tokens of the unit. Refused by
+    /// name on a layer without card experts. Asynchronous, allocation-free,
+    /// capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "the route's ids, weights, normed rows, the slot map, the layer and the unit's width (rust-quality R8)"
@@ -410,7 +451,7 @@ impl CardRoute38 {
         l: usize,
         (ffn_x, ids, weights): (&DeviceBuffer<f32>, &DeviceBuffer<u32>, &DeviceBuffer<f32>),
         slots: &DeviceTensor<u32>,
-        m: usize,
+        (m, tiered): (usize, bool),
     ) -> Result<(), GpuError> {
         let st = card.stacks(c.w, l)?;
         let (n_card, gate, up) = (st.n_card, st.gate, st.up);
@@ -425,19 +466,43 @@ impl CardRoute38 {
         // a row), which stays resident while the window lives (this layer's
         // route launches).
         let map = unsafe { param_view::<u32>(slots.buf(), l * geo::EXPERTS, geo::EXPERTS) };
+        let kept = self.tsel.is_some();
+        if (tiered && !kept) || m * geo::HIDDEN > self.acc.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: a card route of {m} tokens{} on a route made for {} with kept \
+                     rows {kept}",
+                    if tiered { " on a tier layer" } else { "" },
+                    self.acc.len() / geo::HIDDEN
+                ),
+            ));
+        }
         let mut c0 = 0;
         while c0 < m {
             let n = self.run.min(m - c0);
+            // The places and the down rows of the run: from the run's first
+            // token of the unit when the route keeps them for the join, else
+            // from the run buffers' start.
+            let at = if kept { c0 } else { 0 };
             // SAFETY: tokens c0 .. c0 + n <= m <= rows of the walk's ids and
             // weights (`rows · pitch` each) and the arena's `ffn_x`
-            // (`rows · HIDDEN`); every buffer stays in place for this run's
+            // (`rows · HIDDEN`); the places and the down rows hold ten slots a
+            // token of the unit when kept, else of the run, so at .. at + n
+            // lies inside them; every buffer stays in place for this run's
             // launches.
-            let (ids_w, w_w, x_w, mut acc_w) = unsafe {
+            let (ids_w, w_w, x_w, mut acc_w, mut sel_w, mut down_w) = unsafe {
                 (
                     param_view::<u32>(ids, c0 * pitch, n * pitch),
                     f32_view(weights, c0 * pitch, n * pitch),
                     f32_view(ffn_x, c0 * geo::HIDDEN, n * geo::HIDDEN),
                     f32_view(&self.acc, c0 * geo::HIDDEN, n * geo::HIDDEN),
+                    param_view::<u32>(&self.sel, at * geo::N_USED, n * geo::N_USED),
+                    f32_view(
+                        &self.down,
+                        at * geo::N_USED * geo::HIDDEN,
+                        n * geo::N_USED * geo::HIDDEN,
+                    ),
                 )
             };
             let places = |map: &DeviceBuffer<u32>, out: &mut DeviceBuffer<u32>| {
@@ -456,14 +521,14 @@ impl CardRoute38 {
                 )
             };
             places(&self.ids_map, &mut self.ids)?;
-            places(&map, &mut self.sel)?;
-            let at = self.table_at(n_card)?;
+            places(&map, &mut sel_w)?;
+            let table = self.table_at(n_card)?;
             c.k.g32.enqueue_route_remap(
                 stream,
                 &self.ids,
                 &map,
                 n * geo::N_USED,
-                &mut self.routes[at],
+                &mut self.routes[table],
                 sink,
             )?;
             gpu.enqueue_quantize_gemm(&x_w, n, &mut self.x, sink)?;
@@ -475,7 +540,7 @@ impl CardRoute38 {
                         w,
                         rows_per_expert: geo::FF,
                         act: &self.x,
-                        route: &self.routes[at],
+                        route: &self.routes[table],
                         input: GemmInput::Shared { top_k: geo::N_USED },
                         y,
                     },
@@ -485,7 +550,7 @@ impl CardRoute38 {
                 stream,
                 &self.g,
                 &self.u,
-                &self.sel,
+                &sel_w,
                 n_card,
                 n * geo::N_USED,
                 &mut self.act,
@@ -497,27 +562,88 @@ impl CardRoute38 {
                     w: down,
                     rows_per_expert: geo::HIDDEN,
                     act: &self.act,
-                    route: &self.routes[at],
+                    route: &self.routes[table],
                     input: GemmInput::PerSlot,
-                    y: &mut self.down,
+                    y: &mut down_w,
                 },
             )?;
-            c.k.q38.enqueue_card_acc(
-                stream,
-                CardAccArgs {
-                    down: &self.down,
-                    w: &w_w,
-                    sel: &self.sel,
-                    n: geo::HIDDEN,
-                    m: n,
-                    n_card,
-                    fault: sink,
-                    acc: &mut acc_w,
-                },
-            )?;
+            if !tiered {
+                c.k.q38.enqueue_card_acc(
+                    stream,
+                    CardAccArgs {
+                        down: &down_w,
+                        w: &w_w,
+                        sel: &sel_w,
+                        n: geo::HIDDEN,
+                        m: n,
+                        n_card,
+                        fault: sink,
+                        acc: &mut acc_w,
+                    },
+                )?;
+            }
             c0 += n;
         }
         Ok(())
+    }
+
+    /// The unit's tier places, for the front's places launch and the
+    /// tiered download; refused by name on a route made for no tier.
+    fn tsel_mut(&mut self) -> Result<&mut DeviceBuffer<u32>, GpuError> {
+        self.tsel.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "a card route made for an expert tier",
+        ))
+    }
+
+    /// Enqueue tier layer `l`'s join sum over the unit's `m` tokens, after
+    /// the host's wait for the tier (`q38_card_tier_acc`): the card's slots
+    /// — the kept places and down rows of every run — and the tier's — the
+    /// unit's tier places, below `n_tier`, the tier's packed rows `trows` at
+    /// their ranks, which `q38_tier_rank` takes first over the same places
+    /// the tier ranked — in slot order by the router's `weights` (eleven a
+    /// token) into the unit-wide acc, which the back's combine reads as it
+    /// reads the card sum. Two launches. A route made for no tier is refused
+    /// by name.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the walk's context, the layer's card and tier counts, the unit's width, the router's weights and the tier's rows (rust-quality R8)"
+    )]
+    fn enqueue_tier_acc(
+        &mut self,
+        c: &Ctx38<'_>,
+        l: usize,
+        (n_card, n_tier): (usize, usize),
+        m: usize,
+        weights: &DeviceBuffer<f32>,
+        trows: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let (Some(tsel), Some(trank)) = (self.tsel.as_ref(), self.trank.as_mut()) else {
+            return Err(GpuError::state(
+                WHAT,
+                "a card route made for an expert tier",
+            ));
+        };
+        let stream = c.gpu.stream();
+        c.k.q38
+            .enqueue_tier_rank(stream, tsel, (m * geo::N_USED, n_tier), trank)?;
+        c.k.q38.enqueue_card_tier_acc(
+            stream,
+            CardTierAccArgs {
+                down: &self.down,
+                trows,
+                w: weights,
+                sel: &self.sel,
+                tsel,
+                trank,
+                n: geo::HIDDEN,
+                m,
+                n_card,
+                n_tier,
+                fault: c.gpu.layer_sink(l)?,
+                acc: &mut self.acc,
+            },
+        )
     }
 }
 
@@ -557,13 +683,19 @@ pub(super) struct Wide38 {
 impl Wide38 {
     /// The walk's own buffers for units of up to `rows` rows over `card`'s
     /// card experts: the card route's buffers beside them when a layer has
-    /// card experts. Load-time only.
-    pub(super) fn new(stream: &CudaStream, rows: usize, card: &Card38) -> Result<Wide38, GpuError> {
+    /// card experts, made for an expert tier's join when `tiered`. Load-time
+    /// only.
+    pub(super) fn new(
+        stream: &CudaStream,
+        rows: usize,
+        card: &Card38,
+        tiered: bool,
+    ) -> Result<Wide38, GpuError> {
         let geometry = Geometry::new(geo::STREAMS as u32, geo::RANK as u32, geo::HIDDEN as u32)
             .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
         let slots = geo::N_USED + 1;
         let card = (card.card_layers() > 0)
-            .then(|| CardRoute38::new(stream, rows, card))
+            .then(|| CardRoute38::new(stream, rows, card, tiered))
             .transpose()?;
         Ok(Wide38 {
             rows,
@@ -618,6 +750,9 @@ pub(super) struct WideParts<'a> {
     /// route on a layer with card experts.
     pub(super) slots: &'a DeviceTensor<u32>,
     pub(super) card: &'a Card38,
+    /// The stage card's tier side on a load with an expert tier: each
+    /// layer's tier count and the map's tier view.
+    pub(super) tier: Option<&'a TierSide38>,
     pub(super) m: usize,
     pub(super) pos0: usize,
     pub(super) dense: usize,
@@ -991,6 +1126,7 @@ impl WideParts<'_> {
         if !self.card.has(l) {
             return Ok(());
         }
+        let tiered = self.tier_k(l) > 0;
         let (c, m) = (&self.c, self.m);
         let s = &*self.s;
         let x = &mut *self.x;
@@ -1003,8 +1139,73 @@ impl WideParts<'_> {
             l,
             (&s.ffn_x, &x.ids, &x.weights),
             self.slots,
-            m,
+            (m, tiered),
         )
+    }
+
+    /// The tier's experts of layer `l`: 0 off the tier and on a load
+    /// without one.
+    fn tier_k(&self, l: usize) -> usize {
+        self.tier.map_or(0, |t| t.k(l))
+    }
+
+    /// Tier layer `l`'s download after its front: the unit's tier places
+    /// from the walk's ids and the map's tier view into the card route's,
+    /// then the activations, the routing and those places into the batch
+    /// port's set ([`crate::host::HostTier::enqueue_download_tiered_pitched`]),
+    /// which the tier's service reads.
+    fn download_tiered(
+        &mut self,
+        port: &mut BatchLeg<'_, HostRun>,
+        key: crate::host::batch::BatchKey,
+    ) -> Result<(), GpuError> {
+        let l = key.layer;
+        let tier = self
+            .tier
+            .ok_or(GpuError::state(WHAT, "the tier side of a tier layer"))?;
+        let (c, m) = (&self.c, self.m);
+        let stream = c.gpu.stream();
+        let (s, x) = (&*self.s, &mut *self.x);
+        let r = x
+            .card
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "the card route of a tier layer"))?;
+        let tsel = r.tsel_mut()?;
+        c.k.handoff.enqueue_places_cols(
+            stream,
+            &Places {
+                ids: &x.ids,
+                map: tier.view(),
+                row_off: l * geo::EXPERTS,
+                n_expert: geo::EXPERTS,
+            },
+            geo::N_USED + 1,
+            m,
+            c.gpu.layer_sink(l)?,
+            tsel,
+        )?;
+        port.hybrid().enqueue_download_tiered_pitched(
+            stream,
+            [&s.ffn_x, &x.weights],
+            &x.ids,
+            geo::N_USED + 1,
+            &[&*tsel],
+            key,
+        )
+    }
+
+    /// Tier layer `l`'s join after the host's wait for the tier
+    /// ([`CardRoute38::enqueue_tier_acc`] over the tier's rows `trows`):
+    /// the card sum the back's combine reads.
+    fn tier_acc(&mut self, l: usize, trows: &DeviceBuffer<f32>) -> Result<(), GpuError> {
+        let n_tier = self.tier_k(l);
+        let n_card = self.card.n_card(l);
+        let (c, m, x) = (&self.c, self.m, &mut *self.x);
+        let r = x
+            .card
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "the card route of a tier layer"))?;
+        r.enqueue_tier_acc(c, l, (n_card, n_tier), m, &x.weights, trows)
     }
 
     /// Layer `l`'s block output into `y`: the host's routed sums `hsum`, on
@@ -1507,7 +1708,9 @@ impl<'a> LayerProgram for Gemm38<'a> {
     type Port = BatchLeg<'a, HostRun>;
 
     /// The layer up to its router, the mix into the arena's `ffn_x`, then
-    /// the download of the unit's activations and routed slots.
+    /// the download of the unit's activations and routed slots — on a tier
+    /// layer with the unit's tier places beside them
+    /// ([`WideParts::download_tiered`]).
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let enq = port.part_start();
@@ -1518,13 +1721,17 @@ impl<'a> LayerProgram for Gemm38<'a> {
         port.mark(at, Mark::FrontEnd as usize)?;
         let key = port.key(at);
         let stream = self.p.c.gpu.stream();
-        let r = port.hybrid().enqueue_download_pitched(
-            stream,
-            [&self.p.s.ffn_x, &self.p.x.weights],
-            &self.p.x.ids,
-            geo::N_USED + 1,
-            key,
-        );
+        let r = if self.p.tier_k(l) > 0 {
+            self.p.download_tiered(port, key)
+        } else {
+            port.hybrid().enqueue_download_pitched(
+                stream,
+                [&self.p.s.ffn_x, &self.p.x.weights],
+                &self.p.x.ids,
+                geo::N_USED + 1,
+                key,
+            )
+        };
         let marked = r.and_then(|()| port.mark(at, Mark::Down as usize));
         port.part_end(at, enq);
         marked
@@ -1559,12 +1766,21 @@ impl<'a> LayerProgram for Gemm38<'a> {
     }
 
     /// The gated sum over the host sums the walk's serve uploaded, the card
-    /// route's beside them on a layer with card experts.
+    /// route's beside them on a layer with card experts. On a tier layer the
+    /// join first ([`BatchLeg::join_tiered`]): once the host has seen the
+    /// tier's service complete, the card sum over both cards' slots
+    /// ([`WideParts::tier_acc`]), then the host sums' upload.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = at.layer;
         let enq = port.part_start();
-        let r = self
-            .p
-            .shared_add(at.layer, port.hsum())
+        let joined = if self.p.tier_k(l) > 0 {
+            let p = &mut self.p;
+            port.join_tiered(at, |_, trows| p.tier_acc(l, trows))
+        } else {
+            Ok(())
+        };
+        let r = joined
+            .and_then(|()| self.p.shared_add(l, port.hsum()))
             .and_then(|()| port.mark(at, Mark::Back as usize));
         port.part_end(at, enq);
         r

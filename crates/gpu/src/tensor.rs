@@ -413,6 +413,11 @@ pub(crate) const Q8ACT_MAX_K: usize = 20_480;
 pub(crate) const Q8ACT_MAX_SLOTS: usize = 3072;
 const _: () = assert!(Q8ACT_MAX_SLOTS == model::moe::UNION_MAX_COLS * 6);
 
+/// The most token columns a tier's staged block activation takes
+/// ([`Q8Act::with_tier_cols`]): a block of the widest batch port a body
+/// opens, a ubatch of 4,096 positions.
+pub(crate) const TIER_ACT_MAX_COLS: usize = 4096;
+
 /// q8_1 activation scratch for up to `m` columns of `k` values each. One
 /// set per distinct input site: sites that read the same activation
 /// (gate·up, q·kv_a) share one (decision 2, as the CPU engine does).
@@ -464,6 +469,20 @@ impl Q8Act {
             ));
         }
         Q8Act::alloc("Q8Act::with_slots", stream, cols, k)
+    }
+
+    /// Allocate scratch for `cols` (1..=[`TIER_ACT_MAX_COLS`]) token columns
+    /// of `k` values: an expert tier's staged block of a prompt batch, one
+    /// column a token, which the batch port's tier leg quantizes on the tier
+    /// card. Load-time only.
+    pub fn with_tier_cols(stream: &CudaStream, cols: usize, k: usize) -> Result<Self, GpuError> {
+        if !(1..=TIER_ACT_MAX_COLS).contains(&cols) {
+            return Err(GpuError::shape(
+                "Q8Act::with_tier_cols",
+                format!("1 <= cols <= {TIER_ACT_MAX_COLS}, got {cols}"),
+            ));
+        }
+        Q8Act::alloc("Q8Act::with_tier_cols", stream, cols, k)
     }
 
     /// The planes for `m` columns of `k` values, `k` checked here.

@@ -186,6 +186,10 @@ generate_ds41   q2_k_rows                               0          0
 generate_ds41   q38_card_acc                            0          0
 generate_ds41   q38_card_shared_add                     0          0
 generate_ds41   q38_card_tier_shared_add                0          0
+generate_ds41   q38_card_tier_acc                       0          0
+generate_ds41   q38_tier_ids                            0          0
+generate_ds41   q38_tier_rank                           0          0
+generate_ds41   q38_tier_rows_pack                      0          0
 generate_ds41   q38_shared_add                          0          0
 generate_ds41   q3k_gemv                                0          0
 generate_ds41   q3k_gemv_groups                         0          0
@@ -358,6 +362,10 @@ gate_e2e        q2_k_rows                               0          0
 gate_e2e        q38_card_acc                            0          0
 gate_e2e        q38_card_shared_add                     0          0
 gate_e2e        q38_card_tier_shared_add                0          0
+gate_e2e        q38_card_tier_acc                       0          0
+gate_e2e        q38_tier_ids                            0          0
+gate_e2e        q38_tier_rank                           0          0
+gate_e2e        q38_tier_rows_pack                      0          0
 gate_e2e        q38_shared_add                          0          0
 gate_e2e        q3k_gemv                                0          0
 gate_e2e        q3k_gemv_groups                         0          0

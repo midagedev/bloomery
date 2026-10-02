@@ -1330,18 +1330,21 @@ gate-gpu-qwen38-residency:
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_residency && bash tools/gpu-gate.sh gate_qwen38_residency'
 
 # Qwen3.8 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier on the 3090, its decode walks (a
-# step and the 2-, 3- and 4-row verifies) serving the tier. The reference is the same plan with every tier set joined to
-# the stage card's (one card, no tier code), the plans made under a card budget so the A6000 holds both sets. --union:
-# 32 prose ids step by step, greedy steps, six verifies, greedy steps, every token and logits row bit for bit the
-# reference's; the stage graphs' nodes the reference's less one a tier layer, the tier's graphs eight a tier layer and
-# the fault copy; precondition: every tier layer sent a routed slot. --residency: the tier load under mid-p<P>-s1, the
-# history twice the same with flips landed, its ids the residency-off run's or parted at a near tie, the tier's set the
-# live map's tier rows, no tier expert's bytes in the host set. --lost: the tier's stream held behind a host flag, the
-# step named as a lost card, CardLost, the next step refused. Up to three loads, one after the other. Both cards
-# (BLOOMERY_CARD=both: both gate locks), alone in a batch.
+# step and the 2-, 3- and 4-row verifies) and its ubatch prompt walk serving the tier. The reference is the same plan
+# with every tier set joined to the stage card's (one card, no tier code), the plans made under a card budget so the
+# A6000 holds both sets. --union: 32 prose ids step by step, greedy steps, six verifies, greedy steps, then a 600-id
+# prompt call and 8 greedy steps, every token and logits row bit for bit the reference's; the stage graphs' nodes the
+# reference's less one a tier layer, the tier's graphs eight a tier layer and the fault copy; preconditions: every tier
+# layer sent a routed slot, the prompt's tier services one a tier layer. --residency: the tier load under mid-p<P>-s1,
+# the history twice the same with flips landed, its ids the residency-off run's or parted at a near tie, the streamed
+# 600-id prompt call by the same rule, the tier's set the live map's tier rows, no tier expert's bytes in the host set.
+# --prompt4k: plan (b′) and its union at 4,352 positions, a 4,096-id prompt call (the full ubatch window) and 8 greedy
+# steps bit for bit. --lost: the tier's stream held behind a host flag, the step named as a lost card, CardLost, the
+# next step refused. Up to five loads, one after the other. Both cards (BLOOMERY_CARD=both: both gate locks), alone in a
+# batch.
 [group('solo')]
 [group('v41-load')]
-gate-gpu-qwen38-twocard *ARGS='--union --residency':
+gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
 
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text

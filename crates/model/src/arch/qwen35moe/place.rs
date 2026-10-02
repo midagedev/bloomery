@@ -667,6 +667,64 @@ pub const fn card_route_scratch_bytes(u: u64) -> u64 {
     run * CARD_ROUTE_RUN_TOKEN_BYTES + u * CARD_ROUTE_ACC_TOKEN_BYTES
 }
 
+/// Card bytes the ubatch walk's card route holds past
+/// [`card_route_scratch_bytes`] on a load with an expert tier, at ubatches
+/// of up to `u` positions [derived: a tier layer's join sums the card's and
+/// the tier's slots in slot order after the host's wait, so the route keeps
+/// its card slots' down rows and places for the whole unit, not one run —
+/// (u − min(u, CARD_ROUTE_ROWS)) tokens more of 10 · 2,560 · 4 + 10 · 4 =
+/// 102,440 B — and the unit's tier places and their ranks among the tier
+/// slots, 2 · 10 · 4 = 80 B a token].
+#[must_use]
+pub const fn card_tier_join_bytes(u: u64) -> u64 {
+    let run = if u < CARD_ROUTE_ROWS {
+        u
+    } else {
+        CARD_ROUTE_ROWS
+    };
+    (u - run) * 102_440 + u * 80
+}
+
+/// Tier-card bytes a run token of the tier's block route holds
+/// (`tier38`'s `BlockRoute38`) [derived: the route's ids 10 · 4 = 40 B; the
+/// run's rows' `GemmAct` at K = 2,560, 8,592 B; the gate and up f32 rows
+/// 2 · 10 · 640 · 4 = 51,200 B; the SwiGLU `GemmAct32` at K = 640, 800 B a
+/// slot, 8,000 B; the down GEMM's f32 rows the run's pack reads, 10 · 2,560 ·
+/// 4 = 102,400 B].
+pub const TIER_ROUTE_RUN_TOKEN_BYTES: u64 = 170_232;
+
+/// The most experts a layer has: the bound a tier route table is counted at
+/// before the plan sets the tier's counts.
+const ROUTE_EXPERTS_BOUND: u64 = 512;
+
+/// The tier-card bytes of the tier's block route for blocks of up to `cols`
+/// columns [derived: [`TIER_ROUTE_RUN_TOKEN_BYTES`] a token of one run of
+/// `min(cols, CARD_ROUTE_ROWS)`; two route tables of that run's `S` slots
+/// counted at [`ROUTE_EXPERTS_BOUND`] experts, each its slot list 4 · S, its
+/// tile words 8 · (S / 64 + min(512, S)) and its counts 8; two identity maps
+/// of 513 words; the block's slots' ranks, 10 · 4 = 40 B a column]. The
+/// tier holds the tables of its own counts and the rest of this bound beside
+/// them, so its block bytes are this reserve.
+#[must_use]
+pub const fn tier_route_scratch_bytes(cols: u64) -> u64 {
+    let run = if cols < CARD_ROUTE_ROWS {
+        cols
+    } else {
+        CARD_ROUTE_ROWS
+    };
+    let slots = run * 10;
+    let tiles = slots / 64
+        + if slots < ROUTE_EXPERTS_BOUND {
+            slots
+        } else {
+            ROUTE_EXPERTS_BOUND
+        };
+    run * TIER_ROUTE_RUN_TOKEN_BYTES
+        + cols * 40
+        + 2 * (4 * slots + 8 * tiles + 8)
+        + 2 * 4 * (ROUTE_EXPERTS_BOUND + 1)
+}
+
 /// The ubatch arena bytes a plan made on `card` counts: its scratch past the
 /// m = 1 scratch. The load of a ubatch whose arena holds more is refused by
 /// name.
@@ -735,9 +793,11 @@ pub const MTP_RESERVE: &str = "MTP draft";
 /// column at the model width as the card route's gate·up input), the down
 /// outputs by slot ([`tier_batch_staging_bytes`]) — and on the host, per
 /// exchange set, the rows the tier hands back and the places it reads
-/// ([`tier_batch_host_bytes`]). The tier's block scratch is the card
-/// route's at that ubatch ([`card_route_scratch_bytes`]): the tier runs its
-/// slots of a block through the route the stage card runs its own through.
+/// ([`tier_batch_host_bytes`]). The tier's block scratch is its block
+/// route's at those columns ([`tier_route_scratch_bytes`]): the tier runs
+/// its slots of a block through the route the stage card runs its own
+/// through, into the staging's down outputs, and writes its slots' rows
+/// into the host's rows itself.
 #[must_use]
 pub fn tier_batch(hp: &Hparams, ubatch: u64) -> TierBatchBytes {
     tier_batch_of(hp.n_embd as u64, hp.n_used as u64, ubatch)
@@ -752,7 +812,7 @@ const fn tier_batch_of(n_embd: u64, n_used: u64, ubatch: u64) -> TierBatchBytes 
     };
     TierBatchBytes {
         staging: tier_batch_staging_bytes(n_embd, n_used, cols),
-        scratch: card_route_scratch_bytes(ubatch),
+        scratch: tier_route_scratch_bytes(cols),
         host: tier_batch_host_bytes(n_embd, n_used, cols),
     }
 }
@@ -760,7 +820,8 @@ const fn tier_batch_of(n_embd: u64, n_used: u64, ubatch: u64) -> TierBatchBytes 
 /// Plan (b′) for a qwen4exp file (`--place bp`): the A6000 runs every one
 /// of `layers`, the head and the token embedding as
 /// [`machine_for_experts`] lays it out under [`Experts::Card`] for
-/// ubatches of up to `ubatch` positions, with `draft` — the MTP draft's
+/// ubatches of up to `ubatch` positions, its scratch with the ubatch walk's
+/// tier join beside it ([`card_tier_join_bytes`]), with `draft` — the MTP draft's
 /// card bytes ([`MtpInputs::card_bytes`]) when the draft runs beside the
 /// target — as its named reserve [`MTP_RESERVE`]; the 3090 is an expert
 /// tier beside the host, with no stage, its prompt-batch service `batch`
@@ -768,8 +829,8 @@ const fn tier_batch_of(n_embd: u64, n_used: u64, ubatch: u64) -> TierBatchBytes 
 ///
 /// **The split.** The planner fills the A6000 first and then the tier with
 /// each layer's next ids, each card to its own budget, so the A6000 keeps
-/// the counts plan (a) gives it, byte for byte, and the tier takes the
-/// next ids it holds after them. That is the rule this plan keeps, from
+/// the counts plan (a) gives it less what the tier join's scratch takes,
+/// and the tier takes the next ids it holds after them. That is the rule this plan keeps, from
 /// the per-slot costs:
 /// - the residency machine holds the tier's experts away for the load's
 ///   life (never admitted, never a victim), so the tier's share of a
@@ -799,6 +860,7 @@ pub fn machine_bp(
     batch: TierBatchBytes,
 ) -> Machine {
     let mut m = machine_for_experts(A6000, layers, ubatch, Experts::Card);
+    m.cards[0].scratch_bytes += card_tier_join_bytes(ubatch);
     m.cards[0]
         .reserves
         .extend(draft.map(|b| (MTP_RESERVE.to_string(), b)));
@@ -2402,32 +2464,43 @@ mod tests {
     }
 
     /// Plan (b′)'s machine ([`super::machine_bp`]): the A6000 as
-    /// [`super::machine_for_experts`] lays it out under the card experts, the
-    /// draft's bytes its one named reserve when given; the 3090 a tier with
-    /// no stage and the tier's prompt batch as its one reserve; the host's
-    /// reserves the workstation's and the tier's rows. The tier's prompt
-    /// batch at U 4,096 and 512 [derived: cols = U, 10 slots a column of
-    /// 2,560 values; staging 4·cols·2560 + 4·slots + 8,592·cols +
-    /// 4·slots·2560, the card route's scratch (2,048 run tokens at most of
-    /// 170,360 B, 10,240 B a token), host 2·(4·slots·2560 + 4·slots)]. The
-    /// stage card's draft reserve is checked against what the plan needs.
+    /// [`super::machine_for_experts`] lays it out under the card experts, its
+    /// scratch with the tier join's beside it, the draft's bytes its one
+    /// named reserve when given; the 3090 a tier with no stage and the tier's
+    /// prompt batch as its one reserve; the host's reserves the
+    /// workstation's and the tier's rows. The tier's prompt batch at U 4,096
+    /// and 512 [derived: cols = U, 10 slots a column of 2,560 values; staging
+    /// 4·cols·2560 + 4·slots + 8,592·cols + 4·slots·2560, the block route's
+    /// scratch (run = min(cols, 2,048) tokens of 170,232 B, 40 B a column of
+    /// ranks, two tables of S = 10·run slots at 4·S + 8·(S/64 + 512) + 8 B,
+    /// two maps of 513 words: 348,980,248 at 4,096, 87,233,816 at 512), host
+    /// 2·(4·slots·2560 + 4·slots)]; the tier join at U 4,096: 2,048 ·
+    /// 102,440 + 4,096 · 80 = 210,124,800 B. The stage card's draft reserve is checked against what
+    /// the plan needs.
     mod bp {
         use super::super::{
-            Experts, MTP_RESERVE, PlaceError, check_draft_reserve, machine_bp, machine_for_experts,
-            tier_batch_of,
+            Experts, MTP_RESERVE, PlaceError, card_tier_join_bytes, check_draft_reserve,
+            machine_bp, machine_for_experts, tier_batch_of,
         };
         use crate::placement::workstation::{
             A6000, CONTEXT, MARGIN, OS_RESERVE, ROW_CACHE_RESERVE, RTX_3090, SCRATCH,
             TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes,
         };
 
+        // PIN(2026-10-02): the tier's block scratch is its block route's
+        // with the run's down rows and the block's ranks (q38tier2b: the tier
+        // packs its slots' rows by rank for the copy engine), and the A6000's
+        // scratch gains the tier join's unit-wide card rows, places and
+        // ranks; derivation in the doc.
         #[test]
         fn tier_batch_at_two_ubatches() {
+            assert_eq!(card_tier_join_bytes(4096), 210_124_800);
+            assert_eq!(card_tier_join_bytes(512), 40_960);
             assert_eq!(
                 tier_batch_of(2560, 10, 4096),
                 TierBatchBytes {
                     staging: 496_730_112,
-                    scratch: 390_840_320,
+                    scratch: 348_980_248,
                     host: 839_188_480,
                 }
             );
@@ -2435,7 +2508,7 @@ mod tests {
                 tier_batch_of(2560, 10, 512),
                 TierBatchBytes {
                     staging: 62_091_264,
-                    scratch: 92_467_200,
+                    scratch: 87_233_816,
                     host: 104_898_560,
                 }
             );
@@ -2458,7 +2531,7 @@ mod tests {
                         &stage.name,
                         stage.usable_bytes,
                         stage.context_bytes,
-                        stage.scratch_bytes,
+                        stage.scratch_bytes - card_tier_join_bytes(4096),
                         stage.margin_bytes,
                         stage.granule_bytes,
                         &stage.layers,
@@ -2495,7 +2568,7 @@ mod tests {
                 );
                 assert_eq!(
                     tier.reserves,
-                    vec![(TIER_BATCH_RESERVE.to_string(), 887_570_432)]
+                    vec![(TIER_BATCH_RESERVE.to_string(), 845_710_360)]
                 );
                 let names: Vec<&str> = m.host.reserves.iter().map(|(n, _)| n.as_str()).collect();
                 assert_eq!(
