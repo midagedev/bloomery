@@ -166,7 +166,7 @@
 //!   [`route_cap`] and a gap within [`route_margin_cap`], those past an
 //!   earlier flip counted against the cap and printed with no margin rule
 //!   (the forced arm below holds that case); every layer's live stores within its
-//!   band ([`gemm_bands`]) at the layers no flip's path reaches (no flip at a
+//!   stores' band ([`gemm_bands`]) at the layers no flip's path reaches (no flip at a
 //!   lower layer), the rest printed; the last logits within the head's band
 //!   when no flip lies anywhere, printed otherwise; the argmax the
 //!   reference's, or one whose logit in the reference's row lies within six
@@ -269,7 +269,7 @@ mod gate {
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
-    use runtime::layer::{FfnKind, MixerKind};
+    use runtime::layer::{FfnKind, Layer, MixerKind};
     use runtime::{Out, Target, Want};
 
     /// The router's experts and picks a token.
@@ -2275,28 +2275,59 @@ mod gate {
         Ok(pass)
     }
 
+    /// The GEMM batch's bands per layer ([`gemm_bands`]): each layer's
+    /// stores', and its stream's after the layer's mixer and block — what
+    /// the next layer, the layer's router and, at the last layer, the head
+    /// read.
+    struct Bands {
+        stores: Vec<f64>,
+        stream: Vec<f64>,
+    }
+
     /// PIN(2026-10-02): the GEMM batch's distance from the steps per layer,
     /// as the error model gives it: q = `rounding::q8_32_rel` = 1.2858e-2 per
-    /// quantized input, passed to the projection's output. A KDA layer's
-    /// stream gains it from the normed input through q, k and v (the delta
-    /// rule is trilinear in them: 3), the gated rows through `out` (1), and
-    /// through σ, slope <= 1/4, from β and twice from z (3/16): c = 4.1875;
-    /// its decay pair stays on the one-column gemv (0). A latent layer's from
-    /// its stack's one input: c = 1. The feed-forward blocks stay on the gemv:
-    /// 0. Layers add independently: layer l within q·√(Σ_{j<=l} c_j) where
-    /// both feeds take the same experts and pools; the head reads all 45:
-    /// q·√(34·4.1875 + 11) = 0.159. Each layer's band, from `latent` (the
-    /// layers whose mixer is the latent attention).
-    fn gemm_bands(latent: &[bool]) -> Vec<f64> {
+    /// quantized input, passed to the projection's output; outputs of one
+    /// input through different weights' rows are independent, so their
+    /// variances add. Each site is counted at the first store or stream that
+    /// reads it. A KDA layer's stores (the conv ring of q, k and v, the delta
+    /// rule's state) read q, k and v (3) and, through σ, slope <= 1/4, β
+    /// (1/16): 3.0625; its stream reads beside them the gated rows through
+    /// `out` (1) and, through σ, z twice (2/16): 4.1875 in all. Its decay pair
+    /// stays on the one-column gemv (0). A latent layer's stores (its latent
+    /// and index rows) read its stack's one input (1); its stream reads beside
+    /// it the query's low rank through `q_b` (1) and the heads' outputs
+    /// through `out` (1): 3 in all — the query's error reaches the scores
+    /// `q·k` as the stack's error in the latent keys does, through the same
+    /// softmax, so it is counted as that one is; the absorbed pair `k_b`,
+    /// `v_b` stays on the gemv (0). A dense block reaches only the stream:
+    /// through the up (1) and the gate, whose relative error reaches
+    /// `silu(g)` times its log-slope `1 + g·(1 − σ(g))`, at most 1.28 (at
+    /// g = 1.28; the clamp only lowers it): 1.28² = 1.64, and its SwiGLU rows
+    /// through the down (1): 3.64. A routed layer's shared expert stays on
+    /// the gemv (0). Layers add independently, where both feeds take the same
+    /// experts and pools: layer l's stores within q·√(Σ_{j<l} c_j + s_l) (s_l
+    /// its stores' part), its stream within q·√(Σ_{j<=l} c_j) — the router
+    /// reads the stream after the layer's mixer, a routed block adding 0; the
+    /// head reads all 45: q·√(34·4.1875 + 3·3.64 + 11·3) = 0.1755. From
+    /// `kinds` (each layer's mixer and feed-forward block).
+    fn gemm_bands(kinds: &[Layer]) -> Bands {
         let q = q8_32_rel();
         let mut c = 0.0f64;
-        latent
-            .iter()
-            .map(|&lat| {
-                c += if lat { 1.0 } else { 4.1875 };
-                q * c.sqrt()
-            })
-            .collect()
+        let (mut stores, mut stream) = (Vec::new(), Vec::new());
+        for k in kinds {
+            let (store, mixer) = if k.mixer == MixerKind::Latent {
+                (1.0, 3.0)
+            } else {
+                (3.0625, 4.1875)
+            };
+            stores.push(q * (c + store).sqrt());
+            c += mixer;
+            if k.ffn == FfnKind::Dense {
+                c += 3.64;
+            }
+            stream.push(q * c.sqrt());
+        }
+        Bands { stores, stream }
     }
 
     /// PIN(2026-10-02): a flip between the GEMM batch's routing and the
@@ -2305,7 +2336,7 @@ mod gate {
     /// two values' distance there ([`Flip::allowed`]), and that distance
     /// within six deviations of the router's error at the layer: a logit `z`
     /// is a dot of the layer's normed input, which carries `band`
-    /// ([`gemm_bands`] at the layer) of relative error, so `z` moves by about
+    /// ([`gemm_bands`]' stream at the layer) of relative error, so `z` moves by about
     /// that times the logits' RMS; the ranked value σ(z) + bias moves by at
     /// most ¼ of it; two values, three deviations each: 6 · ¼ · band ·
     /// RMS(z). The logits are the scores' own, `ln(p / (1 − p))` of the
@@ -2314,8 +2345,8 @@ mod gate {
     /// lies within the cap too (a margin is at most the pair's distance). Past an earlier flip the layer's input also carries that
     /// flip's other experts' output, which no band covers: the distance is
     /// counted and printed against the cap, not held, and no margin rule
-    /// applies there (the clean run at 2051 positions has 407 of 45565 such
-    /// flips past the cap, the worst at 2.85 of it). That case is held by the
+    /// applies there (the clean run at 2051 positions has 322 of 47148 such
+    /// flips past the cap, the worst at 3.20 of it). That case is held by the
     /// forced arm ([`gemm_forced`]): with the reference's routes planted at
     /// every layer, every layer's stores and the logits lie within their
     /// bands ([`gemm_bands`]).
@@ -2652,7 +2683,7 @@ mod gate {
         ids: &[u32],
         want: &Held,
         routes: &[Option<RouteTapRows>],
-        (bias, bands): (&[Option<Vec<f32>>], &[f64]),
+        (bias, bands): (&[Option<Vec<f32>>], &Bands),
     ) -> Result<(bool, Option<After>), GateError> {
         let p = want.after.p;
         m.reset()?;
@@ -2670,12 +2701,12 @@ mod gate {
         let ours = by_layer(&store_rows(m, p)?);
         let theirs = by_layer(&want.stores);
         let taps = prompt_route_taps(m, p)?;
-        let tally = judge_routes("gemm", p, (&taps, routes), bias, bands);
+        let tally = judge_routes("gemm", p, (&taps, routes), bias, &bands.stream);
         let reach = tally.low.unwrap_or(N_LAYER - 1);
         let (mut held_ok, mut worst, mut worst_l, mut past, mut past_l) =
             (true, 0.0f64, 0usize, 0.0f64, 0usize);
         for (l, (o, w)) in ours.iter().zip(&theirs).enumerate() {
-            let r = rel(o, w) / bands[l];
+            let r = rel(o, w) / bands.stores[l];
             if l <= reach {
                 held_ok &= r <= 1.0;
                 if r > worst || r.is_nan() {
@@ -2685,15 +2716,15 @@ mod gate {
                     println!(
                         "prompt batch G=1 P={p}: layer {l}'s stores {:.3e} from the reference's, \
                          past its band {:.3e} FAIL",
-                        r * bands[l],
-                        bands[l]
+                        r * bands.stores[l],
+                        bands.stores[l]
                     );
                 }
             } else if r > past {
                 (past, past_l) = (r, l);
             }
         }
-        let head = bands[N_LAYER - 1];
+        let head = bands.stream[N_LAYER - 1];
         let logits_rel = rel(&logits, &want.logits);
         let logits_ok = tally.low.is_some() || logits_rel <= head;
         let top = argmax(&want.logits);
@@ -2774,7 +2805,7 @@ mod gate {
         m: &mut Glm5nextModel,
         ids: &[u32],
         want: &Held,
-        bands: &[f64],
+        bands: &Bands,
     ) -> Result<bool, GateError> {
         let p = want.after.p;
         m.reset()?;
@@ -2793,7 +2824,7 @@ mod gate {
         let theirs = by_layer(&want.stores);
         let (mut held_ok, mut worst, mut worst_l) = (true, 0.0f64, 0usize);
         for (l, (o, w)) in ours.iter().zip(&theirs).enumerate() {
-            let r = rel(o, w) / bands[l];
+            let r = rel(o, w) / bands.stores[l];
             held_ok &= r <= 1.0;
             if r > worst || r.is_nan() {
                 (worst, worst_l) = (r, l);
@@ -2802,12 +2833,12 @@ mod gate {
                 println!(
                     "prompt batch forced P={p}: layer {l}'s stores {:.3e} from the reference's, \
                      past its band {:.3e} FAIL",
-                    r * bands[l],
-                    bands[l]
+                    r * bands.stores[l],
+                    bands.stores[l]
                 );
             }
         }
-        let head = bands[N_LAYER - 1];
+        let head = bands.stream[N_LAYER - 1];
         let logits_rel = rel(&logits, &want.logits);
         let top = argmax(&want.logits);
         let tok_gap = f64::from(want.logits[top as usize])
@@ -2916,19 +2947,19 @@ mod gate {
             routes,
         } = chunk_calls(m, &ids, &after)?;
         ok &= chunks_ok;
-        let latent: Vec<bool> = m
-            .body("prompt batch")?
-            .kinds()
-            .iter()
-            .map(|k| k.mixer == MixerKind::Latent)
-            .collect();
-        let bands = gemm_bands(&latent);
+        let bands = gemm_bands(&m.body("prompt batch")?.kinds());
         let bias = biases(m)?;
         println!(
-            "prompt batch: the GEMM bands at layers 0, 3, 44: {:.3e} {:.3e} {:.3e}",
-            bands[0],
-            bands[3],
-            bands[N_LAYER - 1]
+            "prompt batch: the GEMM bands: stores at layers 0..=4 {:.3e} {:.3e} {:.3e} {:.3e} \
+             {:.3e}; the stream at layers 0, 3, 44 {:.3e} {:.3e} {:.3e}",
+            bands.stores[0],
+            bands.stores[1],
+            bands.stores[2],
+            bands.stores[3],
+            bands.stores[4],
+            bands.stream[0],
+            bands.stream[3],
+            bands.stream[N_LAYER - 1]
         );
         // Groups of one: a call of at most a chunk the steps' bits, one past
         // it against the chunk calls.

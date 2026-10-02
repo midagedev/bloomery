@@ -96,34 +96,79 @@ pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
 pub const FRONT_TILE_COLS: usize = 64;
 pub const FRONT_STEP: usize = 64;
 
-/// Card bytes of a GEMM front of `cols` token columns whose inputs are
-/// `embd`, `low` and `gated` values wide, four bytes a word: the dense table
-/// — the slot list and its all-zero ids, a column a word each, two words a
-/// tile (a tile every [`FRONT_TILE_COLS`] columns, and one more) and the two
-/// counts — and each input's three activation planes, twenty words a
-/// column's [`FRONT_STEP`]-value step (sixteen of codes, two scales, two
-/// code sums). The one formula of those bytes: the card body's front checks
-/// its made bytes against it.
+/// The widths, in values a column, a prompt batch's GEMM front is sized for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontWidths {
+    /// The normed input (`embedding_length`).
+    pub embd: usize,
+    /// A KDA mixer's low-rank gate rows (one head, `kda.head_dim`).
+    pub low: usize,
+    /// A KDA mixer's gated rows (every value head).
+    pub gated: usize,
+    /// A latent mixer's normed query low rank (`attention.q_lora_rank`).
+    pub q_low: usize,
+    /// A latent mixer's query heads before absorption (every head's
+    /// `attention.key_length_mla` values).
+    pub q: usize,
+    /// A latent mixer's heads' outputs (every head's
+    /// `attention.value_length_mla` values).
+    pub heads_v: usize,
+    /// A dense block's width (`feed_forward_length`); 0 on a load with no
+    /// dense block, which makes no feed-forward scratch.
+    pub ff: usize,
+}
+
+/// Card bytes of a GEMM front of `cols` token columns of widths `w`, four
+/// bytes a word: the dense table — the slot list and its all-zero ids, a
+/// column a word each, two words a tile (a tile every [`FRONT_TILE_COLS`]
+/// columns, and one more) and the two counts — each quantized input's three
+/// activation planes, twenty words a column's [`FRONT_STEP`]-value step
+/// (sixteen of codes, two scales, two code sums), over the normed input, the
+/// KDA gate's low-rank and gated rows, the latent query's low rank, the
+/// latent heads' outputs and the dense block's SwiGLU rows; and the f32 rows
+/// the front holds whole, a word a value: the latent query heads, the heads'
+/// outputs, and the dense block's gate and up rows. A width of 0 makes
+/// nothing. The one formula of those bytes: the card body's front checks its
+/// made bytes against it.
 #[must_use]
-pub fn front_bytes(cols: usize, [embd, low, gated]: [usize; 3]) -> usize {
+pub fn front_bytes(cols: usize, w: FrontWidths) -> usize {
     let table = 2 * cols + 2 * (cols / FRONT_TILE_COLS + 1) + 2;
     let act = |k: usize| 20 * cols * k.div_ceil(FRONT_STEP);
-    4 * (table + act(embd) + act(low) + act(gated))
+    let acts: usize = [w.embd, w.low, w.gated, w.q_low, w.heads_v, w.ff]
+        .into_iter()
+        .map(act)
+        .sum();
+    let rows = cols * (w.q + w.heads_v + 2 * w.ff);
+    4 * (table + acts + rows)
+}
+
+/// The widths of a load of `hp`'s prompt batch's GEMM front
+/// ([`FrontWidths`]): one head count for the KDA and latent heads
+/// (`attention.head_count`).
+#[must_use]
+pub fn front_widths(hp: &Hparams) -> FrontWidths {
+    FrontWidths {
+        embd: hp.n_embd,
+        low: hp.kda_head_dim,
+        gated: hp.n_head * hp.kda_head_dim,
+        q_low: hp.q_lora,
+        q: hp.n_head * hp.head_k,
+        heads_v: hp.n_head * hp.head_v,
+        ff: hp.dense_ff,
+    }
 }
 
 /// The bytes of the GEMM front a prompt batch of a load of `hp` at `ctx_max`
 /// positions makes on the stage card ([`front_bytes`]): batches of up to the
-/// host union's columns or the context, whichever is fewer, over the normed
-/// input (`embedding_length`), a KDA mixer's low-rank gate rows (one head,
-/// `kda.head_dim`) and its gated rows (every value head). The plan reserves
-/// them on the stage card ([`PlanInputs::plan_lanes`]).
+/// host union's columns or the context, whichever is fewer, at the load's
+/// widths ([`front_widths`]). The plan reserves them on the stage card
+/// ([`PlanInputs::plan_lanes`]).
 #[must_use]
 pub fn prompt_front_bytes(hp: &Hparams, ctx_max: u64) -> u64 {
     let cols = usize::try_from(ctx_max).map_or(crate::moe::UNION_MAX_COLS, |c| {
         c.min(crate::moe::UNION_MAX_COLS)
     });
-    let widths = [hp.n_embd, hp.kda_head_dim, hp.n_head * hp.kda_head_dim];
-    front_bytes(cols, widths) as u64
+    front_bytes(cols, front_widths(hp)) as u64
 }
 
 /// Batches a prompt group holds at most under a group lever of `g`

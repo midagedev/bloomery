@@ -1,0 +1,46 @@
+# Round glmgemm2: GLM-5.3-Flash's prompt batch with the rest of its card front on the GEMM (GemmFront): a latent
+# mixer's query heads q_b and output projection, and a dense block's gate, up and down behind the clamped SwiGLU
+# quantizer (swiglu_act_quant32), from GEMM_FROM = 9 positions a batch, against the base 1f08252b (glmswap on
+# main 849a64ad) whose front runs them as q8_0_gemv_mcol in chunks of 8 (each weight read 64 times a 512-column
+# batch). The absorbed pair k_b, v_b and the routed layers' shared expert stay on the gemv.
+# Decomposition [derived, round report section 1]. Base per 512-position batch from glmswap's sitting (A6000,
+# place a, G1): pp512 128.44 -> 3.986 s, pp4096 124.99 -> 4.096 s. At G1 every routed layer-batch is front + host
+# union 72.9 + exchange ~1.1 ms in series (the shadow, 37.8 ms with the shared expert, under the union: its term
+# is 0), so a front term pays in full.
+# - latent q_b + out, per latent layer-batch: mcol 6.27 GB (q_b 26.7 MB, out 71.3 MB, x 64) at 180..210 GB/s =
+#   29.9..34.9 ms -> GEMM 0.78 GB (x 8 tiles) at 550..700 GB/s + ~0.17 GB of rows = 1.4..1.7 ms; x 11 layers:
+#   -0.31..-0.37 s a batch.
+# - dense FFN, per dense layer-batch: mcol 10.27 GB (160.4 MB x 64), held to ~50 ms by the 0.15 s glmgroup's
+#   outside-the-spans time leaves for three of them -> GEMM 1.28 GB + rows = 2.0..2.5 ms; x 3: -0.14..-0.15 s.
+# Total -0.45..-0.52 s a batch: pp512 3.47..3.54 s -> 145..148 tok/s (+12.7..+15.0 %), pp4096 3.58..3.65 s ->
+# 140..143 tok/s (+12.4..+14.6 %).
+# pp512 is one batch, so the term reads pp4096; pp512 is printed beside it with the same bands.
+kind: ab
+question: does moving the latent heads' q_b and out and the dense blocks onto the GEMM cut the prompt batch's
+  card front by the term the one-column gemv at m = 8 (~195 GB/s, glmswap's H1, measured) gives these sites?
+term: pp tok/s @ P = 4096, prose prompt (GLM_PROSE from GLM_PROSE_FROM), A6000, plan (a), --ctx 4352, groups of
+  one (BLOOMERY_PREFILL_GROUP unset) - (gemm2 - base) / base, paired by round across the two invocations
+unit: %
+predict: +12..+15
+rounds: 2
+condition: one hold, two runner invocations back to back, each carrying this card: the base from a tree at
+  1f08252b (/Users/hckim/repo/bloomery-gemm2base, its own remote dir), then this round's from
+  /Users/hckim/repo/bloomery-glmgemm2 (BLOOMERY_REMOTE='~/repo/bloomery-glmgemm2'), each BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4352 BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmgemm2-pp.card'
+  just depth-gpu-glm5next 512 4096. Every row's time prompt record names kind=batch and 1 pass at P = 512, 8 at
+  4096; a row marked [cold], [cpu-busy] or [other-busy] is void, and so is a window whose card witness differs
+  between the two invocations. The plan reserves the front's 136.8 MB more (145 MB in all) on the stage card, so
+  the gemm2 arm holds ~9 fewer card experts than the base (both arms' plan lines print card_experts): its decode
+  rows move by that, its prompt rows by nothing measurable. The effect predicted is far outside the ~5 % a window
+  moves, so pairing across the two invocations decides it. Box time ~14..20 min [derived: per invocation two
+  warm-up processes and four rows, six loads at 45..75 s, 2 x (4 + 33) s of prompt; plus the two builds]
+decide-in: the mcol rate holds for these sites too; land it, and the next card-front terms at G1 are the latent
+  fronts' non-projection residue (attention, selector, appends, ~11..29 ms a latent layer-batch by depth), the
+  KDA fronts (~5.8 ms, the decay pair's launches) and k_b, v_b (~5.9 ms a latent layer-batch, 1.14 GB on mcol);
+  past them the host union is the floor, 42 x 74.0 ms = 3.11 s a batch (~165 tok/s at G1)
+decide-below: under +12 %: q_b, out or the dense blocks' mcol ran faster than 210 GB/s, or the GEMM slower than
+  550 GB/s: read card_front_ms per layer kind from one run's stat prompt lb rows (BLOOMERY_STEP_STATS=1) against
+  glmswap's, before landing, and re-derive k_b, v_b's term on the measured rate
+decide-above: past +15 %: those sites' gemv ran slower than 180 GB/s, or the dense blocks took more than the 50 ms
+  the outside-the-spans time allowed; re-derive from the stat prompt lb rows, then price k_b, v_b on the measured
+  rate first (their 1.14 GB is the largest projection term left on the front)

@@ -6,8 +6,8 @@
 //! logits. A batch of at most [`CHUNK`] positions writes the steps' bits; one
 //! of [`GEMM_FROM`] or more runs its mixers' Q8_0 projections on the GEMM
 //! ([`GemmFront`]: a KDA mixer's input projections but the decay's pair and
-//! its output projection, a latent mixer's joined projection), whose
-//! activations are quantized to 32-value int8 blocks, so it writes the
+//! its output projection, a latent mixer's joined projection, query heads
+//! and output projection, a dense block), whose activations are quantized to 32-value int8 blocks, so it writes the
 //! GEMM's bits there. Either way a token's bits are a function of the ids
 //! before it and of which side of [`GEMM_FROM`] each batch they ran in fell,
 //! not of the batches' cut otherwise: the GEMM's output for a column is that
@@ -67,7 +67,7 @@
 //! - the GEMM's projections over the batch's `T` rows from [`GEMM_FROM`];
 //! - chunks of up to [`CHUNK`] tokens where it takes at most that many: the
 //!   q8_0 gemvs (`q8_0_gemv_mcol`, `q8_0_gemv_heads_mcol`) the GEMM does
-//!   not take, the
+//!   not take, the shared expert's
 //!   gate·up·SwiGLU (`ds41_shexp_gate_up_q8_0_mcol`), the card experts'
 //!   launches, the k-pool selector, and the attention, each token over the
 //!   positions at and before its own — the batch's own rows and pools
@@ -118,7 +118,7 @@ use cuda_core::DeviceBuffer;
 use gguf::GgmlType;
 use gguf::quant::dequant_row;
 use model::arch::glm5next::names::Sub;
-use model::arch::glm5next::place;
+use model::arch::glm5next::place::{self, FrontWidths};
 use model::moe::UNION_MAX_COLS;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -129,7 +129,7 @@ use super::{
     weight,
 };
 use crate::ffn::{self, CardRows};
-use crate::gemm::{FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
+use crate::gemm::{DenseNames, FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
 use crate::host::GlmHost;
 use crate::mla::{self, Select};
 use crate::tensors::{FfnNames, MixerNames, other_kind};
@@ -148,7 +148,8 @@ const _: () = assert!(CHUNK == HC_MAX_TOKENS);
 
 /// The fewest tokens a batch runs its GEMM projections over
 /// ([`GemmFront`]: a KDA mixer's input and output projections but its decay
-/// pair, a latent mixer's joined projection): a batch of at most a chunk
+/// pair, a latent mixer's joined projection, query heads and output
+/// projection, a dense block): a batch of at most a chunk
 /// runs them as the step's gemv does, so it writes the step's bits.
 pub const GEMM_FROM: usize = CHUNK + 1;
 
@@ -570,14 +571,13 @@ struct Bufs {
     decay: DeviceBuffer<f32>,
     o: DeviceBuffer<f32>,
     gated: DeviceBuffer<f32>,
-    // A latent mixer's: the projections per token, the heads per chunk.
+    // A latent mixer's: the projections per token, the absorbed heads per
+    // chunk (the query heads and the heads' outputs are the front's rows).
     qa: DeviceBuffer<f32>,
     kv: DeviceBuffer<f32>,
     qr: DeviceBuffer<f32>,
-    q: DeviceBuffer<f32>,
     qabs: DeviceBuffer<f32>,
     att: DeviceBuffer<f32>,
-    av: DeviceBuffer<f32>,
     part_v: DeviceBuffer<f32>,
     part_ms: DeviceBuffer<f32>,
     // The k-pool selector's, per chunk: the indexer query and head weights
@@ -604,22 +604,24 @@ struct Bufs {
     card_h: DeviceBuffer<f32>,
     act_h: Vec<Q8Act>,
     card_down: DeviceBuffer<f32>,
-    /// The GEMM projections of a batch of [`GEMM_FROM`] tokens or more.
+    /// The GEMM projections of a batch of [`GEMM_FROM`] tokens or more, and
+    /// the latent query heads and heads' outputs at any count.
     front: GemmFront,
 }
 
 impl Bufs {
     /// The shared buffers for batches of up to `cap` tokens of `d`'s widths,
-    /// `ff` the widest dense or shared-expert width, `expert_ff` a routed
-    /// expert's, over stores of `ctx` positions, the card downs a batch's
-    /// when `tiered` (a load with an expert tier). The attention's partials
+    /// `ff` the widest dense or shared-expert width, `dense_ff` the widest
+    /// dense block's (0 for none), `expert_ff` a routed expert's, over stores
+    /// of `ctx` positions, the card downs a batch's when `tiered` (a load
+    /// with an expert tier). The attention's partials
     /// cover `ctx` keys: a chunk selects only on stores past the dense
     /// positions, which are a list's width, so they cover a list too.
     /// Load-time or first-prompt only.
     fn new(
         gpu: &Gpu,
         d: &Dims,
-        [ff, expert_ff]: [usize; 2],
+        [ff, dense_ff, expert_ff]: [usize; 3],
         ctx: usize,
         cap: usize,
         tiered: bool,
@@ -659,10 +661,8 @@ impl Bufs {
             qa: z(cap * d.q_lora)?,
             kv: z(cap * kv_width(d))?,
             qr: z(cap * d.q_lora)?,
-            q: z(CHUNK * d.heads * d.head_k)?,
             qabs: z(rows * LATENT)?,
             att: z(rows * LATENT)?,
-            av: z(CHUNK * d.heads * d.head_v)?,
             part_v: z(attn::partials_v_len(rows, segs))?,
             part_ms: z(attn::partials_ms_len(rows, segs))?,
             qi: z(CHUNK * kpool::HEADS * kpool::DIM)?,
@@ -687,9 +687,15 @@ impl Bufs {
                 gpu,
                 FrontShape {
                     cols: cap,
-                    embd: n,
-                    low: head,
-                    gated: v,
+                    widths: FrontWidths {
+                        embd: n,
+                        low: head,
+                        gated: v,
+                        q_low: d.q_lora,
+                        q: d.heads * d.head_k,
+                        heads_v: d.heads * d.head_v,
+                        ff: dense_ff,
+                    },
                 },
             )?,
         })
@@ -716,10 +722,8 @@ impl Bufs {
             &self.qa,
             &self.kv,
             &self.qr,
-            &self.q,
             &self.qabs,
             &self.att,
-            &self.av,
             &self.part_v,
             &self.part_ms,
             &self.qi,
@@ -1457,10 +1461,24 @@ impl Body {
         }
         refuse_dense_after_routed(&self.cfg, self.prompt.group)?;
         let ff = self.cfg.iter().map(|c| c.ff).max().unwrap_or(0);
+        let dense_ff = self
+            .cfg
+            .iter()
+            .filter(|c| c.kind.ffn == FfnKind::Dense)
+            .map(|c| c.ff)
+            .max()
+            .unwrap_or(0);
         let expert_ff = self.card.ff();
         let cap = T_MAX.min(self.ctx);
         let tiered = self.card.tier().is_some();
-        let bufs = Bufs::new(gpu, &self.dims, [ff, expert_ff], self.ctx, cap, tiered)?;
+        let bufs = Bufs::new(
+            gpu,
+            &self.dims,
+            [ff, dense_ff, expert_ff],
+            self.ctx,
+            cap,
+            tiered,
+        )?;
         self.refuse_unreserved(gpu, place::group_sets(self.prompt.group) - 1)?;
         let units = (0..place::group_sets(self.prompt.group))
             .map(|_| UnitBufs::new(gpu, self.dims.embd, cap, tiered))
@@ -2150,7 +2168,9 @@ impl PromptProgram<'_> {
     /// chunk, the query's norm, every token's latent and index rows appended
     /// at its position and the pools the tokens complete, then chunk by chunk
     /// the heads, the selector past the dense positions ([`prompt_keys`]),
-    /// the attention and the output projection.
+    /// the attention and the output projection — from [`GEMM_FROM`] tokens
+    /// the query heads before the chunks and the output projection after
+    /// them on the GEMM, over the front's rows ([`GemmFront::heads_rows`]).
     fn mla(&mut self, l: usize, u: usize) -> Result<(), GpuError> {
         const W: &str = "glm5next prefill mla";
         let (gpu, w, t) = (self.gpu, self.w, self.t[u]);
@@ -2268,6 +2288,11 @@ impl PromptProgram<'_> {
         let first = ub.pos_host[0] as usize;
         let rows = index.rows();
         let kept = d.kept;
+        let gemm = t >= GEMM_FROM;
+        let (hq, hv) = (d.heads * d.head_k, d.heads * d.head_v);
+        if gemm {
+            b.front.latent_q(gpu, w, (l, t), &b.qr, &nm.q_b)?;
+        }
         let (qs_kb, d_kb) = q8(w, &nm.k_b)?;
         let (qs_vb, d_vb) = q8(w, &nm.v_b)?;
         // SAFETY: a view of no rows at the address of the layer's own latent
@@ -2277,16 +2302,26 @@ impl PromptProgram<'_> {
         let window = unsafe {
             DeviceTensor::<u16>::window(latent.buf().cu_deviceptr(), 0, LATENT, gpu.context())
         };
+        let (q, av) = b.front.heads_rows();
         let r = (|| -> Result<(), GpuError> {
             for (c0, c) in chunks(t) {
                 let qr = span(W, &b.qr, c0 * ql, c * ql)?;
-                mcol(gpu, w, &nm.q_b, &qr, c, &mut b.q)?;
+                if !gemm {
+                    mcol(
+                        gpu,
+                        w,
+                        &nm.q_b,
+                        &qr,
+                        c,
+                        &mut *span_mut(W, q, c0 * hq, c * hq)?,
+                    )?;
+                }
                 gpu.q8f32().enqueue_q8_0_gemv_heads_mcol(
                     stream,
                     Q8_0GemvHeadsMcolArgs {
                         qs: qs_kb,
                         d: d_kb,
-                        x: &b.q,
+                        x: &*span(W, q, c0 * hq, c * hq)?,
                         rows_per_head: LATENT,
                         x_head_stride: d.head_k,
                         y_head_stride: LATENT,
@@ -2360,26 +2395,33 @@ impl PromptProgram<'_> {
                         m: c,
                         x_col_stride: d.heads * LATENT,
                         y_col_stride: d.heads * d.head_v,
-                        y: &mut b.av,
+                        y: &mut *span_mut(W, av, c0 * hv, c * hv)?,
                     },
                 )?;
-                mcol(
-                    gpu,
-                    w,
-                    &nm.out,
-                    &b.av,
-                    c,
-                    &mut *span_mut(W, &mut b.out, c0 * n, c * n)?,
-                )?;
+                if !gemm {
+                    mcol(
+                        gpu,
+                        w,
+                        &nm.out,
+                        &*span(W, av, c0 * hv, c * hv)?,
+                        c,
+                        &mut *span_mut(W, &mut b.out, c0 * n, c * n)?,
+                    )?;
+                }
             }
             Ok(())
         })();
         DeviceTensor::release(window);
-        r
+        r?;
+        if gemm {
+            b.front.latent_out(gpu, w, (l, t), &nm.out, &mut b.out)?;
+        }
+        Ok(())
     }
 
     /// Layer `l`'s dense block over unit `u`'s batch: the norm, then by
-    /// chunk the gate·up·SwiGLU and the down projection.
+    /// chunk the gate·up·SwiGLU and the down projection, or from
+    /// [`GEMM_FROM`] tokens the front's ([`GemmFront::dense_ffn`]).
     fn dense(&mut self, l: usize, u: usize) -> Result<(), GpuError> {
         const W: &str = "glm5next prefill dense";
         let (gpu, w, t) = (self.gpu, self.w, self.t[u]);
@@ -2398,6 +2440,18 @@ impl PromptProgram<'_> {
         let n = d.embd;
         gpu.elem()
             .enqueue_rms_norm(stream, &b.x, f32v(w, norm)?, d.rms_eps, n, t, &mut b.xn)?;
+        if t >= GEMM_FROM {
+            return b.front.dense_ffn(
+                gpu,
+                w,
+                l,
+                t,
+                &b.xn,
+                DenseNames { gate, up, down },
+                c.limit,
+                &mut b.out,
+            );
+        }
         let (g, u) = (weight(w, gate)?, weight(w, up)?);
         for (c0, cn) in chunks(t) {
             let xs = span(W, &b.xn, c0 * n, cn * n)?;
