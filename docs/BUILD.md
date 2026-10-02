@@ -101,7 +101,7 @@ Runtime levers are `BLOOMERY_*` environment variables, the rows of `crates/lever
 
 ## Model files
 
-Put each model's download in a directory of its own. The r8 sidecar of V4.1 is written beside that directory (below), and the loaders take the first shard's path and follow the split count from there. Each file is the public upload as downloaded; no conversion runs on it. Clef-Flash is the exception ([below](#clef-flash)).
+Put each model's download in a directory of its own. The r8 sidecar of V4.1 is written beside that directory (below), and the loaders take the first shard's path and follow the split count from there. Each file is the public upload as downloaded; no conversion runs on it.
 
 | Model | Upload | First shard (under the download directory) | Size [derived: the upload's file sizes as the Hugging Face API lists them] |
 |---|---|---|---|
@@ -252,19 +252,16 @@ The same binary opens the Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` file (`unsloth/Qw
 
 ## Clef-Flash
 
-[Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) is Cloudflare's decision model: a Qwen3.5 backbone (`qwen35`, dense) and a small joint schema head that scores every allowed option of every question in one prompt pass. bloomery reads the backbone's Q4_K and Q6_K weights only, and the published Clef GGUFs carry Q8_0 sites, so the file is converted from the BF16 release with llama.cpp mainline (text only, with `--no-mtp`, as the gates ran it):
+[Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) is Cloudflare's decision model: a Qwen3.5 backbone (`qwen35`, dense) and a small joint schema head that scores every allowed option of every question in one prompt pass. The backbone is bartowski's GGUF; the head is the release's own file.
 
 ```sh
-hf download Cloudflare/clef-flash --local-dir ~/models/clef-flash/hf
-python3 <llama.cpp>/convert_hf_to_gguf.py ~/models/clef-flash/hf --no-mtp --outtype bf16 \
-  --outfile ~/models/clef-flash/clef-flash-BF16.gguf
-<llama.cpp>/build/bin/llama-quantize ~/models/clef-flash/clef-flash-BF16.gguf \
-  ~/models/clef-flash/clef-flash-Q4_K_M.gguf Q4_K_M
+hf download bartowski/Cloudflare_clef-flash-GGUF Cloudflare_clef-flash-Q8_0.gguf --local-dir ~/models/clef-flash
+hf download Cloudflare/clef-flash joint_head.safetensors joint_head_config.json --local-dir ~/models/clef-flash/hf
 
 cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features clef --release --bin bloomery_serve_clef
 
 # the backbone on one card (see Picking the card), the head on the host
-target/release/bloomery_serve_clef --model ~/models/clef-flash/clef-flash-Q4_K_M.gguf \
+target/release/bloomery_serve_clef --model ~/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf \
   --head ~/models/clef-flash/hf/joint_head.safetensors --port 8091
 
 curl -s http://127.0.0.1:8091/v1/systemone -d '{"model": "clef-flash",
@@ -273,6 +270,8 @@ curl -s http://127.0.0.1:8091/v1/systemone -d '{"model": "clef-flash",
     "criteria": {"web_search": "Look something up online", "calculator": "Do arithmetic",
                  "calendar": "Read or write events", "none": "Answer directly"}}}}'
 ```
+
+`Cloudflare_clef-flash-Q4_K_M.gguf` from the same upload runs too (smaller, a faster prompt, a little further from the release's probabilities). The backbone reads Q4_K, Q6_K, Q8_0 and F32 weights; the upload's smaller files carry other types (Q5_K, Q3_K, the IQ types), which it refuses by name before loading.
 
 The request and the response are the release's SystemOne format (its `README.md`): question types `choice`, `noul` and `score`, and per question the chosen option with its probabilities. Each response adds `timings` (`prompt_n`, `prompt_ms`, `head_ms`, `cache_n`). `GET /props` names the engine, the build, the model file, its quant and the head file. Flags: `--host` (default `127.0.0.1`), `--port` (default 8091), `--ctx` (default 16384, the release's `max_length`), `--head-config` (default: `joint_head_config.json` beside `--head`). It serves one request at a time and takes text states only.
 
