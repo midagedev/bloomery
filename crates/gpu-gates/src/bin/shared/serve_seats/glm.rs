@@ -124,7 +124,7 @@ use bloomery_levers::{
     GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
 };
 use gguf::Split;
-use model::arch::glm5next::place::{NextnInputs, PlanInputs};
+use model::arch::glm5next::place::{NextnInputs, PROMPT_GROUP, PlanInputs};
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{HostNeed, TierBatchBytes, host_available};
 use model::placement::{Machine, Plan, PlanLevers};
@@ -469,7 +469,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             place: plan_levers,
             host: levers.host(),
             prefill: a.prefill,
-            group: 1,
+            group: PROMPT_GROUP,
         },
         pin_main: levers.pin_main(),
         path: path.clone(),
@@ -559,6 +559,7 @@ impl Glm {
             place: a.place.name(),
             placement: a.place,
             prefill: a.cfg.prefill,
+            group: a.cfg.group,
             ctx: a.ctx,
             pin_main: a.pin_main,
             pinned,
@@ -645,6 +646,8 @@ struct Log {
     /// The placement, whose cards the `load` record names.
     placement: Place,
     prefill: PrefillMode,
+    /// The batches a prompt group runs (`GlmCfg::group`).
+    group: usize,
     ctx: usize,
     pin_main: bool,
     pinned: bool,
@@ -681,6 +684,7 @@ impl OpenLog<Body> for Log {
         with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
             .map_err(app::SessionError::Caller)?
             .w("prefill", self.prefill.name())
+            .u("group", self.group)
             .w("mode", mode_name(StepMode::Graph))
             .w("place", self.place)
             .w("pin_main", if self.pin_main { "on" } else { "off" })

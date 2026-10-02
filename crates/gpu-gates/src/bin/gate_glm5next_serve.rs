@@ -36,6 +36,9 @@
 //!   one step, and so does the CLI (`--last-step`) — the same batches, so
 //!   the same bits (a batch past a chunk runs the GEMM, not the steps'
 //!   gemvs);
+//! - the server's `load` record and the CLI's, both under
+//!   `BLOOMERY_PREFILL_GROUP` unset, print `group=` the group the plan
+//!   reserves the prompt units for (`place::PROMPT_GROUP`);
 //! - `POST /residency/reset` is the server's 501 (no machine);
 //! - then a third load, the server under `BLOOMERY_DRAFT=mtp
 //!   BLOOMERY_RESIDENCY=off`: it prints `load draft=mtp` and no `residency
@@ -121,7 +124,7 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
-    use model::arch::glm5next::place::{NextnInputs, PlanInputs};
+    use model::arch::glm5next::place::{NextnInputs, PROMPT_GROUP, PlanInputs};
     use model::placement::{PlanLevers, workstation};
     use serde_json::{Value, json};
 
@@ -335,6 +338,15 @@ mod gate {
             .iter()
             .find(|l| l.starts_with(&prefix))
             .map(String::as_str)
+    }
+
+    /// The `group=` of the `load` record in `lines` (the generator's, which
+    /// opens with `resident_bytes=`).
+    fn load_group(lines: &[String]) -> Option<&str> {
+        lines
+            .iter()
+            .find(|l| l.starts_with("load resident_bytes="))
+            .and_then(|l| field(l, "group"))
     }
 
     /// The value of `key=` in a record line.
@@ -706,12 +718,20 @@ mod gate {
         println!("plain residency reset: HTTP {st} {body}");
         check(&mut ok, "plain_residency_reset_is_501", st == 501);
         println!("plain server stopped: {}", served.stop()?);
-        let (reference, _) = cli(dir, PLAIN, &ids, true)?;
+        let (reference, cli_lines) = cli(dir, PLAIN, &ids, true)?;
         println!("generate_glm5next tokens {reference:?}");
         check(
             &mut ok,
             "plain_ids_are_generate_glm5next",
             agree(&got, &stop, &reference),
+        );
+        let (seat, cli_group) = (load_group(&load), load_group(&cli_lines));
+        println!("plain load groups: the seat's {seat:?}, generate_glm5next's {cli_group:?}");
+        let want = PROMPT_GROUP.to_string();
+        check(
+            &mut ok,
+            "plain_loads_run_the_reserved_group",
+            seat == Some(want.as_str()) && cli_group == Some(want.as_str()),
         );
         ok &= draft_only(dir, &ids, &reference)?;
         Ok(ok)

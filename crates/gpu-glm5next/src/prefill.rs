@@ -538,12 +538,15 @@ impl UnitBufs {
 }
 
 /// Card bytes of one unit's buffers ([`UnitBufs`]) for up to `cap` tokens of
-/// `n` values, the tier places when `tiered`: per token the two stream
-/// buffers, the feed-forward mix, the position, the live and the two visible
-/// counts, the route's weights and the tier places, four bytes a value.
+/// `n` values, the tier places when `tiered`: [`place::unit_bytes`] at the
+/// body's streams and routed experts a token, the formula the plan reserves
+/// a group's units by ([`place::prompt_reserve_bytes`]).
 fn unit_bytes(n: usize, cap: usize, tiered: bool) -> usize {
-    4 * cap * (2 * HC_STREAMS * n + HC_MIX + 4 + N_USED + if tiered { N_USED } else { 0 })
+    place::unit_bytes(n, cap, HC_STREAMS, N_USED, tiered)
 }
+
+// The feed-forward mix `place::unit_bytes` counts is the hyper-connection's.
+const _: () = assert!(HC_MIX == (2 + HC_STREAMS) * HC_STREAMS);
 
 /// Every buffer a group's units share besides the stores, for up to `cap`
 /// tokens where a launch takes the batch whole and [`CHUNK`] where it takes
@@ -1493,10 +1496,11 @@ impl Body {
     }
 
     /// Refused by name when `units` more units of a group ([`unit_bytes`]
-    /// each) pass the card's free device bytes: the plan reserves nothing
-    /// for a group's units past the first, so they come out of what the load
-    /// left free, its margin included, and a group that does not fit is
-    /// refused here, not by the driver.
+    /// each) pass the card's free device bytes: the plan reserves the units
+    /// a group of [`place::PROMPT_GROUP`] holds past the first
+    /// ([`place::prompt_reserve_bytes`]), and a larger group's come out of
+    /// what the load left free, its margin included, so a group that does
+    /// not fit is refused here, not by the driver.
     fn refuse_unreserved(&self, gpu: &Gpu, units: usize) -> Result<(), GpuError> {
         if units == 0 {
             return Ok(());
@@ -1509,8 +1513,9 @@ impl Body {
         }
         Err(shape(format!(
             "a prompt group of {} batches: {units} more units take {extra} B, and the card has \
-             {free} B free; the plan reserves none for a group's units past the first",
-            self.prompt.group
+             {free} B free; the plan reserves a group's units only up to a group of {}",
+            self.prompt.group,
+            place::PROMPT_GROUP
         )))
     }
 

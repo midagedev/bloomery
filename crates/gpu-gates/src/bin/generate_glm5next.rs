@@ -118,8 +118,9 @@
 //! by name beside the MTP draft.
 //!
 //! `BLOOMERY_PREFILL_GROUP` sets the batches a prompt group runs layer by
-//! layer (`bloomery_gpu_glm5next::set_prefill_group`), 1 unset; the `load`
-//! line prints it as `group=`.
+//! layer (`bloomery_gpu_glm5next::set_prefill_group`), the registry's 2
+//! unset, whose units the plan reserves (`place::prompt_reserve_bytes`). The
+//! `load` line prints it as `group=`.
 //!
 //! `BLOOMERY_ROUTE_TRACE=<dir>` writes the engine's route trace of the run
 //! into `dir`, a new directory made before the load
@@ -458,11 +459,12 @@ mod cli {
                     .into(),
             );
         }
+        let group = levers.prefill_group();
         let cfg = GlmCfg {
             place: PlanLevers::from_levers(&levers)?,
             host: levers.host(),
             prefill,
-            group: levers.prefill_group_set().unwrap_or(1),
+            group,
         };
         let mut log = Log {
             top_k: 0,
@@ -470,7 +472,7 @@ mod cli {
             placement,
             mode,
             prefill,
-            group: levers.prefill_group_set().unwrap_or(1),
+            group,
             ctx,
             stop_at_plan: has("--plan"),
             t,

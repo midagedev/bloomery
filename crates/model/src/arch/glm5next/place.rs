@@ -162,13 +162,54 @@ pub fn front_widths(hp: &Hparams) -> FrontWidths {
 /// positions makes on the stage card ([`front_bytes`]): batches of up to the
 /// host union's columns or the context, whichever is fewer, at the load's
 /// widths ([`front_widths`]). The plan reserves them on the stage card
-/// ([`PlanInputs::plan_lanes`]).
+/// ([`prompt_reserve_bytes`], [`PlanInputs::plan_lanes`]).
 #[must_use]
 pub fn prompt_front_bytes(hp: &Hparams, ctx_max: u64) -> u64 {
-    let cols = usize::try_from(ctx_max).map_or(crate::moe::UNION_MAX_COLS, |c| {
+    front_bytes(prompt_cols(ctx_max), front_widths(hp)) as u64
+}
+
+/// The columns a prompt batch of a load at `ctx_max` positions is made for:
+/// the host union's, or the context when it holds fewer.
+fn prompt_cols(ctx_max: u64) -> usize {
+    usize::try_from(ctx_max).map_or(crate::moe::UNION_MAX_COLS, |c| {
         c.min(crate::moe::UNION_MAX_COLS)
-    });
-    front_bytes(cols, front_widths(hp)) as u64
+    })
+}
+
+/// The group the plan reserves a prompt batch's units for: the group
+/// lever's default (`BLOOMERY_PREFILL_GROUP` unset). A load run at a larger
+/// group takes the units past these out of the card's margin.
+pub const PROMPT_GROUP: usize = bloomery_levers::PREFILL_GROUP_DEFAULT as usize;
+
+/// Card bytes of one prompt group unit for up to `cap` tokens of `n` values,
+/// `streams` hyper-connection streams and `used` routed experts a token, the
+/// tier places when `tiered`: per token the two stream buffers, the
+/// feed-forward sub-layer's mix (`(2 + streams) · streams` values), the
+/// position, the live and the two visible counts, the route's weights and
+/// the tier places, four bytes a value. The one formula of those bytes: the
+/// card body's units check their made bytes against it.
+#[must_use]
+pub const fn unit_bytes(n: usize, cap: usize, streams: usize, used: usize, tiered: bool) -> usize {
+    let places = if tiered { used } else { 0 };
+    4 * cap * (2 * streams * n + (2 + streams) * streams + 4 + used + places)
+}
+
+/// The card bytes the plan reserves on the stage card for a load of `hp`'s
+/// prompt batch at `ctx_max` positions: its GEMM front
+/// ([`prompt_front_bytes`]) and the units a group of [`PROMPT_GROUP`] holds
+/// past the first ([`group_sets`], [`unit_bytes`] at the front's columns,
+/// the tier places when `tiered`). The first unit and the buffers the units
+/// share but the front come out of the card's margin.
+#[must_use]
+pub fn prompt_reserve_bytes(hp: &Hparams, ctx_max: u64, tiered: bool) -> u64 {
+    let unit = unit_bytes(
+        hp.n_embd,
+        prompt_cols(ctx_max),
+        hp.hc.streams,
+        hp.n_used,
+        tiered,
+    );
+    prompt_front_bytes(hp, ctx_max) + ((group_sets(PROMPT_GROUP) - 1) * unit) as u64
 }
 
 /// Batches a prompt group holds at most under a group lever of `g`
@@ -238,13 +279,14 @@ pub enum PlaceError {
     )]
     NextnCards { cards: usize },
     /// A stage card whose plan leaves less beside it than the prompt
-    /// batch's GEMM front ([`prompt_front_bytes`]) takes: the dense
-    /// granules, the cache, context, scratch, reserves and margin already
-    /// pass what the card holds less the front, so no expert placement
+    /// batch's GEMM front and group units ([`prompt_reserve_bytes`]) take:
+    /// the dense granules, the cache, context, scratch, reserves and margin
+    /// already pass what the card holds less them, so no expert placement
     /// makes room.
     #[error(
-        "card {card}: the prompt batch's GEMM front takes {front} B, and the plan leaves {left} B \
-         beside its dense granules, cache, context, scratch, reserves and margin ({short} B short)"
+        "card {card}: the prompt batch's GEMM front and group units take {front} B, and the plan \
+         leaves {left} B beside its dense granules, cache, context, scratch, reserves and margin \
+         ({short} B short)"
     )]
     FrontOver {
         card: String,
@@ -254,10 +296,10 @@ pub enum PlaceError {
     },
 }
 
-/// The prompt batch's GEMM front `front` beside `total` bytes of a plan's
-/// terms on `card`, `limit` its usable bytes less its margin: refused by
-/// name when the terms fit alone and the front does not fit beside them
-/// (terms past the limit are the plan's own violation).
+/// The prompt batch's reserve `front` ([`prompt_reserve_bytes`]) beside
+/// `total` bytes of a plan's terms on `card`, `limit` its usable bytes less
+/// its margin: refused by name when the terms fit alone and the reserve does
+/// not fit beside them (terms past the limit are the plan's own violation).
 fn refuse_front(card: &Card, total: u64, limit: u64, front: u64) -> Result<(), PlaceError> {
     match limit.checked_sub(total) {
         Some(left) if front > left => Err(PlaceError::FrontOver {
@@ -356,9 +398,9 @@ impl PlanInputs {
     /// the placement's `levers`, each KDA layer's state `lanes` lanes: the
     /// expert rule on the layers whose routed stacks [`card_routed`] runs,
     /// each layer's id prefix, within the stage card's budget less the
-    /// prompt batch's GEMM front ([`prompt_front_bytes`]); refused past
-    /// [`ORACLE_POSITIONS`], when it cannot be built, when it breaks an
-    /// invariant, and by name when the front does not fit beside the rest
+    /// prompt batch's GEMM front and group units ([`prompt_reserve_bytes`]);
+    /// refused past [`ORACLE_POSITIONS`], when it cannot be built, when it
+    /// breaks an invariant, and by name when they do not fit beside the rest
     /// ([`PlaceError::FrontOver`]).
     pub fn plan_lanes<'a>(
         &'a self,
@@ -374,7 +416,7 @@ impl PlanInputs {
             });
         }
         let kv = self.kv.with_lanes(lanes);
-        let front = prompt_front_bytes(&self.hp, ctx_max);
+        let front = prompt_reserve_bytes(&self.hp, ctx_max, !machine.tiers.is_empty());
         let plan = placement::plan_routed_reserving(
             &self.model,
             machine,
@@ -563,8 +605,8 @@ pub struct NextnPlan<'a> {
     /// [`NEXTN_ARENA_BYTES`], counted beside the NextN layer's card bytes.
     pub arena_bytes: u64,
     /// The card's usable bytes (capped by the card budget) less the target's
-    /// and the NextN layer's card terms and the prompt batch's GEMM front;
-    /// the margin is inside it.
+    /// and the NextN layer's card terms and the prompt batch's GEMM front and
+    /// group units; the margin is inside it.
     pub headroom_bytes: i128,
     /// The host's headroom less the NextN layer's routed experts.
     pub host_headroom_bytes: i128,
@@ -638,10 +680,11 @@ impl PlanInputs {
     /// [`PlanInputs::plan`] with the next-token layer `nextn` loaded on the
     /// machine's one card: the NextN layer's own plan (its routed stacks on
     /// the host), the target's expert rule within the card's budget less the
-    /// NextN layer's card bytes and arena and the prompt batch's GEMM front,
-    /// each KDA layer's state two lanes ([`KdaLanes::Two`]: the load verifies
-    /// the draft's rows), the card's bound checked on the sum (the front
-    /// named, [`PlaceError::FrontOver`]) and the host's on the target's host
+    /// NextN layer's card bytes and arena and the prompt batch's GEMM front
+    /// and group units ([`prompt_reserve_bytes`]), each KDA layer's state
+    /// two lanes ([`KdaLanes::Two`]: the load verifies the draft's rows), the
+    /// card's bound checked on the sum (the reserve named,
+    /// [`PlaceError::FrontOver`]) and the host's on the target's host
     /// set and the NextN layer's routed experts. Refused as
     /// [`PlanInputs::plan`] refuses and on a
     /// machine of other than one card; every violation of either plan is
@@ -672,7 +715,7 @@ impl PlanInputs {
             &PlanLevers::default(),
         )?;
         let arena = NEXTN_ARENA_BYTES;
-        let front = prompt_front_bytes(&self.hp, ctx_max);
+        let front = prompt_reserve_bytes(&self.hp, ctx_max, !machine.tiers.is_empty());
         let reserve = nextn_card_bytes(&draft.cards[0]) + arena + front;
         let kv = self.kv.with_lanes(KdaLanes::Two);
         let plan = placement::plan_routed_reserving(
@@ -819,7 +862,8 @@ impl KvBytes for KvLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        KdaLanes, Kind, KvBytes, KvLayout, group_sets, groups, recurrent_bytes, row_bytes,
+        KdaLanes, Kind, KvBytes, KvLayout, PROMPT_GROUP, group_sets, groups, recurrent_bytes,
+        row_bytes, unit_bytes,
     };
 
     /// A call's batches cut into groups: runs of `g`, a lone last batch
@@ -850,6 +894,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A prompt group unit at GLM-5.3-Flash's sizes (4,096 values, four
+    /// streams, eight routed experts a token, 512 columns) is the bytes the
+    /// card body's units make (the `prefill units` line's `unit_bytes`), the
+    /// tier places a word a slot more; the plan reserves the two a group of
+    /// `PROMPT_GROUP` holds past the first.
+    #[test]
+    fn prompt_unit_bytes() {
+        assert_eq!(unit_bytes(4096, 512, 4, 8, false), 67_182_592);
+        assert_eq!(unit_bytes(4096, 512, 4, 8, true), 67_182_592 + 4 * 512 * 8);
+        assert_eq!(group_sets(PROMPT_GROUP) - 1, 2);
     }
 
     /// GLM-5.3-Flash's sizes: a KDA layer holds one lane of 64 heads of 128

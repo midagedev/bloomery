@@ -20,8 +20,8 @@
 //!   pinned ones, which the host set must hold too — is refused by name
 //!   before anything loads, within [`REFUSE_BOUND_S`] (mutant: the churn
 //!   pool check removed from the load).
-//! - `front-refuse` (the prompt batch's GEMM front in the plan,
-//!   `place::prompt_front_bytes`): the gate card one byte short of the
+//! - `front-refuse` (the prompt batch's GEMM front and group units in the
+//!   plan, `place::prompt_reserve_bytes`): the gate card one byte short of the
 //!   plan's floor — its dense granules, cache, context, scratch, reserves,
 //!   margin and the front, found from the plan's own shortfalls — is
 //!   refused by name, the front and its bytes named, by the planner and by
@@ -130,7 +130,7 @@ mod gate {
     use gguf::quant::GgmlType;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{
-        NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_front_bytes,
+        NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_reserve_bytes,
     };
     use model::placement::churn::ChurnPool;
     use model::placement::{Machine, ModelTensors, Plan, PlanLevers, Violation, workstation};
@@ -377,7 +377,8 @@ mod gate {
     }
 
     /// `front-refuse` (module header): the gate card's floor with the prompt
-    /// batch's GEMM front found from the plan's own shortfalls, from a guess
+    /// batch's GEMM front and group units found from the plan's own
+    /// shortfalls, from a guess
     /// at or under it (the plan's card terms but its experts and rounding,
     /// the margin and the front): each refusal adds the bytes it names, so
     /// the walk lands on the floor.
@@ -390,7 +391,7 @@ mod gate {
         residency: Residency,
     ) -> Result<bool, GateError> {
         let place = PlanLevers::from_levers(levers)?;
-        let front = prompt_front_bytes(&inputs.hp, CTX as u64);
+        let front = prompt_reserve_bytes(&inputs.hp, CTX as u64, false);
         let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) else {
             return Err("the gate machine has no stage card".into());
         };
@@ -465,8 +466,9 @@ mod gate {
         };
         let ok = front > 0 && at_floor.is_ok() && named && refused;
         println!(
-            "front-refuse: the GEMM front {front} B in the plan of the {} card: its floor {floor} B \
-             ({walked} plans) plans with {} card experts; one byte under it the planner {}; \
+            "front-refuse: the GEMM front and group units {front} B in the plan of the {} card: \
+             its floor {floor} B ({walked} plans) plans with {} card experts; one byte under it \
+             the planner {}; \
              open_resident under {} there in {secs:.1} s — {why}: {}",
             card.name,
             at_floor.map_or_else(|e| format!("no ({e})"), |n| n.to_string()),

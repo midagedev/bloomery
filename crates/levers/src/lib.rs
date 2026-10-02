@@ -31,7 +31,8 @@ use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
     HOSTSTREAM, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WINDOWS, PIN_MAIN, PREFILL, PREFILL_GROUP,
-    PREFILL_GROUP_MAX, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN,
+    STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -703,22 +704,12 @@ impl Levers {
         Levers::defaulted(PREFILL, self.word(PREFILL))
     }
 
-    /// `BLOOMERY_PREFILL_GROUP`: batches a V4.1 prompt group holds, 1 to
-    /// [`PREFILL_GROUP_MAX`].
+    /// `BLOOMERY_PREFILL_GROUP`: batches a V4.1 or GLM-5.3 prompt group
+    /// holds, 1 to [`PREFILL_GROUP_MAX`].
     #[must_use]
     pub fn prefill_group(&self) -> usize {
         let n = Levers::defaulted(PREFILL_GROUP, self.count(PREFILL_GROUP));
         Levers::usize_of(PREFILL_GROUP, n)
-    }
-
-    /// `BLOOMERY_PREFILL_GROUP` as set, `None` unset: a binary whose own
-    /// default differs from the row's (GLM-5.3's 1) reads it here.
-    #[must_use]
-    pub fn prefill_group_set(&self) -> Option<usize> {
-        self.entry(PREFILL_GROUP)
-            .set
-            .as_ref()
-            .map(|_| self.prefill_group())
     }
 
     /// `BLOOMERY_ENGRAM_HELPER`: V4.1 step rows read by a helper thread.

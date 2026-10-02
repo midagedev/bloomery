@@ -1,0 +1,48 @@
+# Round glmpp3: GLM-5.3-Flash's prompt groups of two by default (BLOOMERY_PREFILL_GROUP unset runs the registry's
+# 2, as V4.1 does), the plan reserving the two units a group of two holds past the first
+# (place::prompt_reserve_bytes: the GEMM front and 2 x unit_bytes = 134,365,184 B at 512 columns, 9..11 card
+# experts at 15.2 MB; the gate plan's e2e slot-map line moved 926 -> 915). Against the base, glmunion's commit
+# (1795d258, main at the sitting), whose GLM loads run groups of one.
+# Decomposition [derived, round report section 1]. At G1 a routed layer-batch is the card front, then
+# max(host union + exchange 1.1, card shadow): F_KDA 5.8, F_latent 15 + 3.54 ms a batch of depth, union 48.6 ms
+# (the lane law of the 3090 diagnostic, 10.74 us a slot + 72.2 us an expert, Q6_K layers x1.43) + 3.7 ms
+# unattributed, 28 ms a batch outside the leg spans; the model gives 2764 ms a batch at P = 4096 against the
+# sitting's 2764 (185.23 tok/s). At G2 two units are in flight, and a layer's period is
+# max(one unit's loop F + max(U, S) + 1.1, the host's 2U, the card's 2(F + S + 1)): 233 of 336 layer-batches are
+# host-bound (the KDA layers: the front and exchange hide under the other unit's union), 103 card-bound (the
+# latent layers at depth). The model holds glmgroup's measured G2 walk (34.15 s at P = 4096 before the GEMM front
+# and lanes) to -2.9..+3.1 % over the band of how much the card's spans swell when two units share it
+# (front x1.028, shadow x1.00..x1.15, union x1.016, from glmgroup's G2 rows against its G1 rows).
+# pp4096 2764 -> 2427..2561 ms a batch = 200..211 tok/s (+8..+14 %). pp512 is one batch, a group of one under
+# either lever: its path is the base's but for the 9..11 card experts the reserve takes (derived -0.3..0 %), and so
+# is decode's (host slots +0.1 %: derived, under the ruler).
+kind: ab
+question: do two batches in flight hide the card front and the exchange under the other batch's host union on
+  the KDA layers, and the union under the card on the latent ones, now that the union is the lane kernel's?
+term: pp tok/s @ P = 4096, prose prompt (GLM_PROSE from GLM_PROSE_FROM), A6000, plan (a), --ctx 4352, each arm's
+  own default group (BLOOMERY_PREFILL_GROUP unset: the base runs 1, this round 2) - (glmpp3 - base) / base,
+  paired by round across the two invocations
+unit: %
+predict: +8..+14
+rounds: 2
+condition: one hold, two runner invocations back to back, each carrying this card: the base from a tree at
+  1795d258 (/Users/hckim/repo/bloomery-pp3base, its own remote dir), then this round's from /Users/hckim/repo/bloomery-glmpp3
+  (BLOOMERY_REMOTE='~/repo/bloomery-glmpp3'), each BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4352 BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmpp3-pp.card'
+  just depth-gpu-glm5next 512 4096, BLOOMERY_PREFILL_GROUP unset in both. Every row's load line prints group=1
+  (base) or group=2 (this round), and its time prompt record kind=batch with 1 pass at P = 512 and 8 at 4096;
+  this round's plan line prints 9..11 card experts fewer than the base's (the reserve: 2603 at ctx 4352 here),
+  nothing else on the plan moves. A row marked [cold], [cpu-busy] or [other-busy] is void, and so is a window whose card witness or
+  cpu-freq differs between the two invocations. The pp512 and decode rows must agree with the base's within the
+  window's ~5 % (one batch is a group of one under either lever). Box time ~14..20 min [derived: per invocation
+  two warm-up processes and four rows, six loads at 45..75 s, 2 x (4 + 22..25) s of prompt; plus the two builds]
+decide-in: land it; G2 is then the floor of the flow at 512-position units: the KDA layers bound by the host
+  union, the latent ones by the card. The next prompt terms are the union's per-expert term (72 us an expert,
+  a quarter of the union: the pack and the expert's bytes), the Q6_K layers' downs (x1.43), and on the latent
+  layers at G2 the card's shared expert and k_b, v_b
+decide-below: under +8 %: the card's two streams slow each other more than the shadow's x1.15 span swell says,
+  or the KDA layers are not host-bound: run one BLOOMERY_STEP_STATS=1 P = 4096 row at G2 on this tree and read
+  wait_ms (the host idle on the card) per layer kind against card_front_ms + card_shadow_ms before landing
+decide-above: past +14 %: the 3.7 ms a layer-batch the lane law leaves unattributed sat in the card front (the
+  fronts then hide whole at G2), or the checkpoint waits fell as glmgroup's G2 run showed (220 against 462 ms):
+  read ckpt_ms from one G2 stats row and refit; land either way

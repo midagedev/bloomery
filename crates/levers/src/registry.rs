@@ -37,6 +37,10 @@ pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 /// holds at most, which the body's buffers are sized for.
 pub const PREFILL_GROUP_MAX: u64 = 8;
 
+/// `BLOOMERY_PREFILL_GROUP` unset: the row's default, the group GLM-5.3's
+/// plan reserves a prompt batch's units for.
+pub const PREFILL_GROUP_DEFAULT: u64 = 2;
+
 /// The rounds that convert the levers still read in place.
 const R03: &str = "[03]";
 const V2FENCE: &str = "v2fence";
@@ -139,10 +143,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "V4.1 and GLM-5.3: the batches a prompt group runs layer by layer, each \
               layer-batch's route enqueued ahead of the previous one's host serve; 1 runs \
               each batch alone, the same-binary arm, and both write the same bits. The \
-              `load` line prints `group=`. GLM-5.3 unset runs 1: 2 or more is opt-in, its \
-              units past the first (each about two stream buffers) not reserved by the plan \
-              yet, so they come out of the card's margin, refused by name past its free \
-              bytes; the `prefill units` line prints what they took and what stayed free.",
+              `load` line prints `group=`. GLM-5.3's plan reserves the units a group of 2 \
+              holds (each about two stream buffers); a group past 2 takes its further units \
+              out of the card's margin, refused by name past its free bytes; the `prefill \
+              units` line prints what they took and what stayed free.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

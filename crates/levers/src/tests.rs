@@ -147,6 +147,21 @@ fn garbage(kind: Kind) -> Vec<String> {
     g
 }
 
+/// `BLOOMERY_PREFILL_GROUP`'s row defaults to [`PREFILL_GROUP_DEFAULT`],
+/// the group GLM-5.3's plan reserves its prompt units for.
+#[test]
+fn prefill_group_default_is_the_rows() {
+    let row = REGISTRY.iter().find(|r| r.name == PREFILL_GROUP);
+    let Some(LeverSpec {
+        default: Unset::Is(d),
+        ..
+    }) = row
+    else {
+        panic!("{PREFILL_GROUP} has no default value: {row:?}");
+    };
+    assert_eq!(*d, PREFILL_GROUP_DEFAULT.to_string());
+}
+
 /// Every name is a `BLOOMERY_*` variable, and no two rows share one.
 #[test]
 fn names_are_unique() {
