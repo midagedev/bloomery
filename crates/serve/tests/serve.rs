@@ -928,7 +928,7 @@ fn hw_props_engine_object() {
     argv.extend(args.iter().map(|a| (*a).to_owned()));
     assert_eq!(e["args"], json!(argv), "{e}");
     assert_eq!(e["server_pid"], served.0.id(), "{e}");
-    for key in ["model", "placement", "draft"] {
+    for key in ["model", "placement", "draft", "ctx_verified"] {
         assert!(e.get(key).is_none(), "the mock reports no {key}: {e}");
     }
 }

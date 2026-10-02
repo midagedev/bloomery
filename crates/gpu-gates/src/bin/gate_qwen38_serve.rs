@@ -15,7 +15,8 @@
 //!   counts as the header states them; a card `GPU<n>` and the host `CPU`,
 //!   each device's `bytes` the sum of its classes and equal to the plan's
 //!   card (dense + experts) and host (experts + tables) bytes; the cards' KV
-//!   bytes; no draft;
+//!   bytes; no draft; `ctx_verified` the deepest reference set's
+//!   positions (`refset::arch::qwen4exp::VERIFIED_POSITIONS`);
 //! - `/completion` of `--prompt` at temperature 0 with `return_tokens`: its
 //!   ids are `generate_qwen3moe --tokens <--ids> -n 16`'s `tokens` line — all
 //!   16, or a prefix ending in the end-of-generation id when the server
@@ -42,8 +43,11 @@
 //!   rows past the reply) and gives the ids of the same session run with no
 //!   switch; a resend with the reply's reasoning stripped keeps the
 //!   checkpoint at the first turn's end and gives a fresh run's ids; under
-//!   the draft every request that kept a checkpoint by a cut drafts nothing
-//!   and says why by name;
+//!   the draft a cut keeps that checkpoint only at or past the seat's
+//!   break-even for the reply (its `draft keep` line), drafting nothing and
+//!   saying why by name, and below it resets with the draft on; both sides
+//!   of the break-even at the turn's end, by reply length, each with a fresh
+//!   run's ids and its `mtp keep` record;
 //! - under `BLOOMERY_DRAFT=mtp`, requests that extend the sequence the
 //!   server holds (`continued`): each keeps the held prefix (`cache_n`), a
 //!   prompt call past it prints one `mtp prompt` record — the draft caught
@@ -64,8 +68,10 @@
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default
 //!   ([`CTX`]), the largest context the card holds with its card expert
 //!   bytes and the largest within the plan's margin, before its load, each
-//!   the rule's against this gate's own plans (stopped there), and one asked for a position past the largest
-//!   context the card holds is refused by name before it listens;
+//!   the rule's against this gate's own plans (stopped there), the fit
+//!   at most the file's serving cap (`place::serve_ctx`), and one asked for
+//!   a position past the fit is refused by name before it listens (the
+//!   card's rule, or the cap's when the card holds more);
 //! - `residency`: `bloomery-serve-qwen38` with the same arguments under
 //!   `BLOOMERY_RESIDENCY=mid-p0-s1` (`BLOOMERY_DRAFT=off`, the MTP levers
 //!   removed; the word set explicitly, one the lever takes): it loads and
@@ -121,12 +127,13 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
-    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, PlanInputs, machine_for_experts, read_head_rows,
+        Experts, MtpInputs, PlanInputs, machine_for_experts, serve_ctx,
     };
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
+    use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
     use serde_json::{Value, json};
 
@@ -190,6 +197,24 @@ mod gate {
     const STRIPPED_A: &str = "The Rhine, the Danube and the Elbe; the Danube is the longest.\
                               <|im_end|>\n<|im_start|>user\nAnd which of them reaches the sea \
                               first?<|im_end|>\n<|im_start|>assistant\n";
+    /// The break-even clause's two sessions, one a side, each a first turn and
+    /// the text it resends in place of its reply: no other clause sends them,
+    /// so no state the prompt cache holds shares more than their turn.
+    const BREAK_EVEN_TURNS: [(&str, &str); 2] = [
+        (
+            "Name three mountains of the Alps and say in one sentence which of them is the \
+             highest.",
+            "Mont Blanc, the Matterhorn and the Eiger; Mont Blanc is the highest.<|im_end|>\n\
+             <|im_start|>user\nAnd which of them was climbed first?<|im_end|>\n\
+             <|im_start|>assistant\n",
+        ),
+        (
+            "Name three lakes of Italy and say in one sentence which of them is the largest.",
+            "Lake Garda, Lake Como and Lake Maggiore; Lake Garda is the largest.<|im_end|>\n\
+             <|im_start|>user\nAnd which of them lies furthest north?<|im_end|>\n\
+             <|im_start|>assistant\n",
+        ),
+    ];
     /// The words of the seat's line that says the MTP draft proposes nothing
     /// after a cut or a state put back.
     const DRAFT_OFF: &str = "the MTP draft proposes nothing from position";
@@ -386,10 +411,6 @@ mod gate {
         // row map and its program's arena beside the target's card terms),
         // and `/props` files its bytes as the card's `draft` class.
         let levers_plan = PlanLevers::from_levers(levers)?;
-        let rows = match levers.mtp_head_rows() {
-            Some(p) => Some(read_head_rows(p, &split, inputs.spec.vocab)?),
-            None => None,
-        };
         let (draft_path, from) = draft_file(levers.mtp_draft(), &path);
         let terms = |dense: u64, experts_at: u64, host: u64, tables: u64, kv: u64, draft: u64| {
             (dense + experts_at + draft, host + tables, kv, draft)
@@ -409,7 +430,7 @@ mod gate {
                 )
             }
             true => {
-                let rows = rows.unwrap_or(HeadRows::Full);
+                let rows = head_rows_of(levers.mtp_head_rows(), &split, inputs.spec.vocab)?.rows;
                 let draft = Split::open(&draft_path).map_err(|e| {
                     format!(
                         "open the MTP draft {} ({}): {e}",
@@ -515,6 +536,11 @@ mod gate {
             "props_engine_vram_kv",
             e["placement"]["vram_kv_bytes"] == json!(kv),
         );
+        check(
+            &mut ok,
+            "props_engine_ctx_verified",
+            e["ctx_verified"] == json!(VERIFIED_POSITIONS),
+        );
         match mtp {
             false => check(&mut ok, "props_engine_no_draft", e.get("draft").is_none()),
             true => {
@@ -577,13 +603,72 @@ mod gate {
         Ok(ok)
     }
 
-    /// The `mtp prompt` records on the server's stderr so far.
-    fn mtp_prompts(err_log: &Path) -> Result<Vec<String>, GateError> {
+    /// The records on the server's stderr so far whose line starts with
+    /// `head` and a space.
+    fn records(err_log: &Path, head: &str) -> Result<Vec<String>, GateError> {
+        let prefix = format!("{head} ");
         Ok(std::fs::read_to_string(err_log)?
             .lines()
-            .filter(|l| l.starts_with("mtp prompt "))
+            .filter(|l| l.starts_with(&prefix))
             .map(str::to_owned)
             .collect())
+    }
+
+    /// The `mtp prompt` records on the server's stderr so far.
+    fn mtp_prompts(err_log: &Path) -> Result<Vec<String>, GateError> {
+        records(err_log, "mtp prompt")
+    }
+
+    /// The drafted seat's break-even as its `draft keep` line prints it: the
+    /// ids a reply token and the most reply tokens it weighs.
+    #[derive(Clone, Copy)]
+    struct Keep38 {
+        per_token: f64,
+        nominal: usize,
+    }
+
+    impl Keep38 {
+        fn read(err_log: &Path) -> Result<Keep38, GateError> {
+            let line = record_line(err_log, "draft keep")?
+                .ok_or("the drafted server printed no `draft keep` line")?;
+            let field = |k: &str| {
+                line.split_whitespace()
+                    .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
+            };
+            match (
+                field("per_reply_token").and_then(|v| v.parse::<f64>().ok()),
+                field("reply").and_then(|v| v.parse::<usize>().ok()),
+            ) {
+                (Some(per_token), Some(nominal)) => Ok(Keep38 { per_token, nominal }),
+                _ => Err(
+                    format!("a `draft keep` line without per_reply_token and reply: {line}").into(),
+                ),
+            }
+        }
+
+        /// The reply a greedy request of `n` tokens is weighed for: the
+        /// tokens after its first, at most the nominal.
+        fn reply(self, n: usize) -> usize {
+            n.saturating_sub(1).min(self.nominal)
+        }
+
+        /// The break-even of a greedy request of `n` tokens, the seat's
+        /// arithmetic.
+        fn at(self, n: usize) -> usize {
+            let r = f64::from(u32::try_from(self.reply(n)).unwrap_or(u32::MAX));
+            (r * self.per_token).ceil() as usize
+        }
+
+        /// The `mtp keep` record a request of `n` tokens that weighed a
+        /// prefix of `prefix` positions prints, its branch `kept` or `reset`.
+        fn record(self, n: usize, prefix: u64, kept: bool) -> String {
+            format!(
+                "mtp keep branch={} prefix={prefix} break_even={} reply={}",
+                if kept { "kept" } else { "reset" },
+                self.at(n),
+                self.reply(n)
+            )
+        }
     }
 
     /// The seat's lines on the server's stderr so far that say the MTP draft
@@ -622,6 +707,7 @@ mod gate {
     ) -> Result<Greedy, GateError> {
         let before = mtp_prompts(err_log)?.len();
         let offs_before = draft_offs(err_log)?.len();
+        let keeps_before = records(err_log, "mtp keep")?.len();
         let body = json!({
             "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
             "cache_prompt": cache,
@@ -636,6 +722,7 @@ mod gate {
                     draft_n: v["timings"]["draft_n"].as_u64().unwrap_or(0),
                     joins: Vec::new(),
                     offs: Vec::new(),
+                    keeps: Vec::new(),
                     said: String::new(),
                 }
             }
@@ -644,7 +731,13 @@ mod gate {
         };
         let joins = mtp_prompts(err_log)?.split_off(before);
         let offs = draft_offs(err_log)?.split_off(offs_before);
-        Ok(Greedy { joins, offs, ..g })
+        let keeps = records(err_log, "mtp keep")?.split_off(keeps_before);
+        Ok(Greedy {
+            joins,
+            offs,
+            keeps,
+            ..g
+        })
     }
 
     struct Greedy {
@@ -654,6 +747,8 @@ mod gate {
         draft_n: u64,
         joins: Vec<String>,
         offs: Vec<String>,
+        /// The `mtp keep` records the request made the server print.
+        keeps: Vec<String>,
         said: String,
     }
 
@@ -666,6 +761,7 @@ mod gate {
                 draft_n: 0,
                 joins: Vec::new(),
                 offs: Vec::new(),
+                keeps: Vec::new(),
                 said,
             }
         }
@@ -674,8 +770,8 @@ mod gate {
         fn show(&self, what: &str) {
             if self.ok {
                 println!(
-                    "{what}: tokens {:?} cache_n={} draft_n={} joins {:?} offs {:?}",
-                    self.tokens, self.cache_n, self.draft_n, self.joins, self.offs
+                    "{what}: tokens {:?} cache_n={} draft_n={} joins {:?} offs {:?} keeps {:?}",
+                    self.tokens, self.cache_n, self.draft_n, self.joins, self.offs, self.keeps
                 );
             } else {
                 println!("{what}: {} joins {:?}", self.said, self.joins);
@@ -693,6 +789,17 @@ mod gate {
                 && self.joins.iter().any(|l| {
                     join_of(l).is_some_and(|(s, c, k)| s == self.cache_n && c == 0 && k != "none")
                 })
+        }
+
+        /// Under the draft, a request that reset below the break-even: it
+        /// kept nothing, printed `record` (its `mtp keep`) and no draft-off
+        /// line, and drafted.
+        fn reset_by_rule(&self, record: &str) -> bool {
+            self.ok
+                && self.cache_n == 0
+                && self.draft_n > 0
+                && self.offs.is_empty()
+                && self.keeps.last().is_some_and(|l| l == record)
         }
 
         /// One join printed for this request, at `start`, that walked the
@@ -718,8 +825,10 @@ mod gate {
     /// did not generate, against the same prompt fed fresh. That first step
     /// is the prompt resent, which keeps the prompt's end (one short of it)
     /// by a cut: the draft proposes nothing from there, by name, and the
-    /// extension keeps the prompt and runs plain steps with the fresh run's
-    /// ids. Every prompt call stays below
+    /// extension, with the draft off, keeps the prompt only at or past the
+    /// break-even of its reply (`mtp keep` `kept`, plain steps), else resets
+    /// (`reset`, drafted) — with the fresh run's ids either way. Every prompt
+    /// call stays below
     /// [`GEMM_FROM`](bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM), so
     /// a continued and a fresh feed leave the same state.
     fn continued(
@@ -787,20 +896,35 @@ mod gate {
         // PIN(2026-10-01): the keep rule grants checkpoints under the draft (lead, round recsave),
         // and the draft's rejoin after a cut is not built (app/src/mtp.rs): `b` keeps p − 1 by a
         // cut, so `x3` drafts nothing and its join names why; was a join at p that drafts.
+        // PIN(2026-10-02): the seat's break-even weighs a keep that leaves the draft off (round
+        // q38rules): `b`'s reply of one token makes no pass, so it keeps p − 1 by a cut; `x3`,
+        // with the draft off, keeps the whole prompt only at or past the break-even of its 8
+        // tokens, else it resets and drafts; was the prompt kept and nothing drafted, always.
+        let k = Keep38::read(err_log)?;
+        let x3_kept = p as usize >= k.at(8);
         let skips_at_p = x3
             .joins
             .iter()
             .any(|l| join_of(l).is_some_and(|(s, c, k)| s == p && c == 0 && k != "none"));
+        let x3_ok = if x3_kept {
+            x3.ok
+                && x3.cache_n == p
+                && x3.draft_n == 0
+                && x3.offs.is_empty()
+                && skips_at_p
+                && x3.keeps.last() == Some(&k.record(8, p, true))
+        } else {
+            // The reset may follow a state the prompt cache put back first,
+            // whose prefix the rule then declined: any prefix up to p.
+            (1..=p).any(|q| x3.reset_by_rule(&k.record(8, q, false)))
+        };
         check(
             &mut ok,
             "continued_by_other_ids_keeps_the_prompt_and_skips_by_name",
             b.cache_n == p - 1
                 && b.skipped_by_name()
-                && x3.ok
-                && x3.cache_n == p
-                && x3.draft_n == 0
-                && x3.offs.is_empty()
-                && skips_at_p,
+                && b.keeps.last() == Some(&k.record(1, p - 1, true))
+                && x3_ok,
         );
         check(
             &mut ok,
@@ -991,13 +1115,18 @@ mod gate {
     ///   or off, and its ids are a fresh run's of the same ids (every prompt
     ///   call of at least nine ids is the ubatch walk, whose bits do not
     ///   depend on where a call is cut);
-    /// - under the draft, every request that kept a checkpoint by a cut (the
-    ///   resends with and without the switch, the stripped resend) drafted
-    ///   nothing and says so by name: the seat's draft-off line at the kept
-    ///   position, and an `mtp prompt` record there with why; the fresh run
-    ///   after them drafts again. Without the draft no such line prints.
-    ///   The draft's rejoin after a cut is not built: when it is, this
-    ///   clause turns over.
+    /// - under the draft, the cuts (the resends with and without the switch,
+    ///   the stripped resend) weigh the turn's end against the seat's
+    ///   break-even for the reply ([`Keep38`], the `draft keep` line): at or
+    ///   past it each keeps the turn's end, drafts nothing and says so by
+    ///   name (the seat's draft-off line at the kept position, an `mtp
+    ///   prompt` record there with why, a `kept` `mtp keep` record); below it
+    ///   each keeps nothing, prints a `reset` record and no draft-off line,
+    ///   and drafts. The fresh run after them drafts. Without the draft no
+    ///   such line prints. The draft's rejoin after a cut is not built: when
+    ///   it is, this clause turns over;
+    /// - (c) under the draft, both sides of the break-even at the turn's end
+    ///   ([`break_even`]).
     ///
     /// Mutants: the state keeping the current position's recurrent stores
     /// alone ((b) keeps 0); a resume that leaves the PLE history behind (the
@@ -1047,7 +1176,22 @@ mod gate {
         a2.show(&format!("cache {label}: A resent verbatim after B"));
         let held = (p1.len() + a1.tokens.len()).saturating_sub(1) as u64;
         let turn_end = p1.len() as u64 - 1;
-        let want = if drafted { turn_end } else { held };
+        // PIN(2026-10-02): under the draft a cut keeps the turn's end only at or past the seat's
+        // break-even for the reply (round q38rules: `Q38::draft_keep`), else the request resets
+        // and prefills whole with the draft on; was the turn's end, the draft off, always.
+        let keep38 = drafted.then(|| Keep38::read(err_log)).transpose()?;
+        let cut_kept = keep38.is_none_or(|k| turn_end >= k.at(n) as u64);
+        let cut_at = if cut_kept { turn_end } else { 0 };
+        let want = if drafted { cut_at } else { held };
+        if let Some(k) = keep38 {
+            println!(
+                "cache {label}: the turn's end {turn_end} against the break-even {} of a reply of \
+                 {} tokens: {}",
+                k.at(n),
+                k.reply(n),
+                if cut_kept { "kept" } else { "reset" }
+            );
+        }
         let kept = a2.cache_n == want && r2.cache_n == want;
         check(
             &mut ok,
@@ -1081,7 +1225,7 @@ mod gate {
         check(
             &mut ok,
             &format!("cache_{label}_b_keeps_the_turns_end"),
-            c1.ok && b2.ok && a3.ok && a3.cache_n == turn_end,
+            c1.ok && b2.ok && a3.ok && a3.cache_n == if drafted { cut_at } else { turn_end },
         );
         check(
             &mut ok,
@@ -1089,16 +1233,135 @@ mod gate {
             f3.ok && f3.cache_n == 0 && !a3.tokens.is_empty() && a3.tokens == f3.tokens,
         );
         let cuts = [&r2, &a2, &a3];
-        let named = if drafted {
-            cuts.iter().all(|g| g.skipped_by_name()) && f3.draft_n > 0 && f3.offs.is_empty()
-        } else {
-            cuts.iter().chain([&f3].iter()).all(|g| g.offs.is_empty())
+        let named = match keep38 {
+            Some(k) if cut_kept => {
+                let rec = k.record(n, turn_end, true);
+                cuts.iter()
+                    .all(|g| g.skipped_by_name() && g.keeps.last() == Some(&rec))
+                    && f3.draft_n > 0
+                    && f3.offs.is_empty()
+            }
+            Some(k) => {
+                let rec = k.record(n, turn_end, false);
+                cuts.iter().all(|g| g.reset_by_rule(&rec)) && f3.draft_n > 0 && f3.offs.is_empty()
+            }
+            None => cuts.iter().chain([&f3].iter()).all(|g| g.offs.is_empty()),
         };
         check(
             &mut ok,
             &format!("cache_{label}_cuts_leave_the_draft_off_by_name"),
             named,
         );
+        if let Some(k) = keep38 {
+            ok &= break_even(url, err_log, k, &pb)?;
+        }
+        Ok(ok)
+    }
+
+    /// The drafted seat's break-even at a turn's end, as the `cache`
+    /// clause's (b) reaches it (the turn, B's turn, the turn resent with its
+    /// reply stripped: its state put back, the turn's end kept by a cut): a
+    /// reply short enough that the turn's end is at or past its break-even
+    /// keeps it — the draft off from there, by name, a `kept` record — and
+    /// one whose break-even is past it resets — nothing kept, the draft on, a
+    /// `reset` record, no draft-off line; each gives the ids of the same
+    /// request fed fresh. Each side has a session of its own
+    /// ([`BREAK_EVEN_TURNS`]), so the prompt cache holds no state that shares
+    /// more than its turn. The replies are the seat's own arithmetic on its
+    /// `draft keep` line: the longest of at most [`N_PREDICT`] tokens whose
+    /// break-even the turn's end reaches, and [`N_PREDICT`], whose
+    /// break-even it must not. Mutants: a break-even of 0 (the short reply
+    /// keeps the turn's end) and of `usize::MAX` (the long reply resets).
+    fn break_even(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        k: Keep38,
+        pb: &[u32],
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        for (side, (turn, reply_text)) in ["long", "short"].into_iter().zip(BREAK_EVEN_TURNS) {
+            let p1 = rendered(url, json!([{ "role": "user", "content": turn }]))?;
+            let stripped = tokenized(url, reply_text)?;
+            let turn_end = p1.len() - 1;
+            let long = (2..=N_PREDICT)
+                .rev()
+                .find(|&n| k.at(n) <= turn_end)
+                .ok_or_else(|| {
+                    format!(
+                        "the turn's end {turn_end} is below the break-even of every reply of 2 to \
+                     {N_PREDICT} tokens ({} ids a token): the clause needs a longer turn",
+                        k.per_token
+                    )
+                })?;
+            if k.at(N_PREDICT) <= turn_end {
+                return Err(format!(
+                    "the turn's end {turn_end} reaches the break-even {} of a reply of {N_PREDICT} \
+                 tokens: the clause needs a shorter turn",
+                    k.at(N_PREDICT)
+                )
+                .into());
+            }
+            let (n, kept) = if side == "long" {
+                (long, true)
+            } else {
+                (N_PREDICT, false)
+            };
+            let strip: Vec<u32> = p1.iter().chain(&stripped).copied().collect();
+            {
+                erase(url)?;
+                let a = greedy(url, err_log, &p1, n, false)?;
+                a.show(&format!("break-even {side}: A's turn fresh, {n} tokens"));
+                if stripped.first() == a.tokens.first() {
+                    return Err(format!(
+                    "the {side} side's stripped reply's first id {:?} is the reply's: the shared \
+                     prefix would not end at the turn",
+                    stripped.first()
+                )
+                .into());
+                }
+                let b = greedy(url, err_log, pb, n, true)?;
+                b.show(&format!("break-even {side}: B's turn"));
+                let s = greedy(url, err_log, &strip, n, true)?;
+                s.show(&format!("break-even {side}: A resent stripped after B"));
+                let f = greedy(url, err_log, &strip, n, false)?;
+                f.show(&format!("break-even {side}: the same ids fresh"));
+                let rec = k.record(n, turn_end as u64, kept);
+                let branch = if kept {
+                    s.cache_n == turn_end as u64
+                        && s.skipped_by_name()
+                        && s.keeps.last() == Some(&rec)
+                } else {
+                    s.reset_by_rule(&rec)
+                };
+                let fresh = a.ok && b.ok && f.ok && f.cache_n == 0 && f.offs.is_empty();
+                let same = !s.tokens.is_empty() && s.tokens == f.tokens;
+                println!(
+                    "break-even {side}: the turn's end {turn_end}, a reply of {n} tokens weighed as {} \
+                 against the break-even {}: want {rec:?} {}",
+                    k.reply(n),
+                    k.at(n),
+                    verdict(branch && fresh && same)
+                );
+                check(
+                    &mut ok,
+                    if kept {
+                        "break_even_past_it_keeps_the_prefix_the_draft_off"
+                    } else {
+                        "break_even_below_it_resets_the_draft_on"
+                    },
+                    branch && fresh,
+                );
+                check(
+                    &mut ok,
+                    if kept {
+                        "break_even_kept_ids_are_a_fresh_runs"
+                    } else {
+                        "break_even_reset_ids_are_a_fresh_runs"
+                    },
+                    same,
+                );
+            }
+        }
         Ok(ok)
     }
 
@@ -1149,14 +1412,18 @@ mod gate {
     /// `ctx` line before its load (it is stopped there), against this gate's
     /// own plans of the file: its context is [`CTX`] (`base`), or the
     /// largest the card holds when that is fewer (`card`); the line's `fit`
-    /// is the largest the card holds — its plan taken, the one past it
-    /// refused — with that plan's card expert bytes; its `margin_ctx` holds
-    /// at most the plan's margin fewer card expert bytes than the plan at
-    /// [`CTX`], and the next multiple of [`CTX_STEP`] past it more (or it is
-    /// the fit). A server asked for one position past the fit is refused by
-    /// name before it listens. Mutant: the refusal of a context past the
-    /// card taken out (the load's own plan refuses it, not by the rule's
-    /// name).
+    /// is the largest context the card holds up to the file's serving cap
+    /// (`place::serve_ctx`, its `context_length`) — its plan taken, and the
+    /// one past it refused when the card bounds it, else the cap itself —
+    /// with that plan's card expert bytes; its `margin_ctx` holds at most
+    /// the plan's margin fewer card expert bytes than the plan at [`CTX`],
+    /// and the next multiple of [`CTX_STEP`] past it more (or it is the
+    /// fit). A server asked for one position past the fit is refused by name
+    /// before it listens: by the card's rule when the card bounds the fit,
+    /// by the cap's (the trained context, YaRN not built) when the cap does.
+    /// Mutants: the refusal of a context past the card taken out (the load's
+    /// own plan refuses it, not by the rule's name); the cap's refusal taken
+    /// out (the card's rule names the clamped fit instead).
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -1219,10 +1486,20 @@ mod gate {
         let here = lost(margin_ctx)?;
         let past = lost(margin_ctx + CTX_STEP)?;
         let (at_fit, past_fit) = (at(fit)?, at(fit + 1)?);
+        let cap = usize::try_from(serve_ctx(1, &inputs.hp)?)?;
+        // PIN(2026-10-02): the fit is the card's largest context up to the file's serving cap
+        // (round q38rules: `serve_ctx`, 262,144 for Qwen3.8); where the card holds more, the fit
+        // is the cap and a plan past it is still a plan; was the card's largest, `past_fit` none.
+        let card_bounds = fit < cap;
         println!(
             "ctx: the gate's plans: lost at {margin_ctx} {here:?}, at {} {past:?}, fit {fit} \
-             {at_fit:?}, past it {past_fit:?}",
+             {at_fit:?}, past it {past_fit:?}; the serving cap {cap} ({})",
             margin_ctx + CTX_STEP,
+            if card_bounds {
+                "the card bounds the fit"
+            } else {
+                "the cap bounds the fit"
+            }
         );
         let mut ok = true;
         check(
@@ -1238,7 +1515,12 @@ mod gate {
             &mut ok,
             "ctx_line_prints_the_fit_and_the_margin",
             at_fit == Some(fit_bytes)
-                && past_fit.is_none()
+                && fit <= cap
+                && (if card_bounds {
+                    past_fit.is_none()
+                } else {
+                    fit == cap
+                })
                 && here.is_some_and(|l| l <= margin)
                 && margin_ctx <= fit
                 && (margin_ctx == fit
@@ -1260,7 +1542,15 @@ mod gate {
             std::thread::sleep(Duration::from_secs(1));
         }
         let text = std::fs::read_to_string(&err_log).unwrap_or_default();
-        let named = format!("--ctx-size {over}: the card holds at most {fit} positions");
+        let named = if card_bounds {
+            format!("--ctx-size {over}: the card holds at most {fit} positions")
+        } else {
+            format!(
+                "a context of {over} positions: the file was trained at {cap} (context_length), \
+                 and a load serves at most {cap}; YaRN scaling past the trained context is not \
+                 implemented"
+            )
+        };
         println!(
             "ctx: --ctx-size {over}: exit {status:?}; named {}",
             text.contains(&named)
@@ -1270,7 +1560,7 @@ mod gate {
         }
         check(
             &mut ok,
-            "ctx_past_the_card_is_refused_by_name",
+            "ctx_past_the_fit_is_refused_by_name",
             status.is_some_and(|s| !s.success())
                 && text.contains(&named)
                 && !text.contains("listening on http://"),

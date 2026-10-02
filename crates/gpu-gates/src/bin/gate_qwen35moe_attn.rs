@@ -127,6 +127,20 @@
 //!     zero or past the width raising `key_count`: that row NaN, the other bit
 //!     for bit clean.
 //! 14. The five new entries compile with no local depot.
+//! 15. Deep: the selector and the selected flash at a cache of 262,144 rows
+//!     (Qwen3.8's `context_length`, the most a load serves), synthetic keys,
+//!     no model: one pool launch over every count bit for bit the
+//!     transcription and within its band, pool 65,535 the last; the
+//!     selection at counts 65,537, 131,074, 262,143 and 262,144 in one
+//!     launch and on the eight rows of a verify at 262,137..=262,144 — the
+//!     heads bit for bit, the scores within their band, each list
+//!     `runtime::qsa`'s rule over the full span of 65,536 pools, every list
+//!     holding rows past 65,535 and a tail ending at its position; the selected
+//!     flash, both passes, within the band of the exact attention over the
+//!     listed rows, with NaN in every unlisted cache row changing no bit.
+//!     The counts reach the kernels as their `u32` arguments, the list
+//!     entries as `u32` cache rows: a count or a row cut to 16 bits, or the
+//!     context clamped at 65,535, reads other rows or refuses the count.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -3024,6 +3038,124 @@ mod gate {
         Ok(ok)
     }
 
+    /// The deep clause's cache height and its largest count: Qwen3.8's
+    /// `context_length`, the most a load serves (`place::serve_ctx`).
+    const DEEP_CTX: usize = 262_144;
+    /// One-row counts of the deep clause: the first past the u16 range, one
+    /// past twice it with a tail of two, a tail of three, the cap.
+    const DEEP_COUNTS: [usize; 4] = [65_537, 131_074, 262_143, 262_144];
+    /// The first count of the eight rows of a verify at the cap.
+    const DEEP_ROWS0: usize = DEEP_CTX - 7;
+
+    /// The deep clause (module doc, 15): the selector and the selected flash
+    /// at [`DEEP_CTX`] on synthetic keys, no model loaded.
+    fn deep_check(gpu: &Gpu, k: &FlashGqaKernels, qk: &QsaKernels) -> Result<bool, GateError> {
+        let t0 = std::time::Instant::now();
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let idx = idx_inputs(stream, DEEP_CTX, 701, false)?;
+        // One pool launch of every count: the row of count 262,144 completes
+        // pool 65,535, the plane's last.
+        let (pooled, ph) = pool_plane(qk, stream, &idx, DEEP_CTX, DEEP_CTX, unl)?;
+        let complete = DEEP_CTX / POOL;
+        let (exact, worst) = pool_keys_ok(&idx, &ph, complete);
+        let pool_ok = exact && worst <= 1.0;
+        println!(
+            "qsa deep pool counts 1..={DEEP_CTX} ctx={DEEP_CTX}: {complete} pools \
+             bit_exact_host={exact} f64 measured/bound {worst:.3e} {}",
+            verdict(pool_ok)
+        );
+        let mut ok = pool_ok;
+        let mut scratch = QsaScratch::new(stream, MAX_ROWS, DEEP_CTX, KEPT)?;
+        let kb = to16(&activations(HEAD, N_KV * DEEP_CTX, 720));
+        let vb = to16(&activations(HEAD, N_KV * DEEP_CTX, 721));
+        let (kc, vc) = (
+            DeviceBuffer::from_host(stream, &kb)?,
+            DeviceBuffer::from_host(stream, &vb)?,
+        );
+        let host = HostCache {
+            kf: from16(&kb),
+            vf: from16(&vb),
+            ctx: DEEP_CTX,
+        };
+        let verify: Vec<usize> = (DEEP_ROWS0..=DEEP_CTX).collect();
+        for (name, counts, seed) in [
+            ("one launch", DEEP_COUNTS.to_vec(), 711u32),
+            ("verify", verify, 712u32),
+        ] {
+            let m = counts.len();
+            let cu: Vec<u32> = counts
+                .iter()
+                .map(|&v| u32::try_from(v))
+                .collect::<Result<_, _>>()?;
+            let qi = idx_queries(m, seed);
+            let sel = run_select(qk, stream, unl, &idx, &pooled, &qi, &cu, &mut scratch)?;
+            let (heads, sc, lists, worst) = select_rows_ok(&idx, &ph, &qi, &counts, &sel);
+            let rows: Vec<Vec<u32>> = (0..m).map(|t| row_list(&sel, t).to_vec()).collect();
+            // Every list reaches past the u16 range, and a row with a tail
+            // ends at its own position.
+            let high = rows
+                .iter()
+                .all(|l| l.iter().any(|&r| r > u32::from(u16::MAX)));
+            let last = counts.iter().zip(&rows).all(|(&c, l)| {
+                c % POOL == 0 || l.last() == Some(&u32::try_from(c - 1).unwrap_or(u32::MAX))
+            });
+            let sel_ok = heads && sc && lists && high && last;
+            println!(
+                "qsa deep select {name} counts={counts:?}: heads bit_exact_host={heads} scores \
+                 measured/bound {worst:.3e} band={sc} lists = rule on the scores={lists} \
+                 lengths={:?} rows past 65,535 in every list={high} each tail ends at its \
+                 position={last} {}",
+                sel.n_sel,
+                verdict(sel_ok)
+            );
+            ok &= sel_ok;
+            // The planes with every row outside the lists' union NaN.
+            let mut named = vec![false; DEEP_CTX];
+            for &r in rows.iter().flatten() {
+                named[r as usize] = true;
+            }
+            let nanify = |b: &[u16]| -> Vec<u16> {
+                b.iter()
+                    .enumerate()
+                    .map(|(i, &h)| {
+                        if named[(i / HEAD) % DEEP_CTX] {
+                            h
+                        } else {
+                            NAN16
+                        }
+                    })
+                    .collect()
+            };
+            let kn = DeviceBuffer::from_host(stream, &nanify(&kb))?;
+            let vn = DeviceBuffer::from_host(stream, &nanify(&vb))?;
+            let q: Vec<f32> = activations(HEAD, m * N_HEAD_Q38, seed + 10)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            for (pass, mma) in [(Pass::Scalar, false), (Pass::Mma, true)] {
+                let lsel = (&scratch.list, &scratch.n_sel);
+                let y = run_sel(k, stream, unl, &q, lsel, m, (&kc, &vc), DEEP_CTX, mma)?;
+                let yn = run_sel(k, stream, unl, &q, lsel, m, (&kn, &vn), DEEP_CTX, mma)?;
+                let (band, worst) = band_listed(&q, &rows, &host, &y, pass);
+                let nan_same = bits_equal(&y, &yn);
+                let pass_ok = band && nan_same;
+                println!(
+                    "qsa deep flash {name} pass={} counts={counts:?}: measured/bound \
+                     {worst:.3e} band={band} nan_in_unlisted_rows_same={nan_same} {}",
+                    pass.name(),
+                    verdict(pass_ok)
+                );
+                ok &= pass_ok;
+            }
+        }
+        println!(
+            "qsa deep ctx={DEEP_CTX}: {:.1} s (runtime value)",
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(ok)
+    }
+
     /// The new entries compile with no local depot (module doc, 14).
     fn sel_shapes() -> Result<bool, GateError> {
         no_local_depot(&[
@@ -3082,6 +3214,9 @@ mod gate {
         ok &= s;
         let s = sel_flash_check(&gpu, &k, &qk)?;
         println!("qsa selected flash {}", verdict(s));
+        ok &= s;
+        let s = deep_check(&gpu, &k, &qk)?;
+        println!("qsa deep {}", verdict(s));
         ok &= s;
         let (p, win36) = prefill_check(&gpu, &kp, Q36, &[])?;
         println!("prefill flash 256 {}", verdict(p));

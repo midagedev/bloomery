@@ -37,6 +37,11 @@ pub const D1K: &str = "ref_qwen4exp_d1k";
 /// the cells their indexer selects, not to every cell.
 pub const D3K: &str = "ref_qwen4exp_d3k";
 
+/// The deepest context our numbers are held to ik's at: [`D3K`]'s decode
+/// step at position 3,000, which reads 3,001 positions. A load prints it
+/// beside the context it serves; it does not bound that context.
+pub const VERIFIED_POSITIONS: u64 = 3001;
+
 /// The decode-step sets (the model profile's `ref_step_variant`), by
 /// position.
 pub const STEP_SETS: &[&str] = &[STEP4, STEP4_EVERY_NODE, D1K, D3K];

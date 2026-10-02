@@ -68,6 +68,20 @@ pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 /// cache rows, so a context past this is one those launches cannot name.
 pub const KERNEL_POSITIONS: u64 = u32::MAX as u64;
 
+/// The most positions a load of the file `hp` describes serves: its
+/// `context_length`, the context it was trained at (the rope runs unscaled;
+/// YaRN scaling is not built), within [`KERNEL_POSITIONS`]. `ctx` past it is
+/// refused by name; else the cap. The one owner of the rule for
+/// `generate_qwen3moe` and the Qwen3.8 seat.
+pub fn serve_ctx(ctx: u64, hp: &Hparams) -> Result<u64, PlaceError> {
+    let trained = u64::try_from(hp.n_ctx_train).unwrap_or(u64::MAX);
+    let cap = trained.min(KERNEL_POSITIONS);
+    if ctx > cap {
+        return Err(PlaceError::PastTrained { ctx, trained, cap });
+    }
+    Ok(cap)
+}
+
 /// Where a plan puts the file's routed experts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Experts {
@@ -148,6 +162,12 @@ pub enum PlaceError {
          take the context as a u32 launch argument, the selected flash reads u32 cache rows)"
     )]
     Positions { ctx_max: u64 },
+    /// A context past the one the file was trained at ([`serve_ctx`]).
+    #[error(
+        "a context of {ctx} positions: the file was trained at {trained} (context_length), and a \
+         load serves at most {cap}; YaRN scaling past the trained context is not implemented"
+    )]
+    PastTrained { ctx: u64, trained: u64, cap: u64 },
     /// A draft planned beside a machine of other than one card.
     #[error("the MTP draft is planned on the target's one card; the machine has {cards} cards")]
     DraftCards { cards: usize },

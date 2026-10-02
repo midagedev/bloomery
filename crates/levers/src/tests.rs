@@ -63,6 +63,7 @@ fn sample(kind: Kind) -> String {
         Kind::Multiple { of } => of.to_string(),
         Kind::Bytes => "38G".into(),
         Kind::Path => "/data/set".into(),
+        Kind::PathOr(words) => words[0].into(),
         Kind::File => A_FILE.into(),
         Kind::Text => "text".into(),
         Kind::Residency => "mid-p33-s1".into(),
@@ -121,7 +122,7 @@ fn garbage(kind: Kind) -> Vec<String> {
             "/no/such/file".to_string(),
             env!("CARGO_MANIFEST_DIR").to_string(),
         ]),
-        Kind::Path | Kind::Text => {}
+        Kind::Path | Kind::PathOr(_) | Kind::Text => {}
         Kind::Residency => g.extend(
             [
                 "OFF",
@@ -172,7 +173,7 @@ fn rows_are_well_formed() {
             assert!(r.kind.parse(d).is_ok(), "{}: default {d:?}", r.name);
         }
         match r.kind {
-            Kind::Words(words) => {
+            Kind::Words(words) | Kind::PathOr(words) => {
                 let mut w = words.to_vec();
                 w.sort_unstable();
                 w.dedup();
@@ -310,7 +311,10 @@ fn accessors_read_their_rows() {
     assert_eq!(set.card_budget_bytes(), Some(38 << 30));
     assert!(!set.pin_main());
     assert_eq!(set.draft(), Some("dspark"));
-    assert_eq!(set.mtp_head_rows(), Some(Path::new("/data/rows.txt")));
+    assert_eq!(
+        set.mtp_head_rows(),
+        Some(MtpHead::List(Path::new("/data/rows.txt")))
+    );
     assert_eq!(set.mtp_draft(), Some(Path::new(A_FILE)));
     assert!(set.mtp_windows());
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
@@ -1221,4 +1225,19 @@ fn residency_words_take_any_p_and_s_at_least_1() {
         assert!(Kind::Residency.parse(v).is_ok(), "{v}");
     }
     assert_eq!(residency_word("mid-p33-s0"), None);
+}
+
+/// `BLOOMERY_MTP_HEAD_ROWS`'s word is never a path, and every other value
+/// is one: `full` is the full head, `./full` a list named `full`.
+#[test]
+fn mtp_head_rows_takes_full_or_a_path() {
+    let read_one = |v: &str| read(&env(&[(MTP_HEAD_ROWS, v)]), Scope::Every);
+    let full = read_one("full").expect("full is the word");
+    assert_eq!(full.mtp_head_rows(), Some(MtpHead::Full));
+    let named = read_one("./full").expect("a path");
+    assert_eq!(
+        named.mtp_head_rows(),
+        Some(MtpHead::List(Path::new("./full")))
+    );
+    assert!(read_one("").is_err(), "the empty value is no path");
 }

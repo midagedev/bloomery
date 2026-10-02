@@ -597,6 +597,14 @@ pub(crate) fn generate(
             0
         }
     ];
+    // Only a greedy request with no banned id passes, and its first token is
+    // the prompt's step: the passes make at most the rest.
+    let passes = sampler.is_none() && banned.is_empty();
+    slot.engine.will_reply(match usize::try_from(p.n_predict) {
+        Ok(n) if passes => Some(n.saturating_sub(1)),
+        Err(_) if passes => None,
+        _ => Some(0),
+    });
     let cache_n = slot.reuse(ids, p.cache_prompt)?;
     let t0 = Instant::now();
     slot.prefill_marked(ids, cache_n, n - 1)?;
@@ -785,6 +793,8 @@ mod cache_tests {
     struct Log {
         notes: Vec<CacheNote>,
         calls: Vec<usize>,
+        /// What each request told [`Engine::will_reply`].
+        replies: Vec<Option<usize>>,
     }
 
     /// The mock engine under a cut rule like V4.1's CED hole: a position
@@ -874,6 +884,9 @@ mod cache_tests {
             self.ctx.clear();
             self.calls.clear();
             self.inner.reset()
+        }
+        fn will_reply(&mut self, tokens: Option<usize>) {
+            self.log.lock().expect("the log").replies.push(tokens);
         }
         fn keepable(&self, n: usize) -> usize {
             rule(n.min(self.ctx.len()), &self.calls).0
@@ -1158,5 +1171,43 @@ mod cache_tests {
         let refused = |n: &CacheNote| matches!(n, CacheNote::Skip { why, .. } if why.contains("refused to take the state back"));
         assert_eq!(notes.iter().filter(|n| refused(n)).count(), 1, "{notes:?}");
         assert!(!slot.cache.covers(&a1), "the refused state is still cached");
+    }
+
+    /// Each request tells the engine its reply before the cache is reused:
+    /// a greedy one the tokens after its first (the passes make at most
+    /// those), one that takes no pass — it bans the end of generation —
+    /// none.
+    #[test]
+    fn a_request_tells_the_engine_its_reply_before_the_reuse() {
+        let (mut slot, log) = Probe::slot(0, false);
+        let ids = enc("<｜User｜>the cat sat on the mat and the ");
+        run(&mut slot, &ids);
+        let p = GenParams {
+            n_predict: 8,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: Vec::new(),
+            ignore_eos: true,
+            stream: false,
+            timings_per_token: false,
+            return_progress: false,
+            include_usage: false,
+            cache_prompt: true,
+        };
+        let factory = sampling::reference_factory();
+        let mut tim = Timings::default();
+        generate(
+            &mut slot,
+            &factory,
+            &ids,
+            &p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut tim,
+        )
+        .expect("a generation");
+        assert_eq!(log.lock().expect("log").replies, [Some(7), Some(0)]);
     }
 }

@@ -211,6 +211,12 @@ breaks even against the plain path at about 10 output tokens at P 512 and about 
   window before any rule change. (`c4resid`)
 - **The Qwen3.8 defaults on the 3090 (M, after the resit's 3090 cells)**: residency and MTP stay off under
   `--place gate` until a 3090 cell measures them.
+- **Qwen3.8's deep oracle as a `weekly-*` recipe (XS, the 256k rule, `q38rules`)**: the d32k and d64k CPU dumps
+  (`tools/ref/models/qwen4exp.sh:149-153`, 5–8 and 13–21 min [derived], `specs/release/research/longctx-report.md`)
+  become one weekly recipe, triggered in `tools/gate-paths.tsv` by the attention, KV and QSA files
+  (`crates/gpu/src/{qsa,flash_gqa}.rs`, `crates/runtime/src/{qsa,stores}.rs`, the qwen3moe arch's body and wide
+  walks). Serving already goes to the file's 262,144 (`place::serve_ctx`); the verified depth stays D3K's 3,001
+  until the weekly sets land, and no landing gate prefills past its depth today.
 - **GLM G2: PRIME in the load (M, binary change)**: this is a follow-up of GLM's MTP arm. (`glmmtparm`)
 - **gate_deepseek41_tier's lost_case and batch_lost_case (S)**: about 80 % of the two is the same, so one
   helper would serve both. (`gmerge`)

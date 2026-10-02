@@ -114,6 +114,25 @@ pp512의 사다리는 91 → ~~127(1) → 146(1 + h1fold)~~ 정정 09-25: 1은 p
 
 e2e 핀은 이산 개수(마진 ≥ 0.5 불일치 ≤ 6)라 경계에서 동전 던지기다. `exact-forced-32.tsv`가 1023위치 전부의 참 마진을 가지므로 σ(우리 마진 − 참 마진의 RMS)를 진단으로 함께 찍는다 — `gate-gpu-e2e`의 `forced_sigma`, `--margins PATH`. 첫 실측 σ 0.35(스칼라)·0.36(MMA), 시뮬 0.378. 위치별 차의 꼬리는 가우시안보다 훨씬 두껍다(RMS 4배 초과 위치 11개 대 기대 0.1) — 라우터 뒤집힘 의심, 직접 본 것은 아니다. 팔 비교는 σ 둘의 비교다. 모든 숫자는 `tok/s @ n=N, 깊이 D, 카드`로 적는다 — 조건이 없으면 숫자가 아니다.
 
+### Qwen3.8 serve: the drafted seat's break-even (2026-10-02, `q38rules`)
+
+A drafted request whose kept prefix leaves the MTP draft off (a cut, or a draft already off) pays each reply token
+at the plain step's time; a reset pays the prefix's re-prefill with the draft on. The seat keeps the prefix only at or
+past k* = R · Δ · ρ (`Q38::draft_keep`). R is the reply's tokens through passes: `max_tokens − 1`, at most 277, the
+mean greedy reply of the 20 Korean chat prompts of `tools/ref/data/d2-prompts-ko.tsv` under the full head (5,543
+tokens, round q38head2), and 277 when the request bounds nothing; a request that takes no pass weighs 0. Δ = 1/57.88 −
+1/79.33 s = 4.672 ms, the plain and the drafted decode at P 4096 (A6000 plan (a), residency and streaming on,
+rig-log 09-30#q38seed-ab). ρ is the rate a reset re-prefills at with the draft on: 1,224.1 ids/s under `--place a`
+(the default arm at P 4096, rig-log 10-01#q38hol-ab), so 5.718 ids per reply token and k* = 1,585 at R = 277
+[derived]. `--place gate` takes plan (a)'s terms: k* = R · (ρ/plain) · (1 − plain/drafted) is a product of one card's
+own rate ratios [derived; no 3090 row]. `--place bp` feeds its prompt by steps, so ρ is the plain step's rate and k*
+= R · (1 − plain/drafted) = 0.270 R, 75 at 277 [derived; re-derived when bp's prompt walk lands]. Not counted: the P
+512 pair (57.18 / 91.24) gives Δ = 6.53 ms, k* +40 % [derived]; the shipped head list raises the drafted rate
+~~+2.0..+5.4 % [derived]~~ +4.8 % [+2.5, +7.3] at P 4096 and +6.4 % at P 512 (A6000, n = 96, 6 rounds,
+`docs/cards/q38head2-ab.card`), Δ +12 % [+6, +18] at P 4096 [derived from it]; a kept prefix's remaining prompt runs plain, about 6 % faster; the draft stays off past the reply until a
+reset, which each later request's keep weighs again. The seat prints k* on its `draft keep` line and each weighed
+request's branch as an `mtp keep` record.
+
 ## 라운드 운영
 
 라운드 하나 = 워크트리 하나 = 파일 경계 하나 = 게이트 하나 = 완료 보고 하나. 위임은 opus 서브에이전트(Agent 도구, `model:"opus"`). 리드는 스펙·diff 독해·게이트 재실행·임대 측정·머지만 한다. 원칙(원문과 사고 경위는 장부):

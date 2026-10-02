@@ -13,6 +13,10 @@
 //!   addresses — nothing copied, the list's rows among them; the program's
 //!   arena is the plan's; the map holds one word a vocabulary id, its first
 //!   the list's ids and the rest 0.
+//! - (u) before the load: the head `BLOOMERY_MTP_HEAD_ROWS` unset picks on
+//!   this target (`head_list::head_rows_of`) is the shipped list — its
+//!   65,536 rows, its first line naming the target tokenizer's digest, the
+//!   pick `shipped` — and `full` is the full head.
 //! - (q) `Mtp38::open` refuses by name, beside the loaded model: a draft
 //!   read as carrying its own matrices, and a plan whose row map is not the
 //!   one the load makes (after the draft's uploads, which it frees).
@@ -140,7 +144,9 @@ mod gate {
     use gguf::Split;
     use gguf::quant::half_to_f32;
     use model::arch::models::{Borrows, HeadRows, MtpSource};
+    use model::arch::qwen35moe::head_list::{HeadWhy, SHIPPED, head_rows_of};
     use model::arch::qwen35moe::place::{MtpInputs, MtpPlan, PlanInputs, machine, vocab_sha256};
+    use model::fileio::hex;
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
     use refset::arch::qwen4exp::IK;
@@ -155,6 +161,8 @@ mod gate {
     const CTX: u64 = 3072;
     /// The head's rows: every sixth id, 0 to 245,754.
     const LIST_ROWS: u32 = 40_960;
+    /// The shipped list's rows ([`SHIPPED`]'s first line).
+    const SHIPPED_ROWS: usize = 65_536;
     /// The draft layer's index in the draft file: ik names its nodes by it.
     const LAYER: usize = 48;
     /// Streams of a hidden row, and the values of one.
@@ -2606,6 +2614,42 @@ mod gate {
         Ok(ok)
     }
 
+    /// (u) the head a drafted load of this target picks with
+    /// `BLOOMERY_MTP_HEAD_ROWS` unset is the shipped list: its rows, its
+    /// first line naming the target tokenizer's digest, the pick's reason
+    /// `shipped`; `full` set is the full head.
+    fn shipped_head(file: &Split, vocab: u32) -> Result<bool, GateError> {
+        let want = vocab_sha256(file)?;
+        let first = SHIPPED.lines().next().unwrap_or_default();
+        let line_ok = first.contains(&format!(" rows={SHIPPED_ROWS} "))
+            && first.ends_with(&format!(" vocab_sha256={}", hex(&want)));
+        let pick = head_rows_of(None, file, vocab)?;
+        let rows_ok = matches!(&pick.rows, HeadRows::List { ids, digest }
+            if ids.len() == SHIPPED_ROWS && *digest == want);
+        let unset_ok = line_ok && rows_ok && pick.why == HeadWhy::Shipped;
+        println!(
+            "(u) unset: head {} of {} rows from {} ({}); the list's first line {first:?}, the \
+             target's tokenizer {} {}",
+            pick.head_word(),
+            pick.rows_of(vocab),
+            pick.why.from_word(),
+            pick.why,
+            hex(&want),
+            verdict(unset_ok)
+        );
+        let full = head_rows_of(Some(bloomery_levers::MtpHead::Full), file, vocab)?;
+        let full_ok = full.rows == HeadRows::Full && full.why == HeadWhy::SetFull;
+        println!(
+            "(u) full: head {} of {} rows from {} ({}) {}",
+            full.head_word(),
+            full.rows_of(vocab),
+            full.why.from_word(),
+            full.why,
+            verdict(full_ok)
+        );
+        Ok(unset_ok && full_ok)
+    }
+
     pub(super) fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[])?;
         let dir = MTP.path(MTP_SET);
@@ -2638,6 +2682,7 @@ mod gate {
         let (file, draft) = (open(MODEL)?, open(DRAFT)?);
         let t = Instant::now();
         let inputs = PlanInputs::describe(&file)?;
+        let shipped_ok = shipped_head(&file, inputs.spec.vocab)?;
         let ids: Vec<u32> = (0..LIST_ROWS).map(|i| i * 6).collect();
         let rows = HeadRows::List {
             ids: ids.clone().into(),
@@ -2670,7 +2715,8 @@ mod gate {
             m.resident_bytes(),
             t.elapsed().as_secs_f64()
         );
-        let mut ok = draft_load(&m, plan, &inputs, &draft, &mtp, &ids)?;
+        let mut ok = shipped_ok;
+        ok &= draft_load(&m, plan, &inputs, &draft, &mtp, &ids)?;
         ok &= refused(
             "the draft's own row before any walk",
             m.mtp_draft(MtpFeed::Own { pos0: 0 }, MtpHead::Rows, MtpMode::Eager),

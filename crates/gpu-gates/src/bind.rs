@@ -393,9 +393,10 @@ enum Cmd {
     Reset,
     /// Take back the positions from this one on.
     Rollback(u32),
-    /// The longest prefix of at most this many positions a rollback keeps,
-    /// and the rule that kept less.
-    Keep(usize),
+    /// The longest prefix of at most this many positions a rollback keeps
+    /// for a reply of at most this many tokens through passes
+    /// ([`Seat::keep_for`]), and the rule that kept less.
+    Keep(usize, Option<usize>),
     /// Where to cut a prompt call of `first .. end` at `marks`.
     Splits {
         first: usize,
@@ -485,6 +486,13 @@ pub trait Seat: 'static {
     /// holds) a rollback keeps and the next request can run from, and the
     /// rule that kept less.
     fn keep(&self, n: usize) -> (usize, Option<String>);
+    /// [`Seat::keep`] for a request whose reply makes at most `reply` tokens
+    /// through passes (`serve::Engine::will_reply`): a seat whose kept prefix
+    /// costs its draft weighs one against the other. The default is `keep`'s.
+    fn keep_for(&self, n: usize, reply: Option<usize>) -> (usize, Option<String>) {
+        let _ = reply;
+        self.keep(n)
+    }
     /// Where to cut a prompt call of `first .. end` (from where the model
     /// stands) so the `marks` stay keepable (`serve::Engine::prefill_splits`).
     fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize>;
@@ -524,6 +532,9 @@ pub struct SeatEngine {
     props: EngineProps,
     cache_ram: u64,
     note: fn(&CacheNote),
+    /// The request's reply (`serve::Engine::will_reply`), which each keep
+    /// query carries.
+    reply: Option<usize>,
 }
 
 /// The handle's side of the engine thread: its channels and the logits buffer
@@ -579,8 +590,8 @@ impl SeatEngine {
                 }
                 for cmd in cmds {
                     let (result, logits, extra) = match cmd {
-                        Cmd::Keep(n) => {
-                            let (k, why) = g.keep(n.min(g.pos()));
+                        Cmd::Keep(n, reply) => {
+                            let (k, why) = g.keep_for(n.min(g.pos()), reply);
                             (
                                 u32::try_from(k).map_err(|_| {
                                     format!("a kept prefix of at most {n} passes u32")
@@ -664,6 +675,7 @@ impl SeatEngine {
             props,
             cache_ram,
             note: S::note,
+            reply: None,
         })
     }
 }
@@ -792,7 +804,7 @@ fn serve_cmd<S: Seat>(
             .rollback(pos)
             .map(|()| 0)
             .map_err(|e| format!("rollback to position {pos} from {at}: {e}")),
-        Cmd::Keep(_)
+        Cmd::Keep(..)
         | Cmd::Splits { .. }
         | Cmd::Save
         | Cmd::Resume(_)
@@ -884,11 +896,16 @@ impl Engine for SeatEngine {
         }
     }
 
-    /// The body's rule, asked on the engine thread (`spawn`'s `keep`). A
+    /// The body's rule for the request's reply, asked on the engine thread
+    /// (`spawn`'s `keep_for`). A
     /// thread that does not answer grants nothing: the caller resets, and the
     /// next call reports the thread.
+    fn will_reply(&mut self, tokens: Option<usize>) {
+        self.reply = tokens;
+    }
+
     fn keepable(&self, n: usize) -> usize {
-        match self.link.ask(Cmd::Keep(n)).map(|r| r.result) {
+        match self.link.ask(Cmd::Keep(n, self.reply)).map(|r| r.result) {
             Ok(Ok(k)) => (k as usize).min(n),
             _ => 0,
         }
@@ -897,7 +914,7 @@ impl Engine for SeatEngine {
     /// The body's rule, as `keepable` asks it; a thread that does not answer
     /// is named as the reason.
     fn keep_limit(&self, n: usize) -> Option<String> {
-        match self.link.ask(Cmd::Keep(n)) {
+        match self.link.ask(Cmd::Keep(n, self.reply)) {
             Ok(Reply {
                 extra: Extra::Why(why),
                 ..

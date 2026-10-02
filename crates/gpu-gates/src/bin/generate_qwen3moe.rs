@@ -126,12 +126,14 @@
 //! every other family and word refused by name) the decode runs through the runtime's
 //! speculative loop with the file's MTP draft (`app::arch::qwen4exp`'s
 //! `MtpDraft` over the shared draft file beside the target or
-//! `BLOOMERY_MTP_DRAFT`'s, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`):
+//! `BLOOMERY_MTP_DRAFT`'s, its head `BLOOMERY_MTP_HEAD_ROWS`'s: unset the
+//! shipped list on a target of its tokenizer, `full` the full head):
 //! windows of four rows — the target's
 //! verify of the draft's three ids, the kept rows committed, the draft's
 //! next chain one readback — and the greedy ids are the plain run's. A
 //! `load draft=mtp` line follows the `load` line (the draft's resident
-//! bytes, its program's arena and its head), the `capture` line the verify
+//! bytes, its program's arena and its head), then the `mtp head` record
+//! (which head, what picked it and why), the `capture` line the verify
 //! passes' widths; each pass prints its `step` lines one kept token a line
 //! and, under `--time`, a `time pass` row (its wall, positions and kept
 //! rows) and a `time step` row a kept position (its pass's wall over its
@@ -229,6 +231,13 @@
 //! (`tools/ref/time-gate.sh`), never at a bare prompt. The cache's
 //! height is `--ctx`: the flash's segment grid is fixed by it, so a timed
 //! run names its ctx.
+//!
+//! On a qwen4exp file `--ctx` is at most the file's `context_length`
+//! (`place::serve_ctx`; YaRN scaling past it is not built), refused by name
+//! past it; the `load` line prints the stores' `ctx`, that cap as
+//! `ctx_max`, `ctx_train` and `verified`, the deepest context the reference
+//! sets hold our numbers to ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`),
+//! which bounds nothing.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -275,12 +284,13 @@ mod cli {
     use cuda_core::sys;
     use gguf::Split;
     use model::arch::Arch;
-    use model::arch::models::HeadRows;
+    use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, PlanInputs, machine_bp, machine_for_experts, read_head_rows, tier_batch,
+        Experts, MtpInputs, PlanInputs, machine_bp, machine_for_experts, serve_ctx, tier_batch,
     };
     use model::placement::workstation::{A6000, CardSpec, RTX_3090};
     use model::placement::{Machine, Plan, PlanLevers};
+    use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
     use runtime::{Advance, Committed, PassSink, Speculative, Stop, Target};
     use std::num::NonZeroUsize;
@@ -1050,7 +1060,7 @@ mod cli {
         };
         if family == Family::Qwen38 && draft == Draft38::Off && levers.mtp_head_rows().is_some() {
             return Err(format!(
-                "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; {}",
+                "BLOOMERY_MTP_HEAD_ROWS picks the MTP draft's head; {}",
                 no_draft("BLOOMERY_DRAFT=mtp on a qwen4exp file")
             )
             .into());
@@ -1574,6 +1584,7 @@ mod cli {
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
+        let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
         let ub = ubatch_for(ctx)?;
         let machine = place.machine(&inputs, u64::try_from(ub)?, experts, None);
         let plan = inputs.plan_with(
@@ -1596,10 +1607,11 @@ mod cli {
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
         println!(
-            "load arch=qwen4exp resident_bytes={} ctx={ctx} layers={} mode={} store_bytes={} \
-             prefill={} ubatch={} place={} card_layers={} card_stacks={} in {:.1} s (runtime \
-             value)",
+            "load arch=qwen4exp resident_bytes={} ctx={ctx} ctx_max={cap} ctx_train={} \
+             verified={VERIFIED_POSITIONS} layers={} mode={} store_bytes={} prefill={} ubatch={} \
+             place={} card_layers={} card_stacks={} in {:.1} s (runtime value)",
             m.resident_bytes(),
+            inputs.hp.n_ctx_train,
             m.layers().len(),
             mode_name(mode),
             body.store_bytes(),
@@ -1619,7 +1631,7 @@ mod cli {
 
     /// The Qwen3.8-Flash-Next model of `file` with its MTP draft loaded
     /// beside it (`Body38::open_placed_mtp_residency`, the draft file `draft_file`
-    /// picks, its head reduced under `BLOOMERY_MTP_HEAD_ROWS`), the residency
+    /// picks, its head `head_list::head_rows_of`'s), the residency
     /// `lever` resolves over the MTP plan: the `plan`, `residency unset`,
     /// `residency host`, `load`, `load draft=mtp` and `capture` lines of the
     /// plain open, the draft's own
@@ -1635,11 +1647,10 @@ mod cli {
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
         let inputs = PlanInputs::describe(&file)?;
+        let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
         let ub = ubatch_for(ctx)?;
-        let rows = match levers.mtp_head_rows() {
-            Some(p) => read_head_rows(p, &file, inputs.spec.vocab)?,
-            None => HeadRows::Full,
-        };
+        let head = head_rows_of(levers.mtp_head_rows(), &file, inputs.spec.vocab)?;
+        let rows = head.rows.clone();
         let (draft_path, from) = draft_file(levers.mtp_draft(), &ref_model_path()?);
         let draft_split = Split::open(&draft_path).map_err(|e| {
             format!(
@@ -1678,10 +1689,11 @@ mod cli {
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
         println!(
-            "load arch=qwen4exp resident_bytes={} ctx={ctx} layers={} mode={} store_bytes={} \
-             prefill={} ubatch={} place={} card_layers={} card_stacks={} in {:.1} s (runtime \
-             value)",
+            "load arch=qwen4exp resident_bytes={} ctx={ctx} ctx_max={cap} ctx_train={} \
+             verified={VERIFIED_POSITIONS} layers={} mode={} store_bytes={} prefill={} ubatch={} \
+             place={} card_layers={} card_stacks={} in {:.1} s (runtime value)",
             m.resident_bytes(),
+            inputs.hp.n_ctx_train,
             m.layers().len(),
             mode_name(mode),
             body.store_bytes(),
@@ -1693,18 +1705,24 @@ mod cli {
             t.elapsed().as_secs_f64()
         );
         let draft = body.mtp().ok_or("the load opened no MTP draft")?;
-        let head = match draft.head_map() {
+        let head_line = match draft.head_map() {
             Some((_, n)) => format!("rows={n}"),
             None => "full".to_string(),
         };
         println!(
-            "load draft=mtp resident={} arena={} head={head} card_bytes={} in {:.1} s (runtime \
-             value)",
+            "load draft=mtp resident={} arena={} head={head_line} card_bytes={} in {:.1} s \
+             (runtime value)",
             draft.resident_bytes(),
             draft.arena_bytes(),
             plan.draft_card_bytes() + plan.arena_bytes,
             t.elapsed().as_secs_f64()
         );
+        Record::new(&record::MTP_HEAD38)
+            .w("head", head.head_word())
+            .u("rows", head.rows_of(inputs.spec.vocab))
+            .w("from", head.why.from_word())
+            .w("why", &head.why)
+            .print();
         capture38_check(&mut m)?;
         Ok((
             m,

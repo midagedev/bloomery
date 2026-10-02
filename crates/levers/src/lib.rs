@@ -91,6 +91,9 @@ pub(crate) enum Kind {
     Bytes,
     /// A non-empty path.
     Path,
+    /// One of these words, or else a non-empty path: a word is never read
+    /// as a path (a file of that name is named `./<word>`).
+    PathOr(&'static [&'static str]),
     /// The path of a regular file that exists when the value is read.
     File,
     /// What the name's owner takes: a name no reading here parses.
@@ -159,6 +162,11 @@ impl Kind {
                 BytesError::Overflow(_) => refused(Some(e.reason())),
             }),
             Kind::Path if !v.is_empty() => Ok(Value::Path(PathBuf::from(v))),
+            Kind::PathOr(words) => match words.iter().find(|&&w| w == v) {
+                Some(&w) => Ok(Value::Word(w)),
+                None if !v.is_empty() => Ok(Value::Path(PathBuf::from(v))),
+                None => Err(refused(None)),
+            },
             Kind::File if Path::new(v).is_file() => Ok(Value::Path(PathBuf::from(v))),
             Kind::File if !v.is_empty() => Err(refused(Some("no regular file is at that path"))),
             Kind::Residency => match residency_word(v) {
@@ -198,6 +206,7 @@ impl Kind {
                 "bytes, or a whole number of MiB or GiB with an M or G suffix".to_string()
             }
             Kind::Path => "a non-empty path".to_string(),
+            Kind::PathOr(words) => format!("{}, or a non-empty path", words.join(", ")),
             Kind::File => "the path of an existing regular file".to_string(),
             Kind::Text => "what its owner takes".to_string(),
             Kind::Residency => {
@@ -233,18 +242,27 @@ pub fn residency_word(v: &str) -> Option<ResidencyWord> {
     }
 }
 
+/// A set `BLOOMERY_MTP_HEAD_ROWS`: the head the MTP draft scores with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtpHead<'a> {
+    /// `full`: every token of the vocabulary.
+    Full,
+    /// The row list at this path.
+    List(&'a Path),
+}
+
 /// A value its kind took.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Value {
     /// A [`Kind::Flag`] or [`Kind::OnOff`].
     Flag(bool),
-    /// A [`Kind::Words`] word.
+    /// A [`Kind::Words`] or [`Kind::PathOr`] word.
     Word(&'static str),
     /// A [`Kind::Count`] or [`Kind::Multiple`] number.
     Count(u64),
     /// A [`Kind::Bytes`] count.
     Bytes(u64),
-    /// A [`Kind::Path`] or [`Kind::File`].
+    /// A [`Kind::Path`], [`Kind::PathOr`] or [`Kind::File`] path.
     Path(PathBuf),
 }
 
@@ -738,14 +756,16 @@ impl Levers {
         self.word(DRAFT)
     }
 
-    /// `BLOOMERY_MTP_HEAD_ROWS`: the MTP draft head's row list; `None` unset
-    /// (the full head).
+    /// `BLOOMERY_MTP_HEAD_ROWS`: the MTP draft's head, `full` or a row
+    /// list's path; `None` unset (the shipped list for its tokenizer's
+    /// target, the full head for any other: the model crate's rule).
     #[must_use]
-    pub fn mtp_head_rows(&self) -> Option<&Path> {
+    pub fn mtp_head_rows(&self) -> Option<MtpHead<'_>> {
         match &self.entry(MTP_HEAD_ROWS).value {
             None => None,
-            Some(Value::Path(p)) => Some(p),
-            v => panic!("{MTP_HEAD_ROWS} holds {v:?}, not a path"),
+            Some(Value::Word("full")) => Some(MtpHead::Full),
+            Some(Value::Path(p)) => Some(MtpHead::List(p)),
+            v => panic!("{MTP_HEAD_ROWS} holds {v:?}, not full or a path"),
         }
     }
 

@@ -31,10 +31,15 @@
 //! `truncated`. Unset, the context is [`CTX`] positions, or the largest the
 //! card holds when that is fewer, and at most what lets one session's
 //! sequence state with its two recurrent copies fit the prompt cache's budget
-//! (one session's whole context can be saved). Set, a context the card cannot
-//! hold beside the plan's dense weights — the largest context any plan of the
-//! file and the placement takes ([`fit38`]) — is refused by name before the
-//! load. A `ctx` line on stderr names the rule and the context, the largest
+//! (one session's whole context can be saved). Set, a context past the file's
+//! `context_length` (`place::serve_ctx`: YaRN scaling past it is not built),
+//! then one the card cannot hold beside the plan's dense weights — the
+//! largest context any plan of the file and the placement takes up to that
+//! cap ([`fit38`]) — is refused by name before the load. The `load` line
+//! prints the stores' `ctx`, the cap as `ctx_max`, `ctx_train` and
+//! `verified`, the deepest context the reference sets hold our numbers to
+//! ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`, `/props`'
+//! `engine.ctx_verified`), which bounds nothing. A `ctx` line on stderr names the rule and the context, the largest
 //! context the card holds with its card expert bytes, and the largest whose
 //! plan holds at most the plan's own margin (`MARGIN`) fewer card expert
 //! bytes than the plan at [`CTX`] ([`margin38`]): more positions on the card
@@ -68,15 +73,24 @@
 //! prints it with each term. A state of another model, card or context is
 //! refused by name; every save, load, eviction and skip prints as a line.
 //!
-//! The MTP draft keeps the same rule, and the server cuts its prompt calls
-//! at the same message starts (the draft's prompt call joins each run where
-//! the one before left it). The draft rejoins a sequence only where its last
-//! call left it, so a cut to a checkpoint, or a state put back, leaves it
-//! proposing nothing until a request starts from position 0: the seat turns
-//! the draft off there (`DraftedSeat::turn_off`), prints a
+//! The MTP draft keeps the same rule past a break-even, and the server cuts
+//! its prompt calls at the same message starts (the draft's prompt call joins
+//! each run where the one before left it). The draft rejoins a sequence only
+//! where its last call left it, so a cut to a checkpoint, or a state put
+//! back, leaves it proposing nothing until a request starts from position 0:
+//! the seat turns the draft off there (`DraftedSeat::turn_off`), prints a
 //! `bloomery-serve-qwen38: the MTP draft proposes nothing …` line at the cut
-//! or the resume, and each later prompt call's `mtp prompt` record names why. A request
-//! that keeps every held position keeps the draft.
+//! or at the first call after the resume, and each later prompt call's `mtp
+//! prompt` record names why. A request that keeps every held position with
+//! the draft on keeps the draft. One whose kept prefix would leave the draft
+//! off (a cut, or a draft already off) keeps it only at or past the
+//! break-even (`Q38::draft_keep`): the prefix whose re-prefill costs what the
+//! draft saves over the reply — the request's tokens through passes, at most
+//! `NOMINAL_REPLY`, that when it bounds nothing — at the placement's prompt
+//! rate (`docs/plan.md`, Qwen3.8 serve). Below it the server resets, the draft
+//! on again, and prefills the whole prompt. A `draft keep` line after the
+//! `cache` line prints the break-even, and each such request an `mtp keep`
+//! record (`kept` or `reset`, the prefix, the break-even, the reply).
 
 //! `BLOOMERY_DRAFT` unset follows the placement as `generate_qwen3moe`'s
 //! does (`bloomery_levers::draft38_unset`): under `--place a` or `bp` the MTP draft
@@ -93,13 +107,15 @@
 //!
 //! Drafting, the seat drives the session through the runtime's speculative
 //! loop with the shared window `app::mtp::MtpDraft` (the shared draft file
-//! beside the target or `BLOOMERY_MTP_DRAFT`'s, its head reduced under
-//! `BLOOMERY_MTP_HEAD_ROWS`): windows of four rows, the greedy ids the plain
+//! beside the target or `BLOOMERY_MTP_DRAFT`'s, its head
+//! `BLOOMERY_MTP_HEAD_ROWS`'s: unset the shipped list on a target of its
+//! tokenizer, `full` the full head): windows of four rows, the greedy ids the plain
 //! server's, `pass_rows` 4. A sampling or id-banning request takes plain
 //! steps (the server's loop asks a pass only of a greedy request with no
 //! banned id), each step's row the target's, read before the step is told
 //! to the draft; its ids are the plain server's. A `load draft=mtp` line
-//! follows the `load` line, and `/props`' `engine.draft` names the draft
+//! follows the `load` line, then the `mtp head` record (which head, what
+//! picked it and why), and `/props`' `engine.draft` names the draft
 //! with its resident bytes as the card's `draft` class. Every other word of
 //! the lever is refused by name, and so are `BLOOMERY_MTP_HEAD_ROWS` and
 //! `BLOOMERY_MTP_DRAFT` set on a server that drafts nothing, with why.
@@ -171,14 +187,15 @@ use bloomery_levers::{
 };
 use cuda_core::sys;
 use gguf::Split;
-use model::arch::models::{HeadRows, Mixer};
+use model::arch::models::Mixer;
+use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
-    Experts, KERNEL_POSITIONS, MtpInputs, PlanInputs, machine_bp, machine_for_experts,
-    read_head_rows, tier_batch,
+    Experts, MtpInputs, PlanInputs, machine_bp, machine_for_experts, serve_ctx, tier_batch,
 };
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{A6000, CardSpec, HostNeed, MARGIN, RTX_3090, host_available};
 use model::placement::{Machine, Plan, PlanLevers};
+use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
 use runtime::seqstate::HOST_BUDGET;
@@ -231,6 +248,66 @@ const MESSAGE_START: &str = "<|im_start|>";
 /// ([`DraftedSeat::turn_off`]).
 const DRAFT_OFF_WHY: &str = "the draft rejoins a sequence only where its last call left it, \
                              and it holds no rows at the kept position";
+
+/// The reply the break-even weighs ([`Q38::draft_keep`]) when a request
+/// bounds nothing, and the most it weighs: the mean greedy reply of the
+/// Korean chat prompts the shipped head list was chosen on (`docs/plan.md`,
+/// Qwen3.8 serve).
+const NOMINAL_REPLY: usize = 277;
+
+/// The plain step's and the drafted decode's positions per second, and the
+/// drafted prompt's ids per second under plan (a), that the break-even
+/// weighs (`docs/plan.md`, Qwen3.8 serve).
+const PLAIN_TPS: f64 = 57.88;
+const DRAFTED_TPS: f64 = 79.33;
+const PROMPT_IDS_PER_S: f64 = 1224.1;
+
+/// The drafted seat's break-even ([`Q38::draft_keep`]): `per_token` is the
+/// ids a reset re-prefills in the time the draft saves one reply token, so
+/// a kept prefix of fewer than `⌈reply · per_token⌉` positions costs less
+/// to prefill again than keeping it costs the reply's `reply` tokens.
+#[derive(Clone, Copy, Debug)]
+struct BreakEven {
+    per_token: f64,
+}
+
+impl BreakEven {
+    /// The break-even at `place`: the draft's gain a token times the rate a
+    /// reset re-prefills at — the ubatch walk's under `a` and `gate` (plan
+    /// (a)'s stands for the 3090's: the product is a ratio of one card's own
+    /// rates), a plain step's under `bp`, whose prompt runs by steps.
+    fn of(place: Place38) -> BreakEven {
+        let gain = 1.0 / PLAIN_TPS - 1.0 / DRAFTED_TPS;
+        let rate = match place {
+            Place38::A | Place38::Gate => PROMPT_IDS_PER_S,
+            Place38::Bp => PLAIN_TPS,
+        };
+        BreakEven {
+            per_token: gain * rate,
+        }
+    }
+
+    /// The kept positions that break even with a reply of `reply` tokens
+    /// through passes.
+    fn at(self, reply: usize) -> usize {
+        let r = f64::from(u32::try_from(reply).unwrap_or(u32::MAX));
+        (r * self.per_token).ceil() as usize
+    }
+}
+
+/// The branch a drafted request took at its kept prefix ([`Q38::draft_keep`]),
+/// its `mtp keep` record's fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Branch38 {
+    /// The prefix was kept (at or past the break-even); else the request
+    /// reset.
+    kept: bool,
+    /// The prefix the body's rule granted.
+    prefix: usize,
+    break_even: usize,
+    /// The reply tokens the break-even was derived for.
+    reply: usize,
+}
 
 /// Where `--place` puts the plan's stage card, and its expert tier card
 /// when it has one, as `generate_qwen3moe` takes it.
@@ -520,7 +597,8 @@ fn largest(
 }
 
 /// The largest context any plan of the file and the placement takes, up to
-/// the kernels' positions: the most a `--ctx-size` may name.
+/// the file's serving cap (`place::serve_ctx`: its `context_length`): the
+/// most a `--ctx-size` may name.
 fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
     let fits = |c: usize| Ok(plans.card(c).is_ok());
     if !fits(1)? {
@@ -534,7 +612,7 @@ fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
         )
         .into());
     }
-    let most = usize::try_from(KERNEL_POSITIONS)?;
+    let most = usize::try_from(serve_ctx(1, &plans.inputs.hp)?)?;
     let ctx = largest(1, most, fits)?;
     Ok(Fit38 {
         ctx,
@@ -560,10 +638,15 @@ fn margin38(
     Ok((c / CTX_STEP * CTX_STEP).max(base_at))
 }
 
-/// The seat's context (the module doc): `set` when it fits the card
-/// ([`fit38`]), else refused by name; unset, [`CTX`], or the fit when that
-/// is fewer. The prompt cache's bound comes after ([`Ctx38::host_bound`]).
+/// The seat's context (the module doc): `set` when the file's serving cap
+/// takes it (`place::serve_ctx`, refused by name past it) and it fits the
+/// card ([`fit38`]), else refused by name; unset, [`CTX`], or the fit when
+/// that is fewer. The prompt cache's bound comes after
+/// ([`Ctx38::host_bound`]).
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
+    if let Some(c) = set {
+        serve_ctx(u64::try_from(c)?, &plans.inputs.hp)?;
+    }
     let fit = fit38(plans)?;
     let base_at = CTX.min(fit.ctx);
     let base_bytes = plans.card(base_at)?;
@@ -776,12 +859,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The draft's one context condition (a window's positions) holds at any
     // context the rule grants; it is asked again at the final context below.
     let (mtp, draft_off) = draft38(&levers, a.place, a.ctx.unwrap_or(CTX), &draft_path)?;
-    let head_rows = levers.mtp_head_rows().map(PathBuf::from);
     // A draft lever set on a server that drafts nothing is refused, with why.
     if let Some(why) = &draft_off {
-        if head_rows.is_some() {
+        if levers.mtp_head_rows().is_some() {
             return Err(format!(
-                "BLOOMERY_MTP_HEAD_ROWS reduces the MTP draft's head; the server drafts nothing \
+                "BLOOMERY_MTP_HEAD_ROWS picks the MTP draft's head; the server drafts nothing \
                  ({why})"
             )
             .into());
@@ -832,15 +914,20 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::describe(&split)?;
     let model = model_props(&split, &inputs.model);
-    let mtp_inputs = match mtp {
+    // The head is picked once, here; the load prints the pick.
+    let head = match mtp {
         false => None,
-        true => {
-            let rows = match head_rows.as_deref() {
-                Some(p) => read_head_rows(p, &split, inputs.spec.vocab)?,
-                None => HeadRows::Full,
-            };
+        true => Some(head_rows_of(
+            levers.mtp_head_rows(),
+            &split,
+            inputs.spec.vocab,
+        )?),
+    };
+    let mtp_inputs = match &head {
+        None => None,
+        Some(h) => {
             let draft = open_draft(&draft_path, draft_from)?;
-            Some(MtpInputs::read(&draft, &split, &inputs, rows)?)
+            Some(MtpInputs::read(&draft, &split, &inputs, h.rows.clone())?)
         }
     };
     drop(split);
@@ -857,6 +944,17 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let rule = rule.host_bound(&inputs, cache.ram)?;
     rule.print();
     cache.print(MESSAGE_START, has_start, in_template);
+    if mtp {
+        let be = BreakEven::of(a.place);
+        eprintln!(
+            "draft keep place={} break_even={} reply={NOMINAL_REPLY} per_reply_token={} (the \
+             kept prefix below which a request that would leave the MTP draft off resets; \
+             docs/plan.md, Qwen3.8 serve)",
+            a.place.name(),
+            be.at(NOMINAL_REPLY),
+            be.per_token
+        );
+    }
     let ctx = rule.ctx;
     if draft38(&levers, a.place, ctx, &draft_path)?.0 != mtp {
         return Err(format!(
@@ -918,6 +1016,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let props = EngineProps {
         model: Some(model),
         placement: gpu.ok(),
+        ctx_verified: Some(VERIFIED_POSITIONS),
         ..EngineProps::default()
     };
 
@@ -930,7 +1029,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         pin_main: levers.pin_main(),
         path: path.clone(),
         mtp,
-        head_rows,
+        head,
         draft_path,
         draft_from,
         draft_bytes,
@@ -974,8 +1073,9 @@ struct SeatArgs {
     path: PathBuf,
     /// `BLOOMERY_DRAFT=mtp`, the MTP draft; unset the plain path.
     mtp: bool,
-    /// `BLOOMERY_MTP_HEAD_ROWS`, the draft head's row list.
-    head_rows: Option<std::path::PathBuf>,
+    /// The draft's head under `mtp` (`head_list::head_rows_of`), which the
+    /// load prints.
+    head: Option<HeadPick>,
     /// The MTP draft file under `mtp`, and what picked it.
     draft_path: PathBuf,
     draft_from: DraftFrom,
@@ -1002,6 +1102,14 @@ struct Q38 {
     /// The load runs the residency machine: each call prints its
     /// boundaries' `residency pass` records.
     residency: bool,
+    /// Under the draft, its break-even at the seat's placement.
+    break_even: Option<BreakEven>,
+    /// The branch the last keep query took ([`Q38::draft_keep`]), printed at
+    /// the request's first call.
+    branch: std::cell::Cell<Option<Branch38>>,
+    /// A state put back under the draft: its positions, whose draft-off line
+    /// prints at the request's first call if the draft is still off then.
+    resumed_off: Option<u32>,
 }
 
 impl Q38 {
@@ -1020,6 +1128,7 @@ impl Q38 {
         let t = Instant::now();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
         let inputs = PlanInputs::describe(&file)?;
+        let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.hp)?;
         let ub = ubatch_for(a.ctx)?;
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
         let mut m = match a.mtp {
@@ -1038,12 +1147,12 @@ impl Q38 {
                 )?
             }
             true => {
-                let rows = match a.head_rows.as_deref() {
-                    Some(p) => read_head_rows(p, &file, inputs.spec.vocab)?,
-                    None => HeadRows::Full,
-                };
+                let head = a
+                    .head
+                    .as_ref()
+                    .ok_or("a drafted load with no head picked")?;
                 let draft = open_draft(&a.draft_path, a.draft_from)?;
-                let mtp = MtpInputs::read(&draft, &file, &inputs, rows)?;
+                let mtp = MtpInputs::read(&draft, &file, &inputs, head.rows.clone())?;
                 let machine = a.place.machine(&inputs, ctx_ub, a.experts, Some(&mtp))?;
                 let plan = inputs.plan_mtp_with(
                     &machine,
@@ -1067,10 +1176,12 @@ impl Q38 {
         };
         m.set_mode(StepMode::Graph);
         eprintln!(
-            "load arch=qwen4exp resident_bytes={} ctx={} layers={} mode=graph store_bytes={} \
-             prefill=auto ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
+            "load arch=qwen4exp resident_bytes={} ctx={} ctx_max={cap} ctx_train={} \
+             verified={VERIFIED_POSITIONS} layers={} mode=graph store_bytes={} prefill=auto \
+             ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             a.ctx,
+            inputs.hp.n_ctx_train,
             m.layers().len(),
             m.body(WHAT)?.store_bytes(),
             m.body(WHAT)?.ubatch_rows(),
@@ -1098,6 +1209,14 @@ impl Q38 {
                 a.draft_bytes,
                 t.elapsed().as_secs_f64(),
             );
+            if let Some(pick) = &a.head {
+                Record::new(&record::MTP_HEAD38)
+                    .w("head", pick.head_word())
+                    .u("rows", pick.rows_of(inputs.spec.vocab))
+                    .w("from", pick.why.from_word())
+                    .w("why", &pick.why)
+                    .eprint();
+            }
         }
         let (launches, memops) = m.body(WHAT)?.step_launches();
         let nodes = m.capture_step()?;
@@ -1151,7 +1270,54 @@ impl Q38 {
             draft_bytes: a.draft_bytes,
             draft_path: a.draft_path,
             residency,
+            break_even: a.mtp.then(|| BreakEven::of(a.place)),
+            branch: std::cell::Cell::new(None),
+            resumed_off: None,
         })
+    }
+
+    /// The drafted seat's keep rule, its one owner: a prefix of `at`
+    /// positions the body's rule keeps, where keeping it leaves the draft
+    /// off for the reply — a cut below the held positions, or a draft already
+    /// off — is kept only at or past the break-even for the reply's `reply`
+    /// tokens through passes (the request's, at most [`NOMINAL_REPLY`], and
+    /// that when it bounds nothing); below it the request resets, which turns
+    /// the draft back on, and prefills its whole prompt. `None` where the rule
+    /// weighs nothing: no draft, nothing kept, or every held position kept
+    /// with the draft on.
+    fn draft_keep(&self, at: usize, reply: Option<usize>) -> Option<Branch38> {
+        let be = self.break_even?;
+        let held = self.s.pos() as usize;
+        if at == 0 || (at >= held && !self.drafted.is_off()) {
+            return None;
+        }
+        let reply = reply.map_or(NOMINAL_REPLY, |r| r.min(NOMINAL_REPLY));
+        let break_even = be.at(reply);
+        Some(Branch38 {
+            kept: at >= break_even,
+            prefix: at,
+            break_even,
+            reply,
+        })
+    }
+
+    /// What the request's reuse left to say, at its first call: the `mtp
+    /// keep` record of the branch its keep took, then, when a state was put
+    /// back and the draft is still off, the draft-off line.
+    fn before_call(&mut self) {
+        if let Some(b) = self.branch.take() {
+            Record::new(&record::MTP_KEEP38)
+                .w("branch", if b.kept { "kept" } else { "reset" })
+                .u("prefix", b.prefix)
+                .u("break_even", b.break_even)
+                .u("reply", b.reply)
+                .eprint();
+        }
+        if let Some(pos) = self.resumed_off.take()
+            && self.drafted.is_off()
+        {
+            draft_off(pos, "a state put back");
+        }
     }
 
     /// The `residency pass` records of the boundaries the last call made, on
@@ -1223,6 +1389,7 @@ impl Seat for Q38 {
     /// under the draft the draft's own prompt call, its store walked over
     /// the prompt's units.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        self.before_call();
         let next = self.drafted.prefill(&mut self.s, ids)?;
         self.print_passes()?;
         Ok(next)
@@ -1232,6 +1399,7 @@ impl Seat for Q38 {
     /// (`MtpDraft::before_step`: a request that continues the held
     /// sequence joins it here when its prompt call is empty).
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
+        self.before_call();
         let next = self.drafted.step(&mut self.s, last)?;
         self.print_passes()?;
         Ok(next)
@@ -1244,14 +1412,16 @@ impl Seat for Q38 {
     /// One step and the target's row of it, read before the step is told
     /// to the draft ([`DraftedSeat::step_with_row`]).
     fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
+        self.before_call();
         let next = self.drafted.step_with_row(&mut self.s, last, row)?;
         self.print_passes()?;
         Ok(next)
     }
 
-    /// The session's reset: the residency stays where use has taken it
-    /// (only [`Seat::residency_reset`] moves it back).
+    /// The session's reset, the MTP draft on again: the residency stays
+    /// where use has taken it (only [`Seat::residency_reset`] moves it back).
     fn reset(&mut self) -> Result<(), GateError> {
+        self.resumed_off = None;
         self.drafted.reset(&mut self.s)
     }
 
@@ -1274,6 +1444,7 @@ impl Seat for Q38 {
     /// One pass from `last`: under the draft the window of four rows,
     /// its kept tokens and counts; without it one step.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
+        self.before_call();
         let d = self.drafted.pass(&mut self.s, last, out)?;
         self.print_passes()?;
         Ok(d)
@@ -1287,13 +1458,35 @@ impl Seat for Q38 {
 
     /// The body's rule (`Body38::kept`): every held position, or the
     /// nearest checkpoint at or below `n`, with the rule's sentence when it
-    /// keeps less; the same under the MTP draft, which a cut leaves
-    /// proposing nothing ([`Seat::rollback`]).
+    /// keeps less.
     fn keep(&self, n: usize) -> (usize, Option<String>) {
         let pos = self.s.pos() as usize;
         let k = self.s.kept(u32::try_from(n).unwrap_or(u32::MAX));
         let at = k.at as usize;
         (at, (at < n.min(pos)).then(|| k.to_string()))
+    }
+
+    /// [`Seat::keep`] under the MTP draft's break-even ([`Q38::draft_keep`]):
+    /// a prefix whose keeping leaves the draft off is granted only at or past
+    /// it, which a cut then leaves proposing nothing ([`Seat::rollback`]);
+    /// below it nothing is granted, with the rule's sentence, and the server
+    /// resets. Without the draft, the body's rule.
+    fn keep_for(&self, n: usize, reply: Option<usize>) -> (usize, Option<String>) {
+        let (at, why) = self.keep(n);
+        let branch = self.draft_keep(at, reply);
+        self.branch.set(branch);
+        match branch {
+            Some(b) if !b.kept => (
+                0,
+                Some(format!(
+                    "under the MTP draft a kept prefix of {at} positions is below the \
+                     break-even of {} for a reply of {} tokens: the prompt is prefilled whole \
+                     with the draft on",
+                    b.break_even, b.reply
+                )),
+            ),
+            _ => (at, why),
+        }
     }
 
     /// The body's commit or its cut to a checkpoint ([`Seat::keep`]
@@ -1305,6 +1498,7 @@ impl Seat for Q38 {
         self.s.model_mut().rollback(pos)?;
         if self.drafted.drafts() && pos < held {
             self.drafted.turn_off(DRAFT_OFF_WHY);
+            self.resumed_off = None;
             draft_off(pos, &format!("a cut back from {held}"));
         }
         Ok(())
@@ -1363,8 +1557,10 @@ impl Seat for Q38 {
     }
 
     /// The state put back (`GpuModel::seq_resume`) after the session's reset,
-    /// which starts the draft over: no refresh of another sequence waits. A
-    /// state this seat did not take is refused by name.
+    /// which starts the draft over: no refresh of another sequence waits;
+    /// under the draft it is then off, said at the request's first call when
+    /// it still is ([`Q38::before_call`]: the keep rule may reset). A state
+    /// this seat did not take is refused by name.
     fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
         let saved = state
             .as_any()
@@ -1382,7 +1578,7 @@ impl Seat for Q38 {
         self.s.model_mut().seq_resume(&saved.state)?;
         if self.drafted.drafts() && saved.state.positions() > 0 {
             self.drafted.turn_off(DRAFT_OFF_WHY);
-            draft_off(saved.state.positions(), "a state put back");
+            self.resumed_off = Some(saved.state.positions());
         }
         Ok(())
     }

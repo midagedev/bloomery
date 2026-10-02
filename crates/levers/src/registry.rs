@@ -265,20 +265,28 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: MTP_HEAD_ROWS,
         class: Class::C,
-        kind: Kind::Path,
-        default: Unset::Means("the full head: every token of the vocabulary"),
-        doc: "Qwen3.8's MTP draft: the reduced head's row list (`tools/ref/draft-vocab.py`), \
-              the vocabulary ids its head scores, read in place from the target's `output` \
-              through the head's map. Its first line names the list's vocabulary and the \
-              target tokenizer's digest; a list of another tokenizer, unsorted, with an id \
-              repeated or past the vocabulary, or of no row is refused by name. The load's \
-              plan is the full head's, byte for byte (the map is one word a vocabulary id \
-              either way), so the target is the full head's target, and a drafted run's ids \
-              are its plain run's under any head: the list moves only the drafts' \
-              acceptance, and the emitted tokens are the full head's. One exception: a \
-              running residency (`BLOOMERY_RESIDENCY`) counts by pass, so a list that moves \
-              the acceptance moves the passes, the experts' flips with them, and the \
-              target's bits at a near tie.",
+        kind: Kind::PathOr(&["full"]),
+        default: Unset::Means(
+            "the list the model crate ships (Qwen3.8's hangul family, 65,536 rows) when the \
+             target's tokenizer is the one its first line names; the full head on any other \
+             target, the load's `mtp head` record saying why",
+        ),
+        doc: "Qwen3.8's MTP draft: the head its walks score with. Unset is the shipped row list \
+              (`crates/model/data/`, built in, its bytes pinned beside it: a list whose bytes \
+              are not the pinned ones is refused by name); `full` is every token of the \
+              vocabulary; any other value is the path of a row list (`tools/ref/draft-vocab.py`; \
+              a file named `full` is `./full`). A list is the vocabulary ids its head scores, \
+              read in place from the target's `output` through the head's map; its first line \
+              names the list's vocabulary and the target tokenizer's digest. A given list of \
+              another tokenizer, unsorted, with an id repeated or past the vocabulary, or of no \
+              row is refused by name; the shipped list on a target of another tokenizer is the \
+              full head, said in the `mtp head` record. The load's plan is the full head's, \
+              byte for byte (the map is one word a vocabulary id either way), so the target is \
+              the full head's target, and a drafted run's ids are its plain run's under any \
+              head: the list moves only the drafts' acceptance, and the emitted tokens are the \
+              full head's. One exception: a running residency (`BLOOMERY_RESIDENCY`) counts by \
+              pass, so a list that moves the acceptance moves the passes, the experts' flips \
+              with them, and the target's bits at a near tie.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

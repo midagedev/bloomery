@@ -648,6 +648,40 @@ pub static LOAD_DRAFT_OFF38: Kind = Kind {
     parts: &[lit(" ("), pos("why", Text, ""), lit(")")],
 };
 
+/// A drafted qwen4exp load's MTP head
+/// (`model::arch::qwen35moe::head_list::head_rows_of`).
+pub static MTP_HEAD38: Kind = Kind {
+    name: "mtp_head38",
+    head: "mtp head",
+    doc: "A drafted qwen4exp load's MTP head, after its load draft=mtp line: list or full, the \
+          rows it scores, what picked it (shipped: BLOOMERY_MTP_HEAD_ROWS unset and the target's \
+          tokenizer the shipped list's; other-tokenizer: unset on a target of another tokenizer, \
+          the full head; set: the lever's value) and why.",
+    parts: &[
+        key("head", Word, ""),
+        key("rows", U64, ""),
+        key("from", Word, ""),
+        key("why", Text, ""),
+    ],
+};
+
+/// The drafted Qwen3.8 seat's choice between a kept prefix and the draft.
+pub static MTP_KEEP38: Kind = Kind {
+    name: "mtp_keep38",
+    head: "mtp keep",
+    doc: "bloomery-serve-qwen38 under the MTP draft: a request whose kept prefix leaves the draft \
+          off (a cut, or the draft already off), and the branch it took: kept (the prefix at or \
+          past the break-even; the draft proposes nothing from there) or reset (below it: the \
+          prompt prefilled whole from position 0, the draft on), the prefix the keep rule \
+          granted, the break-even and the reply tokens it was derived for.",
+    parts: &[
+        key("branch", Word, ""),
+        key("prefix", U64, "positions"),
+        key("break_even", U64, "positions"),
+        key("reply", U64, "tokens"),
+    ],
+};
+
 /// The step's capture.
 pub static CAPTURE: Kind = Kind {
     name: "capture",
@@ -1845,6 +1879,8 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &CACHE_REUSE,
     &MTP_PROMPT,
     &LOAD_DRAFT_OFF38,
+    &MTP_HEAD38,
+    &MTP_KEEP38,
     &RESIDENCY_LEVER,
     &RESIDENCY_UNSET,
     &RESIDENCY_HOST,
@@ -1887,7 +1923,8 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// What `generate_qwen3moe` prints as records: a qwen4exp load's `plan`,
 /// its residency lever's word (set, before the load; unset, after the
 /// `plan`, or before the load on another family and under `--dump-taps`)
-/// and, drafting nothing, why after the `load` line; under `--dump-taps`,
+/// and, drafting nothing, why after the `load` line, drafting, its head
+/// after the `load draft=mtp` line; under `--dump-taps`,
 /// after its `load` line; a drafted arm's `mtp summary` and, under
 /// `BLOOMERY_MTP_WINDOWS`, its `mtp window` records after its lines; and
 /// under `BLOOMERY_STEP_STATS`, after a qwen4exp run's lines; the binary's
@@ -1895,6 +1932,7 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
     &LOAD_DRAFT_OFF38,
+    &MTP_HEAD38,
     &TAPS_SEQ,
     &TAPS_DUMP,
     &MTP_SUMMARY,

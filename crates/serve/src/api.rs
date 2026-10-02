@@ -1025,7 +1025,8 @@ fn put<T: Into<Value>>(o: &mut Map<String, Value>, key: &str, v: Option<T>) {
 
 /// `/props`' `engine` object in toktape's shape: the server's own `name`,
 /// `version` (with the engine's note), `args` (this process's argv, verbatim)
-/// and `server_pid`, and the model, placement and draft the engine reports.
+/// and `server_pid`, and the model, placement, draft and verified context
+/// the engine reports.
 fn engine_object(p: &EngineProps) -> Value {
     let mut o = Map::new();
     o.insert("name".into(), json!("bloomery"));
@@ -1045,6 +1046,7 @@ fn engine_object(p: &EngineProps) -> Value {
         p.placement.as_ref().map(placement_object),
     );
     put(&mut o, "draft", p.draft.as_ref().map(draft_object));
+    put(&mut o, "ctx_verified", p.ctx_verified);
     o.insert("server_pid".into(), json!(std::process::id()));
     Value::Object(o)
 }
@@ -2199,10 +2201,24 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, SlotQueue, after_accept_error,
+        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, EngineProps, SlotQueue,
+        after_accept_error, engine_object,
     };
     use std::io;
     use std::time::Duration;
+
+    /// `engine.ctx_verified` is the engine's verified context when it
+    /// reports one, and absent when it does not: nothing is guessed.
+    #[test]
+    fn engine_object_carries_the_verified_context_only_when_reported() {
+        let with = engine_object(&EngineProps {
+            ctx_verified: Some(3001),
+            ..EngineProps::default()
+        });
+        assert_eq!(with["ctx_verified"], 3001, "{with}");
+        let without = engine_object(&EngineProps::default());
+        assert!(without.get("ctx_verified").is_none(), "{without}");
+    }
 
     /// A failed `accept` ends the server only when the listener no longer
     /// stands or the error is the listening socket's own; a client's aborted

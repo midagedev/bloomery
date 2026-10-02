@@ -65,6 +65,11 @@ where
         self.spec.is_some()
     }
 
+    /// Whether the draft is off until the next reset ([`DraftedSeat::turn_off`]).
+    pub(crate) fn is_off(&self) -> bool {
+        self.off.is_some()
+    }
+
     /// The prompt: under the draft the draft's own prompt call, its store
     /// walked over the prompt's units, then its join record; without it the
     /// session's prompt call.

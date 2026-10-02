@@ -146,6 +146,14 @@ pub trait Engine: Send {
     }
     /// Drops the whole cache; the next `prefill` starts at position 0.
     fn reset(&mut self) -> Result<(), EngineError>;
+    /// The next request's reply, told before its cache is reused: at most
+    /// `tokens` of its generated tokens come from [`Engine::advance`]
+    /// (`Some(0)` for a request that takes no pass, `None` when the request
+    /// bounds nothing). An engine whose [`Engine::keepable`] weighs a kept
+    /// prefix against the reply reads it there; the default ignores it.
+    fn will_reply(&mut self, tokens: Option<usize>) {
+        let _ = tokens;
+    }
     /// The longest prefix, at most `n` positions, of what the cache holds now
     /// that [`Engine::cut`] can keep. The default is 0: the caller resets
     /// instead, so an engine without `cut` never has it called.
@@ -444,6 +452,10 @@ pub struct EngineProps {
     pub placement: Option<PlacementProps>,
     /// The speculative drafter, when one runs.
     pub draft: Option<DraftProps>,
+    /// The deepest context, in positions, at which the engine's numbers are
+    /// held to its reference engine's on this model. It bounds nothing: the
+    /// server serves `n_ctx`.
+    pub ctx_verified: Option<u64>,
 }
 
 /// The model file (`engine.model`), from its header.
