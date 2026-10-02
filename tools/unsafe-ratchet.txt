@@ -79,7 +79,10 @@ placement 0 0 0
 # PIN(2026-10-03): qdot 77 -> 80 blocks, 41 -> 43 fns, new kernels, not old code relaxed: the Q6_K row lanes
 # (pack_lanes_q6k_avx2, dot_lanes_q6k_avx2: two unsafe fns, one block each) and pack_lanes' Q6_K arm, each with its
 # SAFETY line; lanes keeps its one block for both kernels.
-qdot 80 43 0
+# PIN(2026-10-03): qdot 43 -> 45 fns (blocks 80 unchanged), new code, not old code relaxed: the row-lane pack's
+# prefetch helpers lane_ahead and lane_ahead_last (unsafe fns: each reads a line of `next` its caller sized); the
+# pack's three per-arm blocks became pack_group's one block plus one in each helper, each with its SAFETY line.
+qdot 80 45 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

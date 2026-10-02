@@ -136,6 +136,15 @@ const ROUTED_K: usize = UNION_MAX_COLS;
 /// The deferral arms: the claim inside the row dispatch, then the pre-pass.
 const ARMS: [(&str, bool); 2] = [("defer", true), ("prepass", false)];
 
+/// The row-lane cases' arms: [`ARMS`] with the lane packs' prefetch off, and
+/// the deferred arm again with it on (`ops::set_lane_prefetch`): a prefetch
+/// moves no value, so every arm is held to the same columns.
+const LANE_ARMS: [(&str, bool, bool); 3] = [
+    ("defer", true, false),
+    ("prepass", false, false),
+    ("defer+ahead", true, true),
+];
+
 /// The group tails the gate runs: batches of `UNION_MAX_COLS`, and the
 /// columns the last one lacks.
 const TAILS: [(usize, usize); 2] = [(UNION_TAIL_MAX_GROUPS, 0), (3, 300)];
@@ -704,13 +713,15 @@ fn hw_union_wide_matches_per_column_v41() {
             }
             let mut diff = 0;
             let mut counted = true;
-            for (arm, on) in ARMS {
+            for (arm, on, ahead) in LANE_ARMS {
                 ops::set_defer_quant(Some(on));
+                ops::set_lane_prefetch(ahead);
                 let mut got = vec![f32::NAN; embd * k];
                 let (r, ds, dp) = dispatched(&mut us, |us| {
                     layer.experts_union_into(src, &case.x, &lists, &mut got, us)
                 });
                 ops::set_defer_quant(None);
+                ops::set_lane_prefetch(bloomery_levers::LANE_PREFETCH_DEFAULT);
                 r.unwrap_or_else(|e| panic!("layer {l} k {k} {arm}: {e}"));
                 let d = diff_cells(&got, &want);
                 let want_d = call_dispatches(k, case.slots(), on);
@@ -743,13 +754,15 @@ fn hw_union_wide_matches_per_column_v41() {
         routed_spread &= lo < hi && past > 0 && past < case.union();
         let mut diff = 0;
         let mut counted = true;
-        for (arm, on) in ARMS {
+        for (arm, on, ahead) in LANE_ARMS {
             ops::set_defer_quant(Some(on));
+            ops::set_lane_prefetch(ahead);
             let mut got = vec![f32::NAN; embd * ROUTED_K];
             let (r, ds, dp) = dispatched(&mut us, |us| {
                 layer.experts_union_into(src, &case.x, &lists, &mut got, us)
             });
             ops::set_defer_quant(None);
+            ops::set_lane_prefetch(bloomery_levers::LANE_PREFETCH_DEFAULT);
             r.unwrap_or_else(|e| panic!("layer {l} routed {arm}: {e}"));
             let d = diff_cells(&got, &want);
             let want_d = call_dispatches(ROUTED_K, case.slots(), on);
@@ -790,7 +803,8 @@ fn hw_union_wide_matches_per_column_v41() {
     println!(
         "PASSED: union wide — experts_union_into equals experts_into column for column, bit for \
          bit, at k = 16, 64, 512 (the last over every expert of the layer) and a routed k = 512 \
-         on a Q5_K-down and a Q4_K-down layer under both deferral arms, five pool dispatches a call"
+         on a Q5_K-down and a Q4_K-down layer under both deferral arms and the lane packs' \
+         prefetch, five pool dispatches a call"
     );
 }
 
@@ -1524,7 +1538,8 @@ fn q6_lists() -> Vec<Vec<(u32, f32)>> {
 }
 
 /// The Q6_K down lane: the union call at k = 1, 8 and 10 against `experts_into` of every
-/// column, bit for bit, under both deferral arms, in its dispatches.
+/// column, bit for bit, under both deferral arms and the lane packs' prefetch
+/// ([`LANE_ARMS`]), in its dispatches.
 #[test]
 #[ignore = "hw: the box's CPU (qdot's fused kernels run on AVX2); reads no model file"]
 fn hw_union_q6_k_down_matches_per_column() {
@@ -1573,13 +1588,15 @@ fn hw_union_q6_k_down_matches_per_column() {
             sub.slots(),
             sub.union()
         );
-        for (arm, on) in ARMS {
+        for (arm, on, ahead) in LANE_ARMS {
             ops::set_defer_quant(Some(on));
+            ops::set_lane_prefetch(ahead);
             let mut got = vec![f32::NAN; embd * kk];
             let (r, ds, dp) = dispatched(&mut us, |us| {
                 host_layer.experts_union_into(src, &sub.x, &lists, &mut got, us)
             });
             ops::set_defer_quant(None);
+            ops::set_lane_prefetch(bloomery_levers::LANE_PREFETCH_DEFAULT);
             r.unwrap_or_else(|e| panic!("q6_K down k {kk} {arm}: {e}"));
             let d = diff_cells(&got, &want[..kk * embd]);
             let want_d = call_dispatches(kk, sub.slots(), on);
@@ -1605,6 +1622,7 @@ fn hw_union_q6_k_down_matches_per_column() {
     );
     println!(
         "PASSED: union q6_K down — the union call at k = 1, 8, 10 (the last through the row \
-         lanes, its Q6_K down included) equal to experts_into bit for bit under both deferral arms"
+         lanes, its Q6_K down included) equal to experts_into bit for bit under both deferral arms \
+         and the lane packs' prefetch"
     );
 }

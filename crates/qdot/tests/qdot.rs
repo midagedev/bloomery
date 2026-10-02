@@ -4160,7 +4160,10 @@ fn lane_fill(ty: GgmlType, k: usize, fill: u8) -> Vec<u8> {
 }
 
 /// Clause of one row set (a whole number of 8-row groups): every group packed
-/// ([`qdot::pack_lanes`], into a buffer prefilled with 0xA5), then for c =
+/// ([`qdot::pack_lanes`], into a buffer prefilled with 0xA5) without a next
+/// group, and again with the set's next group (the first, after the last) as
+/// `next` into a second 0xA5 buffer, which must hold the same bytes — the
+/// prefetch arm moves no value; then for c =
 /// 1..=TILE_COLS and every starting column of the cyclic list `acols`, the
 /// group's lanes over the c columns from there equal `dot_row` per (row,
 /// column), bit for bit — on the packed group and the columns in place, then
@@ -4210,16 +4213,24 @@ fn assert_lanes_match(
     let group_bytes = L * row_bytes;
     let canary = f32::from_bits(0x7fc0_dead);
     let mut packed = vec![0xA5u8; qdot::lane_pack_bytes(k)];
+    let mut ahead = vec![0xA5u8; qdot::lane_pack_bytes(k)];
+    let groups = rows / L;
     let mut calls = 0;
-    for g in 0..rows / L {
+    for g in 0..groups {
+        let group = &bytes[g * group_bytes..(g + 1) * group_bytes];
+        let h = (g + 1) % groups;
+        let next = &bytes[h * group_bytes..(h + 1) * group_bytes];
         packed.fill(0xA5);
-        qdot::pack_lanes(
-            ty,
-            &bytes[g * group_bytes..(g + 1) * group_bytes],
-            k,
-            &mut packed,
-        )
-        .unwrap();
+        qdot::pack_lanes(ty, group, &[], k, &mut packed).unwrap();
+        ahead.fill(0xA5);
+        qdot::pack_lanes(ty, group, next, k, &mut ahead).unwrap();
+        if let Some(at) = packed.iter().zip(&ahead).position(|(a, b)| a != b) {
+            panic!(
+                "{label}: group {g} packed with group {h} as next differs from its pack \
+                 without one at byte {at}: {:#04x} vs {:#04x}",
+                ahead[at], packed[at]
+            );
+        }
         let (moved, at) = misaligned_copy(&packed);
         let moved = &moved[at..at + packed.len()];
         for c in 1..=qdot::TILE_COLS {
@@ -4345,8 +4356,8 @@ fn hw_lanes_match_dot_row_v41() {
 }
 
 /// The row lanes refuse, by name and with their outputs left as they were: a
-/// type without lanes, a `k` off the 256-value grid, a pack's rows or group of
-/// another length, a column count outside `1..=TILE_COLS`, an `out` of
+/// type without lanes, a `k` off the 256-value grid, a pack's rows, next rows
+/// or group of another length, a column count outside `1..=TILE_COLS`, an `out` of
 /// another length, a group of another length and a short column. `k = 0`
 /// packs nothing.
 #[test]
@@ -4362,7 +4373,10 @@ fn hw_lanes_refuse_bad_shapes() {
     let canary_b = 0x5Au8;
     let mut packed = vec![canary_b; need + 1];
     let mut pack = |w: GgmlType, rows: &[u8], k: usize, len: usize, want: QdotError| {
-        assert_eq!(qdot::pack_lanes(w, rows, k, &mut packed[..len]), Err(want));
+        assert_eq!(
+            qdot::pack_lanes(w, rows, &[], k, &mut packed[..len]),
+            Err(want)
+        );
         assert!(
             packed.iter().all(|&b| b == canary_b),
             "the refusal {want:?} wrote into packed"
@@ -4433,7 +4447,25 @@ fn hw_lanes_refuse_bad_shapes() {
             need,
         },
     );
-    assert_eq!(qdot::pack_lanes(ty, &[], 0, &mut []), Ok(()), "k = 0");
+    for next in [
+        &rows[..rows.len() - 1],
+        &[rows.as_slice(), &[0]].concat()[..],
+    ] {
+        assert_eq!(
+            qdot::pack_lanes(ty, &rows, next, k, &mut packed[..need]),
+            Err(QdotError::RowGroupBytes {
+                buf: "lane next rows",
+                have: next.len(),
+                need: 8 * 144,
+            })
+        );
+        assert!(
+            packed.iter().all(|&b| b == canary_b),
+            "the next-rows refusal at {} bytes wrote into packed",
+            next.len()
+        );
+    }
+    assert_eq!(qdot::pack_lanes(ty, &[], &[], 0, &mut []), Ok(()), "k = 0");
 
     let group = vec![0u8; need];
     let many: Vec<&[u8]> = vec![a.as_slice(); qdot::TILE_COLS + 1];

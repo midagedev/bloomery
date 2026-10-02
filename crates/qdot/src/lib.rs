@@ -74,8 +74,8 @@ pub enum QdotError {
     /// ([`repack_q3k_r8`]'s `rows` or `out`), `"unpack source"` or
     /// `"unpack destination"` ([`unpack_q3k_r8`]'s `groups` or `out`),
     /// `"tile group"` (the group handed to [`dot_q3k_r8_cols`]), or `"lane
-    /// rows"` or `"lane group"` ([`pack_lanes`]' `rows` or `packed`, the
-    /// group [`dot_lanes_cols`] reads).
+    /// rows"`, `"lane next rows"` or `"lane group"` ([`pack_lanes`]' `rows`,
+    /// `next` or `packed`, the group [`dot_lanes_cols`] reads).
     RowGroupBytes {
         buf: &'static str,
         have: usize,
@@ -843,6 +843,12 @@ fn check_lanes(w: GgmlType, k: usize) -> Result<usize, QdotError> {
 /// type's row bytes) unpacked into one row-lane group in `packed`, which is
 /// exactly [`lane_pack_bytes`] long — the layout [`dot_lanes_cols`] reads.
 ///
+/// `next` is empty, or the next group's rows, `rows`' length: then each
+/// super-block's pass also prefetches the next `1 / (k / 256)` of `next`'s
+/// bytes toward L2, so the next group is in flight by the time this one is
+/// packed and lands while its columns are dotted. A prefetch moves no value:
+/// `packed` is the same bytes either way.
+///
 /// Per super-block `i`, 2,560 bytes at `2,560 i`. Q4_K and Q5_K: code vector
 /// `(s, g)` at `32 (8 s + g)` holds at byte `b` row `b / 4`'s code (0..15;
 /// Q5_K with its high bit, 0..31) of sub-block `s`, value `4 g + b % 4`; then
@@ -854,41 +860,66 @@ fn check_lanes(w: GgmlType, k: usize) -> Result<usize, QdotError> {
 /// the one-column kernel forms, one rounding each.
 ///
 /// A type without row lanes ([`QdotError::NoLanes`]), a `k` off the
-/// 256-value grid and a `rows` or `packed` of another length
-/// ([`QdotError::RowGroupBytes`]) are named errors, and none writes to
-/// `packed`. `k = 0` is `Ok` with both buffers empty.
-pub fn pack_lanes(w: GgmlType, rows: &[u8], k: usize, packed: &mut [u8]) -> Result<(), QdotError> {
+/// 256-value grid, a `rows` or `packed` of another length and a non-empty
+/// `next` of another length than `rows` ([`QdotError::RowGroupBytes`]) are
+/// named errors, and none writes to `packed`. `k = 0` is `Ok` with every
+/// buffer empty.
+pub fn pack_lanes(
+    w: GgmlType,
+    rows: &[u8],
+    next: &[u8],
+    k: usize,
+    packed: &mut [u8],
+) -> Result<(), QdotError> {
     let nb = check_lanes(w, k)?;
     let block = match w {
         GgmlType::Q4_K => Q4K_BLOCK,
         GgmlType::Q5_K => Q5K_BLOCK,
         _ => Q6K_BLOCK,
     };
+    let group = LANE_ROWS * nb * block;
     for (buf, have, need) in [
-        ("lane rows", rows.len(), LANE_ROWS * nb * block),
+        ("lane rows", rows.len(), group),
+        (
+            "lane next rows",
+            next.len(),
+            if next.is_empty() { 0 } else { group },
+        ),
         ("lane group", packed.len(), lane_pack_bytes(k)),
     ] {
         if have != need {
             return Err(QdotError::RowGroupBytes { buf, have, need });
         }
     }
-    match w {
-        GgmlType::Q4_K => {
-            // SAFETY: has_lanes saw AVX2+FMA+F16C; `rows` holds LANE_ROWS rows
-            // of nb Q4_K blocks and `packed` nb packed super-blocks (checked
-            // above).
-            unsafe { pack_lanes_avx2::<false>(rows, nb, packed) };
-        }
-        GgmlType::Q5_K => {
-            // SAFETY: as the Q4_K arm, for Q5_K blocks.
-            unsafe { pack_lanes_avx2::<true>(rows, nb, packed) };
-        }
-        _ => {
-            // SAFETY: as the Q4_K arm, for Q6_K blocks.
-            unsafe { pack_lanes_q6k_avx2(rows, nb, packed) };
-        }
+    if next.is_empty() {
+        pack_group::<false>(w, rows, next, nb, packed);
+    } else {
+        pack_group::<true>(w, rows, next, nb, packed);
     }
     Ok(())
+}
+
+/// [`pack_lanes`] over checked buffers: `w` a row-lane type, `rows`
+/// [`LANE_ROWS`] rows of `nb` blocks of it, `next` (with `AHEAD`) as many
+/// bytes, `packed` `nb` packed super-blocks. One function an arm, so each
+/// arm's three kernels are compiled alike: each the one call of its body.
+#[inline(never)]
+fn pack_group<const AHEAD: bool>(
+    w: GgmlType,
+    rows: &[u8],
+    next: &[u8],
+    nb: usize,
+    packed: &mut [u8],
+) {
+    // SAFETY: has_lanes saw AVX2+FMA+F16C; the buffers' sizes are the
+    // caller's checks.
+    unsafe {
+        match w {
+            GgmlType::Q4_K => pack_lanes_avx2::<false, AHEAD>(rows, next, nb, packed),
+            GgmlType::Q5_K => pack_lanes_avx2::<true, AHEAD>(rows, next, nb, packed),
+            _ => pack_lanes_q6k_avx2::<AHEAD>(rows, next, nb, packed),
+        }
+    }
 }
 
 /// One row-lane group ([`pack_lanes`]' `packed`) against up to [`TILE_COLS`]
@@ -3300,20 +3331,69 @@ unsafe fn lane_codes<const Q5: bool, const LO: i32, const HI: i32>(
     }
 }
 
+/// Super-block `i`'s share of the next group's prefetch ([`pack_lanes`]'
+/// `next`): the `SHARE` bytes of `next` from `i · SHARE`, a line at a time,
+/// toward L2 (`T1`: the group is read only after this one's columns are
+/// dotted, which runs the packed group and the columns through L1). Before
+/// the first share the kernel takes `next`'s last byte ([`lane_ahead_last`]),
+/// whose line the steps of 64 miss when `next` does not start on a line.
+///
+/// # Safety
+/// `next` must hold at least `(i + 1) · SHARE` bytes.
+#[inline(always)]
+unsafe fn lane_ahead<const SHARE: usize>(next: &[u8], i: usize) {
+    // SAFETY: every offset is below `(i + 1) · SHARE`, inside `next` (the
+    // caller's contract); a prefetch reads nothing into the program.
+    unsafe {
+        let at = next.as_ptr().add(i * SHARE);
+        for t in 0..SHARE.div_ceil(64) {
+            _mm_prefetch::<_MM_HINT_T1>(at.add(64 * t) as *const i8);
+        }
+    }
+}
+
+/// The line of `next`'s last byte toward L2 ([`lane_ahead`]).
+///
+/// # Safety
+/// `next` must not be empty.
+#[inline(always)]
+unsafe fn lane_ahead_last(next: &[u8]) {
+    // SAFETY: `next.len() - 1` is inside the non-empty `next` (the caller's
+    // contract); a prefetch reads nothing into the program.
+    unsafe { _mm_prefetch::<_MM_HINT_T1>(next.as_ptr().add(next.len() - 1) as *const i8) };
+}
+
 /// AVX2 pack of [`LANE_ROWS`] Q4_K (or, with `Q5`, Q5_K) rows of `nb` blocks
-/// into [`pack_lanes`]' layout.
+/// into [`pack_lanes`]' layout; with `AHEAD`, each super-block's pass also
+/// prefetches its share of `next` ([`lane_ahead`]).
 ///
 /// # Safety
 /// AVX2+FMA+F16C must be present; `rows` must hold [`LANE_ROWS`] rows of `nb`
-/// blocks and `packed` `nb` packed super-blocks.
+/// blocks, `next` (with `AHEAD`) as many bytes, and `packed` `nb` packed
+/// super-blocks.
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
-unsafe fn pack_lanes_avx2<const Q5: bool>(rows: &[u8], nb: usize, packed: &mut [u8]) {
+unsafe fn pack_lanes_avx2<const Q5: bool, const AHEAD: bool>(
+    rows: &[u8],
+    next: &[u8],
+    nb: usize,
+    packed: &mut [u8],
+) {
     // SAFETY: AVX2+FMA+F16C present; every read lies inside a row's block and
     // every write inside the super-block's 2,560 bytes (the caller's sizes).
     unsafe {
         let (block, qs_off) = if Q5 { (Q5K_BLOCK, 48) } else { (Q4K_BLOCK, 16) };
         let row_bytes = nb * block;
+        if AHEAD {
+            lane_ahead_last(next);
+        }
         for i in 0..nb {
+            if AHEAD {
+                if Q5 {
+                    lane_ahead::<{ LANE_ROWS * Q5K_BLOCK }>(next, i);
+                } else {
+                    lane_ahead::<{ LANE_ROWS * Q4K_BLOCK }>(next, i);
+                }
+            }
             let dst = packed.as_mut_ptr().add(i * LANE_SB_BYTES);
             let wb: [*const u8; LANE_ROWS] =
                 std::array::from_fn(|r| rows.as_ptr().add(r * row_bytes + i * block));
@@ -3383,18 +3463,33 @@ unsafe fn pack_lanes_avx2<const Q5: bool>(rows: &[u8], nb: usize, packed: &mut [
 /// byte within a 16-bit lane, so the transpose, which moves whole dwords,
 /// commutes with it.
 ///
+/// With `AHEAD`, each super-block's pass also prefetches its share of `next`
+/// ([`lane_ahead`]).
+///
 /// # Safety
 /// AVX2+FMA+F16C must be present; `rows` must hold [`LANE_ROWS`] rows of `nb`
-/// Q6_K blocks and `packed` `nb` packed super-blocks.
+/// Q6_K blocks, `next` (with `AHEAD`) as many bytes, and `packed` `nb` packed
+/// super-blocks.
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
-unsafe fn pack_lanes_q6k_avx2(rows: &[u8], nb: usize, packed: &mut [u8]) {
+unsafe fn pack_lanes_q6k_avx2<const AHEAD: bool>(
+    rows: &[u8],
+    next: &[u8],
+    nb: usize,
+    packed: &mut [u8],
+) {
     // SAFETY: AVX2+FMA+F16C present; every read lies inside a row's block and
     // every write inside the super-block's 2,560 bytes (the caller's sizes).
     unsafe {
         let ml = _mm256_set1_epi8(0xF);
         let mh = _mm256_set1_epi8(0x30);
         let row_bytes = nb * Q6K_BLOCK;
+        if AHEAD {
+            lane_ahead_last(next);
+        }
         for i in 0..nb {
+            if AHEAD {
+                lane_ahead::<{ LANE_ROWS * Q6K_BLOCK }>(next, i);
+            }
             let dst = packed.as_mut_ptr().add(i * LANE_SB_BYTES);
             let wb: [*const u8; LANE_ROWS] =
                 std::array::from_fn(|r| rows.as_ptr().add(r * row_bytes + i * Q6K_BLOCK));

@@ -168,8 +168,8 @@ mod cli {
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, prompt_bytes};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, PREFILL_GROUP, R8, RESIDENCY,
-        ROUTE_TRACE, ResidencyPick, ResidencyWhy, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH, PREFILL_GROUP,
+        R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
@@ -189,6 +189,7 @@ mod cli {
         RESIDENCY,
         STEP_STATS,
         PREFILL_GROUP,
+        LANE_PREFETCH,
     ];
 
     /// The drafted window's verify: the target's next token and the draft's
@@ -220,6 +221,10 @@ mod cli {
         Ok(s.split(',')
             .map(|v| v.trim().parse::<u32>())
             .collect::<Result<_, _>>()?)
+    }
+
+    fn on_off(on: bool) -> &'static str {
+        if on { "on" } else { "off" }
     }
 
     fn mode_name(m: StepMode) -> &'static str {
@@ -286,6 +291,7 @@ mod cli {
                 .map_err(SessionError::Caller)?
                 .w("prefill", self.prefill.name())
                 .u("group", self.group)
+                .w("lane_prefetch", on_off(model::ops::lane_prefetch()))
                 .w("mode", mode_name(self.mode))
                 .w("place", self.place)
                 .w("pin_main", "off")
@@ -323,6 +329,7 @@ mod cli {
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(ACTS_ON)?;
+        model::ops::set_lane_prefetch(levers.lane_prefetch());
         record::at_main("generate_glm5next", record::GENERATE_GLM5NEXT);
         let ids = ids_of(&flag("--tokens")?.ok_or("--tokens a,b,c is required")?)?;
         if ids.is_empty() {

@@ -2289,7 +2289,8 @@ impl<'a> PairWork<'a> {
     /// lanes: each group unpacked once into this participant's [`LANE_BUF`]
     /// ([`qdot::pack_lanes`]), then dotted with the columns in runs of up to
     /// [`qdot::TILE_COLS`] ([`qdot::dot_lanes_cols`]), which writes each (row,
-    /// column)'s `dot_row` value bit for bit.
+    /// column)'s `dot_row` value bit for bit. Under [`lane_prefetch`] each
+    /// group's pack also prefetches the group after it in `rows`.
     ///
     /// # Safety
     ///
@@ -2323,6 +2324,8 @@ impl<'a> PairWork<'a> {
         let acol = unsafe { std::slice::from_raw_parts(aptr, self.src_ne1 * cb) };
         let (ty, k, n) = (self.ty, self.k, self.n);
         let group_bytes = G * self.row_bytes;
+        let ahead = lane_prefetch();
+        let last = rows.end / G;
         LANE_BUF.with(|cell| {
             let mut buf = cell.borrow_mut();
             let len = qdot::lane_pack_bytes(k);
@@ -2332,9 +2335,15 @@ impl<'a> PairWork<'a> {
             let packed = &mut buf[..len];
             for g in rows.start / G..rows.end / G {
                 let t_dot = if lvl >= 2 { Some(Instant::now()) } else { None };
+                let next: &[u8] = if ahead && g + 1 < last {
+                    &self.bytes[(g + 1) * group_bytes..(g + 2) * group_bytes]
+                } else {
+                    &[]
+                };
                 qdot::pack_lanes(
                     ty,
                     &self.bytes[g * group_bytes..(g + 1) * group_bytes],
+                    next,
                     k,
                     packed,
                 )?;
@@ -2619,6 +2628,26 @@ pub fn set_defer_quant(mode: Option<bool>) {
 /// a test picked the pre-pass ([`set_defer_quant`]).
 pub(crate) fn defer_quant() -> bool {
     DEFER_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) != 2
+}
+
+/// [`lane_prefetch`]'s value: the registry's default until a binary's `main`
+/// sets its parsed lever ([`set_lane_prefetch`]).
+static LANE_PREFETCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(bloomery_levers::LANE_PREFETCH_DEFAULT);
+
+/// `BLOOMERY_LANE_PREFETCH` as a binary's `main` parsed it
+/// (`bloomery_levers::Levers::lane_prefetch`), set once before the first
+/// union call; a binary that does not act on the lever keeps the registry's
+/// default.
+pub fn set_lane_prefetch(on: bool) {
+    LANE_PREFETCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the union's row-lane passes prefetch each group's successor while
+/// they pack it ([`PairWork::compute_lanes`]). Either way every value is
+/// `dot_row`'s.
+pub fn lane_prefetch() -> bool {
+    LANE_PREFETCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A deferred slot's claim state.

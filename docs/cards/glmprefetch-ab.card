@@ -1,0 +1,71 @@
+# Round glmprefetch: the host union's row-lane pack prefetches the next 8-row group of its participant's range toward
+# L2 while it packs this one, a slice a super-block (qdot::pack_lanes' `next`, `_MM_HINT_T1`), behind the lever
+# BLOOMERY_LANE_PREFETCH (on|off, default off). Same binary, both arms; a prefetch moves no value (qdot
+# hw_lanes_match_dot_row_* pack every group both ways and hold the packed bytes equal; union LANE_ARMS hold the calls).
+#
+# Decomposition [derived, round report section 1], from glmlane2's perf window (3090, place gate, P = 768, G2, runtime
+# values): the pack is ~50 us a host expert, ~21.5 of it instructions at the dot's IPC; a group super-block costs
+# ~110 ns (Q4_K, 1,152 B, 18 lines) and ~169 ns (Q5_K, 1,408 B, 22 lines) against 49 / 69 ns of instructions, so
+# 61 / 100 ns a group super-block is stall: 28.4 us an expert (gate/up 512 groups x 16, down 512 x 8, 32
+# participants). A union block is at most 18 groups and the last group of a compute range has no next: 17/18 is
+# covered, 26.8 us an expert at most. The next group (18,432 B gate/up, 11,264 B down) is requested over this group's
+# pack and lands during its dot (a group's period ~9.3 us of thread time against ~4 us for 18 KB at a 32nd of the
+# box's 147.7 GB/s); the group's LANE_BUF (40 / 20 KB), the next raw group and m ~19 columns (~87 KB) sit in the
+# 512 KB L2. Under plan (a) at P = 512 a routed layer-batch serves ~163 host experts (glmpp3's expert term,
+# 458 ms / 72.2 us / 39 layers): at most 4.37 ms a layer-batch.
+# pp512 (one batch, G1: the union is on the path of every layer-batch, U 48.6 > S 33 ms on average): 42 x 4.37 =
+# 184 ms of ~2,623 ms (glmpp3's 2,663 less glmlane2's Q6_K lanes) -> at most +7.5 %. pp4096 (G2: 233 of 336
+# layer-batches host-bound, each gains ΔU, the card-bound ones 0; U - 4.4 stays above F + S + 1 = 39.8 ms on the KDA
+# layers): 29.1 x 4.37 = 127 ms of ~2,372 ms a batch -> at most +5.7 %. The low edge is 0: whether the stall is
+# raw-row load latency (8 short row streams a group, the hardware streamer retraining at each row) or the Q5_K loop's
+# spills, and whether the in-flight prefetches crowd the pack's own misses, are cache effects no derivation fixes.
+# The on arm's loop is +27 / +33 / +28 instructions a group super-block (Q4_K / Q5_K / Q6_K: 18 / 22 / 27
+# prefetches and their address and spill work), ~0.85 us an expert at the dot's IPC: -0.2 % of pp512 if nothing hides.
+# Decode cannot move: lanes run only past 8 columns.
+# Reach of the default: LANE_PREFETCH_DEFAULT is what the union holds in every binary that does not act on the lever
+# (generate_ds41, the serve seats, the gate binaries). V4.1's Q4_K / Q5_K downs take lanes (its gates and ups run the
+# r8 tile): k = 2304, 640 groups x 9 super-blocks an expert at Q4_K's 61 ns of stall -> ~10.4 us a host expert at
+# 17/18 cover, at most ~125 ms a 512-position batch if every layer-batch were union-bound [derived; not a Δ: V4.1's
+# union / shadow split under plan (a) is not in hand]. Qwen3.8's routed experts are Q5_1 / Q8_0 (no lanes): 0.
+#
+# Why noninf: the band holds 0, so an ab card is refused at any round count. With sd 0.6 % the paired interval at 4
+# rounds is h_p = 3.182 x 0.6 x sqrt(2 / 4) = 1.35 %; the margin below clears it.
+#
+# Orientation: the runner's ratio line is bare / @-arm, ours / ours@BLOOMERY_LANE_PREFETCH=on, that is off / on, and
+# card.py's verdict takes changed / base = on / off: feed it the inverse of each printed per-round ratio,
+# pasting the line's `per round:` list as it prints (`r1 1.0123 r2 0.9987 …`; the labels are dropped):
+#   python3 tools/ref/card.py verdict docs/cards/glmprefetch-ab.card $(python3 -c 'import sys; print(" ".join("%.6f" % (1 / float(r)) for a in sys.argv[1:] for r in a.split() if not r.startswith("r")))' "<the per round list>")
+kind: noninf
+question: does prefetching the next row-lane group's raw rows while the host union packs this one shorten GLM-5.3's
+  prompt batch, with the on arm no slower than off by more than the margin?
+term: pp tok/s @ P = 4096, prose prompt (GLM_PROSE from GLM_PROSE_FROM), A6000, plan (a), --ctx 4352, the default
+  group (BLOOMERY_PREFILL_GROUP unset: 2), the same generate_glm5next - (on - off) / off, paired by round; pp512
+  printed beside it (one batch, G1: band 0..+7.5 %)
+unit: %
+predict: 0..+5.7
+rounds: 4
+margin: 1.5 % a decision threshold, not derived: the default stays off unless the verdict passes, and 1.5 % clears
+  the paired ruler at 4 rounds (1.350 %) for a band whose lower edge is 0; 6 rounds would take the default 1.0 % at
+  ~1.5x the box time
+condition: one runner invocation from this tree (BLOOMERY_REMOTE='~/repo/bloomery-glmprefetch'), one binary,
+  BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4352 BLOOMERY_DECODE_N=3
+  BLOOMERY_LEASE_CARD=docs/cards/glmprefetch-ab.card' just depth-gpu-glm5next 4096
+  4096@BLOOMERY_LANE_PREFETCH=on (the lead dropped the P = 512 arms to keep the sitting under 30 min); every bare row's load record prints lane_prefetch=off
+  and every @ row's lane_prefetch=on (the value the union holds, not the parsed lever), every row group=2 and its
+  time prompt record kind=batch with 8 passes at 4096; both arms' plan lines print the same
+  card_experts; a row marked [cold], [cpu-busy] or [other-busy] is void; decode rows agree within the window's ~5 %.
+  The verdict reads the `ratio pp p=4096` line's per-round values inverted (above). Box time ~12..18 min [derived:
+  10 processes (8 rows and 2 warm-ups) at 45..75 s a load plus 19.3 s of prompt, and the build]
+decide-in: on a pass with the mean inside the band and the measured lower bound above 0, propose flipping
+  LANE_PREFETCH_DEFAULT to true (one line; the bits are the same): the flip reaches every binary (V4.1's lane downs,
+  bound above), so it lands after a V4.1 noninf sitting of its own (generate_ds41 acting on the lever, one line) or
+  on the lead's acceptance on paper (identical bits, the on arm's worst derived cost -0.2 %); with the lower bound
+  at or below 0, leave it off with the effect and interval recorded; the next pack term is then its instructions
+  (the scale path, 351 of 646 a Q4_K group super-block)
+decide-below: leave the default off; the stall was not raw-row latency a one-group distance hides, or the prefetches
+  crowd the pack's demand misses: before another arm, one perf window on this tree with the lever on, reading the
+  pack loop's post-load sample share against glmlane2's 49..63 %, and price the same prefetch spread over the
+  group's dot runs instead of its pack
+decide-above: propose the default flip as in decide-in (the same V4.1 condition) and re-derive the expert term: the
+  72.2 us an expert's ~22 us glmlane2 could not attribute was raw-row latency too; refit the lane law from one
+  BLOOMERY_STEP_STATS=1 row at the default

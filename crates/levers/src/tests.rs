@@ -162,6 +162,39 @@ fn prefill_group_default_is_the_rows() {
     assert_eq!(*d, PREFILL_GROUP_DEFAULT.to_string());
 }
 
+/// `BLOOMERY_LANE_PREFETCH`'s row is a parsed same-binary arm taking `on`
+/// and `off`, its default [`LANE_PREFETCH_DEFAULT`] (what the host union
+/// holds in a binary that does not act on it), and its accessor reads unset
+/// as that default, `on` as on and `off` as off.
+#[test]
+fn lane_prefetch_row_is_an_on_off_arm() {
+    let row = REGISTRY.iter().find(|r| r.name == LANE_PREFETCH);
+    let Some(LeverSpec {
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is(d),
+        site: Site::Parsed { left },
+        ..
+    }) = row
+    else {
+        panic!("{LANE_PREFETCH} is not a parsed on/off arm with a default: {row:?}");
+    };
+    assert!(
+        left.is_empty(),
+        "{LANE_PREFETCH} is read in place: {left:?}"
+    );
+    assert_eq!(*d, if LANE_PREFETCH_DEFAULT { "on" } else { "off" });
+    let at = |v: Option<&str>| {
+        let e = v.map_or_else(Vec::new, |v| env(&[(LANE_PREFETCH, v)]));
+        read(&e, Scope::Every)
+            .expect("on, off and unset are taken")
+            .lane_prefetch()
+    };
+    assert_eq!(at(None), LANE_PREFETCH_DEFAULT);
+    assert!(at(Some("on")));
+    assert!(!at(Some("off")));
+}
+
 /// Every name is a `BLOOMERY_*` variable, and no two rows share one.
 #[test]
 fn names_are_unique() {
@@ -277,6 +310,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.qwen38_experts_set(), None);
     assert_eq!(unset.residency(), None);
     assert_eq!(unset.hoststream(), None);
+    assert_eq!(unset.lane_prefetch(), LANE_PREFETCH_DEFAULT);
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -311,6 +345,7 @@ fn accessors_read_their_rows() {
             (RESIDENCY, "mid-p40-s1"),
             (QWEN38_EXPERTS, "card"),
             (HOSTSTREAM, "on"),
+            (LANE_PREFETCH, "on"),
             (PREFILL_GROUP, "8"),
         ]),
         Scope::Every,
@@ -338,6 +373,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.qwen38_experts(), "card");
     assert_eq!(set.qwen38_experts_set(), Some("card"));
     assert_eq!(set.hoststream(), Some(true));
+    assert!(set.lane_prefetch());
     assert_eq!(
         set.host(),
         HostCfg {
@@ -373,7 +409,8 @@ fn accessors_read_their_rows() {
             R8,
             RESIDENCY,
             QWEN38_EXPERTS,
-            HOSTSTREAM
+            HOSTSTREAM,
+            LANE_PREFETCH
         ]
     );
 }

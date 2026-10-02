@@ -538,7 +538,7 @@ pub static LOAD: Kind = Kind {
 pub static LOAD_GENERATOR: Kind = Kind {
     name: "load_generator",
     head: "load",
-    doc: "The load a decode loop opened: device bytes, the context, the body's fields, the cards it loaded (a V4.1 or GLM-5.3 binary's; an expert tier card's experts and resident bytes), the prompt feed, a GLM-5.3 load's prompt group, the step mode and the pin.",
+    doc: "The load a decode loop opened: device bytes, the context, the body's fields, the cards it loaded (a V4.1 or GLM-5.3 binary's; an expert tier card's experts and resident bytes), the prompt feed, a GLM-5.3 load's prompt group and whether its host union's row-lane packs prefetch, the step mode and the pin.",
     parts: &[
         key("resident_bytes", U64, "B"),
         key("ctx", U64, "positions"),
@@ -553,6 +553,7 @@ pub static LOAD_GENERATOR: Kind = Kind {
         opt("tier_bytes", U64, "B"),
         opt("prefill", Word, ""),
         opt("group", U64, "batches"),
+        opt("lane_prefetch", Word, ""),
         key("mode", Word, ""),
         key("place", Word, ""),
         key("pin_main", Word, ""),

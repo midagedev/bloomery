@@ -30,9 +30,9 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOSTSTREAM, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WINDOWS, PIN_MAIN, PREFILL, PREFILL_GROUP,
-    PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN,
-    STEP_STATS, THREADS,
+    HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WINDOWS,
+    PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN38_EXPERTS, R8,
+    RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -841,6 +841,13 @@ impl Levers {
             Some(Value::Flag(b)) => Some(b),
             ref v => panic!("{HOSTSTREAM} holds {v:?}, not a flag"),
         }
+    }
+
+    /// `BLOOMERY_LANE_PREFETCH`: the host union's row-lane packs prefetch
+    /// each group's successor.
+    #[must_use]
+    pub fn lane_prefetch(&self) -> bool {
+        self.flag(LANE_PREFETCH)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],

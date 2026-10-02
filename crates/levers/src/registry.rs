@@ -32,6 +32,7 @@ pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
+pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -40,6 +41,11 @@ pub const PREFILL_GROUP_MAX: u64 = 8;
 /// `BLOOMERY_PREFILL_GROUP` unset: the row's default, the group GLM-5.3's
 /// plan reserves a prompt batch's units for.
 pub const PREFILL_GROUP_DEFAULT: u64 = 2;
+
+/// `BLOOMERY_LANE_PREFETCH` unset: the row's default, which the host
+/// union holds in a binary that does not act on the lever
+/// (`model::ops::lane_prefetch`).
+pub const LANE_PREFETCH_DEFAULT: bool = false;
 
 /// The rounds that convert the levers still read in place.
 const R03: &str = "[03]";
@@ -514,6 +520,20 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               Unset there is on under `--place a` with a residency, off everywhere else; \
               `off` is the same-binary arm; `on` is refused by name beside \
               `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: LANE_PREFETCH,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("off"),
+        doc: "Host union, a prompt batch's row-lane passes (Q4_K, Q5_K and Q6_K stacks, \
+              calls wider than 8 columns): `on` has each 8-row group's pack prefetch the \
+              next group of its participant's range toward L2, a slice a super-block \
+              (`qdot::pack_lanes`' `next`); `off` packs without it, the same-binary arm. \
+              Both write the same bits. `generate_glm5next` acts on it and prints the value \
+              the union holds as its `load` record's `lane_prefetch`; every other binary \
+              runs the default and refuses the name set.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {
