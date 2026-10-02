@@ -517,11 +517,11 @@ fn after_accept_error(e: &io::Error, listener_stands: bool, repeats: u32) -> Opt
 
 /// One live connection's place under [`MAX_CONNECTIONS`], given back when its
 /// thread ends, by a return or a panic.
-struct Permit(Arc<AtomicUsize>);
+pub(crate) struct Permit(Arc<AtomicUsize>);
 
 impl Permit {
     /// A place, or `None` when [`MAX_CONNECTIONS`] are live.
-    fn take(live: &Arc<AtomicUsize>) -> Option<Permit> {
+    pub(crate) fn take(live: &Arc<AtomicUsize>) -> Option<Permit> {
         let held = live.fetch_add(1, Ordering::SeqCst);
         let permit = Permit(Arc::clone(live));
         (held < MAX_CONNECTIONS).then_some(permit)
@@ -567,7 +567,7 @@ fn admit(state: &Arc<State>, live: &Arc<AtomicUsize>, port: u16, stream: TcpStre
 /// Answers a connection the server does not serve with a 503 carrying
 /// `Retry-After`, then closes it after reading what the client sent, for at most
 /// about [`REFUSE_DRAIN`] twice.
-fn refuse(mut stream: TcpStream, message: &str) {
+pub(crate) fn refuse(mut stream: TcpStream, message: &str) {
     let _ = stream.set_write_timeout(Some(REFUSE_DRAIN));
     let body = error_body(503, "unavailable_error", message);
     let sent = http::respond(
@@ -595,7 +595,7 @@ fn refuse(mut stream: TcpStream, message: &str) {
 }
 
 /// The request an answer stands on when none was read: HTTP/1.1, closing.
-fn closing() -> Request {
+pub(crate) fn closing() -> Request {
     Request {
         method: String::new(),
         path: String::new(),
@@ -611,7 +611,7 @@ fn closing() -> Request {
 /// next request (a byte already buffered counts), then gives the rest of the
 /// request [`REQUEST_READ`] per read. `false` when nothing came: the peer
 /// closed, the wait ran out or the read failed, and the connection closes.
-fn next_request_arrives(r: &mut BufReader<TcpStream>) -> bool {
+pub(crate) fn next_request_arrives(r: &mut BufReader<TcpStream>) -> bool {
     if !r.buffer().is_empty() {
         return true;
     }
@@ -656,7 +656,7 @@ fn serve_conn(state: &State, stream: TcpStream) {
     }
 }
 
-const JSON: &str = "application/json; charset=utf-8";
+pub(crate) const JSON: &str = "application/json; charset=utf-8";
 
 /// An error that becomes an OpenAI-style error object.
 struct ApiError {
@@ -676,7 +676,7 @@ fn invalid(message: impl Into<String>) -> ApiError {
     }
 }
 
-fn error_body(code: u16, kind: &str, message: &str) -> Value {
+pub(crate) fn error_body(code: u16, kind: &str, message: &str) -> Value {
     json!({ "error": { "code": code, "message": message, "type": kind } })
 }
 
@@ -691,6 +691,18 @@ fn send_error(w: &mut TcpStream, req: &Request, e: &ApiError) -> io::Result<bool
     let headers: &[(&str, String)] = if e.retry_after { &retry } else { &[] };
     http::respond(w, req, e.code, JSON, headers, body.as_bytes())?;
     Ok(true)
+}
+
+/// The headers of the 204 an `OPTIONS` request gets: any origin may send
+/// `GET`, `POST` and `OPTIONS` with any header.
+pub(crate) fn cors_preflight() -> [(&'static str, String); 2] {
+    [
+        (
+            "Access-Control-Allow-Methods",
+            "GET, POST, OPTIONS".to_owned(),
+        ),
+        ("Access-Control-Allow-Headers", "*".to_owned()),
+    ]
 }
 
 /// Dispatches one request; `Ok(true)` when the connection may carry another.
@@ -711,20 +723,7 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         ("POST", "/detokenize") => body(req).and_then(|b| detokenize(state, &b)),
         ("POST", "/apply-template") => body(req).and_then(|b| apply_template(state, &b)),
         ("OPTIONS", _) => {
-            http::respond(
-                w,
-                req,
-                204,
-                "text/plain",
-                &[
-                    (
-                        "Access-Control-Allow-Methods",
-                        "GET, POST, OPTIONS".to_owned(),
-                    ),
-                    ("Access-Control-Allow-Headers", "*".to_owned()),
-                ],
-                b"",
-            )?;
+            http::respond(w, req, 204, "text/plain", &cors_preflight(), b"")?;
             return Ok(true);
         }
         _ => Err(ApiError {

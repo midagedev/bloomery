@@ -5,9 +5,11 @@
 //! `GET /props`, `GET /slots`, `POST /slots/{id}?action=save|restore|erase`,
 //! `GET /metrics`, and `POST /residency/reset` (bloomery's own). JSON field names, defaults and stream framing are
 //! llama-server's; see `api` for the slots, `sched` for who gets one and
-//! `worker` for the engine thread that steps them.
+//! `worker` for the engine thread that steps them. [`decide`] is a decision model's server
+//! (`POST /v1/systemone`) on the same HTTP layer.
 
 mod api;
+pub mod decide;
 pub mod dsml;
 pub mod engine;
 mod genloop;

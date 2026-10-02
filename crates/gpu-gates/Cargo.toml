@@ -58,6 +58,9 @@ bloomery-sampler = { path = "../sampler", optional = true }
 # `bloomery-serve-ds41`: the HTTP server's `Engine` over the V4.1 generator (`bind`), and its gate
 # `gate_ds41_serve`, which reads the server's JSON. Reached only through the `deepseek41` feature.
 bloomery-serve = { path = "../serve", optional = true }
+# `bloomery_serve_clef`: Clef's request encoder and joint schema head on the host, served by the
+# decision server of `bloomery-serve`. Reached only through the `clef` feature.
+bloomery-decision = { path = "../decision", optional = true }
 serde_json = { version = "=1.0.151", optional = true }
 # `generate_ds41` drives the V4.1 session (`bloomery-app`, its `deepseek41` feature) through the
 # generation loop and the drafts of `bloomery-runtime`; `generate_qwen3moe` runs its arms through
@@ -97,6 +100,7 @@ deepseek41 = [
     "dep:bloomery-runtime",
 ]
 vision = ["gpu", "dep:bloomery-gpu-vision", "dep:bloomery-vision"]
+clef = ["gpu", "dep:bloomery-decision", "dep:bloomery-serve", "dep:serde_json"]
 glm5next = ["deepseek41", "dep:bloomery-gpu-glm5next", "bloomery-app/glm5next"]
 
 # A bin whose `main` sits behind a feature requires that feature: cargo refuses to build it without the
@@ -441,6 +445,10 @@ required-features = ["gpu"]
 [[bin]]
 name = "clef_hidden"
 required-features = ["gpu"]
+
+[[bin]]
+name = "bloomery_serve_clef"
+required-features = ["clef"]
 
 [[bin]]
 name = "gate_qwen4exp_mtp"
