@@ -1018,7 +1018,7 @@ impl RouterKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<RouterKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { router_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(router_kernels, ctx)? };
         Ok(RouterKernels { module })
     }
 
@@ -1499,7 +1499,7 @@ pub mod glm5next {
         pub fn load(ctx: &Arc<CudaContext>) -> Result<RouterKernels, GpuError> {
             // SAFETY: this package owns the embedded device bundle produced
             // for the module above; the launcher checks its launch contract.
-            let module = unsafe { glm5next_router_kernels::load(ctx)? };
+            let module = unsafe { bloomery_gpu::shared_module!(glm5next_router_kernels, ctx)? };
             Ok(RouterKernels { module })
         }
 

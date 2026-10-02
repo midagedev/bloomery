@@ -198,7 +198,7 @@ impl MarkovKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<MarkovKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
-        let module = unsafe { markov_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(markov_kernels, ctx)? };
         Ok(MarkovKernels { module })
     }
 

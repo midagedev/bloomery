@@ -347,7 +347,7 @@ impl ExpertKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<ExpertKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { experts_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(experts_kernels, ctx)? };
         Ok(ExpertKernels { module })
     }
 

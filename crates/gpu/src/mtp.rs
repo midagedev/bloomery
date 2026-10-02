@@ -403,7 +403,7 @@ impl MtpKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<MtpKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launchers check its launch contracts.
-        let module = unsafe { mtp_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(mtp_kernels, ctx)? };
         Ok(MtpKernels { module })
     }
 

@@ -23,7 +23,7 @@
               and the link keeps the name checkable"
 )]
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_core::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
 use cuda_host::cuda_module;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -1892,17 +1892,128 @@ static ANCHORS: Mutex<Vec<Option<Arc<CudaContext>>>> = Mutex::new(Vec::new());
 /// idle and every free bound to its own context. The handle is the `Gpu`'s own
 /// because the driver error a drop records stays on its handle until that
 /// handle's next call: a `Gpu` never surfaces another's (a tier and a draft
-/// share the 3090). Card memory still comes back as each owner drops.
+/// share the 3090). The memory a `Gpu` allocates still comes back as it
+/// drops; the bundle modules stay loaded on the anchor ([`bundle_module`]).
 fn primary_context(device: usize) -> Result<Arc<CudaContext>, GpuError> {
-    let mut held = ANCHORS.lock().unwrap_or_else(PoisonError::into_inner);
-    if !matches!(held.get(device), Some(Some(_))) {
-        let anchor = CudaContext::new(device)?;
-        if held.len() <= device {
-            held.resize(device + 1, None);
-        }
-        held[device] = Some(anchor);
-    }
+    anchor(device)?;
     Ok(CudaContext::new(device)?)
+}
+
+/// Device `device`'s anchor ([`ANCHORS`]), retained here on first use.
+fn anchor(device: usize) -> Result<Arc<CudaContext>, GpuError> {
+    let mut held = ANCHORS.lock().unwrap_or_else(PoisonError::into_inner);
+    if held.len() <= device {
+        held.resize(device + 1, None);
+    }
+    match &held[device] {
+        Some(anchor) => Ok(Arc::clone(anchor)),
+        None => {
+            let anchor = CudaContext::new(device)?;
+            held[device] = Some(Arc::clone(&anchor));
+            Ok(anchor)
+        }
+    }
+}
+
+/// One embedded bundle's slot: a crate's whole device code on one device.
+struct Bundle {
+    device: usize,
+    name: &'static str,
+    /// Its lock is held across a load, so two callers never load one bundle
+    /// twice.
+    state: Arc<Mutex<BundleState>>,
+}
+
+#[derive(Default)]
+struct BundleState {
+    /// `None` until a load succeeds.
+    module: Option<Arc<CudaModule>>,
+    /// Loads made: 1 once loaded, more only after a load that failed.
+    loads: usize,
+}
+
+/// Every bundle a family asked for, one slot per (device, crate bundle).
+static BUNDLES: Mutex<Vec<Bundle>> = Mutex::new(Vec::new());
+
+/// The module of embedded bundle `name` on `ctx`'s device, loaded once per
+/// process and shared by every `#[cuda_module]` family of that bundle and
+/// every `Gpu` on the device ([`shared_module!`]). A family's generated
+/// `load` reads its crate's whole bundle, so one module carries every
+/// family's entries, and loading it per family repeats the same JIT. `load`
+/// runs only for the first caller, on the device's anchor ([`anchor`]): the
+/// module outlives every `Gpu`, and the driver errors it records land on
+/// the anchor, never on a `Gpu`'s own handle. A `ctx` that is not its
+/// device's primary context is refused by name.
+pub fn bundle_module(
+    ctx: &Arc<CudaContext>,
+    name: &'static str,
+    load: impl FnOnce(&Arc<CudaContext>) -> Result<Arc<CudaModule>, cuda_host::EmbeddedModuleError>,
+) -> Result<Arc<CudaModule>, GpuError> {
+    let device = ctx.ordinal();
+    let anchor = anchor(device)?;
+    if anchor.cu_ctx() != ctx.cu_ctx() {
+        return Err(GpuError::state(
+            "bundle_module",
+            "a context on its device's primary context",
+        ));
+    }
+    let slot = {
+        let mut bundles = BUNDLES.lock().unwrap_or_else(PoisonError::into_inner);
+        match bundles
+            .iter()
+            .find(|b| b.device == device && b.name == name)
+        {
+            Some(b) => Arc::clone(&b.state),
+            None => {
+                let state = Arc::new(Mutex::new(BundleState::default()));
+                bundles.push(Bundle {
+                    device,
+                    name,
+                    state: Arc::clone(&state),
+                });
+                state
+            }
+        }
+    };
+    let mut state = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(module) = &state.module {
+        return Ok(Arc::clone(module));
+    }
+    state.loads += 1;
+    let loaded = load(&anchor)?;
+    state.module = Some(Arc::clone(&loaded));
+    Ok(loaded)
+}
+
+/// The bundle loads this process made for bundle `name` on device `device`
+/// ([`bundle_module`]): 1 once any family of it loaded there.
+#[must_use]
+pub fn bundle_loads(device: usize, name: &str) -> usize {
+    let slot = BUNDLES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|b| b.device == device && b.name == name)
+        .map(|b| Arc::clone(&b.state));
+    slot.map_or(0, |state| {
+        state.lock().unwrap_or_else(PoisonError::into_inner).loads
+    })
+}
+
+/// `#[cuda_module]` `$module`'s launchers over its crate's bundle, loaded
+/// once per device ([`bundle_module`]): the first family of the crate to ask
+/// on a device loads it through `$module`'s own generated `load`, every other
+/// binds to that module. `Result<$module::LoadedModule, GpuError>`. Inside the
+/// `unsafe` block that the generated `load` and `from_module` need: the
+/// caller's `SAFETY` covers both, as it covered `load`.
+#[macro_export]
+macro_rules! shared_module {
+    ($module:ident, $ctx:expr) => {
+        $crate::bundle_module($ctx, env!("CARGO_PKG_NAME"), |anchor| {
+            $module::load(anchor).map(|loaded| loaded.as_cuda_module().clone())
+        })
+        .and_then(|module| $module::from_module(module).map_err($crate::GpuError::from))
+    };
 }
 
 impl Gpu {
@@ -1912,9 +2023,9 @@ impl Gpu {
     }
 
     /// Take device `device`'s primary context ([`primary_context`]), make
-    /// the engine stream, and load every device module of this crate into
-    /// that context — the K-quant module here and one per kernel file.
-    /// Load-time only.
+    /// the engine stream, and bind the K-quant module here and one family
+    /// per kernel file to this crate's bundle module on the device
+    /// ([`bundle_module`]), loaded by the first `Gpu` on it. Load-time only.
     pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
         let ctx = primary_context(device)?;
         let stream = role_stream(&ctx, StreamRole::Engine)?;
@@ -1923,7 +2034,7 @@ impl Gpu {
         // SAFETY: this package owns the embedded device bundle produced for
         // the kernels module above; every launcher checks its launch
         // contract before launching.
-        let module = unsafe { kernels::load(&ctx)? };
+        let module = unsafe { crate::shared_module!(kernels, &ctx)? };
         Ok(Gpu {
             q4k_sel: q4k_sel::Q4kSelKernels::load(&ctx, &fault)?,
             q5: q5::Q5Kernels::load(&ctx, &fault)?,
@@ -2681,6 +2792,28 @@ mod context_tests {
             c.context().cu_ctx(),
             raw,
             "a Gpu after the first two dropped got another driver context"
+        );
+    }
+
+    /// A device loads this crate's bundle once per process: two `Gpu`s on
+    /// device 0 bind to one module, and with the families a model opens
+    /// beside them (the grouped GEMM, the three linear-attention families)
+    /// the bundle's load count on the device is 1.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_device_loads_its_bundle_once() {
+        let a = Gpu::with_device(0).expect("a Gpu on device 0");
+        let b = Gpu::with_device(0).expect("a second Gpu on device 0");
+        crate::gemm::GemmKernels::load(a.context()).expect("the grouped GEMM on device 0");
+        crate::linear::LinearKernels::load(b.context()).expect("the linear families on device 0");
+        assert_eq!(
+            super::bundle_loads(0, env!("CARGO_PKG_NAME")),
+            1,
+            "device 0 loaded this crate's bundle more than once"
+        );
+        assert!(
+            Arc::ptr_eq(a.module.as_cuda_module(), b.module.as_cuda_module()),
+            "two Gpus on device 0 hold two loads of the bundle"
         );
     }
 }

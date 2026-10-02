@@ -792,7 +792,7 @@ impl BlockPass {
         let ctx = gpu.context();
         // SAFETY: this crate owns the embedded device bundle produced for
         // `glue_kernels`; the launcher checks its launch contract.
-        let embed = unsafe { glue_kernels::load(ctx)? };
+        let embed = unsafe { bloomery_gpu::shared_module!(glue_kernels, ctx)? };
         let embd = w.embd_rows();
         let mask = decode_mask(gpu, &embed, w, d.n_embd)?;
         let b = MAX_WIDTH;

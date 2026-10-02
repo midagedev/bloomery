@@ -889,7 +889,7 @@ impl Gemm32Kernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<Gemm32Kernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { gemm32_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(gemm32_kernels, ctx)? };
         Ok(Gemm32Kernels { module })
     }
 }

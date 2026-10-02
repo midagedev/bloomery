@@ -196,7 +196,7 @@ impl MoeFusedKernels {
         let fault = crate::module_fault_word(ctx, word, "MoeFusedKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { moe_fused_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(moe_fused_kernels, ctx)? };
         Ok(MoeFusedKernels { module, fault })
     }
 

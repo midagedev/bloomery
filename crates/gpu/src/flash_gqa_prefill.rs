@@ -2123,7 +2123,7 @@ impl FlashGqaPrefill {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<FlashGqaPrefill, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { flash_gqa_prefill_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(flash_gqa_prefill_kernels, ctx)? };
         Ok(FlashGqaPrefill { module })
     }
 

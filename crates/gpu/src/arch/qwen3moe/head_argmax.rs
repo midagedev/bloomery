@@ -329,7 +329,7 @@ impl HeadArgmaxKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<HeadArgmaxKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { qwen3moe_head_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(qwen3moe_head_kernels, ctx)? };
         Ok(HeadArgmaxKernels { module })
     }
 

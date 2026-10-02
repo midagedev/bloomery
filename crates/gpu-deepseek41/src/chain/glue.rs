@@ -689,7 +689,7 @@ impl Glue {
         }
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; the launchers check its launch contracts.
-        let module = unsafe { glue_kernels::load(gpu.context())? };
+        let module = unsafe { bloomery_gpu::shared_module!(glue_kernels, gpu.context())? };
         Ok(Glue {
             module,
             hc: HcKernels::load(gpu.context())?,

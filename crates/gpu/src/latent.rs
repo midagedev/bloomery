@@ -565,7 +565,7 @@ impl LatentKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<LatentKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launchers check its launch contracts.
-        let module = unsafe { latent_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(latent_kernels, ctx)? };
         Ok(LatentKernels { module })
     }
 

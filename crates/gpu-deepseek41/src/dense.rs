@@ -784,7 +784,7 @@ impl DenseKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<DenseKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { dense_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(dense_kernels, ctx)? };
         Ok(DenseKernels { module })
     }
 

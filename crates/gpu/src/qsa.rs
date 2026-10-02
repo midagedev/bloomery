@@ -1337,7 +1337,7 @@ impl QsaKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<QsaKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launchers check its launch contracts.
-        let module = unsafe { qsa_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(qsa_kernels, ctx)? };
         Ok(QsaKernels { module })
     }
 

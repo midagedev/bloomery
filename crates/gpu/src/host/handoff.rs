@@ -918,7 +918,7 @@ impl HandoffKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<HandoffKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
-        let module = unsafe { handoff_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(handoff_kernels, ctx)? };
         Ok(HandoffKernels { module })
     }
 

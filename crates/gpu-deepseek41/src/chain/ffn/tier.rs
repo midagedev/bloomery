@@ -427,7 +427,7 @@ impl TierPiece {
         let stream = gpu.stream();
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
-        let module = unsafe { tier_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(tier_kernels, ctx)? };
         let tsel = (0..rows)
             .map(|_| DeviceBuffer::zeroed(stream, N_USED))
             .collect::<Result<Vec<_>, _>>()?;

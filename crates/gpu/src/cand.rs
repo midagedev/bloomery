@@ -1191,7 +1191,7 @@ impl CandKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<CandKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launchers check its launch contracts.
-        let module = unsafe { cand_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(cand_kernels, ctx)? };
         Ok(CandKernels { module })
     }
 

@@ -517,7 +517,7 @@ impl EngramGateKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<EngramGateKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; the launchers check its launch contracts.
-        let module = unsafe { engram_gate_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(engram_gate_kernels, ctx)? };
         Ok(EngramGateKernels { module })
     }
 

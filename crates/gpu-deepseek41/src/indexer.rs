@@ -819,7 +819,7 @@ impl IndexerKernels {
         })?;
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; the launcher checks its launch contract.
-        let module = unsafe { indexer_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(indexer_kernels, ctx)? };
         Ok(IndexerKernels {
             module,
             blocks: blocks.max(1),

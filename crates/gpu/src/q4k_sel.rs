@@ -676,7 +676,7 @@ impl Q4kSelKernels {
         let fault = crate::module_fault_word(ctx, word, "Q4kSelKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { q4k_sel_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(q4k_sel_kernels, ctx)? };
         Ok(Q4kSelKernels { module, fault })
     }
 

@@ -282,7 +282,7 @@ impl StepKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<StepKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { step_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(step_kernels, ctx)? };
         Ok(StepKernels { module })
     }
 

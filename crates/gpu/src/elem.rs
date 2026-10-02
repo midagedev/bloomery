@@ -1442,7 +1442,7 @@ impl ElemKernels {
         let fault = crate::module_fault_word(ctx, word, "ElemKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { elem_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(elem_kernels, ctx)? };
         Ok(ElemKernels { module, fault })
     }
 

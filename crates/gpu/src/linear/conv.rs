@@ -755,7 +755,7 @@ impl ConvKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<ConvKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { conv_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(conv_kernels, ctx)? };
         Ok(ConvKernels { module })
     }
 

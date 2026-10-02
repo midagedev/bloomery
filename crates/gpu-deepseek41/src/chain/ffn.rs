@@ -791,7 +791,7 @@ impl FfnKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<FfnKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
-        let module = unsafe { ffn_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(ffn_kernels, ctx)? };
         Ok(FfnKernels {
             module,
             handoff: HandoffKernels::load(ctx)?,

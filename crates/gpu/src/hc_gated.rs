@@ -867,7 +867,7 @@ impl HcGatedKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<HcGatedKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launchers check its launch contracts.
-        let module = unsafe { hc_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(hc_kernels, ctx)? };
         Ok(HcGatedKernels { module })
     }
 
@@ -1348,7 +1348,7 @@ impl HcWideKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<HcWideKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launchers check its launch contracts.
-        let module = unsafe { hc_wide_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(hc_wide_kernels, ctx)? };
         Ok(HcWideKernels { module })
     }
 

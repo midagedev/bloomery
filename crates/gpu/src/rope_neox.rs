@@ -568,7 +568,7 @@ impl RopeNeoxKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<RopeNeoxKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { rope_neox_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(rope_neox_kernels, ctx)? };
         Ok(RopeNeoxKernels { module })
     }
 

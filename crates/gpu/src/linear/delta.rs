@@ -602,7 +602,7 @@ impl DeltaKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<DeltaKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { delta_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(delta_kernels, ctx)? };
         Ok(DeltaKernels { module })
     }
 

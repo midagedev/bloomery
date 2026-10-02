@@ -2015,7 +2015,7 @@ impl RouterKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<RouterKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { qwen3moe_router_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(qwen3moe_router_kernels, ctx)? };
         Ok(RouterKernels { module })
     }
 
@@ -2922,7 +2922,7 @@ pub mod gated {
         pub fn load(ctx: &Arc<CudaContext>) -> Result<RouterKernels, GpuError> {
             // SAFETY: this package owns the embedded device bundle produced
             // for the module above; each launcher checks its launch contract.
-            let module = unsafe { qwen35moe_router_kernels::load(ctx)? };
+            let module = unsafe { crate::shared_module!(qwen35moe_router_kernels, ctx)? };
             Ok(RouterKernels { module })
         }
 

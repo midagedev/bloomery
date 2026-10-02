@@ -1002,7 +1002,7 @@ impl TierCard {
         TierLayout::with_cols(shape, cols, q3, d8, 1)?;
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; its launcher checks the launch contract.
-        let module = unsafe { tier_kernels::load(&ctx)? };
+        let module = unsafe { crate::shared_module!(tier_kernels, &ctx)? };
         let layer_hits = vec![0; set.layers().len()];
         Ok(TierCard {
             graphs: std::array::from_fn(|_| None),

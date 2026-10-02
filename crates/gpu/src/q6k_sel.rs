@@ -223,7 +223,7 @@ impl Q6kSelKernels {
         let fault = crate::module_fault_word(ctx, word, "Q6kSelKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { q6k_sel_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(q6k_sel_kernels, ctx)? };
         Ok(Q6kSelKernels { module, fault })
     }
 

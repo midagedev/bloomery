@@ -1801,7 +1801,7 @@ impl FlashKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<FlashKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { flash_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(flash_kernels, ctx)? };
         Ok(FlashKernels { module })
     }
 

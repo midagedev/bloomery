@@ -258,7 +258,7 @@ impl Q80SelKernels {
         let fault = crate::module_fault_word(ctx, word, "Q80SelKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { q8_0_sel32_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(q8_0_sel32_kernels, ctx)? };
         Ok(Q80SelKernels {
             module,
             _fault: fault,

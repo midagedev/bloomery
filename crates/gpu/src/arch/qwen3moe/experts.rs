@@ -364,7 +364,7 @@ impl ExpertKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<ExpertKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { qwen3moe_expert_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(qwen3moe_expert_kernels, ctx)? };
         Ok(ExpertKernels { module })
     }
 

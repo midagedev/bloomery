@@ -250,7 +250,7 @@ impl IndexKeyKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<IndexKeyKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; the launcher checks its launch contract.
-        let module = unsafe { index_key_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(index_key_kernels, ctx)? };
         Ok(IndexKeyKernels { module })
     }
 

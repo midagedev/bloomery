@@ -1586,7 +1586,7 @@ impl Q8F32Kernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<Q8F32Kernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { q8f32_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(q8f32_kernels, ctx)? };
         Ok(Q8F32Kernels { module })
     }
 

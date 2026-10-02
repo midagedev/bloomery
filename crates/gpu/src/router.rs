@@ -429,7 +429,7 @@ impl RouterKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<RouterKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { router_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(router_kernels, ctx)? };
         Ok(RouterKernels { module })
     }
 

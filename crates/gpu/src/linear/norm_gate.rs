@@ -273,7 +273,7 @@ impl NormGateKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<NormGateKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
-        let module = unsafe { norm_gate_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(norm_gate_kernels, ctx)? };
         Ok(NormGateKernels { module })
     }
 

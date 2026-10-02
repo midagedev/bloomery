@@ -1173,7 +1173,7 @@ impl Q5Kernels {
         let fault = crate::module_fault_word(ctx, word, "Q5Kernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { q5_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(q5_kernels, ctx)? };
         Ok(Q5Kernels { module, fault })
     }
 

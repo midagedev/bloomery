@@ -260,7 +260,7 @@ impl ProjKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<ProjKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { qwen3moe_proj_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(qwen3moe_proj_kernels, ctx)? };
         Ok(ProjKernels { module })
     }
 

@@ -3154,7 +3154,7 @@ impl FlashGqaKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<FlashGqaKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launchers check its launch contracts.
-        let module = unsafe { flash_gqa_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(flash_gqa_kernels, ctx)? };
         Ok(FlashGqaKernels { module })
     }
 
