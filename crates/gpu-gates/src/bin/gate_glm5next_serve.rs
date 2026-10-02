@@ -17,12 +17,13 @@
 //! the other (three in `plain`, two in `drafted`); the recipe runs the arms
 //! as two processes, each under its own bound.
 //!
-//! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after two runs of
+//! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after three runs of
 //! the seat with both levers unset and `--plan`, which print the unset rule's
 //! records and the plan and exit 0 before any card is opened: under `--place
-//! a` a `draft unset draft=mtp` and a `residency unset residency=mid-p0-s1`
-//! record and the `residency host` record of the word; under `--place gate`
-//! both `off`, no `residency host`:
+//! a` and under `--place bp` (plan (b′), the 3090 an expert tier) a `draft
+//! unset draft=mtp` and a `residency unset residency=mid-p0-s1` record and
+//! the `residency host` record of the word; under `--place gate` both `off`,
+//! no `residency host`:
 //!
 //! - the load prints `load draft=off (BLOOMERY_DRAFT=off)` and the word as a
 //!   `residency lever` record (`why=set`), no `residency host` and no verify
@@ -559,8 +560,8 @@ mod gate {
         Ok((status.success(), lines))
     }
 
-    /// The unset rule's lines (the module header): `--place a` drafts and
-    /// runs the residency's default word, `--place gate` neither.
+    /// The unset rule's lines (the module header): `--place a` and `bp` draft
+    /// and run the residency's default word, `--place gate` neither.
     fn unset_rule(dir: &Path) -> Result<bool, GateError> {
         let mut ok = true;
         let picks = |lines: &[String], draft: &str, residency: &str| {
@@ -575,6 +576,12 @@ mod gate {
             &mut ok,
             "unset_place_a_drafts_and_runs_mid_p0_s1",
             a_ok && picks(&a, "mtp", RESIDENCY_WORD) && record(&a, "residency host").is_some(),
+        );
+        let (bp_ok, bp) = plan_only(dir, "bp")?;
+        check(
+            &mut ok,
+            "unset_place_bp_drafts_and_runs_mid_p0_s1",
+            bp_ok && picks(&bp, "mtp", RESIDENCY_WORD) && record(&bp, "residency host").is_some(),
         );
         let (g_ok, g) = plan_only(dir, "gate")?;
         check(

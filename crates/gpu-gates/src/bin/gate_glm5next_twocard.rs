@@ -68,6 +68,56 @@
 //!   the run proves nothing and fails by name. A miss is a prompt too short
 //!   for the routing (raise [`PROMPT`], [`STEPS`] or [`PASSES`]), not a
 //!   defect of the tier.
+//!
+//! `--residency`: the serving placements' residency
+//! (`bloomery_levers::GLM_RESIDENCY_UNSET`, `mid-p0-s1`) beside the tier, two
+//! loads of plan (b′) through the binaries' opens, one after the other: the
+//! plain load (`app::arch::glm5next::open_resident`, one KDA lane), then the
+//! NextN load (`open_nextn`, the draft beside the target), each under the
+//! word. The residency machine moves the stage card's experts, so a card
+//! expert served on the host computes other bits than on the card and no
+//! one-card load is a bit reference here; the clauses hold the schedule to
+//! itself:
+//!
+//! - `res-twice` (determinism): a history — a clear (the residency back to
+//!   its seed), the first [`PROMPT`] ids as one prompt call, then [`STEPS`]
+//!   greedy steps, each step's argmax and logits FNV — run twice gives the
+//!   same tokens, logits, boundaries and landings, and flips landed;
+//! - `res-mtp-twice`: on the NextN load, the drafted history (the MTP window,
+//!   [`DRAFT_STEPS`] ids) twice gives the same ids, windows, boundaries and
+//!   landings, flips landed;
+//! - `res-tier-fixed` and `res-mtp-tier-fixed` (no tier expert moves): after
+//!   the histories, the host slot map's tier entries are the load's, the
+//!   tier card's set is the map's tier rows, and the stage card's copy of the
+//!   map, read back, is the host map's stage view with every tier expert on
+//!   the host mark — no card slot names a tier expert; and the histories sent
+//!   every tier layer a routed slot, so the tier served under the machine.
+//!
+//! `--nextn`: the NextN draft beside the tier at residency `off`, against the
+//! one-card NextN load holding the same expert sets:
+//!
+//! - `nextn-refuse`: a NextN plan of (b′) whose next-token layer's routed
+//!   stack puts expert 0 on the tier is refused by name before anything
+//!   uploads (`bloomery_gpu_glm5next::NEXTN_ON_TIER`: the walk serves that
+//!   layer on the host through the batch port and runs no tier join);
+//! - then two loads, one after the other: the reference, the NextN plan's
+//!   target plan with its tier segments joined onto the stage card
+//!   ([`union_plan`]) and no tier, opened by `Body::open_placed_nextn_with`;
+//!   the two cards through `open_nextn`. `nextn-bits`: the drafted history's
+//!   ids and windows (each window's proposal and kept rows) on the two cards
+//!   are the reference's, a draft kept and one rejected among them;
+//! - `nextn-stage` (the draft's walk stays on the stage card): on the two
+//!   cards the slot map's row for the next-token layer holds no tier and no
+//!   card entry, the windows enqueued no tier batch service (the walks use
+//!   the batch port, the verifies the step port), and the windows sent every
+//!   tier layer a routed slot.
+//!
+//! `--records`: the `load` record `generate_glm5next` prints (the binary
+//! built beside this one, run as a child: [`RECORD_TOKENS`] prompt ids, `-n
+//! 2`) names the cards the model runs on — `cards` the A6000 alone under
+//! `--place a` with no tier fields, the A6000 then the 3090 under `--place bp`
+//! with the tier's experts (`tier_experts` > 0) — as a V4.1 binary's load
+//! record names them (`generate::with_cards`). Two loads, one a process.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -86,22 +136,32 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::time::Instant;
 
-    use app::arch::glm5next::{GlmCfg, open_pair};
-    use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
+    use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident};
+    use app::mtp::MtpDraft;
+    use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::batch::TierBatchStats;
+    use bloomery_gpu::host::slots::Slot;
     use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::host::tier::TierSet;
+    use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir};
-    use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, feed, set_prefill_group};
-    use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
+    use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
+    use bloomery_gpu_glm5next::{
+        Body, Glm5nextModel, NEXTN_ON_TIER, PrefillMode, TIER_BEFORE_UPLOAD, feed,
+        set_prefill_group,
+    };
+    use bloomery_levers::{CARD_DONTNEED, GLM_RESIDENCY_UNSET, HOST_LOCK, HOST_POPULATE};
     use gguf::Split;
-    use model::arch::glm5next::place::{self, KdaLanes, PlanInputs};
+    use model::arch::glm5next::names;
+    use model::arch::glm5next::place::{self, KdaLanes, NextnInputs, NextnPlan, PlanInputs};
     use model::placement::{
-        self, Device, ExpertList, Machine, Plan, PlanLevers, Role, Row, workstation,
+        self, Device, ExpertList, Format, Machine, Plan, PlanLevers, Role, Row, Segment,
+        workstation,
     };
     use refset::arch::glm5next::{D1K, IK, MODEL};
+    use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Want};
 
     const NAME: &str = "gate_glm5next_twocard";
     /// The card budget both plans are made under (module header: the union
@@ -126,6 +186,15 @@ mod gate {
     const GROUP_PROMPT: usize = 1024;
     /// The vocabulary: a wrong draft is the right one plus one, within it.
     const N_VOCAB: u32 = 154_880;
+    /// Ids the drafted histories generate after their prompt call.
+    const DRAFT_STEPS: usize = 48;
+    /// The rows a drafted window verifies: the target's next token and one
+    /// proposal.
+    const PAIR: usize = 2;
+    /// A refusal before the upload reads the files' headers and the plan only.
+    const REFUSE_BOUND_S: f64 = 120.0;
+    /// Prompt ids the `--records` arm's child runs.
+    const RECORD_TOKENS: usize = 8;
 
     /// The prompt: the `d1k` set's prefill ids.
     fn prompt() -> Result<Vec<u32>, GateError> {
@@ -239,6 +308,13 @@ mod gate {
             cfg: cfg.clone(),
         };
         let s = open_pair(file, args, &mut Quiet)?.ok_or("the open planned nothing")?;
+        tier_on_3090(&s, "load", t0)?;
+        Ok(s)
+    }
+
+    /// Refused unless `s`'s tier `Gpu` is the 3090; prints the load line,
+    /// `what` its name.
+    fn tier_on_3090(s: &Session<Body>, what: &str, t0: Instant) -> Result<(), GateError> {
         let m = s.model();
         let tier = m
             .body(NAME)?
@@ -255,14 +331,14 @@ mod gate {
             .into());
         }
         println!(
-            "load in {:.1} s: stage {} ({} B), tier {} experts on {tier_device} ({} B)",
+            "{what} in {:.1} s: stage {} ({} B), tier {} experts on {tier_device} ({} B)",
             t0.elapsed().as_secs_f64(),
             m.gpu().device_name()?,
             m.resident_bytes(),
             tier.set().experts(),
             tier.weights().resident_bytes(),
         );
-        Ok(s)
+        Ok(())
     }
 
     /// The reference: `plan`, whose stage card holds the union
@@ -586,7 +662,37 @@ mod gate {
         }
     }
 
+    /// Which of the gate's runs the command line asks for (module header).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Arm {
+        /// No flag: the tier against the union, residency off, no draft.
+        Bits,
+        /// `--residency`.
+        Residency,
+        /// `--nextn`.
+        Nextn,
+        /// `--records`.
+        Records,
+    }
+
+    /// The arm the command line names; any other argument is refused by name.
+    fn arm_of() -> Result<Arm, GateError> {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [] => Ok(Arm::Bits),
+            ["--residency"] => Ok(Arm::Residency),
+            ["--nextn"] => Ok(Arm::Nextn),
+            ["--records"] => Ok(Arm::Records),
+            _ => Err(format!(
+                "{NAME} takes no flag, --residency, --nextn or --records (the module header), not \
+                 {args:?}"
+            )
+            .into()),
+        }
+    }
+
     pub fn run() -> Result<(), GateError> {
+        let arm = arm_of()?;
         let levers = bloomery_levers::at_main(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?;
         let mut place_levers = PlanLevers::from_levers(&levers)?;
         place_levers.card_budget_bytes = Some(BUDGET);
@@ -598,6 +704,22 @@ mod gate {
         };
         let inputs =
             PlanInputs::read(&Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?)?;
+        let pass = match arm {
+            Arm::Bits => bits(&cfg, &inputs)?,
+            Arm::Residency => residency_arm(&cfg, &inputs)?,
+            Arm::Nextn => nextn_arm(&cfg, &inputs)?,
+            Arm::Records => records_arm()?,
+        };
+        if !pass {
+            return Err(checks_failed());
+        }
+        println!("PASSED: {NAME}");
+        Ok(())
+    }
+
+    /// The bits arm (no flag): the union reference, then the two cards.
+    fn bits(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
+        let cfg = cfg.clone();
         let bp = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
         let layers = inputs.model.layers;
         let two = bp(layers);
@@ -663,7 +785,7 @@ mod gate {
             uplan.n_l.iter().sum::<u64>()
         );
         let want = {
-            let mut s = open_union(&uplan, &inputs, &cfg)?;
+            let mut s = open_union(&uplan, inputs, &cfg)?;
             legs(&mut s, &prompt)?
         };
         let (got, [g1, g2]) = {
@@ -702,10 +824,597 @@ mod gate {
         }
         pass &= sent_every("decode", got.sent_decode.as_ref(), &tier_layers, false);
         pass &= sent_every("call", got.sent_call.as_ref(), &tier_layers, true);
-        if !pass {
-            return Err(checks_failed());
+        Ok(pass)
+    }
+
+    // ------------------------------------------ residency beside the tier
+
+    /// FNV-1a 64 over a logits row's f32 bits.
+    fn fnv(row: &[f32]) -> u64 {
+        row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
+            v.to_bits()
+                .to_le_bytes()
+                .iter()
+                .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+        })
+    }
+
+    /// A clause's verdict, an error it met printed as its red line.
+    fn held(clause: &str, r: Result<bool, GateError>) -> bool {
+        r.unwrap_or_else(|e| {
+            println!("FAIL {clause}: error \"{e}\"");
+            false
+        })
+    }
+
+    /// What a history saw (module header): the prompt's argmax, each step's
+    /// argmax and logits FNV, each boundary's ended pass and the flips that
+    /// landed there.
+    #[derive(PartialEq)]
+    struct History {
+        first: u32,
+        tokens: Vec<u32>,
+        fnvs: Vec<u64>,
+        passes: Vec<(PassKind, usize)>,
+        landings: Vec<usize>,
+    }
+
+    /// The history from a clear (the residency back to its seed), with what
+    /// it sent the tier.
+    fn history(s: &mut Session<Body>, ids: &[u32]) -> Result<(History, Option<Sent>), GateError> {
+        s.clear()?;
+        s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+        let before = tier_counts(s.model())?;
+        let mut next = s.prompt(ids, Want::Argmax)?.argmax();
+        let first = next;
+        let (mut tokens, mut fnvs) = (Vec::with_capacity(STEPS), Vec::with_capacity(STEPS));
+        for _ in 0..STEPS {
+            let out = s.step(next, Want::Logits)?;
+            if let Out::Logits { row, .. } = out {
+                fnvs.push(fnv(row));
+            }
+            next = out.argmax();
+            tokens.push(next);
         }
-        println!("PASSED: {NAME}");
-        Ok(())
+        let sent = sent_between(before, tier_counts(s.model())?);
+        let passes = s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+        let h = History {
+            first,
+            tokens,
+            fnvs,
+            passes: passes.iter().map(|&(k, r)| (k, r.kept)).collect(),
+            landings: passes.iter().map(|(_, r)| r.landed).collect(),
+        };
+        println!(
+            "history: prompt + {STEPS} steps, {} boundaries, {} flips landed",
+            h.passes.len(),
+            h.landings.iter().sum::<usize>()
+        );
+        Ok((h, sent))
+    }
+
+    /// The windows' proposals and kept rows, as the generation reports them.
+    #[derive(Default)]
+    struct Windows(Vec<(bool, usize)>);
+
+    impl PassSink<Session<Body>> for Windows {
+        type Error = GateError;
+
+        fn begin(&mut self, _: &Session<Body>) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        fn pass(
+            &mut self,
+            _: &Session<Body>,
+            c: &Committed,
+            _: &[u32],
+            _: std::time::Duration,
+        ) -> Result<(), GateError> {
+            self.0.push((c.proposed, c.kept));
+            Ok(())
+        }
+    }
+
+    /// The verify's capture, heard by nobody.
+    struct QuietRows;
+
+    impl RowsLog for QuietRows {
+        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    /// What a drafted history saw: the generated ids, each window's proposal
+    /// and kept rows, each boundary's ended pass and the flips that landed.
+    #[derive(PartialEq)]
+    struct Drafted {
+        tokens: Vec<u32>,
+        windows: Vec<(bool, usize)>,
+        passes: Vec<(PassKind, usize)>,
+        landings: Vec<usize>,
+    }
+
+    /// The drafted history from a clear: the prompt call with the draft's
+    /// store walks, then MTP windows (`Speculative<MtpDraft<Body>, 2>`) for
+    /// [`DRAFT_STEPS`] ids; with what the windows alone sent the tier.
+    fn drafted(s: &mut Session<Body>, ids: &[u32]) -> Result<(Drafted, Option<Sent>), GateError> {
+        s.clear()?;
+        s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+        let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
+        let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut QuietRows)?;
+        let first = spec.prompt(s, ids)?;
+        let before = tier_counts(s.model())?;
+        let mut w = Windows::default();
+        let stop = Stop::new(DRAFT_STEPS, s.ctx())?;
+        let out = runtime::generate(s, &mut spec, ids, first, &stop, &mut w)?;
+        let sent = sent_between(before, tier_counts(s.model())?);
+        let passes = s.model_mut().body_parts(NAME)?.2.take_residency_passes();
+        let d = Drafted {
+            tokens: out.tokens,
+            windows: w.0,
+            passes: passes.iter().map(|&(k, r)| (k, r.kept)).collect(),
+            landings: passes.iter().map(|(_, r)| r.landed).collect(),
+        };
+        println!(
+            "drafted history: prompt + {} ids in {} windows, {} boundaries, {} flips landed",
+            d.tokens.len(),
+            d.windows.len(),
+            d.passes.len(),
+            d.landings.iter().sum::<usize>()
+        );
+        Ok((d, sent))
+    }
+
+    /// Every tier entry of the load's host slot map, `(layer, id, slot)`,
+    /// and the tier card's set.
+    struct TierHeld {
+        entries: Vec<(usize, u32, Slot)>,
+        set: TierSet,
+    }
+
+    fn tier_held(s: &Session<Body>) -> Result<TierHeld, GateError> {
+        let hybrid = s.model().body(NAME)?.hybrid();
+        let map = hybrid.slots();
+        let mut entries = Vec::new();
+        for l in map.layers() {
+            for id in 0..u32::try_from(map.n_expert())? {
+                if let Some(slot @ Slot::Tier { .. }) = map.slot(l, id) {
+                    entries.push((l, id, slot));
+                }
+            }
+        }
+        let set = hybrid
+            .tiers()
+            .first()
+            .ok_or("the (b′) load holds no tier card")?
+            .set()
+            .clone();
+        Ok(TierHeld { entries, set })
+    }
+
+    /// The layers the loaded map sends tier experts to.
+    fn tier_layers_of(s: &Session<Body>) -> Result<Vec<usize>, GateError> {
+        let map = s.model().body(NAME)?.hybrid().slots();
+        let mut out = Vec::new();
+        for l in map.layers() {
+            if map.on_tier(l)? > 0 {
+                out.push(l);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `what` (the tier-fixed clause, module header): `s`'s tier entries are
+    /// `load`'s, the tier card's set is the host map's tier rows, and the
+    /// stage card's copy of the map, read back, is the host map's stage view
+    /// with every tier expert on the host mark.
+    fn tier_fixed(what: &str, s: &Session<Body>, load: &TierHeld) -> Result<bool, GateError> {
+        let now = tier_held(s)?;
+        let m = s.model();
+        let body = m.body(NAME)?;
+        let map = body.hybrid().slots();
+        let same_entries = now.entries == load.entries;
+        let set_is_map = now.set == load.set && TierSet::of_map(map, 0)? == load.set;
+        m.gpu().stream().synchronize()?;
+        let copy = body.slot_copy().buf().to_host_vec(m.gpu().stream())?;
+        let view_ok = copy == map.stage_view();
+        let mut named = Vec::new();
+        for &(l, id, _) in &load.entries {
+            let at = map
+                .row_offset(l)
+                .ok_or_else(|| format!("no row offset for layer {l}"))?
+                + usize::try_from(id)?;
+            if copy.get(at) != Some(&HOST) {
+                named.push((l, id, copy.get(at).copied()));
+            }
+        }
+        let moved = load
+            .entries
+            .iter()
+            .filter(|e| !now.entries.contains(e))
+            .count();
+        let ok =
+            !load.entries.is_empty() && same_entries && set_is_map && view_ok && named.is_empty();
+        println!(
+            "{what}: {} tier entries at load, {moved} of them moved, {} now; the tier's set the \
+             map's tier rows {set_is_map}; the stage card's copy the host map's stage view \
+             {view_ok}, tier experts at a card slot {named:?}: {}",
+            load.entries.len(),
+            now.entries.len(),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `what` (determinism): `a` and `b` equal, and flips landed in `a`.
+    fn twice<T: PartialEq>(what: &str, a: &T, b: &T, landings: &[usize]) -> bool {
+        let landed: usize = landings.iter().sum();
+        let ok = a == b && landed > 0;
+        println!(
+            "{what}: the same schedule twice the same {}, {landed} flips landed: {}",
+            a == b,
+            verdict(ok)
+        );
+        ok
+    }
+
+    /// The `--residency` arm (module header).
+    fn residency_arm(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
+        let lever = Residency::parse(GLM_RESIDENCY_UNSET)?;
+        let bp = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
+        let prompt = prompt()?;
+        let ids = &prompt[..PROMPT];
+        let open_args = || OpenArgs {
+            place: Place::Bp.name(),
+            machine: bp,
+            ctx: CTX,
+            mode: StepMode::Graph,
+            cfg: cfg.clone(),
+        };
+        let file = || Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"));
+        println!("{NAME} --residency: plan (b′) under BLOOMERY_RESIDENCY {GLM_RESIDENCY_UNSET}");
+        let mut pass = true;
+        {
+            let t0 = Instant::now();
+            let mut s = open_resident(file()?, open_args(), lever, &mut Quiet)?
+                .ok_or("the resident open planned nothing")?;
+            tier_on_3090(&s, "resident load", t0)?;
+            s.model_mut().body_parts(NAME)?.2.log_residency(0);
+            let load = tier_held(&s)?;
+            let tier_layers = tier_layers_of(&s)?;
+            let a = history(&mut s, ids);
+            let b = history(&mut s, ids);
+            match (a, b) {
+                (Ok((a, sent)), Ok((b, _))) => {
+                    pass &= twice("res-twice", &a, &b, &a.landings);
+                    pass &= sent_every("residency", sent.as_ref(), &tier_layers, false);
+                }
+                (a, b) => {
+                    let e = a.err().or(b.err()).map(|e| e.to_string());
+                    println!(
+                        "FAIL res-twice: a history: error \"{}\"",
+                        e.unwrap_or_default()
+                    );
+                    pass = false;
+                }
+            }
+            pass &= held("res-tier-fixed", tier_fixed("res-tier-fixed", &s, &load));
+        }
+        {
+            let t0 = Instant::now();
+            let mut s = open_nextn(file()?, open_args(), lever, &mut Quiet)?
+                .ok_or("the NextN open planned nothing")?;
+            tier_on_3090(&s, "resident NextN load", t0)?;
+            s.model_mut().body_parts(NAME)?.2.log_residency(0);
+            let load = tier_held(&s)?;
+            let tier_layers = tier_layers_of(&s)?;
+            let a = drafted(&mut s, ids);
+            let b = drafted(&mut s, ids);
+            match (a, b) {
+                (Ok((a, sent)), Ok((b, _))) => {
+                    pass &= twice("res-mtp-twice", &a, &b, &a.landings);
+                    pass &= sent_every("residency drafted", sent.as_ref(), &tier_layers, false);
+                }
+                (a, b) => {
+                    let e = a.err().or(b.err()).map(|e| e.to_string());
+                    println!(
+                        "FAIL res-mtp-twice: a drafted history: error \"{}\"",
+                        e.unwrap_or_default()
+                    );
+                    pass = false;
+                }
+            }
+            pass &= held(
+                "res-mtp-tier-fixed",
+                tier_fixed("res-mtp-tier-fixed", &s, &load),
+            );
+        }
+        Ok(pass)
+    }
+
+    // ------------------------------------------------ NextN beside the tier
+
+    /// `np` with the next-token layer's routed gate stack made a routed row
+    /// whose expert 0 sits on the tier card: the plan `nextn-refuse` loads.
+    /// `model` is the target's tensors with that stack's role routed.
+    fn nextn_on_tier_plan<'a>(
+        np: &NextnPlan<'a>,
+        model: &'a placement::ModelTensors,
+        nextn: &NextnInputs,
+    ) -> Result<NextnPlan<'a>, GateError> {
+        let name = names::ffn_gate_exps(nextn.index);
+        let i = model
+            .tensors
+            .iter()
+            .position(|t| t.name == name)
+            .ok_or_else(|| format!("the target's tensors hold no {name}"))?;
+        let mut plan = np.plan.clone();
+        plan.model = model;
+        let row = plan
+            .rows
+            .iter_mut()
+            .find(|r| r.tensor == i)
+            .ok_or_else(|| format!("the plan has no row of {name}"))?;
+        *row = Row {
+            tensor: i,
+            segments: vec![Segment {
+                device: Device::Card(plan.machine.cards.len()),
+                format: Format::Unused,
+                experts: Some(ExpertList::new(vec![0], model.experts)?),
+                resident_bytes: 0,
+            }],
+            read_bytes: 0,
+            stage: 0,
+        };
+        Ok(NextnPlan {
+            plan,
+            nextn: np.nextn.clone(),
+            arena_bytes: np.arena_bytes,
+            headroom_bytes: np.headroom_bytes,
+            host_headroom_bytes: np.host_headroom_bytes,
+        })
+    }
+
+    /// `nextn-refuse` (module header).
+    fn nextn_refuse(
+        np: &NextnPlan<'_>,
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+        cfg: &GlmCfg,
+    ) -> Result<bool, GateError> {
+        let mut model = np.plan.model.clone();
+        let name = names::ffn_gate_exps(nextn.index);
+        let t = model
+            .tensors
+            .iter_mut()
+            .find(|t| t.name == name)
+            .ok_or_else(|| format!("the target's tensors hold no {name}"))?;
+        if t.layer != Some(nextn.index) {
+            return Err(format!("{name} is on layer {:?}, not {}", t.layer, nextn.index).into());
+        }
+        t.role = Role::RoutedExperts;
+        let doctored = nextn_on_tier_plan(np, &model, nextn)?;
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let t0 = Instant::now();
+        let opened = Body::open_placed_nextn_with(
+            file,
+            &doctored,
+            inputs,
+            nextn,
+            0,
+            cfg.host,
+            Residency::Off,
+        );
+        let secs = t0.elapsed().as_secs_f64();
+        let (ok, why) = match opened {
+            Err(e) => {
+                let text = e.to_string();
+                (
+                    text.contains(NEXTN_ON_TIER)
+                        && text.contains(TIER_BEFORE_UPLOAD)
+                        && secs < REFUSE_BOUND_S,
+                    text,
+                )
+            }
+            Ok(_) => (false, "the open loaded".to_string()),
+        };
+        println!(
+            "nextn-refuse: layer {}'s expert 0 on the tier: the open in {secs:.1} s — {why}: {}",
+            nextn.index,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The reference NextN load: `np`, whose stage card holds the union, on
+    /// card 0 with no tier.
+    fn open_union_nextn(
+        np: &NextnPlan<'_>,
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+        cfg: &GlmCfg,
+    ) -> Result<Session<Body>, GateError> {
+        let t0 = Instant::now();
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let mut model =
+            Body::open_placed_nextn_with(file, np, inputs, nextn, 0, cfg.host, Residency::Off)?;
+        model.set_mode(StepMode::Graph);
+        if !model.body(NAME)?.hybrid().tiers().is_empty() {
+            return Err("the reference NextN load holds a tier card".into());
+        }
+        let s = Loaded::from_model(model, cfg.clone(), u32::try_from(np.plan.ctx_max)?)
+            .ready(&mut Quiet)?;
+        println!(
+            "reference NextN load in {:.1} s: {} ({} B) holds the union, no tier",
+            t0.elapsed().as_secs_f64(),
+            s.model().gpu().device_name()?,
+            s.model().resident_bytes(),
+        );
+        Ok(s)
+    }
+
+    /// `nextn-stage` (module header): the next-token layer's map row holds no
+    /// tier and no card entry, the windows enqueued no tier batch service,
+    /// and they sent every tier layer a routed slot.
+    fn nextn_stage(
+        s: &Session<Body>,
+        nextn: usize,
+        windows: Option<&Sent>,
+        tier_layers: &[usize],
+    ) -> Result<bool, GateError> {
+        let map = s.model().body(NAME)?.hybrid().slots();
+        let (on_tier, on_card) = (map.on_tier(nextn)?, map.on_card(nextn)?);
+        let batch = windows.map(|w| w.stats.served);
+        let ok = on_tier == 0 && on_card == 0 && batch == Some(0);
+        println!(
+            "nextn-stage: layer {nextn}'s row: {on_tier} tier, {on_card} card entries; tier batch \
+             services in the windows {batch:?}: {}",
+            verdict(ok)
+        );
+        Ok(ok && sent_every("nextn windows", windows, tier_layers, false))
+    }
+
+    /// The `--nextn` arm (module header).
+    fn nextn_arm(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
+        let nextn = NextnInputs::read(inputs)?;
+        let bp = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
+        let two = bp(inputs.model.layers);
+        let np = inputs.plan_nextn(&two, u64::try_from(CTX)?, &cfg.place, &nextn)?;
+        println!(
+            "{NAME} --nextn: NextN plan (b′): stage {} experts, tier {} experts, host {} experts; \
+             layer {} after the trunk",
+            np.plan.cards[0].experts,
+            np.plan.cards.get(1).map_or(0, |c| c.experts),
+            np.plan.host.experts,
+            nextn.index
+        );
+        let mut pass = held("nextn-refuse", nextn_refuse(&np, inputs, &nextn, cfg));
+        let prompt = prompt()?;
+        let ids = &prompt[..PROMPT];
+        let flat = Machine {
+            tiers: Vec::new(),
+            ..two.clone()
+        };
+        let unp = NextnPlan {
+            plan: union_plan(&np.plan, &flat)?,
+            nextn: np.nextn.clone(),
+            arena_bytes: np.arena_bytes,
+            headroom_bytes: np.headroom_bytes,
+            host_headroom_bytes: np.host_headroom_bytes,
+        };
+        let want = {
+            let mut s = open_union_nextn(&unp, inputs, &nextn, cfg)?;
+            drafted(&mut s, ids)?.0
+        };
+        let t0 = Instant::now();
+        let args = OpenArgs {
+            place: Place::Bp.name(),
+            machine: bp,
+            ctx: CTX,
+            mode: StepMode::Graph,
+            cfg: cfg.clone(),
+        };
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let mut s = open_nextn(file, args, Residency::Off, &mut Quiet)?
+            .ok_or("the NextN open planned nothing")?;
+        tier_on_3090(&s, "NextN load", t0)?;
+        let tier_layers = tier_layers_of(&s)?;
+        let (got, windows) = drafted(&mut s, ids)?;
+        let rejected = got.windows.iter().filter(|&&(p, k)| p && k == 1).count();
+        let accepted = got.windows.iter().filter(|&&(p, k)| p && k == PAIR).count();
+        let differ = got
+            .tokens
+            .iter()
+            .zip(&want.tokens)
+            .position(|(a, b)| a != b);
+        let bits = got.tokens == want.tokens && got.windows == want.windows;
+        let ok = bits && accepted > 0 && rejected > 0;
+        println!(
+            "nextn-bits: {} ids in {} windows, the reference's {} ids in {} windows, the same \
+             {bits} (first id apart {differ:?}); {accepted} drafts kept, {rejected} rejected: {}",
+            got.tokens.len(),
+            got.windows.len(),
+            want.tokens.len(),
+            want.windows.len(),
+            verdict(ok)
+        );
+        pass &= ok;
+        pass &= held(
+            "nextn-stage",
+            nextn_stage(&s, nextn.index, windows.as_ref(), &tier_layers),
+        );
+        Ok(pass)
+    }
+
+    // ------------------------------------------------ the load record's cards
+
+    /// The `load` record `generate_glm5next --place <place>` prints: the
+    /// binary beside this one, a short run of `ids`, stdout read whole.
+    fn load_line(place: &str, ids: &[u32]) -> Result<String, GateError> {
+        let exe = std::env::current_exe()?.with_file_name("generate_glm5next");
+        let tokens: Vec<String> = ids.iter().map(u32::to_string).collect();
+        let out = std::process::Command::new(&exe)
+            .args(["--place", place, "--tokens", &tokens.join(","), "-n", "2"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "generate_glm5next --place {place}: {}; stderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )
+            .into());
+        }
+        String::from_utf8(out.stdout)?
+            .lines()
+            .find(|l| l.starts_with("load resident_bytes="))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!("generate_glm5next --place {place} printed no load record").into()
+            })
+    }
+
+    /// The value of `key=` on a record line, `None` when the line has none.
+    fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.split(' ')
+            .find_map(|w| w.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+    }
+
+    /// `records` (module header): the cards each placement's load record
+    /// names, against the placement's card names in order.
+    fn records_arm() -> Result<bool, GateError> {
+        let prompt = prompt()?;
+        let ids = &prompt[..RECORD_TOKENS];
+        let mut pass = true;
+        for place in [Place::A, Place::Bp] {
+            let line = held("records", load_line(place.name(), ids).map(|l| {
+                let cards: Vec<&str> = field(&l, "cards").map_or_else(Vec::new, |c| c.split(',').collect());
+                let named = cards.len() == place.cards().len()
+                    && cards
+                        .iter()
+                        .zip(place.cards())
+                        .all(|(c, want)| c.contains(&want.replace(' ', "_")));
+                let tier = field(&l, "tier_experts").and_then(|v| v.parse::<u64>().ok());
+                let tier_ok = match place.tier_cards().is_empty() {
+                    true => tier.is_none() && field(&l, "tier_bytes").is_none(),
+                    false => tier.is_some_and(|n| n > 0),
+                };
+                let ok = named && tier_ok;
+                println!(
+                    "records --place {}: cards {cards:?} (want {:?}), tier_experts {tier:?}: {}",
+                    place.name(),
+                    place.cards(),
+                    verdict(ok)
+                );
+                if !ok {
+                    println!("  {l}");
+                }
+                ok
+            }));
+            pass &= line;
+        }
+        Ok(pass)
     }
 }

@@ -27,6 +27,11 @@ fn main() -> std::process::ExitCode {
 #[path = "shared/serve_seats/mod.rs"]
 mod serve_seats;
 
+// The GLM seat's placement word and tier batch bytes (`crate::glm_place`).
+#[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_place.rs"]
+mod glm_place;
+
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_serve_levers.rs"]
 mod serve_levers;

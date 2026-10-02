@@ -17,8 +17,9 @@ use std::io::Write;
 use std::time::Instant;
 
 use bloomery_gpu::host::slots::MAX_TIERS;
+use bloomery_gpu::host::tier::TierCard;
 use bloomery_gpu::model::{ChainBody, StepMode};
-use bloomery_gpu::{GpuError, GpuModel};
+use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::Machine;
 use model::placement::workstation::{self, CardSpec, TierBatchBytes, TierDraft};
@@ -254,6 +255,59 @@ impl Place {
     /// plan reserves nothing and the draft's card is the caller's choice.
     pub fn draft_card(self) -> Option<&'static str> {
         self.tier_cards().first().copied()
+    }
+}
+
+/// `r`, a `load` record ([`record::LOAD_GENERATOR`]) written up to its
+/// `unified_addressing` field, with the devices the model runs on (`cards`:
+/// the stage card `stage`, then the expert tier cards `tiers`), by the names
+/// their drivers report — each space written `_`, since the field is one
+/// word — and, when the placement has an expert tier card, the tier's
+/// experts and resident bytes. A device whose name does not hold the
+/// placement's card name, tiers that do not match the placement's — another
+/// count, or a tier on another card — and more than the one tier the
+/// record's fields hold are refused by name. Every body's load record names
+/// its cards here.
+pub fn with_cards(
+    r: Record,
+    place: Place,
+    stage: &Gpu,
+    tiers: &[TierCard],
+) -> Result<Record, GateError> {
+    let mut devices = vec![stage.device_name()?];
+    for t in tiers {
+        devices.push(t.gpu().device_name()?);
+    }
+    let planned = place.cards();
+    let named =
+        devices.len() == planned.len() && devices.iter().zip(&planned).all(|(d, p)| d.contains(p));
+    if !named {
+        return Err(format!(
+            "--place {}: the model runs on {devices:?}, the placement's cards are {planned:?}",
+            place.name()
+        )
+        .into());
+    }
+    let r = r.csv("cards", devices.iter().map(|d| d.replace(' ', "_")));
+    let want = place.tier_cards();
+    let got: Vec<&str> = tiers.iter().map(TierCard::name).collect();
+    match (tiers, want.as_slice()) {
+        ([], []) => Ok(r),
+        ([t], [name]) if t.name() == *name => Ok(r
+            .u("tier_experts", t.set().experts())
+            .u("tier_bytes", t.weights().resident_bytes())),
+        ([_, _, ..], _) if got == want => Err(format!(
+            "--place {}: the load record holds one expert tier's fields, and the model loaded \
+             {} tiers",
+            place.name(),
+            got.len()
+        )
+        .into()),
+        _ => Err(format!(
+            "--place {}: the loaded model's expert tiers are {got:?}, the placement's {want:?}",
+            place.name()
+        )
+        .into()),
     }
 }
 

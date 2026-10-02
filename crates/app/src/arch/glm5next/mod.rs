@@ -115,9 +115,11 @@ impl Open for Body {
 /// host set also holds each layer's churn pool, which the target plan's host
 /// headroom less the layer's host experts must take) in `args`' step mode,
 /// handed to `log`, the step captured and the prompt call's buffers made.
-/// Refused as [`Open::plan`] refuses, as the residency machine refuses at the
-/// load, and by name for a file of other than one next-token layer and a
-/// plan the layer breaks.
+/// The placement's expert tier cards serve the target; the draft's walk
+/// stays on the stage card and the host. Refused as [`Open::plan`] refuses,
+/// as the residency machine refuses at the load, and by name for a file of
+/// other than one next-token layer, a plan the layer breaks and a plan that
+/// puts one of the layer's experts on a tier.
 pub fn open_nextn<M: Fn(usize) -> Machine>(
     file: Split,
     args: OpenArgs<GlmCfg, M>,
@@ -126,7 +128,7 @@ pub fn open_nextn<M: Fn(usize) -> Machine>(
 ) -> Result<Option<Session<Body>>, SessionError> {
     let inputs = <Body as Open>::inputs(&file)?;
     let nextn = NextnInputs::read(&inputs).map_err(|e| GpuError::plan(WHAT, e))?;
-    let (machine, ctx) = one_card(&args, &inputs, Tiers::Refused)?;
+    let (machine, ctx) = one_card(&args, &inputs)?;
     let plan = inputs
         .plan_nextn(&machine, ctx, &args.cfg.place, &nextn)
         .map_err(|e| GpuError::plan(WHAT, e))?;
@@ -152,7 +154,7 @@ pub fn open_pair<M: Fn(usize) -> Machine>(
     log: &mut impl OpenLog<Body>,
 ) -> Result<Option<Session<Body>>, SessionError> {
     let inputs = <Body as Open>::inputs(&file)?;
-    let (machine, ctx) = one_card(&args, &inputs, Tiers::Hung)?;
+    let (machine, ctx) = one_card(&args, &inputs)?;
     let plan = inputs
         .plan_lanes(&machine, ctx, &args.cfg.place, KdaLanes::Two)
         .map_err(|e| GpuError::plan(WHAT, e))?;
@@ -172,22 +174,12 @@ pub fn open_pair<M: Fn(usize) -> Machine>(
     ready(model, args.mode, args.cfg, ctx, log)
 }
 
-/// Whether a session's open hangs the placement's expert tier cards under
-/// the host tier, or refuses them by name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tiers {
-    Hung,
-    /// The NextN load: the next-token layer's walk is not built on a tier.
-    Refused,
-}
-
 /// `args`' machine for `inputs` and its context, refused by name unless the
-/// machine is one stage card ([`Open::plan`]'s rule) and, under
-/// [`Tiers::Refused`], has no expert tier card.
+/// machine is one stage card ([`Open::plan`]'s rule); its expert tier cards
+/// are hung under the host tier by the load.
 fn one_card<M: Fn(usize) -> Machine>(
     args: &OpenArgs<GlmCfg, M>,
     inputs: &PlanInputs,
-    tiers: Tiers,
 ) -> Result<(Machine, u64), SessionError> {
     let machine = (args.machine)(<Body as Open>::layer_count(inputs));
     if machine.cards.len() != 1 {
@@ -196,17 +188,6 @@ fn one_card<M: Fn(usize) -> Machine>(
             detail: format!(
                 "the placement puts the layers on {} cards; the chain runs on one",
                 machine.cards.len()
-            ),
-        }
-        .into());
-    }
-    if tiers == Tiers::Refused && !machine.tiers.is_empty() {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!(
-                "a NextN session beside {} expert tier card(s): the next-token layer's walk is not \
-                 built on the tier; open it on one card (--place a or gate)",
-                machine.tiers.len()
             ),
         }
         .into());

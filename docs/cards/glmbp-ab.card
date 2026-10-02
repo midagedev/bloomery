@@ -1,0 +1,65 @@
+# Round glmlift's card, for the lead to sit: GLM-5.3-Flash's serving defaults (the NextN MTP draft and adaptive
+# residency mid-p0-s1) on plan (a), the A6000 alone, against plan (b′) (--place bp: plan (a) on the A6000 and the
+# 3090 an expert tier under the host tier), one binary, decode at prose depth 512. The answer decides whether the GLM
+# seat's default moves from --place a to bp (round glmlift lifted the tier's refusals beside both levers; the default
+# stays a until this run).
+# Decomposition [derived], one drafted pass (two rows, the target's next token and one proposal):
+# - the pass on plan (a): 58.3 ms at the clip's acceptance 29/35 (round ncard's report, section 2), its host leg 378
+#   union slots at 0.111..0.117 ms a slot (glmres-ab.card: an expert's 15.2 MB read at ~133 GB/s, flat in its 1..2
+#   columns), 43 ms; the host leg is the per-layer max on the step's sum path (the card's ~66 experts a layer read
+#   in its shadow), so a host slot removed is its 0.114 ms off the wall;
+# - the tier: about 39 experts a layer on 39 routed layers (round ncard: the 3090's 23.67 GB less its batch reserve
+#   at 15.2 MB an expert; the NextN plan's reserve, the layer's card bytes and its 16 MB arena, is also taken off
+#   the tier card by placement::plan_rule, about one expert a layer, 2.5 %); the tier's ids are the ones after the
+#   stage card's id prefix, uncorrelated with how hot they route. Under the residency the card holds the hottest 66
+#   of the 249 non-tier ids instead of 288; the tier carries its ids' share of the routed mass, ~39/288 = 13.5 % of
+#   all slots, and the card's hit drops by less than that (its top-66 loses ~13.5 % of its members, refilled from
+#   ranks 67..76): the host's share falls from 60.5 % (glmres-ab's replay, card hit 39.5 %) to 48.7..51.0 %,
+#   -15..-20 % of the host slots, 57..76 union slots a pass: -6.3..-8.9 ms;
+# - c_two, the two-card fixed cost a step pays (+1.9..+2.5 ms over V4.1's one-card model, rig-log
+#   09-29#chatlist-dspark, docs/plan-triage.md; its source is open): +1.9..+2.5 ms a pass if it is paid once a pass,
+#   +3.8..+5.0 if once a row: +1.9..+5.0;
+# - unchanged: the draft's walk (the NextN layer's experts are host-only in both arms, its walk on the stage card),
+#   the residency's staging, the card front.
+# Pass 58.3 - 8.9 + 1.9 = 51.3 ms .. 58.3 - 6.3 + 5.0 = 57.0 ms: tok/s +2.3 .. +13.6 %, band +2..+14 [derived].
+# Round ncard's -2..+15 took the tier's low edge at 26 slots a row (-3.8 ms a pass); a tier share under 15 % of the
+# host slots needs the tier's ids to route below the mean, which the id-prefix fill gives no reason for. The edge
+# nearest 0 rests on that share and c_two per row; the run reads both together, as d_slots (BLOOMERY_STEP_STATS is
+# refused beside the draft today, so the host slots a pass are not printed: the ratio is the term).
+# Waits for the per-arm place runner (round armplace's tools/ref/depth-glm5next.sh: an arm's `place=<a|gate|bp>` item,
+# the two-card mode BLOOMERY_TIMING_CARDS=a6000+3090 with depth-ds41.sh's witness — both cards' name and power
+# limit, the 3090 at its 250 W cap, Xid before and after every arm — and each ours arm's load record `cards`
+# held to its placement, which generate_glm5next prints since round glmlift). The two arms differ in their place=
+# item alone, so the runner pairs them by round in its `ratio place d=` table (bp / a), the list
+# `tools/ref/card.py verdict` reads. With it:
+#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmbp-ab.card BLOOMERY_AB_ROUNDS=4
+#   BLOOMERY_TIMING_CARDS=a6000+3090' just depth-gpu-glm5next oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1,place=a
+#   oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1,place=bp > <log> 2>&1
+# Wall [derived]: 2 arms x (4 rounds + 1 warm-up) = 10 processes, each a load with its host set preheated (the bp
+# load also uploads the tier's ~23 GB to the 3090, ~1..2 s at PCIe 4.0 x16) plus 512 prompt ids and 96 generated:
+# 1.2..2.0 min a process (glmres-ab's 10..18 min for 8), 12..20 min.
+kind: ab
+question: on the serving defaults (NextN draft + residency mid-p0-s1), does plan (b′) — the 3090 as GLM's expert
+  tier — decode faster than plan (a) on the A6000 alone, by the host slots the tier takes less the two-card cost?
+term: tok/s(mean) @ n=96, depth 512, A6000 (+ 3090 under bp), prose ids (GLM_PROSE from GLM_PROSE_FROM), ctx 2048,
+  BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=mid-p0-s1, --place bp against --place a, same binary, paired by round
+unit: %
+predict: +2..+14
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, both arms in one lease, a fresh process a run (each residency run starts at the seed); every
+  row's SMOKE names the arm's place (a, bp), the bp arm's load record names cards A6000 then 3090 with
+  tier_experts > 0 and its plan record 1,531 fewer host_experts than the a arm's at the same card_experts 2600
+  (the seat's --plan at ctx 2048: 9,496 against 7,965, round glmlift's serve gate log), and the 3090 runs no other
+  compute process (no [other-busy] on the bp rows); each arm prints
+  `residency lever residency=mid-p0-s1 why=set`, a `residency host` record and an `mtp summary`; no row [cold],
+  [cpu-busy] or [other-busy]; no Xid on either card before or after; the full output to a file first
+decide-in: move the GLM seat's unset --place from a to bp (serve_seats/glm.rs parse_args, README and docs/BUILD.md),
+  then sit the bp arm in the public table beside plan (a); the edge reads the tier's host-slot share and c_two
+  together, so a value in the lower third takes one BLOOMERY_STEP_STATS window on the plain bp arm (host slots a
+  step, tier hits) before the public row
+decide-below: keep --place a as the default; the tier takes fewer host slots than its share (the residency's card
+  set overlaps the tier's ids) or c_two is paid per row and larger than V4.1's: one nsys window of the bp arm (the
+  tier's go and join against the host leg per layer) before any tier-slot residency work
+decide-above: move the default to bp, and price tier-slot residency (the 3090's slots moved by the same rule,
+  round ncard's D3 next lever) next: the tier's share is above its ids' mean mass, so a hot-set tier pays more

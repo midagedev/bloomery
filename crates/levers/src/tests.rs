@@ -662,15 +662,16 @@ fn draft38_unset_follows_the_place_and_the_file() {
     );
 }
 
-/// The GLM seat's levers unset: under `--place a` the NextN draft and the
+/// The GLM seat's levers unset: under a serving placement (`--place a` or
+/// `bp`, both `serving_place`) the NextN draft and the
 /// residency's default word; `off`, the first condition that holds named,
 /// under `--place gate`, with stores short of a window (both), on a file of
 /// other than one next-token layer (the draft), beside the step feed (the
 /// residency).
 #[test]
 fn glm_unset_follows_the_place() {
-    let at = |place_a, nextn_layers, ctx, prefill_steps| GlmAt {
-        place_a,
+    let at = |serving_place, nextn_layers, ctx, prefill_steps| GlmAt {
+        serving_place,
         nextn_layers,
         need: 3,
         ctx,
@@ -678,8 +679,8 @@ fn glm_unset_follows_the_place() {
     };
     let pick = |word, why| GlmPick { word, why };
     let on_a = GlmUnset {
-        draft: pick("mtp", GlmWhy::PlaceA),
-        residency: pick("mid-p0-s1", GlmWhy::PlaceA),
+        draft: pick("mtp", GlmWhy::Serving),
+        residency: pick("mid-p0-s1", GlmWhy::Serving),
     };
     for (at, want) in [
         (at(true, 1, 2048, false), on_a),
@@ -716,7 +717,7 @@ fn glm_unset_follows_the_place() {
             at(true, 2, 2048, false),
             GlmUnset {
                 draft: pick("off", GlmWhy::Nextn { layers: 2 }),
-                residency: pick("mid-p0-s1", GlmWhy::PlaceA),
+                residency: pick("mid-p0-s1", GlmWhy::Serving),
             },
         ),
     ] {
@@ -730,6 +731,7 @@ fn glm_unset_follows_the_place() {
         GlmWhy::Gate.to_string(),
         "unset: --place gate keeps its fixed placement"
     );
+    assert_eq!(GlmWhy::Serving.to_string(), "unset: --place a or bp");
 }
 
 /// The GLM seat's unset residency on the plan: the default word where it
@@ -739,7 +741,7 @@ fn glm_unset_follows_the_place() {
 fn glm_residency_at_plan_takes_only_what_fits() {
     let mid = GlmPick {
         word: "mid-p0-s1",
-        why: GlmWhy::PlaceA,
+        why: GlmWhy::Serving,
     };
     let off = |why| GlmPick { word: "off", why };
     let fit = |n: &[u64], pool: u64, headroom, mem| {
@@ -779,7 +781,7 @@ fn glm_residency_at_plan_takes_only_what_fits() {
         glm_residency_at_plan(gate, [66u64], |_| Err("not asked"), 0, 0),
         Ok(gate)
     );
-    assert_eq!(fit(&[66], 10, 10, 10).map(|p| p.why), Ok(GlmWhy::PlaceA));
+    assert_eq!(fit(&[66], 10, 10, 10).map(|p| p.why), Ok(GlmWhy::Serving));
     assert_eq!(
         glm_residency_at_plan(mid, [66u64], |_| Err::<u64, &str>("the pool"), 0, 0),
         Err("the pool"),

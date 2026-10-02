@@ -1641,12 +1641,18 @@ gate-gpu-glm5next-mtp:
 # A6000 holds the stage's and the tier's experts with no tier: the step leg (32 prompt steps, 48 greedy), the pair leg (16
 # verifies of two rows, a third rejected) and the call leg (one 512-position prompt batch, 4 steps after) bit for bit the
 # reference's, tokens, kept counts and logits rows; the stage's step graph of the reference's node count; every tier layer
-# sent a routed slot by each leg, the call's batch served by the tier. Two loads, one after the other. Both cards
+# sent a routed slot by each leg, the call's batch served by the tier. Two loads, one after the other. Then two more
+# runs, each under its own bound: --residency (the plain and the NextN load under mid-p0-s1 beside the tier: the same
+# history twice with flips landed, and no tier expert moved — the host map's tier entries, the tier's set and the stage
+# card's copy of the map), and --nextn (a NextN plan with a next-token expert on the tier refused by name before any
+# upload, then the drafted ids and windows on the two cards against the one-card NextN load of the union, the walk on
+# the stage card). Two loads each. Then --records: generate_glm5next's load record names the A6000 alone under --place a
+# and the A6000 then the 3090 (with the tier's experts) under bp, one child process a placement. Both cards
 # (BLOOMERY_CARD=both: both gate locks), alone in a batch.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-twocard:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_twocard && bash tools/gpu-gate.sh gate_glm5next_twocard'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_twocard --bin generate_glm5next && bash tools/gpu-gate.sh gate_glm5next_twocard && bash tools/gpu-gate.sh gate_glm5next_twocard --residency && bash tools/gpu-gate.sh gate_glm5next_twocard --nextn && bash tools/gpu-gate.sh gate_glm5next_twocard --records'
 
 # GLM's adaptive expert residency on the gate placement (BLOOMERY_RESIDENCY set in the gate at mid-p<P>-s1, P half the
 # plan's least card slots a layer): the churn pool's host refusal at load, the batch prompt one pass keeping 0 and each

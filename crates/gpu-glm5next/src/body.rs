@@ -917,35 +917,55 @@ fn refuse_other_lanes(
 
 /// Refused by name, before anything uploads, unless the expert tier cards
 /// `tiers` of `plan` are ones this load hangs: at most the cards the host
-/// tier serves ([`refuse_tier_count`]), none beside a residency other than
-/// `off` (the residency machine's moves are not built beside a tier here),
-/// and a slot map with every expert on one device.
+/// tier serves ([`refuse_tier_count`]), and a slot map over the host run
+/// (with the next-token layer `nextn` at its end on a NextN load) with every
+/// expert on one device and no tier entry in that layer's row
+/// ([`refuse_nextn_on_tier`]). A residency machine runs beside a tier as it
+/// runs without one: it moves the stage card's experts alone and holds every
+/// tier expert away ([`bloomery_gpu::host::swap`]).
 fn refuse_tiers_before_upload(
     plan: &Plan<'_>,
     inputs: &PlanInputs,
     card: usize,
     tiers: &[TierOpen],
-    residency: Residency,
+    nextn: Option<usize>,
 ) -> Result<(), GpuError> {
     if tiers.is_empty() {
         return Ok(());
     }
     refuse_tier_count(TIER_BEFORE_UPLOAD, tiers.len())?;
-    if residency != Residency::Off {
-        return Err(GpuError::Shape {
-            what: TIER_BEFORE_UPLOAD,
-            detail: format!(
-                "an expert tier card beside BLOOMERY_RESIDENCY {residency:?}: residency on a \
-                 tiered GLM load is not built; use BLOOMERY_RESIDENCY=off"
-            ),
-        });
-    }
-    let run = host_run(&inputs.spec.layers, None)?;
+    let run = host_run(&inputs.spec.layers, nextn)?;
     let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
-    SlotMap::of_plan_tiers(plan, card, &cards, run, N_EXPERT)
+    let map = SlotMap::of_plan_tiers(plan, card, &cards, run, N_EXPERT)
         .map_err(|e| GpuError::plan(TIER_BEFORE_UPLOAD, e))?;
-    Ok(())
+    match nextn {
+        Some(n) => refuse_nextn_on_tier(&map, n),
+        None => Ok(()),
+    }
 }
+
+/// Refused by name: a slot map whose row for the next-token layer `nextn`
+/// sends an expert to a tier card. The draft's walk serves that layer's
+/// routed experts through the host tier's batch port and runs no tier join,
+/// and the port's serve leaves a tiered layer's upload to that join, so a
+/// tier entry there would leave the walk's routed sum unwritten.
+fn refuse_nextn_on_tier(map: &SlotMap, nextn: usize) -> Result<(), GpuError> {
+    let on_tier = map.on_tier(nextn)?;
+    if on_tier == 0 {
+        return Ok(());
+    }
+    Err(GpuError::Shape {
+        what: TIER_BEFORE_UPLOAD,
+        detail: format!(
+            "{NEXTN_ON_TIER}: the next-token layer {nextn}'s row sends {on_tier} experts to an \
+             expert tier card; the draft's walk serves that layer on the host through the batch \
+             port and runs no tier join"
+        ),
+    })
+}
+
+/// The words [`refuse_nextn_on_tier`]'s refusal opens with.
+pub const NEXTN_ON_TIER: &str = "a NextN expert on the tier";
 
 /// What a tiered load's checks before any upload are named as in their
 /// refusals ([`Body::open_placed_lanes`]).
@@ -1011,9 +1031,10 @@ impl Body {
     /// it names one, is hung under the host tier ([`TierOpen::of_machine`]):
     /// its routed segments load onto that card, the slot map sends their
     /// experts to it, and each layer that holds one runs as a tier layer
-    /// ([`crate::tier`]). Refused by name: more tier cards than the host
-    /// tier serves, a tier beside residency other than `off`, and a slot map
-    /// that puts an expert on two devices (each before anything uploads), a
+    /// ([`crate::tier`]); a residency machine beside it moves the stage
+    /// card's experts alone. Refused by name: more tier cards than the host
+    /// tier serves and a slot map that puts an expert on two devices (each
+    /// before anything uploads), a
     /// plan of more than one stage card, a layer kind or a width no kernel
     /// here runs, routed layers that are not one run, and the machine's own
     /// refusals at the load (the churn pool past the host's headroom, a layer
@@ -1033,7 +1054,7 @@ impl Body {
         lanes: KdaLanes,
     ) -> Result<Glm5nextModel, GpuError> {
         let tiers = TierOpen::of_machine(plan.machine);
-        refuse_tiers_before_upload(plan, inputs, card, &tiers, residency)?;
+        refuse_tiers_before_upload(plan, inputs, card, &tiers, None)?;
         refuse_other_lanes(plan, inputs, card, lanes)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         // The host tier's run — the layers the body's slot map holds, which
@@ -1103,9 +1124,13 @@ impl Body {
     /// draft's walks serve it through the batch port, which notes no id), so
     /// the machine lists it as unrouted; the host set also holds the
     /// churn pool, which the target plan's host headroom less the layer's
-    /// host experts must take. Refused as [`Body::open_placed_lanes`]
-    /// refuses, and by name for a next-token layer that does not follow the
-    /// host run.
+    /// host experts must take. The target plan's expert tier card, when it
+    /// names one, is hung as [`Body::open_placed_lanes`] hangs it: it serves
+    /// the target's steps, verifies and prompt batches, and the draft's walk
+    /// stays on the stage card and the host. Refused as
+    /// [`Body::open_placed_lanes`] refuses, and by name for a next-token
+    /// layer that does not follow the host run and for a slot map that sends
+    /// one of that layer's experts to a tier ([`refuse_nextn_on_tier`]).
     pub fn open_placed_nextn_with(
         file: Split,
         plan: &NextnPlan<'_>,
@@ -1116,13 +1141,8 @@ impl Body {
         residency: Residency,
     ) -> Result<Glm5nextModel, GpuError> {
         let target = &plan.plan;
-        if !target.machine.tiers.is_empty() {
-            return Err(shape(format!(
-                "a NextN load beside {} expert tier card(s): the next-token layer's walk is not \
-                 built on the tier (the tier serves the target's step and verify only)",
-                target.machine.tiers.len()
-            )));
-        }
+        let tiers = TierOpen::of_machine(target.machine);
+        refuse_tiers_before_upload(target, inputs, card, &tiers, Some(nextn.index))?;
         refuse_other_lanes(target, inputs, card, KdaLanes::Two)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         // The slot map's layers: the trunk's routed run and the next-token
@@ -1150,7 +1170,7 @@ impl Body {
                     gpu,
                     file,
                     w,
-                    (target, inputs, card, &[]),
+                    (target, inputs, card, &tiers),
                     host,
                     set,
                     glue,

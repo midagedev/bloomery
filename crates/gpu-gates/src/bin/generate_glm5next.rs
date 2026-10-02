@@ -5,7 +5,7 @@
 //! (`app::Loaded`), the prompt fed as `--prefill` says, then `-n` greedy
 //! steps.
 //!
-//! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate|bp]
+//! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate|bp|<stage>[+<tier>…]]
 //! [--mode graph|eager] [--prefill batch|steps] [--time [--warm W]]
 //! [--pair] [--logits] [--plan]`
 //!
@@ -13,11 +13,17 @@
 //! - `--ctx`: the positions the caches hold; the plan refuses more than the
 //!   deepest context a reference set checks the selector at
 //!   (`place::ORACLE_POSITIONS`). Default 2048.
-//! - `--place`: `a` is the serving plan (`workstation::plan_a`, the A6000),
-//!   `gate` the gate card's (`workstation::plan_gate`, the 3090), `bp` plan
-//!   (b′) (`workstation::plan_bp`: plan (a) on the A6000, the 3090 an expert
-//!   tier under the host tier, its prompt-batch bytes `place::tier_batch`'s).
-//!   Default `gate`. A NextN draft and residency are refused beside `bp`.
+//! - `--place`: the shared placement word (`generate::Place`): `a` is the
+//!   serving plan (`workstation::plan_a`, the A6000), `gate` the gate card's
+//!   (`workstation::plan_gate`, the 3090), `bp` plan (b′)
+//!   (`workstation::plan_bp`: plan (a) on the A6000, the 3090 an expert tier
+//!   under the host tier, its prompt-batch bytes `place::tier_batch`'s), also
+//!   spelled `a6000+3090`. A list of more tier cards than the GLM body serves
+//!   and a stage other than the A6000 are refused by name before the plan.
+//!   Default `gate`. The NextN draft and residency run beside `bp` as beside
+//!   `a`: the tier serves the target's experts it holds, the residency
+//!   machine moves the stage card's alone, and the draft's walk stays on the
+//!   stage card and the host.
 //! - `--prefill`: `batch` feeds the prompt in batches
 //!   (`bloomery_gpu_glm5next::prefill`), `steps` one decode step a position,
 //!   the same bits at any `--ctx`, past the positions the latent layers
@@ -132,18 +138,24 @@ fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("generate_glm5next", cli::run())
 }
 
+// The placement word the GLM body serves and its tier batch bytes.
+#[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_place.rs"]
+mod glm_place;
+
 #[cfg(feature = "glm5next")]
 mod cli {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    use crate::glm_place;
     use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident};
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::generate::{Place, with_cards};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
@@ -155,8 +167,8 @@ mod cli {
     };
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
-    use model::arch::glm5next::place::{self, PlanInputs};
-    use model::placement::{Machine, Plan, PlanLevers, workstation};
+    use model::arch::glm5next::place::PlanInputs;
+    use model::placement::{Machine, Plan, PlanLevers};
     use runtime::layer::hosted;
     use runtime::{Advance, Committed, PassSink, Stop, Target, Verify, Want};
 
@@ -216,6 +228,8 @@ mod cli {
         /// The file's indexer top-k, which the plan read.
         top_k: usize,
         place: &'static str,
+        /// The placement, whose cards the `load` record names.
+        placement: Place,
         mode: StepMode,
         prefill: PrefillMode,
         /// Batches a prompt group runs.
@@ -254,14 +268,16 @@ mod cli {
 
         fn load(&mut self, m: &Glm5nextModel) -> Result<(), SessionError> {
             let b = m.body("generate_glm5next")?;
-            Record::new(&record::LOAD_GENERATOR)
+            let r = Record::new(&record::LOAD_GENERATOR)
                 .u("resident_bytes", m.resident_bytes())
                 .u("ctx", self.ctx)
                 .u("layers", b.kinds().len())
                 .u("top_k", self.top_k)
                 .w("shadow", "none")
                 .u("shadow_bytes", 0)
-                .u("unified_addressing", 0)
+                .u("unified_addressing", 0);
+            with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
+                .map_err(SessionError::Caller)?
                 .w("prefill", self.prefill.name())
                 .u("group", self.group)
                 .w("mode", mode_name(self.mode))
@@ -370,12 +386,11 @@ mod cli {
             }
         }
         let ctx: usize = flag("--ctx")?.map_or(Ok(2048), |s| s.parse())?;
-        let place: &'static str = match flag("--place")?.as_deref() {
-            None | Some("gate") => "gate",
-            Some("a") => "a",
-            Some("bp") => "bp",
-            Some(o) => return Err(format!("--place is a, gate or bp, not {o}").into()),
+        let placement = match flag("--place")? {
+            None => Place::Gate,
+            Some(v) => glm_place::parse(&v)?,
         };
+        let place = placement.name();
         let mode = match flag("--mode")?.as_deref() {
             None | Some("graph") => StepMode::Graph,
             Some("eager") => StepMode::Eager,
@@ -411,16 +426,8 @@ mod cli {
         }
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        let machine: Box<dyn Fn(usize) -> Machine> = match place {
-            "a" => Box::new(workstation::plan_a),
-            "bp" => {
-                // Plan (b′): plan (a) on the A6000, the 3090 the host tier's
-                // expert tier, its prompt-batch bytes GLM's own.
-                let hp = Hparams::read(&file)?;
-                Box::new(Place::Bp.machine(None, Some(place::tier_batch(&hp)))?)
-            }
-            _ => Box::new(workstation::plan_gate),
-        };
+        let tier_batch = glm_place::tier_batch(placement, &Hparams::read(&file)?);
+        let machine = placement.machine(None, tier_batch)?;
         let trace = trace_of(
             &levers,
             &file,
@@ -446,6 +453,7 @@ mod cli {
         let mut log = Log {
             top_k: 0,
             place,
+            placement,
             mode,
             prefill,
             group: levers.prefill_group_set().unwrap_or(1),

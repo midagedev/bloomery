@@ -81,7 +81,7 @@ The placement plans are built from the development machine's two cards and its R
 | `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` | `a`, `gate`, `bp` | `a` |
 | `generate_qwen3moe` on a Qwen3.8 file, `bloomery-serve-qwen38` | `a`, `gate`, `bp` | `a` |
 | `generate_glm5next` | `a`, `gate`, `bp` | `gate` |
-| `bloomery-serve --model glm` | `a`, `gate` | `a` |
+| `bloomery-serve --model glm` | `a`, `gate`, `bp` | `a` |
 | `generate_qwen3moe` on a Qwen3.6 or Qwen3-30B file | refused | CUDA device 0 |
 
 <!-- pending: default-place-a — every binary above but generate_glm5next defaults to --place a (a card named A6000), so on a host with only a 3090 pass --place gate; generate_glm5next is the opposite, its default is gate and an A6000-only host passes --place a -->
@@ -201,7 +201,7 @@ target/release/bloomery-tokenize -m "$M" --decode -p "$(sed -n 's/^tokens //p' g
 
 Flags: `-n N` (default 16), `--ctx C` (default 2048, at most 16,384), `--place a|gate` (default `gate`), `--prefill batch|steps` (default `batch`), `--mode graph|eager`, `--plan` (print the plan and exit before the load), `--logits`, `--time [--warm W]`.
 
-The server is `bloomery-serve --model glm` (build it with `--features glm5next --bin bloomery-serve`). At `--place a` it runs adaptive residency and the MTP draft by default (`BLOOMERY_RESIDENCY=off` and `BLOOMERY_DRAFT=off` turn them off), and `--plan` prints the plan and those choices and exits before any card is opened:
+The server is `bloomery-serve --model glm` (build it with `--features glm5next --bin bloomery-serve`). At `--place a` and `--place bp` (the 3090 as an expert tier) it runs adaptive residency and the MTP draft by default (`BLOOMERY_RESIDENCY=off` and `BLOOMERY_DRAFT=off` turn them off), and `--plan` prints the plan and those choices and exits before any card is opened:
 
 ```sh
 cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin bloomery-serve

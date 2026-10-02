@@ -51,8 +51,8 @@ pub use body::prefill::{
     set_prefill_group, set_prompt_stats, store_digests, take_prompt_stats,
 };
 pub use body::{
-    Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, PAIR_ROWS, Plant, TIER_BEFORE_UPLOAD, prompt,
-    set_taps,
+    Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, NEXTN_ON_TIER, PAIR_ROWS, Plant,
+    TIER_BEFORE_UPLOAD, prompt, set_taps,
 };
 pub use host::GlmHost;
 pub use model::arch::glm5next::place::KdaLanes;

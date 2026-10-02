@@ -4,7 +4,7 @@
 //! takes the process's arguments (`--model` already taken out by the
 //! one-binary server).
 //!
-//!     [--host 127.0.0.1] [--port 8080] [--place a|gate] [--ctx C]
+//!     [--host 127.0.0.1] [--port 8080] [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C]
 //!     [--alias NAME] [--chat-template-file PATH] [--prefill batch|steps] [--plan]
 //!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
@@ -20,8 +20,14 @@
 //! the engine's argmax, the
 //! ids `generate_glm5next --tokens <the prompt's ids>` prints.
 //!
-//! `--place` is `a` (the serving plan, `workstation::plan_a`, on the A6000 —
-//! the default, as both other serving seats) or `gate` (the gate card's). The
+//! `--place` is the shared placement word (`generate::Place`, as
+//! `generate_glm5next` takes it): `a` (the serving plan, `workstation::plan_a`,
+//! on the A6000 — the default, as both other serving seats), `gate` (the gate
+//! card's), or `bp` (plan (b′): plan (a) on the A6000 and the 3090 an expert
+//! tier under the host tier, its prompt-batch bytes `place::tier_batch`'s) and
+//! its list spelling `a6000+3090`; a list of more tier cards than the GLM
+//! body serves (`bloomery_gpu::host::SERVED_TIERS`) and a stage other than the
+//! A6000 are refused by name before the plan. The
 //! positions the server serves are the stores the load sized (`--ctx`,
 //! default 2048 as the CLI's, refused past `place::ORACLE_POSITIONS`):
 //! `/props`' `n_ctx` is that number, a prompt that long is a 400 before it
@@ -58,8 +64,8 @@
 //! `BLOOMERY_DRAFT=off` is the plain path, one step a pass, with a `load
 //! draft=off (<why>)` record. Unset follows the placement
 //! (`bloomery_levers::glm_unset`), its word and why a `draft unset` record
-//! before the plan: `mtp` under `--place a` on a file of one next-token
-//! layer; the plain path under `--place gate`, on a file of other than one,
+//! before the plan: `mtp` under `--place a` and `bp` on a file of one
+//! next-token layer; the plain path under `--place gate`, on a file of other than one,
 //! and with stores too short for one window, never a refusal. Set, refused by
 //! name: `mtp` with stores too short for one window (`--ctx` under 3: the
 //! prompt's last id, its first token and the window's second row), and every
@@ -68,8 +74,8 @@
 //! `BLOOMERY_RESIDENCY` set prints as a `residency lever` record first
 //! thing. Unset follows the placement and the plan
 //! (`bloomery_levers::glm_unset`, `glm_residency_at_plan`), its word and why a
-//! `residency unset` record after the `plan` line: under `--place a`
-//! `mid-p0-s1`; `off` under `--place gate`, with stores too short for one
+//! `residency unset` record after the `plan` line: under `--place a` and
+//! `bp` `mid-p0-s1`; `off` under `--place gate`, with stores too short for one
 //! window, beside `--prefill steps`, and when the plan holds no card expert,
 //! its fewest leave no room for the word, or the churn pool does not fit the
 //! plan's host headroom less the NextN layer's host experts or what
@@ -109,7 +115,7 @@ use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
 };
-use bloomery_gpu_gates::generate::mode_name;
+use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Kind, Record};
 use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, ref_model_path};
@@ -120,7 +126,7 @@ use bloomery_levers::{
 use gguf::Split;
 use model::arch::glm5next::place::{NextnInputs, PlanInputs};
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{self, HostNeed, host_available};
+use model::placement::workstation::{HostNeed, TierBatchBytes, host_available};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
 use runtime::seqstate::Why;
@@ -131,11 +137,13 @@ use serve::{
 use tokenizer::Tokenizer;
 
 use super::drafted::DraftedSeat;
+use crate::glm_place;
 
 /// The seat's name, as its records and errors print it.
 const WHAT: &str = "bloomery-serve-glm";
 
-const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] [--place a|gate] \
+const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] \
+                     [--place a|gate|bp|<stage>[+<tier>…]] \
                      [--ctx C] [--alias NAME] [--chat-template-file PATH] \
                      [--prefill batch|steps] [--plan]";
 
@@ -202,40 +210,6 @@ const VERIFY_ROWS: usize = <Body as MtpBody>::VERIFY_ROWS;
 /// model: it takes one only while its rows fit, the first at a one-id
 /// prompt's first generated token, 1 + 1 + rows − 1.
 const NEED: usize = VERIFY_ROWS + 1;
-
-/// Where `--place` puts the plan's one card, as `generate_glm5next` takes it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GlmPlace {
-    /// The serving plan (`workstation::plan_a`), on the A6000. The default:
-    /// a server belongs on the serving card.
-    A,
-    /// The gate card's plan (`workstation::plan_gate`), on the 3090.
-    Gate,
-}
-
-impl GlmPlace {
-    fn parse(v: &str) -> Result<GlmPlace, GateError> {
-        match v {
-            "a" => Ok(GlmPlace::A),
-            "gate" => Ok(GlmPlace::Gate),
-            other => Err(format!("--place is a or gate, not {other}").into()),
-        }
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            GlmPlace::A => "a",
-            GlmPlace::Gate => "gate",
-        }
-    }
-
-    fn machine(self) -> fn(usize) -> Machine {
-        match self {
-            GlmPlace::A => workstation::plan_a,
-            GlmPlace::Gate => workstation::plan_gate,
-        }
-    }
-}
 
 /// `BLOOMERY_DRAFT` on stores of `ctx` positions, `unset` the seat's rule
 /// for it: `None` drafts with the NextN layer; `Some` runs the plain path,
@@ -355,7 +329,7 @@ fn residency_at(
 struct Args {
     host: String,
     port: u16,
-    place: GlmPlace,
+    place: Place,
     ctx: usize,
     alias: Option<String>,
     /// `--chat-template-file`, replacing the file's own template.
@@ -369,7 +343,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     let mut a = Args {
         host: "127.0.0.1".to_owned(),
         port: 8080,
-        place: GlmPlace::A,
+        place: Place::A,
         ctx: CTX,
         alias: None,
         template_file: None,
@@ -391,7 +365,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         match flag {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = v.parse()?,
-            "--place" => a.place = GlmPlace::parse(v)?,
+            "--place" => a.place = glm_place::parse(v)?,
             "--ctx" => a.ctx = v.parse()?,
             "--alias" => a.alias = Some(v.to_owned()),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
@@ -441,7 +415,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::read(&split)?;
     let unset = glm_unset(GlmAt {
-        place_a: a.place == GlmPlace::A,
+        serving_place: a.place != Place::Gate,
         nextn_layers: inputs.hp.n_layer.saturating_sub(inputs.hp.n_trunk),
         need: NEED,
         ctx: a.ctx,
@@ -450,7 +424,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let lever = residency_of(&levers, a.prefill, unset.residency)?;
     let draft_off = draft_of(&levers, a.ctx, unset.draft)?;
     let model = model_props(&split, &inputs.model);
-    let machine = (a.place.machine())(inputs.model.layers);
+    let tier_batch = glm_place::tier_batch(a.place, &inputs.hp);
+    let machine = a.place.machine(None, tier_batch)?(inputs.model.layers);
     let ctx = u64::try_from(a.ctx)?;
     let nextn = match draft_off {
         None => Some(NextnInputs::read(&inputs)?),
@@ -471,9 +446,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         // The records before the load are out; nothing was opened on a card.
         std::process::exit(0);
     }
-    let gpu = nvidia_smi_index(&machine.cards[0].name)
-        .map(|i| format!("GPU{i}"))
-        .and_then(|g| placement_props(&plan, &[g]));
+    let gpu = machine
+        .all_cards()
+        .map(|c| nvidia_smi_index(&c.name).map(|i| format!("GPU{i}")))
+        .collect::<Result<Vec<String>, String>>()
+        .and_then(|g| placement_props(&plan, &g));
     if let Err(e) = &gpu {
         eprintln!("{WHAT}: /props leaves the placement out: {e}");
     }
@@ -485,6 +462,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
     let open = SeatArgs {
         place: a.place,
+        tier_batch,
         ctx: a.ctx,
         cfg: GlmCfg {
             place: plan_levers,
@@ -528,7 +506,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
 /// What the engine thread opens the seat with.
 struct SeatArgs {
-    place: GlmPlace,
+    place: Place,
+    /// The expert tier's prompt-batch bytes the plan reserves under a
+    /// placement with a tier card.
+    tier_batch: Option<TierBatchBytes>,
     ctx: usize,
     cfg: GlmCfg,
     pin_main: bool,
@@ -575,6 +556,7 @@ impl Glm {
         let mut log = Log {
             top_k: 0,
             place: a.place.name(),
+            placement: a.place,
             prefill: a.cfg.prefill,
             ctx: a.ctx,
             pin_main: a.pin_main,
@@ -586,7 +568,7 @@ impl Glm {
         let prefill = a.cfg.prefill;
         let args = app::OpenArgs {
             place: a.place.name(),
-            machine: a.place.machine(),
+            machine: a.place.machine(None, a.tier_batch)?,
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: a.cfg,
@@ -659,6 +641,8 @@ struct Log {
     /// The file's indexer top-k, which the plan read.
     top_k: usize,
     place: &'static str,
+    /// The placement, whose cards the `load` record names.
+    placement: Place,
     prefill: PrefillMode,
     ctx: usize,
     pin_main: bool,
@@ -685,14 +669,16 @@ impl OpenLog<Body> for Log {
 
     fn load(&mut self, m: &Glm5nextModel) -> Result<(), app::SessionError> {
         let b = m.body(WHAT)?;
-        Record::new(&record::LOAD_GENERATOR)
+        let r = Record::new(&record::LOAD_GENERATOR)
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", self.ctx)
             .u("layers", b.kinds().len())
             .u("top_k", self.top_k)
             .w("shadow", "none")
             .u("shadow_bytes", 0)
-            .u("unified_addressing", 0)
+            .u("unified_addressing", 0);
+        with_cards(r, self.placement, m.gpu(), b.hybrid().tiers())
+            .map_err(app::SessionError::Caller)?
             .w("prefill", self.prefill.name())
             .w("mode", mode_name(StepMode::Graph))
             .w("place", self.place)

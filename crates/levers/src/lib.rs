@@ -1259,15 +1259,16 @@ pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
 pub const GLM_DRAFT_UNSET: &str = "mtp";
 
 /// The word the GLM seat runs by with [`RESIDENCY`] unset where the machine
-/// runs: plan (a)'s, no seed expert pinned and one spare a layer
+/// runs: the serving placements', no seed expert pinned and one spare a layer
 /// ([`glm_unset`], [`glm_residency_at_plan`]).
 pub const GLM_RESIDENCY_UNSET: &str = "mid-p0-s1";
 
 /// What decides the GLM seat's unset words before any plan ([`glm_unset`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GlmAt {
-    /// `--place a`: the serving plan on the A6000.
-    pub place_a: bool,
+    /// The serving placements: the A6000 is the stage card, alone (`--place
+    /// a`) or with expert tier cards beside it (`bp`); `gate` is not one.
+    pub serving_place: bool,
     /// The file's next-token layers (`block_count` less the trunk's); the
     /// NextN draft runs one.
     pub nextn_layers: usize,
@@ -1284,8 +1285,8 @@ pub struct GlmAt {
 /// `draft unset`, `load draft=off` and `residency unset` records' why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GlmWhy {
-    /// `--place a` runs the default word.
-    PlaceA,
+    /// A serving placement (`--place a` or `bp`) runs the default word.
+    Serving,
     /// `--place gate` keeps its fixed placement and drafts nothing.
     Gate,
     /// The file carries `layers` next-token layers, not the one the draft
@@ -1312,7 +1313,7 @@ pub enum GlmWhy {
 impl fmt::Display for GlmWhy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            GlmWhy::PlaceA => f.write_str("unset: --place a"),
+            GlmWhy::Serving => f.write_str("unset: --place a or bp"),
             GlmWhy::Gate => f.write_str("unset: --place gate keeps its fixed placement"),
             GlmWhy::Nextn { layers } => write!(
                 f,
@@ -1367,7 +1368,8 @@ pub struct GlmUnset {
 }
 
 /// [`DRAFT`] and [`RESIDENCY`] unset on the GLM seat at `at`, before the
-/// plan: under `--place a` [`GLM_DRAFT_UNSET`] when the file carries the one
+/// plan: under a serving placement (`--place a` or `bp`)
+/// [`GLM_DRAFT_UNSET`] when the file carries the one
 /// next-token layer and [`GLM_RESIDENCY_UNSET`], which the plan then decides
 /// ([`glm_residency_at_plan`]); `off`, with why, under `--place gate` and
 /// with stores too short for one window (both), for the draft on a file of
@@ -1376,7 +1378,7 @@ pub struct GlmUnset {
 #[must_use]
 pub fn glm_unset(at: GlmAt) -> GlmUnset {
     let short = at.need > at.ctx;
-    let draft = if !at.place_a {
+    let draft = if !at.serving_place {
         GlmPick::off(GlmWhy::Gate)
     } else if at.nextn_layers != 1 {
         GlmPick::off(GlmWhy::Nextn {
@@ -1390,10 +1392,10 @@ pub fn glm_unset(at: GlmAt) -> GlmUnset {
     } else {
         GlmPick {
             word: GLM_DRAFT_UNSET,
-            why: GlmWhy::PlaceA,
+            why: GlmWhy::Serving,
         }
     };
-    let residency = if !at.place_a {
+    let residency = if !at.serving_place {
         GlmPick::off(GlmWhy::Gate)
     } else if short {
         GlmPick::off(GlmWhy::Ctx {
@@ -1405,7 +1407,7 @@ pub fn glm_unset(at: GlmAt) -> GlmUnset {
     } else {
         GlmPick {
             word: GLM_RESIDENCY_UNSET,
-            why: GlmWhy::PlaceA,
+            why: GlmWhy::Serving,
         }
     };
     GlmUnset { draft, residency }
