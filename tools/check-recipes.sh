@@ -258,6 +258,7 @@ selftests=(
   "tools/flow/routes.py --self-test"
   "tools/mac-disk.py --self-test"
   "tools/ref/check-int-twins.py --self-test"
+  "tools/ref/clef_ref.py --self-test"
   "tools/ref/dma-dram-share.py --self-test"
   "tools/ref/draft-accept.py --self-test"
   "tools/ref/draft-vocab.py --self-test"
