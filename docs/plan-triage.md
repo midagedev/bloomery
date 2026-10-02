@@ -120,6 +120,20 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### What glmswap left (line1, 10-02 — GLM-5.3's prompt front on the GEMM, 0a4c2d68)
+
+Sat under the lease (A6000, place a, G1, 2 rounds, no void rows): pp512 93.98 → 128.44 tok/s (+36.7 %), pp4096
+91.87 → 124.99 (+36.0 %), inside H1's +34..+42 % (`docs/cards/glmswap-pp.card`). Round `glmgemm2` takes the latent
+heads and the FFNs next.
+
+- **plan_nextn's FrontOver has no FAIL-first (S, gpu-gates)**: `front-refuse` walks `open_resident`'s floor only;
+  the serving default (NextN draft) plans through `plan_nextn`. A `nextn-front-refuse` clause over `open_nextn_on`
+  with a mutant that zeroes the front there.
+- **The serve gate's drafted CLI arm feeds P in one call (S, gpu-gates)**: the server cuts P − 1 + a step
+  (`--last-step`), so the last position's bits can differ on a near tie; `drafted_run` should take the same cut.
+- **The plan reserves the front alone (M, glmgroup piece 3)**: the prompt batch's other `Bufs`, units and `hsum`
+  still come out of the 1 GiB margin.
+
 ### What glmpaper-replay left (line1, 10-01 — a Mac replay of GLM residency over the ik router set glm5next-prose)
 
 The replay (24 contexts of 2048, a 512-token prompt kept 0, then the engine's `mid` rule) puts the cold n = 96 arm at
