@@ -120,6 +120,15 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### What glmprefetch left (line1, 10-03 — the host union's lane pack prefetch, 07ec8f04)
+
+Sat under the lease (A6000, place a, G2, same binary, 4 rounds, pp4096 only, clean): on / off +0.78 % [lower bound
++0.47 %], a noninf pass (`docs/cards/glmprefetch-ab.card`); the pack's stall was mostly not raw-row latency.
+
+- **Flip `LANE_PREFETCH_DEFAULT` to on (XS, levers)**: the claim is under 1 %, so it needs an A/A arm beside the
+  on/off pair, and the flip reaches V4.1's lane downs, so a V4.1 noninf sitting (`generate_ds41` acting on the lever,
+  one line) first. The bits do not move.
+
 ### What glmswap left (line1, 10-02 — GLM-5.3's prompt front on the GEMM, 0a4c2d68)
 
 Sat under the lease (A6000, place a, G1, 2 rounds, no void rows): pp512 93.98 → 128.44 tok/s (+36.7 %), pp4096
