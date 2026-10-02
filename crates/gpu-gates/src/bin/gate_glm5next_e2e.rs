@@ -124,16 +124,22 @@
 //!   twice: on the steps feed, then on the batch feed in groups of two
 //!   batches (`set_prefill_group`), where the prompt of [`A`] ids is one
 //!   group whose take at 512 is opened before it and filled layer by layer
-//!   inside it: the same points and the same logits.
+//!   inside it: the same points, and the logits the same calls give from a
+//!   reset with no cut (a batch past a chunk runs the GEMM, whose bits are
+//!   not the steps'; the same calls cut the same batches).
 //! - (pb-long) the prompt batch past the positions the latent layers attend
-//!   whole, on the same load: [`LONG`] lcg ids as plain steps from a reset,
-//!   then as two batch calls from a reset, the first of [`LONG_CUT`] ids so
-//!   that the second starts inside a pool, the prompt itself ending inside
-//!   one; every store, the latent layers' pool planes included, the last
-//!   logits and the argmax bit for bit the steps' after the prompt, then
-//!   [`GREEDY`] greedy steps from there each giving the steps' token and
-//!   logits bit for bit, and every store bit for bit again after them (a
-//!   greedy step completes the prompt's last pool).
+//!   whole, on the same load: [`LONG`] lcg ids as one batch call from a
+//!   reset, then as two batch calls from a reset, the first of [`LONG_CUT`]
+//!   ids so that the second starts inside a pool, the prompt itself ending
+//!   inside one, every batch of either past a chunk; every store, the latent
+//!   layers' pool planes included, the last logits and the argmax bit for bit
+//!   the one call's after the prompt, then [`GREEDY`] greedy steps from there
+//!   each giving the one call's token and logits bit for bit, and every store
+//!   bit for bit again after them (a greedy step completes the prompt's last
+//!   pool). Then after a call of [`LONG_TAIL`] ids, the rest to [`LONG`] — the
+//!   selector's positions — by graph steps, and again from the call's
+//!   checkpoint in calls of a chunk: every store, the logits and the argmax
+//!   bit for bit the steps'.
 //!
 //! The prompt batch, on a second load at [`CTX_PP`] positions — every
 //! position the latent layers attend whole — in its own session fed in
@@ -146,34 +152,53 @@
 //!   run's.
 //! - (pb) one run of plain steps over [`CTX_PP`] lcg ids from a reset, every
 //!   store digested and the logits and argmax kept after each of [`PP`]
-//!   positions; then at each group of [`GROUPS`] batches
-//!   (`set_prefill_group` on the one load) and for each, a batch call of that
-//!   many ids from a reset:
-//!   every KDA layer's state and conv ring, every latent layer's latent and
-//!   index rows and pool plane, the last logits and the argmax bit for bit
-//!   the steps', and
-//!   the checkpoints at the multiples of 512 inside the call and its end —
-//!   the steps feed's marks, as (k) holds them.
+//!   positions; then the reference: the same ids from a reset in batch calls
+//!   of at most [`CHUNK`] positions, each ending at the next count of [`PP`],
+//!   with the route taps armed (`set_prompt_route_taps`) — every KDA layer's
+//!   state and conv ring, every latent layer's latent and index rows and pool
+//!   plane, the last logits and the argmax bit for bit the steps' at each
+//!   count (a batch of at most a chunk runs the step's gemvs), its stores'
+//!   live values and every routed layer's scores and picks kept. At groups
+//!   of one, a batch call of each count from a reset: under [`GEMM_FROM`]
+//!   the steps' bits as above; from it (the GEMM's projections, int8
+//!   activations) against the reference: every routed pick at every position
+//!   with no earlier flip on its path judged by the pair rule under
+//!   [`route_cap`] and a gap within [`route_margin_cap`], those past an
+//!   earlier flip counted against the cap and printed with no margin rule
+//!   (the forced arm below holds that case); every layer's live stores within its
+//!   band ([`gemm_bands`]) at the layers no flip's path reaches (no flip at a
+//!   lower layer), the rest printed; the last logits within the head's band
+//!   when no flip lies anywhere, printed otherwise; the argmax the
+//!   reference's, or one whose logit in the reference's row lies within six
+//!   head bands of the row's RMS below its top. Then the forced arm: the same
+//!   calls with the reference's picks and weights planted at every position
+//!   (`plant_prompt_routes`), so no flip can happen: every layer's live
+//!   stores within its band, no layer excused, the last logits within the
+//!   head's band, the argmax as above. At groups of two and four ([`GROUPS`],
+//!   `set_prefill_group` on the one load) each call against the call at
+//!   groups of one, bit for bit. Every call's checkpoints at the multiples of
+//!   512 inside it and its end — the steps feed's marks, as (k) holds them.
 //! - (pr) a call one position past the stores is refused by name before any
 //!   launch, on either feed: the model stands at 0 and every store digests
 //!   as the reset's.
 //! - (pf) `blk.0.attn_norm.weight[0]` set to NaN, at groups of one and of
-//!   two batches: a step and a batch call of nine ids each end in the same
-//!   fault, at layer 0, the model poisoned and the next call refused as
-//!   such; a call of 513 ids (two batches) ends in it after the group that
+//!   two batches: a step and a batch call of nine ids each end in a fault at
+//!   layer 0 — the batch's the step's with the GEMM quantizer's site added —
+//!   the model poisoned and the next call refused as such; a call of 513 ids (two batches) ends in it after the group that
 //!   holds its first batch (that batch alone at a group of one), no
 //!   checkpoint taken or sealed of the faulted state — also with the NaN in
 //!   the last KDA layer's norm instead, where the first batch's every store
 //!   has reached its take before the fault is read; the weight put back, a
-//!   reset and the call give (pb)'s argmax.
+//!   reset and the call give (pb)'s argmax at groups of one.
 //!   PIN(2026-10-02): the fault point moved from the first batch to the
 //!   group that holds it, as a group reads the fault word once.
 //! - (pg) a failure that is no fault, planted in a group's walk at its
 //!   second unit (`Plant::Group(1)`), at groups of two: after a call of 513
 //!   ids, a call of the next 517 ids (one group of two batches, the mark at
 //!   1024 inside it) fails by name; the model stands at 513, the points from
-//!   before the call (512, 513) stand, and the call again gives (pb)'s
-//!   stores, logits and argmax at 1030, its points 512, 513, 1024, 1030.
+//!   before the call (512, 513) stand, and the call again gives the stores,
+//!   logits and argmax of the same two calls unplanted from a reset, its
+//!   points 512, 513, 1024, 1030.
 //!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
@@ -223,14 +248,17 @@ mod gate {
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ik_q8_2, patch_bytes,
         ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
-        Body, Glm5nextModel, Plant, PrefillMode, StoreDigest, feed, prefill, set_prefill,
-        set_prefill_group, set_taps, step_launches, store_digests,
+        Body, CHUNK, GEMM_FROM, Glm5nextModel, Plant, PrefillMode, RouteTapRows, StoreDigest,
+        StoreRows, feed, plant_prompt_routes, prefill, prefill_mode, prompt_route_taps,
+        set_prefill, set_prefill_group, set_prompt_route_taps, set_taps, step_launches,
+        store_digests, store_rows,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
@@ -271,8 +299,14 @@ mod gate {
     /// not a whole number of pools of four, so it ends inside one.
     const LONG: usize = 2222;
     /// (pb-long)'s first call: not a whole number of pools either, so the
-    /// second call's first positions complete a pool the first began.
-    const LONG_CUT: usize = 1030;
+    /// second call's first positions complete a pool the first began; its
+    /// last batch, after the mark at 1024, past a chunk, so every batch of
+    /// both calls runs the GEMM as the one call's do.
+    const LONG_CUT: usize = 1042;
+    /// (pb-long)'s tail: from the last mark below [`LONG`], past the
+    /// positions the latent layers attend whole, fed by steps and in calls
+    /// of a chunk.
+    const LONG_TAIL: usize = 2048;
     /// (pb-long)'s greedy steps after the prompt: the second completes the
     /// prompt's last pool.
     const GREEDY: usize = 4;
@@ -282,6 +316,11 @@ mod gate {
             && !LONG.is_multiple_of(4)
             && !LONG_CUT.is_multiple_of(4)
             && (LONG / 4 + 1) * 4 <= LONG + GREEDY
+            && LONG_CUT % 512 > 8
+            && LONG % 512 > 8
+            && LONG_TAIL.is_multiple_of(512)
+            && LONG_TAIL < CTX_PP
+            && LONG_TAIL + 512 > LONG
     );
 
     /// The file's shape, as the header states it (glmops-design §1): what
@@ -1775,29 +1814,57 @@ mod gate {
         );
         ok &= branch_ok;
         let stats = s.model().body("keep")?.checkpoints().stats();
-        // The references are plain steps from a reset: no mark, no take.
-        let plain = |s: &mut Session<Body>, ids: &[u32]| -> Result<Vec<f32>, GateError> {
+        // The references, from a reset with no cut. On the steps feed plain
+        // steps: no mark, no take. On the batch feed the same calls the
+        // branches made, so each token runs in a batch of the size it ran in
+        // there — a batch's bits depend on its side of GEMM_FROM — and the
+        // calls' takes are the references' too.
+        let batch = prefill_mode(s.model())? == PrefillMode::Batch;
+        let (f512, f712) = if batch {
             s.reset()?;
-            let m = s.model_mut();
-            m.step(ids)?;
-            Ok(m.logits()?)
+            s.prompt(&a[..512], Want::Argmax)?;
+            let f512 = row(s.prompt(e, Want::Logits)?)?;
+            s.reset()?;
+            s.prompt(&a[..512], Want::Argmax)?;
+            s.prompt(d, Want::Argmax)?;
+            s.step(e[0], Want::Argmax)?;
+            (f512, row(s.prompt(&e[1..], Want::Logits)?)?)
+        } else {
+            let plain = |s: &mut Session<Body>, ids: &[u32]| -> Result<Vec<f32>, GateError> {
+                s.reset()?;
+                let m = s.model_mut();
+                m.step(ids)?;
+                Ok(m.logits()?)
+            };
+            (
+                plain(s, &[&a[..512], e].concat())?,
+                plain(s, &[&a[..512], d, e].concat())?,
+            )
         };
-        let f512 = plain(s, &[&a[..512], e].concat())?;
-        let f712 = plain(s, &[&a[..512], d, e].concat())?;
+        let reference = if batch {
+            "the same calls from a reset with no cut"
+        } else {
+            "plain steps of the same ids from a reset"
+        };
         s.reset()?;
         let t512 = row(s.prompt(&[&a[..512], e].concat(), Want::Logits)?)?;
         let read_only = same_bits(&t512, &f512);
         println!(
-            "keep ({feed}): a prompt call's takes leave the logits of plain steps, bit for bit: \
+            "keep ({feed}): a prompt call's takes leave the logits of {}, bit for bit: \
              {read_only} {}",
+            if batch {
+                "a call of 512 then one of the tail"
+            } else {
+                "plain steps"
+            },
             verdict(read_only)
         );
         ok &= read_only;
         let bits = same_bits(&l712, &f712) && same_bits(&l512, &f512);
         let c = s.model().body("keep")?.checkpoints();
         println!(
-            "keep ({feed}): restored at 712 and at 512, a tail of {} each, against plain steps of the \
-             same ids from a reset: logits bit for bit {bits} (argmax {} / {} and {} / {}); {} \
+            "keep ({feed}): restored at 712 and at 512, a tail of {} each, against {reference}: \
+             logits bit for bit {bits} (argmax {} / {} and {} / {}); {} \
              taken, {} restored, {} dropped, {} evicted before the references; {} slots made of \
              {}, {} bytes a checkpoint {}",
             e.len(),
@@ -2104,19 +2171,21 @@ mod gate {
 
     /// (pb-long) on `m`, a load at [`CTX`]; the model left reset. The taps
     /// disarmed (a batch refuses them) and graph steps, whatever the clauses
-    /// before it left.
+    /// before it left. Two references, each the same tokens in batches of the
+    /// same side of `GEMM_FROM` (a batch's bits depend on nothing else): one
+    /// call of [`LONG`] ids against two cut at [`LONG_CUT`]; and after a call
+    /// of [`LONG_TAIL`] ids, the tail to [`LONG`] — past the positions the
+    /// latent layers attend whole, through the selector — by steps against
+    /// calls of a chunk, from the checkpoint at [`LONG_TAIL`].
     fn prompt_long(m: &mut Glm5nextModel) -> Result<bool, GateError> {
         let ids = lcg_ids(LONG);
         set_taps(m, false)?;
         m.set_mode(StepMode::Graph);
         m.reset()?;
         let t = Instant::now();
-        let mut argmax = 0;
-        for &id in &ids {
-            argmax = m.step(&[id])?;
-        }
-        let steps_s = t.elapsed().as_secs_f64();
-        let want = after_prompt(m, argmax)?;
+        let one = prefill(m, &ids)?;
+        let one_s = t.elapsed().as_secs_f64();
+        let want = after_prompt(m, one)?;
         m.reset()?;
         let t = Instant::now();
         let fed = prefill(m, &ids[..LONG_CUT]).and_then(|_| prefill(m, &ids[LONG_CUT..]));
@@ -2140,10 +2209,10 @@ mod gate {
         let pass = got == want && pos == LONG;
         let tokens = |l: &Long| l.greedy.iter().map(|g| g.0).collect::<Vec<_>>();
         println!(
-            "prompt batch long: {LONG} ids as {LONG_CUT} + {} in {batch_s:.2} s against {LONG} steps \
-             in {steps_s:.1} s (runtime values), pos {pos}, checkpoints {points:?}: stores after the \
-             prompt {} ({} stores), logits {} argmax {} (steps {}); {GREEDY} greedy steps: tokens {:?} \
-             (steps {:?}), logits {}; stores after them {} {}",
+            "prompt batch long: {LONG} ids as {LONG_CUT} + {} in {batch_s:.2} s against one call \
+             in {one_s:.2} s (runtime values), pos {pos}, checkpoints {points:?}: stores after the \
+             prompt {} ({} stores), logits {} argmax {} (one call {}); {GREEDY} greedy steps: \
+             tokens {:?} (one call {:?}), logits {}; stores after them {} {}",
             LONG - LONG_CUT,
             first_store_diff(&got.prompt, &want.prompt)
                 .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
@@ -2166,17 +2235,659 @@ mod gate {
                 .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
             verdict(pass)
         );
+        Ok(pass & long_tail(m, &ids)?)
+    }
+
+    /// (pb-long)'s tail: a call of [`LONG_TAIL`] ids, then the rest to
+    /// [`LONG`] by graph steps; back to the call's checkpoint at
+    /// [`LONG_TAIL`] and the rest in calls of at most a chunk: every store,
+    /// the logits and the argmax bit for bit the steps'. The model left
+    /// reset.
+    fn long_tail(m: &mut Glm5nextModel, ids: &[u32]) -> Result<bool, GateError> {
+        m.reset()?;
+        prefill(m, &ids[..LONG_TAIL])?;
+        let mut tok = 0;
+        for &id in &ids[LONG_TAIL..] {
+            tok = m.step(&[id])?;
+        }
+        let (stores, logits) = (store_digests(m)?, fnv_row(&m.logits()?));
+        m.rollback(LONG_TAIL as u32)?;
+        let mut at = LONG_TAIL;
+        let mut chunked = 0;
+        while at < LONG {
+            let to = (at + CHUNK).min(LONG);
+            chunked = prefill(m, &ids[at..to])?;
+            at = to;
+        }
+        let diff = first_store_diff(&store_digests(m)?, &stores);
+        let same_logits = fnv_row(&m.logits()?) == logits;
+        m.reset()?;
+        let pass = diff.is_none() && same_logits && chunked == tok;
+        println!(
+            "prompt batch long tail: after a call of {LONG_TAIL}, positions {LONG_TAIL}..{LONG} in \
+             calls of at most {CHUNK} against steps: stores {} logits {} argmax {chunked} (steps \
+             {tok}) {}",
+            diff.as_deref()
+                .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
+            if same_logits { "bit for bit" } else { "differ" },
+            verdict(pass)
+        );
         Ok(pass)
     }
 
-    /// (l1), (pb), (pr), (pf) on a load at [`CTX_PP`] of one KDA lane whose
-    /// session feeds in batches.
+    /// PIN(2026-10-02): the GEMM batch's distance from the steps per layer,
+    /// as the error model gives it: q = `rounding::q8_32_rel` = 1.2858e-2 per
+    /// quantized input, passed to the projection's output. A KDA layer's
+    /// stream gains it from the normed input through q, k and v (the delta
+    /// rule is trilinear in them: 3), the gated rows through `out` (1), and
+    /// through σ, slope <= 1/4, from β and twice from z (3/16): c = 4.1875;
+    /// its decay pair stays on the one-column gemv (0). A latent layer's from
+    /// its stack's one input: c = 1. The feed-forward blocks stay on the gemv:
+    /// 0. Layers add independently: layer l within q·√(Σ_{j<=l} c_j) where
+    /// both feeds take the same experts and pools; the head reads all 45:
+    /// q·√(34·4.1875 + 11) = 0.159. Each layer's band, from `latent` (the
+    /// layers whose mixer is the latent attention).
+    fn gemm_bands(latent: &[bool]) -> Vec<f64> {
+        let q = q8_32_rel();
+        let mut c = 0.0f64;
+        latent
+            .iter()
+            .map(|&lat| {
+                c += if lat { 1.0 } else { 4.1875 };
+                q * c.sqrt()
+            })
+            .collect()
+    }
+
+    /// PIN(2026-10-02): a flip between the GEMM batch's routing and the
+    /// reference's with no earlier flip on its path is excused while each
+    /// exchanged pair's gap in the reference's ranked values lies within our
+    /// two values' distance there ([`Flip::allowed`]), and that distance
+    /// within six deviations of the router's error at the layer: a logit `z`
+    /// is a dot of the layer's normed input, which carries `band`
+    /// ([`gemm_bands`] at the layer) of relative error, so `z` moves by about
+    /// that times the logits' RMS; the ranked value σ(z) + bias moves by at
+    /// most ¼ of it; two values, three deviations each: 6 · ¼ · band ·
+    /// RMS(z). The logits are the scores' own, `ln(p / (1 − p))` of the
+    /// reference's. Such a flip's reference margin — its eighth pick's ranked
+    /// value less the best it left, the least gap any exchange crosses —
+    /// lies within the cap too (a margin is at most the pair's distance). Past an earlier flip the layer's input also carries that
+    /// flip's other experts' output, which no band covers: the distance is
+    /// counted and printed against the cap, not held, and no margin rule
+    /// applies there (the clean run at 2051 positions has 407 of 45565 such
+    /// flips past the cap, the worst at 2.85 of it). That case is held by the
+    /// forced arm ([`gemm_forced`]): with the reference's routes planted at
+    /// every layer, every layer's stores and the logits lie within their
+    /// bands ([`gemm_bands`]).
+    fn route_cap(band: f64, probs: &[f32]) -> f64 {
+        1.5 * band * logit_moments(probs).0
+    }
+
+    /// The widest gap in the reference's ranked values a flip may exchange
+    /// where no earlier flip lies on its path: [`route_cap`]'s derivation on
+    /// the logits' deviation about their mean (a common offset moves no
+    /// rank). A flip at a wider gap is a pick the error model does not
+    /// explain.
+    fn route_margin_cap(band: f64, probs: &[f32]) -> f64 {
+        1.5 * band * logit_moments(probs).1
+    }
+
+    /// The RMS and the deviation about the mean of the logits a row of
+    /// sigmoid scores was made from; NaN when a score is 0 or 1 (its logit
+    /// not finite), so no cap made from it passes.
+    fn logit_moments(probs: &[f32]) -> (f64, f64) {
+        let z: Vec<f64> = probs
+            .iter()
+            .map(|&p| {
+                let p = f64::from(p);
+                (p / (1.0 - p)).ln()
+            })
+            .collect();
+        if z.iter().any(|v| !v.is_finite()) {
+            return (f64::NAN, f64::NAN);
+        }
+        let n = z.len().max(1) as f64;
+        let rms = (z.iter().map(|v| v * v).sum::<f64>() / n).sqrt();
+        let mean = z.iter().sum::<f64>() / n;
+        let dev = (z.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n).sqrt();
+        (rms, dev)
+    }
+
+    /// The RMS of a row.
+    fn rms(v: &[f32]) -> f64 {
+        (v.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt()
+    }
+
+    /// What a feed leaves after `p` positions with the values a band reads:
+    /// the record, the last logits, and from [`GEMM_FROM`] positions every
+    /// store's live values ([`store_rows`]).
+    struct Held {
+        after: After,
+        logits: Vec<f32>,
+        stores: Vec<StoreRows>,
+    }
+
+    /// Each layer's live store values joined, in layer order.
+    fn by_layer(rows: &[StoreRows]) -> Vec<Vec<f32>> {
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); N_LAYER];
+        for r in rows {
+            if let Some(v) = out.get_mut(r.layer) {
+                v.extend_from_slice(&r.values);
+            }
+        }
+        out
+    }
+
+    /// Each routed layer's selection bias, the ranked value of expert `e`
+    /// being its score plus `bias[e]`; `None` for a dense layer. A routed
+    /// layer without its F32 bias resident is refused by name.
+    fn biases(m: &mut Glm5nextModel) -> Result<Vec<Option<Vec<f32>>>, GateError> {
+        let kinds = m.body("biases")?.kinds();
+        let (gpu, w, _) = m.body_parts("biases")?;
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(l, k)| {
+                if k.ffn != FfnKind::Moe {
+                    return Ok(None);
+                }
+                let name = names::exp_probs_b(l);
+                let Some(DevWeight::F32 { w: b, .. }) = w.get(&name) else {
+                    return Err(format!("{name} is not resident as F32").into());
+                };
+                Ok(Some(b.buf().to_host_vec(gpu.stream())?))
+            })
+            .collect()
+    }
+
+    /// The (pb) reference ([`chunk_calls`]): whether it held the steps' bits,
+    /// its record at each count, and every routed layer's route taps.
+    struct Reference {
+        ok: bool,
+        held: Vec<Held>,
+        routes: Vec<Option<RouteTapRows>>,
+    }
+
+    /// The (pb) reference: `ids` fed from a reset in calls of at most
+    /// [`CHUNK`] positions, each ending at the next of `after`'s counts — a
+    /// batch of at most a chunk runs the step's gemvs, so it writes the
+    /// steps' bits — with the route taps armed: at each count its stores,
+    /// logits and argmax held to the steps' (`after`) bit for bit, and its
+    /// record kept; then every routed layer's taps over the positions fed.
+    fn chunk_calls(
+        m: &mut Glm5nextModel,
+        ids: &[u32],
+        after: &[After],
+    ) -> Result<Reference, GateError> {
+        m.reset()?;
+        let t = Instant::now();
+        let (mut at, mut argmax, mut ok) = (0usize, 0u32, true);
+        let mut held = Vec::with_capacity(after.len());
+        let mut calls = 0usize;
+        for a in after {
+            while at < a.p {
+                let to = (at + CHUNK).min(a.p);
+                argmax = prefill(m, &ids[at..to])?;
+                at = to;
+                calls += 1;
+            }
+            let (digests, logits) = (store_digests(m)?, m.logits()?);
+            let diff = first_store_diff(&digests, &a.stores);
+            let pass = diff.is_none() && fnv_row(&logits) == a.logits && argmax == a.argmax;
+            println!(
+                "prompt batch chunks P={}: calls of at most {CHUNK} positions against the steps: \
+                 stores {} logits {} argmax {argmax} (steps {}) {}",
+                a.p,
+                diff.as_deref()
+                    .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
+                if fnv_row(&logits) == a.logits {
+                    "bit for bit"
+                } else {
+                    "differ"
+                },
+                a.argmax,
+                verdict(pass)
+            );
+            ok &= pass;
+            held.push(Held {
+                after: After {
+                    p: a.p,
+                    stores: digests,
+                    logits: fnv_row(&logits),
+                    argmax,
+                },
+                stores: if a.p >= GEMM_FROM {
+                    store_rows(m, a.p)?
+                } else {
+                    Vec::new()
+                },
+                logits,
+            });
+        }
+        let routes = prompt_route_taps(m, at)?;
+        println!(
+            "prompt batch chunks: {at} positions in {calls} calls in {:.1} s (runtime value), \
+             every routed layer's route taps read",
+            t.elapsed().as_secs_f64()
+        );
+        Ok(Reference { ok, held, routes })
+    }
+
+    /// The flips of one run's routing (`ours`) against another's (`theirs`,
+    /// the reference) over positions `0 .. p`, and their tally: the flips
+    /// first on their path, those past [`route_cap`] and those at a wide
+    /// margin (held), and those past an earlier flip, the ones of them past
+    /// the cap and the largest distance over it (printed).
+    struct Tally {
+        flips: usize,
+        first: usize,
+        refused: usize,
+        wide: usize,
+        past_over: usize,
+        past_worst: f64,
+        /// Flips whose reference margin (its eighth pick's ranked value less
+        /// the best it left) lies past [`route_cap`], on any path (printed).
+        margin_over: usize,
+        /// Of them, the flips first on their path (held).
+        margin_first: usize,
+        /// The flips' reference margins over their caps, sorted.
+        margins: Vec<f64>,
+        /// The lowest layer a flip lies at: every store past it lies on a
+        /// flip's path.
+        low: Option<usize>,
+    }
+
+    impl Tally {
+        /// Every flip first on its path allowed by the pair rule, at a gap
+        /// within the margin bound and at a reference margin within the cap.
+        fn ok(&self) -> bool {
+            self.refused == 0 && self.wide == 0 && self.margin_first == 0
+        }
+
+        /// The flips' margin over cap at the quantile `q` (0 to 1).
+        fn margin_at(&self, q: f64) -> f64 {
+            if self.margins.is_empty() {
+                return 0.0;
+            }
+            let i = ((self.margins.len() - 1) as f64 * q).round() as usize;
+            self.margins[i]
+        }
+    }
+
+    /// The flips of `ours` against `theirs` (each routed layer's taps, `None`
+    /// a dense one) over positions `0 .. p`: each with no earlier flip on its
+    /// path (a flip at a lower layer and at the same or an earlier position)
+    /// excused by the pair rule under [`route_cap`] and only at a gap within
+    /// [`route_margin_cap`], both at the layer's band; each past one counted
+    /// against the cap, printed. The first few, every refused one and the
+    /// first few past ones over the cap printed with `arm`.
+    fn judge_routes(
+        arm: &str,
+        p: usize,
+        (ours, theirs): (&[Option<RouteTapRows>], &[Option<RouteTapRows>]),
+        bias: &[Option<Vec<f32>>],
+        bands: &[f64],
+    ) -> Tally {
+        let mut flips: Vec<(Flip, f64, f64)> = Vec::new();
+        for (l, ((o, r), b)) in ours.iter().zip(theirs).zip(bias).enumerate() {
+            let (Some(o), Some(r), Some(b)) = (o, r, b) else {
+                continue;
+            };
+            for t in 0..p {
+                let (oi, ri) = (
+                    &o.ids[t * N_USED..(t + 1) * N_USED],
+                    &r.ids[t * N_USED..(t + 1) * N_USED],
+                );
+                if oi.iter().all(|e| ri.contains(e)) {
+                    continue;
+                }
+                let ranked = |x: &[f32]| -> Vec<f32> {
+                    x[t * N_EXPERT..(t + 1) * N_EXPERT]
+                        .iter()
+                        .zip(b)
+                        .map(|(&s, &c)| s + c)
+                        .collect()
+                };
+                let (ov, rv) = (ranked(&o.probs), ranked(&r.probs));
+                let rids: Vec<i32> = ri.iter().map(|&e| e as i32).collect();
+                let margin = flip::margin(&rv, &rids);
+                if let Some(f) = Flip::between((l, t), (oi, &ov), (&rids, &rv), margin) {
+                    let probs = &r.probs[t * N_EXPERT..(t + 1) * N_EXPERT];
+                    let band = bands[l];
+                    flips.push((f, route_cap(band, probs), route_margin_cap(band, probs)));
+                }
+            }
+        }
+        // The earliest position a flip lies at below each layer.
+        let mut below = vec![usize::MAX; N_LAYER + 1];
+        for (f, _, _) in &flips {
+            for e in below.iter_mut().skip(f.layer + 1) {
+                *e = (*e).min(f.token);
+            }
+        }
+        let (mut refused, mut first, mut wide, mut shown) = (0usize, 0usize, 0usize, 0usize);
+        let (mut past_over, mut past_worst, mut past_shown) = (0usize, 0.0f64, 0usize);
+        let (mut margin_over, mut margin_first) = (0usize, 0usize);
+        let mut margins = Vec::with_capacity(flips.len());
+        for (f, cap, bound) in &flips {
+            let wide_margin = f.margin > *cap || f.margin.is_nan() || cap.is_nan();
+            margin_over += usize::from(wide_margin);
+            margins.push(f.margin / cap);
+            let prior = below[f.layer] <= f.token;
+            let widest = f
+                .pairs
+                .iter()
+                .map(|p| p.2)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let over = !f.allowed(*cap);
+            let at_wide = !prior && (widest > *bound || widest.is_nan());
+            let bad = !prior && (over || at_wide || wide_margin);
+            if prior {
+                past_over += usize::from(over);
+                let err = f.pairs.iter().map(|p| p.3).fold(0.0f64, f64::max);
+                past_worst = past_worst.max(err / cap);
+            } else {
+                first += 1;
+                margin_first += usize::from(wide_margin);
+                refused += usize::from(over);
+                wide += usize::from(at_wide);
+            }
+            let show_past = prior && over && past_shown < 4;
+            if shown < 8 || (bad && shown < 40) || show_past {
+                shown += 1;
+                past_shown += usize::from(show_past);
+                println!(
+                    "{}; {}",
+                    f.line(arm, *cap),
+                    if prior {
+                        "past an earlier flip on its path (printed: no band covers its input; \
+                         margin rule not applied)"
+                            .to_owned()
+                    } else if wide_margin {
+                        format!(
+                            "first on its path: FAIL: the reference's margin {:.3e} past the cap",
+                            f.margin
+                        )
+                    } else {
+                        format!(
+                            "first on its path: widest gap {widest:.3e} (margin bound {bound:.3e}) {}",
+                            if at_wide {
+                                "FAIL: a flip at a wide margin"
+                            } else {
+                                "within"
+                            }
+                        )
+                    }
+                );
+            }
+        }
+        Tally {
+            flips: flips.len(),
+            first,
+            refused,
+            wide,
+            past_over,
+            past_worst,
+            margin_over,
+            margin_first,
+            margins: {
+                margins.sort_by(f64::total_cmp);
+                margins
+            },
+            low: flips.iter().map(|(f, _, _)| f.layer).min(),
+        }
+    }
+
+    /// (pb) at groups of one, a call of `want.after.p` ids from a reset from
+    /// [`GEMM_FROM`] on, against the chunk calls' `want` (the steps' bits):
+    /// every routed layer's picks judged ([`judge_routes`]); each layer's live
+    /// stores within its band ([`gemm_bands`]) at every layer no flip's path
+    /// reaches (no flip at a lower layer), the rest printed; the last logits
+    /// within the head's band when no flip lies anywhere, printed otherwise;
+    /// the argmax the reference's, or one whose logit in the reference's row
+    /// lies within six head bands of the row's RMS below its top; the position and the checkpoints the
+    /// call's. Returns the call's record.
+    fn gemm_against(
+        m: &mut Glm5nextModel,
+        ids: &[u32],
+        want: &Held,
+        routes: &[Option<RouteTapRows>],
+        (bias, bands): (&[Option<Vec<f32>>], &[f64]),
+    ) -> Result<(bool, Option<After>), GateError> {
+        let p = want.after.p;
+        m.reset()?;
+        let t = Instant::now();
+        let tok = match prefill(m, &ids[..p]) {
+            Ok(tok) => tok,
+            Err(e) => {
+                println!("prompt batch G=1 P={p}: error \"{e}\" {}", verdict(false));
+                return Ok((false, None));
+            }
+        };
+        let secs = t.elapsed().as_secs_f64();
+        let points = m.body("prompt batch")?.checkpoints().positions();
+        let (digests, logits) = (store_digests(m)?, m.logits()?);
+        let ours = by_layer(&store_rows(m, p)?);
+        let theirs = by_layer(&want.stores);
+        let taps = prompt_route_taps(m, p)?;
+        let tally = judge_routes("gemm", p, (&taps, routes), bias, bands);
+        let reach = tally.low.unwrap_or(N_LAYER - 1);
+        let (mut held_ok, mut worst, mut worst_l, mut past, mut past_l) =
+            (true, 0.0f64, 0usize, 0.0f64, 0usize);
+        for (l, (o, w)) in ours.iter().zip(&theirs).enumerate() {
+            let r = rel(o, w) / bands[l];
+            if l <= reach {
+                held_ok &= r <= 1.0;
+                if r > worst || r.is_nan() {
+                    (worst, worst_l) = (r, l);
+                }
+                if r > 1.0 || r.is_nan() {
+                    println!(
+                        "prompt batch G=1 P={p}: layer {l}'s stores {:.3e} from the reference's, \
+                         past its band {:.3e} FAIL",
+                        r * bands[l],
+                        bands[l]
+                    );
+                }
+            } else if r > past {
+                (past, past_l) = (r, l);
+            }
+        }
+        let head = bands[N_LAYER - 1];
+        let logits_rel = rel(&logits, &want.logits);
+        let logits_ok = tally.low.is_some() || logits_rel <= head;
+        let top = argmax(&want.logits);
+        let runner = second(&want.logits, top);
+        let gap = f64::from(want.logits[top as usize]) - f64::from(want.logits[runner as usize]);
+        let head_cap = 6.0 * head * rms(&want.logits);
+        let tok_gap = f64::from(want.logits[top as usize])
+            - want
+                .logits
+                .get(tok as usize)
+                .map_or(f64::NAN, |&v| f64::from(v));
+        let argmax_ok = tok == want.after.argmax || tok_gap <= head_cap;
+        let pass = tally.ok()
+            && held_ok
+            && logits_ok
+            && argmax_ok
+            && m.pos() as usize == p
+            && points == marks(p);
+        println!(
+            "prompt batch G=1 P={p}: against calls of {CHUNK}: {} flip(s); {} first on their path, \
+             {} of them past the pair rule's cap, {} at a wide margin; {} past an earlier flip, {} \
+             of them past the cap, the worst at {:.2} of it (printed); the reference's margins \
+             over the cap at the flips: median {:.3}, 99th percentile {:.3}, largest {:.3}, {} \
+             past it, {} of them first on their path (held); the stores of layers 0..={reach} (no flip's path) held to their bands, \
+             worst {worst:.3} of it at layer \
+             {worst_l}; past them (printed) worst {past:.3} at layer {past_l}; logits {logits_rel:.3e} \
+             from the reference's (band {head:.3e}, {}); argmax {tok} (reference {}, {tok_gap:.3e} \
+             below its top, cap {head_cap:.3e}; its runner-up {runner} at {gap:.3e}{}); pos {} \
+             checkpoints {points:?} (want {:?}), \
+             {secs:.2} s (runtime value) {}",
+            tally.flips,
+            tally.first,
+            tally.refused,
+            tally.wide,
+            tally.flips - tally.first,
+            tally.past_over,
+            tally.past_worst,
+            tally.margin_at(0.5),
+            tally.margin_at(0.99),
+            tally.margin_at(1.0),
+            tally.margin_over,
+            tally.margin_first,
+            if tally.low.is_some() {
+                "printed: a flip lies on its path"
+            } else {
+                "held"
+            },
+            want.after.argmax,
+            if tok == runner && tok != want.after.argmax {
+                ", ours"
+            } else {
+                ""
+            },
+            m.pos(),
+            marks(p),
+            verdict(pass)
+        );
+        Ok((
+            pass,
+            Some(After {
+                p,
+                stores: digests,
+                logits: fnv_row(&logits),
+                argmax: tok,
+            }),
+        ))
+    }
+
+    /// (pb)'s forced arm at groups of one: a call of `want.after.p` ids from a
+    /// reset with the reference's routes planted (`plant_prompt_routes`:
+    /// every pick and weight the chunk calls' at every position), so both
+    /// take the same experts and weights and no flip can happen: every
+    /// layer's live stores within its band ([`gemm_bands`]), no layer
+    /// excused; the last logits within the head's band; the argmax the
+    /// reference's, or one whose logit in the reference's row lies within six
+    /// head bands of the row's RMS below its top.
+    fn gemm_forced(
+        m: &mut Glm5nextModel,
+        ids: &[u32],
+        want: &Held,
+        bands: &[f64],
+    ) -> Result<bool, GateError> {
+        let p = want.after.p;
+        m.reset()?;
+        let tok = match prefill(m, &ids[..p]) {
+            Ok(tok) => tok,
+            Err(e) => {
+                println!(
+                    "prompt batch forced P={p}: error \"{e}\" {}",
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        let logits = m.logits()?;
+        let ours = by_layer(&store_rows(m, p)?);
+        let theirs = by_layer(&want.stores);
+        let (mut held_ok, mut worst, mut worst_l) = (true, 0.0f64, 0usize);
+        for (l, (o, w)) in ours.iter().zip(&theirs).enumerate() {
+            let r = rel(o, w) / bands[l];
+            held_ok &= r <= 1.0;
+            if r > worst || r.is_nan() {
+                (worst, worst_l) = (r, l);
+            }
+            if r > 1.0 || r.is_nan() {
+                println!(
+                    "prompt batch forced P={p}: layer {l}'s stores {:.3e} from the reference's, \
+                     past its band {:.3e} FAIL",
+                    r * bands[l],
+                    bands[l]
+                );
+            }
+        }
+        let head = bands[N_LAYER - 1];
+        let logits_rel = rel(&logits, &want.logits);
+        let top = argmax(&want.logits);
+        let tok_gap = f64::from(want.logits[top as usize])
+            - want
+                .logits
+                .get(tok as usize)
+                .map_or(f64::NAN, |&v| f64::from(v));
+        let head_cap = 6.0 * head * rms(&want.logits);
+        let argmax_ok = tok == want.after.argmax || tok_gap <= head_cap;
+        let pass = held_ok && logits_rel <= head && argmax_ok;
+        println!(
+            "prompt batch forced P={p}: the reference's routes planted: every layer's stores held \
+             to its band, worst {worst:.3} of it at layer {worst_l}; logits {logits_rel:.3e} from \
+             the reference's (band {head:.3e}); argmax {tok} (reference {}, {tok_gap:.3e} below its \
+             top, cap {head_cap:.3e}) {}",
+            want.after.argmax,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// One batch call of `a.p` ids from a reset at the load's group against
+    /// `a`, bit for bit: the stores, the logits, the argmax, the position and
+    /// the checkpoints. `what` names the reference.
+    fn batch_bits(
+        m: &mut Glm5nextModel,
+        ids: &[u32],
+        a: &After,
+        g: usize,
+        what: &str,
+    ) -> Result<bool, GateError> {
+        m.reset()?;
+        let t = Instant::now();
+        let got = prefill(m, &ids[..a.p]);
+        let secs = t.elapsed().as_secs_f64();
+        let (argmax, stores, logits) = match got {
+            Ok(tok) => (tok, store_digests(m)?, fnv_row(&m.logits()?)),
+            Err(e) => {
+                println!(
+                    "prompt batch G={g} P={}: error \"{e}\" {}",
+                    a.p,
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        let points = m.body("prompt batch")?.checkpoints().positions();
+        let diff = first_store_diff(&stores, &a.stores);
+        let pass = diff.is_none()
+            && logits == a.logits
+            && argmax == a.argmax
+            && m.pos() as usize == a.p
+            && points == marks(a.p);
+        println!(
+            "prompt batch G={g} P={}: against {what}: stores {} logits {} argmax {argmax} ({what} \
+             {}) pos {} checkpoints {points:?} (want {:?}), {secs:.2} s (runtime value) {}",
+            a.p,
+            diff.as_deref()
+                .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
+            if logits == a.logits {
+                "bit for bit"
+            } else {
+                "differ"
+            },
+            a.argmax,
+            m.pos(),
+            marks(a.p),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// (l1), (pb), (pr), (pf), (pg) on a load at [`CTX_PP`] of one KDA lane
+    /// whose session feeds in batches.
     fn prompt_batch(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let (mut s, _) = open(levers, CTX_PP, PrefillMode::Batch, KdaLanes::One)?;
         let m = s.model_mut();
         let ids = lcg_ids(CTX_PP + 1);
         let mut ok = one_lane(m, &ids[..3])?;
-        // (pb): the steps' record, then one batch call a position count.
+        // (pb): the steps' record, then the chunk calls' against it.
         m.reset()?;
         let t = Instant::now();
         let mut after = Vec::new();
@@ -2197,56 +2908,71 @@ mod gate {
             t.elapsed().as_secs_f64(),
             after.first().map_or(0, |a| a.stores.len())
         );
-        for g in GROUPS {
-            set_prefill_group(m, g)?;
-            for a in &after {
-                m.reset()?;
-                let t = Instant::now();
-                let got = prefill(m, &ids[..a.p]);
-                let secs = t.elapsed().as_secs_f64();
-                let (argmax, stores, logits) = match got {
-                    Ok(tok) => (tok, store_digests(m)?, fnv_row(&m.logits()?)),
-                    Err(e) => {
-                        println!(
-                            "prompt batch G={g} P={}: error \"{e}\" {}",
-                            a.p,
-                            verdict(false)
-                        );
-                        ok = false;
-                        continue;
-                    }
-                };
-                let points = m.body("prompt batch")?.checkpoints().positions();
-                let diff = first_store_diff(&stores, &a.stores);
-                let pass = diff.is_none()
-                    && logits == a.logits
-                    && argmax == a.argmax
-                    && m.pos() as usize == a.p
-                    && points == marks(a.p);
-                println!(
-                    "prompt batch G={g} P={}: stores {} logits {} argmax {argmax} (steps {}) pos {} \
-                 checkpoints {points:?} (want {:?}), {secs:.2} s (runtime value) {}",
-                    a.p,
-                    diff.as_deref()
-                        .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
-                    if logits == a.logits {
-                        "bit for bit"
-                    } else {
-                        "differ"
-                    },
-                    a.argmax,
-                    m.pos(),
-                    marks(a.p),
-                    verdict(pass)
-                );
+        set_prefill_group(m, 1)?;
+        set_prompt_route_taps(m, CTX_PP)?;
+        let Reference {
+            ok: chunks_ok,
+            held: reference,
+            routes,
+        } = chunk_calls(m, &ids, &after)?;
+        ok &= chunks_ok;
+        let latent: Vec<bool> = m
+            .body("prompt batch")?
+            .kinds()
+            .iter()
+            .map(|k| k.mixer == MixerKind::Latent)
+            .collect();
+        let bands = gemm_bands(&latent);
+        let bias = biases(m)?;
+        println!(
+            "prompt batch: the GEMM bands at layers 0, 3, 44: {:.3e} {:.3e} {:.3e}",
+            bands[0],
+            bands[3],
+            bands[N_LAYER - 1]
+        );
+        // Groups of one: a call of at most a chunk the steps' bits, one past
+        // it against the chunk calls.
+        let mut ones = Vec::with_capacity(after.len());
+        for (a, r) in after.iter().zip(&reference) {
+            if a.p < GEMM_FROM {
+                ok &= batch_bits(m, &ids, a, 1, "steps")?;
+                ones.push(Some(After {
+                    p: a.p,
+                    stores: a.stores.clone(),
+                    logits: a.logits,
+                    argmax: a.argmax,
+                }));
+            } else {
+                let (pass, got) = gemm_against(m, &ids, r, &routes, (&bias, &bands))?;
                 ok &= pass;
+                ones.push(got);
+            }
+        }
+        // The forced arm: the reference's routes planted.
+        set_prompt_route_taps(m, 0)?;
+        plant_prompt_routes(m, Some((&routes, CTX_PP)))?;
+        for r in reference.iter().filter(|r| r.after.p >= GEMM_FROM) {
+            ok &= gemm_forced(m, &ids, r, &bands)?;
+        }
+        plant_prompt_routes(m, None)?;
+        drop(reference);
+        // Groups of two and four: the calls at groups of one, bit for bit.
+        for g in GROUPS.into_iter().filter(|&g| g > 1) {
+            set_prefill_group(m, g)?;
+            for one in &ones {
+                let Some(one) = one else {
+                    println!("prompt batch G={g}: no call at groups of one to hold it to FAIL");
+                    ok = false;
+                    continue;
+                };
+                ok &= batch_bits(m, &ids, one, g, "groups of one")?;
             }
         }
         set_prefill_group(m, 1)?;
         ok &= refused_past(m, &ids)?;
         set_prefill_group(m, 2)?;
-        ok &= planted_group(m, &ids, after.iter().find(|a| a.p == 1030))?;
-        let clean = after.iter().find(|a| a.p == 9).map(|a| a.argmax);
+        ok &= planted_group(m, &ids)?;
+        let clean = ones.iter().flatten().find(|a| a.p == 9).map(|a| a.argmax);
         for g in [1, 2] {
             set_prefill_group(m, g)?;
             ok &= batch_fault(m, &ids[..9], &ids[..513], clean, g)?;
@@ -2255,20 +2981,20 @@ mod gate {
         Ok(ok)
     }
 
-    /// (pg) at the load's group of two: after a call of 513 ids, a call of
-    /// the next 517 — one group of two batches, the mark at 1024 inside it —
-    /// with [`Plant::Group`]`(1)` planted fails by name, the model standing at
-    /// 513 and the points from before it (512, 513) standing; the call again
-    /// gives `want`'s stores, logits and argmax (the steps' at 1030), its
-    /// points 512, 513, 1024 and 1030. The model left reset.
-    fn planted_group(
-        m: &mut Glm5nextModel,
-        ids: &[u32],
-        want: Option<&After>,
-    ) -> Result<bool, GateError> {
-        let Some(want) = want.filter(|w| w.p == 1030) else {
-            return Err("(pg) needs (pb)'s record at 1030".into());
-        };
+    /// (pg) at the load's group of two: the calls of 513 ids and of the next
+    /// 517 from a reset, unplanted — the reference, every token in the batch
+    /// it lands in below (a batch's bits depend on its side of [`GEMM_FROM`],
+    /// so the reference makes the same cut); then after the call of 513, the
+    /// call of the next 517 — one group of two batches, the mark at 1024
+    /// inside it — with [`Plant::Group`]`(1)` planted fails by name, the model
+    /// standing at 513 and the points from before it (512, 513) standing; the
+    /// call again gives the reference's stores, logits and argmax, its points
+    /// 512, 513, 1024 and 1030. The model left reset.
+    fn planted_group(m: &mut Glm5nextModel, ids: &[u32]) -> Result<bool, GateError> {
+        m.reset()?;
+        prefill(m, &ids[..513])?;
+        let want_tok = prefill(m, &ids[513..1030])?;
+        let (want_stores, want_logits) = (store_digests(m)?, fnv_row(&m.logits()?));
         m.reset()?;
         prefill(m, &ids[..513])?;
         let before = m.body("planted group")?.checkpoints().positions();
@@ -2281,31 +3007,31 @@ mod gate {
         let (stores, logits) = (store_digests(m)?, fnv_row(&m.logits()?));
         let after_points = m.body("planted group")?.checkpoints().positions();
         m.reset()?;
-        let diff = first_store_diff(&stores, &want.stores);
+        let diff = first_store_diff(&stores, &want_stores);
         let ok = named
             && before == [512, 513]
             && pos == 513
             && points == before
-            && matches!(again, Ok(t) if t == want.argmax)
+            && matches!(again, Ok(t) if t == want_tok)
             && diff.is_none()
-            && logits == want.logits
+            && logits == want_logits
             && after_points == [512, 513, 1024, 1030];
         println!(
             "planted group: after 513 ids (points {before:?}) a call of 517 at groups of 2 with \
              a failure planted at unit 1: {}; the model at {pos} (want 513), points {points:?} \
              (want {before:?}); the call again: {}, stores {}, logits {}, points \
-             {after_points:?} (want [512, 513, 1024, 1030]) {}",
+             {after_points:?} (want [512, 513, 1024, 1030]), against the same two calls unplanted {}",
             match &failed {
                 Ok(t) => format!("token {t}"),
                 Err(e) => format!("error \"{e}\""),
             },
             match &again {
-                Ok(t) => format!("token {t} (steps {})", want.argmax),
+                Ok(t) => format!("token {t} (unplanted {want_tok})"),
                 Err(e) => format!("error \"{e}\""),
             },
             diff.as_deref()
                 .map_or("bit for bit".to_string(), |d| format!("differ at {d}")),
-            if logits == want.logits {
+            if logits == want_logits {
                 "bit for bit"
             } else {
                 "differ"
@@ -2418,13 +3144,17 @@ mod gate {
     }
 
     /// (pf) at groups of `g`: a NaN in layer 0's norm; a step and a batch
-    /// call end in the same fault at layer 0, the model poisoned; a call of
-    /// two batches ends in it after the group that holds its first, with no
-    /// checkpoint taken or sealed of the faulted state, and so does that call
-    /// with the NaN in the last KDA layer's norm instead (the fault at that
-    /// layer, after every store of the first batch reached its take); the
-    /// weight put back, a reset and the batch call give `clean`, (pb)'s argmax
-    /// at nine positions.
+    /// call end in a fault at layer 0, the model poisoned — the batch's the
+    /// step's with the GEMM's quantizer's site added ([`FaultSite::QuantColumn`],
+    /// the smallest code: a batch of nine runs its projections on the GEMM,
+    /// whose quantizer refuses the normed input's NaN block, and the NaN it
+    /// leaves in every output row meets the step's sites after it); a call of
+    /// two batches ends in the batch's after the group that holds its first,
+    /// with no checkpoint taken or sealed of the faulted state, and so does
+    /// that call with the NaN in the last KDA layer's norm instead (the fault
+    /// at that layer, after every store of the first batch reached its take);
+    /// the weight put back, a reset and the batch call give `clean`, (pb)'s
+    /// argmax at nine positions at groups of one.
     fn batch_fault(
         m: &mut Glm5nextModel,
         ids: &[u32],
@@ -2466,11 +3196,16 @@ mod gate {
             _ => None,
         };
         let (fs, fb) = (fault_of(&step), fault_of(&batch));
-        let early = fault_of(&long) == fs && long_points == zero_points;
+        let quant = FaultSite::QuantColumn as u32;
+        let with_quant = |f: Fault| (f.layer, f.code.min(quant), f.sites | (1 << quant));
+        let fb_is_gemm = fs
+            .zip(fb)
+            .is_some_and(|(s, b)| (b.layer, b.code, b.sites) == with_quant(s));
+        let early = fault_of(&long) == fb && long_points == zero_points;
         let late_ok = fault_of(&late).is_some_and(|f| f.layer as usize == last_kda)
             && late_points == zero_points;
         let named = fs.is_some()
-            && fs == fb
+            && fb_is_gemm
             && fs.is_some_and(|f| f.layer == 0)
             && step_poison == fs
             && batch_poison == fb;

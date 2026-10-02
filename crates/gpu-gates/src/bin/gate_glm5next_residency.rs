@@ -20,6 +20,16 @@
 //!   pinned ones, which the host set must hold too — is refused by name
 //!   before anything loads, within [`REFUSE_BOUND_S`] (mutant: the churn
 //!   pool check removed from the load).
+//! - `front-refuse` (the prompt batch's GEMM front in the plan,
+//!   `place::prompt_front_bytes`): the gate card one byte short of the
+//!   plan's floor — its dense granules, cache, context, scratch, reserves,
+//!   margin and the front, found from the plan's own shortfalls — is
+//!   refused by name, the front and its bytes named, by the planner and by
+//!   `open_resident` (the tape's open, under the gate's lever) before
+//!   anything loads, within [`REFUSE_BOUND_S`]; the card at the floor plans,
+//!   its card experts printed (mutant: the front out of the plan's reserve and
+//!   check — the card one byte short then fails by the card's bound or
+//!   plans, the front unnamed).
 //! - `passes` (a pass counts its kept rows only): a history's boundaries
 //!   end, in order, no pass, the prompt call (one pass, 0 rows kept — the
 //!   batch service notes no id) and each step (1 kept) (mutant: the call
@@ -105,7 +115,7 @@ mod gate {
     use std::ops::Range;
     use std::time::Instant;
 
-    use app::arch::glm5next::{GlmCfg, open_nextn};
+    use app::arch::glm5next::{GlmCfg, open_nextn, open_resident};
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::PassKind;
@@ -119,9 +129,11 @@ mod gate {
     use gguf::Split;
     use gguf::quant::GgmlType;
     use model::arch::glm5next::names;
-    use model::arch::glm5next::place::{NextnInputs, NextnPlan, PlanInputs};
+    use model::arch::glm5next::place::{
+        NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_front_bytes,
+    };
     use model::placement::churn::ChurnPool;
-    use model::placement::{Machine, ModelTensors, Plan, PlanLevers, workstation};
+    use model::placement::{Machine, ModelTensors, Plan, PlanLevers, Violation, workstation};
     use refset::arch::glm5next::{MTP, MTP_SET};
     use refset::mtpref::MtpSet;
     use runtime::layer::hosted;
@@ -359,6 +371,111 @@ mod gate {
             "refuse: a host of {short} B, one byte short of the {} B churn pool: {} in {secs:.1} \
              s — {why}",
             pool.bytes,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `front-refuse` (module header): the gate card's floor with the prompt
+    /// batch's GEMM front found from the plan's own shortfalls, from a guess
+    /// at or under it (the plan's card terms but its experts and rounding,
+    /// the margin and the front): each refusal adds the bytes it names, so
+    /// the walk lands on the floor.
+    fn front_refuse_clause(
+        path: &str,
+        machine: &Machine,
+        levers: &bloomery_levers::Levers,
+        inputs: &PlanInputs,
+        plan: &Plan<'_>,
+        residency: Residency,
+    ) -> Result<bool, GateError> {
+        let place = PlanLevers::from_levers(levers)?;
+        let front = prompt_front_bytes(&inputs.hp, CTX as u64);
+        let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) else {
+            return Err("the gate machine has no stage card".into());
+        };
+        let with = |usable: u64| {
+            let mut m = machine.clone();
+            m.cards[0].usable_bytes = usable;
+            m
+        };
+        let mut usable = t.dense_bytes
+            + t.kv_bytes
+            + t.scratch_bytes
+            + t.context_bytes
+            + t.reserve_bytes
+            + card.margin_bytes
+            + front;
+        let mut walked = 0usize;
+        let floor = loop {
+            if walked == 8 {
+                return Err(format!("the floor walk did not settle by {usable} B").into());
+            }
+            walked += 1;
+            match inputs.plan(&with(usable), CTX as u64, &place) {
+                Ok(_) => break usable,
+                Err(PlaceError::FrontOver { short, .. }) => usable += short,
+                Err(PlaceError::Broken(v)) => {
+                    let over = v.iter().find_map(|v| match v {
+                        Violation::CardOver { total, limit, .. } => Some(total - limit),
+                        _ => None,
+                    });
+                    usable += over.ok_or_else(|| format!("{path}: {}", PlaceError::Broken(v)))?;
+                }
+                Err(e) => return Err(format!("{path}: {e}").into()),
+            }
+        };
+        let at_floor = inputs
+            .plan(&with(floor), CTX as u64, &place)
+            .map(|p| p.cards[0].experts);
+        let short_card = with(floor - 1);
+        let below = inputs.plan(&short_card, CTX as u64, &place);
+        let named = matches!(
+            below,
+            Err(PlaceError::FrontOver { front: f, short: 1, .. }) if f == front
+        );
+        let t0 = Instant::now();
+        let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let small = short_card.clone();
+        let args = OpenArgs {
+            place: "gate",
+            machine: move |_| small.clone(),
+            ctx: CTX,
+            mode: StepMode::Graph,
+            cfg: GlmCfg {
+                place: place.clone(),
+                host: levers.host(),
+                prefill: PrefillMode::Batch,
+                group: 1,
+            },
+        };
+        let opened = open_resident(file, args, residency, &mut Quiet);
+        let secs = t0.elapsed().as_secs_f64();
+        let (refused, why) = match opened {
+            Err(e) => {
+                let text = e.to_string();
+                (
+                    text.contains("GEMM front")
+                        && text.contains(&format!("{front} B"))
+                        && secs < REFUSE_BOUND_S,
+                    text,
+                )
+            }
+            Ok(_) => (false, "the open loaded".to_string()),
+        };
+        let ok = front > 0 && at_floor.is_ok() && named && refused;
+        println!(
+            "front-refuse: the GEMM front {front} B in the plan of the {} card: its floor {floor} B \
+             ({walked} plans) plans with {} card experts; one byte under it the planner {}; \
+             open_resident under {} there in {secs:.1} s — {why}: {}",
+            card.name,
+            at_floor.map_or_else(|e| format!("no ({e})"), |n| n.to_string()),
+            match &below {
+                Err(e @ PlaceError::FrontOver { .. }) => format!("refuses: {e}"),
+                Err(e) => format!("refuses by another name: {e}"),
+                Ok(_) => "plans".to_string(),
+            },
+            word_of(residency),
             verdict(ok)
         );
         Ok(ok)
@@ -999,6 +1116,10 @@ mod gate {
             word_of(residency)
         );
         let mut pass = refuse_clause(&path, &machine, &levers, &plan, residency)?;
+        pass &= held(
+            "front-refuse",
+            front_refuse_clause(&path, &machine, &levers, &inputs, &plan, residency),
+        );
 
         let t0 = Instant::now();
         let mut s = open(&path, &machine, &levers, residency)?;

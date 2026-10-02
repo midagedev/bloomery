@@ -1,0 +1,39 @@
+# Round glmswap: GLM-5.3-Flash's prompt batch with its mixers' Q8_0 projections on the GEMM (GemmFront: a KDA
+# mixer's qkv, g_a, beta, g_b and out; a latent mixer's joined stack) from GEMM_FROM = 9 positions a batch, against
+# the base 9e7c858b (main before glmswap) whose front runs every projection as q8_0_gemv_mcol in chunks of 8 (each weight read 64 times
+# a 512-column batch).
+# Decomposition [derived, round report section 1], from glmgroup's runtime values (A6000, place a, G1, P = 4096,
+# BLOOMERY_STEP_STATS): a routed layer-batch is front + host union 72.9 + exchange about 1.1 ms (the shadow, 37.8,
+# under the union); KDA front 49.9 ms flat, latent 52.5..69.9; 7.2 ms a routed layer-batch outside the leg spans
+# (the three dense KDA layers, the head). 31 routed KDA + 3 dense KDA + 11 latent layers.
+# H1 (favoured: mcol at m = 8 streams ~195 GB/s): KDA front 49.9 -> 4.6..6.0 ms (GEMM 1.14 GB at 550..700 GB/s,
+# the decay pair's 128 mcol launches at their floor, ~1.9 ms non-projection), latent stack 3.3 -> 0.13 ms:
+# -1.53..-1.58 s a batch of 512 -> pp512 129..131 (+39..+40 %), pp4096 124..126 (+37..+39 %).
+# H3 (glmgemm's: mcol at 550..700 GB/s, ~33 ms fixed): -0.40..-0.59 s a batch -> pp512 100..104 (+8..+12 %),
+# pp4096 97..101 (+8..+12 %).
+# pp512 is one batch, so the term reads pp4096; pp512 is printed beside it with the same bands.
+kind: ab
+question: does moving the KDA and latent fronts' projections onto the GEMM cut the prompt batch's card front by
+  the H1 term (the one-column gemv at m = 8 streaming near 195 GB/s), or only by H3's?
+term: pp tok/s @ P = 4096, prose prompt (GLM_PROSE from GLM_PROSE_FROM), A6000, plan (a), --ctx 4352, groups of
+  one (BLOOMERY_PREFILL_GROUP unset) - (swap - base) / base, paired by round across the two invocations
+unit: %
+predict: +34..+42
+rounds: 2
+condition: one hold, two runner invocations back to back, each carrying this card: the base from a tree at
+  9e7c858b (/Users/hckim/repo/bloomery-glmswapbase, its own remote dir), then the swap from /Users/hckim/repo/bloomery-glmswap
+  (BLOOMERY_REMOTE='~/repo/bloomery-glmswap'), each BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4352
+  BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmswap-pp.card' just depth-gpu-glm5next 512 4096. Every
+  row's time prompt record names kind=batch and 1 pass at P = 512, 8 at 4096; a row marked [cold], [cpu-busy] or
+  [other-busy] is void, and so is a window whose card witness differs between the two invocations. The effect
+  predicted (+34 % or more, or H3's +8..+12 %) is far outside the ~5 % a window moves, so pairing across the two
+  invocations decides it. Box time ~16..22 min [derived: per invocation two warm-up processes and four rows, six
+  loads at 45..75 s, 2 x (5.5 + 45) s of prompt at the base's rate, less at the swap's; plus the two builds]
+decide-in: H1 holds: the mcol front was the bound; land the swap, and open the next round on what the front now
+  leaves (the latent heads q_b, k_b, v_b and out, 7.41 GB a latent layer-batch on mcol, and the FFNs behind a
+  clamped swiglu_quant32 entry), and at G >= 2 the host union, which the KDA layer-batches now wait on
+decide-below: under +34 %: if inside H3's +6..+14 %, the 33 ms is fixed non-projection cost - time one batch
+  under nsys (the KDA front's launches by kind) before any further GEMM round; if between H3 and H1, name the term
+  from the stat prompt lb rows (card_front_ms per kind) before landing
+decide-above: past +42 %: the gemv was slower than 195 GB/s or the GEMM faster than 700 GB/s; re-derive the KDA
+  front from the stat prompt lb rows and re-base the latent heads' prediction on the measured rate

@@ -33,8 +33,9 @@
 //!   its ids are the CLI's `tokens` line — all 16, or a prefix ending in the
 //!   end-of-generation id when the server stopped there (the CLI does not
 //!   stop at it). Exact: the server feeds the prompt less its last id, then
-//!   one step, the CLI the whole prompt in one call, and the body's batched
-//!   feed and its steps leave the same bits;
+//!   one step, and so does the CLI (`--last-step`) — the same batches, so
+//!   the same bits (a batch past a chunk runs the GEMM, not the steps'
+//!   gemvs);
 //! - `POST /residency/reset` is the server's 501 (no machine);
 //! - then a third load, the server under `BLOOMERY_DRAFT=mtp
 //!   BLOOMERY_RESIDENCY=off`: it prints `load draft=mtp` and no `residency
@@ -436,17 +437,28 @@ mod gate {
         }
     }
 
-    /// `generate_glm5next --place gate --ctx 2048 --tokens <ids> -n 16`
-    /// beside this binary under the arm's levers, stdout to `<dir>/gen.log`
-    /// and stderr to `<dir>/gen.err`: its `tokens` line and its stdout.
-    fn cli(dir: &Path, levers: Levers, ids: &[u32]) -> Result<(Vec<u32>, Vec<String>), GateError> {
+    /// `generate_glm5next --place gate --ctx 2048 --tokens <ids> -n 16`,
+    /// with `--last-step` when `last_step` (the server's cut: the prompt less
+    /// its last id, then a step), beside this binary under the arm's levers,
+    /// stdout to `<dir>/gen.log` and stderr to `<dir>/gen.err`: its `tokens`
+    /// line and its stdout.
+    fn cli(
+        dir: &Path,
+        levers: Levers,
+        ids: &[u32],
+        last_step: bool,
+    ) -> Result<(Vec<u32>, Vec<String>), GateError> {
         let exe = beside("generate_glm5next")?;
         let tokens = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
         let out = dir.join("gen.log");
+        let mut args = vec![
+            "--place", "gate", "--ctx", "2048", "--tokens", &tokens, "-n", "16",
+        ];
+        if last_step {
+            args.push("--last-step");
+        }
         let status = Command::new(&exe)
-            .args([
-                "--place", "gate", "--ctx", "2048", "--tokens", &tokens, "-n", "16",
-            ])
+            .args(&args)
             .envs(levers.iter().copied())
             .stdin(Stdio::null())
             .stdout(File::create(&out)?)
@@ -694,7 +706,7 @@ mod gate {
         println!("plain residency reset: HTTP {st} {body}");
         check(&mut ok, "plain_residency_reset_is_501", st == 501);
         println!("plain server stopped: {}", served.stop()?);
-        let (reference, _) = cli(dir, PLAIN, &ids)?;
+        let (reference, _) = cli(dir, PLAIN, &ids, true)?;
         println!("generate_glm5next tokens {reference:?}");
         check(
             &mut ok,
@@ -806,7 +818,7 @@ mod gate {
 
         println!("drafted server stopped: {}", served.stop()?);
 
-        let (reference, cli_lines) = cli(dir, DRAFTED, &ids)?;
+        let (reference, cli_lines) = cli(dir, DRAFTED, &ids, false)?;
         let cli_passes = passes(&cli_lines);
         println!("generate_glm5next tokens {reference:?}");
         println!("generate_glm5next passes (kind, kept, landed) {cli_passes:?}");

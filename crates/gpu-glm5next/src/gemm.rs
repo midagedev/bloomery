@@ -24,16 +24,19 @@
 //! Refused by name, before any launch: a weight that is not a resident
 //! Q8_0 plane, a weight whose K is not the width its input's activations
 //! were sized for, no columns or more than the scratch holds, a row range
-//! outside its stack.
+//! outside its stack. A front whose made bytes are not [`front_bytes`]'
+//! is refused at open.
 
 use std::ops::Range;
 
 use bloomery_gpu::gemm::{
-    Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmKernels, GemmRoute,
+    GEMM_BN, GEMM32_STEP, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput,
+    GemmKernels, GemmRoute,
 };
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use cuda_core::DeviceBuffer;
+use model::arch::glm5next::place;
 
 use crate::body::q8;
 
@@ -127,11 +130,12 @@ pub struct GemmFront {
 }
 
 impl GemmFront {
-    /// The front for `shape` on `gpu`'s context. Load-time only.
+    /// The front for `shape` on `gpu`'s context: [`front_bytes`]' bytes,
+    /// refused by name otherwise. Load-time only.
     pub fn open(gpu: &Gpu, shape: FrontShape) -> Result<GemmFront, GpuError> {
         let stream = gpu.stream();
         let ctx = gpu.context();
-        Ok(GemmFront {
+        let front = GemmFront {
             route_k: GemmKernels::load(ctx)?,
             k32: Gemm32Kernels::load(ctx)?,
             dense: GemmRoute::new(stream, shape.cols, 1)?,
@@ -140,7 +144,18 @@ impl GemmFront {
             gated: GemmAct32::new(stream, shape.cols, shape.gated)?,
             shape,
             stats: FrontStats::default(),
-        })
+        };
+        let want = front_bytes(shape);
+        if front.bytes() != want {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a front of {shape:?} takes {} B; front_bytes counts {want}",
+                    front.bytes()
+                ),
+            });
+        }
+        Ok(front)
     }
 
     /// The widths the scratch was sized for.
@@ -391,6 +406,16 @@ impl GemmFront {
         )
     }
 }
+
+/// Card bytes of a front of `shape` ([`GemmFront::bytes`]): the plan's
+/// formula (`place::front_bytes`), which the plan reserves on the stage card.
+#[must_use]
+pub fn front_bytes(shape: FrontShape) -> usize {
+    place::front_bytes(shape.cols, [shape.embd, shape.low, shape.gated])
+}
+
+const _: () = assert!(GEMM_BN == place::FRONT_TILE_COLS);
+const _: () = assert!(GEMM32_STEP == place::FRONT_STEP);
 
 impl<'a, 'y> Proj<'a, 'y> {
     /// Every row of `name` into `y`.

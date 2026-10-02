@@ -25,10 +25,13 @@
 //!   printed over the band. At least one graph is held off a tie.
 //! - (p) the pairing: the hidden rows a walk fed the target's arenas reads
 //!   (`bloomery_gpu_glm5next::nextn_hidden`, the walk's own gather): the
-//!   set's prompt in batches and by steps leaves the same rows in the
-//!   prompt-batch and step arenas, bit for bit, and so does a prompt of
-//!   [`GROUPED`] of its ids cycled (two batches) at groups of two, every
-//!   unit's rows read after the group; each value of every row
+//!   set's first `CHUNK` prompt ids in a batch and by steps leave the same
+//!   rows in the prompt-batch and step arenas, bit for bit (a batch of at
+//!   most a chunk runs the step's gemvs; the whole prompt's distance between
+//!   the two printed, a longer batch running the GEMM), and a prompt of
+//!   [`GROUPED`] of its ids cycled (two batches) at groups of two leaves the
+//!   rows it leaves at groups of one, bit for bit, every unit's rows read
+//!   after the group; each value of every row of the whole prompt's
 //!   within its derived bound of the f64 replica of the gather — the four
 //!   streams' mean, then `output_norm`'s RMS at the file's eps — on the
 //!   target streams the row was made from (`nextn_target_streams`; the
@@ -48,7 +51,7 @@
 //!   for bit. ik's committed stream beside them is printed, not held.
 //! - (w) the windows end to end, the prompt fed in batches and by steps:
 //!   under `Speculative<MtpDraft<Body>, 2>` the drafted greedy ids are the
-//!   plain run's for [`N`] tokens, with a rejected row and an accepted
+//!   plain run's on the same path for [`N`] tokens, with a rejected row and an accepted
 //!   proposal among the windows — else either path never ran and the clause
 //!   is red.
 //! - (f) the walk's refusals by name: a walk on a load without the layer,
@@ -95,9 +98,10 @@ mod gate {
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
-        Body, Glm5nextModel, GlmArena, GlmPromptSink, NextnFeed, NextnHead, NextnHidden, NextnMode,
-        PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden, nextn_logits,
-        nextn_target_streams, nextn_walk, prompt_with, set_prefill, set_prefill_group,
+        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, NextnFeed, NextnHead,
+        NextnHidden, NextnMode, PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden,
+        nextn_logits, nextn_target_streams, nextn_walk, prompt_with, set_prefill,
+        set_prefill_group,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
@@ -653,8 +657,9 @@ mod gate {
     }
 
     /// (p) the pairing: the hidden rows a walk fed the target's arenas reads.
-    /// A prompt call's units in batches (the prompt-batch arena) and by steps
-    /// (the step arena) leave the same rows bit for bit, each value within
+    /// A prompt call's first chunk of units in a batch (the prompt-batch
+    /// arena) and by steps (the step arena) leave the same rows bit for bit,
+    /// the whole prompt's two printed, each value of either within
     /// its bound of the gather's f64 replica on the rows' target streams
     /// ([`hidden_held`], at the file's `eps`); the row at position
     /// `q` lies closer to ik's warmup row at `q + 1` — ik's MTP row `p` reads
@@ -684,33 +689,41 @@ mod gate {
         let held_ok = hidden_held(&batch, &batch_streams, &gain, eps, "batches")
             & hidden_held(&steps, &steps_streams, &gain, eps, "steps");
         let n = prompt.len();
-        let same = batch.len() == n * hidden
-            && batch
-                .iter()
-                .map(|x| x.to_bits())
-                .eq(steps.iter().map(|x| x.to_bits()));
-        let mut ok = same && held_ok;
+        let bits = |a: &[f32], b: &[f32]| {
+            a.len() == b.len()
+                && a.iter()
+                    .map(|x| x.to_bits())
+                    .eq(b.iter().map(|x| x.to_bits()))
+        };
+        // A batch of at most a chunk runs the step's gemvs, so its rows are
+        // the steps' bits; a longer one runs the GEMM, whose rows the gather's
+        // bound holds on their own target streams above.
+        let short = &prompt[..n.min(CHUNK)];
+        let (batch_short, _) = unit_rows(m, short, PrefillMode::Batch)?;
+        let (steps_short, _) = unit_rows(m, short, PrefillMode::Steps)?;
+        let same = batch_short.len() == short.len() * hidden && bits(&batch_short, &steps_short);
+        let mut ok = same && held_ok && batch.len() == n * hidden;
         println!(
-            "(p) the prompt's {n} units' hidden rows, in batches = by steps, bit for bit {}",
-            verdict(same)
+            "(p) the prompt's first {} units' hidden rows, in a batch = by steps, bit for bit {}; \
+             all {n} units' in batches against by steps {:.3e} (printed: from {GEMM_FROM} \
+             positions a batch runs the GEMM)",
+            short.len(),
+            verdict(same),
+            rel(&batch, &steps)
         );
         // Two batches in one group: the sink reads each unit's own final
-        // streams after the group.
+        // streams after the group; the same batches at groups of one.
         let two: Vec<u32> = prompt.iter().copied().cycle().take(GROUPED).collect();
         set_prefill_group(m, 2)?;
         let grouped = unit_rows(m, &two, PrefillMode::Batch);
         set_prefill_group(m, 1)?;
         let (grouped, _) = grouped?;
-        let (stepped, _) = unit_rows(m, &two, PrefillMode::Steps)?;
-        let same2 = grouped.len() == GROUPED * hidden
-            && grouped
-                .iter()
-                .map(|x| x.to_bits())
-                .eq(stepped.iter().map(|x| x.to_bits()));
+        let (ones, _) = unit_rows(m, &two, PrefillMode::Batch)?;
+        let same2 = grouped.len() == GROUPED * hidden && bits(&grouped, &ones);
         ok &= same2;
         println!(
-            "(p) {GROUPED} ids (two batches) at groups of two: every unit's hidden rows = by \
-             steps, bit for bit {}",
+            "(p) {GROUPED} ids (two batches) at groups of two: every unit's hidden rows = at \
+             groups of one, bit for bit {}",
             verdict(same2)
         );
         let warm = IkGraph::read(set, -1, Graph::Warmup, hidden)?;
@@ -1360,8 +1373,11 @@ mod gate {
             ik.len()
         );
 
-        for path in [PrefillMode::Batch, PrefillMode::Steps] {
-            let (model, w_ok) = drafted(m, &prompt, path, &with, &set)?;
+        // Each path against its own plain run: a prompt batch past a chunk
+        // runs the GEMM, so the two paths' plain runs are not one run's bits.
+        let by_steps = plain(&mut m, &prompt, PrefillMode::Steps)?;
+        for (path, plain) in [(PrefillMode::Batch, &with), (PrefillMode::Steps, &by_steps)] {
+            let (model, w_ok) = drafted(m, &prompt, path, plain, &set)?;
             m = model;
             ok &= w_ok;
         }

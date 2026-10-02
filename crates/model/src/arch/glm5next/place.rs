@@ -90,6 +90,42 @@ pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
     }
 }
 
+/// Token columns a tile of the GEMM front's dense table spans, and values
+/// one step of its int8 activations quantizes: the card GEMM's constants
+/// (`GEMM_BN`, `GEMM32_STEP`), which the card body binds to these.
+pub const FRONT_TILE_COLS: usize = 64;
+pub const FRONT_STEP: usize = 64;
+
+/// Card bytes of a GEMM front of `cols` token columns whose inputs are
+/// `embd`, `low` and `gated` values wide, four bytes a word: the dense table
+/// — the slot list and its all-zero ids, a column a word each, two words a
+/// tile (a tile every [`FRONT_TILE_COLS`] columns, and one more) and the two
+/// counts — and each input's three activation planes, twenty words a
+/// column's [`FRONT_STEP`]-value step (sixteen of codes, two scales, two
+/// code sums). The one formula of those bytes: the card body's front checks
+/// its made bytes against it.
+#[must_use]
+pub fn front_bytes(cols: usize, [embd, low, gated]: [usize; 3]) -> usize {
+    let table = 2 * cols + 2 * (cols / FRONT_TILE_COLS + 1) + 2;
+    let act = |k: usize| 20 * cols * k.div_ceil(FRONT_STEP);
+    4 * (table + act(embd) + act(low) + act(gated))
+}
+
+/// The bytes of the GEMM front a prompt batch of a load of `hp` at `ctx_max`
+/// positions makes on the stage card ([`front_bytes`]): batches of up to the
+/// host union's columns or the context, whichever is fewer, over the normed
+/// input (`embedding_length`), a KDA mixer's low-rank gate rows (one head,
+/// `kda.head_dim`) and its gated rows (every value head). The plan reserves
+/// them on the stage card ([`PlanInputs::plan_lanes`]).
+#[must_use]
+pub fn prompt_front_bytes(hp: &Hparams, ctx_max: u64) -> u64 {
+    let cols = usize::try_from(ctx_max).map_or(crate::moe::UNION_MAX_COLS, |c| {
+        c.min(crate::moe::UNION_MAX_COLS)
+    });
+    let widths = [hp.n_embd, hp.kda_head_dim, hp.n_head * hp.kda_head_dim];
+    front_bytes(cols, widths) as u64
+}
+
 /// Batches a prompt group holds at most under a group lever of `g`
 /// (`BLOOMERY_PREFILL_GROUP`): `g`, and one more from 2 on — a call's lone
 /// last batch joins the group before it ([`groups`]). The prompt batch's
@@ -156,6 +192,49 @@ pub enum PlaceError {
          {cards} cards"
     )]
     NextnCards { cards: usize },
+    /// A stage card whose plan leaves less beside it than the prompt
+    /// batch's GEMM front ([`prompt_front_bytes`]) takes: the dense
+    /// granules, the cache, context, scratch, reserves and margin already
+    /// pass what the card holds less the front, so no expert placement
+    /// makes room.
+    #[error(
+        "card {card}: the prompt batch's GEMM front takes {front} B, and the plan leaves {left} B \
+         beside its dense granules, cache, context, scratch, reserves and margin ({short} B short)"
+    )]
+    FrontOver {
+        card: String,
+        front: u64,
+        left: u64,
+        short: u64,
+    },
+}
+
+/// The prompt batch's GEMM front `front` beside `total` bytes of a plan's
+/// terms on `card`, `limit` its usable bytes less its margin: refused by
+/// name when the terms fit alone and the front does not fit beside them
+/// (terms past the limit are the plan's own violation).
+fn refuse_front(card: &Card, total: u64, limit: u64, front: u64) -> Result<(), PlaceError> {
+    match limit.checked_sub(total) {
+        Some(left) if front > left => Err(PlaceError::FrontOver {
+            card: card.name.clone(),
+            front,
+            left,
+            short: front - left,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// A plan's terms on a card: its granules, cache, scratch, context and
+/// reserves.
+fn card_terms(t: &CardTotals) -> u64 {
+    t.dense_bytes
+        + t.expert_bytes
+        + t.rounding_bytes
+        + t.kv_bytes
+        + t.scratch_bytes
+        + t.context_bytes
+        + t.reserve_bytes
 }
 
 /// The violations, `; `-separated.
@@ -231,8 +310,11 @@ impl PlanInputs {
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// the placement's `levers`, each KDA layer's state `lanes` lanes: the
     /// expert rule on the layers whose routed stacks [`card_routed`] runs,
-    /// each layer's id prefix; refused past [`ORACLE_POSITIONS`], when it
-    /// cannot be built, or when it breaks an invariant.
+    /// each layer's id prefix, within the stage card's budget less the
+    /// prompt batch's GEMM front ([`prompt_front_bytes`]); refused past
+    /// [`ORACLE_POSITIONS`], when it cannot be built, when it breaks an
+    /// invariant, and by name when the front does not fit beside the rest
+    /// ([`PlaceError::FrontOver`]).
     pub fn plan_lanes<'a>(
         &'a self,
         machine: &'a Machine,
@@ -247,13 +329,25 @@ impl PlanInputs {
             });
         }
         let kv = self.kv.with_lanes(lanes);
-        let plan = placement::plan_routed(&self.model, machine, ctx_max, &kv, levers, card_routed)?;
+        let front = prompt_front_bytes(&self.hp, ctx_max);
+        let plan = placement::plan_routed_reserving(
+            &self.model,
+            machine,
+            ctx_max,
+            &kv,
+            levers,
+            card_routed,
+            front,
+        )?;
         let broken = plan.violations();
-        if broken.is_empty() {
-            Ok(plan)
-        } else {
-            Err(PlaceError::Broken(broken))
+        if !broken.is_empty() {
+            return Err(PlaceError::Broken(broken));
         }
+        if let (Some(card), Some(t)) = (machine.cards.first(), plan.cards.first()) {
+            let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
+            refuse_front(card, card_terms(t), limit, front)?;
+        }
+        Ok(plan)
     }
 }
 
@@ -423,7 +517,8 @@ pub struct NextnPlan<'a> {
     /// [`NEXTN_ARENA_BYTES`], counted beside the NextN layer's card bytes.
     pub arena_bytes: u64,
     /// The card's usable bytes (capped by the card budget) less the target's
-    /// and the NextN layer's card terms; the margin is inside it.
+    /// and the NextN layer's card terms and the prompt batch's GEMM front;
+    /// the margin is inside it.
     pub headroom_bytes: i128,
     /// The host's headroom less the NextN layer's routed experts.
     pub host_headroom_bytes: i128,
@@ -497,10 +592,12 @@ impl PlanInputs {
     /// [`PlanInputs::plan`] with the next-token layer `nextn` loaded on the
     /// machine's one card: the NextN layer's own plan (its routed stacks on
     /// the host), the target's expert rule within the card's budget less the
-    /// NextN layer's card bytes and arena, each KDA layer's state two lanes
-    /// ([`KdaLanes::Two`]: the load verifies the draft's rows), the card's
-    /// bound checked on the sum and the host's on the target's host set and
-    /// the NextN layer's routed experts. Refused as [`PlanInputs::plan`] refuses and on a
+    /// NextN layer's card bytes and arena and the prompt batch's GEMM front,
+    /// each KDA layer's state two lanes ([`KdaLanes::Two`]: the load verifies
+    /// the draft's rows), the card's bound checked on the sum (the front
+    /// named, [`PlaceError::FrontOver`]) and the host's on the target's host
+    /// set and the NextN layer's routed experts. Refused as
+    /// [`PlanInputs::plan`] refuses and on a
     /// machine of other than one card; every violation of either plan is
     /// listed, the card's and the host's bound once.
     pub fn plan_nextn<'a>(
@@ -529,7 +626,8 @@ impl PlanInputs {
             &PlanLevers::default(),
         )?;
         let arena = NEXTN_ARENA_BYTES;
-        let reserve = nextn_card_bytes(&draft.cards[0]) + arena;
+        let front = prompt_front_bytes(&self.hp, ctx_max);
+        let reserve = nextn_card_bytes(&draft.cards[0]) + arena + front;
         let kv = self.kv.with_lanes(KdaLanes::Two);
         let plan = placement::plan_routed_reserving(
             &self.model,
@@ -540,20 +638,7 @@ impl PlanInputs {
             card_routed,
             reserve,
         )?;
-        let t = &plan.cards[0];
-        let total = [
-            t.dense_bytes,
-            t.expert_bytes,
-            t.rounding_bytes,
-            t.kv_bytes,
-            t.scratch_bytes,
-            t.context_bytes,
-            t.reserve_bytes,
-            nextn_card_bytes(&draft.cards[0]),
-            arena,
-        ]
-        .iter()
-        .sum::<u64>();
+        let total = card_terms(&plan.cards[0]) + nextn_card_bytes(&draft.cards[0]) + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let host_headroom = plan.host.headroom_bytes - i128::from(draft.host.expert_bytes);
@@ -585,8 +670,9 @@ impl PlanInputs {
         if !broken.is_empty() {
             return Err(PlaceError::Broken(broken));
         }
+        refuse_front(card, total, limit, front)?;
         Ok(NextnPlan {
-            headroom_bytes: i128::from(usable) - i128::from(total),
+            headroom_bytes: i128::from(usable) - i128::from(total) - i128::from(front),
             host_headroom_bytes: host_headroom,
             plan,
             nextn: draft,

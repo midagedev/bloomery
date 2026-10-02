@@ -6,8 +6,8 @@
 //! steps.
 //!
 //! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate|bp|<stage>[+<tier>…]]
-//! [--mode graph|eager] [--prefill batch|steps] [--time [--warm W]]
-//! [--pair] [--logits] [--plan]`
+//! [--mode graph|eager] [--prefill batch|steps] [--last-step]
+//! [--time [--warm W]] [--pair] [--logits] [--plan]`
 //!
 //! - `--tokens`: the prompt's ids (the file's own vocabulary, no BOS added).
 //! - `--ctx`: the positions the caches hold; the plan refuses more than the
@@ -27,7 +27,12 @@
 //! - `--prefill`: `batch` feeds the prompt in batches
 //!   (`bloomery_gpu_glm5next::prefill`), `steps` one decode step a position,
 //!   the same bits at any `--ctx`, past the positions the latent layers
-//!   attend whole too; the same-binary arm. Default `batch`.
+//!   attend whole too, as long as no batch is longer than a chunk (one past
+//!   it runs its mixers' projections on the GEMM); the same-binary arm.
+//!   Default `batch`.
+//! - `--last-step`: the prompt less its last id fed as `--prefill` says,
+//!   then the last id as a decode step — the cut the server's seat feeds a
+//!   prompt by. Refused by name beside the draft, `--time` and `--pair`.
 //! - The model file is `$BLOOMERY_REF_MODEL` (`ref_model_path`), which
 //!   `tools/box.sh` exports from the `glm5next` profile, as in every other bin.
 //! - `--plan` prints the plan and exits before the load.
@@ -345,6 +350,14 @@ mod cli {
             .into());
         }
         let pair = has("--pair");
+        let last_step = has("--last-step");
+        if last_step && (timed || pair || matches!(levers.draft(), Some(d) if d != "off")) {
+            return Err(
+                "--last-step is refused beside --time, --pair and BLOOMERY_DRAFT: it feeds the \
+                 plain run's prompt only"
+                    .into(),
+            );
+        }
         if pair && n_gen < 3 {
             return Err(
                 "--pair needs -n 3 or more: a verify runs two of the fed tokens and checks the next"
@@ -536,7 +549,15 @@ mod cli {
                 .hybrid_mut()
                 .route_prompt(pos, ids.len())?;
         }
-        let mut next = s.prompt(&ids, Want::Argmax)?.argmax();
+        let mut next = match ids.split_last() {
+            Some((&last, head)) if last_step => {
+                if !head.is_empty() {
+                    s.prompt(head, Want::Argmax)?;
+                }
+                s.step(last, Want::Argmax)?.argmax()
+            }
+            _ => s.prompt(&ids, Want::Argmax)?.argmax(),
+        };
         let feed = t_feed.elapsed();
         Record::new(&record::STEP0)
             .u("pos", s.pos() - 1)

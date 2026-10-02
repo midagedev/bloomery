@@ -1,9 +1,18 @@
 //! The prompt batch: a prompt of `P` ids fed in batches of at most
 //! [`T_MAX`] positions ([`prefill`]), which leaves the model where `P`
-//! decode steps over the same ids leave it, bit for bit, in everything a
-//! later step reads: every KDA layer's state and conv ring, every latent
-//! layer's latent and index rows and pool plane, the checkpoints, and the
-//! last position's logits.
+//! decode steps over the same ids leave it in everything a later step
+//! reads: every KDA layer's state and conv ring, every latent layer's latent
+//! and index rows and pool plane, the checkpoints, and the last position's
+//! logits. A batch of at most [`CHUNK`] positions writes the steps' bits; one
+//! of [`GEMM_FROM`] or more runs its mixers' Q8_0 projections on the GEMM
+//! ([`GemmFront`]: a KDA mixer's input projections but the decay's pair and
+//! its output projection, a latent mixer's joined projection), whose
+//! activations are quantized to 32-value int8 blocks, so it writes the
+//! GEMM's bits there. Either way a token's bits are a function of the ids
+//! before it and of which side of [`GEMM_FROM`] each batch they ran in fell,
+//! not of the batches' cut otherwise: the GEMM's output for a column is that
+//! of any other column count, and every other launch writes a column what
+//! the step's one-column launch writes.
 //!
 //! A call is cut at its checkpoint marks
 //! ([`bloomery_gpu::checkpoint::Checkpoints::marks`]: its start, every
@@ -46,17 +55,19 @@
 //! front of the unit that ends on it, and is sealed once the group's fault
 //! word is read, or abandoned with the group.
 //!
-//! Every launch writes, per token, what the step's one-token launch writes,
-//! and what carries state from a position to the next (the conv ring, the
-//! delta rule's state, the latent rows an attention reads) runs in position
-//! order:
+//! Every launch but the GEMM's writes, per token, what the step's one-token
+//! launch writes, and what carries state from a position to the next (the
+//! conv ring, the delta rule's state, the latent rows an attention reads)
+//! runs in position order:
 //! - one launch over the batch's `T` rows where the kernel takes any count:
 //!   the RMS norms, `hc_pre` (in its token groups), the fold and `hc_post`,
 //!   the KDA conv and prep, the delta step, the gated norm, the latent and
 //!   index appends, the pool keys the batch's tokens complete, the router's
 //!   two launches, the card places, the sums;
+//! - the GEMM's projections over the batch's `T` rows from [`GEMM_FROM`];
 //! - chunks of up to [`CHUNK`] tokens where it takes at most that many: the
-//!   q8_0 gemvs (`q8_0_gemv_mcol`, `q8_0_gemv_heads_mcol`), the
+//!   q8_0 gemvs (`q8_0_gemv_mcol`, `q8_0_gemv_heads_mcol`) the GEMM does
+//!   not take, the
 //!   gate·up·SwiGLU (`ds41_shexp_gate_up_q8_0_mcol`), the card experts'
 //!   launches, the k-pool selector, and the attention, each token over the
 //!   positions at and before its own — the batch's own rows and pools
@@ -118,6 +129,7 @@ use super::{
     weight,
 };
 use crate::ffn::{self, CardRows};
+use crate::gemm::{FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
 use crate::host::GlmHost;
 use crate::mla::{self, Select};
 use crate::tensors::{FfnNames, MixerNames, other_kind};
@@ -133,6 +145,12 @@ pub const T_MAX: usize = UNION_MAX_COLS;
 /// token group.
 pub const CHUNK: usize = COL_GROUP;
 const _: () = assert!(CHUNK == HC_MAX_TOKENS);
+
+/// The fewest tokens a batch runs its GEMM projections over
+/// ([`GemmFront`]: a KDA mixer's input and output projections but its decay
+/// pair, a latent mixer's joined projection): a batch of at most a chunk
+/// runs them as the step's gemv does, so it writes the step's bits.
+pub const GEMM_FROM: usize = CHUNK + 1;
 
 /// How a prompt is fed: in batches ([`prefill`]) or one decode step per id
 /// ([`prompt`]) — the same-binary arm, which is the decode step and not a
@@ -179,6 +197,11 @@ pub(crate) struct PromptState {
     /// The batch walks' timing ([`set_prompt_stats`]); unarmed, a walk
     /// records nothing and waits for nothing beyond its own serves.
     timing: Option<PromptTiming>,
+    /// The batch walks' route taps ([`set_prompt_route_taps`]); unarmed, a
+    /// walk copies nothing.
+    routes: Option<RouteTaps>,
+    /// The batch walks' planted routes ([`plant_prompt_routes`]).
+    plant_routes: Option<RoutePlant>,
 }
 
 impl PromptState {
@@ -191,12 +214,23 @@ impl PromptState {
             sink: 0,
             in_call: false,
             timing: None,
+            routes: None,
+            plant_routes: None,
         }
     }
 
-    /// Device bytes of the batch's buffers, 0 before they are made.
+    /// Device bytes of the batch's buffers, 0 before they are made, and of
+    /// the route taps while armed.
     pub(crate) fn bytes(&self) -> usize {
         self.batch.as_ref().map_or(0, |b| b.bytes())
+            + self.routes.as_ref().map_or(0, RouteTaps::bytes)
+            + self.plant_routes.as_ref().map_or(0, |p| {
+                p.layers
+                    .iter()
+                    .flatten()
+                    .map(TapPlanes::bytes)
+                    .sum::<usize>()
+            })
     }
 
     /// The stream buffer `fin` of the sink's unit's rows, where a group's
@@ -206,6 +240,196 @@ impl PromptState {
         let b = self.batch.as_deref()?;
         Some((b.units.get(self.sink)?.streams.get(fin)?, b.bufs.cap))
     }
+}
+
+/// The batch walks' route taps, for the gates: each routed layer's router
+/// scores ([`N_EXPERT`] a position, unbiased), picks ([`N_USED`] a position,
+/// in slot order) and their weights at every position below `rows` a batch
+/// ran, copied by the walk right after the router; `None` for a dense layer.
+struct RouteTaps {
+    rows: usize,
+    layers: Vec<Option<TapPlanes>>,
+    /// The positions whose rows the batch calls since the arming wrote, in
+    /// one run: a call that starts inside or at the end of it extends it,
+    /// any other starts it again.
+    fed: Range<usize>,
+}
+
+/// One routed layer's route planes for `rows` positions: the scores (a
+/// tap's only), the picks and their weights.
+struct TapPlanes {
+    probs: Option<DeviceBuffer<f32>>,
+    ids: DeviceBuffer<u32>,
+    weights: DeviceBuffer<f32>,
+}
+
+impl TapPlanes {
+    fn bytes(&self) -> usize {
+        self.probs.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.ids.num_bytes()
+            + self.weights.num_bytes()
+    }
+}
+
+impl RouteTaps {
+    fn bytes(&self) -> usize {
+        self.layers.iter().flatten().map(TapPlanes::bytes).sum()
+    }
+}
+
+/// The batch walks' planted routes, for the gates: each routed layer's picks
+/// and weights at every position below `rows`, written over the router's
+/// own right after it (and after the taps' copy), so every expert the
+/// batch runs and every weight it sums with are the plant's.
+struct RoutePlant {
+    rows: usize,
+    layers: Vec<Option<TapPlanes>>,
+}
+
+/// One routed layer's taps read back ([`prompt_route_taps`]): the router's
+/// scores, [`N_EXPERT`] a position, its picks and their weights, [`N_USED`]
+/// a position, position-major from position 0.
+#[derive(Clone, Debug)]
+pub struct RouteTapRows {
+    pub probs: Vec<f32>,
+    pub ids: Vec<u32>,
+    pub weights: Vec<f32>,
+}
+
+/// Arm the batch walks' route taps for positions below `rows`, or disarm
+/// them with 0: each routed layer's scores, picks and weights at every
+/// position a batch runs, which [`prompt_route_taps`] reads back. A batch
+/// call past `rows` is refused by name before it runs. Load-time
+/// allocation, for the gates; refused inside a call.
+pub fn set_prompt_route_taps(m: &mut Glm5nextModel, rows: usize) -> Result<(), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    if body.prompt.in_call {
+        return Err(shape(format!(
+            "route taps of {rows} rows set inside a prompt call"
+        )));
+    }
+    body.prompt.routes = None;
+    if rows == 0 {
+        return Ok(());
+    }
+    let stream = gpu.stream();
+    let layers = body
+        .cfg
+        .iter()
+        .map(|c| {
+            if !c.kind.host_leg() {
+                return Ok(None);
+            }
+            Ok(Some(TapPlanes {
+                probs: Some(DeviceBuffer::zeroed(stream, rows * N_EXPERT)?),
+                ids: DeviceBuffer::zeroed(stream, rows * N_USED)?,
+                weights: DeviceBuffer::zeroed(stream, rows * N_USED)?,
+            }))
+        })
+        .collect::<Result<Vec<_>, GpuError>>()?;
+    body.prompt.routes = Some(RouteTaps {
+        rows,
+        layers,
+        fed: 0..0,
+    });
+    Ok(())
+}
+
+/// Each layer's route taps for positions `0 .. n` ([`set_prompt_route_taps`]),
+/// `None` for a dense layer. Blocking. Refused by name while unarmed and for
+/// positions the batch calls since the arming did not write in one run from
+/// position 0.
+pub fn prompt_route_taps(
+    m: &mut Glm5nextModel,
+    n: usize,
+) -> Result<Vec<Option<RouteTapRows>>, GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let taps = body.prompt.routes.as_ref().ok_or(GpuError::State {
+        what: WHAT,
+        missing: "armed route taps (set_prompt_route_taps)",
+    })?;
+    if taps.fed.start != 0 || n > taps.fed.end {
+        return Err(shape(format!(
+            "route taps of positions 0..{n}: the batch calls since the arming wrote {:?}",
+            taps.fed
+        )));
+    }
+    let stream = gpu.stream();
+    taps.layers
+        .iter()
+        .map(|t| {
+            let Some(t) = t else {
+                return Ok(None);
+            };
+            let probs = t.probs.as_ref().ok_or(GpuError::State {
+                what: WHAT,
+                missing: "a route tap's scores",
+            })?;
+            Ok(Some(RouteTapRows {
+                probs: span(WHAT, probs, 0, n * N_EXPERT)?.to_host_vec(stream)?,
+                ids: span(WHAT, &t.ids, 0, n * N_USED)?.to_host_vec(stream)?,
+                weights: span(WHAT, &t.weights, 0, n * N_USED)?.to_host_vec(stream)?,
+            }))
+        })
+        .collect()
+}
+
+/// Plant `routes` (each layer's, as [`prompt_route_taps`] reads them, for
+/// positions `0 .. n`) into the batch walks, or take the plant back with
+/// `None`: from the next call each routed layer's picks and weights at a
+/// position below `n` are the plant's, written over the router's own. A
+/// batch call past `n` is refused by name before it runs, and so is a plant
+/// whose layers are not the load's routed ones or whose rows are not `n`
+/// positions. Load-time allocation, for the gates; refused inside a call.
+pub fn plant_prompt_routes(
+    m: &mut Glm5nextModel,
+    routes: Option<(&[Option<RouteTapRows>], usize)>,
+) -> Result<(), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    if body.prompt.in_call {
+        return Err(shape("a route plant set inside a prompt call".to_string()));
+    }
+    body.prompt.plant_routes = None;
+    let Some((routes, n)) = routes else {
+        return Ok(());
+    };
+    if routes.len() != body.cfg.len() || n == 0 {
+        return Err(shape(format!(
+            "a route plant of {} layers and {n} positions on a load of {} layers",
+            routes.len(),
+            body.cfg.len()
+        )));
+    }
+    let stream = gpu.stream();
+    let layers = body
+        .cfg
+        .iter()
+        .zip(routes)
+        .enumerate()
+        .map(|(l, (c, r))| match (c.kind.host_leg(), r) {
+            (false, None) => Ok(None),
+            (true, Some(r)) if r.ids.len() == n * N_USED && r.weights.len() == n * N_USED => {
+                Ok(Some(TapPlanes {
+                    probs: None,
+                    ids: DeviceBuffer::from_host(stream, &r.ids)?,
+                    weights: DeviceBuffer::from_host(stream, &r.weights)?,
+                }))
+            }
+            _ => Err(shape(format!(
+                "a route plant's layer {l}: {} picks and {} weights, the load's layer {}",
+                r.as_ref().map_or(0, |r| r.ids.len()),
+                r.as_ref().map_or(0, |r| r.weights.len()),
+                if c.kind.host_leg() {
+                    format!("routed, {n} positions of {N_USED}")
+                } else {
+                    "dense".to_string()
+                }
+            ))),
+        })
+        .collect::<Result<Vec<_>, GpuError>>()?;
+    stream.synchronize()?;
+    body.prompt.plant_routes = Some(RoutePlant { rows: n, layers });
+    Ok(())
 }
 
 /// A prompt call's tap ([`prompt_with`]): called after each unit the call
@@ -380,6 +604,8 @@ struct Bufs {
     card_h: DeviceBuffer<f32>,
     act_h: Vec<Q8Act>,
     card_down: DeviceBuffer<f32>,
+    /// The GEMM projections of a batch of [`GEMM_FROM`] tokens or more.
+    front: GemmFront,
 }
 
 impl Bufs {
@@ -457,6 +683,15 @@ impl Bufs {
                 .map(|c| Q8Act::with_slots(stream, c * N_USED, expert_ff))
                 .collect::<Result<_, _>>()?,
             card_down: z(if tiered { cap } else { CHUNK } * N_USED * n)?,
+            front: GemmFront::open(
+                gpu,
+                FrontShape {
+                    cols: cap,
+                    embd: n,
+                    low: head,
+                    gated: v,
+                },
+            )?,
         })
     }
 
@@ -507,6 +742,7 @@ impl Bufs {
             + self.hc_scratch.device_bytes()
             + self.act_x.device_bytes()
             + self.act_h.iter().map(Q8Act::device_bytes).sum::<usize>()
+            + self.front.bytes()
     }
 }
 
@@ -842,6 +1078,22 @@ fn prefill_units(
                 "a prompt batch with the taps armed: a tap holds one step's streams".to_string(),
             ));
         }
+        if let Some(taps) = body.prompt.routes.as_ref()
+            && to as usize > taps.rows
+        {
+            return Err(shape(format!(
+                "a prompt batch from {from} to {to} with route taps of {} rows",
+                taps.rows
+            )));
+        }
+        if let Some(plant) = body.prompt.plant_routes.as_ref()
+            && to as usize > plant.rows
+        {
+            return Err(shape(format!(
+                "a prompt batch from {from} to {to} with routes planted for {} positions",
+                plant.rows
+            )));
+        }
         if body.prompt.batch.is_none() {
             body.make_batch(gpu)?;
         }
@@ -850,6 +1102,14 @@ fn prefill_units(
     let r = call_groups(m, ids, from, to, sink);
     if let Ok(body) = m.body_parts(WHAT).map(|(_, _, b)| b) {
         body.prompt.in_call = false;
+        if let Some(taps) = body.prompt.routes.as_mut() {
+            let (from, to) = (from as usize, to as usize);
+            taps.fed = match &r {
+                Err(_) => 0..0,
+                Ok(_) if taps.fed.start <= from && from <= taps.fed.end => taps.fed.start..to,
+                Ok(_) => from..to,
+            };
+        }
     }
     r
 }
@@ -1079,6 +1339,68 @@ pub fn store_digests(m: &mut Glm5nextModel) -> Result<Vec<StoreDigest>, GpuError
     Ok(out)
 }
 
+/// One store's live values ([`store_rows`]).
+#[derive(Clone, Debug)]
+pub struct StoreRows {
+    pub layer: usize,
+    /// `state`, `ring`, `latent`, `index` or `pooled`.
+    pub what: &'static str,
+    /// The values, widened to f32 from the f16 of a latent layer's rows.
+    pub values: Vec<f32>,
+}
+
+/// Every layer's live stores read back as values, in layer order: a KDA
+/// layer's committed lane of its state and its conv ring whole, a latent
+/// layer's latent and index rows of the first `live` positions and the pools
+/// they complete ([`bloomery_gpu::latent::POOL`] positions a pool). Refused
+/// by name for `live` past the stores' rows. Blocking.
+pub fn store_rows(m: &mut Glm5nextModel, live: usize) -> Result<Vec<StoreRows>, GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let stream = gpu.stream();
+    let lane = body.s.lanes.committed();
+    let half = |w: Vec<u16>| -> Vec<f32> { w.into_iter().map(gguf::quant::half_to_f32).collect() };
+    let mut out = Vec::new();
+    for (layer, s) in body.stores.iter().enumerate() {
+        match s {
+            Store::Kda { state, ring, .. } => {
+                for (what, b) in [("state", state.part(lane)?), ("ring", ring)] {
+                    out.push(StoreRows {
+                        layer,
+                        what,
+                        values: b.to_host_vec(stream)?,
+                    });
+                }
+            }
+            Store::Latent {
+                latent,
+                index,
+                pooled,
+            } => {
+                let pools = live / bloomery_gpu::latent::POOL;
+                for (what, t, rows) in [
+                    ("latent", latent, live),
+                    ("index", index, live),
+                    ("pooled", pooled, pools),
+                ] {
+                    if rows > t.rows() {
+                        return Err(shape(format!(
+                            "layer {layer}'s {what} rows 0..{rows} past the {} it holds",
+                            t.rows()
+                        )));
+                    }
+                    let words = span(WHAT, t.buf(), 0, rows * t.cols())?.to_host_vec(stream)?;
+                    out.push(StoreRows {
+                        layer,
+                        what,
+                        values: half(words),
+                    });
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// FNV-1a over `words`, each word's eight little-endian bytes.
 fn fnv(words: impl Iterator<Item = u64>) -> u64 {
     words.fold(0xcbf2_9ce4_8422_2325_u64, |h, w| {
@@ -1278,6 +1600,8 @@ impl Body {
             batch,
             timing,
             sink,
+            routes,
+            plant_routes,
             ..
         } = prompt;
         let Batch { bufs, units, hsum } = batch.as_deref_mut().ok_or(GpuError::State {
@@ -1351,6 +1675,8 @@ impl Body {
                 store: &store_ix,
             },
             plant,
+            routes: routes.as_mut(),
+            planted: plant_routes.as_ref(),
         };
         let o = Overlap {
             units: g,
@@ -1548,6 +1874,10 @@ struct PromptProgram<'a> {
     takes: Takes<'a>,
     /// [`super::Plant::Group`]'s unit: its first routed front fails.
     plant: Option<usize>,
+    /// The armed route taps, which each router's rows are copied into.
+    routes: Option<&'a mut RouteTaps>,
+    /// The planted routes, written over each router's picks and weights.
+    planted: Option<&'a RoutePlant>,
 }
 
 /// A group's open takes, one a unit ([`Body::enqueue_group`]), with what
@@ -1658,16 +1988,40 @@ impl PromptProgram<'_> {
             t,
             &mut b.xn,
         )?;
-        for (c0, c) in chunks(t) {
-            let xs = span(W, &b.xn, c0 * n, c * n)?;
-            mcol(
+        let gemm = t >= GEMM_FROM;
+        if gemm {
+            b.front.kda_in(
                 gpu,
                 w,
-                &nm.qkv,
-                &xs,
-                c,
-                &mut *span_mut(W, &mut b.qkv, c0 * ch, c * ch)?,
+                l,
+                t,
+                &b.xn,
+                KdaInNames {
+                    qkv: &nm.qkv,
+                    g_a: &nm.g_a,
+                    beta: &nm.beta,
+                    g_b: &nm.g_b,
+                },
+                KdaInRows {
+                    qkv: &mut b.qkv,
+                    ga: &mut b.ga,
+                    beta_raw: &mut b.beta_raw,
+                    z: &mut b.z,
+                },
             )?;
+        }
+        for (c0, c) in chunks(t) {
+            let xs = span(W, &b.xn, c0 * n, c * n)?;
+            if !gemm {
+                mcol(
+                    gpu,
+                    w,
+                    &nm.qkv,
+                    &xs,
+                    c,
+                    &mut *span_mut(W, &mut b.qkv, c0 * ch, c * ch)?,
+                )?;
+            }
             mcol(
                 gpu,
                 w,
@@ -1676,22 +2030,24 @@ impl PromptProgram<'_> {
                 c,
                 &mut *span_mut(W, &mut b.fa, c0 * head, c * head)?,
             )?;
-            mcol(
-                gpu,
-                w,
-                &nm.g_a,
-                &xs,
-                c,
-                &mut *span_mut(W, &mut b.ga, c0 * head, c * head)?,
-            )?;
-            mcol(
-                gpu,
-                w,
-                &nm.beta,
-                &xs,
-                c,
-                &mut *span_mut(W, &mut b.beta_raw, c0 * nv, c * nv)?,
-            )?;
+            if !gemm {
+                mcol(
+                    gpu,
+                    w,
+                    &nm.g_a,
+                    &xs,
+                    c,
+                    &mut *span_mut(W, &mut b.ga, c0 * head, c * head)?,
+                )?;
+                mcol(
+                    gpu,
+                    w,
+                    &nm.beta,
+                    &xs,
+                    c,
+                    &mut *span_mut(W, &mut b.beta_raw, c0 * nv, c * nv)?,
+                )?;
+            }
             let fa = span(W, &b.fa, c0 * head, c * head)?;
             mcol(
                 gpu,
@@ -1701,15 +2057,17 @@ impl PromptProgram<'_> {
                 c,
                 &mut *span_mut(W, &mut b.f, c0 * v, c * v)?,
             )?;
-            let ga = span(W, &b.ga, c0 * head, c * head)?;
-            mcol(
-                gpu,
-                w,
-                &nm.g_b,
-                &ga,
-                c,
-                &mut *span_mut(W, &mut b.z, c0 * v, c * v)?,
-            )?;
+            if !gemm {
+                let ga = span(W, &b.ga, c0 * head, c * head)?;
+                mcol(
+                    gpu,
+                    w,
+                    &nm.g_b,
+                    &ga,
+                    c,
+                    &mut *span_mut(W, &mut b.z, c0 * v, c * v)?,
+                )?;
+            }
         }
         let lin = &self.p.k.linear;
         lin.conv.enqueue_kda_conv_prep(
@@ -1770,6 +2128,9 @@ impl PromptProgram<'_> {
                 y: &mut b.gated,
             },
         )?;
+        if gemm {
+            return b.front.kda_out(gpu, w, l, t, &b.gated, &nm.out, &mut b.out);
+        }
         for (c0, c) in chunks(t) {
             let gs = span(W, &b.gated, c0 * v, c * v)?;
             mcol(
@@ -1823,7 +2184,20 @@ impl PromptProgram<'_> {
             t,
             &mut b.xn,
         )?;
-        {
+        if t >= GEMM_FROM {
+            b.front.latent_in(
+                gpu,
+                w,
+                l,
+                t,
+                &b.xn,
+                (&nm.stack, ql, kvw),
+                LatentInRows {
+                    qa: &mut b.qa,
+                    kv: &mut b.kv,
+                },
+            )?;
+        } else {
             let (qs, dd) = q8(w, &nm.stack)?;
             let qa_rows = RowWindow::of(qs, dd, 0..ql)?;
             let kv_rows = RowWindow::of(qs, dd, ql..ql + kvw)?;
@@ -2082,6 +2456,38 @@ impl PromptProgram<'_> {
             &mut ub.weights,
             fault,
         )?;
+        let p0 = ub.pos_host[0] as usize;
+        if let Some(taps) = self.routes.as_deref_mut() {
+            let Some(Some(TapPlanes {
+                probs: Some(probs),
+                ids,
+                weights,
+            })) = taps.layers.get_mut(l)
+            else {
+                return Err(GpuError::State {
+                    what: WHAT,
+                    missing: "a routed layer's route taps",
+                });
+            };
+            span_mut(WHAT, probs, p0 * N_EXPERT, t * N_EXPERT)?
+                .copy_from_device_async(&*span(WHAT, &b.probs, 0, t * N_EXPERT)?, stream)?;
+            span_mut(WHAT, ids, p0 * N_USED, t * N_USED)?
+                .copy_from_device_async(&*span(WHAT, &b.ids, 0, t * N_USED)?, stream)?;
+            span_mut(WHAT, weights, p0 * N_USED, t * N_USED)?
+                .copy_from_device_async(&*span(WHAT, &ub.weights, 0, t * N_USED)?, stream)?;
+        }
+        if let Some(plant) = self.planted {
+            let Some(Some(TapPlanes { ids, weights, .. })) = plant.layers.get(l) else {
+                return Err(GpuError::State {
+                    what: WHAT,
+                    missing: "a routed layer's planted routes",
+                });
+            };
+            span_mut(WHAT, &mut b.ids, 0, t * N_USED)?
+                .copy_from_device_async(&*span(WHAT, ids, p0 * N_USED, t * N_USED)?, stream)?;
+            span_mut(WHAT, &mut ub.weights, 0, t * N_USED)?
+                .copy_from_device_async(&*span(WHAT, weights, p0 * N_USED, t * N_USED)?, stream)?;
+        }
         port.mark(at, Mark::FrontEnd as usize)?;
         let key = port.key(at);
         let Some(side) = self.p.card.tier().filter(|t| t.k(l) > 0) else {

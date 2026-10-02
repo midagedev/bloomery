@@ -11,7 +11,8 @@
 //! - [`body`]: the load, the stores, the step's buffers and [`body::Body`]
 //!   behind `GpuModel`;
 //! - `program`: the step's walk and its host leg's port;
-//! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps;
+//! - [`body::prefill`]: the prompt fed in batches, bit for bit the steps up
+//!   to a chunk a batch and the mixers' projections on the GEMM past it;
 //! - `body::pair`: the verify of two rows behind `Rows`, bit for bit two
 //!   steps, and its commit over the KDA lanes;
 //! - [`body::nextn`]: the next-token (MTP) layer beside the chain on a NextN
@@ -24,8 +25,7 @@
 //! - `tier`: the expert tier card's side of the routed layers, GLM's
 //!   computation on it and the stage card's handoff and card sum around it;
 //! - [`forced`]: one layer alone on given streams, for the gates;
-//! - [`gemm`]: the prompt batch's Q8_0 projections on the tensor-core GEMM,
-//!   no caller yet but its gate.
+//! - [`gemm`]: the prompt batch's Q8_0 projections on the tensor-core GEMM.
 //!
 //! Built with `cargo oxide`, as the device crates it links are.
 
@@ -46,9 +46,10 @@ pub use body::nextn::{
     nextn_hidden, nextn_logits, nextn_store, nextn_target_streams, nextn_walk,
 };
 pub use body::prefill::{
-    CHUNK, GlmPromptSink, PrefillMode, PromptBytes, StoreDigest, T_MAX, batches_of, call_batches,
-    feed, prefill, prefill_group, prefill_mode, prompt_bytes, prompt_with, set_prefill,
-    set_prefill_group, set_prompt_stats, store_digests, take_prompt_stats,
+    CHUNK, GEMM_FROM, GlmPromptSink, PrefillMode, PromptBytes, RouteTapRows, StoreDigest,
+    StoreRows, T_MAX, batches_of, call_batches, feed, plant_prompt_routes, prefill, prefill_group,
+    prefill_mode, prompt_bytes, prompt_route_taps, prompt_with, set_prefill, set_prefill_group,
+    set_prompt_route_taps, set_prompt_stats, store_digests, store_rows, take_prompt_stats,
 };
 pub use body::{
     Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, NEXTN_ON_TIER, PAIR_ROWS, Plant,
