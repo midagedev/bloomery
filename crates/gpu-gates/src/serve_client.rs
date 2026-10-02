@@ -4,6 +4,7 @@
 //! from its stderr, and one request through curl.
 
 use std::fs::File;
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -95,17 +96,38 @@ impl Drop for Served {
     }
 }
 
-/// One request through curl: the status and the body.
+/// One request through curl: the status and the body. The request body goes
+/// through curl's stdin, not its argv: a prompt of a serving context's ids is
+/// longer than one argument may be (Linux `MAX_ARG_STRLEN`, 128 KiB).
 pub fn curl(url: &str, body: Option<&Value>, stream: bool) -> Result<(u16, String), GateError> {
     let mut c = Command::new("curl");
     c.args(["-sS", "--max-time", "600", "-w", "\n%{http_code}"]);
     if stream {
         c.arg("-N");
     }
-    if let Some(b) = body {
-        c.args(["-H", "Content-Type: application/json", "-d", &b.to_string()]);
+    if body.is_some() {
+        c.args([
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+        ]);
     }
-    let out = c.arg(url).output()?;
+    let mut child = c
+        .arg(url)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("curl {url}: no stdin"))?;
+    if let Some(b) = body {
+        stdin.write_all(b.to_string().as_bytes())?;
+    }
+    drop(stdin);
+    let out = child.wait_with_output()?;
     if !out.status.success() {
         return Err(format!(
             "curl {url}: {} {}",
