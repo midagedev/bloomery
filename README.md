@@ -131,6 +131,15 @@ Every throughput number in this README ran on the A6000: the one-card rows on th
 - **One tier card.** The host tier serves at most one expert tier card today; the N-card structure is in progress.
 - **Qwen3.8** keeps the routed experts past its card share on the CPU, where adaptive residency moves them as it runs. Its MTP draft costs the prompt 3.1 % at P = 512 and 6.1 % at P = 4096 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#q38mtp-wide)).
 
+## Prebuilt release
+
+[bloomery 0.1.0](https://github.com/midagedev/bloomery/releases/tag/v0.1.0) is a Linux x86-64 archive (glibc 2.34+, x86-64-v3, an NVIDIA GPU of compute capability 8.6 or newer) with `bloomery-serve` and `bloomery_serve_clef`; no CUDA toolkit or Rust toolchain is needed:
+
+```sh
+tar -xzf bloomery-0.1.0-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.1.0-linux-x86_64-cuda-sm86
+bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
+```
+
 ## Build
 
 See [`docs/BUILD.md`](docs/BUILD.md): the toolchain, one command block per model (download, build, generate, serve, and `--place gate` on a single RTX 3090), and the CPU flag. In short: Linux x86-64 (the build targets Zen 3), CUDA 13.3, LLVM 21, Clang 21 and `cargo-oxide` from our cuda-oxide fork, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41` and `BLOOMERY_REF_MODEL=<first shard> target/release/generate_ds41 --place gate --tokens 671,6102,294,8760,344`.
