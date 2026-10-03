@@ -4,7 +4,11 @@
 # ref-paths.sh, models/glm5next.sh (the real profile: the arms run at its flags),
 # timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, lcpp-warm.sh, cold-blocks.sh, lever-arms.sh, arm-place.sh, gguf-ranges.py,
 # records.py with generate_glm5next's checked-in schema, the lever registry, and a copy of lease.sh whose lease_take is replaced by a line
-# that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs. The profile keeps a
+# that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs. The fault counter every
+# copy reads (majflt_now, majflt_mark, lcpp_srv_majflt) is a file the stub engines add to when a case
+# makes them fault, so a row is cold exactly where a case says — with the real /proc/vmstat counters the
+# box's ambient page faults (the lease is what keeps them to the arm's process) would tag random arms
+# [cold] on the stubs' ~0.1 s windows, a different case each run. The profile keeps a
 # caller's values, so the two PR trees' llama-bench and generate_glm5next are stub scripts here, their
 # llama-server tools/ref/stub-llama-server.py, and MODEL a path nothing opens — or, for
 # the preheat cases, gguf-ranges.py's two-shard fixture. Every case runs with BLOOMERY_PREHEAT=0 unless
@@ -192,6 +196,17 @@ cp "$ROOT/tools/bloomery/schema/generate_glm5next.jsonl" "$T/tools/bloomery/sche
 FIX=$tmp/fix-00001-of-00002.gguf
 python3 "$ROOT/tools/ref/gguf-ranges.py" fixture "$FIX" || { echo "FAIL setup: gguf-ranges.py fixture"; exit 1; }
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
+# The fault counter: $STUB_MAJFLT, a number the stub engines add to. The cold tag's readers are
+# machine-wide /proc/vmstat counters whose premise is the lease ("the lease keeps it to the arm's
+# process", cold-blocks.sh); this test takes no lease, and the box's ambient page-fault churn would
+# tag random stub arms [cold] on their ~0.1 s windows — the copies read the file instead, so a row is
+# cold exactly where a case says. The stub generate adds to it under STUB_GEN_FAULT, after its fed line.
+# shellcheck disable=SC2016 # the copies expand them when they run
+{
+  echo 'majflt_now() { cat "$STUB_MAJFLT"; }'
+  echo 'majflt_mark() { awk -v f="$1" -v re="$2" -v src="$STUB_MAJFLT" '"'"'!s && re != "" && $0 ~ re { getline l < src; close(src); print l > f; close(f); s = 1 } { print; fflush() }'"'"'; }'
+} >> "$T/tools/ref/cold-blocks.sh"
+echo 'lcpp_srv_majflt() { cat "$STUB_MAJFLT"; }' >> "$T/tools/ref/lcpp-warm.sh"
 touch "$T/Cargo.toml"
 cat > "$T/bin/nvidia-smi" << 'EOF'
 #!/usr/bin/env bash
@@ -290,8 +305,8 @@ cp "$T/pr27752/llama-server" "$T/pr27754/llama-server"
 # summary` record when STUB_GEN_MTP_REC=1; it prints the
 # records a timed run prints, the `fed` line left out under
 # STUB_GEN_NOFED=1; its load record names --ctx (STUB_GEN_LOAD_CTX in its stead), its tokens record token 0
-# STUB_GEN_TOKEN0 (1000 by default) and then the step lines' ids. Under STUB_GEN_FAULT=<file> it takes major faults after its `fed` line (the file
-# written, its pages dropped, then read through a mapping) and times its prompt and steps at 0.01 ms,
+# STUB_GEN_TOKEN0 (1000 by default) and then the step lines' ids. Under STUB_GEN_FAULT=<marker> it adds
+# 100000 to the fault counter after its `fed` line and times its prompt and steps at 0.01 ms,
 # so the row is [cold]; with STUB_GEN_FAULT_ONCE=1 only its first run does.
 G=$T/target/release/generate_glm5next
 # shellcheck disable=SC2016 # ${1:-} is the stub's own argument
@@ -343,18 +358,7 @@ if [ -n "${STUB_GEN_FAULT:-}" ] && { [ -z "${STUB_GEN_FAULT_ONCE:-}" ] || [ ! -e
   pms=0.0100 sms=0.0100
   # after the runner's mark reads the counter at the fed line
   sleep 0.5
-  python3 - "$STUB_GEN_FAULT" << 'PY'
-import mmap, os, sys
-p = sys.argv[1]
-with open(p, "wb") as f:
-    f.write(os.urandom(1 << 20))
-    f.flush()
-    os.fsync(f.fileno())
-fd = os.open(p, os.O_RDONLY)
-os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
-m = mmap.mmap(fd, 0, prot=mmap.PROT_READ)
-sum(m[i] for i in range(0, len(m), 4096))
-PY
+  echo $(($(cat "$STUB_MAJFLT") + 100000)) > "$STUB_MAJFLT"
 fi
 echo "step 0 $((depth - 1)) 12 (the $depth fed steps in 0.1 s, runtime value)"
 echo "time prompt n=$depth ms=$pms tok/s=$((depth * 10)).00 passes=$depth kind=steps"
@@ -381,7 +385,9 @@ stub_run() {
   shift
   while [ "$1" != -- ]; do e+=("$1"); shift; done
   shift
-  (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" BLOOMERY_MODEL=glm5next BLOOMERY_REF_MODEL_PROFILE=glm5next \
+  echo 0 > "$tmp/tmp/stub-majflt"
+  (cd "$T" && env PATH="$T/bin:$PATH" TMPDIR="$tmp/tmp" STUB_MAJFLT="$tmp/tmp/stub-majflt" \
+    BLOOMERY_MODEL=glm5next BLOOMERY_REF_MODEL_PROFILE=glm5next \
     BLOOMERY_REF_MODEL="$tmp/m-00001-of-00006.gguf" BLOOMERY_DATA="$T/data" \
     LCPP27752="$T/pr27752" LCPP27752BIN="$T/pr27752/llama-bench" LCPP27752SRV="$T/pr27752/llama-server" \
     LCPP27754="$T/pr27754" LCPP27754BIN="$T/pr27754/llama-bench" LCPP27754SRV="$T/pr27754/llama-server" \

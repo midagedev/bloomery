@@ -237,8 +237,8 @@ PAIR=${BLOOMERY_GEN_PAIR:-}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 WARMUP=${BLOOMERY_AB_WARMUP:-1}
 PREHEAT=${BLOOMERY_PREHEAT:-1}
-# majflt_mark (the timed window's fault mark) is cold-blocks.sh's; sourced before COLD_US, which this
-# runner keeps at its own value.
+# majflt_now and majflt_mark (the fault counter and the timed window's mark) are cold-blocks.sh's;
+# sourced before COLD_US, which this runner keeps at its own value.
 # shellcheck source=tools/ref/cold-blocks.sh
 source "${BASH_SOURCE[0]%/*}/cold-blocks.sh" || exit 2
 COLD_US=75.4
@@ -822,7 +822,6 @@ guard_timing() {
   witness abort-timing >&2
   exit 75
 }
-majflt() { awk '$1 == "pgmajfault" { print $2 }' /proc/vmstat; }
 strip() { sed 's/\x1b\[[0-9;]*m//g' | tr '\r' '\n'; }
 # cold_col <faults> <timed window, s> [<what the count spans>]: the majflt column, and COLD_TAG when the
 # faults could cost 1 % of the window. The span defaults to the whole process.
@@ -903,7 +902,7 @@ run_arm() {
   arm_cmd "$i"
   witness "pre $tag r$r $label ${dep}"
   ref_witness
-  m0=$(majflt) t0=$(date +%s)
+  m0=$(majflt_now) t0=$(date +%s)
   case ${eng%%+*} in
     lcpp2775[24]srv | lcpp2775[24]srvpp* | lcpp2775[24]mtp)
       srv_start_arm "$i" "$dep"
@@ -922,7 +921,7 @@ run_arm() {
       rc=$?
       ;;
   esac
-  t1=$(date +%s) m1=$(majflt)
+  t1=$(date +%s) m1=$(majflt_now)
   witness "post $tag r$r $label ${dep}"
   guard_cpu "post r$r $label $dep"
   [ "$tag" != ROW ] || {
