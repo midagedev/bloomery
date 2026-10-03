@@ -178,7 +178,6 @@ mod gate {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let trained = split
             .arch_get_u64("context_length")
-            .and_then(|v| u64::try_from(v).ok())
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;
         let props_ctx = |url: &dyn Fn(&str) -> String| -> Result<u64, GateError> {
             let (st, body) = curl(&url("/props"), None, false)?;
