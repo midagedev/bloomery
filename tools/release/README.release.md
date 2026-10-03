@@ -26,9 +26,16 @@ for the experts that stay on the CPU. Source, measurements and the full README: 
 
 ## Run
 
+Without unpacking by hand, the installer fetches the latest release, checks its sha256 and puts a
+`bloomery-serve` symlink into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
+```
+
 On Windows, run this archive inside WSL2 (Ubuntu): `wsl --install` from an administrator PowerShell, reboot, then
 extract and run as below inside the WSL shell — the binaries see the GPU through Windows' driver (tested on an RTX
-3060 12 GB under WSL2, Windows driver 591.86).
+3060 12 GB under WSL2, Windows driver 591.86; the installer runs there too).
 
 ```sh
 tar -xzf bloomery-*-linux-x86_64-cuda-sm86.tar.gz

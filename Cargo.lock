@@ -286,7 +286,7 @@ version = "0.1.0"
 
 [[package]]
 name = "bloomery-serve"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bloomery-gguf",
  "serde_json",

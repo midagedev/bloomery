@@ -12,6 +12,9 @@
 #   - a binary with no embedded sm_86 PTX, or PTX for another target.
 # Usage: tools/release/build.sh <version> <commit>
 #        tools/release/build.sh --check <dir>   (the binary checks alone, on <dir>/<bin>; builds and packs nothing)
+# The tarball and its .sha256 keep the names this script writes ($NAME.tar.gz…): install.sh resolves the release by
+# them and the Homebrew tap's formula pins them, so `gh release upload` must be given the files as named, not copies
+# under other names. The version the tarball carries is the serve crate's, so a release bumps that crate first.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
