@@ -177,11 +177,13 @@
 # later placement over the earlier (bp / a, gate / a), whatever the arms' order or BLOOMERY_GEN_PLACE, so its
 # per-round list is what `tools/ref/card.py verdict` reads for a bp-against-a card. place= on a reference arm, a word outside a|gate|bp, an empty one and place given twice are
 # refused by name before anything runs (tools/ref/arm-place.sh, shared with depth-ds41.sh). Plan (a) loads
-# on the card named A6000, the gate plan on the 3090 (workstation::plan_a, plan_gate), plan (b′) on both
-# (plan_bp: the 3090 the host tier's expert tier). Under one card the arms see the timing card alone, so a
-# placement whose card is not the timing card is refused (64) before the lease, and bp is refused outside
-# the two-card mode. Every ours row names its placement (`place <p>`), one whose SMOKE names another is a
-# FAIL row, and with a place= arm the [config] line has a `placements` line.
+# on the largest visible card (workstation::ALIASES: the binary finds its cards by device — on this box
+# the A6000), the gate plan on the one card named 3090 (plan_gate), plan (b′) on the two largest
+# (plan_bp: the 3090 the host tier's expert tier); the timing card is TIMING_GPU's, timing-card.sh's pick
+# (BLOOMERY_TIMING_GPU overrides), never a name the binary sees. Under one card the arms see the timing
+# card alone, so a placement whose card is not the timing card is refused (64) before the lease, and bp is
+# refused outside the two-card mode. Every ours row names its placement (`place <p>`), one whose SMOKE
+# names another is a FAIL row, and with a place= arm the [config] line has a `placements` line.
 #
 # Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh's mode, depth-ds41.sh's) shows both cards to
 # every ours arm, the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table: every
@@ -395,7 +397,9 @@ T975=$(python3 "${BASH_SOURCE[0]%/*}/tdist.py" "$ROUNDS") || {
   exit 2
 }
 # Each ours arm's placement against the mode and the timing card (tools/ref/arm-place.sh): plan (a) is made
-# for the card named A6000, the gate plan for the 3090, plan (b′) for both in the two-card mode;
+# for the largest visible card (the binary finds its cards by device; on this box the A6000), the gate plan
+# for the one card named 3090, plan (b′) for the two largest in the two-card mode; the timing card is
+# TIMING_GPU's, timing-card.sh's pick (BLOOMERY_TIMING_GPU overrides), never a name the binary sees.
 # BLOOMERY_GEN_PLACE once for the arms that follow it, an arm's place= for that arm.
 PLACE_SEEN=0 PLACES_SET='' PLACE_ARMS=()
 for i in "${!ARMS[@]}"; do
