@@ -28,9 +28,9 @@ DeepSeek-V4.1-Flash `Q3_K_M` on an RTX A6000 and a 32-core CPU: 29.66 tok/s deco
 | [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | [`Q3_K_M`](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF) (vcruz305) | GPU + CPU experts; `generate_ds41`, `bloomery-chat`, `bloomery-serve --model ds41` |
 | [GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts; sparse attention past 2,051 positions; `generate_glm5next`, `bloomery-serve --model glm` |
 | [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (unsloth) | GPU + CPU experts; `generate_qwen3moe`, `bloomery-serve --model qwen38` |
-| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole model on one GPU; `generate_qwen3moe`, `bloomery-serve --model qwen3` |
-| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole model on one GPU; `generate_qwen3moe`, `bloomery-serve --model qwen3` |
-| [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) (Cloudflare, a decision model) | [`Q8_0` to `Q3_K_S`](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF) (bartowski: the Q8_0 file and eleven K-quant files), and the release's head file ([how](docs/BUILD.md#clef-flash)) | whole model on one GPU, its head on the CPU; `bloomery_serve_clef` (`POST /v1/systemone`) |
+| [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole on one GPU, or `--place a` with routed experts on the CPU for a 12-16 GB card; `generate_qwen3moe`, `bloomery-serve --model qwen3` |
+| [Qwen3-30B-A3B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507) | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole on one GPU, or `--place a` with routed experts on the CPU for a 12-16 GB card; `generate_qwen3moe`, `bloomery-serve --model qwen3` |
+| [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) (Cloudflare, a decision model) | [`Q8_0` to `Q3_K_S`](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF) (bartowski: the Q8_0 file and eleven K-quant files), and the release's head file ([how](docs/BUILD.md#clef-flash)) | whole model on one GPU, its head on the CPU; the decide seat of `bloomery-serve` (`--head`, or `--hf bartowski/Cloudflare_clef-flash-GGUF:<quant>`; `POST /v1/systemone`) |
 | [DeepSeek-V2-Lite-Chat](https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat) | [`Q3_K_M`](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) (mradermacher) | CPU or GPU; the first model, still gated |
 
 Each file is the public upload as downloaded. For GLM-5.3, Qwen3.8 and Qwen3.6 the files were checked against the uploads on 2026-09-28 (every shard's size, the first shard's sha256); the others have no recorded sha256 check yet. Clef-Flash also needs its joint schema head, `joint_head.safetensors`, from Cloudflare's release.
@@ -126,17 +126,17 @@ Every throughput number in this README ran on the A6000: the one-card rows on th
 - **sm_86 only.** The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remote workstation; [`docs/BUILD.md`](docs/BUILD.md) gives the direct commands for your own host.
 - **A pinned nightly** (`nightly-2026-08-28`) with a pinned cuda-oxide revision from our fork, where fixes wait for upstream (`THIRD_PARTY_NOTICES.md`).
 - **V4.1 prompts are bound by the CPU expert tier**: the host experts are most of each layer-batch.
-- **One request at a time** in every server, one slot each.
+- **Concurrency**: the ds41, glm and qwen3 seats take `--parallel N` (two by default) on one model, requests alternating in 64-token turns; the qwen38 and decide seats serve one request at a time (Qwen3.8's MTP draft does not rejoin a turn yet, and DSpark drafts never do -- `--parallel > 1` with `BLOOMERY_DRAFT=dspark` is refused by name).
 - **Clef** takes text states only (no images or video), reads backbone weights of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 (not yet the IQ types, Q2_K, Q4_0 or Q4_1), and runs its head on the CPU.
 - **One tier card.** The host tier serves at most one expert tier card today; the N-card structure is in progress.
 - **Qwen3.8** keeps the routed experts past its card share on the CPU, where adaptive residency moves them as it runs. Its MTP draft costs the prompt 3.1 % at P = 512 and 6.1 % at P = 4096 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#q38mtp-wide)).
 
 ## Prebuilt release
 
-[bloomery 0.1.0](https://github.com/midagedev/bloomery/releases/tag/v0.1.0) is a Linux x86-64 archive (glibc 2.34+, x86-64-v3, an NVIDIA GPU of compute capability 8.6 or newer) with `bloomery-serve` and `bloomery_serve_clef`; no CUDA toolkit or Rust toolchain is needed:
+[bloomery 0.2.0](https://github.com/midagedev/bloomery/releases/tag/v0.2.0) is a Linux x86-64 archive (glibc 2.34+, x86-64-v3, an NVIDIA GPU of compute capability 8.6 or newer) with `bloomery-serve` alone -- every seat in one binary, the model file's architecture picking it; no CUDA toolkit or Rust toolchain is needed:
 
 ```sh
-tar -xzf bloomery-0.1.0-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.1.0-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.2.0-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.0-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 

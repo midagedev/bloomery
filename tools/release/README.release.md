@@ -7,7 +7,7 @@ for the experts that stay on the CPU. Source, measurements and the full README: 
 
 | File | What it serves |
 |---|---|
-| `bin/bloomery-serve` | llama-server's HTTP API (`/v1/chat/completions`, `/completion`, streaming): DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B; and, given a decision model's head, Cloudflare Clef-Flash's SystemOne API (`POST /v1/systemone`) |
+| `bin/bloomery-serve` | every seat in one binary (the model file's architecture picks it; `--help` lists them): llama-server's HTTP API (`/v1/chat/completions`, `/completion`, streaming) for DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B, and Cloudflare Clef-Flash's SystemOne API (`POST /v1/systemone`) as its decide seat |
 
 ## Requirements
 
@@ -21,7 +21,7 @@ for the experts that stay on the CPU. Source, measurements and the full README: 
   start then recompiles and takes minutes.
 - What fits where:
   - Clef-Flash: run on a 12 GB card with the `Q3_K_S` file (4.26 GB); the files run from 4.26 GB (`Q3_K_S`) to 9.55 GB (`Q8_0`).
-  - Qwen3-30B-A3B and Qwen3.6-35B-A3B at `Q4_K_M`: a 24 GB card; the whole model sits on device 0.
+  - Qwen3-30B-A3B and Qwen3.6-35B-A3B at `Q4_K_M`: a 24 GB card whole on device 0, or a 12-16 GB card with `--place a` (the routed experts on the CPU; the server plans the split itself when the file does not fit the card's free bytes).
   - V4.1, GLM-5.3, Qwen3.8 (their experts partly on the CPU): a 24–48 GB card and a host with 256 GB of RAM.
 
 ## Run
@@ -54,6 +54,8 @@ Downloads go to `~/.cache/bloomery/hf` (`BLOOMERY_CACHE` overrides it). A gated 
 `~/.cache/huggingface/token`.
 
 ## Cards
+
+The ds41, glm and qwen3 seats take `--parallel N` (two by default): requests alternate in 64-token turns on one model, and a lone request pays nothing for the second slot. A plan that cannot fit the card's free bytes is refused by name with its terms and the processes holding the card.
 
 `--place` picks the cards for the models with CPU experts: `a` runs the model on the visible card with the most memory,
 `bp` adds the next card as an expert tier, and `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` makes it `nvidia-smi`'s numbering). The single-card models run on
