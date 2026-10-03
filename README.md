@@ -33,7 +33,8 @@ Where it ends today: one model a server, sm_86+ GPUs, and the seats' own default
 
 Prebuilt, one binary, no CUDA toolkit and no Rust toolchain — Linux x86-64 with AVX2/FMA (x86-64-v3), glibc
 2.34+, an NVIDIA GPU of compute capability 8.6 or newer and its driver. On Windows, run it inside WSL2
-(`wsl --install`, reboot, then the same commands in the WSL shell).
+(`wsl --install`, reboot, then the same commands in the WSL shell). What each model needs in GPU, RAM and
+disk: [Hardware](#hardware).
 
 ```sh
 tar -xzf bloomery-0.2.0-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.0-linux-x86_64-cuda-sm86
@@ -190,16 +191,29 @@ over the last 16 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2
 
 ## Hardware
 
-| | Minimum | Extended |
-|---|---|---|
-| GPU | 12 GB, compute capability 8.6+ | a 24 GB card, or two cards (`--place bp`) |
-| CPU | AVX2/FMA (x86-64-v3) | 32 cores, 8 DDR4 channels |
-| RAM | 32 GB (whole-card Qwens on a 24 GB GPU) | 256 GB (GPU + CPU experts) |
+**Required of every host**: an NVIDIA GPU of compute capability 8.6 or newer and its driver; a CPU with AVX2
+and FMA (the prebuilt archive targets x86-64-v3); glibc 2.34+; Linux, or Windows through WSL2. NVMe is
+recommended — a load streams the file to the card, and V4.1 reads its engram table from disk as it runs.
 
-Cards are found by device, not by name; a list word such as `0+1` names cards by CUDA index
-(`CUDA_DEVICE_ORDER=PCI_BUS_ID` matches `nvidia-smi`'s numbering). The development machine is a Threadripper
-PRO 5975WX with an RTX A6000 and an RTX 3090; only those cards have been run. Hardware costs per part:
-[`docs/HARDWARE.md`](docs/HARDWARE.md).
+**What each model needs:**
+
+| Model | GPU | Host RAM | Disk (the file) |
+|---|---|---|---|
+| Clef-Flash | 12 GB covers every quantization (the files run 4.26–9.55 GB) | any | 4.3–9.6 GB, plus the head (243 MB, fetched) |
+| Qwen3.6-35B `Q4_K_M` | 24 GB whole, or 12–16 GB with `--place a` | 32 GB whole; about 10 GB free beside a small card | 21.2 GB |
+| Qwen3-30B `Q4_K_M` | 24 GB whole, or 12–16 GB with `--place a` | 32 GB whole; about 8 GB free beside a small card | 18.6 GB |
+| Qwen3.8-Flash-Next | 24 GB recommended (the expert share sizes to the card's free bytes) | 256 GB | 111.3 GB, plus the 2.8 GB MTP draft |
+| GLM-5.3-Flash | 24 GB recommended | 256 GB | 199.7 GB |
+| DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB | 347.3 GB, plus 155.7 GB for the optional r8 sidecar |
+
+**Recommended** (the configuration every number in this README ran on): a 32-core AVX2 CPU with 8 DDR4
+channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for `--place bp`. Cards are found
+by device, not by name; a list word such as `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID`
+matches `nvidia-smi`'s numbering).
+
+Only the A6000, the 3090, and an RTX 3060 12 GB under WSL2 (running Clef-Flash, its download and its cache)
+have been run; other cards and drivers are untested — please open an issue with `--version` and the error
+text. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
 ## Limits
 
