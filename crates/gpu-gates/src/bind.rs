@@ -41,6 +41,7 @@ use std::thread::JoinHandle;
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId};
 use model::placement::{Device, ModelTensors, Plan, Role};
+use runtime::seqstate::HOST_BUDGET;
 use sampler::{Sampler, SamplerParams};
 use serve::{
     CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, ModelProps,
@@ -353,6 +354,97 @@ pub fn nvidia_smi_index(name: &str, device: Option<DeviceId>) -> Result<u32, Str
         return Err(format!("nvidia-smi: {}", out.status));
     }
     workstation::listed_index(name, device, &census, &String::from_utf8_lossy(&out.stdout))
+}
+
+/// The most the prompt cache takes by default: llama-server's `--cache-ram`
+/// default.
+pub const CACHE_RAM_CAP: u64 = 8192 << 20;
+
+/// The prompt cache's budget of a seat whose saved states live in host RAM
+/// beside a load's host set (llama-server's `--cache-ram`, in MiB; 0 turns
+/// it off), and its terms: set, as given; else the lesser of
+/// [`CACHE_RAM_CAP`] and half of what `MemAvailable` leaves past the plan's
+/// host need, the residency's churn pool and the checkpoints' host budget
+/// ([`HOST_BUDGET`]), 0 when nothing is left.
+pub struct CacheRam {
+    pub ram: u64,
+    /// `--cache-ram` given, or the default's terms.
+    pub set: bool,
+    /// `MemAvailable` before the load.
+    pub available: u64,
+    /// The plan's host need.
+    pub need: u64,
+    /// The residency's churn pool, 0 without one.
+    pub pool: u64,
+}
+
+impl CacheRam {
+    /// `--cache-ram`'s value, `mib` MiB, in bytes; refused by name past u64.
+    pub fn parse_mib(mib: &str) -> Result<u64, GateError> {
+        let n: u64 = mib.parse()?;
+        Ok(n.checked_mul(1 << 20)
+            .ok_or_else(|| format!("--cache-ram {n} MiB passes u64 bytes"))?)
+    }
+
+    /// The budget (the type's doc): `set` in bytes as given, else the
+    /// default over `need` and `pool`.
+    pub fn of(set: Option<u64>, need: u64, pool: u64) -> Result<CacheRam, GateError> {
+        let available = workstation::host_available()?;
+        let ram = set.unwrap_or_else(|| {
+            let left = i128::from(available)
+                - i128::from(need)
+                - i128::from(pool)
+                - i128::from(HOST_BUDGET);
+            u64::try_from((left / 2).max(0)).map_or(CACHE_RAM_CAP, |h| h.min(CACHE_RAM_CAP))
+        });
+        Ok(CacheRam {
+            ram,
+            set: set.is_some(),
+            available,
+            need,
+            pool,
+        })
+    }
+
+    /// The parked states' budget of `n` slots that take one model in turns
+    /// (`serve::SwapEngine`): `set` (`--park-ram`) as given, else the lesser
+    /// of [`CACHE_RAM_CAP`] and what `MemAvailable` leaves past the plan's
+    /// host need, the churn pool, the checkpoints' host budget and the prompt
+    /// cache's budget; refused by name when that leaves nothing.
+    pub fn park(&self, set: Option<u64>, n: usize) -> Result<u64, GateError> {
+        if let Some(b) = set {
+            return Ok(b);
+        }
+        let left = i128::from(self.available)
+            - i128::from(self.need)
+            - i128::from(self.pool)
+            - i128::from(HOST_BUDGET)
+            - i128::from(self.ram);
+        match u64::try_from(left) {
+            Ok(b) if b > 0 => Ok(b.min(CACHE_RAM_CAP)),
+            _ => Err(format!(
+                "--parallel {n}: MemAvailable {} B less the plan's host need {} B, the churn \
+                 pool {} B, the checkpoints {HOST_BUDGET} B and the prompt cache {} B leaves no \
+                 room to park a slot's state; give --park-ram MIB or a smaller --cache-ram",
+                self.available, self.need, self.pool, self.ram
+            )
+            .into()),
+        }
+    }
+
+    /// The `cache` line's terms, the seat's own fields to follow: `cache
+    /// ram=… rule=set|default available=… need=… pool=… checkpoints=…`.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "cache ram={} rule={} available={} need={} pool={} checkpoints={HOST_BUDGET}",
+            self.ram,
+            if self.set { "set" } else { "default" },
+            self.available,
+            self.need,
+            self.pool
+        )
+    }
 }
 
 /// What the engine thread is asked to do.

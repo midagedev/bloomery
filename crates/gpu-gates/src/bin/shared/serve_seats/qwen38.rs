@@ -67,7 +67,7 @@
 //! positions, the recurrent stores at the held position and at the last
 //! prompt call's end, each with its PLE history (`Seq38`). A returning
 //! session's state comes back whole, and its checkpoints are those two
-//! points. Its default is the lesser of [`CACHE_RAM_CAP`] and half of what
+//! points. Its default is the lesser of `bind::CACHE_RAM_CAP` and half of what
 //! `MemAvailable` leaves at load past the plan's host need, the residency's
 //! churn pool and the checkpoints' host budget; a `cache` line on stderr
 //! prints it with each term. A state of another model, card or context is
@@ -175,7 +175,8 @@ use bloomery_gpu::arch::qwen3moe::{
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
+    CacheRam, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
+    sampler_factory,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -194,12 +195,11 @@ use model::arch::qwen35moe::place::{
     Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
 };
 use model::placement::churn::ChurnPool;
-use model::placement::workstation::{CardSpec, HostNeed, MARGIN, host_available};
+use model::placement::workstation::{CardSpec, HostNeed, MARGIN};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
-use runtime::seqstate::HOST_BUDGET;
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
     Server, ServerConfig,
@@ -236,10 +236,6 @@ const CTX: usize = 4096;
 
 /// The default context is a multiple of this many positions.
 const CTX_STEP: usize = 256;
-
-/// The most the prompt cache takes by default: llama-server's
-/// `--cache-ram` default.
-const CACHE_RAM_CAP: u64 = 8192 << 20;
 
 /// The token every message of the chat template opens with: a prompt call is
 /// cut at the first and the last inside it.
@@ -754,54 +750,6 @@ impl Ctx38 {
     }
 }
 
-/// The prompt cache's budget (the module doc) and its terms.
-struct CacheRam {
-    ram: u64,
-    /// `--cache-ram`, or the default's terms: `MemAvailable`, the plan's
-    /// host need, the churn pool, the checkpoints' host budget.
-    set: bool,
-    available: u64,
-    need: u64,
-    pool: u64,
-}
-
-impl CacheRam {
-    /// `set` as given, else the lesser of [`CACHE_RAM_CAP`] and half of what
-    /// `MemAvailable` leaves past `need`, `pool` and the checkpoints' host
-    /// budget (`runtime::seqstate::HOST_BUDGET`), 0 when nothing is left.
-    fn of(set: Option<u64>, need: u64, pool: u64) -> Result<CacheRam, GateError> {
-        let available = host_available()?;
-        let ram = set.unwrap_or_else(|| {
-            let left = i128::from(available)
-                - i128::from(need)
-                - i128::from(pool)
-                - i128::from(HOST_BUDGET);
-            u64::try_from((left / 2).max(0)).map_or(CACHE_RAM_CAP, |h| h.min(CACHE_RAM_CAP))
-        });
-        Ok(CacheRam {
-            ram,
-            set: set.is_some(),
-            available,
-            need,
-            pool,
-        })
-    }
-
-    /// The `cache` line on stderr, with the message start prompt calls are
-    /// cut at and whether the vocabulary and the template have it.
-    fn print(&self, start: &str, in_vocab: bool, in_template: bool) {
-        eprintln!(
-            "cache ram={} rule={} available={} need={} pool={} checkpoints={HOST_BUDGET} \
-             message_start={start} in_vocab={in_vocab} in_template={in_template}",
-            self.ram,
-            if self.set { "set" } else { "default" },
-            self.available,
-            self.need,
-            self.pool
-        );
-    }
-}
-
 struct Args {
     host: String,
     port: u16,
@@ -843,13 +791,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--place" => a.place = Place38::parse(v)?,
             "--ctx-size" | "--ctx" => a.ctx = Some(v.parse()?),
             "--alias" => a.alias = Some(v.to_owned()),
-            "--cache-ram" => {
-                let mib: u64 = v.parse()?;
-                a.cache_ram = Some(
-                    mib.checked_mul(1 << 20)
-                        .ok_or_else(|| format!("--cache-ram {mib} MiB passes u64 bytes"))?,
-                );
-            }
+            "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(v)?),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
@@ -970,7 +912,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let cache = CacheRam::of(a.cache_ram, need, pool)?;
     let rule = rule.host_bound(&inputs, cache.ram)?;
     rule.print();
-    cache.print(MESSAGE_START, has_start, in_template);
+    eprintln!(
+        "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
+        cache.line()
+    );
     if mtp {
         let be = BreakEven::of(a.place);
         eprintln!(

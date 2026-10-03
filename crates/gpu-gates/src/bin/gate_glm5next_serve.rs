@@ -6,7 +6,8 @@
 //!     gate_glm5next_serve --arm plain|drafted --dir <out>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
-//! 127.0.0.1 --port 0 --place gate --ctx 2048`, its levers set here), reads
+//! 127.0.0.1 --port 0 --place gate --ctx 2048 --slot-save-path /tmp`, its
+//! levers set here), reads
 //! its address from its stderr, waits for `/health`, takes the prompt of one
 //! chat turn ([`CHAT`]) as the server renders it (`/apply-template`, then
 //! `/tokenize` of that text without BOS: the ids `/v1/chat/completions`
@@ -40,6 +41,11 @@
 //!   `BLOOMERY_PREFILL_GROUP` unset, print `group=` the group the plan
 //!   reserves the prompt units for (`place::PROMPT_GROUP`);
 //! - `POST /residency/reset` is the server's 501 (no machine);
+//! - `cache` ([`cache`]): two sessions through the prompt cache, A's state
+//!   saved when B takes the slot and put back when A returns — every held
+//!   position kept and the ids of the same requests with no switch, and a
+//!   resend that shares only A's turn keeps the checkpoint the state carried
+//!   there, with the no-switch run's ids;
 //! - then a third load, the server under `BLOOMERY_DRAFT=mtp
 //!   BLOOMERY_RESIDENCY=off`: it prints `load draft=mtp` and no `residency
 //!   host`, the same `/completion` carries the draft's counts, and its ids
@@ -49,7 +55,9 @@
 //!   draft, and its ids are the plain CLI's too. Green-only for the row's
 //!   read: the NextN walk writes no row of the target's head, so a `step_row`
 //!   left at the default reads the same row; the clause holds the sampled
-//!   path's ids end to end. Exact: with no residency nothing
+//!   path's ids end to end; and `cache` again under the draft, where the
+//!   draft also rejoins A where A left it, its counts the no-switch run's.
+//!   Exact: with no residency nothing
 //!   moves between the host and the card, every kept token is the target's
 //!   own argmax, and a verify's rows are its steps' bits — the window's
 //!   wiring end to end, which the drafted arm's clause holds only up to the
@@ -78,6 +86,13 @@
 //!   history lands the same flips at the same passes, so two runs of it are
 //!   bit for bit);
 //! - the chat turn at temperature 0 drafts (`draft_n` above 0);
+//! - a state put back runs on the slot map as it stands
+//!   ([`resume_under_residency`]): kept whole, its passes logged, the draft
+//!   rejoining;
+//! - a decode preempted mid-run on `--parallel 2` is put back the same way
+//!   ([`swap_rejoins_the_draft`]): both requests answer their solo runs' ids,
+//!   their drafts run and skip nothing, the switches counter moved and the
+//!   second request came back before the first;
 //! - against the CLI under the same levers: the ids agree through the first
 //!   pass whose boundary landed a flip in either run, by their `residency
 //!   pass` records. Not the whole run: the server's prompt call stops one id
@@ -119,7 +134,9 @@ mod gate {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -127,6 +144,7 @@ mod gate {
     use model::arch::glm5next::place::{NextnInputs, PROMPT_GROUP, PlanInputs};
     use model::placement::{PlanLevers, workstation};
     use serde_json::{Value, json};
+    use threads::helper::{Placement, spawn_helper};
 
     /// The levers the seat acts on — the same list `serve_seats::glm`
     /// parses, kept one with it: this gate starts the server with its own
@@ -146,8 +164,9 @@ mod gate {
 
     /// The stores both engines size, the seat's and the CLI's default.
     const CTX: usize = 2048;
-    /// The server's arguments after its path.
-    const SERVER_ARGS: [&str; 10] = [
+    /// The server's arguments after its path. The slot actions need a save
+    /// directory; the gate asks only for `erase`, which writes nothing.
+    const SERVER_ARGS: [&str; 12] = [
         "--model",
         "glm",
         "--host",
@@ -158,14 +177,32 @@ mod gate {
         "gate",
         "--ctx",
         "2048",
+        "--slot-save-path",
+        "/tmp",
     ];
     /// The load takes a minute or two; the bound is 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
     /// The greedy requests' length, the CLI's `-n`.
     const N_PREDICT: usize = 16;
+    /// The swap clause's requests: the first long enough to be preempted
+    /// mid-decode, the second short enough to come back before it.
+    const SWAP_A_PREDICT: usize = 48;
+    const SWAP_B_PREDICT: usize = 8;
+    /// The swap clause's `/slots` poll while it waits for the first request's
+    /// decode.
+    const SWAP_POLL: Duration = Duration::from_millis(300);
     /// The one chat turn.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
+    /// The `cache` clause's sessions: A's first turn, B's turn, the text A
+    /// sends after its reply, and the text A resends in place of its reply
+    /// (its first id is not the reply's).
+    const TURN_A: &str = "Name three rivers that flow through Germany and say in one sentence \
+                          which of them is the longest.";
+    const TURN_B: &str = "Write a haiku about a lighthouse in winter.";
+    const LATER_A: &str = " And which of them reaches the sea first?";
+    const STRIPPED_A: &str = "Rhine, Danube and Elbe; the Danube is the longest. And which of \
+                              them reaches the sea first?";
     /// The drafted arm's residency word: no seed expert pinned, one spare a
     /// layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
@@ -673,7 +710,424 @@ mod gate {
             "draft_only_top1_sample_is_the_plain_generate_glm5next",
             k1["timings"].get("draft_n").is_none() && agree(&sampled, &k1_stop, reference),
         );
+        ok &= cache(&url, &err_log, true)?;
         println!("draft-only server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
+    /// The ids of `messages` as the server's chat template renders them
+    /// (`/apply-template`, then `/tokenize` without BOS).
+    fn rendered(url: &dyn Fn(&str) -> String, messages: Value) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(
+            &url("/apply-template"),
+            Some(&json!({ "messages": messages })),
+            false,
+        )?;
+        let text = json_of("/apply-template", st, &body)?["prompt"]
+            .as_str()
+            .ok_or("/apply-template: no prompt")?
+            .to_owned();
+        tokenized(url, &text)
+    }
+
+    /// `/tokenize` of `text` without BOS.
+    fn tokenized(url: &dyn Fn(&str) -> String, text: &str) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(
+            &url("/tokenize"),
+            Some(&json!({ "content": text, "add_special": false })),
+            false,
+        )?;
+        Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
+    }
+
+    /// The slot dropped and not saved (`POST /slots/0?action=erase`): the
+    /// prompt cache keeps what it held, and nothing more.
+    fn erase(url: &dyn Fn(&str) -> String) -> Result<(), GateError> {
+        let (st, body) = curl(&url("/slots/0?action=erase"), Some(&json!({})), false)?;
+        json_of("/slots/0?action=erase", st, &body)?;
+        Ok(())
+    }
+
+    /// One greedy request of the `cache` clause as the clause reads it: its
+    /// ids, `cache_n`, the draft's counts and stop, and the server's lines it
+    /// printed (`cache` notes, `mtp prompt` records, `residency pass`
+    /// records).
+    struct Turn {
+        tokens: Vec<u32>,
+        cache_n: u64,
+        draft_n: u64,
+        accepted: u64,
+        stop: String,
+        lines: Vec<String>,
+    }
+
+    impl Turn {
+        fn run(
+            url: &dyn Fn(&str) -> String,
+            err_log: &Path,
+            ids: &[u32],
+            cache: bool,
+        ) -> Result<Turn, GateError> {
+            let from = lines_from(err_log, 0)?.len();
+            let c = greedy(url, ids, N_PREDICT, cache)?;
+            let t = &c["timings"];
+            Ok(Turn {
+                tokens: ids_of(&c["tokens"]),
+                cache_n: t["cache_n"].as_u64().unwrap_or(u64::MAX),
+                draft_n: t["draft_n"].as_u64().unwrap_or(0),
+                accepted: t["draft_n_accepted"].as_u64().unwrap_or(0),
+                stop: c["stop_type"].as_str().unwrap_or("").to_owned(),
+                lines: lines_from(err_log, from)?,
+            })
+        }
+
+        fn show(&self, what: &str) {
+            let picked: Vec<&String> = self
+                .lines
+                .iter()
+                .filter(|l| l.contains(" cache ") || l.starts_with("mtp prompt "))
+                .collect();
+            println!(
+                "{what}: tokens {:?} stop={} cache_n={} draft_n={} accepted={} lines {picked:?}",
+                self.tokens, self.stop, self.cache_n, self.draft_n, self.accepted
+            );
+        }
+
+        /// The `cache load` note this request printed: a state put back.
+        fn loaded(&self) -> Option<&str> {
+            self.lines
+                .iter()
+                .find(|l| l.contains(": cache load "))
+                .map(String::as_str)
+        }
+
+        /// The `mtp prompt` records this request printed that say the draft
+        /// skips.
+        fn skips(&self) -> usize {
+            self.lines
+                .iter()
+                .filter(|l| l.starts_with("mtp prompt ") && !l.ends_with(" skipped=none"))
+                .count()
+        }
+    }
+
+    /// The `cache` clause on one server (`drafted`: its MTP draft runs; the
+    /// residency off, so a sequence's bits are its own): session A's first
+    /// turn fed fresh, B's turn, then A again — its state saved when B took
+    /// the slot (`glm5next::seq_save`) and put back (`seq_resume`) — against
+    /// the same requests with no switch between, run first:
+    /// - (a) A's turn, its reply and a later text: it keeps every position A
+    ///   held (a `cache load` note, `cache_n` the run with no switch's), and
+    ///   its ids are that run's; under the draft the draft rejoins where A
+    ///   left it — no `mtp prompt` record says it skips (the parked rows and
+    ///   the NextN store's positions came back), it drafts and accepts, and
+    ///   its counts are that run's: counts, which hold the store's and the
+    ///   arena rows' bits only as far as a moved proposal moves an accept;
+    /// - (b) A's turn with another text in place of its reply, so the shared
+    ///   prefix ends at the turn: it keeps the checkpoint at the turn's
+    ///   prompt call's end (the point the state carried), and its ids are the
+    ///   run with no switch's, which cut to the model's own checkpoint there.
+    ///
+    /// Mutants: the state carrying no point ((b) keeps nothing); the KDA
+    /// stores zeroed after the put-back ((a)'s ids move); the latent rows
+    /// zeroed after it ((a)'s and (b)'s ids move); the seat's rule granting
+    /// nothing of a saved state (no `cache load`: (a) and (b) keep nothing);
+    /// under the draft its side not put back (the draft skips by name).
+    fn cache(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        drafted: bool,
+    ) -> Result<bool, GateError> {
+        let label = if drafted { "drafted" } else { "plain" };
+        let p1 = rendered(url, json!([{ "role": "user", "content": TURN_A }]))?;
+        let pb = rendered(url, json!([{ "role": "user", "content": TURN_B }]))?;
+        let later = tokenized(url, LATER_A)?;
+        let stripped = tokenized(url, STRIPPED_A)?;
+        let with = |a: &[u32], b: &[u32], c: &[u32]| -> Vec<u32> {
+            a.iter().chain(b).chain(c).copied().collect()
+        };
+        let mut ok = true;
+
+        // (a) with no switch, then the slot dropped unsaved, so no cached
+        // state holds A when the switched run asks for it.
+        let r1 = Turn::run(url, err_log, &p1, false)?;
+        r1.show(&format!("cache {label}: A's turn fresh"));
+        if r1.stop != "limit" || r1.tokens.len() != N_PREDICT {
+            return Err(format!(
+                "the cache clause's A turn stopped at {} tokens ({}): the clause needs {N_PREDICT}",
+                r1.tokens.len(),
+                r1.stop
+            )
+            .into());
+        }
+        let resend = with(&p1, &r1.tokens, &later);
+        let r2 = Turn::run(url, err_log, &resend, true)?;
+        r2.show(&format!("cache {label}: A resent, no switch"));
+        erase(url)?;
+        let a1 = Turn::run(url, err_log, &p1, false)?;
+        a1.show(&format!("cache {label}: A's turn fresh again"));
+        let b1 = Turn::run(url, err_log, &pb, true)?;
+        b1.show(&format!("cache {label}: B's turn"));
+        let a2 = Turn::run(url, err_log, &resend, true)?;
+        a2.show(&format!("cache {label}: A resent after B"));
+        let least = (p1.len() + N_PREDICT - 1) as u64;
+        check(
+            &mut ok,
+            &format!("cache_{label}_a_keeps_every_held_position_after_the_switch"),
+            a1.tokens == r1.tokens
+                && !b1.tokens.is_empty()
+                && a2.loaded().is_some()
+                && r2.loaded().is_none()
+                && a2.cache_n == r2.cache_n
+                && a2.cache_n >= least,
+        );
+        check(
+            &mut ok,
+            &format!("cache_{label}_a_ids_are_the_run_with_no_switch"),
+            !a2.tokens.is_empty() && a2.tokens == r2.tokens,
+        );
+        if drafted {
+            check(
+                &mut ok,
+                "cache_drafted_a_draft_rejoins_where_a_left_it",
+                a2.skips() == 0
+                    && r2.skips() == 0
+                    && a2.draft_n > 0
+                    && a2.accepted > 0
+                    && (a2.draft_n, a2.accepted) == (r2.draft_n, r2.accepted),
+            );
+        }
+
+        // (b): the shared prefix ends at the turn, a checkpoint the prompt
+        // call took at its end (the turn less its last id, which the first
+        // step feeds).
+        if stripped.first() == r1.tokens.first() {
+            return Err(format!(
+                "the replacement text's first id {:?} is the reply's: the shared prefix would not \
+                 end at the turn",
+                stripped.first()
+            )
+            .into());
+        }
+        let strip = with(&p1, &stripped, &[]);
+        erase(url)?;
+        let c1 = Turn::run(url, err_log, &p1, false)?;
+        let s1 = Turn::run(url, err_log, &strip, true)?;
+        s1.show(&format!("cache {label}: A's turn replaced, no switch"));
+        erase(url)?;
+        let c2 = Turn::run(url, err_log, &p1, false)?;
+        let b2 = Turn::run(url, err_log, &pb, true)?;
+        let s2 = Turn::run(url, err_log, &strip, true)?;
+        s2.show(&format!("cache {label}: A's turn replaced after B"));
+        let turn_end = p1.len() as u64 - 1;
+        check(
+            &mut ok,
+            &format!("cache_{label}_b_keeps_the_turns_end"),
+            c1.tokens == r1.tokens
+                && c2.tokens == r1.tokens
+                && !b2.tokens.is_empty()
+                && s2.loaded().is_some()
+                && s1.cache_n == turn_end
+                && s2.cache_n == turn_end,
+        );
+        check(
+            &mut ok,
+            &format!("cache_{label}_b_ids_are_the_run_with_no_switch"),
+            !s2.tokens.is_empty() && s2.tokens == s1.tokens,
+        );
+        Ok(ok)
+    }
+
+    /// Under the residency, a state put back runs on the slot map as it
+    /// stands (the state carries none): A's turn, B's, A resent — put back (a
+    /// `cache load` note), every held position kept, its passes printing
+    /// their `residency pass` records, and the draft rejoining (no `mtp
+    /// prompt` record says it skips, and it drafts). Its ids are printed, not
+    /// held: B's passes land flips, and a flip moves an expert between the
+    /// host and the card, whose sums round another way. Mutant: the draft's
+    /// side not put back (the draft skips by name).
+    fn resume_under_residency(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+    ) -> Result<bool, GateError> {
+        let p1 = rendered(url, json!([{ "role": "user", "content": TURN_A }]))?;
+        let pb = rendered(url, json!([{ "role": "user", "content": TURN_B }]))?;
+        let later = tokenized(url, LATER_A)?;
+        let a1 = Turn::run(url, err_log, &p1, false)?;
+        a1.show("residency resume: A's turn fresh");
+        let b1 = Turn::run(url, err_log, &pb, true)?;
+        b1.show("residency resume: B's turn");
+        let resend: Vec<u32> = p1.iter().chain(&a1.tokens).chain(&later).copied().collect();
+        let a2 = Turn::run(url, err_log, &resend, true)?;
+        a2.show("residency resume: A resent after B");
+        let a2_passes = passes(&a2.lines);
+        println!("residency resume: A resent's passes (kind, kept, landed) {a2_passes:?}");
+        let mut ok = true;
+        check(
+            &mut ok,
+            "drafted_resume_runs_on_the_map_as_it_stands",
+            a1.tokens.len() == N_PREDICT
+                && !b1.tokens.is_empty()
+                && a2.loaded().is_some()
+                && a2.cache_n >= (p1.len() + N_PREDICT - 1) as u64
+                && !a2.tokens.is_empty()
+                && !a2_passes.is_empty()
+                && a2.skips() == 0
+                && a2.draft_n > 0,
+        );
+        Ok(ok)
+    }
+
+    /// `/metrics`' `llamacpp:<name>` value; `None` when it carries none.
+    fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
+        let (st, body) = curl(&url("/metrics"), None, false)?;
+        if st != 200 {
+            return Err(format!("/metrics: HTTP {st}: {body}").into());
+        }
+        let key = format!("llamacpp:{name} ");
+        Ok(body
+            .lines()
+            .find_map(|l| l.strip_prefix(&key))
+            .and_then(|v| v.trim().parse().ok()))
+    }
+
+    /// The swap clause (module header) on a server of two slots started into
+    /// `<dir>/swap`: a decode preempted mid-run is put back with its draft
+    /// rejoining, so both requests answer their solo runs' ids, their drafts
+    /// run and skip nothing while they take turns (the proposal count rides
+    /// the map as it stands at the resume, so it is not the solo run's).
+    fn swap_rejoins_the_draft(dir: &Path) -> Result<bool, GateError> {
+        let dir = dir.join("swap");
+        std::fs::create_dir_all(&dir)?;
+        let mut args: Vec<&str> = SERVER_ARGS.to_vec();
+        args.extend_from_slice(&["--parallel", "2"]);
+        let err_log = dir.join("server.err");
+        // The draft-only levers: with the residency moving experts the map a
+        // resumed pass runs on is the one the turns left, and a near tie may
+        // flip between the solo and the swapped run; this clause holds the
+        // draft's park and rejoin, which the map does not touch.
+        let mut served = Served::spawn(&args, &dir, DRAFT_ONLY)?;
+        println!("swap server pid {}", served.child.id());
+        let addr = served.address(&err_log)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        // No `ignore_eos`: its banned stop ids step a request plainly (a
+        // pass applies no logit bias), and this clause holds the draft.
+        let body = |ids: &[u32], n: usize| {
+            json!({
+                "prompt": ids, "n_predict": n, "temperature": 0,
+                "return_tokens": true, "cache_prompt": false,
+            })
+        };
+        let (a_ids, b_ids) = (chat_ids(&url)?, tokenized(&url, LATER_A)?);
+        let mut alone = Vec::new();
+        for (ids, n) in [(&a_ids, SWAP_A_PREDICT), (&b_ids, SWAP_B_PREDICT)] {
+            let (st, text) = curl(&url("/completion"), Some(&body(ids, n)), false)?;
+            let v = json_of("/completion", st, &text)?;
+            alone.push((
+                ids_of(&v["tokens"]),
+                v["timings"]["draft_n"].as_u64().unwrap_or(0),
+            ));
+        }
+        println!(
+            "swap alone: {} and {} ids, drafts {} and {}",
+            alone[0].0.len(),
+            alone[1].0.len(),
+            alone[0].1,
+            alone[1].1
+        );
+        let swaps = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
+        // A request on a helper thread of its own: its handle, and its answer
+        // with when it came back.
+        type Answer = (Result<(u16, String), String>, Instant);
+        let post = |ids: Vec<u32>,
+                    n: usize|
+         -> Result<(JoinHandle<()>, mpsc::Receiver<Answer>), GateError> {
+            let u = url("/completion");
+            let b = body(&ids, n);
+            let (tx, rx) = mpsc::channel();
+            let (h, _) = spawn_helper("swap-request", Placement::Float, move || {
+                let r = curl(&u, Some(&b), false).map_err(|e| e.to_string());
+                let _ = tx.send((r, Instant::now()));
+            })
+            .map_err(|e| format!("swap: {}", e.what()))?;
+            Ok((h, rx))
+        };
+        let first = post(a_ids, SWAP_A_PREDICT)?;
+        loop {
+            if first.0.is_finished() {
+                return Err(
+                    "swap: the first request ended before /slots showed it decoding".into(),
+                );
+            }
+            let (st, text) = curl(&url("/slots"), None, false)?;
+            let slots = json_of("/slots", st, &text)?;
+            let decoding = slots.as_array().is_some_and(|l| {
+                l.iter().any(|s| {
+                    s["turn"] == "running"
+                        && s["next_token"]["n_decoded"].as_u64().is_some_and(|n| n > 0)
+                })
+            });
+            if decoding {
+                break;
+            }
+            std::thread::sleep(SWAP_POLL);
+        }
+        let from = lines_from(&err_log, 0)?.len();
+        let second = post(b_ids, SWAP_B_PREDICT)?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+            h.join()
+                .map_err(|_| format!("swap: the {what} request's thread panicked"))?;
+            let (r, at) = rx
+                .recv()
+                .map_err(|_| format!("swap: the {what} request's thread gave no answer"))?;
+            let (st, text) = r?;
+            let v = json_of("/completion", st, &text)?;
+            together.push((
+                ids_of(&v["tokens"]),
+                v["timings"]["draft_n"].as_u64().unwrap_or(0),
+                at,
+            ));
+        }
+        let skips = lines_from(&err_log, from)?
+            .iter()
+            .filter(|l| l.starts_with("mtp prompt ") && !l.ends_with(" skipped=none"))
+            .count();
+        let after = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
+        println!(
+            "swap together: first {} ids of {} drafts, second {} ids of {} drafts, second back \
+             {:?} before the first, switches {swaps} -> {after}, draft skips {skips}",
+            together[0].0.len(),
+            together[0].1,
+            together[1].0.len(),
+            together[1].1,
+            together[0].2.checked_duration_since(together[1].2)
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "swap_alone_ran_long_enough_to_preempt",
+            alone[0].0.len() >= SWAP_B_PREDICT && !alone[1].0.is_empty(),
+        );
+        check(
+            &mut ok,
+            "swap_second_back_before_the_first",
+            together[1].2 < together[0].2,
+        );
+        check(
+            &mut ok,
+            "swap_ids_are_alone_and_the_drafts_ran",
+            together[0].0 == alone[0].0
+                && together[1].0 == alone[1].0
+                && together[0].1 > 0
+                && together[1].1 > 0,
+        );
+        check(
+            &mut ok,
+            "swap_no_draft_skip_and_switched",
+            skips == 0 && after > swaps,
+        );
+        println!("swap server stopped: {}", served.stop()?);
         Ok(ok)
     }
 
@@ -717,6 +1171,7 @@ mod gate {
         let (st, body) = curl(&url("/residency/reset"), Some(&json!({})), false)?;
         println!("plain residency reset: HTTP {st} {body}");
         check(&mut ok, "plain_residency_reset_is_501", st == 501);
+        ok &= cache(&url, &err_log, false)?;
         println!("plain server stopped: {}", served.stop()?);
         let (reference, cli_lines) = cli(dir, PLAIN, &ids, true)?;
         println!("generate_glm5next tokens {reference:?}");
@@ -835,8 +1290,10 @@ mod gate {
             x["timings"]["draft_n"],
             ids_of(&x["tokens"])
         );
+        ok &= resume_under_residency(&url, &err_log)?;
 
         println!("drafted server stopped: {}", served.stop()?);
+        ok &= swap_rejoins_the_draft(dir)?;
 
         let (reference, cli_lines) = cli(dir, DRAFTED, &ids, false)?;
         let cli_passes = passes(&cli_lines);

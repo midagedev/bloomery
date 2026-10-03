@@ -70,6 +70,12 @@
 //!   is a fault by name and leaves the model poisoned by that fault before
 //!   any target call, and a walk after it is refused as poisoned; the gain
 //!   put back and a reset, the same chain gives the clean chain's id.
+//! - (s) a sequence state (`bloomery_gpu_glm5next::seq_save`) of the load
+//!   without the layer, taken after its plain run, put back on the NextN
+//!   load (`seq_resume`): the store layouts differ (the NextN layer's store
+//!   rows), so it is refused by name before any copy, and the model stays at
+//!   position 0, unpoisoned. The same file, card and context: the refusal is
+//!   the layout's, not the identity's.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -98,10 +104,10 @@ mod gate {
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
     use bloomery_gpu_glm5next::{
-        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, NextnFeed, NextnHead,
-        NextnHidden, NextnMode, PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden,
-        nextn_logits, nextn_target_streams, nextn_walk, prompt_with, set_prefill,
-        set_prefill_group,
+        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnFeed,
+        NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden,
+        nextn_logits, nextn_target_streams, nextn_walk, prompt_with, seq_resume, seq_save,
+        set_prefill, set_prefill_group,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
@@ -978,6 +984,30 @@ mod gate {
         ok
     }
 
+    /// (s) `without`, a state of the load without the layer, put back on the
+    /// empty NextN load `m`: refused by name, and `m` still at position 0,
+    /// unpoisoned. Mutant: the body's NextN-side check taken out (the shared
+    /// layout check refuses it under its own name).
+    fn layout_refused(m: &mut Glm5nextModel, without: &GlmSeq) -> bool {
+        let r = seq_resume(m, without);
+        let want = "a state without the NextN rows put back on a load with the layer";
+        let named = matches!(&r, Err(e) if e.to_string().contains(want));
+        let empty = m.pos() == 0 && m.poisoned().is_none();
+        println!(
+            "(s) a state of the load without the layer put back on the NextN load -> {} {}; the \
+             model after it at position {}, poisoned {:?} {}",
+            match &r {
+                Ok(()) => "accepted".to_string(),
+                Err(e) => e.to_string(),
+            },
+            verdict(named),
+            m.pos(),
+            m.poisoned(),
+            verdict(empty)
+        );
+        named && empty
+    }
+
     /// A walk's feed.
     fn f<'a>(tokens: &'a [u32], pos0: u32, hidden: NextnHidden<'a>) -> NextnFeed<'a> {
         NextnFeed {
@@ -1329,6 +1359,8 @@ mod gate {
             "an MTP draft on a load without the NextN layer",
         );
         let reference = plain(&mut m, &prompt, PrefillMode::Batch)?;
+        // (s) this load's sequence state, for the NextN load to refuse.
+        let without = seq_save(&mut m)?;
         drop(m);
 
         // The NextN load.
@@ -1348,6 +1380,8 @@ mod gate {
             m.resident_bytes()
         );
 
+        ok &= layout_refused(&mut m, &without);
+        drop(without);
         ok &= pos_mask(&set, hidden)?;
         ok &= refusals(&mut m, hidden)?;
         ok &= chain_fault(&mut m, nextn.index, hidden)?;

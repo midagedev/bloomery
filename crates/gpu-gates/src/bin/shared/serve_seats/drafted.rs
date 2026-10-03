@@ -4,18 +4,34 @@
 //! beside its session and forwards the [`Seat`](bloomery_gpu_gates::bind::Seat)
 //! calls that move positions to it.
 //!
-//! The draft rejoins a sequence only where its last call left it. After the
-//! seat cuts the sequence back or puts a saved state in place, the seat turns
-//! the draft off ([`DraftedSeat::turn_off`]): every call is the session's own
-//! until the next reset, and each prompt call (or the first step when the
-//! call is empty) prints an `mtp prompt` record that names why.
+//! The draft rejoins a sequence only where its last call left it. A seat
+//! whose saved state keeps the draft's side (its store and the arenas its
+//! waiting rows sit in) parks the draft with the state ([`DraftedSeat::park`])
+//! and puts it back with it ([`DraftedSeat::unpark`]), so a returning
+//! sequence drafts as if no other had run. A seat whose state does not keep
+//! that side turns the draft off after a cut or a put-back state
+//! ([`DraftedSeat::turn_off`]): every call is the session's own until the next
+//! reset, and each prompt call (or the first step when the call is empty)
+//! prints an `mtp prompt` record that names why.
 
 use app::Session;
-use app::mtp::{MtpBody, MtpDraft};
+use app::mtp::{MtpBody, MtpDraft, Parked};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
 use runtime::{Advance, Draft, Plain, Speculative, Target as _, Want, Widths, Window};
 use serve::Drafted;
+
+/// The draft's side of a saved sequence ([`DraftedSeat::park`]): what the
+/// draft held of it, and why the seat had turned it off, if it had.
+#[allow(
+    dead_code,
+    reason = "bloomery-serve-qwen38 includes this file and parks no draft; bloomery-serve's glm seat parks it"
+)]
+#[derive(Clone, Debug)]
+pub(crate) struct ParkedDraft<A> {
+    draft: Parked<A>,
+    off: Option<&'static str>,
+}
 
 /// The windows a seat drives its session with, `M` = the body's
 /// [`MtpBody::VERIFY_ROWS`], or none: every pass a plain step.
@@ -175,6 +191,53 @@ where
         self.off = None;
         if let Some(spec) = &mut self.spec {
             spec.draft_mut().restart();
+        }
+        Ok(())
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "bloomery-serve-qwen38 includes this file and parks no draft; bloomery-serve's glm seat parks it"
+)]
+impl<B: MtpBody, const M: usize> DraftedSeat<B, M>
+where
+    Window<M>: Widths,
+{
+    /// The draft's side of the session's sequence, for a state the seat
+    /// saves ([`MtpDraft::park`]; the turn-off why with it); `None` without
+    /// a draft. The state keeps the draft's store and the arenas the
+    /// waiting rows sit in.
+    pub(crate) fn park(&self) -> Option<ParkedDraft<B::Arena>> {
+        self.spec.as_ref().map(|spec| ParkedDraft {
+            draft: spec.draft().park(),
+            off: self.off.map(|(why, _)| why),
+        })
+    }
+
+    /// Refused by name unless a state whose draft's side is `p` fits this
+    /// seat: a side where a draft runs, none where none does.
+    pub(crate) fn takes(&self, p: Option<&ParkedDraft<B::Arena>>) -> Result<(), GateError> {
+        if p.is_some() == self.spec.is_some() {
+            return Ok(());
+        }
+        Err(format!(
+            "a state saved with the MTP draft {} put back with it {}",
+            if p.is_some() { "on" } else { "off" },
+            if self.spec.is_some() { "on" } else { "off" }
+        )
+        .into())
+    }
+
+    /// `p`, which [`DraftedSeat::park`] took with a state, back in place once
+    /// that state is put back after the session's reset: the draft joins the
+    /// sequence's next call where it left it, or stays off for the parked
+    /// why. Refused by name as [`DraftedSeat::takes`] refuses.
+    pub(crate) fn unpark(&mut self, p: Option<&ParkedDraft<B::Arena>>) -> Result<(), GateError> {
+        self.takes(p)?;
+        if let (Some(spec), Some(p)) = (&mut self.spec, p) {
+            spec.draft_mut().unpark(&p.draft);
+            self.off = p.off.map(|why| (why, false));
         }
         Ok(())
     }

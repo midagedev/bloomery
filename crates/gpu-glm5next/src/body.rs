@@ -37,7 +37,10 @@
 //! checkpoint ([`bloomery_gpu::checkpoint`]): each prompt call ([`prompt`])
 //! copies every KDA layer's committed state and conv ring to the host at the
 //! marks of `runtime::seqstate`, and a cut to one of them copies it back at
-//! the next step; the latent rows are cut by position.
+//! the next step; the latent rows are cut by position. A sequence state on
+//! the host ([`seq`]) carries the latent rows, the KDA stores at the held
+//! position and at the last checkpoint below it, and the NextN side, and
+//! puts them back on an empty model.
 //!
 //! Each KDA layer's state has the load's stamped lanes (`linear::delta`'s
 //! module doc, [`KdaLanes`]), the committed one named by one lane word every
@@ -55,6 +58,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::checkpoint::Checkpoints;
+use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::refuse_tier_count;
@@ -103,6 +107,9 @@ mod pair;
 
 #[path = "nextn.rs"]
 pub mod nextn;
+
+#[path = "seq.rs"]
+pub mod seq;
 
 pub use pair::PAIR_ROWS;
 
@@ -724,6 +731,8 @@ pub struct Body {
     residency: Residency,
     /// The next-token layer, on a NextN load ([`nextn`]).
     nextn: Option<Box<nextn::Nextn>>,
+    /// What a sequence state of this load belongs to ([`seq`]).
+    who: Identity,
 }
 
 /// Every KDA layer's committed lane `lane` of its state and its conv ring,
@@ -1372,6 +1381,19 @@ impl Body {
             .flat_map(|_| [dims.kda.state_len(), dims.kda.ring_len()])
             .collect();
         let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?;
+        let who = Identity {
+            arch: "glm5next",
+            file: embd
+                .file
+                .shard_path(0)
+                .ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the file's first shard",
+                })?
+                .to_path_buf(),
+            card: gpu.device_name()?,
+            ctx,
+        };
         let lane = [0u32];
         let mut body = Body {
             hybrid,
@@ -1397,6 +1419,7 @@ impl Body {
             residency_glue: glue,
             residency: lever,
             nextn: None,
+            who,
         };
         body.s.lane.copy_from_host(stream, &lane)?;
         stream.synchronize()?;

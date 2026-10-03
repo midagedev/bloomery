@@ -17,6 +17,7 @@
 //!   steps, and its commit over the KDA lanes;
 //! - [`body::nextn`]: the next-token (MTP) layer beside the chain on a NextN
 //!   load, and its walks;
+//! - [`body::seq`]: a sequence's state on the host, saved and put back;
 //! - `kda`, `mla`: the two mixers; `ffn`: the dense block, and the routed
 //!   block around its host leg with its card experts in the leg's shadow;
 //! - `host`: the host tier's routed stacks;
@@ -51,6 +52,7 @@ pub use body::prefill::{
     prefill_mode, prompt_bytes, prompt_route_taps, prompt_with, set_prefill, set_prefill_group,
     set_prompt_route_taps, set_prompt_stats, store_digests, store_rows, take_prompt_stats,
 };
+pub use body::seq::{GlmSeq, seq_resume, seq_save};
 pub use body::{
     Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, NEXTN_ON_TIER, PAIR_ROWS, Plant,
     TIER_BEFORE_UPLOAD, prompt, set_taps,
