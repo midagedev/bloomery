@@ -15,7 +15,13 @@
 //!    of the turned key and of the value — bit for bit, the planes' other rows
 //!    untouched, and a rerun bit for bit. A position at the cache's height
 //!    raises `cache_pos` with the launch's layer, leaves that token's heads NaN
-//!    and appends nothing; every other token is the clean run's.
+//!    and appends nothing; every other token is the clean run's. Its q8_0
+//!    append (`head_norm_neox_append_256_q8`) runs the same inputs: the heads
+//!    the f16 entry's bit for bit, every appended row the two planes of
+//!    `quantize_q8_0` (the engine's one Q8_0 quantizer) over the same f32
+//!    values, packed by `weights::q8_0_planes`, a rerun bit for bit; and a
+//!    value holding a NaN refuses its block — `kv_quant`, a NaN scale and zero
+//!    codes, every other bit the clean run's.
 //! 2. Decode flash (`flash_gqa::enqueue_pass_256`), both segment passes: each
 //!    output within its first-order bound of the exact attention computed here
 //!    in f64 on the same f16 keys and values (the model of
@@ -169,10 +175,14 @@ mod gate {
         DIM as IDX_DIM, HEADS as IDX_HEADS, MAX_ROWS, POOL, PoolArgs, QsaKernels, QsaScratch,
         ROT as IDX_ROT, SelectArgs, list_width, pools_for,
     };
-    use bloomery_gpu::rope_neox::{PartialNeoxArgs, ROT_256 as ROT, RopeNeoxKernels, owned_pair};
+    use bloomery_gpu::rope_neox::{
+        PartialNeoxArgs, ROT_256 as ROT, RopeNeoxKernels, owned_pair, q8_plane_lens,
+    };
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::route_core::sigmoid;
+    use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError, Q8Act, window};
+    use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE};
     use bloomery_gpu_gates::rounding::{U, U_F32, butterfly, gamma};
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RowKind, activations, bits_equal, checks_failed, data_dir,
@@ -180,7 +190,8 @@ mod gate {
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
-    use gguf::quant::{f32_to_f16_bits, half_to_f32};
+    use gguf::quant::{Q8Block, f32_to_f16_bits, half_to_f32};
+    use model::arch::deepseek2::attn::quantize_q8_0;
     use refset::arch::qwen35moe::{BATCH, IK, MODEL};
     use runtime::qsa::{Qsa, select as qsa_select};
     use std::mem::ManuallyDrop;
@@ -388,6 +399,7 @@ mod gate {
     }
 
     /// The rope check's inputs on the host.
+    #[derive(Clone)]
     struct RopeIn {
         qg: Vec<f32>,
         k: Vec<f32>,
@@ -473,8 +485,9 @@ mod gate {
         RopeOut { q, k, ck, cv }
     }
 
-    fn rope_check(gpu: &Gpu, kern: &RopeNeoxKernels) -> Result<bool, GateError> {
-        let stream = gpu.stream();
+    /// The rope check's inputs ([`rope_check`]'s construction, shared with
+    /// its q8_0 clause): the table, the rows, the gains and the positions.
+    fn rope_inputs() -> Result<(RopeIn, Vec<u32>), GateError> {
         let table_rt = RopeTable::new(&RopeSpec::window(THETA, ROT))?;
         let mut table = Vec::with_capacity(ROPE_CTX * ROT);
         for p in 0..ROPE_CTX {
@@ -510,6 +523,12 @@ mod gate {
         let pos: Vec<u32> = (0..ROPE_M)
             .map(|t| u32::try_from(ROPE_P0 + t))
             .collect::<Result<_, _>>()?;
+        Ok((inp, pos))
+    }
+
+    fn rope_check(gpu: &Gpu, kern: &RopeNeoxKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (inp, pos) = rope_inputs()?;
         let unl = gpu.unlabelled_sink();
         let a = rope_run(kern, stream, &inp, &pos, unl)?;
         let b = rope_run(kern, stream, &inp, &pos, unl)?;
@@ -563,6 +582,159 @@ mod gate {
              word {raised:?} (want {want_fault:?}), its heads NaN {nan}, nothing appended \
              {not_appended}, other tokens bit-identical {others}, clean rerun and word clean \
              {clean_after} {}",
+            verdict(fault_ok)
+        );
+        Ok(pass && fault_ok)
+    }
+
+    /// The q8_0 append's launch (`head_norm_neox_append_256_q8`) read back:
+    /// [`RopeOut`]'s four planes in place of its two.
+    struct RopeQ8Out {
+        q: Vec<f32>,
+        k: Vec<f32>,
+        kq: Vec<u32>,
+        kd: Vec<u16>,
+        vq: Vec<u32>,
+        vd: Vec<u16>,
+    }
+
+    fn rope_q8_run(
+        kern: &RopeNeoxKernels,
+        stream: &CudaStream,
+        inp: &RopeIn,
+        pos: &[u32],
+        fault: FaultSink,
+    ) -> Result<RopeQ8Out, GateError> {
+        use bloomery_gpu::rope_neox::PartialNeoxQ8Args;
+        let m = pos.len();
+        let qg = DeviceBuffer::from_host(stream, &inp.qg)?;
+        let mut q = DeviceBuffer::from_host(stream, &vec![0.0f32; m * N_HEAD * HEAD])?;
+        let mut k = DeviceBuffer::from_host(stream, &inp.k)?;
+        let v = DeviceBuffer::from_host(stream, &inp.v)?;
+        let gq = DeviceBuffer::from_host(stream, &inp.gq)?;
+        let gk = DeviceBuffer::from_host(stream, &inp.gk)?;
+        let table = DeviceBuffer::from_host(stream, &inp.table)?;
+        let posd = DeviceBuffer::from_host(stream, pos)?;
+        let (words, scales) = q8_plane_lens(HEAD, N_KV, ROPE_CTX);
+        let codes = vec![SENTINEL_Q8_CODE; words];
+        let sc = vec![SENTINEL_Q8_SCALE; scales];
+        let mut kq = DeviceBuffer::from_host(stream, &codes)?;
+        let mut kd = DeviceBuffer::from_host(stream, &sc)?;
+        let mut vq = DeviceBuffer::from_host(stream, &codes)?;
+        let mut vd = DeviceBuffer::from_host(stream, &sc)?;
+        kern.enqueue_head_norm_neox_append_256_q8(
+            stream,
+            PartialNeoxQ8Args {
+                qg: &qg,
+                q: &mut q,
+                k: &mut k,
+                v: &v,
+                gq: &gq,
+                gk: &gk,
+                table: &table,
+                pos: &posd,
+                eps: EPS,
+                n_head: N_HEAD,
+                n_kv: N_KV,
+                ctx: ROPE_CTX,
+                m,
+                fault,
+                kq: &mut kq,
+                kd: &mut kd,
+                vq: &mut vq,
+                vd: &mut vd,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok(RopeQ8Out {
+            q: q.to_host_vec(stream)?,
+            k: k.to_host_vec(stream)?,
+            kq: kq.to_host_vec(stream)?,
+            kd: kd.to_host_vec(stream)?,
+            vq: vq.to_host_vec(stream)?,
+            vd: vd.to_host_vec(stream)?,
+        })
+    }
+
+    /// The q8_0 append's expected planes ([`rope_host`]'s rows through
+    /// `quantize_q8_0` and `q8_0_planes`, every other slot the sentinel).
+    fn rope_q8_host(inp: &RopeIn, pos: &[u32]) -> (Vec<u32>, Vec<u16>, Vec<u32>, Vec<u16>) {
+        let (words, scales) = q8_plane_lens(HEAD, N_KV, ROPE_CTX);
+        let mut kq = vec![SENTINEL_Q8_CODE; words];
+        let mut kd = vec![SENTINEL_Q8_SCALE; scales];
+        let mut vq = kq.clone();
+        let mut vd = kd.clone();
+        let pack = |vals: &[f32], q: &mut [u32], d: &mut [u16], row: usize| {
+            let blocks: Vec<Q8Block> = vals.chunks(32).map(quantize_q8_0).collect();
+            let (qs, ds) = q8_0_planes(&blocks);
+            q[row * (HEAD / 4)..row * (HEAD / 4) + qs.len()].copy_from_slice(&qs);
+            d[row * (HEAD / 32)..row * (HEAD / 32) + ds.len()].copy_from_slice(&ds);
+        };
+        for (t, &p) in pos.iter().enumerate() {
+            let p = p as usize;
+            let cs = &inp.table[p * ROT..(p + 1) * ROT];
+            for j in 0..N_KV {
+                let at = (t * N_KV + j) * HEAD;
+                let y = head_rule(&inp.k[at..at + HEAD], &inp.gk, cs);
+                let row = j * ROPE_CTX + p;
+                pack(&y, &mut kq, &mut kd, row);
+                pack(&inp.v[at..at + HEAD], &mut vq, &mut vd, row);
+            }
+        }
+        (kq, kd, vq, vd)
+    }
+
+    /// The q8_0 append clause (module doc): whether it held.
+    fn rope_q8_check(gpu: &Gpu, kern: &RopeNeoxKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (inp, pos) = rope_inputs()?;
+        let unl = gpu.unlabelled_sink();
+        let f16 = rope_run(kern, stream, &inp, &pos, unl)?;
+        let a = rope_q8_run(kern, stream, &inp, &pos, unl)?;
+        let b = rope_q8_run(kern, stream, &inp, &pos, unl)?;
+        // The prefix the two entries share: the heads bit for bit.
+        let heads = bits_equal(&a.q, &f16.q) && bits_equal(&a.k, &f16.k);
+        let (wkq, wkd, wvq, wvd) = rope_q8_host(&inp, &pos);
+        let planes = a.kq == wkq && a.kd == wkd && a.vq == wvq && a.vd == wvd;
+        let rerun = bits_equal(&a.q, &b.q)
+            && bits_equal(&a.k, &b.k)
+            && a.kq == b.kq
+            && a.kd == b.kd
+            && a.vq == b.vq
+            && a.vd == b.vd;
+        let pass = heads && planes && rerun;
+        println!(
+            "rope q8 m={ROPE_M} positions {ROPE_P0}.. ctx={ROPE_CTX} head {HEAD} rot {ROT}: q/k \
+             the f16 append's bits {heads} planes_exact={planes} rerun={rerun} {}",
+            verdict(pass)
+        );
+
+        // A value row holding a NaN: the block that holds it refused.
+        let (bad_t, bad_j, bad_val) = (2usize, 1usize, 200usize);
+        let bad_block = bad_val / 32;
+        let mut bad_inp = inp.clone();
+        bad_inp.v[(bad_t * N_KV + bad_j) * HEAD + bad_val] = f32::NAN;
+        let before = gpu.fault()?;
+        let sink = gpu.layer_sink(LAYER)?;
+        let bad = rope_q8_run(kern, stream, &bad_inp, &pos, sink)?;
+        let raised = gpu.take_fault()?;
+        let want_fault = Some(Fault::at(u32::try_from(LAYER)?, FaultSite::KvQuant));
+        let row = bad_j * ROPE_CTX + pos[bad_t] as usize;
+        let (mut wvq, mut wvd) = (a.vq.clone(), a.vd.clone());
+        wvq[row * (HEAD / 4) + 8 * bad_block..row * (HEAD / 4) + 8 * (bad_block + 1)].fill(0);
+        wvd[row * (HEAD / 32) + bad_block] = f32_to_f16_bits(f32::NAN);
+        let others = bad.kq == a.kq
+            && bad.kd == a.kd
+            && bits_equal(&bad.q, &a.q)
+            && bits_equal(&bad.k, &a.k);
+        let refused = bad.vq == wvq && bad.vd == wvd;
+        let again = rope_q8_run(kern, stream, &inp, &pos, unl)?;
+        let clean_after = gpu.fault()?.is_none() && bits_equal(&again.q, &a.q) && again.vd == a.vd;
+        let fault_ok = before.is_none() && raised == want_fault && others && refused && clean_after;
+        println!(
+            "rope q8 fault: token {bad_t} head {bad_j} value {bad_val} NaN, layer {LAYER}: word \
+             {raised:?} (want {want_fault:?}), the block a NaN scale and zero codes {refused}, \
+             every other bit the clean run's {others}, clean rerun and word clean {clean_after} {}",
             verdict(fault_ok)
         );
         Ok(pass && fault_ok)
@@ -3184,6 +3356,9 @@ mod gate {
         let mut ok = true;
         let r = rope_check(&gpu, &rope)?;
         println!("rope-256 {}", verdict(r));
+        ok &= r;
+        let r = rope_q8_check(&gpu, &rope)?;
+        println!("rope-256 q8 {}", verdict(r));
         ok &= r;
         let d = decode_check(&gpu, &k, Q36, &DEC_KEYS)?;
         println!("decode flash 256 {}", verdict(d));

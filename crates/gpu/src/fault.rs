@@ -138,6 +138,10 @@ pub enum FaultSite {
     /// that is not strictly ascending or does not end at its pin, or a list
     /// entry at or past the candidate rows.
     CandMask = 26,
+    /// A q8_0 cache append (`rope_neox`'s quantizing entries) met a
+    /// non-finite key or value: the block is stored with a NaN scale, so
+    /// every value it dequantizes to is NaN.
+    KvQuant = 27,
 }
 
 // A site is one bit of a u32 mask.
@@ -146,6 +150,7 @@ const _: () = assert!((FaultSite::F32Product as u32) < 32);
 const _: () = assert!((FaultSite::Logit as u32) < 32);
 const _: () = assert!((FaultSite::DeltaStamp as u32) < 32);
 const _: () = assert!((FaultSite::CandMask as u32) < 32);
+const _: () = assert!((FaultSite::KvQuant as u32) < 32);
 
 impl FaultSite {
     /// Every site, in code order.
@@ -173,6 +178,7 @@ impl FaultSite {
         FaultSite::Logit,
         FaultSite::DeltaStamp,
         FaultSite::CandMask,
+        FaultSite::KvQuant,
     ];
 
     /// The site's name as an error prints it.
@@ -202,6 +208,7 @@ impl FaultSite {
             FaultSite::Logit => "logit",
             FaultSite::DeltaStamp => "delta_stamp",
             FaultSite::CandMask => "cand_mask",
+            FaultSite::KvQuant => "kv_quant",
         }
     }
 
@@ -261,6 +268,7 @@ impl FaultSite {
                  list not strictly ascending or not ending at its pin, or a list entry past the \
                  candidate rows"
             }
+            FaultSite::KvQuant => "a q8_0 cache row value not finite",
         }
     }
 }
@@ -277,7 +285,7 @@ pub mod step_order {
     use super::FaultSite;
     use super::FaultSite::{
         AttnCount, AttnSel, CachePos, CacheValue, CandMask, DeltaLane, DeltaStamp, ExpertId,
-        F32Product, HcMix, HcQuant, KeyCount, LinearConv, LinearDelta, LinearGate, Logit,
+        F32Product, HcMix, HcQuant, KeyCount, KvQuant, LinearConv, LinearDelta, LinearGate, Logit,
         NormQuant, Ple, PoolSelect, Q5Quant, QuantColumn, Router, TokenId,
     };
 
@@ -290,6 +298,7 @@ pub mod step_order {
         TokenId,
         NormQuant,
         CachePos,
+        KvQuant,
         QuantColumn,
         Router,
         ExpertId,
@@ -328,6 +337,7 @@ pub mod step_order {
         KeyCount,
         Q5Quant,
         CachePos,
+        KvQuant,
         LinearConv,
         LinearDelta,
         LinearGate,
@@ -349,6 +359,7 @@ pub mod step_order {
         TokenId,
         NormQuant,
         CachePos,
+        KvQuant,
         KeyCount,
         QuantColumn,
         Router,
@@ -394,6 +405,7 @@ pub mod step_order {
         HcMix,
         NormQuant,
         CachePos,
+        KvQuant,
         KeyCount,
         LinearConv,
         LinearDelta,
@@ -429,6 +441,7 @@ pub mod step_order {
         LinearGate,
         CachePos,
         CacheValue,
+        KvQuant,
         AttnCount,
         Router,
         ExpertId,

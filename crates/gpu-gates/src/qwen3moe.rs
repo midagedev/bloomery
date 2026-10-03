@@ -161,6 +161,7 @@ pub fn neox_rotate(x: &[f32], cs: &[f32], n_vec: usize) -> Vec<f32> {
 /// in `src1`), `Qcur_roped-L`/`Kcur_roped-L` (ROPE, positions in `src1`)
 /// and the two cache writes (`… (copy of Kcur_roped-L)`, `… (copy of
 /// Vcur-L)`) as f16 bits, token after token.
+#[derive(Clone)]
 pub struct AttnRows {
     pub layer: usize,
     pub m: usize,
@@ -375,6 +376,148 @@ pub mod dev {
                 k: kb.to_host_vec(stream)?,
                 cache_k: cache_k.to_host_vec(stream)?,
                 cache_v: cache_v.to_host_vec(stream)?,
+            },
+            nodes,
+        ))
+    }
+
+    /// [`run`] with the append quantized to Q8_0
+    /// (`rope_neox::head_norm_neox_append_q8`): the same inputs, the four
+    /// planes of [`bloomery_gpu::rope_neox::q8_plane_lens`] filled with the
+    /// sentinels before the launch.
+    #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
+    pub fn run_q8(
+        k: &RopeNeoxKernels,
+        stream: &CudaStream,
+        fault: FaultSink,
+        rows: &AttnRows,
+        gq: &[f32],
+        gk: &[f32],
+        table: &[f32],
+        eps: f32,
+        ctx: usize,
+    ) -> Result<NeoxQ8Out, GateError> {
+        Ok(launch_q8(k, stream, None, fault, rows, gq, gk, table, eps, ctx)?.0)
+    }
+
+    /// [`run_q8`] with the launch captured on `gpu`'s stream as a graph and
+    /// replayed once; also returns the graph's node count.
+    #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
+    pub fn run_q8_graph(
+        gpu: &Gpu,
+        k: &RopeNeoxKernels,
+        fault: FaultSink,
+        rows: &AttnRows,
+        gq: &[f32],
+        gk: &[f32],
+        table: &[f32],
+        eps: f32,
+        ctx: usize,
+    ) -> Result<(NeoxQ8Out, usize), GateError> {
+        launch_q8(
+            k,
+            gpu.stream(),
+            Some(gpu),
+            fault,
+            rows,
+            gq,
+            gk,
+            table,
+            eps,
+            ctx,
+        )
+    }
+
+    /// One launch's results with the append quantized to Q8_0, read back:
+    /// the query and key heads after the norm and the turn, and the four
+    /// whole planes.
+    pub struct NeoxQ8Out {
+        pub q: Vec<f32>,
+        pub k: Vec<f32>,
+        pub kq: Vec<u32>,
+        pub kd: Vec<u16>,
+        pub vq: Vec<u32>,
+        pub vd: Vec<u16>,
+    }
+
+    /// What the gate fills the q8_0 planes with before an append: byte and
+    /// scale values the quantizer never writes together (a refused block
+    /// stores zero codes).
+    pub const SENTINEL_Q8_CODE: u32 = 0xa5a5_a5a5;
+    pub const SENTINEL_Q8_SCALE: u16 = 0x5a5a;
+
+    #[allow(clippy::too_many_arguments, reason = "one launch's inputs, each named")]
+    fn launch_q8(
+        k: &RopeNeoxKernels,
+        stream: &CudaStream,
+        graph: Option<&Gpu>,
+        fault: FaultSink,
+        rows: &AttnRows,
+        gq: &[f32],
+        gk: &[f32],
+        table: &[f32],
+        eps: f32,
+        ctx: usize,
+    ) -> Result<(NeoxQ8Out, usize), GateError> {
+        use bloomery_gpu::rope_neox::{NeoxQ8Args, q8_plane_lens};
+        let mut q = DeviceBuffer::from_host(stream, &rows.q)?;
+        let mut kb = DeviceBuffer::from_host(stream, &rows.k)?;
+        let v = DeviceBuffer::from_host(stream, &rows.v)?;
+        let gq = DeviceBuffer::from_host(stream, gq)?;
+        let gk = DeviceBuffer::from_host(stream, gk)?;
+        let table = DeviceBuffer::from_host(stream, table)?;
+        let pos = DeviceBuffer::from_host(stream, &rows.pos)?;
+        let (words, scales) = q8_plane_lens(HEAD, rows.n_kv, ctx);
+        let codes = vec![SENTINEL_Q8_CODE; words];
+        let sc = vec![SENTINEL_Q8_SCALE; scales];
+        let mut kq = DeviceBuffer::from_host(stream, &codes)?;
+        let mut kd = DeviceBuffer::from_host(stream, &sc)?;
+        let mut vq = DeviceBuffer::from_host(stream, &codes)?;
+        let mut vd = DeviceBuffer::from_host(stream, &sc)?;
+        let mut enqueue = |s: &CudaStream| {
+            k.enqueue_head_norm_neox_append_q8(
+                s,
+                NeoxQ8Args {
+                    q: &mut q,
+                    k: &mut kb,
+                    v: &v,
+                    gq: &gq,
+                    gk: &gk,
+                    table: &table,
+                    pos: &pos,
+                    eps,
+                    n_head: rows.n_head,
+                    n_kv: rows.n_kv,
+                    ctx,
+                    m: rows.m,
+                    fault,
+                    kq: &mut kq,
+                    kd: &mut kd,
+                    vq: &mut vq,
+                    vd: &mut vd,
+                },
+            )
+        };
+        let nodes = match graph {
+            None => {
+                enqueue(stream)?;
+                0
+            }
+            Some(gpu) => {
+                let g = gpu.capture(&mut enqueue)?;
+                g.launch(stream)?;
+                g.node_count()
+            }
+        };
+        stream.synchronize()?;
+        Ok((
+            NeoxQ8Out {
+                q: q.to_host_vec(stream)?,
+                k: kb.to_host_vec(stream)?,
+                kq: kq.to_host_vec(stream)?,
+                kd: kd.to_host_vec(stream)?,
+                vq: vq.to_host_vec(stream)?,
+                vd: vd.to_host_vec(stream)?,
             },
             nodes,
         ))

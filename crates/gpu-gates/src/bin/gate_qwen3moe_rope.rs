@@ -49,6 +49,20 @@
 //! `FaultSite::CachePos` with that layer; every other token's heads and every
 //! other plane slot are the clean run's bit for bit; the word is clean before
 //! and after a clean run.
+//!
+//! And the q8_0 append (`head_norm_neox_append_q8`), the same norm and turn
+//! with each K/V row quantized, per (set, layer) in one clause: the query and
+//! key heads bit for bit the f16 append's (the prefix the two entries share),
+//! every appended row the two planes of `quantize_q8_0` (the engine's one Q8_0
+//! quantizer, `model::arch::deepseek2::attn::quantize_q8_0`) over the same
+//! f32 values the f16 append rounds, packed by `weights::q8_0_planes` — byte
+//! for byte, both sides — every other plane slot the sentinel, and a rerun
+//! bit-identical. The launch captured as a graph: one node, the replay the
+//! eager launch's bits. And a value row holding a NaN: the block that holds
+//! it raises `FaultSite::KvQuant` and is stored with a NaN scale and zero
+//! codes — every value it dequantizes to is NaN, never a plausible number —
+//! with every other block and both whole K planes the clean run's bits, and
+//! the word clean after a clean rerun.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -65,10 +79,14 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::rope_neox::RopeNeoxKernels;
+    use bloomery_gpu::rope_neox::{RopeNeoxKernels, q8_plane_lens};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable, ggml_rope_cache};
+    use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Fault, FaultSite, Gpu};
-    use bloomery_gpu_gates::qwen3moe::dev::{SENTINEL, run as run_neox, run_graph};
+    use bloomery_gpu_gates::qwen3moe::dev::{
+        SENTINEL, SENTINEL_Q8_CODE, SENTINEL_Q8_SCALE, run as run_neox, run_graph,
+        run_q8 as run_neox_q8, run_q8_graph,
+    };
     use bloomery_gpu_gates::qwen3moe::{AttnRows, HEAD, head_norm, neox_rotate, sets};
     use bloomery_gpu_gates::rounding::U_F32;
     use bloomery_gpu_gates::{
@@ -76,8 +94,9 @@ mod gate {
         same_bits, split_f32, verdict,
     };
     use gguf::Split;
-    use gguf::quant::f32_to_f16_bits;
+    use gguf::quant::{Q8Block, f32_to_f16_bits};
     use model::arch::Arch;
+    use model::arch::deepseek2::attn::quantize_q8_0;
     use model::arch::qwen3moe::hparams::Hparams;
 
     /// Band for a normalized value against ik's, relative to ik's value. The
@@ -136,6 +155,7 @@ mod gate {
         );
         let sets = read_sets(&split, &hp)?;
         let norm_ok = norm_clause(&gpu, &k, &sets, &hp)?;
+        let q8_ok = q8_clause(&gpu, &k, &sets, &hp, &table)?;
 
         // The turn and the append.
         let (mut sites, mut failed) = (0u32, 0u32);
@@ -284,7 +304,7 @@ mod gate {
             "rope: {sites} (set, layer) sites and the graph, {failed} failed — {}",
             verdict(pass)
         );
-        let ok = norm_ok && pass;
+        let ok = norm_ok && q8_ok && pass;
         println!("gate_qwen3moe_rope: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
@@ -423,6 +443,196 @@ mod gate {
         let pass = failed == 0;
         println!(
             "qknorm: {sites} (set, layer) sites, {failed} failed — {}",
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The q8_0 append's expected planes: row `(h·ctx + p)` of each side the
+    /// blocks `quantize_q8_0` makes of the row's `HEAD` values, packed by
+    /// `q8_0_planes` (the engine's one Q8_0 format), every other slot the
+    /// sentinel.
+    fn q8_planes_want(
+        rows: &AttnRows,
+        hk: &[f32],
+        ctx: usize,
+    ) -> (Vec<u32>, Vec<u16>, Vec<u32>, Vec<u16>) {
+        let (words, scales) = q8_plane_lens(HEAD, rows.n_kv, ctx);
+        let mut kq = vec![SENTINEL_Q8_CODE; words];
+        let mut kd = vec![SENTINEL_Q8_SCALE; scales];
+        let mut vq = kq.clone();
+        let mut vd = kd.clone();
+        let pack = |vals: &[f32], q: &mut [u32], d: &mut [u16], row: usize| {
+            let blocks: Vec<Q8Block> = vals.chunks(32).map(quantize_q8_0).collect();
+            let (qs, ds) = q8_0_planes(&blocks);
+            let (wq, wd) = (row * (HEAD / 4), row * (HEAD / 32));
+            q[wq..wq + qs.len()].copy_from_slice(&qs);
+            d[wd..wd + ds.len()].copy_from_slice(&ds);
+        };
+        for (t, &p) in rows.pos.iter().enumerate() {
+            for h in 0..rows.n_kv {
+                let src = (t * rows.n_kv + h) * HEAD;
+                let row = h * ctx + p as usize;
+                pack(&hk[src..src + HEAD], &mut kq, &mut kd, row);
+                pack(&rows.v[src..src + HEAD], &mut vq, &mut vd, row);
+            }
+        }
+        (kq, kd, vq, vd)
+    }
+
+    /// The q8_0 append clause (module doc): whether it held.
+    fn q8_clause(
+        gpu: &Gpu,
+        k: &RopeNeoxKernels,
+        sets: &[SetLayers],
+        hp: &Hparams,
+        table: &RopeTable,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let mut grown = Vec::new();
+        println!(
+            "q8 append: device {} — {} layers, {} q / {} kv heads of {}",
+            gpu.device_name()?,
+            hp.n_layer,
+            hp.n_head,
+            hp.n_head_kv,
+            hp.head_dim
+        );
+        let (mut sites, mut failed) = (0u32, 0u32);
+        for SetLayers { label, layers, .. } in sets {
+            for (layer, Layer { rows, gq, gk }) in layers.iter().enumerate() {
+                let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
+                let tab = table_rows(table, &mut grown, ctx)?;
+                let cs = rows_at(tab, &rows.pos);
+                let norm = |x: &[f32], g: &[f32]| -> Vec<f32> {
+                    x.chunks(HEAD)
+                        .flat_map(|h| head_norm(h, g, hp.rms_eps))
+                        .collect()
+                };
+                let hk = neox_rotate(&norm(&rows.k, gk), &cs, rows.n_kv);
+
+                let f16 = run_neox(k, stream, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
+                let a = run_neox_q8(k, stream, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
+                let b = run_neox_q8(k, stream, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
+                // The prefix the two entries share: the heads bit for bit.
+                let heads = bits_equal(&a.q, &f16.q) && bits_equal(&a.k, &f16.k);
+                let (wkq, wkd, wvq, wvd) = q8_planes_want(rows, &hk, ctx);
+                let planes = a.kq == wkq && a.kd == wkd && a.vq == wvq && a.vd == wvd;
+                let rerun = bits_equal(&a.q, &b.q)
+                    && bits_equal(&a.k, &b.k)
+                    && a.kq == b.kq
+                    && a.kd == b.kd
+                    && a.vq == b.vq
+                    && a.vd == b.vd;
+                let pass = heads && planes && rerun;
+                sites += 1;
+                failed += u32::from(!pass);
+                if !pass || layer == 0 || layer + 1 == hp.n_layer {
+                    println!(
+                        "q8 append set={label} layer={layer} m={} pos={:?} heads_f16_bits={heads} \
+                         planes_exact={planes} rerun={rerun} {}",
+                        rows.m,
+                        rows.pos,
+                        verdict(pass)
+                    );
+                }
+            }
+        }
+        // The captured graph: one node, the replay the eager launch's bits.
+        let SetLayers { label, layers, .. } = &sets[1];
+        let Layer { rows, gq, gk } = &layers[0];
+        let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
+        let tab = table_rows(table, &mut grown, ctx)?;
+        let eager = run_neox_q8(k, stream, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let (replay, nodes) = run_q8_graph(gpu, k, unl, rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let same = bits_equal(&eager.q, &replay.q)
+            && bits_equal(&eager.k, &replay.k)
+            && eager.kq == replay.kq
+            && eager.kd == replay.kd
+            && eager.vq == replay.vq
+            && eager.vd == replay.vd;
+        let graph_ok = same && nodes == 1;
+        println!(
+            "graph op=head_norm_neox_append_q8 set={label} layer=0 \
+             eager_vs_graph_bit_identical={same} graph_nodes={nodes} {}",
+            verdict(graph_ok)
+        );
+        failed += u32::from(!graph_ok);
+        failed += u32::from(!kv_quant_clause(gpu, k, sets, hp, table)?);
+
+        let pass = failed == 0;
+        println!(
+            "q8 append: {sites} (set, layer) sites and the graph, {failed} failed — {}",
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// A value row holding a NaN (module doc): whether the refusal held.
+    fn kv_quant_clause(
+        gpu: &Gpu,
+        k: &RopeNeoxKernels,
+        sets: &[SetLayers],
+        hp: &Hparams,
+        table: &RopeTable,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let SetLayers { label, layers, .. } = &sets[0];
+        let (gq, gk) = (&layers[0].gq, &layers[0].gk);
+        let mut rows = layers[0].rows.clone();
+        if rows.m < 2 || rows.n_kv == 0 {
+            return Err(format!(
+                "{label}: the kv_quant clause wants two tokens and a key head, got {} and {}",
+                rows.m, rows.n_kv
+            )
+            .into());
+        }
+        let ctx = rows.pos.iter().max().map_or(1, |&p| p as usize + 1);
+        let mut grown = Vec::new();
+        let tab = table_rows(table, &mut grown, ctx)?;
+        let unl = gpu.unlabelled_sink();
+        let layer = 13usize;
+        let sink = gpu.layer_sink(layer)?;
+        let before = gpu.fault()?;
+        let clean = run_neox_q8(k, stream, unl, &rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let after_clean = gpu.fault()?;
+        // Token 1, key head 0, value 100: block 3 of its V row.
+        let (bad_t, bad_h, bad_val) = (1usize, 0usize, 100usize);
+        let src = (bad_t * rows.n_kv + bad_h) * HEAD + bad_val;
+        let bad_block = bad_val / 32;
+        rows.v[src] = f32::NAN;
+        let bad = run_neox_q8(k, stream, sink, &rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let word = gpu.take_fault()?;
+        rows.v[src] = layers[0].rows.v[src];
+
+        let row = bad_h * ctx + rows.pos[bad_t] as usize;
+        let (mut wvq, mut wvd) = (clean.vq.clone(), clean.vd.clone());
+        wvq[row * (HEAD / 4) + 8 * bad_block..row * (HEAD / 4) + 8 * (bad_block + 1)].fill(0);
+        wvd[row * (HEAD / 32) + bad_block] = f32_to_f16_bits(f32::NAN);
+        let planes = bad.kq == clean.kq
+            && bad.kd == clean.kd
+            && bad.vq == wvq
+            && bad.vd == wvd
+            && bits_equal(&bad.q, &clean.q)
+            && bits_equal(&bad.k, &clean.k);
+        let again = run_neox_q8(k, stream, unl, &rows, gq, gk, tab, hp.rms_eps, ctx)?;
+        let clean_again = bits_equal(&again.q, &clean.q)
+            && again.kq == clean.kq
+            && again.vd == clean.vd
+            && gpu.fault()?.is_none();
+        let want = Some(Fault::at(u32::try_from(layer)?, FaultSite::KvQuant));
+        let pass =
+            before.is_none() && after_clean.is_none() && word == want && planes && clean_again;
+        println!(
+            "kv_quant set={label} layer=0 token {bad_t} head {bad_h} value {bad_val} NaN: word \"{}\" \
+             (want \"{}\", clean before {} and after the clean run {}) the block refused with a NaN \
+             scale and zero codes, every other bit the clean run's {planes}, clean rerun and word \
+             clean {clean_again} {}",
+            word.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            want.map_or(String::new(), |f| f.to_string()),
+            before.is_none(),
+            after_clean.is_none(),
             verdict(pass)
         );
         Ok(pass)

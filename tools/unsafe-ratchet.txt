@@ -65,7 +65,12 @@ gguf 9 2 0
 # tiles.rs's kq_card_gather (four: the count, the slot and the three plane copies), the generic gate_up_tiles_body
 # (the fn, its tile_at, its two row_dot calls and its store_cols: three), q5k_gemv_tiles (three: tile_at, row_dot,
 # the scatter), the two host launchers' kernel launches (two) and the module load (one), each with its SAFETY line.
-gpu 1457 153 6
+# PIN(2026-10-04): gpu 1457 -> 1480 blocks, 153 -> 155 fns, two new kernel entries, not old code relaxed:
+# head_norm_neox_append_q8 and head_norm_neox_append_256_q8 (rope_neox.rs: the q8_0 cache append, a warp's
+# whole 32-value blocks quantized in place) add the two unsafe fns — the device core q8_block_warp (its
+# plane-store block) and the 256 body norm_partial_append_q8 — and the entries' and body's read, store and
+# module blocks, twenty-three in all, each with its SAFETY line.
+gpu 1480 155 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
