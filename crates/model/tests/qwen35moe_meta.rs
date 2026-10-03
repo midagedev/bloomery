@@ -70,10 +70,15 @@ const COVERAGE_Q4KM: &[&str] = &["a tool-call parser for this template"];
 // it joins each shared expert into its layer's routed stacks, of one type, q4_K gate and up and
 // q4_K or q6_K down, so this file's q8_0 shared experts on every layer are two items. Red on the
 // tree before the split: it lists the three q8_0 items and not the shared expert's two.
+// PIN(2026-10-03): the routed stacks are the pins' by part (gate and up q4_K, down q4_K or q6_K)
+// where the default expert rule's card formats let them through to the load's refusal, so the
+// file's q5_K stacks are the two part items (down on 0,2-33,35-37; gate and up on layer 1 alone)
+// where one `q5_K routed experts on a card` line named them.
 const COVERAGE_UD: &[&str] = &[
-    "q5_K routed experts on a card: 0-33,35-37",
+    "q5_K routed experts down, each shared expert joined in (the body reads q4_K and q6_K): 0,2-33,35-37",
     "q8_0 shared expert down, joined into the routed stack (the body reads q4_K and q6_K): 0-39",
     "q8_0 shared expert gate and up, joined into the routed stacks (the body reads q4_K): 0-39",
+    "q5_K routed experts gate and up, each shared expert joined in (the body reads q4_K): 1",
     "a tool-call parser for this template",
 ];
 
