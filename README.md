@@ -36,6 +36,23 @@ Prebuilt, one binary, no CUDA toolkit and no Rust toolchain — Linux x86-64 wit
 (`wsl --install`, reboot, then the same commands in the WSL shell). What each model needs in GPU, RAM and
 disk: [Hardware](#hardware).
 
+Three ways to get it:
+
+```sh
+# Homebrew (Linux x86-64)
+brew install midagedev/tap/bloomery
+
+# or the installer: latest release, sha256-checked, symlink into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
+
+# or Docker (the image builds from this repo; running it needs the host's NVIDIA Container Toolkit)
+git clone https://github.com/midagedev/bloomery && cd bloomery && docker build --platform linux/amd64 -t bloomery tools/release
+docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
+  bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
+```
+
+The plain tarball, when you want to lay it down yourself:
+
 ```sh
 tar -xzf bloomery-0.2.0-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.0-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
