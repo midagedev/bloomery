@@ -45,10 +45,9 @@ brew install midagedev/tap/bloomery
 # or the installer: latest release, sha256-checked, symlink into ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
 
-# or Docker (the image builds from this repo; running it needs the host's NVIDIA Container Toolkit)
-git clone https://github.com/midagedev/bloomery && cd bloomery && docker build --platform linux/amd64 -t bloomery tools/release
+# or Docker (needs the host's NVIDIA Container Toolkit; model downloads live in the bloomery-cache volume)
 docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
-  bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
+  ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 ```
 
 The plain tarball, when you want to lay it down yourself:
