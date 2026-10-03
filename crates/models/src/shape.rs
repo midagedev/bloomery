@@ -709,14 +709,14 @@ mod tests {
 
     /// Qwen3 32/4 × 128 (qwen3moe_meta.rs:409), Qwen3.6 16/2 × 256
     /// (qwen35moe_meta.rs:34), Qwen3.8 24/2 × 256 (q38gqa, 9e5b716),
-    /// Qwen3.5-27B 24/4 × 256 (the Clef backbone's config).
+    /// Qwen3.5-9B 24/4 × 256 (the Clef backbone's config).
     #[test]
     fn every_attention_the_tree_runs_selects_its_flash() {
         for (name, s, head, pack, packs) in [
             ("Qwen3", attn(32, 4, 128), 128, 8, 1),
             ("Qwen3.6", attn(16, 2, 256), 256, 8, 1),
             ("Qwen3.8", attn(24, 2, 256), 256, 4, 3),
-            ("Qwen3.5-27B", attn(24, 4, 256), 256, 2, 3),
+            ("Qwen3.5-9B", attn(24, 4, 256), 256, 2, 3),
         ] {
             let row = select_gqa(s).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!((row.head, row.pack), (head, pack), "{name}");

@@ -1,4 +1,4 @@
-//! The Qwen3.6-35B-A3B (`qwen35moe`) and Qwen3.5-27B (`qwen35`, the Clef
+//! The Qwen3.6-35B-A3B (`qwen35moe`) and Qwen3.5-9B (`qwen35`, the Clef
 //! backbone) `ChainBody`: the family's one layer body (`dispatch::layer`)
 //! over plans that interleave gated-delta-rule layers with gated GQA layers
 //! at head 256 — every routed layer's experts carrying the sigmoid-gated

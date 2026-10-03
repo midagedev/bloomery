@@ -67,7 +67,7 @@
 //!
 //! The `_p2` entry ([`FlashGqaKernels::enqueue_pass_256_p2`]) is the `_p4`
 //! scalar pass in blocks of [`PACK_2`] query heads — two warps — for a group
-//! that is a multiple of two and not of four (Qwen3.5-27B's 24/4): an
+//! that is a multiple of two and not of four (Qwen3.5-9B's 24/4): an
 //! instance of the same `seg_scalar_p`. The tensor-core body needs four warps
 //! a tile, so no `_p2` tensor-core pass exists and a call asking for one is
 //! refused by name.
@@ -965,7 +965,7 @@ const _: () =
     assert!(seg_blocks_hold::<PACK_4>(3, 2, 3, 4) && seg_blocks_hold::<PACK_4>(2, 3, 2, 3));
 const _: () =
     assert!(seg_blocks_hold::<PACK_4>(1, 2, 1, 5) && seg_blocks_hold::<PACK_4>(2, 1, 3, 7));
-// The `_p2` entry's packs of two at group 6 (Qwen3.5-27B's 24/4) and 2.
+// The `_p2` entry's packs of two at group 6 (Qwen3.5-9B's 24/4) and 2.
 const _: () =
     assert!(seg_blocks_hold::<PACK_2>(3, 4, 3, 4) && seg_blocks_hold::<PACK_2>(2, 3, 1, 5));
 

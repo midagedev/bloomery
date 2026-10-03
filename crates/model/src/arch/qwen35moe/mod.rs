@@ -1,5 +1,5 @@
 //! `qwen35moe` — Qwen3.5/3.6 mixture-of-experts (Qwen3.6-35B-A3B), its dense
-//! variant `qwen35` (Qwen3.5-27B and Cloudflare's Clef backbone: the same
+//! variant `qwen35` (Qwen3.5-9B, Cloudflare's Clef backbone: the same
 //! layers with a dense SwiGLU FFN), and its variant `qwen4exp`
 //! (Qwen3.8-Flash-Next). The file's keys (`hparams`),
 //! every tensor's role (`roles`) and the typed description (`spec`), which

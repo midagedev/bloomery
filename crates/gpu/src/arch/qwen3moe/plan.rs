@@ -10,7 +10,7 @@
 //! shared expert. Qwen3.6-35B-A3B interleaves [`MixerPlan::Delta`] (gated
 //! delta rule) with gated GQA at head 256, each followed by 256 routed
 //! experts and a sigmoid-gated shared expert folded in as one more slot of
-//! joined stacks. Qwen3.5-27B has the same mixers and a dense SwiGLU FFN,
+//! joined stacks. Qwen3.5-9B has the same mixers and a dense SwiGLU FFN,
 //! which runs as a stack of one expert, every token's one slot on it at
 //! weight 1 ([`FfnRoute::Dense`]): the routed FFN's launches without the
 //! router. A layer's kind comes from its [`LayerSpec`] — the file's tensors,
@@ -536,7 +536,7 @@ mod tests {
         }
     }
 
-    /// Qwen3.5-27B's layers run: 24/4 heads take the pairs flash, 16/48
+    /// Qwen3.5-9B's layers run: 24/4 heads take the pairs flash, 16/48
     /// delta heads the delta shape, and a dense FFN of 17408 the one-slot
     /// route; a group the body launches no flash for (3: neither eight nor a
     /// whole number of pairs) and a dense width of no whole super-block are

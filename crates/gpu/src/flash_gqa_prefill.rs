@@ -80,7 +80,7 @@
 //! `prefill_256_p`, a PACK-generic copy of the eight-head kernel's.
 //! [`FlashGqaPrefill::enqueue_256_p2`] runs the same body in packs of two
 //! (`gqa_prefill_flash_256_p2`) for a group that is even and not a multiple of
-//! four (Qwen3.5-27B's 24/4): a block takes two heads of thirty-two positions,
+//! four (Qwen3.5-9B's 24/4): a block takes two heads of thirty-two positions,
 //! an m16 fragment eight positions × two heads.
 
 use crate::fault::{FaultSink, FaultSite};
