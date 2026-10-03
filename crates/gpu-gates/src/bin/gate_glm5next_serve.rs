@@ -812,9 +812,12 @@ mod gate {
         };
 
         // The default arm: the rule's own line, the server stopped before
-        // its load.
-        let err_log = own.join("server.err");
-        let mut served = Served::spawn(&args, &own, PLAIN)?;
+        // its load. Each arm's server takes its own directory — `spawn`
+        // writes `server.err` inside the one it is given.
+        let default = own.join("default");
+        std::fs::create_dir_all(&default)?;
+        let err_log = default.join("server.err");
+        let mut served = Served::spawn(&args, &default, PLAIN)?;
         println!("ctx server pid {}", served.child.id());
         let lines = wait_for(&mut served, &err_log, &["ctx rule=", "plan "])?;
         println!("ctx: the default server stopped: {}", served.stop()?);
@@ -906,8 +909,10 @@ mod gate {
         let flag_ctx = FLAG_CTX.to_string();
         let mut flag = args.clone();
         flag.extend_from_slice(&["--ctx", flag_ctx.as_str()]);
-        let err_log = own.join("flag.err");
-        let mut served = Served::spawn(&flag, &own, PLAIN)?;
+        let flagdir = own.join("flag");
+        std::fs::create_dir_all(&flagdir)?;
+        let err_log = flagdir.join("server.err");
+        let mut served = Served::spawn(&flag, &flagdir, PLAIN)?;
         let lines = wait_for(&mut served, &err_log, &["ctx rule="])?;
         println!("ctx: the flag server stopped: {}", served.stop()?);
         let line = lines
