@@ -60,8 +60,9 @@ bloomery-sampler = { path = "../sampler", optional = true }
 # `bloomery-serve-ds41`: the HTTP server's `Engine` over the V4.1 generator (`bind`), and its gate
 # `gate_ds41_serve`, which reads the server's JSON. Reached only through the `deepseek41` feature.
 bloomery-serve = { path = "../serve", optional = true }
-# `bloomery_serve_clef`: Clef's request encoder and joint schema head on the host, served by the
-# decision server of `bloomery-serve`. Reached only through the `clef` feature.
+# `bloomery-serve`'s decide seat: Clef's request encoder and joint schema head on the host, served by
+# the decision server of `bloomery-serve`. Reached only through the `clef` feature, which
+# `bloomery-serve` requires.
 bloomery-decision = { path = "../decision", optional = true }
 serde_json = { version = "=1.0.151", optional = true }
 # `generate_ds41` drives the V4.1 session (`bloomery-app`, its `deepseek41` feature) through the
@@ -116,7 +117,7 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next"]
+required-features = ["glm5next", "clef"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
@@ -135,6 +136,10 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "gate_qwen3_serve"
 required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_clef_serve"
+required-features = ["deepseek41", "clef"]
 
 [[bin]]
 name = "soak_ds41_serve"
@@ -451,10 +456,6 @@ required-features = ["gpu"]
 [[bin]]
 name = "clef_hidden"
 required-features = ["gpu"]
-
-[[bin]]
-name = "bloomery_serve_clef"
-required-features = ["clef"]
 
 [[bin]]
 name = "gate_qwen4exp_mtp"

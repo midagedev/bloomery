@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Clef end to end: one model file through `bloomery_serve_clef` against the official BF16 answers.
+"""Clef end to end: one model file through `bloomery-serve`'s decide seat against the official BF16 answers.
 
-    tools/ref/clef/e2e.py run --model FILE --out DIR [--port 8091] [--bin PATH] [--head PATH] [--data DIR]
+    tools/ref/clef/e2e.py run (--model FILE | --hf REPO:QUANT) --out DIR [--port 8091] [--bin PATH]
+                              [--head PATH] [--data DIR]
     tools/ref/clef/e2e.py table LOG [LOG ...]
+    tools/ref/clef/e2e.py same DIR DIR
     tools/ref/clef/e2e.py --self-test
 
-`run` starts the server on FILE with the release's head (`--head`, default
-/models/clef-flash/hf/joint_head.safetensors), POSTs every request of `tools/ref/clef/suite.jsonl` (English)
-and `suite-ko.jsonl` (Korean) that has an official row (`<data>/clef/flash/ref/reference.jsonl` and
-`ref-ko/reference.jsonl`, `--data` default $BLOOMERY_DATA or /root/bloomery-data), and stops the server by
-the pid captured at its spawn (written to `<out>/serve.pid`; signalled only while `/proc/<pid>/comm` names
-the server). It writes `<out>/rows.json` (each request's response, the official one and the wall) and
+`run` starts the server (`--bin`, default target/release/bloomery-serve) on FILE (`-m FILE`) with the
+release's head (`--head`, default /models/clef-flash/hf/joint_head.safetensors), or on `--hf REPO:QUANT`
+with the head the seat finds for the repo (`--head` only when given), `BLOOMERY_REF_MODEL` left out of its environment, POSTs every request of
+`tools/ref/clef/suite.jsonl` (English) and `suite-ko.jsonl` (Korean) that has an official row
+(`<data>/clef/flash/ref/reference.jsonl` and `ref-ko/reference.jsonl`, `--data` default $BLOOMERY_DATA or
+/root/bloomery-data), and stops the server by the pid captured at its spawn (written to `<out>/serve.pid`;
+signalled only while `/proc/<pid>/comm` is the comm `--bin`'s file name gives, its first 15 bytes). It
+writes `<out>/rows.json` (each request's response, its body as sent, the official one and the wall) and
 `<out>/serve.log` (the server's stderr), and prints one line a question then `TOPS a/n`: the log `table`
-reads. A server that does not print its listening line, or a response with no answers, stops the run by name
-(rc 1) after the server is stopped.
+reads. A server whose first stdout line is not its listening line, or a response with no answers, stops the
+run by name (rc 1) after the server is stopped.
+
+`same` holds two runs' bodies equal byte for byte with each body's `timings` (the server's last key) taken
+out: it prints `SAME n/n`, or names the first request that differs and exits 1.
 
 A question's top is the answer the body picks: a noul's yes when its p >= 0.5, a choice's `choice`, else the
 most probable option; its p is that answer's probability. |dp| is |p(ours, our top) - p(official, its top)|,
@@ -81,6 +88,37 @@ def lines(rows: list[dict]) -> list[str]:
     return out
 
 
+TIMINGS = re.compile(r',?"timings":\{[^{}]*\}\}\s*$')
+
+
+def untimed(body: str) -> str:
+    """`body` with its `timings` object, the last key the server appends, taken out; a body with none
+    raises by name."""
+    out, n = TIMINGS.subn("}", body)
+    if n != 1:
+        raise SystemExit(f"e2e: a body with no timings as its last key: {body[:300]}")
+    return out
+
+
+def same(a: list[dict], b: list[dict]) -> list[str]:
+    """`same`'s lines for two runs' rows: `SAME n/n`, or the first request whose untimed body differs (raises
+    by name)."""
+    ka, kb = [(r["suite"], r["id"]) for r in a], [(r["suite"], r["id"]) for r in b]
+    if ka != kb:
+        raise SystemExit(f"e2e same: the runs posted other requests: {ka} and {kb}")
+    for ra, rb in zip(a, b):
+        if untimed(ra["raw"]) != untimed(rb["raw"]):
+            raise SystemExit(f"e2e same: {ra['suite']} {ra['id']} differs:\n{untimed(ra['raw'])}\n"
+                             f"{untimed(rb['raw'])}")
+    return [f"SAME {len(a)}/{len(b)}"]
+
+
+def owns(comm: str | None, binp: str) -> bool:
+    """Whether `comm` (`/proc/<pid>/comm`) is the server `binp` started: the kernel keeps the first 15 bytes
+    of the file name."""
+    return comm is not None and comm == Path(binp).name.encode()[:15].decode(errors="ignore")
+
+
 LINE = re.compile(r"^(?P<suite>en|ko) (?P<id>\S+) (?P<q>.+?)\t(?P<to>[^/\t]*)/(?P<tr>[^\t]*)\t(?P<ok>ok|MISS)\t"
                   r"p (?P<po>[\d.]+)/(?P<pr>[\d.]+)\t\|dp\| (?P<dp>[\d.]+)\tprompt_n (?P<n>\d+)\t"
                   r"prompt_ms (?P<ms>[\d.]+)\thead_ms (?P<head>[\d.]+)$")
@@ -133,13 +171,13 @@ def row(s: dict) -> str:
             f"{misses or '—'} |")
 
 
-def stop(p: subprocess.Popen) -> None:
-    """SIGTERM the server spawned as `p` while its comm still names it; SIGKILL after 30 s."""
+def stop(p: subprocess.Popen, binp: str) -> None:
+    """SIGTERM the server spawned as `p` from `binp` while its comm still names it; SIGKILL after 30 s."""
     try:
         comm = Path(f"/proc/{p.pid}/comm").read_text().strip()
     except OSError:
         comm = None
-    if comm and comm.startswith("bloomery_serve"):
+    if owns(comm, binp):
         os.kill(p.pid, signal.SIGTERM)
         try:
             p.wait(30)
@@ -151,13 +189,13 @@ def stop(p: subprocess.Popen) -> None:
 
 def run(argv: list[str]) -> int:
     a = dict(zip(argv[::2], argv[1::2]))
-    if len(argv) % 2 or not {"--model", "--out"} <= a.keys() or a.keys() - {"--model", "--out", "--port", "--bin",
-                                                                              "--head", "--data"}:
+    keys = {"--model", "--hf", "--out", "--port", "--bin", "--head", "--data"}
+    if len(argv) % 2 or "--out" not in a or len({"--model", "--hf"} & a.keys()) != 1 or a.keys() - keys:
         raise SystemExit(__doc__)
     out = Path(a["--out"])
     out.mkdir(parents=True, exist_ok=True)
     port = int(a.get("--port", "8091"))
-    binp = a.get("--bin", str(ROOT / "target/release/bloomery_serve_clef"))
+    binp = a.get("--bin", str(ROOT / "target/release/bloomery-serve"))
     data = Path(a.get("--data", os.environ.get("BLOOMERY_DATA", "/root/bloomery-data")))
     refs = {}
     for suite, _, refp in SUITES:
@@ -166,7 +204,13 @@ def run(argv: list[str]) -> int:
             refs[(suite, r["id"])] = r["response"]
     log = open(out / "serve.log", "w")
     t0 = time.time()
-    p = subprocess.Popen([binp, "--model", a["--model"], "--head", a.get("--head", HEAD), "--port", str(port)],
+    if "--model" in a:
+        model = ["-m", a["--model"], "--head", a.get("--head", HEAD)]
+    else:
+        model = ["--hf", a["--hf"]] + (["--head", a["--head"]] if "--head" in a else [])
+    # The model is named once, by the flags: the gates' BLOOMERY_REF_MODEL beside them is a second name.
+    env = {k: v for k, v in os.environ.items() if k != "BLOOMERY_REF_MODEL"}
+    p = subprocess.Popen([binp, *model, "--port", str(port)], env=env,
                          stdout=subprocess.PIPE, stderr=log, text=True, start_new_session=True)
     (out / "serve.pid").write_text(f"{p.pid}\n")
     try:
@@ -187,16 +231,18 @@ def run(argv: list[str]) -> int:
                                             headers={"Content-Type": "application/json"})
                 t1 = time.time()
                 try:
-                    resp = json.loads(urllib.request.urlopen(hr, timeout=300).read())
+                    raw = urllib.request.urlopen(hr, timeout=300).read().decode()
+                    resp = json.loads(raw)
                 except urllib.error.HTTPError as e:
-                    resp = {"error": e.code, "body": e.read().decode()[:500]}
-                rows.append({"suite": suite, "id": rid, "resp": resp, "ref": refs[(suite, rid)],
+                    raw = e.read().decode()
+                    resp = {"error": e.code, "body": raw[:500]}
+                rows.append({"suite": suite, "id": rid, "resp": resp, "raw": raw, "ref": refs[(suite, rid)],
                              "wall_ms": (time.time() - t1) * 1000})
         (out / "rows.json").write_text(json.dumps(rows))
         for l in lines(rows):
             print(l, flush=True)
     finally:
-        stop(p)
+        stop(p, binp)
     return 0
 
 
@@ -216,7 +262,8 @@ def self_test() -> None:
         req("ko", "b-1", 4067, 900.0, 20.0, {"부서": noul}, {"부서": {"type": "noul", "noul": 0.71}}),
         req("ko", "b-2", 250, 50.0, 25.0, {"x": multi}, {"x": multi}),
     ]
-    log = "open 1.0s: bloomery_serve_clef: listening on http://127.0.0.1:1 (model m-Q3_K_M.gguf, quant Q3_K_M)\n"
+    log = ("open 1.0s: bloomery-serve: listening on http://127.0.0.1:1 (model m-Q3_K_M.gguf, quant Q3_K_M, "
+           "head joint_head.safetensors, row clef)\n")
     log += "\n".join(lines(rows))
     s = summary(log)
     assert s["model"] == "m-Q3_K_M.gguf", s
@@ -240,6 +287,27 @@ def self_test() -> None:
         assert "TOPS 4/4" in str(e), e
     else:
         raise AssertionError("a TOPS line that disagrees with its lines passed")
+    # The server's comm is the first 15 bytes of its file name; another process's comm is not it.
+    assert owns("bloomery-serve", "/x/target/release/bloomery-serve")
+    assert owns("a_long_server_n", "/x/a_long_server_name")
+    assert not owns("bloomery_serve_", "/x/target/release/bloomery-serve")
+    assert not owns(None, "/x/bloomery-serve") and not owns("bash", "/x/bloomery-serve")
+    # `same`: bodies equal once `timings` is out; a differing byte, a body with no timings and another
+    # request list stop by name.
+    body = '{"answers":{"q":{"type":"noul","noul":0.5}},"timings":{"prompt_n":3,"prompt_ms":1.5,"head_ms":2.0,"cache_n":0}}'
+    other = body.replace('"prompt_ms":1.5', '"prompt_ms":9.25')
+    ra = [{"suite": "en", "id": "a", "raw": body}]
+    assert untimed(body) == '{"answers":{"q":{"type":"noul","noul":0.5}}}', untimed(body)
+    assert same(ra, [{"suite": "en", "id": "a", "raw": other}]) == ["SAME 1/1"]
+    for bad, want in (([{"suite": "en", "id": "a", "raw": body.replace("0.5", "0.50")}], "differs"),
+                      ([{"suite": "en", "id": "a", "raw": '{"answers":{}}'}], "no timings"),
+                      ([{"suite": "en", "id": "b", "raw": body}], "other requests")):
+        try:
+            same(ra, bad)
+        except SystemExit as e:
+            assert want in str(e), e
+        else:
+            raise AssertionError(f"same passed {bad}")
     print("e2e self-test ok")
 
 
@@ -249,6 +317,11 @@ def main() -> int:
         return 0
     if len(sys.argv) >= 2 and sys.argv[1] == "run":
         return run(sys.argv[2:])
+    if len(sys.argv) == 4 and sys.argv[1] == "same":
+        rows = [json.loads((Path(d) / "rows.json").read_text()) for d in sys.argv[2:]]
+        for l in same(*rows):
+            print(l)
+        return 0
     if len(sys.argv) >= 3 and sys.argv[1] == "table":
         print("| file | size (GB) | tops /31 | English /16 | Korean /15 | max abs dp | mean abs dp | "
               "prefill tok/s | head_ms median | misses (question: official, ours) |")

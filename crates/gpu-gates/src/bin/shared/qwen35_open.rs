@@ -1,5 +1,6 @@
-//! What `clef_hidden` and its gate share: the ids file reader and the load
-//! of a Qwen3.5 dense file (`qwen35`, Clef's backbone) for its prompt call.
+//! The load of a Qwen3.5 dense file (`qwen35`, Clef's backbone) for its
+//! prompt call, which `clef_hidden`, its gate and `bloomery-serve`'s decide
+//! seat share, and the ids file reader of the first two.
 
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::{Open35, Qwen35moeModel};
@@ -39,8 +40,12 @@ pub fn read_ids(path: &Path, n: Option<usize>) -> Result<Vec<u32>, GateError> {
 }
 
 /// The `qwen35` file at `path`, whole on one card: a cache of `ctx` rows,
-/// prompt ubatches of `ubatch` ids, the scalar decode flash (group 6 has no
-/// tensor-core pass). A file of any other architecture is refused by name.
+/// prompt ubatches of `ubatch` ids, the scalar flash for the row passes
+/// (`mma` false). The 27B file's group of 6 query heads a KV head runs the
+/// pairs' pass, which has no tensor-core form and is refused with `mma` at
+/// load; Clef-Flash's group of 4 would take it, but `gate_clef_hidden` holds
+/// the scalar pass, so every file opens with it. A file of any other
+/// architecture is refused by name.
 pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, Split), GateError> {
     let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let want = Arch::Qwen35.name();

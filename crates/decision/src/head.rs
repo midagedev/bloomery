@@ -16,6 +16,22 @@ use crate::json::{self, Json};
 use crate::ops::{self, Mha, dot, gelu, layer_norm, layer_normed, linear, normalized};
 use crate::safetensors::Safetensors;
 
+/// The head config's file name beside the head's weights.
+pub const CONFIG_FILE: &str = "joint_head_config.json";
+
+/// The config's keys, in [`HeadConfig`]'s field order.
+const KEYS: [&str; 6] = [
+    "hidden_size",
+    "width",
+    "routing_layers",
+    "layers",
+    "heads",
+    "feedforward",
+];
+
+/// The key the config may carry beside [`KEYS`], which has no effect at inference.
+const DROPOUT: &str = "dropout";
+
 /// `joint_head_config.json`: the head's shape (`dropout` is accepted and has no effect at inference).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadConfig {
@@ -28,22 +44,39 @@ pub struct HeadConfig {
 }
 
 impl HeadConfig {
+    /// Whether the config file's text is a Clef head's: a JSON object of exactly the config's keys
+    /// (`dropout` optional), whatever their values, which [`HeadConfig::parse`] checks. A text that is
+    /// not is refused with why.
+    pub fn recognise(text: &str) -> Result<(), Error> {
+        let Json::Object(pairs) = json::parse(text)? else {
+            return Err(Error::HeadConfig("the config is not a JSON object".into()));
+        };
+        let unknown: Vec<&str> = pairs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| *k != DROPOUT && !KEYS.contains(k))
+            .collect();
+        let missing: Vec<&str> = KEYS
+            .iter()
+            .copied()
+            .filter(|k| !pairs.iter().any(|(p, _)| p == k))
+            .collect();
+        if unknown.is_empty() && missing.is_empty() {
+            return Ok(());
+        }
+        Err(Error::HeadConfig(format!(
+            "unknown keys {unknown:?}, missing keys {missing:?}"
+        )))
+    }
+
     /// Parse the config file's text; an unknown or missing key is refused by name.
     pub fn parse(text: &str) -> Result<HeadConfig, Error> {
         let Json::Object(pairs) = json::parse(text)? else {
             return Err(Error::HeadConfig("the config is not a JSON object".into()));
         };
         let mut vals = [None; 6];
-        const KEYS: [&str; 6] = [
-            "hidden_size",
-            "width",
-            "routing_layers",
-            "layers",
-            "heads",
-            "feedforward",
-        ];
         for (k, v) in &pairs {
-            if k == "dropout" {
+            if k == DROPOUT {
                 continue;
             }
             let i = KEYS
@@ -209,12 +242,9 @@ pub struct ClefHead {
 pub type Rows<'a> = dyn FnMut(&[u32]) -> Result<Vec<f32>, String> + 'a;
 
 impl ClefHead {
-    /// The head at `path` with its config: `config`, or `joint_head_config.json` beside the file.
+    /// The head at `path` with its config: `config`, or [`CONFIG_FILE`] beside the file.
     pub fn open(path: &Path, config: Option<&Path>) -> Result<ClefHead, Error> {
-        let cfg_path = config.map_or_else(
-            || path.with_file_name("joint_head_config.json"),
-            Path::to_path_buf,
-        );
+        let cfg_path = config.map_or_else(|| path.with_file_name(CONFIG_FILE), Path::to_path_buf);
         let text = std::fs::read_to_string(&cfg_path)
             .map_err(|e| Error::Io(cfg_path.display().to_string(), e))?;
         ClefHead::from_safetensors(&Safetensors::open(path)?, HeadConfig::parse(&text)?)
@@ -723,6 +753,32 @@ mod tests {
             (r#"{"hidden": 16}"#, "unknown key"),
         ] {
             let e = HeadConfig::parse(text).unwrap_err().to_string();
+            assert!(e.contains(want), "{text}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_config_is_recognised_by_its_keys_alone() {
+        // Clef's keys with a value parse refuses are still Clef's config: parse names the value.
+        for text in [
+            r#"{"hidden_size": 16, "width": 8, "routing_layers": 2, "layers": 1, "heads": 2, "feedforward": 12, "dropout": 0.1}"#,
+            r#"{"hidden_size": 16, "width": 8, "routing_layers": 2, "layers": 1, "heads": 3, "feedforward": 12}"#,
+        ] {
+            assert!(HeadConfig::recognise(text).is_ok(), "{text}");
+        }
+        for (text, want) in [
+            (
+                r#"{"hidden_size": 16, "width": 8, "routing_layers": 2, "layers": 1, "heads": 2}"#,
+                r#"missing keys ["feedforward"]"#,
+            ),
+            (
+                r#"{"hidden_size": 16, "width": 8, "routing_layers": 2, "layers": 1, "heads": 2, "feedforward": 12, "labels": 3}"#,
+                r#"unknown keys ["labels"]"#,
+            ),
+            (r#"{"num_labels": 2}"#, r#"unknown keys ["num_labels"]"#),
+            ("[1]", "not a JSON object"),
+        ] {
+            let e = HeadConfig::recognise(text).unwrap_err().to_string();
             assert!(e.contains(want), "{text}: {e}");
         }
     }

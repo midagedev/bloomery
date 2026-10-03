@@ -5,11 +5,14 @@
 //! them, and the path it resolves is the process's model file
 //! ([`set_model_file`]), which [`crate::ref_model_path`] reads before the
 //! gates' `$BLOOMERY_REF_MODEL`. The rules of a model named twice are
-//! [`hf::source`]'s.
+//! [`hf::source`]'s. A decision model's head comes from the repo a `--hf`
+//! repo's model card says it quantizes ([`quantized_from`]), fetched by
+//! [`fetch_exact`].
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use hf::HfError;
 use hf::fetch::{Client, Event};
 use hf::source::{self, Flags, Source};
 
@@ -118,19 +121,33 @@ pub fn fetch_exact(repo: &str, paths: &[&str]) -> Result<Vec<PathBuf>, GateError
     Ok(client()?.resolve_exact(repo, paths, &mut print)?)
 }
 
-/// A server's model file from its arguments: the flags taken out
-/// ([`take`]), resolved beside `$BLOOMERY_REF_MODEL` ([`resolve`]) and set
-/// as the process's ([`set_model_file`]) when they name one; the rest of
-/// the arguments.
-pub fn from_args(args: &[String], path_flags: &[&str]) -> Result<Vec<String>, GateError> {
-    let (flags, rest) = take(args, path_flags)?;
+/// The repo the model card of `repo` (its `README.md`, fetched and checked
+/// as any file of it) says `repo` quantizes ([`hf::card::quantizes`]);
+/// `None` when the repo has no card or its card says no such thing.
+pub fn quantized_from(repo: &str) -> Result<Option<String>, GateError> {
+    let card = match client()?.resolve_exact(repo, &["README.md"], &mut print) {
+        Ok(paths) => paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| format!("{repo}: the card's fetch returned no file"))?,
+        Err(HfError::NoFile { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let text = std::fs::read_to_string(&card).map_err(|e| format!("{}: {e}", card.display()))?;
+    Ok(hf::card::quantizes(&text))
+}
+
+/// The model file `flags` name, resolved beside `$BLOOMERY_REF_MODEL`
+/// ([`resolve`]) and set as the process's ([`set_model_file`]) when they
+/// name one.
+pub fn name(flags: &Flags) -> Result<(), GateError> {
     let env = std::env::var("BLOOMERY_REF_MODEL").ok();
-    if flags != Flags::default()
-        && let Some(path) = resolve(&flags, env.as_deref())?
+    if *flags != Flags::default()
+        && let Some(path) = resolve(flags, env.as_deref())?
     {
         set_model_file(path)?;
     }
-    Ok(rest)
+    Ok(())
 }
 
 /// `<bin> <version> (commit <c>)`: this crate's version and the commit the

@@ -16,6 +16,7 @@ mod genloop;
 pub mod glmxml;
 mod http;
 pub mod mock;
+mod models;
 mod promptcache;
 pub mod reasoning;
 pub mod sampling;

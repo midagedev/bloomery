@@ -5,7 +5,8 @@
 //!
 //! [`json`] reads a request as Python does, [`render`] writes JSON as Python does, [`request`]
 //! validates, [`encode`] builds the ids, [`safetensors`] and [`head`] load and run the head,
-//! [`rows`] gives the head its output embedding rows from a GGUF file, [`answer`] builds the body.
+//! [`rows`] gives the head its output embedding rows from a GGUF file, [`answer`] builds the body;
+//! [`release`] holds what a server needs to seat Clef.
 
 pub mod answer;
 pub mod encode;
@@ -13,6 +14,7 @@ pub mod head;
 pub mod json;
 mod ops;
 mod pool;
+pub mod release;
 pub mod render;
 pub mod request;
 pub mod rows;
@@ -33,8 +35,9 @@ pub enum Error {
     JsonLoneSurrogate(u32),
     #[error("{0}")]
     Request(String),
-    #[error("{0}: this engine answers text requests only")]
-    Media(&'static str),
+    /// A request this engine cannot answer (images, videos): llama.cpp's 501 `not_supported_error`.
+    #[error("{0}")]
+    NotSupported(String),
     #[error("{id}: {what}")]
     Question { id: String, what: String },
     #[error("{question}: {what} span is empty (its mean would be NaN)")]

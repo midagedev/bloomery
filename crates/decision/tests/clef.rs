@@ -310,12 +310,14 @@ fn hw_clef_answer_matches_the_release() {
         let id = id_of(row);
         let req = Request::from_json(&reqs[&id]).unwrap();
         let (enc, ours) = our_logits(&head, row);
-        let body = answer(&req, &enc, &ours).unwrap();
+        // The release echoes the request's model; the engine names the one it serves.
+        let model = reqs[&id].get("model").and_then(Json::as_str).unwrap();
+        let body = answer(&req, &enc, &ours, model).unwrap();
         let referee: Vec<Vec<f32>> = logits_of(row, "logits_f64_head")
             .iter()
             .map(|q| q.iter().map(|&v| v as f32).collect())
             .collect();
-        let body64 = answer(&req, &enc, &referee).unwrap();
+        let body64 = answer(&req, &enc, &referee, model).unwrap();
         let release = row.get("response").unwrap();
         let (mut n_ours, mut n_rel, mut n_64) = (Vec::new(), Vec::new(), Vec::new());
         let shape_ok = numbers(&body, "", &mut n_ours) == numbers(release, "", &mut n_rel);
@@ -366,14 +368,14 @@ fn hw_clef_answer_matches_the_release() {
     assert!(bad.is_empty(), "answers differ from the release: {bad:?}");
 }
 
-/// The probability an answer reports for its top option.
+/// The probability an answer reports for its top option (`confidence` is llama.cpp's formula in
+/// ours and the top probability in the release's, so it is not compared).
 fn json_num(a: &Json) -> String {
-    let key = if a.get("type").and_then(Json::as_str) == Some("noul") {
-        "noul"
+    let p = if a.get("type").and_then(Json::as_str) == Some("noul") {
+        a.get("noul")
     } else {
-        "confidence"
+        a.get("probabilities").and_then(|p| p.get(&top(a)))
     };
-    a.get(key)
-        .and_then(Json::as_f64)
+    p.and_then(Json::as_f64)
         .map_or_else(|| "?".into(), |v| v.to_string())
 }

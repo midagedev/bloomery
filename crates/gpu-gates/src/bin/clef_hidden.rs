@@ -37,12 +37,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
-#[path = "shared/clef.rs"]
-mod clef;
+#[path = "shared/qwen35_open.rs"]
+mod qwen35_open;
 
 #[cfg(feature = "gpu")]
 mod run {
-    use super::clef;
+    use super::qwen35_open;
     use bloomery_gpu::arch::qwen3moe::PrefillPath;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu_gates::GateError;
@@ -125,9 +125,9 @@ mod run {
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let a = parse()?;
-        let ids = clef::read_ids(&a.ids, a.count)?;
+        let ids = qwen35_open::read_ids(&a.ids, a.count)?;
         let ctx = a.ctx.unwrap_or(ids.len());
-        let (mut engine, split) = clef::open(&a.model, ctx, a.ubatch.min(ctx))?;
+        let (mut engine, split) = qwen35_open::open(&a.model, ctx, a.ubatch.min(ctx))?;
         for _ in 0..a.warm {
             engine.reset()?;
             engine.prefill_hidden(&ids, PrefillPath::Auto)?;
@@ -146,7 +146,7 @@ mod run {
             .f("tok/s", ids.len() as f64 / (ms / 1e3))
             .print();
         if let Some((row_ids, rows_out)) = &a.rows {
-            let ids = clef::read_ids(row_ids, None)?;
+            let ids = qwen35_open::read_ids(row_ids, None)?;
             let gguf = split.shard(0).ok_or("the model file has no shard 0")?;
             let rows = model::arch::qwen35moe::output_rows(gguf, &ids)?;
             let bytes = write_f32(rows_out, &rows.data)?;

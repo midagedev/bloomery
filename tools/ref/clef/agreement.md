@@ -1,6 +1,6 @@
 # Clef-Flash: each published GGUF against the BF16 release
 
-Cloudflare's [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) answered by bloomery (`bloomery_serve_clef`, `POST /v1/systemone`) from each of [bartowski's GGUFs](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF) (rev `d7f376ea`), with the release's own head file, against the release's own Python at BF16 (`tools/ref/clef_ref.py`, rev `17f0b0ad`). The requests are `suite.jsonl` (8, English) and `suite-ko.jsonl` (7, Korean): 31 questions. `e2e.py` runs a file and prints its row.
+Cloudflare's [Clef-Flash](https://huggingface.co/Cloudflare/clef-flash) answered by bloomery (`bloomery-serve`'s decide seat, `POST /v1/systemone`; the rows were measured through its predecessor `bloomery_serve_clef`, whose bodies the seat gives byte for byte on `Q3_K_S`) from each of [bartowski's GGUFs](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF) (rev `d7f376ea`), with the release's own head file, against the release's own Python at BF16 (`tools/ref/clef_ref.py`, rev `17f0b0ad`). The requests are `suite.jsonl` (8, English) and `suite-ko.jsonl` (7, Korean): 31 questions. `e2e.py` runs a file and prints its row.
 
 | file | size (GB) | tops /31 | English /16 | Korean /15 | max abs dp | mean abs dp | prefill tok/s (n 4,067) | head_ms median | misses (question: official, ours) |
 |---|---|---|---|---|---|---|---|---|---|
@@ -30,3 +30,14 @@ Not supported yet (refused by name at load, before any upload):
 | Q2_K / IQ2_M | 3.64 / 3.54 | Q2_K sites (IQ2_M: IQ2_S, IQ3_S, IQ3_XXS, IQ4_XS); token_embd Q3_K |
 
 Answers are compared with the official BF16 release (tools/ref/clef/e2e.py; |dp| = |p(ours, our top) − p(official, its top)|; tops and |dp| repeat exactly between runs). The official BF16 is itself near a tie on `risk` (top "1" at p 0.474). Prefill and head_ms come from one sitting, each server alone on the A6000, one request (functional, no lease); the same file moves about 3–4 % between sittings. head_ms is the host joint head, the same work for every file. Sizes are the files' bytes / 1e9; each sha256 equals Hugging Face's LFS oid (rev d7f376ea).
+
+The response's `confidence` changed meaning after these rows: it is now llama.cpp's wire formula
+(`tools/server/server-decision.cpp` at `a4cb4c61`: a choice's `max(0, (p_max − u) / (1 − u))`, a score's
+`max(0, 1 − dist / dist_uniform)`), not the release's top probability. The table reads tops and
+probabilities only (|dp| is on the top option's probability), so its rows stand. The answer's `model` is
+now the server's name for the model, not the request's.
+
+`suite-upstream.jsonl` is `suite.jsonl` with `instructions` given to the four questions that had none
+(`route-01/urgency`, `guard-04/severity`, `review-05/risk`, `sentiment-07/sentiment`): llama.cpp's server
+refuses a question without them, so this file is the input both servers accept, for a later cross-check
+against llama-server. It has no official rows of its own.

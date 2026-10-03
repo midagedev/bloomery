@@ -3,7 +3,13 @@
 //! Per question, the softmax runs in f32 over the options in span order; each probability is then the
 //! f64 of that f32 (torch's `.tolist()`), and every printed number is Python's `round(x, 4)`. A `choice`
 //! answer lists its options in the request's criteria order and picks the first highest there; a
-//! `score` is `sum(i · p_i)` as Python 3.12's `sum` adds floats (Neumaier-compensated).
+//! `score` is `sum(i · p_i)` as Python 3.12's `sum` adds floats (Neumaier-compensated). `confidence`
+//! is the wire's, llama.cpp's server (`tools/server/server-decision.cpp` at `a4cb4c61`,
+//! `decision_confidence_choice` and `decision_confidence_score`, TypeSafe's formulas): a choice's
+//! `max(0, (p_max − u) / (1 − u))` with `u` the uniform probability, a score's
+//! `max(0, 1 − dist / dist_uniform)` with `dist` the mean distance of the levels to the most probable
+//! one and `dist_uniform` that of the uniform distribution to the middle level. `model` is the
+//! server's name for the model, as llama.cpp's server answers.
 
 use crate::Error;
 use crate::encode::Encoded;
@@ -46,8 +52,47 @@ fn num(x: f64) -> Json {
     Json::Float(x)
 }
 
-/// The response body for `req`, encoded as `enc`, with `logits` from the head.
-pub fn answer(req: &Request, enc: &Encoded, logits: &[Vec<f32>]) -> Result<Json, Error> {
+/// A choice's confidence over its options' probabilities `p`: `(p_max − u) / (1 − u)` clamped at
+/// 0, `u = 1 / n`; one option is certain.
+fn confidence_choice(p: &[f64]) -> f64 {
+    if p.len() < 2 {
+        return 1.0;
+    }
+    let u = 1.0 / p.len() as f64;
+    let p_max = p.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    ((p_max - u) / (1.0 - u)).max(0.0)
+}
+
+/// A score's confidence over its levels' probabilities `p`: one less the mean distance to the first
+/// most probable level over that of the uniform distribution to the middle level, clamped at 0; one
+/// level is certain.
+fn confidence_score(p: &[f64]) -> f64 {
+    let n = p.len();
+    if n < 2 {
+        return 1.0;
+    }
+    let mut mode = 0;
+    for (i, &x) in p.iter().enumerate() {
+        if x > p[mode] {
+            mode = i;
+        }
+    }
+    let (mut dist, mut dist_uniform) = (0.0f64, 0.0f64);
+    for (i, &x) in p.iter().enumerate() {
+        dist += x * (i as f64 - mode as f64).abs();
+        dist_uniform += (i as f64 - (n - 1) as f64 / 2.0).abs() / n as f64;
+    }
+    (1.0 - dist / dist_uniform).max(0.0)
+}
+
+/// The response body for `req`, encoded as `enc`, with `logits` from the head, answered by the
+/// model the server names `model`.
+pub fn answer(
+    req: &Request,
+    enc: &Encoded,
+    logits: &[Vec<f32>],
+    model: &str,
+) -> Result<Json, Error> {
     if logits.len() != enc.questions.len() || req.questions.len() != enc.questions.len() {
         return Err(Error::Logits(format!(
             "{} logit rows for {} questions",
@@ -93,7 +138,12 @@ pub fn answer(req: &Request, enc: &Encoded, logits: &[Vec<f32>]) -> Result<Json,
                 vec![
                     ("type".into(), Json::Str("choice".into())),
                     ("choice".into(), Json::Str(best.into())),
-                    ("confidence".into(), num(round4(p(best)))),
+                    (
+                        "confidence".into(),
+                        num(round4(confidence_choice(
+                            &order.iter().map(|&o| p(o)).collect::<Vec<_>>(),
+                        ))),
+                    ),
                     (
                         "probabilities".into(),
                         Json::Object(
@@ -111,11 +161,15 @@ pub fn answer(req: &Request, enc: &Encoded, logits: &[Vec<f32>]) -> Result<Json,
                 };
                 let ids: Vec<String> = (0..levels.len()).map(|i| i.to_string()).collect();
                 let score = python_sum(ids.iter().enumerate().map(|(i, id)| i as f64 * p(id)));
-                let top = ids.iter().map(|id| p(id)).fold(f64::NEG_INFINITY, f64::max);
                 vec![
                     ("type".into(), Json::Str("score".into())),
                     ("score".into(), num(round4(score))),
-                    ("confidence".into(), num(round4(top))),
+                    (
+                        "confidence".into(),
+                        num(round4(confidence_score(
+                            &ids.iter().map(|id| p(id)).collect::<Vec<_>>(),
+                        ))),
+                    ),
                     (
                         "legend".into(),
                         Json::Object(ids.iter().cloned().zip(levels.iter().cloned()).collect()),
@@ -134,7 +188,7 @@ pub fn answer(req: &Request, enc: &Encoded, logits: &[Vec<f32>]) -> Result<Json,
         answers.push((q.id.clone(), Json::Object(body)));
     }
     Ok(Json::Object(vec![
-        ("model".into(), Json::Str(req.model.clone())),
+        ("model".into(), Json::Str(model.to_owned())),
         ("answers".into(), Json::Object(answers)),
         (
             "usage".into(),
@@ -186,7 +240,7 @@ mod tests {
         )
         .unwrap();
         (
-            dumps(&answer(&req, &enc, logits).unwrap(), false),
+            dumps(&answer(&req, &enc, logits, "served").unwrap(), false),
             enc.ids.len(),
         )
     }
@@ -201,13 +255,15 @@ mod tests {
                "outage":{"type":"noul"}}}"#,
             &[vec![0.0, 2.0], vec![0.0, 1.0, 0.5], vec![1.0, -1.0]],
         );
-        // p(technical) = 1/(1+e⁻²) = 0.880797; urgency p = softmax(0, 1, 0.5) = (0.186324, 0.506480,
-        // 0.307196); score = 0.506480 + 2·0.307196 = 1.120872.
+        // p(technical) = 1/(1+e⁻²) = 0.880797, its confidence (0.880797 − ½)/½ = 0.761594; urgency
+        // p = softmax(0, 1, 0.5) = (0.186324, 0.506480, 0.307196); score = 0.506480 + 2·0.307196 =
+        // 1.120872; its confidence 1 − (0.186324 + 0.307196)/(2/3) = 0.259720. The body names the
+        // served model, not the request's.
         let want = format!(
             "{}{}{}{}{}",
-            r#"{"model":"clef-flash","answers":{"department":{"type":"choice","choice":"technical","confidence":0.8808,"#,
+            r#"{"model":"served","answers":{"department":{"type":"choice","choice":"technical","confidence":0.7616,"#,
             r#""probabilities":{"technical":0.8808,"billing":0.1192}},"#,
-            r#""urgency":{"type":"score","score":1.1209,"confidence":0.5065,"legend":{"0":"Can wait","1":"This week","2":"Today"},"#,
+            r#""urgency":{"type":"score","score":1.1209,"confidence":0.2597,"legend":{"0":"Can wait","1":"This week","2":"Today"},"#,
             r#""probabilities":{"0":0.1863,"1":0.5065,"2":0.3072}},"outage":{"type":"noul","noul":0.8808}},"#,
             format_args!(r#""usage":{{"input_tokens":{n},"output_tokens":0}}}}"#),
         );
@@ -221,7 +277,7 @@ mod tests {
             &[vec![0.0, 0.0]],
         );
         assert!(
-            got.contains(r#""choice":"b","confidence":0.5,"probabilities":{"b":0.5,"a":0.5}"#),
+            got.contains(r#""choice":"b","confidence":0.0,"probabilities":{"b":0.5,"a":0.5}"#),
             "{got}"
         );
     }
@@ -239,9 +295,29 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            answer(&req, &enc, &[vec![0.0]]),
+            answer(&req, &enc, &[vec![0.0]], "m"),
             Err(Error::Logits(_))
         ));
-        assert!(matches!(answer(&req, &enc, &[]), Err(Error::Logits(_))));
+        assert!(matches!(
+            answer(&req, &enc, &[], "m"),
+            Err(Error::Logits(_))
+        ));
+    }
+
+    /// llama.cpp's confidence formulas on hand-computed cases: a choice's distance of p_max above
+    /// uniform, a score's distance to the mode against the uniform one, each clamped at 0; one
+    /// option or level is certain.
+    #[test]
+    fn confidence_is_llama_cpps() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        // (0.7 − 1/3) / (2/3) = 0.55.
+        assert!(close(confidence_choice(&[0.7, 0.2, 0.1]), 0.55));
+        assert_eq!(confidence_choice(&[0.25; 4]), 0.0);
+        assert_eq!(confidence_choice(&[1.0]), 1.0);
+        // Mode 0: dist = 0.1·1 + 0.1·2 = 0.3; uniform's = (1 + 0 + 1)/3; 1 − 0.3·1.5 = 0.55.
+        assert!(close(confidence_score(&[0.8, 0.1, 0.1]), 0.55));
+        // Uniform levels: the first is the mode, dist 1 against 2/3, clamped.
+        assert_eq!(confidence_score(&[1.0 / 3.0; 3]), 0.0);
+        assert_eq!(confidence_score(&[1.0]), 1.0);
     }
 }

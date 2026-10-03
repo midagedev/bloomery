@@ -943,17 +943,12 @@ fn health(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
 }
 
 fn models(state: &State) -> Value {
-    json!({
-        "object": "list",
-        "data": [{
-            "id": state.alias,
-            "object": "model",
-            "created": state.start_unix,
-            "owned_by": "bloomery",
-            "meta": { "n_vocab": state.info.n_vocab, "n_ctx_train": state.info.ctx_max },
-            "max_model_len": state.info.ctx_max,
-        }],
-    })
+    crate::models::listing(
+        &state.alias,
+        state.start_unix,
+        json!({ "n_vocab": state.info.n_vocab, "n_ctx_train": state.info.ctx_max }),
+        Some(state.info.ctx_max),
+    )
 }
 
 fn props(state: &State) -> Value {
@@ -995,7 +990,7 @@ fn put<T: Into<Value>>(o: &mut Map<String, Value>, key: &str, v: Option<T>) {
 /// `version` (with the engine's note), `args` (this process's argv, verbatim)
 /// and `server_pid`, and the model, placement, draft and verified context
 /// the engine reports.
-fn engine_object(p: &EngineProps) -> Value {
+pub(crate) fn engine_object(p: &EngineProps) -> Value {
     let mut o = Map::new();
     o.insert("name".into(), json!("bloomery"));
     let version = match &p.version_note {

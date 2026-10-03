@@ -4,8 +4,8 @@
 # admissible as a benchmark; they say how much of a start is JIT and module loading.
 #
 #   tools/ref/coldstart.sh <binary> [the server's own flags…]
-#     e.g. tools/ref/coldstart.sh target/release/bloomery_serve_clef \
-#            --model /models/clef-flash/Cloudflare_clef-flash-Q3_K_S.gguf \
+#     e.g. tools/ref/coldstart.sh target/release/bloomery-serve \
+#            -m /models/clef-flash/Cloudflare_clef-flash-Q3_K_S.gguf \
 #            --head /models/clef-flash/hf/joint_head.safetensors
 #
 # Arms, in this order (COLDSTART_ARMS overrides, space separated):
@@ -46,7 +46,8 @@ run() {
   shift
   envs=("$@")
   t0=$(date +%s.%N)
-  env "${envs[@]}" "${pre[@]}" "$BIN" "${SERVER_ARGS[@]}" --port 0 >"$W/$arm.log" 2>&1 &
+  # The flags name the model once: the gates' BLOOMERY_REF_MODEL beside them would be a second name.
+  env -u BLOOMERY_REF_MODEL "${envs[@]}" "${pre[@]}" "$BIN" "${SERVER_ARGS[@]}" --port 0 >"$W/$arm.log" 2>&1 &
   PID=$!
   local deadline=$(( $(date +%s) + BOUND ))
   while [ "$(date +%s)" -lt "$deadline" ] && kill -0 "$PID" 2>/dev/null; do

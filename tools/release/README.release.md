@@ -7,8 +7,7 @@ for the experts that stay on the CPU. Source, measurements and the full README: 
 
 | File | What it serves |
 |---|---|
-| `bin/bloomery-serve` | llama-server's HTTP API (`/v1/chat/completions`, `/completion`, streaming): DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
-| `bin/bloomery_serve_clef` | Cloudflare Clef-Flash's SystemOne API (`POST /v1/systemone`) |
+| `bin/bloomery-serve` | llama-server's HTTP API (`/v1/chat/completions`, `/completion`, streaming): DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B; and, given a decision model's head, Cloudflare Clef-Flash's SystemOne API (`POST /v1/systemone`) |
 
 ## Requirements
 
@@ -41,11 +40,15 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 64}'
 ```
 
-Clef-Flash, with the head file fetched from Cloudflare's release:
+Clef-Flash, with the head file fetched from Cloudflare's release (the repo bartowski's model card names as the model
+it quantizes):
 
 ```sh
-bin/bloomery_serve_clef --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M --port 8091
+bin/bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M --port 8091
 ```
+
+A local file takes its head by name: `bin/bloomery-serve -m <file.gguf> --head <dir>/joint_head.safetensors`, the
+config `joint_head_config.json` beside it.
 
 Downloads go to `~/.cache/bloomery/hf` (`BLOOMERY_CACHE` overrides it). A gated repo reads `HF_TOKEN` or
 `~/.cache/huggingface/token`.

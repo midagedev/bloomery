@@ -28,3 +28,6 @@ pub mod qwen38;
 // The qwen3 seat sits behind the same server-surface feature.
 #[cfg(feature = "deepseek41")]
 pub mod qwen3;
+// The decide seat: a decision model's backbone on the card, its head on the host.
+#[cfg(feature = "clef")]
+pub mod decide;

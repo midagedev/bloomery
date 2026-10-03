@@ -64,7 +64,7 @@ This builds the V4.1 CLI, the GPU kernels and the host expert tier into one bina
 |---|---|---|
 | `generate_ds41`, `bloomery-chat`, `bloomery-serve-ds41` | `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin <bin>` | DeepSeek-V4.1-Flash |
 | `bloomery-serve-qwen38` | the same, `--features deepseek41` (the feature scopes the server code; it runs no V4.1 code) | Qwen3.8-Flash-Next |
-| `bloomery-serve` | `… --features glm5next --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm`; the ds41 and qwen38 seats are the two binaries above) | all three |
+| `bloomery-serve` | `… --features glm5next,clef --release --bin bloomery-serve` (`--model ds41\|qwen38\|glm\|qwen3\|decide`; the ds41 and qwen38 seats are the two binaries above) | DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B, Qwen3-30B-A3B, Clef-Flash |
 | `generate_qwen3moe` | `… --features gpu --release --bin generate_qwen3moe` | Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B |
 | `generate_glm5next` | `… --features glm5next --release --bin generate_glm5next` | GLM-5.3-Flash |
 | `r8conv` | `cargo build --release -p bloomery-model --bin r8conv` | the V4.1 sidecar |
@@ -201,10 +201,10 @@ target/release/bloomery-tokenize -m "$M" --decode -p "$(sed -n 's/^tokens //p' g
 
 Flags: `-n N` (default 16), `--ctx C` (default 2048, at most 16,384), `--place a|gate` (default `gate`), `--prefill batch|steps` (default `batch`), `--mode graph|eager`, `--plan` (print the plan and exit before the load), `--logits`, `--time [--warm W]`.
 
-The server is `bloomery-serve --model glm` (build it with `--features glm5next --bin bloomery-serve`). At `--place a` and `--place bp` (the 3090 as an expert tier) it runs adaptive residency and the MTP draft by default (`BLOOMERY_RESIDENCY=off` and `BLOOMERY_DRAFT=off` turn them off), and `--plan` prints the plan and those choices and exits before any card is opened:
+The server is `bloomery-serve --model glm` (build it with `--features glm5next,clef --bin bloomery-serve`). At `--place a` and `--place bp` (the 3090 as an expert tier) it runs adaptive residency and the MTP draft by default (`BLOOMERY_RESIDENCY=off` and `BLOOMERY_DRAFT=off` turn them off), and `--plan` prints the plan and those choices and exits before any card is opened:
 
 ```sh
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin bloomery-serve
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve
 BLOOMERY_REF_MODEL="$M" target/release/bloomery-serve --model glm --place a --ctx 4096 --host 127.0.0.1 --port 8080
 ```
 
@@ -258,11 +258,14 @@ The same binary opens the Qwen3-30B-A3B-Instruct-2507 `Q4_K_M` file (`unsloth/Qw
 hf download bartowski/Cloudflare_clef-flash-GGUF Cloudflare_clef-flash-Q8_0.gguf --local-dir ~/models/clef-flash
 hf download Cloudflare/clef-flash joint_head.safetensors joint_head_config.json --local-dir ~/models/clef-flash/hf
 
-cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features clef --release --bin bloomery_serve_clef
+cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next,clef --release --bin bloomery-serve
 
-# the backbone on one card (see Picking the card), the head on the host
-target/release/bloomery_serve_clef --model ~/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf \
+# the backbone on one card (see Picking the card), the head on the host; --head picks the decide seat
+target/release/bloomery-serve -m ~/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf \
   --head ~/models/clef-flash/hf/joint_head.safetensors --port 8091
+
+# or with no download step: the head comes from the repo bartowski's model card names as the model it quantizes
+target/release/bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q8_0 --port 8091
 
 curl -s http://127.0.0.1:8091/v1/systemone -d '{"model": "clef-flash",
   "state": "User: what is the weather in Seoul tomorrow? Tools available: web_search, calculator, calendar.",
@@ -273,7 +276,7 @@ curl -s http://127.0.0.1:8091/v1/systemone -d '{"model": "clef-flash",
 
 Every K-quant file of the same upload runs too, down to `Cloudflare_clef-flash-Q3_K_S.gguf` (4.26 GB); how close each one's answers are to the release's: [`tools/ref/clef/agreement.md`](../tools/ref/clef/agreement.md). The backbone reads Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 weights; the upload's IQ, Q2_K and Q4_0/Q4_1 files carry other types, which it refuses by name before loading.
 
-The request and the response are the release's SystemOne format (its `README.md`): question types `choice`, `noul` and `score`, and per question the chosen option with its probabilities. Each response adds `timings` (`prompt_n`, `prompt_ms`, `head_ms`, `cache_n`). `GET /props` names the engine, the build, the model file, its quant and the head file. Flags: `--host` (default `127.0.0.1`), `--port` (default 8091), `--ctx` (default 16384, the release's `max_length`), `--head-config` (default: `joint_head_config.json` beside `--head`). It serves one request at a time and takes text states only.
+The request and the response are the release's SystemOne format (its `README.md`): question types `choice`, `noul` and `score`, and per question the chosen option with its probabilities. Each response adds `timings` (`prompt_n`, `prompt_ms`, `head_ms`, `cache_n`). `GET /props` names the engine, the build, the model file, its quant and the head file. Flags: `--host` (default `127.0.0.1`), `--port` (default 8080), `--ctx` (default 16384, the release's `max_length`), `--head-config` (default: `joint_head_config.json` beside `--head`). It serves one request at a time and takes text states only.
 
 ## The data directory
 

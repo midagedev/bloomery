@@ -25,7 +25,7 @@ else
 fi
 
 GLIBC_FLOOR=2.34
-BINS=(bloomery-serve bloomery_serve_clef)
+BINS=(bloomery-serve)
 DISPATCHED='^(sha2::sha256::x86::digest_blocks|sha1::compress::x86::digest_blocks)$'
 ALLOWED_NEEDED='^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2)$'
 if [ -n "$CHECK_ONLY" ]; then

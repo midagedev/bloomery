@@ -6,9 +6,10 @@
 //! answers (`api/models/<repo>/tree/main?recursive=true`, [`listing`]), the
 //! GGUF sets in it ([`gguf_sets`]) and the one a quant tag picks ([`pick`]),
 //! the files named exactly ([`exact`]), the cache paths ([`cache_root`],
-//! [`cache_path`]) and where a model file comes from ([`source`]). The
-//! network part, [`fetch`], is `curl`, the checks of what it wrote, and the
-//! cache standing in when the network refuses the listing.
+//! [`cache_path`]), where a model file comes from ([`source`]) and what a
+//! model card says ([`card`]). The network part, [`fetch`], is `curl`, the
+//! checks of what it wrote, and the cache standing in when the network
+//! refuses the listing.
 //!
 //! The picking follows llama.cpp's `common/download.cpp`: a split set
 //! (`-00001-of-0000N.gguf`) is one set by its prefix and count, and the
@@ -18,6 +19,7 @@
 //! no tag on a repo of several sets are each refused by name, with the
 //! candidates.
 
+pub mod card;
 pub mod fetch;
 pub mod source;
 

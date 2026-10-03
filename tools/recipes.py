@@ -2620,11 +2620,42 @@ def plan_problems(root: str, recipes: dict[str, Recipe]) -> list[str]:
     return problems
 
 
+# The recipes of the static tier: each compiles every target of the workspace (`--workspace
+# --all-targets`), so a bin whose required-features one of them leaves out is never checked or linted.
+STATIC_RECIPES = ("check", "lint")
+
+
+def static_problems(tree: Tree, recipes: dict[str, Recipe], names: tuple[str, ...] = STATIC_RECIPES) -> list[str]:
+    """A bin of a workspace package that one of the static recipes leaves out (its required-features are not
+    in the recipe's features, so cargo skips it): code no `just check` or `just lint` compiles. Blocks a
+    feature-gated server or gate whose code only a box build ever reads."""
+    problems: list[str] = []
+    for name in names:
+        recipe = recipes.get(name)
+        if recipe is None:
+            problems.append(f"static tier: no `{name}` recipe")
+            continue
+        invs = [i for i in recipe_commands(recipe).invocations if i.sub in ("check", "clippy")]
+        if len(invs) != 1 or not invs[0].all_targets or invs[0].packages:
+            problems.append(f"justfile:{recipe.line} {name}: not one `cargo check|clippy --workspace --all-targets`")
+            continue
+        built, _ = tree.resolve(invs[0])
+        have = {(pkg, kind, t) for pkg, kind, t, _ in built}
+        for pname in sorted(tree.packages):
+            for t in tree.packages[pname].targets:
+                if t.kind == "bin" and t.required and (pname, "bin", t.name) not in have:
+                    problems.append(
+                        f"justfile:{recipe.line} {name}: bin {t.name} of {pname} requires features {t.required}, which "
+                        f"the recipe does not enable: the static tier never compiles it"
+                    )
+    return problems
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
     problems = (check(tree, recipes) + plan_problems(ROOT, recipes) + gate_paths_problems(tree, recipes) + weekly_problems(recipes)
-                + host_problems(tree, recipes))
+                + host_problems(tree, recipes) + static_problems(tree, recipes))
     for p in problems:
         print(f"check-recipes: {p}", file=sys.stderr)
     return 1 if problems else 0
@@ -4557,6 +4588,44 @@ def side_at(root: str, meta: dict) -> Side:
     return Side(tree, recipes, Graph(tree, recipes))
 
 
+def static_self_test(expect) -> None:
+    """static_problems on a synthetic workspace: package g with bins x (no feature) and y (`fy`). A static
+    recipe without `fy` names y; enabling it by package path clears it; a recipe that is not one workspace
+    check is named."""
+    with tempfile.TemporaryDirectory(prefix="recipes-static-") as tmp:
+        files = {"crates/g/Cargo.toml": "", "crates/g/src/lib.rs": "", "crates/g/src/bin/x.rs": "fn main() {}\n",
+                 "crates/g/src/bin/y.rs": "fn main() {}\n"}
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        meta = {
+            "workspace_root": tmp,
+            "workspace_members": ["g"],
+            "packages": [{
+                "id": "g", "name": "g", "manifest_path": os.path.join(tmp, "crates/g/Cargo.toml"), "features": {"fy": []},
+                "dependencies": [],
+                "targets": [
+                    {"kind": ["lib"], "name": "g", "src_path": os.path.join(tmp, "crates/g/src/lib.rs")},
+                    {"kind": ["bin"], "name": "x", "src_path": os.path.join(tmp, "crates/g/src/bin/x.rs")},
+                    {"kind": ["bin"], "name": "y", "src_path": os.path.join(tmp, "crates/g/src/bin/y.rs"), "required-features": ["fy"]},
+                ],
+            }],
+        }
+        tree = Tree(tmp, meta)
+
+        def recipes(check_features: str, lint: str = "cargo clippy --workspace --all-targets --features g/fy") -> dict[str, Recipe]:
+            return {"check": Recipe("check", [f"./tools/box.sh 'cargo check --workspace --all-targets{check_features}'"], [], ""),
+                    "lint": Recipe("lint", [f"./tools/box.sh '{lint}'"], [], "")}
+
+        got = static_problems(tree, recipes(""))
+        expect(len(got) == 1 and "check: bin y of g requires features ['fy']" in got[0], f"static: a check without fy gives {got}")
+        got = static_problems(tree, recipes(" --features g/fy"))
+        expect(got == [], f"static: every bin checked, yet {got}")
+        got = static_problems(tree, recipes(" --features g/fy", "cargo clippy -p g --lib"))
+        expect(len(got) == 1 and "lint: not one" in got[0], f"static: a lint of one target gives {got}")
+
+
 def manifest_self_test(expect) -> None:
     """A package manifest read by table, on a synthetic workspace (package g: a lib and bins x, y, v; user: a
     bin linking g; a script that reads g's manifest whole). Each change gives the recipes it must select and
@@ -5874,6 +5943,9 @@ def self_test() -> int:
 
     # a package manifest read by table
     manifest_self_test(expect)
+
+    # the static tier compiles every feature-gated bin
+    static_self_test(expect)
 
     # the green ledger's key
     key_self_test(expect, side)

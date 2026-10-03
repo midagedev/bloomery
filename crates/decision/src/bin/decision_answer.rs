@@ -3,7 +3,8 @@
 //!     decision_answer --model <gguf> --head <safetensors> --request <json> --hidden <f32 file>
 //!                     [--head-config <json>] [--max-length N]
 //!
-//! `--model` gives the tokenizer and the output head's rows (`output`, else `token_embd`). The head's
+//! `--model` gives the tokenizer and the output head's rows (`output`, else `token_embd`), and its
+//! file name is the body's `model`, as `bloomery-serve -m` names the model it serves. The head's
 //! config is `--head-config`, else `joint_head_config.json` beside `--head`. `--hidden` is raw f32
 //! little-endian, row-major `[n, hidden]`, no header (`clef_hidden --out` writes it): a length that is
 //! not whole rows, or a row count other than the encoded request's, is refused by name. The body goes
@@ -111,7 +112,11 @@ fn run() -> Result<(), BinError> {
         &mut stages,
     )?;
     let ms = t0.elapsed().as_secs_f64() * 1e3;
-    println!("{}", dumps(&answer(&req, &enc, &logits)?, false));
+    let name = a.model.file_name().map_or_else(
+        || a.model.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    println!("{}", dumps(&answer(&req, &enc, &logits, &name)?, false));
     let (rows_name, _, rows_t) = output_head(&split)?;
     eprintln!(
         "decision_answer: head n={} ms={ms:.1} (functional), lexical rows from {rows_name} ({})",

@@ -52,12 +52,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
-#[path = "shared/clef.rs"]
-mod clef;
+#[path = "shared/qwen35_open.rs"]
+mod qwen35_open;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use super::clef;
+    use super::qwen35_open;
     use bloomery_gpu::Gpu;
     use bloomery_gpu::arch::qwen3moe::{Open35, PrefillPath, Qwen35moeModel};
     use bloomery_gpu_gates::{
@@ -246,7 +246,7 @@ mod gate {
             )
             .into());
         }
-        let ids = clef::read_ids(Path::new(file), Some(n))?;
+        let ids = qwen35_open::read_ids(Path::new(file), Some(n))?;
         let (row, lcpp) = load_ref_in(&man, "result_norm", 0)?;
         row.expect(name, "f32", [width as u64, n as u64, 1, 1], "RMS_NORM")?;
         Ok((ids, lcpp))
@@ -341,7 +341,7 @@ mod gate {
         println!("  mma true: {refused}  {}", verdict(r));
         ok &= r;
 
-        let (mut engine, _) = clef::open(&path, CTX, U_GATE)?;
+        let (mut engine, _) = qwen35_open::open(&path, CTX, U_GATE)?;
         println!("(h) final-norm hidden states against mainline's result_norm");
         for (name, n) in [(P64, 64), (P600, 600), (P4096, 4096)] {
             let (ids, lcpp) = open_set(&HIDDEN, (name, n, WIDTH))?;
@@ -365,7 +365,7 @@ mod gate {
         drop(engine);
 
         let flash = Path::new(MODEL_FLASH_Q8);
-        let (mut engine, _) = clef::open(flash, CTX, U_GATE)?;
+        let (mut engine, _) = qwen35_open::open(flash, CTX, U_GATE)?;
         println!(
             "(q) Clef-Flash Q8_0 ({}): final-norm hidden states against mainline's result_norm",
             flash.display()

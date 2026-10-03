@@ -1,8 +1,13 @@
 //! A SystemOne `/v1/systemone` request: its validation and each question's allowed options.
 //!
 //! The refusals are the release's `systemone` checks in its order, then the ones its encoder meets
-//! by raising (a criteria value of the wrong shape), then what this engine does not run (media).
-//! Unknown top-level keys (a client's `id`) are ignored, as the release ignores them.
+//! by raising (a criteria value of the wrong shape), then the media checks of llama.cpp's server
+//! (`tools/server/server-decision.cpp` at `a4cb4c61`, `parse_state`): `images` and every `image_url`
+//! part of a chat-messages state must be data URLs, at most [`MAX_IMAGES`] in all, and a request
+//! that carries one, or `videos`, is one this text-only engine does not answer
+//! ([`Error::NotSupported`]). `model` is read by no one: a server of one model answers whatever a
+//! request names, as llama.cpp's does. Unknown top-level keys (a client's `id`) are ignored, as the
+//! release ignores them.
 
 use crate::Error;
 use crate::json::Json;
@@ -47,7 +52,6 @@ pub struct Question {
 /// A validated request.
 #[derive(Clone, Debug)]
 pub struct Request {
-    pub model: String,
     pub state: Json,
     /// In request order: the order of the encoder's fields and of the answers.
     pub questions: Vec<Question>,
@@ -59,6 +63,10 @@ pub struct Opt {
     pub id: String,
     pub description: Option<Json>,
 }
+
+/// The images a request may carry, `images` and a state's image parts together: llama.cpp's
+/// `DECISION_MAX_IMAGES`.
+pub const MAX_IMAGES: usize = 8;
 
 const NOUL_TRUE: &str = "The proposition is true or the answer is yes.";
 const NOUL_FALSE: &str = "The proposition is false or the answer is no.";
@@ -72,19 +80,13 @@ impl Request {
                 body.kind()
             )));
         };
-        let model = body.get("model").and_then(Json::as_str);
-        let (Some(model), Some(state)) = (model, body.get("state")) else {
-            return Err(Error::Request("model and state are required".into()));
+        let Some(state) = body.get("state") else {
+            return Err(Error::Request("state is required".into()));
         };
         let questions = match body.get("questions") {
             Some(Json::Object(q)) if !q.is_empty() => q,
             _ => return Err(Error::Request("at least one question is required".into())),
         };
-        for key in ["images", "videos"] {
-            if body.get(key).is_some_and(Json::truthy) {
-                return Err(Error::Media(key));
-            }
-        }
         let mut out = Vec::with_capacity(questions.len());
         for (id, q) in questions {
             let Json::Object(_) = q else {
@@ -139,12 +141,76 @@ impl Request {
                 criteria,
             });
         }
+        let images = image_count(body, state)?;
+        if images > 0 {
+            return Err(Error::NotSupported(format!(
+                "the request carries {images} image(s); this server does not support image input \
+                 for decisions (the backbone reads text only)"
+            )));
+        }
+        if body.get("videos").is_some_and(Json::truthy) {
+            return Err(Error::NotSupported(
+                "the request carries videos; this server does not support video input for decisions"
+                    .into(),
+            ));
+        }
         Ok(Request {
-            model: model.to_string(),
             state: state.clone(),
             questions: out,
         })
     }
+}
+
+/// The images of a request, as llama.cpp's server counts them: `images` (null, or an array) and
+/// the `image_url` parts of a chat-messages `state` (an array of messages, or an object's
+/// `messages`), each a data URL (`data:image/…`), at most [`MAX_IMAGES`]. A malformed image is the
+/// request's error, named.
+fn image_count(body: &Json, state: &Json) -> Result<usize, Error> {
+    let mut n = 0usize;
+    let mut load = |url: &Json| -> Result<(), Error> {
+        if !url.as_str().is_some_and(|u| u.starts_with("data:image/")) {
+            return Err(Error::Request(
+                "images must be data URLs (data:image/...;base64,...)".into(),
+            ));
+        }
+        if n >= MAX_IMAGES {
+            return Err(Error::Request(format!(
+                "too many images, the maximum is {MAX_IMAGES}"
+            )));
+        }
+        n += 1;
+        Ok(())
+    };
+    match body.get("images") {
+        None | Some(Json::Null) => {}
+        Some(Json::Array(urls)) => {
+            for url in urls {
+                load(url)?;
+            }
+        }
+        Some(_) => return Err(Error::Request("\"images\" must be an array".into())),
+    }
+    let messages = match state {
+        Json::Object(_) => state.get("messages"),
+        _ => Some(state),
+    };
+    if let Some(Json::Array(messages)) = messages {
+        for msg in messages {
+            let Some(Json::Array(parts)) = msg.get("content") else {
+                continue;
+            };
+            for part in parts {
+                if part.get("type").and_then(Json::as_str) != Some("image_url") {
+                    continue;
+                }
+                let Some(image) = part.get("image_url") else {
+                    continue;
+                };
+                load(image.get("url").unwrap_or(image))?;
+            }
+        }
+    }
+    Ok(n)
 }
 
 impl Question {
@@ -275,16 +341,8 @@ mod tests {
         let cases = [
             (r#"[1]"#, "not an object"),
             (
-                r#"{"state":1,"questions":{"q":{"type":"noul"}}}"#,
-                "model and state are required",
-            ),
-            (
-                r#"{"model":3,"state":1,"questions":{"q":{"type":"noul"}}}"#,
-                "model and state are required",
-            ),
-            (
                 r#"{"model":"m","questions":{"q":{"type":"noul"}}}"#,
-                "model and state are required",
+                "state is required",
             ),
             (
                 r#"{"model":"m","state":1}"#,
@@ -326,15 +384,71 @@ mod tests {
                 r#"{"model":"m","state":1,"questions":{"q":{"type":"noul","criteria":"yes"}}}"#,
                 "q: noul criteria must be an object",
             ),
-            (
-                r#"{"model":"m","state":1,"images":["x.png"],"questions":{"q":{"type":"noul"}}}"#,
-                "images",
-            ),
         ];
         for (text, want) in cases {
             let e = req(text).expect_err(text).to_string();
             assert!(e.contains(want), "{text}: {e}");
         }
-        assert!(req(r#"{"model":"m","state":1,"images":[],"videos":null,"questions":{"q":{"type":"noul"}}}"#).is_ok());
+        // `model` is read by no one: absent, of another type, or naming another model.
+        for text in [
+            r#"{"state":1,"questions":{"q":{"type":"noul"}}}"#,
+            r#"{"model":3,"state":1,"questions":{"q":{"type":"noul"}}}"#,
+            r#"{"model":"other","state":1,"images":[],"videos":null,"questions":{"q":{"type":"noul"}}}"#,
+        ] {
+            assert!(req(text).is_ok(), "{text}");
+        }
+    }
+
+    /// llama.cpp's media rules: a malformed image is the request's error (400), a well-formed one,
+    /// in `images` or in a chat-messages state, and `videos` are not supported (501).
+    #[test]
+    fn media_is_checked_then_not_supported() {
+        let png = "data:image/png;base64,AA==";
+        let q = r#""questions":{"q":{"type":"noul"}}"#;
+        let nine = vec![format!("{png:?}"); 9].join(",");
+        for (text, want) in [
+            (
+                format!(r#"{{"state":1,"images":"x",{q}}}"#),
+                "must be an array",
+            ),
+            (
+                format!(r#"{{"state":1,"images":["x.png"],{q}}}"#),
+                "must be data URLs",
+            ),
+            (
+                format!(r#"{{"state":1,"images":[{nine}],{q}}}"#),
+                "too many images, the maximum is 8",
+            ),
+            (
+                format!(
+                    r#"{{"state":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"http://x/a.png"}}}}]}}],{q}}}"#
+                ),
+                "must be data URLs",
+            ),
+        ] {
+            match req(&text) {
+                Err(Error::Request(e)) => assert!(e.contains(want), "{text}: {e}"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+        for text in [
+            format!(r#"{{"state":1,"images":[{png:?}],{q}}}"#),
+            format!(
+                r#"{{"state":[{{"role":"user","content":[{{"type":"text","text":"hi"}},{{"type":"image_url","image_url":{{"url":{png:?}}}}}]}}],{q}}}"#
+            ),
+            format!(
+                r#"{{"state":{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{png:?}}}]}}]}},{q}}}"#
+            ),
+            format!(r#"{{"state":1,"videos":["v.mp4"],{q}}}"#),
+        ] {
+            assert!(matches!(req(&text), Err(Error::NotSupported(_))), "{text}");
+        }
+        // A text-only chat state is text.
+        assert!(
+            req(&format!(
+                r#"{{"state":[{{"role":"user","content":[{{"type":"text","text":"hi"}}]}}],{q}}}"#
+            ))
+            .is_ok()
+        );
     }
 }
