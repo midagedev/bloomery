@@ -66,12 +66,14 @@
 //! - `cache` again on a server with the draft the first did not run
 //!   (`BLOOMERY_DRAFT=mtp` when it ran `off`, and the other way);
 //! - `ctx` ([`ctx`]): a server with no `--ctx-size` prints its default
-//!   ([`CTX`]), the largest context the card holds with its card expert
-//!   bytes and the largest within the plan's margin, before its load, each
-//!   the rule's against this gate's own plans (stopped there), the fit
-//!   at most the file's serving cap (`place::serve_ctx`), and one asked for
-//!   a position past the fit is refused by name before it listens (the
-//!   card's rule, or the cap's when the card holds more);
+//!   (the margin rule's answer — or the largest the card holds when that is
+//!   fewer, or the prompt cache's clamp of it), the largest context the card
+//!   holds with its card expert bytes and the largest within the plan's
+//!   margin, before its load, each the rule's against this gate's own plans
+//!   (stopped there), the fit at most the file's serving cap
+//!   (`place::serve_ctx`), and one asked for a position past the fit is
+//!   refused by name before it listens (the card's rule, or the cap's when
+//!   the card holds more);
 //! - `residency`: `bloomery-serve-qwen38` with the same arguments under
 //!   `BLOOMERY_RESIDENCY=mid-p0-s1` (`BLOOMERY_DRAFT=off`, the MTP levers
 //!   removed; the word set explicitly, one the lever takes): it loads and
@@ -124,9 +126,11 @@ mod gate {
     use std::time::Duration;
 
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
+    use bloomery_gpu::arch::qwen3moe::{checkpoint_bytes, seq_positional_bytes};
     use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
+    use model::arch::models::Mixer;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
         Experts, MtpInputs, PlanInputs, machine_for_experts, serve_ctx,
@@ -1427,20 +1431,26 @@ mod gate {
 
     /// The `ctx` clause: a plain server with no `--ctx-size` prints its
     /// `ctx` line before its load (it is stopped there), against this gate's
-    /// own plans of the file: its context is [`CTX`] (`base`), or the
-    /// largest the card holds when that is fewer (`card`); the line's `fit`
-    /// is the largest context the card holds up to the file's serving cap
-    /// (`place::serve_ctx`, its `context_length`) — its plan taken, and the
-    /// one past it refused when the card bounds it, else the cap itself —
-    /// with that plan's card expert bytes; its `margin_ctx` holds at most
-    /// the plan's margin fewer card expert bytes than the plan at [`CTX`],
-    /// and the next multiple of [`CTX_STEP`] past it more (or it is the
-    /// fit). A server asked for one position past the fit is refused by name
-    /// before it listens: by the card's rule when the card bounds the fit,
-    /// by the cap's (the trained context, YaRN not built) when the cap does.
-    /// Mutants: the refusal of a context past the card taken out (the load's
-    /// own plan refuses it, not by the rule's name); the cap's refusal taken
-    /// out (the card's rule names the clamped fit instead).
+    /// own plans of the file: its context is the margin rule's answer
+    /// (`margin`: the line's own `margin_ctx`, which the clause below holds
+    /// to the gate's plans), or the largest the card holds when that is
+    /// fewer than [`CTX`] (`card`), or the prompt cache's clamp of the
+    /// margin's answer (`cache`, composed the seat's way from the cache
+    /// line's own ram — the clamp rides MemAvailable as the fit rides the
+    /// census); the line's `fit` is the largest context the card holds up to
+    /// the file's serving cap (`place::serve_ctx`, its `context_length`) —
+    /// its plan taken, and the one past it refused when the card bounds it,
+    /// else the cap itself — with that plan's card expert bytes; its
+    /// `margin_ctx` holds at most the plan's margin fewer card expert bytes
+    /// than the plan at [`CTX`], and the next multiple of [`CTX_STEP`] past
+    /// it more (or it is the fit). A server asked for one position past the
+    /// fit is refused by name before it listens: by the card's rule when the
+    /// card bounds the fit, by the cap's (the trained context, YaRN not
+    /// built) when the cap does. Mutants: the default ignoring the fit
+    /// (staying at the base); the default passing the fit through without
+    /// the margin rule; the refusal of a context past the card taken out
+    /// (the load's own plan refuses it, not by the rule's name); the cap's
+    /// refusal taken out (the card's rule names the clamped fit instead).
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -1495,6 +1505,16 @@ mod gate {
         let experts = experts38(levers)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
         let free = server_card_free(&err_log)?;
+        // The default the seat's rules compose to also answers the prompt
+        // cache's bound, whose ram rides MemAvailable as the fit rides the
+        // census: the gate takes the server's own `cache` line's ram, not a
+        // fresh reading.
+        let ram = record_line(&err_log, "cache")?
+            .ok_or("the default server printed no `cache` line")?
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix("ram="))
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or("a `cache` line without its ram")?;
         let at = |c: usize| card_at(&inputs, &plan_levers, experts, c, free);
         let base = at(CTX)?.ok_or("no plan at the base context")?;
         let lost = |c: usize| -> Result<Option<u64>, GateError> {
@@ -1509,9 +1529,40 @@ mod gate {
         // (round q38rules: `serve_ctx`, 262,144 for Qwen3.8); where the card holds more, the fit
         // is the cap and a plan past it is still a plan; was the card's largest, `past_fit` none.
         let card_bounds = fit < cap;
+        // One session's whole-context state (`Seq38`), the bound the seat's
+        // `cache` rule clamps the default with (`Ctx38::host_bound`).
+        let gdn = inputs
+            .spec
+            .layers
+            .iter()
+            .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
+            .count();
+        let qsa = inputs.spec.layers.len() - gdn;
+        let state = |n: usize| seq_positional_bytes(qsa, n) + 2 * checkpoint_bytes(gdn);
+        let cache_ctx = |from: usize| {
+            let mut lo = 1;
+            let mut hi = from;
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if state(mid) <= ram {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            (lo / CTX_STEP * CTX_STEP).max(lo.min(CTX_STEP))
+        };
+        let (want_rule, want_ctx) = if fit < CTX {
+            ("card", fit)
+        } else if ram == 0 || state(margin_ctx) <= ram {
+            ("margin", margin_ctx)
+        } else {
+            ("cache", cache_ctx(margin_ctx))
+        };
         println!(
             "ctx: the gate's plans: lost at {margin_ctx} {here:?}, at {} {past:?}, fit {fit} \
-             {at_fit:?}, past it {past_fit:?}; the serving cap {cap} ({})",
+             {at_fit:?}, past it {past_fit:?}; the serving cap {cap} ({}); the default the rules \
+             compose to: rule {want_rule} ctx {want_ctx} (the cache line's ram {ram})",
             margin_ctx + CTX_STEP,
             if card_bounds {
                 "the card bounds the fit"
@@ -1523,11 +1574,7 @@ mod gate {
         check(
             &mut ok,
             "ctx_default_is_the_rules",
-            match rule.as_str() {
-                "base" => ctx == CTX && CTX <= fit,
-                "card" => ctx == fit && fit < CTX,
-                _ => false,
-            },
+            rule.as_str() == want_rule && ctx == want_ctx,
         );
         check(
             &mut ok,

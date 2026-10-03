@@ -28,10 +28,14 @@
 //! The positions the server serves are the stores the load sized
 //! (`--ctx-size`): `/props`' `n_ctx` is that number, a prompt that long is a
 //! 400 before it reaches the engine, and generation stops there with
-//! `truncated`. Unset, the context is [`CTX`] positions, or the largest the
-//! card holds when that is fewer, and at most what lets one session's
-//! sequence state with its two recurrent copies fit the prompt cache's budget
-//! (one session's whole context can be saved). Set, a context past the file's
+//! `truncated`. Unset, the context is [`margin38`]'s answer — the largest
+//! multiple of [`CTX_STEP`] up to the fit (the largest the card holds, at
+//! most the file's serving cap) whose plan holds at most the plan's own
+//! margin (`MARGIN`) fewer card expert bytes than the plan at [`CTX`], the
+//! fit when every context does — the largest the card holds when that is
+//! fewer than [`CTX`], and at most what lets one session's sequence state
+//! with its two recurrent copies fit the prompt cache's budget (one
+//! session's whole context can be saved). Set, a context past the file's
 //! `context_length` (`place::serve_ctx`: YaRN scaling past it is not built),
 //! then one the card cannot hold beside the plan's dense weights — the
 //! largest context any plan of the file and the placement takes up to that
@@ -579,9 +583,10 @@ impl Plans<'_> {
 /// The context the seat loads ([`ctx38`]) and what decided it.
 struct Ctx38 {
     ctx: usize,
-    /// `set` (`--ctx-size`), or what bounded the default: `base` ([`CTX`]),
-    /// `card` (the largest context the card holds, fewer), `cache` (one
-    /// state in the prompt cache's budget).
+    /// `set` (`--ctx-size`), or what decided the default: `margin`
+    /// ([`margin38`]'s answer), `card` (the largest context the card holds,
+    /// fewer than [`CTX`]), `cache` (one state in the prompt cache's
+    /// budget).
     rule: &'static str,
     /// The largest context the card holds ([`fit38`]).
     fit: Fit38,
@@ -662,9 +667,9 @@ fn margin38(
 
 /// The seat's context (the module doc): `set` when the file's serving cap
 /// takes it (`place::serve_ctx`, refused by name past it) and it fits the
-/// card ([`fit38`]), else refused by name; unset, [`CTX`], or the fit when
-/// that is fewer. The prompt cache's bound comes after
-/// ([`Ctx38::host_bound`]).
+/// card ([`fit38`]), else refused by name; unset, [`margin38`]'s answer, or
+/// the largest the card holds when that is fewer than [`CTX`]. The prompt
+/// cache's bound comes after ([`Ctx38::host_bound`]).
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
     if let Some(c) = set {
         serve_ctx(u64::try_from(c)?, &plans.inputs.hp)?;
@@ -685,7 +690,8 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
         }
         Some(c) => (c, "set"),
         None if base_at < CTX => (base_at, "card"),
-        None => (base_at, "base"),
+        // Unset takes the fit's context without paying its card experts.
+        None => (margin_ctx, "margin"),
     };
     Ok(Ctx38 {
         ctx,
