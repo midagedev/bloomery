@@ -119,6 +119,16 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### 0.2.1 진행 (10-04 저녁, 리드 — 웨이브 1 여섯 트랙 병렬, 착지: q38ctx 5d5b2a6d · placectx ded96616 · gatedebt 75d70794 · glmctx 5bb0b045 · cleanup 9110b7d4 · kvq8 1/3 00034f5c)
+
+- **좌석 ctx 전면 착지**: qwen3 통짜(7fab4e21)·placed 폴백(placectx, 바닥 expert 분할 유지 최대)·qwen38 fit 마진(4096→40,704)·glm(2048→16,384, 공유 소유자 serve_seats::ctx). GLM 기본 P=0은 이미 기본이었고 게이트 핀만 없었다(glmctx가 핀 착지, 뮤턴트 red).
+- **게이트 빚 5절 닫힘**(gatedebt); q38sel 풀 합은 이미 착지된 낡은 줄이었다(f6a62a52).
+- **cleanup 7항목**: stub 실패 원인은 머신 전체 pgmajfault 환경 노이즈(임대 없는 stub의 판독) — ds41/qwen3moe 설계로 수선.
+- **kvq8 3조각 중 1번 착지**(형식+양자화 append, add-class 증명). 2번(읽기 경로) 진행 중, 3번(레버 배선 --cache-type-k) 대기.
+- **웨이브 2 진행 중**: 탄성 --parallel + qwen38 MTP 재결합(parwave) · 첫 시작 JIT 업로드 겹침(jitovl) · /slots 신선도+bp 손익(smallfix) · kvq8-2(kvq8). actions Node-20 범프 착지(121ff405).
+- **선결 게이트 빚 둘 (cleanup의 118항목 배치가 발견, base에서도 빨강)**: `gate-ds41-place` `resolved_on_the_box_plans_as_before` — memguard의 resolved-plan free_bytes 대 정적 plan, 테스트의 strip이 device만 지움, 마지막 초록 2e0189f2 (memguard 배치가 이 게이트를 안 돌았다) · `gate-ds41-load` check v — 결정적 4 MiB 첫 드롭 잔여 vs 2 MiB 허용, 마지막 초록 f1387c99 (10-01).
+- **placectx 열린 끝**: 여유 큰 카드에선 m1형 뮤턴트(경계 무시)의 답이 정답과 우연히 같다 — 잡으려면 적재된 서버 옆 교차 센서스 비교가 필요(memguard가 피한 모양). lane-X 센서스 핀 메커니즘 가설은 [유도]로 위에 있다(glmctx 절).
+
 ### 다음 릴리즈 백로그 (10-04 수집, 리드 — 0.2.0·설치 채널 뒤의 열린 것을 한 곳에; 중복 줄은 아래 각절이 주인)
 
 **범위 결정(10-04, 사용자)**: **0.2.1 소형 먼저** — A(서빙 견고성·UX) + B(게이트 빚) + C(출시 채널 빚) + D(청소 트레인) + GLM 조기 레버 둘(P=0 기본 XS·staging 창 밖 멈춤, 각각 아래 조건 뒤)을 넣고, E의 나머지(prompt-call pick·glmnext 레버·callstream·qwen38 사다리·warm 재측정 시팅·새 모델 행)는 **0.3.0**으로 간다. 0.2.1의 숫자 표는 갱신하지 않고 릴리스 노트가 A/B 카드 값을 조건과 함께 인용한다(전면 warm 재측정은 0.3.0의 시팅).
