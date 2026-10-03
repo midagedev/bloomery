@@ -6,6 +6,7 @@
 //!
 //!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place PLACE]
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
+//!                         [--parallel N] [--queue-depth Q] [--park-ram MIB]
 //!
 //! `PLACE` is `a`, `gate`, `bp` or a card list `<stage>[+<tier>…]`
 //! (`generate::Place`, as `generate_ds41` takes it); a list whose stage card
@@ -45,6 +46,21 @@
 //! later request keeps the start of a user message ([`USER_START`], with
 //! whether the chat template writes it). Every cache event and every prefix
 //! the body keeps less of than a request shares is a record line.
+//!
+//! `--parallel N` (`-np N`, default 1) serves N slots that take the one body
+//! in turns (`serve::SwapEngine`): a request that arrives while another
+//! decodes preempts it at the next step, the running request's sequence
+//! state parked in host RAM, and the live requests then take turns of
+//! `serve::QUANTUM` tokens. The parked states' budget is `--park-ram` (MiB),
+//! by default the lesser of [`CACHE_RAM_CAP`] and the host headroom the
+//! prompt cache leaves (`/metrics`' `swap_park_budget_bytes`); a request that
+//! would park a state past it is a 503 naming the budget. `--queue-depth Q`
+//! bounds the requests that wait for a slot. Several slots are refused by
+//! name under the DSpark draft (a state put back starts the draft over, and a
+//! turn has no prompt call to feed it its window) and under
+//! `BLOOMERY_ROUTE_TRACE` (a turn's steps would follow another request's
+//! call row); the lookup draft rebuilds its tables from the target's history
+//! at a turn's first pass and drafts on.
 //!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
@@ -121,8 +137,9 @@ use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::{Committed, Lookup, Speculative, Target, Want};
 use serve::{
-    CacheNote, DeviceProps, DraftProps, Drafted, EngineProps, FATAL_LINGER, PlacementProps,
-    ResidencyReset, Saved, ServeError, Server, ServerConfig,
+    CacheNote, DeviceProps, DraftProps, Drafted, Engine, EngineProps, FATAL_LINGER, Park,
+    PlacementProps, ResidencyReset, Saved, ServeError, Server, ServerConfig, SlotConfig,
+    SwapEngine,
 };
 use tokenizer::Tokenizer;
 
@@ -131,7 +148,7 @@ use crate::{dspark, place};
 
 const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
-                     [--cache-ram MIB]";
+                     [--cache-ram MIB] [--parallel N] [--queue-depth Q] [--park-ram MIB]";
 
 /// The token V4.1's chat template opens every user and tool message with.
 pub const USER_START: &str = "<｜User｜>";
@@ -156,6 +173,11 @@ struct Args {
     alias: Option<String>,
     /// `--cache-ram` in bytes; `None` takes the default.
     cache_ram: Option<u64>,
+    /// `--parallel`: slots that take the body in turns past 1.
+    parallel: usize,
+    queue_depth: Option<usize>,
+    /// `--park-ram` in bytes; `None` takes the default.
+    park_ram: Option<u64>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -166,6 +188,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: usize::try_from(workstation::CTX_MAX)?,
         alias: None,
         cache_ram: None,
+        parallel: 1,
+        queue_depth: None,
+        park_ram: None,
     };
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
@@ -181,18 +206,61 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--place" => a.place = place::parse(v)?,
             "--ctx" => a.ctx = v.parse()?,
             "--alias" => a.alias = Some(v.to_owned()),
-            "--cache-ram" => {
-                let mib: u64 = v.parse()?;
-                a.cache_ram = Some(
-                    mib.checked_mul(1 << 20)
-                        .ok_or_else(|| format!("--cache-ram {mib} MiB passes u64 bytes"))?,
-                );
-            }
+            "--cache-ram" => a.cache_ram = Some(mib_bytes(flag, v)?),
+            "--parallel" | "-np" => a.parallel = v.parse()?,
+            "--queue-depth" => a.queue_depth = Some(v.parse()?),
+            "--park-ram" => a.park_ram = Some(mib_bytes(flag, v)?),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
+    match a.park_ram {
+        Some(_) if a.parallel < 2 => {
+            return Err(format!(
+                "--park-ram holds the states of slots that take the body in turns; \
+                 --parallel {} has none to park",
+                a.parallel
+            )
+            .into());
+        }
+        Some(0) => return Err("--park-ram 0 parks no state: give the slots room".into()),
+        _ => {}
+    }
     a.place = a.place.on_host()?;
     Ok(a)
+}
+
+/// A flag's value in MiB, as bytes.
+fn mib_bytes(flag: &str, v: &str) -> Result<u64, GateError> {
+    let mib: u64 = v.parse()?;
+    Ok(mib
+        .checked_mul(1 << 20)
+        .ok_or_else(|| format!("{flag} {mib} MiB passes u64 bytes"))?)
+}
+
+/// The parked states' budget of `--parallel n` slots: `park_ram`, else the
+/// lesser of [`CACHE_RAM_CAP`] and the plan's host headroom less the prompt
+/// cache's `cache_ram`; refused by name when that leaves nothing.
+fn park_budget(
+    park_ram: Option<u64>,
+    headroom: i64,
+    cache_ram: u64,
+    n: usize,
+) -> Result<u64, GateError> {
+    if let Some(b) = park_ram {
+        return Ok(b);
+    }
+    let left = u64::try_from(headroom)
+        .unwrap_or(0)
+        .saturating_sub(cache_ram);
+    if left == 0 {
+        return Err(format!(
+            "--parallel {n}: the plan's host headroom of {headroom} B less the prompt cache's \
+             {cache_ram} B leaves no room to park a slot's state; give --park-ram MIB or a \
+             smaller --cache-ram"
+        )
+        .into());
+    }
+    Ok(left.min(CACHE_RAM_CAP))
 }
 
 /// Loads the model and serves until the listener or the engine fails;
@@ -220,6 +288,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .into());
     }
     let draft = Draft::from_levers(&levers)?;
+    if a.parallel > 1 && draft == Draft::Dspark {
+        return Err(format!(
+            "--parallel {} under BLOOMERY_DRAFT=dspark: a slot's state put back starts the \
+             DSpark draft over, and a turn has no prompt call to feed it its window; serve one \
+             slot, or the lookup draft",
+            a.parallel
+        )
+        .into());
+    }
     // The draft's file is read before the target's load, which takes a minute.
     let draft_file = match draft {
         Draft::Dspark => Some(dspark::draft_hparams()?),
@@ -249,7 +326,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let model = model_props(&split, &inputs.model);
     let tier_batch = place::tier_batch(a.place, &inputs.hp);
     drop(split);
-    let trace = route_trace(&levers, &cfg, residency, draft, a.place, &path, &inputs)?;
+    let trace = route_trace(
+        &levers,
+        &cfg,
+        residency,
+        (draft, a.parallel),
+        a.place,
+        &path,
+        &inputs,
+    )?;
     let (card, placement, headroom) = print_plan(
         &inputs,
         a.place,
@@ -262,6 +347,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let cache_ram = a
         .cache_ram
         .unwrap_or_else(|| u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP)));
+    let park = match a.parallel {
+        0 | 1 => None,
+        n => Some(park_budget(a.park_ram, headroom, cache_ram, n)?),
+    };
     Record::new(&record::CACHE_CONFIG)
         .u("ram", cache_ram)
         .u("headroom", headroom)
@@ -305,7 +394,21 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         fatal_linger: FATAL_LINGER,
         slot_save_path: None,
     };
-    let server = Server::bind((a.host.as_str(), a.port), Box::new(engine), config)?;
+    // One slot stays the plain engine; several take it in turns.
+    let engine: Box<dyn Engine> = match park {
+        Some(budget) => Box::new(SwapEngine::new(
+            Box::new(engine),
+            a.parallel,
+            Park::States { budget },
+        )?),
+        None => Box::new(engine),
+    };
+    let slots = SlotConfig {
+        parallel: a.parallel,
+        queue_depth: a.queue_depth,
+        ..SlotConfig::default()
+    };
+    let server = Server::bind_with((a.host.as_str(), a.port), engine, config, slots)?;
     Record::new(&record::LISTENING)
         .w("place", a.place.name())
         .u("ctx", a.ctx)
@@ -315,13 +418,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 }
 
 /// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made
-/// now, before the load; refused by name under the batched feed or a
-/// draft, which it does not record.
+/// now, before the load; refused by name under the batched feed, a draft or
+/// several slots (`parallel`), which it does not record.
 fn route_trace(
     levers: &bloomery_levers::Levers,
     cfg: &body::OpenCfg,
     residency: ResidencyPick,
-    draft: Draft,
+    (draft, parallel): (Draft, usize),
     place: Place,
     path: &Path,
     inputs: &PlanInputs,
@@ -341,6 +444,13 @@ fn route_trace(
         return Err(format!(
             "BLOOMERY_ROUTE_TRACE records one-row steps; BLOOMERY_DRAFT={} runs two-row passes",
             draft.name()
+        )
+        .into());
+    }
+    if parallel > 1 {
+        return Err(format!(
+            "BLOOMERY_ROUTE_TRACE records one sequence's steps after its call row; \
+             --parallel {parallel} puts a parked request's steps after another's"
         )
         .into());
     }

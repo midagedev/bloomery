@@ -2,7 +2,11 @@
 //! ids are its request's alone, a free slot takes the oldest waiting request,
 //! a request takes the slot whose ids share its prefix, the queue refuses past
 //! its depth, `/slots` serves N ids and no more, and N past what the engine
-//! declares is refused by name.
+//! declares is refused by name. Then N slots that take the one-slot mock in
+//! turns ([`serve::SwapEngine`]): preemption at a step, turns of `QUANTUM`
+//! tokens, shortest prompt first, a newcomer refused by name when the running
+//! request cannot be parked, the re-prefill fallback, `/slots`' turns, and the
+//! draft kept.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -11,8 +15,8 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use serve::{
-    Engine, EngineError, FATAL_LINGER, MockEngine, ServeError, Server, ServerConfig, SlotConfig,
-    SlotRow, Tokenizer,
+    Drafted, Engine, EngineError, FATAL_LINGER, MockEngine, Park, QUANTUM, SavedState, ServeError,
+    Server, ServerConfig, SlotConfig, SlotRow, StateError, SwapEngine, Tokenizer,
 };
 
 use super::common::{V41_TEMPLATE, call, get, post};
@@ -433,4 +437,502 @@ fn hw_slots_an_engine_does_not_declare_are_refused() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("--parallel"), "{args:?}: {err}");
     }
+}
+
+/// What a [`Turned`] engine does when asked for a snapshot.
+#[derive(Clone, Copy)]
+enum Snap {
+    /// The mock's own state.
+    Takes,
+    /// [`serve::StateError::Unsupported`]: an engine that cannot snapshot.
+    Cannot,
+    /// A [`serve::StateError::Format`]: a snapshot that fails.
+    Fails,
+    /// The mock's own state, which a resume then refuses.
+    Unresumable,
+}
+
+/// An engine of one slot (the mock, unless given another) whose every call
+/// goes into `trace` in order (`prefill <text>`, `next`, `advance`, `reset`,
+/// `snapshot`, `resume`), and whose steps (`next` and `advance`, counted over
+/// the engine's life) block where `holds` say: the `k`-th one waits until its
+/// latch is released.
+struct Turned {
+    inner: Box<dyn Engine>,
+    trace: Arc<Mutex<Vec<String>>>,
+    holds: Vec<(usize, Arc<super::Latch>)>,
+    steps: usize,
+    snap: Snap,
+}
+
+impl Turned {
+    fn new(snap: Snap, holds: &[(usize, &Arc<super::Latch>)]) -> (Turned, Arc<Mutex<Vec<String>>>) {
+        Turned::over(Box::new(MockEngine::new(4096)), snap, holds)
+    }
+
+    fn over(
+        inner: Box<dyn Engine>,
+        snap: Snap,
+        holds: &[(usize, &Arc<super::Latch>)],
+    ) -> (Turned, Arc<Mutex<Vec<String>>>) {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let t = Turned {
+            inner,
+            trace: Arc::clone(&trace),
+            holds: holds.iter().map(|&(k, l)| (k, Arc::clone(l))).collect(),
+            steps: 0,
+            snap,
+        };
+        (t, trace)
+    }
+
+    fn log(&self, what: String) {
+        self.trace.lock().expect("trace").push(what);
+    }
+
+    /// One more step, held where `holds` say.
+    fn step(&mut self, what: &str) {
+        self.steps += 1;
+        self.log(what.to_owned());
+        if let Some((_, latch)) = self.holds.iter().find(|(k, _)| *k == self.steps) {
+            let mut g = latch.state.lock().expect("latch");
+            g.0 = true;
+            latch.cv.notify_all();
+            while !g.1 {
+                g = latch.cv.wait(g).expect("latch");
+            }
+        }
+    }
+}
+
+impl Engine for Turned {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        self.inner.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.log(format!("prefill {}", self.inner.tokenizer().decode(ids)));
+        self.inner.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.step("next");
+        self.inner.next(last, out)
+    }
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        self.step("advance");
+        self.inner.advance(last, out)
+    }
+    fn advance_rows(&self) -> usize {
+        self.inner.advance_rows()
+    }
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.log("reset".to_owned());
+        self.inner.reset()
+    }
+    fn keepable(&self, n: usize) -> usize {
+        self.inner.keepable(n)
+    }
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        self.inner.cut(n)
+    }
+    fn ctx_max(&self) -> usize {
+        self.inner.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn save_state(&self, out: &mut dyn std::io::Write) -> Result<SavedState, StateError> {
+        self.log("snapshot".to_owned());
+        match self.snap {
+            Snap::Takes | Snap::Unresumable => self.inner.save_state(out),
+            Snap::Cannot => Err(StateError::Unsupported("snapshots")),
+            Snap::Fails => Err(StateError::Format(
+                "the mock refuses this snapshot".to_owned(),
+            )),
+        }
+    }
+    fn restore_state(&mut self, input: &mut dyn std::io::Read) -> Result<SavedState, StateError> {
+        self.log("resume".to_owned());
+        if let Snap::Unresumable = self.snap {
+            return Err(StateError::Format(
+                "the mock refuses this resume".to_owned(),
+            ));
+        }
+        self.inner.restore_state(input)
+    }
+}
+
+/// A server of `n` slots that take `engine` in turns.
+fn start_swap(engine: Box<dyn Engine>, n: usize, park: Park) -> SocketAddr {
+    let swap = SwapEngine::new(engine, n, park).unwrap_or_else(|e| panic!("swap engine: {e}"));
+    start_n(Box::new(swap), n, None, None)
+}
+
+/// Room for every state these gates park.
+const ROOMY: Park = Park::States { budget: 1 << 20 };
+
+/// The request `body` posted on a thread of its own.
+fn post_bg(addr: SocketAddr, body: Value) -> std::thread::JoinHandle<super::common::Reply> {
+    std::thread::spawn(move || post(addr, "/completion", &body))
+}
+
+/// The lengths of the runs of `next` in `trace`, each run ended by any other
+/// call.
+fn next_runs(trace: &[String]) -> Vec<usize> {
+    let mut runs = vec![0];
+    for e in trace {
+        if e == "next" {
+            *runs.last_mut().expect("a run") += 1;
+        } else if runs.last() != Some(&0) {
+            runs.push(0);
+        }
+    }
+    runs.retain(|&r| r > 0);
+    runs
+}
+
+/// A request that takes a slot while another decodes runs its prompt at the
+/// next step boundary, the running request's state parked first; both give
+/// the ids each gives alone.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_request_preempts_the_running_one_at_a_step_and_both_give_their_alone_ids() {
+    const HELD: usize = 5;
+    let latch = Arc::new(super::Latch::default());
+    let (engine, trace) = Turned::new(Snap::Takes, &[(HELD, &latch)]);
+    let addr = start_swap(Box::new(engine), 2, ROOMY);
+    let (long, short) = (completion("abcabcab", 40), completion("xyzxyz", 6));
+    let a = post_bg(addr, long.clone());
+    assert!(
+        latch.wait_entered(BOUND),
+        "the first request never reached next #{HELD}"
+    );
+    let b = post_bg(addr, short.clone());
+    wait_deferred(addr, 1, BOUND);
+    latch.release();
+    let (a, b) = (a.join().expect("a"), b.join().expect("b"));
+    let alone = super::common::start(4096);
+    for (r, body) in [(&a, &long), (&b, &short)] {
+        assert_eq!(r.status, 200, "{}", r.body);
+        let want = post(alone, "/completion", body).json();
+        assert_eq!(r.json()["tokens"], want["tokens"], "{body}: {}", r.body);
+    }
+    let trace = trace.lock().expect("trace").clone();
+    let at = trace
+        .iter()
+        .position(|e| e == "prefill xyzxy")
+        .unwrap_or_else(|| panic!("the second prompt never ran: {trace:?}"));
+    let before = &trace[..at];
+    let nexts = before.iter().filter(|e| *e == "next").count();
+    assert_eq!(
+        nexts, HELD,
+        "the second prompt waited past the step boundary: {trace:?}"
+    );
+    let last = before.iter().rposition(|e| e == "next").expect("a next");
+    assert!(
+        before[last..].iter().any(|e| e == "snapshot"),
+        "the running request was not parked before the prompt: {trace:?}"
+    );
+    assert_eq!(
+        trace.iter().filter(|e| *e == "resume").count(),
+        1,
+        "the first request comes back once: {trace:?}"
+    );
+}
+
+/// Live requests take the engine in turns of `QUANTUM` tokens, the one that
+/// waited longest next, and a prompt that arrives during a turn starts at its
+/// end: each run of steps is a whole turn but a request's first, cut by the
+/// arrival, and its last.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_live_requests_take_turns_and_a_prompt_waits_for_the_turn_boundary() {
+    let (first, during) = (
+        Arc::new(super::Latch::default()),
+        Arc::new(super::Latch::default()),
+    );
+    let (engine, trace) = Turned::new(Snap::Takes, &[(3, &first), (80, &during)]);
+    let addr = start_swap(Box::new(engine), 3, ROOMY);
+    let a = post_bg(addr, completion("abcabcab", 200));
+    assert!(
+        first.wait_entered(BOUND),
+        "the first request never reached next #3"
+    );
+    let b = post_bg(addr, completion("xyzxyz", 200));
+    wait_deferred(addr, 1, BOUND);
+    first.release();
+    assert!(
+        during.wait_entered(BOUND),
+        "the turns never reached next #80"
+    );
+    let c = post_bg(addr, completion("pqpqpq", 70));
+    wait_deferred(addr, 1, BOUND);
+    during.release();
+    for r in [a, b, c] {
+        let r = r.join().expect("request");
+        assert_eq!(r.status, 200, "{}", r.body);
+    }
+    let q = QUANTUM;
+    let trace = trace.lock().expect("trace").clone();
+    // A 3 (preempted by B), B q, A q (next #80 inside it), C q, B q, A q,
+    // C 6 (its last), B q, A q, B 8 (its last), A 5 (its last).
+    assert_eq!(
+        next_runs(&trace),
+        [3, q, q, q, q, q, 6, q, q, 8, 5],
+        "{trace:?}"
+    );
+}
+
+/// Requests that take slots together start shortest prompt first, the next
+/// at the first's turn boundary or end, not at its first step.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_requests_that_take_slots_together_start_shortest_first() {
+    let latch = Arc::new(super::Latch::default());
+    // Next #2 is the first request's last: the two that wait take slots
+    // together, and it ends before either starts.
+    let (engine, trace) = Turned::new(Snap::Takes, &[(2, &latch)]);
+    let addr = start_swap(Box::new(engine), 3, ROOMY);
+    let a = post_bg(addr, completion("abcabcab", 2));
+    assert!(
+        latch.wait_entered(BOUND),
+        "the first request never reached next #2"
+    );
+    let long = post_bg(addr, completion("pqrstuvwpqrstuvw", 3));
+    wait_deferred(addr, 1, BOUND);
+    let short = post_bg(addr, completion("mnm", 3));
+    wait_deferred(addr, 2, BOUND);
+    latch.release();
+    for r in [a, long, short] {
+        assert_eq!(r.join().expect("request").status, 200);
+    }
+    let trace = trace.lock().expect("trace").clone();
+    let prompts: Vec<&str> = trace
+        .iter()
+        .filter_map(|e| e.strip_prefix("prefill "))
+        .collect();
+    assert_eq!(
+        prompts,
+        ["abcabca", "mn", "pqrstuvwpqrstuv"],
+        "the shorter prompt that arrived second starts first"
+    );
+    let at = |p: &str| trace.iter().position(|e| e == p).expect("a prefill");
+    let between = &trace[at("prefill mn")..at("prefill pqrstuvwpqrstuv")];
+    assert_eq!(
+        between.iter().filter(|e| *e == "next").count(),
+        3,
+        "the longer prompt waits for the shorter request's three tokens: {trace:?}"
+    );
+}
+
+/// A live request whose state cannot be parked — a snapshot past the park
+/// budget, or one the engine fails — refuses the newcomer with a named 503
+/// and `Retry-After`; the running request finishes with its alone ids.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_state_that_cannot_be_parked_refuses_the_newcomer_by_name() {
+    let alone = super::common::start(4096);
+    let long = completion("abcabcab", 20);
+    let want = post(alone, "/completion", &long).json();
+    // The mock's state of ten positions is 56 bytes.
+    let cases = [
+        (
+            Snap::Takes,
+            Park::States { budget: 32 },
+            "the park budget of 32 bytes",
+        ),
+        (Snap::Fails, ROOMY, "the mock refuses this snapshot"),
+    ];
+    for (snap, park, why) in cases {
+        let latch = Arc::new(super::Latch::default());
+        let (engine, _) = Turned::new(snap, &[(3, &latch)]);
+        let addr = start_swap(Box::new(engine), 2, park);
+        let a = post_bg(addr, long.clone());
+        assert!(latch.wait_entered(BOUND), "{why}: never reached next #3");
+        let b = post_bg(addr, completion("xyzxyz", 6));
+        wait_deferred(addr, 1, BOUND);
+        latch.release();
+        let b = b.join().expect("b");
+        assert_error(&b, 503, "unavailable_error", why);
+        assert_error(&b, 503, "unavailable_error", "slot 0 cannot be parked");
+        assert_eq!(b.header("Retry-After"), Some("1"), "{why}: {:?}", b.headers);
+        let a = a.join().expect("a");
+        assert_eq!(a.status, 200, "{why}: {}", a.body);
+        assert_eq!(a.json()["tokens"], want["tokens"], "{why}");
+        let m = get(addr, "/metrics").body;
+        assert_eq!(metric(&m, "swap_refusals_total"), 1.0, "{why}");
+    }
+}
+
+/// An engine that cannot snapshot takes turns by its ids: a parked request's
+/// ids are fed again at its next turn, and both requests give their alone
+/// ids; `/metrics` counts the positions fed again.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_the_re_prefill_fallback_gives_the_alone_ids() {
+    let latch = Arc::new(super::Latch::default());
+    let (engine, trace) = Turned::new(Snap::Cannot, &[(3, &latch)]);
+    let addr = start_swap(Box::new(engine), 2, Park::Ids);
+    let bodies = [completion("abcabcab", 100), completion("xyzxyz", 100)];
+    let a = post_bg(addr, bodies[0].clone());
+    assert!(
+        latch.wait_entered(BOUND),
+        "the first request never reached next #3"
+    );
+    let b = post_bg(addr, bodies[1].clone());
+    wait_deferred(addr, 1, BOUND);
+    latch.release();
+    let alone = super::common::start(4096);
+    for (r, body) in [a, b].into_iter().zip(&bodies) {
+        let r = r.join().expect("request");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let want = post(alone, "/completion", body).json();
+        assert_eq!(r.json()["tokens"], want["tokens"], "{body}");
+    }
+    let trace = trace.lock().expect("trace").clone();
+    assert!(
+        !trace.iter().any(|e| e == "snapshot" || e == "resume"),
+        "an engine of ids is never asked for a snapshot: {trace:?}"
+    );
+    let fed = metric(&get(addr, "/metrics").body, "swap_reprefill_tokens_total");
+    assert!(fed > 0.0, "no position was fed again");
+}
+
+/// `/slots` names each slot's turn: the request whose state is parked, the
+/// one running, and idle once both end; `/metrics` counts the switches and
+/// states the parked bytes beside the budget.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_slots_and_metrics_state_a_parked_request() {
+    let (held, during) = (
+        Arc::new(super::Latch::default()),
+        Arc::new(super::Latch::default()),
+    );
+    // Next #3 is the first request's; #5 is the second's first step.
+    let (engine, _) = Turned::new(Snap::Takes, &[(3, &held), (5, &during)]);
+    let addr = start_swap(Box::new(engine), 2, ROOMY);
+    let a = post_bg(addr, completion("abcabcab", 8));
+    assert!(
+        held.wait_entered(BOUND),
+        "the first request never reached next #3"
+    );
+    let b = post_bg(addr, completion("xyzxyz", 4));
+    wait_deferred(addr, 1, BOUND);
+    held.release();
+    assert!(
+        during.wait_entered(BOUND),
+        "the second request never stepped"
+    );
+    let turns = |addr| -> Vec<Value> {
+        get(addr, "/slots")
+            .json()
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|s| json!([s["turn"], s["is_processing"]]))
+            .collect()
+    };
+    let mid = turns(addr);
+    let m = get(addr, "/metrics").body;
+    during.release();
+    assert_eq!(
+        mid,
+        [json!(["parked", true]), json!(["running", true])],
+        "the first request is parked while the second runs"
+    );
+    assert_eq!(
+        metric(&m, "swap_parked_bytes"),
+        56.0,
+        "the first request's ten positions: 16 + 4 · 10 bytes"
+    );
+    assert_eq!(
+        metric(&m, "swap_park_budget_bytes"),
+        1_048_576.0,
+        "the budget the server was given: ROOMY's"
+    );
+    for r in [a, b] {
+        assert_eq!(r.join().expect("request").status, 200);
+    }
+    assert_eq!(
+        turns(addr),
+        [json!(["idle", false]), json!(["idle", false])]
+    );
+    let m = get(addr, "/metrics").body;
+    assert_eq!(metric(&m, "swaps_total"), 2.0, "parked once, back once");
+}
+
+/// A drafting engine whose slots take turns serves `--parallel 2`, and its
+/// greedy requests keep drafting through a preemption: their ids are their
+/// alone ids and their timings count drafted ids.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_slots_that_take_turns_keep_the_draft() {
+    let latch = Arc::new(super::Latch::default());
+    let draft = Box::new(serve::DraftMock::new(4096));
+    let (engine, trace) = Turned::over(draft, Snap::Cannot, &[(3, &latch)]);
+    let addr = start_swap(Box::new(engine), 2, Park::Ids);
+    let bodies = [completion("abcabcab", 30), completion("xyzxyz", 30)];
+    let a = post_bg(addr, bodies[0].clone());
+    assert!(
+        latch.wait_entered(BOUND),
+        "the first request never reached step #3"
+    );
+    let b = post_bg(addr, bodies[1].clone());
+    wait_deferred(addr, 1, BOUND);
+    latch.release();
+    let alone = super::common::start(4096);
+    for (r, body) in [a, b].into_iter().zip(&bodies) {
+        let r = r.join().expect("request");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = r.json();
+        let want = post(alone, "/completion", body).json();
+        assert_eq!(v["tokens"], want["tokens"], "{body}");
+        assert!(
+            v["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
+            "{body}: no drafted id: {}",
+            v["timings"]
+        );
+    }
+    let trace = trace.lock().expect("trace").clone();
+    let first_b = trace
+        .iter()
+        .position(|e| e == "prefill xyzxy")
+        .unwrap_or_else(|| panic!("the second prompt never ran: {trace:?}"));
+    assert!(
+        trace[..first_b].iter().filter(|e| *e == "advance").count() == 2,
+        "the second prompt did not preempt the first's passes at a step: {trace:?}"
+    );
+}
+
+/// A parked state the engine does not take back ends its request with a
+/// named error and nothing else: the other request finishes with its alone
+/// ids, and the server serves on.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_state_that_does_not_resume_ends_its_request_by_name() {
+    let latch = Arc::new(super::Latch::default());
+    let (engine, _) = Turned::new(Snap::Unresumable, &[(3, &latch)]);
+    let addr = start_swap(Box::new(engine), 2, ROOMY);
+    let short = completion("xyzxyz", 6);
+    let a = post_bg(addr, completion("abcabcab", 40));
+    assert!(
+        latch.wait_entered(BOUND),
+        "the first request never reached next #3"
+    );
+    let b = post_bg(addr, short.clone());
+    wait_deferred(addr, 1, BOUND);
+    latch.release();
+    let b = b.join().expect("b");
+    assert_eq!(b.status, 200, "{}", b.body);
+    let want = post(super::common::start(4096), "/completion", &short).json();
+    assert_eq!(b.json()["tokens"], want["tokens"]);
+    let a = a.join().expect("a");
+    assert_error(
+        &a,
+        500,
+        "server_error",
+        "the parked state of slot 0 did not resume: the mock refuses this resume",
+    );
+    assert_eq!(get(addr, "/health").json()["status"], "ok");
+    let after = post(addr, "/completion", &short);
+    assert_eq!(after.status, 200, "{}", after.body);
 }

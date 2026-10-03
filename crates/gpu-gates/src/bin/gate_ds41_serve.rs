@@ -71,7 +71,20 @@
 //!   `cache_prompt: false`.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
-//! waited for. Logs and the raw stream go to `--dir`, the first
+//! waited for, and a second server of two slots that take the body in turns
+//! (`--parallel 2`, `serve::SwapEngine`) is started into `<dir>/swap`:
+//!
+//! - two greedy requests (`ignore_eos`, `cache_prompt: false`), each alone,
+//!   then together, the second sent once `/slots` shows the first decoding
+//!   and long enough to run past a turn ([`serve::QUANTUM`]), so each
+//!   request's state is parked and put back mid-reply: the second's response
+//!   comes back before the first's, each request's ids are its alone ids, and
+//!   `/metrics` counts switches and no refusal.
+//!
+//! That server is killed and waited for the same way. Last, the same
+//! `--parallel 2` under `BLOOMERY_DRAFT=dspark` (set on that process alone)
+//! ends before it listens, naming both: a state put back starts the DSpark
+//! draft over. Logs and the raw stream go to `--dir`, the first
 //! `/completion`'s ids to `completion.ids` in it, and the greedy ids of the
 //! probe — [`DRAFT_PREDICT`] ids after a long document, a prompt whose
 //! continuation both keeps and rejects DSpark proposals — to `probe.ids`,
@@ -151,7 +164,10 @@ mod dspark;
 #[cfg(feature = "deepseek41")]
 mod gate {
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::process::Command;
+    use std::sync::mpsc::{self, Receiver};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu_gates::bind::nvidia_smi_index;
     use bloomery_gpu_gates::generate::Place;
@@ -164,6 +180,7 @@ mod gate {
     use model::placement::{Card, PlanLevers, workstation};
     use refset::arch::deepseek41::VERIFIED_POSITIONS;
     use serde_json::{Value, json};
+    use threads::helper::{Placement, spawn_helper};
 
     use crate::dspark;
 
@@ -180,6 +197,28 @@ mod gate {
     const SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "gate"];
     /// The server's arguments under `--place bp`.
     const BP_SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "bp"];
+    /// The swap clause's server: two slots that take the body in turns.
+    const SWAP_SERVER_ARGS: [&str; 8] = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--place",
+        "gate",
+        "--parallel",
+        "2",
+    ];
+    /// The swap clause's requests: the second runs past a turn, so each one's
+    /// state is parked and put back mid-reply, and ends while the first, sent
+    /// before it, still has a turn's tokens and more left.
+    const SWAP_FIRST_PREDICT: usize = 200;
+    const SWAP_SECOND_PREDICT: usize = 100;
+    const _: () = assert!(
+        SWAP_SECOND_PREDICT > serve::QUANTUM
+            && SWAP_FIRST_PREDICT > SWAP_SECOND_PREDICT + serve::QUANTUM
+    );
+    /// How often the swap clause reads `/slots` while the first request starts.
+    const SWAP_POLL: Duration = Duration::from_millis(20);
     /// The load takes tens of seconds; the bound is the spec's 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
@@ -856,6 +895,163 @@ mod gate {
             "shared_system_prompt_answer_is_fresh",
             warm["choices"][0]["message"] == fresh["choices"][0]["message"]
                 && fresh["timings"]["cache_n"] == json!(0),
+        );
+        Ok(ok)
+    }
+
+    /// One greedy `/completion` body of the swap clause.
+    fn swap_body(prompt: &str, n: usize) -> Value {
+        json!({
+            "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
+            "return_tokens": true, "cache_prompt": false,
+        })
+    }
+
+    /// `/metrics`' `llamacpp:<name>` value; `None` when it carries none.
+    fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
+        let (st, body) = curl(&url("/metrics"), None, false)?;
+        if st != 200 {
+            return Err(format!("/metrics: HTTP {st}: {body}").into());
+        }
+        let key = format!("llamacpp:{name} ");
+        Ok(body
+            .lines()
+            .find_map(|l| l.strip_prefix(&key))
+            .and_then(|v| v.trim().parse().ok()))
+    }
+
+    /// The swap clause (module header) on a server of two slots started into
+    /// `<dir>/swap`.
+    fn swap(a: &Args) -> Result<bool, GateError> {
+        let dir = a.dir.join("swap");
+        std::fs::create_dir_all(&dir)?;
+        let mut served = Served::spawn(&SWAP_SERVER_ARGS, &dir)?;
+        println!("swap server pid {}", served.child.id());
+        let addr = served.address(&dir.join("server.err"), POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let bodies = [
+            swap_body(&a.prompt, SWAP_FIRST_PREDICT),
+            swap_body(OTHER, SWAP_SECOND_PREDICT),
+        ];
+        let mut alone = Vec::new();
+        for (body, n) in bodies.iter().zip([SWAP_FIRST_PREDICT, SWAP_SECOND_PREDICT]) {
+            let (st, text) = curl(&url("/completion"), Some(body), false)?;
+            let v = json_of("/completion", st, &text)?;
+            let ids = ids_of(&v["tokens"]);
+            println!(
+                "swap alone: {} ids of {n}, {} tok/s",
+                ids.len(),
+                v["timings"]["predicted_per_second"]
+            );
+            alone.push((ids, n));
+        }
+        let swaps = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
+        // A request on a helper thread of its own: its handle, and its
+        // answer with when it came back.
+        type Answer = (Result<(u16, String), String>, Instant);
+        let post = |body: Value| -> Result<(JoinHandle<()>, Receiver<Answer>), GateError> {
+            let u = url("/completion");
+            let (tx, rx) = mpsc::channel();
+            let (h, _) = spawn_helper("swap-request", Placement::Float, move || {
+                let r = curl(&u, Some(&body), false).map_err(|e| e.to_string());
+                let _ = tx.send((r, Instant::now()));
+            })
+            .map_err(|e| format!("swap: {}", e.what()))?;
+            Ok((h, rx))
+        };
+        let first = post(bodies[0].clone())?;
+        loop {
+            if first.0.is_finished() {
+                return Err(
+                    "swap: the first request ended before /slots showed it decoding".into(),
+                );
+            }
+            let (st, text) = curl(&url("/slots"), None, false)?;
+            let slots = json_of("/slots", st, &text)?;
+            let decoding = slots.as_array().is_some_and(|l| {
+                l.iter().any(|s| {
+                    s["turn"] == "running"
+                        && s["next_token"]["n_decoded"].as_u64().is_some_and(|n| n > 0)
+                })
+            });
+            if decoding {
+                break;
+            }
+            std::thread::sleep(SWAP_POLL);
+        }
+        let second = post(bodies[1].clone())?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+            h.join()
+                .map_err(|_| format!("swap: the {what} request's thread panicked"))?;
+            let (r, at) = rx
+                .recv()
+                .map_err(|_| format!("swap: the {what} request's thread gave no answer"))?;
+            let (st, text) = r?;
+            let v = json_of("/completion", st, &text)?;
+            together.push((ids_of(&v["tokens"]), at));
+        }
+        let (after, refused, swap_s) = (
+            metric(&url, "swaps_total")?.unwrap_or(f64::NAN),
+            metric(&url, "swap_refusals_total")?.unwrap_or(f64::NAN),
+            metric(&url, "swap_seconds_total")?.unwrap_or(f64::NAN),
+        );
+        println!(
+            "swap together: first {} ids, second {} ids, second back {:?} before the first; \
+             switches {swaps} -> {after} ({swap_s} s in all, the server's wall clock), \
+             refusals {refused}",
+            together[0].0.len(),
+            together[1].0.len(),
+            together[0].1.checked_duration_since(together[1].1)
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "swap_alone_ran_to_n_predict",
+            alone.iter().all(|(ids, n)| ids.len() == *n),
+        );
+        check(
+            &mut ok,
+            "swap_second_back_before_the_first",
+            together[1].1 < together[0].1,
+        );
+        check(
+            &mut ok,
+            "swap_first_ids_are_alone",
+            together[0].0 == alone[0].0,
+        );
+        check(
+            &mut ok,
+            "swap_second_ids_are_alone",
+            together[1].0 == alone[1].0,
+        );
+        check(
+            &mut ok,
+            "swap_switched_and_refused_none",
+            after > swaps && refused == 0.0,
+        );
+        println!("swap server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
+    /// `--parallel 2` under the DSpark draft (module header), into
+    /// `<dir>/swap-dspark`.
+    fn swap_refuses_dspark(a: &Args) -> Result<bool, GateError> {
+        let dir = a.dir.join("swap-dspark");
+        std::fs::create_dir_all(&dir)?;
+        let mut cmd = Command::new(Served::exe()?);
+        cmd.env("BLOOMERY_DRAFT", "dspark");
+        let mut served = Served::spawn_cmd(cmd, &SWAP_SERVER_ARGS, &dir)?;
+        let refused = match served.address(&dir.join("server.err"), POLLS, POLL) {
+            Ok(addr) => format!("listening on {addr}"),
+            Err(e) => e.to_string(),
+        };
+        println!("swap under the DSpark draft: {refused}");
+        let mut ok = true;
+        check(
+            &mut ok,
+            "swap_under_dspark_is_refused_by_name",
+            refused.contains("--parallel 2 under BLOOMERY_DRAFT=dspark"),
         );
         Ok(ok)
     }
@@ -1709,6 +1905,8 @@ mod gate {
         ok &= shared_system(&url)?;
 
         println!("server stopped: {}", served.stop()?);
+        ok &= swap(&a)?;
+        ok &= swap_refuses_dspark(&a)?;
         if ok {
             println!("weekly-gpu-ds41-serve: PASS");
             Ok(())

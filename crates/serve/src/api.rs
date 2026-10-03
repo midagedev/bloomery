@@ -201,7 +201,7 @@ fn check_slots(engine: &dyn Engine, slots: &SlotConfig) -> Result<usize, ServeEr
         ));
     }
     let rows = engine.advance_rows();
-    if n > 1 && rows > 1 {
+    if n > 1 && rows > 1 && engine.turns().is_none() {
         return refuse(format!(
             "--parallel {n}: this engine drafts ({rows} rows a pass), and a step of several \
              slots does not draft"
@@ -231,8 +231,9 @@ impl Server {
 
     /// Binds `addr` and takes ownership of the engine, serving the slots
     /// `slots` asks for. A slot count the engine does not declare
-    /// ([`Engine::slots`]), several slots on an engine that drafts, and a
-    /// depth no queue can reach are refused by name ([`ServeError::Slots`]).
+    /// ([`Engine::slots`]), several slots on an engine that drafts unless they
+    /// take it in turns ([`Engine::turns`]), and a depth no queue can reach are
+    /// refused by name ([`ServeError::Slots`]).
     pub fn bind_with(
         addr: impl ToSocketAddrs,
         engine: Box<dyn Engine>,
@@ -1068,6 +1069,7 @@ fn draft_object(d: &DraftProps) -> Value {
 }
 
 fn slots(state: &State) -> Value {
+    let turns = relock(&state.shared.turns).clone();
     let b = relock(&state.shared.board);
     let list = b
         .slots()
@@ -1094,6 +1096,9 @@ fn slots(state: &State) -> Value {
                 m.insert("state".into(), json!(i32::from(busy)));
                 m.insert("is_processing".into(), json!(busy));
                 m.insert("n_past".into(), json!(s.n_past));
+                if let Some(t) = turns.as_ref().and_then(|t| t.get(id)) {
+                    m.insert("turn".into(), json!(t.as_str()));
+                }
                 m.insert("prompt".into(), s.prompt.clone());
                 m.insert(
                     "next_token".into(),
@@ -1126,6 +1131,7 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
     } else {
         0.0
     };
+    let turns = relock(&state.shared.turns).is_some();
     let text = {
         let s = relock(&state.shared.stats);
         // Throughput since start: the ratio of the matching `*_total` counters, so a
@@ -1246,8 +1252,53 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 deferred.to_string(),
             ),
         ];
+        let swap: [(&str, &str, &str, String); 7] = [
+            (
+                "counter",
+                "swaps_total",
+                "Slots that take the engine in turns: switches that moved a state",
+                s.n_swaps_total.to_string(),
+            ),
+            (
+                "counter",
+                "swap_seconds_total",
+                "Slots that take the engine in turns: time spent parking and putting back states",
+                (s.t_swap_ms_total / 1e3).to_string(),
+            ),
+            (
+                "counter",
+                "swap_refusals_total",
+                "Requests refused because the running request's state could not be parked",
+                s.n_swap_refused_total.to_string(),
+            ),
+            (
+                "counter",
+                "swap_reprefill_tokens_total",
+                "Positions a parked request's turn fed again (an engine that cannot snapshot)",
+                s.n_reprefill_total.to_string(),
+            ),
+            (
+                "counter",
+                "swap_reprefill_seconds_total",
+                "Time spent feeding parked requests' positions again",
+                (s.t_reprefill_ms_total / 1e3).to_string(),
+            ),
+            (
+                "gauge",
+                "swap_parked_bytes",
+                "Bytes of the parked states",
+                s.parked_bytes.to_string(),
+            ),
+            (
+                "gauge",
+                "swap_park_budget_bytes",
+                "The most bytes the parked states may hold (0: the engine parks ids, no state)",
+                s.park_budget.to_string(),
+            ),
+        ];
         let mut out = String::new();
-        for (kind, name, help, value) in rows {
+        for (kind, name, help, value) in rows.into_iter().chain(swap.into_iter().filter(|_| turns))
+        {
             out.push_str(&format!(
                 "# HELP llamacpp:{name} {help}\n# TYPE llamacpp:{name} {kind}\nllamacpp:{name} {value}\n"
             ));
@@ -1469,6 +1520,14 @@ fn run_gen(
             Msg::Prompt(t) => sink(Event::Prompt(&t), at),
             Msg::Text(text, t) => sink(Event::Text(&text, &t), at),
             Msg::Done(r) => return Ok((r, at)),
+            Msg::Refused(why) => {
+                return Err(ApiError {
+                    retry_after: true,
+                    code: 503,
+                    kind: "unavailable_error",
+                    message: why,
+                });
+            }
         };
         if let Err(e) = sent {
             return Ok((Err(GenError::Client(e)), at));

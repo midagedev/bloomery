@@ -11,6 +11,11 @@
 //! and the counters final. A client gone (its channel closed) ends its request
 //! at the next event; the slot is released.
 //!
+//! An engine whose slots take it in turns ([`Engine::turns`]) is run by the
+//! rules of [`crate::swap`] instead: one request on the engine at a time, the
+//! others' states parked, and the slot changing hands at step and turn
+//! boundaries.
+//!
 //! An engine error is fatal: every request in the failed call gets the error,
 //! every waiting one is refused, and the server ends ([`crate::api::End`]). A
 //! panic on this thread ends the server the same way, by name.
@@ -19,13 +24,17 @@ use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::Instant;
 
 use serde_json::Value;
 
 use crate::api::{End, EngineFailure, relock};
-use crate::engine::{EngineError, SamplerFactory, SlotRow};
-use crate::genloop::{Event, Gen, GenError, GenParams, Need, Outcome, Slot, StopKind, Timings};
+use crate::engine::{EngineError, SamplerFactory, SlotRow, StateError};
+use crate::genloop::{
+    Event, Gen, GenError, GenParams, Need, Outcome, Slot, StopKind, Timings, ms_since,
+};
 use crate::sched::{Board, Reserve, SlotView};
+use crate::swap::{Entry, NoRoom, Park, ParkTable, QUANTUM, Turn};
 
 /// The server's counters, `/metrics`' totals.
 #[derive(Default)]
@@ -48,6 +57,21 @@ pub(crate) struct Stats {
     pub n_draft_total: u64,
     pub n_draft_accepted_total: u64,
     pub n_draft_passes_total: u64,
+    /// Slots that take the engine in turns: the switches that moved a state
+    /// (a snapshot parked or a parked state put back) and their wall time.
+    pub n_swaps_total: u64,
+    pub t_swap_ms_total: f64,
+    /// Requests refused because the running request's state could not be
+    /// parked.
+    pub n_swap_refused_total: u64,
+    /// Under [`Park::Ids`]: the positions fed again at a parked request's
+    /// turn, and the wall time of those calls.
+    pub n_reprefill_total: u64,
+    pub t_reprefill_ms_total: f64,
+    /// The parked states' bytes now, and the most they may hold (the
+    /// [`Park::States`] budget; 0 under [`Park::Ids`], which parks no state).
+    pub parked_bytes: u64,
+    pub park_budget: u64,
 }
 
 /// A request handed to the engine thread.
@@ -67,6 +91,10 @@ pub(crate) enum Msg {
     Text(String, Timings),
     /// The last message.
     Done(Result<Outcome, GenError>),
+    /// The request was not started: the state of the request on the engine
+    /// could not be parked. Sent before any other message; the request may
+    /// succeed later as it is.
+    Refused(String),
 }
 
 /// A slot action run on the engine thread: `run` on the reserved slot
@@ -90,6 +118,9 @@ pub(crate) struct Shared {
     pub stats: Mutex<Stats>,
     /// Set by the engine error that ended the server; the reason `/health` gives.
     pub fatal: Mutex<Option<String>>,
+    /// Each slot's turn, for an engine whose slots take turns; `None` for any
+    /// other.
+    pub turns: Mutex<Option<Vec<Turn>>>,
     pub end: mpsc::Sender<End>,
     pub sampler: SamplerFactory,
     ids: AtomicU64,
@@ -106,6 +137,7 @@ impl Shared {
             work: Condvar::new(),
             stats: Mutex::new(Stats::default()),
             fatal: Mutex::new(None),
+            turns: Mutex::new(None),
             end,
             sampler,
             ids: AtomicU64::new(0),
@@ -124,6 +156,55 @@ struct Active {
     slot: usize,
     job: Gen,
     events: mpsc::Sender<Msg>,
+    /// Under turns: the engine call the request needs, taken from its
+    /// generation before its slot was parked.
+    need: Option<Need>,
+    /// Under turns: when it last left the engine (the turns' clock).
+    left: u64,
+    /// Under turns: the admission it took its slot in.
+    batch: u64,
+}
+
+/// A request that took a slot and waits for its prompt's turn.
+struct Pending {
+    slot: usize,
+    ids: Vec<u32>,
+    sub: Submit,
+    /// The admission it took its slot in: requests of one admission start
+    /// one after another at turn boundaries, a later one's at a step.
+    batch: u64,
+}
+
+/// The engine thread's part of slots that take the engine in turns.
+struct Turns {
+    table: ParkTable,
+    /// The slot whose state the engine holds.
+    on: usize,
+    /// The slot of the request on the engine, if one is.
+    running: Option<usize>,
+    /// The running request's generated tokens when its turn began.
+    turn_from: usize,
+    /// Requests that took slots and wait for their prompts, shortest first.
+    pending: Vec<Pending>,
+    /// Slot actions reserved while a request was live.
+    deferred: Vec<(Reserve, Action)>,
+    /// A turn's end could not park the running request: the next turns keep
+    /// it on the engine until a request ends or starts, which changes what the
+    /// table holds.
+    stuck: bool,
+    clock: u64,
+    /// Admissions so far.
+    batches: u64,
+}
+
+/// What a move of the engine to another slot did.
+enum Switched {
+    Done,
+    /// The live request on the engine could not be parked: nothing moved.
+    Refused(String),
+    /// The target's live request lost its parked state: the engine holds
+    /// nothing for it.
+    Lost(String),
 }
 
 struct Worker {
@@ -131,16 +212,43 @@ struct Worker {
     sh: Arc<Shared>,
     /// The requests running, in the order they took their slots.
     active: Vec<Active>,
+    turns: Option<Turns>,
 }
 
 /// Runs the engine thread until the engine fails or the thread panics.
 pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
+    let n = relock(&sh.board).slots().len();
+    let turns = slot.engine.turns().map(|park| {
+        *relock(&sh.turns) = Some(vec![Turn::Idle; n]);
+        relock(&sh.stats).park_budget = match park {
+            Park::States { budget } => budget,
+            Park::Ids => 0,
+        };
+        Turns {
+            table: ParkTable::new(park, n),
+            on: 0,
+            running: None,
+            turn_from: 0,
+            pending: Vec::new(),
+            deferred: Vec::new(),
+            stuck: false,
+            clock: 0,
+            batches: 0,
+        }
+    });
     let mut w = Worker {
         slot,
         sh: Arc::clone(&sh),
         active: Vec::new(),
+        turns,
     };
-    let ran = panic::catch_unwind(AssertUnwindSafe(|| w.run()));
+    let ran = panic::catch_unwind(AssertUnwindSafe(|| {
+        if w.turns.is_some() {
+            w.run_turns();
+        } else {
+            w.run();
+        }
+    }));
     if let Err(p) = ran {
         let what = p
             .downcast_ref::<&str>()
@@ -266,8 +374,9 @@ impl Worker {
         Ok(())
     }
 
-    /// A request that took `slot`: its prompt, run now.
-    fn start(&mut self, slot: usize, ids: &[u32], sub: Submit) -> Result<(), Dead> {
+    /// A request that took `slot`: its prompt, run now. Returns whether it
+    /// runs on (an error ended it otherwise).
+    fn start(&mut self, slot: usize, ids: &[u32], sub: Submit) -> Result<bool, Dead> {
         let Submit {
             p,
             prompt,
@@ -282,16 +391,28 @@ impl Worker {
             n_predict: p.n_predict,
             ..SlotView::default()
         };
+        // The turns change with the view: `/slots` never shows the request
+        // running with the counts of the one before it on the slot.
+        if self.turns.is_some() {
+            self.show_turns();
+        }
         let mut job = Gen::new(&self.slot, &self.sh.sampler, ids.len(), &p);
         let r = match self.slot.select(slot) {
             Ok(()) => job.prompt(&mut self.slot, ids, &p, &mut sink_of(&events)),
             Err(e) => Err(GenError::Engine(e)),
         };
-        let a = Active { slot, job, events };
+        let a = Active {
+            slot,
+            job,
+            events,
+            need: None,
+            left: 0,
+            batch: 0,
+        };
         match r {
             Ok(()) => {
                 self.active.push(a);
-                Ok(())
+                Ok(true)
             }
             Err(GenError::Engine(e)) => {
                 let f = self.fail(&e);
@@ -300,7 +421,7 @@ impl Worker {
             }
             Err(e) => {
                 self.end_request(a, Err(e));
-                Ok(())
+                Ok(false)
             }
         }
     }
@@ -386,11 +507,17 @@ impl Worker {
         let Err(e) = called else {
             return Ok(());
         };
-        let f = self.fail(&e);
+        Err(self.die(&e))
+    }
+
+    /// An engine failure in a call every running request waits on: each gets
+    /// the error, and the server ends.
+    fn die(&mut self, e: &EngineError) -> Dead {
+        let f = self.fail(e);
         for a in std::mem::take(&mut self.active) {
             self.end_request(a, Err(GenError::Engine(EngineError(e.0.clone()))));
         }
-        Err(self.end(f))
+        self.end(f)
     }
 
     /// Books a request's counters and view, releases its slot, and sends its
@@ -429,6 +556,422 @@ impl Worker {
             }
             b.release(a.slot, self.slot.held_of(a.slot).to_vec());
         }
+        if let Some(t) = &mut self.turns {
+            t.stuck = false;
+            self.show_turns();
+        }
         let _ = a.events.send(Msg::Done(r));
+    }
+}
+
+/// Slots that take the engine in turns ([`crate::swap`]).
+impl Worker {
+    fn t(&self) -> &Turns {
+        self.turns
+            .as_ref()
+            .expect("the turns of an engine whose slots take turns")
+    }
+
+    fn t_mut(&mut self) -> &mut Turns {
+        self.turns
+            .as_mut()
+            .expect("the turns of an engine whose slots take turns")
+    }
+
+    fn index_of(&self, slot: usize) -> Option<usize> {
+        self.active.iter().position(|a| a.slot == slot)
+    }
+
+    fn run_turns(&mut self) {
+        loop {
+            let (actions, admitted) = {
+                let mut b = relock(&self.sh.board);
+                loop {
+                    let actions = b.take_actions();
+                    let admitted = b.admit();
+                    let t = self.t();
+                    if !actions.is_empty()
+                        || !admitted.is_empty()
+                        || !self.active.is_empty()
+                        || !t.pending.is_empty()
+                        || !t.deferred.is_empty()
+                    {
+                        break (actions, admitted);
+                    }
+                    b = self.sh.work.wait(b).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let t = self.t_mut();
+            t.batches += u64::from(!admitted.is_empty());
+            let batch = t.batches;
+            let mut new: Vec<Pending> = admitted
+                .into_iter()
+                .map(|(slot, ids, sub)| Pending {
+                    slot,
+                    ids,
+                    sub,
+                    batch,
+                })
+                .collect();
+            // Requests that took slots together: the shortest prompt first.
+            new.sort_by_key(|p| p.ids.len());
+            let t = self.t_mut();
+            t.deferred.extend(actions);
+            t.pending.extend(new);
+            if self.active.is_empty() && self.t().pending.is_empty() {
+                for (what, a) in std::mem::take(&mut self.t_mut().deferred) {
+                    let moved = match what {
+                        Reserve::One(i) => self.switch(i).map(|_| ()),
+                        Reserve::All => Ok(()),
+                    };
+                    if moved.is_err() || self.act(what, a).is_err() {
+                        return;
+                    }
+                }
+            }
+            self.show_turns();
+            if self.turn().is_err() {
+                return;
+            }
+        }
+    }
+
+    /// One step boundary: the running request's tokens in hand go out, the
+    /// engine changes hands where a rule says so, and the request on it takes
+    /// one engine call.
+    fn turn(&mut self) -> Result<(), Dead> {
+        if let Some(i) = self.t().running.and_then(|r| self.index_of(r))
+            && self.active[i].need.is_none()
+            && let Some(need) = self.pump_at(i)
+        {
+            self.active[i].need = Some(need);
+        }
+        let running = self.t().running;
+        let on = running.and_then(|r| self.index_of(r));
+        let turn_done = on.is_some_and(|i| {
+            self.active[i].job.timings().predicted_n >= self.t().turn_from + QUANTUM
+        });
+        // A request that came after the running one began preempts it at this
+        // step while it runs alone; one of its own admission waits its turn.
+        let preempts = self.t().pending.first().is_some_and(|p| {
+            self.active.len() <= 1 && on.is_some_and(|i| p.batch > self.active[i].batch)
+        });
+        if !self.t().pending.is_empty() && (running.is_none() || turn_done || preempts) {
+            self.begin()?;
+        } else if running.is_none() || turn_done {
+            match self.longest_waiting() {
+                Some(to) if running.is_none() || !self.t().stuck => self.rotate(to)?,
+                // Alone on the engine, or stuck on it: the next turn starts now.
+                _ => {
+                    let i = running.and_then(|r| self.index_of(r));
+                    let n = i.map_or(0, |i| self.active[i].job.timings().predicted_n);
+                    self.t_mut().turn_from = n;
+                }
+            }
+        }
+        self.show_turns();
+        self.step_running()
+    }
+
+    /// The live request that left the engine longest ago, the running one
+    /// aside.
+    fn longest_waiting(&self) -> Option<usize> {
+        let running = self.t().running;
+        self.active
+            .iter()
+            .filter(|a| Some(a.slot) != running)
+            .min_by_key(|a| a.left)
+            .map(|a| a.slot)
+    }
+
+    /// The first pending request's prompt: the engine moves to its slot (a
+    /// live request's state that cannot be parked refuses it by name), its
+    /// prompt runs, and its turn begins.
+    fn begin(&mut self) -> Result<(), Dead> {
+        let p = self.t_mut().pending.remove(0);
+        match self.switch(p.slot)? {
+            Switched::Refused(why) => {
+                relock(&self.sh.stats).n_swap_refused_total += 1;
+                relock(&self.sh.board).release(p.slot, self.slot.held_of(p.slot).to_vec());
+                self.show_turns();
+                let _ = p.sub.events.send(Msg::Refused(why));
+                return Ok(());
+            }
+            // A pending request has no parked state to lose.
+            Switched::Lost(_) | Switched::Done => {}
+        }
+        let t = self.t_mut();
+        t.running = Some(p.slot);
+        t.turn_from = 0;
+        t.stuck = false;
+        if !self.start(p.slot, &p.ids, p.sub)? {
+            self.t_mut().running = None;
+        } else if let Some(i) = self.index_of(p.slot) {
+            self.active[i].batch = p.batch;
+        }
+        Ok(())
+    }
+
+    /// The engine to `to`'s live request for its turn. A running request
+    /// whose state cannot be parked keeps the engine for another turn; a
+    /// parked state that does not resume ends its request by name.
+    fn rotate(&mut self, to: usize) -> Result<(), Dead> {
+        match self.switch(to)? {
+            Switched::Refused(_) => {
+                let i = self.t().running.and_then(|r| self.index_of(r));
+                let n = i.map_or(0, |i| self.active[i].job.timings().predicted_n);
+                let t = self.t_mut();
+                t.turn_from = n;
+                t.stuck = true;
+            }
+            Switched::Lost(why) => {
+                self.t_mut().running = None;
+                if let Some(i) = self.index_of(to) {
+                    let a = self.active.remove(i);
+                    self.end_request(a, Err(GenError::Engine(EngineError(why))));
+                }
+            }
+            Switched::Done => {
+                let n = self
+                    .index_of(to)
+                    .map_or(0, |i| self.active[i].job.timings().predicted_n);
+                let t = self.t_mut();
+                t.running = Some(to);
+                t.turn_from = n;
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the tokens request `i` holds; its next engine call, or `None`
+    /// when it ended (and is booked).
+    fn pump_at(&mut self, i: usize) -> Option<Need> {
+        let a = &mut self.active[i];
+        let pumped = a
+            .job
+            .pump(&mut sink_of(&a.events), &mut tick_of(&self.sh, a.slot));
+        let ended = match pumped {
+            Ok(Need::Done) => {
+                let mut a = self.active.remove(i);
+                let r = a.job.finish(&mut sink_of(&a.events));
+                Some((a, r))
+            }
+            Ok(need) => return Some(need),
+            Err(e) => Some((self.active.remove(i), Err(e))),
+        };
+        if let Some((a, r)) = ended {
+            if self.t().running == Some(a.slot) {
+                self.t_mut().running = None;
+            }
+            self.end_request(a, r);
+        }
+        None
+    }
+
+    /// The running request's next engine call.
+    fn step_running(&mut self) -> Result<(), Dead> {
+        let Some(i) = self.t().running.and_then(|r| self.index_of(r)) else {
+            return Ok(());
+        };
+        let need = match self.active[i].need.take() {
+            Some(n) => n,
+            None => match self.pump_at(i) {
+                Some(n) => n,
+                None => return Ok(()),
+            },
+        };
+        {
+            let mut s = relock(&self.sh.stats);
+            s.n_decode_total += 1;
+            s.n_busy_slots_total += 1;
+        }
+        let a = &mut self.active[i];
+        let called = match need {
+            Need::Step(t) => self
+                .slot
+                .next(t, a.job.logits_out())
+                .map(|g| a.job.stepped(g)),
+            Need::Advance(t) => self
+                .slot
+                .advance(t, a.job.kept_mut())
+                .map(|d| a.job.advanced(d)),
+            Need::Done => unreachable!("a finished request left the running ones"),
+        };
+        match called {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.die(&e)),
+        }
+    }
+
+    /// The slots whose parked idle states stay through a move to `to`: `to`,
+    /// the pending requests' and the deferred actions'.
+    fn kept_slots(&self, to: usize) -> Vec<usize> {
+        let t = self.t();
+        let mut keep = vec![to];
+        keep.extend(t.pending.iter().map(|p| p.slot));
+        keep.extend(t.deferred.iter().filter_map(|(what, _)| match what {
+            Reserve::One(i) => Some(*i),
+            Reserve::All => None,
+        }));
+        keep
+    }
+
+    /// Moves the engine from the slot it holds to `to`: the state it leaves
+    /// parked as [`crate::swap`] says, then `to`'s parked state put back, its
+    /// ids fed again, or the engine emptied. A slot whose state leaves the
+    /// table, or that is left with no room, holds nothing after.
+    fn switch(&mut self, to: usize) -> Result<Switched, Dead> {
+        let from = self.t().on;
+        if from == to {
+            return Ok(Switched::Done);
+        }
+        let t0 = Instant::now();
+        let live_from = self.index_of(from).is_some();
+        let live_to = self.index_of(to).is_some();
+        let keep = self.kept_slots(to);
+        let held = self.slot.held_of(from).len();
+        let mut voids = Vec::new();
+        let mut moved = false;
+        if held > 0 {
+            let refused = match self.t().table.park() {
+                Park::Ids if live_from => {
+                    self.t_mut().table.put(from, Entry::Ids);
+                    moved = true;
+                    None
+                }
+                Park::Ids => Some(String::new()),
+                Park::States { .. } => match self.slot.engine.snapshot() {
+                    Err(StateError::Engine(e)) => return Err(self.die(&e)),
+                    Err(e) => Some(format!("the engine took no snapshot: {e}")),
+                    Ok(state) if state.n_tokens() != held => Some(format!(
+                        "its snapshot holds {} positions, the slot {held}",
+                        state.n_tokens()
+                    )),
+                    Ok(state) => match self.t_mut().table.room(state.n_bytes(), &keep) {
+                        Ok(gone) => {
+                            voids.extend(gone);
+                            let entry = Entry::State {
+                                state,
+                                live: live_from,
+                                at: 0,
+                            };
+                            self.t_mut().table.put(from, entry);
+                            moved = true;
+                            None
+                        }
+                        Err(NoRoom {
+                            need,
+                            pinned,
+                            budget,
+                        }) => Some(format!(
+                            "its {need} bytes beside the {pinned} parked for live requests pass \
+                             the park budget of {budget} bytes"
+                        )),
+                    },
+                },
+            };
+            match refused {
+                Some(why) if live_from => {
+                    return Ok(Switched::Refused(format!(
+                        "the request on slot {from} cannot be parked: {why}"
+                    )));
+                }
+                Some(_) => voids.push(from),
+                None => {}
+            }
+        }
+        if let Some(i) = self.index_of(from) {
+            let t = self.t_mut();
+            t.clock += 1;
+            self.active[i].left = self.t().clock;
+        }
+        for j in voids {
+            if let Err(e) = self
+                .slot
+                .select(j)
+                .and_then(|()| self.slot.erase().map(|_| ()))
+            {
+                return Err(self.die(&e));
+            }
+        }
+        if let Err(e) = self.slot.select(to) {
+            return Err(self.die(&e));
+        }
+        self.t_mut().on = to;
+        let mut out = Switched::Done;
+        let mut fed_ms = 0.0;
+        match self.t_mut().table.take(to) {
+            Some(Entry::State { state, .. }) => {
+                moved = true;
+                match self.slot.engine.resume(&state) {
+                    Ok(()) => {}
+                    Err(StateError::Engine(e)) => return Err(self.die(&e)),
+                    Err(e) => {
+                        if let Err(e) = self.slot.erase() {
+                            return Err(self.die(&e));
+                        }
+                        if live_to {
+                            out = Switched::Lost(format!(
+                                "the parked state of slot {to} did not resume: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Some(Entry::Ids) => {
+                moved = true;
+                let ids = self.slot.held_of(to).to_vec();
+                let t1 = Instant::now();
+                let fed = self
+                    .slot
+                    .engine
+                    .reset()
+                    .and_then(|()| self.slot.engine.prefill(&ids));
+                if let Err(e) = fed {
+                    return Err(self.die(&e));
+                }
+                fed_ms = ms_since(t1);
+                let mut s = relock(&self.sh.stats);
+                s.n_reprefill_total += ids.len() as u64;
+                s.t_reprefill_ms_total += fed_ms;
+            }
+            None => {
+                assert!(
+                    self.slot.held_of(to).is_empty(),
+                    "slot {to} holds {} ids and no parked state",
+                    self.slot.held_of(to).len()
+                );
+                if let Err(e) = self.slot.engine.reset() {
+                    return Err(self.die(&e));
+                }
+            }
+        }
+        let mut s = relock(&self.sh.stats);
+        if moved {
+            s.n_swaps_total += 1;
+            s.t_swap_ms_total += ms_since(t0) - fed_ms;
+        }
+        s.parked_bytes = self.t().table.bytes();
+        Ok(out)
+    }
+
+    /// Each slot's turn, for `/slots`.
+    fn show_turns(&self) {
+        let t = self.t();
+        let n = relock(&self.sh.board).slots().len();
+        let turns = (0..n)
+            .map(|slot| {
+                if t.running == Some(slot) {
+                    Turn::Running
+                } else if self.index_of(slot).is_some() {
+                    Turn::Parked
+                } else if t.pending.iter().any(|p| p.slot == slot) {
+                    Turn::Queued
+                } else {
+                    Turn::Idle
+                }
+            })
+            .collect();
+        *relock(&self.sh.turns) = Some(turns);
     }
 }
