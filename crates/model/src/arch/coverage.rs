@@ -491,8 +491,16 @@ const TYPE_PINS: &[TypePin] = &[
         program: Program::Qwen3moeBody,
         role: Role::Attention,
         matrices: true,
-        names: None,
-        what: "attention matrices (the body reads q4_K and q6_K)",
+        names: Some(|n| !n.ends_with(".attn_v.weight")),
+        what: "attention q, k and output matrices (the body reads q4_K)",
+        reads: &[GgmlType::Q4_K],
+    },
+    TypePin {
+        program: Program::Qwen3moeBody,
+        role: Role::Attention,
+        matrices: true,
+        names: Some(|n| n.ends_with(".attn_v.weight")),
+        what: "attention value matrices (the body reads q4_K and q6_K)",
         reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
     },
     TypePin {
@@ -526,6 +534,22 @@ const TYPE_PINS: &[TypePin] = &[
         names: None,
         what: "token embedding (the card reads q4_K rows)",
         reads: &[GgmlType::Q4_K],
+    },
+    TypePin {
+        program: Program::Qwen3moeBody,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_gate_up),
+        what: "routed experts gate and up (the body reads q4_K)",
+        reads: &[GgmlType::Q4_K],
+    },
+    TypePin {
+        program: Program::Qwen3moeBody,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_down),
+        what: "routed experts down (the body reads q4_K and q6_K)",
+        reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
     },
     TypePin {
         program: Program::Qwen35Body,
@@ -581,6 +605,22 @@ const TYPE_PINS: &[TypePin] = &[
             GgmlType::Q6_K,
             GgmlType::Q8_0,
         ],
+    },
+    TypePin {
+        program: Program::Qwen35Body,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_gate_up),
+        what: "routed experts gate and up, each shared expert joined in (the body reads q4_K)",
+        reads: &[GgmlType::Q4_K],
+    },
+    TypePin {
+        program: Program::Qwen35Body,
+        role: Role::RoutedExperts,
+        matrices: true,
+        names: Some(routed_down),
+        what: "routed experts down, each shared expert joined in (the body reads q4_K and q6_K)",
+        reads: &[GgmlType::Q4_K, GgmlType::Q6_K],
     },
     TypePin {
         program: Program::Deepseek41Chain,
@@ -714,6 +754,18 @@ const Q35_PROJ: &[GgmlType] = &[
     GgmlType::Q8_0,
 ];
 
+/// A routed expert stack's gate or up rows (`ffn_gate_exps`/`ffn_up_exps`),
+/// the part both whole-card bodies launch q4_K alone.
+fn routed_gate_up(name: &str) -> bool {
+    name.ends_with(".ffn_gate_exps.weight") || name.ends_with(".ffn_up_exps.weight")
+}
+
+/// A routed expert stack's down rows (`ffn_down_exps`), the part both
+/// whole-card bodies launch q4_K or q6_K.
+fn routed_down(name: &str) -> bool {
+    name.ends_with(".ffn_down_exps.weight")
+}
+
 /// A qwen4exp selector's key or query projection, which `Body38` reads as
 /// bf16 widened to f32 (`plan38::plans`), where it reads every other
 /// attention matrix as q8_0.
@@ -796,21 +848,31 @@ pub fn check_with(
         }
     }
     for t in &model.tensors {
-        let card = match program {
-            // The V4.1 chain's and the glm5next body's rule: a stack of a type
-            // no card format loads. A layer whose stacks the program's card
-            // experts do not read keeps them on the host, whose load refuses
-            // a type with no host kernel; the qwen4exp body serves every
-            // stack on the host.
-            Some(Program::Deepseek41Chain | Program::Glm5nextBody | Program::Qwen38Body) => {
-                CardFormat::of(t.ty)
+        if t.role == Role::RoutedExperts {
+            match program {
+                // The V4.1 chain's and the glm5next body's rule: a stack of a
+                // type no card format loads. A layer whose stacks the program's
+                // card experts do not read keeps them on the host, whose load
+                // refuses a type with no host kernel; the qwen4exp body serves
+                // every stack on the host.
+                Some(Program::Deepseek41Chain | Program::Glm5nextBody | Program::Qwen38Body) => {
+                    if CardFormat::of(t.ty).is_none() {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
+                // The one still to be written needs a card expert kernel for
+                // the type.
+                None => {
+                    if CardFormat::of_routed(t.ty).is_none() {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
+                // A whole-card program launches every stack itself, at its
+                // pins' types: a part of another type is one of their items,
+                // by name and part (the default expert rule's card formats
+                // would pass q3_K and q6_K gate·up to the load's refusal).
+                Some(Program::Qwen3moeBody | Program::Qwen35Body) => {}
             }
-            // A whole-card program, or the one still to be written, needs a
-            // card expert kernel for the type.
-            Some(Program::Qwen3moeBody | Program::Qwen35Body) | None => CardFormat::of_routed(t.ty),
-        };
-        if t.role == Role::RoutedExperts && card.is_none() {
-            at(t.layer, Need::RoutedFormat(t.ty));
         }
         for need in weight_formats(program, t) {
             at(t.layer, need);
@@ -913,8 +975,90 @@ mod tests {
         let attn = matrix("attn_q.weight", Role::Attention, q8);
         assert_eq!(
             items(Program::Qwen3moeBody, &attn),
-            ["q8_0 attention matrices (the body reads q4_K and q6_K)"]
+            ["q8_0 attention q, k and output matrices (the body reads q4_K)"]
         );
+        let v = matrix("attn_v.weight", Role::Attention, q8);
+        assert_eq!(
+            items(Program::Qwen3moeBody, &v),
+            ["q8_0 attention value matrices (the body reads q4_K and q6_K)"]
+        );
+    }
+
+    /// The qwen3moe body's attention pins are its launches' by part: q, k and
+    /// the output projection read q4_K alone, the values q4_K or q6_K, so a
+    /// q6_K q or output is an item a looser one-list pin passes.
+    #[test]
+    fn the_qwen3moe_body_reads_attention_by_part() {
+        for name in ["attn_q.weight", "attn_k.weight", "attn_output.weight"] {
+            assert_eq!(
+                items(
+                    Program::Qwen3moeBody,
+                    &matrix(name, Role::Attention, GgmlType::Q6_K)
+                ),
+                ["q6_K attention q, k and output matrices (the body reads q4_K)"],
+                "{name}"
+            );
+        }
+        let v = matrix("attn_v.weight", Role::Attention, GgmlType::Q6_K);
+        assert_eq!(items(Program::Qwen3moeBody, &v), Vec::<String>::new());
+    }
+
+    /// The whole-card bodies' routed pins, by part: the gate and up stacks
+    /// read q4_K alone, the down q4_K or q6_K — the parts the default expert
+    /// rule's card formats pass (q3_K, q6_K, q8_0 gate·up; q3_K, q8_0 down)
+    /// reach the loads' refusal otherwise.
+    #[test]
+    fn the_whole_card_bodies_read_routed_stacks_by_part() {
+        for (program, join) in [
+            (Program::Qwen3moeBody, ""),
+            (Program::Qwen35Body, ", each shared expert joined in"),
+        ] {
+            let stack = |name: &str, part: &str, ty: GgmlType, reads: &str, item: bool| {
+                let want = format!("{ty} routed experts {part}{join} (the body reads {reads})");
+                assert_eq!(
+                    items(program, &matrix(name, Role::RoutedExperts, ty)),
+                    if item {
+                        vec![want]
+                    } else {
+                        Vec::<String>::new()
+                    },
+                    "{name} {ty}"
+                );
+            };
+            stack(
+                "ffn_gate_exps.weight",
+                "gate and up",
+                GgmlType::Q4_K,
+                "q4_K",
+                false,
+            );
+            stack(
+                "ffn_up_exps.weight",
+                "gate and up",
+                GgmlType::Q4_K,
+                "q4_K",
+                false,
+            );
+            stack(
+                "ffn_down_exps.weight",
+                "down",
+                GgmlType::Q6_K,
+                "q4_K and q6_K",
+                false,
+            );
+            for ty in [
+                GgmlType::Q3_K,
+                GgmlType::Q6_K,
+                GgmlType::Q8_0,
+                GgmlType::Q5_K,
+            ] {
+                stack("ffn_gate_exps.weight", "gate and up", ty, "q4_K", true);
+                stack("ffn_up_exps.weight", "gate and up", ty, "q4_K", true);
+            }
+            for ty in [GgmlType::Q3_K, GgmlType::Q8_0, GgmlType::Q5_K] {
+                stack("ffn_down_exps.weight", "down", ty, "q4_K and q6_K", true);
+            }
+        }
     }
 
     /// A type `Body35` cannot launch is still an item by name: bf16
