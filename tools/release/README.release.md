@@ -26,6 +26,10 @@ for the experts that stay on the CPU. Source, measurements and the full README: 
 
 ## Run
 
+On Windows, run this archive inside WSL2 (Ubuntu): `wsl --install` from an administrator PowerShell, reboot, then
+extract and run as below inside the WSL shell — the binaries see the GPU through Windows' driver (tested on an RTX
+3060 12 GB under WSL2, Windows driver 591.86).
+
 ```sh
 tar -xzf bloomery-*-linux-x86_64-cuda-sm86.tar.gz
 cd bloomery-*/
