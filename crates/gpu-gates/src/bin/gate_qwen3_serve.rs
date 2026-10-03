@@ -82,6 +82,7 @@ mod gate {
 
     use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use gguf::Split;
     use serde_json::{Value, json};
 
     const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir>";
@@ -159,6 +160,73 @@ mod gate {
     /// A binary beside this one.
     fn beside(name: &str) -> Result<PathBuf, GateError> {
         Ok(std::env::current_exe()?.with_file_name(name))
+    }
+
+    /// The seat's default `--ctx` against the file and this gate's card:
+    /// unset, the whole-card load takes the file's trained context capped
+    /// to what the card had free — at least the 4096 floor, a multiple of
+    /// 1024, and past the floor when the card has room past it (a 24 GB
+    /// card and a Q4_K_M 30B file leave tens of thousands of rows); the
+    /// `--ctx` flag still wins; a load under `--place` keeps the floor.
+    /// FAIL-first: a search that hands back the trained context uncapped
+    /// makes the default arm's load a plan the card cannot hold (the spawn
+    /// never listens), and one that hands back nothing leaves the default
+    /// at the floor.
+    fn ctx_default(model: &Path, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        // The trained context read from the file beside the server, not the
+        // server's own echo of it.
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let trained = split
+            .arch_get_u64("context_length")
+            .and_then(|v| u64::try_from(v).ok())
+            .ok_or_else(|| format!("{}: no context_length", model.display()))?;
+        let props_ctx = |url: &dyn Fn(&str) -> String| -> Result<u64, GateError> {
+            let (st, body) = curl(&url("/props"), None, false)?;
+            let v = json_of("/props", st, &body)?;
+            Ok(v["n_ctx"].as_u64().unwrap_or(u64::MAX))
+        };
+        // Each arm loads the model, so each takes its own directory.
+        let arms: [(&str, &[&str]); 3] = [
+            ("default", &[]),
+            ("flag", &["--ctx", "2048"]),
+            ("placed", &["--place", "a"]),
+        ];
+        for (name, extra) in arms {
+            let d = dir.join(format!("ctx-{name}"));
+            std::fs::create_dir_all(&d)?;
+            let err_log = d.join("server.err");
+            let mut cmd = Command::new(beside("bloomery-serve")?);
+            cmd.env_remove("BLOOMERY_REF_MODEL");
+            let m = model.to_str().ok_or("the model path is not UTF-8")?;
+            let mut args: Vec<&str> = vec![
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "1",
+                "-m",
+                m,
+            ];
+            args.extend_from_slice(extra);
+            let mut s = Served::spawn_cmd(cmd, &args, &d)?;
+            let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+            let url = |p: &str| format!("http://{addr}{p}");
+            let n = props_ctx(&url)?;
+            println!("ctx arm {name}: props n_ctx {n} of trained {trained}");
+            check(ok, "ctx_never_passes_the_trained_context", n <= trained);
+            match name {
+                "default" => check(
+                    ok,
+                    "ctx_default_is_capped_to_the_card",
+                    n >= 4096 && n % 1024 == 0 && n > 4096,
+                ),
+                "flag" => check(ok, "ctx_flag_wins", n == 2048),
+                _ => check(ok, "placed_keeps_the_ctx_floor", n == 4096),
+            }
+            println!("ctx arm {name}: server stopped: {}", s.stop()?);
+        }
+        Ok(())
     }
 
     /// `bloomery-serve --model qwen3 -m <model> --port 0 --parallel 1` beside
@@ -574,6 +642,7 @@ mod gate {
                 };
             }
             check(&mut ok, "completion_ids_are_the_cli_ids", agree);
+            ctx_default(model, &dir, &mut ok)?;
         }
         if ok {
             println!("PASS");

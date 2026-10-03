@@ -241,6 +241,91 @@ pub fn unplaced_qwen3(file: &Split, ctx: usize) -> Result<Unplaced, GateError> {
     )?)))
 }
 
+/// The step the searched default context moves in ([`whole_ctx_qwen3`]):
+/// a round power of two a cache row count stays readable in.
+pub const CTX_GRAN: usize = 1024;
+
+/// The file's trained context (`<arch>.context_length`), `None` when the
+/// file states none.
+pub fn trained_ctx(file: &Split) -> Option<usize> {
+    file.arch_get_u64("context_length")
+        .and_then(|v| usize::try_from(v).ok())
+}
+
+/// The `--ctx` a whole-card load defaults to when the flag is unset: the
+/// file's trained context ([`trained_ctx`]) capped to the largest multiple
+/// of [`CTX_GRAN`] at or above `floor` that [`whole_fits_free`] takes on
+/// device 0. `None` when the file states no trained context or nothing at
+/// `floor` fits — the caller keeps `floor`, and the load falls to the placed
+/// plan as it does today. A placed plan keeps the caller's default: its
+/// solver trades context against card experts, a trade the flag owns.
+#[allow(
+    dead_code,
+    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
+)]
+pub fn whole_ctx_qwen3(file: &Split, floor: usize) -> Result<Option<usize>, GateError> {
+    let fits = |ctx: usize| {
+        let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, ctx)?;
+        whole_fits_free(&probe, u64::try_from(ctx)?)
+    };
+    searched_ctx(file, floor, &fits)
+}
+
+/// [`whole_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context terms.
+#[allow(
+    dead_code,
+    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
+)]
+pub fn whole_ctx_qwen35(
+    file: &Split,
+    o: &Open35,
+    floor: usize,
+) -> Result<Option<usize>, GateError> {
+    let fits = |ctx: usize| {
+        let mut probe_o = *o;
+        probe_o.ctx = ctx;
+        let probe = PlaceQ3::qwen35(file, Place::parse("cuda0")?, probe_o)?;
+        whole_fits_free(&probe, u64::try_from(ctx)?)
+    };
+    searched_ctx(file, floor, &fits)
+}
+
+/// The search both `whole_ctx_*` run: the largest `floor + k·CTX_GRAN` that
+/// `fits` takes, `Some(trained)` when the trained context itself fits.
+#[allow(
+    dead_code,
+    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
+)]
+fn searched_ctx(
+    file: &Split,
+    floor: usize,
+    fits: &dyn Fn(usize) -> Result<bool, GateError>,
+) -> Result<Option<usize>, GateError> {
+    let Some(trained) = trained_ctx(file) else {
+        return Ok(None);
+    };
+    if trained <= floor {
+        return Ok(Some(trained));
+    }
+    if !fits(floor)? {
+        return Ok(None);
+    }
+    let mut lo = floor;
+    let mut hi = trained;
+    while hi - lo > CTX_GRAN {
+        let mid = lo + (hi - lo) / 2 / CTX_GRAN * CTX_GRAN;
+        if mid == lo {
+            break;
+        }
+        if fits(mid)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(Some(lo))
+}
+
 /// What a run with `--place` unset loads, as [`unplaced_qwen3`] decides it,
 /// of a qwen35moe file.
 pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> {

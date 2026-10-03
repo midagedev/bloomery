@@ -10,7 +10,10 @@
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
 //! doc); `--ctx-size` is `--ctx` under llama-server's spelling, C defaults to
-//! 4096, `generate_qwen3moe`'s default. The model is opened as
+//! the file's trained context capped to what the card's free bytes fit (a
+//! whole-card load; never under 4096, a multiple of 1024, one stderr line
+//! when the cap binds), 4096 for a file that states none and for every load
+//! under `--place`. The model is opened as
 //! `generate_qwen3moe` opens it — qwen3moe through `Qwen3moeModel::open` at
 //! its levers' options, qwen35moe through `Qwen35moeModel::open` with the
 //! tensor-core decode flash and the levers' ubatch — in graph mode with the
@@ -112,13 +115,46 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
 /// The context unless `--ctx` says: `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
 
+/// The `--ctx` the seat takes when the flag is unset: a whole-card load
+/// takes the file's trained context capped to what the card's free bytes
+/// fit — never under [`CTX`], a multiple of 1024, one line on stderr when
+/// the cap binds. A file that states no trained context, and every load
+/// under `--place`, keeps [`CTX`]: the placed solver trades context against
+/// card experts, a trade the flag owns.
+fn default_ctx(split: &Split, arch: Arch) -> Result<usize, GateError> {
+    let searched = match arch {
+        Arch::Qwen3moe => q3place::whole_ctx_qwen3(split, CTX)?,
+        Arch::Qwen35moe => {
+            let o = Open35 {
+                ctx: CTX,
+                mma: true,
+                ubatch: ubatch_size()?,
+            };
+            q3place::whole_ctx_qwen35(split, &o, CTX)?
+        }
+        _ => None,
+    };
+    let Some(ctx) = searched else {
+        return Ok(CTX);
+    };
+    if let Some(trained) = q3place::trained_ctx(split)
+        && trained > ctx
+    {
+        eprintln!(
+            "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions \
+             (the whole load fits the card's free bytes; pass --ctx to choose)"
+        );
+    }
+    Ok(ctx)
+}
+
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the qwen3 seat runs no prompt cache";
 
 struct Args {
     host: String,
     port: u16,
-    ctx: usize,
+    ctx: Option<usize>,
     place: Option<Place>,
     /// `--parallel`: slots that take the model in turns past 1.
     parallel: usize,
@@ -129,7 +165,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     let mut a = Args {
         host: "127.0.0.1".to_owned(),
         port: 8080,
-        ctx: CTX,
+        ctx: None,
         place: None,
         // Two slots by default: a lone request pays nothing for the second
         // (the turns act only on a second arrival); `--parallel 1` keeps the
@@ -149,7 +185,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = v.parse().map_err(|e| format!("--port {v:?}: {e}"))?,
             "--ctx" | "--ctx-size" => match v.parse::<usize>() {
-                Ok(n) if n > 0 => a.ctx = n,
+                Ok(n) if n > 0 => a.ctx = Some(n),
                 _ => {
                     return Err(
                         format!("{flag} takes a whole number of at least 1, not {v:?}").into(),
@@ -516,9 +552,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .and_then(|v| v.as_str())
         .unwrap_or("qwen3")
         .to_owned();
+    let ctx = match a.ctx {
+        Some(c) => c,
+        // A placed plan keeps the floor: its solver trades context against
+        // card experts, a trade the flag owns.
+        None if a.place.is_none() => default_ctx(&split, arch)?,
+        None => CTX,
+    };
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
-    let ctx = a.ctx;
     let open = path.clone();
     let place = a.place;
     let device = place.map_or("device 0", Place::name).to_owned();
