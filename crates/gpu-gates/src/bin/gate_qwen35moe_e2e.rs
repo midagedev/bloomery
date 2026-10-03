@@ -108,6 +108,11 @@
 //!   name, the ubatch kept; (o4) the host tier served slots on both of its
 //!   ports. `--placed-only` runs (o) alone.
 //!
+//! (m) the memory guard, `--memguard-only` (no model loaded): the census
+//!   free reading, the quiet-card whole decision, the held-card refusal by
+//!   name and the placed decision, and the live reading once the hold drops
+//!   — `gate_qwen3moe_e2e`'s (m) is the clause's full form.
+//!
 //! Tap maps (ik → ours). Delta layer: `qkv_mixed` → the q·k·v projection;
 //! `z` → the gate projection; `beta_in`, `alpha` → β's and α's raw
 //! projections; `g_in` → `ln` of our decay (`exp(g)`); the v channels of
@@ -159,7 +164,7 @@ mod q3place;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use super::q3place::PlaceQ3;
+    use super::q3place::{self, PlaceQ3};
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
         Body35, Delta35Run, Gqa35Run, LayerKind35, Mixer35Run, Open35, PrefillPath, Qwen35moeModel,
@@ -1865,6 +1870,76 @@ mod gate {
     /// experts split between the card and the host tier.
     const PLACED_BUDGET: u64 = 12 << 30;
 
+    /// What the memguard clause leaves free of the card while it holds the
+    /// rest: well under the trunk's smallest term, so the refusal is
+    /// certain.
+    const MEMGUARD_LEFT: usize = 512 << 20;
+
+    /// The memory guard on this file (`gate_qwen3moe_e2e`'s (m) is the
+    /// clause's full form; this one holds the qwen35moe shapes of the same
+    /// planner): the quiet-card decision is the whole-card load, holding all
+    /// but [`MEMGUARD_LEFT`] of the free bytes refuses the plan on device 0
+    /// by name and makes the unset decision the placed one, and the hold
+    /// dropped restores the whole-card decision — the reading is live.
+    /// FAIL-first: a census that reads the total as the free bytes (mutant:
+    /// `raw_device_free_bytes` returning `cuDeviceTotalMem`'s figure) turns
+    /// every arm red.
+    fn memguard() -> Result<bool, GateError> {
+        use bloomery_gpu_gates::gpu_census::census;
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let d0 = census()?
+            .into_iter()
+            .find(|d| d.ordinal == 0)
+            .ok_or("the census reads no device 0")?;
+        println!(
+            "memguard census: cuda0 {} free {} B",
+            d0.name, d0.free_bytes
+        );
+        let o = Open35 {
+            ctx: CTX,
+            mma: true,
+            ubatch: U_GATE,
+        };
+        let whole = matches!(
+            q3place::unplaced_qwen35(&file, &o)?,
+            q3place::Unplaced::Whole
+        );
+        println!("memguard quiet: whole decision {whole} {}", verdict(whole));
+        let gpu = bloomery_gpu::Gpu::new()?;
+        let (free, _) = gpu.mem_info()?;
+        let hold = free
+            .checked_sub(MEMGUARD_LEFT)
+            .ok_or("the card had less free than the clause leaves")?;
+        let held = cuda_core::DeviceBuffer::<u8>::zeroed(gpu.stream(), hold)?;
+        let refusal = match q3place::PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?
+            .plan(CTX, &PlanLevers::default())
+        {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        };
+        let refused = refusal.contains("the plan's dense trunk alone needs");
+        println!("memguard held: refusal {refused} {refusal}");
+        let placed = matches!(
+            q3place::unplaced_qwen35(&file, &o)?,
+            q3place::Unplaced::Placed(_)
+        );
+        println!(
+            "memguard held: placed decision {placed} {}",
+            verdict(placed)
+        );
+        drop(held);
+        drop(gpu);
+        let whole_again = matches!(
+            q3place::unplaced_qwen35(&file, &o)?,
+            q3place::Unplaced::Whole
+        );
+        println!(
+            "memguard released: whole decision {whole_again} {}",
+            verdict(whole_again)
+        );
+        Ok(whole && refused && placed && whole_again)
+    }
+
     /// (o) (module doc): the model is dropped before the clause returns.
     fn placed(man: &RefManifest, toks: &[u32], host: HostCfg) -> Result<bool, GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
@@ -1878,7 +1953,7 @@ mod gate {
             card_budget_bytes: Some(PLACED_BUDGET),
         };
         let plan = q.plan(CTX, &levers)?;
-        q.record(&plan).print();
+        q.record(&plan, None).print();
         let split = plan.host.experts > 0 && plan.cards[0].experts > 0;
         println!(
             "placed plan: card_experts={} host_experts={} (both above 0) {}",
@@ -1986,6 +2061,14 @@ mod gate {
             let (man, toks) = batch_set()?;
             let ok = placed(&man, &toks, host)?;
             println!("gate_qwen35moe_e2e --placed-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
+        if std::env::args().any(|a| a == "--memguard-only") {
+            let ok = memguard()?;
+            println!("gate_qwen35moe_e2e --memguard-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
             }

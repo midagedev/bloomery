@@ -1298,6 +1298,8 @@ fn byte_card(name: &str, usable: u64, layers: Range<usize>) -> Card {
         scratch_bytes: 0,
         margin_bytes: 0,
         granule_bytes: NonZeroU64::MIN,
+        free_bytes: None,
+        held_by: None,
         head: !layers.is_empty(),
         layers,
         token_embedding: false,

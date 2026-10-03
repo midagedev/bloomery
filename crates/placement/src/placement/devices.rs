@@ -27,10 +27,20 @@ pub struct DeviceInfo {
     /// calls reserved, to under a MiB [measured on both of this
     /// workstation's cards].
     pub total_bytes: u64,
+    /// `cuMemGetInfo`'s free bytes on the device's primary context, read at
+    /// census time: what the device had left after every process done with
+    /// it, our own future context included in the reading's cost. A plan
+    /// sizes against this, not the total ([`spec_of_device`]).
+    pub free_bytes: u64,
     /// `cuDeviceGetUuid`.
     pub uuid: [u8; 16],
     /// `cuDeviceGetPCIBusId`.
     pub pci_bus: String,
+    /// The other processes holding the device's memory at census time, as
+    /// one named list ("pid 4321 (1234 MiB), …"), when the tool that reads
+    /// them answered; `None` when it did not or named none — a plan never
+    /// fails for want of holders.
+    pub held_by: Option<String>,
 }
 
 impl DeviceInfo {
@@ -77,26 +87,51 @@ pub const fn census_usable(total_bytes: u64) -> u64 {
     total_bytes / MIB * MIB
 }
 
-/// The card spec device `d` gives a plan, naming `d`. A device of a known
-/// card's driver name whose total gives that card's usable bytes takes the
-/// card's measured figures; any other device takes its census total with
-/// [`census_usable`]'s tail as the reserve, under a label from its driver
-/// name ([`label`]).
+/// The card spec device `d` gives a plan, naming `d`: the device's free
+/// reading and its holders ride along ([`CardSpec::free_bytes`],
+/// [`CardSpec::held_by`]) for the plan's budget term and its refusals. A
+/// device of a known card's driver name whose total gives that card's
+/// usable bytes takes the card's measured figures; any other device takes
+/// its census total with [`census_usable`]'s tail as the reserve, under a
+/// label from its driver name ([`label`]).
 #[must_use]
 pub fn spec_of_device(d: &DeviceInfo) -> CardSpec {
     let device = Some(d.device());
+    let free = Some(d.free_bytes);
+    let held_by = held_word(&d.held_by);
     let known = KNOWN
         .iter()
         .find(|(name, k)| *name == d.name && k.usable_bytes() == census_usable(d.total_bytes));
     if let Some((_, k)) = known {
-        return CardSpec { device, ..*k };
+        return CardSpec {
+            device,
+            free_bytes: free,
+            held_by,
+            ..*k
+        };
     }
     CardSpec {
         name: label(&d.name),
         total_bytes: d.total_bytes,
         driver_reserve_bytes: d.total_bytes - census_usable(d.total_bytes),
         device,
+        free_bytes: free,
+        held_by,
     }
+}
+
+/// A census holder list as a plan's card holds it: spelled once per list and
+/// kept for the process, like a `--place` word.
+fn held_word(held: &Option<String>) -> Option<&'static str> {
+    static HELD: Mutex<Vec<(String, &'static str)>> = Mutex::new(Vec::new());
+    let held = held.as_ref()?;
+    let mut helds = HELD.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, w)) = helds.iter().find(|(h, _)| h == held) {
+        return Some(w);
+    }
+    let w: &'static str = Box::leak(held.clone().into_boxed_str());
+    helds.push((held.clone(), w));
+    Some(w)
 }
 
 /// The name a plan and its records give a device of driver name `name`: a
@@ -131,7 +166,8 @@ pub fn label(name: &str) -> &'static str {
     l
 }
 
-/// The visible devices, as a refusal lists them.
+/// The visible devices, as a refusal lists them: each with its usable bytes
+/// and what it had free at census time.
 #[must_use]
 pub fn visible(census: &[DeviceInfo]) -> String {
     if census.is_empty() {
@@ -141,11 +177,12 @@ pub fn visible(census: &[DeviceInfo]) -> String {
         .iter()
         .map(|d| {
             format!(
-                "cuda{} {} {} {} MiB usable",
+                "cuda{} {} {} {} MiB usable, {} MiB free",
                 d.ordinal,
                 d.name,
                 d.pci_bus,
-                spec_of_device(d).usable_bytes() / MIB
+                spec_of_device(d).usable_bytes() / MIB,
+                d.free_bytes / MIB
             )
         })
         .collect::<Vec<_>>()
@@ -603,7 +640,8 @@ impl std::error::Error for CardNotInView {}
 mod tests {
     use super::{
         ALIASES, CardNotInView, DeviceInfo, Pick, PickError, PickWhy, WordError, census_usable,
-        device_on_host, listed_index, resolve, spec_of_device, word_picks, workstation_spec,
+        device_on_host, listed_index, resolve, spec_of_device, visible, word_picks,
+        workstation_spec,
     };
     use crate::placement::PlacementError;
     use crate::placement::workstation::{
@@ -618,7 +656,8 @@ mod tests {
     const NAME_4090: &str = "NVIDIA GeForce RTX 4090";
 
     /// A fake census of `(name, total)` devices, by ordinal, each of its own
-    /// UUID.
+    /// UUID and its full usable bytes free (a quiet card) and no holder
+    /// named.
     fn census(devices: &[(&str, u64)]) -> Vec<DeviceInfo> {
         devices
             .iter()
@@ -627,8 +666,10 @@ mod tests {
                 ordinal: u32::try_from(i).expect("small"),
                 name: name.to_string(),
                 total_bytes,
+                free_bytes: census_usable(total_bytes),
                 uuid: [u8::try_from(i).expect("small") + 0x10; 16],
                 pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
+                held_by: None,
             })
             .collect()
     }
@@ -667,10 +708,12 @@ mod tests {
             (
                 CardSpec {
                     device: Some(c[0].device()),
+                    free_bytes: Some(census_usable(TOTAL_3090)),
                     ..RTX_3090
                 },
                 CardSpec {
                     device: Some(c[1].device()),
+                    free_bytes: Some(census_usable(TOTAL_A6000)),
                     ..A6000
                 }
             )
@@ -690,6 +733,47 @@ mod tests {
         assert_eq!(
             (s.name, s.usable_bytes()),
             ("A6000", A6000.usable_bytes() - 2048 * MIB)
+        );
+    }
+
+    /// The census's free reading and its holder list ride the device's card
+    /// spec for the plan's budget term and its refusals, and a refusal
+    /// listing the visible devices names what each had free; the spec's own
+    /// identity figures stay the total's.
+    #[test]
+    fn the_free_reading_rides_the_spec() {
+        let mut c = census(&[(NAME_3090, TOTAL_3090), (NAME_A6000, TOTAL_A6000)]);
+        c[0].free_bytes = 8192 * MIB;
+        c[0].held_by = Some("pid 7 (977 MiB)".to_string());
+        let s = spec_of_device(&c[0]);
+        assert_eq!(
+            (s.free_bytes, s.held_by),
+            (Some(8192 * MIB), Some("pid 7 (977 MiB)"))
+        );
+        assert_eq!(s.usable_bytes(), RTX_3090.usable_bytes());
+        // A device the census read whole and named no holder of.
+        assert_eq!(
+            (
+                spec_of_device(&c[1]).free_bytes,
+                spec_of_device(&c[1]).held_by
+            ),
+            (Some(census_usable(TOTAL_A6000)), None)
+        );
+        let text = visible(&c);
+        assert!(
+            text.starts_with(&format!(
+                "cuda0 {NAME_3090} 0000:41:00.0 {} MiB usable, 8192 MiB free; ",
+                RTX_3090.usable_bytes() / MIB
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "cuda1 {NAME_A6000} 0000:42:00.0 {} MiB usable, {} MiB free",
+                A6000.usable_bytes() / MIB,
+                census_usable(TOTAL_A6000) / MIB
+            )),
+            "{text}"
         );
     }
 
@@ -824,6 +908,8 @@ mod tests {
         let strip = |mut m: crate::placement::Machine| {
             for c in m.cards.iter_mut().chain(m.tiers.iter_mut()) {
                 c.device = None;
+                c.free_bytes = None;
+                c.held_by = None;
             }
             m
         };

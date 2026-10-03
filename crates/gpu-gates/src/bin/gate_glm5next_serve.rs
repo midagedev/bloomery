@@ -656,6 +656,28 @@ mod gate {
             "unset_place_gate_runs_neither",
             g_ok && picks(&g, "off", "off") && record(&g, "residency host").is_none(),
         );
+        // Every plan line names its stage card's free bytes at plan time, at
+        // most its usable bytes — the census term the expert rule filled
+        // within (memguard). FAIL-first: a plan line that drops it, or names
+        // it past the card's usable bytes, turns this red.
+        for (place, lines) in [("a", &a), ("bp", &bp), ("gate", &g)] {
+            let named = record(lines, "plan").is_some_and(|l| {
+                let free = l
+                    .split("card_free=")
+                    .nth(1)
+                    .and_then(|t| t.split(' ').next())
+                    .and_then(|n| n.parse::<u64>().ok());
+                let usable = l
+                    .split("devices=")
+                    .nth(1)
+                    .and_then(|d| d.split([',', ' ', ']']).next())
+                    .and_then(|c| c.rsplit(':').next())
+                    .and_then(|n| n.parse::<u64>().ok());
+                free.is_some_and(|f| usable.is_some_and(|u| f <= u))
+            });
+            println!("--place {place}: card_free named and within usable {named}");
+            check(&mut ok, "plan_names_the_cards_free_bytes", named);
+        }
         Ok(ok)
     }
 

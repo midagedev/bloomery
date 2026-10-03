@@ -11,6 +11,10 @@
 //!
 //! - `load_and_listen`: the server prints its `load` record for the file's
 //!   architecture before its `listening` record;
+//! - `unplaced_default_names_itself`: with no `--place` the default is the
+//!   whole-card load printing no `plan` record (a card with room; today's
+//!   lines), or the auto-placed plan whose one record names
+//!   `whole_does_not_fit` (FAIL-first: a default that plans without the why);
 //! - the chat turn [`MESSAGES`], rendered by the server's own template
 //!   (`/apply-template`, `/tokenize`), is longer than the eight ids a pass
 //!   takes, so the prompt call runs the ubatch walk;
@@ -414,6 +418,21 @@ mod gate {
             ok,
             "load_and_listen",
             matches!((load, listen), (Some(a), Some(b)) if a < b),
+        );
+        // The server ran with no `--place`: the default is exactly one of
+        // two things — the whole-card load, printing no `plan` record (a
+        // card with room; today's lines), or the auto-placed plan, its one
+        // record naming `whole_does_not_fit`. FAIL-first: a default that
+        // plans without the why, or prints more than one plan record, turns
+        // this red.
+        let plans: Vec<&str> = log.lines().filter(|l| l.starts_with("plan ")).collect();
+        let default_ok =
+            plans.is_empty() || (plans.len() == 1 && plans[0].contains("why=whole_does_not_fit"));
+        println!("unplaced default: {} plan record(s) {plans:?}", plans.len());
+        check(
+            ok,
+            "unplaced_default_names_itself",
+            load.is_some() && default_ok,
         );
 
         let (st, body) = curl(

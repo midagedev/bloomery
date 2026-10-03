@@ -561,6 +561,8 @@ fn nextn_machine() -> Machine {
             scratch_bytes: 0,
             margin_bytes: 0,
             granule_bytes: GRANULE,
+            free_bytes: None,
+            held_by: None,
             layers: 0..1,
             head: true,
             token_embedding: false,

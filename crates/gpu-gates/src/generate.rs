@@ -147,10 +147,11 @@ impl Place {
         })
     }
 
-    /// The placement on this process's devices ([`bloomery_gpu::census`]):
-    /// [`Place::on`] of the census.
+    /// The placement on this process's devices ([`crate::gpu_census::census`],
+    /// the driver's census with nvidia-smi's holders): [`Place::on`] of the
+    /// census.
     pub fn on_host(self) -> Result<Place, GateError> {
-        self.on(&bloomery_gpu::census()?)
+        self.on(&crate::gpu_census::census()?)
     }
 
     /// The placement resolved against `census`: each card the spec of the
@@ -745,8 +746,10 @@ mod tests {
                     ordinal: u32::try_from(i).expect("small"),
                     name,
                     total_bytes,
+                    free_bytes: total_bytes / 1024 / 1024 * 1024,
                     uuid: [u8::try_from(i).expect("small") + 1; 16],
                     pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
+                    held_by: None,
                 }
             })
             .collect()
@@ -910,8 +913,10 @@ mod draft_card_tests {
                     ordinal: u32::try_from(i).expect("small"),
                     name: name.to_string(),
                     total_bytes,
+                    free_bytes: total_bytes / 1024 / 1024 * 1024,
                     uuid: [u8::try_from(i).expect("small") + 1; 16],
                     pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
+                    held_by: None,
                 }
             })
             .collect()

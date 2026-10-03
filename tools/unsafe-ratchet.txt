@@ -58,7 +58,10 @@ gguf 9 2 0
 # qwen3moe family's placed host leg (arch/qwen3moe/hostleg.rs) — qwen3moe_places (the id load, the map read, the sel
 # store), qwen3moe_combine_host and qwen3moe_combine_host_sh (each its card sum and its store block), the card sum
 # (the one unsafe fn, its place and its product reads) and the module load, each with its SAFETY line.
-gpu 1437 152 6
+# PIN(2026-10-03): gpu 1437 -> 1443 blocks, new code, not old code relaxed: lib.rs
+# raw_device_free_bytes, the census's free-bytes reading on the device's primary context —
+# six driver calls (get/set current, retain, GetInfo, release), each with its SAFETY line.
+gpu 1443 152 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

@@ -41,8 +41,9 @@ pub fn card_routed(ty: GgmlType) -> Option<CardFormat> {
 /// of `layers`, the head and the token embedding whole, with the
 /// workstation's context and margin, the m = 1 scratch plus `arena` bytes —
 /// what the load's prompt arenas hold beyond it, which the program sizes
-/// and its load refuses to pass — and the workstation's host. No expert
-/// tier.
+/// and its load refuses to pass — and the workstation's host. The spec's
+/// free reading and its holders ride on the card
+/// ([`crate::placement::Card::free_bytes`]). No expert tier.
 #[must_use]
 pub fn machine(card: CardSpec, layers: usize, arena: u64) -> Machine {
     Machine {
@@ -54,6 +55,8 @@ pub fn machine(card: CardSpec, layers: usize, arena: u64) -> Machine {
             scratch_bytes: SCRATCH + arena,
             margin_bytes: MARGIN,
             granule_bytes: GRANULE,
+            free_bytes: card.free_bytes,
+            held_by: card.held_by,
             layers: 0..layers,
             head: true,
             token_embedding: true,

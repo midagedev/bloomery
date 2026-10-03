@@ -121,6 +121,22 @@
 //!   activations) where the card runs q8_1, so no layer's error grows.
 //!   `--placed-only` runs (o) alone.
 //!
+//! - (m) the memory guard, `--memguard-only` (the card as the runner pins
+//!   it, nothing loaded): the census reads device 0's free bytes (at most
+//!   its usable bytes); with the card quiet the `--place`-unset load is
+//!   today's whole-card one (`q3place::unplaced_qwen3` answers `Whole`, no
+//!   plan record); holding all but [`MEMGUARD_LEFT`] of the free bytes in
+//!   one device buffer, the plan on device 0 is refused by name with every
+//!   term — the card, its free and usable bytes, the dense trunk, KV,
+//!   context, scratch, reserves and margin — under no budget and under
+//!   `BLOOMERY_CARD_BUDGET` above the free reading (the free term binds
+//!   under it), and the unset load's decision is the placed plan on `a`'s
+//!   card, its record naming `whole_does_not_fit`; the hold dropped, both
+//!   are gone (the reading is live). FAIL-first: a census that reads the
+//!   total as the free bytes (mutant: `raw_device_free_bytes` returning
+//!   `cuDeviceTotalMem`'s figure) plans where the refusal is expected and
+//!   answers `Whole` where the placed decision is — every arm red.
+//!
 //! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
 //! `--rope-only` the load and (t), `--fault-only` the load and (x),
 //! `--taps-only` the load and (d).
@@ -172,7 +188,7 @@ mod q3place;
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use super::q3place::PlaceQ3;
+    use super::q3place::{self, PlaceQ3};
     use super::taps;
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
@@ -396,6 +412,14 @@ mod gate {
         if args.iter().any(|a| a == "--placed-only") {
             let ok = placed(host)?;
             println!("gate_qwen3moe_e2e --placed-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
+        if args.iter().any(|a| a == "--memguard-only") {
+            let ok = memguard()?;
+            println!("gate_qwen3moe_e2e --memguard-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
             }
@@ -894,12 +918,127 @@ mod gate {
         Ok(ok)
     }
 
+    // ----------------------------------------------- (m) the memory guard
+
+    /// What (m) leaves free of the card while it holds the rest: well under
+    /// the trunk's smallest term, so the refusal is certain.
+    const MEMGUARD_LEFT: usize = 512 << 20;
+
+    /// (m) (module doc), no model loaded: the census's free reading, the
+    /// quiet-card whole decision, the held-card refusal with every term
+    /// under no budget and under a budget above free, the placed decision,
+    /// the auto record's why and `card_free`, and the live reading once the
+    /// hold is dropped.
+    fn memguard() -> Result<bool, GateError> {
+        use bloomery_gpu_gates::gpu_census::census;
+        use model::placement::workstation::census_usable;
+        let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
+        let d0 = census()?
+            .into_iter()
+            .find(|d| d.ordinal == 0)
+            .ok_or("the census reads no device 0")?;
+        let usable = census_usable(d0.total_bytes);
+        println!(
+            "memguard census: cuda0 {} free {} B of usable {usable} B",
+            d0.name, d0.free_bytes
+        );
+        let mut ok = d0.free_bytes <= usable;
+        // The quiet card: the unset load is today's whole-card one.
+        let whole = matches!(
+            q3place::unplaced_qwen3(&file, CTX)?,
+            q3place::Unplaced::Whole
+        );
+        println!("memguard quiet: whole decision {whole} {}", verdict(whole));
+        ok &= whole;
+        // The auto record's shape, planned explicitly under (o)'s budget:
+        // its why word and the free bytes it names.
+        let q = PlaceQ3::qwen3(&file, Place::A.on_host()?, CTX)?;
+        let plan = q.plan(
+            CTX,
+            &PlanLevers {
+                card_budget_bytes: Some(PLACED_BUDGET),
+            },
+        )?;
+        let line = q.record(&plan, Some(q3place::WHY_NOT_WHOLE)).line();
+        let record_ok = line.contains("why=whole_does_not_fit") && line.contains("card_free=");
+        println!("memguard record: {record_ok} {line}");
+        ok &= record_ok;
+        // Held: all but MEMGUARD_LEFT of the free bytes in one buffer on
+        // this context (our own pid, which the holder list never names).
+        let gpu = Gpu::new()?;
+        let (free, _) = gpu.mem_info()?;
+        let hold = free
+            .checked_sub(MEMGUARD_LEFT)
+            .ok_or("the card had less free than the clause leaves")?;
+        let held = cuda_core::DeviceBuffer::<u8>::zeroed(gpu.stream(), hold)?;
+        let refusal = |levers: &PlanLevers| -> Result<String, GateError> {
+            let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, CTX)?;
+            Ok(q.plan(CTX, levers)
+                .map_or_else(|e| e.to_string(), |_| String::new()))
+        };
+        let mut terms = true;
+        let budgets = [
+            ("no budget", PlanLevers::default()),
+            (
+                "a budget above free",
+                PlanLevers {
+                    card_budget_bytes: Some(usable),
+                },
+            ),
+        ];
+        for (what, levers) in budgets {
+            let text = refusal(&levers)?;
+            for part in [
+                "the device had",
+                " B free of its usable",
+                " B at plan time",
+                "the plan's dense trunk alone needs",
+                " B = dense ",
+                " B (the allocator's granules) + KV ",
+                " B + context ",
+                " B + scratch ",
+                " B + reserves ",
+                " B + margin ",
+            ] {
+                terms &= text.contains(part);
+                if !text.contains(part) {
+                    println!("memguard refusal ({what}): {part:?} missing: {text}");
+                }
+            }
+        }
+        println!("memguard held: refusal with every term {terms}");
+        ok &= terms;
+        // The unset load's decision under the hold: the placed plan.
+        let placed = matches!(
+            q3place::unplaced_qwen3(&file, CTX)?,
+            q3place::Unplaced::Placed(_)
+        );
+        println!(
+            "memguard held: placed decision {placed} {}",
+            verdict(placed)
+        );
+        ok &= placed;
+        drop(held);
+        drop(gpu);
+        // The hold gone, the decision is the whole-card one again: the
+        // reading is live, not a constant.
+        let whole = matches!(
+            q3place::unplaced_qwen3(&file, CTX)?,
+            q3place::Unplaced::Whole
+        );
+        println!(
+            "memguard released: whole decision {whole} {}",
+            verdict(whole)
+        );
+        ok &= whole;
+        Ok(ok)
+    }
+
     // -------------------------------------------------- (o) the placed load
 
     /// (o)'s card budget: a 12 GiB card's, under which the file's routed
     /// experts split between the card and the host tier.
     const PLACED_BUDGET: u64 = 12 << 30;
-
     /// The file planned on device 0 at `ctx` positions under
     /// [`PLACED_BUDGET`], its `plan` record and the split line printed, and
     /// loaded by that plan with its host set as `host` asks; `None` when the
@@ -911,7 +1050,7 @@ mod gate {
             card_budget_bytes: Some(PLACED_BUDGET),
         };
         let plan = q.plan(ctx, &levers)?;
-        q.record(&plan).print();
+        q.record(&plan, None).print();
         let split = plan.host.experts > 0 && plan.cards[0].experts > 0;
         println!(
             "placed plan: card_experts={} host_experts={} (both above 0) {}",

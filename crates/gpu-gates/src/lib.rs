@@ -22,6 +22,7 @@ pub mod flip;
 pub mod gemm32;
 #[cfg(feature = "gpu")]
 pub mod generate;
+pub mod gpu_census;
 pub mod hc_host;
 #[cfg(feature = "gpu")]
 pub mod host_stats;

@@ -391,6 +391,7 @@ mod gate {
         argv: &[String],
         pid: u32,
         levers: &bloomery_levers::Levers,
+        err_log: &Path,
     ) -> Result<bool, GateError> {
         let (st, body) = curl(&url("/props"), None, false)?;
         let e = json_of("/props", st, &body)?["engine"].clone();
@@ -401,12 +402,13 @@ mod gate {
         let inputs = PlanInputs::describe(&split)?;
         let experts = experts38(levers)?;
         let ub = ubatch_for(CTX)?;
-        let machine = machine_for_experts(
+        let mut machine = machine_for_experts(
             RTX_3090,
             inputs.spec.layers.len(),
             u64::try_from(ub)?,
             experts,
         );
+        machine.cards[0].free_bytes = server_card_free(err_log)?;
         // Under the draft the plan carries it (its granules, its store, its
         // row map and its program's arena beside the target's card terms),
         // and `/props` files its bytes as the card's `draft` class.
@@ -984,6 +986,19 @@ mod gate {
 
     /// The first record on the server's stderr at `err_log` whose line
     /// starts with `head` and a space.
+    /// The card free bytes the server's own `plan` line named: its census
+    /// reading at its load. The gate's re-derivations take the same one — a
+    /// fresh census read beside the loaded server would see the server's own
+    /// bytes as taken and size another plan.
+    fn server_card_free(err_log: &Path) -> Result<Option<u64>, GateError> {
+        Ok(record_line(err_log, "plan")?.and_then(|l| {
+            l.split("card_free=")
+                .nth(1)
+                .and_then(|t| t.split(' ').next())
+                .and_then(|n| n.parse::<u64>().ok())
+        }))
+    }
+
     fn record_line(err_log: &Path, head: &str) -> Result<Option<String>, GateError> {
         let prefix = format!("{head} ");
         Ok(std::fs::read_to_string(err_log)?
@@ -1395,13 +1410,15 @@ mod gate {
         levers: &PlanLevers,
         experts: Experts,
         ctx: usize,
+        free: Option<u64>,
     ) -> Result<Option<u64>, GateError> {
-        let machine = machine_for_experts(
+        let mut machine = machine_for_experts(
             RTX_3090,
             inputs.spec.layers.len(),
             u64::try_from(ubatch_for(ctx)?)?,
             experts,
         );
+        machine.cards[0].free_bytes = free;
         Ok(inputs
             .plan_with(&machine, u64::try_from(ctx)?, levers, experts)
             .ok()
@@ -1477,7 +1494,8 @@ mod gate {
         let inputs = PlanInputs::describe(&split)?;
         let experts = experts38(levers)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
-        let at = |c: usize| card_at(&inputs, &plan_levers, experts, c);
+        let free = server_card_free(&err_log)?;
+        let at = |c: usize| card_at(&inputs, &plan_levers, experts, c, free);
         let base = at(CTX)?.ok_or("no plan at the base context")?;
         let lost = |c: usize| -> Result<Option<u64>, GateError> {
             Ok(at(c)?.map(|e| base.saturating_sub(e)))
@@ -1607,10 +1625,30 @@ mod gate {
         let (st, body) = curl(&url("/health"), None, false)?;
         println!("health {st} {body}");
         check(&mut ok, "health_ok", st == 200 && body.contains("\"ok\""));
+        // The seat's `plan` line names its stage card's free bytes at plan
+        // time, at most the device's usable bytes — the census term the
+        // expert rule filled within (memguard). FAIL-first: a plan line that
+        // drops it, or names it past the usable bytes, turns this red.
+        let free_named = record_line(&err_log, "plan")?.is_some_and(|l| {
+            let free = l
+                .split("card_free=")
+                .nth(1)
+                .and_then(|t| t.split(' ').next())
+                .and_then(|n| n.parse::<u64>().ok());
+            let usable = l
+                .split("devices=")
+                .nth(1)
+                .and_then(|d| d.split([',', ' ', ']']).next())
+                .and_then(|c| c.rsplit(':').next())
+                .and_then(|n| n.parse::<u64>().ok());
+            free.is_some_and(|f| usable.is_some_and(|u| f <= u))
+        });
+        println!("plan names the stage card's free bytes {free_named}");
+        check(&mut ok, "plan_names_the_cards_free_bytes", free_named);
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();
-        ok &= props_engine(&url, &argv, served.child.id(), &levers)?;
+        ok &= props_engine(&url, &argv, served.child.id(), &levers, &err_log)?;
 
         let completion = json!({
             "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,

@@ -975,6 +975,10 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             .u("tier_experts", n.iter().sum::<u64>()),
         _ => line,
     };
+    let line = match machine.cards.first().and_then(|c| c.free_bytes) {
+        Some(free) => line.u("card_free", free),
+        None => line,
+    };
     line.csv("devices", record::plan_devices(&machine))
         .w("cuda_order", record::cuda_order())
         .eprint();

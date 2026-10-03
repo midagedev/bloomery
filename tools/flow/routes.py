@@ -212,7 +212,10 @@ def self_test():
         # 6 (1); window 6 (3), 7 (2), 5 (2) -> 5, 6, 7 at 2, 3, 2.
         nw, host, card = g1[2]
         assert nw == 2 and host == [[3 + 2, 2 + 3, 1 + 2]], (nw, host)
-        assert plan_n_l(40)[:3] == [0, 0, 71] and sum(plan_n_l(40)) == 2668, plan_n_l(40)
+        # PIN(2026-10-03): the plan rides the census free reading at records-refresh
+        # time (memguard); a refresh beside a held card moves card_experts and n_l —
+        # regenerate the .rec and move this pin with the card_free term it names.
+        assert plan_n_l(40)[:3] == [0, 0, 70] and sum(plan_n_l(40)) == 2651, plan_n_l(40)
         assert spread(5, [2, 3]) == {2: 3, 3: 2}
         try:
             build_set(rc.read_manifest(wu._fake_set(root, "nochunk", {0: rows}, 8, 2)), [2], (1,), batch=2)

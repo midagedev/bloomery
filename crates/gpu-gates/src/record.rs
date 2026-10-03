@@ -460,7 +460,7 @@ use Ty::{Bool, Csv, F64, I64, List, Text, U64, Word};
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force.",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, and each plan card's device (role:name:ordinal:usable bytes; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them.",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -480,6 +480,7 @@ pub static PLAN: Kind = Kind {
         pos("n_l_layers", U64, "layers"),
         lit(" layers"),
         key("card_budget", Word, "B"),
+        opt("card_free", U64, "B"),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
     ],
@@ -490,7 +491,7 @@ pub static PLAN: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), and each plan card's device as the plan record names them.",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not.",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -502,6 +503,8 @@ pub static PLAN38: Kind = Kind {
         opt("n_l", Word, "experts"),
         opt("tier", Word, ""),
         opt("tier_experts", U64, "experts"),
+        opt("card_free", U64, "B"),
+        opt("why", Word, ""),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
     ],
@@ -2108,7 +2111,7 @@ pub static GATE_DEEPSEEK41_PREFILL: &[&Kind] = &[&STAT_PREFILL_SPLIT];
 pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
     let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
     let card = &plan.cards[0];
-    Record::new(&PLAN)
+    let r = Record::new(&PLAN)
         .w("place", place)
         .w("card", &machine.cards[0].name)
         .u("ctx_max", plan.ctx_max)
@@ -2130,8 +2133,12 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
             "card_budget",
             plan.card_budget
                 .map_or_else(|| "none".to_string(), |b| b.to_string()),
-        )
-        .csv("devices", plan_devices(machine))
+        );
+    let r = match machine.cards.first().and_then(|c| c.free_bytes) {
+        Some(free) => r.u("card_free", free),
+        None => r,
+    };
+    r.csv("devices", plan_devices(machine))
         .w("cuda_order", cuda_order())
 }
 

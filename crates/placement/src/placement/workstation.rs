@@ -32,6 +32,14 @@ pub struct CardSpec {
     /// The device, when resolved ([`resolve`]); `None` for a card of this
     /// workstation by name, which the open finds by that name.
     pub device: Option<DeviceId>,
+    /// The device's free bytes at census time, when the spec came from a
+    /// census ([`spec_of_device`]); `None` for a card by name, whose plan
+    /// knows only the card. The plan's card budget term is the usable bytes
+    /// capped by this ([`super::plan_with`]).
+    pub free_bytes: Option<u64>,
+    /// The other processes holding the device at census time, one named
+    /// list, when the tool that reads them answered; `None` names none.
+    pub held_by: Option<&'static str>,
 }
 
 impl CardSpec {
@@ -58,6 +66,8 @@ pub const A6000: CardSpec = CardSpec {
     total_bytes: 49_140 * MIB,
     driver_reserve_bytes: 548 * MIB,
     device: None,
+    free_bytes: None,
+    held_by: None,
 };
 
 /// The RTX 3090 [measured, `nvidia-smi`].
@@ -66,6 +76,8 @@ pub const RTX_3090: CardSpec = CardSpec {
     total_bytes: 24_576 * MIB,
     driver_reserve_bytes: 400 * MIB,
     device: None,
+    free_bytes: None,
+    held_by: None,
 };
 
 /// Every card a plan names by name, the most usable bytes first: the names
@@ -112,6 +124,8 @@ pub fn model_v41() -> String {
 }
 
 /// `spec` running `layers`, with this machine's context, scratch and margin.
+/// The spec's free reading and its holders ride on the card for the plan's
+/// budget term and its refusals ([`Card::free_bytes`], [`Card::held_by`]).
 fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
     Card {
         name: spec.name.to_string(),
@@ -125,6 +139,8 @@ fn card(spec: CardSpec, layers: Range<usize>, head: bool) -> Card {
         head,
         token_embedding: false,
         reserves: Vec::new(),
+        free_bytes: spec.free_bytes,
+        held_by: spec.held_by,
     }
 }
 

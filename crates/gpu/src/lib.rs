@@ -1722,11 +1722,62 @@ fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16], GpuError> 
     Ok(uuid.bytes.map(|c| c.to_ne_bytes()[0]))
 }
 
+/// Device `dev`'s free bytes, read on its primary context: the context the
+/// load itself will run in, so the reading already carries a context's own
+/// cost and every other process's allocations. The context is retained for
+/// the call and released after, and the calling thread's current context is
+/// what it was before; a device whose reading fails is a named error, never
+/// a plausible total.
+fn raw_device_free_bytes(dev: cuda_core::sys::CUdevice) -> Result<u64, GpuError> {
+    use cuda_core::sys::{
+        cuCtxGetCurrent, cuCtxSetCurrent, cuDevicePrimaryCtxRelease_v2, cuDevicePrimaryCtxRetain,
+        cuMemGetInfo_v2,
+    };
+    let mut before = std::ptr::null_mut();
+    // SAFETY: `before` is a live out-pointer for the call.
+    let rc = unsafe { cuCtxGetCurrent(&mut before) };
+    graph::cu(rc, "cuCtxGetCurrent")?;
+    let mut primary = std::ptr::null_mut();
+    // SAFETY: `primary` is a live out-pointer and `dev` a device handle the
+    // driver returned for this ordinal.
+    let rc = unsafe { cuDevicePrimaryCtxRetain(&mut primary, dev) };
+    match graph::cu(rc, "cuDevicePrimaryCtxRetain") {
+        Err(e) => Err(e),
+        Ok(()) => {
+            // SAFETY: `primary` is the context just retained on this device,
+            // made current on the calling thread by this call.
+            let rc = unsafe { cuCtxSetCurrent(primary) };
+            let r = match graph::cu(rc, "cuCtxSetCurrent") {
+                Err(e) => Err(e),
+                Ok(()) => {
+                    let (mut free, mut total) = (0usize, 0usize);
+                    // SAFETY: both out-pointers are live locals for the call
+                    // and the retained context is current on this thread.
+                    let rc = unsafe { cuMemGetInfo_v2(&mut free, &mut total) };
+                    graph::cu(rc, "cuMemGetInfo").and_then(|()| {
+                        u64::try_from(free)
+                            .map_err(|_| GpuError::shape("census", "a free byte count past u64"))
+                    })
+                }
+            };
+            // SAFETY: `before` is the context handle `cuCtxGetCurrent` gave;
+            // putting it back leaves the thread as it was, primary or none.
+            let _ = unsafe { cuCtxSetCurrent(before) };
+            // SAFETY: the release paired with the retain above.
+            let _ = unsafe { cuDevicePrimaryCtxRelease_v2(dev) };
+            r
+        }
+    }
+}
+
 /// The visible devices as this process's driver enumerates them, each read
-/// without a context: ordinal, name, `cuDeviceTotalMem`, UUID and PCI bus
+/// without a context but its free bytes, which the primary context answers:
+/// ordinal, name, `cuDeviceTotalMem`, free bytes, UUID and PCI bus
 /// id — the census a plan resolves its cards against
 /// ([`::model::placement::workstation::resolve`]) and an open checks them
 /// against ([`Gpu::open_card`]). No device is an empty census, not an error.
+/// The holder list (`DeviceInfo::held_by`) stays empty here; the gates'
+/// census ([`bloomery_gpu_gates::census`]) fills what nvidia-smi names.
 pub fn census() -> Result<Vec<::model::placement::workstation::DeviceInfo>, GpuError> {
     let n = usize::try_from(cuda_core::Device::device_count()?)
         .map_err(|_| GpuError::shape("census", "negative device count"))?;
@@ -1754,8 +1805,10 @@ pub fn census() -> Result<Vec<::model::placement::workstation::DeviceInfo>, GpuE
                 .map_err(|_| GpuError::shape("census", "an ordinal past u32"))?,
             name: raw_device_name(dev)?,
             total_bytes: total as u64,
+            free_bytes: raw_device_free_bytes(dev)?,
             uuid: raw_device_uuid(dev)?,
             pci_bus: String::from_utf8_lossy(&bus).into_owned(),
+            held_by: None,
         });
     }
     Ok(out)

@@ -14,8 +14,10 @@
 //! `n_l` — and the rest stay on the host. Which experts a layer keeps is an
 //! [`ExpertList`]: the id prefix `[0, n_l)`. A card byte budget
 //! (`BLOOMERY_CARD_BUDGET`, [`card_budget`]) caps every card's usable bytes
-//! before the rule runs; it comes in as [`PlanLevers`], which a binary parses
-//! once.
+//! before the rule runs — the lever comes in as [`PlanLevers`], which a
+//! binary parses once — and the census's free reading caps them below that:
+//! while another process holds the device, fewer experts fit
+//! ([`Card::free_bytes`], [`capped`]).
 //!
 //! A machine may also carry expert tier cards ([`Machine::tiers`]): cards
 //! that run no stage and hold only routed experts beside the host. The stage
@@ -114,6 +116,16 @@ pub struct Card {
     /// The device allocator's granule: an allocation of this size or more
     /// takes whole granules of its own, smaller ones share granules.
     pub granule_bytes: NonZeroU64,
+    /// The device's free bytes at plan time, when the card came from a
+    /// census ([`devices::spec_of_device`]); `None` on a census-free card.
+    /// The card's budget term is its usable bytes capped by this
+    /// ([`capped`]): while another process holds the device, fewer experts
+    /// fit, and a trunk that alone passes it is refused by name
+    /// ([`PlacementError::CardFreeFloor`]).
+    pub free_bytes: Option<u64>,
+    /// The other processes holding the device at plan time, one named list,
+    /// when the census named them; `None` names none.
+    pub held_by: Option<&'static str>,
     /// The layers this card's stage runs.
     pub layers: Range<usize>,
     /// Whether this stage ends with the head.
@@ -153,6 +165,14 @@ impl Card {
     #[must_use]
     pub fn set_aside_bytes(&self) -> u64 {
         self.context_bytes + self.scratch_bytes + self.reserve_bytes()
+    }
+
+    /// The bytes a plan may take from this card: its usable bytes capped by
+    /// the device's free bytes at plan time and by `budget` — [`capped`]'s
+    /// one cap, for a caller that sizes a load beside a plan.
+    #[must_use]
+    pub fn planned_bytes(&self, budget: Option<u64>) -> u64 {
+        capped(self, budget)
     }
 }
 
@@ -854,7 +874,66 @@ pub enum PlacementError {
         reserves: u64,
         margin: u64,
     },
+    /// A card whose device another process holds: what it had free at plan
+    /// time is below the card's floor — the dense tensors, KV, set-aside and
+    /// margin, before any expert moved to the host. [`CardFreeFloor`]'s
+    /// terms, boxed to keep the error small.
+    #[error("{}", .0.as_ref())]
+    CardFreeFloor(Box<CardFreeFloor>),
 }
+
+/// The terms of [`PlacementError::CardFreeFloor`]: a card whose device
+/// another process holds, what it had free, and the trunk that alone passes
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardFreeFloor {
+    pub card: String,
+    /// The device's free bytes at plan time.
+    pub free: u64,
+    /// The card's usable bytes.
+    pub usable: u64,
+    /// The dense trunk's floor: dense, KV, set-aside and margin summed.
+    pub floor: u64,
+    /// How far the floor passes the free bytes.
+    pub over: u64,
+    pub dense: u64,
+    pub kv: u64,
+    pub context: u64,
+    pub scratch: u64,
+    pub reserves: u64,
+    pub margin: u64,
+    /// "" or " (held by …)", the census's holder list.
+    pub held: String,
+}
+
+impl fmt::Display for CardFreeFloor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let CardFreeFloor {
+            card,
+            free,
+            usable,
+            floor,
+            over,
+            dense,
+            kv,
+            context,
+            scratch,
+            reserves,
+            margin,
+            held,
+        } = self;
+        write!(
+            f,
+            "card {card}: the device had {free} B free of its usable {usable} B at plan \
+             time{held}, and the plan's dense trunk alone needs {floor} B = dense {dense} B (the \
+             allocator's granules) + KV {kv} B + context {context} B + scratch {scratch} B + \
+             reserves {reserves} B + margin {margin} B, past the {free} B by {over} B: free the \
+             card, or plan a placement on a card with room"
+        )
+    }
+}
+
+impl std::error::Error for CardFreeFloor {}
 
 impl PlacementError {
     /// The refusal that names a tensor: `host_lock` (in `bloomery-model`)
@@ -1492,23 +1571,33 @@ pub fn plan<'a>(
     plan_with(model, machine, ctx_max, kv, levers.card_budget_bytes)
 }
 
-/// `card`'s usable bytes under `budget`: the one place the cap is taken.
+/// The bytes the plan may take from `card`: its usable bytes, capped by the
+/// free bytes the census read at plan time ([`Card::free_bytes`]) and by the
+/// card budget, whichever holds less — the one place the free cap is taken.
+/// The expert rule's budget, the card budget floor, the headroom and
+/// [`Plan::violations`] all take it from here.
 fn capped(card: &Card, budget: Option<u64>) -> u64 {
-    budget.map_or(card.usable_bytes, |b| card.usable_bytes.min(b))
+    let usable = card
+        .free_bytes
+        .map_or(card.usable_bytes, |free| card.usable_bytes.min(free));
+    budget.map_or(usable, |b| usable.min(b))
 }
 
 /// Place every tensor of `model` on `machine` for a context of `ctx_max`
 /// tokens. Dense tensors go where their role says. Routed stacks follow the
 /// expert rule per card ([`spread`]): the granules the card's uploads take —
-/// dense tensors and each layer's `n_l` experts, in upload order, through the
-/// card's allocator — within usable − KV − context − scratch − margin. A card
-/// whose layers cannot keep one expert keeps none; one that cannot hold even
-/// its dense tensors shows up in [`Plan::violations`], not as an error here.
-/// The `n_l` experts of a layer are its id prefix `[0, n_l)`. With
+/// dense tensors and each layer's `n_l` experts, in upload order, through
+/// the card's allocator — within usable − KV − context − scratch − margin. A
+/// card whose layers cannot keep one expert keeps none; one that cannot hold
+/// even its dense tensors shows up in [`Plan::violations`], not as an error
+/// here. The `n_l` experts of a layer are its id prefix `[0, n_l)`. With
 /// `card_budget`, every card plans
 /// with `min(usable, budget)` usable bytes, and a card whose dense tensors,
 /// KV, context, scratch and margin pass that is refused
-/// ([`PlacementError::CardBudgetFloor`]). Cards of one name whose budgets sum
+/// ([`PlacementError::CardBudgetFloor`]). A card whose census free reading
+/// is below its usable bytes plans within the free bytes instead
+/// ([`capped`]), and one whose dense trunk alone passes them is refused
+/// ([`PlacementError::CardFreeFloor`]). Cards of one name whose budgets sum
 /// past that device's usable bytes ([`PlacementError::DeviceTwice`]) and a
 /// tier left with nothing to hold ([`PlacementError::IdleTier`]) are refused
 /// too.
@@ -1811,7 +1900,9 @@ struct Fill<'m, 'r> {
 
 impl Fill<'_, '_> {
     /// Fill `n_l` ([`spread`]) beside the counts `held` on other devices;
-    /// under a card budget, refuse a card whose floor passes it first.
+    /// under a card budget, refuse a card whose floor passes it first, and
+    /// under a free reading below the card's usable bytes, refuse a card
+    /// whose floor passes what the device had free.
     fn run(&self, n_l: &mut [u64], held: &[u64]) -> Result<(), PlacementError> {
         let card = self.card;
         let format = self.routed.unwrap_or(CardFormat::of_routed);
@@ -1824,6 +1915,10 @@ impl Fill<'_, '_> {
         if let Some(b) = self.card_budget {
             let dense = footprint(card.granule_bytes, &uploads, n_l)?;
             check_floor(card, b, dense, self.kv)?;
+        }
+        if let Some(free) = card.free_bytes.filter(|&f| f < card.usable_bytes) {
+            let dense = footprint(card.granule_bytes, &uploads, n_l)?;
+            check_free_floor(card, free, dense, self.kv)?;
         }
         spread(n_l, held, self.eligible, self.model.experts, budget, |n| {
             footprint(card.granule_bytes, &uploads, n)
@@ -1853,6 +1948,36 @@ fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), Plac
             reserves: card.reserve_bytes(),
             margin: card.margin_bytes,
         }),
+    }
+}
+
+/// Refuse `card` when its floor — the same terms [`check_floor`] sums —
+/// passes `free`, what its device had free at plan time: another process
+/// holds enough of it that no expert rule can save the plan, because the
+/// dense tensors alone do not fit. A floor within the free bytes of a card
+/// whose census read none plans as before.
+fn check_free_floor(card: &Card, free: u64, dense: u64, kv: u64) -> Result<(), PlacementError> {
+    let floor = [kv, card.set_aside_bytes(), card.margin_bytes]
+        .into_iter()
+        .try_fold(dense, u64::checked_add);
+    match floor {
+        Some(floor) if floor <= free => Ok(()),
+        floor => Err(PlacementError::CardFreeFloor(Box::new(CardFreeFloor {
+            card: card.name.clone(),
+            free,
+            usable: card.usable_bytes,
+            floor: floor.unwrap_or(u64::MAX),
+            over: floor.unwrap_or(u64::MAX).saturating_sub(free),
+            dense,
+            kv,
+            context: card.context_bytes,
+            scratch: card.scratch_bytes,
+            reserves: card.reserve_bytes(),
+            margin: card.margin_bytes,
+            held: card
+                .held_by
+                .map_or(String::new(), |h| format!(" (held by {h})")),
+        }))),
     }
 }
 
@@ -1955,8 +2080,9 @@ fn totals<'a>(
 }
 
 impl Plan<'_> {
-    /// The usable bytes `card` planned with: its own, capped by the plan's
-    /// card budget.
+    /// The usable bytes `card` planned with: its own, capped by the device's
+    /// free bytes at plan time and by the plan's card budget
+    /// ([`capped`]'s one cap).
     #[must_use]
     pub fn usable_bytes(&self, card: &Card) -> u64 {
         capped(card, self.card_budget)
@@ -2105,6 +2231,8 @@ mod tests {
             scratch_bytes: 0,
             margin_bytes: 0,
             granule_bytes: NonZeroU64::MIN,
+            free_bytes: None,
+            held_by: None,
             layers,
             head,
             token_embedding,
@@ -2257,6 +2385,99 @@ mod tests {
         let plan = plan_host_routed(&model, &whole, 4096, &NoKv, &PlanLevers::default())
             .expect("every stack on the host");
         assert_eq!(plan.host.experts, 24);
+    }
+
+    /// A card another process holds: the census's free reading caps the
+    /// expert rule — fewer experts fit than the card's usable bytes hold,
+    /// the headroom and the violations against the free bytes — and a card
+    /// budget below the free reading still caps below it.
+    #[test]
+    fn a_held_card_plans_within_its_free_bytes() {
+        let model = layered(3);
+        let usable = HEAD + 24 * EXPERT;
+        let machine = |free: Option<u64>| Machine {
+            cards: vec![Card {
+                free_bytes: free,
+                held_by: free.map(|_| "pid 7 (977 MiB)"),
+                ..bytes_card("held", usable, 0..3)
+            }],
+            tiers: Vec::new(),
+            host: host(),
+        };
+        let held_machine = machine(Some(HEAD + 12 * EXPERT));
+        let plan = plan_with(&model, &held_machine, 4096, &NoKv, None).expect("a held card plans");
+        let held: u64 = plan.n_l.iter().sum();
+        assert!(held > 0 && held < 24, "a held card keeps fewer than all 24");
+        assert_eq!(
+            plan.usable_bytes(&plan.machine.cards[0]),
+            HEAD + 12 * EXPERT
+        );
+        assert!(plan.violations().is_empty());
+        // A card budget above the free reading leaves the free cap binding;
+        // one below it caps below.
+        let above = plan_with(&model, &held_machine, 4096, &NoKv, Some(usable))
+            .expect("plans under a budget above free");
+        assert_eq!(
+            above.n_l.iter().sum::<u64>(),
+            held,
+            "a budget past free changes nothing"
+        );
+        let below = plan_with(&model, &held_machine, 4096, &NoKv, Some(HEAD + 6 * EXPERT))
+            .expect("plans under a budget below free");
+        assert_eq!(below.n_l.iter().sum::<u64>(), 6);
+        // A full free reading (a quiet card) plans every expert, as the
+        // census-free card always did.
+        for free in [usable, u64::MAX] {
+            let full = machine(Some(free));
+            let plan = plan_with(&model, &full, 4096, &NoKv, None).expect("plans");
+            assert_eq!(plan.n_l.iter().sum::<u64>(), 24, "free {free}");
+            assert!(plan.violations().is_empty());
+        }
+        let census_free = machine(None);
+        let plan = plan_with(&model, &census_free, 4096, &NoKv, None).expect("plans");
+        assert_eq!(plan.n_l.iter().sum::<u64>(), 24);
+    }
+
+    /// A card whose dense trunk alone passes what its device had free is
+    /// refused by name, every term in the message — the card, the free and
+    /// the usable bytes, the floor's terms and the holder the census named.
+    #[test]
+    fn a_trunk_past_the_free_bytes_is_refused_by_name() {
+        let model = layered(3);
+        let usable = HEAD + 24 * EXPERT;
+        let machine = |free: u64| Machine {
+            cards: vec![Card {
+                free_bytes: Some(free),
+                held_by: Some("pid 7 (977 MiB)"),
+                ..bytes_card("held", usable, 0..3)
+            }],
+            tiers: Vec::new(),
+            host: host(),
+        };
+        let held = machine(HEAD - 1);
+        match plan_with(&model, &held, 4096, &NoKv, None) {
+            Err(PlacementError::CardFreeFloor(terms)) => {
+                assert_eq!((terms.free, terms.floor), (HEAD - 1, HEAD));
+                let text = terms.to_string();
+                for part in [
+                    "card held: the device had 4351 B free of its usable",
+                    "(held by pid 7 (977 MiB))",
+                    "needs 4352 B = dense 4352 B (the allocator's granules)",
+                    "+ KV 0 B + context 0 B + scratch 0 B + reserves 0 B + margin 0 B",
+                    "past the 4351 B by 1 B",
+                    "free the card, or plan a placement on a card with room",
+                ] {
+                    assert!(text.contains(part), "{part:?} in {text}");
+                }
+            }
+            Err(e) => panic!("{e}, not CardFreeFloor"),
+            Ok(_) => panic!("a trunk past the free bytes was planned"),
+        }
+        // A floor within the free bytes never refuses; the holder list is
+        // absent when the census named none.
+        let mut quiet = machine(HEAD);
+        quiet.cards[0].held_by = None;
+        plan_with(&model, &quiet, 4096, &NoKv, None).expect("a trunk at the free bytes");
     }
 
     /// Two plan cards of one name are one device: their budgets past its

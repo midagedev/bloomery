@@ -91,9 +91,14 @@
 //! port and the prompt as eager passes of up to eight ids through its batch
 //! port (`auto` and `pass`; `--prefill gemm` refused by name), and in graph
 //! mode captures the step only. Unset, the load is the whole-card one on
-//! device 0. The placement's levers (`BLOOMERY_CARD_BUDGET` and the host
-//! set's, `q3place::PLACED_LEVERS`) act on a run that names `--place`, on
-//! any file; set without it they are refused by name.
+//! device 0 while that fits the card's free bytes — the plan's own test of
+//! the whole file's card bytes plus its KV, context, scratch and margin
+//! against the census's free reading — and when it does not, the placed
+//! plan on `a`'s card runs instead, its `plan` line naming why
+//! (`why=whole_does_not_fit`). The placement's levers
+//! (`BLOOMERY_CARD_BUDGET` and the host set's, `q3place::PLACED_LEVERS`)
+//! act on a run that names `--place`, on any file; set without it they are
+//! refused by name.
 //!
 //! `BLOOMERY_ROUTE_TRACE=<dir>` (a qwen4exp file only, refused by name on
 //! the others) writes the engine's route trace of the run into `dir`, a new
@@ -787,7 +792,7 @@ mod cli {
                 .iter()
                 .find(|(w, _)| *w == word)
                 .ok_or_else(|| format!("--place {word}: no alias of that word"))?;
-            let specs = workstation::resolve(picks, &bloomery_gpu::census()?)
+            let specs = workstation::resolve(picks, &bloomery_gpu_gates::gpu_census::census()?)
                 .map_err(|e| format!("--place {word}: {e}"))?;
             Ok(Place38 {
                 kind,
@@ -842,8 +847,9 @@ mod cli {
     }
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage
-    /// card's experts, the tier card's when the plan has one, and each plan
-    /// card's device (`record::plan_devices`).
+    /// card's experts, the tier card's when the plan has one, the stage
+    /// card's free bytes when the census read them, and each plan card's
+    /// device (`record::plan_devices`).
     fn plan38_line(place: Place38, experts: Experts, plan: &Plan<'_>) -> String {
         let r = Record::new(&record::PLAN38)
             .w("place", place.name())
@@ -857,6 +863,10 @@ mod cli {
                 .w("tier", &t.name)
                 .u("tier_experts", n.iter().sum::<u64>()),
             _ => r,
+        };
+        let r = match plan.machine.cards.first().and_then(|c| c.free_bytes) {
+            Some(free) => r.u("card_free", free),
+            None => r,
         };
         r.csv("devices", record::plan_devices(plan.machine))
             .w("cuda_order", record::cuda_order())
@@ -984,7 +994,7 @@ mod cli {
                     prefill_step: false,
                 },
             );
-            return dump_taps(&dir);
+            return dump_taps(&dir, &levers);
         }
         let timed = std::env::args().any(|a| a == "--time");
         let sync = std::env::args().any(|a| a == "--arm-sync");
@@ -1209,7 +1219,7 @@ mod cli {
         };
         match chosen {
             Chosen::Qwen3(path, place) => drive(
-                open_qwen3(file, (ctx, mode), place.map(|p| (p, &levers)), t)?,
+                open_qwen3(file, (ctx, mode), place.map(|p| (p, &levers)), &levers, t)?,
                 &run,
                 path,
                 &arms,
@@ -1217,7 +1227,7 @@ mod cli {
                 sync,
             ),
             Chosen::Qwen35(path, place) => drive(
-                open_qwen35(file, (ctx, mode), place.map(|p| (p, &levers)), t)?,
+                open_qwen35(file, (ctx, mode), place.map(|p| (p, &levers)), &levers, t)?,
                 &run,
                 path,
                 &arms,
@@ -1379,7 +1389,7 @@ mod cli {
 
     /// `--dump-taps DIR`: the tap dump of every `--tokens-file`'s windows on
     /// a qwen3moe file, eager, then the manifest read back.
-    fn dump_taps(dir: &str) -> Result<(), GateError> {
+    fn dump_taps(dir: &str, levers: &Levers) -> Result<(), GateError> {
         let args: Vec<String> = std::env::args().collect();
         if let Some(f) = NOT_WITH_DUMP.iter().find(|f| args.iter().any(|a| a == *f)) {
             return Err(format!(
@@ -1415,7 +1425,7 @@ mod cli {
             )
             .into());
         }
-        let mut m = open_qwen3(file, (ctx, StepMode::Eager), None, t)?;
+        let mut m = open_qwen3(file, (ctx, StepMode::Eager), None, levers, t)?;
         let hidden = m.body("generate_qwen3moe")?.hparams().n_embd;
         let out = Path::new(dir);
         let mut dump = taps::Dump::create(out, &ref_model_path()?, hidden)?;
@@ -1497,22 +1507,26 @@ mod cli {
     }
 
     /// The Qwen3-30B-A3B model of `file` — under `place` by its plan
-    /// (`q3place`), the `plan` line first — its `load` line, and in graph
-    /// mode the step captured and, unplaced, every prefill pass, with their
+    /// (`q3place`), the `plan` line first, and with `place` unset the
+    /// default ([`q3place::open_unplaced_qwen3`]): today's whole-card load
+    /// on device 0 while that fits the card's free bytes, else the placed
+    /// plan on `a`'s card with its why — its `load` line, and in graph mode
+    /// the step captured and, unplaced, every prefill pass, with their
     /// `capture` lines.
     fn open_qwen3(
         file: Split,
         (ctx, mode): (usize, StepMode),
         place: Option<(Place, &Levers)>,
+        levers: &Levers,
         t: Instant,
     ) -> Result<Qwen3moeModel, GateError> {
         let opts = Qwen3moeModel::lever_opts(ctx)?;
         let mut m = match place {
-            None => Qwen3moeModel::open(Gpu::new()?, file, opts)?,
+            None => q3place::open_unplaced_qwen3(file, ctx, opts, levers, Record::print)?,
             Some((p, levers)) => {
                 let q = PlaceQ3::qwen3(&file, p, ctx)?;
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
-                q.record(&plan).print();
+                q.record(&plan, None).print();
                 q3place::open_qwen3(file, &plan, opts, levers.host())?
             }
         };
@@ -1544,13 +1558,17 @@ mod cli {
 
     /// The Qwen3.6-35B-A3B model of `file` with the tensor-core decode
     /// flash (the engine's) — under `place` by its plan (`q3place`), the
-    /// `plan` line first — its `load` line, and in graph mode the step
-    /// captured and, unplaced, the passes of 2 to [`MAX_PASS_ROWS`] rows,
-    /// with their `capture` lines.
+    /// `plan` line first, and with `place` unset the default
+    /// ([`q3place::open_unplaced_qwen35`]): today's whole-card load on
+    /// device 0 while that fits the card's free bytes, else the placed
+    /// plan on `a`'s card with its why — its `load` line, and in graph
+    /// mode the step captured and, unplaced, the passes of 2 to
+    /// [`MAX_PASS_ROWS`] rows, with their `capture` lines.
     fn open_qwen35(
         file: Split,
         (ctx, mode): (usize, StepMode),
         place: Option<(Place, &Levers)>,
+        levers: &Levers,
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
         let o = Open35 {
@@ -1559,11 +1577,11 @@ mod cli {
             ubatch: ubatch_size()?,
         };
         let mut m = match place {
-            None => Qwen35moeModel::open(Gpu::new()?, file, o)?,
+            None => q3place::open_unplaced_qwen35(file, o, levers, Record::print)?,
             Some((p, levers)) => {
                 let q = PlaceQ3::qwen35(&file, p, o)?;
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
-                q.record(&plan).print();
+                q.record(&plan, None).print();
                 q3place::open_qwen35(file, &plan, o, levers.host())?
             }
         };
