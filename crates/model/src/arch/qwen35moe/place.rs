@@ -54,7 +54,7 @@ use crate::placement::workstation::{
 };
 use crate::placement::{
     self, Card, CardFormat, Device, Format, Host, KvBytes, Machine, ModelTensor, ModelTensors,
-    PlacementError, Plan, PlanLevers, Unimplemented, Violation,
+    PlacementError, Plan, PlanLevers, RoutedFormat, Unimplemented, Violation,
 };
 
 use runtime::stores::{
@@ -188,6 +188,13 @@ pub enum PlaceError {
          card experts"
     )]
     TierHost { tier: String },
+    /// A machine with an expert tier card, under a card rule whose program
+    /// hangs no tier ([`PlanInputs::plan_rule`]).
+    #[error(
+        "the machine has the expert tier card {tier}; the program this plan is for hangs no \
+         expert tier"
+    )]
+    Tier { tier: String },
     /// The stage card's MTP draft reserve ([`MTP_RESERVE`]) is not the one
     /// the plan needs: none for a plan without the draft or on a machine with
     /// no tier card, the draft's card bytes for a draft beside a tier.
@@ -304,22 +311,71 @@ impl PlanInputs {
                 tier: tier.name.clone(),
             });
         }
-        let mut plan = match experts {
-            Experts::Host => {
-                placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?
-            }
-            Experts::Card => placement::plan_routed_reserving(
+        let rule = match experts {
+            Experts::Host => None,
+            Experts::Card => Some(card_routed as RoutedFormat),
+        };
+        self.target_rule(machine, ctx_max, levers, rule, reserve)
+    }
+
+    /// The target's plan, unchecked, under the card rule `rule`: every
+    /// routed expert on the host for `None`, else the expert rule over the
+    /// layers whose routed stacks `rule` loads within each card's budget
+    /// less `reserve`; then the PLE table moved to the host.
+    fn target_rule<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        rule: Option<RoutedFormat>,
+        reserve: u64,
+    ) -> Result<Plan<'a>, PlaceError> {
+        let mut plan = match rule {
+            None => placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?,
+            Some(rule) => placement::plan_routed_reserving(
                 &self.model,
                 machine,
                 ctx_max,
                 &self.kv,
                 levers,
-                card_routed,
+                rule,
                 reserve,
             )?,
         };
         ple_on_host(&mut plan)?;
         Ok(plan)
+    }
+
+    /// The placement of the file on `machine` at `ctx_max` positions under
+    /// `levers`, the routed experts by the expert rule over the layers whose
+    /// three routed stacks `rule` loads — the card rule of the program that
+    /// runs the plan, as [`card_routed`] is Qwen3.8's and
+    /// `qwen3moe::place::card_routed` the qwen3moe program's for a qwen35moe
+    /// file — the rest on the host. Refused as [`PlanInputs::plan_with`]
+    /// refuses; a machine with an expert tier card is refused by name.
+    pub fn plan_rule<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        rule: RoutedFormat,
+    ) -> Result<Plan<'a>, PlaceError> {
+        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
+            return Err(PlaceError::Positions { ctx_max });
+        }
+        if let Some(tier) = machine.tiers.first() {
+            return Err(PlaceError::Tier {
+                tier: tier.name.clone(),
+            });
+        }
+        check_draft_reserve(machine, None)?;
+        let plan = self.target_rule(machine, ctx_max, levers, Some(rule), 0)?;
+        let broken = plan.violations();
+        if broken.is_empty() {
+            Ok(plan)
+        } else {
+            Err(PlaceError::Broken(broken))
+        }
     }
 
     /// Every routed stack whose layer keeps all its experts on the host

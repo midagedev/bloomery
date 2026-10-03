@@ -3,11 +3,13 @@
 //! and the K/V planes allocated once, and the per-step parameters refreshed
 //! before every enqueue or replay (docs/arch-split.md).
 
-use super::dispatch;
+use super::dispatch::{self, PassCtx};
 use super::experts::ExpertKernels;
 use super::head_argmax::{HeadArgmaxKernels, HeadArgmaxState};
+use super::placed::{Placed, PlacedOpen, StepWalk, WalkParts, placed_bytes};
 use super::plan::{FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy};
 use super::prefill::Prefill;
+use super::program::Tail;
 use super::proj::ProjKernels;
 use super::router::{RouterDims, RouterKernels, gated};
 use super::scratch::{Arena, Dims, KvPlanes, RopeRows, StepParams, f32_view};
@@ -17,8 +19,9 @@ use crate::flash_gqa_prefill::FlashGqaPrefill;
 use crate::gated_quant::GatedQuantKernels;
 use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
+use crate::host::StepLeg;
 use crate::linear::LinearKernels;
-use crate::model::{ChainBody, GpuModel, Instrumented, NoHost, block_count};
+use crate::model::{ChainBody, GpuModel, Instrumented, block_count};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
@@ -27,6 +30,7 @@ use crate::site::KGemvKernels;
 use crate::tensor::window;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
@@ -34,8 +38,10 @@ use model::arch::Arch;
 use model::arch::models::shape::{MoeShape, rules};
 use model::arch::qwen3moe::hparams::Hparams;
 use model::arch::qwen3moe::names;
+use model::placement::Plan;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// The attention's score scale `1/√HEAD` in f32: the bits `1.0 / (HEAD as
 /// f32).sqrt()` rounds to at `HEAD` 128, which every flash launch of every
@@ -155,6 +161,9 @@ pub struct Body {
     /// The per-layer output copies an instrument asked for
     /// ([`Body::set_taps`]).
     pub(super) taps: Option<TapRows>,
+    /// A placed load's placed side ([`Placed`]); `None` on a whole-card
+    /// load.
+    pub(super) placed: Option<Placed>,
 }
 
 /// One `hidden` row per layer and a window onto each, the copy target of
@@ -262,8 +271,10 @@ pub(super) fn f32_site(w: &Weights, name: &str, rows: usize, k: usize) -> Result
 }
 
 /// Layer `l`'s plan: attention at head 128, eight routed experts, every
-/// weight checked against the shape and type its launch takes.
-fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
+/// weight checked against the shape and type its launch takes — the routed
+/// stacks only when `stacks` (a placed load's are its placed side's to
+/// check, `placed`).
+fn resolve(w: &Weights, hp: &Hparams, l: usize, stacks: bool) -> Result<LayerPlan, GpuError> {
     let (h, q, kv, ff) = (
         hp.n_embd,
         hp.n_head * hp.head_dim,
@@ -313,6 +324,12 @@ fn resolve(w: &Weights, hp: &Hparams, l: usize) -> Result<LayerPlan, GpuError> {
     kq_site(w, &g.attn_k, kv, h, &[SiteTy::Q4K])?;
     g.v_ty = kq_site(w, &g.attn_v, kv, h, &[SiteTy::Q4K, SiteTy::Q6K])?;
     kq_site(w, &g.attn_output, h, q, &[SiteTy::Q4K])?;
+    if !stacks {
+        return Ok(LayerPlan {
+            mixer: MixerPlan::Gqa(g),
+            ffn: f,
+        });
+    }
     kq_site(w, &f.gate, e * ff, h, &[SiteTy::Q4K])?;
     kq_site(w, &f.up, e * ff, h, &[SiteTy::Q4K])?;
     f.down_ty = kq_site(w, &f.down, e * h, ff, &[SiteTy::Q4K, SiteTy::Q6K])?;
@@ -355,6 +372,13 @@ impl Body {
     #[must_use]
     pub fn hparams(&self) -> &Hparams {
         &self.hp
+    }
+
+    /// The placed side of a placed load ([`Placed`]); `None` on a
+    /// whole-card load.
+    #[must_use]
+    pub fn placed(&self) -> Option<&Placed> {
+        self.placed.as_ref()
     }
 }
 
@@ -402,8 +426,92 @@ impl GpuModel<Body> {
         let n_layers = block_count(&file, "qwen3moe GpuModel::open")?;
         let mma = opts.flash == FlashKind::Mma;
         GpuModel::load_blocks(gpu, &file, opts.ctx, 0..n_layers, true, |gpu, w| {
-            Body::load(gpu, &file, w, 0..n_layers, opts.ctx, opts.ubatch, mma)
+            Body::load(gpu, &file, w, 0..n_layers, opts.ctx, opts.ubatch, mma, None)
         })
+    }
+
+    /// The Qwen3-30B model of `file` placed by `plan` (made by
+    /// `model::arch::qwen3moe::place::PlanInputs::plan` on the machine
+    /// `model::arch::qwen3moe::place::machine` lays out): the plan's card
+    /// segments resident ([`GpuModel::load_placed`]: the trunk and each
+    /// layer's card experts), the host set read in and locked as `host`
+    /// asks, and the body over them with its placed side ([`Placed`]) and
+    /// caches of `opts.ctx` rows, the plan's context. Its prompt runs as
+    /// eager passes through the host tier's batch port, so its ubatch arena
+    /// holds one row. Refused by name as [`GpuModel::open`] refuses, for a
+    /// plan of another context, and as the placed side refuses
+    /// ([`Placed::new`]).
+    pub fn open_placed(
+        file: Split,
+        plan: &Plan<'_>,
+        opts: OpenOpts,
+        host: HostCfg,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        const WHAT_P: &str = "qwen3moe GpuModel::open_placed";
+        let n_layers = block_count(&file, WHAT_P)?;
+        if u64::try_from(opts.ctx).ok() != Some(plan.ctx_max) {
+            return Err(GpuError::shape(
+                WHAT_P,
+                format!(
+                    "caches of {} rows on a plan of {} positions",
+                    opts.ctx, plan.ctx_max
+                ),
+            ));
+        }
+        let card = plan
+            .machine
+            .cards
+            .first()
+            .ok_or(GpuError::shape(WHAT_P, "a plan of no card"))?;
+        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let mma = opts.flash == FlashKind::Mma;
+        GpuModel::load_placed(
+            file,
+            plan,
+            0,
+            host,
+            |_, _, _, _| Ok(()),
+            |gpu, file, w, set| {
+                let file = Arc::new(file);
+                let open = PlacedOpen {
+                    plan,
+                    file: Arc::clone(&file),
+                    host,
+                    set,
+                    arch: "qwen3moe",
+                };
+                Body::load(
+                    gpu,
+                    &file,
+                    w,
+                    0..n_layers,
+                    opts.ctx,
+                    1,
+                    mma,
+                    Some((open, counted)),
+                )
+            },
+        )
+    }
+
+    /// The card bytes a placed load of `file` holds past the m = 1 scratch
+    /// for its placed side ([`placed_bytes`]), at caches of `ctx` rows: what
+    /// the plan's machine counts in the card's scratch
+    /// (`model::arch::qwen3moe::place::machine`), and what
+    /// [`GpuModel::open_placed`] refuses to pass.
+    pub fn placed_arena_bytes(file: &Split, ctx: usize) -> Result<u64, GpuError> {
+        let what = "qwen3moe GpuModel::placed_arena_bytes";
+        let hp = Hparams::read(file).map_err(|e| GpuError::plan(what, e))?;
+        let router = pins(&hp)?;
+        let dims = Dims::qwen3(
+            hp.n_embd,
+            hp.n_head,
+            hp.n_head_kv,
+            hp.experts.ff,
+            router,
+            ctx,
+        );
+        placed_bytes(&dims, hp.n_layer)
     }
 
     /// `ctx` cache rows, the ubatch size this process's lever names
@@ -420,6 +528,16 @@ impl GpuModel<Body> {
 }
 
 impl Body {
+    /// The body over the resident weights `w` of `file`'s `layers` (every
+    /// layer), with caches of `ctx_max` rows, ubatches of `ubatch` tokens and
+    /// the flash `mma`; on a placed load (`placed`: its placed side's inputs
+    /// and the bytes its plan counts for that side) the routed stacks are
+    /// the placed side's to check, and the side is built ([`Placed::new`]),
+    /// its bytes held to the plan's count first.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the load's card, file, weights, layers, cache, ubatch and flash, and the placed side (rust-quality R8)"
+    )]
     fn load(
         gpu: &Gpu,
         file: &Split,
@@ -428,6 +546,7 @@ impl Body {
         ctx_max: usize,
         ubatch: usize,
         mma: bool,
+        placed: Option<(PlacedOpen<'_>, u64)>,
     ) -> Result<Body, GpuError> {
         let what = "qwen3moe::Body::load";
         let hp = Hparams::read(file).map_err(|e| GpuError::plan(what, e))?;
@@ -446,7 +565,7 @@ impl Body {
         }
         let plans = layers
             .clone()
-            .map(|l| resolve(w, &hp, l))
+            .map(|l| resolve(w, &hp, l, placed.is_none()))
             .collect::<Result<Vec<_>, _>>()?;
         let dims = Dims::qwen3(
             hp.n_embd,
@@ -462,6 +581,21 @@ impl Body {
             .collect::<Result<Vec<_>, _>>()?;
         let k = Kernels::load(gpu, false)?;
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
+        let placed = match placed {
+            None => None,
+            Some((open, counted)) => {
+                let side = placed_bytes(&dims, plans.len())?;
+                if side > counted {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "the placed side needs {side} card bytes; the plan counts {counted}"
+                        ),
+                    ));
+                }
+                Some(Placed::new(gpu, w, &plans, &dims, open)?)
+            }
+        };
         Ok(Body {
             prefill: Prefill::new(stream, dims)?,
             ub: Ubatch::new(stream, dims, ubatch)?,
@@ -475,13 +609,14 @@ impl Body {
             head_state: HeadArgmaxState::new(stream)?,
             mma,
             taps: None,
+            placed,
         })
     }
 }
 
 impl ChainBody for Body {
     type Input = DecodeInput;
-    type Host = NoHost;
+    type Host = Placed;
 
     fn arch() -> Arch {
         Arch::Qwen3moe
@@ -499,13 +634,20 @@ impl ChainBody for Body {
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
+        if self.placed.is_some() {
+            return enqueue_placed_chain(gpu, w, self, head);
+        }
         dispatch::enqueue_chain(gpu, w, self, head)
     }
 
-    /// Nothing to clear: the flash never loads a key row at or past the live
-    /// count, and every row below it is written by its own step first.
-    fn reset(&mut self, _gpu: &Gpu) -> Result<(), GpuError> {
-        Ok(())
+    /// The caches need nothing: the flash never loads a key row at or past
+    /// the live count, and every row below it is written by its own step
+    /// first. A placed load's host tier is reset ([`Placed`]).
+    fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        match self.placed.as_mut() {
+            Some(p) => p.reset(gpu.stream()),
+            None => Ok(()),
+        }
     }
 
     fn head_eps(&self) -> f32 {
@@ -521,15 +663,76 @@ impl ChainBody for Body {
             + self.prefill.bytes()
             + self.ub.bytes()
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
+            + self.placed.as_ref().map_or(0, Placed::device_bytes)
     }
 
     fn layers(&self) -> Range<usize> {
         0..self.plans.len()
     }
 
-    fn host(&mut self) -> Option<&mut NoHost> {
-        None
+    fn host(&mut self) -> Option<&mut Placed> {
+        self.placed.as_mut()
     }
+}
+
+/// Enqueue a placed load's decode chain at one row through the host tier's
+/// step port (`placed`'s step walk), then the head.
+fn enqueue_placed_chain(
+    gpu: &Gpu,
+    w: &Weights,
+    b: &mut Body,
+    head: &mut Head,
+) -> Result<(), GpuError> {
+    let Body {
+        hp,
+        plans,
+        kv,
+        rope,
+        s,
+        sp,
+        k,
+        head_state,
+        mma,
+        taps,
+        placed,
+        ..
+    } = b;
+    let Some(Placed {
+        hybrid, side, step, ..
+    }) = placed
+    else {
+        return Err(GpuError::state(
+            "qwen3moe::enqueue_placed_chain",
+            "a placed side (a placed load)",
+        ));
+    };
+    let c = PassCtx {
+        gpu,
+        w,
+        plans,
+        k,
+        mma: *mma,
+        eps: hp.rms_eps,
+        table: &rope.table,
+    };
+    let mut leg = StepLeg::new(gpu.stream(), hybrid);
+    StepWalk {
+        p: WalkParts {
+            c: &c,
+            stores: kv.as_mut_slice(),
+            s,
+            io: &sp.io(),
+            m: 1,
+            side,
+            rows: step,
+        },
+        tail: Tail::Step {
+            head,
+            state: head_state,
+            taps: taps.as_mut(),
+        },
+    }
+    .walk(&mut leg)
 }
 
 impl Instrumented for Body {

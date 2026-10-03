@@ -37,6 +37,7 @@ use super::body::{Kernels, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::image::{ImageWrite, PromptImage};
+use super::placed::{BatchWalk, Placed, PlacedOpen, StepWalk, WalkParts, placed_bytes};
 use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
     SharedPlan, SiteTy, kinds35, moe_fits, q35,
@@ -51,22 +52,26 @@ use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
 use crate::flash_gqa::HEAD_256;
 use crate::head::Head;
+use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
-use crate::model::{ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, NoHost, Rows, block_count};
+use crate::model::{ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rows, block_count};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
 use crate::tensor::window;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec};
+use model::placement::Plan;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
+use std::sync::Arc;
 
 const WHAT: &str = "qwen35moe::Body35::load";
 
@@ -99,6 +104,16 @@ pub struct Open35 {
 /// at most the cache.
 fn prompt_rows(u: usize, ctx: usize) -> usize {
     u.max(GEMV_COLS).min(ctx)
+}
+
+/// `o` as a placed load opens it: its prompt runs as passes of up to
+/// [`MAX_PASS_ROWS`] positions through the host tier's batch port, so its
+/// ubatch arena holds that many rows, whatever `o.ubatch` asks.
+fn placed_open(o: Open35) -> Open35 {
+    Open35 {
+        ubatch: MAX_PASS_ROWS,
+        ..o
+    }
 }
 
 /// `u` as a ubatch size of `d`, or a named refusal outside
@@ -152,6 +167,44 @@ fn ubatch_arena(
     }
     let a = Arena::with(stream, d, rows, forms)?;
     if a.bytes() != need {
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the ubatch arena holds {} bytes, its fit check counted {need}",
+                a.bytes()
+            ),
+        ));
+    }
+    Ok(a)
+}
+
+/// The ubatch arena of `d` for ubatches of `u` tokens on a placed load,
+/// after the check that it and the placed side's `side` bytes
+/// ([`placed_bytes`]) fit the `counted` bytes the load's plan holds for them
+/// in the card's scratch — not the card's free bytes, which a card budget
+/// (`BLOOMERY_CARD_BUDGET`) does not bound — else a named refusal with both
+/// terms, before anything is allocated. Load-time allocation.
+fn counted_arena(
+    stream: &CudaStream,
+    (d, forms): (Dims, Forms),
+    u: usize,
+    counted: u64,
+    side: u64,
+) -> Result<Arena, GpuError> {
+    const WHAT_FIT: &str = "qwen35moe::counted_arena";
+    let rows = prompt_rows(u, d.ctx);
+    let need = arena_bytes(&d, rows, forms) as u64;
+    if need + side > counted {
+        return Err(GpuError::shape(
+            WHAT_FIT,
+            format!(
+                "the ubatch arena for ubatches of {u} tokens ({rows} rows) needs {need} bytes and \
+                 the placed side {side}; the plan counts {counted}"
+            ),
+        ));
+    }
+    let a = Arena::with(stream, d, rows, forms)?;
+    if a.bytes() as u64 != need {
         return Err(GpuError::shape(
             WHAT_FIT,
             format!(
@@ -292,6 +345,9 @@ pub struct Body35 {
     /// The flash pass the chain runs: the tensor-core pass from load on.
     pub(super) mma: bool,
     pub(super) taps: Option<TapRows>,
+    /// A placed load's placed side ([`Placed`]): the host tier and what the
+    /// walks over its legs read; `None` on a whole-card load.
+    pub(super) placed: Option<Placed>,
 }
 
 /// `name` of layer `l`.
@@ -513,8 +569,9 @@ fn plan_delta(file: &Split, d: &Dims, shape: LinearShape, l: usize) -> Result<De
 
 /// Every weight of layer plan `p` resident as the plan read it from the
 /// file: each site in its type and shape (`site::site`), each norm and
-/// parameter table an F32 plane of its shape.
-fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan) -> Result<(), GpuError> {
+/// parameter table an F32 plane of its shape — the FFN's stacks only when
+/// `stacks` (a placed load's are its placed side's to check, `placed`).
+fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan, stacks: bool) -> Result<(), GpuError> {
     let (h, ff) = (d.hidden, d.ff);
     let on =
         |name: &str, rows: usize, k: usize, ty: SiteTy| site::site(w, WHAT, name, (rows, k), ty);
@@ -553,9 +610,34 @@ fn check_resident(w: &Weights, d: &Dims, p: &LayerPlan) -> Result<(), GpuError> 
         FfnRoute::Dense => 1,
     };
     f32_site(w, &f.ffn_norm, 1, h)?;
+    if !stacks {
+        return Ok(());
+    }
     on(&f.gate, e * ff, h, f.gate_ty)?;
     on(&f.up, e * ff, h, f.up_ty)?;
     on(&f.down, e * h, ff, f.down_ty)
+}
+
+/// Layer `l`'s router joined with its shared expert's gate, the routed
+/// stacks left as the plan uploaded them: a placed load's join
+/// ([`join_ffn`]'s router half); a dense layer has nothing to join.
+fn join_router(
+    stream: &CudaStream,
+    w: &mut Weights,
+    spec: &LayerSpec,
+    l: usize,
+) -> Result<(), GpuError> {
+    if !matches!(spec.ffn, Ffn::Moe(_)) {
+        return Ok(());
+    }
+    w.join_rows(
+        stream,
+        &[
+            blk(l, "ffn_gate_inp.weight").as_str(),
+            blk(l, "ffn_gate_inp_shexp.weight").as_str(),
+        ],
+        format!("derived.blk.{l}.ffn_gate_inp_sh"),
+    )
 }
 
 impl Forms {
@@ -840,14 +922,124 @@ impl GpuModel<Body35> {
             Body35::load(gpu, w, pre, o)
         })
     }
+
+    /// The card bytes a placed load of `file` opened with `o` holds past the
+    /// m = 1 scratch: its ubatch arena ([`arena_bytes`] at the placed
+    /// ubatch, [`placed_open`]) and its placed side ([`placed_bytes`]) —
+    /// what the plan's machine counts in the card's scratch
+    /// (`model::arch::qwen3moe::place::machine`), and what
+    /// [`GpuModel::open_placed`] refuses to pass.
+    pub fn placed_arena_bytes(file: &Split, o: Open35) -> Result<u64, GpuError> {
+        let o = placed_open(o);
+        let pre = Pre35::read(file, o)?;
+        let forms = Forms::of(&pre.plans, &pre.d);
+        let arena = arena_bytes(&pre.d, prompt_rows(o.ubatch, o.ctx), forms) as u64;
+        Ok(arena + placed_bytes(&pre.d, pre.plans.len())?)
+    }
+
+    /// The Qwen3.6 model of `file` placed by `plan` (made by
+    /// `model::arch::qwen35moe::place::PlanInputs::plan_rule` under
+    /// `model::arch::qwen3moe::place::card_routed` on the machine
+    /// `model::arch::qwen3moe::place::machine` lays out): the plan's card
+    /// segments resident ([`GpuModel::load_placed`]: the trunk, the shared
+    /// experts, each layer's card experts) with each router joined with its
+    /// shared gate, the host set read in and locked as `host` asks, and the
+    /// body over them with its placed side ([`Placed`]), caches of `o.ctx`
+    /// rows — the plan's context — and the ubatch arena of the placed
+    /// ubatch ([`placed_open`]; `o.ubatch` is not read) held to the bytes
+    /// the plan counts ([`GpuModel::placed_arena_bytes`]). Refused
+    /// by name as [`GpuModel::open`] refuses, for a plan of another context,
+    /// and as the placed side refuses ([`Placed::new`]).
+    pub fn open_placed(
+        file: Split,
+        plan: &Plan<'_>,
+        o: Open35,
+        host: HostCfg,
+    ) -> Result<GpuModel<Body35>, GpuError> {
+        const WHAT_P: &str = "qwen35moe GpuModel::open_placed";
+        let o = placed_open(o);
+        let n_layers = block_count(&file, WHAT_P)?;
+        if u64::try_from(o.ctx).ok() != Some(plan.ctx_max) {
+            return Err(GpuError::shape(
+                WHAT_P,
+                format!(
+                    "caches of {} rows on a plan of {} positions",
+                    o.ctx, plan.ctx_max
+                ),
+            ));
+        }
+        let pre = Pre35::read(&file, o)?;
+        if pre.layers.len() != n_layers {
+            return Err(GpuError::shape(
+                WHAT_P,
+                format!(
+                    "the description holds {} layers, the file's block count {n_layers}",
+                    pre.layers.len()
+                ),
+            ));
+        }
+        let card = plan
+            .machine
+            .cards
+            .first()
+            .ok_or(GpuError::shape(WHAT_P, "a plan of no card"))?;
+        let counted = model::arch::qwen3moe::place::counted_arena_bytes(card);
+        let specs = pre.layers.clone();
+        GpuModel::load_placed(
+            file,
+            plan,
+            0,
+            host,
+            |stream, _, layers, w| {
+                for l in layers {
+                    let spec = specs.get(l).ok_or_else(|| {
+                        GpuError::shape(WHAT_P, format!("layer {l} past the description"))
+                    })?;
+                    join_router(stream, w, spec, l)?;
+                }
+                Ok(())
+            },
+            |gpu, file, w, set| {
+                let open = PlacedOpen {
+                    plan,
+                    file: Arc::new(file),
+                    host,
+                    set,
+                    arch: "qwen35moe",
+                };
+                Body35::build(gpu, w, pre, o, Some((open, counted)))
+            },
+        )
+    }
 }
 
 impl Body35 {
+    /// The whole-card load: each routed layer's stacks joined with its
+    /// shared expert and its router with the shared gate ([`join_ffn`]),
+    /// then the body ([`Body35::build`]).
     fn load(gpu: &Gpu, w: &mut Weights, pre: Pre35, o: Open35) -> Result<Body35, GpuError> {
+        for (l, layer) in pre.layers.iter().enumerate() {
+            join_ffn(gpu.stream(), w, layer, l)?;
+        }
+        Body35::build(gpu, w, pre, o, None)
+    }
+
+    /// The body over the resident weights `w` of `pre`'s description: the
+    /// stores, the arenas, the kernels and the prompt image; on a placed
+    /// load (`placed`: its placed side's inputs and the arena bytes its plan
+    /// counts) the ubatch arena held to what the plan counts, not to the
+    /// card's free bytes, and the placed side ([`Placed::new`]).
+    fn build(
+        gpu: &Gpu,
+        w: &Weights,
+        pre: Pre35,
+        o: Open35,
+        placed: Option<(PlacedOpen<'_>, u64)>,
+    ) -> Result<Body35, GpuError> {
         let Pre35 {
             vocab,
             eps,
-            layers,
+            layers: _,
             kinds,
             plans,
             d,
@@ -857,9 +1049,8 @@ impl Body35 {
         let ctx = o.ctx;
         let stream = gpu.stream();
         let mut stores = Vec::with_capacity(plans.len());
-        for (l, ((kind, layer), plan)) in kinds.iter().zip(&layers).zip(&plans).enumerate() {
-            join_ffn(stream, w, layer, l)?;
-            check_resident(w, &d, plan)?;
+        for (kind, plan) in kinds.iter().zip(&plans) {
+            check_resident(w, &d, plan, placed.is_none())?;
             stores.push(match *kind {
                 Kind35::Gqa(_) => LayerStore::Kv(KvPlanes::new(stream, &d)?),
                 Kind35::Delta(shape) => LayerStore::Rec(RecStore::new(stream, shape, LANES)?),
@@ -875,8 +1066,17 @@ impl Body35 {
         let k = Kernels::load(gpu, true)?;
         let head_state = HeadArgmaxState::new(stream)?;
         let img = PromptImage::new(stream, ctx, true)?;
-        let (free, _) = gpu.mem_info()?;
-        let u = ubatch_arena(stream, (d, forms), ubatch.get(), free)?;
+        let (u, placed) = match placed {
+            None => {
+                let (free, _) = gpu.mem_info()?;
+                (ubatch_arena(stream, (d, forms), ubatch.get(), free)?, None)
+            }
+            Some((open, counted)) => {
+                let side = placed_bytes(&d, plans.len())?;
+                let u = counted_arena(stream, (d, forms), ubatch.get(), counted, side)?;
+                (u, Some(Placed::new(gpu, w, &plans, &d, open)?))
+            }
+        };
         Ok(Body35 {
             vocab,
             eps,
@@ -894,6 +1094,7 @@ impl Body35 {
             head_state,
             mma: o.mma,
             taps: None,
+            placed,
         })
     }
 
@@ -923,6 +1124,13 @@ impl Body35 {
     #[must_use]
     pub fn flash_mma(&self) -> bool {
         self.mma
+    }
+
+    /// The placed side of a placed load ([`Placed`]); `None` on a
+    /// whole-card load.
+    #[must_use]
+    pub fn placed(&self) -> Option<&Placed> {
+        self.placed.as_ref()
     }
 
     /// Device bytes of the layer stores: the attention layers' K/V planes
@@ -969,6 +1177,7 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
         head_state,
         mma,
         taps,
+        placed,
         ..
     } = b;
     let c = PassCtx {
@@ -980,6 +1189,29 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
         eps: *eps,
         table: &rope.table,
     };
+    if let Some(Placed {
+        hybrid, side, step, ..
+    }) = placed
+    {
+        let mut leg = StepLeg::new(gpu.stream(), hybrid);
+        return StepWalk {
+            p: WalkParts {
+                c: &c,
+                stores: stores.as_mut_slice(),
+                s,
+                io: &sp.io(),
+                m: 1,
+                side,
+                rows: step,
+            },
+            tail: Tail::Step {
+                head,
+                state: head_state,
+                taps: taps.as_mut(),
+            },
+        }
+        .walk(&mut leg);
+    }
     Program {
         c: &c,
         stores: stores.as_mut_slice(),
@@ -1005,6 +1237,13 @@ fn enqueue_rows(
     heads: &mut [Head],
 ) -> Result<(), GpuError> {
     const WHAT_ROWS: &str = "qwen35moe::enqueue_rows";
+    if b.placed.is_some() {
+        return Err(GpuError::shape(
+            WHAT_ROWS,
+            "a pass of several rows on a placed load: its prompt runs through the prompt call \
+             (prefill_with), each unit through the host tier's batch port",
+        ));
+    }
     let m = heads.len();
     // A capture records the launches only; the replay reads the record the
     // plan before it wrote, so only an eager pass needs one planned now.
@@ -1092,6 +1331,7 @@ impl Body35 {
             k,
             head_state,
             mma,
+            placed,
             ..
         } = self;
         let c = PassCtx {
@@ -1111,6 +1351,28 @@ impl Body35 {
             UnitEnd::Pass => Tail::Pass,
             UnitEnd::Hidden => Tail::Hidden,
         };
+        if let Some(Placed {
+            hybrid,
+            side,
+            pass,
+            pass_hsum,
+            ..
+        }) = placed
+        {
+            let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, MAX_PASS_ROWS);
+            return BatchWalk {
+                p: WalkParts {
+                    c: &c,
+                    stores: stores.as_mut_slice(),
+                    s: u,
+                    io: &win.io(),
+                    m,
+                    side,
+                    rows: pass,
+                },
+            }
+            .walk(&mut leg, tail);
+        }
         Program {
             c: &c,
             stores: stores.as_mut_slice(),
@@ -1137,6 +1399,15 @@ impl GpuModel<Body35> {
     /// so a prompt leaves the same bits at every size.
     pub fn set_ubatch(&mut self, u: usize) -> Result<(), GpuError> {
         let (gpu, _, body) = self.body_parts("qwen35moe::set_ubatch")?;
+        if body.placed.is_some() {
+            return Err(GpuError::shape(
+                "qwen35moe::set_ubatch",
+                format!(
+                    "ubatches of {u} tokens on a placed load: its arena is the plan's count, \
+                     passes of up to {MAX_PASS_ROWS}"
+                ),
+            ));
+        }
         let d = body.u.dims;
         let size = ubatch_of(&d, u)?;
         let forms = Forms::of(&body.plans, &d);
@@ -1149,8 +1420,20 @@ impl GpuModel<Body35> {
     /// The units [`GpuModel::prefill_with`] runs a prompt of `tokens` ids as
     /// by `path`, at this model's ubatch size.
     pub fn prefill_plan(&self, tokens: usize, path: PrefillPath) -> Result<PrefillPlan, GpuError> {
-        let ub = self.body("qwen35moe::prefill_plan")?.ubatch;
-        Ok(PrefillPlan::new(tokens, path, ub))
+        let body = self.body("qwen35moe::prefill_plan")?;
+        // A placed load walks units of at most GEMV_COLS rows through the
+        // host tier's batch port: its prompt runs as passes.
+        let path = match (body.placed.is_some(), path) {
+            (true, PrefillPath::Gemm) => {
+                return Err(GpuError::shape(
+                    "qwen35moe::prefill_plan",
+                    "a GEMM ubatch on a placed load: its prompt runs as passes (auto or pass)",
+                ));
+            }
+            (true, _) => PrefillPath::Pass,
+            (false, p) => p,
+        };
+        Ok(PrefillPlan::new(tokens, path, body.ubatch))
     }
 
     /// The last prompt image the prompt call wrote; `None` before one.
@@ -1279,7 +1562,7 @@ impl GpuModel<Body35> {
 
 impl ChainBody for Body35 {
     type Input = DecodeInput35;
-    type Host = NoHost;
+    type Host = Placed;
 
     fn arch() -> Arch {
         Arch::Qwen35moe
@@ -1306,6 +1589,9 @@ impl ChainBody for Body35 {
     /// below it is written by its own step first. Synchronizes.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
+        if let Some(p) = self.placed.as_mut() {
+            p.reset(stream)?;
+        }
         let most = self
             .stores
             .iter()
@@ -1341,14 +1627,15 @@ impl ChainBody for Body35 {
             + self.img.bytes()
             + self.head_state.bytes()
             + self.taps.as_ref().map_or(0, |t| t.buf.num_bytes())
+            + self.placed.as_ref().map_or(0, Placed::device_bytes)
     }
 
     fn layers(&self) -> Range<usize> {
         0..self.plans.len()
     }
 
-    fn host(&mut self) -> Option<&mut NoHost> {
-        None
+    fn host(&mut self) -> Option<&mut Placed> {
+        self.placed.as_mut()
     }
 }
 

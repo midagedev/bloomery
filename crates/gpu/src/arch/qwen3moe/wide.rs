@@ -197,7 +197,7 @@ impl Wide {
 /// Bytes of one q8_1 activation column of `k` values, a `Q8Act`'s or a
 /// `GemmAct`'s: the q3 pairs (u64), the q4 and q6 permutations, the 32-value
 /// code sums and the 128-value scales.
-fn act_col_bytes(k: usize) -> usize {
+pub(super) fn act_col_bytes(k: usize) -> usize {
     let n_sb = k / 256;
     64 * n_sb.div_ceil(2) * 8
         + (256 * n_sb.div_ceil(4) + 128 * n_sb.div_ceil(2)) * 4

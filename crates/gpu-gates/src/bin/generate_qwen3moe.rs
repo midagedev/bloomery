@@ -1,12 +1,13 @@
 //! `generate_qwen3moe` — the decode CLI of the qwen3moe family's engines: a
 //! qwen3moe (Qwen3-30B-A3B), a qwen35moe (Qwen3.6-35B-A3B) or a qwen4exp
 //! (Qwen3.8-Flash-Next) file, the architecture read from the file's header
-//! (any other is refused by name), the whole model on one card, greedy, one
-//! token per step, and the timing runner's ruler.
+//! (any other is refused by name), the whole model on one card or placed by
+//! a plan over a card and the host tier (`--place`), greedy, one token per
+//! step, and the timing runner's ruler.
 //!
 //!     generate_qwen3moe (--prompt <text> | --tokens a,b,c | --seed-depth D)
 //!                       [-n N] [--ctx C] [--mode eager|graph]
-//!                       [--prefill auto|pass|gemm|step] [--place a|gate|bp]
+//!                       [--prefill auto|pass|gemm|step] [--place a|gate|bp|<cards>]
 //!                       [--time [--warm W]] [--logits] [--last-step]
 //!     generate_qwen3moe --arm a,b,c[/N] [--arm ...] [--arm-sync] [-n N] [--ctx C] ...
 //!     generate_qwen3moe --dump-taps DIR --tokens-file F [--tokens-file F ...]
@@ -76,7 +77,23 @@
 //! program's count, and a mismatch ends the run by name. Its plan prints as
 //! `step:1x<P>`, `pass:<sizes>` or `ubatch:<sizes>`, and `time prompt`'s
 //! `kind=` is the path the prompt ran — `step`, `pass` or `gemm`, never
-//! `auto`. `--place` on any other file is refused by name.
+//! `auto`.
+//!
+//! `--place W` on a qwen3moe or qwen35moe file places it by its plan
+//! (`shared/qwen3moe_place.rs`): `W` a placement word of `generate::Place`
+//! (`a`, `gate`, or a card list of one card — `bp` and every list with a
+//! tier card refused by name: the program hangs no expert tier), the plan
+//! on that card under `BLOOMERY_CARD_BUDGET` — the trunk on the card, each
+//! layer's routed id prefix as the budget holds, the rest on the host tier
+//! — printed as a `plan` line (`record::PLAN38`) before the `load` line. A
+//! plan with no host expert loads the whole model on the plan's card; any
+//! other runs the decode step (graph or eager) through the host tier's step
+//! port and the prompt as eager passes of up to eight ids through its batch
+//! port (`auto` and `pass`; `--prefill gemm` refused by name), and in graph
+//! mode captures the step only. Unset, the load is the whole-card one on
+//! device 0. The placement's levers (`BLOOMERY_CARD_BUDGET` and the host
+//! set's, `q3place::PLACED_LEVERS`) act on a run that names `--place`, on
+//! any file; set without it they are refused by name.
 //!
 //! `BLOOMERY_ROUTE_TRACE=<dir>` (a qwen4exp file only, refused by name on
 //! the others) writes the engine's route trace of the run into `dir`, a new
@@ -207,8 +224,9 @@
 //! `arm` line, for one line on stdin: the timing runner takes its witness
 //! blocks there. A failed arm ends the process, naming the arm.
 //!
-//! `--logits` prints `logits n= argmax= fnv64=` after the `tokens` line: the
-//! head's last logits row, read back once, by its f32 bits (FNV-1a 64).
+//! `--logits` prints `logits n= argmax= margin= fnv64=` after the `tokens`
+//! line: the head's last logits row, read back once — the argmax's lead over
+//! the best other logit, and the row by its f32 bits (FNV-1a 64).
 //!
 //! `BLOOMERY_STEP_STATS=1` on a qwen4exp file reads, before the first
 //! generated step and after each one, the host tier's counters
@@ -264,7 +282,12 @@ fn main() -> std::process::ExitCode {
 mod taps;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen3moe_place.rs"]
+mod q3place;
+
+#[cfg(feature = "gpu")]
 mod cli {
+    use super::q3place::{self, PlaceQ3};
     use super::taps;
     use app::Session;
     use app::arch::qwen3moe::Q38Cfg;
@@ -281,6 +304,7 @@ mod cli {
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
@@ -527,13 +551,13 @@ mod cli {
 
         /// `pass`: each pass of the plan as one `step_rows` of its size, a
         /// pass of one id as a step, bit for bit one step per token; `auto`
-        /// and `gemm`: the prompt call.
+        /// and `gemm`, and every path of a placed load: the prompt call.
         fn prefill(
             m: &mut Qwen35moeModel,
             ids: &[u32],
             path: PrefillPath,
         ) -> Result<u32, GateError> {
-            if path != PrefillPath::Pass {
+            if path != PrefillPath::Pass || m.body("generate_qwen3moe")?.placed().is_some() {
                 return Ok(m.prefill_with(ids, path)?);
             }
             let plan = plan35(m, ids.len(), path)?;
@@ -885,7 +909,9 @@ mod cli {
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
-        let levers = bloomery_levers::at_main(&[
+        // The placement's levers act on a run that names `--place`; set on
+        // one that does not, they are refused by name.
+        let mut acts_on = vec![
             bloomery_levers::STEP_STATS,
             bloomery_levers::QWEN38_EXPERTS,
             bloomery_levers::ROUTE_TRACE,
@@ -895,7 +921,11 @@ mod cli {
             bloomery_levers::MTP_WINDOWS,
             bloomery_levers::RESIDENCY,
             bloomery_levers::HOSTSTREAM,
-        ])?;
+        ];
+        if std::env::args().any(|a| a == "--place") {
+            acts_on.extend(q3place::PLACED_LEVERS);
+        }
+        let levers = bloomery_levers::at_main(&acts_on)?;
         record::at_main("generate_qwen3moe", record::GENERATE_QWEN3MOE);
         // Set, the word runs as given; unset, the Qwen3.8 rule picks it once
         // the file, the flags and plan (a) are known (`residency unset`).
@@ -1030,11 +1060,13 @@ mod cli {
         let (chosen, draft_off) = match family {
             Family::Qwen3 => {
                 draft_refused_on_other(&levers, family)?;
-                (Chosen::Qwen3(Body::path(prefill)?), None)
+                let place = place_q3(place.as_deref(), prefill)?;
+                (Chosen::Qwen3(Body::path(prefill)?, place), None)
             }
             Family::Qwen35 => {
                 draft_refused_on_other(&levers, family)?;
-                (Chosen::Qwen35(Body35::path(prefill)?), None)
+                let place = place_q3(place.as_deref(), prefill)?;
+                (Chosen::Qwen35(Body35::path(prefill)?, place), None)
             }
             Family::Qwen38 => {
                 if let Some(d) = seed_depth {
@@ -1047,20 +1079,13 @@ mod cli {
         };
         let draft = match chosen {
             Chosen::Qwen38(_, _, d) => d,
-            Chosen::Qwen3(_) | Chosen::Qwen35(_) => Draft38::Off,
+            Chosen::Qwen3(..) | Chosen::Qwen35(..) => Draft38::Off,
         };
         if last_step && (family == Family::Qwen38 || timed || seed_depth.is_some()) {
             return Err(
                 "--last-step feeds a qwen3moe or qwen35moe prompt's last id as a step, the \
                  server's cut; it is refused on a qwen4exp file and beside --time and \
                  --seed-depth"
-                    .into(),
-            );
-        }
-        if family != Family::Qwen38 && place.is_some() {
-            return Err(
-                "--place picks a qwen4exp plan's card; a qwen3moe or qwen35moe file runs on the \
-                 card box.sh puts in view"
                     .into(),
             );
         }
@@ -1130,7 +1155,7 @@ mod cli {
         }
         let (place_a, prefill_step) = match chosen {
             Chosen::Qwen38(path, place, _) => (place.stage_a(), path == Prompt38::Step),
-            Chosen::Qwen3(_) | Chosen::Qwen35(_) => (false, false),
+            Chosen::Qwen3(..) | Chosen::Qwen35(..) => (false, false),
         };
         let at = Residency38At {
             qwen38_file: family == Family::Qwen38,
@@ -1146,7 +1171,7 @@ mod cli {
             Some(_) => Lever38::Set(residency, word_set),
             None => Lever38::Unset(residency38_unset(at)),
         };
-        if matches!(chosen, Chosen::Qwen35(PrefillPath::Pass))
+        if matches!(chosen, Chosen::Qwen35(PrefillPath::Pass, None))
             && logits
             && arms.iter().any(|a| a.n_gen == 1)
         {
@@ -1180,16 +1205,16 @@ mod cli {
             last_step,
         };
         match chosen {
-            Chosen::Qwen3(path) => drive(
-                open_qwen3(file, ctx, mode, t)?,
+            Chosen::Qwen3(path, place) => drive(
+                open_qwen3(file, (ctx, mode), place.map(|p| (p, &levers)), t)?,
                 &run,
                 path,
                 &arms,
                 listed,
                 sync,
             ),
-            Chosen::Qwen35(path) => drive(
-                open_qwen35(file, ctx, mode, t)?,
+            Chosen::Qwen35(path, place) => drive(
+                open_qwen35(file, (ctx, mode), place.map(|p| (p, &levers)), t)?,
                 &run,
                 path,
                 &arms,
@@ -1387,7 +1412,7 @@ mod cli {
             )
             .into());
         }
-        let mut m = open_qwen3(file, ctx, StepMode::Eager, t)?;
+        let mut m = open_qwen3(file, (ctx, StepMode::Eager), None, t)?;
         let hidden = m.body("generate_qwen3moe")?.hparams().n_embd;
         let out = Path::new(dir);
         let mut dump = taps::Dump::create(out, &ref_model_path()?, hidden)?;
@@ -1446,20 +1471,49 @@ mod cli {
     /// `BLOOMERY_QWEN38_EXPERTS`'s.
     #[derive(Clone, Copy)]
     enum Chosen {
-        Qwen3(PrefillPath),
-        Qwen35(PrefillPath),
+        Qwen3(PrefillPath, Option<Place>),
+        Qwen35(PrefillPath, Option<Place>),
         Qwen38(Prompt38, Place38, Draft38),
     }
 
-    /// The Qwen3-30B-A3B model of `file`, its `load` line, and in graph mode
-    /// the step and every prefill pass captured and their `capture` lines.
+    /// `--place` on a qwen3moe or qwen35moe file: the placement word
+    /// (`generate::Place`), refused by name beside `--prefill gemm` — a
+    /// placed prompt runs as passes through the host tier's batch port.
+    fn place_q3(arg: Option<&str>, prefill: Option<&str>) -> Result<Option<Place>, GateError> {
+        let Some(word) = arg else {
+            return Ok(None);
+        };
+        if prefill == Some("gemm") {
+            return Err(format!(
+                "--prefill gemm beside --place {word}: a placed qwen3moe or qwen35moe prompt \
+                 runs as passes through the host tier (auto or pass)"
+            )
+            .into());
+        }
+        Ok(Some(Place::parse(word)?))
+    }
+
+    /// The Qwen3-30B-A3B model of `file` — under `place` by its plan
+    /// (`q3place`), the `plan` line first — its `load` line, and in graph
+    /// mode the step captured and, unplaced, every prefill pass, with their
+    /// `capture` lines.
     fn open_qwen3(
         file: Split,
-        ctx: usize,
-        mode: StepMode,
+        (ctx, mode): (usize, StepMode),
+        place: Option<(Place, &Levers)>,
         t: Instant,
     ) -> Result<Qwen3moeModel, GateError> {
-        let mut m = Qwen3moeModel::open(Gpu::new()?, file, Qwen3moeModel::lever_opts(ctx)?)?;
+        let opts = Qwen3moeModel::lever_opts(ctx)?;
+        let mut m = match place {
+            None => Qwen3moeModel::open(Gpu::new()?, file, opts)?,
+            Some((p, levers)) => {
+                let q = PlaceQ3::qwen3(&file, p, ctx)?;
+                let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
+                q.record(&plan).print();
+                q3place::open_qwen3(file, &plan, opts, levers.host())?
+            }
+        };
+        let placed = m.body("generate_qwen3moe")?.placed().is_some();
         m.set_mode(mode);
         println!(
             "load arch=qwen3moe resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
@@ -1474,6 +1528,9 @@ mod cli {
         );
         if mode == StepMode::Graph {
             println!("capture graph_nodes={}", m.capture_step()?);
+            if placed {
+                return Ok(m);
+            }
             let (free0, _) = m.gpu().mem_info()?;
             let t = Instant::now();
             let nodes = m.capture_prefill()?;
@@ -1483,13 +1540,14 @@ mod cli {
     }
 
     /// The Qwen3.6-35B-A3B model of `file` with the tensor-core decode
-    /// flash (the engine's), its `load` line, and in graph mode the step and
-    /// the passes of 2 to [`MAX_PASS_ROWS`] rows captured and their
-    /// `capture` lines.
+    /// flash (the engine's) — under `place` by its plan (`q3place`), the
+    /// `plan` line first — its `load` line, and in graph mode the step
+    /// captured and, unplaced, the passes of 2 to [`MAX_PASS_ROWS`] rows,
+    /// with their `capture` lines.
     fn open_qwen35(
         file: Split,
-        ctx: usize,
-        mode: StepMode,
+        (ctx, mode): (usize, StepMode),
+        place: Option<(Place, &Levers)>,
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
         let o = Open35 {
@@ -1497,7 +1555,16 @@ mod cli {
             mma: true,
             ubatch: ubatch_size()?,
         };
-        let mut m = Qwen35moeModel::open(Gpu::new()?, file, o)?;
+        let mut m = match place {
+            None => Qwen35moeModel::open(Gpu::new()?, file, o)?,
+            Some((p, levers)) => {
+                let q = PlaceQ3::qwen35(&file, p, o)?;
+                let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
+                q.record(&plan).print();
+                q3place::open_qwen35(file, &plan, o, levers.host())?
+            }
+        };
+        let placed = m.body("generate_qwen3moe")?.placed().is_some();
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
         println!(
@@ -1514,6 +1581,9 @@ mod cli {
         if mode == StepMode::Graph {
             let step = m.capture_step()?;
             println!("capture graph_nodes={step}");
+            if placed {
+                return Ok(m);
+            }
             let (free0, _) = m.gpu().mem_info()?;
             let t = Instant::now();
             let nodes = vec![
@@ -2342,7 +2412,20 @@ mod cli {
                     (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
                 })
             });
-            println!("logits n={} argmax={argmax} fnv64={fnv:016x}", row.len());
+            // The argmax's lead over the best other logit: how near a tie the
+            // last token was.
+            let top = row[argmax];
+            let second = row
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != argmax)
+                .map(|(_, &v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+            println!(
+                "logits n={} argmax={argmax} margin={:.4} fnv64={fnv:016x}",
+                row.len(),
+                top - second
+            );
         }
         if let Some(t) = &run.tok {
             println!("text {:?}", t.decode(&tokens_out));

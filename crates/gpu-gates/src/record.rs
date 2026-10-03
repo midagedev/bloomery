@@ -485,18 +485,21 @@ pub static PLAN: Kind = Kind {
     ],
 };
 
-/// Where a qwen4exp placement puts the routed experts, before the load.
+/// Where a qwen3moe-family placement puts the routed experts, before the
+/// load.
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "The qwen4exp placement the engine is about to load by: its card, the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card; under plan (b′) the expert tier card and the next ids it holds), and each plan card's device as the plan record names them.",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), and each plan card's device as the plan record names them.",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
+        opt("arch", Word, ""),
         key("experts", Word, ""),
         key("ctx_max", U64, "positions"),
         key("host_experts", U64, "experts"),
         key("card_experts", U64, "experts"),
+        opt("n_l", Word, "experts"),
         opt("tier", Word, ""),
         opt("tier_experts", U64, "experts"),
         opt("devices", Csv, ""),
@@ -2017,6 +2020,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
 /// fetch's lines (printed by the server before the seat registers), the
 /// load, the address and each request's note of the prefix it kept none of.
 pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
+    &PLAN38,
     &HF_OFFLINE,
     &HF_SET,
     &HF_FILE,
@@ -2059,7 +2063,8 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_LEAK,
 ];
 
-/// What `generate_qwen3moe` prints as records: a qwen4exp load's `plan`,
+/// What `generate_qwen3moe` prints as records: a load's `plan` (a qwen4exp
+/// line; a placed qwen3moe or qwen35moe line names its architecture),
 /// its residency lever's word (set, before the load; unset, after the
 /// `plan`, or before the load on another family and under `--dump-taps`)
 /// and, drafting nothing, why after the `load` line, drafting, its head

@@ -1,9 +1,11 @@
 //! `bloomery-serve --model qwen3` — the llama-server-compatible HTTP API on
 //! the single-card Qwen engines: a qwen3moe file (Qwen3-30B-A3B) or a
-//! qwen35moe file (Qwen3.6-35B-A3B), the whole model on device 0.
+//! qwen35moe file (Qwen3.6-35B-A3B), the whole model on device 0, or under
+//! `--place` placed by its plan on the card the word names with the routed
+//! experts the card's budget does not hold on the host tier.
 //!
 //!     bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]]
-//!                    [--host 127.0.0.1] [--port 8080] [--ctx C]
+//!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--place W]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
 //! doc); `--ctx-size` is `--ctx` under llama-server's spelling, C defaults to
@@ -20,6 +22,16 @@
 //! crate's chain with no repetition penalty, `temperature <= 0` the
 //! engine's argmax.
 //!
+//! `--place W` opens the model as `generate_qwen3moe --place W` does
+//! (`qwen3moe_place`): `W` a placement word of `generate::Place` (`a`,
+//! `gate`, or a card list of one card; a tier card is refused by name), the
+//! plan's `plan` record on stderr before the `load` record, the card budget
+//! `BLOOMERY_CARD_BUDGET`'s and the host set's load the host levers' (each
+//! of them refused by name without `--place`). A
+//! plan with no host expert loads the whole model on the plan's card; any
+//! other runs the step graph through the host tier and every prompt as
+//! eager passes of up to eight ids, no pass captured.
+//!
 //! The bodies hold no rollback and the seat no prompt cache: every request
 //! prefills its whole prompt from a reset, and a request that shares a
 //! prefix with the last is a `cache reuse` note of why it kept none. The
@@ -29,13 +41,17 @@
 //! process with the crash block and exit code 70, as every seat's.
 //!
 //! The seat sits behind the `deepseek41` feature, the server surface's
-//! scope (`bind`, the `serve` and `sampler` crates); it runs no V4.1 code
-//! and acts on no parsed lever (`BLOOMERY_QWEN3_UBATCH` is read where the
-//! load sizes its arena).
+//! scope (`bind`, the `serve` and `sampler` crates); it runs no V4.1 code;
+//! a placed load acts on the plan's and the host tier's levers
+//! (`BLOOMERY_QWEN3_UBATCH` is read where the load sizes its arena).
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+
+#[path = "../qwen3moe_place.rs"]
+mod q3place;
+use q3place::PlaceQ3;
 
 use bloomery_gpu::Gpu;
 use bloomery_gpu::Qwen3moeModel;
@@ -43,17 +59,20 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, Open35, PrefillPath, Qwen35moeModel};
 use bloomery_gpu::model::{ChainBody, GpuModel, StepMode};
 use bloomery_gpu_gates::bind::{Seat, SeatEngine, Vocab, sampler_factory};
+use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, ref_model_path};
+use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::Arch;
+use model::placement::PlanLevers;
 use serve::{CacheNote, EngineProps, FATAL_LINGER, Saved, ServeError, Server, ServerConfig};
 use tokenizer::Tokenizer;
 
 const NAME: &str = "bloomery-serve-qwen3";
 
 const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]] \
-                     [--host H] [--port P] [--ctx C]";
+                     [--host H] [--port P] [--ctx C] [--place W]";
 
 /// The context unless `--ctx` says: `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
@@ -66,6 +85,7 @@ struct Args {
     host: String,
     port: u16,
     ctx: usize,
+    place: Option<Place>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -73,6 +93,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         host: "127.0.0.1".to_owned(),
         port: 8080,
         ctx: CTX,
+        place: None,
     };
     let mut it = args.iter().map(String::as_str);
     while let Some(flag) = it.next() {
@@ -93,6 +114,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                     );
                 }
             },
+            "--place" => a.place = Some(Place::parse(v)?),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
@@ -104,8 +126,15 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 trait Body3: ChainBody + Sized + 'static {
     /// The file's `general.architecture`, as the `load` record names it.
     const ARCH: &'static str;
-    /// The model of `file` on device 0 with a `ctx`-row cache.
-    fn open(file: Split, ctx: usize) -> Result<GpuModel<Self>, GateError>;
+    /// The model of `file` with a `ctx`-row cache: on device 0, or under
+    /// `place` by its plan, the `plan` record on stderr first.
+    fn open(
+        file: Split,
+        ctx: usize,
+        place: Option<(Place, &Levers)>,
+    ) -> Result<GpuModel<Self>, GateError>;
+    /// The load runs its routed experts on the host tier too.
+    fn placed(m: &GpuModel<Self>) -> Result<bool, GateError>;
     /// Every pass the prompt call replays, captured after the step.
     fn capture_passes(m: &mut GpuModel<Self>) -> Result<(), GateError>;
     /// The prompt call's ubatch size.
@@ -118,12 +147,23 @@ trait Body3: ChainBody + Sized + 'static {
 impl Body3 for Body {
     const ARCH: &'static str = "qwen3moe";
 
-    fn open(file: Split, ctx: usize) -> Result<Qwen3moeModel, GateError> {
-        Ok(Qwen3moeModel::open(
-            Gpu::new()?,
-            file,
-            Qwen3moeModel::lever_opts(ctx)?,
-        )?)
+    fn open(
+        file: Split,
+        ctx: usize,
+        place: Option<(Place, &Levers)>,
+    ) -> Result<Qwen3moeModel, GateError> {
+        let opts = Qwen3moeModel::lever_opts(ctx)?;
+        let Some((p, levers)) = place else {
+            return Ok(Qwen3moeModel::open(Gpu::new()?, file, opts)?);
+        };
+        let q = PlaceQ3::qwen3(&file, p, ctx)?;
+        let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
+        q.record(&plan).eprint();
+        q3place::open_qwen3(file, &plan, opts, levers.host())
+    }
+
+    fn placed(m: &Qwen3moeModel) -> Result<bool, GateError> {
+        Ok(m.body(NAME)?.placed().is_some())
     }
 
     fn capture_passes(m: &mut Qwen3moeModel) -> Result<(), GateError> {
@@ -143,13 +183,27 @@ impl Body3 for Body {
 impl Body3 for Body35 {
     const ARCH: &'static str = "qwen35moe";
 
-    fn open(file: Split, ctx: usize) -> Result<Qwen35moeModel, GateError> {
+    fn open(
+        file: Split,
+        ctx: usize,
+        place: Option<(Place, &Levers)>,
+    ) -> Result<Qwen35moeModel, GateError> {
         let o = Open35 {
             ctx,
             mma: true,
             ubatch: ubatch_size()?,
         };
-        Ok(Qwen35moeModel::open(Gpu::new()?, file, o)?)
+        let Some((p, levers)) = place else {
+            return Ok(Qwen35moeModel::open(Gpu::new()?, file, o)?);
+        };
+        let q = PlaceQ3::qwen35(&file, p, o)?;
+        let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
+        q.record(&plan).eprint();
+        q3place::open_qwen35(file, &plan, o, levers.host())
+    }
+
+    fn placed(m: &Qwen35moeModel) -> Result<bool, GateError> {
+        Ok(m.body(NAME)?.placed().is_some())
     }
 
     fn capture_passes(m: &mut Qwen35moeModel) -> Result<(), GateError> {
@@ -180,15 +234,18 @@ struct Q3<B: Body3> {
 }
 
 impl<B: Body3> Q3<B> {
-    /// The model of the file at `path` in graph mode, its step and passes
-    /// captured; the `load` record on stderr.
-    fn open(path: &Path, ctx: usize) -> Result<Q3<B>, GateError> {
+    /// The model of the file at `path` in graph mode — under `place` by
+    /// its plan — its step captured and, unless placed, its passes; the
+    /// `load` record on stderr.
+    fn open(path: &Path, ctx: usize, place: Option<(Place, &Levers)>) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let mut m = B::open(file, ctx)?;
+        let mut m = B::open(file, ctx, place)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
-        B::capture_passes(&mut m)?;
+        if !B::placed(&m)? {
+            B::capture_passes(&mut m)?;
+        }
         Record::new(&record::LOAD_QWEN3)
             .w("arch", B::ARCH)
             .u("resident_bytes", m.resident_bytes())
@@ -276,7 +333,10 @@ impl<B: Body3> Seat for Q3<B> {
 /// Loads the model and serves until the listener or the engine fails;
 /// `Ok` carries why the server ended.
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
-    bloomery_levers::at_main(&[])?;
+    // A placed load (`--place`) acts on the placement's levers; set beside
+    // an unplaced one, they are refused by name.
+    let placed = args.iter().any(|a| a == "--place");
+    let levers = bloomery_levers::at_main(if placed { &q3place::PLACED_LEVERS } else { &[] })?;
     record::at_main(NAME, record::BLOOMERY_SERVE_QWEN3);
     let a = parse_args(args)?;
     let path = ref_model_path()?;
@@ -299,20 +359,22 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let ctx = a.ctx;
     let open = path.clone();
+    let place = a.place;
+    let device = place.map_or("device 0", Place::name).to_owned();
     let engine = match arch {
         Arch::Qwen3moe => SeatEngine::spawn(
-            move || Q3::<Body>::open(&open, ctx),
+            move || Q3::<Body>::open(&open, ctx, place.map(|p| (p, &levers))),
             ctx,
             vocab,
-            "device 0".to_owned(),
+            device,
             EngineProps::default(),
             0,
         )?,
         Arch::Qwen35moe => SeatEngine::spawn(
-            move || Q3::<Body35>::open(&open, ctx),
+            move || Q3::<Body35>::open(&open, ctx, place.map(|p| (p, &levers))),
             ctx,
             vocab,
-            "device 0".to_owned(),
+            device,
             EngineProps::default(),
             0,
         )?,

@@ -75,6 +75,21 @@
 //! - (r) refusals: a ubatch size of 0 or past `UBATCH` is refused by name
 //!   with the size and the resident bytes kept; a prompt past the cache is
 //!   refused by name before any launch, the position kept.
+//! - (o) the placed load: the file planned on device 0 under a card budget
+//!   of [`PLACED_BUDGET`] (`shared/qwen3moe_place.rs`, the CLI's and the
+//!   seat's planner), which must leave routed experts both on the card and
+//!   on the host tier, then loaded by that plan (`open_placed`, the shared
+//!   expert its own one-expert stacks on the card): (o1) the batch set's
+//!   five tokens as five graph steps and as five eager steps from zero
+//!   stores leave the same logits, tokens and stores bit for bit, and so
+//!   does the prompt call on the pass path (one unit of five rows through
+//!   the host tier's batch port) against the fifth step — each row of a
+//!   unit runs every card launch and every host dot the way its one-row
+//!   step does; (o2) (c) on it, the same [`FREE_BAND`] — a host expert runs
+//!   ik's own 8-bit rule (Q8_K activations) where the card runs q8_1, so no
+//!   layer's error grows; (o3) a GEMM prompt and a ubatch resize refused by
+//!   name, the ubatch kept; (o4) the host tier served slots on both of its
+//!   ports. `--placed-only` runs (o) alone.
 //!
 //! Tap maps (ik → ours). Delta layer: `qkv_mixed` → the q·k·v projection;
 //! `z` → the gate projection; `beta_in`, `alpha` → β's and α's raw
@@ -118,27 +133,39 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen3moe_place.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate plans and opens a qwen35moe file only; the other half serves the CLI and the seat"
+)]
+mod q3place;
+
+#[cfg(feature = "gpu")]
 mod gate {
+    use super::q3place::PlaceQ3;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
-        Delta35Run, Gqa35Run, LayerKind35, Mixer35Run, Open35, PrefillPath, Qwen35moeModel,
+        Body35, Delta35Run, Gqa35Run, LayerKind35, Mixer35Run, Open35, PrefillPath, Qwen35moeModel,
         StoreHost,
     };
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::route_core::sigmoid;
-    use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu::{Gpu, GpuError, GpuModel};
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir, ik_q8_2,
         q8_1_dequant, ref_ints, ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
         widened_f16_rows_in,
     };
+    use bloomery_levers::HostCfg;
     use cuda_core::sys;
     use gguf::Split;
     use gguf::quant::half_to_f32;
     use model::arch::models::Mixer;
     use model::arch::models::shape::{AttnShape, MoeShape};
+    use model::placement::PlanLevers;
     use refset::arch::qwen35moe::{BATCH, D1K, IK, MODEL, STEP4};
     use std::time::Instant;
 
@@ -1684,18 +1711,142 @@ mod gate {
         Ok(ok && pass)
     }
 
-    pub fn run() -> Result<(), GateError> {
-        // A lever set to a value it does not take, or a retired name that is
-        // set, is refused by name before anything loads.
-        bloomery_levers::at_main(&[])?;
-        let mut m = open(CTX)?;
-        let mut ok = file_shape()?;
-        ok &= structure(&mut m)?;
+    // ---------------------------------------------- (o) the placed load
+
+    /// (o)'s card budget: a 12 GiB card's, under which the file's routed
+    /// experts split between the card and the host tier.
+    const PLACED_BUDGET: u64 = 12 << 30;
+
+    /// (o) (module doc): the model is dropped before the clause returns.
+    fn placed(man: &RefManifest, toks: &[u32], host: HostCfg) -> Result<bool, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let o = Open35 {
+            ctx: CTX,
+            mma: true,
+            ubatch: U_GATE,
+        };
+        let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
+        let levers = PlanLevers {
+            card_budget_bytes: Some(PLACED_BUDGET),
+        };
+        let plan = q.plan(CTX, &levers)?;
+        q.record(&plan).print();
+        let split = plan.host.experts > 0 && plan.cards[0].experts > 0;
+        println!(
+            "placed plan: card_experts={} host_experts={} (both above 0) {}",
+            plan.cards[0].experts,
+            plan.host.experts,
+            verdict(split)
+        );
+        if !split {
+            return Ok(false);
+        }
+        let t = Instant::now();
+        let mut m = GpuModel::<Body35>::open_placed(file, &plan, o, host)?;
+        let counts = m
+            .body("gate_qwen35moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .card_counts();
+        println!(
+            "placed load resident_bytes={} ubatch={} card experts per layer {counts:?} in {:.1} s \
+             (runtime value)",
+            m.resident_bytes(),
+            m.ubatch()?,
+            t.elapsed().as_secs_f64()
+        );
+        m.set_mode(StepMode::Graph);
+        println!("placed capture graph_nodes={}", m.capture_step()?);
+        // (o1)
+        let decode = decode_run(&mut m, toks, false)?;
+        m.set_mode(StepMode::Eager);
+        let eager = decode_run(&mut m, toks, false)?;
+        let mut ok = same_run(
+            "placed: five eager steps vs five graph replays",
+            &eager,
+            &decode,
+        );
+        // (o2)
+        ok &= free(&mut m, man, toks, &decode)?;
+        m.set_mode(StepMode::Graph);
+        fresh(&mut m)?;
+        let plan_p = m.prefill_plan(toks.len(), PrefillPath::Auto)?;
+        let tok = m.prefill_with(toks, PrefillPath::Auto)?;
+        let call = PathRun {
+            logits: vec![m.logits()?],
+            tokens: vec![tok],
+            stores: stores(&mut m)?,
+        };
+        let PathRun {
+            mut logits,
+            mut tokens,
+            stores: last_stores,
+        } = decode;
+        let fifth = PathRun {
+            logits: logits.pop().into_iter().collect(),
+            tokens: tokens.pop().into_iter().collect(),
+            stores: last_stores,
+        };
+        ok &= same_run(
+            &format!("placed: the prompt call ({plan_p}) vs the fifth graph step"),
+            &call,
+            &fifth,
+        );
+        // (o3)
+        let u0 = m.ubatch()?;
+        let gemm = m.prefill_plan(toks.len(), PrefillPath::Gemm).err();
+        let resize = m.set_ubatch(U_GATE).err();
+        let refused = gemm.is_some() && resize.is_some() && m.ubatch()? == u0;
+        println!(
+            "placed refusals: a GEMM prompt: {}; ubatches of {U_GATE}: {} (ubatch {u0} kept) {}",
+            gemm.map_or("accepted".to_string(), |e| e.to_string()),
+            resize.map_or("accepted".to_string(), |e| e.to_string()),
+            verdict(refused)
+        );
+        // (o4)
+        let stats = m
+            .body("gate_qwen35moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .hybrid()
+            .stats();
+        let served = stats.host_slots > 0 && stats.batch_host_slots > 0;
+        println!(
+            "placed host tier: step host_slots={} batch host_slots={} (both above 0) {}",
+            stats.host_slots,
+            stats.batch_host_slots,
+            verdict(served)
+        );
+        Ok(ok && refused && served)
+    }
+
+    /// The batch set's manifest and its five tokens.
+    fn batch_set() -> Result<(RefManifest, Vec<u32>), GateError> {
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let toks: Vec<u32> = ref_ints(&man, "inp_tokens", 0, RowKind::Input, Layout::Flat)?
             .iter()
             .map(|&i| u32::try_from(i))
             .collect::<Result<_, _>>()?;
+        Ok((man, toks))
+    }
+
+    pub fn run() -> Result<(), GateError> {
+        // A lever set to a value it does not take, or a retired name that is
+        // set, is refused by name before anything loads.
+        let host = bloomery_levers::at_main(&[])?.host();
+        if std::env::args().any(|a| a == "--placed-only") {
+            let (man, toks) = batch_set()?;
+            let ok = placed(&man, &toks, host)?;
+            println!("gate_qwen35moe_e2e --placed-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
+        let mut m = open(CTX)?;
+        let mut ok = file_shape()?;
+        ok &= structure(&mut m)?;
+        let (man, toks) = batch_set()?;
         let (p_ok, decode) = paths(&mut m, &toks)?;
         ok &= p_ok;
         ok &= free(&mut m, &man, &toks, &decode)?;
@@ -1712,6 +1863,8 @@ mod gate {
         ok &= wide_arm(&mut m)?;
         ok &= ubatch_bits(&mut m)?;
         ok &= refusals(&mut m)?;
+        drop(m);
+        ok &= placed(&man, &toks, host)?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

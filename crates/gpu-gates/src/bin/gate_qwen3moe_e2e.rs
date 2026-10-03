@@ -108,6 +108,19 @@
 //!   smallest code among the layer's raises, printed), the model poisoned;
 //!   `reset` leaves the word clean and the next step a token.
 //!
+//! - (o) the placed load: the file planned on device 0 under a card budget
+//!   of [`PLACED_BUDGET`] (`shared/qwen3moe_place.rs`, the CLI's and the
+//!   seat's planner), which must leave routed experts both on the card and
+//!   on the host tier, then loaded by that plan (`open_placed`): (c) and (g)
+//!   again on it — every layer's `l_out` within [`FREE_BAND`] of ik's and
+//!   the argmax ik's; no greedy prompt diverging from ik where ik's margin
+//!   is at or above [`MARGIN_FLOOR`]; graph = eager; the pass prefill = the
+//!   one-token path, bit for bit (every unit a walk through the host tier's
+//!   batch port) — and the host tier served slots on both of its ports. The
+//!   bands are the card's: a host expert runs ik's own 8-bit rule (Q8_K
+//!   activations) where the card runs q8_1, so no layer's error grows.
+//!   `--placed-only` runs (o) alone.
+//!
 //! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
 //! `--rope-only` the load and (t), `--fault-only` the load and (x),
 //! `--taps-only` the load and (d).
@@ -126,7 +139,8 @@
 //! across builds (`md5sum DIR/*`). With `--gemm-only` only the (u) files
 //! are written.
 //!
-//! `--ppl TAG` instead scores the chain against ik's KL-divergence base file
+//! `--ppl TAG [--placed]` instead scores the chain — with `--placed` (o)'s
+//! placed load — against ik's KL-divergence base file
 //! `$BLOOMERY_DATA/ikppl/TAG.kld` (`tools/ref/ik-ppl.sh --kld-base`): chunk by
 //! chunk from a reset, one step per id, at every scored position our NLL,
 //! ik's, KL(ik‖ours) and the top-1 agreement. Printed, not judged.
@@ -149,7 +163,16 @@ fn main() -> std::process::ExitCode {
 mod taps;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/qwen3moe_place.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate plans and opens a qwen3moe file only; the other half serves the CLI and the seat"
+)]
+mod q3place;
+
+#[cfg(feature = "gpu")]
 mod gate {
+    use super::q3place::PlaceQ3;
     use super::taps;
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
@@ -158,7 +181,8 @@ mod gate {
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
-    use bloomery_gpu::{Gpu, GpuError, Qwen3moeModel};
+    use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel};
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::oracle::{self, Set};
@@ -170,8 +194,10 @@ mod gate {
         ik_q8_2, open_split, q8_1_dequant, ref_ints, ref_model_path, ref_tensor_logical_in,
         topk_ids_logical_within, verdict,
     };
+    use bloomery_levers::HostCfg;
     use cuda_core::sys;
     use model::arch::Arch;
+    use model::placement::PlanLevers;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
@@ -354,11 +380,12 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
-        bloomery_levers::at_main(&[])?;
+        let host = bloomery_levers::at_main(&[])?.host();
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--ppl") {
             let tag = args.get(i + 1).ok_or("--ppl needs a tag")?;
-            return ppl(tag);
+            let placed = args.iter().any(|a| a == "--placed").then_some(host);
+            return ppl(tag, placed);
         }
         let dump = match args.iter().position(|a| a == "--dump") {
             Some(i) => Some(PathBuf::from(
@@ -366,6 +393,14 @@ mod gate {
             )),
             None => None,
         };
+        if args.iter().any(|a| a == "--placed-only") {
+            let ok = placed(host)?;
+            println!("gate_qwen3moe_e2e --placed-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--ubatch-only") {
             let ok = ubatch_sizes()?;
             println!("gate_qwen3moe_e2e --ubatch-only: {}", verdict(ok));
@@ -420,11 +455,12 @@ mod gate {
         ok &= forced(m, &man)?;
         ok &= free(m, &man)?;
         ok &= tap_dump(m)?;
-        ok &= greedy(m, dump.as_deref())?;
+        ok &= greedy(m, dump.as_deref(), true)?;
         ok &= rope_table(m, CTX)?;
         ok &= fault_layer(m)?;
         drop(s);
         ok &= ubatch_sizes()?;
+        ok &= placed(host)?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
@@ -858,6 +894,79 @@ mod gate {
         Ok(ok)
     }
 
+    // -------------------------------------------------- (o) the placed load
+
+    /// (o)'s card budget: a 12 GiB card's, under which the file's routed
+    /// experts split between the card and the host tier.
+    const PLACED_BUDGET: u64 = 12 << 30;
+
+    /// The file planned on device 0 at `ctx` positions under
+    /// [`PLACED_BUDGET`], its `plan` record and the split line printed, and
+    /// loaded by that plan with its host set as `host` asks; `None` when the
+    /// plan leaves no routed expert on the card or none on the host.
+    fn open_placed(ctx: usize, host: HostCfg) -> Result<Option<Qwen3moeModel>, GateError> {
+        let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
+        let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, ctx)?;
+        let levers = PlanLevers {
+            card_budget_bytes: Some(PLACED_BUDGET),
+        };
+        let plan = q.plan(ctx, &levers)?;
+        q.record(&plan).print();
+        let split = plan.host.experts > 0 && plan.cards[0].experts > 0;
+        println!(
+            "placed plan: card_experts={} host_experts={} (both above 0) {}",
+            plan.cards[0].experts,
+            plan.host.experts,
+            verdict(split)
+        );
+        if !split {
+            return Ok(None);
+        }
+        let opts = Qwen3moeModel::lever_opts(ctx)?;
+        Ok(Some(GpuModel::<Body>::open_placed(
+            file, &plan, opts, host,
+        )?))
+    }
+
+    /// (o) (module doc): the model is dropped before the clause returns.
+    fn placed(host: HostCfg) -> Result<bool, GateError> {
+        let t = Instant::now();
+        let Some(mut m) = open_placed(CTX, host)? else {
+            return Ok(false);
+        };
+        let counts = m
+            .body("gate_qwen3moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .card_counts();
+        println!(
+            "placed load resident_bytes={} card experts per layer {counts:?} in {:.1} s \
+             (runtime value)",
+            m.resident_bytes(),
+            t.elapsed().as_secs_f64()
+        );
+        m.set_mode(StepMode::Graph);
+        println!("placed capture graph_nodes={}", m.capture_step()?);
+        let o = oracle::for_arch(Arch::Qwen3moe)?;
+        let man = o.open(Set::Cpu)?;
+        let mut ok = free(&mut m, &man)?;
+        ok &= greedy(&mut m, None, false)?;
+        let stats = m
+            .body("gate_qwen3moe_e2e")?
+            .placed()
+            .ok_or("an open_placed load with no placed side")?
+            .hybrid()
+            .stats();
+        let served = stats.host_slots > 0 && stats.batch_host_slots > 0;
+        println!(
+            "placed host tier: step host_slots={} batch host_slots={} (both above 0) {}",
+            stats.host_slots,
+            stats.batch_host_slots,
+            verdict(served)
+        );
+        Ok(ok && served)
+    }
+
     // --------------------------------------------------- (d) the tap dump
 
     /// The tap clause's windows of the prose, their prompt ids and greedy
@@ -1010,7 +1119,13 @@ mod gate {
         Ok(())
     }
 
-    fn greedy(m: &mut Qwen3moeModel, dump_dir: Option<&Path>) -> Result<bool, GateError> {
+    /// (g), (r), (p) and (q) over the prompts, and (u) when `gemm` (a placed
+    /// load runs no GEMM ubatch).
+    fn greedy(
+        m: &mut Qwen3moeModel,
+        dump_dir: Option<&Path>,
+        gemm: bool,
+    ) -> Result<bool, GateError> {
         let dir = greedy_dir();
         let mut prompts = Vec::new();
         let mut reference = Vec::new();
@@ -1090,7 +1205,7 @@ mod gate {
         );
         let prefill_ok = prefilled(m, &prompts, &graph, &graph_logits, dump_dir)?;
         let passes_ok = prefill_replay(m, &prompts)?;
-        let gemm_ok = gemm_prefill(m, dump_dir)?;
+        let gemm_ok = !gemm || gemm_prefill(m, dump_dir)?;
         Ok(replay_ok && greedy_ok && prefill_ok && passes_ok && gemm_ok)
     }
 
@@ -1856,7 +1971,9 @@ mod gate {
         }
     }
 
-    fn ppl(tag: &str) -> Result<(), GateError> {
+    /// `--ppl TAG [--placed]` (module doc): on the whole-card load, or with
+    /// `--placed` on (o)'s placed load at the base's context.
+    fn ppl(tag: &str, placed: Option<HostCfg>) -> Result<(), GateError> {
         let path: PathBuf = data_dir().join("ikppl").join(format!("{tag}.kld"));
         let base = KldBase::open_own_vocab(&path)?;
         println!(
@@ -1867,7 +1984,15 @@ mod gate {
             base.scored_per_chunk(),
             base.first_scored()
         );
-        let mut m = open(base.n_ctx(), StepMode::Graph)?;
+        let mut m = match placed {
+            None => open(base.n_ctx(), StepMode::Graph)?,
+            Some(host) => {
+                let mut m = open_placed(base.n_ctx(), host)?
+                    .ok_or("--placed: the plan leaves no routed expert on one side")?;
+                m.set_mode(StepMode::Graph);
+                m
+            }
+        };
         let n_vocab = m.body("ppl")?.hparams().n_vocab;
         if base.n_vocab() != n_vocab {
             return Err(format!(

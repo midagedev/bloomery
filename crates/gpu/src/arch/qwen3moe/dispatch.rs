@@ -383,6 +383,21 @@ pub(super) fn layer(
     embed: bool,
     out: Option<&mut DeviceBuffer<f32>>,
 ) -> Result<(), GpuError> {
+    mixer(c, st, s, io, m, embed)?;
+    ffn(c, &c.p.ffn, s, m, out)
+}
+
+/// One layer at `m` rows up to its FFN half ([`layer`]'s first part): the
+/// embedding rows in front when `embed`, then the mixer the plan names over
+/// the layer's store, which leaves the FFN's input residual in `ffn_inp`.
+pub(super) fn mixer(
+    c: &Ctx<'_>,
+    st: StoreMut<'_>,
+    s: &mut Arena,
+    io: &Io<'_>,
+    m: usize,
+    embed: bool,
+) -> Result<(), GpuError> {
     if embed {
         embed_rows(c.gpu, c.w, c.k, io, s)?;
         if m > GEMV_COLS {
@@ -403,7 +418,7 @@ pub(super) fn layer(
             ));
         }
     }
-    ffn(c, &c.p.ffn, s, m, out)
+    Ok(())
 }
 
 /// A unit's front, one launch: the embedding rows of `io`'s ids into `s.x`

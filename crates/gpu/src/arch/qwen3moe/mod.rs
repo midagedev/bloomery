@@ -7,10 +7,12 @@
 //! layer's kind a load-time plan (`plan`); [`Body38`], Qwen3.8-Flash-Next,
 //! over its own plan and program (`plan38`, [`program38`]: the layers in
 //! gated-residual streams, a selecting attention, every routed expert on the
-//! host tier); and the kernels whose constants
-//! are this family's and nothing else's — the attention projections, the
-//! routers, the experts' gate·up and combine, and the head's projection with
-//! its argmax. The shape kernels it runs over — the Q4_K embedding row, the
+//! host tier); [`Placed`], the placed side `Body` and `Body35` carry on a
+//! load whose plan puts part of each layer's routed experts on the host tier
+//! (`placed`, its launches around the host leg in `hostleg`); and the kernels
+//! whose constants are this family's and nothing else's — the attention
+//! projections, the routers, the experts' gate·up and combine, and the head's
+//! projection with its argmax. The shape kernels it runs over — the Q4_K embedding row, the
 //! NEOX norm/rope/append, the grouped-query flash, the delta rule, the Q6_K
 //! down `_sel` — live in the crate root beside the runtime.
 
@@ -22,8 +24,10 @@ mod delta;
 mod dispatch;
 pub mod experts;
 pub mod head_argmax;
+mod hostleg;
 mod image;
 mod mtp38;
+mod placed;
 mod plan;
 mod plan38;
 mod prefill;
@@ -51,6 +55,7 @@ pub use mtp38::{
     BorrowedPlanes, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft, MtpFeed, MtpHead,
     MtpHidden, MtpMode, MtpNode, MtpTaps, TargetRows, walk_launches,
 };
+pub use placed::Placed;
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};
 
 /// Qwen3.6-35B-A3B on one card.

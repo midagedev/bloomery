@@ -41,12 +41,14 @@
 
 use super::body::Body;
 use super::dispatch::{self, PassCtx};
+use super::placed::{BatchWalk, Placed, WalkParts};
 use super::program::{self, Program, Tail};
 use super::router::MAX_TOKENS;
 use super::scratch::{Arena, Dims, IN_IDS, IN_POS0, Inbox, Io, param_view, put_input};
 use super::ubatch::UbCtx;
 use crate::head::Head;
-use crate::model::{GpuModel, StepMode};
+use crate::host::BatchLeg;
+use crate::model::{GpuModel, MAX_PASS_ROWS, StepMode};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -315,6 +317,9 @@ impl Body {
         head: Option<&mut Head>,
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
+        if self.placed.is_some() {
+            return self.run_placed_pass(gpu, w, (chunk, m), head);
+        }
         if graph {
             self.prefill.stage(stream, chunk, m)?;
             self.prefill.replay(stream, chunk, m)?;
@@ -368,6 +373,73 @@ impl Body {
             tail,
         }
         .walk()
+    }
+}
+
+impl Body {
+    /// Run pass `chunk` of `m` tokens of the prompt in the image on a placed
+    /// load: eager, through the host tier's batch port (`placed`'s unit
+    /// walk), reading the block where it lies; with `head`, its last row
+    /// into `head` and that head after it.
+    fn run_placed_pass(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        (chunk, m): (usize, usize),
+        head: Option<&mut Head>,
+    ) -> Result<(), GpuError> {
+        let win = self.prefill.image_windows(chunk, m)?;
+        let Body {
+            hp,
+            plans,
+            kv,
+            rope,
+            k,
+            mma,
+            prefill,
+            head_state,
+            placed,
+            ..
+        } = self;
+        let Some(Placed {
+            hybrid,
+            side,
+            pass,
+            pass_hsum,
+            ..
+        }) = placed
+        else {
+            return Err(GpuError::state(WHAT, "a placed side (a placed load)"));
+        };
+        let c = PassCtx {
+            gpu,
+            w,
+            plans,
+            k,
+            mma: *mma,
+            eps: hp.rms_eps,
+            table: &rope.table,
+        };
+        let tail = match head {
+            Some(head) => Tail::Last {
+                head,
+                state: head_state,
+            },
+            None => Tail::Pass,
+        };
+        let mut leg = BatchLeg::new(gpu.stream(), hybrid, pass_hsum, MAX_PASS_ROWS);
+        BatchWalk {
+            p: WalkParts {
+                c: &c,
+                stores: kv.as_mut_slice(),
+                s: &mut prefill.a,
+                io: &win.io(),
+                m,
+                side,
+                rows: pass,
+            },
+        }
+        .walk(&mut leg, tail)
     }
 }
 
@@ -538,14 +610,35 @@ impl GpuModel<Body> {
     /// logits are the same bits at every size.
     pub fn set_ubatch(&mut self, u: usize) -> Result<(), GpuError> {
         let (gpu, _, body) = self.body_parts("qwen3moe::set_ubatch")?;
+        if body.placed.is_some() {
+            return Err(GpuError::shape(
+                "qwen3moe::set_ubatch",
+                format!(
+                    "ubatches of {u} tokens on a placed load: its arena is the plan's count, \
+                     passes of up to {MAX_PASS_ROWS}"
+                ),
+            ));
+        }
         body.ub.resize(gpu.stream(), u)
     }
 
     /// The units [`GpuModel::prefill_with`] runs a prompt of `tokens` ids
     /// as by `path`, at this model's ubatch size.
     pub fn prefill_plan(&self, tokens: usize, path: PrefillPath) -> Result<PrefillPlan, GpuError> {
-        let ub = self.body("qwen3moe::prefill_plan")?.ub.size();
-        Ok(PrefillPlan::new(tokens, path, ub))
+        let body = self.body("qwen3moe::prefill_plan")?;
+        // A placed load runs its prompt as passes through the host tier's
+        // batch port.
+        let path = match (body.placed.is_some(), path) {
+            (true, PrefillPath::Gemm) => {
+                return Err(GpuError::shape(
+                    "qwen3moe::prefill_plan",
+                    "a GEMM ubatch on a placed load: its prompt runs as passes (auto or pass)",
+                ));
+            }
+            (true, _) => PrefillPath::Pass,
+            (false, p) => p,
+        };
+        Ok(PrefillPlan::new(tokens, path, body.ub.size()))
     }
 
     /// Feed `tokens` through the chain by the plan of `path` (module doc)
@@ -563,7 +656,8 @@ impl GpuModel<Body> {
         }
         let pos0 = self.pos();
         self.check_pos(pos0 + launch_u32(WHAT, "tokens", tokens.len())? - 1, WHAT)?;
-        let graph = self.mode() == StepMode::Graph;
+        let placed = self.body(WHAT)?.placed.is_some();
+        let graph = self.mode() == StepMode::Graph && !placed;
         let plan = self.prefill_plan(tokens.len(), path)?;
         let n_ub = plan.ubatch_tokens();
         let passes: Vec<usize> = plan
@@ -645,6 +739,13 @@ impl GpuModel<Body> {
     /// itself, inside its call; a timed caller captures here first.
     pub fn capture_prefill(&mut self) -> Result<Vec<usize>, GpuError> {
         let (gpu, w, body) = self.body_parts("qwen3moe::capture_prefill")?;
+        if body.placed.is_some() {
+            return Err(GpuError::shape(
+                "qwen3moe::capture_prefill",
+                "a placed load captures no prefill pass: its passes run eager through the host \
+                 tier's batch port",
+            ));
+        }
         for m in 1..=MAX_TOKENS {
             if body.prefill.graphs[m - 1].is_none() {
                 body.capture_pass(gpu, w, m)?;

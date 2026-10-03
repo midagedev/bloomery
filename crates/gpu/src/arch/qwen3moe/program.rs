@@ -140,20 +140,32 @@ impl<S: Stores + ?Sized> LayerProgram for Program<'_, S> {
     /// The walk's [`Tail`].
     fn end(&mut self, _: usize) -> Result<(), GpuError> {
         let Program { c, s, m, tail, .. } = self;
-        let (gpu, w, k) = (c.gpu, c.w, c.k);
-        match tail {
-            Tail::Step { head, state, .. } => dispatch::enqueue_head(gpu, w, k, state, head),
-            Tail::Rows { heads, state } => {
-                for (row, head) in s.x_rows.iter().zip(heads.iter_mut()) {
-                    head.input_mut().copy_from_device_async(row, gpu.stream())?;
-                    dispatch::enqueue_head(gpu, w, k, state, head)?;
-                }
-                Ok(())
+        enqueue_tail(c, s, *m, tail)
+    }
+}
+
+/// Enqueue what follows the last layer of a walk of `m` rows over arena `s`:
+/// the walk's [`Tail`] (a step's taps are its layers', copied as each layer
+/// ends).
+pub(super) fn enqueue_tail(
+    c: &PassCtx<'_>,
+    s: &mut Arena,
+    m: usize,
+    tail: &mut Tail<'_>,
+) -> Result<(), GpuError> {
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    match tail {
+        Tail::Step { head, state, .. } => dispatch::enqueue_head(gpu, w, k, state, head),
+        Tail::Rows { heads, state } => {
+            for (row, head) in s.x_rows.iter().zip(heads.iter_mut()) {
+                head.input_mut().copy_from_device_async(row, gpu.stream())?;
+                dispatch::enqueue_head(gpu, w, k, state, head)?;
             }
-            Tail::Pass => Ok(()),
-            Tail::Last { head, state } => enqueue_last(gpu, w, k, state, s, *m, head),
-            Tail::Hidden => enqueue_hidden(gpu, w, c.eps, s, *m),
+            Ok(())
         }
+        Tail::Pass => Ok(()),
+        Tail::Last { head, state } => enqueue_last(gpu, w, k, state, s, m, head),
+        Tail::Hidden => enqueue_hidden(gpu, w, c.eps, s, m),
     }
 }
 
