@@ -6,8 +6,9 @@
 //!     gate_glm5next_serve --arm plain|drafted --dir <out>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
-//! 127.0.0.1 --port 0 --place gate --ctx 2048 --slot-save-path /tmp`, its
-//! levers set here), reads
+//! 127.0.0.1 --port 0 --place gate --ctx 2048 --slot-save-path /tmp
+//! --parallel 1`, the plain engine its clauses hold; the levers are set
+//! here), reads
 //! its address from its stderr, waits for `/health`, takes the prompt of one
 //! chat turn ([`CHAT`]) as the server renders it (`/apply-template`, then
 //! `/tokenize` of that text without BOS: the ids `/v1/chat/completions`
@@ -165,8 +166,11 @@ mod gate {
     /// The stores both engines size, the seat's and the CLI's default.
     const CTX: usize = 2048;
     /// The server's arguments after its path. The slot actions need a save
-    /// directory; the gate asks only for `erase`, which writes nothing.
-    const SERVER_ARGS: [&str; 12] = [
+    /// directory; the gate asks only for `erase`, which writes nothing. The
+    /// plain engine is pinned (`--parallel 1`): this gate's clauses hold the
+    /// one-slot path's prompt cache, and the swap clause's server runs the
+    /// turns on its own.
+    const SERVER_ARGS: [&str; 14] = [
         "--model",
         "glm",
         "--host",
@@ -179,6 +183,8 @@ mod gate {
         "2048",
         "--slot-save-path",
         "/tmp",
+        "--parallel",
+        "1",
     ];
     /// The load takes a minute or two; the bound is 120 polls × 5 s.
     const POLLS: usize = 120;
@@ -999,8 +1005,11 @@ mod gate {
     fn swap_rejoins_the_draft(dir: &Path) -> Result<bool, GateError> {
         let dir = dir.join("swap");
         std::fs::create_dir_all(&dir)?;
+        // SERVER_ARGS ends in the plain engine's `--parallel 1`; this
+        // clause's server takes the two-slot value.
         let mut args: Vec<&str> = SERVER_ARGS.to_vec();
-        args.extend_from_slice(&["--parallel", "2"]);
+        let parallel = args.len() - 1;
+        args[parallel] = "2";
         let err_log = dir.join("server.err");
         // The draft-only levers: with the residency moving experts the map a
         // resumed pass runs on is the one the turns left, and a near tie may

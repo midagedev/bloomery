@@ -21,8 +21,8 @@
 //! past that) — then steps the last, which `generate_qwen3moe --last-step`
 //! does too. Its
 //! first shard gives the vocabulary, `tokenizer.chat_template` the chat
-//! template and `general.name` the alias. One slot unless `--parallel`
-//! names more; sampling is the sampler
+//! template and `general.name` the alias. Two slots by default
+//! (`--parallel`), one only at `--parallel 1`; sampling is the sampler
 //! crate's chain with no repetition penalty, `temperature <= 0` the
 //! engine's argmax.
 //!
@@ -53,8 +53,10 @@
 //! to stderr (`record::BLOOMERY_SERVE_QWEN3`). An engine error ends the
 //! process with the crash block and exit code 70, as every seat's.
 //!
-//! `--parallel N` (`-np N`, default 1) serves N slots that take the one
-//! model in turns (`serve::SwapEngine`): a request that arrives while
+//! `--parallel N` (`-np N`, default 2) serves N slots that take the one
+//! model in turns (`serve::SwapEngine`); the default's second slot costs a
+//! lone request nothing, the turns acting only on a second arrival, and
+//! `--parallel 1` keeps the plain engine: a request that arrives while
 //! another decodes preempts it at the next step, the live requests then
 //! take turns of `serve::QUANTUM` tokens, and a preempted request comes
 //! back by the re-prefill fallback — the engine reset to position 0 and its
@@ -130,7 +132,10 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         port: 8080,
         ctx: CTX,
         place: None,
-        parallel: 1,
+        // Two slots by default: a lone request pays nothing for the second
+        // (the turns act only on a second arrival); `--parallel 1` keeps the
+        // plain engine.
+        parallel: 2,
         queue_depth: None,
     };
     let mut it = args.iter().map(String::as_str);

@@ -67,6 +67,7 @@ pub const ROWS: &[Row<Open>] = &[Row {
     ctx: release::CTX,
     backbones: release::BACKBONES,
     head_repo: release::HEAD_REPO,
+    quant_repo: release::QUANT_REPO,
     head_file: release::HEAD_FILE,
     config_file: release::HEAD_CONFIG,
     knows: release::knows,

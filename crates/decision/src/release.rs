@@ -20,6 +20,11 @@ pub const BACKBONES: &[&str] = &["qwen35"];
 /// The repo the release's head is fetched from.
 pub const HEAD_REPO: &str = "Cloudflare/clef-flash";
 
+/// A repo whose model card names [`HEAD_REPO`] as the model it quantizes, whose
+/// set seats the row under `--hf`: the `--hf` a bare `qwen35` file's refusal
+/// points at.
+pub const QUANT_REPO: &str = "bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M";
+
 /// The head's weights in [`HEAD_REPO`]; its config is [`HEAD_CONFIG`] beside them.
 pub const HEAD_FILE: &str = "joint_head.safetensors";
 

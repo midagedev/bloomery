@@ -104,6 +104,10 @@ pub struct Row<O> {
     pub backbones: &'static [&'static str],
     /// The repo the head is fetched from under `--hf`.
     pub head_repo: &'static str,
+    /// A repo whose model card names [`head_repo`](Row::head_repo) as the model it
+    /// quantizes, whose set seats the row under `--hf`: the `--hf` a bare-backbone
+    /// refusal points at.
+    pub quant_repo: &'static str,
     /// The head's weights in that repo.
     pub head_file: &'static str,
     /// The head config's file name, beside the weights.
@@ -208,10 +212,11 @@ pub fn no_head<O>(arch: &str, rows: &[Row<O>]) -> String {
         .iter()
         .map(|r| {
             format!(
-                "{} (head repo {}, backbone {})",
+                "{} (head repo {}, backbone {}; --hf {})",
                 r.name,
                 r.head_repo,
-                r.backbones.join(" or ")
+                r.backbones.join(" or "),
+                r.quant_repo
             )
         })
         .collect();
@@ -629,6 +634,7 @@ mod tests {
         ctx: 16,
         backbones: &["qwen35"],
         head_repo: "Org/a",
+        quant_repo: "q/a-GGUF:Q4",
         head_file: "a.safetensors",
         config_file: "a.json",
         knows: knows_a,
@@ -749,7 +755,10 @@ mod tests {
                 e.contains("--model decide: a qwen35 file with no head") && e.contains("--head"),
                 "{e}"
             );
-            assert!(e.contains("rowa (head repo Org/a, backbone qwen35)"), "{e}");
+            assert!(
+                e.contains("rowa (head repo Org/a, backbone qwen35; --hf q/a-GGUF:Q4)"),
+                "{e}"
+            );
         }
         // No --model and no head: no seat here; the generative side refuses by no_head.
         assert!(matches!(

@@ -65,8 +65,10 @@
 //! and `save` and `restore` answer the server's own 501, a state being a
 //! host value and not a file.
 //!
-//! `--parallel N` (`-np N`, default 1) serves N slots that take the one model
-//! in turns (`serve::SwapEngine`): a request that arrives while another
+//! `--parallel N` (`-np N`, default 2) serves N slots that take the one model
+//! in turns (`serve::SwapEngine`); the default's second slot costs a lone
+//! request nothing, the turns acting only on a second arrival, and
+//! `--parallel 1` keeps the plain engine: a request that arrives while another
 //! decodes preempts it at the next step, the running request's sequence
 //! state ([`seq_save`], the draft's side with it) parked in host RAM, and the
 //! live requests then take turns of `serve::QUANTUM` tokens, each put back
@@ -391,7 +393,10 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         template_file: None,
         prefill: PrefillMode::Batch,
         plan_only: false,
-        parallel: 1,
+        // Two slots by default: a lone request pays nothing for the second
+        // (the turns act only on a second arrival); `--parallel 1` keeps the
+        // plain engine.
+        parallel: 2,
         queue_depth: None,
         park_ram: None,
     };

@@ -4,9 +4,10 @@
 //!
 //!     gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir>
 //!
-//! For each file it starts `bloomery-serve --model qwen3 -m <file> --port 0`
-//! (beside this binary, `BLOOMERY_REF_MODEL` removed from its environment:
-//! the file is named once, by `-m`) and holds:
+//! For each file it starts `bloomery-serve --model qwen3 -m <file> --port 0
+//! --parallel 1` (beside this binary, `BLOOMERY_REF_MODEL` removed from its
+//! environment: the file is named once, by `-m`; the plain engine pinned,
+//! the prefix clauses holding the one-slot path's keeps) and holds:
 //!
 //! - `load_and_listen`: the server prints its `load` record for the file's
 //!   architecture before its `listening` record;
@@ -132,13 +133,28 @@ mod gate {
         Ok(std::env::current_exe()?.with_file_name(name))
     }
 
-    /// `bloomery-serve --model qwen3 -m <model> --port 0` beside this binary,
-    /// `BLOOMERY_REF_MODEL` removed, its logs in `dir`.
+    /// `bloomery-serve --model qwen3 -m <model> --port 0 --parallel 1` beside
+    /// this binary, `BLOOMERY_REF_MODEL` removed, its logs in `dir`. The
+    /// plain engine is pinned: the prefix clauses below hold the one-slot
+    /// path's keeps.
     fn spawn(model: &Path, dir: &Path) -> Result<Served, GateError> {
         let mut cmd = Command::new(beside("bloomery-serve")?);
         cmd.env_remove("BLOOMERY_REF_MODEL");
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
-        Served::spawn_cmd(cmd, &["--model", "qwen3", "--port", "0", "-m", m], dir)
+        Served::spawn_cmd(
+            cmd,
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "1",
+                "-m",
+                m,
+            ],
+            dir,
+        )
     }
 
     /// What the server answered for one prompt.

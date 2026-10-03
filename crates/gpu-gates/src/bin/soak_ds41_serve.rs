@@ -4,8 +4,9 @@
 //!
 //!     soak_ds41_serve --minutes <M> --dir <out> [--seed <n>]
 //!
-//! Starts the server beside this binary (`--port 0 --place a`), waits for it
-//! to listen, then
+//! Starts the server beside this binary (`--port 0 --place a --parallel 1`,
+//! the plain engine the soak's verdict is taken on), waits for it to listen,
+//! then
 //! until the deadline sends a mix drawn from `--seed` (printed): turns of a
 //! multi-turn chat that reuses the cached prefix and starts over past
 //! [`CHAT_CAP`] positions, `/completion` with `cache_prompt: false`, streamed
@@ -68,7 +69,19 @@ mod soak {
     use serde_json::{Value, json};
 
     const USAGE: &str = "usage: soak_ds41_serve --minutes <M> --dir <out> [--seed <n>]";
-    const SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "a"];
+    /// The server's arguments after its path. The plain engine is pinned
+    /// (`--parallel 1`): the soak's memory verdict is the one-slot path's,
+    /// the default's parked states being a budget the soak does not model.
+    const SERVER_ARGS: [&str; 8] = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--place",
+        "a",
+        "--parallel",
+        "1",
+    ];
     /// The load's bound: the serve gate's 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);

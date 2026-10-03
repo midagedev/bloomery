@@ -4,7 +4,8 @@
 //!     gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>
 //!                     [--plain <the plain run's --dir> | --place bp]
 //!
-//! Starts the server beside this binary (`--port 0 --place gate`), reads its
+//! Starts the server beside this binary (`--port 0 --place gate --parallel
+//! 1`, the plain engine this gate's body holds), reads its
 //! address from its stderr, waits for `/health`, then checks:
 //!
 //! - `/props`' `engine` object, printed once, against this gate's own plan of
@@ -118,7 +119,7 @@
 //! With `--place bp`, under `BLOOMERY_DRAFT=dspark` (refused otherwise, and
 //! beside `--plain`), the server runs plan (b′) — plan (a) on the A6000, the
 //! 3090 an expert tier holding the draft's reserve — with the DSpark draft,
-//! started as `--port 0 --place bp`, and the gate checks it against its own
+//! started as `--port 0 --place bp --parallel 1`, and the gate checks it against its own
 //! plan (b′) of the file (the draft's reserve from its header and the tier's
 //! prompt-batch bytes from the file's, as the server makes them) and nothing
 //! above:
@@ -193,10 +194,33 @@ mod gate {
     const SAMPLED_IDS: &str = "sampled.ids";
     /// The draft run's greedy requests' length: long enough for several passes.
     const DRAFT_PREDICT: usize = 32;
-    /// The server's arguments after its path; `/props` must echo them.
-    const SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "gate"];
-    /// The server's arguments under `--place bp`.
-    const BP_SERVER_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "bp"];
+    /// The server's arguments after its path; `/props` must echo them. The
+    /// plain engine is pinned (`--parallel 1`): this gate's body holds the
+    /// one-slot path's prompt-cache clauses, and the draft runs below would
+    /// refuse the default's two slots by name; the swap clause's server runs
+    /// the turns on its own.
+    const SERVER_ARGS: [&str; 8] = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--place",
+        "gate",
+        "--parallel",
+        "1",
+    ];
+    /// The server's arguments under `--place bp`, the plain engine pinned as
+    /// [`SERVER_ARGS`]'s (the run drafts).
+    const BP_SERVER_ARGS: [&str; 8] = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--place",
+        "bp",
+        "--parallel",
+        "1",
+    ];
     /// The swap clause's server: two slots that take the body in turns.
     const SWAP_SERVER_ARGS: [&str; 8] = [
         "--host",

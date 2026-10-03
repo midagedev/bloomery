@@ -1,13 +1,20 @@
 //! `bloomery-serve` — one server binary, one seat a model: `--model
 //! ds41|qwen38|glm|qwen3|decide` picks the seat (`serve_seats`, the shared
 //! seat modules), every other flag the seat's own, parsed by the seat's own
-//! parser, so each seat's flag set is exactly its per-model binary's.
+//! parser, so each seat's flag set is exactly its per-model binary's. The
+//! word is optional with a model file: with none, the file's architecture
+//! picks the seat, and a bare start or `--help` prints [`drive::MODELS`],
+//! one line a seat with a working `--hf` example.
 //!
 //!     bloomery-serve [--model ds41|qwen38|glm|qwen3|decide]
 //!                    [-m PATH | --model-file PATH | --hf <repo>[:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
 //!                    <the seat's own flags>
 //!     bloomery-serve --version
+//!
+//! Every start prints one line on stderr before the load begins
+//! ([`drive::FIRST_START`]): a first start on a new card compiles the GPU
+//! code for it, which takes tens of seconds.
 //!
 //! The model file is `-m` (`--model-file`), the first shard of a split
 //! set; `--hf` fetches a Hugging Face repo's GGUF set by its quant tag into
@@ -24,11 +31,13 @@
 //! decide seat (`serve_seats::decide`); `--head` beside a generative seat's
 //! `--model` is refused by name, and so is `--model decide` with no head.
 //! Otherwise, with no `--model`, the architecture of the file's first shard
-//! picks the seat: deepseek41 and deepseek4 the ds41 seat, qwen4exp the
-//! qwen38 seat, qwen3moe and qwen35moe the qwen3 seat, glm5next the glm
-//! seat; a file of a decision row's backbone (qwen35) with no head is
-//! refused by name, saying what would seat it; a file whose architecture
-//! does not match an explicit `--model` is refused by name before any load.
+//! picks the seat: deepseek41 and deepseek4 the ds41 seat, glm5next the glm
+//! seat, qwen4exp the qwen38 seat, qwen3moe and qwen35moe the qwen3 seat;
+//! a file of a decision row's backbone (qwen35) with no head is refused by
+//! name, saying what would seat it (`--head`, or a row's `--hf` repo); a
+//! file whose architecture no seat serves is refused by name listing the
+//! seat words; a file whose architecture does not match an explicit
+//! `--model` is refused by name before any load.
 //! `--version` prints this crate's version and the build's commit and exits.
 //! Each seat's flags, records, `/props` fields and exit codes are its
 //! module's doc; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are this
@@ -94,7 +103,6 @@ mod drive {
 
     use bloomery_gpu_gates::{GateError, exit_with, model_file, ref_model_path};
     use gguf::Split;
-    use model::arch::Arch;
     use model::arch::DEEPSEEK4;
     use serve::ServeError;
     use serve::decide::Ask;
@@ -108,6 +116,23 @@ mod drive {
                          [--head-config <file>]] <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3 or the \
                          decide seat takes them> | --version";
+
+    /// One line a seat, printed beside [`USAGE`] on `--help` and a bare
+    /// start: the seat word, what it serves, and a working `--hf` example of
+    /// it. Plain lines, one seat each, so a gate can pin them.
+    const MODELS: &str = "\
+models (the --model word is optional with a model file: the file's architecture picks the seat)
+  ds41    DeepSeek-V4.1-Flash          --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M
+  qwen38  Qwen3.8-Flash-Next           --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL
+  glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL
+  qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
+  decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M";
+
+    /// What every start prints on stderr before the load begins: the claim
+    /// holds for every start (a start cannot know whether it is the card's
+    /// first).
+    const FIRST_START: &str = "bloomery-serve: a first start on a new card compiles the GPU \
+                               code for it (tens of seconds); later starts take seconds";
 
     /// The spellings of the model path flag.
     const PATH_FLAGS: &[&str] = &["-m", "--model-file"];
@@ -167,7 +192,7 @@ mod drive {
         }
 
         /// Whether a file of architecture `arch` (its `general.architecture`
-        /// string) is this seat's. `qwen4exp` is not an [`Arch`] name, which
+        /// string) is this seat's. `qwen4exp` is not an `Arch` name, which
         /// is why the seat of a file is read from the string.
         fn serves(self, arch: &str) -> bool {
             match self {
@@ -201,21 +226,29 @@ mod drive {
         Ok((word, rest))
     }
 
-    /// The seat the model file's ([`ref_model_path`]) first shard holds,
-    /// with its `general.architecture` string: `qwen4exp` by its name (which
-    /// [`Arch`] does not list), else [`Arch::detect`]'s. Any other file is
-    /// refused by name — this server serves four generative seats; a file of
-    /// a decision row's backbone (`qwen35`, Clef's) here has no head, and its
-    /// refusal ([`serve::decide::no_head`]) says what would seat it. A
-    /// qwen35moe file (Qwen3.6) is the qwen3 seat's: the qwen38 seat's body is
-    /// qwen4exp's, whose plan refuses its geometry by name before the server
-    /// listens.
+    /// Every seat's word, in [`USAGE`]'s order, as the refusal of a file no
+    /// seat serves lists them.
+    fn seat_words() -> String {
+        Model::ALL
+            .iter()
+            .map(|m| m.word())
+            .chain([serve::decide::WORD])
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The seat the model file's ([`ref_model_path`]) first shard holds, with
+    /// its `general.architecture` string: the one generative seat that serves
+    /// the architecture ([`Model::serves`]; the string itself, not an `Arch`
+    /// variant, because `qwen4exp` is no `Arch` name). A file of a decision
+    /// row's backbone (`qwen35`, Clef's) here has no head: its refusal
+    /// ([`serve::decide::no_head`]) says what would seat it. Any other
+    /// architecture, and a shard that names none, is refused by name listing
+    /// the seat words. A qwen35moe file (Qwen3.6) is the qwen3 seat's.
     fn seat_of_file() -> Result<(Model, String), GateError> {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let arch = split.architecture().map(str::to_owned);
-        let seat = match arch.as_deref() {
-            Some("qwen4exp") => Model::Qwen38,
+        let (seat, arch) = match split.architecture() {
             Some(a) if decide::ROWS.iter().any(|r| r.backbones.contains(&a)) => {
                 return Err(format!(
                     "{}: {}",
@@ -224,30 +257,30 @@ mod drive {
                 )
                 .into());
             }
-            _ => {
-                let first = split
-                    .shard(0)
-                    .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
-                match Arch::detect(first) {
-                    Ok(Arch::Deepseek41) => Model::Ds41,
-                    Ok(Arch::Glm5next) => Model::Glm,
-                    Ok(Arch::Qwen3moe | Arch::Qwen35moe) => Model::Qwen3,
-                    Ok(other) => {
-                        return Err(format!(
-                            "{} is a {} file; {NAME} serves deepseek41, {DEEPSEEK4}, qwen4exp, \
-                             glm5next, qwen3moe and qwen35moe files",
+            Some(a) => (
+                Model::ALL
+                    .iter()
+                    .copied()
+                    .find(|m| m.serves(a))
+                    .ok_or_else(|| {
+                        format!(
+                            "{} is a {a} file, which no seat serves; the seats are --model {}",
                             path.display(),
-                            other.name()
+                            seat_words()
                         )
-                        .into());
-                    }
-                    Err(e) => {
-                        return Err(format!("{}: {e}", path.display()).into());
-                    }
-                }
+                    })?,
+                a.to_owned(),
+            ),
+            None => {
+                return Err(format!(
+                    "{}: the first shard names no architecture; the seats are --model {}",
+                    path.display(),
+                    seat_words()
+                )
+                .into());
             }
         };
-        Ok((seat, arch.unwrap_or_else(|| "<missing>".to_owned())))
+        Ok((seat, arch))
     }
 
     /// The `general.architecture` of the model file's first shard
@@ -292,10 +325,11 @@ mod drive {
             Ok(v) => v,
             Err(e) => return exit_with(NAME, Err(e)),
         };
-        if word.is_none() && args.iter().any(|a| a == "--help" || a == "-h") {
+        if word.is_none() && (args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h")) {
             // No seat chosen yet; the seat's own usage follows once one is.
-            return exit_with(NAME, Err(USAGE.into()));
+            return exit_with(NAME, Err(format!("{USAGE}\n{MODELS}").into()));
         }
+        eprintln!("{FIRST_START}");
         // The model file is named before any seat parses: `-m`, or a `--hf`
         // set fetched into the cache.
         let (flags, rest) = match model_file::take(&rest, PATH_FLAGS) {

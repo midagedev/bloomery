@@ -47,8 +47,10 @@
 //! whether the chat template writes it). Every cache event and every prefix
 //! the body keeps less of than a request shares is a record line.
 //!
-//! `--parallel N` (`-np N`, default 1) serves N slots that take the one body
-//! in turns (`serve::SwapEngine`): a request that arrives while another
+//! `--parallel N` (`-np N`, default 2) serves N slots that take the one body
+//! in turns (`serve::SwapEngine`); the default's second slot costs a lone
+//! request nothing, the turns acting only on a second arrival, and
+//! `--parallel 1` keeps the plain engine: a request that arrives while another
 //! decodes preempts it at the next step, the running request's sequence
 //! state parked in host RAM, and the live requests then take turns of
 //! `serve::QUANTUM` tokens. The parked states' budget is `--park-ram` (MiB),
@@ -188,7 +190,11 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: usize::try_from(workstation::CTX_MAX)?,
         alias: None,
         cache_ram: None,
-        parallel: 1,
+        // Two slots by default: a lone request pays nothing for the second
+        // (the turns act only on a second arrival), so a caller that sends
+        // one conversation at a time needs no flag. `--parallel 1` keeps the
+        // plain engine.
+        parallel: 2,
         queue_depth: None,
         park_ram: None,
     };

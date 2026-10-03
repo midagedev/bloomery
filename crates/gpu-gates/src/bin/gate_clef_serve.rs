@@ -282,7 +282,8 @@ mod gate {
             &[
                 "a qwen35 file with no head",
                 "--head",
-                "clef (head repo Cloudflare/clef-flash, backbone qwen35)",
+                "clef (head repo Cloudflare/clef-flash, backbone qwen35; --hf \
+                 bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M)",
             ],
         )?;
         check(&mut ok, "qwen35_with_no_head", pass);
