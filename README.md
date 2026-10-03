@@ -96,7 +96,9 @@ curl -s http://127.0.0.1:8080/v1/systemone -d '{"state": "User: what is the weat
 **Concurrent requests.** The ds41, glm and qwen3 seats take `--parallel N` (two by default; a lone request pays
 nothing for the second): requests take turns of 64 tokens on one model, a later arrival preempts at the next
 step, and both answer their solo runs' tokens exactly — V4.1 by snapshot/resume, GLM with its MTP draft
-rejoining, the qwen3 seats by re-prefill. The qwen38 and decide seats serve one request at a time.
+rejoining, the qwen3 seats by re-prefill. The qwen38 and decide seats serve one request at a time. The N slots
+share one context-sized cache in turns (llama-server gives each slot its own full `n_ctx`, N times the memory —
+a different resource reading of the same flag, not a defect).
 
 **Small cards.** Qwen3.6 and Qwen3-30B at `Q4_K_M` (19-21 GB) run whole on a 24 GB card, or on a 12-16 GB card
 with `--place a`: the routed experts go to the CPU. With no `--place` at all, a file that does not fit the
