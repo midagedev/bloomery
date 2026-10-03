@@ -36,7 +36,22 @@
 //!   extension clause — the turn resent with its reply and [`LATER`]'s user
 //!   turn — keeps every position the slot held (`cache_n == held`), its ids
 //!   printed only, for the rows the first run's steps wrote are not a fresh
-//!   prompt call's rows.
+//!   prompt call's rows;
+//! - on a qwen35moe file, whose seat keeps a prefix back to the checkpoints
+//!   a marked prompt call took (every 512 positions and its end), the
+//!   prefix clauses: the stripped clause — the turn of [`EDIT_A`] answered,
+//!   then resent with a reasoning-free reply ([`STRIPPED_35`]) in place of
+//!   the reply, so the shared prefix ends at the turn's prompt end — keeps
+//!   the checkpoint there (`cache_n == len(p1) - 1`) and its ids are the
+//!   same ids fed fresh (a re-fed call of at least [`GEMM_FROM`] rows is
+//!   the wide walk wherever it is cut); and the extension clause — the turn
+//!   resent with its reply and [`LATER`]'s user turn — keeps every position
+//!   the slot held (`cache_n == held`: the ask reaches the standing
+//!   position, which no cut takes back), its ids printed only.
+//!   FAIL-first mutants, each red on its line: a keep rule that grants the
+//!   common prefix instead of the checkpoint makes the session's cut refuse
+//!   by name and both clauses' requests fail; the cut's restore omitted
+//!   leaves the re-fed ids a fresh run's (the stripped clause's ids red).
 //!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
@@ -89,6 +104,15 @@ mod gate {
     /// The user turn the extension clause appends after the reply, as the
     /// template renders it past the reply's end.
     const LATER: &str = "<|im_end|>\n<|im_start|>user\nAnd which of the three does a screen show when it shows none of them?\n<|im_end|>\n";
+
+    /// The stripped clause's resend on a qwen35moe file (the module header):
+    /// a reasoning-free reply in place of the reply, then a later user turn
+    /// — the template's rendering of the reply with its reasoning dropped.
+    /// Its first id is a word of the answer, never the reply's first id.
+    const STRIPPED_35: &str = "Red, green and blue; a screen mixes them because each of its \
+                               pixels emits those three lights side by side.<|im_end|>\n\
+                               <|im_start|>user\nAnd which of the three does a screen show when \
+                               it shows none of them?<|im_end|>\n<|im_start|>assistant\n";
 
     /// The prompt ids a pass takes at most: the rendered turn must be
     /// longer, so the clause covers the ubatch walk.
@@ -283,6 +307,87 @@ mod gate {
         Ok(())
     }
 
+    /// The prefix clauses of the qwen35moe arm (the module header): the
+    /// stripped clause — the turn answered, then resent with a
+    /// reasoning-free reply in place of the reply, so the shared prefix
+    /// ends at the turn's prompt end — keeps the checkpoint there and
+    /// answers the ids of the same ids fed fresh; the extension clause —
+    /// the turn resent with its reply and [`LATER`]'s user turn — keeps
+    /// every position the slot held, its ids printed only.
+    fn prefix35(url: &dyn Fn(&str) -> String, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let p1 = rendered(url, json!([{ "role": "user", "content": EDIT_A }]))?;
+        let later = tokenized(url, LATER)?;
+        let stripped = tokenized(url, STRIPPED_35)?;
+        if stripped.len() < GEMM_FROM || later.len() < GEMM_FROM {
+            return Err(format!(
+                "the prefix clauses' resends hold {} and {} ids past the turn; each needs at \
+                 least {GEMM_FROM}",
+                stripped.len(),
+                later.len()
+            )
+            .into());
+        }
+        // The stripped clause: the turn answered fresh, resent with the
+        // reasoning-free reply, and the same ids fed fresh.
+        let (held_run, _) = greedy(url, p1.clone(), dir, "strip35_first", false)?;
+        if held_run.tokens.is_empty() || stripped.first() == held_run.tokens.first() {
+            return Err(format!(
+                "the reply's first id {:?} is the stripped reply's {:?}: the shared prefix \
+                 would not end at the turn",
+                held_run.tokens.first(),
+                stripped.first()
+            )
+            .into());
+        }
+        let mut strip = p1.clone();
+        strip.extend_from_slice(&stripped);
+        let (resend, _) = greedy(url, strip.clone(), dir, "strip35", true)?;
+        let (fresh, _) = greedy(url, strip, dir, "strip35_fresh", false)?;
+        let turn_end = p1.len() as u64 - 1;
+        println!(
+            "strip35: the turn ends at {turn_end}; the resend kept {} and answered {:?}; the \
+             fresh run's {:?}",
+            resend.cache_n, resend.tokens, fresh.tokens
+        );
+        check(
+            ok,
+            "qwen35_stripped_resend_keeps_the_turns_end",
+            held_run.cache_n == 0 && resend.cache_n == turn_end,
+        );
+        check(
+            ok,
+            "qwen35_stripped_resend_ids_are_a_fresh_runs",
+            !resend.tokens.is_empty() && resend.tokens == fresh.tokens && fresh.cache_n == 0,
+        );
+
+        // The extension clause: the turn resent with its reply and a later
+        // user turn. The stripped clause's runs left the slot holding the
+        // stripped conversation, so the fresh turn runs again first — the
+        // slot back at the reply's end, its prompt call's end mark standing.
+        let (held_again, _) = greedy(url, p1.clone(), dir, "extend35_first", false)?;
+        if held_again.tokens != held_run.tokens {
+            return Err(
+                "the extension's fresh turn answered ids the first one did not: the clause                  cannot hold a shared prefix"
+                    .into(),
+            );
+        }
+        let held = (held_again.prompt.len() + held_again.tokens.len()).saturating_sub(1) as u64;
+        let mut extend = held_again.prompt.clone();
+        extend.extend_from_slice(&held_again.tokens);
+        extend.extend_from_slice(&later);
+        let (resend, _) = greedy(url, extend, dir, "extend35", true)?;
+        println!(
+            "extension35: the slot held {held}; the resend kept {} and answered {:?}",
+            resend.cache_n, resend.tokens
+        );
+        check(
+            ok,
+            "qwen35_extension_keeps_every_held_position",
+            resend.cache_n == held && !resend.tokens.is_empty(),
+        );
+        Ok(())
+    }
+
     /// The server's clauses for `model`, its logs in `dir`; the answers the
     /// CLI is held to, the chat turn's first.
     fn served(model: &Path, dir: &Path, ok: &mut bool) -> Result<Vec<Answer>, GateError> {
@@ -375,6 +480,9 @@ mod gate {
         );
         if arch == "qwen3moe" {
             prefix(&url, dir, ok)?;
+        }
+        if arch == "qwen35moe" {
+            prefix35(&url, dir, ok)?;
         }
         println!("server stopped: {}", s.stop()?);
         Ok(vec![chat_ids, prose_ids])

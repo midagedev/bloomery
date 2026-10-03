@@ -15,12 +15,11 @@
 //! its levers' options, qwen35moe through `Qwen35moeModel::open` with the
 //! tensor-core decode flash and the levers' ubatch — in graph mode with the
 //! step and every pass captured, so a request's ids are the CLI's: the
-//! server feeds the prompt less its last id as one prompt call — a qwen3moe
-//! file by the seat's schedule (the GEMM walk from nine rows on, passes
-//! below), a qwen35moe file by `auto` (passes up to eight ids, ubatches
-//! past that) — then steps the last, which `generate_qwen3moe --last-step`
-//! does too. Its
-//! first shard gives the vocabulary, `tokenizer.chat_template` the chat
+//! server feeds the prompt less its last id as one prompt call — both bodies
+//! by the seat's schedule (the ubatch walk from nine rows on — qwen3moe's
+//! GEMM, qwen35moe's wide, no unit under the gemv arm's cut — passes below)
+//! — then steps the last, which `generate_qwen3moe --last-step` does too.
+//! Its first shard gives the vocabulary, `tokenizer.chat_template` the chat
 //! template and `general.name` the alias. Two slots by default
 //! (`--parallel`), one only at `--parallel 1`; sampling is the sampler
 //! crate's chain with no repetition penalty, `temperature <= 0` the
@@ -36,18 +35,18 @@
 //! other runs the step graph through the host tier and every prompt as
 //! eager passes of up to eight ids, no pass captured.
 //!
-//! A qwen3moe request keeps the longest prefix it shares with what the slot
-//! holds: the session over the model answers the server's keep queries and
-//! cuts (`app::Keep for Body` — every held position, the caches being
-//! per-position), so the resend of a conversation keeps everything up to
+//! A request keeps the longest prefix it shares with what the slot holds:
+//! the session over the model answers the server's keep queries and cuts
+//! (`app::Keep` — a qwen3moe file's [`Body`] grants every held position,
+//! the caches being per-position; a qwen35moe file's [`Body35`] grants the
+//! nearest checkpoint a marked prompt call took at or below the ask, every
+//! 512 positions and each call's end, and its prompt calls take those
+//! checkpoints), so the resend of a conversation keeps everything up to
 //! where it diverges and a request that extends the held sequence keeps all
-//! of it. The prompt call runs the GEMM ubatch walk from
+//! of it. The prompt call runs the ubatch walk from
 //! `app::arch::qwen3moe::GEMM_FROM` rows on and passes below, so the rows a
-//! kept prefix leaves behind are a whole fresh run's. A qwen35moe file's
-//! body holds no rollback — its recurrent state has no checkpoint to cut to
-//! — so every request prefills from a reset, and a request that shares a
-//! prefix with the last is a `cache reuse` note of why it kept none. The
-//! seat runs no prompt cache: a save and a resume are refused by name. The
+//! kept prefix leaves behind are a whole fresh run's. The seat runs no
+//! prompt cache: a save and a resume are refused by name. The
 //! `load` record (architecture, resident bytes, context, layers, ubatch,
 //! the step graph's nodes, the load's wall) then the `listening` record go
 //! to stderr (`record::BLOOMERY_SERVE_QWEN3`). An engine error ends the
@@ -83,7 +82,7 @@ use q3place::PlaceQ3;
 use bloomery_gpu::Gpu;
 use bloomery_gpu::Qwen3moeModel;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-use bloomery_gpu::arch::qwen3moe::{Body, Body35, Open35, PrefillPath, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Body, Body35, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{ChainBody, GpuModel, StepMode};
 use bloomery_gpu_gates::bind::{Seat, SeatEngine, Vocab, sampler_factory};
 use bloomery_gpu_gates::generate::Place;
@@ -108,10 +107,6 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
 
 /// The context unless `--ctx` says: `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
-
-/// Why a qwen35moe body keeps no prefix of the last request.
-const NO_KEEP35: &str = "the qwen35moe body holds no rollback: its recurrent state has no \
-                         checkpoint to cut to, so every request prefills from a reset";
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the qwen3 seat runs no prompt cache";
@@ -297,13 +292,20 @@ impl Body3 for Body35 {
             mma: true,
             ubatch: ubatch_size()?,
         };
-        let Some((p, levers)) = place else {
-            return Ok(Qwen35moeModel::open(Gpu::new()?, file, o)?);
+        let mut m = match place {
+            None => Qwen35moeModel::open(Gpu::new()?, file, o)?,
+            Some((p, levers)) => {
+                let q = PlaceQ3::qwen35(&file, p, o)?;
+                let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
+                q.record(&plan).eprint();
+                q3place::open_qwen35(file, &plan, o, levers.host())?
+            }
         };
-        let q = PlaceQ3::qwen35(&file, p, o)?;
-        let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
-        q.record(&plan).eprint();
-        q3place::open_qwen35(file, &plan, o, levers.host())
+        // The seat keeps prefixes, so its prompt calls take the checkpoints
+        // of their marks.
+        let (_, _, body) = m.body_parts(NAME)?;
+        body.set_checkpoints(true);
+        Ok(m)
     }
 
     fn placed(m: &Qwen35moeModel) -> Result<bool, GateError> {
@@ -325,23 +327,40 @@ impl Body3 for Body35 {
         Ok(m.ubatch()?)
     }
 
+    /// The session's own schedule (`app::Prompt for Body35`): the wide
+    /// ubatch walk from [`GEMM_FROM`] rows on, passes below.
     fn prompt(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<u32, GateError> {
-        Ok(m.prefill_with(ids, PrefillPath::Auto)?)
+        Ok(<Body35 as app::Prompt>::prompt(m, ids)?)
     }
 
-    /// Nothing: the body holds no rollback ([`NO_KEEP35`]).
-    fn keep(_s: &app::Session<Body35>, n: usize) -> (usize, Option<String>) {
-        (0, (n > 0).then(|| NO_KEEP35.to_owned()))
+    /// The checkpoints' rule (`app::Keep for Body35`), the session's answer:
+    /// every held position, the nearest checkpoint at or below, or nothing
+    /// with the rule's sentence.
+    fn keep(s: &app::Session<Body35>, n: usize) -> (usize, Option<String>) {
+        let pos = s.pos() as usize;
+        let k = s.kept(u32::try_from(n).unwrap_or(u32::MAX));
+        let at = k.at as usize;
+        (at, (at < n.min(pos)).then(|| k.to_string()))
     }
 
-    /// Never asked ([`Body3::keep`] grants nothing); refused by name.
-    fn rollback(_s: &mut app::Session<Body35>, pos: u32) -> Result<(), GateError> {
-        Err(format!("a rollback to position {pos}: {NO_KEEP35}").into())
+    /// The session's cut, which takes only a position the rule granted.
+    fn rollback(s: &mut app::Session<Body35>, pos: u32) -> Result<(), GateError> {
+        Ok(s.cut(pos)?)
     }
 
-    /// The body cuts nowhere: its prompt bits do not survive a cut.
-    fn splits(_first: usize, _end: usize, _marks: &[usize]) -> Vec<usize> {
-        Vec::new()
+    /// The marks inside the call where both runs hold at least
+    /// [`GEMM_FROM`] ids, so each run is the wide walk whose bits are the
+    /// uncut call's.
+    fn splits(first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
+        let mut at = Vec::new();
+        let mut last = first;
+        for &u in marks {
+            if u >= last + GEMM_FROM && u + GEMM_FROM <= end {
+                at.push(u);
+                last = u;
+            }
+        }
+        at
     }
 }
 

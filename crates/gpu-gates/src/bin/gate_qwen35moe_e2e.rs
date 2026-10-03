@@ -72,6 +72,23 @@
 //!   token, the last logits and every store of the one-ubatch run bit for
 //!   bit. Every unit of these runs is wide: a unit of at most `GEMV_COLS`
 //!   rows is the gemv arm, a band away.
+//! - (k) checkpoints, on a second load at [`KCTX`] (the marks' positions
+//!   need the room [`CTX`] does not hold) with the marks armed and an lcg
+//!   prompt of [`KP`] ids on the seat's schedule
+//!   (`PrefillPath::Wide`): a prompt call takes its checkpoints at 512,
+//!   1024, …, 4096 and [`KP`], and one checkpoint's bytes and slots are
+//!   their derivation (each delta layer's state of `N_V · HEAD_V²` f32 and
+//!   conv ring of `RING_ROWS · C`, the host budget's share); a cut to an
+//!   ask between 4096 and [`KP`] keeps 4096, one below 4096 keeps 3584,
+//!   one below 512 keeps nothing (`no-checkpoint`), each with its code, and
+//!   a cut to a non-checkpoint is refused by name; a cut to 4096 and the
+//!   re-fed 104 ids leave the token, the last logits and every store bit
+//!   for bit the uncut call's (the call takes its points back, 4096 held);
+//!   a reset drops every point. FAIL-first mutants, each red on its line:
+//!   the restore omitted (the cut a Stay: the re-feed runs from the fed
+//!   state, the stores and logits red); `kept` answering the ask instead of
+//!   the checkpoint (the neighbours red, and the refused cut not refused);
+//!   `reset` keeping the checkpoints (the dropped-points line red).
 //! - (r) refusals: a ubatch size of 0 or past `UBATCH` is refused by name
 //!   with the size and the resident bytes kept; a prompt past the cache is
 //!   refused by name before any launch, the position kept.
@@ -1681,6 +1698,137 @@ mod gate {
         Ok(ok)
     }
 
+    // ---------------------------------------------- (k) the checkpoints
+
+    /// (k)'s prompt: past the eighth inner mark (4096) with a run left
+    /// after it, and short of a whole ninth window.
+    const KP: usize = 4200;
+
+    /// (k)'s cache: the prompt, and the marks' positions, with room.
+    const KCTX: usize = 4352;
+
+    /// `n` ids of an lcg over the vocabulary: every id a row of the
+    /// embedding, the routing spread over the experts.
+    fn lcg_ids(n: usize, vocab: usize) -> Vec<u32> {
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((x >> 33) % vocab as u64) as u32
+            })
+            .collect()
+    }
+
+    /// (k) (module doc): the checkpoints of a marked prompt call, the keep
+    /// rule around them, the refused non-checkpoint cut, and the re-feed
+    /// after a cut bit for bit. The model is dropped before the clause
+    /// returns.
+    fn checkpoints() -> Result<bool, GateError> {
+        let mut m = open(KCTX)?;
+        {
+            let (_, _, body) = m.body_parts("gate_qwen35moe_e2e")?;
+            body.set_checkpoints(true);
+        }
+        let vocab = m.body("gate_qwen35moe_e2e")?.vocab();
+        let ids = lcg_ids(KP, vocab);
+        let mut ok = true;
+
+        // One checkpoint's bytes and slots against their derivation: each
+        // delta layer's state (N_V heads of HEAD_V x HEAD_V f32) and conv
+        // ring (RING_ROWS rows of C), and the host budget's share of them.
+        let c = m.body("gate_qwen35moe_e2e")?.checkpoints();
+        let want_bytes = N_DELTA * (N_V * HEAD_V * HEAD_V + RING_ROWS * C) * 4;
+        let points_ok = c.bytes() == want_bytes as u64 && c.capacity() >= 9;
+        println!(
+            "checkpoints: one copy {} bytes (want {want_bytes}, derived: a delta layer's state \
+             {} f32 and ring {} f32), {} slots of one copy the host budget holds {}",
+            c.bytes(),
+            N_V * HEAD_V * HEAD_V,
+            RING_ROWS * C,
+            c.capacity(),
+            verdict(points_ok)
+        );
+        ok &= points_ok;
+
+        // The fresh call: its marks, and what a cut keeps around them.
+        fresh(&mut m)?;
+        let plan = m.prefill_plan(KP, PrefillPath::Wide)?;
+        let tok0 = m.prefill_with(&ids, PrefillPath::Wide)?;
+        let (logits0, stores0) = (m.logits()?, stores(&mut m)?);
+        let want_pts: Vec<u32> = (1..=8).map(|k| 512 * k as u32).chain([KP as u32]).collect();
+        let pts = m.body("gate_qwen35moe_e2e")?.checkpoints().positions();
+        let (k_above, k_below, k_low, k_here) = (
+            m.body("gate_qwen35moe_e2e")?.kept(4150, KP as u32),
+            m.body("gate_qwen35moe_e2e")?.kept(4095, KP as u32),
+            m.body("gate_qwen35moe_e2e")?.kept(100, KP as u32),
+            m.body("gate_qwen35moe_e2e")?.kept(KP as u32, KP as u32),
+        );
+        let marks_ok = pts == want_pts
+            && (k_above.at, k_above.why.code()) == (4096, "checkpoint")
+            && (k_below.at, k_below.why.code()) == (3584, "checkpoint")
+            && (k_low.at, k_low.why.code()) == (0, "no-checkpoint")
+            && (k_here.at, k_here.why.code()) == (KP as u32, "current")
+            && plan.ubatch_tokens() == KP;
+        println!(
+            "checkpoints: a prompt of {KP} ids (plan {plan}) took its points at {pts:?} (want \
+             {want_pts:?}); kept(4150) = {k_above}; kept(4095) = {k_below}; kept(100) = {k_low}; \
+             kept({KP}) = {k_here} {}",
+            verdict(marks_ok)
+        );
+        ok &= marks_ok;
+
+        // A cut to a non-checkpoint is refused by name, the points kept.
+        let refused = match m.rollback(4150) {
+            Err(e) => e.to_string(),
+            Ok(()) => "accepted".to_owned(),
+        };
+        let cut_ok = refused.contains("no checkpoint restores it")
+            && m.body("gate_qwen35moe_e2e")?.checkpoints().positions() == want_pts;
+        println!(
+            "checkpoints: a cut to 4150: {refused}; the points stand {} ",
+            verdict(cut_ok)
+        );
+        ok &= cut_ok;
+
+        // The cut and the re-fed tail: the same bits the uncut call left.
+        m.rollback(4096)?;
+        let tail = &ids[4096..];
+        let tok = m.prefill_with(tail, PrefillPath::Wide)?;
+        let (logits, st) = (m.logits()?, stores(&mut m)?);
+        let differ: Vec<usize> = (0..st.len())
+            .filter(|&l| !stores0.get(l).is_some_and(|w| same_store(&st[l], w)))
+            .collect();
+        let same_logits = bits_equal(&logits, &logits0);
+        let refed_ok = tok == tok0
+            && same_logits
+            && differ.is_empty()
+            && st.len() == stores0.len()
+            && m.body("gate_qwen35moe_e2e")?.checkpoints().positions() == want_pts;
+        println!(
+            "checkpoints: cut to 4096 and {} ids re-fed: token {tok} vs {tok0}, last logits \
+             bit-identical={same_logits}, every store bit-identical (layers differing {differ:?}), \
+             the points back at {want_pts:?} {}",
+            tail.len(),
+            verdict(refed_ok)
+        );
+        ok &= refed_ok;
+
+        // A reset drops every point.
+        fresh(&mut m)?;
+        let dropped = m
+            .body("gate_qwen35moe_e2e")?
+            .checkpoints()
+            .positions()
+            .is_empty();
+        println!(
+            "checkpoints: a reset drops every point {}",
+            verdict(dropped)
+        );
+        Ok(ok && dropped)
+    }
+
     // ---------------------------------------------------- (r) refusals
 
     fn refusals(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
@@ -1864,6 +2012,7 @@ mod gate {
         ok &= ubatch_bits(&mut m)?;
         ok &= refusals(&mut m)?;
         drop(m);
+        ok &= checkpoints()?;
         ok &= placed(&man, &toks, host)?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
         if !ok {

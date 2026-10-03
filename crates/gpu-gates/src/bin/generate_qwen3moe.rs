@@ -528,11 +528,14 @@ mod cli {
     }
 
     /// A Qwen3.6 prompt's plan by `path`: `pass` the captured passes,
-    /// `auto` and `gemm` the prompt call's.
+    /// `auto` and `gemm` the prompt call's (the seat's `wide` with them, a
+    /// caller that names it).
     fn plan35(m: &Qwen35moeModel, n: usize, path: PrefillPath) -> Result<PrefillPlan, GateError> {
         match path {
-            PrefillPath::Pass => Ok(PrefillPlan::new(n, path, NonZeroUsize::MIN)),
-            PrefillPath::Auto | PrefillPath::Gemm => Ok(m.prefill_plan(n, path)?),
+            PrefillPath::Pass => Ok(PrefillPlan::new(n, path, NonZeroUsize::MIN)?),
+            PrefillPath::Auto | PrefillPath::Gemm | PrefillPath::Wide => {
+                Ok(m.prefill_plan(n, path)?)
+            }
         }
     }
 
@@ -656,7 +659,7 @@ mod cli {
                     ubatch_tokens: 0,
                 },
                 Prompt38::Pass => {
-                    let plan = PrefillPlan::new(n, PrefillPath::Pass, NonZeroUsize::MIN);
+                    let plan = PrefillPlan::new(n, PrefillPath::Pass, NonZeroUsize::MIN)?;
                     Units {
                         kind: path.name(),
                         ..Units::from(&plan)

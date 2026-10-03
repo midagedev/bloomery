@@ -7,7 +7,10 @@
 //!
 //! The plain attention body of a qwen3moe file ([`Body`]) sits behind the
 //! same traits: its prompt schedule ([`GEMM_FROM`]) and its keep rule (every
-//! held position — the caches are per-position).
+//! held position — the caches are per-position). So does the Qwen3.6 body
+//! of a qwen35moe file ([`Body35`]): the same schedule's wide half
+//! (`PrefillPath::Wide`) and the checkpoints' keep rule — the nearest
+//! checkpoint a marked prompt call took at or below the cut.
 //!
 //! The MTP layer's row at position `q` reads the token at `q` and the
 //! target's hidden row at `q − 1` (ik's pairing, the `mtp-qwen4exp` set's
@@ -16,7 +19,9 @@
 use bloomery_gpu::GpuError;
 use bloomery_gpu::Qwen3moeModel;
 use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
-use bloomery_gpu::arch::qwen3moe::{Body, Body38, PrefillPath, Prompt38, Qwen38Model, TargetRows};
+use bloomery_gpu::arch::qwen3moe::{
+    Body, Body35, Body38, PrefillPath, Prompt38, Qwen35moeModel, Qwen38Model, TargetRows,
+};
 use bloomery_gpu::model::StepMode;
 use runtime::seqstate::Kept;
 use runtime::{Speculative, Tapped};
@@ -73,13 +78,15 @@ impl Keep for Body38 {
     }
 }
 
-/// The fewest rows a qwen3moe prompt call runs as the GEMM ubatch walk: one
-/// past a pass. A call this long and longer writes each row the bits the
-/// walk writes wherever the call is cut (a token's values do not depend on
-/// the ubatch it lands in), and a shorter call runs passes, bit-equal to one
-/// step a row — so a request that keeps a prefix of what the model holds
-/// leaves a call whose rows are a whole fresh run's as long as it holds at
-/// least this many ids.
+/// The fewest rows a qwen3moe prompt call runs as the ubatch walk: one past
+/// a pass. A call this long and longer writes each row the bits the walk
+/// writes wherever the call is cut — `Body`'s GEMM because a token's values
+/// do not depend on the ubatch it lands in, `Body35`'s
+/// [`Wide`](PrefillPath::Wide) because it runs no unit small enough to fall
+/// to the gemv arm — and a shorter call runs passes, bit-equal to one step
+/// a row. So a request that keeps a prefix of what the model holds leaves a
+/// call whose rows are a whole fresh run's as long as it holds at least
+/// this many ids.
 pub const GEMM_FROM: usize = MAX_TOKENS + 1;
 
 impl Prompt for Body {
@@ -108,6 +115,49 @@ impl Keep for Body {
     /// ([`Rollback`](bloomery_gpu::model::Rollback)), which the caches take
     /// as given.
     fn cut(m: &mut Qwen3moeModel, n: u32) -> Result<(), GpuError> {
+        match n {
+            0 => m.reset(),
+            n => m.rollback(n),
+        }
+    }
+}
+
+impl Prompt for Body35 {
+    /// The wide ubatch walk from [`GEMM_FROM`] rows on — a call this long
+    /// and longer runs no unit under the gemv arm's cut, so its rows are
+    /// the same bits wherever the call is cut — and passes below, bit-equal
+    /// to one step a row. The model takes the checkpoints of the call's
+    /// marks only while a caller armed them
+    /// ([`Body35::set_checkpoints`](bloomery_gpu::arch::qwen3moe::Body35)).
+    fn prompt(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<u32, GpuError> {
+        let path = if ids.len() >= GEMM_FROM {
+            PrefillPath::Wide
+        } else {
+            PrefillPath::Pass
+        };
+        m.prefill_with(ids, path)
+    }
+}
+
+impl Keep for Body35 {
+    /// [`Body35::kept`]'s position: every position, the empty model, or the
+    /// nearest checkpoint a marked prompt call took at or below `n`.
+    fn keepable(m: &Qwen35moeModel, n: u32) -> u32 {
+        <Body35 as Keep>::kept(m, n).at
+    }
+
+    /// [`Body35::kept`]: what a cut keeps and why — a checkpoint's
+    /// position, or nothing with the reason a delta layer holds no earlier
+    /// state but a copy.
+    fn kept(m: &Qwen35moeModel, n: u32) -> Kept {
+        m.body(WHAT)
+            .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
+    }
+
+    /// Back to empty at 0 — a reset; else the model's rollback
+    /// ([`Rollback`](bloomery_gpu::model::Rollback)): the checkpoint at
+    /// `n`, any other position refused by name.
+    fn cut(m: &mut Qwen35moeModel, n: u32) -> Result<(), GpuError> {
         match n {
             0 => m.reset(),
             n => m.rollback(n),

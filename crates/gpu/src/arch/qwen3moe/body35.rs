@@ -32,6 +32,15 @@
 //! in its last row's head ([`Tail::Last`]). The hidden-state call
 //! ([`GpuModel::prefill_hidden`]) walks the same units and ends each in the
 //! final norm of its rows ([`Tail::Hidden`]).
+//!
+//! A delta layer's state is written in place, so a cut behind the fed
+//! positions finds it only in a copy taken at the cut's position: a load
+//! that takes checkpoints ([`Body35::set_checkpoints`]) walks a prompt as
+//! the runs between its marks ([`Body35::marked`]), a checkpoint of every
+//! delta layer's state and conv ring copied to a pinned host slot at each,
+//! and a cut to one of them plans the copy back for the next call
+//! ([`Body35::cut`], [`Rollback`]). The K/V planes are cut by position, as
+//! [`Body`]'s are.
 
 use super::body::{Kernels, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
@@ -42,7 +51,7 @@ use super::plan::{
     DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, Kind35, LayerPlan, MixerPlan,
     SharedPlan, SiteTy, kinds35, moe_fits, q35,
 };
-use super::prefill::{PrefillPath, PrefillPlan, PrefillStep};
+use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
 use super::scratch::{
     Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, LayerStore, RecStore, RopeRows,
@@ -50,12 +59,13 @@ use super::scratch::{
 };
 use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
+use crate::checkpoint::Checkpoints;
 use crate::flash_gqa::HEAD_256;
 use crate::head::Head;
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
-use crate::model::{ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rows, block_count};
+use crate::model::{ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, block_count};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
 use crate::tensor::window;
@@ -68,12 +78,23 @@ use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec};
 use model::placement::Plan;
+use runtime::seqstate::{HOST_BUDGET, Kept};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 
 const WHAT: &str = "qwen35moe::Body35::load";
+
+/// The spacing of a prompt call's inner checkpoints (`runtime::seqstate`'s
+/// marks), when the load takes them ([`Body35::set_checkpoints`]): GLM's
+/// spacing, whose cost balance a Qwen3.6 copy — a delta layer's state and
+/// conv ring, smaller than GLM's KDA state beside its ring — sits under at
+/// the same window. A denser spacing halves the rows a cut at most re-feeds
+/// but takes a copy of every store inside each smaller window of the
+/// prompt's own walk; a sparser one trades the copies away for rows every
+/// cut repeats.
+const CHECKPOINT_EVERY: u32 = 512;
 
 /// Card bytes a load leaves free past the ubatch arena: what the load and
 /// the first prompt still allocate after it — the output head and the
@@ -348,11 +369,35 @@ pub struct Body35 {
     /// A placed load's placed side ([`Placed`]): the host tier and what the
     /// walks over its legs read; `None` on a whole-card load.
     pub(super) placed: Option<Placed>,
+    /// Positions the recurrent stores hold: a call's end once its launches
+    /// are enqueued (the step, a pass, a prompt unit). The next position is
+    /// the model's (`GpuModel::pos`); the two differ only after a call
+    /// failed past its launch, and a call at the model's position is then
+    /// refused ([`Body35::stores_at`]).
+    held: u32,
+    /// The delta layers' stores on the host at chosen positions: the points
+    /// a cut behind the fed positions restores. A prompt call takes them
+    /// only while `marks` is on.
+    ckpt: Checkpoints,
+    marks: bool,
 }
 
 /// `name` of layer `l`.
 fn blk(l: usize, stem: &str) -> String {
     format!("blk.{l}.{stem}")
+}
+
+/// The delta layers' stores a checkpoint copies, in [`Checkpoints::new`]'s
+/// order: each one's state, then its conv ring.
+fn copied(stores: &mut [LayerStore]) -> Vec<&mut DeviceBuffer<f32>> {
+    let mut out = Vec::new();
+    for s in stores {
+        if let LayerStore::Rec(r) = s {
+            out.push(&mut r.state);
+            out.push(&mut r.ring);
+        }
+    }
+    out
 }
 
 /// The joined name of layer `l`'s stack `part` (`gate`, `up`, `down`).
@@ -1059,6 +1104,17 @@ impl Body35 {
         let forms = Forms::of(&plans, &d);
         let rope = RopeTable::new(&RopeSpec::window(base, q35::ROPE_DIMS as usize))?;
         let rope = RopeRows::new(stream, &rope, q35::ROPE_DIMS as usize, ctx)?;
+        // The stores a checkpoint copies, always in this order: each delta
+        // layer's state, then its conv ring.
+        let lens: Vec<usize> = stores
+            .iter()
+            .filter_map(|s| match s {
+                LayerStore::Rec(r) => Some([r.state.len(), r.ring.len()]),
+                LayerStore::Kv(_) => None,
+            })
+            .flatten()
+            .collect();
+        let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?;
         let s = Arena::with(stream, d, 1, forms)?;
         let sp = StepParams::new(stream, true)?;
         let a = Arena::with(stream, d, MAX_PASS_ROWS, forms)?;
@@ -1095,6 +1151,9 @@ impl Body35 {
             mma: o.mma,
             taps: None,
             placed,
+            held: 0,
+            ckpt,
+            marks: false,
         })
     }
 
@@ -1138,6 +1197,145 @@ impl Body35 {
     #[must_use]
     pub fn store_bytes(&self) -> usize {
         self.stores.iter().map(LayerStore::bytes).sum()
+    }
+
+    /// What a cut to at most `n` positions of a model standing at `pos`
+    /// keeps, and why: every position, the empty model at 0, or the nearest
+    /// checkpoint at or below `n`, nothing (`Missed`) when none lies there —
+    /// a delta layer keeps no earlier state but a copy. After a call failed
+    /// past its launch the stores hold more than `pos`, which is no longer
+    /// kept. Never past `pos`. The rule [`Body35::cut`] takes.
+    #[must_use]
+    pub fn kept(&self, n: u32, pos: u32) -> Kept {
+        if self.held == pos {
+            self.ckpt.kept(n, pos)
+        } else {
+            self.ckpt.kept(n.min(pos), self.held)
+        }
+    }
+
+    /// The checkpoints: their positions, their slots, what they have done.
+    #[must_use]
+    pub fn checkpoints(&self) -> &Checkpoints {
+        &self.ckpt
+    }
+
+    /// Whether a prompt call takes checkpoints at its marks ([`Body35::marked`]):
+    /// off at load, so a binary that never cuts behind the fed positions
+    /// copies nothing; the serve seat turns it on. Off drops none taken.
+    pub fn set_checkpoints(&mut self, on: bool) {
+        self.marks = on;
+    }
+
+    /// Whether a prompt call takes checkpoints ([`Body35::set_checkpoints`]).
+    #[must_use]
+    pub fn takes_checkpoints(&self) -> bool {
+        self.marks
+    }
+
+    /// The marks a prompt call from `from` to `to` takes a checkpoint at:
+    /// [`Checkpoints::marks`] less every inner mark whose neighbouring run
+    /// would hold fewer than [`WIDE_FROM`] rows — a run that short runs the
+    /// gemv arm, whose bits are not a longer run's, so the rows a kept
+    /// prefix leaves behind would not be a whole fresh call's; the mark's
+    /// position keeps no checkpoint, and a cut there keeps the mark below
+    /// it. The call's own ends always stand.
+    fn marked(&self, from: u32, to: u32) -> Vec<u32> {
+        let min = WIDE_FROM as u32;
+        let mut out = Vec::new();
+        let mut last = from;
+        for m in self.ckpt.marks(from, to) {
+            let inner = m != from && m != to;
+            if inner && (m - last < min || to - m < min) {
+                continue;
+            }
+            out.push(m);
+            last = m;
+        }
+        out
+    }
+
+    /// Refused by name unless the recurrent stores hold `pos` positions: a
+    /// call at `pos` that failed after its launches were enqueued has
+    /// already run the recurrence over it, and running it again would apply
+    /// the position twice.
+    fn stores_at(&self, pos: u32) -> Result<(), GpuError> {
+        const WHAT_S: &str = "qwen35moe::Body35::stores";
+        match self.held {
+            h if h == pos => Ok(()),
+            h => Err(GpuError::shape(
+                WHAT_S,
+                format!(
+                    "position {pos}, where the recurrent stores hold {h}{}: reset, or cut to a \
+                     checkpoint (Body35::kept)",
+                    if h == pos.wrapping_add(1) {
+                        " (the call there failed after its launches)"
+                    } else {
+                        ""
+                    }
+                ),
+            )),
+        }
+    }
+
+    /// The waiting cut carried out ([`Checkpoints::apply`]): every delta
+    /// layer's state and conv ring from the point's slot, or each zeroed.
+    /// Nothing when no cut waits. Waits for the copies; never inside a
+    /// capture (a cut has no stream of its own).
+    fn settle(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if !self.ckpt.pending() {
+            return Ok(());
+        }
+        let Body35 { ckpt, stores, .. } = self;
+        ckpt.apply(stream, &mut copied(stores))
+    }
+
+    /// The stores counted at the end of a call of `m` positions from `pos`,
+    /// after any waiting cut and a check that they stand at `pos`: what
+    /// follows launches, and a call that fails past its launch leaves them
+    /// ahead of the model's position, which the next call refuses by name.
+    fn stand_held(&mut self, stream: &CudaStream, pos: u32, m: usize) -> Result<(), GpuError> {
+        const WHAT_M: &str = "qwen35moe::Body35::stand_held";
+        self.settle(stream)?;
+        self.stores_at(pos)?;
+        self.held = pos
+            + u32::try_from(m).map_err(|_| {
+                GpuError::shape(WHAT_M, format!("a call of {m} positions past u32"))
+            })?;
+        Ok(())
+    }
+
+    /// A checkpoint at `pos`, where the stores stand, after any waiting cut:
+    /// the delta layers' stores copied to a host slot, or nothing where one
+    /// stands or at 0. Refused by name when the stores hold another
+    /// position. Waits for the copies.
+    fn take_mark(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
+        self.stores_at(pos)?;
+        self.settle(stream)?;
+        let Body35 { ckpt, stores, .. } = self;
+        ckpt.take(stream, pos, &mut copied(stores))?;
+        Ok(())
+    }
+
+    /// A cut to `pos`, behind the stores' position: the point at `pos`
+    /// planned for the next call ([`Body35::settle`]), every later point
+    /// dropped as another branch's. Refused by name, nothing moved, at 0 (a
+    /// reset), past what the stores hold, and where no point stands; the
+    /// model's position is the caller's ([`GpuModel::rollback`] stands it).
+    fn cut(&mut self, pos: u32) -> Result<(), GpuError> {
+        const WHAT_C: &str = "qwen35moe::Body35::cut";
+        if pos == 0 {
+            return Err(GpuError::shape(
+                WHAT_C,
+                format!(
+                    "back to position 0 from {}: the empty model is a reset",
+                    self.held
+                ),
+            ));
+        }
+        self.ckpt.cut(pos, self.held)?;
+        self.held = pos;
+        Ok(())
     }
 
     /// Keep a copy of every layer's output residual after each layer of the
@@ -1321,6 +1519,7 @@ impl Body35 {
             ));
         }
         let m = tokens.len();
+        self.stand_held(gpu.stream(), pos, m)?;
         let win = self.img.windows(tokens)?;
         let Body35 {
             eps,
@@ -1433,7 +1632,7 @@ impl GpuModel<Body35> {
             (true, _) => PrefillPath::Pass,
             (false, p) => p,
         };
-        Ok(PrefillPlan::new(tokens, path, body.ubatch))
+        PrefillPlan::new(tokens, path, body.ubatch)
     }
 
     /// The last prompt image the prompt call wrote; `None` before one.
@@ -1443,28 +1642,29 @@ impl GpuModel<Body35> {
 
     /// Feed `tokens` through the chain by the plan of `path` and return the
     /// greedy next token after the last one; positions continue from wherever
-    /// the model stands. The prompt's image — its first position, its ids
-    /// and the lane word — is written and copied once, then each unit of the
-    /// plan is one walk over the ubatch arena, eager in either step mode: a
-    /// unit of at most [`GEMV_COLS`] rows (a pass, or a ubatch that short)
-    /// leaves the cache rows, the recurrent state and the logits of one step
-    /// per token bit for bit, a longer one agrees with them to its band
-    /// (`wide`). The last unit's last row runs the head. The layer taps must
-    /// be off, and every id must be below the vocabulary; a prompt past the
-    /// cache is refused before any launch.
+    /// the model stands. While the load takes checkpoints
+    /// ([`Body35::set_checkpoints`]) the call runs as the runs between its
+    /// marks ([`Body35::marked`]), a checkpoint of the delta layers' stores
+    /// taken at each; else it is one run. The prompt's image — its first
+    /// position, its ids and the lane word — is written and copied once per
+    /// run, then each unit of the run's plan is one walk over the ubatch
+    /// arena, eager in either step mode: a unit of at most [`GEMV_COLS`]
+    /// rows (a pass, or a ubatch that short) leaves the cache rows, the
+    /// recurrent state and the logits of one step per token bit for bit, a
+    /// longer one agrees with them to its band (`wide`). The last unit's
+    /// last row runs the head. The layer taps must be off, and every id must
+    /// be below the vocabulary; a prompt past the cache is refused before any
+    /// launch.
     pub fn prefill_with(&mut self, tokens: &[u32], path: PrefillPath) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen35moe::prefill";
         if tokens.is_empty() {
             return Err(GpuError::shape(WHAT_P, "empty token slice"));
         }
         let pos0 = self.pos();
-        self.check_pos(
-            pos0 + launch_u32(WHAT_P, "tokens", tokens.len())? - 1,
-            WHAT_P,
-        )?;
-        let plan = self.prefill_plan(tokens.len(), path)?;
-        {
-            let (gpu, _, body) = self.body_parts(WHAT_P)?;
+        let n = launch_u32(WHAT_P, "tokens", tokens.len())?;
+        self.check_pos(pos0 + n - 1, WHAT_P)?;
+        let marked = {
+            let (_, _, body) = self.body_parts(WHAT_P)?;
             if body.taps.is_some() {
                 return Err(GpuError::state(
                     WHAT_P,
@@ -1472,7 +1672,40 @@ impl GpuModel<Body35> {
                 ));
             }
             super::refuse_past_vocab(WHAT_P, tokens, body.vocab)?;
-            body.img.write(gpu.stream(), tokens, pos0)?;
+            body.takes_checkpoints()
+        };
+        let marks = if marked {
+            self.body(WHAT_P)?.marked(pos0, pos0 + n)
+        } else {
+            vec![pos0 + n]
+        };
+        let (mut next, mut at) = (None, pos0);
+        for &mark in &marks {
+            if mark > at {
+                let run = &tokens[(at - pos0) as usize..(mark - pos0) as usize];
+                next = Some(self.feed35(run, path)?);
+                at = mark;
+            }
+            if marked {
+                let pos = self.pos();
+                let (gpu, _, body) = self.body_parts(WHAT_P)?;
+                body.take_mark(gpu.stream(), pos)?;
+            }
+        }
+        next.ok_or(GpuError::state(WHAT_P, "a token read after the last unit"))
+    }
+
+    /// One run of [`GpuModel::prefill_with`]'s call, from where the model
+    /// stands: the image written for the run's ids, then each unit of the
+    /// run's plan one walk, the last ending in its last row's head. The
+    /// argmax after the last id.
+    fn feed35(&mut self, run: &[u32], path: PrefillPath) -> Result<u32, GpuError> {
+        const WHAT_F: &str = "qwen35moe::prefill::run";
+        let plan = self.prefill_plan(run.len(), path)?;
+        {
+            let pos = self.pos();
+            let (gpu, _, body) = self.body_parts(WHAT_F)?;
+            body.img.write(gpu.stream(), run, pos)?;
         }
         let n_steps = plan.steps.len();
         let (mut at, mut next) = (0usize, None);
@@ -1483,7 +1716,7 @@ impl GpuModel<Body35> {
             let last = i + 1 == n_steps;
             let unit = at..at + t;
             at += t;
-            next = self.run_rows(t, WHAT_P, |gpu, w, body, head, pos| {
+            next = self.run_rows(t, WHAT_F, |gpu, w, body, head, pos| {
                 let end = if last {
                     UnitEnd::Head(head)
                 } else {
@@ -1493,7 +1726,7 @@ impl GpuModel<Body35> {
                 Ok(last)
             })?;
         }
-        next.ok_or(GpuError::state(WHAT_P, "a token read after the last unit"))
+        next.ok_or(GpuError::state(WHAT_F, "a token read after the last unit"))
     }
 
     /// Feed `tokens` through the chain by the plan of `path`, as
@@ -1573,9 +1806,15 @@ impl ChainBody for Body35 {
     }
 
     /// The step's input record — its position, its token and the lane word
-    /// — in one asynchronous copy ahead of the step's launches.
+    /// — in one asynchronous copy ahead of the step's launches, after any
+    /// waiting cut is carried out and the stores are checked to stand at
+    /// `pos`: the launches advance them to `pos + 1`, which a failure past
+    /// the enqueue leaves held for the next call to refuse.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput35) -> Result<(), GpuError> {
         let DecodeInput35 { token, pos } = *input;
+        self.settle(stream)?;
+        self.stores_at(pos)?;
+        self.held = pos + 1;
         self.sp.write(stream, token, pos)
     }
 
@@ -1583,10 +1822,11 @@ impl ChainBody for Body35 {
         enqueue_chain(gpu, w, self, head)
     }
 
-    /// Every delta layer's state lanes and conv ring back to zero, and the
-    /// records' lane word to [`LANE`]. The K/V planes need nothing: the
-    /// flash never loads a key row at or past the live count, and every row
-    /// below it is written by its own step first. Synchronizes.
+    /// Every delta layer's state lanes and conv ring back to zero, the
+    /// checkpoints dropped and the stores counted at 0, and the records'
+    /// lane word to [`LANE`]. The K/V planes need nothing: the flash never
+    /// loads a key row at or past the live count, and every row below it is
+    /// written by its own step first. Synchronizes.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         if let Some(p) = self.placed.as_mut() {
@@ -1607,6 +1847,8 @@ impl ChainBody for Body35 {
                 r.clear(stream, &zeros)?;
             }
         }
+        self.ckpt.clear();
+        self.held = 0;
         self.sp.write(stream, 0, 0)?;
         stream.synchronize()?;
         Ok(())
@@ -1639,6 +1881,16 @@ impl ChainBody for Body35 {
     }
 }
 
+impl Rollback for Body35 {
+    /// A cut to `pos` ([`Body35::cut`]): the checkpoint there planned for
+    /// the next call to carry out ([`Body35::settle`]), any other position
+    /// behind the stores refused by name. No device work, so the default
+    /// `rollback_on` serves.
+    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        self.cut(pos)
+    }
+}
+
 impl Rows for Body35 {
     const MAX_ROWS: usize = MAX_PASS_ROWS;
     /// No host tier serves a Qwen3.6 replay; the pass is the chain's
@@ -1646,6 +1898,7 @@ impl Rows for Body35 {
     const CHAIN: Chain = Chain::Step;
 
     fn plan_rows(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        self.stand_held(stream, pos, tokens.len())?;
         self.rp.write(stream, tokens, pos)
     }
 
@@ -1659,7 +1912,8 @@ impl Instrumented for Body35 {
     /// a deterministic pattern of finite, nonzero f16 values that differ
     /// from row to row; the delta layers' stores stay as they stand (a
     /// step's cost does not depend on the state's values) — a step shape,
-    /// not a model state.
+    /// not a model state. The held counter follows the position the
+    /// instrument stands the model at, so the step after it runs.
     fn seed_depth(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
         let d = self.s.dims;
         let mut plane = vec![0u16; d.n_kv * d.ctx * d.head];
@@ -1681,6 +1935,8 @@ impl Instrumented for Body35 {
             }
         }
         stream.synchronize()?;
+        self.held = u32::try_from(rows)
+            .map_err(|_| GpuError::shape(WHAT, format!("a depth of {rows} positions past u32")))?;
         Ok(())
     }
 }

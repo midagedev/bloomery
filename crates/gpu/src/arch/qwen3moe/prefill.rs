@@ -1,5 +1,5 @@
 //! qwen3moe's prompt prefill: a prompt fed several positions per launch
-//! instead of one decode step per token, by one of two paths
+//! instead of one decode step per token, by one of three paths
 //! ([`PrefillPlan`]). A prompt that fits one pass takes the pass path; a
 //! longer one runs as GEMM ubatches of up to the model's ubatch size
 //! (`super::ubatch`: at most [`UBATCH`](super::ubatch::UBATCH), set at
@@ -9,7 +9,10 @@
 //! ubatch reads fewer expert bytes than two passes and its dense GEMMs cost
 //! less than a pass's launches, so the cut sits there. The GEMM path sums
 //! its products in another order than the one-token path and is gated by a
-//! band; the pass path is bit-equal to it.
+//! band; the pass path is bit-equal to it. [`PrefillPath::Wide`] is the
+//! GEMM path with no unit under that nine-row cut (a body whose pass-sized
+//! units are the gemv arm, bit another way): the serve seat's schedule,
+//! whose bits stay whole wherever its calls are cut.
 //!
 //! The pass path feeds [`MAX_TOKENS`] positions per pass. A pass is the decode chain's own
 //! layer body at `m` rows (`dispatch::enqueue_pass`), and every launch in it
@@ -46,6 +49,7 @@ use super::program::{self, Program, Tail};
 use super::router::MAX_TOKENS;
 use super::scratch::{Arena, Dims, IN_IDS, IN_POS0, Inbox, Io, param_view, put_input};
 use super::ubatch::UbCtx;
+use super::wide::GEMV_COLS;
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::model::{GpuModel, MAX_PASS_ROWS, StepMode};
@@ -124,6 +128,54 @@ impl Windows {
 }
 
 const WHAT: &str = "qwen3moe::prefill";
+
+/// The units a [`PrefillPath::Wide`] call of `tokens` ids at a ubatch of
+/// `ub` rows runs, every one of them a ubatch of at least [`WIDE_FROM`] and
+/// at most `ub` rows: whole ubatches, with a tail under [`WIDE_FROM`]
+/// borrowing from the unit before it so the last two units hold
+/// `ub + tail − WIDE_FROM` and `WIDE_FROM` rows. A load whose ubatch holds
+/// no such split — a ubatch under [`WIDE_FROM`] rows, or a tail too short
+/// for the unit before it to lend from (fewer than `2 · WIDE_FROM` rows
+/// over the last two units' `ub + tail`) — is refused by name.
+fn wide_steps(tokens: usize, ub: usize) -> Result<Vec<PrefillStep>, GpuError> {
+    if ub < WIDE_FROM {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "a wide call of {tokens} ids on a ubatch of {ub} rows: a wide unit holds at least \
+                 {WIDE_FROM} of them (one past the gemv arm's {GEMV_COLS}); a ubatch of at least \
+                 {WIDE_FROM} rows, or the pass path, serves the call"
+            ),
+        ));
+    }
+    if tokens <= ub {
+        return Ok(vec![PrefillStep::Ubatch(tokens)]);
+    }
+    let refuse = |tail: usize| {
+        GpuError::shape(
+            WHAT,
+            format!(
+                "a wide call of {tokens} ids on a ubatch of {ub} rows: its last unit would hold \
+                 {tail} rows, under the {WIDE_FROM} a wide unit takes, and the unit before it \
+                 cannot lend it enough (two units hold at least {} rows at this ubatch; a larger \
+                 ubatch, or the pass path, serves the call)",
+                2 * WIDE_FROM
+            ),
+        )
+    };
+    let (whole, tail) = (tokens / ub, tokens % ub);
+    if tail == 0 {
+        return Ok((0..whole).map(|_| PrefillStep::Ubatch(ub)).collect());
+    }
+    let mut v: Vec<PrefillStep> = (0..whole - 1).map(|_| PrefillStep::Ubatch(ub)).collect();
+    let last = ub + tail;
+    if last < 2 * WIDE_FROM {
+        return Err(refuse(tail));
+    }
+    v.push(PrefillStep::Ubatch(last - WIDE_FROM));
+    v.push(PrefillStep::Ubatch(WIDE_FROM));
+    Ok(v)
+}
 
 impl Prefill {
     /// The arena for [`MAX_TOKENS`] rows of `d`, an image for a prompt as
@@ -455,7 +507,22 @@ pub enum PrefillPath {
     Pass,
     /// GEMM ubatches of up to the ubatch size, the whole prompt.
     Gemm,
+    /// GEMM ubatches of up to the ubatch size that never fall to the gemv
+    /// arm: every unit of a call of more than [`WIDE_FROM`] rows holds at
+    /// least [`WIDE_FROM`] of them, a tail under that borrowing from the unit
+    /// before it, and a call of at most [`GEMV_COLS`] rows takes one pass —
+    /// so wherever a longer call is cut, every row a kept prefix leaves
+    /// behind runs the wide arm (`wide`: a token's bits do not depend on the
+    /// unit it lands in) and the call writes the same bits as an uncut one.
+    /// The serve seat's schedule for a body whose wide arm is gated by a
+    /// band against its gemv arm; a load whose ubatch cannot split a call
+    /// that way refuses it by name ([`PrefillPlan::new`]).
+    Wide,
 }
+
+/// The fewest rows every unit of a [`PrefillPath::Wide`] call holds: one
+/// past the gemv arm's cut ([`GEMV_COLS`]), the wide arm's first row count.
+pub const WIDE_FROM: usize = GEMV_COLS + 1;
 
 /// One launch unit of a prompt: a GEMM ubatch or a pass, and its tokens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,9 +540,14 @@ pub struct PrefillPlan {
 impl PrefillPlan {
     /// The plan of a prompt of `tokens` ids by `path` on a model whose
     /// ubatch size is `ubatch` ([`GpuModel::prefill_plan`] passes the
-    /// model's).
-    #[must_use]
-    pub fn new(tokens: usize, path: PrefillPath, ubatch: NonZeroUsize) -> PrefillPlan {
+    /// model's). [`PrefillPath::Wide`] is refused by name when `ubatch`
+    /// holds no split of the call whose every unit is at least
+    /// [`WIDE_FROM`] rows.
+    pub fn new(
+        tokens: usize,
+        path: PrefillPath,
+        ubatch: NonZeroUsize,
+    ) -> Result<PrefillPlan, GpuError> {
         let ub = ubatch.get();
         let chunked = |n: usize, w: usize, f: fn(usize) -> PrefillStep| {
             (0..n.div_ceil(w)).map(move |i| f(w.min(n - i * w)))
@@ -483,6 +555,10 @@ impl PrefillPlan {
         let steps = match path {
             PrefillPath::Pass => chunked(tokens, MAX_TOKENS, PrefillStep::Pass).collect(),
             PrefillPath::Gemm => chunked(tokens, ub, PrefillStep::Ubatch).collect(),
+            PrefillPath::Wide if tokens <= GEMV_COLS => {
+                chunked(tokens, MAX_TOKENS, PrefillStep::Pass).collect()
+            }
+            PrefillPath::Wide => wide_steps(tokens, ub)?,
             PrefillPath::Auto if tokens <= MAX_TOKENS => {
                 chunked(tokens, MAX_TOKENS, PrefillStep::Pass).collect()
             }
@@ -498,7 +574,7 @@ impl PrefillPlan {
                 v
             }
         };
-        PrefillPlan { steps }
+        Ok(PrefillPlan { steps })
     }
 
     /// Tokens the ubatches take: a prefix of the prompt.
@@ -638,7 +714,7 @@ impl GpuModel<Body> {
             (true, _) => PrefillPath::Pass,
             (false, p) => p,
         };
-        Ok(PrefillPlan::new(tokens, path, body.ub.size()))
+        PrefillPlan::new(tokens, path, body.ub.size())
     }
 
     /// Feed `tokens` through the chain by the plan of `path` (module doc)
