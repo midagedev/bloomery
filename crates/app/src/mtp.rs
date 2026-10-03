@@ -682,9 +682,13 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     }
 
     /// The next window's anchor: the target's own token `first` at the
-    /// prompt's end, with the hidden row the prompt's last position wrote.
+    /// prompt's end, with the hidden row the prompt's last position wrote —
+    /// unless a step since the prompt call already recorded one (the
+    /// server's cut: the prompt less its last id, then the last id as a
+    /// step, [`Draft::stepped`] recording the anchor the step's window
+    /// proposes from).
     fn begin(&mut self, t: &Session<B>, _prompt: &[u32], first: u32) -> Result<(), SessionError> {
-        if self.skip.is_some() {
+        if self.skip.is_some() || self.next.is_some() {
             return Ok(());
         }
         let (walk, rows) = self.last_unit.ok_or_else(|| {

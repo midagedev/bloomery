@@ -69,6 +69,14 @@
 //!   plan's segments — is refused by name before anything loads, while the
 //!   planner at that host still plans (mutant: the load's pool check without
 //!   the layer's bytes).
+//! - `nextn-front-refuse`: the same floor walk the plain `front-refuse`
+//!   holds, planned through `plan_nextn` (the serving default's path: the
+//!   draft's card bytes and arena beside the front in the reserve, the front
+//!   named on the sum) and opened through [`open_nextn`]: a stage card one
+//!   byte short of that floor is refused by name, the front and its bytes
+//!   named, before anything loads (mutant: the front zeroed in `plan_nextn`
+//!   — the card one byte under the floor then plans or fails by the card's
+//!   own bound, the front unnamed).
 //! - `nextn-open`: the machine starts over the map's layers — the rule's
 //!   layer count, the tally's edges — every pinned count 0, the next-token
 //!   layer's ledger row empty, no card part of it in the source, and it alone
@@ -130,7 +138,7 @@ mod gate {
     use gguf::quant::GgmlType;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{
-        NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_reserve_bytes,
+        NEXTN_ARENA_BYTES, NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_reserve_bytes,
     };
     use model::placement::churn::ChurnPool;
     use model::placement::{Machine, ModelTensors, Plan, PlanLevers, Violation, workstation};
@@ -756,6 +764,117 @@ mod gate {
         Ok(ok)
     }
 
+    /// `nextn-front-refuse` (module header): the gate card's floor under
+    /// `plan_nextn` — the front found from the nextn plan's own refusals,
+    /// from a guess at or under it (the target plan's terms but its experts
+    /// and rounding, the margin, the draft's card bytes and the arena, and
+    /// the front) — each refusal adding the bytes it names, so the walk
+    /// lands on the floor. The clause holds the shape `front-refuse` holds
+    /// on the plain plan, on the serving default's own planner: the card at
+    /// the floor plans, one byte under it the planner refuses by name with
+    /// the front and its bytes, and `open_nextn` under [`NEXTN_LEVER`]
+    /// refuses the same way before anything loads.
+    fn nextn_front_refuse_clause(
+        path: &str,
+        machine: &Machine,
+        levers: &bloomery_levers::Levers,
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+    ) -> Result<bool, GateError> {
+        let place = PlanLevers::from_levers(levers)?;
+        let front = prompt_reserve_bytes(&inputs.hp, CTX as u64, false);
+        let Some(card) = machine.cards.first() else {
+            return Err("the gate machine has no stage card".into());
+        };
+        if !machine.tiers.is_empty() {
+            return Err(
+                "the gate machine holds tier cards; the front walked here is the \
+                        no-tiers one"
+                    .into(),
+            );
+        }
+        let np = inputs
+            .plan_nextn(machine, CTX as u64, &place, nextn)
+            .map_err(|e| format!("{path}: {e}"))?;
+        let t = np.plan.cards.first().ok_or("the plan names no card")?;
+        let draft = np.nextn_card_bytes();
+        let with = |usable: u64| {
+            let mut m = machine.clone();
+            m.cards[0].usable_bytes = usable;
+            m
+        };
+        let mut usable = t.dense_bytes
+            + t.kv_bytes
+            + t.scratch_bytes
+            + t.context_bytes
+            + t.reserve_bytes
+            + card.margin_bytes
+            + draft
+            + NEXTN_ARENA_BYTES
+            + front;
+        let mut walked = 0usize;
+        let floor = loop {
+            if walked == 8 {
+                return Err(format!("the floor walk did not settle by {usable} B").into());
+            }
+            walked += 1;
+            match inputs.plan_nextn(&with(usable), CTX as u64, &place, nextn) {
+                Ok(_) => break usable,
+                Err(PlaceError::FrontOver { short, .. }) => usable += short,
+                Err(PlaceError::Broken(v)) => {
+                    let over = v.iter().find_map(|v| match v {
+                        Violation::CardOver { total, limit, .. } => Some(total - limit),
+                        _ => None,
+                    });
+                    usable += over.ok_or_else(|| format!("{path}: {}", PlaceError::Broken(v)))?;
+                }
+                Err(e) => return Err(format!("{path}: {e}").into()),
+            }
+        };
+        let floor_m = with(floor);
+        let at_floor = inputs
+            .plan_nextn(&floor_m, CTX as u64, &place, nextn)
+            .is_ok();
+        let short_card = with(floor - 1);
+        let below = inputs.plan_nextn(&short_card, CTX as u64, &place, nextn);
+        let named = matches!(
+            below,
+            Err(PlaceError::FrontOver { front: f, short: 1, .. }) if f == front
+        );
+        let t0 = Instant::now();
+        let opened = open_nextn_on(path, short_card.clone(), levers, NEXTN_LEVER);
+        let secs = t0.elapsed().as_secs_f64();
+        let (refused, why) = match opened {
+            Err(e) => {
+                let text = e.to_string();
+                (
+                    text.contains("GEMM front")
+                        && text.contains(&format!("{front} B"))
+                        && secs < REFUSE_BOUND_S,
+                    text,
+                )
+            }
+            Ok(_) => (false, "the open loaded".to_string()),
+        };
+        let ok = front > 0 && at_floor && named && refused;
+        println!(
+            "nextn-front-refuse: the GEMM front and group units {front} B beside the draft's \
+             {draft} B of card bytes and the {} B arena, in the nextn plan of the {} card: its \
+             floor {floor} B ({walked} plans) plans; one byte under it the planner {}; \
+             open_nextn under {} there in {secs:.1} s — {why}: {}",
+            NEXTN_ARENA_BYTES,
+            card.name,
+            match &below {
+                Err(e @ PlaceError::FrontOver { .. }) => format!("refuses: {e}"),
+                Err(e) => format!("refuses by another name: {e}"),
+                Ok(_) => "plans".to_string(),
+            },
+            word_of(NEXTN_LEVER),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// `nextn-open`: the machine's layers are the slot map's, the trunk's
     /// routed run and the next-token layer `nextn` after it, every layer's
     /// pinned count 0; that layer's ledger row is empty and the source holds
@@ -1061,6 +1180,10 @@ mod gate {
         let mut ok = held(
             "nextn-refuse",
             nextn_refuse_clause(path, machine, levers, inputs, &nextn, &np),
+        );
+        ok &= held(
+            "nextn-front-refuse",
+            nextn_front_refuse_clause(path, machine, levers, inputs, &nextn),
         );
         let t0 = Instant::now();
         let mut s = match open_nextn_on(path, machine.clone(), levers, NEXTN_LEVER) {

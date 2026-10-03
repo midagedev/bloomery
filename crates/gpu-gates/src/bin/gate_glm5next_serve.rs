@@ -94,16 +94,12 @@
 //!   ([`swap_rejoins_the_draft`]): both requests answer their solo runs' ids,
 //!   their drafts run and skip nothing, the switches counter moved and the
 //!   second request came back before the first;
-//! - against the CLI under the same levers: the ids agree through the first
-//!   pass whose boundary landed a flip in either run, by their `residency
-//!   pass` records. Not the whole run: the server's prompt call stops one id
-//!   short and steps it, the CLI's takes it, so the server's rule counts one
-//!   more step and its flips may land at other passes; a flip moves an
-//!   expert between the host and the card, whose sums round another way, so
-//!   a greedy id past a landing can move at a near tie. Before any landing
-//!   both run on the same seed, the plan's card experts less the spares, and
-//!   a verify's rows are its steps' bits. Whether the whole run agrees is
-//!   printed, not held.
+//! - against the CLI under the same levers: the ids agree, all of them or a
+//!   prefix ending in the end-of-generation id — the CLI takes the server's
+//!   cut (`--last-step`), so both run the same batches, count the rule's
+//!   steps the same and land their flips at the same passes; through which
+//!   pass the first landing sits is printed, not held (the reset clause
+//!   above holds the seed's determinism).
 //!
 //! A request that extends the held sequence (the prompt and the ids it
 //! generated) is printed with its `cache_n` and the draft's `mtp prompt`
@@ -413,10 +409,9 @@ mod gate {
 
     /// The tokens a run produced through the first pass whose boundary
     /// landed a flip (every token, when none did): `first` the tokens before
-    /// the first pass's rows count (the CLI's prompt call gives token 0 and
-    /// keeps no row; the server's prompt call gives none, its step token 0),
-    /// then each pass's kept rows, that pass's included — it ran before its
-    /// flips went live.
+    /// the first pass's rows count — with the server's cut both runs' prompt
+    /// calls give no token, their step token 0 — then each pass's kept rows,
+    /// that pass's included — it ran before its flips went live.
     fn before_landing(passes: &[(String, u64, u64)], first: u64) -> u64 {
         let mut n = first;
         for (_, kept, landed) in passes {
@@ -1326,23 +1321,23 @@ mod gate {
         println!("drafted server stopped: {}", served.stop()?);
         ok &= swap_rejoins_the_draft(dir)?;
 
-        let (reference, cli_lines) = cli(dir, DRAFTED, &ids, false)?;
+        let (reference, cli_lines) = cli(dir, DRAFTED, &ids, true)?;
         let cli_passes = passes(&cli_lines);
         println!("generate_glm5next tokens {reference:?}");
         println!("generate_glm5next passes (kind, kept, landed) {cli_passes:?}");
-        let exact = before_landing(&served_passes, 0)
-            .min(before_landing(&cli_passes, 1))
-            .min(first.len() as u64);
-        let exact = usize::try_from(exact)?;
+        let landing = before_landing(&served_passes, 0).min(before_landing(&cli_passes, 0));
+        let same_passes = served_passes == cli_passes;
         println!(
-            "drafted ids before the first landing: {exact} of {}; the whole run agrees: {}",
-            first.len(),
-            agree(&first, &stop, &reference)
+            "drafted ids: the whole run agrees {}; the first landing sits through pass {} of \
+             {}, the passes the same lists {same_passes}",
+            agree(&first, &stop, &reference),
+            landing,
+            first.len()
         );
         check(
             &mut ok,
-            "drafted_ids_are_generate_glm5next_through_the_first_landing",
-            exact >= 1 && reference.len() >= exact && first[..exact] == reference[..exact],
+            "drafted_ids_are_generate_glm5next",
+            agree(&first, &stop, &reference),
         );
         Ok(ok)
     }

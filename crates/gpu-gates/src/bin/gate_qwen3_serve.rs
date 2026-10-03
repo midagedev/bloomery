@@ -47,8 +47,8 @@
 //!   then resent with a reasoning-free reply ([`STRIPPED_35`]) in place of
 //!   the reply, so the shared prefix ends at the turn's prompt end — keeps
 //!   the checkpoint there (`cache_n == len(p1) - 1`) and its ids are the
-//!   same ids fed fresh (a re-fed call of at least [`GEMM_FROM`] rows is
-//!   the wide walk wherever it is cut); and the extension clause — the turn
+//!   same ids fed fresh (a re-fed call of at least [`GEMM_FROM`] rows is the
+//!   wide walk wherever it is cut); and the extension clause — the turn
 //!   resent with its reply and [`LATER`]'s user turn — keeps every position
 //!   the slot held (`cache_n == held`: the ask reaches the standing
 //!   position, which no cut takes back), its ids printed only.
@@ -56,6 +56,18 @@
 //!   common prefix instead of the checkpoint makes the session's cut refuse
 //!   by name and both clauses' requests fail; the cut's restore omitted
 //!   leaves the re-fed ids a fresh run's (the stripped clause's ids red).
+//! - `swap_reprefills_the_parked_ids`, on the first file's arm alone (the
+//!   park is the seat's, not the file's): a server of `--parallel 2`, a
+//!   decode preempted mid-run by a second request comes back by the
+//!   re-prefill fallback — the engine reset to 0 and its held ids fed again
+//!   before it steps — so the first request's ids are its solo run's through
+//!   the park (the same steps wrote them; past it the re-fed call's walk
+//!   re-writes the rows its steps wrote, the prefill band, so the tail is
+//!   printed, not held) and the second's, which never parks, are its solo
+//!   run's; the second finishes before the first, the switches counter
+//!   moved and the park's re-fed ids counted in `/metrics`. FAIL-first: the
+//!   re-prefill omitted leaves the first request stepping from an empty
+//!   engine and the re-fed count at 0.
 //!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
@@ -78,12 +90,15 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use gguf::Split;
     use serde_json::{Value, json};
+    use threads::helper::{Placement, spawn_helper};
 
     const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir>";
 
@@ -123,6 +138,17 @@ mod gate {
     /// longer, so the clause covers the ubatch walk.
     const PASS_IDS: usize = 8;
 
+    /// The swap clause's requests: the first long enough that the second's
+    /// arrival cannot miss its decode (a whole quantum and more, so a late
+    /// arrival still finds it mid-run), the second short enough to come back
+    /// before it.
+    const SWAP_A_PREDICT: usize = 96;
+    const SWAP_B_PREDICT: usize = 8;
+
+    /// The swap clause's `/slots` poll while it waits for the first
+    /// request's decode.
+    const SWAP_POLL: Duration = Duration::from_millis(300);
+
     /// The fewest rows the seat's prompt call runs as the GEMM walk
     /// (`app::arch::qwen3moe::GEMM_FROM`): the rows a kept prefix leaves
     /// behind are a whole fresh run's.
@@ -160,6 +186,19 @@ mod gate {
     /// A binary beside this one.
     fn beside(name: &str) -> Result<PathBuf, GateError> {
         Ok(std::env::current_exe()?.with_file_name(name))
+    }
+
+    /// `/metrics`' `llamacpp:<name>` value; `None` when it carries none.
+    fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
+        let (st, body) = curl(&url("/metrics"), None, false)?;
+        if st != 200 {
+            return Err(format!("/metrics: HTTP {st}: {body}").into());
+        }
+        let key = format!("llamacpp:{name} ");
+        Ok(body
+            .lines()
+            .find_map(|l| l.strip_prefix(&key))
+            .and_then(|v| v.trim().parse().ok()))
     }
 
     /// The seat's default `--ctx` against the file and this gate's card:
@@ -511,6 +550,171 @@ mod gate {
         Ok(())
     }
 
+    /// The swap clause (module header) on a server of two slots started into
+    /// `<dir>/swap`: a decode preempted mid-run by a second request comes
+    /// back by the re-prefill fallback — the engine reset to 0 and its held
+    /// ids fed again before it steps (`Park::Ids`; the seat holds no
+    /// snapshot to park) — so both requests answer their solo runs' ids, the
+    /// second finishes before the first, and the switches and the re-fed
+    /// ids the park counted both moved.
+    fn swap_reprefills_the_parked_ids(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let dir = dir.join("swap");
+        std::fs::create_dir_all(&dir)?;
+        let err_log = dir.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL");
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mut s = Served::spawn_cmd(
+            cmd,
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "2",
+                "-m",
+                m,
+            ],
+            &dir,
+        )?;
+        // The load reads the whole file: up to ten minutes from a cold cache.
+        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let body = |ids: &[u32], n: usize| {
+            json!({
+                "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
+                "cache_prompt": false,
+                // The seat runs no draft, so a banned stop id steps nothing
+                // plainly (glm's clause avoids it for its draft); this holds
+                // the first request's decode open for the second's arrival.
+                "ignore_eos": true,
+            })
+        };
+        let (a_ids, b_ids) = {
+            let a = rendered(&url, messages())?;
+            let (st, text) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
+            let b = ids_of(&json_of("/tokenize", st, &text)?["tokens"]);
+            (a, b)
+        };
+        // The solo runs: one request at a time takes no turn, so these are
+        // the plain engine's answers.
+        let mut alone = Vec::new();
+        for (ids, n) in [(&a_ids, SWAP_A_PREDICT), (&b_ids, SWAP_B_PREDICT)] {
+            let (st, text) = curl(&url("/completion"), Some(&body(ids, n)), false)?;
+            let v = json_of("/completion", st, &text)?;
+            alone.push(ids_of(&v["tokens"]));
+        }
+        println!("swap alone: {} and {} ids", alone[0].len(), alone[1].len());
+        let swaps = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
+        let refed = metric(&url, "swap_reprefill_tokens_total")?.unwrap_or(f64::NAN);
+        // A request on a helper thread of its own: its handle, and its answer
+        // with when it came back.
+        type Answer = (Result<(u16, String), String>, Instant);
+        let post = |ids: Vec<u32>,
+                    n: usize|
+         -> Result<(JoinHandle<()>, mpsc::Receiver<Answer>), GateError> {
+            let u = url("/completion");
+            let b = body(&ids, n);
+            let (tx, rx) = mpsc::channel();
+            let (h, _) = spawn_helper("swap-request", Placement::Float, move || {
+                let r = curl(&u, Some(&b), false).map_err(|e| e.to_string());
+                let _ = tx.send((r, Instant::now()));
+            })
+            .map_err(|e| format!("swap: {}", e.what()))?;
+            Ok((h, rx))
+        };
+        let a_len = a_ids.len();
+        let first = post(a_ids, SWAP_A_PREDICT)?;
+        loop {
+            if first.0.is_finished() {
+                return Err(
+                    "swap: the first request ended before /slots showed it decoding".into(),
+                );
+            }
+            let (st, text) = curl(&url("/slots"), None, false)?;
+            let slots = json_of("/slots", st, &text)?;
+            let decoding = slots.as_array().is_some_and(|l| {
+                l.iter().any(|s| {
+                    s["turn"] == "running"
+                        && s["next_token"]["n_decoded"].as_u64().is_some_and(|n| n > 0)
+                })
+            });
+            if decoding {
+                break;
+            }
+            std::thread::sleep(SWAP_POLL);
+        }
+        let second = post(b_ids, SWAP_B_PREDICT)?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+            h.join()
+                .map_err(|_| format!("swap: the {what} request's thread panicked"))?;
+            let (r, at) = rx
+                .recv()
+                .map_err(|_| format!("swap: the {what} request's thread gave no answer"))?;
+            let (st, text) = r?;
+            let v = json_of("/completion", st, &text)?;
+            together.push((ids_of(&v["tokens"]), at));
+        }
+        let after = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
+        let refed_after = metric(&url, "swap_reprefill_tokens_total")?.unwrap_or(f64::NAN);
+        // The park re-fed the first request's held ids: its prompt's ids plus
+        // the tokens it had written before the park, so many tokens of its
+        // answer. Through those its ids are its solo run's (the same steps
+        // wrote them); past the park the re-fed call's walk re-writes the
+        // rows its steps wrote (the prefill band: a step-written row is not
+        // a fresh run's, qwen38-(a) class), so the tail is printed, not
+        // held. The second request never parks: its ids are its solo run's.
+        let pre_park = (refed_after as usize)
+            .saturating_sub(a_len)
+            .min(alone[0].len());
+        let tail_same = together[0].0 == alone[0];
+        println!(
+            "swap together: first {} ids, second {} ids, second back {:?} before the first, \
+             switches {swaps} -> {after}, re-fed ids {refed} -> {refed_after} ({} held of the \
+             first), the first's ids its solo run's through {pre_park}, the whole tail the \
+             same {tail_same}",
+            together[0].0.len(),
+            together[1].0.len(),
+            together[0].1.checked_duration_since(together[1].1),
+            refed_after,
+        );
+        check(
+            ok,
+            "swap_alone_ran_long_enough_to_preempt",
+            alone[0].len() == SWAP_A_PREDICT && !alone[1].is_empty(),
+        );
+        check(
+            ok,
+            "swap_second_back_before_the_first",
+            together[1].1 < together[0].1,
+        );
+        check(
+            ok,
+            "swap_first_ids_are_alone_through_the_park",
+            together[0].0.len() >= pre_park
+                && pre_park > 0
+                && together[0].0[..pre_park] == alone[0][..pre_park],
+        );
+        check(
+            ok,
+            "swap_second_ids_are_alone",
+            !together[1].0.is_empty() && together[1].0 == alone[1],
+        );
+        check(
+            ok,
+            "swap_switched_and_reprefilled_the_held_ids",
+            after > swaps && refed_after > refed,
+        );
+        println!("swap server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
     /// The server's clauses for `model`, its logs in `dir`; the answers the
     /// CLI is held to, the chat turn's first.
     fn served(model: &Path, dir: &Path, ok: &mut bool) -> Result<Vec<Answer>, GateError> {
@@ -694,6 +898,11 @@ mod gate {
             }
             check(&mut ok, "completion_ids_are_the_cli_ids", agree);
             ctx_default(model, &dir, &mut ok)?;
+            if i == 0 {
+                // The park is the seat's, not the file's: the first file's
+                // arm carries the swap clause.
+                swap_reprefills_the_parked_ids(model, &dir, &mut ok)?;
+            }
         }
         if ok {
             println!("PASS");

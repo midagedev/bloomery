@@ -23,6 +23,12 @@
 //!   `not_supported_error`;
 //! - `a_repeat_is_the_same_body`: the same request again is the same body
 //!   byte for byte, `timings` taken out (each request runs from a reset);
+//! - the face both constants of `bloomery-serve`'s drive print
+//!   ([`face_pins_the_constants`]): `--help` exits non-zero with the models
+//!   table on its stderr, one line a seat with its `--hf` example exactly as
+//!   the gate pins it, and a start that passes the help branch prints the
+//!   first-start note before it refuses (here `--model qwen3` with no model
+//!   file, refused before any load);
 //! - the refusals, each a process that exits non-zero before it listens,
 //!   its stderr naming why: `qwen35_with_no_head` (`-m <gguf>`),
 //!   `decide_with_no_head` (`--model decide -m <gguf>`), `qwen3_with_head`
@@ -268,11 +274,56 @@ mod gate {
         Ok(head)
     }
 
+    /// The models table `bloomery-serve --help` prints beside its usage
+    /// ([`drive::MODELS`] in `bloomery_serve.rs`): one line a seat, the seat
+    /// word, what it serves and a working `--hf` example of it, and the
+    /// header line above them.
+    const MODELS_LINES: [&str; 6] = [
+        "models (the --model word is optional with a model file: the file's architecture picks \
+         the seat)",
+        "ds41    DeepSeek-V4.1-Flash          --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M",
+        "qwen38  Qwen3.8-Flash-Next           --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL",
+        "glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL",
+        "qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M",
+        "decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M",
+    ];
+
+    /// The note every start that passes the help branch prints on stderr
+    /// before the load begins ([`drive::FIRST_START`] in `bloomery_serve.rs`).
+    const FIRST_START: &str = "bloomery-serve: a first start on a new card compiles the GPU \
+                               code for it (tens of seconds); later starts take seconds";
+
+    /// The face (module header): the two constant lines of the drive, read
+    /// from what the binary printed. `--help` exits non-zero with the usage
+    /// and the models table on stderr, every line exactly as
+    /// [`MODELS_LINES`] pins it; a start that passes the help branch — here
+    /// `--model qwen3` with no model file, which refuses before any load —
+    /// prints the first-start note first. Neither process opens a card or
+    /// reads a model.
+    fn face_pins_the_constants(dir: &Path) -> Result<bool, GateError> {
+        let helps = refused(
+            dir,
+            "help_prints_the_models_table",
+            &["--help"],
+            &MODELS_LINES,
+        )?;
+        let starts = refused(
+            dir,
+            "every_start_notes_the_first_compile",
+            &["--model", "qwen3"],
+            &[FIRST_START],
+        )?;
+        Ok(helps && starts)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let a = parse_args()?;
         std::fs::create_dir_all(&a.dir)?;
         let (model, head) = (utf8(&a.model)?, utf8(&a.head)?);
         let mut ok = true;
+
+        let pass = face_pins_the_constants(&a.dir)?;
+        check(&mut ok, "face_pins_the_constants", pass);
 
         // The refusals first: none of them loads the backbone.
         let pass = refused(

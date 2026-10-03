@@ -32,7 +32,9 @@
 //!   Default `batch`.
 //! - `--last-step`: the prompt less its last id fed as `--prefill` says,
 //!   then the last id as a decode step — the cut the server's seat feeds a
-//!   prompt by. Refused by name beside the draft, `--time` and `--pair`.
+//!   prompt by, under the draft too (the draft's own prompt call over the
+//!   head, then the step told to it). Refused by name beside `--time` and
+//!   `--pair`.
 //! - The model file is `$BLOOMERY_REF_MODEL` (`ref_model_path`), which
 //!   `tools/box.sh` exports from the `glm5next` profile, as in every other bin.
 //! - `--plan` prints the plan and exits before the load.
@@ -176,7 +178,7 @@ mod cli {
     use model::arch::glm5next::place::PlanInputs;
     use model::placement::{Machine, Plan, PlanLevers};
     use runtime::layer::hosted;
-    use runtime::{Advance, Committed, PassSink, Stop, Target, Verify, Want};
+    use runtime::{Advance, Committed, Draft, PassSink, Stop, Target, Verify, Want};
 
     const ACTS_ON: &[&str] = &[
         CARD_BUDGET,
@@ -359,10 +361,10 @@ mod cli {
         }
         let pair = has("--pair");
         let last_step = has("--last-step");
-        if last_step && (timed || pair || matches!(levers.draft(), Some(d) if d != "off")) {
+        if last_step && (timed || pair) {
             return Err(
-                "--last-step is refused beside --time, --pair and BLOOMERY_DRAFT: it feeds the \
-                 plain run's prompt only"
+                "--last-step is refused beside --time and --pair: it feeds the plain run's \
+                 prompt only"
                     .into(),
             );
         }
@@ -543,6 +545,7 @@ mod cli {
                 place,
                 prefill,
                 passes,
+                last_step,
             };
             return drafted_run(&mut s, &arm);
         }
@@ -737,6 +740,9 @@ mod cli {
         prefill: PrefillMode,
         /// The feed's batches or steps, as the plain run counts them.
         passes: usize,
+        /// `--last-step`: the prompt less its last id fed as `--prefill`
+        /// says, then the last id as a decode step — the server's cut.
+        last_step: bool,
     }
 
     /// The verify pass's capture: its nodes, one line.
@@ -794,7 +800,23 @@ mod cli {
         let mut spec = s.with_draft::<MtpDraft<Body>, VERIFY_ROWS>(draft, &mut PairCapture)?;
         fed(a.ids);
         let t_feed = Instant::now();
-        let first = spec.prompt(s, a.ids)?;
+        // The server's cut (`--last-step`): the prompt less its last id
+        // through the draft's own prompt call, then the last id as a step
+        // told to the draft — the seat's step order (`DraftedSeat::step`),
+        // `Draft::stepped` walking the prompt call's anchor row with the
+        // last id and recording the step's refresh, which the first window
+        // proposes from (`Draft::begin` leaves it standing).
+        let first = match a.ids.split_last() {
+            Some((&last, head)) if a.last_step => {
+                if !head.is_empty() {
+                    Advance::prompt(&mut spec, s, head)?;
+                }
+                let next = s.step(last, Want::Argmax)?.argmax();
+                Draft::stepped(spec.draft_mut(), s, last, next)?;
+                next
+            }
+            _ => spec.prompt(s, a.ids)?,
+        };
         let feed = t_feed.elapsed();
         Record::new(&record::STEP0)
             .u("pos", s.pos() - 1)
