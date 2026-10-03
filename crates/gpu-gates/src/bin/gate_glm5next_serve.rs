@@ -773,10 +773,13 @@ mod gate {
     /// next multiple of [`CTX_STEP`] past it more (or it is the fit). A
     /// server asked for [`FLAG_CTX`] takes it (below the floor, a value no
     /// default can coincide with); one asked past the oracle is refused by
-    /// name before it listens. Mutants: the margin guard taken out (the
-    /// line's `margin_ctx` loses more than the margin); the search giving up
-    /// (the line's `margin_ctx` keeps the floor while a step past it stays
-    /// within it).
+    /// name before it listens. Every unset rule word must hold the relation
+    /// it claims between the line's `ctx`, its `margin_ctx` and its `fit` —
+    /// a default that keeps the floor while its margin reaches further
+    /// names the wrong word. Mutants: the default taking the trained
+    /// context past the fit (the server's own plan refuses it by name
+    /// before any line); the search giving up (the line's `margin_ctx`
+    /// keeps the floor while a step past it stays within it).
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -881,10 +884,11 @@ mod gate {
             &mut ok,
             "ctx_default_is_the_rules",
             match rule.as_str() {
-                "base" => ctx == CTX && CTX <= fit,
-                "card" => ctx == fit && fit < CTX,
-                "margin" => ctx == margin_ctx && CTX < ctx && ctx < fit,
-                "fit" => ctx == fit && fit > CTX,
+                "set" => false,
+                "base" => ctx == CTX && margin_ctx == CTX && CTX <= fit,
+                "card" => ctx == fit && margin_ctx == fit && fit < CTX,
+                "margin" => ctx == margin_ctx && CTX < margin_ctx && margin_ctx < fit,
+                "fit" => ctx == fit && margin_ctx == fit && fit > CTX,
                 _ => false,
             },
         );
