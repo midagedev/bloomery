@@ -44,6 +44,8 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
+use crate::swap::Park;
+
 /// A failure inside the engine (a device error, a context overflow it detected
 /// itself, a NaN in the logits).
 #[derive(Debug, thiserror::Error)]
@@ -187,6 +189,14 @@ pub trait Engine: Send {
             row.next = self.next(row.last, row.logits.as_deref_mut())?;
         }
         Ok(())
+    }
+    /// How the slots share the engine. `None` (the default): each slot holds
+    /// a sequence of its own and several step in one call. `Some(park)`: the
+    /// slots take the engine's one sequence in turns ([`crate::SwapEngine`]):
+    /// the server steps one slot a call, so a draft keeps drafting, and keeps
+    /// the state of a slot it leaves as `park` says.
+    fn turns(&self) -> Option<Park> {
+        None
     }
     /// Drops the whole cache; the next `prefill` starts at position 0.
     fn reset(&mut self) -> Result<(), EngineError>;
