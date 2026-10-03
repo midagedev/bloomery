@@ -120,6 +120,23 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### 0.2.0의 날이 남긴 것 (10-03 밤, 리드 — decideseat·q3off·slotswap·glmsave·P3·seatpick·P4·memguard·glmnext 착지, 8d62f74a·68f72d68)
+
+- **MODELS/FIRST_START 게이트 절 없음 (XS)**: seatpick의 두 상수 줄(`bloomery_serve.rs`의 `--help` 표와
+  첫시작 안내)을 grep하는 절과 뮤턴트.
+- **qwen3 스왑 경로 게이트 절 없음 (S)**: P3의 `Park::Ids` 재프리필 폴백은 serve 테스트의 목 엔진에서만
+  증명됐다. glm의 `swap_rejoins_the_draft` 모양으로 qwen3 좌석에 ids-동일 절.
+- **Qwen3.8 MTP 재결합 (S–M)**: glmsave가 `mtp.rs`의 park/unpark를 공유 코드로 넣었다. `Seq38`에 스토어
+  행과 held, 아레나의 Wrote/Held 위치 기록, 좌석의 `drafted.park()/unpark()` (glmsave2 보고 §6). 그 뒤
+  qwen38 좌석도 `--parallel`.
+- **`--ctx` 기본을 모델에서 (S, 0.2.1 후보)**: 학습 컨텍스트에서 읽고 메모리가 못 받으면 이름 붙인 거부.
+- **탄력 `--parallel` (S, 0.2.1 후보)**: park 예산이 감당하는 만큼 기본, 플래그는 상한 (오늘은 llama 호환
+  고정값 2).
+- **flow 계획 핀은 여유를 탄다 (알림)**: `routes.py`의 계획 핀(2651)은 records-refresh 당시 카드 여유에
+  의존한다 — 홀드된 카드에서 재생성하면 옮겨 적을 것 (PIN 주석 참조).
+- **memguard 뒤에 남은 것**: 홀드된 카드 위 serve 응답 비교 한 줄(에이전트 보고 §7); auto-placed 실행의
+  `--prefill gemm` 거부가 적재 뒤에 온다(좌석 문서에 이미 적힘).
+
 ### What jitonce, relfollow, sysone and decideseat phase 1 left (line3, 10-03 — 412367f3, 2e0189f2)
 
 - **Raw bundle loads outside `shared_module!` (S).** `crates/gpu-vision/src/{attn,mlp,norm,rope2d,aligner,gemm_bf16}.rs`
