@@ -120,6 +120,30 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### What jitonce, relfollow, sysone and decideseat phase 1 left (line3, 10-03 — 412367f3, 2e0189f2)
+
+- **Raw bundle loads outside `shared_module!` (S).** `crates/gpu-vision/src/{attn,mlp,norm,rope2d,aligner,gemm_bf16}.rs`
+  and `encoder.rs:201` (7 loads per vision encoder), and `gate_kquant.rs`/`gate_swap.rs` in gpu-gates. One line each.
+- **The empty-cache start's last JIT runs serially (M).** One bundle JIT (about 7 s [derived]) before the weights
+  upload. Running it on a thread beside the upload brings an empty-cache start to about max(JIT, load) [derived].
+  Upstream shape: a per-context module cache or a generated `load_shared` in cuda-host (nvlabs ledger #37).
+- **Body35's routed types pass coverage and are refused at load (S).** `crates/placement/src/placement.rs:367`
+  `CardFormat::of_routed` lets Q3_K/Q6_K routed gate·up through; Body35 reads Q4_K only.
+- **Qwen3moeBody's coverage pins are looser than `kq_site` (S).** `crates/model/src/arch/coverage.rs` vs
+  `gpu/src/arch/qwen3moe/body.rs:312-318` (q/k/o read Q4_K only).
+- **Qwen3.8's bp break-even uses the decode rate (S, after q3off).** `serve_seats/qwen38.rs:284` `Kind38::Bp => PLAIN_TPS`;
+  bp's prompt now runs ubatches, so its prompt rate needs one measurement.
+- **Comments that still find the A6000 by name (S).** `tools/ref/depth-glm5next.sh:180,398`,
+  `depth-qwen3moe.sh:956`, `nsys-ds41.sh:41`, `timing-card.sh:39`.
+- **`depth-glm5next-stub.sh` fails a different case each run, on the base too (M).** Cause not known.
+- **`tools/recipes.py:5183` pins the count of `bind::` tests at 2 (S).** Count them from the tree.
+- **`body35.rs:2` calls Clef's backbone Qwen3.5-27B (XS, after q3off).** Clef-Flash is Qwen3.5-9B (4096 wide).
+- **The decide seat's listening line is stdout text, not a record Kind (S, after q3off's record.rs).**
+- **Decision rows after 0.2.0.** A `clefgguf`: llama.cpp's Clef layout (arch `clef`, head inside the GGUF;
+  ggml-org/Clef-Flash-GGUF), after llama.cpp #29831 merges, ~360 lines plus one agreement box run. B: Kev-4B and lev
+  rows (head in the GGUF or the LM head's label logits; tied output; `cls.output` role), ~820 lines, llama-server as
+  the oracle. Both from sysone's report (line3 scratchpad `sysone.md` §6).
+
 ### What glmprefetch left (line1, 10-03 — the host union's lane pack prefetch, 07ec8f04)
 
 Sat under the lease (A6000, place a, G2, same binary, 4 rounds, pp4096 only, clean): on / off +0.78 % [lower bound
