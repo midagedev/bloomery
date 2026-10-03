@@ -16,8 +16,8 @@ with the head the seat finds for the repo (`--head` only when given), `BLOOMERY_
 signalled only while `/proc/<pid>/comm` is the comm `--bin`'s file name gives, its first 15 bytes). It
 writes `<out>/rows.json` (each request's response, its body as sent, the official one and the wall) and
 `<out>/serve.log` (the server's stderr), and prints one line a question then `TOPS a/n`: the log `table`
-reads. A server whose first stdout line is not its listening line, or a response with no answers, stops the
-run by name (rc 1) after the server is stopped.
+reads. A server whose `listening` record does not appear on its stderr within ten minutes, or a response
+with no answers, stops the run by name (rc 1) after the server is stopped.
 
 `same` holds two runs' bodies equal byte for byte with each body's `timings` (the server's last key) taken
 out: it prints `SAME n/n`, or names the first request that differs and exits 1.
@@ -134,8 +134,8 @@ def summary(log: str) -> dict:
             qs.append(m.groupdict())
         elif l.startswith("TOPS "):
             tops = l.split()[1]
-        elif "(model " in l:
-            model = l.split("(model ", 1)[1].split(",", 1)[0].rstrip(")")
+        elif " model=" in l:
+            model = l.split(" model=", 1)[1].split()[0]
     if not qs or tops is None:
         raise SystemExit("e2e table: no question lines or no TOPS line in the log")
     ok = [q["ok"] == "ok" for q in qs]
@@ -211,12 +211,21 @@ def run(argv: list[str]) -> int:
     # The model is named once, by the flags: the gates' BLOOMERY_REF_MODEL beside them is a second name.
     env = {k: v for k, v in os.environ.items() if k != "BLOOMERY_REF_MODEL"}
     p = subprocess.Popen([binp, *model, "--port", str(port)], env=env,
-                         stdout=subprocess.PIPE, stderr=log, text=True, start_new_session=True)
+                         stdout=subprocess.DEVNULL, stderr=log, text=True, start_new_session=True)
     (out / "serve.pid").write_text(f"{p.pid}\n")
     try:
-        first = p.stdout.readline() if p.stdout else ""
+        # The seat's `listening` record is stderr's; wait for it there.
+        deadline = time.time() + 600
+        first = ""
+        while time.time() < deadline:
+            log.flush()
+            first = next((l for l in (out / "serve.log").read_text().splitlines()
+                          if "listening on http://" in l), "")
+            if first or p.poll() is not None:
+                break
+            time.sleep(0.5)
         print(f"open {time.time() - t0:.1f}s: {first.strip()}", flush=True)
-        if "listening" not in first:
+        if not first:
             log.flush()
             print((out / "serve.log").read_text()[-4000:])
             raise SystemExit("e2e: the server did not start")
@@ -262,8 +271,8 @@ def self_test() -> None:
         req("ko", "b-1", 4067, 900.0, 20.0, {"부서": noul}, {"부서": {"type": "noul", "noul": 0.71}}),
         req("ko", "b-2", 250, 50.0, 25.0, {"x": multi}, {"x": multi}),
     ]
-    log = ("open 1.0s: bloomery-serve: listening on http://127.0.0.1:1 (model m-Q3_K_M.gguf, quant Q3_K_M, "
-           "head joint_head.safetensors, row clef)\n")
+    log = ("open 1.0s: bloomery-serve-decide: model=m-Q3_K_M.gguf quant=Q3_K_M "
+           "head=joint_head.safetensors row=clef listening on http://127.0.0.1:1\n")
     log += "\n".join(lines(rows))
     s = summary(log)
     assert s["model"] == "m-Q3_K_M.gguf", s

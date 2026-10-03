@@ -159,16 +159,17 @@ mod gate {
     }
 
     /// How long the server may take to load and listen, and how often its
-    /// stdout is read meanwhile.
+    /// stderr is read meanwhile.
     const LISTEN_WITHIN: Duration = Duration::from_secs(300);
     const LISTEN_POLL: Duration = Duration::from_millis(500);
 
-    /// The listening line on the server's stdout, read every [`LISTEN_POLL`]
-    /// for at most [`LISTEN_WITHIN`]; a server that exits first fails by name.
-    fn listening(s: &mut Served, out: &Path) -> Result<String, GateError> {
+    /// The seat's `listening` record in the server's stderr, read every
+    /// [`LISTEN_POLL`] for at most [`LISTEN_WITHIN`]; a server that exits
+    /// first fails by name.
+    fn listening(s: &mut Served, err_log: &Path) -> Result<String, GateError> {
         let t = Instant::now();
         while t.elapsed() < LISTEN_WITHIN {
-            let text = std::fs::read_to_string(out).unwrap_or_default();
+            let text = std::fs::read_to_string(err_log).unwrap_or_default();
             if let Some(l) = text.lines().find(|l| l.contains("listening on http://")) {
                 return Ok(l.to_owned());
             }
@@ -392,20 +393,20 @@ mod gate {
             "serve",
             &["-m", model, "--head", head, "--port", "0"],
         )?;
-        let line = listening(&mut s, &d.join("server.out"))?;
+        let line = listening(&mut s, &d.join("server.err"))?;
         println!("{line}");
         let addr = line
             .split_once("listening on http://")
             .and_then(|(_, r)| r.split_whitespace().next())
-            .ok_or("no address in the listening line")?
+            .ok_or("no address in the listening record")?
             .to_owned();
         let url = |p: &str| format!("http://{addr}{p}");
         let names = |w: &str| line.contains(w);
         let mut serves = names(&format!(
-            "model {}",
+            "model={}",
             a.model.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-        )) && names("head joint_head.safetensors")
-            && names("row clef)");
+        )) && names("head=joint_head.safetensors")
+            && names("row=clef");
         let (st, props) = curl(&url("/props"), None, false)?;
         let props: Value = serde_json::from_str(&props)?;
         println!("/props {st} {props}");

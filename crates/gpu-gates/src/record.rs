@@ -1656,6 +1656,21 @@ pub static LISTENING_QWEN3: Kind = Kind {
     ],
 };
 
+/// The decide seat's address.
+pub static LISTENING_DECIDE: Kind = Kind {
+    name: "listening_decide",
+    head: "bloomery-serve-decide:",
+    doc: "The decide seat's model, quant, head, row and the address it listens on.",
+    parts: &[
+        key("model", Word, ""),
+        key("quant", Text, ""),
+        key("head", Word, ""),
+        key("row", Word, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The Qwen3 seat's load.
 pub static LOAD_QWEN3: Kind = Kind {
     name: "load_qwen3",
@@ -2550,6 +2565,18 @@ mod tests {
         assert_eq!(
             plan38,
             "plan place=a card=A6000 experts=card ctx_max=4096 host_experts=11735 card_experts=12841"
+        );
+        let decide = Record::new(&LISTENING_DECIDE)
+            .w("model", "m-Q3_K_M.gguf")
+            .w("quant", "q4_K×1988 q6_K×97")
+            .w("head", "joint_head.safetensors")
+            .w("row", "clef")
+            .w("addr", "127.0.0.1:39291")
+            .line();
+        assert_eq!(
+            decide,
+            "bloomery-serve-decide: model=m-Q3_K_M.gguf quant=q4_K×1988 q6_K×97 \
+             head=joint_head.safetensors row=clef listening on http://127.0.0.1:39291"
         );
         let smoke = Record::new(&SMOKE)
             .w("mode", "graph")

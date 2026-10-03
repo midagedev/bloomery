@@ -20,9 +20,9 @@
 //! not one of the row's backbones; then, on a worker thread that owns the
 //! card, it opens the head, refuses a head whose width is not the file's
 //! `embedding_length`, opens the tokenizer and the backbone ([`BODIES`]),
-//! and prints one line on stdout, `bloomery-serve: listening on http://H:P
-//! (model …, quant …, head …, row …)`, P the bound port (`--port 0` binds a
-//! free one). Requests are POSTed to the row's routes and answered one at a
+//! and prints its `listening` record on stderr (`record::LISTENING_DECIDE`),
+//! naming the model, quant, head, row and the address, P the bound port
+//! (`--port 0` binds a free one). Requests are POSTed to the row's routes and answered one at a
 //! time by the row's own part ([`Decision`]), which runs the backbone
 //! through [`Backbone::hidden`] (from a reset). `/props` carries the
 //! server's `engine` object, as every seat's (its version names the build's
@@ -39,6 +39,7 @@ use std::time::Instant;
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{PrefillPath, Qwen35moeModel};
+use bloomery_gpu_gates::record::{self, Kind, Record};
 use bloomery_gpu_gates::{GateError, model_file, ref_model_path};
 use decision::release;
 use gguf::Split;
@@ -49,7 +50,12 @@ use tokenizer::Tokenizer;
 
 use crate::clef_seat;
 
-const NAME: &str = "bloomery-serve";
+/// The seat's record bin name, the `listening` record's head.
+const WHAT: &str = "bloomery-serve-decide";
+
+/// What this seat prints, all on stderr (its `--records-schema`): the
+/// `listening` record.
+static KINDS: &[&Kind] = &[&record::LISTENING_DECIDE];
 
 const USAGE: &str = "usage: bloomery-serve [--model decide] (-m PATH | --hf <repo>[:<quant>]) \
                      [--head <weights> [--head-config <file>]] [--host H] [--port P] [--ctx C]";
@@ -353,6 +359,7 @@ fn head_files(from: Pick) -> Result<(&'static Row<Open>, PathBuf, PathBuf), Gate
 /// file came from under `--hf`: the model's name, else its file name.
 pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, GateError> {
     bloomery_levers::at_main(&[])?;
+    record::at_main(WHAT, KINDS);
     let a = parse_args(args)?;
     let (row, head, config) = head_files(from)?;
     let model = ref_model_path()?;
@@ -416,9 +423,12 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         .map_err(|e| format!("bind {addr}: {e}"))?;
     // The bound address: `--port 0` binds a free port.
     let bound = server.local_addr()?;
-    println!(
-        "{NAME}: listening on http://{bound} (model {model_name}, quant {quant}, head {head_name}, row {})",
-        row.name
-    );
+    Record::new(&record::LISTENING_DECIDE)
+        .w("model", &model_name)
+        .w("quant", &quant)
+        .w("head", &head_name)
+        .w("row", row.name)
+        .w("addr", bound)
+        .eprint();
     Ok(ServeError::Io(server.run()))
 }
