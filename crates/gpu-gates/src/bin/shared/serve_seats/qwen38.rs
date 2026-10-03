@@ -298,12 +298,18 @@ impl BreakEven {
     /// The break-even at `place`: the draft's gain a token times the rate a
     /// reset re-prefills at — the ubatch walk's under `a` and `gate` (plan
     /// (a)'s stands for the 3090's: the product is a ratio of one card's own
-    /// rates), a plain step's under `bp`, whose prompt runs ubatches too
-    /// (`Body38::resolve_prompt`) at a rate this table does not hold.
+    /// rates). Under `bp` the prompt runs that walk too
+    /// (`Body38::resolve_prompt`: a tier load takes it at every length), at a
+    /// rate this table does not hold: it waits on the qwen38 two-card lease
+    /// A/B of `docs/cards/q38tier-ab.card`, and until that sitting lands the
+    /// plain step's rate stands in, which understates the break-even with it
+    /// — the seat keeps prefixes a reset would re-prefill for less.
     fn of(place: Place38) -> BreakEven {
         let gain = 1.0 / PLAIN_TPS - 1.0 / DRAFTED_TPS;
         let rate = match place.kind {
             Kind38::A | Kind38::Gate => PROMPT_IDS_PER_S,
+            // bp's own walk rate, not this: the lease A/B the comment above
+            // names.
             Kind38::Bp => PLAIN_TPS,
         };
         BreakEven {

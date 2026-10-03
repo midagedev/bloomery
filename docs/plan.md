@@ -125,8 +125,11 @@ tokens, round q38head2), and 277 when the request bounds nothing; a request that
 rig-log 09-30#q38seed-ab). ρ is the rate a reset re-prefills at with the draft on: 1,224.1 ids/s under `--place a`
 (the default arm at P 4096, rig-log 10-01#q38hol-ab), so 5.718 ids per reply token and k* = 1,585 at R = 277
 [derived]. `--place gate` takes plan (a)'s terms: k* = R · (ρ/plain) · (1 − plain/drafted) is a product of one card's
-own rate ratios [derived; no 3090 row]. `--place bp` feeds its prompt by steps, so ρ is the plain step's rate and k*
-= R · (1 − plain/drafted) = 0.270 R, 75 at 277 [derived; re-derived when bp's prompt walk lands]. Not counted: the P
+own rate ratios [derived; no 3090 row]. `--place bp` ~~feeds its prompt by steps, so ρ is the plain step's rate~~ — its prompt walk landed (the tier's packed rows:
+`Body38::resolve_prompt` takes the ubatch walk at every length on a tier load), so ρ is bp's own walk rate, which the functional rows read past plan (a)'s
+(1,483 against 1,225 ids/s at P 4096, a's row beside the admissible 1,224; `docs/cards/q38tier-ab.card` — functional, not admissible), and k* = R · Δ · ρ_bp
+waits on that card's lease A/B (both cards, unrun). Until that sitting the seat keeps the plain step's rate as the stand-in: k* = R · (1 − plain/drafted) = 0.270
+R, 75 at 277 [derived], understated by the walk's whole margin — the seat keeps prefixes a reset would re-prefill for less. Not counted: the P
 512 pair (57.18 / 91.24) gives Δ = 6.53 ms, k* +40 % [derived]; the shipped head list raises the drafted rate
 ~~+2.0..+5.4 % [derived]~~ +4.8 % [+2.5, +7.3] at P 4096 and +6.4 % at P 512 (A6000, n = 96, 6 rounds,
 `docs/cards/q38head2-ab.card`), Δ +12 % [+6, +18] at P 4096 [derived from it]; a kept prefix's remaining prompt runs plain, about 6 % faster; the draft stays off past the reply until a
