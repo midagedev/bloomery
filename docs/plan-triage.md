@@ -120,6 +120,43 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### 다음 릴리즈 백로그 (10-04 수집, 리드 — 0.2.0·설치 채널 뒤의 열린 것을 한 곳에; 중복 줄은 아래 각절이 주인)
+
+버전 틀은 사용자 결정 대기(0.2.1 소형 후속 먼저 vs 곧바로 0.3.0 성능 묶음). 수집 기준: 사용자가 겪는 결함과 검증 빚이 앞, 헤드라인 성능이 뒤.
+
+**A. 서빙 견고성·UX (사용자가 바로 겪음)**
+- 서버 견고성 셋: 연결마다 스레드 상한 없음(`serve/src/api.rs` 수락 루프, S) · temp>0에서 토큰마다 n_vocab `Vec` 재할당(`bind.rs` `logits()`, 버퍼 재사용, S) · 위치 상한 초과 요청이 엔진 오류로 서버 전체 exit 70 → 요청 검증에서 400(`body.rs` `check_defined`, S). 출시 트랙 절 참조.
+- `--ctx` 기본을 모델 학습 컨텍스트에서, 메모리가 못 받으면 이름 붙은 거부 (S) — 0.2.1 후보로 미뤄둔 것.
+- 탄력 `--parallel`: park 예산이 감당하는 만큼 기본, 플래그는 상한 (S) — 같은 미룸.
+- Qwen3.8 MTP 재결합 → qwen38 좌석 `--parallel` (S–M) — glmsave의 공유 park/unpark 위 `Seq38`(glmsave2 보고 §6).
+- 서빙 작은 것들: `partial_path` 프로세스 단위 충돌(원자 카운터, S) · restore·erase 뒤 `GET /slots`의 `prompt`·`settings` 낡음(S) · `http.rs` 퍼센트 디코딩(S). slotsnap 절 참조.
+- 빈 캐시 첫 시작의 마지막 JIT가 직렬 (M): 번들 JIT ~7 s를 적재 업로드 옆 스레드로 → 첫 시작 ≈ max(JIT, load). line3 절 참조.
+- memguard 잔여: 홀드된 카드 위 serve 응답 비교 한 줄 · auto-placed 실행의 `--prefill gemm` 거부가 적재 뒤에 온다(좌석 문서에 이미 적힘).
+
+**B. 게이트 빚 (증명 구멍, 모두 절 주인이 있는 것의 이름만)**
+- MODELS/FIRST_START 상수 줄 절 (XS) · qwen3 스왑 ids-동일 절 (S) · `plan_nextn` FrontOver FAIL-first (S) · serve 게이트의 drafted CLI arm 컷 (S) · q38sel 풀 합 순서 절 (XS). 각각 0.2.0의 날·glmswap·열차 7 절 참조.
+
+**C. 설치·출시 채널 (0.2.0 저녁 작업의 빚)**
+- **publish 절차 스키 없음 (S)**: 이번 애셋 이름 사고(`release-upload.tar.gz`로 404)는 수동 업로드 탓 — `tools/release/publish.sh`가 박스에서 타르볼·sha를 받아 네 검사를 재확인하고 build.sh가 쓴 이름으로만 업로드하며, 릴리스 body의 Install 절을 버전·sha와 함께 갱신한다. 크레이트 버전(bloomery-serve·gpu-gates 둘) 올리는 것도 절차에 넣는다.
+- brew formula 실설치 검증: 맥의 `brew fetch`는 URL·sha를 뒀고 formula 파싱은 됐으나 전체 `brew install` 완주는 이 맥의 QEMU 컨테이너에서 불가했다(SSSE3 게이트·TTY 프로브·popen 교착). brew가 있는 x86_64 리눅스 한 대에서 한 번(S, sihyung WSL에 brew를 설치할지는 사용자 결정).
+- 도커 GPU 경로 실기 검증: ghcr 이미지의 `--version`까지는 검증; NVIDIA Container Toolkit 호스트에서의 서빙 실행은 한 번도 안 돌았다(맥에 NVIDIA 런타임 없음, 박스에 docker 없음).
+- container.yml의 actions가 Node 20 deprecation 경고(버전 올리기, XS).
+- 다음 릴리스부터 workflow가 자동으로 이미징한다(v* 태그) — 태그 푸시 = 이미지 게시임을 release 절차 문서에 한 줄.
+
+**D. 청소 묶음 (XS~S 모음, 익스프레스 트레인 한 대)**
+- `body35.rs:2`의 Clef backbone 이름 (XS) · A6000 이름 주석 넷 (S) · `recipes.py`의 `bind::` 테스트 수 핀 (S) · Body35 카드 형식·coverage 핀 (S, line3 절) · decide 좌석 listening 줄을 record Kind로 (S) · `depth-glm5next-stub` 매번 다른 케이스 실패(원인 모름, 조사 포함, M) · LANEPREFETCH 기본 on 플립(XS + V4.1 noninf 시팅) · qwen38 bp 손익분기의 프롬프트 률 한 번 (S).
+
+**E. 헤드라인 성능 후보 (0.3.0의 살코기 — 아래 각절에 상세)**
+- GLM: prompt-call pick (M, 가장 큰 레버) · 기본 P=0 (XS, A/B 뒤) · `knee` 규칙 프리셋 · 창 밖 멈춤 staging. glmpaper-replay 절 참조.
+- glmnext 잔여 레버: pack scale 경로 벡터화(+5.6 %), MLA front 깊이 기울기, 공유 expert GEMM.
+- callstream(착지, 기본 off): pp 미스의 처분과 레버 전환. 재구성 절 참조.
+- Qwen3.8 레버 순서(사용자 09-28 지정): 배치 프리필 → 두 카드 residency → raw Q5_1 → MTP.
+- **공개 숫자 warm 재측정 시팅**(사용자 결정 09-28 "glm의 프리필과 qwen3.8의 개선이 명확해진 다음에 재자"): GLM 프리필 세 연착지(glmswap +36 %·glmgemm2 +13 %·glmnext +8.5 %)로 조건이 열렸다 — qwen38 개선을 어디까지 넣고 재지을지가 0.3.0 범위와 같은 결정.
+- 새 모델 행: clefgguf(llama.cpp #29831 머지 뒤, ~360줄) · Kev-4B·lev 행(~820줄). line3 절 참조.
+
+**F. 다음 버전에 닿는 사용자 결정 대기**
+- 공개 시점(M1 숫자만 vs M2 함께) · 서빙 호스트 집합 잠금 기본(S) · skip-softmax·SWA bounded replay(손실 기법, 무손실 소진 뒤 재검토 조건 그대로).
+
 ### 0.2.0의 날이 남긴 것 (10-03 밤, 리드 — decideseat·q3off·slotswap·glmsave·P3·seatpick·P4·memguard·glmnext 착지, 8d62f74a·68f72d68)
 
 - **MODELS/FIRST_START 게이트 절 없음 (XS)**: seatpick의 두 상수 줄(`bloomery_serve.rs`의 `--help` 표와
