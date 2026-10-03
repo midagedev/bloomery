@@ -746,24 +746,15 @@ fn read_rows(
     Ok((held, v))
 }
 
-/// `got`'s rows back into the arena whose row `r` is `rows[r]`, each `wide`
-/// values; refused by name for rows of another count or width.
+/// `v`'s rows back into the arena whose row `r` is `rows[r]`, each `wide`
+/// values, as many as `v` holds ([`Body::draft_fits`] held them to the
+/// arena).
 fn write_rows(
     stream: &CudaStream,
-    got: &(Held, Vec<f32>),
+    v: &[f32],
     rows: &mut [&mut DeviceBuffer<f32>],
     wide: usize,
 ) -> Result<(), GpuError> {
-    let (held, v) = got;
-    let r = held.rows as usize;
-    if r > rows.len() || v.len() != r * wide {
-        return Err(shape(format!(
-            "{} values for {} of an arena of {} rows of {wide}",
-            v.len(),
-            held.shown(),
-            rows.len()
-        )));
-    }
     for (b, row) in rows.iter_mut().zip(v.chunks_exact(wide)) {
         span_mut(WHAT, b, 0, wide)?.copy_from_host(stream, row)?;
     }
@@ -808,35 +799,62 @@ impl Body {
         }))
     }
 
-    /// `d` put back on a model that stands at `pos` ([`Body::draft_rows`]'s
-    /// rows): the store holding `d`'s positions, the step's and the verify's
-    /// arenas their rows, the prompt batch's arena none. Refused by name on a
-    /// load without the layer and for a store past `pos`.
-    pub(super) fn put_draft_rows(
-        &mut self,
-        stream: &CudaStream,
-        d: &DraftRows,
-        pos: u32,
-    ) -> Result<(), GpuError> {
-        let fin = crate::program::final_streams(self.cfg.len());
-        let wide = HC_STREAMS * self.dims.embd;
-        let Body {
-            s, nextn, wrote, ..
-        } = self;
-        let nx = nextn.as_deref_mut().ok_or_else(|| {
-            shape("the NextN rows of a state onto a load without the layer".into())
-        })?;
+    /// Refused by name unless `d` fits this load standing at `pos`, nothing
+    /// copied: the layer loaded, the store's positions and each arena's at
+    /// or below `pos`, each arena's rows within its buffers (the step's one,
+    /// the verify's two) and of the model's width.
+    pub(super) fn draft_fits(&self, d: &DraftRows, pos: u32) -> Result<(), GpuError> {
+        if self.nextn.is_none() {
+            return Err(shape(
+                "the NextN rows of a state put back on a load without the layer".into(),
+            ));
+        }
         if d.held > pos {
             return Err(shape(format!(
                 "a NextN store of {} positions put back at {pos}",
                 d.held
             )));
         }
-        write_rows(stream, &d.step, &mut [&mut s.row0.streams[fin]], wide)?;
+        let wide = HC_STREAMS * self.dims.embd;
+        let pair = 1 + usize::from(self.s.row1.is_some());
+        for (what, (held, v), rows) in [("step", &d.step, 1), ("verify", &d.pair, pair)] {
+            let r = held.rows as usize;
+            if r > rows || v.len() != r * wide || (r > 0 && held.first + held.rows > pos) {
+                return Err(shape(format!(
+                    "the {what} arena's {} ({} values) put back into {rows} rows of {wide} at \
+                     position {pos}",
+                    held.shown(),
+                    v.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `d` put back on a model that stands at `pos` ([`Body::draft_rows`]'s
+    /// rows): the store holding `d`'s positions, the step's and the verify's
+    /// arenas their rows, the prompt batch's arena none. Refused by name, as
+    /// [`Body::draft_fits`] refuses, before any copy.
+    pub(super) fn put_draft_rows(
+        &mut self,
+        stream: &CudaStream,
+        d: &DraftRows,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        self.draft_fits(d, pos)?;
+        let fin = crate::program::final_streams(self.cfg.len());
+        let wide = HC_STREAMS * self.dims.embd;
+        let Body {
+            s, nextn, wrote, ..
+        } = self;
+        let nx = nextn.as_deref_mut().ok_or_else(|| {
+            shape("the NextN rows of a state put back on a load without the layer".into())
+        })?;
+        write_rows(stream, &d.step.1, &mut [&mut s.row0.streams[fin]], wide)?;
         let mut pair_rows: Vec<&mut DeviceBuffer<f32>> = std::iter::once(&mut nx.pair0)
             .chain(s.row1.as_mut().map(|r| &mut r.streams[fin]))
             .collect();
-        write_rows(stream, &d.pair, &mut pair_rows, wide)?;
+        write_rows(stream, &d.pair.1, &mut pair_rows, wide)?;
         nx.held = d.held as usize;
         *wrote = Wrote {
             step: d.step.0,

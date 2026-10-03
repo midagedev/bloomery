@@ -43,8 +43,8 @@ mod tensors;
 mod tier;
 
 pub use body::nextn::{
-    DraftRows, GlmArena, Nextn, NextnFeed, NextnHead, NextnHidden, NextnMode, WALK_ROWS,
-    nextn_chain, nextn_hidden, nextn_logits, nextn_store, nextn_target_streams, nextn_walk,
+    GlmArena, Nextn, NextnFeed, NextnHead, NextnHidden, NextnMode, WALK_ROWS, nextn_chain,
+    nextn_hidden, nextn_logits, nextn_store, nextn_target_streams, nextn_walk,
 };
 pub use body::prefill::{
     CHUNK, GEMM_FROM, GlmPromptSink, PrefillMode, PromptBytes, RouteTapRows, StoreDigest,

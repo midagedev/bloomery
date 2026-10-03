@@ -1,4 +1,4 @@
-//! A GLM sequence state on the host ([`GlmSeq`], the shared
+//! A GLM sequence state on the host ([`GlmSeq`], over the shared
 //! `bloomery_gpu::checkpoint::saved`): what a server's prompt cache or its
 //! slot swap holds for a sequence it switches away from.
 //!
@@ -32,10 +32,10 @@ use super::nextn::{DraftRows, Nextn};
 use super::{Body, Store, shape};
 
 /// A GLM sequence state ([`seq_save`]): the shared state of the module
-/// doc's rows and stores, and the NextN side's host bytes beside it.
+/// doc's rows and stores, and on a NextN load the layer's side beside it.
 pub struct GlmSeq {
-    state: SeqState<SeqHost>,
-    side_bytes: usize,
+    state: SeqState<()>,
+    draft: Option<DraftRows>,
 }
 
 impl GlmSeq {
@@ -48,7 +48,7 @@ impl GlmSeq {
     /// The host bytes it holds: the shared state's and the NextN side's.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.state.bytes() + self.side_bytes
+        self.state.bytes() + self.draft.as_ref().map_or(0, DraftRows::bytes)
     }
 
     /// The positions of the points it carries, ascending.
@@ -63,13 +63,6 @@ impl GlmSeq {
     pub fn keep_point(&self, n: u32) -> u32 {
         self.state.keep_point(n)
     }
-}
-
-/// The host value beside a state's position: at the held position the NextN
-/// side on a NextN load ([`DraftRows`]); at a carried point nothing.
-#[derive(Clone, Debug, Default)]
-pub struct SeqHost {
-    draft: Option<DraftRows>,
 }
 
 /// The rows of positions below `n` of one latent store's three planes: its
@@ -126,17 +119,14 @@ impl Body {
     fn save_state(&mut self, stream: &CudaStream, pos: u32) -> Result<GlmSeq, GpuError> {
         self.stores_at(pos)?;
         self.apply_cut(stream)?;
-        let current = SeqHost {
-            draft: self.draft_rows(stream, pos)?,
-        };
-        let side_bytes = current.draft.as_ref().map_or(0, DraftRows::bytes);
-        let points: Vec<(u32, SeqHost)> = self
+        let draft = self.draft_rows(stream, pos)?;
+        let points: Vec<(u32, ())> = self
             .ckpt
             .positions()
             .into_iter()
             .rev()
             .find(|&p| p < pos)
-            .map(|p| (p, SeqHost::default()))
+            .map(|p| (p, ()))
             .into_iter()
             .collect();
         let lane = self.s.lanes.committed();
@@ -150,24 +140,17 @@ impl Body {
             positional: &mut positional,
             recurrent: &mut recurrent,
         };
-        let state = SeqState::save(
-            stream,
-            self.who.clone(),
-            pos,
-            &lent,
-            current,
-            points,
-            &self.ckpt,
-        )?;
-        Ok(GlmSeq { state, side_bytes })
+        let state = SeqState::save(stream, self.who.clone(), pos, &lent, (), points, &self.ckpt)?;
+        Ok(GlmSeq { state, draft })
     }
 
     /// `s` put back on the empty model: the stores standing at its
     /// positions, every KDA layer's committed lane stamped there, the points
     /// it carried the checkpoints, its NextN side the layer's. Refused by
-    /// name, nothing copied, for another model's state or layout or onto a
-    /// model that is not empty; a NextN side that does not fit after the
-    /// copies leaves the model to a reset, its checkpoints dropped.
+    /// name, nothing copied, onto a model that is not empty, for a NextN
+    /// side the load does not take (a state with it onto a load without the
+    /// layer, or the other way: the store layouts differ), and for another
+    /// model's state or layout ([`SeqState::load`]).
     fn load_state(&mut self, stream: &CudaStream, s: &GlmSeq) -> Result<(), GpuError> {
         const WHAT_L: &str = "glm5next resume";
         self.stores_at(0).map_err(|e| GpuError::Shape {
@@ -175,8 +158,17 @@ impl Body {
             detail: format!("a resume onto a model that is not empty ({e}): reset first"),
         })?;
         let n = s.positions();
+        match &s.draft {
+            Some(d) => self.draft_fits(d, n)?,
+            None if self.nextn.is_some() => {
+                return Err(shape(
+                    "a state without the NextN rows put back on a load with the layer".into(),
+                ));
+            }
+            None => {}
+        }
         let lane = self.s.lanes.committed();
-        let cur = {
+        {
             let (mut positional, mut recurrent) = lend(
                 &mut self.stores,
                 self.nextn.as_deref_mut(),
@@ -187,23 +179,10 @@ impl Body {
                 positional: &mut positional,
                 recurrent: &mut recurrent,
             };
-            s.state
-                .load(stream, &self.who, &mut lent, &mut self.ckpt)?
-                .0
-                .clone()
-        };
-        let side = match (&cur.draft, self.nextn.is_some()) {
-            (Some(d), true) => self.put_draft_rows(stream, d, n),
-            (None, false) => Ok(()),
-            (d, layer) => Err(shape(format!(
-                "a state {} NextN rows onto a load {} the layer",
-                if d.is_some() { "with" } else { "without" },
-                if layer { "with" } else { "without" }
-            ))),
-        };
-        if let Err(e) = side {
-            self.ckpt.clear();
-            return Err(e);
+            s.state.load(stream, &self.who, &mut lent, &mut self.ckpt)?;
+        }
+        if let Some(d) = &s.draft {
+            self.put_draft_rows(stream, d, n)?;
         }
         for st in &mut self.stores {
             st.restamp(stream, lane, n)?;
@@ -235,7 +214,7 @@ pub fn seq_save(m: &mut GpuModel<Body>) -> Result<GlmSeq, GpuError> {
 /// reset unless the model is empty already (a reset just before, or the
 /// load; the residency stays where use has taken it), then — as a pass of
 /// `s`'s positions whose work is the copies — the state put back; the model
-/// stands at its positions, its checkpoints the points `s` carried and no
+/// stands at its positions, its checkpoints the point `s` carried and no
 /// other, and the calls after it are bit for bit those after the state was
 /// taken. Refused by name, nothing copied, for another model's state (its
 /// file, card or context) or layout.

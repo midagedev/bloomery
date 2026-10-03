@@ -39,6 +39,11 @@
 //! skips: it proposes nothing, every pass a plain step, until a prompt call
 //! from position 0 or a restart; the call's [`Join`] names why.
 //!
+//! A server that switches the target between sequences parks the draft's
+//! waiting rows with the sequence's state ([`MtpDraft::park`]) and puts them
+//! back with it ([`MtpDraft::unpark`]): the returning sequence's next call
+//! joins it as the call after no switch would.
+//!
 //! The proposal changes which passes run, never a token: every kept token is
 //! the target's own argmax. The hidden rows never leave the card: a walk
 //! names them by the arena a target call left them in and the row they
@@ -255,6 +260,7 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
 /// The refresh a window's chain opens with: its rows' tokens, their first
 /// position, and where their hidden rows sit — the arena `walk`'s rows
 /// `first` on, one row a walk row.
+#[derive(Clone, Debug)]
 struct Refresh<A> {
     tokens: Vec<u32>,
     pos0: u32,
@@ -304,6 +310,22 @@ const ENDS_ELSEWHERE: &str = "the rows waiting for the draft do not end at the c
 /// A join the draft cannot make: the store is behind the waiting rows.
 const STORE_BEHIND: &str = "the draft's store does not hold the positions below the rows \
                             waiting for it";
+/// A join the draft cannot make: the sequence was parked with its waiting
+/// rows in a prompt call's arena.
+const PROMPT_ARENA: &str = "the rows waiting for the draft sat in a prompt call's arena when the \
+                            sequence was parked, and a parked sequence keeps only the step's and \
+                            the verify's";
+
+/// What a draft holds of the target's sequence between two calls, kept
+/// apart while another sequence runs ([`MtpDraft::park`]) and put back with
+/// it ([`MtpDraft::unpark`]): the rows waiting for its next walk, or why it
+/// proposes nothing.
+#[derive(Clone, Debug)]
+pub struct Parked<A> {
+    next: Option<Refresh<A>>,
+    last_unit: Option<(A, usize)>,
+    skip: Option<&'static str>,
+}
 
 /// How a prompt call that continues a held sequence joined the draft to it
 /// ([`MtpDraft::take_joined`]).
@@ -411,6 +433,60 @@ impl<B: MtpBody> MtpDraft<B> {
         self.last_unit = None;
         self.joined = None;
         self.skip = None;
+        if let Some(w) = &mut self.windows {
+            w.pending = None;
+        }
+    }
+
+    /// What the draft holds of the target's sequence between two calls, for
+    /// the caller's sequence state ([`MtpDraft::unpark`] puts it back): the
+    /// rows waiting for its next walk when they sit in the step's or the
+    /// verify's arena ([`MtpBody::STEP_ARENA`], [`MtpBody::VERIFY_ARENA`]),
+    /// or why it proposes nothing — its own skip, or rows a prompt call's
+    /// arena holds, which a sequence state does not keep. The caller's
+    /// state keeps the draft's store and those two arenas' rows with the
+    /// positions they hold, so the walk after the put-back reads the rows it
+    /// would have read; a body whose walk does not refuse an arena that holds
+    /// other positions must not park.
+    #[must_use]
+    pub fn park(&self) -> Parked<B::Arena> {
+        let kept = |walk: B::Arena| walk == B::STEP_ARENA || walk == B::VERIFY_ARENA;
+        let skipping = |why| Parked {
+            next: None,
+            last_unit: None,
+            skip: Some(why),
+        };
+        match (self.skip, &self.next, self.last_unit) {
+            (Some(why), _, _) => skipping(why),
+            (None, Some(r), _) if kept(r.walk) => Parked {
+                next: Some(r.clone()),
+                last_unit: None,
+                skip: None,
+            },
+            (None, None, Some((walk, rows))) if kept(walk) => Parked {
+                next: None,
+                last_unit: Some((walk, rows)),
+                skip: None,
+            },
+            (None, Some(_), _) | (None, None, Some(_)) => skipping(PROMPT_ARENA),
+            (None, None, None) => Parked {
+                next: None,
+                last_unit: None,
+                skip: None,
+            },
+        }
+    }
+
+    /// `p`, which [`MtpDraft::park`] took, back in place once the target's
+    /// sequence stands where it stood then (the caller's state put back,
+    /// the draft's store and the two arenas with it): the next call walks
+    /// the waiting rows as it would have, or skips for the parked why, its
+    /// [`Join`] naming it.
+    pub fn unpark(&mut self, p: &Parked<B::Arena>) {
+        self.next = p.next.clone();
+        self.last_unit = p.last_unit;
+        self.skip = p.skip;
+        self.joined = None;
         if let Some(w) = &mut self.windows {
             w.pending = None;
         }

@@ -56,8 +56,8 @@
 //!   read: the NextN walk writes no row of the target's head, so a `step_row`
 //!   left at the default reads the same row; the clause holds the sampled
 //!   path's ids end to end; and `cache` again under the draft, where the
-//!   draft also rejoins A where A left it, its proposals and accepts the
-//!   no-switch run's. Exact: with no residency nothing
+//!   draft also rejoins A where A left it, its counts the no-switch run's.
+//!   Exact: with no residency nothing
 //!   moves between the host and the card, every kept token is the target's
 //!   own argmax, and a verify's rows are its steps' bits — the window's
 //!   wiring end to end, which the drafted arm's clause holds only up to the
@@ -187,8 +187,8 @@ mod gate {
                           which of them is the longest.";
     const TURN_B: &str = "Write a haiku about a lighthouse in winter.";
     const LATER_A: &str = " And which of them reaches the sea first?";
-    const STRIPPED_A: &str = "The Rhine, the Danube and the Elbe; the Danube is the longest. \
-                              And which of them reaches the sea first?";
+    const STRIPPED_A: &str = "Rhine, Danube and Elbe; the Danube is the longest. And which of \
+                              them reaches the sea first?";
     /// The drafted arm's residency word: no seed expert pinned, one spare a
     /// layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
@@ -805,17 +805,20 @@ mod gate {
     /// - (a) A's turn, its reply and a later text: it keeps every position A
     ///   held (a `cache load` note, `cache_n` the run with no switch's), and
     ///   its ids are that run's; under the draft the draft rejoins where A
-    ///   left it — no `mtp prompt` record says it skips, and its proposals
-    ///   and accepts are that run's, so the NextN store, its positions and
-    ///   the arena rows the waiting rows read came back bit for bit;
+    ///   left it — no `mtp prompt` record says it skips (the parked rows and
+    ///   the NextN store's positions came back), it drafts and accepts, and
+    ///   its counts are that run's: counts, which hold the store's and the
+    ///   arena rows' bits only as far as a moved proposal moves an accept;
     /// - (b) A's turn with another text in place of its reply, so the shared
     ///   prefix ends at the turn: it keeps the checkpoint at the turn's
     ///   prompt call's end (the point the state carried), and its ids are the
     ///   run with no switch's, which cut to the model's own checkpoint there.
     ///
     /// Mutants: the state carrying no point ((b) keeps nothing); the KDA
-    /// stores left out of the resume ((a)'s ids move); under the draft the
-    /// rejoin left out (the draft skips by name, (a)'s proposals move).
+    /// stores zeroed after the put-back ((a)'s ids move); the latent rows
+    /// zeroed after it ((a)'s and (b)'s ids move); the seat's rule granting
+    /// nothing of a saved state (no `cache load`: (a) and (b) keep nothing);
+    /// under the draft its side not put back (the draft skips by name).
     fn cache(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,
@@ -927,9 +930,8 @@ mod gate {
     /// their `residency pass` records, and the draft rejoining (no `mtp
     /// prompt` record says it skips, and it drafts). Its ids are printed, not
     /// held: B's passes land flips, and a flip moves an expert between the
-    /// host and the card, whose sums round another way. Mutant: the resume
-    /// without its reset (the body refuses a resume onto a model that is not
-    /// empty, the request fails).
+    /// host and the card, whose sums round another way. Mutant: the draft's
+    /// side not put back (the draft skips by name).
     fn resume_under_residency(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,

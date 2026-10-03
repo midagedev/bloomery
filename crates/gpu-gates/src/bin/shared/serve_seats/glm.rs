@@ -5,7 +5,8 @@
 //! one-binary server).
 //!
 //!     [--host 127.0.0.1] [--port 8080] [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C]
-//!     [--alias NAME] [--chat-template-file PATH] [--prefill batch|steps] [--plan]
+//!     [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] [--chat-template-file PATH]
+//!     [--prefill batch|steps] [--plan]
 //!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
 //! `tokenizer.chat_template` the chat template (`--chat-template-file`
@@ -42,11 +43,27 @@
 //! marks no user-start token, so the server asks nowhere to cut a prompt
 //! call: the checkpoint spacing owns where a cut can land.
 //!
-//! The server's host prompt cache is off for this seat (its budget 0): a
-//! checkpoint lives in the model's own host slots, not a value a cache could
-//! hold, and the latent layers' cache rows have no copy either, so
-//! `snapshot` and `resume` refuse by name and slot save/restore answers the
-//! server's own 501.
+//! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
+//! holds the slot's sequence state when a request of another session takes
+//! the slot (`bloomery_gpu_glm5next::seq_save`): every latent layer's rows
+//! of the held positions, each KDA layer's state and conv ring at the held
+//! position and at the last checkpoint below it (the last prompt call's
+//! end), and on a NextN load the layer's store rows and the target's rows
+//! its draft reads next, with the draft's waiting rows beside them
+//! ([`DraftedSeat::park`]). A returning session's state comes back whole
+//! after the session's reset (`seq_resume`), its checkpoints that one point,
+//! its draft joining where it left (`DraftedSeat::unpark`); the residency is
+//! the model's and stays where use has taken it, the state carrying no slot
+//! map. Its default is the lesser of `bind::CACHE_RAM_CAP` and half of what
+//! `MemAvailable` leaves at load past the plan's host need, the residency's
+//! churn pool and the checkpoints' host budget (`bind::CacheRam`); a `cache`
+//! line on stderr after the `residency host` record (`--plan` too) prints it
+//! with each term. A state of another model, card, context or store layout
+//! is refused by name; every save, load, eviction and skip prints as a line.
+//! `--slot-save-path` names the directory the slot actions answer from
+//! (none refuses every one, as llama-server does): `erase` drops the slot,
+//! and `save` and `restore` answer the server's own 501, a state being a
+//! host value and not a file.
 //!
 //! `BLOOMERY_DRAFT=mtp` loads the file's next-token layer beside the target
 //! (`app::arch::glm5next::open_nextn`, the plan `PlanInputs::plan_nextn`
@@ -100,9 +117,11 @@
 //! parsed once, at `main` (`bloomery_levers::at_main`), which refuses by name
 //! a lever set outside them; `--levers` prints them with this process's
 //! values and exits. The stderr lines named above are records of the kinds
-//! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
-//! kinds and exits.
+//! `bloomery_gpu_gates::record` declares, but for the `cache` line and the
+//! prompt cache's notes past `cache reuse`, which print as their own lines;
+//! `--records-schema` prints those kinds and exits.
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -113,13 +132,16 @@ use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
+    CacheRam, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
+    sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Kind, Record};
 use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, ref_model_path};
-use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode};
+use bloomery_gpu_glm5next::{
+    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_resume, seq_save,
+};
 use bloomery_levers::{
     GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
 };
@@ -136,7 +158,7 @@ use serve::{
 };
 use tokenizer::Tokenizer;
 
-use super::drafted::DraftedSeat;
+use super::drafted::{DraftedSeat, ParkedDraft};
 use crate::glm_place;
 
 /// The seat's name, as its records and errors print it.
@@ -144,18 +166,12 @@ const WHAT: &str = "bloomery-serve-glm";
 
 const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] \
-                     [--ctx C] [--alias NAME] [--chat-template-file PATH] \
-                     [--prefill batch|steps] [--plan]";
+                     [--ctx C] [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] \
+                     [--chat-template-file PATH] [--prefill batch|steps] [--plan]";
 
 /// The positions the stores are sized for when `--ctx` names none:
 /// `generate_glm5next`'s default.
 const CTX: usize = 2048;
-
-/// Why no state is saved or put back: the recurrent state lives only in the
-/// model's own checkpoint slots and the latent cache rows have no copy.
-const SNAPSHOT_WHY: &str = "the KDA recurrent state lives only in the model's own checkpoint \
-                            slots and the latent layers' cache rows have no copy: no sequence \
-                            state is a value the cache could hold";
 
 /// What this seat prints, all on stderr (its `--records-schema`): the
 /// residency lever's word, the `plan`, `load` and `capture` lines
@@ -332,6 +348,11 @@ struct Args {
     place: Place,
     ctx: usize,
     alias: Option<String>,
+    /// `--cache-ram` in bytes; `None` takes the default.
+    cache_ram: Option<u64>,
+    /// `--slot-save-path`: the directory the slot actions answer from;
+    /// `None` refuses every one, as llama-server does.
+    slot_save_path: Option<PathBuf>,
     /// `--chat-template-file`, replacing the file's own template.
     template_file: Option<PathBuf>,
     prefill: PrefillMode,
@@ -346,6 +367,8 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         place: Place::A,
         ctx: CTX,
         alias: None,
+        cache_ram: None,
+        slot_save_path: None,
         template_file: None,
         prefill: PrefillMode::Batch,
         plan_only: false,
@@ -368,6 +391,8 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--place" => a.place = glm_place::parse(v)?,
             "--ctx" => a.ctx = v.parse()?,
             "--alias" => a.alias = Some(v.to_owned()),
+            "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(v)?),
+            "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
             "--prefill" => {
                 a.prefill = PrefillMode::from_name(v)
@@ -443,6 +468,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     record::plan(a.place.name(), &machine, &plan).eprint();
     let residency = residency_at(&plan, lever, beside)?;
+    let pool = match residency {
+        Residency::Mid { pinned, .. } => {
+            ChurnPool::of(&plan, GLM_CARD, pinned)
+                .map_err(|e| format!("the churn pool: {e}"))?
+                .bytes
+        }
+        Residency::Off => 0,
+    };
+    let cache = CacheRam::of(a.cache_ram, HostNeed::of(&plan, beside).bytes(), pool)?;
+    eprintln!("{}", cache.line());
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
         std::process::exit(0);
@@ -477,15 +512,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_bytes,
         residency,
     };
-    // The prompt cache is off (its budget 0): the seat's snapshot refuses, and
-    // slot save/restore is the server's own 501.
     let engine = SeatEngine::spawn(
         move || Glm::open(open),
         a.ctx,
         vocab,
         machine.cards[0].name.clone(),
         props,
-        0,
+        cache.ram,
     )?;
 
     let config = ServerConfig {
@@ -494,7 +527,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         chat_template: template,
         sampler: Some(sampler_factory()),
         fatal_linger: FATAL_LINGER,
-        slot_save_path: None,
+        slot_save_path: a.slot_save_path,
     };
     let server = Server::bind((a.host.as_str(), a.port), Box::new(engine), config)?;
     Record::new(&record::LISTENING_GLM)
@@ -622,6 +655,33 @@ impl Glm {
             record::residency_pass_of(kind, &r).eprint();
         }
         Ok(())
+    }
+}
+
+/// A GLM sequence state as the server's prompt cache holds it ([`GlmSeq`]),
+/// with the draft's side of it when the seat drafts. The cache ranks it by
+/// the body's rule: every position it holds, or the point it carries at or
+/// below the shared prefix.
+struct SavedGlm {
+    state: GlmSeq,
+    draft: Option<ParkedDraft<GlmArena>>,
+}
+
+impl Saved for SavedGlm {
+    fn n_tokens(&self) -> usize {
+        self.state.positions() as usize
+    }
+
+    fn n_bytes(&self) -> u64 {
+        self.state.bytes() as u64
+    }
+
+    fn keepable(&self, n: usize) -> usize {
+        self.state.keep_point(u32::try_from(n).unwrap_or(u32::MAX)) as usize
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -858,23 +918,34 @@ impl Seat for Glm {
         Vec::new()
     }
 
-    /// A GLM sequence state is not a value a cache could hold
-    /// ([`SNAPSHOT_WHY`]). The prompt cache is off, so this is never asked;
-    /// a caller that asks is refused by name.
+    /// The sequence state ([`seq_save`]) and, under the draft, its side of
+    /// it ([`DraftedSeat::park`]), as the prompt cache holds them.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
-        Err(format!("a snapshot at position {}: {SNAPSHOT_WHY}", self.s.pos()).into())
+        Ok(Arc::new(SavedGlm {
+            state: seq_save(self.s.model_mut())?,
+            draft: self.drafted.park(),
+        }))
     }
 
+    /// The state put back ([`seq_resume`]) after the session's reset, then
+    /// the draft's side of it ([`DraftedSeat::unpark`]): the sequence's next
+    /// call runs as it would have with no switch between, its draft joining
+    /// where it left. Refused by name, before the reset, for a state this
+    /// seat did not take or one saved with the draft on put back with it off
+    /// (or the other way); the body refuses another model's state or layout.
     fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
-        Err(format!(
-            "a resume of a state of {} positions: {SNAPSHOT_WHY}",
-            state.n_tokens()
-        )
-        .into())
+        let saved = state
+            .as_any()
+            .downcast_ref::<SavedGlm>()
+            .ok_or("a saved state that is not a glm5next body's")?;
+        self.drafted.takes(saved.draft.as_ref())?;
+        self.drafted.reset(&mut self.s)?;
+        seq_resume(self.s.model_mut(), &saved.state)?;
+        self.drafted.unpark(saved.draft.as_ref())
     }
 
-    /// Only `Reuse` arrives (the cache is off and no call is cut); the other
-    /// notes belong to a caching engine and print as they come.
+    /// A prefix kept less of than shared is a `cache reuse` record; every
+    /// other note of the prompt cache prints as its line.
     fn note(note: &CacheNote) {
         if let CacheNote::Reuse {
             common,
