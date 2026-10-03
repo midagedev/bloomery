@@ -1381,13 +1381,14 @@ impl FfnBatchKernels {
     }
 
     /// Enqueue `ds41_card_buckets`: the table of the `n_slots` places `sel`
-    /// grouped by their `n_experts` card experts, into `order` and `start`.
-    /// One launch. Asynchronous, allocation-free.
+    /// grouped by their `n_experts` card experts, into `order` and `start`
+    /// — the table every grouped path reads, of either model's slots a
+    /// token. One launch. Asynchronous, allocation-free.
     #[allow(
         clippy::too_many_arguments,
         reason = "host launcher over the kernel's flat inputs (rust-quality R8)"
     )]
-    fn enqueue_buckets(
+    pub fn enqueue_buckets(
         &self,
         stream: &CudaStream,
         sel: &DeviceBuffer<u32>,

@@ -194,22 +194,30 @@ pub const fn unit_bytes(n: usize, cap: usize, streams: usize, used: usize, tiere
     4 * cap * (2 * streams * n + (2 + streams) * streams + 4 + used + places)
 }
 
+/// Card bytes of the card experts' grouped scratch for prompt batches of up
+/// to `cap` tokens of `n` values through routed experts of `ff` rows, `used`
+/// slots a token ([`workstation::walk_a_tile_scratch_bytes`]). The one
+/// formula of those bytes: the card body's scratch checks its made bytes
+/// against it.
+#[must_use]
+pub fn card_tile_bytes(n: usize, ff: usize, used: usize, cap: usize) -> usize {
+    let b = workstation::walk_a_tile_scratch_bytes(n as u64, ff as u64, used as u64, cap as u64);
+    usize::try_from(b).unwrap_or(usize::MAX)
+}
+
 /// The card bytes the plan reserves on the stage card for a load of `hp`'s
 /// prompt batch at `ctx_max` positions: its GEMM front
-/// ([`prompt_front_bytes`]) and the units a group of [`PROMPT_GROUP`] holds
-/// past the first ([`group_sets`], [`unit_bytes`] at the front's columns,
-/// the tier places when `tiered`). The first unit and the buffers the units
-/// share but the front come out of the card's margin.
+/// ([`prompt_front_bytes`]), the card experts' grouped scratch
+/// ([`card_tile_bytes`] at the front's columns) and the units a group of
+/// [`PROMPT_GROUP`] holds past the first ([`group_sets`], [`unit_bytes`] at
+/// the front's columns, the tier places when `tiered`). The first unit and
+/// the other buffers the units share come out of the card's margin.
 #[must_use]
 pub fn prompt_reserve_bytes(hp: &Hparams, ctx_max: u64, tiered: bool) -> u64 {
-    let unit = unit_bytes(
-        hp.n_embd,
-        prompt_cols(ctx_max),
-        hp.hc.streams,
-        hp.n_used,
-        tiered,
-    );
-    prompt_front_bytes(hp, ctx_max) + ((group_sets(PROMPT_GROUP) - 1) * unit) as u64
+    let cols = prompt_cols(ctx_max);
+    let unit = unit_bytes(hp.n_embd, cols, hp.hc.streams, hp.n_used, tiered);
+    let tiles = card_tile_bytes(hp.n_embd, hp.expert_ff, hp.n_used, cols);
+    prompt_front_bytes(hp, ctx_max) + (tiles + (group_sets(PROMPT_GROUP) - 1) * unit) as u64
 }
 
 /// Batches a prompt group holds at most under a group lever of `g`
@@ -864,8 +872,8 @@ impl KvBytes for KvLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        KdaLanes, Kind, KvBytes, KvLayout, PROMPT_GROUP, group_sets, groups, recurrent_bytes,
-        row_bytes, unit_bytes,
+        KdaLanes, Kind, KvBytes, KvLayout, PROMPT_GROUP, card_tile_bytes, group_sets, groups,
+        recurrent_bytes, row_bytes, unit_bytes,
     };
 
     /// A call's batches cut into groups: runs of `g`, a lone last batch
@@ -908,6 +916,20 @@ mod tests {
         assert_eq!(unit_bytes(4096, 512, 4, 8, false), 67_182_592);
         assert_eq!(unit_bytes(4096, 512, 4, 8, true), 67_182_592 + 4 * 512 * 8);
         assert_eq!(group_sets(PROMPT_GROUP) - 1, 2);
+    }
+
+    /// The card experts' grouped scratch at GLM-5.3-Flash's sizes (4,096
+    /// values, routed experts of 2,048 rows, eight slots a token, 512
+    /// columns: 4,096 slots): the rows' q8_1 6,619,136 B, the table's order
+    /// 16,384, starts 4,100 and 1,409 tile words 5,636, the entries' Walk A
+    /// planes 4,096 · 4,736 = 19,398,656, the SwiGLU rows 33,554,432 and their
+    /// q8_1 26,476,544, the downs 67,108,864.
+    #[test]
+    fn card_tile_scratch_bytes() {
+        assert_eq!(
+            card_tile_bytes(4096, 2048, 8, 512),
+            6_619_136 + 16_384 + 4_100 + 5_636 + 19_398_656 + 33_554_432 + 26_476_544 + 67_108_864
+        );
     }
 
     /// GLM-5.3-Flash's sizes: a KDA layer holds one lane of 64 heads of 128

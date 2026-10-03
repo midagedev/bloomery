@@ -1,0 +1,54 @@
+# Round glmnext: GLM-5.3-Flash's card experts in a prompt batch by tile items (expert x 8-row tile x <= 8 slots),
+# the V4.1 cardtile design on the K-quant Walk A planes (crates/gpu/src/kquant/tiles.rs: kq_card_gather,
+# kq_gate_up_act_q4k_tiles / _q5k_tiles, q5k_gemv_tiles; the Q4_K downs on q4k_gemv_tiles), bit for bit the
+# per-slot _sel path's output (gate_kquant clause 12, gate-gpu-glm5next-e2e's prompt bits). One path, no lever.
+# The plan reserves the path's scratch (place::card_tile_bytes, 153,183,752 B at 512 columns: ~10 card experts at
+# 15.2 MB). Against the base, main at 07ec8f04.
+# Decomposition [derived, round report section 1]. The _sel path runs a warp a row a slot, so each card slot reads
+# its expert's 15.2 MB again: ~940 card slots a 512-position layer-batch under plan (a) (67 card experts of 288 on
+# a routed layer, top-8) x 15.2 MB = ~14.5 GB at ~590 GB/s = ~24.6 ms of the card shadow S (33.8 ms KDA, 37.2 ms
+# latent; the shared expert's 64 mcol chunks are ~9.2 ms of the rest). By tiles each card expert's rows are read
+# once a tile item of up to 8 slots: ~67 x 15.2 MB x 1.9..2.2 tiles an expert ~= 1.9..2.3 GB, 3..4 ms; the grid
+# is sized for the table's bound, tile_cap(4096 slots, 67 experts) = 570 tiles against ~150 live, so ~420 x 768 row
+# tiles ~= 0.32 M blocks a layer-batch exit at the tile word, ~1 ms at 336 resident blocks (4 a SM): S_card' ~4..5
+# ms, inside the band's 2.5..6 ms. At G2 a routed
+# layer's period is max(F + max(U, S) + 1.1, 2U, 2(F + S + 1)): the KDA layers are host-bound today (2U 94.3
+# against the card's 86.6 ms a pair) and stay so; the latent layers are card-bound (116.5..160.1 against 90.9 ms
+# a pair over depth), S 37.2 -> ~13.7 ms: the first two pairs (positions 0..2047) fall to the host's 2U, the
+# last two stay bound by the MLA front, 2(F + S' + 1) = 97..117 ms against 90.9. The paper model (calibrated on
+# the sitting rows of 07ec8f04, 218.1 tok/s at P = 4096) gives +9.0..+11.1 % at a tile path of 3 ms over the
+# shadow swell
+# band x1.00..x1.15, +8.1..+10.1 % at 6 ms. pp512 is one batch, a group of one: F + max(U + 1.1, S) with U above S
+# on every layer kind, so the shadow is under the union and pp512 moves only by the ~10 card experts the reserve
+# takes (derived -0.3..0 %); decode does not run this path (card_rows serves prompt batches only), and moves only
+# by the same ~10 card experts (host experts +0.1 %: derived, under the ruler).
+kind: ab
+question: does reading each card expert's rows once a tile item instead of once a slot take the card shadow off
+  the latent layers' G2 period, so that those layers fall to the host union's bound?
+term: pp tok/s @ P = 4096, prose prompt (GLM_PROSE from GLM_PROSE_FROM), A6000, plan (a), --ctx 4352, the default
+  group (BLOOMERY_PREFILL_GROUP unset: 2) - (glmnext - base) / base, paired by round across the two invocations
+unit: %
+predict: +8..+11.3
+rounds: 2
+condition: one hold, two runner invocations back to back, each carrying this card: the base from a detached tree
+  at 07ec8f04 (its own remote dir), then this round's from /Users/hckim/repo/bloomery-glmnext
+  (BLOOMERY_REMOTE='~/repo/bloomery-glmnext'), each BLOOMERY_AB_ROUNDS=2
+  BLOOMERY_BOX_ENV='BLOOMERY_GEN_CTX=4352 BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmnext-cardtile.card'
+  just depth-gpu-glm5next 512 4096, BLOOMERY_PREFILL_GROUP unset in both. Every row's load line prints group=2 and
+  its time prompt record kind=batch with 1 pass at P = 512 and 8 at 4096; this round's plan line prints 10..11
+  card experts fewer than the base's (the reserve), nothing else on the plan moves. A row marked [cold],
+  [cpu-busy] or [other-busy] is void, and so is a window whose card witness or cpu-freq differs between the two
+  invocations. The pp512 and decode rows must agree with the base's within the window's ~5 %. Box time ~14..20 min
+  [derived: per invocation two warm-up processes and four rows, six loads at 45..75 s, 2 x (3 + 17..19) s of
+  prompt; plus the two builds]
+decide-in: land it; at G2 every routed layer is then bound by the host union's 2U but the latent layers past
+  position 2048, which the MLA front bounds (its 3.54 ms a batch of depth): the next prompt lever is the union
+  (the pack's scale path, 351 of 646 Q4_K pack instructions, and the Q5_K loop's spills: a pack 25 % shorter is
+  +5.6 % over this round, derived), then the MLA front's depth slope and the shared expert on the GEMM (+1.4..+1.5 %
+  over this round, the same deep latent pairs)
+decide-below: under +8 %: the tile path is slower than the ~4..5 ms derived (the gather or the down's scatter
+  costs), or the two units' card streams swell it: run one BLOOMERY_STEP_STATS=1 P = 4096 row at G2 on this tree
+  and read card_shadow_ms on the latent layers against the base's 37.2 ms before landing
+decide-above: past +11.3 %: the KDA layers were card-bound on some pairs too (their 2(F + S + 1) at 86.6 ms is
+  within 8 % of the host's 94.3), so the shadow gain reached them: read card_shadow_ms and wait_ms per layer kind
+  from one STEP_STATS row, refit the model, and land

@@ -146,7 +146,7 @@ pub unsafe fn tile_at(
     reason = "device helper: a kernel's output, table and bounds (rust-quality R8)"
 )]
 #[inline(always)]
-unsafe fn scatter_col(
+pub(crate) unsafe fn scatter_col(
     y: &mut DisjointSlice<f32>,
     order: &[u32],
     at: usize,

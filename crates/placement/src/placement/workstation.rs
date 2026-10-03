@@ -266,6 +266,30 @@ pub const fn tier_block_scratch_bytes(n_embd: u64, ff: u64, slots: u64) -> u64 {
         + q8_act_bytes(slots, ff)
 }
 
+/// The Walk A tile path's scratch for prompt batches of up to `cols` tokens
+/// of rows of `n_embd`, `n_used` slots a token, through experts of `ff`
+/// (the K-quant grouped entries, `bloomery_gpu::kquant::tiles`): the rows'
+/// q8_1 form a column a token, the bucket table, the tiles, the entries'
+/// Walk A planes (q4 codes, 32-value sums, 128-value scales), the SwiGLU
+/// outputs by entry and their q8_1 form, and the downs by slot.
+#[must_use]
+pub const fn walk_a_tile_scratch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> u64 {
+    let slots = cols * n_used;
+    let n_sb = n_embd / 256;
+    let tile_cap = {
+        let spread = (slots + (TILE_COLS - 1) * TILE_BUCKET_EXPERTS) / TILE_COLS;
+        if slots < spread { slots } else { spread }
+    };
+    q8_act_bytes(cols, n_embd)
+        + 4 * slots
+        + 4 * (TILE_BUCKET_EXPERTS + 1)
+        + 4 * (tile_cap + 1)
+        + 4 * slots * (256 * n_sb.div_ceil(4) + 10 * n_sb)
+        + 4 * slots * ff
+        + q8_act_bytes(slots, ff)
+        + 4 * slots * n_embd
+}
+
 /// The tier's chunk scratch for blocks of rows of `n_embd`, `n_used` slots a
 /// token, through experts of `ff`, cut in chunks of `chunk` tokens: the q8_1
 /// of a chunk's rows, its gate·up rows a slot, and per chunk width `c` from

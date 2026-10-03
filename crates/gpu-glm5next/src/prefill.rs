@@ -63,13 +63,14 @@
 //!   the RMS norms, `hc_pre` (in its token groups), the fold and `hc_post`,
 //!   the KDA conv and prep, the delta step, the gated norm, the latent and
 //!   index appends, the pool keys the batch's tokens complete, the router's
-//!   two launches, the card places, the sums;
+//!   two launches, the card places, the card experts by tile items (each
+//!   slot the one-token `_sel`'s bit for bit, `ffn::card_rows`), the sums;
 //! - the GEMM's projections over the batch's `T` rows from [`GEMM_FROM`];
 //! - chunks of up to [`CHUNK`] tokens where it takes at most that many: the
 //!   q8_0 gemvs (`q8_0_gemv_mcol`, `q8_0_gemv_heads_mcol`) the GEMM does
 //!   not take, the shared expert's
-//!   gate·up·SwiGLU (`ds41_shexp_gate_up_q8_0_mcol`), the card experts'
-//!   launches, the k-pool selector, and the attention, each token over the
+//!   gate·up·SwiGLU (`ds41_shexp_gate_up_q8_0_mcol`), the k-pool selector,
+//!   and the attention, each token over the
 //!   positions at and before its own — the batch's own rows and pools
 //!   written before the first chunk attends.
 //!
@@ -107,7 +108,7 @@ use bloomery_gpu::prompt_timing::{Mark, PromptStats, PromptTiming, nanos};
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvHeadsMcolArgs, Q8_0GemvMcolArgs};
 use bloomery_gpu::qsa::list_width;
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, Q8Act};
+use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{self, AttnArgs, SelectedRows};
 use bloomery_gpu_deepseek41::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_STREAMS, HcPostArgs, HcPreScratch, HcQ8Params, HcQ8PreArgs,
@@ -128,7 +129,7 @@ use super::{
     Body, Dims, Embedding, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape,
     weight,
 };
-use crate::ffn::{self, CardRows};
+use crate::ffn::{self, CardRows, CardTiles};
 use crate::gemm::{DenseNames, FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
 use crate::host::GlmHost;
 use crate::mla::{self, Select};
@@ -599,14 +600,10 @@ struct Bufs {
     probs: DeviceBuffer<f32>,
     ids: DeviceBuffer<u32>,
     sel: DeviceBuffer<u32>,
-    // The card experts', per chunk: the rows' q8_1 form, the gate·up rows a
-    // slot, per chunk width the q8_1 of its slots' columns, the downs — on a
-    // load with an expert tier the whole batch's, which a tiered layer's
-    // card sum reads beside the tier's rows after the serve.
-    act_x: Q8Act,
-    card_h: DeviceBuffer<f32>,
-    act_h: Vec<Q8Act>,
-    card_down: DeviceBuffer<f32>,
+    /// The card experts' grouped scratch: the batch's downs by slot among
+    /// it, which a tiered layer's card sum reads beside the tier's rows
+    /// after the serve.
+    tiles: CardTiles,
     /// The GEMM projections of a batch of [`GEMM_FROM`] tokens or more, and
     /// the latent query heads and heads' outputs at any count.
     front: GemmFront,
@@ -616,8 +613,7 @@ impl Bufs {
     /// The shared buffers for batches of up to `cap` tokens of `d`'s widths,
     /// `ff` the widest dense or shared-expert width, `dense_ff` the widest
     /// dense block's (0 for none), `expert_ff` a routed expert's, over stores
-    /// of `ctx` positions, the card downs a batch's when `tiered` (a load
-    /// with an expert tier). The attention's partials
+    /// of `ctx` positions. The attention's partials
     /// cover `ctx` keys: a chunk selects only on stores past the dense
     /// positions, which are a list's width, so they cover a list too.
     /// Load-time or first-prompt only.
@@ -627,7 +623,6 @@ impl Bufs {
         [ff, dense_ff, expert_ff]: [usize; 3],
         ctx: usize,
         cap: usize,
-        tiered: bool,
     ) -> Result<Bufs, GpuError> {
         let stream = gpu.stream();
         let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
@@ -680,12 +675,7 @@ impl Bufs {
             probs: z(cap * N_EXPERT)?,
             ids: zu(cap * N_USED)?,
             sel: zu(cap * N_USED)?,
-            act_x: Q8Act::with_k(stream, CHUNK, n)?,
-            card_h: z(CHUNK * N_USED * expert_ff)?,
-            act_h: (1..=CHUNK)
-                .map(|c| Q8Act::with_slots(stream, c * N_USED, expert_ff))
-                .collect::<Result<_, _>>()?,
-            card_down: z(if tiered { cap } else { CHUNK } * N_USED * n)?,
+            tiles: CardTiles::new(gpu, n, expert_ff, cap)?,
             front: GemmFront::open(
                 gpu,
                 FrontShape {
@@ -738,8 +728,6 @@ impl Bufs {
             &self.acc,
             &self.pre,
             &self.probs,
-            &self.card_h,
-            &self.card_down,
         ];
         f.iter().map(|b| b.num_bytes()).sum::<usize>()
             + [&self.ids, &self.sel, &self.list]
@@ -747,8 +735,7 @@ impl Bufs {
                 .map(|b| b.num_bytes())
                 .sum::<usize>()
             + self.hc_scratch.device_bytes()
-            + self.act_x.device_bytes()
-            + self.act_h.iter().map(Q8Act::device_bytes).sum::<usize>()
+            + self.tiles.bytes()
             + self.front.bytes()
     }
 }
@@ -1474,14 +1461,7 @@ impl Body {
         let expert_ff = self.card.ff();
         let cap = T_MAX.min(self.ctx);
         let tiered = self.card.tier().is_some();
-        let bufs = Bufs::new(
-            gpu,
-            &self.dims,
-            [ff, dense_ff, expert_ff],
-            self.ctx,
-            cap,
-            tiered,
-        )?;
+        let bufs = Bufs::new(gpu, &self.dims, [ff, dense_ff, expert_ff], self.ctx, cap)?;
         self.refuse_unreserved(gpu, place::group_sets(self.prompt.group) - 1)?;
         let units = (0..place::group_sets(self.prompt.group))
             .map(|_| UnitBufs::new(gpu, self.dims.embd, cap, tiered))
@@ -2607,10 +2587,7 @@ impl PromptProgram<'_> {
                     weights: &ub.weights,
                     t,
                     sel: &mut b.sel,
-                    act_x: &mut b.act_x,
-                    h: &mut b.card_h,
-                    act_h: &mut b.act_h,
-                    down: &mut b.card_down,
+                    tiles: &mut b.tiles,
                     acc: &mut b.acc,
                     tiered,
                 },
@@ -2659,7 +2636,7 @@ impl PromptProgram<'_> {
             what: WHAT,
             missing: "the tier places of a batch made with a tier",
         })?;
-        let (down, w, sel, acc) = (&b.card_down, &ub.weights, &b.sel, &mut b.acc);
+        let (down, w, sel, acc) = (b.tiles.down(), &ub.weights, &b.sel, &mut b.acc);
         port.join_tiered(at, |stream, trows| {
             let a = CardAccTier {
                 down,

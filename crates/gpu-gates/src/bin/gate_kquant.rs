@@ -111,6 +111,23 @@
 //!     taken in its row (the band at 64 × 1120), the `HOST` slot not skipped
 //!     (the untouched slot), `ExpertId` not raised (the past-stack fault).
 
+//! 12. tiles: the grouped entries (`bloomery_gpu::kquant::tiles`) over a
+//!     table of GLM-5.3-Flash's routed shapes — Q4_K gate and up 2048 × 4096,
+//!     Q5_K down 4096 × 2048, eight slots a token over 24 tokens, six experts:
+//!     one with over three tiles' slots (a partial last tile), one with
+//!     exactly eight, one with one, one with none, and `HOST` slots. The
+//!     table is the bucket layout (entries by expert, slots ascending) built
+//!     on the host and its tiles `q4k_sel::grouped_tiles`'. The gathered
+//!     planes (`kq_card_gather`) are each entry's token column bit for bit;
+//!     the gate·up by tiles (`kq_gate_up_act_q4k_tiles`, `swiglu_clamp` at
+//!     GLM's limit 10 and at 0.5) is `kq_gate_up_act_q4k`'s row of the
+//!     entry's slot bit for bit; the down by tiles (`q5k_gemv_tiles`) over the
+//!     entries' q8_1 (`q8_1_quantize_ord`) is `q5k_gemv_sel`'s rows of every
+//!     card slot bit for bit, `HOST` slots untouched; the Q5_K gate·up by
+//!     tiles is `kq_gate_up_act_q5k`'s (1024 × 2048); no launch raises a
+//!     fault; the launchers refuse a Q6_K gate stack, an up stack of another
+//!     shape and a table of more experts than the stack holds.
+
 #[cfg(not(feature = "gpu"))]
 fn main() {
     eprintln!("gate_kquant: built without the `gpu` feature; see `just gate-gpu-kquant`.");
@@ -128,7 +145,8 @@ mod gate {
     use bloomery_gpu::kquant::sel::{ROWS_PER_BLOCK, THREADS, gemv_sel_body};
     use bloomery_gpu::kquant::walk::{iter_term, row_dot, row_dot_1col};
     use bloomery_gpu::kquant::{
-        Act, GateUpAct, KquantKernels, Q4k, Q5k, Q8_0, SbDecode, SelDown, act, walk_a_planes,
+        Act, EntryPlanes, GateUpAct, KquantKernels, KquantTileKernels, Q4k, Q5k, Q8_0, SbDecode,
+        SelDown, TileGather, TileTable, TiledDown, TiledGateUpAct, act, walk_a_planes,
     };
     use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::q5::{Q8Blocks32, pack_q5_1};
@@ -470,6 +488,7 @@ mod gate {
         kq: KquantKernels,
         q51: Q51SelKernels,
         q80: Q80SelKernels,
+        tiles: KquantTileKernels,
         gm: gate_kernels::LoadedModule,
     }
 
@@ -889,11 +908,13 @@ mod gate {
         let gm = unsafe { gate_kernels::load(gpu.context())? };
         let q51 = Q51SelKernels::load(gpu.context(), gpu.fault_word())?;
         let q80 = Q80SelKernels::load(gpu.context(), gpu.fault_word())?;
+        let tiles = KquantTileKernels::load(gpu.context(), gpu.fault_word())?;
         let c = Ctx {
             gpu,
             kq,
             q51,
             q80,
+            tiles,
             gm,
         };
         if let Some(f) = c.gpu.take_fault()? {
@@ -911,6 +932,7 @@ mod gate {
         ok &= check_q4k_gate_up(&c)?;
         ok &= check_q38_card(&c)?;
         ok &= check_q8_0_sel32(&c)?;
+        ok &= check_tiles(&c)?;
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -934,7 +956,9 @@ mod gate {
              f32_product named, the launchers' refusals; q8_0_gemv_sel32 within \
              {KERNEL_BAND:e} of the f64 dequant_row reference at 5 shapes (odd blocks a row \
              among them), HOST untouched, graph replay, expert_id past the stack, q5_quant on a \
-             NaN column, a NaN scale NaNs its rows, the launcher's refusals"
+             NaN column, a NaN scale NaNs its rows, the launcher's refusals; the grouped entries at \
+             GLM's routed shapes: the gather, the Q4_K and Q5_K gate·up and the Q5_K down by tiles \
+             each their _sel's bit for bit, HOST untouched, the launchers' refusals"
         );
         Ok(())
     }
@@ -2798,5 +2822,369 @@ mod gate {
         }
         stream.synchronize()?;
         Ok(ok && c.gpu.take_fault()?.is_none())
+    }
+
+    /// Clause 12's tokens, slots a token and experts.
+    const T12: usize = 24;
+    const S12: usize = 8;
+    const E12: usize = 6;
+
+    /// Clause 12's routing: slot `i` of the `T12 · S12` by a fixed rule —
+    /// expert 0 hot (over three tiles), expert 1 at exactly eight slots,
+    /// expert 2 at one, expert 5 at none, `HOST` on the rest of the pattern.
+    fn sel12() -> Vec<u32> {
+        let mut sel: Vec<u32> = (0..T12 * S12)
+            .map(|i| match i % 13 {
+                0..=4 => 0,
+                5 | 6 => 1,
+                7 | 8 => 3,
+                9 => 4,
+                _ => HOST,
+            })
+            .collect();
+        let mut ones = 0;
+        let mut twos = 0;
+        for v in &mut sel {
+            if *v == 1 {
+                ones += 1;
+                if ones > 8 {
+                    *v = 3;
+                }
+            } else if *v == 4 {
+                twos += 1;
+                if twos == 1 {
+                    *v = 2;
+                }
+            }
+        }
+        sel
+    }
+
+    /// The bucket table of `sel` over `experts` experts on the host:
+    /// entries by expert, slots ascending within one, and the runs' starts.
+    fn table12(sel: &[u32], experts: usize) -> (Vec<u32>, Vec<u32>) {
+        let mut order = Vec::new();
+        let mut start = Vec::with_capacity(experts + 1);
+        for e in 0..experts {
+            start.push(order.len() as u32);
+            order.extend(
+                (0..sel.len())
+                    .filter(|&s| sel[s] == e as u32)
+                    .map(|s| s as u32),
+            );
+        }
+        start.push(order.len() as u32);
+        (order, start)
+    }
+
+    /// The table's order as the engine holds it: a word a slot, the entries
+    /// first and `u32::MAX` past them, a slot no kernel may read.
+    fn order12(c: &Ctx, order: &[u32], slots: usize) -> Result<DeviceBuffer<u32>, GateError> {
+        let mut words = order.to_vec();
+        words.resize(slots, u32::MAX);
+        Ok(DeviceBuffer::from_host(c.gpu.stream(), &words)?)
+    }
+
+    /// Clause 12 (module doc).
+    fn check_tiles(c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let (n, ff) = (4096usize, 2048usize);
+        let sel = sel12();
+        let slots = sel.len();
+        let (order, start) = table12(&sel, E12);
+        let count = order.len();
+        let runs: Vec<u32> = start.windows(2).map(|w| w[1] - w[0]).collect();
+        let shape_ok = runs[0] > 24 && runs[1] == 8 && runs[2] == 1 && runs[5] == 0;
+        let g = Stack::with_experts(c, "tile_gate", GgmlType::Q4_K, E12, ff, n, 0x7113_0001)?;
+        let u = Stack::with_experts(c, "tile_up", GgmlType::Q4_K, E12, ff, n, 0x7113_0002)?;
+        let d = Stack::with_experts(c, "tile_down", GgmlType::Q5_K, E12, n, ff, 0x7113_0003)?;
+        let x = activations(n, T12, 7701);
+        let act_x = quantize(c, &x, T12, n)?;
+        let order_d = order12(c, &order, slots)?;
+        let start_d = DeviceBuffer::from_host(stream, &start)?;
+        let cap = bloomery_gpu::q4k_sel::tile_cap(slots, E12);
+        let mut tiles_d = DeviceBuffer::<u32>::zeroed(stream, cap + 1)?;
+        c.gpu.q4k_sel().enqueue_grouped_tiles(
+            stream,
+            &start_d,
+            E12,
+            slots,
+            c.gpu.unlabelled_sink(),
+            &mut tiles_d,
+        )?;
+        let table = || TileTable {
+            order: &order_d,
+            start: &start_d,
+            tiles: &tiles_d,
+            n_experts: E12,
+            n_slots: slots,
+        };
+        // The gather against each entry's token column of the quantizer's planes.
+        let mut ord = EntryPlanes::new(stream, slots, n)?;
+        let gth = TileGather {
+            x: &act_x,
+            cols: T12,
+            slots_per_col: S12,
+            table: table(),
+        };
+        c.tiles
+            .enqueue_card_gather(stream, &gth, c.gpu.unlabelled_sink(), &mut ord)?;
+        stream.synchronize()?;
+        let mut ok = shape_ok;
+        println!(
+            "tiles[table] slots={slots} entries={count} runs={runs:?} tiles={} {}",
+            tiles_d.to_host_vec(stream)?[0],
+            verdict(shape_ok)
+        );
+        let mut ok_rules = true;
+        for (name, limit) in [("swiglu_clamp_10", 10.0f32), ("swiglu_clamp_0.5", 0.5)] {
+            let rule = Act::SwigluClamp { limit };
+            let (h_ref, f_ref) = gate_up(c, &g, &u, &act_x, &sel, S12, rule)?;
+            let mut h = DeviceBuffer::from_host(stream, &vec![SENT; slots * ff])?;
+            let a = TiledGateUpAct {
+                wg: &g.w,
+                wu: &u.w,
+                act: &ord,
+                table: table(),
+                rows_per_expert: ff,
+                rule,
+            };
+            c.tiles.enqueue_gate_up_tiles(
+                stream,
+                GgmlType::Q4_K,
+                &a,
+                c.gpu.unlabelled_sink(),
+                &mut h,
+            )?;
+            stream.synchronize()?;
+            let f_t = c.gpu.take_fault()?;
+            let h_t = h.to_host_vec(stream)?;
+            let want: Vec<f32> = order
+                .iter()
+                .flat_map(|&s| {
+                    h_ref[s as usize * ff..(s as usize + 1) * ff]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            let got = &h_t[..count * ff];
+            let same = bits_equal(got, &want);
+            let pass = same && f_ref.is_none() && f_t.is_none();
+            ok_rules &= pass;
+            println!(
+                "tiles[gate_up_q4k {name}] entries={count} rows={ff} entry_rows_are_the_sel_rows={same} \
+                 fault=\"{}\" {}{}",
+                shown(f_t),
+                verdict(pass),
+                mismatch("first_mismatch", got, &want, ff),
+            );
+            if limit != 10.0 {
+                continue;
+            }
+            // The down by tiles over the entries' q8_1 against the down `_sel` of
+            // every slot over the slots' q8_1 of the same rows.
+            let mut act_h = Q8Act::with_slots(stream, slots, ff)?;
+            c.gpu.q4k_sel().enqueue_quantize_ord(
+                stream,
+                &h,
+                &start_d,
+                E12,
+                slots,
+                c.gpu.unlabelled_sink(),
+                &mut act_h,
+            )?;
+            let act_ref = quantize(c, &h_ref, slots, ff)?;
+            let (y_ref, fy_ref) = down(c, &d, &act_ref, &sel)?;
+            let mut y = DeviceBuffer::from_host(stream, &vec![SENT; slots * n])?;
+            let a = TiledDown {
+                w: &d.w,
+                act: &act_h,
+                table: table(),
+                rows_per_expert: n,
+            };
+            c.tiles
+                .enqueue_gemv_q5k_tiles(stream, &a, c.gpu.unlabelled_sink(), &mut y)?;
+            stream.synchronize()?;
+            let fy = c.gpu.take_fault()?;
+            let y_t = y.to_host_vec(stream)?;
+            let same = bits_equal(&y_t, &y_ref);
+            let host_untouched =
+                sel.iter()
+                    .enumerate()
+                    .filter(|&(_, &e)| e == HOST)
+                    .all(|(s, _)| {
+                        y_t[s * n..(s + 1) * n]
+                            .iter()
+                            .all(|v| v.to_bits() == SENT.to_bits())
+                    });
+            let pass = same && host_untouched && fy_ref.is_none() && fy.is_none();
+            ok_rules &= pass;
+            println!(
+                "tiles[down_q5k] slots={slots} rows={n} slot_rows_are_the_sel_rows={same} \
+                 host_slots_untouched={host_untouched} fault=\"{}\" {}{}",
+                shown(fy),
+                verdict(pass),
+                mismatch("first_mismatch", &y_t, &y_ref, n),
+            );
+        }
+        ok &= ok_rules;
+        ok &= check_tiles_q5k(c, &sel, &order, &start)?;
+        ok &= check_tiles_refusals(c, &g, &u, &ord, &order_d, &start_d, &tiles_d)?;
+        Ok(ok)
+    }
+
+    /// Clause 12's Q5_K gate·up by tiles against `kq_gate_up_act_q5k`.
+    fn check_tiles_q5k(
+        c: &Ctx,
+        sel: &[u32],
+        order: &[u32],
+        start: &[u32],
+    ) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let (rpe, k) = (1024usize, 2048usize);
+        let slots = sel.len();
+        let count = order.len();
+        let g = Stack::with_experts(c, "tile_gate5", GgmlType::Q5_K, E12, rpe, k, 0x7113_0011)?;
+        let u = Stack::with_experts(c, "tile_up5", GgmlType::Q5_K, E12, rpe, k, 0x7113_0012)?;
+        let x = activations(k, T12, 7702);
+        let act_x = quantize(c, &x, T12, k)?;
+        let order_d = order12(c, order, slots)?;
+        let start_d = DeviceBuffer::from_host(stream, start)?;
+        let cap = bloomery_gpu::q4k_sel::tile_cap(slots, E12);
+        let mut tiles_d = DeviceBuffer::<u32>::zeroed(stream, cap + 1)?;
+        c.gpu.q4k_sel().enqueue_grouped_tiles(
+            stream,
+            &start_d,
+            E12,
+            slots,
+            c.gpu.unlabelled_sink(),
+            &mut tiles_d,
+        )?;
+        let table = || TileTable {
+            order: &order_d,
+            start: &start_d,
+            tiles: &tiles_d,
+            n_experts: E12,
+            n_slots: slots,
+        };
+        let mut ord = EntryPlanes::new(stream, slots, k)?;
+        let gth = TileGather {
+            x: &act_x,
+            cols: T12,
+            slots_per_col: S12,
+            table: table(),
+        };
+        c.tiles
+            .enqueue_card_gather(stream, &gth, c.gpu.unlabelled_sink(), &mut ord)?;
+        let rule = Act::SwigluClamp { limit: 10.0 };
+        let mut h = DeviceBuffer::from_host(stream, &vec![SENT; slots * rpe])?;
+        let a = TiledGateUpAct {
+            wg: &g.w,
+            wu: &u.w,
+            act: &ord,
+            table: table(),
+            rows_per_expert: rpe,
+            rule,
+        };
+        c.tiles.enqueue_gate_up_tiles(
+            stream,
+            GgmlType::Q5_K,
+            &a,
+            c.gpu.unlabelled_sink(),
+            &mut h,
+        )?;
+        stream.synchronize()?;
+        let f_t = c.gpu.take_fault()?;
+        let (h_ref, f_ref) = gate_up(c, &g, &u, &act_x, sel, S12, rule)?;
+        let h_t = h.to_host_vec(stream)?;
+        let want: Vec<f32> = order
+            .iter()
+            .flat_map(|&s| {
+                h_ref[s as usize * rpe..(s as usize + 1) * rpe]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        let got = &h_t[..count * rpe];
+        let same = bits_equal(got, &want);
+        let pass = same && f_ref.is_none() && f_t.is_none();
+        println!(
+            "tiles[gate_up_q5k swiglu_clamp_10] entries={count} rows={rpe} \
+             entry_rows_are_the_sel_rows={same} fault=\"{}\" {}{}",
+            shown(f_t),
+            verdict(pass),
+            mismatch("first_mismatch", got, &want, rpe),
+        );
+        Ok(pass)
+    }
+
+    /// Clause 12's launcher refusals.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the clause's stacks, planes and table, handed on"
+    )]
+    fn check_tiles_refusals(
+        c: &Ctx,
+        g: &Stack,
+        u: &Stack,
+        ord: &EntryPlanes,
+        order: &DeviceBuffer<u32>,
+        start: &DeviceBuffer<u32>,
+        tiles: &DeviceBuffer<u32>,
+    ) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let slots = T12 * S12;
+        let table = |experts: usize| TileTable {
+            order,
+            start,
+            tiles,
+            n_experts: experts,
+            n_slots: slots,
+        };
+        let mut h = DeviceBuffer::<f32>::zeroed(stream, slots * g.rpe)?;
+        let rule = Act::SwigluClamp { limit: 10.0 };
+        let small = Stack::with_experts(
+            c,
+            "tile_up_small",
+            GgmlType::Q4_K,
+            E12,
+            1024,
+            4096,
+            0x7113_0021,
+        )?;
+        let cases: [(&str, GgmlType, &Stack, usize); 3] = [
+            ("q6k_gate", GgmlType::Q6_K, u, E12),
+            ("other_up", GgmlType::Q4_K, &small, E12),
+            ("experts_past_the_stack", GgmlType::Q4_K, u, E12 + 1),
+        ];
+        let mut ok = true;
+        for (name, ty, up, experts) in cases {
+            let a = TiledGateUpAct {
+                wg: &g.w,
+                wu: &up.w,
+                act: ord,
+                table: table(experts),
+                rows_per_expert: g.rpe,
+                rule,
+            };
+            let r = c
+                .tiles
+                .enqueue_gate_up_tiles(stream, ty, &a, c.gpu.unlabelled_sink(), &mut h);
+            let refused = matches!(r, Err(GpuError::Shape { .. }));
+            ok &= refused;
+            println!(
+                "tiles[refuse {name}] refused={refused} ({}) {}",
+                r.err()
+                    .map_or_else(|| "accepted".to_owned(), |e| e.to_string()),
+                verdict(refused)
+            );
+        }
+        stream.synchronize()?;
+        let quiet = c.gpu.take_fault()?.is_none();
+        println!(
+            "tiles[refusals_launch_nothing] fault_none={quiet} {}",
+            verdict(quiet)
+        );
+        Ok(ok && quiet)
     }
 }

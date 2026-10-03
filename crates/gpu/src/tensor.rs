@@ -407,11 +407,11 @@ impl<T> Drop for TensorWindow<'_, T> {
 pub(crate) const Q8ACT_MAX_K: usize = 20_480;
 
 /// The most columns a per-slot [`Q8Act`] takes ([`Q8Act::with_slots`]):
-/// every routed slot of a V4.1 prompt batch — the host union's
-/// `UNION_MAX_COLS` tokens, six slots each — the down input of the batch's
-/// grouped experts.
-pub(crate) const Q8ACT_MAX_SLOTS: usize = 3072;
-const _: () = assert!(Q8ACT_MAX_SLOTS == model::moe::UNION_MAX_COLS * 6);
+/// every routed slot of a prompt batch — the host union's `UNION_MAX_COLS`
+/// tokens at eight slots each, GLM-5.3-Flash's (V4.1 routes six) — the down
+/// input of the batch's grouped experts.
+pub(crate) const Q8ACT_MAX_SLOTS: usize = 4096;
+const _: () = assert!(Q8ACT_MAX_SLOTS == model::moe::UNION_MAX_COLS * 8);
 
 /// The most token columns a tier's staged block activation takes
 /// ([`Q8Act::with_tier_cols`]): a block of the widest batch port a body
