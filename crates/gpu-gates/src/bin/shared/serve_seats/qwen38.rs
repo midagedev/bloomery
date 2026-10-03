@@ -605,24 +605,6 @@ struct Fit38 {
     card_bytes: u64,
 }
 
-/// The largest `c` in `lo..=hi` for which `ok` holds, `ok(lo)` given: `ok`
-/// holds below a point and not above it.
-fn largest(
-    mut lo: usize,
-    mut hi: usize,
-    ok: impl Fn(usize) -> Result<bool, GateError>,
-) -> Result<usize, GateError> {
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if ok(mid)? {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    Ok(lo)
-}
-
 /// The largest context any plan of the file and the placement takes, up to
 /// the file's serving cap (`place::serve_ctx`: its `context_length`): the
 /// most a `--ctx-size` may name.
@@ -640,7 +622,7 @@ fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
         .into());
     }
     let most = usize::try_from(serve_ctx(1, &plans.inputs.hp)?)?;
-    let ctx = largest(1, most, fits)?;
+    let ctx = super::ctx::largest(1, most, fits)?;
     Ok(Fit38 {
         ctx,
         card_bytes: plans.card(ctx)?,
@@ -650,19 +632,14 @@ fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
 /// The largest multiple of [`CTX_STEP`] up to `fit` whose plan holds at most
 /// `MARGIN` fewer card expert bytes than the plan at `base_at` (`base_bytes`
 /// there), `fit` when every context does, `base_at` when no step past it
-/// does.
+/// does ([`super::ctx::within_margin`], the seats' shared guard).
 fn margin38(
     plans: &Plans<'_>,
     fit: usize,
     base_at: usize,
     base_bytes: u64,
 ) -> Result<usize, GateError> {
-    let within = |c: usize| Ok(base_bytes.saturating_sub(plans.card(c)?) <= MARGIN);
-    let c = largest(base_at, fit, within)?;
-    if c == fit {
-        return Ok(c);
-    }
-    Ok((c / CTX_STEP * CTX_STEP).max(base_at))
+    super::ctx::within_margin(fit, base_at, base_bytes, CTX_STEP, &|c| plans.card(c))
 }
 
 /// The seat's context (the module doc): `set` when the file's serving cap
@@ -730,7 +707,7 @@ impl Ctx38 {
             )
             .into());
         }
-        let c = largest(1, self.ctx, |n| Ok(state(n) <= ram))?;
+        let c = super::ctx::largest(1, self.ctx, |n| Ok(state(n) <= ram))?;
         let ctx = (c / CTX_STEP * CTX_STEP).max(c.min(CTX_STEP));
         Ok(Ctx38 {
             ctx,

@@ -33,3 +33,9 @@ mod qwen38;
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/drafted.rs"]
 mod drafted;
+
+// The seats' shared `--ctx` default rule, a sibling of the seat as in
+// `bloomery-serve`.
+#[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/ctx.rs"]
+mod ctx;

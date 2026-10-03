@@ -20,9 +20,10 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The files**: the GGUF uploads as downloaded, the same quantizations, the chat template read from the file,
   and a tokenizer bit-identical to `llama-tokenize`.
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
-  twice), `--parallel/-np`, `--queue-depth`, `--cache-ram`, `--ctx/--ctx-size` (the qwen3 and qwen38 seats
-  default it to what the card's free memory fits — the trained context capped to it on the qwen3 seat's
-  whole-card loads, the largest context that keeps the card's experts on the qwen38 seat), `--host/--port`,
+  twice), `--parallel/-np`, `--queue-depth`, `--cache-ram`, `--ctx/--ctx-size` (the qwen3, qwen38 and glm
+  seats default it to what the card's free memory fits — the trained context capped to it on the qwen3 seat's
+  whole-card loads, the largest context that keeps the card's experts on the qwen38 seat, the placed plan's
+  margin on the glm seat), `--host/--port`,)
   `--alias`.
 - **Two-card serving like `-ts`**: `--place a` for the largest visible card, `--place bp` to add the next one
   as an expert tier, or a list (`0+1`) by CUDA index.

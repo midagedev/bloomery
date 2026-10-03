@@ -125,7 +125,7 @@
 
 **A. 서빙 견고성·UX (사용자가 바로 겪음)**
 - ~~서버 견고성 셋~~ **이미 착지(10-04 확인)**: `MAX_CONNECTIONS` 64 + Permit 503(`api.rs`), logits 재사용 버퍼(`genloop.rs` `logits_out()`), 초과 프롬프트의 400 `exceed_context_size_error`(`api.rs:1486`) — 출시 트랙 절의 이 세 줄은 낡았다.
-- ~~`--ctx` 기본을 모델 학습 컨텍스트에서~~ **qwen3 좌석 착지(10-04, `7fab4e21`)**: 통짜 적재는 학습 컨텍스트를 카드 여유에 맞는 최대(1024 단위, 하한 4096)로 상한, `--place`는 4096 유지, 상한이 걸리면 stderr 한 줄. 남은 것: qwen38(4096)·glm(2048) 좌석 같은 규칙, ds41은 32k 기본 의도대로 둠.
+- ~~`--ctx` 기본을 모델 학습 컨텍스트에서~~ **qwen3·glm 좌석 착지(10-04, `7fab4e21`·glmctx)**: qwen3의 통짜 적재는 학습 컨텍스트를 카드 여유에 맞는 최대(1024 단위, 하한 4096)로 상한; glm 좌석은 항상 배치 적재라 계획이 감당하는 최대(하한 2048, qwen38의 마진 규칙이 카드 전문가 1 GiB 이상 안 잃게, `serve_seats::ctx` 공유 소유)를 타고, stderr에 `ctx rule=…` 한 줄. 남은 것: qwen38(4096 기본 유지가 의도), ds41은 32k 기본 의도대로 둠.
 - 탄성 `--parallel`: park 예산이 감당하는 만큼 기본, 플래그는 상한 (S) — 같은 미룸.
 - Qwen3.8 MTP 재결합 → qwen38 좌석 `--parallel` (S–M) — glmsave의 공유 park/unpark 위 `Seq38`(glmsave2 보고 §6).
 - 서빙 작은 것들: `partial_path` 프로세스 단위 충돌(원자 카운터, S) · restore·erase 뒤 `GET /slots`의 `prompt`·`settings` 낡음(S) · `http.rs` 퍼센트 디코딩(S). slotsnap 절 참조.
@@ -147,7 +147,7 @@
 - `body35.rs:2`의 Clef backbone 이름 (XS) · A6000 이름 주석 넷 (S) · `recipes.py`의 `bind::` 테스트 수 핀 (S) · Body35 카드 형식·coverage 핀 (S, line3 절) · decide 좌석 listening 줄을 record Kind로 (S) · `depth-glm5next-stub` 매번 다른 케이스 실패(원인 모름, 조사 포함, M) · LANEPREFETCH 기본 on 플립(XS + V4.1 noninf 시팅) · qwen38 bp 손익분기의 프롬프트 률 한 번 (S).
 
 **E. 헤드라인 성능 후보 (0.3.0의 살코기 — 아래 각절에 상세)**
-- GLM: prompt-call pick (M, 가장 큰 레버) · 기본 P=0 (XS, A/B 뒤) · `knee` 규칙 프리셋 · 창 밖 멈춤 staging. glmpaper-replay 절 참조.
+- GLM: prompt-call pick (M, 가장 큰 레버) · `knee` 규칙 프리셋 · 창 밖 멈춤 staging. glmpaper-replay 절 참조.
 - glmnext 잔여 레버: pack scale 경로 벡터화(+5.6 %), MLA front 깊이 기울기, 공유 expert GEMM.
 - callstream(착지, 기본 off): pp 미스의 처분과 레버 전환. 재구성 절 참조.
 - Qwen3.8 레버 순서(사용자 09-28 지정): 배치 프리필 → 두 카드 residency → raw Q5_1 → MTP.
@@ -223,8 +223,12 @@ nothing inside 95 steps [derived]. The one open term is τ, a flip's staging cos
   `<D>@NAME=VALUE` lever arm and the residency sums, but not the `stat` records, so the card's τ read-out needs the
   timed prompt's host slots from a route trace of ids 50000..50511 + 96 through the replay, or a `stat` column
   ported from depth-qwen3moe.sh (`q38stats`).
-- **GLM default P = 0 (XS, after the A/B)**: steady state +7.7 hit points over P 33, ≈ −2.7 ms a step; the churn pool
-  grows 20.2 → 39.7 GB of host RAM. `residency host`'s headroom_after checks it.
+- ~~**GLM default P = 0 (XS, after the A/B)**~~ **착지 확인(10-04, glmctx; 절반은 이미 서 있었다)**: 좌석의 미설정 단어는
+  glmseat(`f8c57c86`)부터 이미 `mid-p0-s1`이었다 — A/B(`glmres-ab.card`)의 decide-in이 확인만 했고, `generate_glm5next`의
+  미설정은 `off`가 원래 오늘의 설계. 이 회차가 `residency host` 기록의 `pinned=0`과 `headroom_after ≥ 0`를
+  gate-gpu-glm5next-serve의 절로 잡는다(뮤턴트: 단어를 `mid-p33-s1`로 되돌리면 빨강). 풀이 20.2 → 39.7 GB로 자라는 것은
+  계획의 host 항 안에 있다: `glm_residency_at_plan`이 풀을 headroom·`MemAvailable`에 대보고 못 미치면 `off`와 이유를
+  인쇄한다(조용한 적재 없음).
 - **Prompt-call pick for GLM (M, the biggest lever)**: V4.1's callstream pick at floor 32 (22 experts a layer, 334 MB
   inside one 86–114 ms layer-batch): n = 96 at 58.3 % hit, +23…+34 %, and the MTP window at 32–34 tok/s [derived];
   floors 16 and 1 overflow the layer-batch.

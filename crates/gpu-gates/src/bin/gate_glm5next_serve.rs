@@ -24,8 +24,16 @@
 //! records and the plan and exit 0 before any card is opened: under `--place
 //! a` and under `--place bp` (plan (b′), the 3090 an expert tier) a `draft
 //! unset draft=mtp` and a `residency unset residency=mid-p0-s1` record and
-//! the `residency host` record of the word; under `--place gate` both `off`,
-//! no `residency host`:
+//! the `residency host` record of the word — its pinned count 0 and the
+//! headroom past the churn pool non-negative, the pool inside the plan's
+//! host terms — every placement's `ctx` line naming a default context at or
+//! past the floor; under `--place gate` both `off`, no `residency host`:
+//!
+//! - the seat's `--ctx` rule ([`ctx`], on the gate card): the default's `ctx`
+//!   line against this gate's own plans of the file — the rule's context,
+//!   its fit and its margin — the flag winning below the floor, and a
+//!   context past `place::ORACLE_POSITIONS` refused by name before it
+//!   listens;
 //!
 //! - the load prints `load draft=off (BLOOMERY_DRAFT=off)` and the word as a
 //!   `residency lever` record (`why=set`), no `residency host` and no verify
@@ -138,7 +146,7 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
-    use model::arch::glm5next::place::{NextnInputs, PROMPT_GROUP, PlanInputs};
+    use model::arch::glm5next::place::{NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs};
     use model::placement::{PlanLevers, workstation};
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
@@ -159,8 +167,19 @@ mod gate {
 
     const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted --dir <out>";
 
-    /// The stores both engines size, the seat's and the CLI's default.
+    /// The stores both engines size, the seat's floor and the CLI's default.
     const CTX: usize = 2048;
+    /// The seat's default context's multiple (its `CTX_STEP`).
+    const CTX_STEP: usize = 256;
+    /// The flag arm's context, below the seat's floor: a flag seen to win,
+    /// not to coincide with a default the floor already takes.
+    const FLAG_CTX: usize = 1536;
+    /// A context past `ORACLE_POSITIONS`, the refusal the clause asks for.
+    const OVER_CTX: usize = 99_999;
+    /// The `ctx` clause's polls for the seat's pre-load lines, 1 s apart:
+    /// the lines print at plan time, before the load's first-start JIT.
+    const LINE_POLLS: usize = 90;
+    const LINE_POLL: Duration = Duration::from_secs(1);
     /// The server's arguments after its path. The slot actions need a save
     /// directory; the gate asks only for `erase`, which writes nothing. The
     /// plain engine is pinned (`--parallel 1`): this gate's clauses hold the
@@ -597,15 +616,14 @@ mod gate {
     }
 
     /// `bloomery-serve --model glm --place <place> --plan` with both levers
-    /// unset: its exit status and stderr. It plans and exits before the
-    /// load, so it opens no card.
+    /// unset and no `--ctx`, so the default context rule runs: its exit
+    /// status and stderr. It plans and exits before the load, so it opens no
+    /// card.
     fn plan_only(dir: &Path, place: &str) -> Result<(bool, Vec<String>), GateError> {
         let exe = beside("bloomery-serve")?;
         let err = dir.join(format!("plan-{place}.err"));
         let status = Command::new(&exe)
-            .args([
-                "--model", "glm", "--place", place, "--ctx", "2048", "--plan",
-            ])
+            .args(["--model", "glm", "--place", place, "--plan"])
             .env_remove(bloomery_levers::DRAFT)
             .env_remove(bloomery_levers::RESIDENCY)
             .envs(UNSET.iter().copied())
@@ -651,6 +669,41 @@ mod gate {
             "unset_place_gate_runs_neither",
             g_ok && picks(&g, "off", "off") && record(&g, "residency host").is_none(),
         );
+        // Every placement's `ctx` line: a rule word of the default rule's,
+        // its context at or past the floor while the card holds it (a card
+        // that holds less plans fewer, `card`, as qwen38 does). FAIL-first:
+        // a seat that keeps the floor silently, or prints no line, turns
+        // this red.
+        let ctx_line = |lines: &[String]| -> Option<(String, usize)> {
+            let l = lines.iter().find(|l| l.starts_with("ctx rule="))?;
+            Some((field(l, "rule")?.to_owned(), field(l, "ctx")?.parse().ok()?))
+        };
+        for (place, lines) in [("a", &a), ("bp", &bp), ("gate", &g)] {
+            let named = ctx_line(lines).is_some_and(|(rule, ctx)| {
+                matches!(rule.as_str(), "base" | "margin" | "fit" | "card") && ctx >= CTX
+            });
+            println!("--place {place}: a default ctx line, rule and context in {named}");
+            check(&mut ok, "unset_plans_take_the_ctx_default", named);
+        }
+        // The default word's churn pool inside the plan's host terms: the
+        // `residency host` record of a default load carries the word's
+        // pinned count (0: no seed expert pinned, the pool every card expert
+        // lands in) and the headroom left past it. FAIL-first: a default that
+        // pins seed experts, or a pool past the headroom, turns this red.
+        let pool = |lines: &[String]| -> Option<(u64, i128)> {
+            let l = record(lines, "residency host")?;
+            Some((
+                field(l, "pinned")?.parse().ok()?,
+                field(l, "headroom_after")?.parse().ok()?,
+            ))
+        };
+        check(
+            &mut ok,
+            "unset_default_pool_is_p0_inside_the_headroom",
+            [&a, &bp]
+                .into_iter()
+                .all(|lines| pool(lines).is_some_and(|(pinned, after)| pinned == 0 && after >= 0)),
+        );
         // Every plan line names its stage card's free bytes at plan time, at
         // most its usable bytes — the census term the expert rule filled
         // within (memguard). FAIL-first: a plan line that drops it, or names
@@ -673,6 +726,239 @@ mod gate {
             println!("--place {place}: card_free named and within usable {named}");
             check(&mut ok, "plan_names_the_cards_free_bytes", named);
         }
+        Ok(ok)
+    }
+
+    /// The stage card's free bytes as a server's own `plan` line read them
+    /// (the census reading its rule searched against).
+    fn server_card_free(err_log: &Path) -> Result<Option<u64>, GateError> {
+        Ok(lines_from(err_log, 0)?
+            .into_iter()
+            .find(|l| l.starts_with("plan "))
+            .and_then(|l| {
+                l.split("card_free=")
+                    .nth(1)
+                    .and_then(|t| t.split(' ').next())
+                    .and_then(|n| n.parse::<u64>().ok())
+            }))
+    }
+
+    /// The plan's stage-card expert bytes on the gate card at `ctx`, plain,
+    /// as the server makes it; `None` when no plan takes the context.
+    fn card_at(
+        inputs: &PlanInputs,
+        levers: &PlanLevers,
+        ctx: usize,
+        free: Option<u64>,
+    ) -> Result<Option<u64>, GateError> {
+        let mut machine = workstation::plan_gate(inputs.model.layers);
+        machine.cards[0].free_bytes = free;
+        Ok(inputs
+            .plan(&machine, u64::try_from(ctx)?, levers)
+            .ok()
+            .and_then(|p| p.cards.first().map(|c| c.expert_bytes)))
+    }
+
+    /// The `ctx` clause (the module header): a plain server with no `--ctx`
+    /// prints its `ctx` and `plan` lines before any load and is stopped
+    /// there, against this gate's own plans of the file: its context is the
+    /// rule's — [`CTX`] under `base`, the largest within the plan's margin
+    /// under `margin`, the plan's largest under `fit`, the card's largest
+    /// under `card`; the line's `trained` is the file's; its `fit` the
+    /// largest context whose plan stands up to the trained context capped to
+    /// `ORACLE_POSITIONS` — this gate's own plan taken, the one past it
+    /// refused when the card bounds it, else the cap itself — with that
+    /// plan's stage-card expert bytes; its `margin_ctx` at most
+    /// `workstation::MARGIN` fewer of them than the plan at [`CTX`], and the
+    /// next multiple of [`CTX_STEP`] past it more (or it is the fit). A
+    /// server asked for [`FLAG_CTX`] takes it (below the floor, a value no
+    /// default can coincide with); one asked past the oracle is refused by
+    /// name before it listens. Mutants: the margin guard taken out (the
+    /// line's `margin_ctx` loses more than the margin); the search giving up
+    /// (the line's `margin_ctx` keeps the floor while a step past it stays
+    /// within it).
+    fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let own = dir.join("ctx");
+        std::fs::create_dir_all(&own)?;
+        let mut args: Vec<&str> = SERVER_ARGS.to_vec();
+        let ctx_at = args
+            .iter()
+            .position(|&f| f == "--ctx")
+            .ok_or("SERVER_ARGS names no --ctx")?;
+        args.drain(ctx_at..ctx_at + 2);
+        let wait_for = |served: &mut Served,
+                        err_log: &Path,
+                        want: &[&str]|
+         -> Result<Vec<String>, GateError> {
+            for _ in 0..LINE_POLLS {
+                let text = std::fs::read_to_string(err_log).unwrap_or_default();
+                if want.iter().all(|w| text.lines().any(|l| l.starts_with(w))) {
+                    return Ok(text.lines().map(str::to_owned).collect());
+                }
+                if let Some(status) = served.child.try_wait()? {
+                    return Err(format!(
+                        "the server exited ({status}) before its lines; {}:\n{text}",
+                        err_log.display()
+                    )
+                    .into());
+                }
+                std::thread::sleep(LINE_POLL);
+            }
+            Err(format!(
+                "the server printed no {want:?} within {LINE_POLLS} polls; {}",
+                err_log.display()
+            )
+            .into())
+        };
+
+        // The default arm: the rule's own line, the server stopped before
+        // its load.
+        let err_log = own.join("server.err");
+        let mut served = Served::spawn(&args, &own, PLAIN)?;
+        println!("ctx server pid {}", served.child.id());
+        let lines = wait_for(&mut served, &err_log, &["ctx rule=", "plan "])?;
+        println!("ctx: the default server stopped: {}", served.stop()?);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("ctx rule="))
+            .map(String::as_str)
+            .ok_or("the default server printed no `ctx` line")?
+            .to_owned();
+        println!("ctx: {line}");
+        let num = |k: &str| field(&line, k).and_then(|v| v.parse::<usize>().ok());
+        let bytes = |k: &str| field(&line, k).and_then(|v| v.parse::<u64>().ok());
+        let (rule, ctx, trained, fit) = (
+            field(&line, "rule").map(str::to_owned),
+            num("ctx"),
+            num("trained"),
+            num("fit"),
+        );
+        let (fit_bytes, margin_ctx) = (bytes("fit_card_expert_bytes"), num("margin_ctx"));
+        let (Some(rule), Some(ctx), Some(trained), Some(fit), Some(fit_bytes), Some(margin_ctx)) =
+            (rule, ctx, trained, fit, fit_bytes, margin_ctx)
+        else {
+            return Err(format!(
+                "a `ctx` line without its rule, ctx, trained, fit, fit_card_expert_bytes and \
+                 margin_ctx: {line}"
+            )
+            .into());
+        };
+
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let plan_levers = PlanLevers::from_levers(levers)?;
+        let free = server_card_free(&err_log)?;
+        let at = |c: usize| card_at(&inputs, &plan_levers, c, free);
+        let base = at(CTX)?.ok_or("no plan at the base context")?;
+        let lost = |c: usize| -> Result<Option<u64>, GateError> {
+            Ok(at(c)?.map(|e| base.saturating_sub(e)))
+        };
+        let margin = model::placement::workstation::MARGIN;
+        let here = lost(margin_ctx)?;
+        let past = lost(margin_ctx + CTX_STEP)?;
+        let (at_fit, past_fit) = (at(fit)?, at(fit + 1)?);
+        let cap = inputs
+            .hp
+            .n_ctx_train
+            .min(usize::try_from(ORACLE_POSITIONS)?);
+        let card_bounds = fit < cap;
+        println!(
+            "ctx: the gate's plans: lost at {margin_ctx} {here:?}, at {} {past:?}, fit {fit} \
+             {at_fit:?}, past it {past_fit:?}; the cap {cap} ({})",
+            margin_ctx + CTX_STEP,
+            if card_bounds {
+                "the card bounds the fit"
+            } else {
+                "the cap bounds the fit"
+            }
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "ctx_default_is_the_rules",
+            match rule.as_str() {
+                "base" => ctx == CTX && CTX <= fit,
+                "card" => ctx == fit && fit < CTX,
+                "margin" => ctx == margin_ctx && CTX < ctx && ctx < fit,
+                "fit" => ctx == fit && fit > CTX,
+                _ => false,
+            },
+        );
+        check(
+            &mut ok,
+            "ctx_line_prints_the_fit_and_the_margin",
+            trained == inputs.hp.n_ctx_train
+                && fit <= cap
+                && at_fit == Some(fit_bytes)
+                && (if card_bounds {
+                    past_fit.is_none()
+                } else {
+                    fit == cap
+                })
+                && here.is_some_and(|l| l <= margin)
+                && margin_ctx <= fit
+                && (margin_ctx == fit
+                    || (margin_ctx.is_multiple_of(CTX_STEP) && past.is_none_or(|l| l > margin))),
+        );
+
+        // The flag arm: below the floor, the flag wins.
+        let flag_ctx = FLAG_CTX.to_string();
+        let mut flag = args.clone();
+        flag.extend_from_slice(&["--ctx", flag_ctx.as_str()]);
+        let err_log = own.join("flag.err");
+        let mut served = Served::spawn(&flag, &own, PLAIN)?;
+        let lines = wait_for(&mut served, &err_log, &["ctx rule="])?;
+        println!("ctx: the flag server stopped: {}", served.stop()?);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("ctx rule="))
+            .map(String::as_str)
+            .ok_or("the flag server printed no `ctx` line")?
+            .to_owned();
+        println!("ctx: {line}");
+        check(
+            &mut ok,
+            "ctx_flag_wins",
+            field(&line, "rule") == Some("set")
+                && field(&line, "ctx").and_then(|v| v.parse::<usize>().ok()) == Some(FLAG_CTX),
+        );
+
+        // A context past the oracle: refused by name before it listens.
+        let over_ctx = OVER_CTX.to_string();
+        let err = own.join("oracle.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.args([
+            "--model",
+            "glm",
+            "--place",
+            "gate",
+            "--ctx",
+            over_ctx.as_str(),
+            "--plan",
+        ])
+        .env_remove(bloomery_levers::DRAFT)
+        .env_remove(bloomery_levers::RESIDENCY)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(File::create(&err)?);
+        let status = cmd
+            .status()
+            .map_err(|e| format!("spawn bloomery-serve: {e}"))?;
+        let text = std::fs::read_to_string(&err)?;
+        let refused = text
+            .lines()
+            .find(|l| l.contains(&format!("ctx_max {OVER_CTX}")))
+            .unwrap_or("")
+            .to_owned();
+        println!("ctx: --ctx {OVER_CTX} --plan: {status}; refused: {refused:?}");
+        check(
+            &mut ok,
+            "ctx_past_the_oracle_is_refused_by_name",
+            !status.success()
+                && text.contains(&format!("ctx_max {OVER_CTX}"))
+                && text.contains(&ORACLE_POSITIONS.to_string()),
+        );
         Ok(ok)
     }
 
@@ -1158,8 +1444,9 @@ mod gate {
     }
 
     /// The plain arm (the module header).
-    fn plain(dir: &Path) -> Result<bool, GateError> {
+    fn plain(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let mut ok = unset_rule(dir)?;
+        ok &= ctx(dir, levers)?;
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&SERVER_ARGS, dir, PLAIN)?;
         println!("plain server pid {}", served.child.id());
@@ -1359,7 +1646,7 @@ mod gate {
         let a = parse_args()?;
         std::fs::create_dir_all(&a.dir)?;
         let ok = match a.arm {
-            Arm::Plain => plain(&a.dir)?,
+            Arm::Plain => plain(&a.dir, &levers)?,
             Arm::Drafted => drafted(&a.dir, &levers)?,
         };
         if ok {
