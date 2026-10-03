@@ -24,7 +24,18 @@
 //!   temperature 0 and `max_tokens` N is a 200 whose `usage` counts the
 //!   prompt's ids and the completion's tokens, and whose message text (the
 //!   reasoning and the content) is inside the text of those ids
-//!   (`/detokenize`).
+//!   (`/detokenize`);
+//! - on a qwen3moe file, whose seat keeps a prefix of what the slot holds,
+//!   the prefix clauses: the edit clause — the turn of [`EDIT_A`] answered,
+//!   then resent with its user message changed to [`EDIT_B`], which diverges
+//!   at `j` inside the rows the first run's prompt call wrote with at least
+//!   [`GEMM_FROM`] ids after it — keeps `j` (`cache_n`) and its ids are the
+//!   same ids fed fresh (`cache_prompt: false`: a cut call of at least
+//!   `GEMM_FROM` rows is the GEMM walk wherever it is cut); and the
+//!   extension clause — the turn resent with its reply and [`LATER`]'s user
+//!   turn — keeps every position the slot held (`cache_n == held`), its ids
+//!   printed only, for the rows the first run's steps wrote are not a fresh
+//!   prompt call's rows.
 //!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
@@ -66,9 +77,26 @@ mod gate {
     /// The raw prompt every file continues.
     const PROSE: &str = "The lighthouse keeper counted the steps as he climbed: one hundred and twelve, the same as every night, until the hundred and thirteenth";
 
+    /// The edit clause's turn, and the same turn with its user message
+    /// changed: the resend diverges inside the rows the first run's prompt
+    /// call wrote, with the rest of the prompt after it.
+    const EDIT_A: &str =
+        "Name the three primary colors of light, and say in one sentence why a screen mixes them.";
+    const EDIT_B: &str =
+        "Name the three primary colors of ink, and say in one sentence why a page reflects them.";
+
+    /// The user turn the extension clause appends after the reply, as the
+    /// template renders it past the reply's end.
+    const LATER: &str = "<|im_end|>\n<|im_start|>user\nAnd which of the three does a screen show when it shows none of them?\n<|im_end|>\n";
+
     /// The prompt ids a pass takes at most: the rendered turn must be
     /// longer, so the clause covers the ubatch walk.
     const PASS_IDS: usize = 8;
+
+    /// The fewest rows the seat's prompt call runs as the GEMM walk
+    /// (`app::arch::qwen3moe::GEMM_FROM`): the rows a kept prefix leaves
+    /// behind are a whole fresh run's.
+    const GEMM_FROM: usize = app::arch::qwen3moe::GEMM_FROM;
 
     struct Args {
         models: Vec<PathBuf>,
@@ -118,33 +146,125 @@ mod gate {
         prompt: Vec<u32>,
         tokens: Vec<u32>,
         stop: String,
+        /// `cache_n`: the positions the request kept of what the slot held.
+        cache_n: u64,
     }
 
-    /// `/completion` of `prompt` at temperature 0, its body in `<dir>/<name>.json`.
+    /// `/completion` of `prompt` at temperature 0 — `cache` asks the server
+    /// to keep the prefix the prompt shares with the slot — its body in
+    /// `<dir>/<name>.json`.
     fn greedy(
         url: &dyn Fn(&str) -> String,
         prompt: Vec<u32>,
         dir: &Path,
         name: &str,
+        cache: bool,
     ) -> Result<(Answer, Value), GateError> {
         let body = json!({
             "prompt": prompt, "n_predict": N, "temperature": 0, "return_tokens": true,
-            "cache_prompt": false,
+            "cache_prompt": cache,
         });
         let (st, text) = curl(&url("/completion"), Some(&body), false)?;
         std::fs::write(dir.join(format!("{name}.json")), &text)?;
         let v = json_of("/completion", st, &text)?;
         let tokens = ids_of(&v["tokens"]);
         let stop = v["stop_type"].as_str().unwrap_or("").to_owned();
-        println!("{name} completion tokens {tokens:?} stop {stop}");
+        let cache_n = v["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX);
+        println!("{name} completion tokens {tokens:?} stop {stop} cache_n {cache_n}");
         Ok((
             Answer {
                 prompt,
                 tokens,
                 stop,
+                cache_n,
             },
             v,
         ))
+    }
+
+    /// The ids of `messages` as the server's chat template renders them
+    /// (`/apply-template`, then `/tokenize`).
+    fn rendered(url: &dyn Fn(&str) -> String, messages: Value) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(
+            &url("/apply-template"),
+            Some(&json!({ "messages": messages })),
+            false,
+        )?;
+        let text = json_of("/apply-template", st, &body)?["prompt"]
+            .as_str()
+            .ok_or("/apply-template: no prompt")?
+            .to_owned();
+        tokenized(url, &text)
+    }
+
+    /// `/tokenize` of `text`.
+    fn tokenized(url: &dyn Fn(&str) -> String, text: &str) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": text })), false)?;
+        Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
+    }
+
+    /// The prefix clauses (the module header), on the qwen3moe arm alone:
+    /// the edit clause — the turn answered, then resent with its user
+    /// message changed — diverges at `j`, inside the rows the first run's
+    /// prompt call wrote, with at least [`GEMM_FROM`] ids after it, keeps
+    /// `j` (`cache_n`) and answers the ids of the same ids fed fresh; the
+    /// extension clause — the turn resent with its reply and [`LATER`]'s
+    /// user turn — keeps every position the slot held, its ids printed
+    /// only.
+    fn prefix(url: &dyn Fn(&str) -> String, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let p = rendered(url, json!([{ "role": "user", "content": EDIT_A }]))?;
+        let q = rendered(url, json!([{ "role": "user", "content": EDIT_B }]))?;
+        let later = tokenized(url, LATER)?;
+        let j = p.iter().zip(&q).take_while(|(a, b)| a == b).count();
+        if j == 0 || j >= p.len() || q.len() < j + GEMM_FROM + 1 {
+            return Err(format!(
+                "the edit clause's turns diverge at {j} of {} and {} ids; the divergence must \
+                 sit inside the first turn's prompt rows with at least {} ids after it",
+                p.len(),
+                q.len(),
+                GEMM_FROM
+            )
+            .into());
+        }
+        // The edit clause: the turn answered fresh, resent with the user
+        // message changed, and the changed turn fed fresh.
+        let (first, _) = greedy(url, p.clone(), dir, "edit_first", false)?;
+        let (edit, _) = greedy(url, q.clone(), dir, "edit", true)?;
+        let (fresh, _) = greedy(url, q, dir, "edit_fresh", false)?;
+        println!(
+            "edit: the turns diverge at {j}; the resend kept {}; its ids {:?}; the fresh run's \
+             {:?}",
+            edit.cache_n, edit.tokens, fresh.tokens
+        );
+        check(
+            ok,
+            "edit_resend_keeps_the_row_where_it_diverges",
+            first.cache_n == 0 && edit.cache_n == j as u64,
+        );
+        check(
+            ok,
+            "edit_resend_ids_are_a_fresh_runs",
+            !fresh.tokens.is_empty() && edit.tokens == fresh.tokens && fresh.cache_n == 0,
+        );
+
+        // The extension clause: the turn answered again, then resent with
+        // its reply and a later user turn.
+        let (held_run, _) = greedy(url, p, dir, "extend_first", false)?;
+        let held = (held_run.prompt.len() + held_run.tokens.len()).saturating_sub(1) as u64;
+        let mut extend = held_run.prompt.clone();
+        extend.extend_from_slice(&held_run.tokens);
+        extend.extend_from_slice(&later);
+        let (resend, _) = greedy(url, extend, dir, "extend", true)?;
+        println!(
+            "extension: the slot held {held}; the resend kept {} and answered {:?}",
+            resend.cache_n, resend.tokens
+        );
+        check(
+            ok,
+            "extension_keeps_every_held_position",
+            held_run.cache_n == 0 && resend.cache_n == held && !resend.tokens.is_empty(),
+        );
+        Ok(())
     }
 
     /// The server's clauses for `model`, its logs in `dir`; the answers the
@@ -158,6 +278,12 @@ mod gate {
         let log = std::fs::read_to_string(&err_log)?;
         let load = log.lines().position(|l| l.starts_with("load arch="));
         let listen = log.lines().position(|l| l.contains("listening on http://"));
+        let arch = log
+            .lines()
+            .find_map(|l| l.strip_prefix("load arch="))
+            .and_then(|r| r.split(' ').next())
+            .unwrap_or("")
+            .to_owned();
         println!(
             "server {} at {addr}; load record {:?}",
             model.display(),
@@ -184,12 +310,12 @@ mod gate {
         println!("rendered prompt: {} ids", prompt.len());
         check(ok, "the_turn_is_past_a_pass", prompt.len() > PASS_IDS);
 
-        let (chat_ids, v) = greedy(&url, prompt, dir, "completion")?;
+        let (chat_ids, v) = greedy(&url, prompt, dir, "completion", false)?;
         let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
         let prose = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
         println!("prose prompt: {} ids", prose.len());
         check(ok, "the_prose_is_past_a_pass", prose.len() > PASS_IDS);
-        let (prose_ids, _) = greedy(&url, prose, dir, "prose")?;
+        let (prose_ids, _) = greedy(&url, prose, dir, "prose", false)?;
 
         let body = json!({
             "messages": messages(), "max_tokens": N, "temperature": 0, "stream": false,
@@ -231,6 +357,9 @@ mod gate {
             "chat_is_those_ids",
             counted && !said.trim().is_empty() && parts_inside,
         );
+        if arch == "qwen3moe" {
+            prefix(&url, dir, ok)?;
+        }
         println!("server stopped: {}", s.stop()?);
         Ok(vec![chat_ids, prose_ids])
     }

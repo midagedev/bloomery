@@ -21,7 +21,7 @@ use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
 use crate::host::StepLeg;
 use crate::linear::LinearKernels;
-use crate::model::{ChainBody, GpuModel, Instrumented, block_count};
+use crate::model::{ChainBody, GpuModel, Instrumented, Rollback, block_count};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
@@ -758,6 +758,16 @@ impl Instrumented for Body {
             p.v.copy_from_host(stream, &plane)?;
         }
         stream.synchronize()?;
+        Ok(())
+    }
+}
+
+impl Rollback for Body {
+    /// Nothing to take back: the caches are per-position, the flash never
+    /// loads a key row at or past the live count, and every row below it is
+    /// written by its own step first ([`ChainBody::reset`]'s rule), so the
+    /// rows past `pos` are dead the moment the model stands at `pos`.
+    fn rollback(&mut self, _pos: u32) -> Result<(), GpuError> {
         Ok(())
     }
 }

@@ -5,12 +5,18 @@
 //! [`MtpDraft`](crate::mtp::MtpDraft) drives in windows of [`Drafted38`]'s
 //! rows.
 //!
+//! The plain attention body of a qwen3moe file ([`Body`]) sits behind the
+//! same traits: its prompt schedule ([`GEMM_FROM`]) and its keep rule (every
+//! held position — the caches are per-position).
+//!
 //! The MTP layer's row at position `q` reads the token at `q` and the
 //! target's hidden row at `q − 1` (ik's pairing, the `mtp-qwen4exp` set's
 //! shift 1), and predicts the token at `q + 1`.
 
 use bloomery_gpu::GpuError;
-use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, TargetRows};
+use bloomery_gpu::Qwen3moeModel;
+use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
+use bloomery_gpu::arch::qwen3moe::{Body, Body38, PrefillPath, Prompt38, Qwen38Model, TargetRows};
 use bloomery_gpu::model::StepMode;
 use runtime::seqstate::Kept;
 use runtime::{Speculative, Tapped};
@@ -60,6 +66,48 @@ impl Keep for Body38 {
     /// a waiting verify's kept rows, or the checkpoint at `n`, any other
     /// position refused by name.
     fn cut(m: &mut Qwen38Model, n: u32) -> Result<(), GpuError> {
+        match n {
+            0 => m.reset(),
+            n => m.rollback(n),
+        }
+    }
+}
+
+/// The fewest rows a qwen3moe prompt call runs as the GEMM ubatch walk: one
+/// past a pass. A call this long and longer writes each row the bits the
+/// walk writes wherever the call is cut (a token's values do not depend on
+/// the ubatch it lands in), and a shorter call runs passes, bit-equal to one
+/// step a row — so a request that keeps a prefix of what the model holds
+/// leaves a call whose rows are a whole fresh run's as long as it holds at
+/// least this many ids.
+pub const GEMM_FROM: usize = MAX_TOKENS + 1;
+
+impl Prompt for Body {
+    /// The GEMM ubatch walk from [`GEMM_FROM`] rows on, passes below (the
+    /// `Auto` of a prompt shorter than one ubatch, resolved without the
+    /// tail pass): the argmax after the last id.
+    fn prompt(m: &mut Qwen3moeModel, ids: &[u32]) -> Result<u32, GpuError> {
+        let path = if ids.len() >= GEMM_FROM {
+            PrefillPath::Gemm
+        } else {
+            PrefillPath::Pass
+        };
+        m.prefill_with(ids, path)
+    }
+}
+
+impl Keep for Body {
+    /// Every held position: the caches are per-position, and
+    /// [`Rollback`](bloomery_gpu::model::Rollback) takes a position back
+    /// without device work.
+    fn keepable(m: &Qwen3moeModel, n: u32) -> u32 {
+        n.min(m.pos())
+    }
+
+    /// Back to empty at 0 — a reset; else the model's rollback
+    /// ([`Rollback`](bloomery_gpu::model::Rollback)), which the caches take
+    /// as given.
+    fn cut(m: &mut Qwen3moeModel, n: u32) -> Result<(), GpuError> {
         match n {
             0 => m.reset(),
             n => m.rollback(n),
