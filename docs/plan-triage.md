@@ -125,9 +125,9 @@
 **범위 결정(10-04, 사용자)**: **0.2.1 소형 먼저** — A(서빙 견고성·UX) + B(게이트 빚) + C(출시 채널 빚) + D(청소 트레인) + GLM 조기 레버 둘(P=0 기본 XS·staging 창 밖 멈춤, 각각 아래 조건 뒤)을 넣고, E의 나머지(prompt-call pick·glmnext 레버·callstream·qwen38 사다리·warm 재측정 시팅·새 모델 행)는 **0.3.0**으로 간다. 0.2.1의 숫자 표는 갱신하지 않고 릴리스 노트가 A/B 카드 값을 조건과 함께 인용한다(전면 warm 재측정은 0.3.0의 시팅).
 
 **A. 서빙 견고성·UX (사용자가 바로 겪음)**
-- 서버 견고성 셋: 연결마다 스레드 상한 없음(`serve/src/api.rs` 수락 루프, S) · temp>0에서 토큰마다 n_vocab `Vec` 재할당(`bind.rs` `logits()`, 버퍼 재사용, S) · 위치 상한 초과 요청이 엔진 오류로 서버 전체 exit 70 → 요청 검증에서 400(`body.rs` `check_defined`, S). 출시 트랙 절 참조.
+- ~~서버 견고성 셋~~ **이미 착지(10-04 확인)**: `MAX_CONNECTIONS` 64 + Permit 503(`api.rs`), logits 재사용 버퍼(`genloop.rs` `logits_out()`), 초과 프롬프트의 400 `exceed_context_size_error`(`api.rs:1486`) — 출시 트랙 절의 이 세 줄은 낡았다.
 - `--ctx` 기본을 모델 학습 컨텍스트에서, 메모리가 못 받으면 이름 붙은 거부 (S) — 0.2.1 후보로 미뤄둔 것.
-- 탄력 `--parallel`: park 예산이 감당하는 만큼 기본, 플래그는 상한 (S) — 같은 미룸.
+- 탄성 `--parallel`: park 예산이 감당하는 만큼 기본, 플래그는 상한 (S) — 같은 미룸.
 - Qwen3.8 MTP 재결합 → qwen38 좌석 `--parallel` (S–M) — glmsave의 공유 park/unpark 위 `Seq38`(glmsave2 보고 §6).
 - 서빙 작은 것들: `partial_path` 프로세스 단위 충돌(원자 카운터, S) · restore·erase 뒤 `GET /slots`의 `prompt`·`settings` 낡음(S) · `http.rs` 퍼센트 디코딩(S). slotsnap 절 참조.
 - 빈 캐시 첫 시작의 마지막 JIT가 직렬 (M): 번들 JIT ~7 s를 적재 업로드 옆 스레드로 → 첫 시작 ≈ max(JIT, load). line3 절 참조.
