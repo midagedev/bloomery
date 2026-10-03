@@ -9,11 +9,13 @@
 //!                    [--parallel N] [--queue-depth Q]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
-//! doc); `--ctx-size` is `--ctx` under llama-server's spelling, C defaults to
-//! the file's trained context capped to what the card's free bytes fit (a
+//! doc); `--ctx-size` is `--ctx` under llama-server's spelling, C defaults
+//! to the file's trained context capped to what the card's free bytes fit (a
 //! whole-card load; never under 4096, a multiple of 1024, one stderr line
-//! when the cap binds), 4096 for a file that states none and for every load
-//! under `--place`. The model is opened as
+//! when the cap binds), or — for a placed load, under `--place` or the plan
+//! a run without it falls to — to the largest context whose placed plan
+//! keeps the card experts the 4096-floor's plan keeps, one stderr line
+//! naming it. 4096 for a file that states none. The model is opened as
 //! `generate_qwen3moe` opens it — qwen3moe through `Qwen3moeModel::open` at
 //! its levers' options, qwen35moe through `Qwen35moeModel::open` with the
 //! tensor-core decode flash and the levers' ubatch — in graph mode with the
@@ -115,13 +117,65 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
 /// The context unless `--ctx` says: `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
 
-/// The `--ctx` the seat takes when the flag is unset: a whole-card load
+/// The `--ctx` the seat takes when the flag is unset. A whole-card load
 /// takes the file's trained context capped to what the card's free bytes
 /// fit — never under [`CTX`], a multiple of 1024, one line on stderr when
-/// the cap binds. A file that states no trained context, and every load
-/// under `--place`, keeps [`CTX`]: the placed solver trades context against
-/// card experts, a trade the flag owns.
-fn default_ctx(split: &Split, arch: Arch) -> Result<usize, GateError> {
+/// the cap binds; a file that states no trained context keeps [`CTX`]. A
+/// placed load — under `--place`, or the plan a run without it falls to when
+/// the whole file does not fit the card's free bytes — searches the same
+/// shape over the plan's own expert split: the largest context whose plan
+/// keeps the card experts the [`CTX`]-floor's plan keeps, so the solver's
+/// context-for-experts trade never sits below the floor's split. One line
+/// names the answer, at the floor or past it.
+fn default_ctx(
+    split: &Split,
+    arch: Arch,
+    place: Option<Place>,
+    levers: &Levers,
+) -> Result<usize, GateError> {
+    let Some(trained) = q3place::trained_ctx(split) else {
+        return Ok(CTX);
+    };
+    let plan_levers = PlanLevers::from_levers(levers)?;
+    let placed_default = |place: Place| -> Result<usize, GateError> {
+        let searched = match arch {
+            Arch::Qwen3moe => q3place::placed_ctx_qwen3(split, place, CTX, &plan_levers)?,
+            Arch::Qwen35moe => {
+                let o = Open35 {
+                    ctx: CTX,
+                    mma: true,
+                    ubatch: ubatch_size()?,
+                };
+                q3place::placed_ctx_qwen35(split, &o, place, CTX, &plan_levers)?
+            }
+            _ => None,
+        };
+        match searched {
+            // The plan holds the trained context with the floor's experts:
+            // the trade bound nothing, as the whole load's rule.
+            Some(ctx) if ctx >= trained => Ok(ctx),
+            Some(ctx) if ctx > CTX => {
+                eprintln!(
+                    "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions \
+                     (the placed plan keeps its card experts to there; pass --ctx to choose)"
+                );
+                Ok(ctx)
+            }
+            // The floor is the most the plan keeps its experts at, and a
+            // floor that would not build keeps it too — the load's own plan
+            // call names what refused it.
+            _ => {
+                eprintln!(
+                    "{NAME}: --ctx defaults to {CTX} (the placed plan's card experts hold the \
+                     context at the floor; pass --ctx to choose)"
+                );
+                Ok(CTX)
+            }
+        }
+    };
+    if let Some(p) = place {
+        return placed_default(p);
+    }
     let searched = match arch {
         Arch::Qwen3moe => q3place::whole_ctx_qwen3(split, CTX)?,
         Arch::Qwen35moe => {
@@ -134,18 +188,21 @@ fn default_ctx(split: &Split, arch: Arch) -> Result<usize, GateError> {
         }
         _ => None,
     };
-    let Some(ctx) = searched else {
-        return Ok(CTX);
-    };
-    if let Some(trained) = q3place::trained_ctx(split)
-        && trained > ctx
-    {
-        eprintln!(
-            "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions \
-             (the whole load fits the card's free bytes; pass --ctx to choose)"
-        );
+    match searched {
+        Some(ctx) => {
+            if trained > ctx {
+                eprintln!(
+                    "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions \
+                     (the whole load fits the card's free bytes; pass --ctx to choose)"
+                );
+            }
+            Ok(ctx)
+        }
+        // The whole file does not fit the card's free bytes even at the
+        // floor: the load falls to the placed plan on `a`'s card
+        // (`open_unplaced_qwen3`), and its default is searched there.
+        None => placed_default(Place::A),
     }
-    Ok(ctx)
 }
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
@@ -554,10 +611,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .to_owned();
     let ctx = match a.ctx {
         Some(c) => c,
-        // A placed plan keeps the floor: its solver trades context against
-        // card experts, a trade the flag owns.
-        None if a.place.is_none() => default_ctx(&split, arch)?,
-        None => CTX,
+        None => default_ctx(&split, arch, a.place, &levers)?,
     };
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);

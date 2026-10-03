@@ -14,7 +14,9 @@
 //! The same two binaries' `--place`-unset default lives here too
 //! ([`unplaced_qwen3`]): today's whole model on device 0 while that fits
 //! the card's free bytes — the census reading the plan's own budget term
-//! uses — and when it does not, the placed plan on `a`'s card.
+//! uses — and when it does not, the placed plan on `a`'s card. The serve
+//! seat's unset `--ctx` defaults live here too ([`whole_ctx_qwen3`] for the
+//! whole load, [`placed_ctx_qwen3`] for a placed one).
 
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, Open35, OpenOpts, Qwen35moeModel};
 use bloomery_gpu::model::GpuModel;
@@ -257,8 +259,7 @@ pub fn trained_ctx(file: &Split) -> Option<usize> {
 /// of [`CTX_GRAN`] at or above `floor` that [`whole_fits_free`] takes on
 /// device 0. `None` when the file states no trained context or nothing at
 /// `floor` fits — the caller keeps `floor`, and the load falls to the placed
-/// plan as it does today. A placed plan keeps the caller's default: its
-/// solver trades context against card experts, a trade the flag owns.
+/// plan, whose own default [`placed_ctx_qwen3`] searches.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -287,6 +288,75 @@ pub fn whole_ctx_qwen35(
         let probe = PlaceQ3::qwen35(file, Place::parse("cuda0")?, probe_o)?;
         whole_fits_free(&probe, u64::try_from(ctx)?)
     };
+    searched_ctx(file, floor, &fits)
+}
+
+/// The `--ctx` a placed load defaults to when the flag is unset: the largest
+/// multiple of [`CTX_GRAN`] at or above `floor`, capped to the trained
+/// context, whose plan on `place`'s card under `levers` keeps the card
+/// experts the floor's plan keeps — the solver's context-for-experts trade
+/// never below the floor's split, so the search spends only the plan's own
+/// headroom. `None` when the file states no trained context or no plan at
+/// `floor` builds — the caller keeps `floor`, and the load's own plan call
+/// names what refused it.
+#[allow(
+    dead_code,
+    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
+)]
+pub fn placed_ctx_qwen3(
+    file: &Split,
+    place: Place,
+    floor: usize,
+    levers: &PlanLevers,
+) -> Result<Option<usize>, GateError> {
+    let experts = |ctx: usize| {
+        let probe = PlaceQ3::qwen3(file, place, ctx)?;
+        Ok(probe.plan(ctx, levers).ok().map(|p| p.cards[0].experts))
+    };
+    searched_placed_ctx(file, floor, &experts)
+}
+
+/// [`placed_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context terms.
+#[allow(
+    dead_code,
+    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
+)]
+pub fn placed_ctx_qwen35(
+    file: &Split,
+    o: &Open35,
+    place: Place,
+    floor: usize,
+    levers: &PlanLevers,
+) -> Result<Option<usize>, GateError> {
+    let experts = |ctx: usize| {
+        let mut probe_o = *o;
+        probe_o.ctx = ctx;
+        let probe = PlaceQ3::qwen35(file, place, probe_o)?;
+        Ok(probe.plan(ctx, levers).ok().map(|p| p.cards[0].experts))
+    };
+    searched_placed_ctx(file, floor, &experts)
+}
+
+/// The search both `placed_ctx_*` run: [`searched_ctx`] over the plan's own
+/// expert split — a context whose plan keeps the floor's card experts fits,
+/// one whose plan cannot build (the census fell, a budget binds) or that
+/// drops below the split does not. Monotone in the context: the KV term
+/// grows with it, the expert rule's budget falls, and the rule's fill is a
+/// prefix through the allocator's granules, so more budget never holds
+/// fewer experts.
+#[allow(
+    dead_code,
+    reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
+)]
+fn searched_placed_ctx(
+    file: &Split,
+    floor: usize,
+    card_experts: &dyn Fn(usize) -> Result<Option<u64>, GateError>,
+) -> Result<Option<usize>, GateError> {
+    let Some(at_floor) = card_experts(floor)? else {
+        return Ok(None);
+    };
+    let fits = |ctx: usize| Ok(card_experts(ctx)?.is_some_and(|e| e >= at_floor));
     searched_ctx(file, floor, &fits)
 }
 

@@ -167,11 +167,12 @@ mod gate {
     /// to what the card had free — at least the 4096 floor, a multiple of
     /// 1024, and past the floor when the card has room past it (a 24 GB
     /// card and a Q4_K_M 30B file leave tens of thousands of rows); the
-    /// `--ctx` flag still wins; a load under `--place` keeps the floor.
-    /// FAIL-first: a search that hands back the trained context uncapped
-    /// makes the default arm's load a plan the card cannot hold (the spawn
-    /// never listens), and one that hands back nothing leaves the default
-    /// at the floor.
+    /// `--ctx` flag still wins; a load under `--place` takes the placed
+    /// search's answer over the plan's expert split, pinned by relation
+    /// (the placed arm's checks below). FAIL-first: a search that hands
+    /// back the trained context uncapped makes the default arm's load a
+    /// plan the card cannot hold (the spawn never listens), and one that
+    /// hands back nothing leaves the default at the floor.
     fn ctx_default(model: &Path, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
         // The trained context read from the file beside the server, not the
         // server's own echo of it.
@@ -221,7 +222,58 @@ mod gate {
                     n >= 4096 && n % 1024 == 0 && n > 4096,
                 ),
                 "flag" => check(ok, "ctx_flag_wins", n == 2048),
-                _ => check(ok, "placed_keeps_the_ctx_floor", n == 4096),
+                _ => {
+                    // The placed default is searched over the plan's own
+                    // expert split, and the relation is what holds on every
+                    // card — the fit rides the census reading: the served
+                    // context keeps the floor and the granule, is the ctx
+                    // the one `plan` record was made at, and the one
+                    // `--ctx defaults to` line names it, present exactly
+                    // when the search stopped below the trained context
+                    // (an idle A6000 holds every expert at the trained
+                    // context and prints none). FAIL-first: a search that
+                    // ignores its bound plans past what the card holds and
+                    // the server dies before listening; a load that says
+                    // nothing leaves the line's side of the biconditional
+                    // red on a card where the search grows.
+                    check(
+                        ok,
+                        "placed_ctx_keeps_the_floor_and_the_granule",
+                        n >= 4096 && n % 1024 == 0,
+                    );
+                    let log = std::fs::read_to_string(&err_log)?;
+                    let plan_ctx = log.lines().find(|l| l.starts_with("plan ")).and_then(|l| {
+                        l.split("ctx_max=")
+                            .nth(1)?
+                            .split(' ')
+                            .next()?
+                            .parse::<u64>()
+                            .ok()
+                    });
+                    println!("placed arm: plan ctx_max {plan_ctx:?}");
+                    check(ok, "placed_ctx_is_the_plans_ctx_max", Some(n) == plan_ctx);
+                    let said: Vec<u64> = log
+                        .lines()
+                        .filter(|l| l.contains("--ctx defaults to "))
+                        .filter_map(|l| {
+                            l.split("--ctx defaults to ")
+                                .nth(1)?
+                                .chars()
+                                .take_while(char::is_ascii_digit)
+                                .collect::<String>()
+                                .parse()
+                                .ok()
+                        })
+                        .collect();
+                    println!("placed arm: --ctx default lines {said:?} of trained {trained}");
+                    check(
+                        ok,
+                        "placed_names_its_default_ctx",
+                        (n < trained) == !said.is_empty()
+                            && said.len() <= 1
+                            && (said.is_empty() || said[0] == n),
+                    );
+                }
             }
             println!("ctx arm {name}: server stopped: {}", s.stop()?);
         }
