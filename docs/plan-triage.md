@@ -126,12 +126,13 @@
 
 **A. 서빙 견고성·UX (사용자가 바로 겪음)**
 - ~~서버 견고성 셋~~ **이미 착지(10-04 확인)**: `MAX_CONNECTIONS` 64 + Permit 503(`api.rs`), logits 재사용 버퍼(`genloop.rs` `logits_out()`), 초과 프롬프트의 400 `exceed_context_size_error`(`api.rs:1486`) — 출시 트랙 절의 이 세 줄은 낡았다.
-- `--ctx` 기본을 모델 학습 컨텍스트에서, 메모리가 못 받으면 이름 붙은 거부 (S) — 0.2.1 후보로 미뤄둔 것.
+- ~~`--ctx` 기본을 모델 학습 컨텍스트에서~~ **qwen3 좌석 착지(10-04, `7fab4e21`)**: 통짜 적재는 학습 컨텍스트를 카드 여유에 맞는 최대(1024 단위, 하한 4096)로 상한, `--place`는 4096 유지, 상한이 걸리면 stderr 한 줄. 남은 것: qwen38(4096)·glm(2048) 좌석 같은 규칙, ds41은 32k 기본 의도대로 둠.
 - 탄성 `--parallel`: park 예산이 감당하는 만큼 기본, 플래그는 상한 (S) — 같은 미룸.
 - Qwen3.8 MTP 재결합 → qwen38 좌석 `--parallel` (S–M) — glmsave의 공유 park/unpark 위 `Seq38`(glmsave2 보고 §6).
 - 서빙 작은 것들: `partial_path` 프로세스 단위 충돌(원자 카운터, S) · restore·erase 뒤 `GET /slots`의 `prompt`·`settings` 낡음(S) · `http.rs` 퍼센트 디코딩(S). slotsnap 절 참조.
 - 빈 캐시 첫 시작의 마지막 JIT가 직렬 (M): 번들 JIT ~7 s를 적재 업로드 옆 스레드로 → 첫 시작 ≈ max(JIT, load). line3 절 참조.
 - memguard 잔여: 홀드된 카드 위 serve 응답 비교 한 줄 · auto-placed 실행의 `--prefill gemm` 거부가 적재 뒤에 온다(좌석 문서에 이미 적힘).
+- **lane X의 센서스 타는 핀이 같은 레인 앞 팔의 잔류에 흔들린다 (S, 10-04 ctxauto 묶음에서 발견)**: qwen38-serve의 `ctx_line_prints_the_fit_and_the_margin`이 glm 서버 SIGKILL 직후의 낮은 여유 판독에서 1 GiB 마진 경계가 385 KB 밀려 빨강, 단독 재실행 초록. 게이트가 카드 여유에 타는 핀을 절대값으로 쥐는 곳마다 같은 모양 — lane X가 다음 팔을 띄우기 전 카드 여유가 안정될 때까지 기다리는 것(gpu-gate.sh 또는 gate-batch)이 일반 수선, 아니면 그 핀을 서버와 같은 lost() 걸음에서 유도.
 
 **B. 게이트 빚 (증명 구멍, 모두 절 주인이 있는 것의 이름만)**
 - MODELS/FIRST_START 상수 줄 절 (XS) · qwen3 스왑 ids-동일 절 (S) · `plan_nextn` FrontOver FAIL-first (S) · serve 게이트의 drafted CLI arm 컷 (S) · q38sel 풀 합 순서 절 (XS). 각각 0.2.0의 날·glmswap·열차 7 절 참조.
