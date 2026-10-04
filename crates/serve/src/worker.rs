@@ -105,6 +105,10 @@ pub(crate) enum Msg {
 /// released, and the engine error it met, if any, which is fatal.
 pub(crate) struct Action {
     pub run: Box<dyn FnOnce(&mut Slot) -> Acted + Send>,
+    /// It drops its slot's state and reads none ([`Slot::erase`]): when the
+    /// slots take turns and the engine holds another slot's state, it runs
+    /// where its slot's state lies and the engine stays as it is.
+    pub drops: bool,
 }
 
 pub(crate) struct Acted {
@@ -310,7 +314,7 @@ impl Worker {
                 }
             };
             for (what, a) in actions {
-                if self.act(what, a).is_err() {
+                if self.act(what, a, false).is_err() {
                     return;
                 }
             }
@@ -346,9 +350,15 @@ impl Worker {
         Dead
     }
 
-    fn act(&mut self, what: Reserve, a: Action) -> Result<(), Dead> {
+    /// `off`: the action drops its slot's state while the engine holds
+    /// another's ([`Action::drops`]); the slot is selected off the engine.
+    fn act(&mut self, what: Reserve, a: Action, off: bool) -> Result<(), Dead> {
         if let Reserve::One(i) = what
-            && let Err(e) = self.slot.select(i)
+            && let Err(e) = if off {
+                self.slot.select_off(i)
+            } else {
+                self.slot.select(i)
+            }
         {
             let f = self.fail(&e);
             return Err(self.end(f));
@@ -653,11 +663,17 @@ impl Worker {
             t.pending.extend(new);
             if self.active.is_empty() && self.t().pending.is_empty() {
                 for (what, a) in std::mem::take(&mut self.t_mut().deferred) {
-                    let moved = match what {
-                        Reserve::One(i) => self.switch(i, false).map(|_| ()),
-                        Reserve::All => Ok(()),
+                    let off = match what {
+                        Reserve::One(i) if a.drops && i != self.t().on => {
+                            self.t_mut().table.take(i);
+                            relock(&self.sh.stats).parked_bytes = self.t().table.bytes();
+                            Ok(true)
+                        }
+                        Reserve::One(i) => self.switch(i, false).map(|_| false),
+                        Reserve::All => Ok(false),
                     };
-                    if moved.is_err() || self.act(what, a).is_err() {
+                    let Ok(off) = off else { return };
+                    if self.act(what, a, off).is_err() {
                         return;
                     }
                 }

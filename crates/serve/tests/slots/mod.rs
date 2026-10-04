@@ -10,8 +10,9 @@
 //! tokens, shortest prompt first, a newcomer refused by name when the running
 //! request cannot be parked, the re-prefill fallback, `/slots`' turns, the
 //! draft kept, a lone request on the engine's slot among equals, a slot the
-//! engine emptied holding nothing for the next request, and a parked idle
-//! state taken into the prompt cache without a copy.
+//! engine emptied holding nothing for the next request, an erase of a slot
+//! the engine does not hold leaving the engine's slot and moving no state,
+//! and a parked idle state taken into the prompt cache without a copy.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -1021,8 +1022,13 @@ impl Engine for Turned {
 
 /// A server of `n` slots that take `engine` in turns.
 fn start_swap(engine: Box<dyn Engine>, n: usize, park: Park) -> SocketAddr {
+    start_swap_in(engine, n, park, None)
+}
+
+/// [`start_swap`] whose slot actions save and restore in `dir`.
+fn start_swap_in(engine: Box<dyn Engine>, n: usize, park: Park, dir: Option<&Path>) -> SocketAddr {
     let swap = SwapEngine::new(engine, n, park).unwrap_or_else(|e| panic!("swap engine: {e}"));
-    start_n(Box::new(swap), n, None, None)
+    start_n(Box::new(swap), n, None, dir)
 }
 
 /// Room for every state these gates park.
@@ -1455,6 +1461,17 @@ fn hw_a_lone_request_takes_the_engines_slot_among_equals() {
     }
 }
 
+/// Each slot's `n_past` in `/slots`.
+fn n_pasts(addr: SocketAddr) -> Vec<Value> {
+    get(addr, "/slots")
+        .json()
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|s| s["n_past"].clone())
+        .collect()
+}
+
 /// An idle slot whose state the engine drops holds nothing after: under the
 /// re-prefill fallback the engine leaves the slot of a finished request
 /// empty, `/slots` shows it empty, and a request that shares more with what
@@ -1474,13 +1491,7 @@ fn hw_a_slot_the_engine_emptied_holds_nothing_for_the_next_request() {
     );
     // The second ended first; the engine went back to the first's slot and
     // dropped the second's ids.
-    let n_past: Vec<Value> = get(addr, "/slots")
-        .json()
-        .as_array()
-        .expect("a list")
-        .iter()
-        .map(|s| s["n_past"].clone())
-        .collect();
+    let n_past = n_pasts(addr);
     assert_eq!(n_past[1], 0, "the slot the engine emptied: {n_past:?}");
     // Twelve ids shared with what slot 1 held, seven with slot 0's.
     let v = post(addr, "/completion", &completion("system:pqrpqzz", 4)).json();
@@ -1489,6 +1500,86 @@ fn hw_a_slot_the_engine_emptied_holds_nothing_for_the_next_request() {
         "the slot that holds the shared header: {v}"
     );
     assert_eq!(v["timings"]["cache_n"], 7, "the header kept: {v}");
+}
+
+/// An erase names its slot alone: under the re-prefill fallback, erasing a
+/// slot the engine does not hold leaves the engine's slot its ids, and a
+/// later turn of that slot's request keeps all of them with nothing fed
+/// again.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_erase_of_another_slot_leaves_the_engines_slot_its_ids() {
+    let dir = super::common::fresh_dir("slots-erase-ids");
+    let (engine, _) = Turned::new(Snap::Cannot, &[]);
+    let addr = start_swap_in(Box::new(engine), 2, Park::Ids, Some(&dir));
+    let first = post(addr, "/completion", &completion("sys:abcabcab", 4)).json();
+    assert_eq!(first["id_slot"], 0, "{first}");
+    // Its twelve prompt ids and three of its four tokens fed.
+    assert_eq!(n_pasts(addr), [json!(15), json!(0)], "the fixture");
+    let erased = call(addr, "POST", "/slots/1?action=erase", None);
+    assert_eq!(erased.status, 200, "{}", erased.body);
+    assert_eq!(erased.json(), json!({"id_slot": 1, "n_erased": 0}));
+    assert_eq!(
+        n_pasts(addr),
+        [json!(15), json!(0)],
+        "the erase of slot 1 left slot 0's ids"
+    );
+    let mut later = vec![json!("sys:abcabcab")];
+    later.extend(first["tokens"].as_array().expect("tokens").iter().cloned());
+    later.push(json!("zz"));
+    let body = json!({"prompt": later, "n_predict": 4, "temperature": 0});
+    let v = post(addr, "/completion", &body).json();
+    assert_eq!(
+        (&v["id_slot"], &v["timings"]["cache_n"]),
+        (&json!(0), &json!(15)),
+        "the later turn keeps slot 0's fifteen ids: {v}"
+    );
+    let fed = metric(&get(addr, "/metrics").body, "swap_reprefill_tokens_total");
+    assert_eq!(fed, 0.0, "slot 0's ids stayed on the engine");
+    super::common::drop_dir(&dir);
+}
+
+/// An erase of a slot whose idle state is parked drops that state where it
+/// lies: the engine keeps its own slot's state and no state moves, nor for
+/// the next request on the engine's slot.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_erase_of_a_parked_slot_moves_no_state() {
+    let dir = super::common::fresh_dir("slots-erase-parked");
+    let latch = Arc::new(super::Latch::default());
+    let (engine, _) = Turned::new(Snap::Takes, &[(3, &latch)]);
+    let addr = start_swap_in(Box::new(engine), 2, ROOMY, Some(&dir));
+    concurrent_pair(
+        addr,
+        &latch,
+        completion("sys:abcabcab", 40),
+        completion("sys:xyzxyz", 6),
+    );
+    let swaps = || metric(&get(addr, "/metrics").body, "swaps_total");
+    let parked = || metric(&get(addr, "/metrics").body, "swap_parked_bytes");
+    // The second ended first: the engine went back to slot 0 and parked slot
+    // 1's fifteen positions, 16 + 4 · 15 bytes.
+    assert_eq!((swaps(), parked()), (2.0, 76.0), "the fixture");
+    let erased = call(addr, "POST", "/slots/1?action=erase", None);
+    assert_eq!(erased.status, 200, "{}", erased.body);
+    assert_eq!(erased.json(), json!({"id_slot": 1, "n_erased": 15}));
+    assert_eq!(
+        (swaps(), parked()),
+        (2.0, 0.0),
+        "the erase of slot 1 dropped its parked state and moved none"
+    );
+    let v = post(addr, "/completion", &completion("sys:abcabcab", 4)).json();
+    assert_eq!(
+        (&v["id_slot"], &v["timings"]["cache_n"]),
+        (&json!(0), &json!(11)),
+        "slot 0 keeps the prompt's eleven ids: {v}"
+    );
+    assert_eq!(
+        swaps(),
+        2.0,
+        "the request on the engine's slot moved no state"
+    );
+    super::common::drop_dir(&dir);
 }
 
 /// What `trace` holds between the last step before `prompt`'s prefill and

@@ -249,6 +249,9 @@ pub(crate) struct Slot {
     /// state handed back for the request about to start there
     /// ([`Slot::hand_back`]), which that request's [`Slot::reuse`] consumes.
     away: Option<Arc<dyn Saved>>,
+    /// The selected slot's state is not on the engine, which holds another
+    /// slot's ([`Slot::select_off`]): [`Slot::erase`] drops its ids alone.
+    off: bool,
     cache: PromptCache,
 }
 
@@ -271,6 +274,7 @@ impl Slot {
             selected: Some(0),
             prompts: vec![0; n],
             away: None,
+            off: false,
         }
     }
 
@@ -287,6 +291,7 @@ impl Slot {
              request took it",
             self.cur
         );
+        self.off = false;
         if self.selected != Some(slot) {
             self.engine.select_slot(slot)?;
             self.selected = Some(slot);
@@ -296,6 +301,14 @@ impl Slot {
             self.parked[self.cur] = std::mem::replace(&mut self.held, parked);
             self.cur = slot;
         }
+        Ok(())
+    }
+
+    /// [`Slot::select`] of a slot whose state the engine does not hold, for
+    /// an action that drops it ([`Slot::erase`]); the next select ends it.
+    pub(crate) fn select_off(&mut self, slot: usize) -> Result<(), EngineError> {
+        self.select(slot)?;
+        self.off = true;
         Ok(())
     }
 
@@ -792,7 +805,9 @@ impl Slot {
     pub(crate) fn erase(&mut self) -> Result<usize, EngineError> {
         let held = std::mem::take(&mut self.held);
         self.prompts[self.cur] = 0;
-        self.engine.reset()?;
+        if !self.off {
+            self.engine.reset()?;
+        }
         Ok(held.len())
     }
 }
