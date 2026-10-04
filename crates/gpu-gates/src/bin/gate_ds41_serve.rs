@@ -931,8 +931,11 @@ mod gate {
         );
         // The follow-up turn keeps the prefix it shares with what the
         // budgeted turn left: the recorded turn diverges at the generation
-        // prompt's last id (its `<think>`), in whole compression groups of
-        // the rest.
+        // prompt's last id (its `<think>`), and the server keeps at least
+        // that prefix in whole compression groups. It may keep more — an
+        // earlier clause's state can share a longer prefix with the turn
+        // (this clause runs mid-gate, its ledger not its own) — which the
+        // converse scripts bound with the ledger this one cannot.
         let (held_ids, _) = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
         let mut held = p.clone();
         held.extend(&held_ids[..held_ids.len() - 1]);
@@ -954,7 +957,7 @@ mod gate {
         check(
             &mut ok,
             "budget_followup_keeps_the_shared_prefix",
-            shared + 1 == p.len() && kept.is_some_and(|k| floor <= k && k <= shared),
+            shared + 1 == p.len() && kept.is_some_and(|k| k >= floor),
         );
         Ok(ok)
     }
