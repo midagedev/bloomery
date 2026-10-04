@@ -59,11 +59,11 @@
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) is served
 //!   through plain steps, drafting nothing, and the same request at `top_k`
 //!   1 gives this server's greedy ids;
-//! - every server's `parallel` line ([`parallel_agrees`]): the elastic
-//!   `--parallel` default's slots are what its rule (`plain` or `budget`)
-//!   holds of the line's own terms — the park budget, one slot's
-//!   whole-context state and the cap — and the swap server's flag names the
-//!   `flag` rule with the flag's slots;
+//! - the seats' `parallel` lines ([`parallel_agrees`]): the elastic
+//!   `--parallel` default's slots (the `ctx` clause's flagless server) are
+//!   what its rule (`plain` or `budget`) holds of the line's own terms — the
+//!   park budget, one slot's whole-context state and the cap — and the swap
+//!   server's flag names the `flag` rule with the flag's slots;
 //! - the swap clause ([`swap_rejoins_the_draft`], a server of its own under
 //!   `BLOOMERY_DRAFT=mtp`): a decode preempted mid-run on `--parallel 2` is
 //!   parked with its draft's side and put back with it rejoining, so both
@@ -181,8 +181,15 @@ mod gate {
     /// The server's arguments after its path; `/props` must echo them. The
     /// context is named: the clauses below count on [`CTX`] positions, and
     /// the default is the `ctx` clause's. The slot actions need a save
-    /// directory; the gate asks only for `erase`, which writes nothing.
-    const SERVER_ARGS: [&str; 10] = [
+    /// directory; the gate asks only for `erase`, which writes nothing. The
+    /// one slot is named (glm's gate's shape): the clauses below hold the
+    /// one-slot path's prompt cache, whose choreography — which state the
+    /// slot-0 `erase` drops, what the cache can serve a resend — the turns
+    /// of several slots would move with a request-arrival race (the free
+    /// slots' LRU) and with the elastic default's machine-riding count; the
+    /// swap clause's server runs the two-slot turns on its own, and the
+    /// `ctx` clause's flagless server holds the elastic default's own line.
+    const SERVER_ARGS: [&str; 12] = [
         "--host",
         "127.0.0.1",
         "--port",
@@ -193,6 +200,8 @@ mod gate {
         "4096",
         "--slot-save-path",
         "/tmp",
+        "--parallel",
+        "1",
     ];
     /// The same arguments with no context named: the default's.
     const DEFAULT_ARGS: [&str; 6] = ["--host", "127.0.0.1", "--port", "0", "--place", "gate"];
@@ -1476,10 +1485,11 @@ mod gate {
         let dir = dir.join("swap");
         std::fs::create_dir_all(&dir)?;
         let err_log = dir.join("server.err");
-        // The main server's arguments plus the two-slot flag: this clause's
-        // server runs the turns on its own.
+        // SERVER_ARGS ends in the plain engine's `--parallel 1`; this
+        // clause's server takes the two-slot value.
         let mut args: Vec<&str> = SERVER_ARGS.to_vec();
-        args.extend(["--parallel", "2"]);
+        let parallel = args.len() - 1;
+        args[parallel] = "2";
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::DRAFT, "mtp")
             .env(bloomery_levers::RESIDENCY, "off");
@@ -1728,6 +1738,16 @@ mod gate {
         }
         let line = line.ok_or("the default server printed no `ctx` line")?;
         println!("ctx: {line}");
+        // The elastic `--parallel` default's own line (the module header):
+        // this flagless server is the one that takes it, [`SERVER_ARGS`]
+        // naming the slots its clauses count on. The slots its rule names
+        // are what the line's own terms hold. FAIL-first: a default that
+        // ignores the budget (always two slots) turns this red wherever the
+        // budget holds another count.
+        let parallel =
+            parallel_line(&err_log)?.ok_or("the default server printed no `parallel` line")?;
+        println!("ctx: {parallel}");
+        let parallel_ok = parallel_agrees(&parallel, None).unwrap_or(false);
         let field = |k: &str| -> Option<String> {
             line.split_whitespace()
                 .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
@@ -1822,6 +1842,11 @@ mod gate {
             &mut ok,
             "ctx_default_is_the_rules",
             rule.as_str() == want_rule && ctx == want_ctx,
+        );
+        check(
+            &mut ok,
+            "parallel_default_holds_what_its_rule_names",
+            parallel_ok,
         );
         check(
             &mut ok,
@@ -1939,17 +1964,6 @@ mod gate {
         });
         println!("plan names the stage card's free bytes {free_named}");
         check(&mut ok, "plan_names_the_cards_free_bytes", free_named);
-        // The elastic `--parallel` default's line (the module header): the
-        // slots its rule names are what the line's own terms hold. FAIL-first:
-        // a default that ignores the budget (always two slots) turns this red
-        // wherever the budget holds another count.
-        let parallel = parallel_line(&err_log)?.ok_or("the server printed no `parallel` line")?;
-        println!("parallel {parallel}");
-        check(
-            &mut ok,
-            "parallel_default_holds_what_its_rule_names",
-            parallel_agrees(&parallel, None).unwrap_or(false),
-        );
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();

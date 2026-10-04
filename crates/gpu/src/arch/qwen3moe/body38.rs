@@ -82,8 +82,8 @@
 
 use super::card38::{Card38, MapCheck, Walk38};
 use super::mtp38::{
-    DraftRows38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, MtpTaps,
-    Target38, TargetRows,
+    DraftRows38, Held38, MTP_ROWS, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode,
+    MtpTaps, Target38, TargetRows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -1823,25 +1823,32 @@ impl Body38 {
     }
 
     /// The draft's side of a sequence state at `pos` ([`DraftRows38`]);
-    /// `None` on a load without the draft: the store's rows below its
-    /// positions, and the step's and the pass's arena rows with the
-    /// positions they hold — the rows below `pos`, the positions a walk can
-    /// read (a verify's rejected tail, an arena's rows at or past `pos`, is
-    /// dead: no walk reads past `pos - 1` and the next launch overwrites
-    /// the arena from `pos`). Refused by name when the store holds past
-    /// `pos` or an arena's rows begin at or past it. Blocking.
+    /// `None` on a load without the draft: the store's rows and the step's
+    /// and the pass's arena rows, each the positions below `pos` — the ones
+    /// a walk can read. The store and the pass arena both hold a verify's
+    /// rejected tail past `pos` (the chain appends its proposal rows, the
+    /// verify keeps fewer): those rows are the dropped branch's, dead — no
+    /// walk reads at or past `pos`, and the next chain's appends and the
+    /// next launch overwrite them from `pos` — so each is clamped to the
+    /// rows below `pos`. Refused by name when the store holds more than a
+    /// chain's proposal rows past `pos` or an arena's rows begin at or past
+    /// it. Blocking.
     fn draft_rows(&self, stream: &CudaStream, pos: u32) -> Result<Option<DraftRows38>, GpuError> {
         const WHAT_D: &str = "qwen4exp snapshot";
         let Some(d) = self.mtp.as_ref() else {
             return Ok(None);
         };
         let held = d.held();
-        if held > pos as usize {
+        if held > pos as usize + MTP_ROWS {
             return Err(GpuError::shape(
                 WHAT_D,
-                format!("a state at {pos} of a draft store that holds {held} positions"),
+                format!(
+                    "a state at {pos} of a draft store that holds {held} positions (a chain \
+                     appends at most {MTP_ROWS} past the model)"
+                ),
             ));
         }
+        let held = held.min(pos as usize);
         let wide = geo::STREAMS * geo::HIDDEN;
         let rows = |walk: TargetRows, most: usize| -> Result<(Held38, Vec<f32>), GpuError> {
             let held = self.wrote.of(walk);
