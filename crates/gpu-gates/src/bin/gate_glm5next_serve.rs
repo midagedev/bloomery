@@ -55,6 +55,11 @@
 //!   position kept and the ids of the same requests with no switch, and a
 //!   resend that shares only A's turn keeps the checkpoint the state carried
 //!   there, with the no-switch run's ids;
+//! - `round_trip` ([`round_trip`]): a session's second turn sent as the chat
+//!   messages a client sends back — the reply's content, no
+//!   `reasoning_content`, the template rendering the think span empty —
+//!   keeps the first turn's prompt call's end (`cache_n` its prompt less
+//!   one) and saves nothing (no `cache save` line);
 //! - then a third load, the server under `BLOOMERY_DRAFT=mtp
 //!   BLOOMERY_RESIDENCY=off`: it prints `load draft=mtp` and no `residency
 //!   host`, the same `/completion` carries the draft's counts, and its ids
@@ -224,6 +229,11 @@ mod gate {
     const LATER_A: &str = " And which of them reaches the sea first?";
     const STRIPPED_A: &str = "Rhine, Danube and Elbe; the Danube is the longest. And which of \
                               them reaches the sea first?";
+    /// The `round_trip` clause's session: its first turn and its second,
+    /// sharing nothing past the template's head with the `cache` clause's.
+    const TURN_C: &str = "List the planets of the solar system in order from the Sun and say \
+                          which of them is the largest.";
+    const LATER_C: &str = "And which of them has the most moons?";
     /// The drafted arm's residency word: no seed expert pinned, one spare a
     /// layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
@@ -1256,6 +1266,86 @@ mod gate {
         Ok(ok)
     }
 
+    /// The `round_trip` clause on the plain server: a session as a chat
+    /// client runs it. Its first turn is a chat request whose reply, the
+    /// think span open past its prompt's length, is longer than its prompt;
+    /// its second turn is the chat messages the client sends back — the
+    /// reply's `content` and no `reasoning_content` — which the template
+    /// renders with the think span empty, so the second turn's prompt parts
+    /// from what the slot holds at the reply's first id. It keeps the first
+    /// turn's prompt call's end (the checkpoint there: `cache_n` the first
+    /// prompt less its last id), less than half of what the slot holds, and
+    /// the slot's state is not saved (no `cache save` line): the second turn
+    /// carries the slot's last prompt whole and drops only that prompt's
+    /// reply, which the client never sends back. Mutant: the cache's half
+    /// rule alone (llama-server's `f_keep < 0.5`), which saves the state
+    /// here.
+    fn round_trip(url: &dyn Fn(&str) -> String, err_log: &Path) -> Result<bool, GateError> {
+        erase(url)?;
+        let first = json!([{ "role": "user", "content": TURN_C }]);
+        let p1 = rendered(url, first.clone())?;
+        // Past the prompt less one, so the slot then holds more than twice
+        // what the second turn keeps.
+        let reply = p1.len() + 8;
+        let body = json!({ "messages": first, "temperature": 0, "max_tokens": reply });
+        let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+        let r1 = json_of("/v1/chat/completions", st, &text)?;
+        let m1 = &r1["choices"][0]["message"];
+        let finish = r1["choices"][0]["finish_reason"].as_str().unwrap_or("");
+        let reasoning = m1["reasoning_content"].as_str().unwrap_or("");
+        let content = m1["content"].as_str().unwrap_or("").to_owned();
+        println!(
+            "round trip: a first turn of {} ids, a reply of {reply} ({finish}): reasoning \
+             {reasoning:?} content {content:?} timings {}",
+            p1.len(),
+            r1["timings"]
+        );
+        if finish != "length" || reasoning.is_empty() {
+            return Err(format!(
+                "the round trip's first reply ended {finish:?} with reasoning {reasoning:?}: the \
+                 clause needs {reply} ids that open with the think span"
+            )
+            .into());
+        }
+        let mut messages = vec![first[0].clone()];
+        messages.push(json!({ "role": "assistant", "content": content }));
+        messages.push(json!({ "role": "user", "content": LATER_C }));
+        let messages = Value::Array(messages);
+        let p2 = rendered(url, messages.clone())?;
+        if !p2.starts_with(&p1) {
+            return Err(format!(
+                "the second turn's {} ids do not carry the first turn's {} whole",
+                p2.len(),
+                p1.len()
+            )
+            .into());
+        }
+        let from = lines_from(err_log, 0)?.len();
+        let body = json!({ "messages": messages, "temperature": 0, "max_tokens": 4 });
+        let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+        let t = json_of("/v1/chat/completions", st, &text)?["timings"].clone();
+        let saves: Vec<String> = lines_from(err_log, from)?
+            .into_iter()
+            .filter(|l| l.contains(": cache save "))
+            .collect();
+        let want = p1.len() as u64 - 1;
+        println!(
+            "round trip: a second turn of {} ids, the slot holding {}: cache_n={} (want {want}) \
+             cache_ms={} saves {saves:?}",
+            p2.len(),
+            p1.len() + reply - 1,
+            t["cache_n"],
+            t["cache_ms"]
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "round_trip_keeps_the_prompt_calls_end_and_saves_nothing",
+            t["cache_n"].as_u64() == Some(want) && saves.is_empty(),
+        );
+        Ok(ok)
+    }
+
     /// Under the residency, a state put back runs on the slot map as it
     /// stands (the state carries none): A's turn, B's, A resent — put back (a
     /// `cache load` note), every held position kept, its passes printing
@@ -1494,6 +1584,7 @@ mod gate {
         println!("plain residency reset: HTTP {st} {body}");
         check(&mut ok, "plain_residency_reset_is_501", st == 501);
         ok &= cache(&url, &err_log, false)?;
+        ok &= round_trip(&url, &err_log)?;
         println!("plain server stopped: {}", served.stop()?);
         let (reference, cli_lines) = cli(dir, PLAIN, &ids, true)?;
         println!("generate_glm5next tokens {reference:?}");

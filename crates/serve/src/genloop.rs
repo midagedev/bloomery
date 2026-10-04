@@ -5,7 +5,10 @@
 //! measurements for this repository: those come only from the lease runners.
 //! Like llama-server, the prompt phase ends when the first token's logits are
 //! out, and the predicted phase runs from there to the end, so `predicted_ms`
-//! spans `predicted_n - 1` decode steps.
+//! spans `predicted_n - 1` decode steps. `cache_ms`, which llama-server does
+//! not report, is the phase before the prompt's: the prompt cache's work on
+//! the slot (its state saved, a cached state put back, the cut), which
+//! `prompt_ms` does not count.
 //!
 //! An engine that drafts ([`Engine::advance_rows`] past 1) takes every greedy
 //! token after the first through [`Engine::advance`]: a pass keeps one token
@@ -78,6 +81,10 @@ pub(crate) struct Timings {
     pub n_past: usize,
     /// Prompt positions kept from the previous request instead of evaluated.
     pub cache_n: usize,
+    /// The prompt cache's work before the prompt phase: the slot's state
+    /// saved, a cached state put back, the cut (ours; llama-server has no
+    /// such field).
+    pub cache_ms: f64,
     /// The whole prompt, kept and evaluated (llama-server's `n_prompt_tokens`;
     /// not a `timings` field).
     pub n_prompt: usize,
@@ -91,9 +98,10 @@ pub(crate) struct Timings {
 }
 
 impl Timings {
-    /// The JSON llama-server emits. A zero count gives NaN per-token fields,
-    /// which serialize as `null` exactly as nlohmann writes them. The draft's
-    /// two counts are there once a pass proposed, as llama-server's are.
+    /// The JSON llama-server emits, and `cache_ms`. A zero count gives NaN
+    /// per-token fields, which serialize as `null` exactly as nlohmann writes
+    /// them. The draft's two counts are there once a pass proposed, as
+    /// llama-server's are.
     pub(crate) fn to_json(&self) -> Value {
         let (pn, dn) = (self.prompt_n as f64, self.predicted_n as f64);
         let mut v = json!({
@@ -108,6 +116,7 @@ impl Timings {
             "n_ctx": self.n_ctx,
             "n_past": self.n_past,
             "cache_n": self.cache_n,
+            "cache_ms": self.cache_ms,
         });
         if self.draft_n > 0 {
             v["draft_n"] = json!(self.draft_n);
@@ -232,6 +241,14 @@ pub(crate) struct Slot {
     cur: usize,
     /// The slot the engine has selected: `None` after a call of several.
     selected: Option<usize>,
+    /// Each slot's last request prompt, in ids, the one it fed; 0 when not
+    /// known (nothing fed since the slot emptied). A state the slot took back
+    /// whole (a cached state, a slot file) counts as all prompt.
+    prompts: Vec<usize>,
+    /// The selected slot's state while the engine holds another: the parked
+    /// state handed back for the request about to start there
+    /// ([`Slot::hand_back`]), which that request's [`Slot::reuse`] consumes.
+    away: Option<Arc<dyn Saved>>,
     cache: PromptCache,
 }
 
@@ -252,11 +269,24 @@ impl Slot {
             parked: vec![Vec::new(); n],
             cur: 0,
             selected: Some(0),
+            prompts: vec![0; n],
+            away: None,
         }
     }
 
     /// Makes `slot` the selected one, on the engine too when it changes.
+    ///
+    /// # Panics
+    ///
+    /// When another slot is selected while the selected one's handed-back
+    /// state waits for its request ([`Slot::hand_back`]).
     pub(crate) fn select(&mut self, slot: usize) -> Result<(), EngineError> {
+        assert!(
+            self.away.is_none() || self.cur == slot,
+            "slot {} was handed its parked state back and slot {slot} was selected before a \
+             request took it",
+            self.cur
+        );
         if self.selected != Some(slot) {
             self.engine.select_slot(slot)?;
             self.selected = Some(slot);
@@ -276,6 +306,28 @@ impl Slot {
         } else {
             &self.parked[slot]
         }
+    }
+
+    /// `state`, the selected slot's parked state of the ids it holds, handed
+    /// back for the request about to start on it while the engine holds
+    /// another: that request's [`Slot::reuse`] puts it into the prompt cache
+    /// as it is where the rule saves it (no copy), and back into the engine
+    /// only when the request keeps some of it.
+    ///
+    /// # Panics
+    ///
+    /// When `state` holds other than the slot's positions: the park table and
+    /// the slot disagree.
+    pub(crate) fn hand_back(&mut self, state: Arc<dyn Saved>) {
+        assert_eq!(
+            state.n_tokens(),
+            self.held.len(),
+            "slot {}'s parked state holds {} positions, the slot {}",
+            self.cur,
+            state.n_tokens(),
+            self.held.len()
+        );
+        self.away = Some(state);
     }
 
     fn held_mut(&mut self, slot: usize) -> &mut Vec<u32> {
@@ -367,11 +419,24 @@ impl Slot {
     ///
     /// With the prompt cache on: a cached state that keeps more of `ids` than
     /// the slot replaces the slot's state; the slot's state goes into the
-    /// cache first whenever it is replaced or the request keeps less than half
-    /// of it (llama-server's rule). A prefix the engine keeps less of than the
-    /// request shares is noted with the engine's reason.
+    /// cache first whenever it is replaced, or the request keeps less than
+    /// half of it and does not carry the slot's last prompt whole. That last
+    /// condition is ours: llama-server saves on the half alone
+    /// (`f_keep < 0.5`). A request that carries the last prompt whole drops
+    /// only that prompt's reply, which a client that renders the reply again
+    /// (a template that leaves the reasoning out) never sends back; the price
+    /// is that a regenerated reply's old state is not kept. A prefix the
+    /// engine keeps less of than the request shares is noted with the
+    /// engine's reason.
+    ///
+    /// A slot handed its parked state back ([`Slot::hand_back`]) holds it off
+    /// the engine: the cache takes that state as it is where the rule saves
+    /// it, and the engine takes it back only when the request keeps some of
+    /// it. One the request keeps none of leaves the slot holding nothing, so
+    /// no prefix it shared is noted.
     fn reuse(&mut self, ids: &[u32], want: bool) -> Result<usize, EngineError> {
-        let (mut common, mut ask, mut k) = self.keep_of(ids, want);
+        let away = self.away.take();
+        let (mut common, mut ask, mut k) = self.keep_of(ids, want, away.as_ref());
         // The pick is taken out before the slot's state is saved: making room
         // for that state may evict it, and the pick then lives on in `picked`.
         let picked = if want && self.cache.enabled() {
@@ -379,16 +444,18 @@ impl Slot {
         } else {
             None
         };
+        let last = self.prompts[self.cur];
+        let continues = last > 0 && common >= last;
         if self.cache.enabled()
             && !self.held.is_empty()
-            && (picked.is_some() || 2 * k < self.held.len())
+            && (picked.is_some() || (2 * k < self.held.len() && !continues))
         {
-            self.save_held()?;
+            self.save_held(away.as_ref())?;
         }
         if let Some((entry, state)) = picked {
             let slot_kept = k;
             if let Some((positions, bytes, ms)) = self.load(entry, &state)? {
-                (common, ask, k) = self.keep_of(ids, want);
+                (common, ask, k) = self.keep_of(ids, want, None);
                 self.engine.note(&CacheNote::Load {
                     positions,
                     common,
@@ -400,6 +467,11 @@ impl Slot {
             } else {
                 (common, ask, k) = (0, 0, 0);
             }
+        } else if let Some(state) = away
+            && (k == 0 || !self.put_back(&state)?)
+        {
+            self.held.clear();
+            (common, ask, k) = (0, 0, 0);
         }
         if k < ask {
             self.engine.note(&CacheNote::Reuse {
@@ -422,35 +494,47 @@ impl Slot {
     }
 
     /// The ids `ids` shares with the slot, the most of them a request may
-    /// keep (all but its last), and what the engine keeps of those.
-    fn keep_of(&self, ids: &[u32], want: bool) -> (usize, usize, usize) {
+    /// keep (all but its last), and what the engine keeps of those: what it
+    /// would keep of `away`, the slot's state off the engine, when given.
+    fn keep_of(
+        &self,
+        ids: &[u32],
+        want: bool,
+        away: Option<&Arc<dyn Saved>>,
+    ) -> (usize, usize, usize) {
         let common = if want {
             promptcache::common_prefix(&self.held, ids)
         } else {
             0
         };
         let ask = common.min(ids.len() - 1);
-        (common, ask, self.engine.keepable(ask).min(ask))
+        let kept = away.map_or_else(|| self.engine.keepable(ask), |s| s.keepable(ask));
+        (common, ask, kept.min(ask))
     }
 
     /// The slot's state into the prompt cache, unless a cached state already
-    /// keeps all of it. A snapshot the engine refuses is noted and not kept;
-    /// an engine failure is the request's error.
-    fn save_held(&mut self) -> Result<(), EngineError> {
+    /// keeps all of it: `away`, the slot's state off the engine, as it is,
+    /// else the engine's snapshot. A snapshot the engine refuses is noted and
+    /// not kept; an engine failure is the request's error.
+    fn save_held(&mut self, away: Option<&Arc<dyn Saved>>) -> Result<(), EngineError> {
         if self.cache.covers(&self.held) {
             return Ok(());
         }
         let positions = self.held.len();
         let t = Instant::now();
-        let state = match self.engine.snapshot() {
-            Ok(s) => s,
-            Err(StateError::Engine(e)) => return Err(e),
-            Err(e) => {
-                self.engine.note(&CacheNote::Skip {
-                    positions,
-                    why: format!("the engine took no snapshot: {e}"),
-                });
-                return Ok(());
+        let state = if let Some(s) = away {
+            Arc::clone(s)
+        } else {
+            match self.engine.snapshot() {
+                Ok(s) => s,
+                Err(StateError::Engine(e)) => return Err(e),
+                Err(e) => {
+                    self.engine.note(&CacheNote::Skip {
+                        positions,
+                        why: format!("the engine took no snapshot: {e}"),
+                    });
+                    return Ok(());
+                }
             }
         };
         if state.n_tokens() != positions {
@@ -484,6 +568,7 @@ impl Slot {
             Ok(()) => {
                 let ms = ms_since(t);
                 let got = (ids.len(), state.n_bytes(), ms);
+                self.prompts[self.cur] = ids.len();
                 self.held = ids;
                 Ok(Some(got))
             }
@@ -496,6 +581,30 @@ impl Slot {
                     why: format!("the engine refused to take the state back: {e}"),
                 });
                 Ok(None)
+            }
+        }
+    }
+
+    /// The slot's own handed-back `state` into the engine; true once it is
+    /// there. A state the engine refuses leaves the cache (where the rule
+    /// saved it just now), the engine is reset and the slot holds nothing
+    /// (false); an engine failure is the request's error.
+    fn put_back(&mut self, state: &Arc<dyn Saved>) -> Result<bool, EngineError> {
+        let held = std::mem::take(&mut self.held);
+        match self.engine.resume(state) {
+            Ok(()) => {
+                self.held = held;
+                Ok(true)
+            }
+            Err(StateError::Engine(e)) => Err(e),
+            Err(e) => {
+                self.cache.remove(state);
+                self.engine.reset()?;
+                self.engine.note(&CacheNote::Skip {
+                    positions: held.len(),
+                    why: format!("the engine refused to take the slot's parked state back: {e}"),
+                });
+                Ok(false)
             }
         }
     }
@@ -647,6 +756,7 @@ impl Slot {
             }
             Err(e @ StateError::Engine(_)) => return Err(e),
             Err(e) => {
+                self.prompts[self.cur] = 0;
                 self.engine.reset()?;
                 return Err(e);
             }
@@ -668,17 +778,20 @@ impl Slot {
             Ok(_) => None,
         };
         if let Some(m) = mismatch {
+            self.prompts[self.cur] = 0;
             self.engine.reset()?;
             return Err(StateError::Format(m));
         }
         let n = ids.len();
         self.held = ids;
+        self.prompts[self.cur] = n;
         Ok((n, r.bytes))
     }
 
     /// Drops the whole cache and the ids it held; returns how many it held.
     pub(crate) fn erase(&mut self) -> Result<usize, EngineError> {
         let held = std::mem::take(&mut self.held);
+        self.prompts[self.cur] = 0;
         self.engine.reset()?;
         Ok(held.len())
     }
@@ -930,16 +1043,20 @@ impl Gen {
             Err(_) if passes => None,
             _ => Some(0),
         });
+        let t = Instant::now();
         let cache_n = slot.reuse(ids, p.cache_prompt)?;
+        let cache_ms = ms_since(t);
         let t0 = Instant::now();
         slot.prefill_marked(ids, cache_n, n - 1)?;
         let greedy = slot.next(ids[n - 1], out(&mut self.logits))?;
+        slot.prompts[slot.cur] = n;
         self.tim = Timings {
             prompt_n: n - cache_n,
             prompt_ms: ms_since(t0),
             n_ctx: self.ctx_max,
             n_past: n,
             cache_n,
+            cache_ms,
             n_prompt: n,
             ..Timings::default()
         };
@@ -1154,8 +1271,9 @@ mod cache_tests {
     use std::any::Any;
     use std::ops::Range;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
-    use super::{GenParams, Slot, Timings, generate};
+    use super::{GenParams, Outcome, Slot, Timings, generate};
     use crate::engine::{
         CacheNote, Decoder, Engine, EngineError, SamplingParams, Saved, StateError, Tokenizer,
     };
@@ -1192,13 +1310,16 @@ mod cache_tests {
         }
     }
 
-    /// What a [`Probe`] saw: its notes and the length of every prefill call.
+    /// What a [`Probe`] saw: its notes, the length of every prefill call,
+    /// and the states it took and took back.
     #[derive(Default)]
     struct Log {
         notes: Vec<CacheNote>,
         calls: Vec<usize>,
         /// What each request told [`Engine::will_reply`].
         replies: Vec<Option<usize>>,
+        snapshots: usize,
+        resumes: usize,
     }
 
     /// The mock engine under a cut rule like V4.1's CED hole: a position
@@ -1216,6 +1337,8 @@ mod cache_tests {
         off_mark: bool,
         /// Refuse every state it is handed back.
         refuse: bool,
+        /// How long each snapshot sleeps.
+        snapshot_takes: Duration,
         log: Arc<Mutex<Log>>,
     }
 
@@ -1250,9 +1373,8 @@ mod cache_tests {
     }
 
     impl Probe {
-        fn slot(budget: u64, split: bool) -> (Slot, Arc<Mutex<Log>>) {
-            let log = Arc::new(Mutex::new(Log::default()));
-            let probe = Probe {
+        fn new(budget: u64, split: bool, log: &Arc<Mutex<Log>>) -> Probe {
+            Probe {
                 inner: MockEngine::new(4096),
                 tok: Arc::new(MarkTok(MockTokenizer)),
                 ctx: Vec::new(),
@@ -1261,9 +1383,14 @@ mod cache_tests {
                 split,
                 off_mark: false,
                 refuse: false,
-                log: Arc::clone(&log),
-            };
-            (Slot::new(Box::new(probe)), log)
+                snapshot_takes: Duration::ZERO,
+                log: Arc::clone(log),
+            }
+        }
+
+        fn slot(budget: u64, split: bool) -> (Slot, Arc<Mutex<Log>>) {
+            let log = Arc::new(Mutex::new(Log::default()));
+            (Slot::new(Box::new(Probe::new(budget, split, &log))), log)
         }
     }
 
@@ -1320,12 +1447,15 @@ mod cache_tests {
             self.budget
         }
         fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
+            std::thread::sleep(self.snapshot_takes);
+            self.log.lock().expect("the log").snapshots += 1;
             Ok(Arc::new(ProbeSaved {
                 ctx: self.ctx.clone(),
                 calls: self.calls.clone(),
             }))
         }
         fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
+            self.log.lock().expect("the log").resumes += 1;
             let s = state
                 .as_any()
                 .downcast_ref::<ProbeSaved>()
@@ -1354,6 +1484,12 @@ mod cache_tests {
     /// One greedy request of at most 8 tokens: what the cache kept, and
     /// what came out.
     fn run(slot: &mut Slot, ids: &[u32]) -> (usize, Vec<u32>) {
+        let o = outcome(slot, ids);
+        (o.timings.cache_n, o.tokens)
+    }
+
+    /// [`run`]'s request, its whole outcome.
+    fn outcome(slot: &mut Slot, ids: &[u32]) -> Outcome {
         let p = GenParams {
             n_predict: 8,
             sampling: SamplingParams {
@@ -1371,7 +1507,7 @@ mod cache_tests {
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
-        let o = generate(
+        generate(
             slot,
             &factory,
             ids,
@@ -1380,8 +1516,7 @@ mod cache_tests {
             &mut |_| {},
             &mut tim,
         )
-        .expect("a generation");
-        (o.timings.cache_n, o.tokens)
+        .expect("a generation")
     }
 
     fn enc(text: &str) -> Vec<u32> {
@@ -1474,15 +1609,8 @@ mod cache_tests {
     fn a_cut_off_the_marks_is_a_named_error() {
         let log = Arc::new(Mutex::new(Log::default()));
         let probe = Probe {
-            inner: MockEngine::new(4096),
-            tok: Arc::new(MarkTok(MockTokenizer)),
-            ctx: Vec::new(),
-            calls: Vec::new(),
-            budget: 0,
-            split: true,
             off_mark: true,
-            refuse: false,
-            log: Arc::clone(&log),
+            ..Probe::new(0, true, &log)
         };
         let mut slot = Slot::new(Box::new(probe));
         let a = enc("be brief and kind. <｜User｜>the cat sat on the mat and the ");
@@ -1552,15 +1680,8 @@ mod cache_tests {
     fn a_refused_state_leaves_the_cache() {
         let log = Arc::new(Mutex::new(Log::default()));
         let probe = Probe {
-            inner: MockEngine::new(4096),
-            tok: Arc::new(MarkTok(MockTokenizer)),
-            ctx: Vec::new(),
-            calls: Vec::new(),
-            budget: 1 << 20,
-            split: false,
-            off_mark: false,
             refuse: true,
-            log: Arc::clone(&log),
+            ..Probe::new(1 << 20, false, &log)
         };
         let mut slot = Slot::new(Box::new(probe));
         let a1 = enc("<｜User｜>the cat sat on the mat and the ");
@@ -1616,6 +1737,87 @@ mod cache_tests {
         )
         .expect("a generation");
         assert_eq!(log.lock().expect("log").replies, [Some(7), Some(0)]);
+    }
+
+    /// One request ([`run`]) and what it cost the engine in states: the
+    /// snapshots taken and the states taken back.
+    fn costed(slot: &mut Slot, log: &Mutex<Log>, ids: &[u32]) -> ((usize, usize), usize, Vec<u32>) {
+        let count = || {
+            let l = log.lock().expect("log");
+            (l.snapshots, l.resumes)
+        };
+        let before = count();
+        let (kept, tokens) = run(slot, ids);
+        let after = count();
+        ((after.0 - before.0, after.1 - before.1), kept, tokens)
+    }
+
+    /// The slot's state goes into the cache when another conversation takes
+    /// the slot or a cached state replaces it, and never for a request that
+    /// carries the slot's last prompt whole. Each row's (snapshots, resumes):
+    /// (i) a first turn, (ii) its next turn, which keeps all of it, (iii)
+    /// another conversation, (iv) the first one back from the cache, (v-a) a
+    /// short turn of a third, (v-b) its next turn with the reply rendered
+    /// again — the reply's first id not the slot's — which keeps less than
+    /// half the slot, where llama-server's half rule saves.
+    #[test]
+    fn a_switch_pays_one_snapshot_and_a_continuation_none() {
+        let (mut slot, log) = Probe::slot(1 << 20, false);
+        let a1 = enc("<｜User｜>the cat sat on the mat and the ");
+        let (i, _, t1) = costed(&mut slot, &log, &a1);
+        let mut a2 = a1.clone();
+        a2.extend(&t1);
+        a2.extend(enc("<｜User｜>and then the "));
+        let (ii, _, t2) = costed(&mut slot, &log, &a2);
+        let (iii, _, _) = costed(&mut slot, &log, &enc("<｜User｜>xyz uvw xyz "));
+        let mut a3 = a2.clone();
+        a3.extend(&t2);
+        a3.extend(enc("<｜User｜>and so the "));
+        let (iv, _, _) = costed(&mut slot, &log, &a3);
+        let c1 = enc("aba");
+        let (va, _, tc1) = costed(&mut slot, &log, &c1);
+        let mut c2 = c1.clone();
+        c2.extend(enc("<think></think>ba<｜User｜>ab"));
+        assert_ne!(
+            Some(&c2[c1.len()]),
+            tc1.first(),
+            "the fixture: (v-b) parts from the reply at its first id"
+        );
+        let (vb, kept, _) = costed(&mut slot, &log, &c2);
+        let held = c1.len() + tc1.len() - 1;
+        assert!(
+            2 * kept < held,
+            "the fixture: (v-b) keeps {kept} of the {held} positions the slot held, at least half"
+        );
+        assert_eq!(
+            [i, ii, iii, iv, va, vb],
+            [(0, 0), (0, 0), (1, 0), (1, 1), (1, 0), (0, 0)],
+            "{:?}",
+            log.lock().expect("log").notes
+        );
+    }
+
+    /// The prompt cache's work is the request's `cache_ms`, before its
+    /// `prompt_ms`: a request that saves the slot's state reports at least
+    /// the time the probe's snapshot sleeps, in its `timings` too.
+    #[test]
+    fn a_save_is_timed_in_cache_ms() {
+        const TAKES: Duration = Duration::from_millis(20);
+        let log = Arc::new(Mutex::new(Log::default()));
+        let probe = Probe {
+            snapshot_takes: TAKES,
+            ..Probe::new(1 << 20, false, &log)
+        };
+        let mut slot = Slot::new(Box::new(probe));
+        outcome(&mut slot, &enc("<｜User｜>the cat sat on the mat and the "));
+        let t = outcome(&mut slot, &enc("xyz uvw xyz ")).timings;
+        assert_eq!(log.lock().expect("log").snapshots, 1, "the second saves");
+        assert!(
+            t.cache_ms >= TAKES.as_secs_f64() * 1e3,
+            "cache_ms {} under the snapshot's {TAKES:?}",
+            t.cache_ms
+        );
+        assert_eq!(t.to_json()["cache_ms"].as_f64(), Some(t.cache_ms));
     }
 }
 

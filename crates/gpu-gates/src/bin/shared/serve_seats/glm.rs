@@ -54,7 +54,11 @@
 //!
 //! The prompt cache (llama-server's `--cache-ram`, in MiB; 0 turns it off)
 //! holds the slot's sequence state when a request of another session takes
-//! the slot (`bloomery_gpu_glm5next::seq_save`): every latent layer's rows
+//! the slot, never for the session's next turn that carries its last prompt
+//! whole (the reply rendered again without its reasoning, which never comes
+//! back), and also for one of the session that leaves part of that prompt
+//! out and keeps less than half of the slot
+//! (`bloomery_gpu_glm5next::seq_save`): every latent layer's rows
 //! of the held positions, each KDA layer's state and conv ring at the held
 //! position and at the last checkpoint below it (the last prompt call's
 //! end), and on a NextN load the layer's store rows and the target's rows

@@ -59,7 +59,9 @@ pub(crate) struct Stats {
     pub n_draft_accepted_total: u64,
     pub n_draft_passes_total: u64,
     /// Slots that take the engine in turns: the switches that moved a state
-    /// (a snapshot parked or a parked state put back) and their wall time.
+    /// (a snapshot parked, a parked state put back or handed back to its
+    /// slot's request) and their wall time; a handed-back state's put back
+    /// is its request's (`cache_ms`).
     pub n_swaps_total: u64,
     pub t_swap_ms_total: f64,
     /// Requests refused because the running request's state could not be
@@ -652,7 +654,7 @@ impl Worker {
             if self.active.is_empty() && self.t().pending.is_empty() {
                 for (what, a) in std::mem::take(&mut self.t_mut().deferred) {
                     let moved = match what {
-                        Reserve::One(i) => self.switch(i).map(|_| ()),
+                        Reserve::One(i) => self.switch(i, false).map(|_| ()),
                         Reserve::All => Ok(()),
                     };
                     if moved.is_err() || self.act(what, a).is_err() {
@@ -720,7 +722,7 @@ impl Worker {
     /// prompt runs, and its turn begins.
     fn begin(&mut self) -> Result<(), Dead> {
         let p = self.t_mut().pending.remove(0);
-        match self.switch(p.slot)? {
+        match self.switch(p.slot, true)? {
             Switched::Refused(why) => {
                 relock(&self.sh.stats).n_swap_refused_total += 1;
                 relock(&self.sh.board).release(p.slot);
@@ -747,7 +749,7 @@ impl Worker {
     /// whose state cannot be parked keeps the engine for another turn; a
     /// parked state that does not resume ends its request by name.
     fn rotate(&mut self, to: usize) -> Result<(), Dead> {
-        match self.switch(to)? {
+        match self.switch(to, false)? {
             Switched::Refused(_) => {
                 let i = self.t().running.and_then(|r| self.index_of(r));
                 let n = i.map_or(0, |i| self.active[i].job.timings().predicted_n);
@@ -849,10 +851,14 @@ impl Worker {
 
     /// Moves the engine from the slot it holds to `to`: the state it leaves
     /// parked as [`crate::swap`] says, then `to`'s parked state put back, its
-    /// ids fed again, or the engine emptied. A slot whose state leaves the
-    /// table, or that is left with no room, holds nothing after, and its
-    /// `/slots` view says so.
-    fn switch(&mut self, to: usize) -> Result<Switched, Dead> {
+    /// ids fed again, or the engine emptied. With `prompt` (the request
+    /// about to start on `to`), `to`'s idle parked state is handed back to
+    /// the slot instead of put back: that request's prompt puts it back only
+    /// if it keeps some of it, and hands it to the prompt cache without a
+    /// copy where the cache's rule saves it ([`Slot::hand_back`]). A slot
+    /// whose state leaves the table, or that is left with no room, holds
+    /// nothing after, and its `/slots` view says so.
+    fn switch(&mut self, to: usize, prompt: bool) -> Result<Switched, Dead> {
         let from = self.t().on;
         if from == to {
             return Ok(Switched::Done);
@@ -939,6 +945,12 @@ impl Worker {
         let mut out = Switched::Done;
         let mut fed_ms = 0.0;
         match self.t_mut().table.take(to) {
+            Some(Entry::State {
+                state, live: false, ..
+            }) if prompt => {
+                moved = true;
+                self.slot.hand_back(state);
+            }
             Some(Entry::State { state, .. }) => {
                 moved = true;
                 match self.slot.engine.resume(&state) {

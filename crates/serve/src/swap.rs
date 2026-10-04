@@ -27,7 +27,10 @@
 //! - The state of an idle slot (its request finished) is parked when it fits
 //!   and is the first to leave when a live one needs room; the slot then holds
 //!   nothing, and a request on it starts from what the prompt cache holds.
-//!   Under [`Park::Ids`] an idle slot's state is not kept.
+//!   A request that starts on a slot whose idle state is parked takes that
+//!   state as its slot's own, without a copy: back into the engine only if it
+//!   keeps some of it, into the prompt cache as it is where the cache's rule
+//!   saves it. Under [`Park::Ids`] an idle slot's state is not kept.
 //! - A slot action waits until no request is live: it would move a running
 //!   request's state aside.
 

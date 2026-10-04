@@ -33,9 +33,9 @@
 //! keeps serving.
 //!
 //! The host prompt cache (llama-server's `--cache-ram`), one for every slot:
-//! before a request drops most of what its slot holds, the server takes the
-//! slot's state as a
-//! value ([`Engine::snapshot`]) into a host-RAM LRU of [`Engine::cache_ram`]
+//! before a request drops most of what its slot holds — unless it carries the
+//! slot's last prompt whole, and so drops only that prompt's reply — the
+//! server takes the slot's state as a value ([`Engine::snapshot`]) into a host-RAM LRU of [`Engine::cache_ram`]
 //! bytes, keyed by the ids it covers; a later request that one of those states
 //! serves better than the slot does gets it back ([`Engine::resume`]). What
 //! the cache did, and every prefix the engine keeps less of than a request

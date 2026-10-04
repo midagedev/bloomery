@@ -9,8 +9,9 @@
 //! turns ([`serve::SwapEngine`]): preemption at a step, turns of `QUANTUM`
 //! tokens, shortest prompt first, a newcomer refused by name when the running
 //! request cannot be parked, the re-prefill fallback, `/slots`' turns, the
-//! draft kept, a lone request on the engine's slot among equals, and a slot
-//! the engine emptied holding nothing for the next request.
+//! draft kept, a lone request on the engine's slot among equals, a slot the
+//! engine emptied holding nothing for the next request, and a parked idle
+//! state taken into the prompt cache without a copy.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -900,13 +901,14 @@ enum Snap {
 /// goes into `trace` in order (`prefill <text>`, `next`, `advance`, `reset`,
 /// `snapshot`, `resume`), and whose steps (`next` and `advance`, counted over
 /// the engine's life) block where `holds` say: the `k`-th one waits until its
-/// latch is released.
+/// latch is released. Its prompt cache is off unless [`Turned::caching`].
 struct Turned {
     inner: Box<dyn Engine>,
     trace: Arc<Mutex<Vec<String>>>,
     holds: Vec<(usize, Arc<super::Latch>)>,
     steps: usize,
     snap: Snap,
+    cache: u64,
 }
 
 impl Turned {
@@ -926,8 +928,17 @@ impl Turned {
             holds: holds.iter().map(|&(k, l)| (k, Arc::clone(l))).collect(),
             steps: 0,
             snap,
+            cache: 0,
         };
         (t, trace)
+    }
+
+    /// The same engine with a prompt cache of `bytes`.
+    fn caching(self, bytes: u64) -> Turned {
+        Turned {
+            cache: bytes,
+            ..self
+        }
     }
 
     fn log(&self, what: String) {
@@ -983,6 +994,9 @@ impl Engine for Turned {
     }
     fn describe(&self) -> String {
         self.inner.describe()
+    }
+    fn cache_ram(&self) -> u64 {
+        self.cache
     }
     fn save_state(&self, out: &mut dyn std::io::Write) -> Result<SavedState, StateError> {
         self.log("snapshot".to_owned());
@@ -1475,4 +1489,117 @@ fn hw_a_slot_the_engine_emptied_holds_nothing_for_the_next_request() {
         "the slot that holds the shared header: {v}"
     );
     assert_eq!(v["timings"]["cache_n"], 7, "the header kept: {v}");
+}
+
+/// What `trace` holds between the last step before `prompt`'s prefill and
+/// that prefill: the switch to the prompt's slot and the prompt cache's work
+/// on it.
+fn before_prefill(trace: &[String], prompt: &str) -> Vec<String> {
+    let at = trace
+        .iter()
+        .position(|e| *e == format!("prefill {prompt}"))
+        .unwrap_or_else(|| panic!("no prefill of {prompt:?}: {trace:?}"));
+    let from = trace[..at]
+        .iter()
+        .rposition(|e| e == "next")
+        .unwrap_or_else(|| panic!("no step before the prefill of {prompt:?}: {trace:?}"));
+    trace[from + 1..at].to_vec()
+}
+
+/// After the park of the state the engine leaves (its first call), the
+/// states put back and the snapshots taken.
+fn past_park(between: &[String]) -> (usize, usize) {
+    assert_eq!(
+        between.first().map(String::as_str),
+        Some("snapshot"),
+        "the state the engine leaves is parked first: {between:?}"
+    );
+    let count = |what: &str| between[1..].iter().filter(|e| *e == what).count();
+    (count("resume"), count("snapshot"))
+}
+
+/// A request that starts on a slot whose idle state is parked takes that
+/// state from the park table as it is. One that keeps none of it costs no
+/// copy past the running request's park — no put back, no snapshot — and the
+/// prompt cache holds the state under its ids: a later request that returns
+/// to it keeps all of it. One that keeps some of it, less than half, puts it
+/// back for the cut and takes no snapshot. Every request gives its alone
+/// ids.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_parked_idle_state_goes_to_the_cache_without_a_copy() {
+    let (held, again) = (
+        Arc::new(super::Latch::default()),
+        Arc::new(super::Latch::default()),
+    );
+    // Next #3 is A's third step; B's six steps are #4 to #9; #12 is A's
+    // third after it is put back.
+    let (engine, trace) = Turned::new(Snap::Takes, &[(3, &held), (12, &again)]);
+    let addr = start_swap(Box::new(engine.caching(1 << 20)), 2, ROOMY);
+    let bodies = [
+        completion("abcabcab", 40),
+        completion("xyzxyz", 6),
+        completion("pqrpqr", 6),
+    ];
+    let a = post_bg(addr, bodies[0].clone());
+    assert!(held.wait_entered(BOUND), "A never reached next #3");
+    let b = post_bg(addr, bodies[1].clone());
+    wait_deferred(addr, 1, BOUND);
+    held.release();
+    assert!(again.wait_entered(BOUND), "A never reached next #12");
+    let b = b.join().expect("b");
+    let turns: Vec<Value> = get(addr, "/slots")
+        .json()
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|s| s["turn"].clone())
+        .collect();
+    assert_eq!(
+        turns,
+        [json!("running"), json!("idle")],
+        "the fixture: A runs on slot 0 and B, ended, left slot 1's state parked"
+    );
+    let r = post_bg(addr, bodies[2].clone());
+    wait_deferred(addr, 1, BOUND);
+    again.release();
+    let (a, r) = (a.join().expect("a"), r.join().expect("r"));
+    let alone = super::common::start(4096);
+    for (got, body) in [&a, &b, &r].into_iter().zip(&bodies) {
+        assert_eq!(got.status, 200, "{}", got.body);
+        let want = post(alone, "/completion", body).json();
+        assert_eq!(got.json()["tokens"], want["tokens"], "{body}");
+    }
+    assert_eq!(r.json()["id_slot"], 1, "R takes B's slot: {}", r.body);
+    let between = before_prefill(&trace.lock().expect("trace"), "pqrpq");
+    assert_eq!(
+        past_park(&between),
+        (0, 0),
+        "R keeps none of B's state: (put back, snapshots) {between:?}"
+    );
+    // B's eleven held positions (its prompt and five fed ids), from the
+    // prompt cache: the engine holds A's.
+    let back = completion("xyzxyzxyzxyzx", 6);
+    let v = post(addr, "/completion", &back).json();
+    assert_eq!(v["id_slot"], 0, "the engine's slot among equals: {v}");
+    assert_eq!(v["timings"]["cache_n"], 11, "B's state kept whole: {v}");
+    let want = post(alone, "/completion", &back).json();
+    assert_eq!(v["tokens"], want["tokens"], "{v}");
+    // Two ids of R's state, less than half of its eleven: its slot takes the
+    // request over the engine's.
+    let short = completion("pqmnmnmn", 6);
+    let v = post(addr, "/completion", &short).json();
+    assert_eq!(
+        (&v["id_slot"], &v["timings"]["cache_n"]),
+        (&json!(1), &json!(2)),
+        "R's slot, its two shared ids kept: {v}"
+    );
+    let want = post(alone, "/completion", &short).json();
+    assert_eq!(v["tokens"], want["tokens"], "{v}");
+    let between = before_prefill(&trace.lock().expect("trace"), "mnmnm");
+    assert_eq!(
+        past_park(&between),
+        (1, 0),
+        "a request that keeps two ids of R's state: (put back, snapshots) {between:?}"
+    );
 }
