@@ -167,12 +167,26 @@ impl Card {
         self.context_bytes + self.scratch_bytes + self.reserve_bytes()
     }
 
-    /// The bytes a plan may take from this card: its usable bytes capped by
-    /// the device's free bytes at plan time and by `budget` — [`capped`]'s
-    /// one cap, for a caller that sizes a load beside a plan.
+    /// The part of the card's context term a census free reading already
+    /// carries: the census reads on the device's primary context, so its
+    /// reading is net of the context's own creation cost
+    /// ([`workstation::CONTEXT_SELF`]), never of more than the card's whole
+    /// context term; 0 on a census-free card.
+    fn context_in_free(&self) -> u64 {
+        self.free_bytes
+            .map_or(0, |_| self.context_bytes.min(workstation::CONTEXT_SELF))
+    }
+
+    /// The card's usable bytes capped by the device's free reading as the
+    /// census took it — the context's own creation cost already out of it,
+    /// which the plan's own cap ([`capped`]) adds back — and by `budget`, for
+    /// a caller that sizes a load beside a plan against what the device read.
     #[must_use]
-    pub fn planned_bytes(&self, budget: Option<u64>) -> u64 {
-        capped(self, budget)
+    pub fn read_capped_bytes(&self, budget: Option<u64>) -> u64 {
+        let usable = self
+            .free_bytes
+            .map_or(self.usable_bytes, |free| self.usable_bytes.min(free));
+        budget.map_or(usable, |b| usable.min(b))
     }
 }
 
@@ -898,6 +912,8 @@ pub struct CardFreeFloor {
     pub over: u64,
     pub dense: u64,
     pub kv: u64,
+    /// The card's context term less the part the free reading already
+    /// carries.
     pub context: u64,
     pub scratch: u64,
     pub reserves: u64,
@@ -1574,12 +1590,17 @@ pub fn plan<'a>(
 /// The bytes the plan may take from `card`: its usable bytes, capped by the
 /// free bytes the census read at plan time ([`Card::free_bytes`]) and by the
 /// card budget, whichever holds less — the one place the free cap is taken.
-/// The expert rule's budget, the card budget floor, the headroom and
-/// [`Plan::violations`] all take it from here.
+/// The reading is already net of the context's own creation cost, which the
+/// card's context term ([`Card::set_aside_bytes`]) counts again, so the cap
+/// adds it back ([`Card::context_in_free`]): the context is counted once, and
+/// an idle card's reading caps as its usable bytes do. The expert rule's
+/// budget, the free floor, the headroom and [`Plan::violations`] all take it
+/// from here.
 fn capped(card: &Card, budget: Option<u64>) -> u64 {
-    let usable = card
-        .free_bytes
-        .map_or(card.usable_bytes, |free| card.usable_bytes.min(free));
+    let usable = card.free_bytes.map_or(card.usable_bytes, |free| {
+        card.usable_bytes
+            .min(free.saturating_add(card.context_in_free()))
+    });
     budget.map_or(usable, |b| usable.min(b))
 }
 
@@ -1951,15 +1972,23 @@ fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), Plac
     }
 }
 
-/// Refuse `card` when its floor — the same terms [`check_floor`] sums —
-/// passes `free`, what its device had free at plan time: another process
-/// holds enough of it that no expert rule can save the plan, because the
-/// dense tensors alone do not fit. A floor within the free bytes of a card
-/// whose census read none plans as before.
+/// Refuse `card` when its floor — the same terms [`check_floor`] sums, the
+/// context less the part the reading already carries
+/// ([`Card::context_in_free`]) — passes `free`, what its device had free at
+/// plan time: another process holds enough of it that no expert rule can save
+/// the plan, because the dense tensors alone do not fit. A floor within the
+/// free bytes of a card whose census read none plans as before.
 fn check_free_floor(card: &Card, free: u64, dense: u64, kv: u64) -> Result<(), PlacementError> {
-    let floor = [kv, card.set_aside_bytes(), card.margin_bytes]
-        .into_iter()
-        .try_fold(dense, u64::checked_add);
+    let context = card.context_bytes - card.context_in_free();
+    let floor = [
+        kv,
+        context,
+        card.scratch_bytes,
+        card.reserve_bytes(),
+        card.margin_bytes,
+    ]
+    .into_iter()
+    .try_fold(dense, u64::checked_add);
     match floor {
         Some(floor) if floor <= free => Ok(()),
         floor => Err(PlacementError::CardFreeFloor(Box::new(CardFreeFloor {
@@ -1970,7 +1999,7 @@ fn check_free_floor(card: &Card, free: u64, dense: u64, kv: u64) -> Result<(), P
             over: floor.unwrap_or(u64::MAX).saturating_sub(free),
             dense,
             kv,
-            context: card.context_bytes,
+            context,
             scratch: card.scratch_bytes,
             reserves: card.reserve_bytes(),
             margin: card.margin_bytes,
@@ -2436,6 +2465,64 @@ mod tests {
         let census_free = machine(None);
         let plan = plan_with(&model, &census_free, 4096, &NoKv, None).expect("plans");
         assert_eq!(plan.n_l.iter().sum::<u64>(), 24);
+    }
+
+    /// The census reads a card on its primary context, so an idle card's
+    /// reading is its usable bytes less the context's own creation cost,
+    /// which the card's context term counts again: the plan counts the
+    /// context once. An idle reading plans what the census-free card plans;
+    /// a reading another process holds 12 experts' bytes of plans what a
+    /// card budget that much below usable plans; and the free floor takes the
+    /// context less that cost — a trunk at the reading plans, one byte past it
+    /// is refused.
+    #[test]
+    fn a_census_reading_counts_the_context_once() {
+        let model = layered(3);
+        let context = workstation::CONTEXT;
+        let own = workstation::CONTEXT_SELF;
+        let usable = HEAD + 24 * EXPERT + context;
+        let machine = |free: Option<u64>| Machine {
+            cards: vec![Card {
+                context_bytes: context,
+                free_bytes: free,
+                ..bytes_card("card", usable, 0..3)
+            }],
+            tiers: Vec::new(),
+            host: host(),
+        };
+        let (none, idle, busy, budgeted) = (
+            machine(None),
+            machine(Some(usable - own)),
+            machine(Some(usable - own - 12 * EXPERT)),
+            machine(None),
+        );
+        let census_free = plan_with(&model, &none, 4096, &NoKv, None).expect("plans");
+        assert_eq!(census_free.n_l.iter().sum::<u64>(), 24);
+        let idle = plan_with(&model, &idle, 4096, &NoKv, None).expect("an idle card plans");
+        assert_eq!(
+            idle.n_l, census_free.n_l,
+            "an idle reading plans as no reading"
+        );
+        assert_eq!(idle.usable_bytes(&idle.machine.cards[0]), usable);
+        assert!(idle.violations().is_empty());
+        let busy = plan_with(&model, &busy, 4096, &NoKv, None).expect("a held card plans");
+        let budget = plan_with(&model, &budgeted, 4096, &NoKv, Some(usable - 12 * EXPERT))
+            .expect("plans under a budget");
+        assert_eq!(busy.n_l.iter().sum::<u64>(), 12);
+        assert_eq!(busy.n_l, budget.n_l, "a held reading plans as its budget");
+        assert!(busy.violations().is_empty());
+        let at = HEAD + context - own;
+        plan_with(&model, &machine(Some(at)), 4096, &NoKv, None).expect("a trunk at the reading");
+        match plan_with(&model, &machine(Some(at - 1)), 4096, &NoKv, None) {
+            Err(PlacementError::CardFreeFloor(terms)) => {
+                assert_eq!(
+                    (terms.free, terms.floor, terms.context),
+                    (at - 1, at, context - own)
+                );
+            }
+            Err(e) => panic!("{e}, not CardFreeFloor"),
+            Ok(_) => panic!("a trunk past the reading was planned"),
+        }
     }
 
     /// A card whose dense trunk alone passes what its device had free is

@@ -256,14 +256,15 @@ pub fn seq_bytes(inputs: &PlanInputs, ctx: usize, drafts: bool) -> u64 {
     let hp = &inputs.hp;
     let f16 = size_of::<u16>() as u64;
     let f32 = size_of::<f32>() as u64;
-    let mut layers = inputs.spec.layers.iter();
-    let kda = layers
-        .by_ref()
-        .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
-        .count();
-    let latent = layers
-        .filter(|l| matches!(l.mixer, Mixer::Latent(_)))
-        .count();
+    let (kda, latent) = inputs
+        .spec
+        .layers
+        .iter()
+        .fold((0u64, 0u64), |(kda, latent), l| match l.mixer {
+            Mixer::DeltaRule(_) => (kda + 1, latent),
+            Mixer::Latent(_) => (kda, latent + 1),
+            _ => (kda, latent),
+        });
     let positional = |n: usize| (n * (LATENT + INDEX_ROW) + pools_for(n) * INDEX_HEAD) as u64 * f16;
     // The load's every KDA layer one shape (`body::dims_of`): heads of the
     // head count each, the head dim the kernels'.
@@ -272,7 +273,7 @@ pub fn seq_bytes(inputs: &PlanInputs, ctx: usize, drafts: bool) -> u64 {
         n_v: hp.n_head,
         map: KHeadMap::Tiled,
     };
-    let recurrent = 2 * kda as u64 * (shape.state_len() + shape.ring_len()) as u64 * f32;
+    let recurrent = 2 * kda * (shape.state_len() + shape.ring_len()) as u64 * f32;
     let draft = |n: usize| positional(n) + 3 * (HC_STREAMS * hp.n_embd) as u64 * f32;
-    latent as u64 * positional(ctx) + recurrent + u64::from(drafts) * draft(ctx)
+    latent * positional(ctx) + recurrent + u64::from(drafts) * draft(ctx)
 }

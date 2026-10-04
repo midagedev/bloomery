@@ -1,7 +1,7 @@
 # just records-refresh: generate_ds41 --plan --depth 128 --place a under BLOOMERY_CED=on
 residency lever residency=mid-p40-s1 why=place
-plan place=a card=A6000 ctx_max=32768 card_experts=2651 (44465541120 B) host_experts=12709 (214302044160 B) host_shadow=1342177280 B n_l=69..70 on 38 layers card_budget=none card_free=50668240896 devices=[stage:A6000:cuda0:50952404992] cuda_order=unset(FASTEST_FIRST)
-residency host residency=mid-p40-s1 pinned=40 churn_experts=1131 churn_bytes=18970398720 headroom=43152766976 headroom_after=24182368256
+plan place=a card=A6000 ctx_max=32768 card_experts=2668 (44750684160 B) host_experts=12692 (214016901120 B) host_shadow=1342177280 B n_l=70..71 on 38 layers card_budget=none card_free=50668240896 devices=[stage:A6000:cuda0:50952404992] cuda_order=unset(FASTEST_FIRST)
+residency host residency=mid-p40-s1 pinned=40 churn_experts=1148 churn_bytes=19255541760 headroom=43437910016 headroom_after=24182368256
 call plan first=0 end=128 batches=1 group=2 groups=1 t_max=512 chunk=8 sub_chunks=16 ring=128 layers=40 ced=on
 call groups g=1 sizes=[1]
 call groups g=2 sizes=[1]
@@ -14,14 +14,14 @@ call groups g=8 sizes=[1]
 call batch b=0 first=0 end=128 group=0 set=0 chunks=16 cuts=[0,8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128]
 call layer l=0 ratio=0 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=0
 call layer l=1 ratio=0 compressor=false gated=false index_keys=false indexer=false engram=true card_experts=0
-call layer l=2 ratio=2 compressor=true gated=true index_keys=true indexer=true engram=false card_experts=70
-call layer l=3 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
-call layer l=4 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
-call layer l=5 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
-call layer l=6 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
-call layer l=7 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
-call layer l=8 ratio=2 compressor=true gated=true index_keys=true indexer=true engram=false card_experts=70
-call layer l=9 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
+call layer l=2 ratio=2 compressor=true gated=true index_keys=true indexer=true engram=false card_experts=71
+call layer l=3 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=71
+call layer l=4 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=71
+call layer l=5 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=71
+call layer l=6 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=71
+call layer l=7 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=71
+call layer l=8 ratio=2 compressor=true gated=true index_keys=true indexer=true engram=false card_experts=71
+call layer l=9 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=71
 call layer l=10 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
 call layer l=11 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
 call layer l=12 ratio=2 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
@@ -43,15 +43,15 @@ call layer l=27 ratio=1 compressor=false gated=false index_keys=false indexer=fa
 call layer l=28 ratio=1 compressor=false gated=false index_keys=false indexer=true engram=false card_experts=70
 call layer l=29 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
 call layer l=30 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
-call layer l=31 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=69
-call layer l=32 ratio=1 compressor=false gated=false index_keys=false indexer=true engram=false card_experts=69
-call layer l=33 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=69
-call layer l=34 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=69
-call layer l=35 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=69
-call layer l=36 ratio=1 compressor=false gated=false index_keys=false indexer=true engram=false card_experts=69
-call layer l=37 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=69
-call layer l=38 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=69
-call layer l=39 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=69
+call layer l=31 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
+call layer l=32 ratio=1 compressor=false gated=false index_keys=false indexer=true engram=false card_experts=70
+call layer l=33 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
+call layer l=34 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
+call layer l=35 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
+call layer l=36 ratio=1 compressor=false gated=false index_keys=false indexer=true engram=false card_experts=70
+call layer l=37 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
+call layer l=38 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
+call layer l=39 ratio=1 compressor=false gated=false index_keys=false indexer=false engram=false card_experts=70
 call need features_from=128 block_positions=5000 part_positions=120 full_from=[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,120] part_from=[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
 call lb b=0 layer=0 run=0 full=0 part_sb=[] full_sb=[16]
 call lb b=0 layer=1 run=0 full=0 part_sb=[] full_sb=[16]

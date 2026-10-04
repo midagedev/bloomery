@@ -107,11 +107,34 @@ impl PlaceQ3 {
     /// The plan at `ctx` positions under `levers` (the card budget), every
     /// refusal by name with its terms.
     pub fn plan(&self, ctx: usize, levers: &PlanLevers) -> Result<Plan<'_>, GateError> {
+        self.plan_over(&self.machine, ctx, levers)
+    }
+
+    /// [`Self::plan`] over a machine [`Self::machine_at`] relayed at another
+    /// context.
+    fn plan_over<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx: usize,
+        levers: &PlanLevers,
+    ) -> Result<Plan<'a>, GateError> {
         let ctx = u64::try_from(ctx)?;
         Ok(match &self.inputs {
-            Inputs::Qwen3(i) => i.plan(&self.machine, ctx, levers)?,
-            Inputs::Qwen35(i) => i.plan_rule(&self.machine, ctx, levers, card_routed)?,
+            Inputs::Qwen3(i) => i.plan(machine, ctx, levers)?,
+            Inputs::Qwen35(i) => i.plan_rule(machine, ctx, levers, card_routed)?,
         })
+    }
+
+    /// The same placed load's machine at `ctx`: the place and the inputs this
+    /// one resolved and read stay — the census and the file's headers a
+    /// context search's every probe retook before — and the machine is relaid
+    /// over the arena `ctx` sets, its only ctx-dependent term.
+    fn machine_at(&self, arena: u64) -> Result<Machine, GateError> {
+        let layers = match &self.inputs {
+            Inputs::Qwen3(i) => i.hp.n_layer,
+            Inputs::Qwen35(i) => i.hp.n_layer,
+        };
+        Ok(q3::machine(self.place.card_specs()?[0], layers, arena))
     }
 
     /// The `plan` record of `plan`: the card, the architecture, the expert
@@ -172,20 +195,21 @@ fn whole_card_bytes(model: &ModelTensors) -> Option<u64> {
     Some(sum)
 }
 
-/// The KV bytes of `q`'s model at `ctx` positions, its own layout's.
-fn kv_bytes(q: &PlaceQ3, ctx: u64) -> u64 {
-    let layers = q.machine.cards[0].layers.clone();
+/// The KV bytes of the model `inputs` holds at `ctx` positions over
+/// `layers`, its own layout's.
+fn kv_bytes(layers: &std::ops::Range<usize>, inputs: &Inputs, ctx: u64) -> u64 {
     layers
-        .map(|l| match &q.inputs {
+        .clone()
+        .map(|l| match inputs {
             Inputs::Qwen3(i) => i.kv.layer_bytes(l, ctx),
             Inputs::Qwen35(i) => i.kv.layer_bytes(l, ctx),
         })
         .sum()
 }
 
-/// The model of `q`'s file as `inputs` holds it.
-fn inputs_model(q: &PlaceQ3) -> &ModelTensors {
-    match &q.inputs {
+/// The model of `inputs`'s file as it holds it.
+fn inputs_model(inputs: &Inputs) -> &ModelTensors {
+    match inputs {
         Inputs::Qwen3(i) => &i.model,
         Inputs::Qwen35(i) => &i.model,
     }
@@ -194,22 +218,25 @@ fn inputs_model(q: &PlaceQ3) -> &ModelTensors {
 /// Whether the whole model fits what device 0 — today's unplaced load's
 /// card — had free at plan time: the whole-card bytes plus the KV, context,
 /// scratch and margin of the machine the planner lays out for the file,
-/// against the card's free-capped bytes (the margin covers the whole load's
-/// own arena, which the placed machine's scratch understates). A model that
-/// does not fit and has no routed expert to move to the host tier is
-/// refused by name, the card, its free and usable bytes, the need and the
-/// holders the census named.
-fn whole_fits_free(q: &PlaceQ3, ctx: u64) -> Result<bool, GateError> {
-    let card = &q.machine.cards[0];
-    let model = inputs_model(q);
+/// against the card's free reading as the census took it
+/// (`Card::read_capped_bytes`). The need counts no allocator granule
+/// rounding and understates the whole load's own arena (the placed machine's
+/// scratch); the margin and the context's own creation cost — out of the
+/// reading and in the context term both, where the plan's own cap counts it
+/// once — are what cover them. A model that does not fit and has no routed
+/// expert to move to the host tier is refused by name, the card, its free
+/// and usable bytes, the need and the holders the census named.
+fn whole_fits_free(machine: &Machine, inputs: &Inputs, ctx: u64) -> Result<bool, GateError> {
+    let card = &machine.cards[0];
+    let model = inputs_model(inputs);
     let whole = whole_card_bytes(model)
         .ok_or("a tensor of this file has no card format, and the whole load takes the card")?;
     let need = whole
-        .checked_add(kv_bytes(q, ctx))
+        .checked_add(kv_bytes(&machine.cards[0].layers, inputs, ctx))
         .and_then(|n| n.checked_add(card.set_aside_bytes()))
         .and_then(|n| n.checked_add(card.margin_bytes))
         .ok_or("the whole load's need passes u64 bytes")?;
-    if need <= card.planned_bytes(None) {
+    if need <= card.read_capped_bytes(None) {
         return Ok(true);
     }
     if !model.tensors.iter().any(|t| t.role == Role::RoutedExperts) {
@@ -241,7 +268,7 @@ fn whole_fits_free(q: &PlaceQ3, ctx: u64) -> Result<bool, GateError> {
 /// A file with no routed experts that does not fit is refused by name.
 pub fn unplaced_qwen3(file: &Split, ctx: usize, kv: KvQ8) -> Result<Unplaced, GateError> {
     let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, ctx, kv)?;
-    if whole_fits_free(&probe, u64::try_from(ctx)?)? {
+    if whole_fits_free(&probe.machine, &probe.inputs, u64::try_from(ctx)?)? {
         return Ok(Unplaced::Whole);
     }
     Ok(Unplaced::Placed(Box::new(PlaceQ3::qwen3(
@@ -274,9 +301,10 @@ pub fn trained_ctx(file: &Split) -> Option<usize> {
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
 )]
 pub fn whole_ctx_qwen3(file: &Split, floor: usize, kv: KvQ8) -> Result<Option<usize>, GateError> {
+    let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, floor, kv)?;
     let fits = |ctx: usize| {
-        let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, ctx, kv)?;
-        whole_fits_free(&probe, u64::try_from(ctx)?)
+        let machine = probe.machine_at(Qwen3moeModel::placed_arena_bytes(file, ctx)?)?;
+        whole_fits_free(&machine, &probe.inputs, u64::try_from(ctx)?)
     };
     searched_ctx(file, floor, &fits)
 }
@@ -291,11 +319,12 @@ pub fn whole_ctx_qwen35(
     o: &Open35,
     floor: usize,
 ) -> Result<Option<usize>, GateError> {
+    let probe = PlaceQ3::qwen35(file, Place::parse("cuda0")?, *o)?;
     let fits = |ctx: usize| {
-        let mut probe_o = *o;
-        probe_o.ctx = ctx;
-        let probe = PlaceQ3::qwen35(file, Place::parse("cuda0")?, probe_o)?;
-        whole_fits_free(&probe, u64::try_from(ctx)?)
+        let mut at = *o;
+        at.ctx = ctx;
+        let machine = probe.machine_at(Qwen35moeModel::placed_arena_bytes(file, at)?)?;
+        whole_fits_free(&machine, &probe.inputs, u64::try_from(ctx)?)
     };
     searched_ctx(file, floor, &fits)
 }
@@ -319,9 +348,13 @@ pub fn placed_ctx_qwen3(
     levers: &PlanLevers,
     kv: KvQ8,
 ) -> Result<Option<usize>, GateError> {
+    let probe = PlaceQ3::qwen3(file, place, floor, kv)?;
     let experts = |ctx: usize| {
-        let probe = PlaceQ3::qwen3(file, place, ctx, kv)?;
-        Ok(probe.plan(ctx, levers).ok().map(|p| p.cards[0].experts))
+        let machine = probe.machine_at(Qwen3moeModel::placed_arena_bytes(file, ctx)?)?;
+        Ok(probe
+            .plan_over(&machine, ctx, levers)
+            .ok()
+            .map(|p| p.cards[0].experts))
     };
     searched_placed_ctx(file, floor, &experts)
 }
@@ -338,22 +371,28 @@ pub fn placed_ctx_qwen35(
     floor: usize,
     levers: &PlanLevers,
 ) -> Result<Option<usize>, GateError> {
+    let probe = PlaceQ3::qwen35(file, place, *o)?;
     let experts = |ctx: usize| {
-        let mut probe_o = *o;
-        probe_o.ctx = ctx;
-        let probe = PlaceQ3::qwen35(file, place, probe_o)?;
-        Ok(probe.plan(ctx, levers).ok().map(|p| p.cards[0].experts))
+        let mut at = *o;
+        at.ctx = ctx;
+        let machine = probe.machine_at(Qwen35moeModel::placed_arena_bytes(file, at)?)?;
+        Ok(probe
+            .plan_over(&machine, ctx, levers)
+            .ok()
+            .map(|p| p.cards[0].experts))
     };
     searched_placed_ctx(file, floor, &experts)
 }
 
 /// The search both `placed_ctx_*` run: [`searched_ctx`] over the plan's own
 /// expert split — a context whose plan keeps the floor's card experts fits,
-/// one whose plan cannot build (the census fell, a budget binds) or that
+/// one whose plan cannot build (the card is held, a budget binds) or that
 /// drops below the split does not. Monotone in the context: the KV term
 /// grows with it, the expert rule's budget falls, and the rule's fill is a
 /// prefix through the allocator's granules, so more budget never holds
-/// fewer experts.
+/// fewer experts. One census and one header read serve the whole search
+/// ([`PlaceQ3::machine_at`]), so the reading cannot move between the
+/// probes the premise rides on.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -410,7 +449,7 @@ fn searched_ctx(
 /// of a qwen35moe file.
 pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> {
     let probe = PlaceQ3::qwen35(file, Place::parse("cuda0")?, *o)?;
-    if whole_fits_free(&probe, u64::try_from(o.ctx)?)? {
+    if whole_fits_free(&probe.machine, &probe.inputs, u64::try_from(o.ctx)?)? {
         return Ok(Unplaced::Whole);
     }
     Ok(Unplaced::Placed(Box::new(PlaceQ3::qwen35(

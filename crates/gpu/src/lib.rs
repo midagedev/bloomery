@@ -1722,54 +1722,6 @@ fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16], GpuError> 
     Ok(uuid.bytes.map(|c| c.to_ne_bytes()[0]))
 }
 
-/// Device `dev`'s free bytes, read on its primary context: the context the
-/// load itself will run in, so the reading already carries a context's own
-/// cost and every other process's allocations. The context is retained for
-/// the call and released after, and the calling thread's current context is
-/// what it was before; a device whose reading fails is a named error, never
-/// a plausible total.
-fn raw_device_free_bytes(dev: cuda_core::sys::CUdevice) -> Result<u64, GpuError> {
-    use cuda_core::sys::{
-        cuCtxGetCurrent, cuCtxSetCurrent, cuDevicePrimaryCtxRelease_v2, cuDevicePrimaryCtxRetain,
-        cuMemGetInfo_v2,
-    };
-    let mut before = std::ptr::null_mut();
-    // SAFETY: `before` is a live out-pointer for the call.
-    let rc = unsafe { cuCtxGetCurrent(&mut before) };
-    graph::cu(rc, "cuCtxGetCurrent")?;
-    let mut primary = std::ptr::null_mut();
-    // SAFETY: `primary` is a live out-pointer and `dev` a device handle the
-    // driver returned for this ordinal.
-    let rc = unsafe { cuDevicePrimaryCtxRetain(&mut primary, dev) };
-    match graph::cu(rc, "cuDevicePrimaryCtxRetain") {
-        Err(e) => Err(e),
-        Ok(()) => {
-            // SAFETY: `primary` is the context just retained on this device,
-            // made current on the calling thread by this call.
-            let rc = unsafe { cuCtxSetCurrent(primary) };
-            let r = match graph::cu(rc, "cuCtxSetCurrent") {
-                Err(e) => Err(e),
-                Ok(()) => {
-                    let (mut free, mut total) = (0usize, 0usize);
-                    // SAFETY: both out-pointers are live locals for the call
-                    // and the retained context is current on this thread.
-                    let rc = unsafe { cuMemGetInfo_v2(&mut free, &mut total) };
-                    graph::cu(rc, "cuMemGetInfo").and_then(|()| {
-                        u64::try_from(free)
-                            .map_err(|_| GpuError::shape("census", "a free byte count past u64"))
-                    })
-                }
-            };
-            // SAFETY: `before` is the context handle `cuCtxGetCurrent` gave;
-            // putting it back leaves the thread as it was, primary or none.
-            let _ = unsafe { cuCtxSetCurrent(before) };
-            // SAFETY: the release paired with the retain above.
-            let _ = unsafe { cuDevicePrimaryCtxRelease_v2(dev) };
-            r
-        }
-    }
-}
-
 /// The visible devices as this process's driver enumerates them, each read
 /// without a context but its free bytes, which the primary context answers:
 /// ordinal, name, `cuDeviceTotalMem`, free bytes, UUID and PCI bus
@@ -1965,6 +1917,65 @@ fn anchor(device: usize) -> Result<Arc<CudaContext>, GpuError> {
             held[device] = Some(Arc::clone(&anchor));
             Ok(anchor)
         }
+    }
+}
+
+/// Device `dev`'s free bytes, read on its primary context: the context the
+/// load itself will run in, so the reading already carries the context's own
+/// creation cost (which a plan's cap adds back,
+/// `model::placement::workstation::CONTEXT_SELF`) and every other process's
+/// allocations. The context is retained for the read and released after,
+/// never held: on a device this process holds, the anchor's retain
+/// ([`anchor`]) keeps it, so the pair leaves it as it was; on any other, the
+/// context made here runs no work, and the process holds no device it does
+/// not open. The calling thread's current context is put back. Every step's
+/// failure is the call's error: the restore and the release run whatever came
+/// before them, one failure is that driver error, and more than one is a
+/// census error naming each.
+fn raw_device_free_bytes(dev: cuda_core::sys::CUdevice) -> Result<u64, GpuError> {
+    use cuda_core::sys::{
+        cuCtxGetCurrent, cuCtxSetCurrent, cuDevicePrimaryCtxRelease_v2, cuDevicePrimaryCtxRetain,
+        cuMemGetInfo_v2,
+    };
+    let mut before = std::ptr::null_mut();
+    // SAFETY: `before` is a live out-pointer for the call.
+    let rc = unsafe { cuCtxGetCurrent(&mut before) };
+    graph::cu(rc, "cuCtxGetCurrent")?;
+    let mut primary = std::ptr::null_mut();
+    // SAFETY: `primary` is a live out-pointer and `dev` a device handle the
+    // driver returned for this ordinal.
+    let rc = unsafe { cuDevicePrimaryCtxRetain(&mut primary, dev) };
+    graph::cu(rc, "cuDevicePrimaryCtxRetain")?;
+    // SAFETY: `primary` is the context just retained on this device, made
+    // current on the calling thread by this call.
+    let rc = unsafe { cuCtxSetCurrent(primary) };
+    let read = graph::cu(rc, "cuCtxSetCurrent").and_then(|()| {
+        let (mut free, mut total) = (0usize, 0usize);
+        // SAFETY: both out-pointers are live locals for the call and the
+        // retained context is current on this thread.
+        let rc = unsafe { cuMemGetInfo_v2(&mut free, &mut total) };
+        graph::cu(rc, "cuMemGetInfo")?;
+        u64::try_from(free).map_err(|_| GpuError::shape("census", "a free byte count past u64"))
+    });
+    // SAFETY: `before` is the context handle `cuCtxGetCurrent` gave; putting
+    // it back leaves the thread as it was, primary or none.
+    let rc = unsafe { cuCtxSetCurrent(before) };
+    let restore = graph::cu(rc, "cuCtxSetCurrent (the census's restore)");
+    // SAFETY: the release paired with the retain above.
+    let rc = unsafe { cuDevicePrimaryCtxRelease_v2(dev) };
+    let release = graph::cu(rc, "cuDevicePrimaryCtxRelease");
+    match (read, restore, release) {
+        (Ok(free), Ok(()), Ok(())) => Ok(free),
+        (Err(e), Ok(()), Ok(())) | (Ok(_), Err(e), Ok(())) | (Ok(_), Ok(()), Err(e)) => Err(e),
+        (read, restore, release) => Err(GpuError::shape(
+            "census",
+            [read.err(), restore.err(), release.err()]
+                .into_iter()
+                .flatten()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; then "),
+        )),
     }
 }
 

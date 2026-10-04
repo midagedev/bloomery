@@ -142,6 +142,7 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{checkpoint_bytes, seq_positional_bytes};
+    use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
@@ -445,7 +446,7 @@ mod gate {
             u64::try_from(ub)?,
             experts,
         );
-        machine.cards[0].free_bytes = server_card_free(err_log)?;
+        machine.cards[0].free_bytes = Some(server_card_free(err_log)?);
         // Under the draft the plan carries it (its granules, its store, its
         // row map and its program's arena beside the target's card terms),
         // and `/props` files its bytes as the card's `draft` class.
@@ -1021,21 +1022,38 @@ mod gate {
         Ok(ok)
     }
 
-    /// The first record on the server's stderr at `err_log` whose line
-    /// starts with `head` and a space.
-    /// The card free bytes the server's own `plan` line named: its census
-    /// reading at its load. The gate's re-derivations take the same one — a
-    /// fresh census read beside the loaded server would see the server's own
-    /// bytes as taken and size another plan.
-    fn server_card_free(err_log: &Path) -> Result<Option<u64>, GateError> {
-        Ok(record_line(err_log, "plan")?.and_then(|l| {
-            l.split("card_free=")
-                .nth(1)
-                .and_then(|t| t.split(' ').next())
-                .and_then(|n| n.parse::<u64>().ok())
-        }))
+    /// The card free bytes the server's own `plan` record
+    /// ([`record::PLAN38`]) named: its census reading at its load. The
+    /// gate's re-derivations take the same one — a fresh census read beside
+    /// the loaded server would see the server's own bytes as taken and size
+    /// another plan. A server that printed no `plan` record, or a record
+    /// without its `card_free`, is a named error, never an uncapped re-plan:
+    /// the seat prints its `ctx` line before its `plan` record, so a reader
+    /// that stops the server at the `ctx` line waits for the record too.
+    fn server_card_free(err_log: &Path) -> Result<u64, GateError> {
+        let kind = &record::PLAN38;
+        let line = record_line(err_log, kind.head)?.ok_or_else(|| {
+            format!(
+                "{}: the server printed no `{}` record",
+                err_log.display(),
+                kind.name
+            )
+        })?;
+        line.split(" card_free=")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| {
+                format!(
+                    "the server's `{}` record carries no card_free: {line}",
+                    kind.name
+                )
+                .into()
+            })
     }
 
+    /// The first record on the server's stderr at `err_log` whose line
+    /// starts with `head` and a space.
     fn record_line(err_log: &Path, head: &str) -> Result<Option<String>, GateError> {
         let prefix = format!("{head} ");
         Ok(std::fs::read_to_string(err_log)?
@@ -1728,7 +1746,13 @@ mod gate {
                 .lines()
                 .find(|l| l.starts_with("ctx rule="))
                 .map(str::to_owned);
-            if line.is_some() || served.child.try_wait()?.is_some() {
+            // The `plan` record carries the free reading the re-derivations
+            // below take ([`server_card_free`]), and the seat prints its `ctx`
+            // line before it: both must be in the log before the server
+            // stops, or the reading is raced away.
+            let head = format!("{} ", record::PLAN38.head);
+            let plan = text.lines().any(|l| l.starts_with(&head));
+            if (line.is_some() && plan) || served.child.try_wait()?.is_some() {
                 break;
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -1771,7 +1795,7 @@ mod gate {
         let inputs = PlanInputs::describe(&split)?;
         let experts = experts38(levers)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
-        let free = server_card_free(&err_log)?;
+        let free = Some(server_card_free(&err_log)?);
         // The default the seat's rules compose to also answers the prompt
         // cache's bound, whose ram rides MemAvailable as the fit rides the
         // census: the gate takes the server's own `cache` line's ram, not a

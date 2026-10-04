@@ -61,12 +61,12 @@
 //!   compression groups: its cut lands in a reply or at a prompt call's end,
 //!   outside every prompt call's hole. The other two print what they kept.
 //! - the think-span budget (`reasoning_budget`): a thinking-on generation
-//!   with the budget at 8 takes the model's own first 8 ids, force-feeds the
-//!   close id as the 9th, and the continuation conditions on it (its ids
-//!   after the close are a fresh run's fed the close as an ordinary prompt
-//!   id); the chat reply's reasoning is bounded and closed with content after
-//!   it, the count includes the close, and a follow-up turn keeps the prefix
-//!   it shares with what the budgeted turn left;
+//!   with the budget at 8 carries the close id as the 9th, and the
+//!   continuation conditions on it (its ids after the close are a fresh
+//!   run's fed the close as an ordinary prompt id): the close id really
+//!   enters the engine's context. The ids before the budget, the reply's
+//!   bounded-and-closed shape and the follow-up turn's prefix are
+//!   `crates/serve`'s mock tests' to pin;
 //! - two conversations interleaved (the prompt cache): `--ids` and its
 //!   greedy ids, then the ids reversed, then `--ids` plus its greedy ids
 //!   again keeps every position the first left (`cache_n` = its length − 1)
@@ -179,6 +179,7 @@ mod gate {
 
     use bloomery_gpu_gates::bind::nvidia_smi_index;
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
@@ -832,13 +833,18 @@ mod gate {
     }
 
     /// The think-span budget (module header): a thinking-on generation with
-    /// `reasoning_budget` 8 takes the model's own first 8 ids, force-feeds the
-    /// close id as the 9th, and the continuation conditions on it; the chat
-    /// reply's reasoning is bounded and closed, and the follow-up turn keeps
-    /// the shared prefix.
-    fn budget(url: &dyn Fn(&str) -> String, rules: &Rules) -> Result<bool, GateError> {
+    /// `reasoning_budget` 8 carries the close id at the 9th position, and the
+    /// continuation conditions on it — fed the run's ids through the close as
+    /// an ordinary prompt, the model continues as the budgeted run did. The
+    /// close at the budget is the clause's precondition, not a pin of its own:
+    /// without it the continuation matches whatever the run did. The model's
+    /// own ids before the budget, the bounded-and-closed shape of the reply,
+    /// the count that includes the close, and the follow-up turn's prefix are
+    /// `crates/serve`'s mock tests' to pin; this clause holds the one they
+    /// cannot — the close id really enters the engine's context.
+    fn budget(url: &dyn Fn(&str) -> String) -> Result<bool, GateError> {
         const THINK_BUDGET: usize = 8;
-        /// The budgeted generations' length and the chat turn's.
+        /// The budgeted generation's length.
         const THINK_PREDICT: usize = 16;
         let on = json!({"thinking": true});
         let one = json!([{"role": "user", "content": CHAT}]);
@@ -849,115 +855,36 @@ mod gate {
             false,
         )?;
         let close = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
-        // The budgeted and free runs, from a reset cache: ids and timings.
-        let run =
-            |prompt: &[u32], budget: Value, n: usize| -> Result<(Vec<u32>, Value), GateError> {
-                let body = json!({
-                    "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
-                    "return_tokens": true, "cache_prompt": false, "reasoning_budget": budget,
-                });
-                let (st, text) = curl(&url("/completion"), Some(&body), false)?;
-                let v = json_of("/completion", st, &text)?;
-                Ok((ids_of(&v["tokens"]), v))
-            };
-        let (free, _) = run(&p, Value::Null, THINK_BUDGET)?;
-        let (capped, _) = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
+        // A run's ids, from a reset cache.
+        let run = |prompt: &[u32], budget: Value, n: usize| -> Result<Vec<u32>, GateError> {
+            let body = json!({
+                "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
+                "return_tokens": true, "cache_prompt": false, "reasoning_budget": budget,
+            });
+            let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+            Ok(ids_of(&json_of("/completion", st, &text)?["tokens"]))
+        };
+        let capped = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
+        let through = THINK_BUDGET + close.len();
+        let closed = capped.len() == THINK_PREDICT && capped[THINK_BUDGET..through] == close[..];
         // Fed the close as an ordinary prompt id, the model continues as the
         // capped run did: the engine's context really carries the close.
-        let mut through = p.clone();
-        through.extend(&capped[..THINK_BUDGET + close.len()]);
-        let (after, _) = run(
-            &through,
-            Value::Null,
-            THINK_PREDICT - THINK_BUDGET - close.len(),
-        )?;
+        let after = if closed {
+            let mut fed = p.clone();
+            fed.extend(&capped[..through]);
+            run(&fed, Value::Null, THINK_PREDICT - through)?
+        } else {
+            Vec::new()
+        };
         println!(
-            "think budget {THINK_BUDGET}: free {free:?}, capped {:?}.., close {close:?}",
-            &capped[..THINK_BUDGET + close.len()],
+            "think budget {THINK_BUDGET}: capped {capped:?}, close {close:?} at {THINK_BUDGET}: \
+             {closed}, fed through it {after:?}"
         );
         let mut ok = true;
         check(
             &mut ok,
-            "budget_leaves_the_models_own_ids",
-            capped.len() == THINK_PREDICT && capped[..THINK_BUDGET] == free[..],
-        );
-        check(
-            &mut ok,
-            "budget_forces_the_close_at_the_budget",
-            capped[THINK_BUDGET..THINK_BUDGET + close.len()] == close[..],
-        );
-        check(
-            &mut ok,
             "budget_continues_on_the_close",
-            after == capped[THINK_BUDGET + close.len()..],
-        );
-        // The chat turn: bounded, closed, the close counted.
-        let chat = |messages: &Value, budget: Value| -> Result<Value, GateError> {
-            let body = json!({
-                "messages": messages, "temperature": 0, "max_tokens": THINK_PREDICT,
-                "ignore_eos": true, "chat_template_kwargs": on.clone(),
-                "reasoning_budget": budget,
-            });
-            let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
-            json_of("/v1/chat/completions", st, &text)
-        };
-        let warm = chat(&one, json!(THINK_BUDGET))?;
-        let m = &warm["choices"][0]["message"];
-        let reasoning = m["reasoning_content"].as_str().unwrap_or("").to_owned();
-        let content = m["content"].as_str().unwrap_or("").to_owned();
-        let (st, body) = curl(
-            &url("/tokenize"),
-            Some(&json!({"content": reasoning})),
-            false,
-        )?;
-        let reasoning_ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
-        println!(
-            "think budget chat: reasoning {} ids, content {} chars, usage {}",
-            reasoning_ids.len(),
-            content.len(),
-            warm["usage"]
-        );
-        check(
-            &mut ok,
-            "budget_reasoning_is_bounded",
-            !reasoning.is_empty() && reasoning_ids.len() <= THINK_BUDGET,
-        );
-        check(
-            &mut ok,
-            "budget_reply_is_closed_and_counts_the_close",
-            !content.is_empty()
-                && as_count(&warm["usage"]["completion_tokens"])
-                    .is_some_and(|n| n > THINK_BUDGET + close.len()),
-        );
-        // The follow-up turn keeps the prefix it shares with what the
-        // budgeted turn left: the recorded turn diverges at the generation
-        // prompt's last id (its `<think>`), and the server keeps at least
-        // that prefix in whole compression groups. It may keep more — an
-        // earlier clause's state can share a longer prefix with the turn
-        // (this clause runs mid-gate, its ledger not its own) — which the
-        // converse scripts bound with the ledger this one cannot.
-        let (held_ids, _) = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
-        let mut held = p.clone();
-        held.extend(&held_ids[..held_ids.len() - 1]);
-        let mut two = one.as_array().expect("messages").clone();
-        two.push(json!({"role": "assistant", "content": content}));
-        two.push(json!({"role": "user", "content": TURN2}));
-        let two = Value::Array(two);
-        let p2 = rendered(url, &two, &on)?;
-        let shared = common(&held, &p2);
-        let followup = chat(&two, Value::Null)?;
-        let kept = as_count(&followup["timings"]["cache_n"]);
-        let floor = whole_groups(shared, &rules.ratios);
-        println!(
-            "think budget follow-up: shared {shared} of {} held (the prompt's {} ids),              floor {floor}, cache_n={}",
-            held.len(),
-            p.len(),
-            followup["timings"]["cache_n"]
-        );
-        check(
-            &mut ok,
-            "budget_followup_keeps_the_shared_prefix",
-            shared + 1 == p.len() && kept.is_some_and(|k| k >= floor),
+            closed && after == capped[through..],
         );
         Ok(ok)
     }
@@ -1220,13 +1147,16 @@ mod gate {
 
     /// `/props`' `engine` object (see the module header) against the plan of
     /// the file the server opens, made here from its headers the way the
-    /// server makes it, under the placement's `levers` the server inherits;
-    /// `argv` and `pid` are the process this gate spawned.
+    /// server makes it — under the placement's `levers` the server inherits
+    /// and its stage card's free reading, taken from the server's own `plan`
+    /// record ([`server_card_free`]); `argv` and `pid` are the process this
+    /// gate spawned.
     fn props_engine(
         url: &dyn Fn(&str) -> String,
         argv: &[String],
         pid: u32,
         levers: &PlanLevers,
+        err_log: &Path,
     ) -> Result<bool, GateError> {
         let (st, body) = curl(&url("/props"), None, false)?;
         let e = json_of("/props", st, &body)?["engine"].clone();
@@ -1234,7 +1164,9 @@ mod gate {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let mut spec = workstation::RTX_3090;
+        spec.free_bytes = Some(server_card_free(err_log)?);
+        let machine = workstation::plan_on(spec, inputs.model.layers);
         let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
         let (Some(card), Some(stage)) = (plan.cards.first(), machine.cards.first()) else {
             return Err("the gate's plan has no card".into());
@@ -1455,7 +1387,7 @@ mod gate {
         let url = |p: &str| format!("http://{addr}{p}");
         println!("server listening on {addr}");
         let mut ok = true;
-        ok &= drafted_props(&url, levers, &draft_path, &draft_device)?;
+        ok &= drafted_props(&url, levers, &draft_path, &draft_device, &err_log)?;
 
         let completion = json!({
             "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
@@ -1551,12 +1483,15 @@ mod gate {
         Ok(ids)
     }
 
-    /// `/props`' `engine.draft` and the draft's placement row (module header).
+    /// `/props`' `engine.draft` and the draft's placement row (module header),
+    /// the plan re-derived under the server's own `card_free` reading
+    /// ([`server_card_free`]).
     fn drafted_props(
         url: &dyn Fn(&str) -> String,
         levers: &PlanLevers,
         draft_path: &Path,
         draft_device: &str,
+        err_log: &Path,
     ) -> Result<bool, GateError> {
         let (st, body) = curl(&url("/props"), None, false)?;
         let e = json_of("/props", st, &body)?["engine"].clone();
@@ -1564,7 +1499,9 @@ mod gate {
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        let machine = workstation::plan_gate(inputs.model.layers);
+        let mut spec = workstation::RTX_3090;
+        spec.free_bytes = Some(server_card_free(err_log)?);
+        let machine = workstation::plan_on(spec, inputs.model.layers);
         let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
         let card = plan.cards.first().ok_or("the gate's plan has no card")?;
         let card_bytes = card.dense_bytes + card.expert_bytes;
@@ -1681,9 +1618,23 @@ mod gate {
             .ok_or("plan (b′) made no draft reserve")?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
-        let machine = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?(
-            inputs.model.layers,
-        );
+        let machine_of = Place::Bp.machine(Some(reserve), Some(place::tier_batch(&inputs.hp)))?;
+        std::fs::create_dir_all(&a.dir)?;
+        let exe = Served::exe()?;
+        let err_log = a.dir.join("server.err");
+        let mut served = Served::spawn(&BP_SERVER_ARGS, &a.dir)?;
+        println!("server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        println!("server listening on {addr}");
+        // The machine the server planned by, as close as its record carries
+        // it: the placement's name-based cards with the stage card's free
+        // reading taken from the server's own `plan` record
+        // ([`server_card_free`]). The record carries the stage's reading
+        // alone, so the tier's card plans on its usable bytes, where an idle
+        // card's reading caps once the plan adds the context's own cost back.
+        let mut machine = machine_of(inputs.model.layers);
+        machine.cards[0].free_bytes = Some(server_card_free(&err_log)?);
         let plan = inputs.plan(&machine, workstation::CTX_MAX, levers)?;
         let ([stage], [tier], [card, tcard]) = (
             machine.cards.as_slice(),
@@ -1704,14 +1655,6 @@ mod gate {
              {tier_bytes} B with the draft's reserve {reserve} B, host {host_bytes} B",
             stage.name, tier.name, tcard.experts
         );
-        std::fs::create_dir_all(&a.dir)?;
-        let exe = Served::exe()?;
-        let err_log = a.dir.join("server.err");
-        let mut served = Served::spawn(&BP_SERVER_ARGS, &a.dir)?;
-        println!("server pid {}", served.child.id());
-        let addr = served.address(&err_log, POLLS, POLL)?;
-        let url = |p: &str| format!("http://{addr}{p}");
-        println!("server listening on {addr}");
         let mut ok = true;
 
         let (st, body) = curl(&url("/props"), None, false)?;
@@ -1809,6 +1752,40 @@ mod gate {
         *ok &= pass;
     }
 
+    /// The card free bytes the server's own `plan` record ([`record::PLAN`])
+    /// named: the census reading its plan was capped by. This gate's
+    /// re-derivations plan with the same reading — a census read here would
+    /// see the loaded server's own bytes as taken and size another plan, and a
+    /// census-free re-plan (`workstation::plan_gate`) misses the cap the server
+    /// planned under. A server that printed no `plan` record, or a record
+    /// without its `card_free`, is a named error, never an uncapped re-plan.
+    fn server_card_free(err_log: &Path) -> Result<u64, GateError> {
+        let kind = &record::PLAN;
+        let head = format!("{} ", kind.head);
+        let line = std::fs::read_to_string(err_log)?
+            .lines()
+            .find(|l| l.starts_with(&head))
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "{}: the server printed no `{}` record",
+                    err_log.display(),
+                    kind.name
+                )
+            })?;
+        line.split(" card_free=")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| {
+                format!(
+                    "the server's `{}` record carries no card_free: {line}",
+                    kind.name
+                )
+                .into()
+            })
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         let a = parse_args()?;
@@ -1856,7 +1833,7 @@ mod gate {
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|a| (*a).to_owned()))
             .collect();
-        ok &= props_engine(&url, &argv, served.child.id(), &place)?;
+        ok &= props_engine(&url, &argv, served.child.id(), &place, &err_log)?;
 
         let completion = json!({
             "prompt": a.prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
@@ -2063,7 +2040,7 @@ mod gate {
         }
 
         ok &= conversations(&url, &rules)?;
-        ok &= budget(&url, &rules)?;
+        ok &= budget(&url)?;
         ok &= interleaved(&url, &a.ids)?;
         ok &= shared_system(&url)?;
 

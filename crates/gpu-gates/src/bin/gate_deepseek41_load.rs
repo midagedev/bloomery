@@ -943,17 +943,27 @@ mod gate {
     /// PIN(2026-10-04): the first load also JITs the crate's bundle, which
     /// jitonce (412367f3) keeps per (device, bundle) past every drop — a
     /// second granule the second load finds mapped and no drop gives back.
+    /// That granule's cause is the load itself, not the shadows or the
+    /// capture: it holds for every run of this gate, while the page-locked
+    /// granule holds only while the body held shadows (`shadow_host`) and a
+    /// capture keeps the mapping (`captured`).
     fn check_reload(
         [before, first, dropped, second, end]: [u64; 5],
         captured: u64,
         shadow_host: usize,
     ) -> bool {
         let took = |a: u64, b: u64| i128::from(a) - i128::from(b);
-        let granule: i128 = if shadow_host > 0 && captured > 0 {
-            2 * PINNED_GRANULE
+        // The JIT'd bundle's granule: every first load of the crate's bundle
+        // on this device takes it (PIN(2026-10-04) above).
+        let jit = PINNED_GRANULE;
+        // The page-locked shadows' granule, kept by the capture's device
+        // allocation (PIN(2026-09-24) above).
+        let pinned: i128 = if shadow_host > 0 && captured > 0 {
+            PINNED_GRANULE
         } else {
             0
         };
+        let granule = jit + pinned;
         let pass = took(before, dropped) == i128::from(captured) + granule
             && took(dropped, second) == took(before, first) - granule
             && end == dropped;
@@ -970,8 +980,9 @@ mod gate {
         if !pass {
             println!(
                 "FAIL: check v: the first drop left {} B taken besides the capture's {captured} \
-                 (allowed {granule}: the shadows' {shadow_host} B page-locked), the second load \
-                 took {} B more than the first (allowed {}), the second drop left {} B taken",
+                 (allowed {granule}: the JIT'd bundle's granule, plus the shadows' {shadow_host} B \
+                 page-locked when a capture keeps it), the second load took {} B more than the \
+                 first (allowed {}), the second drop left {} B taken",
                 took(before, dropped) - i128::from(captured),
                 took(dropped, second) - took(before, first),
                 -granule,

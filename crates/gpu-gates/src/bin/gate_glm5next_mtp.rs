@@ -75,7 +75,10 @@
 //!   load (`seq_resume`): the store layouts differ (the NextN layer's store
 //!   rows), so it is refused by name before any copy, and the model stays at
 //!   position 0, unpoisoned. The same file, card and context: the refusal is
-//!   the layout's, not the identity's.
+//!   the layout's, not the identity's. Both loads' states pin
+//!   `bloomery_gpu_glm5next::seq_bytes` — the plan-time host bytes of a
+//!   state, the elastic `--parallel` default's unit — equal to the state's
+//!   `GlmSeq::bytes` at its positions and its draft setting.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -106,8 +109,8 @@ mod gate {
     use bloomery_gpu_glm5next::{
         Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnFeed,
         NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden,
-        nextn_logits, nextn_target_streams, nextn_walk, prompt_with, seq_resume, seq_save,
-        set_prefill, set_prefill_group,
+        nextn_logits, nextn_target_streams, nextn_walk, prompt_with, seq_bytes, seq_resume,
+        seq_save, set_prefill, set_prefill_group,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
@@ -1361,6 +1364,18 @@ mod gate {
         let reference = plain(&mut m, &prompt, PrefillMode::Batch)?;
         // (s) this load's sequence state, for the NextN load to refuse.
         let without = seq_save(&mut m)?;
+        // The state a load really holds pins the plan-time formula of its
+        // bytes (`seq_bytes`, the elastic `--parallel` default's unit) at the
+        // state's own positions and its draft setting — here the load
+        // without the layer, whose state carries no draft side.
+        let without_at = usize::try_from(without.positions())?;
+        let without_bytes = seq_bytes(&inputs, without_at, false);
+        ok &= without_bytes == without.bytes() as u64;
+        println!(
+            "(s) the state's {} B = seq_bytes at {without_at} positions without the draft: {}",
+            without.bytes(),
+            verdict(without_bytes == without.bytes() as u64)
+        );
         drop(m);
 
         // The NextN load.
@@ -1415,6 +1430,19 @@ mod gate {
             m = model;
             ok &= w_ok;
         }
+        // The drafted load's own state pins the formula's draft side: the
+        // last window's verify behind a step leaves both arenas at the rows
+        // the formula's draft term counts.
+        let with_state = seq_save(&mut m)?;
+        let with_at = usize::try_from(with_state.positions())?;
+        let with_bytes = seq_bytes(&inputs, with_at, true);
+        ok &= with_bytes == with_state.bytes() as u64;
+        println!(
+            "(s) the drafted load's state {} B = seq_bytes at {with_at} positions with the \
+             draft: {}",
+            with_state.bytes(),
+            verdict(with_bytes == with_state.bytes() as u64)
+        );
         m.reset()?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

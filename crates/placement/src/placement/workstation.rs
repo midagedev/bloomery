@@ -88,8 +88,17 @@ pub const CARDS: [CardSpec; 2] = [A6000, RTX_3090];
 const _: () = assert!(A6000.usable_bytes() > RTX_3090.usable_bytes());
 
 /// Per card: the CUDA context and the m = 1 scratch [assumed], and the margin
-/// the expert rule leaves free.
+/// the expert rule leaves free. The context term covers the primary context's
+/// own creation ([`CONTEXT_SELF`]) and what a load takes from the device past
+/// a census reading that no other plan term counts: the bundles' module
+/// images, the kernels' local-memory growth, a capture's graph.
 pub const CONTEXT: u64 = 512 * MIB;
+/// The primary context's own creation cost [measured: an idle A6000's census
+/// reading sits this far below its usable bytes; an idle 3090's sits less far
+/// below, a `Gpu` and its module included]. A census reads free bytes on that
+/// context, so the reading is already net of it; a plan's cap adds it back
+/// (placement's `capped`) and counts the context once, in [`CONTEXT`].
+pub const CONTEXT_SELF: u64 = 271 * MIB;
 pub const SCRATCH: u64 = 64 * MIB;
 pub const MARGIN: u64 = 1 << 30;
 
