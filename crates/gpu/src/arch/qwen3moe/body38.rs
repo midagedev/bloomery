@@ -763,7 +763,12 @@ impl Body38 {
     /// refused by name when the plan's host headroom cannot take it — while
     /// `off` is [`Body38::open_placed`] itself. The lever's word a load runs
     /// by is the registry's, read by the caller
-    /// (`bloomery_levers::Levers::residency_at`).
+    /// (`bloomery_levers::Levers::residency_at`). `slots` is
+    /// [`Body38::open_placed_slots`]'s: the plan must have counted them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "open_placed's six, the residency and the planned slots (rust-quality R8)"
+    )]
     pub fn open_placed_residency(
         file: Split,
         plan: &Plan<'_>,
@@ -772,8 +777,11 @@ impl Body38 {
         host: HostCfg,
         ubatch: usize,
         residency: Residency,
+        slots: usize,
     ) -> Result<Qwen38Model, GpuError> {
-        Body38::open_with(file, plan, inputs, card, host, ubatch, residency, None, 1)
+        Body38::open_with(
+            file, plan, inputs, card, host, ubatch, residency, None, slots,
+        )
     }
 
     /// [`Body38::open_placed`] of `plan`'s target plan with the MTP draft
@@ -840,10 +848,12 @@ impl Body38 {
     }
 
     /// [`Body38::open_placed_mtp`] under `residency`, as
-    /// [`Body38::open_placed_residency`] is [`Body38::open_placed`].
+    /// [`Body38::open_placed_residency`] is [`Body38::open_placed`], for a
+    /// load that serves `slots` resident sequences
+    /// ([`Body38::open_placed_mtp_slots`]): the plan must have counted them.
     #[allow(
         clippy::too_many_arguments,
-        reason = "open_placed_mtp's eight and the residency (rust-quality R8)"
+        reason = "open_placed_mtp's eight, the residency and the planned slots (rust-quality R8)"
     )]
     pub fn open_placed_mtp_residency(
         file: Split,
@@ -855,6 +865,7 @@ impl Body38 {
         draft: &Split,
         mtp: &model::arch::qwen35moe::place::MtpInputs,
         residency: Residency,
+        slots: usize,
     ) -> Result<Qwen38Model, GpuError> {
         Body38::open_with(
             file,
@@ -865,7 +876,7 @@ impl Body38 {
             ubatch,
             residency,
             Some((draft, mtp, plan)),
-            1,
+            slots,
         )
     }
 

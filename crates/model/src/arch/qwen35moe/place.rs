@@ -299,9 +299,11 @@ impl PlanInputs {
     /// per-load sequence term — the positional rows at the load's context and
     /// the fixed recurrent, conv and PLE terms ([`KvLayout::layer_bytes`]),
     /// and the bytes a sequence holds beside its stores
-    /// ([`slot_resident_bytes`]) — counts them all, so a card that cannot
-    /// hold them is refused as [`PlanInputs::plan_with`] refuses it. One
-    /// slot is [`PlanInputs::plan_with`] itself; zero is refused by name.
+    /// ([`slot_resident_bytes`]) — counts them all, the bytes beside the
+    /// stores reserved out of the expert budget before it fills so a card the
+    /// plan saturates holds them too, so a card that cannot hold them is
+    /// refused as [`PlanInputs::plan_with`] refuses it. One slot is
+    /// [`PlanInputs::plan_with`] itself; zero is refused by name.
     pub fn plan_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
@@ -320,14 +322,16 @@ impl PlanInputs {
             return Err(PlaceError::Slots { slots });
         }
         check_draft_reserve(machine, None)?;
+        let rows = slot_resident_bytes(&self.hp) * (slots as u64 - 1);
         let kv = SlotsOf {
             kv: &self.kv,
             slots: slots as u64,
         };
-        let mut plan = self.target_of(machine, ctx_max, levers, experts, 0, &kv)?;
+        let mut plan = self.target_of(machine, ctx_max, levers, experts, rows, &kv)?;
         // The bytes a sequence holds beside its stores ride the card's kv
-        // class, so [`Plan::violations`] holds the card's bound against them.
-        plan.cards[0].kv_bytes += slot_resident_bytes(&self.hp) * (slots as u64 - 1);
+        // class, out of the budget `rows` reserved above, so
+        // [`Plan::violations`] holds the card's bound against them.
+        plan.cards[0].kv_bytes += rows;
         let broken = plan.violations();
         if broken.is_empty() {
             Ok(plan)
@@ -594,7 +598,8 @@ impl PlanInputs {
     /// sequences ([`PlanInputs::plan_with_slots`]): the target's and the
     /// draft's per-load sequence terms — their stores, and the bytes a
     /// sequence holds beside them ([`slot_resident_bytes`]) — count them
-    /// all, the sum keeping the card's bound. One slot is
+    /// all, the bytes beside the stores reserved out of the expert budget
+    /// before it fills, the sum keeping the card's bound. One slot is
     /// [`PlanInputs::plan_mtp_with`] itself; zero is refused by name.
     pub fn plan_mtp_with_slots<'a>(
         &'a self,
@@ -628,7 +633,7 @@ impl PlanInputs {
         };
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
-            let mut plan = self.target_of(machine, ctx_max, levers, experts, 0, &kv)?;
+            let mut plan = self.target_of(machine, ctx_max, levers, experts, rows, &kv)?;
             plan.cards[0].kv_bytes += rows;
             let broken: Vec<Violation> = plan
                 .violations()
@@ -647,7 +652,7 @@ impl PlanInputs {
             });
         }
         check_draft_reserve(machine, None)?;
-        let mut plan = self.target_of(machine, ctx_max, levers, experts, reserve, &kv)?;
+        let mut plan = self.target_of(machine, ctx_max, levers, experts, reserve + rows, &kv)?;
         plan.cards[0].kv_bytes += rows;
         let (t, d) = (&plan.cards[0], &draft.cards[0]);
         let total = [

@@ -59,19 +59,69 @@
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) is served
 //!   through plain steps, drafting nothing, and the same request at `top_k`
 //!   1 gives this server's greedy ids;
-//! - the seats' `parallel` lines ([`parallel_agrees`]): the elastic
-//!   `--parallel` default's slots (the `ctx` clause's flagless server) are
-//!   what its rule (`plain` or `budget`) holds of the line's own terms — the
-//!   park budget, one slot's whole-context state and the cap — and the swap
-//!   server's flag names the `flag` rule with the flag's slots;
-//! - the swap clause ([`swap_rejoins_the_draft`], a server of its own under
-//!   `BLOOMERY_DRAFT=mtp`): a decode preempted mid-run on `--parallel 2` is
-//!   parked with its draft's side and put back with it rejoining, so both
-//!   requests answer their solo runs' ids, their drafts run and skip
-//!   nothing (no `mtp prompt` skip, no draft-off line) while they take
-//!   turns, the switches counter moved and the second request came back
-//!   before the first (the residency off: nothing moves between the host
-//!   and the card, so the ids are exact).
+//! - the seats' `parallel` lines ([`parallel_agrees`]): the resident-slot
+//!   rule names its slots, and the line's own terms hold them — the slots
+//!   are the flag's (`--parallel 2`) or the default's (2, the `ctx` clause's
+//!   flagless server), and the split they serve (`slot_ctx`, `total`) is the
+//!   `ctx` line's own context times the slots;
+//! - the slots clause ([`slots_flow_together`], a server of its own under
+//!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off`): two greedy streamed
+//!   requests of distinct prompts on `--parallel 2`, each first run alone
+//!   on that same server and then both together —
+//!   (v1) each request's together ids are its alone ids, and its
+//!   `draft_n`/`draft_n_accepted` are its alone run's: the slots hold
+//!   separate sequences, and the draft's host state is parked with its slot
+//!   on every switch ([`Seat::select`]) so a slot's passes are its own —
+//!   the coverage the swap clause held (a preempted request's draft
+//!   rejoining) lives here now: the rejoin is the per-slot park, and this
+//!   equality is red without it;
+//!   (v2) `swaps_total` is absent or 0 (nothing parks), and over the
+//!   together run the deltas of the busy slots booked per engine call
+//!   (busy total = `n_busy_slots_per_decode` × `n_decode_total`) sit at ≥
+//!   1.5: the worker books one call a round carrying every running slot
+//!   (`worker.rs`'s `Stats`), so two drafted requests that decode together
+//!   book 2 busy a call — at 96 tokens each and a mean ~2.5 kept ids a
+//!   drafted pass, ~40 rounds carry both and a handful of head and tail
+//!   rounds one, (2·N + ~4)/(N + ~4) ≈ 1.9 — while a turn-taking server
+//!   books exactly 1 busy a call, 1.0;
+//!   (v3) the two SSE streams' token arrivals, timestamped by a reader
+//!   thread a stream: while both are live, every window of
+//!   [`SLOTS_WINDOW`] = 16 consecutive arrivals holds at least
+//!   [`SLOTS_EACH`] = 4 of each — one drafted pass a slot a round keeps
+//!   1–4 ids (`advance_rows` = 4), so ideal delivery alternates in runs of
+//!   at most 4, and batching (the server flushes per event; curl and the
+//!   pipe may clump) tolerates up to 12 consecutive same-stream arrivals
+//!   before the minority drops under 4, while a turn-taking server's
+//!   64-token turns put windows of 16 holding 16 of one stream and none of
+//!   the other;
+//!   (v4) the `load` line names `slots=2` and `slot_ctx` = the `--ctx-size`
+//!   the server was started at over two (2048 of the 4096 total), the
+//!   `listening` record the same split, and `/props`' `n_ctx` is the slot
+//!   context.
+//!   Then one more server of `--parallel 2` under the seat's own defaults
+//!   — `--place a`, no `BLOOMERY_DRAFT`, no `BLOOMERY_RESIDENCY` (the
+//!   user's case: the A6000 stages, the adaptive residency runs, the draft
+//!   runs) — runs the together pair once and holds (v2) and (v3) alone,
+//!   no id equality: under the adaptive residency the other stream moves
+//!   experts between the host and the card, so a stream's bits need not
+//!   equal its alone run's.
+//!   The swap clause this replaces is gone: the turn path it held
+//!   (`serve::SwapEngine`, the park of a preempted request's state) left
+//!   the seat with the resident slots — no load of this seat takes turns
+//!   any more (every plan counts its sequences
+//!   ([`PlanInputs::plan_with_slots`]), a plan that cannot hold them is
+//!   refused by name), so nothing remains for it to check; a preempted
+//!   request cannot happen (no slot waits for another), and the draft's
+//!   park-and-rejoin under a switch is (v1)'s draft-count equality.
+//!   FAIL-first mutants, each red on its line: the seat still building the
+//!   turn-taking engine leaves (v2) at ~1.0 and (v3) failing; a select
+//!   that parks no draft state leaves (v1)'s draft counts red (a slot's
+//!   pass refuses or drafts another's rows); a reply that hands row
+//!   answers back in the wrong order scrambles (v1)'s ids;
+//!   `slot_drafts` false ends the server at `check_slots`'s named refusal
+//!   before it listens; a context search that ignores the slot count loads
+//!   a plan of one sequence and makes the second slot's load fail (the
+//!   server never listens) or (v4) red.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for, and more servers start on the card, one at a time:
@@ -114,7 +164,9 @@
 //! nor the environment move what a clause means: `BLOOMERY_DRAFT` (`mtp` when
 //! this binary's environment names it, else `off`; the sampled clause's plain
 //! server `off`) and `BLOOMERY_RESIDENCY` (`off`, the residency clause's
-//! word there); `BLOOMERY_RESIDENCY` set in this binary's environment is
+//! word there) — the slots clause's second server alone sets neither: it is
+//! the seat under its own defaults (the user's case).
+//! `BLOOMERY_RESIDENCY` set in this binary's environment is
 //! refused by name.
 
 #[cfg(not(feature = "gpu"))]
@@ -183,13 +235,13 @@ mod gate {
     /// context is named: the clauses below count on [`CTX`] positions, and
     /// the default is the `ctx` clause's. The slot actions need a save
     /// directory; the gate asks only for `erase`, which writes nothing. The
-    /// one slot is named (glm's gate's shape): the clauses below hold the
-    /// one-slot path's prompt cache, whose choreography — which state the
-    /// slot-0 `erase` drops, what the cache can serve a resend — the turns
-    /// of several slots would move with a request-arrival race (the free
-    /// slots' LRU) and with the elastic default's machine-riding count; the
-    /// swap clause's server runs the two-slot turns on its own, and the
-    /// `ctx` clause's flagless server holds the elastic default's own line.
+    /// one slot is named: the clauses below hold the one-slot path's prompt
+    /// cache, whose choreography — which state the slot-0 `erase` drops,
+    /// what the cache can serve a resend — the streams of several slots
+    /// would move with a request-arrival race (the free slots' LRU); the
+    /// slots clause's server runs the two-slot streams on its own, and the
+    /// `ctx` clause's flagless server holds the resident default's own
+    /// lines.
     const SERVER_ARGS: [&str; 12] = [
         "--host",
         "127.0.0.1",
@@ -248,14 +300,20 @@ mod gate {
     /// The words of the seat's line that says the MTP draft proposes nothing
     /// after a cut or a state put back.
     const DRAFT_OFF: &str = "the MTP draft proposes nothing from position";
-    /// The swap clause's requests: the first long enough to be preempted
-    /// mid-decode (the drafted step's rate is a fraction of the plain one's),
-    /// the second short enough to come back before it.
-    const SWAP_A_PREDICT: usize = 48;
-    const SWAP_B_PREDICT: usize = 8;
-    /// The swap clause's `/slots` poll while it waits for the first request's
-    /// decode.
-    const SWAP_POLL: Duration = Duration::from_millis(300);
+    /// The slots clause's second prompt: `TURN_A`'s shape over another
+    /// country's rivers — distinct from `TURN_A` from its first content ids,
+    /// and its greedy reply runs as long.
+    const SLOTS_B: &str = "Name three rivers that flow through Russia and say in one sentence \
+                           which of them is the longest.";
+    /// The slots clause's requests: long enough that the together run holds
+    /// dozens of rounds with both streams live (and `TURN_A`'s greedy reply
+    /// runs past it without an end-of-generation id — no `ignore_eos`, which
+    /// steps a request plainly).
+    const SLOTS_PREDICT: usize = 96;
+    /// The slots clause's interleave window and its floor for each stream
+    /// (the module header's (v3) derivation).
+    const SLOTS_WINDOW: usize = 16;
+    const SLOTS_EACH: usize = 4;
     /// The one chat turn the chat clauses send.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
     /// The chat's reply length.
@@ -1448,8 +1506,8 @@ mod gate {
             .and_then(|v| v.trim().parse().ok()))
     }
 
-    /// The server's `parallel` line (`serve_seats::Parallel::line`), printed
-    /// before its load.
+    /// The server's `parallel` line (the seat's own, printed before its
+    /// load).
     fn parallel_line(err_log: &Path) -> Result<Option<String>, GateError> {
         Ok(std::fs::read_to_string(err_log)?
             .lines()
@@ -1457,14 +1515,13 @@ mod gate {
             .map(str::to_owned))
     }
 
-    /// The `parallel` line's rule against its own terms: the slots it names
-    /// are what its rule holds of the line's own park budget, one slot's
-    /// whole-context state and cap — one slot under `plain`, the lesser of
-    /// the cap and the budget's holds under `budget` (`Parallel::of`, whose
-    /// unit test holds the arithmetic), the flag's bound of the same holds
-    /// under `flag` (the flag the caller names, the line carrying only its
-    /// outcome). `None` a line that is not the seat's; `Some(false)` a rule
-    /// whose slots the terms do not hold.
+    /// The `parallel` line's rule against its own terms (the module header):
+    /// under `slots` the line's slots are the flag's (`--parallel`'s value,
+    /// the caller naming it) or the default's (2), and the split the line
+    /// names holds — `slot_ctx` the one context the whole round of clauses
+    /// pins a slot at (the server's `--ctx-size` total over the slots) and
+    /// `total` the slots' sum. `None` a line that is not the seat's;
+    /// `Some(false)` a rule whose terms do not hold.
     fn parallel_agrees(line: &str, flag: Option<usize>) -> Option<bool> {
         let field = |k: &str| {
             line.split_whitespace()
@@ -1472,191 +1529,485 @@ mod gate {
         };
         let rule = field("rule")?;
         let slots: usize = field("slots")?.parse().ok()?;
-        let park: u64 = field("park")?.parse().ok()?;
-        let state: u64 = field("state")?.parse().ok()?;
-        let cap: usize = field("cap")?.parse().ok()?;
-        let holds = 1 + usize::try_from(park / state.max(1)).unwrap_or(usize::MAX);
+        let slot_ctx: usize = field("slot_ctx")?.parse().ok()?;
+        let total: usize = field("total")?.parse().ok()?;
         let want = match (rule, flag) {
-            ("plain", _) => 1,
-            ("budget", None) => cap.min(holds),
-            ("flag", Some(f)) => f.min(holds).max(1),
+            ("slots", f) => f.unwrap_or(2),
             _ => return None,
         };
-        Some(slots == want)
+        Some(slots == want && total == slots * slot_ctx && slot_ctx > 0)
     }
 
-    /// The swap clause (module header) on a server of two slots started into
-    /// `<dir>/swap`: a decode preempted mid-run is parked with its draft's
-    /// side ([`Seat::snapshot`], the draft's rows within the state) and put
-    /// back with it rejoining ([`Seat::resume`]), so both requests answer
-    /// their solo runs' ids, their drafts run and skip nothing while they
-    /// take turns, the switches counter moved, the second request came back
-    /// before the first, and the server's `parallel` line names the flag's
-    /// rule with its two slots. The residency is off: nothing moves between
-    /// the host and the card, so a resumed run's bits are the solo run's.
-    /// Mutants: the seat resuming with the draft off (its old rule: the
-    /// draft-off line, a skip and no drafts — three of the five red); the
-    /// body's `put_draft_rows` omitted (the store stale, the first chain
-    /// after the resume refused — the requests fail); the state dropping the
-    /// arenas' rows (a resumed walk refused by name, the requests fail).
-    fn swap_rejoins_the_draft(dir: &Path) -> Result<bool, GateError> {
-        let dir = dir.join("swap");
-        std::fs::create_dir_all(&dir)?;
-        let err_log = dir.join("server.err");
-        // SERVER_ARGS ends in the plain engine's `--parallel 1`; this
-        // clause's server takes the two-slot value.
+    /// One streamed request's answer: the final event's tokens, its draft
+    /// counts, and each token event's arrival on its reader thread's clock.
+    struct Streamed {
+        tokens: Vec<u32>,
+        /// The last event's `timings.draft_n`/`draft_n_accepted`.
+        drafts: (u64, u64),
+        arrivals: Vec<Instant>,
+    }
+
+    /// A streamed request's answer channel: what its reader thread sends
+    /// when the stream ends.
+    type StreamedRx = mpsc::Receiver<Result<Streamed, String>>;
+
+    /// `/completion` of `ids` at temperature 0, streamed: a helper thread of
+    /// its own runs `curl -N` and reads the SSE lines as they land, each
+    /// token event timestamped the moment it is read (the module header's
+    /// (v3) reader thread a stream). The final event carries the tokens and
+    /// the request's timings, its draft counts among them.
+    fn streamed(
+        addr: &str,
+        ids: &[u32],
+        n: usize,
+    ) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
+        let (tx, rx) = mpsc::channel();
+        let body = json!({
+            "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
+            "cache_prompt": false, "stream": true,
+        });
+        let url = format!("http://{addr}/completion");
+        let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
+            let run = (|| -> Result<Streamed, String> {
+                use std::io::{BufRead, BufReader, Write};
+                let mut child = Command::new("curl")
+                    .args([
+                        "-sS",
+                        "-N",
+                        "--max-time",
+                        "600",
+                        "-H",
+                        "Content-Type: application/json",
+                        "--data-binary",
+                        "@-",
+                    ])
+                    .arg(&url)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| format!("curl {url}: {e}"))?;
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| format!("curl {url}: no stdin"))?;
+                stdin
+                    .write_all(body.to_string().as_bytes())
+                    .map_err(|e| format!("curl {url}: {e}"))?;
+                drop(stdin);
+                let out = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| format!("curl {url}: no stdout"))?;
+                let mut arrivals = Vec::new();
+                let mut tokens = Vec::new();
+                let mut drafts = (0, 0);
+                for line in BufReader::new(out).lines() {
+                    let line = line.map_err(|e| format!("curl {url}: {e}"))?;
+                    let at = Instant::now();
+                    let Some(v) = line
+                        .strip_prefix("data: ")
+                        .and_then(|d| serde_json::from_str::<Value>(d).ok())
+                    else {
+                        continue;
+                    };
+                    if v["stop"] == json!(false) && !v["content"].as_str().unwrap_or("").is_empty()
+                    {
+                        arrivals.push(at);
+                    }
+                    if let (Some(n), Some(a)) = (
+                        v["timings"]["draft_n"].as_u64(),
+                        v["timings"]["draft_n_accepted"].as_u64(),
+                    ) {
+                        drafts = (n, a);
+                    }
+                    if v.get("tokens").is_some_and(Value::is_array) {
+                        tokens = ids_of(&v["tokens"]);
+                    }
+                }
+                let status = child.wait().map_err(|e| format!("curl {url}: {e}"))?;
+                if !status.success() {
+                    return Err(format!("curl {url}: {status}"));
+                }
+                Ok(Streamed {
+                    tokens,
+                    drafts,
+                    arrivals,
+                })
+            })();
+            let _ = tx.send(run);
+        })
+        .map_err(|e| format!("slots: {}", e.what()))?;
+        Ok((h, rx))
+    }
+
+    /// One streamed request run to its end on its own thread: its answer, or
+    /// `None` a request that failed (a red check, not the clause's end).
+    fn run_streamed(
+        addr: &str,
+        ids: &[u32],
+        n: usize,
+        what: &str,
+    ) -> Result<Option<Streamed>, GateError> {
+        let (h, rx) = streamed(addr, ids, n)?;
+        h.join()
+            .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
+        let ran = rx
+            .recv()
+            .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
+        match ran {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => {
+                println!("slots: the {what} request failed: {e}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The busy slots the server has booked over its `decodes` engine calls:
+    /// `/metrics` carries them as the running mean `n_busy_slots_per_decode`
+    /// (`serve::api`'s metrics), so the total is that mean times the calls.
+    fn busy_total(url: &dyn Fn(&str) -> String, decodes: f64) -> Result<f64, GateError> {
+        Ok(metric(url, "n_busy_slots_per_decode")?.unwrap_or(f64::NAN) * decodes)
+    }
+
+    /// The (v3) interleave check (the module header's derivation): while both
+    /// streams are live — from the later one's first arrival to the earlier
+    /// one's last — every window of [`SLOTS_WINDOW`] consecutive arrivals
+    /// holds at least [`SLOTS_EACH`] of each stream. `None` a pair a stream
+    /// of which never ran; the check is red on an empty stretch.
+    fn interleave(
+        ok: &mut bool,
+        name: &str,
+        together: &[Option<Streamed>],
+    ) -> Result<(), GateError> {
+        let (Some(a), Some(b)) = (together[0].as_ref(), together[1].as_ref()) else {
+            check(ok, name, false);
+            return Ok(());
+        };
+        let mut merged: Vec<(usize, Instant)> = [a, b]
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| s.arrivals.iter().map(move |&t| (i, t)))
+            .collect();
+        merged.sort_by_key(|&(_, t)| t);
+        let live_from = [a, b]
+            .iter()
+            .map(|s| s.arrivals.first().copied())
+            .max()
+            .flatten();
+        let live_to = [a, b]
+            .iter()
+            .map(|s| s.arrivals.last().copied())
+            .min()
+            .flatten();
+        let tags: Vec<usize> = merged
+            .iter()
+            .filter(|(_, t)| live_from.is_some_and(|f| *t >= f) && live_to.is_some_and(|u| *t < u))
+            .map(|&(i, _)| i)
+            .collect();
+        let mut thin = 0;
+        for w in tags.windows(SLOTS_WINDOW) {
+            let of_first = w.iter().filter(|&&i| i == 0).count();
+            if of_first < SLOTS_EACH || SLOTS_WINDOW - of_first < SLOTS_EACH {
+                thin += 1;
+            }
+        }
+        println!(
+            "slots interleave: {} arrivals while both live, {} thin window(s) of {}",
+            tags.len(),
+            thin,
+            SLOTS_WINDOW,
+        );
+        check(ok, name, !tags.is_empty() && thin == 0);
+        Ok(())
+    }
+
+    /// The slots clause (the module header) in two parts. The first server,
+    /// into `<dir>/slots`, is this gate's own shape at `--parallel 2` with
+    /// the draft on and the residency off: the ids and draft counts of two
+    /// streamed requests run together are their alone runs'
+    /// ((v1) — the per-slot draft park is the rejoin the swap clause held),
+    /// a round carries both slots and nothing swaps ((v2)), the streams
+    /// interleave ((v3)), and the load, `listening` and `/props` name the
+    /// split ((v4)). The second server, into `<dir>/slots-default`, is the
+    /// seat under its own defaults at `--parallel 2` — `--place a`, neither
+    /// lever set (the user's case: the A6000 stages, the adaptive residency
+    /// and the draft run) — and runs the together pair once, holding (v2)
+    /// and (v3) alone.
+    // PIN(2026-10-05): the swap clause (`swap_rejoins_the_draft`) is removed — the
+    /// turn path it checked (`serve::SwapEngine`, the park of a preempted request's
+    /// state) left the seat with the resident slots, and its coverage (a preempted
+    /// request's draft rejoining) is this clause's (v1) draft-count equality.
+    fn slots_flow_together(dir: &Path) -> Result<bool, GateError> {
+        let mut ok = true;
+        let own = dir.join("slots");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        // SERVER_ARGS ends in the one-slot `--parallel 1`; this clause's
+        // server takes the two-slot value, the total context the same 4096.
         let mut args: Vec<&str> = SERVER_ARGS.to_vec();
         let parallel = args.len() - 1;
         args[parallel] = "2";
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::DRAFT, "mtp")
             .env(bloomery_levers::RESIDENCY, "off");
-        let mut served = Served38::spawn_with(&args, &dir, &mut cmd)?;
-        println!("swap server pid {}", served.child.id());
-        let addr = served.address(&err_log, POLLS, POLL)?;
+        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        println!("slots server pid {}", served.child.id());
+        let addr = match served.address(&err_log, POLLS, POLL) {
+            Ok(a) => a,
+            // A server that never listens names no split: the checks are red
+            // by name, and the clause's second server still runs.
+            Err(e) => {
+                println!(
+                    "slots: the server never listened: {e}; it said: {}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                for name in [
+                    "slots_parallel_line_names_the_rule",
+                    "slots_load_names_the_split",
+                    "slots_alone_ids_stay",
+                    "slots_alone_draft_counts_stay",
+                    "slots_rounds_carry_both_slots",
+                    "slots_streams_interleave",
+                ] {
+                    check(&mut ok, name, false);
+                }
+                let _ = served.stop();
+                return slots_default_residency(dir, &mut ok);
+            }
+        };
         let url = |p: &str| format!("http://{addr}{p}");
-        let mut ok = true;
-        let line = parallel_line(&err_log)?.ok_or("the swap server printed no `parallel` line")?;
-        println!("swap parallel {line}");
+        let line = parallel_line(&err_log)?.ok_or("the slots server printed no `parallel` line")?;
+        println!("slots {line}");
         check(
             &mut ok,
-            "swap_parallel_line_names_the_flag",
-            line.contains("rule=flag") && parallel_agrees(&line, Some(2)) == Some(true),
+            "slots_parallel_line_names_the_rule",
+            line.contains("rule=slots") && parallel_agrees(&line, Some(2)) == Some(true),
         );
-        // No `ignore_eos`: its banned stop ids step a request plainly (a pass
-        // applies no logit bias), and this clause holds the draft.
-        let body = |ids: &[u32], n: usize| {
-            json!({
-                "prompt": ids, "n_predict": n, "temperature": 0,
-                "return_tokens": true, "cache_prompt": false,
-            })
+        // (v4) The load names the split, the `listening` record the same,
+        // and /props the slot ctx.
+        // The `load arch=` line, not the host tier's own `load host_tier …`
+        // note that can precede it.
+        let load = std::fs::read_to_string(&err_log)?
+            .lines()
+            .find(|l| l.starts_with("load arch="))
+            .unwrap_or("")
+            .to_owned();
+        let field = |l: &str, k: &str| {
+            l.split_whitespace()
+                .find_map(|w| w.strip_prefix(&format!("{k}=")))
+                .and_then(|v| v.parse::<u64>().ok())
         };
+        let listening = std::fs::read_to_string(&err_log)?
+            .lines()
+            .find(|l| l.starts_with(record::LISTENING38.head))
+            .unwrap_or("")
+            .to_owned();
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let props = json_of("/props", st, &body)?;
+        let n_ctx = props["n_ctx"].as_u64().unwrap_or(u64::MAX);
+        println!(
+            "slots: {load}; {listening}; props n_ctx {n_ctx}, load slots={:?} slot_ctx={:?}",
+            field(&load, "slots"),
+            field(&load, "slot_ctx"),
+        );
+        check(
+            &mut ok,
+            "slots_load_names_the_split",
+            field(&load, "slots") == Some(2)
+                && field(&load, "slot_ctx") == Some(u64::try_from(CTX / 2).unwrap())
+                && field(&listening, "slots") == Some(2)
+                && field(&listening, "slot_ctx") == Some(u64::try_from(CTX / 2).unwrap())
+                && n_ctx == u64::try_from(CTX / 2).unwrap(),
+        );
+        // Two distinct prompts, each first run alone, then both together.
         let (a_ids, b_ids) = (
             rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
-            rendered(&url, json!([{ "role": "user", "content": TURN_B }]))?,
+            rendered(&url, json!([{ "role": "user", "content": SLOTS_B }]))?,
         );
         let gemm = bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM;
         if a_ids.len() < gemm || b_ids.len() < gemm {
             return Err(format!(
-                "the swap clause's turns are {} and {} ids; each needs at least {gemm}",
+                "the slots clause's prompts are {} and {} ids; each needs at least {gemm}",
                 a_ids.len(),
                 b_ids.len()
             )
             .into());
         }
         let mut alone = Vec::new();
-        for (ids, n) in [(&a_ids, SWAP_A_PREDICT), (&b_ids, SWAP_B_PREDICT)] {
-            let (st, text) = curl(&url("/completion"), Some(&body(ids, n)), false)?;
-            let v = json_of("/completion", st, &text)?;
-            alone.push((
-                ids_of(&v["tokens"]),
-                v["timings"]["draft_n"].as_u64().unwrap_or(0),
-            ));
+        for (ids, what) in [(&a_ids, "alone A"), (&b_ids, "alone B")] {
+            alone.push(run_streamed(&addr, ids, SLOTS_PREDICT, what)?);
         }
-        println!(
-            "swap alone: {} and {} ids, drafts {} and {}",
-            alone[0].0.len(),
-            alone[1].0.len(),
-            alone[0].1,
-            alone[1].1
-        );
-        let swaps = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
-        // A request on a helper thread of its own: its handle, and its answer
-        // with when it came back.
-        type Answer = (Result<(u16, String), String>, Instant);
-        let post = |ids: Vec<u32>,
-                    n: usize|
-         -> Result<(JoinHandle<()>, mpsc::Receiver<Answer>), GateError> {
-            let u = url("/completion");
-            let b = body(&ids, n);
-            let (tx, rx) = mpsc::channel();
-            let (h, _) = spawn_helper("swap-request", Placement::Float, move || {
-                let r = curl(&u, Some(&b), false).map_err(|e| e.to_string());
-                let _ = tx.send((r, Instant::now()));
-            })
-            .map_err(|e| format!("swap: {}", e.what()))?;
-            Ok((h, rx))
-        };
-        let first = post(a_ids, SWAP_A_PREDICT)?;
-        loop {
-            if first.0.is_finished() {
-                return Err(
-                    "swap: the first request ended before /slots showed it decoding".into(),
-                );
-            }
-            let (st, text) = curl(&url("/slots"), None, false)?;
-            let slots = json_of("/slots", st, &text)?;
-            let decoding = slots.as_array().is_some_and(|l| {
-                l.iter().any(|s| {
-                    s["turn"] == "running"
-                        && s["next_token"]["n_decoded"].as_u64().is_some_and(|n| n > 0)
-                })
-            });
-            if decoding {
-                break;
-            }
-            std::thread::sleep(SWAP_POLL);
-        }
-        let joins_from = mtp_prompts(&err_log)?.len();
-        let offs_from = draft_offs(&err_log)?.len();
-        let second = post(b_ids, SWAP_B_PREDICT)?;
+        let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let busy0 = busy_total(&url, decode0)?;
+        // Both posted at once: the prompts serialize on the engine thread (a
+        // round or two of skew), so nearly every round carries both slots —
+        // the (v2) bound's shape.
+        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
+        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
         let mut together = Vec::new();
-        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+        for ((h, rx), what) in [(first, "together A"), (second, "together B")] {
             h.join()
-                .map_err(|_| format!("swap: the {what} request's thread panicked"))?;
-            let (r, at) = rx
+                .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
+            let ran = rx
                 .recv()
-                .map_err(|_| format!("swap: the {what} request's thread gave no answer"))?;
-            let (st, text) = r.map_err(GateError::from)?;
-            let v = json_of("/completion", st, &text)?;
-            together.push((
-                ids_of(&v["tokens"]),
-                v["timings"]["draft_n"].as_u64().unwrap_or(0),
-                at,
-            ));
+                .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
+            match ran {
+                Ok(s) => together.push(Some(s)),
+                Err(e) => {
+                    println!("slots: the {what} request failed: {e}");
+                    together.push(None);
+                }
+            }
         }
-        let skips = mtp_prompts(&err_log)?
-            .iter()
-            .skip(joins_from)
-            .filter(|l| !l.ends_with("skipped=none"))
-            .count();
-        let offs = draft_offs(&err_log)?.len() - offs_from;
-        let after = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
+        let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let busy1 = busy_total(&url, decode1)?;
+        let swaps = metric(&url, "swaps_total")?;
         println!(
-            "swap together: first {} ids of {} drafts, second {} ids of {} drafts, second back \
-             {:?} before the first, switches {swaps} -> {after}, draft skips {skips}, draft-off \
-             lines {offs}",
-            together[0].0.len(),
-            together[0].1,
-            together[1].0.len(),
-            together[1].1,
-            together[0].2.checked_duration_since(together[1].2)
+            "slots alone: {} and {} ids; together {} and {} ids, drafts {:?} -> {:?} and {:?} \
+             -> {:?}; decode {decode0} -> {decode1}, busy {busy0} -> {busy1}, swaps {swaps:?}",
+            alone[0].as_ref().map_or(0, |s| s.tokens.len()),
+            alone[1].as_ref().map_or(0, |s| s.tokens.len()),
+            together[0].as_ref().map_or(0, |s| s.tokens.len()),
+            together[1].as_ref().map_or(0, |s| s.tokens.len()),
+            alone[0].as_ref().map(|s| s.drafts),
+            together[0].as_ref().map(|s| s.drafts),
+            alone[1].as_ref().map(|s| s.drafts),
+            together[1].as_ref().map(|s| s.drafts),
+        );
+        // (v1) The slots hold separate sequences and each slot's draft its
+        // own state: together ids and draft counts are alone ones (a failed
+        // request is red, not the clause's end).
+        check(
+            &mut ok,
+            "slots_alone_ids_stay",
+            together[0].as_ref().is_some_and(|t| !t.tokens.is_empty())
+                && together[1].as_ref().is_some_and(|t| !t.tokens.is_empty())
+                && alone[0]
+                    .as_ref()
+                    .is_some_and(|a| a.tokens == together[0].as_ref().unwrap().tokens)
+                && alone[1]
+                    .as_ref()
+                    .is_some_and(|a| a.tokens == together[1].as_ref().unwrap().tokens),
         );
         check(
             &mut ok,
-            "swap_alone_ran_long_enough_to_preempt",
-            alone[0].0.len() >= SWAP_B_PREDICT && !alone[1].0.is_empty(),
+            "slots_alone_draft_counts_stay",
+            together[0].as_ref().is_some_and(|t| t.drafts.0 > 0)
+                && together[1].as_ref().is_some_and(|t| t.drafts.0 > 0)
+                && alone[0]
+                    .as_ref()
+                    .is_some_and(|a| a.drafts == together[0].as_ref().unwrap().drafts)
+                && alone[1]
+                    .as_ref()
+                    .is_some_and(|a| a.drafts == together[1].as_ref().unwrap().drafts),
         );
+        // (v2) Nothing parks, and a round carries both slots (the module
+        // header's derivation): >= 1.5 against the turns' 1.0.
+        let ratio = (busy1 - busy0) / (decode1 - decode0);
         check(
             &mut ok,
-            "swap_second_back_before_the_first",
-            together[1].2 < together[0].2,
+            "slots_rounds_carry_both_slots",
+            swaps.is_none_or(|v| v == 0.0) && ratio >= 1.5,
         );
+        // (v3) While both stream, the arrivals interleave.
+        interleave(&mut ok, "slots_streams_interleave", &together)?;
+        println!("slots server stopped: {}", served.stop()?);
+        slots_default_residency(dir, &mut ok)
+    }
+
+    /// The slots clause's second server (the module header): the seat under
+    /// its own defaults at `--parallel 2` — `--place a`, neither lever set —
+    /// runs the together pair once and holds (v2) and (v3) alone; under the
+    /// adaptive residency a stream's bits need not equal its alone run's, so
+    /// no id equality is asked. This gate's own card is the 3090; this
+    /// server's stage is the A6000 (the user's case), its load waiting out a
+    /// timing sitting by the box guard this gate runs under.
+    fn slots_default_residency(dir: &Path, ok: &mut bool) -> Result<bool, GateError> {
+        let own = dir.join("slots-default");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env_remove(bloomery_levers::DRAFT)
+            .env_remove(bloomery_levers::RESIDENCY)
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT);
+        let args = [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--place",
+            "a",
+            "--parallel",
+            "2",
+        ];
+        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        println!("slots-default server pid {}", served.child.id());
+        let addr = match served.address(&err_log, POLLS, POLL) {
+            Ok(a) => a,
+            Err(e) => {
+                println!(
+                    "slots-default: the server never listened: {e}; it said: {}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                check(ok, "slots_default_rounds_carry_both_slots", false);
+                check(ok, "slots_default_streams_interleave", false);
+                let _ = served.stop();
+                return Ok(*ok);
+            }
+        };
+        let url = |p: &str| format!("http://{addr}{p}");
+        let line = parallel_line(&err_log)?
+            .ok_or("the slots-default server printed no `parallel` line")?;
+        println!("slots-default {line}");
         check(
-            &mut ok,
-            "swap_ids_are_alone_and_the_drafts_ran",
-            together[0].0 == alone[0].0
-                && together[1].0 == alone[1].0
-                && together[0].1 > 0
-                && together[1].1 > 0,
+            ok,
+            "slots_default_parallel_line_names_the_rule",
+            line.contains("rule=slots") && parallel_agrees(&line, Some(2)) == Some(true),
         );
+        let (a_ids, b_ids) = (
+            rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
+            rendered(&url, json!([{ "role": "user", "content": SLOTS_B }]))?,
+        );
+        let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let busy0 = busy_total(&url, decode0)?;
+        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
+        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "default A"), (second, "default B")] {
+            h.join()
+                .map_err(|_| format!("slots-default: the {what} request's thread panicked"))?;
+            let ran = rx.recv().map_err(|_| {
+                format!("slots-default: the {what} request's thread gave no answer")
+            })?;
+            match ran {
+                Ok(s) => together.push(Some(s)),
+                Err(e) => {
+                    println!("slots-default: the {what} request failed: {e}");
+                    together.push(None);
+                }
+            }
+        }
+        let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let busy1 = busy_total(&url, decode1)?;
+        let swaps = metric(&url, "swaps_total")?;
+        println!(
+            "slots-default together: {} and {} ids; decode {decode0} -> {decode1}, busy {busy0} \
+             -> {busy1}, swaps {swaps:?}",
+            together[0].as_ref().map_or(0, |s| s.tokens.len()),
+            together[1].as_ref().map_or(0, |s| s.tokens.len()),
+        );
+        let ratio = (busy1 - busy0) / (decode1 - decode0);
         check(
-            &mut ok,
-            "swap_no_draft_skip_no_draft_off_and_switched",
-            skips == 0 && offs == 0 && after > swaps,
+            ok,
+            "slots_default_rounds_carry_both_slots",
+            swaps.is_none_or(|v| v == 0.0) && ratio >= 1.5,
         );
-        println!("swap server stopped: {}", served.stop()?);
-        Ok(ok)
+        interleave(ok, "slots_default_streams_interleave", &together)?;
+        println!("slots-default server stopped: {}", served.stop()?);
+        Ok(*ok)
     }
 
     /// The `cache` clause on a server of its own with the draft the main
@@ -1682,8 +2033,10 @@ mod gate {
         Ok(ok)
     }
 
-    /// The plan's card expert bytes on the gate card at `ctx`, plain, as the
-    /// server makes it; `None` when no plan takes the context.
+    /// The plan's card expert bytes on the gate card at a slot's `ctx`, the
+    /// two resident slots of this clause's flagless server counted
+    /// (`plan_with_slots`), plain, as the server makes it; `None` when no
+    /// plan takes the context.
     fn card_at(
         inputs: &PlanInputs,
         levers: &PlanLevers,
@@ -1699,33 +2052,41 @@ mod gate {
         );
         machine.cards[0].free_bytes = free;
         Ok(inputs
-            .plan_with(&machine, u64::try_from(ctx)?, levers, experts)
+            .plan_with_slots(&machine, u64::try_from(ctx)?, levers, experts, 2)
             .ok()
             .and_then(|p| p.cards.first().map(|c| c.expert_bytes)))
     }
 
-    /// The `ctx` clause: a plain server with no `--ctx-size` prints its
+    /// The `ctx` clause: a plain server with no `--ctx-size` (and no
+    /// `--parallel`, so the seat's default two resident slots) prints its
     /// `ctx` line before its load (it is stopped there), against this gate's
-    /// own plans of the file: its context is the margin rule's answer
+    /// own plans of the file — every plan counting the two slots, as the
+    /// seat's does: its context is a slot's, the margin rule's answer
     /// (`margin`: the line's own `margin_ctx`, which the clause below holds
     /// to the gate's plans), or the largest the card holds when that is
     /// fewer than [`CTX`] (`card`), or the prompt cache's clamp of the
     /// margin's answer (`cache`, composed the seat's way from the cache
     /// line's own ram — the clamp rides MemAvailable as the fit rides the
-    /// census); the line's `fit` is the largest context the card holds up to
-    /// the file's serving cap (`place::serve_ctx`, its `context_length`) —
-    /// its plan taken, and the one past it refused when the card bounds it,
-    /// else the cap itself — with that plan's card expert bytes; its
-    /// `margin_ctx` holds at most the plan's margin fewer card expert bytes
-    /// than the plan at [`CTX`], and the next multiple of [`CTX_STEP`] past
-    /// it more (or it is the fit). A server asked for one position past the
-    /// fit is refused by name before it listens: by the card's rule when the
-    /// card bounds the fit, by the cap's (the trained context, YaRN not
-    /// built) when the cap does. Mutants: the default ignoring the fit
-    /// (staying at the base); the default passing the fit through without
-    /// the margin rule; the refusal of a context past the card taken out
-    /// (the load's own plan refuses it, not by the rule's name); the cap's
-    /// refusal taken out (the card's rule names the clamped fit instead).
+    /// census); the line's `fit` is the largest slot context the card holds
+    /// up to the file's serving cap (`place::serve_ctx`, its
+    /// `context_length`) — its plan taken, and the one past it refused when
+    /// the card bounds it, else the cap itself — with that plan's card
+    /// expert bytes; its `margin_ctx` holds at most the plan's margin fewer
+    /// card expert bytes than the two-slot plan at [`CTX`], and the next
+    /// multiple of [`CTX_STEP`] past it more (or it is the fit). A server
+    /// asked for a total whose slot share passes the fit is refused by name
+    /// before it listens: by the card's rule when the card bounds the fit,
+    /// by the cap's (the trained context, YaRN not built) when the cap
+    /// does. Mutants: the default ignoring the fit (staying at the base);
+    /// the default passing the fit through without the margin rule; the
+    /// refusal of a context past the card taken out (the load's own plan
+    /// refuses it, not by the rule's name); the cap's refusal taken out
+    /// (the card's rule names the clamped fit instead).
+    // PIN(2026-10-05): re-derived for the seat's default two resident slots — every
+    /// `at` below is `plan_with_slots(2)` at a slot's context, the default `--parallel`
+    /// names two (the `parallel` line's check), and the refusal arm asks for the total
+    /// whose slot share is one past the fit. Was the one-sequence search (round
+    /// q38rules).
     fn ctx(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let own = dir.join("ctx");
         std::fs::create_dir_all(&own)?;
@@ -1762,16 +2123,16 @@ mod gate {
         }
         let line = line.ok_or("the default server printed no `ctx` line")?;
         println!("ctx: {line}");
-        // The elastic `--parallel` default's own line (the module header):
-        // this flagless server is the one that takes it, [`SERVER_ARGS`]
-        // naming the slots its clauses count on. The slots its rule names
-        // are what the line's own terms hold. FAIL-first: a default that
-        // ignores the budget (always two slots) turns this red wherever the
-        // budget holds another count.
+        // The resident-slot default's own line (the module header): this
+        // flagless server is the one that takes it, [`SERVER_ARGS`] naming
+        // the one slot its clauses count on. The slots its rule names are
+        // what the line's own terms hold — the default's 2 and the split it
+        // names the `ctx` line's own context. FAIL-first: a default that
+        // serves another count (or a split off the `ctx` line) turns this
+        // red.
         let parallel =
             parallel_line(&err_log)?.ok_or("the default server printed no `parallel` line")?;
         println!("ctx: {parallel}");
-        let parallel_ok = parallel_agrees(&parallel, None).unwrap_or(false);
         let field = |k: &str| -> Option<String> {
             line.split_whitespace()
                 .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
@@ -1790,6 +2151,17 @@ mod gate {
             )
             .into());
         };
+        // The rule's own terms: the default's 2 slots at the `ctx` line's own
+        // context (the line's `total` twice it, held by `parallel_agrees`).
+        let pfield = |k: &str| {
+            parallel
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
+                .and_then(|v| v.parse::<usize>().ok())
+        };
+        let parallel_ok = parallel_agrees(&parallel, None).unwrap_or(false)
+            && pfield("slots") == Some(2)
+            && pfield("slot_ctx") == Some(ctx);
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::describe(&split)?;
@@ -1887,7 +2259,11 @@ mod gate {
                 && (margin_ctx == fit
                     || (margin_ctx.is_multiple_of(CTX_STEP) && past.is_none_or(|l| l > margin))),
         );
-        let over = (fit + 1).to_string();
+        // The refusal arm asks for a total whose slot share is one past the
+        // fit: the server splits `--ctx-size` over its default two slots, so
+        // the total the arm names is twice the share it refuses.
+        let over = (2 * (fit + 1)).to_string();
+        let share = fit + 1;
         let args: Vec<&str> = DEFAULT_ARGS
             .iter()
             .copied()
@@ -1904,10 +2280,13 @@ mod gate {
         }
         let text = std::fs::read_to_string(&err_log).unwrap_or_default();
         let named = if card_bounds {
-            format!("--ctx-size {over}: the card holds at most {fit} positions")
+            format!(
+                "--ctx-size {over}: with --parallel 2 each slot takes {share} positions and the \
+                 card holds at most {fit} a slot beside the plan's dense weights (`--place gate`)"
+            )
         } else {
             format!(
-                "a context of {over} positions: the file was trained at {cap} (context_length), \
+                "a context of {share} positions: the file was trained at {cap} (context_length), \
                  and a load serves at most {cap}; YaRN scaling past the trained context is not \
                  implemented"
             )
@@ -2132,10 +2511,9 @@ mod gate {
         ok &= cache_other(&a.dir, !drafted)?;
         ok &= ctx(&a.dir, &levers)?;
         ok &= residency(&a.dir, &completion)?;
-        if drafted {
-            // The draft's park and rejoin (the module header): its own server.
-            ok &= swap_rejoins_the_draft(&a.dir)?;
-        }
+        // The resident slots together (the module header): its own servers,
+        // the first with the draft on whatever this binary's lever says.
+        ok &= slots_flow_together(&a.dir)?;
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");
             Ok(())

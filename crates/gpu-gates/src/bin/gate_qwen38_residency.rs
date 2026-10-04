@@ -218,7 +218,7 @@ mod gate {
         }
         let plan = plan_of(inputs, &machine)?;
         Ok(Body38::open_placed_residency(
-            file, &plan, inputs, 0, host, ub, residency,
+            file, &plan, inputs, 0, host, ub, residency, 1,
         )?)
     }
 

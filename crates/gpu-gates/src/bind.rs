@@ -581,6 +581,11 @@ enum Cmd {
     /// `step_slots`): each row's `last` on its own slot, in row order, the
     /// answers and lent rows back with the one reply.
     StepSlots(Vec<SlotStep>),
+    /// A drafted pass of several slots in one command ([`SeatEngine`]'s
+    /// `advance_slots`): each row's `last` passed on its own slot, in row
+    /// order, the kept ids and what each pass drafted back with the one
+    /// reply.
+    PassSlots(Vec<SlotPassRow>),
 }
 
 /// One row of a [`Cmd::StepSlots`]: the slot, the id it evaluates, the
@@ -591,6 +596,16 @@ struct SlotStep {
     last: u32,
     logits: Option<Vec<f32>>,
     next: u32,
+}
+
+/// One row of a [`Cmd::PassSlots`]: the slot, the id its pass runs, the
+/// caller's buffer of the pass's kept ids, and what the pass drafted, which
+/// the thread sets.
+struct SlotPassRow {
+    slot: usize,
+    last: u32,
+    out: Vec<u32>,
+    drafted: Drafted,
 }
 
 /// What a reply carries besides its result.
@@ -609,6 +624,8 @@ enum Extra {
     Residency(Option<ResidencyReset>),
     /// A `StepSlots`' rows, their answers set and their lent rows filled.
     StepSlots(Vec<SlotStep>),
+    /// A `PassSlots`' rows, their kept ids and drafted counts set.
+    PassSlots(Vec<SlotPassRow>),
 }
 
 /// Its answer: the argmax of a `Next` (the kept length of a `Keep`), the
@@ -685,6 +702,15 @@ pub trait Seat: 'static {
             Err(format!("slot {slot}: this seat serves slot 0 alone").into())
         }
     }
+    /// Whether the seat keeps its draft's state per slot — parked on a
+    /// [`Seat::select`], put back with the slot — so a slot's drafted passes
+    /// are the passes it would run alone whatever the other slots run
+    /// (`serve::Engine::slot_drafts`); the server serves several slots of a
+    /// drafting seat only when it declares this. A seat that drafts nothing
+    /// needs no declaration. The default is false.
+    fn slot_drafts(&self) -> bool {
+        false
+    }
     /// Empty caches at position 0.
     fn reset(&mut self) -> Result<(), GateError>;
     /// Take back the positions from `pos` on; `pos` is one [`Seat::keep`]
@@ -740,6 +766,8 @@ pub struct SeatEngine {
     turn_slots: usize,
     /// [`Seat::slots`], the opened seat's.
     slots: usize,
+    /// [`Seat::slot_drafts`], the opened seat's.
+    slot_drafts: bool,
     card: String,
     props: EngineProps,
     cache_ram: u64,
@@ -772,8 +800,8 @@ impl SeatEngine {
     /// [`placement_props`]), which the seat completes ([`Seat::props`]);
     /// `cache_ram` is the server's prompt cache budget
     /// (`serve::Engine::cache_ram`). The seat's whole-load capabilities —
-    /// [`Seat::pass_rows`], [`Seat::turn_slots`], [`Seat::slots`] — cross
-    /// with the load.
+    /// [`Seat::pass_rows`], [`Seat::turn_slots`], [`Seat::slots`],
+    /// [`Seat::slot_drafts`] — cross with the load.
     pub fn spawn<S, F>(
         open: F,
         defined: usize,
@@ -789,7 +817,7 @@ impl SeatEngine {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let (opened, loaded) =
-            mpsc::channel::<Result<(usize, usize, usize, usize, EngineProps), String>>();
+            mpsc::channel::<Result<(usize, usize, usize, usize, bool, EngineProps), String>>();
         let n_vocab = vocab.n_vocab();
         let worker = std::thread::Builder::new()
             .name("engine".to_owned())
@@ -807,6 +835,7 @@ impl SeatEngine {
                         g.pass_rows(),
                         g.turn_slots(),
                         g.slots(),
+                        g.slot_drafts(),
                         g.props(props),
                     )))
                     .is_err()
@@ -885,6 +914,31 @@ impl SeatEngine {
                             }
                             (failed.map_or(Ok(0), Err), None, Extra::StepSlots(rows))
                         }
+                        Cmd::PassSlots(mut rows) => {
+                            // Select and pass each row in order, on the seat:
+                            // one command, a select and a drafted pass a row
+                            // on the thread — not two round trips a row. A
+                            // row that fails ends the call there; the error
+                            // is the server's to die on.
+                            let mut failed = None;
+                            for r in rows.iter_mut() {
+                                let at = g.pos();
+                                let run =
+                                    g.select(r.slot).map_err(|e| e.to_string()).and_then(|()| {
+                                        r.out.clear();
+                                        pass(&mut g, r.last, &mut r.out)
+                                            .map_err(|e| format!("pass at position {at}: {e}"))
+                                    });
+                                match run {
+                                    Ok(d) => r.drafted = d,
+                                    Err(e) => {
+                                        failed = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            (failed.map_or(Ok(0), Err), None, Extra::PassSlots(rows))
+                        }
                         cmd => {
                             let (result, logits) = serve_cmd(&mut g, cmd, n_vocab);
                             (result, logits, Extra::None)
@@ -903,8 +957,8 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, turn_slots, slots, props) = match loaded.recv() {
-            Ok(Ok((c, rows, t, n, props))) => (c.min(defined), rows, t, n, props),
+        let (ctx_max, rows, turn_slots, slots, slot_drafts, props) = match loaded.recv() {
+            Ok(Ok((c, rows, t, n, d, props))) => (c.min(defined), rows, t, n, d, props),
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
@@ -921,6 +975,7 @@ impl SeatEngine {
             rows,
             turn_slots,
             slots,
+            slot_drafts,
             card,
             props,
             cache_ram,
@@ -1089,6 +1144,48 @@ impl Link {
             }
         }
     }
+
+    /// One command for a round of several drafted passes
+    /// ([`SeatEngine`]'s `advance_slots`): the engine thread selects and
+    /// passes each row in order, on the seat, and each row's kept ids and
+    /// drafted counts come back with the one reply — not a select and a pass
+    /// round trip a row. The rows' kept-id buffers cross to the thread and
+    /// back as the command's own rows.
+    fn pass_slots(&mut self, rows: &mut [serve::SlotPass<'_>]) -> Result<(), EngineError> {
+        // Two rows of one slot would pass its sequence twice in the round,
+        // the second on the first's answer: named before anything crosses.
+        if let Some((i, r)) = rows
+            .iter()
+            .enumerate()
+            .find(|(i, r)| rows[..*i].iter().any(|p| p.slot == r.slot))
+        {
+            return Err(EngineError(format!(
+                "a round of {} rows names slot {} twice (row {i} again)",
+                rows.len(),
+                r.slot
+            )));
+        }
+        let mut sent = Vec::with_capacity(rows.len());
+        for r in rows.iter_mut() {
+            sent.push(SlotPassRow {
+                slot: r.slot,
+                last: r.last,
+                out: std::mem::take(r.out),
+                drafted: Drafted::default(),
+            });
+        }
+        let reply = self.ask(Cmd::PassSlots(sent))?;
+        let Extra::PassSlots(mut back) = reply.extra else {
+            return Err(EngineError(
+                "the engine thread answered a pass of several slots with no rows".to_owned(),
+            ));
+        };
+        for (row, back) in rows.iter_mut().zip(back.iter_mut()) {
+            row.drafted = back.drafted;
+            *row.out = std::mem::take(&mut back.out);
+        }
+        reply.result.map(|_| ()).map_err(EngineError)
+    }
 }
 
 /// Whether a feed of `n` ids may start at `g`'s position: at least one, and
@@ -1165,8 +1262,9 @@ fn serve_cmd<S: Seat>(
         | Cmd::Resume(_)
         | Cmd::Pass { .. }
         | Cmd::StepSlots(..)
+        | Cmd::PassSlots(..)
         | Cmd::ResidencyReset => Err(
-            "a keep, split, pass, step of several slots, save, resume or residency reset \
+            "a keep, split, pass, step or pass of several slots, save, resume or residency reset \
              reached the step loop; the \
              engine thread \
              answers it"
@@ -1256,6 +1354,22 @@ impl Engine for SeatEngine {
     /// the one reply — not a select and a step round trip a row.
     fn step_slots(&mut self, rows: &mut [serve::SlotRow<'_>]) -> Result<(), EngineError> {
         self.link.step_slots(rows)
+    }
+
+    /// One command for a round of several drafted passes
+    /// ([`serve::Engine`]'s `advance_slots`): the thread selects and passes
+    /// each row in order, on the seat, and each row's kept ids and drafted
+    /// counts come back with the one reply — not a select and a pass round
+    /// trip a row.
+    fn advance_slots(&mut self, rows: &mut [serve::SlotPass<'_>]) -> Result<(), EngineError> {
+        self.link.pass_slots(rows)
+    }
+
+    /// The seat's declaration ([`Seat::slot_drafts`]), read once at the
+    /// spawn: the server serves several slots of a drafting engine only when
+    /// it holds.
+    fn slot_drafts(&self) -> bool {
+        self.slot_drafts
     }
 
     fn reset(&mut self) -> Result<(), EngineError> {
@@ -1389,7 +1503,8 @@ mod tests {
 
     /// A link to a thread that answers every `Next` as the engine thread does:
     /// it fills the lent row and hands it back with the argmax. A
-    /// `StepSlots` it answers the same way, a row at a time in row order.
+    /// `StepSlots` it answers the same way, a row at a time in row order, and
+    /// a `PassSlots` keeps `last` and one drafted id a row.
     fn echo_link() -> (Link, std::thread::JoinHandle<()>) {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
@@ -1421,7 +1536,22 @@ mod tests {
                             extra: super::Extra::StepSlots(rows),
                         }
                     }
-                    _ => panic!("the echo thread answers Next and StepSlots only"),
+                    Cmd::PassSlots(mut rows) => {
+                        for r in rows.iter_mut() {
+                            r.out = vec![r.last, r.last + 1];
+                            r.drafted = serve::Drafted {
+                                proposed: 1,
+                                accepted: 1,
+                            };
+                        }
+                        Reply {
+                            result: Ok(0),
+                            logits: None,
+                            pos: at + 1,
+                            extra: super::Extra::PassSlots(rows),
+                        }
+                    }
+                    _ => panic!("the echo thread answers Next, StepSlots and PassSlots only"),
                 };
                 if replies.send(reply).is_err() {
                     return;
@@ -1544,6 +1674,71 @@ mod tests {
             .step_slots(&mut rows)
             .expect_err("one slot twice in a round");
         assert!(e.0.contains("names slot 1 twice"), "{e}");
+        link.tx = None;
+        worker.join().expect("the echo thread");
+    }
+
+    /// A round of several drafted passes is one command whose reply gives
+    /// each row its own kept ids and drafted counts in row order
+    /// ([`Link::pass_slots`]), the caller's buffers crossing with the
+    /// command; a slot named twice is a named error.
+    #[test]
+    fn a_round_of_passes_answers_in_row_order() {
+        use serve::SlotPass;
+        let (mut link, worker) = echo_link();
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let mut rows = vec![
+            SlotPass {
+                slot: 1,
+                last: 3,
+                out: &mut a,
+                drafted: serve::Drafted::default(),
+            },
+            SlotPass {
+                slot: 0,
+                last: 5,
+                out: &mut b,
+                drafted: serve::Drafted::default(),
+            },
+        ];
+        link.pass_slots(&mut rows).expect("a round of two passes");
+        let counts = rows.iter().map(|r| r.drafted).collect::<Vec<_>>();
+        drop(rows);
+        assert_eq!(a, vec![3, 4], "the first row's kept ids");
+        assert_eq!(b, vec![5, 6], "the second row's kept ids");
+        assert_eq!(
+            counts,
+            vec![
+                serve::Drafted {
+                    proposed: 1,
+                    accepted: 1
+                };
+                2
+            ],
+            "each row its own counts, in row order"
+        );
+        // Two rows of one slot are a named error before anything crosses.
+        let mut c = Vec::new();
+        let mut d = Vec::new();
+        let mut rows = vec![
+            SlotPass {
+                slot: 2,
+                last: 2,
+                out: &mut c,
+                drafted: serve::Drafted::default(),
+            },
+            SlotPass {
+                slot: 2,
+                last: 4,
+                out: &mut d,
+                drafted: serve::Drafted::default(),
+            },
+        ];
+        let e = link
+            .pass_slots(&mut rows)
+            .expect_err("one slot twice in a round of passes");
+        assert!(e.0.contains("names slot 2 twice"), "{e}");
         link.tx = None;
         worker.join().expect("the echo thread");
     }

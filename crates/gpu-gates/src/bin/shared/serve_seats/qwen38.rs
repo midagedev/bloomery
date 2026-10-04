@@ -26,29 +26,32 @@
 //! leaves a position's bits a function of its own inputs, so a longer
 //! prompt's greedy ids are the walk's, not a step-fed run's).
 //!
-//! The positions the server serves are the stores the load sized
-//! (`--ctx-size`): `/props`' `n_ctx` is that number, a prompt that long is a
-//! 400 before it reaches the engine, and generation stops there with
-//! `truncated`. Unset, the context is [`margin38`]'s answer — the largest
-//! multiple of [`CTX_STEP`] up to the fit (the largest the card holds, at
-//! most the file's serving cap) whose plan holds at most the plan's own
-//! margin (`MARGIN`) fewer card expert bytes than the plan at [`CTX`], the
-//! fit when every context does — the largest the card holds when that is
-//! fewer than [`CTX`], and at most what lets one session's sequence state
-//! with its two recurrent copies fit the prompt cache's budget (one
-//! session's whole context can be saved). Set, a context past the file's
-//! `context_length` (`place::serve_ctx`: YaRN scaling past it is not built),
-//! then one the card cannot hold beside the plan's dense weights — the
-//! largest context any plan of the file and the placement takes up to that
-//! cap ([`fit38`]) — is refused by name before the load. The `load` line
-//! prints the stores' `ctx`, the cap as `ctx_max`, `ctx_train` and
+//! The positions a slot serves are the stores the load sized
+//! (`--ctx-size` names the total the slots split): `/props`' `n_ctx` is a
+//! slot's number, a prompt that long is a 400 before it reaches the engine,
+//! and generation stops there with `truncated`. Unset, the context is
+//! [`margin38`]'s answer over a slot's share — the largest multiple of
+//! [`CTX_STEP`] up to the fit (the largest a slot's N-slot plan holds on the
+//! card, at most the file's serving cap) whose plan holds at most the plan's
+//! own margin (`MARGIN`) fewer card expert bytes than the N-slot plan at
+//! [`CTX`] a slot, the fit when every context does — the largest the card
+//! holds when that is fewer than [`CTX`], and at most what lets one
+//! session's sequence state with its two recurrent copies fit the prompt
+//! cache's budget (one session's whole slot context can be saved). Set, a
+//! total a slot's share of which passes the file's `context_length`
+//! (`place::serve_ctx`: YaRN scaling past it is not built), then one whose
+//! N-slot plan the card cannot hold beside the plan's dense weights — the
+//! largest slot context any N-slot plan of the file and the placement takes
+//! up to that cap ([`fit38`]) — is refused by name before the load. The
+//! `load` line prints the stores' `ctx` (a slot's rows) with the slot count
+//! and each slot's context, the cap as `ctx_max`, `ctx_train` and
 //! `verified`, the deepest context the reference sets hold our numbers to
 //! ik's at (`refset::arch::qwen4exp::VERIFIED_POSITIONS`, `/props`'
-//! `engine.ctx_verified`), which bounds nothing. A `ctx` line on stderr names the rule and the context, the largest
-//! context the card holds with its card expert bytes, and the largest whose
-//! plan holds at most the plan's own margin (`MARGIN`) fewer card expert
-//! bytes than the plan at [`CTX`] ([`margin38`]): more positions on the card
-//! push card experts to the host.
+//! `engine.ctx_verified`), which bounds nothing. A `ctx` line on stderr names the rule, the slot context, the slots and
+//! the total they serve, the largest context the card holds with its card
+//! expert bytes, and the largest whose plan holds at most the plan's own
+//! margin (`MARGIN`) fewer card expert bytes than the plan at [`CTX`] a slot
+//! ([`margin38`]): more positions on the card push card experts to the host.
 //!
 //! A request keeps the longest prefix it shares with what the slot holds that
 //! the recurrent layers can stand at: every held position, or the nearest
@@ -82,22 +85,25 @@
 //! with the draft beside one without it) is refused by name; every save,
 //! load, eviction and skip prints as a line.
 //!
-//! `--parallel N` (`-np N`) serves N slots that take the one model in turns
-//! (`serve::SwapEngine`); the default is what the parked states' budget
-//! holds of one slot's whole-context state — the lesser of
-//! `bind::PARALLEL_CAP` and it, never below the plain engine — and the flag
-//! an upper bound on the same, so `--parallel 1` keeps the plain engine: a
-//! request that arrives while another decodes preempts it at the next step,
-//! the running request's sequence state ([`Seq38`], the draft's side with
-//! it) parked in host RAM, and the live requests then take turns of
-//! `serve::QUANTUM` tokens, each put back where it left, its draft joining
-//! there. The parked states' budget is `--park-ram` (MiB), by default the
-//! lesser of `bind::CACHE_RAM_CAP` and what `MemAvailable` leaves past the
-//! plan's host need, the churn pool, the checkpoints and the prompt cache
-//! (`bind::CacheRam::park`); a request that would park a state past it is a
-//! 503 naming the budget. A `parallel` line on stderr names the rule
-//! (`plain`, `budget` or `flag`), the slots and each term.
-//! `--queue-depth Q` bounds the requests that wait for a slot.
+//! `--parallel N` (`-np N`, default 2) serves N resident sequences inside
+//! the one model (`Session::add_slots` over `Body38`'s [`Slots`]): one
+//! drafted pass a slot a round, the sequences switched by pointer exchange,
+//! and the draft's host state parked with its slot on every switch, so each
+//! request's tokens are its solo run's. `--parallel 1` is exactly the
+//! one-sequence server. The context is split as llama-server splits it with
+//! `-np N` and no `-kvu`: the `--ctx-size` the flags named (or the automatic
+//! choice when unset) is the total, each slot `total / N` positions rounded
+//! down, and the search for the default — the largest total whose N-slot
+//! plan fits the card within the margin rule `ctx38` applies, each slot a
+//! multiple of [`CTX_STEP`] — runs over a slot's context, the plan counting
+//! every sequence ([`PlanInputs::plan_with_slots`]). An explicit `--ctx` a
+//! slot of whose N-slot plan the card cannot hold is refused by name before
+//! the load, naming the split. Nothing parks: no slot ever waits for another
+//! (a slot's round runs whether the others stream), so `--park-ram` is
+//! refused by name — resident slots hold their state on the card, in the
+//! plan. A `parallel` line on stderr names the rule (`slots`), the slots and
+//! the split they serve. `--queue-depth Q` bounds the requests that wait for
+//! a slot.
 //!
 //! The MTP draft keeps the same rule past a break-even, and the server cuts
 //! its prompt calls at the same message starts (the draft's prompt call joins
@@ -201,7 +207,7 @@ use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_by
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Parallel, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
+    CacheRam, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
     sampler_factory,
 };
 use bloomery_gpu_gates::generate::Place;
@@ -227,8 +233,8 @@ use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
 use serve::{
-    CacheNote, DraftProps, Drafted, Engine, EngineProps, FATAL_LINGER, Park, ResidencyReset, Saved,
-    ServeError, Server, ServerConfig, SlotConfig, SwapEngine,
+    CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
+    Server, ServerConfig, SlotConfig,
 };
 use tokenizer::Tokenizer;
 
@@ -529,18 +535,23 @@ fn residency38_at(
 }
 
 /// The plans the seat can load, by context: the file's inputs at `place`
-/// under the expert rule, the placement levers and the draft.
+/// under the expert rule, the placement levers and the draft, every
+/// per-sequence term counted `slots` times
+/// ([`PlanInputs::plan_with_slots`]).
 struct Plans<'a> {
     inputs: &'a PlanInputs,
     place: Place38,
     experts: Experts,
     levers: &'a PlanLevers,
     mtp: Option<&'a MtpInputs>,
+    /// The resident sequences every plan counts; 1 is the one-sequence plan
+    /// itself.
+    slots: usize,
 }
 
 impl Plans<'_> {
-    /// The plan's card expert bytes at `ctx` positions, or why no plan takes
-    /// that context.
+    /// The plan's card expert bytes at `ctx` positions a sequence serves, or
+    /// why no plan takes that context.
     fn card(&self, ctx: usize) -> Result<u64, GateError> {
         let ub = ubatch_for(ctx)?;
         let ctx = u64::try_from(ctx)?;
@@ -551,12 +562,13 @@ impl Plans<'_> {
             self.mtp,
         )?;
         let plan = match self.mtp {
-            None => self
-                .inputs
-                .plan_with(&machine, ctx, self.levers, self.experts)?,
+            None => {
+                self.inputs
+                    .plan_with_slots(&machine, ctx, self.levers, self.experts, self.slots)?
+            }
             Some(mi) => {
                 self.inputs
-                    .plan_mtp_with(&machine, ctx, self.levers, mi, self.experts)?
+                    .plan_mtp_with_slots(&machine, ctx, self.levers, mi, self.experts, self.slots)?
                     .plan
             }
         };
@@ -577,12 +589,13 @@ impl Plans<'_> {
             self.place
                 .machine(self.inputs, (c, u64::try_from(ub)?), self.experts, self.mtp)?;
         let plan = match self.mtp {
-            None => self
-                .inputs
-                .plan_with(&machine, c, self.levers, self.experts)?,
+            None => {
+                self.inputs
+                    .plan_with_slots(&machine, c, self.levers, self.experts, self.slots)?
+            }
             Some(mi) => {
                 self.inputs
-                    .plan_mtp_with(&machine, c, self.levers, mi, self.experts)?
+                    .plan_mtp_with_slots(&machine, c, self.levers, mi, self.experts, self.slots)?
                     .plan
             }
         };
@@ -608,34 +621,40 @@ impl Plans<'_> {
     }
 }
 
-/// The context the seat loads ([`ctx38`]) and what decided it.
+/// The context the seat loads ([`ctx38`]) and what decided it: every number
+/// a slot's own — the stores' rows one sequence serves — the total they hold
+/// `slots` times over.
 struct Ctx38 {
+    /// A slot's context.
     ctx: usize,
-    /// `set` (`--ctx-size`), or what decided the default: `margin`
-    /// ([`margin38`]'s answer), `card` (the largest context the card holds,
-    /// fewer than [`CTX`]), `cache` (one state in the prompt cache's
-    /// budget).
+    /// The resident sequences the plan counted.
+    slots: usize,
+    /// `set` (`--ctx-size`, the total the slots split), or what decided the
+    /// default: `margin` ([`margin38`]'s answer), `card` (the largest
+    /// context the card holds, fewer than [`CTX`]), `cache` (one state in
+    /// the prompt cache's budget).
     rule: &'static str,
-    /// The largest context the card holds ([`fit38`]).
+    /// The largest slot context the card holds ([`fit38`]).
     fit: Fit38,
-    /// The largest context within the plan's margin ([`margin38`]).
+    /// The largest slot context within the plan's margin ([`margin38`]).
     margin_ctx: usize,
-    /// The plan's card expert bytes at [`CTX`] and at `ctx`.
+    /// The plan's card expert bytes at [`CTX`] a slot and at `ctx`.
     base_bytes: u64,
     card_bytes: u64,
 }
 
-/// The largest context the card holds beside the plan's dense weights, and
-/// the plan's card expert bytes there.
+/// The largest slot context the card holds beside the plan's dense weights,
+/// and the plan's card expert bytes there.
 #[derive(Clone, Copy)]
 struct Fit38 {
     ctx: usize,
     card_bytes: u64,
 }
 
-/// The largest context any plan of the file and the placement takes, up to
-/// the file's serving cap (`place::serve_ctx`: its `context_length`): the
-/// most a `--ctx-size` may name.
+/// The largest slot context any plan of the file and the placement takes —
+/// every plan counting the seat's slots — up to the file's serving cap
+/// (`place::serve_ctx`: its `context_length`): the most a `--ctx-size`'s
+/// split may give a slot.
 fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
     let fits = |c: usize| Ok(plans.card(c).is_ok());
     if !fits(1)? {
@@ -658,9 +677,10 @@ fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
 }
 
 /// The largest multiple of [`CTX_STEP`] up to `fit` whose plan holds at most
-/// `MARGIN` fewer card expert bytes than the plan at `base_at` (`base_bytes`
-/// there), `fit` when every context does, `base_at` when no step past it
-/// does ([`super::ctx::within_margin`], the seats' shared guard).
+/// `MARGIN` fewer card expert bytes than the plan at `base_at` a slot
+/// (`base_bytes` there), `fit` when every context does, `base_at` when no
+/// step past it does ([`super::ctx::within_margin`], the seats' shared
+/// guard).
 fn margin38(
     plans: &Plans<'_>,
     fit: usize,
@@ -670,36 +690,46 @@ fn margin38(
     super::ctx::within_margin(fit, base_at, base_bytes, CTX_STEP, &|c| plans.card(c))
 }
 
-/// The seat's context (the module doc): `set` when the file's serving cap
-/// takes it (`place::serve_ctx`, refused by name past it) and it fits the
-/// card ([`fit38`]), else refused by name; unset, [`margin38`]'s answer, or
-/// the largest the card holds when that is fewer than [`CTX`]. The prompt
+/// The seat's context (the module doc), every number a slot's own: `set`
+/// when the file's serving cap takes a slot's share of the total
+/// (`place::serve_ctx`, refused by name past it) and it fits the card
+/// ([`fit38`]), else refused by name; unset, [`margin38`]'s answer, or the
+/// largest the card holds when that is fewer than [`CTX`]. The prompt
 /// cache's bound comes after ([`Ctx38::host_bound`]).
 fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
+    let n = plans.slots;
+    let split = |c: usize| c / n;
     if let Some(c) = set {
-        serve_ctx(u64::try_from(c)?, &plans.inputs.hp)?;
+        if split(c) == 0 {
+            return Err(
+                format!("--ctx-size {c}: --parallel {n} splits it to no position a slot").into(),
+            );
+        }
+        serve_ctx(u64::try_from(split(c))?, &plans.inputs.hp)?;
     }
     let fit = fit38(plans)?;
     let base_at = CTX.min(fit.ctx);
     let base_bytes = plans.card(base_at)?;
     let margin_ctx = margin38(plans, fit.ctx, base_at, base_bytes)?;
     let (ctx, rule) = match set {
-        Some(c) if c > fit.ctx => {
+        Some(c) if split(c) > fit.ctx => {
             return Err(format!(
-                "--ctx-size {c}: the card holds at most {} positions beside the plan's dense \
-                 weights (`--place {}`)",
+                "--ctx-size {c}: with --parallel {n} each slot takes {} positions and the card \
+                 holds at most {} a slot beside the plan's dense weights (`--place {}`)",
+                split(c),
                 fit.ctx,
                 plans.place.name()
             )
             .into());
         }
-        Some(c) => (c, "set"),
+        Some(c) => (split(c), "set"),
         None if base_at < CTX => (base_at, "card"),
         // Unset takes the fit's context without paying its card experts.
         None => (margin_ctx, "margin"),
     };
     Ok(Ctx38 {
         ctx,
+        slots: n,
         rule,
         fit,
         margin_ctx,
@@ -709,8 +739,8 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
 }
 
 impl Ctx38 {
-    /// A default bounded by the prompt cache too: one session's state at the
-    /// whole context ([`Seq38`: its positional rows and two recurrent
+    /// A default bounded by the prompt cache too: one session's state at its
+    /// slot's context ([`Seq38`: its positional rows and two recurrent
     /// copies, the draft's side under `drafts`](seq38_bytes)) fits `ram`
     /// bytes, when the cache is on. A set context keeps its value.
     fn host_bound(self, inputs: &PlanInputs, ram: u64, drafts: bool) -> Result<Ctx38, GateError> {
@@ -744,13 +774,17 @@ impl Ctx38 {
         })
     }
 
-    /// The `ctx` line on stderr.
+    /// The `ctx` line on stderr: every context a slot's, `total` the slots'
+    /// sum, `base` the plan at [`CTX`] a slot the margin counts against.
     fn print(&self) {
         eprintln!(
-            "ctx rule={} ctx={} fit={} fit_card_expert_bytes={} margin_ctx={} base={CTX} \
-             base_card_expert_bytes={} card_expert_bytes={} lost_bytes={} margin_bytes={MARGIN}",
+            "ctx rule={} ctx={} slots={} total={} fit={} fit_card_expert_bytes={} margin_ctx={} \
+             base={CTX} base_card_expert_bytes={} card_expert_bytes={} lost_bytes={} \
+             margin_bytes={MARGIN}",
             self.rule,
             self.ctx,
+            self.slots,
+            self.slots * self.ctx,
             self.fit.ctx,
             self.fit.card_bytes,
             self.margin_ctx,
@@ -775,11 +809,12 @@ struct Args {
     /// `--slot-save-path`: the directory the slot actions answer from;
     /// `None` refuses every one, as llama-server does.
     slot_save_path: Option<PathBuf>,
-    /// `--parallel`: slots that take the model in turns past 1; `None`
-    /// takes the elastic default ([`Parallel`]).
+    /// `--parallel`: the resident sequences the seat serves; `None` takes
+    /// the default, 2.
     parallel: Option<usize>,
     queue_depth: Option<usize>,
-    /// `--park-ram` in bytes; `None` takes the default.
+    /// `--park-ram` in bytes; set is refused by name (resident slots park
+    /// nothing).
     park_ram: Option<u64>,
 }
 
@@ -823,13 +858,15 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     if a.ctx == Some(0) {
         return Err("--ctx-size 0: the stores hold no position".into());
     }
-    if a.park_ram.is_some() && a.parallel.is_some_and(|n| n < 2) {
-        return Err(format!(
-            "--park-ram holds the states of slots that take the model in turns; --parallel {} \
-             has none to park",
-            a.parallel.unwrap_or(0)
-        )
-        .into());
+    if a.parallel == Some(0) {
+        return Err("--parallel 0: the server serves no slot".into());
+    }
+    if a.park_ram.is_some() {
+        return Err(
+            "--park-ram holds the states of slots that take the model in turns; this seat's \
+             slots are resident sequences, which park nothing — the plan counts their state"
+                .into(),
+        );
     }
     a.place = a.place.on_host()?;
     Ok(a)
@@ -931,12 +968,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         }
     };
     drop(split);
+    // The slot count first: it shapes the context search itself, every plan
+    // the seat asks for counting each sequence (`Plans::slots`).
+    let slots = a.parallel.unwrap_or(2);
     let plans = Plans {
         inputs: &inputs,
         place: a.place,
         experts,
         levers: &plan_levers,
         mtp: mtp_inputs.as_ref(),
+        slots,
     };
     let rule = ctx38(&plans, a.ctx)?;
     let (need, pool) = plans.host(rule.ctx, set)?;
@@ -947,23 +988,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
         cache.line()
     );
-    // The elastic slot count ([`Parallel`]): one slot's whole-context state
-    // the budget's unit, the flag an upper bound, the default what the
-    // budget holds.
-    let gdn = inputs
-        .spec
-        .layers
-        .iter()
-        .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
-        .count();
-    let qsa = inputs.spec.layers.len() - gdn;
-    let state = seq38_bytes(gdn, qsa, rule.ctx, mtp);
-    let budget = match a.parallel {
-        Some(n) if n >= 2 => cache.park(a.park_ram, n)?,
-        _ => cache.park_or_none(a.park_ram),
-    };
-    let parallel = Parallel::of(a.parallel, budget, state);
-    eprintln!("{}", parallel.line());
+    // The slots the seat serves ([`Session::add_slots`]): the flag's, or 2 —
+    // one drafted pass a slot a round, nothing parked.
+    eprintln!(
+        "parallel rule=slots slots={slots} slot_ctx={} total={}",
+        rule.ctx,
+        slots * rule.ctx
+    );
     if mtp {
         let be = BreakEven::of(a.place);
         eprintln!(
@@ -978,9 +1009,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let ctx = rule.ctx;
     if draft38(&levers, a.place, ctx, &draft_path)?.0 != mtp {
         return Err(format!(
-            "the context {ctx} leaves no positions for the MTP draft's window; --ctx-size names \
-             one past {}",
-            <Body38 as MtpBody>::VERIFY_ROWS
+            "a slot's context of {ctx} leaves no positions for the MTP draft's window; \
+             --ctx-size names a total one past {}",
+            <Body38 as MtpBody>::VERIFY_ROWS * slots
         )
         .into());
     }
@@ -993,12 +1024,18 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     )?;
     let (plan, draft_bytes) = match &mtp_inputs {
         None => (
-            inputs.plan_with(&machine, u64::try_from(ctx)?, &plan_levers, experts)?,
+            inputs.plan_with_slots(&machine, u64::try_from(ctx)?, &plan_levers, experts, slots)?,
             0,
         ),
         Some(mi) => {
-            let with =
-                inputs.plan_mtp_with(&machine, u64::try_from(ctx)?, &plan_levers, mi, experts)?;
+            let with = inputs.plan_mtp_with_slots(
+                &machine,
+                u64::try_from(ctx)?,
+                &plan_levers,
+                mi,
+                experts,
+                slots,
+            )?;
             let bytes = with.draft_card_bytes() + with.arena_bytes;
             (with.plan, bytes)
         }
@@ -1049,6 +1086,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let open = SeatArgs {
         place: a.place,
         ctx,
+        slots,
         experts,
         plan_levers,
         host: levers.host(),
@@ -1079,25 +1117,25 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         fatal_linger: FATAL_LINGER,
         slot_save_path: a.slot_save_path,
     };
-    // One slot stays the plain engine; several take it in turns.
-    let engine: Box<dyn Engine> = if parallel.slots > 1 {
-        Box::new(SwapEngine::new(
-            Box::new(engine),
-            parallel.slots,
-            Park::States { budget },
-        )?)
-    } else {
-        Box::new(engine)
-    };
-    let slots = SlotConfig {
-        parallel: parallel.slots,
+    // The seat's resident slots are the server's, one sequence each: the
+    // server selects and steps them together (the engine declares its
+    // per-slot draft), no turns and no park.
+    let config_slots = SlotConfig {
+        parallel: slots,
         queue_depth: a.queue_depth,
         ..SlotConfig::default()
     };
-    let server = Server::bind_with((a.host.as_str(), a.port), engine, config, slots)?;
+    let server = Server::bind_with(
+        (a.host.as_str(), a.port),
+        Box::new(engine),
+        config,
+        config_slots,
+    )?;
     Record::new(&record::LISTENING38)
         .w("place", a.place.name())
         .u("ctx", ctx)
+        .u("slots", slots)
+        .u("slot_ctx", ctx)
         .w("addr", server.local_addr()?)
         .eprint();
     Ok(server.run())
@@ -1106,7 +1144,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 /// What the engine thread opens the seat with.
 struct SeatArgs {
     place: Place38,
+    /// A slot's context: the stores' rows one sequence serves.
     ctx: usize,
+    /// The resident sequences the plan counted and the load makes
+    /// ([`Session::add_slots`] after the captures).
+    slots: usize,
     experts: Experts,
     plan_levers: PlanLevers,
     host: bloomery_levers::HostCfg,
@@ -1130,11 +1172,17 @@ struct SeatArgs {
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
 /// the draft it drives when one runs (its windows of four rows through
-/// the runtime's speculative loop), and the positions its stores were
+/// the runtime's speculative loop), the parked draft sides of the sequences
+/// it is not standing on, and the positions its stores were
 /// sized for.
 struct Q38 {
     s: app::Session<Body38>,
     drafted: DraftedSeat<Body38, { <Body38 as MtpBody>::VERIFY_ROWS }>,
+    /// The draft's side of every sequence but the live one
+    /// ([`Q38::select`]): what [`DraftedSeat::park`] took when the seat left
+    /// that slot, put back the next time it stands there. All `None` without
+    /// a draft.
+    drafts: Vec<Option<ParkedDraft<TargetRows>>>,
     ctx: usize,
     /// The plan's draft card bytes and arena, for `/props`' `draft` class.
     draft_bytes: u64,
@@ -1145,9 +1193,11 @@ struct Q38 {
     residency: bool,
     /// Under the draft, its break-even at the seat's placement.
     break_even: Option<BreakEven>,
-    /// The branch the last keep query took ([`Q38::draft_keep`]), printed at
-    /// the request's first call.
-    branch: std::cell::Cell<Option<Branch38>>,
+    /// The branch the last keep query took ([`Q38::draft_keep`]), one a
+    /// slot, printed at that slot's next call; a `RefCell` because the keep
+    /// query runs on `&self` (the engine thread owns the seat, so the borrow
+    /// never contends).
+    branch: std::cell::RefCell<Vec<Option<Branch38>>>,
 }
 
 impl Q38 {
@@ -1155,7 +1205,8 @@ impl Q38 {
     /// `generate_qwen3moe` prints them; under `mtp` the draft loaded
     /// beside the target, its own `load draft=mtp` line and the verify
     /// passes' capture lines after them), on the calling thread, pinned
-    /// to the dispatcher's cpu slot when asked.
+    /// to the dispatcher's cpu slot when asked, its `a.slots` resident
+    /// sequences parked after the captures ([`Session::add_slots`]).
     fn open(a: SeatArgs) -> Result<Q38, GateError> {
         const WHAT: &str = "bloomery-serve-qwen38";
         if a.pin_main {
@@ -1172,8 +1223,13 @@ impl Q38 {
         let mut m = match a.mtp {
             false => {
                 let machine = a.place.machine(&inputs, ctx_ub, a.experts, None)?;
-                let plan =
-                    inputs.plan_with(&machine, u64::try_from(a.ctx)?, &a.plan_levers, a.experts)?;
+                let plan = inputs.plan_with_slots(
+                    &machine,
+                    u64::try_from(a.ctx)?,
+                    &a.plan_levers,
+                    a.experts,
+                    a.slots,
+                )?;
                 Body38::open_placed_residency(
                     file,
                     &plan,
@@ -1182,6 +1238,7 @@ impl Q38 {
                     a.host,
                     ub,
                     a.residency,
+                    a.slots,
                 )?
             }
             true => {
@@ -1192,12 +1249,13 @@ impl Q38 {
                 let draft = open_draft(&a.draft_path, a.draft_from)?;
                 let mtp = MtpInputs::read(&draft, &file, &inputs, head.rows.clone())?;
                 let machine = a.place.machine(&inputs, ctx_ub, a.experts, Some(&mtp))?;
-                let plan = inputs.plan_mtp_with(
+                let plan = inputs.plan_mtp_with_slots(
                     &machine,
                     u64::try_from(a.ctx)?,
                     &a.plan_levers,
                     &mtp,
                     a.experts,
+                    a.slots,
                 )?;
                 Body38::open_placed_mtp_residency(
                     file,
@@ -1209,15 +1267,18 @@ impl Q38 {
                     &draft,
                     &mtp,
                     a.residency,
+                    a.slots,
                 )?
             }
         };
         m.set_mode(StepMode::Graph);
         eprintln!(
-            "load arch=qwen4exp resident_bytes={} ctx={} ctx_max={cap} ctx_train={} \
-             verified={VERIFIED_POSITIONS} layers={} mode=graph store_bytes={} prefill=auto \
-             ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
+            "load arch=qwen4exp resident_bytes={} ctx={} slots={} slot_ctx={} ctx_max={cap} \
+             ctx_train={} verified={VERIFIED_POSITIONS} layers={} mode=graph store_bytes={} \
+             prefill=auto ubatch={} place={} card_layers={} in {:.1} s (runtime value)",
             m.resident_bytes(),
+            a.ctx,
+            a.slots,
             a.ctx,
             inputs.hp.n_ctx_train,
             m.layers().len(),
@@ -1283,6 +1344,10 @@ impl Q38 {
             // must, and every call takes it.
             s.model_mut().body_parts(WHAT)?.2.log_residency(0);
         }
+        // The resident sequences, parked after the captures: the live slot's
+        // step and verify chains stay with it, each parked slot capturing on
+        // its first use.
+        s.add_slots(a.slots)?;
         let drafted = DraftedSeat::new(match a.mtp {
             false => None,
             true => {
@@ -1301,15 +1366,19 @@ impl Q38 {
                 Some(s.with_draft(draft, &mut Captures)?)
             }
         });
+        // Every parked slot's draft side starts as a fresh draft's: nothing
+        // waits, nothing skipped. The live slot's lives in the [`DraftedSeat`].
+        let drafts = vec![drafted.park(); a.slots];
         Ok(Q38 {
             s,
             drafted,
+            drafts,
             ctx: a.ctx,
             draft_bytes: a.draft_bytes,
             draft_path: a.draft_path,
             residency,
             break_even: a.mtp.then(|| BreakEven::of(a.place)),
-            branch: std::cell::Cell::new(None),
+            branch: std::cell::RefCell::new(vec![None; a.slots]),
         })
     }
 
@@ -1338,10 +1407,10 @@ impl Q38 {
         })
     }
 
-    /// What the request's reuse left to say, at its first call: the `mtp
-    /// keep` record of the branch its keep took.
+    /// What the request's reuse left to say, at its first call on the slot
+    /// it runs: the `mtp keep` record of the branch its keep took.
     fn before_call(&mut self) {
-        if let Some(b) = self.branch.take() {
+        if let Some(b) = self.branch.borrow_mut()[self.s.selected()].take() {
             Record::new(&record::MTP_KEEP38)
                 .w("branch", if b.kept { "kept" } else { "reset" })
                 .u("prefix", b.prefix)
@@ -1414,6 +1483,37 @@ impl Seat for Q38 {
 
     fn ctx_max(&self) -> usize {
         self.ctx
+    }
+
+    /// The resident sequences the load made ([`Session::slots`]): one a
+    /// `--parallel 1` load, the `--parallel` the seat served past it.
+    fn slots(&self) -> usize {
+        self.s.slots()
+    }
+
+    /// The session's slot ([`Session::select_slot`]), the live sequence's
+    /// draft side parked into its entry and the target's put back around the
+    /// exchange: the target slot's draft joins its sequence where it left
+    /// it, as if no other had run. The exchange is refused by name while a
+    /// verify waits for its commit (the session's and the body's own checks;
+    /// nothing has moved then — the parked entry is written only after the
+    /// exchange takes).
+    fn select(&mut self, slot: usize) -> Result<(), GateError> {
+        let was = self.s.selected();
+        if was == slot {
+            return Ok(());
+        }
+        let live = self.drafted.park();
+        self.s.select_slot(slot)?;
+        let back = self.drafts[slot].take();
+        self.drafts[was] = live;
+        self.drafted.unpark(back.as_ref())
+    }
+
+    /// The draft's state is per slot ([`Q38::select`]): a slot's drafted
+    /// passes are the passes it would run alone.
+    fn slot_drafts(&self) -> bool {
+        self.drafted.drafts()
     }
 
     /// The prompt through the ubatch walk `--prefill auto` takes: `gemm`
@@ -1505,7 +1605,7 @@ impl Seat for Q38 {
     fn keep_for(&self, n: usize, reply: Option<usize>) -> (usize, Option<String>) {
         let (at, why) = self.keep(n);
         let branch = self.draft_keep(at, reply);
-        self.branch.set(branch);
+        self.branch.borrow_mut()[self.s.selected()] = branch;
         match branch {
             Some(b) if !b.kept => (
                 0,
