@@ -148,6 +148,7 @@
 
 **C. 설치·출시 채널 (0.2.0 저녁 작업의 빚)**
 - **publish 절차 스키 없음 (S)**: 이번 애셋 이름 사고(`release-upload.tar.gz`로 404)는 수동 업로드 탓 — `tools/release/publish.sh`가 박스에서 타르볼·sha를 받아 네 검사를 재확인하고 build.sh가 쓴 이름으로만 업로드하며, 릴리스 body의 Install 절을 버전·sha와 함께 갱신한다. 크레이트 버전(bloomery-serve·gpu-gates 둘) 올리는 것도 절차에 넣는다.
+- **채널 검증 상태 (10-04, 사용자 결정: sihyung에서 GPU·brew 전수검증은 하지 않는다)**: 검증된 것 — formula의 URL·sha256 바이트 정합과 파싱(맥 `brew fetch --bottle-tag=x86_64_linux`), ghcr 이미지 pull·CPU `--version`(맥 linux/amd64), curl|sh 설치자 end-to-end(sihyung WSL, 0.2.0 당시 8/8 응답 동일). 미검증 — `--gpus all` GPU 패스스루(도커 데몬이 nvidia-container-toolkit을 요구했고 설치는 취소), `brew install` 완주(실리콘 x86_64 brew 머신 없음). GitHub Actions의 ubuntu-latest에서 formula 빌드만은 검증 가능(비-GPU, --version 테스트 블록) — 후보로 남긴다.
 - brew formula 실설치 검증: 맥의 `brew fetch`는 URL·sha를 뒀고 formula 파싱은 됐으나 전체 `brew install` 완주는 이 맥의 QEMU 컨테이너에서 불가했다(SSSE3 게이트·TTY 프로브·popen 교착). brew가 있는 x86_64 리눅스 한 대에서 한 번(S, sihyung WSL에 brew를 설치할지는 사용자 결정).
 - 도커 GPU 경로 실기 검증: ghcr 이미지의 `--version`까지는 검증; NVIDIA Container Toolkit 호스트에서의 서빙 실행은 한 번도 안 돌았다(맥에 NVIDIA 런타임 없음, 박스에 docker 없음).
 - container.yml의 actions가 Node 20 deprecation 경고(버전 올리기, XS).
