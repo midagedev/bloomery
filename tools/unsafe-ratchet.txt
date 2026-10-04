@@ -78,11 +78,7 @@ gguf 9 2 0
 # cp.async staging and widening macros (dequant_row!/zero_row! are macros, not fns, because a shared
 # tile pointer cannot cross a device helper fn boundary — upstream ledger #38), ninety-seven blocks in
 # all, each with its SAFETY line.
-
-# PIN(2026-10-04): gpu 1480 -> 1482 blocks, new code, not old code relaxed: the bundle load started
-# beside the weights upload (lib.rs jitovl) adds Gpu::opening's generated-load closure and the
-# overlapped-path gate's mid-load closure, each with its SAFETY line.
-gpu 1579 160 6
+gpu 1577 160 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

@@ -572,14 +572,13 @@ pub static LOAD_GENERATOR: Kind = Kind {
 
 /// The load's phases, each the wall of its span inside the load line's
 /// `load_s`: the file's headers, the placement plan when its loader timed
-/// it, the card's context and device modules (the bundle load started
-/// beside the upload, its JIT under `upload_s` and only its residue waited
-/// for here), the weights upload, the derived weights, the plan's host set,
-/// the body's build, the output head, and the rest of the span.
+/// it, the card's context and device modules, the weights upload, the
+/// derived weights, the plan's host set, the body's build, the output head,
+/// and the rest of the span.
 pub static LOAD_PHASES: Kind = Kind {
     name: "load_phases",
     head: "load phases",
-    doc: "The load's phases, each the wall of its span inside the load line's load_s: the file's headers, the placement plan when its loader timed it, the card's context and device modules (the bundle load started beside the upload, its JIT under upload_s and only its residue waited for here), the weights upload, the derived weights, the plan's host set, the body's build, the output head, and the rest of the span.",
+    doc: "The load's phases, each the wall of its span inside the load line's load_s: the file's headers, the placement plan when its loader timed it, the card's context and device modules, the weights upload, the derived weights, the plan's host set, the body's build, the output head, and the rest of the span.",
     parts: &[
         key("open_s", F64(2), "s"),
         opt("plan_s", F64(2), "s"),

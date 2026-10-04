@@ -408,9 +408,7 @@ struct PlacedPre {
 pub struct LoadTimes {
     /// The inputs read and the placement plan, when the loader stamped it.
     pub plan: Option<Duration>,
-    /// The card's context, its engine stream and this crate's device
-    /// modules: the opening (whose bundle load starts beside the upload) and
-    /// the wait for that load's completion before `derive`.
+    /// The card's context, its engine stream and this crate's device modules.
     pub context: Duration,
     /// The card segments' upload: the staging and the host-to-device copies.
     pub upload: Duration,
@@ -1250,17 +1248,14 @@ impl<B: ChainBody> GpuModel<B> {
 }
 
 /// The steps of a placed load before its body: the plan's card and context
-/// budget, the card opened with its bundle load started beside the steps
-/// that need no module ([`Gpu::open_card_beside`]), the host's memory
-/// against the plan's host need, the card's weights with `derive`'s filings
-/// — the started load's completion waited for between the upload and
-/// `derive` — and, after the uploads, so the card's file bytes have left
-/// the page cache first, the plan's host set read in and locked as `host`
-/// asks, with `extra`'s runs (of `extra`'s bytes) beside it. The pieces,
-/// and the host set. Every placed load passes here, so the two refusals
-/// before any upload are made once: a plan's card that is not one visible
-/// device, and a host whose `MemAvailable` is under the plan's need
-/// ([`HostNeed`]).
+/// budget, the card, the host's memory against the plan's host need, the
+/// card's weights with `derive`'s filings, and — after the uploads, so the
+/// card's file bytes have left the page cache first — the plan's host set
+/// read in and locked as `host` asks, with `extra`'s runs (of `extra`'s
+/// bytes) beside it. The pieces, and the host set. Every placed load passes
+/// here, so the two refusals before any upload are made once: a plan's card
+/// that is not one visible device ([`Gpu::open_card`]), and a
+/// host whose `MemAvailable` is under the plan's need ([`HostNeed`]).
 fn placed_pre(
     file: &Split,
     plan: &Plan<'_>,
@@ -1282,21 +1277,15 @@ fn placed_pre(
     let layers = spec.layers.clone();
     let (extra, extra_bytes) = extra;
     let t = Instant::now();
-    let opening = Gpu::open_card_beside(&spec.name, spec.device)?;
-    let mut context = t.elapsed();
+    let gpu = Gpu::open_card(&spec.name, spec.device)?;
+    let context = t.elapsed();
     let available = workstation::host_available().map_err(|e| GpuError::plan(what, e))?;
     HostNeed::of(plan, extra_bytes)
         .check(available)
         .map_err(|e| GpuError::plan(what, e))?;
     let t = Instant::now();
-    let mut weights = Weights::load_placed(opening.stream(), file, plan, card, host.card_dontneed)?;
+    let mut weights = Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?;
     let upload = t.elapsed();
-    // The upload is enqueued: the bundle load started at the opening has had
-    // the upload's wall to run beside, and what is left of it is waited for
-    // here, before `derive` launches.
-    let t = Instant::now();
-    let gpu = opening.finish()?;
-    context += t.elapsed();
     let t = Instant::now();
     derive(gpu.stream(), file, layers.clone(), &mut weights)?;
     let derived = t.elapsed();
