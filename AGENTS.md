@@ -269,7 +269,8 @@ A quiet agent is a symptom: the first suspect is a hung gate on the box.
   count. Under 1 %, judge only between same-binary lever arms.
 - **Prefill is a headline metric beside decode.** Every model's public numbers carry `pp tok/s @ P = 512 and 4096, card`
   next to decode tok/s, for ours and the reference engines in one lease; a round touching the prompt path is judged on
-  it. The measured history is in rig-log.
+  it. The measured history is in rig-log. The reference engines' rows live on rig-log's bench page with their flags;
+  the README links them and states no ratio against another engine.
 - **A decode headline names its depth.** `tools/ref/depth-decode.sh` runs both engines at each depth in one lease
   (`BLOOMERY_DEPTHS="6 1024 4096"`); a round touching attention or the KV cache is judged on the deep rows. For V4.1,
   `just depth-gpu-ds41 prose:<P>[@K=V,…]` / `code:<P>` feed the first P ids of `corpus-prose.ids` / `corpus-code.ids`;
