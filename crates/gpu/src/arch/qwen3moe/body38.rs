@@ -1825,8 +1825,11 @@ impl Body38 {
     /// The draft's side of a sequence state at `pos` ([`DraftRows38`]);
     /// `None` on a load without the draft: the store's rows below its
     /// positions, and the step's and the pass's arena rows with the
-    /// positions they hold. Refused by name when the store or an arena holds
-    /// positions past `pos`. Blocking.
+    /// positions they hold — the rows below `pos`, the positions a walk can
+    /// read (a verify's rejected tail, an arena's rows at or past `pos`, is
+    /// dead: no walk reads past `pos - 1` and the next launch overwrites
+    /// the arena from `pos`). Refused by name when the store holds past
+    /// `pos` or an arena's rows begin at or past it. Blocking.
     fn draft_rows(&self, stream: &CudaStream, pos: u32) -> Result<Option<DraftRows38>, GpuError> {
         const WHAT_D: &str = "qwen4exp snapshot";
         let Some(d) = self.mtp.as_ref() else {
@@ -1844,7 +1847,7 @@ impl Body38 {
             let held = self.wrote.of(walk);
             let (first, n) = held.parts();
             let n = n as usize;
-            if n > most || n > 0 && first as usize + n > pos as usize {
+            if n > most || n > 0 && first as usize >= pos as usize {
                 return Err(GpuError::shape(
                     WHAT_D,
                     format!(
@@ -1853,9 +1856,10 @@ impl Body38 {
                     ),
                 ));
             }
+            let n = n.min(pos as usize - first as usize);
             let mut v = self.final_streams(walk).to_host_vec(stream)?;
             v.truncate(n * wide);
-            Ok((held, v))
+            Ok((Held38::at(first, u32::try_from(n).unwrap_or(u32::MAX)), v))
         };
         let step = rows(TargetRows::Step, 1)?;
         let pass = rows(TargetRows::Pass, PASS_ROWS)?;
