@@ -39,7 +39,8 @@
 //! f16 bits. Asserted: ours within its bound of the exact value, ik within
 //! its bound (the check that this model of ik is right), ours within the sum
 //! of both of ik's `fa-L`; a rerun bit-identical; padded cache rows set to
-//! NaN change no bit; the captured graph (two nodes) replays bit-identical.
+//! NaN change no bit; the captured graph (two nodes) replays bit-identical
+//! (the grid clause below, at the first set's own height).
 //!
 //! And the prefill shape, on each set's layer 0 in both passes: one launch of
 //! [`ROWS`] query rows — row `t` the step's query with its heads rotated by
@@ -91,42 +92,30 @@
 //! before any launch — the last check, because a launch through such a
 //! window is a sticky error that ends the context.
 //!
-//! The q8_0 read path (`enqueue_pass_q8` and `enqueue_q8`, no engine caller
-//! yet) runs the same walks over the cache's Q8_0 form, host-built over each
-//! layer's own f32 K and V values: `quantize_q8_0` a 32-value block, the two
-//! planes `q8_0_planes` packs. The oracle is the dequantized cache — the
-//! q8_0 reads' own bits are not the f16 cache's, and what the format's
-//! algebra pins is which rounding each pass takes, so the comparison is
-//! split by the pass:
-//! - the scalar pass's score products are exact over the dequantized values
-//!   (`code·d` never rounds in f32: a code's 7 significant bits against the
-//!   f16 scale's 11 leave 6 of f32's 24), so its band is the scalar twin's
-//!   over the dequantized keys and the f16-rounded dequantized values (the
-//!   V tile's own format) — the f64 exact attention recomputed on those
-//!   values, `bound_ours` unchanged;
-//! - the tensor-core pass and the prefill stage the dequantized values
-//!   rounded to f16 — the twin tiles' own bits — so each is held bit for bit
-//!   to its f16 twin run on the synthesized f16 cache of the dequantized
-//!   values (`f32_to_f16_bits` of each): the tiles hold the same bits, and
-//!   the walk after them is the twin's verbatim, so the two launches must
-//!   agree to the bit (a band would only re-derive the twin's own gate).
-//!
-//! Bit identity against a host oracle is not claimed for either: the
+//! The q8_0 read path (`enqueue_pass_q8`, the tensor-core segment pass, and
+//! `enqueue_q8`) runs the same walks over the cache's Q8_0 form, host-built
+//! over each layer's own f32 K and V values: `quantize_q8_0` a 32-value
+//! block, the two planes `q8_0_planes` packs. Both stage the dequantized
+//! values (`code·d`, exact in f32: a code's 7 significant bits against the
+//! f16 scale's 11 leave 6 of f32's 24) rounded to f16 — the twin tiles' own
+//! bits — so each is held bit for bit to its f16 twin run on the synthesized
+//! f16 cache of the dequantized values (`f32_to_f16_bits` of each): the tiles
+//! hold the same bits, and the walk after them is the twin's verbatim, so the
+//! two launches must agree to the bit (a band would only re-derive the twin's
+//! own gate). Bit identity against a host oracle is not claimed: the
 //! exponential is the device's own (`dev_exp`), and the host cannot run it.
 //!
-//! Asserted for the q8 entries: on each set, every layer's scalar and mma
-//! decode passes and the prefill launch — a rerun bit-identical, the cache
-//! rows at or past the count holding the q8 sentinel bits (codes
-//! `0xa5a5a5a5`, scales `0x5a5a`) changing no bit, the scalar pass within its
-//! band, the mma pass and the prefill bit for bit their f16 twins on the
+//! Asserted for the q8 entries: on each set, every layer's decode pass and
+//! prefill launch — a rerun bit-identical, every key head's cache rows at or
+//! past the count holding the q8 sentinel bits (codes `0xa5a5a5a5`, scales
+//! `0x5a5a`) changing no bit, each bit for bit its f16 twin on the
 //! synthesized cache; on layer 0, the [`ROWS`] rotated rows of the prefill
-//! shape each bit for bit their one-row launch (both decode passes), the
-//! `key_count` fault with NaN in exactly the bad rows and every other row
-//! the clean run's, the captured decode launch (two nodes) and prefill
-//! launch (one node) replaying the eager bits, and a `kq` one word short
-//! refused by name. Last (after the f16 window checks), `kq` at 8 bytes past
-//! a 16-byte boundary through the q8 prefill refused by name before any
-//! launch.
+//! shape each bit for bit their one-row launch, the `key_count` fault with
+//! NaN in exactly the bad rows and every other row the clean run's, the
+//! captured decode launch (two nodes) and prefill launch (one node) replaying
+//! the eager bits, and a `kq` one word short refused by name. Last (after the
+//! f16 window checks), `kq` at 8 bytes past a 16-byte boundary through the q8
+//! prefill refused by name before any launch.
 //!
 //! The segment grid ([`SEGMENTS`] segments a row's key head) does not depend
 //! on the cache height, and two clauses pin it. Grid at two heights: on the first set's layer 0, the
@@ -517,7 +506,6 @@ mod gate {
                                 fault: gpu.unlabelled_sink(),
                                 y: &mut y,
                             },
-                            true,
                         )
                     } else {
                         k.enqueue_pass(
@@ -563,7 +551,6 @@ mod gate {
                     &inp.n_keys,
                     &c8,
                     g,
-                    true,
                     false,
                 )?
             } else {
@@ -763,7 +750,6 @@ mod gate {
                     fault: unl,
                     y: &mut y8,
                 },
-                true,
             )?;
             stream.synchronize()?;
             let twin = launch(&q, count, true, &k16, &v16)?;
@@ -1116,15 +1102,13 @@ mod gate {
     // ------------------------------------------------ the q8_0 read path
 
     /// One side's Q8_0 planes of a cache — `quantize_q8_0` over its f32
-    /// values a row, `q8_0_planes`' packing — with the two views the reads
-    /// hold: the dequantized values `code·d` (exact in f32) and their f16
-    /// rounding (the tiles' own format). `sentil`'s padded twin writes the
-    /// sentinel bits into every row at or past `live`, which no live key
-    /// reads.
+    /// values a row, `q8_0_planes`' packing — with the f16 rounding of the
+    /// dequantized values `code·d` (exact in f32), the tiles' own format.
+    /// `sentinel`'s padded twin writes the sentinel bits into every row at or
+    /// past `live`, which no live key reads.
     struct Q8Side {
         codes: Vec<u32>,
         scales: Vec<u16>,
-        vals: Vec<f32>,
         f16: Vec<u16>,
     }
 
@@ -1133,7 +1117,7 @@ mod gate {
             let n = vals.len() / head;
             let mut codes = Vec::with_capacity(n * head / 4);
             let mut scales = Vec::with_capacity(n * head / 32);
-            let mut deq = Vec::with_capacity(vals.len());
+            let mut f16 = Vec::with_capacity(vals.len());
             for row in 0..n {
                 let blocks: Vec<Q8Block> = vals[row * head..(row + 1) * head]
                     .chunks(32)
@@ -1146,32 +1130,33 @@ mod gate {
                     let d = half_to_f32(b.d);
                     for &c in &b.q {
                         // The one product the format takes, exact in f32.
-                        deq.push(f32::from(c) * d);
+                        f16.push(f32_to_f16_bits(f32::from(c) * d));
                     }
                 }
             }
-            Q8Side {
-                f16: deq.iter().map(|&v| f32_to_f16_bits(v)).collect(),
-                codes,
-                scales,
-                vals: deq,
-            }
+            Q8Side { codes, scales, f16 }
         }
 
-        /// The planes with every row at or past `live` the sentinel bits.
+        /// The planes with every row at or past `live` the sentinel bits, in
+        /// every key head: the planes are `[n_kv][ctx][head]`, so a key
+        /// head's dead rows are `live..ctx` of its own plane.
         fn sentinel(&self, head: usize, ctx: usize, live: usize) -> (Vec<u32>, Vec<u16>) {
             let (mut q, mut d) = (self.codes.clone(), self.scales.clone());
-            for row in live..ctx {
-                let (qw, sw) = (row * head / 4, row * head / 32);
-                q[qw..qw + head / 4].fill(SENTINEL_Q8_CODE);
-                d[sw..sw + head / 32].fill(SENTINEL_Q8_SCALE);
+            let n_kv = q.len() / (ctx * head / 4);
+            for kh in 0..n_kv {
+                for row in kh * ctx + live..(kh + 1) * ctx {
+                    let (qw, sw) = (row * head / 4, row * head / 32);
+                    q[qw..qw + head / 4].fill(SENTINEL_Q8_CODE);
+                    d[sw..sw + head / 32].fill(SENTINEL_Q8_SCALE);
+                }
             }
             (q, d)
         }
     }
 
-    /// The q8 cache of one layer: the four planes (and their sentinel twins)
-    /// on the card, and the host's two views of the values.
+    /// The q8 cache of one layer: the four planes and their sentinel twins
+    /// on the card, and the synthesized f16 cache of the dequantized values
+    /// (the bit anchors' twin launches).
     struct Q8Cache {
         kq: DeviceBuffer<u32>,
         kd: DeviceBuffer<u16>,
@@ -1181,12 +1166,8 @@ mod gate {
         knd: DeviceBuffer<u16>,
         vnq: DeviceBuffer<u32>,
         vnd: DeviceBuffer<u16>,
-        /// The synthesized f16 cache of the dequantized values (the mma and
-        /// prefill bit anchors' twin launch).
         k16: DeviceBuffer<u16>,
         v16: DeviceBuffer<u16>,
-        kf: Vec<f32>,
-        vf16: Vec<f32>,
     }
 
     impl Q8Cache {
@@ -1211,8 +1192,6 @@ mod gate {
                 vnd: DeviceBuffer::from_host(stream, &vnd)?,
                 k16: DeviceBuffer::from_host(stream, &ks.f16)?,
                 v16: DeviceBuffer::from_host(stream, &vs.f16)?,
-                kf: ks.vals,
-                vf16: from16(&vs.f16),
             })
         }
 
@@ -1239,18 +1218,9 @@ mod gate {
         }
     }
 
-    /// `from16` is in the qwen35 gate; a local twin keeps this gate's helpers
-    /// one place.
-    fn from16(v: &[u16]) -> Vec<f32> {
-        v.iter().map(|&h| half_to_f32(h)).collect()
-    }
-
     /// One launch of `m` query rows of the q8 decode pass over the four
-    /// planes, into fresh scratch, read back.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the kernel, the stream and sink, the query and counts, the planes, the geometry, the pass"
-    )]
+    /// planes (`use_sentinel`: their sentinel twins), into fresh scratch,
+    /// read back.
     fn run_once_q8(
         k: &FlashGqaKernels,
         (stream, fault): (&CudaStream, FaultSink),
@@ -1258,7 +1228,6 @@ mod gate {
         n_keys: &DeviceBuffer<u32>,
         c: &Q8Cache,
         g: &Geom,
-        mma: bool,
         use_sentinel: bool,
     ) -> Result<Vec<f32>, GateError> {
         let (n_head, m) = (g.n_kv * GROUP, n_keys.len());
@@ -1288,7 +1257,6 @@ mod gate {
                 fault,
                 y: &mut y,
             },
-            mma,
         )?;
         stream.synchronize()?;
         Ok(y.to_host_vec(stream)?)
@@ -1338,11 +1306,11 @@ mod gate {
         Ok(y.to_host_vec(stream)?)
     }
 
-    /// The q8_0 read path's clauses on one layer of a set (module doc): both
-    /// decode passes and the prefill launch over the cache's Q8_0 form —
-    /// rerun, sentinel padding, the scalar pass's band, the mma pass's and
-    /// the prefill's bit identity with their f16 twins on the synthesized
-    /// cache; `layer0` adds the prefill-shape rows, the fault and the graphs.
+    /// The q8_0 read path's clauses on one layer of a set (module doc): the
+    /// decode pass and the prefill launch over the cache's Q8_0 form — a
+    /// rerun, the sentinel padding and bit identity with their f16 twins on
+    /// the synthesized cache; `layer0` adds the prefill-shape rows, the fault,
+    /// the graphs and the refusal.
     #[allow(
         clippy::too_many_arguments,
         reason = "the kernels, the card, the layer's query and cache values, the geometry, the flags"
@@ -1368,53 +1336,23 @@ mod gate {
         let qd = DeviceBuffer::from_host(stream, q)?;
         let nk = DeviceBuffer::from_host(stream, &[u32::try_from(live)?])?;
         let mut ok = true;
-        for mma in [false, true] {
-            let name = if mma { "mma" } else { "scalar" };
-            let y = run_once_q8(k, run, &qd, &nk, &c, g, mma, false)?;
-            let y2 = run_once_q8(k, run, &qd, &nk, &c, g, mma, false)?;
-            let ys = run_once_q8(k, run, &qd, &nk, &c, g, mma, true)?;
-            let (rerun, sentinel) = (bits_equal(&y, &y2), bits_equal(&y, &ys));
-            let mut pass_ok = rerun && sentinel;
-            if mma {
-                // The twin on the synthesized f16 cache: the same bits.
-                let tw = run_once(k, run, &qd, &nk, (&c.k16, &c.v16), g, mma)?;
-                let twin_same = bits_equal(&y, &tw);
-                pass_ok &= twin_same;
-                println!(
-                    "flash q8 set={label} layer={l} pass={name} keys={live}: = the f16 mma twin \
-                     on the synthesized f16 cache bit for bit {twin_same} {}",
-                    verdict(pass_ok)
-                );
-            } else {
-                // The exact attention of the scalar pass's oracle: the
-                // dequantized keys, the f16-rounded dequantized values.
-                let mut worst = 0.0f64;
-                let mut band = true;
-                for h in 0..n_head {
-                    let plane = (h / GROUP) * g.ctx * HEAD;
-                    let ex = exact(
-                        &q[h * HEAD..(h + 1) * HEAD],
-                        &c.kf[plane..plane + live * HEAD],
-                        &c.vf16[plane..plane + live * HEAD],
-                        live,
-                        g.scale,
-                    );
-                    for d in 0..HEAD {
-                        let e = (f64::from(y[h * HEAD + d]) - ex.o[d]).abs();
-                        worst = worst.max(e / ex.bound_ours[d]);
-                        band &= e <= ex.bound_ours[d];
-                    }
-                }
-                pass_ok &= band;
-                println!(
-                    "flash q8 set={label} layer={l} pass={name} keys={live} ctx={}: measured/bound \
-                     {worst:.3e} band={band} rerun={rerun} sentinel_same={sentinel} {}",
-                    g.ctx,
-                    verdict(pass_ok)
-                );
-            }
-            ok &= pass_ok;
-        }
+
+        // The decode pass: bit for bit the twin on the synthesized f16 cache,
+        // a rerun and the sentinel padding the same bits.
+        let y = run_once_q8(k, run, &qd, &nk, &c, g, false)?;
+        let y2 = run_once_q8(k, run, &qd, &nk, &c, g, false)?;
+        let ys = run_once_q8(k, run, &qd, &nk, &c, g, true)?;
+        let tw = run_once(k, run, &qd, &nk, (&c.k16, &c.v16), g, true)?;
+        let (rerun, sentinel) = (bits_equal(&y, &y2), bits_equal(&y, &ys));
+        let twin_same = bits_equal(&y, &tw);
+        let dec_ok = rerun && sentinel && twin_same;
+        println!(
+            "flash q8 set={label} layer={l} pass=mma keys={live} ctx={}: = the f16 mma twin on the \
+             synthesized f16 cache bit for bit {twin_same} rerun={rerun} sentinel_same={sentinel} {}",
+            g.ctx,
+            verdict(dec_ok)
+        );
+        ok &= dec_ok;
 
         // The prefill launch: bit for bit the twin on the synthesized cache,
         // a rerun and the sentinel padding the same bits.
@@ -1435,36 +1373,32 @@ mod gate {
 
         if layer0 {
             // The prefill shape: one launch of ROWS rotated rows, each row bit
-            // for bit its one-row launch, both passes.
+            // for bit its one-row launch.
             let rows = rotated_rows(q, n_head);
             let limits = spread_counts(live)?;
             let rd = DeviceBuffer::from_host(stream, &rows.concat())?;
             let ld = DeviceBuffer::from_host(stream, &limits)?;
-            for mma in [false, true] {
-                let name = if mma { "mma" } else { "scalar" };
-                let all = run_once_q8(k, run, &rd, &ld, &c, g, mma, false)?;
-                let mut same = true;
-                for (t, row) in rows.iter().enumerate() {
-                    let one = run_once_q8(
-                        k,
-                        run,
-                        &DeviceBuffer::from_host(stream, row)?,
-                        &DeviceBuffer::from_host(stream, &limits[t..=t])?,
-                        &c,
-                        g,
-                        mma,
-                        false,
-                    )?;
-                    same &= bits_equal(&all[t * n_head * HEAD..(t + 1) * n_head * HEAD], &one);
-                }
-                println!(
-                    "flash q8 rows pass={name} m={ROWS} keys={limits:?} ctx={}: each row = its \
-                     one-row launch bit for bit {same} {}",
-                    g.ctx,
-                    verdict(same)
-                );
-                ok &= same;
+            let all = run_once_q8(k, run, &rd, &ld, &c, g, false)?;
+            let mut same = true;
+            for (t, row) in rows.iter().enumerate() {
+                let one = run_once_q8(
+                    k,
+                    run,
+                    &DeviceBuffer::from_host(stream, row)?,
+                    &DeviceBuffer::from_host(stream, &limits[t..=t])?,
+                    &c,
+                    g,
+                    false,
+                )?;
+                same &= bits_equal(&all[t * n_head * HEAD..(t + 1) * n_head * HEAD], &one);
             }
+            println!(
+                "flash q8 rows pass=mma m={ROWS} keys={limits:?} ctx={}: each row = its one-row \
+                 launch bit for bit {same} {}",
+                g.ctx,
+                verdict(same)
+            );
+            ok &= same;
 
             // The refusal path: rows 3 and 5 of the eight-row launch.
             let (bad_hi, bad_zero) = (3usize, 5usize);
@@ -1472,24 +1406,14 @@ mod gate {
             bad[bad_hi] = u32::try_from(g.ctx + 1)?;
             bad[bad_zero] = 0;
             let bd = DeviceBuffer::from_host(stream, &bad)?;
-            let clean = run_once_q8(k, run, &rd, &ld, &c, g, false, false)?;
             let before = gpu.fault()?;
-            let yb = run_once_q8(
-                k,
-                (stream, gpu.layer_sink(13)?),
-                &rd,
-                &bd,
-                &c,
-                g,
-                false,
-                false,
-            )?;
+            let yb = run_once_q8(k, (stream, gpu.layer_sink(13)?), &rd, &bd, &c, g, false)?;
             let raised = gpu.take_fault()?;
             let want = Some(Fault::at(13, FaultSite::KeyCount));
             let w = n_head * HEAD;
             let (mut others, mut nan) = (true, true);
             for r in 0..ROWS {
-                let (a, b) = (&clean[r * w..(r + 1) * w], &yb[r * w..(r + 1) * w]);
+                let (a, b) = (&all[r * w..(r + 1) * w], &yb[r * w..(r + 1) * w]);
                 if r == bad_hi || r == bad_zero {
                     nan &= b.iter().all(|v| v.is_nan());
                 } else {
@@ -1498,8 +1422,9 @@ mod gate {
             }
             let fault_ok = before.is_none() && raised == want && nan && others;
             println!(
-                "flash q8 fault: counts {} (past ctx {}) and 0 at rows {bad_hi}, {bad_zero}: word \
-                 {raised:?} (want {want:?}), those rows NaN {nan}, other rows bit-identical {others} {}",
+                "flash q8 fault pass=mma: counts {} (past ctx {}) and 0 at rows {bad_hi}, \
+                 {bad_zero}: word {raised:?} (want {want:?}), those rows NaN {nan}, other rows \
+                 bit-identical {others} {}",
                 g.ctx + 1,
                 g.ctx,
                 verdict(fault_ok)
@@ -1508,51 +1433,45 @@ mod gate {
 
             // The captured decode launch (two nodes) and prefill launch (one
             // node), replaying the eager bits.
-            for mma in [false, true] {
-                let name = if mma { "mma" } else { "scalar" };
-                let (mut pv, mut pms, mut yg) = (
-                    DeviceBuffer::<f32>::zeroed(stream, partials_v_len(ROWS, n_head))?,
-                    DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, n_head))?,
-                    DeviceBuffer::<f32>::zeroed(stream, ROWS * n_head * HEAD)?,
-                );
-                let (kq, kd, vq, vd) = c.planes();
-                let graph = gpu.capture(|s| {
-                    k.enqueue_pass_q8(
-                        s,
-                        GqaQ8Args {
-                            q: &rd,
-                            kq,
-                            kd,
-                            vq,
-                            vd,
-                            n_keys: &ld,
-                            scale: g.scale,
-                            n_kv: g.n_kv,
-                            ctx: g.ctx,
-                            m: ROWS,
-                            part_v: &mut pv,
-                            part_ms: &mut pms,
-                            fault: gpu.unlabelled_sink(),
-                            y: &mut yg,
-                        },
-                        mma,
-                    )
-                })?;
-                graph.launch(stream)?;
-                stream.synchronize()?;
-                let eager = run_once_q8(k, run, &rd, &ld, &c, g, mma, false)?;
-                let same = bits_equal(&yg.to_host_vec(stream)?, &eager);
-                let nodes = graph.node_count();
-                let graph_ok = same && nodes == 2;
-                println!(
-                    "flash q8 graph pass={name} m={ROWS}: eager_vs_graph_bit_identical={same} \
-                     graph_nodes={nodes} {}",
-                    verdict(graph_ok)
-                );
-                ok &= graph_ok;
-            }
-            let mut yg = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
+            let (mut pv, mut pms, mut yg) = (
+                DeviceBuffer::<f32>::zeroed(stream, partials_v_len(ROWS, n_head))?,
+                DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, n_head))?,
+                DeviceBuffer::<f32>::zeroed(stream, ROWS * n_head * HEAD)?,
+            );
             let (kq, kd, vq, vd) = c.planes();
+            let graph = gpu.capture(|s| {
+                k.enqueue_pass_q8(
+                    s,
+                    GqaQ8Args {
+                        q: &rd,
+                        kq,
+                        kd,
+                        vq,
+                        vd,
+                        n_keys: &ld,
+                        scale: g.scale,
+                        n_kv: g.n_kv,
+                        ctx: g.ctx,
+                        m: ROWS,
+                        part_v: &mut pv,
+                        part_ms: &mut pms,
+                        fault: gpu.unlabelled_sink(),
+                        y: &mut yg,
+                    },
+                )
+            })?;
+            graph.launch(stream)?;
+            stream.synchronize()?;
+            let same = bits_equal(&yg.to_host_vec(stream)?, &all);
+            let nodes = graph.node_count();
+            let graph_ok = same && nodes == 2;
+            println!(
+                "flash q8 graph pass=mma m={ROWS}: eager_vs_graph_bit_identical={same} \
+                 graph_nodes={nodes} {}",
+                verdict(graph_ok)
+            );
+            ok &= graph_ok;
+            let mut yg = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
             let graph = gpu.capture(|s| {
                 kp.enqueue_q8(
                     s,
@@ -1607,7 +1526,6 @@ mod gate {
                     fault: unl,
                     y: &mut yr,
                 },
-                false,
             );
             let named = matches!(
                 &r,
@@ -2016,7 +1934,6 @@ mod gate {
             gpu.device_name()?
         );
         let mut ok = true;
-        let mut graph_done = false;
         let mut grid_done = false;
         for (label, man) in step_sets()? {
             let mut rs = [Ratios::default(), Ratios::default()];
@@ -2173,58 +2090,13 @@ mod gate {
                     set_ok &= prefill_rows(&kp, &gpu, &q, &inp, &kf, &vf, live, &g)?;
                 }
 
-                // The q8_0 read path (module doc): every layer's three
-                // entries over the cache's Q8_0 form, layer 0's extras once a
-                // set.
+                // The q8_0 read path (module doc): every layer's two entries
+                // over the cache's Q8_0 form, layer 0's extras once a set.
                 set_ok &= flash_q8_layer(&k, &kp, &gpu, &q, &kf, &vf, live, &g, label, l, l == 0)?;
 
-                if !graph_done {
-                    for (pass, mma) in [false, true].into_iter().enumerate() {
-                        let mut pv =
-                            DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?;
-                        let mut pms =
-                            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
-                        let mut yg = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
-                        let graph = gpu.capture(|s| {
-                            k.enqueue_pass(
-                                s,
-                                GqaArgs {
-                                    q: &inp.q,
-                                    kc: &inp.kc,
-                                    vc: &inp.vc,
-                                    n_keys: &inp.n_keys,
-                                    scale,
-                                    n_kv,
-                                    ctx,
-                                    m: 1,
-                                    part_v: &mut pv,
-                                    part_ms: &mut pms,
-                                    fault: gpu.unlabelled_sink(),
-                                    y: &mut yg,
-                                },
-                                mma,
-                            )
-                        })?;
-                        graph.launch(stream)?;
-                        stream.synchronize()?;
-                        let same = bits_equal(&yg.to_host_vec(stream)?, &ys[pass]);
-                        let nodes = graph.node_count();
-                        let pass_ok = same && nodes == 2;
-                        println!(
-                            "graph op={}+gqa_flash_merge set={label} layer={l} segments={} \
-                             eager_vs_graph_bit_identical={same} graph_nodes={nodes} {}",
-                            if mma {
-                                "gqa_flash_seg_mma"
-                            } else {
-                                "gqa_flash_seg"
-                            },
-                            SEGMENTS,
-                            verdict(pass_ok)
-                        );
-                        ok &= pass_ok;
-                    }
-                    graph_done = true;
-                }
+                // The grid clause, once: its capture at the set's own height
+                // is also the captured launch's clause (two nodes, the eager
+                // bits).
                 if !grid_done {
                     ok &= grid_heights(&k, &gpu, &inp, (&kf, &vf), (&kb, &vb), &ys, live, &g)?;
                     grid_done = true;

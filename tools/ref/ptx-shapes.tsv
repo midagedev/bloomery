@@ -8,10 +8,6 @@
 # binary          entry                              spill  jit_local
 
 # generate_ds41 (--features gpu,deepseek41)
-# PIN(2026-10-03): the two packed scalar q8 segment passes carry 16 jit_local bytes a thread the f16
-# twins do not: their staging's three-value load (the K and V code words and the V scale of one
-# tile word) does not fully fit the registers the 128- and 64-thread blocks give it, and the JIT
-# parks 16 bytes in local; spill stays 0. Every other q8 entry matches its twin's 0/0.
 generate_ds41   add                                      0           0
 generate_ds41   argmax_fault                             0           0
 generate_ds41   argmax_finite_fault                      0           0
@@ -141,26 +137,19 @@ generate_ds41   gqa_flash_merge_256                      0           0
 generate_ds41   gqa_flash_seg                            0           0
 generate_ds41   gqa_flash_seg_256                        0           0
 generate_ds41   gqa_flash_seg_256_p2                     0           0
-generate_ds41   gqa_flash_seg_256_p2_q8                  0          16
 generate_ds41   gqa_flash_seg_256_p4                     0           0
-generate_ds41   gqa_flash_seg_256_p4_q8                  0          16
 generate_ds41   gqa_flash_seg_256_p4_sel                 0           0
-generate_ds41   gqa_flash_seg_256_q8                     0           0
 generate_ds41   gqa_flash_seg_mma                        0           0
 generate_ds41   gqa_flash_seg_mma_256                    0           0
 generate_ds41   gqa_flash_seg_mma_256_p4                 0           0
-generate_ds41   gqa_flash_seg_mma_256_p4_q8              0           0
 generate_ds41   gqa_flash_seg_mma_256_p4_sel             0           0
 generate_ds41   gqa_flash_seg_mma_256_q8                 0           0
 generate_ds41   gqa_flash_seg_mma_q8                     0           0
-generate_ds41   gqa_flash_seg_q8                         0           0
 generate_ds41   gqa_out_gate_f32                         0           0
 generate_ds41   gqa_prefill_flash                        0           0
 generate_ds41   gqa_prefill_flash_256                    0           0
 generate_ds41   gqa_prefill_flash_256_p2                 0           0
-generate_ds41   gqa_prefill_flash_256_p2_q8              0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
-generate_ds41   gqa_prefill_flash_256_p4_q8              0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_q8                     0           0
 generate_ds41   grouped_tiles                            0           0
@@ -341,26 +330,19 @@ gate_e2e   gqa_flash_merge_256                      0           0
 gate_e2e   gqa_flash_seg                            0           0
 gate_e2e   gqa_flash_seg_256                        0           0
 gate_e2e   gqa_flash_seg_256_p2                     0           0
-gate_e2e   gqa_flash_seg_256_p2_q8                  0          16
 gate_e2e   gqa_flash_seg_256_p4                     0           0
-gate_e2e   gqa_flash_seg_256_p4_q8                  0          16
 gate_e2e   gqa_flash_seg_256_p4_sel                 0           0
-gate_e2e   gqa_flash_seg_256_q8                     0           0
 gate_e2e   gqa_flash_seg_mma                        0           0
 gate_e2e   gqa_flash_seg_mma_256                    0           0
 gate_e2e   gqa_flash_seg_mma_256_p4                 0           0
-gate_e2e   gqa_flash_seg_mma_256_p4_q8              0           0
 gate_e2e   gqa_flash_seg_mma_256_p4_sel             0           0
 gate_e2e   gqa_flash_seg_mma_256_q8                 0           0
 gate_e2e   gqa_flash_seg_mma_q8                     0           0
-gate_e2e   gqa_flash_seg_q8                         0           0
 gate_e2e   gqa_out_gate_f32                         0           0
 gate_e2e   gqa_prefill_flash                        0           0
 gate_e2e   gqa_prefill_flash_256                    0           0
 gate_e2e   gqa_prefill_flash_256_p2                 0           0
-gate_e2e   gqa_prefill_flash_256_p2_q8              0           0
 gate_e2e   gqa_prefill_flash_256_p4                 0           0
-gate_e2e   gqa_prefill_flash_256_p4_q8              0           0
 gate_e2e   gqa_prefill_flash_256_q8                 0           0
 gate_e2e   gqa_prefill_flash_q8                     0           0
 gate_e2e   grouped_tiles                            0           0

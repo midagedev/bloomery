@@ -113,14 +113,15 @@
 //!
 //! - (v) the q8_0 cache arm (`BLOOMERY_QWEN3_KV=q8_0`, the seat's
 //!   `--cache-type-k q8_0`): its own models, each dropped before the clause
-//!   returns — the budget's census-free relations (the plan's KV term
-//!   exactly 17/32 of the f16 term's, the auto context search never below
-//!   the f16 answer), the resident bytes' derived drop, {`Q8_IDS`} prose ids
-//!   stepped, prefilled on the pass path and replayed through the captured
-//!   step graph leaving the same planes and logits bit for bit, and row 0's
-//!   dequantized values within each 32-value block's own quantization step
-//!   of the f16 model's row 0 (bounds derived at runtime, no measured band);
-//!   the later rows' compounding distance prints as a diagnostic.
+//!   returns — the plan's KV term exactly 17/32 of the f16 term's
+//!   (census-free), {`Q8_IDS`} prose ids stepped, prefilled on the pass path
+//!   and replayed through the captured step graph leaving the same planes
+//!   and logits bit for bit, and row 0's dequantized values within each
+//!   32-value block's own quantization step of the f16 model's row 0 (bounds
+//!   derived at runtime, no measured band); the later rows' compounding
+//!   distance prints as a diagnostic. The auto context search under the two
+//!   formats and the resident bytes' drop are `gate_qwen3_serve`'s
+//!   (`q8_ctx_never_below_the_f16_answer`, `q8_resident_drops_by_the_planes`).
 //! - (o) the placed load: the file planned on device 0 under a card budget
 //!   of [`PLACED_BUDGET`] (`shared/qwen3moe_place.rs`, the CLI's and the
 //!   seat's planner), which must leave routed experts both on the card and
@@ -207,6 +208,10 @@ fn main() -> std::process::ExitCode {
 mod taps;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/flash_grid.rs"]
+mod flash_grid;
+
+#[cfg(feature = "gpu")]
 #[path = "shared/qwen3moe_place.rs"]
 #[allow(
     dead_code,
@@ -216,15 +221,14 @@ mod q3place;
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use super::flash_grid::flash_grids;
     use super::q3place::{self, PlaceQ3};
     use super::taps;
     use app::Session;
-    use bloomery_gpu::NodeInfo;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{Body, KvQ8, KvQ8Host, PrefillPath};
     use bloomery_gpu::flash_gqa::HEAD;
-    use bloomery_gpu::flash_gqa::SEGMENTS;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel, Slots};
@@ -710,41 +714,9 @@ mod gate {
         // are not the tensor-core ones the load picks.
         let hp = m.body("gate_qwen3moe_e2e")?.hparams();
         let (n_kv, n_head, n_layer) = (hp.n_head_kv, hp.n_head, hp.n_layer);
-        let flash_grids = |nodes: &[NodeInfo], rows: usize| -> Result<(bool, String), GateError> {
-            let want = [
-                [u32::try_from(rows * n_kv * SEGMENTS)?, 1, 1],
-                [u32::try_from(rows * n_head)?, 1, 1],
-            ];
-            let (mut grids, mut count): ([Vec<[u32; 3]>; 2], [usize; 2]) = Default::default();
-            let mut names: Vec<&str> = Vec::new();
-            for kn in nodes.iter().filter_map(|n| n.kernel.as_ref()) {
-                let Some(i) = ["gqa_flash_seg", "gqa_flash_merge"]
-                    .iter()
-                    .position(|p| kn.name.starts_with(p))
-                else {
-                    continue;
-                };
-                count[i] += 1;
-                if !grids[i].contains(&kn.grid) {
-                    grids[i].push(kn.grid);
-                }
-                if !names.contains(&kn.name.as_str()) {
-                    names.push(kn.name.as_str());
-                }
-            }
-            if names != ["gqa_flash_seg_mma", "gqa_flash_merge"] {
-                println!("structure flash entries: {names:?}");
-            }
-            let ok = (0..2).all(|i| grids[i] == [want[i]] && count[i] == n_layer);
-            Ok((
-                ok,
-                format!(
-                    "seg {:?} x{} merge {:?} x{} (want [{:?}] and [{:?}] x{n_layer})",
-                    grids[0], count[0], grids[1], count[1], want[0], want[1]
-                ),
-            ))
-        };
-        let (flash_ok, got) = flash_grids(&m.step_graph_nodes()?, 1)?;
+        let names = ["gqa_flash_seg_mma", "gqa_flash_merge"];
+        let (flash_ok, got) =
+            flash_grids(&m.step_graph_nodes()?, (1, n_kv, n_head), n_layer, names)?;
         pass &= flash_ok;
         println!("structure flash grid m=1 {got} {}", verdict(flash_ok));
         let t = Instant::now();
@@ -771,7 +743,7 @@ mod gate {
                 verdict(ok)
             );
             pass &= ok;
-            let (flash_ok, got) = flash_grids(&list, rows)?;
+            let (flash_ok, got) = flash_grids(&list, (rows, n_kv, n_head), n_layer, names)?;
             println!(
                 "structure prefill flash grid m={rows} {got} {}",
                 verdict(flash_ok)
@@ -1208,9 +1180,7 @@ mod gate {
     /// (v) (module doc): the cache lever's `q8_0` arm, on its own models
     /// (each dropped before the clause returns). The budget relation is
     /// host-only and census-free: the plan's KV term at q8_0 is the f16
-    /// term's 17/32 exactly (17/16 B a value against 2), and the auto
-    /// context search never answers below the f16 answer. The load's
-    /// resident bytes drop by the planes' derived delta. The q8 model runs
+    /// term's 17/32 exactly (17/16 B a value against 2). The q8 model runs
     /// the prose's first ids: eager steps, the pass prefill of the same ids
     /// and the graph replay all leave the same planes and logits bit for
     /// bit (the arm's own consistency, the (p) and (r) contracts on the q8
@@ -1224,28 +1194,16 @@ mod gate {
         let mut ok = q8_budget(&file)?;
         drop(file);
         let ids = prose(Q8_IDS)?;
-        let (f16_row0, f16_resident, hp) = {
+        let (f16_row0, hp) = {
             let mut m = open(CTX, StepMode::Eager, KvQ8::F16)?;
-            let (r, hp) = (m.resident_bytes(), m.body("q8")?.hparams().clone());
+            let hp = m.body("q8")?.hparams().clone();
             m.reset()?;
             for &id in &ids {
                 m.step(&[id])?;
             }
-            (m.kv_rows(1)?, r, hp)
+            (m.kv_rows(1)?, hp)
         };
         let mut m = open(CTX, StepMode::Eager, KvQ8::Q8)?;
-        let resident = m.resident_bytes();
-        // The planes' delta: n_layer layers, each two f16 planes against the
-        // two-plane layout's 17/16 B a value.
-        let values = hp.n_head_kv * CTX * hp.head_dim;
-        let delta = hp.n_layer * (2 * values * 2 - 2 * values * 17 / 16);
-        let bytes_ok = f16_resident.saturating_sub(resident) == delta;
-        println!(
-            "q8 load: resident_bytes={resident} (f16 {f16_resident} less the planes' derived \
-             {delta} B) {}",
-            verdict(bytes_ok)
-        );
-        ok &= bytes_ok;
         m.reset()?;
         let mut step_tok = 0;
         for &id in &ids {
@@ -1286,8 +1244,8 @@ mod gate {
         Ok(ok)
     }
 
-    /// (v)'s budget relations, host-only: the plan's KV term and the auto
-    /// context search under the two formats.
+    /// (v)'s budget relation, host-only: the plan's KV term under the two
+    /// formats.
     fn q8_budget(file: &gguf::Split) -> Result<bool, GateError> {
         let levers = PlanLevers::default();
         let f16_kv = PlaceQ3::qwen3(file, Place::parse("cuda0")?, CTX, KvQ8::F16)?
@@ -1303,30 +1261,7 @@ mod gate {
             "q8 budget: plan kv_bytes f16 {f16_kv} q8_0 {q8_kv} (17/32 exactly) {}",
             verdict(term)
         );
-        let s16 = q3place::whole_ctx_qwen3(file, q3place::CTX_GRAN, KvQ8::F16)?;
-        let sq8 = q3place::whole_ctx_qwen3(file, q3place::CTX_GRAN, KvQ8::Q8)?;
-        let search = match (s16, sq8) {
-            (Some(a), Some(b)) => {
-                println!(
-                    "q8 budget: auto ctx f16 {a} q8_0 {b} of the trained context (census-free \
-                     relation, runtime values)"
-                );
-                b >= a
-            }
-            (None, None) => {
-                println!("q8 budget: the trained context fits both formats at the floor");
-                true
-            }
-            (a, b) => {
-                println!("q8 budget: the searches answered {a:?} and {b:?}");
-                false
-            }
-        };
-        println!(
-            "q8 budget: the search never answers below the f16 one {}",
-            verdict(search)
-        );
-        Ok(term && search)
+        Ok(term)
     }
 
     /// (v)'s row-0 clause: layer 0's first K and V row (the one row whose

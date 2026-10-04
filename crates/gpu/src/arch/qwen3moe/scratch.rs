@@ -367,6 +367,20 @@ pub(super) struct PrefillFlash<'a> {
     pub(super) y: &'a mut DeviceBuffer<f32>,
 }
 
+/// The named refusal of a flash a q8_0 cache has no entry for: its reads
+/// serve the eight-head layout's tensor-core passes only (the `_q8`
+/// paragraphs of `flash_gqa` and `flash_gqa_prefill`), and `pass` names the
+/// one asked for.
+fn q8_unserved(what: &'static str, flash: Flash, pass: &str) -> GpuError {
+    GpuError::shape(
+        what,
+        format!(
+            "a q8_0 cache's flash runs the eight-head layout's tensor-core pass only; asked for \
+             the {pass} pass at the {flash:?} layout"
+        ),
+    )
+}
+
 impl KvPlanes {
     /// The layer's planes of `d`'s shape in the `kv` format. Load-time only.
     pub(super) fn new(stream: &CudaStream, d: &Dims, kv: KvQ8) -> Result<KvPlanes, GpuError> {
@@ -607,8 +621,9 @@ impl KvPlanes {
     }
 
     /// The head-128 decode flash of `s`'s rows over these planes
-    /// ([`FlashGqaKernels::enqueue_pass`]'s f16 launch or its q8_0 twin's,
-    /// the tensor-core pass when `mma`).
+    /// ([`FlashGqaKernels::enqueue_pass`]'s f16 launch, the tensor-core pass
+    /// when `mma`, or its q8_0 twin's, which is that pass only: the scalar
+    /// pass on a q8_0 cache is refused by name).
     pub(super) fn flash_128(
         &mut self,
         flash: &FlashGqaKernels,
@@ -647,7 +662,7 @@ impl KvPlanes {
                 },
                 mma,
             ),
-            KvPlanes::Q8 { kq, kd, vq, vd } => flash.enqueue_pass_q8(
+            KvPlanes::Q8 { kq, kd, vq, vd } if mma => flash.enqueue_pass_q8(
                 stream,
                 GqaQ8Args {
                     q,
@@ -665,14 +680,19 @@ impl KvPlanes {
                     fault,
                     y,
                 },
-                mma,
             ),
+            KvPlanes::Q8 { .. } => Err(q8_unserved(
+                "qwen3moe::KvPlanes::flash_128",
+                Flash::Group,
+                "scalar",
+            )),
         }
     }
 
     /// The head-256 decode flash of `s`'s rows over these planes, the pass
-    /// `flash` names (the pairs' pass scalar only), the f16 launches or
-    /// their q8_0 twins'.
+    /// `flash` names (the pairs' pass scalar only), the f16 launches or, on
+    /// the eight-head layout's tensor-core pass, its q8_0 twin's; any other
+    /// pass on a q8_0 cache is refused by name.
     pub(super) fn flash_256(
         &mut self,
         k: &FlashGqaKernels,
@@ -751,7 +771,7 @@ impl KvPlanes {
                 },
                 n_head,
             ),
-            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Group) => k.enqueue_pass_256_q8(
+            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Group) if mma => k.enqueue_pass_256_q8(
                 stream,
                 GqaQ8Args {
                     q,
@@ -769,50 +789,12 @@ impl KvPlanes {
                     fault,
                     y,
                 },
-                mma,
             ),
-            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Quads) => k.enqueue_pass_256_p4_q8(
-                stream,
-                GqaQ8Args {
-                    q,
-                    kq,
-                    kd,
-                    vq,
-                    vd,
-                    n_keys,
-                    scale,
-                    n_kv,
-                    ctx,
-                    m,
-                    part_v,
-                    part_ms,
-                    fault,
-                    y,
-                },
-                n_head,
-                mma,
-            ),
-            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Pairs) => k.enqueue_pass_256_p2_q8(
-                stream,
-                GqaQ8Args {
-                    q,
-                    kq,
-                    kd,
-                    vq,
-                    vd,
-                    n_keys,
-                    scale,
-                    n_kv,
-                    ctx,
-                    m,
-                    part_v,
-                    part_ms,
-                    fault,
-                    y,
-                },
-                n_head,
-                mma,
-            ),
+            (KvPlanes::Q8 { .. }, flash) => Err(q8_unserved(
+                "qwen3moe::KvPlanes::flash_256",
+                flash,
+                if mma { "tensor-core" } else { "scalar" },
+            )),
         }
     }
 
@@ -874,7 +856,8 @@ impl KvPlanes {
     }
 
     /// The head-256 prefill flash of `s`'s rows over these planes, the pass
-    /// `flash` names, the f16 launches or their q8_0 twins'.
+    /// `flash` names, the f16 launches or, on the eight-head layout, its
+    /// q8_0 twin's; a packed layout on a q8_0 cache is refused by name.
     pub(super) fn prefill_256(
         &mut self,
         k: &FlashGqaPrefill,
@@ -960,42 +943,11 @@ impl KvPlanes {
                     y,
                 },
             ),
-            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Quads) => k.enqueue_256_p4_q8(
-                stream,
-                GqaPrefillQ8Args {
-                    q,
-                    kq,
-                    kd,
-                    vq,
-                    vd,
-                    n_keys,
-                    scale,
-                    n_head,
-                    n_kv,
-                    ctx,
-                    t,
-                    fault,
-                    y,
-                },
-            ),
-            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Pairs) => k.enqueue_256_p2_q8(
-                stream,
-                GqaPrefillQ8Args {
-                    q,
-                    kq,
-                    kd,
-                    vq,
-                    vd,
-                    n_keys,
-                    scale,
-                    n_head,
-                    n_kv,
-                    ctx,
-                    t,
-                    fault,
-                    y,
-                },
-            ),
+            (KvPlanes::Q8 { .. }, flash @ (Flash::Quads | Flash::Pairs)) => Err(q8_unserved(
+                "qwen3moe::KvPlanes::prefill_256",
+                flash,
+                "prefill",
+            )),
         }
     }
 

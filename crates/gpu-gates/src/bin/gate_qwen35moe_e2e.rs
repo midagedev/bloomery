@@ -182,7 +182,12 @@ fn main() -> std::process::ExitCode {
 mod q3place;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/flash_grid.rs"]
+mod flash_grid;
+
+#[cfg(feature = "gpu")]
 mod gate {
+    use super::flash_grid::flash_grids;
     use super::q3place::{self, PlaceQ3};
     use bloomery_gpu::NodeInfo;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
@@ -190,7 +195,6 @@ mod gate {
         Body35, Delta35Run, Gqa35Run, KvQ8, LayerKind35, Mixer35Run, Open35, PrefillPath,
         Qwen35moeModel, StoreHost,
     };
-    use bloomery_gpu::flash_gqa::SEGMENTS;
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::route_core::sigmoid;
@@ -497,45 +501,11 @@ mod gate {
     // ------------------------------------------------------ (s) structure
 
     /// The flash launches' grids in a captured step (module doc, (s) and
-    /// (k)): the segment pass `N_KV · SEGMENTS` blocks an attention layer —
-    /// the eight-head `_256` entries, one pack a key head — and the merge
-    /// `N_HEAD` blocks, one of each an attention layer, whatever the cache
-    /// height the load allocated; and each kind's distinct grids and node
-    /// count as the graph holds them, for the line. The entry names print
-    /// when they are not the tensor-core ones the load picks.
+    /// (k)): the eight-head `_256` entries, one pack a key head, at one row,
+    /// one segment pass and one merge an attention layer ([`flash_grids`]).
     fn flash_grid_ok(nodes: &[NodeInfo]) -> Result<(bool, String), GateError> {
-        let want = [
-            [u32::try_from(N_KV * SEGMENTS)?, 1, 1],
-            [u32::try_from(N_HEAD)?, 1, 1],
-        ];
-        let (mut grids, mut count): ([Vec<[u32; 3]>; 2], [usize; 2]) = Default::default();
-        let mut names: Vec<&str> = Vec::new();
-        for kn in nodes.iter().filter_map(|n| n.kernel.as_ref()) {
-            let Some(i) = ["gqa_flash_seg", "gqa_flash_merge"]
-                .iter()
-                .position(|p| kn.name.starts_with(p))
-            else {
-                continue;
-            };
-            count[i] += 1;
-            if !grids[i].contains(&kn.grid) {
-                grids[i].push(kn.grid);
-            }
-            if !names.contains(&kn.name.as_str()) {
-                names.push(kn.name.as_str());
-            }
-        }
-        if names != ["gqa_flash_seg_mma_256", "gqa_flash_merge_256"] {
-            println!("structure flash entries: {names:?}");
-        }
-        let ok = (0..2).all(|i| grids[i] == [want[i]] && count[i] == N_ATTN);
-        Ok((
-            ok,
-            format!(
-                "seg {:?} x{} merge {:?} x{} (want [{:?}] and [{:?}] x{N_ATTN})",
-                grids[0], count[0], grids[1], count[1], want[0], want[1]
-            ),
-        ))
+        let names = ["gqa_flash_seg_mma_256", "gqa_flash_merge_256"];
+        flash_grids(nodes, (1, N_KV, N_HEAD), N_ATTN, names)
     }
 
     fn structure(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
