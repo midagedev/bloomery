@@ -184,8 +184,11 @@ pub(super) struct LayerScratch {
     pub(super) moe: Option<MoeScratch>,
     pub(super) l_out: DeviceBuffer<f32>,
     /// Flash split partials: `Σ exp·V` per (query row, key segment), and
-    /// the `(running max, Σ exp)` pair beside it. Sized at load from the
-    /// cache height, so the split launch allocates nothing per step.
+    /// the `(running max, Σ exp)` pair beside it. Sized at load for the split
+    /// launch's segments over the cache (`flash::segments_for`: a fixed count,
+    /// or one on a cache the single launch serves), so the split launch
+    /// allocates nothing per step and the size does not grow with the
+    /// context.
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
     pub(super) g_f_rope_lo: Gather,

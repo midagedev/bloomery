@@ -7,6 +7,7 @@ use crate::flash::{
     FlashGeom, FlashInputs, FlashLatentArgs, FlashLatentQ8Args, FlashMergeArgs, FlashMergeQ8Args,
     FlashSegArgs,
 };
+use crate::flash_gqa::seg_span;
 use crate::head::Head;
 use crate::hybrid::{Boundary, HostExperts, Hybrid, SlotMap};
 use crate::model::kernels::{HeadsGeom, Q3kGemvHeadsPairArgs, Q8_0GemvHeadsArgs, StepKernels};
@@ -478,10 +479,11 @@ fn attn_flash(
             },
         )?;
         // Same reads as the single-block launch; the partials of the live
-        // segments out, plus the `(−inf, 0)` pair every segment past the
-        // live keys still writes so the merge can skip it.
+        // segments out (the count the cut leaves, `seg_span`'s), plus the
+        // `(−inf, 0)` pair every segment past the live keys still writes so
+        // the merge can skip it.
         let segs = crate::flash::segments_for(kv_l.rows());
-        let live = n_keys.div_ceil(crate::flash::seg_keys()).min(segs);
+        let live = n_keys.div_ceil(seg_span(n_keys, segs, crate::flash::seg_keys()));
         tick(
             i,
             obs,

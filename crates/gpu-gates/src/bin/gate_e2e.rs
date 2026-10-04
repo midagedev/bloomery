@@ -57,7 +57,11 @@
 //! - (2) graph mode reproduces the eager sequence token for token on every
 //!   prompt — the eager-equals-replay arm every step gate has — and the
 //!   captured chain holds no host node: its node kinds, as the driver lists
-//!   them, are printed and the host count is pinned at zero.
+//!   them, are printed and the host count is pinned at zero. The flash
+//!   launches' grids in the captured chain: every layer's segment pass
+//!   `SEGMENTS` blocks (one head group: the load pins the head count to
+//!   `MMA_ROWS`) and its merge one block a head, one of each a layer,
+//!   whatever the cache height.
 //! - (3) determinism: two eager runs give identical tables.
 //! - (4) a cache prepared by `GpuModel::seed_depth` leaves the next step at
 //!   the same position and live key count a decoded prompt of the same
@@ -75,6 +79,10 @@ fn main() {
 
 #[cfg(feature = "gpu")]
 use bloomery_gpu::Deepseek2Model;
+#[cfg(feature = "gpu")]
+use bloomery_gpu::flash::{MMA_ROWS, mma_groups};
+#[cfg(feature = "gpu")]
+use bloomery_gpu::flash_gqa::SEGMENTS;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::model::{Engine, StepMode};
 #[cfg(feature = "gpu")]
@@ -817,8 +825,9 @@ fn run() -> Result<(), GateError> {
     // The chain is kernels and copies: a host node would put a CPU callback
     // in every replay. The kinds as the driver lists them, the host count
     // pinned at zero.
+    let step_nodes = model.step_graph_nodes()?;
     let ([kernel, memcpy, memset, host], other) = count_kinds(
-        &model.step_graph_nodes()?,
+        &step_nodes,
         [
             sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL,
             sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY,
@@ -832,6 +841,41 @@ fn run() -> Result<(), GateError> {
         if host == 0 { "ok" } else { "FAIL" }
     );
     if host != 0 {
+        ok = false;
+    }
+    // The flash launches' grids at this cache height (module doc, (2)): each
+    // kind's distinct grids and node count as the graph holds them.
+    let n_layer = model.layers().len();
+    let want = [
+        [u32::try_from(mma_groups(MMA_ROWS) * SEGMENTS)?, 1, 1],
+        [u32::try_from(MMA_ROWS)?, 1, 1],
+    ];
+    let (mut grids, mut count): ([Vec<[u32; 3]>; 2], [usize; 2]) = Default::default();
+    for kn in step_nodes.iter().filter_map(|n| n.kernel.as_ref()) {
+        let Some(i) = ["flash_latent_mma", "flash_merge"]
+            .iter()
+            .position(|p| kn.name.starts_with(p))
+        else {
+            continue;
+        };
+        count[i] += 1;
+        if !grids[i].contains(&kn.grid) {
+            grids[i].push(kn.grid);
+        }
+    }
+    let flash_ok = (0..2).all(|i| grids[i] == [want[i]] && count[i] == n_layer);
+    println!(
+        "graph flash grid ctx_max={CTX_MAX} seg {:?} x{} merge {:?} x{} (want [{:?}] and \
+         [{:?}] x{n_layer}) {}",
+        grids[0],
+        count[0],
+        grids[1],
+        count[1],
+        want[0],
+        want[1],
+        if flash_ok { "ok" } else { "FAIL" }
+    );
+    if !flash_ok {
         ok = false;
     }
     if !same {
@@ -892,7 +936,8 @@ fn run() -> Result<(), GateError> {
              every prompt or misses it only inside MARGIN_FLOOR; fed the reference's own \
              path, it leaves the model's exact answer on that path at no more than \
              FORCED_PIN positions the exact margin was clear about; graph replay equals eager \
-             token for token at the pinned node count, none of them a host node; two eager \
+             token for token at the pinned node count, none of them a host node, every \
+             layer's flash at the fixed segment grid; two eager \
              runs are identical; a seeded cache leaves the step at the same position and key \
              count a decoded prompt does; and the two reference files agree with each other."
         );

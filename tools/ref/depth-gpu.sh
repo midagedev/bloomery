@@ -29,11 +29,9 @@
 #                        같은 임대 안에 번갈아 세우려고 있다(ab-decode.sh의 BLOOMERY_AB_ENVS와 같은 이유):
 #                        커널 선택처럼 프로세스 시작 때 한 번 읽히는 레버는 프로세스를 갈라야 갈린다.
 #                        변수 목록이 팔 이름에 붙으므로 평균 표에서 두 팔이 섞이지 않는다.
-#   <깊이>:<ctx>[:<n>]   우리 팔. ctx는 generate의 --ctx이고, 세그먼트 수를 정한다
-#                        (flash::segments_for(ctx) = ceil(ctx/seg_keys), seg_keys는 기본 텐서 코어
-#                        패스에서 64 — generate의 load 줄이
-#                        찍는다). ctx는 깊이가 아니라 캐시 높이라
-#                        죽은 세그먼트도 블록을 런치한다 — 그래서 ctx는 팔마다 명시한다.
+#   <깊이>:<ctx>[:<n>]   our arm. ctx is generate's --ctx, the cache height: it sizes the cache and the
+#                        partials, while the flash split grid is flash_gqa::SEGMENTS whatever the ctx. Each
+#                        arm names its ctx so it has the reference's shape (ctx = depth + n).
 #   ik:<깊이>            ik 팔. 깊이 0은 llama-bench의 평범한 tg N이고, 그 위는 -gp <깊이>,N이다.
 #                        llama-bench는 cparams.n_ctx = n_prompt + n_gen으로 스스로 ctx를 맞추므로
 #                        (examples/llama-bench/llama-bench.cpp:1046), 우리 팔의 ctx = 깊이+n이 같은 모양이다.

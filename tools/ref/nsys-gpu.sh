@@ -12,7 +12,7 @@
 # 그 안에서 토큰마다 그래프를 한 번씩 재생한다(model.rs `step`의 토큰 루프). 그러니 프로파일 안의
 # 재생은 P + (n-1)개이고, 마지막 재생이 깊이 P + n - 2의 디코드 스텝이다. "몇 개를 건너뛴다"를
 # 런치 수로 세면 틀린다 — 2026-09-22 실측: ncu가 54런치(= 스텝 하나라고 믿은 값)를 건너뛰고 잡은
-# "깊이 4096"은 깊이 2였고, 그리드(캐시 높이에서 나온다)는 깊이 0부터 528이라 증거가 못 됐다.
+# "깊이 4096"은 깊이 2였고, 그리드(그때는 캐시 높이에서 나왔다)는 깊이 0부터 528이라 증거가 못 됐다.
 # 이 러너는 재생마다 정확히 한 번 나오는 커널을 찾아 그것으로 경계를 긋고, 그 경계가 P + n - 1개인지
 # 스스로 확인한다. 아니면 표를 내지 않는다.
 #
@@ -29,8 +29,8 @@
 # 1 .. N - 1` of the same run. The boundary is named, not searched for: `embed_rows_q4k`, layer 0's
 # embedding gather, one launch per pass and per replay (arch/qwen3moe/dispatch.rs `layer`, embed =
 # slot 0); its count must be N or no table. C defaults to depth-qwen3moe.sh's height for the same
-# D (D + BLOOMERY_DECODE_N rounded up to 256; BLOOMERY_GEN_CTX fixes it), because the flash grid is
-# a function of C (flash_gqa::segments_for) and the table must be of the kernels that runner times.
+# D (D + BLOOMERY_DECODE_N rounded up to 256; BLOOMERY_GEN_CTX fixes it), so the table is of the
+# load that runner times; the flash grid does not depend on C (flash_gqa::SEGMENTS segments a row).
 # The seeded cache is a pattern, so routing differs from a real prompt's; the kernel shapes do not.
 # N >= 3, so that the control window is a replay. Each profile runs under BLOOMERY_ARM_BOUND
 # (seconds, default 900).

@@ -30,9 +30,28 @@
 //! variant stays frozen at its capture-time row. The depth cases add the one
 //! a key-split launch needs — a single graph, captured with one live
 //! segment, replayed at every key count up to a full cache and still
-//! byte-identical to the eager run there. The grid comes from the cache
-//! height; a grid derived from the key count passes every other arm and
-//! fails that one.
+//! byte-identical to the eager run there. A grid derived from the key count
+//! passes every other arm and fails that one.
+//!
+//! The split launch cuts every row into `flash_gqa::SEGMENTS` segments
+//! whatever the cache height, through `flash_gqa::seg_span` (the cut's one
+//! owner): [`seg_keys`]-key segments while `SEGMENTS` of them cover the row,
+//! so every count the depth and real cases run (at most 4,096 keys, under
+//! the 5,120 the default cut covers) is cut as before, bit for bit. Two
+//! clauses pin the cut. Grid at two heights: the split launch captured over
+//! the depth cache and over a tall copy of [`GRID_TALL_ROWS`] rows (the same
+//! key rows first, the f16 NaN pattern in the rest) and replayed at the depth
+//! counts — two kernel nodes each, the segment pass's grid
+//! `mma_groups(heads) · SEGMENTS` blocks and the merge's `heads` at both
+//! heights, the replays bit-identical to each other and to the eager launch.
+//! Deep counts, the only clause that reaches the cut past 5,120 keys: a
+//! synthetic cache of [`DEEP_ROWS`] rows, one-token launches at 5,120 (the
+//! last 64-key cut), 5,121 (the first past it), 8,193, 65,537 and 262,144
+//! keys within the split launch's band of the f64 reference, a rerun
+//! bit-identical, the NaN pattern in every row at or past the count (at
+//! 5,121 and 65,537) changing no bit, and one launch of eight tokens whose
+//! limits straddle 5,120 (and one at the cache's top) each token bit for bit
+//! its one-token launch.
 //!
 //! The q8_1 side output the attention folds into its last launch
 //! (`flash_latent_q8`, `flash_merge_q8`) refuses a query row whose output is
@@ -60,6 +79,8 @@ use bloomery_gpu::flash::{
     FlashMergeQ8Args, FlashSplitArgs, f32_to_f16_bits, mma_groups, partials_ms_len, partials_v_len,
     seg_keys, segments_for,
 };
+#[cfg(feature = "gpu")]
+use bloomery_gpu::flash_gqa::{SEGMENTS, seg_span};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::fused::{Q8ActHost, readback_q8act};
 #[cfg(feature = "gpu")]
@@ -148,6 +169,8 @@ fn run() -> Result<(), GateError> {
         mma_band: FLASH_MMA_BAND,
     };
     ok &= depth_cases(&gpu, &flash, &case)?;
+    ok &= grid_heights(&gpu, &flash, &case)?;
+    ok &= deep_counts(&gpu, &flash, dims, FLASH_MMA_BAND)?;
     ok &= side_quant_refusal(&gpu, &flash, &case)?;
     ok &= edge_values(&flash, stream)?;
     // This package's kernels, read off the PTX this executable embeds;
@@ -168,9 +191,12 @@ fn run() -> Result<(), GateError> {
         "PASSED: gate_p5 kv_append bits exact (incl. IEEE edges, ik cache bits equal); \
          the single-block flash within {FLASH_BAND} of the f64 reference on real layers \
          and on the depth and segment edges; the tensor-core split launch within its own \
-         {FLASH_MMA_BAND} band of the reference and of the single-block pass there; reruns \
-         bit-identical; padded NaN rows never read; one captured graph replays \
-         bit-identically at every key count; the flash kernels compile with no local depot"
+         {FLASH_MMA_BAND} band of the reference and of the single-block pass there, and \
+         of the reference past the 64-key cut to 262,144 keys; reruns bit-identical; \
+         padded NaN rows never read; one captured graph replays bit-identically at every \
+         key count; the split grid is the same at two cache heights; every token of a \
+         multi-token launch is its one-token launch; the flash kernels compile with no \
+         local depot"
     );
     Ok(())
 }
@@ -730,8 +756,8 @@ impl DepthInputs {
 /// The key counts the depth cases run at. 1/31/32/33 are the key-tile
 /// edges; seg-1/seg/seg+1 the segment edges a split launch adds; 1 and 31
 /// are also `n_keys` far below one segment with a tall cache. 4096 is a
-/// whole number of default-size segments and leaves the last segment of the
-/// 4160-row cache wholly empty.
+/// whole number of default-size segments and leaves every segment past the
+/// 64th wholly empty.
 #[cfg(feature = "gpu")]
 fn depth_key_counts(cache_rows: usize) -> Vec<usize> {
     let seg = seg_keys();
@@ -770,11 +796,11 @@ fn depth_cases(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool
     let d = DepthInputs::new(stream, case)?;
     let mut y_dev = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
     // This cache is tall enough to be cut into segments, so every case below
-    // runs the split launch. `segs` counts the whole cache, not the live
-    // keys: at small `n_keys` most segments are past the causal limit and
-    // must write their neutral partial without reading a row — every one of
-    // those rows holds the f16 NaN pattern, so a segment that read one would
-    // fail the finiteness check inside `max_rel_err`.
+    // runs the split launch. `segs` is the launch's fixed count, not the
+    // live keys': at small `n_keys` most segments are past the causal limit
+    // and must write their neutral partial without reading a row — every
+    // row past the keys holds the f16 NaN pattern, so a segment that read
+    // one would fail the finiteness check inside `max_rel_err`.
     let segs = segments_for(depth_rows);
     let seg = seg_keys();
     let mut part = Partials::zeroed(stream, n_heads, depth_rows)?;
@@ -861,7 +887,7 @@ fn depth_report(p: &DepthLines, n_keys: usize, s: &SplitDepth) -> bool {
         && s.replay_same;
     println!(
         "shape op=flash_latent_depth n_keys={n_keys} m=1 seg_keys={seg} segs={segs} groups={groups} live_segs={} nan_pad_rows={} band={mma_band:.3e} max_rel_err={:.3e} single_band={band:.3e} single_launch_rel={:.3e} split_vs_single={:.3e} bit_identical_rerun={} graph_nodes={graph_nodes} replay_bit_identical={} {}",
-        n_keys.div_ceil(seg),
+        n_keys.div_ceil(seg_span(n_keys, segs, seg)),
         depth_rows - n_keys,
         s.rel,
         s.one_rel,
@@ -916,6 +942,206 @@ fn depth_split(
         rerun_same,
         replay_same,
     })
+}
+
+// ----------------------------------------------------- the cut, two clauses
+
+/// The grid clause's tall copy (module doc): a cache height whose old cut
+/// would have launched 1,024 segments.
+#[cfg(feature = "gpu")]
+const GRID_TALL_ROWS: usize = 65_536;
+
+/// The grid clause (module doc): the split launch captured over the depth
+/// cache and over its tall copy, each captured at one live key and replayed
+/// at every depth count. Each graph holds two kernel nodes, the segment
+/// pass's grid `mma_groups(heads) · SEGMENTS` and the merge's `heads` at both
+/// heights, and the two replays are bit for bit the eager launch over the
+/// depth cache at every count.
+#[cfg(feature = "gpu")]
+fn grid_heights(gpu: &Gpu, flash: &FlashKernels, case: &DepthCase) -> Result<bool, GateError> {
+    let DepthCase {
+        dims, cache_rows, ..
+    } = *case;
+    let (n_heads, latent, width) = (dims.heads, dims.latent_dims, dims.width);
+    let stream = gpu.stream();
+    let d = DepthInputs::new(stream, case)?;
+    // The depth cache's rows first (its keys, then its NaN pad), the NaN
+    // pattern in every row past them.
+    let mut tall_bits = vec![0x7e00u16; GRID_TALL_ROWS * width];
+    tall_bits[..d.cache_bits.len()].copy_from_slice(&d.cache_bits);
+    let tall = DeviceTensor::upload(stream, &tall_bits, GRID_TALL_ROWS, width)?;
+    let want_seg = [u32::try_from(mma_groups(n_heads) * SEGMENTS)?, 1, 1];
+    let want_merge = [u32::try_from(n_heads)?, 1, 1];
+    let mut n_keys_dev = DeviceBuffer::from_host(stream, &[1u32])?;
+    let mut graphs = Vec::with_capacity(2);
+    let mut shapes = Vec::with_capacity(2);
+    let mut outs = Vec::with_capacity(2);
+    for (cache, rows) in [(&d.cache, cache_rows), (&tall, GRID_TALL_ROWS)] {
+        let mut part = Partials::zeroed(stream, n_heads, rows)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
+        let inputs = FlashInputs {
+            q: &d.q_dev,
+            kv: cache,
+            n_keys_buf: &n_keys_dev,
+            kq_scale: dims.kq_scale,
+            geom: dims.geom(1),
+        };
+        let graph = split_graph(gpu, flash, inputs, &mut part, &mut y)?;
+        let nodes = graph.nodes()?;
+        let grid = |prefix: &str| {
+            nodes.iter().find_map(|n| {
+                n.kernel
+                    .as_ref()
+                    .filter(|kn| kn.name.starts_with(prefix))
+                    .map(|kn| kn.grid)
+            })
+        };
+        let two = nodes.len() == 2 && nodes.iter().all(|n| n.kernel.is_some());
+        shapes.push((two, grid("flash_latent_mma"), grid("flash_merge")));
+        graphs.push((graph, part, y));
+    }
+    let mut eager_part = Partials::zeroed(stream, n_heads, cache_rows)?;
+    let mut eager_y = DeviceBuffer::<f32>::zeroed(stream, n_heads * latent)?;
+    let counts = depth_key_counts(cache_rows);
+    let mut same = true;
+    for &n in &counts {
+        n_keys_dev.copy_from_host(stream, &[u32::try_from(n)?])?;
+        outs.clear();
+        for (graph, _, y) in &graphs {
+            graph.launch(stream)?;
+            stream.synchronize()?;
+            outs.push(y.to_host_vec(stream)?);
+        }
+        flash.enqueue_flash_latent_split(
+            stream,
+            FlashSplitArgs {
+                inputs: d.inputs(&n_keys_dev, dims),
+                part_v: &mut eager_part.v,
+                part_ms: &mut eager_part.ms,
+                y: &mut eager_y,
+            },
+        )?;
+        stream.synchronize()?;
+        let eager = eager_y.to_host_vec(stream)?;
+        same &= bits_equal(&outs[0], &outs[1]) && bits_equal(&outs[0], &eager);
+    }
+    let pass = same
+        && shapes
+            .iter()
+            .all(|&(two, seg, merge)| two && seg == Some(want_seg) && merge == Some(want_merge));
+    println!(
+        "flash grid heights rows={cache_rows},{GRID_TALL_ROWS} seg_grid={:?},{:?} (want \
+         {want_seg:?}) merge_grid={:?},{:?} (want {want_merge:?}) two_kernel_nodes={},{} \
+         counts={counts:?} replays_and_eager_bit_identical={same} {}",
+        shapes[0].1,
+        shapes[1].1,
+        shapes[0].2,
+        shapes[1].2,
+        shapes[0].0,
+        shapes[1].0,
+        verdict(pass)
+    );
+    Ok(pass)
+}
+
+/// The deep clause's cache height (module doc): the most its counts reach,
+/// cut into `SEGMENTS` segments of 3,296 keys.
+#[cfg(feature = "gpu")]
+const DEEP_ROWS: usize = 262_144;
+
+/// Tokens of the deep clause's multi-token launches: the most one launch
+/// takes.
+#[cfg(feature = "gpu")]
+const DEEP_TOKENS: usize = 8;
+
+/// The deep clause (module doc): one-token split launches at counts past the
+/// 64-key cut over a synthetic [`DEEP_ROWS`]-row cache, each within `band` of
+/// the f64 reference, a rerun bit-identical and (at 5,121 and 65,537) the
+/// NaN pattern in every row at or past the count changing no bit; then two
+/// launches of [`DEEP_TOKENS`] tokens, one whose limits straddle the 5,120
+/// keys the 64-key cut covers and one at the cache's top, each token bit for
+/// bit its one-token launch at its own limit.
+#[cfg(feature = "gpu")]
+fn deep_counts(gpu: &Gpu, flash: &FlashKernels, dims: Dims, band: f32) -> Result<bool, GateError> {
+    let stream = gpu.stream();
+    let (width, n_heads, latent) = (dims.width, dims.heads, dims.latent_dims);
+    let bits: Vec<u16> = activations(width, DEEP_ROWS, 50023)
+        .iter()
+        .map(|&v| f32_to_f16_bits(v))
+        .collect();
+    let cache = DeviceTensor::upload(stream, &bits, DEEP_ROWS, width)?;
+    let queries = activations(width, DEEP_TOKENS * n_heads, 60017);
+    // One split launch of the tokens in `q` at `count` live keys over `kv`.
+    let launch = |q: &[f32], count: usize, kv: &DeviceTensor<u16>| -> Result<Vec<f32>, GateError> {
+        let tokens = q.len() / (n_heads * width);
+        let q_dev = DeviceBuffer::from_host(stream, q)?;
+        let n_keys = DeviceBuffer::from_host(stream, &[u32::try_from(count)?])?;
+        let mut part = Partials::zeroed(stream, tokens * n_heads, DEEP_ROWS)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(stream, tokens * n_heads * latent)?;
+        flash.enqueue_flash_latent_split(
+            stream,
+            FlashSplitArgs {
+                inputs: FlashInputs {
+                    q: &q_dev,
+                    kv,
+                    n_keys_buf: &n_keys,
+                    kq_scale: dims.kq_scale,
+                    geom: dims.geom(tokens),
+                },
+                part_v: &mut part.v,
+                part_ms: &mut part.ms,
+                y: &mut y,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok(y.to_host_vec(stream)?)
+    };
+    let token = |t: usize| &queries[t * n_heads * width..(t + 1) * n_heads * width];
+    let mut ok = true;
+    for count in [5_120, 5_121, 8_193, 65_537, DEEP_ROWS] {
+        let span = seg_span(count, SEGMENTS, seg_keys());
+        let y = launch(token(0), count, &cache)?;
+        let rerun = bits_equal(&y, &launch(token(0), count, &cache)?);
+        let y_ref = flash_f64_ref(token(0), &bits, count, dims.kq_scale, dims.geom(1));
+        let rel = max_rel_err(&y, &y_ref)?;
+        let nan_same = if count == 5_121 || count == 65_537 {
+            let mut nan_bits = bits.clone();
+            nan_bits[count * width..].fill(0x7e00);
+            let nan_cache = DeviceTensor::upload(stream, &nan_bits, DEEP_ROWS, width)?;
+            bits_equal(&y, &launch(token(0), count, &nan_cache)?)
+        } else {
+            true
+        };
+        let pass = rel <= band && rerun && nan_same;
+        println!(
+            "flash deep count={count} span={span} segments={} m=1 band={band:.3e} \
+             max_rel_err={rel:.3e} bit_identical_rerun={rerun} nan_past_count_same={nan_same} {}",
+            count.div_ceil(span),
+            verdict(pass)
+        );
+        ok &= pass;
+    }
+    // Token `t` of a launch at `n` live keys attends `n - DEEP_TOKENS + t + 1`.
+    for n in [5_124, DEEP_ROWS] {
+        let all = launch(&queries[..], n, &cache)?;
+        let limits: Vec<usize> = (0..DEEP_TOKENS).map(|t| n - DEEP_TOKENS + t + 1).collect();
+        let mut same = true;
+        for (t, &limit) in limits.iter().enumerate() {
+            let one = launch(token(t), limit, &cache)?;
+            same &= bits_equal(&all[t * n_heads * latent..(t + 1) * n_heads * latent], &one);
+        }
+        let spans: Vec<usize> = limits
+            .iter()
+            .map(|&l| seg_span(l, SEGMENTS, seg_keys()))
+            .collect();
+        println!(
+            "flash deep tokens m={DEEP_TOKENS} n_keys={n} limits={limits:?} spans={spans:?} \
+             each_token_its_one_token_launch={same} {}",
+            verdict(same)
+        );
+        ok &= same;
+    }
+    Ok(ok)
 }
 
 // ----------------------------------------------------------- IEEE edges
@@ -1241,7 +1467,8 @@ fn kq_scale_of(gguf: &Gguf) -> Result<f32, GateError> {
 /// accumulated in f64, weights `exp(s_i − max)` in f64, output
 /// `Σ w_i·v_i[d] / Σ w_i` cast once to f32. Query `t` of `geom.tokens`
 /// attends to keys `0..n_keys − tokens + t + 1` (the causal prefix the kernel
-/// uses).
+/// uses). The keys are widened once, which is exact (f16 to f32), rather
+/// than once a row.
 #[cfg(feature = "gpu")]
 fn flash_f64_ref(
     q: &[f32],
@@ -1257,6 +1484,10 @@ fn flash_f64_ref(
         latent_dims: latent,
     } = geom;
     let width = rope + latent;
+    let keys: Vec<f32> = keys16[..n_keys * width]
+        .iter()
+        .map(|&h| half_to_f32(h))
+        .collect();
     let mut out = vec![0.0f32; m * n_heads * latent];
     for row in 0..m * n_heads {
         let t = row / n_heads;
@@ -1264,10 +1495,10 @@ fn flash_f64_ref(
         let qrow = &q[row * width..(row + 1) * width];
         let mut s = vec![0.0f64; limit];
         for (i, si) in s.iter_mut().enumerate() {
-            let krow = &keys16[i * width..(i + 1) * width];
+            let krow = &keys[i * width..(i + 1) * width];
             let mut acc = 0.0f64;
             for d in 0..width {
-                acc += f64::from(qrow[d]) * f64::from(half_to_f32(krow[d]));
+                acc += f64::from(qrow[d]) * f64::from(krow[d]);
             }
             *si = f64::from(scale) * acc;
         }
@@ -1277,9 +1508,9 @@ fn flash_f64_ref(
         for i in 0..limit {
             let w = (s[i] - mx).exp();
             denom += w;
-            let vrow = &keys16[i * width + rope..(i + 1) * width];
+            let vrow = &keys[i * width + rope..(i + 1) * width];
             for (nd, &v) in num.iter_mut().zip(vrow) {
-                *nd += w * f64::from(half_to_f32(v));
+                *nd += w * f64::from(v);
             }
         }
         let inv = 1.0 / denom;
