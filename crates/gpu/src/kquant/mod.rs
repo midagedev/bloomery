@@ -13,8 +13,9 @@
 //!   gate·up.
 //! - [`tiles`]: the grouped entries over a slot table by tile items (an
 //!   expert, eight weight rows, up to eight slots), each slot its `_sel`
-//!   entry's bit for bit: the gather of the entries' Walk A planes, the
-//!   Q4_K and Q5_K gate·up and the Q5_K down.
+//!   entry's bit for bit: the gather of the entries' planes, the Q4_K and
+//!   Q5_K gate·up and the Q5_K down, the bodies every model's tile path
+//!   runs (the gather, the down), and its scratch.
 //! - [`act`]: the gate·up rules.
 //!
 //! No entry here names a model: a caller passes its stacks' rows, experts
@@ -32,5 +33,7 @@ pub use act::Act;
 pub use q5k::Q5k;
 pub use q8_0::Q8_0;
 pub use sel::{GateUpAct, KquantKernels, SelDown, walk_a_planes};
-pub use tiles::{EntryPlanes, KquantTileKernels, TileGather, TileTable, TiledDown, TiledGateUpAct};
+pub use tiles::{
+    EntryPlanes, KquantTileKernels, TileGather, TileScratch, TileTable, TiledDown, TiledGateUpAct,
+};
 pub use walk::{Q4k, SbDecode};

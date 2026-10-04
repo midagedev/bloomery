@@ -53,6 +53,8 @@ fn main() {
 #[cfg(feature = "gpu")]
 use bloomery_gpu::hybrid::HOST;
 #[cfg(feature = "gpu")]
+use bloomery_gpu::kquant::{TileTable, TiledDown};
+#[cfg(feature = "gpu")]
 use bloomery_gpu::q4k_sel::{QuantSel, TILE_COLS, tile_cap};
 #[cfg(feature = "gpu")]
 use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
@@ -745,18 +747,20 @@ fn check_tiles(gpu: &Gpu, st: &Stack) -> Result<bool, GateError> {
         stream.synchronize()?;
         let quant_fault = gpu.take_fault()?;
         let mut y = DeviceBuffer::from_host(stream, &vec![SENT; n_slots * rpe])?;
-        gpu.q4k_sel().enqueue_gemv_q4k_tiles(
-            stream,
-            &st.w,
-            &act,
-            &order_dev,
-            &start_dev,
-            &tiles_dev,
-            n_slots,
-            rpe,
-            gpu.unlabelled_sink(),
-            &mut y,
-        )?;
+        let down = TiledDown {
+            w: &st.w,
+            act: &act,
+            table: TileTable {
+                order: &order_dev,
+                start: &start_dev,
+                tiles: &tiles_dev,
+                n_experts: N_EXPERTS,
+                n_slots,
+            },
+            rows_per_expert: rpe,
+        };
+        gpu.q4k_sel()
+            .enqueue_gemv_q4k_tiles(stream, &down, gpu.unlabelled_sink(), &mut y)?;
         stream.synchronize()?;
         Ok((
             table_fault,

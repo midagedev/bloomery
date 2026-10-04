@@ -1,0 +1,53 @@
+# Round glmtiles (draft for the lead; docs/cards/glmtiles-pp.card when placed): the grouped tile path has one owner
+# in crates/gpu (q4k_sel::tile_block over TileWork, kquant::tiles's gather over GatherPlanes, GemvTiles and
+# GateUpTiles over SbDecode, TileScratch), the V4.1 and GLM crates keep only their format's planes and works.
+#
+# Decomposition [derived, round report section 1]: launch counts unchanged (V4.1 6 a routed layer-batch, GLM 9, 8 on
+# a tiered layer), grids and scratch bytes unchanged (TileScratch sizes the same buffers: the tier reserve and
+# card_tile_bytes checks are equalities and pass), ptx-scan of generate_ds41 and generate_glm5next: 259 of 268 md5s
+# equal, grouped_buckets = the base ds41_card_buckets md5, every resource column equal (267 of 267 rows). Seven moved
+# md5s are reorder-class (renumbering, an `or` of disjoint bits written `add`, a trap or ret block placed elsewhere),
+# the owning gates bit-identical. One changes its instruction stream: q4k_gemv_tiles (the Q4_K down by tiles, V4.1's
+# down on every routed layer-batch) now runs Walk A's row walk (walk::row_dot::<Q4k>) in place of
+# cores::q4k_row_dot: 1773 -> 1734 PTX lines, 48 registers at (256, 5) as before, spill 0, jit_local 0, the same
+# loads a weight word (one decode an iteration, eight A chains a column, one s8 and one d8 load a column), the same
+# rounding (gate-gpu-q4k-sel bit-identical). The kernel reads each weight row once a tile of <= 8 slots: weight-read
+# bound, so an instruction-count change predicts 0 (AGENTS: an instruction count on a kernel near ~700 GB/s).
+# On plan (a) the card's tile path sits under the host union's shadow (the wall is max(host, card + exchange)), so
+# the term is 0 twice over. This sitting cannot see a q4k_gemv_tiles change under that shadow: it only guards against
+# a user-visible regression; the kernel-level evidence is the equal resource columns and loads above.
+#
+# Why noninf: the band is 0, so an ab card is refused at any round count. Two binaries' per-round pp ratios scatter
+# with sd 1.1 % (rig-log 09-25#v41-prefill-s14, as callstream-pp-a.card carries it): h_p at 5 rounds = 2.776 x 1.1 x sqrt(2 / 5) = 1.93 %, under the
+# margin below.
+#
+# Orientation: the runner's `ratio pp` line for the prose corpus prints prose / bin:bloomery-glmtiles-base@prose,
+# that is new / base, which card.py's verdict takes as it prints (changed / base).
+kind: noninf
+question: does V4.1's prompt batch with the grouped tile path on one owner (the Q4_K down by tiles over Walk A's
+  row walk) run no slower than the base build by more than the margin?
+term: pp tok/s @ P = 4096, prose prompt (corpus-prose.ids, the first 4096), A6000, plan (a), CED on, the default
+  group, generate_ds41 of this tree against the base tree's build (bin: arm) - (new - base) / base, paired by
+  round; pp512 printed beside it
+unit: %
+predict: 0..0
+rounds: 5
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios, the larger of the two runs' SD (carried
+  from docs/cards/callstream-pp-a.card, not re-derived)
+margin: 2.0 % a no-regression guard, not derived: the change is a move whose kernel evidence (equal resource
+  columns, equal loads a weight word, bit-identical gates) settles the kernel, and 2.0 % clears the two-binary
+  ruler at 5 rounds (1.93 %); 1.5 % would take 7 rounds (h_p 1.44 %) at ~1.4x the box time
+condition: one runner invocation from this tree, both binaries in one lease: BLOOMERY_REMOTE='~/repo/bloomery-glmtiles'
+  BLOOMERY_AB_ROUNDS=5 BLOOMERY_BOX_ENV='BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmtiles-pp.card'
+  just depth-gpu-ds41 prose:512 prose:4096 bin:/root/repo/bloomery-glmtiles-base/target/release/generate_ds41:prose:512
+  bin:/root/repo/bloomery-glmtiles-base/target/release/generate_ds41:prose:4096 (the base tree's generate_ds41 built
+  with --features deepseek41 at d1763a48, the build its ptx-scan read); two load keys a round (this tree's binary,
+  the base's), each arm from Session::clear; both binaries' load records print the same placement and card experts;
+  no row carries [cold], [cpu-busy] or [other-busy]. Box time 14..20 min [derived: 10 loads and one warm-up at
+  60..90 s (74.6 s measured on plan (a), rig-log 09-26, carried from callstream-pp-a.card), 5 rounds of 4 prompts at ~26 s a round, the build]
+decide-in: land the move; the verdict and its interval go in the landing note beside the ptx-scan table
+decide-below: hold the landing; time one layer-batch of both binaries under nsys (q4k_gemv_tiles, ds41_card_gather,
+  ds41_expert_gate_up_tiles) to find which kernel moved, and if it is q4k_gemv_tiles keep cores::q4k_row_dot as the
+  Q4_K work's dot (the body stays shared, the decoder choice moves)
+decide-above: re-derive the shadow: a gain means the card tile path was on the wall on plan (a); read the step stats'
+  card and host terms of one row of each binary before any claim
