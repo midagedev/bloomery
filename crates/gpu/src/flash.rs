@@ -19,20 +19,24 @@
 //! tile's logits, its weights, the rescale) goes through shared memory.
 //!
 //! A decode step's 16 heads are 16 query rows. Sixteen blocks leave most of
-//! the card idle, so the key range is cut into [`seg_keys`]-key segments and
-//! the launch is two kernels: [`flash_latent_mma`], one block per (group of
-//! [`MMA_ROWS`] query rows, segment) with the `Q·Kᵀ` product on the tensor
-//! cores, writing each row's softmax partials per segment (running max,
-//! `Σ exp` relative to it, and the un-normalised `Σ exp·V`), and `flash_merge`
-//! folding the segments of a row into the final latent row. The segment count comes from
-//! the cache height, not from the live key count, so a captured graph's grid
-//! is fixed and the step still follows `n_keys_buf` — a segment wholly past
-//! the causal limit writes a neutral partial (`m = −inf`, `s = 0`) and reads
-//! no key row at all, which is also what keeps padded rows holding NaN out of
-//! every result. A cache short enough to hold one segment takes the
-//! single-launch [`flash_latent`] instead, which needs no partials and no
-//! merge; that choice is made from the cache height when the launch is
-//! enqueued, never per key count.
+//! the card idle, so the key range is cut into segments and the launch is two
+//! kernels: [`flash_latent_mma`], one block per (group of [`MMA_ROWS`] query
+//! rows, segment) with the `Q·Kᵀ` product on the tensor cores, writing each
+//! row's softmax partials per segment (running max, `Σ exp` relative to it,
+//! and the un-normalised `Σ exp·V`), and `flash_merge` folding the segments of
+//! a row into the final latent row. Every row is cut into [`SEGMENTS`]
+//! segments whatever the cache height, so a captured graph's grid does not
+//! depend on the context the load allocated. A block takes its key range from
+//! its group's live count through [`seg_span`], the GQA flash's cut and its
+//! one owner — [`seg_keys`]-key segments while `SEGMENTS` of them cover the
+//! row, longer ones past it — so the step still follows `n_keys_buf`. A
+//! segment wholly past the causal limit writes a neutral partial
+//! (`m = −inf`, `s = 0`) and reads no key row at all, which is also what keeps
+//! padded rows holding NaN out of every result, and the merge stops at the
+//! row's last live segment. A cache short enough to hold one [`seg_keys`]-key
+//! segment takes the single-launch [`flash_latent`] instead, which needs no
+//! partials and no merge; that choice is made from the cache height when the
+//! launch is enqueued, never per key count.
 //!
 //! Merge order is fixed (ascending segment), so reruns and graph replays are
 //! bit-identical. The split launch rounds the query rows and the products to
@@ -68,6 +72,7 @@
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
+use crate::flash_gqa::{SEGMENTS, seg_span};
 use crate::launch_u32;
 use crate::q8_1_quant_vals;
 use crate::tensor::{DeviceTensor, Q8Act};
@@ -211,12 +216,19 @@ const _: () = assert!(mma_row_words(MMA_WIDTH) == MMA_KROW_W);
 const _: () = assert!(mma_qwords(MMA_WIDTH) == MMA_QWORDS);
 const _: () = assert!(mma_kwords(MMA_WIDTH) == MMA_KWORDS);
 const _: () = assert!(mma_dyn_bytes(MMA_WIDTH) == MMA_DYN_BYTES);
-/// Keys one segment of the tensor-core pass walks, and so [`seg_keys`]'s
-/// default. One block carries every head, so the grid is the segment count
-/// alone: 128-key segments would leave a 4192-row cache at thirty-three
-/// blocks on eighty-four SMs. Sixty-four keys give sixty-six blocks there and
-/// keep the merge's fold half the length a thirty-two-key segment would.
+/// Keys the shortest segment of the tensor-core pass walks, and so
+/// [`seg_keys`]'s default: the floor of the cut, so a row of at most
+/// `SEGMENTS · 64` keys is cut into 64-key segments. One block carries every
+/// head, so the live blocks are the live segments: 128-key segments would
+/// leave 4192 keys at thirty-three live blocks on eighty-four SMs. Sixty-four
+/// keys give sixty-six there and keep the merge's fold half the length a
+/// thirty-two-key segment would.
 pub const MMA_SEG_KEYS: usize = 64;
+// The cut's span is whole `flash_gqa::KEY_TILE`s and the tensor-core pass
+// walks a segment in `MMA_KEYS`-key tiles from its start: the tiles agree, so
+// every segment starts on a tile edge, and the default floor is whole tiles.
+const _: () =
+    assert!(crate::flash_gqa::KEY_TILE == MMA_KEYS && MMA_SEG_KEYS.is_multiple_of(MMA_KEYS));
 
 /// Segments whose partials a split-K merge loads as one batch before it
 /// folds them: every merge kernel (this file's, the GQA flash's, V4.1's
@@ -229,11 +241,13 @@ pub fn mma_groups(q_rows: usize) -> usize {
     q_rows.div_ceil(MMA_ROWS)
 }
 
-/// Keys per segment: [`MMA_SEG_KEYS`], unless `BLOOMERY_FLASH_SEG` names
-/// another multiple of [`KEY_TILE`]. Read once, at first use: the value fixes
-/// a captured graph's grid, so it must not change between capture and replay.
-/// A value that is set but unusable panics rather than falling back — a
-/// sweep row that silently ran the default would be a wrong measurement.
+/// Keys the shortest segment walks, the floor of [`seg_span`]'s cut:
+/// [`MMA_SEG_KEYS`], unless `BLOOMERY_FLASH_SEG` names another multiple of
+/// [`KEY_TILE`]. Read once, at first use: the value picks whether a cache
+/// takes the single launch and is the segment pass's `seg_keys` argument, so
+/// it must not change between capture and replay. A value that is set but
+/// unusable panics rather than falling back — a sweep row that silently ran
+/// the default would be a wrong measurement.
 ///
 /// `BLOOMERY_FLASH_MMA` is refused by name, whatever its value: the
 /// tensor-core pass is the only segment pass, and a run that asks for another
@@ -259,14 +273,21 @@ pub fn seg_keys() -> usize {
     })
 }
 
-/// Segments a `cache_rows`-tall cache is cut into. One means the cache fits
-/// in a single segment and the single-launch [`flash_latent`] serves it.
+/// Segments the split launch cuts every query row into over a
+/// `cache_rows`-tall cache: [`SEGMENTS`] whatever the height, so the grid
+/// does not grow with the context the load allocated. One means the whole
+/// cache fits in a single [`seg_keys`]-key segment and the single-launch
+/// [`flash_latent`] serves it.
 pub fn segments_for(cache_rows: usize) -> usize {
-    cache_rows.max(1).div_ceil(seg_keys())
+    if cache_rows <= seg_keys() {
+        1
+    } else {
+        SEGMENTS
+    }
 }
 
 /// Length the split launch's `Σ exp·V` partials buffer needs for `q_rows`
-/// query rows over a `cache_rows`-tall cache.
+/// query rows over a `cache_rows`-tall cache: [`segments_for`] slots a row.
 pub fn partials_v_len(q_rows: usize, cache_rows: usize) -> usize {
     q_rows * segments_for(cache_rows) * LATENT
 }
@@ -1008,12 +1029,15 @@ mod flash_kernels {
     }
 
     /// The segment pass of the split launch: block `(group, segment)` attends
-    /// keys `[segment * seg_keys, min((segment + 1) * seg_keys, limit))` for
-    /// the [`MMA_ROWS`] query rows `group * MMA_ROWS ..` at once and writes
-    /// each row's partials for [`flash_merge`] and [`flash_merge_q8`] to fold:
+    /// keys `[segment * span, min((segment + 1) * span, limit))` for the
+    /// [`MMA_ROWS`] query rows `group * MMA_ROWS ..` at once and writes each
+    /// row's partials for [`flash_merge`] and [`flash_merge_q8`] to fold:
     /// `part_ms` holds `(running max, Σ exp)` per (row, segment), `part_v` the
-    /// row's un-normalised `Σ exp·V` relative to that max. Segment is the slow
-    /// block index, so the blocks sharing a key slice run together.
+    /// row's un-normalised `Σ exp·V` relative to that max. `span` is
+    /// [`seg_span`] of the group's widest limit over `segs` segments with
+    /// `seg_keys` the floor — one cut for the group, since its rows share the
+    /// staged key tile. Segment is the slow block index, so the blocks sharing
+    /// a key slice run together.
     ///
     /// The heads are the `M` axis of `mma.sync.aligned.m16n8k16`: one
     /// instruction takes sixteen heads times eight keys times sixteen dims,
@@ -1060,6 +1084,7 @@ mod flash_kernels {
         dynamic_shared = 56064,
         requires = (
             n_keys_buf.len() >= 1,
+            segs >= 1,
             q.len() >= q_rows * (rope_dims + latent),
             kv.len() >= dst_rows * (rope_dims + latent),
             part_v.len() >= q_rows * segs * latent,
@@ -1104,11 +1129,13 @@ mod flash_kernels {
         let rope = rope_dims as usize;
         let lat = latent as usize;
         let width = rope + lat;
-        let lo = seg * seg_keys as usize;
         // The group's widest limit: limits rise with the row, and a row past
-        // `q_rows` is not a row at all, so the last live row carries it.
+        // `q_rows` is not a row at all, so the last live row carries it. The
+        // group's cut is that limit's.
         let last_row = (base_row + MMA_ROWS - 1).min(rows - 1);
         let lim_max = causal_limit(n_keys_buf, dst_rows, last_row, n_heads, m);
+        let span = seg_span(lim_max, n_seg, seg_keys as usize);
+        let lo = seg * span;
         if lo >= lim_max {
             if tid < MMA_ROWS && base_row + tid < rows {
                 let idx = (base_row + tid) * n_seg + seg;
@@ -1121,7 +1148,7 @@ mod flash_kernels {
             }
             return; // block-uniform, and no key row of this segment is read
         }
-        let hi_max = (lo + seg_keys as usize).min(lim_max);
+        let hi_max = (lo + span).min(lim_max);
 
         // The group's query rows and the tile's key rows as f16, both in the
         // block's dynamic shared memory: the query tile first, the key tile
@@ -1184,11 +1211,11 @@ mod flash_kernels {
     /// thread per latent dim, folding the row's partials by the standard
     /// online-softmax rescale in ascending segment order — a fixed order, so
     /// reruns and graph replays are bit-identical. The scan stops at the last
-    /// segment the row's causal limit reaches, which is why this kernel reads
-    /// `n_keys_buf` too: the grid is the cache's, the work is the live key
-    /// count's. A neutral partial (`Σ exp == 0`) is skipped as well, so a
-    /// segment past the limit is never folded in and its `part_v` slice is
-    /// never read.
+    /// segment the row's causal limit reaches under [`seg_span`]'s cut, which
+    /// is why this kernel reads `n_keys_buf` too: the grid is fixed, the work
+    /// is the live key count's. A neutral partial (`Σ exp == 0`) is skipped as
+    /// well, so a segment past the limit is never folded in and its `part_v`
+    /// slice is never read.
     #[kernel]
     #[launch_bounds(512)]
     #[launch_contract(
@@ -1196,6 +1223,7 @@ mod flash_kernels {
         block = (512, 1, 1),
         requires = (
             n_keys_buf.len() >= 1,
+            segs >= 1,
             part_v.len() >= q_rows * segs * latent,
             part_ms.len() >= q_rows * segs * 2,
             y.len() >= q_rows * latent
@@ -1257,6 +1285,7 @@ mod flash_kernels {
         block = (512, 1, 1),
         requires = (
             n_keys_buf.len() >= 1,
+            segs >= 1,
             part_v.len() >= q_rows * segs * latent,
             part_ms.len() >= q_rows * segs * 2,
             y.len() >= q_rows * latent,
@@ -1342,8 +1371,8 @@ mod flash_kernels {
     /// sixteen segments at a time ahead of their folds; the folds and their
     /// order are the one-at-a-time walk's.
     ///
-    /// SAFETY: `row < q_rows`, `tid < latent`, and the partial buffers hold
-    /// `q_rows * segs * latent` / `q_rows * segs * 2` elements.
+    /// SAFETY: `row < q_rows`, `tid < latent`, `segs >= 1`, and the partial
+    /// buffers hold `q_rows * segs * latent` / `q_rows * segs * 2` elements.
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     unsafe fn merge_row(
@@ -1360,7 +1389,14 @@ mod flash_kernels {
         lat: usize,
     ) -> f32 {
         let limit = causal_limit(n_keys_buf, dst_rows, row, n_heads, m);
-        let n_seg = limit.div_ceil(seg_keys as usize).min(segs as usize);
+        // The row's live segments under its own cut. The segment pass cut the
+        // row's group at the group's widest limit, a span at least this one
+        // (the span rises with the count), so every partial holding this
+        // row's keys is below `n_seg`; a slot below it that holds none is
+        // neutral, since every (row, segment) slot gets its pair written, and
+        // is skipped. seg_span keeps ⌈limit / span⌉ <= segs (its const check
+        // in flash_gqa), so the walk stays inside the row's slots.
+        let n_seg = limit.div_ceil(seg_span(limit, segs as usize, seg_keys as usize));
         let mut mx = f32::NEG_INFINITY;
         let mut s_sum = 0.0f32;
         let mut acc = 0.0f32;
@@ -1951,15 +1987,16 @@ impl FlashKernels {
     }
 
     /// [`FlashKernels::enqueue_flash_latent`] with the key range spread over
-    /// [`segments_for`]`(kv.rows())` segments: the tensor-core segment pass
-    /// ([`FlashKernels::enqueue_flash_latent_mma`]) writes partials into
-    /// `part_v`/`part_ms` and the merge pass folds them into `y`. Returns the
-    /// number of launches enqueued — one when the cache is short enough to
-    /// hold a single segment (the single-block kernel serves it, no partials
-    /// touched), two otherwise. That choice comes from the cache height alone,
-    /// so it is fixed for the life of a captured graph, and the grid does not
-    /// move with `n_keys_buf`. The two-launch path takes only the segment
-    /// pass's [`MMA_WIDTH`] row.
+    /// [`segments_for`]`(kv.rows())` segments a row ([`SEGMENTS`]): the
+    /// tensor-core segment pass ([`FlashKernels::enqueue_flash_latent_mma`])
+    /// writes partials into `part_v`/`part_ms` and the merge pass folds them
+    /// into `y`. Returns the number of launches enqueued — one when the cache
+    /// is short enough to hold a single [`seg_keys`]-key segment (the
+    /// single-block kernel serves it, no partials touched), two otherwise.
+    /// That choice comes from the cache height alone, so it is fixed for the
+    /// life of a captured graph, and neither grid moves with `n_keys_buf` or
+    /// grows with the cache height. The two-launch path takes only the
+    /// segment pass's [`MMA_WIDTH`] row.
     ///
     /// `part_v` must hold [`partials_v_len`] and `part_ms`
     /// [`partials_ms_len`] for the same `tokens * heads` rows and cache
@@ -2008,8 +2045,9 @@ impl FlashKernels {
     /// [`FlashKernels::enqueue_flash_latent_split`] makes: a grid of
     /// [`mma_groups`]`(q_rows) * `[`segments_for`]`(kv.rows())` blocks of
     /// [`MMA_BLOCK`] threads, a block carrying [`MMA_ROWS`] query rows and
-    /// putting their `Q·Kᵀ` on `mma.sync`, each writing its rows' partials
-    /// into `part_v`/`part_ms`. A caller that wants the two launches timed or
+    /// putting their `Q·Kᵀ` on `mma.sync`, each walking its segment of the
+    /// group's [`seg_span`] cut and writing its rows' partials into
+    /// `part_v`/`part_ms`. A caller that wants the two launches timed or
     /// observed separately enqueues this and [`FlashKernels::enqueue_flash_merge`]
     /// (or its q8 twin) itself, after asking [`segments_for`] whether the
     /// cache is tall enough to need them at all.

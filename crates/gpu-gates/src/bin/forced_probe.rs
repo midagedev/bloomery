@@ -179,7 +179,11 @@ fn run() -> Res<()> {
         p.tokens.len() - 1 + step,
         p.tokens.len() + step,
         bloomery_gpu::flash::segments_for(ctx),
-        (p.tokens.len() + step).div_ceil(bloomery_gpu::flash::seg_keys()),
+        (p.tokens.len() + step).div_ceil(bloomery_gpu::flash_gqa::seg_span(
+            p.tokens.len() + step,
+            bloomery_gpu::flash::segments_for(ctx),
+            bloomery_gpu::flash::seg_keys(),
+        )),
     );
 
     // The forced walk up to the position before `step`, one line per step:
