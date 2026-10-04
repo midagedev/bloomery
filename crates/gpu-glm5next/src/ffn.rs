@@ -46,10 +46,10 @@
 
 use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
 use bloomery_gpu::kquant::{
-    Act, EntryPlanes, GateUpAct, KquantKernels, KquantTileKernels, SelDown, TileGather, TileTable,
-    TiledDown, TiledGateUpAct,
+    Act, EntryPlanes, GateUpAct, KquantKernels, KquantTileKernels, SelDown, TileGather,
+    TileScratch, TiledGateUpAct,
 };
-use bloomery_gpu::q4k_sel::{QuantSel, tile_cap};
+use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
 use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, CardAccTier, FfnBatchKernels, Handoff, Places};
@@ -598,26 +598,18 @@ pub(crate) struct CardRows<'a> {
 
 /// The grouped path's scratch for prompt batches of up to `cap` tokens of
 /// `n_embd` through routed experts of `ff` rows, [`N_USED`] slots a token:
-/// the batch's rows in q8_1 (a column a token), the table — the card slots
-/// by expert (`order`, runs `start` of up to [`TILE_BUCKET_EXPERTS`]
-/// experts) and its tiles — the entries' gathered Walk A planes, the
-/// gate·up rows by entry and their q8_1 form, and the downs by slot,
-/// slot-major from the batch's first slot (the tier layers' back reads them
-/// beside the tier's rows). Its bytes are [`card_tile_bytes`]'s, which the
-/// plan reserves.
+/// the batch's rows in q8_1 (a column a token), the K-quant family's tile
+/// scratch ([`TileScratch`]: the table — the card slots by expert and its
+/// tiles — the gate·up rows by entry and their q8_1 form), the entries'
+/// gathered Walk A planes, and the downs by slot, slot-major from the
+/// batch's first slot (the tier layers' back reads them beside the tier's
+/// rows). Its bytes are [`card_tile_bytes`]'s, which the plan reserves.
 pub(crate) struct CardTiles {
     act_x: Q8Act,
-    order: DeviceBuffer<u32>,
-    start: DeviceBuffer<u32>,
-    tiles: DeviceBuffer<u32>,
+    tile: TileScratch,
     ord: EntryPlanes,
-    h: DeviceBuffer<f32>,
-    act_h: Q8Act,
     down: DeviceBuffer<f32>,
 }
-
-/// The most card experts a layer's table takes: the bucket kernel's.
-const TILE_BUCKET_EXPERTS: usize = 1024;
 
 impl CardTiles {
     /// The scratch for batches of up to `cap` tokens, refused by name when
@@ -633,12 +625,8 @@ impl CardTiles {
         let slots = cap * N_USED;
         let t = CardTiles {
             act_x: Q8Act::with_tier_cols(stream, cap, n_embd)?,
-            order: DeviceBuffer::zeroed(stream, slots)?,
-            start: DeviceBuffer::zeroed(stream, TILE_BUCKET_EXPERTS + 1)?,
-            tiles: DeviceBuffer::zeroed(stream, tile_cap(slots, TILE_BUCKET_EXPERTS) + 1)?,
+            tile: TileScratch::new(stream, slots, ff)?,
             ord: EntryPlanes::new(stream, slots, n_embd)?,
-            h: DeviceBuffer::zeroed(stream, slots * ff)?,
-            act_h: Q8Act::with_slots(stream, slots, ff)?,
             down: DeviceBuffer::zeroed(stream, slots * n_embd)?,
         };
         let want = card_tile_bytes(n_embd, ff, N_USED, cap);
@@ -658,12 +646,8 @@ impl CardTiles {
     /// Device bytes of the scratch.
     pub(crate) fn bytes(&self) -> usize {
         self.act_x.device_bytes()
-            + self.order.num_bytes()
-            + self.start.num_bytes()
-            + self.tiles.num_bytes()
+            + self.tile.device_bytes()
             + self.ord.device_bytes()
-            + self.h.num_bytes()
-            + self.act_h.device_bytes()
             + self.down.num_bytes()
     }
 
@@ -676,8 +660,9 @@ impl CardTiles {
 /// Layer `l`'s card slots over a prompt batch's `t` tokens into the card
 /// sums `io.acc`: every slot's place from the slot map in one launch
 /// (`ds41_ffn_places`, the handoff's rule), the rows' q8_1 form, then the
-/// card slots by tile items — the table by expert (`ds41_card_buckets`) and
-/// its tiles (`grouped_tiles`), the entries' planes gathered
+/// card slots by tile items — the table by expert (`grouped_buckets`) and
+/// its tiles (`grouped_tiles`, [`TileScratch::enqueue_table`]), the entries'
+/// planes gathered
 /// (`kq_card_gather`), the gate·up by tiles, the q8_1 of its rows by entry
 /// (`q8_1_quantize_ord`) and the down by tiles, which scatters each entry's
 /// rows to its slot — and the card sums (`ds41_ffn_card_acc_8`). Each slot
@@ -720,85 +705,40 @@ pub(crate) fn card_rows(
     let sel: &DeviceBuffer<u32> = &*io.sel;
     let tl = &mut *io.tiles;
     gpu.enqueue_quantize_q8_1_cols(io.normed, &mut tl.act_x, t, l)?;
-    k.batch.enqueue_buckets(
-        stream,
-        sel,
-        slots,
-        cl.n_card,
-        fault,
-        &mut tl.order,
-        &mut tl.start,
-    )?;
-    gpu.q4k_sel().enqueue_grouped_tiles(
-        stream,
-        &tl.start,
-        cl.n_card,
-        slots,
-        fault,
-        &mut tl.tiles,
-    )?;
-    let table = || TileTable {
-        order: &tl.order,
-        start: &tl.start,
-        tiles: &tl.tiles,
-        n_experts: cl.n_card,
-        n_slots: slots,
-    };
+    tl.tile.enqueue_table(gpu, sel, slots, cl.n_card, fault)?;
     let g = TileGather {
         x: &tl.act_x,
         cols: t,
         slots_per_col: N_USED,
-        table: table(),
+        table: tl.tile.table(slots, cl.n_card),
     };
     k.tiles
         .enqueue_card_gather(stream, &g, fault, &mut tl.ord)?;
-    let a = TiledGateUpAct {
-        wg: st.gate.w,
-        wu: st.up.w,
-        act: &tl.ord,
-        table: table(),
-        rows_per_expert: k.ff,
-        rule: Act::SwigluClamp { limit: cl.limit },
-    };
     match st.gate.ty {
         GgmlType::Q4_K | GgmlType::Q5_K => {
+            let (table, h) = tl.tile.table_and_h(slots, cl.n_card);
+            let a = TiledGateUpAct {
+                wg: st.gate.w,
+                wu: st.up.w,
+                act: &tl.ord,
+                table,
+                rows_per_expert: k.ff,
+                rule: Act::SwigluClamp { limit: cl.limit },
+            };
             k.tiles
-                .enqueue_gate_up_tiles(stream, st.gate.ty, &a, fault, &mut tl.h)?;
+                .enqueue_gate_up_tiles(stream, st.gate.ty, &a, fault, h)?;
         }
         _ => return Err(unrun(&st.gate)),
     }
-    gpu.q4k_sel().enqueue_quantize_ord(
-        stream,
-        &tl.h,
-        &tl.start,
-        cl.n_card,
-        slots,
-        fault,
-        &mut tl.act_h,
-    )?;
+    tl.tile.enqueue_quantize_h(gpu, slots, cl.n_card, fault)?;
+    let d = tl.tile.down(st.down.w, n, slots, cl.n_card);
     match st.down.ty {
-        GgmlType::Q5_K => {
-            let a = TiledDown {
-                w: st.down.w,
-                act: &tl.act_h,
-                table: table(),
-                rows_per_expert: n,
-            };
-            k.tiles
-                .enqueue_gemv_q5k_tiles(stream, &a, fault, &mut tl.down)?;
-        }
-        GgmlType::Q4_K => gpu.q4k_sel().enqueue_gemv_q4k_tiles(
-            stream,
-            st.down.w,
-            &tl.act_h,
-            &tl.order,
-            &tl.start,
-            &tl.tiles,
-            slots,
-            n,
-            fault,
-            &mut tl.down,
-        )?,
+        GgmlType::Q5_K => k
+            .tiles
+            .enqueue_gemv_q5k_tiles(stream, &d, fault, &mut tl.down)?,
+        GgmlType::Q4_K => gpu
+            .q4k_sel()
+            .enqueue_gemv_q4k_tiles(stream, &d, fault, &mut tl.down)?,
         _ => return Err(unrun(&st.down)),
     }
     if io.tiered {

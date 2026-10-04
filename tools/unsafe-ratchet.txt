@@ -78,11 +78,20 @@ gguf 9 2 0
 # cp.async staging and widening macros (dequant_row!/zero_row! are macros, not fns, because a shared
 # tile pointer cannot cross a device helper fn boundary — upstream ledger #38), ninety-seven blocks in
 # all, each with its SAFETY line.
-gpu 1536 157 6
+# PIN(2026-10-05): gpu 1536 -> 1548 blocks, 157 -> 165 fns, moved and shared code, not old code relaxed: the
+# grouped tile path's one owner. q4k_sel.rs 23 -> 35 blocks, 2 -> 5 fns: the bucket pass grouped_buckets, moved here
+# from gpu-deepseek41, tile_block (every tile entry's prologue) with its TileWork trait method, and scatter_cols.
+# kquant/tiles.rs 14 -> 14 blocks, 1 -> 6 fns: the gather core with its GatherPlanes trait method, gather_plane,
+# WalkAPlanes::copy, and the GemvTiles and GateUpTiles works in place of gate_up_tiles_body; each with its SAFETY line.
+gpu 1548 165 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
-gpu-deepseek41 464 52 0
+# PIN(2026-10-05): gpu-deepseek41 52 -> 53 fns (blocks 464 -> 448), shared code, not old code relaxed:
+# chain/ffn/batch.rs 57 -> 41 blocks, 5 -> 6 fns: the bucket pass moved to the gpu crate, the gather and the tile
+# prologue taken from it, and Q3GateUpTiles::run and Q3Planes::copy (the two methods its tile cores call) in place
+# of gather_at; each with its SAFETY line.
+gpu-deepseek41 448 53 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.

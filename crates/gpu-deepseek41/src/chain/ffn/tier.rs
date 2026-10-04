@@ -25,7 +25,7 @@
 use bloomery_gpu::FaultSite;
 use bloomery_gpu::host::tier::{TierBlock, TierExperts, TierInput, TierIo, TierSet, TierTarget};
 
-use super::batch::{FfnBatchKernels, TileScratch, TiledBlock, enqueue_tiled_experts};
+use super::batch::{FfnBatchKernels, Q3TileScratch, TiledBlock, enqueue_tiled_experts};
 
 use super::*;
 
@@ -717,7 +717,7 @@ pub struct Ds41Tier {
     h: DeviceBuffer<f32>,
     act_h: Q8Act,
     batch: FfnBatchKernels,
-    tile: TileScratch,
+    tile: Q3TileScratch,
     layers: Range<usize>,
     /// Per layer of `layers`, the experts the tier holds and the layer's
     /// `swiglu_clamp_exp`.
@@ -782,7 +782,7 @@ impl Ds41Tier {
             cfg.push((k, kind.swiglu_limit));
         }
         let stream = gpu.stream();
-        let tile = TileScratch::new(stream, UNION_MAX_COLS * N_USED, n, ff)?;
+        let tile = Q3TileScratch::new(stream, UNION_MAX_COLS * N_USED, n, ff)?;
         Ok(Ds41Tier {
             experts: ExpertKernels::load(gpu.context())?,
             h: DeviceBuffer::zeroed(stream, N_USED * ff)?,

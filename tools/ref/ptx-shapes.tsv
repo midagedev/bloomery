@@ -29,7 +29,6 @@ generate_ds41   ds41_attn_seg                            0           0
 generate_ds41   ds41_attn_seg_sel                        0           0
 generate_ds41   ds41_attn_seg_sel_stage                  0           0
 generate_ds41   ds41_attn_seg_stage                      8           8
-generate_ds41   ds41_card_buckets                        0           0
 generate_ds41   ds41_card_gather                         0           0
 generate_ds41   ds41_card_gather_8                       0           0
 generate_ds41   ds41_comp_pool                           0           0
@@ -152,6 +151,7 @@ generate_ds41   gqa_prefill_flash_256_p2                 0           0
 generate_ds41   gqa_prefill_flash_256_p4                 0           0
 generate_ds41   gqa_prefill_flash_256_q8                 0           0
 generate_ds41   gqa_prefill_flash_q8                     0           0
+generate_ds41   grouped_buckets                          0           0
 generate_ds41   grouped_tiles                            0           0
 generate_ds41   half_decode                              0           0
 generate_ds41   half_encode_check                        0           0
@@ -345,6 +345,7 @@ gate_e2e   gqa_prefill_flash_256_p2                 0           0
 gate_e2e   gqa_prefill_flash_256_p4                 0           0
 gate_e2e   gqa_prefill_flash_256_q8                 0           0
 gate_e2e   gqa_prefill_flash_q8                     0           0
+gate_e2e   grouped_buckets                          0           0
 gate_e2e   grouped_tiles                            0           0
 gate_e2e   half_decode                              0           0
 gate_e2e   half_encode_check                        0           0
