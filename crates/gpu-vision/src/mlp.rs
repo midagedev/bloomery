@@ -73,7 +73,7 @@ impl MlpKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<MlpKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the module above; the
         // launcher checks its launch contract.
-        let module = unsafe { mlp_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(mlp_kernels, ctx)? };
         Ok(MlpKernels { module })
     }
 

@@ -353,7 +353,7 @@ impl GemmKernels {
     pub fn load(ctx: &Arc<CudaContext>, stream: &CudaStream) -> Result<GemmKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the module above; the
         // launcher checks its launch contract.
-        let module = unsafe { gemm_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(gemm_kernels, ctx)? };
         Ok(GemmKernels {
             module,
             dummy_f32: DeviceBuffer::zeroed(stream, 1)?,

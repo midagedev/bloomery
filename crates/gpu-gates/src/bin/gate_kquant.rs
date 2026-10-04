@@ -905,7 +905,7 @@ mod gate {
         let kq = KquantKernels::load(gpu.context(), gpu.fault_word())?;
         // SAFETY: this binary owns the embedded bundle the module above produced;
         // every launch here passes the launch contract's check.
-        let gm = unsafe { gate_kernels::load(gpu.context())? };
+        let gm = unsafe { bloomery_gpu::shared_module!(gate_kernels, gpu.context())? };
         let q51 = Q51SelKernels::load(gpu.context(), gpu.fault_word())?;
         let q80 = Q80SelKernels::load(gpu.context(), gpu.fault_word())?;
         let tiles = KquantTileKernels::load(gpu.context(), gpu.fault_word())?;

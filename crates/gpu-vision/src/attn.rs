@@ -493,7 +493,7 @@ impl AttnKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<AttnKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the module above; the
         // launcher checks its launch contract.
-        let module = unsafe { attn_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(attn_kernels, ctx)? };
         Ok(AttnKernels { module })
     }
 

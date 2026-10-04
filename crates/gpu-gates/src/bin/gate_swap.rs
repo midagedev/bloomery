@@ -3288,7 +3288,7 @@ mod gate {
         let gpu = Gpu::new()?;
         // SAFETY: the module is this binary's own, loaded once into the
         // card's context before any launch.
-        let pm = unsafe { probe_kernels::load(gpu.context())? };
+        let pm = unsafe { bloomery_gpu::shared_module!(probe_kernels, gpu.context())? };
         let trace = trace();
         println!(
             "gate_swap: layers {LAYERS:?} of {E} experts, top-{K}, card slots {N_L:?}, parts \

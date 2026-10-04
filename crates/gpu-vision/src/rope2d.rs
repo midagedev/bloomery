@@ -186,7 +186,7 @@ impl RopeKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<RopeKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the module above; the
         // launcher checks its launch contract.
-        let module = unsafe { rope2d_kernels::load(ctx)? };
+        let module = unsafe { bloomery_gpu::shared_module!(rope2d_kernels, ctx)? };
         Ok(RopeKernels { module })
     }
 

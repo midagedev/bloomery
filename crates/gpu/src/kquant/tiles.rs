@@ -657,7 +657,7 @@ impl KquantTileKernels {
         let fault = crate::module_fault_word(ctx, word, "KquantTileKernels::load")?;
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; every launcher checks its launch contract.
-        let module = unsafe { kquant_tile_kernels::load(ctx)? };
+        let module = unsafe { crate::shared_module!(kquant_tile_kernels, ctx)? };
         Ok(KquantTileKernels {
             module,
             _fault: fault,
