@@ -1606,6 +1606,7 @@ fn on_engine(
     state: &State,
     what: Reserve,
     who: &str,
+    drops: bool,
     run: impl FnOnce(&mut Slot) -> (Result<Value, ApiError>, Option<EngineError>) + Send + 'static,
 ) -> Result<Value, ApiError> {
     if let Some(reason) = state.fatal() {
@@ -1622,6 +1623,7 @@ fn on_engine(
                 }),
             }
         }),
+        drops,
     };
     relock(&state.shared.board)
         .reserve(what, action)
@@ -1640,7 +1642,7 @@ fn residency_reset(state: &State, req: &Request, w: &mut TcpStream) -> io::Resul
     } else {
         "a slot"
     };
-    let r = on_engine(state, Reserve::All, who, |slot| {
+    let r = on_engine(state, Reserve::All, who, false, |slot| {
         let t0 = Instant::now();
         match slot.engine.residency_reset() {
             Ok(Some(r)) => (
@@ -1693,10 +1695,12 @@ fn slot_action(state: &State, req: &Request, w: &mut TcpStream, id: &str) -> io:
         Ok(a) => a,
         Err(e) => return send_error(w, req, &e),
     };
+    let drops = matches!(action, SlotAction::Erase);
     let r = on_engine(
         state,
         Reserve::One(id),
         &format!("slot {id}"),
+        drops,
         move |slot| slot_job(slot, id, &dir, action),
     );
     match r {
