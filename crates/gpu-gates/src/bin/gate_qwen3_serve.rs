@@ -376,11 +376,14 @@ mod gate {
                     // never shrinks the auto answer (where the card has room
                     // past the f16 answer it grows it — the fit rides the
                     // census, so the growth prints, not judged), and the
-                    // residents differ by exactly the planes' derived delta:
-                    // the file's layers, KV heads and head width at the
-                    // served context, 15/8 B a value (f16's 4 against q8_0's
-                    // 17/8, both planes). FAIL-first: a budget or allocation
-                    // that ignores the flag leaves the delta wrong or 0.
+                    // residents of a q8_0 load held to the default arm's
+                    // context differ from the f16 load's by exactly the
+                    // planes' derived delta: the file's layers, KV heads and
+                    // head width at that one context, 15/8 B a value (f16's 4
+                    // against q8_0's 17/8, both planes). FAIL-first: a budget
+                    // or allocation that ignores the flag leaves the delta
+                    // wrong or 0; a comparison across the two auto contexts
+                    // is red on any card where the q8_0 answer grows.
                     let log = std::fs::read_to_string(&err_log)?;
                     let loads = log.lines().filter(|l| l.starts_with("load ")).count();
                     let says_q8 = log
@@ -395,45 +398,6 @@ mod gate {
                             && n <= trained
                             && n >= default_n.unwrap_or(u64::MAX),
                     );
-                    let resident = |log: &str| {
-                        log.lines()
-                            .find(|l| l.starts_with("load "))
-                            .and_then(|l| l.split("resident_bytes=").nth(1))
-                            .and_then(|r| r.split(' ').next())
-                            .and_then(|r| r.parse::<u64>().ok())
-                    };
-                    let kv_heads = split
-                        .arch_get_u64("attention.head_count_kv")
-                        .or_else(|| split.arch_get_u64("attention.head_count"))
-                        .ok_or("no attention.head_count(_kv)")?;
-                    let head_dim = split
-                        .arch_get_u64("attention.key_length")
-                        .ok_or("no attention.key_length")?;
-                    let layers = split.arch_get_u64("block_count").ok_or("no block_count")?;
-                    // A qwen3moe file's every layer carries the planes, so
-                    // the delta is exact; a qwen35moe file's delta layers
-                    // carry none, so the same product is only the upper
-                    // bound (their exact 17/32 term is the model crate's
-                    // own unit pin).
-                    let ceiling = layers * n * kv_heads * head_dim * 15 / 8;
-                    let f16_log =
-                        std::fs::read_to_string(dir.join("ctx-default").join("server.err"))?;
-                    let dropped = resident(&f16_log)
-                        .zip(resident(&log))
-                        .is_some_and(|(a, b)| {
-                            let d = a.saturating_sub(b);
-                            match split.architecture() {
-                                Some("qwen3moe") => d == ceiling,
-                                _ => d > 0 && d <= ceiling,
-                            }
-                        });
-                    println!(
-                        "ctx arm q8: residents f16 {:?} q8_0 {:?}, the planes' delta at most \
-                         {ceiling} B",
-                        resident(&f16_log),
-                        resident(&log)
-                    );
-                    check(ok, "q8_resident_drops_by_the_planes", dropped);
                 }
                 "default" => {
                     check(
@@ -522,6 +486,79 @@ mod gate {
             }
             println!("ctx arm {name}: server stopped: {}", s.stop()?);
         }
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let resident = |log: &str| {
+            log.lines()
+                .find(|l| l.starts_with("load "))
+                .and_then(|l| l.split("resident_bytes=").nth(1))
+                .and_then(|r| r.split(' ').next())
+                .and_then(|r| r.parse::<u64>().ok())
+        };
+        let kv_heads = split
+            .arch_get_u64("attention.head_count_kv")
+            .or_else(|| split.arch_get_u64("attention.head_count"))
+            .ok_or("no attention.head_count(_kv)")?;
+        let head_dim = split
+            .arch_get_u64("attention.key_length")
+            .ok_or("no attention.key_length")?;
+        let layers = split.arch_get_u64("block_count").ok_or("no block_count")?;
+        // A qwen3moe file's every layer carries the planes, so
+        // the delta is exact; a qwen35moe file's delta layers
+        // carry none, so the same product is only the upper
+        // bound (their exact 17/32 term is the model crate's
+        // own unit pin).
+        // The delta holds at one context: the auto search grows
+        // the q8_0 answer past the f16 one wherever the card has
+        // room (the relation above pins that), so the residents
+        // compare against a second q8_0 server held to the
+        // default arm's context by `--ctx`, started once every arm's
+        // server has stopped (two loads do not fit one card).
+        let same_n = default_n.ok_or("the q8 arm runs after the default arm")?;
+        let same_dir = dir.join("ctx-q8-same");
+        std::fs::create_dir_all(&same_dir)?;
+        let same_err = same_dir.join("server.err");
+        let mut same_cmd = Command::new(beside("bloomery-serve")?);
+        same_cmd.env_remove("BLOOMERY_REF_MODEL");
+        let same_ctx = same_n.to_string();
+        let same_args = [
+            "--model",
+            "qwen3",
+            "--port",
+            "0",
+            "-m",
+            m,
+            "--parallel",
+            "1",
+            "--cache-type-k",
+            "q8_0",
+            "--ctx",
+            same_ctx.as_str(),
+        ];
+        let mut same = Served::spawn_cmd(same_cmd, &same_args, &same_dir)?;
+        same.address(&same_err, 600, Duration::from_secs(1))?;
+        println!(
+            "ctx arm q8 at the f16 context: server stopped: {}",
+            same.stop()?
+        );
+        let same_log = std::fs::read_to_string(&same_err)?;
+        let ceiling = layers * same_n * kv_heads * head_dim * 15 / 8;
+        let f16_log = std::fs::read_to_string(dir.join("ctx-default").join("server.err"))?;
+        let dropped = resident(&f16_log)
+            .zip(resident(&same_log))
+            .is_some_and(|(a, b)| {
+                let d = a.saturating_sub(b);
+                match split.architecture() {
+                    Some("qwen3moe") => d == ceiling,
+                    _ => d > 0 && d <= ceiling,
+                }
+            });
+        println!(
+            "ctx arm q8: residents f16 {:?} q8_0 {:?} at the f16 context {same_n}, \
+                 the planes' delta at most {ceiling} B",
+            resident(&f16_log),
+            resident(&same_log)
+        );
+        check(ok, "q8_resident_drops_by_the_planes", dropped);
         // The default arm's answer, the one-slot load's total context: the
         // slots clause's split is half of it.
         Ok(default_n)
