@@ -47,16 +47,20 @@
 //! whether the chat template writes it). Every cache event and every prefix
 //! the body keeps less of than a request shares is a record line.
 //!
-//! `--parallel N` (`-np N`, default 2) serves N slots that take the one body
-//! in turns (`serve::SwapEngine`); the default's second slot costs a lone
-//! request nothing, the turns acting only on a second arrival, and
-//! `--parallel 1` keeps the plain engine: a request that arrives while another
-//! decodes preempts it at the next step, the running request's sequence
-//! state parked in host RAM, and the live requests then take turns of
-//! `serve::QUANTUM` tokens. The parked states' budget is `--park-ram` (MiB),
-//! by default the lesser of [`CACHE_RAM_CAP`] and the host headroom the
-//! prompt cache leaves (`/metrics`' `swap_park_budget_bytes`); a request that
-//! would park a state past it is a 503 naming the budget. `--queue-depth Q`
+//! `--parallel N` (`-np N`) serves N slots that take the one body
+//! in turns (`serve::SwapEngine`); the default is what the parked states'
+//! budget holds of one slot's whole-context state — the plan's KV rows, the
+//! ring shadows and the history, at the ctx the server loads — the lesser of
+//! `bind::PARALLEL_CAP` and it, never below the plain engine, and the flag
+//! an upper bound on the same, so `--parallel 1` keeps the plain engine: a
+//! request that arrives while another decodes preempts it at the next step,
+//! the running request's sequence state parked in host RAM, and the live
+//! requests then take turns of `serve::QUANTUM` tokens. The parked states'
+//! budget is `--park-ram` (MiB), by default the lesser of [`CACHE_RAM_CAP`]
+//! and the host headroom the prompt cache leaves (`/metrics`'
+//! `swap_park_budget_bytes`); a request that would park a state past it is a
+//! 503 naming the budget. A `parallel` line on stderr names the rule
+//! (`plain`, `budget` or `flag`), the slots and each term. `--queue-depth Q`
 //! bounds the requests that wait for a slot. Several slots are refused by
 //! name under the DSpark draft (a state put back starts the draft over, and a
 //! turn has no prompt call to feed it its window) and under
@@ -125,7 +129,8 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
+    Parallel, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
+    sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -175,8 +180,9 @@ struct Args {
     alias: Option<String>,
     /// `--cache-ram` in bytes; `None` takes the default.
     cache_ram: Option<u64>,
-    /// `--parallel`: slots that take the body in turns past 1.
-    parallel: usize,
+    /// `--parallel`: slots that take the body in turns past 1; `None` takes
+    /// the elastic default ([`Parallel`]).
+    parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// `--park-ram` in bytes; `None` takes the default.
     park_ram: Option<u64>,
@@ -190,11 +196,10 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: usize::try_from(workstation::CTX_MAX)?,
         alias: None,
         cache_ram: None,
-        // Two slots by default: a lone request pays nothing for the second
-        // (the turns act only on a second arrival), so a caller that sends
-        // one conversation at a time needs no flag. `--parallel 1` keeps the
-        // plain engine.
-        parallel: 2,
+        // The elastic default ([`Parallel`]): a lone request pays nothing for
+        // a second slot (the turns act only on a second arrival), and
+        // `--parallel 1` keeps the plain engine.
+        parallel: None,
         queue_depth: None,
         park_ram: None,
     };
@@ -213,18 +218,18 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--ctx" => a.ctx = v.parse()?,
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(mib_bytes(flag, v)?),
-            "--parallel" | "-np" => a.parallel = v.parse()?,
+            "--parallel" | "-np" => a.parallel = Some(v.parse()?),
             "--queue-depth" => a.queue_depth = Some(v.parse()?),
             "--park-ram" => a.park_ram = Some(mib_bytes(flag, v)?),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
     match a.park_ram {
-        Some(_) if a.parallel < 2 => {
+        Some(_) if a.parallel.is_some_and(|n| n < 2) => {
             return Err(format!(
                 "--park-ram holds the states of slots that take the body in turns; \
                  --parallel {} has none to park",
-                a.parallel
+                a.parallel.unwrap_or(0)
             )
             .into());
         }
@@ -255,9 +260,7 @@ fn park_budget(
     if let Some(b) = park_ram {
         return Ok(b);
     }
-    let left = u64::try_from(headroom)
-        .unwrap_or(0)
-        .saturating_sub(cache_ram);
+    let left = park_left(None, headroom, cache_ram);
     if left == 0 {
         return Err(format!(
             "--parallel {n}: the plan's host headroom of {headroom} B less the prompt cache's \
@@ -266,7 +269,20 @@ fn park_budget(
         )
         .into());
     }
-    Ok(left.min(CACHE_RAM_CAP))
+    Ok(left)
+}
+
+/// [`park_budget`]'s terms, 0 when nothing is left: the elastic
+/// `--parallel` default's budget, which falls to the plain engine there
+/// instead of refusing. `park_ram` as given, as `park_budget` takes it.
+fn park_left(park_ram: Option<u64>, headroom: i64, cache_ram: u64) -> u64 {
+    if let Some(b) = park_ram {
+        return b;
+    }
+    u64::try_from(headroom)
+        .unwrap_or(0)
+        .saturating_sub(cache_ram)
+        .min(CACHE_RAM_CAP)
 }
 
 /// Loads the model and serves until the listener or the engine fails;
@@ -294,12 +310,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .into());
     }
     let draft = Draft::from_levers(&levers)?;
-    if a.parallel > 1 && draft == Draft::Dspark {
+    if a.parallel.is_some_and(|n| n > 1) && draft == Draft::Dspark {
         return Err(format!(
             "--parallel {} under BLOOMERY_DRAFT=dspark: a slot's state put back starts the \
              DSpark draft over, and a turn has no prompt call to feed it its window; serve one \
              slot, or the lookup draft",
-            a.parallel
+            a.parallel.unwrap_or(0)
         )
         .into());
     }
@@ -341,7 +357,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         &path,
         &inputs,
     )?;
-    let (card, placement, headroom) = print_plan(
+    let (card, placement, headroom, state) = print_plan(
         &inputs,
         a.place,
         reserve,
@@ -353,10 +369,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let cache_ram = a
         .cache_ram
         .unwrap_or_else(|| u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP)));
-    let park = match a.parallel {
-        0 | 1 => None,
-        n => Some(park_budget(a.park_ram, headroom, cache_ram, n)?),
+    let budget = match a.parallel {
+        Some(n) if n >= 2 => park_budget(a.park_ram, headroom, cache_ram, n)?,
+        _ => park_left(a.park_ram, headroom, cache_ram),
     };
+    // The elastic slot count ([`Parallel`]): one slot's whole-context state
+    // the budget's unit, the flag an upper bound, the default what the
+    // budget holds.
+    let parallel = Parallel::of(a.parallel, budget, state);
+    eprintln!("{}", parallel.line());
+    let park = (parallel.slots > 1).then_some((parallel.slots, budget));
     Record::new(&record::CACHE_CONFIG)
         .u("ram", cache_ram)
         .u("headroom", headroom)
@@ -402,15 +424,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     // One slot stays the plain engine; several take it in turns.
     let engine: Box<dyn Engine> = match park {
-        Some(budget) => Box::new(SwapEngine::new(
+        Some((slots, budget)) => Box::new(SwapEngine::new(
             Box::new(engine),
-            a.parallel,
+            slots,
             Park::States { budget },
         )?),
         None => Box::new(engine),
     };
     let slots = SlotConfig {
-        parallel: a.parallel,
+        parallel: parallel.slots,
         queue_depth: a.queue_depth,
         ..SlotConfig::default()
     };
@@ -430,7 +452,7 @@ fn route_trace(
     levers: &bloomery_levers::Levers,
     cfg: &body::OpenCfg,
     residency: ResidencyPick,
-    (draft, parallel): (Draft, usize),
+    (draft, parallel): (Draft, Option<usize>),
     place: Place,
     path: &Path,
     inputs: &PlanInputs,
@@ -453,6 +475,14 @@ fn route_trace(
         )
         .into());
     }
+    let Some(parallel) = parallel else {
+        return Err(
+            "BLOOMERY_ROUTE_TRACE records one sequence's steps after its call row; the elastic \
+             --parallel default may put a parked request's steps after another's; --parallel 1 \
+             names the plain engine"
+                .into(),
+        );
+    };
     if parallel > 1 {
         return Err(format!(
             "BLOOMERY_ROUTE_TRACE records one sequence's steps after its call row; \
@@ -514,7 +544,7 @@ fn print_plan(
     ctx: usize,
     levers: &PlanLevers,
     residency: (Residency, ResidencyPick),
-) -> Result<(String, Option<PlacementProps>, i64), GateError> {
+) -> Result<(String, Option<PlacementProps>, i64, u64), GateError> {
     let machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
     let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
     record::plan(place.name(), &machine, &plan).eprint();
@@ -546,7 +576,14 @@ fn print_plan(
     let headroom = i64::try_from(host_headroom)
         .map_err(|_| format!("the plan's host headroom {host_headroom} B passes i64"))?;
     let cards: Vec<&str> = machine.all_cards().map(|c| c.name.as_str()).collect();
-    Ok((cards.join("+"), placement.ok(), headroom))
+    // One slot's whole-context state, the parked states' budget's unit: the
+    // snapshot's own terms at the ctx the server loads — the plan's KV rows
+    // (each layer's window ring, compressed rows and keys, and the pooling
+    // state), the ring shadows' rows, the history a position a u32.
+    let state = plan.cards.iter().map(|c| c.kv_bytes).sum::<u64>()
+        + plan.host.shadow_bytes
+        + 4 * u64::try_from(ctx).unwrap_or(u64::MAX);
+    Ok((cards.join("+"), placement.ok(), headroom, state))
 }
 
 const WHAT: &str = "bloomery-serve-ds41";

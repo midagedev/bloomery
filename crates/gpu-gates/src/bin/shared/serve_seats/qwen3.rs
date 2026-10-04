@@ -224,9 +224,11 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         port: 8080,
         ctx: None,
         place: None,
-        // Two slots by default: a lone request pays nothing for the second
-        // (the turns act only on a second arrival); `--parallel 1` keeps the
-        // plain engine.
+        // The fixed default, not an elastic one: this seat's park holds ids
+        // only (`Park::Ids`), no byte budget to size the slots from — a
+        // state to park is a seat that saves one. A lone request pays
+        // nothing for the second (the turns act only on a second arrival);
+        // `--parallel 1` keeps the plain engine.
         parallel: 2,
         queue_depth: None,
     };

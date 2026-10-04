@@ -23,10 +23,6 @@ use serve::Drafted;
 
 /// The draft's side of a saved sequence ([`DraftedSeat::park`]): what the
 /// draft held of it, and why the seat had turned it off, if it had.
-#[allow(
-    dead_code,
-    reason = "bloomery-serve-qwen38 includes this file and parks no draft; bloomery-serve's glm seat parks it"
-)]
 #[derive(Clone, Debug)]
 pub(crate) struct ParkedDraft<A> {
     draft: Parked<A>,
@@ -196,10 +192,6 @@ where
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "bloomery-serve-qwen38 includes this file and parks no draft; bloomery-serve's glm seat parks it"
-)]
 impl<B: MtpBody, const M: usize> DraftedSeat<B, M>
 where
     Window<M>: Widths,

@@ -7,7 +7,8 @@
 //!
 //!     bloomery-serve-qwen38 [--host 127.0.0.1] [--port 8080] [--place a|gate|bp]
 //!                           [--ctx-size C] [--alias NAME] [--cache-ram MIB]
-//!                           [--chat-template-file PATH] [--slot-save-path DIR]
+//!                           [--chat-template-file PATH] [--parallel N]
+//!                           [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
 //!
 //! `--slot-save-path` names the directory the slot actions answer from, as
 //! llama-server's; without it every slot action is refused. `--ctx` is `--ctx-size` under its family's other spelling. The model is
@@ -69,22 +70,45 @@
 //! holds the slot's sequence state when a request of another session takes
 //! the slot: the positional rows (K/V, raw and pooled keys) of the held
 //! positions, the recurrent stores at the held position and at the last
-//! prompt call's end, each with its PLE history (`Seq38`). A returning
-//! session's state comes back whole, and its checkpoints are those two
-//! points. Its default is the lesser of `bind::CACHE_RAM_CAP` and half of what
-//! `MemAvailable` leaves at load past the plan's host need, the residency's
-//! churn pool and the checkpoints' host budget; a `cache` line on stderr
-//! prints it with each term. A state of another model, card or context is
-//! refused by name; every save, load, eviction and skip prints as a line.
+//! prompt call's end, each with its PLE history, and under the draft the
+//! layer's side (`Seq38`): its store rows and the step's and the pass's
+//! arena rows with the positions they hold, the draft's waiting rows beside
+//! them ([`DraftedSeat::park`]). A returning session's state comes back
+//! whole, and its checkpoints are those two points. Its default is the
+//! lesser of `bind::CACHE_RAM_CAP` and half of what `MemAvailable` leaves at
+//! load past the plan's host need, the residency's churn pool and the
+//! checkpoints' host budget; a `cache` line on stderr prints it with each
+//! term. A state of another model, card, context or store layout (a load
+//! with the draft beside one without it) is refused by name; every save,
+//! load, eviction and skip prints as a line.
+//!
+//! `--parallel N` (`-np N`) serves N slots that take the one model in turns
+//! (`serve::SwapEngine`); the default is what the parked states' budget
+//! holds of one slot's whole-context state — the lesser of
+//! `bind::PARALLEL_CAP` and it, never below the plain engine — and the flag
+//! an upper bound on the same, so `--parallel 1` keeps the plain engine: a
+//! request that arrives while another decodes preempts it at the next step,
+//! the running request's sequence state ([`Seq38`], the draft's side with
+//! it) parked in host RAM, and the live requests then take turns of
+//! `serve::QUANTUM` tokens, each put back where it left, its draft joining
+//! there. The parked states' budget is `--park-ram` (MiB), by default the
+//! lesser of `bind::CACHE_RAM_CAP` and what `MemAvailable` leaves past the
+//! plan's host need, the churn pool, the checkpoints and the prompt cache
+//! (`bind::CacheRam::park`); a request that would park a state past it is a
+//! 503 naming the budget. A `parallel` line on stderr names the rule
+//! (`plain`, `budget` or `flag`), the slots and each term.
+//! `--queue-depth Q` bounds the requests that wait for a slot.
 //!
 //! The MTP draft keeps the same rule past a break-even, and the server cuts
 //! its prompt calls at the same message starts (the draft's prompt call joins
 //! each run where the one before left it). The draft rejoins a sequence only
-//! where its last call left it, so a cut to a checkpoint, or a state put
-//! back, leaves it proposing nothing until a request starts from position 0:
-//! the seat turns the draft off there (`DraftedSeat::turn_off`), prints a
-//! `bloomery-serve-qwen38: the MTP draft proposes nothing …` line at the cut
-//! or at the first call after the resume, and each later prompt call's `mtp
+//! where its last call left it: a state put back carries its waiting rows
+//! ([`DraftedSeat::park`]) and it drafts on as if no other sequence had run,
+//! while a cut to a checkpoint — the rows past the cut belonging to the
+//! branch the cut dropped — leaves it proposing nothing until a request
+//! starts from position 0. The seat turns the draft off there
+//! (`DraftedSeat::turn_off`), prints a `bloomery-serve-qwen38: the MTP draft
+//! proposes nothing …` line at the cut, and each later prompt call's `mtp
 //! prompt` record names why. A request that keeps every held position with
 //! the draft on keeps the draft. One whose kept prefix would leave the draft
 //! off (a cut, or a draft already off) keeps it only at or past the
@@ -173,13 +197,11 @@ use std::time::Instant;
 
 use app::mtp::MtpBody;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-use bloomery_gpu::arch::qwen3moe::{
-    Body38, Prompt38, Seq38, checkpoint_bytes, seq_positional_bytes,
-};
+use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_bytes};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
+    CacheRam, Parallel, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
     sampler_factory,
 };
 use bloomery_gpu_gates::generate::Place;
@@ -205,12 +227,12 @@ use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
 use serve::{
-    CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
-    Server, ServerConfig,
+    CacheNote, DraftProps, Drafted, Engine, EngineProps, FATAL_LINGER, Park, ResidencyReset, Saved,
+    ServeError, Server, ServerConfig, SlotConfig, SwapEngine,
 };
 use tokenizer::Tokenizer;
 
-use super::drafted::DraftedSeat;
+use super::drafted::{DraftedSeat, ParkedDraft};
 
 /// The levers `bloomery-serve-qwen38` acts on, for its own `main` and for
 /// `gate_qwen38_serve`'s (the gate starts the server with its own
@@ -232,7 +254,7 @@ pub const ACTS_ON: &[&str] = &[
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
                      [--ctx-size C] [--alias NAME] [--cache-ram MIB] [--chat-template-file PATH] \
-                     [--slot-save-path DIR]";
+                     [--parallel N] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]";
 
 /// The context the default's expert cost is counted against: the plan
 /// every Qwen3.8 measurement ran at, and `generate_qwen3moe`'s default.
@@ -245,7 +267,7 @@ const CTX_STEP: usize = 256;
 /// cut at the first and the last inside it.
 const MESSAGE_START: &str = "<|im_start|>";
 
-/// Why a cut or a state put back leaves the MTP draft proposing nothing
+/// Why a cut leaves the MTP draft proposing nothing
 /// ([`DraftedSeat::turn_off`]).
 const DRAFT_OFF_WHY: &str = "the draft rejoins a sequence only where its last call left it, \
                              and it holds no rows at the kept position";
@@ -682,9 +704,10 @@ fn ctx38(plans: &Plans<'_>, set: Option<usize>) -> Result<Ctx38, GateError> {
 
 impl Ctx38 {
     /// A default bounded by the prompt cache too: one session's state at the
-    /// whole context (`Seq38`: its positional rows and two recurrent copies)
-    /// fits `ram` bytes, when the cache is on. A set context keeps its value.
-    fn host_bound(self, inputs: &PlanInputs, ram: u64) -> Result<Ctx38, GateError> {
+    /// whole context ([`Seq38`: its positional rows and two recurrent
+    /// copies, the draft's side under `drafts`](seq38_bytes)) fits `ram`
+    /// bytes, when the cache is on. A set context keeps its value.
+    fn host_bound(self, inputs: &PlanInputs, ram: u64, drafts: bool) -> Result<Ctx38, GateError> {
         if self.rule == "set" || ram == 0 {
             return Ok(self);
         }
@@ -695,15 +718,14 @@ impl Ctx38 {
             .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
             .count();
         let qsa = inputs.spec.layers.len() - gdn;
-        let state = |n: usize| seq_positional_bytes(qsa, n) + 2 * checkpoint_bytes(gdn);
+        let state = |n: usize| seq38_bytes(gdn, qsa, n, drafts);
         if state(self.ctx) <= ram {
             return Ok(self);
         }
         if state(1) > ram {
             return Err(format!(
                 "the prompt cache's {ram} bytes hold no sequence state (two recurrent copies \
-                 of {} bytes); --cache-ram 0 turns it off",
-                checkpoint_bytes(gdn)
+                 among its terms); --cache-ram 0 turns it off"
             )
             .into());
         }
@@ -747,6 +769,12 @@ struct Args {
     /// `--slot-save-path`: the directory the slot actions answer from;
     /// `None` refuses every one, as llama-server does.
     slot_save_path: Option<PathBuf>,
+    /// `--parallel`: slots that take the model in turns past 1; `None`
+    /// takes the elastic default ([`Parallel`]).
+    parallel: Option<usize>,
+    queue_depth: Option<usize>,
+    /// `--park-ram` in bytes; `None` takes the default.
+    park_ram: Option<u64>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -759,6 +787,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         cache_ram: None,
         template_file: None,
         slot_save_path: None,
+        parallel: None,
+        queue_depth: None,
+        park_ram: None,
     };
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
@@ -777,11 +808,22 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(v)?),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
+            "--parallel" | "-np" => a.parallel = Some(v.parse()?),
+            "--queue-depth" => a.queue_depth = Some(v.parse()?),
+            "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(v)?),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
     if a.ctx == Some(0) {
         return Err("--ctx-size 0: the stores hold no position".into());
+    }
+    if a.park_ram.is_some() && a.parallel.is_some_and(|n| n < 2) {
+        return Err(format!(
+            "--park-ram holds the states of slots that take the model in turns; --parallel {} \
+             has none to park",
+            a.parallel.unwrap_or(0)
+        )
+        .into());
     }
     a.place = a.place.on_host()?;
     Ok(a)
@@ -893,12 +935,29 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let rule = ctx38(&plans, a.ctx)?;
     let (need, pool) = plans.host(rule.ctx, set)?;
     let cache = CacheRam::of(a.cache_ram, need, pool)?;
-    let rule = rule.host_bound(&inputs, cache.ram)?;
+    let rule = rule.host_bound(&inputs, cache.ram, mtp)?;
     rule.print();
     eprintln!(
         "{} message_start={MESSAGE_START} in_vocab={has_start} in_template={in_template}",
         cache.line()
     );
+    // The elastic slot count ([`Parallel`]): one slot's whole-context state
+    // the budget's unit, the flag an upper bound, the default what the
+    // budget holds.
+    let gdn = inputs
+        .spec
+        .layers
+        .iter()
+        .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
+        .count();
+    let qsa = inputs.spec.layers.len() - gdn;
+    let state = seq38_bytes(gdn, qsa, rule.ctx, mtp);
+    let budget = match a.parallel {
+        Some(n) if n >= 2 => cache.park(a.park_ram, n)?,
+        _ => cache.park_or_none(a.park_ram),
+    };
+    let parallel = Parallel::of(a.parallel, budget, state);
+    eprintln!("{}", parallel.line());
     if mtp {
         let be = BreakEven::of(a.place);
         eprintln!(
@@ -1014,7 +1073,22 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         fatal_linger: FATAL_LINGER,
         slot_save_path: a.slot_save_path,
     };
-    let server = Server::bind((a.host.as_str(), a.port), Box::new(engine), config)?;
+    // One slot stays the plain engine; several take it in turns.
+    let engine: Box<dyn Engine> = if parallel.slots > 1 {
+        Box::new(SwapEngine::new(
+            Box::new(engine),
+            parallel.slots,
+            Park::States { budget },
+        )?)
+    } else {
+        Box::new(engine)
+    };
+    let slots = SlotConfig {
+        parallel: parallel.slots,
+        queue_depth: a.queue_depth,
+        ..SlotConfig::default()
+    };
+    let server = Server::bind_with((a.host.as_str(), a.port), engine, config, slots)?;
     Record::new(&record::LISTENING38)
         .w("place", a.place.name())
         .u("ctx", ctx)
@@ -1068,9 +1142,6 @@ struct Q38 {
     /// The branch the last keep query took ([`Q38::draft_keep`]), printed at
     /// the request's first call.
     branch: std::cell::Cell<Option<Branch38>>,
-    /// A state put back under the draft: its positions, whose draft-off line
-    /// prints at the request's first call if the draft is still off then.
-    resumed_off: Option<u32>,
 }
 
 impl Q38 {
@@ -1233,7 +1304,6 @@ impl Q38 {
             residency,
             break_even: a.mtp.then(|| BreakEven::of(a.place)),
             branch: std::cell::Cell::new(None),
-            resumed_off: None,
         })
     }
 
@@ -1263,8 +1333,7 @@ impl Q38 {
     }
 
     /// What the request's reuse left to say, at its first call: the `mtp
-    /// keep` record of the branch its keep took, then, when a state was put
-    /// back and the draft is still off, the draft-off line.
+    /// keep` record of the branch its keep took.
     fn before_call(&mut self) {
         if let Some(b) = self.branch.take() {
             Record::new(&record::MTP_KEEP38)
@@ -1273,11 +1342,6 @@ impl Q38 {
                 .u("break_even", b.break_even)
                 .u("reply", b.reply)
                 .eprint();
-        }
-        if let Some(pos) = self.resumed_off.take()
-            && self.drafted.is_off()
-        {
-            draft_off(pos, "a state put back");
         }
     }
 
@@ -1309,13 +1373,14 @@ fn draft_off(pos: u32, what: &str) {
     );
 }
 
-/// A Qwen3.8 sequence state as the server's prompt cache holds it, and
-/// whether the MTP draft ran (a state is put back only on a seat with the
-/// same draft). The cache ranks it by the seat's rule: every position it
-/// holds, or the point it carries at or below the shared prefix.
+/// A Qwen3.8 sequence state as the server's prompt cache holds it, with the
+/// draft's side of it ([`DraftedSeat::park`]) beside the body's
+/// ([`Seq38`], the draft's rows within it). The cache ranks it by the
+/// seat's rule: every position it holds, or the point it carries at or
+/// below the shared prefix.
 struct Saved38 {
     state: Seq38,
-    drafted: bool,
+    draft: Option<ParkedDraft<TargetRows>>,
 }
 
 impl Saved for Saved38 {
@@ -1382,7 +1447,6 @@ impl Seat for Q38 {
     /// The session's reset, the MTP draft on again: the residency stays
     /// where use has taken it (only [`Seat::residency_reset`] moves it back).
     fn reset(&mut self) -> Result<(), GateError> {
-        self.resumed_off = None;
         self.drafted.reset(&mut self.s)
     }
 
@@ -1459,7 +1523,6 @@ impl Seat for Q38 {
         self.s.model_mut().rollback(pos)?;
         if self.drafted.drafts() && pos < held {
             self.drafted.turn_off(DRAFT_OFF_WHY);
-            self.resumed_off = None;
             draft_off(pos, &format!("a cut back from {held}"));
         }
         Ok(())
@@ -1508,40 +1571,32 @@ impl Seat for Q38 {
         p
     }
 
-    /// The sequence state (`GpuModel::seq_save`) as the prompt cache holds
-    /// it, with the keep rule the seat grants after its resume.
+    /// The sequence state (`GpuModel::seq_save`, the draft's rows within it)
+    /// as the prompt cache holds it, with the draft's side of it
+    /// ([`DraftedSeat::park`]) beside the body's.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
         Ok(Arc::new(Saved38 {
             state: self.s.model_mut().seq_save()?,
-            drafted: self.drafted.drafts(),
+            draft: self.drafted.park(),
         }))
     }
 
     /// The state put back (`GpuModel::seq_resume`) after the session's reset,
-    /// which starts the draft over: no refresh of another sequence waits;
-    /// under the draft it is then off, said at the request's first call when
-    /// it still is ([`Q38::before_call`]: the keep rule may reset). A state
-    /// this seat did not take is refused by name.
+    /// then the draft's side of it ([`DraftedSeat::unpark`]): the sequence's
+    /// next call runs as it would have with no switch between, its draft
+    /// joining where it left. Refused by name, before the reset, for a state
+    /// this seat did not take or one saved with the draft on put back with it
+    /// off (or the other way); the body refuses another model's state or
+    /// layout.
     fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError> {
         let saved = state
             .as_any()
             .downcast_ref::<Saved38>()
             .ok_or("a saved state that is not a qwen4exp body's")?;
-        if saved.drafted != self.drafted.drafts() {
-            return Err(format!(
-                "a state saved with the MTP draft {} put back with it {}",
-                if saved.drafted { "on" } else { "off" },
-                if self.drafted.drafts() { "on" } else { "off" }
-            )
-            .into());
-        }
+        self.drafted.takes(saved.draft.as_ref())?;
         self.drafted.reset(&mut self.s)?;
         self.s.model_mut().seq_resume(&saved.state)?;
-        if self.drafted.drafts() && saved.state.positions() > 0 {
-            self.drafted.turn_off(DRAFT_OFF_WHY);
-            self.resumed_off = Some(saved.state.positions());
-        }
-        Ok(())
+        self.drafted.unpark(saved.draft.as_ref())
     }
 
     /// A prefix kept less of than shared is a `cache reuse` record; every

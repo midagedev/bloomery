@@ -58,7 +58,20 @@
 //!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path;
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) is served
 //!   through plain steps, drafting nothing, and the same request at `top_k`
-//!   1 gives this server's greedy ids.
+//!   1 gives this server's greedy ids;
+//! - every server's `parallel` line ([`parallel_agrees`]): the elastic
+//!   `--parallel` default's slots are what its rule (`plain` or `budget`)
+//!   holds of the line's own terms — the park budget, one slot's
+//!   whole-context state and the cap — and the swap server's flag names the
+//!   `flag` rule with the flag's slots;
+//! - the swap clause ([`swap_rejoins_the_draft`], a server of its own under
+//!   `BLOOMERY_DRAFT=mtp`): a decode preempted mid-run on `--parallel 2` is
+//!   parked with its draft's side and put back with it rejoining, so both
+//!   requests answer their solo runs' ids, their drafts run and skip
+//!   nothing (no `mtp prompt` skip, no draft-off line) while they take
+//!   turns, the switches counter moved and the second request came back
+//!   before the first (the residency off: nothing moves between the host
+//!   and the card, so the ids are exact).
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for, and more servers start on the card, one at a time:
@@ -123,7 +136,9 @@ mod gate {
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{checkpoint_bytes, seq_positional_bytes};
@@ -140,6 +155,7 @@ mod gate {
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::draft_file;
     use serde_json::{Value, json};
+    use threads::helper::{Placement, spawn_helper};
 
     /// The levers the server acts on — the same list
     /// `bloomery_serve_qwen38` parses, kept one with it: this gate starts the
@@ -222,6 +238,14 @@ mod gate {
     /// The words of the seat's line that says the MTP draft proposes nothing
     /// after a cut or a state put back.
     const DRAFT_OFF: &str = "the MTP draft proposes nothing from position";
+    /// The swap clause's requests: the first long enough to be preempted
+    /// mid-decode (the drafted step's rate is a fraction of the plain one's),
+    /// the second short enough to come back before it.
+    const SWAP_A_PREDICT: usize = 48;
+    const SWAP_B_PREDICT: usize = 8;
+    /// The swap clause's `/slots` poll while it waits for the first request's
+    /// decode.
+    const SWAP_POLL: Duration = Duration::from_millis(300);
     /// The one chat turn the chat clauses send.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
     /// The chat's reply length.
@@ -1384,6 +1408,229 @@ mod gate {
         Ok(ok)
     }
 
+    /// `/metrics`' `llamacpp:<name>` value; `None` when it carries none.
+    fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
+        let (st, body) = curl(&url("/metrics"), None, false)?;
+        if st != 200 {
+            return Err(format!("/metrics: HTTP {st}: {body}").into());
+        }
+        let key = format!("llamacpp:{name} ");
+        Ok(body
+            .lines()
+            .find_map(|l| l.strip_prefix(&key))
+            .and_then(|v| v.trim().parse().ok()))
+    }
+
+    /// The server's `parallel` line (`serve_seats::Parallel::line`), printed
+    /// before its load.
+    fn parallel_line(err_log: &Path) -> Result<Option<String>, GateError> {
+        Ok(std::fs::read_to_string(err_log)?
+            .lines()
+            .find(|l| l.starts_with("parallel rule="))
+            .map(str::to_owned))
+    }
+
+    /// The `parallel` line's rule against its own terms: the slots it names
+    /// are what its rule holds of the line's own park budget, one slot's
+    /// whole-context state and cap — one slot under `plain`, the lesser of
+    /// the cap and the budget's holds under `budget` (`Parallel::of`, whose
+    /// unit test holds the arithmetic), the flag's bound of the same holds
+    /// under `flag` (the flag the caller names, the line carrying only its
+    /// outcome). `None` a line that is not the seat's; `Some(false)` a rule
+    /// whose slots the terms do not hold.
+    fn parallel_agrees(line: &str, flag: Option<usize>) -> Option<bool> {
+        let field = |k: &str| {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(k)?.strip_prefix('='))
+        };
+        let rule = field("rule")?;
+        let slots: usize = field("slots")?.parse().ok()?;
+        let park: u64 = field("park")?.parse().ok()?;
+        let state: u64 = field("state")?.parse().ok()?;
+        let cap: usize = field("cap")?.parse().ok()?;
+        let holds = 1 + usize::try_from(park / state.max(1)).unwrap_or(usize::MAX);
+        let want = match (rule, flag) {
+            ("plain", _) => 1,
+            ("budget", None) => cap.min(holds),
+            ("flag", Some(f)) => f.min(holds).max(1),
+            _ => return None,
+        };
+        Some(slots == want)
+    }
+
+    /// The swap clause (module header) on a server of two slots started into
+    /// `<dir>/swap`: a decode preempted mid-run is parked with its draft's
+    /// side ([`Seat::snapshot`], the draft's rows within the state) and put
+    /// back with it rejoining ([`Seat::resume`]), so both requests answer
+    /// their solo runs' ids, their drafts run and skip nothing while they
+    /// take turns, the switches counter moved, the second request came back
+    /// before the first, and the server's `parallel` line names the flag's
+    /// rule with its two slots. The residency is off: nothing moves between
+    /// the host and the card, so a resumed run's bits are the solo run's.
+    /// Mutants: the seat resuming with the draft off (its old rule: the
+    /// draft-off line, a skip and no drafts — three of the five red); the
+    /// body's `put_draft_rows` omitted (the store stale, the first chain
+    /// after the resume refused — the requests fail); the state dropping the
+    /// arenas' rows (a resumed walk refused by name, the requests fail).
+    fn swap_rejoins_the_draft(dir: &Path) -> Result<bool, GateError> {
+        let dir = dir.join("swap");
+        std::fs::create_dir_all(&dir)?;
+        let err_log = dir.join("server.err");
+        // The main server's arguments plus the two-slot flag: this clause's
+        // server runs the turns on its own.
+        let mut args: Vec<&str> = SERVER_ARGS.to_vec();
+        args.extend(["--parallel", "2"]);
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "mtp")
+            .env(bloomery_levers::RESIDENCY, "off");
+        let mut served = Served38::spawn_with(&args, &dir, &mut cmd)?;
+        println!("swap server pid {}", served.child.id());
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let mut ok = true;
+        let line = parallel_line(&err_log)?.ok_or("the swap server printed no `parallel` line")?;
+        println!("swap parallel {line}");
+        check(
+            &mut ok,
+            "swap_parallel_line_names_the_flag",
+            line.contains("rule=flag") && parallel_agrees(&line, Some(2)) == Some(true),
+        );
+        // No `ignore_eos`: its banned stop ids step a request plainly (a pass
+        // applies no logit bias), and this clause holds the draft.
+        let body = |ids: &[u32], n: usize| {
+            json!({
+                "prompt": ids, "n_predict": n, "temperature": 0,
+                "return_tokens": true, "cache_prompt": false,
+            })
+        };
+        let (a_ids, b_ids) = (
+            rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
+            rendered(&url, json!([{ "role": "user", "content": TURN_B }]))?,
+        );
+        let gemm = bloomery_gpu::arch::qwen3moe::Prompt38::GEMM_FROM;
+        if a_ids.len() < gemm || b_ids.len() < gemm {
+            return Err(format!(
+                "the swap clause's turns are {} and {} ids; each needs at least {gemm}",
+                a_ids.len(),
+                b_ids.len()
+            )
+            .into());
+        }
+        let mut alone = Vec::new();
+        for (ids, n) in [(&a_ids, SWAP_A_PREDICT), (&b_ids, SWAP_B_PREDICT)] {
+            let (st, text) = curl(&url("/completion"), Some(&body(ids, n)), false)?;
+            let v = json_of("/completion", st, &text)?;
+            alone.push((
+                ids_of(&v["tokens"]),
+                v["timings"]["draft_n"].as_u64().unwrap_or(0),
+            ));
+        }
+        println!(
+            "swap alone: {} and {} ids, drafts {} and {}",
+            alone[0].0.len(),
+            alone[1].0.len(),
+            alone[0].1,
+            alone[1].1
+        );
+        let swaps = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
+        // A request on a helper thread of its own: its handle, and its answer
+        // with when it came back.
+        type Answer = (Result<(u16, String), String>, Instant);
+        let post = |ids: Vec<u32>,
+                    n: usize|
+         -> Result<(JoinHandle<()>, mpsc::Receiver<Answer>), GateError> {
+            let u = url("/completion");
+            let b = body(&ids, n);
+            let (tx, rx) = mpsc::channel();
+            let (h, _) = spawn_helper("swap-request", Placement::Float, move || {
+                let r = curl(&u, Some(&b), false).map_err(|e| e.to_string());
+                let _ = tx.send((r, Instant::now()));
+            })
+            .map_err(|e| format!("swap: {}", e.what()))?;
+            Ok((h, rx))
+        };
+        let first = post(a_ids, SWAP_A_PREDICT)?;
+        loop {
+            if first.0.is_finished() {
+                return Err(
+                    "swap: the first request ended before /slots showed it decoding".into(),
+                );
+            }
+            let (st, text) = curl(&url("/slots"), None, false)?;
+            let slots = json_of("/slots", st, &text)?;
+            let decoding = slots.as_array().is_some_and(|l| {
+                l.iter().any(|s| {
+                    s["turn"] == "running"
+                        && s["next_token"]["n_decoded"].as_u64().is_some_and(|n| n > 0)
+                })
+            });
+            if decoding {
+                break;
+            }
+            std::thread::sleep(SWAP_POLL);
+        }
+        let joins_from = mtp_prompts(&err_log)?.len();
+        let offs_from = draft_offs(&err_log)?.len();
+        let second = post(b_ids, SWAP_B_PREDICT)?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+            h.join()
+                .map_err(|_| format!("swap: the {what} request's thread panicked"))?;
+            let (r, at) = rx
+                .recv()
+                .map_err(|_| format!("swap: the {what} request's thread gave no answer"))?;
+            let (st, text) = r.map_err(GateError::from)?;
+            let v = json_of("/completion", st, &text)?;
+            together.push((
+                ids_of(&v["tokens"]),
+                v["timings"]["draft_n"].as_u64().unwrap_or(0),
+                at,
+            ));
+        }
+        let skips = mtp_prompts(&err_log)?
+            .iter()
+            .skip(joins_from)
+            .filter(|l| !l.ends_with("skipped=none"))
+            .count();
+        let offs = draft_offs(&err_log)?.len() - offs_from;
+        let after = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
+        println!(
+            "swap together: first {} ids of {} drafts, second {} ids of {} drafts, second back \
+             {:?} before the first, switches {swaps} -> {after}, draft skips {skips}, draft-off \
+             lines {offs}",
+            together[0].0.len(),
+            together[0].1,
+            together[1].0.len(),
+            together[1].1,
+            together[0].2.checked_duration_since(together[1].2)
+        );
+        check(
+            &mut ok,
+            "swap_alone_ran_long_enough_to_preempt",
+            alone[0].0.len() >= SWAP_B_PREDICT && !alone[1].0.is_empty(),
+        );
+        check(
+            &mut ok,
+            "swap_second_back_before_the_first",
+            together[1].2 < together[0].2,
+        );
+        check(
+            &mut ok,
+            "swap_ids_are_alone_and_the_drafts_ran",
+            together[0].0 == alone[0].0
+                && together[1].0 == alone[1].0
+                && together[0].1 > 0
+                && together[1].1 > 0,
+        );
+        check(
+            &mut ok,
+            "swap_no_draft_skip_no_draft_off_and_switched",
+            skips == 0 && offs == 0 && after > swaps,
+        );
+        println!("swap server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
     /// The `cache` clause on a server of its own with the draft the main
     /// server did not run (`drafted`), the residency off.
     fn cache_other(dir: &Path, drafted: bool) -> Result<bool, GateError> {
@@ -1692,6 +1939,17 @@ mod gate {
         });
         println!("plan names the stage card's free bytes {free_named}");
         check(&mut ok, "plan_names_the_cards_free_bytes", free_named);
+        // The elastic `--parallel` default's line (the module header): the
+        // slots its rule names are what the line's own terms hold. FAIL-first:
+        // a default that ignores the budget (always two slots) turns this red
+        // wherever the budget holds another count.
+        let parallel = parallel_line(&err_log)?.ok_or("the server printed no `parallel` line")?;
+        println!("parallel {parallel}");
+        check(
+            &mut ok,
+            "parallel_default_holds_what_its_rule_names",
+            parallel_agrees(&parallel, None).unwrap_or(false),
+        );
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();
@@ -1836,6 +2094,10 @@ mod gate {
         ok &= cache_other(&a.dir, !drafted)?;
         ok &= ctx(&a.dir, &levers)?;
         ok &= residency(&a.dir, &completion)?;
+        if drafted {
+            // The draft's park and rejoin (the module header): its own server.
+            ok &= swap_rejoins_the_draft(&a.dir)?;
+        }
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");
             Ok(())

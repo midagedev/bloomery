@@ -74,20 +74,22 @@
 //! and `save` and `restore` answer the server's own 501, a state being a
 //! host value and not a file.
 //!
-//! `--parallel N` (`-np N`, default 2) serves N slots that take the one model
-//! in turns (`serve::SwapEngine`); the default's second slot costs a lone
-//! request nothing, the turns acting only on a second arrival, and
-//! `--parallel 1` keeps the plain engine: a request that arrives while another
-//! decodes preempts it at the next step, the running request's sequence
-//! state ([`seq_save`], the draft's side with it) parked in host RAM, and the
-//! live requests then take turns of `serve::QUANTUM` tokens, each put back
-//! ([`seq_resume`]) where it left, its draft joining there. The parked
-//! states' budget is `--park-ram` (MiB), by default the lesser of
-//! `bind::CACHE_RAM_CAP` and what `MemAvailable` leaves past the plan's host
-//! need, the churn pool, the checkpoints and the prompt cache
-//! (`bind::CacheRam::park`); a request that would park a state past it is a
-//! 503 naming the budget. `--queue-depth Q` bounds the requests that wait
-//! for a slot.
+//! `--parallel N` (`-np N`) serves N slots that take the one model in turns
+//! (`serve::SwapEngine`); the default is what the parked states' budget
+//! holds of one slot's whole-context state — the lesser of
+//! `bind::PARALLEL_CAP` and it, never below the plain engine — and the flag
+//! an upper bound on the same, so `--parallel 1` keeps the plain engine: a
+//! request that arrives while another decodes preempts it at the next step,
+//! the running request's sequence state ([`seq_save`], the draft's side with
+//! it) parked in host RAM, and the live requests then take turns of
+//! `serve::QUANTUM` tokens, each put back ([`seq_resume`]) where it left,
+//! its draft joining there. The parked states' budget is `--park-ram` (MiB),
+//! by default the lesser of `bind::CACHE_RAM_CAP` and what `MemAvailable`
+//! leaves past the plan's host need, the churn pool, the checkpoints and the
+//! prompt cache (`bind::CacheRam::park`); a request that would park a state
+//! past it is a 503 naming the budget. A `parallel` line on stderr names the
+//! rule (`plain`, `budget` or `flag`), the slots and each term.
+//! `--queue-depth Q` bounds the requests that wait for a slot.
 //!
 //! `BLOOMERY_DRAFT=mtp` loads the file's next-token layer beside the target
 //! (`app::arch::glm5next::open_nextn`, the plan `PlanInputs::plan_nextn`
@@ -156,7 +158,7 @@ use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
+    CacheRam, Parallel, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
     sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
@@ -164,7 +166,7 @@ use bloomery_gpu_gates::record::{self, Kind, Record};
 use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, ref_model_path};
 use bloomery_gpu_glm5next::{
-    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_resume, seq_save,
+    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_bytes, seq_resume, seq_save,
 };
 use bloomery_levers::{
     GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
@@ -495,8 +497,9 @@ struct Args {
     prefill: PrefillMode,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
-    /// `--parallel`: slots that take the model in turns past 1.
-    parallel: usize,
+    /// `--parallel`: slots that take the model in turns past 1; `None`
+    /// takes the elastic default ([`Parallel`]).
+    parallel: Option<usize>,
     queue_depth: Option<usize>,
     /// `--park-ram` in bytes; `None` takes the default.
     park_ram: Option<u64>,
@@ -514,10 +517,10 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         template_file: None,
         prefill: PrefillMode::Batch,
         plan_only: false,
-        // Two slots by default: a lone request pays nothing for the second
-        // (the turns act only on a second arrival); `--parallel 1` keeps the
-        // plain engine.
-        parallel: 2,
+        // The elastic default ([`Parallel`]): a lone request pays nothing for
+        // a second slot (the turns act only on a second arrival), and
+        // `--parallel 1` keeps the plain engine.
+        parallel: None,
         queue_depth: None,
         park_ram: None,
     };
@@ -541,7 +544,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
-            "--parallel" | "-np" => a.parallel = v.parse()?,
+            "--parallel" | "-np" => a.parallel = Some(v.parse()?),
             "--queue-depth" => a.queue_depth = Some(v.parse()?),
             "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(v)?),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
@@ -644,16 +647,29 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let cache = CacheRam::of(a.cache_ram, HostNeed::of(&plan, beside).bytes(), pool)?;
     eprintln!("{}", cache.line());
     let park = match a.parallel {
-        0 | 1 if a.park_ram.is_some() => {
+        Some(n) if n < 2 && a.park_ram.is_some() => {
             return Err(format!(
                 "--park-ram holds the states of slots that take the model in turns; \
-                 --parallel {} has none to park",
-                a.parallel
+                 --parallel {n} has none to park"
             )
             .into());
         }
-        0 | 1 => None,
-        n => Some(cache.park(a.park_ram, n)?),
+        // The elastic default ([`Parallel`]): one slot's whole-context state
+        // the budget's unit, the flag an upper bound, the default what the
+        // budget holds.
+        _ => {
+            let budget = match a.parallel {
+                Some(n) if n >= 2 => cache.park(a.park_ram, n)?,
+                _ => cache.park_or_none(a.park_ram),
+            };
+            let parallel = Parallel::of(
+                a.parallel,
+                budget,
+                seq_bytes(&inputs, rule.ctx, nextn.is_some()),
+            );
+            eprintln!("{}", parallel.line());
+            (parallel.slots > 1).then_some((parallel.slots, budget))
+        }
     };
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
@@ -708,15 +724,16 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     // One slot stays the plain engine; several take it in turns.
     let engine: Box<dyn Engine> = match park {
-        Some(budget) => Box::new(SwapEngine::new(
+        Some((slots, budget)) => Box::new(SwapEngine::new(
             Box::new(engine),
-            a.parallel,
+            slots,
             Park::States { budget },
         )?),
         None => Box::new(engine),
     };
+    let parallel = park.map_or(1, |(slots, _)| slots);
     let slots = SlotConfig {
-        parallel: a.parallel,
+        parallel,
         queue_depth: a.queue_depth,
         ..SlotConfig::default()
     };

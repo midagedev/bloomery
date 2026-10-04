@@ -95,10 +95,13 @@ curl -s http://127.0.0.1:8080/v1/systemone -d '{"state": "User: what is the weat
     "criteria": {"web_search": "Look something up online", "calculator": "Do arithmetic", "none": "Answer directly"}}}}'
 ```
 
-**Concurrent requests.** The ds41, glm and qwen3 seats take `--parallel N` (two by default; a lone request pays
-nothing for the second): requests take turns of 64 tokens on one model, a later arrival preempts at the next
-step, and both answer their solo runs' tokens exactly — V4.1 by snapshot/resume, GLM with its MTP draft
-rejoining, the qwen3 seats by re-prefill. The qwen38 and decide seats serve one request at a time. The N slots
+**Concurrent requests.** The ds41, glm, qwen3 and qwen38 seats take `--parallel N`: requests take
+turns of 64 tokens on one model, a later arrival preempts at the next step, and both answer their
+solo runs' tokens exactly — V4.1, GLM and Qwen3.8 by snapshot/resume (their MTP drafts rejoining),
+the qwen3 seats by re-prefill. Unset, the ds41, glm and qwen38 seats size the slots to what the
+park budget holds of one slot's whole-context state (a `parallel` line on stderr names the rule,
+the slots and each term; never below one, and `--parallel 1` keeps the plain engine); the qwen3
+seats keep two (their park holds ids only, nothing to size from). The N slots
 share one context-sized cache in turns (llama-server gives each slot its own full `n_ctx`, N times the memory —
 a different resource reading of the same flag, not a defect).
 
