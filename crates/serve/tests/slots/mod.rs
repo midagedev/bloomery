@@ -5,8 +5,9 @@
 //! declares is refused by name. Then N slots that take the one-slot mock in
 //! turns ([`serve::SwapEngine`]): preemption at a step, turns of `QUANTUM`
 //! tokens, shortest prompt first, a newcomer refused by name when the running
-//! request cannot be parked, the re-prefill fallback, `/slots`' turns, and the
-//! draft kept.
+//! request cannot be parked, the re-prefill fallback, `/slots`' turns, the
+//! draft kept, a lone request on the engine's slot among equals, and a slot
+//! the engine emptied holding nothing for the next request.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -935,4 +936,100 @@ fn hw_a_state_that_does_not_resume_ends_its_request_by_name() {
     assert_eq!(get(addr, "/health").json()["status"], "ok");
     let after = post(addr, "/completion", &short);
     assert_eq!(after.status, 200, "{}", after.body);
+}
+
+/// The pair a turns test opens with: `first` takes slot 0 and is held at its
+/// third step until `second`, posted then, has queued for slot 1; both answer
+/// 200 on the slots they took.
+fn concurrent_pair(addr: SocketAddr, latch: &super::Latch, first: Value, second: Value) {
+    let a = post_bg(addr, first);
+    assert!(
+        latch.wait_entered(BOUND),
+        "the first request never reached next #3"
+    );
+    let b = post_bg(addr, second);
+    wait_deferred(addr, 1, BOUND);
+    latch.release();
+    let answers = [a.join().expect("first"), b.join().expect("second")].map(|r| {
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()
+    });
+    assert_eq!(
+        [&answers[0]["id_slot"], &answers[1]["id_slot"]],
+        [&json!(0), &json!(1)],
+        "the pair takes both slots"
+    );
+}
+
+/// Of the free slots that share as much of its prompt, a request takes the
+/// one whose state the engine holds: after a concurrent pair, two requests in
+/// a row that share only a header with every slot move no state.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_lone_request_takes_the_engines_slot_among_equals() {
+    let latch = Arc::new(super::Latch::default());
+    let (engine, _) = Turned::new(Snap::Takes, &[(3, &latch)]);
+    let addr = start_swap(Box::new(engine), 2, ROOMY);
+    concurrent_pair(
+        addr,
+        &latch,
+        completion("sys:abcabcab", 40),
+        completion("sys:xyzxyz", 6),
+    );
+    let swaps = || metric(&get(addr, "/metrics").body, "swaps_total");
+    assert_eq!(
+        swaps(),
+        2.0,
+        "the pair: the first parked for the second, then put back"
+    );
+    // The second ended first, so the engine holds the first's slot, 0.
+    let lone: Vec<Value> = ["sys:pqrpqr", "sys:mnomno"]
+        .iter()
+        .map(|p| post(addr, "/completion", &completion(p, 6)).json())
+        .collect();
+    assert_eq!(
+        swaps(),
+        2.0,
+        "a lone request whose prompt every slot shares as much of moves no state"
+    );
+    for v in &lone {
+        assert_eq!(v["id_slot"], 0, "the engine's slot: {v}");
+        assert_eq!(v["timings"]["cache_n"], 4, "the header kept: {v}");
+    }
+}
+
+/// An idle slot whose state the engine drops holds nothing after: under the
+/// re-prefill fallback the engine leaves the slot of a finished request
+/// empty, `/slots` shows it empty, and a request that shares more with what
+/// it held than with the engine's slot takes the engine's slot and keeps the
+/// header it shares there.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_slot_the_engine_emptied_holds_nothing_for_the_next_request() {
+    let latch = Arc::new(super::Latch::default());
+    let (engine, _) = Turned::new(Snap::Cannot, &[(3, &latch)]);
+    let addr = start_swap(Box::new(engine), 2, Park::Ids);
+    concurrent_pair(
+        addr,
+        &latch,
+        completion("system:abcabcab", 40),
+        completion("system:pqrpqr", 6),
+    );
+    // The second ended first; the engine went back to the first's slot and
+    // dropped the second's ids.
+    let n_past: Vec<Value> = get(addr, "/slots")
+        .json()
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|s| s["n_past"].clone())
+        .collect();
+    assert_eq!(n_past[1], 0, "the slot the engine emptied: {n_past:?}");
+    // Twelve ids shared with what slot 1 held, seven with slot 0's.
+    let v = post(addr, "/completion", &completion("system:pqrpqzz", 4)).json();
+    assert_eq!(
+        v["id_slot"], 0,
+        "the slot that holds the shared header: {v}"
+    );
+    assert_eq!(v["timings"]["cache_n"], 7, "the header kept: {v}");
 }

@@ -178,7 +178,8 @@ struct Pending {
 /// The engine thread's part of slots that take the engine in turns.
 struct Turns {
     table: ParkTable,
-    /// The slot whose state the engine holds.
+    /// The slot whose state the engine holds: admission's choice among slots
+    /// that share as much of a prompt.
     on: usize,
     /// The slot of the request on the engine, if one is.
     running: Option<usize>,
@@ -298,7 +299,7 @@ impl Worker {
                 let mut b = relock(&self.sh.board);
                 loop {
                     let actions = b.take_actions();
-                    let admitted = b.admit();
+                    let admitted = b.admit(|i| self.slot.held_of(i), None);
                     if !actions.is_empty() || !admitted.is_empty() || !self.active.is_empty() {
                         break (actions, admitted);
                     }
@@ -359,13 +360,12 @@ impl Worker {
             let mut b = relock(&self.sh.board);
             match what {
                 Reserve::One(i) => {
-                    let held = self.slot.held_of(i).to_vec();
-                    b.view_mut(i).n_past = held.len();
-                    b.release(i, held);
+                    b.view_mut(i).n_past = self.slot.held_of(i).len();
+                    b.release(i);
                 }
                 Reserve::All => {
                     for i in 0..b.slots().len() {
-                        b.release(i, self.slot.held_of(i).to_vec());
+                        b.release(i);
                     }
                 }
             }
@@ -554,7 +554,7 @@ impl Worker {
                 v.stopped_limit = o.stop == StopKind::Limit;
                 v.stopping_word.clone_from(&o.stopping_word);
             }
-            b.release(a.slot, self.slot.held_of(a.slot).to_vec());
+            b.release(a.slot);
         }
         if let Some(t) = &mut self.turns {
             t.stuck = false;
@@ -588,7 +588,7 @@ impl Worker {
                 let mut b = relock(&self.sh.board);
                 loop {
                     let actions = b.take_actions();
-                    let admitted = b.admit();
+                    let admitted = b.admit(|i| self.slot.held_of(i), Some(self.t().on));
                     let t = self.t();
                     if !actions.is_empty()
                         || !admitted.is_empty()
@@ -692,7 +692,7 @@ impl Worker {
         match self.switch(p.slot)? {
             Switched::Refused(why) => {
                 relock(&self.sh.stats).n_swap_refused_total += 1;
-                relock(&self.sh.board).release(p.slot, self.slot.held_of(p.slot).to_vec());
+                relock(&self.sh.board).release(p.slot);
                 self.show_turns();
                 let _ = p.sub.events.send(Msg::Refused(why));
                 return Ok(());
@@ -819,7 +819,8 @@ impl Worker {
     /// Moves the engine from the slot it holds to `to`: the state it leaves
     /// parked as [`crate::swap`] says, then `to`'s parked state put back, its
     /// ids fed again, or the engine emptied. A slot whose state leaves the
-    /// table, or that is left with no room, holds nothing after.
+    /// table, or that is left with no room, holds nothing after, and its
+    /// `/slots` view says so.
     fn switch(&mut self, to: usize) -> Result<Switched, Dead> {
         let from = self.t().on;
         if from == to {
@@ -885,13 +886,19 @@ impl Worker {
             t.clock += 1;
             self.active[i].left = self.t().clock;
         }
-        for j in voids {
+        for &j in &voids {
             if let Err(e) = self
                 .slot
                 .select(j)
                 .and_then(|()| self.slot.erase().map(|_| ()))
             {
                 return Err(self.die(&e));
+            }
+        }
+        if !voids.is_empty() {
+            let mut b = relock(&self.sh.board);
+            for &j in &voids {
+                b.view_mut(j).n_past = 0;
             }
         }
         if let Err(e) = self.slot.select(to) {

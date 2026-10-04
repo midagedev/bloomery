@@ -7,7 +7,9 @@
 //! default). The request then takes, of the free slots, the one whose held ids
 //! share the longest prefix with its own, the least recently used among
 //! equals (llama-server's choice, without its similarity floor): its cache
-//! keeps the most.
+//! keeps the most. When the slots take one engine in turns, the slot whose
+//! state the engine holds goes before the least recently used: taking
+//! another moves that state aside.
 //!
 //! A slot action (save, restore, erase) reserves its slot, and a residency
 //! reset every slot, only while the slot is free and no request waits, so
@@ -16,8 +18,12 @@
 //!
 //! The board holds no engine: the HTTP threads read and change it under its
 //! lock while the engine thread is inside a call, so `/health`, `/slots`,
-//! `/metrics` and a refusal answer at once.
+//! `/metrics` and a refusal answer at once. Nor does it keep the ids a slot
+//! holds: the engine thread's slots are their one owner, and it hands them to
+//! [`Board::admit`] with the slot the engine is on, so a move of the engine's
+//! states leaves no copy behind to steer a request to a slot that lost them.
 
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 
 use serde_json::Value;
@@ -124,8 +130,6 @@ pub(crate) struct SlotView {
 
 pub(crate) struct SlotState {
     pub state: Use,
-    /// The ids the slot's cache holds, as of its last release.
-    pub held: Vec<u32>,
     /// The board's clock at the slot's last release; 0 never used.
     pub last_used: u64,
     pub routing: Vec<f32>,
@@ -179,7 +183,6 @@ impl<R, A> Board<R, A> {
             slots: (0..parallel)
                 .map(|_| SlotState {
                     state: Use::Free,
-                    held: Vec::new(),
                     last_used: 0,
                     routing: Vec::new(),
                     view: SlotView::default(),
@@ -257,14 +260,20 @@ impl<R, A> Board<R, A> {
     }
 
     /// Gives every waiting request it can a free slot, oldest first unless the
-    /// picker chooses another while more wait than slots are free. Returns
-    /// each request's slot, its ids and its payload, in the order they took
-    /// them.
+    /// picker chooses another while more wait than slots are free. `held` is
+    /// the ids each slot's cache holds; `on` the slot whose state the engine
+    /// holds when the slots take it in turns, `None` when each slot keeps its
+    /// own. Returns each request's slot, its ids and its payload, in the order
+    /// they took them.
     ///
     /// # Panics
     ///
     /// When the picker answers an index past the waiting requests.
-    pub(crate) fn admit(&mut self) -> Vec<(usize, Vec<u32>, R)> {
+    pub(crate) fn admit<'h>(
+        &mut self,
+        held: impl Fn(usize) -> &'h [u32],
+        on: Option<usize>,
+    ) -> Vec<(usize, Vec<u32>, R)> {
         let mut out = Vec::new();
         if self.dead.is_some() {
             return out;
@@ -289,7 +298,7 @@ impl<R, A> Board<R, A> {
                     .map(|(id, s)| SlotSummary {
                         id,
                         busy: s.state != Use::Free,
-                        held: &s.held,
+                        held: held(id),
                         routing: &s.routing,
                     })
                     .collect();
@@ -306,7 +315,7 @@ impl<R, A> Board<R, A> {
             let Some(w) = self.waiting.remove(at) else {
                 unreachable!("{at} is below the waiting requests");
             };
-            let slot = best_slot(&self.slots, &free, &w.ids);
+            let slot = best_slot(&self.slots, &free, &held, on, &w.ids);
             self.slots[slot].state = Use::Running;
             let serving = self.tickets.serving();
             self.tickets.pass(serving);
@@ -314,12 +323,11 @@ impl<R, A> Board<R, A> {
         }
     }
 
-    /// Frees `slot`, whose cache now holds `held`.
-    pub(crate) fn release(&mut self, slot: usize, held: Vec<u32>) {
+    /// Frees `slot`.
+    pub(crate) fn release(&mut self, slot: usize) {
         self.clock += 1;
         let s = &mut self.slots[slot];
         s.state = Use::Free;
-        s.held = held;
         s.last_used = self.clock;
     }
 
@@ -334,15 +342,29 @@ impl<R, A> Board<R, A> {
 }
 
 /// Of the free slots, the one whose held ids share the longest prefix with
-/// `ids`; among equals the least recently used, then the lowest id.
-fn best_slot(slots: &[SlotState], free: &[usize], ids: &[u32]) -> usize {
+/// `ids`; among equals the one the engine is on, then the least recently
+/// used, then the lowest id.
+fn best_slot<'h>(
+    slots: &[SlotState],
+    free: &[usize],
+    held: &impl Fn(usize) -> &'h [u32],
+    on: Option<usize>,
+    ids: &[u32],
+) -> usize {
+    let key = |i: usize| {
+        (
+            common_prefix(held(i), ids),
+            on == Some(i),
+            Reverse(slots[i].last_used),
+        )
+    };
     let mut best = free[0];
-    let mut key = (common_prefix(&slots[best].held, ids), slots[best].last_used);
+    let mut top = key(best);
     for &i in &free[1..] {
-        let k = (common_prefix(&slots[i].held, ids), slots[i].last_used);
-        if k.0 > key.0 || (k.0 == key.0 && k.1 < key.1) {
+        let k = key(i);
+        if k > top {
             best = i;
-            key = k;
+            top = k;
         }
     }
     best
@@ -358,6 +380,11 @@ mod tests {
         Board::new(n, depth, Box::new(FifoPicker))
     }
 
+    /// No slot holds an id.
+    fn nothing(_: usize) -> &'static [u32] {
+        &[]
+    }
+
     /// At N = 2 a free slot takes the oldest waiting request: four queued
     /// behind two busy slots take them in arrival order as the slots free.
     #[test]
@@ -366,13 +393,17 @@ mod tests {
         for r in 0..6 {
             b.enqueue(vec![r], r).expect("room");
         }
-        let first: Vec<u32> = b.admit().into_iter().map(|(_, _, r)| r).collect();
+        let first: Vec<u32> = b
+            .admit(nothing, None)
+            .into_iter()
+            .map(|(_, _, r)| r)
+            .collect();
         assert_eq!(first, [0, 1]);
         assert_eq!(b.waiting(), 4);
         let mut order = Vec::new();
         for slot in [1, 0, 0, 1] {
-            b.release(slot, Vec::new());
-            let got = b.admit();
+            b.release(slot);
+            let got = b.admit(nothing, None);
             assert_eq!(got.len(), 1, "one slot freed");
             assert_eq!(got[0].0, slot, "the freed slot");
             order.push(got[0].2);
@@ -381,24 +412,46 @@ mod tests {
     }
 
     /// Of the free slots a request takes the one whose held ids share the
-    /// longest prefix with it, not the least recently used one; with no prefix
-    /// shared it takes the least recently used.
+    /// longest prefix with it, not the least recently used one nor the one the
+    /// engine is on; with no prefix shared it takes the one the engine is on
+    /// when the slots take turns, else the least recently used.
     #[test]
     fn a_request_takes_the_slot_that_shares_its_prefix() {
         let mut b = board(3, 8);
         b.enqueue(vec![1, 2, 3], 0).expect("room");
         b.enqueue(vec![7, 8], 1).expect("room");
         b.enqueue(vec![4, 4], 2).expect("room");
-        let slots: Vec<usize> = b.admit().into_iter().map(|(s, _, _)| s).collect();
+        let slots: Vec<usize> = b
+            .admit(nothing, None)
+            .into_iter()
+            .map(|(s, _, _)| s)
+            .collect();
         assert_eq!(slots, [0, 1, 2], "nothing held: the lowest id among equals");
         // Slot 0 released first, so it is the least recently used.
-        b.release(0, vec![1, 2, 3, 9]);
-        b.release(1, vec![7, 8, 9]);
-        b.release(2, vec![4, 4, 9]);
+        for slot in 0..3 {
+            b.release(slot);
+        }
+        let ids = [vec![1, 2, 3, 9], vec![7, 8, 9], vec![4, 4, 9]];
+        let held = |i: usize| ids[i].as_slice();
         b.enqueue(vec![7, 8, 5], 3).expect("room");
-        assert_eq!(b.admit()[0].0, 1, "slot 1 holds 7 8");
+        assert_eq!(
+            b.admit(held, Some(2))[0].0,
+            1,
+            "slot 1 holds 7 8; the engine is on slot 2"
+        );
         b.enqueue(vec![6], 4).expect("room");
-        assert_eq!(b.admit()[0].0, 0, "no prefix shared: least recently used");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            0,
+            "no prefix shared: least recently used"
+        );
+        b.release(0);
+        b.enqueue(vec![6], 5).expect("room");
+        assert_eq!(
+            b.admit(held, Some(0))[0].0,
+            0,
+            "no prefix shared: the slot the engine is on, not slot 2, the least recently used"
+        );
     }
 
     /// Past the depth a request is refused, never queued: the depth counts the
@@ -414,15 +467,15 @@ mod tests {
             Err(Refusal::Full { depth: 1 }),
             "two free slots and one place: a fourth waits past the depth"
         );
-        assert_eq!(b.admit().len(), 2);
+        assert_eq!(b.admit(nothing, None).len(), 2);
         assert_eq!(b.waiting(), 1);
         assert_eq!(b.enqueue(vec![3], 3), Err(Refusal::Full { depth: 1 }));
-        b.release(0, Vec::new());
-        assert_eq!(b.admit().len(), 1);
+        b.release(0);
+        assert_eq!(b.admit(nothing, None).len(), 1);
         b.enqueue(vec![3], 3).expect("the place freed");
         let mut none = board(1, 0);
         none.enqueue(vec![0], 0).expect("the free slot");
-        none.admit();
+        none.admit(nothing, None);
         assert_eq!(none.enqueue(vec![1], 1), Err(Refusal::Full { depth: 0 }));
     }
 
@@ -432,21 +485,24 @@ mod tests {
     fn an_action_never_goes_ahead_of_a_waiting_request() {
         let mut b = board(2, 8);
         b.enqueue(vec![0], 0).expect("room");
-        assert_eq!(b.admit()[0].0, 0);
+        assert_eq!(b.admit(nothing, None)[0].0, 0);
         b.reserve(Reserve::One(1), "erase").expect("slot 1 is free");
         assert_eq!(b.reserve(Reserve::One(0), "save"), Err(Refusal::Busy));
         assert_eq!(b.reserve(Reserve::All, "reset"), Err(Refusal::Busy));
         b.enqueue(vec![1], 1).expect("room");
-        assert!(b.admit().is_empty(), "slot 1 is held by the action");
+        assert!(
+            b.admit(nothing, None).is_empty(),
+            "slot 1 is held by the action"
+        );
         assert_eq!(b.take_actions(), [(Reserve::One(1), "erase")]);
-        b.release(1, Vec::new());
-        b.release(0, Vec::new());
+        b.release(1);
+        b.release(0);
         assert_eq!(
             b.reserve(Reserve::One(0), "save"),
             Err(Refusal::Busy),
             "a request waits for a slot"
         );
-        assert_eq!(b.admit()[0].2, 1);
+        assert_eq!(b.admit(nothing, None)[0].2, 1);
         b.reserve(Reserve::One(0), "save")
             .expect("free, nothing waits");
         assert_eq!(b.slots()[0].state, Use::Held);
@@ -467,12 +523,16 @@ mod tests {
         for r in 0..2 {
             b.enqueue(vec![r], r).expect("room");
         }
-        assert_eq!(b.admit().len(), 2, "two wait, two free: no pick");
+        assert_eq!(
+            b.admit(nothing, None).len(),
+            2,
+            "two wait, two free: no pick"
+        );
         for r in 2..5 {
             b.enqueue(vec![r], r).expect("room");
         }
-        b.release(0, Vec::new());
-        b.admit();
+        b.release(0);
+        b.admit(nothing, None);
     }
 
     /// A picker chooses which waiting request takes a freed slot; the others
@@ -492,9 +552,9 @@ mod tests {
         }
         let mut order = Vec::new();
         for _ in 0..4 {
-            let got = b.admit();
+            let got = b.admit(nothing, None);
             order.push(got[0].2);
-            b.release(0, Vec::new());
+            b.release(0);
         }
         assert_eq!(order, [3, 2, 1, 0]);
         b.reserve(Reserve::All, ()).expect("nothing waits");
