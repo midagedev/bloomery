@@ -1778,6 +1778,7 @@ mod cli {
             levers.host(),
             ub,
             residency,
+            1,
         )?;
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
@@ -1860,6 +1861,7 @@ mod cli {
             &draft_split,
             &mtp,
             residency,
+            1,
         )?;
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;

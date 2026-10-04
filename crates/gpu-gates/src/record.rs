@@ -1621,10 +1621,12 @@ pub static LISTENING: Kind = Kind {
 pub static LISTENING38: Kind = Kind {
     name: "listening38",
     head: "bloomery-serve-qwen38:",
-    doc: "The Qwen3.8 server's placement, context and the address it listens on.",
+    doc: "The Qwen3.8 server's placement, the context a slot serves (`ctx`, the rows each slot's caches hold; `slot_ctx` the same number, a resident slot's share of the split context), the resident sequences it serves and the address it listens on.",
     parts: &[
         key("place", Word, ""),
         key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("slot_ctx", U64, "positions"),
         lit(" listening on http://"),
         pos("addr", Word, ""),
     ],
