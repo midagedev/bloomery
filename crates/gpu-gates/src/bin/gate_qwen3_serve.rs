@@ -56,8 +56,9 @@
 //!   common prefix instead of the checkpoint makes the session's cut refuse
 //!   by name and both clauses' requests fail; the cut's restore omitted
 //!   leaves the re-fed ids a fresh run's (the stripped clause's ids red).
-//! - `swap_reprefills_the_parked_ids`, on the first file's arm alone (the
-//!   park is the seat's, not the file's): a server of `--parallel 2`, a
+//! - `swap_reprefills_the_parked_ids`, on the qwen35moe arm (the park is
+//!   the seat's, and the qwen3moe arm's whole-card load serves resident
+//!   slots instead): a server of `--parallel 2`, a
 //!   decode preempted mid-run by a second request comes back by the
 //!   re-prefill fallback — the engine reset to 0 and its held ids fed again
 //!   before it steps — so the first request's ids are its solo run's through
@@ -68,6 +69,67 @@
 //!   moved and the park's re-fed ids counted in `/metrics`. FAIL-first: the
 //!   re-prefill omitted leaves the first request stepping from an empty
 //!   engine and the re-fed count at 0.
+//! - `slots_flow_together`, on the qwen3moe arm: a server of
+//!   `--parallel 2` (the gate's ctx handling — no `--ctx`, the auto
+//!   default), two greedy streamed requests of distinct prompts
+//!   (`n_predict` [`SLOTS_PREDICT`], `ignore_eos`, no cache), each first run
+//!   alone on that same server and then both together —
+//!   (v1) each request's together ids are its alone ids (the slots hold
+//!   separate sequences; nothing one runs feeds the other);
+//!   (v2) `swaps_total` is absent or 0 (no park), and over the together run
+//!   the deltas of the busy slots booked / `n_decode_total` sit at ≥ 1.5
+//!   (`/metrics` carries the busy count as the running mean
+//!   `n_busy_slots_per_decode`; times `n_decode_total` it is the total):
+//!   the worker books one call a round carrying every running slot
+//!   (`worker.rs`'s `Stats`), so two requests that decode together book 2
+//!   busy a call, the two prompts and any non-overlapping head or tail
+//!   rounds 1 — at 96 tokens each the ratio is (2·94 + 2 + ~2)/(94 + 2 +
+//!   ~2) ≈ 1.9 — while a turn-taking server books exactly 1 busy a call
+//!   (every round is one slot's), 1.0 past the two prompts;
+//!   (v3) the two SSE streams' token arrivals, timestamped by a reader
+//!   thread a stream: while both are live, every window of
+//!   [`SLOTS_WINDOW`] = 16 consecutive arrivals holds at least
+//!   [`SLOTS_EACH`] = 4 of each stream — the engine emits one token a slot
+//!   a round (8 and 8 ideally), delivery batching (the server flushes per
+//!   event; curl and the pipe may clump) tolerates up to 12 consecutive
+//!   same-stream arrivals before the minority drops under 4, while a
+//!   turn-taking server's `QUANTUM` = 64-token turns put windows of 16
+//!   inside a turn holding 16 of one stream and none of the other;
+//!   (v4) the load record names `slots=2` and `slot_ctx` = the auto default
+//!   the one-slot arm measured over two (a cache row the granularity, the
+//!   floor exact), and `/props`' `n_ctx` is that slot ctx.
+//!   FAIL-first mutants, each red on its line: the seat still building the
+//!   turn-taking engine leaves (v2) at ~1.0 and (v3) failing; a select that
+//!   ignores the slot (both requests on one sequence) moves the together
+//!   ids off the alone ones; a reply that hands row answers back in the
+//!   wrong order scrambles the ids; a ctx not divided gives each slot the
+//!   total, and the second sequence does not fit past the first (the auto
+//!   default spent the card's free bytes on the one-sequence cache): the
+//!   server never listens, which the clause names as the split's check red.
+//! - `slot_ctx_too_small_is_refused`, on the qwen3moe arm: `--ctx 15`
+//!   under the default two slots — a slot of 7 rows, one under the 8 rows
+//!   the load's widest captured pass writes (`router::MAX_TOKENS`) — ends
+//!   the process before the load, naming the total, the slot count and the
+//!   slot ctx. FAIL-first: the refusal dropped loads the slot and dies in
+//!   the pass capture under the launcher's own message.
+//! - `placed_slots_take_turns`, `ctx_default`'s placed arm (`--place a
+//!   --parallel 2`): a placed load's slots take its one sequence in turns
+//!   over the whole context — its plan counts the card bytes of one
+//!   sequence — so the load record names one resident sequence and the
+//!   listening record two slots of the arm's `n_ctx` each. FAIL-first: a
+//!   placed load made resident adds a sequence its plan never counted, and
+//!   either never listens or names two in its load.
+//!
+//! The spawn census, every server this gate starts and its `--parallel`:
+//! [`spawn`] and `ctx_default`'s default, flag and q8 arms pin
+//! `--parallel 1` (the prefix and ctx clauses hold the one-slot path's
+//! keeps and defaults), its placed arm passes `--parallel 2` (the placed
+//! turns above); `cache_refusals`' two refusal arms pass none — they die at
+//! flag parsing before the seat splits anything — and its flag-wins arm
+//! pins `--parallel 1`; the swap clause passes `--parallel 2` (qwen35moe,
+//! the turns); the slots clause passes `--parallel 2` (qwen3moe, resident)
+//! and the refusal arm passes none (the default two are what makes the
+//! split too small).
 //!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
@@ -94,6 +156,7 @@ mod gate {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
+    use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use gguf::Split;
@@ -154,6 +217,23 @@ mod gate {
     /// request's decode.
     const SWAP_POLL: Duration = Duration::from_millis(300);
 
+    /// The slots clause's requests: long enough that the together run holds
+    /// dozens of rounds with both streams live.
+    const SLOTS_PREDICT: usize = 96;
+
+    /// The slots clause's interleave window and its floor for each stream
+    /// (the module header's (v3) derivation).
+    const SLOTS_WINDOW: usize = 16;
+    const SLOTS_EACH: usize = 4;
+
+    /// The slots clause's poll for the refusal arm's exit.
+    const SLOTS_POLL: Duration = Duration::from_millis(500);
+
+    /// The refusal arm's `--ctx`: two slots of one row under the seat's
+    /// least slot context, the widest pass a whole-card load captures
+    /// ([`MAX_TOKENS`] rows).
+    const SLOTS_REFUSED_CTX: usize = 2 * MAX_TOKENS - 1;
+
     /// The fewest rows the seat's prompt call runs as the GEMM walk
     /// (`app::arch::qwen3moe::GEMM_FROM`): the rows a kept prefix leaves
     /// behind are a whole fresh run's.
@@ -206,6 +286,35 @@ mod gate {
             .and_then(|v| v.trim().parse().ok()))
     }
 
+    /// The busy slots the server has booked over its `decodes` engine calls:
+    /// `/metrics` carries them as the running mean `n_busy_slots_per_decode`
+    /// (`serve::api`'s metrics), so the total is that mean times the calls.
+    fn busy_total(url: &dyn Fn(&str) -> String, decodes: f64) -> Result<f64, GateError> {
+        Ok(metric(url, "n_busy_slots_per_decode")?.unwrap_or(f64::NAN) * decodes)
+    }
+
+    /// The whole-number field ` name=…` of a record line; `None` when the
+    /// line carries none.
+    fn field_u64(line: &str, name: &str) -> Option<u64> {
+        line.split(&format!(" {name}="))
+            .nth(1)?
+            .split(' ')
+            .next()?
+            .parse()
+            .ok()
+    }
+
+    /// The `load` record's line and the `listening` record's line of a
+    /// server's stderr, each empty when the server printed none.
+    fn load_and_listening(log: &str) -> (&str, &str) {
+        let load = log.lines().find(|l| l.starts_with("load ")).unwrap_or("");
+        let listening = log
+            .lines()
+            .find(|l| l.contains(" listening on http://"))
+            .unwrap_or("");
+        (load, listening)
+    }
+
     /// The seat's default `--ctx` against the file and this gate's card:
     /// unset, the whole-card load takes the file's trained context capped
     /// to what the card had free — at least the 4096 floor, a multiple of
@@ -213,11 +322,14 @@ mod gate {
     /// card and a Q4_K_M 30B file leave tens of thousands of rows); the
     /// `--ctx` flag still wins; a load under `--place` takes the placed
     /// search's answer over the plan's expert split, pinned by relation
-    /// (the placed arm's checks below). FAIL-first: a search that hands
-    /// back the trained context uncapped makes the default arm's load a
-    /// plan the card cannot hold (the spawn never listens), and one that
-    /// hands back nothing leaves the default at the floor.
-    fn ctx_default(model: &Path, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+    /// (the placed arm's checks below), and its two slots take the one
+    /// sequence in turns (`placed_slots_take_turns`). FAIL-first: a search
+    /// that hands back the trained context uncapped makes the default arm's
+    /// load a plan the card cannot hold (the spawn never listens), and one
+    /// that hands back nothing leaves the default at the floor. Returns the
+    /// default arm's `n_ctx` — the one-slot load's total context, what the
+    /// slots clause's split halves.
+    fn ctx_default(model: &Path, dir: &Path, ok: &mut bool) -> Result<Option<u64>, GateError> {
         // The trained context read from the file beside the server, not the
         // server's own echo of it.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
@@ -231,12 +343,14 @@ mod gate {
         };
         // Each arm loads the model, so each takes its own directory.
         let arms: [(&str, &[&str]); 4] = [
-            ("default", &[]),
-            ("flag", &["--ctx", "2048"]),
-            ("placed", &["--place", "a"]),
+            ("default", &["--parallel", "1"]),
+            ("flag", &["--parallel", "1", "--ctx", "2048"]),
+            // Two slots on the placed load: they take its one sequence in
+            // turns (the module header's `placed_slots_take_turns`).
+            ("placed", &["--parallel", "2", "--place", "a"]),
             // The cache lever's arm: the q8_0 planes the seat's flag names,
             // the auto context search under the halved KV term.
-            ("q8", &["--cache-type-k", "q8_0"]),
+            ("q8", &["--parallel", "1", "--cache-type-k", "q8_0"]),
         ];
         // The default arm's answer, for the q8 arm's growth relation.
         let mut default_n = None;
@@ -247,16 +361,7 @@ mod gate {
             let mut cmd = Command::new(beside("bloomery-serve")?);
             cmd.env_remove("BLOOMERY_REF_MODEL");
             let m = model.to_str().ok_or("the model path is not UTF-8")?;
-            let mut args: Vec<&str> = vec![
-                "--model",
-                "qwen3",
-                "--port",
-                "0",
-                "--parallel",
-                "1",
-                "-m",
-                m,
-            ];
+            let mut args: Vec<&str> = vec!["--model", "qwen3", "--port", "0", "-m", m];
             args.extend_from_slice(extra);
             let mut s = Served::spawn_cmd(cmd, &args, &d)?;
             let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
@@ -394,11 +499,32 @@ mod gate {
                             && said.len() <= 1
                             && (said.is_empty() || said[0] == n),
                     );
+                    // The two slots take the placed load's one sequence in
+                    // turns over the whole context (the module header).
+                    let (load, listening) = load_and_listening(&log);
+                    let terms = [
+                        field_u64(load, "slots"),
+                        field_u64(load, "slot_ctx"),
+                        field_u64(listening, "slots"),
+                        field_u64(listening, "slot_ctx"),
+                    ];
+                    println!(
+                        "placed arm: load slots={:?} slot_ctx={:?}, listening slots={:?} \
+                         slot_ctx={:?}",
+                        terms[0], terms[1], terms[2], terms[3]
+                    );
+                    check(
+                        ok,
+                        "placed_slots_take_turns",
+                        terms == [Some(1), Some(n), Some(2), Some(n)],
+                    );
                 }
             }
             println!("ctx arm {name}: server stopped: {}", s.stop()?);
         }
-        Ok(())
+        // The default arm's answer, the one-slot load's total context: the
+        // slots clause's split is half of it.
+        Ok(default_n)
     }
 
     /// `bloomery-serve --model qwen3 -m <model> --port 0 --parallel 1` beside
@@ -837,9 +963,318 @@ mod gate {
         Ok(())
     }
 
+    /// One streamed request's answer: the final event's tokens, and each
+    /// token event's arrival on its reader thread's clock.
+    struct Streamed {
+        tokens: Vec<u32>,
+        arrivals: Vec<Instant>,
+    }
+
+    /// A streamed request's answer channel: what its reader thread sends
+    /// when the stream ends.
+    type StreamedRx = mpsc::Receiver<Result<Streamed, String>>;
+
+    /// `/completion` of `ids` at temperature 0, streamed: a helper thread of
+    /// its own runs `curl -N` and reads the SSE lines as they land, each
+    /// token event timestamped the moment it is read (the module header's
+    /// (v3) reader thread a stream). The final event carries the tokens.
+    fn streamed(
+        addr: &str,
+        ids: &[u32],
+        n: usize,
+    ) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
+        let (tx, rx) = mpsc::channel();
+        let body = json!({
+            "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
+            "cache_prompt": false, "ignore_eos": true, "stream": true,
+        });
+        let url = format!("http://{addr}/completion");
+        let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
+            let run = (|| -> Result<Streamed, String> {
+                use std::io::{BufRead, BufReader, Write};
+                let mut child = Command::new("curl")
+                    .args([
+                        "-sS",
+                        "-N",
+                        "--max-time",
+                        "600",
+                        "-H",
+                        "Content-Type: application/json",
+                        "--data-binary",
+                        "@-",
+                    ])
+                    .arg(&url)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| format!("curl {url}: {e}"))?;
+                let mut stdin = child
+                    .stdin
+                    .take()
+                    .ok_or_else(|| format!("curl {url}: no stdin"))?;
+                stdin
+                    .write_all(body.to_string().as_bytes())
+                    .map_err(|e| format!("curl {url}: {e}"))?;
+                drop(stdin);
+                let out = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| format!("curl {url}: no stdout"))?;
+                let mut arrivals = Vec::new();
+                let mut tokens = Vec::new();
+                for line in BufReader::new(out).lines() {
+                    let line = line.map_err(|e| format!("curl {url}: {e}"))?;
+                    let at = Instant::now();
+                    let Some(v) = line
+                        .strip_prefix("data: ")
+                        .and_then(|d| serde_json::from_str::<Value>(d).ok())
+                    else {
+                        continue;
+                    };
+                    if v["stop"] == json!(false) && !v["content"].as_str().unwrap_or("").is_empty()
+                    {
+                        arrivals.push(at);
+                    }
+                    if v.get("tokens").is_some_and(Value::is_array) {
+                        tokens = ids_of(&v["tokens"]);
+                    }
+                }
+                let status = child.wait().map_err(|e| format!("curl {url}: {e}"))?;
+                if !status.success() {
+                    return Err(format!("curl {url}: {status}"));
+                }
+                Ok(Streamed { tokens, arrivals })
+            })();
+            let _ = tx.send(run);
+        })
+        .map_err(|e| format!("slots: {}", e.what()))?;
+        Ok((h, rx))
+    }
+
+    /// The slots clause (module header) on a server of `--parallel 2` started
+    /// into `<dir>/slots`: two greedy streamed requests of distinct prompts,
+    /// each first run alone on that same server and then both together, the
+    /// ids, the round counters and the streams' interleaving held, the load
+    /// record's split and `/props`' context pinned to half the one-slot
+    /// default `total`.
+    fn slots_flow_together(
+        model: &Path,
+        dir: &Path,
+        total: Option<u64>,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let dir = dir.join("slots");
+        std::fs::create_dir_all(&dir)?;
+        let err_log = dir.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL");
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mut s = Served::spawn_cmd(
+            cmd,
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "2",
+                "-m",
+                m,
+            ],
+            &dir,
+        )?;
+        let addr = match s.address(&err_log, 600, Duration::from_secs(1)) {
+            Ok(a) => a,
+            // A load that never listens names no split: the split's check
+            // is red by name, and the clauses after this one still run.
+            Err(e) => {
+                println!("slots: the server never listened: {e}");
+                check(ok, "slots_load_names_the_split", false);
+                let _ = s.stop();
+                return Ok(());
+            }
+        };
+        let url = |p: &str| format!("http://{addr}{p}");
+        // (v4) The load names the split and /props the slot ctx.
+        let log = std::fs::read_to_string(&err_log)?;
+        let (load, _) = load_and_listening(&log);
+        let field = |name: &str| field_u64(load, name);
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let props = json_of("/props", st, &body)?;
+        let n_ctx = props["n_ctx"].as_u64().unwrap_or(u64::MAX);
+        println!(
+            "slots: {load}; the one-slot default {total:?}, props n_ctx {n_ctx}, record \
+             slots={:?} slot_ctx={:?}",
+            field("slots"),
+            field("slot_ctx"),
+        );
+        check(
+            ok,
+            "slots_load_names_the_split",
+            field("slots") == Some(2) && total.is_some_and(|t| field("slot_ctx") == Some(t / 2)),
+        );
+        check(
+            ok,
+            "props_names_the_slot_ctx",
+            total.is_some_and(|t| n_ctx == t / 2),
+        );
+        // Two distinct prompts, each first run alone, then both together.
+        let a_ids = rendered(&url, messages())?;
+        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
+        let b_ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let mut alone = Vec::new();
+        for ids in [&a_ids, &b_ids] {
+            let (h, rx) = streamed(&addr, ids, SLOTS_PREDICT)?;
+            h.join()
+                .map_err(|_| "slots: an alone request's thread panicked")?;
+            let ran = rx
+                .recv()
+                .map_err(|_| "slots: an alone request's thread gave no answer")??;
+            println!("slots alone: {} ids", ran.tokens.len());
+            alone.push(ran.tokens);
+        }
+        let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let busy0 = busy_total(&url, decode0)?;
+        // Both posted at once: the prompts serialize on the engine thread
+        // (a round or two of skew), so nearly every decode round carries
+        // both slots — the (v2) bound's shape.
+        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
+        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+            h.join()
+                .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
+            let ran = rx
+                .recv()
+                .map_err(|_| format!("slots: the {what} request's thread gave no answer"))??;
+            together.push(ran);
+        }
+        let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let busy1 = busy_total(&url, decode1)?;
+        let swaps = metric(&url, "swaps_total")?;
+        // (v1) The slots hold separate sequences: together ids are alone ids.
+        check(
+            ok,
+            "slots_alone_ids_stay",
+            !together[0].tokens.is_empty()
+                && !together[1].tokens.is_empty()
+                && together[0].tokens == alone[0]
+                && together[1].tokens == alone[1],
+        );
+        // (v2) No park, and a round carries both slots (the derivation in
+        // the module header): ≥ 1.5 against the turns' 1.0.
+        let ratio = (busy1 - busy0) / (decode1 - decode0);
+        println!(
+            "slots together: {} and {} ids; decode {decode0} -> {decode1}, busy {busy0} -> \
+             {busy1} (ratio {ratio:.3}); swaps {swaps:?}",
+            together[0].tokens.len(),
+            together[1].tokens.len(),
+        );
+        check(
+            ok,
+            "slots_rounds_carry_both_slots",
+            swaps.is_none_or(|v| v == 0.0) && ratio >= 1.5,
+        );
+        // (v3) While both streams are live, every window of SLOTS_WINDOW
+        // consecutive arrivals holds at least SLOTS_EACH of each: both live
+        // from the later stream's first arrival to the earlier one's last.
+        let mut merged: Vec<(usize, Instant)> = together
+            .iter()
+            .enumerate()
+            .flat_map(|(i, s)| s.arrivals.iter().map(move |&t| (i, t)))
+            .collect();
+        merged.sort_by_key(|&(_, t)| t);
+        let live_from = (0..2)
+            .map(|i| together[i].arrivals.first().copied())
+            .max()
+            .flatten();
+        let live_to = (0..2)
+            .map(|i| together[i].arrivals.last().copied())
+            .min()
+            .flatten();
+        let tags: Vec<usize> = merged
+            .iter()
+            .filter(|(_, t)| live_from.is_some_and(|a| *t >= a) && live_to.is_some_and(|b| *t < b))
+            .map(|&(i, _)| i)
+            .collect();
+        let mut thin = 0;
+        for w in tags.windows(SLOTS_WINDOW) {
+            let of_first = w.iter().filter(|&&i| i == 0).count();
+            if of_first < SLOTS_EACH || SLOTS_WINDOW - of_first < SLOTS_EACH {
+                thin += 1;
+            }
+        }
+        println!(
+            "slots interleave: {} arrivals while both live, {} thin window(s) of {}",
+            tags.len(),
+            thin,
+            SLOTS_WINDOW,
+        );
+        check(
+            ok,
+            "slots_streams_interleave",
+            !tags.is_empty() && thin == 0,
+        );
+        println!("slots server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
+    /// The refusal clause (module header): `--ctx` [`SLOTS_REFUSED_CTX`]
+    /// under the default two slots ends the process before the load,
+    /// naming the total, the slot count and the slot ctx it split, one row
+    /// under the seat's least. A refusal that loads instead shows as the
+    /// server still running (or listening) past the polls and is stopped
+    /// here, red; one that dies inside the load names another cause, red.
+    fn slot_ctx_too_small_is_refused(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let d = dir.join("refuse");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL");
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let total = SLOTS_REFUSED_CTX.to_string();
+        let mut s = Served::spawn_cmd(
+            cmd,
+            &["--model", "qwen3", "--port", "0", "--ctx", &total, "-m", m],
+            &d,
+        )?;
+        let mut said = String::new();
+        let mut refused = false;
+        for _ in 0..360 {
+            said = std::fs::read_to_string(&err_log).unwrap_or_default();
+            match s.child.try_wait()? {
+                Some(status) => {
+                    refused = !status.success()
+                        && said.contains("--parallel 2")
+                        && said.contains(&format!("of a --ctx of {total}:"))
+                        && said.contains(&format!(
+                            "a slot's context of {} rows is below the {MAX_TOKENS} rows",
+                            SLOTS_REFUSED_CTX / 2
+                        ));
+                    break;
+                }
+                None if said.contains("listening on http://") => break,
+                None => std::thread::sleep(SLOTS_POLL),
+            }
+        }
+        println!(
+            "slots refusal: exit {:?}, said {said}",
+            s.child.try_wait()?.map(|s| s.code())
+        );
+        check(ok, "slot_ctx_too_small_is_refused", refused);
+        let _ = s.stop();
+        Ok(())
+    }
+
     /// The server's clauses for `model`, its logs in `dir`; the answers the
-    /// CLI is held to, the chat turn's first.
-    fn served(model: &Path, dir: &Path, ok: &mut bool) -> Result<Vec<Answer>, GateError> {
+    /// CLI is held to, the chat turn's first, and the file's architecture
+    /// (which arm carries which clause below).
+    fn served(model: &Path, dir: &Path, ok: &mut bool) -> Result<(Vec<Answer>, String), GateError> {
         let err_log = dir.join("server.err");
         let mut s = spawn(model, dir)?;
         // The load reads the whole file: up to ten minutes from a cold cache.
@@ -954,7 +1389,7 @@ mod gate {
         println!("server stopped: {}", s.stop()?);
         let mut answers = vec![chat_ids, prose_ids];
         answers.extend(whole);
-        Ok(answers)
+        Ok((answers, arch))
     }
 
     /// `generate_qwen3moe --arm <prompt>/N … --last-step` on `model`, an arm
@@ -1093,7 +1528,7 @@ mod gate {
             let dir = a.dir.join(i.to_string());
             std::fs::create_dir_all(&dir)?;
             println!("== {}", model.display());
-            let answers = served(model, &dir, &mut ok)?;
+            let (answers, arch) = served(model, &dir, &mut ok)?;
             let prompts: Vec<&[u32]> = answers.iter().map(|a| a.prompt.as_slice()).collect();
             let references = cli(model, &prompts, &dir)?;
             let mut agree = true;
@@ -1105,11 +1540,19 @@ mod gate {
                 };
             }
             check(&mut ok, "completion_ids_are_the_cli_ids", agree);
-            ctx_default(model, &dir, &mut ok)?;
+            let total = ctx_default(model, &dir, &mut ok)?;
             cache_refusals(model, &dir, &mut ok)?;
-            if i == 0 {
-                // The park is the seat's, not the file's: the first file's
-                // arm carries the swap clause.
+            if arch == "qwen3moe" {
+                // The qwen3moe arm: the resident slots and the split they
+                // serve (a moved coverage clause would be lost — the swap
+                // clause below is the qwen35moe arm's now).
+                slots_flow_together(model, &dir, total, &mut ok)?;
+                slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
+            }
+            if arch == "qwen35moe" {
+                // The park is the seat's, and the qwen3moe arm's whole-card
+                // load serves resident slots: the qwen35moe arm carries the
+                // swap clause.
                 swap_reprefills_the_parked_ids(model, &dir, &mut ok)?;
             }
         }

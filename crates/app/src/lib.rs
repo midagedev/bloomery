@@ -32,7 +32,7 @@ pub mod mtp;
 
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::swap::ResetReport;
-use bloomery_gpu::model::{ChainBody, Rollback, Rows, StepMode};
+use bloomery_gpu::model::{ChainBody, Rollback, Rows, Slots, StepMode};
 use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
@@ -323,6 +323,7 @@ impl<B: Open> Loaded<B> {
         Ok(Session {
             model,
             ctx,
+            slots: 1,
             rows: None,
             logits: Vec::new(),
             tapped: Vec::new(),
@@ -343,6 +344,12 @@ pub struct Session<B: ChainBody> {
     model: GpuModel<B>,
     /// The positions the caches were sized for.
     ctx: u32,
+    /// The slots the session's model serves: 1 until
+    /// [`Session::add_slots`] grows it. What the clear goes by — a model
+    /// whose body parked slots before [`Session::from_model`] took it is
+    /// not the session's; grow slots through the session so its clear
+    /// knows them.
+    slots: usize,
     rows: Option<RowsInFlight>,
     /// The last logits row read back ([`Want::Logits`]).
     logits: Vec<f32>,
@@ -360,6 +367,7 @@ impl<B: ChainBody> Session<B> {
         Session {
             model,
             ctx,
+            slots: 1,
             rows: None,
             logits: Vec::new(),
             tapped: Vec::new(),
@@ -376,13 +384,24 @@ impl<B: ChainBody> Session<B> {
     /// the captured chains and the prompt call's
     /// buffers stay: that is the load. Refused on a model a fault poisoned:
     /// a fault ends the load, it is not cleared into the next prompt.
+    ///
+    /// Over several slots ([`Session::add_slots`]) the clear rewinds the
+    /// selected slot's sequence alone and leaves the model-wide state the
+    /// parked slots stand on where it is — a residency machine's map stays
+    /// where use has taken it, so [`Session::take_cleared`] reports `None`
+    /// there; with one slot it is exactly the clear above.
     pub fn clear(&mut self) -> Result<(), SessionError> {
         clearable(self.model.poisoned())?;
+        let one = self.slots == 1;
         self.model.reset()?;
         self.rows = None;
         self.logits.clear();
         self.tapped.clear();
-        self.cleared = self.model.residency_reset()?;
+        self.cleared = if one {
+            self.model.residency_reset()?
+        } else {
+            None
+        };
         Ok(())
     }
 
@@ -456,6 +475,51 @@ impl<B: ChainBody> Session<B> {
                 })
             }
         }
+    }
+}
+
+impl<B: Slots> Session<B>
+where
+    B::Seq: 'static,
+{
+    /// The model serving `n` slots from now on ([`GpuModel::add_slots`]): the
+    /// live sequence keeps its state, `n − slots()` new ones allocated and
+    /// parked empty. Callable any time — it allocates and parks, touching
+    /// nothing the live sequence stands on.
+    pub fn add_slots(&mut self, n: usize) -> Result<(), SessionError> {
+        self.model.add_slots(n)?;
+        self.slots = self.model.slots();
+        Ok(())
+    }
+
+    /// The slots the model serves: 1 until [`Session::add_slots`] grows it.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.model.slots()
+    }
+
+    /// The slot every later call acts on: 0 until a
+    /// [`Session::select_slot`] moves it.
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.model.selected()
+    }
+
+    /// Make `slot` the one every later call acts on
+    /// ([`GpuModel::select_slot`]): the model exchanges its live sequence,
+    /// position and capture cache with the slot's parked state — pointer
+    /// moves, nothing allocated, copied or synchronized. Refused by name
+    /// while a verify's rows wait for their commit: the rows were verified
+    /// on the sequence that stands live and their commit's rollback lands
+    /// there, so a select between would move them onto another slot's
+    /// sequence — the commit comes first.
+    ///
+    /// The kept logits row and taps need no parking of their own: each is a
+    /// readback of the call that just ran, handed back inside that call's
+    /// borrow, and the next call overwrites it.
+    pub fn select_slot(&mut self, slot: usize) -> Result<(), SessionError> {
+        self.idle("select_slot")?;
+        Ok(self.model.select_slot(slot)?)
     }
 }
 

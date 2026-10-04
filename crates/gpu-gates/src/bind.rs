@@ -575,6 +575,22 @@ enum Cmd {
     Pos,
     /// The residency back to its seed.
     ResidencyReset,
+    /// Make `slot` the one every later command acts on ([`Seat::select`]).
+    Select(usize),
+    /// A step of several slots in one command ([`SeatEngine`]'s
+    /// `step_slots`): each row's `last` on its own slot, in row order, the
+    /// answers and lent rows back with the one reply.
+    StepSlots(Vec<SlotStep>),
+}
+
+/// One row of a [`Cmd::StepSlots`]: the slot, the id it evaluates, the
+/// engine's logits row lent for it (`n_vocab` f32), and the engine's
+/// answer, which the thread sets.
+struct SlotStep {
+    slot: usize,
+    last: u32,
+    logits: Option<Vec<f32>>,
+    next: u32,
 }
 
 /// What a reply carries besides its result.
@@ -591,6 +607,8 @@ enum Extra {
     Pass(Vec<u32>, Drafted),
     /// A `ResidencyReset`'s report; `None` for a seat with no residency.
     Residency(Option<ResidencyReset>),
+    /// A `StepSlots`' rows, their answers set and their lent rows filled.
+    StepSlots(Vec<SlotStep>),
 }
 
 /// Its answer: the argmax of a `Next` (the kept length of a `Keep`), the
@@ -648,6 +666,25 @@ pub trait Seat: 'static {
     fn turn_slots(&self) -> usize {
         usize::MAX
     }
+    /// The sequences this seat serves at once, each a sequence of its own
+    /// the seat keeps resident (the server steps them together, one
+    /// [`Seat::step`] each in one round). The default is 1: the seat serves
+    /// one sequence, and several slots take it in turns
+    /// ([`Seat::turn_slots`], `serve::SwapEngine`).
+    fn slots(&self) -> usize {
+        1
+    }
+    /// Make `slot` (below [`Seat::slots`]) the one every later call acts on
+    /// until the next select, exchanging the seat's resident sequences. The
+    /// default serves slot 0 alone: selecting it is a no-op, any other slot
+    /// refused by name.
+    fn select(&mut self, slot: usize) -> Result<(), GateError> {
+        if slot == 0 {
+            Ok(())
+        } else {
+            Err(format!("slot {slot}: this seat serves slot 0 alone").into())
+        }
+    }
     /// Empty caches at position 0.
     fn reset(&mut self) -> Result<(), GateError>;
     /// Take back the positions from `pos` on; `pos` is one [`Seat::keep`]
@@ -701,6 +738,8 @@ pub struct SeatEngine {
     rows: usize,
     /// [`Seat::turn_slots`], the opened seat's.
     turn_slots: usize,
+    /// [`Seat::slots`], the opened seat's.
+    slots: usize,
     card: String,
     props: EngineProps,
     cache_ram: u64,
@@ -718,6 +757,10 @@ struct Link {
     /// The logits row a sampled `next` reads (`n_vocab` f32), lent to the
     /// engine thread for the call; empty while lent or when it never came back.
     logits: Vec<f32>,
+    /// The logits rows a step of several slots reads, one a row of the round
+    /// (`n_vocab` f32, grown once and reused every round): lent with the
+    /// command, filled on the engine thread, handed back with the reply.
+    scratch: Vec<Vec<f32>>,
 }
 
 impl SeatEngine {
@@ -729,7 +772,8 @@ impl SeatEngine {
     /// [`placement_props`]), which the seat completes ([`Seat::props`]);
     /// `cache_ram` is the server's prompt cache budget
     /// (`serve::Engine::cache_ram`). The seat's whole-load capabilities —
-    /// [`Seat::pass_rows`], [`Seat::turn_slots`] — cross with the load.
+    /// [`Seat::pass_rows`], [`Seat::turn_slots`], [`Seat::slots`] — cross
+    /// with the load.
     pub fn spawn<S, F>(
         open: F,
         defined: usize,
@@ -745,7 +789,7 @@ impl SeatEngine {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let (opened, loaded) =
-            mpsc::channel::<Result<(usize, usize, usize, EngineProps), String>>();
+            mpsc::channel::<Result<(usize, usize, usize, usize, EngineProps), String>>();
         let n_vocab = vocab.n_vocab();
         let worker = std::thread::Builder::new()
             .name("engine".to_owned())
@@ -762,6 +806,7 @@ impl SeatEngine {
                         g.ctx_max(),
                         g.pass_rows(),
                         g.turn_slots(),
+                        g.slots(),
                         g.props(props),
                     )))
                     .is_err()
@@ -818,6 +863,28 @@ impl SeatEngine {
                             None,
                             Extra::None,
                         ),
+                        Cmd::StepSlots(mut rows) => {
+                            // Select and step each row in order, on the seat:
+                            // one command, a select and a step a row on the
+                            // thread — not two round trips a row. A row that
+                            // fails ends the call there; the error is the
+                            // server's to die on.
+                            let mut failed = None;
+                            for r in rows.iter_mut() {
+                                let run =
+                                    g.select(r.slot).map_err(|e| e.to_string()).and_then(|()| {
+                                        next_row(&mut g, r.last, r.logits.as_deref_mut(), n_vocab)
+                                    });
+                                match run {
+                                    Ok(next) => r.next = next,
+                                    Err(e) => {
+                                        failed = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            (failed.map_or(Ok(0), Err), None, Extra::StepSlots(rows))
+                        }
                         cmd => {
                             let (result, logits) = serve_cmd(&mut g, cmd, n_vocab);
                             (result, logits, Extra::None)
@@ -836,8 +903,8 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, turn_slots, props) = match loaded.recv() {
-            Ok(Ok((c, rows, t, props))) => (c.min(defined), rows, t, props),
+        let (ctx_max, rows, turn_slots, slots, props) = match loaded.recv() {
+            Ok(Ok((c, rows, t, n, props))) => (c.min(defined), rows, t, n, props),
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
@@ -846,12 +913,14 @@ impl SeatEngine {
                 tx: Some(tx),
                 rx,
                 logits: vec![0.0; n_vocab],
+                scratch: Vec::new(),
             },
             worker: Some(worker),
             vocab,
             ctx_max,
             rows,
             turn_slots,
+            slots,
             card,
             props,
             cache_ram,
@@ -866,6 +935,13 @@ impl SeatEngine {
     #[must_use]
     pub fn turn_slots(&self) -> usize {
         self.turn_slots
+    }
+
+    /// The sequences the engine serves at once, the opened seat's answer
+    /// ([`Seat::slots`]): one until the seat made resident slots.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.slots
     }
 }
 
@@ -925,6 +1001,92 @@ impl Link {
             _ => Err(EngineError(
                 "the engine thread answered a pass with no tokens".to_owned(),
             )),
+        }
+    }
+
+    /// A step of several slots in one command
+    /// ([`SeatEngine`]'s `step_slots`): the engine thread selects and steps
+    /// each row in order on the seat, and the answers and lent rows come
+    /// back with the one reply — not two round trips a row. The rows' logits
+    /// travel as the link's own scratch, one row a round, grown once and
+    /// reused: no token allocates a row.
+    fn step_slots(&mut self, rows: &mut [serve::SlotRow<'_>]) -> Result<(), EngineError> {
+        let n_vocab = self.logits.len();
+        // Two rows of one slot would step its sequence twice in the round,
+        // the second on the first's answer: named before anything crosses.
+        if let Some((i, r)) = rows
+            .iter()
+            .enumerate()
+            .find(|(i, r)| rows[..*i].iter().any(|p| p.slot == r.slot))
+        {
+            return Err(EngineError(format!(
+                "a round of {} rows names slot {} twice (row {i} again)",
+                rows.len(),
+                r.slot
+            )));
+        }
+        // Grown, never shrunk: a shorter round keeps the rows it grew.
+        if self.scratch.len() < rows.len() {
+            self.scratch.resize_with(rows.len(), Vec::new);
+        }
+        let mut steps = Vec::with_capacity(rows.len());
+        let mut refused = None;
+        for (i, row) in rows.iter().enumerate() {
+            // A row that wants the logits row borrows the link's scratch for
+            // it; a caller buffer of another length is a named error before
+            // anything crosses.
+            let lent = row.logits.as_ref().map_or(Ok(None), |b| {
+                if b.len() != n_vocab {
+                    Err(EngineError(format!(
+                        "a row's logits buffer holds {}, the vocabulary has {n_vocab}",
+                        b.len()
+                    )))
+                } else {
+                    let mut v = std::mem::take(&mut self.scratch[i]);
+                    v.resize(n_vocab, 0.0);
+                    Ok(Some(v))
+                }
+            });
+            match lent {
+                Ok(logits) => steps.push(SlotStep {
+                    slot: row.slot,
+                    last: row.last,
+                    logits,
+                    next: 0,
+                }),
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+        if let Some(e) = refused {
+            self.take_back(&mut steps);
+            return Err(e);
+        }
+        let reply = self.ask(Cmd::StepSlots(steps))?;
+        let Extra::StepSlots(mut back) = reply.extra else {
+            return Err(EngineError(
+                "the engine thread answered a step of several slots with no rows".to_owned(),
+            ));
+        };
+        for (i, (row, step)) in rows.iter_mut().zip(back.iter_mut()).enumerate() {
+            row.next = step.next;
+            if let (Some(v), Some(out)) = (step.logits.as_ref(), row.logits.as_deref_mut()) {
+                out.copy_from_slice(v);
+            }
+            self.scratch[i] = step.logits.take().unwrap_or_default();
+        }
+        reply.result.map(|_| ()).map_err(EngineError)
+    }
+
+    /// The scratch rows `steps` hold back into the link, after a call that
+    /// did not cross (a refused buffer length): what was taken out goes home.
+    fn take_back(&mut self, steps: &mut [SlotStep]) {
+        for (i, s) in steps.iter_mut().enumerate() {
+            if s.logits.is_some() {
+                self.scratch[i] = s.logits.take().unwrap_or_default();
+            }
         }
     }
 }
@@ -988,6 +1150,10 @@ fn serve_cmd<S: Seat>(
             .reset()
             .map(|()| 0)
             .map_err(|e| format!("reset at position {at}: {e}")),
+        Cmd::Select(slot) => g
+            .select(slot)
+            .map(|()| 0)
+            .map_err(|e| format!("select of slot {slot}: {e}")),
         Cmd::Rollback(pos) if pos as usize == at => Ok(0),
         Cmd::Rollback(pos) => g
             .rollback(pos)
@@ -998,8 +1164,10 @@ fn serve_cmd<S: Seat>(
         | Cmd::Save
         | Cmd::Resume(_)
         | Cmd::Pass { .. }
+        | Cmd::StepSlots(..)
         | Cmd::ResidencyReset => Err(
-            "a keep, split, pass, save, resume or residency reset reached the step loop; the \
+            "a keep, split, pass, step of several slots, save, resume or residency reset \
+             reached the step loop; the \
              engine thread \
              answers it"
                 .to_owned(),
@@ -1068,6 +1236,26 @@ impl Engine for SeatEngine {
 
     fn advance_rows(&self) -> usize {
         self.rows
+    }
+
+    /// The seat's slots ([`Seat::slots`]), read once at the spawn: the
+    /// server serves this many sequences at once and steps them together.
+    fn slots(&self) -> usize {
+        self.slots
+    }
+
+    /// The seat's slot ([`Seat::select`]), forwarded to the thread: the
+    /// exchange happens there, with every other call the seat runs.
+    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+        self.link.call(Cmd::Select(slot)).map(|_| ())
+    }
+
+    /// One command for a round of several rows ([`serve::Engine`'s
+    /// `step_slots`]): the thread selects and steps each row in order, on
+    /// the seat, and the answers and requested logits rows come back with
+    /// the one reply — not a select and a step round trip a row.
+    fn step_slots(&mut self, rows: &mut [serve::SlotRow<'_>]) -> Result<(), EngineError> {
+        self.link.step_slots(rows)
     }
 
     fn reset(&mut self) -> Result<(), EngineError> {
@@ -1200,23 +1388,40 @@ mod tests {
     const N_VOCAB: usize = 8;
 
     /// A link to a thread that answers every `Next` as the engine thread does:
-    /// it fills the lent row and hands it back with the argmax.
+    /// it fills the lent row and hands it back with the argmax. A
+    /// `StepSlots` it answers the same way, a row at a time in row order.
     fn echo_link() -> (Link, std::thread::JoinHandle<()>) {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let worker = std::thread::spawn(move || {
             for (at, cmd) in cmds.into_iter().enumerate() {
-                let Cmd::Next { last, mut logits } = cmd else {
-                    panic!("the echo thread answers Next only");
-                };
-                if let Some(row) = logits.as_deref_mut() {
-                    row.fill(last as f32);
-                }
-                let reply = Reply {
-                    result: Ok(last + 1),
-                    logits,
-                    pos: at + 1,
-                    extra: super::Extra::None,
+                let reply = match cmd {
+                    Cmd::Next { last, mut logits } => {
+                        if let Some(row) = logits.as_deref_mut() {
+                            row.fill(last as f32);
+                        }
+                        Reply {
+                            result: Ok(last + 1),
+                            logits,
+                            pos: at + 1,
+                            extra: super::Extra::None,
+                        }
+                    }
+                    Cmd::StepSlots(mut rows) => {
+                        for r in rows.iter_mut() {
+                            if let Some(row) = r.logits.as_deref_mut() {
+                                row.fill(r.last as f32);
+                            }
+                            r.next = r.last + 1;
+                        }
+                        Reply {
+                            result: Ok(0),
+                            logits: None,
+                            pos: at + 1,
+                            extra: super::Extra::StepSlots(rows),
+                        }
+                    }
+                    _ => panic!("the echo thread answers Next and StepSlots only"),
                 };
                 if replies.send(reply).is_err() {
                     return;
@@ -1227,8 +1432,120 @@ mod tests {
             tx: Some(tx),
             rx,
             logits: vec![0.0; N_VOCAB],
+            scratch: Vec::new(),
         };
         (link, worker)
+    }
+
+    /// A round of several slots is one command whose reply sets each row's
+    /// answer in row order ([`Link::step_slots`]), the rows' logits reading
+    /// into the link's own scratch — grown once on the first round, reused
+    /// every round, so no token allocates a row; a caller buffer of another
+    /// length and a slot named twice are named errors.
+    #[test]
+    fn a_round_of_slots_answers_in_row_order() {
+        use serve::SlotRow;
+        let (mut link, worker) = echo_link();
+        let mut a = [0.0f32; N_VOCAB];
+        let mut b = [0.0f32; N_VOCAB];
+        let mut rows = vec![
+            SlotRow {
+                slot: 0,
+                last: 3,
+                logits: Some(&mut a),
+                next: 0,
+            },
+            SlotRow {
+                slot: 1,
+                last: 5,
+                logits: None,
+                next: 0,
+            },
+            SlotRow {
+                slot: 2,
+                last: 9,
+                logits: Some(&mut b),
+                next: 0,
+            },
+        ];
+        link.step_slots(&mut rows).expect("a round of three slots");
+        assert_eq!(
+            rows.iter().map(|r| r.next).collect::<Vec<_>>(),
+            vec![4, 6, 10],
+            "each row its own answer, in row order"
+        );
+        assert_eq!(a, [3.0f32; N_VOCAB]);
+        assert_eq!(b, [9.0f32; N_VOCAB]);
+        assert_eq!(link.scratch.len(), 3, "the scratch came home");
+        let first = link.scratch[0].as_ptr();
+        let third = link.scratch[2].as_ptr();
+        let mut c = [0.0f32; N_VOCAB];
+        let mut rows = vec![
+            SlotRow {
+                slot: 1,
+                last: 7,
+                logits: Some(&mut c),
+                next: 0,
+            },
+            SlotRow {
+                slot: 0,
+                last: 1,
+                logits: None,
+                next: 0,
+            },
+        ];
+        link.step_slots(&mut rows).expect("a second, shorter round");
+        assert_eq!(rows[0].next, 8);
+        assert_eq!(rows[1].next, 2);
+        assert_eq!(c, [7.0f32; N_VOCAB]);
+        assert_eq!(link.scratch[0].as_ptr(), first, "the scratch reused");
+        assert_eq!(
+            link.scratch[2].as_ptr(),
+            third,
+            "an untouched row kept its row"
+        );
+        // A caller buffer of another length is a named error, and the
+        // scratch it had lent comes home for the next round.
+        let mut short = [0.0f32; N_VOCAB - 1];
+        let mut rows = vec![
+            SlotRow {
+                slot: 0,
+                last: 2,
+                logits: Some(&mut short),
+                next: 0,
+            },
+            SlotRow {
+                slot: 1,
+                last: 4,
+                logits: None,
+                next: 0,
+            },
+        ];
+        let e = link
+            .step_slots(&mut rows)
+            .expect_err("a short buffer among the rows");
+        assert!(e.0.contains("holds 7"), "{e}");
+        // Two rows of one slot are a named error before anything crosses.
+        let mut rows = vec![
+            SlotRow {
+                slot: 1,
+                last: 2,
+                logits: None,
+                next: 0,
+            },
+            SlotRow {
+                slot: 1,
+                last: 4,
+                logits: None,
+                next: 0,
+            },
+        ];
+        let e = link
+            .step_slots(&mut rows)
+            .expect_err("one slot twice in a round");
+        assert!(e.0.contains("names slot 1 twice"), "{e}");
+        link.tx = None;
+        worker.join().expect("the echo thread");
     }
 
     /// Every sampled step reads into the buffer the link was built with: the

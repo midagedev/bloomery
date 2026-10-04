@@ -1647,10 +1647,12 @@ pub static LISTENING_GLM: Kind = Kind {
 pub static LISTENING_QWEN3: Kind = Kind {
     name: "listening_qwen3",
     head: "bloomery-serve-qwen3:",
-    doc: "The Qwen3 seat's architecture, context and the address it listens on.",
+    doc: "The Qwen3 seat's architecture, the context a slot serves (`ctx`, the cache rows the model was loaded with; `slot_ctx` the same number — a resident slot's share of the split context, or the whole context the slots take in turns), the slots it serves and the address it listens on.",
     parts: &[
         key("arch", Word, ""),
         key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("slot_ctx", U64, "positions"),
         lit(" listening on http://"),
         pos("addr", Word, ""),
     ],
@@ -1675,12 +1677,14 @@ pub static LISTENING_DECIDE: Kind = Kind {
 pub static LOAD_QWEN3: Kind = Kind {
     name: "load_qwen3",
     head: "load",
-    doc: "The Qwen3 seat's model on device 0: its architecture, resident bytes, the K/V planes' format, context, layers, the prompt ubatch and the step graph's nodes, and the load's wall.",
+    doc: "The Qwen3 seat's model on device 0: its architecture, resident bytes (every resident sequence's), the K/V planes' format, the cache rows the model was loaded with (`ctx`; `slot_ctx` the same number, each resident sequence's), the resident sequences it holds (`slots`; 1 when the server's slots take one sequence in turns), layers, the prompt ubatch and the step graph's nodes, and the load's wall.",
     parts: &[
         key("arch", Word, ""),
         key("resident_bytes", U64, "B"),
         key("cache", Word, ""),
         key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("slot_ctx", U64, "positions"),
         key("layers", U64, ""),
         key("ubatch", U64, "positions"),
         key("graph_nodes", U64, ""),
