@@ -350,10 +350,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Err(e) => return exit_with(NAME, Err(e)),
         };
         if let Some(from) = from {
-            return match decide::run(&rest, from, repo.as_deref()) {
-                Ok(e) => exit_with(NAME, Err(e.into())),
-                Err(e) => exit_with(NAME, Err(e)),
-            };
+            return ended(decide::run(&rest, from, repo.as_deref()));
         }
         let (seat, arch) = match seat_of_file() {
             Ok(v) => v,
@@ -378,6 +375,12 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Glm => glm::run(&rest),
             Model::Qwen3 => qwen3::run(&rest),
         };
+        ended(r)
+    }
+
+    /// The process's exit for a seat's end, the decide seat's and the
+    /// generative seats' alike.
+    fn ended(r: Result<ServeError, GateError>) -> ExitCode {
         match r {
             // EX_SOFTWARE: the engine, not the listener or the load, ended the run.
             Ok(ServeError::Engine(f)) => {

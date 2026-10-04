@@ -309,39 +309,9 @@ impl Server {
             .map_err(|e| {
                 io::Error::new(e.kind(), format!("cannot start the engine thread: {e}"))
             })?;
-        let accept_state = Arc::clone(&state);
-        let port = listener.local_addr().map_or(0, |a| a.port());
-        let live = Arc::new(AtomicUsize::new(0));
-        thread::spawn(move || {
-            let mut repeats = 0;
-            for conn in listener.incoming() {
-                match conn {
-                    Ok(stream) => {
-                        repeats = 0;
-                        admit(&accept_state, &live, port, stream);
-                    }
-                    Err(e) => {
-                        let stands = listener.local_addr().is_ok();
-                        let Some(wait) = after_accept_error(&e, stands, repeats) else {
-                            let gone = io::Error::new(
-                                e.kind(),
-                                format!(
-                                    "accept failed ({e}); the listener cannot accept again \
-                                     (it stands: {stands})"
-                                ),
-                            );
-                            let _ = accept_state.shared.end.send(End::Io(gone));
-                            return;
-                        };
-                        eprintln!(
-                            "bloomery-serve: accept failed ({e}); the listener stands, next accept in {} ms",
-                            wait.as_millis()
-                        );
-                        repeats = repeats.saturating_add(1);
-                        thread::sleep(wait);
-                    }
-                }
-            }
+        let conn_state = Arc::clone(&state);
+        accept(listener, state.shared.end.clone(), move |stream| {
+            keep_alive(stream, |req, w| route(&conn_state, req, w));
         });
         Ok((state, ended))
     }
@@ -352,15 +322,8 @@ impl Server {
             Ok(s) => s,
             Err(e) => return ServeError::Io(e),
         };
-        match ended.recv() {
-            Ok(End::Io(e)) => ServeError::Io(e),
-            Ok(End::Engine(f)) => {
-                thread::sleep(state.fatal_linger);
-                ServeError::Engine(f)
-            }
-            // `state` holds a sender, so the channel cannot close while we wait.
-            Err(mpsc::RecvError) => ServeError::Io(io::Error::other("accept loop vanished")),
-        }
+        // `state` holds a sender, so the channel cannot close while we wait.
+        wait_end(&ended, state.fatal_linger)
     }
 
     /// Serves in the background and returns the address. What ends the
@@ -519,11 +482,11 @@ fn after_accept_error(e: &io::Error, listener_stands: bool, repeats: u32) -> Opt
 
 /// One live connection's place under [`MAX_CONNECTIONS`], given back when its
 /// thread ends, by a return or a panic.
-pub(crate) struct Permit(Arc<AtomicUsize>);
+struct Permit(Arc<AtomicUsize>);
 
 impl Permit {
     /// A place, or `None` when [`MAX_CONNECTIONS`] are live.
-    pub(crate) fn take(live: &Arc<AtomicUsize>) -> Option<Permit> {
+    fn take(live: &Arc<AtomicUsize>) -> Option<Permit> {
         let held = live.fetch_add(1, Ordering::SeqCst);
         let permit = Permit(Arc::clone(live));
         (held < MAX_CONNECTIONS).then_some(permit)
@@ -536,9 +499,86 @@ impl Drop for Permit {
     }
 }
 
+/// Accepts connections on `listener` on a thread of its own and serves each
+/// through `serve` ([`admit`]). An `accept` that fails while the listener
+/// stands is a named line on stderr and the loop goes on
+/// ([`after_accept_error`]); a listener that no longer stands is sent on `end`
+/// and ends the loop. Every server of the crate accepts here.
+pub(crate) fn accept<F>(listener: TcpListener, end: mpsc::Sender<End>, serve: F)
+where
+    F: Fn(TcpStream) + Send + Sync + 'static,
+{
+    let port = listener.local_addr().map_or(0, |a| a.port());
+    let live = Arc::new(AtomicUsize::new(0));
+    let serve = Arc::new(serve);
+    thread::spawn(move || {
+        let mut repeats = 0;
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    repeats = 0;
+                    admit(&serve, &live, port, stream);
+                }
+                Err(e) => {
+                    let stands = listener.local_addr().is_ok();
+                    let Some(wait) = after_accept_error(&e, stands, repeats) else {
+                        let gone = io::Error::new(
+                            e.kind(),
+                            format!(
+                                "accept failed ({e}); the listener cannot accept again \
+                                 (it stands: {stands})"
+                            ),
+                        );
+                        let _ = end.send(End::Io(gone));
+                        return;
+                    };
+                    eprintln!(
+                        "bloomery-serve: accept failed ({e}); the listener stands, next accept in {} ms",
+                        wait.as_millis()
+                    );
+                    repeats = repeats.saturating_add(1);
+                    thread::sleep(wait);
+                }
+            }
+        }
+    });
+}
+
+/// What ends a server, waited for on `ended`: the listener's failure at once,
+/// an engine's after `linger`, during which `/health` answers it
+/// ([`fatal_health`]). The caller holds a sender, so the channel cannot close
+/// while it waits.
+pub(crate) fn wait_end(ended: &mpsc::Receiver<End>, linger: Duration) -> ServeError {
+    match ended.recv() {
+        Ok(End::Io(e)) => ServeError::Io(e),
+        Ok(End::Engine(f)) => {
+            thread::sleep(linger);
+            ServeError::Engine(f)
+        }
+        Err(mpsc::RecvError) => ServeError::Io(io::Error::other("accept loop vanished")),
+    }
+}
+
+/// `/health`'s 503 body once an engine failure ends the server.
+pub(crate) fn fatal_health(reason: &str) -> Value {
+    let mut v = error_body(503, "unavailable_error", reason);
+    v["status"] = json!("error");
+    v["reason"] = json!(reason);
+    v
+}
+
+/// The message of the 503 every request that needs the engine gets once an
+/// engine failure ends the server.
+pub(crate) fn stopping(reason: &str) -> String {
+    format!("the engine failed and the server is stopping: {reason}")
+}
+
 /// Serves `stream` on a thread of its own, named `serve:<port>`, or refuses it
 /// with a 503 when [`MAX_CONNECTIONS`] are live or no thread can be started.
-fn admit(state: &Arc<State>, live: &Arc<AtomicUsize>, port: u16, stream: TcpStream) {
+fn admit<F>(serve: &Arc<F>, live: &Arc<AtomicUsize>, port: u16, stream: TcpStream)
+where
+    F: Fn(TcpStream) + Send + Sync + 'static,
+{
     let Some(permit) = Permit::take(live) else {
         refuse(
             stream,
@@ -554,12 +594,12 @@ fn admit(state: &Arc<State>, live: &Arc<AtomicUsize>, port: u16, stream: TcpStre
             return;
         }
     };
-    let state = Arc::clone(state);
+    let serve = Arc::clone(serve);
     let spawned = thread::Builder::new()
         .name(format!("serve:{port}"))
         .spawn(move || {
             let _permit = permit;
-            serve_conn(&state, stream);
+            serve(stream);
         });
     if let Err(e) = spawned {
         refuse(answer, &format!("cannot start a connection thread: {e}"));
@@ -569,7 +609,7 @@ fn admit(state: &Arc<State>, live: &Arc<AtomicUsize>, port: u16, stream: TcpStre
 /// Answers a connection the server does not serve with a 503 carrying
 /// `Retry-After`, then closes it after reading what the client sent, for at most
 /// about [`REFUSE_DRAIN`] twice.
-pub(crate) fn refuse(mut stream: TcpStream, message: &str) {
+fn refuse(mut stream: TcpStream, message: &str) {
     let _ = stream.set_write_timeout(Some(REFUSE_DRAIN));
     let body = error_body(503, "unavailable_error", message);
     let sent = http::respond(
@@ -613,7 +653,7 @@ pub(crate) fn closing() -> Request {
 /// next request (a byte already buffered counts), then gives the rest of the
 /// request [`REQUEST_READ`] per read. `false` when nothing came: the peer
 /// closed, the wait ran out or the read failed, and the connection closes.
-pub(crate) fn next_request_arrives(r: &mut BufReader<TcpStream>) -> bool {
+fn next_request_arrives(r: &mut BufReader<TcpStream>) -> bool {
     if !r.buffer().is_empty() {
         return true;
     }
@@ -624,7 +664,14 @@ pub(crate) fn next_request_arrives(r: &mut BufReader<TcpStream>) -> bool {
     arrived && r.get_ref().set_read_timeout(Some(REQUEST_READ)).is_ok()
 }
 
-fn serve_conn(state: &State, stream: TcpStream) {
+/// Answers `stream`'s requests in order through `route` while the client keeps
+/// the connection alive ([`next_request_arrives`]); `route` answers one
+/// request, `Ok(true)` when the connection may carry another. A request that
+/// cannot be read is a 400 and the connection closes.
+pub(crate) fn keep_alive(
+    stream: TcpStream,
+    mut route: impl FnMut(&Request, &mut TcpStream) -> io::Result<bool>,
+) {
     let _ = stream.set_nodelay(true);
     let Ok(mut w) = stream.try_clone() else {
         return;
@@ -651,7 +698,7 @@ fn serve_conn(state: &State, stream: TcpStream) {
             }
             Err(_) => return,
         };
-        match route(state, &req, &mut w) {
+        match route(&req, &mut w) {
             Ok(true) if req.keep_alive => {}
             _ => return,
         }
@@ -980,10 +1027,7 @@ fn default_params() -> GenParams {
 
 fn health(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     if let Some(reason) = state.fatal() {
-        let mut v = error_body(503, "unavailable_error", &reason);
-        v["status"] = json!("error");
-        v["reason"] = json!(reason);
-        return send_json(w, req, 503, &v);
+        return send_json(w, req, 503, &fatal_health(&reason));
     }
     let idle = relock(&state.shared.board).free();
     let v = json!({
@@ -1482,7 +1526,7 @@ fn dead_engine(reason: &str) -> ApiError {
         retry_after: false,
         code: 503,
         kind: "unavailable_error",
-        message: format!("the engine failed and the server is stopping: {reason}"),
+        message: stopping(reason),
     }
 }
 

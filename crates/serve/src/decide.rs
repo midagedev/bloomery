@@ -7,29 +7,35 @@
 //! seated model's listing, as the generative server's), `GET /health`, `OPTIONS` on any path (the
 //! CORS answer [`crate::Server`] gives), and a 404 error object for anything else. A refused request
 //! is a 400 carrying the decider's message, a request the engine cannot answer (an image) a 501
-//! `not_supported_error`, an engine fault a 500. The decider runs one request at a time behind a mutex; connections are
-//! served one thread each, at most [`MAX_CONNECTIONS`] at once, with the same keep-alive and read
-//! bounds as [`crate::Server`].
+//! `not_supported_error`. The decider runs one request at a time behind a mutex; connections are
+//! accepted and kept alive by the same owner as [`crate::Server`]'s (at most
+//! [`crate::MAX_CONNECTIONS`] at once, a connection past them a 503).
+//!
+//! A decider that fails is fatal, as an engine is to [`crate::Server`]: an engine error (a worker
+//! that died is one), a panic in the decider, or its lock poisoned. The request that met it gets
+//! a 500 carrying the reason, `/health` and every later request a 503 with it, and after
+//! [`FATAL_LINGER`] [`DecideServer::run`] returns it, so the process exits instead of holding the
+//! port with a dead decider behind it.
 //!
 //! A decision model is named by its head, not by its backbone's architecture: `--head` given, or a
 //! `--hf` repo whose model card names a row's head repo as the model it quantizes, seats it
 //! ([`pick`]); the head's config picks the row ([`row_of_config`]).
 
-use std::io::{self, BufReader};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::io;
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
 use crate::api::{
-    JSON, Permit, closing, cors_preflight, engine_object, error_body, next_request_arrives, refuse,
+    End, JSON, accept, cors_preflight, engine_object, error_body, fatal_health, keep_alive, relock,
+    stopping, wait_end,
 };
 use crate::http::{self, Request};
-use crate::{EngineProps, MAX_CONNECTIONS};
+use crate::{EngineFailure, EngineProps, FATAL_LINGER, ServeError};
 
 /// One answered request.
 #[derive(Clone, Debug)]
@@ -54,7 +60,7 @@ pub enum DecideError {
     /// server answers an image to a text-only decision model).
     #[error("{0}")]
     NotSupported(String),
-    /// The engine failed on a valid request (a 500).
+    /// The engine failed on a valid request (a 500), which ends the server.
     #[error("{0}")]
     Engine(String),
 }
@@ -328,19 +334,56 @@ fn with_timings(d: &Decided) -> Result<String, DecideError> {
     Ok(format!("{open}{comma}\"timings\":{timings}}}"))
 }
 
+/// What every connection shares: the decider, what is fixed at bind, and the failure that ends
+/// the server.
+struct Shared {
+    decider: Mutex<Box<dyn Decide>>,
+    fixed: Fixed,
+    /// What the crash block names as the engine.
+    engine: String,
+    /// The decider's failure that ends the server, the reason `/health` and every later request
+    /// give; the first one is kept.
+    fatal: Mutex<Option<String>>,
+    /// Where that failure goes, to end [`DecideServer::run`].
+    end: mpsc::Sender<End>,
+}
+
+impl Shared {
+    fn fatal(&self) -> Option<String> {
+        relock(&self.fatal).clone()
+    }
+
+    /// Records `error` as the failure that ends the server, unless one already did, and answers
+    /// the request that met it with a 500 carrying it.
+    fn fail(&self, error: String) -> Reply {
+        let mut fatal = relock(&self.fatal);
+        if fatal.is_none() {
+            *fatal = Some(error.clone());
+            let _ = self.end.send(End::Engine(EngineFailure {
+                engine: self.engine.clone(),
+                error: error.clone(),
+            }));
+        }
+        Reply::error(500, "server_error", &error)
+    }
+}
+
 /// The reply to one request.
-fn reply(decider: &Mutex<Box<dyn Decide>>, fixed: &Fixed, req: &Request) -> Reply {
+fn reply(s: &Shared, req: &Request) -> Reply {
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/health") => Reply::json(200, &json!({ "status": "ok" })),
-        ("GET", "/props") => Reply::json(200, &fixed.props),
-        ("GET", "/v1/models" | "/models") => Reply::json(200, &fixed.models),
+        ("GET", "/health") => match s.fatal() {
+            Some(reason) => Reply::json(503, &fatal_health(&reason)),
+            None => Reply::json(200, &json!({ "status": "ok" })),
+        },
+        ("GET", "/props") => Reply::json(200, &s.fixed.props),
+        ("GET", "/v1/models" | "/models") => Reply::json(200, &s.fixed.models),
         ("OPTIONS", _) => Reply {
             status: 204,
             ctype: "text/plain",
             extra: cors_preflight().to_vec(),
             body: Vec::new(),
         },
-        ("POST", path) if fixed.routes.contains(&path) => {
+        ("POST", path) if s.fixed.routes.contains(&path) => {
             let Ok(body) = std::str::from_utf8(&req.body) else {
                 return Reply::error(
                     400,
@@ -348,34 +391,50 @@ fn reply(decider: &Mutex<Box<dyn Decide>>, fixed: &Fixed, req: &Request) -> Repl
                     "the request body is not UTF-8",
                 );
             };
-            let Ok(mut d) = decider.lock() else {
-                return Reply::error(
-                    500,
-                    "server_error",
-                    "the decider panicked in an earlier request",
-                );
-            };
-            match d.decide(body).and_then(|a| with_timings(&a)) {
-                Ok(text) => Reply {
-                    status: 200,
-                    ctype: JSON,
-                    extra: Vec::new(),
-                    body: text.into_bytes(),
-                },
-                Err(DecideError::Refused(m)) => Reply::error(400, "invalid_request_error", &m),
-                Err(DecideError::NotSupported(m)) => Reply::error(501, "not_supported_error", &m),
-                Err(DecideError::Engine(m)) => Reply::error(500, "server_error", &m),
-            }
+            decide(s, body)
         }
         _ => Reply::error(404, "not_found_error", "File Not Found"),
+    }
+}
+
+/// One request body through the decider. An engine error, a panic in the decider and a lock a
+/// panic poisoned are fatal ([`Shared::fail`]); once one was, every request is a 503 naming it.
+fn decide(s: &Shared, body: &str) -> Reply {
+    let held = s.decider.lock();
+    if let Some(reason) = s.fatal() {
+        return Reply::error(503, "unavailable_error", &stopping(&reason));
+    }
+    let Ok(mut d) = held else {
+        return s
+            .fail("the decider's lock is poisoned: a request panicked while it held it".into());
+    };
+    let decided = panic::catch_unwind(AssertUnwindSafe(|| d.decide(body)));
+    match decided.map(|r| r.and_then(|a| with_timings(&a))) {
+        Ok(Ok(text)) => Reply {
+            status: 200,
+            ctype: JSON,
+            extra: Vec::new(),
+            body: text.into_bytes(),
+        },
+        Ok(Err(DecideError::Refused(m))) => Reply::error(400, "invalid_request_error", &m),
+        Ok(Err(DecideError::NotSupported(m))) => Reply::error(501, "not_supported_error", &m),
+        Ok(Err(DecideError::Engine(m))) => s.fail(m),
+        Err(p) => {
+            let what = p
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic without a message".to_owned());
+            s.fail(format!("the decider panicked: {what}"))
+        }
     }
 }
 
 /// A bound, not yet running decision server.
 pub struct DecideServer {
     listener: TcpListener,
-    decider: Arc<Mutex<Box<dyn Decide>>>,
-    fixed: Arc<Fixed>,
+    shared: Arc<Shared>,
+    ended: mpsc::Receiver<End>,
 }
 
 impl DecideServer {
@@ -404,10 +463,17 @@ impl DecideServer {
             ),
         };
         let listener = TcpListener::bind(addr)?;
+        let (end, ended) = mpsc::channel();
         Ok(DecideServer {
             listener,
-            decider: Arc::new(Mutex::new(decider)),
-            fixed: Arc::new(fixed),
+            shared: Arc::new(Shared {
+                decider: Mutex::new(decider),
+                fixed,
+                engine: format!("the decider of {}", seated.name),
+                fatal: Mutex::new(None),
+                end,
+            }),
+            ended,
         })
     }
 
@@ -416,33 +482,26 @@ impl DecideServer {
         self.listener.local_addr()
     }
 
-    /// Accepts connections until `accept` fails, and returns that error.
-    pub fn run(self) -> io::Error {
-        let live = Arc::new(AtomicUsize::new(0));
-        for conn in self.listener.incoming() {
-            let stream = match conn {
-                Ok(s) => s,
-                Err(e) => return e,
-            };
-            let Some(permit) = Permit::take(&live) else {
-                refuse(
-                    stream,
-                    &format!("the server is serving {MAX_CONNECTIONS} connections, its limit"),
-                );
-                continue;
-            };
-            let (decider, fixed) = (Arc::clone(&self.decider), Arc::clone(&self.fixed));
-            let spawned = thread::Builder::new()
-                .name("decide".to_owned())
-                .spawn(move || {
-                    let _permit = permit;
-                    serve_conn(&decider, &fixed, stream);
-                });
-            if let Err(e) = spawned {
-                eprintln!("bloomery-serve: cannot start a connection thread: {e}");
-            }
-        }
-        io::Error::other("the listener's accept loop ended")
+    /// Serves until the listener fails or the decider does, and returns why: the listener's
+    /// error ([`ServeError::Io`]), or after [`FATAL_LINGER`], during which `/health` answers it,
+    /// the decider's failure ([`ServeError::Engine`], its crash block), as the generative server
+    /// does.
+    pub fn run(self) -> ServeError {
+        let DecideServer {
+            listener,
+            shared,
+            ended,
+        } = self;
+        let conn = Arc::clone(&shared);
+        accept(listener, shared.end.clone(), move |stream| {
+            keep_alive(stream, |req, w| {
+                let a = reply(&conn, req);
+                http::respond(w, req, a.status, a.ctype, &a.extra, &a.body)?;
+                Ok(true)
+            });
+        });
+        // `shared` holds a sender, so the channel cannot close while we wait.
+        wait_end(&ended, FATAL_LINGER)
     }
 }
 
@@ -475,35 +534,6 @@ fn check_routes(routes: &[&str]) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn serve_conn(decider: &Mutex<Box<dyn Decide>>, fixed: &Fixed, stream: TcpStream) {
-    let _ = stream.set_nodelay(true);
-    let Ok(mut w) = stream.try_clone() else {
-        return;
-    };
-    let mut r = BufReader::new(stream);
-    loop {
-        if !next_request_arrives(&mut r) {
-            return;
-        }
-        let req = match http::read_request(&mut r, &mut w) {
-            Ok(Some(req)) => req,
-            Ok(None) => return,
-            Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                let a = Reply::error(400, "invalid_request_error", &e.to_string());
-                let _ = http::respond(&mut w, &closing(), a.status, a.ctype, &a.extra, &a.body);
-                return;
-            }
-            Err(_) => return,
-        };
-        let a = reply(decider, fixed, &req);
-        if http::respond(&mut w, &req, a.status, a.ctype, &a.extra, &a.body).is_err()
-            || !req.keep_alive
-        {
-            return;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -543,20 +573,25 @@ mod tests {
 
     const ROUTES: &[&str] = &["/v1/rerank", "/rerank"];
 
-    fn fixed() -> Fixed {
-        Fixed {
-            routes: ROUTES,
-            props: json!({}),
-            models: crate::models::listing("m.gguf", 0, json!({}), None),
+    fn shared() -> Shared {
+        Shared {
+            decider: Mutex::new(Box::new(Echo)),
+            fixed: Fixed {
+                routes: ROUTES,
+                props: json!({}),
+                models: crate::models::listing("m.gguf", 0, json!({}), None),
+            },
+            engine: "the decider of m.gguf".to_owned(),
+            fatal: Mutex::new(None),
+            end: mpsc::channel().0,
         }
     }
 
     #[test]
     fn the_routes_are_the_deciders_and_no_other() {
-        let d: Mutex<Box<dyn Decide>> = Mutex::new(Box::new(Echo));
-        let (fixed, routes) = (fixed(), ROUTES);
+        let (s, routes) = (shared(), ROUTES);
         for path in routes {
-            let r = reply(&d, &fixed, &post(path));
+            let r = reply(&s, &post(path));
             assert_eq!(r.status, 200, "{path}");
             assert!(
                 String::from_utf8(r.body)
@@ -564,7 +599,7 @@ mod tests {
                     .starts_with(r#"{"a":1,"timings":"#)
             );
         }
-        assert_eq!(reply(&d, &fixed, &post("/v1/systemone")).status, 404);
+        assert_eq!(reply(&s, &post("/v1/systemone")).status, 404);
         assert!(check_routes(&[]).unwrap_err().contains("no route"));
         assert!(check_routes(&["v1/x"]).is_err() && check_routes(&["/props"]).is_err());
         assert!(check_routes(routes).is_ok());
@@ -573,11 +608,10 @@ mod tests {
     /// A request the engine cannot answer is llama.cpp's 501; the model list is the seated one's.
     #[test]
     fn not_supported_is_501_and_the_models_are_listed() {
-        let d: Mutex<Box<dyn Decide>> = Mutex::new(Box::new(Echo));
-        let fixed = fixed();
+        let s = shared();
         let mut req = post("/rerank");
         req.body = b"\"image\"".to_vec();
-        let r = reply(&d, &fixed, &req);
+        let r = reply(&s, &req);
         let body: Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(
             (r.status, &body["error"]["type"]),
@@ -585,8 +619,7 @@ mod tests {
         );
         for path in ["/v1/models", "/models"] {
             let r = reply(
-                &d,
-                &fixed,
+                &s,
                 &Request {
                     method: "GET".to_owned(),
                     ..post(path)
@@ -598,6 +631,134 @@ mod tests {
                 (200, &json!("m.gguf")),
                 "{path}"
             );
+        }
+    }
+
+    /// The decide seat's side of a backbone worker thread that has ended (it panicked): its job
+    /// channel is closed, which is an engine error.
+    struct Worker(mpsc::Sender<mpsc::Sender<Decided>>);
+
+    impl Worker {
+        fn ended() -> Worker {
+            Worker(mpsc::channel().0)
+        }
+    }
+
+    impl Decide for Worker {
+        fn decide(&mut self, _: &str) -> Result<Decided, DecideError> {
+            let gone = || DecideError::Engine("the backbone's worker thread has ended".to_owned());
+            let (tx, rx) = mpsc::channel();
+            self.0.send(tx).map_err(|_| gone())?;
+            rx.recv().map_err(|_| gone())
+        }
+
+        fn props(&self) -> Value {
+            json!({})
+        }
+    }
+
+    /// A decider that panics on every request.
+    struct Panics;
+
+    impl Decide for Panics {
+        fn decide(&mut self, _: &str) -> Result<Decided, DecideError> {
+            panic!("boom");
+        }
+
+        fn props(&self) -> Value {
+            json!({})
+        }
+    }
+
+    /// One request over a fresh HTTP/1.0 connection: the status and the body.
+    fn call(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(addr).expect("connect");
+        write!(
+            s,
+            "{method} {path} HTTP/1.0\r\nContent-Length: 2\r\n\r\n{{}}"
+        )
+        .expect("write");
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).expect("read");
+        let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+        let status = head.split(' ').nth(1).and_then(|c| c.parse().ok());
+        (status.expect("a status line"), body.to_owned())
+    }
+
+    /// A decide server over `decider`, its lock poisoned first when `poison`, run on a free port;
+    /// what `run` returns arrives on the receiver.
+    fn serving(decider: Box<dyn Decide>, poison: bool) -> (SocketAddr, mpsc::Receiver<ServeError>) {
+        let seated = Seated {
+            routes: ROUTES,
+            name: "m.gguf".to_owned(),
+            n_ctx: 16,
+        };
+        let server = DecideServer::bind("127.0.0.1:0", &seated, decider).expect("bind");
+        if poison {
+            let lock = &server.shared.decider;
+            let held = panic::catch_unwind(AssertUnwindSafe(|| {
+                let _held = lock.lock();
+                panic!("a request panicked while it held the lock");
+            }));
+            assert!(held.is_err() && lock.is_poisoned());
+        }
+        let addr = server.local_addr().expect("addr");
+        let (tx, ran) = mpsc::channel();
+        std::thread::spawn(move || tx.send(server.run()));
+        (addr, ran)
+    }
+
+    /// A decider that cannot answer any more ends the server, as an engine ends
+    /// [`crate::Server`]: the request that met it gets a 500 naming why, `/health` and the next
+    /// request a 503 naming it, and `run` returns it no sooner than [`FATAL_LINGER`] after.
+    #[test]
+    fn a_decider_that_failed_ends_the_server() {
+        let cases: [(Box<dyn Decide>, bool, &str); 3] = [
+            (
+                Box::new(Worker::ended()),
+                false,
+                "the backbone's worker thread has ended",
+            ),
+            (Box::new(Panics), false, "the decider panicked: boom"),
+            (Box::new(Echo), true, "the decider's lock is poisoned"),
+        ];
+        // The servers linger at once.
+        let mut lingering = Vec::new();
+        for (decider, poison, why) in cases {
+            let (addr, ran) = serving(decider, poison);
+            let since = std::time::Instant::now();
+            let (status, body) = call(addr, "POST", "/rerank");
+            assert!(
+                status == 500 && body.contains(why),
+                "{why}: {status} {body}"
+            );
+            let (status, body) = call(addr, "GET", "/health");
+            let v: Value = serde_json::from_str(&body).expect("JSON");
+            assert_eq!((status, &v["status"]), (503, &json!("error")), "{why}: {v}");
+            assert!(v["reason"].as_str().is_some_and(|r| r.contains(why)), "{v}");
+            let (status, body) = call(addr, "POST", "/rerank");
+            assert!(
+                status == 503 && body.contains(&stopping(why)),
+                "{why}: {status} {body}"
+            );
+            lingering.push((ran, since, why));
+        }
+        for (ran, since, why) in lingering {
+            let e = ran
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("{why}: the server kept serving for 20 s"));
+            assert!(
+                since.elapsed() >= FATAL_LINGER,
+                "{why}: {:?}",
+                since.elapsed()
+            );
+            // The engine's end, so the binary exits as a generative seat's engine does.
+            let ServeError::Engine(f) = e else {
+                panic!("{why}: run returned {e}, not the decider's failure");
+            };
+            let f = f.to_string();
+            assert!(f.contains(why), "{f}");
         }
     }
 

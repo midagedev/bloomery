@@ -430,5 +430,5 @@ pub fn run(args: &[String], from: Pick, hf: Option<&str>) -> Result<ServeError, 
         .w("row", row.name)
         .w("addr", bound)
         .eprint();
-    Ok(ServeError::Io(server.run()))
+    Ok(server.run())
 }
