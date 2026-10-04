@@ -294,7 +294,8 @@ text. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
   `--parallel > 1` with `BLOOMERY_DRAFT=dspark` is refused by name.
 - Clef takes text states only, and reads backbone weights of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 (not the IQ
   types, Q2_K, Q4_0 or Q4_1).
-- V4.1 prompts are bound by the CPU expert tier; V4.1 decode is bound by host memory bandwidth.
+- V4.1 decode is bound by host memory bandwidth in each step's expert part, and by the card's own serial work
+  before it; a long V4.1 prompt (P = 4096) is bound by the card, since the prompt call streams host experts in.
 - A pinned nightly with a pinned cuda-oxide revision from our fork ([`docs/BUILD.md`](docs/BUILD.md)).
 
 In progress: serving on N cards for every model; Clef from the IQ and Q2_K files; DeepSeek-V4-Flash-0731.
