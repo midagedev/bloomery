@@ -753,7 +753,10 @@ impl GpuModel<Body> {
     /// Eagerly run hybrid routed layer `l` for the input residual `x_in` at
     /// `pos` (rows `0..pos` already in that layer's cache — this call appends
     /// row `pos`), serve its host share, and read the layer back.
-    /// Synchronizes; gate/debug use.
+    /// Synchronizes; gate/debug use. A fault the call reads back is its
+    /// error and poisons the model as a step's fault does
+    /// ([`GpuModel::note_fault`]): a later step refuses until
+    /// [`GpuModel::reset`].
     pub fn step_layer_hybrid(
         &mut self,
         l: usize,
@@ -767,19 +770,8 @@ impl GpuModel<Body> {
         let slot = self.layer_slot(l, what)?;
         let (gpu, w, body) = self.body_parts(what)?;
         let r = body.enqueue_hybrid_layer(gpu, w, slot);
-        // A fault printed in this architecture's step order.
-        self.name_host_refusal(r).map_err(|e| match e {
-            GpuError::Fault {
-                what,
-                fault,
-                behind,
-            } => GpuError::Fault {
-                what,
-                fault: fault.in_arch(Body::arch()),
-                behind,
-            },
-            e => e,
-        })?;
+        let r = self.name_host_refusal(r);
+        self.note_fault(what, r)?;
         let (gpu, _, body) = self.body_parts(what)?;
         let stream = gpu.stream();
         let h = body

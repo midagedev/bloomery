@@ -55,11 +55,13 @@
 //! Last, on the engine itself (`n_l` = 32): a NaN in a hybrid layer's input
 //! residual through `step_layer_hybrid` returns the card's fault at that
 //! layer — its norm's and its router's sites in the mask, printed in the
-//! Deepseek2 step order — with one refusal recorded by the host tier. The
-//! model's reset then lifts the tier's poison (one reset counted, the poison
-//! kept as refused at that layer), and the first prompt, eagerly and by
-//! replay, gives the n_l = 32 run's logits bit for bit with every step
-//! served by the host on every routed layer and the words at rest after it.
+//! Deepseek2 step order — with one refusal recorded by the host tier, and
+//! the model poisoned by that fault as a step's fault poisons it. The
+//! model's reset then lifts both — the tier's poison (one reset counted, the
+//! poison kept as refused at that layer) and the model's — and the first
+//! prompt, eagerly and by replay, gives the n_l = 32 run's logits bit for
+//! bit with every step served by the host on every routed layer and the
+//! words at rest after it.
 //!
 //! And the batch service's exclusion set, on the same stub boundary: a
 //! service given a set of host experts computes, for every column, what the
@@ -1556,8 +1558,9 @@ mod gate {
             // handoff, and the caller sees the card's fault
             // (`GpuModel::name_host_refusal`), never the host's error, its
             // mask printed in this architecture's step order. It poisons the
-            // tier; the model's reset lifts it, and a prompt after the reset
-            // replays as it did before the refusal (below).
+            // tier, and the model by that fault as a step's fault does; the
+            // model's reset lifts both, and a prompt after the reset replays
+            // as it did before the refusal (below).
             let services_per_step = routed;
             let (l, x_in, _) = chains
                 .first()
@@ -1583,12 +1586,19 @@ mod gate {
                 Err(e) => e.to_string(),
             };
             let in_order = answer.contains("Deepseek2 step order");
-            let pass = named && routed && in_order && refused;
+            // The model holds the fault the call returned, as it holds a
+            // step's, until the reset below.
+            let poisoned = match &r {
+                Err(GpuError::Fault { fault, .. }) => h.poisoned() == Some(*fault),
+                _ => false,
+            };
+            let pass = named && routed && in_order && refused && poisoned;
             ok &= pass;
             println!(
                 "n_l=32 engine refusal layer={l} input NaN at value 0: answer \"{answer}\" names the \
                  card's fault at the layer {named}, the router's refusal there too {routed}, in the \
-                 Deepseek2 step order {in_order}, the host recorded one refusal {refused} {}",
+                 Deepseek2 step order {in_order}, the host recorded one refusal {refused}, the model \
+                 poisoned by that fault {poisoned} {}",
                 verdict(pass)
             );
 
