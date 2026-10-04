@@ -667,9 +667,14 @@ mod tests {
     /// Names that spell an alias but land elsewhere print as their names.
     #[test]
     fn resolved_on_the_box_plans_as_before() {
+        // The plan's shape is what this test holds; the census readings the
+        // resolution fills in (the device binding, the free bytes and their
+        // holders) ride whatever card state the sitting meets.
         let strip = |mut m: Machine| {
             for c in m.cards.iter_mut().chain(m.tiers.iter_mut()) {
                 c.device = None;
+                c.free_bytes = None;
+                c.held_by = None;
             }
             m
         };

@@ -940,6 +940,9 @@ mod gate {
     /// past its free keeps that granule (probe `pinprobe2.py`, shadowhost
     /// round): with shadows and a capture, the first drop leaves the capture
     /// plus exactly that granule, and the second load finds it mapped.
+    /// PIN(2026-10-04): the first load also JITs the crate's bundle, which
+    /// jitonce (412367f3) keeps per (device, bundle) past every drop — a
+    /// second granule the second load finds mapped and no drop gives back.
     fn check_reload(
         [before, first, dropped, second, end]: [u64; 5],
         captured: u64,
@@ -947,7 +950,7 @@ mod gate {
     ) -> bool {
         let took = |a: u64, b: u64| i128::from(a) - i128::from(b);
         let granule: i128 = if shadow_host > 0 && captured > 0 {
-            PINNED_GRANULE
+            2 * PINNED_GRANULE
         } else {
             0
         };
