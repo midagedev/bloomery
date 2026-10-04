@@ -77,7 +77,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec};
-use model::placement::Plan;
+use model::placement::{Plan, WholeLoad};
 use runtime::seqstate::{HOST_BUDGET, Kept};
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
@@ -166,8 +166,17 @@ fn checkpoint_every(asked: usize, d: &Dims) -> Result<u32, GpuError> {
     Ok(ubatch_of(d, asked)?.get() as u32)
 }
 
+/// The rows and the device bytes of the ubatch arena of `d` for ubatches of
+/// `u` tokens ([`prompt_rows`], [`arena_bytes`]): what [`ubatch_arena`]
+/// checks against the card's free bytes and allocates, and what
+/// [`GpuModel::whole_load`] hands a whole-fit verdict.
+fn ubatch_need(d: &Dims, forms: Forms, u: usize) -> (usize, usize) {
+    let rows = prompt_rows(u, d.ctx);
+    (rows, arena_bytes(d, rows, forms))
+}
+
 /// The ubatch arena of `d` for ubatches of `u` tokens, after the check that
-/// it fits: its bytes ([`arena_bytes`]) and [`FIT_RESERVE`] within the
+/// it fits: its bytes ([`ubatch_need`]) and [`FIT_RESERVE`] within the
 /// card's `free` bytes, else a named refusal with the free bytes, the need
 /// and the largest ubatch that fits, before anything is allocated. The
 /// arena it allocates holds the bytes the check counted, or the load fails
@@ -179,12 +188,11 @@ fn ubatch_arena(
     free: usize,
 ) -> Result<Arena, GpuError> {
     const WHAT_FIT: &str = "qwen35moe::ubatch_arena";
-    let rows = prompt_rows(u, d.ctx);
-    let need = arena_bytes(&d, rows, forms);
+    let (rows, need) = ubatch_need(&d, forms, u);
     if need + FIT_RESERVE > free {
         let fits = (1..u)
             .rev()
-            .find(|&v| arena_bytes(&d, prompt_rows(v, d.ctx), forms) + FIT_RESERVE <= free)
+            .find(|&v| ubatch_need(&d, forms, v).1 + FIT_RESERVE <= free)
             .map_or("no ubatch size fits".to_string(), |v| {
                 format!("ubatches of {v} tokens fit")
             });
@@ -996,6 +1004,21 @@ impl GpuModel<Body35> {
         let forms = Forms::of(&pre.plans, &pre.d);
         let arena = arena_bytes(&pre.d, prompt_rows(o.ubatch, o.ctx), forms) as u64;
         Ok(arena + placed_bytes(&pre.d, pre.plans.len())?)
+    }
+
+    /// What a whole load of `file` opened with `o` ([`GpuModel::open`])
+    /// holds past its weights, stores and step arenas, as its own fit check
+    /// counts it: its ubatch arena at `o.ubatch` ([`ubatch_need`]), checked
+    /// against the card's free bytes, and [`FIT_RESERVE`], which the check
+    /// keeps free past it. Read through the load's own description, so a
+    /// file or options the load refuses are refused here by the same name.
+    pub fn whole_load(file: &Split, o: Open35) -> Result<WholeLoad, GpuError> {
+        let pre = Pre35::read(file, o)?;
+        let forms = Forms::of(&pre.plans, &pre.d);
+        Ok(WholeLoad::Checked {
+            arena: ubatch_need(&pre.d, forms, pre.ubatch.get()).1 as u64,
+            reserve: FIT_RESERVE as u64,
+        })
     }
 
     /// The Qwen3.6 model of `file` placed by `plan` (made by

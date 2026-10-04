@@ -10,12 +10,14 @@
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
 //! doc); `--ctx-size` is `--ctx` under llama-server's spelling, C defaults
-//! to the file's trained context capped to what the card's free bytes fit (a
-//! whole-card load; never under 4096, a multiple of 1024, one stderr line
-//! when the cap binds), or — for a placed load, under `--place` or the plan
+//! to the file's trained context capped to the largest whose whole load fits
+//! what the card had, its arena and reserve counted (a whole-card load; never
+//! under 4096, a multiple of 1024, one stderr line when the cap binds), or —
+//! for a placed load, under `--place` or the plan
 //! a run without it falls to — to the largest context whose placed plan
-//! keeps the card experts the 4096-floor's plan keeps, one stderr line
-//! naming it. 4096 for a file that states none. The model is opened as
+//! keeps the card experts the 4096-floor's plan keeps (a plan that keeps
+//! every expert opens whole, so the whole fit must take it too), one stderr
+//! line naming it. 4096 for a file that states none. The model is opened as
 //! `generate_qwen3moe` opens it — qwen3moe through `Qwen3moeModel::open` at
 //! its levers' options, qwen35moe through `Qwen35moeModel::open` with the
 //! tensor-core decode flash and the levers' ubatch — in graph mode with the
@@ -41,9 +43,10 @@
 //! eager passes of up to eight ids, no pass captured.
 //!
 //! With `--place` unset the model opens as `generate_qwen3moe` opens it:
-//! the whole file on device 0 while that fits the card's free bytes, else
-//! the placed plan on `a`'s card, its `plan` record naming why
-//! (`whole_does_not_fit`).
+//! the whole file on device 0 while the whole-fit verdict takes it (one
+//! stderr line with its terms), else the placed plan on `a`'s card, its
+//! `plan` record naming why (`whole_does_not_fit`). Each `--ctx` search
+//! prints one line more: its probes and the census readings it took.
 //!
 //! A request keeps the longest prefix it shares with what the slot holds:
 //! the session over the model answers the server's keep queries and cuts
@@ -139,15 +142,20 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
 const CTX: usize = 4096;
 
 /// The `--ctx` the seat takes when the flag is unset. A whole-card load
-/// takes the file's trained context capped to what the card's free bytes
-/// fit — never under [`CTX`], a multiple of 1024, one line on stderr when
-/// the cap binds; a file that states no trained context keeps [`CTX`]. A
-/// placed load — under `--place`, or the plan a run without it falls to when
-/// the whole file does not fit the card's free bytes — searches the same
-/// shape over the plan's own expert split: the largest context whose plan
-/// keeps the card experts the [`CTX`]-floor's plan keeps, so the solver's
-/// context-for-experts trade never sits below the floor's split. One line
-/// names the answer, at the floor or past it.
+/// takes the file's trained context capped to the largest whose whole load
+/// the whole-fit verdict takes — weights, cache, the program's arena at the
+/// load's ubatch and the reserve its load keeps free past it, against what
+/// the card had (`q3place::whole_ctx_qwen3`) — never under [`CTX`], a
+/// multiple of 1024, one line on stderr when the cap binds; a file that
+/// states no trained context keeps [`CTX`]. A placed load — under `--place`,
+/// or the plan a run without it falls to when the whole load does not fit —
+/// searches the same shape over the plan's own expert split: the largest
+/// context whose plan keeps the card experts the [`CTX`]-floor's plan keeps,
+/// so the solver's context-for-experts trade never sits below the floor's
+/// split, and whose whole load the verdict takes when that plan keeps every
+/// expert on the card (the load then opens whole). One line names the answer, at the floor or past it, and every
+/// search one line more: its probes and the census readings it took
+/// ([`searched_line`]).
 fn default_ctx(
     split: &Split,
     arch: Arch,
@@ -160,6 +168,7 @@ fn default_ctx(
     };
     let plan_levers = PlanLevers::from_levers(levers)?;
     let placed_default = |place: Place| -> Result<usize, GateError> {
+        let before = q3place::reads();
         let searched = match arch {
             Arch::Qwen3moe => q3place::placed_ctx_qwen3(split, place, CTX, &plan_levers, kv)?,
             Arch::Qwen35moe => {
@@ -173,6 +182,7 @@ fn default_ctx(
             }
             _ => None,
         };
+        searched_line("placed", before);
         match searched {
             // The plan holds the trained context with the floor's experts:
             // the trade bound nothing, as the whole load's rule.
@@ -199,6 +209,7 @@ fn default_ctx(
     if let Some(p) = place {
         return placed_default(p);
     }
+    let before = q3place::reads();
     let searched = match arch {
         Arch::Qwen3moe => q3place::whole_ctx_qwen3(split, CTX, kv)?,
         Arch::Qwen35moe => {
@@ -212,12 +223,14 @@ fn default_ctx(
         }
         _ => None,
     };
+    searched_line("whole", before);
     match searched {
         Some(ctx) => {
             if trained > ctx {
                 eprintln!(
                     "{NAME}: --ctx defaults to {ctx} of the file's {trained} trained positions \
-                     (the whole load fits the card's free bytes; pass --ctx to choose)"
+                     (the whole load fits what the card had, its arena and reserve counted; pass \
+                     --ctx to choose)"
                 );
             }
             Ok(ctx)
@@ -227,6 +240,18 @@ fn default_ctx(
         // (`open_unplaced_qwen3`), and its default is searched there.
         None => placed_default(Place::A),
     }
+}
+
+/// The line a `--ctx` search (`kind`, whole or placed) prints once it
+/// answers: the probes it ran and the census readings it took since
+/// `before` — one reading serves every probe, so a search that read the
+/// census per probe shows here.
+fn searched_line(kind: &str, before: q3place::Reads) {
+    let r = q3place::reads().since(before);
+    eprintln!(
+        "{NAME}: the {kind} --ctx search ran {} probes on {} census reading(s)",
+        r.probes, r.censuses
+    );
 }
 
 /// Why the seat takes no sequence state: it runs no prompt cache.

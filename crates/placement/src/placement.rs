@@ -167,6 +167,19 @@ impl Card {
         self.context_bytes + self.scratch_bytes + self.reserve_bytes()
     }
 
+    /// The card's floor under `dense` bytes of uploads and `kv` bytes of
+    /// cache: those, its set-aside, and `past` — what the load keeps beside
+    /// them: a plan's margin, or a whole load's own arena and reserve
+    /// ([`WholeLoad::past_bytes`]). The one owner of that sum: the budget
+    /// floor, the free floor and the whole fit ([`whole_need`]) all take it
+    /// from here. `None` past u64 bytes.
+    #[must_use]
+    pub fn floor_bytes(&self, dense: u64, kv: u64, past: u64) -> Option<u64> {
+        [kv, self.set_aside_bytes(), past]
+            .into_iter()
+            .try_fold(dense, u64::checked_add)
+    }
+
     /// The part of the card's context term a census free reading already
     /// carries: the census reads on the device's primary context, so its
     /// reading is net of the context's own creation cost
@@ -1953,9 +1966,7 @@ impl Fill<'_, '_> {
 /// usable bytes but past those shows up in [`Plan::violations`], as without
 /// a budget: the card, not the budget, is too small.
 fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), PlacementError> {
-    let floor = [kv, card.set_aside_bytes(), card.margin_bytes]
-        .into_iter()
-        .try_fold(dense, u64::checked_add);
+    let floor = card.floor_bytes(dense, kv, card.margin_bytes);
     match floor {
         Some(floor) if floor <= budget => Ok(()),
         _ => Err(PlacementError::CardBudgetFloor {
@@ -1980,15 +1991,9 @@ fn check_floor(card: &Card, budget: u64, dense: u64, kv: u64) -> Result<(), Plac
 /// free bytes of a card whose census read none plans as before.
 fn check_free_floor(card: &Card, free: u64, dense: u64, kv: u64) -> Result<(), PlacementError> {
     let context = card.context_bytes - card.context_in_free();
-    let floor = [
-        kv,
-        context,
-        card.scratch_bytes,
-        card.reserve_bytes(),
-        card.margin_bytes,
-    ]
-    .into_iter()
-    .try_fold(dense, u64::checked_add);
+    let floor = card
+        .floor_bytes(dense, kv, card.margin_bytes)
+        .map(|f| f - card.context_in_free());
     match floor {
         Some(floor) if floor <= free => Ok(()),
         floor => Err(PlacementError::CardFreeFloor(Box::new(CardFreeFloor {
@@ -2008,6 +2013,161 @@ fn check_free_floor(card: &Card, free: u64, dense: u64, kv: u64) -> Result<(), P
                 .map_or(String::new(), |h| format!(" (held by {h})")),
         }))),
     }
+}
+
+/// What a program's whole load holds on its card past its weights, its
+/// cache and its card's set-aside ([`Card::set_aside_bytes`]: the context
+/// and the step arenas' scratch), as its own load counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WholeLoad {
+    /// Its ubatch arena, which the load checks against the card's free
+    /// bytes before allocating, and what that check keeps free past it.
+    Checked { arena: u64, reserve: u64 },
+    /// A program whose load allocates its arena with no such check and whose
+    /// arena's bytes have no formula outside the allocation: the card's
+    /// margin is what covers it.
+    Unchecked,
+}
+
+impl WholeLoad {
+    /// The bytes it holds past the set-aside on `card`: the arena and the
+    /// reserve, or the card's margin. `None` past u64 bytes.
+    #[must_use]
+    pub fn past_bytes(self, card: &Card) -> Option<u64> {
+        match self {
+            WholeLoad::Checked { arena, reserve } => arena.checked_add(reserve),
+            WholeLoad::Unchecked => Some(card.margin_bytes),
+        }
+    }
+}
+
+/// What a load of the whole model asks of one card ([`whole_need`]) and
+/// what the card had; its `Display` is the verdict in one line, term by
+/// term.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WholeNeed {
+    /// The card, its context, scratch, reserves, margin and free reading.
+    pub card: Card,
+    /// The granules the uploads take through the card's allocator.
+    pub weights: u64,
+    /// The same uploads' buffer bytes, before the allocator's rounding.
+    pub weights_unrounded: u64,
+    /// The cache the caller counted: the load's context, every slot.
+    pub kv: u64,
+    /// What the program holds past them.
+    pub load: WholeLoad,
+    /// The card's floor over all of it ([`Card::floor_bytes`]); `u64::MAX`
+    /// when the sum passes u64 bytes.
+    pub need: u64,
+    /// What the card had: [`Card::read_capped_bytes`].
+    pub budget: u64,
+}
+
+impl WholeNeed {
+    /// Whether the load fits: its need within what the card had.
+    #[must_use]
+    pub fn fits(&self) -> bool {
+        self.need <= self.budget
+    }
+}
+
+impl fmt::Display for WholeNeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let c = &self.card;
+        write!(
+            f,
+            "the whole load on {}: {}: need {} B = weights {} B (the allocator's granules; {} B \
+             of buffers) + cache {} B + context {} B + scratch {} B + reserves {} B + ",
+            c.name,
+            if self.fits() { "fits" } else { "does not fit" },
+            self.need,
+            self.weights,
+            self.weights_unrounded,
+            self.kv,
+            c.context_bytes,
+            c.scratch_bytes,
+            c.reserve_bytes(),
+        )?;
+        match self.load {
+            WholeLoad::Checked { arena, reserve } => {
+                write!(f, "arena {arena} B + reserve past it {reserve} B")?;
+            }
+            WholeLoad::Unchecked => write!(
+                f,
+                "margin {} B (the program's arena under it)",
+                c.margin_bytes
+            )?,
+        }
+        write!(f, ", of {} B the card had (", self.budget)?;
+        match c.free_bytes {
+            Some(free) => write!(
+                f,
+                "{free} B free of its usable {} B at plan time",
+                c.usable_bytes
+            )?,
+            None => write!(f, "no free reading, its usable {} B", c.usable_bytes)?,
+        }
+        if let Some(held) = c.held_by {
+            write!(f, ", held by {held}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// What a load of the whole of `model` on `card` with `kv` bytes of cache
+/// asks of the card, against what the card had: the one owner of the
+/// whole-fit verdict. The load uploads every tensor its loader takes — each
+/// of the model's layers and every model-level tensor, whatever its role —
+/// in the model's order, each in the card format its role gives its type
+/// ([`CardFormat::of_role`]) and each one's buffers through the card's
+/// allocator ([`Heap`]), so the granules are counted; then the cache, the
+/// card's set-aside and what the program holds past them (`load`), summed
+/// by the card's floor ([`Card::floor_bytes`]). The budget is the card's
+/// usable bytes capped by the census's free reading as taken
+/// ([`Card::read_capped_bytes`]), not the plan's cap ([`capped`]), which
+/// adds the context's own creation back: between the reading and its arena
+/// a whole load takes more than these terms — its joined stacks' and its
+/// caches' rounding, its rope rows and prompt image, its step arenas — and
+/// the context term's whole size is what covers that. A tensor no card
+/// format loads is refused by name ([`PlacementError::NoCardFormat`]): the
+/// whole load cannot upload it.
+pub fn whole_need(
+    model: &ModelTensors,
+    card: &Card,
+    kv: u64,
+    load: WholeLoad,
+) -> Result<WholeNeed, PlacementError> {
+    let mut heap = Heap::new(card.granule_bytes);
+    let mut unrounded = 0u64;
+    let loaded = model
+        .tensors
+        .iter()
+        .filter(|t| t.layer.is_none_or(|l| l < model.layers));
+    for t in loaded {
+        let format =
+            CardFormat::of_role(t.ty, t.role).ok_or_else(|| PlacementError::NoCardFormat {
+                name: t.name.clone(),
+                ty: t.ty,
+                role: t.role,
+            })?;
+        for b in card_buffers(t, format, rows_of(t))? {
+            unrounded += b;
+            heap.alloc(b);
+        }
+    }
+    let need = load
+        .past_bytes(card)
+        .and_then(|past| card.floor_bytes(heap.taken, kv, past))
+        .unwrap_or(u64::MAX);
+    Ok(WholeNeed {
+        card: card.clone(),
+        weights: heap.taken,
+        weights_unrounded: unrounded,
+        kv,
+        load,
+        need,
+        budget: card.read_capped_bytes(None),
+    })
 }
 
 /// The per-device sums of a finished set of rows; `kv_bytes` is, per card of
@@ -2565,6 +2725,78 @@ mod tests {
         let mut quiet = machine(HEAD);
         quiet.cards[0].held_by = None;
         plan_with(&model, &quiet, 4096, &NoKv, None).expect("a trunk at the free bytes");
+    }
+
+    /// The whole fit counts what the whole load asks for: every tensor's
+    /// buffers through the card's allocator (the embedding's two q8_0
+    /// planes, each layer's stack, the head's planes: 22,528 B of buffers,
+    /// 36,864 B of 4 KiB granules — the planes' small halves share one), the
+    /// cache, the context, the scratch, and the program's arena with the
+    /// reserve its load keeps free past it. A card whose free reading holds
+    /// all of that but one byte of the arena does not fit; at the need it
+    /// fits. The budget is the reading as taken — the context's own creation
+    /// not added back, as the plan's cap adds it; a program with no checked
+    /// arena keeps the card's margin in its place; and a tensor no card
+    /// format loads is refused by name.
+    #[test]
+    fn the_whole_fit_counts_the_arena_and_the_granules() {
+        const GRANULE: u64 = 4096;
+        const KV: u64 = 3_000;
+        const ARENA: u64 = 50_000;
+        const RESERVE: u64 = 7_000;
+        const MARGIN: u64 = 90_000;
+        let model = layered(3);
+        let context = workstation::CONTEXT;
+        let scratch = workstation::SCRATCH;
+        let load = WholeLoad::Checked {
+            arena: ARENA,
+            reserve: RESERVE,
+        };
+        let at = |free: u64| Card {
+            context_bytes: context,
+            scratch_bytes: scratch,
+            margin_bytes: MARGIN,
+            granule_bytes: NonZeroU64::new(GRANULE).expect("not zero"),
+            free_bytes: Some(free),
+            ..bytes_card("card", u64::MAX, 0..3)
+        };
+        let weights = 9 * GRANULE;
+        let need = weights + KV + context + scratch + ARENA + RESERVE;
+        let fit = whole_need(&model, &at(need), KV, load).expect("every tensor has a format");
+        assert_eq!((fit.weights, fit.weights_unrounded), (weights, 22_528));
+        assert_eq!((fit.kv, fit.need, fit.budget), (KV, need, need));
+        assert!(fit.fits(), "a reading at the need fits");
+        let short = whole_need(&model, &at(need - 1), KV, load).expect("sized");
+        assert!(
+            !short.fits(),
+            "the weights, the cache and all but one byte of the arena are not a whole load"
+        );
+        assert_eq!(short.budget, need - 1, "the reading as taken");
+        let text = short.to_string();
+        for part in [
+            "the whole load on card: does not fit: need",
+            "weights 36864 B (the allocator's granules; 22528 B of buffers) + cache 3000 B",
+            "arena 50000 B + reserve past it 7000 B",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text}");
+        }
+        let unchecked = whole_need(&model, &at(need), KV, WholeLoad::Unchecked).expect("sized");
+        assert_eq!(
+            unchecked.need,
+            weights + KV + context + scratch + MARGIN,
+            "the margin in the arena's place"
+        );
+        let mut odd = layered(3);
+        odd.tensors[1].ty = GgmlType::F16;
+        match whole_need(&odd, &at(need), KV, load) {
+            Err(e @ PlacementError::NoCardFormat { .. }) => assert_eq!(
+                e.to_string(),
+                "tensor experts 0: type f16 has no device format, but its role (routed) puts it \
+                 on a card"
+            ),
+            Err(e) => panic!("{e}, not NoCardFormat"),
+            Ok(n) => panic!("an f16 stack was sized as {n:?}"),
+        }
     }
 
     /// Two plan cards of one name are one device: their budgets past its

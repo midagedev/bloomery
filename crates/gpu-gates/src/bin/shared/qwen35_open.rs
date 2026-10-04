@@ -7,7 +7,10 @@ use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu_gates::GateError;
 use gguf::Split;
 use model::arch::models::Arch;
-use model::placement::workstation;
+use model::arch::qwen3moe::place as q3;
+use model::arch::qwen35moe::place as q35;
+use model::placement::workstation::spec_of_device;
+use model::placement::{KvBytes, whole_need};
 use std::path::Path;
 
 /// The first `n` ids of `path`, one decimal id a line; a line that is not an
@@ -46,10 +49,10 @@ pub fn read_ids(path: &Path, n: Option<usize>) -> Result<Vec<u32>, GateError> {
 /// pairs' pass, which has no tensor-core form and is refused with `mma` at
 /// load; Clef-Flash's group of 4 would take it, but `gate_clef_hidden` holds
 /// the scalar pass, so every file opens with it. A file of any other
-/// architecture is refused by name, and a card whose free bytes cannot hold
-/// even the file's own bytes — a lower bound of the whole load's device
-/// need, every tensor's upload — is refused by name before the load: a
-/// dense backbone has no routed experts to move to the host tier.
+/// architecture is refused by name, and so is a load the whole-fit verdict
+/// does not take on device 0 — the card it opens on — before any upload,
+/// with the verdict's terms ([`refuse_unless_whole_fits`]): a dense
+/// backbone has no routed experts to move to the host tier.
 pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, Split), GateError> {
     let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let want = Arch::Qwen35.name();
@@ -61,47 +64,45 @@ pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, S
         )
         .into());
     }
-    refuse_when_free_is_past_the_weights(path, &split)?;
-    let model = Qwen35moeModel::open(
-        Gpu::new()?,
-        Split::open(path)?,
-        Open35 {
-            ctx,
-            mma: false,
-            ubatch,
-            kv: KvQ8::F16,
-        },
-    )?;
+    let o = Open35 {
+        ctx,
+        mma: false,
+        ubatch,
+        kv: KvQ8::F16,
+    };
+    refuse_unless_whole_fits(&split, o).map_err(|e| format!("{}: {e}", path.display()))?;
+    let model = Qwen35moeModel::open(Gpu::new()?, Split::open(path)?, o)?;
     Ok((model, split))
 }
 
-/// Refuse the whole load of `split` when device 0 — the card it opens on —
-/// had fewer free bytes at census time than the file's own bytes: every
-/// tensor uploads, so the file's bytes are a lower bound of the load's
-/// device need, and past them no placement of this dense file fits. The
-/// refusal names the card, its free and usable bytes, the need and the
-/// holders nvidia-smi named; a census of no device leaves the load to the
-/// driver's own refusal.
-fn refuse_when_free_is_past_the_weights(path: &Path, split: &Split) -> Result<(), GateError> {
+/// Refuse the whole load of `split` under `o` unless the whole-fit verdict
+/// (`placement::whole_need`, its one owner) takes it on device 0 at census
+/// time: every tensor's granules, the cache of `o.ctx` rows, the card the
+/// program's plan lays out (`q3::machine`: context and step arenas'
+/// scratch), and the ubatch arena with the reserve the load's own fit check
+/// keeps free past it (`GpuModel::whole_load`). The verdict's line goes to
+/// stderr; a refusal names its terms, the card and its holders. A census
+/// that reads no device 0 is refused by name.
+fn refuse_unless_whole_fits(split: &Split, o: Open35) -> Result<(), GateError> {
     let census = bloomery_gpu_gates::gpu_census::census()?;
-    let Some(d0) = census.iter().find(|d| d.ordinal == 0) else {
-        return Ok(());
-    };
-    let weights: u64 = split.iter_tensors().map(|(_, t)| t.nbytes).sum();
-    if d0.free_bytes >= weights {
+    let d0 = census
+        .iter()
+        .find(|d| d.ordinal == 0)
+        .ok_or("the census reads no device 0, the card the whole load opens on")?;
+    let inputs = q35::PlanInputs::describe(split)?;
+    let layers = inputs.hp.n_layer;
+    let ctx = u64::try_from(o.ctx)?;
+    let kv = (0..layers).map(|l| inputs.kv.layer_bytes(l, ctx)).sum();
+    let machine = q3::machine(spec_of_device(d0), layers, 0);
+    let need = whole_need(
+        &inputs.model,
+        &machine.cards[0],
+        kv,
+        Qwen35moeModel::whole_load(split, o)?,
+    )?;
+    eprintln!("whole fit at ctx {}: {need}", o.ctx);
+    if need.fits() {
         return Ok(());
     }
-    let held = d0
-        .held_by
-        .as_ref()
-        .map_or(String::new(), |h| format!(" (held by {h})"));
-    Err(format!(
-        "{} is a dense backbone of {weights} B, and {} (cuda0) had {} B free of its usable {} B \
-         at plan time{held}: no routed experts to move to the host tier",
-        path.display(),
-        d0.name,
-        d0.free_bytes,
-        workstation::census_usable(d0.total_bytes),
-    )
-    .into())
+    Err(format!("{need}: a dense backbone has no routed experts to move to the host tier").into())
 }

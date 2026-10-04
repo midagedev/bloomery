@@ -9,6 +9,17 @@
 //! environment: the file is named once, by `-m`; the plain engine pinned,
 //! the prefix clauses holding the one-slot path's keeps) and holds:
 //!
+//! - `default_seat_listens`: that server — no `--ctx`, the seat's own
+//!   default — listens on the card the runner pins, both cards in turn
+//!   (`BLOOMERY_GATE_CARD`): its default context is one whose whole load
+//!   passes the load's own arena check, or the placed plan's. A server that
+//!   never listens is this check red, its words printed, and the file's
+//!   other clauses skipped. FAIL-first: a whole fit that leaves the arena out
+//!   of its need picks, on the 3090, a Qwen3.6 context whose load the arena
+//!   check refuses;
+//! - `default_load_is_its_whole_fit`: the seat prints one whole-fit verdict
+//!   line at the loaded context, its terms named, and it says `fits`
+//!   exactly when the load is the whole-card one (no `plan` record);
 //! - `load_and_listen`: the server prints its `load` record for the file's
 //!   architecture before its `listening` record;
 //! - `unplaced_default_names_itself`: with no `--place` the default is the
@@ -112,6 +123,11 @@
 //!   the process before the load, naming the total, the slot count and the
 //!   slot ctx. FAIL-first: the refusal dropped loads the slot and dies in
 //!   the pass capture under the launcher's own message.
+//! - `ctx_search_reads_the_census_once`, `ctx_default`'s arms that search
+//!   (default, placed, q8): each `--ctx` search the seat ran names its
+//!   probes and its census readings on one line, and every one read the
+//!   census once for all its probes. FAIL-first: a placed search that
+//!   resolves its placement per probe reads it once a probe.
 //! - `placed_slots_take_turns`, `ctx_default`'s placed arm (`--place a
 //!   --parallel 2`): a placed load's slots take its one sequence in turns
 //!   over the whole context — its plan counts the card bytes of one
@@ -304,6 +320,22 @@ mod gate {
             .ok()
     }
 
+    /// The `--ctx` searches a server's stderr names, one line a search
+    /// (`… --ctx search ran P probes on C census reading(s)`): each one's
+    /// probes and census readings.
+    fn searches(log: &str) -> Vec<(u64, u64)> {
+        log.lines()
+            .filter_map(|l| {
+                let (probes, rest) = l
+                    .split(" --ctx search ran ")
+                    .nth(1)?
+                    .split_once(" probes on ")?;
+                let censuses = rest.split(' ').next()?;
+                Some((probes.parse().ok()?, censuses.parse().ok()?))
+            })
+            .collect()
+    }
+
     /// The `load` record's line and the `listening` record's line of a
     /// server's stderr, each empty when the server printed none.
     fn load_and_listening(log: &str) -> (&str, &str) {
@@ -423,7 +455,10 @@ mod gate {
                     // (an idle A6000 holds every expert at the trained
                     // context and prints none). FAIL-first: a search that
                     // ignores its bound plans past what the card holds and
-                    // the server dies before listening; a load that says
+                    // the server dies before listening — on the 3090, a
+                    // Qwen3.6 plan that keeps every expert at a context its
+                    // whole load (which that plan opens) does not fit; a
+                    // load that says
                     // nothing leaves the line's side of the biconditional
                     // red on a card where the search grows.
                     check(
@@ -483,6 +518,21 @@ mod gate {
                         terms == [Some(1), Some(n), Some(2), Some(n)],
                     );
                 }
+            }
+            if name != "flag" {
+                // Every search the unset `--ctx` ran — the whole one, and the
+                // placed one a run under `--place` or a fall to the plan runs —
+                // read the census once for all its probes (the seat's line a
+                // search). FAIL-first: a search that resolves its placement
+                // per probe reads the census once a probe.
+                let log = std::fs::read_to_string(&err_log)?;
+                let runs = searches(&log);
+                println!("ctx arm {name}: searches (probes, census readings) {runs:?}");
+                check(
+                    ok,
+                    "ctx_search_reads_the_census_once",
+                    !runs.is_empty() && runs.iter().all(|&(p, c)| p >= 1 && c == 1),
+                );
             }
             println!("ctx arm {name}: server stopped: {}", s.stop()?);
         }
@@ -1310,12 +1360,27 @@ mod gate {
 
     /// The server's clauses for `model`, its logs in `dir`; the answers the
     /// CLI is held to, the chat turn's first, and the file's architecture
-    /// (which arm carries which clause below).
-    fn served(model: &Path, dir: &Path, ok: &mut bool) -> Result<(Vec<Answer>, String), GateError> {
+    /// (which arm carries which clause below). `None` when the server never
+    /// listened — `default_seat_listens` red, the server's own words
+    /// printed — and the file's other clauses do not run.
+    fn served(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<Option<(Vec<Answer>, String)>, GateError> {
         let err_log = dir.join("server.err");
         let mut s = spawn(model, dir)?;
         // The load reads the whole file: up to ten minutes from a cold cache.
-        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+        let addr = match s.address(&err_log, 600, Duration::from_secs(1)) {
+            Ok(addr) => addr,
+            Err(e) => {
+                println!("the default seat never listened: {e}");
+                check(ok, "default_seat_listens", false);
+                // A server still up past the polls is killed when `s` drops.
+                return Ok(None);
+            }
+        };
+        check(ok, "default_seat_listens", true);
         let url = |p: &str| format!("http://{addr}{p}");
         let log = std::fs::read_to_string(&err_log)?;
         let load = log.lines().position(|l| l.starts_with("load arch="));
@@ -1350,6 +1415,26 @@ mod gate {
             ok,
             "unplaced_default_names_itself",
             load.is_some() && default_ok,
+        );
+        // The whole-fit verdict that chose the load, one line at the loaded
+        // context: `fits` exactly when the load is the whole-card one (no
+        // `plan` record). FAIL-first: a seat that loads whole on a verdict
+        // that does not fit, or prints none, turns this red.
+        let verdicts: Vec<&str> = log
+            .lines()
+            .filter(|l| l.starts_with("whole fit at ctx "))
+            .collect();
+        let loaded_ctx = load
+            .and_then(|i| log.lines().nth(i))
+            .and_then(|l| field_u64(l, "ctx"));
+        println!("whole-fit verdicts {verdicts:?}");
+        check(
+            ok,
+            "default_load_is_its_whole_fit",
+            verdicts.len() == 1
+                && verdicts[0].contains(": fits: ") == plans.is_empty()
+                && loaded_ctx
+                    .is_some_and(|c| verdicts[0].starts_with(&format!("whole fit at ctx {c}: "))),
         );
 
         let (st, body) = curl(
@@ -1426,7 +1511,7 @@ mod gate {
         println!("server stopped: {}", s.stop()?);
         let mut answers = vec![chat_ids, prose_ids];
         answers.extend(whole);
-        Ok((answers, arch))
+        Ok(Some((answers, arch)))
     }
 
     /// `generate_qwen3moe --arm <prompt>/N … --last-step` on `model`, an arm
@@ -1565,7 +1650,9 @@ mod gate {
             let dir = a.dir.join(i.to_string());
             std::fs::create_dir_all(&dir)?;
             println!("== {}", model.display());
-            let (answers, arch) = served(model, &dir, &mut ok)?;
+            let Some((answers, arch)) = served(model, &dir, &mut ok)? else {
+                continue;
+            };
             let prompts: Vec<&[u32]> = answers.iter().map(|a| a.prompt.as_slice()).collect();
             let references = cli(model, &prompts, &dir)?;
             let mut agree = true;

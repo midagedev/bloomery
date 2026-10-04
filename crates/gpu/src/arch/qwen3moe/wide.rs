@@ -705,3 +705,33 @@ pub(super) fn ffn(
         },
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GEMV_COLS;
+    use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
+    use model::placement::workstation::SCRATCH;
+
+    /// The decode flash's partials a load's step arena (one row) and pass
+    /// arena ([`GEMV_COLS`] rows) hold fit the m = 1 scratch a plan's card
+    /// counts for them (`workstation::SCRATCH`), at either of the family's
+    /// head layouts: Qwen3-30B's 32 heads of [`HEAD`], Qwen3.6's 16 of
+    /// [`HEAD_256`]. The partials do not grow with the context, so no
+    /// context term carries them.
+    #[test]
+    fn the_flash_partials_fit_the_planned_scratch() {
+        let rows = 1 + GEMV_COLS;
+        for (n_head, head) in [(32, HEAD), (16, HEAD_256)] {
+            let v = if head == HEAD_256 {
+                partials_v_len_256(rows, n_head)
+            } else {
+                partials_v_len(rows, n_head)
+            };
+            let bytes = (v + partials_ms_len(rows, n_head)) * std::mem::size_of::<f32>();
+            assert!(
+                bytes as u64 <= SCRATCH,
+                "{n_head} heads of {head}: {bytes} B of partials past the {SCRATCH} B scratch"
+            );
+        }
+    }
+}
