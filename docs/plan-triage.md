@@ -127,7 +127,8 @@
 - **kvq8 3조각 중 1번 착지**(형식+양자화 append, add-class 증명). 2번(읽기 경로) 진행 중, 3번(레버 배선 --cache-type-k) 대기.
 - **탄성 --parallel + qwen38 MTP 재결합 착지 (parwave, 10-04, `88b0c888`)**: 기본 슬롯 = min(4, 1+park/state 예산) (`budget` 규칙; 플래그는 상한 `flag`; qwen3은 Park::Ids에 바이트 예산이 없어 고정 2 유지, 이유 한 줄), 서버의 `parallel` 줄이 규칙·슬롯·park·state·상한을 이름. qwen38 좌석 `--parallel`+`--park-ram` (드래프트 park/unpark, resume이 드래프트를 끄지 않음; Seq38의 Wrote/Held 위치 기록, verify·드래프트 스토어 꼬리 clamp 둘). 뮤턴트 4종 red. 리드 배치: qwen3-serve·qwen4exp-e2e·gates-lib·ds41-bind rc 0.
 - **parwave가 발견해 넘긴 serve측 슬롯 경합 (S, 미수선)**: 슬롯 ≥2에서 이전 요청의 슬롯 해제보다 먼저 온 요청이 LRU로 안 쓴 슬롯을 가져가고, 슬롯 주소 `erase`가 다른 슬롯의 남은 것을 지운다 — 프롬프트 캐시가 더 긴 축자 상태를 줄 수 있다 (ids는 무스위치 실행과 동일로 검증됨). 게이트들은 glm 관례대로 `--parallel 1`로 고정. lane-X qwen38-serve 흔들림과 닿을 수 있다 [유도].
-- **웨이브 2 잔여**: JIT 업로드 겹침(jitovl) · /slots 신선도+bp 손익(smallfix) · kvq8-2(kvq8).
+- **웨이브 2 잔여**: JIT 업로드 겹침(jitovl) · /slots 신선도+bp 손익(smallfix) · kvq8-3(kvq8, 진행 중; 2번 읽기 경로는 `a5d233be` 착지).
+- **`reasoning_budget` 요청 필드 (thinkcap, 10-04 발사 — kvq8-3 대기 중 리드 설계)**: llama-server `--reasoning-budget` 의미를 요청 단위로. 프롬프트가 `<think>`로 스팬을 열 때만 살고(템플릿이 이미 닫았으면 무시, llama-server와 같다), 스팬이 열린 채 생성 id가 N개(0 포함, -1/생략 = 무제한) 차면 서버가 `</think>` id를 강제로 먹여 닫는다 — 엔진 트레잇 불변(`next(last)`의 서버 소유 피드)이라 트레잇 변경 없이 `Gen::stepped`/`prompt`의 choose 가드 + advance 게이트(`left < rows`면 단보)로 구현. reasoning_effort(템플릿 위임)·`chat_template_kwargs`(enable_thinking/thinking)은 이미 있고 이것이 빠진 마지막 조각. 0.2.1 노트에 한 줄.
 - **선결 게이트 빚 둘 (cleanup의 118항목 배치가 발견, base에서도 빨강)**: `gate-ds41-place` `resolved_on_the_box_plans_as_before` — memguard의 resolved-plan free_bytes 대 정적 plan, 테스트의 strip이 device만 지움, 마지막 초록 2e0189f2 (memguard 배치가 이 게이트를 안 돌았다) · `gate-ds41-load` check v — 결정적 4 MiB 첫 드롭 잔여 vs 2 MiB 허용, 마지막 초록 f1387c99 (10-01).
 - **placectx 열린 끝**: 여유 큰 카드에선 m1형 뮤턴트(경계 무시)의 답이 정답과 우연히 같다 — 잡으려면 적재된 서버 옆 교차 센서스 비교가 필요(memguard가 피한 모양). lane-X 센서스 핀 메커니즘 가설은 [유도]로 위에 있다(glmctx 절).
 
