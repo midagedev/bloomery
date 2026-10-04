@@ -150,17 +150,46 @@ pub struct Mtp38 {
     a: Option<MtpArena>,
     /// The captured walks, by rows, feed and head.
     graphs: Vec<(MtpKey, Graph)>,
+    /// The rows of the last walk, which the readbacks and the next own row
+    /// read; `None` before a walk of the sequence and after a store walk.
+    last: Option<(usize, MtpHead)>,
+    /// Positions of this sequence the store holds: the last walk's end. A
+    /// walk may start at or below it, never past it.
+    held: usize,
+}
+
+/// One sequence's side of the draft ([`Body38`]'s
+/// [`Slots`](crate::model::Slots)): its store, the walks captured over it
+/// and the store's own record of the positions it holds for the sequence.
+/// The captures are declared first: they address the store, and drop while
+/// it is alive. The program's arena stays the model's one — a walk's
+/// buffers are scratch, rewritten within the walk before anything reads
+/// them, save the own row an [`MtpFeed::Own`] walk reads, which no call
+/// reads across a select: a chain's refresh walk rewrites it before any own
+/// walk of the chain does.
+pub(super) struct DraftSeq38 {
+    graphs: Vec<(MtpKey, Graph)>,
+    store: KvPlanes,
+    last: Option<(usize, MtpHead)>,
+    held: usize,
 }
 
 impl Mtp38 {
     /// The draft `mtp` describes, resident on `gpu` as `plan`'s draft plan
     /// places it, reading `target_w`'s `token_embd` and `output` (the head's
     /// listed rows among them); each segment's file pages leave the page
-    /// cache once uploaded when `card_dontneed`. Refused by name: a draft
-    /// that is not the target's shape, a draft file that carries its own
-    /// matrices, a borrowed matrix absent or not Q8_0 `[hidden, vocab]`, a
-    /// listed id at or past the vocabulary, an upload whose bytes are not
-    /// the plan's.
+    /// cache once uploaded when `card_dontneed`. `slots` is the count of
+    /// resident sequences the plan was made for
+    /// ([`PlanInputs::plan_mtp_with_slots`](model::arch::qwen35moe::place::PlanInputs)):
+    /// the plan's store term counts them all, this load's one sequence among
+    /// them. Refused by name: a draft that is not the target's shape, a
+    /// draft file that carries its own matrices, a borrowed matrix absent or
+    /// not Q8_0 `[hidden, vocab]`, a listed id at or past the vocabulary, an
+    /// upload whose bytes are not the plan's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, the target's weights, the draft's file, inputs and plan, the page-cache release and the planned slots (rust-quality R8)"
+    )]
     pub fn open(
         gpu: &Gpu,
         target_w: &Weights,
@@ -168,6 +197,7 @@ impl Mtp38 {
         mtp: &model::arch::qwen35moe::place::MtpInputs,
         plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
         card_dontneed: bool,
+        slots: usize,
     ) -> Result<Mtp38, GpuError> {
         let d = &mtp.draft;
         let (hidden, vocab) = (d.hidden as usize, d.vocab as usize);
@@ -272,6 +302,8 @@ impl Mtp38 {
             ctx,
             a: None,
             graphs: Vec::new(),
+            last: None,
+            held: 0,
         };
         let c = &plan.draft.cards[0];
         let got = [
@@ -279,7 +311,11 @@ impl Mtp38 {
             body.store.bytes() as u64,
             body.map_bytes(),
         ];
-        let want = [plan.draft_resident_bytes(), c.kv_bytes, plan.map_bytes];
+        let want = [
+            plan.draft_resident_bytes(),
+            c.kv_bytes / slots as u64,
+            plan.map_bytes,
+        ];
         if got != want {
             return Err(GpuError::shape(
                 WHAT,
@@ -425,10 +461,41 @@ impl Mtp38 {
         let (k, v) = self.store.f16_mut(WHAT)?;
         plane(&rows.0, k)?;
         plane(&rows.1, v)?;
-        if let Some(a) = self.a.as_mut() {
-            a.held = n;
-        }
+        self.held = n;
         Ok(())
+    }
+
+    /// A new sequence's side of the draft ([`Body38`]'s
+    /// [`Slots`](crate::model::Slots)): a zeroed store no walk has captured
+    /// over, no positions held. Load-time allocation.
+    pub(super) fn new_seq(&self, stream: &CudaStream) -> Result<DraftSeq38, GpuError> {
+        let n = geo::N_KV * self.ctx * geo::HEAD;
+        // The draft's store is f16: the qwen38 family's stores carry no q8_0
+        // form.
+        Ok(DraftSeq38 {
+            graphs: Vec::new(),
+            store: KvPlanes::F16 {
+                k: DeviceBuffer::zeroed(stream, n)?,
+                v: DeviceBuffer::zeroed(stream, n)?,
+            },
+            last: None,
+            held: 0,
+        })
+    }
+
+    /// Exchange the live sequence's side of the draft with `seq`'s: pointer
+    /// moves only, so each sequence's captures keep addressing its own
+    /// store.
+    pub(super) fn swap_slot(&mut self, seq: &mut DraftSeq38) {
+        std::mem::swap(&mut self.store, &mut seq.store);
+        std::mem::swap(&mut self.graphs, &mut seq.graphs);
+        std::mem::swap(&mut self.last, &mut seq.last);
+        std::mem::swap(&mut self.held, &mut seq.held);
+    }
+
+    /// Device bytes one sequence's side of the draft holds: its store.
+    pub(super) fn seq_bytes(&self) -> usize {
+        self.store.bytes()
     }
 }
 
@@ -961,12 +1028,6 @@ struct MtpArena {
     chain: DeviceBuffer<u32>,
     taps: Option<TapBufs>,
     st: StoreArena,
-    /// The rows of the last walk, which the readbacks and the next own row
-    /// read; `None` before a walk of the sequence and after a store walk.
-    last: Option<(usize, MtpHead)>,
-    /// Positions of this sequence the store holds: the last walk's end. A
-    /// walk may start at or below it, never past it.
-    held: usize,
     vocab: usize,
 }
 
@@ -1027,8 +1088,6 @@ impl MtpArena {
             chain: u(2 * MTP_GRAPH_ROWS + 2)?,
             taps: None,
             st: StoreArena::new(stream, geometry)?,
-            last: None,
-            held: 0,
             vocab,
         })
     }
@@ -1237,26 +1296,22 @@ impl Mtp38 {
     /// keys before its attention reads them, and none may start past the
     /// count.
     pub(super) fn forget(&mut self) {
-        if let Some(a) = self.a.as_mut() {
-            a.last = None;
-            a.held = 0;
-        }
+        self.last = None;
+        self.held = 0;
     }
 
     /// A cut of the target to `pos`: the store holds no position past it —
     /// the rows past it belong to the branch the cut dropped, and a walk
     /// writes its own rows' keys before its attention reads them.
     pub(super) fn cut(&mut self, pos: u32) {
-        if let Some(a) = self.a.as_mut() {
-            a.held = a.held.min(pos as usize);
-        }
+        self.held = self.held.min(pos as usize);
     }
 
     /// Positions of the current sequence the store holds: a walk may start
-    /// at or below it, never past it. 0 before the arena is made.
+    /// at or below it, never past it.
     #[must_use]
     pub fn held(&self) -> usize {
-        self.a.as_ref().map_or(0, |a| a.held)
+        self.held
     }
 
     fn arena(&mut self) -> Result<&mut MtpArena, GpuError> {
@@ -1359,8 +1414,8 @@ impl Mtp38 {
             ));
         }
         let (vocab, held, walked) = {
-            let a = self.arena_ref()?;
-            (a.vocab, a.held, a.last.is_some())
+            let vocab = self.arena_ref()?.vocab;
+            (vocab, self.held, self.last.is_some())
         };
         if own && !walked {
             return Err(GpuError::state(WHAT, "a walk before the draft's own row"));
@@ -1473,11 +1528,10 @@ impl Mtp38 {
                 launched?;
             }
         }
-        let a = self.arena()?;
         // A store walk wrote no own row, no streams past its attention's
         // input and no head: nothing of it is there to read.
-        a.last = (mode != MtpMode::Store).then_some((m, head));
-        a.held = pos0 as usize + m;
+        self.last = (mode != MtpMode::Store).then_some((m, head));
+        self.held = pos0 as usize + m;
         Ok(m)
     }
 
@@ -2145,7 +2199,7 @@ impl Mtp38 {
     /// Blocking; gate use.
     pub fn l_out(&self, stream: &CudaStream) -> Result<Vec<f32>, GpuError> {
         let a = self.arena_ref()?;
-        let (m, _) = a.last.ok_or(GpuError::state(WHAT, "a walk to read"))?;
+        let (m, _) = self.last.ok_or(GpuError::state(WHAT, "a walk to read"))?;
         let mut v = a.res.to_host_vec(stream)?;
         v.truncate(m * WIDE);
         Ok(v)
@@ -2155,7 +2209,7 @@ impl Mtp38 {
     /// the head's rows. Blocking; gate use.
     pub fn logits(&self, stream: &CudaStream) -> Result<(Vec<f32>, usize), GpuError> {
         let a = self.arena_ref()?;
-        let (m, head) = a.last.ok_or(GpuError::state(WHAT, "a walk to read"))?;
+        let (m, head) = self.last.ok_or(GpuError::state(WHAT, "a walk to read"))?;
         let rows = match (head, self.head.rows) {
             (MtpHead::Rows, Some(n)) => n,
             _ => a.vocab,
@@ -2169,7 +2223,7 @@ impl Mtp38 {
     /// armed.
     pub fn taps(&self, stream: &CudaStream) -> Result<MtpTaps, GpuError> {
         let a = self.arena_ref()?;
-        let (m, _) = a.last.ok_or(GpuError::state(WHAT, "a walk to read"))?;
+        let (m, _) = self.last.ok_or(GpuError::state(WHAT, "a walk to read"))?;
         let t = a
             .taps
             .as_ref()

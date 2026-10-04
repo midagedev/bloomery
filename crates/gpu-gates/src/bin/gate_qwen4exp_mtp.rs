@@ -127,6 +127,20 @@
 //! - (x) a resume of a state whose draft side the load does not take (a
 //!   state of a load without the draft) is refused by name with the model
 //!   untouched: its stores, position and draft store unchanged.
+//! - (y) two drafted sequences resident over a plan of two
+//!   (`PlanInputs::plan_mtp_with_slots`, `Body38::open_placed_mtp_slots`),
+//!   in the server's order (`worker.rs`'s `start` → `genloop`'s `prompt`):
+//!   each request's prompt call and its first plain step run together
+//!   before any other slot is selected, then the drafted passes interleave
+//!   with a select between every pass, the app-side draft state parked per
+//!   slot around each select exactly as a seat will (`MtpDraft::park`
+//!   before a select away, `unpark` after a select back): each slot's ids,
+//!   draft proposals and acceptances and draft store equal its window's
+//!   single-sequence reference, run on the load's own sequence before any
+//!   slot exists — references the slots' exchange cannot have shaped. The
+//!   windows diverge from position 0 on (the deep prompt read past the
+//!   set's own whole length), so no per-sequence state the two share by
+//!   content can pass for one the slots exchanged.
 //!
 //! (l) and (h) hold at least one row each off a flip: a run that excuses
 //! every row as a flip fails.
@@ -162,7 +176,9 @@ mod gate {
     use gguf::quant::half_to_f32;
     use model::arch::models::{Borrows, HeadRows, MtpSource};
     use model::arch::qwen35moe::head_list::{HeadWhy, SHIPPED, head_rows_of};
-    use model::arch::qwen35moe::place::{MtpInputs, MtpPlan, PlanInputs, machine, vocab_sha256};
+    use model::arch::qwen35moe::place::{
+        Experts, MtpInputs, MtpPlan, PlanInputs, machine, vocab_sha256,
+    };
     use model::fileio::hex;
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
@@ -172,7 +188,7 @@ mod gate {
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
     use runtime::hc_gated::{Geometry, LO_BAND, MIXED_BAND, MixWeights, mix_ref};
-    use runtime::{Advance as _, Committed, Draft, PassSink, TapNeed, Target as _};
+    use runtime::{Advance, Committed, Draft, PassSink, TapNeed, Target, Want};
 
     /// Cache rows: the e2e gate's.
     const CTX: u64 = 3072;
@@ -2926,7 +2942,7 @@ mod gate {
                 head: false,
             };
         }
-        let r1 = Mtp38::open(m.gpu(), m.weights(), draft, &own, &plan, false)
+        let r1 = Mtp38::open(m.gpu(), m.weights(), draft, &own, &plan, false, 1)
             .err()
             .map_or("opened".to_string(), |e| e.to_string());
         let r1_ok = r1.contains("the load borrows the target's token_embd and output");
@@ -2934,7 +2950,7 @@ mod gate {
         println!("(q) a draft with its own matrices: {r1} {}", verdict(r1_ok));
         let mut other = plan;
         other.map_bytes += 4;
-        let r2 = Mtp38::open(m.gpu(), m.weights(), draft, mtp, &other, false)
+        let r2 = Mtp38::open(m.gpu(), m.weights(), draft, mtp, &other, false, 1)
             .err()
             .map_or("opened".to_string(), |e| e.to_string());
         let r2_ok = r2.contains("resident weights, store and row map hold");
@@ -2977,6 +2993,207 @@ mod gate {
             verdict(full_ok)
         );
         Ok(unset_ok && full_ok)
+    }
+
+    // ------------------------------------------------------ (y) two slots
+
+    /// The drafted session's speculative over this body.
+    type Spec38 = runtime::Speculative<app::mtp::MtpDraft<Body38>, 4>;
+
+    /// The server's first plain step after a request's prompt call
+    /// (`serve_seats::drafted`'s step): the rows the last call left waiting
+    /// walked, the step read, then the step told to the draft.
+    fn plain_step(
+        s: &mut app::Session<Body38>,
+        spec: &mut Spec38,
+        last: u32,
+    ) -> Result<u32, GateError> {
+        spec.draft_mut().before_step(s, last)?;
+        let next = Target::step(s, last, Want::Argmax)?.argmax();
+        Draft::stepped(spec.draft_mut(), s, last, next)?;
+        Ok(next)
+    }
+
+    /// Make `to` the slot every later call acts on, exactly as a seat
+    /// switches: the live slot's draft state parked before the select away,
+    /// the target's own put back after the select back, the parked states
+    /// kept one a slot.
+    fn switch(
+        s: &mut app::Session<Body38>,
+        spec: &mut Spec38,
+        parked: &mut [Option<app::mtp::Parked<TargetRows>>; 2],
+        to: usize,
+    ) -> Result<(), GateError> {
+        let from = s.model().selected();
+        let live = spec.draft().park();
+        s.model_mut().select_slot(to)?;
+        if let Some(back) = parked[to].take() {
+            spec.draft_mut().unpark(&back);
+        }
+        parked[from] = Some(live);
+        Ok(())
+    }
+
+    /// One drafted request's start as the server runs it (`worker.rs`'s
+    /// `start` → `genloop`'s `prompt`): the prompt call, then its first
+    /// plain step, together — no select between them. Returns the ids so
+    /// far (the prompt's argmax, then the first step's).
+    fn begin_request(
+        s: &mut app::Session<Body38>,
+        spec: &mut Spec38,
+        ids: &[u32],
+    ) -> Result<Vec<u32>, GateError> {
+        let first = Advance::prompt(spec, s, ids)?;
+        Ok(vec![first, plain_step(s, spec, first)?])
+    }
+
+    /// One drafted request as the server runs it when nothing switches
+    /// beneath it (the alone run): the start of [`begin_request`], then
+    /// `rounds` drafted passes — every id the passes kept, and every pass's
+    /// proposal and kept rows.
+    fn drive(
+        s: &mut app::Session<Body38>,
+        spec: &mut Spec38,
+        ids: &[u32],
+        rounds: usize,
+    ) -> Result<(Vec<u32>, Vec<Committed>), GateError> {
+        let mut out = begin_request(s, spec, ids)?;
+        let mut passes = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            passes.push(one_pass(s, spec, &mut out)?);
+        }
+        Ok((out, passes))
+    }
+
+    /// One drafted pass from `out`'s last id, its kept ids appended.
+    fn one_pass(
+        s: &mut app::Session<Body38>,
+        spec: &mut Spec38,
+        out: &mut Vec<u32>,
+    ) -> Result<Committed, GateError> {
+        let last = *out.last().ok_or("no token")?;
+        let mut kept = Vec::new();
+        let c = Advance::pass(spec, s, last, &mut kept)?;
+        out.append(&mut kept);
+        Ok(c)
+    }
+
+    /// The selected slot's draft store, read back at the count its own walks
+    /// hold: the rows the sequence's walks wrote.
+    fn slot_store(s: &app::Session<Body38>) -> Result<(Vec<u16>, Vec<u16>), GateError> {
+        let m = s.model();
+        let n = m
+            .body("slots")?
+            .mtp()
+            .ok_or("the load opened no draft")?
+            .held();
+        store_of(m, n)
+    }
+
+    /// (y) (module doc): two drafted sequences over one plan of two, in the
+    /// server's order, against each window's single-sequence reference.
+    fn slots_windows(
+        inputs: &PlanInputs,
+        mtp: &MtpInputs,
+        levers: &bloomery_levers::Levers,
+        ub: usize,
+        a: &[u32],
+        b: &[u32],
+    ) -> Result<bool, GateError> {
+        const ROUNDS: usize = 8;
+        let ctx = u32::try_from(CTX)?;
+        let (file, draft_file) = (
+            Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?,
+            Split::open(DRAFT).map_err(|e| format!("open {DRAFT}: {e}"))?,
+        );
+        let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let plan = inputs.plan_mtp_with_slots(
+            &machine,
+            CTX,
+            &PlanLevers::from_levers(levers)?,
+            mtp,
+            Experts::Host,
+            2,
+        )?;
+        let mut m = Body38::open_placed_mtp_slots(
+            file,
+            &plan,
+            inputs,
+            0,
+            levers.host(),
+            ub,
+            &draft_file,
+            mtp,
+            2,
+        )?;
+        m.set_mode(bloomery_gpu::model::StepMode::Graph);
+        let mut s = app::Session::from_model(m, ctx);
+        let mut spec = s.with_draft::<app::mtp::MtpDraft<Body38>, 4>(
+            app::mtp::MtpDraft::open(
+                s.model(),
+                Prompt38::Auto,
+                bloomery_gpu::model::StepMode::Graph,
+            )?,
+            &mut Quiet,
+        )?;
+        // The references, each on the load's own single sequence before any
+        // slot exists: what the server's one-request runs produce, so the
+        // two-slot run is judged against runs the slots' exchange cannot
+        // have shaped.
+        let (a_ids, a_passes, a_store) = {
+            s.reset()?;
+            spec.draft_mut().restart();
+            let run = drive(&mut s, &mut spec, a, ROUNDS)?;
+            (run.0, run.1, slot_store(&s)?)
+        };
+        let (b_ids, b_passes, b_store) = {
+            s.reset()?;
+            spec.draft_mut().restart();
+            let run = drive(&mut s, &mut spec, b, ROUNDS)?;
+            (run.0, run.1, slot_store(&s)?)
+        };
+        s.model_mut().add_slots(2)?;
+        // Together, in the server's order: slot 0's prompt call and first
+        // plain step run together, then slot 1's, then the drafted passes
+        // interleave — a select between every pass. Each slot's request
+        // starts from its own reset.
+        let mut parked = [None, None];
+        s.reset()?;
+        spec.draft_mut().restart();
+        let mut t_a = begin_request(&mut s, &mut spec, a)?;
+        switch(&mut s, &mut spec, &mut parked, 1)?;
+        s.reset()?;
+        spec.draft_mut().restart();
+        let mut t_b = begin_request(&mut s, &mut spec, b)?;
+        let (mut p_a, mut p_b) = (Vec::new(), Vec::new());
+        for _ in 0..ROUNDS {
+            switch(&mut s, &mut spec, &mut parked, 0)?;
+            p_a.push(one_pass(&mut s, &mut spec, &mut t_a)?);
+            switch(&mut s, &mut spec, &mut parked, 1)?;
+            p_b.push(one_pass(&mut s, &mut spec, &mut t_b)?);
+        }
+        let ids_ok = t_a == a_ids && t_b == b_ids;
+        let passes_ok = p_a == a_passes && p_b == b_passes;
+        // Each slot's draft store, read back at its own held count: the rows
+        // its walks wrote, bit for bit its single-sequence reference's — the
+        // ids and the passes' kept counts alone cannot see a store another
+        // slot's walks filled (a proposal the target refuses every row of
+        // leaves them as it found them).
+        let stores_ok = slot_store(&s)? == b_store && {
+            switch(&mut s, &mut spec, &mut parked, 0)?;
+            slot_store(&s)? == a_store
+        };
+        println!(
+            "(y) two slots in the server's order: {} drafted passes a slot, a select between \
+             every pass; each slot's ids {} its single-sequence reference's, its proposals and \
+             acceptances {}, its draft store {} {}",
+            ROUNDS,
+            verdict(ids_ok),
+            verdict(passes_ok),
+            verdict(stores_ok),
+            verdict(ids_ok && passes_ok && stores_ok)
+        );
+        Ok(ids_ok && passes_ok && stores_ok)
     }
 
     pub(super) fn run() -> Result<(), GateError> {
@@ -3138,8 +3355,14 @@ mod gate {
         ok &= arena_holds(&mut m, &prompt)?;
         let (model, p_ok) = kept_state(m, &prompt)?;
         ok &= p_ok;
-        let (_, x_ok) = resume_refused(model, &inputs, &levers, ub, &prompt)?;
+        let (model, x_ok) = resume_refused(model, &inputs, &levers, ub, &prompt)?;
         ok &= x_ok;
+        drop(model);
+        // Window B diverges from window A from position 0 on: the corpus's
+        // deep window read past A's whole length, so no per-sequence state
+        // the two share by content can pass for one the slots exchanged.
+        let deep = deep_prompt()?;
+        ok &= slots_windows(&inputs, &mtp, &levers, ub, &prompt, &deep[1000..])?;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

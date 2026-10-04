@@ -207,6 +207,9 @@ pub enum PlaceError {
         got: Vec<u64>,
         want: Option<u64>,
     },
+    /// A plan of no resident sequence slot.
+    #[error("{slots} resident sequence slots: a plan serves at least one")]
+    Slots { slots: usize },
 }
 
 /// The violations, `; `-separated.
@@ -291,6 +294,48 @@ impl PlanInputs {
         }
     }
 
+    /// [`PlanInputs::plan_with`] for a load that serves `slots` resident
+    /// sequences ([`GpuModel::add_slots`](bloomery_gpu::model::Slots)): every
+    /// per-load sequence term — the positional rows at the load's context and
+    /// the fixed recurrent, conv and PLE terms ([`KvLayout::layer_bytes`]),
+    /// and the bytes a sequence holds beside its stores
+    /// ([`slot_resident_bytes`]) — counts them all, so a card that cannot
+    /// hold them is refused as [`PlanInputs::plan_with`] refuses it. One
+    /// slot is [`PlanInputs::plan_with`] itself; zero is refused by name.
+    pub fn plan_with_slots<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        experts: Experts,
+        slots: usize,
+    ) -> Result<Plan<'a>, PlaceError> {
+        if slots == 1 {
+            return self.plan_with(machine, ctx_max, levers, experts);
+        }
+        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
+            return Err(PlaceError::Positions { ctx_max });
+        }
+        if slots == 0 {
+            return Err(PlaceError::Slots { slots });
+        }
+        check_draft_reserve(machine, None)?;
+        let kv = SlotsOf {
+            kv: &self.kv,
+            slots: slots as u64,
+        };
+        let mut plan = self.target_of(machine, ctx_max, levers, experts, 0, &kv)?;
+        // The bytes a sequence holds beside its stores ride the card's kv
+        // class, so [`Plan::violations`] holds the card's bound against them.
+        plan.cards[0].kv_bytes += slot_resident_bytes(&self.hp) * (slots as u64 - 1);
+        let broken = plan.violations();
+        if broken.is_empty() {
+            Ok(plan)
+        } else {
+            Err(PlaceError::Broken(broken))
+        }
+    }
+
     /// The target's plan, unchecked: every routed expert on the host, or the
     /// expert rule over [`card_routed`]'s layers within each card's budget
     /// less `reserve` ([`placement::plan_routed_reserving`]) — on a machine
@@ -318,6 +363,59 @@ impl PlanInputs {
         self.target_rule(machine, ctx_max, levers, rule, reserve)
     }
 
+    /// [`PlanInputs::target`] over `kv`'s per-layer bytes instead of the
+    /// file's own — the multiplying view a multi-slot plan counts by.
+    fn target_of<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        experts: Experts,
+        reserve: u64,
+        kv: &dyn KvBytes,
+    ) -> Result<Plan<'a>, PlaceError> {
+        if let (Some(tier), Experts::Host) = (machine.tiers.first(), experts) {
+            return Err(PlaceError::TierHost {
+                tier: tier.name.clone(),
+            });
+        }
+        let rule = match experts {
+            Experts::Host => None,
+            Experts::Card => Some(card_routed as RoutedFormat),
+        };
+        self.target_rule_of(machine, ctx_max, levers, rule, reserve, kv)
+    }
+
+    /// The target's plan, unchecked, under the card rule `rule` over `kv`'s
+    /// per-layer bytes: every routed expert on the host for `None`, else the
+    /// expert rule over the layers whose routed stacks `rule` loads within
+    /// each card's budget less `reserve`; then the PLE table moved to the
+    /// host.
+    fn target_rule_of<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        rule: Option<RoutedFormat>,
+        reserve: u64,
+        kv: &dyn KvBytes,
+    ) -> Result<Plan<'a>, PlaceError> {
+        let mut plan = match rule {
+            None => placement::plan_host_routed(&self.model, machine, ctx_max, kv, levers)?,
+            Some(rule) => placement::plan_routed_reserving(
+                &self.model,
+                machine,
+                ctx_max,
+                kv,
+                levers,
+                rule,
+                reserve,
+            )?,
+        };
+        ple_on_host(&mut plan)?;
+        Ok(plan)
+    }
+
     /// The target's plan, unchecked, under the card rule `rule`: every
     /// routed expert on the host for `None`, else the expert rule over the
     /// layers whose routed stacks `rule` loads within each card's budget
@@ -330,23 +428,8 @@ impl PlanInputs {
         rule: Option<RoutedFormat>,
         reserve: u64,
     ) -> Result<Plan<'a>, PlaceError> {
-        let mut plan = match rule {
-            None => placement::plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)?,
-            Some(rule) => placement::plan_routed_reserving(
-                &self.model,
-                machine,
-                ctx_max,
-                &self.kv,
-                levers,
-                rule,
-                reserve,
-            )?,
-        };
-        ple_on_host(&mut plan)?;
-        Ok(plan)
+        self.target_rule_of(machine, ctx_max, levers, rule, reserve, &self.kv)
     }
-
-    /// The placement of the file on `machine` at `ctx_max` positions under
     /// `levers`, the routed experts by the expert rule over the layers whose
     /// three routed stacks `rule` loads — the card rule of the program that
     /// runs the plan, as [`card_routed`] is Qwen3.8's and
@@ -467,6 +550,105 @@ impl PlanInputs {
         }
         check_draft_reserve(machine, None)?;
         let plan = self.target(machine, ctx_max, levers, experts, reserve)?;
+        let (t, d) = (&plan.cards[0], &draft.cards[0]);
+        let total = [
+            t.dense_bytes,
+            t.expert_bytes,
+            t.rounding_bytes,
+            t.kv_bytes,
+            t.scratch_bytes,
+            t.context_bytes,
+            draft_card_bytes(d, mtp.map_bytes),
+            arena,
+        ]
+        .iter()
+        .sum::<u64>();
+        let usable = plan.usable_bytes(card);
+        let limit = usable.saturating_sub(card.margin_bytes);
+        let mut broken: Vec<Violation> = plan
+            .violations()
+            .into_iter()
+            .filter(|v| !matches!(v, Violation::CardOver { .. }))
+            .chain(draft.violations())
+            .collect();
+        if total > limit {
+            broken.push(Violation::CardOver {
+                card: card.name.clone(),
+                total,
+                limit,
+            });
+        }
+        if !broken.is_empty() {
+            return Err(PlaceError::Broken(broken));
+        }
+        Ok(MtpPlan {
+            headroom_bytes: i128::from(usable) - i128::from(total),
+            plan,
+            draft,
+            map_bytes: mtp.map_bytes,
+            arena_bytes: arena,
+        })
+    }
+
+    /// [`PlanInputs::plan_mtp_with`] for a load that serves `slots` resident
+    /// sequences ([`PlanInputs::plan_with_slots`]): the target's and the
+    /// draft's per-load sequence terms — their stores, and the bytes a
+    /// sequence holds beside them ([`slot_resident_bytes`]) — count them
+    /// all, the sum keeping the card's bound. One slot is
+    /// [`PlanInputs::plan_mtp_with`] itself; zero is refused by name.
+    pub fn plan_mtp_with_slots<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        mtp: &'a MtpInputs,
+        experts: Experts,
+        slots: usize,
+    ) -> Result<MtpPlan<'a>, PlaceError> {
+        if slots == 1 {
+            return self.plan_mtp_with(machine, ctx_max, levers, mtp, experts);
+        }
+        if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
+            return Err(PlaceError::Positions { ctx_max });
+        }
+        if slots == 0 {
+            return Err(PlaceError::Slots { slots });
+        }
+        let [card] = machine.cards.as_slice() else {
+            return Err(PlaceError::DraftCards {
+                cards: machine.cards.len(),
+            });
+        };
+        let (draft, reserve) = mtp.draft_plan_of(ctx_max, slots)?;
+        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab));
+        let rows = slot_resident_bytes(&self.hp) * (slots as u64 - 1);
+        let kv = SlotsOf {
+            kv: &self.kv,
+            slots: slots as u64,
+        };
+        if !machine.tiers.is_empty() {
+            check_draft_reserve(machine, Some(reserve))?;
+            let mut plan = self.target_of(machine, ctx_max, levers, experts, 0, &kv)?;
+            plan.cards[0].kv_bytes += rows;
+            let broken: Vec<Violation> = plan
+                .violations()
+                .into_iter()
+                .chain(draft.violations())
+                .collect();
+            if !broken.is_empty() {
+                return Err(PlaceError::Broken(broken));
+            }
+            return Ok(MtpPlan {
+                headroom_bytes: plan.cards[0].headroom_bytes,
+                plan,
+                draft,
+                map_bytes: mtp.map_bytes,
+                arena_bytes: arena,
+            });
+        }
+        check_draft_reserve(machine, None)?;
+        let mut plan = self.target_of(machine, ctx_max, levers, experts, reserve, &kv)?;
+        plan.cards[0].kv_bytes += rows;
         let (t, d) = (&plan.cards[0], &draft.cards[0]);
         let total = [
             t.dense_bytes,
@@ -1059,6 +1241,37 @@ fn streams(hp: &Hparams) -> usize {
     hp.exp.as_ref().map_or(1, |e| e.hc_streams)
 }
 
+/// `kv`'s per-layer bytes for `slots` resident sequences: the multiplying
+/// view a multi-slot plan counts its per-load sequence terms by — the terms
+/// keep one owner, [`KvLayout`] (or the draft's [`MtpKv`]), multiplied.
+struct SlotsOf<'a, K: KvBytes + ?Sized> {
+    kv: &'a K,
+    slots: u64,
+}
+
+impl<K: KvBytes + ?Sized> KvBytes for SlotsOf<'_, K> {
+    fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        self.kv.layer_bytes(layer, ctx_max) * self.slots
+    }
+
+    fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        self.kv.shadow_bytes(layer, ctx_max) * self.slots
+    }
+}
+
+/// Card bytes one resident sequence of a qwen4exp load holds beside its
+/// per-layer stores ([`PlanInputs::plan_with_slots`]): the step's one row
+/// and the pass's [`PASS_ROWS`] rows of the four streams — the arena rows a
+/// sequence's own draft walks read, held in its own buffers while the
+/// arenas address whichever sequence is live — and the lane word every
+/// delta launch of the sequence reads [derived: `(1 + PASS_ROWS) · streams
+/// · n_embd` f32, one u32 device word]. The engine's own owner of the rows
+/// term is `Body38`'s `seq38_bytes`; the gate holds the two equal.
+#[must_use]
+pub fn slot_resident_bytes(hp: &Hparams) -> u64 {
+    ((1 + PASS_ROWS) * streams(hp) * hp.n_embd * std::mem::size_of::<f32>() + 4) as u64
+}
+
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         let ple = match self.ple {
@@ -1294,11 +1507,21 @@ impl MtpInputs {
     /// ([`mtp_arena_bytes`]). Refused by name when the plan keeps a routed
     /// expert off the card.
     fn draft_plan(&self, ctx_max: u64) -> Result<(Plan<'_>, u64), PlaceError> {
+        self.draft_plan_of(ctx_max, 1)
+    }
+
+    /// [`MtpInputs::draft_plan`] for a load that serves `slots` resident
+    /// sequences: the draft's store counts them all.
+    fn draft_plan_of(&self, ctx_max: u64, slots: usize) -> Result<(Plan<'_>, u64), PlaceError> {
+        let kv = SlotsOf {
+            kv: &self.kv,
+            slots: slots as u64,
+        };
         let draft = placement::plan_routed(
             &self.model,
             &self.machine,
             ctx_max,
-            &self.kv,
+            &kv,
             &PlanLevers::default(),
             CardFormat::of_routed,
         )?;

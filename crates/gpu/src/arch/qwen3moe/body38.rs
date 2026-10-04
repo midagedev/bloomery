@@ -38,6 +38,22 @@
 //! target's weights and streams and write only the draft's store and
 //! arena, so no target walk reads what they leave.
 //!
+//! The body serves resident sequence slots ([`Slots`],
+//! [`GpuModel::add_slots`]): one sequence's stores, PLE ring and hash
+//! history, lane word, checkpoints with their points, the positions it
+//! holds and where its calls left their rows — and, on a load with the
+//! draft, the draft's store, its captures and its own positions — travel
+//! as [`Slot38`], exchanged by pointer moves at a select. The step's and
+//! the pass's final-stream rows travel with it too: a draft walk reads the
+//! rows its sequence's last target walk left in the shared arenas, so each
+//! sequence holds its own and the arenas address whichever is live — the
+//! same rule the slots' own captures follow. Everything a walk of another
+//! sequence cannot read (the weights, the kernels, the arenas' scratch,
+//! the host tier and residency machine, the slot map, the fault word)
+//! stays one. A load made for one sequence launches and allocates exactly
+//! as a load that never serves slots does; a sequence past the count the
+//! load's plan was made for is refused by name.
+//!
 //! The walk is `program38`'s. The decode step is captured; a prompt runs
 //! as captured steps, one a position ([`Prompt38::Step`]), as eager passes
 //! of up to eight positions through the batch port ([`Prompt38::Pass`]) —
@@ -82,8 +98,8 @@
 
 use super::card38::{Card38, MapCheck, Walk38};
 use super::mtp38::{
-    DraftRows38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, MtpTaps,
-    Target38, TargetRows,
+    DraftRows38, DraftSeq38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode,
+    MtpTaps, Target38, TargetRows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -113,7 +129,7 @@ use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::tier::TierOpen;
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
-use crate::model::{ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows};
+use crate::model::{ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, Slots};
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::WindowMut;
@@ -175,6 +191,35 @@ impl Seq38 {
     pub fn keep_point(&self, n: u32) -> u32 {
         self.state.keep_point(n)
     }
+}
+
+/// One Qwen3.8 sequence's resident state ([`Slots`], what a select
+/// exchanges): the per-layer stores, the PLE ring with the hash's history
+/// and its points, the committed lane word, the checkpoints, the positions
+/// the stores hold and where the last call left its rows — and, on a load
+/// with the draft ([`DraftSeq38`]), the draft's store with the captures
+/// that address it and its own record of the positions it holds. The
+/// step's and the pass's final-stream rows travel with it too: a draft
+/// walk reads the rows its sequence's last target walk left in the shared
+/// arenas, so each sequence holds its own and the arenas address whichever
+/// is live — the same rule a slot's own captures follow, each slot's
+/// graphs addressing the buffers that were live at their capture.
+pub struct Slot38 {
+    stores: Vec<Store38>,
+    ple_ring: DeviceBuffer<f32>,
+    lane: LaneWord,
+    ckpt: Checkpoints,
+    ple_points: Vec<(u32, History)>,
+    ple_hist: History,
+    held: u32,
+    wrote: Wrote38,
+    last_walk: TargetRows,
+    /// The step arena's final-stream row and the pass arena's
+    /// [`PASS_ROWS`] rows, the buffers the shared arenas address while this
+    /// sequence is live.
+    rows_step: DeviceBuffer<f32>,
+    rows_pass: DeviceBuffer<f32>,
+    draft: Option<DraftSeq38>,
 }
 
 /// The host bytes a sequence state of `positions` positions holds on a load
@@ -615,6 +660,11 @@ pub struct Body38 {
     held: u32,
     /// The call planned and not yet launched.
     staged: Option<Staged38>,
+    /// The sequence slots the load's plan was made for ([`Slots`]), and how
+    /// many stand: the load's own sequence plus every [`Slots::new_seq`]. A
+    /// sequence past the plan is refused by name.
+    slots_planned: usize,
+    slots_made: usize,
     /// The arena the last planned call walked (a step's, a pass's or a
     /// verify's the step arena or the pass arena, a ubatch's its own): where
     /// its rows' final streams sit for a caller that reads them back
@@ -666,7 +716,44 @@ impl Body38 {
         host: HostCfg,
         ubatch: usize,
     ) -> Result<Qwen38Model, GpuError> {
-        Body38::open_with(file, plan, inputs, card, host, ubatch, Residency::Off, None)
+        Body38::open_with(
+            file,
+            plan,
+            inputs,
+            card,
+            host,
+            ubatch,
+            Residency::Off,
+            None,
+            1,
+        )
+    }
+
+    /// [`Body38::open_placed`] for a load that serves `slots` resident
+    /// sequences ([`Slots`]): the plan must have counted them
+    /// ([`PlanInputs::plan_with_slots`](model::arch::qwen35moe::place::PlanInputs)),
+    /// and a sequence past the count is refused by name. Zero slots is
+    /// refused by name.
+    pub fn open_placed_slots(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        card: usize,
+        host: HostCfg,
+        ubatch: usize,
+        slots: usize,
+    ) -> Result<Qwen38Model, GpuError> {
+        Body38::open_with(
+            file,
+            plan,
+            inputs,
+            card,
+            host,
+            ubatch,
+            Residency::Off,
+            None,
+            slots,
+        )
     }
 
     /// [`Body38::open_placed`] under `residency`: `mid-p<P>-s<S>` runs the
@@ -686,7 +773,7 @@ impl Body38 {
         ubatch: usize,
         residency: Residency,
     ) -> Result<Qwen38Model, GpuError> {
-        Body38::open_with(file, plan, inputs, card, host, ubatch, residency, None)
+        Body38::open_with(file, plan, inputs, card, host, ubatch, residency, None, 1)
     }
 
     /// [`Body38::open_placed`] of `plan`'s target plan with the MTP draft
@@ -716,6 +803,39 @@ impl Body38 {
             ubatch,
             Residency::Off,
             Some((draft, mtp, plan)),
+            1,
+        )
+    }
+
+    /// [`Body38::open_placed_mtp`] for a load that serves `slots` resident
+    /// sequences ([`Body38::open_placed_slots`]): the plan must have counted
+    /// them
+    /// ([`PlanInputs::plan_mtp_with_slots`](model::arch::qwen35moe::place::PlanInputs)).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "open_placed_mtp's eight and the slot count (rust-quality R8)"
+    )]
+    pub fn open_placed_mtp_slots(
+        file: Split,
+        plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        card: usize,
+        host: HostCfg,
+        ubatch: usize,
+        draft: &Split,
+        mtp: &model::arch::qwen35moe::place::MtpInputs,
+        slots: usize,
+    ) -> Result<Qwen38Model, GpuError> {
+        Body38::open_with(
+            file,
+            &plan.plan,
+            inputs,
+            card,
+            host,
+            ubatch,
+            Residency::Off,
+            Some((draft, mtp, plan)),
+            slots,
         )
     }
 
@@ -745,14 +865,16 @@ impl Body38 {
             ubatch,
             residency,
             Some((draft, mtp, plan)),
+            1,
         )
     }
 
     /// The load every constructor shares, under `residency`; `mtp` the
-    /// draft's file, inputs and plan, when there is one.
+    /// draft's file, inputs and plan, when there is one, and `slots` the
+    /// sequence slots the plan was made for ([`Slots`]).
     #[allow(
         clippy::too_many_arguments,
-        reason = "open_placed's six, the residency and the draft's file, inputs and plan (rust-quality R8)"
+        reason = "open_placed's six, the residency, the draft's file, inputs and plan, and the planned slots (rust-quality R8)"
     )]
     fn open_with(
         file: Split,
@@ -767,7 +889,11 @@ impl Body38 {
             &model::arch::qwen35moe::place::MtpInputs,
             &model::arch::qwen35moe::place::MtpPlan<'_>,
         )>,
+        slots: usize,
     ) -> Result<Qwen38Model, GpuError> {
+        if slots == 0 {
+            return Err(GpuError::shape(WHAT, "a load of 0 resident sequence slots"));
+        }
         refuse_tier_count(WHAT, plan.machine.tiers.len())?;
         let refused: Vec<String> = inputs
             .unimplemented()
@@ -823,7 +949,7 @@ impl Body38 {
             |stream, _, layers, w| Body38::derive(stream, &shape.kinds, layers, w),
             |gpu, file, w, set, glue| {
                 let draft = mtp
-                    .map(|(d, m, p)| Mtp38::open(gpu, w, d, m, p, host.card_dontneed))
+                    .map(|(d, m, p)| Mtp38::open(gpu, w, d, m, p, host.card_dontneed, slots))
                     .transpose()?;
                 let mut body = Body38::load_placed(
                     gpu,
@@ -835,7 +961,7 @@ impl Body38 {
                     host,
                     set,
                     glue,
-                    (ubatch, counted),
+                    (ubatch, counted, slots),
                 )?;
                 if let Some(mut d) = draft {
                     let rows = body.rope.table.len() / body.rope.width;
@@ -888,7 +1014,7 @@ impl Body38 {
     /// sized ([`HostServed::start_residency`], the load's last step).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card handle, file, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the arena bytes the plan counts (rust-quality R8)"
+        reason = "the load's card handle, file, weights, plan, inputs and chain shape, the host tier's residency and levers, the residency glue, and the ubatch with the arena bytes the plan counts and the planned slots (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
@@ -900,7 +1026,7 @@ impl Body38 {
         host: HostCfg,
         set: HostResidency,
         residency_glue: ResidencyGlue,
-        (ub, counted): (usize, u64),
+        (ub, counted, planned): (usize, u64, usize),
     ) -> Result<Body38, GpuError> {
         let (spec, hp) = (&inputs.spec, &inputs.hp);
         let n = spec.layers.len();
@@ -1109,6 +1235,8 @@ impl Body38 {
             ctx,
             held: 0,
             staged: None,
+            slots_planned: planned,
+            slots_made: 1,
             last_walk: TargetRows::Step,
             wrote: Wrote38::default(),
             plant: None,
@@ -3260,6 +3388,159 @@ impl ChainBody for Body38 {
 
     fn host(&mut self) -> Option<&mut Body38> {
         Some(self)
+    }
+}
+
+impl Slots for Body38 {
+    type Seq = Slot38;
+
+    /// A sequence of the load's shape in the state the load leaves: zeroed
+    /// stores with a fresh delta store's stamps, the PLE ring zeroed and a
+    /// new hash history, lane 0, no checkpoint and no position held, its
+    /// arena rows zeroed, and — on a load with the draft — a zeroed draft
+    /// store no walk has captured over. Refused by name past the count the
+    /// load's plan was made for, naming the plan's count and the sequence
+    /// asked for. Load-time allocation.
+    fn new_seq(&mut self, gpu: &Gpu) -> Result<Slot38, GpuError> {
+        const WHAT_N: &str = "qwen4exp Body38::new_seq";
+        if self.slots_made >= self.slots_planned {
+            return Err(GpuError::shape(
+                WHAT_N,
+                format!(
+                    "sequence {} of a plan that counts {} slots; plan the load for as many \
+                     resident sequences as it must serve",
+                    self.slots_made + 1,
+                    self.slots_planned
+                ),
+            ));
+        }
+        let stream = gpu.stream();
+        let d = dims(self.s.route.dims(), self.ctx);
+        let stores = self
+            .kinds()
+            .into_iter()
+            .map(|k| match k {
+                LayerKind38::Gdn => Store38::rec(stream),
+                LayerKind38::Qsa => Store38::qsa(stream, &d),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let lens = stores
+            .iter()
+            .filter(|s| matches!(s, Store38::Rec { .. }))
+            .flat_map(|_| [GDN.state_len(), GDN.ring_len()])
+            .chain([ple::ring_len(geo::STREAMS)])
+            .collect();
+        let ple_hist = self
+            .ple
+            .hash
+            .new_history()
+            .map_err(|e| GpuError::shape(WHAT_N, e.to_string()))?;
+        let arenas = [&self.s, &self.a, &self.wa];
+        let rows_len = |walk: TargetRows| final_streams(&self.plans, arenas, walk).len();
+        let (rows_step, rows_pass) = (
+            DeviceBuffer::zeroed(stream, rows_len(TargetRows::Step))?,
+            DeviceBuffer::zeroed(stream, rows_len(TargetRows::Pass))?,
+        );
+        let draft = match self.mtp.as_ref() {
+            None => None,
+            Some(d) => Some(d.new_seq(stream)?),
+        };
+        let seq = Slot38 {
+            stores,
+            ple_ring: DeviceBuffer::zeroed(stream, ple::ring_len(geo::STREAMS))?,
+            lane: LaneWord::new(stream)?,
+            ckpt: Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?,
+            ple_points: Vec::new(),
+            ple_hist,
+            held: 0,
+            wrote: Wrote38::default(),
+            last_walk: TargetRows::Step,
+            rows_step,
+            rows_pass,
+            draft,
+        };
+        // Last, so a sequence whose allocation failed is not counted.
+        self.slots_made += 1;
+        Ok(seq)
+    }
+
+    /// Exchange the live sequence with `seq`: pointer moves only — every
+    /// per-sequence piece is a buffer handle or a host value the body holds
+    /// by value, so nothing is copied, captured or synchronized, and each
+    /// slot's captures keep addressing its own buffers. Refused by name,
+    /// moving nothing, while a call is staged or a verify waits for its
+    /// commit: the staged call's launches are the live sequence's alone.
+    fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Slot38) -> Result<(), GpuError> {
+        const WHAT_W: &str = "qwen4exp Body38::swap_seq";
+        if let Some(s) = &self.staged {
+            return Err(GpuError::shape(
+                WHAT_W,
+                format!(
+                    "a select while a call of {} rows from {} is staged and not launched",
+                    s.rows, s.pos
+                ),
+            ));
+        }
+        if let Some(p) = &self.pending {
+            return Err(GpuError::shape(
+                WHAT_W,
+                format!(
+                    "a select while the verify of {} rows at {} waits for its commit \
+                     (GpuModel::rollback to the first position not kept)",
+                    p.tokens.len(),
+                    p.pos0
+                ),
+            ));
+        }
+        if self.mtp.is_some() != seq.draft.is_some() {
+            return Err(GpuError::state(
+                WHAT_W,
+                "the draft's side of every sequence (a load that drafts serves sequences that \
+                 each carry one)",
+            ));
+        }
+        std::mem::swap(&mut self.stores, &mut seq.stores);
+        std::mem::swap(&mut self.ple_ring, &mut seq.ple_ring);
+        std::mem::swap(&mut self.lane, &mut seq.lane);
+        std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
+        std::mem::swap(&mut self.ple_points, &mut seq.ple_points);
+        std::mem::swap(&mut self.ple.hist, &mut seq.ple_hist);
+        std::mem::swap(&mut self.held, &mut seq.held);
+        std::mem::swap(&mut self.wrote, &mut seq.wrote);
+        std::mem::swap(&mut self.last_walk, &mut seq.last_walk);
+        // The arena rows a draft walk reads by position (the walk's graph
+        // replays the shared arena's address, so the sequence's rows move as
+        // the buffer the arena addresses, not as a copy).
+        let plans = &self.plans;
+        let step = [&mut self.s, &mut self.a, &mut self.wa];
+        std::mem::swap(
+            final_streams_mut(plans, step, TargetRows::Step),
+            &mut seq.rows_step,
+        );
+        let pass = [&mut self.s, &mut self.a, &mut self.wa];
+        std::mem::swap(
+            final_streams_mut(plans, pass, TargetRows::Pass),
+            &mut seq.rows_pass,
+        );
+        // Checked above: both sides carry a draft or neither does.
+        if let (Some(d), Some(s)) = (&mut self.mtp, &mut seq.draft) {
+            d.swap_slot(s);
+        }
+        Ok(())
+    }
+
+    /// Device bytes one sequence holds: its stores and PLE ring, its lane
+    /// word, its two arena-row buffers and the draft's store on a load with
+    /// one — the same terms [`seq38_bytes`] counts a host park's read of
+    /// them by.
+    fn seq_bytes(&self) -> usize {
+        let arenas = [&self.s, &self.a, &self.wa];
+        self.stores.iter().map(Store38::bytes).sum::<usize>()
+            + self.ple_ring.num_bytes()
+            + self.lane.bytes()
+            + final_streams(&self.plans, arenas, TargetRows::Step).num_bytes()
+            + final_streams(&self.plans, arenas, TargetRows::Pass).num_bytes()
+            + self.mtp.as_ref().map_or(0, Mtp38::seq_bytes)
     }
 }
 
