@@ -4,9 +4,9 @@
     tools/ref/router-residency.py hit <family> [<set>...] [--cap plan|n<N>|<f>] [--seed <seed>]
                                   [--rule mid|strata|knee] [--every N] [--link-gbps G]
                                   [--policies static,adaptive,lru,belady] [--json PATH]
-    tools/ref/router-residency.py hit <family> --streams S1,S2[,...] [--offset K] [--cap ...] [--seed <seed>]
-                                  [--rule ...] [--every N] [--link-gbps G] [--policies static,adaptive,belady]
-                                  [--json PATH]
+    tools/ref/router-residency.py hit <family> --streams S1,S2[,...] [--offset K] [--turn K] [--cap ...]
+                                  [--seed <seed>] [--rule ...] [--every N] [--link-gbps G]
+                                  [--policies static,adaptive,belady] [--json PATH]
     tools/ref/router-residency.py hit <family> [<set>...] --window N [--prompt P] [--open M|all
                                   [--stage K] [--open-from all|last:N]] [--seed <seed>] [--d D]
                                   [--copies K] [--json PATH]
@@ -50,7 +50,11 @@ hit      Without --window, the continuous replay over the eval half, one markdow
          m K past the eval half is refused, and so is --offset with no set named twice. Streams of
          unequal lengths are truncated to the shortest, and a `truncated` line says so: refusing would
          rule out every arm that mixes a windowed set with a whole one, and only passes that carry all B
-         rows measure the merged count. Seeds: in = the streams' learn halves summed, insample = their
+         rows measure the merged count. `--turn K` takes the card in turns instead: stream 0 runs K
+         passes (one token each), then stream 1 K, round robin until every window is consumed — every
+         pass one row of one stream, which the rule's cadence counts (K 1 is token interleave, K 64
+         today's time-slicing; B = 1 is the plain hit), the rows carry turn=K, and a `tok` column is per
+         one-row pass. Seeds: in = the streams' learn halves summed, insample = their
          eval windows summed, cross = the family's sets that are no stream (refused when there is none),
          pooled and prefix as above. Rows: `pooled` (all B rows), `sK` (stream K inside the merged
          replay), and per stream `alone sK` (that stream replayed by itself from its own seed, B = 1),
@@ -1125,37 +1129,49 @@ def unique_misses(X, rec, B, E):
     return int(np.unique(key[~rec]).size)
 
 
-def streams_replay(fam, streams, seeds, pol, rule, link_gbps, a, data, sets, extra):
-    """The merged replay of `streams` on one card: rows (pooled first, then one a stream for static and adaptive)
-    for every policy and seed."""
+def streams_replay(fam, streams, seeds, pol, rule, link_gbps, a, data, sets, extra, turn=None):
+    """The replay of `streams` on one card: rows (pooled first, then one a stream for static and adaptive)
+    for every policy and seed. turn None is the merged replay (a pass carries one token of every stream);
+    turn K is the turn replay: stream 0 runs K passes, then stream 1 K, round robin, every pass one row of
+    one stream."""
     F = family(fam)
     B, s0 = len(streams), streams[0][1]
     W = streams[0][3] - streams[0][2]
     n_l = n_cap(fam, a.cap, s0.E)
     S, step = F["expert_bytes"], F["step_ms"]
-    X = np.stack([s.stack(F["eligible"], SPLIT + t0, SPLIT + t1) for _, s, t0, t1 in streams], axis=1)
-    X = X.reshape(W * B, X.shape[2], X.shape[3])
-    passes = [(p * B, (p + 1) * B, B) for p in range(W)]
+    Xs = np.stack([s.stack(F["eligible"], SPLIT + t0, SPLIT + t1) for _, s, t0, t1 in streams], axis=1)
+    if turn is None:
+        X = Xs.reshape(W * B, Xs.shape[2], Xs.shape[3])
+        passes, npass, rows_pass, whose = [(p * B, (p + 1) * B, B) for p in range(W)], W, B, None
+    else:
+        at = np.asarray([(s, t) for j0 in range(0, W, turn) for s in range(B)
+                         for t in range(j0, min(j0 + turn, W))], dtype=np.int64)
+        X = Xs[at[:, 1], at[:, 0]]
+        passes, npass, rows_pass, whose = None, B * W, 1, at[:, 0]
     joined = "+".join(n for n, _, _, _ in streams)
     rows = []
 
     def emit(policy, sd, label, hits, swaps, rec=None, link=None, ties=None):
         r = v1_row(fam, s0, a.cap, n_l, policy, sd, label, hits, swaps, link, a.pin_gbps, a.page_gbps,
-                   tokens=W, rows=B, name=joined)
-        r.update(role="pooled", streams=joined, rows_pass=B)
+                   tokens=npass, rows=rows_pass, name=joined)
+        r.update(role="pooled", streams=joined, rows_pass=rows_pass)
+        if turn is not None:
+            r["turn"] = turn
         if ties is not None:
-            r["cap_bound"] = ties["cap_bound"] / max(W // rule.every, 1)
+            r["cap_bound"] = ties["cap_bound"] / max(npass // rule.every, 1)
         if rec is not None:
-            u = unique_misses(X, rec, B, s0.E)
-            r["host_gb_unique"] = u * S / W / 1e9
+            u = unique_misses(X, rec, rows_pass, s0.E)
+            r["host_gb_unique"] = u * S / npass / 1e9
         rows.append(r)
         if rec is None or B == 1:
             return
-        per = rec.reshape(W, B, rec.shape[1], rec.shape[2])
         for j, (n, s, t0, t1) in enumerate(streams):
-            q = v1_row(fam, s, a.cap, n_l, policy, sd, label, per[:, j].sum(axis=(0, 2)).astype(np.int64), swaps, link,
+            h = rec.reshape(W, B, rec.shape[1], rec.shape[2])[:, j] if whose is None else rec[whose == j]
+            q = v1_row(fam, s, a.cap, n_l, policy, sd, label, h.sum(axis=(0, 2)).astype(np.int64), swaps, link,
                        a.pin_gbps, a.page_gbps, tokens=W)
-            q.update(role=f"s{j}", streams=joined, rows_pass=B, window=[SPLIT + t0, SPLIT + t1])
+            q.update(role=f"s{j}", streams=joined, rows_pass=rows_pass, window=[SPLIT + t0, SPLIT + t1])
+            if turn is not None:
+                q["turn"] = turn
             rows.append(q)
 
     lists = {sd: stream_seed(fam, streams, sd, data, sets) for sd in seeds}
@@ -1185,7 +1201,8 @@ def streams_replay(fam, streams, seeds, pol, rule, link_gbps, a, data, sets, ext
 def streams_line(r):
     host = r["host_gb_tok"]
     uniq = r.get("host_gb_unique", float("nan"))
-    return (f"| {r['fam']} | {r['streams']} | {r['role']} | {r['cap']} {r['n_l']} ({r['f']:.3f}) | {r['label']} | "
+    streams = r["streams"] + (f" turn={r['turn']}" if "turn" in r else "")
+    return (f"| {r['fam']} | {streams} | {r['role']} | {r['cap']} {r['n_l']} ({r['f']:.3f}) | {r['label']} | "
             f"{100 * r['hit']:.2f} | {r['swaps_tok']:.2f} | {r['mb_tok']:.0f} | {r['ms_pin']:.2f} | "
             f"{r.get('link_util', float('nan')):.3f} | {r.get('delay_steps', float('nan')):.2f} | "
             f"{100 * r.get('cap_bound', float('nan')):.1f} | {host:.3f} | {uniq:.3f} | {1e3 * uniq / HOST_GBPS:.2f} |")
@@ -1197,6 +1214,8 @@ def cmd_streams(a, out):
         raise ToolError(f"--streams names the sets; drop the positional sets {' '.join(a.sets)}")
     if a.window is not None or a.open is not None or a.prompt is not None:
         raise ToolError("--streams is the continuous replay: drop --window, --open and --prompt")
+    if a.turn is not None and a.turn < 1:
+        raise ToolError(f"--turn {a.turn}: at least 1 pass a stream")
     pol = (a.policies or "static,adaptive,belady").split(",")
     bad = [p for p in pol if p not in ("static", "adaptive", "belady")]
     if bad:
@@ -1214,7 +1233,8 @@ def cmd_streams(a, out):
     if not a.seed and "cross" in seeds and all(n in {m for m, _, _, _ in streams} for n in F["sets"]):
         seeds.remove("cross")
         skipped.append("seed cross: every set of the family is a stream, so it has no cross seed; not run")
-    out.write(f"# router-residency hit --streams: data={a.data} family={a.family} B={B} rule {rule.text()} "
+    out.write(f"# router-residency hit --streams: data={a.data} family={a.family} B={B}"
+              + (f" turn {a.turn}" if a.turn is not None else "") + f" rule {rule.text()} "
               f"link {link_gbps:g} GB/s, step {F['step_ms']:g} ms, host {HOST_GBPS:g} GB/s\n")
     out.write("# streams: " + "  ".join(f"s{j} {n} [{SPLIT + t0}, {SPLIT + t1})" for j, (n, _, t0, t1) in
                                        enumerate(streams)) + "\n")
@@ -1224,7 +1244,7 @@ def cmd_streams(a, out):
               "admit delay (steps) | cap-bound % | host GB/pass (slots) | host GB/pass (unique) | host ms/pass @"
               f"{HOST_GBPS:g} |\n")
     out.write("|---|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-    rows = streams_replay(a.family, streams, seeds, pol, rule, link_gbps, a, a.data, sets, extra)
+    rows = streams_replay(a.family, streams, seeds, pol, rule, link_gbps, a, a.data, sets, extra, turn=a.turn)
     for r in rows:
         out.write(streams_line(r) + "\n")
     out.flush()
@@ -1232,7 +1252,8 @@ def cmd_streams(a, out):
         return rows
     alone = []
     for j, st in enumerate(streams):
-        for r in streams_replay(a.family, [st], seeds, pol, rule, link_gbps, a, a.data, sets, extra):
+        for r in streams_replay(a.family, [st], seeds, pol, rule, link_gbps, a, a.data, sets, extra,
+                                turn=a.turn):
             r["role"] = f"alone s{j}"
             r["window"] = [SPLIT + st[2], SPLIT + st[3]]
             alone.append(r)
@@ -1246,16 +1267,18 @@ def cmd_streams(a, out):
         if len(mine) != B:
             raise ToolError(f"{r['label']}: {len(mine)} alone rows for {B} streams")
         mean = sum(q["hit"] for q in mine) / B
-        slots_ms = (mean - r["hit"]) * B * L * K * S / (HOST_GBPS * 1e6)
+        slots_ms = (mean - r["hit"]) * B * L * K * S / (HOST_GBPS * 1e6)  # B rows: a merged pass, a turn round
         sum_u = (sum(q["host_gb_unique"] for q in mine)
                  if "host_gb_unique" in r and all("host_gb_unique" in q for q in mine) else None)
         r.update(alone_mean=mean, delta=r["hit"] - mean, extra_ms_slots=slots_ms)
-        text = (f"merged {r['streams']} {r['label']}: pooled {100 * r['hit']:.2f} alone mean {100 * mean:.2f} "
-                f"delta {100 * (r['hit'] - mean):+.2f} points; extra host {slots_ms:+.2f} ms/pass at {HOST_GBPS:g} GB/s "
+        head = "merged" if a.turn is None else f"turn {a.turn}"
+        unit = "pass" if r["rows_pass"] == B else f"{B} passes"
+        text = (f"{head} {r['streams']} {r['label']}: pooled {100 * r['hit']:.2f} alone mean {100 * mean:.2f} "
+                f"delta {100 * (r['hit'] - mean):+.2f} points; extra host {slots_ms:+.2f} ms/{unit} at {HOST_GBPS:g} GB/s "
                 "priced by slots [derived]")
         if sum_u is not None:
-            text += (f"; unique host {1e3 * r['host_gb_unique'] / HOST_GBPS:.2f} ms/pass against {1e3 * sum_u / HOST_GBPS:.2f}"
-                     f" for the {B} streams in passes of their own [derived]")
+            text += (f"; unique host {1e3 * r['host_gb_unique'] * B / r['rows_pass'] / HOST_GBPS:.2f} ms/{unit} "
+                     f"against {1e3 * sum_u / HOST_GBPS:.2f} for the {B} streams in passes of their own [derived]")
         out.write(text + "\n")
     return rows + alone
 
@@ -1266,6 +1289,8 @@ def cmd_hit(a, out):
         return cmd_streams(a, out)
     if a.offset is not None:
         raise ToolError("--offset needs --streams: it places the windows of a set named twice")
+    if a.turn is not None:
+        raise ToolError("--turn needs --streams: it cuts the streams' replay into turns of K passes")
     if a.open is not None and a.window is None:
         raise ToolError("--open needs --window: the opening reshuffle is a timed-window replay")
     if a.stage is not None and a.open is None:
@@ -1540,6 +1565,8 @@ def parser():
                                      "named m > 1 times is m windows of its eval half, copy j at [j K, (j + 1) K)")
     h.add_argument("--offset", type=int, help="K for --streams' windows of a repeated set: floor(eval / m) by default "
                                               "(disjoint), 0 = every copy the whole eval half")
+    h.add_argument("--turn", type=int, help="K passes a stream runs before the next takes the card (needs --streams): "
+                                            "1 is token interleave, 64 today's time-slicing")
     g = sub.add_parser("gen")
     g.add_argument("family")
     g.add_argument("trace")
@@ -2260,11 +2287,101 @@ def case_streams_refusals():
             assert code == 1 and want in err.getvalue(), (argv, code, err.getvalue())
 
 
+def case_turn_refusals():
+    # C1: --turn is a --streams modifier — without --streams refused by name, and so is K < 1
+    with tempfile.TemporaryDirectory() as root:
+        fixture_sets(root, (("prose", 1, 240),))
+        cases = [
+            (["hit", "v41", "prose", "--turn", "3"], "--turn needs --streams"),
+            (["hit", "v41", "--streams", "prose", "--turn", "0"], "--turn 0: at least 1 pass a stream"),
+            (["hit", "v41", "--streams", "prose", "--turn", "-2"], "--turn -2: at least 1 pass a stream"),
+        ]
+        for argv, want in cases:
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                code = main(argv + ["--data", root, "--cap", "n16"])
+            assert code == 1 and want in err.getvalue(), (argv, code, err.getvalue())
+
+
+def case_turn_one_stream():
+    # C3: --turn K with one stream is the plain hit on that set's window — the turn order over one stream
+    # is the token order, and one row a pass is the plain hit's own pass, every number bit for bit
+    with tempfile.TemporaryDirectory() as root:
+        fixture_sets(root, (("prose", 1, 240), ("code", 2, 200), ("korean", 3, 240)))
+        plain, _ = hit_json(["hit", "v41", "prose", "--cap", "n16", "--policies", "static,adaptive,belady"], root)
+        turned, text = hit_json(["hit", "v41", "--streams", "prose", "--turn", "7", "--cap", "n16"], root)
+        assert len(plain) == len(turned) == 6, (len(plain), len(turned))
+        for p, m in zip(plain, turned):
+            assert m["role"] == "pooled" and m["rows_pass"] == 1 and m["turn"] == 7, m
+            assert {k: m[k] for k in p} == p, (p, m)  # every plain column, bit for bit
+            assert {"role", "streams", "rows_pass", "turn"} <= set(m), m
+        assert "B=1 turn 7" in text and "turn=7" in text, text
+
+
+def case_turn_blocks():
+    # C5: two streams whose hot layers (2..5) route disjoint 6-id sets, card n6 = one stream's set. The
+    # pooled `in` seed sums both learn halves, whose counts tie, so the card starts at {0..5} (the lower
+    # ids). Under --turn 1 the rule counts both streams alike every window: pb's candidates tie pa's
+    # residents forever, never clear strata's margin, and pb runs its whole window at 0/6 on those
+    # layers. Under --turn W pa's whole block runs first (pb's ids count 0: no flip), then pb's, where
+    # 64..69 clear the margin over the victims' decayed counts at boundary w_full and serve 6/6 from
+    # pass 4 w_full of pb's block.
+    W, L, HOT = 240, 38, 4
+    with tempfile.TemporaryDirectory() as root:
+        for name, hot in (("prose", (0, 1, 2, 3, 4, 5)), ("code", (64, 65, 66, 67, 68, 69))):
+            T = SPLIT + W
+            d = os.path.join(root, name)
+            os.makedirs(d)
+            with open(os.path.join(d, "MANIFEST.tsv"), "w", encoding="utf-8") as f:
+                f.write("# router_trace — test\n# model\t/m/m.gguf\n# model_file\tm.gguf\n# build\tb0\n")
+                f.write(f"# tokens\t{T}\n# n_expert\t384\n# n_expert_used\t6\n")
+                f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
+                for l in range(40):
+                    f.write(f"layer\t{l}\tx\tx\t{T}\t0\t0\ttopk-{l}.u16\n")
+                f.write(f"# complete\t{T}\t40\n")
+            for l in range(40):
+                row = hot if 2 <= l <= 5 else (0, 1, 2, 3, 4, 5)
+                np.asarray([row] * T, dtype="<u2").tofile(os.path.join(d, f"topk-{l}.u16"))
+        argv = ["hit", "v41", "--streams", "prose,code", "--cap", "n6", "--seed", "in", "--policies", "adaptive",
+                "--rule", "strata", "--link-gbps", "0"]
+        # the rule's own arithmetic on the fixture, not a run: pa's block takes 0..5's counts to their
+        # decay steady state (4 a window, x0.7 at the boundary); in pb's block 64..69's accumulated count
+        # clears the victims' decayed one plus strata's margin 1.5 first at boundary w_full
+        v = 0.0
+        for _ in range(W // 4):
+            v = (v + 4.0) * 0.7
+        c, w_full = 0.0, None
+        for w in range(1, W // 4 + 1):
+            if c + 4.0 >= v + 1.5:
+                w_full = w
+                break
+            c = (c + 4.0) * 0.7
+            v *= 0.7
+        assert w_full == 3, w_full
+        t1, text1 = hit_json(argv + ["--turn", "1"], root)
+        tw, textw = hit_json(argv + ["--turn", str(W)], root)
+        by1 = {(r["policy"], r["role"]): r for r in t1}
+        byw = {(r["policy"], r["role"]): r for r in tw}
+        slots, a_hits = 2 * W * L * 6, W * L * 6
+        b1 = W * (L - HOT) * 6                               # turn 1: pb never gains a hot-layer slot
+        bw = W * (L - HOT) * 6 + HOT * 6 * (W - 4 * w_full)   # turn W: 0/6 for 4 w_full passes, then 6/6
+        assert by1[("adaptive", "pooled")]["hit"] == (a_hits + b1) / slots, by1[("adaptive", "pooled")]
+        assert byw[("adaptive", "pooled")]["hit"] == (a_hits + bw) / slots, byw[("adaptive", "pooled")]
+        assert byw[("adaptive", "pooled")]["hit"] > by1[("adaptive", "pooled")]["hit"]
+        assert by1[("adaptive", "s0")]["hit"] == byw[("adaptive", "s0")]["hit"] == 1.0
+        assert by1[("adaptive", "s1")]["hit"] == b1 / (W * L * 6), by1[("adaptive", "s1")]
+        assert byw[("adaptive", "s1")]["hit"] == bw / (W * L * 6), byw[("adaptive", "s1")]
+        assert by1[("adaptive", "pooled")]["swaps_tok"] == 0.0, by1[("adaptive", "pooled")]
+        assert byw[("adaptive", "pooled")]["swaps_tok"] == HOT * 6 / (2 * W), byw[("adaptive", "pooled")]
+        assert "B=2 turn 1" in text1 and f"B=2 turn {W}" in textw, (text1, textw)
+        assert "turn 1 prose+code strata[in,gbps=0]: pooled" in text1, text1
+
+
 CASES = [case_static, case_belady, case_lru, case_adaptive_link, case_adaptive_margin, case_adaptive_min_count,
          case_adaptive_cap, case_lru_is_global, case_in_flight, case_land_then_plan, case_window, case_open,
          case_open_last, case_gen, case_gen_contexts, case_gen_split, case_gen_short, case_q38_family,
          case_fixture, case_refusals, case_streams_one, case_streams_twice, case_streams_windows,
-         case_streams_refusals]
+         case_streams_refusals, case_turn_refusals, case_turn_one_stream, case_turn_blocks]
 
 
 def self_test():
