@@ -42,7 +42,7 @@
 //!   printed only, for the rows the first run's steps wrote are not a fresh
 //!   prompt call's rows;
 //! - on a qwen35moe file, whose seat keeps a prefix back to the checkpoints
-//!   a marked prompt call took (every 512 positions and its end), the
+//!   a marked prompt call took (every ubatch of positions and its end), the
 //!   prefix clauses: the stripped clause — the turn of [`EDIT_A`] answered,
 //!   then resent with a reasoning-free reply ([`STRIPPED_35`]) in place of
 //!   the reply, so the shared prefix ends at the turn's prompt end — keeps

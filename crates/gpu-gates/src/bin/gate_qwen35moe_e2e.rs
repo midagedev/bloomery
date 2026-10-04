@@ -75,20 +75,25 @@
 //! - (k) checkpoints, on a second load at [`KCTX`] (the marks' positions
 //!   need the room [`CTX`] does not hold) with the marks armed and an lcg
 //!   prompt of [`KP`] ids on the seat's schedule
-//!   (`PrefillPath::Wide`): a prompt call takes its checkpoints at 512,
-//!   1024, …, 4096 and [`KP`], and one checkpoint's bytes and slots are
-//!   their derivation (each delta layer's state of `N_V · HEAD_V²` f32 and
-//!   conv ring of `RING_ROWS · C`, the host budget's share); a cut to an
-//!   ask between 4096 and [`KP`] keeps 4096, one below 4096 keeps 3584,
-//!   one below 512 keeps nothing (`no-checkpoint`), each with its code, and
-//!   a cut to a non-checkpoint is refused by name; a cut to 4096 and the
-//!   re-fed 104 ids leave the token, the last logits and every store bit
-//!   for bit the uncut call's (the call takes its points back, 4096 held);
-//!   a reset drops every point. FAIL-first mutants, each red on its line:
-//!   the restore omitted (the cut a Stay: the re-feed runs from the fed
-//!   state, the stores and logits red); `kept` answering the ask instead of
-//!   the checkpoint (the neighbours red, and the refused cut not refused);
-//!   `reset` keeping the checkpoints (the dropped-points line red).
+//!   (`PrefillPath::Wide`): a prompt call takes its checkpoints at the
+//!   load's ubatch multiples inside it and [`KP`] (the spacing pinned in
+//!   the clause), and one checkpoint's bytes and slots are their derivation
+//!   (each delta layer's state of `N_V · HEAD_V²` f32 and conv ring of
+//!   `RING_ROWS · C`, the host budget's share); the call runs exactly
+//!   ⌈[`KP`]/ub⌉ walks, one a unit of its own plan, the re-fed tail after a
+//!   cut one walk; a cut to an ask between the last inner mark and [`KP`]
+//!   keeps it, one below that keeps the mark under it, one below the first
+//!   keeps nothing (`no-checkpoint`), each with its code, and a cut to a
+//!   non-checkpoint is refused by name; a cut to the last inner mark and
+//!   the re-fed tail leave the token, the last logits and every store bit
+//!   for bit the uncut call's (the call takes its points back, the mark
+//!   held); a reset drops every point. FAIL-first mutants, each red on its
+//!   line: the spacing put back at the flat 512 it was (the points and the
+//!   walk count red); the restore omitted (the cut a Stay: the re-feed runs
+//!   from the fed state, the stores and logits red); `kept` answering the
+//!   ask instead of the checkpoint (the neighbours red, and the refused cut
+//!   not refused); `reset` keeping the checkpoints (the dropped-points line
+//!   red).
 //! - (r) refusals: a ubatch size of 0 or past `UBATCH` is refused by name
 //!   with the size and the resident bytes kept; a prompt past the cache is
 //!   refused by name before any launch, the position kept.
@@ -1714,8 +1719,8 @@ mod gate {
 
     // ---------------------------------------------- (k) the checkpoints
 
-    /// (k)'s prompt: past the eighth inner mark (4096) with a run left
-    /// after it, and short of a whole ninth window.
+    /// (k)'s prompt: past an inner mark of the load's ubatch with a run
+    /// left after it, and short of the next whole window.
     const KP: usize = 4200;
 
     /// (k)'s cache: the prompt, and the marks' positions, with room.
@@ -1766,13 +1771,32 @@ mod gate {
         );
         ok &= points_ok;
 
-        // The fresh call: its marks, and what a cut keeps around them.
+        // The fresh call: its marks, the walks it ran, and what a cut keeps
+        // around them.
         fresh(&mut m)?;
         let plan = m.prefill_plan(KP, PrefillPath::Wide)?;
         let tok0 = m.prefill_with(&ids, PrefillPath::Wide)?;
         let (logits0, stores0) = (m.logits()?, stores(&mut m)?);
-        let want_pts: Vec<u32> = (1..=8).map(|k| 512 * k as u32).chain([KP as u32]).collect();
+        // PIN(2026-10-04): the marks' spacing is the ubatch size the load was
+        // asked for — the walk's most positions, the sibling body's rule —
+        // re-derived here from the model's own size, where it was GLM's flat
+        // 512: a mark every 512 rows cut a seat prompt of one ubatch walk's
+        // rows into a walk each, every walk re-reading the expert weights
+        // ([derived] pp@4096 at the seat down 27–29 %). At the load's size
+        // the marks are its multiples: the points, the keep below an ask
+        // (the multiple under it) and the walks follow — a run between
+        // marks is one whole ubatch, the tail one unit, so the call runs
+        // exactly ⌈P/ub⌉ walks, one more only where a mark falls inside a
+        // walk (a continuation's first, or the borrowed tail).
+        let ub = u32::try_from(m.ubatch()?).expect("a ubatch the load validated, at most UBATCH");
+        let mark_below = |ask: u32| ub * (ask / ub);
+        let want_pts: Vec<u32> = (1..)
+            .map(|k| ub * k)
+            .take_while(|&p| p < KP as u32)
+            .chain([KP as u32])
+            .collect();
         let pts = m.body("gate_qwen35moe_e2e")?.checkpoints().positions();
+        let walks = m.body("gate_qwen35moe_e2e")?.prompt_walks();
         let (k_above, k_below, k_low, k_here) = (
             m.body("gate_qwen35moe_e2e")?.kept(4150, KP as u32),
             m.body("gate_qwen35moe_e2e")?.kept(4095, KP as u32),
@@ -1780,18 +1804,21 @@ mod gate {
             m.body("gate_qwen35moe_e2e")?.kept(KP as u32, KP as u32),
         );
         let marks_ok = pts == want_pts
-            && (k_above.at, k_above.why.code()) == (4096, "checkpoint")
-            && (k_below.at, k_below.why.code()) == (3584, "checkpoint")
-            && (k_low.at, k_low.why.code()) == (0, "no-checkpoint")
+            && (k_above.at, k_above.why.code()) == (mark_below(4150), "checkpoint")
+            && (k_below.at, k_below.why.code()) == (mark_below(4095), "checkpoint")
+            && (k_low.at, k_low.why.code()) == (mark_below(100), "no-checkpoint")
             && (k_here.at, k_here.why.code()) == (KP as u32, "current")
             && plan.ubatch_tokens() == KP;
+        let walks_ok = walks == (KP as u32).div_ceil(ub) as usize;
         println!(
             "checkpoints: a prompt of {KP} ids (plan {plan}) took its points at {pts:?} (want \
-             {want_pts:?}); kept(4150) = {k_above}; kept(4095) = {k_below}; kept(100) = {k_low}; \
-             kept({KP}) = {k_here} {}",
-            verdict(marks_ok)
+             {want_pts:?}, the ubatch {ub}'s multiples); kept(4150) = {k_above}; kept(4095) = \
+             {k_below}; kept(100) = {k_low}; kept({KP}) = {k_here}; {walks} walks (want \
+             {}, the plan's own units) {}",
+            (KP as u32).div_ceil(ub),
+            verdict(marks_ok && walks_ok)
         );
-        ok &= marks_ok;
+        ok &= marks_ok && walks_ok;
 
         // A cut to a non-checkpoint is refused by name, the points kept.
         let refused = match m.rollback(4150) {
@@ -1807,23 +1834,28 @@ mod gate {
         ok &= cut_ok;
 
         // The cut and the re-fed tail: the same bits the uncut call left.
-        m.rollback(4096)?;
-        let tail = &ids[4096..];
+        let cut_at = mark_below(4150);
+        m.rollback(cut_at)?;
+        let tail = &ids[cut_at as usize..];
         let tok = m.prefill_with(tail, PrefillPath::Wide)?;
         let (logits, st) = (m.logits()?, stores(&mut m)?);
         let differ: Vec<usize> = (0..st.len())
             .filter(|&l| !stores0.get(l).is_some_and(|w| same_store(&st[l], w)))
             .collect();
         let same_logits = bits_equal(&logits, &logits0);
+        let refed_walks = m.body("gate_qwen35moe_e2e")?.prompt_walks();
         let refed_ok = tok == tok0
             && same_logits
             && differ.is_empty()
             && st.len() == stores0.len()
-            && m.body("gate_qwen35moe_e2e")?.checkpoints().positions() == want_pts;
+            && m.body("gate_qwen35moe_e2e")?.checkpoints().positions() == want_pts
+            // A cut lands on a mark, so the re-fed call's only run is the
+            // tail itself: one walk of its own plan.
+            && refed_walks == (tail.len() as u32).div_ceil(ub) as usize;
         println!(
-            "checkpoints: cut to 4096 and {} ids re-fed: token {tok} vs {tok0}, last logits \
+            "checkpoints: cut to {cut_at} and {} ids re-fed: token {tok} vs {tok0}, last logits \
              bit-identical={same_logits}, every store bit-identical (layers differing {differ:?}), \
-             the points back at {want_pts:?} {}",
+             the points back at {want_pts:?}, {refed_walks} walk {}",
             tail.len(),
             verdict(refed_ok)
         );

@@ -86,16 +86,6 @@ use std::sync::Arc;
 
 const WHAT: &str = "qwen35moe::Body35::load";
 
-/// The spacing of a prompt call's inner checkpoints (`runtime::seqstate`'s
-/// marks), when the load takes them ([`Body35::set_checkpoints`]): GLM's
-/// spacing, whose cost balance a Qwen3.6 copy — a delta layer's state and
-/// conv ring, smaller than GLM's KDA state beside its ring — sits under at
-/// the same window. A denser spacing halves the rows a cut at most re-feeds
-/// but takes a copy of every store inside each smaller window of the
-/// prompt's own walk; a sparser one trades the copies away for rows every
-/// cut repeats.
-const CHECKPOINT_EVERY: u32 = 512;
-
 /// Card bytes a load leaves free past the ubatch arena: what the load and
 /// the first prompt still allocate after it — the output head and the
 /// heads of a pass of up to [`MAX_PASS_ROWS`] rows (a vocabulary of logits
@@ -156,6 +146,24 @@ fn ubatch_of(d: &Dims, u: usize) -> Result<NonZeroUsize, GpuError> {
                 ),
             )
         })
+}
+
+/// The spacing of a prompt call's inner checkpoints (`runtime::seqstate`'s
+/// marks), when the load takes them ([`Body35::set_checkpoints`]): the
+/// ubatch size the load was asked for, as [`ubatch_of`] validates it — the
+/// ubatch walk's most positions, the sibling body's rule — so the marks
+/// fall on the walk's multiples and a mark never cuts a ubatch walk the
+/// call's own ubatches do not already cut: a cut re-feeds at most one
+/// ubatch of rows, and a prompt call takes at most one walk more than its
+/// own ubatches. A denser spacing takes a copy of every store inside each
+/// smaller window of the prompt's own walk without saving a walk; a sparser
+/// one trades the copies away for rows every cut repeats. A placed load's
+/// prompt runs as passes of a few rows instead ([`placed_open`]), and the
+/// asked size stays the spacing: its marks cut a pass at most once a mark,
+/// a copy a window apart. The size [`ubatch_of`] returns is at most
+/// [`UBATCH`], so the `u32` loses nothing.
+fn checkpoint_every(asked: usize, d: &Dims) -> Result<u32, GpuError> {
+    Ok(ubatch_of(d, asked)?.get() as u32)
 }
 
 /// The ubatch arena of `d` for ubatches of `u` tokens, after the check that
@@ -383,6 +391,9 @@ pub struct Body35 {
     /// only while `marks` is on.
     ckpt: Checkpoints,
     marks: bool,
+    /// Walks the last prompt call ran ([`Body35::prompt_walks`]): one a
+    /// unit, counted from the call's start.
+    prompt_walks: usize,
 }
 
 /// `name` of layer `l`.
@@ -996,8 +1007,9 @@ impl GpuModel<Body35> {
     /// shared gate, the host set read in and locked as `host` asks, and the
     /// body over them with its placed side ([`Placed`]), caches of `o.ctx`
     /// rows — the plan's context — and the ubatch arena of the placed
-    /// ubatch ([`placed_open`]; `o.ubatch` is not read) held to the bytes
-    /// the plan counts ([`GpuModel::placed_arena_bytes`]). Refused
+    /// ubatch ([`placed_open`]) held to the bytes the plan counts
+    /// ([`GpuModel::placed_arena_bytes`]); the checkpoints' spacing
+    /// ([`checkpoint_every`]) is the one part that reads `o.ubatch`. Refused
     /// by name as [`GpuModel::open`] refuses, for a plan of another context,
     /// and as the placed side refuses ([`Placed::new`]).
     pub fn open_placed(
@@ -1007,6 +1019,7 @@ impl GpuModel<Body35> {
         host: HostCfg,
     ) -> Result<GpuModel<Body35>, GpuError> {
         const WHAT_P: &str = "qwen35moe GpuModel::open_placed";
+        let asked = o.ubatch;
         let o = placed_open(o);
         let n_layers = block_count(&file, WHAT_P)?;
         if u64::try_from(o.ctx).ok() != Some(plan.ctx_max) {
@@ -1057,7 +1070,7 @@ impl GpuModel<Body35> {
                     set,
                     arch: "qwen35moe",
                 };
-                Body35::build(gpu, w, pre, o, Some((open, counted)))
+                Body35::build(gpu, w, pre, o, asked, Some((open, counted)))
             },
         )
     }
@@ -1071,19 +1084,23 @@ impl Body35 {
         for (l, layer) in pre.layers.iter().enumerate() {
             join_ffn(gpu.stream(), w, layer, l)?;
         }
-        Body35::build(gpu, w, pre, o, None)
+        Body35::build(gpu, w, pre, o, o.ubatch, None)
     }
 
     /// The body over the resident weights `w` of `pre`'s description: the
     /// stores, the arenas, the kernels and the prompt image; on a placed
     /// load (`placed`: its placed side's inputs and the arena bytes its plan
     /// counts) the ubatch arena held to what the plan counts, not to the
-    /// card's free bytes, and the placed side ([`Placed::new`]).
+    /// card's free bytes, and the placed side ([`Placed::new`]). The
+    /// checkpoints' spacing is the ubatch size the load was asked for
+    /// (`asked`: [`checkpoint_every`]), whether or not a placed load walks
+    /// its prompt at it.
     fn build(
         gpu: &Gpu,
         w: &Weights,
         pre: Pre35,
         o: Open35,
+        asked: usize,
         placed: Option<(PlacedOpen<'_>, u64)>,
     ) -> Result<Body35, GpuError> {
         let Pre35 {
@@ -1119,7 +1136,12 @@ impl Body35 {
             })
             .flatten()
             .collect();
-        let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?;
+        let ckpt = Checkpoints::new(
+            gpu.context(),
+            lens,
+            HOST_BUDGET,
+            checkpoint_every(asked, &d)?,
+        )?;
         let s = Arena::with(stream, d, 1, forms)?;
         let sp = StepParams::new(stream, true)?;
         let a = Arena::with(stream, d, MAX_PASS_ROWS, forms)?;
@@ -1159,6 +1181,7 @@ impl Body35 {
             held: 0,
             ckpt,
             marks: false,
+            prompt_walks: 0,
         })
     }
 
@@ -1236,6 +1259,15 @@ impl Body35 {
     #[must_use]
     pub fn takes_checkpoints(&self) -> bool {
         self.marks
+    }
+
+    /// Walks the last prompt call ran ([`GpuModel::prefill_with`],
+    /// [`GpuModel::prefill_hidden`]): one a unit of the call's plans, the
+    /// count taken from the call's start. A call that fails past a walk
+    /// leaves the walks it took.
+    #[must_use]
+    pub fn prompt_walks(&self) -> usize {
+        self.prompt_walks
     }
 
     /// The marks a prompt call from `from` to `to` takes a checkpoint at:
@@ -1526,6 +1558,7 @@ impl Body35 {
         let m = tokens.len();
         self.stand_held(gpu.stream(), pos, m)?;
         let win = self.img.windows(tokens)?;
+        self.prompt_walks += 1;
         let Body35 {
             eps,
             plans,
@@ -1677,6 +1710,7 @@ impl GpuModel<Body35> {
                 ));
             }
             super::refuse_past_vocab(WHAT_P, tokens, body.vocab)?;
+            body.prompt_walks = 0;
             body.takes_checkpoints()
         };
         let marks = if marked {
@@ -1769,6 +1803,7 @@ impl GpuModel<Body35> {
                 ));
             }
             super::refuse_past_vocab(WHAT_H, tokens, body.vocab)?;
+            body.prompt_walks = 0;
             body.img.write(gpu.stream(), tokens, pos0)?;
             body.u.dims.hidden
         };
