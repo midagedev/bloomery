@@ -257,8 +257,10 @@ impl GpuModel<Body> {
 
     /// Eagerly run block 0's step for `token` at `pos` (`pos + 1` live keys,
     /// rows `0..pos` already in the cache — this call appends row `pos`) and
-    /// read every tap back. Synchronizes; gate/debug use.
+    /// read every tap back. Synchronizes; gate/debug use. A poisoned model
+    /// refuses it until [`GpuModel::reset`].
     pub fn step_block0_taps(&mut self, token: u32, pos: u32) -> Result<Block0Taps, GpuError> {
+        self.refuse_if_poisoned("GpuModel::step_block0_taps")?;
         self.check_pos(pos, "GpuModel::step_block0_taps")?;
         self.refresh_params(token, pos)?;
         let (gpu, w, body) = self.block0_parts("GpuModel::block0")?;
@@ -337,13 +339,16 @@ impl GpuModel<Body> {
     /// Eagerly run layer `l`'s step for the input residual `x_in` at `pos`
     /// (`pos + 1` live keys, rows `0..pos` already in that layer's cache —
     /// this call appends row `pos`) and read every tap back. Synchronizes;
-    /// gate/debug use.
+    /// gate/debug use. A poisoned model refuses it until
+    /// [`GpuModel::reset`]; it does not read the fault word, so a fault it
+    /// raises is the next readback's.
     pub fn step_layer_taps(
         &mut self,
         l: usize,
         x_in: &[f32],
         pos: u32,
     ) -> Result<LayerTaps, GpuError> {
+        self.refuse_if_poisoned("GpuModel::step_layer_taps")?;
         self.check_pos(pos, "GpuModel::step_layer_taps")?;
         self.set_layer_input(x_in)?;
         self.refresh_params(0, pos)?;
@@ -366,8 +371,10 @@ impl GpuModel<Body> {
     }
 
     /// Refresh the step parameters for `(x_in, pos)` and replay the captured
-    /// layer graph. Synchronizes.
+    /// layer graph. Synchronizes. A poisoned model refuses it until
+    /// [`GpuModel::reset`].
     pub fn replay_layer(&mut self, l: usize, x_in: &[f32], pos: u32) -> Result<(), GpuError> {
+        self.refuse_if_poisoned("GpuModel::replay_layer")?;
         self.check_pos(pos, "GpuModel::replay_layer")?;
         self.layer_slot(l, "GpuModel::replay_layer")?;
         self.set_layer_input(x_in)?;

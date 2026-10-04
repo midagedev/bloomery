@@ -845,10 +845,12 @@ impl<B: ChainBody> GpuModel<B> {
     /// weights, the arena and any captured chain stay (they do not depend on
     /// the cache contents). It rewinds the selected slot's sequence
     /// ([`ChainBody::reset`] sees the live one alone); the parked slots keep
-    /// their positions and stores. It lifts a fault only when the selected
-    /// slot is the one that faulted — a reset of another slot rewinds it and
-    /// leaves the fault standing; a caller that must not continue past one
-    /// checks [`GpuModel::poisoned`] first.
+    /// their positions and stores. It clears the fault word and the poison
+    /// when the selected slot is the one that faulted or no other slot is
+    /// parked — a one-slot model's reset clears a word whatever raised it; a
+    /// reset of another slot rewinds it and leaves the fault standing, a
+    /// raised word no call recorded included. A caller that must not continue
+    /// past one checks [`GpuModel::poisoned`] first.
     ///
     /// A residency machine's map stays where use has taken it
     /// ([`GpuModel::residency_reset`] is the explicit call).
@@ -856,11 +858,13 @@ impl<B: ChainBody> GpuModel<B> {
         // The body owns its row store, so it owns what "empty" means there.
         self.body.reset(&self.gpu)?;
         // Empty caches hold nothing a fault condemned — on the slot whose
-        // fault it was ([`SlotFault`]).
-        if self
-            .poisoned
-            .as_ref()
-            .is_some_and(|p| p.slot == self.selected)
+        // fault it was ([`SlotFault`]), and on a model with no parked slot,
+        // whose word no other sequence can have raised.
+        if self.parked.is_empty()
+            || self
+                .poisoned
+                .as_ref()
+                .is_some_and(|p| p.slot == self.selected)
         {
             self.gpu.clear_fault()?;
             self.poisoned = None;
@@ -1093,9 +1097,10 @@ impl<B: ChainBody> GpuModel<B> {
         }
     }
 
-    /// A step on a poisoned model is refused, naming the fault — and, once
-    /// the model serves more than one slot, the slot it was live on.
-    fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
+    /// A step, or a gate/debug instrument's call, on a poisoned model is
+    /// refused, naming the fault — and, once the model serves more than one
+    /// slot, the slot it was live on.
+    pub(crate) fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
         match &self.poisoned {
             None => Ok(()),
             // The one-sequence refusal stays the load's own: no other slot
