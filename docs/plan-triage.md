@@ -119,19 +119,29 @@
 
 ## 열린 항목 — 받을 라운드별
 
-### 0.2.1 진행 (10-04 저녁, 리드 — 웨이브 1 여섯 트랙 병렬, 착지: q38ctx 5d5b2a6d · placectx ded96616 · gatedebt 75d70794 · glmctx 5bb0b045 · cleanup 9110b7d4 · kvq8 1/3 00034f5c)
+### 0.2.1 준비 회차 (10-03~04, 리드 — 출시는 사용자 결정으로 **보류**, 아래 「보류 시점」이 재개 조건)
 
-- **좌석 ctx 전면 착지**: qwen3 통짜(7fab4e21)·placed 폴백(placectx, 바닥 expert 분할 유지 최대)·qwen38 fit 마진(4096→40,704)·glm(2048→16,384, 공유 소유자 serve_seats::ctx). GLM 기본 P=0은 이미 기본이었고 게이트 핀만 없었다(glmctx가 핀 착지, 뮤턴트 red).
-- **게이트 빚 5절 닫힘**(gatedebt); q38sel 풀 합은 이미 착지된 낡은 줄이었다(f6a62a52).
-- **cleanup 7항목**: stub 실패 원인은 머신 전체 pgmajfault 환경 노이즈(임대 없는 stub의 판독) — ds41/qwen3moe 설계로 수선.
-- **kvq8 3조각 중 1번 착지**(형식+양자화 append, add-class 증명). 2번(읽기 경로) 진행 중, 3번(레버 배선 --cache-type-k) 대기.
-- **탄성 --parallel + qwen38 MTP 재결합 착지 (parwave, 10-04, `88b0c888`)**: 기본 슬롯 = min(4, 1+park/state 예산) (`budget` 규칙; 플래그는 상한 `flag`; qwen3은 Park::Ids에 바이트 예산이 없어 고정 2 유지, 이유 한 줄), 서버의 `parallel` 줄이 규칙·슬롯·park·state·상한을 이름. qwen38 좌석 `--parallel`+`--park-ram` (드래프트 park/unpark, resume이 드래프트를 끄지 않음; Seq38의 Wrote/Held 위치 기록, verify·드래프트 스토어 꼬리 clamp 둘). 뮤턴트 4종 red. 리드 배치: qwen3-serve·qwen4exp-e2e·gates-lib·ds41-bind rc 0.
-- **parwave가 발견해 넘긴 serve측 슬롯 경합 (S, 미수선)**: 슬롯 ≥2에서 이전 요청의 슬롯 해제보다 먼저 온 요청이 LRU로 안 쓴 슬롯을 가져가고, 슬롯 주소 `erase`가 다른 슬롯의 남은 것을 지운다 — 프롬프트 캐시가 더 긴 축자 상태를 줄 수 있다 (ids는 무스위치 실행과 동일로 검증됨). 게이트들은 glm 관례대로 `--parallel 1`로 고정. lane-X qwen38-serve 흔들림과 닿을 수 있다 [유도].
-- **웨이브 2·thinkcap 전원 착지 (10-04, 리드)**: smallfix `421050a1`(bp 손익의 임대 A/B 카드 명명·/slots 낡은 줄 삭제) · jitovl `d4d5bc2d`(번들 JIT 업로드 옆 스레드, KEEP — 측정 손익 0, 드라이버가 same-context 업로드와 JIT 컴파일을 직렬화한다는 것이 발견, ledger #37; unsafe 핀 1579/160 합산, ptx-scan 표 동일 551+406행 재증명, 게이트 8 초록) · thinkcap `2ff186a1`(`reasoning_budget` 요청 필드 — budget 절 6/6 PASS, 유일 빨강은 아래 props 센서스 사례) · kvq8-3 `28ff8c03`(레버 BLOOMERY_QWEN3_KV + `--cache-type-k`, 예산 17/16 B/value 전 경로, 자동 ctx f16 49152 → q8_0 92160 = **1.875×** 기능 실측 3090; 119 게이트 초록, 뮤턴트 4, ptx-scan 396행 동일; A6000에선 둘 다 261120에 닿어 성장 관계가 공소하니 17/32 계획항 핀이 뮤턴트를 죽는다).
-- **`gate-gpu-qwen4exp-mtp` base 빨강 (S, 10-04 kvq8-3이 분리 — 현재 main `28ff8c03`에서도 빨강)**: `Mtp38: rows 0..8 of the Pass arena as positions 55..63 for a walk from 56: the arena holds positions 56..64` — walk 시작의 경계 off-by-one 버그 후보. parwave(qwen38 MTP 재결합, `88b0c888`)가 이 게이트를 착지 배치에서 안 돌렸고(Seq38 꼬리 clamp 둘이 이 문자와 닿는다) a5d233be에서도 빨강이었다. 0.2.1의 qwen38 MTP 기능이 닿는 경로라 출시 전 한번 보는 것이 좋다.
-- **`reasoning_budget` 요청 필드 (thinkcap, 10-04 발사 — kvq8-3 대기 중 리드 설계)**: llama-server `--reasoning-budget` 의미를 요청 단위로. 프롬프트가 `<think>`로 스팬을 열 때만 살고(템플릿이 이미 닫았으면 무시, llama-server와 같다), 스팬이 열린 채 생성 id가 N개(0 포함, -1/생략 = 무제한) 차면 서버가 `</think>` id를 강제로 먹여 닫는다 — 엔진 트레잇 불변(`next(last)`의 서버 소유 피드)이라 트레잇 변경 없이 `Gen::stepped`/`prompt`의 choose 가드 + advance 게이트(`left < rows`면 단보)로 구현. reasoning_effort(템플릿 위임)·`chat_template_kwargs`(enable_thinking/thinking)은 이미 있고 이것이 빠진 마지막 조각. 0.2.1 노트에 한 줄.
-- **선결 게이트 빚 둘 (cleanup의 118항목 배치가 발견, base에서도 빨강)**: `gate-ds41-place` `resolved_on_the_box_plans_as_before` — memguard의 resolved-plan free_bytes 대 정적 plan, 테스트의 strip이 device만 지움, 마지막 초록 2e0189f2 (memguard 배치가 이 게이트를 안 돌았다) · `gate-ds41-load` check v — 결정적 4 MiB 첫 드롭 잔여 vs 2 MiB 허용, 마지막 초록 f1387c99 (10-01).
-- **placectx 열린 끝**: 여유 큰 카드에선 m1형 뮤턴트(경계 무시)의 답이 정답과 우연히 같다 — 잡으려면 적재된 서버 옆 교차 센서스 비교가 필요(memguard가 피한 모양). lane-X 센서스 핀 메커니즘 가설은 [유도]로 위에 있다(glmctx 절).
+**착지 전부(main `da00c5d4`까지, 각 트랙 리드 검증 후 ff-머지·푸시·track 청소):**
+
+- **좌석 ctx 전면**: qwen3 통짜(`7fab4e21`)·placed 폴백(placectx `ded96616`, 바닥 expert 분할 유지 최대)·qwen38 fit 마진(4096→40,704)·glm(2048→16,384, 공유 소유자 serve_seats::ctx, glmctx `5bb0b045`).
+- **게이트 빚 5절 닫힘**(gatedebt `75d70794`); **cleanup 7항목**(`9110b7d4`; stub 실패는 머신 전체 pgmajfault 환경 노이즈 — ds41/qwen3moe 설계로 수선).
+- **탄성 `--parallel` + qwen38 MTP 재결합**(parwave `88b0c888`; 기본 슬롯 min(4, 1+park/state 예산), 플래그는 상한; qwen38 좌석 `--parallel`+`--park-ram`, 뮤턴트 4종 red).
+- **kvq8 3조각 완결**(형식 `00034f5c` → 읽기 `a5d233be` → 배선 `28ff8c03`): `KvPlanes`가 적재의 단일 캐시 형식 선택, 레버 `BLOOMERY_QWEN3_KV` + 좌석 `--cache-type-k q8_0|f16`(`--cache-type-v`는 이름으로 거부), 예산 17/16 B/value가 whole/placed ctx 탐색 전 경로에 — **자동 ctx f16 49,152 → q8_0 92,160 = 1.875× (기능 실측 3090)**, 계획 kv_bytes 132,120,576 → 70,189,056 B(정확히 17/32). 소유 게이트 3종 리드 재실행 초록; A6000에선 두 형식이 261,120에 닿아 성장 관계가 공소 → 17/32 계획항 핀(qwen3moe-e2e)과 resident-delta 관계(qwen3-serve)가 뮤턴트를 죽는다. 기본 전환은 별도 결정(레버 opt-in 유지).
+- **`reasoning_budget` 요청 필드**(thinkcap `2ff186a1`, kvq8-3 대기 중 리드 설계): llama-server `--reasoning-budget`를 요청 단위로 — 프롬프트가 `<think>`로 스팬을 열 때만 살고, 스팬 열린 채 생성 id N개(0 포함; -1/생략 무제한)면 서버가 `</think>` id를 강제 먹여 닫는다. 엔진 트레잇 불변(`next(last)`의 서버 소유 피드) 덕에 트레잇 변경 없이 `Gen::answer` 대체점 + advance 게이트(`left < rows`면 단보)로 구현; close가 실제 컨텍스트에 들가는 것을 ds41 좌석 절 6개가 증명(자유 실행 8 id → 9번째 강제 close → continuation이 close를 프롬프트 id로 먹인 새 실행과 같음, 후속 턴 프리픽스 유지). reasoning_effort·chat_template_kwargs에 이어 빠진 마지막 reasoning 노브.
+- **jitovl**(KEEP, `d4d5bc2d`): 번들 JIT를 적재 업로드 옆 스레드로. 측정 손익 0 — **드라이버가 same-context 업로드와 cuModuleLoadData 컴파일을 직렬화한다**는 것이 이 라운드의 실제 발견(ledger #37, cubin 페이로드가 max(JIT, load)의 길). 게이트 8 초록, ptx-scan 표 동일(551+406행, 번들 총바이트만 +151B 메타데이터 성장 — 엔트리 불변), unsafe 핀 1579/160 합산 해결.
+- **smallfix**(`421050a1`): bp 손익의 근거가 qwen38 two-card 임대 A/B(`docs/cards/q38tier-ab.card`)를 기다린다고 코드 옆에 명명, /slots 낡은 줄 삭제.
+- **출시 기계**(0.2.0 저녁~): `tools/release/publish.sh`(태그·양쪽 크레이트 버전 점검, 박스 재검증, build.sh 이름 그대로 업로드, tap 범프) · install.sh sha 수정 · container.yml actions 버전업. 채널 검증 상태는 C절 참조.
+
+**QA 클립 (toktape 0.7.1, 10-04, A6000, functional — 임대 밖 숫자):** 4/6 녹화·허브 게시 — qwen3 f16 `slot_ctx 49152` agg 42.7 tok/s [tape](https://tape.midagedev.com/r/aay2zmi5njm5pgx2dk32) · **qwen3 q8_0 `slot_ctx 92160`** agg 38.4 [tape](https://tape.midagedev.com/r/wsmcsgk2yn4mszpnysvx) (자동-ctx 1.875×가 테이프 안에서 직접 보임; 스트림당 −9%는 스칼라 q8 읽기 경로, 정식 A/B는 별도 결정) · glm place a `slot_ctx 16384` 17.9(추론 토큰 = 전체) [tape](https://tape.midagedev.com/r/43p2wqvh7f4g4zsdnqsk) · qwen38 2스트림 `slot_ctx 35840`(A6000 마진 규칙) 35.6 [tape](https://tape.midagedev.com/r/fhrkqev692cijuhen4b4). 미녹화 둘: **ds41** — V4.1 9샤드 + 호스트 티어 SwapMachine 적재가 toktape 15분 대기창을 넘김(다음은 `--wait 30m` 또는 예열 서버; 서버 자체는 건강했다) · **decide** — `/v1/chat/completions`가 없는 `/v1/systemone` 와이어, `toktape decide` 동사로 찍어야 한다. 클립 스크립트가 이 회차에서 배운 것: 서버 스폰은 서브셸 `( nohup … & )`로 떼어야 ssh가 닫힌다, 정지는 `pkill -x bloomery-serve`(패턴 `-f`는 자기 명령줄을 죽인다), 라벨은 `--tag`(`--label` 없음), decide 좌석엔 `--parallel` 플래그 자체가 없다, ds41 파일은 V4.1-Flash(Q3_K_M 9샤드)이지 V4-Flash가 아니다(258 피처 이름 거부가 올바르게 동작).
+
+**보류 시점 (10-04, 사용자 결정 — 재개 조건):** 컷 직전까지 와 있었다(양쪽 크레이트 범프 → `just release-build` → `publish.sh` → 태그만 남음). 재개 전에 볼 것: 아래 qwen4exp-mtp 빨강(0.2.1의 qwen38 MTP 경로), 그리고 릴리스 노트가 인용할 A/B 카드 값(q38tier-ab 미시행).
+
+**이 회차가 남긴 열린 것:**
+- **`gate-gpu-qwen4exp-mtp` base 빨강 (S)**: `Mtp38: rows 0..8 of the Pass arena as positions 55..63 for a walk from 56: the arena holds positions 56..64` — walk 시작의 경계 off-by-one 버그 후보. parwave가 착지 배치에서 이 게이트를 안 돌렸고(Seq38 꼬리 clamp 둘이 이 문자와 닿는다) a5d233be에서도 빨강. **0.2.1의 qwen38 MTP 기능이 닿는 경로라 출시 전 검토 권고.**
+- **`props_engine_bytes_are_the_plans` 센서스 빨강(셋째 사례, B절)**: live free-bytes 배치 vs 게이트의 정적 plan_gate 숫자 ~300 MB 어긋남. `weekly-gpu-ds41-serve`의 `&&` 사슬을 끊어 draft·bp 팔을 못 돌게 한다.
+- **parwave의 serve측 슬롯 경합 (S, 미수선)**: 슬롯 ≥2에서 이전 요청의 해제보다 먼저 온 요청이 LRU로 안 쓴 슬롯을 가져가고 슬롯 주소 `erase`가 다른 슬롯의 남은 것을 지운다(ids는 무스위치 실행과 동일로 검증됨). 게이트들은 `--parallel 1`로 고정.
+- **선결 게이트 빚 둘 → 닫힘**: `gate-ds41-place`(테스트 strip이 free_bytes/held_by도 지우게, `f9c366ea`) · `gate-ds41-load` check v(jitonce 유지 모듈의 4 MiB 첫 드롭을 PIN(2026-10-04) `2×PINNED_GRANULE`로) — jitovl 착지 배치가 둘 다 초록으로 재확인.
+- **placectx 열린 끝**: 여유 큰 카드에선 m1형 뮤턴트의 답이 정답과 우연히 같다 — 적재된 서버 옆 교차 센서스 비교가 필요.
 
 ### 다음 릴리즈 백로그 (10-04 수집, 리드 — 0.2.0·설치 채널 뒤의 열린 것을 한 곳에; 중복 줄은 아래 각절이 주인)
 
