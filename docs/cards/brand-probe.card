@@ -1,0 +1,8 @@
+# The promo film's generation probe: two LTX-2.5 furnace shots (distilled, 1024x1024, 121 frames) and three YuE2
+# instrumental takes, through the box's own take runners (ltx-take.sh, music-take.sh). Not a measurement: no row is
+# taken, nothing is predicted.
+kind: exclusive
+reason: a 22B video model on the A6000 (about 27 GB VRAM, 40 GB host RSS) and a 7 GB music model; a gate or a timed
+  run beside it would share the card and the host memory; why now: the user approved the box for the release promo
+  film (2026-10-04)
+minutes: 15..25
