@@ -382,6 +382,50 @@ impl Mtp38 {
         };
         Ok((plane(&self.store.k)?, plane(&self.store.v)?))
     }
+
+    /// The store's rows `rows` (`store_host`'s position-major shape, both
+    /// planes) at positions `0..n` put back, the store counted at `n`: the
+    /// side of a sequence state adopted by a put-back
+    /// (`Body38::put_draft_rows`). Refused by name when the rows do not
+    /// cover `n` positions. Blocking.
+    pub(super) fn adopt_store(
+        &mut self,
+        stream: &CudaStream,
+        n: usize,
+        rows: &(Vec<u16>, Vec<u16>),
+    ) -> Result<(), GpuError> {
+        let want = n * geo::N_KV * geo::HEAD;
+        if n > self.ctx || rows.0.len() != want || rows.1.len() != want {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the store's rows at 0..{n} of a store of {}: {} and {} values",
+                    self.ctx,
+                    rows.0.len(),
+                    rows.1.len()
+                ),
+            ));
+        }
+        let (ctx, head) = (self.ctx, geo::HEAD);
+        let plane = |rows: &[u16], buf: &mut DeviceBuffer<u16>| -> Result<(), GpuError> {
+            let mut all = buf.to_host_vec(stream)?;
+            for p in 0..n {
+                for kv in 0..geo::N_KV {
+                    let at = (p * geo::N_KV + kv) * head;
+                    let to = (kv * ctx + p) * head;
+                    all[to..to + head].copy_from_slice(&rows[at..at + head]);
+                }
+            }
+            buf.copy_from_host(stream, &all)?;
+            Ok(())
+        };
+        plane(&rows.0, &mut self.store.k)?;
+        plane(&rows.1, &mut self.store.v)?;
+        if let Some(a) = self.a.as_mut() {
+            a.held = n;
+        }
+        Ok(())
+    }
 }
 
 /// A Q8_0 weight's two planes' device addresses; `None` for another format.
@@ -540,6 +584,79 @@ pub enum TargetRows {
     Ubatch,
 }
 
+/// The positions a target arena's rows hold, row `r` position `first + r`:
+/// what the call that last wrote the arena left there, less the positions a
+/// cut took back since. No rows: the arena holds no position of the
+/// sequence. A walk that reads an arena names the positions its rows must
+/// hold ([`MtpHidden::Target`]); without this record it would read a stale
+/// arena silently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held38 {
+    first: u32,
+    rows: u32,
+}
+
+impl Held38 {
+    /// No position.
+    pub const NONE: Held38 = Held38 { first: 0, rows: 0 };
+
+    /// Rows `0 .. rows` at positions `first ..`.
+    #[must_use]
+    pub const fn at(first: u32, rows: u32) -> Held38 {
+        Held38 { first, rows }
+    }
+
+    /// The positions from `pos` on taken back.
+    pub(super) fn cut(&mut self, pos: u32) {
+        self.rows = self.rows.min(pos.saturating_sub(self.first));
+    }
+
+    /// The rows it holds, and the first position they hold.
+    #[must_use]
+    pub const fn parts(self) -> (u32, u32) {
+        (self.first, self.rows)
+    }
+
+    /// Whether rows `row .. row + m` hold positions `at .. at + m`.
+    #[must_use]
+    pub const fn holds(self, row: usize, m: usize, at: u32) -> bool {
+        row + m <= self.rows as usize && self.first as usize + row == at as usize
+    }
+
+    /// The positions held, for a refusal's words.
+    fn shown(self) -> String {
+        match self.rows {
+            0 => "no position".to_string(),
+            r => format!("positions {}..{}", self.first, self.first + r),
+        }
+    }
+}
+
+/// What a sequence state carries of the draft beside the target's own
+/// stores ([`Body38::draft_rows`]): the store's K and V rows below its
+/// `held` positions ([`Mtp38::held`], position-major as `store_host`
+/// gathers them), and the step's and the pass's arena rows with the
+/// positions they hold ([`Held38`]) — the target's hidden rows a draft's
+/// waiting rows read when it rejoins the sequence. The ubatch walk's rows
+/// are not carried: after a resume that arena holds no position, and a walk
+/// that names it is refused.
+#[derive(Clone, Debug)]
+pub struct DraftRows38 {
+    pub(super) held: u32,
+    pub(super) store: (Vec<u16>, Vec<u16>),
+    pub(super) step: (Held38, Vec<f32>),
+    pub(super) pass: (Held38, Vec<f32>),
+}
+
+impl DraftRows38 {
+    /// The host bytes it holds.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        (self.store.0.len() + self.store.1.len()) * size_of::<u16>()
+            + (self.step.1.len() + self.pass.1.len()) * size_of::<f32>()
+    }
+}
+
 /// A walk's rows.
 #[derive(Clone, Copy, Debug)]
 pub enum MtpFeed<'a> {
@@ -551,6 +668,15 @@ pub enum MtpFeed<'a> {
     },
     /// One row at `pos0`: the last walk's last row's token and streams.
     Own { pos0: u32 },
+}
+
+/// The target's streams a [`MtpHidden::Target`] feed copies from, and the
+/// positions its rows hold ([`Held38`]): the buffer and the record together,
+/// the body's `mtp_target` resolving both over its arenas.
+#[derive(Clone, Copy)]
+pub(super) struct Target38<'a> {
+    pub(super) buf: &'a DeviceBuffer<f32>,
+    pub(super) held: Held38,
 }
 
 /// How a walk runs.
@@ -1160,7 +1286,7 @@ impl Mtp38 {
     pub(super) fn run(
         &mut self,
         c: &MtpCtx<'_>,
-        target: Option<&DeviceBuffer<f32>>,
+        target: Option<Target38<'_>>,
         feed: MtpFeed<'_>,
         head: MtpHead,
         mode: MtpMode,
@@ -1186,7 +1312,7 @@ impl Mtp38 {
     pub(super) fn run_walk(
         &mut self,
         c: &MtpCtx<'_>,
-        target: Option<&DeviceBuffer<f32>>,
+        target: Option<Target38<'_>>,
         feed: MtpFeed<'_>,
         head: MtpHead,
         mode: MtpMode,
@@ -1251,19 +1377,40 @@ impl Mtp38 {
                     ));
                 }
                 MtpHidden::Host(_) => {}
-                MtpHidden::Target { first, .. } => {
+                MtpHidden::Target { walk, first } => {
                     let t = target.ok_or(GpuError::state(WHAT, "the target's streams to copy"))?;
-                    if (first + m) * WIDE > t.len() {
+                    if (first + m) * WIDE > t.buf.len() {
                         return Err(GpuError::shape(
                             WHAT,
                             format!(
                                 "rows {first}..{} of the target's {} streams' rows",
                                 first + m,
-                                t.len() / WIDE
+                                t.buf.len() / WIDE
                             ),
                         ));
                     }
-                    src = Some((t, first));
+                    let at = pos0.checked_sub(1).ok_or_else(|| {
+                        GpuError::shape(
+                            WHAT,
+                            format!(
+                                "the {walk:?} arena's rows for a walk at position 0: the target \
+                                 holds no row before it (a host zero row is position 0's)"
+                            ),
+                        )
+                    })?;
+                    if !t.held.holds(first, m, at) {
+                        return Err(GpuError::shape(
+                            WHAT,
+                            format!(
+                                "rows {first}..{} of the {walk:?} arena as positions {at}..{} for \
+                                 a walk from {pos0}: the arena holds {}",
+                                first + m,
+                                at as usize + m,
+                                t.held.shown()
+                            ),
+                        ));
+                    }
+                    src = Some((t.buf, first));
                 }
             }
         }
@@ -1339,7 +1486,7 @@ impl Mtp38 {
     pub(super) fn run_chain(
         &mut self,
         c: &MtpCtx<'_>,
-        target: Option<&DeviceBuffer<f32>>,
+        target: Option<Target38<'_>>,
         refresh: MtpFeed<'_>,
         own: usize,
         head: MtpHead,

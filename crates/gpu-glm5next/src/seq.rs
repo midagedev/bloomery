@@ -25,8 +25,13 @@
 
 use bloomery_gpu::checkpoint::saved::{Lent, SeqState, Spans};
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, pools_for};
+use bloomery_gpu::linear::KHeadMap;
+use bloomery_gpu::linear::LinearShape;
 use bloomery_gpu::{DeviceTensor, GpuError, GpuModel};
+use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use cuda_core::{CudaStream, DeviceBuffer};
+use model::arch::glm5next::place::PlanInputs;
+use models::Mixer;
 
 use super::nextn::{DraftRows, Nextn};
 use super::{Body, Store, shape};
@@ -237,4 +242,37 @@ pub fn seq_resume(m: &mut GpuModel<Body>, s: &GlmSeq) -> Result<(), GpuError> {
         Ok(false)
     })?;
     Ok(())
+}
+
+/// The host bytes a sequence state of `ctx` positions holds on the file
+/// `inputs` describes, with the NextN layer's side when the load drafts
+/// ([`GlmSeq::bytes`]'s terms at plan time, for a seat's park budget):
+/// every latent layer's rows of the positions and their pool keys (the
+/// NextN layer's store beside them under the draft), two recurrent copies
+/// of each KDA layer's committed lane and conv ring, and the draft's two
+/// arenas' rows — the step's one and the verify's two.
+#[must_use]
+pub fn seq_bytes(inputs: &PlanInputs, ctx: usize, drafts: bool) -> u64 {
+    let hp = &inputs.hp;
+    let f16 = size_of::<u16>() as u64;
+    let f32 = size_of::<f32>() as u64;
+    let mut layers = inputs.spec.layers.iter();
+    let kda = layers
+        .by_ref()
+        .filter(|l| matches!(l.mixer, Mixer::DeltaRule(_)))
+        .count();
+    let latent = layers
+        .filter(|l| matches!(l.mixer, Mixer::Latent(_)))
+        .count();
+    let positional = |n: usize| (n * (LATENT + INDEX_ROW) + pools_for(n) * INDEX_HEAD) as u64 * f16;
+    // The load's every KDA layer one shape (`body::dims_of`): heads of the
+    // head count each, the head dim the kernels'.
+    let shape = LinearShape {
+        n_k: hp.n_head,
+        n_v: hp.n_head,
+        map: KHeadMap::Tiled,
+    };
+    let recurrent = 2 * kda as u64 * (shape.state_len() + shape.ring_len()) as u64 * f32;
+    let draft = |n: usize| positional(n) + 3 * (HC_STREAMS * hp.n_embd) as u64 * f32;
+    latent as u64 * positional(ctx) + recurrent + u64::from(drafts) * draft(ctx)
 }

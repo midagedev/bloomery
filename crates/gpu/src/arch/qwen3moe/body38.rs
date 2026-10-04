@@ -82,7 +82,8 @@
 
 use super::card38::{Card38, MapCheck, Walk38};
 use super::mtp38::{
-    Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, MtpTaps, TargetRows,
+    DraftRows38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, MtpTaps,
+    Target38, TargetRows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -145,10 +146,54 @@ pub const ALLOWED: &[&str] = &[
 /// The Qwen3.8 model: one card, the skeleton over this body.
 pub type Qwen38Model = GpuModel<Body38>;
 
-/// A Qwen3.8 sequence state on the host ([`GpuModel::seq_save`]): its
-/// positional rows, the recurrent stores at its position and at the last
-/// prompt call's end, each with the PLE hash's history there.
-pub type Seq38 = SeqState<History>;
+/// A Qwen3.8 sequence state on the host ([`GpuModel::seq_save`]): the
+/// shared positional rows and recurrent stores with their PLE histories
+/// ([`SeqState<History>`]), and on a load with the draft the layer's side
+/// beside them ([`DraftRows38`]) — its store rows and the two arenas' rows,
+/// so a sequence put back after another ran drafts as if none had.
+pub struct Seq38 {
+    state: SeqState<History>,
+    draft: Option<DraftRows38>,
+}
+
+impl Seq38 {
+    /// The positions it holds.
+    #[must_use]
+    pub fn positions(&self) -> u32 {
+        self.state.positions()
+    }
+
+    /// The host bytes it holds: the shared state's and the draft side's.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.state.bytes() + self.draft.as_ref().map_or(0, DraftRows38::bytes)
+    }
+
+    /// The longest prefix of at most `n` positions a model holds right after
+    /// the state is put back ([`SeqState::keep_point`]).
+    #[must_use]
+    pub fn keep_point(&self, n: u32) -> u32 {
+        self.state.keep_point(n)
+    }
+}
+
+/// The host bytes a sequence state of `positions` positions holds on a load
+/// of `gdn` delta and `qsa` selecting layers, with the draft's side when the
+/// load carries it ([`Seq38::bytes`]'s terms at plan time, for a seat's park
+/// budget): the positional rows and two recurrent copies
+/// ([`seq_positional_bytes`], [`checkpoint_bytes`]), the draft's store rows
+/// below the same positions, and the step's and the pass's arena rows — the
+/// most a parked refresh reads.
+#[must_use]
+pub fn seq38_bytes(gdn: usize, qsa: usize, positions: usize, drafts: bool) -> u64 {
+    let shared = seq_positional_bytes(qsa, positions) + 2 * checkpoint_bytes(gdn);
+    if !drafts {
+        return shared;
+    }
+    let store = 2 * (geo::N_KV * positions * geo::HEAD * size_of::<u16>()) as u64;
+    let rows = ((1 + PASS_ROWS) * geo::STREAMS * geo::HIDDEN * size_of::<f32>()) as u64;
+    shared + store + rows
+}
 
 /// The spacing of a prompt call's inner checkpoints (`runtime::seqstate`'s
 /// marks), when the load takes them ([`Body38::set_checkpoints`]): the
@@ -575,6 +620,10 @@ pub struct Body38 {
     /// its rows' final streams sit for a caller that reads them back
     /// ([`Body38::target_streams`], [`Tapped`]).
     last_walk: TargetRows,
+    /// Each target arena's [`Held38`]: where the step, the pass (a verify's
+    /// rows too) and the ubatch walk left their rows, which a draft's walk
+    /// reads by position ([`mtp_target`]) and a sequence state carries.
+    wrote: Wrote38,
     /// A failure a gate planted for the next call.
     plant: Option<Plant>,
     /// The MTP draft layer, when the load opened one ([`Body38::open_placed_mtp`]).
@@ -1061,6 +1110,7 @@ impl Body38 {
             held: 0,
             staged: None,
             last_walk: TargetRows::Step,
+            wrote: Wrote38::default(),
             plant: None,
             mtp: None,
             residency_glue,
@@ -1186,13 +1236,14 @@ impl Body38 {
             s,
             a,
             wa,
+            wrote,
             ..
         } = self;
         let d = mtp.as_mut().ok_or(GpuError::state(
             WHAT,
             "an MTP draft (Body38::open_placed_mtp)",
         ))?;
-        let target = mtp_target(plans, [s, a, wa], feed);
+        let target = mtp_target(plans, [s, a, wa], wrote, feed);
         d.run(
             &mtp_ctx(gpu, w, k, *eps, &rope.table),
             target,
@@ -1221,13 +1272,14 @@ impl Body38 {
             s,
             a,
             wa,
+            wrote,
             ..
         } = self;
         let d = mtp.as_mut().ok_or(GpuError::state(
             WHAT,
             "an MTP draft (Body38::open_placed_mtp)",
         ))?;
-        let target = mtp_target(plans, [s, a, wa], feed);
+        let target = mtp_target(plans, [s, a, wa], wrote, feed);
         d.run_walk(
             &mtp_ctx(gpu, w, k, *eps, &rope.table),
             target,
@@ -1257,13 +1309,14 @@ impl Body38 {
             s,
             a,
             wa,
+            wrote,
             ..
         } = self;
         let d = mtp.as_mut().ok_or(GpuError::state(
             WHAT,
             "an MTP draft (Body38::open_placed_mtp)",
         ))?;
-        let target = mtp_target(plans, [s, a, wa], refresh);
+        let target = mtp_target(plans, [s, a, wa], wrote, refresh);
         d.run_chain(
             &mtp_ctx(gpu, w, k, *eps, &rope.table),
             target,
@@ -1697,6 +1750,7 @@ impl Body38 {
         self.pending = None;
         self.staged = None;
         self.held = pos;
+        self.wrote.cut(pos);
         if let Some(d) = self.mtp.as_mut() {
             d.forget();
         }
@@ -1742,6 +1796,9 @@ impl Body38 {
             .into_iter()
             .collect();
         let lane = self.lane.lane();
+        // The draft's rows read the draft's store and the arenas, none of the
+        // copies below, and `Copied`'s drop holds its borrow to the end.
+        let draft = self.draft_rows(stream, pos)?;
         let mut c = Copied::of(
             &mut self.stores,
             &mut self.ple_ring,
@@ -1753,7 +1810,7 @@ impl Body38 {
             positional,
             recurrent: &mut recurrent,
         };
-        SeqState::save(
+        let state = SeqState::save(
             stream,
             self.who.clone(),
             pos,
@@ -1761,7 +1818,131 @@ impl Body38 {
             current,
             points,
             &self.ckpt,
-        )
+        )?;
+        Ok(Seq38 { state, draft })
+    }
+
+    /// The draft's side of a sequence state at `pos` ([`DraftRows38`]);
+    /// `None` on a load without the draft: the store's rows below its
+    /// positions, and the step's and the pass's arena rows with the
+    /// positions they hold. Refused by name when the store or an arena holds
+    /// positions past `pos`. Blocking.
+    fn draft_rows(&self, stream: &CudaStream, pos: u32) -> Result<Option<DraftRows38>, GpuError> {
+        const WHAT_D: &str = "qwen4exp snapshot";
+        let Some(d) = self.mtp.as_ref() else {
+            return Ok(None);
+        };
+        let held = d.held();
+        if held > pos as usize {
+            return Err(GpuError::shape(
+                WHAT_D,
+                format!("a state at {pos} of a draft store that holds {held} positions"),
+            ));
+        }
+        let wide = geo::STREAMS * geo::HIDDEN;
+        let rows = |walk: TargetRows, most: usize| -> Result<(Held38, Vec<f32>), GpuError> {
+            let held = self.wrote.of(walk);
+            let (first, n) = held.parts();
+            let n = n as usize;
+            if n > most || n > 0 && first as usize + n > pos as usize {
+                return Err(GpuError::shape(
+                    WHAT_D,
+                    format!(
+                        "the {walk:?} arena's {} at a state of {pos} positions",
+                        held_shown(first, n)
+                    ),
+                ));
+            }
+            let mut v = self.final_streams(walk).to_host_vec(stream)?;
+            v.truncate(n * wide);
+            Ok((held, v))
+        };
+        let step = rows(TargetRows::Step, 1)?;
+        let pass = rows(TargetRows::Pass, PASS_ROWS)?;
+        Ok(Some(DraftRows38 {
+            held: u32::try_from(held).unwrap_or(u32::MAX),
+            store: d.store_host(stream, held)?,
+            step,
+            pass,
+        }))
+    }
+
+    /// Refused by name unless `d` fits this load standing at `pos`, nothing
+    /// copied: the draft loaded, its store's positions and each arena's at
+    /// or below `pos`, each arena's rows within its buffer (the step's one,
+    /// the pass's [`PASS_ROWS`]) and of the streams' width.
+    fn draft_fits(&self, d: &DraftRows38, pos: u32) -> Result<(), GpuError> {
+        const WHAT_F: &str = "qwen4exp resume";
+        if self.mtp.is_none() {
+            return Err(GpuError::shape(
+                WHAT_F,
+                "the draft's side of a state put back on a load without the draft".to_owned(),
+            ));
+        }
+        if d.held > pos {
+            return Err(GpuError::shape(
+                WHAT_F,
+                format!("a draft store of {} positions put back at {pos}", d.held),
+            ));
+        }
+        let wide = geo::STREAMS * geo::HIDDEN;
+        for (what, (held, v), rows) in [("step", &d.step, 1usize), ("pass", &d.pass, PASS_ROWS)] {
+            let (first, n) = held.parts();
+            let n = n as usize;
+            if n > rows || v.len() != n * wide || n > 0 && first as usize + n > pos as usize {
+                return Err(GpuError::shape(
+                    WHAT_F,
+                    format!(
+                        "the {what} arena's {} ({} values) put back into {rows} rows of {wide} \
+                         at position {pos}",
+                        held_shown(first, n),
+                        v.len()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `d` put back on a model that stands at `pos` ([`Body38::draft_rows`]'
+    /// rows): the draft's store holding `d`'s positions, the step's and the
+    /// pass's arenas their rows, the ubatch's none. Refused by name, as
+    /// [`Body38::draft_fits`] refuses, before any copy. Blocking.
+    fn put_draft_rows(
+        &mut self,
+        stream: &CudaStream,
+        d: &DraftRows38,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        const WHAT_P: &str = "qwen4exp resume";
+        self.draft_fits(d, pos)?;
+        let Body38 {
+            plans,
+            s,
+            a,
+            wa,
+            mtp,
+            wrote,
+            ..
+        } = self;
+        for (walk, (_, v)) in [(TargetRows::Step, &d.step), (TargetRows::Pass, &d.pass)] {
+            let len = final_streams(plans, [s, a, wa], walk).len();
+            let mut host = vec![0.0f32; len];
+            host[..v.len()].copy_from_slice(v);
+            final_streams_mut(plans, [s, a, wa], walk).copy_from_host(stream, &host)?;
+        }
+        mtp.as_mut()
+            .ok_or(GpuError::state(
+                WHAT_P,
+                "an MTP draft (Body38::open_placed_mtp)",
+            ))?
+            .adopt_store(stream, d.held as usize, &d.store)?;
+        *wrote = Wrote38 {
+            step: d.step.0,
+            pass: d.pass.0,
+            ubatch: Held38::NONE,
+        };
+        Ok(())
     }
 
     /// `s` put back on the empty model ([`SeqState::load`]): the stores
@@ -1791,7 +1972,7 @@ impl Body38 {
                 positional,
                 recurrent: &mut recurrent,
             };
-            let (cur, pts) = s.load(stream, &self.who, &mut lent, &mut self.ckpt)?;
+            let (cur, pts) = s.state.load(stream, &self.who, &mut lent, &mut self.ckpt)?;
             (cur.clone(), pts.to_vec())
         };
         let off = std::iter::once((n, &cur))
@@ -1806,6 +1987,18 @@ impl Body38 {
                     h.next_pos()
                 ),
             ));
+        }
+        match &s.draft {
+            Some(d) => self.put_draft_rows(stream, d, n)?,
+            None if self.mtp.is_some() => {
+                return Err(GpuError::shape(
+                    WHAT_L,
+                    "a state without the draft's side put back on a load with the draft (the \
+                     store layouts differ)"
+                        .to_owned(),
+                ));
+            }
+            None => {}
         }
         self.restamp(stream, lane, n)?;
         self.ple.hist = cur;
@@ -1874,6 +2067,7 @@ impl Body38 {
         };
         let before = std::mem::replace(&mut self.ple.hist, s.hist);
         self.held = s.pos + s.rows;
+        self.wrote.set(self.last_walk, s.pos, s.rows as usize);
         if let Some(tokens) = s.verify {
             self.pending = Some(Pending38 {
                 pos0: s.pos,
@@ -2584,6 +2778,54 @@ impl GpuModel<Body38> {
     }
 }
 
+/// The positions `first .. first + n`, for a refusal's words of a state's
+/// arena rows.
+fn held_shown(first: u32, n: usize) -> String {
+    match n {
+        0 => "no position".to_string(),
+        n => format!("positions {}..{}", first, first as usize + n),
+    }
+}
+
+/// Each target arena's [`Held38`]: the body's record of where the step, the
+/// pass (a verify's rows too) and the ubatch walk left their rows — what a
+/// draft's walk checks its read positions against, and a sequence state
+/// carries of the two arenas a parked refresh reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct Wrote38 {
+    step: Held38,
+    pass: Held38,
+    ubatch: Held38,
+}
+
+impl Wrote38 {
+    /// The arena `walk`'s rows hold `rows` rows at `pos ..`, as the call that
+    /// last wrote it left them.
+    fn set(&mut self, walk: TargetRows, pos: u32, rows: usize) {
+        let held = Held38::at(pos, u32::try_from(rows).unwrap_or(u32::MAX));
+        match walk {
+            TargetRows::Step => self.step = held,
+            TargetRows::Pass => self.pass = held,
+            TargetRows::Ubatch => self.ubatch = held,
+        }
+    }
+
+    /// Every arena's positions from `pos` on taken back.
+    fn cut(&mut self, pos: u32) {
+        for h in [&mut self.step, &mut self.pass, &mut self.ubatch] {
+            h.cut(pos);
+        }
+    }
+
+    fn of(&self, walk: TargetRows) -> Held38 {
+        match walk {
+            TargetRows::Step => self.step,
+            TargetRows::Pass => self.pass,
+            TargetRows::Ubatch => self.ubatch,
+        }
+    }
+}
+
 /// The streams' buffer of `walk`'s arena (the step's, the pass's, the
 /// ubatch walk's) that holds the target's hidden rows once the walk ran its
 /// head: a walk's current buffer flips once at each PLE layer past layer 0.
@@ -2601,18 +2843,40 @@ fn final_streams<'b>(
     &arena.res[cur]
 }
 
+/// [`final_streams`] mutable, for a state's arena rows put back
+/// ([`Body38::put_draft_rows`]).
+fn final_streams_mut<'b>(
+    plans: &[Layer38],
+    [s, a, wa]: [&'b mut Arena38; 3],
+    walk: TargetRows,
+) -> &'b mut DeviceBuffer<f32> {
+    let cur = plans.iter().skip(1).filter(|p| p.ple.is_some()).count() % 2;
+    let arena = match walk {
+        TargetRows::Step => s,
+        TargetRows::Pass => a,
+        TargetRows::Ubatch => wa,
+    };
+    &mut arena.res[cur]
+}
+
 /// The target's streams a [`MtpHidden::Target`] feed of a walk or a chain's
-/// refresh names, over the body's arenas.
+/// refresh names, over the body's arenas, with the positions the arena's
+/// rows hold ([`Wrote38`]): the walk refuses rows that hold other
+/// positions, or none.
 fn mtp_target<'b>(
     plans: &[Layer38],
     arenas: [&'b Arena38; 3],
+    wrote: &Wrote38,
     feed: MtpFeed<'_>,
-) -> Option<&'b DeviceBuffer<f32>> {
+) -> Option<Target38<'b>> {
     match feed {
         MtpFeed::Rows {
             hidden: MtpHidden::Target { walk, .. },
             ..
-        } => Some(final_streams(plans, arenas, walk)),
+        } => Some(Target38 {
+            buf: final_streams(plans, arenas, walk),
+            held: wrote.of(walk),
+        }),
         _ => None,
     }
 }
@@ -2928,6 +3192,7 @@ impl ChainBody for Body38 {
         if let Some(d) = self.mtp.as_mut() {
             d.forget();
         }
+        self.wrote = Wrote38::default();
         self.held = 0;
         self.staged = None;
         self.plant = None;
