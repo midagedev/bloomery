@@ -7,8 +7,24 @@
 
 # bloomery
 
-An LLM inference engine in Rust, from the HTTP server down to the CUDA kernels — and a **drop-in
-[llama-server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server)** for it.
+An LLM inference engine for mixture-of-experts models, in Rust from the HTTP server down to the CUDA
+kernels, and a **drop-in [llama-server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server)**: the
+same API and the same GGUF files.
+
+- **MoE models larger than the card.** Routed experts split between the GPU and host RAM, and the experts a
+  workload calls most move onto the card as it runs. DeepSeek-V4.1-Flash (347 GB) runs on one card with 256 GB
+  of RAM; Qwen3.6-35B fits a 12–16 GB card with `--place a`.
+- **Built around that split.** The card and the CPU work on a prompt at once, and rows kept on disk are read
+  ahead of the step. Each choice comes with the measurement that isolates it: [Why it is fast](#why-it-is-fast).
+- **Five model families:** DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B and Qwen3-30B,
+  and the decision model Clef-Flash.
+
+```sh
+brew install midagedev/tap/bloomery
+bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
+```
+
+Other ways to install: [Install](#install). What each model needs: [Hardware](#hardware).
 
 ## llama-server compatibility
 
@@ -156,18 +172,7 @@ Single-stream tok/s on the development machine (an RTX A6000 48 GB and a 32-core
 Every number comes from the runners in `tools/ref/` under the quiet-machine protocol, and every measured row,
 the other engines, and progress over time live on [rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md).
 
-Against llama.cpp, DeepSeek-V4.1-Flash `Q3_K_M` ([pull #28696](https://github.com/ggml-org/llama.cpp/pull/28696) at its fastest
-flags, 2026-09-28, [conditions and caveats](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#v41-release) — a warm
-re-measure replaces these rows):
-
-| A6000, tok/s | bloomery | llama.cpp | ratio |
-|---|---:|---:|---:|
-| decode, depth 6 | **29.66** | 22.75 | 1.304 |
-| decode, depth 4096 | **30.04** | 21.78 | 1.379 |
-| prompt, P = 512 | **190.6** | 104.9 | 1.817 |
-| prompt, P = 4096 | **358.4** | 76.5 | 4.68 |
-
-On this machine, today's defaults ([per-row conditions in rig-log](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md)):
+Today's defaults ([per-row conditions in rig-log](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md)):
 
 | Model | Decode | Prompt |
 |---|---|---|
@@ -181,19 +186,26 @@ On this machine, today's defaults ([per-row conditions in rig-log](https://githu
 A first start compiles the GPU code for the card (tens of seconds); later starts take seconds. A warm V4.1
 load takes about 16 s.
 
-## How it works
+**Other engines.** The bench page also holds rows measured side by side with llama.cpp, mistral.rs and
+exllamav3 on the same card in the same window, each with its build and flags; on some rows bloomery is ahead
+and on some it is behind. They are not a claim about the other engines: each ran at the fastest flags we found,
+which is not a proof of its best, and some rows did not hold both engines to the same conditions: in the
+V4.1 rows of 2026-09-28, llama.cpp read the engram table cold on new prompt ids while bloomery's prompt repeated
+one ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#v41-xeng)). If you know faster flags for a row, please open an issue.
 
-- More than 200 CUDA kernels, all written in Rust with [cuda-oxide](https://github.com/NVIDIA/cuda-rust)
-  ([how](docs/cuda-oxide.md)).
-- Experts on the GPU and the AVX2 CPU in one CUDA graph step; V4.1's batched prompts leave the state of one
-  step per token, bit for bit.
-- Adaptive residency: routed experts move between the card and the host by the engine's own routing as it
-  runs; V4.1's engram table is read from NVMe, 48 rows a token, prefetched by a helper thread.
-- Speculative decoding with greedy output unchanged: DSpark for V4.1 (the draft on a second card), the MTP
-  head for Qwen3.8 and GLM-5.3.
-- Prompts run batched — V4.1 in batches of up to 512 positions with two in flight so the card and the CPU
-  overlap, the Qwens through an int8 tensor-core GEMM in ubatches of up to 4096 tokens.
-- A load streams the file's bytes to the card through a pinned ring with one sync.
+## Why it is fast
+
+Each point names the measurement that isolates it: the same engine, or a bench of that one path, with and
+without that one choice, on the development machine. A point with no such measurement carries no number. The language is not one of the reasons: the
+kernels are Rust (274 of them, through [cuda-oxide](https://github.com/NVIDIA/cuda-rust),
+[how](docs/cuda-oxide.md)), but the speed comes from the choices below.
+
+- **Experts move to where they are used.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and
+  swap routed experts between the card and the host between steps; a prompt call streams its hottest host
+  experts onto the card, so decode starts warm. V4.1 `Q3_K_M`, 96 decode steps after a 512-token prose prompt:
+  29.48 tok/s with it off, 35.70 with the swap rule, 43.86 with the prompt call's streaming as well (the
+  default). The card served 18 % of the routed calls with it off; with streaming it served 57 % over the first
+  16 steps and 71 % over the last 16 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#residency-clip)).
 
 <p align="center">
   <a href="https://github.com/midagedev/rig-log/blob/main/assets/residency-explainer-v5.mp4">
@@ -201,10 +213,34 @@ load takes about 16 s.
   </a>
 </p>
 
-Adaptive residency on one A6000, V4.1 `Q3_K_M`, 96 decode steps after a 512-token prose prompt: 29.48 tok/s
-with it off, 35.70 with the swap rule, 43.86 with the prompt call's streaming as well (the default). The card
-served 18 % of the routed calls with it off; with streaming it served 57 % over the first 16 steps and 71 %
-over the last 16 ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#residency-clip)).
+- **The card and the CPU work on a prompt at once (V4.1).** A prompt runs in batches of up to 512 positions:
+  every routed expert a batch calls is read once for the whole batch. Batching took P = 512 from 30.7 to
+  91 tok/s against one position at a time ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#ds41batch-pp)). Two batches stay in
+  flight, layer first, so the card routes and attends one while the CPU runs the other's host experts: 1.20×
+  at P = 4096, the host's wait for routes falling from 17.8 to 0.8 ms per layer-batch
+  ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-26.md#prefillgroup-ab)). A batched prompt leaves the same state as one step per
+  token, bit for bit.
+- **Qwen prompts as tensor-core matrix products.** The Qwens' prompt weights and routed experts run as grouped
+  int8 tensor-core GEMMs: P = 4096 went from 357 tok/s (eight positions a pass) to 2,615
+  ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#qwen3prefill-ab)). A prefill-only flash attention kernel, where a block owns 64
+  query rows and loads each 64-key tile once, then took it 2.12× further
+  ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#q3pflash-ab)), and ubatches of 4096 tokens instead of 512 another 1.35×
+  ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-25.md#q3ubatch-ab)).
+- **Disk rows read ahead of the step (V4.1).** V4.1's engram table (195 GiB) stays on NVMe, and every token
+  reads 48 scattered rows. In a bench of that path, read on demand from a cold cache they took 4.69 ms a token;
+  with the next token's read-ahead issued early, 0.31 ms ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-22.md#p-the-engram-path-costs-a-third-of-a-millisecond-and-it-is-syscalls)).
+- **CPU experts at memory speed.** AVX2 kernels take the dot products on the quantized weights as stored, and
+  a step's host experts go out as 82 grouped dispatches on a pinned worker pool instead of 720 per-matrix
+  ones. In a bench of that leg on an earlier V4.1 file: 31.1 ms against 35.5 ms for the same bytes, at 130 GB/s of the machine's 148
+  ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-23.md#v41-host-leg)). The kernels are not faster than ik_llama.cpp's on one core;
+  the leg is bound by memory.
+- **One CUDA graph a decode step, the CPU experts inside it.** Where experts run on the host, the card waits on
+  a counter in pinned memory that the CPU workers write, not on a host synchronization. Not isolated by a
+  measurement on today's models.
+- **Speculative decoding** with greedy output unchanged: DSpark for V4.1 (the draft on a second card), the MTP
+  head for Qwen3.8 and GLM-5.3.
+- **Loads stream through a pinned ring** with one sync: a warm V4.1 load went from 36.3–36.6 s to 15.9–16.6 s
+  ([rig-log](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#v41-load-upload)).
 
 ## How it is verified
 
@@ -287,8 +323,8 @@ generate, serve, and `--place gate` on a single RTX 3090). In short: Linux x86-6
 
 ## More
 
-- How bloomery uses cuda-oxide: [`docs/cuda-oxide.md`](docs/cuda-oxide.md). Plan and cost models:
-  [`docs/plan.md`](docs/plan.md); GPU design: [`docs/gpu-design.md`](docs/gpu-design.md).
+- How bloomery uses cuda-oxide: [`docs/cuda-oxide.md`](docs/cuda-oxide.md). Every other page, reference and
+  working records: [`docs/README.md`](docs/README.md).
 - Measurements and command lines: [rig-log](https://github.com/midagedev/rig-log) (Korean).
 - Recorded sessions, not benchmark rows: [V4.1 on two cards answering a coding
   review](https://tape.midagedev.com/r/6w4t9r5nqwtt5c9sagn3); [GLM-5.3's server at its
