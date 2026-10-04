@@ -59,8 +59,10 @@
 //!   the target's streams at position `q` lie within [`FREE_BAND`] of ik's
 //!   warmup hidden row at position `q + 1` — ik's MTP row `p` reads the
 //!   target's hidden of `p − 1` — and that shift reads closer than 0 or 2;
-//!   a draft walk fed the target's streams in place equals one fed them from
-//!   the host, bit for bit.
+//!   a draft walk from the position after the prompt's last unit's first,
+//!   its rows reading the unit's arena rows in place, equals one fed them
+//!   from the host, bit for bit (a walk error here is a FAIL line, not the
+//!   gate's end).
 //! - (g) a captured walk equals the eager walk over the same rows, bit for
 //!   bit — tokens, probabilities, streams, logits — at 1 to 4 rows with the
 //!   list head and at 1 row with the full head, each capture of
@@ -77,7 +79,11 @@
 //!   `MTP_STORE_ROWS` rows, read back or chained, and the own row and the
 //!   streams after one — and a NaN in a
 //!   hidden row raised on the fault word as the draft layer's `hc_mix`, the
-//!   walk's error.
+//!   walk's error; and a walk that reads the target's arenas by position
+//!   (`MtpHidden::Target`): after the prompt by passes, one that reads the
+//!   position before the Pass arena's first, one past its last row and one
+//!   that starts its rows at the wrong arena row are each refused by name
+//!   with the positions the arena holds, and the walk the arena holds runs.
 //! - (s) the store walks: over a prompt's rows fed the target's hidden rows
 //!   from the host (position 0 beside a zero row, each later position beside
 //!   the row of the one before it), store walks in runs of three leave each
@@ -110,6 +116,17 @@
 //!   sequence: the draft joins at the call's start and drafts with the plain
 //!   run's ids, and restarted beside the held sequence it skips the next
 //!   call by name, proposing nothing, the ids still the plain run's.
+//! - (p) a partial accept's records: the commit of a verify that kept fewer
+//!   rows than it ran cuts the draft's records to the kept rows — after a
+//!   drafted run the draft store's count stands at the model's position, a
+//!   snapshot there holds exactly the accepted rows, a store walked past the
+//!   position (an anchor row) makes the snapshot refused by name, and after
+//!   a scripted window that keeps 2 of its 4 rows the pass arena's rejected
+//!   row is refused by name for a walk that reads it (the uncut record
+//!   would let the walk run).
+//! - (x) a resume of a state whose draft side the load does not take (a
+//!   state of a load without the draft) is refused by name with the model
+//!   untouched: its stores, position and draft store unchanged.
 //!
 //! (l) and (h) hold at least one row each off a flip: a run that excuses
 //! every row as a flip fails.
@@ -1303,7 +1320,7 @@ mod gate {
     /// rows, and a draft walk fed them in place against one fed them from the
     /// host.
     fn pairing(m: &mut Qwen38Model, prompt: &[u32], warm: &IkGraph) -> Result<bool, GateError> {
-        m.prompt38(prompt, Prompt38::Pass)?;
+        let next = m.prompt38(prompt, Prompt38::Pass)?;
         let n = prompt.len();
         let rows = (n - 1) % MTP_ROWS + 1;
         let first = n - rows;
@@ -1334,22 +1351,27 @@ mod gate {
             "(t) ik's row p reads the target's hidden of p − 1, within {FREE_BAND:.2}: {}",
             verdict(shift_ok)
         );
-        let tokens = &prompt[first..];
-        let pos0 = u32::try_from(first)?;
+        // The walk starts one past the arena's first position — each of its
+        // rows at q reads the hidden row at q − 1, the arena's rows 0..rows
+        // (the prompt's last unit's rows, `first` on) — and runs one row past
+        // the prompt's end, the prompt's own next id its last token.
+        let mut tokens = prompt[first + 1..].to_vec();
+        tokens.push(next);
+        let pos0 = u32::try_from(first + 1)?;
         let host = walk(
             m,
             MtpFeed::Rows {
-                tokens,
+                tokens: &tokens,
                 pos0,
                 hidden: MtpHidden::Host(&ours),
             },
             MtpHead::Rows,
             MtpMode::Eager,
-        )?;
+        );
         let place = walk(
             m,
             MtpFeed::Rows {
-                tokens,
+                tokens: &tokens,
                 pos0,
                 hidden: MtpHidden::Target {
                     walk: TargetRows::Pass,
@@ -1358,11 +1380,17 @@ mod gate {
             },
             MtpHead::Rows,
             MtpMode::Eager,
-        )?;
-        let same = same_bits(&host, &place);
+        );
+        let same = match (&host, &place) {
+            (Ok(h), Ok(p)) => same_bits(h, p),
+            _ => false,
+        };
         println!(
-            "(t) {rows} rows fed the target's streams in place = from the host, bit for bit {}",
-            verdict(same)
+            "(t) {rows} rows from {pos0} fed the target's streams in place = from the host, bit \
+             for bit {}{}{}",
+            verdict(same),
+            host.err().map_or(String::new(), |e| format!(" ({e})")),
+            place.err().map_or(String::new(), |e| format!(" ({e})")),
         );
         Ok(shift_ok && same)
     }
@@ -1614,6 +1642,307 @@ mod gate {
             "a walk to read",
         );
         Ok(ok && raised)
+    }
+
+    /// (f): a walk that reads the target's arenas by position: after the
+    /// set's prompt by passes (the Pass arena holding its last unit's rows),
+    /// with the draft's store warmed over the prompt and its next position,
+    /// a walk that reads the position before the arena's first, one that
+    /// reads past its last row, and one that starts its rows at the wrong
+    /// arena row are each refused by name with the positions the arena
+    /// holds, and the walk the arena does hold — its rows from the position
+    /// after the arena's first, the prompt's own next id its last token —
+    /// runs.
+    fn arena_holds(m: &mut Qwen38Model, prompt: &[u32]) -> Result<bool, GateError> {
+        m.reset()?;
+        let next = m.prompt38(prompt, Prompt38::Pass)?;
+        let n = u32::try_from(prompt.len())?;
+        let rows = (prompt.len() - 1) % MTP_ROWS + 1;
+        let first = n - rows as u32;
+        // The draft's store must hold every walk's start: warm it over the
+        // prompt's rows and the position after them (store walks, the prompt
+        // call's warmup shape).
+        let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
+        m.mtp_walk(
+            MtpFeed::Rows {
+                tokens: &prompt[..MTP_STORE_ROWS.min(prompt.len())],
+                pos0: 0,
+                hidden: MtpHidden::Host(&zeros[..MTP_STORE_ROWS.min(prompt.len()) * WIDE]),
+            },
+            MtpHead::Rows,
+            MtpMode::Store,
+        )?;
+        m.mtp_walk(
+            MtpFeed::Rows {
+                tokens: &prompt[..1],
+                pos0: n,
+                hidden: MtpHidden::Host(&zeros[..WIDE]),
+            },
+            MtpHead::Rows,
+            MtpMode::Store,
+        )?;
+        fn feed(tokens: &[u32], pos0: u32, at: usize) -> MtpFeed<'_> {
+            MtpFeed::Rows {
+                tokens,
+                pos0,
+                hidden: MtpHidden::Target {
+                    walk: TargetRows::Pass,
+                    first: at,
+                },
+            }
+        }
+        let (h, e) = (MtpHead::Rows, MtpMode::Eager);
+        let mut ok = refused(
+            "the Pass arena's rows read as the position before their first",
+            m.mtp_draft(feed(&prompt[..1], first, 0), h, e),
+            &format!(
+                "as positions {}..{first} for a walk from {first}: the arena holds positions \
+                 {first}..{n}",
+                first - 1
+            ),
+        );
+        ok &= refused(
+            "the Pass arena's rows read past their last",
+            m.mtp_draft(feed(&prompt[..1], n + 1, 0), h, e),
+            &format!(
+                "as positions {n}..{} for a walk from {}: the arena holds positions {first}..{n}",
+                n + 1,
+                n + 1
+            ),
+        );
+        ok &= refused(
+            "the Pass arena's rows read as other positions",
+            m.mtp_draft(feed(&prompt[..1], first + 1, 1), h, e),
+            &format!(
+                "rows 1..2 of the Pass arena as positions {first}..{} for a walk from {}",
+                first + 1,
+                first + 1
+            ),
+        );
+        let mut tokens = prompt[first as usize + 1..].to_vec();
+        tokens.push(next);
+        let runs = m.mtp_draft(
+            MtpFeed::Rows {
+                tokens: &tokens,
+                pos0: first + 1,
+                hidden: MtpHidden::Target {
+                    walk: TargetRows::Pass,
+                    first: 0,
+                },
+            },
+            h,
+            e,
+        );
+        let runs_ok = runs.is_ok();
+        println!(
+            "(f) the walk the Pass arena holds, its {rows} rows from {}: {} {}",
+            first + 1,
+            match &runs {
+                Ok(w) => format!("ran, {} tokens", w.tokens.len()),
+                Err(err) => err.to_string(),
+            },
+            verdict(runs_ok)
+        );
+        Ok(ok && runs_ok)
+    }
+
+    /// (p): a partial accept's records and snapshot. The commit of a verify
+    /// that kept fewer rows than it ran cuts the draft's records to the kept
+    /// rows: after a drafted run the store's count stands at the model's
+    /// position, a snapshot there holds exactly the accepted rows, and once
+    /// the store walks past the position (an anchor row) the snapshot is
+    /// refused by name; after a scripted window that keeps 2 of its 4 rows
+    /// the pass arena's rejected row is a position the arena no longer
+    /// holds — a walk that reads it is refused by name, where the uncut
+    /// record would let it run.
+    fn kept_state(m: Qwen38Model, prompt: &[u32]) -> Result<(Qwen38Model, bool), GateError> {
+        const N: usize = 6;
+        const KEEP: usize = 2;
+        let ctx = m.body("kept state")?.ctx() as u32;
+        // A drafted run: the model stands after its last commit.
+        let (mut m, kept) = {
+            let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), ctx)?;
+            let first = spec.prompt(&mut s, prompt)?;
+            let mut k = Kept::default();
+            runtime::generate(
+                &mut s,
+                &mut spec,
+                prompt,
+                first,
+                &runtime::Stop::new(N, ctx)?,
+                &mut k,
+            )?;
+            (s.into_model(), k)
+        };
+        let at = m.pos() as usize;
+        let held = m.body("kept state")?.mtp().map_or(0, |d| d.held());
+        let cut = held == at;
+        println!(
+            "(p) after the drafted run's {} windows at {at}: the draft store holds {held} \
+             positions {}",
+            kept.rows.len(),
+            verdict(cut)
+        );
+        let snap = m.seq_save();
+        let snap_ok = matches!(&snap, Ok(s) if s.positions() as usize == at);
+        println!(
+            "(p) a snapshot at {at} holds exactly the accepted rows: {} {}",
+            match &snap {
+                Ok(s) => format!("{} positions, {} bytes", s.positions(), s.bytes()),
+                Err(e) => e.to_string(),
+            },
+            verdict(snap_ok)
+        );
+        // The store walked past the position — an anchor row: the state
+        // carries the rows below the position only.
+        let zeros = vec![0.0f32; WIDE];
+        m.mtp_walk(
+            MtpFeed::Rows {
+                tokens: &prompt[..1],
+                pos0: u32::try_from(at)?,
+                hidden: MtpHidden::Host(&zeros),
+            },
+            MtpHead::Rows,
+            MtpMode::Store,
+        )?;
+        let mut ok = cut && snap_ok;
+        ok &= refused(
+            "a snapshot of a store past the position",
+            m.seq_save(),
+            &format!(
+                "a state at {at} of a draft store that holds {} positions",
+                at + 1
+            ),
+        );
+        // A scripted window that keeps `KEEP` of its 4 rows: the arena's
+        // rows `KEEP` on are the rejected tail the commit takes back. The
+        // scripted drafter walks no draft, so the store is warmed over the
+        // positions first (store walks of other ids).
+        let (m, plain) = plain_run(m, prompt, Prompt38::Auto, KEEP + 2)?;
+        let (mut m, w_ok) = scripted_window(m, &plain, prompt, KEEP, ctx, "the partial accept")?;
+        let at = m.pos() as usize;
+        let pos0 = at - KEEP;
+        let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
+        let vocab = u32::try_from(m.body("kept state")?.vocab())?;
+        let ids: Vec<u32> = (0..at + 2)
+            .map(|i| (prompt[i % prompt.len()] + 1) % vocab)
+            .collect();
+        for (i, run) in ids[..at].chunks(MTP_STORE_ROWS).enumerate() {
+            m.mtp_walk(
+                MtpFeed::Rows {
+                    tokens: run,
+                    pos0: u32::try_from(i * MTP_STORE_ROWS)?,
+                    hidden: MtpHidden::Host(&zeros[..run.len() * WIDE]),
+                },
+                MtpHead::Rows,
+                MtpMode::Store,
+            )?;
+        }
+        m.mtp_walk(
+            MtpFeed::Rows {
+                tokens: &ids[at..at + 1],
+                pos0: u32::try_from(at)?,
+                hidden: MtpHidden::Host(&zeros[..WIDE]),
+            },
+            MtpHead::Rows,
+            MtpMode::Store,
+        )?;
+        ok &= w_ok;
+        ok &= refused(
+            "the pass arena's rejected row",
+            m.mtp_draft(
+                MtpFeed::Rows {
+                    tokens: &ids[..1],
+                    pos0: u32::try_from(at + 1)?,
+                    hidden: MtpHidden::Target {
+                        walk: TargetRows::Pass,
+                        first: KEEP,
+                    },
+                },
+                MtpHead::Rows,
+                MtpMode::Eager,
+            ),
+            &format!(
+                "rows {KEEP}..{} of the Pass arena as positions {at}..{} for a walk from {}: the \
+                 arena holds positions {pos0}..{at}",
+                KEEP + 1,
+                at + 1,
+                at + 1
+            ),
+        );
+        Ok((m, ok))
+    }
+
+    /// (x): a resume refused before any copy. A state of a load without the
+    /// draft (its own short prompt run) put back on this load is refused by
+    /// name — the store layouts differ — with the model untouched: its
+    /// stores still the empty model's bit for bit, its position 0, the
+    /// draft's store empty.
+    fn resume_refused(
+        m: Qwen38Model,
+        inputs: &PlanInputs,
+        levers: &bloomery_levers::Levers,
+        ub: usize,
+        prompt: &[u32],
+    ) -> Result<(Qwen38Model, bool), GateError> {
+        let machine = machine(RTX_3090, inputs.spec.layers.len(), u64::try_from(ub)?);
+        let plan_levers = PlanLevers::from_levers(levers)?;
+        let plain_plan = inputs.plan(&machine, CTX, &plan_levers)?;
+        let mut b = Body38::open_placed(
+            Split::open(MODEL)?,
+            &plain_plan,
+            inputs,
+            0,
+            levers.host(),
+            ub,
+        )?;
+        // Other ids over the same length: the state's rows differ from
+        // whatever this model's stores hold, so a copy that should not
+        // happen shows.
+        let vocab = u32::try_from(b.body("resume refused")?.vocab())?;
+        let ids: Vec<u32> = prompt.iter().map(|&t| (t + 1) % vocab).collect();
+        b.prompt38(&ids, Prompt38::Pass)?;
+        let without = b.seq_save()?;
+        drop(b);
+        let mut m = m;
+        m.reset()?;
+        let read = |m: &mut Qwen38Model| -> Result<(Vec<Store38Host>, Vec<f32>), GateError> {
+            let (gpu, _, body) = m.body_parts("resume refused")?;
+            Ok(body.stores_host(gpu)?)
+        };
+        let before = read(&mut m)?;
+        let r = m.seq_resume(&without);
+        let after = read(&mut m)?;
+        let pos = m.pos();
+        let held = m.body("resume refused")?.mtp().map_or(0, |d| d.held());
+        let stores_same = before.0.len() == after.0.len()
+            && before.0.iter().zip(&after.0).all(|(a, b)| a.same_bits(b));
+        let ring_same = before.1.len() == after.1.len()
+            && before
+                .1
+                .iter()
+                .zip(&after.1)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        let named = matches!(&r, Err(e) if e.to_string().contains(
+            "a state without the draft's side put back on a load with the draft"
+        ));
+        let untouched = stores_same && ring_same && pos == 0 && held == 0;
+        let ok = named && untouched;
+        println!(
+            "(x) a state without the draft's side put back on a load with the draft: {} — the \
+             model untouched: stores {}, position {pos}, draft store {held} {}",
+            match &r {
+                Ok(()) => "resumed".to_string(),
+                Err(e) => e.to_string(),
+            },
+            if stores_same && ring_same {
+                "same".to_string()
+            } else {
+                "changed".to_string()
+            },
+            verdict(ok)
+        );
+        Ok((m, ok))
     }
 
     /// D3K's prefill, the e2e family's deep prompt (the set's `# tokens`).
@@ -2804,8 +3133,13 @@ mod gate {
         ok &= refusals(&mut m, &warm)?;
         let (m, w_ok) = windows(m, &prompt, &deep_prompt()?)?;
         ok &= w_ok;
-        let (_, c_ok) = continued(m, &prompt)?;
+        let (mut m, c_ok) = continued(m, &prompt)?;
         ok &= c_ok;
+        ok &= arena_holds(&mut m, &prompt)?;
+        let (model, p_ok) = kept_state(m, &prompt)?;
+        ok &= p_ok;
+        let (_, x_ok) = resume_refused(model, &inputs, &levers, ub, &prompt)?;
+        ok &= x_ok;
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

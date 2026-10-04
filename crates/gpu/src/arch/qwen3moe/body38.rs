@@ -82,8 +82,8 @@
 
 use super::card38::{Card38, MapCheck, Walk38};
 use super::mtp38::{
-    DraftRows38, Held38, MTP_ROWS, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode,
-    MtpTaps, Target38, TargetRows,
+    DraftRows38, Held38, Mtp38, MtpCtx, MtpDraft, MtpFeed, MtpHead, MtpHidden, MtpMode, MtpTaps,
+    Target38, TargetRows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -1830,36 +1830,29 @@ impl Body38 {
     /// The draft's side of a sequence state at `pos` ([`DraftRows38`]);
     /// `None` on a load without the draft: the store's rows and the step's
     /// and the pass's arena rows, each the positions below `pos` — the ones
-    /// a walk can read. The store and the pass arena both hold a verify's
-    /// rejected tail past `pos` (the chain appends its proposal rows, the
-    /// verify keeps fewer): those rows are the dropped branch's, dead — no
-    /// walk reads at or past `pos`, and the next chain's appends and the
-    /// next launch overwrite them from `pos` — so each is clamped to the
-    /// rows below `pos`. Refused by name when the store holds more than a
-    /// chain's proposal rows past `pos` or an arena's rows begin at or past
-    /// it. Blocking.
+    /// a walk can read. Refused by name when the store holds positions past
+    /// `pos` or an arena's rows reach past it: a state's rows are the
+    /// positions the model stands at, and a record past them is a verify's
+    /// rejected tail or an anchor row the commit or the snapshot's caller
+    /// left standing — neither is the state's to carry. Blocking.
     fn draft_rows(&self, stream: &CudaStream, pos: u32) -> Result<Option<DraftRows38>, GpuError> {
         const WHAT_D: &str = "qwen4exp snapshot";
         let Some(d) = self.mtp.as_ref() else {
             return Ok(None);
         };
         let held = d.held();
-        if held > pos as usize + MTP_ROWS {
+        if held > pos as usize {
             return Err(GpuError::shape(
                 WHAT_D,
-                format!(
-                    "a state at {pos} of a draft store that holds {held} positions (a chain \
-                     appends at most {MTP_ROWS} past the model)"
-                ),
+                format!("a state at {pos} of a draft store that holds {held} positions"),
             ));
         }
-        let held = held.min(pos as usize);
         let wide = geo::STREAMS * geo::HIDDEN;
         let rows = |walk: TargetRows, most: usize| -> Result<(Held38, Vec<f32>), GpuError> {
             let held = self.wrote.of(walk);
             let (first, n) = held.parts();
             let n = n as usize;
-            if n > most || n > 0 && first as usize >= pos as usize {
+            if n > most || n > 0 && first as usize + n > pos as usize {
                 return Err(GpuError::shape(
                     WHAT_D,
                     format!(
@@ -1868,7 +1861,6 @@ impl Body38 {
                     ),
                 ));
             }
-            let n = n.min(pos as usize - first as usize);
             let mut v = self.final_streams(walk).to_host_vec(stream)?;
             v.truncate(n * wide);
             Ok((Held38::at(first, u32::try_from(n).unwrap_or(u32::MAX)), v))
@@ -1964,8 +1956,9 @@ impl Body38 {
     /// `s` put back on the empty model ([`SeqState::load`]): the stores
     /// stand at its positions, the committed lane stamped there, the PLE
     /// history and the points it carried the model's own. Refused by name,
-    /// nothing copied, for another model's state or onto a model that is not
-    /// empty.
+    /// nothing copied, for another model's state, a draft side the load does
+    /// not take (a state with it onto a load without the draft, or the other
+    /// way: the store layouts differ) or onto a model that is not empty.
     fn load_state(&mut self, stream: &CudaStream, s: &Seq38) -> Result<(), GpuError> {
         const WHAT_L: &str = "qwen4exp resume";
         if self.held != 0 || self.pending.is_some() || self.staged.is_some() {
@@ -1975,6 +1968,18 @@ impl Body38 {
             ));
         }
         let n = s.positions();
+        match &s.draft {
+            Some(d) => self.draft_fits(d, n)?,
+            None if self.mtp.is_some() => {
+                return Err(GpuError::shape(
+                    WHAT_L,
+                    "a state without the draft's side put back on a load with the draft (the \
+                     store layouts differ)"
+                        .to_owned(),
+                ));
+            }
+            None => {}
+        }
         let lane = self.lane.lane();
         let (cur, pts) = {
             let mut c = Copied::of(
@@ -2004,17 +2009,8 @@ impl Body38 {
                 ),
             ));
         }
-        match &s.draft {
-            Some(d) => self.put_draft_rows(stream, d, n)?,
-            None if self.mtp.is_some() => {
-                return Err(GpuError::shape(
-                    WHAT_L,
-                    "a state without the draft's side put back on a load with the draft (the \
-                     store layouts differ)"
-                        .to_owned(),
-                ));
-            }
-            None => {}
+        if let Some(d) = &s.draft {
+            self.put_draft_rows(stream, d, n)?;
         }
         self.restamp(stream, lane, n)?;
         self.ple.hist = cur;
@@ -3426,7 +3422,10 @@ impl Body38 {
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit
     /// and take the rest back: the lane word to the last kept row's lane
-    /// ([`kept_lane`]), the PLE history over the kept rows. With no verify
+    /// ([`kept_lane`]), the PLE history over the kept rows, and the MTP
+    /// draft's records — the arenas' held rows and the store's held
+    /// positions — cut to `pos`, the rejected rows no longer any walk's to
+    /// read. With no verify
     /// waiting nothing is taken at the position the stores stand at, and a
     /// position behind it is a cut to the checkpoint there ([`Body38::cut`]),
     /// as it is at or below a waiting verify's first position. What is taken
@@ -3460,6 +3459,10 @@ impl Body38 {
             self.ple.keep(p.hist, p.pos0, &p.tokens[..kept])?;
         }
         self.held = pos;
+        self.wrote.cut(pos);
+        if let Some(d) = self.mtp.as_mut() {
+            d.cut(pos);
+        }
         Ok(())
     }
 }

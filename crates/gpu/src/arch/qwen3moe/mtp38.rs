@@ -1248,6 +1248,15 @@ impl Mtp38 {
         }
     }
 
+    /// A cut of the target to `pos`: the store holds no position past it —
+    /// the rows past it belong to the branch the cut dropped, and a walk
+    /// writes its own rows' keys before its attention reads them.
+    pub(super) fn cut(&mut self, pos: u32) {
+        if let Some(a) = self.a.as_mut() {
+            a.held = a.held.min(pos as usize);
+        }
+    }
+
     /// Positions of the current sequence the store holds: a walk may start
     /// at or below it, never past it. 0 before the arena is made.
     #[must_use]
