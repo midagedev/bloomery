@@ -2285,6 +2285,196 @@ fn hw_a_reply_past_the_window_keeps_the_prompt_to_its_think() {
     assert_eq!(k2.cache_n, p1.len() - 1, "the cut is at a decode position");
 }
 
+/// A server whose every generation is the never-closing script
+/// `abcdefghijkl` then EOS (the mock's vocabulary: one id a byte, the
+/// specials single ids).
+fn think_script() -> std::net::SocketAddr {
+    common::start_with(Box::new(serve::ScriptedEngine::new(4096, "abcdefghijkl")))
+}
+
+/// A thinking-on chat of one user turn — the rendered prompt ends in
+/// `<think>` — with `extra` beside it.
+fn think_chat(extra: Value) -> Value {
+    let mut b = json!({
+        "messages": [{"role": "user", "content": "q"}],
+        "temperature": 0,
+        "max_tokens": 32,
+        "chat_template_kwargs": {"thinking": true},
+    });
+    if let (Value::Object(b), Value::Object(e)) = (&mut b, extra) {
+        b.extend(e.clone());
+    }
+    b
+}
+
+/// A never-closing script with `reasoning_budget` 4: the script's first four
+/// tokens are the reasoning, the close id is forced as the fifth taken token
+/// (the engine answer it displaces never appears), and the split consumes the
+/// tag — `</think>` shows in neither field.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_reasoning_budget_caps_the_span() {
+    let addr = think_script();
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &think_chat(json!({"reasoning_budget": 4})),
+    )
+    .json();
+    let m = &r["choices"][0]["message"];
+    let (reasoning, content) = (
+        m["reasoning_content"].as_str().unwrap_or(""),
+        m["content"].as_str().unwrap_or(""),
+    );
+    assert_eq!(reasoning, "abcd", "{r}");
+    // The script's `e` is the answer the arming step displaced; the content
+    // resumes at `f`.
+    assert_eq!(content, "fghijkl", "{r}");
+    assert!(
+        !reasoning.contains("</think>") && !content.contains("</think>"),
+        "{r}"
+    );
+    assert_eq!(r["usage"]["completion_tokens"], json!(13), "{r}");
+    assert_eq!(r["choices"][0]["finish_reason"], json!("stop"), "{r}");
+}
+
+/// `reasoning_budget` 0 closes the span before any model token: no reasoning,
+/// and the content starts at the script's second token — the first is the
+/// answer the force displaced at the prompt's step.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_reasoning_budget_zero_closes_at_once() {
+    let addr = think_script();
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &think_chat(json!({"reasoning_budget": 0})),
+    )
+    .json();
+    let m = &r["choices"][0]["message"];
+    assert!(m.get("reasoning_content").is_none(), "{r}");
+    assert_eq!(m["content"], json!("bcdefghijkl"), "{r}");
+    assert_eq!(r["usage"]["completion_tokens"], json!(13), "{r}");
+}
+
+/// Absent, `null` and `-1` are the one unrestricted spelling: identical
+/// replies, the span still open at the end keeping everything in reasoning.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_reasoning_budget_absent_null_and_minus_one_are_unrestricted() {
+    let addr = think_script();
+    let free = post(addr, "/v1/chat/completions", &think_chat(json!({}))).json();
+    for budget in [Value::Null, json!(-1)] {
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &think_chat(json!({ "reasoning_budget": budget })),
+        )
+        .json();
+        assert_eq!(
+            r["choices"][0]["message"], free["choices"][0]["message"],
+            "budget {budget}: {r}"
+        );
+        assert_eq!(
+            r["usage"]["completion_tokens"], free["usage"]["completion_tokens"],
+            "budget {budget}: {r}"
+        );
+    }
+    let m = &free["choices"][0]["message"];
+    assert_eq!(m["reasoning_content"], json!("abcdefghijkl"), "{free}");
+    assert_eq!(m["content"], json!(""), "{free}");
+}
+
+/// A value the field does not take is a 400 naming it (an integer under -1)
+/// or its type (a non-integer number, a string, a boolean), on both
+/// endpoints; `-1` and an integer-valued float serve.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_reasoning_budget_parse_errors_are_refused() {
+    let addr = start(4096);
+    for (value, named) in [
+        (json!(-2), "-2"),
+        (json!(3.5), "a number"),
+        (json!("8"), "a string"),
+        (json!(true), "a boolean"),
+    ] {
+        for path in ["/completion", "/v1/chat/completions"] {
+            let mut b = chat_body(json!({}));
+            b["reasoning_budget"] = value.clone();
+            let r = post(addr, path, &b);
+            assert_eq!(r.status, 400, "{path} {value}: {}", r.body);
+            let e = &r.json()["error"];
+            assert_eq!(e["type"], "invalid_request_error", "{path} {value}: {e}");
+            assert!(
+                e["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("reasoning_budget") && m.contains(named)),
+                "{path} {value}: the message must name the field and {named}: {e}"
+            );
+        }
+    }
+    for value in [json!(-1), json!(8.0)] {
+        let mut b = chat_body(json!({}));
+        b["prompt"] = json!("ab");
+        b["reasoning_budget"] = value.clone();
+        let r = post(addr, "/completion", &b);
+        assert_eq!(r.status, 200, "{value}: {}", r.body);
+    }
+}
+
+/// A prompt the template already closed (thinking off) silently ignores the
+/// budget, as llama-server ignores the flag when thinking is off by other
+/// means: no close id forced, the whole script the content.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_reasoning_budget_ignored_when_the_span_is_closed() {
+    let addr = think_script();
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &json!({
+            "messages": [{"role": "user", "content": "q"}],
+            "temperature": 0,
+            "max_tokens": 32,
+            "reasoning_budget": 0,
+        }),
+    )
+    .json();
+    let m = &r["choices"][0]["message"];
+    assert!(m.get("reasoning_content").is_none(), "{r}");
+    assert_eq!(m["content"], json!("abcdefghijkl"), "{r}");
+    assert_eq!(r["usage"]["completion_tokens"], json!(13), "{r}");
+}
+
+/// `/completion` carries the budget too, its prompt a string or an id array
+/// (the array decoded for the span check): the raw reply shows the forced
+/// close in place, the third taken token.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_reasoning_budget_on_a_completion_prompt() {
+    use serve::{MockTokenizer, Tokenizer};
+    let addr = think_script();
+    let close = MockTokenizer.encode("</think>");
+    assert_eq!(close.len(), 1, "the mock's vocabulary closes in one id");
+    for prompt in [json!("xy<think>"), json!(MockTokenizer.encode("xy<think>"))] {
+        let r = post(
+            addr,
+            "/completion",
+            &json!({
+                "prompt": prompt, "temperature": 0, "n_predict": 32,
+                "reasoning_budget": 2, "return_tokens": true,
+            }),
+        )
+        .json();
+        let at = format!("prompt {prompt}: {r}");
+        assert_eq!(r["content"], json!("ab</think>defghijkl"), "{at}");
+        let tokens = ids(&r["tokens"]);
+        assert_eq!(tokens[2], close[0], "{at}");
+        assert_eq!(tokens.len(), 13, "{at}");
+        assert_eq!(r["tokens_predicted"], json!(13), "{at}");
+    }
+}
+
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_a_divergence_inside_a_long_prompt_call_keeps_what_the_engine_grants() {

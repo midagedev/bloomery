@@ -59,7 +59,7 @@ use crate::engine::{
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::{ArgTypes, GlmXmlError};
 use crate::http::{self, EventStream, Request};
-use crate::reasoning::ReasoningFormat;
+use crate::reasoning::{ReasoningFormat, ThinkSplit};
 use crate::sampling;
 use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
@@ -861,8 +861,62 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .and_then(Value::as_bool)
             .unwrap_or(false),
         cache_prompt: get_b(o, "cache_prompt").unwrap_or(true),
+        reasoning_budget: reasoning_budget(o)?,
     };
     Ok(p)
+}
+
+/// `reasoning_budget`: absent or `null` unrestricted, `-1` unrestricted
+/// (llama-server's spelling), an integer `N >= 0` the think span's budget in
+/// generated ids, any other integer a 400 naming it, a non-integer a 400
+/// naming its type. An integer-valued float (`8.0`) passes, as every integer
+/// field's does.
+fn reasoning_budget(o: &Map<String, Value>) -> Result<Option<usize>, ApiError> {
+    let Some(v) = o.get("reasoning_budget").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let n = match v {
+        Value::Number(n) => n.as_i64().or_else(|| {
+            n.as_f64().and_then(|f| {
+                (f.fract() == 0.0 && f >= 0.0 && f <= i64::MAX as f64).then_some(f as i64)
+            })
+        }),
+        _ => None,
+    };
+    match n {
+        Some(-1) => Ok(None),
+        Some(n) if n >= 0 => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
+        Some(n) => Err(invalid(format!(
+            "reasoning_budget {n} is not -1 (unrestricted) or an integer >= 0"
+        ))),
+        None => Err(invalid(format!(
+            "reasoning_budget must be an integer, not {}",
+            json_type(v)
+        ))),
+    }
+}
+
+/// A JSON value's type, for a field's refusal naming what it got.
+fn json_type(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// The think-span budget lives only while the prompt opens the span: a prompt
+/// whose text ends with `<think>` starts the model inside it, and one that
+/// already closed it (the template with thinking off) has no reasoning to cap,
+/// so the budget is silently ignored there — llama-server ignores
+/// `--reasoning-budget` when thinking is already off by other means.
+fn gate_reasoning_budget(p: &mut GenParams, prompt: &str) {
+    if p.reasoning_budget.is_some() && !ThinkSplit::prompt_opens_span(prompt) {
+        p.reasoning_budget = None;
+    }
 }
 
 /// llama-server's `generation_settings`, with the values this server applies.
@@ -917,6 +971,7 @@ fn default_params() -> GenParams {
         return_progress: false,
         include_usage: false,
         cache_prompt: true,
+        reasoning_budget: None,
     }
 }
 
@@ -1835,7 +1890,7 @@ fn engine_error(e: &dyn fmt::Display) -> ApiError {
 
 fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = body(req).and_then(|b| gen_params(state, &b).map(|p| (b, p)));
-    let (b, p) = match parsed {
+    let (b, mut p) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
@@ -1843,6 +1898,15 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
         Ok(ids) => ids,
         Err(e) => return send_error(w, req, &e),
     };
+    if p.reasoning_budget.is_some() {
+        // The budget's span check reads the prompt's text: a string prompt is
+        // its own, an id array's its decode.
+        let text = match b.get("prompt") {
+            Some(Value::String(s)) => s.clone(),
+            _ => state.tok.decode(&ids),
+        };
+        gate_reasoning_budget(&mut p, &text);
+    }
     let return_tokens = get_b(&b, "return_tokens").unwrap_or(false);
     let prompt = b.get("prompt").cloned().unwrap_or(Value::Null);
     if !p.stream {
@@ -2065,10 +2129,11 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         let tools = tool_scan(state, &b)?;
         Ok((b, p, format, text, tools))
     });
-    let (b, p, format, text, tools) = match parsed {
+    let (b, mut p, format, text, tools) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
+    gate_reasoning_budget(&mut p, &text);
     let ids_meta = ChatIds {
         id: format!("chatcmpl-{}", state.random_id()),
         created: unix_now(),

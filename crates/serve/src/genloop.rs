@@ -36,6 +36,7 @@ use crate::engine::{
     Saved, SlotRow, StateError, Tokenizer,
 };
 use crate::promptcache::{self, PromptCache};
+use crate::reasoning::{THINK_CLOSE, ThinkSplit};
 use crate::sampling;
 use crate::slotfile::{self, Counting};
 use crate::stop::StopScan;
@@ -54,6 +55,13 @@ pub(crate) struct GenParams {
     pub include_usage: bool,
     /// Keep the longest cached prefix of the prompt (llama-server's default `true`).
     pub cache_prompt: bool,
+    /// The think-span budget, in generated ids taken while the span is open:
+    /// spending it force-feeds the span's close id, which the model's context
+    /// then really carries (llama-server's `--reasoning-budget` per request).
+    /// `Some` only when the prompt's text opened the span — a prompt that
+    /// already closed it has no reasoning to cap and the budget is silently
+    /// ignored, as llama-server ignores the flag when thinking is off.
+    pub reasoning_budget: Option<usize>,
 }
 
 /// llama-server's `timings` object, as the server clocked it.
@@ -667,6 +675,47 @@ pub(crate) enum Need {
     Done,
 }
 
+/// The think-span budget's state in [`Gen`]: the budget left while the span is
+/// open, the span's close detection over the generated text (the output's own
+/// split is api-side; this instance only decides when the span closes), and the
+/// ids of the close, `at` naming the next of them the loop force-feeds —
+/// `close.len()` while the budget holds.
+struct Think {
+    /// Budget left; the id whose text closes the span does not spend.
+    left: usize,
+    split: ThinkSplit,
+    close: Vec<u32>,
+    at: usize,
+}
+
+impl Think {
+    /// A budget of `left` generated ids over a span the prompt opened; at 0 the
+    /// close is forced from the first taken id.
+    fn new(left: usize, close: Vec<u32>) -> Think {
+        let n = close.len();
+        Think {
+            left,
+            split: ThinkSplit::inside(),
+            close,
+            at: if left == 0 { 0 } else { n },
+        }
+    }
+
+    /// Whether a close id is queued to force.
+    fn forcing(&self) -> bool {
+        self.at < self.close.len()
+    }
+
+    /// The next close id to force.
+    fn next_forced(&mut self) -> Option<u32> {
+        self.forcing().then(|| {
+            let id = self.close[self.at];
+            self.at += 1;
+            id
+        })
+    }
+}
+
 /// One request's generation on its slot, run a call at a time so the engine
 /// thread can step several slots' generations in one engine call. `ids` is
 /// non-empty and shorter than the context. [`Gen::timings`] are filled even
@@ -699,6 +748,9 @@ pub(crate) struct Gen {
     taken: usize,
     /// The token the loop takes next; `None` once there is none.
     tok: Option<u32>,
+    /// The think-span budget, `None` on a request without one (or whose prompt
+    /// never opened the span) and once the span closed.
+    think: Option<Think>,
 }
 
 impl Gen {
@@ -746,6 +798,9 @@ impl Gen {
             kept: Vec::with_capacity(rows),
             taken: 0,
             tok: None,
+            think: p
+                .reasoning_budget
+                .map(|left| Think::new(left, slot.vocab.encode(THINK_CLOSE))),
         }
     }
 
@@ -762,6 +817,55 @@ impl Gen {
     /// The logits buffer a step writes, or `None` on a greedy request.
     pub(crate) fn logits_out(&mut self) -> Option<&mut [f32]> {
         out(&mut self.logits)
+    }
+
+    /// The id the loop takes for an engine answer `g`: the next forced close id
+    /// while one is queued (the engine's answer is discarded — the loop never
+    /// commits it, so nothing desyncs), else the sampled or greedy choice.
+    fn answer(&mut self, g: u32) -> u32 {
+        if let Some(id) = self.think.as_mut().and_then(Think::next_forced) {
+            return id;
+        }
+        choose(
+            &mut self.sampler,
+            g,
+            &mut self.logits,
+            &self.generated,
+            &self.banned,
+        )
+    }
+
+    /// Whether a close id is queued to force: the budget spent with the span
+    /// still open.
+    fn forcing(&self) -> bool {
+        self.think.as_ref().is_some_and(Think::forcing)
+    }
+
+    /// The think budget left, `usize::MAX` with none: a pass keeps at most
+    /// `rows` tokens and each spends, so it starts only while they all fit.
+    fn think_left(&self) -> usize {
+        self.think.as_ref().map_or(usize::MAX, |t| t.left)
+    }
+
+    /// One taken id against the think budget: its text first — a piece that
+    /// closes the span retires the tracker, the closing id spending nothing —
+    /// then the count, which arms the forced close at zero.
+    fn spend(&mut self, piece: Option<&str>) {
+        let Some(t) = self.think.as_mut() else {
+            return;
+        };
+        if let Some(text) = piece
+            && t.split.push(text).closed
+        {
+            self.think = None;
+            return;
+        }
+        if t.left > 0 {
+            t.left -= 1;
+            if t.left == 0 {
+                t.at = 0;
+            }
+        }
     }
 
     /// The prompt on the selected slot: what the cache keeps of `ids`, the
@@ -800,13 +904,7 @@ impl Gen {
             sink(Event::Prompt(&self.tim))?;
         }
         if self.budget > 0 {
-            self.tok = Some(choose(
-                &mut self.sampler,
-                greedy,
-                &mut self.logits,
-                &self.generated,
-                &self.banned,
-            ));
+            self.tok = Some(self.answer(greedy));
         }
         Ok(())
     }
@@ -830,8 +928,9 @@ impl Gen {
                 self.stop = StopKind::Eos;
                 break;
             }
-            if let Some(piece) = self.dec.push(tok) {
-                let pushed = self.scan.push(&piece);
+            let piece = self.dec.push(tok);
+            if let Some(piece) = &piece {
+                let pushed = self.scan.push(piece);
                 if !pushed.send.is_empty() {
                     sink(Event::Text(&pushed.send, &self.tim))?;
                 }
@@ -841,8 +940,25 @@ impl Gen {
                     break;
                 }
             }
+            // The think budget: the text first, then the count.
+            self.spend(piece.as_deref());
             if self.generated.len() >= self.budget {
                 break;
+            }
+            // While a close id is queued, every taken id is stepped into the
+            // engine, whose context then carries the close text: a pass cannot
+            // run (one starts only while the budget holds `rows`, below, and
+            // keeps at most `rows`, so the budget spends at the earliest with
+            // the pass's last kept token taken — none remains for the fast
+            // path below to drop), and the context bound stops the forced ids
+            // like any token.
+            if self.forcing() {
+                let (n, len) = (self.n, self.generated.len());
+                if n + len > self.ctx_max {
+                    self.truncated = true;
+                    break;
+                }
+                return Ok(Need::Step(tok));
             }
             // The last pass evaluated this token already.
             if let Some(&t) = self.kept.get(self.taken) {
@@ -856,8 +972,13 @@ impl Gen {
                 self.truncated = true;
                 break;
             }
-            // A pass takes `rows` positions from there.
-            if self.rows > 1 && n + len + self.rows - 1 <= self.ctx_max {
+            // A pass takes `rows` positions from there, and every token it
+            // keeps spends the think budget: it starts only while the budget
+            // holds them all, so no kept token spends past the cap.
+            if self.rows > 1
+                && self.think_left() >= self.rows
+                && n + len + self.rows - 1 <= self.ctx_max
+            {
                 return Ok(Need::Advance(tok));
             }
             return Ok(Need::Step(tok));
@@ -868,16 +989,13 @@ impl Gen {
     /// The engine's answer `g` to a [`Need::Step`].
     pub(crate) fn stepped(&mut self, g: u32) {
         self.tim.n_past = self.n + self.generated.len();
-        self.tok = Some(choose(
-            &mut self.sampler,
-            g,
-            &mut self.logits,
-            &self.generated,
-            &self.banned,
-        ));
+        self.tok = Some(self.answer(g));
     }
 
     /// What a [`Need::Advance`] drafted; its tokens are in [`Gen::kept_mut`].
+    /// The force is never armed here by [`Gen::pump`]'s pass gate: a pass
+    /// starts only while the budget holds `rows` and keeps at most `rows`, so
+    /// its first kept token is always there for the taking.
     pub(crate) fn advanced(&mut self, d: Drafted) {
         self.tim.book(d);
         self.tim.n_past = self.n + self.generated.len() + self.kept.len() - 1;
@@ -1205,6 +1323,7 @@ mod cache_tests {
             return_progress: false,
             include_usage: false,
             cache_prompt: true,
+            reasoning_budget: None,
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -1336,6 +1455,7 @@ mod cache_tests {
             return_progress: false,
             include_usage: false,
             cache_prompt: true,
+            reasoning_budget: None,
         };
         let mut tim = Timings::default();
         let r = generate(
@@ -1437,6 +1557,7 @@ mod cache_tests {
             return_progress: false,
             include_usage: false,
             cache_prompt: true,
+            reasoning_budget: None,
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -1519,5 +1640,168 @@ mod slot_tests {
             .step_slots(&mut rows())
             .expect_err("a row left unanswered");
         assert!(e.0.contains("answered slot 0 with id 4294967295"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod think_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{GenParams, Outcome, Slot, StopKind, Timings, generate};
+    use crate::engine::{Drafted, Engine, EngineError, SamplingParams, Tokenizer};
+    use crate::mock::{DraftMock, MockEngine, MockTokenizer};
+    use crate::sampling;
+
+    /// An engine behind a log of every id fed to it: `prefill`'s, every
+    /// step's `last`, and a pass's `last` and kept tokens but its last.
+    struct Fed<E> {
+        inner: E,
+        fed: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl<E: Engine> Engine for Fed<E> {
+        fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+            self.inner.tokenizer()
+        }
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+            self.fed.lock().expect("fed").extend_from_slice(ids);
+            self.inner.prefill(ids)
+        }
+        fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+            self.fed.lock().expect("fed").push(last);
+            self.inner.next(last, out)
+        }
+        fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+            let d = self.inner.advance(last, out)?;
+            let mut fed = self.fed.lock().expect("fed");
+            fed.push(last);
+            fed.extend(&out[..out.len() - 1]);
+            Ok(d)
+        }
+        fn advance_rows(&self) -> usize {
+            self.inner.advance_rows()
+        }
+        fn reset(&mut self) -> Result<(), EngineError> {
+            self.inner.reset()
+        }
+        fn ctx_max(&self) -> usize {
+            self.inner.ctx_max()
+        }
+        fn describe(&self) -> String {
+            self.inner.describe()
+        }
+    }
+
+    /// One greedy generation of at most 8 tokens of `prompt` with `budget`,
+    /// and every id the engine was fed. A prompt holding `<think>` twice makes
+    /// the mock echo `a`, `<think>`, `a`, `<think>` forever after the span
+    /// opens, so only the forced close ever closes the span; one holding
+    /// `<think></think>` makes it close the span itself on its first token.
+    fn run_on<E: Engine + 'static>(
+        inner: E,
+        prompt: &str,
+        budget: Option<usize>,
+    ) -> (Vec<u32>, Outcome) {
+        let fed = Arc::new(Mutex::new(Vec::new()));
+        let mut slot = Slot::new(Box::new(Fed {
+            inner,
+            fed: Arc::clone(&fed),
+        }));
+        let ids = MockTokenizer.encode(prompt);
+        let p = GenParams {
+            n_predict: 8,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: Vec::new(),
+            ignore_eos: false,
+            stream: false,
+            timings_per_token: false,
+            return_progress: false,
+            include_usage: false,
+            cache_prompt: true,
+            reasoning_budget: budget,
+        };
+        let mut tim = Timings::default();
+        let o = generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &ids,
+            &p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut tim,
+        )
+        .expect("a generation");
+        let fed = std::mem::take(&mut *fed.lock().expect("fed"));
+        (fed, o)
+    }
+
+    fn run(prompt: &str, budget: Option<usize>) -> (Vec<u32>, Outcome) {
+        run_on(MockEngine::new(4096), prompt, budget)
+    }
+
+    /// The mock ids these tests spell: `q`, `a`, the span's open and close.
+    const Q: u32 = 6 + 113;
+    const A: u32 = 6 + 97;
+    const CLOSE: u32 = 5;
+
+    /// A budget of 3 spends on the third generated id and the next id the
+    /// engine is fed is the close id, which is taken, counted and fed itself.
+    #[test]
+    fn the_budget_spends_into_the_forced_close() {
+        assert_eq!(MockTokenizer.encode("</think>"), vec![CLOSE]);
+        let (fed, o) = run("q<think>aa<think>", Some(3));
+        // `a`, `<think>`, `a` spent, the close forced, the eos the model
+        // answers after it.
+        assert_eq!(o.tokens, vec![A, 4, A, CLOSE, MockTokenizer.eos()]);
+        assert_eq!(o.timings.predicted_n, 5, "the close counts like any token");
+        assert_eq!(o.stop, StopKind::Eos);
+        // The prompt's four prefill ids and its last, the three spent ids,
+        // then the close.
+        assert_eq!(fed, vec![Q, 4, A, A, 4, A, 4, A, CLOSE]);
+    }
+
+    /// A budget of 0 forces the close before any model token: the first taken
+    /// id is the close id, and the engine is fed nothing the model answered.
+    #[test]
+    fn a_budget_of_zero_closes_before_any_model_token() {
+        let (fed, o) = run("q<think>aa<think>", Some(0));
+        assert_eq!(o.tokens, vec![CLOSE, MockTokenizer.eos()]);
+        assert_eq!(fed, vec![Q, 4, A, A, 4, CLOSE]);
+    }
+
+    /// A close the model makes itself retires the tracker: the fed ids and
+    /// the tokens are a no-budget run's exactly.
+    #[test]
+    fn a_natural_close_retires_the_tracker() {
+        let prompt = "z<think></think>abab<think>";
+        let (fed, with) = run(prompt, Some(4));
+        let (fed_free, without) = run(prompt, None);
+        assert_eq!(with.tokens, without.tokens);
+        assert_eq!(fed, fed_free);
+        assert!(
+            with.tokens.len() > 4,
+            "the budget is smaller than the run, or it pins nothing"
+        );
+    }
+
+    /// A drafting engine stops passing near the limit: a pass of 2 rows needs
+    /// the budget to hold 2, so with 4 the loop steps once at 1 left and the
+    /// force fires at exactly 4 taken ids. The pass the span's close itself
+    /// opens afterwards is the normal flow resumed, its eos ending the run.
+    #[test]
+    fn a_pass_waits_for_the_budget_to_hold_its_rows() {
+        let (fed, o) = run_on(DraftMock::new(4096), "q<think>aa<think>", Some(4));
+        assert_eq!(o.tokens, vec![A, 4, A, 4, CLOSE, MockTokenizer.eos()]);
+        // The prompt's four prefill ids and its last, the pass's `a` and
+        // `<think>`, then the gated step's `a` (a second pass here would feed
+        // `a` and `<think>` again), the armed step's `<think>`, the close, and
+        // the eos the pass the retired span opens kept.
+        assert_eq!(
+            fed,
+            vec![Q, 4, A, A, 4, A, 4, A, 4, CLOSE, MockTokenizer.eos()]
+        );
     }
 }

@@ -17,6 +17,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The API**: `/v1/chat/completions`, `/completion`, streaming, tool calls, `reasoning_content`,
   `cache_prompt`, `/tokenize`, `/detokenize`, `/slots`, `/metrics`, `/v1/models`, `/props`. OpenAI SDKs, curl,
   and llama-server tutorials apply as they are.
+- **`reasoning_budget`**, per request on `/v1/chat/completions` and `/completion`: llama-server's
+  `--reasoning-budget` — the think span's budget in generated ids taken while the span is open, `0` closing it at
+  once, `-1` or absent unrestricted, and silently ignored when the template already closed the span.
 - **The files**: the GGUF uploads as downloaded, the same quantizations, the chat template read from the file,
   and a tokenizer bit-identical to `llama-tokenize`.
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched

@@ -61,11 +61,28 @@ pub struct ThinkSplit {
 }
 
 impl ThinkSplit {
+    /// Whether a prompt's text starts the model inside the span: the template's
+    /// generation prompt ends with `<think>` when thinking is on, and a prompt
+    /// that already closed the span (thinking off) has no reasoning in it.
+    #[must_use]
+    pub(crate) fn prompt_opens_span(prompt: &str) -> bool {
+        prompt.ends_with(THINK_OPEN)
+    }
+
     /// The start state for a rendered prompt.
     #[must_use]
     pub fn for_prompt(prompt: &str) -> Self {
         ThinkSplit {
-            inside: prompt.ends_with(THINK_OPEN),
+            inside: Self::prompt_opens_span(prompt),
+            held: String::new(),
+        }
+    }
+
+    /// The start state inside the span: a generation whose prompt opened it.
+    #[must_use]
+    pub(crate) fn inside() -> Self {
+        ThinkSplit {
+            inside: true,
             held: String::new(),
         }
     }
@@ -144,5 +161,14 @@ mod tests {
         assert_eq!(partial_suffix("x</think>", THINK_CLOSE), 0);
         assert_eq!(partial_suffix("x</thin", THINK_CLOSE), 6);
         assert_eq!(partial_suffix("<", THINK_CLOSE), 1);
+    }
+
+    /// A prompt opens the span only when its text ends with `<think>`: the one
+    /// rule the think-span budget's span check and the split's start state share.
+    #[test]
+    fn a_prompt_opens_the_span_only_at_its_end() {
+        assert!(ThinkSplit::prompt_opens_span("<｜Assistant｜><think>"));
+        assert!(!ThinkSplit::prompt_opens_span("<｜Assistant｜></think>"));
+        assert!(!ThinkSplit::prompt_opens_span("<think>x"));
     }
 }
