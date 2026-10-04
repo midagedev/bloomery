@@ -6,7 +6,7 @@ bloomery is still in active development, and this page describes the tree as it 
 
 ## Size
 
-The device code lives in four crates: about 90 `#[cuda_module]` modules with about 200 `#[kernel]` entries. The kernels include quantized matrix-vector and matrix-matrix products (k-quants, int8 tensor-core GEMM), flash attention for decode and prefill, MoE routing, RoPE and norms. Every one of them is Rust.
+The device code lives in three engine crates (`gpu`, `gpu-deepseek41`, `gpu-vision`): 69 `#[cuda_module]` modules with 274 `#[kernel]` entries, plus a few test kernels in `gpu-gates`. The kernels include quantized matrix-vector and matrix-matrix products (k-quants, int8 tensor-core GEMM), flash attention for decode and prefill, MoE routing, RoPE and norms. Every one of them is Rust.
 
 ## Layout
 
