@@ -60,6 +60,13 @@
 //!   is everything the most recent request left (no cut), else in whole
 //!   compression groups: its cut lands in a reply or at a prompt call's end,
 //!   outside every prompt call's hole. The other two print what they kept.
+//! - the think-span budget (`reasoning_budget`): a thinking-on generation
+//!   with the budget at 8 takes the model's own first 8 ids, force-feeds the
+//!   close id as the 9th, and the continuation conditions on it (its ids
+//!   after the close are a fresh run's fed the close as an ordinary prompt
+//!   id); the chat reply's reasoning is bounded and closed with content after
+//!   it, the count includes the close, and a follow-up turn keeps the prefix
+//!   it shares with what the budgeted turn left;
 //! - two conversations interleaved (the prompt cache): `--ids` and its
 //!   greedy ids, then the ids reversed, then `--ids` plus its greedy ids
 //!   again keeps every position the first left (`cache_n` = its length − 1)
@@ -821,6 +828,134 @@ mod gate {
         for s in &scripts {
             ok &= converse(url, rules, &mut ledger, s)?;
         }
+        Ok(ok)
+    }
+
+    /// The think-span budget (module header): a thinking-on generation with
+    /// `reasoning_budget` 8 takes the model's own first 8 ids, force-feeds the
+    /// close id as the 9th, and the continuation conditions on it; the chat
+    /// reply's reasoning is bounded and closed, and the follow-up turn keeps
+    /// the shared prefix.
+    fn budget(url: &dyn Fn(&str) -> String, rules: &Rules) -> Result<bool, GateError> {
+        const THINK_BUDGET: usize = 8;
+        /// The budgeted generations' length and the chat turn's.
+        const THINK_PREDICT: usize = 16;
+        let on = json!({"thinking": true});
+        let one = json!([{"role": "user", "content": CHAT}]);
+        let p = rendered(url, &one, &on)?;
+        let (st, body) = curl(
+            &url("/tokenize"),
+            Some(&json!({"content": serve::reasoning::THINK_CLOSE})),
+            false,
+        )?;
+        let close = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        // The budgeted and free runs, from a reset cache: ids and timings.
+        let run =
+            |prompt: &[u32], budget: Value, n: usize| -> Result<(Vec<u32>, Value), GateError> {
+                let body = json!({
+                    "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
+                    "return_tokens": true, "cache_prompt": false, "reasoning_budget": budget,
+                });
+                let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+                let v = json_of("/completion", st, &text)?;
+                Ok((ids_of(&v["tokens"]), v))
+            };
+        let (free, _) = run(&p, Value::Null, THINK_BUDGET)?;
+        let (capped, _) = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
+        // Fed the close as an ordinary prompt id, the model continues as the
+        // capped run did: the engine's context really carries the close.
+        let mut through = p.clone();
+        through.extend(&capped[..THINK_BUDGET + close.len()]);
+        let (after, _) = run(
+            &through,
+            Value::Null,
+            THINK_PREDICT - THINK_BUDGET - close.len(),
+        )?;
+        println!(
+            "think budget {THINK_BUDGET}: free {free:?}, capped {:?}.., close {close:?}",
+            &capped[..THINK_BUDGET + close.len()],
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "budget_leaves_the_models_own_ids",
+            capped.len() == THINK_PREDICT && capped[..THINK_BUDGET] == free[..],
+        );
+        check(
+            &mut ok,
+            "budget_forces_the_close_at_the_budget",
+            capped[THINK_BUDGET..THINK_BUDGET + close.len()] == close[..],
+        );
+        check(
+            &mut ok,
+            "budget_continues_on_the_close",
+            after == capped[THINK_BUDGET + close.len()..],
+        );
+        // The chat turn: bounded, closed, the close counted.
+        let chat = |messages: &Value, budget: Value| -> Result<Value, GateError> {
+            let body = json!({
+                "messages": messages, "temperature": 0, "max_tokens": THINK_PREDICT,
+                "ignore_eos": true, "chat_template_kwargs": on.clone(),
+                "reasoning_budget": budget,
+            });
+            let (st, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
+            json_of("/v1/chat/completions", st, &text)
+        };
+        let warm = chat(&one, json!(THINK_BUDGET))?;
+        let m = &warm["choices"][0]["message"];
+        let reasoning = m["reasoning_content"].as_str().unwrap_or("").to_owned();
+        let content = m["content"].as_str().unwrap_or("").to_owned();
+        let (st, body) = curl(
+            &url("/tokenize"),
+            Some(&json!({"content": reasoning})),
+            false,
+        )?;
+        let reasoning_ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        println!(
+            "think budget chat: reasoning {} ids, content {} chars, usage {}",
+            reasoning_ids.len(),
+            content.len(),
+            warm["usage"]
+        );
+        check(
+            &mut ok,
+            "budget_reasoning_is_bounded",
+            !reasoning.is_empty() && reasoning_ids.len() <= THINK_BUDGET,
+        );
+        check(
+            &mut ok,
+            "budget_reply_is_closed_and_counts_the_close",
+            !content.is_empty()
+                && as_count(&warm["usage"]["completion_tokens"])
+                    .is_some_and(|n| n > THINK_BUDGET + close.len()),
+        );
+        // The follow-up turn keeps the prefix it shares with what the
+        // budgeted turn left: the recorded turn diverges at the generation
+        // prompt's last id (its `<think>`), in whole compression groups of
+        // the rest.
+        let (held_ids, _) = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
+        let mut held = p.clone();
+        held.extend(&held_ids[..held_ids.len() - 1]);
+        let mut two = one.as_array().expect("messages").clone();
+        two.push(json!({"role": "assistant", "content": content}));
+        two.push(json!({"role": "user", "content": TURN2}));
+        let two = Value::Array(two);
+        let p2 = rendered(url, &two, &on)?;
+        let shared = common(&held, &p2);
+        let followup = chat(&two, Value::Null)?;
+        let kept = as_count(&followup["timings"]["cache_n"]);
+        let floor = whole_groups(shared, &rules.ratios);
+        println!(
+            "think budget follow-up: shared {shared} of {} held (the prompt's {} ids),              floor {floor}, cache_n={}",
+            held.len(),
+            p.len(),
+            followup["timings"]["cache_n"]
+        );
+        check(
+            &mut ok,
+            "budget_followup_keeps_the_shared_prefix",
+            shared + 1 == p.len() && kept.is_some_and(|k| floor <= k && k <= shared),
+        );
         Ok(ok)
     }
 
@@ -1925,6 +2060,7 @@ mod gate {
         }
 
         ok &= conversations(&url, &rules)?;
+        ok &= budget(&url, &rules)?;
         ok &= interleaved(&url, &a.ids)?;
         ok &= shared_system(&url)?;
 
