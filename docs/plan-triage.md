@@ -947,6 +947,15 @@ V4.1 `--place gate` 게이트는 카드 이름 "3090"이 박혀 `BLOOMERY_GATE_C
 - **F. Two verify rows per MMA tile (`flash_gqa.rs:43-45`, 8 of 16 rows idle): hold.** ≤ +1.3 % at P 4096 [derived upper bound].
 - **Rejected:** trees (routed bytes are re-read per position), DSpark k ≥ 2 at fixed width, a bf16 lane matmul (our q8 m-column path is already row-independent), FP8/NVFP4/cluster kernels (sm_89+), a ring margin in place of the V4.1 shadow (≈0). Multi-stream shared rounds are throughput, not single-stream: hold.
 
+**Resident slots in one pass** (line1's DeepGEMM round, out-of-scope spot, 10-05; line2 owns): today a qwen3 seat round
+of N slots is N passes, one slot each (`crates/gpu/src/model/slots.rs`, `Engine::advance_slots`), so the dense
+weights are read N times a round. One pass over all N slots reads them once; the m ≤ 8 arm already takes several
+columns. **Hold (L), behind A8s.** Prediction for Qwen3-30B-A3B at N = 2 [derived, parameter counts, not measured]:
+dense per token ≈ 1.2 B params (attention 0.91 B + head 0.31 B), routed ≈ 1.81 B; a round reads 6.0 → 4.8 units,
+round −20 %, aggregate ≈ ×1.25 if the step is byte-bound, more where it is latency-bound (launches halve). Per-slot
+attention stays per slot (separate KV planes). The term to measure first: our r(m) = pass(m)/pass(1) on the qwen3
+chain at m = 2 (the same term as the recentlit "verify m-rows" line above).
+
 ### 재판정 잔여 (revisit)
 
 R2 Q3_K 밀집 m ≤ 8 대역(m=6이 m=1 GB/s의 90 % 밑이면 m > 1 명령 레버 카드 — DSpark 패스 +4.7 ms 위험; uniongroup 앞); R5 0·1층 Q5_K `_sel`을 카드로(순 −0.15…−0.4 ms); R6 목록 주장 확인·R7 DSpark 재유도(합집합 0.753로)·R8 rows % 4(plainfile이 덮었는지); N1·N2·N3·N4·N5는 시팅 큐와 사용자 결정.
