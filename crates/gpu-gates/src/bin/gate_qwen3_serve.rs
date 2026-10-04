@@ -121,6 +121,11 @@ mod gate {
     const EDIT_B: &str =
         "Name the three primary colors of ink, and say in one sentence why a page reflects them.";
 
+    /// The whole-call clause's system message, ahead of [`EDIT_A`]'s user
+    /// turn: the chat's prompt opens two messages.
+    const SYSTEM_MSG: &str = "You answer in one short sentence, naming each item exactly as the \
+                              question names it.";
+
     /// The user turn the extension clause appends after the reply, as the
     /// template renders it past the reply's end.
     const LATER: &str = "<|im_end|>\n<|im_start|>user\nAnd which of the three does a screen show when it shows none of them?\n<|im_end|>\n";
@@ -489,8 +494,17 @@ mod gate {
     /// `j` (`cache_n`) and answers the ids of the same ids fed fresh; the
     /// extension clause — the turn resent with its reply and [`LATER`]'s
     /// user turn — keeps every position the slot held, its ids printed
-    /// only.
-    fn prefix(url: &dyn Fn(&str) -> String, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+    /// only; the whole-call clause — a chat whose prompt opens a system and
+    /// a user message, each at least [`GEMM_FROM`] ids, on a slot holding
+    /// another conversation — runs as one prompt call: no `prefill split`
+    /// note (the per-position cache keeps every mark as it stands, so a cut
+    /// would buy nothing and cost a walk), and the answer it returns is
+    /// held to the CLI's below, a fresh run's ids.
+    fn prefix(
+        url: &dyn Fn(&str) -> String,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<Answer, GateError> {
         let p = rendered(url, json!([{ "role": "user", "content": EDIT_A }]))?;
         let q = rendered(url, json!([{ "role": "user", "content": EDIT_B }]))?;
         let later = tokenized(url, LATER)?;
@@ -543,7 +557,38 @@ mod gate {
             "extension_keeps_every_held_position",
             held_run.cache_n == 0 && resend.cache_n == held && !resend.tokens.is_empty(),
         );
-        Ok(())
+
+        // The whole-call clause: the two-message chat on the slot the
+        // extension left holding another conversation. Each message at
+        // least GEMM_FROM ids, so the user message's start sits GEMM_FROM
+        // ids inside the call either side — a mark a cutting rule could
+        // take.
+        let n_sys = tokenized(url, SYSTEM_MSG)?.len();
+        let n_user = tokenized(url, EDIT_A)?.len();
+        if n_sys < GEMM_FROM || n_user < GEMM_FROM {
+            return Err(format!(
+                "the whole-call clause's messages hold {n_sys} and {n_user} ids; each needs at \
+                 least {GEMM_FROM} so a message-start mark sits inside the call"
+            )
+            .into());
+        }
+        let chat = rendered(
+            url,
+            json!([
+                { "role": "system", "content": SYSTEM_MSG },
+                { "role": "user", "content": EDIT_A },
+            ]),
+        )?;
+        let (whole, _) = greedy(url, chat, dir, "whole", true)?;
+        let log = std::fs::read_to_string(dir.join("server.err"))?;
+        let cuts = log.lines().filter(|l| l.contains("prefill split")).count();
+        println!(
+            "whole-call: the chat holds {} ids; the server's log carries {cuts} prefill split \
+             note(s)",
+            whole.prompt.len(),
+        );
+        check(ok, "two_message_chat_runs_one_call", cuts == 0);
+        Ok(whole)
     }
 
     /// The prefix clauses of the qwen35moe arm (the module header): the
@@ -897,14 +942,19 @@ mod gate {
             "chat_is_those_ids",
             counted && !said.trim().is_empty() && parts_inside,
         );
+        // The qwen3moe arm's whole-call answer joins the CLI comparison: a
+        // fresh run's ids for the two-message chat.
+        let mut whole = None;
         if arch == "qwen3moe" {
-            prefix(&url, dir, ok)?;
+            whole = Some(prefix(&url, dir, ok)?);
         }
         if arch == "qwen35moe" {
             prefix35(&url, dir, ok)?;
         }
         println!("server stopped: {}", s.stop()?);
-        Ok(vec![chat_ids, prose_ids])
+        let mut answers = vec![chat_ids, prose_ids];
+        answers.extend(whole);
+        Ok(answers)
     }
 
     /// `generate_qwen3moe --arm <prompt>/N … --last-step` on `model`, an arm

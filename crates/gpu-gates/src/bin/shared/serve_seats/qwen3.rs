@@ -64,16 +64,18 @@
 //!
 //! `--parallel N` (`-np N`, default 2) serves N slots that take the one
 //! model in turns (`serve::SwapEngine`); the default's second slot costs a
-//! lone request nothing, the turns acting only on a second arrival, and
-//! `--parallel 1` keeps the plain engine: a request that arrives while
-//! another decodes preempts it at the next step, the live requests then
-//! take turns of `serve::QUANTUM` tokens, and a preempted request comes
-//! back by the re-prefill fallback — the engine reset to position 0 and its
-//! held ids fed again before it steps (`serve::Park::Ids`; the seat holds
-//! no snapshot to park, and a kept prefix does not survive another slot's
-//! rows over the cache), the ids it feeds again counted in `/metrics`.
-//! `--queue-depth Q` bounds the requests that wait for a slot; `--park-ram`
-//! is refused by name: the park holds ids, no state, so it reads no budget.
+//! lone request nothing — the turns act only on a second arrival, and an
+//! idle slot the engine left holds nothing, so a lone request stays on the
+//! engine's slot — and `--parallel 1` keeps the plain engine: a request that
+//! arrives while another decodes preempts it at the next step, the live
+//! requests then take turns of `serve::QUANTUM` tokens, and a preempted
+//! request comes back by the re-prefill fallback — the engine reset to
+//! position 0 and its held ids fed again before it steps
+//! (`serve::Park::Ids`; the seat holds no snapshot to park, and a kept
+//! prefix does not survive another slot's rows over the cache), the ids it
+//! feeds again counted in `/metrics`. `--queue-depth Q` bounds the requests
+//! that wait for a slot; `--park-ram` is refused by name: the park holds
+//! ids, no state, so it reads no budget.
 //!
 //! The seat sits behind the `deepseek41` feature, the server surface's
 //! scope (`bind`, the `serve` and `sampler` crates); it runs no V4.1 code;
@@ -247,8 +249,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         // The fixed default, not an elastic one: this seat's park holds ids
         // only (`Park::Ids`), no byte budget to size the slots from — a
         // state to park is a seat that saves one. A lone request pays
-        // nothing for the second (the turns act only on a second arrival);
-        // `--parallel 1` keeps the plain engine.
+        // nothing for the second: the turns act only on a second arrival,
+        // and an idle slot the engine left holds nothing, so a lone request
+        // stays on the engine's slot; `--parallel 1` keeps the plain engine.
         parallel: 2,
         queue_depth: None,
     };
@@ -397,19 +400,12 @@ impl Body3 for Body {
         Ok(s.cut(pos)?)
     }
 
-    /// The marks inside the call where both runs hold at least
-    /// [`GEMM_FROM`] ids, so each run is the GEMM walk whose bits are the
-    /// uncut call's.
-    fn splits(first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
-        let mut at = Vec::new();
-        let mut last = first;
-        for &u in marks {
-            if u >= last + GEMM_FROM && u + GEMM_FROM <= end {
-                at.push(u);
-                last = u;
-            }
-        }
-        at
+    /// Nowhere: the caches are per-position, so every position the body
+    /// holds is keepable as it stands and a cut never needs the calls on
+    /// either side of it to be whole prompt calls of their own — a token's
+    /// values do not depend on its ubatch.
+    fn splits(_first: usize, _end: usize, _marks: &[usize]) -> Vec<usize> {
+        Vec::new()
     }
 }
 

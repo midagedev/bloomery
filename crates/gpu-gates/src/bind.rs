@@ -379,11 +379,12 @@ pub struct CacheRam {
 }
 
 impl CacheRam {
-    /// `--cache-ram`'s value, `mib` MiB, in bytes; refused by name past u64.
-    pub fn parse_mib(mib: &str) -> Result<u64, GateError> {
+    /// The `flag`'s value (`--cache-ram`, `--park-ram`), `mib` MiB, in
+    /// bytes; refused by name past u64.
+    pub fn parse_mib(flag: &str, mib: &str) -> Result<u64, GateError> {
         let n: u64 = mib.parse()?;
         Ok(n.checked_mul(1 << 20)
-            .ok_or_else(|| format!("--cache-ram {n} MiB passes u64 bytes"))?)
+            .ok_or_else(|| format!("{flag} {n} MiB passes u64 bytes"))?)
     }
 
     /// The budget (the type's doc): `set` in bytes as given, else the
@@ -468,13 +469,15 @@ pub const PARALLEL_CAP: usize = 4;
 /// `--parallel`'s slot count and what decided it, for the `parallel` line a
 /// seat that parks states prints: the parked states' `budget` holding one
 /// whole-context `state` a slot (one parked while the others run), the flag
-/// an upper bound on what it holds, [`PARALLEL_CAP`] the default's, never
-/// below 1 (the plain engine, nothing parked).
+/// an upper bound on what it holds, [`PARALLEL_CAP`] the default's, the
+/// engine's own turn bound ([`Seat::turn_slots`]) another on the default's,
+/// never below 1 (the plain engine, nothing parked).
 pub struct Parallel {
     /// The slots, the `--parallel` the server serves.
     pub slots: usize,
     /// `flag` (the flag's bound, what it holds of it), `budget` (the
-    /// default, what the budget holds), `plain` (one slot: the flag's, or a
+    /// default, what the budget holds), `engine` (the default, what the
+    /// engine's own turn bound takes), `plain` (one slot: the flag's, or a
     /// budget that holds no state).
     pub rule: &'static str,
     /// The parked states' budget, 0 with none.
@@ -484,15 +487,40 @@ pub struct Parallel {
 }
 
 impl Parallel {
-    /// The count and the rule (the type's doc).
+    /// The count and the rule (the type's doc), the engine taking its turns
+    /// in however many slots it serves ([`Seat::turn_slots`]'s default: no
+    /// limit).
     #[must_use]
     pub fn of(flag: Option<usize>, budget: u64, state: u64) -> Parallel {
+        Parallel::of_turn_slots(flag, budget, state, usize::MAX)
+    }
+
+    /// [`Parallel::of`] with the engine's own turn bound
+    /// ([`Seat::turn_slots`]): the elastic default holds no more slots than
+    /// the engine takes its one sequence in turns in, the rule naming the
+    /// engine when its bound is what held the count. The flag stays the
+    /// operator's ask, bounded by the budget's holds alone — a flag past
+    /// what the engine takes is the seat's to refuse by name.
+    #[must_use]
+    pub fn of_turn_slots(
+        flag: Option<usize>,
+        budget: u64,
+        state: u64,
+        turn_slots: usize,
+    ) -> Parallel {
         let holds = 1 + usize::try_from(budget / state.max(1)).unwrap_or(usize::MAX);
         let (slots, rule) = match flag {
             Some(0 | 1) => (1, "plain"),
             Some(f) => (f.min(holds).max(1), "flag"),
             None if holds < 2 => (1, "plain"),
-            None => (PARALLEL_CAP.min(holds), "budget"),
+            None => {
+                let want = PARALLEL_CAP.min(holds);
+                if turn_slots < want {
+                    (turn_slots.max(1), "engine")
+                } else {
+                    (want, "budget")
+                }
+            }
         };
         Parallel {
             slots,
@@ -613,6 +641,13 @@ pub trait Seat: 'static {
     fn pass_rows(&self) -> usize {
         1
     }
+    /// The most slots that may take this seat's one sequence in turns
+    /// (`serve::SwapEngine`): a seat whose engine's state does not survive
+    /// a park caps it, and the elastic `--parallel` default holds no more
+    /// ([`Parallel::of_turn_slots`]). The default is no limit.
+    fn turn_slots(&self) -> usize {
+        usize::MAX
+    }
     /// Empty caches at position 0.
     fn reset(&mut self) -> Result<(), GateError>;
     /// Take back the positions from `pos` on; `pos` is one [`Seat::keep`]
@@ -664,6 +699,8 @@ pub struct SeatEngine {
     ctx_max: usize,
     /// [`Seat::pass_rows`].
     rows: usize,
+    /// [`Seat::turn_slots`], the opened seat's.
+    turn_slots: usize,
     card: String,
     props: EngineProps,
     cache_ram: u64,
@@ -691,7 +728,8 @@ impl SeatEngine {
     /// `props` is what `/props` reports about the engine ([`model_props`],
     /// [`placement_props`]), which the seat completes ([`Seat::props`]);
     /// `cache_ram` is the server's prompt cache budget
-    /// (`serve::Engine::cache_ram`).
+    /// (`serve::Engine::cache_ram`). The seat's whole-load capabilities —
+    /// [`Seat::pass_rows`], [`Seat::turn_slots`] — cross with the load.
     pub fn spawn<S, F>(
         open: F,
         defined: usize,
@@ -706,7 +744,8 @@ impl SeatEngine {
     {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
-        let (opened, loaded) = mpsc::channel::<Result<(usize, usize, EngineProps), String>>();
+        let (opened, loaded) =
+            mpsc::channel::<Result<(usize, usize, usize, EngineProps), String>>();
         let n_vocab = vocab.n_vocab();
         let worker = std::thread::Builder::new()
             .name("engine".to_owned())
@@ -719,7 +758,12 @@ impl SeatEngine {
                     }
                 };
                 if opened
-                    .send(Ok((g.ctx_max(), g.pass_rows(), g.props(props))))
+                    .send(Ok((
+                        g.ctx_max(),
+                        g.pass_rows(),
+                        g.turn_slots(),
+                        g.props(props),
+                    )))
                     .is_err()
                 {
                     return;
@@ -792,8 +836,8 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, props) = match loaded.recv() {
-            Ok(Ok((c, rows, props))) => (c.min(defined), rows, props),
+        let (ctx_max, rows, turn_slots, props) = match loaded.recv() {
+            Ok(Ok((c, rows, t, props))) => (c.min(defined), rows, t, props),
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
@@ -807,12 +851,21 @@ impl SeatEngine {
             vocab,
             ctx_max,
             rows,
+            turn_slots,
             card,
             props,
             cache_ram,
             note: S::note,
             reply: None,
         })
+    }
+
+    /// The most slots that may take the engine in turns, the opened seat's
+    /// answer ([`Seat::turn_slots`]): no limit unless the seat's state does
+    /// not survive a park.
+    #[must_use]
+    pub fn turn_slots(&self) -> usize {
+        self.turn_slots
     }
 }
 
@@ -1262,5 +1315,44 @@ mod tests {
             ..ram
         };
         assert_eq!(tight.park_or_none(None), 0);
+    }
+
+    /// The engine's own turn bound ([`Seat::turn_slots`],
+    /// [`Parallel::of_turn_slots`]): the elastic default holds no more slots
+    /// than the engine takes its one sequence in turns in, the rule naming
+    /// the engine when its bound is what held the count; the flag's bound is
+    /// the operator's ask, held by the budget's holds alone.
+    #[test]
+    fn the_engines_turn_bound_holds_the_elastic_default() {
+        use super::{PARALLEL_CAP, Parallel};
+        let s = 1 << 30;
+        // The default: the budget holds the cap, the engine fewer turn slots.
+        for bound in [1, 2] {
+            let p = Parallel::of_turn_slots(None, 90 * s, s, bound);
+            assert_eq!((p.slots, p.rule), (bound, "engine"), "bound {bound}");
+        }
+        // A bound past what the cap or the budget holds names nothing.
+        let p = Parallel::of_turn_slots(None, 90 * s, s, usize::MAX);
+        assert_eq!((p.slots, p.rule), (PARALLEL_CAP, "budget"));
+        let p = Parallel::of_turn_slots(None, 2 * s, s, 4);
+        assert_eq!((p.slots, p.rule), (3, "budget"), "the budget holds three");
+        // A budget that holds no state stays the plain engine.
+        let p = Parallel::of_turn_slots(None, 0, s, 1);
+        assert_eq!((p.slots, p.rule), (1, "plain"));
+        // The flag: bounded by the budget's holds alone, never the engine's
+        // bound — a flag past what the engine takes is the seat's refusal.
+        let p = Parallel::of_turn_slots(Some(3), 90 * s, s, 1);
+        assert_eq!(p.slots, 3, "the flag's bound unchanged by the engine's");
+    }
+
+    /// A MiB value past u64 bytes names the flag it parsed
+    /// ([`CacheRam::parse_mib`]): the park flag's, not the cache's.
+    #[test]
+    fn a_mib_value_past_u64_names_the_flag_it_parsed() {
+        let e = super::CacheRam::parse_mib("--park-ram", &(1u64 << 44).to_string())
+            .expect_err("2^44 MiB passes u64 bytes");
+        let e = e.to_string();
+        assert!(e.contains("--park-ram 17592186044416 MiB"), "{e}");
+        assert!(!e.contains("--cache-ram"), "{e}");
     }
 }

@@ -51,22 +51,26 @@
 //! in turns (`serve::SwapEngine`); the default is what the parked states'
 //! budget holds of one slot's whole-context state — the plan's KV rows, the
 //! ring shadows and the history, at the ctx the server loads — the lesser of
-//! `bind::PARALLEL_CAP` and it, never below the plain engine, and the flag
-//! an upper bound on the same, so `--parallel 1` keeps the plain engine: a
-//! request that arrives while another decodes preempts it at the next step,
-//! the running request's sequence state parked in host RAM, and the live
-//! requests then take turns of `serve::QUANTUM` tokens. The parked states'
+//! `bind::PARALLEL_CAP`, it and the engine's own turn bound
+//! (`bind::Seat::turn_slots`: one slot under the DSpark draft), never below
+//! the plain engine, and the flag an upper bound on the same, so
+//! `--parallel 1` keeps the plain engine: a request that arrives while
+//! another decodes preempts it at the next step, the running request's
+//! sequence state parked in host RAM, and the live requests then take turns
+//! of `serve::QUANTUM` tokens. The parked states'
 //! budget is `--park-ram` (MiB), by default the lesser of [`CACHE_RAM_CAP`]
 //! and the host headroom the prompt cache leaves (`/metrics`'
 //! `swap_park_budget_bytes`); a request that would park a state past it is a
 //! 503 naming the budget. A `parallel` line on stderr names the rule
-//! (`plain`, `budget` or `flag`), the slots and each term. `--queue-depth Q`
+//! (`plain`, `budget`, `engine` or `flag`), the slots and each term, after
+//! the load — the turn bound is read from the opened seat. `--queue-depth Q`
 //! bounds the requests that wait for a slot. Several slots are refused by
 //! name under the DSpark draft (a state put back starts the draft over, and a
-//! turn has no prompt call to feed it its window) and under
-//! `BLOOMERY_ROUTE_TRACE` (a turn's steps would follow another request's
-//! call row); the lookup draft rebuilds its tables from the target's history
-//! at a turn's first pass and drafts on.
+//! turn has no prompt call to feed it its window) — the elastic default
+//! resolves to one slot there, the `parallel` line naming the engine — and
+//! under `BLOOMERY_ROUTE_TRACE` (a turn's steps would follow another
+//! request's call row); the lookup draft rebuilds its tables from the
+//! target's history at a turn's first pass and drafts on.
 //!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
@@ -196,8 +200,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: usize::try_from(workstation::CTX_MAX)?,
         alias: None,
         cache_ram: None,
-        // The elastic default ([`Parallel`]): a lone request pays nothing for
-        // a second slot (the turns act only on a second arrival), and
+        // The elastic default ([`Parallel`]): the turns act only on a second
+        // arrival, and a lone request stays on the slot the engine holds
+        // unless another slot's parked state shares more of its prompt;
         // `--parallel 1` keeps the plain engine.
         parallel: None,
         queue_depth: None,
@@ -373,12 +378,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Some(n) if n >= 2 => park_budget(a.park_ram, headroom, cache_ram, n)?,
         _ => park_left(a.park_ram, headroom, cache_ram),
     };
-    // The elastic slot count ([`Parallel`]): one slot's whole-context state
-    // the budget's unit, the flag an upper bound, the default what the
-    // budget holds.
-    let parallel = Parallel::of(a.parallel, budget, state);
-    eprintln!("{}", parallel.line());
-    let park = (parallel.slots > 1).then_some((parallel.slots, budget));
     Record::new(&record::CACHE_CONFIG)
         .u("ram", cache_ram)
         .u("headroom", headroom)
@@ -413,6 +412,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         props,
         cache_ram,
     )?;
+    // The elastic slot count ([`Parallel`]): one slot's whole-context state
+    // the budget's unit, the flag an upper bound, the default what the
+    // budget holds within the engine's own turn bound — read from the opened
+    // seat ([`Seat::turn_slots`]), one slot under the DSpark draft, whose
+    // state does not survive a park.
+    let parallel = Parallel::of_turn_slots(a.parallel, budget, state, engine.turn_slots());
+    eprintln!("{}", parallel.line());
+    let park = (parallel.slots > 1).then_some((parallel.slots, budget));
 
     let config = ServerConfig {
         model_alias: a.alias.unwrap_or(name),
@@ -844,6 +851,18 @@ impl Seat for V41 {
         match self.draft {
             Served::Off => 1,
             Served::Lookup(..) | Served::Dspark(_) => PAIR_ROWS,
+        }
+    }
+
+    /// One slot under the DSpark draft ([`Seat::turn_slots`]): a slot's
+    /// state put back starts the draft over, and a turn has no prompt call
+    /// to feed it its window, so the engine's one sequence never survives a
+    /// park. The lookup rebuilds its tables at a turn's first pass, so it
+    /// takes turns like the plain path.
+    fn turn_slots(&self) -> usize {
+        match self.draft {
+            Served::Dspark(_) => 1,
+            Served::Off | Served::Lookup(..) => usize::MAX,
         }
     }
 

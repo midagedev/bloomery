@@ -811,12 +811,12 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--place" => a.place = Place38::parse(v)?,
             "--ctx-size" | "--ctx" => a.ctx = Some(v.parse()?),
             "--alias" => a.alias = Some(v.to_owned()),
-            "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(v)?),
+            "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             "--parallel" | "-np" => a.parallel = Some(v.parse()?),
             "--queue-depth" => a.queue_depth = Some(v.parse()?),
-            "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(v)?),
+            "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(flag, v)?),
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }

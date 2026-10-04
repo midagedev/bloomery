@@ -517,8 +517,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         template_file: None,
         prefill: PrefillMode::Batch,
         plan_only: false,
-        // The elastic default ([`Parallel`]): a lone request pays nothing for
-        // a second slot (the turns act only on a second arrival), and
+        // The elastic default ([`Parallel`]): the turns act only on a second
+        // arrival, and a lone request stays on the slot the engine holds
+        // unless another slot's parked state shares more of its prompt;
         // `--parallel 1` keeps the plain engine.
         parallel: None,
         queue_depth: None,
@@ -542,11 +543,11 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--place" => a.place = glm_place::parse(v)?,
             "--ctx" => a.ctx = Some(v.parse()?),
             "--alias" => a.alias = Some(v.to_owned()),
-            "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(v)?),
+            "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
             "--parallel" | "-np" => a.parallel = Some(v.parse()?),
             "--queue-depth" => a.queue_depth = Some(v.parse()?),
-            "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(v)?),
+            "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(flag, v)?),
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
             "--prefill" => {
                 a.prefill = PrefillMode::from_name(v)
