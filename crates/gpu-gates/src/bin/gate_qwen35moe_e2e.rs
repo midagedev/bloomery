@@ -11,7 +11,10 @@
 //!   (`m` memcpys of a row into its head, the rest kernels), at `m` = 5 and
 //!   8; each count also equals the body's own launch count
 //!   (`Body35::pass_launches`) plus its heads. The layer stores' bytes equal
-//!   their derivation from the header ([`store_bytes`]).
+//!   their derivation from the header ([`store_bytes`]). The flash
+//!   launches' grids: the segment pass `n_kv · SEGMENTS` blocks an
+//!   attention layer and the merge `n_head`, one of each an attention
+//!   layer, whatever the cache height the load allocated.
 //! - (p) one layer body: the batch set's five tokens as five decode steps
 //!   in graph mode, as one pass of five rows (`step_rows`) and as five eager
 //!   steps, each from zero stores written by the gate, then as five graph
@@ -87,7 +90,10 @@
 //!   non-checkpoint is refused by name; a cut to the last inner mark and
 //!   the re-fed tail leave the token, the last logits and every store bit
 //!   for bit the uncut call's (the call takes its points back, the mark
-//!   held); a reset drops every point. FAIL-first mutants, each red on its
+//!   held); a reset drops every point, and the captured step after it holds
+//!   the flash launches at this load's height with (s)'s grids — the
+//!   engine-level two-height pin, no second load of its own. FAIL-first
+//!   mutants, each red on its
 //!   line: the spacing put back at the flat 512 it was (the points and the
 //!   walk count red); the restore omitted (the cut a Stay: the re-feed runs
 //!   from the fed state, the stores and logits red); `kept` answering the
@@ -178,11 +184,13 @@ mod q3place;
 #[cfg(feature = "gpu")]
 mod gate {
     use super::q3place::{self, PlaceQ3};
+    use bloomery_gpu::NodeInfo;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
         Body35, Delta35Run, Gqa35Run, KvQ8, LayerKind35, Mixer35Run, Open35, PrefillPath,
         Qwen35moeModel, StoreHost,
     };
+    use bloomery_gpu::flash_gqa::SEGMENTS;
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::route_core::sigmoid;
@@ -488,6 +496,48 @@ mod gate {
 
     // ------------------------------------------------------ (s) structure
 
+    /// The flash launches' grids in a captured step (module doc, (s) and
+    /// (k)): the segment pass `N_KV · SEGMENTS` blocks an attention layer —
+    /// the eight-head `_256` entries, one pack a key head — and the merge
+    /// `N_HEAD` blocks, one of each an attention layer, whatever the cache
+    /// height the load allocated; and each kind's distinct grids and node
+    /// count as the graph holds them, for the line. The entry names print
+    /// when they are not the tensor-core ones the load picks.
+    fn flash_grid_ok(nodes: &[NodeInfo]) -> Result<(bool, String), GateError> {
+        let want = [
+            [u32::try_from(N_KV * SEGMENTS)?, 1, 1],
+            [u32::try_from(N_HEAD)?, 1, 1],
+        ];
+        let (mut grids, mut count): ([Vec<[u32; 3]>; 2], [usize; 2]) = Default::default();
+        let mut names: Vec<&str> = Vec::new();
+        for kn in nodes.iter().filter_map(|n| n.kernel.as_ref()) {
+            let Some(i) = ["gqa_flash_seg", "gqa_flash_merge"]
+                .iter()
+                .position(|p| kn.name.starts_with(p))
+            else {
+                continue;
+            };
+            count[i] += 1;
+            if !grids[i].contains(&kn.grid) {
+                grids[i].push(kn.grid);
+            }
+            if !names.contains(&kn.name.as_str()) {
+                names.push(kn.name.as_str());
+            }
+        }
+        if names != ["gqa_flash_seg_mma_256", "gqa_flash_merge_256"] {
+            println!("structure flash entries: {names:?}");
+        }
+        let ok = (0..2).all(|i| grids[i] == [want[i]] && count[i] == N_ATTN);
+        Ok((
+            ok,
+            format!(
+                "seg {:?} x{} merge {:?} x{} (want [{:?}] and [{:?}] x{N_ATTN})",
+                grids[0], count[0], grids[1], count[1], want[0], want[1]
+            ),
+        ))
+    }
+
     fn structure(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
         let body = m.body("structure")?;
         let kinds = body.kinds();
@@ -519,6 +569,9 @@ mod gate {
             verdict(pass)
         );
         ok &= pass;
+        let (flash_ok, got) = flash_grid_ok(&m.step_graph_nodes()?)?;
+        println!("structure flash grid {got} {}", verdict(flash_ok));
+        ok &= flash_ok;
         for (rows, nodes, list) in [
             (5usize, m.capture_rows::<5>()?, m.rows_graph_nodes::<5>()?),
             (8, m.capture_rows::<8>()?, m.rows_graph_nodes::<8>()?),
@@ -1872,7 +1925,17 @@ mod gate {
             "checkpoints: a reset drops every point {}",
             verdict(dropped)
         );
-        Ok(ok && dropped)
+        // The flash grid at this load's height (4,352 rows, not the (s)
+        // clause's 1,088): the same SEGMENTS-sized segment pass and head
+        // merge as (s) — the engine-level two-height pin, on a capture that
+        // runs after the reset and so changes nothing above.
+        m.capture_step()?;
+        let (flash_ok, got) = flash_grid_ok(&m.step_graph_nodes()?)?;
+        println!(
+            "checkpoints flash grid at ctx {KCTX}: {got} {}",
+            verdict(flash_ok)
+        );
+        Ok(ok && dropped && flash_ok)
     }
 
     // ---------------------------------------------------- (r) refusals

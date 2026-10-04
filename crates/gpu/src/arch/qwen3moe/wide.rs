@@ -238,16 +238,16 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize, forms: Forms) -> usize {
     let n = rows.min(GEMV_COLS);
     let (q_len, kv_len, att, slots) = (d.q_rows, d.kv_len(), d.attn_len(), d.slots());
     let part_v = if d.head == HEAD_256 {
-        partials_v_len_256(n, d.n_head, d.ctx)
+        partials_v_len_256(n, d.n_head)
     } else {
-        partials_v_len(n, d.n_head, d.ctx)
+        partials_v_len(n, d.n_head)
     };
     let f32s = 3 * rows * d.hidden
         + rows * (q_len + 2 * kv_len)
         + if q_len == att { 0 } else { rows * att }
         + if rows > 1 { n * kv_len } else { 0 }
         + part_v
-        + partials_ms_len(n, d.n_head, d.ctx)
+        + partials_ms_len(n, d.n_head)
         + rows * att
         + rows * slots * (d.ff + d.hidden)
         + if forms.glu { 2 * n * slots * d.ff } else { 0 }

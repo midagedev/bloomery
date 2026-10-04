@@ -31,7 +31,8 @@
 #             attention (ik: GGML_PAD(n_ctx, llama_kv_cache::get_padding(flash_attn)) in
 #             src/llama.cpp; mainline: GGML_PAD(n_ctx, 256) in src/llama-context.cpp), so the
 #             caches have one height (mistral.rs: below).
-#             Our flash grid is fixed by C (flash_gqa::segments_for), so C goes into the row.
+#             Our flash grid no longer depends on C (flash_gqa::SEGMENTS); C still sets the cache
+#             height every engine gets, so C goes into the row.
 #             BLOOMERY_GEN_CTX fixes C for every ours arm instead, e.g. at a serving height.
 #             The row also carries `pp_tok/s <v> (n=D, passes=K)` from the binary's `time prompt`
 #             row, the wall of that prefill (Prefill below): one arm reports both the prefill of

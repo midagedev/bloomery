@@ -361,7 +361,7 @@ fn hw_qwen4exp_mtp_plan() {
                 .map(|l| model::placement::KvBytes::layer_bytes(&inputs.kv, l, ctx))
                 .sum::<u64>()
                 + ctx * DRAFT_KV_ROW
-                + model::arch::qwen35moe::place::mtp_arena_bytes(u64::from(full.draft.vocab), ctx)
+                + model::arch::qwen35moe::place::mtp_arena_bytes(u64::from(full.draft.vocab))
         };
         let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);
         while lo < hi {
@@ -433,8 +433,18 @@ fn hw_qwen4exp_mtp_plan() {
 // experts and 146,415,616 B of rounding; the host 119 or 120 a layer, 5,730 experts]. Row: the
 // A6000's (high, at_high, low), both cards' (high, at_high), the tier's experts, expert bytes,
 // rounding.
+// PIN(2026-10-04): re-pinned for the decode flash's fixed segment count (`flash_gqa::SEGMENTS`, 80
+// at every cache height): the draft program's arena (`place::mtp_arena_bytes`) grows 3,170,304 B at
+// ctx 4,096 (64 -> 80 segments of 49,536 f32), so the A6000's "MTP draft" reserve grows by it and
+// plan (a)'s drafted row, qwen4exp_meta's CARD_PLANS A6000 4k U 4,096 row, loses one expert
+// (244/17/243): the A6000 242 on the first 41 layers, 241 on the rest, 11,609 experts; both cards'
+// spread keeps the tier's 7,236 experts, bytes and rounding, now 393 on the first 29: the tier holds
+// 151 on layers 0-28 and 41-47 and 150 on 29-40, the host 5,731 [predicted: one expert off the
+// A6000 (3,170,304 B against 3,072,000 B an expert and the granules' slack) and the tier's terms
+// unchanged; the box's planner on this tree: as predicted, the old pins red on exactly the A6000's
+// split and the tier's].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (242, 42, 241, 393, 30, 7_236, 22_676_889_600, 146_415_616);
+    (242, 41, 241, 393, 29, 7_236, 22_676_889_600, 146_415_616);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`

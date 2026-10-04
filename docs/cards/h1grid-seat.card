@@ -1,0 +1,40 @@
+# h1grid, window 1 of 2: the decode flash grid fixed at flash_gqa::SEGMENTS (80) segments a
+# (row, key head) instead of ceil(ctx / 64), at the A6000 serve seat's default cache height.
+# The base is the fix's parent at landing (the commit the fix rebases onto), built in a detached
+# worktree at ~/repo/bloomery-h1grid-base, so the ratio holds only this change.
+# Arms: BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/h1grid-seat.card BLOOMERY_GEN_CTX=261120'
+#   just depth-gpu-qwen3moe 6 bin:/root/repo/bloomery-h1grid-base/target/release/generate_qwen3moe:6
+# Derivation [derived]: base at --ctx 261,120 launches 16,320 seg blocks a layer, 16,312-16,316 of
+# them past the live count; each empty block holds an SM slot for tau = 0.3-0.6 us (launch, one
+# n_keys load from L2, lane-0 neutral stores, exit) over 252-336 slots (gqa_flash_seg_mma: 22,272 B
+# static smem, 256 threads, 3-4 blocks/SM by regs and smem), so 14-38 us a layer past the live
+# blocks' shadow, 0.70-1.88 ms a token over 48 layers. The fix launches 320 a layer (316 empty,
+# one wave, inside the 3-5 us the 4-8 live blocks take: 0). Base step at depth 6 is the README row
+# 4.780 ms (209.2 tok/s @ n=96, depth 6, C=256, A6000, rig-log 09-27#qwen3-xeng); its 252 empty
+# blocks at C 4096 sit in the same shadow. Effect = 4.78/(4.78 + 0.70..1.88) inverse: +14.6..+39.3 %.
+# Calibration of the empty-block model: plan-ledger A4 (V2-Lite MLA flash, one block a SM: ctx
+# 512 -> 4192 at depth 6 = -1.8 %, reproduced by the same tau over 84 slots) - another kernel.
+kind: ab
+question: at the A6000 seat's default cache height (261,120), how much decode speed does today's
+  ctx-sized flash grid cost at chat depth, and does the grid fixed at 80 segments a key head remove it?
+term: tok/s of the fix (ours, this tree's generate_qwen3moe) over the base (bin:, the fix's parent at
+  landing) @ n=96, depth 6, --ctx 261,120 (BLOOMERY_GEN_CTX), A6000, Qwen3-30B-A3B Q4_K_M whole, f16
+  KV, mma
+unit: %
+predict: 13..40 %
+rounds: 4
+condition: one window, both binaries at the same --ctx 261120 (each arm's load line prints it) and
+  the same lease; the fix tree's gate-gpu-qwen3moe-e2e structure clause green on its round ledger
+  (48 gqa_flash_seg_mma nodes of grid 320 in the step graph); the base is the fix's parent at landing
+  built in a detached worktree (its tree line printed with the references'); the A6000 witness blocks
+  clean at start and end of every row (no [cpu-busy], no compute process on the A6000, Xid none); a
+  row marked [cold] or FAIL is void and the window is rerun, not read
+decide-in: land the fix with the round's gates; record c_dead = (1/base - 1/fix) / (16,312 x 48)
+  per empty block in rig-log beside this window; open window 2 (h1grid-split.card) after the landing
+decide-below: under +13 %: if the paired interval excludes 0, land (the user's fix, a smaller gain
+  than derived) and re-derive tau/slots from an nsys-gpu run of both binaries at --ctx 261120, depth 6
+  (the gqa_flash_seg_mma node against 3-5 us fix, 17-43 us base); if it includes 0 or the fix is
+  slower, do not land: that nsys run first, then the round's structure clause on the fix binary
+decide-above: land the fix; past +40 % an empty block costs more than one slot lifetime (the
+  dispatcher or the 1 MB of neutral part_ms stores a layer binds): re-derive c_dead and move the
+  other ctx-sized grids (crate::flash's segments_for(ctx_max), kpool's pools_for(ctx)) up the triage

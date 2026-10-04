@@ -27,11 +27,20 @@
 //!    in f64 on the same f16 keys and values (the model of
 //!    `gate_qwen3moe_flash` at a head of 256: the scalar pass's score dot
 //!    `γ(67)`, 64 fused multiply-adds per rotating partial; the tensor-core
-//!    pass's `2^-11 + 2·γ(258)`), a rerun bit for bit, NaN in the cache rows
+//!    pass's `2^-11 + 2·γ(258)`; a segment's keys `flash_gqa::seg_span`'s,
+//!    64 at every count up to 5,120, so at this clause's counts the segment
+//!    count and the bound are the 64-key cut's value for value), a rerun bit
+//!    for bit, NaN in the cache rows
 //!    past the count changing no bit, eight rows in one launch each bit for bit
 //!    its one-row launch, a count of zero or past the cache raising `key_count`
 //!    with NaN in exactly those rows, the captured launch (two nodes) the eager
-//!    bits.
+//!    bits. The segment grid at two heights — the clause's cache and a tall
+//!    copy at 65,536 rows holding its live rows, NaN (the q8 sentinel bits)
+//!    in the rest — for every decode launcher (the eight-head entries
+//!    both passes, the pack-of-four at 24/2 both passes, the pack of two, the
+//!    q8 tensor-core twins of the eight-head and pack-of-four entries):
+//!    `n_kv · packs · SEGMENTS` segment blocks and `n_head` merge blocks at
+//!    both heights, the outputs the same bits.
 //! 3. Score order: a query whose two 128-value halves are equal, over keys `a`
 //!    and `b` whose halves are swapped (`b = [a_hi | a_lo]`), with values that
 //!    are multiples of 1/256. Summing each half's k16 chain on its own and then
@@ -147,6 +156,10 @@
 //!     The counts reach the kernels as their `u32` arguments, the list
 //!     entries as `u32` cache rows: a count or a row cut to 16 bits, or the
 //!     context clamped at 65,535, reads other rows or refuses the count.
+//!     The dense passes over the same cache — the Group pass (16/2) and the
+//!     p4 pass (24/2) at counts 5,120, 5,121, 65,537 and 262,144 within
+//!     their band, a rerun bit-identical, and the eight straddling rows of
+//!     the 5,120-key floor and the tall counts each its one-row launch.
 //! 16. The q8_0 read path (`flash_gqa::enqueue_pass_256_q8` and its `_p4`,
 //!     `_p2` and mma kin, `flash_gqa_prefill::enqueue_256_q8` and its `_p4`
 //!     and `_p2`, no engine caller yet), the discipline of
@@ -198,7 +211,8 @@ mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
         FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, GqaSelArgs, HEAD_256 as HEAD, KEY_TILE, PACK_2,
-        PACK_4, SEG_KEYS, partials_ms_len, partials_v_len_256, segments_for,
+        PACK_4, SEG_KEYS, SEGMENTS, listed_partials_ms_len, listed_partials_v_len_256,
+        partials_ms_len, partials_v_len_256, seg_span,
     };
     use bloomery_gpu::flash_gqa_prefill::{
         FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE,
@@ -821,14 +835,18 @@ mod gate {
         let pb: Vec<f64> = p.iter().map(|&v| v / z).collect();
         let x: Vec<f64> = s.iter().map(|&v| m - v).collect();
         let xmax = x.iter().copied().fold(0.0f64, f64::max);
-        let segs = n.div_ceil(SEG_KEYS);
+        // The cut read through `seg_span`: at or below 5,120 keys (every
+        // count but the deep clause's dense ones) span = SEG_KEYS and segs
+        // = `n.div_ceil(SEG_KEYS)`, the 64-key cut's bound value for value.
+        let span = seg_span(n, SEGMENTS, SEG_KEYS);
+        let segs = n.div_ceil(span);
         let r_ours = (n.div_ceil(KEY_TILE) + segs) as f64;
         // The scalar dot: 64 fused multiply-adds per rotating partial, two
         // combine levels, the scale.
         let es_o = gamma(HEAD / 4 + 3);
         // Each half's tensor-core chain, their sum, and the query's f16.
         let es_m = 2f64.powi(-11) + 2.0 * gamma(HEAD + 2);
-        let acc_o = gamma(SEG_KEYS + segs + 8);
+        let acc_o = gamma(span + segs + 8);
         let r_pref = n.div_ceil(PREF_TILE) as f64;
         let w16: Vec<f64> = pb
             .iter()
@@ -1021,8 +1039,8 @@ mod gate {
         let m = n_keys.len();
         let qd = DeviceBuffer::from_host(stream, q)?;
         let nk = DeviceBuffer::from_host(stream, n_keys)?;
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, sh.n_head, ctx))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, sh.n_head, ctx))?;
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, sh.n_head))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, sh.n_head))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * sh.width())?;
         enqueue_dec(
             k,
@@ -1078,10 +1096,13 @@ mod gate {
                 let (band, worst) = band_rows(sh, &q, &[live], &c.host, &y, pass);
                 let pass_ok = band && rerun && nan_same;
                 println!(
-                    "decode{tag} pass={} keys={live} ctx={ctx} segments={}: measured/bound \
+                    "decode{tag} pass={} keys={live} ctx={ctx} segments={} span={} \
+                     live_segments={}: measured/bound \
                      {worst:.3e} band={band} rerun={rerun} nan_padding_same={nan_same} {}",
                     pass.name(),
-                    segments_for(ctx),
+                    SEGMENTS,
+                    seg_span(live, SEGMENTS, SEG_KEYS),
+                    live.div_ceil(seg_span(live, SEGMENTS, SEG_KEYS)),
                     verdict(pass_ok)
                 );
                 ok &= pass_ok;
@@ -1173,10 +1194,8 @@ mod gate {
             // The captured launch: two nodes, the eager bits.
             let qd = DeviceBuffer::from_host(stream, &rows)?;
             let nk = DeviceBuffer::from_host(stream, &counts)?;
-            let mut pv =
-                DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(ROWS, sh.n_head, ctx))?;
-            let mut pms =
-                DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, sh.n_head, ctx))?;
+            let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(ROWS, sh.n_head))?;
+            let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, sh.n_head))?;
             let mut yg = DeviceBuffer::<f32>::zeroed(stream, ROWS * w)?;
             let graph = gpu.capture(|s| {
                 enqueue_dec(
@@ -1564,6 +1583,178 @@ mod gate {
         Ok((ok, win))
     }
 
+    /// The grid clause's tall height: past every count the decode clauses
+    /// hold, under the 65,537-key count the deep clause walks.
+    const GRID_TALL_CTX: usize = 65_536;
+
+    /// `planes` — [`N_KV`] planes of `ctx` rows of `per_row` values — as
+    /// planes of `tall` rows: each plane's first `live` rows its first rows,
+    /// `fill` in the rest.
+    fn tall_planes<T: Copy>(
+        planes: &[T],
+        per_row: usize,
+        (ctx, live, tall): (usize, usize, usize),
+        fill: T,
+    ) -> Vec<T> {
+        let mut out = vec![fill; N_KV * tall * per_row];
+        for kh in 0..N_KV {
+            let (from, to) = (kh * ctx * per_row, kh * tall * per_row);
+            out[to..to + live * per_row].copy_from_slice(&planes[from..from + live * per_row]);
+        }
+        out
+    }
+
+    /// The grid clause (module doc, 2): every decode launcher's segment grid
+    /// at its clause's height and at [`GRID_TALL_CTX`] — `n_kv · packs ·
+    /// SEGMENTS` blocks, the merge's `n_head`, the outputs the same bits.
+    /// The tall planes hold the clause cache's live rows in their first rows
+    /// and NaN (the q8 sentinel bits) in the rest. The eight-head entries
+    /// both passes, the pack-of-four entries at 24/2 both passes, the pack
+    /// of two (24/2, its only pass) and the q8 tensor-core twins of the
+    /// eight-head and the pack-of-four entries.
+    fn grid_heights_check(gpu: &Gpu, k: &FlashGqaKernels) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let (live, seed) = (1025usize, 500u32);
+        let short = live + PAD;
+        let rows = (short, live, GRID_TALL_CTX);
+        let c = cache(stream, short, live, seed)?;
+        let c8 = cache_q8(stream, short, live, seed)?;
+        let (kt, vt) = (
+            DeviceBuffer::from_host(stream, &tall_planes(&c.kb, HEAD, rows, NAN16))?,
+            DeviceBuffer::from_host(stream, &tall_planes(&c.vb, HEAD, rows, NAN16))?,
+        );
+        let codes = |b: &DeviceBuffer<u32>| -> Result<DeviceBuffer<u32>, GateError> {
+            let t = tall_planes(&b.to_host_vec(stream)?, HEAD / 4, rows, SENTINEL_Q8_CODE);
+            Ok(DeviceBuffer::from_host(stream, &t)?)
+        };
+        let scales = |b: &DeviceBuffer<u16>| -> Result<DeviceBuffer<u16>, GateError> {
+            let t = tall_planes(&b.to_host_vec(stream)?, HEAD / 32, rows, SENTINEL_Q8_SCALE);
+            Ok(DeviceBuffer::from_host(stream, &t)?)
+        };
+        let (kqt, kdt, vqt, vdt) = (
+            codes(&c8.kq)?,
+            scales(&c8.kd)?,
+            codes(&c8.vq)?,
+            scales(&c8.vd)?,
+        );
+        let q: Vec<f32> = activations(HEAD, N_HEAD_Q38, seed + 5)
+            .iter()
+            .map(|v| v * SEED_Q_SCALE)
+            .collect();
+        let qd = DeviceBuffer::from_host(stream, &q)?;
+        let q36 = DeviceBuffer::from_host(stream, &q[..N_HEAD * HEAD])?;
+        let nk = DeviceBuffer::from_host(stream, &[u32::try_from(live)?])?;
+        // (tag, n_head, entry, mma, q8): entry 0 the eight-head `_256`, 1
+        // the `_p4`, 2 the `_p2`.
+        let arms: [(&str, usize, u8, bool, bool); 7] = [
+            ("", N_HEAD, 0, false, false),
+            ("", N_HEAD, 0, true, false),
+            (" p4 24/2", N_HEAD_Q38, 1, false, false),
+            (" p4 24/2", N_HEAD_Q38, 1, true, false),
+            (" p2 24/2", N_HEAD_Q38, 2, false, false),
+            (" q8", N_HEAD, 0, true, true),
+            (" q8 p4 24/2", N_HEAD_Q38, 1, true, true),
+        ];
+        let mut ok = true;
+        for &(tag, n_head, entry, mma, q8) in &arms {
+            let pack = [GROUP, PACK_4, PACK_2][usize::from(entry)];
+            let packs = n_head / (N_KV * pack);
+            let want_seg = [u32::try_from(N_KV * packs * SEGMENTS)?, 1, 1];
+            let want_merge = [u32::try_from(n_head)?, 1, 1];
+            let mut outs = Vec::with_capacity(2);
+            let mut grids = Vec::with_capacity(2);
+            for ctx in [short, GRID_TALL_CTX] {
+                let tall = ctx == GRID_TALL_CTX;
+                let (mut pv, mut pms, mut y) = (
+                    DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(1, n_head))?,
+                    DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?,
+                    DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?,
+                );
+                let graph = gpu.capture(|s| {
+                    if q8 {
+                        let (kq, kd, vq, vd) = if tall {
+                            (&kqt, &kdt, &vqt, &vdt)
+                        } else {
+                            (&c8.kq, &c8.kd, &c8.vq, &c8.vd)
+                        };
+                        let a = GqaQ8Args {
+                            q: if n_head == N_HEAD { &q36 } else { &qd },
+                            kq,
+                            kd,
+                            vq,
+                            vd,
+                            n_keys: &nk,
+                            scale: scale(),
+                            n_kv: N_KV,
+                            ctx,
+                            m: 1,
+                            part_v: &mut pv,
+                            part_ms: &mut pms,
+                            fault: gpu.unlabelled_sink(),
+                            y: &mut y,
+                        };
+                        match entry {
+                            1 => k.enqueue_pass_256_p4_q8(s, a, n_head, mma),
+                            _ => k.enqueue_pass_256_q8(s, a, mma),
+                        }
+                    } else {
+                        let (kc, vc) = if tall { (&kt, &vt) } else { (&c.kc, &c.vc) };
+                        let a = GqaArgs {
+                            q: if n_head == N_HEAD { &q36 } else { &qd },
+                            kc,
+                            vc,
+                            n_keys: &nk,
+                            scale: scale(),
+                            n_kv: N_KV,
+                            ctx,
+                            m: 1,
+                            part_v: &mut pv,
+                            part_ms: &mut pms,
+                            fault: gpu.unlabelled_sink(),
+                            y: &mut y,
+                        };
+                        match entry {
+                            1 => k.enqueue_pass_256_p4(s, a, n_head, mma),
+                            2 => k.enqueue_pass_256_p2(s, a, n_head),
+                            _ => k.enqueue_pass_256(s, a, mma),
+                        }
+                    }
+                })?;
+                graph.launch(stream)?;
+                stream.synchronize()?;
+                let nodes = graph.nodes()?;
+                let grid = |prefix: &str| {
+                    nodes.iter().find_map(|n| {
+                        n.kernel
+                            .as_ref()
+                            .filter(|kn| kn.name.starts_with(prefix))
+                            .map(|kn| kn.grid)
+                    })
+                };
+                let two = nodes.len() == 2 && nodes.iter().all(|n| n.kernel.is_some());
+                grids.push((two, grid("gqa_flash_seg"), grid("gqa_flash_merge")));
+                outs.push(y.to_host_vec(stream)?);
+            }
+            let name = if mma { "mma" } else { "scalar" };
+            let same = bits_equal(&outs[0], &outs[1]);
+            let pass_ok = same
+                && grids.iter().all(|&(two, seg, merge)| {
+                    two && seg == Some(want_seg) && merge == Some(want_merge)
+                });
+            println!(
+                "flash grid{tag} pass={name} ctx={short},{GRID_TALL_CTX} seg_grid={:?},{:?} \
+                 (want {want_seg:?}) merge_grid={:?},{:?} outputs_bit_identical={same} {}",
+                grids[0].1,
+                grids[1].1,
+                grids[0].2,
+                grids[1].2,
+                verdict(pass_ok)
+            );
+            ok &= pass_ok;
+        }
+        Ok(ok)
+    }
+
     /// The pack-of-four entries against the eight-head ones on Qwen3.6's
     /// layout (two packs a key head): a row's arithmetic does not depend on
     /// the rows or heads that share its block or its tensor-core tile, so both
@@ -1764,8 +1955,8 @@ mod gate {
         let m = n_keys.len();
         let qd = DeviceBuffer::from_host(stream, q)?;
         let nk = DeviceBuffer::from_host(stream, n_keys)?;
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, n_head, ctx))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head, ctx))?;
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, n_head))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * n_head * HEAD)?;
         let (kq, kd, vq, vd) = if sentinel {
             (&c.knq, &c.knd, &c.vnq, &c.vnd)
@@ -1882,9 +2073,12 @@ mod gate {
             let (band, worst) = band_rows(sh, &q, &[live], &c.scalar_host, &y, Pass::Scalar);
             let pass_ok = band && rerun && sentinel;
             println!(
-                "decode q8{tag} pass=scalar keys={live} ctx={ctx} segments={}: measured/bound \
+                "decode q8{tag} pass=scalar keys={live} ctx={ctx} segments={} span={} \
+                 live_segments={}: measured/bound \
                  {worst:.3e} band={band} rerun={rerun} sentinel_same={sentinel} {}",
-                segments_for(ctx),
+                SEGMENTS,
+                seg_span(live, SEGMENTS, SEG_KEYS),
+                live.div_ceil(seg_span(live, SEGMENTS, SEG_KEYS)),
                 verdict(pass_ok)
             );
             ok &= pass_ok;
@@ -2011,8 +2205,8 @@ mod gate {
         let qd = DeviceBuffer::from_host(stream, &rows)?;
         let nkd = DeviceBuffer::from_host(stream, &counts)?;
         let (mut pv, mut pms, mut yg) = (
-            DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(ROWS, n_head, ctx))?,
-            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, n_head, ctx))?,
+            DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(ROWS, n_head))?,
+            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, n_head))?,
             DeviceBuffer::<f32>::zeroed(stream, ROWS * w)?,
         );
         let graph = gpu.capture(|s| {
@@ -3697,8 +3891,10 @@ mod gate {
         mma: bool,
     ) -> Result<Vec<f32>, GateError> {
         let qd = DeviceBuffer::from_host(stream, q)?;
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, N_HEAD_Q38, WIDTH))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, N_HEAD_Q38, WIDTH))?;
+        let mut pv =
+            DeviceBuffer::<f32>::zeroed(stream, listed_partials_v_len_256(m, N_HEAD_Q38, WIDTH))?;
+        let mut pms =
+            DeviceBuffer::<f32>::zeroed(stream, listed_partials_ms_len(m, N_HEAD_Q38, WIDTH))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * Q38.width())?;
         k.enqueue_pass_256_p4_sel(
             stream,
@@ -3939,8 +4135,10 @@ mod gate {
         )?;
         let nk = DeviceBuffer::from_host(stream, &cs)?;
         let mut pooled_g = DeviceBuffer::from_host(stream, &pooled.to_host_vec(stream)?)?;
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len_256(m, N_HEAD_Q38, WIDTH))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, N_HEAD_Q38, WIDTH))?;
+        let mut pv =
+            DeviceBuffer::<f32>::zeroed(stream, listed_partials_v_len_256(m, N_HEAD_Q38, WIDTH))?;
+        let mut pms =
+            DeviceBuffer::<f32>::zeroed(stream, listed_partials_ms_len(m, N_HEAD_Q38, WIDTH))?;
         let mut ya = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
         let mut yg = DeviceBuffer::<f32>::zeroed(stream, m * w)?;
         let chain = |s: &CudaStream,
@@ -4245,10 +4443,109 @@ mod gate {
                 ok &= pass_ok;
             }
         }
+        ok &= deep_dense(k, stream, unl, (&kc, &vc), &host)?;
         println!(
             "qsa deep ctx={DEEP_CTX}: {:.1} s (runtime value)",
             t0.elapsed().as_secs_f64()
         );
+        Ok(ok)
+    }
+
+    /// The deep clause's dense counts (module doc, 15): the Group pass
+    /// (`enqueue_pass_256`, 16/2) and the p4 pass (`enqueue_pass_256_p4`,
+    /// 24/2) at counts 5,120 (the last 64-key cut), 5,121 (the first past
+    /// it), 65,537 and 262,144 over the deep clause's synthetic cache —
+    /// within the band of the exact attention in f64, a rerun
+    /// bit-identical — and one launch of [`ROWS`] rows at counts straddling
+    /// the threshold each row bit for bit its one-row launch.
+    fn deep_dense(
+        k: &FlashGqaKernels,
+        stream: &CudaStream,
+        unl: FaultSink,
+        (kc, vc): (&DeviceBuffer<u16>, &DeviceBuffer<u16>),
+        host: &HostCache,
+    ) -> Result<bool, GateError> {
+        let counts = [5_120, 5_121, 65_537, 262_144];
+        let mut ok = true;
+        for (sh, tag) in [(Q36, "group 16/2"), (Q38, "p4 24/2")] {
+            let q: Vec<f32> = activations(HEAD, sh.n_head, 715)
+                .iter()
+                .map(|v| v * SEED_Q_SCALE)
+                .collect();
+            for &live in &counts {
+                let nk = [u32::try_from(live)?];
+                let span = seg_span(live, SEGMENTS, SEG_KEYS);
+                let live_segs = live.div_ceil(span);
+                for (pass, mma) in [(Pass::Scalar, false), (Pass::Mma, true)] {
+                    let y = run_dec(k, stream, unl, sh, &q, &nk, (kc, vc), DEEP_CTX, mma)?;
+                    let y2 = run_dec(k, stream, unl, sh, &q, &nk, (kc, vc), DEEP_CTX, mma)?;
+                    let rerun = bits_equal(&y, &y2);
+                    let (band, worst) = band_rows(sh, &q, &[live], host, &y, pass);
+                    let pass_ok = band && rerun;
+                    println!(
+                        "deep dense {tag} pass={} keys={live} ctx={DEEP_CTX} \
+                         segments={SEGMENTS} span={span} live_segments={live_segs}: \
+                         measured/bound {worst:.3e} band={band} rerun={rerun} {}",
+                        pass.name(),
+                        verdict(pass_ok)
+                    );
+                    ok &= pass_ok;
+                }
+            }
+            // The straddling rows: row `t` the query with its heads rotated
+            // by `t`, at counts around the 5,120-key floor and the tall
+            // counts, each its one-row launch.
+            let straddle = [
+                5_119, 5_120, 5_121, 5_122, 65_537, 261_119, 261_120, 262_144,
+            ];
+            let q1 = &q;
+            let rows: Vec<f32> = (0..ROWS)
+                .flat_map(|t| {
+                    (0..sh.n_head)
+                        .flat_map(move |h| q1[((h + t) % sh.n_head) * HEAD..][..HEAD].to_vec())
+                })
+                .collect();
+            let counts_d: Vec<u32> = straddle
+                .iter()
+                .map(|&c| u32::try_from(c))
+                .collect::<Result<_, _>>()?;
+            for (pass, mma) in [(Pass::Scalar, false), (Pass::Mma, true)] {
+                let all = run_dec(
+                    k,
+                    stream,
+                    unl,
+                    sh,
+                    &rows,
+                    &counts_d,
+                    (kc, vc),
+                    DEEP_CTX,
+                    mma,
+                )?;
+                let w = sh.width();
+                let mut same = true;
+                for (t, &c) in straddle.iter().enumerate() {
+                    let one = run_dec(
+                        k,
+                        stream,
+                        unl,
+                        sh,
+                        &rows[t * w..(t + 1) * w],
+                        &[u32::try_from(c)?],
+                        (kc, vc),
+                        DEEP_CTX,
+                        mma,
+                    )?;
+                    same &= bits_equal(&all[t * w..(t + 1) * w], &one);
+                }
+                println!(
+                    "deep dense {tag} straddling rows pass={} counts={straddle:?} \
+                     each_row_its_one_row_launch={same} {}",
+                    pass.name(),
+                    verdict(same)
+                );
+                ok &= same;
+            }
+        }
         Ok(ok)
     }
 
@@ -4290,6 +4587,9 @@ mod gate {
         let d = decode_check(&gpu, &k, Q38, &DEC_KEYS_Q38)?;
         println!("decode flash 256 p4 {}", verdict(d));
         ok &= d;
+        let g = grid_heights_check(&gpu, &k)?;
+        println!("decode flash grid at two heights {}", verdict(g));
+        ok &= g;
         let x = cross_check(&gpu, &k, &kp)?;
         println!("cross geometry {}", verdict(x));
         ok &= x;

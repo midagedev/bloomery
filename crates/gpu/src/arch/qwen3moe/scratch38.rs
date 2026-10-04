@@ -18,7 +18,7 @@ use super::scratch::{
     Dims, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, RecStore, param_view, put_input,
 };
 use crate::GpuError;
-use crate::flash_gqa::{partials_ms_len, partials_v_len_256};
+use crate::flash_gqa::{listed_partials_ms_len, listed_partials_v_len_256};
 use crate::hc_gated::HcScratch;
 use crate::linear::{self, LinearShape};
 use crate::ple;
@@ -391,8 +391,14 @@ impl Arena38 {
                 k: f(geo::KV)?,
                 v: f(geo::KV)?,
                 q: f(geo::ATTN)?,
-                part_v: DeviceBuffer::zeroed(stream, partials_v_len_256(sel, geo::N_HEAD, width))?,
-                part_ms: DeviceBuffer::zeroed(stream, partials_ms_len(sel, geo::N_HEAD, width))?,
+                part_v: DeviceBuffer::zeroed(
+                    stream,
+                    listed_partials_v_len_256(sel, geo::N_HEAD, width),
+                )?,
+                part_ms: DeviceBuffer::zeroed(
+                    stream,
+                    listed_partials_ms_len(sel, geo::N_HEAD, width),
+                )?,
                 kr: f(geo::IDX_DIM)?,
                 qr: f(geo::IDX_HEADS * geo::IDX_DIM)?,
                 qi: f(geo::IDX_HEADS * geo::IDX_DIM)?,

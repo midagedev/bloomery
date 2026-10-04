@@ -13,7 +13,10 @@
 //!   them a memcpy (the combine writes the next layer's input in place) or
 //!   a host node; the captured prefill pass holds [`NODES_PASS_1`] nodes at
 //!   one token and [`NODES_PASS_M`] at every count from two to `MAX_TOKENS`,
-//!   all of them kernels.
+//!   all of them kernels. The flash launches' grids, in the step and in
+//!   every prefill pass: the segment pass `m · n_kv · SEGMENTS` blocks a
+//!   layer whatever the cache height, the merge `m · n_head`, one of each
+//!   a layer.
 //! - (k) the clear: right after (s), before any token has run, three arms
 //!   through the session (`app::Session::arms`), each after the first from
 //!   `Session::clear` — a GEMM ubatch arm (the prose's first [`CLEAR_A`] ids
@@ -216,10 +219,12 @@ mod gate {
     use super::q3place::{self, PlaceQ3};
     use super::taps;
     use app::Session;
+    use bloomery_gpu::NodeInfo;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{Body, KvQ8, KvQ8Host, PrefillPath};
     use bloomery_gpu::flash_gqa::HEAD;
+    use bloomery_gpu::flash_gqa::SEGMENTS;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel, Slots};
@@ -698,6 +703,50 @@ mod gate {
              (want {MEMCPY_CHAIN}) memset={memset} host={host} (want 0) other={other} {}",
             verdict(pass)
         );
+        // The flash launches' grids, whatever the cache height: the segment
+        // pass `m · n_kv · SEGMENTS` blocks a layer, the merge `m · n_head`,
+        // one of each a layer; the line prints each kind's distinct grids and
+        // node count as the graph holds them. The entry names print when they
+        // are not the tensor-core ones the load picks.
+        let hp = m.body("gate_qwen3moe_e2e")?.hparams();
+        let (n_kv, n_head, n_layer) = (hp.n_head_kv, hp.n_head, hp.n_layer);
+        let flash_grids = |nodes: &[NodeInfo], rows: usize| -> Result<(bool, String), GateError> {
+            let want = [
+                [u32::try_from(rows * n_kv * SEGMENTS)?, 1, 1],
+                [u32::try_from(rows * n_head)?, 1, 1],
+            ];
+            let (mut grids, mut count): ([Vec<[u32; 3]>; 2], [usize; 2]) = Default::default();
+            let mut names: Vec<&str> = Vec::new();
+            for kn in nodes.iter().filter_map(|n| n.kernel.as_ref()) {
+                let Some(i) = ["gqa_flash_seg", "gqa_flash_merge"]
+                    .iter()
+                    .position(|p| kn.name.starts_with(p))
+                else {
+                    continue;
+                };
+                count[i] += 1;
+                if !grids[i].contains(&kn.grid) {
+                    grids[i].push(kn.grid);
+                }
+                if !names.contains(&kn.name.as_str()) {
+                    names.push(kn.name.as_str());
+                }
+            }
+            if names != ["gqa_flash_seg_mma", "gqa_flash_merge"] {
+                println!("structure flash entries: {names:?}");
+            }
+            let ok = (0..2).all(|i| grids[i] == [want[i]] && count[i] == n_layer);
+            Ok((
+                ok,
+                format!(
+                    "seg {:?} x{} merge {:?} x{} (want [{:?}] and [{:?}] x{n_layer})",
+                    grids[0], count[0], grids[1], count[1], want[0], want[1]
+                ),
+            ))
+        };
+        let (flash_ok, got) = flash_grids(&m.step_graph_nodes()?, 1)?;
+        pass &= flash_ok;
+        println!("structure flash grid m=1 {got} {}", verdict(flash_ok));
         let t = Instant::now();
         let counts = m.capture_prefill()?;
         println!(
@@ -712,10 +761,9 @@ mod gate {
             } else {
                 NODES_PASS_M
             };
-            let ([kernel], other) = count_kinds(
-                &m.prefill_graph_nodes(rows)?,
-                [sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL],
-            );
+            let list = m.prefill_graph_nodes(rows)?;
+            let ([kernel], other) =
+                count_kinds(&list, [sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL]);
             let ok = nodes == want && kernel == nodes;
             println!(
                 "structure prefill m={rows} graph_nodes={nodes} (want {want}) kernel={kernel} \
@@ -723,6 +771,12 @@ mod gate {
                 verdict(ok)
             );
             pass &= ok;
+            let (flash_ok, got) = flash_grids(&list, rows)?;
+            println!(
+                "structure prefill flash grid m={rows} {got} {}",
+                verdict(flash_ok)
+            );
+            pass &= flash_ok;
         }
         Ok(pass)
     }

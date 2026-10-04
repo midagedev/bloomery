@@ -22,7 +22,12 @@
 //!   (ours one per tile and per segment, ik's one per 32-key block and per
 //!   thread chunk);
 //! - `γ(n_acc)`: the value and weight sums — ours a segment's keys, the
-//!   segments and the butterfly, ik's every key serially.
+//!   segments and the butterfly, ik's every key serially. A segment holds
+//!   [`seg_span`]'s keys: [`SEG_KEYS`] for every count up to [`SEGMENTS`]
+//!   segments of them (5,120 keys), so at the sets' 5, 1,025 and 4,097 keys
+//!   the cut, the segment count and the bound are the 64-key ones, value for
+//!   value; past 5,120 the span grows and the segments stay at most
+//!   [`SEGMENTS`].
 //!
 //! The tensor-core pass (`gqa_flash_seg_mma`) rounds the query to f16 for
 //! its scores, so its `ε_s` is `2^-11 + 2·γ(130)` (the f16 rounding, and
@@ -122,6 +127,25 @@
 //! refused by name. Last (after the f16 window checks), `kq` at 8 bytes past
 //! a 16-byte boundary through the q8 prefill refused by name before any
 //! launch.
+//!
+//! The segment grid ([`SEGMENTS`] segments a row's key head) does not depend
+//! on the cache height, and two clauses pin it. Grid at two heights: on the first set's layer 0, the
+//! scalar pass, the tensor-core pass and the q8 tensor-core twin captured at
+//! the set's own height and on a tall copy at [`GRID_TALL_CTX`] (each kv
+//! plane's live rows its first rows, NaN in the rest, the same query, counts
+//! and partial lengths) — two kernel nodes each, the segment node's grid
+//! `n_kv · SEGMENTS` blocks and the merge's `n_head` at both heights, the
+//! two outputs bit-identical to each other and to the eager launch. Deep
+//! counts, the only clause that reaches the changed arithmetic past 5,120
+//! keys: a synthetic f16 cache of [`DEEP_CTX`] rows over [`DEEP_KV`] key
+//! heads and a synthetic query, one-row launches at counts 5,120 (the last
+//! the 64-key cut covers), 5,121 (the first past it), 8,193, 65,537, 261,120 and
+//! 262,144 — both passes within the band above read through [`seg_span`]
+//! (the exact attention of two key heads), a rerun bit-identical, NaN in the
+//! rows at or past the count changing no bit, the q8 tensor-core twin bit
+//! for bit its f16 twin on the synthesized dequantized cache at 5,121 and
+//! 65,537, and one launch of [`ROWS`] rows at counts straddling the
+//! threshold each row bit for bit its one-row launch.
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -140,8 +164,8 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::fault::{Fault, FaultSink, FaultSite, LAYER_NONE};
     use bloomery_gpu::flash_gqa::{
-        FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, HEAD, KEY_TILE, SEG_KEYS, partials_ms_len,
-        partials_v_len, segments_for,
+        FlashGqaKernels, GROUP, GqaArgs, GqaQ8Args, HEAD, KEY_TILE, SEG_KEYS, SEGMENTS,
+        partials_ms_len, partials_v_len, seg_span,
     };
     use bloomery_gpu::flash_gqa_prefill::{
         FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, KEY_TILE as PREF_TILE,
@@ -233,8 +257,8 @@ mod gate {
         mma: bool,
     ) -> Result<Vec<f32>, GateError> {
         let (n_head, m) = (g.n_kv * GROUP, n_keys.len());
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(m, n_head, g.ctx))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head, g.ctx))?;
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(m, n_head))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * n_head * HEAD)?;
         k.enqueue_pass(
             stream,
@@ -394,6 +418,418 @@ mod gate {
         Ok(pass)
     }
 
+    /// The tall height of the grid clause (module doc): past every count the
+    /// sets hold, under the 65,537-key count the deep clause walks.
+    const GRID_TALL_CTX: usize = 65_536;
+
+    /// `planes` — `n_kv` planes of `ctx` rows of `per_row` values — as
+    /// planes of `tall` rows: each plane's first `live` rows its first rows,
+    /// `fill` in the rest.
+    fn tall_planes<T: Copy>(
+        planes: &[T],
+        n_kv: usize,
+        per_row: usize,
+        (ctx, live, tall): (usize, usize, usize),
+        fill: T,
+    ) -> Vec<T> {
+        let mut out = vec![fill; n_kv * tall * per_row];
+        for kh in 0..n_kv {
+            let (from, to) = (kh * ctx * per_row, kh * tall * per_row);
+            out[to..to + live * per_row].copy_from_slice(&planes[from..from + live * per_row]);
+        }
+        out
+    }
+
+    /// The grid clause (module doc): the decode launch captured at the set's
+    /// own height and at [`GRID_TALL_CTX`] — the segment node's grid
+    /// `n_kv · SEGMENTS` blocks and the merge's `n_head` at both heights, the
+    /// outputs bit-identical to each other and to the eager launch (`ys`'s
+    /// f16 bits, the q8 twin's own eager run). The scalar pass, the
+    /// tensor-core pass and the q8 tensor-core twin; each tall copy holds the
+    /// live rows in its first rows and NaN (the q8 sentinel bits) in the
+    /// rest.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the kernels, the card, the set's inputs and host values, the eager bits, the geometry"
+    )]
+    fn grid_heights(
+        k: &FlashGqaKernels,
+        gpu: &Gpu,
+        inp: &Inputs,
+        (kf, vf): (&[f32], &[f32]),
+        (kb, vb): (&[u16], &[u16]),
+        ys: &[Vec<f32>],
+        live: usize,
+        g: &Geom,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let n_head = g.n_kv * GROUP;
+        let rows = (g.ctx, live, GRID_TALL_CTX);
+        let tall_k = DeviceBuffer::from_host(stream, &tall_planes(kb, g.n_kv, HEAD, rows, NAN16))?;
+        let tall_v = DeviceBuffer::from_host(stream, &tall_planes(vb, g.n_kv, HEAD, rows, NAN16))?;
+        // The tall q8 planes, the same rows of the set's Q8_0 form (the
+        // codes and scales `Q8Cache::build` uploads) with the sentinel bits
+        // in the rest.
+        let c8 = Q8Cache::build(stream, kf, vf, g, live)?;
+        let (ks, vs) = (Q8Side::build(kf, HEAD), Q8Side::build(vf, HEAD));
+        let codes = |w: &[u32]| tall_planes(w, g.n_kv, HEAD / 4, rows, SENTINEL_Q8_CODE);
+        let scales = |w: &[u16]| tall_planes(w, g.n_kv, HEAD / 32, rows, SENTINEL_Q8_SCALE);
+        let (tall_kq, tall_kd, tall_vq, tall_vd) = (
+            DeviceBuffer::from_host(stream, &codes(&ks.codes))?,
+            DeviceBuffer::from_host(stream, &scales(&ks.scales))?,
+            DeviceBuffer::from_host(stream, &codes(&vs.codes))?,
+            DeviceBuffer::from_host(stream, &scales(&vs.scales))?,
+        );
+        let want_seg = [u32::try_from(g.n_kv * SEGMENTS)?, 1, 1];
+        let want_merge = [u32::try_from(n_head)?, 1, 1];
+        let mut ok = true;
+        for (name, pass, q8) in [
+            ("scalar", 0usize, false),
+            ("mma", 1, false),
+            ("q8-mma", 1, true),
+        ] {
+            let mut grids = Vec::with_capacity(2);
+            let mut outs = Vec::with_capacity(2);
+            let heights = [(g.ctx, &inp.kc, &inp.vc), (GRID_TALL_CTX, &tall_k, &tall_v)];
+            for (ctx, kc, vc) in heights {
+                let (mut pv, mut pms, mut y) = (
+                    DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?,
+                    DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?,
+                    DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?,
+                );
+                let graph = gpu.capture(|s| {
+                    if q8 {
+                        k.enqueue_pass_q8(
+                            s,
+                            GqaQ8Args {
+                                q: &inp.q,
+                                kq: if ctx == g.ctx { &c8.kq } else { &tall_kq },
+                                kd: if ctx == g.ctx { &c8.kd } else { &tall_kd },
+                                vq: if ctx == g.ctx { &c8.vq } else { &tall_vq },
+                                vd: if ctx == g.ctx { &c8.vd } else { &tall_vd },
+                                n_keys: &inp.n_keys,
+                                scale: g.scale,
+                                n_kv: g.n_kv,
+                                ctx,
+                                m: 1,
+                                part_v: &mut pv,
+                                part_ms: &mut pms,
+                                fault: gpu.unlabelled_sink(),
+                                y: &mut y,
+                            },
+                            true,
+                        )
+                    } else {
+                        k.enqueue_pass(
+                            s,
+                            GqaArgs {
+                                q: &inp.q,
+                                kc,
+                                vc,
+                                n_keys: &inp.n_keys,
+                                scale: g.scale,
+                                n_kv: g.n_kv,
+                                ctx,
+                                m: 1,
+                                part_v: &mut pv,
+                                part_ms: &mut pms,
+                                fault: gpu.unlabelled_sink(),
+                                y: &mut y,
+                            },
+                            pass == 1,
+                        )
+                    }
+                })?;
+                graph.launch(stream)?;
+                stream.synchronize()?;
+                let nodes = graph.nodes()?;
+                let grid = |prefix: &str| {
+                    nodes.iter().find_map(|n| {
+                        n.kernel
+                            .as_ref()
+                            .filter(|kn| kn.name.starts_with(prefix))
+                            .map(|kn| kn.grid)
+                    })
+                };
+                let two = nodes.len() == 2 && nodes.iter().all(|n| n.kernel.is_some());
+                grids.push((two, grid("gqa_flash_seg"), grid("gqa_flash_merge")));
+                outs.push(y.to_host_vec(stream)?);
+            }
+            let eager = if q8 {
+                run_once_q8(
+                    k,
+                    (stream, gpu.unlabelled_sink()),
+                    &inp.q,
+                    &inp.n_keys,
+                    &c8,
+                    g,
+                    true,
+                    false,
+                )?
+            } else {
+                ys[pass].clone()
+            };
+            let same = bits_equal(&outs[0], &outs[1]) && bits_equal(&outs[0], &eager);
+            let pass_ok = same
+                && grids.iter().all(|&(two, seg, merge)| {
+                    two && seg == Some(want_seg) && merge == Some(want_merge)
+                });
+            println!(
+                "flash grid pass={name} ctx={},{} seg_grid={:?},{:?} (want {want_seg:?}) \
+                 merge_grid={:?},{:?} (want {want_merge:?}) outputs_bit_identical={same} {}",
+                g.ctx,
+                GRID_TALL_CTX,
+                grids[0].1,
+                grids[1].1,
+                grids[0].2,
+                grids[1].2,
+                verdict(pass_ok)
+            );
+            ok &= pass_ok;
+        }
+        Ok(ok)
+    }
+
+    /// The deep clause's cache height and key heads (module doc): the most a
+    /// load serves, over the model's four.
+    const DEEP_CTX: usize = 262_144;
+    const DEEP_KV: usize = 4;
+
+    /// The deep-count clause (module doc): the counts past the fixed cut's
+    /// 5,120-key floor, where the segment boundaries move. One-row launches
+    /// of both passes at 5,120 (the last 64-key cut), 5,121 (the first past
+    /// it), 8,193, 65,537, 261,120 and 262,144 keys over a synthetic f16
+    /// cache, each within the band of the exact attention of the query heads
+    /// of two key heads; a rerun and the NaN rows past the count (at 5,121
+    /// and 65,537) bit-identical; the q8 tensor-core twin bit for bit its
+    /// f16 twin on the synthesized dequantized cache at 5,121 and 65,537; one
+    /// launch of [`ROWS`] rows at counts straddling the threshold each row
+    /// bit for bit its one-row launch.
+    fn deep_counts(k: &FlashGqaKernels, gpu: &Gpu, scale: f32) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let unl = gpu.unlabelled_sink();
+        let (n_kv, ctx) = (DEEP_KV, DEEP_CTX);
+        let n_head = n_kv * GROUP;
+        let to16 = |v: Vec<f32>| -> Vec<u16> { v.iter().map(|&x| f32_to_f16_bits(x)).collect() };
+        let kb = to16(activations(HEAD, n_kv * ctx, 730));
+        let vb = to16(activations(HEAD, n_kv * ctx, 731));
+        // The oracle's values are the planes' f16 bits, as the set clauses'
+        // are (module doc: both sides read the same f16 bits).
+        let (kf, vf): (Vec<f32>, Vec<f32>) = (
+            kb.iter().map(|&h| half_to_f32(h)).collect(),
+            vb.iter().map(|&h| half_to_f32(h)).collect(),
+        );
+        let (kc, vc) = (
+            DeviceBuffer::from_host(stream, &kb)?,
+            DeviceBuffer::from_host(stream, &vb)?,
+        );
+        let q: Vec<f32> = activations(HEAD, n_head, 732)
+            .iter()
+            .map(|v| v * SEED_Q_SCALE)
+            .collect();
+        // One one-row launch of `count` keys through `mma` over `ck`/`cv`.
+        let launch = |q: &[f32],
+                      count: usize,
+                      mma: bool,
+                      ck: &DeviceBuffer<u16>,
+                      cv: &DeviceBuffer<u16>|
+         -> Result<Vec<f32>, GateError> {
+            let (qd, nk) = (
+                DeviceBuffer::from_host(stream, q)?,
+                DeviceBuffer::from_host(stream, &[u32::try_from(count)?])?,
+            );
+            let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?;
+            let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
+            k.enqueue_pass(
+                stream,
+                GqaArgs {
+                    q: &qd,
+                    kc: ck,
+                    vc: cv,
+                    n_keys: &nk,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m: 1,
+                    part_v: &mut pv,
+                    part_ms: &mut pms,
+                    fault: unl,
+                    y: &mut y,
+                },
+                mma,
+            )?;
+            stream.synchronize()?;
+            Ok(y.to_host_vec(stream)?)
+        };
+        // The NaN twins: every row at or past the count NaN.
+        let nanify = |b: &[u16], past: usize| -> Vec<u16> {
+            b.iter()
+                .enumerate()
+                .map(|(i, &h)| if (i / HEAD) % ctx >= past { NAN16 } else { h })
+                .collect()
+        };
+        let counts = [5_120, 5_121, 8_193, 65_537, 261_120, 262_144];
+        let mut ok = true;
+        for &count in &counts {
+            let span = seg_span(count, SEGMENTS, SEG_KEYS);
+            let live_segs = count.div_ceil(span);
+            // The exact attention of the query heads of the first two key
+            // heads: the bound of both passes.
+            let exacts: Vec<Exact> = (0..2 * GROUP)
+                .map(|h| {
+                    let plane = (h / GROUP) * ctx * HEAD;
+                    exact(
+                        &q[h * HEAD..(h + 1) * HEAD],
+                        &kf[plane..plane + count * HEAD],
+                        &vf[plane..plane + count * HEAD],
+                        count,
+                        scale,
+                    )
+                })
+                .collect();
+            let (nan_k, nan_v) = if count == 5_121 || count == 65_537 {
+                (
+                    &DeviceBuffer::from_host(stream, &nanify(&kb, count))?,
+                    &DeviceBuffer::from_host(stream, &nanify(&vb, count))?,
+                )
+            } else {
+                (&kc, &vc)
+            };
+            for mma in [false, true] {
+                let name = if mma { "mma" } else { "scalar" };
+                let y = launch(&q, count, mma, &kc, &vc)?;
+                let y2 = launch(&q, count, mma, &kc, &vc)?;
+                let rerun = bits_equal(&y, &y2);
+                let mut worst = 0.0f64;
+                let mut band = true;
+                for (h, ex) in exacts.iter().enumerate() {
+                    let bound = if mma { &ex.bound_mma } else { &ex.bound_ours };
+                    for d in 0..HEAD {
+                        let e = (f64::from(y[h * HEAD + d]) - ex.o[d]).abs() / bound[d];
+                        worst = worst.max(e);
+                        band &= e <= 1.0;
+                    }
+                }
+                let nan_same = if count == 5_121 || count == 65_537 {
+                    bits_equal(&y, &launch(&q, count, mma, nan_k, nan_v)?)
+                } else {
+                    true
+                };
+                let pass_ok = band && rerun && nan_same;
+                println!(
+                    "flash deep count={count} span={span} segments={live_segs} pass={name} \
+                     measured/bound {worst:.3e} band={band} rerun={rerun} \
+                     nan_past_count_same={nan_same} {}",
+                    verdict(pass_ok)
+                );
+                ok &= pass_ok;
+            }
+        }
+        // The q8 tensor-core twin and its f16 twin (the dequantized values'
+        // own f16 cache) at the boundary counts.
+        let (ks, vs) = (Q8Side::build(&kf, HEAD), Q8Side::build(&vf, HEAD));
+        let (kq, kd, vq, vd) = (
+            DeviceBuffer::from_host(stream, &ks.codes)?,
+            DeviceBuffer::from_host(stream, &ks.scales)?,
+            DeviceBuffer::from_host(stream, &vs.codes)?,
+            DeviceBuffer::from_host(stream, &vs.scales)?,
+        );
+        let (k16, v16) = (
+            DeviceBuffer::from_host(stream, &ks.f16)?,
+            DeviceBuffer::from_host(stream, &vs.f16)?,
+        );
+        let qd = DeviceBuffer::from_host(stream, &q)?;
+        for &count in &[5_121, 65_537] {
+            let nk = DeviceBuffer::from_host(stream, &[u32::try_from(count)?])?;
+            let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?;
+            let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
+            let mut y8 = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
+            k.enqueue_pass_q8(
+                stream,
+                GqaQ8Args {
+                    q: &qd,
+                    kq: &kq,
+                    kd: &kd,
+                    vq: &vq,
+                    vd: &vd,
+                    n_keys: &nk,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m: 1,
+                    part_v: &mut pv,
+                    part_ms: &mut pms,
+                    fault: unl,
+                    y: &mut y8,
+                },
+                true,
+            )?;
+            stream.synchronize()?;
+            let twin = launch(&q, count, true, &k16, &v16)?;
+            let same = bits_equal(&y8.to_host_vec(stream)?, &twin);
+            println!(
+                "flash deep q8 twin count={count} = the f16 twin on the dequantized cache \
+                 bit for bit {same} {}",
+                verdict(same)
+            );
+            ok &= same;
+        }
+        // The straddling rows: one launch of ROWS rows at counts around the
+        // 5,120-key floor and the tall counts, each row its one-row launch.
+        let straddle = [
+            5_119, 5_120, 5_121, 5_122, 65_537, 261_119, 261_120, 262_144,
+        ];
+        let rows = rotated_rows(&q, n_head);
+        let rows_q = DeviceBuffer::from_host(stream, &rows.concat())?;
+        let counts_d = DeviceBuffer::from_host(
+            stream,
+            &straddle
+                .iter()
+                .map(|&c| u32::try_from(c))
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        for mma in [false, true] {
+            let name = if mma { "mma" } else { "scalar" };
+            let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(ROWS, n_head))?;
+            let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, n_head))?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, ROWS * n_head * HEAD)?;
+            k.enqueue_pass(
+                stream,
+                GqaArgs {
+                    q: &rows_q,
+                    kc: &kc,
+                    vc: &vc,
+                    n_keys: &counts_d,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m: ROWS,
+                    part_v: &mut pv,
+                    part_ms: &mut pms,
+                    fault: unl,
+                    y: &mut y,
+                },
+                mma,
+            )?;
+            stream.synchronize()?;
+            let all = y.to_host_vec(stream)?;
+            let w = n_head * HEAD;
+            let mut same = true;
+            for (t, row) in rows.iter().enumerate() {
+                let one = launch(row, straddle[t], mma, &kc, &vc)?;
+                same &= bits_equal(&all[t * w..(t + 1) * w], &one);
+            }
+            println!(
+                "flash deep rows m={ROWS} counts={straddle:?} pass={name} \
+                 each_row_its_one_row_launch={same} {}",
+                verdict(same)
+            );
+            ok &= same;
+        }
+        Ok(ok)
+    }
+
     /// The prefill flash's multi-row check on a set (module doc): [`ROWS_PREF`]
     /// rows (at most the step's count) at the counts ending at `live`, row `t`
     /// the step's query with its heads rotated by `t`: every row within its
@@ -493,14 +929,17 @@ mod gate {
         let pb: Vec<f64> = p.iter().map(|&v| v / z).collect();
         let x: Vec<f64> = s.iter().map(|&v| m - v).collect();
         let xmax = x.iter().copied().fold(0.0f64, f64::max);
-        let segs = n.div_ceil(SEG_KEYS);
+        // The cut read through `seg_span` (module doc): at or below 5,120
+        // keys span = SEG_KEYS and segs = `n.div_ceil(SEG_KEYS)`.
+        let span = seg_span(n, SEGMENTS, SEG_KEYS);
+        let segs = n.div_ceil(span);
         let r_ours = (n.div_ceil(KEY_TILE) + segs) as f64;
         let r_ik = (n.div_ceil(32) + 33) as f64;
         let (es_o, es_i) = (gamma(35), gamma(129));
         // The tensor core's f32 accumulation order is not documented and may
         // truncate: twice γ(130) for the dot of exact f16 products.
         let es_m = 2f64.powi(-11) + 2.0 * gamma(130);
-        let (acc_o, acc_i) = (gamma(SEG_KEYS + segs + 8), gamma(n + 40));
+        let (acc_o, acc_i) = (gamma(span + segs + 8), gamma(n + 40));
         // The prefill flash (module doc): one rescale per 64-key tile, the
         // f16 weights normalized by their own sum, the tensor core's value
         // accumulation and the lanes' weight sums.
@@ -823,8 +1262,8 @@ mod gate {
         use_sentinel: bool,
     ) -> Result<Vec<f32>, GateError> {
         let (n_head, m) = (g.n_kv * GROUP, n_keys.len());
-        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(m, n_head, g.ctx))?;
-        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head, g.ctx))?;
+        let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(m, n_head))?;
+        let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(m, n_head))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, m * n_head * HEAD)?;
         let (kq, kd, vq, vd) = if use_sentinel {
             c.sentinel_planes()
@@ -1072,8 +1511,8 @@ mod gate {
             for mma in [false, true] {
                 let name = if mma { "mma" } else { "scalar" };
                 let (mut pv, mut pms, mut yg) = (
-                    DeviceBuffer::<f32>::zeroed(stream, partials_v_len(ROWS, n_head, g.ctx))?,
-                    DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, n_head, g.ctx))?,
+                    DeviceBuffer::<f32>::zeroed(stream, partials_v_len(ROWS, n_head))?,
+                    DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(ROWS, n_head))?,
                     DeviceBuffer::<f32>::zeroed(stream, ROWS * n_head * HEAD)?,
                 );
                 let (kq, kd, vq, vd) = c.planes();
@@ -1147,8 +1586,8 @@ mod gate {
 
             // A `kq` one word short: refused by name.
             let short = DeviceBuffer::<u32>::zeroed(stream, c.kq.len().saturating_sub(1).max(1))?;
-            let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head, g.ctx))?;
-            let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head, g.ctx))?;
+            let mut pv = DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?;
+            let mut pms = DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
             let mut yr = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
             let r = k.enqueue_pass_q8(
                 stream,
@@ -1572,11 +2011,13 @@ mod gate {
         let kp = FlashGqaPrefill::load(gpu.context())?;
         let stream = gpu.stream();
         println!(
-            "gate_qwen3moe_flash: device {} — head {HEAD}, group {GROUP}, {SEG_KEYS}-key segments, scale {scale:e}",
+            "gate_qwen3moe_flash: device {} — head {HEAD}, group {GROUP}, {SEGMENTS} segments of at \
+             least {SEG_KEYS} keys, scale {scale:e}",
             gpu.device_name()?
         );
         let mut ok = true;
         let mut graph_done = false;
+        let mut grid_done = false;
         for (label, man) in step_sets()? {
             let mut rs = [Ratios::default(), Ratios::default()];
             let mut rp = Ratios::default();
@@ -1740,9 +2181,9 @@ mod gate {
                 if !graph_done {
                     for (pass, mma) in [false, true].into_iter().enumerate() {
                         let mut pv =
-                            DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head, ctx))?;
+                            DeviceBuffer::<f32>::zeroed(stream, partials_v_len(1, n_head))?;
                         let mut pms =
-                            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head, ctx))?;
+                            DeviceBuffer::<f32>::zeroed(stream, partials_ms_len(1, n_head))?;
                         let mut yg = DeviceBuffer::<f32>::zeroed(stream, n_head * HEAD)?;
                         let graph = gpu.capture(|s| {
                             k.enqueue_pass(
@@ -1777,12 +2218,16 @@ mod gate {
                             } else {
                                 "gqa_flash_seg"
                             },
-                            segments_for(ctx),
+                            SEGMENTS,
                             verdict(pass_ok)
                         );
                         ok &= pass_ok;
                     }
                     graph_done = true;
+                }
+                if !grid_done {
+                    ok &= grid_heights(&k, &gpu, &inp, (&kf, &vf), (&kb, &vb), &ys, live, &g)?;
+                    grid_done = true;
                 }
                 n_live = live;
                 ctx_seen = ctx;
@@ -1793,11 +2238,14 @@ mod gate {
             }
             for (pass, r) in rs.iter().enumerate() {
                 println!(
-                    "flash set={label} pass={} layers={layers} keys={n_live} ctx={ctx_seen} segments={} — \
+                    "flash set={label} pass={} layers={layers} keys={n_live} ctx={ctx_seen} segments={} \
+                     span={} live_segments={} — \
                      measured / bound: ours-exact {:.3e}, ik-exact {:.3e}, ours-ik {:.3e}; ours-ik plain \
                      {:.3e} of max|ik| (printed)",
                     if pass == 1 { "mma" } else { "scalar" },
-                    segments_for(ctx_seen),
+                    SEGMENTS,
+                    seg_span(n_live, SEGMENTS, SEG_KEYS),
+                    n_live.div_ceil(seg_span(n_live, SEGMENTS, SEG_KEYS)),
                     r.ours,
                     r.ik,
                     r.pair,
@@ -1820,6 +2268,9 @@ mod gate {
             );
             ok &= set_ok;
         }
+        let deep_ok = deep_counts(&k, &gpu, scale)?;
+        println!("flash deep counts {}", verdict(deep_ok));
+        ok &= deep_ok;
         let seeded_ok = prefill_seeded(&kp, &gpu, scale)?;
         println!(
             "prefill flash seeded, fault, graph, refusal {}",

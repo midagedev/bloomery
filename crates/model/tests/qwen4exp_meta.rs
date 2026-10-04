@@ -624,6 +624,19 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // eligible layers ascending, so the first `at_high` of the 48 hold `high`: 12,841 -> 12,568
 // experts on the A6000 at 4k and U 4,096, 262/261 a layer; the card's expert bytes move by the
 // three sizes and their granules, the budget's slack].
+// PIN(2026-10-04): the eight draft rows re-pinned for the decode flash's fixed segment count
+// (`flash_gqa::SEGMENTS`, 80 segments at every cache height): the draft program's arena
+// (`place::mtp_arena_bytes`, 49,536 f32 a segment) grows 3,170,304 B at ctx 4,096 (64 -> 80
+// segments) and shrinks 85,598,208 B at 32,768 (512 -> 80), so each row's card experts plus
+// rounding move by the opposite of that within the 2 MiB granules' slack [derived; predicted one
+// expert off each 4k row and about 27.9 (85,598,208 / 3,072,000 B) onto each 32k row]. The box's
+// planner on this tree, the old pins red on exactly the eight draft rows: the 4k rows one expert
+// off each, experts plus rounding -4,194,304 B (-6,291,456 B on the A6000 at U 512), the splits
+// 244/17/243, 262/15/261, 73/35/72, 92/15/91; the 32k rows +26 (A6000, U 4,096), +13 (A6000, U
+// 512), +43 (3090, U 4,096) and +21 (3090, U 512) experts, experts plus rounding +81,788,928 to
+// +88,080,384 B, the splits 238/12/237, 255/40/254, 68/2/67, 86/5/85 — the count past the estimate
+// is where the granules each layer's three stacks round to fall, the bytes within two granules of
+// the arena's move.
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -653,10 +666,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         244,
-        18,
+        17,
         243,
-        36_610_150_400,
-        524_083_712,
+        36_607_078_400,
+        522_961_408,
     ),
     (
         "A6000",
@@ -664,10 +677,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         262,
-        16,
+        15,
         261,
-        39_311_667_200,
-        517_407_232,
+        39_308_595_200,
+        514_187_776,
     ),
     (
         "A6000",
@@ -696,11 +709,11 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         32_768,
         true,
         4_096,
+        238,
+        12,
         237,
-        34,
-        236,
-        35_606_835_200,
-        564_806_144,
+        35_689_164_800,
+        570_556_928,
     ),
     (
         "A6000",
@@ -708,10 +721,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         255,
-        27,
+        40,
         254,
-        38_292_480_000,
-        574_001_664,
+        38_332_928_000,
+        615_342_592,
     ),
     (
         "3090",
@@ -741,10 +754,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         73,
-        36,
+        35,
         72,
-        10_943_180_800,
-        591_118_848,
+        10_940_108_800,
+        589_996_544,
     ),
     (
         "3090",
@@ -752,10 +765,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         92,
-        16,
+        15,
         91,
-        13_739_315_200,
-        487_727_616,
+        13_736_243_200,
+        486_605_312,
     ),
     (
         "3090",
@@ -784,22 +797,22 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         32_768,
         true,
         4_096,
+        68,
+        2,
         67,
-        7,
-        66,
-        9_951_027_200,
-        620_679_680,
+        10_084_659_200,
+        573_030_912,
     ),
     (
         "3090",
         32_768,
         true,
         512,
+        86,
+        5,
         85,
-        32,
-        84,
-        12_736_000_000,
-        528_450_048,
+        12_802_969_600,
+        547_463_680,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their

@@ -445,7 +445,7 @@ impl PlanInputs {
             });
         };
         let (draft, reserve) = mtp.draft_plan(ctx_max)?;
-        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab), ctx_max);
+        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab));
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let plan = self.target(machine, ctx_max, levers, experts, 0)?;
@@ -568,8 +568,8 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
     d.dense_bytes + d.expert_bytes + d.rounding_bytes + d.kv_bytes + map_bytes
 }
 
-/// Card bytes the MTP draft's program arena holds at a cache of `ctx` positions
-/// and a vocabulary of `vocab` [derived: the arena `MtpArena::new` allocates
+/// Card bytes the MTP draft's program arena holds at a vocabulary of `vocab`
+/// [derived: the arena `MtpArena::new` allocates
 /// for eight rows — its input record 65 u32 (a store walk's 64 ids); the hidden
 /// rows in and the last row's own copy 2 · (81,920 + 10,240) f32; the
 /// embedding, the mix and sub-layer outputs and the shared expert's rows, 7 ·
@@ -577,7 +577,9 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 /// scratch 94,880 f32 (the normed streams 81,920, the down's dots 10,240, the
 /// inject's 128, the bottleneck 2,560, the weights 32); the query rows with
 /// their gates 98,304 f32; the keys and values 2 · 4,096 f32; the attention
-/// rows 2 · 49,152 f32; the dense flash's partials 49,536 f32 a 64-key segment;
+/// rows 2 · 49,152 f32; the dense flash's partials 49,536 f32 a segment, 80 of
+/// them a row's head — `MTP_FLASH_SEGMENTS` below, `flash_gqa::SEGMENTS`
+/// restated, the gpu crate the model crate does not read;
 /// the router's buffers 8,288 f32 and 89 u32; the routed slots 80 u32 and the
 /// identity map 512 u32; the routed rows 3 · 51,200 and their down 204,800 f32;
 /// the head's input and logits' rows 20,480 f32 each; the head's logits 8 ·
@@ -597,10 +599,14 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 ///
 /// [`MtpArena::new`]: bloomery_gpu::arch::qwen3moe::Mtp38
 #[must_use]
-pub fn mtp_arena_bytes(vocab: u64, ctx: u64) -> u64 {
-    let segments = ctx.max(1).div_ceil(64);
-    4 * (1_212_160 + 8 * vocab + 49_536 * segments + 793 + 6_219_282)
+pub fn mtp_arena_bytes(vocab: u64) -> u64 {
+    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 6_219_282)
 }
+
+/// The decode flash's segments a row of the MTP program's arena holds
+/// partials for: `flash_gqa::SEGMENTS` restated, the model crate not reading
+/// the gpu crate's. `gate_qwen4exp_mtp`'s arena clause holds the two equal.
+const MTP_FLASH_SEGMENTS: u64 = 80;
 
 /// A qwen4exp plan with its MTP draft ([`PlanInputs::plan_mtp`]).
 #[derive(Debug)]
@@ -618,9 +624,9 @@ pub struct MtpPlan<'a> {
     pub draft: Plan<'a>,
     /// The head's row → id map, one `u32` a vocabulary id whatever the head.
     pub map_bytes: u64,
-    /// The draft program's arena ([`mtp_arena_bytes`] at the plan's context
-    /// and the draft's vocabulary), counted beside the draft's card bytes;
-    /// the load's `Mtp38::arm` holds the arena it allocates to it.
+    /// The draft program's arena ([`mtp_arena_bytes`] at the draft's
+    /// vocabulary), counted beside the draft's card bytes; the load's
+    /// `Mtp38::arm` holds the arena it allocates to it.
     pub arena_bytes: u64,
     /// The card's usable bytes (capped by the card budget) less the target's
     /// and the draft's card terms; the margin is inside it.
@@ -1303,7 +1309,7 @@ impl MtpInputs {
                 experts: self.model.experts,
             });
         }
-        let arena = mtp_arena_bytes(u64::from(self.draft.vocab), ctx_max);
+        let arena = mtp_arena_bytes(u64::from(self.draft.vocab));
         let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + arena;
         Ok((draft, bytes))
     }
@@ -2164,20 +2170,24 @@ mod tests {
         use crate::fileio::hex;
         use crate::placement::{self, CardFormat, Device, PlanLevers, Role};
 
-        /// The draft program's arena formula, at the e2e gates' context and
-        /// the file's vocabulary: the derived value the doc states, the
-        /// dense flash partials' term a 64-key segment.
+        /// The draft program's arena formula, at the file's vocabulary:
+        /// the derived value the doc states, the dense flash partials' term
+        /// the fixed 80 segments of a row's head.
+        // PIN(2026-10-04): re-pinned for the ctx-free formula — the decode
+        // flash's segment count is `flash_gqa::SEGMENTS` (80) at every cache
+        // height [derived: the old pins' 47,186,092 B at ctx 3,072 counted
+        // ceil(3,072/64) = 48 segments; the formula now holds 80, so the
+        // arena at the file's 248,320-row head is 4 · (1,212,160 + 8·248,320
+        // + 49,536·80 + 793 + 6,219,282) = 53,526,700 B, and only the
+        // vocabulary moves it — one row of the head's logits, 4 · 8 B].
         #[test]
         fn the_mtp_arena_formula() {
-            assert_eq!(mtp_arena_bytes(248_320, 3_072), 47_186_092);
+            assert_eq!(mtp_arena_bytes(248_320), 53_526_700);
             assert_eq!(
-                mtp_arena_bytes(248_320, 64),
-                4 * (1_212_160 + 8 * 248_320 + 49_536 + 793 + 6_219_282)
+                mtp_arena_bytes(248_320),
+                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 6_219_282)
             );
-            assert_eq!(
-                mtp_arena_bytes(248_320, 65) - mtp_arena_bytes(248_320, 64),
-                4 * 49_536
-            );
+            assert_eq!(mtp_arena_bytes(248_321) - mtp_arena_bytes(248_320), 4 * 8);
         }
 
         /// Qwen3.8's MTP layer as `mtp_of` reads the shared file.

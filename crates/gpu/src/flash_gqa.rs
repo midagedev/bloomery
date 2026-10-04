@@ -5,14 +5,16 @@
 //! `rope_neox::head_norm_neox_append` writes). Row `t` sees the keys below
 //! its own live count `n_keys[t]` — the causal limit of its position. The
 //! segment + merge shape of `flash.rs`: the key range is cut into
-//! `seg_keys`-key segments, block `(segment, kv head, row)` walks its
+//! [`SEGMENTS`] segments, block `(segment, kv head, row)` walks its
 //! segment for all the group's query heads of that row at once — one warp
 //! per query head over one staging of the K and V tiles — and writes per
 //! head the softmax partials `(max, Σ exp, Σ exp·V)`; the merge folds a
 //! head's live segments in ascending order. A row's arithmetic does not
 //! depend on `m` or on the other rows: one row is the one-position launch.
-//! The segment count comes from the cache height, so a captured graph's
-//! grid is fixed; a segment wholly past its row's live count writes the
+//! The segment count comes from [`SEGMENTS`], not the cache height, so a
+//! captured graph's grid is fixed whatever context the load allocated; each
+//! block computes its key range from its row's own live count through
+//! [`seg_span`], a segment wholly past that count writes the
 //! neutral partial (`m = −inf`, `s = 0`) and reads no key row, and the merge
 //! stops at the row's last live segment.
 //!
@@ -126,9 +128,9 @@ pub const HEAD: usize = 128;
 pub const GROUP: usize = 8;
 /// Keys per online-softmax tile: one key per lane.
 pub const KEY_TILE: usize = 32;
-/// Keys per segment. A multiple of [`KEY_TILE`]; the choice keeps the grid
-/// above the card's SM count from about a thousand keys on (four key heads
-/// times one block per segment).
+/// The shortest segment a row's cut walks ([`seg_span`]'s floor): a multiple
+/// of [`KEY_TILE`]; the choice keeps the grid above the card's SM count from
+/// about a thousand keys on (four key heads times one block per segment).
 pub const SEG_KEYS: usize = 64;
 /// Rotating partials of the score dot.
 const ILP: usize = 4;
@@ -190,31 +192,112 @@ const KQD_STRIDE: usize = HEAD / 32 + 1;
 const KQ_STRIDE_256: usize = HEAD_256 / 4 + 1;
 const KQD_STRIDE_256: usize = HEAD_256 / 32 + 1;
 
-/// Segments a `ctx`-row cache is cut into.
+/// Segments every decode launch cuts a row's keys into, whatever the cache
+/// height: per (row, key head) unit about one block for each SM of either
+/// workstation card (82 and 84 SMs), and whole merge batches. The grid is
+/// `m · units · SEGMENTS`, so a captured graph's launch does not depend on
+/// the context the load allocated.
+pub const SEGMENTS: usize = 80;
+const _: () = assert!(SEGMENTS.is_multiple_of(MERGE_BATCH));
+
+/// Keys each segment of a row of `live` keys walks when the row is cut into
+/// `segs` segments: `floor` while `segs · floor` covers the row, else
+/// `⌈live / segs⌉` rounded up to whole [`KEY_TILE`]s. Segment `s` walks
+/// `[s · span, min((s + 1) · span, live))`, and the first `⌈live / span⌉ <=
+/// segs` hold keys. The one owner of the cut: every segment pass and both
+/// merges compute it from the row's own count, on the device.
+#[inline(always)]
 #[must_use]
-pub fn segments_for(ctx: usize) -> usize {
-    ctx.max(1).div_ceil(SEG_KEYS)
+pub const fn seg_span(live: usize, segs: usize, floor: usize) -> usize {
+    let per = live.div_ceil(segs).div_ceil(KEY_TILE) * KEY_TILE;
+    if per > floor { per } else { floor }
 }
 
-/// The `Σ exp·V` partials' length for `m` rows of `n_head` query heads over
-/// a `ctx`-row cache.
+/// Segments a listed launch ([`FlashGqaKernels::enqueue_pass_256_p4_sel`])
+/// cuts a row's list of at most `width` entries into: whole
+/// [`SEG_KEYS`]-key segments of the width.
 #[must_use]
-pub fn partials_v_len(m: usize, n_head: usize, ctx: usize) -> usize {
-    m * n_head * segments_for(ctx) * HEAD
+pub const fn listed_segments(width: usize) -> usize {
+    let w = if width == 0 { 1 } else { width };
+    w.div_ceil(SEG_KEYS)
+}
+
+/// The partials' length for `m` rows of `n_head` query heads cut into
+/// `segs` segments, `per_seg` values a segment: the one product every
+/// `partials_*` function below takes.
+const fn partials_len(m: usize, n_head: usize, segs: usize, per_seg: usize) -> usize {
+    m * n_head * segs * per_seg
+}
+
+/// The `Σ exp·V` partials' length for `m` rows of `n_head` query heads
+/// ([`SEGMENTS`] a row's head).
+#[must_use]
+pub fn partials_v_len(m: usize, n_head: usize) -> usize {
+    partials_len(m, n_head, SEGMENTS, HEAD)
 }
 
 /// The `(max, Σ exp)` partials' length.
 #[must_use]
-pub fn partials_ms_len(m: usize, n_head: usize, ctx: usize) -> usize {
-    m * n_head * segments_for(ctx) * 2
+pub fn partials_ms_len(m: usize, n_head: usize) -> usize {
+    partials_len(m, n_head, SEGMENTS, 2)
 }
 
 /// [`partials_v_len`] at [`HEAD_256`]; the `(max, Σ exp)` partials are
 /// [`partials_ms_len`] at either width.
 #[must_use]
-pub fn partials_v_len_256(m: usize, n_head: usize, ctx: usize) -> usize {
-    m * n_head * segments_for(ctx) * HEAD_256
+pub fn partials_v_len_256(m: usize, n_head: usize) -> usize {
+    partials_len(m, n_head, SEGMENTS, HEAD_256)
 }
+
+/// [`partials_v_len_256`] of a listed launch over lists of at most `width`
+/// ([`listed_segments`]`(width)` a row's head).
+#[must_use]
+pub fn listed_partials_v_len_256(m: usize, n_head: usize, width: usize) -> usize {
+    partials_len(m, n_head, listed_segments(width), HEAD_256)
+}
+
+/// [`partials_ms_len`] of a listed launch over lists of at most `width`.
+#[must_use]
+pub fn listed_partials_ms_len(m: usize, n_head: usize, width: usize) -> usize {
+    partials_len(m, n_head, listed_segments(width), 2)
+}
+
+// The cut's invariants, the ones the segment bodies and both merges rely on
+// (every range they walk and every partial they read): the span covers the
+// row (`span · segs >= live`), so a row's live segments stay within the
+// launch (`live.div_ceil(span) <= segs`) and the merges never read a partial
+// past the buffer; the span is whole KEY_TILEs; and it is the floor's
+// `SEG_KEYS` exactly while `segs · SEG_KEYS` covers the row, so every count
+// at or below 80 · 64 = 5,120 keys is cut into 64-key segments whatever the
+// cache height. The listed path's cut at Qwen3.8's width: `SEG_KEYS` for
+// every live count, because its 33 launched segments of 64 keys cover 2,051.
+const fn seg_span_holds(live: usize, segs: usize, floor: usize) -> bool {
+    let span = seg_span(live, segs, floor);
+    span * segs >= live
+        && live.div_ceil(span) <= segs
+        && span.is_multiple_of(KEY_TILE)
+        && (span == floor) == (live <= segs * floor)
+}
+const _: () = {
+    let mut live = 0;
+    while live <= 65_536 {
+        assert!(seg_span_holds(live, SEGMENTS, SEG_KEYS));
+        live += 1;
+    }
+    let mut i = 0;
+    let points = [261_120, 262_144, 1_048_576, 2_000_000, u32::MAX as usize];
+    while i < points.len() {
+        assert!(seg_span_holds(points[i], SEGMENTS, SEG_KEYS));
+        i += 1;
+    }
+    let segs = listed_segments(2_051);
+    assert!(segs == 33);
+    let mut live = 0;
+    while live <= 2_051 {
+        assert!(seg_span_holds(live, segs, SEG_KEYS));
+        live += 1;
+    }
+};
 
 /// A row's live key count as every kernel here reads it: `count` when it
 /// lies in `1..=ctx`, else 0 — a refused row, whose segments are all
@@ -459,7 +542,8 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
@@ -470,7 +554,7 @@ unsafe fn seg_scalar<const HEAD: usize, const QW: usize>(
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // Row t's group query rows: thread `tid` stages values
     // `per_thread·tid ..` of the group's GROUP·HEAD.
@@ -646,7 +730,8 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
@@ -657,7 +742,7 @@ unsafe fn seg_mma<const HEAD: usize, const QW: usize>(
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // The query tile: warp `w` rounds row t's head `w`'s HEAD/2 value pairs,
     // HEAD/64 per lane, and writes the zero rows `8 + w`. Each pair is one
@@ -1072,7 +1157,8 @@ unsafe fn seg_scalar_p<const HEAD: usize, const QW: usize, const PACK: usize>(
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
@@ -1083,7 +1169,7 @@ unsafe fn seg_scalar_p<const HEAD: usize, const QW: usize, const PACK: usize>(
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // Row t's pack of query rows: thread `tid` stages values
     // `per_thread·tid ..` of the pack's PACK·HEAD.
@@ -1272,7 +1358,8 @@ unsafe fn seg_mma_p<
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
@@ -1283,7 +1370,7 @@ unsafe fn seg_mma_p<
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // The query tile: warp `w` rounds row t's head `head0 + w`'s HEAD/2 value
     // pairs, HEAD/64 per lane, into row `w`, and writes the zero rows `z·PACK +
@@ -1591,7 +1678,8 @@ unsafe fn seg_scalar_ps<const HEAD: usize, const QW: usize, const PACK: usize>(
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, walk.count_cap());
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
@@ -1602,7 +1690,7 @@ unsafe fn seg_scalar_ps<const HEAD: usize, const QW: usize, const PACK: usize>(
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // Row t's pack of query rows: thread `tid` stages values
     // `per_thread·tid ..` of the pack's PACK·HEAD.
@@ -1773,7 +1861,8 @@ unsafe fn seg_mma_ps<
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, walk.count_cap());
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
@@ -1784,7 +1873,7 @@ unsafe fn seg_mma_ps<
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // The query tile: warp `w` rounds row t's head `head0 + w`'s HEAD/2 value
     // pairs, HEAD/64 per lane, into row `w`, and writes the zero rows `z·PACK +
@@ -2069,7 +2158,8 @@ unsafe fn seg_scalar_q8<const HEAD: usize, const QW: usize>(
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
@@ -2080,7 +2170,7 @@ unsafe fn seg_scalar_q8<const HEAD: usize, const QW: usize>(
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // Row t's group query rows: thread `tid` stages values
     // `per_thread·tid ..` of the group's GROUP·HEAD.
@@ -2287,7 +2377,8 @@ unsafe fn seg_mma_q8<const HEAD: usize, const QW: usize>(
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
@@ -2298,7 +2389,7 @@ unsafe fn seg_mma_q8<const HEAD: usize, const QW: usize>(
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // The query tile: warp `w` rounds row t's head `w`'s HEAD/2 value pairs,
     // HEAD/64 per lane, and writes the zero rows `8 + w`. Each pair is one
@@ -2543,7 +2634,8 @@ unsafe fn seg_scalar_p_q8<const HEAD: usize, const QW: usize, const PACK: usize>
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
@@ -2554,7 +2646,7 @@ unsafe fn seg_scalar_p_q8<const HEAD: usize, const QW: usize, const PACK: usize>
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // Row t's pack of query rows: thread `tid` stages values
     // `per_thread·tid ..` of the pack's PACK·HEAD.
@@ -2760,7 +2852,8 @@ unsafe fn seg_mma_p_q8<
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
     let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-    let lo = seg * seg_keys as usize;
+    let span = seg_span(limit, n_seg, seg_keys as usize);
+    let lo = seg * span;
     if lo >= limit {
         if lane == 0 {
             // SAFETY: idx < m·n_head·segs, both slots inside part_ms.
@@ -2771,7 +2864,7 @@ unsafe fn seg_mma_p_q8<
         }
         return; // block-uniform: lo and limit are the block's
     }
-    let hi = (lo + seg_keys as usize).min(limit);
+    let hi = (lo + span).min(limit);
 
     // The query tile: warp `w` rounds row t's head `head0 + w`'s HEAD/2 value
     // pairs, HEAD/64 per lane, into row `w`, and writes the zero rows `z·PACK +
@@ -3002,9 +3095,9 @@ unsafe fn merge_body<const HEAD: usize>(
         unsafe { *y.get_unchecked_mut(b * HEAD + d) = f32::NAN };
         return; // block-uniform: the row is the block's
     }
-    let sk = seg_keys as usize;
-    // limit <= ctx <= segs·seg_keys (launch contract), so live <= segs.
-    let live = limit.div_ceil(sk);
+    // seg_span keeps ⌈limit / span⌉ <= segs (its const check), so the walk
+    // below stays inside the row's segments.
+    let live = limit.div_ceil(seg_span(limit, n_seg, seg_keys as usize));
     let mut mx = f32::NEG_INFINITY;
     let mut s = 0.0f32;
     let mut acc = 0.0f32;
@@ -3043,8 +3136,10 @@ mod flash_gqa_kernels {
     use super::*;
 
     /// The segment pass. Block `b = (seg·n_kv + kh)·m + t` walks keys
-    /// `[seg · seg_keys, min((seg + 1)·seg_keys, n_keys))` of key head `kh`
-    /// for row `t`'s query heads `kh·GROUP ..`; warp `w` is query head `h =
+    /// `[seg · span, min((seg + 1)·span, n_keys))` of key head `kh` —
+    /// `span` = [`seg_span`] of the row's own `n_keys`, `segs` and
+    /// `seg_keys` — for row `t`'s query heads `kh·GROUP ..`; warp `w` is
+    /// query head `h =
     /// kh·GROUP + w`, whose partials land at index `(t·n_head + h)·segs +
     /// seg`. `n_keys` is [`live_keys`] of `n_keys_buf[t]`: a refused row's
     /// segments are all neutral. The rows of one segment are neighbouring
@@ -3060,7 +3155,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * 8 * 128,
             kc.len() >= n_kv * ctx * 128,
             vc.len() >= n_kv * ctx * 128,
@@ -3107,7 +3202,8 @@ mod flash_gqa_kernels {
         let ctx = ctx as usize;
         // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
         let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-        let lo = seg * seg_keys as usize;
+        let span = seg_span(limit, n_seg, seg_keys as usize);
+        let lo = seg * span;
         if lo >= limit {
             if lane == 0 {
                 // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
@@ -3118,7 +3214,7 @@ mod flash_gqa_kernels {
             }
             return; // block-uniform: lo and limit are the block's
         }
-        let hi = (lo + seg_keys as usize).min(limit);
+        let hi = (lo + span).min(limit);
 
         // SAFETY: each `static mut` above is this block's own shared
         // allocation; the raw form reaches it without a reference. Every
@@ -3262,7 +3358,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * 8 * 128,
             kc.len() >= n_kv * ctx * 128,
             vc.len() >= n_kv * ctx * 128,
@@ -3309,7 +3405,8 @@ mod flash_gqa_kernels {
         let ctx = ctx as usize;
         // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
         let limit = live_keys(unsafe { *n_keys_buf.get_unchecked(t) }, ctx);
-        let lo = seg * seg_keys as usize;
+        let span = seg_span(limit, n_seg, seg_keys as usize);
+        let lo = seg * span;
         if lo >= limit {
             if lane == 0 {
                 // SAFETY: idx < m·n_kv·GROUP·segs, both slots inside part_ms.
@@ -3320,7 +3417,7 @@ mod flash_gqa_kernels {
             }
             return; // block-uniform: lo and limit are the block's
         }
-        let hi = (lo + seg_keys as usize).min(limit);
+        let hi = (lo + span).min(limit);
 
         // SAFETY: each `static mut` above is this block's own shared
         // allocation; the raw form reaches it without a reference. Every
@@ -3484,7 +3581,8 @@ mod flash_gqa_kernels {
 
     /// The merge: block `b = t·n_head + h` folds row `t`'s query head `h`'s
     /// partials of the segments that hold its keys — the first
-    /// `ceil(n_keys / seg_keys)` of `segs`, with `n_keys` [`live_keys`] of
+    /// `ceil(n_keys / span)` of `segs`, `span` = [`seg_span`] of the row's
+    /// own `n_keys`, with `n_keys` [`live_keys`] of
     /// `n_keys_buf[t]` as the segment pass reads it — in ascending order
     /// through `online_fold`, skipping one whose `Σ exp` is zero, and writes
     /// `y[(t·n_head + h)·HEAD + d] = r · (1/s)`, thread `d` owning dim `d`.
@@ -3505,7 +3603,7 @@ mod flash_gqa_kernels {
         block = (128, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             part_v.len() >= m * n_head * segs * 128,
             part_ms.len() >= m * n_head * segs * 2,
             y.len() >= m * n_head * 128
@@ -3541,9 +3639,9 @@ mod flash_gqa_kernels {
             unsafe { *y.get_unchecked_mut(b * HEAD + d) = f32::NAN };
             return; // block-uniform: the row is the block's
         }
-        let sk = seg_keys as usize;
-        // limit <= ctx <= segs·seg_keys (launch contract), so live <= segs.
-        let live = limit.div_ceil(sk);
+        // seg_span keeps ⌈limit / span⌉ <= segs (its const check), so the
+        // walk below stays inside the row's segments.
+        let live = limit.div_ceil(seg_span(limit, n_seg, seg_keys as usize));
         let mut mx = f32::NEG_INFINITY;
         let mut s = 0.0f32;
         let mut acc = 0.0f32;
@@ -3592,7 +3690,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * 8 * 256,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
@@ -3657,7 +3755,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * 8 * 256,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
@@ -3721,7 +3819,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             part_v.len() >= m * n_head * segs * 256,
             part_ms.len() >= m * n_head * segs * 2,
             y.len() >= m * n_head * 256
@@ -3760,7 +3858,7 @@ mod flash_gqa_kernels {
         block = (128, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * packs * 4 * 256,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
@@ -3829,7 +3927,7 @@ mod flash_gqa_kernels {
         block = (64, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * packs * 2 * 256,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
@@ -3899,7 +3997,7 @@ mod flash_gqa_kernels {
         block = (128, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * packs * 4 * 256,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
@@ -3973,7 +4071,7 @@ mod flash_gqa_kernels {
         requires = (
             n_sel.len() >= m,
             list.len() >= m * width,
-            segs * seg_keys >= width,
+            segs >= 1,
             q.len() >= m * n_kv * packs * 4 * 256,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
@@ -4054,7 +4152,7 @@ mod flash_gqa_kernels {
         requires = (
             n_sel.len() >= m,
             list.len() >= m * width,
-            segs * seg_keys >= width,
+            segs >= 1,
             q.len() >= m * n_kv * packs * 4 * 256,
             kc.len() >= n_kv * ctx * 256,
             vc.len() >= n_kv * ctx * 256,
@@ -4133,7 +4231,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * 8 * 128,
             kq.len() >= n_kv * ctx * 32,
             kd.len() >= n_kv * ctx * 4,
@@ -4208,7 +4306,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * 8 * 128,
             kq.len() >= n_kv * ctx * 32,
             kd.len() >= n_kv * ctx * 4,
@@ -4280,7 +4378,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * 8 * 256,
             kq.len() >= n_kv * ctx * 64,
             kd.len() >= n_kv * ctx * 8,
@@ -4354,7 +4452,7 @@ mod flash_gqa_kernels {
         block = (256, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * 8 * 256,
             kq.len() >= n_kv * ctx * 64,
             kd.len() >= n_kv * ctx * 8,
@@ -4425,7 +4523,7 @@ mod flash_gqa_kernels {
         block = (128, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * packs * 4 * 256,
             kq.len() >= n_kv * ctx * 64,
             kd.len() >= n_kv * ctx * 8,
@@ -4501,7 +4599,7 @@ mod flash_gqa_kernels {
         block = (64, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * packs * 2 * 256,
             kq.len() >= n_kv * ctx * 64,
             kd.len() >= n_kv * ctx * 8,
@@ -4578,7 +4676,7 @@ mod flash_gqa_kernels {
         block = (128, 1, 1),
         requires = (
             n_keys_buf.len() >= m,
-            segs * seg_keys >= ctx,
+            segs >= 1,
             q.len() >= m * n_kv * packs * 4 * 256,
             kq.len() >= n_kv * ctx * 64,
             kd.len() >= n_kv * ctx * 8,
@@ -4734,9 +4832,10 @@ impl FlashGqaKernels {
     }
 
     /// Enqueue `m` rows' attention: the segment pass (`m · n_kv ·
-    /// segments_for(ctx)` blocks; the tensor-core one when `mma`) and the
-    /// merge (`m · n_kv · GROUP` blocks). The segments cover the whole
-    /// cache, so every count the kernels accept is walked in full; a count
+    /// [`SEGMENTS`]` blocks; the tensor-core one when `mma`) and the
+    /// merge (`m · n_kv · GROUP` blocks). Each block cuts its row's range
+    /// from the row's own count, so every count the kernels accept is
+    /// walked in full; a count
     /// of zero or past `ctx` raises [`FaultSite::KeyCount`] on `args.fault`
     /// and its row is NaN. Two launches. Asynchronous, allocation-free,
     /// capturable.
@@ -4768,14 +4867,14 @@ impl FlashGqaKernels {
             ));
         }
         let n_head = n_kv * GROUP;
-        let segs = segments_for(ctx);
+        let segs = SEGMENTS;
         let lens = [
             ("q", q.len(), m * n_head * HEAD),
             ("kc", kc.len(), n_kv * ctx * HEAD),
             ("vc", vc.len(), n_kv * ctx * HEAD),
             ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len(m, n_head, ctx)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("part_v", part_v.len(), partials_v_len(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
             ("y", y.len(), m * n_head * HEAD),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -4851,14 +4950,14 @@ impl FlashGqaKernels {
             ));
         }
         let n_head = n_kv * GROUP;
-        let segs = segments_for(ctx);
+        let segs = SEGMENTS;
         let lens = [
             ("q", q.len(), m * n_head * HEAD_256),
             ("kc", kc.len(), n_kv * ctx * HEAD_256),
             ("vc", vc.len(), n_kv * ctx * HEAD_256),
             ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len_256(m, n_head, ctx)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("part_v", part_v.len(), partials_v_len_256(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
             ("y", y.len(), m * n_head * HEAD_256),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -4904,7 +5003,7 @@ impl FlashGqaKernels {
     /// `args.y` `m · n_head` rows of 256, `args.part_v` [`partials_v_len_256`]
     /// and `args.part_ms` [`partials_ms_len`] of `n_head`. The segment pass
     /// (`gqa_flash_seg_mma_256_p4` when `mma`, else `gqa_flash_seg_256_p4`;
-    /// `m · n_head / 4 · segments_for(ctx)` blocks of 128 threads) and
+    /// `m · n_head / 4 · `[`SEGMENTS`]` blocks of 128 threads) and
     /// `gqa_flash_merge_256` (`m · n_head` blocks): two launches, the refusals
     /// of `enqueue_pass_256`. Asynchronous, allocation-free, capturable.
     pub fn enqueue_pass_256_p4(
@@ -4924,7 +5023,7 @@ impl FlashGqaKernels {
 
     /// [`FlashGqaKernels::enqueue_pass_256_p4`]'s scalar pass in blocks of
     /// [`PACK_2`]: `n_head` a nonzero multiple of `2 · n_kv` (refused by name
-    /// otherwise), `gqa_flash_seg_256_p2` (`m · n_head / 2 · segments_for(ctx)`
+    /// otherwise), `gqa_flash_seg_256_p2` (`m · n_head / 2 · `[`SEGMENTS`]`
     /// blocks of 64 threads) and `gqa_flash_merge_256`: two launches, the
     /// refusals of `enqueue_pass_256`. Every row's bits are the `_256` scalar
     /// pass's. Asynchronous, allocation-free, capturable.
@@ -4985,14 +5084,14 @@ impl FlashGqaKernels {
             ));
         }
         let packs = n_head / (n_kv * pack);
-        let segs = segments_for(ctx);
+        let segs = SEGMENTS;
         let lens = [
             ("q", q.len(), m * n_head * HEAD_256),
             ("kc", kc.len(), n_kv * ctx * HEAD_256),
             ("vc", vc.len(), n_kv * ctx * HEAD_256),
             ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len_256(m, n_head, ctx)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("part_v", part_v.len(), partials_v_len_256(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
             ("y", y.len(), m * n_head * HEAD_256),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -5049,9 +5148,10 @@ impl FlashGqaKernels {
     /// row `t` attends the cache rows `list[t·width .. t·width + n_sel[t]]`
     /// (ascending, as `qsa`'s top-k writes them), `n_head` query heads over
     /// `args.n_kv` in blocks of [`PACK_4`] (refused by name otherwise), the
-    /// segments cut over list positions: `segments_for(width)` of them, so
-    /// `args.part_v` is [`partials_v_len_256`] and `args.part_ms`
-    /// [`partials_ms_len`] at `(m, n_head, width)`. The segment pass
+    /// segments cut over list positions: [`listed_segments`]`(width)` of
+    /// them, so
+    /// `args.part_v` is [`listed_partials_v_len_256`] and `args.part_ms`
+    /// [`listed_partials_ms_len`] at `(m, n_head, width)`. The segment pass
     /// (`gqa_flash_seg_mma_256_p4_sel` when `mma`, else
     /// `gqa_flash_seg_256_p4_sel`) and `gqa_flash_merge_256` over the lists:
     /// two launches. A length of zero or past `width` raises
@@ -5103,15 +5203,23 @@ impl FlashGqaKernels {
             ));
         }
         let packs = n_head / (n_kv * PACK_4);
-        let segs = segments_for(width);
+        let segs = listed_segments(width);
         let lens = [
             ("q", q.len(), m * n_head * HEAD_256),
             ("kc", kc.len(), n_kv * ctx * HEAD_256),
             ("vc", vc.len(), n_kv * ctx * HEAD_256),
             ("list", list.len(), m * width),
             ("n_sel", n_sel.len(), m),
-            ("part_v", part_v.len(), partials_v_len_256(m, n_head, width)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, width)),
+            (
+                "part_v",
+                part_v.len(),
+                listed_partials_v_len_256(m, n_head, width),
+            ),
+            (
+                "part_ms",
+                part_ms.len(),
+                listed_partials_ms_len(m, n_head, width),
+            ),
             ("y", y.len(), m * n_head * HEAD_256),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -5192,7 +5300,7 @@ impl FlashGqaKernels {
             ));
         }
         let n_head = n_kv * GROUP;
-        let segs = segments_for(ctx);
+        let segs = SEGMENTS;
         let (words, scales) = q8_plane_lens(HEAD, n_kv, ctx);
         let lens = [
             ("q", q.len(), m * n_head * HEAD),
@@ -5201,8 +5309,8 @@ impl FlashGqaKernels {
             ("vq", vq.len(), words),
             ("vd", vd.len(), scales),
             ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len(m, n_head, ctx)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("part_v", part_v.len(), partials_v_len(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
             ("y", y.len(), m * n_head * HEAD),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -5279,7 +5387,7 @@ impl FlashGqaKernels {
             ));
         }
         let n_head = n_kv * GROUP;
-        let segs = segments_for(ctx);
+        let segs = SEGMENTS;
         let (words, scales) = q8_plane_lens(HEAD_256, n_kv, ctx);
         let lens = [
             ("q", q.len(), m * n_head * HEAD_256),
@@ -5288,8 +5396,8 @@ impl FlashGqaKernels {
             ("vq", vq.len(), words),
             ("vd", vd.len(), scales),
             ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len_256(m, n_head, ctx)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("part_v", part_v.len(), partials_v_len_256(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
             ("y", y.len(), m * n_head * HEAD_256),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
@@ -5423,7 +5531,7 @@ impl FlashGqaKernels {
             ));
         }
         let packs = n_head / (n_kv * pack);
-        let segs = segments_for(ctx);
+        let segs = SEGMENTS;
         let (words, scales) = q8_plane_lens(HEAD_256, n_kv, ctx);
         let lens = [
             ("q", q.len(), m * n_head * HEAD_256),
@@ -5432,8 +5540,8 @@ impl FlashGqaKernels {
             ("vq", vq.len(), words),
             ("vd", vd.len(), scales),
             ("n_keys", n_keys.len(), m),
-            ("part_v", part_v.len(), partials_v_len_256(m, n_head, ctx)),
-            ("part_ms", part_ms.len(), partials_ms_len(m, n_head, ctx)),
+            ("part_v", part_v.len(), partials_v_len_256(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
             ("y", y.len(), m * n_head * HEAD_256),
         ];
         if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {

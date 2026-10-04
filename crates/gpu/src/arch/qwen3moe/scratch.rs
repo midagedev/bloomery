@@ -1539,9 +1539,9 @@ impl Arena {
             }
         };
         let part_v = if d.head == HEAD_256 {
-            partials_v_len_256(narrow, d.n_head, d.ctx)
+            partials_v_len_256(narrow, d.n_head)
         } else {
-            partials_v_len(narrow, d.n_head, d.ctx)
+            partials_v_len(narrow, d.n_head)
         };
         // SAFETY: every window below lies inside its parent — row `t <
         // narrow <= rows` of `x` (`hidden` values), and the three blocks that tile `qkv`
@@ -1572,7 +1572,7 @@ impl Arena {
             q_out: gated.then(|| f(rows * attn_len)).transpose()?,
             v_cols: (rows > 1).then(|| f(narrow * kv_len)).transpose()?,
             part_v: f(part_v)?,
-            part_ms: f(partials_ms_len(narrow, d.n_head, d.ctx))?,
+            part_ms: f(partials_ms_len(narrow, d.n_head))?,
             attn: f(rows * attn_len)?,
             act_attn: acts(attn_len)?,
             ffn_inp: f(rows * d.hidden)?,

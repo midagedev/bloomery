@@ -971,12 +971,7 @@ struct MtpArena {
 }
 
 impl MtpArena {
-    fn new(
-        stream: &CudaStream,
-        dims: RouterDims,
-        vocab: usize,
-        ctx: usize,
-    ) -> Result<MtpArena, GpuError> {
+    fn new(stream: &CudaStream, dims: RouterDims, vocab: usize) -> Result<MtpArena, GpuError> {
         let r = MTP_ROWS;
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
@@ -1007,8 +1002,8 @@ impl MtpArena {
             k: f(r * geo::KV)?,
             v: f(r * geo::KV)?,
             q: f(r * geo::ATTN)?,
-            part_v: f(partials_v_len_256(r, geo::N_HEAD, ctx))?,
-            part_ms: f(partials_ms_len(r, geo::N_HEAD, ctx))?,
+            part_v: f(partials_v_len_256(r, geo::N_HEAD))?,
+            part_ms: f(partials_ms_len(r, geo::N_HEAD))?,
             flash: f(r * geo::ATTN)?,
             attn: f(r * geo::ATTN)?,
             route: RouterOut::with_tokens(stream, dims, r)?,
@@ -1192,7 +1187,7 @@ impl Mtp38 {
                 ),
             ));
         }
-        let a = MtpArena::new(stream, dims, vocab, self.ctx)?;
+        let a = MtpArena::new(stream, dims, vocab)?;
         let got = a.bytes() as u64;
         if got != arena {
             return Err(GpuError::shape(
