@@ -19,8 +19,9 @@
 //!
 //! A request runs as a [`Gen`], one engine call at a time, so the engine
 //! thread can make one call of several slots' steps: each running request's
-//! next step is a row of one [`Engine::step_slots`]. A drafting engine serves
-//! one slot.
+//! next step a row of one [`Engine::step_slots`], its next drafted pass a row
+//! of one [`Engine::advance_slots`]. A drafting engine serves one slot unless
+//! it keeps its draft's state per slot ([`Engine::slot_drafts`]).
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -33,7 +34,7 @@ use serde_json::{Value, json};
 
 use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplingParams,
-    Saved, SlotRow, StateError, Tokenizer,
+    Saved, SlotPass, SlotRow, StateError, Tokenizer,
 };
 use crate::promptcache::{self, PromptCache};
 use crate::reasoning::{THINK_CLOSE, ThinkSplit};
@@ -216,7 +217,8 @@ fn choose(
 /// The engine and its slots: the ids each slot's cache holds, one per
 /// position, and the host prompt cache of states the slots held before
 /// ([`PromptCache`]), one for every slot. Every method but [`Slot::select`],
-/// [`Slot::held_of`] and [`Slot::step_slots`] acts on the selected slot.
+/// [`Slot::held_of`], [`Slot::step_slots`] and [`Slot::advance_slots`] acts
+/// on the selected slot.
 pub(crate) struct Slot {
     pub engine: Box<dyn Engine>,
     vocab: Arc<dyn Tokenizer>,
@@ -312,6 +314,48 @@ impl Slot {
             let ids = self.held_mut(r.slot);
             *ids = h;
             ids.push(r.last);
+        }
+        Ok(())
+    }
+
+    /// One drafted pass of several slots ([`Engine::advance_slots`]) that
+    /// books what each fed: `last` and every kept token but the last. While
+    /// the call is in flight the rows' ids are empty, so a failed call leaves
+    /// no claim about their caches. A row whose pass kept no token, more than
+    /// the engine's rows, or other than one more than its draft's accepted
+    /// ids is the engine's error.
+    pub(crate) fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
+        let held: Vec<Vec<u32>> = rows
+            .iter()
+            .map(|r| std::mem::take(self.held_mut(r.slot)))
+            .collect();
+        self.selected = None;
+        for r in rows.iter_mut() {
+            r.out.clear();
+        }
+        self.engine.advance_slots(rows)?;
+        let rows_n = self.engine.advance_rows();
+        for r in rows.iter() {
+            if r.out.is_empty()
+                || r.out.len() > rows_n
+                || r.out.len() != r.drafted.accepted + 1
+                || r.drafted.accepted > r.drafted.proposed
+            {
+                return Err(EngineError(format!(
+                    "slot {}: a pass of at most {rows_n} rows kept {} tokens, its draft {} of {} \
+                     proposed ids",
+                    r.slot,
+                    r.out.len(),
+                    r.drafted.accepted,
+                    r.drafted.proposed
+                )));
+            }
+        }
+        for (r, h) in rows.iter().zip(held) {
+            let ids = self.held_mut(r.slot);
+            *ids = h;
+            ids.push(r.last);
+            ids.extend_from_slice(&r.out[..r.out.len() - 1]);
         }
         Ok(())
     }

@@ -34,7 +34,7 @@ pub use api::{
 pub use engine::{
     CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps,
     ModelProps, PlacementProps, ResidencyReset, Sampler, SamplerFactory, SamplingParams, Saved,
-    SavedState, SlotRow, StateError, Tokenizer,
+    SavedState, SlotPass, SlotRow, StateError, Tokenizer,
 };
 pub use mock::{DraftMock, MockEngine, MockTokenizer, ScriptedEngine};
 pub use sched::{FifoPicker, SlotConfig, SlotPicker, SlotSummary, WaitingRequest};

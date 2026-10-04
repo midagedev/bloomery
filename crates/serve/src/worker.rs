@@ -1,8 +1,9 @@
 //! The engine thread: the one place the engine is called. It takes the
 //! requests the [`Board`] admits to slots, runs each one's prompt as its own
-//! calls, and then steps every running request together: one row a slot, in
-//! one [`Engine::step_slots`] call when two or more run, a plain
-//! [`Engine::next`] (or a drafted pass) when one does. It runs the slot
+//! calls, and then steps every running request together: the plain steps of
+//! several in one [`Engine::step_slots`] call, the drafted passes of several
+//! in one [`Engine::advance_slots`] call (the steps first), a plain
+//! [`Engine::next`] (or one drafted pass) when one runs. It runs the slot
 //! actions the board reserved between those calls.
 //!
 //! A request's events reach its HTTP thread over a channel of its own. Its
@@ -29,7 +30,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::api::{End, EngineFailure, relock};
-use crate::engine::{EngineError, SamplerFactory, SlotRow, StateError};
+use crate::engine::{Drafted, EngineError, SamplerFactory, SlotPass, SlotRow, StateError};
 use crate::genloop::{
     Event, Gen, GenError, GenParams, Need, Outcome, Slot, StopKind, Timings, ms_since,
 };
@@ -476,33 +477,63 @@ impl Worker {
                 Need::Done => unreachable!("a finished request left the running ones"),
             }
         } else {
-            let mut rows: Vec<SlotRow<'_>> = self
-                .active
-                .iter_mut()
-                .zip(&needs)
-                .map(|(a, need)| {
-                    let Need::Step(last) = *need else {
-                        panic!(
-                            "a drafted pass among {} running slots: a drafting engine serves one",
-                            needs.len()
-                        );
-                    };
-                    SlotRow {
-                        slot: a.slot,
-                        last,
-                        logits: a.job.logits_out(),
-                        next: 0,
+            // One engine round, its rows split by what they need: the steps
+            // of two slots or more in one call (one step is a select and a
+            // `next`, as `step_slots`' doc requires), then the drafted passes
+            // in one. Within each call the rows keep `active`'s order.
+            let mut steps: Vec<SlotRow<'_>> = Vec::new();
+            let mut step_at: Vec<usize> = Vec::new();
+            let mut passes: Vec<SlotPass<'_>> = Vec::new();
+            let mut pass_at: Vec<usize> = Vec::new();
+            for (i, (a, need)) in self.active.iter_mut().zip(&needs).enumerate() {
+                match *need {
+                    Need::Step(last) => {
+                        step_at.push(i);
+                        steps.push(SlotRow {
+                            slot: a.slot,
+                            last,
+                            logits: a.job.logits_out(),
+                            next: 0,
+                        });
                     }
-                })
-                .collect();
-            let called = self.slot.step_slots(&mut rows);
-            let answers: Vec<u32> = rows.iter().map(|r| r.next).collect();
-            drop(rows);
-            called.map(|()| {
-                for (a, g) in self.active.iter_mut().zip(answers) {
-                    a.job.stepped(g);
+                    Need::Advance(last) => {
+                        pass_at.push(i);
+                        passes.push(SlotPass {
+                            slot: a.slot,
+                            last,
+                            out: a.job.kept_mut(),
+                            drafted: Drafted::default(),
+                        });
+                    }
+                    Need::Done => unreachable!("a finished request left the running ones"),
                 }
-            })
+            }
+            let mut called = if steps.len() > 1 {
+                self.slot.step_slots(&mut steps)
+            } else if let [row] = steps.as_mut_slice() {
+                self.slot
+                    .select(row.slot)
+                    .and_then(|()| self.slot.next(row.last, row.logits.as_deref_mut()))
+                    .map(|g| row.next = g)
+            } else {
+                Ok(())
+            };
+            if called.is_ok() && !passes.is_empty() {
+                called = self.slot.advance_slots(&mut passes);
+            }
+            if called.is_ok() {
+                let answers: Vec<u32> = steps.iter().map(|r| r.next).collect();
+                let drafted: Vec<Drafted> = passes.iter().map(|r| r.drafted).collect();
+                drop(steps);
+                drop(passes);
+                for (i, g) in step_at.into_iter().zip(answers) {
+                    self.active[i].job.stepped(g);
+                }
+                for (i, d) in pass_at.into_iter().zip(drafted) {
+                    self.active[i].job.advanced(d);
+                }
+            }
+            called
         };
         let Err(e) = called else {
             return Ok(());

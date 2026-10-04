@@ -23,6 +23,8 @@
 //! [`DraftMock`] is the same engine behind a draft of one id: each pass
 //! verifies a proposal after `last`, the mock's own next token on two passes of
 //! three and another id on the third, and keeps what the target agrees with.
+//! [`DraftMock::with_slots`] serves several slots, the pass count — the state
+//! its draft keeps — one a slot.
 //!
 //! Its saved state is its context: [`MOCK_STATE`], a u32 version, a u64 count
 //! and the ids, little-endian.
@@ -358,9 +360,12 @@ impl Engine for MockEngine {
 
 /// [`MockEngine`] with a draft of one id a pass (see the module header). Its
 /// passes keep the target's argmax, so its greedy ids are the plain mock's.
+/// [`DraftMock::with_slots`] serves several, the pass count that decides each
+/// pass's proposal its own a slot ([`Engine::slot_drafts`]).
 pub struct DraftMock {
     inner: MockEngine,
-    passes: usize,
+    /// One pass counter a slot, the selected one's read by each pass.
+    passes: Vec<usize>,
 }
 
 impl DraftMock {
@@ -369,7 +374,22 @@ impl DraftMock {
     pub fn new(ctx_max: usize) -> Self {
         DraftMock {
             inner: MockEngine::new(ctx_max),
-            passes: 0,
+            passes: vec![0],
+        }
+    }
+
+    /// The same drafting mock serving `n` slots (at least 1), each a context
+    /// and a pass count of its own.
+    ///
+    /// # Panics
+    ///
+    /// When `n` is 0.
+    #[must_use]
+    pub fn with_slots(self, n: usize) -> Self {
+        assert!(n > 0, "a mock of no slots");
+        DraftMock {
+            inner: self.inner.with_slots(n),
+            passes: vec![0; n],
         }
     }
 }
@@ -388,13 +408,15 @@ impl Engine for DraftMock {
     }
 
     /// Row 0 runs `last`; a proposal the target's argmax agrees with runs row
-    /// 1 on it, and both rows' argmax are kept.
+    /// 1 on it, and both rows' argmax are kept. The selected slot's pass
+    /// counter decides the proposal, so a slot's passes are its own.
     fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
-        self.passes += 1;
+        let slot = self.inner.cur;
+        self.passes[slot] += 1;
         let first = self.inner.next(last, None)?;
         let n_vocab =
             u32::try_from(MockTokenizer.n_vocab()).expect("the mock's vocabulary fits u32");
-        let proposal = if self.passes.is_multiple_of(3) {
+        let proposal = if self.passes[slot].is_multiple_of(3) {
             (first + 1) % n_vocab
         } else {
             first
@@ -415,6 +437,18 @@ impl Engine for DraftMock {
 
     fn advance_rows(&self) -> usize {
         2
+    }
+
+    fn slots(&self) -> usize {
+        self.inner.slots()
+    }
+
+    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+        self.inner.select_slot(slot)
+    }
+
+    fn slot_drafts(&self) -> bool {
+        true
     }
 
     fn reset(&mut self) -> Result<(), EngineError> {

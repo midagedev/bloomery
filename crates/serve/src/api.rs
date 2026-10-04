@@ -201,10 +201,10 @@ fn check_slots(engine: &dyn Engine, slots: &SlotConfig) -> Result<usize, ServeEr
         ));
     }
     let rows = engine.advance_rows();
-    if n > 1 && rows > 1 && engine.turns().is_none() {
+    if n > 1 && rows > 1 && engine.turns().is_none() && !engine.slot_drafts() {
         return refuse(format!(
-            "--parallel {n}: this engine drafts ({rows} rows a pass), and a step of several \
-             slots does not draft"
+            "--parallel {n}: this engine drafts ({rows} rows a pass) and keeps no draft state \
+             per slot (slot_drafts), so one slot's pass is not its own"
         ));
     }
     let most = default_depth(MAX_CONNECTIONS, n);
@@ -232,7 +232,8 @@ impl Server {
     /// Binds `addr` and takes ownership of the engine, serving the slots
     /// `slots` asks for. A slot count the engine does not declare
     /// ([`Engine::slots`]), several slots on an engine that drafts unless they
-    /// take it in turns ([`Engine::turns`]), and a depth no queue can reach are
+    /// take it in turns ([`Engine::turns`]) or it keeps its draft per slot
+    /// ([`Engine::slot_drafts`]), and a depth no queue can reach are
     /// refused by name ([`ServeError::Slots`]).
     pub fn bind_with(
         addr: impl ToSocketAddrs,

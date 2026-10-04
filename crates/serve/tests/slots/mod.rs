@@ -2,17 +2,21 @@
 //! ids are its request's alone, a free slot takes the oldest waiting request,
 //! a request takes the slot whose ids share its prefix, the queue refuses past
 //! its depth, `/slots` serves N ids and no more, and N past what the engine
-//! declares is refused by name. Then N slots that take the one-slot mock in
+//! declares is refused by name. Then the drafting mock of N slots whose draft
+//! state is per slot: two drafted streams interleave by passes, a plain step
+//! row beside a pass row, and a drafting engine without the per-slot
+//! declaration is refused by name. Then N slots that take the one-slot mock in
 //! turns ([`serve::SwapEngine`]): preemption at a step, turns of `QUANTUM`
 //! tokens, shortest prompt first, a newcomer refused by name when the running
 //! request cannot be parked, the re-prefill fallback, `/slots`' turns, the
 //! draft kept, a lone request on the engine's slot among equals, and a slot
 //! the engine emptied holding nothing for the next request.
 
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use serve::{
@@ -358,8 +362,9 @@ impl Engine for Slotted {
     }
 }
 
-/// The mock that drafts, declaring two slots: a drafting engine is refused
-/// past one slot whatever it declares.
+/// The mock that drafts, declaring two slots and no per-slot draft state: a
+/// drafting engine is refused past one slot unless it declares
+/// [`serve::Engine::slot_drafts`].
 struct DraftingSlots(serve::DraftMock);
 
 impl Engine for DraftingSlots {
@@ -437,6 +442,444 @@ fn hw_slots_an_engine_does_not_declare_are_refused() {
         assert_eq!(out.status.code(), Some(64), "{args:?}: {out:?}");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("--parallel"), "{args:?}: {err}");
+    }
+}
+
+/// A drafting engine behind the entry log in `prefill` (every entry recorded
+/// and, until the log is released, held there), so one request's prompt holds
+/// the engine thread until the other has queued and both run together. Every
+/// `select_slot`, `next` and `advance` it takes goes into `calls` in order —
+/// the engine thread's single order, the deterministic record of which slot
+/// each drafted pass ran on.
+struct DraftGated {
+    inner: Box<dyn Engine>,
+    log: Arc<EntryLog>,
+    calls: Arc<Mutex<Vec<(usize, char)>>>,
+}
+
+impl Engine for DraftGated {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        self.inner.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.log.enter(self.inner.tokenizer().decode(ids));
+        self.inner.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.calls.lock().expect("calls").push((0, 'n'));
+        self.inner.next(last, out)
+    }
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        let d = self.inner.advance(last, out)?;
+        self.calls.lock().expect("calls").push((0, 'a'));
+        Ok(d)
+    }
+    fn advance_rows(&self) -> usize {
+        self.inner.advance_rows()
+    }
+    fn slots(&self) -> usize {
+        self.inner.slots()
+    }
+    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+        let r = self.inner.select_slot(slot);
+        if r.is_ok() {
+            self.calls.lock().expect("calls").push((slot, 's'));
+        }
+        r
+    }
+    fn slot_drafts(&self) -> bool {
+        self.inner.slot_drafts()
+    }
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.inner.reset()
+    }
+    fn keepable(&self, n: usize) -> usize {
+        self.inner.keepable(n)
+    }
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        self.inner.cut(n)
+    }
+    fn ctx_max(&self) -> usize {
+        self.inner.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+/// The violating engine: [`serve::DraftMock`] with its draft state — the pass
+/// count that decides each pass's proposal — one count shared by both slots,
+/// while it declares `slot_drafts`. The FAIL-first of
+/// `hw_drafted_passes_interleave_across_slots` runs that gate's scenario
+/// against it; no gate holds it, for it would pin a defect.
+#[allow(dead_code, reason = "only the FAIL-first run constructs it")]
+struct SharedDraft {
+    inner: MockEngine,
+    passes: usize,
+}
+
+#[allow(dead_code, reason = "only the FAIL-first run constructs it")]
+impl SharedDraft {
+    fn new(ctx_max: usize) -> Self {
+        SharedDraft {
+            inner: MockEngine::new(ctx_max).with_slots(2),
+            passes: 0,
+        }
+    }
+}
+
+impl Engine for SharedDraft {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        self.inner.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.inner.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.inner.next(last, out)
+    }
+    /// [`serve::DraftMock`]'s rule on one counter for both slots.
+    fn advance(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        self.passes += 1;
+        let first = self.inner.next(last, None)?;
+        let n_vocab =
+            u32::try_from(serve::MockTokenizer.n_vocab()).expect("the mock's vocabulary fits u32");
+        let proposal = if self.passes.is_multiple_of(3) {
+            (first + 1) % n_vocab
+        } else {
+            first
+        };
+        out.push(first);
+        if proposal != first {
+            return Ok(Drafted {
+                proposed: 1,
+                accepted: 0,
+            });
+        }
+        out.push(self.inner.next(proposal, None)?);
+        Ok(Drafted {
+            proposed: 1,
+            accepted: 1,
+        })
+    }
+    fn advance_rows(&self) -> usize {
+        2
+    }
+    fn reset(&mut self) -> Result<(), EngineError> {
+        self.inner.reset()
+    }
+    fn keepable(&self, n: usize) -> usize {
+        self.inner.keepable(n)
+    }
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        self.inner.cut(n)
+    }
+    fn ctx_max(&self) -> usize {
+        self.inner.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn slots(&self) -> usize {
+        self.inner.slots()
+    }
+    fn select_slot(&mut self, slot: usize) -> Result<(), EngineError> {
+        self.inner.select_slot(slot)
+    }
+    /// The violating declaration: the draft state is shared, not per slot.
+    fn slot_drafts(&self) -> bool {
+        true
+    }
+}
+
+/// One arrival in [`SeenChunks`]: when it landed, its stream's slot, whether
+/// it is the last chunk, and the chunk itself.
+type SeenChunk = (Instant, u64, bool, Value);
+
+/// One `/completion` stream read as it arrives: every `data:` payload, with
+/// the moment it landed, its stream's slot and whether it is the last chunk,
+/// appended to `seen` — the shared log's order is the streams' arrival order.
+fn read_stream(addr: SocketAddr, body: &Value, seen: &Mutex<Vec<SeenChunk>>) {
+    let mut s = TcpStream::connect(addr).expect("connect");
+    s.set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("timeout");
+    let text = body.to_string();
+    let req = format!(
+        "POST /completion HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{text}",
+        text.len()
+    );
+    s.write_all(req.as_bytes()).expect("write");
+    let mut held = String::new();
+    let mut buf = [0u8; 8192];
+    let mut head = true;
+    loop {
+        let n = match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => panic!("stream read: {e}"),
+        };
+        held.push_str(&String::from_utf8_lossy(&buf[..n]));
+        if head {
+            let Some(at) = held.find("\r\n\r\n") else {
+                continue;
+            };
+            held.drain(..at + 4);
+            head = false;
+        }
+        while let Some(at) = held.find("\n\n") {
+            let frame = held[..at].to_owned();
+            held.drain(..at + 2);
+            let Some(payload) = frame.strip_prefix("data: ") else {
+                panic!("a frame that is no payload: {frame}");
+            };
+            let v: Value = serde_json::from_str(payload).expect("chunk JSON");
+            let slot = v["id_slot"].as_u64().expect("id_slot");
+            let last = v["stop"].as_bool().expect("stop");
+            seen.lock()
+                .expect("seen")
+                .push((Instant::now(), slot, last, v));
+        }
+    }
+}
+
+/// The slots of the drafted passes in engine-call order: each pass pairs with
+/// the select that precedes it (the default `advance_slots` selects a row's
+/// slot before it advances).
+fn pass_slots(calls: &[(usize, char)]) -> Vec<usize> {
+    let mut slot = 0;
+    let mut out = Vec::new();
+    for (at, what) in calls {
+        match what {
+            's' => slot = *at,
+            'a' => out.push(slot),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Two concurrent greedy requests on the two-slot drafting mock interleave by
+/// drafted passes: each request's ids and draft counts are its run alone's on
+/// a fresh server, the engine's passes alternate slots while both requests
+/// run (one pass a slot a round, in the engine thread's one order — the
+/// streams' arrival order is the writers' scheduling, not the engine's), and
+/// the two streams overlap in arrival.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_drafted_passes_interleave_across_slots() {
+    const N: usize = 40;
+    let log = Arc::new(EntryLog::default());
+    let calls: Arc<Mutex<Vec<(usize, char)>>> = Arc::new(Mutex::new(Vec::new()));
+    let addr = start_n(
+        Box::new(DraftGated {
+            inner: Box::new(serve::DraftMock::new(4096).with_slots(2)),
+            log: Arc::clone(&log),
+            calls: Arc::clone(&calls),
+        }),
+        2,
+        None,
+        None,
+    );
+    // Greedy and unbanned, so both requests take drafted passes; `ignore_eos`
+    // would ban the stop ids and make every token a plain step.
+    let body = |p: &str| {
+        json!({"prompt": p, "n_predict": N, "temperature": 0, "cache_prompt": false,
+               "return_tokens": true, "stream": true})
+    };
+    let seen: Arc<Mutex<Vec<SeenChunk>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut readers = Vec::new();
+    for (i, p) in PROMPTS[..2].iter().enumerate() {
+        let (addr, seen, body) = (addr, Arc::clone(&seen), body(p));
+        readers.push(std::thread::spawn(move || read_stream(addr, &body, &seen)));
+        if i == 0 {
+            assert!(
+                log.len_reached(1, BOUND),
+                "the first prompt never reached the engine"
+            );
+        } else {
+            wait_deferred(addr, 1, BOUND);
+        }
+    }
+    log.release();
+    for r in readers {
+        r.join().expect("reader");
+    }
+    let seen = seen.lock().expect("seen").clone();
+    let finals: Vec<&Value> = seen
+        .iter()
+        .filter(|(_, _, last, _)| *last)
+        .map(|(_, _, _, v)| v)
+        .collect();
+    assert_eq!(finals.len(), 2, "the two streams' last chunks");
+    let mut slots: Vec<u64> = finals
+        .iter()
+        .map(|v| v["id_slot"].as_u64().expect("id_slot"))
+        .collect();
+    slots.sort_unstable();
+    assert_eq!(slots, [0, 1], "each request its own slot");
+    for p in &PROMPTS[..2] {
+        let v = finals
+            .iter()
+            .find(|v| v["prompt"] == *p)
+            .unwrap_or_else(|| panic!("no stream of {p}"));
+        let alone = start_n(
+            Box::new(serve::DraftMock::new(4096).with_slots(2)),
+            2,
+            None,
+            None,
+        );
+        let mut want_body = body(p);
+        want_body["stream"] = json!(false);
+        let want = post(alone, "/completion", &want_body).json();
+        assert!(
+            want["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
+            "{p}: the alone run drafted"
+        );
+        assert_eq!(v["tokens"], want["tokens"], "{p}: {}", v);
+        assert_eq!(
+            v["timings"]["draft_n"], want["timings"]["draft_n"],
+            "{p}: the passes it proposed"
+        );
+        assert_eq!(
+            v["timings"]["draft_n_accepted"], want["timings"]["draft_n_accepted"],
+            "{p}: the proposals its target kept"
+        );
+    }
+    // The passes alternate: no two of one slot's passes run in a row while
+    // the other slot's request is between its first and last pass.
+    let passes = pass_slots(&calls.lock().expect("calls").clone());
+    assert!(
+        passes.len() >= N,
+        "fewer than one pass a token ran: {passes:?}"
+    );
+    for slot in [0, 1] {
+        let other = 1 - slot;
+        let other_first = passes.iter().position(|&at| at == other);
+        let other_last = passes.iter().rposition(|&at| at == other);
+        let mut run = 0;
+        for (i, &at) in passes.iter().enumerate() {
+            if at != slot {
+                run = 0;
+                continue;
+            }
+            run += 1;
+            let began = i + 1 - run;
+            let live = other_first.is_some_and(|f| f <= i) && other_last.is_some_and(|l| l > began);
+            assert!(
+                !live || run == 1,
+                "slot {slot} ran {run} passes in a row while slot {other} was between its \
+                 passes: {passes:?}"
+            );
+        }
+    }
+    // The streams overlap in arrival: each stream's last chunk lands after
+    // the other's first.
+    for slot in slots {
+        let other = 1 - slot;
+        let (Some(mine_last), Some(theirs_first)) = (
+            seen.iter().rposition(|(_, s, _, _)| *s == slot),
+            seen.iter().position(|(_, s, _, _)| *s == other),
+        ) else {
+            panic!("stream {slot} or {other} never sent a chunk");
+        };
+        assert!(
+            mine_last > theirs_first,
+            "stream {slot} ended before stream {other} began: the streams did not overlap"
+        );
+    }
+    let per = metric(&get(addr, "/metrics").body, "n_busy_slots_per_decode");
+    assert!(
+        per > 1.0,
+        "the requests never ran one round together: {per}"
+    );
+}
+
+/// A request that samples takes plain steps beside a greedy request's drafted
+/// passes: both finish, each request's ids are its run alone's on a fresh
+/// server, and the rounds carry both slots.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_mixed_step_and_pass_rows() {
+    let log = Arc::new(EntryLog::default());
+    let calls: Arc<Mutex<Vec<(usize, char)>>> = Arc::new(Mutex::new(Vec::new()));
+    let addr = start_n(
+        Box::new(DraftGated {
+            inner: Box::new(serve::DraftMock::new(4096).with_slots(2)),
+            log: Arc::clone(&log),
+            calls: Arc::clone(&calls),
+        }),
+        2,
+        None,
+        None,
+    );
+    // The sampler reads the logits row every token, so that request steps;
+    // the greedy one passes.
+    let sampled = json!({"prompt": PROMPTS[0], "n_predict": 40, "temperature": 0.8, "seed": 7,
+                         "cache_prompt": false, "return_tokens": true});
+    let drafted = json!({"prompt": PROMPTS[2], "n_predict": 40, "temperature": 0,
+                         "cache_prompt": false, "return_tokens": true});
+    let a = post_bg(addr, sampled.clone());
+    assert!(
+        log.len_reached(1, BOUND),
+        "the first prompt never reached the engine"
+    );
+    let b = post_bg(addr, drafted.clone());
+    wait_deferred(addr, 1, BOUND);
+    log.release();
+    let (ra, rb) = (a.join().expect("sampled"), b.join().expect("drafted"));
+    assert_eq!(
+        (ra.status, rb.status),
+        (200, 200),
+        "{} | {}",
+        ra.body,
+        rb.body
+    );
+    let (va, vb) = (ra.json(), rb.json());
+    assert!(
+        vb["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
+        "the greedy request drafted: {vb}"
+    );
+    assert!(
+        va["timings"].get("draft_n").is_none(),
+        "the sampled request takes plain steps, no draft counts: {va}"
+    );
+    for (v, body) in [(&va, &sampled), (&vb, &drafted)] {
+        let alone = start_n(
+            Box::new(serve::DraftMock::new(4096).with_slots(2)),
+            2,
+            None,
+            None,
+        );
+        let want = post(alone, "/completion", body).json();
+        assert_eq!(v["tokens"], want["tokens"], "{body}");
+    }
+    let per = metric(&get(addr, "/metrics").body, "n_busy_slots_per_decode");
+    assert!(
+        per > 1.0,
+        "the requests never ran one round together: {per}"
+    );
+}
+
+/// A drafting engine of two slots that declares no per-slot draft state is
+/// refused past one slot by a message naming `slot_drafts`; one that declares
+/// it serves `--parallel 2` (the two gates above).
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_drafting_engine_without_slot_drafts_is_refused() {
+    let slots = SlotConfig {
+        parallel: 2,
+        ..SlotConfig::default()
+    };
+    match Server::bind_with(
+        "127.0.0.1:0",
+        Box::new(DraftingSlots(serve::DraftMock::new(64))),
+        config(None),
+        slots,
+    ) {
+        Err(ServeError::Slots(m)) => assert!(m.contains("slot_drafts"), "{m}"),
+        Err(e) => panic!("another error: {e}"),
+        Ok(_) => panic!("bound: a drafting engine without slot_drafts serves one slot"),
     }
 }
 

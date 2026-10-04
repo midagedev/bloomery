@@ -5,9 +5,11 @@
 //! encoding never wait for a generation. The engine serves
 //! [`Engine::slots`] sequences at once, each with its own cache of
 //! [`Engine::ctx_max`] positions; [`Engine::select_slot`] picks the one every
-//! per-slot call below acts on, and [`Engine::step_slots`] steps several in
-//! one call. An engine that declares one slot (the default) is never asked to
-//! select and never steps more than one row.
+//! per-slot call below acts on, [`Engine::step_slots`] steps several in one
+//! call and [`Engine::advance_slots`] runs one drafted pass on each of
+//! several, which an engine that keeps its draft's state per slot declares
+//! ([`Engine::slot_drafts`]). An engine that declares one slot (the default)
+//! is never asked to select and never steps more than one row.
 //!
 //! On the selected slot, a request keeps the longest prefix `k` of its ids the
 //! cache already holds and the engine can keep ([`Engine::keepable`]): `cut(k)`,
@@ -190,6 +192,29 @@ pub trait Engine: Send {
         }
         Ok(())
     }
+    /// One drafted pass on each row's own slot (distinct, each below
+    /// [`Engine::slots`]), in row order: each row's `last` and whatever the
+    /// engine's draft proposes after it evaluated together, the tokens the
+    /// pass keeps appended to its `out` in position order and what it drafted
+    /// set in its `drafted`, as [`Engine::advance`] does for one. Afterwards
+    /// the selected slot is unspecified: the server selects before its next
+    /// per-slot call. The default is a select and an `advance` a row.
+    fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
+        for row in rows {
+            self.select_slot(row.slot)?;
+            row.drafted = self.advance(row.last, row.out)?;
+        }
+        Ok(())
+    }
+    /// Whether this engine keeps its draft's state (proposal history, draft
+    /// cache, acceptance counters) per slot, so a slot's drafted passes are
+    /// the passes it would run alone whatever the other slots run; the server
+    /// serves several slots of such an engine past one. The default is false:
+    /// a drafting engine that shares its draft's state across slots serves
+    /// one slot, or several that take it in turns ([`Engine::turns`]).
+    fn slot_drafts(&self) -> bool {
+        false
+    }
     /// How the slots share the engine. `None` (the default): each slot holds
     /// a sequence of its own and several step in one call. `Some(park)`: the
     /// slots take the engine's one sequence in turns ([`crate::SwapEngine`]):
@@ -337,6 +362,18 @@ pub struct SlotRow<'a> {
     pub last: u32,
     pub logits: Option<&'a mut [f32]>,
     pub next: u32,
+}
+
+/// One row of [`Engine::advance_slots`]: the slot, the id its pass runs, the
+/// ids the pass keeps (appended), and what the pass drafted. `drafted` is the
+/// engine's answer, set by the call; the server checks the kept ids against
+/// the engine's rows as [`Engine::advance`]'s caller does.
+#[derive(Debug)]
+pub struct SlotPass<'a> {
+    pub slot: usize,
+    pub last: u32,
+    pub out: &'a mut Vec<u32>,
+    pub drafted: Drafted,
 }
 
 /// What one [`Engine::advance`] drafted: the ids its draft proposed (0 for a
