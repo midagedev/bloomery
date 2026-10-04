@@ -70,7 +70,15 @@ gguf 9 2 0
 # whole 32-value blocks quantized in place) add the two unsafe fns — the device core q8_block_warp (its
 # plane-store block) and the 256 body norm_partial_append_q8 — and the entries' and body's read, store and
 # module blocks, twenty-three in all, each with its SAFETY line.
-gpu 1480 155 6
+# PIN(2026-10-03): gpu 1480 -> 1577 blocks, 155 -> 160 fns, eleven new kernel entries, not old code relaxed:
+# the q8_0 read path (flash_gqa.rs, flash_gqa_prefill.rs) adds the five unsafe fns — the four segment
+# bodies seg_scalar_q8, seg_mma_q8, seg_scalar_p_q8 and seg_mma_p_q8, and the prefill body
+# prefill_256_p_q8 — with the bodies' staging, score and partial blocks, the eleven entries'
+# shared-memory blocks (the 128-head prefill entry's whole inline body among them) and the prefill's
+# cp.async staging and widening macros (dequant_row!/zero_row! are macros, not fns, because a shared
+# tile pointer cannot cross a device helper fn boundary — upstream ledger #38), ninety-seven blocks in
+# all, each with its SAFETY line.
+gpu 1577 160 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -78,7 +86,10 @@ gpu-deepseek41 464 52 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.
-gpu-gates 61 5 1
+# PIN(2026-10-03): gpu-gates 61 -> 62 blocks, new code, not old code relaxed: gate_qwen3moe_flash's q8 window
+# refusal (the q8 prefill's `kq` at 8 bytes past a 16-byte boundary) takes its window over a padded
+# allocation in one block, with its SAFETY line.
+gpu-gates 62 5 1
 gpu-glm5next 4 0 0
 gpu-vision 48 0 0
 hf 0 0 0
