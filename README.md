@@ -100,15 +100,17 @@ curl -s http://127.0.0.1:8080/v1/systemone -d '{"state": "User: what is the weat
     "criteria": {"web_search": "Look something up online", "calculator": "Do arithmetic", "none": "Answer directly"}}}}'
 ```
 
-**Concurrent requests.** The ds41, glm, qwen3 and qwen38 seats take `--parallel N`: requests take
-turns of 64 tokens on one model, a later arrival preempts at the next step, and both answer their
-solo runs' tokens exactly — V4.1, GLM and Qwen3.8 by snapshot/resume (their MTP drafts rejoining),
-the qwen3 seats by re-prefill. Unset, the ds41, glm and qwen38 seats size the slots to what the
-park budget holds of one slot's whole-context state (a `parallel` line on stderr names the rule,
-the slots and each term; never below one, and `--parallel 1` keeps the plain engine); the qwen3
-seats keep two (their park holds ids only, nothing to size from). The N slots
-share one context-sized cache in turns (llama-server gives each slot its own full `n_ctx`, N times the memory —
-a different resource reading of the same flag, not a defect).
+**Concurrent requests.** Every seat takes `--parallel N`. On a whole-card qwen3moe load (Qwen3-30B and its
+kin) the N slots are resident sequences inside the one model: each running request decodes one token a round, so
+the streams flow together, and each answers its solo run's tokens exactly. The context is split as llama-server
+splits it with `-np N` and no `-kvu`: `--ctx-size` (or the automatic choice) is the total, each slot holds
+`total / N` rows; unset, `--parallel` is 2, and `--parallel 1` keeps one sequence with the whole context. The
+ds41, glm and qwen38 seats, a qwen35moe file and a placed load still take turns of 64 tokens on one sequence: a
+later arrival preempts at the next step, and both answer their solo runs' tokens exactly — V4.1, GLM and
+Qwen3.8 by snapshot/resume (their MTP drafts rejoining), the qwen35moe file and a placed load by re-prefill.
+Unset, the ds41, glm and qwen38 seats size the slots to what the park budget holds of one slot's whole-context
+state (a `parallel` line on stderr names the rule, the slots and each term; never below one, and `--parallel 1`
+keeps the plain engine). Their N slots share one context-sized cache in turns.
 
 **Small cards.** Qwen3.6 and Qwen3-30B at `Q4_K_M` (19-21 GB) run whole on a 24 GB card, or on a 12-16 GB card
 with `--place a`: the routed experts go to the CPU. With no `--place` at all, a file that does not fit the
@@ -249,8 +251,9 @@ text. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
 - **sm_86+** GPUs; the prebuilt archive carries sm_86 PTX.
 - One model a server; one expert tier card at most (`--place bp`).
-- The qwen38 and decide seats serve one request at a time (Qwen3.8's MTP draft does not rejoin a turn yet);
-  DSpark drafts never rejoin — `--parallel > 1` with `BLOOMERY_DRAFT=dspark` is refused by name.
+- Streams flow together only on a whole-card qwen3moe load so far; the other seats' `--parallel` slots take
+  turns of 64 tokens. The decide seat serves one request at a time; DSpark drafts never rejoin —
+  `--parallel > 1` with `BLOOMERY_DRAFT=dspark` is refused by name.
 - Clef takes text states only, and reads backbone weights of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 (not the IQ
   types, Q2_K, Q4_0 or Q4_1).
 - V4.1 prompts are bound by the CPU expert tier; V4.1 decode is bound by host memory bandwidth.
