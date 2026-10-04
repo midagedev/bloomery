@@ -139,7 +139,7 @@
 **이 회차가 남긴 열린 것:**
 - **`gate-gpu-qwen4exp-mtp` base 빨강 (S)**: `Mtp38: rows 0..8 of the Pass arena as positions 55..63 for a walk from 56: the arena holds positions 56..64` — walk 시작의 경계 off-by-one 버그 후보. parwave가 착지 배치에서 이 게이트를 안 돌렸고(Seq38 꼬리 clamp 둘이 이 문자와 닿는다) a5d233be에서도 빨강. **0.2.1의 qwen38 MTP 기능이 닿는 경로라 출시 전 검토 권고.**
 - **`props_engine_bytes_are_the_plans` 센서스 빨강(셋째 사례, B절)**: live free-bytes 배치 vs 게이트의 정적 plan_gate 숫자 ~300 MB 어긋남. `weekly-gpu-ds41-serve`의 `&&` 사슬을 끊어 draft·bp 팔을 못 돌게 한다.
-- **parwave의 serve측 슬롯 경합 (S, 미수선)**: 슬롯 ≥2에서 이전 요청의 해제보다 먼저 온 요청이 LRU로 안 쓴 슬롯을 가져가고 슬롯 주소 `erase`가 다른 슬롯의 남은 것을 지운다(ids는 무스위치 실행과 동일로 검증됨). 게이트들은 `--parallel 1`로 고정.
+- ~~**parwave의 serve측 슬롯 경합 (S, 미수선)**: 슬롯 ≥2에서 이전 요청의 해제보다 먼저 온 요청이 LRU로 안 쓴 슬롯을 가져가고 슬롯 주소 `erase`가 다른 슬롯의 남은 것을 지운다(ids는 무스위치 실행과 동일로 검증됨). 게이트들은 `--parallel 1`로 고정.~~ **Split (10-05, slotrace):** (a) the request-arrival choice is closed by fslot `9f103368` (`end_request` releases before `Done`, the tie rule prefers the engine's slot); (b) the erase is real but sits in `run_turns`' switch before a slot action (`worker.rs:655-663`), fixed on branch `slotrace` `06860ce4` (two `hw_` gates in `tests/slots/mod.rs`, red before) — in the 0.2.1 batch.
 - **선결 게이트 빚 둘 → 닫힘**: `gate-ds41-place`(테스트 strip이 free_bytes/held_by도 지우게, `f9c366ea`) · `gate-ds41-load` check v(jitonce 유지 모듈의 4 MiB 첫 드롭을 PIN(2026-10-04) `2×PINNED_GRANULE`로) — jitovl 착지 배치가 둘 다 초록으로 재확인.
 - **placectx 열린 끝**: 여유 큰 카드에선 m1형 뮤턴트의 답이 정답과 우연히 같다 — 적재된 서버 옆 교차 센서스 비교가 필요.
 
