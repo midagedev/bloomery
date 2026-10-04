@@ -1,5 +1,5 @@
 //! Gate: what one client cannot do to the server over the mock engine — hold
-//! connections past [`serve::MAX_CONNECTIONS`], keep an idle one past
+//! connections past [`serve::MAX_CONNECTIONS`] (the decide server's too), keep an idle one past
 //! [`serve::KEEP_ALIVE_IDLE`], or send a request that takes the engine past the
 //! positions it serves.
 
@@ -17,6 +17,7 @@ mod connections {
     use std::time::{Duration, Instant};
 
     use super::common::{get, start};
+    use serve::decide::{Decide, DecideError, DecideServer, Decided, Seated};
     use serve::{KEEP_ALIVE_IDLE, MAX_CONNECTIONS};
 
     /// The server's connection threads (named `serve:<port>`) alive in this process.
@@ -53,13 +54,46 @@ mod connections {
         s
     }
 
+    /// A decider that answers nothing; the limit is reached before any request.
+    struct Idle;
+
+    impl Decide for Idle {
+        fn decide(&mut self, _: &str) -> Result<Decided, DecideError> {
+            Err(DecideError::Refused("idle".to_owned()))
+        }
+
+        fn props(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    /// A decide server over [`Idle`] on a free port, run on a thread of its own.
+    fn start_decide() -> SocketAddr {
+        let seated = Seated {
+            routes: &["/v1/systemone"],
+            name: "idle".to_owned(),
+            n_ctx: 16,
+        };
+        let server = DecideServer::bind("127.0.0.1:0", &seated, Box::new(Idle)).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        std::thread::spawn(move || server.run());
+        addr
+    }
+
     /// `MAX_CONNECTIONS` connections inside a request hold every place: the next one
     /// gets a 503 with `Retry-After` and no thread, and once one closes a new one is
-    /// served.
+    /// served. The decide server takes the same rule from the same owner: its 503 is the
+    /// generative server's byte for byte.
     #[test]
     #[ignore = "gate: just gate-serve"]
     fn hw_connections_past_the_limit_get_503() {
-        let addr = start(4096);
+        let decide = past_the_limit(start_decide());
+        let generative = past_the_limit(start(4096));
+        assert_eq!(decide, generative);
+    }
+
+    /// Holds every place of the server at `addr` and returns the refused connection's body.
+    fn past_the_limit(addr: SocketAddr) -> String {
         let mut held: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| half_request(addr)).collect();
         await_threads(addr.port(), MAX_CONNECTIONS);
 
@@ -81,6 +115,7 @@ mod connections {
         let served = get(addr, "/health");
         assert_eq!(served.status, 200, "{}", served.body);
         drop(held);
+        refused.body
     }
 
     /// Reads one response with a `Content-Length` body off a keep-alive connection.
