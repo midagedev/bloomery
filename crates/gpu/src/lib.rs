@@ -1973,7 +1973,8 @@ struct Bundle {
     device: usize,
     name: &'static str,
     /// Its lock is held across a load, so two callers never load one bundle
-    /// twice.
+    /// twice — and a caller that arrives while [`start_bundle_load`]'s
+    /// helper holds it across a load waits on the same completion.
     state: Arc<Mutex<BundleState>>,
 }
 
@@ -1988,15 +1989,59 @@ struct BundleState {
 /// Every bundle a family asked for, one slot per (device, crate bundle).
 static BUNDLES: Mutex<Vec<Bundle>> = Mutex::new(Vec::new());
 
+/// The (device, bundle) slot in [`BUNDLES`], registered on first ask.
+fn bundle_slot(device: usize, name: &'static str) -> Arc<Mutex<BundleState>> {
+    let mut bundles = BUNDLES.lock().unwrap_or_else(PoisonError::into_inner);
+    match bundles
+        .iter()
+        .find(|b| b.device == device && b.name == name)
+    {
+        Some(b) => Arc::clone(&b.state),
+        None => {
+            let state = Arc::new(Mutex::new(BundleState::default()));
+            bundles.push(Bundle {
+                device,
+                name,
+                state: Arc::clone(&state),
+            });
+            state
+        }
+    }
+}
+
+/// The body every bundle load runs under its slot's lock
+/// ([`Bundle::state`], held across a load so two callers never load one
+/// bundle twice): a module already present is shared, and only a slot still
+/// empty after a load that failed (or never started) loads. Whichever
+/// thread runs it — the caller, or [`start_bundle_load`]'s helper — the
+/// process makes one load per (device, bundle), and a failed load's error
+/// surfaces at the next asker, which retries it.
+fn load_bundle_once(
+    anchor: &Arc<CudaContext>,
+    slot: &Arc<Mutex<BundleState>>,
+    load: impl FnOnce(&Arc<CudaContext>) -> Result<Arc<CudaModule>, cuda_host::EmbeddedModuleError>,
+) -> Result<Arc<CudaModule>, GpuError> {
+    let mut state = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(module) = &state.module {
+        return Ok(Arc::clone(module));
+    }
+    state.loads += 1;
+    let loaded = load(anchor)?;
+    state.module = Some(Arc::clone(&loaded));
+    Ok(loaded)
+}
+
 /// The module of embedded bundle `name` on `ctx`'s device, loaded once per
 /// process and shared by every `#[cuda_module]` family of that bundle and
 /// every `Gpu` on the device ([`shared_module!`]). A family's generated
 /// `load` reads its crate's whole bundle, so one module carries every
 /// family's entries, and loading it per family repeats the same JIT. `load`
 /// runs only for the first caller, on the device's anchor ([`anchor`]): the
-/// module outlives every `Gpu`, and the driver errors it records land on
-/// the anchor, never on a `Gpu`'s own handle. A `ctx` that is not its
-/// device's primary context is refused by name.
+/// module outlives every `Gpu`, and the driver errors it records land on the
+/// anchor, never on a `Gpu`'s own handle. A load [`start_bundle_load`]
+/// started is waited for here: the slot's lock is held across the load, so
+/// this caller blocks until the helper finishes and then shares its module.
+/// A `ctx` that is not its device's primary context is refused by name.
 pub fn bundle_module(
     ctx: &Arc<CudaContext>,
     name: &'static str,
@@ -2010,32 +2055,60 @@ pub fn bundle_module(
             "a context on its device's primary context",
         ));
     }
-    let slot = {
-        let mut bundles = BUNDLES.lock().unwrap_or_else(PoisonError::into_inner);
-        match bundles
-            .iter()
-            .find(|b| b.device == device && b.name == name)
-        {
-            Some(b) => Arc::clone(&b.state),
-            None => {
-                let state = Arc::new(Mutex::new(BundleState::default()));
-                bundles.push(Bundle {
-                    device,
-                    name,
-                    state: Arc::clone(&state),
-                });
-                state
-            }
-        }
-    };
-    let mut state = slot.lock().unwrap_or_else(PoisonError::into_inner);
-    if let Some(module) = &state.module {
-        return Ok(Arc::clone(module));
+    let slot = bundle_slot(device, name);
+    load_bundle_once(&anchor, &slot, load)
+}
+
+/// Start embedded bundle `name`'s one load on `ctx`'s device on a helper
+/// thread and return at once, on the slot [`bundle_module`] shares: the one
+/// bundle JIT an empty-cache start makes sits before its weights upload, and
+/// on the helper thread it runs beside the upload instead of ahead of it.
+/// The starter retains the device's anchor itself, so the loader thread
+/// holds the primary context for the whole load — cuda-core binds a context
+/// to whichever thread calls ([`CudaContext::bind_to_thread`]) — and every
+/// later asker (the `Gpu` whose [`Gpu::opening`] started it, a family of the
+/// bundle, another `Gpu`) waits on the slot's lock and shares the one
+/// module. A load that fails leaves the slot empty and its error surfaces at
+/// the next asker's retry, as for an inline load. A `ctx` that is not its
+/// device's primary context is refused by name. Load-time only.
+pub fn start_bundle_load(
+    ctx: &Arc<CudaContext>,
+    name: &'static str,
+    load: impl FnOnce(&Arc<CudaContext>) -> Result<Arc<CudaModule>, cuda_host::EmbeddedModuleError>
+    + Send
+    + 'static,
+) -> Result<(), GpuError> {
+    let device = ctx.ordinal();
+    let anchor = anchor(device)?;
+    if anchor.cu_ctx() != ctx.cu_ctx() {
+        return Err(GpuError::state(
+            "start_bundle_load",
+            "a context on its device's primary context",
+        ));
     }
-    state.loads += 1;
-    let loaded = load(&anchor)?;
-    state.module = Some(Arc::clone(&loaded));
-    Ok(loaded)
+    let slot = bundle_slot(device, name);
+    // A thread the process cannot make is a named refusal, not a silent
+    // serial load: the starter's caller has work that assumes the load runs
+    // beside it.
+    std::thread::Builder::new()
+        .name("bundle-jit".into())
+        .spawn({
+            let anchor = Arc::clone(&anchor);
+            let slot = Arc::clone(&slot);
+            move || {
+                // The failure stays nameless here by design: the slot holds
+                // no module, and the next asker retries the load and
+                // surfaces the error on its own call.
+                let _ = load_bundle_once(&anchor, &slot, load);
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| {
+            GpuError::plan(
+                "start_bundle_load",
+                format!("a thread to load bundle {name} beside the caller: {e}"),
+            )
+        })
 }
 
 /// The bundle loads this process made for bundle `name` on device `device`
@@ -2069,23 +2142,34 @@ macro_rules! shared_module {
     };
 }
 
-impl Gpu {
-    /// `with_device(0)`: under the box environment device 0 is the dev card.
-    pub fn new() -> Result<Gpu, GpuError> {
-        Gpu::with_device(0)
+/// A card [`Gpu::opening`] opened with this crate's bundle load started on
+/// a helper thread ([`start_bundle_load`]): the context, the engine stream
+/// and the fault word every `Gpu` over the card holds, while the bundle's
+/// one load is still in flight. The uploads of the load that opened it go
+/// on `stream` — an upload needs no module — and [`GpuOpening::finish`]
+/// waits on the started load's completion and binds this crate's families
+/// to its one module. Load-time only.
+pub(crate) struct GpuOpening {
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    fault: Arc<DeviceBuffer<u32>>,
+}
+
+impl GpuOpening {
+    /// The engine stream the opening's uploads go on, the stream of the
+    /// `Gpu` it finishes into ([`Gpu::stream`]).
+    pub(crate) fn stream(&self) -> &CudaStream {
+        &self.stream
     }
 
-    /// Take device `device`'s primary context ([`primary_context`]), make
-    /// the engine stream, and bind the K-quant module here and one family
-    /// per kernel file to this crate's bundle module on the device
-    /// ([`bundle_module`]), loaded by the first `Gpu` on it. Load-time only.
-    pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
-        let ctx = primary_context(device)?;
-        let stream = role_stream(&ctx, StreamRole::Engine)?;
-        // First: the modules below that raise are given it at load.
-        let fault = Arc::new(DeviceBuffer::from_host(&stream, &clean_fault_words())?);
+    /// Wait for the started bundle load's one completion — [`bundle_module`]
+    /// over the same slot, so no second load — and bind the K-quant module
+    /// here and one family per kernel file of this crate to its module: the
+    /// `Gpu` ([`Gpu::with_device`]'s binding). Load-time only.
+    pub(crate) fn finish(self) -> Result<Gpu, GpuError> {
+        let GpuOpening { ctx, stream, fault } = self;
         // SAFETY: this package owns the embedded device bundle produced for
-        // the kernels module above; every launcher checks its launch
+        // the kernels module below; every launcher checks its launch
         // contract before launching.
         let module = unsafe { crate::shared_module!(kernels, &ctx)? };
         Ok(Gpu {
@@ -2102,6 +2186,43 @@ impl Gpu {
             stream,
             module,
         })
+    }
+}
+
+impl Gpu {
+    /// `with_device(0)`: under the box environment device 0 is the dev card.
+    pub fn new() -> Result<Gpu, GpuError> {
+        Gpu::with_device(0)
+    }
+
+    /// Take device `device`'s primary context ([`primary_context`]), make
+    /// the engine stream, and bind the K-quant module here and one family
+    /// per kernel file to this crate's bundle module on the device
+    /// ([`bundle_module`]), loaded by the first `Gpu` on it. Load-time only.
+    pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
+        Gpu::opening(device)?.finish()
+    }
+
+    /// The opened card a load uploads against: device `device`'s primary
+    /// context ([`primary_context`]) and engine stream, its fault word, and
+    /// this crate's bundle load started on a helper thread
+    /// ([`start_bundle_load`]) — the one JIT an empty-cache start makes runs
+    /// beside the upload instead of ahead of it. [`GpuOpening::finish`]
+    /// waits on the started load and binds the families. Load-time only.
+    pub(crate) fn opening(device: usize) -> Result<GpuOpening, GpuError> {
+        let ctx = primary_context(device)?;
+        let stream = role_stream(&ctx, StreamRole::Engine)?;
+        // First: the modules below that raise are given it at load.
+        let fault = Arc::new(DeviceBuffer::from_host(&stream, &clean_fault_words())?);
+        // SAFETY: this package owns the embedded device bundle produced for
+        // the kernels module below; every launcher checks its launch
+        // contract before launching.
+        unsafe {
+            crate::start_bundle_load(&ctx, env!("CARGO_PKG_NAME"), |anchor| {
+                kernels::load(anchor).map(|loaded| loaded.as_cuda_module().clone())
+            })?;
+        }
+        Ok(GpuOpening { ctx, stream, fault })
     }
 
     /// The sink a launch of `layer` raises into: this context's fault word.
@@ -2200,10 +2321,30 @@ impl Gpu {
         name: &str,
         device: Option<::model::placement::workstation::DeviceId>,
     ) -> Result<Gpu, GpuError> {
+        Gpu::with_device(Gpu::card_ordinal(name, device)?)
+    }
+
+    /// [`Gpu::open_card`]'s resolution, shared by [`Gpu::open_card_beside`]:
+    /// the ordinal of the visible device a plan's card is.
+    fn card_ordinal(
+        name: &str,
+        device: Option<::model::placement::workstation::DeviceId>,
+    ) -> Result<usize, GpuError> {
         let seen = census()?;
         let ordinal = ::model::placement::workstation::device_on_host(name, device, &seen)
             .map_err(|e| GpuError::plan("Gpu::open_card", e))?;
-        Gpu::with_device(usize::try_from(ordinal).expect("a u32 ordinal fits usize"))
+        Ok(usize::try_from(ordinal).expect("a u32 ordinal fits usize"))
+    }
+
+    /// [`Gpu::open_card`]'s device opened with this crate's bundle load
+    /// started on a helper thread ([`Gpu::opening`]): the opening a placed
+    /// load uploads its card segments against, so the bundle's one JIT runs
+    /// beside the upload. Load-time only.
+    pub(crate) fn open_card_beside(
+        name: &str,
+        device: Option<::model::placement::workstation::DeviceId>,
+    ) -> Result<GpuOpening, GpuError> {
+        Gpu::opening(Gpu::card_ordinal(name, device)?)
     }
 
     /// This context's device as the census names it: ordinal and UUID.
@@ -2867,6 +3008,71 @@ mod context_tests {
         assert!(
             Arc::ptr_eq(a.module.as_cuda_module(), b.module.as_cuda_module()),
             "two Gpus on device 0 hold two loads of the bundle"
+        );
+    }
+
+    /// A bundle load started on the helper thread is the one load every
+    /// asker shares: a family that asks while the helper is still inside
+    /// its load — the load runs under the slot's lock, which the closure's
+    /// signal and sleep hold across it — receives the started load's module
+    /// without running a load of its own, a later asker receives the same
+    /// module, and the `Gpu` an opening finishes into holds the module a
+    /// synchronously opened `Gpu` does, the bundle loaded once on the
+    /// device. The mid-load ask runs on a slot of this test's own name: the
+    /// binary's other hw_ tests load this crate's real bundle in parallel,
+    /// so a mid-load ask over the real slot would race whichever of them
+    /// won it — the name is the slot's only key, and the started load still
+    /// runs the crate's real bundle load, on the helper thread.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_bundle_load_started_beside_shares_its_one_load() {
+        let ctx = super::primary_context(0).expect("device 0's primary context");
+        const OWN: &str = "gpu-overlap-test";
+        // Sent once the helper holds the slot's lock, so the asker below
+        // cannot race the load's start.
+        let (held, asker) = std::sync::mpsc::channel();
+        super::start_bundle_load(&ctx, OWN, move |anchor| {
+            held.send(()).expect("the asker waits for the load");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            // SAFETY: this package owns the embedded device bundle produced
+            // for the kernels module above; the launchers check its launch
+            // contracts.
+            unsafe { super::kernels::load(anchor).map(|loaded| loaded.as_cuda_module().clone()) }
+        })
+        .expect("the bundle load started on device 0");
+        asker
+            .recv()
+            .expect("the started bundle load runs on the helper thread");
+        let mid_load = super::bundle_module(&ctx, OWN, |_| {
+            panic!("a family that asked while the started load was in flight loaded its own")
+        })
+        .expect("the module of the started bundle load");
+        let settled = super::bundle_module(&ctx, OWN, |_| {
+            panic!("a family that asked after the started load loaded its own")
+        })
+        .expect("the module of the started bundle load, asked again");
+        let gpu = Gpu::opening(0)
+            .expect("device 0 opened beside its bundle load")
+            .finish()
+            .expect("the opening finished into a Gpu");
+        let plain = Gpu::with_device(0).expect("a Gpu on device 0");
+        assert_eq!(
+            super::bundle_loads(0, OWN),
+            1,
+            "the started bundle load was not the slot's one load of it"
+        );
+        assert_eq!(
+            super::bundle_loads(0, env!("CARGO_PKG_NAME")),
+            1,
+            "device 0 loaded this crate's bundle more than once over the opening path"
+        );
+        assert!(
+            Arc::ptr_eq(&mid_load, &settled),
+            "the mid-load asker and a later asker hold two loads of the started load"
+        );
+        assert!(
+            Arc::ptr_eq(gpu.module.as_cuda_module(), plain.module.as_cuda_module()),
+            "the Gpu the opening finished into and a synchronous Gpu hold two loads of the bundle"
         );
     }
 }
