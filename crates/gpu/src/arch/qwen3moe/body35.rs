@@ -42,7 +42,7 @@
 //! ([`Body35::cut`], [`Rollback`]). The K/V planes are cut by position, as
 //! [`Body`]'s are.
 
-use super::body::{Kernels, TapRows, f32_site};
+use super::body::{Kernels, KvQ8, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
 use super::head_argmax::HeadArgmaxState;
 use super::image::{ImageWrite, PromptImage};
@@ -118,6 +118,9 @@ pub struct Open35 {
     /// A size outside that range, or an arena that does not fit the card's
     /// free bytes with [`FIT_RESERVE`] left, is refused by name at load.
     pub ubatch: usize,
+    /// The attention layers' KV planes' format ([`KvQ8`]); the delta layers'
+    /// recurrent stores are f32 either way.
+    pub kv: KvQ8,
 }
 
 /// Rows of the ubatch arena for ubatches of `u` tokens on a `ctx`-row cache:
@@ -769,7 +772,9 @@ struct Pre35 {
 
 impl Pre35 {
     fn read(file: &Split, o: Open35) -> Result<Pre35, GpuError> {
-        let Open35 { ctx, mma, ubatch } = o;
+        let Open35 {
+            ctx, mma, ubatch, ..
+        } = o;
         let read = model::arch::qwen35moe::spec::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         let spec = read.spec;
         if ctx == 0 {
@@ -1097,7 +1102,7 @@ impl Body35 {
         for (kind, plan) in kinds.iter().zip(&plans) {
             check_resident(w, &d, plan, placed.is_none())?;
             stores.push(match *kind {
-                Kind35::Gqa(_) => LayerStore::Kv(KvPlanes::new(stream, &d)?),
+                Kind35::Gqa(_) => LayerStore::Kv(KvPlanes::new(stream, &d, o.kv)?),
                 Kind35::Delta(shape) => LayerStore::Rec(RecStore::new(stream, shape, LANES)?),
             });
         }
@@ -1909,29 +1914,29 @@ impl Rows for Body35 {
 
 impl Instrumented for Body35 {
     /// Rows `0..rows` of every attention layer's K and V planes filled with
-    /// a deterministic pattern of finite, nonzero f16 values that differ
-    /// from row to row; the delta layers' stores stay as they stand (a
+    /// a deterministic pattern of finite, nonzero values that differ from
+    /// row to row — f16 bits on an f16 cache, the q8_0 form of the same
+    /// values on a q8_0 one; the delta layers' stores stay as they stand (a
     /// step's cost does not depend on the state's values) — a step shape,
     /// not a model state. The held counter follows the position the
     /// instrument stands the model at, so the step after it runs.
     fn seed_depth(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
         let d = self.s.dims;
-        let mut plane = vec![0u16; d.n_kv * d.ctx * d.head];
+        let mut vals = vec![0f32; d.n_kv * d.ctx * d.head];
         let mut state = 0x9e37_79b9u32 ^ rows as u32;
         for h in 0..d.n_kv {
             for r in 0..rows.min(d.ctx) {
                 for c in 0..d.head {
                     state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                     let v = ((state >> 9) as f32 / (1u32 << 23) as f32 - 0.5) + 1.0 / 64.0;
-                    plane[(h * d.ctx + r) * d.head + c] = gguf::quant::f32_to_f16_bits(v);
+                    vals[(h * d.ctx + r) * d.head + c] = v;
                 }
             }
         }
         let stream = gpu.stream();
         for s in &mut self.stores {
             if let LayerStore::Kv(p) = s {
-                p.k.copy_from_host(stream, &plane)?;
-                p.v.copy_from_host(stream, &plane)?;
+                p.fill(stream, &vals, &d)?;
             }
         }
         stream.synchronize()?;

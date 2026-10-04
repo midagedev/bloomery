@@ -58,8 +58,8 @@ use crate::placement::{
 };
 
 use runtime::stores::{
-    DELTA_LANES, delta_lane_bytes, dense_kv_bytes, kv_row_bytes, ple_ring_bytes, recurrent_bytes,
-    selecting_bytes,
+    DELTA_LANES, delta_lane_bytes, dense_kv_bytes, kv_q8_row_bytes, kv_row_bytes, ple_ring_bytes,
+    recurrent_bytes, selecting_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -992,10 +992,13 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 ///   (`runtime::stores::delta_lane_bytes`);
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
-/// - an attention layer: a position's K and V (`2 · kv_heads · head_dim` f16);
-///   with the selector, also its raw indexer key (`idx_dim` f16) and a
-///   pooled key (`idx_dim` f16) per pool of `ratio` positions, the last pool
-///   counted whole (`runtime::stores::selecting_bytes`).
+/// - an attention layer: a position's K and V (`2 · kv_heads · head_dim`
+///   values — f16, or q8_0's two-plane layout when the load runs its cache
+///   in it ([`KvLayout::in_q8`], the cache lever's `q8_0`); a selecting
+///   layer's planes stay f16: the qwen38 family's stores carry no q8_0
+///   form); with the selector, also its raw indexer key (`idx_dim` f16) and
+///   a pooled key (`idx_dim` f16) per pool of `ratio` positions, the last
+///   pool counted whole (`runtime::stores::selecting_bytes`).
 #[derive(Clone, Debug)]
 pub struct KvLayout {
     /// Per layer: its kind.
@@ -1010,6 +1013,8 @@ pub struct KvLayout {
     /// The selector's key width and each layer's pool (0 on a GDN layer);
     /// `None` on a qwen35moe file.
     select: Option<(usize, Vec<usize>)>,
+    /// A plain attention layer's planes in q8_0's layout.
+    q8: bool,
 }
 
 impl KvLayout {
@@ -1030,7 +1035,16 @@ impl KvLayout {
             kv_heads: hp.n_head_kv,
             head_dim: hp.head_dim,
             select: exp.map(|e| (e.idx_dim, e.ratios.clone())),
+            q8: false,
         }
+    }
+
+    /// The same layout with a plain attention layer's planes in q8_0's
+    /// two-plane layout.
+    #[must_use]
+    pub const fn in_q8(mut self) -> KvLayout {
+        self.q8 = true;
+        self
     }
 }
 
@@ -1055,7 +1069,14 @@ impl KvBytes for KvLayout {
                     let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
                     selecting_bytes(self.kv_heads, self.head_dim, *idx_dim, pool, ctx)
                 }
-                None => ctx_max * kv_row_bytes(self.kv_heads, self.head_dim),
+                None => {
+                    let row = if self.q8 {
+                        kv_q8_row_bytes(self.kv_heads, self.head_dim)
+                    } else {
+                        kv_row_bytes(self.kv_heads, self.head_dim)
+                    };
+                    ctx_max * row
+                }
             },
             None => 0,
         };
@@ -1781,12 +1802,45 @@ mod tests {
             kv_heads: 2,
             head_dim: 256,
             select: Some((128, vec![0, 0, 4])),
+            q8: false,
         };
         assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 9_437_200);
         assert_eq!(kv.layer_bytes(1, 4096), 3_596_288 + 9_437_200 + 696_320);
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2304 + 1024 * 256);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2304 + 1025 * 256);
         assert_eq!(kv.layer_bytes(3, 4096), 0);
+    }
+
+    /// The cache lever's q8_0 term ([`KvLayout::in_q8`]): a plain attention
+    /// layer's K/V at `17/16` bytes a value, a selecting layer's and a GDN
+    /// layer's stores untouched (the qwen38 family carries no q8_0 form).
+    #[test]
+    fn q8_layer_bytes() {
+        let plain = KvLayout {
+            kinds: vec![Kind::Attention],
+            recurrent: 0,
+            ple: None,
+            kv_heads: 4,
+            head_dim: 128,
+            select: None,
+            q8: false,
+        };
+        let f16 = plain.layer_bytes(0, 4096);
+        let q8 = plain.in_q8().layer_bytes(0, 4096);
+        assert_eq!(f16, 4096 * 4 * 128 * 2 * 2);
+        assert_eq!(q8, 4096 * 4 * 128 * 2 * 17 / 16);
+        assert_eq!(q8 * 32, f16 * 17);
+        let selecting = KvLayout {
+            kinds: vec![Kind::Attention],
+            recurrent: 0,
+            ple: None,
+            kv_heads: 2,
+            head_dim: 256,
+            select: Some((128, vec![4])),
+            q8: false,
+        };
+        let sel = selecting.layer_bytes(0, 4096);
+        assert_eq!(selecting.in_q8().layer_bytes(0, 4096), sel);
     }
 
     /// The card rule over Qwen3.8's routed stacks ([`super::card_routed`]) on

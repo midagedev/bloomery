@@ -225,11 +225,16 @@ mod gate {
             Ok(v["n_ctx"].as_u64().unwrap_or(u64::MAX))
         };
         // Each arm loads the model, so each takes its own directory.
-        let arms: [(&str, &[&str]); 3] = [
+        let arms: [(&str, &[&str]); 4] = [
             ("default", &[]),
             ("flag", &["--ctx", "2048"]),
             ("placed", &["--place", "a"]),
+            // The cache lever's arm: the q8_0 planes the seat's flag names,
+            // the auto context search under the halved KV term.
+            ("q8", &["--cache-type-k", "q8_0"]),
         ];
+        // The default arm's answer, for the q8 arm's growth relation.
+        let mut default_n = None;
         for (name, extra) in arms {
             let d = dir.join(format!("ctx-{name}"));
             std::fs::create_dir_all(&d)?;
@@ -255,12 +260,84 @@ mod gate {
             println!("ctx arm {name}: props n_ctx {n} of trained {trained}");
             check(ok, "ctx_never_passes_the_trained_context", n <= trained);
             match name {
-                "default" => check(
-                    ok,
-                    "ctx_default_is_capped_to_the_card",
-                    n >= 4096 && n % 1024 == 0 && n > 4096,
-                ),
                 "flag" => check(ok, "ctx_flag_wins", n == 2048),
+                "q8" => {
+                    // The load names the format it holds, the halved KV term
+                    // never shrinks the auto answer (where the card has room
+                    // past the f16 answer it grows it — the fit rides the
+                    // census, so the growth prints, not judged), and the
+                    // residents differ by exactly the planes' derived delta:
+                    // the file's layers, KV heads and head width at the
+                    // served context, 15/8 B a value (f16's 4 against q8_0's
+                    // 17/8, both planes). FAIL-first: a budget or allocation
+                    // that ignores the flag leaves the delta wrong or 0.
+                    let log = std::fs::read_to_string(&err_log)?;
+                    let loads = log.lines().filter(|l| l.starts_with("load ")).count();
+                    let says_q8 = log
+                        .lines()
+                        .any(|l| l.starts_with("load ") && l.contains("cache=q8_0"));
+                    check(ok, "q8_load_names_its_cache", loads == 1 && says_q8);
+                    check(
+                        ok,
+                        "q8_ctx_never_below_the_f16_answer",
+                        n >= 4096
+                            && n % 1024 == 0
+                            && n <= trained
+                            && n >= default_n.unwrap_or(u64::MAX),
+                    );
+                    let resident = |log: &str| {
+                        log.lines()
+                            .find(|l| l.starts_with("load "))
+                            .and_then(|l| l.split("resident_bytes=").nth(1))
+                            .and_then(|r| r.split(' ').next())
+                            .and_then(|r| r.parse::<u64>().ok())
+                    };
+                    let kv_heads = split
+                        .arch_get_u64("attention.head_count_kv")
+                        .or_else(|| split.arch_get_u64("attention.head_count"))
+                        .ok_or("no attention.head_count(_kv)")?;
+                    let head_dim = split
+                        .arch_get_u64("attention.key_length")
+                        .ok_or("no attention.key_length")?;
+                    let layers = split.arch_get_u64("block_count").ok_or("no block_count")?;
+                    // A qwen3moe file's every layer carries the planes, so
+                    // the delta is exact; a qwen35moe file's delta layers
+                    // carry none, so the same product is only the upper
+                    // bound (their exact 17/32 term is the model crate's
+                    // own unit pin).
+                    let ceiling = layers * n * kv_heads * head_dim * 15 / 8;
+                    let f16_log =
+                        std::fs::read_to_string(dir.join("ctx-default").join("server.err"))?;
+                    let dropped = resident(&f16_log)
+                        .zip(resident(&log))
+                        .is_some_and(|(a, b)| {
+                            let d = a.saturating_sub(b);
+                            match split.architecture() {
+                                Some("qwen3moe") => d == ceiling,
+                                _ => d > 0 && d <= ceiling,
+                            }
+                        });
+                    println!(
+                        "ctx arm q8: residents f16 {:?} q8_0 {:?}, the planes' delta at most \
+                         {ceiling} B",
+                        resident(&f16_log),
+                        resident(&log)
+                    );
+                    check(ok, "q8_resident_drops_by_the_planes", dropped);
+                }
+                "default" => {
+                    check(
+                        ok,
+                        "ctx_default_is_capped_to_the_card",
+                        n >= 4096 && n % 1024 == 0 && n > 4096,
+                    );
+                    let log = std::fs::read_to_string(&err_log)?;
+                    let says_f16 = log
+                        .lines()
+                        .any(|l| l.starts_with("load ") && l.contains("cache=f16"));
+                    check(ok, "default_load_names_f16", says_f16);
+                    default_n = Some(n);
+                }
                 _ => {
                     // The placed default is searched over the plan's own
                     // expert split, and the relation is what holds on every
@@ -877,6 +954,87 @@ mod gate {
         Ok(lines)
     }
 
+    /// The cache flag's own surface (`--cache-type-k`): a word outside the
+    /// two spellings refused by name before anything loads, `--cache-type-v`
+    /// refused by name with the why (both planes quantize together), and
+    /// the flag winning over the `BLOOMERY_QWEN3_KV` lever — a spawn with
+    /// the lever at `q8_0` and the flag at `f16` loads the f16 planes and
+    /// says so. FAIL-first: a parser that takes any word listens; one that
+    /// lets the lever override the flag loads `cache=q8_0`.
+    fn cache_refusals(model: &Path, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let refuses = |name: &str, want: &str| -> Result<bool, GateError> {
+            let d = dir.join(format!("cache-{name}"));
+            std::fs::create_dir_all(&d)?;
+            let out = Command::new(beside("bloomery-serve")?)
+                .args(["--model", "qwen3", "--port", "0", "-m", m])
+                .args(
+                    match name {
+                        "word" => vec!["--cache-type-k", "q6_0"],
+                        _ => vec!["--cache-type-v", "q8_0"],
+                    }
+                    .as_slice(),
+                )
+                .env_remove("BLOOMERY_REF_MODEL")
+                .output()?;
+            let said = String::from_utf8_lossy(&out.stderr).into_owned();
+            std::fs::write(d.join("server.err"), &said)?;
+            let refused = !out.status.success() && said.contains(want);
+            println!(
+                "cache arm {name}: exit {:?}, said {said}",
+                out.status.code()
+            );
+            Ok(refused)
+        };
+        check(
+            ok,
+            "cache_type_k_refuses_other_words",
+            refuses("word", "--cache-type-k takes f16 or q8_0, not \"q6_0\"")?,
+        );
+        check(
+            ok,
+            "cache_type_v_refused_naming_why",
+            refuses("v", "--cache-type-v does not exist")?
+                && std::fs::read_to_string(dir.join("cache-v").join("server.err"))?
+                    .contains("together"),
+        );
+        // The flag wins over the lever: the spawn listens and its load names
+        // the f16 planes.
+        let d = dir.join("cache-flag-wins");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL")
+            .env("BLOOMERY_QWEN3_KV", "q8_0");
+        let mut s = Served::spawn_cmd(
+            cmd,
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "1",
+                "-m",
+                m,
+                "--cache-type-k",
+                "f16",
+            ],
+            &d,
+        )?;
+        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let (st, body) = curl(&url("/props"), None, false)?;
+        json_of("/props", st, &body)?;
+        let log = std::fs::read_to_string(&err_log)?;
+        let f16 = log
+            .lines()
+            .any(|l| l.starts_with("load ") && l.contains("cache=f16"));
+        println!("cache arm flag-wins: server stopped: {}", s.stop()?);
+        check(ok, "cache_type_k_wins_over_the_lever", f16);
+        Ok(())
+    }
+
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let a = parse_args()?;
@@ -898,6 +1056,7 @@ mod gate {
             }
             check(&mut ok, "completion_ids_are_the_cli_ids", agree);
             ctx_default(model, &dir, &mut ok)?;
+            cache_refusals(model, &dir, &mut ok)?;
             if i == 0 {
                 // The park is the seat's, not the file's: the first file's
                 // arm carries the swap clause.

@@ -29,6 +29,7 @@ pub mod moe;
 pub mod ops;
 pub mod placement;
 pub mod profile;
+pub mod quant;
 pub mod r8file;
 
 pub use ops::{Tensor2, Tensor2View};

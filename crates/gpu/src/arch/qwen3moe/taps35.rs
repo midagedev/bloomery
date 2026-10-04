@@ -85,14 +85,20 @@ fn head_of(stream: &CudaStream, b: &DeviceBuffer<f32>, n: usize) -> Result<Vec<f
 }
 
 impl Body35 {
-    /// Layer `l`'s store, read back. Synchronizes; gate use.
+    /// Layer `l`'s store, read back — an attention layer's K/V planes as
+    /// their f16 bits, refused by name on a q8_0 cache (which holds no f16
+    /// rows). Synchronizes; gate use.
     pub fn store(&self, gpu: &Gpu, l: usize) -> Result<StoreHost, GpuError> {
+        const WHAT: &str = "qwen35moe::store";
         let stream = gpu.stream();
-        Ok(match self.store_at(l, "qwen35moe::store")? {
-            LayerStore::Kv(p) => StoreHost::Kv {
-                k: p.k.to_host_vec(stream)?,
-                v: p.v.to_host_vec(stream)?,
-            },
+        Ok(match self.store_at(l, WHAT)? {
+            LayerStore::Kv(p) => {
+                let (k, v) = p.f16(WHAT)?;
+                StoreHost::Kv {
+                    k: k.to_host_vec(stream)?,
+                    v: v.to_host_vec(stream)?,
+                }
+            }
             LayerStore::Rec(r) => StoreHost::Rec {
                 state: r.state.to_host_vec(stream)?,
                 ring: r.ring.to_host_vec(stream)?,
@@ -108,16 +114,17 @@ impl Body35 {
         let bad = |want: String| GpuError::shape(WHAT, format!("layer {l}: {want}"));
         match (self.store_at_mut(l, WHAT)?, h) {
             (LayerStore::Kv(p), StoreHost::Kv { k, v }) => {
-                if k.len() != p.k.len() || v.len() != p.v.len() {
+                let (pk, pv) = p.f16_mut(WHAT)?;
+                if k.len() != pk.len() || v.len() != pv.len() {
                     return Err(bad(format!(
                         "K/V planes of {} values, given {} and {}",
-                        p.k.len(),
+                        pk.len(),
                         k.len(),
                         v.len()
                     )));
                 }
-                p.k.copy_from_host(stream, k)?;
-                p.v.copy_from_host(stream, v)?;
+                pk.copy_from_host(stream, k)?;
+                pv.copy_from_host(stream, v)?;
             }
             (LayerStore::Rec(r), StoreHost::Rec { state, ring }) => {
                 if state.len() != r.state.len() || ring.len() != r.ring.len() {

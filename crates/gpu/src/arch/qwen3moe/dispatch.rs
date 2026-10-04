@@ -20,18 +20,16 @@ use super::body::{ATTN_SCALE, ATTN_SCALE_256, Body, Kernels};
 use super::delta;
 use super::experts::{CombineArgs, GateUpArgs};
 use super::head_argmax::HeadArgmaxState;
-use super::plan::{FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy};
+use super::plan::{FfnPlan, FfnRoute, Form, GqaKind, GqaPlan, LayerPlan, MixerPlan, SiteTy};
 use super::program::{Program, Tail};
 use super::proj::{OResidArgs, QkvArgs};
-use super::scratch::{Arena, Io, KvPlanes, StoreMut};
+use super::scratch::{Append128, Append256, Arena, FlashPass, Io, KvPlanes, StoreMut};
 use super::wide::{self, GEMV_COLS};
 use crate::elem::EmbedRowsArgs;
-use crate::flash_gqa::GqaArgs;
 use crate::gated_quant::GateLayout;
 use crate::head::Head;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q38::{EmbedQ8Args, OutGateArgs};
-use crate::rope_neox::{NeoxArgs, PartialNeoxArgs};
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
@@ -590,9 +588,10 @@ fn attention(
     }
     match n.kind {
         GqaKind::Neox128 => {
-            k.neox.enqueue_head_norm_neox_append(
+            kv.append_128(
+                &k.neox,
                 stream,
-                NeoxArgs {
+                Append128 {
                     q: &mut s.q,
                     k: &mut s.k,
                     v: &s.v,
@@ -606,16 +605,13 @@ fn attention(
                     ctx: d.ctx,
                     m,
                     fault: c.sink,
-                    cache_k: &mut kv.k,
-                    cache_v: &mut kv.v,
                 },
             )?;
-            k.flash.enqueue_pass(
+            kv.flash_128(
+                &k.flash,
                 stream,
-                GqaArgs {
+                FlashPass {
                     q: &s.q,
-                    kc: &kv.k,
-                    vc: &kv.v,
                     n_keys: &s.n_keys,
                     scale: ATTN_SCALE,
                     n_kv: d.n_kv,
@@ -722,9 +718,10 @@ fn gated_256(
         .q_out
         .as_mut()
         .ok_or(GpuError::state(WHAT, "the arena's buffer of gated queries"))?;
-    k.neox.enqueue_head_norm_neox_append_256(
+    kv.append_256(
+        &k.neox,
         stream,
-        PartialNeoxArgs {
+        Append256 {
             qg: &s.q,
             q: q_out,
             k: &mut s.k,
@@ -739,30 +736,27 @@ fn gated_256(
             ctx: d.ctx,
             m,
             fault: c.sink,
-            cache_k: &mut kv.k,
-            cache_v: &mut kv.v,
         },
     )?;
-    let args = GqaArgs {
-        q: q_out,
-        kc: &kv.k,
-        vc: &kv.v,
-        n_keys: &s.n_keys,
-        scale: ATTN_SCALE_256,
-        n_kv: d.n_kv,
-        ctx: d.ctx,
-        m,
-        part_v: &mut s.part_v,
-        part_ms: &mut s.part_ms,
-        fault: c.sink,
-        y: &mut s.attn,
-    };
-    match n.flash {
-        Flash::Group => k.flash.enqueue_pass_256(stream, args, c.mma)?,
-        Flash::Quads => k.flash.enqueue_pass_256_p4(stream, args, d.n_head, c.mma)?,
-        // The pairs' pass is scalar: the load refuses the tensor-core one.
-        Flash::Pairs => k.flash.enqueue_pass_256_p2(stream, args, d.n_head)?,
-    }
+    kv.flash_256(
+        &k.flash,
+        stream,
+        FlashPass {
+            q: q_out,
+            n_keys: &s.n_keys,
+            scale: ATTN_SCALE_256,
+            n_kv: d.n_kv,
+            ctx: d.ctx,
+            m,
+            part_v: &mut s.part_v,
+            part_ms: &mut s.part_ms,
+            fault: c.sink,
+            y: &mut s.attn,
+        },
+        d.n_head,
+        n.flash,
+        c.mma,
+    )?;
     if !n.o_ty.kquant() {
         return q35.q38.enqueue_out_gate(
             stream,

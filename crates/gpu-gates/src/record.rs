@@ -1676,10 +1676,11 @@ pub static LISTENING_DECIDE: Kind = Kind {
 pub static LOAD_QWEN3: Kind = Kind {
     name: "load_qwen3",
     head: "load",
-    doc: "The Qwen3 seat's model on device 0: its architecture, resident bytes, context, layers, the prompt ubatch and the step graph's nodes, and the load's wall.",
+    doc: "The Qwen3 seat's model on device 0: its architecture, resident bytes, the K/V planes' format, context, layers, the prompt ubatch and the step graph's nodes, and the load's wall.",
     parts: &[
         key("arch", Word, ""),
         key("resident_bytes", U64, "B"),
+        key("cache", Word, ""),
         key("ctx", U64, "positions"),
         key("layers", U64, ""),
         key("ubatch", U64, "positions"),

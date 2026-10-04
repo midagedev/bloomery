@@ -256,7 +256,9 @@ impl Mtp38 {
             }
         };
         let n = geo::N_KV * ctx * geo::HEAD;
-        let store = KvPlanes {
+        // The draft's store is f16: the qwen38 family's stores carry no q8_0
+        // form.
+        let store = KvPlanes::F16 {
             k: DeviceBuffer::zeroed(stream, n)?,
             v: DeviceBuffer::zeroed(stream, n)?,
         };
@@ -380,7 +382,8 @@ impl Mtp38 {
                 .copied()
                 .collect())
         };
-        Ok((plane(&self.store.k)?, plane(&self.store.v)?))
+        let (k, v) = self.store.f16(WHAT)?;
+        Ok((plane(k)?, plane(v)?))
     }
 
     /// The store's rows `rows` (`store_host`'s position-major shape, both
@@ -419,8 +422,9 @@ impl Mtp38 {
             buf.copy_from_host(stream, &all)?;
             Ok(())
         };
-        plane(&rows.0, &mut self.store.k)?;
-        plane(&rows.1, &mut self.store.v)?;
+        let (k, v) = self.store.f16_mut(WHAT)?;
+        plane(&rows.0, k)?;
+        plane(&rows.1, v)?;
         if let Some(a) = self.a.as_mut() {
             a.held = n;
         }
@@ -1723,6 +1727,9 @@ impl Mtp38 {
         cx.q8_gemv(&n.q, &a.mixed, m, &mut a.qg)?;
         cx.q8_gemv(&n.k, &a.mixed, m, &mut a.k)?;
         cx.q8_gemv(&n.v, &a.mixed, m, &mut a.v)?;
+        // The draft's store is f16: the family's shared append runs its f16
+        // arm.
+        let (kc, vc) = store.f16_mut("qwen38::mtp")?;
         k.neox.enqueue_head_norm_neox_append_256(
             stream,
             PartialNeoxArgs {
@@ -1740,16 +1747,17 @@ impl Mtp38 {
                 ctx: *ctx,
                 m,
                 fault: sink,
-                cache_k: &mut store.k,
-                cache_v: &mut store.v,
+                cache_k: kc,
+                cache_v: vc,
             },
         )?;
+        let (kc, vc) = store.f16("qwen38::mtp")?;
         k.flash.enqueue_pass_256_p4(
             stream,
             GqaArgs {
                 q: &a.q,
-                kc: &store.k,
-                vc: &store.v,
+                kc,
+                vc,
                 n_keys: &a.n_keys,
                 scale: ATTN_SCALE_256,
                 n_kv: geo::N_KV,
@@ -2103,6 +2111,9 @@ impl Mtp38 {
                 },
             )?;
         }
+        // The draft's store is f16: the family's shared append runs its f16
+        // arm.
+        let (kc, vc) = store.f16_mut("qwen38::mtp")?;
         k.neox.enqueue_head_norm_neox_append_256(
             stream,
             PartialNeoxArgs {
@@ -2120,8 +2131,8 @@ impl Mtp38 {
                 ctx: *ctx,
                 m,
                 fault: sink,
-                cache_k: &mut store.k,
-                cache_v: &mut store.v,
+                cache_k: kc,
+                cache_v: vc,
             },
         )
     }

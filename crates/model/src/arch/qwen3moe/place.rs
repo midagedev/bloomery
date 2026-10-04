@@ -21,7 +21,7 @@ use crate::placement::{
     self, Card, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
     Violation,
 };
-use runtime::stores::kv_row_bytes;
+use runtime::stores::{kv_q8_row_bytes, kv_row_bytes};
 
 /// The routed stacks the qwen3moe program's card experts read, each in the
 /// file's blocks ([`CardFormat::KQuant`]): the Q4_K gate and up (the
@@ -76,30 +76,46 @@ pub const fn counted_arena_bytes(card: &Card) -> u64 {
 }
 
 /// A qwen3moe file's per-layer cache: every layer's K and V planes, a
-/// position's `2 · kv_heads · head_dim` f16.
+/// position's `2 · kv_heads · head_dim` values — f16, or q8_0's two-plane
+/// layout when the load runs its cache in it ([`KvLayout::in_q8`], the
+/// cache lever's `q8_0`).
 #[derive(Clone, Copy, Debug)]
 pub struct KvLayout {
     layers: usize,
     kv_heads: usize,
     head_dim: usize,
+    q8: bool,
 }
 
 impl KvLayout {
-    /// The layout `hp` describes.
+    /// The layout `hp` describes, in f16.
     #[must_use]
     pub fn of(hp: &Hparams) -> KvLayout {
         KvLayout {
             layers: hp.n_layer,
             kv_heads: hp.n_head_kv,
             head_dim: hp.head_dim,
+            q8: false,
         }
+    }
+
+    /// The same layout in q8_0's two-plane planes.
+    #[must_use]
+    pub const fn in_q8(mut self) -> KvLayout {
+        self.q8 = true;
+        self
     }
 }
 
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         if layer < self.layers {
-            ctx_max * kv_row_bytes(self.kv_heads, self.head_dim)
+            let row = if self.q8 {
+                kv_q8_row_bytes(self.kv_heads, self.head_dim)
+            } else {
+                kv_row_bytes(self.kv_heads, self.head_dim)
+            };
+            ctx_max * row
         } else {
             0
         }

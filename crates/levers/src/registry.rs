@@ -32,6 +32,7 @@ pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
+pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
@@ -520,6 +521,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               Unset there is on under `--place a` with a residency, off everywhere else; \
               `off` is the same-binary arm; `on` is refused by name beside \
               `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: QWEN3_KV,
+        class: Class::A,
+        kind: Kind::Words(&["f16", "q8_0"]),
+        default: Unset::Is("f16"),
+        doc: "Qwen3 and Qwen3.6 (`generate_qwen3moe`, `bloomery-serve --model qwen3`): the \
+              format the load holds its K/V cache planes in — `q8_0` the two-plane layout \
+              (17/16 B a value against f16's 2, both planes quantized together by the one \
+              choice), a cache half the bytes wide, so the seat's auto `--ctx` search \
+              reaches about 1.88x the f16 answer on the same card. Read once at load: the \
+              append quantizes each row and the flash reads it through the format's \
+              algebra, so a q8_0 run's bits are its own, never an f16 run's; the budget \
+              (`whole_ctx` and the placed searches) counts the format's bytes. The seat's \
+              `--cache-type-k` takes the same two words (llama-server's spelling) and \
+              wins over the lever; `--cache-type-v` does not exist — both planes quantize \
+              together. Refused by name on a qwen4exp (Qwen3.8) file, whose stores carry \
+              no q8_0 form. The `load` line prints `cache=`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

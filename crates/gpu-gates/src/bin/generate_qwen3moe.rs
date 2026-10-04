@@ -300,7 +300,7 @@ mod cli {
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for, ubatch_size};
     use bloomery_gpu::arch::qwen3moe::{
-        Body, Body35, Body38, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
+        Body, Body35, Body38, KvQ8, Open35, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
         Qwen35moeModel, Qwen38Model,
     };
     use bloomery_gpu::host::PassKind;
@@ -927,6 +927,7 @@ mod cli {
         let mut acts_on = vec![
             bloomery_levers::STEP_STATS,
             bloomery_levers::QWEN38_EXPERTS,
+            bloomery_levers::QWEN3_KV,
             bloomery_levers::ROUTE_TRACE,
             bloomery_levers::DRAFT,
             bloomery_levers::MTP_HEAD_ROWS,
@@ -952,6 +953,11 @@ mod cli {
         let word_set = levers.residency().unwrap_or("off");
         let residency = Residency::parse(word_set)?;
         let experts = experts38(&levers)?;
+        // The K/V planes' format, read once here: the loads below carry it
+        // and the plan's KV term counts it (the lever's kind holds the word
+        // to the two spellings).
+        let kv = KvQ8::parse(levers.qwen3_kv_set().unwrap_or("f16"))
+            .ok_or("BLOOMERY_QWEN3_KV takes f16 or q8_0")?;
         // Unset, the lever is a qwen4exp plan's card experts and nothing on
         // another family's file; only a set `card` is refused there.
         let card_set = levers.qwen38_experts_set() == Some("card");
@@ -1109,6 +1115,13 @@ mod cli {
                     .into(),
             );
         }
+        if family == Family::Qwen38 && kv == KvQ8::Q8 {
+            return Err(
+                "BLOOMERY_QWEN3_KV=q8_0 quantizes the qwen3 family's K/V planes; a qwen4exp \
+                 file's selecting stores carry no q8_0 form"
+                    .into(),
+            );
+        }
         if family != Family::Qwen38 && levers.route_trace().is_some() {
             return Err(
                 "BLOOMERY_ROUTE_TRACE records a qwen4exp host tier's routing; a qwen3moe or \
@@ -1219,7 +1232,14 @@ mod cli {
         };
         match chosen {
             Chosen::Qwen3(path, place) => drive(
-                open_qwen3(file, (ctx, mode), place.map(|p| (p, &levers)), &levers, t)?,
+                open_qwen3(
+                    file,
+                    (ctx, mode),
+                    place.map(|p| (p, &levers)),
+                    &levers,
+                    kv,
+                    t,
+                )?,
                 &run,
                 path,
                 &arms,
@@ -1227,7 +1247,14 @@ mod cli {
                 sync,
             ),
             Chosen::Qwen35(path, place) => drive(
-                open_qwen35(file, (ctx, mode), place.map(|p| (p, &levers)), &levers, t)?,
+                open_qwen35(
+                    file,
+                    (ctx, mode),
+                    place.map(|p| (p, &levers)),
+                    &levers,
+                    kv,
+                    t,
+                )?,
                 &run,
                 path,
                 &arms,
@@ -1425,7 +1452,7 @@ mod cli {
             )
             .into());
         }
-        let mut m = open_qwen3(file, (ctx, StepMode::Eager), None, levers, t)?;
+        let mut m = open_qwen3(file, (ctx, StepMode::Eager), None, levers, KvQ8::F16, t)?;
         let hidden = m.body("generate_qwen3moe")?.hparams().n_embd;
         let out = Path::new(dir);
         let mut dump = taps::Dump::create(out, &ref_model_path()?, hidden)?;
@@ -1518,13 +1545,14 @@ mod cli {
         (ctx, mode): (usize, StepMode),
         place: Option<(Place, &Levers)>,
         levers: &Levers,
+        kv: KvQ8,
         t: Instant,
     ) -> Result<Qwen3moeModel, GateError> {
-        let opts = Qwen3moeModel::lever_opts(ctx)?;
+        let opts = Qwen3moeModel::lever_opts(ctx, kv)?;
         let mut m = match place {
             None => q3place::open_unplaced_qwen3(file, ctx, opts, levers, Record::print)?,
             Some((p, levers)) => {
-                let q = PlaceQ3::qwen3(&file, p, ctx)?;
+                let q = PlaceQ3::qwen3(&file, p, ctx, kv)?;
                 let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
                 q.record(&plan, None).print();
                 q3place::open_qwen3(file, &plan, opts, levers.host())?
@@ -1533,9 +1561,11 @@ mod cli {
         let placed = m.body("generate_qwen3moe")?.placed().is_some();
         m.set_mode(mode);
         println!(
-            "load arch=qwen3moe resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
-             ubatch_attn=gqa_prefill_flash ubatch={} rope_table_us={:.1} in {:.1} s (runtime value)",
+            "load arch=qwen3moe resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
+             flash_mma={} ubatch_attn=gqa_prefill_flash ubatch={} rope_table_us={:.1} in {:.1} s \
+             (runtime value)",
             m.resident_bytes(),
+            kv.name(),
             m.layers().len(),
             mode_name(mode),
             m.body("generate_qwen3moe")?.flash_mma(),
@@ -1569,12 +1599,14 @@ mod cli {
         (ctx, mode): (usize, StepMode),
         place: Option<(Place, &Levers)>,
         levers: &Levers,
+        kv: KvQ8,
         t: Instant,
     ) -> Result<Qwen35moeModel, GateError> {
         let o = Open35 {
             ctx,
             mma: true,
             ubatch: ubatch_size()?,
+            kv,
         };
         let mut m = match place {
             None => q3place::open_unplaced_qwen35(file, o, levers, Record::print)?,
@@ -1589,9 +1621,11 @@ mod cli {
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
         println!(
-            "load arch=qwen35moe resident_bytes={} ctx={ctx} layers={} mode={} flash_mma={} \
-             store_bytes={} ubatch_attn=gqa_prefill_flash_256 ubatch={} in {:.1} s (runtime value)",
+            "load arch=qwen35moe resident_bytes={} ctx={ctx} cache={} layers={} mode={} \
+             flash_mma={} store_bytes={} ubatch_attn=gqa_prefill_flash_256 ubatch={} in {:.1} s \
+             (runtime value)",
             m.resident_bytes(),
+            kv.name(),
             m.layers().len(),
             mode_name(mode),
             body.flash_mma(),

@@ -3,7 +3,7 @@
 //! seat share, and the ids file reader of the first two.
 
 use bloomery_gpu::Gpu;
-use bloomery_gpu::arch::qwen3moe::{Open35, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu_gates::GateError;
 use gguf::Split;
 use model::arch::models::Arch;
@@ -69,6 +69,7 @@ pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, S
             ctx,
             mma: false,
             ubatch,
+            kv: KvQ8::F16,
         },
     )?;
     Ok((model, split))

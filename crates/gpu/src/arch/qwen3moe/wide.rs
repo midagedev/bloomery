@@ -32,19 +32,17 @@
 use super::body::ATTN_SCALE_256;
 use super::dispatch::Ctx;
 use super::experts::CombineArgs;
-use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Flash, Form, GqaKind, GqaPlan, SiteTy};
+use super::plan::{DeltaPlan, FfnPlan, FfnRoute, Form, GqaKind, GqaPlan, SiteTy};
 use super::router::MAX_TOKENS;
-use super::scratch::{Arena, Dims, Forms, GdnArena, KvPlanes, Wants};
+use super::scratch::{Append256, Arena, Dims, Forms, GdnArena, KvPlanes, PrefillFlash, Wants};
 use crate::GpuError;
 use crate::flash_gqa::{HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
-use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gated_quant::GateLayout;
 use crate::gemm::{GEMM_BN, GEMM_MAX_SLOTS, GEMM32_STEP, GemmAct, GemmAct32, GemmInput, GemmRoute};
 use crate::linear::{self, LinearShape};
 use crate::model::MAX_PASS_ROWS;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::q38::OutGateArgs;
-use crate::rope_neox::PartialNeoxArgs;
 use crate::site::{self, WideIn, WideKernels};
 use cuda_core::{CudaStream, DeviceBuffer};
 
@@ -383,9 +381,10 @@ pub(super) fn attention(
     gemm(c, (n.q_ty, &n.attn_q), d.q_rows, &hid, table, m, q)?;
     gemm(c, (n.k_ty, &n.attn_k), d.kv_len(), &hid, table, m, kr)?;
     gemm(c, (n.v_ty, &n.attn_v), d.kv_len(), &hid, table, m, v)?;
-    k.neox.enqueue_head_norm_neox_append_256(
+    kv.append_256(
+        &k.neox,
         stream,
-        PartialNeoxArgs {
+        Append256 {
             qg: q,
             q: q_out,
             k: kr,
@@ -400,28 +399,24 @@ pub(super) fn attention(
             ctx: d.ctx,
             m,
             fault: c.sink,
-            cache_k: &mut kv.k,
-            cache_v: &mut kv.v,
         },
     )?;
-    let args = GqaPrefillArgs {
-        q: q_out,
-        kc: &kv.k,
-        vc: &kv.v,
-        n_keys,
-        scale: ATTN_SCALE_256,
-        n_head: d.n_head,
-        n_kv: d.n_kv,
-        ctx: d.ctx,
-        t: m,
-        fault: c.sink,
-        y: attn,
-    };
-    match n.flash {
-        Flash::Group => k.prefill.enqueue_256(stream, args)?,
-        Flash::Quads => k.prefill.enqueue_256_p4(stream, args)?,
-        Flash::Pairs => k.prefill.enqueue_256_p2(stream, args)?,
-    }
+    kv.prefill_256(
+        &k.prefill,
+        stream,
+        PrefillFlash {
+            q: q_out,
+            n_keys,
+            scale: ATTN_SCALE_256,
+            n_head: d.n_head,
+            n_kv: d.n_kv,
+            ctx: d.ctx,
+            t: m,
+            fault: c.sink,
+            y: attn,
+        },
+        n.flash,
+    )?;
     let Wide {
         act_attn,
         dense,

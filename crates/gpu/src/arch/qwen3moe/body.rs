@@ -382,8 +382,46 @@ impl Body {
     }
 }
 
+/// The format a qwen3-family load holds its KV cache planes in: f16 (the
+/// format before the lever), or q8_0's two-plane layout — 17/16 bytes a
+/// value against f16's 2, both planes (K and V) quantized together by the
+/// one choice. `q8_0` is the opt-in arm ([`OpenOpts::kv`], the seat's
+/// `--cache-type-k` spelling): a cache half the f16 bytes wide, its rows the
+/// quantizing appends' and the q8 read paths'.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvQ8 {
+    /// `[n_kv][ctx][head]` f16 a side — the only format until the lever.
+    #[default]
+    F16,
+    /// Per side a codes plane of `head/4` u32 a row and a scales plane of
+    /// `head/32` u16 ([`rope_neox::q8_plane_lens`](crate::rope_neox)).
+    Q8,
+}
+
+impl KvQ8 {
+    /// The word the lever and `--cache-type-k` take (llama-server's
+    /// spelling), or `None` on any other.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<KvQ8> {
+        match word {
+            "f16" => Some(KvQ8::F16),
+            "q8_0" => Some(KvQ8::Q8),
+            _ => None,
+        }
+    }
+
+    /// The word [`KvQ8::parse`] took.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            KvQ8::F16 => "f16",
+            KvQ8::Q8 => "q8_0",
+        }
+    }
+}
+
 /// What [`GpuModel::open`] takes besides the card and the file: the cache's
-/// rows and the two load-time choices a binary reads at its edge
+/// rows and the load-time choices a binary reads at its edge
 /// ([`GpuModel::lever_opts`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpenOpts {
@@ -394,6 +432,8 @@ pub struct OpenOpts {
     pub ubatch: usize,
     /// The decode flash pass.
     pub flash: FlashKind,
+    /// The KV planes' format ([`KvQ8`]).
+    pub kv: KvQ8,
 }
 
 /// The decode flash pass a qwen3moe body runs.
@@ -426,7 +466,17 @@ impl GpuModel<Body> {
         let n_layers = block_count(&file, "qwen3moe GpuModel::open")?;
         let mma = opts.flash == FlashKind::Mma;
         GpuModel::load_blocks(gpu, &file, opts.ctx, 0..n_layers, true, |gpu, w| {
-            Body::load(gpu, &file, w, 0..n_layers, opts.ctx, opts.ubatch, mma, None)
+            Body::load(
+                gpu,
+                &file,
+                w,
+                0..n_layers,
+                opts.ctx,
+                opts.ubatch,
+                mma,
+                opts.kv,
+                None,
+            )
         })
     }
 
@@ -488,6 +538,7 @@ impl GpuModel<Body> {
                     opts.ctx,
                     1,
                     mma,
+                    opts.kv,
                     Some((open, counted)),
                 )
             },
@@ -515,28 +566,30 @@ impl GpuModel<Body> {
     }
 
     /// `ctx` cache rows, the ubatch size this process's lever names
-    /// ([`ubatch_size`]) and the tensor-core flash, the engine's only decode
-    /// pass: the options a binary's edge passes to [`GpuModel::open`] when it
-    /// takes the levers as they are.
-    pub fn lever_opts(ctx: usize) -> Result<OpenOpts, GpuError> {
+    /// ([`ubatch_size`]), the tensor-core flash (the engine's only decode
+    /// pass) and the KV planes' format `kv` ([`KvQ8`]): the options a
+    /// binary's edge passes to [`GpuModel::open`] when it takes the levers
+    /// as they are.
+    pub fn lever_opts(ctx: usize, kv: KvQ8) -> Result<OpenOpts, GpuError> {
         Ok(OpenOpts {
             ctx,
             ubatch: ubatch_size()?,
             flash: FlashKind::Mma,
+            kv,
         })
     }
 }
 
 impl Body {
     /// The body over the resident weights `w` of `file`'s `layers` (every
-    /// layer), with caches of `ctx_max` rows, ubatches of `ubatch` tokens and
-    /// the flash `mma`; on a placed load (`placed`: its placed side's inputs
-    /// and the bytes its plan counts for that side) the routed stacks are
-    /// the placed side's to check, and the side is built ([`Placed::new`]),
-    /// its bytes held to the plan's count first.
+    /// layer), with caches of `ctx_max` rows in the `kv` format, ubatches of
+    /// `ubatch` tokens and the flash `mma`; on a placed load (`placed`: its
+    /// placed side's inputs and the bytes its plan counts for that side) the
+    /// routed stacks are the placed side's to check, and the side is built
+    /// ([`Placed::new`]), its bytes held to the plan's count first.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card, file, weights, layers, cache, ubatch and flash, and the placed side (rust-quality R8)"
+        reason = "the load's card, file, weights, layers, cache and format, ubatch and flash, and the placed side (rust-quality R8)"
     )]
     fn load(
         gpu: &Gpu,
@@ -546,6 +599,7 @@ impl Body {
         ctx_max: usize,
         ubatch: usize,
         mma: bool,
+        kv: KvQ8,
         placed: Option<(PlacedOpen<'_>, u64)>,
     ) -> Result<Body, GpuError> {
         let what = "qwen3moe::Body::load";
@@ -577,7 +631,7 @@ impl Body {
         );
         let stream = gpu.stream();
         let kv = layers
-            .map(|_| KvPlanes::new(stream, &dims))
+            .map(|_| KvPlanes::new(stream, &dims, kv))
             .collect::<Result<Vec<_>, _>>()?;
         let k = Kernels::load(gpu, false)?;
         let rope = RopeTable::new(&RopeSpec::window(hp.rope.base, hp.rope.dims))?;
@@ -737,25 +791,26 @@ fn enqueue_placed_chain(
 
 impl Instrumented for Body {
     /// Rows `0..rows` of every layer's K and V planes filled with a
-    /// deterministic pattern of finite, nonzero f16 values that differ from
-    /// row to row — a step shape, not a model state.
+    /// deterministic pattern of finite, nonzero values that differ from row
+    /// to row — f16 bits on an f16 cache, the q8_0 form of the same values
+    /// (the engine's one quantizer's rule) on a q8_0 one — a step shape, not
+    /// a model state.
     fn seed_depth(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
         let d = self.s.dims;
-        let mut plane = vec![0u16; d.n_kv * d.ctx * HEAD];
+        let mut vals = vec![0f32; d.n_kv * d.ctx * HEAD];
         let mut state = 0x9e37_79b9u32 ^ rows as u32;
         for h in 0..d.n_kv {
             for r in 0..rows.min(d.ctx) {
                 for c in 0..HEAD {
                     state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                     let v = ((state >> 9) as f32 / (1u32 << 23) as f32 - 0.5) + 1.0 / 64.0;
-                    plane[(h * d.ctx + r) * HEAD + c] = gguf::quant::f32_to_f16_bits(v);
+                    vals[(h * d.ctx + r) * HEAD + c] = v;
                 }
             }
         }
         let stream = gpu.stream();
         for p in &mut self.kv {
-            p.k.copy_from_host(stream, &plane)?;
-            p.v.copy_from_host(stream, &plane)?;
+            p.fill(stream, &vals, &d)?;
         }
         stream.synchronize()?;
         Ok(())

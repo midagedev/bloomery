@@ -485,29 +485,10 @@ impl MlaParams {
 
 // `Q8Block` lives in `gguf::quant` with the other GGUF block formats; re-exported so `Derived`'s storage, the gates' `assert_eq!` and the size assertion (`tests/derived.rs`) keep compiling; field-wise equality is equality of every byte.
 pub use gguf::quant::Q8Block;
-
-/// The weight requant the reference's `wk_b` cast runs: `quantize_row_q8_0`, x86 branch
-/// (ggml-quants.c:938+) — `d = amax/127` stored f16, `id = 127/amax` (a different f32
-/// than `1/d`), `_mm256_round_ps(_MM_ROUND_NEAREST)` codes; the ref variant (`id = 1/d`,
-/// `roundf`) is NOT what runs here.
-pub fn quantize_q8_0(x: &[f32]) -> Q8Block {
-    // One 32-value block at a time: a shorter slice would leave trailing codes at 0 silently.
-    assert_eq!(x.len(), 32, "quantize_q8_0: one 32-value block at a time");
-    let mut amax = 0.0f32;
-    for &v in x {
-        amax = amax.max(v.abs());
-    }
-    let d = amax / 127.0;
-    let id = if amax != 0.0 { 127.0 / amax } else { 0.0 };
-    let mut q = [0i8; 32];
-    for (j, &v) in x.iter().enumerate() {
-        q[j] = qdot::nearest_int(v * id).clamp(-128, 127) as i8;
-    }
-    Q8Block {
-        d: f32_to_f16_bits(d),
-        q,
-    }
-}
+// The one Q8_0 quantizer lives at the crate's shared level (`crate::quant`),
+// where the qwen3 family's cache seed reads it too; re-exported so this
+// module's own readers keep their path.
+pub use crate::quant::quantize_q8_0;
 
 // `ActBlock` lives in qdot with the cell kernel; the quantizer below still owns its conventions — the scale as **bf16**, int8 codes.
 use qdot::ActBlock;

@@ -1433,6 +1433,9 @@ fn qsa(
     )?;
     c.k.g32
         .enqueue_f32_tile(stream, f32_tensor(w, &qp.idx_q)?, mixed, m, &mut q.qi)?;
+    // The selecting store is f16 (the qwen38 family's stores carry no q8_0
+    // form), so the family's shared append runs its f16 arm.
+    let (kcache, vcache) = kv.f16_mut("qwen38::wide")?;
     c.k.neox.enqueue_head_norm_neox_append_256(
         stream,
         PartialNeoxArgs {
@@ -1450,10 +1453,11 @@ fn qsa(
             ctx,
             m,
             fault: sink,
-            cache_k: &mut kv.k,
-            cache_v: &mut kv.v,
+            cache_k: kcache,
+            cache_v: vcache,
         },
     )?;
+    let (kcache, vcache) = kv.f16("qwen38::wide")?;
     if dense > 0 {
         // SAFETY: rows 0 .. dense <= m of the queries, the counts and the
         // flash's output, inside their `rows` rows; they stay in place for
@@ -1469,8 +1473,8 @@ fn qsa(
             stream,
             GqaPrefillArgs {
                 q: &qw,
-                kc: &kv.k,
-                vc: &kv.v,
+                kc: kcache,
+                vc: vcache,
                 n_keys: &nw,
                 scale: ATTN_SCALE_256,
                 n_head: geo::N_HEAD,
@@ -1518,8 +1522,8 @@ fn qsa(
             stream,
             GqaSelArgs {
                 q: &qw,
-                kc: &kv.k,
-                vc: &kv.v,
+                kc: kcache,
+                vc: vcache,
                 list: &q.sel.list,
                 n_sel: &q.sel.n_sel,
                 width,

@@ -90,7 +90,7 @@ use super::program38::{
     Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, Verify38, step_launches,
     verify_launches,
 };
-use super::scratch::{Io, KvPlanes, LANE, RecStore, RopeRows, StepParams, f32_view};
+use super::scratch::{Io, LANE, RecStore, RopeRows, StepParams, f32_view};
 use super::scratch38::{
     Arena38, LANES, LaneWord, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, WideRecord,
     dims, kept_lane, store_rule_bytes,
@@ -1480,12 +1480,15 @@ impl Body38 {
                         state: lane_of(rec.state.to_host_vec(stream)?, self.lane.lane())?,
                         ring: rec.ring.to_host_vec(stream)?,
                     },
-                    Store38::Qsa { kv, raw, pooled } => Store38Host::Qsa {
-                        k: kv.k.to_host_vec(stream)?,
-                        v: kv.v.to_host_vec(stream)?,
-                        raw: raw.to_host_vec(stream)?,
-                        pooled: pooled.to_host_vec(stream)?,
-                    },
+                    Store38::Qsa { kv, raw, pooled } => {
+                        let (k, v) = kv.f16("qwen38::stores_host")?;
+                        Store38Host::Qsa {
+                            k: k.to_host_vec(stream)?,
+                            v: v.to_host_vec(stream)?,
+                            raw: raw.to_host_vec(stream)?,
+                            pooled: pooled.to_host_vec(stream)?,
+                        }
+                    }
                 })
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
@@ -1497,10 +1500,12 @@ impl Body38 {
     /// as they were, so a path that reads a row it did not write reads the
     /// pattern, not a previous run's value. Synchronizes; gate use.
     pub fn fill_planes(&mut self, gpu: &Gpu, bits: u16) -> Result<(), GpuError> {
+        const WHAT: &str = "qwen38::fill_planes";
         let stream = gpu.stream();
         for s in &mut self.stores {
             if let Store38::Qsa { kv, raw, pooled } = s {
-                for buf in [&mut kv.k, &mut kv.v, raw, pooled] {
+                let (k, v) = kv.f16_mut(WHAT)?;
+                for buf in [k, v, raw, pooled] {
                     buf.copy_from_host(stream, &vec![bits; buf.len()])?;
                 }
             }
@@ -3502,7 +3507,7 @@ impl<'a> Copied<'a> {
                 Store38::Qsa { kv, raw, pooled } => {
                     if let Some((ctx, n)) = rows {
                         let (h, d) = (geo::HEAD, geo::IDX_DIM);
-                        let KvPlanes { k, v } = kv;
+                        let (k, v) = kv.f16_mut("qwen38::copied")?;
                         c.spans.push(Spans::planes(k, geo::N_KV, ctx * h, n * h)?);
                         c.spans.push(Spans::planes(v, geo::N_KV, ctx * h, n * h)?);
                         c.spans.push(Spans::planes(raw, 1, 0, n * d)?);

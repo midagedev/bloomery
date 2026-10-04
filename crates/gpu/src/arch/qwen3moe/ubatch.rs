@@ -49,14 +49,12 @@ pub use super::image::ImageWrite;
 use super::image::PromptImage;
 use super::plan::{FfnPlan, FfnRoute, GqaPlan, LayerPlan, SiteTy};
 use super::router::RouterOut;
-use super::scratch::{Dims, KvPlanes, f32_view};
+use super::scratch::{Append128, Dims, KvPlanes, PrefillFlash, f32_view};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::HEAD;
-use crate::flash_gqa_prefill::GqaPrefillArgs;
 use crate::gemm::{GEMM_MAX_SLOTS, GemmAct, GemmArgs, GemmInput, GemmRoute, GemmWeight};
 use crate::model::GpuModel;
 use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
-use crate::rope_neox::NeoxArgs;
 use crate::weights::Weights;
 use crate::{FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -453,9 +451,10 @@ fn attention(
             },
         )?;
     }
-    k.neox.enqueue_head_norm_neox_append(
+    kv.append_128(
+        &k.neox,
         stream,
-        NeoxArgs {
+        Append128 {
             q: &mut a.q,
             k: &mut a.k,
             v: &a.v,
@@ -469,16 +468,13 @@ fn attention(
             ctx: d.ctx,
             m: t,
             fault: sink,
-            cache_k: &mut kv.k,
-            cache_v: &mut kv.v,
         },
     )?;
-    k.prefill.enqueue(
+    kv.prefill_128(
+        &k.prefill,
         stream,
-        GqaPrefillArgs {
+        PrefillFlash {
             q: &a.q,
-            kc: &kv.k,
-            vc: &kv.v,
             n_keys: &a.n_keys,
             scale: ATTN_SCALE,
             n_head: d.n_head,

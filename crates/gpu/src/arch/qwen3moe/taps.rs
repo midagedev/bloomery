@@ -5,9 +5,22 @@
 
 use super::body::Body;
 use super::dispatch;
+use super::scratch::KvPlanes;
 use crate::GpuError;
 use crate::flash_gqa::HEAD;
 use crate::model::{GpuModel, StepMode};
+use cuda_core::DeviceBuffer;
+
+/// One layer's q8_0 cache planes on the host, rows `0..rows` per head, for
+/// a gate to compare bit for bit ([`GpuModel::kv_q8_rows`]): per side the
+/// codes words and the scales.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KvQ8Host {
+    pub kq: Vec<u32>,
+    pub kd: Vec<u16>,
+    pub vq: Vec<u32>,
+    pub vd: Vec<u16>,
+}
 
 /// What one layer's run leaves, read back.
 pub struct LayerRun {
@@ -109,8 +122,9 @@ impl GpuModel<Body> {
     }
 
     /// Rows `0..rows` of every layer's K and V planes as f16 bits: per
-    /// layer, K then V, each head's `rows` rows of [`HEAD`] values in turn.
-    /// Synchronizes; gate use.
+    /// layer, K then V, each head's `rows` rows of [`HEAD`] values in turn —
+    /// refused by name on a q8_0 cache, which holds no f16 rows
+    /// ([`GpuModel::kv_q8_rows`]). Synchronizes; gate use.
     pub fn kv_rows(&mut self, rows: usize) -> Result<Vec<Vec<u16>>, GpuError> {
         let what = "qwen3moe::kv_rows";
         let (gpu, _, body) = self.body_parts(what)?;
@@ -125,8 +139,9 @@ impl GpuModel<Body> {
         body.kv
             .iter()
             .map(|p| {
+                let (k, v) = p.f16(what)?;
                 let mut out = Vec::with_capacity(2 * d.n_kv * rows * HEAD);
-                for plane in [&p.k, &p.v] {
+                for plane in [k, v] {
                     let all = plane.to_host_vec(stream)?;
                     for h in 0..d.n_kv {
                         out.extend_from_slice(&all[h * d.ctx * HEAD..][..rows * HEAD]);
@@ -135,6 +150,52 @@ impl GpuModel<Body> {
                 Ok(out)
             })
             .collect()
+    }
+
+    /// Rows `0..rows` of every layer's q8_0 cache planes, per head the
+    /// head's `rows` rows of the two-plane layout (`q8_plane_lens`'s
+    /// per-head stride): per layer the codes words and the scales of K then
+    /// V — refused by name on an f16 cache ([`GpuModel::kv_rows`]).
+    /// Synchronizes; gate use.
+    pub fn kv_q8_rows(&mut self, rows: usize) -> Result<Vec<KvQ8Host>, GpuError> {
+        let what = "qwen3moe::kv_q8_rows";
+        let (gpu, _, body) = self.body_parts(what)?;
+        let d = body.s.dims;
+        if rows > d.ctx {
+            return Err(GpuError::shape(
+                what,
+                format!("{rows} rows of a {}-row cache", d.ctx),
+            ));
+        }
+        let (words, scales) = crate::rope_neox::q8_plane_lens(d.head, 1, d.ctx);
+        let stream = gpu.stream();
+        let mut out = Vec::with_capacity(body.kv.len());
+        for p in &body.kv {
+            let KvPlanes::Q8 { kq, kd, vq, vd } = p else {
+                return Err(GpuError::state(
+                    what,
+                    "the q8_0 planes (this cache runs f16)",
+                ));
+            };
+            let per_head = |codes: &DeviceBuffer<u32>, scl: &DeviceBuffer<u16>| {
+                let (all_q, all_d) = (codes.to_host_vec(stream)?, scl.to_host_vec(stream)?);
+                let (mut cq, mut cd) = (Vec::new(), Vec::new());
+                for h in 0..d.n_kv {
+                    cq.extend_from_slice(&all_q[h * words..][..rows * d.head / 4]);
+                    cd.extend_from_slice(&all_d[h * scales..][..rows * d.head / 32]);
+                }
+                Ok::<_, GpuError>((cq, cd))
+            };
+            let (kq_rows, kd_rows) = per_head(kq, kd)?;
+            let (vq_rows, vd_rows) = per_head(vq, vd)?;
+            out.push(KvQ8Host {
+                kq: kq_rows,
+                kd: kd_rows,
+                vq: vq_rows,
+                vd: vd_rows,
+            });
+        }
+        Ok(out)
     }
 
     /// Every layer's output residual from the last step, layer by layer.

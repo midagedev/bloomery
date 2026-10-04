@@ -18,7 +18,7 @@
 //! seat's unset `--ctx` defaults live here too ([`whole_ctx_qwen3`] for the
 //! whole load, [`placed_ctx_qwen3`] for a placed one).
 
-use bloomery_gpu::arch::qwen3moe::{Body, Body35, Open35, OpenOpts, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel};
 use bloomery_gpu::model::GpuModel;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
@@ -68,10 +68,14 @@ impl PlaceQ3 {
         Ok(place)
     }
 
-    /// A qwen3moe file's placed load at `ctx` positions on `place`'s card.
-    pub fn qwen3(file: &Split, place: Place, ctx: usize) -> Result<PlaceQ3, GateError> {
+    /// A qwen3moe file's placed load at `ctx` positions on `place`'s card,
+    /// its cache planes in the `kv` format ([`KvQ8`]).
+    pub fn qwen3(file: &Split, place: Place, ctx: usize, kv: KvQ8) -> Result<PlaceQ3, GateError> {
         let place = PlaceQ3::resolve(place)?;
-        let inputs = q3::PlanInputs::read(file)?;
+        let mut inputs = q3::PlanInputs::read(file)?;
+        if kv == KvQ8::Q8 {
+            inputs.kv = inputs.kv.in_q8();
+        }
         let arena = Qwen3moeModel::placed_arena_bytes(file, ctx)?;
         let machine = q3::machine(place.card_specs()?[0], inputs.hp.n_layer, arena);
         Ok(PlaceQ3 {
@@ -82,10 +86,14 @@ impl PlaceQ3 {
         })
     }
 
-    /// A qwen35moe file's placed load under `o` on `place`'s card.
+    /// A qwen35moe file's placed load under `o` on `place`'s card, its
+    /// attention planes in `o.kv`'s format.
     pub fn qwen35(file: &Split, place: Place, o: Open35) -> Result<PlaceQ3, GateError> {
         let place = PlaceQ3::resolve(place)?;
-        let inputs = q35::PlanInputs::describe(file)?;
+        let mut inputs = q35::PlanInputs::describe(file)?;
+        if o.kv == KvQ8::Q8 {
+            inputs.kv = inputs.kv.in_q8();
+        }
         let arena = Qwen35moeModel::placed_arena_bytes(file, o)?;
         let machine = q3::machine(place.card_specs()?[0], inputs.hp.n_layer, arena);
         Ok(PlaceQ3 {
@@ -231,8 +239,8 @@ fn whole_fits_free(q: &PlaceQ3, ctx: u64) -> Result<bool, GateError> {
 /// byte for byte) while that fits the card's free bytes
 /// ([`whole_fits_free`]); else the placed plan on `a`'s card (`Placed`).
 /// A file with no routed experts that does not fit is refused by name.
-pub fn unplaced_qwen3(file: &Split, ctx: usize) -> Result<Unplaced, GateError> {
-    let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, ctx)?;
+pub fn unplaced_qwen3(file: &Split, ctx: usize, kv: KvQ8) -> Result<Unplaced, GateError> {
+    let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, ctx, kv)?;
     if whole_fits_free(&probe, u64::try_from(ctx)?)? {
         return Ok(Unplaced::Whole);
     }
@@ -240,6 +248,7 @@ pub fn unplaced_qwen3(file: &Split, ctx: usize) -> Result<Unplaced, GateError> {
         file,
         Place::A.on_host()?,
         ctx,
+        kv,
     )?)))
 }
 
@@ -264,9 +273,9 @@ pub fn trained_ctx(file: &Split) -> Option<usize> {
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
 )]
-pub fn whole_ctx_qwen3(file: &Split, floor: usize) -> Result<Option<usize>, GateError> {
+pub fn whole_ctx_qwen3(file: &Split, floor: usize, kv: KvQ8) -> Result<Option<usize>, GateError> {
     let fits = |ctx: usize| {
-        let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, ctx)?;
+        let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, ctx, kv)?;
         whole_fits_free(&probe, u64::try_from(ctx)?)
     };
     searched_ctx(file, floor, &fits)
@@ -308,9 +317,10 @@ pub fn placed_ctx_qwen3(
     place: Place,
     floor: usize,
     levers: &PlanLevers,
+    kv: KvQ8,
 ) -> Result<Option<usize>, GateError> {
     let experts = |ctx: usize| {
-        let probe = PlaceQ3::qwen3(file, place, ctx)?;
+        let probe = PlaceQ3::qwen3(file, place, ctx, kv)?;
         Ok(probe.plan(ctx, levers).ok().map(|p| p.cards[0].experts))
     };
     searched_placed_ctx(file, floor, &experts)
@@ -432,7 +442,7 @@ pub fn open_unplaced_qwen3(
     levers: &Levers,
     emit: fn(Record),
 ) -> Result<Qwen3moeModel, GateError> {
-    match unplaced_qwen3(&file, ctx)? {
+    match unplaced_qwen3(&file, ctx, opts.kv)? {
         Unplaced::Whole => Ok(Qwen3moeModel::open(Gpu::new()?, file, opts)?),
         Unplaced::Placed(q) => {
             let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;

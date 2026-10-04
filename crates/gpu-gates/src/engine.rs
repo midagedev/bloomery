@@ -12,6 +12,7 @@
 
 #![cfg(feature = "gpu")]
 
+use bloomery_gpu::arch::qwen3moe::KvQ8;
 use bloomery_gpu::model::Engine;
 use bloomery_gpu::{Deepseek2Model, Gpu, GpuError, Qwen3moeModel};
 use gguf::Split;
@@ -65,7 +66,9 @@ impl AnyEngine {
             models::Arch::Qwen3Moe => Ok(AnyEngine::Qwen3moe(Qwen3moeModel::open(
                 Gpu::new()?,
                 file,
-                Qwen3moeModel::lever_opts(ctx)?,
+                // The f16 cache: this harness runs no cache lever (the
+                // binaries through it refuse the name set).
+                Qwen3moeModel::lever_opts(ctx, KvQ8::F16)?,
             )?)),
             a => Err(GpuError::UnsupportedArch(a.name().to_string())),
         }

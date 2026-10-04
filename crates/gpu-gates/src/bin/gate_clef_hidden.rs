@@ -59,7 +59,7 @@ mod qwen35_open;
 mod gate {
     use super::qwen35_open;
     use bloomery_gpu::Gpu;
-    use bloomery_gpu::arch::qwen3moe::{Open35, PrefillPath, Qwen35moeModel};
+    use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, PrefillPath, Qwen35moeModel};
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, load_ref_in, ref_model_path, verdict,
     };
@@ -332,6 +332,7 @@ mod gate {
                 ctx: CTX,
                 mma: true,
                 ubatch: U_GATE,
+                kv: KvQ8::F16,
             },
         ) {
             Ok(_) => "opened".to_string(),

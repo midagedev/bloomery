@@ -108,6 +108,16 @@
 //!   smallest code among the layer's raises, printed), the model poisoned;
 //!   `reset` leaves the word clean and the next step a token.
 //!
+//! - (v) the q8_0 cache arm (`BLOOMERY_QWEN3_KV=q8_0`, the seat's
+//!   `--cache-type-k q8_0`): its own models, each dropped before the clause
+//!   returns — the budget's census-free relations (the plan's KV term
+//!   exactly 17/32 of the f16 term's, the auto context search never below
+//!   the f16 answer), the resident bytes' derived drop, {`Q8_IDS`} prose ids
+//!   stepped, prefilled on the pass path and replayed through the captured
+//!   step graph leaving the same planes and logits bit for bit, and row 0's
+//!   dequantized values within each 32-value block's own quantization step
+//!   of the f16 model's row 0 (bounds derived at runtime, no measured band);
+//!   the later rows' compounding distance prints as a diagnostic.
 //! - (o) the placed load: the file planned on device 0 under a card budget
 //!   of [`PLACED_BUDGET`] (`shared/qwen3moe_place.rs`, the CLI's and the
 //!   seat's planner), which must leave routed experts both on the card and
@@ -193,7 +203,7 @@ mod gate {
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
-    use bloomery_gpu::arch::qwen3moe::{Body, PrefillPath};
+    use bloomery_gpu::arch::qwen3moe::{Body, KvQ8, KvQ8Host, PrefillPath};
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
@@ -213,6 +223,7 @@ mod gate {
     use bloomery_levers::HostCfg;
     use cuda_core::sys;
     use model::arch::Arch;
+    use model::arch::qwen3moe::hparams::Hparams;
     use model::placement::PlanLevers;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
@@ -376,10 +387,10 @@ mod gate {
         Ok(v.chunks(k).map(<[f32]>::to_vec).collect())
     }
 
-    fn open(ctx: usize, mode: StepMode) -> Result<Qwen3moeModel, GateError> {
+    fn open(ctx: usize, mode: StepMode, kv: KvQ8) -> Result<Qwen3moeModel, GateError> {
         let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
         let t = Instant::now();
-        let mut m = Qwen3moeModel::open(Gpu::new()?, file, Qwen3moeModel::lever_opts(ctx)?)?;
+        let mut m = Qwen3moeModel::open(Gpu::new()?, file, Qwen3moeModel::lever_opts(ctx, kv)?)?;
         m.set_mode(mode);
         let mma = m.body("gate_qwen3moe_e2e")?.flash_mma();
         println!(
@@ -433,7 +444,7 @@ mod gate {
             }
             return Ok(());
         }
-        let mut m = open(CTX, StepMode::Graph)?;
+        let mut m = open(CTX, StepMode::Graph, KvQ8::F16)?;
         if args.iter().any(|a| a == "--fault-only") {
             let ok = fault_layer(&mut m)?;
             println!("gate_qwen3moe_e2e --fault-only: {}", verdict(ok));
@@ -453,6 +464,15 @@ mod gate {
         if args.iter().any(|a| a == "--taps-only") {
             let ok = tap_dump(&mut m)?;
             println!("gate_qwen3moe_e2e --taps-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
+        if args.iter().any(|a| a == "--q8-only") {
+            drop(m);
+            let ok = q8_cache()?;
+            println!("gate_qwen3moe_e2e --q8-only: {}", verdict(ok));
             if !ok {
                 return Err(checks_failed());
             }
@@ -485,6 +505,7 @@ mod gate {
         drop(s);
         ok &= ubatch_sizes()?;
         ok &= placed(host)?;
+        ok &= q8_cache()?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());
@@ -945,14 +966,14 @@ mod gate {
         let mut ok = d0.free_bytes <= usable;
         // The quiet card: the unset load is today's whole-card one.
         let whole = matches!(
-            q3place::unplaced_qwen3(&file, CTX)?,
+            q3place::unplaced_qwen3(&file, CTX, KvQ8::F16)?,
             q3place::Unplaced::Whole
         );
         println!("memguard quiet: whole decision {whole} {}", verdict(whole));
         ok &= whole;
         // The auto record's shape, planned explicitly under (o)'s budget:
         // its why word and the free bytes it names.
-        let q = PlaceQ3::qwen3(&file, Place::A.on_host()?, CTX)?;
+        let q = PlaceQ3::qwen3(&file, Place::A.on_host()?, CTX, KvQ8::F16)?;
         let plan = q.plan(
             CTX,
             &PlanLevers {
@@ -972,7 +993,7 @@ mod gate {
             .ok_or("the card had less free than the clause leaves")?;
         let held = cuda_core::DeviceBuffer::<u8>::zeroed(gpu.stream(), hold)?;
         let refusal = |levers: &PlanLevers| -> Result<String, GateError> {
-            let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, CTX)?;
+            let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, CTX, KvQ8::F16)?;
             Ok(q.plan(CTX, levers)
                 .map_or_else(|e| e.to_string(), |_| String::new()))
         };
@@ -1010,7 +1031,7 @@ mod gate {
         ok &= terms;
         // The unset load's decision under the hold: the placed plan.
         let placed = matches!(
-            q3place::unplaced_qwen3(&file, CTX)?,
+            q3place::unplaced_qwen3(&file, CTX, KvQ8::F16)?,
             q3place::Unplaced::Placed(_)
         );
         println!(
@@ -1023,7 +1044,7 @@ mod gate {
         // The hold gone, the decision is the whole-card one again: the
         // reading is live, not a constant.
         let whole = matches!(
-            q3place::unplaced_qwen3(&file, CTX)?,
+            q3place::unplaced_qwen3(&file, CTX, KvQ8::F16)?,
             q3place::Unplaced::Whole
         );
         println!(
@@ -1045,7 +1066,7 @@ mod gate {
     /// plan leaves no routed expert on the card or none on the host.
     fn open_placed(ctx: usize, host: HostCfg) -> Result<Option<Qwen3moeModel>, GateError> {
         let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
-        let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, ctx)?;
+        let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, ctx, KvQ8::F16)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(PLACED_BUDGET),
         };
@@ -1061,7 +1082,7 @@ mod gate {
         if !split {
             return Ok(None);
         }
-        let opts = Qwen3moeModel::lever_opts(ctx)?;
+        let opts = Qwen3moeModel::lever_opts(ctx, KvQ8::F16)?;
         Ok(Some(GpuModel::<Body>::open_placed(
             file, &plan, opts, host,
         )?))
@@ -1104,6 +1125,212 @@ mod gate {
             verdict(served)
         );
         Ok(ok && served)
+    }
+
+    // ------------------------------------------ (v) the q8_0 cache arm
+
+    /// The stepped rows the (v) planes clause compares: row 0 of every
+    /// layer's K and V, the one row whose values no cache read touched (each
+    /// later row's input carries the attention over the rows before it, the
+    /// two formats' own error growing from there — printed, not judged).
+    const Q8_IDS: usize = 96;
+
+    /// (v) (module doc): the cache lever's `q8_0` arm, on its own models
+    /// (each dropped before the clause returns). The budget relation is
+    /// host-only and census-free: the plan's KV term at q8_0 is the f16
+    /// term's 17/32 exactly (17/16 B a value against 2), and the auto
+    /// context search never answers below the f16 answer. The load's
+    /// resident bytes drop by the planes' derived delta. The q8 model runs
+    /// the prose's first ids: eager steps, the pass prefill of the same ids
+    /// and the graph replay all leave the same planes and logits bit for
+    /// bit (the arm's own consistency, the (p) and (r) contracts on the q8
+    /// path), and row 0's dequantized values sit within each 32-value
+    /// block's own quantization step of the f16 model's row 0 (the two
+    /// formats round the same f32 append values; a block's `d/2` plus the
+    /// f16 rounding, derived at runtime — no measured band). Later rows'
+    /// distance to the f16 run prints as the compounding diagnostic.
+    fn q8_cache() -> Result<bool, GateError> {
+        let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
+        let mut ok = q8_budget(&file)?;
+        drop(file);
+        let ids = prose(Q8_IDS)?;
+        let (f16_row0, f16_resident, hp) = {
+            let mut m = open(CTX, StepMode::Eager, KvQ8::F16)?;
+            let (r, hp) = (m.resident_bytes(), m.body("q8")?.hparams().clone());
+            m.reset()?;
+            for &id in &ids {
+                m.step(&[id])?;
+            }
+            (m.kv_rows(1)?, r, hp)
+        };
+        let mut m = open(CTX, StepMode::Eager, KvQ8::Q8)?;
+        let resident = m.resident_bytes();
+        // The planes' delta: n_layer layers, each two f16 planes against the
+        // two-plane layout's 17/16 B a value.
+        let values = hp.n_head_kv * CTX * hp.head_dim;
+        let delta = hp.n_layer * (2 * values * 2 - 2 * values * 17 / 16);
+        let bytes_ok = f16_resident.saturating_sub(resident) == delta;
+        println!(
+            "q8 load: resident_bytes={resident} (f16 {f16_resident} less the planes' derived \
+             {delta} B) {}",
+            verdict(bytes_ok)
+        );
+        ok &= bytes_ok;
+        m.reset()?;
+        let mut step_tok = 0;
+        for &id in &ids {
+            step_tok = m.step(&[id])?;
+        }
+        let stepped = m.kv_q8_rows(Q8_IDS)?;
+        let logits = Fnv1a64::default().f32s(&m.logits()?).value();
+        // The pass prefill of the same ids leaves the stepped run's bits.
+        m.reset()?;
+        let pass_tok = m.prefill_with(&ids, PrefillPath::Pass)?;
+        let pass = m.kv_q8_rows(Q8_IDS)?;
+        let pass_logits = Fnv1a64::default().f32s(&m.logits()?).value();
+        let bits = pass_tok == step_tok && pass == stepped && logits == pass_logits;
+        println!(
+            "q8 bits: pass prefill == {Q8_IDS} steps, planes and logits bit for bit {}",
+            verdict(bits)
+        );
+        ok &= bits;
+        // The graph replay: the same steps through the captured step graph.
+        m.reset()?;
+        m.set_mode(StepMode::Graph);
+        println!("q8 capture graph_nodes={}", m.capture_step()?);
+        m.reset()?;
+        let mut last = 0;
+        for &id in &ids {
+            last = m.step(&[id])?;
+        }
+        let graph = m.kv_q8_rows(Q8_IDS)?;
+        let graph_logits = Fnv1a64::default().f32s(&m.logits()?).value();
+        let replay = last == step_tok && graph == stepped && logits == graph_logits;
+        println!(
+            "q8 replay: {Q8_IDS} captured steps == the eager bits {}",
+            verdict(replay)
+        );
+        ok &= replay;
+        // Row 0 against the f16 model's row 0, block by block.
+        ok &= q8_row0(&stepped, &f16_row0, &hp)?;
+        Ok(ok)
+    }
+
+    /// (v)'s budget relations, host-only: the plan's KV term and the auto
+    /// context search under the two formats.
+    fn q8_budget(file: &gguf::Split) -> Result<bool, GateError> {
+        let levers = PlanLevers::default();
+        let f16_kv = PlaceQ3::qwen3(file, Place::parse("cuda0")?, CTX, KvQ8::F16)?
+            .plan(CTX, &levers)?
+            .cards[0]
+            .kv_bytes;
+        let q8_kv = PlaceQ3::qwen3(file, Place::parse("cuda0")?, CTX, KvQ8::Q8)?
+            .plan(CTX, &levers)?
+            .cards[0]
+            .kv_bytes;
+        let term = q8_kv * 32 == f16_kv * 17;
+        println!(
+            "q8 budget: plan kv_bytes f16 {f16_kv} q8_0 {q8_kv} (17/32 exactly) {}",
+            verdict(term)
+        );
+        let s16 = q3place::whole_ctx_qwen3(file, q3place::CTX_GRAN, KvQ8::F16)?;
+        let sq8 = q3place::whole_ctx_qwen3(file, q3place::CTX_GRAN, KvQ8::Q8)?;
+        let search = match (s16, sq8) {
+            (Some(a), Some(b)) => {
+                println!(
+                    "q8 budget: auto ctx f16 {a} q8_0 {b} of the trained context (census-free \
+                     relation, runtime values)"
+                );
+                b >= a
+            }
+            (None, None) => {
+                println!("q8 budget: the trained context fits both formats at the floor");
+                true
+            }
+            (a, b) => {
+                println!("q8 budget: the searches answered {a:?} and {b:?}");
+                false
+            }
+        };
+        println!(
+            "q8 budget: the search never answers below the f16 one {}",
+            verdict(search)
+        );
+        Ok(term && search)
+    }
+
+    /// (v)'s row-0 clause: layer 0's first K and V row (the one row whose
+    /// values no cache read touched — every later layer's input carries the
+    /// attention over the rows before it, the two formats' own error
+    /// compounding from layer 1 on), dequantized from the q8_0 planes and
+    /// within each 32-value block's own step of the f16 model's row: the
+    /// codes' `d/2` nearest radius, the scale's own f16 rounding on every
+    /// code unit, the f16 side's `2^-11` relative rounding on top. The
+    /// later layers' worst ratio to the same bound prints as the
+    /// compounding diagnostic.
+    fn q8_row0(q8: &[KvQ8Host], f16: &[Vec<u16>], hp: &Hparams) -> Result<bool, GateError> {
+        const WHAT: &str = "q8_row0";
+        let (n_kv, head, rows) = (hp.n_head_kv, hp.head_dim, Q8_IDS);
+        if q8.len() != f16.len() || q8.len() != hp.n_layer {
+            return Err(format!(
+                "{WHAT}: {} layers of K/V rows, {} and {}",
+                hp.n_layer,
+                q8.len(),
+                f16.len()
+            )
+            .into());
+        }
+        // The bound each value carries: the codes are taken against the f32
+        // scale (id = 127/amax) but dequantized by the scale's own f16 bits,
+        // so |deq − v| <= d/2 + 127·d·2^-11 (nearest's d/2, the scale's f16
+        // rounding on every code unit), and the f16 side rounds v relatively
+        // by 2^-11 with |v| <= |f16|·(1 + 2^-10):
+        // |q8 − f16| <= d·(1/2 + 127·2^-11) + (2^-11 + 2^-21)·|f16|.
+        let q8_round = 0.5f32 + 127.0 * 2.0f32.powi(-11);
+        let f16_round = 2.0f32.powi(-11) + 2.0f32.powi(-21);
+        let mut worst = 0.0f32;
+        let mut worst_ratio = 0.0f32;
+        let mut worst_at = (0usize, 0usize);
+        let mut bad = String::new();
+        for (l, (q, f)) in q8.iter().zip(f16).enumerate() {
+            for (side, (codes, scales)) in [(0, (&q.kq, &q.kd)), (1, (&q.vq, &q.vd))] {
+                let (cstride, sstride) = (rows * head / 4, rows * head / 32);
+                for h in 0..n_kv {
+                    let cs = &codes[h * cstride..][..head / 4];
+                    let ds = &scales[h * sstride..][..head / 32];
+                    let frow = &f[(side * n_kv + h) * head..][..head];
+                    for c in 0..head {
+                        let d = gguf::quant::half_to_f32(ds[c / 32]);
+                        let code = ((cs[c / 4] >> (8 * (c % 4))) & 0xff) as u8 as i8;
+                        let v = f32::from(code) * d;
+                        let f = gguf::quant::half_to_f32(frow[c]);
+                        let e = (v - f).abs();
+                        let bound = d * q8_round + f16_round * f.abs();
+                        if e > worst {
+                            worst = e;
+                            worst_at = (l, side);
+                        }
+                        worst_ratio = worst_ratio.max(e / bound);
+                        if l == 0 && e > bound && bad.is_empty() {
+                            bad = format!(
+                                "layer {l} side {side} head {h} value {c}: |{v:.6e} − {f:.6e}| \
+                                 = {e:.3e} past the block's bound {bound:.3e} (d = {d:.6e})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "q8 row0: layer 0's first K and V row within its blocks' own bounds (worst |Δ| \
+             {worst:.3e} at layer {} side {}); all layers' worst ratio to the same bound \
+             {worst_ratio:.2} (the compounding past layer 0, diagnostic)",
+            worst_at.0, worst_at.1
+        );
+        match bad.is_empty() {
+            true => Ok(true),
+            false => Err(format!("{WHAT}: {bad}").into()),
+        }
     }
 
     // --------------------------------------------------- (d) the tap dump
@@ -2009,7 +2236,7 @@ mod gate {
     /// (w) (module doc), on its own model: the caller drops any other first,
     /// so the two never share the card.
     fn ubatch_sizes() -> Result<bool, GateError> {
-        let mut m = open(CTX_W, StepMode::Graph)?;
+        let mut m = open(CTX_W, StepMode::Graph, KvQ8::F16)?;
         let prose = prose(W_LONG + 1)?;
         let (ids, ids1) = (&prose[..W_LONG], &prose[..=W_LONG]);
         let mut ok = true;
@@ -2124,7 +2351,7 @@ mod gate {
             base.first_scored()
         );
         let mut m = match placed {
-            None => open(base.n_ctx(), StepMode::Graph)?,
+            None => open(base.n_ctx(), StepMode::Graph, KvQ8::F16)?,
             Some(host) => {
                 let mut m = open_placed(base.n_ctx(), host)?
                     .ok_or("--placed: the plan leaves no routed expert on one side")?;

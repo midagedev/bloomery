@@ -6,7 +6,7 @@
 //!
 //!     bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--place W]
-//!                    [--parallel N] [--queue-depth Q]
+//!                    [--cache-type-k f16|q8_0] [--parallel N] [--queue-depth Q]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
 //! doc); `--ctx-size` is `--ctx` under llama-server's spelling, C defaults
@@ -91,7 +91,7 @@ use q3place::PlaceQ3;
 
 use bloomery_gpu::Qwen3moeModel;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-use bloomery_gpu::arch::qwen3moe::{Body, Body35, Open35, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{ChainBody, GpuModel, StepMode};
 use bloomery_gpu_gates::bind::{Seat, SeatEngine, Vocab, sampler_factory};
 use bloomery_gpu_gates::generate::Place;
@@ -111,8 +111,8 @@ use tokenizer::Tokenizer;
 const NAME: &str = "bloomery-serve-qwen3";
 
 const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[:<quant>]] \
-                     [--host H] [--port P] [--ctx C] [--place W] [--parallel N] \
-                     [--queue-depth Q]";
+                     [--host H] [--port P] [--ctx C] [--place W] [--cache-type-k f16|q8_0] \
+                     [--parallel N] [--queue-depth Q]";
 
 /// The context unless `--ctx` says: `generate_qwen3moe`'s default.
 const CTX: usize = 4096;
@@ -132,6 +132,7 @@ fn default_ctx(
     arch: Arch,
     place: Option<Place>,
     levers: &Levers,
+    kv: KvQ8,
 ) -> Result<usize, GateError> {
     let Some(trained) = q3place::trained_ctx(split) else {
         return Ok(CTX);
@@ -139,12 +140,13 @@ fn default_ctx(
     let plan_levers = PlanLevers::from_levers(levers)?;
     let placed_default = |place: Place| -> Result<usize, GateError> {
         let searched = match arch {
-            Arch::Qwen3moe => q3place::placed_ctx_qwen3(split, place, CTX, &plan_levers)?,
+            Arch::Qwen3moe => q3place::placed_ctx_qwen3(split, place, CTX, &plan_levers, kv)?,
             Arch::Qwen35moe => {
                 let o = Open35 {
                     ctx: CTX,
                     mma: true,
                     ubatch: ubatch_size()?,
+                    kv,
                 };
                 q3place::placed_ctx_qwen35(split, &o, place, CTX, &plan_levers)?
             }
@@ -177,12 +179,13 @@ fn default_ctx(
         return placed_default(p);
     }
     let searched = match arch {
-        Arch::Qwen3moe => q3place::whole_ctx_qwen3(split, CTX)?,
+        Arch::Qwen3moe => q3place::whole_ctx_qwen3(split, CTX, kv)?,
         Arch::Qwen35moe => {
             let o = Open35 {
                 ctx: CTX,
                 mma: true,
                 ubatch: ubatch_size()?,
+                kv,
             };
             q3place::whole_ctx_qwen35(split, &o, CTX)?
         }
@@ -213,9 +216,25 @@ struct Args {
     port: u16,
     ctx: Option<usize>,
     place: Option<Place>,
+    /// `--cache-type-k`: the K/V planes' format (llama-server's spelling),
+    /// over the `BLOOMERY_QWEN3_KV` lever's word when given.
+    cache_type_k: Option<String>,
     /// `--parallel`: slots that take the model in turns past 1.
     parallel: usize,
     queue_depth: Option<usize>,
+}
+
+/// The K/V planes' format this run loads: `--cache-type-k`'s word when given
+/// (refused by name on any other), else the `BLOOMERY_QWEN3_KV` lever's,
+/// else f16.
+fn cache_k(a: &Args, levers: &Levers) -> Result<KvQ8, GateError> {
+    let word = a
+        .cache_type_k
+        .as_deref()
+        .or(levers.qwen3_kv_set())
+        .unwrap_or("f16");
+    KvQ8::parse(word)
+        .ok_or_else(|| format!("--cache-type-k takes f16 or q8_0, not {word:?}").into())
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -224,6 +243,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         port: 8080,
         ctx: None,
         place: None,
+        cache_type_k: None,
         // The fixed default, not an elastic one: this seat's park holds ids
         // only (`Park::Ids`), no byte budget to size the slots from — a
         // state to park is a seat that saves one. A lone request pays
@@ -252,6 +272,14 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
                 }
             },
             "--place" => a.place = Some(Place::parse(v)?),
+            "--cache-type-k" => a.cache_type_k = Some(v.to_owned()),
+            "--cache-type-v" => {
+                return Err(
+                    "--cache-type-v does not exist: the qwen3 cache quantizes its K and V \
+                     planes together, so --cache-type-k names the one format both take"
+                        .into(),
+                );
+            }
             "--parallel" | "-np" => match v.parse::<usize>() {
                 Ok(n) if n > 0 => a.parallel = n,
                 _ => {
@@ -293,6 +321,7 @@ trait Body3: ChainBody + Sized + 'static {
         ctx: usize,
         place: Option<(Place, &Levers)>,
         levers: &Levers,
+        kv: KvQ8,
     ) -> Result<GpuModel<Self>, GateError>;
     /// The load runs its routed experts on the host tier too.
     fn placed(m: &GpuModel<Self>) -> Result<bool, GateError>;
@@ -324,12 +353,13 @@ impl Body3 for Body {
         ctx: usize,
         place: Option<(Place, &Levers)>,
         levers: &Levers,
+        kv: KvQ8,
     ) -> Result<Qwen3moeModel, GateError> {
-        let opts = Qwen3moeModel::lever_opts(ctx)?;
+        let opts = Qwen3moeModel::lever_opts(ctx, kv)?;
         let Some((p, levers)) = place else {
             return q3place::open_unplaced_qwen3(file, ctx, opts, levers, Record::eprint);
         };
-        let q = PlaceQ3::qwen3(&file, p, ctx)?;
+        let q = PlaceQ3::qwen3(&file, p, ctx, kv)?;
         let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
         q.record(&plan, None).eprint();
         q3place::open_qwen3(file, &plan, opts, levers.host())
@@ -391,11 +421,13 @@ impl Body3 for Body35 {
         ctx: usize,
         place: Option<(Place, &Levers)>,
         levers: &Levers,
+        kv: KvQ8,
     ) -> Result<Qwen35moeModel, GateError> {
         let o = Open35 {
             ctx,
             mma: true,
             ubatch: ubatch_size()?,
+            kv,
         };
         let mut m = match place {
             None => q3place::open_unplaced_qwen35(file, o, levers, Record::eprint)?,
@@ -486,10 +518,11 @@ impl<B: Body3> Q3<B> {
         ctx: usize,
         place: Option<(Place, &Levers)>,
         levers: &Levers,
+        kv: KvQ8,
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let mut m = B::open(file, ctx, place, levers)?;
+        let mut m = B::open(file, ctx, place, levers, kv)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         if !B::placed(&m)? {
@@ -498,6 +531,7 @@ impl<B: Body3> Q3<B> {
         Record::new(&record::LOAD_QWEN3)
             .w("arch", B::ARCH)
             .u("resident_bytes", m.resident_bytes())
+            .w("cache", kv.name())
             .u("ctx", ctx)
             .u("layers", m.layers().len())
             .u("ubatch", B::ubatch(&m)?)
@@ -592,9 +626,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // A placed load (`--place`) acts on the placement's levers; set beside
     // an unplaced one, they are refused by name.
     let placed = args.iter().any(|a| a == "--place");
-    let levers = bloomery_levers::at_main(if placed { &q3place::PLACED_LEVERS } else { &[] })?;
+    let mut acts_on = vec![bloomery_levers::QWEN3_KV];
+    if placed {
+        acts_on.extend(q3place::PLACED_LEVERS);
+    }
+    let levers = bloomery_levers::at_main(&acts_on)?;
     record::at_main(NAME, record::BLOOMERY_SERVE_QWEN3);
     let a = parse_args(args)?;
+    let kv = cache_k(&a, &levers)?;
     let path = ref_model_path()?;
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let first = split
@@ -613,7 +652,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .to_owned();
     let ctx = match a.ctx {
         Some(c) => c,
-        None => default_ctx(&split, arch, a.place, &levers)?,
+        None => default_ctx(&split, arch, a.place, &levers, kv)?,
     };
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
@@ -622,7 +661,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let device = place.map_or("device 0", Place::name).to_owned();
     let engine = match arch {
         Arch::Qwen3moe => SeatEngine::spawn(
-            move || Q3::<Body>::open(&open, ctx, place.map(|p| (p, &levers)), &levers),
+            move || Q3::<Body>::open(&open, ctx, place.map(|p| (p, &levers)), &levers, kv),
             ctx,
             vocab,
             device,
@@ -630,7 +669,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             0,
         )?,
         Arch::Qwen35moe => SeatEngine::spawn(
-            move || Q3::<Body35>::open(&open, ctx, place.map(|p| (p, &levers)), &levers),
+            move || Q3::<Body35>::open(&open, ctx, place.map(|p| (p, &levers)), &levers, kv),
             ctx,
             vocab,
             device,

@@ -31,8 +31,8 @@ use registry::REGISTRY;
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
     HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WINDOWS,
-    PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN38_EXPERTS, R8,
-    RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV,
+    QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
 };
 
 #[cfg(test)]
@@ -802,6 +802,13 @@ impl Levers {
     #[must_use]
     pub fn qwen38_experts_set(&self) -> Option<&'static str> {
         self.word(QWEN38_EXPERTS)
+    }
+
+    /// `BLOOMERY_QWEN3_KV` as set: the K/V planes' format, `f16` or `q8_0`;
+    /// `None` unset, which the load reads as the registry's `f16` default.
+    #[must_use]
+    pub fn qwen3_kv_set(&self) -> Option<&'static str> {
+        self.word(QWEN3_KV)
     }
 
     /// `BLOOMERY_CHECK_FINITE`: the finite probe runs.

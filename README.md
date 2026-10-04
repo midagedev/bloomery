@@ -26,7 +26,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   twice), `--parallel/-np`, `--queue-depth`, `--cache-ram`, `--ctx/--ctx-size` (the qwen3, qwen38 and glm
   seats default it to what the card's free memory fits — the trained context capped to it on the qwen3 seat's
   whole-card loads, the largest context that keeps the card's experts on the qwen38 seat, the placed plan's
-  margin on the glm seat), `--host/--port`,)
+  margin on the glm seat), `--cache-type-k f16|q8_0` (the qwen3 seats; llama-server's spelling, also the
+  `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the auto context nearly doubles on the
+  same card; `--cache-type-v` does not exist, both planes quantize together), `--host/--port`,)
   `--alias`.
 - **Two-card serving like `-ts`**: `--place a` for the largest visible card, `--place bp` to add the next one
   as an expert tier, or a list (`0+1`) by CUDA index.

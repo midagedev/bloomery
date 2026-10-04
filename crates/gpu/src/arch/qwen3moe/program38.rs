@@ -913,6 +913,9 @@ fn qsa(
             scratch: &mut q.sel,
         },
     )?;
+    // The selecting store is f16 (the qwen38 family's stores carry no q8_0
+    // form), so the family's shared append runs its f16 arm.
+    let (kc, vc) = kv.f16_mut("qwen38::attention")?;
     c.k.neox.enqueue_head_norm_neox_append_256(
         stream,
         PartialNeoxArgs {
@@ -930,17 +933,18 @@ fn qsa(
             ctx,
             m,
             fault: sink,
-            cache_k: &mut kv.k,
-            cache_v: &mut kv.v,
+            cache_k: kc,
+            cache_v: vc,
         },
     )?;
+    let (kc, vc) = kv.f16("qwen38::attention")?;
     let width = q.sel.width();
     c.k.flash.enqueue_pass_256_p4_sel(
         stream,
         GqaSelArgs {
             q: &q.q,
-            kc: &kv.k,
-            vc: &kv.v,
+            kc,
+            vc,
             list: &q.sel.list,
             n_sel: &q.sel.n_sel,
             width,

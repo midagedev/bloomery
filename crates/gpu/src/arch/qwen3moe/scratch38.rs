@@ -11,6 +11,7 @@
 //! the load holds the stores it allocated to the rules' bytes
 //! ([`store_rule_bytes`]).
 
+use super::body::KvQ8;
 use super::plan38::{GDN, geo};
 use super::router::{RouterDims, RouterOut};
 use super::scratch::{
@@ -107,10 +108,11 @@ impl Store38 {
         Ok(())
     }
 
-    /// A zeroed selecting store of `ctx` positions over the planes `d` cuts.
+    /// A zeroed selecting store of `ctx` positions over the planes `d` cuts
+    /// — f16 planes: the qwen38 family's stores carry no q8_0 form.
     pub(super) fn qsa(stream: &CudaStream, d: &Dims) -> Result<Store38, GpuError> {
         Ok(Store38::Qsa {
-            kv: KvPlanes::new(stream, d)?,
+            kv: KvPlanes::new(stream, d, KvQ8::F16)?,
             raw: DeviceBuffer::zeroed(stream, d.ctx * geo::IDX_DIM)?,
             pooled: DeviceBuffer::zeroed(stream, qsa::pools_for(d.ctx) * geo::IDX_DIM)?,
         })

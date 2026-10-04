@@ -129,6 +129,9 @@ dispatch=(
   'crates/model/src/bin/bench_v41_host.rs use'
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.
   'crates/gpu-gates/src/oracle/mod.rs fn for_arch'
+  # AnyEngine::open 이 파일의 아키텍처를 그 몸체로 잇는다 — 이 파일의 use 묶음이 그 디스패치의
+  # 수입면이다: qwen3moe 팔이 그 family 의 불러오기 선택(KvQ8 포함)을 root 별칭과 arch 경로로 받는다.
+  'crates/gpu-gates/src/engine.rs use'
   # 디스패치가 아닌 유일한 항목: 하네스의 기본 참조 세트. ref_dir 가 Arch 를 받기 전까지 남는다.
   'crates/gpu-gates/src/lib.rs fn ref_dir'
 )

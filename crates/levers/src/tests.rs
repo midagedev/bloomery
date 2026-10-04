@@ -345,6 +345,7 @@ fn accessors_read_their_rows() {
             (RESIDENCY, "mid-p40-s1"),
             (QWEN38_EXPERTS, "card"),
             (HOSTSTREAM, "on"),
+            (QWEN3_KV, "q8_0"),
             (LANE_PREFETCH, "on"),
             (PREFILL_GROUP, "8"),
         ]),
@@ -372,6 +373,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.residency(), Some("mid-p40-s1"));
     assert_eq!(set.qwen38_experts(), "card");
     assert_eq!(set.qwen38_experts_set(), Some("card"));
+    assert_eq!(set.qwen3_kv_set(), Some("q8_0"));
     assert_eq!(set.hoststream(), Some(true));
     assert!(set.lane_prefetch());
     assert_eq!(
@@ -410,9 +412,24 @@ fn accessors_read_their_rows() {
             RESIDENCY,
             QWEN38_EXPERTS,
             HOSTSTREAM,
+            QWEN3_KV,
             LANE_PREFETCH
         ]
     );
+}
+
+/// `BLOOMERY_QWEN3_KV` takes the two cache-format words, and unset is the
+/// f16 default the load reads.
+#[test]
+fn qwen3_kv_takes_f16_and_q8_0() {
+    for w in ["f16", "q8_0"] {
+        let set = read(&env(&[(QWEN3_KV, w)]), Scope::Every).expect("a word the row takes");
+        assert_eq!(set.qwen3_kv_set(), Some(w));
+    }
+    let Err(other) = read(&env(&[(QWEN3_KV, "q6_0")]), Scope::Every) else {
+        panic!("a word the row does not take is refused");
+    };
+    assert!(other.to_string().contains("BLOOMERY_QWEN3_KV"), "{other}");
 }
 
 /// `BLOOMERY_DRAFT` takes `mtp` and `off` beside the V4.1 words: the row's

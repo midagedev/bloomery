@@ -45,7 +45,7 @@ pub mod ubatch;
 mod wide;
 mod wide38;
 
-pub use body::{Body, DecodeInput, FlashKind, OpenOpts};
+pub use body::{Body, DecodeInput, FlashKind, KvQ8, OpenOpts};
 pub use body35::{Body35, DecodeInput35, LayerKind35, Open35};
 pub use body38::{
     ALLOWED, Body38, CHECKPOINT_EVERY, DecodeInput38, LayerKind38, Prompt38, Qwen38Model, RouteTap,
@@ -61,7 +61,7 @@ pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHo
 /// Qwen3.6-35B-A3B on one card.
 pub type Qwen35moeModel = crate::GpuModel<Body35>;
 pub use prefill::{PrefillPath, PrefillPlan, PrefillStep};
-pub use taps::LayerRun;
+pub use taps::{KvQ8Host, LayerRun};
 
 /// The first of a prompt call's `tokens` at or past a vocabulary of `vocab`
 /// ids, refused by name: a call checks every id before its first launch.

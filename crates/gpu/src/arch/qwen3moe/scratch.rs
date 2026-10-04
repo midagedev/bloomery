@@ -14,16 +14,29 @@
 //! position ([`RopeRows`]) and appends it there, and the flash reads its
 //! live key count.
 
+use super::body::KvQ8;
+use super::plan::Flash;
 use super::router::{MAX_TOKENS, RouterDims, RouterOut};
 use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
-use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
+use crate::fault::FaultSink;
+use crate::flash_gqa::{
+    FlashGqaKernels, GqaArgs, GqaQ8Args, HEAD, HEAD_256, partials_ms_len, partials_v_len,
+    partials_v_len_256,
+};
+use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
+use crate::rope_neox::{
+    NeoxArgs, NeoxQ8Args, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels, q8_plane_lens,
+};
 use crate::rope_table::{Direction, RopeTable};
 use crate::tensor::{Q8Act, window};
+use crate::weights::q8_0_planes;
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
+use gguf::quant::f32_to_f16_bits;
+use model::quant::quantize_q8_0;
 use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
 
@@ -262,23 +275,738 @@ impl Dims {
     }
 }
 
-/// One layer's K and V planes, `[n_kv][ctx][head]` f16 each.
-pub(super) struct KvPlanes {
-    pub(super) k: DeviceBuffer<u16>,
-    pub(super) v: DeviceBuffer<u16>,
+/// One layer's K and V planes, as the load's cache format holds them:
+/// `[n_kv][ctx][head]` f16 each ([`KvPlanes::F16`]), or — when the load runs
+/// its cache in q8_0 ([`KvQ8`]) — the two-plane layout the weights side owns
+/// (`weights::q8_0_planes`): per side a codes plane of `head/4` u32 a row
+/// and a scales plane of `head/32` u16 ([`rope_neox::q8_plane_lens`]), the
+/// rows the quantizing appends write and the q8 read paths walk.
+pub(super) enum KvPlanes {
+    F16 {
+        k: DeviceBuffer<u16>,
+        v: DeviceBuffer<u16>,
+    },
+    Q8 {
+        kq: DeviceBuffer<u32>,
+        kd: DeviceBuffer<u16>,
+        vq: DeviceBuffer<u32>,
+        vd: DeviceBuffer<u16>,
+    },
+}
+
+/// The fields [`NeoxArgs`](crate::rope_neox::NeoxArgs) and
+/// [`NeoxQ8Args`](crate::rope_neox::NeoxQ8Args) share, the head-128 append
+/// every cache-format arm of [`KvPlanes::append_128`] launches.
+pub(super) struct Append128<'a> {
+    pub(super) q: &'a mut DeviceBuffer<f32>,
+    pub(super) k: &'a mut DeviceBuffer<f32>,
+    pub(super) v: &'a DeviceBuffer<f32>,
+    pub(super) gq: &'a DeviceBuffer<f32>,
+    pub(super) gk: &'a DeviceBuffer<f32>,
+    pub(super) table: &'a DeviceBuffer<f32>,
+    pub(super) pos: &'a DeviceBuffer<u32>,
+    pub(super) eps: f32,
+    pub(super) n_head: usize,
+    pub(super) n_kv: usize,
+    pub(super) ctx: usize,
+    pub(super) m: usize,
+    pub(super) fault: FaultSink,
+}
+
+/// The fields [`PartialNeoxArgs`](crate::rope_neox::PartialNeoxArgs) and
+/// [`PartialNeoxQ8Args`](crate::rope_neox::PartialNeoxQ8Args) share, the
+/// head-256 append every cache-format arm of [`KvPlanes::append_256`]
+/// launches.
+pub(super) struct Append256<'a> {
+    pub(super) qg: &'a DeviceBuffer<f32>,
+    pub(super) q: &'a mut DeviceBuffer<f32>,
+    pub(super) k: &'a mut DeviceBuffer<f32>,
+    pub(super) v: &'a DeviceBuffer<f32>,
+    pub(super) gq: &'a DeviceBuffer<f32>,
+    pub(super) gk: &'a DeviceBuffer<f32>,
+    pub(super) table: &'a DeviceBuffer<f32>,
+    pub(super) pos: &'a DeviceBuffer<u32>,
+    pub(super) eps: f32,
+    pub(super) n_head: usize,
+    pub(super) n_kv: usize,
+    pub(super) ctx: usize,
+    pub(super) m: usize,
+    pub(super) fault: FaultSink,
+}
+
+/// The fields [`GqaArgs`](crate::flash_gqa::GqaArgs) and
+/// [`GqaQ8Args`](crate::flash_gqa::GqaQ8Args) share, the decode flash every
+/// cache-format arm of [`KvPlanes::flash_128`] and [`KvPlanes::flash_256`]
+/// launches.
+pub(super) struct FlashPass<'a> {
+    pub(super) q: &'a DeviceBuffer<f32>,
+    pub(super) n_keys: &'a DeviceBuffer<u32>,
+    pub(super) scale: f32,
+    pub(super) n_kv: usize,
+    pub(super) ctx: usize,
+    pub(super) m: usize,
+    pub(super) part_v: &'a mut DeviceBuffer<f32>,
+    pub(super) part_ms: &'a mut DeviceBuffer<f32>,
+    pub(super) fault: FaultSink,
+    pub(super) y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The fields [`GqaPrefillArgs`](crate::flash_gqa_prefill::GqaPrefillArgs)
+/// and [`GqaPrefillQ8Args`](crate::flash_gqa_prefill::GqaPrefillQ8Args)
+/// share, the prefill flash every cache-format arm of
+/// [`KvPlanes::prefill_128`] and [`KvPlanes::prefill_256`] launches.
+pub(super) struct PrefillFlash<'a> {
+    pub(super) q: &'a DeviceBuffer<f32>,
+    pub(super) n_keys: &'a DeviceBuffer<u32>,
+    pub(super) scale: f32,
+    pub(super) n_head: usize,
+    pub(super) n_kv: usize,
+    pub(super) ctx: usize,
+    pub(super) t: usize,
+    pub(super) fault: FaultSink,
+    pub(super) y: &'a mut DeviceBuffer<f32>,
 }
 
 impl KvPlanes {
-    pub(super) fn new(stream: &CudaStream, d: &Dims) -> Result<KvPlanes, GpuError> {
-        let n = d.n_kv * d.ctx * d.head;
-        Ok(KvPlanes {
-            k: DeviceBuffer::zeroed(stream, n)?,
-            v: DeviceBuffer::zeroed(stream, n)?,
+    /// The layer's planes of `d`'s shape in the `kv` format. Load-time only.
+    pub(super) fn new(stream: &CudaStream, d: &Dims, kv: KvQ8) -> Result<KvPlanes, GpuError> {
+        Ok(match kv {
+            KvQ8::F16 => {
+                let n = d.n_kv * d.ctx * d.head;
+                KvPlanes::F16 {
+                    k: DeviceBuffer::zeroed(stream, n)?,
+                    v: DeviceBuffer::zeroed(stream, n)?,
+                }
+            }
+            KvQ8::Q8 => {
+                let (words, scales) = q8_plane_lens(d.head, d.n_kv, d.ctx);
+                KvPlanes::Q8 {
+                    kq: DeviceBuffer::zeroed(stream, words)?,
+                    kd: DeviceBuffer::zeroed(stream, scales)?,
+                    vq: DeviceBuffer::zeroed(stream, words)?,
+                    vd: DeviceBuffer::zeroed(stream, scales)?,
+                }
+            }
         })
     }
 
+    /// Both sides' rows `0..d.ctx` set to the pattern `vals` (`n_kv · ctx ·
+    /// head` values, f32): their f16 bits on an f16 cache, the q8_0 form of
+    /// each whole 32-value block — the engine's one quantizer's rule
+    /// (`model::arch::deepseek2::attn::quantize_q8_0`), packed
+    /// ([`weights::q8_0_planes`]) — on a q8_0 one. Gate use; synchronizes
+    /// with the caller.
+    pub(super) fn fill(
+        &mut self,
+        stream: &CudaStream,
+        vals: &[f32],
+        d: &Dims,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "qwen3moe::KvPlanes::fill";
+        let want = d.n_kv * d.ctx * d.head;
+        if vals.len() != want {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{} values of a {}-value plane", vals.len(), want),
+            ));
+        }
+        match self {
+            KvPlanes::F16 { k, v } => {
+                let bits = vals.iter().map(|&x| f32_to_f16_bits(x)).collect::<Vec<_>>();
+                k.copy_from_host(stream, &bits)?;
+                v.copy_from_host(stream, &bits)?;
+            }
+            KvPlanes::Q8 { kq, kd, vq, vd } => {
+                let blocks = vals
+                    .as_chunks::<32>()
+                    .0
+                    .iter()
+                    .map(|b| quantize_q8_0(b))
+                    .collect::<Vec<_>>();
+                let (codes, scales) = q8_0_planes(&blocks);
+                kq.copy_from_host(stream, &codes)?;
+                kd.copy_from_host(stream, &scales)?;
+                vq.copy_from_host(stream, &codes)?;
+                vd.copy_from_host(stream, &scales)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The f16 planes, or a named refusal on a q8_0 cache: the paths that
+    /// read K/V rows as f16 bits (the qwen38 family's stores and snapshots)
+    /// load in f16 only.
+    pub(super) fn f16(
+        &self,
+        what: &'static str,
+    ) -> Result<(&DeviceBuffer<u16>, &DeviceBuffer<u16>), GpuError> {
+        match self {
+            KvPlanes::F16 { k, v } => Ok((k, v)),
+            KvPlanes::Q8 { .. } => Err(GpuError::state(
+                what,
+                "the f16 K/V planes (this cache runs q8_0)",
+            )),
+        }
+    }
+
+    /// [`KvPlanes::f16`]'s mutable form.
+    pub(super) fn f16_mut(
+        &mut self,
+        what: &'static str,
+    ) -> Result<(&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>), GpuError> {
+        match self {
+            KvPlanes::F16 { k, v } => Ok((k, v)),
+            KvPlanes::Q8 { .. } => Err(GpuError::state(
+                what,
+                "the f16 K/V planes (this cache runs q8_0)",
+            )),
+        }
+    }
+
+    /// The head-128 norm, turn and append of `s`'s rows over these planes:
+    /// [`enqueue_head_norm_neox_append`](crate::rope_neox::RopeNeoxKernels::enqueue_head_norm_neox_append)'s
+    /// f16 launch, or its q8_0 twin's on a q8_0 cache. Asynchronous,
+    /// allocation-free, capturable.
+    pub(super) fn append_128(
+        &mut self,
+        neox: &RopeNeoxKernels,
+        stream: &CudaStream,
+        s: Append128<'_>,
+    ) -> Result<(), GpuError> {
+        let Append128 {
+            q,
+            k,
+            v,
+            gq,
+            gk,
+            table,
+            pos,
+            eps,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+        } = s;
+        match self {
+            KvPlanes::F16 { k: kc, v: vc } => neox.enqueue_head_norm_neox_append(
+                stream,
+                NeoxArgs {
+                    q,
+                    k,
+                    v,
+                    gq,
+                    gk,
+                    table,
+                    pos,
+                    eps,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault,
+                    cache_k: kc,
+                    cache_v: vc,
+                },
+            ),
+            KvPlanes::Q8 { kq, kd, vq, vd } => neox.enqueue_head_norm_neox_append_q8(
+                stream,
+                NeoxQ8Args {
+                    q,
+                    k,
+                    v,
+                    gq,
+                    gk,
+                    table,
+                    pos,
+                    eps,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                },
+            ),
+        }
+    }
+
+    /// The head-256 norm, partial turn and append of `s`'s rows over these
+    /// planes ([`KvPlanes::append_128`]'s head-256 form).
+    pub(super) fn append_256(
+        &mut self,
+        neox: &RopeNeoxKernels,
+        stream: &CudaStream,
+        s: Append256<'_>,
+    ) -> Result<(), GpuError> {
+        let Append256 {
+            qg,
+            q,
+            k,
+            v,
+            gq,
+            gk,
+            table,
+            pos,
+            eps,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+        } = s;
+        match self {
+            KvPlanes::F16 { k: kc, v: vc } => neox.enqueue_head_norm_neox_append_256(
+                stream,
+                PartialNeoxArgs {
+                    qg,
+                    q,
+                    k,
+                    v,
+                    gq,
+                    gk,
+                    table,
+                    pos,
+                    eps,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault,
+                    cache_k: kc,
+                    cache_v: vc,
+                },
+            ),
+            KvPlanes::Q8 { kq, kd, vq, vd } => neox.enqueue_head_norm_neox_append_256_q8(
+                stream,
+                PartialNeoxQ8Args {
+                    qg,
+                    q,
+                    k,
+                    v,
+                    gq,
+                    gk,
+                    table,
+                    pos,
+                    eps,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    m,
+                    fault,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                },
+            ),
+        }
+    }
+
+    /// The head-128 decode flash of `s`'s rows over these planes
+    /// ([`FlashGqaKernels::enqueue_pass`]'s f16 launch or its q8_0 twin's,
+    /// the tensor-core pass when `mma`).
+    pub(super) fn flash_128(
+        &mut self,
+        flash: &FlashGqaKernels,
+        stream: &CudaStream,
+        s: FlashPass<'_>,
+        mma: bool,
+    ) -> Result<(), GpuError> {
+        let FlashPass {
+            q,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = s;
+        match self {
+            KvPlanes::F16 { k: kc, v: vc } => flash.enqueue_pass(
+                stream,
+                GqaArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                mma,
+            ),
+            KvPlanes::Q8 { kq, kd, vq, vd } => flash.enqueue_pass_q8(
+                stream,
+                GqaQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                mma,
+            ),
+        }
+    }
+
+    /// The head-256 decode flash of `s`'s rows over these planes, the pass
+    /// `flash` names (the pairs' pass scalar only), the f16 launches or
+    /// their q8_0 twins'.
+    pub(super) fn flash_256(
+        &mut self,
+        k: &FlashGqaKernels,
+        stream: &CudaStream,
+        s: FlashPass<'_>,
+        n_head: usize,
+        flash: Flash,
+        mma: bool,
+    ) -> Result<(), GpuError> {
+        let FlashPass {
+            q,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = s;
+        match (self, flash) {
+            (KvPlanes::F16 { k: kc, v: vc }, Flash::Group) => k.enqueue_pass_256(
+                stream,
+                GqaArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                mma,
+            ),
+            (KvPlanes::F16 { k: kc, v: vc }, Flash::Quads) => k.enqueue_pass_256_p4(
+                stream,
+                GqaArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                n_head,
+                mma,
+            ),
+            // The pairs' pass is scalar: the load refuses the tensor-core one.
+            (KvPlanes::F16 { k: kc, v: vc }, Flash::Pairs) => k.enqueue_pass_256_p2(
+                stream,
+                GqaArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                n_head,
+            ),
+            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Group) => k.enqueue_pass_256_q8(
+                stream,
+                GqaQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                mma,
+            ),
+            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Quads) => k.enqueue_pass_256_p4_q8(
+                stream,
+                GqaQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                n_head,
+                mma,
+            ),
+            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Pairs) => k.enqueue_pass_256_p2_q8(
+                stream,
+                GqaQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_kv,
+                    ctx,
+                    m,
+                    part_v,
+                    part_ms,
+                    fault,
+                    y,
+                },
+                n_head,
+                mma,
+            ),
+        }
+    }
+
+    /// The head-128 prefill flash of `s`'s rows over these planes
+    /// ([`FlashGqaPrefill::enqueue`]'s f16 launch or its q8_0 twin's).
+    pub(super) fn prefill_128(
+        &mut self,
+        prefill: &FlashGqaPrefill,
+        stream: &CudaStream,
+        s: PrefillFlash<'_>,
+    ) -> Result<(), GpuError> {
+        let PrefillFlash {
+            q,
+            n_keys,
+            scale,
+            n_head,
+            n_kv,
+            ctx,
+            t,
+            fault,
+            y,
+        } = s;
+        match self {
+            KvPlanes::F16 { k: kc, v: vc } => prefill.enqueue(
+                stream,
+                GqaPrefillArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            ),
+            KvPlanes::Q8 { kq, kd, vq, vd } => prefill.enqueue_q8(
+                stream,
+                GqaPrefillQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            ),
+        }
+    }
+
+    /// The head-256 prefill flash of `s`'s rows over these planes, the pass
+    /// `flash` names, the f16 launches or their q8_0 twins'.
+    pub(super) fn prefill_256(
+        &mut self,
+        k: &FlashGqaPrefill,
+        stream: &CudaStream,
+        s: PrefillFlash<'_>,
+        flash: Flash,
+    ) -> Result<(), GpuError> {
+        let PrefillFlash {
+            q,
+            n_keys,
+            scale,
+            n_head,
+            n_kv,
+            ctx,
+            t,
+            fault,
+            y,
+        } = s;
+        match (self, flash) {
+            (KvPlanes::F16 { k: kc, v: vc }, Flash::Group) => k.enqueue_256(
+                stream,
+                GqaPrefillArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            ),
+            (KvPlanes::F16 { k: kc, v: vc }, Flash::Quads) => k.enqueue_256_p4(
+                stream,
+                GqaPrefillArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            ),
+            (KvPlanes::F16 { k: kc, v: vc }, Flash::Pairs) => k.enqueue_256_p2(
+                stream,
+                GqaPrefillArgs {
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            ),
+            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Group) => k.enqueue_256_q8(
+                stream,
+                GqaPrefillQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            ),
+            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Quads) => k.enqueue_256_p4_q8(
+                stream,
+                GqaPrefillQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            ),
+            (KvPlanes::Q8 { kq, kd, vq, vd }, Flash::Pairs) => k.enqueue_256_p2_q8(
+                stream,
+                GqaPrefillQ8Args {
+                    q,
+                    kq,
+                    kd,
+                    vq,
+                    vd,
+                    n_keys,
+                    scale,
+                    n_head,
+                    n_kv,
+                    ctx,
+                    t,
+                    fault,
+                    y,
+                },
+            ),
+        }
+    }
+
     pub(super) fn bytes(&self) -> usize {
-        self.k.num_bytes() + self.v.num_bytes()
+        fn bytes<T>(b: &DeviceBuffer<T>) -> usize {
+            b.num_bytes()
+        }
+        match self {
+            KvPlanes::F16 { k, v } => bytes(k) + bytes(v),
+            KvPlanes::Q8 { kq, kd, vq, vd } => bytes(kq) + bytes(kd) + bytes(vq) + bytes(vd),
+        }
     }
 }
 

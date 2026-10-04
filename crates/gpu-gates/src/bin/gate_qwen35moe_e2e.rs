@@ -92,6 +92,14 @@
 //! - (r) refusals: a ubatch size of 0 or past `UBATCH` is refused by name
 //!   with the size and the resident bytes kept; a prompt past the cache is
 //!   refused by name before any launch, the position kept.
+//! - (v) the q8_0 cache arm (`BLOOMERY_QWEN3_KV=q8_0`, the seat's
+//!   `--cache-type-k q8_0`), on its own models: the store bytes' derived
+//!   drop (the attention planes' two-plane layout against f16, the delta
+//!   layers' stores f32 either way) carrying the resident bytes' delta
+//!   exactly, and 96 of the oracle set's ids stepped, prefilled on the
+//!   pass path and replayed through the captured step graph leaving the
+//!   same last logits bit for bit and the same argmax; the distance to the
+//!   f16 run prints as the quantization diagnostic.
 //! - (o) the placed load: the file planned on device 0 under a card budget
 //!   of [`PLACED_BUDGET`] (`shared/qwen3moe_place.rs`, the CLI's and the
 //!   seat's planner), which must leave routed experts both on the card and
@@ -167,8 +175,8 @@ mod gate {
     use super::q3place::{self, PlaceQ3};
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
-        Body35, Delta35Run, Gqa35Run, LayerKind35, Mixer35Run, Open35, PrefillPath, Qwen35moeModel,
-        StoreHost,
+        Body35, Delta35Run, Gqa35Run, KvQ8, LayerKind35, Mixer35Run, Open35, PrefillPath,
+        Qwen35moeModel, StoreHost,
     };
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::StepMode;
@@ -445,7 +453,7 @@ mod gate {
         }
     }
 
-    fn open(ctx: usize) -> Result<Qwen35moeModel, GateError> {
+    fn open(ctx: usize, kv: KvQ8) -> Result<Qwen35moeModel, GateError> {
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         if file.architecture() != Some("qwen35moe") {
             return Err(format!("{MODEL} is {:?}, not qwen35moe", file.architecture()).into());
@@ -458,6 +466,7 @@ mod gate {
                 ctx,
                 mma: true,
                 ubatch: U_GATE,
+                kv,
             },
         )?;
         println!(
@@ -1731,7 +1740,7 @@ mod gate {
     /// after a cut bit for bit. The model is dropped before the clause
     /// returns.
     fn checkpoints() -> Result<bool, GateError> {
-        let mut m = open(KCTX)?;
+        let mut m = open(KCTX, KvQ8::F16)?;
         {
             let (_, _, body) = m.body_parts("gate_qwen35moe_e2e")?;
             body.set_checkpoints(true);
@@ -1899,6 +1908,7 @@ mod gate {
             ctx: CTX,
             mma: true,
             ubatch: U_GATE,
+            kv: KvQ8::F16,
         };
         let whole = matches!(
             q3place::unplaced_qwen35(&file, &o)?,
@@ -1947,6 +1957,7 @@ mod gate {
             ctx: CTX,
             mma: true,
             ubatch: U_GATE,
+            kv: KvQ8::F16,
         };
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {
@@ -2053,6 +2064,89 @@ mod gate {
         Ok((man, toks))
     }
 
+    /// The q8_0 cache arm (`BLOOMERY_QWEN3_KV=q8_0`, the seat's
+    /// `--cache-type-k q8_0`), on its own models dropped before the clause
+    /// returns: the attention layers' planes hold the two-plane layout (the
+    /// store bytes drop, and the resident bytes drop by exactly the stores'
+    /// own delta; the delta layers' stores are f32 either way), and the
+    /// oracle set's first ids stepped, the same ids prefilled on the pass
+    /// path and the same steps through the captured graph all leave the
+    /// same last logits bit for bit and the same argmax — the arm's own
+    /// consistency, the (p) and (r) contracts on the q8 path. The distance
+    /// to the f16 run's logits prints as the quantization diagnostic
+    /// (`store`'s f16 readback refuses a q8_0 cache by name, so the bits
+    /// clause holds the logits and tokens).
+    fn q8_cache() -> Result<bool, GateError> {
+        const Q8_N: usize = 96;
+        let (_, toks) = batch_set()?;
+        let ids: Vec<u32> = toks.iter().take(Q8_N).copied().collect();
+        let mut f16 = open(CTX, KvQ8::F16)?;
+        let (f16_resident, f16_store) = (f16.resident_bytes(), f16.body("q8")?.store_bytes());
+        f16.reset()?;
+        let mut f16_tok = 0;
+        for &id in &ids {
+            f16_tok = f16.step(&[id])?;
+        }
+        let f16_logits = f16.logits()?;
+        drop(f16);
+        let mut m = open(CTX, KvQ8::Q8)?;
+        let (resident, store) = (m.resident_bytes(), m.body("q8")?.store_bytes());
+        let bytes_ok = f16_store > store
+            && f16_resident.saturating_sub(resident) == f16_store.saturating_sub(store);
+        println!(
+            "q8 load: resident_bytes={resident} (f16 {f16_resident}), store bytes {store} of \
+             f16's {f16_store} — the residents differ by the stores' own delta {}",
+            f16_store.saturating_sub(store)
+        );
+        let mut ok = bytes_ok;
+        m.reset()?;
+        let mut step_tok = 0;
+        for &id in &ids {
+            step_tok = m.step(&[id])?;
+        }
+        let logits = m.logits()?;
+        // The quantization diagnostic against the f16 run: the argmax's
+        // agreement and the relative distance, printed.
+        let num: f64 = logits
+            .iter()
+            .zip(&f16_logits)
+            .map(|(a, b)| f64::from(a - b).powi(2))
+            .sum();
+        let den: f64 = f16_logits.iter().map(|b| f64::from(*b).powi(2)).sum();
+        println!(
+            "q8 steps: {Q8_N} ids; argmax ours={step_tok} f16={f16_tok} (printed); logits \
+             rel dist {:.3e} (diagnostic)",
+            if den > 0.0 { (num / den).sqrt() } else { 0.0 }
+        );
+        // The pass prefill of the same ids leaves the stepped run's bits.
+        m.reset()?;
+        let pass_tok = m.prefill_with(&ids, PrefillPath::Pass)?;
+        let pass_logits = m.logits()?;
+        let bits = pass_tok == step_tok && logits == pass_logits;
+        println!(
+            "q8 bits: pass prefill == {Q8_N} steps, last logits bit for bit {}",
+            verdict(bits)
+        );
+        ok &= bits;
+        // The graph replay: the same steps through the captured step graph.
+        m.reset()?;
+        m.set_mode(StepMode::Graph);
+        println!("q8 capture graph_nodes={}", m.capture_step()?);
+        m.reset()?;
+        let mut last = 0;
+        for &id in &ids {
+            last = m.step(&[id])?;
+        }
+        let graph_logits = m.logits()?;
+        let replay = last == step_tok && logits == graph_logits;
+        println!(
+            "q8 replay: {Q8_N} captured steps == the eager bits {}",
+            verdict(replay)
+        );
+        ok &= replay;
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         // A lever set to a value it does not take, or a retired name that is
         // set, is refused by name before anything loads.
@@ -2074,7 +2168,7 @@ mod gate {
             }
             return Ok(());
         }
-        let mut m = open(CTX)?;
+        let mut m = open(CTX, KvQ8::F16)?;
         let mut ok = file_shape()?;
         ok &= structure(&mut m)?;
         let (man, toks) = batch_set()?;
@@ -2097,6 +2191,7 @@ mod gate {
         drop(m);
         ok &= checkpoints()?;
         ok &= placed(&man, &toks, host)?;
+        ok &= q8_cache()?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

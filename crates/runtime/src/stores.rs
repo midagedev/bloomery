@@ -94,6 +94,16 @@ pub const fn kv_row_bytes(kv_heads: usize, head_dim: usize) -> u64 {
     2 * (kv_heads * head_dim) as u64 * F16_BYTES
 }
 
+/// A GQA position's K and V over `kv_heads` heads of `head_dim` in q8_0's
+/// two-plane layout: per side a code byte and a f16 scale's half byte every
+/// 32 values (`2 + 32·1 = 34` bytes a block, `17/16` a value), both planes
+/// quantized together by the one format choice.
+#[must_use]
+pub const fn kv_q8_row_bytes(kv_heads: usize, head_dim: usize) -> u64 {
+    assert!(head_dim.is_multiple_of(32), "a q8_0 block covers 32 values");
+    2 * (kv_heads * head_dim) as u64 * 17 / 16
+}
+
 /// A dense attention layer's bytes at `ctx` positions: each position's K and
 /// V ([`kv_row_bytes`]) and nothing else — the MTP draft layer's store, which
 /// attends to every position it holds.
