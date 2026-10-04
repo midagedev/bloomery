@@ -755,7 +755,7 @@ impl GpuModel<Body> {
     /// row `pos`), serve its host share, and read the layer back.
     /// Synchronizes; gate/debug use. A fault the call reads back is its
     /// error and poisons the model as a step's fault does
-    /// ([`GpuModel::note_fault`]): a later step refuses until
+    /// ([`GpuModel::note_fault`]): a later step, and this call, refuse until
     /// [`GpuModel::reset`].
     pub fn step_layer_hybrid(
         &mut self,
@@ -764,6 +764,7 @@ impl GpuModel<Body> {
         pos: u32,
     ) -> Result<HybridTaps, GpuError> {
         let what = "GpuModel::step_layer_hybrid";
+        self.refuse_if_poisoned(what)?;
         self.check_pos(pos, what)?;
         self.set_layer_input(x_in)?;
         self.refresh_params(0, pos)?;

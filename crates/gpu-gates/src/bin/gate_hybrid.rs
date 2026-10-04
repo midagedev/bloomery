@@ -56,12 +56,17 @@
 //! residual through `step_layer_hybrid` returns the card's fault at that
 //! layer — its norm's and its router's sites in the mask, printed in the
 //! Deepseek2 step order — with one refusal recorded by the host tier, and
-//! the model poisoned by that fault as a step's fault poisons it. The
+//! the model poisoned by that fault as a step's fault poisons it. While
+//! poisoned, the model refuses `step_layer_hybrid` and `step_layer_taps` at
+//! entry with `Poisoned`, naming the instrument and that fault. The
 //! model's reset then lifts both — the tier's poison (one reset counted, the
 //! poison kept as refused at that layer) and the model's — and the first
 //! prompt, eagerly and by replay, gives the n_l = 32 run's logits bit for
 //! bit with every step served by the host on every routed layer and the
-//! words at rest after it.
+//! words at rest after it. Before that, on the all-card model (one slot): a
+//! NaN through `step_layer_taps`, which does not read the fault word, raises
+//! it at the layer and poisons nothing; the reset clears the word, and the
+//! first prompt's step gives the forced run's token and margin bit for bit.
 //!
 //! And the batch service's exclusion set, on the same stub boundary: a
 //! service given a set of host experts computes, for every column, what the
@@ -1467,6 +1472,97 @@ mod gate {
         Ok(ok)
     }
 
+    /// A one-slot model's reset clears a fault word no call recorded: a NaN
+    /// in layer `l`'s input residual through `step_layer_taps`, which does
+    /// not read the word, raises it at that layer and poisons nothing; the
+    /// reset clears it, and the first prompt's graph step then gives the
+    /// forced run's token and margin bit for bit, unpoisoned. Whether it held.
+    fn unrecorded_reset(
+        a: &mut Deepseek2Model,
+        l: usize,
+        x_in: &[f32],
+        p0: &PromptRow,
+        forced: &Forced,
+    ) -> Result<bool, GateError> {
+        let mut x_nan = x_in.to_vec();
+        x_nan[0] = f32::NAN;
+        a.set_mode(StepMode::Graph);
+        a.reset()?;
+        let taps = a.step_layer_taps(l, &x_nan, 0).map(drop);
+        let word = a.gpu().fault()?;
+        let at_l = word.is_some_and(|f| usize::try_from(f.layer).is_ok_and(|fl| fl == l));
+        let raised = taps.is_ok() && at_l && a.poisoned().is_none();
+        let reset = a.reset();
+        let cleared = reset.is_ok() && a.gpu().fault()?.is_none();
+        let step = match a.step(&p0.tokens) {
+            Ok(t) => a.logits().map(|lg| (t, lg)),
+            Err(e) => Err(e),
+        };
+        let (want_t, want_m) = (forced.top1[0][0], forced.margin[0][0]);
+        let same = step.as_ref().is_ok_and(|(t, lg)| {
+            *t == want_t && margin_at(lg, *t as usize).to_bits() == want_m.to_bits()
+        });
+        let pass = raised && cleared && same && a.poisoned().is_none();
+        println!(
+            "all_card one-slot reset of an unrecorded fault: layer={l} input NaN through \
+             step_layer_taps {}, word \"{}\" at the layer, model unpoisoned {raised}; reset {} word \
+             clear {cleared}; prompt {} step {} (want token {want_t} margin {want_m}) bit for bit \
+             {same}, unpoisoned {} {}",
+            match &taps {
+                Ok(()) => "Ok".to_string(),
+                Err(e) => e.to_string(),
+            },
+            word.map_or_else(|| "none".to_string(), |f| f.to_string()),
+            match &reset {
+                Ok(()) => "Ok".to_string(),
+                Err(e) => e.to_string(),
+            },
+            p0.id,
+            match &step {
+                Ok((t, lg)) => format!("token {t} margin {}", margin_at(lg, *t as usize)),
+                Err(e) => e.to_string(),
+            },
+            a.poisoned().is_none(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// A poisoned model refuses the layer instruments by name until its
+    /// reset: `step_layer_hybrid` on routed layer `l` and `step_layer_taps`
+    /// on layer 0 (a card layer here: a hybrid load refuses a routed one for
+    /// another reason), each with a clean input, return `Poisoned` naming the
+    /// instrument and the model's fault. Whether both held.
+    fn poisoned_refusals(h: &mut Deepseek2Model, l: usize, x_in: &[f32]) -> bool {
+        let Some(fault) = h.poisoned() else {
+            println!("n_l=32 engine poisoned instruments: the model is not poisoned FAIL");
+            return false;
+        };
+        let hybrid = h.step_layer_hybrid(l, x_in, 0).map(drop);
+        let taps = h.step_layer_taps(0, x_in, 0).map(drop);
+        let mut ok = true;
+        for (want, layer, r) in [
+            ("GpuModel::step_layer_hybrid", l, hybrid),
+            ("GpuModel::step_layer_taps", 0, taps),
+        ] {
+            let pass = matches!(
+                &r,
+                Err(GpuError::Poisoned { what, fault: f }) if *what == want && *f == fault
+            );
+            ok &= pass;
+            println!(
+                "n_l=32 engine poisoned refuses {want} layer={layer}: answer \"{}\" Poisoned by \
+                 name with the model's fault {pass} {}",
+                match &r {
+                    Ok(()) => "Ok".to_string(),
+                    Err(e) => e.to_string(),
+                },
+                verdict(pass)
+            );
+        }
+        ok
+    }
+
     pub fn run() -> Result<(), GateError> {
         let refusals = refusal_arm()?;
         let exclusion = exclusion_arm()?;
@@ -1541,6 +1637,15 @@ mod gate {
         }
         let on32 = on32.ok_or("gate_hybrid: no n_l = 32 run for the engine's reset arm")?;
 
+        // The all-card model serves one slot: its reset clears a word that
+        // an instrument raised and no call recorded.
+        let (l0, x0, _) = chains
+            .first()
+            .and_then(|c| c.layers.first())
+            .ok_or("gate_hybrid: no routed layer")?;
+        let p0 = prompts.first().ok_or("gate_hybrid: no prompt")?;
+        ok &= unrecorded_reset(&mut a, *l0, x0, p0, &forced)?;
+
         {
             let mut h = Deepseek2Model::open_hybrid(
                 Split::open(ref_model_path()?)?,
@@ -1601,6 +1706,7 @@ mod gate {
                  poisoned by that fault {poisoned} {}",
                 verdict(pass)
             );
+            ok &= poisoned_refusals(&mut h, *l, x_in);
 
             // The reset: the first prompt eagerly and by replay gives the
             // logits the n_l = 32 run gave, every step served by the host
@@ -1659,7 +1765,8 @@ mod gate {
                  card's slots unchanged, the host's slots zero and the host sum inside the error model's band, \
                  and leaves the all-card argmax only inside the flip band; a handoff the card should have refused names the card's fault, or says the \
                  card raised nothing; a batch service leaves exactly its exclusion set's slots off the host, \
-                 over one batch or more, and refuses a malformed set by name."
+                 over one batch or more, and refuses a malformed set by name; a poisoned model refuses the \
+                 layer instruments by name, and a one-slot model's reset clears a word no call recorded."
             );
             Ok(())
         } else {
