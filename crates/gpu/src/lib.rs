@@ -79,7 +79,7 @@ pub use fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultSink, FaultSite, LAYER_HEAD
 pub use graph::{
     Branch, FLAG_WAIT_OPS, Graph, HostFlags, KernelNode, NodeInfo, capturing, node_info,
 };
-pub use model::GpuModel;
+pub use model::{GpuModel, Slots};
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
 /// before the skeleton became generic over its architecture.
 pub type Deepseek2Model = GpuModel<arch::deepseek2::Body>;

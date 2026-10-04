@@ -68,12 +68,14 @@ const BLOCK: usize = IN_IDS + MAX_TOKENS;
 /// The prefill arena, the current prompt's image, the slot the captured
 /// passes read and the passes themselves.
 pub(super) struct Prefill {
-    /// The pass of `m` tokens captured over the slot, at `m − 1`. Declared
-    /// first: fields drop in declaration order, and a graph is destroyed
-    /// while the arena and the slot it addresses are alive (and, since
-    /// `Body` declares this struct first, the cache planes and the rope
-    /// table too).
-    graphs: Vec<Option<Graph>>,
+    /// The passes of `m` tokens captured over the live sequence's planes,
+    /// at `m − 1`: the live slot's own captures, exchanged with the parked
+    /// sequences' on a slot switch (the body's `Slots::swap_seq`), so no
+    /// replay runs another sequence's addresses. Declared first: fields drop
+    /// in declaration order, and a graph is destroyed while the arena and
+    /// the slot it addresses are alive (and, since `Body` declares this
+    /// struct first, the cache planes and the rope table too).
+    pub(super) graphs: Vec<Option<Graph>>,
     pub(super) a: Arena,
     /// The captured passes' windows onto the slot, `m` tokens at `m − 1`.
     /// Declared before the slot, so they drop first (a window frees nothing
@@ -178,6 +180,12 @@ fn wide_steps(tokens: usize, ub: usize) -> Result<Vec<PrefillStep>, GpuError> {
 }
 
 impl Prefill {
+    /// No captured passes, one entry a pass size: the state a load and a new
+    /// sequence start from.
+    pub(super) fn no_passes() -> Vec<Option<Graph>> {
+        (0..MAX_TOKENS).map(|_| None).collect()
+    }
+
     /// The arena for [`MAX_TOKENS`] rows of `d`, an image for a prompt as
     /// long as the cache (`d.ctx` tokens), the slot and its windows, no pass
     /// captured. Load-time only.
@@ -193,7 +201,7 @@ impl Prefill {
                 .collect()
         };
         Ok(Prefill {
-            graphs: (0..MAX_TOKENS).map(|_| None).collect(),
+            graphs: Prefill::no_passes(),
             a: Arena::new(stream, d, MAX_TOKENS)?,
             slot_windows,
             slot,

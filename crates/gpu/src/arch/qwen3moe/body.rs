@@ -21,7 +21,7 @@ use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
 use crate::host::StepLeg;
 use crate::linear::LinearKernels;
-use crate::model::{ChainBody, GpuModel, Instrumented, Rollback, block_count};
+use crate::model::{ChainBody, GpuModel, Instrumented, Rollback, Slots, block_count};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
@@ -29,7 +29,7 @@ use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::KGemvKernels;
 use crate::tensor::window;
 use crate::weights::{DevWeight, Weights};
-use crate::{Gpu, GpuError};
+use crate::{Gpu, GpuError, Graph};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -171,6 +171,16 @@ pub struct Body {
 pub(super) struct TapRows {
     pub(super) buf: DeviceBuffer<f32>,
     pub(super) rows: Vec<ManuallyDrop<DeviceBuffer<f32>>>,
+}
+
+/// One qwen3moe sequence's own state ([`Slots`]): its per-layer K/V planes,
+/// and the prefill passes captured over them — a captured pass replays the
+/// recorded plane addresses, so the captures follow the planes. The captures
+/// are declared before the planes: a parked sequence drops them first, while
+/// the buffers they address are alive.
+pub struct Seq {
+    pass_graphs: Vec<Option<Graph>>,
+    kv: Vec<KvPlanes>,
 }
 
 /// `(what, want, got)` for every hyperparameter the kernels were built for
@@ -726,6 +736,50 @@ impl ChainBody for Body {
 
     fn host(&mut self) -> Option<&mut Placed> {
         self.placed.as_mut()
+    }
+}
+
+impl Slots for Body {
+    type Seq = Seq;
+
+    /// A sequence of the load's shape and cache format in the state the load
+    /// leaves: zeroed planes, no captured pass. Load-time allocation.
+    fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
+        const WHAT: &str = "qwen3moe::Body::new_seq";
+        let Some(first) = self.kv.first() else {
+            return Err(GpuError::state(
+                WHAT,
+                "a layer's planes (the chain has none)",
+            ));
+        };
+        // The load's one cache-format choice, read back from the live planes:
+        // the variant the load allocated is the variant a new one takes.
+        let kv = match first {
+            KvPlanes::F16 { .. } => KvQ8::F16,
+            KvPlanes::Q8 { .. } => KvQ8::Q8,
+        };
+        let stream = gpu.stream();
+        let dims = self.prefill.a.dims;
+        let planes = (0..self.kv.len())
+            .map(|_| KvPlanes::new(stream, &dims, kv))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Seq {
+            pass_graphs: Prefill::no_passes(),
+            kv: planes,
+        })
+    }
+
+    /// Exchange the live sequence's planes and captured passes with `seq`'s:
+    /// pointer moves, no device work.
+    fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
+        std::mem::swap(&mut self.kv, &mut seq.kv);
+        std::mem::swap(&mut self.prefill.graphs, &mut seq.pass_graphs);
+        Ok(())
+    }
+
+    /// Device bytes one sequence holds: its layers' K/V planes.
+    fn seq_bytes(&self) -> usize {
+        self.kv.iter().map(KvPlanes::bytes).sum()
     }
 }
 

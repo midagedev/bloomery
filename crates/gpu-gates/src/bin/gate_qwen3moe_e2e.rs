@@ -147,6 +147,21 @@
 //!   `cuDeviceTotalMem`'s figure) plans where the refusal is expected and
 //!   answers `Whole` where the placed decision is — every arm red.
 //!
+//! - (n) two resident slots (`add_slots`): prompts A and B — two distinct
+//!   windows of the prose, [`N_IDS`] ids each, the pass path — [`GEN_W`]
+//!   greedy steps a slot. Alone, the load's one sequence: each prompt's ids,
+//!   last logits and every layer's K/V rows hashed (FNV-1a 64). Together, a
+//!   second sequence resident: `resident_bytes` grows by exactly one
+//!   `seq_bytes`, the derived per-sequence KV bytes; the two slots stepped
+//!   token-interleaved leave each the bits its alone run left. A reset of
+//!   slot 1 between runs does not move slot 0: its next [`N_STEPS`] ids are
+//!   its alone run's continuation. A fault raised on one slot refuses the
+//!   other's steps naming the slot, and only the faulting slot's own reset
+//!   lifts it; the select refusals name themselves; and both slots hold
+//!   captures after the interleave, none after a `set_mode` round trip. The
+//!   last clause on the main model: the model it leaves is dropped, its
+//!   second sequence's planes with it.
+//!
 //! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
 //! `--rope-only` the load and (t), `--fault-only` the load and (x),
 //! `--taps-only` the load and (d).
@@ -207,7 +222,7 @@ mod gate {
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
-    use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel};
+    use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel, Slots};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -502,6 +517,7 @@ mod gate {
         ok &= greedy(m, dump.as_deref(), true)?;
         ok &= rope_table(m, CTX)?;
         ok &= fault_layer(m)?;
+        ok &= slots_two(m)?;
         drop(s);
         ok &= ubatch_sizes()?;
         ok &= placed(host)?;
@@ -2314,6 +2330,240 @@ mod gate {
              whole at {UBATCH}, bit for bit {}",
             verdict(ok)
         );
+        Ok(ok)
+    }
+
+    // ------------------------------------------- (n) two resident slots
+
+    /// The slot clause's prompt width: two distinct windows of the prose
+    /// this wide, every pass of each [`MAX_TOKENS`] tokens on the pass path.
+    const N_IDS: usize = 64;
+
+    /// The slot clause's prompt windows of the prose: A and B, distinct.
+    const N_A: usize = 64;
+    const N_B: usize = 700;
+
+    /// Interleaved steps a slot of (n): each slot replays its own captured
+    /// chain against its own planes while the other's state sits between
+    /// every pair of its steps.
+    const GEN_W: usize = 48;
+
+    /// The steps the reset-isolation arm of (n) runs on each slot.
+    const N_STEPS: usize = 8;
+
+    /// Prompt `ids` prefilled on the pass path — the model standing wherever
+    /// it stands, so the caller resets — then `steps` greedy steps; the ids
+    /// cover the prefill's argmax and every step's.
+    fn feed_and_step(
+        m: &mut Qwen3moeModel,
+        ids: &[u32],
+        steps: usize,
+    ) -> Result<Vec<u32>, GateError> {
+        let mut out = vec![m.prefill_with(ids, PrefillPath::Pass)?];
+        step_more(m, &mut out, steps)?;
+        Ok(out)
+    }
+
+    /// `steps` more greedy steps on the model as it stands, appended to
+    /// `out` (its last id the first step's input).
+    fn step_more(m: &mut Qwen3moeModel, out: &mut Vec<u32>, steps: usize) -> Result<(), GateError> {
+        for _ in 0..steps {
+            let last = *out.last().ok_or("no token")?;
+            out.push(m.step(&[last])?);
+        }
+        Ok(())
+    }
+
+    /// FNV-1a 64 of every layer's K/V rows below `end` — the (k) clause's
+    /// hash of the same readback.
+    fn kv_fnv(m: &mut Qwen3moeModel, end: usize) -> Result<u64, GateError> {
+        Ok(m.kv_rows(end)?
+            .iter()
+            .flatten()
+            .fold(Fnv1a64::default(), |h, v| h.bytes(&v.to_le_bytes()))
+            .value())
+    }
+
+    /// (n) (module doc): two resident slots, interleaved. The last clause on
+    /// the main model — the one it leaves is dropped, its second sequence's
+    /// planes with it.
+    fn slots_two(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        m.set_mode(StepMode::Graph);
+        let prose = prose(N_B + N_IDS)?;
+        let (a, b) = (&prose[N_A..N_A + N_IDS], &prose[N_B..N_B + N_IDS]);
+        // Alone, the load's one sequence: A runs GEN_W steps (what the
+        // interleave compares against) and then N_STEPS more (the
+        // continuation the isolation arm compares against); B runs GEN_W.
+        m.reset()?;
+        let mut a_alone = feed_and_step(m, a, GEN_W)?;
+        let a_logits = Fnv1a64::default().f32s(&m.logits()?).value();
+        let a_kv = kv_fnv(m, usize::try_from(m.pos())?)?;
+        step_more(m, &mut a_alone, N_STEPS)?;
+        let a_cont = a_alone[1 + GEN_W..].to_vec();
+        m.reset()?;
+        let b_alone = feed_and_step(m, b, GEN_W)?;
+        let b_logits = Fnv1a64::default().f32s(&m.logits()?).value();
+        let b_kv = kv_fnv(m, usize::try_from(m.pos())?)?;
+        // Together: a second sequence resident, its bytes counted against
+        // the one owner of the per-sequence KV term.
+        let before = m.resident_bytes();
+        m.add_slots(2)?;
+        let seq_bytes = m.body("slots")?.seq_bytes();
+        let grown = m.resident_bytes() - before;
+        let hp = m.body("slots")?.hparams().clone();
+        let derived = m.layers().len()
+            * CTX
+            * usize::try_from(runtime::stores::kv_row_bytes(hp.n_head_kv, hp.head_dim))?;
+        let bytes_ok = grown == seq_bytes && seq_bytes == derived;
+        println!(
+            "slots bytes: the second sequence grew resident_bytes by {grown}, seq_bytes \
+             {seq_bytes}, the derived {} layers x {CTX} rows x kv_row_bytes({}, {}) = {derived} {}",
+            m.layers().len(),
+            hp.n_head_kv,
+            hp.head_dim,
+            verdict(bytes_ok)
+        );
+        // The interleave: each slot prefilled from its own reset, then a
+        // step of slot 0 and a step of slot 1 a round. Each slot's last
+        // logits are hashed inside that round: the head is the model's one,
+        // so a step of the other slot's replaces what it holds.
+        m.select_slot(0)?;
+        m.reset()?;
+        let mut a_ids = vec![m.prefill_with(a, PrefillPath::Pass)?];
+        m.select_slot(1)?;
+        m.reset()?;
+        let mut b_ids = vec![m.prefill_with(b, PrefillPath::Pass)?];
+        let (mut a_last, mut b_last) = (0u64, 0u64);
+        for r in 0..GEN_W {
+            let last = r + 1 == GEN_W;
+            m.select_slot(0)?;
+            let t = *a_ids.last().ok_or("no token")?;
+            a_ids.push(m.step(&[t])?);
+            if last {
+                a_last = Fnv1a64::default().f32s(&m.logits()?).value();
+            }
+            m.select_slot(1)?;
+            let t = *b_ids.last().ok_or("no token")?;
+            b_ids.push(m.step(&[t])?);
+            if last {
+                b_last = Fnv1a64::default().f32s(&m.logits()?).value();
+            }
+        }
+        m.select_slot(0)?;
+        let a_got = (a_last, kv_fnv(m, usize::try_from(m.pos())?)?);
+        m.select_slot(1)?;
+        let b_got = (b_last, kv_fnv(m, usize::try_from(m.pos())?)?);
+        let off: Vec<&str> = [
+            ("slot 0 ids", a_ids == a_alone[..1 + GEN_W]),
+            ("slot 0 logits", a_got.0 == a_logits),
+            ("slot 0 kv", a_got.1 == a_kv),
+            ("slot 1 ids", b_ids == b_alone),
+            ("slot 1 logits", b_got.0 == b_logits),
+            ("slot 1 kv", b_got.1 == b_kv),
+        ]
+        .into_iter()
+        .filter_map(|(name, same)| (!same).then_some(name))
+        .collect();
+        let together_ok = off.is_empty();
+        println!(
+            "slots interleave: {} interleaved steps a slot against its alone run: {} {}",
+            GEN_W,
+            if together_ok {
+                "every slot's ids, logits and K/V rows bit for bit".to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(together_ok)
+        );
+        // Captures per slot: both hold their own after the interleave.
+        m.select_slot(0)?;
+        let cap0 = m.has_capture();
+        m.select_slot(1)?;
+        let cap1 = m.has_capture();
+        let caps = cap0 && cap1;
+        // Reset isolation: slot 1 rewinds and runs its prompt again; slot
+        // 0's next ids are its alone run's continuation.
+        m.select_slot(1)?;
+        m.reset()?;
+        feed_and_step(m, b, N_STEPS)?;
+        m.select_slot(0)?;
+        let mut a_tail = vec![*a_ids.last().ok_or("no token")?];
+        step_more(m, &mut a_tail, N_STEPS)?;
+        let iso_ok = a_tail[1..] == a_cont[..];
+        println!(
+            "slots reset isolation: slot 1 reset and re-prompted, slot 0's next {N_STEPS} ids {} \
+             its alone run's continuation {}",
+            if iso_ok { "equal" } else { "differ from" },
+            verdict(iso_ok)
+        );
+        // A fault on one slot: the other's steps refuse naming the slot, and
+        // only the faulting slot's reset lifts it ((x)'s plant).
+        m.select_slot(1)?;
+        m.reset()?;
+        let hidden = m.body("slots")?.hparams().n_embd;
+        let mut x = vec![0.25f32; hidden];
+        x[5] = f32::NAN;
+        m.step_ffn(FAULT_LAYER, &x)?;
+        let read = m.step(&[1]);
+        let poisoned = m.poisoned();
+        m.select_slot(0)?;
+        let named = match m.step(&[1]) {
+            Err(GpuError::Shape { detail, .. }) => detail.contains("slot 1"),
+            _ => false,
+        };
+        m.reset()?;
+        let stands = m.step(&[1]).is_err();
+        m.select_slot(1)?;
+        m.reset()?;
+        let clean = m.step(&[1]).is_ok();
+        m.reset()?;
+        let fault_ok = read.is_err() && poisoned.is_some() && named && stands && clean;
+        println!(
+            "slots fault: the faulting slot's step {}, slot 0's step refused naming slot 1 \
+             {named}, after slot 0's reset still refused {stands}, after slot 1's own reset a \
+             clean step {clean} {}",
+            match &read {
+                Ok(t) => format!("returned token {t}"),
+                Err(e) => format!("returned \"{e}\""),
+            },
+            verdict(fault_ok)
+        );
+        // The select refusals name themselves.
+        let sel_named = match m.select_slot(2) {
+            Err(GpuError::Shape {
+                what: "GpuModel::select_slot",
+                detail,
+            }) => detail.contains("serves 0..2"),
+            _ => false,
+        };
+        let add_named = match m.add_slots(1) {
+            Err(GpuError::Shape {
+                what: "GpuModel::add_slots",
+                detail,
+            }) => detail.contains("already serves 2"),
+            _ => false,
+        };
+        let refused_ok = sel_named && add_named;
+        println!(
+            "slots refusals: select 2 of two slots named {sel_named}, add_slots(1) after \
+             add_slots(2) named {add_named} {}",
+            verdict(refused_ok)
+        );
+        // A mode round trip leaves no capture on either slot.
+        m.set_mode(StepMode::Eager);
+        m.set_mode(StepMode::Graph);
+        m.select_slot(0)?;
+        let gone0 = !m.has_capture();
+        m.select_slot(1)?;
+        let gone1 = !m.has_capture();
+        let gone_ok = gone0 && gone1;
+        println!(
+            "slots captures: both slots held captures after the interleave {caps}; none after a \
+             set_mode round trip ({gone0}, {gone1}) {}",
+            verdict(caps && gone_ok)
+        );
+        let ok = bytes_ok && together_ok && caps && iso_ok && fault_ok && refused_ok && gone_ok;
+        println!("slots: {}", verdict(ok));
         Ok(ok)
     }
 

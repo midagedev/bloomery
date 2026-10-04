@@ -28,10 +28,14 @@
 pub(crate) mod kernels;
 pub(crate) mod lookup;
 pub(crate) mod probe;
+pub(crate) mod slots;
 
 pub use kernels::{Q8_0GemvHeadsArgs, StepKernels};
 pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
+pub use slots::Slots;
+
+use slots::ParkedSlot;
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
@@ -369,6 +373,15 @@ impl Graphs {
     }
 }
 
+/// The fault that poisons the model and the slot it was live on when the
+/// step read it back: what every later step refuses by, and what
+/// [`GpuModel::reset`] lifts on that slot alone.
+#[derive(Clone, Copy)]
+struct SlotFault {
+    slot: usize,
+    fault: Fault,
+}
+
 // ------------------------------------------------------------------ model
 
 /// Everything one card holds for a model, as the model's constructor hands it
@@ -430,13 +443,20 @@ pub struct LoadTimes {
 ///
 /// Fields drop in declaration order, after the drop has stopped the body's
 /// residency machine, and a graph must be destroyed while
-/// every buffer it addresses is still alive: the captured chains first, then
-/// the heads, the body (which drops its own captures first, and its host
-/// tier's lock over the host set before the mappings under it),
-/// the weights they all address, and the card last.
+/// every buffer it addresses is still alive: the captured chains first — the
+/// live slot's, then each parked slot's ([`ParkedSlot`]: its graph cache
+/// before its sequence) — then the heads, the body (which drops its own
+/// captures first, and its host tier's lock over the host set before the
+/// mappings under it), the weights they all address, and the card last.
 pub struct GpuModel<B: ChainBody> {
-    /// The captured chains, keyed by rows.
+    /// The captured chains, keyed by rows: the live slot's cache, exchanged
+    /// with the parked slots' on a [`GpuModel::select_slot`].
     graphs: Graphs,
+    /// The parked slots ([`GpuModel::add_slots`]), one entry a slot past the
+    /// first. Declared after `graphs` and before the heads, the body, the
+    /// weights and the card: a parked capture addresses those buffers (and
+    /// its own sequence's stores, which its entry drops after the capture).
+    parked: Vec<ParkedSlot<B>>,
     /// Row `r`'s output head: row 0's is the one-token step's, made at load
     /// when the load carries the head; rows 1 on are made by the first pass
     /// of [`Rows`] that needs them. Empty on a load without the head.
@@ -454,12 +474,17 @@ pub struct GpuModel<B: ChainBody> {
     /// KV rows the resident caches were sized for; `step` refuses to grow them.
     ctx_max: usize,
     mode: StepMode,
+    /// The slot every later call acts on ([`GpuModel::select_slot`]): 0
+    /// until a select moves it, and the live fields hold this slot's
+    /// position, captures and sequence.
+    selected: usize,
     /// The cache row the next `step` token lands in. Written only through
     /// [`GpuModel::stand_at`].
     pos: u32,
-    /// The fault a step read back (crate::fault): the caches and rings hold
-    /// what it condemned, so every later step refuses until `reset`.
-    poisoned: Option<Fault>,
+    /// The fault a step read back (crate::fault) and the slot it was live
+    /// on: the caches and rings hold what it condemned, so every later step
+    /// refuses until a `reset` on that slot.
+    poisoned: Option<SlotFault>,
     /// The load's phases, when its load timed them ([`LoadTimes`]); `None`
     /// on a load that timed none.
     load_times: Option<LoadTimes>,
@@ -492,6 +517,7 @@ impl<B: ChainBody> GpuModel<B> {
         } = r;
         GpuModel {
             graphs: Graphs::new(),
+            parked: Vec::new(),
             heads: head.into_iter().collect(),
             pass_heads: (0..MAX_PASS_ROWS).map(|_| None).collect(),
             one_pass: None,
@@ -500,6 +526,7 @@ impl<B: ChainBody> GpuModel<B> {
             gpu,
             ctx_max,
             mode: StepMode::Graph,
+            selected: 0,
             pos: 0,
             poisoned: None,
             load_times: None,
@@ -743,7 +770,8 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// Device bytes of everything this model holds resident: the weights and
     /// the body, plus the heads' scratch — a multi-row pass's heads once one
-    /// has run.
+    /// has run — and every parked slot's sequence
+    /// ([`GpuModel::add_slots`]).
     pub fn resident_bytes(&self) -> usize {
         self.weights.resident_bytes()
             + self.body.resident_bytes()
@@ -754,6 +782,7 @@ impl<B: ChainBody> GpuModel<B> {
                 .flatten()
                 .map(Head::resident_bytes)
                 .sum::<usize>()
+            + self.parked.iter().map(|p| p.bytes).sum::<usize>()
     }
 
     /// The cache row the next [`GpuModel::step`] token lands in.
@@ -783,20 +812,25 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// Choose how the chain submits. Changing the mode drops every captured
-    /// chain: a graph is a recording of this body over these buffers, and a
-    /// later `Graph` run recaptures rather than replay a stale one.
+    /// chain — the parked slots' with the live one's: a graph is a recording
+    /// of this body over these buffers, and a later `Graph` run recaptures
+    /// rather than replay a stale one.
     pub fn set_mode(&mut self, mode: StepMode) {
         if mode != self.mode {
-            self.graphs.clear();
+            self.drop_captures();
         }
         self.mode = mode;
     }
 
-    /// Drop every captured chain, the mode kept: for a body change that
-    /// moves what a capture recorded (the buffers its launches address), so
-    /// the next `Graph` run recaptures rather than replay a stale one.
+    /// Drop every captured chain, the mode kept — the parked slots' with the
+    /// live one's: for a body change that moves what a capture recorded (the
+    /// buffers its launches address), so the next `Graph` run recaptures
+    /// rather than replay a stale one.
     pub(crate) fn drop_captures(&mut self) {
         self.graphs.clear();
+        for p in &mut self.parked {
+            p.graphs.clear();
+        }
     }
 
     /// Whether any chain is captured.
@@ -809,17 +843,28 @@ impl<B: ChainBody> GpuModel<B> {
     /// the next prompt: a prompt after it gives the tokens and logits it
     /// gives in a fresh process right after the load, bit for bit. The
     /// weights, the arena and any captured chain stay (they do not depend on
-    /// the cache contents). It also lifts a fault; a caller that must not
-    /// continue past one checks [`GpuModel::poisoned`] first.
+    /// the cache contents). It rewinds the selected slot's sequence
+    /// ([`ChainBody::reset`] sees the live one alone); the parked slots keep
+    /// their positions and stores. It lifts a fault only when the selected
+    /// slot is the one that faulted — a reset of another slot rewinds it and
+    /// leaves the fault standing; a caller that must not continue past one
+    /// checks [`GpuModel::poisoned`] first.
     ///
     /// A residency machine's map stays where use has taken it
     /// ([`GpuModel::residency_reset`] is the explicit call).
     pub fn reset(&mut self) -> Result<(), GpuError> {
         // The body owns its row store, so it owns what "empty" means there.
         self.body.reset(&self.gpu)?;
-        // Empty caches hold nothing a fault condemned.
-        self.gpu.clear_fault()?;
-        self.poisoned = None;
+        // Empty caches hold nothing a fault condemned — on the slot whose
+        // fault it was ([`SlotFault`]).
+        if self
+            .poisoned
+            .as_ref()
+            .is_some_and(|p| p.slot == self.selected)
+        {
+            self.gpu.clear_fault()?;
+            self.poisoned = None;
+        }
         self.one_pass = None;
         self.stand_at(0);
         Ok(())
@@ -1048,11 +1093,25 @@ impl<B: ChainBody> GpuModel<B> {
         }
     }
 
-    /// A step on a poisoned model is refused, naming the fault.
+    /// A step on a poisoned model is refused, naming the fault — and, once
+    /// the model serves more than one slot, the slot it was live on.
     fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
-        match self.poisoned {
-            Some(fault) => Err(GpuError::Poisoned { what, fault }),
+        match &self.poisoned {
             None => Ok(()),
+            // The one-sequence refusal stays the load's own: no other slot
+            // exists for the fault to name.
+            Some(p) if self.parked.is_empty() => Err(GpuError::Poisoned {
+                what,
+                fault: p.fault,
+            }),
+            Some(p) => Err(GpuError::shape(
+                what,
+                format!(
+                    "slot {} is poisoned by an earlier device fault at {:#}; select that slot \
+                     and reset() to clear it",
+                    p.slot, p.fault
+                ),
+            )),
         }
     }
 
@@ -1075,7 +1134,10 @@ impl<B: ChainBody> GpuModel<B> {
         };
         if let GpuError::Fault { fault, .. } = &mut e {
             *fault = fault.in_arch(B::arch());
-            self.poisoned = Some(*fault);
+            self.poisoned = Some(SlotFault {
+                slot: self.selected,
+                fault: *fault,
+            });
         }
         Err(e)
     }
@@ -1106,10 +1168,12 @@ impl<B: ChainBody> GpuModel<B> {
         }
     }
 
-    /// The fault that poisons this model, if a step has read one back.
+    /// The fault that poisons this model, if a step has read one back. The
+    /// slot it was live on is the refusal's to name
+    /// ([`GpuModel::reset`] lifts the fault on that slot alone).
     #[must_use]
     pub fn poisoned(&self) -> Option<Fault> {
-        self.poisoned
+        self.poisoned.map(|p| p.fault)
     }
 
     /// The head's logits of the last `step` (`n_vocab` f32). Blocking read;
@@ -1623,13 +1687,14 @@ impl<B: Instrumented> GpuModel<B> {
 
 impl<B: Probed> GpuModel<B> {
     /// Arm (or disarm) the node-price probe. Like [`GpuModel::set_mode`] this
-    /// drops every captured chain, since the probe changes which launches the
+    /// drops every captured chain — the parked slots' with the live one's —
+    /// since the probe changes which launches the
     /// body issues. A probe with either lever set makes the chain a timing
     /// instrument: `skip_quant` leaves activation buffers unwritten, so the
     /// tokens that come out are not the model's answer.
     pub fn set_probe(&mut self, probe: StepProbe) -> Result<(), GpuError> {
         self.body.set_probe(probe)?;
-        self.graphs.clear();
+        self.drop_captures();
         Ok(())
     }
 }
