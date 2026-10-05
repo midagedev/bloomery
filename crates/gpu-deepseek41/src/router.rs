@@ -62,7 +62,10 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
+use std::ops::Range;
 use std::sync::Arc;
+
+use crate::span::{span, span_mut};
 
 /// Experts the router scores (this model's `expert_count`): the width of the
 /// selecting block's shared arrays, so a compile-time shape.
@@ -1109,6 +1112,44 @@ impl RouterKernels {
         weights: &mut DeviceBuffer<f32>,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
+        self.enqueue_router_rows_runs(
+            stream,
+            w,
+            x,
+            scale,
+            t,
+            &[(0..t, bias)],
+            probs,
+            ids,
+            weights,
+            fault,
+        )
+    }
+
+    /// [`RouterKernels::enqueue_router_rows`] with the tokens picking in
+    /// `runs`: consecutive runs of the `t` tokens from 0, each with the
+    /// selection bias its tokens pick with. One score launch over the `t`
+    /// tokens, then one pick launch a run over the run's tokens' scores, ids
+    /// and weights: what one pick over all `t` with each token's own bias
+    /// writes, since a pick block reads its own token's scores alone.
+    /// Asynchronous, allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "enqueue_router_rows's inputs with its bias as runs (rust-quality R8)"
+    )]
+    pub fn enqueue_router_rows_runs(
+        &self,
+        stream: &CudaStream,
+        w: &DeviceTensor<f32>,
+        x: &DeviceBuffer<f32>,
+        scale: f32,
+        t: usize,
+        runs: &[(Range<usize>, &DeviceBuffer<f32>)],
+        probs: &mut DeviceBuffer<f32>,
+        ids: &mut DeviceBuffer<u32>,
+        weights: &mut DeviceBuffer<f32>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
         let what = "enqueue_router_rows";
         let shape = |detail: String| GpuError::Shape { what, detail };
         let k = w.cols();
@@ -1120,18 +1161,33 @@ impl RouterKernels {
             )));
         }
         if x.len() < k * t
-            || bias.len() < N_EXPERT
             || probs.len() < N_EXPERT * t
             || ids.len() < N_USED * t
             || weights.len() < N_USED * t
         {
             return Err(shape(format!(
-                "{t} tokens of {k}: x {}, bias {}, probs {}, ids {}, weights {}",
+                "{t} tokens of {k}: x {}, probs {}, ids {}, weights {}",
                 x.len(),
-                bias.len(),
                 probs.len(),
                 ids.len(),
                 weights.len()
+            )));
+        }
+        let mut next = 0;
+        for (r, bias) in runs {
+            if r.start != next || r.is_empty() || bias.len() < N_EXPERT {
+                return Err(shape(format!(
+                    "a pick run {r:?} after token {next} with a bias of {}: runs are \
+                     consecutive, non-empty, from token 0, each bias {N_EXPERT} values",
+                    bias.len()
+                )));
+            }
+            next = r.end;
+        }
+        if next != t {
+            return Err(shape(format!(
+                "pick runs {:?} over {t} tokens: they end at the last",
+                runs.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>()
             )));
         }
         let (k, n_expert) = (
@@ -1147,12 +1203,20 @@ impl RouterKernels {
         ))?;
         self.module
             .ds41_router_scores(stream, &prep, w.buf(), x, n_expert, k, tt, &mut *probs)?;
-        let prep =
-            self.module
-                .prepare_ds41_router_pick(LaunchConfig1D::new(tt, ROUTER_THREADS_U32, 0))?;
-        self.module.ds41_router_pick(
-            stream, &prep, probs, bias, n_expert, tt, scale, ids, weights, fault,
-        )?;
+        for (r, bias) in runs {
+            let n = launch_u32(what, "run", r.len())?;
+            let p = span(what, probs, r.start * N_EXPERT, r.len() * N_EXPERT)?;
+            let mut i = span_mut(what, ids, r.start * N_USED, r.len() * N_USED)?;
+            let mut wt = span_mut(what, weights, r.start * N_USED, r.len() * N_USED)?;
+            let prep = self.module.prepare_ds41_router_pick(LaunchConfig1D::new(
+                n,
+                ROUTER_THREADS_U32,
+                0,
+            ))?;
+            self.module.ds41_router_pick(
+                stream, &prep, &p, bias, n_expert, n, scale, &mut i, &mut wt, fault,
+            )?;
+        }
         Ok(())
     }
 

@@ -25,6 +25,7 @@
 //! | | the layers' start and end; per layer the values of its ring, compressed rows, index keys, state values and state scores |
 //! | | the shadow's width; the ring's slots; the state rings (a count, then each ratio) |
 //! | | `shadow_from`; the holes, then the shadow's runs (each a count, then each start and end) |
+//! | | the history's media spans (each a count, then each start and end) |
 //! | values | the history: `n` ids (u32) |
 //! | | the slots' record: per ring slot, then per state ring and slot, the position it holds (u64, `u64::MAX` for none) |
 //! | | a pending ring restore (u8, 0 or 1) |
@@ -61,7 +62,7 @@ const STATE_TAG: [u8; 8] = *b"BLMV41SQ";
 
 /// The byte form's layout (the module table): raised whenever a part, its
 /// order or its encoding changes.
-const STATE_FORMAT: u32 = 1;
+const STATE_FORMAT: u32 = 2;
 
 /// Bytes of the byte form's write and read buffer.
 const CHUNK: usize = 1 << 16;
@@ -289,6 +290,12 @@ impl SeqSnapshot {
             shadow_from: self.shadow_from,
             holes: self.holes.clone(),
             runs: self.runs.clone(),
+            media: self
+                .history
+                .media()
+                .iter()
+                .map(|r| r.start as usize..r.end as usize)
+                .collect(),
         }
     }
 
@@ -316,8 +323,20 @@ impl SeqSnapshot {
 
     /// The values after header `h` (the module table), read from `r`.
     fn read(r: &mut Take<'_>, h: Header) -> Result<SeqSnapshot, StateFail> {
+        let ids = r.vals::<u32>(h.positions, "the history")?;
+        let media = h
+            .media
+            .iter()
+            .map(|r| {
+                u32::try_from(r.start)
+                    .and_then(|s| u32::try_from(r.end).map(|e| s..e))
+                    .map_err(|_| refused(format!("a media span {r:?} of positions that pass u32")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut history = History::default();
-        history.extend(&r.vals::<u32>(h.positions, "the history")?);
+        history
+            .set_media(&ids, &media)
+            .map_err(|e| refused(format!("{e}")))?;
         let held = |q: u64| -> Result<Option<usize>, StateFail> {
             if q == u64::MAX {
                 return Ok(None);
@@ -442,6 +461,8 @@ struct Header {
     shadow_from: usize,
     holes: Vec<Range<usize>>,
     runs: Vec<Range<usize>>,
+    /// The history's media spans, of the positions the history holds.
+    media: Vec<Range<usize>>,
 }
 
 impl Header {
@@ -468,7 +489,8 @@ impl Header {
         }
         w.count(self.shadow_from)?;
         w.runs(&self.holes)?;
-        w.runs(&self.runs)
+        w.runs(&self.runs)?;
+        w.runs(&self.media)
     }
 
     /// The header `r` starts with: refused by name when the stream ends
@@ -521,6 +543,7 @@ impl Header {
         let shadow_from = r.count("the shadow's start")?;
         let holes = r.runs("the holes")?;
         let runs = r.runs("the shadow's runs")?;
+        let media = r.runs("the history's media spans")?;
         Ok(Header {
             who,
             slots,
@@ -535,6 +558,7 @@ impl Header {
             shadow_from,
             holes,
             runs,
+            media,
         })
     }
 }
@@ -1087,6 +1111,7 @@ mod tests {
             },
             shadow_from: 0,
             runs: kept_runs(0, 40, &holes),
+            media: vec![4..12, 30..31],
             holes,
         }
     }

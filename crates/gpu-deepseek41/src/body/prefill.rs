@@ -110,6 +110,7 @@
 //! named by the lowest (layer, site) any of the group's batches raised,
 //! whatever error the group met after it.
 
+use std::fmt;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -129,6 +130,7 @@ use crate::chain::ffn::{BatchLayer, BlockIo, FfnBatch, JoinIo, STAGE_TIER};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
 use crate::hc::{HC_MAX_TOKENS, HC_MIX};
+use crate::router::N_EXPERT;
 use crate::span::{span, span_mut};
 use bloomery_gpu::Fault;
 use bloomery_gpu::fault::read_cards;
@@ -168,6 +170,80 @@ pub enum PrefillMode {
     Steps,
 }
 
+/// The kind of a media span's position, the reference's
+/// `image_token_types` (`IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END`):
+/// whether the span carries a learned delimiter row there or an aligner row.
+/// Every kind takes one engine rule — the given embedding row, the pick with
+/// `exp_probs_b_vl`, a DEAD engram hash — so the kinds are the caller's
+/// splice, checked once at the entry ([`prefill_media`]) and read by no
+/// launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKind {
+    /// `IMAGE_START`: the span's first position, the `image_start` row.
+    Start,
+    /// `IMAGE`: an aligner row, in reading order.
+    Image,
+    /// `IMAGE_NEWLINE`: a grid row's last position, the `image_newline` row.
+    NewLine,
+    /// `IMAGE_END`: the span's last position, the `image_end` row.
+    End,
+}
+
+/// One media span of a [`prefill_media`] call: its positions `at` in the
+/// call's ids, the bf16 row of each of them (`n_embd` values, the aligner's
+/// or a learned delimiter's, as the reference's merge casts them) and each
+/// position's kind. The engine reads the positions and the rows; the kinds
+/// are checked against the reference's splice shape.
+#[derive(Clone)]
+pub struct MediaSpan<'a> {
+    /// The span's positions in the call's ids, non-empty.
+    pub at: Range<usize>,
+    /// The span's rows, `at.len()` rows of `n_embd` bf16 values.
+    pub rows: &'a [u16],
+    /// The kind of each of the span's positions, `at.len()` of them.
+    pub kinds: &'a [MediaKind],
+}
+
+impl fmt::Debug for MediaSpan<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaSpan")
+            .field("at", &self.at)
+            .field("rows", &self.rows.len())
+            .field("kinds", &self.kinds.len())
+            .finish()
+    }
+}
+
+/// A call's media spans, checked ([`Body::check_media`]) and made absolute:
+/// the rows the batches stage and the dead ranges every plan of the call
+/// takes.
+pub(crate) struct CallMedia<'a> {
+    /// The file's `n_embd`, the width of a row.
+    n_embd: usize,
+    /// Per span: its absolute positions and its rows.
+    spans: Vec<(Range<u32>, &'a [u16])>,
+}
+
+impl CallMedia<'_> {
+    /// The spans' absolute position ranges, as the planner takes them: the
+    /// call's dead positions.
+    fn dead(&self) -> Vec<Range<u32>> {
+        self.spans.iter().map(|(at, _)| at.clone()).collect()
+    }
+
+    /// Whether position `p` carries a media row.
+    fn is_media(&self, p: u32) -> bool {
+        self.spans.iter().any(|(at, _)| at.contains(&p))
+    }
+
+    /// The row of position `p` (`n_embd` bf16 values); `None` off the spans.
+    fn row(&self, p: u32) -> Option<&[u16]> {
+        let (at, rows) = self.spans.iter().find(|(at, _)| at.contains(&p))?;
+        let i = (p - at.start) as usize;
+        rows.get(i * self.n_embd..(i + 1) * self.n_embd)
+    }
+}
+
 impl PrefillMode {
     /// The mode [`PrefillMode::name`] names; `None` for any other word.
     #[must_use]
@@ -200,11 +276,20 @@ pub fn prepare_prefill(m: &mut Deepseek41Model) -> Result<(), GpuError> {
     body.make_batch_once(gpu)
 }
 
+/// Make the prompt batch's media half ([`prepare_prefill`]'s buffers first,
+/// then [`MediaBatch`]): the one maker, a load-time call — a media call
+/// ([`prefill_media`]) on a body without it is refused by name. Text loads
+/// never call it, so their buffers and bytes are the text load's own.
+pub fn prepare_media(m: &mut Deepseek41Model) -> Result<(), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    body.make_media_once(gpu)
+}
+
 /// Feed `ids` from the model's position on as [`batches`] and return the
 /// greedy token after the last of them; the model stands `ids.len()`
 /// positions on. See the module comment.
 pub fn prefill(m: &mut Deepseek41Model, ids: &[u32]) -> Result<u32, GpuError> {
-    feed(m, ids, None, &mut |_, _| Ok(()))
+    feed(m, ids, None, &mut |_, _| Ok(()), None)
 }
 
 /// How many batches a call of `n` positions runs: `⌈n / T_MAX⌉`.
@@ -464,11 +549,20 @@ impl PromptCounts {
     }
 }
 
-/// Which sub-layer a [`BatchSeam`] follows.
+/// Which sub-layer a [`BatchSeam`] follows. A media call
+/// ([`prefill_media_observed`]) also shows the two seams a decode step has no
+/// counterpart of, which a text call's observer, pairing its seams with the
+/// steps', never sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatchSeamKind {
+    /// A batch's first steps, before the first layer: the streams and the
+    /// layer-0 fold the embedding broadcast wrote. Media calls only.
+    Front,
     Engram,
     Attn,
+    /// A MoE sub-layer's route of its block, before the shadow: its
+    /// [`BatchSeam::route`]. Media calls only.
+    Route,
     Ffn,
 }
 
@@ -489,6 +583,19 @@ pub struct BatchSeam<'a> {
     /// After an attention sub-layer: the piece's buffers as its last chunk
     /// left them.
     pub attn: Option<AttnTaps<'a>>,
+    /// At a route seam: the route's buffers.
+    pub route: Option<RouteTap<'a>>,
+}
+
+/// A layer-batch's route at its [`BatchSeamKind::Route`] seam, for a reader
+/// that runs the selection again on the host: the router's score of every
+/// expert for the block's tokens (`probs`, [`N_EXPERT`] a token from the
+/// block's first, the seam's `at`) and their [`N_USED`] ids (`ids`, from the
+/// batch's token 0). The route buffers every batch of a group shares: the
+/// next route rewrites them.
+pub struct RouteTap<'a> {
+    pub probs: &'a DeviceBuffer<f32>,
+    pub ids: &'a DeviceBuffer<u32>,
 }
 
 /// [`prefill_observed`]'s observer.
@@ -502,7 +609,54 @@ pub fn prefill_observed(
     ids: &[u32],
     observe: &mut BatchObserver<'_>,
 ) -> Result<u32, GpuError> {
-    feed(m, ids, None, observe)
+    feed(m, ids, None, observe, None)
+}
+
+/// Feed `ids` with `media` from the model's position on: the batched call of
+/// [`prefill`], where each span position takes its given bf16 row instead of
+/// `token_embd`'s, picks its experts with `exp_probs_b_vl` (its weights from
+/// the unbiased scores, as every token's), and takes zero engram rows — its
+/// hash DEAD, and the lookback of the positions after it padded from it on,
+/// the reference's blocked chain, which the history keeps for the steps
+/// after the call. A text position before the first span is what
+/// [`prefill`] gives it. Returns the greedy token after the last id.
+/// Refused by name: under the steps feed, while a route trace is attached, a
+/// span the call does not hold whole, a span of another shape, and on a body
+/// without the media buffers ([`prepare_media`]).
+pub fn prefill_media(
+    m: &mut Deepseek41Model,
+    ids: &[u32],
+    media: &[MediaSpan<'_>],
+) -> Result<u32, GpuError> {
+    feed_media(m, ids, media, None, &mut |_, _| Ok(()))
+}
+
+/// [`prefill_media`], showing `observe` each [`BatchSeam`] of every batch as
+/// its launches are enqueued, the media call's own front and route seams
+/// ([`BatchSeamKind::Front`], [`BatchSeamKind::Route`]) among them.
+pub fn prefill_media_observed(
+    m: &mut Deepseek41Model,
+    ids: &[u32],
+    media: &[MediaSpan<'_>],
+    observe: &mut BatchObserver<'_>,
+) -> Result<u32, GpuError> {
+    feed_media(m, ids, media, None, observe)
+}
+
+/// [`prefill_media`]'s entry: the call's media checked once, then [`feed`]
+/// with it. No spans is [`prefill`]'s numbers under a media call's seams.
+fn feed_media(
+    m: &mut Deepseek41Model,
+    ids: &[u32],
+    media: &[MediaSpan<'_>],
+    features: Option<FeatureRows<'_>>,
+    observe: &mut BatchObserver<'_>,
+) -> Result<u32, GpuError> {
+    let first = m.pos() as usize;
+    let call = m
+        .body_parts(WHAT)
+        .and_then(|(_, _, body)| body.check_media(first, ids, media))?;
+    feed(m, ids, features, observe, Some(&call))
 }
 
 /// Where [`prefill_with`] hands the feature rows: the first position they
@@ -526,7 +680,7 @@ pub fn prefill_with(
     ids: &[u32],
     features: Option<FeatureRows<'_>>,
 ) -> Result<u32, GpuError> {
-    feed(m, ids, features, &mut |_, _| Ok(()))
+    feed(m, ids, features, &mut |_, _| Ok(()), None)
 }
 
 fn feed(
@@ -534,6 +688,7 @@ fn feed(
     ids: &[u32],
     features: Option<FeatureRows<'_>>,
     observe: &mut BatchObserver<'_>,
+    media: Option<&CallMedia<'_>>,
 ) -> Result<u32, GpuError> {
     if ids.is_empty() {
         return Err(GpuError::Shape {
@@ -554,6 +709,12 @@ fn feed(
         let group = body.batch_mut()?.group;
         body.begin_call(first, end, &starts, window)?;
         body.stream_begin(gpu, ids.len())?;
+        // The call's spans join the history before its positions do, so
+        // every chunk plans them dead; a call taken back drops them with its
+        // positions (`History::truncate`).
+        if let Some(call) = media {
+            body.seq.history.extend_media(&call.dead());
+        }
         group
     };
     let mut token = None;
@@ -573,6 +734,7 @@ fn feed(
                         runs: rs,
                         batch: g.start,
                         last: e == end,
+                        media,
                     },
                     observe,
                 )
@@ -787,6 +949,35 @@ pub(super) struct Batch {
     counts: PromptCounts,
     /// The call's host streaming ([`Body::stream_begin`]).
     stream: StreamCall,
+    /// The media half, made at load by [`prepare_media`]; `None` on a
+    /// text-only load.
+    media: Option<MediaBatch>,
+}
+
+/// The prompt batch's media half, made once by [`prepare_media`]: per batch
+/// of a group a row of words per token ([`T_MAX`] rows) — a media token's
+/// bf16 row at its token's place, two values to a word with the low half
+/// first, as the embedding broadcast's bf16 entry reads them — on the card
+/// and on the host where a group packs them; and the selection bias
+/// `exp_probs_b_vl`, [`N_EXPERT`] f32 a layer, read by name from the file
+/// (the text plan leaves it there: its role is `Unread`).
+struct MediaBatch {
+    /// Words of one row: half the file's `n_embd`.
+    half: usize,
+    sets: Vec<MediaSet>,
+    bias_vl: DeviceBuffer<f32>,
+}
+
+/// One batch of a group's media rows, card and host.
+struct MediaSet {
+    rows: DeviceBuffer<u32>,
+    host: Vec<u32>,
+}
+
+impl MediaBatch {
+    fn device_bytes(&self) -> usize {
+        self.bias_vl.num_bytes() + self.sets.iter().map(|s| s.rows.num_bytes()).sum::<usize>()
+    }
 }
 
 /// A call's host streaming: whether this call streams, the group it is at,
@@ -932,6 +1123,7 @@ impl Batch {
             + self.ffn.device_bytes()
             + self.sets.iter().map(BatchSet::device_bytes).sum::<usize>()
             + self.staging.buf().num_bytes()
+            + self.media.as_ref().map_or(0, MediaBatch::device_bytes)
     }
 
     /// Of [`Batch::device_bytes`], what each batch past a group's first holds
@@ -952,18 +1144,20 @@ impl Batch {
 }
 
 /// One group of a prompt: its ids, its batches' positions, the index of its
-/// first batch in the call, and whether it holds the prompt's last position
-/// (the head's).
+/// first batch in the call, whether it holds the prompt's last position (the
+/// head's), and the call's media — `None` on a text call.
 struct GroupRun<'a> {
     ids: &'a [u32],
     runs: &'a [Range<usize>],
     batch: usize,
     last: bool,
+    media: Option<&'a CallMedia<'a>>,
 }
 
 /// A batch of a group as its layers run: its index in the call, its set of
-/// buffers, its chunks, its first position and tokens, and which half of its
-/// ping-pong pairs its next sub-layer reads.
+/// buffers, its chunks, its first position and tokens, which half of its
+/// ping-pong pairs its next sub-layer reads, and on a media call per token
+/// whether it is a media position (empty on a text call).
 struct Member {
     batch: usize,
     set: usize,
@@ -971,6 +1165,7 @@ struct Member {
     b: usize,
     u: usize,
     cur: Cursor,
+    media: Vec<bool>,
 }
 
 impl Member {
@@ -1207,6 +1402,193 @@ impl Body {
         self.complete_batch_taps(gpu)
     }
 
+    /// Make the batch's media half when it holds none ([`prepare_media`]):
+    /// the batch's own buffers first, then per batch of a group its rows of
+    /// media words, and every layer's `exp_probs_b_vl` read by name from the
+    /// file, refused by name when it is missing or not f32 of the expert
+    /// count. Load-time only.
+    fn make_media_once(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        const MAKE: &str = "deepseek41 prepare_media";
+        self.make_batch_once(gpu)?;
+        let sets = match self.batch.as_deref() {
+            Some(b) if b.media.is_some() => return Ok(()),
+            Some(b) => b.sets.len(),
+            None => {
+                return Err(GpuError::State {
+                    what: MAKE,
+                    missing: "the prompt batch's buffers (body::prepare_prefill)",
+                });
+            }
+        };
+        let n_expert = self.hp.experts.n_expert;
+        let mut bias = Vec::with_capacity(self.layers.len() * n_expert);
+        for l in self.layers.clone() {
+            let name = names::exp_probs_b_vl(l);
+            let (shard, info) = self.file.find(&name).ok_or_else(|| GpuError::Tensor {
+                what: MAKE,
+                name: name.clone(),
+                need: "in the file: a media call's router picks with it",
+            })?;
+            if n_expert != N_EXPERT
+                || info.ty != GgmlType::F32
+                || info.dims != [n_expert as u64]
+                || info.nbytes != 4 * n_expert as u64
+            {
+                return Err(GpuError::Shape {
+                    what: MAKE,
+                    detail: format!(
+                        "{name} is {} {:?} of {} bytes; the router picks from f32 [{N_EXPERT}]",
+                        info.ty, info.dims, info.nbytes
+                    ),
+                });
+            }
+            let bytes = self
+                .file
+                .shard(shard)
+                .ok_or_else(|| GpuError::Shape {
+                    what: MAKE,
+                    detail: format!("the file has no shard {shard}"),
+                })?
+                .data(info)?;
+            bias.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c)),
+            );
+        }
+        let half = self.hp.n_embd / 2;
+        let stream = gpu.stream();
+        let bias_vl = DeviceBuffer::from_host(stream, &bias)?;
+        let sets = (0..sets)
+            .map(|_| {
+                Ok(MediaSet {
+                    rows: DeviceBuffer::zeroed(stream, T_MAX * half)?,
+                    host: vec![0; T_MAX * half],
+                })
+            })
+            .collect::<Result<Vec<_>, GpuError>>()?;
+        let batch = self.batch_mut()?;
+        batch.media = Some(MediaBatch {
+            half,
+            sets,
+            bias_vl,
+        });
+        Ok(())
+    }
+
+    /// A media call's spans, checked and made absolute for a call whose first
+    /// position is `first`: the feed is the batched call with no route trace
+    /// attached, the batch's media half is made, each span lies whole inside
+    /// the call's ids with a row and a kind per position and the reference's
+    /// splice shape — a Start, then Image and NewLine, an End — and the spans
+    /// are ascending and disjoint. A span the call's end cuts is refused
+    /// here: a span's rows come with its call or not at all.
+    fn check_media<'a>(
+        &self,
+        first: usize,
+        ids: &[u32],
+        media: &[MediaSpan<'a>],
+    ) -> Result<CallMedia<'a>, GpuError> {
+        const MEDIA: &str = "deepseek41 prefill_media";
+        if self.levers.prefill != PrefillMode::Batch {
+            return Err(GpuError::Shape {
+                what: MEDIA,
+                detail: format!(
+                    "media in a prompt under BLOOMERY_PREFILL={}: a media span's rows have no \
+                     step path; use BLOOMERY_PREFILL=batch",
+                    self.levers.prefill.name()
+                ),
+            });
+        }
+        if self.hybrid.route_traced() {
+            return Err(GpuError::Shape {
+                what: MEDIA,
+                detail: "a media prompt call while a route trace is attached: the trace records \
+                         the step feed (BLOOMERY_PREFILL=steps)"
+                    .to_string(),
+            });
+        }
+        let made = self.batch.as_deref().is_some_and(|b| b.media.is_some());
+        if !made {
+            return Err(GpuError::State {
+                what: MEDIA,
+                missing: "the prompt batch's media buffers, made at load (body::prepare_media)",
+            });
+        }
+        let n_embd = self.hp.n_embd;
+        let mut spans = Vec::with_capacity(media.len());
+        for span in media {
+            let at = span.at.clone();
+            let rows = span.rows.len() / n_embd;
+            if at.is_empty()
+                || at.end > ids.len()
+                || span.rows.len() != at.len() * n_embd
+                || span.kinds.len() != at.len()
+            {
+                return Err(GpuError::Shape {
+                    what: MEDIA,
+                    detail: format!(
+                        "a media span of {} positions at {:?} of a prompt of {} ids, {} rows of \
+                         {n_embd} and {} kinds: the call holds a span whole or not at all",
+                        at.len(),
+                        at,
+                        ids.len(),
+                        rows,
+                        span.kinds.len()
+                    ),
+                });
+            }
+            match (span.kinds.first(), span.kinds.last()) {
+                (Some(&MediaKind::Start), Some(&MediaKind::End)) => {}
+                got => {
+                    return Err(GpuError::Shape {
+                        what: MEDIA,
+                        detail: format!(
+                            "a media span whose ends are {:?}, want a Start and an End",
+                            got
+                        ),
+                    });
+                }
+            }
+            if let Some(bad) = span.kinds[1..span.kinds.len() - 1]
+                .iter()
+                .find(|k| !matches!(k, MediaKind::Image | MediaKind::NewLine))
+            {
+                return Err(GpuError::Shape {
+                    what: MEDIA,
+                    detail: format!(
+                        "a media span whose inside carries {:?}, want Image and NewLine rows",
+                        bad
+                    ),
+                });
+            }
+            spans.push((
+                u32::try_from(first + at.start).map_err(|_| GpuError::Shape {
+                    what: MEDIA,
+                    detail: format!("a media position {} passes u32", first + at.start),
+                })?..u32::try_from(first + at.end).map_err(|_| {
+                    GpuError::Shape {
+                        what: MEDIA,
+                        detail: format!("a media position {} passes u32", first + at.end),
+                    }
+                })?,
+                span.rows,
+            ));
+        }
+        if media.windows(2).any(|p| p[0].at.end > p[1].at.start) {
+            return Err(GpuError::Shape {
+                what: MEDIA,
+                detail: format!(
+                    "the media spans {:?}: ascending, each inside the prompt, disjoint",
+                    media.iter().map(|s| s.at.clone()).collect::<Vec<_>>()
+                ),
+            });
+        }
+        Ok(CallMedia { n_embd, spans })
+    }
+
     /// Give every batch set of the held buffers that has no feature rows the
     /// tap's ([`BatchSet::tap_rows`]), and the host rows their width: a
     /// tiered load makes the buffers before a draft can attach its tap
@@ -1333,6 +1715,7 @@ impl Body {
             card_served: vec![false; self.layers.len() * sets],
             counts: PromptCounts::default(),
             stream: StreamCall::default(),
+            media: None,
             image,
             attn,
             proj,
@@ -1615,6 +1998,7 @@ impl Body {
             runs,
             batch,
             last,
+            media,
         } = run;
         self.admit(WHAT, Entry::Group)?;
         let stream = gpu.stream();
@@ -1671,10 +2055,15 @@ impl Body {
                 b: r.start,
                 u: r.len(),
                 cur: Cursor::default(),
+                media: media.map_or_else(Vec::new, |call| {
+                    (r.start..r.end)
+                        .map(|p| u32::try_from(p).is_ok_and(|p| call.is_media(p)))
+                        .collect()
+                }),
             })
             .collect();
         let t0 = Instant::now();
-        self.plan_group(stream, ids, &members)?;
+        self.plan_group(stream, ids, &members, media)?;
         let prologue = nanos(t0.elapsed());
         for p in b..end {
             self.seq.holds.wrote(p);
@@ -1777,18 +2166,22 @@ impl Body {
     }
 
     /// The group's host half: each batch's chunks planned in order, each
-    /// after the tokens before it (the ids joining the history), each
-    /// batch's rows read and its chunks' images built into its own place,
-    /// then every batch's images copied to the card in one transfer and its
-    /// rope tables in another, each of which synchronizes the stream. The
-    /// call's first group records the call's hole once the history holds
-    /// the group's positions: a hole always starts below the history's
-    /// length, so taking the call back to its first position drops it.
+    /// after the tokens before it (the ids joining the history) and with the
+    /// history's media positions dead, each batch's rows read and its chunks'
+    /// images built into its own place, then every batch's images copied to
+    /// the card in one transfer and its rope tables in another, each of which
+    /// synchronizes the stream. On a media call each batch's media rows are
+    /// packed at their tokens' places and copied to the card in one transfer
+    /// a batch that holds any. The call's first group records the call's
+    /// hole once the history holds the group's positions: a hole always
+    /// starts below the history's length, so taking the call back to its
+    /// first position drops it.
     fn plan_group(
         &mut self,
         stream: &CudaStream,
         ids: &[u32],
         members: &[Member],
+        media: Option<&CallMedia<'_>>,
     ) -> Result<(), GpuError> {
         let Body {
             batch,
@@ -1810,11 +2203,14 @@ impl Body {
             for (plan, r) in batch.plans.iter_mut().zip(&m.cuts) {
                 let toks = &ids[r.start - first..r.end - first];
                 planner
-                    .plan_into(toks, r.start as u32, history.ids(), plan)
+                    .plan_dead_into(toks, r.start as u32, history.ids(), history.media(), plan)
                     .map_err(|e| GpuError::plan(WHAT, e))?;
                 history.extend(toks);
             }
-            batch.rows.fill(file, &batch.plans[..n])?;
+            batch.rows.fill_media(file, &batch.plans[..n], &m.media)?;
+            if let Some(call) = media {
+                stage_media(stream, batch.media.as_mut(), m, call)?;
+            }
             for (k, r) in m.cuts.iter().enumerate() {
                 let at = r.start - m.b..r.end - m.b;
                 batch.image.build(
@@ -1909,7 +2305,7 @@ impl Body {
             tally: Tally::new(first, members.len(), layers.clone()),
         };
         for m in members.iter_mut() {
-            cx.front(m)?;
+            cx.front(m, observe)?;
         }
         let g = members.len();
         let items: Vec<(usize, usize)> = (0..layers.len())
@@ -2033,8 +2429,9 @@ impl<'a> GroupCx<'a> {
 
     /// A batch's first steps, before its first layer: its chunks' words
     /// gathered into its rows, the embedding broadcast into its streams and
-    /// fold.
-    fn front(&mut self, m: &mut Member) -> Result<(), GpuError> {
+    /// fold — a media token's row from the batch's media rows. Shows
+    /// `observe` a media call's front seam.
+    fn front(&mut self, m: &mut Member, observe: &mut BatchObserver<'_>) -> Result<(), GpuError> {
         let (gpu, n) = (self.gpu, self.n);
         let batch = &mut *self.batch;
         let words = batch.image.layout().words();
@@ -2047,6 +2444,22 @@ impl<'a> GroupCx<'a> {
             self.tally.front(m.set, 1)?;
         }
         let own = set_of(&mut batch.sets, m.set)?;
+        let rows = match (m.media.is_empty(), batch.media.as_ref()) {
+            (true, _) => None,
+            (false, Some(media)) => {
+                let set = media.sets.get(m.set).ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the media rows of each batch of a group",
+                })?;
+                Some((&set.rows, media.half))
+            }
+            (false, None) => {
+                return Err(GpuError::State {
+                    what: WHAT,
+                    missing: "the prompt batch's media buffers, made at load (body::prepare_media)",
+                });
+            }
+        };
         for (k, r) in m.cuts.iter().enumerate() {
             let (at, len) = (r.start - m.b, r.len());
             let p = span(WHAT, &batch.params, (row0 + k) * words, words)?;
@@ -2054,20 +2467,41 @@ impl<'a> GroupCx<'a> {
             let [f0, _] = &mut own.folds;
             let mut s = span_mut(WHAT, h0, at * s4, len * s4)?;
             let mut f = span_mut(WHAT, f0, at * n, len * n)?;
+            let chunk = rows
+                .map(|(rows, half)| span(WHAT, rows, at * half, len * half))
+                .transpose()?;
+            let media = chunk.as_deref().map(|rows| (&m.media[at..at + len], rows));
             self.glue
-                .enqueue_batch_embed(gpu, &batch.glue, &p, len, &mut s, &mut f)?;
+                .enqueue_batch_embed(gpu, &batch.glue, &p, len, media, &mut s, &mut f)?;
             // The embedding broadcast: a launch a token.
             self.tally.front(m.set, len as u64)?;
         }
         m.cur = Cursor::default();
+        if !m.media.is_empty() {
+            observe(
+                gpu,
+                BatchSeam {
+                    kind: BatchSeamKind::Front,
+                    layer: self.layers.start,
+                    first: m.b as u32,
+                    at: 0,
+                    tokens: m.u,
+                    streams: &own.hc[0],
+                    fold: Some(&own.folds[0]),
+                    attn: None,
+                    route: None,
+                },
+            )?;
+        }
         Ok(())
     }
 
     /// Layer index `i` of the batch `m` up to its route: the engram step
     /// where the layer carries a site, the attention sub-layer, and where the
-    /// layer runs a block of the batch, the MoE sub-layer's route of it and
-    /// its copies to the host. Shows `observe` the engram's and the
-    /// attention's seams.
+    /// layer runs a block of the batch, the MoE sub-layer's route of it —
+    /// its media tokens picking with the layer's `exp_probs_b_vl` on a media
+    /// call — and its copies to the host. Shows `observe` the engram's and
+    /// the attention's seams, and a media call's route seam.
     fn route(
         &mut self,
         m: &mut Member,
@@ -2141,6 +2575,7 @@ impl<'a> GroupCx<'a> {
                 streams: &own.hc[m.cur.s],
                 fold: Some(&own.folds[m.cur.f]),
                 attn: Some(batch.attn.batch_taps(&batch.proj)),
+                route: None,
             },
         )?;
         if full == m.cuts.len() {
@@ -2168,12 +2603,36 @@ impl<'a> GroupCx<'a> {
             fold_in: &own.folds[m.cur.f],
         };
         let bl = self.ffn.resolve_batch(w, l)?;
-        self.ffn
-            .enqueue_batch_route(gpu, &bl, &mut batch.ffn, &block, self.slots)?;
-        // Each chunk's norm, the router's two launches over the block, the
+        // Scoped so the bias window into the batch's media half ends with
+        // the route: the timing mark below borrows the body again.
+        let picks = {
+            let vl = match (m.media.is_empty(), batch.media.as_ref()) {
+                (true, _) => None,
+                (false, Some(media)) => Some((
+                    span(WHAT, &media.bias_vl, i * N_EXPERT, N_EXPERT)?,
+                    &m.media[..],
+                )),
+                (false, None) => {
+                    return Err(GpuError::State {
+                        what: WHAT,
+                        missing: "the prompt batch's media buffers, made at load (body::prepare_media)",
+                    });
+                }
+            };
+            self.ffn.enqueue_batch_route(
+                gpu,
+                &bl,
+                &mut batch.ffn,
+                &block,
+                self.slots,
+                vl.as_ref().map(|(bias, media)| (&**bias, *media)),
+            )?
+        };
+        // Each chunk's norm, the router's score launch over the block and
+        // its picks — one, or on a media call one a run of one kind — the
         // places.
         self.tally
-            .route(i, m.set, (m.cuts.len() - full) as u64 + 3)?;
+            .route(i, m.set, (m.cuts.len() - full) as u64 + 2 + picks as u64)?;
         if tiered {
             let map = self.tier.map(TierPiece::places).ok_or(GpuError::State {
                 what: WHAT,
@@ -2183,6 +2642,23 @@ impl<'a> GroupCx<'a> {
                 .enqueue_batch_tier_places(gpu, &bl, &mut batch.ffn, &block, map)?;
             // The slots' tier places.
             self.tally.route(i, m.set, 1)?;
+        }
+        if !m.media.is_empty() {
+            let (probs, ids) = batch.ffn.route_rows();
+            observe(
+                gpu,
+                BatchSeam {
+                    kind: BatchSeamKind::Route,
+                    layer: l,
+                    first: (b + at) as u32,
+                    at,
+                    tokens: u - at,
+                    streams: &own.hc[m.cur.s],
+                    fold: Some(&own.folds[m.cur.f]),
+                    attn: None,
+                    route: Some(RouteTap { probs, ids }),
+                },
+            )?;
         }
         batch
             .ffn
@@ -2263,6 +2739,7 @@ impl<'a> GroupCx<'a> {
                 streams: &own.hc[m.cur.s],
                 fold: Some(&own.folds[m.cur.f]),
                 attn: None,
+                route: None,
             },
         )
     }
@@ -2489,6 +2966,7 @@ impl<'a> GroupCx<'a> {
                 streams: &own.hc[m.cur.s],
                 fold: step.folds.then_some(&own.folds[m.cur.f]),
                 attn: None,
+                route: None,
             },
         )?;
         // The tap of the kept rows: every one of them is in the block.
@@ -2513,6 +2991,54 @@ impl<'a> GroupCx<'a> {
         }
         Ok(())
     }
+}
+
+/// The media rows of the group's batch `m` of a media call `call` into its
+/// set of `media`, the batch's media half: each media token's row packed at
+/// its token's place on the host, two bf16 to a word with the low half
+/// first, then the rows from the batch's first media token to its last
+/// copied to the card in one transfer (which synchronizes the stream).
+/// Nothing for a batch with no media token.
+fn stage_media(
+    stream: &CudaStream,
+    media: Option<&mut MediaBatch>,
+    m: &Member,
+    call: &CallMedia<'_>,
+) -> Result<(), GpuError> {
+    let (Some(lo), Some(hi)) = (
+        m.media.iter().position(|&f| f),
+        m.media.iter().rposition(|&f| f),
+    ) else {
+        return Ok(());
+    };
+    let media = media.ok_or(GpuError::State {
+        what: WHAT,
+        missing: "the prompt batch's media buffers, made at load (body::prepare_media)",
+    })?;
+    let half = media.half;
+    let set = media.sets.get_mut(m.set).ok_or_else(|| GpuError::Shape {
+        what: WHAT,
+        detail: format!("media rows of batch {} of a group", m.set),
+    })?;
+    for t in (lo..=hi).filter(|&t| m.media[t]) {
+        let p = m.b + t;
+        let row = u32::try_from(p)
+            .ok()
+            .and_then(|p| call.row(p))
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!("position {p} is a media position with no row"),
+            })?;
+        for (w, pair) in set.host[t * half..(t + 1) * half]
+            .iter_mut()
+            .zip(row.as_chunks::<2>().0)
+        {
+            *w = u32::from(pair[0]) | (u32::from(pair[1]) << 16);
+        }
+    }
+    let mut dst = span_mut(WHAT, &mut set.rows, lo * half, (hi + 1 - lo) * half)?;
+    dst.copy_from_host(stream, &set.host[lo * half..(hi + 1) * half])?;
+    Ok(())
 }
 
 /// The error of a group from position `b` that failed with `e` after its

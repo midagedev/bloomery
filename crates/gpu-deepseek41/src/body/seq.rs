@@ -46,12 +46,17 @@ use super::{Body, Holds, LayerKv, PAIR_ROWS, Shadows, layer_kv};
 /// The tokens a sequence holds, one per position: what each step's engram
 /// n-grams read back from (`Planner::plan_into`'s `before`), cut, cleared and
 /// saved with the sequence. The one owner of the sequence's per-position
-/// record: vision's engram mask (the image positions whose engram step is
-/// off) joins it here as a second per-position field, cut and cleared with
-/// the ids.
+/// record: the media positions — the spans of a vision prompt, whose engram
+/// hash is DEAD and whose lookback the blocked chain pads
+/// ([`Planner::plan_dead_into`]) — join it here as a second per-position
+/// field, cut and cleared with the ids.
 #[derive(Clone, Debug, Default, Hash)]
 pub(super) struct History {
     ids: Vec<u32>,
+    /// The media positions, ascending disjoint ranges. Positions are `u32`,
+    /// the plan's own type, so a decode step hands them to
+    /// [`Planner::plan_dead_into`] as they are.
+    media: Vec<Range<u32>>,
 }
 
 impl History {
@@ -59,12 +64,18 @@ impl History {
     fn with_capacity(positions: usize) -> History {
         History {
             ids: Vec::with_capacity(positions),
+            media: Vec::new(),
         }
     }
 
     /// The tokens, in position order.
     pub(super) fn ids(&self) -> &[u32] {
         &self.ids
+    }
+
+    /// The media positions, as [`Planner::plan_dead_into`]'s `dead`.
+    pub(super) fn media(&self) -> &[Range<u32>] {
+        &self.media
     }
 
     pub(super) fn len(&self) -> usize {
@@ -85,20 +96,51 @@ impl History {
         self.ids.extend_from_slice(ids);
     }
 
-    /// The positions from `n` on taken back.
+    /// A prompt call's media spans, absolute and past every range held: the
+    /// call adds them before its ids, so each of its chunks plans them dead.
+    pub(super) fn extend_media(&mut self, media: &[Range<u32>]) {
+        self.media.extend_from_slice(media);
+    }
+
+    /// The positions from `n` on taken back, and every media range that does
+    /// not end by `n` — [`Body::rollback`] refuses a cut inside one first, so
+    /// such a range lies wholly past the cut.
     pub(super) fn truncate(&mut self, n: usize) {
         self.ids.truncate(n);
+        if let Ok(n) = u32::try_from(n) {
+            self.media.retain(|r| r.end <= n);
+        }
     }
 
     /// No position.
     pub(super) fn clear(&mut self) {
         self.ids.clear();
+        self.media.clear();
     }
 
-    /// Exactly `ids`, from position 0.
-    pub(super) fn set(&mut self, ids: &[u32]) {
+    /// Exactly `ids` from position 0, and the media positions `media`,
+    /// refused by name unless each range is non-empty, inside the ids, and
+    /// the ranges ascend disjoint.
+    pub(super) fn set_media(&mut self, ids: &[u32], media: &[Range<u32>]) -> Result<(), GpuError> {
+        let len = u32::try_from(ids.len()).map_err(|_| GpuError::Shape {
+            what: "deepseek41 Body::set_history",
+            detail: format!("{} tokens pass u32", ids.len()),
+        })?;
+        let outside = |r: &Range<u32>| r.start >= r.end || r.end > len;
+        if media.iter().any(outside) || media.windows(2).any(|p| p[0].end > p[1].start) {
+            return Err(GpuError::Shape {
+                what: "deepseek41 Body::set_history",
+                detail: format!(
+                    "the media positions {media:?} of a history of {len} tokens: each range \
+                     inside it, non-empty, ascending and disjoint"
+                ),
+            });
+        }
         self.ids.clear();
         self.ids.extend_from_slice(ids);
+        self.media.clear();
+        self.media.extend_from_slice(media);
+        Ok(())
     }
 }
 

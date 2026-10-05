@@ -30,6 +30,8 @@
 //! Every model value comes from the file, and a missing key is an error, never a literal.
 //! [`MASK_TOKEN_PAD`] and [`KV_PAD`] are the port's mask layout, not model values.
 
+use std::ops::Range;
+
 use gguf::Split;
 
 use super::hparams::{Hparams, LayerKind};
@@ -183,6 +185,26 @@ impl Planner {
         before: &[u32],
         out: &mut StepPlan,
     ) -> Result<(), PlanError> {
+        self.plan_dead_into(tokens, pos0, before, &[], out)
+    }
+
+    /// [`Planner::plan_into`] with `dead`: the sequence's media positions, as
+    /// ascending disjoint ranges of absolute positions (a vision span's
+    /// positions, before or inside the step), whose engram hash is DEAD. A
+    /// dead position's own n-gram is all pad, and the lookback of a position
+    /// after a dead position pads from the first dead position it reaches
+    /// back to — every shift beyond is pad too, whatever it holds: the
+    /// reference's `blocked` chain (`engram.py:173`), where a dead source
+    /// blocks as the sequence's start does. `&[]` is [`Planner::plan_into`].
+    /// Malformed ranges (empty, unsorted, overlapping) are refused.
+    pub fn plan_dead_into(
+        &self,
+        tokens: &[u32],
+        pos0: u32,
+        before: &[u32],
+        dead: &[Range<u32>],
+        out: &mut StepPlan,
+    ) -> Result<(), PlanError> {
         let refuse = |detail: String| PlanError::Step {
             pos0,
             tokens: tokens.len(),
@@ -190,6 +212,11 @@ impl Planner {
         };
         if tokens.is_empty() {
             return Err(refuse("a step runs at least one token".to_string()));
+        }
+        if dead.iter().any(|r| r.start >= r.end) || dead.windows(2).any(|p| p[0].end > p[1].start) {
+            return Err(refuse(format!(
+                "its dead positions {dead:?}: each range non-empty, ascending and disjoint"
+            )));
         }
         let last = u32::try_from(tokens.len() - 1)
             .ok()
@@ -211,9 +238,15 @@ impl Planner {
             out.pos.push(p);
             out.raw_write.push(p);
             out.raw_first.push(p.saturating_sub(self.window - 1));
+            // The blocked chain: the sequence's start and a dead position
+            // each pad their shift and every shift past it.
+            let mut blocked = false;
             for back in 0..self.ngram {
-                out.engram_window
-                    .push(token_at(p, back, pos0, tokens, tail));
+                // `token_at` gives `Some` only where `back <= p`.
+                let entry = token_at(p, back, pos0, tokens, tail)
+                    .filter(|_| !blocked && !is_dead(dead, p - back as u32));
+                blocked |= entry.is_none();
+                out.engram_window.push(entry);
             }
         }
         out.raw_n_kv = padded(last as usize + 1);
@@ -277,6 +310,13 @@ fn padded(n: usize) -> usize {
     n.div_ceil(KV_PAD).max(1) * KV_PAD
 }
 
+/// Whether position `q` lies in `dead` (ascending, disjoint position ranges,
+/// as [`Planner::plan_dead_into`] validated them).
+fn is_dead(dead: &[Range<u32>], q: u32) -> bool {
+    let i = dead.partition_point(|r| r.start <= q);
+    i > 0 && q < dead[i - 1].end
+}
+
 /// The token `back` positions before position `p` of a step that runs `tokens` from `pos0`,
 /// `tail` ending at `pos0 − 1`; `None` before the sequence starts. `plan_into` gives `tail`
 /// the `min(ngram − 1, pos0)` tokens a `back` below `ngram` can reach.
@@ -309,8 +349,9 @@ pub struct StepPlan {
     pub out_ids: Vec<u32>,
     /// Per token, the engram n-gram ending at it, newest first: `[i * ngram + back]` is the
     /// token `back` positions before token `i` (`back` 0 is token `i` itself), `None` before
-    /// the sequence starts. The engram row ids are hashed from these (the engram crate's
-    /// `Hash::rows_into`, after its token map).
+    /// the sequence starts or where the reference's blocked chain pads — at and behind a
+    /// media position ([`Planner::plan_dead_into`]). The engram row ids are hashed from
+    /// these (the engram crate's `Hash::rows_into`, after its token map).
     pub engram_window: Vec<Option<u32>>,
 }
 
@@ -838,6 +879,164 @@ mod tests {
             pl.plan_into(&[1], 2, &[7, 8], &mut plan).is_ok(),
             "the whole, shorter history"
         );
+    }
+
+    /// The reference's hash window, ported line for line (`engram.py:166-175`): the cache holds
+    /// each position's token or DEAD at a dead position, and shift `k` of position `p` reads
+    /// `cache[max(p − k, 0)]`, blocked from the first shift past the sequence's start or onto
+    /// a DEAD source on; a blocked shift is the pad (`None` here).
+    fn reference_window(seq: &[u32], dead: &[Range<u32>], p: u32) -> Vec<Option<u32>> {
+        const DEAD: Option<u32> = None;
+        let cache: Vec<Option<u32>> = (0u32..)
+            .zip(seq)
+            .map(|(q, &t)| {
+                if dead.iter().any(|r| r.contains(&q)) {
+                    DEAD
+                } else {
+                    Some(t)
+                }
+            })
+            .collect();
+        let mut blocked = false;
+        (0..NGRAM)
+            .map(|shift| {
+                let source = cache[(p as usize).saturating_sub(shift)];
+                blocked = blocked || (p as usize) < shift || source == DEAD;
+                if blocked { None } else { source }
+            })
+            .collect()
+    }
+
+    /// A media span's engram window, the reference's `blocked` chain: a dead position's own
+    /// n-gram is all pad, and the lookback of a position after it pads from the first dead
+    /// position it reaches back to, every shift past it too, whatever that holds. Hand-derived
+    /// rows first — a span mid-way (`10 .. 14`), one at the sequence's start (`0 .. 2`) and
+    /// spans shorter than the lookback (`20 .. 21`, `30 .. 32`), where a chain that stopped at
+    /// the dead shift would read the text before the span — then every position of several
+    /// span sets against [`reference_window`], planned one position a step and as one step
+    /// over them all (dead positions inside the step, as a prompt call plans them).
+    #[test]
+    fn media_spans_block_the_engram_window() {
+        let pl = planner(4096);
+        let seq = sequence(64);
+        let s = |q: u32| Some(seq[q as usize]);
+        type Row = (u32, [Option<u32>; NGRAM]);
+        // Under `10 .. 14`: positions 0 to 3 pad behind the sequence's start, 4 and 9 see a
+        // full window, the span's positions are all pad, and 14 to 17 pad from the back
+        // that reaches 13.
+        let mid: &[Row] = &[
+            (0, [s(0), None, None, None]),
+            (1, [s(1), s(0), None, None]),
+            (2, [s(2), s(1), s(0), None]),
+            (3, [s(3), s(2), s(1), s(0)]),
+            (4, [s(4), s(3), s(2), s(1)]),
+            (9, [s(9), s(8), s(7), s(6)]),
+            (10, [None, None, None, None]),
+            (11, [None, None, None, None]),
+            (12, [None, None, None, None]),
+            (13, [None, None, None, None]),
+            (14, [s(14), None, None, None]),
+            (15, [s(15), s(14), None, None]),
+            (16, [s(16), s(15), s(14), None]),
+            (17, [s(17), s(16), s(15), s(14)]),
+        ];
+        // Under `0 .. 2`: the span's positions pad, the positions after it pad from the back
+        // that reaches 1.
+        let start: &[Row] = &[
+            (0, [None, None, None, None]),
+            (1, [None, None, None, None]),
+            (2, [s(2), None, None, None]),
+            (3, [s(3), s(2), None, None]),
+            (4, [s(4), s(3), s(2), None]),
+            (5, [s(5), s(4), s(3), s(2)]),
+        ];
+        // Under `20 .. 21` and `30 .. 32`: position 22's third back is the dead 20, and its
+        // fourth, the text 19, pads too; 33's third back is the dead 31.
+        let short: &[Row] = &[
+            (21, [s(21), None, None, None]),
+            (22, [s(22), s(21), None, None]),
+            (23, [s(23), s(22), s(21), None]),
+            (24, [s(24), s(23), s(22), s(21)]),
+            (32, [s(32), None, None, None]),
+            (33, [s(33), s(32), None, None]),
+            (34, [s(34), s(33), s(32), None]),
+        ];
+        let mut plan = StepPlan::default();
+        // One span each (`once`, so the lint that reads a lone `a..b`
+        // literal as the range it contains stays quiet) and a two-span set.
+        let mid_dead = std::iter::once(10u32..14).collect::<Vec<_>>();
+        let start_dead = std::iter::once(0u32..2).collect::<Vec<_>>();
+        let short_dead: Vec<Range<u32>> = vec![20..21, 30..32];
+        let sets: [(&[Range<u32>], &[Row]); 3] =
+            [(&mid_dead, mid), (&start_dead, start), (&short_dead, short)];
+        for (dead, table) in sets {
+            for &(p, want) in table {
+                pl.plan_dead_into(
+                    &seq[p as usize..p as usize + 1],
+                    p,
+                    &seq[..p as usize],
+                    dead,
+                    &mut plan,
+                )
+                .expect("a step inside the context");
+                assert_eq!(
+                    plan.engram_window, want,
+                    "the n-gram of position {p} under {dead:?}"
+                );
+            }
+        }
+        let sweep: [&[Range<u32>]; 5] = [
+            &mid_dead,
+            &start_dead,
+            &short_dead,
+            &[5..6, 7..9, 9..12],
+            &[0..1, 40..48],
+        ];
+        let n = 48u32;
+        for dead in sweep {
+            let want: Vec<Option<u32>> = (0..n)
+                .flat_map(|p| reference_window(&seq, dead, p))
+                .collect();
+            let mut steps = Vec::with_capacity(want.len());
+            for p in 0..n {
+                pl.plan_dead_into(
+                    &seq[p as usize..p as usize + 1],
+                    p,
+                    &seq[..p as usize],
+                    dead,
+                    &mut plan,
+                )
+                .expect("a step inside the context");
+                steps.extend_from_slice(&plan.engram_window);
+            }
+            assert_eq!(steps, want, "one position a step under {dead:?}");
+            pl.plan_dead_into(&seq[..n as usize], 0, &[], dead, &mut plan)
+                .expect("one step over every position");
+            assert_eq!(plan.engram_window, want, "one step under {dead:?}");
+        }
+        // Text-only steps: no dead ranges is [`Planner::plan_into`] exactly.
+        let (mut a, mut b) = (StepPlan::default(), StepPlan::default());
+        for (pos0, n) in [(0usize, 5), (9, 4), (13, 3)] {
+            let (tokens, before) = (&seq[pos0..pos0 + n], &seq[..pos0]);
+            pl.plan_into(tokens, pos0 as u32, before, &mut a)
+                .expect("a text step");
+            pl.plan_dead_into(tokens, pos0 as u32, before, &[], &mut b)
+                .expect("the same step, no dead positions");
+            assert_eq!(a, b, "a text step of {n} at {pos0}");
+        }
+        // Malformed dead ranges are refused, not guessed: an empty range, an unsorted pair and
+        // an overlapping pair.
+        for bad in [
+            vec![10u32..14, 14..14],
+            vec![12u32..14, 0..4],
+            vec![0u32..4, 3..6],
+        ] {
+            assert!(
+                pl.plan_dead_into(&seq[20..21], 20, &seq[..20], &bad, &mut plan)
+                    .is_err(),
+                "the dead ranges {bad:?}"
+            );
+        }
     }
 
     /// The mask values are the engine's own f16 roundings of 0 and −∞.

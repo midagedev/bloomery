@@ -234,6 +234,10 @@ name = "gate_ds41_serve"
 required-features = ["deepseek41"]
 
 [[bin]]
+name = "gate_ds41_media"
+required-features = ["deepseek41"]
+
+[[bin]]
 name = "gate_dspark_experts"
 required-features = ["deepseek41"]
 

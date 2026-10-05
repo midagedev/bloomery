@@ -115,9 +115,10 @@ mod slots;
 mod snap;
 pub use ced::{CedLayer, CedState, LayerNeed, Need, exact};
 pub use prefill::{
-    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, PrefillMode,
-    PrefillStats, PromptCounts, T_MAX, batch_count, batches, prefill, prefill_observed,
-    prefill_with, prepare_prefill,
+    BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, MediaKind, MediaSpan,
+    PrefillMode, PrefillStats, PromptCounts, RouteTap, T_MAX, batch_count, batches, prefill,
+    prefill_media, prefill_media_observed, prefill_observed, prefill_with, prepare_media,
+    prepare_prefill,
 };
 use seq::RowSeqs;
 pub use seq::{KeepLimit, Seq};
@@ -1114,8 +1115,21 @@ impl Body {
     /// state they leave into the buffers itself ([`Body::state_mut`]): the
     /// next [`ChainBody::decode_input`] runs at position `history.len()`. The
     /// ring shadow holds none of those positions, so no cut reaches a ring
-    /// row below them.
+    /// row below them. The history carries no media positions; one whose
+    /// state a vision prompt left takes [`Body::set_history_media`].
     pub fn set_history(&mut self, history: &[u32]) -> Result<(), GpuError> {
+        self.set_history_media(history, &[])
+    }
+
+    /// [`Body::set_history`] with the history's media positions `media`
+    /// (ranges of positions of `history`, ascending and disjoint, refused by
+    /// name otherwise): the spans of the vision prompts the state holds,
+    /// whose positions the steps after it read as dead.
+    pub fn set_history_media(
+        &mut self,
+        history: &[u32],
+        media: &[Range<u32>],
+    ) -> Result<(), GpuError> {
         if history.len() >= self.positions() {
             return Err(GpuError::Shape {
                 what: "deepseek41 Body::set_history",
@@ -1126,13 +1140,22 @@ impl Body {
                 ),
             });
         }
-        self.seq.history.set(history);
+        self.seq.history.set_media(history, media)?;
         self.seq.holds.known(history.len());
         self.seq.shadow_from = history.len();
         self.seq.holes.clear();
         self.need = None;
         self.seq.restore = false;
         Ok(())
+    }
+
+    /// The last decode step's engram n-grams ([`StepPlan::engram_window`],
+    /// `ngram` entries a token, newest first): what its rows were hashed
+    /// from, `None` where the reference's blocked chain pads — before the
+    /// sequence's start, and from a media position back.
+    #[must_use]
+    pub fn step_window(&self) -> &[Option<u32>] {
+        &self.plan.engram_window
     }
 
     /// Whether a prompt call runs the CED triangle ([`prefill`]), and why
@@ -1143,10 +1166,18 @@ impl Body {
     }
 
     /// How a binary feeds this body a prompt: the `BLOOMERY_PREFILL` it was
-    /// loaded with.
+    /// loaded with, or the last [`Body::set_prefill_mode`].
     #[must_use]
     pub fn prefill_mode(&self) -> PrefillMode {
         self.levers.prefill
+    }
+
+    /// Feed the next prompts as `mode` says, so one load runs both feeds (a
+    /// gate holds the steps feed's refusals beside the batched calls). The
+    /// batched feed still needs the batch's buffers ([`prepare_prefill`]),
+    /// refused by name at the call without them.
+    pub fn set_prefill_mode(&mut self, mode: PrefillMode) {
+        self.levers.prefill = mode;
     }
 
     /// The last prompt call's needs: which positions each layer ran.
@@ -1401,6 +1432,26 @@ impl Body {
     /// nothing else on the device is touched.
     pub fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
         let (to, len) = (pos as usize, self.seq.history.len());
+        // A cut inside a media span would keep part of an image: refused
+        // where it falls, not moved — the caller cuts at the span's start or
+        // end. Named before the keep rule, which would answer with the
+        // prompt call's hole and hide it.
+        if let Some(span) = self
+            .seq
+            .history
+            .media()
+            .iter()
+            .find(|r| r.start < pos && pos < r.end)
+        {
+            return Err(GpuError::Shape {
+                what: "deepseek41 Body::rollback",
+                detail: format!(
+                    "back to position {pos}, inside the media span {span:?}: a cut keeps a \
+                     span whole or drops it; cut to {} or {}",
+                    span.start, span.end
+                ),
+            });
+        }
         let kept = self.keep_point(to);
         if to > len || kept != to {
             return Err(GpuError::Shape {
@@ -1418,8 +1469,11 @@ impl Body {
             h.end = h.end.min(to);
             h.start < h.end
         });
+        // Also at `to == len`: a prompt call's media spans join the history
+        // before its positions, and a call taken back before any of them
+        // landed drops its spans here.
+        self.seq.history.truncate(to);
         if to < len {
-            self.seq.history.truncate(to);
             self.seq.shadow_from = self.seq.shadow_from.min(to);
             self.seq.restore = self.seq.holds.stale(to).next().is_some();
         }
@@ -1558,7 +1612,7 @@ impl Body {
             });
         }
         planner
-            .plan_into(&[token], pos, seq.history.ids(), plan)
+            .plan_dead_into(&[token], pos, seq.history.ids(), seq.history.media(), plan)
             .map_err(|e| GpuError::plan(what, e))?;
         rows.begin(file, plan)?;
         // The rows section is written again by the arrival; what it holds
