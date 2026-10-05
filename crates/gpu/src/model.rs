@@ -129,12 +129,13 @@ pub trait ChainBody: Sized {
 
 /// A body whose chain holds host work: a host tier computes part of the
 /// captured step, and a replay of the chain is served on the calling thread
-/// right after its launch ([`GpuModel::step`], [`GpuModel::step_rows`]).
+/// right after its launch ([`GpuModel::step`], [`GpuModel::step_rows`],
+/// [`GpuModel::step_slots`]).
 pub trait HostServed {
     /// Serve the host's share of the chain `chain` a graph replay just
     /// submitted, in chain order, before anything else waits on the stream:
     /// [`Chain::Step`] for the one-token step, [`Rows::CHAIN`] for a
-    /// multi-row pass.
+    /// multi-row pass, [`SlotRows::chain_of`] for a pass of several slots.
     fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError>;
 
     /// The refusal that failed the step's host service, once
@@ -163,13 +164,14 @@ pub trait HostServed {
     /// boundary runs after the last launched pass's host service has
     /// returned, so every host word the engine stream's enqueued work waits
     /// on is written, and after that pass's kept rows
-    /// ([`HostServed::keep_rows`]). The callers: `GpuModel::replay`, and
-    /// through [`GpuModel::pass_boundary`] an eager step or pass
-    /// (`GpuModel::run_tokens`, `GpuModel::run_pass`) and a prompt call,
-    /// whose caller makes one before it and none inside it — all at
-    /// `Launch`; and `GpuModel::run_tokens` at `Ahead`, after each step's
-    /// kept row and before its readback, the one pass whose kept rows are
-    /// known before its readback.
+    /// ([`HostServed::keep_rows`]). The callers: `launch_served` (every
+    /// replay), and through [`GpuModel::pass_boundary`] an eager step or
+    /// pass (`GpuModel::run_tokens`, `GpuModel::run_pass`, a pass of
+    /// several slots) and a prompt call, whose caller makes one before it
+    /// and none inside it — all at `Launch`; and at `Ahead` the passes whose
+    /// kept rows are known before their readback, after those kept rows:
+    /// each step of `GpuModel::run_tokens` and a pass of several slots
+    /// ([`GpuModel::step_slots`]).
     fn at_boundary(&mut self, stream: &CudaStream, at: BoundaryAt) -> Result<(), GpuError> {
         let _ = (stream, at);
         Ok(())
@@ -962,8 +964,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// position's refresh and chain, its kept row and then the next pass's
     /// residency boundary made ahead ([`HostServed::at_boundary`] at
     /// [`BoundaryAt::Ahead`]: its host time runs under the rest of the
-    /// step, the head's read included), then the head's readback. This is
-    /// the one place a boundary runs ahead of its pass. An error here can
+    /// step, the head's read included), then the head's readback. This and
+    /// a pass of several slots ([`GpuModel::step_slots`]) are where a
+    /// boundary runs ahead of its pass. An error here can
     /// follow launches, so the caller passes it through
     /// [`GpuModel::note_fault`]; a boundary that fails leaves the model at
     /// the step's position, as a refused kept row does.
@@ -993,10 +996,7 @@ impl<B: ChainBody> GpuModel<B> {
     }
 
     /// Launch the captured chain of `rows` rows and serve the host's share
-    /// of the replay, as `chain`, when the body has a host service: the only
-    /// place a captured chain is replayed. The host service's residency
-    /// boundary runs first, once the chain is known to exist
-    /// ([`HostServed::at_boundary`] at [`BoundaryAt::Launch`]).
+    /// of the replay as `chain` ([`launch_served`]).
     fn replay(&mut self, rows: usize, chain: Chain) -> Result<(), GpuError> {
         let GpuModel {
             graphs,
@@ -1008,14 +1008,7 @@ impl<B: ChainBody> GpuModel<B> {
         let graph = graphs
             .get(rows)
             .ok_or(GpuError::state("GpuModel::replay", "no captured chain"))?;
-        if let Some(host) = body.host() {
-            host.at_boundary(gpu.stream(), BoundaryAt::Launch { reads: *reads })?;
-        }
-        graph.launch(gpu.stream())?;
-        match body.host() {
-            Some(host) => host.serve_captured(chain),
-            None => Ok(()),
-        }
+        launch_served(graph, body.as_mut(), gpu, *reads, chain)
     }
 
     /// The residency boundary before a pass the caller enqueues itself (a
@@ -1070,13 +1063,25 @@ impl<B: ChainBody> GpuModel<B> {
     /// refusal and the step's error beside its own. Any other result passes
     /// through.
     pub(crate) fn name_host_refusal(&mut self, r: Result<(), GpuError>) -> Result<(), GpuError> {
+        self.name_host_refusal_by(r, |_| {})
+    }
+
+    /// [`GpuModel::name_host_refusal`] with the refusal's detail rewritten
+    /// by `name` first: what a pass whose rows are not one sequence's
+    /// positions adds to say whose row it was.
+    fn name_host_refusal_by(
+        &mut self,
+        r: Result<(), GpuError>,
+        name: impl FnOnce(&mut Refusal),
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "GpuModel::name_host_refusal";
         let Err(e) = r else {
             return Ok(());
         };
-        let Some(refusal) = self.body.host().and_then(HostServed::take_host_refusal) else {
+        let Some(mut refusal) = self.body.host().and_then(HostServed::take_host_refusal) else {
             return Err(e);
         };
+        name(&mut refusal);
         match self.gpu.fault() {
             Ok(word) => Err(name_refusal(&refusal, word)),
             Err(s) => Err(GpuError::shape(
@@ -1384,6 +1389,30 @@ impl<B: ChainBody> GpuModel<B> {
         let token = self.note_fault(what, token)?;
         self.stand_at(pos + n);
         Ok(token)
+    }
+}
+
+/// Launch `graph`, a capture of `body`'s, on the engine stream and serve the
+/// host's share of the replay, as `chain`, when the body has a host service:
+/// the only place a captured chain or pass is replayed (`GpuModel::replay`,
+/// a pass of several slots). The host service's residency boundary runs
+/// first, stamped with `reads` ([`HostServed::at_boundary`] at
+/// [`BoundaryAt::Launch`]): the caller has looked `graph` up, so the
+/// boundary runs once the chain is known to exist.
+fn launch_served<B: ChainBody>(
+    graph: &Graph,
+    body: &mut B,
+    gpu: &Gpu,
+    reads: u64,
+    chain: Chain,
+) -> Result<(), GpuError> {
+    if let Some(host) = body.host() {
+        host.at_boundary(gpu.stream(), BoundaryAt::Launch { reads })?;
+    }
+    graph.launch(gpu.stream())?;
+    match body.host() {
+        Some(host) => host.serve_captured(chain),
+        None => Ok(()),
     }
 }
 

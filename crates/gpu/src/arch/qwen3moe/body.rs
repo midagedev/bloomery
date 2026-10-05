@@ -792,6 +792,16 @@ impl Slots for Body {
 }
 
 impl SlotRows for Body {
+    /// The pass runs on the prompt arena and its input record holds this
+    /// many rows ([`SlotIn`]).
+    const MAX_ROWS: usize = crate::model::MAX_PASS_ROWS;
+
+    /// Never read: a whole-card load serves no host work, and a placed load
+    /// refuses the pass in [`SlotRows::plan_slots`].
+    fn chain_of(_rows: &[SlotRange]) -> crate::hybrid::Chain {
+        crate::hybrid::Chain::Step
+    }
+
     /// Each busy slot's input record, in one copy ([`SlotIn`]). A placed
     /// load is refused by name.
     fn plan_slots(
