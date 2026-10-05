@@ -23,6 +23,13 @@
 //! mock's states, and [`MockEngine::with_prompt_quantum`] lets the server
 //! interleave its prompts with the other slots' decode rounds.
 //!
+//! [`MockEngine::with_media`] takes images: [`MediaTokenizer`]'s vocabulary
+//! (one more special, [`IMAGE_SPECIAL`] as [`IMAGE_ID`]), [`MockMedia`]'s
+//! placeholder and span (one position a pixel), and a log of every
+//! [`Engine::prefill_media`] call ([`MediaCall`]). A span's positions enter the
+//! context as letters its image's key picks, so what follows a span depends on
+//! the image in it; an image token without its image is the server's error.
+//!
 //! [`DraftMock`] is the same engine behind a draft of one id: each pass
 //! verifies a proposal after `last`, the mock's own next token on two passes of
 //! three and another id on the third, and keeps what the target agrees with.
@@ -44,10 +51,13 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use vision::{GridPlan, MediaModel, Patches, Prepared, Rgb8, VisionError};
+
 use crate::engine::{
     Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, ResidencyReset, Sampler,
     SavedState, StateError, Tokenizer,
 };
+use crate::media::{MediaFeed, MediaSpan, SharedMediaModel};
 use crate::slotfile;
 
 /// Special strings, in id order. Longest-match wins on encode.
@@ -80,7 +90,7 @@ pub struct MockEngine {
     parked: Vec<Vec<u32>>,
     cur: usize,
     ctx_max: usize,
-    tok: Arc<MockTokenizer>,
+    tok: Arc<dyn Tokenizer>,
     nexts: usize,
     fail_at: Option<usize>,
     /// Counts [`Engine::residency_reset`] calls when the mock has a
@@ -92,6 +102,9 @@ pub struct MockEngine {
     /// [`Engine::prompt_quantum`]: `None`, prompts never interleave, unless
     /// [`MockEngine::with_prompt_quantum`].
     prompt_quantum: Option<NonZeroUsize>,
+    /// The log of its image calls, when it takes images
+    /// ([`MockEngine::with_media`]).
+    media: Option<Arc<Mutex<Vec<MediaCall>>>>,
 }
 
 impl MockEngine {
@@ -109,6 +122,7 @@ impl MockEngine {
             resets: None,
             cache_ram: 0,
             prompt_quantum: None,
+            media: None,
         }
     }
 
@@ -172,6 +186,19 @@ impl MockEngine {
             prompt_quantum: NonZeroUsize::new(quantum),
             ..self
         }
+    }
+
+    /// The same mock taking images (see the module header), and the log of
+    /// its [`Engine::prefill_media`] calls.
+    #[must_use]
+    pub fn with_media(self) -> (Self, Arc<Mutex<Vec<MediaCall>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mock = MockEngine {
+            tok: Arc::new(MediaTokenizer),
+            media: Some(Arc::clone(&log)),
+            ..self
+        };
+        (mock, log)
     }
 
     fn push(&mut self, id: u32) -> Result<(), EngineError> {
@@ -257,8 +284,61 @@ impl Engine for MockEngine {
         self.tok.clone()
     }
 
+    fn media_model(&self) -> Option<SharedMediaModel> {
+        self.media.as_ref().map(|_| {
+            let model: SharedMediaModel = Arc::new(MockMedia);
+            model
+        })
+    }
+
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        if self.media.is_some()
+            && let Some(at) = ids.iter().position(|&id| id == IMAGE_ID)
+        {
+            return Err(EngineError(format!(
+                "mock: the image token at {at} of a prefill of {} ids came without its image",
+                ids.len()
+            )));
+        }
         ids.iter().try_for_each(|&id| self.push(id))
+    }
+
+    /// Each feed's span must lie whole inside `ids`, after the one before it,
+    /// every position the image token; the call is logged, and each span's
+    /// positions enter the context as its key's letters.
+    fn prefill_media(&mut self, ids: &[u32], media: &[MediaFeed]) -> Result<(), EngineError> {
+        let Some(log) = self.media.as_ref().map(Arc::clone) else {
+            return Err(EngineError(
+                "mock: this mock takes no image input".to_owned(),
+            ));
+        };
+        let mut fed = ids.to_vec();
+        let mut free = 0;
+        for f in media {
+            let s = f.span();
+            if s.len == 0
+                || s.at < free
+                || s.end() > ids.len()
+                || ids[s.at..s.end()].iter().any(|&id| id != IMAGE_ID)
+            {
+                return Err(EngineError(format!(
+                    "mock: the image span {}..{} of a call of {} ids is empty, overlaps the one \
+                     before, passes the call or holds other than the image token",
+                    s.at,
+                    s.end(),
+                    ids.len()
+                )));
+            }
+            for (j, id) in fed[s.at..s.end()].iter_mut().enumerate() {
+                *id = N_SPECIAL + u32::from(b'a' + f.key.0[j % 32] % 26);
+            }
+            free = s.end();
+        }
+        log.lock().expect("the mock's media log").push(MediaCall {
+            ids: ids.to_vec(),
+            spans: media.iter().map(MediaFeed::span).collect(),
+        });
+        fed.iter().try_for_each(|&id| self.push(id))
     }
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
@@ -405,12 +485,126 @@ impl Engine for MockEngine {
                     self.ctx_max
                 ))
             })?;
-        self.ctx = slotfile::read_ids(input, n, MockTokenizer.n_vocab())?;
+        self.ctx = slotfile::read_ids(input, n, self.tok.n_vocab())?;
         Ok(SavedState {
             n_tokens: n,
             n_bytes: MOCK_STATE_HEAD + 4 * n as u64,
         })
     }
+}
+
+/// The media mock's placeholder text: one more special of [`MediaTokenizer`].
+pub const IMAGE_SPECIAL: &str = "<｜image｜>";
+
+/// The id [`IMAGE_SPECIAL`] encodes to, the one past [`MockTokenizer`]'s.
+pub const IMAGE_ID: u32 = N_SPECIAL + 256;
+
+/// [`MockTokenizer`]'s vocabulary and [`IMAGE_SPECIAL`] as [`IMAGE_ID`]: the
+/// media mock's placeholder is one id, as a real model's is.
+pub struct MediaTokenizer;
+
+impl Tokenizer for MediaTokenizer {
+    /// No special contains the placeholder or overlaps it, so the text
+    /// between placeholders encodes as [`MockTokenizer`] encodes it.
+    fn encode(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::with_capacity(text.len());
+        for (i, piece) in text.split(IMAGE_SPECIAL).enumerate() {
+            if i > 0 {
+                out.push(IMAGE_ID);
+            }
+            out.extend(MockTokenizer.encode(piece));
+        }
+        out
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        let pieces: Vec<String> = ids
+            .split(|&id| id == IMAGE_ID)
+            .map(|run| MockTokenizer.decode(run))
+            .collect();
+        pieces.join(IMAGE_SPECIAL)
+    }
+
+    fn decoder(&self) -> Box<dyn Decoder> {
+        Box::new(MediaDecoder(MockTokenizer.decoder()))
+    }
+
+    fn bos(&self) -> u32 {
+        MockTokenizer.bos()
+    }
+
+    fn eos(&self) -> u32 {
+        MockTokenizer.eos()
+    }
+
+    fn add_bos(&self) -> bool {
+        MockTokenizer.add_bos()
+    }
+
+    fn n_vocab(&self) -> usize {
+        MockTokenizer.n_vocab() + 1
+    }
+}
+
+/// [`MockTokenizer`]'s streaming decoder, [`IMAGE_ID`] its placeholder text
+/// after the bytes held before it.
+struct MediaDecoder(Box<dyn Decoder>);
+
+impl Decoder for MediaDecoder {
+    fn push(&mut self, id: u32) -> Option<String> {
+        if id != IMAGE_ID {
+            return self.0.push(id);
+        }
+        let mut text = self.0.flush();
+        text.push_str(IMAGE_SPECIAL);
+        Some(text)
+    }
+
+    fn flush(&mut self) -> String {
+        self.0.flush()
+    }
+}
+
+/// The media mock's model: [`IMAGE_SPECIAL`] as [`IMAGE_ID`], parts joined by
+/// the default separator, and one span position a pixel, so two images of one
+/// size take spans of one length and differ only in their keys.
+pub struct MockMedia;
+
+impl MediaModel for MockMedia {
+    fn image_placeholder(&self) -> &str {
+        IMAGE_SPECIAL
+    }
+
+    fn image_token(&self) -> u32 {
+        IMAGE_ID
+    }
+
+    fn prepare(&self, image: &Rgb8) -> Result<Prepared, VisionError> {
+        let plan = GridPlan {
+            n_llm_h: image.height,
+            n_llm_w: image.width,
+            best_h: image.height,
+            best_w: image.width,
+        };
+        Ok(Prepared {
+            span_len: image.width * image.height,
+            patches: Patches {
+                plan,
+                n_vit_h: 0,
+                n_vit_w: 0,
+                patch_len: 0,
+                bf16: Vec::new(),
+            },
+        })
+    }
+}
+
+/// One [`Engine::prefill_media`] call of the media mock: the ids it was handed
+/// and its images' spans, at the call's own positions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaCall {
+    pub ids: Vec<u32>,
+    pub spans: Vec<MediaSpan>,
 }
 
 /// [`MockEngine`] with a draft of one id a pass (see the module header). Its

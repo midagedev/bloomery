@@ -51,7 +51,8 @@ use crate::engine::{
     CacheNote, Decoder, Drafted, Engine, EngineError, Sampler, SamplerFactory, SamplingParams,
     Saved, SlotPass, SlotRow, StateError, Tokenizer,
 };
-use crate::promptcache::{self, PromptCache};
+use crate::media::{Held, MediaFeed, MediaSpan, common_prefix, keep_whole_spans};
+use crate::promptcache::PromptCache;
 use crate::reasoning::{THINK_CLOSE, ThinkEntry, ThinkSplit};
 use crate::sampling;
 use crate::slotfile::{self, Counting};
@@ -252,21 +253,21 @@ fn takes_passes(sampler: Option<&Sampler>, banned: &[u32], engine: &dyn Engine) 
     banned.is_empty() && (sampler.is_none() || engine.drafts_sampled())
 }
 
-/// The engine and its slots: the ids each slot's cache holds, one per
-/// position, and the host prompt cache of states the slots held before
-/// ([`PromptCache`]), one for every slot. Every method but [`Slot::select`],
-/// [`Slot::held_of`], [`Slot::step_slots`] and [`Slot::advance_slots`] acts
-/// on the selected slot.
+/// The engine and its slots: what each slot's cache holds — the ids, one per
+/// position, and the image spans among them ([`Held`]) — and the host prompt
+/// cache of states the slots held before ([`PromptCache`]), one for every
+/// slot. Every method but [`Slot::select`], [`Slot::held_of`],
+/// [`Slot::step_slots`] and [`Slot::advance_slots`] acts on the selected slot.
 pub(crate) struct Slot {
     pub engine: Box<dyn Engine>,
     vocab: Arc<dyn Tokenizer>,
     /// Every id the selected slot has evaluated since its last reset, in
-    /// order. The last generated id of a request is not in it: it is never
-    /// fed back.
-    held: Vec<u32>,
-    /// The other slots' ids; the selected slot's entry is empty.
-    parked: Vec<Vec<u32>>,
-    /// The slot whose ids `held` is.
+    /// order, and the image spans among them. The last generated id of a
+    /// request is not in it: it is never fed back.
+    held: Held,
+    /// The other slots' held sequences; the selected slot's entry is empty.
+    parked: Vec<Held>,
+    /// The slot whose held sequence `held` is.
     cur: usize,
     /// The slot the engine has selected: `None` after a call of several.
     selected: Option<usize>,
@@ -297,8 +298,8 @@ impl Slot {
             vocab: engine.tokenizer(),
             cache: PromptCache::new(engine.cache_ram()),
             engine,
-            held: Vec::new(),
-            parked: vec![Vec::new(); n],
+            held: Held::default(),
+            parked: vec![Held::default(); n],
             cur: 0,
             selected: Some(0),
             prompts: vec![0; n],
@@ -341,8 +342,8 @@ impl Slot {
         Ok(())
     }
 
-    /// The ids `slot`'s cache holds.
-    pub(crate) fn held_of(&self, slot: usize) -> &[u32] {
+    /// What `slot`'s cache holds: its ids and their image spans.
+    pub(crate) fn held_of(&self, slot: usize) -> &Held {
         if slot == self.cur {
             &self.held
         } else {
@@ -372,7 +373,7 @@ impl Slot {
         self.away = Some(state);
     }
 
-    fn held_mut(&mut self, slot: usize) -> &mut Vec<u32> {
+    fn held_mut(&mut self, slot: usize) -> &mut Held {
         if slot == self.cur {
             &mut self.held
         } else {
@@ -386,7 +387,7 @@ impl Slot {
     /// answers with no id of the vocabulary (its `next` left as it was) is the
     /// engine's error.
     pub(crate) fn step_slots(&mut self, rows: &mut [SlotRow<'_>]) -> Result<(), EngineError> {
-        let held: Vec<Vec<u32>> = rows
+        let held: Vec<Held> = rows
             .iter()
             .map(|r| std::mem::take(self.held_mut(r.slot)))
             .collect();
@@ -405,9 +406,9 @@ impl Slot {
             )));
         }
         for (r, h) in rows.iter().zip(held) {
-            let ids = self.held_mut(r.slot);
-            *ids = h;
-            ids.push(r.last);
+            let held = self.held_mut(r.slot);
+            *held = h;
+            held.ids.push(r.last);
         }
         Ok(())
     }
@@ -419,7 +420,7 @@ impl Slot {
     /// the engine's rows, or other than one more than its draft's accepted
     /// ids is the engine's error.
     pub(crate) fn advance_slots(&mut self, rows: &mut [SlotPass<'_>]) -> Result<(), EngineError> {
-        let held: Vec<Vec<u32>> = rows
+        let held: Vec<Held> = rows
             .iter()
             .map(|r| std::mem::take(self.held_mut(r.slot)))
             .collect();
@@ -446,20 +447,24 @@ impl Slot {
             }
         }
         for (r, h) in rows.iter().zip(held) {
-            let ids = self.held_mut(r.slot);
-            *ids = h;
-            ids.push(r.last);
-            ids.extend_from_slice(&r.out[..r.out.len() - 1]);
+            let held = self.held_mut(r.slot);
+            *held = h;
+            held.ids.push(r.last);
+            held.ids.extend_from_slice(&r.out[..r.out.len() - 1]);
         }
         Ok(())
     }
 
-    /// Brings the cache to the longest prefix of `ids` it can keep, leaving at
+    /// Brings the cache to the longest prefix of `req` it can keep, leaving at
     /// least the last id for `next`, and returns that length. `want` false
     /// (`cache_prompt: false`) always resets. While an engine call is in flight
     /// `held` is empty, so a failed call leaves no claim about the cache.
     ///
-    /// With the prompt cache on: a cached state that keeps more of `ids` than
+    /// The prefix is the longest the slot and the request share as sequences
+    /// ([`common_prefix`]): the same ids and, inside the shared part, the same
+    /// images, and it never ends inside an image span.
+    ///
+    /// With the prompt cache on: a cached state that keeps more of `req` than
     /// the slot replaces the slot's state; the slot's state goes into the
     /// cache first whenever it is replaced, or the request cuts it and does
     /// not carry the slot's last prompt whole. On a server of one slot the
@@ -479,13 +484,13 @@ impl Slot {
     /// it, and the engine takes it back only when the request keeps some of
     /// it. One the request keeps none of leaves the slot holding nothing, so
     /// no prefix it shared is noted.
-    fn reuse(&mut self, ids: &[u32], want: bool) -> Result<usize, EngineError> {
+    fn reuse(&mut self, req: &Held, want: bool) -> Result<usize, EngineError> {
         let away = self.away.take();
-        let (mut common, mut ask, mut k) = self.keep_of(ids, want, away.as_ref());
+        let (mut common, mut ask, mut k) = self.keep_of(req, want, away.as_ref());
         // The pick is taken out before the slot's state is saved: making room
         // for that state may evict it, and the pick then lives on in `picked`.
         let picked = if want && self.cache.enabled() {
-            self.cache.best(ids, k).map(|p| self.cache.take(p))
+            self.cache.best(req, k).map(|p| self.cache.take(p))
         } else {
             None
         };
@@ -505,7 +510,7 @@ impl Slot {
         if let Some((entry, state)) = picked {
             let slot_kept = k;
             if let Some((positions, bytes, ms)) = self.load(entry, &state)? {
-                (common, ask, k) = self.keep_of(ids, want, None);
+                (common, ask, k) = self.keep_of(req, want, None);
                 self.engine.note(&CacheNote::Load {
                     positions,
                     common,
@@ -520,7 +525,7 @@ impl Slot {
         } else if let Some(state) = away
             && (k == 0 || !self.put_back(&state)?)
         {
-            self.held.clear();
+            self.held = Held::default();
             (common, ask, k) = (0, 0, 0);
         }
         if k < ask {
@@ -543,23 +548,26 @@ impl Slot {
         Ok(k)
     }
 
-    /// The ids `ids` shares with the slot, the most of them a request may
-    /// keep (all but its last), and what the engine keeps of those: what it
-    /// would keep of `away`, the slot's state off the engine, when given.
+    /// The positions `req` shares with the slot, the most of them a request
+    /// may keep (all but its last), and what the engine keeps of those: what
+    /// it would keep of `away`, the slot's state off the engine, when given,
+    /// never ending inside an image span ([`keep_whole_spans`]).
     fn keep_of(
         &self,
-        ids: &[u32],
+        req: &Held,
         want: bool,
         away: Option<&Arc<dyn Saved>>,
     ) -> (usize, usize, usize) {
         let common = if want {
-            promptcache::common_prefix(&self.held, ids)
+            common_prefix(&self.held, req)
         } else {
             0
         };
-        let ask = common.min(ids.len() - 1);
-        let kept = away.map_or_else(|| self.engine.keepable(ask), |s| s.keepable(ask));
-        (common, ask, kept.min(ask))
+        let ask = common.min(req.len() - 1);
+        let kept = keep_whole_spans(req, ask, |n| {
+            away.map_or_else(|| self.engine.keepable(n), |s| s.keepable(n))
+        });
+        (common, ask, kept)
     }
 
     /// The slot's state into the prompt cache, unless a cached state already
@@ -590,7 +598,7 @@ impl Slot {
         Ok(())
     }
 
-    /// `state`, `slot`'s state of the ids it holds, which the slots that take
+    /// `state`, `slot`'s state of what it holds, which the slots that take
     /// the engine in turns let go of, into the prompt cache as a save puts
     /// it there ([`Slot::reuse`]), unless a cached state already keeps all of
     /// it; the slot drops it after. `copied`: a snapshot was taken for it,
@@ -601,11 +609,11 @@ impl Slot {
         }
     }
 
-    /// `state` of the ids `slot` holds into the prompt cache, timed from `t`.
+    /// `state` of what `slot` holds into the prompt cache, timed from `t`.
     /// A state of other than those positions is noted and not kept.
     fn keep(&mut self, slot: usize, state: Arc<dyn Saved>, copied: bool, t: Instant) {
-        let ids = self.held_of(slot).to_vec();
-        let positions = ids.len();
+        let held = self.held_of(slot).clone();
+        let positions = held.ids.len();
         if state.n_tokens() != positions {
             self.engine.note(&CacheNote::Skip {
                 positions,
@@ -616,28 +624,28 @@ impl Slot {
             });
             return;
         }
-        for note in self.cache.insert(ids, state, ms_since(t), copied) {
+        for note in self.cache.insert(held, state, ms_since(t), copied) {
             self.engine.note(&note);
         }
     }
 
-    /// A cached `state` of `ids` into the engine, the slot then holding its
-    /// ids; returns its positions, bytes and the wall time of the resume. A
+    /// A cached `state` of `held` into the engine, the slot then holding it;
+    /// returns its positions, bytes and the wall time of the resume. A
     /// state the engine refuses leaves the cache, the engine is reset and the
     /// slot holds nothing (`None`); an engine failure is the request's error.
     fn load(
         &mut self,
-        ids: Vec<u32>,
+        held: Held,
         state: &Arc<dyn Saved>,
     ) -> Result<Option<(usize, u64, f64)>, EngineError> {
-        self.held.clear();
+        self.held = Held::default();
         let t = Instant::now();
         match self.engine.resume(state) {
             Ok(()) => {
                 let ms = ms_since(t);
-                let got = (ids.len(), state.n_bytes(), ms);
-                self.prompts[self.cur] = ids.len();
-                self.held = ids;
+                let got = (held.ids.len(), state.n_bytes(), ms);
+                self.prompts[self.cur] = held.ids.len();
+                self.held = held;
                 Ok(Some(got))
             }
             Err(StateError::Engine(e)) => Err(e),
@@ -645,7 +653,7 @@ impl Slot {
                 self.cache.remove(state);
                 self.engine.reset()?;
                 self.engine.note(&CacheNote::Skip {
-                    positions: ids.len(),
+                    positions: held.ids.len(),
                     why: format!("the engine refused to take the state back: {e}"),
                 });
                 Ok(None)
@@ -698,15 +706,22 @@ impl Slot {
     }
 
     /// Feeds `ids[from..to]`, cut into calls where the engine asks
-    /// ([`Slot::marked_cuts`]).
-    fn prefill_marked(&mut self, ids: &[u32], from: usize, to: usize) -> Result<(), EngineError> {
+    /// ([`Slot::marked_cuts`]). Each of the prompt's images (`media`) rides
+    /// the call that holds its span.
+    fn prefill_marked(
+        &mut self,
+        ids: &[u32],
+        from: usize,
+        to: usize,
+        media: &[MediaFeed],
+    ) -> Result<(), EngineError> {
         let at = self.marked_cuts(ids, from, to)?;
         let mut first = from;
         for &u in &at {
-            self.prefill(&ids[first..u])?;
+            self.prefill_range(&ids[first..u], first, media)?;
             first = u;
         }
-        self.prefill(&ids[first..to])?;
+        self.prefill_range(&ids[first..to], first, media)?;
         self.note_split(from, to, at);
         Ok(())
     }
@@ -719,12 +734,49 @@ impl Slot {
         }
     }
 
-    /// `prefill` that books what it fed.
-    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+    /// `prefill` of the prompt's positions `at..at + ids.len()` that books
+    /// what it fed; a call that holds an image span (of `media`, the prompt's
+    /// feeds) is [`Engine::prefill_media`] with the feeds it holds, at its own
+    /// positions, and books their spans. A call that would cut a span is the
+    /// server's error: the cache and the prompt's last position never lie
+    /// inside one.
+    fn prefill_range(
+        &mut self,
+        ids: &[u32],
+        at: usize,
+        media: &[MediaFeed],
+    ) -> Result<(), EngineError> {
+        let end = at + ids.len();
+        let mut feeds = Vec::new();
+        for f in media {
+            let s = f.span();
+            if s.end() <= at || s.at >= end {
+                continue;
+            }
+            if s.at < at || s.end() > end {
+                return Err(EngineError(format!(
+                    "the prompt call {at}..{end} cuts the image span {}..{}",
+                    s.at,
+                    s.end()
+                )));
+            }
+            feeds.push(MediaFeed {
+                at: s.at - at,
+                ..f.clone()
+            });
+        }
         let held = std::mem::take(&mut self.held);
-        self.engine.prefill(ids)?;
+        if feeds.is_empty() {
+            self.engine.prefill(ids)?;
+        } else {
+            self.engine.prefill_media(ids, &feeds)?;
+        }
         self.held = held;
-        self.held.extend_from_slice(ids);
+        self.held.ids.extend_from_slice(ids);
+        self.held.media.extend(feeds.iter().map(|f| MediaSpan {
+            at: at + f.at,
+            ..f.span()
+        }));
         Ok(())
     }
 
@@ -756,7 +808,7 @@ impl Slot {
         self.check_pass(out, d)?;
         self.held = held;
         self.held.push(last);
-        self.held.extend_from_slice(&out[..out.len() - 1]);
+        self.held.ids.extend_from_slice(&out[..out.len() - 1]);
         Ok(d)
     }
 
@@ -795,7 +847,7 @@ impl Slot {
         if d.is_ok() {
             self.held = held;
             self.held.push(last);
-            self.held.extend_from_slice(&out[..out.len() - 1]);
+            self.held.ids.extend_from_slice(&out[..out.len() - 1]);
         }
         (d, sampler)
     }
@@ -864,13 +916,14 @@ impl Slot {
 
     /// Replaces the cache with the slot saved in `path`. A file refused before
     /// the engine reads its part (unreadable, another tag, version or
-    /// vocabulary, a count past the context, an id past the vocabulary) and an
-    /// engine that does not restore leave the cache as it was; once the engine
-    /// has read, any failure resets it and the slot holds nothing. Returns the
-    /// positions restored and the file's bytes.
+    /// vocabulary, a count past the context, an id past the vocabulary, a
+    /// span outside the ids) and an engine that does not restore leave the
+    /// cache as it was; once the engine has read, any failure resets it and
+    /// the slot holds nothing. Returns the positions restored and the file's
+    /// bytes.
     pub(crate) fn restore(&mut self, path: &Path) -> Result<(usize, u64), StateError> {
         let mut r = Counting::new(BufReader::new(File::open(path)?));
-        let ids = slotfile::read_header(&mut r, self.vocab.n_vocab(), self.engine.ctx_max())?;
+        let stored = slotfile::read_header(&mut r, self.vocab.n_vocab(), self.engine.ctx_max())?;
         let head = r.bytes;
         let held = std::mem::take(&mut self.held);
         let restored = match self.engine.restore_state(&mut r) {
@@ -893,13 +946,15 @@ impl Slot {
             Ok(n) if n > 0 => Some(format!(
                 "the engine read {read} bytes and the file runs on past them"
             )),
-            Ok(_) if restored.n_tokens != ids.len() || restored.n_bytes != read => Some(format!(
-                "the engine restored {} positions from {} bytes; the file holds {} positions and \
+            Ok(_) if restored.n_tokens != stored.len() || restored.n_bytes != read => {
+                Some(format!(
+                    "the engine restored {} positions from {} bytes; the file holds {} positions and \
                  the engine read {read} bytes",
-                restored.n_tokens,
-                restored.n_bytes,
-                ids.len()
-            )),
+                    restored.n_tokens,
+                    restored.n_bytes,
+                    stored.len()
+                ))
+            }
             Ok(_) => None,
         };
         if let Some(m) = mismatch {
@@ -907,8 +962,8 @@ impl Slot {
             self.engine.reset()?;
             return Err(StateError::Format(m));
         }
-        let n = ids.len();
-        self.held = ids;
+        let n = stored.len();
+        self.held = stored;
         self.prompts[self.cur] = n;
         Ok((n, r.bytes))
     }
@@ -965,6 +1020,9 @@ pub(crate) struct Kept {
 /// the request's bits are those of the prompt run in one go.
 pub(crate) struct Prompt {
     ids: Vec<u32>,
+    /// The prompt's images, each riding the call that holds its span: a
+    /// quantum's cut inside a span moves to the span's end.
+    media: Vec<MediaFeed>,
     kept: Kept,
     /// The engine's cuts at the messages, which the prompt call's note names
     /// as an uninterrupted call's does: a quantum's cut keeps nothing more.
@@ -978,12 +1036,37 @@ pub(crate) struct Prompt {
 
 /// The ends of the calls the prompt call `from..to` runs as: cut at `marks`
 /// (ascending, inside the range), and each of those calls every `q` ids from
-/// its own start.
-fn quantum_ends(from: usize, to: usize, marks: &[usize], q: usize) -> Vec<usize> {
+/// its own start. A cut inside an image span (`media`, the prompt's feeds)
+/// moves to the span's end, as a mark's end is one: a span never crosses
+/// calls, and the call after it runs on from the span's end.
+fn quantum_ends(
+    from: usize,
+    to: usize,
+    marks: &[usize],
+    media: &[MediaFeed],
+    q: usize,
+) -> Vec<usize> {
+    // The spans do not overlap, so the end a snap returns lies in none.
+    let snap = |u: usize| {
+        media
+            .iter()
+            .map(MediaFeed::span)
+            .find(|s| s.at < u && u < s.end())
+            .map_or(u, |s| s.end())
+    };
     let mut ends = Vec::new();
     let mut start = from;
     for &end in marks.iter().chain([&to]) {
-        ends.extend((start + q..end).step_by(q));
+        let mut u = start + q;
+        while u < end {
+            u = snap(u);
+            if u >= end {
+                break;
+            }
+            ends.push(u);
+            start = u;
+            u = start + q;
+        }
         ends.push(end);
         start = end;
     }
@@ -1219,27 +1302,29 @@ impl Gen {
         }
     }
 
-    /// The prompt on the selected slot: what the cache keeps of `ids`, the
-    /// rest fed, and the first token's logits read.
+    /// The prompt on the selected slot: what the cache keeps of it (`held`),
+    /// the rest fed — its images with it ([`Engine::prefill_media`]) — and
+    /// the first token's logits read.
     #[cfg(test)]
     pub(crate) fn prompt(
         &mut self,
         slot: &mut Slot,
-        ids: &[u32],
+        held: &Held,
+        media: &[MediaFeed],
         p: &GenParams,
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<(), GenError> {
-        let kept = self.open(slot, ids, p)?;
-        self.prompt_whole(slot, ids, kept, p, sink)
+        let kept = self.open(slot, held, p)?;
+        self.prompt_whole(slot, &held.ids, media, kept, p, sink)
     }
 
     /// The prompt's opening on the selected slot: the engine told the reply
     /// the request may make, and the cache brought to the longest prefix of
-    /// `ids` it keeps. No id of the prompt is fed yet.
+    /// `held` it keeps. No id of the prompt is fed yet.
     pub(crate) fn open(
         &mut self,
         slot: &mut Slot,
-        ids: &[u32],
+        held: &Held,
         p: &GenParams,
     ) -> Result<Kept, GenError> {
         // A request that passes has its first token from the prompt's step:
@@ -1251,7 +1336,7 @@ impl Gen {
             _ => Some(0),
         });
         let t = Instant::now();
-        let cache_n = slot.reuse(ids, p.cache_prompt)?;
+        let cache_n = slot.reuse(held, p.cache_prompt)?;
         Ok(Kept {
             cache_n,
             cache_ms: ms_since(t),
@@ -1265,12 +1350,13 @@ impl Gen {
         &mut self,
         slot: &mut Slot,
         ids: &[u32],
+        media: &[MediaFeed],
         kept: Kept,
         p: &GenParams,
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<(), GenError> {
         let t0 = Instant::now();
-        slot.prefill_marked(ids, kept.cache_n, self.n - 1)?;
+        slot.prefill_marked(ids, kept.cache_n, self.n - 1, media)?;
         self.close(slot, ids[self.n - 1], kept, t0, p.return_progress, sink)
     }
 
@@ -1283,6 +1369,7 @@ impl Gen {
         &mut self,
         slot: &Slot,
         ids: Vec<u32>,
+        media: Vec<MediaFeed>,
         kept: Kept,
         q: NonZeroUsize,
         progress: bool,
@@ -1290,7 +1377,7 @@ impl Gen {
         let t = Instant::now();
         let to = self.n - 1;
         let marks = slot.marked_cuts(&ids, kept.cache_n, to)?;
-        let ends = quantum_ends(kept.cache_n, to, &marks, q.get());
+        let ends = quantum_ends(kept.cache_n, to, &marks, &media, q.get());
         self.tim = Timings {
             prompt_ms: ms_since(t),
             n_ctx: self.ctx_max,
@@ -1302,6 +1389,7 @@ impl Gen {
         };
         Ok(Prompt {
             ids,
+            media,
             kept,
             marks,
             ends,
@@ -1328,7 +1416,7 @@ impl Gen {
         let from = p.ran.checked_sub(1).map_or(p.kept.cache_n, |i| p.ends[i]);
         let to = p.ends[p.ran];
         let t = Instant::now();
-        slot.prefill(&p.ids[from..to])?;
+        slot.prefill_range(&p.ids[from..to], from, &p.media)?;
         p.ran += 1;
         self.tim.prompt_ms += ms_since(t);
         self.tim.prompt_n = to - p.kept.cache_n;
@@ -1544,12 +1632,13 @@ impl Gen {
     fn run(
         &mut self,
         slot: &mut Slot,
-        ids: &[u32],
+        held: &Held,
+        media: &[MediaFeed],
         p: &GenParams,
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
         tick: &mut dyn FnMut(&Timings),
     ) -> Result<Outcome, GenError> {
-        self.prompt(slot, ids, p, sink)?;
+        self.prompt(slot, held, media, p, sink)?;
         loop {
             match self.pump(sink, tick)? {
                 Need::Done => return self.finish(sink),
@@ -1580,7 +1669,7 @@ pub(crate) fn generate(
     timings_out: &mut Timings,
 ) -> Result<Outcome, GenError> {
     let mut g = Gen::new(slot, factory, ids.len(), p);
-    let r = g.run(slot, ids, p, sink, tick);
+    let r = g.run(slot, &Held::from(ids.to_vec()), &[], p, sink, tick);
     timings_out.clone_from(g.timings());
     r
 }
@@ -1623,6 +1712,7 @@ mod cache_tests {
     use crate::engine::{
         CacheNote, Decoder, Engine, EngineError, SamplingParams, Saved, StateError, Tokenizer,
     };
+    use crate::media::Held;
     use crate::mock::{MockEngine, MockTokenizer};
     use crate::reasoning::ThinkEntry;
     use crate::sampling;
@@ -2046,7 +2136,10 @@ mod cache_tests {
         let notes = log.lock().expect("log").notes.clone();
         let refused = |n: &CacheNote| matches!(n, CacheNote::Skip { why, .. } if why.contains("refused to take the state back"));
         assert_eq!(notes.iter().filter(|n| refused(n)).count(), 1, "{notes:?}");
-        assert!(!slot.cache.covers(&a1), "the refused state is still cached");
+        assert!(
+            !slot.cache.covers(&Held::from(a1.clone())),
+            "the refused state is still cached"
+        );
     }
 
     /// Each request tells the engine its reply before the cache is reused:
@@ -2171,12 +2264,233 @@ mod cache_tests {
     }
 }
 
+/// A prompt that carries an image, through [`Gen`] on the mock that takes
+/// images: what the cache keeps of it and what the engine is fed. The mock's
+/// context holds a span as its key's letters and the prompt `q\n` image `\n`
+/// generates from the span, so a reply names the image the cache holds.
+#[cfg(test)]
+mod media_tests {
+    use std::sync::{Arc, Mutex};
+
+    use vision::{GridPlan, Patches};
+
+    use super::{Gen, GenParams, Slot};
+    use crate::engine::{Engine, EngineError, SamplingParams, Tokenizer};
+    use crate::media::{Held, ImageKey, MediaFeed, MediaSpan, Prepared, Prompt};
+    use crate::mock::{IMAGE_ID, MediaCall, MediaTokenizer, MockEngine};
+    use crate::reasoning::ThinkEntry;
+    use crate::sampling;
+
+    /// `before`, an image of `len` positions and key `[key; 32]`, `after`.
+    fn prompt(before: &str, len: usize, key: u8, after: &str) -> Prompt {
+        let mut ids = MediaTokenizer.encode(before);
+        let at = ids.len();
+        ids.extend(std::iter::repeat_n(IMAGE_ID, len));
+        ids.extend(MediaTokenizer.encode(after));
+        let plan = GridPlan {
+            n_llm_h: 1,
+            n_llm_w: len,
+            best_h: 1,
+            best_w: len,
+        };
+        let feed = MediaFeed {
+            at,
+            key: ImageKey([key; 32]),
+            prepared: Arc::new(Prepared {
+                span_len: len,
+                patches: Patches {
+                    plan,
+                    n_vit_h: 0,
+                    n_vit_w: 0,
+                    patch_len: 0,
+                    bf16: Vec::new(),
+                },
+            }),
+        };
+        Prompt {
+            held: Held {
+                ids,
+                media: vec![feed.span()],
+            },
+            feeds: vec![feed],
+        }
+    }
+
+    /// One greedy request of four tokens: what the cache kept, and the tokens.
+    fn run(slot: &mut Slot, p: &Prompt) -> Result<(usize, Vec<u32>), String> {
+        let params = GenParams {
+            n_predict: 4,
+            sampling: SamplingParams {
+                temperature: 0.0,
+                ..SamplingParams::default()
+            },
+            stop: Vec::new(),
+            ignore_eos: false,
+            stream: false,
+            timings_per_token: false,
+            return_progress: false,
+            include_usage: false,
+            cache_prompt: true,
+            reasoning_budget: None,
+            think_entry: ThinkEntry::Closed,
+        };
+        let factory = sampling::reference_factory();
+        let mut g = Gen::new(slot, &factory, p.held.len(), &params);
+        let o = g
+            .run(
+                slot,
+                &p.held,
+                &p.feeds,
+                &params,
+                &mut |_| Ok(()),
+                &mut |_| {},
+            )
+            .map_err(|e| format!("{e:?}"))?;
+        Ok((o.timings.cache_n, o.tokens))
+    }
+
+    /// The media mock on a slot of its own, and its log of image calls.
+    fn media_slot() -> (Slot, Arc<Mutex<Vec<MediaCall>>>) {
+        let (mock, log) = MockEngine::new(4096).with_media();
+        (Slot::new(Box::new(mock)), log)
+    }
+
+    /// What `p` generates on a fresh slot.
+    fn fresh(p: &Prompt) -> Vec<u32> {
+        run(&mut media_slot().0, p).expect("a fresh generation").1
+    }
+
+    fn calls(log: &Mutex<Vec<MediaCall>>) -> Vec<MediaCall> {
+        std::mem::take(&mut *log.lock().expect("the media log"))
+    }
+
+    /// A second chat whose image is another of the same size keeps nothing of
+    /// the first's span: the ids are equal (every span position carries the
+    /// image token), the image is not, so the reuse stops at the span's start
+    /// and the span is fed again, and the reply is the one a fresh slot gives,
+    /// not the first image's.
+    #[test]
+    fn another_image_of_one_size_stops_the_reuse_at_the_span() {
+        let (mut slot, log) = media_slot();
+        let a = prompt("q\n", 3, 1, "\n");
+        let b = prompt("q\n", 3, 2, "\n");
+        assert_eq!(a.held.ids, b.held.ids, "one size: the same ids");
+        let (kept, from_a) = run(&mut slot, &a).expect("a");
+        assert_eq!(kept, 0);
+        assert_eq!(
+            calls(&log),
+            [MediaCall {
+                ids: a.held.ids[..5].to_vec(),
+                spans: a.held.media.clone(),
+            }]
+        );
+        let (kept, from_b) = run(&mut slot, &b).expect("b");
+        assert_eq!(kept, 2, "the span's start");
+        assert_eq!(
+            calls(&log),
+            [MediaCall {
+                ids: vec![IMAGE_ID; 3],
+                spans: vec![MediaSpan {
+                    at: 0,
+                    len: 3,
+                    key: ImageKey([2; 32]),
+                }],
+            }],
+            "the span fed again at the call's own positions"
+        );
+        assert_eq!(from_b, fresh(&b), "the reply of b alone");
+        assert_ne!(from_b, from_a, "the replies name their images");
+    }
+
+    /// The same image again keeps the span whole: the reuse passes its end,
+    /// no image is fed, and the reply is a fresh slot's.
+    #[test]
+    fn the_same_image_keeps_the_span() {
+        let (mut slot, log) = media_slot();
+        let a = prompt("q\n", 3, 1, "\n");
+        run(&mut slot, &a).expect("a");
+        calls(&log);
+        let again = prompt("q\n", 3, 1, "\nq\n");
+        let (kept, got) = run(&mut slot, &again).expect("again");
+        assert_eq!(kept, 6, "all a shares with it: past the span 2..5");
+        assert_eq!(calls(&log), [], "a span kept whole is not fed again");
+        assert_eq!(got, fresh(&again));
+    }
+
+    /// The media mock that keeps only multiples of four positions.
+    struct Fours(MockEngine);
+
+    impl Engine for Fours {
+        fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+            self.0.tokenizer()
+        }
+        fn media_model(&self) -> Option<crate::media::SharedMediaModel> {
+            self.0.media_model()
+        }
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+            self.0.prefill(ids)
+        }
+        fn prefill_media(&mut self, ids: &[u32], m: &[MediaFeed]) -> Result<(), EngineError> {
+            self.0.prefill_media(ids, m)
+        }
+        fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+            self.0.next(last, out)
+        }
+        fn reset(&mut self) -> Result<(), EngineError> {
+            self.0.reset()
+        }
+        fn keepable(&self, n: usize) -> usize {
+            self.0.keepable(n) / 4 * 4
+        }
+        fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+            self.0.cut(n)
+        }
+        fn ctx_max(&self) -> usize {
+            self.0.ctx_max()
+        }
+        fn describe(&self) -> String {
+            self.0.describe()
+        }
+    }
+
+    /// An engine whose keep would end inside a span keeps none of the span:
+    /// the keep goes back to the span's start and the engine is asked again,
+    /// so the span is fed whole and the reply is a fresh slot's.
+    #[test]
+    fn a_keep_inside_a_span_goes_back_to_its_start() {
+        let (mock, log) = MockEngine::new(4096).with_media();
+        let mut slot = Slot::new(Box::new(Fours(mock)));
+        let a = prompt("abcde", 5, 1, "\n");
+        run(&mut slot, &a).expect("a");
+        calls(&log);
+        let again = prompt("abcde", 5, 1, "\nq\n");
+        let (kept, got) = run(&mut slot, &again).expect("a keep inside the span");
+        assert_eq!(
+            kept, 4,
+            "11 shared, 8 lies inside 5..10, then 5 rounds to 4"
+        );
+        assert_eq!(
+            calls(&log),
+            [MediaCall {
+                ids: again.held.ids[4..again.held.len() - 1].to_vec(),
+                spans: vec![MediaSpan {
+                    at: 1,
+                    len: 5,
+                    key: ImageKey([1; 32]),
+                }],
+            }]
+        );
+        assert_eq!(got, fresh(&again));
+    }
+}
+
 #[cfg(test)]
 mod slot_tests {
     use std::sync::Arc;
 
     use super::Slot;
     use crate::engine::{Engine, EngineError, SlotRow, Tokenizer};
+    use crate::media::Held;
     use crate::mock::MockEngine;
 
     /// The two-slot mock whose steps of several slots answer nothing.
@@ -2230,7 +2544,8 @@ mod slot_tests {
         let mut slot = Slot::with_slots(Box::new(MockEngine::new(64).with_slots(2)), 2);
         let mut r = rows();
         slot.step_slots(&mut r).expect("the mock answers");
-        assert_eq!((slot.held_of(0), slot.held_of(1)), (&[10][..], &[10][..]));
+        let want = Held::from(vec![10]);
+        assert_eq!((slot.held_of(0), slot.held_of(1)), (&want, &want));
         let mut mute = Slot::with_slots(Box::new(Mute(MockEngine::new(64).with_slots(2))), 2);
         let e = mute
             .step_slots(&mut rows())

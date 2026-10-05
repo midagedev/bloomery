@@ -22,7 +22,10 @@
 //! the request's bits those of the one call. `timings.cache_n` and `usage.prompt_tokens_details.cached_tokens` are
 //! `k`, `timings.prompt_n` is the `n − k` ids evaluated, and
 //! `tokens_evaluated` and `usage.prompt_tokens` count the whole prompt, `n`, as
-//! llama-server's do.
+//! llama-server's do. A chat's image is a span of positions that each carry the
+//! model's image token ([`Engine::media_model`]): `k` never ends inside one,
+//! and a prompt call that holds a span is [`Engine::prefill_media`] with the
+//! image's feed.
 //!
 //! Any `EngineError` is fatal to the server: the request that met it gets a 500,
 //! `/health` answers 503, and [`crate::Server::run`] returns the error so the
@@ -41,12 +44,12 @@
 //! of it) — unless it carries the slot's last prompt whole, and so drops only
 //! that prompt's reply — the server takes the slot's state as a value
 //! ([`Engine::snapshot`]) into a host-RAM LRU of [`Engine::cache_ram`] bytes,
-//! keyed by the ids it covers; a later request that one of those states
-//! serves better than the slot does gets it back ([`Engine::resume`]). Slots
-//! that take the engine in turns hand the cache the idle states they stop
-//! parking. What the cache did, and every prefix the engine keeps less of than
-//! a request shares, reaches the engine's binary as a [`CacheNote`]
-//! ([`Engine::note`]).
+//! keyed by the ids and the images it covers; a later request that one of
+//! those states serves better than the slot does gets it back
+//! ([`Engine::resume`]). Slots that take the engine in turns hand the cache the
+//! idle states they stop parking. What the cache did, and every prefix the
+//! engine keeps less of than a request shares, reaches the engine's binary as
+//! a [`CacheNote`] ([`Engine::note`]).
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -54,6 +57,7 @@ use std::io::{self, Read, Write};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::media::{MediaFeed, SharedMediaModel};
 use crate::swap::Park;
 
 /// A failure inside the engine (a device error, a context overflow it detected
@@ -138,9 +142,27 @@ pub trait Tokenizer: Send + Sync {
 pub trait Engine: Send {
     /// The vocabulary, taken once when the server binds.
     fn tokenizer(&self) -> Arc<dyn Tokenizer>;
+    /// The model's image input, `None` for an engine that takes none: the
+    /// server renders an image part as the model's placeholder only when it
+    /// has one, and refuses it by name otherwise. Taken once when the server
+    /// binds.
+    fn media_model(&self) -> Option<SharedMediaModel> {
+        None
+    }
     /// Evaluates `ids` from the current position without producing a token.
     /// An empty slice is a no-op.
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError>;
+    /// [`Engine::prefill`] where the slice carries images: each feed's `at` is
+    /// its span's first position in `ids`, every span lies whole inside the
+    /// slice, and every position of a span carries the model's image token.
+    /// The default is [`Engine::prefill`] when the slice carries no image, and
+    /// a named refusal when it does.
+    fn prefill_media(&mut self, ids: &[u32], media: &[MediaFeed]) -> Result<(), EngineError> {
+        if media.is_empty() {
+            return self.prefill(ids);
+        }
+        Err(EngineError("this engine takes no image input".to_owned()))
+    }
     /// Evaluates `last` and returns the argmax of the next position's logits.
     /// With `Some(out)` (length `n_vocab`) it also writes those logits; a
     /// greedy request passes `None` and the engine may skip reading them.

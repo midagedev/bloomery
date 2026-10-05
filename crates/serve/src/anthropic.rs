@@ -48,13 +48,14 @@ use std::net::TcpStream;
 use serde_json::{Map, Value, json};
 
 use super::{
-    ApiError, JSON, RETRY_AFTER_SECS, State, body, engine_error, error_body, gate_reasoning_budget,
-    gen_params, get_i, invalid, json_type, render_chat, run_gen, send_json, tool_markup_error,
-    tool_scan,
+    ApiError, JSON, RETRY_AFTER_SECS, State, body, chat_prompt, engine_error, error_body,
+    gate_reasoning_budget, gen_params, get_i, invalid, json_type, render_chat, run_gen, send_json,
+    tool_markup_error, tool_scan,
 };
 use crate::dsml::{ChatParser, Message, ToolCall};
 use crate::genloop::{Event, GenError, GenParams, Outcome, StopKind, Timings};
 use crate::http::{self, EventStream, Request};
+use crate::media::Prompt;
 use crate::reasoning::ReasoningFormat;
 
 /// The prefix of the system text Claude Code sends first.
@@ -88,7 +89,12 @@ pub(super) fn count_tokens(state: &State, req: &Request, w: &mut TcpStream) -> i
         .and_then(|b| to_chat(&b, false))
         .and_then(|chat| prompt_of(state, &chat));
     match counted {
-        Ok((_, ids)) => send_json(w, req, 200, &json!({ "input_tokens": ids.len() })),
+        Ok((_, prompt)) => send_json(
+            w,
+            req,
+            200,
+            &json!({ "input_tokens": prompt.held.ids.len() }),
+        ),
         Err(e) => send_error(w, req, &e),
     }
 }
@@ -529,7 +535,7 @@ fn tool_choice(v: &Value) -> Result<Value, ApiError> {
 /// teaches.
 struct Plan {
     p: GenParams,
-    ids: Vec<u32>,
+    ids: Prompt,
     prompt: Value,
     parser: ChatParser,
 }
@@ -551,12 +557,13 @@ fn plan(state: &State, chat: &Map<String, Value>) -> Result<Plan, ApiError> {
     })
 }
 
-/// The prompt a converted request runs, rendered by the chat template, and its
-/// ids: where both endpoints take them from.
-fn prompt_of(state: &State, chat: &Map<String, Value>) -> Result<(String, Vec<u32>), ApiError> {
-    let text = render_chat(state, chat)?;
-    let ids = state.tok.encode(&text);
-    Ok((text, ids))
+/// The prompt a converted request runs, rendered by the chat template, and
+/// what the engine is fed: its ids, each image expanded to its span as the
+/// chat path does ([`chat_prompt`]). Both endpoints take them from here.
+fn prompt_of(state: &State, chat: &Map<String, Value>) -> Result<(String, Prompt), ApiError> {
+    let rendered = render_chat(state, chat)?;
+    let prompt = chat_prompt(state, &rendered)?;
+    Ok((rendered.text, prompt))
 }
 
 /// The answer's names: `msg_<32 hex>`, a tool use's `toolu_<index>_<16 hex>`

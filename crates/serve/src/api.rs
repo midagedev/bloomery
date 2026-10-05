@@ -59,11 +59,13 @@ use crate::engine::{
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
 use crate::http::{self, EventStream, Request};
+use crate::media::{self, MediaError, Prompt, SharedMediaModel};
 use crate::qwenxml::ParamKinds;
 use crate::reasoning::{ReasoningFormat, ThinkEntry};
 use crate::sampling;
 use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
+use crate::swap::Park;
 use crate::template::{ChatTemplate, TemplateError};
 use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 
@@ -206,6 +208,12 @@ fn check_slots(engine: &dyn Engine, slots: &SlotConfig) -> Result<usize, ServeEr
             "--parallel {n}: this engine serves {declared} slot(s) at once"
         ));
     }
+    if n > 1 && engine.turns() == Some(Park::Ids) && engine.media_model().is_some() {
+        return refuse(format!(
+            "--parallel {n}: this engine takes images and its slots take it in turns parked as \
+             their ids, which carry no image to feed again"
+        ));
+    }
     let rows = engine.advance_rows();
     if n > 1 && rows > 1 && engine.turns().is_none() && !engine.slot_drafts() {
         return refuse(format!(
@@ -239,8 +247,9 @@ impl Server {
     /// `slots` asks for. A slot count the engine does not declare
     /// ([`Engine::slots`]), several slots on an engine that drafts unless they
     /// take it in turns ([`Engine::turns`]) or it keeps its draft per slot
-    /// ([`Engine::slot_drafts`]), and a depth no queue can reach are
-    /// refused by name ([`ServeError::Slots`]).
+    /// ([`Engine::slot_drafts`]), several slots that take an engine of images
+    /// ([`Engine::media_model`]) in turns parked as ids, and a depth no queue
+    /// can reach are refused by name ([`ServeError::Slots`]).
     pub fn bind_with(
         addr: impl ToSocketAddrs,
         engine: Box<dyn Engine>,
@@ -258,6 +267,7 @@ impl Server {
             return Err(ServeError::NoStops);
         }
         let engine_props = engine_object(&engine.props_engine());
+        let media = engine.media_model();
         let info = ModelInfo {
             n_vocab: tok.n_vocab(),
             ctx_max: engine.ctx_max(),
@@ -281,6 +291,7 @@ impl Server {
             alias: config.model_alias,
             model_path: config.model_path,
             engine_props,
+            media,
             slot_save_path: config.slot_save_path,
             info,
             start_unix: unix_now(),
@@ -365,6 +376,10 @@ struct State {
     model_path: String,
     /// `/props`' `engine` object, built when the server binds.
     engine_props: Value,
+    /// The model's image input, `None` for an engine that takes none: an
+    /// image part is rendered as the model's placeholder only when it exists,
+    /// and refused by name otherwise. Read without the engine.
+    media: Option<SharedMediaModel>,
     /// Where slot files live; `None` refuses slot actions.
     slot_save_path: Option<PathBuf>,
     info: ModelInfo,
@@ -1156,7 +1171,7 @@ fn props(state: &State) -> Value {
         "chat_template_caps": {},
         "bos_token": state.info.bos_text,
         "eos_token": state.info.eos_text,
-        "modalities": { "vision": false, "audio": false },
+        "modalities": { "vision": state.media.is_some(), "audio": false },
         "n_ctx": state.info.ctx_max,
         "build_info": format!("bloomery-serve {VERSION}"),
         "engine": state.engine_props,
@@ -1560,28 +1575,49 @@ fn token_ids(state: &State, v: &Value) -> Result<Vec<u32>, ApiError> {
 }
 
 fn apply_template(state: &State, b: &Map<String, Value>) -> Result<Value, ApiError> {
-    Ok(json!({ "prompt": render_chat(state, b)? }))
+    // The unexpanded placeholder: an image is one placeholder token in the
+    // render, and only the request that runs it expands it to its span.
+    Ok(json!({ "prompt": render_chat(state, b)?.text }))
 }
 
-/// Renders the chat template for an OpenAI `messages` body.
-fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError> {
+/// A chat template's render: its text, each image as the model's
+/// placeholder, and the images' URLs in the order of their placeholders.
+struct Rendered {
+    text: String,
+    images: Vec<String>,
+}
+
+/// Renders the chat template for an OpenAI `messages` body. An array content
+/// becomes one text: on an engine that takes images, its parts flattened by
+/// the model's rule ([`media::flatten`]), each image the model's placeholder;
+/// on one that takes none, its text parts joined, any other part refused by
+/// name ([`content_text`]). Nothing is dropped.
+fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiError> {
     let Some(Value::Array(msgs)) = b.get("messages") else {
         return Err(invalid("'messages' is required and must be an array"));
     };
     let mut messages = Vec::with_capacity(msgs.len());
+    let mut images = Vec::new();
     for m in msgs {
         let Value::Object(m) = m else {
             return Err(invalid("each message must be an object"));
         };
-        if !m.get("role").is_some_and(Value::is_string) {
+        let Some(role) = m.get("role").and_then(Value::as_str) else {
             return Err(invalid("each message needs a string 'role'"));
-        }
-        let mut m = m.clone();
+        };
+        let mut flat = m.clone();
         if let Some(Value::Array(parts)) = m.get("content") {
-            let text = content_text(parts)?;
-            m.insert("content".into(), Value::String(text));
+            let text = match &state.media {
+                None => content_text(parts)?,
+                Some(model) => {
+                    let f = media::flatten(role, parts, &**model).map_err(|e| media_error(&e))?;
+                    images.extend(f.images.into_iter().map(str::to_owned));
+                    f.text
+                }
+            };
+            flat.insert("content".into(), Value::String(text));
         }
-        messages.push(Value::Object(m));
+        messages.push(Value::Object(flat));
     }
     let mut vars = Map::new();
     vars.insert("messages".into(), Value::Array(messages));
@@ -1605,16 +1641,17 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError
     if let Some(Value::Object(kw)) = b.get("chat_template_kwargs") {
         vars.extend(kw.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
-    state.template.render(&vars).map_err(|e| ApiError {
+    let text = state.template.render(&vars).map_err(|e| ApiError {
         retry_after: false,
         code: 500,
         kind: "server_error",
         message: e.to_string(),
-    })
+    })?;
+    Ok(Rendered { text, images })
 }
 
-/// The text of an array `content`: its text parts joined by newlines. This
-/// server reads no media, so a media part is a 400 naming its kind in
+/// The text of an array `content` on an engine that takes no images: its text
+/// parts joined by newlines. A media part is a 400 naming its kind in
 /// llama-server's words, and any other part a 400 too: nothing is dropped.
 fn content_text(parts: &[Value]) -> Result<String, ApiError> {
     let no_media = |kind: &str| {
@@ -1685,13 +1722,36 @@ fn engine_gone(state: &State, started: bool) -> ApiError {
     }
 }
 
+/// A refusal of the media part: the request's 400, but for a prepare whose
+/// span is empty, the model's 500.
+fn media_error(e: &MediaError) -> ApiError {
+    match e {
+        MediaError::EmptySpan(_) => engine_error(e),
+        _ => invalid(e.to_string()),
+    }
+}
+
+/// The prompt of a rendered chat: its ids, and on an engine that takes images
+/// each image expanded to its span with its feed ([`media::expand_prompt`]),
+/// which also refuses a placeholder no image part made.
+fn chat_prompt(state: &State, rendered: &Rendered) -> Result<Prompt, ApiError> {
+    let ids = state.tok.encode(&rendered.text);
+    let Some(model) = &state.media else {
+        return Ok(Prompt::from(ids));
+    };
+    let urls: Vec<&str> = rendered.images.iter().map(String::as_str).collect();
+    media::expand_prompt(&ids, &urls, &**model).map_err(|e| media_error(&e))
+}
+
 /// Validates the prompt, hands the request to the engine thread, and passes
-/// its events to `sink` with the slot it took. Returns the outcome and the
-/// slot; an error before any event is the request's answer. A sink that fails
-/// ends the request: the engine thread sees its channel closed.
+/// its events to `sink` with the slot it took. `input` is what the engine is
+/// fed: the ids, and the images' spans and feeds of a chat that carries any.
+/// Returns the outcome and the slot; an error before any event is the
+/// request's answer. A sink that fails ends the request: the engine thread
+/// sees its channel closed.
 fn run_gen(
     state: &State,
-    ids: &[u32],
+    input: &Prompt,
     prompt: Value,
     p: &GenParams,
     sink: &mut dyn FnMut(Event<'_>, usize) -> io::Result<()>,
@@ -1699,6 +1759,7 @@ fn run_gen(
     if let Some(reason) = state.fatal() {
         return Err(dead_engine(&reason));
     }
+    let ids = &input.held.ids;
     if ids.is_empty() {
         return Err(invalid("the prompt is empty"));
     }
@@ -1719,10 +1780,11 @@ fn run_gen(
         p: p.clone(),
         prompt,
         settings: generation_settings(state, p),
+        media: input.feeds.clone(),
         events,
     };
     relock(&state.shared.board)
-        .enqueue(ids.to_vec(), submit)
+        .enqueue(input.held.clone(), submit)
         .map_err(|r| refused(state, r, "the slot"))?;
     state.shared.work.notify_one();
     let mut slot = None;
@@ -1979,8 +2041,18 @@ fn state_error(
 
 /// The prompt of `/completion`: text (BOS per `add_bos_token`), an id array, or a
 /// mixed array whose strings are tokenized in place. A prompt object carrying
-/// media, alone or in the array, is refused by that name in llama-server's words.
+/// media, alone or in the array, is refused by that name in llama-server's words;
+/// on an engine that takes images, so is the image token, which only a chat's
+/// image part makes.
 fn completion_prompt(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError> {
+    let ids = completion_ids(state, v)?;
+    if let Some(model) = &state.media {
+        media::expand_prompt(&ids, &[], &**model).map_err(|e| media_error(&e))?;
+    }
+    Ok(ids)
+}
+
+fn completion_ids(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError> {
     let e = &*state.tok;
     let no_media =
         || invalid("Multimodal data provided, but model does not support multimodal requests.");
@@ -2094,8 +2166,9 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
     }
     let return_tokens = get_b(&b, "return_tokens").unwrap_or(false);
     let prompt = b.get("prompt").cloned().unwrap_or(Value::Null);
+    let input = Prompt::from(ids);
     if !p.stream {
-        return match run_gen(state, &ids, prompt.clone(), &p, &mut |_, _| Ok(())) {
+        return match run_gen(state, &input, prompt.clone(), &p, &mut |_, _| Ok(())) {
             Err(e) => send_error(w, req, &e),
             Ok((Err(e), _)) => send_error(w, req, &engine_error(&e)),
             Ok((Ok(o), slot)) => send_json(
@@ -2135,7 +2208,7 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
             };
             sse(s, &v)
         };
-        run_gen(state, &ids, prompt.clone(), &p, &mut sink)
+        run_gen(state, &input, prompt.clone(), &p, &mut sink)
     };
     let slot = r.as_ref().map_or(0, |(_, slot)| *slot);
     finish_stream(req, stream, w_opt, r.map(|(o, _)| o), |s, o| {
@@ -2315,15 +2388,15 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let parsed = body(req).and_then(|b| {
         let p = gen_params(state, &b)?;
         let format = ReasoningFormat::from_request(b.get("reasoning_format")).map_err(invalid)?;
-        let text = render_chat(state, &b)?;
+        let rendered = render_chat(state, &b)?;
         let tools = tool_scan(state, &b)?;
-        Ok((b, p, format, text, tools))
+        Ok((b, p, format, rendered, tools))
     });
-    let (b, mut p, format, text, tools) = match parsed {
+    let (b, mut p, format, rendered, tools) = match parsed {
         Ok(x) => x,
         Err(e) => return send_error(w, req, &e),
     };
-    gate_reasoning_budget(&mut p, &text);
+    gate_reasoning_budget(&mut p, &rendered.text);
     let ids_meta = ChatIds {
         id: format!("chatcmpl-{}", state.random_id()),
         created: unix_now(),
@@ -2332,11 +2405,14 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
             .and_then(Value::as_str)
             .map_or_else(|| state.alias.clone(), str::to_owned),
     };
-    let ids = state.tok.encode(&text);
-    let mut parser = ChatParser::with_tools(&text, format, tools);
-    let prompt = Value::String(text);
+    let input = match chat_prompt(state, &rendered) {
+        Ok(x) => x,
+        Err(e) => return send_error(w, req, &e),
+    };
+    let mut parser = ChatParser::with_tools(&rendered.text, format, tools);
+    let prompt = Value::String(rendered.text);
     if !p.stream {
-        return match run_gen(state, &ids, prompt, &p, &mut |_, _| Ok(())) {
+        return match run_gen(state, &input, prompt, &p, &mut |_, _| Ok(())) {
             Err(e) => send_error(w, req, &e),
             Ok((Err(e), _)) => send_error(w, req, &engine_error(&e)),
             Ok((Ok(o), _)) => match parser
@@ -2402,7 +2478,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
                 }
             }
         };
-        run_gen(state, &ids, prompt, &p, &mut sink).map(|(o, _)| o)
+        run_gen(state, &input, prompt, &p, &mut sink).map(|(o, _)| o)
     };
     let r = match markup {
         Some(e) => Err(tool_markup_error(&e)),
@@ -2477,9 +2553,12 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
-        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, EngineProps, SlotQueue,
-        after_accept_error, carries_media, content_text, engine_object, id_half,
+        ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, Engine, EngineProps, Park,
+        ServeError, SlotConfig, SlotQueue, after_accept_error, carries_media, check_slots,
+        content_text, engine_object, id_half,
     };
     use serde_json::{Value, json};
     use std::io;
@@ -2632,5 +2711,60 @@ mod tests {
                 "seed {seed} draws a half another seed drew at the same counter"
             );
         }
+    }
+
+    /// The media mock whose two slots take it in turns, parked as `park`.
+    struct Turned(crate::MockEngine, Park);
+
+    impl Engine for Turned {
+        fn tokenizer(&self) -> Arc<dyn crate::Tokenizer> {
+            self.0.tokenizer()
+        }
+        fn media_model(&self) -> Option<crate::media::SharedMediaModel> {
+            self.0.media_model()
+        }
+        fn prefill(&mut self, ids: &[u32]) -> Result<(), crate::EngineError> {
+            self.0.prefill(ids)
+        }
+        fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, crate::EngineError> {
+            self.0.next(last, out)
+        }
+        fn slots(&self) -> usize {
+            2
+        }
+        fn turns(&self) -> Option<Park> {
+            Some(self.1)
+        }
+        fn reset(&mut self) -> Result<(), crate::EngineError> {
+            self.0.reset()
+        }
+        fn ctx_max(&self) -> usize {
+            self.0.ctx_max()
+        }
+        fn describe(&self) -> String {
+            self.0.describe()
+        }
+    }
+
+    /// Slots that park a request as its ids cannot feed its image again, so
+    /// an engine of images whose slots take it in turns so is refused by name
+    /// at two slots; one slot parks nothing, and slots that park states, or an
+    /// engine of no images, serve.
+    #[test]
+    fn images_refuse_slots_parked_as_ids() {
+        let media = || crate::MockEngine::new(64).with_media().0;
+        let slots = |n: usize| SlotConfig {
+            parallel: n,
+            ..SlotConfig::default()
+        };
+        match check_slots(&Turned(media(), Park::Ids), &slots(2)) {
+            Err(ServeError::Slots(why)) => assert!(why.contains("takes images"), "{why}"),
+            other => panic!("{:?}", other.map_err(|e| e.to_string())),
+        }
+        assert!(check_slots(&Turned(media(), Park::Ids), &slots(1)).is_ok());
+        let states = Park::States { budget: 1 << 20 };
+        assert!(check_slots(&Turned(media(), states), &slots(2)).is_ok());
+        let text = Turned(crate::MockEngine::new(64), Park::Ids);
+        assert!(check_slots(&text, &slots(2)).is_ok());
     }
 }

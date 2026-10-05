@@ -4,10 +4,13 @@
 //! One queue in arrival order holds every waiting request; a free slot takes
 //! the oldest of them. When more requests wait than slots are free, a
 //! [`SlotPicker`] chooses which one goes next ([`FifoPicker`], the oldest, by
-//! default). The request then takes, of the free slots, the one whose held ids
-//! share the longest prefix with its own (llama-server's choice, without its
-//! similarity floor): its cache keeps the most. Among equals a slot that
-//! holds no ids comes before one that holds a conversation: seating the
+//! default). The request then takes, of the free slots, the one whose held
+//! sequence shares the longest prefix with its own (llama-server's choice,
+//! without its similarity floor): its cache keeps the most. A shared prefix
+//! counts an image span only when both sides hold the same image
+//! ([`common_prefix`]), so a request takes the slot that holds its
+//! image, not one that holds another of the same grid. Among equals a slot
+//! that holds no ids comes before one that holds a conversation: seating the
 //! request there cuts nothing, so nothing is saved either. When the slots
 //! take one engine in turns, the slot whose state the engine holds goes
 //! before the least recently used: taking another moves that state aside.
@@ -30,7 +33,7 @@ use std::collections::VecDeque;
 use serde_json::Value;
 
 use crate::api::SlotQueue;
-use crate::promptcache::common_prefix;
+use crate::media::{Held, common_prefix};
 
 /// What a [`SlotPicker`] sees of a waiting request.
 #[derive(Clone, Copy, Debug)]
@@ -156,7 +159,7 @@ pub(crate) enum Refusal {
 }
 
 struct Waiter<R> {
-    ids: Vec<u32>,
+    held: Held,
     payload: R,
 }
 
@@ -216,7 +219,7 @@ impl<R, A> Board<R, A> {
 
     /// Queues a request, unless the requests that would then wait past the
     /// free slots exceed the depth.
-    pub(crate) fn enqueue(&mut self, ids: Vec<u32>, payload: R) -> Result<(), Refusal> {
+    pub(crate) fn enqueue(&mut self, held: Held, payload: R) -> Result<(), Refusal> {
         if let Some(reason) = &self.dead {
             return Err(Refusal::Dead(reason.clone()));
         }
@@ -224,7 +227,7 @@ impl<R, A> Board<R, A> {
             return Err(Refusal::Full { depth: self.depth });
         }
         self.tickets.draw();
-        self.waiting.push_back(Waiter { ids, payload });
+        self.waiting.push_back(Waiter { held, payload });
         Ok(())
     }
 
@@ -262,19 +265,19 @@ impl<R, A> Board<R, A> {
 
     /// Gives every waiting request it can a free slot, oldest first unless the
     /// picker chooses another while more wait than slots are free. `held` is
-    /// the ids each slot's cache holds; `on` the slot whose state the engine
+    /// what each slot's cache holds; `on` the slot whose state the engine
     /// holds when the slots take it in turns, `None` when each slot keeps its
-    /// own. Returns each request's slot, its ids and its payload, in the order
-    /// they took them.
+    /// own. Returns each request's slot, what its prompt holds and its
+    /// payload, in the order they took them.
     ///
     /// # Panics
     ///
     /// When the picker answers an index past the waiting requests.
     pub(crate) fn admit<'h>(
         &mut self,
-        held: impl Fn(usize) -> &'h [u32],
+        held: impl Fn(usize) -> &'h Held,
         on: Option<usize>,
-    ) -> Vec<(usize, Vec<u32>, R)> {
+    ) -> Vec<(usize, Held, R)> {
         let mut out = Vec::new();
         if self.dead.is_some() {
             return out;
@@ -290,7 +293,7 @@ impl<R, A> Board<R, A> {
                 let waiting: Vec<WaitingRequest<'_>> = self
                     .waiting
                     .iter()
-                    .map(|w| WaitingRequest { ids: &w.ids })
+                    .map(|w| WaitingRequest { ids: &w.held.ids })
                     .collect();
                 let slots: Vec<SlotSummary<'_>> = self
                     .slots
@@ -299,7 +302,7 @@ impl<R, A> Board<R, A> {
                     .map(|(id, s)| SlotSummary {
                         id,
                         busy: s.state != Use::Free,
-                        held: held(id),
+                        held: &held(id).ids,
                         routing: &s.routing,
                     })
                     .collect();
@@ -316,11 +319,11 @@ impl<R, A> Board<R, A> {
             let Some(w) = self.waiting.remove(at) else {
                 unreachable!("{at} is below the waiting requests");
             };
-            let slot = best_slot(&self.slots, &free, &held, on, &w.ids);
+            let slot = best_slot(&self.slots, &free, &held, on, &w.held);
             self.slots[slot].state = Use::Running;
             let serving = self.tickets.serving();
             self.tickets.pass(serving);
-            out.push((slot, w.ids, w.payload));
+            out.push((slot, w.held, w.payload));
         }
     }
 
@@ -342,21 +345,23 @@ impl<R, A> Board<R, A> {
     }
 }
 
-/// Of the free slots, the one whose held ids share the longest prefix with
-/// `ids`; among equals one that holds no ids (nothing is cut or saved),
+/// Of the free slots, the one whose held sequence shares the longest prefix
+/// with `req` — the same images in the spans ([`common_prefix`]), so the slot
+/// that holds the request's image beats one that holds another of the same
+/// grid; among equals one that holds no ids (nothing is cut or saved),
 /// then the one the engine is on, then the least recently used, then the
 /// lowest id.
 fn best_slot<'h>(
     slots: &[SlotState],
     free: &[usize],
-    held: &impl Fn(usize) -> &'h [u32],
+    held: &impl Fn(usize) -> &'h Held,
     on: Option<usize>,
-    ids: &[u32],
+    req: &Held,
 ) -> usize {
     let key = |i: usize| {
         let held = held(i);
         (
-            common_prefix(held, ids),
+            common_prefix(held, req),
             held.is_empty(),
             on == Some(i),
             Reverse(slots[i].last_used),
@@ -379,14 +384,36 @@ mod tests {
     use super::{
         Board, FifoPicker, Refusal, Reserve, SlotPicker, SlotSummary, Use, WaitingRequest,
     };
+    use crate::media::{Held, ImageKey, MediaSpan};
 
     fn board(n: usize, depth: usize) -> Board<u32, &'static str> {
         Board::new(n, depth, Box::new(FifoPicker))
     }
 
     /// No slot holds an id.
-    fn nothing(_: usize) -> &'static [u32] {
-        &[]
+    static NOTHING: Held = Held {
+        ids: Vec::new(),
+        media: Vec::new(),
+    };
+
+    fn nothing(_: usize) -> &'static Held {
+        &NOTHING
+    }
+
+    /// A held sequence of one image span at `at`: the ids of the span carry
+    /// the image token, as an expanded prompt's do.
+    fn held_image(mut ids: Vec<u32>, at: usize, len: usize, key: u8) -> Held {
+        for id in &mut ids[at..at + len] {
+            *id = 7;
+        }
+        Held {
+            media: vec![MediaSpan {
+                at,
+                len,
+                key: ImageKey([key; 32]),
+            }],
+            ids,
+        }
     }
 
     /// At N = 2 a free slot takes the oldest waiting request: four queued
@@ -395,7 +422,7 @@ mod tests {
     fn a_free_slot_takes_the_oldest_waiting_request() {
         let mut b = board(2, 8);
         for r in 0..6 {
-            b.enqueue(vec![r], r).expect("room");
+            b.enqueue(Held::from(vec![r]), r).expect("room");
         }
         let first: Vec<u32> = b
             .admit(nothing, None)
@@ -422,9 +449,9 @@ mod tests {
     #[test]
     fn a_request_takes_the_slot_that_shares_its_prefix() {
         let mut b = board(3, 8);
-        b.enqueue(vec![1, 2, 3], 0).expect("room");
-        b.enqueue(vec![7, 8], 1).expect("room");
-        b.enqueue(vec![4, 4], 2).expect("room");
+        b.enqueue(Held::from(vec![1, 2, 3]), 0).expect("room");
+        b.enqueue(Held::from(vec![7, 8]), 1).expect("room");
+        b.enqueue(Held::from(vec![4, 4]), 2).expect("room");
         let slots: Vec<usize> = b
             .admit(nothing, None)
             .into_iter()
@@ -435,22 +462,26 @@ mod tests {
         for slot in 0..3 {
             b.release(slot);
         }
-        let ids = [vec![1, 2, 3, 9], vec![7, 8, 9], vec![4, 4, 9]];
-        let held = |i: usize| ids[i].as_slice();
-        b.enqueue(vec![7, 8, 5], 3).expect("room");
+        let ids = [
+            Held::from(vec![1, 2, 3, 9]),
+            Held::from(vec![7, 8, 9]),
+            Held::from(vec![4, 4, 9]),
+        ];
+        let held = |i: usize| &ids[i];
+        b.enqueue(Held::from(vec![7, 8, 5]), 3).expect("room");
         assert_eq!(
             b.admit(held, Some(2))[0].0,
             1,
             "slot 1 holds 7 8; the engine is on slot 2"
         );
-        b.enqueue(vec![6], 4).expect("room");
+        b.enqueue(Held::from(vec![6]), 4).expect("room");
         assert_eq!(
             b.admit(held, None)[0].0,
             0,
             "no prefix shared: least recently used"
         );
         b.release(0);
-        b.enqueue(vec![6], 5).expect("room");
+        b.enqueue(Held::from(vec![6]), 5).expect("room");
         assert_eq!(
             b.admit(held, Some(0))[0].0,
             0,
@@ -458,33 +489,59 @@ mod tests {
         );
     }
 
+    /// A request whose prompt carries an image takes the slot that holds the
+    /// same image. Two slots can hold the same ids with different images (a
+    /// span's every position carries the image token), and the key tells them
+    /// apart: the ids alone would leave the request on the slot the engine is
+    /// on, which holds the other image.
+    #[test]
+    fn a_request_takes_the_slot_that_holds_its_image() {
+        let mut b = board(2, 8);
+        b.enqueue(Held::from(vec![1]), 0).expect("room");
+        b.enqueue(Held::from(vec![2]), 1).expect("room");
+        b.admit(nothing, None);
+        b.release(0);
+        b.release(1);
+        let ids = vec![1, 2, 7, 7, 7, 4];
+        let slots = [held_image(ids.clone(), 2, 3, 1), held_image(ids, 2, 3, 2)];
+        let held = |i: usize| &slots[i];
+        b.enqueue(held_image(vec![1, 2, 7, 7, 7, 4, 9], 2, 3, 1), 3)
+            .expect("room");
+        assert_eq!(
+            b.admit(held, Some(1))[0].0,
+            0,
+            "slot 0 holds the request's image; slot 1, where the engine is, holds another"
+        );
+    }
+
     /// Of the free slots whose held ids share the request's prefix equally,
     /// one that holds no ids comes before one that holds a conversation:
     /// seating the request there cuts nothing, so nothing is saved either. A
     /// longer prefix still wins, and among empty slots the order is as it
-    /// was: the slot the engine is on, then the least recently used, then
-    /// the lowest id.
+    /// was: the slot the engine is on, then the least recently used, then the
+    /// lowest id.
     #[test]
     fn a_request_takes_an_empty_slot_before_one_that_holds_ids() {
         let mut b = board(2, 8);
         for r in 0..2 {
-            b.enqueue(vec![r], r).expect("room");
+            b.enqueue(Held::from(vec![r]), r).expect("room");
         }
         b.admit(nothing, None);
         // Slot 0, released first, holds a conversation and is the least
         // recently used; slot 1, released after, holds nothing.
         b.release(0);
         b.release(1);
-        let a = [7, 8, 9];
-        let held = |i: usize| if i == 0 { a.as_slice() } else { &[] };
-        b.enqueue(vec![1, 2, 3], 2).expect("room");
+        let a = Held::from(vec![7, 8, 9]);
+        let empty = Held::default();
+        let held = |i: usize| if i == 0 { &a } else { &empty };
+        b.enqueue(Held::from(vec![1, 2, 3]), 2).expect("room");
         assert_eq!(
             b.admit(held, None)[0].0,
             1,
             "nothing shared with A: the empty slot, not the idle conversation"
         );
         b.release(1);
-        b.enqueue(vec![7, 8, 9, 4], 3).expect("room");
+        b.enqueue(Held::from(vec![7, 8, 9, 4]), 3).expect("room");
         assert_eq!(
             b.admit(held, None)[0].0,
             0,
@@ -492,19 +549,19 @@ mod tests {
         );
         let mut b = board(2, 8);
         for r in 0..2 {
-            b.enqueue(vec![r], r).expect("room");
+            b.enqueue(Held::from(vec![r]), r).expect("room");
         }
         b.admit(nothing, None);
         b.release(1);
         b.release(0);
-        b.enqueue(vec![5], 0).expect("room");
+        b.enqueue(Held::from(vec![5]), 0).expect("room");
         assert_eq!(
             b.admit(nothing, None)[0].0,
             1,
             "both empty: the least recently used, not the lowest id"
         );
         b.release(1);
-        b.enqueue(vec![5], 1).expect("room");
+        b.enqueue(Held::from(vec![5]), 1).expect("room");
         assert_eq!(
             b.admit(nothing, Some(1))[0].0,
             1,
@@ -517,24 +574,31 @@ mod tests {
     #[test]
     fn a_request_past_the_depth_is_refused() {
         let mut b = board(2, 1);
-        b.enqueue(vec![0], 0).expect("a free slot");
-        b.enqueue(vec![1], 1).expect("a free slot");
-        b.enqueue(vec![2], 2).expect("the one place in the queue");
+        b.enqueue(Held::from(vec![0]), 0).expect("a free slot");
+        b.enqueue(Held::from(vec![1]), 1).expect("a free slot");
+        b.enqueue(Held::from(vec![2]), 2)
+            .expect("the one place in the queue");
         assert_eq!(
-            b.enqueue(vec![3], 3),
+            b.enqueue(Held::from(vec![3]), 3),
             Err(Refusal::Full { depth: 1 }),
             "two free slots and one place: a fourth waits past the depth"
         );
         assert_eq!(b.admit(nothing, None).len(), 2);
         assert_eq!(b.waiting(), 1);
-        assert_eq!(b.enqueue(vec![3], 3), Err(Refusal::Full { depth: 1 }));
+        assert_eq!(
+            b.enqueue(Held::from(vec![3]), 3),
+            Err(Refusal::Full { depth: 1 })
+        );
         b.release(0);
         assert_eq!(b.admit(nothing, None).len(), 1);
-        b.enqueue(vec![3], 3).expect("the place freed");
+        b.enqueue(Held::from(vec![3]), 3).expect("the place freed");
         let mut none = board(1, 0);
-        none.enqueue(vec![0], 0).expect("the free slot");
+        none.enqueue(Held::from(vec![0]), 0).expect("the free slot");
         none.admit(nothing, None);
-        assert_eq!(none.enqueue(vec![1], 1), Err(Refusal::Full { depth: 0 }));
+        assert_eq!(
+            none.enqueue(Held::from(vec![1]), 1),
+            Err(Refusal::Full { depth: 0 })
+        );
     }
 
     /// An action takes a free slot only while no request waits, and the slot
@@ -542,12 +606,12 @@ mod tests {
     #[test]
     fn an_action_never_goes_ahead_of_a_waiting_request() {
         let mut b = board(2, 8);
-        b.enqueue(vec![0], 0).expect("room");
+        b.enqueue(Held::from(vec![0]), 0).expect("room");
         assert_eq!(b.admit(nothing, None)[0].0, 0);
         b.reserve(Reserve::One(1), "erase").expect("slot 1 is free");
         assert_eq!(b.reserve(Reserve::One(0), "save"), Err(Refusal::Busy));
         assert_eq!(b.reserve(Reserve::All, "reset"), Err(Refusal::Busy));
-        b.enqueue(vec![1], 1).expect("room");
+        b.enqueue(Held::from(vec![1]), 1).expect("room");
         assert!(
             b.admit(nothing, None).is_empty(),
             "slot 1 is held by the action"
@@ -579,7 +643,7 @@ mod tests {
         }
         let mut b: Board<u32, ()> = Board::new(2, 8, Box::new(Past));
         for r in 0..2 {
-            b.enqueue(vec![r], r).expect("room");
+            b.enqueue(Held::from(vec![r]), r).expect("room");
         }
         assert_eq!(
             b.admit(nothing, None).len(),
@@ -587,7 +651,7 @@ mod tests {
             "two wait, two free: no pick"
         );
         for r in 2..5 {
-            b.enqueue(vec![r], r).expect("room");
+            b.enqueue(Held::from(vec![r]), r).expect("room");
         }
         b.release(0);
         b.admit(nothing, None);
@@ -606,7 +670,7 @@ mod tests {
         }
         let mut b: Board<u32, ()> = Board::new(1, 8, Box::new(Newest));
         for r in 0..4 {
-            b.enqueue(vec![r], r).expect("room");
+            b.enqueue(Held::from(vec![r]), r).expect("room");
         }
         let mut order = Vec::new();
         for _ in 0..4 {

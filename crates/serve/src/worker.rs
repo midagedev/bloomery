@@ -43,6 +43,7 @@ use crate::engine::{Drafted, EngineError, SamplerFactory, Saved, SlotPass, SlotR
 use crate::genloop::{
     Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
 };
+use crate::media::{Held, MediaFeed};
 use crate::sched::{Board, Reserve, SlotView};
 use crate::swap::{Entry, NoRoom, Park, ParkTable, QUANTUM, Turn};
 
@@ -95,6 +96,9 @@ pub(crate) struct Submit {
     /// What `/slots` shows of it.
     pub prompt: Value,
     pub settings: Value,
+    /// The prompt's images, in the order of their spans: each rides the
+    /// prompt call that holds its span.
+    pub media: Vec<MediaFeed>,
     pub events: mpsc::Sender<Msg>,
 }
 
@@ -187,7 +191,7 @@ struct Active {
 /// A request that took a slot and waits for its prompt's turn.
 struct Pending {
     slot: usize,
-    ids: Vec<u32>,
+    held: Held,
     sub: Submit,
     /// The admission it took its slot in: requests of one admission start
     /// one after another at turn boundaries, a later one's at a step.
@@ -353,8 +357,8 @@ impl Worker {
                     return;
                 }
             }
-            for (slot, ids, sub) in admitted {
-                if self.start(slot, ids, sub).is_err() {
+            for (slot, held, sub) in admitted {
+                if self.start(slot, &held, sub).is_err() {
                     return;
                 }
             }
@@ -425,15 +429,16 @@ impl Worker {
         Ok(())
     }
 
-    /// A request that took `slot`: its prompt, run now, or planned as calls
-    /// of the engine's quantum that [`Worker::prompts`] runs one a round
-    /// ([`Worker::interleaves`]). Returns whether it runs on (an error ended
-    /// it otherwise).
-    fn start(&mut self, slot: usize, ids: Vec<u32>, sub: Submit) -> Result<bool, Dead> {
+    /// A request that took `slot`: its prompt (`held`, with its images'
+    /// feeds), run now, or planned as calls of the engine's quantum that
+    /// [`Worker::prompts`] runs one a round ([`Worker::interleaves`]).
+    /// Returns whether it runs on (an error ended it otherwise).
+    fn start(&mut self, slot: usize, held: &Held, sub: Submit) -> Result<bool, Dead> {
         let Submit {
             p,
             prompt,
             settings,
+            media,
             events,
         } = sub;
         let _ = events.send(Msg::Started(slot));
@@ -449,19 +454,33 @@ impl Worker {
         if self.turns.is_some() {
             self.show_turns();
         }
-        let n = ids.len();
+        let n = held.ids.len();
         let mut job = Gen::new(&self.slot, &self.sh.sampler, n, &p);
         let kept = match self.slot.select(slot) {
-            Ok(()) => job.open(&mut self.slot, &ids, &p),
+            Ok(()) => job.open(&mut self.slot, held, &p),
             Err(e) => Err(GenError::Engine(e)),
         };
         let r = match kept {
             Ok(kept) => match self.interleaves(n, kept.cache_n) {
                 Some(q) => job
-                    .plan(&self.slot, ids, kept, q, p.return_progress)
+                    .plan(
+                        &self.slot,
+                        held.ids.clone(),
+                        media,
+                        kept,
+                        q,
+                        p.return_progress,
+                    )
                     .map(Some),
                 None => job
-                    .prompt_whole(&mut self.slot, &ids, kept, &p, &mut sink_of(&events))
+                    .prompt_whole(
+                        &mut self.slot,
+                        &held.ids,
+                        &media,
+                        kept,
+                        &p,
+                        &mut sink_of(&events),
+                    )
                     .map(|()| None),
             },
             Err(e) => Err(e),
@@ -765,15 +784,15 @@ impl Worker {
             let batch = t.batches;
             let mut new: Vec<Pending> = admitted
                 .into_iter()
-                .map(|(slot, ids, sub)| Pending {
+                .map(|(slot, held, sub)| Pending {
                     slot,
-                    ids,
+                    held,
                     sub,
                     batch,
                 })
                 .collect();
             // Requests that took slots together: the shortest prompt first.
-            new.sort_by_key(|p| p.ids.len());
+            new.sort_by_key(|p| p.held.ids.len());
             let t = self.t_mut();
             t.deferred.extend(actions);
             t.pending.extend(new);
@@ -869,7 +888,7 @@ impl Worker {
         t.running = Some(p.slot);
         t.turn_from = 0;
         t.stuck = false;
-        if !self.start(p.slot, p.ids, p.sub)? {
+        if !self.start(p.slot, &p.held, p.sub)? {
             self.t_mut().running = None;
         } else if let Some(i) = self.index_of(p.slot) {
             self.active[i].batch = p.batch;
@@ -1119,19 +1138,27 @@ impl Worker {
             }
             Some(Entry::Ids) => {
                 moved = true;
-                let ids = self.slot.held_of(to).to_vec();
+                let held = self.slot.held_of(to).clone();
                 let t1 = Instant::now();
-                let fed = self
-                    .slot
-                    .engine
-                    .reset()
-                    .and_then(|()| self.slot.engine.prefill(&ids));
+                // Ids carry no image to feed a span again; the server refuses
+                // an engine of images whose slots park ids when it binds.
+                let fed = if held.media.is_empty() {
+                    self.slot
+                        .engine
+                        .reset()
+                        .and_then(|()| self.slot.engine.prefill(&held.ids))
+                } else {
+                    Err(EngineError(format!(
+                        "slot {to} holds {} image span(s); ids parking cannot feed them again",
+                        held.media.len()
+                    )))
+                };
                 if let Err(e) = fed {
                     return Err(self.die(&e));
                 }
                 fed_ms = ms_since(t1);
                 let mut s = relock(&self.sh.stats);
-                s.n_reprefill_total += ids.len() as u64;
+                s.n_reprefill_total += held.ids.len() as u64;
                 s.t_reprefill_ms_total += fed_ms;
             }
             None => {

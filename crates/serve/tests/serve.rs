@@ -541,6 +541,282 @@ fn hw_media_parts_are_refused() {
     assert_eq!(reply(ab), reply(json!("a\nb")));
 }
 
+/// A template that renders each message's content and nothing else: the
+/// prompt is the user's text, so the mock's reply reads the image's span.
+const CONTENT_TEMPLATE: &str = "{%- for m in messages -%}{{- m['content'] -}}{%- endfor -%}";
+
+/// 2×1 PNGs of the colours (200, 100, 50) and (50, 100, 200): two images of
+/// one size, so one span length (the mock's model: a position a pixel).
+const PNG_A: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGM4kWIERAAKxQK9KV6Y1QAAAABJRU5ErkJggg==";
+const PNG_B: &str = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAADUlEQVR4nGMwSjkBRAAIbQK9i80DoQAAAABJRU5ErkJggg==";
+
+fn png_url(b64: &str) -> String {
+    format!("data:image/png;base64,{b64}")
+}
+
+/// The media mock's server on `template`, and the log of its image calls.
+fn media_server(
+    template: &str,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::Mutex<Vec<serve::mock::MediaCall>>>,
+) {
+    let (mock, log) = serve::MockEngine::new(4096).with_media();
+    (common::start_templated(Box::new(mock), template), log)
+}
+
+fn media_calls(log: &std::sync::Mutex<Vec<serve::mock::MediaCall>>) -> Vec<serve::mock::MediaCall> {
+    std::mem::take(&mut *log.lock().expect("the media log"))
+}
+
+/// A greedy chat of four tokens whose one user message is `parts`.
+fn parts_chat(parts: Value) -> Value {
+    json!({
+        "messages": [{"role": "user", "content": parts}],
+        "temperature": 0,
+        "max_tokens": 4,
+    })
+}
+
+/// `q`, the image at `url`, and an empty text part: the prompt `q\n` image
+/// `\n` under [`CONTENT_TEMPLATE`], whose reply starts with the span.
+fn image_chat(url: &str) -> Value {
+    parts_chat(json!([
+        {"type": "text", "text": "q"},
+        {"type": "image_url", "image_url": {"url": url}},
+        {"type": "text", "text": ""},
+    ]))
+}
+
+/// One chat's reply text and its cached prompt tokens.
+fn chat_reply(addr: std::net::SocketAddr, body: &Value) -> (Value, Value) {
+    let r = post(addr, "/v1/chat/completions", body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let v = r.json();
+    (
+        v["choices"][0]["message"]["content"].clone(),
+        v["usage"]["prompt_tokens_details"]["cached_tokens"].clone(),
+    )
+}
+
+/// A chat's image part becomes the model's placeholder in the render, one
+/// token the request expands to the image's span (the mock's: two positions
+/// for 2×1); `/props` names the vision, `/apply-template` returns the
+/// placeholder unexpanded, and the engine is fed the image with the ids that
+/// hold its span.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_chat_images_expand_to_spans() {
+    use serve::Tokenizer;
+    use serve::mock::{IMAGE_ID, IMAGE_SPECIAL, MediaCall, MediaTokenizer};
+    let (addr, log) = media_server(common::V41_TEMPLATE);
+    assert_eq!(get(addr, "/props").json()["modalities"]["vision"], true);
+    let url = png_url(PNG_A);
+    let body = parts_chat(json!([
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": url},
+        {"type": "text", "text": "please"},
+    ]));
+    let r = post(addr, "/apply-template", &body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let text = r.json()["prompt"].as_str().expect("a prompt").to_owned();
+    assert!(
+        text.contains(&format!("look\n{IMAGE_SPECIAL}\nplease")),
+        "the parts joined by the model's separator, the image unexpanded: {text}"
+    );
+    let rendered = MediaTokenizer.encode(&text);
+    let at = rendered
+        .iter()
+        .position(|&t| t == IMAGE_ID)
+        .expect("the placeholder");
+    let r = post(addr, "/v1/chat/completions", &body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let n = r.json()["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+    assert_eq!(
+        n as usize,
+        rendered.len() + 1,
+        "one placeholder, two positions"
+    );
+    let mut ids = rendered.clone();
+    ids.insert(at, IMAGE_ID);
+    ids.pop();
+    let key = serve::media::load(&url).expect("the fixture").key;
+    assert_eq!(
+        media_calls(&log),
+        [MediaCall {
+            ids,
+            spans: vec![serve::media::MediaSpan { at, len: 2, key }],
+        }],
+        "the prompt but its last id in one call, the span at the placeholder"
+    );
+}
+
+/// An Anthropic `image` block feeds the engine as the chat's `image_url` part
+/// does: on two fresh servers, `/v1/messages` and `/v1/chat/completions` of
+/// the same turn answer 200 and make the same engine call, the image's span
+/// at its placeholder.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_anthropic_images_feed_as_the_chat_does() {
+    let anthropic = json!({
+        "max_tokens": 4,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": PNG_A}},
+        ]}],
+    });
+    let chat = parts_chat(json!([
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": png_url(PNG_A)}},
+    ]));
+    let (a, a_log) = media_server(common::V41_TEMPLATE);
+    let r = post(a, "/v1/messages", &anthropic);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let (o, o_log) = media_server(common::V41_TEMPLATE);
+    let r = post(o, "/v1/chat/completions", &chat);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let calls = media_calls(&a_log);
+    assert_eq!(calls.len(), 1, "one engine call with the image: {calls:?}");
+    assert_eq!(calls, media_calls(&o_log), "the chat path's call");
+}
+
+/// The prompt cache keys an image's span by the image: two chats of one text
+/// whose images differ only in their pixels share their ids (every span
+/// position carries the image token), and the second keeps up to the span's
+/// start, feeds its own image and replies as a fresh server does; the same
+/// image again keeps the span whole and feeds none. The mock's reply spells
+/// the span it holds, so a kept span of the other image would show.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_chat_reuse_needs_the_same_image() {
+    use serve::mock::{IMAGE_ID, MediaCall};
+    let (addr, log) = media_server(CONTENT_TEMPLATE);
+    let (url_a, url_b) = (png_url(PNG_A), png_url(PNG_B));
+    let first = image_chat(&url_a);
+    let (reply_a, cached) = chat_reply(addr, &first);
+    assert_eq!(cached, 0);
+    assert_eq!(media_calls(&log).len(), 1);
+    // The same image, then the reply and a new user turn: `q\n`, the span
+    // (2..4), `\n`, the reply's ids but its last, then the new text.
+    let mut longer = first.clone();
+    let msgs = longer["messages"].as_array_mut().expect("messages");
+    msgs.push(json!({"role": "assistant", "content": reply_a}));
+    msgs.push(json!({"role": "user", "content": "more\n"}));
+    let (_, cached) = chat_reply(addr, &longer);
+    assert_eq!(
+        cached, 8,
+        "the first prompt and three reply ids: past the span"
+    );
+    assert_eq!(media_calls(&log), [], "a span kept whole is not fed again");
+    let other = image_chat(&url_b);
+    let (reply_b, cached) = chat_reply(addr, &other);
+    assert_eq!(cached, 2, "another image of one size: the span's start");
+    let key_b = serve::media::load(&url_b).expect("the fixture").key;
+    assert_eq!(
+        media_calls(&log),
+        [MediaCall {
+            ids: vec![IMAGE_ID; 2],
+            spans: vec![serve::media::MediaSpan {
+                at: 0,
+                len: 2,
+                key: key_b,
+            }],
+        }],
+        "the other image fed from its span's start"
+    );
+    let (fresh, _) = media_server(CONTENT_TEMPLATE);
+    assert_eq!(chat_reply(fresh, &other).0, reply_b, "b's reply alone");
+    assert_eq!(chat_reply(fresh, &first).0, reply_a, "a's reply alone");
+    assert_ne!(
+        reply_a, reply_b,
+        "the replies spell their images: {reply_a}"
+    );
+}
+
+/// Every refusal of a chat's image, each a 400 by name: a URL this server
+/// does not fetch, a base64 text that is not one, bytes of another format
+/// than the URL declares, an image outside a user message, a placeholder
+/// typed into a text part or into a string content (it pairs with no image),
+/// and a prompt that ends with an image; `/completion` refuses the typed
+/// placeholder too. The engine, which takes an image token only with its
+/// image, serves on after all of them.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_chat_image_refusals_are_named() {
+    use serve::mock::IMAGE_SPECIAL;
+    let (addr, log) = media_server(CONTENT_TEMPLATE);
+    let refused = |path: &str, body: &Value, part: &str| {
+        let r = post(addr, path, body);
+        assert_eq!(r.status, 400, "{}", r.body);
+        let e = &r.json()["error"];
+        assert_eq!(e["type"], "invalid_request_error", "{e}");
+        assert!(
+            e["message"].as_str().is_some_and(|m| m.contains(part)),
+            "`{part}` not in {e}"
+        );
+    };
+    let chat = "/v1/chat/completions";
+    let png = png_url(PNG_A);
+    refused(
+        chat,
+        &image_chat("https://example.com/a.png"),
+        "URLs are not fetched",
+    );
+    refused(
+        chat,
+        &image_chat("data:image/png;base64,Zm9vYmF"),
+        "base64:",
+    );
+    refused(
+        chat,
+        &image_chat(&png.replace("image/png", "image/jpeg")),
+        "declared JPEG, but the bytes are PNG",
+    );
+    let assistant = json!({"messages": [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": [{"type": "image_url", "image_url": png}]},
+        {"role": "user", "content": "hi"},
+    ]});
+    refused(chat, &assistant, "only user messages carry images");
+    let typed = format!("an {IMAGE_SPECIAL} by hand\n");
+    refused(
+        chat,
+        &parts_chat(json!([{"type": "text", "text": typed}])),
+        "carries the image placeholder",
+    );
+    refused(
+        chat,
+        &parts_chat(json!(typed)),
+        "1 image placeholder(s) in the prompt for 0 image(s)",
+    );
+    let with_system = json!({"messages": [
+        {"role": "system", "content": typed},
+        {"role": "user", "content": image_chat(&png)["messages"][0]["content"]},
+    ]});
+    refused(
+        chat,
+        &with_system,
+        "2 image placeholder(s) in the prompt for 1 image(s)",
+    );
+    let last = parts_chat(json!([
+        {"type": "text", "text": "q"},
+        {"type": "image_url", "image_url": png},
+    ]));
+    refused(chat, &last, "the prompt ends with an image");
+    refused(
+        "/completion",
+        &json!({"prompt": typed, "n_predict": 2}),
+        "1 image placeholder(s) in the prompt for 0 image(s)",
+    );
+    assert_eq!(media_calls(&log), [], "nothing reached the engine");
+    let (reply, _) = chat_reply(addr, &image_chat(&png));
+    assert!(reply.as_str().is_some_and(|r| !r.is_empty()), "{reply}");
+    assert_eq!(get(addr, "/health").status, 200);
+}
+
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_models_created_is_process_start() {
@@ -1576,14 +1852,16 @@ fn hw_slot_save_erase_restore_round_trip() {
     let r = slot_post(addr, "save", "a.bin");
     assert_eq!(r.status, 200, "{}", r.body);
     let v = r.json();
-    // Derived: a 24-byte header and 10 ids, then the mock's 16-byte head and 10 ids.
+    // Derived: a 24-byte header, 10 ids and an empty span table (its count),
+    // then the mock's 16-byte head and 10 ids.
+    let bytes = 24 + 4 * 10 + 8 + 16 + 4 * 10;
     assert_eq!(v["id_slot"], 0, "{v}");
     assert_eq!(v["filename"], "a.bin", "{v}");
     assert_eq!(v["n_saved"], 10, "{v}");
-    assert_eq!(v["n_written"], 120, "{v}");
+    assert_eq!(v["n_written"], bytes, "{v}");
     assert!(v["timings"]["save_ms"].is_f64(), "{v}");
     let on_disk = std::fs::metadata(dir.join("a.bin")).expect("a.bin").len();
-    assert_eq!(on_disk, 120, "the file's bytes against n_written");
+    assert_eq!(on_disk, bytes, "the file's bytes against n_written");
     assert_eq!(listing(&dir), ["a.bin"], "a partial file was left behind");
 
     let r = erase(addr);
@@ -1605,7 +1883,7 @@ fn hw_slot_save_erase_restore_round_trip() {
     assert_eq!(v["id_slot"], 0, "{v}");
     assert_eq!(v["filename"], "a.bin", "{v}");
     assert_eq!(v["n_restored"], 10, "{v}");
-    assert_eq!(v["n_read"], 120, "{v}");
+    assert_eq!(v["n_read"], bytes, "{v}");
     assert!(v["timings"]["restore_ms"].is_f64(), "{v}");
     let warm = post(addr, "/completion", &slot_b()).json();
     assert_eq!(
@@ -1629,6 +1907,66 @@ fn hw_slot_save_erase_restore_round_trip() {
         warm["tokens"], fresh["tokens"],
         "warm {warm}\nfresh {fresh}"
     );
+    common::drop_dir(&dir);
+}
+
+/// A slot file carries the slot's images: the span table after the ids, and
+/// a restore — in the server that saved it and in another — keeps the span
+/// whole for the next chat of the same image and feeds none. The same file
+/// as version 1 (ids alone) restores a slot of no image, so the same chat
+/// keeps up to the span's start and feeds the image again.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_slot_files_carry_image_spans() {
+    let dir = common::fresh_dir("media-slots");
+    let start_media = || {
+        let (mock, log) = serve::MockEngine::new(4096).with_media();
+        (common::start_slots(Box::new(mock), &dir), log)
+    };
+    let (addr, log) = start_media();
+    let body = image_chat(&png_url(PNG_A));
+    let r = post(addr, "/v1/chat/completions", &body);
+    assert_eq!(r.status, 200, "{}", r.body);
+    let n = r.json()["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt_tokens");
+    let at = media_calls(&log)[0].spans[0].at as u64;
+    let v = slot_post(addr, "save", "media.bin").json();
+    let held = v["n_saved"].as_u64().expect("n_saved");
+    // Derived: a 24-byte header, the held ids, the span count and one span,
+    // then the mock's 16-byte head and its context of as many ids.
+    let bytes = 24 + 4 * held + 8 + 48 + 16 + 4 * held;
+    assert_eq!(v["n_written"], bytes, "{v}");
+    let warm = |addr| {
+        let r = post(addr, "/v1/chat/completions", &body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()["usage"]["prompt_tokens_details"]["cached_tokens"].clone()
+    };
+
+    assert_eq!(erase(addr).status, 200);
+    let r = slot_post(addr, "restore", "media.bin");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["n_restored"], held);
+    assert_eq!(warm(addr), n - 1, "the restored span is kept whole");
+    assert_eq!(media_calls(&log), [], "a restored span is not fed again");
+
+    let (other, other_log) = start_media();
+    assert_eq!(slot_post(other, "restore", "media.bin").status, 200);
+    assert_eq!(warm(other), n - 1, "another server keeps the span whole");
+    assert_eq!(media_calls(&other_log), []);
+
+    let good = std::fs::read(dir.join("media.bin")).expect("media.bin");
+    let ids_end = (24 + 4 * held) as usize;
+    let mut v1 = good[..ids_end].to_vec();
+    v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+    v1.extend_from_slice(&good[ids_end + 8 + 48..]);
+    std::fs::write(dir.join("v1.bin"), &v1).expect("write");
+    assert_eq!(erase(other).status, 200);
+    let r = slot_post(other, "restore", "v1.bin");
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["n_restored"], held);
+    assert_eq!(warm(other), at, "a slot of no image: the span's start");
+    assert_eq!(media_calls(&other_log).len(), 1, "the image fed again");
     common::drop_dir(&dir);
 }
 
@@ -1754,9 +2092,10 @@ fn hw_slot_action_errors() {
     let kept = post(addr, "/completion", &slot_b()).json();
     assert_eq!(kept["timings"]["cache_n"], 8, "{kept}");
 
-    // The engine's part refused: the engine read, so the cache is reset.
+    // The engine's part refused: the engine read, so the cache is reset. Its
+    // tag follows the 24-byte header, A's 10 ids and the span count.
     post(addr, "/completion", &slot_a());
-    patched("mocktag.bin", 64, b"X");
+    patched("mocktag.bin", 24 + 4 * 10 + 8, b"X");
     assert_error(
         &slot_post(addr, "restore", "mocktag.bin"),
         400,

@@ -3,17 +3,28 @@
 //! token into the image's span. What a model contributes is a [`MediaModel`] (`crates/vision`):
 //! the placeholder text and its token, the separator between flattened parts, and one prepare.
 //!
+//! What a prompt, a slot or a cached state holds is a [`Held`]: the ids and the spans of the
+//! images among them. [`common_prefix`] reads both, so two prompts that differ only in their
+//! images share nothing of the image's span; neither it nor [`keep_whole_spans`] ends a kept
+//! prefix inside a span, which is kept whole or fed whole. [`expand_prompt`] makes a chat's
+//! [`Prompt`]: its held sequence and one [`MediaFeed`] per image for the engine.
+//!
 //! An image arrives only inside a `data:` URL holding a base64 PNG or JPEG, in either OpenAI form
 //! of an `image_url` part. Every refusal is one [`MediaError`] variant that names what it refused;
 //! nothing is skipped, repaired or fetched.
 
 use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 pub use vision::{FileKind, MediaModel, Prepared, Rgb8, VisionError};
+
+/// A [`MediaModel`] the server holds across its threads: the request threads prepare images on
+/// it while the engine runs elsewhere.
+pub type SharedMediaModel = Arc<dyn MediaModel + Send + Sync>;
 
 /// One part of a message's `content` array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +62,156 @@ pub struct Expanded {
     pub ids: Vec<u32>,
     /// Where each image's span sits in `ids`, in the order of the images.
     pub spans: Vec<Range<usize>>,
+}
+
+/// One image's span among a prompt's ids: its first position, its length, and the key of the
+/// image that occupies it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MediaSpan {
+    pub at: usize,
+    pub len: usize,
+    pub key: ImageKey,
+}
+
+impl MediaSpan {
+    /// The position past its last.
+    #[must_use]
+    pub fn end(&self) -> usize {
+        self.at + self.len
+    }
+}
+
+/// What a prompt, a slot or a cached state holds: the ids, one a position, and the image spans
+/// among them. Every position of a span carries the image token, so the ids alone cannot tell
+/// two images of one grid apart: the key can.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    pub ids: Vec<u32>,
+    /// Ascending, not overlapping, each whole inside `ids`.
+    pub media: Vec<MediaSpan>,
+}
+
+impl From<Vec<u32>> for Held {
+    fn from(ids: Vec<u32>) -> Held {
+        Held {
+            ids,
+            media: Vec::new(),
+        }
+    }
+}
+
+impl Held {
+    /// The positions it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// Appends one id; no span starts at it.
+    pub fn push(&mut self, id: u32) {
+        self.ids.push(id);
+    }
+
+    /// Keeps the first `n` ids and the spans that lie whole inside them.
+    pub fn truncate(&mut self, n: usize) {
+        self.ids.truncate(n);
+        self.media.retain(|s| s.end() <= n);
+    }
+
+    /// Whether `self` extends `head`: the same ids, and the same image spans where they overlap.
+    #[must_use]
+    pub fn starts_with(&self, head: &Held) -> bool {
+        self.ids.starts_with(&head.ids)
+            && head.media.iter().all(|s| self.media.contains(s))
+            && self
+                .media
+                .iter()
+                .all(|s| s.at >= head.ids.len() || head.media.contains(s))
+    }
+
+    /// The span a prefix of `n` positions would end inside: one that starts before `n` and ends
+    /// after it.
+    #[must_use]
+    pub fn span_around(&self, n: usize) -> Option<&MediaSpan> {
+        self.media.iter().find(|s| s.at < n && n < s.end())
+    }
+}
+
+/// How many leading positions `a` and `b` share. Their ids must be equal, and every image span
+/// inside the shared part must hold the same image on both sides: the same key and the same
+/// length. A span the shared part would end inside, or hold with another image, ends the sharing
+/// at that span's start — the position a later request resumes the prompt at.
+#[must_use]
+pub fn common_prefix(a: &Held, b: &Held) -> usize {
+    let mut n = a.ids.iter().zip(&b.ids).take_while(|(x, y)| x == y).count();
+    for s in a.media.iter().chain(&b.media) {
+        if s.at >= n {
+            continue;
+        }
+        let shared = a.media.contains(s) && b.media.contains(s);
+        if s.end() > n || !shared {
+            n = s.at;
+        }
+    }
+    n
+}
+
+/// What a cache resumes `req` at when it may keep at most `n` positions of it and keeps
+/// `keepable(m)` of any `m`: an image span is kept whole or fed whole, so a keep that would end
+/// inside one of `req`'s spans goes back to the span's start, and the cache is asked again from
+/// there (llama.cpp's `keep_first`, mistral.rs's `clamp_normal_prefix_len`).
+pub fn keep_whole_spans(req: &Held, n: usize, keepable: impl Fn(usize) -> usize) -> usize {
+    let mut k = keepable(n).min(n);
+    while let Some(s) = req.span_around(k) {
+        k = keepable(s.at).min(s.at);
+    }
+    k
+}
+
+/// One image a request carries into the engine: where its span sits in the prompt, its key, and
+/// its prepare — the last shared by every call that feeds the span's positions, so a prompt cut
+/// into calls hands the engine the same image.
+#[derive(Clone, Debug)]
+pub struct MediaFeed {
+    /// The span's first position in the ids it rides with: the prompt's in a [`Prompt`], the
+    /// call's in [`crate::Engine::prefill_media`].
+    pub at: usize,
+    pub key: ImageKey,
+    pub prepared: Arc<Prepared>,
+}
+
+impl MediaFeed {
+    /// The span this feed occupies: `prepared.span_len` positions from `at`.
+    #[must_use]
+    pub fn span(&self) -> MediaSpan {
+        MediaSpan {
+            at: self.at,
+            len: self.prepared.span_len,
+            key: self.key,
+        }
+    }
+}
+
+/// A prompt as a request hands it to the engine thread: what its slot holds once the prompt is
+/// fed, and one feed per image, in the order of the spans.
+#[derive(Clone, Debug, Default)]
+pub struct Prompt {
+    pub held: Held,
+    pub feeds: Vec<MediaFeed>,
+}
+
+impl From<Vec<u32>> for Prompt {
+    fn from(ids: Vec<u32>) -> Prompt {
+        Prompt {
+            held: Held::from(ids),
+            feeds: Vec::new(),
+        }
+    }
 }
 
 /// Everything the media part refuses, each naming what it refused. All but [`MediaError::EmptySpan`]
@@ -131,6 +292,9 @@ pub enum MediaError {
     /// A prepared image whose span is empty (the model's fault, not the request's).
     #[error("image {0} has an empty span")]
     EmptySpan(usize),
+    /// A prompt whose last position is an image's: the reply is read after a text position.
+    #[error("the prompt ends with an image; its last position must be text")]
+    ImageLast,
 }
 
 impl fmt::Display for ImageKey {
@@ -276,6 +440,56 @@ pub fn expand_spans(
     Ok(Expanded { ids: out, spans })
 }
 
+/// The prompt of a rendered chat whose ids are `ids` and whose images are `urls`, in the order of
+/// their placeholders: each image loaded and prepared on the calling thread, its placeholder's
+/// token expanded to its span, and one feed per image. The placeholders are counted and the last
+/// position checked before any image is decoded, so a placeholder typed into the text, which
+/// pairs with no image, costs no decode.
+pub fn expand_prompt(
+    ids: &[u32],
+    urls: &[&str],
+    model: &dyn MediaModel,
+) -> Result<Prompt, MediaError> {
+    let token = model.image_token();
+    let placeholders = ids.iter().filter(|&&t| t == token).count();
+    if placeholders != urls.len() {
+        return Err(MediaError::PlaceholderCount {
+            placeholders,
+            images: urls.len(),
+        });
+    }
+    if ids.last() == Some(&token) {
+        return Err(MediaError::ImageLast);
+    }
+    let files = urls
+        .iter()
+        .map(|url| load(url))
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared = files
+        .iter()
+        .map(|f| prepare(f, model))
+        .collect::<Result<Vec<_>, _>>()?;
+    let lens: Vec<usize> = prepared.iter().map(|p| p.span_len).collect();
+    let expanded = expand_spans(ids, token, &lens)?;
+    let feeds: Vec<MediaFeed> = expanded
+        .spans
+        .iter()
+        .zip(files.iter().zip(prepared))
+        .map(|(span, (file, prepared))| MediaFeed {
+            at: span.start,
+            key: file.key,
+            prepared: Arc::new(prepared),
+        })
+        .collect();
+    Ok(Prompt {
+        held: Held {
+            ids: expanded.ids,
+            media: feeds.iter().map(MediaFeed::span).collect(),
+        },
+        feeds,
+    })
+}
+
 /// A `data:` URL's declared format and its data. Scheme and media type are matched without case
 /// (RFC 3986 §3.1, RFC 2045 §5.1); a media type with parameters is not one of the accepted.
 fn data_url(url: &str) -> Result<(FileKind, &str), MediaError> {
@@ -395,8 +609,9 @@ mod tests {
     use vision::{GridPlan, Patches};
 
     use super::{
-        Expanded, FileKind, ImageKey, MediaError, MediaModel, Part, Prepared, Rgb8, VisionError,
-        expand_spans, flatten, load, parse_part, prepare,
+        Expanded, FileKind, Held, ImageKey, MediaError, MediaModel, MediaSpan, Part, Prepared,
+        Rgb8, VisionError, common_prefix, expand_prompt, expand_spans, flatten, keep_whole_spans,
+        load, parse_part, prepare,
     };
 
     /// A 2×1 RGB PNG of the colour (200, 100, 50).
@@ -785,5 +1000,187 @@ mod tests {
         assert!(msg.len() < 200, "{} bytes: {msg}", msg.len());
         let part: Value = json!({"type": "y".repeat(10_000)});
         assert!(err(parse_part(&part)).to_string().len() < 200);
+    }
+
+    /// One piece of a [`seq`]: `n` text positions, or an image of `len` positions and key `k`.
+    enum Piece {
+        Text(usize),
+        Image(usize, u8),
+    }
+    use Piece::{Image, Text};
+
+    /// A well-formed held sequence: each text position its own id (`100 +` its position), each
+    /// image position the stub's image token 7, each image a span with the key `[k; 32]`.
+    fn seq(pieces: &[Piece]) -> Held {
+        let mut h = Held::default();
+        for p in pieces {
+            match *p {
+                Text(n) => {
+                    let at = h.ids.len();
+                    h.ids.extend((at..at + n).map(|i| 100 + i as u32));
+                }
+                Image(len, k) => {
+                    h.media.push(MediaSpan {
+                        at: h.ids.len(),
+                        len,
+                        key: ImageKey([k; 32]),
+                    });
+                    h.ids.extend(std::iter::repeat_n(7, len));
+                }
+            }
+        }
+        h
+    }
+
+    /// Two images of one grid have the same ids (every span position carries the image token): the
+    /// key stops the sharing at the span's start. The same image is shared whole; a span of
+    /// another length, or one only one side marks, is another image.
+    #[test]
+    fn the_shared_prefix_needs_the_same_image_in_the_span() {
+        let a = seq(&[Text(3), Image(3, 1), Text(2)]);
+        let longer = seq(&[Text(3), Image(3, 1), Text(4)]);
+        assert_eq!(common_prefix(&a, &longer), 8, "the same image: all of a");
+        let other = seq(&[Text(3), Image(3, 2), Text(2)]);
+        assert_eq!(a.ids, other.ids, "one grid: the ids are equal");
+        assert_eq!(
+            common_prefix(&a, &other),
+            3,
+            "another image: the span's start"
+        );
+        assert_eq!(common_prefix(&other, &a), 3, "either order");
+        let wider = seq(&[Text(3), Image(4, 1), Text(1)]);
+        assert_eq!(
+            common_prefix(&a, &wider),
+            3,
+            "another length is another image"
+        );
+        let unmarked = Held::from(a.ids.clone());
+        assert_eq!(
+            common_prefix(&a, &unmarked),
+            3,
+            "a span one side does not mark"
+        );
+        let two = seq(&[Text(3), Image(3, 1), Text(2), Image(2, 9), Text(1)]);
+        let two_b = seq(&[Text(3), Image(3, 1), Text(2), Image(2, 8), Text(1)]);
+        assert_eq!(
+            common_prefix(&two, &two_b),
+            8,
+            "the first shared, the second not"
+        );
+        assert_eq!(common_prefix(&two, &two), two.len());
+        let text = Held::from(vec![1, 2, 3]);
+        assert_eq!(common_prefix(&text, &Held::from(vec![1, 2, 4])), 2);
+        assert_eq!(common_prefix(&Held::default(), &text), 0);
+    }
+
+    /// A state cut inside a span (its ids stop among the span's image tokens, its table drops the
+    /// span) shares with the request that carries the span only up to the span's start.
+    #[test]
+    fn a_prefix_ending_inside_a_span_is_cut_to_its_start() {
+        let req = seq(&[Text(3), Image(3, 1), Text(2)]);
+        let mut cut = req.clone();
+        cut.truncate(5);
+        assert_eq!(
+            (cut.len(), cut.media.len()),
+            (5, 0),
+            "4 and 5 of the span 3..6"
+        );
+        assert_eq!(common_prefix(&cut, &req), 3);
+        assert_eq!(common_prefix(&req, &cut), 3);
+        let mut at_end = req.clone();
+        at_end.truncate(6);
+        assert_eq!(at_end.media, req.media, "the span lies whole inside 6");
+        assert_eq!(common_prefix(&at_end, &req), 6);
+        let two = seq(&[Text(3), Image(3, 1), Text(2), Image(2, 1), Text(1)]);
+        let mut in_second = two.clone();
+        in_second.truncate(9);
+        assert_eq!(common_prefix(&in_second, &two), 8, "9 lies inside 8..10");
+    }
+
+    /// An engine that keeps less than asked keeps no part of an image: a keep inside a span goes
+    /// back to its start and asks again.
+    #[test]
+    fn a_keep_inside_a_span_goes_back_to_its_start() {
+        let req = seq(&[Text(3), Image(3, 1), Text(2)]);
+        let all = |n: usize| n;
+        assert_eq!(keep_whole_spans(&req, 7, all), 7);
+        assert_eq!(keep_whole_spans(&req, 6, all), 6, "the span's end");
+        assert_eq!(keep_whole_spans(&req, 5, all), 3, "inside: its start");
+        let even = |n: usize| n / 2 * 2;
+        assert_eq!(keep_whole_spans(&req, 7, even), 6);
+        assert_eq!(keep_whole_spans(&req, 5, |n: usize| n.min(4)), 3);
+        let fours = |n: usize| n / 4 * 4;
+        assert_eq!(
+            keep_whole_spans(&req, 7, fours),
+            0,
+            "4 lies inside 3..6; the engine keeps 0 of 3"
+        );
+        let grow = |n: usize| n + 2;
+        assert_eq!(keep_whole_spans(&req, 2, grow), 2, "never past n");
+    }
+
+    /// [`Held::starts_with`] needs the same ids and the same images where they overlap: a state of
+    /// another image is not the sequence it covers.
+    #[test]
+    fn held_starts_with_needs_the_same_images() {
+        let a = seq(&[Text(3), Image(3, 1), Text(2)]);
+        assert!(a.starts_with(&a));
+        assert!(a.starts_with(&Held::from(a.ids[..3].to_vec())));
+        assert!(a.starts_with(&seq(&[Text(3), Image(3, 1)])));
+        assert!(Held::default().starts_with(&Held::default()));
+        assert!(
+            !a.starts_with(&Held::from(a.ids.clone())),
+            "the head marks no span"
+        );
+        assert!(
+            !a.starts_with(&seq(&[Text(3), Image(3, 2), Text(2)])),
+            "the head holds another image"
+        );
+        let mut cut = a.clone();
+        cut.truncate(5);
+        assert!(!a.starts_with(&cut), "the head ends inside the span");
+        assert!(!cut.starts_with(&a));
+    }
+
+    /// A chat's prompt: the placeholders counted against the images before a decode, each image's
+    /// span and feed in placeholder order, and a prompt that ends with an image refused.
+    #[test]
+    fn a_prompt_expands_with_one_feed_per_image() {
+        let png = data("image/png", PNG_B64);
+        let p = expand_prompt(&[1, 7, 2, 7, 3], &[&png, &png], &PLAIN).unwrap();
+        assert_eq!(p.held.ids, [1, 7, 7, 2, 7, 7, 3]);
+        let key = load(&png).unwrap().key;
+        assert_eq!(
+            p.held.media,
+            [
+                MediaSpan { at: 1, len: 2, key },
+                MediaSpan { at: 4, len: 2, key }
+            ]
+        );
+        let spans: Vec<MediaSpan> = p.feeds.iter().map(super::MediaFeed::span).collect();
+        assert_eq!(spans, p.held.media, "one feed per span");
+        let text = expand_prompt(&[1, 2], &[], &PLAIN).unwrap();
+        assert_eq!((text.held, text.feeds.len()), (Held::from(vec![1, 2]), 0));
+        for (ids, urls, want) in [
+            (&[1, 7, 2][..], &[][..], (1, 0)),
+            (&[1, 7, 7, 2][..], &[png.as_str()][..], (2, 1)),
+            (&[1, 2][..], &[png.as_str()][..], (0, 1)),
+        ] {
+            match err(expand_prompt(ids, urls, &PLAIN)) {
+                MediaError::PlaceholderCount {
+                    placeholders,
+                    images,
+                } => assert_eq!((placeholders, images), want, "{ids:?}"),
+                e => panic!("{ids:?}: {e}"),
+            }
+        }
+        assert!(matches!(
+            err(expand_prompt(&[1, 7], &[&png], &PLAIN)),
+            MediaError::ImageLast
+        ));
+        assert!(matches!(
+            err(expand_prompt(&[1, 7, 2], &["https://x/a.png"], &PLAIN)),
+            MediaError::Scheme(_)
+        ));
     }
 }
