@@ -5,19 +5,28 @@
 //! `q6k_gemv` writes `m > 1` columns row-major; `qwen3moe_token_major`
 //! copies them into the token-major layout the rest of the chain reads.
 //!
-//! Every row and column is `q4k_gemv`'s one-column body:
-//! `cores::q4k_row_dot_1col`, the fixed warp tree and the lane-0 store, run
-//! once per activation column. So each output is bit for bit the value the
-//! per-matrix `q4k_gemv` launch writes at one column, and the residual
-//! output is that value plus the residual — one add, `elem::add`'s. The
-//! multi-column walk `cores::q4k_row_dot` is not used: at K = 4096 its
-//! column sums differ from the one-column body's in the low bits, so a
-//! prompt pass through it would not leave the rows a decode step leaves.
-//! Outputs are token-major: column `c` of an `m`-column launch lands at
-//! `c · rows + r`, which at `m = 1` is the one layout of every consumer.
+//! Every projection has two entries, split by column count the way
+//! `q4k_gemv` and `q4k_gemv_mcol` are. The one-column entries
+//! (`qwen3moe_qkv_q4k`, `qwen3moe_o_resid_q4k`) run the step (m = 1), every
+//! row and column `q4k_gemv`'s one-column body: `cores::q4k_row_dot_1col`,
+//! the fixed warp tree and the lane-0 store, run once per activation
+//! column. The m-column entries (`qwen3moe_qkv_q4k_mcol`,
+//! `qwen3moe_o_resid_q4k_mcol`) run the pass (m = 2..=8), one
+//! `cores::q4k_row_dot` a row for all `m` columns, so each weight word is
+//! read once instead of `m` times; that walk's column c is the one-column
+//! body on that column bit for bit — it follows the body's compiled
+//! rounding term for term (`cores::q4k_acc`), a property `gate_mcol` pins
+//! on the shared `q4k_gemv` pair up to K = 8192 — so each output, from
+//! either entry, is bit for bit the value the per-matrix `q4k_gemv` launch
+//! writes at one column, and the residual output is that value plus the
+//! residual — one add, `elem::add`'s. A pass therefore leaves the rows a
+//! decode step leaves, which `gate_qwen3moe_e2e`'s prefill clauses hold
+//! against the one-token path. Outputs are token-major: column `c` of an
+//! `m`-column launch lands at `c · rows + r`, which at `m = 1` is the one
+//! layout of every consumer.
 
 use crate::GpuError;
-use crate::cores::q4k_row_dot_1col;
+use crate::cores::{q4k_row_dot, q4k_row_dot_1col};
 use crate::launch_u32;
 use crate::tensor::{DeviceTensor, Q8Act};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -110,6 +119,147 @@ mod qwen3moe_proj_kernels {
         }
     }
 
+    /// The query, key and value projections of `m_cols` (1..=8) activation
+    /// columns in one launch, the m-column walk of `qwen3moe_qkv_q4k`
+    /// (module doc): the row's weight words are read once for all `m`
+    /// columns by `cores::q4k_row_dot`, whose column c is that entry's
+    /// column c bit for bit, and every column is stored where that entry
+    /// stores it. `rows_v` 0 leaves `wv` and the value block untouched (a
+    /// Q6_K value projection).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            wq.len() >= rows_q * 36 * n_sb,
+            wk.len() >= rows_k * 36 * n_sb,
+            wv.len() >= rows_v * 36 * n_sb,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            off_k >= rows_q * m_cols,
+            off_v >= off_k + rows_k * m_cols,
+            y.len() >= off_v + rows_v * m_cols,
+            m_cols >= 1,
+            m_cols <= 8
+        )
+    )]
+    pub fn qwen3moe_qkv_q4k_mcol(
+        wq: &[u32],
+        wk: &[u32],
+        wv: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        rows_q: u32,
+        rows_k: u32,
+        rows_v: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        off_k: u32,
+        off_v: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let (rq, rk, rv) = (rows_q as usize, rows_k as usize, rows_v as usize);
+        if row >= rq + rk + rv {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let m = m_cols as usize;
+        let n_sb = n_sb as usize;
+        // The row's matrix and its output block, warp-uniform: the warp's
+        // 32 lanes share `row`.
+        let (w, base, r, rows) = if row < rq {
+            (wq, 0, row, rq)
+        } else if row < rq + rk {
+            (wk, off_k as usize, row - rq, rk)
+        } else {
+            (wv, off_v as usize, row - rq - rk, rv)
+        };
+        // The core's caller contract, from the launch contract: r < rows
+        // rows of `w`, columns 0..m_cols of q/s8/d8, iters = ceil(n_sb/4)
+        // from the host, and all 32 lanes of the warp are here (the return
+        // above is warp-uniform). One walk covers every column.
+        let f = q4k_row_dot(w, q, s8, d8, n_sb, iters, r, 0, m, lane);
+        // Warp-uniform reduction (m is a launch-wide constant): column c's
+        // tree runs only when m > c, every lane on the same branch, so the
+        // shuffles stay warp-collective.
+        let s0 = warp::reduce_sum_f32(f[0]);
+        let s1 = if m > 1 {
+            warp::reduce_sum_f32(f[1])
+        } else {
+            0.0
+        };
+        let s2 = if m > 2 {
+            warp::reduce_sum_f32(f[2])
+        } else {
+            0.0
+        };
+        let s3 = if m > 3 {
+            warp::reduce_sum_f32(f[3])
+        } else {
+            0.0
+        };
+        let s4 = if m > 4 {
+            warp::reduce_sum_f32(f[4])
+        } else {
+            0.0
+        };
+        let s5 = if m > 5 {
+            warp::reduce_sum_f32(f[5])
+        } else {
+            0.0
+        };
+        let s6 = if m > 6 {
+            warp::reduce_sum_f32(f[6])
+        } else {
+            0.0
+        };
+        let s7 = if m > 7 {
+            warp::reduce_sum_f32(f[7])
+        } else {
+            0.0
+        };
+        if lane == 0 {
+            // SAFETY: c < m_cols and r < rows, so base + c·rows + r <
+            // base + rows·m_cols <= y.len() by the launch contract's block
+            // bounds; lane 0 of the row's warp is the only writer of the
+            // row's slots, each store guarded by its own m > c.
+            unsafe {
+                *y.get_unchecked_mut(base + r) = s0;
+                if m > 1 {
+                    *y.get_unchecked_mut(base + rows + r) = s1;
+                }
+                if m > 2 {
+                    *y.get_unchecked_mut(base + 2 * rows + r) = s2;
+                }
+                if m > 3 {
+                    *y.get_unchecked_mut(base + 3 * rows + r) = s3;
+                }
+                if m > 4 {
+                    *y.get_unchecked_mut(base + 4 * rows + r) = s4;
+                }
+                if m > 5 {
+                    *y.get_unchecked_mut(base + 5 * rows + r) = s5;
+                }
+                if m > 6 {
+                    *y.get_unchecked_mut(base + 6 * rows + r) = s6;
+                }
+                if m > 7 {
+                    *y.get_unchecked_mut(base + 7 * rows + r) = s7;
+                }
+            }
+        }
+    }
+
     /// The output projection of `m_cols` activation columns with the
     /// residual: `y[c · rows + r] = (w · act_c)[r] + x[c · rows + r]`, the
     /// dot as `q4k_gemv` computes it and one add (module doc).
@@ -164,6 +314,133 @@ mod qwen3moe_proj_kernels {
                 unsafe { *y.get_unchecked_mut(i) = v + *x.get_unchecked(i) };
             }
             c += 1;
+        }
+    }
+
+    /// The output projection of `m_cols` (1..=8) activation columns with the
+    /// residual, the m-column walk of `qwen3moe_o_resid_q4k` (module doc):
+    /// one `cores::q4k_row_dot` a row for all `m` columns, each column's
+    /// value the one-column entry's bit for bit, `y[c · rows + r] =
+    /// (w · act_c)[r] + x[c · rows + r]` — the dot as `q4k_gemv` computes it
+    /// and one add, `elem::add`'s.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= rows * 36 * n_sb,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            x.len() >= rows * m_cols,
+            y.len() >= rows * m_cols,
+            m_cols >= 1,
+            m_cols <= 8
+        )
+    )]
+    pub fn qwen3moe_o_resid_q4k_mcol(
+        w: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        x: &[f32],
+        rows: u32,
+        m_cols: u32,
+        n_sb: u32,
+        iters: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let rows = rows as usize;
+        if row >= rows {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        let m = m_cols as usize;
+        let n_sb = n_sb as usize;
+        // The core's caller contract as in `qwen3moe_qkv_q4k_mcol`: one walk
+        // covers every column.
+        let f = q4k_row_dot(w, q, s8, d8, n_sb, iters, row, 0, m, lane);
+        // Warp-uniform reduction (m is a launch-wide constant), as in
+        // `qwen3moe_qkv_q4k_mcol`.
+        let s0 = warp::reduce_sum_f32(f[0]);
+        let s1 = if m > 1 {
+            warp::reduce_sum_f32(f[1])
+        } else {
+            0.0
+        };
+        let s2 = if m > 2 {
+            warp::reduce_sum_f32(f[2])
+        } else {
+            0.0
+        };
+        let s3 = if m > 3 {
+            warp::reduce_sum_f32(f[3])
+        } else {
+            0.0
+        };
+        let s4 = if m > 4 {
+            warp::reduce_sum_f32(f[4])
+        } else {
+            0.0
+        };
+        let s5 = if m > 5 {
+            warp::reduce_sum_f32(f[5])
+        } else {
+            0.0
+        };
+        let s6 = if m > 6 {
+            warp::reduce_sum_f32(f[6])
+        } else {
+            0.0
+        };
+        let s7 = if m > 7 {
+            warp::reduce_sum_f32(f[7])
+        } else {
+            0.0
+        };
+        if lane == 0 {
+            // SAFETY: c < m_cols and row < rows, so c·rows + row <
+            // rows·m_cols <= x.len(), y.len() by the launch contract; lane 0
+            // of the row's warp is the only writer of the row's slots, each
+            // store guarded by its own m > c.
+            unsafe {
+                *y.get_unchecked_mut(row) = s0 + *x.get_unchecked(row);
+                if m > 1 {
+                    let i = rows + row;
+                    *y.get_unchecked_mut(i) = s1 + *x.get_unchecked(i);
+                }
+                if m > 2 {
+                    let i = 2 * rows + row;
+                    *y.get_unchecked_mut(i) = s2 + *x.get_unchecked(i);
+                }
+                if m > 3 {
+                    let i = 3 * rows + row;
+                    *y.get_unchecked_mut(i) = s3 + *x.get_unchecked(i);
+                }
+                if m > 4 {
+                    let i = 4 * rows + row;
+                    *y.get_unchecked_mut(i) = s4 + *x.get_unchecked(i);
+                }
+                if m > 5 {
+                    let i = 5 * rows + row;
+                    *y.get_unchecked_mut(i) = s5 + *x.get_unchecked(i);
+                }
+                if m > 6 {
+                    let i = 6 * rows + row;
+                    *y.get_unchecked_mut(i) = s6 + *x.get_unchecked(i);
+                }
+                if m > 7 {
+                    let i = 7 * rows + row;
+                    *y.get_unchecked_mut(i) = s7 + *x.get_unchecked(i);
+                }
+            }
         }
     }
 
@@ -265,8 +542,9 @@ impl ProjKernels {
     }
 
     /// Enqueue the query, key and (a Q4_K) value projections of `a.act`'s
-    /// columns in one launch (module doc). Asynchronous, allocation-free,
-    /// capturable.
+    /// columns in one launch (module doc): the one-column entry at
+    /// `act.m()` 1, the m-column walk past it. Asynchronous,
+    /// allocation-free, capturable.
     pub fn enqueue_qkv(&self, stream: &CudaStream, a: QkvArgs<'_>) -> Result<(), GpuError> {
         let what = "qwen3moe::enqueue_qkv";
         let QkvArgs {
@@ -306,28 +584,56 @@ impl ProjKernels {
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
         let off_k = launch_u32(what, "off_k", off_k)?;
         let off_v = launch_u32(what, "off_v", off_v)?;
-        let prep = self
-            .module
-            .prepare_qwen3moe_qkv_q4k(LaunchConfig1D::new(grid, 256, 0))?;
-        self.module.qwen3moe_qkv_q4k(
-            stream,
-            &prep,
-            wq.buf(),
-            wk.buf(),
-            wv.unwrap_or(wk).buf(),
-            &act.q4,
-            &act.s8,
-            &act.d8,
-            rows_q,
-            rows_k,
-            rows_v,
-            m,
-            n_sb,
-            n_sb.div_ceil(4),
-            off_k,
-            off_v,
-            y,
-        )?;
+        // One column is the one-column entry — the step path's register
+        // count and blocks per SM do not move; more go to the m-column
+        // entry, whose column c is that entry's launch of column c.
+        if m == 1 {
+            let prep = self
+                .module
+                .prepare_qwen3moe_qkv_q4k(LaunchConfig1D::new(grid, 256, 0))?;
+            self.module.qwen3moe_qkv_q4k(
+                stream,
+                &prep,
+                wq.buf(),
+                wk.buf(),
+                wv.unwrap_or(wk).buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                rows_q,
+                rows_k,
+                rows_v,
+                m,
+                n_sb,
+                n_sb.div_ceil(4),
+                off_k,
+                off_v,
+                y,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_qwen3moe_qkv_q4k_mcol(LaunchConfig1D::new(grid, 256, 0))?;
+            self.module.qwen3moe_qkv_q4k_mcol(
+                stream,
+                &prep,
+                wq.buf(),
+                wk.buf(),
+                wv.unwrap_or(wk).buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                rows_q,
+                rows_k,
+                rows_v,
+                m,
+                n_sb,
+                n_sb.div_ceil(4),
+                off_k,
+                off_v,
+                y,
+            )?;
+        }
         Ok(())
     }
 
@@ -364,7 +670,8 @@ impl ProjKernels {
         Ok(())
     }
 
-    /// Enqueue `y = w · act + x` over `a.act`'s columns (module doc).
+    /// Enqueue `y = w · act + x` over `a.act`'s columns (module doc): the
+    /// one-column entry at `act.m()` 1, the m-column walk past it.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_o_resid(&self, stream: &CudaStream, a: OResidArgs<'_>) -> Result<(), GpuError> {
         let what = "qwen3moe::enqueue_o_resid";
@@ -386,23 +693,44 @@ impl ProjKernels {
         let rows = launch_u32(what, "rows", w.rows())?;
         let m = launch_u32(what, "m", act.m())?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep = self
-            .module
-            .prepare_qwen3moe_o_resid_q4k(LaunchConfig1D::new(grid, 256, 0))?;
-        self.module.qwen3moe_o_resid_q4k(
-            stream,
-            &prep,
-            w.buf(),
-            &act.q4,
-            &act.s8,
-            &act.d8,
-            x,
-            rows,
-            m,
-            n_sb,
-            n_sb.div_ceil(4),
-            y,
-        )?;
+        // One column is the one-column entry, as in `enqueue_qkv`.
+        if m == 1 {
+            let prep = self
+                .module
+                .prepare_qwen3moe_o_resid_q4k(LaunchConfig1D::new(grid, 256, 0))?;
+            self.module.qwen3moe_o_resid_q4k(
+                stream,
+                &prep,
+                w.buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                x,
+                rows,
+                m,
+                n_sb,
+                n_sb.div_ceil(4),
+                y,
+            )?;
+        } else {
+            let prep = self
+                .module
+                .prepare_qwen3moe_o_resid_q4k_mcol(LaunchConfig1D::new(grid, 256, 0))?;
+            self.module.qwen3moe_o_resid_q4k_mcol(
+                stream,
+                &prep,
+                w.buf(),
+                &act.q4,
+                &act.s8,
+                &act.d8,
+                x,
+                rows,
+                m,
+                n_sb,
+                n_sb.div_ceil(4),
+                y,
+            )?;
+        }
         Ok(())
     }
 }
