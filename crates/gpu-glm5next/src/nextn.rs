@@ -225,6 +225,19 @@ impl Arena {
     }
 }
 
+/// One resident sequence's side of the layer ([`Nextn::new_seq`]): its
+/// store's three planes, the positions they hold and the verify's row-0
+/// copy — what a select of the target's slots exchanges
+/// ([`Nextn::swap_seq`]). The layer's weights, head and walk buffers are the
+/// load's.
+pub struct NextnSeq {
+    latent: DeviceTensor<u16>,
+    index_rows: DeviceTensor<u16>,
+    pooled: DeviceTensor<u16>,
+    held: usize,
+    pair0: DeviceBuffer<f32>,
+}
+
 /// The NextN layer resident on the target's card. See the module doc.
 pub struct Nextn {
     /// The layer's `blk.` index in the file.
@@ -325,17 +338,46 @@ impl Nextn {
         [&mut self.latent, &mut self.index_rows, &mut self.pooled]
     }
 
+    /// A resident sequence's side in the state the load leaves: its store
+    /// zeroed at the layer's context, no position held, its row-0 copy
+    /// zeroed. Load-time allocation.
+    pub(super) fn new_seq(&self, stream: &CudaStream) -> Result<NextnSeq, GpuError> {
+        Ok(NextnSeq {
+            latent: DeviceTensor::zeroed(stream, self.ctx, LATENT)?,
+            index_rows: DeviceTensor::zeroed(stream, self.ctx, INDEX_ROW)?,
+            pooled: DeviceTensor::zeroed(stream, pools_for(self.ctx), INDEX_HEAD)?,
+            held: 0,
+            pair0: DeviceBuffer::zeroed(stream, self.pair0.len())?,
+        })
+    }
+
+    /// Exchange the live sequence's side with `s`: pointer moves only, so a
+    /// slot's captured verify keeps copying into its own row-0 buffer.
+    pub(super) fn swap_seq(&mut self, s: &mut NextnSeq) {
+        std::mem::swap(&mut self.latent, &mut s.latent);
+        std::mem::swap(&mut self.index_rows, &mut s.index_rows);
+        std::mem::swap(&mut self.pooled, &mut s.pooled);
+        std::mem::swap(&mut self.held, &mut s.held);
+        std::mem::swap(&mut self.pair0, &mut s.pair0);
+    }
+
+    /// Device bytes one sequence's side holds: the store and the row-0 copy.
+    pub(super) fn seq_bytes(&self) -> usize {
+        self.store_bytes() + self.pair0.num_bytes()
+    }
+
     /// The layer the NextN plan `plan` places, as `inputs` and `nextn`
     /// describe it, resident on `gpu` beside the target's weights `tw`, from
     /// `file`: its tensors uploaded from the plan's rows and checked against
     /// its bytes, the joined projection derived, its store at `ctx`
-    /// positions and its arena, held to [`NEXTN_ARENA_BYTES`]. Refused by
-    /// name: a layer other than a routed latent one, a tensor absent or of
-    /// another type, an upload or a store whose bytes are not the plan's, an
-    /// arena past its bound. Load-time only.
+    /// positions — the plan counting one for each of the load's `slots`
+    /// resident sequences — and its arena, held to [`NEXTN_ARENA_BYTES`].
+    /// Refused by name: a layer other than a routed latent one, a tensor
+    /// absent or of another type, an upload or a store whose bytes are not
+    /// the plan's, an arena past its bound. Load-time only.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card, file, plans, inputs, the target's weights and widths, its context and page release (rust-quality R8)"
+        reason = "the load's card, file, plans, inputs, the target's weights and widths, its context and resident sequences, and page release (rust-quality R8)"
     )]
     pub(super) fn open(
         gpu: &Gpu,
@@ -345,7 +387,7 @@ impl Nextn {
         nextn: &NextnInputs,
         tw: &Weights,
         d: &Dims,
-        ctx: usize,
+        (ctx, slots): (usize, usize),
         card_dontneed: bool,
     ) -> Result<Nextn, GpuError> {
         let index = nextn.index;
@@ -457,9 +499,10 @@ impl Nextn {
         };
         stream.synchronize()?;
         let store = body.store_bytes() as u64;
-        if store != plan.nextn.cards[0].kv_bytes {
+        if store * slots as u64 != plan.nextn.cards[0].kv_bytes {
             return Err(shape(format!(
-                "the layer's store holds {store} device bytes; the NextN plan has {}",
+                "the layer's store holds {store} device bytes a sequence, for {slots} resident \
+                 sequences; the NextN plan has {}",
                 plan.nextn.cards[0].kv_bytes
             )));
         }

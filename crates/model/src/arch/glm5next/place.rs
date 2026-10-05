@@ -9,6 +9,7 @@
 //! experts on the host, and refuses a context past the deepest one a
 //! reference set checks the token-pool selector at ([`ORACLE_POSITIONS`]).
 
+use bloomery_placement::slots::{SeqTerms, SlotsOf, Stores};
 use gguf::{GgmlType, Split};
 use models::ModelSpec;
 use runtime::stores;
@@ -302,6 +303,9 @@ pub enum PlaceError {
         left: u64,
         short: u64,
     },
+    /// A plan of no resident sequence: a load serves at least one.
+    #[error("a plan of {slots} resident sequences: a load serves at least one")]
+    Slots { slots: usize },
 }
 
 /// The prompt batch's reserve `front` ([`prompt_reserve_bytes`]) beside
@@ -417,23 +421,54 @@ impl PlanInputs {
         levers: &PlanLevers,
         lanes: KdaLanes,
     ) -> Result<Plan<'a>, PlaceError> {
+        self.plan_slots(machine, ctx_max, levers, lanes, 1)
+    }
+
+    /// [`PlanInputs::plan_lanes`] for a load that serves `slots` resident
+    /// sequences (`bloomery_gpu::model::Slots`): every term of a sequence
+    /// ([`PlanInputs::seq_terms`]) counts them all — each layer's stores
+    /// `slots` times ([`SeqTerms::slots_of`]) and the bytes beside the
+    /// stores of every sequence past the live one ([`SeqTerms::plan_beside`]),
+    /// those reserved out of the expert budget before it fills, so a card
+    /// that cannot hold them is refused as [`PlanInputs::plan_lanes`] refuses
+    /// it. The stage card's KV term is [`PlanInputs::kv_term`]. One slot is
+    /// [`PlanInputs::plan_lanes`] itself; zero is refused by name.
+    pub fn plan_slots<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        lanes: KdaLanes,
+        slots: usize,
+    ) -> Result<Plan<'a>, PlaceError> {
         if ctx_max > ORACLE_POSITIONS {
             return Err(PlaceError::PastOracle {
                 ctx_max,
                 served: ORACLE_POSITIONS,
             });
         }
+        if slots == 0 {
+            return Err(PlaceError::Slots { slots });
+        }
         let kv = self.kv.with_lanes(lanes);
+        let terms = self.seq_terms(&kv, None);
+        let n = slots as u64;
+        let beside = terms.plan_beside(n);
         let front = prompt_reserve_bytes(&self.hp, ctx_max, !machine.tiers.is_empty());
-        let plan = placement::plan_routed_reserving(
+        let mut plan = placement::plan_routed_reserving(
             &self.model,
             machine,
             ctx_max,
-            &kv,
+            &terms.slots_of(n),
             levers,
             card_routed,
-            front,
+            front.saturating_add(beside),
         )?;
+        // The bytes beside the stores ride the stage card's KV term, out of
+        // the budget reserved above, so the card's bound holds them.
+        if let Some(t) = plan.cards.first_mut() {
+            t.kv_bytes += beside;
+        }
         let broken = plan.violations();
         if !broken.is_empty() {
             return Err(PlaceError::Broken(broken));
@@ -610,7 +645,7 @@ pub struct NextnPlan<'a> {
     pub plan: Plan<'a>,
     /// The NextN layer's plan on [`NextnInputs::machine`]: its tensors but
     /// the routed stacks on its card, the routed stacks every expert on the
-    /// host, and its store (`cards[0].kv_bytes`).
+    /// host, and its store for every resident sequence (`cards[0].kv_bytes`).
     pub nextn: Plan<'a>,
     /// [`NEXTN_ARENA_BYTES`], counted beside the NextN layer's card bytes.
     pub arena_bytes: u64,
@@ -706,6 +741,26 @@ impl PlanInputs {
         levers: &PlanLevers,
         nextn: &'a NextnInputs,
     ) -> Result<NextnPlan<'a>, PlaceError> {
+        self.plan_nextn_slots(machine, ctx_max, levers, nextn, 1)
+    }
+
+    /// [`PlanInputs::plan_nextn`] for a load that serves `slots` resident
+    /// sequences, every term of a sequence ([`PlanInputs::seq_terms`])
+    /// counting them all: the NextN layer's store `slots` times in its own
+    /// plan ([`NextnInputs::slots_of`]), and on the stage card each trunk
+    /// layer's stores `slots` times and the bytes beside the stores of every
+    /// sequence past the live one, those reserved out of the expert budget
+    /// before it fills ([`PlanInputs::kv_term`]). The two plans' kv classes
+    /// sum to [`SeqTerms::plan_kv`]. One slot is [`PlanInputs::plan_nextn`]
+    /// itself; zero is refused by name.
+    pub fn plan_nextn_slots<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        nextn: &'a NextnInputs,
+        slots: usize,
+    ) -> Result<NextnPlan<'a>, PlaceError> {
         if ctx_max > ORACLE_POSITIONS {
             return Err(PlaceError::PastOracle {
                 ctx_max,
@@ -717,26 +772,35 @@ impl PlanInputs {
                 cards: machine.cards.len(),
             });
         };
+        if slots == 0 {
+            return Err(PlaceError::Slots { slots });
+        }
+        let kv = self.kv.with_lanes(KdaLanes::Two);
+        let terms = self.seq_terms(&kv, Some(nextn));
+        let n = slots as u64;
+        let beside = terms.plan_beside(n);
         let draft = placement::plan_host_routed(
             &nextn.model,
             &nextn.machine,
             ctx_max,
-            &nextn.kv,
+            &nextn.slots_of(n),
             &PlanLevers::default(),
         )?;
         let arena = NEXTN_ARENA_BYTES;
         let front = prompt_reserve_bytes(&self.hp, ctx_max, !machine.tiers.is_empty());
-        let reserve = nextn_card_bytes(&draft.cards[0]) + arena + front;
-        let kv = self.kv.with_lanes(KdaLanes::Two);
-        let plan = placement::plan_routed_reserving(
+        let reserve = (nextn_card_bytes(&draft.cards[0]) + arena + front).saturating_add(beside);
+        let mut plan = placement::plan_routed_reserving(
             &self.model,
             machine,
             ctx_max,
-            &kv,
+            &terms.slots_of(n),
             levers,
             card_routed,
             reserve,
         )?;
+        // The bytes beside the stores ride the stage card's KV term, as
+        // [`PlanInputs::plan_slots`] counts them.
+        plan.cards[0].kv_bytes += beside;
         let total = card_terms(&plan.cards[0]) + nextn_card_bytes(&draft.cards[0]) + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
@@ -869,11 +933,114 @@ impl KvBytes for KvLayout {
     }
 }
 
+impl PlanInputs {
+    /// What one resident sequence of a load of the file holds on its card
+    /// ([`SeqTerms`]): its stores over the trunk's layers in `kv` (the
+    /// file's layout at the load's KDA lanes, [`KvLayout::with_lanes`]), the
+    /// next-token layer's store on a load that carries `nextn`, and the bytes
+    /// it holds beside them ([`beside_bytes`]). The one fill the plans of
+    /// resident sequences, a load's check of its plan and a gate's byte
+    /// clause read.
+    #[must_use]
+    pub fn seq_terms<'a>(&self, kv: &'a KvLayout, nextn: Option<&'a NextnInputs>) -> SeqTerms<'a> {
+        seq_terms(kv, nextn.map(|n| &n.kv), self.hp.hc.streams, self.hp.n_embd)
+    }
+
+    /// The KV term a plan of `slots` resident sequences of `ctx_max`
+    /// positions at `lanes` KDA lanes counts on a card that runs `layers`
+    /// (`nextn` when the load carries the next-token layer): the view the
+    /// plan counts the stores by over those layers ([`SeqTerms::slots_of`])
+    /// and the bytes beside the stores it adds ([`SeqTerms::plan_beside`]) —
+    /// what [`PlanInputs::plan_slots`] and [`PlanInputs::plan_nextn_slots`]
+    /// put in the stage card's `kv_bytes`, the next-token layer's store apart
+    /// in its own plan, and what a load of that many sequences holds its plan
+    /// to. Zero slots is refused by name.
+    pub fn kv_term(
+        &self,
+        layers: std::ops::Range<usize>,
+        ctx_max: u64,
+        lanes: KdaLanes,
+        nextn: Option<&NextnInputs>,
+        slots: usize,
+    ) -> Result<u64, PlaceError> {
+        if slots == 0 {
+            return Err(PlaceError::Slots { slots });
+        }
+        let kv = self.kv.with_lanes(lanes);
+        let terms = self.seq_terms(&kv, nextn);
+        Ok(stage_term(&terms, layers, ctx_max, slots as u64))
+    }
+}
+
+impl NextnInputs {
+    /// The view the NextN layer's own plan counts `slots` sequences' stores
+    /// by: its store ([`NextnKv`], layer 0 of its one-layer model) `slots`
+    /// times. The bytes a sequence holds beside its stores are the target's
+    /// ([`PlanInputs::seq_terms`]).
+    fn slots_of(&self, slots: u64) -> SlotsOf<'_> {
+        SeqTerms {
+            layers: Stores {
+                kv: &self.kv,
+                count: 1,
+            },
+            draft: None,
+            beside: 0,
+        }
+        .slots_of(slots)
+    }
+}
+
+/// [`PlanInputs::seq_terms`] from its parts: the trunk's layers in `kv`
+/// (every layer its kinds name), the next-token layer's store `draft` as one
+/// layer, and [`beside_bytes`] of `streams` streams `n_embd` wide at `kv`'s
+/// lanes, with the verify's row-0 copy on a load that drafts.
+fn seq_terms<'a>(
+    kv: &'a KvLayout,
+    draft: Option<&'a NextnKv>,
+    streams: usize,
+    n_embd: usize,
+) -> SeqTerms<'a> {
+    SeqTerms {
+        layers: Stores {
+            kv,
+            count: kv.kinds.len(),
+        },
+        draft: draft.map(|d| Stores { kv: d, count: 1 }),
+        beside: beside_bytes(streams, n_embd, kv.lanes, draft.is_some()),
+    }
+}
+
+/// [`PlanInputs::kv_term`] from its fill: `terms`' view of `slots`
+/// sequences over `layers` and the bytes beside the stores the plan adds;
+/// `u64::MAX` past u64 bytes.
+fn stage_term(
+    terms: &SeqTerms<'_>,
+    layers: std::ops::Range<usize>,
+    ctx_max: u64,
+    slots: u64,
+) -> u64 {
+    let view = terms.slots_of(slots);
+    layers
+        .map(|l| view.layer_bytes(l, ctx_max))
+        .fold(terms.plan_beside(slots), u64::saturating_add)
+}
+
+/// Card bytes one resident sequence holds beside its per-layer stores: the
+/// lane word every KDA launch reads, and the final streams of each row a
+/// pass runs (a row a KDA lane) and, on a NextN load, the verify's row-0
+/// copy — the rows the sequence's own draft walk reads, held a sequence
+/// while the arenas address whichever is live [derived: one u32 word, and
+/// `streams · n_embd` f32 a row].
+fn beside_bytes(streams: usize, n_embd: usize, lanes: KdaLanes, nextn: bool) -> u64 {
+    let row = (streams * n_embd) as u64 * F32_BYTES;
+    4 + (lanes.count() as u64 + u64::from(nextn)) * row
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        KdaLanes, Kind, KvBytes, KvLayout, PROMPT_GROUP, card_tile_bytes, group_sets, groups,
-        recurrent_bytes, row_bytes, unit_bytes,
+        KdaLanes, Kind, KvBytes, KvLayout, NextnKv, PROMPT_GROUP, card_tile_bytes, group_sets,
+        groups, recurrent_bytes, row_bytes, seq_terms, stage_term, unit_bytes,
     };
 
     /// A call's batches cut into groups: runs of `g`, a lone last batch
@@ -965,5 +1132,54 @@ mod tests {
             kv.bytes(0..5, 2051),
             3 * 5_275_652 + 2051 * 1536 + 513 * 256
         );
+    }
+
+    /// One resident sequence of GLM-5.3-Flash (34 KDA and 11 latent layers,
+    /// four streams of 4,096) at 16,384 positions, as its fill counts it
+    /// (`SeqTerms::bytes`): on a plain load the KDA layers at one lane,
+    /// 5,275,652 B each, the latent layers 16,384 · 1,600 B each, and beside
+    /// them the lane word and the step's row of 65,536 B; on a NextN load the
+    /// KDA layers at two lanes, 9,469,960 B each, the NextN layer's store
+    /// 16,384 · 1,600 B, and three rows beside the word (the step's, the
+    /// verify's second and its row-0 copy). The stage card's KV term of a
+    /// NextN plan of two sequences at 1,024 positions: the trunk's stores
+    /// twice and the bytes beside one sequence, the layer's store apart.
+    #[test]
+    fn glm_sequence_bytes() {
+        let kinds: Vec<Kind> = (0..45)
+            .map(|l| if l % 4 == 3 { Kind::Latent } else { Kind::Kda })
+            .collect();
+        let kv = KvLayout {
+            kinds,
+            kda: (64, 128, 4),
+            lanes: KdaLanes::One,
+            row: row_bytes(512, 128),
+            pool_row: 256,
+            kpool: 4,
+        };
+        let draft = NextnKv {
+            row: row_bytes(512, 128),
+            pool_row: 256,
+            kpool: 4,
+        };
+        let plain = seq_terms(&kv, None, 4, 4096);
+        assert_eq!(
+            plain.bytes(16_384, 1),
+            34 * 5_275_652 + 11 * 16_384 * 1600 + 4 + 65_536
+        );
+        assert_eq!(plain.bytes(16_384, 1), 467_796_108);
+        let two = kv.with_lanes(KdaLanes::Two);
+        let drafted = seq_terms(&two, Some(&draft), 4, 4096);
+        assert_eq!(
+            drafted.bytes(16_384, 1),
+            34 * 9_469_960 + 12 * 16_384 * 1600 + 4 + 3 * 65_536
+        );
+        assert_eq!(drafted.bytes(16_384, 1), 636_748_052);
+        let stage = stage_term(&drafted, 0..45, 1024, 2);
+        assert_eq!(
+            stage,
+            2 * (34 * 9_469_960 + 11 * 1024 * 1600) + 4 + 3 * 65_536
+        );
+        assert_eq!(stage, 680_198_692);
     }
 }

@@ -13,9 +13,16 @@
 //! ([`DraftedSeat::turn_off`]): every call is the session's own until the next
 //! reset, and each prompt call (or the first step when the call is empty)
 //! prints an `mtp prompt` record that names why.
+//!
+//! A seat that serves resident slots keeps the draft's side of each slot but
+//! the live one in the seat's table ([`DraftedSeat::hold_slots`]) and selects
+//! through it ([`DraftedSeat::select`]): the live slot's side parked, the
+//! target slot's put back, so each slot's drafted passes are the passes it
+//! would run alone.
 
 use app::Session;
 use app::mtp::{MtpBody, MtpDraft, Parked};
+use bloomery_gpu::model::Slots;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
 use runtime::{Advance, Draft, Plain, Speculative, Target as _, Want, Widths, Window};
@@ -39,6 +46,10 @@ where
     /// Why the draft is off until the next reset, and whether a record has
     /// said so since it was turned off; `None` while it drafts.
     off: Option<(&'static str, bool)>,
+    /// The draft's side of each resident slot but the live one, one entry a
+    /// slot ([`DraftedSeat::hold_slots`]); the live slot's entry is empty,
+    /// its side the window's own. Empty until a seat holds slots.
+    parked: Vec<Option<ParkedDraft<B::Arena>>>,
 }
 
 impl<B: MtpBody, const M: usize> DraftedSeat<B, M>
@@ -47,7 +58,11 @@ where
 {
     /// The seat over `spec`'s windows, or with no draft.
     pub(crate) fn new(spec: Option<Speculative<MtpDraft<B>, M>>) -> Self {
-        DraftedSeat { spec, off: None }
+        DraftedSeat {
+            spec,
+            off: None,
+            parked: Vec::new(),
+        }
     }
 
     /// The draft off until the next reset, for `why`: the session's position
@@ -232,6 +247,48 @@ where
             self.off = p.off.map(|why| (why, false));
         }
         Ok(())
+    }
+}
+
+impl<B: MtpBody + Slots, const M: usize> DraftedSeat<B, M>
+where
+    Window<M>: Widths,
+    B::Seq: 'static,
+{
+    /// The draft's side of each of `slots` resident slots held from here on,
+    /// each a fresh draft's — nothing waits, nothing skipped — the live
+    /// slot's in the window itself; all empty without a draft. Load-time,
+    /// once the session serves its slots.
+    pub(crate) fn hold_slots(&mut self, slots: usize) {
+        self.parked = vec![self.park(); slots];
+    }
+
+    /// Make `slot` the session's live one ([`Session::select_slot`]): the live
+    /// slot's draft side parked into its entry and the target slot's put
+    /// back around the exchange, so the target slot's draft joins its
+    /// sequence where it left it, as if no other had run. Selecting the live
+    /// slot is a no-op. Refused by name, nothing moved: a slot past the table
+    /// [`DraftedSeat::hold_slots`] made, and the exchange's own refusals (a
+    /// verify waiting for its commit, the session's and the body's checks) —
+    /// the parked entry is written only after the exchange takes.
+    pub(crate) fn select(&mut self, s: &mut Session<B>, slot: usize) -> Result<(), GateError> {
+        let was = s.selected();
+        if was == slot {
+            return Ok(());
+        }
+        let held = self.parked.len();
+        if slot >= held || was >= held {
+            return Err(format!(
+                "slot {slot} from slot {was}: the draft holds the sides of {held} slots \
+                 (DraftedSeat::hold_slots)"
+            )
+            .into());
+        }
+        let live = self.park();
+        s.select_slot(slot)?;
+        let back = self.parked[slot].take();
+        self.parked[was] = live;
+        self.unpark(back.as_ref())
     }
 }
 

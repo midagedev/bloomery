@@ -16,7 +16,11 @@
 //! on (`MtpBody`), under adaptive expert residency or not — and [`open_pair`]
 //! with no layer, for the two-row verify probe; both hold two lanes.
 //! [`open_resident`] opens the plain session under adaptive expert residency,
-//! at one lane.
+//! at one lane. [`open_nextn_slots`] and [`open_resident_slots`] open the
+//! same two for a load that serves resident sequence slots
+//! (`Session::add_slots`): the plan counts every sequence
+//! (`PlanInputs::plan_nextn_slots`, `PlanInputs::plan_slots`) and the body
+//! serves at most that many.
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
@@ -126,19 +130,43 @@ pub fn open_nextn<M: Fn(usize) -> Machine>(
     residency: Residency,
     log: &mut impl OpenLog<Body>,
 ) -> Result<Option<Session<Body>>, SessionError> {
+    open_nextn_slots(file, args, residency, 1, log)
+}
+
+/// [`open_nextn`] for a load that serves `slots` resident sequences: the
+/// plan counts every one ([`PlanInputs::plan_nextn_slots`]) and the load
+/// serves at most that many ([`Body::open_placed_nextn_slots`]); the
+/// session holds the live one, the caller adds the rest
+/// (`Session::add_slots`). Refused as [`open_nextn`] refuses, and by name
+/// for no slot.
+pub fn open_nextn_slots<M: Fn(usize) -> Machine>(
+    file: Split,
+    args: OpenArgs<GlmCfg, M>,
+    residency: Residency,
+    slots: usize,
+    log: &mut impl OpenLog<Body>,
+) -> Result<Option<Session<Body>>, SessionError> {
     let inputs = <Body as Open>::inputs(&file)?;
     let nextn = NextnInputs::read(&inputs).map_err(|e| GpuError::plan(WHAT, e))?;
     let (machine, ctx) = one_card(&args, &inputs)?;
     let plan = inputs
-        .plan_nextn(&machine, ctx, &args.cfg.place, &nextn)
+        .plan_nextn_slots(&machine, ctx, &args.cfg.place, &nextn, slots)
         .map_err(|e| GpuError::plan(WHAT, e))?;
     log.beside(plan.host_runs().map_err(|e| GpuError::plan(WHAT, e))?.1);
     if !log.plan(args.place, &inputs, &machine, &plan.plan)? {
         return Ok(None);
     }
     let ctx = ctx_of(&plan.plan)?;
-    let model =
-        Body::open_placed_nextn_with(file, &plan, &inputs, &nextn, 0, args.cfg.host, residency)?;
+    let model = Body::open_placed_nextn_slots(
+        file,
+        &plan,
+        &inputs,
+        &nextn,
+        0,
+        args.cfg.host,
+        residency,
+        slots,
+    )?;
     ready(model, args.mode, args.cfg, ctx, log)
 }
 
@@ -222,9 +250,9 @@ fn ready(
 
 /// The GLM session under adaptive expert residency, as [`Loaded::open`]
 /// then [`Loaded::ready`] open the plain one: `file`'s headers read once,
-/// the plan made once on `args`' placement ([`Open::plan`]) and handed to
-/// `log` (`false` stops there: `Ok(None)`), then the load by that plan under
-/// `residency` ([`Body::open_placed_with`]: the host set also holds each
+/// the plan made once on `args`' placement (as [`Open::plan`] makes it) and
+/// handed to `log` (`false` stops there: `Ok(None)`), then the load by that
+/// plan under `residency` ([`Body::open_placed_with`]: the host set also holds each
 /// layer's churn pool) in `args`' step mode, handed to `log`, the step
 /// captured and the prompt call's buffers made. Refused as [`Open::plan`]
 /// refuses, and as the residency machine refuses at the load.
@@ -234,21 +262,42 @@ pub fn open_resident<M: Fn(usize) -> Machine>(
     residency: Residency,
     log: &mut impl OpenLog<Body>,
 ) -> Result<Option<Session<Body>>, SessionError> {
+    open_resident_slots(file, args, residency, 1, log)
+}
+
+/// [`open_resident`] for a load that serves `slots` resident sequences, at
+/// one KDA lane: the plan counts every one ([`PlanInputs::plan_slots`]) and
+/// the load serves at most that many ([`Body::open_placed_slots`]); the
+/// session holds the live one, the caller adds the rest
+/// (`Session::add_slots`). Refused as [`open_resident`] refuses, and by name
+/// for no slot.
+pub fn open_resident_slots<M: Fn(usize) -> Machine>(
+    file: Split,
+    args: OpenArgs<GlmCfg, M>,
+    residency: Residency,
+    slots: usize,
+    log: &mut impl OpenLog<Body>,
+) -> Result<Option<Session<Body>>, SessionError> {
     let inputs = <Body as Open>::inputs(&file)?;
-    let machine = (args.machine)(<Body as Open>::layer_count(&inputs));
-    let plan = <Body as Open>::plan(&inputs, &machine, args.ctx, &args.cfg)?;
+    let (machine, ctx) = one_card(&args, &inputs)?;
+    let plan = inputs
+        .plan_slots(&machine, ctx, &args.cfg.place, KdaLanes::One, slots)
+        .map_err(|e| GpuError::plan(WHAT, e))?;
     if !log.plan(args.place, &inputs, &machine, &plan)? {
         return Ok(None);
     }
-    let ctx = u32::try_from(plan.ctx_max).map_err(|_| {
-        SessionError::Refused(format!("the plan's ctx_max {} passes u32", plan.ctx_max))
-    })?;
-    let mut model = Body::open_placed_with(file, &plan, &inputs, 0, args.cfg.host, residency)?;
-    model.set_mode(args.mode);
-    log.load(&model)?;
-    Loaded::from_model(model, args.cfg, ctx)
-        .ready(log)
-        .map(Some)
+    let ctx = ctx_of(&plan)?;
+    let model = Body::open_placed_slots(
+        file,
+        &plan,
+        &inputs,
+        0,
+        args.cfg.host,
+        residency,
+        KdaLanes::One,
+        slots,
+    )?;
+    ready(model, args.mode, args.cfg, ctx, log)
 }
 
 impl Prompt for Body {
