@@ -68,9 +68,9 @@
 //! position and at the last checkpoint below it (the last prompt call's
 //! end), and on a NextN load the layer's store rows and the target's rows
 //! its draft reads next, with the draft's waiting rows beside them
-//! ([`DraftedSeat::park`]). A returning session's state comes back whole
+//! ([`SlotDrafts::park`]). A returning session's state comes back whole
 //! after the session's reset (`seq_resume`), its checkpoints that one point,
-//! its draft joining where it left (`DraftedSeat::unpark`); the residency is
+//! its draft joining where it left (`SlotDrafts::unpark`); the residency is
 //! the model's and stays where use has taken it, the state carrying no slot
 //! map. Its default is the lesser of `bind::CACHE_RAM_CAP` and half of what
 //! `MemAvailable` leaves at load past the plan's host need, the residency's
@@ -89,15 +89,28 @@
 //! pointer exchange and each slot's own draft held beside it
 //! ([`SlotDrafts`]), so each request's tokens are its solo run's;
 //! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
-//! by name. The round's shape the open decided once: a plain load (no
-//! NextN draft) runs it as one pass of the busy rows
-//! (`serve_seats::rounds::step_rows_one_pass`, cut at the body's two rows),
-//! a NextN load as a select and a step a row — its body refuses a slots
-//! pass by name, each of its slots being drafted and a pass of plain steps
-//! telling no slot's draft what it ran, until stagger stage S4 — and a
-//! refusal mid-round is the server's error, never a fallback to the loop. A
+//! by name. The round's shape the open decided once, from the load and the
+//! body's `SlotRows::MAX_ROWS`: a plain load (no NextN draft) runs a round of
+//! steps as one pass of the busy rows
+//! (`serve_seats::rounds::step_rows_one_pass`, cut at that bound); a NextN
+//! load runs a round of drafted passes as one pass of the busy slots'
+//! windows (`serve_seats::rounds::pass_rows_one_pass`, each slot's window
+//! over its own draft) when the body's pass holds two windows of one
+//! proposal each, else as a select and a pass a row. A slot whose draft
+//! skips — it proposes nothing until the slot's next reset, its row one
+//! plain step in every shape — is turned off before such a round and steps
+//! alone, the table's off path (`SlotDrafts::turn_off`): the NextN pass of
+//! several slots takes each slot's whole verify, its two rows. A NextN
+//! load's round of steps — sampled and id-banning requests, which the
+//! server steps — is a select and a step a row: its body refuses a pass of
+//! plain steps by name, each of its slots being drafted and such a pass
+//! telling no slot's draft what it ran, so a round of greedy and sampled
+//! requests runs the steps' call and the passes' apart. A refusal
+//! mid-round is the server's error, never a fallback to the loop. A
 //! `parallel` line on stderr names the rule (`slots`), the slots, a slot's
-//! context, the total and the shape (`pass=one` or `pass=turns`); under
+//! context, the total and the shape: `pass=one` where the open decided one
+//! pass, `pass=turns` for a NextN load on a body whose pass holds fewer
+//! rows than two windows; under
 //! `BLOOMERY_STEP_STATS=1` each round of several slots prints a `slots
 //! round` record naming its command, rows, passes and the slots the seat
 //! serves. The plan counts every sequence in its KV term
@@ -173,10 +186,10 @@ use app::arch::glm5next::{GlmCfg, open_nextn_slots, open_resident_slots};
 use app::mtp::{MtpBody, MtpDraft};
 use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::model::StepMode;
+use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, SlotStep, Vocab, model_props, nvidia_smi_index, placement_props,
-    sampler_factory, step_rows_in_turn,
+    CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
+    pass_rows_in_turn, placement_props, sampler_factory, step_rows_in_turn,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -248,6 +261,49 @@ pub const ACTS_ON: &[&str] = &[
 /// The drafted window's verify: the target's next token and the draft's one
 /// proposal.
 const VERIFY_ROWS: usize = <Body as MtpBody>::VERIFY_ROWS;
+
+/// The shape the seat runs a round of several slots in, decided once at the
+/// open from the load and a fact of the body; a refusal mid-round is the
+/// server's error, never a fallback to another shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rounds {
+    /// A plain load: one pass of the busy rows' steps
+    /// (`serve_seats::rounds::step_rows_one_pass`, cut at the body's
+    /// [`SlotRows::MAX_ROWS`]).
+    Steps,
+    /// A NextN load whose body's pass of several slots holds two drafted
+    /// windows: one pass of the busy slots' windows
+    /// (`serve_seats::rounds::pass_rows_one_pass`, cut between windows).
+    Windows,
+    /// A NextN load whose body's pass does not: a select and a pass a row
+    /// ([`pass_rows_in_turn`]).
+    Turns,
+}
+
+impl Rounds {
+    /// The shape of a load that drafts (`drafts`) or not: a drafted round
+    /// is one pass when the body's pass of several slots holds two windows
+    /// of the seat's depth — the token at a slot's position and its
+    /// proposal of [`MtpBody::WIDTH`] ids — so two slots' windows run
+    /// together; a body whose pass holds fewer rows keeps the fallback loop.
+    fn of(drafts: bool) -> Rounds {
+        if !drafts {
+            Rounds::Steps
+        } else if <Body as SlotRows>::MAX_ROWS >= 2 * (1 + <Body as MtpBody>::WIDTH) {
+            Rounds::Windows
+        } else {
+            Rounds::Turns
+        }
+    }
+
+    /// The `parallel` line's `pass=` word: `one` or `turns`.
+    fn word(self) -> &'static str {
+        match self {
+            Rounds::Steps | Rounds::Windows => "one",
+            Rounds::Turns => "turns",
+        }
+    }
+}
 
 /// The positions the server's loop needs for one window from an empty
 /// model: it takes one only while its rows fit, the first at a one-id
@@ -717,10 +773,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         "parallel rule=slots slots={slots} slot_ctx={} total={} pass={}",
         rule.ctx,
         slots * rule.ctx,
-        // The round's shape the open below runs (the module doc): one pass
-        // of the busy rows on a plain load, a select and a step a row on a
-        // NextN one.
-        if draft_off.is_some() { "one" } else { "turns" }
+        // The round's shape the open below runs (the module doc).
+        Rounds::of(draft_off.is_none()).word()
     );
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
@@ -838,12 +892,14 @@ struct Glm {
     /// The load runs the residency machine: each call prints its
     /// boundaries' `residency pass` records.
     residency: bool,
-    /// Whether a round of several slots runs as one pass of the busy rows
-    /// ([`Glm::step_slots`]): a plain load, whose body runs several slots'
-    /// rows as one pass — a NextN load keeps the fallback loop, its body
-    /// refusing a slots pass by name (each of its slots is drafted) until
-    /// stagger stage S4.
-    one_pass: bool,
+    /// The shape a round of several slots runs in ([`Rounds::of`], decided
+    /// at the open): a plain load's step rounds one pass
+    /// ([`Glm::step_slots`]), a NextN load's drafted rounds one pass when the
+    /// body's pass holds two windows ([`Glm::pass_slots`]); every other
+    /// round the fallback loop — a NextN load's step rounds among them, its
+    /// body refusing a pass of plain steps by name (a pass of plain steps
+    /// tells no slot's draft what it ran).
+    rounds: Rounds,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
 }
@@ -912,7 +968,7 @@ impl Glm {
             draft_bytes: a.draft_bytes,
             path: a.path,
             residency,
-            one_pass: a.draft_off.is_some(),
+            rounds: Rounds::of(a.draft_off.is_none()),
             stats: a.stats,
         })
     }
@@ -934,7 +990,37 @@ impl Glm {
         }
         Ok(())
     }
+
+    /// Before a round of one pass ([`Rounds::Windows`]), each row's slot
+    /// whose draft skips turned off ([`SlotDrafts::turn_off`], for
+    /// [`SKIP_OFF_WHY`]): its window would be the one plain row, which the
+    /// NextN pass of several slots refuses by name (each slot's rows there
+    /// are its verify's two), and the round runs an off slot alone, its
+    /// plain step. A skipping draft proposes nothing until the slot's next
+    /// reset — the server resets a slot before every request that keeps
+    /// nothing — so the slot's ids and counts are those of the fallback
+    /// loop, whose pass steps a skipping slot plainly.
+    fn off_skipping(&mut self, rows: &[SlotPassRow]) -> Result<(), GateError> {
+        for r in rows {
+            let skips = self
+                .drafted
+                .specs_mut()
+                .get(r.slot)
+                .and_then(Option::as_ref)
+                .is_some_and(|spec| spec.draft().skipping());
+            if skips && !self.drafted.is_off(r.slot) {
+                self.drafted.turn_off(r.slot, SKIP_OFF_WHY)?;
+            }
+        }
+        Ok(())
+    }
 }
+
+/// Why a slot whose draft skips is off in a round of one pass
+/// ([`Glm::off_skipping`]); its next call prints it as an `mtp prompt`
+/// record.
+const SKIP_OFF_WHY: &str = "the draft skips until the slot's next reset, and a NextN pass of \
+                            several slots takes each slot's whole verify";
 
 /// A GLM sequence state as the server's prompt cache holds it ([`GlmSeq`]),
 /// with the draft's side of it when the seat drafts. The cache ranks it by
@@ -1101,19 +1187,18 @@ impl Seat for Glm {
         self.stats
     }
 
-    /// One round of several slots: one pass of the busy rows while the open
-    /// decided so ([`Glm::one_pass`], through
-    /// `serve_seats::rounds::step_rows_one_pass` — cut at the body's two
-    /// rows, the rows' answers and lent logits rows from the pass's own
-    /// per-row heads, slot 0 left selected), else the seat's fallback — a
-    /// select and a step a row — the NextN load's round, whose body refuses
-    /// a slots pass by name (each of its slots is drafted, and a pass of
-    /// plain steps tells no slot's draft what it ran, until stagger stage
-    /// S4). A refusal on either path is the server's to die on: the open
-    /// decides once, so a load that cannot run one pass never tries it at
-    /// run time.
+    /// One round of several slots: one pass of the busy rows on a plain load
+    /// ([`Rounds::Steps`], through `serve_seats::rounds::step_rows_one_pass`
+    /// — cut at the body's [`SlotRows::MAX_ROWS`], the rows' answers and
+    /// lent logits rows from the pass's own per-row heads, slot 0 left
+    /// selected), else the seat's fallback — a select and a step a row — the
+    /// NextN load's step round, whose body refuses a pass of plain steps by
+    /// name (each of its slots is drafted, and such a pass tells no slot's
+    /// draft what it ran). A refusal on either path is the server's to die
+    /// on: the open decides once, so a load that cannot run one pass never
+    /// tries it at run time.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
-        if !self.one_pass {
+        if self.rounds != Rounds::Steps {
             return step_rows_in_turn(self, rows);
         }
         let passes =
@@ -1121,6 +1206,35 @@ impl Seat for Glm {
         self.print_passes().map_err(|e| e.to_string())?;
         if self.stats {
             record::slots_round("step", rows.len(), passes, self.slots()).eprint();
+        }
+        Ok(())
+    }
+
+    /// One round of several slots' drafted passes: one pass of the busy
+    /// slots' windows while the open decided so ([`Rounds::Windows`],
+    /// through `serve_seats::rounds::pass_rows_one_pass` — each slot's
+    /// window over its own draft at the depth a one-slot pass proposes, the
+    /// windows laid in slot order and cut between them at the body's
+    /// [`SlotRows::MAX_ROWS`], slot 0 left selected), each slot whose draft
+    /// skips turned off first ([`Glm::off_skipping`]) and stepped alone;
+    /// else the fallback ([`pass_rows_in_turn`]: a select and a pass a row,
+    /// which prints its own `slots round` record). A refusal on either path
+    /// is the server's to die on, never a fallback: the open decides once.
+    fn pass_slots(&mut self, rows: &mut [SlotPassRow]) -> Result<(), String> {
+        if self.rounds != Rounds::Windows {
+            return pass_rows_in_turn(self, rows);
+        }
+        self.off_skipping(rows).map_err(|e| e.to_string())?;
+        let passes = super::rounds::pass_rows_one_pass(
+            &mut self.s,
+            rows,
+            &mut self.drafted,
+            <Body as MtpBody>::WIDTH,
+        )
+        .map_err(|e| e.to_string())?;
+        self.print_passes().map_err(|e| e.to_string())?;
+        if self.stats {
+            record::slots_round("pass", rows.len(), passes, self.slots()).eprint();
         }
         Ok(())
     }
@@ -1151,7 +1265,7 @@ impl Seat for Glm {
     }
 
     /// One step and the target's row of it, read before the step is told to
-    /// the draft ([`DraftedSeat::step_with_row`]).
+    /// the draft ([`SlotDrafts::step_with_row`]).
     fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
         let sel = self.s.selected();
         let next = self.drafted.step_with_row(&mut self.s, sel, last, row)?;
@@ -1251,7 +1365,7 @@ impl Seat for Glm {
     }
 
     /// The sequence state ([`seq_save`]) and, under the draft, its side of
-    /// it ([`DraftedSeat::park`]), as the prompt cache holds them.
+    /// it ([`SlotDrafts::park`]), as the prompt cache holds them.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
         Ok(Arc::new(SavedGlm {
             state: seq_save(self.s.model_mut())?,
@@ -1260,7 +1374,7 @@ impl Seat for Glm {
     }
 
     /// The state put back ([`seq_resume`]) after the session's reset, then
-    /// the draft's side of it ([`DraftedSeat::unpark`]): the sequence's next
+    /// the draft's side of it ([`SlotDrafts::unpark`]): the sequence's next
     /// call runs as it would have with no switch between, its draft joining
     /// where it left. Refused by name, before the reset, for a state this
     /// seat did not take or one saved with the draft on put back with it off

@@ -3,7 +3,7 @@
 //! `generate_glm5next` on the same card, as one process under the GPU gate
 //! lock.
 //!
-//!     gate_glm5next_serve --arm plain|drafted --dir <out>
+//!     gate_glm5next_serve --arm plain|drafted|slots --dir <out>
 //!
 //! Each arm starts the server beside this binary (`--model glm --host
 //! 127.0.0.1 --port 0 --place gate --ctx 2048 --slot-save-path /tmp
@@ -17,7 +17,9 @@
 //! 2048 --tokens <those ids> -n 16` beside this binary under the same levers
 //! and holds the ids the server served against it. The loads run one after
 //! the other (four in `plain`, two in `drafted`); the recipe runs the arms
-//! as two processes, each under its own bound.
+//! as two processes, each under its own bound. `slots` runs the drafted
+//! arm's (s5) alone — its server and clauses, nothing else — for a run of
+//! those clauses by name; the recipe runs them inside `drafted`.
 //!
 //! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after three runs of
 //! the seat with both levers unset and `--plan`, which print the unset rule's
@@ -118,10 +120,12 @@
 //!   positions a slot, under the draft's three) and `--parallel 0`;
 //! - (s5) resident slots ([`slots_flow_together`]), on a server of
 //!   `--parallel 2` under `BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off` (bits
-//!   hold only with no expert moving): its `parallel` line names
-//!   `pass=turns` (the drafted seat keeps the fallback loop, its body
-//!   refusing a slots pass by name until stagger stage S4); `/props`'
-//!   `total_slots` is 2, its
+//!   hold only with no expert moving) and `BLOOMERY_STEP_STATS=1`: its
+//!   `parallel` line names `pass=one` — the open runs a drafted round as one
+//!   pass where the body's pass of several slots (`SlotRows::MAX_ROWS`)
+//!   holds two windows of the seat's depth (one proposal, two rows a
+//!   window); a body of fewer rows keeps the turns, which this clause reads
+//!   red; `/props`' `total_slots` is 2, its
 //!   `n_ctx` and the listening record's `ctx` a slot's half of the `--ctx`,
 //!   and its `vram_kv_bytes` the stage card's KV term a plan of two
 //!   sequences counts at that context (`PlanInputs::kv_term`: the trunk's
@@ -142,12 +146,33 @@
 //!   `s` rounds after the earlier's, the calls are at most `p₂ + s + 2` and
 //!   the busy `p₁ + p₂ + 2`, so the ratio is at least (32 + 63 + 2)/(63 + s +
 //!   2) = 97/(65 + s) — 1.45 at `s` = 2, 1.41 at 4 [derived] — where a server
-//!   whose slots take the model in turns books one slot a call, 1.0.
+//!   whose slots take the model in turns books one slot a call, 1.0. Every
+//!   `slots round` record of the together window that reads `cmd=pass` (the
+//!   alone runs print none, a round of one busy slot being a select and a
+//!   pass) reads `slots=2` and `passes=1`, one of them `rows=2`: a two-slot
+//!   round's windows, two rows each, fit one pass of such a body.
 //!   Mutants: the seat wrapping its engine in `serve::SwapEngine` again (the
-//!   turn rules: one busy a call, ratio 1.0, red on the last check); a split
+//!   turn rules: one busy a call, ratio 1.0, red on the ratio check); a split
 //!   that returns the total (`n_ctx`, the listening `ctx` and
 //!   `vram_kv_bytes` the total's, red on the first two checks, and (s4)'s
-//!   split planned, red there).
+//!   split planned, red there); the open deciding turns (the fallback loop's
+//!   `passes=rows`, so `passes=2` on a round of two rows, and `pass=turns`).
+//!   Then on the same server, sampled requests (temperature 0.8, top-k 40,
+//!   a fixed seed a turn, `cache_prompt` off), which the server steps and
+//!   never drafts: each turn alone, then both at once — each one's ids its
+//!   alone run's, no draft counts, every `cmd=step` record of the window
+//!   `slots=2` and `passes=rows` (one with `rows=2`) and no `cmd=pass`
+//!   record; then the greedy [`TURN_A`] beside the sampled [`TURN_C`] — the
+//!   greedy one's ids and draft counts its alone run's, the sampled one's
+//!   ids its alone run's, every `cmd=pass` record of the window `slots=2`,
+//!   `rows=1`, `passes=1` (at least one). These pin today's shape: a
+//!   sampled row is a select and a step, its round the server's call apart
+//!   from the drafted passes', because the drafted pass cannot carry a
+//!   window that proposes nothing (`app::mtp::pass_slots` refuses depth 0,
+//!   the body's NextN pass of several slots a slot of one row, and the
+//!   drafted row lends no logits row). Mutant: the seat running a NextN
+//!   load's step round as one pass — the body refuses it by name, the
+//!   server dies, and the sampled clauses go red.
 //! - against the CLI under the same levers: the ids agree, all of them or a
 //!   prefix ending in the end-of-generation id — the CLI takes the server's
 //!   cut (`--last-step`), so both run the same batches, count the rule's
@@ -217,7 +242,7 @@ mod gate {
         bloomery_levers::STEP_STATS,
     ];
 
-    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted --dir <out>";
+    const USAGE: &str = "usage: gate_glm5next_serve --arm plain|drafted|slots --dir <out>";
 
     /// The stores both engines size, the seat's floor and the CLI's default.
     const CTX: usize = 2048;
@@ -262,6 +287,9 @@ mod gate {
     /// its together run books (the module header's derivation).
     const SLOTS_PREDICT: usize = 64;
     const SLOTS_RATIO: f64 = 1.4;
+    /// The slots clause's sampled requests' seeds, one a turn ([`TURN_A`],
+    /// [`TURN_C`]).
+    const SEEDS: [u64; 2] = [7, 11];
     /// The one chat turn.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
     /// The `cache` clause's sessions: A's first turn, B's turn, the text A
@@ -282,11 +310,13 @@ mod gate {
     /// layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
 
-    /// The arms, one a process.
+    /// The arms, one a process: `slots` is the drafted arm's (s5) alone,
+    /// its server and clauses, which `drafted` runs too.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Arm {
         Plain,
         Drafted,
+        Slots,
     }
 
     impl Arm {
@@ -294,7 +324,8 @@ mod gate {
             match v {
                 "plain" => Ok(Arm::Plain),
                 "drafted" => Ok(Arm::Drafted),
-                other => Err(format!("--arm is plain or drafted, not {other}").into()),
+                "slots" => Ok(Arm::Slots),
+                other => Err(format!("--arm is plain, drafted or slots, not {other}").into()),
             }
         }
     }
@@ -312,6 +343,14 @@ mod gate {
     const DRAFT_ONLY: Levers = &[
         (bloomery_levers::DRAFT, "mtp"),
         (bloomery_levers::RESIDENCY, "off"),
+    ];
+    /// The drafted arm's slots server: the draft with no residency (the bits
+    /// need no expert moving) and the seat's rounds counted, each a `slots
+    /// round` record.
+    const DRAFT_ONLY_STATS: Levers = &[
+        (bloomery_levers::DRAFT, "mtp"),
+        (bloomery_levers::RESIDENCY, "off"),
+        (bloomery_levers::STEP_STATS, "1"),
     ];
     /// The drafted arm's server and CLI.
     const DRAFTED: Levers = &[
@@ -1501,8 +1540,8 @@ mod gate {
     }
 
     /// (s5) the slots clause (module header) on a server of two resident
-    /// slots started into `<dir>/slots`, the draft on and no residency: two
-    /// prompts alone, then both at once.
+    /// slots started into `<dir>/slots`, the draft on, no residency and the
+    /// rounds counted: two prompts alone, then both at once.
     fn slots_flow_together(dir: &Path) -> Result<bool, GateError> {
         let dir = dir.join("slots");
         std::fs::create_dir_all(&dir)?;
@@ -1512,7 +1551,7 @@ mod gate {
         let parallel = args.len() - 1;
         args[parallel] = "2";
         let err_log = dir.join("server.err");
-        let mut served = Served::spawn(&args, &dir, DRAFT_ONLY)?;
+        let mut served = Served::spawn(&args, &dir, DRAFT_ONLY_STATS)?;
         println!("slots server pid {}", served.child.id());
         let addr = served.address(&err_log)?;
         let url = |p: &str| format!("http://{addr}{p}");
@@ -1551,8 +1590,8 @@ mod gate {
             vram == Some(two),
         );
         // The `parallel` line printed before the load names the round's
-        // shape: the drafted seat keeps the fallback loop, its body
-        // refusing a slots pass by name.
+        // shape the open chose: one pass, the body's pass of several slots
+        // holding both slots' drafted windows.
         let parallel_line = std::fs::read_to_string(&err_log)?
             .lines()
             .find(|l| l.starts_with("parallel "))
@@ -1561,8 +1600,8 @@ mod gate {
         println!("slots: {parallel_line}");
         check(
             &mut ok,
-            "slots_parallel_line_names_turns",
-            field(&parallel_line, "pass") == Some("turns"),
+            "slots_parallel_line_names_one_pass",
+            field(&parallel_line, "pass") == Some("one"),
         );
         // A request's ids and the draft's counts.
         let run = |v: &Value| {
@@ -1585,40 +1624,18 @@ mod gate {
         };
         let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy0 = busy(decode0)?;
-        // Each request on a helper thread of its own, both posted at once.
-        type Answer = Result<(u16, String), String>;
-        let post = |ids: &[u32]| -> Result<(JoinHandle<()>, mpsc::Receiver<Answer>), GateError> {
-            let u = url("/completion");
-            let b = json!({
-                "prompt": ids, "n_predict": SLOTS_PREDICT, "temperature": 0,
-                "return_tokens": true, "cache_prompt": false,
-            });
-            let (tx, rx) = mpsc::channel();
-            let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
-                let _ = tx.send(curl(&u, Some(&b), false).map_err(|e| e.to_string()));
-            })
-            .map_err(|e| format!("slots: {}", e.what()))?;
-            Ok((h, rx))
-        };
-        let posted = [post(&a_ids)?, post(&c_ids)?];
-        let mut together = Vec::new();
-        for ((h, rx), what) in posted.into_iter().zip(["A", "C"]) {
-            h.join()
-                .map_err(|_| format!("slots: request {what}'s thread panicked"))?;
-            let answer = rx
-                .recv()
-                .map_err(|_| format!("slots: request {what}'s thread gave no answer"))?;
-            match answer
-                .map_err(GateError::from)
-                .and_then(|(st, text)| json_of("/completion", st, &text))
-            {
-                Ok(v) => together.push(Some(run(&v))),
-                Err(e) => {
-                    println!("slots: request {what} failed: {e}");
-                    together.push(None);
-                }
-            }
-        }
+        // The alone runs print no record (a round of one busy slot is a
+        // select and a pass), so the window opens empty; taken anyway, so the
+        // together run's records are exactly the ones after this point.
+        let before = round_count(&err_log)?;
+        let together: Vec<Option<(Vec<u32>, u64, u64)>> = both_at_once(
+            &url,
+            [greedy_body(&a_ids), greedy_body(&c_ids)],
+            ["slots A", "slots C"],
+        )?
+        .iter()
+        .map(|v| v.as_ref().map(run))
+        .collect();
         let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy1 = busy(decode1)?;
         let swaps = metric(&url, "swaps_total")?;
@@ -1648,8 +1665,225 @@ mod gate {
             "slots_rounds_carry_both_slots",
             swaps.is_none_or(|v| v == 0.0) && ratio >= SLOTS_RATIO,
         );
+        // The together window's drafted rounds (`cmd=pass`): a step round of
+        // two rows (both slots at their prompt's last id) keeps the fallback
+        // loop on a NextN load, the one-pass step round being the plain
+        // load's, and a pass round of one row (the other slot stepping) is
+        // one pass in either shape, so the clause reads the pass rounds and
+        // needs one of two rows among them.
+        let window = rounds_from(&err_log, before)?;
+        let pass_rounds = of_cmd(&window, "pass");
+        let one_pass = pass_rounds.iter().any(|r| r.u64("rows") == Ok(2))
+            && pass_rounds
+                .iter()
+                .all(|r| r.u64("slots") == Ok(2) && r.u64("passes") == Ok(1));
+        print_rounds("slots", &window, &pass_rounds);
+        check(&mut ok, "slots_pass_rounds_run_one_pass", one_pass);
+        ok &= slots_sampled(&url, &err_log, [&a_ids, &c_ids], &alone[0])?;
         println!("slots server stopped: {}", served.stop()?);
         Ok(ok)
+    }
+
+    /// The (s5) server's sampled clauses (the module header): two sampled
+    /// requests ([`sampled_body`], [`SEEDS`]) alone, then both at once, then
+    /// the greedy `ids[0]` beside the sampled `ids[1]`, `greedy_alone` the
+    /// greedy request's alone run (its ids, draft count and accepted).
+    ///
+    /// A sampled request steps on the server — a `next` a token, its row
+    /// read for the sampler — and its round of steps is the server's call
+    /// apart from the drafted passes' (`Engine::step_slots` beside
+    /// `Engine::advance_slots`). The default seat runs neither as one pass
+    /// with the drafted rows: a sampled row would be a window that proposes
+    /// nothing, which `app::mtp::pass_slots` refuses (depth 0, and every
+    /// window's draft proposes), the body's NextN pass of several slots
+    /// refuses (a slot of one row, `Body::refuse_slots`), and no call of the
+    /// server carries (the drafted row lends no logits row, `SlotPassRow`).
+    /// So the clauses pin today's shape: two sampled slots' round is a
+    /// select and a step a row (`cmd=step`, `passes=rows`), and a round of a
+    /// greedy and a sampled slot is two calls — the sampled row's step and
+    /// the greedy row's pass of one window (`cmd=pass`, `rows=1`).
+    fn slots_sampled(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        ids: [&[u32]; 2],
+        greedy_alone: &(Vec<u32>, u64, u64),
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let mut alone = Vec::new();
+        for (ids, seed) in ids.iter().zip(SEEDS) {
+            let (st, text) = curl(&url("/completion"), Some(&sampled_body(ids, seed)), false)?;
+            alone.push(json_of("/completion", st, &text)?);
+        }
+        let before = round_count(err_log)?;
+        let together = both_at_once(
+            url,
+            [
+                sampled_body(ids[0], SEEDS[0]),
+                sampled_body(ids[1], SEEDS[1]),
+            ],
+            ["sampled A", "sampled C"],
+        )?;
+        let window = rounds_from(err_log, before)?;
+        let steps = of_cmd(&window, "step");
+        let ids_of_v = |v: &Value| ids_of(&v["tokens"]);
+        let plain = |v: &Value| v["timings"].get("draft_n").is_none();
+        println!(
+            "slots sampled alone {:?} and {:?} ids, together {:?} and {:?}",
+            ids_of_v(&alone[0]).len(),
+            ids_of_v(&alone[1]).len(),
+            together[0].as_ref().map(|v| ids_of_v(v).len()),
+            together[1].as_ref().map(|v| ids_of_v(v).len()),
+        );
+        print_rounds("slots sampled", &window, &steps);
+        check(
+            &mut ok,
+            "slots_sampled_together_ids_are_alone",
+            alone.iter().all(|v| !ids_of_v(v).is_empty() && plain(v))
+                && together.iter().zip(&alone).all(|(t, a)| {
+                    t.as_ref()
+                        .is_some_and(|t| ids_of_v(t) == ids_of_v(a) && plain(t))
+                }),
+        );
+        check(
+            &mut ok,
+            "slots_sampled_rounds_step_in_turn",
+            steps.iter().any(|r| r.u64("rows") == Ok(2))
+                && steps.iter().all(|r| {
+                    r.u64("slots") == Ok(2) && r.u64("passes").is_ok_and(|p| r.u64("rows") == Ok(p))
+                })
+                && of_cmd(&window, "pass").is_empty(),
+        );
+
+        let before = round_count(err_log)?;
+        let mixed = both_at_once(
+            url,
+            [greedy_body(ids[0]), sampled_body(ids[1], SEEDS[1])],
+            ["mixed greedy A", "mixed sampled C"],
+        )?;
+        let window = rounds_from(err_log, before)?;
+        let passes = of_cmd(&window, "pass");
+        let counts = |v: &Value| {
+            (
+                ids_of_v(v),
+                v["timings"]["draft_n"].as_u64().unwrap_or(0),
+                v["timings"]["draft_n_accepted"].as_u64().unwrap_or(0),
+            )
+        };
+        let greedy_mixed = mixed[0].as_ref().map(counts);
+        println!(
+            "slots mixed greedy (ids, drafts, accepted) {:?} against alone {:?}; sampled {:?} ids",
+            greedy_mixed.as_ref().map(|c| (c.0.len(), c.1, c.2)),
+            (greedy_alone.0.len(), greedy_alone.1, greedy_alone.2),
+            mixed[1].as_ref().map(|v| ids_of_v(v).len()),
+        );
+        print_rounds("slots mixed", &window, &passes);
+        check(
+            &mut ok,
+            "slots_mixed_together_ids_are_alone",
+            greedy_mixed.as_ref() == Some(greedy_alone)
+                && mixed[1]
+                    .as_ref()
+                    .is_some_and(|v| ids_of_v(v) == ids_of_v(&alone[1]) && plain(v)),
+        );
+        check(
+            &mut ok,
+            "slots_mixed_rounds_run_apart",
+            !passes.is_empty()
+                && passes.iter().all(|r| {
+                    r.u64("slots") == Ok(2) && r.u64("rows") == Ok(1) && r.u64("passes") == Ok(1)
+                }),
+        );
+        Ok(ok)
+    }
+
+    /// A greedy `/completion` body of `ids`: [`SLOTS_PREDICT`] tokens at
+    /// temperature 0, `cache_prompt` off.
+    fn greedy_body(ids: &[u32]) -> Value {
+        json!({
+            "prompt": ids, "n_predict": SLOTS_PREDICT, "temperature": 0,
+            "return_tokens": true, "cache_prompt": false,
+        })
+    }
+
+    /// A sampled `/completion` body of `ids`: [`SLOTS_PREDICT`] tokens at
+    /// temperature 0.8 among the top 40 with `seed`, `cache_prompt` off —
+    /// the server steps it, a `next` a token, and never drafts it.
+    fn sampled_body(ids: &[u32], seed: u64) -> Value {
+        json!({
+            "prompt": ids, "n_predict": SLOTS_PREDICT, "temperature": 0.8, "top_k": 40,
+            "seed": seed, "return_tokens": true, "cache_prompt": false,
+        })
+    }
+
+    /// Two `/completion` requests of `bodies` posted at once, each on a
+    /// helper thread of its own: each one's response, in order, or `None`
+    /// (printed under its name) when it failed.
+    fn both_at_once(
+        url: &dyn Fn(&str) -> String,
+        bodies: [Value; 2],
+        names: [&str; 2],
+    ) -> Result<Vec<Option<Value>>, GateError> {
+        type Answer = Result<(u16, String), String>;
+        let mut posted: Vec<(JoinHandle<()>, mpsc::Receiver<Answer>)> = Vec::new();
+        for (b, name) in bodies.into_iter().zip(names) {
+            let u = url("/completion");
+            let (tx, rx) = mpsc::channel();
+            let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
+                let _ = tx.send(curl(&u, Some(&b), false).map_err(|e| e.to_string()));
+            })
+            .map_err(|e| format!("{name}: {}", e.what()))?;
+            posted.push((h, rx));
+        }
+        let mut out = Vec::new();
+        for ((h, rx), name) in posted.into_iter().zip(names) {
+            h.join()
+                .map_err(|_| format!("{name}: the request's thread panicked"))?;
+            let answer = rx
+                .recv()
+                .map_err(|_| format!("{name}: the request's thread gave no answer"))?;
+            match answer
+                .map_err(GateError::from)
+                .and_then(|(st, text)| json_of("/completion", st, &text))
+            {
+                Ok(v) => out.push(Some(v)),
+                Err(e) => {
+                    println!("{name}: the request failed: {e}");
+                    out.push(None);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `slots round` records the server has printed so far.
+    fn round_count(err_log: &Path) -> Result<usize, GateError> {
+        Ok(seat_log(&lines_from(err_log, 0)?)
+            .all(&record::SLOTS_ROUND)?
+            .len())
+    }
+
+    /// The `slots round` records after the first `before`.
+    fn rounds_from(err_log: &Path, before: usize) -> Result<Vec<record::Fields>, GateError> {
+        let mut rounds = seat_log(&lines_from(err_log, 0)?).all(&record::SLOTS_ROUND)?;
+        Ok(rounds.split_off(before.min(rounds.len())))
+    }
+
+    /// The records of `window` whose command is `cmd`.
+    fn of_cmd<'a>(window: &'a [record::Fields], cmd: &str) -> Vec<&'a record::Fields> {
+        window.iter().filter(|r| r.word("cmd") == Ok(cmd)).collect()
+    }
+
+    /// A window's record count and the lines of the records a clause reads.
+    fn print_rounds(what: &str, window: &[record::Fields], read: &[&record::Fields]) {
+        println!(
+            "{what}: {} round record(s) in the window, {} read: {}",
+            window.len(),
+            read.len(),
+            read.iter()
+                .map(|r| r.line().to_owned())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
     }
 
     /// The plain arm's slots clause (the module header): a plain server of
@@ -1704,45 +1938,16 @@ mod gate {
         // The alone runs print no record (a round of one row is a select
         // and a `next`), so the window opens empty; taken anyway, so the
         // together run's records are exactly the ones after this point.
-        let before = seat_log(&lines_from(&err_log, 0)?)
-            .all(&record::SLOTS_ROUND)?
-            .len();
-        // Each request on a helper thread of its own, both posted at once.
-        type Answer = Result<(u16, String), String>;
-        let post = |ids: &[u32]| -> Result<(JoinHandle<()>, mpsc::Receiver<Answer>), GateError> {
-            let u = url("/completion");
-            let b = json!({
-                "prompt": ids, "n_predict": SLOTS_PREDICT, "temperature": 0,
-                "return_tokens": true, "cache_prompt": false,
-            });
-            let (tx, rx) = mpsc::channel();
-            let (h, _) = spawn_helper("plain-slots-request", Placement::Float, move || {
-                let _ = tx.send(curl(&u, Some(&b), false).map_err(|e| e.to_string()));
-            })
-            .map_err(|e| format!("plain slots: {}", e.what()))?;
-            Ok((h, rx))
-        };
-        let posted = [post(&a_ids)?, post(&c_ids)?];
-        let mut together: Vec<Option<Vec<u32>>> = Vec::new();
-        for ((h, rx), what) in posted.into_iter().zip(["A", "C"]) {
-            h.join()
-                .map_err(|_| format!("plain slots: request {what}'s thread panicked"))?;
-            let answer = rx
-                .recv()
-                .map_err(|_| format!("plain slots: request {what}'s thread gave no answer"))?;
-            match answer
-                .map_err(GateError::from)
-                .and_then(|(st, text)| json_of("/completion", st, &text))
-            {
-                Ok(v) => together.push(Some(ids_of(&v["tokens"]))),
-                Err(e) => {
-                    println!("plain slots: request {what} failed: {e}");
-                    together.push(None);
-                }
-            }
-        }
-        let rounds = seat_log(&lines_from(&err_log, 0)?).all(&record::SLOTS_ROUND)?;
-        let window = &rounds[before.min(rounds.len())..];
+        let before = round_count(&err_log)?;
+        let together: Vec<Option<Vec<u32>>> = both_at_once(
+            &url,
+            [greedy_body(&a_ids), greedy_body(&c_ids)],
+            ["plain slots A", "plain slots C"],
+        )?
+        .iter()
+        .map(|v| v.as_ref().map(|v| ids_of(&v["tokens"])))
+        .collect();
+        let window = rounds_from(&err_log, before)?;
         let every = !window.is_empty()
             && window.iter().all(|r| {
                 let rows = r.u64("rows");
@@ -1752,19 +1957,13 @@ mod gate {
                     && r.u64("passes") == rows.map(|n| n.div_ceil(2))
             });
         println!(
-            "plain slots alone {} and {} ids, together {:?} and {:?}; {} round record(s) in the \
-             together window: {}",
+            "plain slots alone {} and {} ids, together {:?} and {:?}",
             alone[0].len(),
             alone[1].len(),
             together[0].as_ref().map(Vec::len),
             together[1].as_ref().map(Vec::len),
-            window.len(),
-            window
-                .iter()
-                .map(|r| r.line().to_owned())
-                .collect::<Vec<_>>()
-                .join(" | ")
         );
+        print_rounds("plain slots", &window, &window.iter().collect::<Vec<_>>());
         check(
             &mut ok,
             "plain_slots_together_ids_are_alone",
@@ -2015,6 +2214,7 @@ mod gate {
         let ok = match a.arm {
             Arm::Plain => plain(&a.dir, &levers)?,
             Arm::Drafted => drafted(&a.dir, &levers)?,
+            Arm::Slots => slots_flow_together(&a.dir)?,
         };
         if ok {
             println!("gate-gpu-glm5next-serve: PASS");
