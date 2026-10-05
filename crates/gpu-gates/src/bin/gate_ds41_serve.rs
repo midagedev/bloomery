@@ -88,7 +88,12 @@
 //! the plan's total) — the same context as one slot is the server above.
 //! Then a second server of two resident sequences (`--parallel 2`, the
 //! default context each, the residency off as the gate placement runs it,
-//! the slot actions on) is started into `<dir>/slots`:
+//! the slot actions on, `BLOOMERY_STEP_STATS=1` set on the process — the
+//! lever moves no computation in the round path and, on V4.1, also turns on
+//! the engine's engram fill statistics (clock reads and page-classifying
+//! syscalls), which change no id and no pass count but cost host time a
+//! step, so a server run under it is never a timing reading) is started
+//! into `<dir>/slots`:
 //!
 //! - its `parallel` line names the rule, the two slots, the default context
 //!   a slot and their total; its `slots` line two sequences made of two
@@ -99,6 +104,16 @@
 //!   slots each (`/metrics`' `n_busy_slots_per_decode` and `n_decode_total`,
 //!   before and after) with no swap counted — the slots flow together, not
 //!   in turns;
+//! - the rounds of the pair posted at once
+//!   ([`slots_rounds_run_one_pass`]): every `slots round` record the seat
+//!   printed, that window's and (s5)'s together window's, holds `cmd=step`,
+//!   `slots=2`, `rows=2` and `passes=1` — one pass of the busy rows, the
+//!   body's two-row bound (FAIL-first: the seat left on the fallback loop
+//!   prints `passes=rows`) — and the rows the clause's own window carries,
+//!   with the solo rounds beside them (a select and a `next`, no record),
+//!   which `/metrics`' `n_decode_total` deltas count less the two requests'
+//!   prompt calls, booked at their end, sum to the tokens the two requests
+//!   decoded beyond their prompts' first;
 //! - (s2) `--ids` and a prompt sharing nothing with it, each on its own
 //!   slot (`cache_prompt`); the second's slot erased; then `--ids` plus its
 //!   greedy ids takes the first's slot and keeps all but its last id, and
@@ -1181,13 +1196,18 @@ mod gate {
             .to_owned();
         let mut args = SLOTS_SERVER_ARGS.to_vec();
         args.extend(["--slot-save-path", save.as_str()]);
-        let mut served = Served::spawn(&args, &dir)?;
+        // The rounds clause counts the seat's rounds: the lever set on this
+        // process alone, so the servers below run without it.
+        let mut cmd = Command::new(Served::exe()?);
+        cmd.env(bloomery_levers::STEP_STATS, "1");
+        let mut served = Served::spawn_cmd(cmd, &args, &dir)?;
         println!("slots server pid {}", served.child.id());
         let err_log = dir.join("server.err");
         let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         ok &= slots_ctx(&url, &err_log)?;
         ok &= slots_together(&url, a)?;
+        ok &= slots_rounds_run_one_pass(&url, &err_log, a)?;
         ok &= slots_actions(&url, a)?;
         let mut taken = taken_firsts(&url, a)?;
         let file = slots_files_save(&url, &mut taken)?;
@@ -1614,6 +1634,90 @@ mod gate {
             &mut ok,
             "slots_rounds_carry_both_slots",
             swaps.is_none_or(|v| v == 0.0) && carried >= SLOTS_BUSY,
+        );
+        Ok(ok)
+    }
+
+    /// The rounds of the pair posted at once (module header): the two-slot
+    /// server runs under `BLOOMERY_STEP_STATS=1`, so the seat counts its
+    /// rounds of several slots. The (s5) pair is posted at once again — the
+    /// clause's own window — and every `slots round` record the seat
+    /// printed, this window's and (s5)'s together window's, holds one pass
+    /// of the busy rows; the window's rows, with the solo rounds beside
+    /// them, sum to the tokens the two requests decoded beyond their
+    /// prompts' first. The lever moves no computation in the round path —
+    /// it only prints the record — so (s5)'s together-equals-alone bits
+    /// stand for the default server.
+    fn slots_rounds_run_one_pass(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        a: &Args,
+    ) -> Result<bool, GateError> {
+        // (s5)'s together run printed its records before this point; the
+        // window opens at what the log holds now, so its records are
+        // exactly this pair's.
+        let before = server_log(err_log, record::BLOOMERY_SERVE_DS41)?
+            .all(&record::SLOTS_ROUND)?
+            .len();
+        let decode0 = rounds(url)?.0;
+        type Answer = Result<(u16, String), String>;
+        let post = |body: Value| -> Result<(JoinHandle<()>, Receiver<Answer>), GateError> {
+            let u = url("/completion");
+            let (tx, rx) = mpsc::channel();
+            let (h, _) = spawn_helper("slots-rounds-request", Placement::Float, move || {
+                let _ = tx.send(curl(&u, Some(&body), false).map_err(|e| e.to_string()));
+            })
+            .map_err(|e| format!("slots rounds: {}", e.what()))?;
+            Ok((h, rx))
+        };
+        let bodies = [pair_body(&a.prompt), pair_body(OTHER)];
+        let first = post(bodies[0].clone())?;
+        let second = post(bodies[1].clone())?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+            h.join()
+                .map_err(|_| format!("slots rounds: the {what} request's thread panicked"))?;
+            let (st, text) = rx.recv().map_err(|_| {
+                format!("slots rounds: the {what} request's thread gave no answer")
+            })??;
+            together.push(ids_of(&json_of("/completion", st, &text)?["tokens"]));
+        }
+        let decode1 = rounds(url)?.0;
+        let rounds_log =
+            server_log(err_log, record::BLOOMERY_SERVE_DS41)?.all(&record::SLOTS_ROUND)?;
+        // The seat serves two slots, so a round of several is two rows run
+        // as one pass: every record the seat printed, this window's and
+        // (s5)'s.
+        let every = !rounds_log.is_empty()
+            && rounds_log.iter().all(|r| {
+                r.word("cmd") == Ok("step")
+                    && r.u64("slots") == Ok(2)
+                    && r.u64("rows") == Ok(2)
+                    && r.u64("passes") == Ok(1)
+            });
+        let window = &rounds_log[before.min(rounds_log.len())..];
+        let sum: u64 = window.iter().map(|r| r.u64("rows").unwrap_or(0)).sum();
+        // The solo rounds beside the window's records (a select and a
+        // `next`, no record): the decode deltas less the records' rounds
+        // less the two requests' prompt calls, booked at their end
+        // (`worker.rs`'s `end_request`).
+        let solo = decode1 - decode0 - window.len() as f64 - 2.0;
+        let want = 2 * (SLOTS_PREDICT - 1) as u64;
+        println!(
+            "slots rounds: {} and {} ids together; {} record(s) in the window, {} in all; rows \
+             sum {sum} + {solo} solo round(s) against the {want} decoded beyond the prompts' \
+             first (decode {decode0} -> {decode1})",
+            together[0].len(),
+            together[1].len(),
+            window.len(),
+            rounds_log.len(),
+        );
+        let mut ok = true;
+        check(&mut ok, "slots_rounds_run_one_pass", every);
+        check(
+            &mut ok,
+            "slots_rounds_rows_sum_the_decoded_tokens",
+            solo >= 0.0 && sum + solo as u64 == want,
         );
         Ok(ok)
     }
