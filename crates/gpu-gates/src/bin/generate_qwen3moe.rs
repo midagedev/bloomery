@@ -229,14 +229,15 @@
 //! `arm` line, for one line on stdin: the timing runner takes its witness
 //! blocks there. A failed arm ends the process, naming the arm.
 //!
-//! `BLOOMERY_GEN_SLOTS=N` (2 to the body's pass rows, 8 on either file;
+//! `BLOOMERY_GEN_SLOTS=N` (2 to the body's pass rows, 8 on every file;
 //! unset or 1 is the one-sequence run above) decodes N streams in one pass
-//! (`GpuModel::step_slots`) on a whole-card qwen3moe file or a qwen4exp
+//! (`GpuModel::step_slots`) on a whole-card qwen3moe, qwen35moe or qwen4exp
 //! file, whose load is then planned for N sequences
 //! (`PlanInputs::plan_with_slots`). Each arm's ids (`--tokens`, or an
 //! `--arm`'s) are N windows of equal length P, window j prefilled into slot
-//! j from its reset by `--prefill` (on a qwen3moe file in graph mode a slot
-//! past 0 captures its prefill passes first, outside the prefill's wall);
+//! j from its reset by `--prefill` (on a qwen3moe or qwen35moe file in
+//! graph mode a slot past 0 captures its prefill passes first, outside the
+//! prefill's wall);
 //! an arm after the first starts from the residency's seed too (its
 //! `residency reset` record before its `arm` line); the pass of a row a slot is
 //! captured before the rounds (`capture slots=N rows=1 graph_nodes=`), then
@@ -248,10 +249,9 @@
 //! N ids' readback, a `warm` round marked) and the `SMOKE` footer names
 //! `slots=`, the counted `rounds=` and `positions=`, the rounds' `p50_ms=`
 //! and `mean_ms=` and `tok/s(aggregate)=`; a qwen4exp arm's `residency pass`
-//! records follow its lines. Refused by name on a qwen35moe file (its body
-//! holds resident sequences, `Slots`, but runs no pass of several slots: it
-//! has no `SlotRows`), on a placed qwen3moe load (`--place`, or the unplaced
-//! default's fallback), on a qwen4exp run that drafts (`BLOOMERY_DRAFT=mtp`,
+//! records follow its lines. Refused by name on a placed qwen3moe or
+//! qwen35moe load (`--place`, or the unplaced default's fallback), on a
+//! qwen4exp run that drafts (`BLOOMERY_DRAFT=mtp`,
 //! or unset under `--place a` with the draft file there: the plain pass
 //! runs under `BLOOMERY_DRAFT=off`), for an id count N does not divide, and
 //! beside `--prompt`, `--seed-depth`, `--last-step`, `--logits`,
@@ -669,6 +669,38 @@ mod cli {
 
         fn seed(m: &mut Qwen35moeModel, rows: usize) -> Result<(), GateError> {
             Ok(m.seed_depth(rows)?)
+        }
+
+        /// A placed load (the unplaced default's fallback; `--place` is
+        /// refused before the load), refused by name before the run: its
+        /// host tier's batch port and its placed chain run one sequence
+        /// each, and neither runs a pass of several slots
+        /// ([`SlotRows::plan_slots`] names the same refusal past the slots'
+        /// prompts).
+        fn slots_load(m: &Qwen35moeModel, slots: usize) -> Result<(), GateError> {
+            if m.body("generate_qwen3moe")?.placed().is_some() {
+                return Err(format!(
+                    "BLOOMERY_GEN_SLOTS={slots}: the load is placed (its plan line names why), \
+                     and a pass of several slots runs a whole-card load: a placed load's prompt \
+                     runs through the host tier's batch port and its step through the placed \
+                     chain, one sequence each"
+                )
+                .into());
+            }
+            Ok(())
+        }
+
+        /// A parked slot's graph cache starts empty ([`GpuModel::add_slots`])
+        /// and its `--prefill pass` prompt replays the row graphs of its
+        /// passes' sizes, which [`GpuModel::step_rows`] captures inside its
+        /// call — inside the prompt's wall: captured here for the selected
+        /// slot, the step and every pass size, the set the load captures
+        /// for slot 0's cache. The `auto` and `gemm` paths' prompt call is
+        /// eager in either mode and replays nothing.
+        fn capture_slot_prompt(m: &mut Qwen35moeModel) -> Result<(), GateError> {
+            m.capture_step()?;
+            capture35_rows(m)?;
+            Ok(())
         }
     }
 
@@ -1362,21 +1394,21 @@ mod cli {
                     drive(m, &run, path, &arms, listed, sync)
                 }
             }
-            Chosen::Qwen35(path, place) => drive(
-                open_qwen35(
+            Chosen::Qwen35(path, place) => {
+                let m = open_qwen35(
                     file,
                     (ctx, mode),
                     place.map(|p| (p, &levers)),
                     &levers,
                     kv,
                     t,
-                )?,
-                &run,
-                path,
-                &arms,
-                listed,
-                sync,
-            ),
+                )?;
+                if slots > 1 {
+                    drive_slots(m, &run, path, &arms, listed, sync)
+                } else {
+                    drive(m, &run, path, &arms, listed, sync)
+                }
+            }
             Chosen::Qwen38(path, place, draft) => match draft {
                 Draft38::Off => {
                     let trace = trace38(
@@ -1706,6 +1738,24 @@ mod cli {
         Ok(m)
     }
 
+    /// The row graphs of the pass sizes 2 to [`MAX_PASS_ROWS`], captured
+    /// for the selected slot, each's node count — the graphs a `--prefill
+    /// pass` pass of its size replays, which [`GpuModel::step_rows`]
+    /// captures inside its call when the slot's cache holds one not. The
+    /// load captures them for slot 0's `capture` line; a parked slot's
+    /// prompt captures its own outside its wall.
+    fn capture35_rows(m: &mut Qwen35moeModel) -> Result<Vec<usize>, GateError> {
+        Ok(vec![
+            m.capture_rows::<2>()?,
+            m.capture_rows::<3>()?,
+            m.capture_rows::<4>()?,
+            m.capture_rows::<5>()?,
+            m.capture_rows::<6>()?,
+            m.capture_rows::<7>()?,
+            m.capture_rows::<8>()?,
+        ])
+    }
+
     /// The Qwen3.6-35B-A3B model of `file` with the tensor-core decode
     /// flash (the engine's) — under `place` by its plan (`q3place`), the
     /// `plan` line first, and with `place` unset the default
@@ -1761,16 +1811,8 @@ mod cli {
             }
             let (free0, _) = m.gpu().mem_info()?;
             let t = Instant::now();
-            let nodes = vec![
-                step,
-                m.capture_rows::<2>()?,
-                m.capture_rows::<3>()?,
-                m.capture_rows::<4>()?,
-                m.capture_rows::<5>()?,
-                m.capture_rows::<6>()?,
-                m.capture_rows::<7>()?,
-                m.capture_rows::<8>()?,
-            ];
+            let mut nodes = vec![step];
+            nodes.extend(capture35_rows(&mut m)?);
             capture_line(&nodes, t, free0, m.gpu())?;
         }
         Ok(m)
@@ -2608,13 +2650,13 @@ mod cli {
     }
 
     /// `BLOOMERY_GEN_SLOTS=slots` beside what it does not run with, each
-    /// refused by name: a qwen35moe file (its body runs no pass of several
-    /// slots), what every body refuses ([`gen_slots::refused`]: each flag of
-    /// `given` that is set, and of the three after it the qwen3moe file's
-    /// `--place` — a placed load's host tier serves one sequence — or the
-    /// qwen4exp file's step stats and route trace, which record one
-    /// sequence's steps), and an arm whose ids `slots` does not cut into
-    /// windows of one length ([`gen_slots::windows`]).
+    /// refused by name: what every body refuses ([`gen_slots::refused`]:
+    /// each flag of `given` that is set, and of the three after it the
+    /// qwen3moe and qwen35moe files' `--place` — a placed load's host tier
+    /// serves one sequence — or the qwen4exp file's step stats and route
+    /// trace, which record one sequence's steps), and an arm whose ids
+    /// `slots` does not cut into windows of one length
+    /// ([`gen_slots::windows`]).
     fn slots_refused(
         slots: usize,
         family: Family,
@@ -2629,13 +2671,8 @@ mod cli {
                 gen_slots::refused::<Body>(slots, "qwen3moe", &beside)?;
             }
             Family::Qwen35 => {
-                return Err(format!(
-                    "BLOOMERY_GEN_SLOTS={slots} decodes several streams in one pass \
-                     (`GpuModel::step_slots`, a body with `SlotRows`); this is a qwen35moe file, \
-                     whose body holds resident sequences (`Slots`) but runs no pass of several \
-                     slots: it has no `SlotRows`"
-                )
-                .into());
+                beside.push(place);
+                gen_slots::refused::<Body35>(slots, "qwen35moe", &beside)?;
             }
             Family::Qwen38 => {
                 beside.extend([stats, trace]);

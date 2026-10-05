@@ -81,7 +81,7 @@
 #             and BLOOMERY_GEN_SLOTS in the runner's own environment (an arm names its own). A FAIL row: a
 #             slots arm with no counted kind=slots record or one whose positions is not N, and a kind=slots
 #             record from an arm that names no N. N = 1 is a plain lever arm. The binary refuses N past a
-#             pass's rows, a qwen35moe or qwen4exp file and a placed load by name (a FAIL row here).
+#             pass's rows and a placed qwen3moe or qwen35moe load by name (a FAIL row here).
 #   prose:<P>[@NAME=VALUE[,NAME=VALUE...]]  ours fed the first P ids of
 #            $BLOOMERY_DATA/$MODEL_NAME/corpus-prose.ids (the profile's own prose corpus, one id a line —
 #            the file its d1k reference set is cut from) through --tokens instead of the LCG prompt, the
