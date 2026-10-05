@@ -25,6 +25,11 @@ if [ "${1:-}" = --check ]; then
 else
   VERSION=${1:?usage: tools/release/build.sh <version> <commit>}
   COMMIT=${2:?usage: tools/release/build.sh <version> <commit>}
+  # box.sh exports the Mac tree's commit, `-dirty` when any porcelain line (an untracked file too) was there; the
+  # serve crate bakes it into /props, so a release built from such a tree would name no commit.
+  case ${BLOOMERY_GIT_COMMIT:-} in
+    *-dirty) echo "build.sh: BLOOMERY_GIT_COMMIT is $BLOOMERY_GIT_COMMIT: the tree box.sh synced had changes or untracked files; a release is built from a clean tree" >&2; exit 1 ;;
+  esac
 fi
 
 GLIBC_FLOOR=2.34

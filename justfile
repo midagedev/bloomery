@@ -421,7 +421,7 @@ mac-disk *ARGS:
 # built on the box from a committed tree, with this commit as the binaries' --version. The tarball lands in the box
 # remote dir's target/release-dist/.
 release-build VERSION:
-    test -z "$(git status --porcelain --untracked-files=no)" || { echo "release-build: the tree has uncommitted changes" >&2; exit 1; }
+    test -z "$(git status --porcelain)" || { echo "release-build: the tree has uncommitted or untracked files (box.sh stamps such a build -dirty):" >&2; git status --porcelain >&2; exit 1; }
     ./tools/box.sh "bash tools/release/build.sh {{VERSION}} $(git rev-parse --short=12 HEAD)"
 
 build-decode:
