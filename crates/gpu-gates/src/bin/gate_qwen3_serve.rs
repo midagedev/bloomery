@@ -86,16 +86,7 @@
 //!   rounds 1 — at 96 tokens each the ratio is (2·94 + 2 + ~2)/(94 + 2 +
 //!   ~2) ≈ 1.9 — while a turn-taking server books exactly 1 busy a call
 //!   (every round is one slot's), 1.0 past the two prompts;
-//!   (v3) the two SSE streams' token arrivals, timestamped by a reader
-//!   thread a stream: while both are live, every window of
-//!   [`SLOTS_WINDOW`] = 16 consecutive arrivals holds at least
-//!   [`SLOTS_EACH`] = 4 of each stream — the engine emits one token a slot
-//!   a round (8 and 8 ideally), delivery batching (the server flushes per
-//!   event; curl and the pipe may clump) tolerates up to 12 consecutive
-//!   same-stream arrivals before the minority drops under 4, while a
-//!   turn-taking server's `QUANTUM` = 64-token turns put windows of 16
-//!   inside a turn holding 16 of one stream and none of the other;
-//!   (v4) the load record names `slots=2` and `slot_ctx` = the auto total
+//!   (v3) the load record names `slots=2` and `slot_ctx` = the auto total
 //!   over two (a cache row the granularity, the floor exact) — the total the
 //!   server's own whole-fit line names, which the search for two slots, each
 //!   slot's planes rounded to the granule, may leave under the one-slot
@@ -103,7 +94,7 @@
 //!   The same clause runs a second time on a placed load, its checks named
 //!   `placed_…`: `--place a` under `BLOOMERY_CARD_BUDGET=12G` (a 12 GiB
 //!   card's budget, which keeps routed experts on the host tier on either
-//!   card) and no `--ctx`, so (v4)'s total is the placed default the server's
+//!   card) and no `--ctx`, so (v3)'s total is the placed default the server's
 //!   own `plan` record was made at (`ctx_max`) — the default listening at
 //!   all is the split's check on the smallest card the seat serves. Then
 //!   `placed_slots_hold_the_plan` reads that server's stderr: the plan keeps
@@ -131,15 +122,18 @@
 //!   sequences take none and the line is absent. FAIL-first: the term
 //!   counted for one sequence names one budget and the clause is red.
 //!   FAIL-first mutants, each red on its line: the seat still building the
-//!   turn-taking engine leaves (v2) at ~1.0 and (v3) failing; a select that
+//!   turn-taking engine leaves (v2) at ~1.0 and the round clause's
+//!   `slots_rounds_hold_a_round_of_both` red (its together window holds no
+//!   record of both); a select that
 //!   ignores the slot (both requests on one sequence) moves the together
 //!   ids off the alone ones; a reply that hands row answers back in the
 //!   wrong order scrambles the ids; a ctx not divided gives each slot the
 //!   total, and the second sequence does not fit past the first (the auto
 //!   default spent the card's free bytes on the one-sequence cache): the
 //!   server never listens, which the clause names as the split's check red;
-//!   a placed load kept on the turns leaves the placed arm's (v2), (v3) and
-//!   (v4) red, no `placed slots` line, and `ctx_default`'s placed arm's
+//!   a placed load kept on the turns leaves the placed arm's (v2) and (v3)
+//!   red and its round clause's `placed_slots_rounds_hold_a_round_of_both`
+//!   red, no `placed slots` line, and `ctx_default`'s placed arm's
 //!   `placed_slots_are_resident` and `placed_ctx_is_the_plans_ctx_max` red.
 //! - `slots_default_is_the_whole_search`, the whole slots arm: the total its
 //!   server's one whole-fit line names is the two-slot whole search's own
@@ -164,7 +158,24 @@
 //!   slots clause's prompts, each first run alone on that server and then
 //!   both together — and over the together run every record holds
 //!   `passes=1` over `rows` of 2..=`MAX_TOKENS` on `slots=2`
-//!   (`slots_rounds_run_one_pass`), and the rows the records carry plus
+//!   (`slots_rounds_run_one_pass`); the window holds a round of both
+//!   (`slots_rounds_hold_a_round_of_both`: at least one record of `rows=2`)
+//!   — the one thing the records can see of both advancing in the same
+//!   rounds, for a round of one stepping slot prints no record (the
+//!   worker runs it as a plain select and `next`), so the records cannot
+//!   see one-slot stretches: a seat that serves one slot at a time leaves
+//!   the window empty, a server that only stretches one-slot runs between
+//!   two-row rounds keeps its records of both — that shape is the slots
+//!   clause's (v2) busy ratio's to catch, which one busy a round pulls to
+//!   ~1.0 — and the window's solo count (the decode deltas less the
+//!   records and the two prompt-call bookings) prints beside it,
+//!   unpinned: a round server's solo rounds are the two requests'
+//!   admission skew and its mirror at the tail, a race the worker counts
+//!   in passes, which no code bounds. No pass-count condition on the
+//!   clause (the placed arm steps
+//!   in turn inside a round, `passes=rows`, by design, and the whole
+//!   arm's one pass is the clause above's own pin); and the rows the
+//!   records carry plus
 //!   the solo rounds between them (a round of one row is a select and a
 //!   `next`, no record; their count the `/metrics` `n_decode_total` deltas
 //!   give, less the two requests' prompt-phase calls booked at their end)
@@ -174,9 +185,14 @@
 //!   (`slots_rounds_rows_sum_the_decoded_tokens`). The same clause on the
 //!   placed arm (`slots-rounds-placed`,
 //!   `--place a` under the slots clause's budget, the lever on too) holds
-//!   `passes=rows`, the default loop (`placed_slots_rounds_run_in_turn`).
+//!   `passes=rows`, the default loop (`placed_slots_rounds_run_in_turn`),
+//!   and its window holds a round of both
+//!   (`placed_slots_rounds_hold_a_round_of_both`).
 //!   FAIL-first: a seat left on the default loop prints `passes=rows` on
-//!   the whole arm, and only this clause is red.
+//!   the whole arm, and only this clause is red; a seat that serves one
+//!   slot at a time prints no record of both and the hold clause is red on
+//!   both arms, while a server that only stretches one-slot runs between
+//!   two-row rounds is the (v2) busy ratio's red, not the records'.
 //! - `slots_late_request_together_alone`, on both arms: a
 //!   whole-card server of `--parallel 2`, the first request decoding alone
 //!   and the second posted once `/metrics`' `n_decode_total` has moved a
@@ -288,7 +304,7 @@ mod gate {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
@@ -351,11 +367,6 @@ mod gate {
     /// The slots clause's requests: long enough that the together run holds
     /// dozens of rounds with both streams live.
     const SLOTS_PREDICT: usize = 96;
-
-    /// The slots clause's interleave window and its floor for each stream
-    /// (the module header's (v3) derivation).
-    const SLOTS_WINDOW: usize = 16;
-    const SLOTS_EACH: usize = 4;
 
     /// The slots clause's poll for the refusal arm's exit.
     const SLOTS_POLL: Duration = Duration::from_millis(500);
@@ -1268,11 +1279,9 @@ mod gate {
         Ok(())
     }
 
-    /// One streamed request's answer: the final event's tokens, and each
-    /// token event's arrival on its reader thread's clock.
+    /// One streamed request's answer: the final event's tokens.
     struct Streamed {
         tokens: Vec<u32>,
-        arrivals: Vec<Instant>,
     }
 
     /// A streamed request's answer channel: what its reader thread sends
@@ -1280,9 +1289,8 @@ mod gate {
     type StreamedRx = mpsc::Receiver<Result<Streamed, String>>;
 
     /// `/completion` of `ids` at temperature 0, streamed: a helper thread of
-    /// its own runs `curl -N` and reads the SSE lines as they land, each
-    /// token event timestamped the moment it is read (the module header's
-    /// (v3) reader thread a stream). The final event carries the tokens.
+    /// its own runs `curl -N` and reads the SSE lines as they land. The
+    /// final event carries the tokens.
     fn streamed(
         addr: &str,
         ids: &[u32],
@@ -1326,21 +1334,15 @@ mod gate {
                     .stdout
                     .take()
                     .ok_or_else(|| format!("curl {url}: no stdout"))?;
-                let mut arrivals = Vec::new();
                 let mut tokens = Vec::new();
                 for line in BufReader::new(out).lines() {
                     let line = line.map_err(|e| format!("curl {url}: {e}"))?;
-                    let at = Instant::now();
                     let Some(v) = line
                         .strip_prefix("data: ")
                         .and_then(|d| serde_json::from_str::<Value>(d).ok())
                     else {
                         continue;
                     };
-                    if v["stop"] == json!(false) && !v["content"].as_str().unwrap_or("").is_empty()
-                    {
-                        arrivals.push(at);
-                    }
                     if v.get("tokens").is_some_and(Value::is_array) {
                         tokens = ids_of(&v["tokens"]);
                     }
@@ -1349,7 +1351,7 @@ mod gate {
                 if !status.success() {
                     return Err(format!("curl {url}: {status}"));
                 }
-                Ok(Streamed { tokens, arrivals })
+                Ok(Streamed { tokens })
             })();
             let _ = tx.send(run);
         })
@@ -1413,8 +1415,8 @@ mod gate {
     /// The slots clause (module header) on a server of `--parallel 2` and
     /// `arm`'s flags and environment started into `<dir>/<arm.dir>`: two
     /// greedy streamed requests of distinct prompts, each first run alone on
-    /// that same server and then both together, the ids, the round counters
-    /// and the streams' interleaving held, the load record's split and
+    /// that same server and then both together, the ids and the round
+    /// counters held, the load record's split and
     /// `/props`' context pinned to half the arm's total. Each check's name
     /// carries the arm's prefix.
     fn slots_flow_together(
@@ -1577,47 +1579,6 @@ mod gate {
             &named("slots_rounds_carry_both_slots"),
             swaps.is_none_or(|v| v == 0.0) && ratio >= 1.5,
         );
-        // (v3) While both streams are live, every window of SLOTS_WINDOW
-        // consecutive arrivals holds at least SLOTS_EACH of each: both live
-        // from the later stream's first arrival to the earlier one's last.
-        let mut merged: Vec<(usize, Instant)> = together
-            .iter()
-            .enumerate()
-            .flat_map(|(i, s)| s.arrivals.iter().map(move |&t| (i, t)))
-            .collect();
-        merged.sort_by_key(|&(_, t)| t);
-        let live_from = (0..2)
-            .map(|i| together[i].arrivals.first().copied())
-            .max()
-            .flatten();
-        let live_to = (0..2)
-            .map(|i| together[i].arrivals.last().copied())
-            .min()
-            .flatten();
-        let tags: Vec<usize> = merged
-            .iter()
-            .filter(|(_, t)| live_from.is_some_and(|a| *t >= a) && live_to.is_some_and(|b| *t < b))
-            .map(|&(i, _)| i)
-            .collect();
-        let mut thin = 0;
-        for w in tags.windows(SLOTS_WINDOW) {
-            let of_first = w.iter().filter(|&&i| i == 0).count();
-            if of_first < SLOTS_EACH || SLOTS_WINDOW - of_first < SLOTS_EACH {
-                thin += 1;
-            }
-        }
-        println!(
-            "{} interleave: {} arrivals while both live, {} thin window(s) of {}",
-            arm.dir,
-            tags.len(),
-            thin,
-            SLOTS_WINDOW,
-        );
-        check(
-            ok,
-            &named("slots_streams_interleave"),
-            !tags.is_empty() && thin == 0,
-        );
         println!("{} server stopped: {}", arm.dir, s.stop()?);
         Ok(())
     }
@@ -1711,7 +1672,12 @@ mod gate {
     /// the slots clause's prompts, each first run alone on that server and
     /// then both together, the `slots round` records between read back. On
     /// the whole-card arm every together-run record holds `passes=1`
-    /// (`slots_rounds_run_one_pass`) and the rows the records carry, with
+    /// (`slots_rounds_run_one_pass`); on both arms the window holds a round
+    /// of both ([`rounds_hold_a_round_of_both`]: at least one record of
+    /// `rows=2` — the records carry no round of one stepping slot, so the
+    /// records cannot see one-slot stretches, and the window's solo count
+    /// prints beside, unpinned);
+    /// and the rows the records carry, with
     /// the solo rounds the `/metrics` decode deltas count, sum to the
     /// tokens the two requests decoded beyond their prompts' first
     /// (`slots_rounds_rows_sum_the_decoded_tokens`); on the placed arm
@@ -1818,15 +1784,22 @@ mod gate {
                 }),
                 every,
             );
+            // The window's solo rounds (a round of one stepping slot is a
+            // select and a `next`, no record): the decode deltas less the
+            // records and the two requests' prompt-phase calls, booked at
+            // their end (`worker.rs`'s `end_request`).
+            let solo = decode1 - decode0 - window.len() as f64 - 2.0;
+            rounds_hold_a_round_of_both(
+                ok,
+                &named("slots_rounds_hold_a_round_of_both"),
+                dir_name,
+                window,
+                solo,
+            );
             if one_pass {
                 // The tokens decoded beyond the two prompts' first: each
                 // request's `n_predict` less one, its first token being the
-                // prompt's own last step. The records carry the rounds of two
-                // rows or more; the solo rounds beside them (a select and a
-                // `next`, no record) the decode deltas count, less the two
-                // requests' prompt-phase calls, booked at their end
-                // (`worker.rs`'s `end_request`).
-                let solo = decode1 - decode0 - window.len() as f64 - 2.0;
+                // prompt's own last step.
                 let sum: u64 = rows.iter().sum();
                 let want = 2 * (SLOTS_PREDICT - 1) as u64;
                 println!(
@@ -1842,6 +1815,47 @@ mod gate {
             println!("{dir_name} server stopped: {}", s.stop()?);
         }
         Ok(())
+    }
+
+    /// The slots clause's both-advance-in-the-same-rounds criterion (the
+    /// module header) on one slots-round arm's together window `window`,
+    /// its solo-round count `solo` printed beside: the window holds at
+    /// least one round that carried both slots (a record of `rows=2`) —
+    /// the one thing the records can see of it. A round of one stepping
+    /// slot prints no record at all (the worker runs it as a plain select
+    /// and `next`), so the records cannot see one-slot stretches: a seat
+    /// that serves one slot at a time leaves the window with no record of
+    /// both, while a server that only stretches one-slot runs between
+    /// two-row rounds keeps its records of both — that shape is the slots
+    /// clause's (v2) busy ratio's to catch (`slots_rounds_carry_both_slots`,
+    /// ≥ 1.5, pulled to ~1.0 by one busy a round). The solo count is
+    /// printed, not pinned: on a round server it is the two requests'
+    /// admission skew and its mirror at the tail (equal `n_predict`), a
+    /// race the worker counts in passes, which no code bounds. No
+    /// pass-count condition either: the placed arm steps in turn inside a
+    /// round (`passes=rows`) by design, and the whole-card arm's one pass
+    /// is `slots_rounds_run_one_pass`'s own pin.
+    // PIN(2026-10-06): the criterion reads the engine's own `slots round`
+    // records, not the SSE arrival timestamps it read before — a client-side
+    // clock on a shared box clumps one stream's events under load (the same
+    // clause in `gate_qwen38_serve` went red at load average 15.6 with the
+    // server's rounds unchanged), so the arrival window was a flake by
+    // construction. The threshold stays zero: no thin arrival window then,
+    // no empty together window now — a window with no record of `rows=2` is
+    // a seat that served one slot at a time.
+    fn rounds_hold_a_round_of_both(
+        ok: &mut bool,
+        name: &str,
+        what: &str,
+        window: &[Fields],
+        solo: f64,
+    ) {
+        let both = window.iter().filter(|r| r.u64("rows") == Ok(2)).count();
+        println!(
+            "{what}: {both} round(s) of both slots; {solo} solo round(s) beside them, printed \
+             not pinned",
+        );
+        check(ok, name, both > 0);
     }
 
     /// The late-request clause (module header): the first request decodes
