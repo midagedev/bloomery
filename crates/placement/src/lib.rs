@@ -16,3 +16,4 @@
 
 pub mod placement;
 pub mod r8;
+pub mod slots;
