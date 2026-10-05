@@ -1,6 +1,7 @@
 //! The V4.1 residency gates' shared open: the records-free open log
-//! ([`Quiet`]), the load through the binaries' open ([`open`]) and the
-//! FNV-1a 64 of a logits row ([`fnv`]). `gate_ds41_callstream` and the
+//! ([`Quiet`]), the load through the binaries' open ([`open`], and
+//! [`open_edited`] with an edit of its plan) and the FNV-1a 64 of a logits
+//! row ([`fnv`]). `gate_ds41_callstream` and the
 //! residency clauses it runs (`shared/ds41_residency.rs`) read them here.
 
 use std::path::Path;
@@ -45,15 +46,30 @@ impl RowsLog for Quiet {
     }
 }
 
-/// The target by `machine` under `cfg` through the binaries' open.
+/// The target by `machine`, placement `place`'s, under `cfg` through the
+/// binaries' open.
 pub fn open(
     path: &Path,
+    place: Place,
     machine: impl Fn(usize) -> Machine,
     cfg: &OpenCfg,
 ) -> Result<Session<Body>, GateError> {
+    open_edited(path, place, machine, cfg, |_| Ok(()))
+}
+
+/// [`open`] with `edit` applied to the plan before the load
+/// (`Loaded::open_edited`): a static load placed by a dumped card table
+/// (`generate::place_table`).
+pub fn open_edited(
+    path: &Path,
+    place: Place,
+    machine: impl Fn(usize) -> Machine,
+    cfg: &OpenCfg,
+    edit: impl FnOnce(&mut Plan<'_>) -> Result<(), SessionError>,
+) -> Result<Session<Body>, GateError> {
     let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let args = OpenArgs {
-        place: Place::Bp.name(),
+        place: place.name(),
         machine,
         ctx: usize::try_from(workstation::CTX_MAX)?,
         mode: StepMode::Graph,
@@ -63,7 +79,8 @@ pub fn open(
             card_timing: false,
         },
     };
-    let loaded = Loaded::<Body>::open(file, args, &mut Quiet)?.ok_or("the open planned nothing")?;
+    let loaded = Loaded::<Body>::open_edited(file, args, &mut Quiet, |_, plan| edit(plan))?
+        .ok_or("the open planned nothing")?;
     Ok(loaded.ready(&mut Quiet)?)
 }
 

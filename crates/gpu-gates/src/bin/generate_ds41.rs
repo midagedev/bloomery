@@ -4,6 +4,9 @@
 //!     generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N]
 //!                   [--ctx C] [--place PLACE] [--mode eager|graph]
 //!                   [--time [--warm W]] [--plan] [--logits]
+//!                   [--top2 K [--rows FILE]] [--repeat R] [--table]
+//!                   [--ignore-eos] [--serve-feed] [--dump-table FILE]
+//!                   [--card-table FILE]
 //!     generate_ds41 --arm SPEC [--arm SPEC ...] [--arm-sync] [-n N] [--ctx C]
 //!                   [--place PLACE] [--mode eager|graph] [--time [--warm W]]
 //!                   [--logits]
@@ -184,6 +187,19 @@
 //! bits — the bit-identity check's handle on the logits, outside every timed
 //! window.
 //!
+//! `--top2 K [--rows FILE]`, `--repeat R`, `--table`, `--ignore-eos`,
+//! `--serve-feed`, `--dump-table FILE` and `--card-table FILE` are the
+//! generate binaries' shared diagnosis flags (`generate::Diag`, whose doc is
+//! theirs). They act on the plain runs of the prompt flags, and each is
+//! refused by name beside a draft, the finite probe and `BLOOMERY_GEN_SLOTS`.
+//! `--repeat` does not mix with `--arm`: an arm list's runs start from the
+//! session's clear, which sends the residency back to its seed, and
+//! `--repeat`'s from `Target::reset`, which keeps it. `--card-table` needs
+//! `BLOOMERY_RESIDENCY=off` (a machine would move the experts it places) and
+//! loads through `app::Loaded::open_edited`. The stage card's copy of the
+//! map the table flags read is `Body::slots`, the host tier's map and machine
+//! `Body::hybrid` (`generate::Residence`).
+//!
 //! `BLOOMERY_DRAFT=lookup` serves an n-gram lookup draft (`runtime::Lookup`,
 //! fed the fed ids and every kept token) through the skewed two-row pass. A
 //! pass with a proposal `d` runs `step_rows([next, d])`: row A's argmax
@@ -311,7 +327,10 @@ mod drive {
     };
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_deepseek41::swap;
-    use bloomery_gpu_gates::generate::{Place, mode_name};
+    use bloomery_gpu_gates::generate::{
+        Diag, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table, dump_table,
+        mode_name, place_table, read_table, repeat_runs, seed_path, slot_table, write_table,
+    };
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use bloomery_levers::{
@@ -331,11 +350,17 @@ mod drive {
     use crate::draft::{Draft, open_dspark};
     use crate::{dspark, finite, gen_slots, place, split};
 
-    const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
-                         [-n N] [--ctx C] [--place a|gate|bp|<stage>[+<tier>…]] \
-                         [--mode eager|graph] \
-                         [--time [--warm W]] [--plan] [--logits], or --arm SPEC [--arm SPEC ...] \
-                         [--arm-sync] in place of the prompt flags";
+    /// The usage line: the prompt flags with the shared diagnosis flags
+    /// (`Diag::USAGE`), or an `--arm` list.
+    fn usage() -> String {
+        format!(
+            "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] [-n N] [--ctx C] \
+             [--place a|gate|bp|<stage>[+<tier>…]] [--mode eager|graph] [--time [--warm W]] \
+             [--plan] [--logits] {}, or --arm SPEC [--arm SPEC ...] [--arm-sync] in place of \
+             the prompt flags",
+            Diag::USAGE
+        )
+    }
 
     /// Where the prompt comes from.
     #[derive(Clone)]
@@ -419,6 +444,10 @@ mod drive {
         sync: bool,
         /// `--logits`: the `logits` record after the loop.
         logits: bool,
+        /// The shared diagnosis flags ([`Diag`]).
+        diag: Diag,
+        /// Whether this run is the one `--dump-table` reads.
+        dump_now: bool,
     }
 
     fn parse_args(levers: &Levers) -> Result<Args, GateError> {
@@ -436,6 +465,8 @@ mod drive {
             arms: Vec::new(),
             sync: false,
             logits: false,
+            diag: Diag::default(),
+            dump_now: false,
         };
         let (mut row, mut ids) = (None, None);
         let mut it = std::env::args().skip(1);
@@ -456,9 +487,12 @@ mod drive {
                 a.logits = true;
                 continue;
             }
+            if a.diag.take(&flag, &mut it)? {
+                continue;
+            }
             let v = it
                 .next()
-                .ok_or_else(|| format!("{flag} needs a value, or is unknown: {USAGE}"))?;
+                .ok_or_else(|| format!("{flag} needs a value, or is unknown: {}", usage()))?;
             match flag.as_str() {
                 "--prompt-id" => row = Some(v.parse()?),
                 "--tokens" => {
@@ -483,7 +517,7 @@ mod drive {
                         }
                     };
                 }
-                other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
+                other => return Err(format!("unknown argument {other:?}: {}", usage()).into()),
             }
         }
         a.prompt = match (row, ids) {
@@ -509,6 +543,12 @@ mod drive {
         } else if a.sync {
             return Err("--arm-sync paces the arms of an --arm list, and none is given".into());
         }
+        if a.diag.repeat > 1 && !a.arms.is_empty() {
+            return Err(
+                "--repeat runs the prompt flags' run again; --arm names its own runs".into(),
+            );
+        }
+        a.diag.finish(a.n_gen, &ref_model_path()?)?;
         check_counts(&a)?;
         for arm in &a.arms {
             check_counts(&a.for_arm(arm))?;
@@ -703,16 +743,14 @@ mod drive {
         }
         let slots = levers.gen_slots();
         if slots > 1 {
-            gen_slots::refused::<Body>(
-                slots,
-                "deepseek41",
-                &[
-                    ("BLOOMERY_DRAFT", draft != Draft::Off),
-                    ("BLOOMERY_CHECK_FINITE=1", check_finite),
-                    ("BLOOMERY_STEP_STATS=1", a.stats),
-                    ("--logits", a.logits),
-                ],
-            )?;
+            let mut beside = vec![
+                ("BLOOMERY_DRAFT", draft != Draft::Off),
+                ("BLOOMERY_CHECK_FINITE=1", check_finite),
+                ("BLOOMERY_STEP_STATS=1", a.stats),
+                ("--logits", a.logits),
+            ];
+            beside.extend(a.diag.set().into_iter().map(|flag| (flag, true)));
+            gen_slots::refused::<Body>(slots, "deepseek41", &beside)?;
         }
         let pin_main = levers.pin_main();
         let pinned = pin_main && threads::pool().pin_caller();
@@ -805,9 +843,33 @@ mod drive {
             ctx_max: 0,
             call: None,
         };
-        let opened = match NonZeroUsize::new(slots).filter(|n| n.get() > 1) {
-            Some(n) => open_slots(file, args, n, &mut log)?,
-            None => Loaded::<Body>::open(file, args, &mut log)?,
+        for r in &runs {
+            a.diag.check_feed(r.ids.len())?;
+        }
+        let table = match &a.diag.card_table {
+            Some(p) if cfg.body.residency == Residency::Off => Some(read_table(p)?),
+            Some(_) => {
+                return Err(
+                    "--card-table places the experts itself: set BLOOMERY_RESIDENCY=off \
+                     (the machine would move them)"
+                        .into(),
+                );
+            }
+            None => None,
+        };
+        let opened = match (NonZeroUsize::new(slots).filter(|n| n.get() > 1), &table) {
+            (Some(_), Some(_)) => {
+                return Err(
+                    "--card-table loads one sequence's placement; BLOOMERY_GEN_SLOTS opens \
+                     several slots: give one of them"
+                        .into(),
+                );
+            }
+            (Some(n), None) => open_slots(file, args, n, &mut log)?,
+            (None, Some(t)) => Loaded::<Body>::open_edited(file, args, &mut log, |_, plan| {
+                place_table(plan, t).map_err(|e| SessionError::Refused(e.to_string()))
+            })?,
+            (None, None) => Loaded::<Body>::open(file, args, &mut log)?,
         };
         let Some(mut loaded) = opened else {
             return Ok(());
@@ -831,6 +893,9 @@ mod drive {
         // the batch's buffers made before it, so the timed feed allocates
         // nothing.
         let mut s = loaded.ready(&mut log)?;
+        if let (Some(t), Some(p)) = (&table, &a.diag.card_table) {
+            card_table(&residence(&s)?.table()?, t, p)?.print();
+        }
         if cfg.body.residency != Residency::Off {
             // An arm's boundaries: one a slot's prompt call, the first
             // pass's, then at most one a generated token.
@@ -873,17 +938,46 @@ mod drive {
                 .map_err(|f| Box::new(f) as GateError);
         }
         if draft == Draft::Off && !check_finite {
-            return s
-                .arms(&runs, |s, i, r| {
-                    if let Some(c) = s.take_cleared() {
-                        record::residency_reset(&c).print();
+            a.diag.begin()?;
+            let at_load = match a.diag.table {
+                true => Some(s.model().body("generate_ds41")?.slot_map().stage_view()),
+                false => None,
+            };
+            if let Some(p) = &a.diag.dump_table {
+                write_table(&seed_path(p), &residence(&s)?.table()?)?;
+            }
+            let each = |s: &mut Session<Body>, i: usize, r: &ArmRun| -> Result<(), GateError> {
+                if let Some(c) = s.take_cleared() {
+                    record::residency_reset(&c).print();
+                }
+                let view = pre.arm(i, r)?;
+                let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), s)?;
+                let ran = if r.a.diag.ignore_eos.is_empty() {
+                    decode(s, &r.a, &fed, &mut runtime::Plain, "steps", |_| {})
+                } else {
+                    let mut adv = NoEog::new(r.a.diag.ignore_eos.clone());
+                    decode(s, &r.a, &fed, &mut adv, "steps", |_| {})
+                };
+                after_passes(s, ran)
+            };
+            if runs.len() > 1 && runs[0].spec.is_none() {
+                let (ids, n_gen) = (runs[0].ids.len(), runs[0].a.n_gen);
+                repeat_runs(&mut s, runs.len(), ids, n_gen, "generate_ds41", |s, i| {
+                    let r = &runs[i];
+                    if let (true, Some(p)) = (r.a.dump_now, &r.a.diag.dump_table) {
+                        write_table(&before_path(p), &residence(s)?.table()?)?;
                     }
-                    let view = pre.arm(i, r)?;
-                    let fed = r.fed(feed_mode, view.as_ref().or(call.as_ref()), s)?;
-                    let ran = decode(s, &r.a, &fed, &mut runtime::Plain, "steps", |_| {});
-                    after_passes(s, ran)
-                })
-                .map_err(|f| Box::new(f) as GateError);
+                    each(s, i, r)
+                })?;
+            } else {
+                s.arms(&runs, each).map_err(|f| Box::new(f) as GateError)?;
+            }
+            if let Some(v) = at_load {
+                let r = residence(&s)?;
+                let t = r.table()?;
+                slot_table(&t, &r.check(&t)?, t.differ(&v)?).print();
+            }
+            return Ok(());
         }
         // One arm: the pair pass's capture comes before its prelude, so no
         // arm's window holds it.
@@ -891,6 +985,12 @@ mod drive {
             return Err("generate_ds41: a draft or the finite probe runs one arm".into());
         };
         let a = &r.a;
+        if let Some(flag) = a.diag.set().first() {
+            return Err(format!(
+                "{flag} acts on the plain runs: not under a draft or the finite probe"
+            )
+            .into());
+        }
         match (draft, spark, check.as_mut()) {
             (Draft::Off, _, None) => {
                 Err("generate_ds41: the plain run goes through the arm list".into())
@@ -921,6 +1021,14 @@ mod drive {
             }
             (Draft::Dspark, None, _) => Err("generate_ds41: the DSpark draft did not load".into()),
         }
+    }
+
+    /// The residency views of `s`'s body ([`Residence`]): its stage card's
+    /// copy of the slot map (`Body::slots`) and its host tier.
+    fn residence(s: &Session<Body>) -> Result<Residence<'_>, GateError> {
+        let m = s.model();
+        let b = m.body("generate_ds41")?;
+        Ok(Residence::of(m.gpu(), b.slots(), b.hybrid()))
     }
 
     /// A run's result `ran`, with the `residency pass` records of its
@@ -1019,6 +1127,7 @@ mod drive {
                 mode,
                 need: call.map(|c| &c.need),
                 base: s.model().body("generate_ds41")?.hybrid().stats(),
+                serve: false,
             };
             let (tok, time) = feed(s, &mut runtime::Plain, &f, "steps")?;
             first.push(tok);
@@ -1065,6 +1174,7 @@ mod drive {
     /// One arm of the run: its arguments (its own `-n`), its fed ids, how
     /// many of them are the prompt's, and the `--arm` it came from (none for
     /// a run of the prompt flags).
+    #[derive(Clone)]
     struct ArmRun {
         a: Args,
         ids: Vec<u32>,
@@ -1073,16 +1183,23 @@ mod drive {
     }
 
     /// The run's arms: the `--arm` list, or the one arm the prompt flags
-    /// name.
+    /// name, `--repeat` times.
     fn arm_runs(a: &Args) -> Result<Vec<ArmRun>, GateError> {
         if a.arms.is_empty() {
             let (ids, prompt_len) = fed_ids(a)?;
-            return Ok(vec![ArmRun {
+            let run = ArmRun {
                 a: a.clone(),
                 ids,
                 prompt_len,
                 spec: None,
-            }]);
+            };
+            let mut runs = vec![run; a.diag.repeat];
+            if a.diag.dump_table.is_some()
+                && let Some(r) = runs.get_mut(1)
+            {
+                r.a.dump_now = true;
+            }
+            return Ok(runs);
         }
         a.arms
             .iter()
@@ -1114,6 +1231,7 @@ mod drive {
                 mode,
                 need: call.map(|c| &c.need),
                 base: s.model().body("generate_ds41")?.hybrid().stats(),
+                serve: self.a.diag.serve_feed,
             })
         }
     }
@@ -1180,6 +1298,8 @@ mod drive {
         need: Option<&'a body::Need>,
         /// The host tier's counters at the arm's start.
         base: HybridStats,
+        /// `--serve-feed`: the call runs every id but the last.
+        serve: bool,
     }
 
     /// `--plan` prints a batched call's plan and runs nothing: refused with
@@ -1611,8 +1731,10 @@ mod drive {
             // The DSpark feed's taps widen the tapped layers' blocks: its call
             // is not the plain call's plan. An `--arm` list prints each arm's
             // call before it runs.
+            // Under `--serve-feed` the call runs every id but the last.
+            let called = depth - usize::from(a.diag.serve_feed);
             let call = (self.batched && self.draft != Draft::Dspark && a.arms.is_empty())
-                .then(|| CallView::of(self.cfg, &inputs.hp, ctx_max, depth));
+                .then(|| CallView::of(self.cfg, &inputs.hp, ctx_max, called));
             if let Some(c) = &call {
                 c.print(a.plan, &inputs.hp, &plan.n_l);
             }
@@ -1893,10 +2015,11 @@ mod drive {
             check_plan(s.model(), f.need)?;
             print_union(s.model_mut(), &f.base)?;
         }
+        let called = if f.serve { depth - 1 } else { depth };
         let time = FeedTime {
             n: depth,
             passes: if batch {
-                body::batch_count(depth)
+                body::batch_count(called) + usize::from(f.serve)
             } else {
                 depth
             },
@@ -1925,12 +2048,14 @@ mod drive {
         }
     }
 
-    /// Each plain step's position, token and wall, and the stats probes.
+    /// Each plain step's position, token and wall, the stats probes, and
+    /// the rows `--top2` reads ([`TopRows`]).
     struct Steps {
         stats: bool,
         rows: Vec<(u32, u32, f64)>,
         probes: Vec<Probe>,
         n_gen: usize,
+        tops: TopRows,
     }
 
     impl PassSink<Session<Body>> for Steps {
@@ -1953,6 +2078,9 @@ mod drive {
             wall: Duration,
         ) -> Result<(), GateError> {
             self.rows.push((c.pos, tokens[0], wall.as_secs_f64() * 1e3));
+            if self.tops.wants() {
+                self.tops.read(&t.model().logits()?, tokens[0])?;
+            }
             if self.stats {
                 self.probes
                     .push(Probe::read(t.model(), self.probes.last())?);
@@ -1973,13 +2101,24 @@ mod drive {
         after: impl FnOnce(&A),
     ) -> Result<(), GateError> {
         let depth = f.ids.len();
-        let (first, feed_time) = feed(s, adv, f, steps)?;
+        let (first, feed_time) = if a.diag.serve_feed {
+            feed(s, &mut ServeFeed { inner: adv }, f, steps)?
+        } else {
+            feed(s, adv, f, steps)?
+        };
+        if let (true, Some(p)) = (a.dump_now, &a.diag.dump_table) {
+            dump_table(&residence(s)?, p)?.print();
+        }
         let mut sink = Steps {
             stats: a.stats,
             rows: Vec::with_capacity(a.n_gen - 1),
             probes: Vec::new(),
             n_gen: a.n_gen,
+            tops: TopRows::new(&a.diag),
         };
+        if sink.tops.wants() {
+            sink.tops.read(&s.model().logits()?, first)?;
+        }
         let stop = stop_at_n(s, a)?;
         let out = runtime::generate(s, adv, f.ids, first, &stop, &mut sink)?;
         ran_to_n(&out)?;
@@ -2003,6 +2142,7 @@ mod drive {
         if a.logits {
             print_logits(s.model())?;
         }
+        sink.tops.finish(a.diag.rows.as_deref())?;
         if a.stats {
             print_counts(s.model())?;
             print_stats(&sink.probes, warm);

@@ -503,6 +503,282 @@ impl SlotLedger {
     }
 }
 
+// --------------------------------------------------------------- readback
+
+/// The stage card's copy of a slot map, read back from the card
+/// ([`CardTable::read`]) or rebuilt from its words ([`CardTable::new`]):
+/// `layers × n_expert` entries, row by row as [`SlotMap::stage_view`] lays
+/// them, [`HOST`] for an expert the stage card holds no slot of. The chain
+/// reads this copy at replay and the machine writes it, so it is the
+/// placement the card computes; [`CardTable::check`] holds it to the host map
+/// and the machine's ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CardTable {
+    layers: Range<usize>,
+    n_expert: usize,
+    entries: Vec<u32>,
+}
+
+/// An entry of a [`CardTable`] that the host map or the ledger names
+/// otherwise: the card's entry, the map's and the ledger's slot, [`HOST`]
+/// for none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableOff {
+    pub layer: usize,
+    pub id: u32,
+    pub card: u32,
+    pub map: u32,
+    pub ledger: u32,
+}
+
+/// A [`CardTable`] against the host map and the ledger
+/// ([`CardTable::check`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableCheck {
+    /// Entries other than the host map's stage view.
+    pub vs_map: usize,
+    /// Entries other than the ledger's `Live` and `Landing` slots; `None` on
+    /// a load with no machine, which keeps no ledger.
+    pub vs_ledger: Option<usize>,
+    /// Stage card slots that two ids of one layer both name.
+    pub doubled: usize,
+    /// The first entries off the map or the ledger, in table order, at most
+    /// [`TableCheck::FIRST`].
+    pub first: Vec<TableOff>,
+}
+
+impl TableCheck {
+    /// The entries [`TableCheck::first`] names at most.
+    pub const FIRST: usize = 6;
+}
+
+/// Two [`CardTable`]s of one shape, entry by entry
+/// ([`CardTable::sets_vs`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetDiff {
+    /// Entries on the stage card in one table and on the host in the other.
+    pub set: usize,
+    /// Entries on the stage card in both, at another slot.
+    pub slot: usize,
+}
+
+impl CardTable {
+    /// The stage card's copy `view` of `map`, read back on `stream`, the
+    /// engine stream every boundary writes it on, so the read waits behind
+    /// those writes. `machine` is the load's residency machine when it runs
+    /// one. Refused by name: a view other than the copy the machine writes, a
+    /// read while a prompt call is open (its picks move the map inside the
+    /// call), and a view of another length than the map's.
+    pub fn read(
+        view: &DeviceBuffer<u32>,
+        map: &SlotMap,
+        machine: Option<&SwapMachine>,
+        stream: &CudaStream,
+    ) -> Result<CardTable, GpuError> {
+        const WHAT: &str = "CardTable::read";
+        if let Some(m) = machine {
+            if m.view != view.cu_deviceptr() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    "the view is not the copy of the map the residency machine writes",
+                ));
+            }
+            if m.call_open() {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    "a prompt call is open: its picks move the map inside the call",
+                ));
+            }
+        }
+        if view.len() != map.layers().len() * map.n_expert() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a view of {} words for the map's layers {:?} of {} experts",
+                    view.len(),
+                    map.layers(),
+                    map.n_expert()
+                ),
+            ));
+        }
+        CardTable::new(map.layers(), map.n_expert(), view.to_host_vec(stream)?)
+    }
+
+    /// The table of `entries` over `layers`, `n_expert` a layer (a table kept
+    /// in a file). Refused by name: no expert a layer, and another count of
+    /// entries.
+    pub fn new(
+        layers: Range<usize>,
+        n_expert: usize,
+        entries: Vec<u32>,
+    ) -> Result<CardTable, GpuError> {
+        if n_expert == 0 || entries.len() != layers.len() * n_expert {
+            return Err(GpuError::shape(
+                "CardTable::new",
+                format!(
+                    "{} entries for layers {layers:?} of {n_expert} experts",
+                    entries.len()
+                ),
+            ));
+        }
+        Ok(CardTable {
+            layers,
+            n_expert,
+            entries,
+        })
+    }
+
+    /// The layers the table covers.
+    #[must_use]
+    pub fn layers(&self) -> Range<usize> {
+        self.layers.clone()
+    }
+
+    /// The experts of each layer.
+    #[must_use]
+    pub fn n_expert(&self) -> usize {
+        self.n_expert
+    }
+
+    /// The entries, row by row.
+    #[must_use]
+    pub fn entries(&self) -> &[u32] {
+        &self.entries
+    }
+
+    /// The entries that name a stage card slot.
+    #[must_use]
+    pub fn on_card(&self) -> usize {
+        self.entries.iter().filter(|&&e| e != HOST).count()
+    }
+
+    /// The table against the host map `map` and, on a load that runs a
+    /// machine, its `ledger`: the entries off each, the slots named twice in
+    /// a layer, and the first entries off either. Refused by name: a map or a
+    /// ledger over other layers or experts, and a ledger slot holding an
+    /// expert past the layer's.
+    pub fn check(
+        &self,
+        map: &SlotMap,
+        ledger: Option<&SlotLedger>,
+    ) -> Result<TableCheck, GpuError> {
+        const WHAT: &str = "CardTable::check";
+        let n = self.n_expert;
+        if map.layers() != self.layers || map.n_expert() != n {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a table of layers {:?} of {n} experts, a map of layers {:?} of {}",
+                    self.layers,
+                    map.layers(),
+                    map.n_expert()
+                ),
+            ));
+        }
+        let view = map.stage_view();
+        let held = match ledger {
+            None => None,
+            Some(ledger) => {
+                let mut slots = vec![HOST; self.entries.len()];
+                for (i, l) in self.layers.clone().enumerate() {
+                    let row = ledger.row(l).ok_or_else(|| {
+                        GpuError::shape(WHAT, format!("the ledger has no row for layer {l}"))
+                    })?;
+                    for (slot, st) in row.iter().enumerate() {
+                        if let SlotState::Live(e) | SlotState::Landing { e, .. } = *st {
+                            if e as usize >= n {
+                                return Err(GpuError::shape(
+                                    WHAT,
+                                    format!("layer {l} slot {slot} holds expert {e} of {n}"),
+                                ));
+                            }
+                            slots[i * n + e as usize] = slot as u32;
+                        }
+                    }
+                }
+                Some(slots)
+            }
+        };
+        let mut c = TableCheck {
+            vs_map: 0,
+            vs_ledger: held.as_ref().map(|_| 0),
+            doubled: 0,
+            first: Vec::new(),
+        };
+        for (k, &card) in self.entries.iter().enumerate() {
+            let at_ledger = held.as_ref().map_or(HOST, |h| h[k]);
+            let off_map = card != view[k];
+            let off_ledger = held.is_some() && card != at_ledger;
+            c.vs_map += usize::from(off_map);
+            if let Some(v) = c.vs_ledger.as_mut() {
+                *v += usize::from(off_ledger);
+            }
+            if (off_map || off_ledger) && c.first.len() < TableCheck::FIRST {
+                c.first.push(TableOff {
+                    layer: self.layers.start + k / n,
+                    id: (k % n) as u32,
+                    card,
+                    map: view[k],
+                    ledger: at_ledger,
+                });
+            }
+        }
+        for row in self.entries.chunks(n) {
+            let mut named: Vec<u32> = row.iter().copied().filter(|&e| e != HOST).collect();
+            named.sort_unstable();
+            c.doubled += named.windows(2).filter(|w| w[0] == w[1]).count();
+        }
+        Ok(c)
+    }
+
+    /// The entries that differ from `view`, a stage view of the table's
+    /// shape (the map as it stood earlier); another length is refused by
+    /// name.
+    pub fn differ(&self, view: &[u32]) -> Result<usize, GpuError> {
+        if view.len() != self.entries.len() {
+            return Err(GpuError::shape(
+                "CardTable::differ",
+                format!(
+                    "a view of {} entries against a table of {}",
+                    view.len(),
+                    self.entries.len()
+                ),
+            ));
+        }
+        Ok(self
+            .entries
+            .iter()
+            .zip(view)
+            .filter(|(a, b)| a != b)
+            .count())
+    }
+
+    /// The table against `other`, entry by entry: the experts on the stage
+    /// card in one and on the host in the other, and those on the card in
+    /// both at another slot (a load places each layer's card set in its own
+    /// slot order). A table of another shape is refused by name.
+    pub fn sets_vs(&self, other: &CardTable) -> Result<SetDiff, GpuError> {
+        if other.layers != self.layers || other.n_expert != self.n_expert {
+            return Err(GpuError::shape(
+                "CardTable::sets_vs",
+                format!(
+                    "a table of layers {:?} of {} experts against one of {:?} of {}",
+                    self.layers, self.n_expert, other.layers, other.n_expert
+                ),
+            ));
+        }
+        let mut d = SetDiff { set: 0, slot: 0 };
+        for (&a, &b) in self.entries.iter().zip(&other.entries) {
+            match (a == HOST, b == HOST) {
+                (true, true) => {}
+                (false, false) => d.slot += usize::from(a != b),
+                _ => d.set += 1,
+            }
+        }
+        Ok(d)
+    }
+}
+
 // ---------------------------------------------------------------- staging
 
 /// Experts the staging ring holds at once.
@@ -3105,8 +3381,91 @@ fn not_resident(what: &'static str, layer: usize, id: u32, which: &str) -> GpuEr
 
 #[cfg(test)]
 mod tests {
-    use super::super::slots::{HOST, SlotMap};
-    use super::{Residency, SlotLedger, SlotState, Tally};
+    use super::super::slots::{HOST, Slot, SlotMap};
+    use super::{
+        CardTable, Residency, SetDiff, SlotLedger, SlotState, TableCheck, TableOff, Tally,
+    };
+
+    /// A card table against its map and ledger: the map's own copy is off
+    /// neither; a copy that kept a landed flip's victim in its old slot is
+    /// off both there, and doubles the slot the admitted expert took; a check
+    /// with no ledger leaves the ledger's count out. Against another
+    /// table, a set off the card counts once per side and a slot order
+    /// apart once per entry; another shape is refused by name. Mutant: the
+    /// slots named twice counted on the host map, which never holds a stale
+    /// entry.
+    #[test]
+    fn a_card_table_names_its_entries_off_the_map_and_the_ledger() {
+        let h = HOST;
+        let mut map = SlotMap::from_rows(3..5, 4, vec![0, 1, h, h, 1, h, 0, h]).expect("two rows");
+        let at_load = map.stage_view();
+        let copy = CardTable::new(3..5, 4, at_load.clone()).expect("the map's copy");
+        let none = TableCheck {
+            vs_map: 0,
+            vs_ledger: Some(0),
+            doubled: 0,
+            first: Vec::new(),
+        };
+        let ledger = SlotLedger::of_map(&map).expect("a ledger");
+        assert_eq!(copy.check(&map, Some(&ledger)).expect("the copy"), none);
+        assert_eq!(copy.check(&map, None).expect("no ledger").vs_ledger, None);
+        // Layer 3: expert 1 leaves slot 1, expert 2 lands there; the stale
+        // copy kept 1 in slot 1 and wrote 2 there too.
+        assert_eq!(map.evict(3, 1).expect("1 off"), Slot::Card(1));
+        map.admit(3, 2, Slot::Card(1)).expect("2 into slot 1");
+        let ledger = SlotLedger::of_map(&map).expect("a ledger");
+        let stale = CardTable::new(3..5, 4, vec![0, 1, 1, h, 1, h, 0, h]).expect("stale");
+        let c = stale.check(&map, Some(&ledger)).expect("the stale copy");
+        assert_eq!((c.vs_map, c.vs_ledger, c.doubled), (1, Some(1), 1));
+        let off = TableOff {
+            layer: 3,
+            id: 1,
+            card: 1,
+            map: h,
+            ledger: h,
+        };
+        assert_eq!(c.first, [off]);
+        assert_eq!(stale.differ(&at_load).expect("one shape"), 1);
+        let landed = CardTable::new(3..5, 4, map.stage_view()).expect("the landed copy");
+        assert_eq!(landed.check(&map, Some(&ledger)).expect("landed"), none);
+        assert_eq!(landed.differ(&at_load).expect("one shape"), 2);
+        assert_eq!(
+            landed.sets_vs(&copy).expect("one shape"),
+            SetDiff { set: 2, slot: 0 }
+        );
+        let reordered = CardTable::new(3..5, 4, vec![1, 0, h, h, 1, h, 0, h]).expect("reordered");
+        assert_eq!(
+            reordered.sets_vs(&copy).expect("one shape"),
+            SetDiff { set: 0, slot: 2 }
+        );
+        assert_eq!(landed.on_card(), 4);
+        let one_row = SlotMap::from_rows(3..4, 4, vec![0, h, h, h]).expect("a row");
+        let wide = CardTable::new(3..4, 8, vec![h; 8]).expect("8 wide");
+        for (e, want) in [
+            (
+                CardTable::new(3..5, 4, vec![h; 7]).expect_err("7 of 8"),
+                "CardTable::new: 7 entries for layers 3..5 of 4 experts",
+            ),
+            (
+                CardTable::new(3..5, 0, Vec::new()).expect_err("no expert"),
+                "CardTable::new: 0 entries for layers 3..5 of 0 experts",
+            ),
+            (
+                copy.differ(&[h; 4]).expect_err("half a view"),
+                "CardTable::differ: a view of 4 entries against a table of 8",
+            ),
+            (
+                copy.sets_vs(&wide).expect_err("another shape"),
+                "CardTable::sets_vs: a table of layers 3..5 of 4 experts against one of 3..4 of 8",
+            ),
+            (
+                copy.check(&one_row, None).expect_err("another map"),
+                "CardTable::check: a table of layers 3..5 of 4 experts, a map of layers 3..4 of 4",
+            ),
+        ] {
+            assert_eq!(e.to_string(), want);
+        }
+    }
 
     /// The parse takes exactly what the lever's grammar takes
     /// (`bloomery_levers::residency_word`, the one owner), with the same
