@@ -134,6 +134,35 @@
 //! tier's routed run, past the dense lead, under the file's own layer
 //! numbers, as a reference engine's set of the same file. The run ends with
 //! `route trace <dir> positions=<n> complete` once the set is sealed.
+//!
+//! `BLOOMERY_GEN_SLOTS=N` (unset or 1 is the one-sequence run above, line
+//! for line) decodes N streams in one pass (`GpuModel::step_slots`) on the
+//! plain load, placed as `--place` says: the GLM body serves several slots'
+//! rows in one pass under the host tier. The load plans N resident sequences
+//! (`open_resident_slots`, at one KDA lane), the session then serves N slots
+//! (`Session::add_slots`). The fed ids are N windows of equal length, an id
+//! count N does not divide refused by name; slot j, from its reset, runs
+//! window j as this run's prompt call (its `fed` and `step 0` records); in
+//! graph mode the pass of a row a slot is captured next, outside every timed
+//! window; then `-n` − 1 rounds of one pass, each slot fed its own argmax,
+//! nothing printed between two rounds. After the rounds: each slot's `time
+//! prompt`, then per round each slot's `step` record and, under `--time`, the
+//! round's `time pass <i> ms= positions=N kind=slots` (the pass and its N
+//! ids' readback; `warm` on a round `--warm` drops), then each slot's
+//! `tokens`; every per-slot record in slot order. The `SMOKE` footer's p50
+//! and mean are a round's, `prompt_tokens` and `depth` a window's, `steps`
+//! the counted rounds, and its `positions` and `tok/s(positions)` the counted
+//! rounds' positions and Σ positions · 1000 / Σ ms, the aggregate rate (the
+//! depth runner's aggregate row). The residency boundaries are the slots'
+//! prompt calls, then one a round. A plain pass of this body lays one or two
+//! slots, a row a slot (from three slots the walk's point is two lanes of
+//! two columns or more, which its step port does not serve): N over 2 is
+//! refused by name before the load, as N past the body's pass rows
+//! (`SlotRows::MAX_ROWS`) is, and the drafted pass of several slots is not
+//! built. `--plan` prints the plan of the N resident sequences and exits
+//! before the load. Refused by name before the load beside `--pair`,
+//! `BLOOMERY_DRAFT=mtp`, `--logits`, `--last-step`, `BLOOMERY_ROUTE_TRACE`
+//! and `BLOOMERY_STEP_STATS=1`, which this arm does not run.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -152,12 +181,17 @@ fn main() -> std::process::ExitCode {
 mod glm_place;
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/gen_slots.rs"]
+mod gen_slots;
+
+#[cfg(feature = "glm5next")]
 mod cli {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    use crate::gen_slots;
     use crate::glm_place;
-    use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident};
+    use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident, open_resident_slots};
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
@@ -170,8 +204,8 @@ mod cli {
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, prompt_bytes};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, DRAFT, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH, PREFILL_GROUP,
-        R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, DRAFT, GEN_SLOTS, HOST_LOCK, HOST_POPULATE, LANE_PREFETCH,
+        PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, ResidencyPick, ResidencyWhy, STEP_STATS,
     };
     use gguf::Split;
     use model::arch::glm5next::hparams::Hparams;
@@ -192,11 +226,18 @@ mod cli {
         STEP_STATS,
         PREFILL_GROUP,
         LANE_PREFETCH,
+        GEN_SLOTS,
     ];
 
     /// The drafted window's verify: the target's next token and the draft's
     /// one proposal.
     const VERIFY_ROWS: usize = 2;
+
+    /// The most streams the plain pass of a row a slot lays: the walk's point
+    /// for a plain pass is the step for one slot and the pair for two
+    /// (`runtime::sched::slot_lanes`), and from three slots on it is two
+    /// lanes of two columns or more, which the GLM step port does not serve.
+    const PLAIN_PASS_SLOTS: usize = 2;
 
     /// The last value of flag `name`, if given.
     fn flag(name: &str) -> Result<Option<String>, GateError> {
@@ -352,9 +393,11 @@ mod cli {
                     .into(),
             );
         }
+        let slots = levers.gen_slots();
         if timed && warm >= n_gen - 1 {
             return Err(format!(
-                "--warm {warm} leaves no timed step of the {} that -n {n_gen} generates",
+                "--warm {warm} leaves no timed {} of the {} that -n {n_gen} generates",
+                if slots > 1 { "round" } else { "step" },
                 n_gen - 1
             )
             .into());
@@ -433,20 +476,57 @@ mod cli {
                     .into(),
             );
         }
+        if slots > 1 {
+            gen_slots::refused::<Body>(
+                slots,
+                "glm5next",
+                &[
+                    ("--pair", pair),
+                    ("BLOOMERY_DRAFT=mtp", drafted),
+                    ("--logits", has("--logits")),
+                    ("--last-step", last_step),
+                    ("BLOOMERY_ROUTE_TRACE", levers.route_trace().is_some()),
+                    ("BLOOMERY_STEP_STATS=1", levers.step_stats()),
+                ],
+            )?;
+            if slots > PLAIN_PASS_SLOTS {
+                return Err(format!(
+                    "BLOOMERY_GEN_SLOTS={slots}: the glm5next body's plain pass lays one or two \
+                     slots, a row a slot (from three slots the walk's point is two lanes of two \
+                     columns or more, which its step port does not serve), and its drafted pass \
+                     of several slots is not built"
+                )
+                .into());
+            }
+            gen_slots::windows(&ids, slots, "the fed ids")?;
+        }
         let path = ref_model_path()?
             .into_os_string()
             .into_string()
             .map_err(|p| format!("BLOOMERY_REF_MODEL is not UTF-8: {p:?}"))?;
         // The last generated token is read out, not fed: the run takes the
         // prompt's positions and one a step after the first token. A drafted
-        // window's verify runs one row past the token it keeps last.
-        let takes = ids.len() + n_gen.saturating_sub(1) + usize::from(drafted);
+        // window's verify runs one row past the token it keeps last. Under
+        // several slots each slot holds one window of the fed ids at its own
+        // positions (the drafted arm is refused beside the lever before
+        // this).
+        let depth = ids.len() / slots;
+        let takes = depth + n_gen.saturating_sub(1) + usize::from(drafted);
         if takes > ctx {
-            return Err(format!(
-                "{} prompt ids and {n_gen} generated take {takes} positions, past --ctx {ctx}",
-                ids.len()
-            )
-            .into());
+            return Err(if slots > 1 {
+                format!(
+                    "a window of {depth} of the {} fed ids and {n_gen} generated take {takes} \
+                     positions a slot, past --ctx {ctx}",
+                    ids.len()
+                )
+                .into()
+            } else {
+                format!(
+                    "{} prompt ids and {n_gen} generated take {takes} positions, past --ctx {ctx}",
+                    ids.len()
+                )
+                .into()
+            });
         }
         let t = Instant::now();
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
@@ -495,7 +575,15 @@ mod cli {
             mode,
             cfg,
         };
-        let mut s = if drafted {
+        let mut s = if slots > 1 {
+            // The plan counts every resident sequence; the residency runs as
+            // the plain load's does (unset here, the plain slots load).
+            let lever = residency.map_or(Residency::Off, |(r, _)| r);
+            let Some(s) = open_resident_slots(file, args, lever, slots, &mut log)? else {
+                return Ok(());
+            };
+            s
+        } else if drafted {
             let lever = residency.map_or(Residency::Off, |(r, _)| r);
             let Some(s) = open_nextn(file, args, lever, &mut log)? else {
                 return Ok(());
@@ -525,11 +613,27 @@ mod cli {
                 .attach_route_trace(t)?;
         }
         if residency.is_some() {
-            // The prompt call's boundary, then one a generated step.
+            // The prompt call's boundary, then one a generated step; under
+            // several slots, one a slot's prompt call, then one a round.
+            let boundaries = n_gen + if slots > 1 { slots + 1 } else { 1 };
             s.model_mut()
                 .body_parts("generate_glm5next")?
                 .2
-                .log_residency(n_gen + 1);
+                .log_residency(boundaries);
+        }
+        if slots > 1 {
+            s.add_slots(slots)?;
+            let arm = SlotsArm {
+                ids: &ids,
+                n_gen,
+                slots,
+                mode,
+                place,
+                prefill,
+                timed,
+                warm,
+            };
+            return slots_run(&mut s, &arm);
         }
         let passes = match prefill {
             PrefillMode::Batch => bloomery_gpu_glm5next::batches_of(s.model(), ids.len())?.len(),
@@ -745,6 +849,20 @@ mod cli {
         last_step: bool,
     }
 
+    /// What the several-slot arm (`BLOOMERY_GEN_SLOTS`) runs: the plain
+    /// path's flags it takes, and its streams.
+    struct SlotsArm<'a> {
+        ids: &'a [u32],
+        n_gen: usize,
+        /// The streams one pass decodes (the lever's count).
+        slots: usize,
+        mode: StepMode,
+        place: &'static str,
+        prefill: PrefillMode,
+        timed: bool,
+        warm: usize,
+    }
+
     /// The verify pass's capture: its nodes, one line.
     struct PairCapture;
 
@@ -915,6 +1033,112 @@ mod cli {
                 .f("tok/s(p50)", 1e3 / p50)
                 .u("positions", counted.len())
                 .f("tok/s(positions)", rate)
+                .print();
+        }
+        for (kind, r) in s
+            .model_mut()
+            .body_parts("generate_glm5next")?
+            .2
+            .take_residency_passes()
+        {
+            record::residency_pass_of(kind, &r).print();
+        }
+        Ok(())
+    }
+
+    /// `BLOOMERY_GEN_SLOTS` (the module doc): the fed ids cut into
+    /// [`SlotsArm::slots`] windows, slot j from its reset prefilled with
+    /// window j by this run's prompt call, in graph mode the pass of a row a
+    /// slot captured, then `-n` − 1 rounds of one pass, each slot fed its own
+    /// argmax. Every slot's `fed` and `step 0` records print in the prefill;
+    /// the rounds run with nothing written between two of them, and every
+    /// record after them in slot order.
+    fn slots_run(s: &mut Session<Body>, a: &SlotsArm<'_>) -> Result<(), GateError> {
+        let (n, warm) = (a.slots, a.warm);
+        let windows = gen_slots::windows(a.ids, n, "the fed ids")?;
+        // Slot 0 stands where the load left it, fresh; every other slot
+        // starts from its reset here. One arm a process: no residency reset.
+        gen_slots::fresh(s, n, false)?;
+        let mut first = Vec::with_capacity(n);
+        let mut pos0 = Vec::with_capacity(n);
+        let mut feeds = Vec::with_capacity(n);
+        for (j, w) in windows.iter().enumerate() {
+            s.select_slot(j)?;
+            fed(w);
+            let passes = match a.prefill {
+                PrefillMode::Batch => bloomery_gpu_glm5next::batches_of(s.model(), w.len())?.len(),
+                PrefillMode::Steps => w.len(),
+            };
+            let t = Instant::now();
+            let tok = s.prompt(w, Want::Argmax)?.argmax();
+            let wall = t.elapsed();
+            Record::new(&record::STEP0)
+                .u("pos", s.pos() - 1)
+                .u("token", tok)
+                .u("fed", w.len())
+                .f("feed_s", wall.as_secs_f64())
+                .print();
+            first.push(tok);
+            pos0.push(s.pos());
+            feeds.push((w.len(), passes, wall));
+        }
+        s.select_slot(0)?;
+        if a.mode == StepMode::Graph && a.n_gen > 1 {
+            gen_slots::capture(s, n)?;
+        }
+        // A write is a syscall, and the rounds it would separate are the
+        // measurement: everything they answer prints after them.
+        let gen_slots::Rounds {
+            ids: out_ids,
+            walls,
+        } = gen_slots::rounds(s, first, a.n_gen)?;
+        for &(len, passes, wall) in &feeds {
+            let ms = wall.as_secs_f64() * 1e3;
+            Record::new(&record::TIME_PROMPT)
+                .u("n", len)
+                .f("ms", ms)
+                .f("tok/s", len as f64 * 1e3 / ms)
+                .u("passes", passes)
+                .w("kind", a.prefill.name())
+                .print();
+        }
+        for (k, &ms) in walls.iter().enumerate() {
+            let i = k + 1;
+            for (&p, ids) in pos0.iter().zip(&out_ids) {
+                Record::new(&record::STEP)
+                    .u("i", i)
+                    .u("pos", p - 1 + u32::try_from(i)?)
+                    .u("token", ids[i])
+                    .print();
+            }
+            if a.timed {
+                Record::new(&record::TIME_PASS)
+                    .u("i", i)
+                    .flag("warm", i <= warm)
+                    .f("ms", ms)
+                    .u("positions", n)
+                    .w("kind", "slots")
+                    .print();
+            }
+        }
+        for ids in &out_ids {
+            Record::new(&record::TOKENS).list("tokens", ids).print();
+        }
+        if a.timed {
+            let c = gen_slots::counted(&walls, warm, n)?;
+            Record::new(&record::SMOKE)
+                .w("mode", mode_name(a.mode))
+                .w("place", a.place)
+                .u("prompt_tokens", windows[0].len())
+                .u("depth", windows[0].len())
+                .u("generated", a.n_gen)
+                .u("warm", warm)
+                .u("steps", c.rounds)
+                .f("p50_ms", c.p50)
+                .f("mean_ms", c.mean)
+                .f("tok/s(p50)", 1e3 / c.p50)
+                .u("positions", c.positions)
+                .f("tok/s(positions)", c.aggregate)
                 .print();
         }
         for (kind, r) in s

@@ -2,7 +2,8 @@
 # The depth-glm5next.sh stub test: the runner's arms with no lease, no card and no model. It copies the
 # runner (DEPTH_GLM5NEXT_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
 # ref-paths.sh, models/glm5next.sh (the real profile: the arms run at its flags),
-# timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, lcpp-warm.sh, cold-blocks.sh, lever-arms.sh, arm-place.sh, gguf-ranges.py,
+# timing-card.sh, lease-probe.sh, tdist.py, lcpp-fit.sh, lcpp-warm.sh, cold-blocks.sh, lever-arms.sh, arm-place.sh, slots-arm.sh,
+# gguf-ranges.py,
 # records.py with generate_glm5next's checked-in schema, the lever registry, and a copy of lease.sh whose lease_take is replaced by a line
 # that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs. The fault counter every
 # copy reads (majflt_now, majflt_mark, lcpp_srv_majflt) is a file the stub engines add to when a case
@@ -131,6 +132,28 @@
 #                with its residency column; no ratio line and no xcheck line for it; rc 0.
 #   lever-levers a generate_glm5next whose --levers refuses BLOOMERY_R8 (STUB_GEN_REFUSE): 512@BLOOMERY_R8=off
 #                refused before the lease by name with the binary's line, rc 2, no row.
+# The aggregate arm (the runner's <D>@BLOOMERY_GEN_SLOTS=N; red on the runner before it, which reads the arm as a
+# plain lever arm):
+#   slots-env    BLOOMERY_GEN_SLOTS=2 in the runner's own environment: refused by name, rc 64, before any row.
+#   slots-bad    6@BLOOMERY_GEN_SLOTS=02: no slot count, refused by name, rc 64, before any row.
+#   slots        6@BLOOMERY_RESIDENCY=mid-p0-s1 6@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=mid-p0-s1, two rounds, no
+#                warm-up: the lever and 12 fed ids in the aggregate arm's processes alone (6 and none in its
+#                twin's), its rows `tok/s(aggregate) 45.45 @ n=2·3` (2 positions a round, 3 rounds at 44 ms) with
+#                prompt ids 50000..50011, its mean line `(aggregate of 2 slots)`, one `ratio slots d=6 <it>/<its
+#                twin> mean 1.5000` (the twin at 33 ms a step) and no `ratio d=` line for it; rc 0. Needs the
+#                prose ids, as ours-timed; so do the cases below.
+#   slots-res-off  6@BLOOMERY_GEN_SLOTS=2, the residency off (generate_glm5next's unset), one round: no residency
+#                record, so the residency clause has no pass to read and its row `tok/s(aggregate) 45.45 @ n=2·3`
+#                stands on its time pass records, with no residency column; rc 0.
+#   slots-pos, slots-leak, slots-none, slots-res-step  one FAIL row each, rc 1: a round of 1 position
+#                (STUB_GEN_SLOTS_POS=1), kind=slots records from the plain arm 6 (STUB_GEN_SLOTS_LEAK=2), the
+#                aggregate arm printing the plain lines (STUB_GEN_SLOTS_NOPASS=1), and a step pass in place of the
+#                first pass=slots (STUB_GEN_SLOTS_RESPASS=step, rc=residency).
+#   slots-past   the 2-slot arm of a D whose plain arm the prose file holds and whose 2·D ids it does not:
+#                refused before the lease by name, rc 64.
+#   slots-dry    the dry run of the twin and the aggregate arm: the aggregate arm's `slots=2 feed=12 twin=…`
+#                and its command line under env with both variables and the ids 50000..50011, the twin's
+#                with 50000..50005.
 # An ours arm's place= and the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090; depth-stub-cards.sh's
 # nvidia-smi and journalctl first on PATH; red on the runner before them, which has no two-card mode, refuses
 # place= as no lever row and BLOOMERY_GEN_PLACE=bp as no word):
@@ -178,7 +201,8 @@ cp "$RUNNER" "$T/tools/ref/depth-glm5next.sh"
 cp "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/timing-card.sh" \
   "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" \
   "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/lcpp-warm.sh" "$ROOT/tools/ref/cold-blocks.sh" \
-  "$ROOT/tools/ref/gguf-ranges.py" "$ROOT/tools/ref/lever-arms.sh" "$ROOT/tools/ref/arm-place.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/gguf-ranges.py" "$ROOT/tools/ref/lever-arms.sh" "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" \
+  "$T/tools/ref/"
 cp "$ROOT/tools/ref/models/glm5next.sh" "$T/tools/ref/models/"
 cp "$ROOT/tools/bloomery/records.py" "$T/tools/bloomery/"
 # The lever registry, which a lever arm's NAME=VALUE list is checked against (before the stub binaries are
@@ -307,7 +331,14 @@ cp "$T/pr27752/llama-server" "$T/pr27754/llama-server"
 # STUB_GEN_NOFED=1; its load record names --ctx (STUB_GEN_LOAD_CTX in its stead), its tokens record token 0
 # STUB_GEN_TOKEN0 (1000 by default) and then the step lines' ids. Under STUB_GEN_FAULT=<marker> it adds
 # 100000 to the fault counter after its `fed` line and times its prompt and steps at 0.01 ms,
-# so the row is [cold]; with STUB_GEN_FAULT_ONCE=1 only its first run does.
+# so the row is [cold]; with STUB_GEN_FAULT_ONCE=1 only its first run does. Under BLOOMERY_RESIDENCY it prints
+# a `residency host` record after its plan, as generate_glm5next does. Every run appends `slots=<BLOOMERY_GEN_SLOTS
+# or none> depth=<ids>` to $TMPDIR/stub-gen-slots. Under BLOOMERY_GEN_SLOTS=N (N >= 2, or STUB_GEN_SLOTS_LEAK=N on
+# any arm) it prints the several-slot arm's records: N windows of depth / N ids, each slot's fed, step 0, time
+# prompt and tokens records in slot order, each round's step records and a `time pass … kind=slots` at 44 ms of
+# N positions (STUB_GEN_SLOTS_POS in its stead), the SMOKE footer with positions and tok/s(positions), and under
+# BLOOMERY_RESIDENCY the residency passes none/0, prompt/0 a slot, then pass=slots kept=N a round
+# (STUB_GEN_SLOTS_RESPASS names another pass); STUB_GEN_SLOTS_NOPASS=1 prints the plain lines instead.
 G=$T/target/release/generate_glm5next
 # shellcheck disable=SC2016 # ${1:-} is the stub's own argument
 printf '#!/usr/bin/env bash\n[ "${1:-}" != --records-schema ] || exec cat %q\n' "$T/tools/bloomery/schema/generate_glm5next.jsonl" > "$G"
@@ -338,6 +369,7 @@ echo "draft=${BLOOMERY_DRAFT:-none} residency=${BLOOMERY_RESIDENCY:-none} depth=
 rp() { [ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=0 made=$4 in_flight=0 bytes=$5 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
 [ -z "${BLOOMERY_RESIDENCY:-}" ] || [ -n "${STUB_GEN_NORESLEVER:-}" ] || echo "residency lever residency=$BLOOMERY_RESIDENCY why=set"
 echo "plan place=$place card=A6000 ctx_max=2048 card_experts=2627 (39941832704 B) host_experts=9469 (145536581632 B) host_shadow=0 B n_l=67..68 on 39 layers card_budget=none"
+[ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency host residency=$BLOOMERY_RESIDENCY pinned=0 churn_experts=8 churn_bytes=4096 headroom=65536 headroom_after=61440"
 cards=''
 if [ -n "${STUB_GEN_CARDS_ON:-}" ]; then
   case $place in
@@ -348,6 +380,31 @@ if [ -n "${STUB_GEN_CARDS_ON:-}" ]; then
 fi
 echo "load resident_bytes=0 ctx=${STUB_GEN_LOAD_CTX:-$ctx}${cards:+ cards=$cards} (stub)"
 echo "capture graph_nodes=1348"
+echo "slots=${BLOOMERY_GEN_SLOTS:-none} depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-slots"
+ns=${STUB_GEN_SLOTS_LEAK:-${BLOOMERY_GEN_SLOTS:-1}}
+if [ "$ns" -gt 1 ] && [ -z "${STUB_GEN_SLOTS_NOPASS:-}" ]; then
+  # The several-slot arm's records in generate_glm5next's order: each slot's fed and step 0, then each slot's
+  # time prompt, each round's step a slot and its time pass, each slot's tokens, the SMOKE footer with the
+  # aggregate, the residency passes (the seed's, a prompt call a slot, a pass a round).
+  w=$((depth / ns))
+  for j in $(seq 0 $((ns - 1))); do
+    echo "fed ids=$w first=[1, 2, 3, 4] last=[5, 6, 7, 8] depth_sequence_from=$w"
+    echo "step 0 $((w - 1)) $((12 + j)) (the $w fed steps in 0.1 s, runtime value)"
+  done
+  for j in $(seq 0 $((ns - 1))); do echo "time prompt n=$w ms=100.0000 tok/s=$((w * 10)).00 passes=1 kind=batch"; done
+  for i in $(seq 1 $((n - 1))); do
+    for j in $(seq 0 $((ns - 1))); do echo "step $i $((w + i - 1)) $((1000 + 100 * j + i))"; done
+    echo "time pass $i ms=44.0000 positions=${STUB_GEN_SLOTS_POS:-$ns} kind=slots"
+  done
+  for j in $(seq 0 $((ns - 1))); do
+    echo "tokens [$((12 + j))$(for i in $(seq 1 $((n - 1))); do printf ', %s' $((1000 + 100 * j + i)); done)]"
+  done
+  echo "SMOKE mode=graph place=$place prompt_tokens=$w depth=$w generated=$n warm=0 steps=$((n - 1)) p50_ms=44.0000 mean_ms=44.0000 tok/s(p50)=22.73 positions=$(((n - 1) * ns)) tok/s(positions)=$(awk -v n="$ns" 'BEGIN { printf "%.2f", n * 1000 / 44 }')"
+  rp none 0 0 0 0
+  for j in $(seq 1 "$ns"); do rp prompt "$j" 0 0 0; done
+  for i in $(seq 1 $((n - 1))); do rp "${STUB_GEN_SLOTS_RESPASS:-slots}" $((ns + i)) "$ns" 1 100; done
+  exit 0
+fi
 rp none 0 0 0 0
 [ -n "${STUB_GEN_NOFED:-}" ] || echo "fed ids=$depth first=[1, 2, 3, 4] last=[5, 6, 7, 8] depth_sequence_from=$depth"
 pms=100.0000 sms=33.0000
@@ -698,6 +755,25 @@ place_refused place-word "^depth-glm5next.sh: arm '6@place=b2': place=b2: genera
 place_refused place-twice "^depth-glm5next.sh: arm '6@place=a,place=a': place is given twice$" -- 6 6@place=a,place=a
 place_refused place-card "^depth-glm5next.sh: arm '6@place=gate': place=gate is the gate plan, which loads on the 3090, and the timing card is " -- 6 6@place=gate
 place_refused twocard-gate "^depth-glm5next.sh: arm '6@place=gate': place=gate is the gate plan, which loads the 3090 alone; the two-card mode times a \(plan \(a\) on the A6000, the 3090 idle\) or bp \(plan \(b′\), both cards\)$" "${TC[@]}" -- 6 6@place=gate
+
+# The aggregate arm's refusals before anything runs (slots-arm.sh's slots_env_check and arm_slots): the lever in
+# the runner's own environment, and an N that is no slot count.
+L=$tmp/slots-env.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_GEN_SLOTS=2 -- 6
+if [ "$RC" != 64 ]; then
+  fail slots-env "rc $RC, want 64" "$L"
+elif want slots-env "$L" 1 "^depth-glm5next.sh: BLOOMERY_GEN_SLOTS=2 is set in the runner's own environment, which every arm inherits: " &&
+  want slots-env "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]) '; then
+  pass slots-env
+fi
+L=$tmp/slots-bad.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 -- 6 6@BLOOMERY_GEN_SLOTS=02
+if [ "$RC" != 64 ]; then
+  fail slots-bad "rc $RC, want 64" "$L"
+elif want slots-bad "$L" 1 "^depth-glm5next.sh: arm '6@BLOOMERY_GEN_SLOTS=02': BLOOMERY_GEN_SLOTS=02 is no slot count \(a whole number from 1, no leading zero\)" &&
+  want slots-bad "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]) '; then
+  pass slots-bad
+fi
 
 PROSE_SRC=${BLOOMERY_DATA:-/root/bloomery-data}/glm5next/corpus-prose.ids
 if [ -f "$PROSE_SRC" ]; then
@@ -1091,8 +1167,82 @@ PY
     want twocard-place-dry "$L" 1 '^\[dry\] placements: 6 bp, 6@place=a a \(an arm.s place= over BLOOMERY_GEN_PLACE=bp\)$'; then
     pass twocard-place-dry
   fi
+  # The aggregate arm (the runner's <D>@BLOOMERY_GEN_SLOTS=N) beside its plain twin, both under one residency
+  # word: the plain arm at 33 ms a step (30.30 tok/s), the 2-slot arm at 44 ms a round of 2 positions over its 3
+  # rounds (2 · 3 · 1000 / 132 = 45.45 tok/s): 45.45 / 30.30 = 1.5000 in each round.
+  RW=BLOOMERY_RESIDENCY=mid-p0-s1
+  SL=ours@BLOOMERY_GEN_SLOTS=2,$RW TW=ours@$RW
+  L=$tmp/slots.log
+  : > "$tmp/tmp/stub-gen-slots"
+  stub_run "$L" BLOOMERY_AB_ROUNDS=2 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- "6@$RW" "6@BLOOMERY_GEN_SLOTS=2,$RW"
+  if [ "$RC" != 0 ]; then
+    fail slots "rc $RC, want 0" "$L"
+  elif [ "$(paste -sd' ' "$tmp/tmp/stub-gen-slots")" != "slots=none depth=6 slots=2 depth=12 slots=2 depth=12 slots=none depth=6" ]; then
+    fail slots "the lever and the feed per process, want the twin's none of 6 ids and the aggregate arm's 2 of 12, in the rotation's order" "$tmp/tmp/stub-gen-slots"
+  elif want slots "$L" 2 "^ROW r[12] $SL d=6 n=4 ctx=2048 \\| tok/s\\(aggregate\\) 45\\.45 @ n=2·3, depth 6, A6000 \\(stub\\) \\| place a card_experts 2627 host_experts 9469 \\| prompt ids 50000\\.\\.50011 \\| slots 2 \\| tok/s\\(per stream, mean\\) 22\\.73 \\| p50 44\\.0000 ms/pass \\| mean 44\\.0000 ms/pass \\| warm 0 \\| first10_p50 44\\.0000 \\| last10_p50 44\\.0000 \\| distinct_tokens 6 \\| pp_tok/s 60\\.00 \\(n=6, passes=1, kind=batch\\) \\| residency mid-p0-s1 \\(set\\) passes 0 " &&
+    want slots "$L" 2 "^ROW r[12] $TW d=6 n=4 ctx=2048 \\| tok/s\\(mean\\) 30\\.30 @ n=4, depth 6, .*\\| prompt ids 50000\\.\\.50005 \\| " &&
+    want slots "$L" 1 "^mean $SL 6 +45\\.45 tok/s  \\[45\\.45\\.\\.45\\.45, spread 0\\.00%\\]  \\(aggregate of 2 slots\\) \\(n=2\\)$" &&
+    want slots "$L" 1 "^mean $TW 6 +30\\.30 tok/s  \\[30\\.30\\.\\.30\\.30, spread 0\\.00%\\]  \\(n=2\\)$" &&
+    want slots "$L" 1 '^ratio slots ' &&
+    want slots "$L" 1 "^ratio slots d=6 +$SL/$TW +mean 1\\.5000 ± 0\\.0000 \\(n=2\\)  of means 1\\.5000  per round: r1 1\\.5000 r2 1\\.5000$" &&
+    want slots "$L" 0 '^ratio d=6 .*GEN_SLOTS' &&
+    want slots "$L" 0 '^failed arms'; then
+    pass slots
+  fi
+  # The residency off (generate_glm5next's unset): no residency record, no pass for the residency clause to read,
+  # so the row stands on its time pass records alone.
+  L=$tmp/slots-res-off.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" -- 6@BLOOMERY_GEN_SLOTS=2
+  if [ "$RC" != 0 ]; then
+    fail slots-res-off "rc $RC, want 0" "$L"
+  elif want slots-res-off "$L" 1 "^ROW r1 ours@BLOOMERY_GEN_SLOTS=2 d=6 n=4 ctx=2048 \\| tok/s\\(aggregate\\) 45\\.45 @ n=2·3, depth 6, A6000 \\(stub\\) \\| place a card_experts 2627 host_experts 9469 \\| prompt ids 50000\\.\\.50011 \\| slots 2 \\| tok/s\\(per stream, mean\\) 22\\.73 \\| p50 44\\.0000 ms/pass \\| mean 44\\.0000 ms/pass \\| .*\\| pp_tok/s 60\\.00 \\(n=6, passes=1, kind=batch\\) \\| " &&
+    want slots-res-off "$L" 0 '^ROW .*\| residency ' &&
+    want slots-res-off "$L" 0 '^FAIL '; then
+    pass slots-res-off
+  fi
+  # A FAIL row for each clause: a round of 1 position, kind=slots records from a plain arm, an aggregate arm that
+  # printed the plain lines, a step pass in place of the pass.
+  slots_fail() { # slots_fail <name> <pattern> <env…> -- <arm>
+    local name=$1 pat=$2 e=()
+    shift 2
+    while [ "$1" != -- ]; do e+=("$1"); shift; done
+    shift
+    L=$tmp/$name.log
+    stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 BLOOMERY_TIMING_GPU="$GPU_A" ${e[@]+"${e[@]}"} -- "$@"
+    if [ "$RC" != 1 ]; then
+      fail "$name" "rc $RC, want 1" "$L"
+    elif want "$name" "$L" 1 "$pat" && want "$name" "$L" 0 '^ROW '; then
+      pass "$name"
+    fi
+  }
+  slots_fail slots-pos "^FAIL r1 $SL d=6 rc=0 \\| 3 of its 3 counted kind=slots records hold positions other than its 2 slots \\| " STUB_GEN_SLOTS_POS=1 -- "6@BLOOMERY_GEN_SLOTS=2,$RW"
+  slots_fail slots-leak '^FAIL r1 ours d=6 rc=0 \| its output holds 3 time pass record\(s\) of kind=slots and the arm names no BLOOMERY_GEN_SLOTS: ' STUB_GEN_SLOTS_LEAK=2 -- 6
+  slots_fail slots-none "^FAIL r1 $SL d=6 rc=0 \\| the arm runs BLOOMERY_GEN_SLOTS=2 and printed no counted time pass record of kind=slots: " STUB_GEN_SLOTS_NOPASS=1 -- "6@BLOOMERY_GEN_SLOTS=2,$RW"
+  slots_fail slots-res-step "^FAIL r1 $SL d=6 rc=residency \\| the slots residency clause: the residency pass at boundary=3 reads pass=step kept=2 before its first pass=slots, where only its 2 slots. prompt calls \\(pass=prompt kept=0\\) stand \\| " STUB_GEN_SLOTS_RESPASS=step -- "6@BLOOMERY_GEN_SLOTS=2,$RW"
+  # N·D ids past the prose file: refused before the lease, where the plain arm of that D fits.
+  PD=$(($(wc -l < "$PROSE_SRC") - 50000))
+  L=$tmp/slots-past.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_TIMING_GPU="$GPU_A" BLOOMERY_GEN_CTX=$((PD + 8)) -- "$PD" "$PD@BLOOMERY_GEN_SLOTS=2,$RW"
+  if [ "$RC" != 64 ]; then
+    fail slots-past "rc $RC, want 64" "$L"
+  elif want slots-past "$L" 1 "^depth-glm5next.sh: arm $PD@BLOOMERY_GEN_SLOTS=2,$RW: .* holds fewer than GLM_PROSE_FROM \\+ $((2 * PD)) = $((50000 + 2 * PD)) ids \\(2 slots × $PD\\)$" &&
+    want slots-past "$L" 0 'holds fewer than GLM_PROSE_FROM \+ '"$PD"' ' &&
+    want slots-past "$L" 0 '^(ROW|WARMUP|FAIL|\[config\]) '; then
+    pass slots-past
+  fi
+  # The dry run: the aggregate arm's facts and its command line, its N·D ids under its variables.
+  L=$tmp/slots-dry.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_DRY=1 BLOOMERY_TIMING_GPU="$GPU_A" -- "6@$RW" "6@BLOOMERY_GEN_SLOTS=2,$RW"
+  if [ "$RC" != 0 ]; then
+    fail slots-dry "rc $RC, want 0" "$L"
+  elif want slots-dry "$L" 1 "^\\[dry\\] 6@BLOOMERY_GEN_SLOTS=2,$RW: slots=2 feed=12 twin=$TW$" &&
+    want slots-dry "$L" 1 "^\\[dry\\]     timeout --kill-after=10 60 env BLOOMERY_GEN_SLOTS=2 $RW target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\\.\\.50011> -n 4 --ctx 2048 --place a --time $" &&
+    want slots-dry "$L" 1 "^\\[dry\\] 6@$RW:$" &&
+    want slots-dry "$L" 1 "^\\[dry\\]     timeout --kill-after=10 60 env $RW target/release/generate_glm5next --tokens <GLM_PROSE ids 50000\\.\\.50005> -n 4 --ctx 2048 --place a --time $"; then
+    pass slots-dry
+  fi
 else
-  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none, lever-levers, twocard-place, twocard-place-mtp, twocard-place-order, twocard-place-3090, twocard-nocards and twocard-place-dry: no prose ids at $PROSE_SRC (the profile pins their sha256)"
+  echo "skip ours-timed, cold-retry, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none, lever-levers, twocard-place, twocard-place-mtp, twocard-place-order, twocard-place-3090, twocard-nocards, twocard-place-dry, slots, slots-res-off, slots-pos, slots-leak, slots-none, slots-res-step, slots-past and slots-dry: no prose ids at $PROSE_SRC (the profile pins their sha256)"
 fi
 
 # same_view: a dry run less the lines this runner changes on purpose (dry-same).
