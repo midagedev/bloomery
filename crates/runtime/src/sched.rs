@@ -5,6 +5,8 @@
 //! a pure function of the point and the layer count. [`walk`] runs that
 //! sequence over a [`LayerProgram`] and its [`Port`]; the program enqueues,
 //! the port exchanges with the host, and neither decides an order.
+//! [`slot_lanes`] is the point a pass of resident slots takes, and which
+//! slots ride which lane: no body chooses its lanes itself.
 //!
 //! A unit is what runs one layer at a time through the chain: a row of the
 //! step or of the pair pass, a batch of a prompt group. A layer's program
@@ -169,7 +171,7 @@ fn batch_nth(u: usize, layers: usize, k: usize) -> Option<Item> {
     items.into_iter().flatten().nth(j)
 }
 
-/// Why a walk did not start.
+/// Why a walk did not start, or a pass of resident slots has no point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
     /// The overlap names one port kind and the port is another.
@@ -178,6 +180,8 @@ pub enum Refused {
     Empty { units: usize, cols: usize },
     /// A serve reached a port whose legs the host serves on its own.
     Serve(At),
+    /// A pass of resident slots with no slot in it ([`slot_lanes`]).
+    NoSlots,
 }
 
 impl fmt::Display for Refused {
@@ -200,6 +204,7 @@ impl fmt::Display for Refused {
                 "a serve of unit {} layer {} on a port whose host serves its legs on its own",
                 at.unit, at.layer
             ),
+            Refused::NoSlots => write!(f, "a pass of 0 resident slots: no lane to lay out"),
         }
     }
 }
@@ -305,6 +310,38 @@ pub fn walk<P: LayerProgram>(
         }
     }
     Ok(())
+}
+
+/// The point a pass of resident slots takes ([`slot_lanes`]): its overlap,
+/// and the busy slots lane 0 takes, the first `lane0` in slot order; lane 1
+/// takes the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lanes {
+    pub overlap: Overlap,
+    pub lane0: usize,
+}
+
+/// The point a pass of `slots` resident slots takes on a step port: the
+/// step for one slot; else two lanes one layer apart (the host serves one
+/// lane's layer while the card runs the other's), lane 0 the first
+/// ⌈slots/2⌉ slots, lane 1 the rest. Refused by name at 0.
+///
+/// The overlap's `cols` is lane 0's width: for an odd count lane 1 holds one
+/// slot fewer. From three slots on the point is two lanes of two columns or
+/// more: a step port that serves one column a row refuses it.
+pub fn slot_lanes(slots: usize) -> Result<Lanes, Refused> {
+    if slots == 0 {
+        return Err(Refused::NoSlots);
+    }
+    let lane0 = slots.div_ceil(2);
+    Ok(Lanes {
+        overlap: Overlap {
+            units: slots.min(2),
+            cols: lane0,
+            port: PortKind::Step,
+        },
+        lane0,
+    })
 }
 
 #[cfg(test)]
@@ -634,5 +671,46 @@ mod tests {
         );
         assert_eq!(port.0.opened, None);
         assert_eq!(port.serve(at(0, 1)), Err(Refused::Serve(at(0, 1))));
+    }
+
+    /// A pass of resident slots: one slot is the step and two the pair,
+    /// today's walks; more are two lanes, lane 0 the first ⌈n/2⌉ slots and
+    /// as wide, lane 1 the rest, one slot fewer for an odd count, never
+    /// none. No slot is refused by name.
+    #[test]
+    fn slot_lanes_split_the_busy_slots() {
+        assert_eq!(slot_lanes(0), Err(Refused::NoSlots));
+        assert!(
+            Refused::NoSlots.to_string().contains("0 resident slots"),
+            "{}",
+            Refused::NoSlots
+        );
+        assert_eq!(slot_lanes(1).map(|l| l.overlap), Ok(step(1)));
+        assert_eq!(slot_lanes(2).map(|l| l.overlap), Ok(step(2)));
+        for (n, units, cols, lane0) in [
+            (1, 1, 1, 1),
+            (2, 2, 1, 1),
+            (3, 2, 2, 2),
+            (4, 2, 2, 2),
+            (8, 2, 4, 4),
+        ] {
+            let want = Lanes {
+                overlap: Overlap {
+                    units,
+                    cols,
+                    port: PortKind::Step,
+                },
+                lane0,
+            };
+            assert_eq!(slot_lanes(n), Ok(want), "{n} slots");
+        }
+        for n in 2..=17 {
+            let l = slot_lanes(n).expect("a pass of slots");
+            let lane1 = n - l.lane0;
+            assert_eq!(l.overlap.units, 2, "{n} slots");
+            assert_eq!(l.overlap.cols, l.lane0, "{n} slots");
+            assert!((1..=l.lane0).contains(&lane1), "{n} slots: lane 1 {lane1}");
+            assert_eq!(l.lane0 - lane1, n % 2, "{n} slots");
+        }
     }
 }

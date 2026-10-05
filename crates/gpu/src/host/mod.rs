@@ -395,6 +395,9 @@ pub enum PassKind {
     Step,
     /// A verify pass of two rows, its accepted rows kept.
     Pair,
+    /// A pass of resident slots' rows: every row kept, rows of different
+    /// sequences.
+    Slots,
     /// A prompt call, one pass whose rows are not counted: 0 kept.
     Prompt,
     /// A pass its caller never kept (a failed pass, a verify a reset drops
@@ -413,6 +416,7 @@ impl PassKind {
             PassKind::None => "none",
             PassKind::Step => "step",
             PassKind::Pair => "pair",
+            PassKind::Slots => "slots",
             PassKind::Prompt => "prompt",
             PassKind::Abandoned => "abandoned",
             PassKind::Driver => "driver",

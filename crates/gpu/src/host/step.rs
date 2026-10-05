@@ -128,11 +128,11 @@ pub(crate) struct RowPage {
 /// combine reads.
 ///
 /// A boundary of several rows lets that many tokens' handoffs be in flight
-/// at once, served in go order: each row has its own layer word, image and
-/// sum in the page; the region, the generation, the counter and the
-/// sequence are shared — the region's readers of one row finish on the
-/// stream before the next row's norm writes it, and the other three count
-/// every go and service in one order.
+/// at once, served in go order: each row has its own counter, layer word,
+/// image and sum in the page; the region, the generation and the sequence
+/// are shared — the region's readers of one row finish on the stream before
+/// the next row's norm writes it, and the other two count every row's goes
+/// in one order, the order the host serves them in.
 pub struct Boundary {
     /// Windows into `region` — what the norm and the router write in place
     /// of the MoE arena's own buffers on a hybrid layer.

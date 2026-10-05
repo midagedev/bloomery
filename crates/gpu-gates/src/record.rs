@@ -1116,9 +1116,9 @@ pub static STAT_PROMPT_SPLIT: Kind = Kind {
 pub static RESIDENCY_PASS: Kind = Kind {
     name: "residency_pass",
     head: "residency pass",
-    doc: "A residency boundary: what the pass before it was (none, step, pair, prompt — a \
-          prompt call's rows are not counted — abandoned, or driver: the machine's own test \
-          driver), its passes since the load or the last reset, the rows the pass before it kept, the flips that went live there (late: their copies had not completed and \
+    doc: "A residency boundary: what the pass before it was (none, step, pair, slots — a pass \
+          of resident slots' rows, all kept — prompt — a prompt call's rows are not counted — \
+          abandoned, or driver: the machine's own test driver), its passes since the load or the last reset, the rows the pass before it kept, the flips that went live there (late: their copies had not completed and \
           the engine stream waited), the flips the rule made, the flips in flight after it, and \
           the bytes its flips copy; the host's microseconds folding the pass into the rule and in \
           the whole boundary call, of \
