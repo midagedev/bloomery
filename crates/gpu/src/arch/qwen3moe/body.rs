@@ -23,7 +23,7 @@ use crate::head::Head;
 use crate::host::StepLeg;
 use crate::linear::LinearKernels;
 use crate::model::{
-    ChainBody, GpuModel, Instrumented, Rollback, SlotRange, SlotRows, Slots, block_count,
+    ChainBody, GpuModel, Instrumented, Rollback, RowHeads, SlotRange, SlotRows, Slots, block_count,
 };
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
@@ -795,6 +795,10 @@ impl SlotRows for Body {
     /// The pass runs on the prompt arena and its input record holds this
     /// many rows ([`SlotIn`]).
     const MAX_ROWS: usize = crate::model::MAX_PASS_ROWS;
+
+    /// One head of every row: the pass's rows read the lm_head once
+    /// ([`RowHeads::One`]).
+    const HEADS: RowHeads = RowHeads::One;
 
     /// Never read: a whole-card load serves no host work, and a placed load
     /// refuses the pass in [`SlotRows::plan_slots`].
