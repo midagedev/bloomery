@@ -15,6 +15,7 @@ pub mod engine;
 mod genloop;
 pub mod glmxml;
 mod http;
+pub mod media;
 pub mod mock;
 mod models;
 mod promptcache;

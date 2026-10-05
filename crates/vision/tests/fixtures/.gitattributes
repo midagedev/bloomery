@@ -1,0 +1,5 @@
+# The JPEG fixtures are bytes: raw RGB and YCbCr buffers and JPEG files, never text (no end-of-line
+# conversion, no text diff, skipped by text greps). MANIFEST.tsv is text.
+jpeg/*.rgb binary
+jpeg/*.ycc binary
+jpeg/*.jpg binary

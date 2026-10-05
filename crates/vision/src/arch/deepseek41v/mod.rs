@@ -4,6 +4,7 @@
 //! with an erf GELU between), plus the three learned span delimiters.
 
 pub mod hparams;
+pub mod media;
 pub mod names;
 pub mod tensors;
 

@@ -18,8 +18,12 @@ workspace = true
 
 [dependencies]
 # The HTTP layer is std::net on purpose: one slot, one engine mutex, and SSE needs a flush per
-# event. JSON is the only third-party need.
+# event. JSON is its only third-party need.
 bloomery-gguf = { path = "../gguf" }
+# The media part: the image decoders and a model's MediaModel (data plus one prepare) are the vision
+# crate's; an image's cache key is the sha256 of its file bytes.
+bloomery-vision = { path = "../vision" }
+sha2.workspace = true
 # `preserve_order`: an object keeps the key order it was parsed or built in, as a Python dict
 # does, so a chat template's `tojson` and `.items()` see a request's objects as jinja2 does.
 serde_json = { version = "=1.0.151", features = ["preserve_order"] }
