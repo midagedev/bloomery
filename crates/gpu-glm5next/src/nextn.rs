@@ -240,6 +240,18 @@ pub struct NextnSeq {
     pair0: DeviceBuffer<f32>,
 }
 
+impl NextnSeq {
+    /// A cut of the sequence's target to `pos` ([`Nextn::cut`]'s rule on a
+    /// parked sequence): the store holds no position past it.
+    #[expect(
+        dead_code,
+        reason = "a parked slot's commit cuts its draft with it; the wiring is the drafted pass's"
+    )]
+    pub(super) fn cut(&mut self, pos: u32) {
+        self.held = self.held.min(pos as usize);
+    }
+}
+
 /// The NextN layer resident on the target's card. See the module doc.
 pub struct Nextn {
     /// The layer's `blk.` index in the file.

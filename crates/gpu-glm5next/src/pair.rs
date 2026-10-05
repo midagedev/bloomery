@@ -35,6 +35,18 @@
 //! slot's sequence: the stores standing at its position, its waiting cut
 //! carried out from its own checkpoints, its held position and step row
 //! moved.
+//!
+//! The drafted pass of a NextN load — each slot's two verify rows in flight
+//! at once, over the busy slots — is not built yet: the pass is refused by
+//! name ([`Body::refuse_slots`]) and what it needs stands named and
+//! refusing, the per-slot planning ([`Body::plan_slot_rows`]) and the
+//! pass's commit (`keep_slot`) here, the draft side's cut
+//! (`NextnSeq::cut`) beside the layer. The pieces it will not change are in
+//! place: [`LOAD_ROWS`] counts the load's rows in flight, and the walk binds
+//! each row to its slot's sequence through [`RowBind`] in [`Parts`], which
+//! exchanges the sequences only at a slot's range boundary and numbers a
+//! row by its offset in its slot's rows — the plain pass's binding already
+//! that rule, at a row a slot.
 
 use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::head::Head;
@@ -51,15 +63,22 @@ use model::arch::glm5next::place::KdaLanes;
 
 use super::nextn::{Held, Wrote};
 use super::{
-    Body, GlmSlot, LANES, Parts, Plant, RowScratch, Scratch, SeqParts, StepInput, Store, cut_into,
-    held_at, shape,
+    Body, GlmSlot, LANES, Parts, Plant, RowBind, RowScratch, Scratch, SeqParts, StepInput, Store,
+    cut_into, held_at, shape,
 };
 use crate::program;
 
-/// The rows one pass runs one layer apart, the load's rows in flight, whose
-/// buffers every load holds whatever its KDA lanes: a verify's two (a row a
-/// lane of the one sequence) or a pass of two slots' (a row a slot).
-pub const PAIR_ROWS: usize = 2;
+/// The rows one load holds in flight, whatever its KDA lanes: every
+/// load-sized term counts them — the pass's row buffers ([`Scratch`]), the
+/// card experts' rows, the host boundary's, the expert tier's. A verify's
+/// two (a row a lane of the one sequence) and a pass of two slots' two (a
+/// row a slot) today; the drafted pass of a NextN load, each slot's rows
+/// its verify's, is not built yet and widens them when it is.
+pub const LOAD_ROWS: usize = 2;
+
+/// The load's rows in flight, as [`LOAD_ROWS`] names them; the verify's own
+/// two rows are [`LANES`], a row a lane.
+pub const PAIR_ROWS: usize = LOAD_ROWS;
 
 // A verify keeps the state after each of its rows in a lane of its own.
 const _: () = assert!(PAIR_ROWS == LANES && LANES >= 1 && LANES <= u32::MAX as usize);
@@ -307,7 +326,9 @@ impl Body {
 }
 
 impl Rows for Body {
-    const MAX_ROWS: usize = PAIR_ROWS;
+    /// A verify of one sequence's positions: a row a lane ([`LANES`]), the
+    /// drafted token's and the step's.
+    const MAX_ROWS: usize = LANES;
     const CHAIN: Chain = Chain::Pair;
 
     /// [`Body::plan_pair`].
@@ -618,6 +639,33 @@ impl Body {
         Ok(())
     }
 
+    /// One slot's rows of a drafted pass planned from its own sequence
+    /// (`None` the live one's), the per-slot entry the drafted
+    /// [`SlotRows::plan_slots`] fills each busy slot from: its waiting cut
+    /// carried out once before its row 0 ([`cut_into`] on its sequence),
+    /// its rows' inputs written — `pos0` and the positions after it, each
+    /// inside its stores — its `held` moved past them, its lanes left
+    /// waiting for the pass's commit and its `wrote` naming its rows. Not
+    /// built yet: refused by name, nothing moved.
+    #[expect(
+        dead_code,
+        reason = "the drafted pass's planning entry; its wiring is that pass's"
+    )]
+    fn plan_slot_rows(
+        &mut self,
+        stream: &CudaStream,
+        seq: Option<&mut GlmSlot>,
+        r: &SlotRange,
+        ids: &[u32],
+    ) -> Result<(), GpuError> {
+        let _ = (stream, seq, r, ids);
+        Err(shape(
+            "a drafted pass of several slots — each slot's rows its verify's — is not built \
+             yet"
+            .to_string(),
+        ))
+    }
+
     /// The pass of `rows` walked with each row bound to its slot's lane word
     /// and stores ([`Parts`]), row `r` into `heads[r]`. The rows' buffers
     /// are bound ([`binding`]).
@@ -675,7 +723,7 @@ impl Body {
             row: 0,
             lane: first.lane,
             stores: first.stores,
-            other,
+            bind: RowBind::of_pass(rows, other),
             slots,
             card,
             taps: None,
@@ -685,9 +733,9 @@ impl Body {
 }
 
 impl SlotRows for Body {
-    /// Two rows in flight, a row a slot: the step port's pair until its
-    /// rows carry columns.
-    const MAX_ROWS: usize = PAIR_ROWS;
+    /// The load's rows in flight ([`LOAD_ROWS`]): the plain pass's two, a
+    /// row a slot.
+    const MAX_ROWS: usize = LOAD_ROWS;
 
     /// [`sched::slot_lanes`]' point over the busy slots: the step for one,
     /// the pair for two. A count the walk does not lay is refused by name
@@ -773,5 +821,28 @@ impl SlotRows for Body {
             self.planned = None;
         }
         self.planted(Plant::AfterLaunch)
+    }
+
+    /// A pass's rows kept whole, the plain pass's a slot a row: a count
+    /// short of its slot's rows is the drafted pass's commit — each kept
+    /// row's lane named on its own sequence, the slot's draft's `held` cut
+    /// with it — which is not built yet, and refused by name.
+    fn keep_slot(
+        &mut self,
+        gpu: &Gpu,
+        seq: Option<&mut GlmSlot>,
+        r: &SlotRange,
+        kept: usize,
+    ) -> Result<(), GpuError> {
+        let _ = (gpu, seq);
+        if kept == r.rows.len() {
+            return Ok(());
+        }
+        Err(shape(format!(
+            "slot {} keeping {kept} of its {} rows: a drafted pass of several slots — each \
+             slot's rows its verify's — is not built yet",
+            r.slot,
+            r.rows.len()
+        )))
     }
 }
