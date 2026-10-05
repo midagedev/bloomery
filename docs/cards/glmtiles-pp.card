@@ -37,11 +37,11 @@ sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios, the 
 margin: 2.0 % a no-regression guard, not derived: the change is a move whose kernel evidence (equal resource
   columns, equal loads a weight word, bit-identical gates) settles the kernel, and 2.0 % clears the two-binary
   ruler at 5 rounds (1.93 %); 1.5 % would take 7 rounds (h_p 1.44 %) at ~1.4x the box time
-condition: one runner invocation from this tree, both binaries in one lease: BLOOMERY_REMOTE='~/repo/bloomery-glmtiles'
+condition: one runner invocation from this tree, both binaries in one lease: BLOOMERY_REMOTE='~/repo/bloomery-train021'
   BLOOMERY_AB_ROUNDS=5 BLOOMERY_BOX_ENV='BLOOMERY_DECODE_N=3 BLOOMERY_LEASE_CARD=docs/cards/glmtiles-pp.card'
-  just depth-gpu-ds41 prose:512 prose:4096 bin:/root/repo/bloomery-glmtiles-base/target/release/generate_ds41:prose:512
-  bin:/root/repo/bloomery-glmtiles-base/target/release/generate_ds41:prose:4096 (the base tree's generate_ds41 built
-  with --features deepseek41 at d1763a48, the build its ptx-scan read); two load keys a round (this tree's binary,
+  just depth-gpu-ds41 prose:512 prose:4096 bin:/root/repo/bloomery-train021-base/target/release/generate_ds41:prose:512
+  bin:/root/repo/bloomery-train021-base/target/release/generate_ds41:prose:4096 (the base tree's generate_ds41 built
+  with --features deepseek41 at main 9943fbf2, the train's parent: the A/B reads the whole 0.2.1 train); two load keys a round (this tree's binary,
   the base's), each arm from Session::clear; both binaries' load records print the same placement and card experts;
   no row carries [cold], [cpu-busy] or [other-busy]. Box time 14..20 min [derived: 10 loads and one warm-up at
   60..90 s (74.6 s measured on plan (a), rig-log 09-26, carried from callstream-pp-a.card), 5 rounds of 4 prompts at ~26 s a round, the build]
