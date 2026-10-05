@@ -1,0 +1,60 @@
+# Round glm2card's prompt card, the companion of docs/cards/glmbp-ab.card and read from the same sitting: GLM-5.3-
+# Flash's prompt of 512 prose ids at the serving defaults (the NextN MTP draft, residency mid-p0-s1), plan (a) on the
+# A6000 against plan (b′) (--place bp, the 3090 an expert tier under the host tier), one binary, ctx 2048.
+# Decomposition [derived] per routed layer-batch. 512 ids are one batch, a group of one (glm5next/place.rs groups),
+# so the wall is the sum over the layers of the card front + max(host union + exchange, card shadow, tier service)
+# + the join (round glmpp3's G1 table; BatchLeg::serve then join_tiered, crates/gpu/src/host/leg.rs:371, :324):
+# - plan (a), the residency at its seed (the prompt's pass is kept 0): 3,184 host slots and 193 host experts touched
+#   a card-routable layer (the ik router set glm5next-prose, the first 512 ids of its 24 contexts; ids [0, n_l - 1)
+#   on the A6000). The union by the lane law round glmpp3 measured (3090, place gate, P 768, runtime values):
+#   10.74 us a slot + 72.2 us an expert = 48.1 ms. The card shadow ~13.7 ms after glmnext (glmnext-cardtile.card),
+#   the front 5.8 ms (KDA) and ~18.5 (latent): the union is the bound on every routed layer.
+# - bp: the tier takes 564.8 slots (544..596 over the contexts) and 33.3 touched experts a layer: -6.1 ms of slot
+#   term and -2.4 of expert term, -8.5 ms (8.3..8.6 over the contexts; 7.7..9.4 with the law's own +-10 %) on 39
+#   layers; the Q6_K layers 11, 12, 44, the dense layers and the NextN layer have no tier.
+# - the tier's service a layer-batch on the 3090: x in, 8.4 MB f32 (0.32 ms at 26.28 GB/s, docs/facts.md:66); 64
+#   chunks of 8 tokens x 4 launches (gpu-glm5next/src/tier.rs:281) reading ~8.6 GB of tier experts (11..13.5 ms at
+#   650..800 GB/s); the Staged rows back (host/tier.rs:831: every slot's row, 67.1 MB, 2.6..3.4 ms): 14..17 ms,
+#   under the bp union's ~40 ms with 22..26 ms to spare.
+# - the tier's costs on the serial path: the serve thread enqueues its leg before its union (host/batch.rs:520
+#   BatchPort::serve, :970 enqueue_tier_leg: two copies, 1 + 64 x 4 launches, the rows' copy, the event: ~260
+#   calls at 2..5 us), 0.5..1.3 ms; the join's card sum reads the tier slots' rows through the mapping
+#   (ds41_ffn_card_acc_8_tier, ~9.25 MB), 0.4..0.8 ms: 0.9..2.1 ms a layer-batch, 35..82 ms a batch.
+# - host DRAM: the tier's DMA, 84.8 MB a layer-batch over the ~40 ms union, 2.1 GB/s (1.4 % of 147.7 GB/s); the
+#   union is compute-bound (glmpp3: its 2.54 GB at 135 GB/s is 18.8 ms under ~49 ms). PCIe: 3090 link 8.4 MB in,
+#   67.1 MB out; A6000 link +9.25 MB in. NVMe 0.
+# - a batch on (a): 2,610 ms (pp512 196.20 tok/s, the glmnext-cardtile sitting, plain arm, place a) + the NextN store
+#   walk over the prompt (64 walks of 8 rows, gpu-glm5next/src/nextn.rs WALK_ROWS, 0.2..0.4 ms each): 2,623..2,636
+#   ms, 194..195 tok/s.
+# bp: 2,623..2,636 - 39 x (7.7..9.4 - 0.9..2.1) = 2,291..2,418 ms, 212..224 tok/s. Effect +9.1..+14.4 % [derived],
+# written outward as +9..+14.5. The edge nearest 0 is the tier's serial cost at its top (2.1 ms a layer-batch) with
+# the law's slot cost at its bottom. V4.1's window-apart prior (rig-log 09-30#callstream-pp-bp against
+# #callstream-pp-a, off arms): pp512 +6.1 % with a tier of 9 % of its ids; GLM's tier holds 13.4 % of its ids.
+# Sitting: glmbp-ab.card's (one invocation, both cards' terms; the lease checks that card), this card checked first:
+#   PYTHONDONTWRITEBYTECODE=1 python3 tools/ref/card.py check docs/cards/glmbp-pp.card --rounds 4
+# then read from the same log's `ratio place pp p=512` line. No box minutes of its own.
+kind: ab
+question: on the serving defaults, does plan (b′) prefill a 512-id prose prompt faster than plan (a) by the host
+  union the tier takes, less the tier's serial costs?
+term: pp tok/s @ P = 512 (each oursmtp row's prefill record: 512 prose ids from GLM_PROSE_FROM, one batch,
+  kind=batch passes=1), A6000+3090 (the 3090 idle under a), ctx 2048, BLOOMERY_DRAFT=mtp
+  BLOOMERY_RESIDENCY=mid-p0-s1, --place bp against --place a, same binary, paired by round: the runner's
+  `ratio place pp p=512` (bp / a), less 1
+unit: %
+predict: +9..+14.5
+rounds: 4
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, per-round pp ratios (carried from docs/cards/glmtiles-pp.card), taken
+  over the 0.6 % decode ruler for a 2.6 s prompt window
+condition: glmbp-ab.card's sitting and every condition of it (one invocation, one lease, the same rows); each row's
+  pp_tok/s reads n=512, passes=1, kind=batch; this card passes card.py check at --rounds 4 before the sitting
+decide-in: the tier's union term holds: write the pp512 rows beside decode in the A6000+3090 table; this card moves
+  no default by itself: the seat's --place goes to bp only when glmbp-ab.card's reading of the same log and this
+  one both have their lower bounds above 0
+decide-below: below +9 the tier's serial costs run above 2.1 ms a layer-batch or its service leaves the union's
+  shadow: with the lower bound above 0 the default follows glmbp-ab.card; at or below 0 keep --place a whatever
+  decode reads; either way one functional bp prompt under BLOOMERY_STEP_STATS=1 on a plain arm (refused beside the
+  draft, generate_glm5next.rs:403): `stat prompt lb`'s serve_ms less union_ms and wait_ms, and card_back_ms, before
+  the Packed-rows or tile-path tier lever
+decide-above: above +14.5 the default follows glmbp-ab.card; the bp union lost more than the lane law prices (fewer
+  experts touched on the held-out prompt, or a DRAM share the law does not see): re-derive the expert term from the
+  same stats window before the next prompt lever
