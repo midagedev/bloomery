@@ -50,9 +50,24 @@
 //!
 //! `--parallel N` (`-np N`, default [`SLOTS`]) serves N resident sequences
 //! inside the one model (`Session::add_slots` over the body's `Slots`): the
-//! server steps the busy slots together, a select and a step a slot each
-//! round, the sequences switched by pointer exchange, so each request's
-//! tokens are its solo run's; nothing parks and no slot waits for another.
+//! server steps the busy slots together, the sequences switched by pointer
+//! exchange; nothing parks and no slot waits for another. At a fixed
+//! placement — `BLOOMERY_RESIDENCY=off`, as `--place gate` always runs, or
+//! before any residency flip lands — each request's tokens are its solo
+//! run's; under adaptive residency every slot's passes move the placement,
+//! and the placement changes the bits. A load of more than one resident
+//! slot with no draft runs each round as one pass of the busy rows
+//! ([`V41::step_slots`] through `serve_seats::rounds::step_rows_one_pass` —
+//! two slots' rows one layer apart, the body's two-row slot pass); every
+//! other load keeps the fallback loop, a select and a step a row: one slot
+//! (a round of several never runs), the DSpark draft (which serves one
+//! slot), and the lookup draft (whose [`Seat::step`] feeds its tables, and
+//! whose drafted rounds are [`Seat::pass_slots`] rounds). Under
+//! `BLOOMERY_STEP_STATS=1` each round of several slots prints a
+//! `slots round` record naming its command, rows, passes and the slots the
+//! seat serves, and the step rows keep their engram fill statistics (clock
+//! reads, page-classifying syscalls) — a server run under it is never a
+//! timing reading.
 //! `--parallel 1` is exactly the one-sequence server, and `--parallel 0` is
 //! refused by name. Every slot holds a whole context: each serves the full
 //! `--ctx` positions, refused by name before the load below the pair pass's
@@ -145,7 +160,8 @@ use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqS
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
+    Seat, SeatEngine, SlotStep, Vocab, model_props, nvidia_smi_index, placement_props,
+    sampler_factory, step_rows_in_turn,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -421,6 +437,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         reserve,
         tier_batch,
         trace,
+        stats: levers.step_stats(),
     };
     let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache_ram)?;
     let config = ServerConfig {
@@ -601,6 +618,8 @@ struct SeatArgs {
     tier_batch: Option<TierBatchBytes>,
     /// The route trace, attached once the session is ready.
     trace: Option<RouteTrace>,
+    /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
+    stats: bool,
 }
 
 /// The draft the seat serves, verified by the pair pass.
@@ -619,6 +638,15 @@ struct V41 {
     /// The positions served (`--ctx`).
     ctx: usize,
     draft: Served,
+    /// Whether a round of several slots runs as one pass of the busy rows
+    /// ([`V41::step_slots`]): a load of more than one resident slot with no
+    /// draft. Every other load keeps the fallback loop: one slot (a round of
+    /// several never runs), the DSpark draft (which serves one slot), and
+    /// the lookup draft (whose [`Seat::step`] feeds its tables, and whose
+    /// drafted rounds are [`Seat::pass_slots`] rounds).
+    one_pass: bool,
+    /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
+    stats: bool,
 }
 
 /// A body's saved sequence state, as the server's prompt cache holds it,
@@ -722,6 +750,8 @@ impl V41 {
             s,
             ctx: a.ctx,
             draft,
+            one_pass: a.slots.get() > 1 && a.draft == Draft::Off,
+            stats: a.stats,
         })
     }
 
@@ -879,6 +909,33 @@ impl Seat for V41 {
     /// the passes it would run alone. The DSpark draft serves one slot.
     fn slot_drafts(&self) -> bool {
         matches!(self.draft, Served::Lookup(..))
+    }
+
+    /// The lever the binary parsed ([`V41::stats`]).
+    fn step_stats(&self) -> bool {
+        self.stats
+    }
+
+    /// One round of several slots: one pass of the busy rows while the open
+    /// decided so ([`V41::one_pass`], through
+    /// `serve_seats::rounds::step_rows_one_pass` — cut at the body's two
+    /// rows, the rows' answers and lent logits rows from the pass's own
+    /// per-row heads, slot 0 left selected as [`Session::step_slots_rounds`]
+    /// decides), else the seat's fallback — a select and a step a row —
+    /// every round of a load the open kept on it ([`V41::one_pass`]'s doc).
+    /// A refusal on either path is the server's to die on: the open decides
+    /// once, so a load that cannot run one pass never tries it at run time.
+    fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
+        if !self.one_pass {
+            return step_rows_in_turn(self, rows);
+        }
+        let passes =
+            super::rounds::step_rows_one_pass(&mut self.s, rows).map_err(|e| e.to_string())?;
+        self.print_passes().map_err(|e| e.to_string())?;
+        if self.stats {
+            record::slots_round("step", rows.len(), passes, self.slots()).eprint();
+        }
+        Ok(())
     }
 
     fn reset(&mut self) -> Result<(), GateError> {

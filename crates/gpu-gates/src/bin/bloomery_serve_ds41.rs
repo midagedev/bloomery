@@ -29,6 +29,27 @@ fn main() -> std::process::ExitCode {
 #[path = "shared/serve_seats/ds41.rs"]
 mod ds41;
 
+// The seats' one owner of a round run as passes, the seat naming it beside
+// itself (`super::rounds`) as it does under `serve_seats` in the one-binary
+// server.
+#[cfg(feature = "deepseek41")]
+#[path = "shared/serve_seats/rounds.rs"]
+#[allow(
+    dead_code,
+    reason = "the seat steps its rows plain; the drafted half serves the drafted seats"
+)]
+mod rounds;
+
+// The per-slot draft table `rounds` names for its drafted half
+// (`super::drafted`).
+#[cfg(feature = "deepseek41")]
+#[path = "shared/serve_seats/drafted.rs"]
+#[allow(
+    dead_code,
+    reason = "only rounds' drafted half names it, which this seat does not run"
+)]
+mod drafted;
+
 // The shared files the seat names at the crate root (`crate::dspark` and
 // kin), as `generate_ds41` includes them.
 #[cfg(feature = "deepseek41")]

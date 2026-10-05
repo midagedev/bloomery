@@ -2549,7 +2549,8 @@ pub static BLOOMERY_CHAT: &[&Kind] = &[
     &CHAT,
 ];
 
-/// What `bloomery-serve-ds41` prints, all on stderr.
+/// What `bloomery-serve-ds41` prints, all on stderr, and the rounds of
+/// several slots a `BLOOMERY_STEP_STATS` run counts.
 pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &PLAN,
     &CACHE_CONFIG,
@@ -2574,6 +2575,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = &[
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
+    &SLOTS_ROUND,
 ];
 
 /// What `bloomery-serve-qwen38` prints, all on stderr.
