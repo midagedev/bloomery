@@ -2,12 +2,14 @@
 //! driven over HTTP, as one process under the GPU gate lock.
 //!
 //!     gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>
-//!                     [--plain <the plain run's --dir> | --place bp | --slots]
+//!                     [--plain <the plain run's --dir> | --place bp | --slots | --need-path]
 //!
 //! Starts the server beside this binary (`--port 0 --place gate --parallel
 //! 1`, the plain engine this gate's body holds), reads its
 //! address from its stderr, waits for `/health`, then checks:
 //!
+//! - (p4) a slot save on this server, started without `--slot-save-path`, is
+//!   the server's 501 naming the flag, and `/health` answers after it;
 //! - `/props`' `engine` object, printed once, against this gate's own plan of
 //!   the file the server opens (placement gate, the server's default
 //!   context): the server's name, argv and pid; the model's architecture,
@@ -97,15 +99,36 @@
 //!   slots each (`/metrics`' `n_busy_slots_per_decode` and `n_decode_total`,
 //!   before and after) with no swap counted — the slots flow together, not
 //!   in turns;
-//! - (s3) a slot's save to a file is refused by name (501, the engine does
-//!   not support slot save/restore): the body's state goes to the prompt
-//!   cache in host RAM, not to a file;
 //! - (s2) `--ids` and a prompt sharing nothing with it, each on its own
 //!   slot (`cache_prompt`); the second's slot erased; then `--ids` plus its
 //!   greedy ids takes the first's slot and keeps all but its last id, and
-//!   its ids are those of `cache_prompt: false`.
+//!   its ids are those of `cache_prompt: false`;
+//! - (p3) a slot file, on a prompt sent as ids with no BOS whose first id
+//!   starts no earlier request (so no slot and no cached state shares a
+//!   prefix with it): the prompt on a slot (`cache_prompt`), the slot saved
+//!   to a file, erased and restored from it; then the prompt plus its
+//!   greedy ids keeps all but its last id on that slot, with the ids of
+//!   `cache_prompt: false`;
+//! - (p2) park and resume through the prompt cache: both slots erased (slot
+//!   0 first, so it is the least recently used), then three conversations
+//!   that share no prefix. A and B are each answered on a slot of its own;
+//!   C takes the least recently used, A's, and a `cache save` record names
+//!   A's positions. B's continuation keeps its slot (no `cache load`); then
+//!   A's takes the least recently used slot, C's, and a `cache load` record
+//!   of A's positions keeps all of them: the continuation keeps all but its
+//!   last id. Each continuation's ids are those of `cache_prompt: false`. B
+//!   runs first: A's continuation first would take B's slot, the least
+//!   recently used, and park B's state instead.
 //!
-//! That server is killed and waited for the same way. Last, the same
+//! That server is killed and waited for the same way. A second server of
+//! the same arguments and directory (`<dir>/slots-files`) restores the (p3)
+//! file into the other slot, and the continuation keeps all but its last id
+//! with the first server's ids of `cache_prompt: false`: the round trip
+//! across two processes. A third, of half the default context
+//! (`<dir>/slots-files-ctx`), refuses the file by name (p4): a 400
+//! (`invalid_request_error`) naming both contexts; it then answers `/health`
+//! and a request. Each starts after the one before it is gone: one load on
+//! the gate card at a time. Last, the same
 //! `--parallel 2` under `BLOOMERY_DRAFT=dspark` (set on that process alone)
 //! ends before it listens, naming both: the draft's window is one
 //! sequence's. Logs and the raw stream go to `--dir`, the first
@@ -115,8 +138,12 @@
 //! and the first sampled request's ids to `sampled.ids`.
 //!
 //! With `--slots` (no draft), the gate runs the slots clauses above alone —
-//! too many slots refused, the two-slot server, the DSpark refusal — and nothing
-//! else: a run of the slots path that loads the model once.
+//! too many slots refused, the two-slot server and the slot-file servers
+//! after it, the DSpark refusal — and nothing else.
+//!
+//! With `--need-path` (no draft), the gate starts the first server above and
+//! checks (p4)'s save without `--slot-save-path` on it, nothing else: a run
+//! of that clause that loads the model once.
 //!
 //! With `--plain`, under `BLOOMERY_DRAFT=dspark` (refused otherwise), the gate
 //! checks the server's DSpark draft instead, and nothing above:
@@ -215,7 +242,7 @@ mod gate {
 
     use crate::dspark;
 
-    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir> | --place bp | --slots]";
+    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir> | --place bp | --slots | --need-path]";
     /// Where the first `/completion`'s ids go in `--dir`, for the draft run.
     const COMPLETION_IDS: &str = "completion.ids";
     /// Where the probe's ids go in `--dir`, for the draft run.
@@ -280,6 +307,19 @@ mod gate {
     /// skew, so the rounds carry `2·P / (P + skew)` slots each, about 1.9 at
     /// [`SLOTS_PREDICT`]; turns or one slot a round carry 1.
     const SLOTS_BUSY: f64 = 1.5;
+    /// (p3, p4) The slot file the slot-file clauses save and restore.
+    const SLOT_FILE: &str = "slot.bin";
+    /// (p3) The slot file's prompt, sent as ids with no BOS: its first word
+    /// starts no earlier request ([`fresh_ids`]).
+    const FILES_TEXT: &str =
+        "Slot files keep a conversation across server processes. Name two reasons to save one.";
+    /// (p2) The park/resume clause's three conversations, sent as ids with
+    /// no BOS: each first word starts no other request ([`fresh_ids`]).
+    const PARK_TEXTS: [&str; 3] = [
+        "Alpha asks: name three rivers of Europe, one line each.",
+        "Bravo asks: name three mountains of Asia, one line each.",
+        "Charlie asks: name three deserts of Africa, one line each.",
+    ];
     /// The load takes tens of seconds; the bound is the spec's 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
@@ -431,15 +471,22 @@ mod gate {
         bp: bool,
         /// `--slots`: the slots clauses alone.
         slots: bool,
+        /// `--need-path`: the main server's slot save without
+        /// `--slot-save-path` alone.
+        need_path: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut gen_log, mut prompt, mut ids, mut dir) = (None, None, None, None);
-        let (mut plain, mut bp, mut slots) = (None, false, false);
+        let (mut plain, mut bp, mut slots, mut need_path) = (None, false, false, false);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             if flag == "--slots" {
                 slots = true;
+                continue;
+            }
+            if flag == "--need-path" {
+                need_path = true;
                 continue;
             }
             let v = it
@@ -472,6 +519,9 @@ mod gate {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
+        if slots && need_path {
+            return Err(format!("--slots and --need-path each run one part alone: {USAGE}").into());
+        }
         match (gen_log, prompt, ids, dir) {
             (Some(gen_log), Some(prompt), Some(ids), Some(dir)) => Ok(Args {
                 gen_log,
@@ -481,6 +531,7 @@ mod gate {
                 plain,
                 bp,
                 slots,
+                need_path,
             }),
             _ => Err(USAGE.into()),
         }
@@ -1114,9 +1165,11 @@ mod gate {
 
     /// The slots clause (module header) on a server of two resident slots
     /// started into `<dir>/slots`, after too many refused: the context a
-    /// slot it names, (s5) the pair served together, (s3) a slot save
-    /// refused by name, (s2) an erase of one slot leaving the other's
-    /// continuation.
+    /// slot it names, (s5) the pair served together, (s2) an erase of one
+    /// slot leaving the other's continuation, (p3) a slot file's round trip
+    /// and (p2) park and resume through the prompt cache; then (p3) the
+    /// file in a second process and (p4) refused by a third of another
+    /// context.
     fn slots(a: &Args) -> Result<bool, GateError> {
         let mut ok = over_refused(a)?;
         let dir = a.dir.join("slots");
@@ -1136,8 +1189,346 @@ mod gate {
         ok &= slots_ctx(&url, &err_log)?;
         ok &= slots_together(&url, a)?;
         ok &= slots_actions(&url, a)?;
+        let mut taken = taken_firsts(&url, a)?;
+        let file = slots_files_save(&url, &mut taken)?;
+        ok &= slots_park_resume(&url, &err_log, &mut taken)?;
         println!("slots server stopped: {}", served.stop()?);
+        // One V4.1 load on the gate card at a time: the processes below start
+        // after the slots server is gone.
+        ok &= slots_files_round_trip(a, &save, &file)?;
+        ok &= slots_files_refused(a, &save)?;
         Ok(ok)
+    }
+
+    /// The first ids of every request the slots server ran before the
+    /// slot-file and park/resume clauses: the BOS a text prompt starts with,
+    /// and the first ids of `--ids` and of `--ids` reversed.
+    fn taken_firsts(url: &dyn Fn(&str) -> String, a: &Args) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(
+            &url("/tokenize"),
+            Some(&json!({"content": "", "add_special": true})),
+            false,
+        )?;
+        let mut taken = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        taken.extend(a.ids.first().into_iter().chain(a.ids.last()));
+        Ok(taken)
+    }
+
+    /// `text`'s ids through the server's tokenizer, no BOS, its first id
+    /// then added to `taken`. A prompt whose first id starts no earlier
+    /// request shares no prefix with any slot or cached state, so it runs
+    /// from nothing and nothing but its own state can serve it again;
+    /// refused by name when its first id is among `taken`.
+    fn fresh_ids(
+        url: &dyn Fn(&str) -> String,
+        text: &str,
+        taken: &mut Vec<u32>,
+    ) -> Result<Vec<u32>, GateError> {
+        let (st, body) = curl(&url("/tokenize"), Some(&json!({"content": text})), false)?;
+        let ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        match ids.first() {
+            Some(&first) if !taken.contains(&first) => {
+                taken.push(first);
+                Ok(ids)
+            }
+            first => Err(format!(
+                "the prompt {text:?} starts with id {first:?}, which an earlier request of the \
+                 slots server started with (taken {taken:?}): it would share a prefix"
+            )
+            .into()),
+        }
+    }
+
+    /// (p3) The slots server's half of the slot-file round trip, and what it
+    /// leaves for the second process.
+    struct SlotFile {
+        /// The slot the file was saved from.
+        slot: u64,
+        /// The prompt plus its greedy ids.
+        cont: Vec<u32>,
+        /// The continuation's ids with `cache_prompt: false`.
+        fresh: Vec<u32>,
+        /// The positions the file holds.
+        saved: u64,
+        /// Whether this half held.
+        held: bool,
+    }
+
+    /// A slot action's answer, printed: its status and its JSON (`Null`
+    /// when the body is not JSON).
+    fn slot_action(
+        url: &dyn Fn(&str) -> String,
+        slot: u64,
+        action: &str,
+        body: &Value,
+    ) -> Result<(u16, Value), GateError> {
+        let (st, text) = curl(
+            &url(&format!("/slots/{slot}?action={action}")),
+            Some(body),
+            false,
+        )?;
+        println!("slots {action} of slot {slot}: HTTP {st}: {text}");
+        Ok((st, serde_json::from_str(&text).unwrap_or(Value::Null)))
+    }
+
+    // PIN(2026-10-05): slots_save_refused_by_name (a save answered 501) is replaced by the
+    // slot-file round trip: the seat now serves save and restore (triage slotsnap, in the user's
+    // 0.2.1 scope), so the contract changed from refused to served.
+    /// (p3) The slots server's half (module header): the prompt on a slot,
+    /// its file saved, the slot erased, the file restored, then the prompt
+    /// plus its greedy ids kept but its last id, with the ids of
+    /// `cache_prompt: false`.
+    fn slots_files_save(
+        url: &dyn Fn(&str) -> String,
+        taken: &mut Vec<u32>,
+    ) -> Result<SlotFile, GateError> {
+        let p = fresh_ids(url, FILES_TEXT, taken)?;
+        let (slot, g, c0) = on_slot(url, &p, true)?;
+        if c0 != json!(0) {
+            return Err(
+                format!("the slot-file prompt kept {c0} positions: it is not fresh").into(),
+            );
+        }
+        let file = json!({"filename": SLOT_FILE});
+        let (st_save, saved) = slot_action(url, slot, "save", &file)?;
+        let (st_erase, _) = slot_action(url, slot, "erase", &json!({}))?;
+        let (st_restore, restored) = slot_action(url, slot, "restore", &file)?;
+        let cont: Vec<u32> = p.iter().chain(&g).copied().collect();
+        let (sc, gc, cc) = on_slot(url, &cont, true)?;
+        let (_, gf, cf) = on_slot(url, &cont, false)?;
+        let positions = (p.len() + REUSE_PREDICT - 1) as u64;
+        println!(
+            "slot file: {} positions saved from slot {slot} in {} bytes, {} restored from {} bytes; \
+             the continuation on slot {sc}: cache_n={cc}",
+            saved["n_saved"], saved["n_written"], restored["n_restored"], restored["n_read"]
+        );
+        let held = g.len() == REUSE_PREDICT
+            && st_save == 200
+            && saved["n_saved"] == json!(positions)
+            && st_erase == 200
+            && st_restore == 200
+            && restored["n_restored"] == json!(positions)
+            && restored["n_read"] == saved["n_written"]
+            && sc == slot
+            && cc == json!(cont.len() - 1)
+            && gc == gf
+            && cf == json!(0);
+        Ok(SlotFile {
+            slot,
+            cont,
+            fresh: gf,
+            saved: positions,
+            held,
+        })
+    }
+
+    /// (p3) The second process (module header), into `<dir>/slots-files`:
+    /// the file restored into the other slot, the continuation's ids and
+    /// cache those of the first; the clause's one verdict, both halves.
+    fn slots_files_round_trip(a: &Args, save: &str, file: &SlotFile) -> Result<bool, GateError> {
+        let dir = a.dir.join("slots-files");
+        std::fs::create_dir_all(&dir)?;
+        let mut args = SLOTS_SERVER_ARGS.to_vec();
+        args.extend(["--slot-save-path", save]);
+        let mut served = Served::spawn(&args, &dir)?;
+        println!("slot-file server pid {}", served.child.id());
+        let addr = served.address(&dir.join("server.err"), POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let into = u64::from(file.slot == 0);
+        let (st, restored) = slot_action(&url, into, "restore", &json!({"filename": SLOT_FILE}))?;
+        let (sc, gc, cc) = on_slot(&url, &file.cont, true)?;
+        println!("slot-file server stopped: {}", served.stop()?);
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slots_files_round_trip",
+            file.held
+                && st == 200
+                && restored["n_restored"] == json!(file.saved)
+                && sc == into
+                && cc == json!(file.cont.len() - 1)
+                && gc == file.fresh,
+        );
+        Ok(ok)
+    }
+
+    /// (p4) The third process (module header), into `<dir>/slots-files-ctx`:
+    /// the file refused by a server of another context, which serves on. Its
+    /// probes are answers, not errors: a server the refusal ended reads as a
+    /// failed check.
+    fn slots_files_refused(a: &Args, save: &str) -> Result<bool, GateError> {
+        let dir = a.dir.join("slots-files-ctx");
+        std::fs::create_dir_all(&dir)?;
+        let whole = served_positions()?;
+        let ctx = (whole / 2).to_string();
+        let mut args = SLOTS_SERVER_ARGS.to_vec();
+        args.extend(["--ctx", ctx.as_str(), "--slot-save-path", save]);
+        let mut served = Served::spawn(&args, &dir)?;
+        println!("other-context server pid {}", served.child.id());
+        let addr = served.address(&dir.join("server.err"), POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let (st, refused) = slot_action(&url, 0, "restore", &json!({"filename": SLOT_FILE}))?;
+        let e = &refused["error"];
+        let names = e["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&whole.to_string()) && m.contains(&ctx));
+        let probe = |path: &str, body: Option<&Value>| match curl(&url(path), body, false) {
+            Ok((st, text)) => (st, text),
+            Err(e) => (0, e.to_string()),
+        };
+        let (hst, health) = probe("/health", None);
+        let body = json!({
+            "prompt": a.ids, "n_predict": REUSE_PREDICT, "temperature": 0, "ignore_eos": true,
+            "return_tokens": true, "cache_prompt": false,
+        });
+        let (rst, answer) = probe("/completion", Some(&body));
+        let answered = rst == 200
+            && serde_json::from_str::<Value>(&answer)
+                .is_ok_and(|v| ids_of(&v["tokens"]).len() == REUSE_PREDICT);
+        println!(
+            "other context {ctx}: restore HTTP {st} {e}; health {hst} {health}; a request: HTTP \
+             {rst}"
+        );
+        println!("other-context server stopped: {}", served.stop()?);
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slots_files_refused",
+            st == 400
+                && e["type"] == "invalid_request_error"
+                && names
+                && hst == 200
+                && health.contains("\"ok\"")
+                && answered,
+        );
+        Ok(ok)
+    }
+
+    /// (p2) Park and resume through the prompt cache (module header), on
+    /// the slots server: the `cache save` and `cache load` records read
+    /// from its stderr, `err_log`. B's continuation runs before A's: resident
+    /// slots break a tie of shared prefixes by the least recently used
+    /// (`serve::sched`'s `best_slot`), so A's continuation first would take
+    /// B's slot and park B's state rather than keep it.
+    fn slots_park_resume(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        taken: &mut Vec<u32>,
+    ) -> Result<bool, GateError> {
+        let records = |kind: &record::Kind| -> Result<Vec<record::Fields>, GateError> {
+            Ok(server_log(err_log, record::BLOOMERY_SERVE_DS41)?.all(kind)?)
+        };
+        let ram = server_log(err_log, record::BLOOMERY_SERVE_DS41)?
+            .one(&record::CACHE_CONFIG)?
+            .u64("ram")?;
+        if ram == 0 {
+            return Err(
+                "the slots server's prompt cache is off (`cache ram=0`): the park/resume \
+                 clause needs it"
+                    .into(),
+            );
+        }
+        // Erased in order, slot 0 first: both empty, slot 0 the least
+        // recently used.
+        for slot in [0, 1] {
+            let (st, _) = slot_action(url, slot, "erase", &json!({}))?;
+            if st != 200 {
+                return Err(format!("the erase of slot {slot} answered HTTP {st}").into());
+            }
+        }
+        let [ta, tb, tc] = PARK_TEXTS;
+        let (pa, pb, pc) = (
+            fresh_ids(url, ta, taken)?,
+            fresh_ids(url, tb, taken)?,
+            fresh_ids(url, tc, taken)?,
+        );
+        let held = |p: &[u32]| p.len() + REUSE_PREDICT - 1;
+        let (sa, ga, _) = on_slot(url, &pa, true)?;
+        let (sb, gb, _) = on_slot(url, &pb, true)?;
+        let (saves, loads) = (
+            records(&record::CACHE_SAVE)?.len(),
+            records(&record::CACHE_LOAD)?.len(),
+        );
+        let (sc, _, _) = on_slot(url, &pc, true)?;
+        let parked = records(&record::CACHE_SAVE)?.split_off(saves);
+        let cb: Vec<u32> = pb.iter().chain(&gb).copied().collect();
+        let (sb2, gb2, kb2) = on_slot(url, &cb, true)?;
+        let b_loads = records(&record::CACHE_LOAD)?.len() - loads;
+        let ca: Vec<u32> = pa.iter().chain(&ga).copied().collect();
+        let (_, ga2, ka2) = on_slot(url, &ca, true)?;
+        let resumed = records(&record::CACHE_LOAD)?.split_off(loads);
+        let (_, ga3, _) = on_slot(url, &ca, false)?;
+        let (_, gb3, _) = on_slot(url, &cb, false)?;
+        let lines = |fs: &[record::Fields]| -> Vec<String> {
+            fs.iter().map(|f| f.line().to_owned()).collect()
+        };
+        let (parked_lines, resumed_lines) = (lines(&parked), lines(&resumed));
+        println!("park: A on slot {sa}, B on slot {sb}, C on slot {sc}; C's {parked_lines:?}");
+        println!("resume: B's continuation on slot {sb2} ({b_loads} loads); A's {resumed_lines:?}");
+        let names = |fs: &[record::Fields], want: &[(&str, usize)]| {
+            fs.iter().any(|f| {
+                want.iter()
+                    .all(|&(k, v)| f.u64(k).ok() == u64::try_from(v).ok())
+            })
+        };
+        let a_held = held(&pa);
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slots_park_resume",
+            sa != sb
+                && sc == sa
+                && names(&parked, &[("positions", a_held)])
+                && sb2 == sb
+                && b_loads == 0
+                && kb2 == json!(cb.len() - 1)
+                && gb2 == gb3
+                && names(&resumed, &[("positions", a_held), ("kept", a_held)])
+                && ka2 == json!(ca.len() - 1)
+                && ga2 == ga3,
+        );
+        Ok(ok)
+    }
+
+    /// (p4) A slot save on the main server, started without
+    /// `--slot-save-path`: the server's 501 naming the flag, and `/health`
+    /// after it.
+    fn slots_files_need_the_path(url: &dyn Fn(&str) -> String) -> Result<bool, GateError> {
+        let (st, text) = curl(
+            &url("/slots/0?action=save"),
+            Some(&json!({"filename": SLOT_FILE})),
+            false,
+        )?;
+        let (hst, health) = curl(&url("/health"), None, false)?;
+        println!("a slot save without --slot-save-path: HTTP {st}: {text}; health {hst} {health}");
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slots_files_need_the_path",
+            st == 501
+                && text.contains("--slot-save-path")
+                && hst == 200
+                && health.contains("\"ok\""),
+        );
+        Ok(ok)
+    }
+
+    /// `--need-path`: the main server (`SERVER_ARGS`) and (p4)'s save
+    /// without `--slot-save-path` on it, nothing else: one load.
+    fn need_path(a: &Args) -> Result<(), GateError> {
+        std::fs::create_dir_all(&a.dir)?;
+        let mut served = Served::spawn(&SERVER_ARGS, &a.dir)?;
+        println!("server pid {}", served.child.id());
+        let addr = served.address(&a.dir.join("server.err"), POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let ok = slots_files_need_the_path(&url)?;
+        println!("server stopped: {}", served.stop()?);
+        if ok {
+            println!("weekly-gpu-ds41-serve need-path: PASS");
+            Ok(())
+        } else {
+            Err(checks_failed())
+        }
     }
 
     /// The context the slots server names: its `parallel` line (the rule,
@@ -1227,23 +1618,12 @@ mod gate {
         Ok(ok)
     }
 
-    /// (s3) and (s2), the slot actions, on a pair that keeps its prompts
-    /// (module header).
+    /// (s2), an erase of one slot, on a pair that keeps its prompts (module
+    /// header).
     fn slots_actions(url: &dyn Fn(&str) -> String, a: &Args) -> Result<bool, GateError> {
         let mut ok = true;
         let other: Vec<u32> = a.ids.iter().rev().copied().collect();
         let (sa, ga, _) = on_slot(url, &a.ids, true)?;
-        let (st, text) = curl(
-            &url(&format!("/slots/{sa}?action=save")),
-            Some(&json!({"filename": "slot.bin"})),
-            false,
-        )?;
-        println!("slots save of slot {sa}: HTTP {st}: {text}");
-        check(
-            &mut ok,
-            "slots_save_refused_by_name",
-            st == 501 && text.contains("does not support slot save/restore"),
-        );
         let (sb, _, _) = on_slot(url, &other, true)?;
         // A POST, as llama-server's slot actions are: curl sends one with a body.
         let (st, text) = curl(
@@ -1926,6 +2306,7 @@ mod gate {
                 .into());
             }
             (Some(plain), Some("dspark")) => return drafted(&a, plain, &place),
+            (None, None) if a.need_path => return need_path(&a),
             (None, None) if a.slots => {
                 std::fs::create_dir_all(&a.dir)?;
                 let ok = slots(&a)? & slots_refuse_dspark(&a)?;
@@ -1963,6 +2344,7 @@ mod gate {
         let (st, body) = curl(&url("/health"), None, false)?;
         println!("health {st} {body}");
         check(&mut ok, "health_ok", st == 200 && body.contains("\"ok\""));
+        ok &= slots_files_need_the_path(&url)?;
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|a| (*a).to_owned()))
             .collect();

@@ -27,15 +27,23 @@
 //! engine owns: lent with each `Next` that wants them, filled on the engine
 //! thread, and handed back with the reply, so no token allocates a row.
 //!
+//! A slot file's state ([`Seat::save_state`], [`Seat::restore_state`])
+//! crosses between the server's thread and the engine thread through a pipe
+//! of chunks of `PIPE_CHUNK` bytes, at most `PIPE_DEPTH` of them waiting,
+//! never staged whole: past the seat's own copy the host holds a few chunks.
+//! The seat's error kind crosses with the answer, so only an engine failure
+//! ends the server.
+//!
 //! What `/props` says about the engine ([`model_props`], [`placement_props`])
 //! is read from the file's header and the placement plan the engine loads by,
 //! once, before the load; the engine hands it back unchanged.
 
 use std::collections::BTreeMap;
+use std::io::{self, Read, Write};
 use std::ops::Range;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
 use gguf::Split;
@@ -45,7 +53,8 @@ use runtime::seqstate::HOST_BUDGET;
 use sampler::{Sampler, SamplerParams};
 use serve::{
     CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, ModelProps,
-    PlacementProps, ResidencyReset, SamplerFactory, SamplingParams, Saved, StateError, Tokenizer,
+    PlacementProps, ResidencyReset, SamplerFactory, SamplingParams, Saved, SavedState, StateError,
+    Tokenizer,
 };
 
 use crate::GateError;
@@ -541,6 +550,14 @@ impl Parallel {
     }
 }
 
+/// The bytes of one chunk of a slot file's pipe (the module doc).
+const PIPE_CHUNK: usize = 4 << 20;
+
+/// The chunks a slot file's pipe holds waiting: with the one each thread
+/// holds in hand, the host peak past the seat's own copy is
+/// `(PIPE_DEPTH + 2) · PIPE_CHUNK`.
+const PIPE_DEPTH: usize = 2;
+
 /// What the engine thread is asked to do.
 enum Cmd {
     Prefill(Vec<u32>),
@@ -571,6 +588,10 @@ enum Cmd {
     Save,
     /// Replace the sequence state with a saved one.
     Resume(Arc<dyn Saved>),
+    /// The selected slot's state written into the pipe ([`save_into`]).
+    SaveState(SyncSender<Vec<u8>>),
+    /// The selected slot's state read from the pipe ([`restore_from`]).
+    RestoreState(Receiver<Vec<u8>>),
     /// Nothing: the reply carries the position the model stands at.
     Pos,
     /// The residency back to its seed.
@@ -616,8 +637,13 @@ enum Extra {
     Why(Option<String>),
     /// A `Splits`' cuts.
     Splits(Vec<usize>),
-    /// A `Save`'s state.
-    Saved(Arc<dyn Saved>),
+    /// A `Save`'s state, or its failure with its kind ([`snapshot_of`]).
+    Saved(Result<Arc<dyn Saved>, StateError>),
+    /// A `Resume`'s outcome with its kind ([`resume_of`]).
+    Resumed(Result<(), StateError>),
+    /// A `SaveState`'s or `RestoreState`'s outcome, its kind as the seat
+    /// gave it.
+    State(Result<SavedState, StateError>),
     /// A `Pass`'s buffer, holding its kept tokens on success, and what its
     /// draft proposed and kept.
     Pass(Vec<u32>, Drafted),
@@ -632,7 +658,9 @@ enum Extra {
 /// Its answer: the argmax of a `Next` (the kept length of a `Keep`), the
 /// logits buffer a `Next` was lent (filled unless the result is an error),
 /// the position it stands at afterwards (the position it failed at, on an
-/// error), and what a `Keep`, `Splits` or `Save` returns besides.
+/// error), and what a `Keep` or `Splits` returns besides. A `Save`,
+/// `Resume`, `SaveState` or `RestoreState` answers in its extra alone, with
+/// its kind.
 struct Reply {
     result: Result<u32, String>,
     logits: Option<Vec<f32>>,
@@ -770,11 +798,41 @@ pub trait Seat: 'static {
     /// Where to cut a prompt call of `first .. end` (from where the model
     /// stands) so the `marks` stay keepable (`serve::Engine::prefill_splits`).
     fn splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize>;
-    /// The sequence state as a value the server's prompt cache holds.
+    /// The sequence state as a value the server's prompt cache holds. A
+    /// refusal by name — a `bloomery_gpu::GpuError` of kind `State` (the
+    /// model does not hold what the call needs) or `Shape` (a call or a
+    /// state it does not take), anywhere in the error's chain — is the
+    /// request's: the server keeps no state and serves on. Any other error is
+    /// the engine's, which ends the server.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError>;
     /// Replace the sequence state with `state`, which [`Seat::snapshot`] took
-    /// of this seat.
+    /// of this seat. A refusal by name ([`Seat::snapshot`]'s kinds) is the
+    /// request's: the server drops the state and resets the slot.
     fn resume(&mut self, state: &dyn Saved) -> Result<(), GateError>;
+    /// The selected slot's sequence state written to `out` in a form
+    /// [`Seat::restore_state`] reads back (`serve::Engine::save_state`), the
+    /// state unchanged; the bytes written. A refusal is `Format`, an error
+    /// of `out` is the stream's (`Io`), never the model's; only a failure
+    /// that leaves the model in no defined state is `Engine`, which ends the
+    /// server. The default writes nothing and refuses with `Unsupported`: the
+    /// server answers 501. The seats that override it: V4.1
+    /// (`serve_seats::ds41`); GLM and Qwen3.8 once their sequence state
+    /// (`SeqState`) has a byte form.
+    fn save_state(&mut self, out: &mut dyn Write) -> Result<u64, StateError> {
+        let _ = out;
+        Err(StateError::Unsupported("slot save/restore"))
+    }
+    /// The selected slot's sequence state replaced with the one `input`
+    /// carries, which runs to its end (`serve::Engine::restore_state`); the
+    /// positions restored, where the seat then stands. The kinds are
+    /// [`Seat::save_state`]'s: a refusal after the seat has started to read
+    /// leaves the slot to the server, which resets it. The default reads
+    /// nothing and refuses with `Unsupported`; the seats that override it are
+    /// [`Seat::save_state`]'s.
+    fn restore_state(&mut self, input: &mut dyn Read) -> Result<usize, StateError> {
+        let _ = input;
+        Err(StateError::Unsupported("slot save/restore"))
+    }
     /// `/props`' `engine` object: `p`, the opener's, with what only the load
     /// learned (a draft's device and resident bytes). The default adds
     /// nothing.
@@ -909,14 +967,7 @@ impl SeatEngine {
                                 ),
                             }
                         }
-                        Cmd::Save => match g.snapshot() {
-                            Ok(s) => (Ok(0), None, Extra::Saved(s)),
-                            Err(e) => (
-                                Err(format!("snapshot at position {}: {e}", g.pos())),
-                                None,
-                                Extra::None,
-                            ),
-                        },
+                        Cmd::Save => (Ok(0), None, Extra::Saved(snapshot_of(&mut g))),
                         Cmd::ResidencyReset => match g.residency_reset() {
                             Ok(r) => (Ok(0), None, Extra::Residency(r)),
                             Err(e) => (
@@ -925,13 +976,15 @@ impl SeatEngine {
                                 Extra::None,
                             ),
                         },
-                        Cmd::Resume(state) => (
-                            g.resume(&*state).map(|()| 0).map_err(|e| {
-                                format!("resume of a state of {} positions: {e}", state.n_tokens())
-                            }),
-                            None,
-                            Extra::None,
-                        ),
+                        Cmd::Resume(state) => {
+                            (Ok(0), None, Extra::Resumed(resume_of(&mut g, &*state)))
+                        }
+                        Cmd::SaveState(chunks) => {
+                            (Ok(0), None, Extra::State(save_into(&mut g, chunks)))
+                        }
+                        Cmd::RestoreState(chunks) => {
+                            (Ok(0), None, Extra::State(restore_from(&mut g, chunks)))
+                        }
                         Cmd::StepSlots(mut rows) => {
                             // The seat's round ([`Seat::step_slots`]): one
                             // command on the thread, its rows back with the
@@ -1019,13 +1072,74 @@ impl Link {
 
     /// One command and its reply, the position left to the caller.
     fn ask(&self, cmd: Cmd) -> Result<Reply, EngineError> {
-        let sent = self.tx.as_ref().map(|tx| tx.send(cmd));
-        if !matches!(sent, Some(Ok(()))) {
-            return Err(EngineError("the engine thread is gone".to_owned()));
+        self.send(cmd)?;
+        self.reply()
+    }
+
+    /// One command sent; [`Link::reply`] waits for its answer.
+    fn send(&self, cmd: Cmd) -> Result<(), EngineError> {
+        match self.tx.as_ref().map(|tx| tx.send(cmd)) {
+            Some(Ok(())) => Ok(()),
+            _ => Err(EngineError("the engine thread is gone".to_owned())),
         }
+    }
+
+    /// The answer to the command sent last.
+    fn reply(&self) -> Result<Reply, EngineError> {
         self.rx
             .recv()
             .map_err(|_| EngineError("the engine thread ended mid-call".to_owned()))
+    }
+
+    /// The selected slot's state as a value ([`Seat::snapshot`]), its
+    /// failure's kind as [`snapshot_of`] read it.
+    fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
+        let reply = self.ask(Cmd::Save)?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::Saved(s)) => s,
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a save with no state".to_owned(),
+            ))),
+        }
+    }
+
+    /// `state` back into the selected slot ([`Seat::resume`]), its failure's
+    /// kind as [`resume_of`] read it.
+    fn resume(&self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
+        let reply = self.ask(Cmd::Resume(Arc::clone(state)))?;
+        match (reply.result, reply.extra) {
+            (Ok(_), Extra::Resumed(r)) => r,
+            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+            (Ok(_), _) => Err(StateError::Engine(EngineError(
+                "the engine thread answered a resume with no outcome".to_owned(),
+            ))),
+        }
+    }
+
+    /// The selected slot's state ([`Seat::save_state`]) into `out` through
+    /// the pipe: the engine thread writes the chunks, this thread writes
+    /// each to `out` as it comes. An error of `out` closes the pipe — the
+    /// seat's next write fails — and is the answer ([`settle`]).
+    fn save_state(&self, out: &mut dyn Write) -> Result<SavedState, StateError> {
+        let (tx, chunks) = mpsc::sync_channel(PIPE_DEPTH);
+        self.send(Cmd::SaveState(tx))?;
+        let written = drain(chunks, out);
+        let saved = state_of(self.reply()?, "save");
+        settle(saved, written)
+    }
+
+    /// The selected slot's state replaced with the one `input` carries
+    /// ([`Seat::restore_state`]), through the pipe: this thread reads `input`
+    /// to its end a chunk at a time, the engine thread reads the chunks. The
+    /// bytes the answer counts are the ones the seat read; the server holds
+    /// them to the file's.
+    fn restore_state(&self, input: &mut dyn Read) -> Result<SavedState, StateError> {
+        let (chunks, rx) = mpsc::sync_channel(PIPE_DEPTH);
+        self.send(Cmd::RestoreState(rx))?;
+        let read = pump(input, chunks);
+        let restored = state_of(self.reply()?, "restore");
+        settle(restored, read)
     }
 
     /// A step; with `logits_out`, the engine's buffer is lent for it and
@@ -1267,14 +1381,14 @@ fn serve_cmd<S: Seat>(
         | Cmd::Splits { .. }
         | Cmd::Save
         | Cmd::Resume(_)
+        | Cmd::SaveState(_)
+        | Cmd::RestoreState(_)
         | Cmd::Pass { .. }
         | Cmd::StepSlots(..)
         | Cmd::PassSlots(..)
         | Cmd::ResidencyReset => Err(
-            "a keep, split, pass, step or pass of several slots, save, resume or residency reset \
-             reached the step loop; the \
-             engine thread \
-             answers it"
+            "a keep, split, pass, step or pass of several slots, save, resume, slot file's save \
+             or restore, or residency reset reached the step loop; the engine thread answers it"
                 .to_owned(),
         ),
         Cmd::Pos => Ok(0),
@@ -1391,6 +1505,237 @@ pub fn pass_rows_in_turn<S: Seat + ?Sized>(
     failed.map_or(Ok(()), Err)
 }
 
+/// The selected slot's state as a value ([`Seat::snapshot`]), on the engine
+/// thread; a failure with its kind ([`seat_failure`]).
+fn snapshot_of<S: Seat + ?Sized>(g: &mut S) -> Result<Arc<dyn Saved>, StateError> {
+    let at = g.pos();
+    g.snapshot()
+        .map_err(|e| seat_failure(&*e, format!("snapshot at position {at}")))
+}
+
+/// `state` back into the selected slot ([`Seat::resume`]), on the engine
+/// thread; a failure with its kind ([`seat_failure`]).
+fn resume_of<S: Seat + ?Sized>(g: &mut S, state: &dyn Saved) -> Result<(), StateError> {
+    g.resume(state).map_err(|e| {
+        seat_failure(
+            &*e,
+            format!("resume of a state of {} positions", state.n_tokens()),
+        )
+    })
+}
+
+/// A seat's failure of a prompt-cache state with `what` before it, as the
+/// server's kind: a refusal by name (a `GpuError` of kind `State` or
+/// `Shape` anywhere in the chain, [`Seat::snapshot`]) is `Format`, the
+/// request's, which the server answers by keeping no state or by resetting
+/// the slot; any other failure — the card's, the driver's, a fault, an
+/// error of no known kind — is `Engine`, which ends it.
+fn seat_failure(e: &(dyn std::error::Error + 'static), what: String) -> StateError {
+    let refused = std::iter::successors(Some(e), |e| e.source())
+        .find_map(|e| e.downcast_ref::<bloomery_gpu::GpuError>())
+        .is_some_and(|g| {
+            matches!(
+                g,
+                bloomery_gpu::GpuError::State { .. } | bloomery_gpu::GpuError::Shape { .. }
+            )
+        });
+    if refused {
+        StateError::Format(format!("{what}: {e}"))
+    } else {
+        StateError::Engine(EngineError(format!("{what}: {e}")))
+    }
+}
+
+/// The selected slot's state ([`Seat::save_state`]) written into the pipe
+/// `chunks`, on the engine thread: its last chunk sent and its end dropped
+/// before the reply, so the server's thread holds every byte when the
+/// answer reaches it. The positions the seat stands at and the bytes it
+/// wrote.
+fn save_into<S: Seat + ?Sized>(
+    g: &mut S,
+    chunks: SyncSender<Vec<u8>>,
+) -> Result<SavedState, StateError> {
+    let at = g.pos();
+    let mut w = PipeWriter {
+        chunks,
+        chunk: Vec::new(),
+    };
+    let n_bytes = g
+        .save_state(&mut w)
+        .map_err(|e| at_position(e, "save", at))?;
+    w.flush()?;
+    Ok(SavedState {
+        n_tokens: at,
+        n_bytes,
+    })
+}
+
+/// The selected slot's state replaced from the pipe `chunks`
+/// ([`Seat::restore_state`]), on the engine thread, the pipe's end dropped
+/// before the reply: the positions restored and the bytes the seat read.
+fn restore_from<S: Seat + ?Sized>(
+    g: &mut S,
+    chunks: Receiver<Vec<u8>>,
+) -> Result<SavedState, StateError> {
+    let at = g.pos();
+    let mut r = PipeReader {
+        chunks,
+        chunk: Vec::new(),
+        at: 0,
+        bytes: 0,
+    };
+    let n_tokens = g
+        .restore_state(&mut r)
+        .map_err(|e| at_position(e, "restore", at))?;
+    Ok(SavedState {
+        n_tokens,
+        n_bytes: r.bytes,
+    })
+}
+
+/// `e` with the command and the position the seat stood at when it is the
+/// engine's; a refusal or a stream's error is the request's answer as the
+/// seat gave it.
+fn at_position(e: StateError, what: &str, at: usize) -> StateError {
+    match e {
+        StateError::Engine(EngineError(m)) => {
+            StateError::Engine(EngineError(format!("{what} at position {at}: {m}")))
+        }
+        other => other,
+    }
+}
+
+/// A `SaveState` or `RestoreState` reply's outcome, its kind as the seat
+/// gave it; a reply without one is the engine thread's defect, named.
+fn state_of(reply: Reply, what: &str) -> Result<SavedState, StateError> {
+    match (reply.result, reply.extra) {
+        (Ok(_), Extra::State(r)) => r,
+        (Err(e), _) => Err(StateError::Engine(EngineError(e))),
+        (Ok(_), _) => Err(StateError::Engine(EngineError(format!(
+            "the engine thread answered a slot file's {what} with no outcome"
+        )))),
+    }
+}
+
+/// The answer of a slot file's state that crossed the pipe: the seat's
+/// engine failure first (a failed model is never hidden behind the file),
+/// then this thread's error of the stream (which closed the pipe, and so
+/// caused whatever the seat answered after it), then the seat's answer.
+fn settle(
+    seat: Result<SavedState, StateError>,
+    stream: io::Result<()>,
+) -> Result<SavedState, StateError> {
+    match (seat, stream) {
+        (Err(e @ StateError::Engine(_)), _) => Err(e),
+        (_, Err(e)) => Err(StateError::Io(e)),
+        (r, Ok(())) => r,
+    }
+}
+
+/// Every chunk of a save's pipe into `out`, until the engine thread drops
+/// its end; the first error of `out` drops this end (the seat's next write
+/// fails) and is returned.
+fn drain(chunks: Receiver<Vec<u8>>, out: &mut dyn Write) -> io::Result<()> {
+    for chunk in &chunks {
+        out.write_all(&chunk)?;
+    }
+    Ok(())
+}
+
+/// `input` to its end into a restore's pipe, [`PIPE_CHUNK`] bytes a chunk,
+/// this end dropped after it: the end of `input` reaches the seat as the
+/// pipe's. A seat that stops reading drops its end, and the pump stops
+/// there. An error of `input` is returned.
+fn pump(input: &mut dyn Read, chunks: SyncSender<Vec<u8>>) -> io::Result<()> {
+    loop {
+        let mut chunk = Vec::with_capacity(PIPE_CHUNK);
+        if (&mut *input)
+            .take(PIPE_CHUNK as u64)
+            .read_to_end(&mut chunk)?
+            == 0
+        {
+            return Ok(());
+        }
+        if chunks.send(chunk).is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// The engine thread's side of a save's pipe: bytes gathered into a chunk
+/// of [`PIPE_CHUNK`], each full chunk sent, the last one by `flush`. A pipe
+/// the server's thread closed is `BrokenPipe`.
+struct PipeWriter {
+    chunks: SyncSender<Vec<u8>>,
+    chunk: Vec<u8>,
+}
+
+impl PipeWriter {
+    fn send(&mut self) -> io::Result<()> {
+        let chunk = std::mem::take(&mut self.chunk);
+        self.chunks.send(chunk).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the server stopped taking the slot's state",
+            )
+        })
+    }
+}
+
+impl Write for PipeWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.chunk.capacity() == 0 {
+            self.chunk.reserve_exact(PIPE_CHUNK);
+        }
+        let n = buf.len().min(PIPE_CHUNK - self.chunk.len());
+        self.chunk.extend_from_slice(&buf[..n]);
+        if self.chunk.len() == PIPE_CHUNK {
+            self.send()?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.chunk.is_empty() {
+            Ok(())
+        } else {
+            self.send()
+        }
+    }
+}
+
+/// The engine thread's side of a restore's pipe: the chunks the server's
+/// thread read, in order, and the pipe's end as the stream's. `bytes`
+/// counts what the seat read.
+struct PipeReader {
+    chunks: Receiver<Vec<u8>>,
+    chunk: Vec<u8>,
+    at: usize,
+    bytes: u64,
+}
+
+impl Read for PipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.at == self.chunk.len() {
+            match self.chunks.recv() {
+                Ok(c) => {
+                    self.chunk = c;
+                    self.at = 0;
+                }
+                Err(mpsc::RecvError) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.chunk.len() - self.at);
+        buf[..n].copy_from_slice(&self.chunk[self.at..self.at + n]);
+        self.at += n;
+        self.bytes += n as u64;
+        Ok(n)
+    }
+}
+
 impl Engine for SeatEngine {
     fn tokenizer(&self) -> Arc<dyn Tokenizer> {
         self.vocab.clone()
@@ -1498,24 +1843,30 @@ impl Engine for SeatEngine {
         self.cache_ram
     }
 
+    /// The seat's state ([`Link::snapshot`]): a refusal by name is the
+    /// request's (the server keeps no state), any other failure fatal.
     fn snapshot(&self) -> Result<Arc<dyn Saved>, StateError> {
-        let reply = self.link.ask(Cmd::Save)?;
-        match (reply.result, reply.extra) {
-            (Ok(_), Extra::Saved(s)) => Ok(s),
-            (Ok(_), _) => Err(StateError::Engine(EngineError(
-                "the engine thread answered a save with no state".to_owned(),
-            ))),
-            (Err(e), _) => Err(StateError::Engine(EngineError(e))),
-        }
+        self.link.snapshot()
     }
 
-    /// A state the body refuses leaves the model in no defined state: every
-    /// refusal is the engine's error, which ends the server.
+    /// The state back into the seat ([`Link::resume`]): a refusal by name
+    /// is the request's (the server drops the state and resets the slot),
+    /// any other failure fatal.
     fn resume(&mut self, state: &Arc<dyn Saved>) -> Result<(), StateError> {
-        self.link
-            .call(Cmd::Resume(Arc::clone(state)))
-            .map(|_| ())
-            .map_err(StateError::Engine)
+        self.link.resume(state)
+    }
+
+    /// The selected slot's state through the pipe ([`Seat::save_state`]),
+    /// its kind carried: `Unsupported` is the server's 501, a refusal or
+    /// the file's error the request's, an engine failure fatal.
+    fn save_state(&self, out: &mut dyn Write) -> Result<SavedState, StateError> {
+        self.link.save_state(out)
+    }
+
+    /// [`Engine::save_state`]'s way back ([`Seat::restore_state`]); a
+    /// refusal leaves the slot to the server, which resets it.
+    fn restore_state(&mut self, input: &mut dyn Read) -> Result<SavedState, StateError> {
+        self.link.restore_state(input)
     }
 
     /// The body's cuts; a thread that does not answer cuts nowhere, and the
@@ -1945,5 +2296,419 @@ mod tests {
         let e = e.to_string();
         assert!(e.contains("--park-ram 17592186044416 MiB"), "{e}");
         assert!(!e.contains("--cache-ram"), "{e}");
+    }
+
+    mod slot_files {
+        use std::io::{self, Read, Write};
+        use std::sync::Arc;
+        use std::sync::mpsc;
+        use std::thread::JoinHandle;
+
+        use serve::{CacheNote, EngineError, Saved, SavedState, StateError};
+
+        use bloomery_gpu::GpuError;
+
+        use super::super::{
+            Cmd, Extra, Link, PIPE_CHUNK, Reply, Seat, restore_from, resume_of, save_into, settle,
+            snapshot_of,
+        };
+        use crate::GateError;
+
+        /// The [`Seat`] methods a slot file's command never calls.
+        macro_rules! no_steps {
+            () => {
+                fn pos(&self) -> usize {
+                    self.pos
+                }
+                fn ctx_max(&self) -> usize {
+                    1 << 10
+                }
+                fn prefill(&mut self, _: &[u32]) -> Result<u32, GateError> {
+                    Err("this seat serves slot files alone".into())
+                }
+                fn step(&mut self, _: u32) -> Result<u32, GateError> {
+                    Err("this seat serves slot files alone".into())
+                }
+                fn logits_into(&self, _: &mut [f32]) -> Result<(), GateError> {
+                    Err("this seat serves slot files alone".into())
+                }
+                fn reset(&mut self) -> Result<(), GateError> {
+                    Err("this seat serves slot files alone".into())
+                }
+                fn rollback(&mut self, _: u32) -> Result<(), GateError> {
+                    Err("this seat serves slot files alone".into())
+                }
+                fn keep(&self, _: usize) -> (usize, Option<String>) {
+                    (0, None)
+                }
+                fn splits(&self, _: usize, _: usize, _: &[usize]) -> Vec<usize> {
+                    Vec::new()
+                }
+                fn note(_: &CacheNote) {}
+            };
+        }
+
+        /// The prompt-cache methods of a seat that serves slot files alone.
+        macro_rules! no_cache {
+            () => {
+                fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+                    Err("this seat serves slot files alone".into())
+                }
+                fn resume(&mut self, _: &dyn Saved) -> Result<(), GateError> {
+                    Err("this seat serves slot files alone".into())
+                }
+            };
+        }
+
+        /// A seat that keeps the trait's slot-file defaults.
+        struct NoFiles {
+            pos: usize,
+        }
+
+        impl Seat for NoFiles {
+            no_steps!();
+            no_cache!();
+        }
+
+        /// The positions [`Files`] stands at after a restore.
+        const RESTORED: usize = 5;
+
+        /// A seat whose state is `state`, which a restore replaces with what
+        /// it read; `fail` makes both refuse with that kind instead.
+        struct Files {
+            pos: usize,
+            state: Vec<u8>,
+            fail: Option<Fail>,
+        }
+
+        #[derive(Clone, Copy)]
+        enum Fail {
+            Format,
+            Engine,
+        }
+
+        impl Fail {
+            fn error(self) -> StateError {
+                match self {
+                    Fail::Format => StateError::Format("a state of another model".to_owned()),
+                    Fail::Engine => StateError::Engine(EngineError("the card fell off".to_owned())),
+                }
+            }
+        }
+
+        impl Seat for Files {
+            no_steps!();
+            no_cache!();
+
+            fn save_state(&mut self, out: &mut dyn Write) -> Result<u64, StateError> {
+                if let Some(f) = self.fail {
+                    return Err(f.error());
+                }
+                out.write_all(&self.state)?;
+                Ok(self.state.len() as u64)
+            }
+
+            fn restore_state(&mut self, input: &mut dyn Read) -> Result<usize, StateError> {
+                if let Some(f) = self.fail {
+                    return Err(f.error());
+                }
+                self.state.clear();
+                input.read_to_end(&mut self.state)?;
+                self.pos = RESTORED;
+                Ok(RESTORED)
+            }
+        }
+
+        /// A seat whose prompt-cache calls fail with `fail`'s error.
+        struct Caches {
+            pos: usize,
+            fail: fn() -> GateError,
+        }
+
+        impl Seat for Caches {
+            no_steps!();
+
+            fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+                Err((self.fail)())
+            }
+
+            fn resume(&mut self, _: &dyn Saved) -> Result<(), GateError> {
+                Err((self.fail)())
+            }
+        }
+
+        /// A prompt-cache state of the positions it names, which no seat here
+        /// takes back.
+        struct Held(usize);
+
+        impl Saved for Held {
+            fn n_tokens(&self) -> usize {
+                self.0
+            }
+
+            fn n_bytes(&self) -> u64 {
+                0
+            }
+
+            fn keepable(&self, n: usize) -> usize {
+                n.min(self.0)
+            }
+
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        /// An error whose source is the one it wraps, as a seat's own error
+        /// wraps the body's.
+        #[derive(Debug)]
+        struct Wrapped(GpuError);
+
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "the session refused")
+            }
+        }
+
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        /// A link to a thread that answers a seat's state commands as the
+        /// engine thread does ([`save_into`], [`restore_from`],
+        /// [`snapshot_of`], [`resume_of`]); joining it hands the seat back.
+        fn file_link<S: Seat + Send>(mut seat: S) -> (Link, JoinHandle<S>) {
+            let (tx, cmds) = mpsc::channel::<Cmd>();
+            let (replies, rx) = mpsc::channel::<Reply>();
+            let worker = std::thread::spawn(move || {
+                for cmd in cmds {
+                    let extra = match cmd {
+                        Cmd::SaveState(chunks) => Extra::State(save_into(&mut seat, chunks)),
+                        Cmd::RestoreState(chunks) => Extra::State(restore_from(&mut seat, chunks)),
+                        Cmd::Save => Extra::Saved(snapshot_of(&mut seat)),
+                        Cmd::Resume(state) => Extra::Resumed(resume_of(&mut seat, &*state)),
+                        _ => panic!("the file thread answers a seat's state commands only"),
+                    };
+                    let reply = Reply {
+                        result: Ok(0),
+                        logits: None,
+                        pos: seat.pos(),
+                        extra,
+                    };
+                    if replies.send(reply).is_err() {
+                        break;
+                    }
+                }
+                seat
+            });
+            let link = Link {
+                tx: Some(tx),
+                rx,
+                logits: Vec::new(),
+                scratch: Vec::new(),
+            };
+            (link, worker)
+        }
+
+        /// `n` bytes of a pattern that repeats past no chunk boundary.
+        fn pattern(n: usize, salt: u8) -> Vec<u8> {
+            (0..n).map(|i| (i % 251) as u8 ^ salt).collect()
+        }
+
+        /// A writer whose every write fails, as a full disk does.
+        struct Full;
+
+        impl Write for Full {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("no space left on the device"))
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// A state of several chunks and a partial one crosses the pipe byte
+        /// for byte, each way: the seat's bytes reach the server's `out`, the
+        /// file's bytes reach the seat, and the answers count them.
+        #[test]
+        fn a_slot_state_crosses_the_pipe_byte_for_byte() {
+            let n = 3 * PIPE_CHUNK + 17;
+            let state = pattern(n, 0);
+            let (mut link, worker) = file_link(Files {
+                pos: 9,
+                state: state.clone(),
+                fail: None,
+            });
+            let mut out = Vec::new();
+            let saved = link.save_state(&mut out).expect("a save");
+            assert_eq!(
+                saved,
+                SavedState {
+                    n_tokens: 9,
+                    n_bytes: n as u64
+                }
+            );
+            assert!(out == state, "the saved bytes differ from the seat's");
+            let file = pattern(n, 0x5a);
+            let restored = link.restore_state(&mut file.as_slice()).expect("a restore");
+            assert_eq!(
+                restored,
+                SavedState {
+                    n_tokens: RESTORED,
+                    n_bytes: n as u64
+                }
+            );
+            link.tx = None;
+            let seat = worker.join().expect("the file thread");
+            assert!(
+                seat.state == file,
+                "the seat read other bytes than the file's"
+            );
+        }
+
+        /// A seat that keeps the trait's defaults answers `Unsupported` both
+        /// ways (the server's 501), and a save writes nothing.
+        #[test]
+        fn the_default_seat_answers_unsupported() {
+            let (mut link, worker) = file_link(NoFiles { pos: 3 });
+            let mut out = Vec::new();
+            let e = link.save_state(&mut out).expect_err("the default save");
+            assert!(
+                matches!(e, StateError::Unsupported("slot save/restore")),
+                "{e:?}"
+            );
+            assert!(out.is_empty(), "the default save wrote {} bytes", out.len());
+            let file = pattern(PIPE_CHUNK + 1, 0);
+            let e = link
+                .restore_state(&mut file.as_slice())
+                .expect_err("the default restore");
+            assert!(
+                matches!(e, StateError::Unsupported("slot save/restore")),
+                "{e:?}"
+            );
+            link.tx = None;
+            worker.join().expect("the file thread");
+        }
+
+        /// The kind crosses the thread: a refusal stays `Format` (its words
+        /// as the seat gave them), an engine failure stays `Engine` (with the
+        /// command and the position), and an error of the server's `out` is
+        /// `Io`. An engine failure is never hidden behind the stream's error.
+        #[test]
+        fn a_state_error_keeps_its_kind() {
+            let (mut link, worker) = file_link(Files {
+                pos: 9,
+                state: Vec::new(),
+                fail: Some(Fail::Format),
+            });
+            let e = link
+                .restore_state(&mut [1u8, 2, 3].as_slice())
+                .expect_err("a refused restore");
+            assert!(
+                matches!(&e, StateError::Format(m) if m == "a state of another model"),
+                "{e:?}"
+            );
+            link.tx = None;
+            worker.join().expect("the file thread");
+
+            let (mut link, worker) = file_link(Files {
+                pos: 9,
+                state: Vec::new(),
+                fail: Some(Fail::Engine),
+            });
+            let e = link.save_state(&mut Vec::new()).expect_err("a failed save");
+            assert!(
+                matches!(&e, StateError::Engine(EngineError(m))
+                    if m == "save at position 9: the card fell off"),
+                "{e:?}"
+            );
+            link.tx = None;
+            worker.join().expect("the file thread");
+
+            let (mut link, worker) = file_link(Files {
+                pos: 9,
+                state: pattern(3 * PIPE_CHUNK, 0),
+                fail: None,
+            });
+            let e = link
+                .save_state(&mut Full)
+                .expect_err("a save to a full disk");
+            assert!(
+                matches!(&e, StateError::Io(io) if io.to_string() == "no space left on the device"),
+                "{e:?}"
+            );
+            link.tx = None;
+            worker.join().expect("the file thread");
+
+            let stream = || Err(io::Error::other("no space left on the device"));
+            let engine = Err(StateError::Engine(EngineError(
+                "the card fell off".to_owned(),
+            )));
+            assert!(matches!(
+                settle(engine, stream()),
+                Err(StateError::Engine(_))
+            ));
+            let format = Err(StateError::Format("a broken pipe".to_owned()));
+            assert!(matches!(settle(format, stream()), Err(StateError::Io(_))));
+        }
+
+        /// A prompt-cache state the seat refuses by name — a `GpuError` of
+        /// kind `Shape` or `State`, itself or in the chain — reaches the
+        /// server as `Format`, the request's (the server keeps no state or
+        /// resets the slot), not `Engine`, which would end it. Any other
+        /// failure stays the engine's.
+        #[test]
+        fn a_refused_cache_state_is_the_requests() {
+            fn waits() -> GateError {
+                Box::new(GpuError::Shape {
+                    what: "deepseek41 sequence state",
+                    detail: "a call while the pass of slots [0, 1] waits for its commit".to_owned(),
+                })
+            }
+            fn missing() -> GateError {
+                Box::new(Wrapped(GpuError::State {
+                    what: "deepseek41 sequence state",
+                    missing: "a reset",
+                }))
+            }
+            fn lost() -> GateError {
+                Box::new(GpuError::Protocol {
+                    what: "the host tier",
+                    detail: "a go that did not land".to_owned(),
+                })
+            }
+            fn unnamed() -> GateError {
+                "a saved state that is not this body's".into()
+            }
+            let held: Arc<dyn Saved> = Arc::new(Held(4));
+            let cases: [(fn() -> GateError, bool); 4] = [
+                (waits, true),
+                (missing, true),
+                (lost, false),
+                (unnamed, false),
+            ];
+            for (fail, refused) in cases {
+                let (mut link, worker) = file_link(Caches { pos: 7, fail });
+                let saved = link.snapshot().map(|_| ()).expect_err("a failed snapshot");
+                let resumed = link.resume(&held).expect_err("a failed resume");
+                let want = fail().to_string();
+                for (e, head) in [
+                    (&saved, "snapshot at position 7: "),
+                    (&resumed, "resume of a state of 4 positions: "),
+                ] {
+                    let m = match e {
+                        StateError::Format(m) if refused => m,
+                        StateError::Engine(EngineError(m)) if !refused => m,
+                        other => panic!("{want}: {other:?}"),
+                    };
+                    assert_eq!(*m, format!("{head}{want}"));
+                }
+                link.tx = None;
+                worker.join().expect("the file thread");
+            }
+        }
     }
 }

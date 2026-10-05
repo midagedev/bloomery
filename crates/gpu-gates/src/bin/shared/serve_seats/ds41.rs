@@ -75,9 +75,12 @@
 //! history at that slot's next pass, so its passes are the slot's alone.
 //!
 //! `--slot-save-path DIR` turns on the slot actions as llama-server's: an
-//! erase empties that slot alone; a save or a restore to a file is refused
-//! by name (the engine answers 501: the body's sequence state goes to the
-//! prompt cache in host RAM, not to a file).
+//! erase empties that slot alone; a save writes the slot's sequence state
+//! in the body's byte form (`body::save_state`) after the server's header,
+//! and a restore reads it back into the slot it names (`body::restore_state`),
+//! the drafts then following as after a prompt-cache resume. A file of
+//! another model file, card, context or slot count is refused by name: the
+//! request's 400, the slot reset, the server serving on.
 //!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
@@ -127,6 +130,7 @@
 //! token history at a request's first token.
 
 use std::any::Any;
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -155,8 +159,9 @@ use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::{Committed, Lookup, Speculative, Target, Want};
 use serve::{
-    CacheNote, DeviceProps, DraftProps, Drafted, EngineProps, FATAL_LINGER, PlacementProps,
-    ResidencyReset, Saved, ServeError, Server, ServerConfig, SlotConfig,
+    CacheNote, DeviceProps, DraftProps, Drafted, EngineError, EngineProps, FATAL_LINGER,
+    PlacementProps, ResidencyReset, Saved, ServeError, Server, ServerConfig, SlotConfig,
+    StateError,
 };
 use tokenizer::Tokenizer;
 
@@ -963,6 +968,21 @@ impl Seat for V41 {
         Ok(body::resume(self.s.model_mut(), &saved.state)?)
     }
 
+    /// The selected slot's state in the body's byte form
+    /// ([`body::save_state`]).
+    fn save_state(&mut self, out: &mut dyn Write) -> Result<u64, StateError> {
+        body::save_state(self.s.model_mut(), out).map_err(state_error)
+    }
+
+    /// The body's byte form put back into the selected slot
+    /// ([`body::restore_state`]); the drafts follow as after a
+    /// [`Seat::resume`]: the DSpark draft starts over, the lookup rebuilds
+    /// its tables from the history at the next pass.
+    fn restore_state(&mut self, input: &mut dyn Read) -> Result<usize, StateError> {
+        self.moved();
+        body::restore_state(self.s.model_mut(), input).map_err(state_error)
+    }
+
     /// `engine.draft`, and the draft's resident bytes in its card's
     /// placement row, the class `draft` (a row of its own when the target
     /// has no layer there). The card's index missing leaves the device out.
@@ -1062,6 +1082,17 @@ impl Seat for V41 {
                 .csv("at", at),
         };
         r.eprint();
+    }
+}
+
+/// The body's state failure as the server's kind: a refusal is the
+/// request's (a 400 or a 500 that keeps the server), a stream's error is the
+/// file's (`Io`), a card failure the model's, which ends it.
+fn state_error(e: body::StateFail) -> StateError {
+    match e {
+        body::StateFail::Refused(e) => StateError::Format(e.to_string()),
+        body::StateFail::Io(e) => StateError::Io(e),
+        body::StateFail::Card(e) => StateError::Engine(EngineError(e.to_string())),
     }
 }
 
