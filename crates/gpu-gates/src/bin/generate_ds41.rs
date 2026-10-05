@@ -1001,14 +1001,7 @@ mod drive {
         call: Option<&CallView>,
     ) -> Result<(), GateError> {
         let (n, a) = (pre.slots, &r.a);
-        for j in 1..n {
-            s.select_slot(j)?;
-            s.clear()?;
-        }
-        s.select_slot(0)?;
-        if i > 0
-            && let Some(c) = s.residency_reset()?
-        {
+        if let Some(c) = gen_slots::fresh(s, n, i > 0)? {
             record::residency_reset(&c).print();
         }
         let view = pre.arm(i, r)?;
