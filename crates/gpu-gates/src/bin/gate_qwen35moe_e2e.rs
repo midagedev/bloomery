@@ -2140,7 +2140,9 @@ mod gate {
     /// consistency, the (p) and (r) contracts on the q8 path. The distance
     /// to the f16 run's logits prints as the quantization diagnostic
     /// (`store`'s f16 readback refuses a q8_0 cache by name, so the bits
-    /// clause holds the logits and tokens).
+    /// clause holds the logits and tokens). Asking the q8 model for the
+    /// scalar pass is refused by name at the call, and its next step still
+    /// runs.
     fn q8_cache() -> Result<bool, GateError> {
         const Q8_N: usize = 96;
         let (_, toks) = batch_set()?;
@@ -2209,6 +2211,27 @@ mod gate {
             verdict(replay)
         );
         ok &= replay;
+        // The scalar pass on a q8_0 cache: refused by name at the call that
+        // asks for it, in `q8_unserved`'s words, and the model's pass kept —
+        // the next eager step runs.
+        m.set_mode(StepMode::Eager);
+        let named = match m.set_flash_mma(false) {
+            Err(GpuError::Shape {
+                what: "qwen35moe::set_flash_mma",
+                detail,
+            }) => detail.contains(
+                "a q8_0 cache's flash runs the eight-head layout's tensor-core pass only; asked \
+                 for the scalar pass",
+            ),
+            _ => false,
+        };
+        let kept = m.reset().is_ok() && m.step(&[ids[0]]).is_ok();
+        println!(
+            "q8 scalar refusal: set_flash_mma(false) refused by name at the call {named}, the \
+             next step runs {kept} {}",
+            verdict(named && kept)
+        );
+        ok &= named && kept;
         Ok(ok)
     }
 

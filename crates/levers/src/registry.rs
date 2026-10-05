@@ -764,7 +764,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Was the Qwen3 GQA flash's scalar segment pass.",
         site: Site::Retired {
             why: "the tensor-core segment pass is the only Qwen3 decode flash pass; the scalar \
-                  pass is a gate's ruler, picked by `set_flash_mma`",
+                  pass is a gate's ruler on an f16 cache, picked by `set_flash_mma`",
             left: &[],
         },
     },

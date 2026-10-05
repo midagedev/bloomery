@@ -345,8 +345,10 @@ impl GpuModel<Body35> {
 
     /// Run the attention layers on the tensor-core flash pass (`mma`, the
     /// pass a load runs) or the scalar one from here on — a same-class
-    /// ruler for a gate, not an engine path. Eager mode only: a captured
-    /// graph holds the pass it was captured with.
+    /// ruler for a gate on an f16 cache, not an engine path. Eager mode
+    /// only: a captured graph holds the pass it was captured with. The
+    /// scalar pass on a q8_0 cache is refused by name here, at the call
+    /// ([`KvPlanes::serves_scalar`](super::scratch::KvPlanes::serves_scalar)).
     pub fn set_flash_mma(&mut self, mma: bool) -> Result<(), GpuError> {
         const WHAT: &str = "qwen35moe::set_flash_mma";
         if self.mode() != StepMode::Eager {
@@ -355,7 +357,15 @@ impl GpuModel<Body35> {
                 "eager mode (the captured graphs hold the flash pass of their capture)",
             ));
         }
-        self.body_parts(WHAT)?.2.mma = mma;
+        let body = self.body_parts(WHAT)?.2;
+        if !mma {
+            for (plan, store) in body.plans.iter().zip(&body.stores) {
+                if let (MixerPlan::Gqa(g), LayerStore::Kv(p)) = (&plan.mixer, store) {
+                    p.serves_scalar(WHAT, g.flash)?;
+                }
+            }
+        }
+        body.mma = mma;
         Ok(())
     }
 }

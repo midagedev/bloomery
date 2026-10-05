@@ -41,9 +41,13 @@
 //! The `_q8` entries ([`RopeNeoxKernels::enqueue_head_norm_neox_append_q8`],
 //! [`RopeNeoxKernels::enqueue_head_norm_neox_append_256_q8`]) are the same two
 //! launches with the cache append quantized: the norm, the turn and the
-//! in-place query and key writes are their f16 twins' bit for bit, and each
-//! key and value row is stored as Q8_0 blocks in the two-plane layout the
-//! weights side owns (`weights::q8_0_planes` over `gguf::quant::Q8Block`) —
+//! in-place query and key writes are their f16 twins' bit for bit — the
+//! `_256` pair is one body, `norm_partial_append`, over the cache format
+//! ([`KvSink`]), and the head-128 q8 entry holds its twin's body with the
+//! append replaced, because moving that f16 entry's kernel body into a
+//! helper changes the entry's code at the toolchain pin — and
+//! each key and value row is stored as Q8_0 blocks in the two-plane layout
+//! the weights side owns (`weights::q8_0_planes` over `gguf::quant::Q8Block`) —
 //! a codes plane of `head/4` u32 a row (code `j` of a 32-value block in word
 //! `j/4`, byte `j%4`) and a scales plane of `head/32` u16 a row, each the
 //! block's f16 scale bits — 17/16 bytes a value against the f16 plane's 2.
@@ -113,7 +117,9 @@ pub const fn owned_pair(head: usize, rot: usize, t: usize) -> (usize, usize) {
 
 /// The norm, partial turn and append of [`rope_neox_kernels::head_norm_neox_append_256`]
 /// over heads of `HEAD` values, the first `ROT` turned, `WARPS = HEAD/64`
-/// warps a block. Block `b = t·(n_head + n_kv) + h`. The query head `h` of
+/// warps a block, into a cache in the format `S` (that entry's body over
+/// [`F16Sink`], `head_norm_neox_append_256_q8`'s over [`Q8Sink`]). Block `b =
+/// t·(n_head + n_kv) + h`. The query head `h` of
 /// token `t` is read from the q+gate rows at `qg[t·n_head·2·HEAD + h·2·HEAD
 /// ..]` (each head's `2·HEAD` values are the query, then its gate) and
 /// written to `q[(t·n_head + h)·HEAD ..]`; key head `j = h − n_head` is
@@ -126,14 +132,20 @@ pub const fn owned_pair(head: usize, rot: usize, t: usize) -> (usize, usize) {
 /// [`FaultSite::CachePos`], writes NaN over the head's output and appends
 /// nothing.
 ///
-/// SAFETY: the entry's launch contract at `(HEAD, ROT)`, a block of
-/// `HEAD/2` threads, and `wsum` this block's `WARPS` f64 of shared memory.
+/// SAFETY: the entry's launch contract at `(HEAD, ROT)` over `sink`'s planes,
+/// a block of `HEAD/2` threads, and `wsum` this block's `WARPS` f64 of shared
+/// memory.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
     reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
 )]
-unsafe fn norm_partial_append<const HEAD: usize, const ROT: usize, const WARPS: usize>(
+unsafe fn norm_partial_append<
+    const HEAD: usize,
+    const ROT: usize,
+    const WARPS: usize,
+    S: KvSink,
+>(
     gq: &[f32],
     gk: &[f32],
     table: &[f32],
@@ -148,8 +160,7 @@ unsafe fn norm_partial_append<const HEAD: usize, const ROT: usize, const WARPS: 
     fault: FaultSink,
     mut q: DisjointSlice<f32>,
     mut k: DisjointSlice<f32>,
-    mut cache_k: DisjointSlice<u16>,
-    mut cache_v: DisjointSlice<u16>,
+    mut sink: S,
     wsum: *mut f64,
 ) {
     const { assert!(WARPS * 64 == HEAD && ROT.is_multiple_of(2) && ROT <= HEAD && ROT / 2 <= 32) };
@@ -260,17 +271,24 @@ unsafe fn norm_partial_append<const HEAD: usize, const ROT: usize, const WARPS: 
         *k.get_unchecked_mut(dst + i0) = y0;
         *k.get_unchecked_mut(dst + i1) = y1;
     }
-    let row = (kh * ctx as usize + p) * HEAD;
-    // SAFETY: kh < n_kv and p < ctx, so row + HEAD − 1 < n_kv·ctx·HEAD <= the
-    // planes' lengths; dst + i < m·n_kv·HEAD <= v.len(). One thread per two
-    // values of the row; the tokens of one launch hold distinct positions,
-    // so no two blocks write one row.
+    // SAFETY: kh < n_kv and p < ctx, so the row is inside the planes; dst +
+    // i < m·n_kv·HEAD <= v.len(). One thread per two values of the row, its
+    // values its warp's two bases plus its lane, both bases multiples of 32,
+    // so each warp holds whole 32-value blocks; the tokens of one launch hold
+    // distinct positions, so no two blocks write one row. The value indices
+    // are summed here, where the key stores share them: summed alone inside
+    // the sink, each would be split into two address adds before inlining,
+    // and the f16 entry's code would move.
     unsafe {
-        *cache_k.get_unchecked_mut(row + i0) = f32_to_f16_bits(y0);
-        *cache_k.get_unchecked_mut(row + i1) = f32_to_f16_bits(y1);
-        *cache_v.get_unchecked_mut(row + i0) = f32_to_f16_bits(*v.get_unchecked(dst + i0));
-        *cache_v.get_unchecked_mut(row + i1) = f32_to_f16_bits(*v.get_unchecked(dst + i1));
-    }
+        sink.append::<HEAD>(
+            kh * ctx as usize + p,
+            (i0, i1),
+            (y0, y1),
+            v,
+            (dst + i0, dst + i1),
+            fault,
+        )
+    };
 }
 
 /// `qdot::nearest_int` on device — ggml's magic-number round to the nearest
@@ -356,163 +374,128 @@ unsafe fn q8_block_warp(
     refused
 }
 
-/// [`norm_partial_append`] with the append quantized to Q8_0 (the module
-/// doc's `_q8` paragraph): everything up to the append is that body's, and
-/// the turned key row and the value row go to the four planes through
-/// [`q8_block_warp`] — lane `lane`'s values `i0` and `i1` sit at `i0 − lane`
-/// and `i1 − lane` over the head, both multiples of 32 (a thread's values are
-/// its warp's two bases plus its lane), so each warp holds whole blocks of
-/// both rows. The launch contract is `norm_partial_append`'s with the f16
-/// planes replaced by the four q8_0 planes.
-///
-/// SAFETY: the entry's launch contract at `(HEAD, ROT)` over the four q8_0
-/// planes, a block of `HEAD/2` threads, and `wsum` this block's `WARPS` f64
-/// of shared memory.
-#[inline(always)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
-)]
-unsafe fn norm_partial_append_q8<const HEAD: usize, const ROT: usize, const WARPS: usize>(
-    gq: &[f32],
-    gk: &[f32],
-    table: &[f32],
-    pos: &[u32],
-    qg: &[f32],
-    v: &[f32],
-    eps: f32,
-    n_head: u32,
-    n_kv: u32,
-    ctx: u32,
-    m: u32,
-    fault: FaultSink,
-    mut q: DisjointSlice<f32>,
-    mut k: DisjointSlice<f32>,
-    mut kq: DisjointSlice<u32>,
-    mut kd: DisjointSlice<u16>,
-    mut vq: DisjointSlice<u32>,
-    mut vd: DisjointSlice<u16>,
-    wsum: *mut f64,
-) {
-    const { assert!(WARPS * 64 == HEAD && ROT.is_multiple_of(2) && ROT <= HEAD) };
-    let heads = (n_head + n_kv) as usize;
-    let b = thread::blockIdx_x() as usize;
-    if b >= m as usize * heads {
-        return; // block-uniform
-    }
-    let t = b / heads;
-    let h = b - t * heads;
-    let tid = thread::threadIdx_x() as usize;
-    let is_q = h < n_head as usize;
-    let kh = h.wrapping_sub(n_head as usize);
-    let (i0, i1) = owned_pair(HEAD, ROT, tid);
-    // The head's first value in its source and in its output.
-    let (src, dst) = if is_q {
-        (
-            (t * n_head as usize + h) * 2 * HEAD,
-            (t * n_head as usize + h) * HEAD,
-        )
-    } else {
-        let at = (t * n_kv as usize + kh) * HEAD;
-        (at, at)
-    };
-    // SAFETY: t < m <= pos.len() by the launch contract.
-    let p = unsafe { *pos.get_unchecked(t) } as usize;
+/// A KV cache format as the appends write it: the f16 planes ([`F16Sink`])
+/// or the Q8_0 planes ([`Q8Sink`]), `n_kv · ctx` rows of `HEAD` values (key
+/// head `kh`'s token at position `p` is row `kh·ctx + p`). The append body
+/// [`norm_partial_append`] is written once over it; its instances differ
+/// only in this one write.
+pub(crate) trait KvSink {
+    /// Values `i0` and `i1` of key row `row` are `y0` and `y1`, and of value
+    /// row `row` `v[x0]` and `v[x1]`.
+    ///
+    /// # Safety
+    /// `row` is a row of the planes, `i0, i1 < HEAD` this thread's alone in
+    /// the launch, `x0, x1 < v.len()`; all 32 lanes of the warp call it
+    /// together, lane `l` with values `b0 + l` and `b1 + l` of two 32-value
+    /// blocks `b0`, `b1` of the row (a Q8_0 block closes inside the warp),
+    /// and no other warp writes those blocks.
+    unsafe fn append<const HEAD: usize>(
+        &mut self,
+        row: usize,
+        i: (usize, usize),
+        y: (f32, f32),
+        v: &[f32],
+        x: (usize, usize),
+        fault: FaultSink,
+    );
+}
 
-    // SAFETY: i0, i1 < HEAD; a query source is inside q+gate row t (m·n_head
-    // ·2·HEAD values by the launch contract), a key inside k (m·n_kv·HEAD).
-    let (x0, x1) = unsafe {
-        if is_q {
-            (*qg.get_unchecked(src + i0), *qg.get_unchecked(src + i1))
-        } else {
-            (
-                *k.get_unchecked_mut(src + i0),
-                *k.get_unchecked_mut(src + i1),
-            )
-        }
-    };
-    let mut acc = f64::from(x0 * x0) + f64::from(x1 * x1);
-    acc += warp::shuffle_xor_f64(acc, 16);
-    acc += warp::shuffle_xor_f64(acc, 8);
-    acc += warp::shuffle_xor_f64(acc, 4);
-    acc += warp::shuffle_xor_f64(acc, 2);
-    acc += warp::shuffle_xor_f64(acc, 1);
-    if warp::lane_id() == 0 {
-        // SAFETY: tid / 32 < WARPS; one lane per warp writes its slot.
-        unsafe { *wsum.add(tid / 32) = acc };
-    }
-    thread::sync_threads();
-    // SAFETY: every slot was written before the barrier above.
-    let mut sum = unsafe { *wsum };
-    for w in 1..WARPS {
-        cuda_device::thread::__unroll_config::<0>();
-        // SAFETY: w < WARPS.
-        sum += unsafe { *wsum.add(w) };
-    }
-    let mean = (sum / HEAD as f64) as f32;
-    let scale = 1.0 / (mean + eps).sqrt();
+/// The f16 planes: each value rounded once to f16, to nearest even.
+pub(crate) struct F16Sink<'a> {
+    pub(crate) k: DisjointSlice<'a, u16>,
+    pub(crate) v: DisjointSlice<'a, u16>,
+}
 
-    if p >= ctx as usize {
-        if tid == 0 {
-            fault.raise(FaultSite::CachePos);
-        }
-        // SAFETY: the output positions of this thread's two values.
+impl KvSink for F16Sink<'_> {
+    #[inline(always)]
+    unsafe fn append<const HEAD: usize>(
+        &mut self,
+        row: usize,
+        (i0, i1): (usize, usize),
+        (y0, y1): (f32, f32),
+        v: &[f32],
+        (x0, x1): (usize, usize),
+        _fault: FaultSink,
+    ) {
+        let row = row * HEAD;
+        // SAFETY: row + HEAD − 1 < n_kv·ctx·HEAD <= the planes' lengths, and
+        // the values are this thread's (the fn's contract).
         unsafe {
-            if is_q {
-                *q.get_unchecked_mut(dst + i0) = f32::NAN;
-                *q.get_unchecked_mut(dst + i1) = f32::NAN;
-            } else {
-                *k.get_unchecked_mut(dst + i0) = f32::NAN;
-                *k.get_unchecked_mut(dst + i1) = f32::NAN;
-            }
+            *self.k.get_unchecked_mut(row + i0) = f32_to_f16_bits(y0);
+            *self.k.get_unchecked_mut(row + i1) = f32_to_f16_bits(y1);
+            *self.v.get_unchecked_mut(row + i0) = f32_to_f16_bits(*v.get_unchecked(x0));
+            *self.v.get_unchecked_mut(row + i1) = f32_to_f16_bits(*v.get_unchecked(x1));
         }
-        return; // block-uniform: p is the token's
     }
-    // SAFETY: i0, i1 < HEAD <= the gain's length.
-    let (g0, g1) = unsafe {
-        let g = if is_q { gq } else { gk };
-        (*g.get_unchecked(i0), *g.get_unchecked(i1))
-    };
-    let n0 = (scale * g0) * x0;
-    let n1 = (scale * g1) * x1;
-    let (y0, y1) = if tid < ROT / 2 {
-        // SAFETY: p < ctx and 2·tid + 1 < ROT: the pair is inside row p of
-        // the table's ctx rows of ROT.
-        let (c, s) = unsafe {
-            (
-                *table.get_unchecked(p * ROT + 2 * tid),
-                *table.get_unchecked(p * ROT + 2 * tid + 1),
-            )
-        };
-        neox_pair(n0, n1, c, s)
-    } else {
-        (n0, n1)
-    };
+}
 
-    if is_q {
-        // SAFETY: the output positions of this thread's two values.
+/// The Q8_0 planes, a codes and a scales plane a side: each warp quantizes
+/// its 32-value blocks through [`q8_block_warp`].
+pub(crate) struct Q8Sink<'a> {
+    pub(crate) kq: DisjointSlice<'a, u32>,
+    pub(crate) kd: DisjointSlice<'a, u16>,
+    pub(crate) vq: DisjointSlice<'a, u32>,
+    pub(crate) vd: DisjointSlice<'a, u16>,
+}
+
+impl KvSink for Q8Sink<'_> {
+    #[inline(always)]
+    unsafe fn append<const HEAD: usize>(
+        &mut self,
+        row: usize,
+        (i0, i1): (usize, usize),
+        (y0, y1): (f32, f32),
+        v: &[f32],
+        (x0, x1): (usize, usize),
+        fault: FaultSink,
+    ) {
+        let lane = warp::lane_id() as usize;
+        // SAFETY: the blocks `i0 − lane` and `i1 − lane` of the row are this
+        // warp's, their code words and scales inside the planes, and the value
+        // reads inside `v` (the fn's contract).
         unsafe {
-            *q.get_unchecked_mut(dst + i0) = y0;
-            *q.get_unchecked_mut(dst + i1) = y1;
+            q8_block_warp(
+                y0,
+                i0 - lane,
+                row,
+                HEAD,
+                lane,
+                &mut self.kq,
+                &mut self.kd,
+                fault,
+            );
+            q8_block_warp(
+                y1,
+                i1 - lane,
+                row,
+                HEAD,
+                lane,
+                &mut self.kq,
+                &mut self.kd,
+                fault,
+            );
+            let (w0, w1) = (*v.get_unchecked(x0), *v.get_unchecked(x1));
+            q8_block_warp(
+                w0,
+                i0 - lane,
+                row,
+                HEAD,
+                lane,
+                &mut self.vq,
+                &mut self.vd,
+                fault,
+            );
+            q8_block_warp(
+                w1,
+                i1 - lane,
+                row,
+                HEAD,
+                lane,
+                &mut self.vq,
+                &mut self.vd,
+                fault,
+            );
         }
-        return;
-    }
-    // SAFETY: the positions read above; this thread owns them.
-    unsafe {
-        *k.get_unchecked_mut(dst + i0) = y0;
-        *k.get_unchecked_mut(dst + i1) = y1;
-    }
-    let row = kh * ctx as usize + p;
-    let lane = warp::lane_id() as usize;
-    // SAFETY: kh < n_kv and p < ctx, so the row is inside the planes; the
-    // value reads stay below m·n_kv·HEAD <= v.len(). The tokens of one launch
-    // hold distinct positions, so no two blocks write one row.
-    unsafe {
-        q8_block_warp(y0, i0 - lane, row, HEAD, lane, &mut kq, &mut kd, fault);
-        q8_block_warp(y1, i1 - lane, row, HEAD, lane, &mut kq, &mut kd, fault);
-        let (w0, w1) = (*v.get_unchecked(dst + i0), *v.get_unchecked(dst + i1));
-        q8_block_warp(w0, i0 - lane, row, HEAD, lane, &mut vq, &mut vd, fault);
-        q8_block_warp(w1, i1 - lane, row, HEAD, lane, &mut vq, &mut vd, fault);
     }
 }
 
@@ -740,9 +723,10 @@ mod rope_neox_kernels {
 
         // SAFETY: WSUM4 is this block's own shared allocation of WARPS_256
         // slots; the raw form reaches it without a reference. The launch
-        // contract is `norm_partial_append`'s at (HEAD_256, ROT_256).
+        // contract is `norm_partial_append`'s at (HEAD_256, ROT_256) over
+        // the f16 planes.
         unsafe {
-            norm_partial_append::<HEAD_256, ROT_256, WARPS_256>(
+            norm_partial_append::<HEAD_256, ROT_256, WARPS_256, _>(
                 gq,
                 gk,
                 table,
@@ -757,8 +741,10 @@ mod rope_neox_kernels {
                 fault,
                 q,
                 k,
-                cache_k,
-                cache_v,
+                F16Sink {
+                    k: cache_k,
+                    v: cache_v,
+                },
                 SharedArray::as_raw_mut_ptr(&raw mut WSUM4),
             )
         };
@@ -953,8 +939,8 @@ mod rope_neox_kernels {
     }
 
     /// [`head_norm_neox_append_256`] with the append quantized to Q8_0 (the
-    /// module doc's `_q8` paragraph): `norm_partial_append_q8` at
-    /// `(HEAD_256, ROT_256)`, the planes `n_kv·ctx·64` code words and
+    /// module doc's `_q8` paragraph): `norm_partial_append` at `(HEAD_256,
+    /// ROT_256)` over [`Q8Sink`], the planes `n_kv·ctx·64` code words and
     /// `n_kv·ctx·8` scales each.
     #[allow(
         clippy::too_many_arguments,
@@ -1004,9 +990,10 @@ mod rope_neox_kernels {
 
         // SAFETY: WSUM4 is this block's own shared allocation of WARPS_256
         // slots; the raw form reaches it without a reference. The launch
-        // contract is `norm_partial_append_q8`'s at (HEAD_256, ROT_256).
+        // contract is `norm_partial_append`'s at (HEAD_256, ROT_256) over
+        // the four Q8_0 planes.
         unsafe {
-            norm_partial_append_q8::<HEAD_256, ROT_256, WARPS_256>(
+            norm_partial_append::<HEAD_256, ROT_256, WARPS_256, _>(
                 gq,
                 gk,
                 table,
@@ -1021,10 +1008,7 @@ mod rope_neox_kernels {
                 fault,
                 q,
                 k,
-                kq,
-                kd,
-                vq,
-                vd,
+                Q8Sink { kq, kd, vq, vd },
                 SharedArray::as_raw_mut_ptr(&raw mut WSUM4),
             )
         };

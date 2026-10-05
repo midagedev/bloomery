@@ -370,7 +370,9 @@ pub(super) struct PrefillFlash<'a> {
 /// The named refusal of a flash a q8_0 cache has no entry for: its reads
 /// serve the eight-head layout's tensor-core passes only (the `_q8`
 /// paragraphs of `flash_gqa` and `flash_gqa_prefill`), and `pass` names the
-/// one asked for.
+/// one asked for. The one owner of that refusal's text: `set_flash_mma`
+/// raises it at the call ([`KvPlanes::serves_scalar`]), and a dispatch
+/// raises it for a combination no load builds.
 fn q8_unserved(what: &'static str, flash: Flash, pass: &str) -> GpuError {
     GpuError::shape(
         what,
@@ -382,6 +384,18 @@ fn q8_unserved(what: &'static str, flash: Flash, pass: &str) -> GpuError {
 }
 
 impl KvPlanes {
+    /// Whether these planes serve the scalar flash pass at the layout
+    /// `flash`: an f16 cache does, and a q8_0 cache's flash is the eight-head
+    /// layout's tensor-core pass only — asking for the scalar pass on it is
+    /// [`q8_unserved`]'s named refusal, raised by the call that asks
+    /// (`set_flash_mma`) before any step dispatches it.
+    pub(super) fn serves_scalar(&self, what: &'static str, flash: Flash) -> Result<(), GpuError> {
+        match self {
+            KvPlanes::F16 { .. } => Ok(()),
+            KvPlanes::Q8 { .. } => Err(q8_unserved(what, flash, "scalar")),
+        }
+    }
+
     /// The layer's planes of `d`'s shape in the `kv` format. Load-time only.
     pub(super) fn new(stream: &CudaStream, d: &Dims, kv: KvQ8) -> Result<KvPlanes, GpuError> {
         Ok(match kv {
