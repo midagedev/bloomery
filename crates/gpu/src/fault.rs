@@ -151,6 +151,16 @@ const _: () = assert!((FaultSite::Logit as u32) < 32);
 const _: () = assert!((FaultSite::DeltaStamp as u32) < 32);
 const _: () = assert!((FaultSite::CandMask as u32) < 32);
 const _: () = assert!((FaultSite::KvQuant as u32) < 32);
+// No site's code is 0, so a raise never stores word 0 with an empty mask:
+// that pair is a head readback's unwritten seed, which `Head::tokens` names
+// as a state error instead of decoding as a fault.
+const _: () = {
+    let mut i = 0;
+    while i < FaultSite::ALL.len() {
+        assert!(FaultSite::ALL[i] as u32 >= 1, "a FaultSite code is 0");
+        i += 1;
+    }
+};
 
 impl FaultSite {
     /// Every site, in code order.
@@ -862,6 +872,17 @@ mod tests {
         let past = FaultSite::ALL.iter().map(|&s| s as u32).max().unwrap_or(0) + 1;
         let odd = Fault::from_words((3 << 8) | 1, (1 << 1) | (1 << past)).unwrap();
         assert!(odd.to_string().contains(&format!("code {past}")), "{odd}");
+    }
+
+    /// The (0, 0) pair no raise can store still decodes — every site's code
+    /// is 1 or more, and a raise ORs its bit into the mask — into a code no
+    /// site names: why `Head::tokens` refuses that pair as an unwritten
+    /// readback before it decodes one.
+    #[test]
+    fn the_zero_pair_decodes_to_a_code_no_site_names() {
+        let phantom = Fault::from_words(0, 0).unwrap();
+        assert_eq!((phantom.layer, phantom.code, phantom.sites), (0, 0, 0));
+        assert_eq!(phantom.site(), None);
     }
 
     #[test]

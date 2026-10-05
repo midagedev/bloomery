@@ -130,6 +130,24 @@ enum Final {
     Mixed,
 }
 
+/// Refuse the fault pair at the end of a head readback. The seeded (0, 0)
+/// pair names a readback no argmax ever wrote — no `FaultSite` code is 0,
+/// and a raise always ORs its bit into the mask, so no launch can store it —
+/// and is a state error, not a fault; every other pair is
+/// [`Fault::from_words`]'s answer, a raised pair [`GpuError::Fault`].
+fn refuse_readback_fault(word: u32, sites: u32) -> Result<(), GpuError> {
+    if word == 0 && sites == 0 {
+        return Err(GpuError::state(
+            "Head::tokens",
+            "the head's readback was never written: no argmax launched for this row",
+        ));
+    }
+    if let Some(fault) = Fault::from_words(word, sites) {
+        return Err(GpuError::fault("Head::tokens", fault));
+    }
+    Ok(())
+}
+
 /// Enqueue the final norm `fin` names over `m` rows of `hidden` in `x`
 /// and return the rows the projection reads: its normed rows, or `x` itself.
 fn norm_rows<'a>(
@@ -166,7 +184,9 @@ pub struct Head {
     act: Q8Act,
     logits: DeviceBuffer<f32>,
     /// The `m` argmax tokens, then the fault's first-layer word and that
-    /// layer's site mask as the argmax found them.
+    /// layer's site mask as the argmax found them. Seeded with the (0, 0)
+    /// pair, which no raise can store: `tokens` refuses that pair as an
+    /// unwritten readback rather than decode it as a fault.
     token_out: DeviceBuffer<u32>,
     /// The ticket count of a Q8_0 head of `m > 1` rows (its argmax's blocks
     /// each draw one), zero between launches; `None` for every other head.
@@ -454,7 +474,8 @@ impl Head {
     }
 
     /// The argmax tokens of the last run, one per row. Blocking read; a
-    /// raised fault is [`GpuError::Fault`], as [`Head::token`].
+    /// raised fault is [`GpuError::Fault`], and a readback no argmax ever
+    /// wrote a state error, as [`Head::token`].
     pub fn tokens(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
         let mut out = self.token_out.to_host_vec(gpu.stream())?;
         let (Some(sites), Some(word)) = (out.pop(), out.pop()) else {
@@ -463,9 +484,40 @@ impl Head {
                 "the readback buffer holds no fault words",
             ));
         };
-        if let Some(fault) = Fault::from_words(word, sites) {
-            return Err(GpuError::fault("Head::tokens", fault));
-        }
+        refuse_readback_fault(word, sites)?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fault::{FAULT_NONE, FaultSite};
+
+    /// The readback's seeded (0, 0) pair is an unwritten readback, not a
+    /// fault: the error names the state, with no device fault in it.
+    #[test]
+    fn an_unwritten_readback_pair_is_a_state_error_not_a_fault() {
+        let err = refuse_readback_fault(0, 0).unwrap_err();
+        assert!(
+            matches!(err, GpuError::State { .. }),
+            "want a state error for the unwritten pair, got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Head::tokens: the head's readback was never written: no argmax launched for this row"
+        );
+    }
+
+    /// A raised pair still refuses as the fault it names, and a clean word
+    /// passes.
+    #[test]
+    fn a_raised_readback_pair_still_refuses_as_its_fault() {
+        let fault = Fault::at(3, FaultSite::CachePos);
+        match refuse_readback_fault(fault.word(), fault.sites) {
+            Err(GpuError::Fault { fault: raised, .. }) => assert_eq!(raised, fault),
+            other => panic!("want the raised fault, got {other:?}"),
+        }
+        assert!(refuse_readback_fault(FAULT_NONE, 0).is_ok());
     }
 }
