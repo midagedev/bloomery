@@ -673,12 +673,38 @@ impl Embedding {
     /// Row `token`, dequantized and repeated into the four streams; a token
     /// past the vocabulary is refused by name.
     fn fill(&mut self, token: u32) -> Result<(), GpuError> {
+        // The row is taken out for the read: `row_into` borrows the whole
+        // embedding over the file, so it cannot fill the row in place.
+        let mut row = std::mem::take(&mut self.row);
+        let read = self.row_into(token, &mut row);
+        self.row = row;
+        read?;
+        for s in self.streams.chunks_exact_mut(self.row.len()) {
+            s.copy_from_slice(&self.row);
+        }
+        Ok(())
+    }
+
+    /// Row `token` into `out`'s chunks, its first chunk the row, one a
+    /// stream; a token past the vocabulary is refused by name.
+    fn fill_row(&self, token: u32, out: &mut [f32]) -> Result<(), GpuError> {
+        let (first, rest) = out.split_at_mut(self.row.len());
+        self.row_into(token, first)?;
+        for s in rest.chunks_exact_mut(first.len()) {
+            s.copy_from_slice(first);
+        }
+        Ok(())
+    }
+
+    /// Token `token`'s embedding row into `out`, one copy; a token past the
+    /// vocabulary is refused by name.
+    fn row_into(&self, token: u32, out: &mut [f32]) -> Result<(), GpuError> {
         let t = token as usize;
         if t >= self.n_vocab {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!("token {token} is past the {} embedding rows", self.n_vocab),
-            });
+            return Err(shape(format!(
+                "token {token} is past the {} embedding rows",
+                self.n_vocab
+            )));
         }
         let data = self
             .file
@@ -689,10 +715,7 @@ impl Embedding {
             })?
             .data(&self.info)?;
         let src = &data[t * self.row_bytes..][..self.row_bytes];
-        dequant_row(GgmlType::Q8_0, src, &mut self.row).map_err(model::ModelError::from)?;
-        for s in self.streams.chunks_exact_mut(self.row.len()) {
-            s.copy_from_slice(&self.row);
-        }
+        dequant_row(GgmlType::Q8_0, src, out).map_err(model::ModelError::from)?;
         Ok(())
     }
 }

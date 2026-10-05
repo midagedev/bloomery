@@ -67,9 +67,7 @@ use runtime::layer::{FfnKind, Layer, MixerKind};
 use runtime::sched::{At, Overlap, Port, PortKind};
 
 use super::prefill::PromptState;
-use super::{
-    Body, Dims, Embedding, Kernels, LANES, RowScratch, Scratch, f32t, f32v, gemv, q8, weight,
-};
+use super::{Body, Dims, Kernels, LANES, RowScratch, Scratch, f32t, f32v, gemv, q8, weight};
 use crate::mla::{self, LatentStore};
 use crate::tensors::{FfnNames, LatentNames, LayerNames, MixerNames};
 
@@ -767,7 +765,7 @@ fn enqueue_hidden(
 /// resume that arena holds no position, and a walk that names it is refused.
 #[derive(Clone, Debug)]
 pub struct DraftRows {
-    held: u32,
+    held: usize,
     step: (Held, Vec<f32>),
     pair: (Held, Vec<f32>),
 }
@@ -853,7 +851,7 @@ impl Body {
         let pair_rows = [&nx.pair0, &self.s.rows[1].streams[fin]];
         let pair = read_rows(stream, self.wrote.pair, &pair_rows, wide)?;
         Ok(Some(DraftRows {
-            held: nx.held as u32,
+            held: nx.held,
             step,
             pair,
         }))
@@ -869,7 +867,7 @@ impl Body {
                 "the NextN rows of a state put back on a load without the layer".into(),
             ));
         }
-        if d.held > pos {
+        if d.held > pos as usize {
             return Err(shape(format!(
                 "a NextN store of {} positions put back at {pos}",
                 d.held
@@ -912,7 +910,7 @@ impl Body {
         write_rows(stream, &d.step.1, &mut [&mut s.rows[0].streams[fin]], wide)?;
         let mut pair_rows = [&mut nx.pair0, &mut s.rows[1].streams[fin]];
         write_rows(stream, &d.pair.1, &mut pair_rows, wide)?;
-        nx.held = d.held as usize;
+        nx.held = d.held;
         *wrote = Wrote {
             step: d.step.0,
             pair: d.pair.0,
@@ -1023,11 +1021,11 @@ impl Body {
         } = nx;
         // The rows' embeddings and positions.
         for t in 0..m {
-            let p = pos0 + t;
+            let p = u32::try_from(pos0 + t).expect("a walk's positions are under the store's rows");
             let e = &mut a.e_host[t * n..(t + 1) * n];
             embd.row_into(feed.tokens[t], e)?;
-            a.pos_host[t] = p as u32;
-            a.cnt_host[t] = p as u32 + 1;
+            a.pos_host[t] = p;
+            a.cnt_host[t] = p + 1;
         }
         span_mut(WHAT, &mut a.emb, 0, m * n)?.copy_from_host(stream, &a.e_host[..m * n])?;
         span_mut(WHAT, &mut a.pos, 0, m)?.copy_from_host(stream, &a.pos_host[..m])?;
@@ -1136,7 +1134,7 @@ impl Body {
         }
         // The full part, the last row alone.
         let r = m - 1;
-        let p = (pos0 + r) as u32;
+        let p = u32::try_from(pos0 + r).expect("a walk's positions are under the store's rows");
         row.x
             .copy_from_device_async(&*span(WHAT, &a.x, r * n, n)?, stream)?;
         row.pos.copy_from_host(stream, &[p])?;
@@ -1435,30 +1433,4 @@ pub fn nextn_store(m: &mut GpuModel<Body>, n: usize) -> Result<(Vec<u16>, Vec<u1
     lat.truncate(n * LATENT);
     idx.truncate(n * INDEX_ROW);
     Ok((lat, idx))
-}
-
-impl Embedding {
-    /// Token `token`'s embedding row into `out`, one copy; a token past the
-    /// vocabulary is refused by name.
-    pub(super) fn row_into(&self, token: u32, out: &mut [f32]) -> Result<(), GpuError> {
-        let t = token as usize;
-        if t >= self.n_vocab {
-            return Err(shape(format!(
-                "token {token} is past the {} embedding rows",
-                self.n_vocab
-            )));
-        }
-        let data = self
-            .file
-            .shard(self.shard)
-            .ok_or(GpuError::State {
-                what: WHAT,
-                missing: "the embedding's shard",
-            })?
-            .data(&self.info)?;
-        let src = &data[t * self.row_bytes..][..self.row_bytes];
-        gguf::quant::dequant_row(gguf::GgmlType::Q8_0, src, out)
-            .map_err(model::ModelError::from)?;
-        Ok(())
-    }
 }

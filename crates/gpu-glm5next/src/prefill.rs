@@ -116,8 +116,6 @@ use bloomery_gpu_deepseek41::hc::{
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::DeviceBuffer;
-use gguf::GgmlType;
-use gguf::quant::dequant_row;
 use model::arch::glm5next::names::Sub;
 use model::arch::glm5next::place::{self, FrontWidths};
 use model::moe::UNION_MAX_COLS;
@@ -127,8 +125,7 @@ use runtime::swaprule::KeptRows;
 
 use super::nextn::GlmArena;
 use super::{
-    Body, Dims, Embedding, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape,
-    weight,
+    Body, Dims, Glm5nextModel, Parts, Store, copied, f32t, f32v, prompt, q8, shape, weight,
 };
 use crate::ffn::{self, CardRows, CardTiles};
 use crate::gemm::{DenseNames, FrontShape, GemmFront, KdaInNames, KdaInRows, LatentInRows};
@@ -760,14 +757,15 @@ fn chunks(t: usize) -> impl Iterator<Item = (usize, usize)> {
 /// once, so a short last batch would pay that read for few tokens.
 #[must_use]
 pub fn call_batches(from: u32, to: u32, marks: &[u32]) -> Vec<Range<u32>> {
+    let t_max = u32::try_from(T_MAX).expect("T_MAX is the host union's column count");
     let mut out = Vec::new();
     let mut at = from;
     for &mark in marks.iter().filter(|&&k| k > from && k <= to) {
-        let len = (mark - at) as usize;
-        let k = len.div_ceil(T_MAX);
+        let len = mark - at;
+        let k = len.div_ceil(t_max);
         let mut p = at;
         for j in 0..k {
-            let n = (len / k + usize::from(j < len % k)) as u32;
+            let n = len / k + u32::from(j < len % k);
             out.push(p..p + n);
             p += n;
         }
@@ -1642,7 +1640,7 @@ impl Body {
                 .iter()
                 .zip(rows.chunks_exact_mut(HC_STREAMS * n))
             {
-                fill_row(embd, token, r)?;
+                embd.fill_row(token, r)?;
             }
             for i in 0..t {
                 let p = p0 + i as u32;
@@ -1745,33 +1743,6 @@ fn kda_store_index(stores: &[Store]) -> Vec<Option<usize>> {
             Store::Latent { .. } => None,
         })
         .collect()
-}
-
-/// Token `token`'s embedding row into `out`, four copies, one a stream; a
-/// token past the vocabulary is refused by name.
-fn fill_row(e: &Embedding, token: u32, out: &mut [f32]) -> Result<(), GpuError> {
-    let t = token as usize;
-    if t >= e.n_vocab {
-        return Err(shape(format!(
-            "token {token} is past the {} embedding rows",
-            e.n_vocab
-        )));
-    }
-    let data = e
-        .file
-        .shard(e.shard)
-        .ok_or(GpuError::State {
-            what: WHAT,
-            missing: "the embedding's shard",
-        })?
-        .data(&e.info)?;
-    let src = &data[t * e.row_bytes..][..e.row_bytes];
-    let (first, rest) = out.split_at_mut(e.row.len());
-    dequant_row(GgmlType::Q8_0, src, first).map_err(model::ModelError::from)?;
-    for s in rest.chunks_exact_mut(first.len()) {
-        s.copy_from_slice(first);
-    }
-    Ok(())
 }
 
 /// `y = W · x` for the q8_0 weight `name` over `c` token columns of `x`,
