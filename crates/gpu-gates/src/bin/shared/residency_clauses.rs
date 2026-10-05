@@ -111,6 +111,15 @@ pub fn static_row0<B: Prompt + Keep>(
         }
     }
     let same = row0.len() == p.row0.len() && off == 0;
+    let lens = if row0.len() == p.row0.len() {
+        String::new()
+    } else {
+        format!(
+            "; {} entries against the probe's {}",
+            row0.len(),
+            p.row0.len()
+        )
+    };
     let quiet = p.quiet();
     let ok = quiet && no_machine && sets.set == 0 && same;
     let boundaries: Vec<String> = p
@@ -129,7 +138,7 @@ pub fn static_row0<B: Prompt + Keep>(
          the card), boundaries since the seat's reset [{}] (no landing before row 0: {quiet}); \
          a static load of that copy in {load_s:.1} s (no machine: {no_machine}; {} experts off \
          its sets, {} at another slot): row 0 bit for bit {same} ({off} of {} entries differ, \
-         max {max}): {}",
+         max {max}{lens}): {}",
         p.ids.len(),
         p.table.on_card(),
         boundaries.join(" "),
