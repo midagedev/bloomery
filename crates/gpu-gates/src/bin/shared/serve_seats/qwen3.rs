@@ -54,7 +54,7 @@
 //! (`app::Keep` — a qwen3moe file's [`Body`] grants every held position,
 //! the caches being per-position; a qwen35moe file's [`Body35`] grants the
 //! nearest checkpoint a marked prompt call took at or below the ask, every
-//! 512 positions and each call's end, and its prompt calls take those
+//! ubatch of positions and each call's end, and its prompt calls take those
 //! checkpoints), so the resend of a conversation keeps everything up to
 //! where it diverges and a request that extends the held sequence keeps all
 //! of it. The prompt call runs the ubatch walk from
@@ -67,46 +67,46 @@
 //! to stderr (`record::BLOOMERY_SERVE_QWEN3`). An engine error ends the
 //! process with the crash block and exit code 70, as every seat's.
 //!
-//! `--parallel N` (`-np N`, default 2) serves N slots. A qwen3moe file's
-//! are N resident sequences inside the one model (`GpuModel::add_slots` on
-//! the session), the context split across them as llama-server splits it
-//! with `-np N` and no `-kvu`: the `--ctx` the flags named (or the auto
-//! choice when unset) is the total, each slot `total / N` rows rounded down
-//! — a cache row is the granularity, so the floor is exact, and N slots
-//! never hold more rows than the one-sequence load — and `--parallel N` is
-//! the slot count itself, the split's bytes the bound. A whole-card load
-//! and a placed one — under `--place`, or the plan a run without it falls to
-//! when the whole file does not fit the card's free bytes — split alike:
-//! what the file loads as is decided once, before the open, at the total
-//! (the whole-fit verdict there, or the placed plan made there, whose card
-//! bytes count every slot's rows), and the open makes no fit call of its
-//! own, so a total whose whole load does not fit never opens whole because
-//! one slot's share would. A placed open holds the slots' cache to the
-//! plan's KV term by name and prints both (`q3place::open_qwen3_slots`).
+//! `--parallel N` (`-np N`, default 2) serves N slots, on both files N
+//! resident sequences inside the one model (`GpuModel::add_slots` on the
+//! session: a qwen3moe file's per-position caches, a qwen35moe file's
+//! `Slot35` — its K/V planes, its delta layers' recurrent states and conv
+//! rings, its held count and its checkpoints), the context split across them
+//! as llama-server splits it with `-np N` and no `-kvu`: the `--ctx` the
+//! flags named (or the auto choice when unset) is the total, each slot
+//! `total / N` rows rounded down — a cache row is the granularity, so the
+//! floor is exact, and N slots never hold more rows than the one-sequence
+//! load — and `--parallel N` is the slot count itself, the split's bytes the
+//! bound. A whole-card load and a placed one — under `--place`, or the plan a
+//! run without it falls to when the whole file does not fit the card's free
+//! bytes — split alike: what the file loads as is decided once, before the
+//! open, at the total (the whole-fit verdict there, which counts every
+//! slot's stores at its share, or the placed plan made there, whose card
+//! bytes count every slot's rows and, past the live slot, every other slot's
+//! fixed stores as the `resident slots` reserve), and the open makes no fit
+//! call of its own, so a total whose whole load does not fit never opens
+//! whole because one slot's share would. A placed open holds the slots'
+//! stores to what the plan counts for them by name and prints both
+//! (`q3place::open_qwen3_slots`, `q3place::open_qwen35_slots`). A qwen35moe
+//! sequence's checkpoints pin host bytes, up to `runtime::seqstate`'s
+//! `HOST_BUDGET` a sequence: a placed plan carries every sequence's as its
+//! host's `checkpoints` reserve, and a whole-card load, which has no host
+//! plan, is refused by name before it loads when the host's available bytes
+//! do not hold them (`q3place::checkpoints_fit`, one stderr line either way).
 //! One token a slot a round, the sequences switched by pointer exchange, no
 //! park and no re-prefill; the engine is the seat's own (`SeatEngine`), and
-//! the server steps every running slot in one call — a whole-card load's
-//! rounds one pass of the busy rows (`GpuModel::step_slots`, every row-wise
-//! launch once over them all), a placed load's a select and a step a row
-//! (the seat's fallback loop). Under `BLOOMERY_STEP_STATS=1` each round of
-//! several slots prints a `slots round` record naming its command, rows,
-//! passes and the slots the seat serves. `--parallel 1` is
-//! exactly the one-sequence server. A qwen35moe file's slots take its one
-//! sequence in turns (`serve::SwapEngine`) over the whole context, until its
-//! body holds resident sequences. Under
-//! the turns the default's second slot costs a lone request nothing — the
-//! turns act only on a second arrival, and an idle slot the engine left
-//! holds nothing, so a lone request stays on the engine's slot — and
-//! `--parallel 1` keeps the plain engine: a request that
-//! arrives while another decodes preempts it at the next step, the live
-//! requests then take turns of `serve::QUANTUM` tokens, and a preempted
-//! request comes back by the re-prefill fallback — the engine reset to
-//! position 0 and its held ids fed again before it steps
-//! (`serve::Park::Ids`; the seat holds no snapshot to park, and a kept
-//! prefix does not survive another slot's rows over the cache), the ids it
-//! feeds again counted in `/metrics`. `--queue-depth Q` bounds the requests
-//! that wait for a slot; `--park-ram` is refused by name: neither the turns'
-//! park nor the resident slots hold a state the flag could budget.
+//! the server steps every running slot in one call — one pass of the busy
+//! rows on a whole-card load of a body that runs several slots' rows as one
+//! pass (a qwen3moe file's `Body`, `GpuModel::step_slots`, every row-wise
+//! launch once over them all), else a select and a step a row (the seat's
+//! fallback loop): a placed load's, and a qwen35moe file's, whose `Body35`
+//! has no `SlotRows` yet — one pass of its slots is that body's next item,
+//! not the seat's. Under `BLOOMERY_STEP_STATS=1` each round of several slots
+//! prints a `slots round` record naming its command, rows, passes and the
+//! slots the seat serves. `--parallel 1` is exactly the one-sequence server.
+//! `--queue-depth Q` bounds the requests that wait for a slot; `--park-ram`
+//! is refused by name: the resident slots hold no parked state the flag
+//! could budget.
 //!
 //! The seat sits behind the `deepseek41` feature, the server surface's
 //! scope (`bind`, the `serve` and `sampler` crates); it runs no V4.1 code;
@@ -120,12 +120,12 @@ use std::time::Instant;
 #[path = "../qwen3moe_place.rs"]
 mod q3place;
 use app::arch::qwen3moe::GEMM_FROM;
-use q3place::PlaceQ3;
+use q3place::{PlaceQ3, Seqs};
 
 use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
-use bloomery_gpu::model::{ChainBody, GpuModel, MAX_PASS_ROWS, StepMode};
+use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::bind::{
     Seat, SeatEngine, SlotStep, Vocab, sampler_factory, step_rows_in_turn,
@@ -139,8 +139,7 @@ use model::arch::Arch;
 use model::placement::PlanLevers;
 use runtime::Target as _;
 use serve::{
-    CacheNote, Engine, EngineProps, FATAL_LINGER, Park, Saved, ServeError, Server, ServerConfig,
-    SlotConfig, SwapEngine,
+    CacheNote, EngineProps, FATAL_LINGER, Saved, ServeError, Server, ServerConfig, SlotConfig,
 };
 use tokenizer::Tokenizer;
 
@@ -165,12 +164,13 @@ const CTX: usize = 4096;
 /// context whose plan keeps the card experts the [`CTX`]-floor's plan keeps,
 /// so the solver's context-for-experts trade never sits below the floor's
 /// split, and whose whole load the verdict takes when that plan keeps every
-/// expert on the card (the load then opens whole). On a qwen3moe file the
-/// verdict counts the cache of all `parallel` resident sequences, each at
-/// its share of the answer (`q3place::kv_bytes`); a qwen35moe file's holds
-/// the one sequence its slots take turns over. One line names the answer, at the floor or past it, and every
-/// search one line more: its probes and the census readings it took
-/// ([`searched_line`]).
+/// expert on the card (the load then opens whole). The verdict counts the
+/// stores of all `parallel` resident sequences, each at its share of the
+/// answer (`q3place::kv_bytes`: a qwen35moe file's delta layers' fixed
+/// stores once a slot), and a qwen35moe file's plans carry its sequences'
+/// rows ([`seqs35`]). One line names the answer, at the floor or past it,
+/// and every search one line more: its probes and the census readings it
+/// took ([`searched_line`]).
 fn default_ctx(
     split: &Split,
     arch: Arch,
@@ -189,15 +189,14 @@ fn default_ctx(
             Arch::Qwen3moe => {
                 q3place::placed_ctx_qwen3(split, place, CTX, &plan_levers, parallel, kv)?
             }
-            Arch::Qwen35moe => {
-                let o = Open35 {
-                    ctx: CTX,
-                    mma: true,
-                    ubatch: ubatch_size()?,
-                    kv,
-                };
-                q3place::placed_ctx_qwen35(split, &o, place, CTX, &plan_levers)?
-            }
+            Arch::Qwen35moe => q3place::placed_ctx_qwen35(
+                split,
+                &open35(CTX, kv)?,
+                place,
+                CTX,
+                &plan_levers,
+                seqs35(parallel),
+            )?,
             _ => None,
         };
         searched_line("placed", before);
@@ -230,15 +229,7 @@ fn default_ctx(
     let before = q3place::reads();
     let searched = match arch {
         Arch::Qwen3moe => q3place::whole_ctx_qwen3(split, CTX, parallel, kv)?,
-        Arch::Qwen35moe => {
-            let o = Open35 {
-                ctx: CTX,
-                mma: true,
-                ubatch: ubatch_size()?,
-                kv,
-            };
-            q3place::whole_ctx_qwen35(split, &o, CTX)?
-        }
+        Arch::Qwen35moe => q3place::whole_ctx_qwen35(split, &open35(CTX, kv)?, CTX, parallel)?,
         _ => None,
     };
     searched_line("whole", before);
@@ -272,6 +263,28 @@ fn searched_line(kind: &str, before: q3place::Reads) {
     );
 }
 
+/// What a qwen35moe file's load opens at with a `ctx`-row cache: the
+/// tensor-core decode flash, the levers' ubatch and the `kv` planes, as
+/// `generate_qwen3moe` opens it.
+fn open35(ctx: usize, kv: KvQ8) -> Result<Open35, GateError> {
+    Ok(Open35 {
+        ctx,
+        mma: true,
+        ubatch: ubatch_size()?,
+        kv,
+    })
+}
+
+/// A qwen35moe file's `parallel` resident sequences: each takes the
+/// checkpoints the seat's kept prefixes come back to ([`Body3::open`] arms
+/// them), so each pins its own on the host.
+fn seqs35(parallel: usize) -> Seqs {
+    Seqs {
+        slots: parallel,
+        checkpoints: true,
+    }
+}
+
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the qwen3 seat runs no prompt cache";
 
@@ -283,8 +296,8 @@ struct Args {
     /// `--cache-type-k`: the K/V planes' format (llama-server's spelling),
     /// over the `BLOOMERY_QWEN3_KV` lever's word when given.
     cache_type_k: Option<String>,
-    /// `--parallel`: the slots the server serves — resident sequences on a
-    /// qwen3moe file's load, turns over one sequence on a qwen35moe file's.
+    /// `--parallel`: the slots the server serves, resident sequences on
+    /// either file's load.
     parallel: usize,
     queue_depth: Option<usize>,
 }
@@ -309,14 +322,11 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: None,
         place: None,
         cache_type_k: None,
-        // The fixed default, not an elastic one: a qwen3moe file's second
-        // slot is a resident sequence the context split bounds (no byte
-        // budget to size it from), a qwen35moe file's a turn over the one
-        // sequence (the park holds ids only, `Park::Ids` — a state to park
-        // is a seat that saves one). A lone request pays nothing for the
-        // second either way: the resident slots sit parked empty, and the
-        // turns act only on a second arrival; `--parallel 1` keeps the
-        // plain engine.
+        // The fixed default, not an elastic one: the second slot is a
+        // resident sequence the context split bounds (no byte budget to size
+        // it from). A lone request pays nothing for it beyond its share of
+        // the context: the other slot sits parked empty; `--parallel 1`
+        // keeps the one sequence.
         parallel: 2,
         queue_depth: None,
     };
@@ -363,8 +373,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--park-ram" => {
                 return Err(
                     "--park-ram names a budget of parked states; the qwen3 seat parks none — \
-                     its resident slots keep their sequences on the card, and its turns park \
-                     each slot's ids and re-prefill them on its return — so it reads no budget"
+                     its resident slots keep their sequences on the card — so it reads no budget"
                         .into(),
                 );
             }
@@ -375,22 +384,25 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 }
 
 /// One of the two bodies the seat serves, opened as `generate_qwen3moe`
-/// opens it, its prompt schedule and its keep rule.
-trait Body3: ChainBody + Sized + 'static {
+/// opens it, its prompt schedule and its keep rule. Both hold resident
+/// sequences ([`Slots`]): the session adds and selects them alike.
+trait Body3: Slots<Seq: 'static> + Sized + 'static {
     /// The file's `general.architecture`, as the `load` record names it.
     const ARCH: &'static str;
-    /// What the open loads by beside the file and its rows: what the seat
-    /// decided before the open ([`Q3Load`], a qwen3moe file's), or the
-    /// placement word the open decides by itself (a qwen35moe file's).
-    type By: Send + 'static;
-    /// The model of `file` with a `ctx`-row cache by `by`, for `slots`
-    /// sequences of that shape, the `plan` record on stderr first when a
-    /// plan loads it.
+    /// Whether the body runs several slots' rows as one pass on a
+    /// whole-card load (`SlotRows`): `Body` (a qwen3moe file) does, through
+    /// [`Body3::one_pass_round`]; `Body35` (a qwen35moe file) has no
+    /// `SlotRows` yet, so its rounds take the seat's fallback loop — one
+    /// pass of its slots is that body's next item.
+    const ONE_PASS: bool = false;
+    /// The model of `file` with a `ctx`-row cache by `load`, decided before
+    /// the open at the total its `slots` sequences of that shape split
+    /// ([`decide`]), the `plan` record on stderr first when a plan loads it.
     fn open(
         file: Split,
         ctx: usize,
         slots: usize,
-        by: Self::By,
+        load: Q3Load,
         levers: &Levers,
         kv: KvQ8,
     ) -> Result<GpuModel<Self>, GateError>;
@@ -414,31 +426,13 @@ trait Body3: ChainBody + Sized + 'static {
     /// the cut makes still holds what the body's prompt schedule treats as
     /// one whole call; empty where the body cuts nowhere.
     fn splits(first: usize, end: usize, marks: &[usize]) -> Vec<usize>;
-    /// The session's model serving `n` resident sequences
-    /// (`app::Session::add_slots`): N sequences over one set of weights,
-    /// switched by pointer exchange. `Body` (a qwen3moe file) serves them;
-    /// `Body35` (a qwen35moe file) refuses by name — its body parks no
-    /// sequence yet, so its slots keep taking the engine in turns.
-    fn add_slots(s: &mut app::Session<Self>, n: usize) -> Result<(), GateError>;
-    /// The session's slot every later call acts on
-    /// (`app::Session::select_slot`). `Body35` refuses by name, as
-    /// [`Body3::add_slots`] does.
-    fn select_slot(s: &mut app::Session<Self>, slot: usize) -> Result<(), GateError>;
-    /// The resident sequences the session's model serves
-    /// (`app::Session::slots`): a qwen3moe file's `--parallel`, one on a
-    /// qwen35moe file's, whose body parks no sequence.
-    fn slots(s: &app::Session<Self>) -> usize {
-        let _ = s;
-        1
-    }
     /// One round of several slots' steps as one pass of the busy rows
     /// ([`Q3::step_slots`]'s one-pass arm), each row's answer into `next`
     /// and each lent logits row filled; the passes it ran back. Refused by
-    /// the default: only a body that runs several slots' rows as one pass
-    /// on a whole-card load takes it — `Body` (a qwen3moe file), through
-    /// [`super::rounds::step_rows_one_pass`]; `Body35` (a qwen35moe file) keeps the
-    /// refusal, its seat serving slot 0 alone (no round of several slots
-    /// ever reaches it).
+    /// the default: only a body of [`Body3::ONE_PASS`] takes it — `Body` (a
+    /// qwen3moe file), through [`super::rounds::step_rows_one_pass`];
+    /// `Body35` (a qwen35moe file) keeps the refusal, which no round reaches
+    /// (the seat decides at its open from [`Body3::ONE_PASS`]).
     fn one_pass_round(
         s: &mut app::Session<Self>,
         rows: &mut [SlotStep],
@@ -450,7 +444,7 @@ trait Body3: ChainBody + Sized + 'static {
 
 impl Body3 for Body {
     const ARCH: &'static str = "qwen3moe";
-    type By = Q3Load;
+    const ONE_PASS: bool = true;
 
     /// As `load` decided before the open, making no fit call of its own: the
     /// whole model on device 0, or the placed plan made at the total, its
@@ -516,22 +510,6 @@ impl Body3 for Body {
         Vec::new()
     }
 
-    /// The session's resident sequences, the body's own
-    /// (`impl Slots for Body`).
-    fn add_slots(s: &mut app::Session<Body>, n: usize) -> Result<(), GateError> {
-        Ok(s.add_slots(n)?)
-    }
-
-    /// The session's slot ([`app::Session::select_slot`]).
-    fn select_slot(s: &mut app::Session<Body>, slot: usize) -> Result<(), GateError> {
-        Ok(s.select_slot(slot)?)
-    }
-
-    /// The session's resident sequences (`app::Session::slots`).
-    fn slots(s: &app::Session<Body>) -> usize {
-        s.slots()
-    }
-
     /// The busy rows as one pass ([`super::rounds::step_rows_one_pass`]).
     fn one_pass_round(
         s: &mut app::Session<Body>,
@@ -543,34 +521,26 @@ impl Body3 for Body {
 
 impl Body3 for Body35 {
     const ARCH: &'static str = "qwen35moe";
-    type By = Option<Place>;
 
-    /// On device 0 — the whole-card load while that fits the card's free
-    /// bytes at `ctx`, else the placed plan on `a`'s card with its why
-    /// (`q3place::open_unplaced_qwen35`) — or under `place` by its plan. One
-    /// sequence: the body parks none, so its slots take turns and `slots`
-    /// is 1.
+    /// As `load` decided before the open, making no fit call of its own: the
+    /// whole model on device 0, or the placed plan made at the total, its
+    /// machine carrying the sequences' rows, its load holding a sequence of
+    /// `ctx` rows for each of `slots` (`q3place::open_qwen35_slots`).
     fn open(
         file: Split,
         ctx: usize,
-        _slots: usize,
-        place: Option<Place>,
+        slots: usize,
+        load: Q3Load,
         levers: &Levers,
         kv: KvQ8,
     ) -> Result<Qwen35moeModel, GateError> {
-        let o = Open35 {
-            ctx,
-            mma: true,
-            ubatch: ubatch_size()?,
-            kv,
-        };
-        let mut m = match place {
-            None => q3place::open_unplaced_qwen35(file, o, levers, Record::eprint)?,
-            Some(p) => {
-                let q = PlaceQ3::qwen35(&file, p, o)?;
-                let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
-                q.record(&plan, None).eprint();
-                q3place::open_qwen35(file, &plan, o, levers.host())?
+        let o = open35(ctx, kv)?;
+        let mut m = match load {
+            Q3Load::Whole => Qwen35moeModel::open(Gpu::new()?, file, o)?,
+            Q3Load::Placed { q, total, why } => {
+                let plan = q.plan(total, &PlanLevers::from_levers(levers)?)?;
+                q.record(&plan, why).eprint();
+                q3place::open_qwen35_slots(file, &plan, slots, o, levers.host())?
             }
         };
         // The seat keeps prefixes, so its prompt calls take the checkpoints
@@ -634,21 +604,6 @@ impl Body3 for Body35 {
         }
         at
     }
-
-    /// Refused by name: the qwen35moe body parks no sequence, so its slots
-    /// take the engine in turns (the module doc's qwen35moe half).
-    fn add_slots(_s: &mut app::Session<Body35>, _n: usize) -> Result<(), GateError> {
-        Err(
-            "--parallel: the qwen35moe body holds one sequence; its slots take the engine in \
-             turns (resident slots are the qwen3moe body's)"
-                .into(),
-        )
-    }
-
-    /// Refused by name, as [`Body3::add_slots`] is.
-    fn select_slot(_s: &mut app::Session<Body35>, _slot: usize) -> Result<(), GateError> {
-        Err("slot: the qwen35moe seat serves slot 0 alone".into())
-    }
 }
 
 /// The session on the engine thread, the positions its cache was sized
@@ -659,17 +614,18 @@ struct Q3<B: Body3> {
     ctx: usize,
     /// Whether a round of several slots runs as one pass of the busy rows
     /// ([`Q3::step_slots`]): a whole-card load of more than one resident
-    /// slot, the body running several slots' rows as one pass — a placed
-    /// load keeps the fallback loop (its body serves each slot's rows in
-    /// its own pass; [`Body3::one_pass_round`] refuses by name), and a
-    /// load of one slot never runs a round of several.
+    /// slot of a body that runs several slots' rows as one pass
+    /// ([`Body3::ONE_PASS`]) — a placed load keeps the fallback loop (its
+    /// body serves each slot's rows in its own pass), as does a body with no
+    /// one pass of its slots, and a load of one slot never runs a round of
+    /// several.
     one_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
 }
 
 impl<B: Body3> Q3<B> {
-    /// The model of the file at `path` in graph mode by `by`
+    /// The model of the file at `path` in graph mode by `load`
     /// ([`Body3::open`]), its step captured and, unless placed, its passes,
     /// `slots` resident sequences parked after them (each capturing on its
     /// first use), the session over it; the `load` record on stderr.
@@ -677,13 +633,13 @@ impl<B: Body3> Q3<B> {
         path: &Path,
         ctx: usize,
         slots: usize,
-        by: B::By,
+        load: Q3Load,
         levers: &Levers,
         kv: KvQ8,
     ) -> Result<Q3<B>, GateError> {
         let t = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let mut m = B::open(file, ctx, slots, by, levers, kv)?;
+        let mut m = B::open(file, ctx, slots, load, levers, kv)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         let placed = B::placed(&m)?;
@@ -693,7 +649,7 @@ impl<B: Body3> Q3<B> {
         let at = u32::try_from(ctx).map_err(|_| format!("--ctx {ctx} passes u32"))?;
         let mut s = app::Session::from_model(m, at);
         if slots > 1 {
-            B::add_slots(&mut s, slots)?;
+            s.add_slots(slots)?;
         }
         Record::new(&record::LOAD_QWEN3)
             .w("arch", B::ARCH)
@@ -710,7 +666,7 @@ impl<B: Body3> Q3<B> {
         Ok(Q3 {
             s,
             ctx,
-            one_pass: slots > 1 && !placed,
+            one_pass: slots > 1 && !placed && B::ONE_PASS,
             stats: levers.step_stats(),
         })
     }
@@ -737,16 +693,16 @@ impl<B: Body3> Seat for Q3<B> {
         Ok(self.s.model().logits_into(row)?)
     }
 
-    /// The resident sequences the seat made at its open ([`Body3::slots`]):
-    /// `--parallel` on a qwen3moe file's load, one on a qwen35moe file's.
+    /// The resident sequences the seat made at its open
+    /// (`app::Session::slots`): `--parallel`.
     fn slots(&self) -> usize {
-        B::slots(&self.s)
+        self.s.slots()
     }
 
-    /// The session's slot ([`Body3::select_slot`]): the model exchanges its
-    /// live sequence with the slot's parked state — pointer moves.
+    /// The session's slot (`app::Session::select_slot`): the model exchanges
+    /// its live sequence with the slot's parked state — pointer moves.
     fn select(&mut self, slot: usize) -> Result<(), GateError> {
-        B::select_slot(&mut self.s, slot)
+        Ok(self.s.select_slot(slot)?)
     }
 
     /// The lever the binary parsed ([`Q3::stats`]).
@@ -756,13 +712,14 @@ impl<B: Body3> Seat for Q3<B> {
 
     /// One round of several slots: one pass of the busy rows while the open
     /// decided so ([`Q3::one_pass`], through [`Body3::one_pass_round`] — a
-    /// whole-card load, the rows' answers and lent logits rows from the
-    /// pass's own per-row heads, slot 0 left selected), else the seat's
-    /// fallback — a select and a step a row — the placed load's round (its
-    /// body serves each slot's rows in its own pass) and the round a load of
-    /// one slot never runs (the turns take that engine). A refusal on either
-    /// path is the server's to die on: the open decides once, so a load that
-    /// cannot run one pass never tries it at run time.
+    /// whole-card load of a body with one pass, the rows' answers and lent
+    /// logits rows from the pass's own per-row heads, slot 0 left
+    /// selected), else the seat's fallback — a select and a step a row — the
+    /// placed load's round (its body serves each slot's rows in its own
+    /// pass), every round of a body with no one pass of its slots (a
+    /// qwen35moe file's), and the round a load of one slot never runs. A
+    /// refusal on either path is the server's to die on: the open decides
+    /// once, so a load that cannot run one pass never tries it at run time.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
         if !self.one_pass {
             return step_rows_in_turn(self, rows);
@@ -827,10 +784,10 @@ impl<B: Body3> Seat for Q3<B> {
     }
 }
 
-/// What a qwen3moe file loads as, decided once before the open at the
-/// total context — the context its whole-fit verdict and its plan count —
-/// and carried into it ([`Body3::By`]), so the open makes no fit call of
-/// its own ([`decide_qwen3`]).
+/// What the file loads as, decided once before the open at the total
+/// context — the context its whole-fit verdict and its plan count — and
+/// carried into it ([`Body3::open`]), so the open makes no fit call of its
+/// own ([`decide`]).
 enum Q3Load {
     /// The whole model on device 0: `--place` unset, and the whole-fit
     /// verdict at the total takes the whole load.
@@ -845,100 +802,90 @@ enum Q3Load {
     },
 }
 
-/// What a qwen3moe file loads as at `total` positions for `parallel`
+/// What the `arch` file loads as at `total` positions for `parallel`
 /// resident sequences ([`Q3Load`]): `--place`'s plan on its card, else the
-/// whole-fit verdict at the total (`q3place::unplaced_qwen3_slots`, its
-/// line on stderr) — the whole model on device 0, or the placed plan on
-/// `a`'s card. Made at the total, never at a slot's share: a card whose
-/// whole load fits a slot's rows and not the total's would open whole, and
-/// the slots added after the open would hold a cache the verdict never
-/// counted; the verdict's own cache term is every slot's planes at its
-/// share of the total.
-fn decide_qwen3(
+/// whole-fit verdict at the total (`q3place::unplaced_qwen3_slots`,
+/// `q3place::unplaced_qwen35_slots`, its line on stderr) — the whole model on
+/// device 0, or the placed plan on `a`'s card. A qwen35moe file's plans carry
+/// its sequences' rows ([`seqs35`]) and their arena is a slot's load's
+/// (`q3place::share`). Made at the total, never at a slot's share: a card
+/// whose whole load fits a slot's rows and not the total's would open whole,
+/// and the slots added after the open would hold stores the verdict never
+/// counted; the verdict's own cache term is every slot's stores at its share
+/// of the total.
+fn decide(
     split: &Split,
+    arch: Arch,
     total: usize,
     place: Option<Place>,
     parallel: usize,
     kv: KvQ8,
 ) -> Result<Q3Load, GateError> {
-    let (q, why) = match place {
-        Some(p) => (Box::new(PlaceQ3::qwen3(split, p, total, kv)?), None),
-        None => match q3place::unplaced_qwen3_slots(split, total, parallel, kv)? {
-            q3place::Unplaced::Whole => return Ok(Q3Load::Whole),
-            q3place::Unplaced::Placed(q) => (q, Some(q3place::WHY_NOT_WHOLE)),
-        },
+    let unplaced = match (arch, place) {
+        (Arch::Qwen35moe, Some(p)) => {
+            let o = q3place::share(&open35(total, kv)?, total, parallel);
+            let q = PlaceQ3::qwen35_seqs(split, p, o, seqs35(parallel))?;
+            return Ok(Q3Load::Placed {
+                q: Box::new(q),
+                total,
+                why: None,
+            });
+        }
+        (Arch::Qwen35moe, None) => {
+            q3place::unplaced_qwen35_slots(split, &open35(total, kv)?, seqs35(parallel))?
+        }
+        (_, Some(p)) => {
+            return Ok(Q3Load::Placed {
+                q: Box::new(PlaceQ3::qwen3(split, p, total, kv)?),
+                total,
+                why: None,
+            });
+        }
+        (_, None) => q3place::unplaced_qwen3_slots(split, total, parallel, kv)?,
     };
-    Ok(Q3Load::Placed { q, total, why })
+    Ok(match unplaced {
+        q3place::Unplaced::Whole => Q3Load::Whole,
+        q3place::Unplaced::Placed(q) => Q3Load::Placed {
+            q,
+            total,
+            why: Some(q3place::WHY_NOT_WHOLE),
+        },
+    })
 }
 
-/// The body the file opens as: a qwen3moe file with its load decided
-/// before the open, or a qwen35moe file, whose open decides by `--place`
-/// itself ([`Body3::By`]).
-enum Seated {
-    Qwen3(Q3Load),
-    Qwen35,
-}
-
-/// How the seat serves `--parallel` for the file (the module doc's
-/// `--parallel` half): resident slots with the context split across them,
-/// or one sequence the slots take in turns.
-enum Serving {
-    /// `n` resident sequences, the model loaded with `slot_ctx` cache rows.
-    Slots { n: usize, slot_ctx: usize },
-    /// One sequence of `ctx` rows, `n` slots taking it in turns (one slot:
-    /// the plain engine).
-    Turns { n: usize, ctx: usize },
-}
-
-/// The least context a resident slot loads at, one rule for both loads
-/// ([`slot_floor`] names why for each): [`MAX_TOKENS`] rows.
+/// The least context a resident slot loads at, one rule for both loads and
+/// both files: [`MAX_TOKENS`] rows. A whole-card load captures its widest
+/// pass (`capture_prefill`, `capture_rows`, [`MAX_TOKENS`] rows), whose
+/// capture writes that many rows into the cache — a cache of fewer rows is
+/// refused by the launcher, deep in the load. A placed load captures no
+/// pass; its prompt runs as eager passes of up to [`MAX_PASS_ROWS`] ids, and
+/// a slot of fewer rows cannot hold one whole pass.
 const SLOT_CTX_MIN: usize = MAX_TOKENS;
 const _: () = assert!(SLOT_CTX_MIN == MAX_PASS_ROWS);
 
-/// Why a slot of `load` takes at least [`SLOT_CTX_MIN`] rows. A whole-card
-/// load captures its widest pass (`capture_prefill`, [`MAX_TOKENS`] rows),
-/// whose capture writes that many rows into the cache — a cache of fewer
-/// rows is refused by the launcher, deep in the load. A placed load captures
-/// no pass; its prompt runs as eager passes of up to [`MAX_PASS_ROWS`] ids,
-/// and a slot of fewer rows cannot hold one whole pass.
-fn slot_floor(load: &Q3Load) -> String {
-    match load {
-        Q3Load::Whole => format!("the {SLOT_CTX_MIN} rows the load's widest captured pass writes"),
-        Q3Load::Placed { .. } => format!(
-            "the {SLOT_CTX_MIN} rows one whole prompt pass of a placed load writes (its prompt \
-             runs as eager passes of up to {MAX_PASS_ROWS} ids)"
-        ),
+/// The rows each of `parallel` slots loads with at a total context of
+/// `ctx` (the module doc's `--parallel` half): the context split across
+/// them, each `ctx / parallel` rows rounded down (a cache row the
+/// granularity, the floor exact; N slots never more rows than the
+/// one-sequence load, so never more stores than the verdict or the plan at
+/// the total counts), a split that leaves a slot under [`SLOT_CTX_MIN`] rows
+/// refused by name before anything is decided or loaded. One slot is the one
+/// sequence of the whole context.
+fn slot_ctx(ctx: usize, parallel: usize) -> Result<usize, GateError> {
+    if parallel <= 1 {
+        return Ok(ctx);
     }
-}
-
-/// How `parallel` slots serve the file `seated` at a total context of
-/// `ctx`. A qwen3moe file past one slot holds them resident, on a
-/// whole-card load and a placed one alike ([`Q3Load`], decided at the
-/// total): the context split across them, each `ctx / parallel` rows
-/// rounded down (a cache row the granularity, the floor exact; N slots
-/// never more rows than the one-sequence load, so never more cache than the
-/// verdict or the plan at the total counts), a split that leaves a slot
-/// under [`SLOT_CTX_MIN`] rows refused by name before anything loads
-/// ([`slot_floor`]). A qwen35moe file, whose body parks no sequence, keeps
-/// one sequence the slots take in turns over the whole context.
-fn serving(seated: &Seated, ctx: usize, parallel: usize) -> Result<Serving, GateError> {
-    let load = match seated {
-        Seated::Qwen3(load) if parallel > 1 => load,
-        _ => return Ok(Serving::Turns { n: parallel, ctx }),
-    };
     let slot_ctx = ctx / parallel;
     if slot_ctx < SLOT_CTX_MIN {
         return Err(format!(
             "--parallel {parallel} of a --ctx of {ctx}: a slot's context of {slot_ctx} rows is \
-             below {}; give a larger --ctx or a smaller --parallel",
-            slot_floor(load)
+             below the {SLOT_CTX_MIN} rows a slot loads at (the widest pass a whole-card load \
+             captures, one whole prompt pass of a placed load's eager passes of up to \
+             {MAX_PASS_ROWS} ids); give a larger --ctx or a smaller --parallel"
         )
         .into());
     }
-    Ok(Serving::Slots {
-        n: parallel,
-        slot_ctx,
-    })
+    Ok(slot_ctx)
 }
 
 /// Loads the model and serves until the listener or the engine fails;
@@ -975,45 +922,40 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         Some(c) => c,
         None => default_ctx(&split, arch, a.place, a.parallel, &levers, kv)?,
     };
+    if !matches!(arch, Arch::Qwen3moe | Arch::Qwen35moe) {
+        return Err(format!(
+            "{} is a {} file; the qwen3 seat serves qwen3moe and qwen35moe files",
+            path.display(),
+            arch.name()
+        )
+        .into());
+    }
+    // Resident slots on both files: the model loads with a slot's share and
+    // parks the rest of the slots after its captures.
+    let slot_ctx = slot_ctx(ctx, a.parallel)?;
     // What the file loads as is decided here, once, at the total: the open
-    // makes no fit call of its own (`decide_qwen3`).
-    let seated = match arch {
-        Arch::Qwen3moe => Seated::Qwen3(decide_qwen3(&split, ctx, a.place, a.parallel, kv)?),
-        Arch::Qwen35moe => Seated::Qwen35,
-        other => {
-            return Err(format!(
-                "{} is a {} file; the qwen3 seat serves qwen3moe and qwen35moe files",
-                path.display(),
-                other.name()
-            )
-            .into());
-        }
-    };
-    let serving = serving(&seated, ctx, a.parallel)?;
+    // makes no fit call of its own (`decide`).
+    let load = decide(&split, arch, ctx, a.place, a.parallel, kv)?;
+    if matches!(arch, Arch::Qwen35moe) {
+        q3place::checkpoints_fit(seqs35(a.parallel), matches!(load, Q3Load::Placed { .. }))?;
+    }
     drop(split);
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
     let open = path.clone();
-    let place = a.place;
-    let device = place.map_or("device 0", Place::name).to_owned();
-    // Resident slots load the model with the slot ctx and park the rest of
-    // the slots after its captures; slots that take turns load one sequence
-    // of the whole context.
-    let (load_ctx, resident) = match serving {
-        Serving::Slots { n, slot_ctx } => (slot_ctx, n),
-        Serving::Turns { ctx, .. } => (ctx, 1),
-    };
-    let engine = match seated {
-        Seated::Qwen3(load) => SeatEngine::spawn(
-            move || Q3::<Body>::open(&open, load_ctx, resident, load, &levers, kv),
-            load_ctx,
+    let device = a.place.map_or("device 0", Place::name).to_owned();
+    let parallel = a.parallel;
+    let engine = match arch {
+        Arch::Qwen3moe => SeatEngine::spawn(
+            move || Q3::<Body>::open(&open, slot_ctx, parallel, load, &levers, kv),
+            slot_ctx,
             vocab,
             device,
             EngineProps::default(),
             0,
         )?,
-        Seated::Qwen35 => SeatEngine::spawn(
-            move || Q3::<Body35>::open(&open, load_ctx, resident, place, &levers, kv),
-            load_ctx,
+        _ => SeatEngine::spawn(
+            move || Q3::<Body35>::open(&open, slot_ctx, parallel, load, &levers, kv),
+            slot_ctx,
             vocab,
             device,
             EngineProps::default(),
@@ -1028,27 +970,19 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         fatal_linger: FATAL_LINGER,
         slot_save_path: None,
     };
-    // The seat's own slots are the engine's (the seat made them at its
-    // open, and the server steps them together); one sequence several slots
-    // take in turns stays the swap engine's, a preempted request's held ids
-    // re-prefilled from a reset on its return (the park holds ids: the seat
-    // has no snapshot to park, and a kept prefix does not survive another
-    // slot's rows over the cache).
-    let engine: Box<dyn Engine> = match serving {
-        Serving::Slots { .. } | Serving::Turns { n: 0 | 1, .. } => Box::new(engine),
-        Serving::Turns { n, .. } => Box::new(SwapEngine::new(Box::new(engine), n, Park::Ids)?),
-    };
+    // The seat's own slots are the engine's: the seat made them at its open,
+    // and the server steps them together.
     let slots = SlotConfig {
         parallel: a.parallel,
         queue_depth: a.queue_depth,
         ..SlotConfig::default()
     };
-    let server = Server::bind_with((a.host.as_str(), a.port), engine, config, slots)?;
+    let server = Server::bind_with((a.host.as_str(), a.port), Box::new(engine), config, slots)?;
     Record::new(&record::LISTENING_QWEN3)
         .w("arch", arch.name())
-        .u("ctx", load_ctx)
+        .u("ctx", slot_ctx)
         .u("slots", a.parallel)
-        .u("slot_ctx", load_ctx)
+        .u("slot_ctx", slot_ctx)
         .w("addr", server.local_addr()?)
         .eprint();
     Ok(server.run())

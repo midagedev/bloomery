@@ -67,20 +67,9 @@
 //!   common prefix instead of the checkpoint makes the session's cut refuse
 //!   by name and both clauses' requests fail; the cut's restore omitted
 //!   leaves the re-fed ids a fresh run's (the stripped clause's ids red).
-//! - `swap_reprefills_the_parked_ids`, on the qwen35moe arm (the park is
-//!   the seat's, and the qwen3moe arm's whole-card load serves resident
-//!   slots instead): a server of `--parallel 2`, a
-//!   decode preempted mid-run by a second request comes back by the
-//!   re-prefill fallback — the engine reset to 0 and its held ids fed again
-//!   before it steps — so the first request's ids are its solo run's through
-//!   the park (the same steps wrote them; past it the re-fed call's walk
-//!   re-writes the rows its steps wrote, the prefill band, so the tail is
-//!   printed, not held) and the second's, which never parks, are its solo
-//!   run's; the second finishes before the first, the switches counter
-//!   moved and the park's re-fed ids counted in `/metrics`. FAIL-first: the
-//!   re-prefill omitted leaves the first request stepping from an empty
-//!   engine and the re-fed count at 0.
-//! - `slots_flow_together`, on the qwen3moe arm: a server of
+//! - `slots_flow_together`, on both arms (both bodies hold resident
+//!   sequences: a qwen3moe file's per-position caches, a qwen35moe file's
+//!   `Slot35`): a server of
 //!   `--parallel 2` (the gate's ctx handling — no `--ctx`, the auto
 //!   default), two greedy streamed requests of distinct prompts
 //!   (`n_predict` [`SLOTS_PREDICT`], `ignore_eos`, no cache), each first run
@@ -121,8 +110,26 @@
 //!   experts on the card and on the host (the arm ran the placed body, not
 //!   the whole load a plan of every expert opens), and the seat's `placed
 //!   slots` line names two sequences of half the plan's `ctx_max` holding at
-//!   most the plan's KV term at the total (the plan counts every slot's
-//!   rows: two of `⌊T/2⌋` never past `T`).
+//!   most what the plan counts for them — its KV term at the total (every
+//!   slot's rows: two of `⌊T/2⌋` never past `T`) and its card's `resident
+//!   slots` reserve — and `placed_slots_reserve_the_fixed_stores` holds that
+//!   line's terms to the file's own planes ([`cache_planes`]): the two
+//!   sequences hold twice one slot's planes at `⌊T/2⌋` rows, and the reserve
+//!   is one sequence's planes no position moves (a qwen35moe file's delta
+//!   layers' states and rings: the plan's KV term at the total counts them
+//!   once, the second slot holds them again), named on the line only where
+//!   they are not 0 (none on a qwen3moe file). FAIL-first: a reserve left
+//!   out holds the second slot's fixed stores past the plan's count — the
+//!   open refuses by name and the placed qwen35moe server never listens
+//!   (`placed_slots_load_names_the_split` red); one counted for every slot
+//!   names twice the planes and the clause is red. `slots_count_their_checkpoints`
+//!   reads both servers' stderr: a qwen35moe file's two sequences each pin
+//!   up to `runtime::seqstate::HOST_BUDGET` of checkpoints on the host, and
+//!   the seat's `checkpoints:` line names two sequences and twice the budget
+//!   — against the host's available bytes on the whole-card arm, as the
+//!   placed plan's host reserve on the placed one; a qwen3moe file's
+//!   sequences take none and the line is absent. FAIL-first: the term
+//!   counted for one sequence names one budget and the clause is red.
 //!   FAIL-first mutants, each red on its line: the seat still building the
 //!   turn-taking engine leaves (v2) at ~1.0 and (v3) failing; a select that
 //!   ignores the slot (both requests on one sequence) moves the together
@@ -149,7 +156,9 @@
 //!   the card. A whole-fit line that says the load does not fit is a named
 //!   error: the arm is not a whole arm. FAIL-first: a halving that stops a
 //!   step early splits a total whose next grid point still fits, red on (c).
-//! - `slots_rounds_run_one_pass`, on the qwen3moe arm: a whole-card server
+//! - `slots_rounds_run_one_pass`, on the qwen3moe arm (the body with one
+//!   pass of its slots, `SlotRows`; a qwen35moe file's rounds take the
+//!   seat's fallback loop on either load): a whole-card server
 //!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
 //!   record a round of several slots — two greedy streamed requests of the
 //!   slots clause's prompts, each first run alone on that server and then
@@ -168,19 +177,21 @@
 //!   `passes=rows`, the default loop (`placed_slots_rounds_run_in_turn`).
 //!   FAIL-first: a seat left on the default loop prints `passes=rows` on
 //!   the whole arm, and only this clause is red.
-//! - `slots_late_request_together_alone`, on the qwen3moe arm: a
+//! - `slots_late_request_together_alone`, on both arms: a
 //!   whole-card server of `--parallel 2`, the first request decoding alone
 //!   and the second posted once `/metrics`' `n_decode_total` has moved a
 //!   few rounds — slot 1 taken mid-run, its prompt run between the first's
 //!   rounds — answers with each request's alone ids, the first's included:
 //!   the rounds the two ran together leave each slot's sequence whole
-//!   whatever slot the pass left selected. FAIL-first: a round that leaves
-//!   the wrong slot selected runs the second request's prompt over the
-//!   first's sequence, and both requests' ids move at once.
-//! - `slot_ctx_too_small_is_refused`, on the qwen3moe arm: `--ctx 15`
+//!   whatever slot the pass left selected (a qwen35moe file's: whatever slot
+//!   the fallback loop's last row left selected, the second's prompt call
+//!   taking its checkpoints in its own sequence). FAIL-first: a round that
+//!   leaves the wrong slot selected runs the second request's prompt over
+//!   the first's sequence, and both requests' ids move at once.
+//! - `slot_ctx_too_small_is_refused`, on both arms: `--ctx 15`
 //!   under the default two slots — a slot of 7 rows, one under the 8 rows
-//!   the load's widest captured pass writes (`router::MAX_TOKENS`; a placed
-//!   load names one whole prompt pass of its own, the same 8) — ends the
+//!   a slot loads at (`router::MAX_TOKENS`: the widest pass a whole-card
+//!   load captures, and one whole prompt pass of a placed load) — ends the
 //!   process before the load, naming the total, the slot count and the
 //!   slot ctx. FAIL-first: the refusal dropped loads the slot and dies in
 //!   the pass capture under the launcher's own message.
@@ -213,16 +224,14 @@
 //!   context stops one granule under it on an idle A6000, where both
 //!   contexts' planes take the same granules, and the clause is red on both
 //!   files.
-//! - `placed_slots_are_resident` (qwen3moe) and `placed_slots_take_turns`
-//!   (qwen35moe), `ctx_default`'s placed arm (`--place a --parallel 2`, no
-//!   budget): a qwen3moe file's placed load holds its two slots resident —
-//!   its plan made at the total, which counts every slot's rows — so the
-//!   load and listening records name two slots of half the plan's `ctx_max`
-//!   each; a qwen35moe file's slots take its one sequence in turns over the
-//!   whole context, the load record naming one resident sequence of
-//!   `ctx_max` and the listening record two slots of it. FAIL-first: the
-//!   seat's qwen3moe placed load kept on the turns names one sequence of
-//!   `ctx_max` in its load.
+//! - `placed_slots_are_resident`, `ctx_default`'s placed arm (`--place a
+//!   --parallel 2`, no budget), on both arms: the placed load holds its two
+//!   slots resident — its plan made at the total, which counts every slot's
+//!   rows and, on a qwen35moe file, the second slot's fixed stores as its
+//!   `resident slots` reserve — so the load and listening records name two
+//!   slots of half the plan's `ctx_max` each. FAIL-first: the seat's placed
+//!   load kept on one sequence (the turns a qwen35moe file took before its
+//!   body held resident slots) names one sequence of `ctx_max` in its load.
 //! - `placed_answers_a_prompt_past_the_gemm_walk`, a placed server whose
 //!   card budget is [`HOST_TIER_BUDGET`] (`--place a --parallel 1`): its
 //!   plan record puts routed experts on the host, and a greedy
@@ -234,20 +243,19 @@
 //! The spawn census, every server this gate starts and its `--parallel`:
 //! [`spawn`] and `ctx_default`'s default, flag and q8 arms pin
 //! `--parallel 1` (the prefix and ctx clauses hold the one-slot path's
-//! keeps and defaults), its placed arm passes `--parallel 2` (resident on
-//! qwen3moe, the turns on qwen35moe, above), and its whole-fit clause pins
+//! keeps and defaults), its placed arm passes `--parallel 2` (resident,
+//! above), and its whole-fit clause pins
 //! `--parallel 1` at a flagged `--ctx` (one sequence's planes; the resident
 //! split's clause is the slots clause's); `cache_refusals`' two refusal
 //! arms pass none — they die at flag parsing before the seat splits
-//! anything — and its flag-wins arm pins `--parallel 1`; the swap clause
-//! passes `--parallel 2` (qwen35moe, the turns); the slots clause's two
-//! arms pass `--parallel 2` (qwen3moe, resident: the whole-card load and
-//! the budgeted placed one) and the refusal arm passes none (the default
+//! anything — and its flag-wins arm pins `--parallel 1`; the slots clause's
+//! two arms pass `--parallel 2` (resident on both files: the whole-card load
+//! and the budgeted placed one) and the refusal arm passes none (the default
 //! two are what makes the split too small); the slots-round clause's two
-//! arms pass `--parallel 2` with `BLOOMERY_STEP_STATS=1` in their
+//! arms (qwen3moe) pass `--parallel 2` with `BLOOMERY_STEP_STATS=1` in their
 //! environment (the whole-card load and the budgeted placed one), and the
 //! late arm passes `--parallel 2` (whole-card, no lever); the host-tier
-//! arm pins `--parallel 1` (one prompt on
+//! arm (qwen3moe) pins `--parallel 1` (one prompt on
 //! the placed path is the clause).
 //!
 //! The server is stopped by the handle this binary spawned it with before
@@ -292,6 +300,7 @@ mod gate {
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use gguf::Split;
     use model::placement::workstation::GRANULE;
+    use runtime::seqstate::HOST_BUDGET;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
 
@@ -339,17 +348,6 @@ mod gate {
     /// The prompt ids a pass takes at most: the rendered turn must be
     /// longer, so the clause covers the ubatch walk.
     const PASS_IDS: usize = 8;
-
-    /// The swap clause's requests: the first long enough that the second's
-    /// arrival cannot miss its decode (a whole quantum and more, so a late
-    /// arrival still finds it mid-run), the second short enough to come back
-    /// before it.
-    const SWAP_A_PREDICT: usize = 96;
-    const SWAP_B_PREDICT: usize = 8;
-
-    /// The swap clause's `/slots` poll while it waits for the first
-    /// request's decode.
-    const SWAP_POLL: Duration = Duration::from_millis(300);
 
     /// The slots clause's requests: long enough that the together run holds
     /// dozens of rounds with both streams live.
@@ -479,9 +477,8 @@ mod gate {
     /// card and a Q4_K_M 30B file leave tens of thousands of rows); the
     /// `--ctx` flag still wins; a load under `--place` takes the placed
     /// search's answer over the plan's expert split, pinned by relation
-    /// (the placed arm's checks below), its two slots resident on a
-    /// qwen3moe file (`placed_slots_are_resident`) and taking the one
-    /// sequence in turns on a qwen35moe file (`placed_slots_take_turns`).
+    /// (the placed arm's checks below), its two slots resident on either
+    /// file (`placed_slots_are_resident`).
     /// The default is the whole search's answer on either card: the trained
     /// context where the whole load fits it, else the largest the load fits
     /// ([`ctx_default_is_the_trained_context`], the default arm).
@@ -508,9 +505,8 @@ mod gate {
         let arms: [(&str, &[&str]); 4] = [
             ("default", &["--parallel", "1"]),
             ("flag", &["--parallel", "1", "--ctx", "2048"]),
-            // Two slots on the placed load: resident on a qwen3moe file, in
-            // turns on a qwen35moe file (the module header's
-            // `placed_slots_are_resident` and `placed_slots_take_turns`).
+            // Two slots on the placed load, resident on either file (the
+            // module header's `placed_slots_are_resident`).
             ("placed", &["--parallel", "2", "--place", "a"]),
             // The cache lever's arm: the q8_0 planes the seat's flag names,
             // the auto context search under the halved KV term.
@@ -597,19 +593,19 @@ mod gate {
                     // load that says nothing leaves the line's side of the
                     // biconditional red on a card where the search grows.
                     // PIN(2026-10-05): the total is the plan's `ctx_max`, not
-                    // `/props`' `n_ctx`: a qwen3moe file's two placed slots
-                    // are resident and each serves `ctx_max / 2` rows (the
-                    // split's floor), a qwen35moe file's take its one
-                    // sequence of `ctx_max` in turns; mutant: the seat's
-                    // placed load kept on the turns serves `ctx_max`.
+                    // `/props`' `n_ctx`, and on both files each of the two
+                    // resident placed slots serves `ctx_max / 2` rows (the
+                    // split's floor: the seat splits the total the plan was
+                    // made at across `--parallel 2`, `slot_ctx`); a qwen35moe
+                    // file's slot was `ctx_max` while its slots took the one
+                    // sequence in turns. Mutant: the seat's qwen35moe placed
+                    // load kept on one sequence serves `ctx_max`.
                     let log = std::fs::read_to_string(&err_log)?;
                     let records = seat_log(&err_log)?;
                     let total = records.one(&record::PLAN38)?.u64("ctx_max")?;
-                    let resident = split.architecture() == Some("qwen3moe");
-                    let slot = if resident { total / 2 } else { total };
+                    let slot = total / 2;
                     println!(
-                        "placed arm: plan ctx_max {total}, resident slots {resident}, props \
-                         n_ctx {n} against a slot's {slot}"
+                        "placed arm: plan ctx_max {total}, props n_ctx {n} against a slot's {slot}"
                     );
                     check(
                         ok,
@@ -638,10 +634,8 @@ mod gate {
                             && said.len() <= 1
                             && (said.is_empty() || said[0] == total),
                     );
-                    // A qwen3moe file's two slots are resident sequences of
-                    // a slot's share each; a qwen35moe file's take the
-                    // placed load's one sequence in turns over the whole
-                    // context (the module header).
+                    // The two slots are resident sequences of a slot's
+                    // share each, on both files (the module header).
                     let load = records.one(&record::LOAD_QWEN3)?;
                     let listening = records.one(&record::LISTENING_QWEN3)?;
                     let terms = [
@@ -655,11 +649,11 @@ mod gate {
                          slot_ctx={}",
                         terms[0], terms[1], terms[2], terms[3]
                     );
-                    if resident {
-                        check(ok, "placed_slots_are_resident", terms == [2, slot, 2, slot]);
-                    } else {
-                        check(ok, "placed_slots_take_turns", terms == [1, total, 2, total]);
-                    }
+                    // PIN(2026-10-05): `placed_slots_take_turns` (qwen35moe,
+                    // `[1, ctx_max, 2, ctx_max]`) turned into this clause's
+                    // qwen35moe arm: the seat's qwen35moe slots are resident
+                    // sequences (`Slot35`), so the turns it pinned are gone.
+                    check(ok, "placed_slots_are_resident", terms == [2, slot, 2, slot]);
                 }
             }
             if name != "flag" {
@@ -1272,171 +1266,6 @@ mod gate {
             "qwen35_extension_keeps_every_held_position",
             resend.cache_n == held && !resend.tokens.is_empty(),
         );
-        Ok(())
-    }
-
-    /// The swap clause (module header) on a server of two slots started into
-    /// `<dir>/swap`: a decode preempted mid-run by a second request comes
-    /// back by the re-prefill fallback — the engine reset to 0 and its held
-    /// ids fed again before it steps (`Park::Ids`; the seat holds no
-    /// snapshot to park) — so both requests answer their solo runs' ids, the
-    /// second finishes before the first, and the switches and the re-fed
-    /// ids the park counted both moved.
-    fn swap_reprefills_the_parked_ids(
-        model: &Path,
-        dir: &Path,
-        ok: &mut bool,
-    ) -> Result<(), GateError> {
-        let dir = dir.join("swap");
-        std::fs::create_dir_all(&dir)?;
-        let err_log = dir.join("server.err");
-        let mut cmd = Command::new(beside("bloomery-serve")?);
-        cmd.env_remove("BLOOMERY_REF_MODEL");
-        let m = model.to_str().ok_or("the model path is not UTF-8")?;
-        let mut s = Served::spawn_cmd(
-            cmd,
-            &[
-                "--model",
-                "qwen3",
-                "--port",
-                "0",
-                "--parallel",
-                "2",
-                "-m",
-                m,
-            ],
-            &dir,
-        )?;
-        // The load reads the whole file: up to ten minutes from a cold cache.
-        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
-        let url = |p: &str| format!("http://{addr}{p}");
-        let body = |ids: &[u32], n: usize| {
-            json!({
-                "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
-                "cache_prompt": false,
-                // The seat runs no draft, so a banned stop id steps nothing
-                // plainly (glm's clause avoids it for its draft); this holds
-                // the first request's decode open for the second's arrival.
-                "ignore_eos": true,
-            })
-        };
-        let (a_ids, b_ids) = {
-            let a = rendered(&url, messages())?;
-            let (st, text) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
-            let b = ids_of(&json_of("/tokenize", st, &text)?["tokens"]);
-            (a, b)
-        };
-        // The solo runs: one request at a time takes no turn, so these are
-        // the plain engine's answers.
-        let mut alone = Vec::new();
-        for (ids, n) in [(&a_ids, SWAP_A_PREDICT), (&b_ids, SWAP_B_PREDICT)] {
-            let (st, text) = curl(&url("/completion"), Some(&body(ids, n)), false)?;
-            let v = json_of("/completion", st, &text)?;
-            alone.push(ids_of(&v["tokens"]));
-        }
-        println!("swap alone: {} and {} ids", alone[0].len(), alone[1].len());
-        let swaps = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
-        let refed = metric(&url, "swap_reprefill_tokens_total")?.unwrap_or(f64::NAN);
-        // A request on a helper thread of its own: its handle, and its answer
-        // with when it came back.
-        type Answer = (Result<(u16, String), String>, Instant);
-        let post = |ids: Vec<u32>,
-                    n: usize|
-         -> Result<(JoinHandle<()>, mpsc::Receiver<Answer>), GateError> {
-            let u = url("/completion");
-            let b = body(&ids, n);
-            let (tx, rx) = mpsc::channel();
-            let (h, _) = spawn_helper("swap-request", Placement::Float, move || {
-                let r = curl(&u, Some(&b), false).map_err(|e| e.to_string());
-                let _ = tx.send((r, Instant::now()));
-            })
-            .map_err(|e| format!("swap: {}", e.what()))?;
-            Ok((h, rx))
-        };
-        let a_len = a_ids.len();
-        let first = post(a_ids, SWAP_A_PREDICT)?;
-        loop {
-            if first.0.is_finished() {
-                return Err(
-                    "swap: the first request ended before /slots showed it decoding".into(),
-                );
-            }
-            let (st, text) = curl(&url("/slots"), None, false)?;
-            let slots = json_of("/slots", st, &text)?;
-            let decoding = slots.as_array().is_some_and(|l| {
-                l.iter().any(|s| {
-                    s["turn"] == "running"
-                        && s["next_token"]["n_decoded"].as_u64().is_some_and(|n| n > 0)
-                })
-            });
-            if decoding {
-                break;
-            }
-            std::thread::sleep(SWAP_POLL);
-        }
-        let second = post(b_ids, SWAP_B_PREDICT)?;
-        let mut together = Vec::new();
-        for ((h, rx), what) in [(first, "first"), (second, "second")] {
-            h.join()
-                .map_err(|_| format!("swap: the {what} request's thread panicked"))?;
-            let (r, at) = rx
-                .recv()
-                .map_err(|_| format!("swap: the {what} request's thread gave no answer"))?;
-            let (st, text) = r?;
-            let v = json_of("/completion", st, &text)?;
-            together.push((ids_of(&v["tokens"]), at));
-        }
-        let after = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
-        let refed_after = metric(&url, "swap_reprefill_tokens_total")?.unwrap_or(f64::NAN);
-        // The park re-fed the first request's held ids: its prompt's ids plus
-        // the tokens it had written before the park, so many tokens of its
-        // answer. Through those its ids are its solo run's (the same steps
-        // wrote them); past the park the re-fed call's walk re-writes the
-        // rows its steps wrote (the prefill band: a step-written row is not
-        // a fresh run's, qwen38-(a) class), so the tail is printed, not
-        // held. The second request never parks: its ids are its solo run's.
-        let pre_park = (refed_after as usize)
-            .saturating_sub(a_len)
-            .min(alone[0].len());
-        let tail_same = together[0].0 == alone[0];
-        println!(
-            "swap together: first {} ids, second {} ids, second back {:?} before the first, \
-             switches {swaps} -> {after}, re-fed ids {refed} -> {refed_after} ({} held of the \
-             first), the first's ids its solo run's through {pre_park}, the whole tail the \
-             same {tail_same}",
-            together[0].0.len(),
-            together[1].0.len(),
-            together[0].1.checked_duration_since(together[1].1),
-            refed_after,
-        );
-        check(
-            ok,
-            "swap_alone_ran_long_enough_to_preempt",
-            alone[0].len() == SWAP_A_PREDICT && !alone[1].is_empty(),
-        );
-        check(
-            ok,
-            "swap_second_back_before_the_first",
-            together[1].1 < together[0].1,
-        );
-        check(
-            ok,
-            "swap_first_ids_are_alone_through_the_park",
-            together[0].0.len() >= pre_park
-                && pre_park > 0
-                && together[0].0[..pre_park] == alone[0][..pre_park],
-        );
-        check(
-            ok,
-            "swap_second_ids_are_alone",
-            !together[1].0.is_empty() && together[1].0 == alone[1],
-        );
-        check(
-            ok,
-            "swap_switched_and_reprefilled_the_held_ids",
-            after > swaps && refed_after > refed,
-        );
-        println!("swap server stopped: {}", s.stop()?);
         Ok(())
     }
 
@@ -2104,10 +1933,21 @@ mod gate {
     /// the placed body: the host tier, the placed step walk, the eager
     /// prompt passes — not the whole load a plan of every expert opens),
     /// and the seat's `placed slots` line holds the two sequences' cache
-    /// bytes at or under the plan's KV term at the total, the slot ctx half
-    /// the plan's `ctx_max`. FAIL-first: the seat's placed load kept on the
-    /// turns prints no `placed slots` line.
-    fn placed_slots_hold_the_plan(dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+    /// bytes at or under what the plan counts for them at the total — its
+    /// KV term and its card's `resident slots` reserve — the slot ctx half
+    /// the plan's `ctx_max` (`placed_slots_cache_within_the_plan`); the
+    /// line's terms are the file's own planes ([`cache_planes`]): the two
+    /// sequences hold twice one slot's planes at the slot ctx, and the
+    /// reserve, named only where it is not 0, is one sequence's planes at
+    /// no position — what the second slot holds again past the KV term's
+    /// count (`placed_slots_reserve_the_fixed_stores`). FAIL-first: the
+    /// seat's placed load kept on one sequence prints no `placed slots`
+    /// line; a reserve counted for both slots names twice the fixed planes.
+    fn placed_slots_hold_the_plan(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
         let log = std::fs::read_to_string(dir.join(PLACED_SLOTS.dir).join("server.err"))
             .unwrap_or_default();
         let plan = log.lines().find(|l| l.starts_with("plan ")).unwrap_or("");
@@ -2118,7 +1958,9 @@ mod gate {
         );
         let (load, _) = load_and_listening(&log);
         // `placed slots: N sequences of S rows hold H B of cache; the plan
-        // at T positions counts K B` (`q3place::open_qwen3_slots`).
+        // at T positions counts K B`, then ` (its KV term V B and its
+        // resident slots reserve R B)` where R is not 0
+        // (`q3place::open_slots`).
         let line = log
             .lines()
             .find(|l| l.starts_with("placed slots: "))
@@ -2152,6 +1994,73 @@ mod gate {
                 && slot == total.map(|t| t / 2)
                 && held.zip(counted).is_some_and(|(h, k)| h > 0 && h <= k),
         );
+        // The line's terms against the file's own planes: two slots' planes
+        // at the slot ctx held, one slot's planes at no position reserved
+        // (named only where not 0), the count its KV term plus that reserve.
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let fixed: u64 = cache_planes(model, &split, 0)?.iter().sum();
+        let both = match slot {
+            Some(s) => Some(2 * cache_planes(model, &split, s)?.iter().sum::<u64>()),
+            None => None,
+        };
+        let (kv, reserve) = (num("(its KV term "), num(" reserve "));
+        println!(
+            "placed slots: held {held:?} of two slots' planes {both:?}; reserve {reserve:?} of \
+             one slot's fixed planes {fixed} B; KV term {kv:?}, counted {counted:?}"
+        );
+        let terms = if fixed == 0 {
+            reserve.is_none() && kv.is_none()
+        } else {
+            reserve == Some(fixed) && kv.zip(counted).is_some_and(|(v, k)| v + fixed == k)
+        };
+        check(
+            ok,
+            "placed_slots_reserve_the_fixed_stores",
+            held.is_some() && held == both && terms,
+        );
+        Ok(())
+    }
+
+    /// `slots_count_their_checkpoints` (module header), from both slots
+    /// arms' servers' stderr once they stopped: a qwen35moe file's two
+    /// sequences each pin up to [`HOST_BUDGET`] of checkpoints, so the seat's
+    /// one `checkpoints:` line names two sequences and twice the budget — on
+    /// the whole-card arm against the host's available bytes, on the placed
+    /// arm as its plan's host reserve; a qwen3moe file's sequences take no
+    /// checkpoints and print none. FAIL-first: the term counted for one
+    /// sequence names one budget.
+    fn slots_count_their_checkpoints(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let takes = split.architecture() == Some("qwen35moe");
+        let want = format!(
+            "checkpoints: 2 sequences pin at most {} B of host ({HOST_BUDGET} B each), ",
+            2 * HOST_BUDGET
+        );
+        let mut held = true;
+        for (arm, counted_in) in [
+            ("slots", "of "),
+            (
+                PLACED_SLOTS.dir,
+                "counted in the placed plan's host reserves",
+            ),
+        ] {
+            let log = std::fs::read_to_string(dir.join(arm).join("server.err")).unwrap_or_default();
+            let lines: Vec<&str> = log
+                .lines()
+                .filter(|l| l.starts_with("checkpoints: "))
+                .collect();
+            println!("{arm}: checkpoints lines {lines:?}");
+            held &= if takes {
+                matches!(lines[..], [l] if l.starts_with(&format!("{want}{counted_in}")))
+            } else {
+                lines.is_empty()
+            };
+        }
+        check(ok, "slots_count_their_checkpoints", held);
         Ok(())
     }
 
@@ -2604,24 +2513,25 @@ mod gate {
             let total = ctx_default(model, &dir, &mut ok)?;
             whole_fit_counts_the_planes_granules(model, &dir, &mut ok)?;
             cache_refusals(model, &dir, &mut ok)?;
+            // Both arms: the resident slots and the split they serve, on the
+            // whole-card load and on a placed one, the late arrival and the
+            // refused split.
+            // PIN(2026-10-05): `swap_reprefills_the_parked_ids` (the qwen35moe
+            // arm's turns, `serve::SwapEngine` under `Park::Ids`) left with
+            // the seat's last swap engine: both bodies hold resident slots, so
+            // the qwen35moe arm runs these slot clauses instead; `Park::Ids`
+            // keeps its pure tests in `crates/serve/tests/slots`.
+            slots_flow_together(model, &dir, &whole_slots(total), &mut ok)?;
+            slots_flow_together(model, &dir, &PLACED_SLOTS, &mut ok)?;
+            placed_slots_hold_the_plan(model, &dir, &mut ok)?;
+            slots_count_their_checkpoints(model, &dir, &mut ok)?;
+            slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
+            slots_late_request_together_alone(model, &dir, &mut ok)?;
             if arch == "qwen3moe" {
-                // The qwen3moe arm: the resident slots and the split they
-                // serve, on the whole-card load and on a placed one (a
-                // moved coverage clause would be lost — the swap clause
-                // below is the qwen35moe arm's now).
-                slots_flow_together(model, &dir, &whole_slots(total), &mut ok)?;
-                slots_flow_together(model, &dir, &PLACED_SLOTS, &mut ok)?;
-                placed_slots_hold_the_plan(&dir, &mut ok)?;
-                slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
+                // The qwen3moe arm alone: the placed prompt past the GEMM
+                // walk, and the one pass a body with `SlotRows` runs.
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
                 slots_rounds_run_one_pass(model, &dir, &mut ok)?;
-                slots_late_request_together_alone(model, &dir, &mut ok)?;
-            }
-            if arch == "qwen35moe" {
-                // The park is the seat's, and the qwen3moe arm's whole-card
-                // load serves resident slots: the qwen35moe arm carries the
-                // swap clause.
-                swap_reprefills_the_parked_ids(model, &dir, &mut ok)?;
             }
         }
         if ok {

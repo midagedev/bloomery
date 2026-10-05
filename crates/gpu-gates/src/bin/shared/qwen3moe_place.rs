@@ -20,7 +20,11 @@
 //! when it does not, the placed plan on `a`'s card. The serve seat's unset
 //! `--ctx` defaults live here too ([`whole_ctx_qwen3`] for the whole load,
 //! [`placed_ctx_qwen3`] for a placed one), and its resident slots open a
-//! placed plan through [`open_qwen3_slots`]. Every census reading the module
+//! placed plan through [`open_qwen3_slots`] and [`open_qwen35_slots`]. A
+//! seat's placed plan counts what its resident sequences hold past the plan's
+//! one-sequence terms ([`Seqs`]): on the card the stores no position moves,
+//! once a sequence past the live one; on the host the checkpoints a
+//! qwen35moe sequence's prompt calls pin. Every census reading the module
 //! takes and every probe its searches run is counted ([`reads`]).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,10 +42,12 @@ use gguf::Split;
 use model::arch::qwen3moe::place::{self as q3, card_routed};
 use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
-use model::placement::workstation::{CardSpec, DeviceInfo, GRANULE};
+use model::placement::workstation::{self, CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
-    self, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role, WholeLoad, WholeNeed,
+    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role, WholeLoad,
+    WholeNeed,
 };
+use runtime::seqstate::HOST_BUDGET;
 
 /// The census readings this module took and the probes its context searches
 /// ran, since the process began: a caller reads them around a search
@@ -120,7 +126,8 @@ enum Inputs {
 }
 
 /// What a placed load plans from: the placement on this process's devices,
-/// the file's plan inputs and the machine its stage card lays out.
+/// the file's plan inputs, the sequences the load holds and the machine its
+/// stage card lays out.
 pub struct PlaceQ3 {
     place: Place,
     arch: &'static str,
@@ -128,7 +135,103 @@ pub struct PlaceQ3 {
     /// The cache format this load counts in — the same choice `inputs.kv`
     /// carries, kept beside it for the plane list [`kv_bytes`] splits.
     kv: KvQ8,
+    /// The sequences the load holds, whose rows every machine of it carries
+    /// ([`laid`]).
+    seqs: Seqs,
     machine: Machine,
+}
+
+/// The sequences a load holds and what they pin besides the plan's
+/// one-sequence terms: `slots` resident sequences, the context split across
+/// them, each taking checkpoints when `checkpoints` (a qwen35moe file's seat
+/// load: its prompt calls take the points a kept prefix comes back to).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seqs {
+    pub slots: usize,
+    pub checkpoints: bool,
+}
+
+impl Seqs {
+    /// One sequence taking no checkpoints: the CLI's loads and a qwen3moe
+    /// file's, whose rows are none.
+    pub const ONE: Seqs = Seqs {
+        slots: 1,
+        checkpoints: false,
+    };
+}
+
+/// The card reserve of a load's resident sequences past the live one
+/// ([`laid`]): each one's stores that no position moves.
+pub const SLOTS_RESERVE: &str = "resident slots";
+
+/// The host reserve of a load's sequences' checkpoints ([`laid`]).
+pub const CHECKPOINTS_RESERVE: &str = "checkpoints";
+
+/// The host bytes the checkpoints of `slots` sequences pin at most: each
+/// sequence's own pinned slots, made as its prompt calls take points, up to
+/// [`HOST_BUDGET`] (`Slots::seq_bytes`'s doc on `Body35`); `u64::MAX` past
+/// u64, which no host holds.
+#[must_use]
+pub fn checkpoint_bytes(slots: usize) -> u64 {
+    u64::try_from(slots).map_or(u64::MAX, |n| n.saturating_mul(HOST_BUDGET))
+}
+
+/// The file's layers.
+fn layers_of(inputs: &Inputs) -> usize {
+    match inputs {
+        Inputs::Qwen3(i) => i.hp.n_layer,
+        Inputs::Qwen35(i) => i.hp.n_layer,
+    }
+}
+
+/// The bytes one sequence of `inputs`'s file holds whatever its length: each
+/// layer's cache bytes at no position, its plan's own [`KvBytes`] — a
+/// qwen35moe file's delta layers' recurrent states and conv rings, nothing on
+/// a qwen3moe file, whose cache is per-position.
+fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
+    let kv: &dyn KvBytes = match inputs {
+        Inputs::Qwen3(i) => &i.kv,
+        Inputs::Qwen35(i) => &i.kv,
+    };
+    (0..layers_of(inputs)).map(|l| kv.layer_bytes(l, 0)).sum()
+}
+
+/// The machine a placed load of `inputs`'s file lays out on `spec`'s card
+/// over `arena` ([`q3::machine`]), with the rows of what `seqs` holds past the
+/// plan's one-sequence terms: on the card, a [`SLOTS_RESERVE`] of every
+/// resident sequence's fixed stores ([`fixed_seq_bytes`]) but the live one's
+/// — the plan's KV term at the total counts the per-position rows of every
+/// slot's share and the fixed stores once — none where they are 0; on the
+/// host, a [`CHECKPOINTS_RESERVE`] of every sequence's checkpoints
+/// ([`checkpoint_bytes`]) when they take them. The one owner of a placed
+/// load's machine, so a relaid machine ([`PlaceQ3::machine_at`],
+/// [`PlaceQ3::moved_to`]) keeps the rows.
+fn laid(spec: CardSpec, inputs: &Inputs, arena: u64, seqs: Seqs) -> Machine {
+    let mut machine = q3::machine(spec, layers_of(inputs), arena);
+    let past = u64::try_from(seqs.slots.saturating_sub(1))
+        .map_or(u64::MAX, |n| n.saturating_mul(fixed_seq_bytes(inputs)));
+    if past > 0 {
+        machine.cards[0]
+            .reserves
+            .push((SLOTS_RESERVE.to_owned(), past));
+    }
+    if seqs.checkpoints {
+        machine
+            .host
+            .reserves
+            .push((CHECKPOINTS_RESERVE.to_owned(), checkpoint_bytes(seqs.slots)));
+    }
+    machine
+}
+
+/// `o` for the load each of `slots` slots opens when they split `ctx`
+/// positions: a slot's share, `ctx / slots` rows (the split's floor).
+#[must_use]
+pub fn share(o: &Open35, ctx: usize, slots: usize) -> Open35 {
+    Open35 {
+        ctx: ctx / slots.max(1),
+        ..*o
+    }
 }
 
 impl PlaceQ3 {
@@ -160,43 +263,64 @@ impl PlaceQ3 {
         if kv == KvQ8::Q8 {
             inputs.kv = inputs.kv.in_q8();
         }
+        let inputs = Inputs::Qwen3(inputs);
         let arena = Qwen3moeModel::placed_arena_bytes(file, ctx)?;
-        let machine = q3::machine(place.card_specs()?[0], inputs.hp.n_layer, arena);
+        let machine = laid(place.card_specs()?[0], &inputs, arena, Seqs::ONE);
         Ok(PlaceQ3 {
             place,
             arch: "qwen3moe",
-            inputs: Inputs::Qwen3(inputs),
+            inputs,
             kv,
+            seqs: Seqs::ONE,
             machine,
         })
     }
 
     /// A qwen35moe file's placed load under `o` on `place`'s card, its
     /// attention planes in `o.kv`'s format, resolved against one census of
-    /// this process's devices.
+    /// this process's devices: one sequence taking no checkpoints, the CLI's.
     pub fn qwen35(file: &Split, place: Place, o: Open35) -> Result<PlaceQ3, GateError> {
-        PlaceQ3::qwen35_on(file, place, &census()?, o)
+        PlaceQ3::qwen35_on(file, place, &census()?, o, Seqs::ONE)
     }
 
-    /// [`PlaceQ3::qwen35`] resolved against `census`.
+    /// [`PlaceQ3::qwen35`] of a load that holds `seqs`, each of its slots
+    /// opened under `o` (a slot's share of the total, [`share`]), its machine
+    /// carrying their rows ([`laid`]): the serve seat's.
+    #[allow(
+        dead_code,
+        reason = "the serve seat's resident slots; the CLI and the e2e gates load one sequence"
+    )]
+    pub fn qwen35_seqs(
+        file: &Split,
+        place: Place,
+        o: Open35,
+        seqs: Seqs,
+    ) -> Result<PlaceQ3, GateError> {
+        PlaceQ3::qwen35_on(file, place, &census()?, o, seqs)
+    }
+
+    /// [`PlaceQ3::qwen35_seqs`] resolved against `census`.
     fn qwen35_on(
         file: &Split,
         place: Place,
         census: &[DeviceInfo],
         o: Open35,
+        seqs: Seqs,
     ) -> Result<PlaceQ3, GateError> {
         let place = PlaceQ3::resolve(place, census)?;
         let mut inputs = q35::PlanInputs::describe(file)?;
         if o.kv == KvQ8::Q8 {
             inputs.kv = inputs.kv.in_q8();
         }
+        let inputs = Inputs::Qwen35(Box::new(inputs));
         let arena = Qwen35moeModel::placed_arena_bytes(file, o)?;
-        let machine = q3::machine(place.card_specs()?[0], inputs.hp.n_layer, arena);
+        let machine = laid(place.card_specs()?[0], &inputs, arena, seqs);
         Ok(PlaceQ3 {
             place,
             arch: "qwen35moe",
-            inputs: Inputs::Qwen35(Box::new(inputs)),
+            inputs,
             kv: o.kv,
+            seqs,
             machine,
         })
     }
@@ -222,15 +346,16 @@ impl PlaceQ3 {
         })
     }
 
-    /// The same placed load's machine at `ctx`: the place and the inputs this
-    /// one resolved and read stay — the census and the file's headers a
-    /// context search's every probe retook before — and the machine is relaid
-    /// over the arena `ctx` sets, its only ctx-dependent term.
+    /// The same placed load's machine at `ctx`: the place, the inputs and the
+    /// sequences this one resolved and read stay — the census and the file's
+    /// headers a context search's every probe retook before — and the machine
+    /// is relaid over the arena `ctx` sets, its only ctx-dependent term.
     fn machine_at(&self, arena: u64) -> Result<Machine, GateError> {
-        Ok(q3::machine(
+        Ok(laid(
             self.place.card_specs()?[0],
-            self.layers(),
+            &self.inputs,
             arena,
+            self.seqs,
         ))
     }
 
@@ -260,19 +385,16 @@ impl PlaceQ3 {
 
     /// The file's layers.
     fn layers(&self) -> usize {
-        match &self.inputs {
-            Inputs::Qwen3(i) => i.hp.n_layer,
-            Inputs::Qwen35(i) => i.hp.n_layer,
-        }
+        layers_of(&self.inputs)
     }
 
     /// The same placed load on `place`'s card, resolved against `census`:
-    /// the inputs this one read stay, and the machine is relaid on that card
-    /// over the arena this one's counts.
+    /// the inputs and the sequences this one read stay, and the machine is
+    /// relaid on that card over the arena this one's counts.
     fn moved_to(self, place: Place, census: &[DeviceInfo]) -> Result<PlaceQ3, GateError> {
         let place = PlaceQ3::resolve(place, census)?;
         let arena = q3::counted_arena_bytes(&self.machine.cards[0]);
-        let machine = q3::machine(place.card_specs()?[0], self.layers(), arena);
+        let machine = laid(place.card_specs()?[0], &self.inputs, arena, self.seqs);
         Ok(PlaceQ3 {
             place,
             machine,
@@ -601,8 +723,11 @@ pub fn whole_ctx_qwen3(
 }
 
 /// [`whole_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context
-/// terms: one sequence — the body parks no sequence, so however many slots
-/// the seat serves, they take turns over the one the verdict counts.
+/// terms, for `slots` resident sequences: the verdict counts every slot's
+/// stores at its share of the context ([`kv_bytes`]: the attention planes
+/// at `ctx / slots` rows and the delta layers' fixed stores, once a slot),
+/// and the program's own arena and reserve as the load each slot's share
+/// opens at gives them ([`share`]).
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -611,14 +736,17 @@ pub fn whole_ctx_qwen35(
     file: &Split,
     o: &Open35,
     floor: usize,
+    slots: usize,
 ) -> Result<Option<usize>, GateError> {
     let probe = PlaceQ3::qwen35(file, Place::parse("cuda0")?, *o)?;
     let fits = |ctx: usize| {
         probed();
-        let mut at = *o;
-        at.ctx = ctx;
         Ok(probe
-            .whole_at(u64::try_from(ctx)?, 1, qwen35_whole(file, at))?
+            .whole_at(
+                u64::try_from(ctx)?,
+                slots,
+                qwen35_whole(file, share(o, ctx, slots)),
+            )?
             .fits())
     };
     searched_ctx(file, floor, &fits)
@@ -656,7 +784,10 @@ pub fn placed_ctx_qwen3(
 }
 
 /// [`placed_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context
-/// terms: one sequence, as [`whole_ctx_qwen35`] counts it.
+/// terms, for the load's `seqs`: every plan carries their rows ([`laid`]),
+/// its arena the load each slot's share opens at ([`share`]), and a plan
+/// that keeps every expert is held to the whole verdict of every slot, as
+/// [`whole_ctx_qwen35`] counts them.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -667,14 +798,14 @@ pub fn placed_ctx_qwen35(
     place: Place,
     floor: usize,
     levers: &PlanLevers,
+    seqs: Seqs,
 ) -> Result<Option<usize>, GateError> {
-    let probe = PlaceQ3::qwen35(file, place, *o)?;
+    let probe = PlaceQ3::qwen35_on(file, place, &census()?, share(o, floor, seqs.slots), seqs)?;
     let experts = |ctx: usize| {
         probed();
-        let mut at = *o;
-        at.ctx = ctx;
+        let at = share(o, ctx, seqs.slots);
         let machine = probe.machine_at(Qwen35moeModel::placed_arena_bytes(file, at)?)?;
-        probe.card_experts(&machine, ctx, levers, 1, || qwen35_whole(file, at))
+        probe.card_experts(&machine, ctx, levers, seqs.slots, || qwen35_whole(file, at))
     };
     searched_placed_ctx(file, floor, &experts)
 }
@@ -750,13 +881,24 @@ fn searched_ctx(
 }
 
 /// What a run with `--place` unset loads, as [`unplaced_qwen3`] decides it,
-/// of a qwen35moe file under `o`: the whole-fit verdict over the program's
-/// own arena at `o.ubatch` and its reserve ([`qwen35_whole`]) — one
-/// sequence, as [`whole_ctx_qwen35`] counts it.
+/// of a qwen35moe file under `o`: one sequence taking no checkpoints
+/// ([`unplaced_qwen35_slots`]), as the CLI's own runs do.
 pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> {
+    unplaced_qwen35_slots(file, o, Seqs::ONE)
+}
+
+/// What a run with `--place` unset loads, as [`unplaced_qwen3_slots`]
+/// decides it, of a qwen35moe file under `o` at `o.ctx` positions — the
+/// total its `seqs` split: the whole-fit verdict of every slot's stores at
+/// its share ([`whole_ctx_qwen35`]'s count) over the program's own arena and
+/// reserve as a slot's load gives them ([`qwen35_whole`] at [`share`]); the
+/// placed plan on `a`'s card, carrying the sequences' rows ([`laid`]), when
+/// it does not take it.
+pub fn unplaced_qwen35_slots(file: &Split, o: &Open35, seqs: Seqs) -> Result<Unplaced, GateError> {
     let census = census()?;
-    let probe = PlaceQ3::qwen35_on(file, Place::parse("cuda0")?, &census, *o)?;
-    let whole = probe.whole_at(u64::try_from(o.ctx)?, 1, qwen35_whole(file, *o))?;
+    let at = share(o, o.ctx, seqs.slots);
+    let probe = PlaceQ3::qwen35_on(file, Place::parse("cuda0")?, &census, at, seqs)?;
+    let whole = probe.whole_at(u64::try_from(o.ctx)?, seqs.slots, qwen35_whole(file, at))?;
     probe.unplaced(&census, o.ctx, &whole)
 }
 
@@ -797,7 +939,11 @@ pub fn open_unplaced_qwen3(
 }
 
 /// What a run with `--place` unset loads, as [`open_unplaced_qwen3`] loads
-/// it, of a qwen35moe file.
+/// it, of a qwen35moe file: one sequence taking no checkpoints.
+#[allow(
+    dead_code,
+    reason = "generate_qwen3moe opens its unset load through it; the serve seat decides its load at the total for its slots"
+)]
 pub fn open_unplaced_qwen35(
     file: Split,
     o: Open35,
@@ -836,16 +982,8 @@ pub fn open_qwen3(
 }
 
 /// The Qwen3-30B model of `file` by `plan` ([`open_qwen3`]) for `slots`
-/// resident sequences: `plan` made at the total context the slots split,
-/// the model holding its one sequence at `opts.ctx` rows — a slot's share —
-/// so the sequences the caller adds after it sit inside the cache the plan
-/// counts. `slots · opts.ctx` past the plan's `ctx_max` is refused by name
-/// before anything loads; the open is handed the plan with its `ctx_max` at
-/// `opts.ctx` (the rows the caches hold, which the open checks and the model
-/// steps against), every other term the plan's own at the total; once open,
-/// the `slots` sequences' cache — the body's own sequence bytes, `slots`
-/// times — past the plan's KV term is refused by name, and both stand on one
-/// stderr line. One slot is [`open_qwen3`] itself.
+/// resident sequences of `opts.ctx` rows each ([`open_slots`]). One slot is
+/// [`open_qwen3`] itself.
 #[allow(
     dead_code,
     reason = "the serve seat's resident slots; the CLI and the e2e gates load one sequence"
@@ -857,40 +995,132 @@ pub fn open_qwen3_slots(
     opts: OpenOpts,
     host: HostCfg,
 ) -> Result<Qwen3moeModel, GateError> {
-    const WHAT: &str = "placed slots";
     if slots <= 1 {
         return open_qwen3(file, plan, opts, host);
     }
-    let rows = u64::try_from(slots.saturating_mul(opts.ctx))?;
+    open_slots(plan, slots, opts.ctx, |at| open_qwen3(file, at, opts, host))
+}
+
+/// The Qwen3.6 model of `file` by `plan` ([`open_qwen35`]) for `slots`
+/// resident sequences of `o.ctx` rows each ([`open_slots`]), `plan` carrying
+/// their rows ([`PlaceQ3::qwen35_seqs`]). One slot is [`open_qwen35`]
+/// itself.
+#[allow(
+    dead_code,
+    reason = "the serve seat's resident slots; the CLI and the e2e gates load one sequence"
+)]
+pub fn open_qwen35_slots(
+    file: Split,
+    plan: &Plan<'_>,
+    slots: usize,
+    o: Open35,
+    host: HostCfg,
+) -> Result<Qwen35moeModel, GateError> {
+    if slots <= 1 {
+        return open_qwen35(file, plan, o, host);
+    }
+    open_slots(plan, slots, o.ctx, |at| open_qwen35(file, at, o, host))
+}
+
+/// The model `open` makes by `plan` for `slots` resident sequences, the
+/// seat's split for both bodies: `plan` made at the total context the slots
+/// split, the model holding its one sequence at `ctx` rows — a slot's share
+/// — so the sequences the caller adds after it sit inside the cache the plan
+/// counts. `slots · ctx` past the plan's `ctx_max` is refused by name before
+/// anything loads; `open` is handed the plan with its `ctx_max` at `ctx`
+/// (the rows the caches hold, which the open checks and the model steps
+/// against), every other term the plan's own at the total; once open, the
+/// `slots` sequences' stores — the body's own sequence bytes
+/// ([`Slots::seq_bytes`]), `slots` times — past what the plan counts for
+/// them — its KV term and its card's [`SLOTS_RESERVE`] rows ([`laid`]) — are
+/// refused by name, and both stand on one stderr line.
+fn open_slots<B: Slots>(
+    plan: &Plan<'_>,
+    slots: usize,
+    ctx: usize,
+    open: impl FnOnce(&Plan<'_>) -> Result<GpuModel<B>, GateError>,
+) -> Result<GpuModel<B>, GateError> {
+    const WHAT: &str = "placed slots";
+    let rows = u64::try_from(slots.saturating_mul(ctx))?;
     if rows > plan.ctx_max {
         return Err(format!(
-            "{WHAT}: {slots} sequences of {} rows hold {rows} positions, past the {} the plan \
+            "{WHAT}: {slots} sequences of {ctx} rows hold {rows} positions, past the {} the plan \
              counts",
-            opts.ctx, plan.ctx_max
+            plan.ctx_max
         )
         .into());
     }
     let at = Plan {
-        ctx_max: u64::try_from(opts.ctx)?,
+        ctx_max: u64::try_from(ctx)?,
         ..plan.clone()
     };
-    let m = open_qwen3(file, &at, opts, host)?;
+    let m = open(&at)?;
     let held = u64::try_from(m.body(WHAT)?.seq_bytes())?.saturating_mul(u64::try_from(slots)?);
-    let counted = plan
-        .cards
-        .first()
-        .ok_or_else(|| format!("{WHAT}: a plan of no card"))?
-        .kv_bytes;
+    let (Some(totals), Some(card)) = (plan.cards.first(), plan.machine.cards.first()) else {
+        return Err(format!("{WHAT}: a plan of no card").into());
+    };
+    let kv = totals.kv_bytes;
+    let row: u64 = card
+        .reserves
+        .iter()
+        .filter(|(name, _)| name == SLOTS_RESERVE)
+        .map(|&(_, b)| b)
+        .sum();
+    let counted = kv.saturating_add(row);
+    let terms = if row > 0 {
+        format!(" (its KV term {kv} B and its {SLOTS_RESERVE} reserve {row} B)")
+    } else {
+        String::new()
+    };
     let line = format!(
-        "{WHAT}: {slots} sequences of {} rows hold {held} B of cache; the plan at {} positions \
-         counts {counted} B",
-        opts.ctx, plan.ctx_max
+        "{WHAT}: {slots} sequences of {ctx} rows hold {held} B of cache; the plan at {} positions \
+         counts {counted} B{terms}",
+        plan.ctx_max
     );
     if held > counted {
         return Err(format!("{line}: past its count").into());
     }
     eprintln!("{line}");
     Ok(m)
+}
+
+/// The checkpoints `seqs` pin on the host held against what the load counts
+/// them in, one stderr line either way: a placed load's plan carries them as
+/// its host's [`CHECKPOINTS_RESERVE`] ([`laid`]), which its own check holds
+/// against the host's usable bytes and refuses by name; a whole-card load has
+/// no host plan, so the host's available bytes now
+/// ([`workstation::host_available`]) must hold them, else they are refused
+/// by name before anything loads. Nothing for `seqs` that take none.
+#[allow(
+    dead_code,
+    reason = "the serve seat's qwen35moe loads take checkpoints; the CLI and the e2e gates take none"
+)]
+pub fn checkpoints_fit(seqs: Seqs, placed: bool) -> Result<(), GateError> {
+    if !seqs.checkpoints {
+        return Ok(());
+    }
+    let pin = checkpoint_bytes(seqs.slots);
+    let n = seqs.slots;
+    let what = if n == 1 {
+        "sequence pins"
+    } else {
+        "sequences pin"
+    };
+    let head = format!("checkpoints: {n} {what} at most {pin} B of host ({HOST_BUDGET} B each)");
+    if placed {
+        eprintln!("{head}, counted in the placed plan's host reserves");
+        return Ok(());
+    }
+    let available = workstation::host_available()?;
+    if pin > available {
+        return Err(format!(
+            "{head}, past the {available} B the host has available (MemAvailable): give a smaller \
+             --parallel"
+        )
+        .into());
+    }
+    eprintln!("{head}, of {available} B the host has available");
+    Ok(())
 }
 
 /// The Qwen3.6 model of `file` by `plan`, as [`open_qwen3`].
