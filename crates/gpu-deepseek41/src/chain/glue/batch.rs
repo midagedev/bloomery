@@ -111,14 +111,24 @@ impl Glue {
 
     /// Enqueue the embedding broadcast of the first `m` tokens of the image
     /// `params`: token `t`'s row into its four streams, `streams[4·n·t ..]`,
-    /// and into its layer-0 input, `input[n·t ..]`. One launch a token.
+    /// and into its layer-0 input, `input[n·t ..]`. One launch a token. With
+    /// `media`, a media call's, a token it marks takes its row from `media`'s
+    /// rows instead — bf16, two to a word with the low half first, row `t`
+    /// at word `t · n / 2` — through the bf16 entry, whatever `token_embd`'s
+    /// format. `media` is per token of the chunk whether it is a media
+    /// position, and the chunk's rows from its first token on.
     /// Asynchronous, allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the broadcast's image, token count and outputs, and a media call's rows (rust-quality R8)"
+    )]
     pub fn enqueue_batch_embed(
         &self,
         gpu: &Gpu,
         b: &GlueBatch,
         params: &DeviceBuffer<u32>,
         m: usize,
+        media: Option<(&[bool], &DeviceBuffer<u32>)>,
         streams: &mut DeviceBuffer<f32>,
         input: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
@@ -127,6 +137,11 @@ impl Glue {
         check_tokens(WHAT, b, m)?;
         need(WHAT, "streams", streams.len(), m * HC_STREAMS * n)?;
         need(WHAT, "input", input.len(), m * n)?;
+        let half = launch_u32(WHAT, "media row words", n / 2)?;
+        if let Some((of, rows)) = media {
+            need(WHAT, "media flags", of.len(), m)?;
+            need(WHAT, "media rows", rows.len(), m * n / 2)?;
+        }
         for (t, &at) in b.embd_at.iter().take(m).enumerate() {
             need(
                 WHAT,
@@ -136,6 +151,25 @@ impl Glue {
             )?;
             let mut s = span_mut(WHAT, streams, t * HC_STREAMS * n, HC_STREAMS * n)?;
             let mut x = span_mut(WHAT, input, t * n, n)?;
+            if let Some((_, rows)) = media.filter(|(of, _)| of[t]) {
+                let prep = self.module.prepare_ds41_glue_embed(LaunchConfig1D::new(
+                    half.div_ceil(THREADS),
+                    THREADS,
+                    0,
+                ))?;
+                let at = launch_u32(WHAT, "media row", t * n / 2)?;
+                self.module.ds41_glue_embed(
+                    gpu.stream(),
+                    &prep,
+                    rows,
+                    at,
+                    half,
+                    HC_STREAMS as u32,
+                    &mut s,
+                    &mut x,
+                )?;
+                continue;
+            }
             match self.embd {
                 EmbdRows::Bf16 => {
                     let half = self.embd_words;
@@ -367,15 +401,34 @@ impl PromptRows {
     /// reader's `cap` tokens in all, from `file`, the file the step's reader
     /// opened.
     pub fn fill(&mut self, file: &Split, plans: &[StepPlan]) -> Result<(), GpuError> {
+        self.fill_media(file, plans, &[])
+    }
+
+    /// [`PromptRows::fill`] with `media`, empty or per token of the steps
+    /// whether it is a media position: such a token's engram rows are zero
+    /// rows, neither hashed nor read — the engram step then leaves its
+    /// streams as they came — and its embedding row is the table's as for
+    /// any token (its broadcast reads the media rows instead).
+    pub fn fill_media(
+        &mut self,
+        file: &Split,
+        plans: &[StepPlan],
+        media: &[bool],
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "PromptRows::fill";
         let n_gram = self.ctx.len();
         let total: usize = plans.iter().map(StepPlan::len).sum();
-        if total == 0 || total > self.cap {
+        if total == 0 || total > self.cap || !(media.is_empty() || media.len() == total) {
             return Err(GpuError::Shape {
                 what: WHAT,
-                detail: format!("{total} tokens in a batch of at most {}", self.cap),
+                detail: format!(
+                    "{total} tokens in a batch of at most {}, {} media flags",
+                    self.cap,
+                    media.len()
+                ),
             });
         }
+        let is_media = |k: usize| media.get(k).copied().unwrap_or(false);
         let sites = self.engram.sites().len();
         let token_ids = sites * self.n_cols;
         let mut t = 0;
@@ -398,6 +451,9 @@ impl PromptRows {
                 plan,
             )?;
             for (k, window) in plan.engram_window.chunks_exact(n_gram).enumerate() {
+                if is_media(t + k) {
+                    continue;
+                }
                 let ids = &mut self.ids[(t + k) * token_ids..][..token_ids];
                 token_rows(&self.engram, &mut self.ctx, window, ids, self.n_cols)?;
             }
@@ -405,7 +461,7 @@ impl PromptRows {
         }
         for (s, list) in self.site_ids.iter_mut().enumerate() {
             list.clear();
-            for k in 0..total {
+            for k in (0..total).filter(|&k| !is_media(k)) {
                 list.extend_from_slice(&self.ids[(k * sites + s) * self.n_cols..][..self.n_cols]);
             }
         }
@@ -415,6 +471,10 @@ impl PromptRows {
         let site_bytes = self.n_cols * self.row_bytes;
         for k in 0..total {
             let out = &mut self.engram_rows[k * sites * site_bytes..][..sites * site_bytes];
+            if is_media(k) {
+                out.fill(0);
+                continue;
+            }
             for ((site, ids), dst) in self
                 .engram
                 .sites()

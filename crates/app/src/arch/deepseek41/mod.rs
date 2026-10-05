@@ -11,13 +11,13 @@ use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu_deepseek41::body::{
-    self, Body, BodyMeta, FeatureRows, FeatureSink, OpenCfg, PrefillMode, TierOpen,
+    self, Body, BodyMeta, FeatureRows, FeatureSink, MediaSpan, OpenCfg, PrefillMode, TierOpen,
 };
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, Plan};
 use runtime::swaprule::KeptRows;
-use runtime::{Tapped, Target};
+use runtime::{Out, Tapped, Target, Want};
 
 use crate::{Keep, Open, Prompt, Session, SessionError};
 
@@ -175,6 +175,32 @@ impl Tapped for Session<Body> {
 }
 
 impl Session<Body> {
+    /// [`Target::prompt`] of `ids` with `media` spliced in: under the batched
+    /// schedule one prompt call ([`body::prefill_media`], one residency pass
+    /// as [`Prompt::prompt`]'s), each span's positions taking its rows, the
+    /// vision routing bias and dead engram n-grams, which the history keeps
+    /// for the steps after. Refused by name under steps, which feed one id a
+    /// step and have no place for a span's rows.
+    pub fn prompt_media(
+        &mut self,
+        ids: &[u32],
+        media: &[MediaSpan<'_>],
+        want: Want,
+    ) -> Result<Out<'_>, SessionError> {
+        self.idle("prompt")?;
+        match self.model().body(WHAT)?.prefill_mode() {
+            PrefillMode::Batch => {
+                let argmax = call(self.model_mut(), |m| body::prefill_media(m, ids, media))?;
+                self.read(argmax, want)
+            }
+            PrefillMode::Steps => Err(SessionError::Refused(format!(
+                "a prompt with {} media spans under BLOOMERY_PREFILL=steps: a span's rows enter \
+                 only through the batched call (BLOOMERY_PREFILL=batch)",
+                media.len()
+            ))),
+        }
+    }
+
     /// [`Target::prompt`] with the feature tap's rows handed to `sink` (the
     /// first position they hold, then one row a position): under the batched
     /// schedule the rows of the call's last `window` positions, per batch
