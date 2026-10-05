@@ -471,6 +471,76 @@ fn hw_unsupported_fields_are_refused() {
     }
 }
 
+/// A chat content part this server cannot read is refused, never dropped: a
+/// media part by its kind, any other by its type, on both paths that render a
+/// chat, in llama-server's words; a `/completion` prompt object carrying media
+/// likewise. Text parts still render byte for byte as the string they join to.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_media_parts_are_refused() {
+    let addr = start(4096);
+    let refused = |r: common::Reply, message: &str| {
+        assert_eq!(r.status, 400, "{}", r.body);
+        let e = &r.json()["error"];
+        assert_eq!(e["code"], 400, "{e}");
+        assert_eq!(e["type"], "invalid_request_error", "{e}");
+        assert_eq!(e["message"], message, "{e}");
+    };
+    let user = |content: Value| json!({"messages": [{"role": "user", "content": content}]});
+    let hint =
+        "input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
+    let parts = [
+        (
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}),
+            format!("image {hint}"),
+        ),
+        (
+            json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+            format!("audio {hint}"),
+        ),
+        (
+            json!({"type": "bogus"}),
+            "unsupported content[].type".to_owned(),
+        ),
+    ];
+    for (part, message) in parts {
+        let b = chat_body(user(json!([{"type": "text", "text": "hi"}, part])));
+        for path in ["/v1/chat/completions", "/apply-template"] {
+            refused(post(addr, path, &b), &message);
+        }
+    }
+    refused(
+        post(
+            addr,
+            "/completion",
+            &json!({"prompt": {"prompt_string": "ab", "multimodal_data": ["AAAA"]}}),
+        ),
+        "Multimodal data provided, but model does not support multimodal requests.",
+    );
+    let rendered = |content: Value| {
+        let r = post(addr, "/apply-template", &user(content));
+        assert_eq!(r.status, 200, "{}", r.body);
+        r.json()["prompt"].clone()
+    };
+    assert_eq!(
+        rendered(json!([{"type": "text", "text": "hi"}])),
+        rendered(json!("hi"))
+    );
+    let ab = json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]);
+    assert_eq!(rendered(ab.clone()), rendered(json!("a\nb")));
+    let reply = |content: Value| {
+        let mut b = chat_body(user(content));
+        b["max_tokens"] = json!(4);
+        let r = post(addr, "/v1/chat/completions", &b);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = r.json();
+        let u = &v["usage"];
+        let tokens = (u["prompt_tokens"].clone(), u["completion_tokens"].clone());
+        (v["choices"][0]["message"].clone(), tokens)
+    };
+    assert_eq!(reply(ab), reply(json!("a\nb")));
+}
+
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_models_created_is_process_start() {

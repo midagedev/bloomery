@@ -1479,12 +1479,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError
         }
         let mut m = m.clone();
         if let Some(Value::Array(parts)) = m.get("content") {
-            let text: String = parts
-                .iter()
-                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
-                .filter_map(|p| p.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let text = content_text(parts)?;
             m.insert("content".into(), Value::String(text));
         }
         messages.push(Value::Object(m));
@@ -1517,6 +1512,31 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<String, ApiError
         kind: "server_error",
         message: e.to_string(),
     })
+}
+
+/// The text of an array `content`: its text parts joined by newlines. This
+/// server reads no media, so a media part is a 400 naming its kind in
+/// llama-server's words, and any other part a 400 too: nothing is dropped.
+fn content_text(parts: &[Value]) -> Result<String, ApiError> {
+    let no_media = |kind: &str| {
+        invalid(format!(
+            "{kind} input is not supported - hint: if this is unexpected, you may need to provide the mmproj"
+        ))
+    };
+    let mut text = Vec::with_capacity(parts.len());
+    for p in parts {
+        match p.get("type").and_then(Value::as_str) {
+            Some("text") => match p.get("text") {
+                Some(Value::String(s)) => text.push(s.as_str()),
+                _ => return Err(invalid("content[].text must be a string")),
+            },
+            Some("image_url") => return Err(no_media("image")),
+            Some("input_audio") => return Err(no_media("audio")),
+            Some("input_video" | "video_url") => return Err(no_media("video")),
+            _ => return Err(invalid("unsupported content[].type")),
+        }
+    }
+    Ok(text.join("\n"))
 }
 
 // ---------------------------------------------------------------- generation endpoints
@@ -1859,10 +1879,14 @@ fn state_error(
 }
 
 /// The prompt of `/completion`: text (BOS per `add_bos_token`), an id array, or a
-/// mixed array whose strings are tokenized in place.
+/// mixed array whose strings are tokenized in place. A prompt object carrying
+/// media, alone or in the array, is refused by that name in llama-server's words.
 fn completion_prompt(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiError> {
     let e = &*state.tok;
+    let no_media =
+        || invalid("Multimodal data provided, but model does not support multimodal requests.");
     match v {
+        Some(o) if carries_media(o) => Err(no_media()),
         Some(Value::String(s)) => {
             let mut ids = Vec::new();
             if e.add_bos() {
@@ -1879,12 +1903,25 @@ fn completion_prompt(state: &State, v: Option<&Value>) -> Result<Vec<u32>, ApiEr
             for x in a {
                 match x {
                     Value::String(s) => ids.extend(e.encode(s)),
+                    o if carries_media(o) => return Err(no_media()),
                     other => ids.extend(token_ids(state, &Value::Array(vec![other.clone()]))?),
                 }
             }
             Ok(ids)
         }
         _ => Err(invalid("'prompt' must be a string or an array of tokens")),
+    }
+}
+
+/// Whether a prompt object carries media: a `multimodal_data` that holds
+/// anything (`null` or an empty array, string or object holds nothing).
+fn carries_media(v: &Value) -> bool {
+    match v.get("multimodal_data") {
+        None | Some(Value::Null) => false,
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(Value::String(s)) => !s.is_empty(),
+        Some(Value::Object(o)) => !o.is_empty(),
+        Some(_) => true,
     }
 }
 
@@ -2338,10 +2375,91 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
 mod tests {
     use super::{
         ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, EngineProps, SlotQueue,
-        after_accept_error, engine_object,
+        after_accept_error, carries_media, content_text, engine_object,
     };
+    use serde_json::{Value, json};
     use std::io;
     use std::time::Duration;
+
+    /// Text parts join by newline, as one string `content` would carry them.
+    /// Every other part is refused by name, wherever it stands in the array:
+    /// a media part by its kind in llama-server's words, a part of any other
+    /// type (or none) as an unsupported type, a text part whose `text` is not
+    /// a string as such. Nothing is dropped.
+    #[test]
+    fn content_parts_join_text_and_refuse_the_rest_by_name() {
+        let text = |t: &str| json!({"type": "text", "text": t});
+        assert_eq!(
+            content_text(&[text("a"), text("b")]).ok().as_deref(),
+            Some("a\nb")
+        );
+        assert_eq!(content_text(&[text("hi")]).ok().as_deref(), Some("hi"));
+        assert_eq!(content_text(&[]).ok().as_deref(), Some(""));
+        let image = "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
+        let audio = "audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
+        let video = "video input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
+        let unsupported = "unsupported content[].type";
+        let not_string = "content[].text must be a string";
+        let refused = [
+            (
+                json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}),
+                image,
+            ),
+            (
+                json!({"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}}),
+                audio,
+            ),
+            (
+                json!({"type": "input_video", "input_video": {"url": "file:///v.mp4"}}),
+                video,
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "file:///v.mp4"}}),
+                video,
+            ),
+            (json!({"type": "bogus"}), unsupported),
+            (json!({"type": ""}), unsupported),
+            (json!({"type": 7}), unsupported),
+            (json!({"text": "a"}), unsupported),
+            (json!("a"), unsupported),
+            (json!({"type": "text", "text": 3}), not_string),
+            (json!({"type": "text", "text": null}), not_string),
+            (json!({"type": "text"}), not_string),
+        ];
+        for (part, message) in refused {
+            for parts in [vec![part.clone()], vec![text("a"), part.clone(), text("b")]] {
+                match content_text(&parts) {
+                    Ok(t) => panic!("{part} accepted as {t:?}"),
+                    Err(e) => {
+                        assert_eq!((e.code, e.kind), (400, "invalid_request_error"), "{part}");
+                        assert_eq!(e.message, message, "{part}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `/completion` prompt object carries media when its `multimodal_data`
+    /// holds anything; `null`, empty or absent carries none, and a prompt that
+    /// is not an object carries none.
+    #[test]
+    fn prompt_media_is_a_non_empty_multimodal_data() {
+        let with = |d: Value| json!({"prompt_string": "ab", "multimodal_data": d});
+        for d in [json!(["AAAA"]), json!("AAAA"), json!({"a": 1}), json!(0)] {
+            assert!(carries_media(&with(d.clone())), "{d}");
+        }
+        for d in [json!([]), json!(""), json!({}), Value::Null] {
+            assert!(!carries_media(&with(d.clone())), "{d}");
+        }
+        for v in [
+            json!({"prompt_string": "ab"}),
+            json!("ab"),
+            json!([1, 2]),
+            json!(7),
+        ] {
+            assert!(!carries_media(&v), "{v}");
+        }
+    }
 
     /// `engine.ctx_verified` is the engine's verified context when it
     /// reports one, and absent when it does not: nothing is guessed.
