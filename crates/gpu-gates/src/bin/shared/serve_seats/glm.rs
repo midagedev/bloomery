@@ -85,17 +85,27 @@
 //!
 //! `--parallel N` (`-np N`, default 2) serves N resident sequences inside
 //! the one model (`Session::add_slots` over the body's `Slots`): the server
-//! steps every running slot in each round, one pass a slot, the sequences
-//! switched by pointer exchange and the draft's side of each slot kept with
-//! it ([`DraftedSeat::select`]), so each request's tokens are its solo
-//! run's; `--parallel 1` is the one-sequence server and `--parallel 0` is
-//! refused by name. The plan counts every sequence in its KV term
+//! steps every running slot in each round, the sequences switched by
+//! pointer exchange and the draft's side of each slot kept with it
+//! ([`DraftedSeat::select`]), so each request's tokens are its solo run's;
+//! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
+//! by name. The round's shape the open decided once: a plain load (no
+//! NextN draft) runs it as one pass of the busy rows
+//! (`serve_seats::rounds::step_rows_one_pass`, cut at the body's two rows),
+//! a NextN load as a select and a step a row — its body refuses a slots
+//! pass by name, each of its slots being drafted and a pass of plain steps
+//! telling no slot's draft what it ran, until stagger stage S4 — and a
+//! refusal mid-round is the server's error, never a fallback to the loop. A
+//! `parallel` line on stderr names the rule (`slots`), the slots, a slot's
+//! context, the total and the shape (`pass=one` or `pass=turns`); under
+//! `BLOOMERY_STEP_STATS=1` each round of several slots prints a `slots
+//! round` record naming its command, rows, passes and the slots the seat
+//! serves. The plan counts every sequence in its KV term
 //! (`PlanInputs::plan_slots`, `plan_nextn_slots`), so the context search, the
 //! load and `/props`' `vram_kv_bytes` see them all, and a card that cannot
 //! hold them is refused by name. Nothing parks — no slot waits for another —
-//! so `--park-ram` is refused by name. A `parallel` line on stderr names the
-//! rule (`slots`), the slots, a slot's context and the total. `--queue-depth
-//! Q` bounds the requests that wait for a slot.
+//! so `--park-ram` is refused by name. `--queue-depth Q` bounds the requests
+//! that wait for a slot.
 //!
 //! `BLOOMERY_DRAFT=mtp` loads the file's next-token layer beside the target
 //! (`app::arch::glm5next::open_nextn`, the plan `PlanInputs::plan_nextn`
@@ -165,8 +175,8 @@ use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
-    sampler_factory,
+    CacheRam, Seat, SeatEngine, SlotStep, Vocab, model_props, nvidia_smi_index, placement_props,
+    sampler_factory, step_rows_in_turn,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -216,11 +226,13 @@ const CTX: usize = 2048;
 const CTX_STEP: usize = 256;
 
 /// The levers this seat acts on: those `generate_glm5next` reads for its load
-/// and its draft (`BLOOMERY_ROUTE_TRACE` and `BLOOMERY_STEP_STATS` left out —
-/// each is one run's instrument, which a server that serves many prompts
-/// does not wire, and a lever set outside this list is refused by name at
-/// `main`), with `BLOOMERY_PIN_MAIN` for the engine thread's cpu slot, as
-/// every serving seat reads it; `gate_glm5next_serve` holds the same list.
+/// and its draft (`BLOOMERY_ROUTE_TRACE` left out — one run's instrument,
+/// which a server that serves many prompts does not wire) and
+/// `BLOOMERY_STEP_STATS`, which the seat reads to count its rounds of several
+/// slots (a `slots round` record each); a lever set outside this list is
+/// refused by name at `main`, with `BLOOMERY_PIN_MAIN` for the engine
+/// thread's cpu slot, as every serving seat reads it; `gate_glm5next_serve`
+/// holds the same list.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::HOST_POPULATE,
@@ -230,6 +242,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::PIN_MAIN,
     bloomery_levers::DRAFT,
     bloomery_levers::RESIDENCY,
+    bloomery_levers::STEP_STATS,
 ];
 
 /// The drafted window's verify: the target's next token and the draft's one
@@ -701,9 +714,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let cache = CacheRam::of(a.cache_ram, HostNeed::of(&plan, beside).bytes(), pool)?;
     eprintln!("{}", cache.line());
     eprintln!(
-        "parallel rule=slots slots={slots} slot_ctx={} total={}",
+        "parallel rule=slots slots={slots} slot_ctx={} total={} pass={}",
         rule.ctx,
-        slots * rule.ctx
+        slots * rule.ctx,
+        // The round's shape the open below runs (the module doc): one pass
+        // of the busy rows on a plain load, a select and a step a row on a
+        // NextN one.
+        if draft_off.is_some() { "one" } else { "turns" }
     );
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
@@ -739,6 +756,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_off,
         draft_bytes,
         residency,
+        stats: levers.step_stats(),
     };
     let engine = SeatEngine::spawn(
         move || Glm::open(open),
@@ -800,6 +818,9 @@ struct SeatArgs {
     draft_bytes: u64,
     /// The residency the load runs.
     residency: Residency,
+    /// Whether the seat counts its rounds of several slots
+    /// (`BLOOMERY_STEP_STATS`, the binary's `main` parsed).
+    stats: bool,
 }
 
 /// The GLM session on the engine thread: the session over the model, the
@@ -817,6 +838,14 @@ struct Glm {
     /// The load runs the residency machine: each call prints its
     /// boundaries' `residency pass` records.
     residency: bool,
+    /// Whether a round of several slots runs as one pass of the busy rows
+    /// ([`Glm::step_slots`]): a plain load, whose body runs several slots'
+    /// rows as one pass — a NextN load keeps the fallback loop, its body
+    /// refusing a slots pass by name (each of its slots is drafted) until
+    /// stagger stage S4.
+    one_pass: bool,
+    /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
+    stats: bool,
 }
 
 impl Glm {
@@ -885,6 +914,8 @@ impl Glm {
             draft_bytes: a.draft_bytes,
             path: a.path,
             residency,
+            one_pass: a.draft_off.is_some(),
+            stats: a.stats,
         })
     }
 
@@ -1063,6 +1094,35 @@ impl Seat for Glm {
     /// passes are the passes it would run alone.
     fn slot_drafts(&self) -> bool {
         self.drafted.drafts()
+    }
+
+    /// The lever the binary parsed ([`Glm::stats`]).
+    fn step_stats(&self) -> bool {
+        self.stats
+    }
+
+    /// One round of several slots: one pass of the busy rows while the open
+    /// decided so ([`Glm::one_pass`], through
+    /// `serve_seats::rounds::step_rows_one_pass` — cut at the body's two
+    /// rows, the rows' answers and lent logits rows from the pass's own
+    /// per-row heads, slot 0 left selected), else the seat's fallback — a
+    /// select and a step a row — the NextN load's round, whose body refuses
+    /// a slots pass by name (each of its slots is drafted, and a pass of
+    /// plain steps tells no slot's draft what it ran, until stagger stage
+    /// S4). A refusal on either path is the server's to die on: the open
+    /// decides once, so a load that cannot run one pass never tries it at
+    /// run time.
+    fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
+        if !self.one_pass {
+            return step_rows_in_turn(self, rows);
+        }
+        let passes =
+            super::rounds::step_rows_one_pass(&mut self.s, rows).map_err(|e| e.to_string())?;
+        self.print_passes().map_err(|e| e.to_string())?;
+        if self.stats {
+            record::slots_round("step", rows.len(), passes, self.slots()).eprint();
+        }
+        Ok(())
     }
 
     /// The body's feed ([`bloomery_gpu_glm5next::feed`]): the batched prompt

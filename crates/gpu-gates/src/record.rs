@@ -2609,8 +2609,9 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
 /// residency lever's word, the `plan`, `load` and `capture` lines
 /// `generate_glm5next` prints, the host set's records of a placed load, the
 /// draft's load line and its verify's capture, the listening line, the reuse
-/// records the checkpoint rule answers, the draft's joins, and the residency
-/// machine's records.
+/// records the checkpoint rule answers, the draft's joins, the residency
+/// machine's records, and the rounds of several slots a
+/// `BLOOMERY_STEP_STATS` run counts.
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
@@ -2631,6 +2632,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
+    &SLOTS_ROUND,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
