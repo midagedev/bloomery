@@ -22,13 +22,25 @@
 //! ids `generate_glm5next --tokens <the prompt's ids>` prints.
 //!
 //! `--place` is the shared placement word (`generate::Place`, as
-//! `generate_glm5next` takes it): `a` (the serving plan, `workstation::plan_a`,
-//! on the A6000 — the default, as both other serving seats), `gate` (the gate
-//! card's), or `bp` (plan (b′): plan (a) on the A6000 and the 3090 an expert
-//! tier under the host tier, its prompt-batch bytes `place::tier_batch`'s) and
-//! its list spelling `a6000+3090`; a list of more tier cards than the GLM
-//! body serves (`bloomery_gpu::host::SERVED_TIERS`) and a stage other than the
-//! A6000 are refused by name before the plan. The
+//! `generate_glm5next` takes it): `a` (the serving plan, `workstation::plan_a`:
+//! the stage on the largest visible card, the A6000 here), `gate` (the gate
+//! card's), or `bp` (plan (b′): plan (a)'s stage and the next-largest card an
+//! expert tier under the host tier — the 3090 under the A6000 here — its
+//! prompt-batch bytes `place::tier_batch`'s) and its list spelling
+//! `a6000+3090`; a list of more tier cards than the GLM body serves
+//! (`bloomery_gpu::host::SERVED_TIERS`) is refused by name before the plan.
+//! Unset, the cards decide, on the census the placement resolves against,
+//! read once: with a second card visible the seat plans `bp` as it would
+//! run it (`Place::by_cards`) and keeps it when the plan puts at least
+//! `TIER_BREAK_EVEN` experts on the tier card, else it runs `a`
+//! (`Place::keep_tier`); with one card, `a`. A `place unset` record after
+//! the levers' records and before the `ctx` line names the word, why
+//! (`two cards, tier at or past the break-even`,
+//! `two cards, tier under the break-even`, `two cards, the tier's plan
+//! refused` (the refusal on stderr), `one card`, or `set` under the
+//! flag), the tier's experts in that plan of `bp` (under the flag, the
+//! placement's own; 0 with no tier card) and the break-even. A refusal of
+//! that plan of `bp` is the seat's refusal by name. The
 //! positions a slot serves are the stores the load sized for each sequence
 //! (`--ctx` names the total the slots split): `/props`' `n_ctx` is that
 //! number, a prompt that long is a 400 before it reaches the engine, and
@@ -194,7 +206,7 @@ use bloomery_gpu_gates::bind::{
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
-use bloomery_gpu_gates::{GateError, ref_model_path};
+use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_gpu_glm5next::{
     Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_resume, seq_save,
 };
@@ -481,6 +493,53 @@ fn plan_of<'a>(
     })
 }
 
+/// With `--place` unset, a second card serves as plan (b′)'s tier only when
+/// the plan puts this many experts on it: the tier size whose predicted
+/// decode gain clears 0 (docs/cards/glmbp-ab.card).
+const TIER_BREAK_EVEN: u64 = 526;
+
+/// A placement as the seat plans it: the tier's prompt-batch bytes, the
+/// machine, the context rule over it, and the experts its tier cards hold
+/// in the plan at the rule's context (0 with no tier card).
+struct Placed {
+    place: Place,
+    tier_batch: Option<TierBatchBytes>,
+    machine: Machine,
+    rule: GlmCtx,
+    tier_experts: u64,
+}
+
+impl Placed {
+    /// `place` planned for `slots` sequences on the load `nextn` names, its
+    /// context `set` or the rule's ([`ctx_of`]); every refusal of the plan's
+    /// by name.
+    fn of(
+        place: Place,
+        inputs: &PlanInputs,
+        levers: &PlanLevers,
+        nextn: Option<&NextnInputs>,
+        set: Option<usize>,
+        slots: usize,
+    ) -> Result<Placed, GateError> {
+        let tier_batch = glm_place::tier_batch(place, &inputs.hp);
+        let machine = place.machine(None, tier_batch)?(inputs.model.layers);
+        let rule = ctx_of(inputs, &machine, levers, nextn, set, slots)?;
+        let ctx = u64::try_from(rule.ctx)?;
+        let tier_experts = plan_of(inputs, &machine, ctx, levers, nextn, slots)?
+            .tier_n_l
+            .iter()
+            .flatten()
+            .sum();
+        Ok(Placed {
+            place,
+            tier_batch,
+            machine,
+            rule,
+            tier_experts,
+        })
+    }
+}
+
 /// `BLOOMERY_RESIDENCY` as this seat takes it before the plan.
 enum ResidencyLever {
     /// Set: its parse and word.
@@ -562,7 +621,9 @@ fn residency_at(
 struct Args {
     host: String,
     port: u16,
-    place: Place,
+    /// `--place`; `None` takes what the cards call for ([`Place::by_cards`],
+    /// [`Place::keep_tier`]).
+    place: Option<Place>,
     /// `--ctx`; `None` takes the rule's default.
     ctx: Option<usize>,
     alias: Option<String>,
@@ -585,7 +646,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     let mut a = Args {
         host: "127.0.0.1".to_owned(),
         port: 8080,
-        place: Place::A,
+        place: None,
         ctx: None,
         alias: None,
         cache_ram: None,
@@ -611,7 +672,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         match flag {
             "--host" => a.host = v.to_owned(),
             "--port" => a.port = v.parse()?,
-            "--place" => a.place = glm_place::parse(v)?,
+            "--place" => a.place = Some(glm_place::parse(v)?),
             "--ctx" => a.ctx = Some(v.parse()?),
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
@@ -640,7 +701,6 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     if a.parallel == 0 {
         return Err("--parallel 0: the server serves no slot".into());
     }
-    a.place = a.place.on_host()?;
     Ok(a)
 }
 
@@ -650,6 +710,14 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
     record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
     let a = parse_args(args)?;
+    // The census the placement resolves against, read once: `--place` as
+    // given, or unset the cards' offer and, when its plan drops the tier,
+    // `a` on the same reading.
+    let census = gpu_census::census()?;
+    let offer = match a.place {
+        Some(p) => p.on(&census)?,
+        None => Place::by_cards(&census)?,
+    };
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let path = ref_model_path()?;
     let vocab = Arc::new(Vocab::new(Tokenizer::from_gguf(&path)?)?);
@@ -716,8 +784,9 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // is never under it while the card holds it — and the context the rule
     // chooses is asked again below.
     let at_ctx = set.unwrap_or(CTX);
+    // `a` and `bp` both serve, so the offer's picks are the placement's.
     let unset = glm_unset(GlmAt {
-        serving_place: a.place != Place::Gate,
+        serving_place: offer != Place::Gate,
         nextn_layers: inputs.hp.n_layer.saturating_sub(inputs.hp.n_trunk),
         need: NEED,
         ctx: at_ctx,
@@ -726,13 +795,54 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let lever = residency_of(&levers, a.prefill, unset.residency)?;
     let draft_off = draft_of(&levers, at_ctx, unset.draft)?;
     let model = model_props(&split, &inputs.model);
-    let tier_batch = glm_place::tier_batch(a.place, &inputs.hp);
-    let machine = a.place.machine(None, tier_batch)?(inputs.model.layers);
     let nextn = match draft_off {
         None => Some(NextnInputs::read(&inputs)?),
         Some(_) => None,
     };
-    let rule = ctx_of(&inputs, &machine, &plan_levers, nextn.as_ref(), set, slots)?;
+    let plan_place = |p: Place| Placed::of(p, &inputs, &plan_levers, nextn.as_ref(), set, slots);
+    // Unset on two cards, a refused plan of the tier's placement runs `a`,
+    // the refusal named on stderr: an unset flag never refuses a load that
+    // `--place a` serves.
+    let (placed, place_why, tier_experts) = match (a.place, plan_place(offer)) {
+        (Some(_), first) => {
+            let first = first?;
+            let n = first.tier_experts;
+            (first, "set", n)
+        }
+        (None, Err(e)) if offer != Place::A => {
+            eprintln!(
+                "bloomery-serve-glm: --place unset, {} on two cards refused ({e}); the largest \
+                 card alone (a)",
+                offer.name()
+            );
+            (
+                plan_place(Place::A.on(&census)?)?,
+                "two cards, the tier's plan refused",
+                0,
+            )
+        }
+        (None, first) => {
+            let first = first?;
+            let n = first.tier_experts;
+            match offer.keep_tier(&census, n, TIER_BREAK_EVEN)? {
+                (p, why) if p == offer => (first, why, n),
+                (p, why) => (plan_place(p)?, why, n),
+            }
+        }
+    };
+    Record::new(&record::PLACE_UNSET_GLM)
+        .w("place", placed.place.name())
+        .w("why", place_why)
+        .u("tier_experts", tier_experts)
+        .u("break_even", TIER_BREAK_EVEN)
+        .eprint();
+    let Placed {
+        place,
+        tier_batch,
+        machine,
+        rule,
+        ..
+    } = placed;
     rule.print();
     if draft_off.is_none() && rule.ctx < NEED {
         return Err(format!(
@@ -757,7 +867,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
             (with.plan, beside, bytes)
         }
     };
-    record::plan(a.place.name(), &machine, &plan).eprint();
+    record::plan(place.name(), &machine, &plan).eprint();
     let residency = residency_at(&plan, lever, beside)?;
     let pool = match residency {
         Residency::Mid { pinned, .. } => {
@@ -795,7 +905,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
 
     let open = SeatArgs {
-        place: a.place,
+        place,
         tier_batch,
         ctx: rule.ctx,
         slots,
@@ -844,7 +954,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         config_slots,
     )?;
     Record::new(&record::LISTENING_GLM)
-        .w("place", a.place.name())
+        .w("place", place.name())
         .u("ctx", rule.ctx)
         .w("addr", server.local_addr()?)
         .eprint();

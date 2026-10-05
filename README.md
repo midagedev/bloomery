@@ -57,7 +57,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   same card; `--cache-type-v` does not exist, both planes quantize together), `--host/--port`,)
   `--alias`.
 - **Two-card serving like `-ts`**: `--place a` for the largest visible card, `--place bp` to add the next one
-  as an expert tier, or a list (`0+1`) by CUDA index.
+  as an expert tier, or a list (`0+1`) by CUDA index; unset, the glm seat takes `bp` when its plan puts enough
+  experts on the second card to pay for it (the GLM row of the A6000 + 3090 table below).
 - **Clef-Flash's `/v1/systemone`** follows llama.cpp's decision server wire (`model` optional, `/v1/models`,
   501 for images and video, upstream's `confidence` formula).
 
