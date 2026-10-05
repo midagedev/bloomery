@@ -6,7 +6,7 @@
 //!
 //!     [--host 127.0.0.1] [--port 8080] [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C]
 //!     [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] [--chat-template-file PATH]
-//!     [--prefill batch|steps] [--parallel N] [--queue-depth Q] [--park-ram MIB] [--plan]
+//!     [--prefill batch|steps] [--parallel N] [--queue-depth Q] [--plan]
 //!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
 //! `tokenizer.chat_template` the chat template (`--chat-template-file`
@@ -29,19 +29,24 @@
 //! its list spelling `a6000+3090`; a list of more tier cards than the GLM
 //! body serves (`bloomery_gpu::host::SERVED_TIERS`) and a stage other than the
 //! A6000 are refused by name before the plan. The
-//! positions the server serves are the stores the load sized (`--ctx`):
-//! `/props`' `n_ctx` is that number, a prompt that long is a 400 before it
-//! reaches the engine, and generation stops there with `truncated`. Unset,
-//! the file's trained context (`context_length`) capped to what the plan
-//! takes — the largest context whose plan stands, itself never past
+//! positions a slot serves are the stores the load sized for each sequence
+//! (`--ctx` names the total the slots split): `/props`' `n_ctx` is that
+//! number, a prompt that long is a 400 before it reaches the engine, and
+//! generation stops there with `truncated`. Unset, a slot's context is the
+//! file's trained context (`context_length`) capped to what the plan takes —
+//! the largest context whose plan of every slot stands, itself never past
 //! `place::ORACLE_POSITIONS` — pulled back to the largest multiple of
 //! `CTX_STEP` that stays within the plan's `MARGIN` of stage-card expert
 //! bytes (`serve_seats::ctx`'s guard, qwen38's margin rule: more positions
 //! on the card push card experts to the host, and decode crawls), and never
 //! under 2048 unless the card holds less than that (qwen38's `card` rule);
-//! a `ctx` line on stderr names the rule, the chosen context, the trained
-//! context, the fit and the margin. Set, the flag wins, the plan refusing
-//! it by name past the oracle and when the card cannot hold it.
+//! a `ctx` line on stderr names the rule, the chosen context, the slots and
+//! their total, the trained context, the fit and the margin. Set, the flag
+//! is the total and each slot takes `total / N` positions rounded down
+//! (llama-server's `-np N` without `-kvu`), a slot under the body's floor
+//! refused by name before the plan — one position, or the MTP draft's
+//! window under `BLOOMERY_DRAFT=mtp` — and the plan refusing it by name past
+//! the oracle and when the card cannot hold every slot.
 //!
 //! The keep rule: each KDA layer holds one recurrent state, and its history
 //! only in the checkpoints a prompt call takes (its start, every 512th
@@ -78,22 +83,19 @@
 //! and `save` and `restore` answer the server's own 501, a state being a
 //! host value and not a file.
 //!
-//! `--parallel N` (`-np N`) serves N slots that take the one model in turns
-//! (`serve::SwapEngine`); the default is what the parked states' budget
-//! holds of one slot's whole-context state — the lesser of
-//! `bind::PARALLEL_CAP` and it, never below the plain engine — and the flag
-//! an upper bound on the same, so `--parallel 1` keeps the plain engine: a
-//! request that arrives while another decodes preempts it at the next step,
-//! the running request's sequence state ([`seq_save`], the draft's side with
-//! it) parked in host RAM, and the live requests then take turns of
-//! `serve::QUANTUM` tokens, each put back ([`seq_resume`]) where it left,
-//! its draft joining there. The parked states' budget is `--park-ram` (MiB),
-//! by default the lesser of `bind::CACHE_RAM_CAP` and what `MemAvailable`
-//! leaves past the plan's host need, the churn pool, the checkpoints and the
-//! prompt cache (`bind::CacheRam::park`); a request that would park a state
-//! past it is a 503 naming the budget. A `parallel` line on stderr names the
-//! rule (`plain`, `budget` or `flag`), the slots and each term.
-//! `--queue-depth Q` bounds the requests that wait for a slot.
+//! `--parallel N` (`-np N`, default 2) serves N resident sequences inside
+//! the one model (`Session::add_slots` over the body's `Slots`): the server
+//! steps every running slot in each round, one pass a slot, the sequences
+//! switched by pointer exchange and the draft's side of each slot kept with
+//! it ([`DraftedSeat::select`]), so each request's tokens are its solo
+//! run's; `--parallel 1` is the one-sequence server and `--parallel 0` is
+//! refused by name. The plan counts every sequence in its KV term
+//! (`PlanInputs::plan_slots`, `plan_nextn_slots`), so the context search, the
+//! load and `/props`' `vram_kv_bytes` see them all, and a card that cannot
+//! hold them is refused by name. Nothing parks — no slot waits for another —
+//! so `--park-ram` is refused by name. A `parallel` line on stderr names the
+//! rule (`slots`), the slots, a slot's context and the total. `--queue-depth
+//! Q` bounds the requests that wait for a slot.
 //!
 //! `BLOOMERY_DRAFT=mtp` loads the file's next-token layer beside the target
 //! (`app::arch::glm5next::open_nextn`, the plan `PlanInputs::plan_nextn`
@@ -152,17 +154,18 @@
 //! `--records-schema` prints those kinds and exits.
 
 use std::any::Any;
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use app::arch::glm5next::{GlmCfg, open_nextn, open_resident};
+use app::arch::glm5next::{GlmCfg, open_nextn_slots, open_resident_slots};
 use app::mtp::{MtpBody, MtpDraft};
-use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
+use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Parallel, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
+    CacheRam, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
     sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
@@ -170,21 +173,24 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, ref_model_path};
 use bloomery_gpu_glm5next::{
-    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_bytes, seq_resume, seq_save,
+    Body, Glm5nextModel, GlmArena, GlmSeq, PrefillMode, seq_resume, seq_save,
 };
 use bloomery_levers::{
     GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
 };
 use gguf::Split;
-use model::arch::glm5next::place::{NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs};
+use model::arch::glm5next::place::{
+    KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs,
+};
 use model::placement::churn::ChurnPool;
+use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes, host_available};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
 use runtime::seqstate::Why;
 use serve::{
-    CacheNote, DraftProps, Drafted, Engine, EngineProps, FATAL_LINGER, Park, ResidencyReset, Saved,
-    ServeError, Server, ServerConfig, SlotConfig, SwapEngine,
+    CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
+    Server, ServerConfig, SlotConfig,
 };
 use tokenizer::Tokenizer;
 
@@ -198,7 +204,7 @@ const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] \
                      [--ctx C] [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] \
                      [--chat-template-file PATH] [--prefill batch|steps] [--parallel N] \
-                     [--queue-depth Q] [--park-ram MIB] [--plan]";
+                     [--queue-depth Q] [--plan]";
 
 /// The positions the stores are sized for when `--ctx` names none:
 /// `generate_glm5next`'s default, and the floor [`ctx_of`]'s rule never
@@ -234,6 +240,8 @@ const VERIFY_ROWS: usize = <Body as MtpBody>::VERIFY_ROWS;
 /// model: it takes one only while its rows fit, the first at a one-id
 /// prompt's first generated token, 1 + 1 + rows − 1.
 const NEED: usize = VERIFY_ROWS + 1;
+/// [`NEED`] as the least a slot of a split holds under the draft.
+const NEED_FLOOR: NonZeroU64 = NonZeroU64::new(NEED as u64).expect("a window of at least one row");
 
 /// `BLOOMERY_DRAFT` on stores of `ctx` positions, `unset` the seat's rule
 /// for it: `None` drafts with the NextN layer; `Some` runs the plain path,
@@ -272,9 +280,12 @@ fn draft_of(
     }
 }
 
-/// The seat's `--ctx` and what decided it, for its `ctx` line.
+/// The seat's `--ctx` and what decided it, for its `ctx` line: every
+/// context a slot's own, the plan counting every slot.
 struct GlmCtx {
     ctx: usize,
+    /// The resident sequences that split the total.
+    slots: usize,
     /// `set` (`--ctx`), or what bounded the default: `card` (the largest
     /// context the plan takes, fewer than [`CTX`]), `base` ([`CTX`]: no
     /// step past it stays within the margin), `margin` (the largest that
@@ -295,30 +306,27 @@ struct GlmCtx {
     card_bytes: u64,
 }
 
-/// The seat's context (the module doc): `set` as given — the plan the load
-/// runs refuses it by name past [`ORACLE_POSITIONS`] and when the card
-/// cannot hold it, so does this, with the plan's own words; unset, [`CTX`]
+/// The seat's context (the module doc), every number a slot's own and every
+/// plan counting `slots` sequences ([`plan_of`]): `set`, a slot's
+/// share of the flag ([`split_ctx`]), as given — the plan the load runs
+/// refuses it by name past [`ORACLE_POSITIONS`] and when the card cannot
+/// hold every slot, so does this, with the plan's own words; unset, [`CTX`]
 /// or the trained context capped to what the plan takes within its
 /// [`MARGIN`] of stage-card expert bytes. The searches are planning-time
 /// only: one plan a probe of the bisection, none past the cap. A card whose
-/// plan stands nowhere, not even at one position, refuses by name here, as
-/// the load's own plan would.
+/// plan stands nowhere, not even at one position a slot, refuses by name
+/// here, as the load's own plan would.
 fn ctx_of(
     inputs: &PlanInputs,
     machine: &Machine,
     levers: &PlanLevers,
     nextn: Option<&NextnInputs>,
     set: Option<usize>,
+    slots: usize,
 ) -> Result<GlmCtx, GateError> {
-    let plan_of = |ctx: usize| -> Result<Plan<'_>, GateError> {
-        let c = u64::try_from(ctx)?;
-        Ok(match nextn {
-            None => inputs.plan(machine, c, levers)?,
-            Some(n) => inputs.plan_nextn(machine, c, levers, n)?.plan,
-        })
-    };
     let card = |ctx: usize| -> Result<u64, GateError> {
-        Ok(plan_of(ctx)?
+        let plan = plan_of(inputs, machine, u64::try_from(ctx)?, levers, nextn, slots)?;
+        Ok(plan
             .cards
             .first()
             .ok_or("a plan with no card")?
@@ -327,10 +335,10 @@ fn ctx_of(
     let trained = inputs.hp.n_ctx_train;
     let cap = trained.min(usize::try_from(ORACLE_POSITIONS)?);
     let fits = |c: usize| Ok(card(c).is_ok());
-    if !fits(1)? {
+    if let Err(e) = card(1) {
         return Err(format!(
-            "no context fits the card: the plan at 1 position is refused ({})",
-            plan_of(1).err().map(|e| e.to_string()).unwrap_or_default()
+            "no context fits the card: the plan of {slots} slots at 1 position a slot is \
+             refused ({e})"
         )
         .into());
     }
@@ -347,6 +355,7 @@ fn ctx_of(
     };
     Ok(GlmCtx {
         ctx,
+        slots,
         rule,
         trained,
         fit,
@@ -359,14 +368,16 @@ fn ctx_of(
 
 impl GlmCtx {
     /// The `ctx` line on stderr, qwen38's shape with the trained context
-    /// named.
+    /// named: every context a slot's, `total` the slots'.
     fn print(&self) {
         eprintln!(
-            "ctx rule={} ctx={} trained={} fit={} fit_card_expert_bytes={} margin_ctx={} \
-             base={CTX} base_card_expert_bytes={} card_expert_bytes={} lost_bytes={} \
-             margin_bytes={MARGIN}",
+            "ctx rule={} ctx={} slots={} total={} trained={} fit={} fit_card_expert_bytes={} \
+             margin_ctx={} base={CTX} base_card_expert_bytes={} card_expert_bytes={} \
+             lost_bytes={} margin_bytes={MARGIN}",
             self.rule,
             self.ctx,
+            self.slots,
+            self.slots * self.ctx,
             self.trained,
             self.fit,
             self.fit_bytes,
@@ -376,6 +387,29 @@ impl GlmCtx {
             self.base_bytes.saturating_sub(self.card_bytes)
         );
     }
+}
+
+/// The target's plan of `slots` resident sequences at `ctx` positions a slot
+/// on the load `nextn` names: with the next-token layer
+/// (`PlanInputs::plan_nextn_slots`, two KDA lanes) or without it
+/// (`PlanInputs::plan_slots` at one lane) — the plans the load runs
+/// ([`open_nextn_slots`], [`open_resident_slots`]).
+fn plan_of<'a>(
+    inputs: &'a PlanInputs,
+    machine: &'a Machine,
+    ctx: u64,
+    levers: &PlanLevers,
+    nextn: Option<&'a NextnInputs>,
+    slots: usize,
+) -> Result<Plan<'a>, GateError> {
+    Ok(match nextn {
+        None => inputs.plan_slots(machine, ctx, levers, KdaLanes::One, slots)?,
+        Some(n) => {
+            inputs
+                .plan_nextn_slots(machine, ctx, levers, n, slots)?
+                .plan
+        }
+    })
 }
 
 /// `BLOOMERY_RESIDENCY` as this seat takes it before the plan.
@@ -473,12 +507,9 @@ struct Args {
     prefill: PrefillMode,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
-    /// `--parallel`: slots that take the model in turns past 1; `None`
-    /// takes the elastic default ([`Parallel`]).
-    parallel: Option<usize>,
+    /// `--parallel`: the resident sequences the seat serves.
+    parallel: usize,
     queue_depth: Option<usize>,
-    /// `--park-ram` in bytes; `None` takes the default.
-    park_ram: Option<u64>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -493,13 +524,8 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         template_file: None,
         prefill: PrefillMode::Batch,
         plan_only: false,
-        // The elastic default ([`Parallel`]): the turns act only on a second
-        // arrival, and a lone request stays on the slot the engine holds
-        // unless another slot's parked state shares more of its prompt;
-        // `--parallel 1` keeps the plain engine.
-        parallel: None,
+        parallel: 2,
         queue_depth: None,
-        park_ram: None,
     };
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
@@ -521,9 +547,16 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
-            "--parallel" | "-np" => a.parallel = Some(v.parse()?),
+            "--parallel" | "-np" => a.parallel = v.parse()?,
             "--queue-depth" => a.queue_depth = Some(v.parse()?),
-            "--park-ram" => a.park_ram = Some(CacheRam::parse_mib(flag, v)?),
+            "--park-ram" => {
+                return Err(format!(
+                    "--park-ram {v}: it holds the states of slots that take the model in turns; \
+                     this seat's slots are resident sequences, which park nothing — the plan \
+                     counts their state"
+                )
+                .into());
+            }
             "--chat-template-file" => a.template_file = Some(PathBuf::from(v)),
             "--prefill" => {
                 a.prefill = PrefillMode::from_name(v)
@@ -534,6 +567,9 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     }
     if a.ctx == Some(0) {
         return Err("--ctx 0: the stores hold no position".into());
+    }
+    if a.parallel == 0 {
+        return Err("--parallel 0: the server serves no slot".into());
     }
     a.place = a.place.on_host()?;
     Ok(a)
@@ -571,10 +607,46 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // load's host set holds beside the plan's.
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let inputs = PlanInputs::read(&split)?;
-    // The unset rule's window bound reads the floor context — a default is
-    // never under it while the card holds it — and the context the rule
+    // A slot's share of `--ctx`, refused by name under the body's least a
+    // slot before anything is planned: one position, or the MTP draft's
+    // window under `BLOOMERY_DRAFT=mtp` (unset, the rule below drafts only
+    // where a window fits, and never refuses).
+    let slots = a.parallel;
+    let (floor, why) = match levers.draft() {
+        Some("mtp") => (
+            NEED_FLOOR,
+            format!(
+                "BLOOMERY_DRAFT=mtp: token 0 comes out of the feed, and a window's {VERIFY_ROWS} \
+                 rows run after it"
+            ),
+        ),
+        _ => (
+            NonZeroU64::MIN,
+            "a slot holds at least one position".to_owned(),
+        ),
+    };
+    // The split is `placement::slots::split_ctx`'s, ⌊total / slots⌋
+    // (llama-server's `-np N` without `-kvu`); its refusal in the flags'
+    // words.
+    let set = a
+        .ctx
+        .map(|total| {
+            let share = split_ctx(total as u64, slots as u64, floor).map_err(|e| match e {
+                SplitError::NoSlots { .. } => {
+                    format!("--ctx {total}: --parallel 0 splits it among no slot ({why})")
+                }
+                SplitError::BelowFloor { split, floor, .. } => format!(
+                    "--ctx {total}: --parallel {slots} splits it to {split} positions a slot, \
+                     under the {floor} a slot needs ({why})"
+                ),
+            })?;
+            usize::try_from(share).map_err(|_| format!("a slot's {share} positions"))
+        })
+        .transpose()?;
+    // The unset rule's window bound reads a slot's floor context — a default
+    // is never under it while the card holds it — and the context the rule
     // chooses is asked again below.
-    let at_ctx = a.ctx.unwrap_or(CTX);
+    let at_ctx = set.unwrap_or(CTX);
     let unset = glm_unset(GlmAt {
         serving_place: a.place != Place::Gate,
         nextn_layers: inputs.hp.n_layer.saturating_sub(inputs.hp.n_trunk),
@@ -591,7 +663,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         None => Some(NextnInputs::read(&inputs)?),
         Some(_) => None,
     };
-    let rule = ctx_of(&inputs, &machine, &plan_levers, nextn.as_ref(), a.ctx)?;
+    let rule = ctx_of(&inputs, &machine, &plan_levers, nextn.as_ref(), set, slots)?;
     rule.print();
     if draft_off.is_none() && rule.ctx < NEED {
         return Err(format!(
@@ -602,10 +674,15 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .into());
     }
     let ctx = u64::try_from(rule.ctx)?;
+    // The plans count every slot in their KV terms.
     let (plan, beside, draft_bytes) = match &nextn {
-        None => (inputs.plan(&machine, ctx, &plan_levers)?, 0, 0),
+        None => (
+            inputs.plan_slots(&machine, ctx, &plan_levers, KdaLanes::One, slots)?,
+            0,
+            0,
+        ),
         Some(n) => {
-            let with = inputs.plan_nextn(&machine, ctx, &plan_levers, n)?;
+            let with = inputs.plan_nextn_slots(&machine, ctx, &plan_levers, n, slots)?;
             let beside = with.host_runs()?.1;
             let bytes = with.nextn_card_bytes() + with.arena_bytes;
             (with.plan, beside, bytes)
@@ -623,31 +700,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let cache = CacheRam::of(a.cache_ram, HostNeed::of(&plan, beside).bytes(), pool)?;
     eprintln!("{}", cache.line());
-    let park = match a.parallel {
-        Some(n) if n < 2 && a.park_ram.is_some() => {
-            return Err(format!(
-                "--park-ram holds the states of slots that take the model in turns; \
-                 --parallel {n} has none to park"
-            )
-            .into());
-        }
-        // The elastic default ([`Parallel`]): one slot's whole-context state
-        // the budget's unit, the flag an upper bound, the default what the
-        // budget holds.
-        _ => {
-            let budget = match a.parallel {
-                Some(n) if n >= 2 => cache.park(a.park_ram, n)?,
-                _ => cache.park_or_none(a.park_ram),
-            };
-            let parallel = Parallel::of(
-                a.parallel,
-                budget,
-                seq_bytes(&inputs, rule.ctx, nextn.is_some()),
-            );
-            eprintln!("{}", parallel.line());
-            (parallel.slots > 1).then_some((parallel.slots, budget))
-        }
-    };
+    eprintln!(
+        "parallel rule=slots slots={slots} slot_ctx={} total={}",
+        rule.ctx,
+        slots * rule.ctx
+    );
     if a.plan_only {
         // The records before the load are out; nothing was opened on a card.
         std::process::exit(0);
@@ -670,6 +727,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         place: a.place,
         tier_batch,
         ctx: rule.ctx,
+        slots,
         cfg: GlmCfg {
             place: plan_levers,
             host: levers.host(),
@@ -699,22 +757,20 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         fatal_linger: FATAL_LINGER,
         slot_save_path: a.slot_save_path,
     };
-    // One slot stays the plain engine; several take it in turns.
-    let engine: Box<dyn Engine> = match park {
-        Some((slots, budget)) => Box::new(SwapEngine::new(
-            Box::new(engine),
-            slots,
-            Park::States { budget },
-        )?),
-        None => Box::new(engine),
-    };
-    let parallel = park.map_or(1, |(slots, _)| slots);
-    let slots = SlotConfig {
-        parallel,
+    // The seat's resident slots are the server's, one sequence each: the
+    // server selects and steps them together (the engine declares its
+    // per-slot draft), no turns and no park.
+    let config_slots = SlotConfig {
+        parallel: slots,
         queue_depth: a.queue_depth,
         ..SlotConfig::default()
     };
-    let server = Server::bind_with((a.host.as_str(), a.port), engine, config, slots)?;
+    let server = Server::bind_with(
+        (a.host.as_str(), a.port),
+        Box::new(engine),
+        config,
+        config_slots,
+    )?;
     Record::new(&record::LISTENING_GLM)
         .w("place", a.place.name())
         .u("ctx", rule.ctx)
@@ -729,7 +785,11 @@ struct SeatArgs {
     /// The expert tier's prompt-batch bytes the plan reserves under a
     /// placement with a tier card.
     tier_batch: Option<TierBatchBytes>,
+    /// A slot's context: the stores' rows one sequence serves.
     ctx: usize,
+    /// The resident sequences the plan counts and the load makes
+    /// ([`Session::add_slots`]).
+    slots: usize,
     cfg: GlmCfg,
     pin_main: bool,
     path: PathBuf,
@@ -765,9 +825,9 @@ impl Glm {
     /// `generate_glm5next` prints them, the draft's `load draft=…` line after
     /// the `load` line), on the calling thread, pinned to the dispatcher's
     /// cpu slot when asked: drafting, the NextN load under the residency
-    /// (`open_nextn`) and the window over it, its verify captured (a
-    /// `capture` line of its nodes); else the residency's load
-    /// (`open_resident`) or the plain one.
+    /// (`open_nextn_slots`) and the window over it, its verify captured (a
+    /// `capture` line of its nodes); else the one-lane load under it
+    /// (`open_resident_slots`). Either plans and serves the seat's slots.
     fn open(a: SeatArgs) -> Result<Glm, GateError> {
         let pinned = a.pin_main && threads::pool().pin_caller();
         let t = Instant::now();
@@ -794,26 +854,30 @@ impl Glm {
             cfg: a.cfg,
         };
         let planned = || format!("{WHAT}: the open planned nothing");
-        let mut s = match (&a.draft_off, a.residency) {
-            (None, r) => open_nextn(file, args, r, &mut log)?.ok_or_else(planned)?,
-            (Some(_), Residency::Off) => Loaded::<Body>::open(file, args, &mut log)?
-                .ok_or_else(planned)?
-                .ready(&mut log)?,
-            (Some(_), r) => open_resident(file, args, r, &mut log)?.ok_or_else(planned)?,
-        };
+        // Every load serves the seat's slots, the plan counting each.
+        let mut s = match &a.draft_off {
+            None => open_nextn_slots(file, args, a.residency, a.slots, &mut log)?,
+            Some(_) => open_resident_slots(file, args, a.residency, a.slots, &mut log)?,
+        }
+        .ok_or_else(planned)?;
         let residency = a.residency != Residency::Off;
         if residency {
             // A request's passes are not known at load: the log grows as it
             // must, and every call takes it.
             s.model_mut().body_parts(WHAT)?.2.log_residency(0);
         }
-        let drafted = DraftedSeat::new(match a.draft_off {
+        // The resident sequences, parked empty: the live slot keeps the
+        // chains already captured, each parked slot capturing its own on its
+        // first use.
+        s.add_slots(a.slots)?;
+        let mut drafted = DraftedSeat::new(match a.draft_off {
             Some(_) => None,
             None => {
                 let draft = MtpDraft::open(s.model(), prefill, StepMode::Eager)?;
                 Some(s.with_draft::<MtpDraft<Body>, VERIFY_ROWS>(draft, &mut PairCapture)?)
             }
         });
+        drafted.hold_slots(a.slots);
         Ok(Glm {
             s,
             drafted,
@@ -981,6 +1045,24 @@ impl Seat for Glm {
 
     fn ctx_max(&self) -> usize {
         self.ctx
+    }
+
+    /// The resident sequences the load made ([`Session::slots`]).
+    fn slots(&self) -> usize {
+        self.s.slots()
+    }
+
+    /// The session's slot through the draft's table
+    /// ([`DraftedSeat::select`]): the live slot's draft side parked and the
+    /// target's put back around the exchange.
+    fn select(&mut self, slot: usize) -> Result<(), GateError> {
+        self.drafted.select(&mut self.s, slot)
+    }
+
+    /// The draft's state is per slot ([`Glm::select`]): a slot's drafted
+    /// passes are the passes it would run alone.
+    fn slot_drafts(&self) -> bool {
+        self.drafted.drafts()
     }
 
     /// The body's feed ([`bloomery_gpu_glm5next::feed`]): the batched prompt

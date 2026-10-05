@@ -200,11 +200,50 @@
 //!   logits and argmax of the same two calls unplanted from a reset, its
 //!   points 512, 513, 1024, 1030.
 //!
+//! The resident sequence slots (`bloomery_gpu::model::Slots` over the body):
+//! the slot harness's contracts (`slots_gate`: H1 interleave, H3 bytes, H4
+//! reset, H6 refusals, H7 captures) over the NextN load at [`SLOT_CTX`]
+//! positions a slot on the gate placement, its plan counting the harness's
+//! two slots (`PlanInputs::plan_nextn_slots`), two prompts of the prose
+//! set's ids fed as the server feeds them (every id but the last in one
+//! batch call, the last a step). H3's plan descriptor is one sequence of
+//! `PlanInputs::seq_terms` (`SeqTerms::bytes`: 327,090,452 B at 256
+//! positions, two lanes and the NextN layer [derived]). Between the
+//! interleave and H4, the body's own clauses, moving slot 1 alone and
+//! reading slot 0 through the harness:
+//! - (sp) plan: a third slot on a plan of two refused by name; the plan of
+//!   two counts one sequence's bytes past the plan of one (its stage card's
+//!   KV term and the layer's store), the descriptor's.
+//! - (sc) cut: slot 1 cut back to its prompt call's checkpoint, slot 0
+//!   selected and stepped on its solo run's continuation before slot 1 takes
+//!   the step that copies the cut back, then slot 1 stepped again to where it
+//!   stood: its last id, position and stores bit for bit as before the cut —
+//!   the pending cut travels with its slot.
+//!
+//! Then, on a load of their own (the MTP draft drives a session, which owns
+//! its model; the harness lends its own by reference only), three prompts:
+//! - (sd) drafted: under the MTP draft (each slot's side of it parked and put
+//!   back around a select, as the seat's table does), the two prompts on
+//!   slots 0 and 1, a select between every pass, [`SLOT_PASSES`] passes and
+//!   a step each: each slot's ids, every pass's proposal and kept rows, and
+//!   the last logits bit for bit its solo run's (slot 0 from a reset); the
+//!   solo runs both accept and reject a proposal.
+//! - (s3) park/resume: slot 1's state saved with its draft's side
+//!   (`seq_save`), the slot reset and run on the third prompt, slot 0 run on
+//!   between, then slot 1 put back (`seq_resume`): both slots'
+//!   [`SLOT_RESUMED`] passes and a step bit for bit, counts included, their
+//!   solo runs'.
+//!
+//! An error inside a clause body of (sp), (sc), (sd) or (s3) is that clause's
+//! FAIL, not the gate's end; one in a load, a solo run or the draft's open
+//! ends the gate.
+//!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
 //! at [`CTX`] of one lane, `--only verify` (s) and (v) alone on a load at
 //! [`CTX`] of two (the plain graph run of the batch set they compare against
-//! included), `--only keep` (k) alone on a load at [`CTX`] of two.
+//! included), `--only keep` (k) alone on a load at [`CTX`] of two, `--only
+//! slots` the resident slots' clauses alone on their two loads.
 //! `--step-sets short` takes (t)'s two 4-token sets only,
 //! `--step-sets long` the 1,024- and 3,070-position sets only, `--step-sets
 //! all` (the default) all four; it names the sets of the load at [`CTX`], so
@@ -240,32 +279,36 @@ mod gate {
     use std::time::Instant;
 
     use app::arch::glm5next::{GlmCfg, open_pair};
+    use app::mtp::{MtpBody, MtpDraft, Parked};
     use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::{Fault, FaultSite, LAYER_HEAD};
     use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, pools_for};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::rounding::q8_32_rel;
+    use bloomery_gpu_gates::slots_gate::{self, Derived, Interleaved, SlotsAdapter};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ik_q8_2, patch_bytes,
         ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
     };
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
-        Body, CHUNK, GEMM_FROM, Glm5nextModel, Plant, PrefillMode, RouteTapRows, StoreDigest,
-        StoreRows, feed, plant_prompt_routes, prefill, prefill_mode, prompt_route_taps,
-        set_prefill, set_prefill_group, set_prompt_route_taps, set_taps, step_launches,
-        store_digests, store_rows,
+        Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode, RouteTapRows,
+        StoreDigest, StoreRows, feed, plant_prompt_routes, prefill, prefill_mode,
+        prompt_route_taps, seq_resume, seq_save, set_prefill, set_prefill_group,
+        set_prompt_route_taps, set_taps, step_launches, store_digests, store_rows,
     };
     use bloomery_levers::CARD_BUDGET;
     use cuda_core::sys;
     use gguf::quant::dequant_row;
     use gguf::{GgmlType, Split};
     use model::arch::glm5next::names;
-    use model::arch::glm5next::place::{KdaLanes, PlanInputs};
+    use model::arch::glm5next::place::{KdaLanes, NextnInputs, NextnPlan, PlanInputs};
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
@@ -1885,6 +1928,526 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------- (slots) resident slots
+
+    /// The resident slots' load: a slot's context, and the slots its plan
+    /// counts — the harness's streams, one a slot.
+    const SLOT_CTX: usize = 256;
+    const SLOTS: usize = slots_gate::STREAMS;
+    /// The drafted passes each slot runs after its prompt's step, and (s3)'s
+    /// after the resume.
+    const SLOT_PASSES: usize = 8;
+    const SLOT_RESUMED: usize = 6;
+    /// The rows a verify runs: the target's next token and the proposal.
+    const PAIR: usize = <Body as MtpBody>::VERIFY_ROWS;
+
+    /// What one slot's drafted run left at a point: its ids from the
+    /// prompt's step on, each pass's proposal and kept rows, and the logits
+    /// of its last step.
+    #[derive(Clone)]
+    struct SlotRun {
+        ids: Vec<u32>,
+        passes: Vec<(bool, usize)>,
+        logits: Vec<f32>,
+    }
+
+    impl SlotRun {
+        fn same(&self, other: &SlotRun) -> bool {
+            self.ids == other.ids
+                && self.passes == other.passes
+                && same_bits(&self.logits, &other.logits)
+        }
+
+        fn last(&self) -> Result<u32, GateError> {
+            Ok(*self.ids.last().ok_or("a slot run with no id")?)
+        }
+    }
+
+    /// The rows-log that hears nothing.
+    struct Quiet;
+
+    impl app::RowsLog for Quiet {
+        fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), SessionError> {
+            Ok(())
+        }
+    }
+
+    /// The window a drafted slot run drives, `PAIR` rows a verify.
+    type Spec = runtime::Speculative<MtpDraft<Body>, PAIR>;
+
+    /// The (slots) body for the slot harness ([`slots_gate`]): the NextN load
+    /// at [`SLOT_CTX`] positions on the gate placement, its plan counting the
+    /// slots it serves (`PlanInputs::plan_nextn_slots`), stream `i`'s prompt
+    /// `prompts[i]` fed as the server feeds it ([`server_start`]); and the
+    /// inputs it is planned from.
+    struct GlmSlots<'a> {
+        levers: &'a bloomery_levers::Levers,
+        inputs: PlanInputs,
+        nextn: NextnInputs,
+        prompts: [&'a [u32]; SLOTS],
+    }
+
+    impl GlmSlots<'_> {
+        /// The plan of `slots` sequences on `machine` the load runs by.
+        fn plan<'p>(
+            &'p self,
+            machine: &'p Machine,
+            slots: usize,
+        ) -> Result<NextnPlan<'p>, GateError> {
+            let place = PlanLevers::from_levers(self.levers)?;
+            let ctx = u64::try_from(SLOT_CTX)?;
+            Ok(self
+                .inputs
+                .plan_nextn_slots(machine, ctx, &place, &self.nextn, slots)?)
+        }
+
+        /// One sequence's card bytes as the plan's descriptor counts them
+        /// (`PlanInputs::seq_terms`, `SeqTerms::bytes` of one).
+        fn seq_terms_one(&self) -> Result<u64, GateError> {
+            let kv = self.inputs.kv.with_lanes(KdaLanes::Two);
+            let terms = self.inputs.seq_terms(&kv, Some(&self.nextn));
+            Ok(terms.bytes(u64::try_from(SLOT_CTX)?, 1))
+        }
+    }
+
+    impl SlotsAdapter for GlmSlots<'_> {
+        type Body = Body;
+
+        const STEPS: usize = 12;
+        const TAIL: usize = 6;
+
+        fn open(&self, slots: usize) -> Result<Glm5nextModel, GateError> {
+            let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let machine = workstation::plan_gate(self.inputs.model.layers);
+            let np = self.plan(&machine, slots)?;
+            let t = Instant::now();
+            let mut m = Body::open_placed_nextn_slots(
+                file,
+                &np,
+                &self.inputs,
+                &self.nextn,
+                0,
+                self.levers.host(),
+                Residency::Off,
+                slots,
+            )?;
+            set_prefill(&mut m, PrefillMode::Batch)?;
+            println!(
+                "slots load resident_bytes={} ctx={SLOT_CTX} slots={slots} in {:.1} s (runtime \
+                 value)",
+                m.resident_bytes(),
+                t.elapsed().as_secs_f64()
+            );
+            Ok(m)
+        }
+
+        /// The reset: it zeroes every store whole and the lane word, so the
+        /// stores [`SlotsAdapter::state_hash`] reads hold no other stream's
+        /// rows past the position.
+        fn rewind(&self, m: &mut Glm5nextModel) -> Result<(), GateError> {
+            Ok(m.reset()?)
+        }
+
+        fn prompt(&self, m: &mut Glm5nextModel, stream: usize) -> Result<u32, GateError> {
+            let p = self
+                .prompts
+                .get(stream)
+                .ok_or_else(|| format!("(slots) runs streams 0 and 1, not {stream}"))?;
+            server_start(m, p)
+        }
+
+        /// Every trunk layer's stores digested ([`store_digests`]: a KDA
+        /// layer's committed lane and its conv ring, a latent layer's rows
+        /// and pools, every row of them).
+        fn state_hash(&self, m: &mut Glm5nextModel) -> Result<u64, GateError> {
+            let h = store_digests(m)?
+                .iter()
+                .fold(Fnv1a64::default(), |h, d| h.bytes(&d.fnv.to_le_bytes()));
+            Ok(h.value())
+        }
+
+        /// The stores (`Body::store_bytes`, the allocations the load holds to
+        /// its plan), the lane word (one device word), each row's final
+        /// streams and the verify's row-0 copy (`(lanes + 1) · streams ·
+        /// n_embd` f32), and the next-token layer's store ([`SLOT_CTX`]
+        /// latent and index rows and the pools over them in f16, at
+        /// `bloomery_gpu::latent`'s widths).
+        fn seq_bytes_derived(&self, m: &Glm5nextModel) -> Result<Derived, GateError> {
+            let body = m.body("slots")?;
+            let stores = body.store_bytes();
+            let hp = &self.inputs.hp;
+            let rows = (body.lanes().count() + 1) * hp.hc.streams * hp.n_embd * 4;
+            let layer = (SLOT_CTX * (LATENT + INDEX_ROW) + pools_for(SLOT_CTX) * INDEX_HEAD) * 2;
+            Ok(Derived {
+                bytes: stores + 4 + rows + layer,
+                terms: format!(
+                    "store_bytes {stores} + the lane word 4 + the rows' final streams and the \
+                     row-0 copy {rows} + the next-token layer's store {layer}"
+                ),
+            })
+        }
+
+        fn seq_terms_bytes(&self, _m: &Glm5nextModel) -> Result<Option<usize>, GateError> {
+            Ok(Some(usize::try_from(self.seq_terms_one()?)?))
+        }
+    }
+
+    /// The prompt as the server feeds it: every id but the last in one call
+    /// by the load's feed ([`feed`]), then the last one step; the step's
+    /// argmax.
+    fn server_start(m: &mut Glm5nextModel, p: &[u32]) -> Result<u32, GateError> {
+        let (&last, head) = p.split_last().ok_or("an empty prompt")?;
+        feed(m, head)?;
+        Ok(m.step(&[last])?)
+    }
+
+    /// (sp) the plan's count (module header): a slot past it refused by name,
+    /// and the plan of [`SLOTS`] counting one sequence's bytes past the plan
+    /// of one for each slot past the first. Moves no slot.
+    fn slots_plan(a: &GlmSlots<'_>, m: &mut Glm5nextModel) -> Result<bool, GateError> {
+        let past = m.add_slots(SLOTS + 1);
+        let named = matches!(&past, Err(e) if e.to_string().contains(&format!(
+            "of a load whose plan counted {SLOTS} resident sequences"
+        )));
+        let machine = workstation::plan_gate(a.inputs.model.layers);
+        let counted = |n: usize| -> Result<u64, GateError> {
+            let np = a.plan(&machine, n)?;
+            Ok(np.plan.cards[0].kv_bytes + np.nextn.cards[0].kv_bytes)
+        };
+        let grown = counted(SLOTS)? - counted(1)?;
+        let one = a.seq_terms_one()?;
+        let counts = grown == one * u64::try_from(SLOTS - 1)?;
+        println!(
+            "slots (sp) plan: add_slots({}) on a plan of {SLOTS} -> {}; the plan of {SLOTS} counts \
+             {grown} B past the plan of one (its stage card's KV term and the layer's store), one \
+             sequence {one} B a slot past the first {}",
+            SLOTS + 1,
+            match &past {
+                Ok(()) => "accepted".to_string(),
+                Err(e) => e.to_string(),
+            },
+            verdict(named && counts)
+        );
+        Ok(named && counts)
+    }
+
+    /// (sc) after the interleave (module header): slot 1 cut back to its
+    /// prompt call's checkpoint, slot 0 selected and stepped on its solo
+    /// run's continuation ([`Interleaved::continues`]) before slot 1 takes
+    /// the step that copies the cut back, then slot 1 stepped again to where
+    /// it stood: its last id, position and state hash as before the cut.
+    fn slots_cut(
+        s: &mut Interleaved<'_, GlmSlots<'_>>,
+        a: &GlmSlots<'_>,
+    ) -> Result<bool, GateError> {
+        let b = a.prompts[1];
+        let (&b_last, _) = b.split_last().ok_or("an empty prompt")?;
+        let last = s.last(1)?;
+        let m = s.model();
+        m.select_slot(1)?;
+        let (pos, hash) = (m.pos(), a.state_hash(m)?);
+        let at = u32::try_from(b.len() - 1)?;
+        let kept = m.body("slots")?.kept(at, pos);
+        m.rollback(at)?;
+        let on = s.continues(0)?;
+        let m = s.model();
+        m.select_slot(1)?;
+        let mut id = m.step(&[b_last])?;
+        while m.pos() < pos {
+            id = m.step(&[id])?;
+        }
+        let again = (id, m.pos(), a.state_hash(m)?) == (last, pos, hash);
+        let pass = kept.at == at && on && again;
+        println!(
+            "slots (sc) cut: slot 1 at {pos} cut to {at} (kept({at}) = {kept}), slot 0's next {} \
+             ids its solo run's {on}; slot 1 stepped again to {}: last id {id} (before {last}), \
+             stores as before the cut {again} {}",
+            GlmSlots::TAIL,
+            m.pos(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Make `slot` live with its draft's side: the live slot's parked into
+    /// `parked`, the target's put back — the seat's table, by hand.
+    fn select_drafted(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        parked: &mut [Parked<GlmArena>],
+        slot: usize,
+    ) -> Result<(), GateError> {
+        let was = s.selected();
+        if was == slot {
+            return Ok(());
+        }
+        let live = spec.draft().park();
+        s.select_slot(slot)?;
+        let back = parked
+            .get(slot)
+            .ok_or("a slot past the draft table")?
+            .clone();
+        *parked.get_mut(was).ok_or("a slot past the draft table")? = live;
+        spec.draft_mut().unpark(&back);
+        Ok(())
+    }
+
+    /// The live slot and its draft from empty.
+    fn reset_drafted(s: &mut Session<Body>, spec: &mut Spec) -> Result<(), GateError> {
+        s.reset()?;
+        spec.draft_mut().restart();
+        Ok(())
+    }
+
+    /// One step of `last` under the draft, as the seat steps
+    /// (`DraftedSeat::step`): the draft's waiting rows walked, the step, the
+    /// step told to the draft; its argmax, and its logits when asked.
+    fn drafted_step(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        last: u32,
+        logits: bool,
+    ) -> Result<(u32, Option<Vec<f32>>), GateError> {
+        spec.draft_mut().before_step(s, last)?;
+        let next = s.step(last, Want::Argmax)?.argmax();
+        let row = if logits {
+            Some(s.model().logits()?)
+        } else {
+            None
+        };
+        runtime::Draft::stepped(spec.draft_mut(), s, last, next)?;
+        Ok((next, row))
+    }
+
+    /// The prompt as the server feeds it under the draft: every id but the
+    /// last through the draft's prompt call, then the last one step.
+    fn drafted_start(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        p: &[u32],
+    ) -> Result<SlotRun, GateError> {
+        let (&last, head) = p.split_last().ok_or("an empty prompt")?;
+        runtime::Advance::prompt(spec, s, head)?;
+        let (first, _) = drafted_step(s, spec, last, false)?;
+        Ok(SlotRun {
+            ids: vec![first],
+            passes: Vec::new(),
+            logits: Vec::new(),
+        })
+    }
+
+    /// `n` drafted passes from `r`'s last id, then one step that reads its
+    /// logits.
+    fn drafted_passes(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        r: &mut SlotRun,
+        n: usize,
+    ) -> Result<(), GateError> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.clear();
+            let c = runtime::Advance::pass(spec, s, r.last()?, &mut out)?;
+            r.passes.push((c.proposed, c.kept));
+            r.ids.extend_from_slice(&out);
+        }
+        let (next, row) = drafted_step(s, spec, r.last()?, true)?;
+        r.ids.push(next);
+        r.logits = row.ok_or("a step that read no logits")?;
+        Ok(())
+    }
+
+    /// `p`'s drafted run on `slot` from a reset: [`SLOT_PASSES`] passes and a
+    /// step, then [`SLOT_RESUMED`] passes and a step.
+    fn drafted_solo(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        parked: &mut [Parked<GlmArena>],
+        slot: usize,
+        p: &[u32],
+    ) -> Result<[SlotRun; 2], GateError> {
+        select_drafted(s, spec, parked, slot)?;
+        reset_drafted(s, spec)?;
+        let mut r = drafted_start(s, spec, p)?;
+        drafted_passes(s, spec, &mut r, SLOT_PASSES)?;
+        let at = r.clone();
+        drafted_passes(s, spec, &mut r, SLOT_RESUMED)?;
+        Ok([at, r])
+    }
+
+    /// (sd) drafted: `a` on slot 0 and `b` on slot 1 under the draft, a
+    /// select between every pass, each slot's ids, passes and last logits
+    /// its solo run's; both slots' runs, for (s3).
+    fn slots_drafted(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        parked: &mut [Parked<GlmArena>],
+        (a, b): (&[u32], &[u32]),
+        (solo_a, solo_b): (&SlotRun, &SlotRun),
+    ) -> Result<(bool, [SlotRun; 2]), GateError> {
+        for slot in [1, 0] {
+            select_drafted(s, spec, parked, slot)?;
+            reset_drafted(s, spec)?;
+        }
+        let mut ra = drafted_start(s, spec, a)?;
+        select_drafted(s, spec, parked, 1)?;
+        let mut rb = drafted_start(s, spec, b)?;
+        let mut out = Vec::new();
+        for _ in 0..SLOT_PASSES {
+            for (slot, r) in [(0, &mut ra), (1, &mut rb)] {
+                select_drafted(s, spec, parked, slot)?;
+                out.clear();
+                let c = runtime::Advance::pass(spec, s, r.last()?, &mut out)?;
+                r.passes.push((c.proposed, c.kept));
+                r.ids.extend_from_slice(&out);
+            }
+        }
+        for (slot, r) in [(0, &mut ra), (1, &mut rb)] {
+            select_drafted(s, spec, parked, slot)?;
+            drafted_passes(s, spec, r, 0)?;
+        }
+        let (a_ok, b_ok) = (ra.same(solo_a), rb.same(solo_b));
+        let accepts = |r: &SlotRun| r.passes.iter().filter(|&&(p, k)| p && k == PAIR).count();
+        println!(
+            "slots (sd) drafted: {SLOT_PASSES} passes a slot, a select between every one: slot 0 \
+             ids {:?} passes {:?} (solo {:?} {:?}) logits bit for bit {a_ok}; slot 1 ids {:?} \
+             passes {:?} (solo {:?} {:?}) bit for bit {b_ok}; accepted windows {} and {} {}",
+            ra.ids,
+            ra.passes,
+            solo_a.ids,
+            solo_a.passes,
+            rb.ids,
+            rb.passes,
+            solo_b.ids,
+            solo_b.passes,
+            accepts(&ra),
+            accepts(&rb),
+            verdict(a_ok && b_ok)
+        );
+        Ok((a_ok && b_ok, [ra, rb]))
+    }
+
+    /// (s3) after (sd) drafted: slot 1's state saved with its draft's side
+    /// (`seq_save`), the slot reset and run on `c`, then put back
+    /// (`seq_resume`) and run on, slot 0 running on between: both slots'
+    /// continuations their solo runs'.
+    fn slots_resume(
+        s: &mut Session<Body>,
+        spec: &mut Spec,
+        parked: &mut [Parked<GlmArena>],
+        c: &[u32],
+        [mut ra, mut rb]: [SlotRun; 2],
+        (solo_a, solo_b): (&SlotRun, &SlotRun),
+    ) -> Result<bool, GateError> {
+        select_drafted(s, spec, parked, 1)?;
+        let state = seq_save(s.model_mut())?;
+        let side = spec.draft().park();
+        reset_drafted(s, spec)?;
+        let mut rc = drafted_start(s, spec, c)?;
+        drafted_passes(s, spec, &mut rc, 2)?;
+        select_drafted(s, spec, parked, 0)?;
+        drafted_passes(s, spec, &mut ra, SLOT_RESUMED)?;
+        select_drafted(s, spec, parked, 1)?;
+        reset_drafted(s, spec)?;
+        seq_resume(s.model_mut(), &state)?;
+        spec.draft_mut().unpark(&side);
+        drafted_passes(s, spec, &mut rb, SLOT_RESUMED)?;
+        let (a_on, b_back) = (ra.same(solo_a), rb.same(solo_b));
+        println!(
+            "slots (s3) park/resume: slot 1's state of {} positions saved ({} host bytes) with its \
+             draft's side, the slot run on {} other ids and put back, then {SLOT_RESUMED} passes: \
+             ids {:?} passes {:?} (solo {:?} {:?}) logits bit for bit {b_back}; slot 0 on \
+             between, bit for bit its solo run's {a_on} {}",
+            state.positions(),
+            state.bytes(),
+            c.len(),
+            rb.ids,
+            rb.passes,
+            solo_b.ids,
+            solo_b.passes,
+            verdict(b_back && a_on)
+        );
+        Ok(b_back && a_on)
+    }
+
+    /// A slot clause's verdict, an error it ended in printed as its FAIL
+    /// rather than ending the gate.
+    fn clause(what: &str, r: Result<bool, GateError>) -> bool {
+        r.unwrap_or_else(|e| {
+            println!("slots {what}: ended in error \"{e}\" {}", verdict(false));
+            false
+        })
+    }
+
+    /// The (slots) clauses (the module header): the harness's contracts and
+    /// the body's own between them on one load, then (sd) and (s3) on a load
+    /// of their own.
+    fn slots(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (_, _, prefill) = man.step()?;
+        if prefill.len() < 700 {
+            return Err(
+                format!("{D1K}: {} prefill ids, the clause reads 700", prefill.len()).into(),
+            );
+        }
+        // Three prompts of distinct ids and lengths: (sc)'s cut restores
+        // slot 1's prompt call's checkpoint, which a ledger the slots shared
+        // would hold slot 0's in place of.
+        let (a, b, c) = (&prefill[..33], &prefill[300..340], &prefill[600..630]);
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let inputs = PlanInputs::read(&file)?;
+        let nextn = NextnInputs::read(&inputs)?;
+        drop(file);
+        let body = GlmSlots {
+            levers,
+            inputs,
+            nextn,
+            prompts: [a, b],
+        };
+        let mut s = slots_gate::interleave(&body)?;
+        let mut ok = clause("(sp) plan", slots_plan(&body, s.model()));
+        ok &= clause("(sc) cut", slots_cut(&mut s, &body));
+        ok &= s.finish()?;
+        // (sd) and (s3) drive the MTP draft through a session, which owns
+        // its model; the harness lends its own by reference only.
+        let mut s = Session::from_model(body.open(SLOTS)?, u32::try_from(SLOT_CTX)?);
+        s.model_mut().set_mode(StepMode::Graph);
+        s.add_slots(SLOTS)?;
+        let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
+        let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut Quiet)?;
+        let mut parked = vec![spec.draft().park(); SLOTS];
+        let solo_a = drafted_solo(&mut s, &mut spec, &mut parked, 0, a)?;
+        let solo_b = drafted_solo(&mut s, &mut spec, &mut parked, 0, b)?;
+        let solo_passes = || solo_a[1].passes.iter().chain(&solo_b[1].passes);
+        let proposed = solo_passes().any(|&(p, k)| p && k == PAIR)
+            && solo_passes().any(|&(p, k)| p && k < PAIR);
+        println!(
+            "slots: the solo drafted runs accept and reject a proposal {}",
+            verdict(proposed)
+        );
+        ok &= proposed;
+        let solos = (&solo_a[0], &solo_b[0]);
+        match slots_drafted(&mut s, &mut spec, &mut parked, (a, b), solos) {
+            Ok((sd, runs)) => {
+                ok &= sd;
+                let r = slots_resume(
+                    &mut s,
+                    &mut spec,
+                    &mut parked,
+                    c,
+                    runs,
+                    (&solo_a[1], &solo_b[1]),
+                );
+                ok &= clause("(s3) park/resume", r);
+            }
+            Err(e) => {
+                ok &= clause("(sd) drafted", Err(e));
+                ok &= clause("(s3) park/resume", Err("(sd) drafted ended first".into()));
+            }
+        }
+        Ok(ok)
+    }
+
     /// Which clauses a run takes.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Only {
@@ -1900,6 +2463,8 @@ mod gate {
         Verify,
         /// (k) alone, on a load at [`CTX`].
         Keep,
+        /// (slots) alone, on their load at [`SLOT_CTX`].
+        Slots,
     }
 
     /// Which of (t)'s step sets the load at [`CTX`] runs.
@@ -1959,7 +2524,7 @@ mod gate {
     }
 
     /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, `--only
-    /// keep`, or every clause.
+    /// keep`, `--only slots`, or every clause.
     fn only() -> Result<Only, GateError> {
         let args: Vec<String> = std::env::args().collect();
         match args.iter().position(|a| a == "--only") {
@@ -1970,9 +2535,11 @@ mod gate {
                 Some("pplong") => Ok(Only::PpLong),
                 Some("verify") => Ok(Only::Verify),
                 Some("keep") => Ok(Only::Keep),
-                other => {
-                    Err(format!("--only is main, pp, pplong, verify or keep, not {other:?}").into())
-                }
+                Some("slots") => Ok(Only::Slots),
+                other => Err(format!(
+                    "--only is main, pp, pplong, verify, keep or slots, not {other:?}"
+                )
+                .into()),
             },
         }
     }
@@ -1998,6 +2565,9 @@ mod gate {
         }
         if matches!(only, Only::All | Only::Pp) {
             ok &= prompt_batch(&levers)?;
+        }
+        if matches!(only, Only::All | Only::Slots) {
+            ok &= slots(&levers)?;
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

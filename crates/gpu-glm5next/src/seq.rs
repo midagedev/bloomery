@@ -1,6 +1,6 @@
 //! A GLM sequence state on the host ([`GlmSeq`], over the shared
-//! `bloomery_gpu::checkpoint::saved`): what a server's prompt cache or its
-//! slot swap holds for a sequence it switches away from.
+//! `bloomery_gpu::checkpoint::saved`): what a server's prompt cache or a
+//! slot's save holds of a sequence, put back on the slot that resumes it.
 //!
 //! The parts, each forced by a fact of the architecture:
 //! - every latent layer's latent rows, index rows and pool keys of the held
@@ -246,7 +246,7 @@ pub fn seq_resume(m: &mut GpuModel<Body>, s: &GlmSeq) -> Result<(), GpuError> {
 
 /// The host bytes a sequence state of `ctx` positions holds on the file
 /// `inputs` describes, with the NextN layer's side when the load drafts
-/// ([`GlmSeq::bytes`]'s terms at plan time, for a seat's park budget):
+/// ([`GlmSeq::bytes`]'s terms at plan time):
 /// every latent layer's rows of the positions and their pool keys (the
 /// NextN layer's store beside them under the draft), two recurrent copies
 /// of each KDA layer's committed lane and conv ring, and the draft's two
