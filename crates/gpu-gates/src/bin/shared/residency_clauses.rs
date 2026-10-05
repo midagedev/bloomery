@@ -1,22 +1,27 @@
 //! The residency clauses' model-free half, one owner for every gate that
 //! runs the residency machine on a real model: V4.1's clauses
-//! (`shared/ds41_residency.rs`, run by `gate_ds41_callstream`) and GLM's
-//! (`gate_glm5next_residency`) include this module with a `#[path]` line.
-//! It holds `refuse`'s tail ([`refuse_tail`]: the open's timing, the verdict
-//! on its error, the `refuse:` line), `transform`'s check
-//! ([`transform_check`]: every admitted expert's slot against its static
-//! bytes), the card table's verdict and its printed line ([`table_clause`]),
-//! `static`'s two halves ([`StaticProbe::of`] the read, [`static_row0`] the
-//! compare on the static load), `passes` ([`passes_clause`]) and `c7`
-//! ([`c7_clause`]); a gate supplies what its body forces — its body type and
-//! accessors, its views of the residency (`generate::Residence`, the card
-//! copy's accessor its body owns: V4.1 `Body::slots`, GLM `Body::slot_copy`),
-//! its session open, its churn pool, its layer seeds, its constants (the
-//! refusal's bound, a history's step count, a source's part count). The
-//! readback and the table helpers stay in `generate` ([`Residence`],
-//! [`slot_table`], `place_table`). The printed lines are keyed on by the
-//! records' readers, so the shared half owns them whole; a gate hands the
-//! clause the history's own name for its line.
+//! (`shared/ds41_residency.rs`, run by `gate_ds41_callstream`), GLM's
+//! (`gate_glm5next_residency`) and Qwen3.8's (`gate_qwen38_residency`)
+//! include this module with a `#[path]` line. It holds `refuse`'s halves
+//! ([`refuse_head`] the short host, [`refuse_tail`] the open's timing, the
+//! verdict on its error, the `refuse:` line), the seed lists ([`seeds`],
+//! [`layer_seeds`]), `transform`'s check and its plain verdict
+//! ([`transform_check`]: every
+//! admitted expert's slot against its static bytes, [`transform_verdict`]
+//! the line), the card table's verdict and its printed line
+//! ([`table_clause`]), `static`'s two halves ([`StaticProbe::of`] the read,
+//! [`static_row0`] the compare on the static load), the history verdicts
+//! ([`c1_clause`], [`passes_clause`], [`c7_clause`]) and the rule walk
+//! ([`rule_after`]); a gate supplies what its body forces — its body type
+//! and accessors, its views of the residency (`generate::Residence`, the
+//! card copy's accessor its body owns: V4.1 `Body::slots`, GLM
+//! `Body::slot_copy`), its session open, its churn pool, its layer seeds,
+//! its rule reader and pass taker, its constants (the refusal's bound, a
+//! history's step count, a source's part count). The readback and the table
+//! helpers stay in `generate` ([`Residence`], [`slot_table`], `place_table`).
+//! The printed lines are keyed on by the records' readers, so the shared
+//! half owns them whole; a gate hands the clause the history's own name for
+//! its line.
 
 use std::time::Instant;
 
@@ -26,21 +31,37 @@ use bloomery_gpu::host::swap::{
     CardTable, PassReport, ResetReport, SlotState, SwapMachine, SwapSource,
 };
 use bloomery_gpu::host::swap_source::FileSwap;
-use bloomery_gpu::model::ChainBody;
 use bloomery_gpu::{Gpu, window};
 use bloomery_gpu_gates::generate::{Residence, ServeFeed, slot_table};
 use bloomery_gpu_gates::{GateError, verdict};
-use runtime::Advance;
+use model::placement::Machine;
+use runtime::swaprule::SwapRule;
+use runtime::{Advance, Target as _, Want};
+
+/// `refuse`'s head: `machine` with its host's usable bytes taken down to
+/// one byte under the plan's `headroom_bytes` plus the churn pool's
+/// `pool_bytes` — the pair it returns, `short` the byte count the clause's
+/// line names and `small` the machine to open on, for [`refuse_tail`].
+pub fn refuse_head(
+    machine: &Machine,
+    headroom_bytes: i128,
+    pool_bytes: u64,
+) -> Result<(i128, Machine), GateError> {
+    let short = i128::from(machine.host.usable_bytes) - headroom_bytes + i128::from(pool_bytes) - 1;
+    let mut small = machine.clone();
+    small.host.usable_bytes = u64::try_from(short)?;
+    Ok((short, small))
+}
 
 /// `refuse`'s tail: the open of a host one byte short of the churn pool —
 /// `short`, of `pool_bytes` — through `open`, timed: refused by name (its
 /// error names the churn pool) within `bound_s` before anything loads, and
 /// the `refuse:` line.
-pub fn refuse_tail<B: ChainBody>(
+pub fn refuse_tail<T>(
     short: i128,
     pool_bytes: u64,
     bound_s: f64,
-    open: impl FnOnce() -> Result<Session<B>, GateError>,
+    open: impl FnOnce() -> Result<T, GateError>,
 ) -> Result<bool, GateError> {
     let t0 = Instant::now();
     let opened = open();
@@ -59,6 +80,37 @@ pub fn refuse_tail<B: ChainBody>(
         verdict(ok)
     );
     Ok(ok)
+}
+
+/// The layers `layers` holds routed experts of, with their seeds
+/// (`machine`'s), in their order, the empty seeds left out: [`c7_clause`]'s
+/// seed list.
+pub fn seeds(
+    machine: &SwapMachine,
+    layers: impl Iterator<Item = usize>,
+) -> Result<Vec<(usize, Vec<u32>)>, GateError> {
+    let mut out = Vec::new();
+    for l in layers {
+        let seed = machine.seed(l)?;
+        if !seed.is_empty() {
+            out.push((l, seed));
+        }
+    }
+    Ok(out)
+}
+
+/// Every layer of `layers` with its seed (`machine`'s), in their order, the
+/// empty seeds included: [`transform_check`]'s layer list, which checks each
+/// live expert of a layer that its seed does not hold.
+pub fn layer_seeds(
+    machine: &SwapMachine,
+    layers: impl Iterator<Item = usize>,
+) -> Result<Vec<(usize, Vec<u32>)>, GateError> {
+    let mut out = Vec::new();
+    for l in layers {
+        out.push((l, machine.seed(l)?));
+    }
+    Ok(out)
 }
 
 /// `transform`'s check: every live non-seed expert of `layers` (each layer
@@ -90,9 +142,9 @@ pub fn transform_check(
             for part in 0..parts {
                 let want = source.card_bytes(l, e, part)?;
                 let at = source.dest(l, part, slot as u32)?;
-                // SAFETY: `at` is slot `slot` of the stage card's stack
-                // of layer `l`, which holds `want.len()` bytes there and
-                // stays allocated while the model lives.
+                // SAFETY: `at` is slot `slot` of layer `l`'s stack `part`,
+                // which holds `want.len()` bytes there and stays allocated
+                // while the model lives.
                 let view = unsafe { window::<u32>(at, want.len() / 4, gpu.context()) };
                 let mut got = vec![0u32; want.len() / 4];
                 view.copy_to_host(stream, &mut got)?;
@@ -107,6 +159,22 @@ pub fn transform_check(
         }
     }
     Ok((checked, bad))
+}
+
+/// `transform`'s verdict, the plain line: [`transform_check`]'s answer with
+/// at least one expert admitted and no part differing (a gate whose clause
+/// reads more of the source than the check does prints its own line).
+pub fn transform_verdict(checked: usize, bad: &[String]) -> bool {
+    let ok = checked > 0 && bad.is_empty();
+    println!(
+        "transform: {checked} admitted experts, {} parts differ from a static load{}: {}",
+        bad.len(),
+        bad.first()
+            .map(|f| format!(" (first {f})"))
+            .unwrap_or_default(),
+        verdict(ok)
+    );
+    ok
 }
 
 /// `table`: the stage card's copy of the map after the history — `start`
@@ -261,6 +329,21 @@ pub fn static_row0<B: Prompt + Keep>(
     Ok(ok)
 }
 
+/// `c1`: the history twice gives the same tokens and logits (`same`) and
+/// flips land (`landed` of them; `tokens` the history's token count for the
+/// line).
+pub fn c1_clause(tokens: usize, landed: usize, same: bool) -> bool {
+    let c1 = same && landed > 0;
+    println!(
+        "c1: the history twice, {} tokens, {} flips landed: same {}: {}",
+        tokens,
+        landed,
+        same,
+        verdict(c1)
+    );
+    c1
+}
+
 /// `passes`: a history's boundaries end, in order, no pass, the prompt call
 /// (one pass, 0 rows kept) and each of `steps` steps (1 kept), the last
 /// step's own included: its boundary is made ahead of its readback.
@@ -308,4 +391,23 @@ pub fn c7_clause(r: &ResetReport, machine: &SwapMachine, seeds: &[(usize, Vec<u3
         verdict(c7)
     );
     c7
+}
+
+/// The rule after `pass` from a clear: the prompt, `pass`, then the next
+/// boundary, which folds the pass's kept rows — the gate hands it its own
+/// `rule_of` and `take_passes`, which reach its body.
+pub fn rule_after<B: Prompt + Keep>(
+    s: &mut Session<B>,
+    ids: &[u32],
+    rule_of: impl Fn(&Session<B>) -> Result<SwapRule, GateError>,
+    take_passes: impl Fn(&mut Session<B>) -> Result<Vec<(PassKind, PassReport)>, GateError>,
+    pass: impl FnOnce(&mut Session<B>, u32) -> Result<(), GateError>,
+) -> Result<SwapRule, GateError> {
+    s.clear()?;
+    let next = s.prompt(ids, Want::Argmax)?.argmax();
+    pass(s, next)?;
+    s.model_mut().pass_boundary()?;
+    let rule = rule_of(s)?;
+    take_passes(s)?;
+    Ok(rule)
 }

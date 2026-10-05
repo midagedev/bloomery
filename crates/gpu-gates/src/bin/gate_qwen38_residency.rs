@@ -101,6 +101,13 @@ fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_qwen38_residency", gate::run())
 }
 
+// `pub`: this gate runs neither `table` nor `static`, and its `passes` list
+// holds a verify row the shared clause does not build, so a private module
+// would count those items dead in this bin.
+#[cfg(feature = "gpu")]
+#[path = "shared/residency_clauses.rs"]
+pub mod residency_clauses;
+
 #[cfg(feature = "gpu")]
 mod gate {
     use std::path::Path;
@@ -110,8 +117,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model};
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::swap::{CallReport, PassReport, Residency, SlotState, SwapSource};
-    use bloomery_gpu::window;
+    use bloomery_gpu::host::swap::{CallReport, PassReport, Residency, SlotState};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
@@ -322,22 +328,6 @@ mod gate {
         Ok(h)
     }
 
-    /// The rule after `pass` from a clear: the prompt, `pass`, then the next
-    /// boundary, which folds the pass's kept rows.
-    fn rule_after(
-        s: &mut Session<Body38>,
-        ids: &[u32],
-        pass: impl FnOnce(&mut Session<Body38>, u32) -> Result<(), GateError>,
-    ) -> Result<SwapRule, GateError> {
-        s.clear()?;
-        let next = s.prompt(ids, Want::Argmax)?.argmax();
-        pass(s, next)?;
-        s.model_mut().pass_boundary()?;
-        let rule = rule_of(s)?;
-        take_passes(s)?;
-        Ok(rule)
-    }
-
     /// The machine's rule as it stands.
     fn rule_of(s: &Session<Body38>) -> Result<SwapRule, GateError> {
         Ok(s.model()
@@ -357,17 +347,11 @@ mod gate {
             .hybrid()
             .swap()
             .ok_or("the load runs no residency machine")?;
-        let mut out = Vec::new();
-        for l in b.hybrid().slots().layers() {
-            let seed = machine.seed(l)?;
-            if !seed.is_empty() {
-                out.push((l, seed));
-            }
-        }
-        Ok(out)
+        crate::residency_clauses::seeds(machine, b.hybrid().slots().layers())
     }
 
-    /// `transform`: each admitted expert's slot against its static bytes.
+    /// `transform`: each admitted expert's slot against its static bytes
+    /// (three parts an expert: the gate and up, the down).
     fn transform_clause(s: &Session<Body38>) -> Result<bool, GateError> {
         let m = s.model();
         let b = m.body(NAME)?;
@@ -378,49 +362,10 @@ mod gate {
         let source = b
             .residency_source()
             .ok_or("the load has no residency source")?;
-        let (gpu, stream) = (m.gpu(), m.gpu().stream());
-        stream.synchronize()?;
-        let (mut checked, mut bad) = (0usize, Vec::new());
-        for l in b.hybrid().slots().layers() {
-            let seed = machine.seed(l)?;
-            let Some(row) = machine.ledger().row(l) else {
-                continue;
-            };
-            for (slot, st) in row.iter().enumerate() {
-                let SlotState::Live(e) = *st else { continue };
-                if seed.contains(&e) {
-                    continue;
-                }
-                checked += 1;
-                for part in 0..3 {
-                    let want = source.card_bytes(l, e, part)?;
-                    let at = source.dest(l, part, slot as u32)?;
-                    // SAFETY: `at` is slot `slot` of the card's stack
-                    // of layer `l`, which holds `want.len()` bytes there and
-                    // stays allocated while the model lives.
-                    let view = unsafe { window::<u32>(at, want.len() / 4, gpu.context()) };
-                    let mut got = vec![0u32; want.len() / 4];
-                    view.copy_to_host(stream, &mut got)?;
-                    let got: Vec<u8> = got.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    if got != want {
-                        let first = got.iter().zip(want).position(|(a, b)| a != b);
-                        bad.push(format!(
-                            "layer {l} expert {e} slot {slot} part {part} at {first:?}"
-                        ));
-                    }
-                }
-            }
-        }
-        let ok = checked > 0 && bad.is_empty();
-        println!(
-            "transform: {checked} admitted experts, {} parts differ from a static load{}: {}",
-            bad.len(),
-            bad.first()
-                .map(|f| format!(" (first {f})"))
-                .unwrap_or_default(),
-            verdict(ok)
-        );
-        Ok(ok)
+        let layers = crate::residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?;
+        let (checked, bad) =
+            crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers, |_| 3)?;
+        Ok(crate::residency_clauses::transform_verdict(checked, &bad))
     }
 
     /// What one run of the streaming clause saw: the greedy ids, the prompt
@@ -739,28 +684,11 @@ mod gate {
         pool.check(&plan)
             .map_err(|e| format!("the churn pool does not fit the plan's host: {e}"))?;
         record::residency_host(&word_of(residency), &pool, &plan).print();
-        let short = i128::from(machine.host.usable_bytes) - plan.host.headroom_bytes
-            + i128::from(pool.bytes)
-            - 1;
-        let mut small = machine.clone();
-        small.host.usable_bytes = u64::try_from(short)?;
-        let t0 = Instant::now();
-        let opened = open(path, inputs, small, *residency, host, ub);
-        let secs = t0.elapsed().as_secs_f64();
-        let (ok, why) = match opened {
-            Err(e) => {
-                let text = e.to_string();
-                (text.contains("churn pool") && secs < REFUSE_BOUND_S, text)
-            }
-            Ok(_) => (false, "the open loaded".to_string()),
-        };
-        println!(
-            "refuse: a host of {short} B, one byte short of the {} B churn pool: {} in {secs:.1} \
-             s — {why}",
-            pool.bytes,
-            verdict(ok)
-        );
-        Ok(ok)
+        let (short, small) =
+            crate::residency_clauses::refuse_head(machine, plan.host.headroom_bytes, pool.bytes)?;
+        crate::residency_clauses::refuse_tail(short, pool.bytes, REFUSE_BOUND_S, || {
+            open(path, inputs, small, *residency, host, ub)
+        })
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -807,20 +735,23 @@ mod gate {
         let seeds = seeds(&s)?;
 
         let ids = prose(PROMPT)?;
-        let step = rule_after(&mut s, &ids, |s, t| {
-            s.step(t, Want::Argmax)?;
-            Ok(())
-        })?;
-        let one = rule_after(&mut s, &ids, |s, t| {
-            s.verify::<2>([t, t])?;
-            s.commit(1)?;
-            Ok(())
-        })?;
-        let both = rule_after(&mut s, &ids, |s, t| {
-            s.verify::<2>([t, t])?;
-            s.commit(2)?;
-            Ok(())
-        })?;
+        let step =
+            crate::residency_clauses::rule_after(&mut s, &ids, rule_of, take_passes, |s, t| {
+                s.step(t, Want::Argmax)?;
+                Ok(())
+            })?;
+        let one =
+            crate::residency_clauses::rule_after(&mut s, &ids, rule_of, take_passes, |s, t| {
+                s.verify::<2>([t, t])?;
+                s.commit(1)?;
+                Ok(())
+            })?;
+        let both =
+            crate::residency_clauses::rule_after(&mut s, &ids, rule_of, take_passes, |s, t| {
+                s.verify::<2>([t, t])?;
+                s.commit(2)?;
+                Ok(())
+            })?;
         let c6 = one == step && both != one;
         println!(
             "c6: a verify keeping one row leaves the rule a step leaves ({}), keeping both does \
@@ -834,15 +765,8 @@ mod gate {
         let first = history(&mut s, &ids)?;
         pass &= transform_clause(&s)?;
         let again = history(&mut s, &ids)?;
-        let c1 = first == again && first.landed > 0;
-        println!(
-            "c1: the history twice, {} tokens, {} flips landed: same {}: {}",
-            first.tokens.len(),
-            first.landed,
-            first == again,
-            verdict(c1)
-        );
-        pass &= c1;
+        pass &=
+            crate::residency_clauses::c1_clause(first.tokens.len(), first.landed, first == again);
 
         // The prompt call is one pass that keeps 0 rows; a step keeps 1; a
         // verify keeps its accepted rows. A step's own boundary is made ahead
@@ -880,33 +804,17 @@ mod gate {
             .residency_reset()?
             .ok_or("the load runs no residency machine")?;
         record::residency_reset(&r).print();
-        let live_is_seed = {
-            let m = s.model();
-            let b = m.body(NAME)?;
-            let machine = b.hybrid().swap().ok_or("no machine")?;
-            seeds.iter().all(|(l, seed)| {
-                let live: Vec<u32> = machine
-                    .ledger()
-                    .row(*l)
-                    .unwrap_or(&[])
-                    .iter()
-                    .filter_map(|st| match st {
-                        SlotState::Live(e) => Some(*e),
-                        _ => None,
-                    })
-                    .collect();
-                live.len() == seed.len() && seed.iter().all(|e| live.contains(e))
-            })
-        };
-        let c7 = r.diff == 0 && live_is_seed && r.dropped_bytes == 0;
-        println!(
-            "c7: the reset's diff {}, live sets the seed {live_is_seed}, dropped {} B (0: the \
-             churn pool stays): {}",
-            r.diff,
-            r.dropped_bytes,
-            verdict(c7)
+        // The placement `machine` stays bound below (the slots clauses' load
+        // plans on it), so the residency machine's borrow stays in the call.
+        pass &= crate::residency_clauses::c7_clause(
+            &r,
+            {
+                let m = s.model();
+                let b = m.body(NAME)?;
+                b.hybrid().swap().ok_or("no machine")?
+            },
+            &seeds,
         );
-        pass &= c7;
 
         pass &= stream_clause(&mut s)?;
         // The gate's load is done: the card holds one load, and the slots
