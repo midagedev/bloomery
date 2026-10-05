@@ -114,7 +114,7 @@ gpu-deepseek41 448 53 0
 # PIN(2026-10-03): gpu-gates 61 -> 62 blocks, new code, not old code relaxed: gate_qwen3moe_flash's q8 window
 # refusal (the q8 prefill's `kq` at 8 bytes past a 16-byte boundary) takes its window over a padded
 # allocation in one block, with its SAFETY line.
-gpu-gates 62 5 1
+gpu-gates 61 5 1
 gpu-glm5next 4 0 0
 gpu-vision 48 0 0
 hf 0 0 0
