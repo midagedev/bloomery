@@ -1383,7 +1383,7 @@ pub static FED: Kind = Kind {
 pub static ARM: Kind = Kind {
     name: "arm",
     head: "arm",
-    doc: "An arm of one load's --arm list, before its lines: its index, the list's length, its feed (lcg or a corpus), its fed ids and its generated count.",
+    doc: "An arm of one load's --arm list, before its lines: its index, the list's length, its feed (lcg, a corpus, or repeat: a --repeat run of the prompt flags), its fed ids and its generated count.",
     parts: &[
         key("i", U64, ""),
         key("arms", U64, ""),
@@ -1402,6 +1402,88 @@ pub static LOGITS: Kind = Kind {
         key("n", U64, ""),
         key("argmax", U64, ""),
         key("fnv64", Word, ""),
+    ],
+};
+
+/// The logits row behind one generated token, by its two largest entries.
+pub static TOP2: Kind = Kind {
+    name: "top2",
+    head: "top2",
+    doc: "--top2 K: the logits row behind each of the first K generated tokens (i 0 the prompt call's last row), its two largest entries' ids and values, the larger first, and their margin.",
+    parts: &[
+        key("i", U64, ""),
+        key("top1", U64, ""),
+        key("top1_logit", F64(4), ""),
+        key("top2", U64, ""),
+        key("top2_logit", F64(4), ""),
+        key("margin", F64(4), ""),
+    ],
+};
+
+/// `--rows`: the rows `--top2` read, appended whole to a file.
+pub static ROWS: Kind = Kind {
+    name: "rows",
+    head: "rows",
+    doc: "--rows FILE: a run's --top2 rows appended whole to FILE as little-endian f32, after the run's top2 records: the rows, each row's length, the bytes written and FILE.",
+    parts: &[
+        key("rows", U64, ""),
+        key("n", U64, ""),
+        key("bytes", U64, "B"),
+        key("path", Text, ""),
+    ],
+};
+
+/// `--ignore-eos`: the ids the pick passes over.
+pub static IGNORE_EOS: Kind = Kind {
+    name: "ignore_eos",
+    head: "ignore eos",
+    doc: "--ignore-eos: the vocabulary's end-of-generation ids, which the pick passes over as the serve does under a request's ignore_eos and --top2 does not rank.",
+    parts: &[key("ids", Csv, "")],
+};
+
+/// `--dump-table`: the card's map as a run's token 0 used it.
+pub static TABLE_DUMP: Kind = Kind {
+    name: "table_dump",
+    head: "table dump",
+    doc: "--dump-table FILE: the stage card's copy of the slot map as the second run's token 0 ran on it, written to FILE: its entries, those on the card, those that differ from the host map, whether the read after Target::reset (FILE.before) is the same, and FILE.",
+    parts: &[
+        key("entries", U64, ""),
+        key("on_card", U64, ""),
+        key("vs_map", U64, ""),
+        key("same_before", Bool, ""),
+        key("path", Text, ""),
+    ],
+};
+
+/// `--card-table`: the fixed placement a load made from a dumped table.
+pub static CARD_TABLE: Kind = Kind {
+    name: "card_table",
+    head: "card table",
+    doc: "--card-table FILE: a load placed by a dumped table, residency off: its layers, its card's experts, the entries whose card or host side differs from FILE's, those on the card in both whose slot differs (the load puts each layer's in id order), and FILE.",
+    parts: &[
+        key("layers", U64, ""),
+        key("on_card", U64, ""),
+        key("set_diff", U64, ""),
+        key("slot_diff", U64, ""),
+        key("path", Text, ""),
+    ],
+};
+
+/// `--table`: the stage card's copy of the slot map, read back.
+pub static SLOT_TABLE: Kind = Kind {
+    name: "slot_table",
+    head: "slot table",
+    doc: "--table: the stage card's copy of the slot map read back after the runs: its layers and entries, the entries on the card, whether the load runs the residency machine, the entries that differ from the host map, from the ledger's live and landing slots (0 without a machine), and from the map before the first run, the card slots two ids of one layer both name, and the first entries that differ from the map or the ledger (l<layer>/e<id>:card=,map=,ledger=, h the host mark; none when none).",
+    parts: &[
+        key("layers", U64, ""),
+        key("entries", U64, ""),
+        key("on_card", U64, ""),
+        key("machine", Bool, ""),
+        key("vs_map", U64, ""),
+        key("vs_ledger", U64, ""),
+        key("vs_load", U64, ""),
+        key("doubled", U64, ""),
+        key("first", Text, ""),
     ],
 };
 
@@ -2518,6 +2600,12 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &TIME_PASS,
     &TOKENS,
     &LOGITS,
+    &TOP2,
+    &ROWS,
+    &IGNORE_EOS,
+    &SLOT_TABLE,
+    &TABLE_DUMP,
+    &CARD_TABLE,
     &STAT_STEP,
     &STAT_SUMMARY,
     &STAT_FINITE_STEP,

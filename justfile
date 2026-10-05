@@ -1225,6 +1225,15 @@ gate-gpu-ds41-unpack:
 gate-gpu-ds41-callstream *ARGS:
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream {{ARGS}}'
 
+# The same residency clauses on plan (a), the serving plan: every layer and the head on the A6000, no tier card
+# (gate_ds41_callstream --place a --only residency; the tier clause asks that the host map holds no tier entry), and
+# the static clause, whose load of the dumped card table follows the residency load's teardown. The A6000 alone, the
+# host set locked, one load at a time, alone in a batch.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-ds41-residency-a:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream --place a --only residency'
+
 # V4.1 long runs on the gate placement, three arms on one load, the host set populated and locked
 # (BLOOMERY_HOST_LOCK=1 unless the environment says otherwise: populated pages alone are reclaimed under
 # another process's reads). --faults first, the process's first steps after the load: 32 greedy graph

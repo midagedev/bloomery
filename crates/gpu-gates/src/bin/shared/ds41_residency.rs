@@ -1,7 +1,8 @@
 //! V4.1's adaptive expert residency clauses on the real model
 //! (`bloomery_gpu_deepseek41::swap`, `BLOOMERY_RESIDENCY`), run by
 //! `gate_ds41_callstream` on its load: plan (b′) on both cards (`--place
-//! bp`: the stage on the A6000, the expert tier on the 3090), the residency
+//! bp`: the stage on the A6000, the expert tier on the 3090), or plan (a) on
+//! the A6000 alone (`--place a`), the residency
 //! machine over the stage card's routed stacks at `mid-p40-s1`, set there
 //! (the lever itself is refused, so the environment cannot move it). The
 //! stage's seed is the plan's id prefix. `refuse` runs before that load, the
@@ -34,7 +35,9 @@
 //!   (mutant: `host_resident` answers true).
 //! - `tier` (bp): every tier entry of the host map is where the load put it
 //!   after the histories, though flips landed on tier layers (mutant: the
-//!   machine's layout does not hold the tier's experts away).
+//!   machine's layout does not hold the tier's experts away). Plan (a) has no
+//!   tier card: there the clause asks only that the host map holds no tier
+//!   entry, at the load and after the histories.
 //! - `c3` (green-only): the history with the machine's copy stream held by a
 //!   host flag for [`HOLD`] from before its first pass gives the first run's
 //!   tokens and logits.
@@ -47,6 +50,26 @@
 //!   misses its cache ([`runtime::Target::reset`], the seat's reset) leaves
 //!   the residency where use took it — the live sets and the rule as before
 //!   it, no `residency reset` (mutant: that reset resets the residency).
+//! - `table`: after the held history, the stage card's copy of the map read
+//!   back (`generate::Residence`, `CardTable`) is off neither the host map
+//!   nor the machine's ledger, names no slot twice in a layer, and is off
+//!   the map the history started from by at least one entry and at most two
+//!   a landed flip (each moves its admitted expert onto a slot and its victim
+//!   off) (mutant: a landing writes the admitted expert's word and not the
+//!   victim's).
+//! - `static` (`--place a`): the residency computes the placement its card
+//!   copy holds. The copy as the held history left it is read; after the
+//!   seat's reset the history's prompt is fed the serve's way
+//!   (`generate::ServeFeed`), and the row of its last id (row 0) is kept,
+//!   the boundaries before that row landing no flip (named). After the
+//!   teardown, one more load — residency off, host streaming off as the
+//!   history ran, each routed layer's card experts the read copy's
+//!   (`Loaded::open_edited`, `generate::place_table`; named: no machine, and
+//!   the card holds the copy's sets) — is fed the same ids the same way: its
+//!   row 0 equals the residency's bit for bit (mutants: a flip's copy
+//!   written one slot below its slot; the admitted expert's bytes left
+//!   unconverted on the card). Under plan (b′) the streaming clauses follow
+//!   on the same load, so the clause runs under `--place a` alone.
 //! - `passes` (green-only): a history's boundaries end, in order, no pass,
 //!   the prompt call (one pass, 0 rows kept) and each step (1 kept), the
 //!   last step's own included: its boundary is made ahead of its readback.
@@ -54,23 +77,24 @@
 //! The gate runs with the r8 sidecar (`BLOOMERY_R8` on, its default): without
 //! it no flip unpacks, and `transform` is red by name.
 
-use crate::ds41_open::{fnv, open};
+use crate::ds41_open::{fnv, open, open_edited};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use app::Session;
+use app::{Session, SessionError};
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::slots::Slot;
-use bloomery_gpu::host::swap::{Residency, SlotState, SwapSource};
+use bloomery_gpu::host::swap::{CardTable, Residency, SlotState, SwapSource};
 use bloomery_gpu::{HostFlags, window};
 use bloomery_gpu_deepseek41::body::{Body, OpenCfg};
 use bloomery_gpu_deepseek41::swap;
+use bloomery_gpu_gates::generate::{Place, Residence, ServeFeed, place_table, slot_table};
 use bloomery_gpu_gates::record;
 use bloomery_gpu_gates::{GateError, data_dir, verdict};
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, workstation};
 use runtime::swaprule::SwapRule;
-use runtime::{Target, Verify, Want};
+use runtime::{Advance, Target, Verify, Want};
 
 const NAME: &str = "residency clauses";
 /// The residency the gate runs: 40 pinned, one spare a layer.
@@ -110,13 +134,24 @@ fn ms(t: Instant) -> f64 {
 
 /// What a history saw: every step's argmax and logits FNV, each
 /// boundary's ended pass (its kind and kept rows), and the flips that
-/// landed.
-#[derive(PartialEq)]
+/// landed; and the host map's stage view after its clear, where those
+/// flips started from.
 struct History {
     tokens: Vec<u32>,
     fnvs: Vec<u64>,
     passes: Vec<(PassKind, usize)>,
     landed: usize,
+    start: Vec<u32>,
+}
+
+/// Two histories are one when they saw the same: the map one starts from
+/// is no part of it, since a reset puts the seed back in whichever slots
+/// are free.
+impl PartialEq for History {
+    fn eq(&self, other: &History) -> bool {
+        (&self.tokens, &self.fnvs, &self.passes, self.landed)
+            == (&other.tokens, &other.fnvs, &other.passes, other.landed)
+    }
 }
 
 /// The history from a clear ([`Session::clear`]), the machine's copy
@@ -131,6 +166,7 @@ fn history(
     s.clear()?;
     let clear_ms = ms(t_clear);
     take_passes(s)?;
+    let start = s.model().body(NAME)?.hybrid().slots().stage_view();
     if let Some(flags) = hold {
         flags.clear(0)?;
         let m = s.model();
@@ -151,6 +187,7 @@ fn history(
             fnvs: Vec::with_capacity(STEPS),
             passes: Vec::new(),
             landed: 0,
+            start: Vec::new(),
         };
         for _ in 0..STEPS {
             let t = Instant::now();
@@ -176,6 +213,7 @@ fn history(
             run(s)
         })?,
     };
+    h.start = start;
     let passes = take_passes(s)?;
     h.landed = passes.iter().map(|(_, r)| r.landed).sum();
     let late: usize = passes.iter().map(|(_, r)| r.late).sum();
@@ -260,14 +298,16 @@ fn rule_of(s: &Session<Body>) -> Result<SwapRule, GateError> {
         .clone())
 }
 
-/// `refuse`: the host one byte short of the churn pool.
+/// `refuse`: the host one byte short of the churn pool, on placement
+/// `place`'s machine.
 pub fn refuse_clause(
     path: &Path,
     inputs: &PlanInputs,
     cfg: &OpenCfg,
-    bp: &dyn Fn(usize) -> Machine,
+    place: Place,
+    machine_of: &dyn Fn(usize) -> Machine,
 ) -> Result<bool, GateError> {
-    let machine = bp(inputs.model.layers);
+    let machine = machine_of(inputs.model.layers);
     let plan = inputs.plan(&machine, workstation::CTX_MAX, &cfg.place)?;
     let pool = swap::churn(&plan, 0, RESIDENCY)?.ok_or("no churn pool under mid")?;
     record::residency_host("mid-p40-s1", &pool, &plan).print();
@@ -277,7 +317,7 @@ pub fn refuse_clause(
     let mut small = machine.clone();
     small.host.usable_bytes = u64::try_from(short)?;
     let t0 = Instant::now();
-    let opened = open(path, move |_| small.clone(), cfg);
+    let opened = open(path, place, move |_| small.clone(), cfg);
     let secs = t0.elapsed().as_secs_f64();
     let (ok, why) = match opened {
         Err(e) => {
@@ -438,12 +478,168 @@ fn resident_clause(s: &Session<Body>, seeds: &[(usize, Vec<u32>)]) -> Result<boo
     Ok(ok)
 }
 
+/// The residency views of `s`'s body: its stage card's copy of the map
+/// (`Body::slots`) and its host tier.
+fn residence(s: &Session<Body>) -> Result<Residence<'_>, GateError> {
+    let m = s.model();
+    let b = m.body(NAME)?;
+    Ok(Residence::of(m.gpu(), b.slots(), b.hybrid()))
+}
+
+/// `table`: the stage card's copy after `held`, the held history, against
+/// the host map, the ledger and the map `held` started from.
+fn table_clause(s: &Session<Body>, held: &History) -> Result<bool, GateError> {
+    let r = residence(s)?;
+    let t = r.table()?;
+    let c = r.check(&t)?;
+    let vs_start = t.differ(&held.start)?;
+    slot_table(&t, &c, vs_start).print();
+    let ok = c.vs_map == 0
+        && c.vs_ledger == Some(0)
+        && c.doubled == 0
+        && vs_start > 0
+        && vs_start <= 2 * held.landed;
+    println!(
+        "table: the card's copy after the held history: {} entries off the host map, {:?} off \
+         the ledger, {} slots named twice, {vs_start} off the history's start for {} flips \
+         landed (0 < {vs_start} <= {}): {}",
+        c.vs_map,
+        c.vs_ledger,
+        c.doubled,
+        held.landed,
+        2 * held.landed,
+        verdict(ok)
+    );
+    Ok(ok)
+}
+
+/// The residency's half of `static`: the stage card's copy of the map as
+/// the history left it, the prompt `ids` the serve's way after the seat's
+/// reset, the row of its last id (row 0), and the boundaries that feed made.
+pub struct StaticProbe {
+    ids: Vec<u32>,
+    table: CardTable,
+    row0: Vec<f32>,
+    /// Each boundary since the seat's reset: the pass it ended, its number,
+    /// the flips that landed there, whether it was made ahead.
+    passes: Vec<(PassKind, u64, usize, bool)>,
+}
+
+impl StaticProbe {
+    /// Whether row 0 ran on the copy read: the feed's last boundary is the
+    /// one row 0's step made ahead, after the row, and none before it
+    /// landed a flip.
+    fn quiet(&self) -> bool {
+        match self.passes.split_last() {
+            Some((&(PassKind::Step, _, _, true), before)) => {
+                !before.is_empty() && before.iter().all(|&(_, _, landed, _)| landed == 0)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// [`StaticProbe`] on `s`, after the held history and `keep`.
+fn static_probe(s: &mut Session<Body>, ids: &[u32]) -> Result<StaticProbe, GateError> {
+    let table = residence(s)?.table()?;
+    runtime::Target::reset(s)?;
+    take_passes(s)?;
+    ServeFeed {
+        inner: &mut runtime::Plain,
+    }
+    .prompt(s, ids)?;
+    let row0 = s.model().logits()?;
+    let passes = take_passes(s)?
+        .iter()
+        .map(|(k, r)| (*k, r.boundary, r.landed, r.ahead))
+        .collect();
+    Ok(StaticProbe {
+        ids: ids.to_vec(),
+        table,
+        row0,
+        passes,
+    })
+}
+
+/// `static`, its second half, after the residency load's teardown: a load by
+/// `machine` under `cfg` with the residency and host streaming off, each
+/// routed layer's card experts `p`'s copy's, fed `p`'s ids the serve's way;
+/// its row 0 against `p`'s, bit for bit.
+pub fn static_clause(
+    path: &Path,
+    place: Place,
+    machine: impl Fn(usize) -> Machine,
+    cfg: &OpenCfg,
+    p: &StaticProbe,
+) -> Result<bool, GateError> {
+    let mut cfg = cfg.clone();
+    cfg.body.residency = Residency::Off;
+    cfg.body.hoststream = false;
+    let t0 = Instant::now();
+    let mut s = open_edited(path, place, machine, &cfg, |plan| {
+        place_table(plan, &p.table).map_err(|e| SessionError::Refused(e.to_string()))
+    })?;
+    let load_s = t0.elapsed().as_secs_f64();
+    let (no_machine, sets) = {
+        let r = residence(&s)?;
+        (r.machine.is_none(), r.table()?.sets_vs(&p.table)?)
+    };
+    ServeFeed {
+        inner: &mut runtime::Plain,
+    }
+    .prompt(&mut s, &p.ids)?;
+    let row0 = s.model().logits()?;
+    let (mut off, mut max) = (0usize, 0f32);
+    if row0.len() == p.row0.len() {
+        for (a, b) in row0.iter().zip(&p.row0) {
+            if a.to_bits() != b.to_bits() {
+                off += 1;
+                max = max.max((a - b).abs());
+            }
+        }
+    }
+    let same = row0.len() == p.row0.len() && off == 0;
+    let quiet = p.quiet();
+    let ok = quiet && no_machine && sets.set == 0 && same;
+    let boundaries: Vec<String> = p
+        .passes
+        .iter()
+        .map(|&(kind, b, landed, ahead)| {
+            format!(
+                "{b}:{}{}+{landed}",
+                kind.word(),
+                if ahead { "(ahead)" } else { "" }
+            )
+        })
+        .collect();
+    println!(
+        "static: the residency's row 0 of the serve's feed of {} ids on its card copy ({} on \
+         the card), boundaries since the seat's reset [{}] (no landing before row 0: {quiet}); \
+         a static load of that copy in {load_s:.1} s (no machine: {no_machine}; {} experts off \
+         its sets, {} at another slot): row 0 bit for bit {same} ({off} of {} entries differ, \
+         max {max}): {}",
+        p.ids.len(),
+        p.table.on_card(),
+        boundaries.join(" "),
+        sets.set,
+        sets.slot,
+        row0.len(),
+        verdict(ok)
+    );
+    Ok(ok)
+}
+
 /// Every clause after `refuse` on `s`, the load just made under
-/// [`RESIDENCY`] by plan (b′), before its first call; `flags` holds the
-/// copy stream for `c3`. Host streaming is off for them, as on the load
-/// they were made on (their prompt calls are under the streaming floor
-/// anyway). `false` when one is red.
-pub fn clauses(s: &mut Session<Body>, flags: &HostFlags) -> Result<bool, GateError> {
+/// [`RESIDENCY`] by placement `place` (plan (b′) or (a)), before its first
+/// call; `flags` holds the copy stream for `c3`. Host streaming is off for
+/// them, as on the load they were made on (their prompt calls are under the
+/// streaming floor anyway). `false` when one is red; under plan (a), with
+/// `static`'s residency half for [`static_clause`] to finish on its own load.
+pub fn clauses(
+    s: &mut Session<Body>,
+    flags: &HostFlags,
+    place: Place,
+) -> Result<(bool, Option<StaticProbe>), GateError> {
     {
         let body = s.model_mut().body_parts(NAME)?.2;
         body.set_hoststream(false)?;
@@ -507,18 +703,31 @@ pub fn clauses(s: &mut Session<Body>, flags: &HostFlags) -> Result<bool, GateErr
     );
     pass &= passes_ok;
 
-    let tier_layers: Vec<usize> = tier_at_load.iter().map(|&(l, _, _)| l).collect();
-    let tier_ok = tier_entries(s)? == tier_at_load && !tier_at_load.is_empty();
-    println!(
-        "tier: {} tier entries on {} layers unchanged: {}",
-        tier_at_load.len(),
-        {
-            let mut t = tier_layers.clone();
-            t.dedup();
-            t.len()
-        },
-        verdict(tier_ok)
-    );
+    let tier_ok = if place == Place::A {
+        let after = tier_entries(s)?.len();
+        let ok = tier_at_load.is_empty() && after == 0;
+        println!(
+            "tier: plan (a) has no tier card: {} tier entries at the load, {after} after the \
+             histories: {}",
+            tier_at_load.len(),
+            verdict(ok)
+        );
+        ok
+    } else {
+        let tier_layers: Vec<usize> = tier_at_load.iter().map(|&(l, _, _)| l).collect();
+        let ok = tier_entries(s)? == tier_at_load && !tier_at_load.is_empty();
+        println!(
+            "tier: {} tier entries on {} layers unchanged: {}",
+            tier_at_load.len(),
+            {
+                let mut t = tier_layers.clone();
+                t.dedup();
+                t.len()
+            },
+            verdict(ok)
+        );
+        ok
+    };
     pass &= tier_ok;
 
     let held = history(s, &ids, Some(flags))?;
@@ -549,6 +758,12 @@ pub fn clauses(s: &mut Session<Body>, flags: &HostFlags) -> Result<bool, GateErr
         verdict(keep)
     );
     pass &= keep;
+
+    pass &= table_clause(s, &held)?;
+    let probe = match place == Place::A {
+        true => Some(static_probe(s, &ids)?),
+        false => None,
+    };
 
     let r = s
         .residency_reset()?
@@ -581,5 +796,5 @@ pub fn clauses(s: &mut Session<Body>, flags: &HostFlags) -> Result<bool, GateErr
         verdict(c7)
     );
     pass &= c7;
-    Ok(pass)
+    Ok((pass, probe))
 }

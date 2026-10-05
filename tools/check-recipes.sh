@@ -258,6 +258,7 @@ echo "${mrt##*$'\n'}"
 selftests=(
   "tools/bloomery/manifest.py --self-test"
   "tools/bloomery/records.py --self-test"
+  "tools/bloomery/rows.py --self-test"
   "tools/bloomery/route_trace.py --self-test"
   "tools/check-comment-only.py --self-test"
   "tools/flow/ds41_prefill.py --self-test"

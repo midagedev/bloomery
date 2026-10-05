@@ -268,9 +268,23 @@ impl<B: Open> Loaded<B> {
         args: OpenArgs<B::Cfg, M>,
         log: &mut impl OpenLog<B>,
     ) -> Result<Option<Loaded<B>>, SessionError> {
+        Loaded::open_edited(file, args, log, |_, _| Ok(()))
+    }
+
+    /// [`Loaded::open`] with `edit` applied to the plan before `log` sees
+    /// it and the model loads by it: a caller that fixes part of the split
+    /// itself (a diagnostic's hand-placed card set) keeps every other row
+    /// the planner made.
+    pub fn open_edited<M: Fn(usize) -> Machine>(
+        file: Split,
+        args: OpenArgs<B::Cfg, M>,
+        log: &mut impl OpenLog<B>,
+        edit: impl FnOnce(&B::Inputs, &mut Plan<'_>) -> Result<(), SessionError>,
+    ) -> Result<Option<Loaded<B>>, SessionError> {
         let inputs = B::inputs(&file)?;
         let machine = (args.machine)(B::layer_count(&inputs));
-        let plan = B::plan(&inputs, &machine, args.ctx, &args.cfg)?;
+        let mut plan = B::plan(&inputs, &machine, args.ctx, &args.cfg)?;
+        edit(&inputs, &mut plan)?;
         if !log.plan(args.place, &inputs, &machine, &plan)? {
             return Ok(None);
         }

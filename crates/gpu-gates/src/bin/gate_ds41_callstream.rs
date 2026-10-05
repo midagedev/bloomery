@@ -8,7 +8,11 @@
 //! process's reads reclaim populated pages). One load. The residency's own
 //! clauses (`shared/ds41_residency.rs`) run first: its host-set refusal
 //! before the load, the rest on the load before the clauses below, with
-//! streaming off; `--only residency` stops after them. Each clause below
+//! streaming off; `--only residency` stops after them. `--place a` loads plan
+//! (a) on the A6000 alone (the serving plan, no tier card) instead, for the
+//! residency's clauses only: it needs `--only residency`, and the clauses
+//! below run under plan (b′). There the residency's `static` clause ends
+//! after the teardown, on a load of its own. Each clause below
 //! starts from a clear (the residency back to its seed), streaming on, and
 //! names its mutant:
 //!
@@ -94,7 +98,7 @@ mod residency;
 #[cfg(feature = "deepseek41")]
 mod gate {
     use crate::ds41_open::{fnv, open};
-    use crate::residency;
+    use crate::residency::{self, StaticProbe};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -539,21 +543,35 @@ mod gate {
         Ok(ok)
     }
 
-    /// `--only residency`: the residency's clauses alone; no argument, every
-    /// clause.
-    fn residency_only() -> Result<bool, GateError> {
-        const USAGE: &str = "usage: gate_ds41_callstream [--only residency]";
+    /// The placement the gate loads (`--place a|bp`, plan (b′) when not
+    /// given) and whether the residency's clauses run alone (`--only
+    /// residency`); `--place a` without it is refused by name.
+    fn parse_args() -> Result<(Place, bool), GateError> {
+        const USAGE: &str = "usage: gate_ds41_callstream [--place a|bp] [--only residency]";
         let args: Vec<String> = std::env::args().skip(1).collect();
-        match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
-            [] => Ok(false),
-            ["--only", "residency"] => Ok(true),
-            _ => Err(format!("{USAGE}, not {args:?}").into()),
+        let (mut place, mut only) = (Place::Bp, false);
+        let mut it = args.iter().map(String::as_str);
+        while let Some(flag) = it.next() {
+            match (flag, it.next()) {
+                ("--place", Some("a")) => place = Place::A,
+                ("--place", Some("bp")) => place = Place::Bp,
+                ("--only", Some("residency")) => only = true,
+                _ => return Err(format!("{USAGE}, not {args:?}").into()),
+            }
         }
+        if place == Place::A && !only {
+            return Err(format!(
+                "--place a runs the residency's clauses alone; the streaming clauses run under \
+                 plan (b′): add --only residency ({USAGE})"
+            )
+            .into());
+        }
+        Ok((place, only))
     }
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, HOST_POPULATE, CARD_DONTNEED, R8])?;
-        let only_residency = residency_only()?;
+        let (at, only_residency) = parse_args()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         cfg.body.residency = RESIDENCY;
         cfg.body.prefill = PrefillMode::Batch;
@@ -571,24 +589,26 @@ mod gate {
         let inputs = PlanInputs::read(
             &Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
         )?;
-        let bp = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
-        let refused = residency::refuse_clause(&path, &inputs, &cfg, &bp)?;
+        // Plan (b′)'s tier reserves the prompt batch's bytes; plan (a) has no tier.
+        let batch = (at == Place::Bp).then(|| place::tier_batch(&inputs.hp));
+        let machine = at.machine(None, batch)?;
+        let refused = residency::refuse_clause(&path, &inputs, &cfg, at, &machine)?;
         let t0 = Instant::now();
-        let mut s = open(&path, bp, &cfg)?;
+        let mut s = open(&path, at, machine, &cfg)?;
         println!("load in {:.1} s", t0.elapsed().as_secs_f64());
         flags = HostFlags::new(s.model().gpu().context(), 1)?;
-        let clauses = |s: &mut Session<Body>| -> Result<bool, GateError> {
-            let mut pass = refused;
-            pass &= watched("residency", || residency::clauses(s, &flags))?;
+        let clauses = |s: &mut Session<Body>| -> Result<(bool, Option<StaticProbe>), GateError> {
+            let (residency_ok, probe) = watched("residency", || residency::clauses(s, &flags, at))?;
+            let mut pass = refused && residency_ok;
             if only_residency {
-                return Ok(pass);
+                return Ok((pass, probe));
             }
             set_stream(s, true)?;
             pass &= watched("s2", || s2(s))?;
             pass &= watched("s1", || s1(s, &flags))?;
             pass &= watched("s3", || on_off(s, "s3", S3_P, S3_WINDOWS))?;
             pass &= watched("s4", || s4(s))?;
-            Ok(pass)
+            Ok((pass, probe))
         };
         let pass = clauses(&mut s);
         // Named before the teardown, so a failure there does not hide it.
@@ -606,6 +626,16 @@ mod gate {
             drop(s);
             Ok(())
         });
+        // `static`'s own load, once the residency's is gone: two V4.1 loads
+        // never stand at once.
+        let pass = match (pass, &down) {
+            (Ok((ok, Some(p))), Ok(())) => watched("static", || {
+                residency::static_clause(&path, at, machine, &cfg, &p)
+            })
+            .map(|st| ok && st),
+            (Ok((ok, _)), _) => Ok(ok),
+            (Err(e), _) => Err(e),
+        };
         match (pass, down) {
             (Ok(true), Ok(())) => {
                 println!("{NAME}: every clause passed");

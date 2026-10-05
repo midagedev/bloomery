@@ -12,19 +12,35 @@
 //! too (the reason [`crate::ds41_meta::RopeMeta::read`] takes its ropes as
 //! functions). The plan line is the caller's for the same reason: the plan's
 //! inputs are the architecture's type.
+//!
+//! The diagnosis flags every generate binary shares ([`Diag`]) live here
+//! too, generic over the session (`runtime::Target`): the serve's pick and
+//! feed ([`NoEog`], [`ServeFeed`]), the rows behind the first tokens
+//! ([`TopRows`]), runs chained by the serve seat's reset ([`repeat_runs`]),
+//! and the stage card's copy of the slot map — read back against the host
+//! map and the residency ledger ([`Residence`], [`slot_table`]), dumped to a
+//! file ([`write_table`], [`dump_table`]) and loaded as a fixed placement
+//! ([`place_table`], [`card_table`]). A binary hands in what only its body
+//! names: the card's copy of the map, its host tier, its plan.
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use bloomery_gpu::host::slots::MAX_TIERS;
+use bloomery_gpu::host::slots::{HOST, MAX_TIERS, SlotMap};
+use bloomery_gpu::host::swap::{CardTable, SwapMachine, TableCheck};
 use bloomery_gpu::host::tier::TierCard;
+use bloomery_gpu::host::{HostExperts, HostTier};
 use bloomery_gpu::model::{ChainBody, StepMode};
-use bloomery_gpu::{Gpu, GpuError, GpuModel};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
-use model::placement::Machine;
 use model::placement::workstation::{
     self, CardSpec, DeviceId, DeviceInfo, Pick, TierBatchBytes, TierDraft,
 };
+use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row};
+use runtime::{Advance, Committed, Out, Target, Want};
+use tokenizer::Tokenizer;
 
 use crate::record::{self, Record};
 use crate::{GateError, ref_model_path};
@@ -585,6 +601,713 @@ pub fn mode_name(mode: StepMode) -> &'static str {
     } else {
         "eager"
     }
+}
+
+// ---------------------------------------------------------------- diagnosis
+
+/// The diagnosis flags a generate binary takes beside its own, each acting
+/// on the plain runs of the prompt flags:
+///
+/// - `--top2 K`: a `top2` record for each of the first K generated tokens,
+///   after the loop: the logits row behind that token (`i` 0 is the prompt
+///   call's last row), read back after its step, by its two largest entries
+///   — ids and values, the larger first, ties to the lower id as the argmax
+///   takes them — and their margin. A row whose largest entry is not the
+///   token the run took, and a NaN in a row, are named errors ([`TopRows`]).
+/// - `--rows FILE`: the K rows `--top2` reads, whole, appended to FILE as
+///   little-endian f32, run after run (FILE emptied before the first), each
+///   run's followed by a `rows` record.
+/// - `--repeat R`: the run R times on one load, each after the first from
+///   `runtime::Target::reset` — the serve seat's reset on a request that
+///   misses its cache, which leaves the adaptive residency where the run
+///   before it took it — each opened by an `arm` record (`feed=repeat`)
+///   ([`repeat_runs`]).
+/// - `--table`: the stage card's copy of the slot map read back after the
+///   runs, a `slot table` record: its entries against the host map, the
+///   residency ledger (a load that runs the machine) and the map before the
+///   first run, and the card slots two ids of one layer both name
+///   ([`Residence`], [`slot_table`]).
+/// - `--ignore-eos`: each token taken as the serve takes it under a
+///   request's `ignore_eos` ([`NoEog`]); `--top2` ranks the rows without the
+///   end-of-generation ids, which an `ignore eos` record names, and `--rows`
+///   writes the rows as the model made them.
+/// - `--serve-feed`: the prompt fed as the serve feeds it ([`ServeFeed`]):
+///   every id but the last in one call, then the last id as a pass of the
+///   run's pick, whose row is generated token 0's.
+/// - `--dump-table FILE` (with `--repeat` 2 or more): the stage card's copy
+///   of the map as the second run's token 0 ran on it, read after
+///   `Target::reset` (FILE.before) and after that run's token-0 step (FILE),
+///   and before the first run (FILE.seed) ([`write_table`]), and a `table
+///   dump` record ([`dump_table`]).
+/// - `--card-table FILE`: the load placed by that table, residency off:
+///   each routed layer's card experts the ids FILE puts on the card, in id
+///   order, the rest on the host, every other row the planner's
+///   ([`place_table`]); a `card table` record after the load holds the
+///   card's copy to FILE's sets ([`card_table`]).
+#[derive(Clone, Debug)]
+pub struct Diag {
+    pub top2: usize,
+    pub rows: Option<PathBuf>,
+    pub repeat: usize,
+    pub table: bool,
+    /// The vocabulary's end-of-generation ids under `--ignore-eos`
+    /// ([`Diag::finish`] reads them); empty without it.
+    pub ignore_eos: Vec<u32>,
+    pub serve_feed: bool,
+    pub dump_table: Option<PathBuf>,
+    pub card_table: Option<PathBuf>,
+    /// `--ignore-eos` was given.
+    no_eog: bool,
+}
+
+impl Default for Diag {
+    /// No flag: one run, nothing read back.
+    fn default() -> Diag {
+        Diag {
+            top2: 0,
+            rows: None,
+            repeat: 1,
+            table: false,
+            ignore_eos: Vec::new(),
+            serve_feed: false,
+            dump_table: None,
+            card_table: None,
+            no_eog: false,
+        }
+    }
+}
+
+impl Diag {
+    /// The flags, as a usage line shows them.
+    pub const USAGE: &'static str = "[--top2 K [--rows FILE]] [--repeat R] [--table] \
+                                     [--ignore-eos] [--serve-feed] [--dump-table FILE] \
+                                     [--card-table FILE]";
+
+    /// Take `flag` when it is one of these, with its value from `it` when it
+    /// takes one: `true` when taken, `false` for a flag of the binary's own.
+    /// A flag given twice takes its last value.
+    pub fn take(
+        &mut self,
+        flag: &str,
+        it: &mut impl Iterator<Item = String>,
+    ) -> Result<bool, GateError> {
+        match flag {
+            "--table" => self.table = true,
+            "--ignore-eos" => self.no_eog = true,
+            "--serve-feed" => self.serve_feed = true,
+            "--top2" | "--repeat" | "--rows" | "--dump-table" | "--card-table" => {
+                let v = it
+                    .next()
+                    .ok_or_else(|| format!("{flag} needs a value: {}", Diag::USAGE))?;
+                match flag {
+                    "--top2" => self.top2 = v.parse()?,
+                    "--repeat" => self.repeat = v.parse()?,
+                    "--rows" => self.rows = Some(PathBuf::from(v)),
+                    "--dump-table" => self.dump_table = Some(PathBuf::from(v)),
+                    _ => self.card_table = Some(PathBuf::from(v)),
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// The flags against each other and against the run's `-n` (`n_gen`),
+    /// each refusal by name; under `--ignore-eos` the end-of-generation ids
+    /// of `model`'s vocabulary, one at least.
+    pub fn finish(&mut self, n_gen: usize, model: &Path) -> Result<(), GateError> {
+        if self.repeat == 0 {
+            return Err("--repeat 0 runs nothing: give 1 or more".into());
+        }
+        if self.dump_table.is_some() && self.repeat < 2 {
+            return Err(
+                "--dump-table reads the second run's table: give --repeat 2 or more".into(),
+            );
+        }
+        if self.dump_table.is_some() && self.card_table.is_some() {
+            return Err("--dump-table reads a residency load; --card-table loads none".into());
+        }
+        if self.rows.is_some() && self.top2 == 0 {
+            return Err("--rows writes the rows --top2 K reads: give --top2".into());
+        }
+        if self.top2 > n_gen {
+            return Err(format!(
+                "--top2 {} asks for more rows than -n {n_gen} tokens",
+                self.top2
+            )
+            .into());
+        }
+        if self.no_eog {
+            let tok = Tokenizer::from_gguf(model)
+                .map_err(|e| format!("--ignore-eos: the vocabulary of {}: {e}", model.display()))?;
+            self.ignore_eos = tok.eog().to_vec();
+            if self.ignore_eos.is_empty() {
+                return Err(format!(
+                    "--ignore-eos: {} names no end-of-generation id",
+                    model.display()
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The flags set, by name: a binary refuses them beside a run they do
+    /// not act on (a draft, a probe, several slots).
+    #[must_use]
+    pub fn set(&self) -> Vec<&'static str> {
+        [
+            (self.top2 > 0, "--top2"),
+            (self.rows.is_some(), "--rows"),
+            (self.repeat > 1, "--repeat"),
+            (self.table, "--table"),
+            (self.no_eog, "--ignore-eos"),
+            (self.serve_feed, "--serve-feed"),
+            (self.dump_table.is_some(), "--dump-table"),
+            (self.card_table.is_some(), "--card-table"),
+        ]
+        .into_iter()
+        .filter_map(|(set, name)| set.then_some(name))
+        .collect()
+    }
+
+    /// `--serve-feed` against a run of `ids` fed ids: the call runs every id
+    /// but the last, so two at least.
+    pub fn check_feed(&self, ids: usize) -> Result<(), GateError> {
+        if self.serve_feed && ids < 2 {
+            return Err(format!(
+                "--serve-feed calls every id but the last: give 2 or more ids, not {ids}"
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Before the first run: `--rows`' file emptied, and under
+    /// `--ignore-eos` the `ignore eos` record.
+    pub fn begin(&self) -> Result<(), GateError> {
+        if let Some(p) = &self.rows {
+            std::fs::File::create(p).map_err(|e| format!("--rows {}: {e}", p.display()))?;
+        }
+        if !self.ignore_eos.is_empty() {
+            Record::new(&record::IGNORE_EOS)
+                .csv("ids", &self.ignore_eos)
+                .print();
+        }
+        Ok(())
+    }
+}
+
+/// `--ignore-eos`'s pick, the serve's under `ignore_eos`
+/// (`serve::genloop::choose`): the engine's argmax unless it is one of the
+/// end-of-generation ids, else the largest logit of the row with those ids
+/// at -inf, first of equals. One step a pass, every row read back.
+#[derive(Clone, Debug)]
+pub struct NoEog {
+    ids: Vec<u32>,
+}
+
+impl NoEog {
+    /// The pick passing over `ids`.
+    #[must_use]
+    pub fn new(ids: Vec<u32>) -> NoEog {
+        NoEog { ids }
+    }
+
+    /// The token taken from `out`, a read back of [`Want::Logits`].
+    #[must_use]
+    pub fn pick(&self, out: &Out<'_>) -> u32 {
+        let greedy = out.argmax();
+        let Out::Logits { row, .. } = *out else {
+            return greedy;
+        };
+        if !self.ids.contains(&greedy) {
+            return greedy;
+        }
+        let mut best: Option<(usize, f32)> = None;
+        for (i, &v) in row.iter().enumerate() {
+            let v = match u32::try_from(i) {
+                Ok(id) if self.ids.contains(&id) => f32::NEG_INFINITY,
+                _ => v,
+            };
+            if best.is_none_or(|(_, b)| v.total_cmp(&b).is_gt()) {
+                best = Some((i, v));
+            }
+        }
+        best.and_then(|(i, _)| u32::try_from(i).ok())
+            .unwrap_or(greedy)
+    }
+}
+
+impl<T: Target> Advance<T> for NoEog {
+    fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error> {
+        let out = t.prompt(ids, Want::Logits)?;
+        Ok(self.pick(&out))
+    }
+
+    fn begin(&mut self, _t: &T, _prompt: &[u32], _first: u32) -> Result<(), T::Error> {
+        Ok(())
+    }
+
+    fn pass(&mut self, t: &mut T, last: u32, out: &mut Vec<u32>) -> Result<Committed, T::Error> {
+        let pos = t.pos();
+        let o = t.step(last, Want::Logits)?;
+        out.push(self.pick(&o));
+        Ok(Committed {
+            pos,
+            kept: 1,
+            rows: 1,
+            proposed: false,
+        })
+    }
+}
+
+/// `--serve-feed`'s prompt, the serve's (`serve::genloop`:
+/// `prefill_marked(ids, 0, n - 1)`, then `next(ids[n - 1])`): every id but
+/// the last in one call, then the last id as one of `inner`'s passes, whose
+/// kept token is generated token 0. The passes after it are `inner`'s own.
+pub struct ServeFeed<'a, A> {
+    pub inner: &'a mut A,
+}
+
+impl<T, A> Advance<T> for ServeFeed<'_, A>
+where
+    T: Target,
+    T::Error: From<GpuError>,
+    A: Advance<T>,
+{
+    const ROWS: usize = A::ROWS;
+
+    fn prompt(&mut self, t: &mut T, ids: &[u32]) -> Result<u32, T::Error> {
+        let refused = |detail: &str| GpuError::Shape {
+            what: "ServeFeed",
+            detail: detail.to_string(),
+        };
+        let Some((&last, head)) = ids.split_last() else {
+            return Err(refused("an empty prompt: the serve feeds one id or more").into());
+        };
+        if !head.is_empty() {
+            t.prompt(head, Want::Argmax)?;
+        }
+        let mut out = Vec::with_capacity(A::ROWS);
+        self.inner.pass(t, last, &mut out)?;
+        out.first()
+            .copied()
+            .ok_or_else(|| refused("the last id's pass kept no token").into())
+    }
+
+    fn begin(&mut self, t: &T, prompt: &[u32], first: u32) -> Result<(), T::Error> {
+        self.inner.begin(t, prompt, first)
+    }
+
+    fn pass(&mut self, t: &mut T, last: u32, out: &mut Vec<u32>) -> Result<Committed, T::Error> {
+        self.inner.pass(t, last, out)
+    }
+}
+
+/// A logits row's two largest entries, the larger first, ties to the lower
+/// id as the argmax takes them.
+struct Top2 {
+    ids: [usize; 2],
+    values: [f32; 2],
+}
+
+impl Top2 {
+    /// The logits row behind `token`, the token the run took from it,
+    /// ranked without the ids in `skip`; a row whose largest such entry is
+    /// another, and a NaN, are named errors.
+    fn of(row: &[f32], token: u32, skip: &[u32]) -> Result<Top2, GateError> {
+        let mut t = Top2 {
+            ids: [usize::MAX; 2],
+            values: [f32::NEG_INFINITY; 2],
+        };
+        for (i, &v) in row.iter().enumerate() {
+            if v.is_nan() {
+                return Err(format!("top2: the logits row is NaN at id {i}").into());
+            }
+            if u32::try_from(i).is_ok_and(|i| skip.contains(&i)) {
+                continue;
+            }
+            if v > t.values[0] {
+                t = Top2 {
+                    ids: [i, t.ids[0]],
+                    values: [v, t.values[0]],
+                };
+            } else if v > t.values[1] {
+                t.ids[1] = i;
+                t.values[1] = v;
+            }
+        }
+        if u32::try_from(t.ids[0]).ok() != Some(token) {
+            return Err(format!(
+                "top2: the row's largest entry is id {}, and the run took {token} from it",
+                t.ids[0]
+            )
+            .into());
+        }
+        Ok(t)
+    }
+
+    fn print(&self, i: usize) {
+        let [a, b] = self.values.map(f64::from);
+        Record::new(&record::TOP2)
+            .u("i", i)
+            .u("top1", self.ids[0])
+            .f("top1_logit", a)
+            .u("top2", self.ids[1])
+            .f("top2_logit", b)
+            .f("margin", a - b)
+            .print();
+    }
+}
+
+/// A run's `--top2` rows ([`Diag`]): the first `top2` logits rows the run's
+/// tokens came from, each ranked as it is read, and under `--rows` kept
+/// whole.
+pub struct TopRows {
+    top2: usize,
+    skip: Vec<u32>,
+    tops: Vec<Top2>,
+    kept: Option<Vec<f32>>,
+}
+
+impl TopRows {
+    /// The rows `d` asks a run for.
+    #[must_use]
+    pub fn new(d: &Diag) -> TopRows {
+        TopRows {
+            top2: d.top2,
+            skip: d.ignore_eos.clone(),
+            tops: Vec::with_capacity(d.top2),
+            kept: d.rows.as_ref().map(|_| Vec::new()),
+        }
+    }
+
+    /// Whether the run still wants a row: fewer than `--top2` read.
+    #[must_use]
+    pub fn wants(&self) -> bool {
+        self.tops.len() < self.top2
+    }
+
+    /// The logits `row` behind generated token `token`, the next one read.
+    pub fn read(&mut self, row: &[f32], token: u32) -> Result<(), GateError> {
+        self.tops.push(Top2::of(row, token, &self.skip)?);
+        if let Some(k) = self.kept.as_mut() {
+            k.extend_from_slice(row);
+        }
+        Ok(())
+    }
+
+    /// After the run's loop: a `top2` record a row and, under `--rows`
+    /// (`rows`), the rows appended whole to that file and the `rows` record.
+    pub fn finish(&self, rows: Option<&Path>) -> Result<(), GateError> {
+        for (i, t) in self.tops.iter().enumerate() {
+            t.print(i);
+        }
+        let (Some(path), Some(kept)) = (rows, &self.kept) else {
+            return Ok(());
+        };
+        let bytes: Vec<u8> = kept.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(&bytes))
+            .map_err(|e| format!("--rows {}: {e}", path.display()))?;
+        Record::new(&record::ROWS)
+            .u("rows", self.tops.len())
+            .u("n", kept.len() / self.tops.len().max(1))
+            .u("bytes", bytes.len())
+            .w("path", path.display())
+            .print();
+        Ok(())
+    }
+}
+
+/// `--repeat`'s `runs` runs on one load: `each(t, i)` in order, each run
+/// after the first from `Target::reset` (the adaptive residency stays where
+/// the run before it took it), each opened by its `arm` record (`ids` fed
+/// ids, `n_gen` generated tokens). The first failure ends them, naming its
+/// run and `bin`.
+pub fn repeat_runs<T: Target>(
+    t: &mut T,
+    runs: usize,
+    ids: usize,
+    n_gen: usize,
+    bin: &str,
+    mut each: impl FnMut(&mut T, usize) -> Result<(), GateError>,
+) -> Result<(), GateError> {
+    for i in 0..runs {
+        if i > 0 {
+            t.reset()?;
+        }
+        Record::new(&record::ARM)
+            .u("i", i)
+            .u("arms", runs)
+            .w("feed", "repeat")
+            .u("ids", ids)
+            .u("n", n_gen)
+            .print();
+        each(t, i).map_err(|e| format!("{bin}: repeat {i} of {runs}: {e}"))?;
+    }
+    Ok(())
+}
+
+/// What the residency diagnostics read of a loaded body: the stage card's
+/// copy of the slot map, which the body holds and hands the machine at its
+/// start; the host tier's map and residency machine (`HostTier::slots`,
+/// `HostTier::swap`); and the engine stream, which writes the copy. A
+/// binary supplies them from its body; the readback is the residency's own
+/// ([`CardTable::read`], [`CardTable::check`]).
+pub struct Residence<'a> {
+    pub card: &'a DeviceBuffer<u32>,
+    pub map: &'a SlotMap,
+    pub machine: Option<&'a SwapMachine>,
+    pub stream: &'a CudaStream,
+}
+
+impl<'a> Residence<'a> {
+    /// A body's views: `card` its stage card's copy of the map, `tier` its
+    /// host tier, on `gpu`'s engine stream.
+    #[must_use]
+    pub fn of<H: HostExperts>(
+        gpu: &'a Gpu,
+        card: &'a DeviceTensor<u32>,
+        tier: &'a HostTier<H>,
+    ) -> Residence<'a> {
+        Residence {
+            card: card.buf(),
+            map: tier.slots(),
+            machine: tier.swap(),
+            stream: gpu.stream(),
+        }
+    }
+
+    /// The stage card's copy, read back.
+    pub fn table(&self) -> Result<CardTable, GateError> {
+        Ok(CardTable::read(
+            self.card,
+            self.map,
+            self.machine,
+            self.stream,
+        )?)
+    }
+
+    /// `t` against the host map and, when the load runs a machine, its
+    /// ledger.
+    pub fn check(&self, t: &CardTable) -> Result<TableCheck, GateError> {
+        Ok(t.check(self.map, self.machine.map(SwapMachine::ledger))?)
+    }
+}
+
+/// The `slot table` record of `t`, checked as `c`, `vs_load` of its entries
+/// off the map before the first run.
+pub fn slot_table(t: &CardTable, c: &TableCheck, vs_load: usize) -> Record {
+    let show = |v: u32| match v {
+        HOST => "h".to_string(),
+        v => v.to_string(),
+    };
+    let first: Vec<String> = c
+        .first
+        .iter()
+        .map(|o| {
+            format!(
+                "l{}/e{}:card={},map={},ledger={}",
+                o.layer,
+                o.id,
+                show(o.card),
+                show(o.map),
+                show(o.ledger)
+            )
+        })
+        .collect();
+    Record::new(&record::SLOT_TABLE)
+        .u("layers", t.layers().len())
+        .u("entries", t.entries().len())
+        .u("on_card", t.on_card())
+        .w("machine", c.vs_ledger.is_some())
+        .u("vs_map", c.vs_map)
+        .u("vs_ledger", c.vs_ledger.unwrap_or(0))
+        .u("vs_load", vs_load)
+        .u("doubled", c.doubled)
+        .w(
+            "first",
+            if first.is_empty() {
+                "none".to_string()
+            } else {
+                first.join(";")
+            },
+        )
+}
+
+/// `FILE.before`: the `--dump-table` read after `Target::reset`.
+#[must_use]
+pub fn before_path(p: &Path) -> PathBuf {
+    suffixed(p, ".before")
+}
+
+/// `FILE.seed`: the `--dump-table` read before the first run.
+#[must_use]
+pub fn seed_path(p: &Path) -> PathBuf {
+    suffixed(p, ".seed")
+}
+
+fn suffixed(p: &Path, suffix: &str) -> PathBuf {
+    let mut s = p.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// `t` into `path`: the first layer, the layer count, the expert count,
+/// then the entries, little-endian `u32`s.
+pub fn write_table(path: &Path, t: &CardTable) -> Result<(), GateError> {
+    let layers = t.layers();
+    let head = [layers.start, layers.len(), t.n_expert()]
+        .map(u32::try_from)
+        .into_iter()
+        .collect::<Result<Vec<u32>, _>>()?;
+    let bytes: Vec<u8> = head
+        .iter()
+        .chain(t.entries())
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// [`write_table`]'s file back; a length that is not its header's is
+/// refused by name.
+pub fn read_table(path: &Path) -> Result<CardTable, GateError> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (words, rest) = bytes.as_chunks::<4>();
+    let words: Vec<u32> = words.iter().map(|&b| u32::from_le_bytes(b)).collect();
+    let [start, len, n, ..] = words[..] else {
+        return Err(format!("{}: {} bytes hold no header", path.display(), bytes.len()).into());
+    };
+    let (start, len, n) = (start as usize, len as usize, n as usize);
+    if !rest.is_empty() || words.len() != 3 + len * n {
+        return Err(format!(
+            "{}: {} bytes; its header names {len} layers of {n} experts",
+            path.display(),
+            bytes.len()
+        )
+        .into());
+    }
+    Ok(CardTable::new(start..start + len, n, words[3..].to_vec())?)
+}
+
+/// `--dump-table`: `r`'s card copy into `path`, held to its read after
+/// `Target::reset` (FILE.before, written before), and the `table dump`
+/// record: the entries, those on the card, those off the host map, and
+/// whether the two reads are one table.
+pub fn dump_table(r: &Residence<'_>, path: &Path) -> Result<Record, GateError> {
+    let t = r.table()?;
+    write_table(path, &t)?;
+    let before = read_table(&before_path(path))?;
+    let c = t.check(r.map, None)?;
+    Ok(Record::new(&record::TABLE_DUMP)
+        .u("entries", t.entries().len())
+        .u("on_card", t.on_card())
+        .u("vs_map", c.vs_map)
+        .w("same_before", before == t)
+        .w("path", path.display()))
+}
+
+/// `--card-table`: each routed layer of `plan` holds on its stage card the
+/// ids `t` puts on the card, in id order (`placement::routed_row`, the one
+/// owner of a stack's split), the rest on the host; the layer's `n_l`
+/// follows. A stack the planner left wholly on the host stays there when `t`
+/// puts none of its layer on the card. Refused by name: another expert
+/// count, a routed layer `t` does not cover, a stack of other than one card
+/// segment that `t` puts experts of on the card, and a card format other
+/// than the planner's.
+pub fn place_table(plan: &mut Plan<'_>, t: &CardTable) -> Result<(), GateError> {
+    let model = plan.model;
+    let n = t.n_expert();
+    let layers = t.layers();
+    if u64::try_from(n)? != model.experts {
+        return Err(format!(
+            "--card-table: {n} experts a layer, the model's {}",
+            model.experts
+        )
+        .into());
+    }
+    for row in &mut plan.rows {
+        let tensor = &model.tensors[row.tensor];
+        if tensor.role != Role::RoutedExperts {
+            continue;
+        }
+        let l = tensor
+            .layer
+            .ok_or_else(|| format!("{}: a routed stack without a layer", tensor.name))?;
+        if !layers.contains(&l) {
+            return Err(format!("--card-table covers layers {layers:?}, not {l}").into());
+        }
+        let at = (l - layers.start) * n;
+        let ids: Vec<u32> = (0..n)
+            .filter(|&e| t.entries()[at + e] != HOST)
+            .map(u32::try_from)
+            .collect::<Result<_, _>>()?;
+        let cards: Vec<&placement::Segment> = row
+            .segments
+            .iter()
+            .filter(|s| matches!(s.device, Device::Card(_)))
+            .collect();
+        if cards.is_empty() && ids.is_empty() {
+            continue;
+        }
+        let [card] = cards[..] else {
+            return Err(format!(
+                "{}: {} card segments; --card-table places one card",
+                tensor.name,
+                cards.len()
+            )
+            .into());
+        };
+        let Device::Card(c) = card.device else {
+            return Err(format!("{}: a card segment off the card", tensor.name).into());
+        };
+        let len = ids.len();
+        let new = placement::routed_row(
+            row.tensor,
+            tensor,
+            c,
+            ExpertList::new(ids, model.experts)?,
+            model,
+        )?;
+        let fmt = new
+            .segments
+            .iter()
+            .find(|s| s.device == Device::Card(c))
+            .map(|s| s.format);
+        if fmt != Some(card.format) {
+            return Err(format!(
+                "{}: routed_row's card format {fmt:?}, the planner's {:?}",
+                tensor.name, card.format
+            )
+            .into());
+        }
+        *row = Row {
+            segments: new.segments,
+            ..row.clone()
+        };
+        if let Some(nl) = plan.n_l.get_mut(l) {
+            *nl = u64::try_from(len)?;
+        }
+    }
+    Ok(())
+}
+
+/// The `card table` record of a `--card-table` load: its card's copy
+/// `loaded` against `file`'s table, read from `path`: the experts on one
+/// side only, and those on the card in both at another slot.
+pub fn card_table(loaded: &CardTable, file: &CardTable, path: &Path) -> Result<Record, GateError> {
+    let d = loaded.sets_vs(file)?;
+    Ok(Record::new(&record::CARD_TABLE)
+        .u("layers", loaded.layers().len())
+        .u("on_card", loaded.on_card())
+        .u("set_diff", d.set)
+        .u("slot_diff", d.slot)
+        .w("path", path.display()))
 }
 
 #[cfg(test)]
