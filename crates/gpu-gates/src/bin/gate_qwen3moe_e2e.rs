@@ -162,9 +162,28 @@
 //!   its alone run's continuation. A fault raised on one slot refuses the
 //!   other's steps naming the slot, and only the faulting slot's own reset
 //!   lifts it; the select refusals name themselves; and both slots hold
-//!   captures after the interleave, none after a `set_mode` round trip. The
-//!   last clause on the main model: the model it leaves is dropped, its
-//!   second sequence's planes with it.
+//!   captures after the interleave, none after a `set_mode` round trip.
+//!
+//! - (j) one pass of two slots (`GpuModel::step_slots`): prompts A and B
+//!   ([`J_A`], [`J_B`], distinct lengths, the pass path) prefilled each in
+//!   its own slot, then [`J_ROUNDS`] passes of a row a slot each feeding
+//!   back its argmax, a pass of two rows on slot 0 beside one on slot 1,
+//!   and a pass of slot 1 alone. (j1) every row's id and logits, and each
+//!   slot's position and K/V rows, bit for bit the slot's solo run (slot 0
+//!   alone from a reset, the prompt then a step a token) — in graph mode
+//!   and again in eager mode. (j2) the captured pass of slots 0 and 1 at a
+//!   row each holds the two-row pass of slot 0's nodes plus one slot's
+//!   ([`J_SLOT_LAYER_NODES`] a layer and its embedding), one memcpy a row
+//!   in each; the one-row pass and the difference from it print, with the
+//!   terms the difference holds. (j3) a pass of nine rows, a slot twice, no
+//!   slot, a slot out of range, a slot of no token and rows past the cache
+//!   refused by name, no position moved. (j4) a fault planted ahead of a
+//!   pass of both slots ((x)'s plant) poisons both: each slot and the pass
+//!   refused naming the set, slot 0's reset leaves slot 1's standing, both
+//!   resets lift it, and the next pass is the solo runs' first step bit for
+//!   bit. The last clause on the main model: the model it leaves is
+//!   dropped, its second sequence's planes with it. `--one-pass-only` runs
+//!   the load and (j).
 //!
 //! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
 //! `--rope-only` the load and (t), `--fault-only` the load and (x),
@@ -493,6 +512,14 @@ mod gate {
             }
             return Ok(());
         }
+        if args.iter().any(|a| a == "--one-pass-only") {
+            let ok = one_pass_two_slots(&mut m)?;
+            println!("gate_qwen3moe_e2e --one-pass-only: {}", verdict(ok));
+            if !ok {
+                return Err(checks_failed());
+            }
+            return Ok(());
+        }
         if args.iter().any(|a| a == "--q8-only") {
             drop(m);
             let ok = q8_cache()?;
@@ -527,6 +554,7 @@ mod gate {
         ok &= rope_table(m, CTX)?;
         ok &= fault_layer(m)?;
         ok &= slots_two(m)?;
+        ok &= one_pass_two_slots(m)?;
         drop(s);
         ok &= ubatch_sizes()?;
         ok &= placed(host)?;
@@ -652,14 +680,22 @@ mod gate {
     /// The layer clause (x) plants its fault in.
     const FAULT_LAYER: usize = 13;
 
-    /// (x) (module doc).
-    fn fault_layer(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
-        m.reset()?;
-        let before = m.gpu().fault()?;
+    /// Raise the fault word in layer [`FAULT_LAYER`]: its FFN half run alone
+    /// on a finite row with one NaN. Nothing reads the word back, so the next
+    /// call that does is the one it poisons.
+    fn plant_fault(m: &mut Qwen3moeModel) -> Result<(), GateError> {
         let hidden = m.body("gate_qwen3moe_e2e")?.hparams().n_embd;
         let mut x = vec![0.25f32; hidden];
         x[5] = f32::NAN;
         m.step_ffn(FAULT_LAYER, &x)?;
+        Ok(())
+    }
+
+    /// (x) (module doc).
+    fn fault_layer(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        m.reset()?;
+        let before = m.gpu().fault()?;
+        plant_fault(m)?;
         let raised = m.gpu().fault()?;
         let step = m.step(&[1]);
         let poisoned = m.poisoned();
@@ -2399,9 +2435,7 @@ mod gate {
             .value())
     }
 
-    /// (n) (module doc): two resident slots, interleaved. The last clause on
-    /// the main model — the one it leaves is dropped, its second sequence's
-    /// planes with it.
+    /// (n) (module doc): two resident slots, interleaved.
     fn slots_two(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
         m.set_mode(StepMode::Graph);
         let prose = prose(N_B + N_IDS)?;
@@ -2515,10 +2549,7 @@ mod gate {
         // only the faulting slot's reset lifts it ((x)'s plant).
         m.select_slot(1)?;
         m.reset()?;
-        let hidden = m.body("slots")?.hparams().n_embd;
-        let mut x = vec![0.25f32; hidden];
-        x[5] = f32::NAN;
-        m.step_ffn(FAULT_LAYER, &x)?;
+        plant_fault(m)?;
         let read = m.step(&[1]);
         let poisoned = m.poisoned();
         m.select_slot(0)?;
@@ -2579,6 +2610,365 @@ mod gate {
         );
         let ok = bytes_ok && together_ok && caps && iso_ok && fault_ok && refused_ok && gone_ok;
         println!("slots: {}", verdict(ok));
+        Ok(ok)
+    }
+
+    // ------------------------------------------- (j) one pass of two slots
+
+    /// (j)'s prompts: windows of the prose (first id, ids) of distinct
+    /// lengths, so the two slots stand at different positions.
+    const J_A: (usize, usize) = (64, 64);
+    const J_B: (usize, usize) = (700, 37);
+
+    /// (j)'s passes of one row a slot.
+    const J_ROUNDS: usize = 16;
+
+    /// PIN(2026-10-05): the nodes a pass of several slots adds per layer for
+    /// each busy slot past the first, at the same rows, derived before the
+    /// pass was built: the launches bound to one sequence's planes run once
+    /// a slot over its row window — the head norm and rope with the cache
+    /// append, the flash's segment pass and its merge (`slot_pass`: the
+    /// flash runs whole per slot) — 3; every other launch covers all of the
+    /// pass's rows. With its embedding from its own record, a slot adds
+    /// `1 + 3 · n_layer` ([`slot_nodes`]).
+    const J_SLOT_LAYER_NODES: usize = 3;
+
+    /// The nodes a busy slot adds to a pass of several slots at the same
+    /// rows ([`J_SLOT_LAYER_NODES`]).
+    fn slot_nodes(n_layer: usize) -> usize {
+        1 + J_SLOT_LAYER_NODES * n_layer
+    }
+
+    /// A slot's run of (j): the ids — its prompt's argmax, then each
+    /// position's — each step's last-logits hash, the position it ends at
+    /// and its K/V rows' hash there.
+    #[derive(PartialEq)]
+    struct JRun {
+        ids: Vec<u32>,
+        logits: Vec<u64>,
+        pos: u32,
+        kv: u64,
+    }
+
+    /// Slot 0 alone from a reset — the state a fresh process stands in,
+    /// (k) — on `prompt`, then `steps` steps each feeding its argmax.
+    fn j_solo(m: &mut Qwen3moeModel, prompt: &[u32], steps: usize) -> Result<JRun, GateError> {
+        m.select_slot(0)?;
+        m.reset()?;
+        let mut ids = vec![m.prefill_with(prompt, PrefillPath::Pass)?];
+        let mut logits = Vec::with_capacity(steps);
+        for t in 0..steps {
+            ids.push(m.step(&[ids[t]])?);
+            logits.push(Fnv1a64::default().f32s(&m.logits()?).value());
+        }
+        let pos = m.pos();
+        Ok(JRun {
+            ids,
+            logits,
+            pos,
+            kv: kv_fnv(m, usize::try_from(pos)?)?,
+        })
+    }
+
+    /// The two slots' runs in passes of several slots: A in slot 0 and B
+    /// in slot 1 prefilled each from its own reset, then [`J_ROUNDS`] passes
+    /// of one row a slot each feeding back its argmax, a pass of three rows
+    /// (slot 0's last argmax and the next id of `a_next` — a pass cannot feed
+    /// its own row back — beside slot 1's last argmax), and a pass of slot 1
+    /// alone. Every pass's rows' logits hashed in row order.
+    fn j_passes(
+        m: &mut Qwen3moeModel,
+        (a, b): (&[u32], &[u32]),
+        a_next: &[u32],
+    ) -> Result<(JRun, JRun), GateError> {
+        m.select_slot(0)?;
+        m.reset()?;
+        let mut ga = vec![m.prefill_with(a, PrefillPath::Pass)?];
+        m.select_slot(1)?;
+        m.reset()?;
+        let mut gb = vec![m.prefill_with(b, PrefillPath::Pass)?];
+        let (mut la, mut lb) = (Vec::new(), Vec::new());
+        let hash = |m: &Qwen3moeModel| -> Result<Vec<u64>, GateError> {
+            Ok(m.slots_logits()?
+                .iter()
+                .map(|l| Fnv1a64::default().f32s(l).value())
+                .collect())
+        };
+        for t in 0..J_ROUNDS {
+            let out = m.step_slots(&[(0, &[ga[t]]), (1, &[gb[t]])])?;
+            let h = hash(m)?;
+            let (&[ia, ib], &[ha, hb]) = (&out.ids[..], &h[..]) else {
+                return Err(format!("(j): a pass of two rows gave {:?}", out.ids).into());
+            };
+            ga.push(ia);
+            gb.push(ib);
+            la.push(ha);
+            lb.push(hb);
+        }
+        let next = *a_next
+            .get(J_ROUNDS + 1)
+            .ok_or("(j): A's solo run is short")?;
+        let out = m.step_slots(&[(0, &[ga[J_ROUNDS], next][..]), (1, &[gb[J_ROUNDS]][..])])?;
+        let h = hash(m)?;
+        let (&[ia0, ia1, ib], &[ha0, ha1, hb]) = (&out.ids[..], &h[..]) else {
+            return Err(format!("(j): a pass of three rows gave {:?}", out.ids).into());
+        };
+        ga.extend([ia0, ia1]);
+        gb.push(ib);
+        la.extend([ha0, ha1]);
+        lb.push(hb);
+        let out = m.step_slots(&[(1, &[gb[J_ROUNDS + 1]])])?;
+        let h = hash(m)?;
+        let (&[ib], &[hb]) = (&out.ids[..], &h[..]) else {
+            return Err(format!("(j): a pass of one row gave {:?}", out.ids).into());
+        };
+        gb.push(ib);
+        lb.push(hb);
+        let mut runs = Vec::with_capacity(2);
+        for (slot, ids, logits) in [(0, ga, la), (1, gb, lb)] {
+            m.select_slot(slot)?;
+            let pos = m.pos();
+            runs.push(JRun {
+                ids,
+                logits,
+                pos,
+                kv: kv_fnv(m, usize::try_from(pos)?)?,
+            });
+        }
+        let [ra, rb]: [JRun; 2] = runs.try_into().map_err(|_| "(j): two runs")?;
+        Ok((ra, rb))
+    }
+
+    /// The fields of `got` that differ from `want`, by name.
+    fn j_off(slot: usize, got: &JRun, want: &JRun) -> Vec<String> {
+        [
+            ("ids", got.ids == want.ids),
+            ("logits", got.logits == want.logits),
+            ("position", got.pos == want.pos),
+            ("kv", got.kv == want.kv),
+        ]
+        .into_iter()
+        .filter(|&(_, same)| !same)
+        .map(|(name, _)| format!("slot {slot} {name}"))
+        .collect()
+    }
+
+    /// `r`, a call that must be refused by `what` with a detail holding
+    /// `phrase`.
+    fn refused<T>(r: Result<T, GpuError>, what: &str, phrase: &str) -> bool {
+        match r {
+            Err(GpuError::Shape { what: w, detail }) => w == what && detail.contains(phrase),
+            _ => false,
+        }
+    }
+
+    /// (j) (module doc): one pass of two slots. The last clause on the main
+    /// model: the model it leaves is dropped, its second sequence's planes
+    /// with it.
+    fn one_pass_two_slots(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        const WHAT: &str = "GpuModel::step_slots";
+        m.set_mode(StepMode::Graph);
+        m.add_slots(2)?;
+        let prose = prose(J_B.0 + J_B.1)?;
+        let (a, b) = (&prose[J_A.0..J_A.0 + J_A.1], &prose[J_B.0..J_B.0 + J_B.1]);
+        // (j1) bits: each slot's ids, logits, position and K/V rows against
+        // its solo run, in graph mode and again in eager mode.
+        let steps = J_ROUNDS + 2;
+        let (sa, sb) = (j_solo(m, a, steps)?, j_solo(m, b, steps)?);
+        let mut bits_ok = true;
+        for mode in [StepMode::Graph, StepMode::Eager] {
+            m.set_mode(mode);
+            // A pass that fails is this arm's failure, named here: the
+            // clauses after it still run (and refuse while it poisons).
+            let off = match j_passes(m, (a, b), &sa.ids) {
+                Ok((ra, rb)) => {
+                    let mut off = j_off(0, &ra, &sa);
+                    off.extend(j_off(1, &rb, &sb));
+                    off
+                }
+                Err(e) => vec![format!("a pass that failed ({e})")],
+            };
+            let ok = off.is_empty();
+            println!(
+                "one pass bits {mode:?}: {J_ROUNDS} passes of slots 0 and 1 at one row a slot, a \
+                 pass of 2 + 1 rows and one of slot 1 alone, from positions {} and {}: {} {}",
+                a.len(),
+                b.len(),
+                if ok {
+                    format!(
+                        "every row's id and logits, each slot's position ({}, {}) and K/V rows \
+                         bit for bit its solo run's",
+                        sa.pos, sb.pos
+                    )
+                } else {
+                    format!("differs in {}", off.join(", "))
+                },
+                verdict(ok)
+            );
+            bits_ok &= ok;
+        }
+        m.set_mode(StepMode::Graph);
+        // (j2) nodes: the pass of slots 0 and 1 at a row each against the
+        // two-row pass of slot 0, one busy slot's launches apart; each pass
+        // copies one row a head.
+        let n_layer = m.body("one pass")?.hparams().n_layer;
+        let two = m.capture_slots(&[(0, 1), (1, 1)])?;
+        let two_row = m.capture_slots(&[(0, 2)])?;
+        let one_row = m.capture_slots(&[(0, 1)])?;
+        let mut memcpy_ok = true;
+        for (key, rows) in [
+            (&[(0, 1), (1, 1)][..], 2),
+            (&[(0, 2)][..], 2),
+            (&[(0, 1)][..], 1),
+        ] {
+            let ([memcpy], _) = count_kinds(
+                &m.slots_graph_nodes(key)?,
+                [sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY],
+            );
+            memcpy_ok &= memcpy == rows;
+        }
+        let per_slot = slot_nodes(n_layer);
+        let nodes_ok = two == two_row + per_slot && memcpy_ok;
+        // Against the one-row pass, the two-slot pass also holds the m = 1 to
+        // m >= 2 step of the row-wise launches and the second row's head: its
+        // three launches (the step's head) and its copy.
+        let head = NODES_CHAIN - NODES_PASS_1 + 1;
+        let from_one = per_slot + (NODES_PASS_M - NODES_PASS_1) + head;
+        println!(
+            "one pass nodes: slots 0 and 1 at a row each {two} = the two-row pass of slot 0 \
+             {two_row} + a slot's {per_slot} (want {}); against the one-row pass {one_row}: +{} \
+             (derived +{from_one}: a slot's {per_slot}, the m>=2 launch step {}, a row's head \
+             {head}); one memcpy a row in each {memcpy_ok} {}",
+            two_row + per_slot,
+            two.wrapping_sub(one_row),
+            NODES_PASS_M - NODES_PASS_1,
+            verdict(nodes_ok)
+        );
+        // (j3) refusals by name, nothing moved.
+        let at = |m: &mut Qwen3moeModel| -> Result<[u32; 2], GateError> {
+            m.select_slot(1)?;
+            let p1 = m.pos();
+            m.select_slot(0)?;
+            Ok([m.pos(), p1])
+        };
+        let before = at(m)?;
+        let ids5 = [1u32; 5];
+        let ids4 = [1u32; 4];
+        let refusals = [
+            (
+                "nine rows",
+                refused(
+                    m.step_slots(&[(0, &ids5[..]), (1, &ids4[..])]),
+                    WHAT,
+                    "9 rows in one pass",
+                ),
+            ),
+            (
+                "a slot twice",
+                refused(m.step_slots(&[(0, &[1]), (0, &[1])]), WHAT, "slot 0 twice"),
+            ),
+            (
+                "no slot",
+                refused(m.step_slots(&[]), WHAT, "a pass of no slot"),
+            ),
+            (
+                "slot out of range",
+                refused(
+                    m.step_slots(&[(2, &[1])]),
+                    WHAT,
+                    "slot 2 of a model that serves 0..2",
+                ),
+            ),
+            (
+                "a slot of no token",
+                refused(m.step_slots(&[(1, &[])]), WHAT, "slot 1 with no token"),
+            ),
+        ];
+        let still = at(m)? == before;
+        m.seed_depth(CTX - 4)?;
+        let past = refused(
+            m.step_slots(&[(0, &[1; 8])]),
+            WHAT,
+            &format!(
+                "slot 0's 8 rows from position {} pass the resident cache's {CTX} rows",
+                CTX - 4
+            ),
+        );
+        m.reset()?;
+        let missed: Vec<&str> = refusals
+            .iter()
+            .filter_map(|&(name, ok)| (!ok).then_some(name))
+            .chain((!past).then_some("past the cache"))
+            .collect();
+        let refused_ok = missed.is_empty() && still;
+        println!(
+            "one pass refusals: nine rows, a slot twice, no slot, a slot out of range, a slot of \
+             no token and rows past the cache each refused by name{}; positions unmoved {still} {}",
+            if missed.is_empty() {
+                String::new()
+            } else {
+                format!(" — except {}", missed.join(", "))
+            },
+            verdict(refused_ok)
+        );
+        // (j4) a fault in a pass poisons both slots; each slot's reset takes
+        // it off the set, and only both lift it.
+        m.select_slot(0)?;
+        m.reset()?;
+        m.prefill_with(a, PrefillPath::Pass)?;
+        m.select_slot(1)?;
+        m.reset()?;
+        m.prefill_with(b, PrefillPath::Pass)?;
+        plant_fault(m)?;
+        let read = m.step_slots(&[(0, &[sa.ids[0]]), (1, &[sb.ids[0]])]);
+        let raised = matches!(read, Err(GpuError::Fault { .. })) && m.poisoned().is_some();
+        let set = "slots 0 and 1 are poisoned";
+        m.select_slot(0)?;
+        let named0 = refused(m.step(&[1]), "GpuModel::step", set);
+        m.select_slot(1)?;
+        let named1 = refused(m.step(&[1]), "GpuModel::step", set);
+        let named_pass = refused(m.step_slots(&[(0, &[1]), (1, &[1])]), WHAT, set);
+        m.select_slot(0)?;
+        m.reset()?;
+        let stands = refused(m.step(&[1]), "GpuModel::step", "slot 1 is poisoned");
+        m.select_slot(1)?;
+        m.reset()?;
+        let lifted = m.poisoned().is_none();
+        // Each slot from its own reset again, so this check stands apart from
+        // the refusals before it.
+        m.select_slot(0)?;
+        m.reset()?;
+        let a0 = m.prefill_with(a, PrefillPath::Pass)?;
+        m.select_slot(1)?;
+        m.reset()?;
+        let b0 = m.prefill_with(b, PrefillPath::Pass)?;
+        let again = m.step_slots(&[(0, &[a0]), (1, &[b0])])?;
+        let again_logits: Vec<u64> = m
+            .slots_logits()?
+            .iter()
+            .map(|l| Fnv1a64::default().f32s(l).value())
+            .collect();
+        let solo_again = [a0, b0] == [sa.ids[0], sb.ids[0]]
+            && again.ids == [sa.ids[1], sb.ids[1]]
+            && again_logits == [sa.logits[0], sb.logits[0]];
+        m.select_slot(0)?;
+        m.reset()?;
+        m.select_slot(1)?;
+        m.reset()?;
+        let fault_ok = raised && named0 && named1 && named_pass && stands && lifted && solo_again;
+        println!(
+            "one pass fault: the pass after a planted fault {}; both slots and the pass refused \
+             naming the set ({named0}, {named1}, {named_pass}), after slot 0's reset still \
+             refused naming slot 1 {stands}, after both resets lifted {lifted}, the next pass \
+             bit for bit the solo runs' first step {solo_again} {}",
+            match &read {
+                Ok(o) => format!("returned ids {:?}", o.ids),
+                Err(e) => format!("returned \"{e}\""),
+            },
+            verdict(fault_ok)
+        );
+        let ok = bits_ok && nodes_ok && refused_ok && fault_ok;
+        println!("one pass: {}", verdict(ok));
         Ok(ok)
     }
 

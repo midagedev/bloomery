@@ -431,6 +431,23 @@ pub(super) fn embed_rows(
     io: &Io<'_>,
     s: &mut Arena,
 ) -> Result<(), GpuError> {
+    embed_into(gpu, w, k, io, (&mut s.x, &mut s.pos, &mut s.n_keys))
+}
+
+/// [`embed_rows`] into `(y, pos, n_keys)`, a unit's embedding rows and
+/// their positions and live key counts: the arena's own, or a window of
+/// them where a pass of several slots embeds each slot's rows apart.
+pub(super) fn embed_into(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &Kernels,
+    io: &Io<'_>,
+    (y, pos, n_keys): (
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<u32>,
+        &mut DeviceBuffer<u32>,
+    ),
+) -> Result<(), GpuError> {
     const WHAT: &str = "qwen3moe::embed_rows";
     let name = token_embd();
     if let Some(DevWeight::Q8_0 { qs, d, .. }) = w.get(&name) {
@@ -443,9 +460,9 @@ pub(super) fn embed_rows(
                 pos0: io.pos0,
                 first: io.first,
                 fault: gpu.unlabelled_sink(),
-                y: &mut s.x,
-                pos: &mut s.pos,
-                n_keys: &mut s.n_keys,
+                y,
+                pos,
+                n_keys,
             },
         );
     }
@@ -461,9 +478,9 @@ pub(super) fn embed_rows(
             ids: io.ids,
             pos0: io.pos0,
             first: io.first,
-            y: &mut s.x,
-            pos: &mut s.pos,
-            n_keys: &mut s.n_keys,
+            y,
+            pos,
+            n_keys,
         },
     )
 }
@@ -533,6 +550,61 @@ fn attention(
     if m > GEMV_COLS {
         return wide::attention(c, n, kv, s, m);
     }
+    attn_in(c, n, s, m)?;
+    let (gpu, w, k) = (c.gpu, c.w, c.k);
+    let stream = gpu.stream();
+    let d = s.dims;
+    let i = s.col(m)?;
+    match n.kind {
+        GqaKind::Neox128 => {
+            kv.append_128(
+                &k.neox,
+                stream,
+                Append128 {
+                    q: &mut s.q,
+                    k: &mut s.k,
+                    v: &s.v,
+                    gq: f32_gain(w, &n.attn_q_norm)?,
+                    gk: f32_gain(w, &n.attn_k_norm)?,
+                    table: c.table,
+                    pos: &s.pos,
+                    eps: c.eps,
+                    n_head: d.n_head,
+                    n_kv: d.n_kv,
+                    ctx: d.ctx,
+                    m,
+                    fault: c.sink,
+                },
+            )?;
+            kv.flash_128(
+                &k.flash,
+                stream,
+                FlashPass {
+                    q: &s.q,
+                    n_keys: &s.n_keys,
+                    scale: ATTN_SCALE,
+                    n_kv: d.n_kv,
+                    ctx: d.ctx,
+                    m,
+                    part_v: &mut s.part_v,
+                    part_ms: &mut s.part_ms,
+                    fault: c.sink,
+                    y: &mut s.attn,
+                },
+                c.mma,
+            )?;
+            gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
+        }
+        GqaKind::Gated256 => gated_256(c, n, kv, s, m)?,
+    }
+    attn_out(c, n, s, m)
+}
+
+/// The attention half's row-wise front at `m <= GEMV_COLS` rows: the
+/// attention norm with its quantizer, then q, k and v — in one launch (a
+/// Q6_K v in its own) when Q4_K, else each by its type ([`site_gemv`]) —
+/// into the arena's `q`, `k` and `v` rows.
+pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
     let d = s.dims;
@@ -586,48 +658,18 @@ fn attention(
         site_gemv(c, (n.k_ty, &n.attn_k), d.kv_len(), x, m, cols.as_mut(), kr)?;
         site_gemv(c, (n.v_ty, &n.attn_v), d.kv_len(), x, m, cols.as_mut(), v)?;
     }
-    match n.kind {
-        GqaKind::Neox128 => {
-            kv.append_128(
-                &k.neox,
-                stream,
-                Append128 {
-                    q: &mut s.q,
-                    k: &mut s.k,
-                    v: &s.v,
-                    gq: f32_gain(w, &n.attn_q_norm)?,
-                    gk: f32_gain(w, &n.attn_k_norm)?,
-                    table: c.table,
-                    pos: &s.pos,
-                    eps: c.eps,
-                    n_head: d.n_head,
-                    n_kv: d.n_kv,
-                    ctx: d.ctx,
-                    m,
-                    fault: c.sink,
-                },
-            )?;
-            kv.flash_128(
-                &k.flash,
-                stream,
-                FlashPass {
-                    q: &s.q,
-                    n_keys: &s.n_keys,
-                    scale: ATTN_SCALE,
-                    n_kv: d.n_kv,
-                    ctx: d.ctx,
-                    m,
-                    part_v: &mut s.part_v,
-                    part_ms: &mut s.part_ms,
-                    fault: c.sink,
-                    y: &mut s.attn,
-                },
-                c.mma,
-            )?;
-            gpu.enqueue_quantize_q8_1_layer(&s.attn, &mut s.act_attn[i], c.layer)?;
-        }
-        GqaKind::Gated256 => gated_256(c, n, kv, s, m)?,
-    }
+    Ok(())
+}
+
+/// The attention half's row-wise back at `m <= GEMV_COLS` rows, once the
+/// attention rows' q8_1 is in `act_attn`: the output projection, a Q4_K one
+/// with the residual add in its store, any other into `normed` and an add,
+/// into `ffn_inp`.
+pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+    let (w, k) = (c.w, c.k);
+    let stream = c.gpu.stream();
+    let d = s.dims;
+    let i = s.col(m)?;
     if n.o_fused() {
         let wo = kq_weight(w, &n.attn_output)?;
         return k.proj.enqueue_o_resid(
