@@ -100,6 +100,24 @@
 //!   ask instead of the checkpoint (the neighbours red, and the refused cut
 //!   not refused); `reset` keeping the checkpoints (the dropped-points line
 //!   red).
+//! - (n) resident slots (`add_slots`), on their own load with the
+//!   checkpoints armed, as the seat arms them: the slot harness's contracts
+//!   (`slots_gate`: H1 interleave, H3 bytes, H4 reset, H6 refusals, H7
+//!   captures) over two lcg streams, A of [`SLOT_A`] ids and B of
+//!   [`SLOT_B`] — each past the load's first mark (its ubatch, [`U_GATE`])
+//!   by a run the mark keeps — prompted by the session's schedule (the wide
+//!   walk), [`SLOT_STEPS`] steps a stream, each slot's state digest every
+//!   attention layer's K/V rows below its position and every delta layer's
+//!   state and ring, and `seq_bytes` held to [`store_bytes`]. Between the
+//!   harness's halves, each slot's checkpoints are its own: after the
+//!   interleave slot 0 holds its points at the mark and its prompt's end,
+//!   slot 1 at the mark and its own end; slot 1 cut back to the mark, slot
+//!   0 — selected before slot 1 runs again, so a cut that waited in the
+//!   wrong checkpoints is carried out on it — holds its points and digest
+//!   and its next ids are its solo run's continuation; slot 1, the rest of
+//!   B re-fed from the mark and stepped as far as the interleave stepped
+//!   it, stands with the interleave's last id, digest, points and position;
+//!   a reset of slot 1 leaves slot 0's points standing.
 //! - (r) refusals: a ubatch size of 0 or past `UBATCH` is refused by name
 //!   with the size and the resident bytes kept; a prompt past the cache is
 //!   refused by name before any launch, the position kept.
@@ -201,10 +219,11 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError, GpuModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
     use bloomery_gpu_gates::{
-        GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir, ik_q8_2,
-        q8_1_dequant, ref_ints, ref_tensor_logical_in, split_f32, topk_ids_logical_within, verdict,
-        widened_f16_rows_in,
+        Fnv1a64, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir,
+        ik_q8_2, q8_1_dequant, ref_ints, ref_tensor_logical_in, split_f32, topk_ids_logical_within,
+        verdict, widened_f16_rows_in,
     };
     use bloomery_levers::HostCfg;
     use cuda_core::sys;
@@ -1908,6 +1927,219 @@ mod gate {
         Ok(ok && dropped && flash_ok)
     }
 
+    // ------------------------------------------------ (n) resident slots
+
+    /// (n)'s prompts, A and B: each past the load's first mark ([`U_GATE`])
+    /// by a run the mark keeps (`marked` drops a mark with a run of fewer
+    /// than `WIDE_FROM` = `GEMV_COLS + 1` = 9 rows beside it), of different
+    /// lengths so the slots stand at different positions, each with its
+    /// steps inside [`CTX`].
+    const SLOT_A: usize = 1040;
+    const SLOT_B: usize = 1056;
+
+    /// Greedy steps a stream takes past its prompt in the interleave, and
+    /// of one continuation check: each solo run steps `SLOT_STEPS + 2 ·
+    /// SLOT_TAIL` (`slots_gate`), inside [`CTX`] for B.
+    const SLOT_STEPS: usize = 16;
+    const SLOT_TAIL: usize = 8;
+
+    const _: () = assert!(
+        SLOT_A >= U_GATE + 9
+            && SLOT_B >= U_GATE + 9
+            && SLOT_A + SLOT_STEPS + 2 * SLOT_TAIL <= CTX
+            && SLOT_B + SLOT_STEPS + 2 * SLOT_TAIL <= CTX
+    );
+
+    /// Qwen3.6's adapter: the whole-card load at [`CTX`] with the
+    /// checkpoints armed, and two lcg prompts over the vocabulary.
+    struct Q35Slots {
+        /// Stream 0's ids (A), then stream 1's (B).
+        ids: Vec<u32>,
+    }
+
+    impl Q35Slots {
+        fn new(vocab: usize) -> Q35Slots {
+            Q35Slots {
+                ids: lcg_ids(SLOT_A + SLOT_B, vocab),
+            }
+        }
+
+        /// Stream `stream`'s ids, else refused by name.
+        fn ids(&self, stream: usize) -> Result<&[u32], GateError> {
+            let (a, b) = self.ids.split_at(SLOT_A);
+            match stream {
+                0 => Ok(a),
+                1 => Ok(b),
+                s => Err(format!("stream {s} of the adapter's two").into()),
+            }
+        }
+    }
+
+    impl SlotsAdapter for Q35Slots {
+        type Body = Body35;
+
+        const STEPS: usize = SLOT_STEPS;
+        const TAIL: usize = SLOT_TAIL;
+
+        /// The whole-card load at [`CTX`], the checkpoints armed as the seat
+        /// arms them. It is the same load at every slot count: its fit
+        /// check counts no slot, and each sequence's stores are allocated
+        /// by `add_slots`.
+        fn open(&self, _slots: usize) -> Result<Qwen35moeModel, GateError> {
+            let mut m = open(CTX, KvQ8::F16)?;
+            m.body_parts("slots")?.2.set_checkpoints(true);
+            Ok(m)
+        }
+
+        /// `reset`: every row `state_hash` reads is written by a call from
+        /// it.
+        fn rewind(&self, m: &mut Qwen35moeModel) -> Result<(), GateError> {
+            Ok(m.reset()?)
+        }
+
+        /// The session's schedule (`app::Prompt for Body35`): the wide walk
+        /// from `GEMM_FROM` ids on, passes below.
+        fn prompt(&self, m: &mut Qwen35moeModel, stream: usize) -> Result<u32, GateError> {
+            Ok(<Body35 as app::Prompt>::prompt(m, self.ids(stream)?)?)
+        }
+
+        /// Every attention layer's K and V rows below the model's position —
+        /// rows past it are no state: the flash never reads them, and a slot
+        /// rewound after a longer sequence still holds that sequence's there —
+        /// and every delta layer's whole state and conv ring.
+        fn state_hash(&self, m: &mut Qwen35moeModel) -> Result<u64, GateError> {
+            let body = m.body("slots")?;
+            let rows = usize::try_from(m.pos())? * HEAD;
+            let plane = body.ctx_rows() * HEAD;
+            let mut h = Fnv1a64::default();
+            for l in m.layers() {
+                h = match body.store(m.gpu(), l)? {
+                    StoreHost::Kv { k, v } => {
+                        k.chunks(plane)
+                            .chain(v.chunks(plane))
+                            .try_fold(h, |h, head| {
+                                let below =
+                                    head.get(..rows).ok_or("a position past the cache rows")?;
+                                Ok::<_, GateError>(
+                                    below.iter().fold(h, |h, w| h.bytes(&w.to_le_bytes())),
+                                )
+                            })?
+                    }
+                    StoreHost::Rec { state, ring } => h.f32s(&state).f32s(&ring),
+                };
+            }
+            Ok(h.value())
+        }
+
+        /// The stores' derivation from the header ([`store_bytes`]): each
+        /// attention layer's K and V planes, each delta layer's state and
+        /// conv ring.
+        fn seq_bytes_derived(&self, _m: &Qwen35moeModel) -> Result<Derived, GateError> {
+            Ok(Derived {
+                bytes: store_bytes(),
+                terms: format!(
+                    "{N_ATTN} x K/V planes of 2 x {N_KV} x {CTX} x {HEAD} f16 + {N_DELTA} x (state \
+                     {N_V} x {HEAD_V} x {HEAD_V} + ring {RING_ROWS} x {C}) f32"
+                ),
+            })
+        }
+    }
+
+    /// The selected slot's checkpoints' positions.
+    fn points(m: &Qwen35moeModel) -> Result<Vec<u32>, GateError> {
+        Ok(m.body("slots")?.checkpoints().positions())
+    }
+
+    /// `n` greedy steps on the selected slot, appended to `ids` (its last id
+    /// the first step's input).
+    fn greedy(m: &mut Qwen35moeModel, ids: &mut Vec<u32>, n: usize) -> Result<(), GateError> {
+        for _ in 0..n {
+            let last = *ids.last().ok_or("no token")?;
+            ids.push(m.step(&[last])?);
+        }
+        Ok(())
+    }
+
+    /// (n) (module doc): the harness's contracts, and between its halves
+    /// each slot's checkpoints its own under a cut and a reset of the other
+    /// slot. The clause's model is dropped with its second sequence.
+    fn slots_two(a: &Q35Slots) -> Result<bool, GateError> {
+        let mut s = slots_gate::interleave(a)?;
+        let mark = u32::try_from(U_GATE)?;
+        let ends = [u32::try_from(SLOT_A)?, u32::try_from(SLOT_B)?];
+        let b_last = s.last(1)?;
+        let m = s.model();
+        // Each slot's points as its prompt in the interleave took them, and
+        // where each stands.
+        m.select_slot(0)?;
+        let a_held = (a.state_hash(m)?, points(m)?);
+        m.select_slot(1)?;
+        let b_held = (a.state_hash(m)?, points(m)?, m.pos());
+        let taken = a_held.1 == [mark, ends[0]] && b_held.1 == [mark, ends[1]];
+        println!(
+            "slots points: slot 0 {:?}, slot 1 {:?} (want [{mark}, {}] and [{mark}, {}]: the \
+             mark and each prompt's end) {}",
+            a_held.1,
+            b_held.1,
+            ends[0],
+            ends[1],
+            verdict(taken)
+        );
+        // Slot 1 cut back to the mark; slot 0 runs before slot 1 does again.
+        m.rollback(mark)?;
+        m.select_slot(0)?;
+        let a_now = (a.state_hash(m)?, points(m)?);
+        let cont = s.continues(0)?;
+        let held_ok = a_now == a_held && cont;
+        println!(
+            "slots cut: slot 1 cut back to {mark}; slot 0's points {:?} and state digest {} as it \
+             stood, its next {SLOT_TAIL} ids {} its solo run's continuation {}",
+            a_now.1,
+            if a_now.0 == a_held.0 {
+                "equal"
+            } else {
+                "differ from"
+            },
+            if cont { "equal" } else { "differ from" },
+            verdict(held_ok)
+        );
+        // Slot 1: the rest of B from the mark, then the interleave's steps.
+        let m = s.model();
+        m.select_slot(1)?;
+        let rest = a
+            .ids(1)?
+            .get(U_GATE..)
+            .ok_or("stream B shorter than the first mark")?;
+        let mut ids = vec![<Body35 as app::Prompt>::prompt(m, rest)?];
+        greedy(m, &mut ids, SLOT_STEPS)?;
+        let b_now = (a.state_hash(m)?, points(m)?, m.pos());
+        let last = ids.last().copied();
+        let refed_ok = last == Some(b_last) && b_now == b_held;
+        println!(
+            "slots cut: slot 1 re-fed {} ids from {mark} and stepped {SLOT_STEPS}: last id {last:?} \
+             vs {b_last}, state digest equal={}, points {:?} vs {:?}, position {} vs {} {}",
+            rest.len(),
+            b_now.0 == b_held.0,
+            b_now.1,
+            b_held.1,
+            b_now.2,
+            b_held.2,
+            verdict(refed_ok)
+        );
+        // A reset of slot 1 leaves slot 0's points.
+        a.rewind(m)?;
+        m.select_slot(0)?;
+        let kept = points(m)?;
+        let kept_ok = kept == a_held.1;
+        println!(
+            "slots cut: after slot 1's reset slot 0's points {kept:?} (want {:?}) {}",
+            a_held.1,
+            verdict(kept_ok)
+        );
+        let harness_ok = s.finish()?;
+        Ok(taken && held_ok && refed_ok && kept_ok && harness_ok)
+    }
+
     // ---------------------------------------------------- (r) refusals
 
     fn refusals(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
@@ -2276,8 +2508,10 @@ mod gate {
         ok &= wide_arm(&mut m)?;
         ok &= ubatch_bits(&mut m)?;
         ok &= refusals(&mut m)?;
+        let slots = Q35Slots::new(m.body("gate_qwen35moe_e2e")?.vocab());
         drop(m);
         ok &= checkpoints()?;
+        ok &= slots_two(&slots)?;
         ok &= placed(&man, &toks, host)?;
         ok &= q8_cache()?;
         println!("gate_qwen35moe_e2e: {}", verdict(ok));
