@@ -5,11 +5,12 @@
 //! the oldest of them. When more requests wait than slots are free, a
 //! [`SlotPicker`] chooses which one goes next ([`FifoPicker`], the oldest, by
 //! default). The request then takes, of the free slots, the one whose held ids
-//! share the longest prefix with its own, the least recently used among
-//! equals (llama-server's choice, without its similarity floor): its cache
-//! keeps the most. When the slots take one engine in turns, the slot whose
-//! state the engine holds goes before the least recently used: taking
-//! another moves that state aside.
+//! share the longest prefix with its own (llama-server's choice, without its
+//! similarity floor): its cache keeps the most. Among equals a slot that
+//! holds no ids comes before one that holds a conversation: seating the
+//! request there cuts nothing, so nothing is saved either. When the slots
+//! take one engine in turns, the slot whose state the engine holds goes
+//! before the least recently used: taking another moves that state aside.
 //!
 //! A slot action (save, restore, erase) reserves its slot, and a residency
 //! reset every slot, only while the slot is free and no request waits, so
@@ -342,8 +343,9 @@ impl<R, A> Board<R, A> {
 }
 
 /// Of the free slots, the one whose held ids share the longest prefix with
-/// `ids`; among equals the one the engine is on, then the least recently
-/// used, then the lowest id.
+/// `ids`; among equals one that holds no ids (nothing is cut or saved),
+/// then the one the engine is on, then the least recently used, then the
+/// lowest id.
 fn best_slot<'h>(
     slots: &[SlotState],
     free: &[usize],
@@ -352,8 +354,10 @@ fn best_slot<'h>(
     ids: &[u32],
 ) -> usize {
     let key = |i: usize| {
+        let held = held(i);
         (
-            common_prefix(held(i), ids),
+            common_prefix(held, ids),
+            held.is_empty(),
             on == Some(i),
             Reverse(slots[i].last_used),
         )
@@ -451,6 +455,60 @@ mod tests {
             b.admit(held, Some(0))[0].0,
             0,
             "no prefix shared: the slot the engine is on, not slot 2, the least recently used"
+        );
+    }
+
+    /// Of the free slots whose held ids share the request's prefix equally,
+    /// one that holds no ids comes before one that holds a conversation:
+    /// seating the request there cuts nothing, so nothing is saved either. A
+    /// longer prefix still wins, and among empty slots the order is as it
+    /// was: the slot the engine is on, then the least recently used, then
+    /// the lowest id.
+    #[test]
+    fn a_request_takes_an_empty_slot_before_one_that_holds_ids() {
+        let mut b = board(2, 8);
+        for r in 0..2 {
+            b.enqueue(vec![r], r).expect("room");
+        }
+        b.admit(nothing, None);
+        // Slot 0, released first, holds a conversation and is the least
+        // recently used; slot 1, released after, holds nothing.
+        b.release(0);
+        b.release(1);
+        let a = [7, 8, 9];
+        let held = |i: usize| if i == 0 { a.as_slice() } else { &[] };
+        b.enqueue(vec![1, 2, 3], 2).expect("room");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            1,
+            "nothing shared with A: the empty slot, not the idle conversation"
+        );
+        b.release(1);
+        b.enqueue(vec![7, 8, 9, 4], 3).expect("room");
+        assert_eq!(
+            b.admit(held, None)[0].0,
+            0,
+            "the request shares A's prefix: the prefix beats the empty slot"
+        );
+        let mut b = board(2, 8);
+        for r in 0..2 {
+            b.enqueue(vec![r], r).expect("room");
+        }
+        b.admit(nothing, None);
+        b.release(1);
+        b.release(0);
+        b.enqueue(vec![5], 0).expect("room");
+        assert_eq!(
+            b.admit(nothing, None)[0].0,
+            1,
+            "both empty: the least recently used, not the lowest id"
+        );
+        b.release(1);
+        b.enqueue(vec![5], 1).expect("room");
+        assert_eq!(
+            b.admit(nothing, Some(1))[0].0,
+            1,
+            "both empty: the slot the engine is on, not the least recently used"
         );
     }
 
