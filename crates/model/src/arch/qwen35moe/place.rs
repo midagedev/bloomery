@@ -39,6 +39,7 @@
 
 use std::path::Path;
 
+use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::{GgmlType, Split, Value};
 use models::{DraftSpec, Ffn, HcKind, HeadRows, Mixer, ModelSpec, MtpDraft, MtpSource, Role};
 use sha2::{Digest, Sha256};
@@ -296,14 +297,16 @@ impl PlanInputs {
 
     /// [`PlanInputs::plan_with`] for a load that serves `slots` resident
     /// sequences ([`GpuModel::add_slots`](bloomery_gpu::model::Slots)): every
-    /// per-load sequence term — the positional rows at the load's context and
-    /// the fixed recurrent, conv and PLE terms ([`KvLayout::layer_bytes`]),
-    /// and the bytes a sequence holds beside its stores
-    /// ([`slot_resident_bytes`]) — counts them all, the bytes beside the
+    /// per-load sequence term ([`PlanInputs::seq_terms`]) — the positional
+    /// rows at the load's context and the fixed recurrent, conv and PLE terms
+    /// ([`KvLayout::layer_bytes`]), and the bytes a sequence holds beside its
+    /// stores ([`slot_resident_bytes`]) — counts them all, the bytes beside the
     /// stores reserved out of the expert budget before it fills so a card the
     /// plan saturates holds them too, so a card that cannot hold them is
-    /// refused as [`PlanInputs::plan_with`] refuses it. One slot is
-    /// [`PlanInputs::plan_with`] itself; zero is refused by name.
+    /// refused as [`PlanInputs::plan_with`] refuses it. The live sequence's
+    /// bytes beside its stores are the load's own (its arenas' rows and its
+    /// lane word), so the card's kv class is [`SeqTerms::plan_kv`]. One slot
+    /// is [`PlanInputs::plan_with`] itself; zero is refused by name.
     pub fn plan_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
@@ -322,11 +325,9 @@ impl PlanInputs {
             return Err(PlaceError::Slots { slots });
         }
         check_draft_reserve(machine, None)?;
-        let rows = slot_resident_bytes(&self.hp) * (slots as u64 - 1);
-        let kv = SlotsOf {
-            kv: &self.kv,
-            slots: slots as u64,
-        };
+        let terms = self.seq_terms(None);
+        let rows = terms.plan_beside(slots as u64);
+        let kv = terms.slots_of(slots as u64);
         let mut plan = self.target_of(machine, ctx_max, levers, experts, rows, &kv)?;
         // The bytes a sequence holds beside its stores ride the card's kv
         // class, out of the budget `rows` reserved above, so
@@ -337,6 +338,21 @@ impl PlanInputs {
             Ok(plan)
         } else {
             Err(PlaceError::Broken(broken))
+        }
+    }
+
+    /// What one resident sequence of a load of the file holds on its card
+    /// ([`SeqTerms`]): its stores over the file's layers ([`KvLayout`]), the
+    /// MTP draft's store on a load that carries `mtp`, and the bytes it holds
+    /// beside them ([`slot_resident_bytes`]).
+    fn seq_terms<'a>(&'a self, mtp: Option<&'a MtpInputs>) -> SeqTerms<'a> {
+        SeqTerms {
+            layers: Stores {
+                kv: &self.kv,
+                count: self.model.layers,
+            },
+            draft: mtp.map(MtpInputs::stores),
+            beside: slot_resident_bytes(&self.hp),
         }
     }
 
@@ -596,11 +612,13 @@ impl PlanInputs {
 
     /// [`PlanInputs::plan_mtp_with`] for a load that serves `slots` resident
     /// sequences ([`PlanInputs::plan_with_slots`]): the target's and the
-    /// draft's per-load sequence terms — their stores, and the bytes a
-    /// sequence holds beside them ([`slot_resident_bytes`]) — count them
-    /// all, the bytes beside the stores reserved out of the expert budget
-    /// before it fills, the sum keeping the card's bound. One slot is
-    /// [`PlanInputs::plan_mtp_with`] itself; zero is refused by name.
+    /// draft's per-load sequence terms ([`PlanInputs::seq_terms`]) — their
+    /// stores, and the bytes a sequence holds beside them
+    /// ([`slot_resident_bytes`]) — count them all, the bytes beside the
+    /// stores reserved out of the expert budget before it fills, the sum
+    /// keeping the card's bound. The target's kv class and the draft's sum to
+    /// [`SeqTerms::plan_kv`]. One slot is [`PlanInputs::plan_mtp_with`]
+    /// itself; zero is refused by name.
     pub fn plan_mtp_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
@@ -626,11 +644,9 @@ impl PlanInputs {
         };
         let (draft, reserve) = mtp.draft_plan_of(ctx_max, slots)?;
         let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab));
-        let rows = slot_resident_bytes(&self.hp) * (slots as u64 - 1);
-        let kv = SlotsOf {
-            kv: &self.kv,
-            slots: slots as u64,
-        };
+        let terms = self.seq_terms(Some(mtp));
+        let rows = terms.plan_beside(slots as u64);
+        let kv = terms.slots_of(slots as u64);
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let mut plan = self.target_of(machine, ctx_max, levers, experts, rows, &kv)?;
@@ -1246,32 +1262,15 @@ fn streams(hp: &Hparams) -> usize {
     hp.exp.as_ref().map_or(1, |e| e.hc_streams)
 }
 
-/// `kv`'s per-layer bytes for `slots` resident sequences: the multiplying
-/// view a multi-slot plan counts its per-load sequence terms by — the terms
-/// keep one owner, [`KvLayout`] (or the draft's [`MtpKv`]), multiplied.
-struct SlotsOf<'a, K: KvBytes + ?Sized> {
-    kv: &'a K,
-    slots: u64,
-}
-
-impl<K: KvBytes + ?Sized> KvBytes for SlotsOf<'_, K> {
-    fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        self.kv.layer_bytes(layer, ctx_max) * self.slots
-    }
-
-    fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        self.kv.shadow_bytes(layer, ctx_max) * self.slots
-    }
-}
-
 /// Card bytes one resident sequence of a qwen4exp load holds beside its
-/// per-layer stores ([`PlanInputs::plan_with_slots`]): the step's one row
-/// and the pass's [`PASS_ROWS`] rows of the four streams — the arena rows a
-/// sequence's own draft walks read, held in its own buffers while the
-/// arenas address whichever sequence is live — and the lane word every
-/// delta launch of the sequence reads [derived: `(1 + PASS_ROWS) · streams
-/// · n_embd` f32, one u32 device word]. The engine's own owner of the rows
-/// term is `Body38`'s `seq38_bytes`; the gate holds the two equal.
+/// per-layer stores, its [`SeqTerms::beside`] ([`PlanInputs::seq_terms`]):
+/// the step's one row and the pass's [`PASS_ROWS`] rows of the four streams
+/// — the arena rows a sequence's own draft walks read, held in its own
+/// buffers while the arenas address whichever sequence is live — and the
+/// lane word every delta launch of the sequence reads [derived: `(1 +
+/// PASS_ROWS) · streams · n_embd` f32, one u32 device word]. The engine's own
+/// owner of the rows term is `Body38`'s `seq38_bytes`; the gate holds the two
+/// equal.
 #[must_use]
 pub fn slot_resident_bytes(hp: &Hparams) -> u64 {
     ((1 + PASS_ROWS) * streams(hp) * hp.n_embd * std::mem::size_of::<f32>() + 4) as u64
@@ -1518,10 +1517,14 @@ impl MtpInputs {
     /// [`MtpInputs::draft_plan`] for a load that serves `slots` resident
     /// sequences: the draft's store counts them all.
     fn draft_plan_of(&self, ctx_max: u64, slots: usize) -> Result<(Plan<'_>, u64), PlaceError> {
-        let kv = SlotsOf {
-            kv: &self.kv,
-            slots: slots as u64,
+        // The draft's own plan is a plan of its one layer, whose sequence is
+        // its store; the rows its walks read are the target's `beside`.
+        let terms = SeqTerms {
+            layers: self.stores(),
+            draft: None,
+            beside: 0,
         };
+        let kv = terms.slots_of(slots as u64);
         let draft = placement::plan_routed(
             &self.model,
             &self.machine,
@@ -1540,6 +1543,15 @@ impl MtpInputs {
         let arena = mtp_arena_bytes(u64::from(self.draft.vocab));
         let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + arena;
         Ok((draft, bytes))
+    }
+
+    /// The draft layer's store of one sequence ([`MtpKv`]), over its one
+    /// layer.
+    fn stores(&self) -> Stores<'_> {
+        Stores {
+            kv: &self.kv,
+            count: self.model.layers,
+        }
     }
 
     /// The bytes the draft adds to the target's card at `ctx_max` positions
@@ -2419,7 +2431,7 @@ mod tests {
         }
 
         /// Qwen3.8's MTP layer as `mtp_of` reads the shared file.
-        fn draft(head_rows: HeadRows) -> MtpDraft {
+        pub(super) fn draft(head_rows: HeadRows) -> MtpDraft {
             MtpDraft {
                 source: MtpSource::File {
                     first_shard: "/m/mtp.gguf".into(),
@@ -2484,7 +2496,7 @@ mod tests {
         /// The shared file's 32 tensors as its header states them, in its
         /// (name) order: the statement's forms, the indexer's projections
         /// BF16 and its norms F32 [the header dump].
-        fn file() -> Vec<FileTensor> {
+        pub(super) fn file() -> Vec<FileTensor> {
             let d = draft(HeadRows::Full);
             let mut out: Vec<FileTensor> = mtp_tensors(&d)
                 .expect("the layer's statement")
@@ -2833,6 +2845,271 @@ mod tests {
                 hex(&got),
                 "cf6ab613e3942391f88ed698557e1680f160bd10e88c6b668c50360c10930e2b"
             );
+        }
+    }
+
+    /// The multi-slot plans ([`super::PlanInputs::plan_with_slots`],
+    /// [`super::PlanInputs::plan_mtp_with_slots`]) on a synthetic file of
+    /// four layers — three delta layers, the PLE site on the second, and a
+    /// selecting attention layer — every routed expert on the host, beside
+    /// the MTP draft of the shared file.
+    mod slots {
+        use std::num::NonZeroU64;
+
+        use gguf::GgmlType;
+        use models::{Arch, ChatSpec, HeadRows, ModelSpec};
+
+        use super::super::{
+            Experts, KvLayout, MtpInputs, PlanInputs, draft_card_bytes, mtp_arena_bytes,
+            slot_resident_bytes,
+        };
+        use super::mtp::{draft, file};
+        use crate::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
+        use crate::placement::{
+            self, Card, CardFormat, Host, KvBytes, Machine, ModelTensor, ModelTensors, Plan,
+            PlanLevers, Role,
+        };
+
+        const CTX: u64 = 4096;
+        const LAYERS: usize = 4;
+
+        /// The file's hyperparameters: the stores' terms of the qwen38 layer
+        /// test's layout; the rest Qwen3.8's, which no plan reads.
+        fn hparams() -> Hparams {
+            Hparams {
+                variant: Variant::Qwen4Exp,
+                n_layer: LAYERS,
+                n_embd: 2560,
+                n_head: 16,
+                n_head_kv: 2,
+                head_dim: 256,
+                rope_dims: 64,
+                rope_sections: [11, 11, 10, 0],
+                rope_base: 1e7,
+                rms_eps: 1e-6,
+                n_vocab: 248_320,
+                n_ctx_train: 262_144,
+                n_expert: 512,
+                n_used: 10,
+                expert_ff: 640,
+                shared_ff: Some(640),
+                ff: None,
+                conv: 4,
+                state: 128,
+                v_heads: 48,
+                k_heads: 16,
+                interval: LAYERS,
+                kinds: vec![
+                    Kind::DeltaRule,
+                    Kind::DeltaRule,
+                    Kind::DeltaRule,
+                    Kind::Attention,
+                ],
+                ffns: vec![FfnKind::Routed; LAYERS],
+                exp: Some(Exp {
+                    hc_streams: 4,
+                    hc_rank: 320,
+                    idx_heads: 4,
+                    idx_dim: 128,
+                    idx_top_k: 2048,
+                    ratios: vec![0, 0, 0, 4],
+                    ple: Some(Ple {
+                        layer: 1,
+                        ngram: 3,
+                        heads_per_ngram: 4,
+                        conv: 4,
+                        eos: 0,
+                        image: None,
+                        row: 256,
+                    }),
+                }),
+                defaults: Vec::new(),
+            }
+        }
+
+        /// The plan's inputs: a norm a layer for the tensors, and a
+        /// description of no layer, which no plan reads.
+        fn inputs() -> PlanInputs {
+            let hp = hparams();
+            let kv = KvLayout::of(&hp);
+            let tensors = (0..LAYERS)
+                .map(|l| ModelTensor {
+                    name: format!("blk.{l}.attn_norm.weight"),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::Attention,
+                    ty: GgmlType::F32,
+                    dims: vec![2560],
+                    file_bytes: 2560 * 4,
+                    gathered_rows: None,
+                })
+                .collect();
+            let spec = ModelSpec {
+                arch: Arch::Qwen4Exp,
+                hidden: 2560,
+                vocab: 248_320,
+                ctx_train: 262_144,
+                rms_eps: 1e-6,
+                layers: Vec::new(),
+                mtp: Vec::new(),
+                hc: None,
+                engram: None,
+                chat: ChatSpec {
+                    pre: String::new(),
+                    template: None,
+                    tools: None,
+                    reasoning: None,
+                },
+            };
+            PlanInputs {
+                hp,
+                model: ModelTensors {
+                    tensors,
+                    layers: LAYERS,
+                    experts: 512,
+                    experts_used: 10,
+                },
+                spec,
+                kv,
+            }
+        }
+
+        /// One card running every layer, with room for every plan here; a
+        /// host with no bound.
+        fn machine() -> Machine {
+            Machine {
+                cards: vec![Card {
+                    name: "card".to_string(),
+                    device: None,
+                    usable_bytes: 1 << 40,
+                    context_bytes: 0,
+                    scratch_bytes: 0,
+                    margin_bytes: 0,
+                    granule_bytes: NonZeroU64::new(2 << 20).expect("2 MiB"),
+                    free_bytes: None,
+                    held_by: None,
+                    layers: 0..LAYERS,
+                    head: true,
+                    token_embedding: false,
+                    reserves: Vec::new(),
+                }],
+                tiers: Vec::new(),
+                host: Host {
+                    usable_bytes: u64::MAX,
+                    reserves: Vec::new(),
+                },
+            }
+        }
+
+        /// `kv`'s per-layer bytes and shadows times `slots`, each its own
+        /// product: the sum the plans are held to, written apart from the
+        /// placement's view.
+        struct Times<'a> {
+            kv: &'a dyn KvBytes,
+            slots: u64,
+        }
+
+        impl KvBytes for Times<'_> {
+            fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+                self.kv.layer_bytes(layer, ctx_max) * self.slots
+            }
+
+            fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+                self.kv.shadow_bytes(layer, ctx_max) * self.slots
+            }
+        }
+
+        /// The target's plan of `slots` slots: each layer's bytes times the
+        /// slots, and the bytes beside the stores of every slot past the
+        /// first reserved with `reserve` and in the card's kv class.
+        fn target<'a>(
+            inputs: &'a PlanInputs,
+            machine: &'a Machine,
+            slots: u64,
+            reserve: u64,
+        ) -> Plan<'a> {
+            let rows = slot_resident_bytes(&inputs.hp) * (slots - 1);
+            let kv = Times {
+                kv: &inputs.kv,
+                slots,
+            };
+            let levers = PlanLevers::default();
+            let mut plan = inputs
+                .target_of(machine, CTX, &levers, Experts::Host, reserve + rows, &kv)
+                .expect("the target's plan");
+            plan.cards[0].kv_bytes += rows;
+            plan
+        }
+
+        /// The draft's plan of `slots` slots, its store times the slots, and
+        /// the bytes it adds to the target's card.
+        fn draft_of(mtp: &MtpInputs, slots: u64) -> (Plan<'_>, u64) {
+            let kv = Times { kv: &mtp.kv, slots };
+            let plan = placement::plan_routed(
+                &mtp.model,
+                &mtp.machine,
+                CTX,
+                &kv,
+                &PlanLevers::default(),
+                CardFormat::of_routed,
+            )
+            .expect("the draft's plan");
+            let bytes = draft_card_bytes(&plan.cards[0], mtp.map_bytes)
+                + mtp_arena_bytes(u64::from(mtp.draft.vocab));
+            (plan, bytes)
+        }
+
+        fn view(p: &Plan<'_>) -> String {
+            format!(
+                "{:?}",
+                (
+                    &p.rows,
+                    &p.cards,
+                    &p.host,
+                    p.nvme_bytes,
+                    &p.n_l,
+                    &p.tier_n_l,
+                    p.ctx_max,
+                    p.card_budget
+                )
+            )
+        }
+
+        /// At 1, 2 and 4 slots, the plain plan and the drafted plan's target
+        /// and draft are the plans of each layer's bytes times the slots and
+        /// the bytes beside the stores times the slots past the first; and
+        /// each plan's kv classes are `SeqTerms::plan_kv` of the slots.
+        #[test]
+        fn slot_plans_count_every_term_per_slot() {
+            let (inputs, machine) = (inputs(), machine());
+            let mtp =
+                MtpInputs::from_parts(draft(HeadRows::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            for n in [1, 2, 4] {
+                let slots = n as u64;
+                let plain = inputs
+                    .plan_with_slots(&machine, CTX, &levers, Experts::Host, n)
+                    .expect("the plan");
+                let want = target(&inputs, &machine, slots, 0);
+                assert_eq!(view(&plain), view(&want), "{n} slots");
+                assert_eq!(
+                    plain.cards[0].kv_bytes,
+                    inputs.seq_terms(None).plan_kv(CTX, slots),
+                    "{n} slots"
+                );
+                let drafted = inputs
+                    .plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Host, n)
+                    .expect("the drafted plan");
+                let (draft_want, reserve) = draft_of(&mtp, slots);
+                assert_eq!(view(&drafted.draft), view(&draft_want), "{n} slots");
+                let want = target(&inputs, &machine, slots, reserve);
+                assert_eq!(view(&drafted.plan), view(&want), "{n} slots");
+                assert_eq!(
+                    drafted.plan.cards[0].kv_bytes + drafted.draft.cards[0].kv_bytes,
+                    inputs.seq_terms(Some(&mtp)).plan_kv(CTX, slots),
+                    "{n} slots"
+                );
+            }
         }
     }
 
