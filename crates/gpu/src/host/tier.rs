@@ -1523,7 +1523,7 @@ fn chain_slot(chain: Chain) -> Result<usize, GpuError> {
     match chain {
         Chain::Step => Ok(0),
         Chain::Pair => Ok(1),
-        Chain::Quad => Ok(2 + DEFER_MAX_COLS),
+        Chain::Quad => Ok(1 + DEFER_MAX_COLS),
         Chain::Cols(m) if (2..=DEFER_MAX_COLS).contains(&m) => Ok(m),
         Chain::Cols(m) => Err(GpuError::shape(
             WHAT,
@@ -1713,7 +1713,9 @@ fn copy_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{TIER_FLAGS, TWord, TierAct, TierLayout, TierSet, TierShape, chain_slot};
+    use super::{
+        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierSet, TierShape, chain_slot,
+    };
     use crate::host::slots::{HOST, Slot, SlotMap, TIER};
     use crate::host::step::Chain;
     use model::ops::DEFER_MAX_COLS;
@@ -1891,9 +1893,22 @@ mod tests {
         assert!(TierLayout::with_cols(q38, 9, 0, 0, 1).is_err());
         assert_eq!(chain_slot(Chain::Step).ok(), Some(0));
         assert_eq!(chain_slot(Chain::Pair).ok(), Some(1));
-        assert_eq!(chain_slot(Chain::Quad).ok(), Some(2 + DEFER_MAX_COLS));
+        assert_eq!(chain_slot(Chain::Quad).ok(), Some(1 + DEFER_MAX_COLS));
         assert_eq!(chain_slot(Chain::Cols(4)).ok(), Some(4));
         assert!(chain_slot(Chain::Cols(1)).is_err());
         assert!(chain_slot(Chain::Cols(9)).is_err());
+        let chains = [Chain::Step, Chain::Pair, Chain::Quad]
+            .into_iter()
+            .chain((2..=DEFER_MAX_COLS).map(Chain::Cols));
+        let mut seen = [false; TIER_CHAINS];
+        for c in chains {
+            let slot = chain_slot(c).expect("every chain the tier serves has a slot");
+            assert!(
+                slot < TIER_CHAINS,
+                "{c:?} at slot {slot}, past the {TIER_CHAINS} graphs"
+            );
+            assert!(!seen[slot], "{c:?} shares slot {slot}");
+            seen[slot] = true;
+        }
     }
 }
