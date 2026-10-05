@@ -18,13 +18,14 @@
 //! program's own arena and the reserve its load keeps free past it — and
 //! when it does not, the placed plan on `a`'s card. The serve seat's unset
 //! `--ctx` defaults live here too ([`whole_ctx_qwen3`] for the whole load,
-//! [`placed_ctx_qwen3`] for a placed one). Every census reading the module
+//! [`placed_ctx_qwen3`] for a placed one), and its resident slots open a
+//! placed plan through [`open_qwen3_slots`]. Every census reading the module
 //! takes and every probe its searches run is counted ([`reads`]).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel};
-use bloomery_gpu::model::GpuModel;
+use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
@@ -658,6 +659,10 @@ pub enum Unplaced {
 /// ([`unplaced_qwen3`]); else the placed plan on `a`'s card, its
 /// `plan` record with `why=whole_does_not_fit` handed to `emit` before the
 /// open, the host set as `levers` asks.
+#[allow(
+    dead_code,
+    reason = "generate_qwen3moe opens its unset load through it; the serve seat decides its load at the total before the open"
+)]
 pub fn open_unplaced_qwen3(
     file: Split,
     ctx: usize,
@@ -712,6 +717,64 @@ pub fn open_qwen3(
         return Ok(GpuModel::<Body>::open(gpu, file, opts)?);
     }
     Ok(GpuModel::<Body>::open_placed(file, plan, opts, host)?)
+}
+
+/// The Qwen3-30B model of `file` by `plan` ([`open_qwen3`]) for `slots`
+/// resident sequences: `plan` made at the total context the slots split,
+/// the model holding its one sequence at `opts.ctx` rows — a slot's share —
+/// so the sequences the caller adds after it sit inside the cache the plan
+/// counts. `slots · opts.ctx` past the plan's `ctx_max` is refused by name
+/// before anything loads; the open is handed the plan with its `ctx_max` at
+/// `opts.ctx` (the rows the caches hold, which the open checks and the model
+/// steps against), every other term the plan's own at the total; once open,
+/// the `slots` sequences' cache — the body's own sequence bytes, `slots`
+/// times — past the plan's KV term is refused by name, and both stand on one
+/// stderr line. One slot is [`open_qwen3`] itself.
+#[allow(
+    dead_code,
+    reason = "the serve seat's resident slots; the CLI and the e2e gates load one sequence"
+)]
+pub fn open_qwen3_slots(
+    file: Split,
+    plan: &Plan<'_>,
+    slots: usize,
+    opts: OpenOpts,
+    host: HostCfg,
+) -> Result<Qwen3moeModel, GateError> {
+    const WHAT: &str = "placed slots";
+    if slots <= 1 {
+        return open_qwen3(file, plan, opts, host);
+    }
+    let rows = u64::try_from(slots.saturating_mul(opts.ctx))?;
+    if rows > plan.ctx_max {
+        return Err(format!(
+            "{WHAT}: {slots} sequences of {} rows hold {rows} positions, past the {} the plan \
+             counts",
+            opts.ctx, plan.ctx_max
+        )
+        .into());
+    }
+    let at = Plan {
+        ctx_max: u64::try_from(opts.ctx)?,
+        ..plan.clone()
+    };
+    let m = open_qwen3(file, &at, opts, host)?;
+    let held = u64::try_from(m.body(WHAT)?.seq_bytes())?.saturating_mul(u64::try_from(slots)?);
+    let counted = plan
+        .cards
+        .first()
+        .ok_or_else(|| format!("{WHAT}: a plan of no card"))?
+        .kv_bytes;
+    let line = format!(
+        "{WHAT}: {slots} sequences of {} rows hold {held} B of cache; the plan at {} positions \
+         counts {counted} B",
+        opts.ctx, plan.ctx_max
+    );
+    if held > counted {
+        return Err(format!("{line}: past its count").into());
+    }
+    eprintln!("{line}");
+    Ok(m)
 }
 
 /// The Qwen3.6 model of `file` by `plan`, as [`open_qwen3`].

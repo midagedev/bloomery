@@ -109,6 +109,18 @@
 //!   (v4) the load record names `slots=2` and `slot_ctx` = the auto default
 //!   the one-slot arm measured over two (a cache row the granularity, the
 //!   floor exact), and `/props`' `n_ctx` is that slot ctx.
+//!   The same clause runs a second time on a placed load, its checks named
+//!   `placed_…`: `--place a` under `BLOOMERY_CARD_BUDGET=12G` (a 12 GiB
+//!   card's budget, which keeps routed experts on the host tier on either
+//!   card) and no `--ctx`, so (v4)'s total is the placed default the server's
+//!   own `plan` record was made at (`ctx_max`) — the default listening at
+//!   all is the split's check on the smallest card the seat serves. Then
+//!   `placed_slots_hold_the_plan` reads that server's stderr: the plan keeps
+//!   experts on the card and on the host (the arm ran the placed body, not
+//!   the whole load a plan of every expert opens), and the seat's `placed
+//!   slots` line names two sequences of half the plan's `ctx_max` holding at
+//!   most the plan's KV term at the total (the plan counts every slot's
+//!   rows: two of `⌊T/2⌋` never past `T`).
 //!   FAIL-first mutants, each red on its line: the seat still building the
 //!   turn-taking engine leaves (v2) at ~1.0 and (v3) failing; a select that
 //!   ignores the slot (both requests on one sequence) moves the together
@@ -116,11 +128,15 @@
 //!   wrong order scrambles the ids; a ctx not divided gives each slot the
 //!   total, and the second sequence does not fit past the first (the auto
 //!   default spent the card's free bytes on the one-sequence cache): the
-//!   server never listens, which the clause names as the split's check red.
+//!   server never listens, which the clause names as the split's check red;
+//!   a placed load kept on the turns leaves the placed arm's (v2), (v3) and
+//!   (v4) red, no `placed slots` line, and `ctx_default`'s placed arm's
+//!   `placed_slots_are_resident` and `placed_ctx_is_the_plans_ctx_max` red.
 //! - `slot_ctx_too_small_is_refused`, on the qwen3moe arm: `--ctx 15`
 //!   under the default two slots — a slot of 7 rows, one under the 8 rows
-//!   the load's widest captured pass writes (`router::MAX_TOKENS`) — ends
-//!   the process before the load, naming the total, the slot count and the
+//!   the load's widest captured pass writes (`router::MAX_TOKENS`; a placed
+//!   load names one whole prompt pass of its own, the same 8) — ends the
+//!   process before the load, naming the total, the slot count and the
 //!   slot ctx. FAIL-first: the refusal dropped loads the slot and dies in
 //!   the pass capture under the launcher's own message.
 //! - `ctx_search_reads_the_census_once`, `ctx_default`'s arms that search
@@ -128,13 +144,16 @@
 //!   probes and its census readings on one line, and every one read the
 //!   census once for all its probes. FAIL-first: a placed search that
 //!   resolves its placement per probe reads it once a probe.
-//! - `placed_slots_take_turns`, `ctx_default`'s placed arm (`--place a
-//!   --parallel 2`): a placed load's slots take its one sequence in turns
-//!   over the whole context — its plan counts the card bytes of one
-//!   sequence — so the load record names one resident sequence and the
-//!   listening record two slots of the arm's `n_ctx` each. FAIL-first: a
-//!   placed load made resident adds a sequence its plan never counted, and
-//!   either never listens or names two in its load.
+//! - `placed_slots_are_resident` (qwen3moe) and `placed_slots_take_turns`
+//!   (qwen35moe), `ctx_default`'s placed arm (`--place a --parallel 2`, no
+//!   budget): a qwen3moe file's placed load holds its two slots resident —
+//!   its plan made at the total, which counts every slot's rows — so the
+//!   load and listening records name two slots of half the plan's `ctx_max`
+//!   each; a qwen35moe file's slots take its one sequence in turns over the
+//!   whole context, the load record naming one resident sequence of
+//!   `ctx_max` and the listening record two slots of it. FAIL-first: the
+//!   seat's qwen3moe placed load kept on the turns names one sequence of
+//!   `ctx_max` in its load.
 //! - `placed_answers_a_prompt_past_the_gemm_walk`, a placed server whose
 //!   card budget is [`HOST_TIER_BUDGET`] (`--place a --parallel 1`): its
 //!   plan record puts routed experts on the host, and a greedy
@@ -146,13 +165,14 @@
 //! The spawn census, every server this gate starts and its `--parallel`:
 //! [`spawn`] and `ctx_default`'s default, flag and q8 arms pin
 //! `--parallel 1` (the prefix and ctx clauses hold the one-slot path's
-//! keeps and defaults), its placed arm passes `--parallel 2` (the placed
-//! turns above); `cache_refusals`' two refusal arms pass none — they die at
-//! flag parsing before the seat splits anything — and its flag-wins arm
-//! pins `--parallel 1`; the swap clause passes `--parallel 2` (qwen35moe,
-//! the turns); the slots clause passes `--parallel 2` (qwen3moe, resident)
-//! and the refusal arm passes none (the default two are what makes the
-//! split too small); the host-tier arm pins `--parallel 1` (one prompt on
+//! keeps and defaults), its placed arm passes `--parallel 2` (resident on
+//! qwen3moe, the turns on qwen35moe, above); `cache_refusals`' two refusal
+//! arms pass none — they die at flag parsing before the seat splits
+//! anything — and its flag-wins arm pins `--parallel 1`; the swap clause
+//! passes `--parallel 2` (qwen35moe, the turns); the slots clause's two
+//! arms pass `--parallel 2` (qwen3moe, resident: the whole-card load and
+//! the budgeted placed one) and the refusal arm passes none (the default
+//! two are what makes the split too small); the host-tier arm pins `--parallel 1` (one prompt on
 //! the placed path is the clause).
 //!
 //! The server is stopped by the handle this binary spawned it with before
@@ -344,10 +364,15 @@ mod gate {
             .collect()
     }
 
-    /// The `load` record's line and the `listening` record's line of a
-    /// server's stderr, each empty when the server printed none.
+    /// The seat's `load` record's line (`load arch=…`, not the host tier's
+    /// `load host_tier …` a placed load prints before it) and the
+    /// `listening` record's line of a server's stderr, each empty when the
+    /// server printed none.
     fn load_and_listening(log: &str) -> (&str, &str) {
-        let load = log.lines().find(|l| l.starts_with("load ")).unwrap_or("");
+        let load = log
+            .lines()
+            .find(|l| l.starts_with("load arch="))
+            .unwrap_or("");
         let listening = log
             .lines()
             .find(|l| l.contains(" listening on http://"))
@@ -362,8 +387,10 @@ mod gate {
     /// card and a Q4_K_M 30B file leave tens of thousands of rows); the
     /// `--ctx` flag still wins; a load under `--place` takes the placed
     /// search's answer over the plan's expert split, pinned by relation
-    /// (the placed arm's checks below), and its two slots take the one
-    /// sequence in turns (`placed_slots_take_turns`). FAIL-first: a search
+    /// (the placed arm's checks below), its two slots resident on a
+    /// qwen3moe file (`placed_slots_are_resident`) and taking the one
+    /// sequence in turns on a qwen35moe file (`placed_slots_take_turns`).
+    /// FAIL-first: a search
     /// that hands back the trained context uncapped makes the default arm's
     /// load a plan the card cannot hold (the spawn never listens), and one
     /// that hands back nothing leaves the default at the floor. Returns the
@@ -385,8 +412,9 @@ mod gate {
         let arms: [(&str, &[&str]); 4] = [
             ("default", &["--parallel", "1"]),
             ("flag", &["--parallel", "1", "--ctx", "2048"]),
-            // Two slots on the placed load: they take its one sequence in
-            // turns (the module header's `placed_slots_take_turns`).
+            // Two slots on the placed load: resident on a qwen3moe file, in
+            // turns on a qwen35moe file (the module header's
+            // `placed_slots_are_resident` and `placed_slots_take_turns`).
             ("placed", &["--parallel", "2", "--place", "a"]),
             // The cache lever's arm: the q8_0 planes the seat's flag names,
             // the auto context search under the halved KV term.
@@ -455,25 +483,25 @@ mod gate {
                 _ => {
                     // The placed default is searched over the plan's own
                     // expert split, and the relation is what holds on every
-                    // card — the fit rides the census reading: the served
-                    // context keeps the floor and the granule, is the ctx
-                    // the one `plan` record was made at, and the one
-                    // `--ctx defaults to` line names it, present exactly
-                    // when the search stopped below the trained context
-                    // (an idle A6000 holds every expert at the trained
-                    // context and prints none). FAIL-first: a search that
-                    // ignores its bound plans past what the card holds and
-                    // the server dies before listening — on the 3090, a
+                    // card — the fit rides the census reading: the total
+                    // the one `plan` record was made at keeps the floor and
+                    // the granule, the one `--ctx defaults to` line names
+                    // it, present exactly when the search stopped below the
+                    // trained context (an idle A6000 holds every expert at
+                    // the trained context and prints none), and `/props`
+                    // serves a slot's share of it. FAIL-first: a search
+                    // that ignores its bound plans past what the card holds
+                    // and the server dies before listening — on the 3090, a
                     // Qwen3.6 plan that keeps every expert at a context its
                     // whole load (which that plan opens) does not fit; a
-                    // load that says
-                    // nothing leaves the line's side of the biconditional
-                    // red on a card where the search grows.
-                    check(
-                        ok,
-                        "placed_ctx_keeps_the_floor_and_the_granule",
-                        n >= 4096 && n % 1024 == 0,
-                    );
+                    // load that says nothing leaves the line's side of the
+                    // biconditional red on a card where the search grows.
+                    // PIN(2026-10-05): the total is the plan's `ctx_max`, not
+                    // `/props`' `n_ctx`: a qwen3moe file's two placed slots
+                    // are resident and each serves `ctx_max / 2` rows (the
+                    // split's floor), a qwen35moe file's take its one
+                    // sequence of `ctx_max` in turns; mutant: the seat's
+                    // placed load kept on the turns serves `ctx_max`.
                     let log = std::fs::read_to_string(&err_log)?;
                     let plan_ctx = log.lines().find(|l| l.starts_with("plan ")).and_then(|l| {
                         l.split("ctx_max=")
@@ -483,8 +511,23 @@ mod gate {
                             .parse::<u64>()
                             .ok()
                     });
-                    println!("placed arm: plan ctx_max {plan_ctx:?}");
-                    check(ok, "placed_ctx_is_the_plans_ctx_max", Some(n) == plan_ctx);
+                    let resident = split.architecture() == Some("qwen3moe");
+                    let total = plan_ctx.unwrap_or(u64::MAX);
+                    let slot = if resident { total / 2 } else { total };
+                    println!(
+                        "placed arm: plan ctx_max {plan_ctx:?}, resident slots {resident}, props \
+                         n_ctx {n} against a slot's {slot}"
+                    );
+                    check(
+                        ok,
+                        "placed_ctx_keeps_the_floor_and_the_granule",
+                        total >= 4096 && total % 1024 == 0,
+                    );
+                    check(
+                        ok,
+                        "placed_ctx_is_the_plans_ctx_max",
+                        plan_ctx.is_some() && n == slot,
+                    );
                     let said: Vec<u64> = log
                         .lines()
                         .filter(|l| l.contains("--ctx defaults to "))
@@ -502,13 +545,19 @@ mod gate {
                     check(
                         ok,
                         "placed_names_its_default_ctx",
-                        (n < trained) == !said.is_empty()
+                        (total < trained) == !said.is_empty()
                             && said.len() <= 1
-                            && (said.is_empty() || said[0] == n),
+                            && (said.is_empty() || said[0] == total),
                     );
-                    // The two slots take the placed load's one sequence in
-                    // turns over the whole context (the module header).
+                    // A qwen3moe file's two slots are resident sequences of
+                    // a slot's share each; a qwen35moe file's take the
+                    // placed load's one sequence in turns over the whole
+                    // context (the module header).
                     let (load, listening) = load_and_listening(&log);
+                    println!(
+                        "placed arm: plan record {:?}; load record {load:?}",
+                        log.lines().find(|l| l.starts_with("plan ")).unwrap_or("")
+                    );
                     let terms = [
                         field_u64(load, "slots"),
                         field_u64(load, "slot_ctx"),
@@ -520,11 +569,19 @@ mod gate {
                          slot_ctx={:?}",
                         terms[0], terms[1], terms[2], terms[3]
                     );
-                    check(
-                        ok,
-                        "placed_slots_take_turns",
-                        terms == [Some(1), Some(n), Some(2), Some(n)],
-                    );
+                    if resident {
+                        check(
+                            ok,
+                            "placed_slots_are_resident",
+                            terms == [Some(2), Some(slot), Some(2), Some(slot)],
+                        );
+                    } else {
+                        check(
+                            ok,
+                            "placed_slots_take_turns",
+                            terms == [Some(1), Some(total), Some(2), Some(total)],
+                        );
+                    }
                 }
             }
             if name != "flag" {
@@ -547,7 +604,7 @@ mod gate {
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
         let resident = |log: &str| {
             log.lines()
-                .find(|l| l.starts_with("load "))
+                .find(|l| l.starts_with("load arch="))
                 .and_then(|l| l.split("resident_bytes=").nth(1))
                 .and_then(|r| r.split(' ').next())
                 .and_then(|r| r.parse::<u64>().ok())
@@ -1147,45 +1204,98 @@ mod gate {
         Ok((h, rx))
     }
 
-    /// The slots clause (module header) on a server of `--parallel 2` started
-    /// into `<dir>/slots`: two greedy streamed requests of distinct prompts,
-    /// each first run alone on that same server and then both together, the
-    /// ids, the round counters and the streams' interleaving held, the load
-    /// record's split and `/props`' context pinned to half the one-slot
-    /// default `total`.
+    /// Where a slots arm's total context comes from: the one-slot default
+    /// arm's answer (`ctx_default`'s, the whole-card load's total), or the
+    /// server's own `plan` record (`ctx_max`: the placed search's answer,
+    /// the total the plan was made at).
+    #[derive(Clone, Copy, Debug)]
+    enum Total {
+        Default(Option<u64>),
+        Plan,
+    }
+
+    /// One server of the slots clause (module header): its directory under
+    /// the file's, the prefix of its checks' names, the flags past
+    /// `--parallel 2`, its environment, and where its total comes from.
+    struct SlotsArm<'a> {
+        dir: &'a str,
+        prefix: &'a str,
+        flags: &'a [&'a str],
+        env: &'a [(&'a str, &'a str)],
+        total: Total,
+    }
+
+    /// The whole-card arm: no `--place`, no `--ctx`, the one-slot default
+    /// `total` split.
+    fn whole_slots(total: Option<u64>) -> SlotsArm<'static> {
+        SlotsArm {
+            dir: "slots",
+            prefix: "",
+            flags: &[],
+            env: &[],
+            total: Total::Default(total),
+        }
+    }
+
+    /// The slots clause's placed arm (its checks `placed_…`): `--place a`
+    /// under a card budget of [`PLACED_BUDGET`], no `--ctx` — the placed
+    /// default the plan record names, split.
+    const PLACED_SLOTS: SlotsArm<'static> = SlotsArm {
+        dir: "slots-placed",
+        prefix: "placed_",
+        flags: &["--place", "a"],
+        env: &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
+        total: Total::Plan,
+    };
+
+    /// The placed slots arm's card budget: a 12 GiB card's, the smallest
+    /// card the seat serves Qwen3-30B on, under which the plan splits the
+    /// routed experts between the card and the host tier on either of this
+    /// machine's cards (`gate_qwen3moe_e2e`'s (o) budget).
+    const PLACED_BUDGET: &str = "12G";
+
+    /// The slots clause (module header) on a server of `--parallel 2` and
+    /// `arm`'s flags and environment started into `<dir>/<arm.dir>`: two
+    /// greedy streamed requests of distinct prompts, each first run alone on
+    /// that same server and then both together, the ids, the round counters
+    /// and the streams' interleaving held, the load record's split and
+    /// `/props`' context pinned to half the arm's total. Each check's name
+    /// carries the arm's prefix.
     fn slots_flow_together(
         model: &Path,
         dir: &Path,
-        total: Option<u64>,
+        arm: &SlotsArm<'_>,
         ok: &mut bool,
     ) -> Result<(), GateError> {
-        let dir = dir.join("slots");
+        let named = |c: &str| format!("{}{c}", arm.prefix);
+        let dir = dir.join(arm.dir);
         std::fs::create_dir_all(&dir)?;
         let err_log = dir.join("server.err");
         let mut cmd = Command::new(beside("bloomery-serve")?);
         cmd.env_remove("BLOOMERY_REF_MODEL");
+        for &(k, v) in arm.env {
+            cmd.env(k, v);
+        }
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
-        let mut s = Served::spawn_cmd(
-            cmd,
-            &[
-                "--model",
-                "qwen3",
-                "--port",
-                "0",
-                "--parallel",
-                "2",
-                "-m",
-                m,
-            ],
-            &dir,
-        )?;
+        let mut args = vec![
+            "--model",
+            "qwen3",
+            "--port",
+            "0",
+            "--parallel",
+            "2",
+            "-m",
+            m,
+        ];
+        args.extend_from_slice(arm.flags);
+        let mut s = Served::spawn_cmd(cmd, &args, &dir)?;
         let addr = match s.address(&err_log, 600, Duration::from_secs(1)) {
             Ok(a) => a,
             // A load that never listens names no split: the split's check
             // is red by name, and the clauses after this one still run.
             Err(e) => {
-                println!("slots: the server never listened: {e}");
-                check(ok, "slots_load_names_the_split", false);
+                println!("{}: the server never listened: {e}", arm.dir);
+                check(ok, &named("slots_load_names_the_split"), false);
                 let _ = s.stop();
                 return Ok(());
             }
@@ -1195,23 +1305,41 @@ mod gate {
         let log = std::fs::read_to_string(&err_log)?;
         let (load, _) = load_and_listening(&log);
         let field = |name: &str| field_u64(load, name);
+        let plan = log.lines().find(|l| l.starts_with("plan ")).unwrap_or("");
+        let total = match arm.total {
+            Total::Default(t) => t,
+            Total::Plan => field_u64(plan, "ctx_max"),
+        };
+        // The load's decision, printed: the whole-fit verdicts the seat ran
+        // (one, at the total, when it made one) and its plan record.
+        let verdicts: Vec<&str> = log
+            .lines()
+            .filter(|l| l.starts_with("whole fit at ctx "))
+            .collect();
+        println!(
+            "{}: {} whole-fit verdict(s) {verdicts:?}; plan record {plan:?}",
+            arm.dir,
+            verdicts.len()
+        );
         let (st, body) = curl(&url("/props"), None, false)?;
         let props = json_of("/props", st, &body)?;
         let n_ctx = props["n_ctx"].as_u64().unwrap_or(u64::MAX);
         println!(
-            "slots: {load}; the one-slot default {total:?}, props n_ctx {n_ctx}, record \
-             slots={:?} slot_ctx={:?}",
+            "{}: {load}; the total {total:?} ({:?}), props n_ctx {n_ctx}, record slots={:?} \
+             slot_ctx={:?}",
+            arm.dir,
+            arm.total,
             field("slots"),
             field("slot_ctx"),
         );
         check(
             ok,
-            "slots_load_names_the_split",
+            &named("slots_load_names_the_split"),
             field("slots") == Some(2) && total.is_some_and(|t| field("slot_ctx") == Some(t / 2)),
         );
         check(
             ok,
-            "props_names_the_slot_ctx",
+            &named("props_names_the_slot_ctx"),
             total.is_some_and(|t| n_ctx == t / 2),
         );
         // Two distinct prompts, each first run alone, then both together.
@@ -1222,11 +1350,11 @@ mod gate {
         for ids in [&a_ids, &b_ids] {
             let (h, rx) = streamed(&addr, ids, SLOTS_PREDICT)?;
             h.join()
-                .map_err(|_| "slots: an alone request's thread panicked")?;
+                .map_err(|_| format!("{}: an alone request's thread panicked", arm.dir))?;
             let ran = rx
                 .recv()
-                .map_err(|_| "slots: an alone request's thread gave no answer")??;
-            println!("slots alone: {} ids", ran.tokens.len());
+                .map_err(|_| format!("{}: an alone request's thread gave no answer", arm.dir))??;
+            println!("{} alone: {} ids", arm.dir, ran.tokens.len());
             alone.push(ran.tokens);
         }
         let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
@@ -1239,10 +1367,10 @@ mod gate {
         let mut together = Vec::new();
         for ((h, rx), what) in [(first, "first"), (second, "second")] {
             h.join()
-                .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
-            let ran = rx
-                .recv()
-                .map_err(|_| format!("slots: the {what} request's thread gave no answer"))??;
+                .map_err(|_| format!("{}: the {what} request's thread panicked", arm.dir))?;
+            let ran = rx.recv().map_err(|_| {
+                format!("{}: the {what} request's thread gave no answer", arm.dir)
+            })??;
             together.push(ran);
         }
         let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
@@ -1251,7 +1379,7 @@ mod gate {
         // (v1) The slots hold separate sequences: together ids are alone ids.
         check(
             ok,
-            "slots_alone_ids_stay",
+            &named("slots_alone_ids_stay"),
             !together[0].tokens.is_empty()
                 && !together[1].tokens.is_empty()
                 && together[0].tokens == alone[0]
@@ -1261,14 +1389,15 @@ mod gate {
         // the module header): ≥ 1.5 against the turns' 1.0.
         let ratio = (busy1 - busy0) / (decode1 - decode0);
         println!(
-            "slots together: {} and {} ids; decode {decode0} -> {decode1}, busy {busy0} -> \
+            "{} together: {} and {} ids; decode {decode0} -> {decode1}, busy {busy0} -> \
              {busy1} (ratio {ratio:.3}); swaps {swaps:?}",
+            arm.dir,
             together[0].tokens.len(),
             together[1].tokens.len(),
         );
         check(
             ok,
-            "slots_rounds_carry_both_slots",
+            &named("slots_rounds_carry_both_slots"),
             swaps.is_none_or(|v| v == 0.0) && ratio >= 1.5,
         );
         // (v3) While both streams are live, every window of SLOTS_WINDOW
@@ -1301,17 +1430,75 @@ mod gate {
             }
         }
         println!(
-            "slots interleave: {} arrivals while both live, {} thin window(s) of {}",
+            "{} interleave: {} arrivals while both live, {} thin window(s) of {}",
+            arm.dir,
             tags.len(),
             thin,
             SLOTS_WINDOW,
         );
         check(
             ok,
-            "slots_streams_interleave",
+            &named("slots_streams_interleave"),
             !tags.is_empty() && thin == 0,
         );
-        println!("slots server stopped: {}", s.stop()?);
+        println!("{} server stopped: {}", arm.dir, s.stop()?);
+        Ok(())
+    }
+
+    /// The placed slots arm's own terms, from its server's stderr
+    /// (`<dir>/slots-placed/server.err`) once it stopped: its `plan` record
+    /// keeps routed experts on the card and on the host tier (the arm ran
+    /// the placed body: the host tier, the placed step walk, the eager
+    /// prompt passes — not the whole load a plan of every expert opens),
+    /// and the seat's `placed slots` line holds the two sequences' cache
+    /// bytes at or under the plan's KV term at the total, the slot ctx half
+    /// the plan's `ctx_max`. FAIL-first: the seat's placed load kept on the
+    /// turns prints no `placed slots` line.
+    fn placed_slots_hold_the_plan(dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let log = std::fs::read_to_string(dir.join(PLACED_SLOTS.dir).join("server.err"))
+            .unwrap_or_default();
+        let plan = log.lines().find(|l| l.starts_with("plan ")).unwrap_or("");
+        let (host, card, total) = (
+            field_u64(plan, "host_experts"),
+            field_u64(plan, "card_experts"),
+            field_u64(plan, "ctx_max"),
+        );
+        let (load, _) = load_and_listening(&log);
+        // `placed slots: N sequences of S rows hold H B of cache; the plan
+        // at T positions counts K B` (`q3place::open_qwen3_slots`).
+        let line = log
+            .lines()
+            .find(|l| l.starts_with("placed slots: "))
+            .unwrap_or("");
+        let num = |after: &str| -> Option<u64> {
+            line.split(after).nth(1)?.split(' ').next()?.parse().ok()
+        };
+        let (n, slot, held, at, counted) = (
+            num("placed slots: "),
+            num(" sequences of "),
+            num(" hold "),
+            num(" the plan at "),
+            num(" counts "),
+        );
+        println!(
+            "placed slots: plan host_experts {host:?} card_experts {card:?} ctx_max {total:?}; \
+             load resident_bytes {:?}; cache line {line:?}",
+            field_u64(load, "resident_bytes")
+        );
+        check(
+            ok,
+            "placed_slots_plan_splits_the_experts",
+            host.is_some_and(|h| h > 0) && card.is_some_and(|c| c > 0),
+        );
+        check(
+            ok,
+            "placed_slots_cache_within_the_plan",
+            total.is_some()
+                && n == Some(2)
+                && at == total
+                && slot == total.map(|t| t / 2)
+                && held.zip(counted).is_some_and(|(h, k)| h > 0 && h <= k),
+        );
         Ok(())
     }
 
@@ -1757,9 +1944,12 @@ mod gate {
             cache_refusals(model, &dir, &mut ok)?;
             if arch == "qwen3moe" {
                 // The qwen3moe arm: the resident slots and the split they
-                // serve (a moved coverage clause would be lost — the swap
-                // clause below is the qwen35moe arm's now).
-                slots_flow_together(model, &dir, total, &mut ok)?;
+                // serve, on the whole-card load and on a placed one (a
+                // moved coverage clause would be lost — the swap clause
+                // below is the qwen35moe arm's now).
+                slots_flow_together(model, &dir, &whole_slots(total), &mut ok)?;
+                slots_flow_together(model, &dir, &PLACED_SLOTS, &mut ok)?;
+                placed_slots_hold_the_plan(&dir, &mut ok)?;
                 slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
             }
