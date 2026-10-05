@@ -817,9 +817,11 @@ ds41_self_test() {
   run_file plain.out prose:4
   want plain-row 0 \
     "ROW r- prose d=4 n=4 | tok/s(mean) 200.00 @ n=4, depth 4, - | place a | p50 5.0000 ms | mean 5.0000 ms | tok/s(p50) 200.00 | warm 1 | first10_p50 5.0000 | last10_p50 5.0000 | distinct_tokens 3 | pp_tok/s 400.00 (n=4, passes=1, kind=batch) | wall -s"
-  # The FAIL rows (red on the runner before them, which read a slots output as one stream's row).
+  # A slots arm with the residency off has no residency pass to read: its row stands on its time pass records.
   run_file slots-off.out prose:512@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off
-  want slots-resoff 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off d=512 rc=residency | the slots residency clause needs the residency on"
+  want slots-resoff 0 \
+    "ROW r- prose@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off d=512 n=4 | tok/s(aggregate) 250.00 @ n=2·2, depth 512, - | place a | slots 2 | tok/s(per stream, mean) 125.00 | p50 8.0000 ms/pass | mean 8.0000 ms/pass | warm 1 | first10_p50 8.0000 | last10_p50 8.0000 | distinct_tokens 6 | pp_tok/s 400.00 (n=4, passes=1, kind=batch) | wall -s"
+  # The FAIL rows (red on the runner before them, which read a slots output as one stream's row).
   run_file slots-pair.out prose:4@BLOOMERY_GEN_SLOTS=2
   want slots-pair 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2 d=4 rc=residency | the slots residency clause: the residency pass at boundary=4 reads pass=pair kept=2, not pass=slots kept=2"
   run_file slots-oneprompt.out prose:4@BLOOMERY_GEN_SLOTS=2
