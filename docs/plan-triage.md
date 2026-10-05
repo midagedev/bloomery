@@ -119,7 +119,45 @@
 
 ## 열린 항목 — 받을 라운드별
 
-### 0.2.1 준비 회차 (10-03~04, 리드 — 출시는 사용자 결정으로 **보류**, 아래 「보류 시점」이 재개 조건)
+### The 0.2.1 cut (10-05 night → 10-06, line1 — the hold below is lifted: 0.2.1 waited for multistream on every family)
+
+**In the train** (on main `6bcb1168`, version `c7eb555e`): every generative seat's slots are resident sequences
+(V4.1 `a03e3612`·`5b7973ba`, GLM `22a80509`·`354eb29a`, Qwen3.6 `cb2f4687`); one pass of the busy rows on a whole-card
+Qwen3-30B, V4.1 (two-row slot pass `008cb859`), GLM and Qwen3.8 (drafted windows O3c `285ad4d0`, glmseatdraft; plain
+rows q38pass `c6008b16`); the GLM skip path pinned (glmskip `02d0a0b7`); the residency diagnosis owner (reslift
+`ce552605`); GEN_SLOTS arms for V4.1, GLM, Qwen3.8 (sb41land, glmslots); the prompt-quantum mechanism with no seat
+opted in (promptlv `d73f4479`); the vision encoder's scratch once a load (v3s `9bd5992a`). No seat takes turns any
+more: `serve::SwapEngine` is built only by the serve crate's tests, and `bind::Parallel::of_turn_slots` only by
+`bind.rs`'s own tests (census021, at `c7eb555e`).
+
+**Morning branches (not in 0.2.1):**
+- **slotpoison** (line2): green on glm5next-e2e, ds41-step, qwen3moe-e2e, qwen35moe-e2e; `gate-gpu-qwen4exp-e2e` red
+  on its H5 window — Body38 refuses `select(1)` after a failed two-slot pass while a verify waits for its commit (an
+  engine-owner question: should the poison path clear that wait). Also open: a poisoned tier that refuses after a
+  launch without `release_all` hangs the card wait (reached only after a named device fault on a host-tier load).
+- **q36rows** (line2): Qwen3.6 one pass (`Body35` gains `SlotRows`); red at 10-06 03:49; tree kept.
+- **promptseat41** (line1): V4.1 opts into the prompt quantum at the window ring's rows (`Body::ring_rows`, 128);
+  Mac green and the round-ledger trio green on base `14912d3d`; conflicts with stgseat2 in
+  `serve_seats/ds41.rs`, `ds41_serve_levers.rs` and the ds41 schema (both add `BLOOMERY_STEP_STATS` wiring); box proof
+  (q1 residency off, q2 default, the mutant) not run. Tree `bloomery-promptseat41`.
+- **glmbpdef** `830e69f9` (line3): GLM `--place bp` when the tier holds ≥ E* = 526 experts — lands only if the glmbp
+  sitting's lower bounds clear 0.
+- **glmresdiag** (line3): GLM's wiring of the shared residency diagnosis, and the A6000 margin run at positions 20/12.
+- **visinj / visserve** (line1): V4.1 vision V3a/V3b and V4b; GLM continuations from their `*-spec-c.md`.
+- **detinv** (line1): placement-invariant expert arithmetic, the card mirroring the host qdot (q8_K x, q8_2_x4 h, the
+  host sum order) and one int64 fixed-point combine owner — +0.2 % centre, +1.2 % worst [derived], size L.
+- **qualmig** (line2): glm/ds41 `step_slots` and the GLM/qwen38 `pass_slots` onto the rounds helpers.
+- GLM's sampled rows in one pass (a zero-proposal window; four owners) — design after 0.2.1.
+
+**census021's outside items** (`c7eb555e` lines): the elastic-park code is dead (`crates/gpu-gates/src/bind.rs:424-551`,
+`:711-714`, `:1047-1053`, its tests `:2215-2288`; delete or re-point, M); the turns half of the serve worker
+(`crates/serve/src/swap.rs:66`, `crates/serve/src/worker.rs:721-1169`) is reachable only from `tests/slots`
+(keep-or-cut, L); `bind.rs:759-764` still lists landed seats as future (S); the qwen3 seat's `load`/`listening`
+records carry no `total` (`serve_seats/qwen3.rs:652-663`, S); qwen38's `BreakEven::of` stands `PLAIN_TPS` in for the
+prompt rate under `--place bp` (`serve_seats/qwen38.rs:327-338`, S/M); the decide seat answers `--parallel` with a
+generic `unknown argument` (`serve_seats/decide.rs:182`, S).
+
+### 0.2.1 준비 회차 (10-03~04, 리드 — superseded by the cut above)
 
 **착지 전부(main `da00c5d4`까지, 각 트랙 리드 검증 후 ff-머지·푸시·track 청소):**
 
