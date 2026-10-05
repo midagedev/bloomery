@@ -80,11 +80,11 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
 The plain tarball, when you want to lay it down yourself:
 
 ```sh
-tar -xzf bloomery-0.2.0-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.0-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.2.1-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.1-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-[bloomery 0.2.0](https://github.com/midagedev/bloomery/releases/tag/v0.2.0) · [all releases](https://github.com/midagedev/bloomery/releases)
+[bloomery 0.2.1](https://github.com/midagedev/bloomery/releases/tag/v0.2.1) · [all releases](https://github.com/midagedev/bloomery/releases)
 
 From source: [`docs/BUILD.md`](docs/BUILD.md) (Linux x86-64, CUDA 13.3, LLVM/Clang 21, `cargo-oxide` from our
 cuda-oxide fork).
@@ -118,21 +118,19 @@ curl -s http://127.0.0.1:8080/v1/systemone -d '{"state": "User: what is the weat
     "criteria": {"web_search": "Look something up online", "calculator": "Do arithmetic", "none": "Answer directly"}}}}'
 ```
 
-**Concurrent requests.** Every seat takes `--parallel N`. On a qwen3moe file (Qwen3-30B and its kin), whole on
-the card or placed with its routed experts partly on the CPU, and on every Qwen3.8 load the N slots are resident
-sequences inside the one model: each running request decodes one token (on Qwen3.8 one drafted pass) a round, so
-the streams flow together, and each answers its solo run's tokens exactly — the draft's state parks with its slot on
-every switch, so a Qwen3.8 stream's speculative decoding is its own. The context is split as llama-server splits it
-with `-np N` and no `-kvu`: `--ctx-size` (or the automatic choice) is the total, each slot holds `total / N` rows;
-unset, `--parallel` is 2, and `--parallel 1` keeps one sequence with the whole context. A placed load makes its plan
-at the total, so the slots' caches together never pass the cache the plan counts. On Qwen3.8 a total a slot's share
-of which the card cannot hold is refused by name, and `--park-ram` with it is too — resident slots hold their state
-on the card, in the plan. The ds41 and glm seats and a qwen35moe file still take turns of 64 tokens on one sequence:
-a later arrival preempts at the next step, and both answer their solo runs' tokens exactly — V4.1 and GLM by
-snapshot/resume (their MTP drafts rejoining), the qwen35moe file by re-prefill. Unset, the ds41 and glm seats size
-the slots to what the park budget holds of one slot's whole-context state (a `parallel` line on stderr names the
-rule, the slots and each term; never below one, and `--parallel 1` keeps the plain engine). Their N slots share one
-context-sized cache in turns.
+**Concurrent requests.** Every generative seat takes `--parallel N` (unset, 2). The N slots are resident sequences
+inside the one model, switched by pointer exchange: nothing parks, and each round advances every busy slot by one
+token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
+all of them: on a whole-card Qwen3-30B, on V4.1 (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
+request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows). A
+placed Qwen3-30B (`--place a`), Qwen3.6, a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
+lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
+fixed expert placement every request answers its solo run's tokens exactly; under adaptive residency the placement
+follows every stream's passes (see [Limits](#limits)). The context splits as llama-server splits it with `-np N` and
+no `-kvu`: `--ctx-size` (or the automatic choice) is the total and each slot holds `total / N` rows, except on V4.1,
+where every slot holds the whole context; `--parallel 1` keeps one sequence with the whole context. The plan counts
+every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by name. A new
+request's prompt runs in one call between rounds, and the other streams wait for it.
 
 **Small cards.** Qwen3.6 and Qwen3-30B at `Q4_K_M` (19-21 GB) run whole on a 24 GB card, or on a 12-16 GB card
 with `--place a`: the routed experts go to the CPU. With no `--place` at all, a file that does not fit the
@@ -293,9 +291,15 @@ text. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
 - **sm_86+** GPUs; the prebuilt archive carries sm_86 PTX.
 - One model a server; one expert tier card at most (`--place bp`).
-- Streams flow together only on a qwen3moe file (whole-card or placed) and on Qwen3.8 so far; the other seats'
-  `--parallel` slots take turns of 64 tokens. The decide seat serves one request at a time; DSpark drafts never
-  rejoin — `--parallel > 1` with `BLOOMERY_DRAFT=dspark` is refused by name.
+- Concurrent streams run as one pass on a whole-card Qwen3-30B, on V4.1, GLM-5.3 and Qwen3.8; a placed Qwen3-30B,
+  Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
+  streams wait. The decide seat serves one request at a time; DSpark drafts never rejoin — `--parallel > 1` with
+  `BLOOMERY_DRAFT=dspark` is refused by name.
+- With adaptive residency on, a request's tokens follow the placement its passes ran on, and the placement follows
+  the history of passes (the requests before it and the streams beside it): the same history gives the same tokens
+  bit for bit, another history can reword an answer at a near tie, since an expert on the card and the same expert
+  on the host round their activations differently. `POST /residency/reset` returns to the load's placement;
+  `BLOOMERY_RESIDENCY=off` gives repeatable tokens at residency's cost in speed.
 - Clef takes text states only, and reads backbone weights of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 (not the IQ
   types, Q2_K, Q4_0 or Q4_1).
 - V4.1 decode is bound by host memory bandwidth in each step's expert part, and by the card's own serial work
