@@ -60,6 +60,16 @@
 #                10.0 ms a pass) and `ratio pass d=6 ours/ours@STUB_GEN_PASSES=5 mean 0.8000`, the passes a second
 #                80 / 100, beside the decode ratio 1.0000 the two arms' equal tok/s give.
 #   mtp-pass-bad STUB_GEN_MTP=1 STUB_GEN_PASSES=0, 6: a SMOKE line with passes=0 is a FAIL row naming it, rc 1.
+# The aggregate arm (the runner's <D>@BLOOMERY_GEN_SLOTS=N; red on the runner before it, which refuses the
+# name as no registry row or reads the arm as a plain lever arm):
+#   slots        6 6@BLOOMERY_GEN_SLOTS=2, two rounds: the aggregate arm fed 12 ids in a load of its own, its
+#                row `tok/s(aggregate) 250.00 @ n=2·3` (2 positions a round, 3 rounds at 8 ms), its means line
+#                beside the plain one's `(aggregate of 2 slots)`, one `ratio slots d=6
+#                ours@BLOOMERY_GEN_SLOTS=2/ours mean 1.2500` and no `ratio d=` line for the pair; rc 0.
+#   slots-pos    a round of 1 position in the 2-slot arm (STUB_GEN_SLOTS_POS=1): a FAIL row naming it, rc 1.
+#   slots-leak   kind=slots records from the plain arm 6 (STUB_GEN_SLOTS_LEAK=2): a FAIL row naming it, rc 1.
+#   slots-none   the 2-slot arm printing the plain lines (STUB_GEN_SLOTS_NOPASS=1, a binary that ignored the
+#                lever): a FAIL row naming the missing records, rc 1.
 #   res-sums     generate_qwen3moe's schema with the residency kinds (the stub tree's copy, its own residency
 #                rows replaced by generate_ds41's), STUB_GEN_RES=mid-p148-s1, 6@BLOOMERY_RESIDENCY=mid-p148-s1: the row's
 #                `residency mid-p148-s1 (set) passes 3 kept 30 landed 3 late 1 made 3 bytes 12288` (the none and
@@ -312,6 +322,10 @@ touch "$T/Cargo.toml"
 # none). A variable named `place` in its environment ends it at rc 9. Its load line names no cards, as
 # generate_qwen3moe's does not; under STUB_GEN_CARDS_ON=1 it names the cards its --place loads (`cards=`:
 # the A6000 under a or none, STUB_GEN_CARDS_A in their stead; the 3090 under gate; both under bp).
+# Under BLOOMERY_GEN_SLOTS=N (N >= 2, or STUB_GEN_SLOTS_LEAK=N on any arm) each arm is N slots of depth / N
+# ids: their step, time prompt and tokens lines tagged `slot=<j>`, a `capture slots=` line, each round a
+# `time pass … kind=slots` at 8 ms of N positions (STUB_GEN_SLOTS_POS in its stead), and the slots' SMOKE
+# footer; STUB_GEN_SLOTS_NOPASS=1 prints the plain lines instead.
 cat > "$T/target/release/generate_qwen3moe" << 'EOF'
 #!/usr/bin/env bash
 if printenv place > /dev/null; then
@@ -361,6 +375,20 @@ for k in "${!arms[@]}"; do
     touch "$mark"
     echo "error: the stub refuses depth $depth once" >&2
     exit 3
+  fi
+  ns=${STUB_GEN_SLOTS_LEAK:-$(printenv BLOOMERY_GEN_SLOTS)}
+  if [ "${ns:-1}" -gt 1 ] && [ -z "${STUB_GEN_SLOTS_NOPASS:-}" ]; then
+    w=$((depth / ns))
+    for j in $(seq 0 $((ns - 1))); do echo "step 0 $((w - 1)) 1000 slot=$j (stub)"; done
+    echo "capture slots=$ns rows=1 graph_nodes=826"
+    for j in $(seq 0 $((ns - 1))); do echo "time prompt n=$w ms=100.0000 tok/s=$((w * 10)).00 passes=1 kind=gemm slot=$j"; done
+    for i in $(seq 1 $((n - 1))); do
+      for j in $(seq 0 $((ns - 1))); do echo "step $i $((w + i - 1)) $((1000 + i)) slot=$j"; done
+      echo "time pass $i ms=8.0000 positions=${STUB_GEN_SLOTS_POS:-$ns} kind=slots"
+    done
+    for j in $(seq 0 $((ns - 1))); do echo "tokens [$(seq -s ', ' 1000 $((1000 + n - 1)))] slot=$j"; done
+    echo "SMOKE mode=graph prompt_tokens=$w depth=$w slots=$ns generated=$n warm=0 rounds=$((n - 1)) positions=$(((n - 1) * ns)) p50_ms=8.0000 mean_ms=8.0000 tok/s(aggregate)=$((ns * 125)).00 ctx=$ctx"
+    continue
   fi
   echo "step 0 $depth 1000 (stub)"
   echo "time prompt n=$depth ms=100.0000 tok/s=$((depth * 10)).00 passes=1 kind=gemm"
@@ -1134,6 +1162,47 @@ elif want mtp-pass-bad "$L" 1 "^FAIL r1 ours d=6 rc=0 \| its SMOKE line carries 
   pass mtp-pass-bad
 fi
 
+# The aggregate arm: the plain arm at 5 ms a step (1000 / 5 = 200 tok/s) and the 2-slot arm at 8 ms a round
+# of 2 positions over its 3 rounds (2 · 3 · 1000 / 24 = 250 tok/s): 250 / 200 = 1.2500 in each round.
+L=$tmp/slots.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=2 -- 6 6@BLOOMERY_GEN_SLOTS=2
+if [ "$RC" != 0 ]; then
+  fail slots "rc $RC, want 0" "$L"
+elif ! grep -qx '12 ' "$tmp/tmp/stub-gen-loads"; then
+  fail slots "no process fed the aggregate arm's 12 ids: $(paste -sd'|' - < "$tmp/tmp/stub-gen-loads")" "$L"
+elif want slots "$L" 2 '^ROW r[12] ours@BLOOMERY_GEN_SLOTS=2 d=6 n=4 ctx=256 \| tok/s\(aggregate\) 250\.00 @ n=2·3, depth 6, [^|]* \| slots 2 \| tok/s\(per stream, mean\) 125\.00 \| p50 8\.0000 ms/pass \| mean 8\.0000 ms/pass \| .* \| nodes 826 \| ' &&
+  want slots "$L" 1 '^mean ours@BLOOMERY_GEN_SLOTS=2 d=6 +250\.00 tok/s  \[250\.00\.\.250\.00, spread 0\.00%\]  \(aggregate of 2 slots\) \(n=2\)' &&
+  want slots "$L" 1 '^mean ours d=6 +200\.00 tok/s ' &&
+  want slots "$L" 1 '^ratio slots ' &&
+  want slots "$L" 1 '^ratio slots d=6 +ours@BLOOMERY_GEN_SLOTS=2/ours +mean 1\.2500 ± 0\.0000 \(n=2\)  of means 1\.2500  per round: r1 1\.2500 r2 1\.2500 ' &&
+  want slots "$L" 0 '^ratio d=6 .*GEN_SLOTS'; then
+  pass slots
+fi
+L=$tmp/slots-pos.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_SLOTS_POS=1 -- 6@BLOOMERY_GEN_SLOTS=2
+if [ "$RC" != 1 ]; then
+  fail slots-pos "rc $RC, want 1" "$L"
+elif want slots-pos "$L" 1 '^FAIL r1 ours@BLOOMERY_GEN_SLOTS=2 d=6 rc=0 \| 3 of its 3 counted kind=slots records hold positions other than its 2 slots' &&
+  want slots-pos "$L" 0 '^ROW '; then
+  pass slots-pos
+fi
+L=$tmp/slots-leak.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_SLOTS_LEAK=2 -- 6
+if [ "$RC" != 1 ]; then
+  fail slots-leak "rc $RC, want 1" "$L"
+elif want slots-leak "$L" 1 '^FAIL r1 ours d=6 rc=0 \| its output holds 3 time pass record\(s\) of kind=slots and the arm names no BLOOMERY_GEN_SLOTS' &&
+  want slots-leak "$L" 0 '^ROW '; then
+  pass slots-leak
+fi
+L=$tmp/slots-none.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 STUB_GEN_SLOTS_NOPASS=1 -- 6@BLOOMERY_GEN_SLOTS=2
+if [ "$RC" != 1 ]; then
+  fail slots-none "rc $RC, want 1" "$L"
+elif want slots-none "$L" 1 '^FAIL r1 ours@BLOOMERY_GEN_SLOTS=2 d=6 rc=0 \| the arm runs BLOOMERY_GEN_SLOTS=2 and printed no counted time pass record of kind=slots' &&
+  want slots-none "$L" 0 '^ROW '; then
+  pass slots-none
+fi
+
 L=$tmp/warm.log
 stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_WARM_ROWS=1 STUB_COLD_GEN=4:2 'STUB_COLD_BENCH=tg4 @ d6:2' -- 6 4 lcpp:6
 want_seq="PRIME r1 ours d=6
@@ -1162,7 +1231,7 @@ if [ "${DEPTH_QWEN3MOE_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/rotate.log "$tmp"/rotate-dry.log "$tmp"/mrs-noiter.log "$tmp"/warmup-rotate.log \
     "$tmp"/blocks.log "$tmp"/order-bad.log "$tmp"/warmup-bad.log "$tmp"/blocks-dry.log "$tmp"/ref-fail.log \
     "$tmp"/discard-fail.log "$tmp"/discard-nofit.log "$tmp"/warmup-fail.log "$tmp"/group-fail.log "$tmp"/twocard*.log \
-    "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/cpu-guard.log "$tmp"/warm.log; do
+    "$tmp"/srv*.log "$tmp"/place-*.log "$tmp"/mtp*.log "$tmp"/slots*.log "$tmp"/cpu-guard.log "$tmp"/warm.log; do
     echo "--- ${L##*/}"
     cat "$L"
   done

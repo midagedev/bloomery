@@ -64,6 +64,24 @@
 #             order and round 1's load command lines (`env NAME=VALUE ...` first), then exits 0 before the card, the binaries and the lease (it runs on the Mac);
 #             `--self-test` runs it on fixed arms, on the Mac. check-recipes does not run it: a script it
 #             names that calls lease_take makes gate-batch.sh refuse the check as a timed recipe.
+#   <D>@BLOOMERY_GEN_SLOTS=N[,NAME=VALUE...]  (and prose:<P>@BLOOMERY_GEN_SLOTS=N…) a lever arm read
+#             as an aggregate row: generate_qwen3moe decodes N streams in one pass (the lever's row in
+#             crates/levers/src/registry.rs). The arm feeds N·D ids — lcg_prompt N·D, whose first D are
+#             the <D> arm's prompt and the rest the walk's next ids, or the corpus's first N·P — which the
+#             binary cuts into N windows of D, window j prefilled into slot j; its `[parse]` line ends in
+#             `slots=N feed=N·D`. Its row reads the counted (`warm` left out) `time pass … kind=slots`
+#             records through records.py: `tok/s(aggregate) <Σ positions · 1000 / Σ ms> @ n=N·<rounds>,
+#             depth D, <card>`, then `slots N`, the per stream rate and the SMOKE footer's p50 and mean
+#             ms a pass; `nodes` is the captured pass's (`capture slots=`). The per-arm means hold it
+#             beside the plain arm, `(aggregate of N slots)`; it stays out of the `ratio d=` and prose
+#             tables, and `ratio slots d=` is its aggregate over its plain twin's tok/s per round — the
+#             twin is its label less the BLOOMERY_GEN_SLOTS item (ours, ours@prose, ours@<the rest>) — so
+#             above 1 N streams in one pass outrun one stream. Refused by name before anything runs: an N
+#             that is not a whole number, N·D past the 20000 ids one argument holds, N·P past the corpus,
+#             and BLOOMERY_GEN_SLOTS in the runner's own environment (an arm names its own). A FAIL row: a
+#             slots arm with no counted kind=slots record or one whose positions is not N, and a kind=slots
+#             record from an arm that names no N. N = 1 is a plain lever arm. The binary refuses N past a
+#             pass's rows, a qwen35moe or qwen4exp file and a placed load by name (a FAIL row here).
 #   prose:<P>[@NAME=VALUE[,NAME=VALUE...]]  ours fed the first P ids of
 #            $BLOOMERY_DATA/$MODEL_NAME/corpus-prose.ids (the profile's own prose corpus, one id a line —
 #            the file its d1k reference set is cut from) through --tokens instead of the LCG prompt, the
@@ -497,6 +515,20 @@ q3_self_test() {
   run_parse -- --registry "${TMPDIR:-/tmp}/q3arm-registry.$$.rs" 6@BLOOMERY_THREADS=8
   rm -f "${TMPDIR:-/tmp}/q3arm-registry.$$.rs"
   want registry-shape 2 "1 LeverSpec rows, 0 read with a name and a site"
+  # The aggregate arm (the header's <D>@BLOOMERY_GEN_SLOTS=N): a lever arm whose load feeds N·D ids, in a
+  # load of its own; N = 1 a plain lever arm; each refusal by name.
+  run_parse -- 6 6@BLOOMERY_GEN_SLOTS=2 6@BLOOMERY_GEN_SLOTS=1
+  want slots-arm 0 \
+    "[parse] 6@BLOOMERY_GEN_SLOTS=2: kind=ours depth=6 label=ours@BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=$bin|ctx=256|BLOOMERY_GEN_SLOTS=2 slots=2 feed=12" \
+    "[parse] 6@BLOOMERY_GEN_SLOTS=1: kind=ours depth=6 label=ours@BLOOMERY_GEN_SLOTS=1 env=BLOOMERY_GEN_SLOTS=1 load=$bin|ctx=256|BLOOMERY_GEN_SLOTS=1" \
+    "[parse] load: env BLOOMERY_GEN_SLOTS=2 $bin --arm <lcg_prompt 12> -n 96 --ctx 256 --time --arm-sync" \
+    "[parse] load: env BLOOMERY_GEN_SLOTS=1 $bin --arm <lcg_prompt 6> -n 96 --ctx 256 --time --arm-sync"
+  run_parse -- 6@BLOOMERY_GEN_SLOTS=x
+  want slots-count 64 "BLOOMERY_GEN_SLOTS=x is no slot count"
+  run_parse -- 10001@BLOOMERY_GEN_SLOTS=2
+  want slots-cap 64 "feeds 2 slots × 10001 = 20002 ids, past the 20000"
+  run_parse BLOOMERY_GEN_SLOTS=2 -- 6
+  want slots-env 64 "BLOOMERY_GEN_SLOTS=2 is set in the runner's own environment"
   # The prose arms (the header's prose:<P>): the grammar and the load it shares with an lcg arm of
   # the same C against a temp corpus in this self-test's own temp dir, then every refusal.
   local pt
@@ -523,6 +555,13 @@ q3_self_test() {
   want prose-nofile 2 "no prose corpus at $pt/none/qwen3moe/corpus-prose.ids"
   run_parse BLOOMERY_DATA="$pt/data" -- prose:702
   want prose-past 64 "a prose prompt of 702 ids; $pt/data/qwen3moe/corpus-prose.ids holds 701 (1..701)"
+  # An aggregate prose arm feeds the corpus's first N·P ids, the plain prose arm's P first.
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:4 prose:4@BLOOMERY_GEN_SLOTS=2
+  want prose-slots 0 \
+    "[parse] prose:4@BLOOMERY_GEN_SLOTS=2: kind=ours depth=4 label=ours@prose@BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=$bin|ctx=256|BLOOMERY_GEN_SLOTS=2 corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102 slots=2 feed=8" \
+    "[parse] load: env BLOOMERY_GEN_SLOTS=2 $bin --arm <prose_prompt 8> -n 96 --ctx 256 --time --arm-sync"
+  run_parse BLOOMERY_DATA="$pt/data" -- prose:400@BLOOMERY_GEN_SLOTS=2
+  want prose-slots-past 64 "a prose prompt of 800 ids (2 slots × 400); $pt/data/qwen3moe/corpus-prose.ids holds 701 (1..701)"
   run_parse BLOOMERY_DATA="$pt/data" -- prose:0
   want prose-zero 64 "a prose prompt of 0 ids; $pt/data/qwen3moe/corpus-prose.ids holds 701 (1..701)"
   run_parse BLOOMERY_DATA="$pt/bad" -- prose:6
@@ -630,6 +669,12 @@ esac
 case $GEN_CTX in
   *[!0-9]* | 0) echo "depth-qwen3moe.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
 esac
+# The aggregate arm's lever is an arm's own (the header's <D>@BLOOMERY_GEN_SLOTS=N): set here it would
+# reach every ours arm, whose plain rows would read a per stream rate under the label `ours`.
+if [ -n "${BLOOMERY_GEN_SLOTS+x}" ]; then
+  echo "depth-qwen3moe.sh: BLOOMERY_GEN_SLOTS=$BLOOMERY_GEN_SLOTS is set in the runner's own environment, which every arm inherits: name it per arm (<D>@BLOOMERY_GEN_SLOTS=N), whose row reads the aggregate" >&2
+  exit 64
+fi
 # The fault witness, the cold tag, ROW_TAG, the order's blocks and the FAIL rows: shared with
 # depth-ds41.sh. A failed arm's whole output goes to
 # ${TMPDIR:-/tmp}/depth-qwen3moe-<label>-<d|p><key>-r<round>.log.
@@ -660,6 +705,8 @@ A_PLACE=() A_PLACE_SET=()
 # A prose arm's prompt, the corpus's first P ids comma-separated as --tokens takes them (empty for
 # every other arm); under --parse-arms the placeholder `<prose_prompt P>` its load lines print.
 A_TOK=()
+# An aggregate arm's N (the header's <D>@BLOOMERY_GEN_SLOTS=N, N >= 2; empty for every other arm).
+A_SLOTS=()
 arm_usage() {
   echo "depth-qwen3moe.sh: arm '$1' is <D>, <D>@NAME=VALUE[,NAME=VALUE...], prose:<P>[@NAME=VALUE,...], ik:<D>, ikdef:<D>, lcpp:<D>, lcppfit:<D>, mrs:<D>, mrspa0:<D>, ikpp[<U>]:<P>, lcpppp[<U>]:<P>, lcppppfit[<U>]:<P>, mrspp:<P>, lcppsrv[fit]:<D>, lcppsrvpp[fit][<U>]:<P> or bin:<path>:<D>" >&2
   exit 64
@@ -672,7 +719,7 @@ arm_refuse() {
 # reference set is cut from. PROSE_N, its line count, is read once, when the first prose arm names it.
 PROSE_N=
 corpus_file() { echo "${BLOOMERY_DATA:-}/$MODEL_NAME/corpus-prose.ids"; }
-# corpus_check <arm> <P>: the corpus file's checks, each refusal by name before anything runs: the
+# corpus_check <arm> <P> [<note>]: the corpus file's checks, each refusal by name before anything runs: the
 # file readable, P within 1..its line count, and every one of its first P lines one id. Under
 # --parse-arms a file that is not readable (the box's path, read on the Mac) is named on the arm's
 # line, not refused: a run reads it, and refuses.
@@ -686,7 +733,7 @@ corpus_check() {
   fi
   [ -n "$PROSE_N" ] || PROSE_N=$(($(wc -l < "$file")))
   if [ "$2" -lt 1 ] || [ "$2" -gt "$PROSE_N" ]; then
-    arm_refuse "$1" "a prose prompt of $2 ids; $file holds $PROSE_N (1..$PROSE_N)"
+    arm_refuse "$1" "a prose prompt of $2 ids${3:+ ($3)}; $file holds $PROSE_N (1..$PROSE_N)"
   fi
   bad=$(head -n "$2" "$file" | grep -nvE '^[0-9]+$' | head -n 1)
   if [ -n "$bad" ]; then
@@ -723,6 +770,25 @@ split_at() {
     place_refuse "$1" "place=$APLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)"
   fi
 }
+# arm_slots <arm> <lever list>: an aggregate arm's N into ASLOTS (the header's <D>@BLOOMERY_GEN_SLOTS=N),
+# empty when the list names none or N = 1 (a plain lever arm); an N that is not a whole number is refused
+# by name, the feed being N·D ids. Its range is the binary's (at_main refuses it by name).
+arm_slots() {
+  local e
+  local -a kv=()
+  ASLOTS=''
+  [ -z "$2" ] || IFS=, read -r -a kv <<< "$2"
+  for e in ${kv[@]+"${kv[@]}"}; do
+    case $e in BLOOMERY_GEN_SLOTS=*) ASLOTS=${e#*=} ;; esac
+  done
+  case $ASLOTS in
+    '') return 0 ;;
+    0* | *[!0-9]*) arm_refuse "$1" "BLOOMERY_GEN_SLOTS=$ASLOTS is no slot count (a whole number from 1, no leading zero), and the arm feeds N·D ids" ;;
+  esac
+  [ "$ASLOTS" != 1 ] || ASLOTS=''
+}
+# arm_feed <i>: the ids arm <i> feeds: its depth, N·D for an aggregate arm.
+arm_feed() { echo $((A_DEP[$1] * ${A_SLOTS[$1]:-1})); }
 # A prefill arm's engine (ikpp[<U>], lcpppp[<U>], lcppppfit[<U>], mrspp), and its ubatch lever U (empty:
 # the default).
 pp_eng() { case $1 in ikpp* | lcpppp* | mrspp) return 0 ;; *) return 1 ;; esac; }
@@ -734,7 +800,7 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 # shellcheck source=tools/ref/lcpp-warm.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS=''
   # `@` is ours only (a <D> arm's or a prose arm's list): split at it first, so a value with a `:` is
   # not read as a reference's arm. place= on a reference arm is refused by name (the header's Placement).
   case ${a%%@*} in
@@ -760,7 +826,7 @@ for a in "${ARMS[@]}"; do
     [ "$dep" -ge 1 ] || { echo "depth-qwen3moe.sh: arm '$a': a server arm sends at least one id" >&2; exit 64; }
     srv_check_arm "$a" || { echo "depth-qwen3moe.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     srv=1
-    A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_IDS+=("$ids") A_ENV+=('') A_TOK+=("$tok")
+    A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_IDS+=("$ids") A_ENV+=('') A_TOK+=("$tok") A_SLOTS+=('')
     A_PLACE+=('') A_PLACE_SET+=('')
     continue
   fi
@@ -793,14 +859,17 @@ for a in "${ARMS[@]}"; do
       label=ours@prose
       case $dep in *@*) split_at "$a" "${dep#*@}" && envs=$ENVS dep=${dep%%@*} label=ours@prose@$AT ;; esac
       case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
-      corpus_check "$a" "$dep"
-      tok=$(corpus_ids "$dep")
+      # An aggregate arm feeds the corpus's first N·P ids, slot j the window j.
+      arm_slots "$a" "$envs"
+      corpus_check "$a" "$((dep * ${ASLOTS:-1}))" "${ASLOTS:+$ASLOTS slots × $dep}"
+      tok=$(corpus_ids "$((dep * ${ASLOTS:-1}))")
       ours=1
       ;;
     *@*)
       kind=ours eng=ours dep=${a%%@*} bin=$BIN label=ours@${a#*@} ours=1
       split_at "$a" "${a#*@}"
       envs=$ENVS
+      arm_slots "$a" "$envs"
       ;;
     *:*)
       case $dep in prose:*) arm_refuse "$a" "prose:<P> is ours on the corpus's first P ids, and ${eng}: is a reference engine, which feeds its own prompt ids" ;; esac
@@ -842,7 +911,11 @@ for a in "${ARMS[@]}"; do
     echo "depth-qwen3moe.sh: our arm '$a' needs 1 <= D <= 20000 (D fed ids in one --tokens argument)" >&2
     exit 64
   fi
-  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok")
+  if [ -n "$ASLOTS" ] && [ $((dep * ASLOTS)) -gt 20000 ]; then
+    echo "depth-qwen3moe.sh: our arm '$a' feeds $ASLOTS slots × $dep = $((dep * ASLOTS)) ids, past the 20000 one --tokens argument holds" >&2
+    exit 64
+  fi
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok") A_SLOTS+=("$ASLOTS")
   # An ours or bin: arm's placement: its place=, else BLOOMERY_GEN_PLACE (empty: no --place, the binary's a).
   if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
@@ -855,9 +928,9 @@ source "${BASH_SOURCE[0]%/*}/load-groups.sh" || exit 2
 LG_FED_RE='^prompt_ids '
 arm_ctx() { echo "${GEN_CTX:-$(((A_DEP[$1] + N + 255) / 256 * 256))}"; }
 # arm_prompt <i>: the prompt ids arm <i> feeds: a prose arm's corpus ids (A_TOK), else the LCG walk of
-# its depth.
+# its feed (arm_feed: its depth, N·D for an aggregate arm).
 arm_prompt() {
-  if [ -n "${A_TOK[$1]}" ]; then printf '%s' "${A_TOK[$1]}"; else lcg_prompt "${A_DEP[$1]}"; fi
+  if [ -n "${A_TOK[$1]}" ]; then printf '%s' "${A_TOK[$1]}"; else lcg_prompt "$(arm_feed "$1")"; fi
 }
 # arm_env_list <i>: the variables arm <i> runs with, comma-separated, the solo marker left out. A
 # list of the marker alone answers the empty string without lg_strip_solo: bash 3.2 (the Mac) reads
@@ -913,6 +986,7 @@ if [ -n "$PARSE_ONLY" ]; then
       if [ -r "$f" ]; then three=$(head -n 3 "$f" | paste -sd, -); else three=-; fi
       extra=" corpus=$f ids=$three"
     fi
+    [ -z "${A_SLOTS[$i]}" ] || extra+=" slots=${A_SLOTS[$i]} feed=$(arm_feed "$i")"
     echo "[parse] ${ARMS[$i]}: kind=${A_KIND[$i]} depth=${A_DEP[$i]} label=${A_LABEL[$i]} env=$(e=$(arm_env_list "$i"); echo "${e:--}") load=${LG_KEY[$i]:-(a process of its own)}$extra"
   done
   echo "[parse] order: $ORDER"
@@ -1270,12 +1344,14 @@ count_row() {
   [ -z "$COLD_TAG" ] || cold_rows=$((cold_rows + 1))
 }
 
-# parse_pp: the `time prompt n=<P> ms=<ms> tok/s=<v> passes=<K> kind=<k>` row of a generate_qwen3moe
-# run on stdin, as `<P> <v> <K> <k> <ms>`; fields after `kind=` are allowed and dropped; nothing when
-# the run printed none (a base tree's build).
-parse_pp() {
-  sed -nE 's/^time prompt n=([0-9]+) ms=([0-9.]+) tok\/s=([0-9.]+|inf) passes=([0-9]+) kind=([a-z]+)( .*)?$/\1 \3 \4 \5 \2/p' | head -n 1
+# pp_rows: every `time prompt n=<P> ms=<ms> tok/s=<v> passes=<K> kind=<k>` row of a generate_qwen3moe
+# run on stdin, as `<P> <v> <K> <k> <ms>`; fields after `kind=` are allowed and dropped (an aggregate
+# arm's ` slot=<j>`: it prints one a slot); nothing when the run printed none (a base tree's build).
+pp_rows() {
+  sed -nE 's/^time prompt n=([0-9]+) ms=([0-9.]+) tok\/s=([0-9.]+|inf) passes=([0-9]+) kind=([a-z]+)( .*)?$/\1 \3 \4 \5 \2/p'
 }
+# parse_pp: the first of them, the one-stream prompt's (an aggregate arm's slot 0).
+parse_pp() { pp_rows | head -n 1; }
 
 # pp_col <arm kind> <output>: an ours or bin arm's prefill column from its run's output, into PP_COL,
 # with the parsed P, tok/s and ms in PP_N, PP_TPS and PP_MS for the closing tables and the timed
@@ -1366,16 +1442,41 @@ ours_post() {
   fi
   # Under BLOOMERY_DRAFT=mtp the `mtp summary` record: E(4), the positions a four-row window kept on
   # average, beside the per-position rate the SMOKE mean already is. Under BLOOMERY_STEP_STATS=1 the
-  # `stat summary` record's host slots a token. Both through records.py, by kind and field.
-  local MK='' MP='' MQ='' HS='' rec lines n_mtp
+  # `stat summary` record's host slots a token. The `time pass` records, an aggregate arm's rounds. All
+  # through records.py, by kind and field.
+  local MK='' MP='' MQ='' HS='' SP_MS='' SP_POS='' SP_KIND='' SP_WARM='' rec lines n_mtp
   if ! rec=$(python3 "$RS_RECORDS" sh --bin generate_qwen3moe - 'MK=mtp_summary.kept' 'MP=mtp_summary.positions' \
-    'MQ=mtp_summary.passes' 'HS=stat_summary_host.host_slots_mean' <<< "$out" 2>&1) ||
+    'MQ=mtp_summary.passes' 'HS=stat_summary_host.host_slots_mean' 'SP_MS=time_pass.ms*' \
+    'SP_POS=time_pass.positions*' 'SP_KIND=time_pass.kind*' 'SP_WARM=time_pass.warm*' <<< "$out" 2>&1) ||
     ! lines=$(python3 "$RS_RECORDS" lines --bin generate_qwen3moe - mtp_summary <<< "$out" 2>&1); then
-    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "records.py did not read its mtp and stat records: $rec${lines:+ $lines}" "$out"
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "records.py did not read its mtp, stat and time pass records: $rec${lines:+ $lines}" "$out"
     return 0
   fi
   n_mtp=$(grep -c . <<< "$lines")
   eval "$rec"
+  # An aggregate arm (the header's <D>@BLOOMERY_GEN_SLOTS=N) reads its rounds from the `time pass …
+  # kind=slots` records: the counted ones (`warm` left out), each of N positions, and every one for the
+  # timed window; an arm that names no N prints none. sl_*: the counted rounds, their positions and ms,
+  # those whose positions is not N, then every kind=slots record and its ms.
+  local nslots=${A_SLOTS[$i]} sl_n sl_pos sl_ms sl_bad sl_all sl_all_ms
+  read -r sl_n sl_pos sl_ms sl_bad sl_all sl_all_ms < <(paste -d' ' <(printf '%s\n' "$SP_MS") <(printf '%s\n' "$SP_POS") \
+    <(printf '%s\n' "$SP_KIND") <(printf '%s\n' "$SP_WARM") | awk -v want="${nslots:-0}" '$3 == "slots" {
+      all++; all_ms += $1
+      if ($4 == "1") next
+      n++; p += $2; ms += $1; if ($2 != want) bad++
+    } END { printf "%d %d %.4f %d %d %.4f\n", n, p, ms, bad, all, all_ms }')
+  if [ -z "$nslots" ] && [ "$sl_all" -gt 0 ]; then
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its output holds $sl_all time pass record(s) of kind=slots and the arm names no BLOOMERY_GEN_SLOTS: its row would read one stream's rate off several" "$out"
+    return 0
+  fi
+  if [ -n "$nslots" ] && [ "$sl_n" = 0 ]; then
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "the arm runs BLOOMERY_GEN_SLOTS=$nslots and printed no counted time pass record of kind=slots: no aggregate to read" "$out"
+    return 0
+  fi
+  if [ -n "$nslots" ] && [ "$sl_bad" -gt 0 ]; then
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$sl_bad of its $sl_n counted kind=slots records hold positions other than its $nslots slots" "$out"
+    return 0
+  fi
   mtp=''
   if [ "$n_mtp" -gt 0 ]; then
     [ -n "$MK" ] && [ -n "$MP" ] && [ -n "$MQ" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its mtp summary record has no kept, positions or passes (kept='$MK' positions='$MP' passes='$MQ')" "$out"; return 0; }
@@ -1407,13 +1508,20 @@ ours_post() {
   nodes=$(echo "$out" | sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p')
   [ -n "$nodes" ] || nodes=$(sed -n 's/^capture graph_nodes=\([0-9]*\).*/\1/p' <<< "${LG_HEADER:-}")
   series=$(echo "$out" | awk '/^time step /{sub(/.*ms=/,""); print}')
+  # An aggregate arm's series are its rounds, its nodes the captured pass's.
+  if [ -n "$nslots" ]; then
+    series=$(paste -d' ' <(printf '%s\n' "$SP_MS") <(printf '%s\n' "$SP_KIND") | awk '$2 == "slots" { print $1 }')
+    nodes=$(echo "$out" | sed -n 's/^capture slots=[0-9]* rows=1 graph_nodes=\([0-9]*\).*/\1/p')
+  fi
   h10=$(echo "$series" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
   t10=$(echo "$series" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
   uniq_tok=$(echo "$out" | awk '/^step / && $2 != 0 {print $4}' | sort -u | wc -l | tr -d ' ')
   tps_mean=$(awk -v m="$mean" 'BEGIN{printf "%.2f", 1e3/m}')
   tps_p50=$(awk -v p="$p50" 'BEGIN{printf "%.2f", 1e3/p}')
-  # The timed window: the prompt's wall and the N generated steps at the mean.
+  # The timed window: the prompt's wall and the N generated steps at the mean; an aggregate arm's, every
+  # slot's prompt and every round.
   win=$(awk -v p="${PP_MS:-0}" -v n="$N" -v m="$mean" 'BEGIN { printf "%.4f", (p + n * m) / 1e3 }')
+  [ -z "$nslots" ] || win=$(echo "$out" | pp_rows | awk -v r="$sl_all_ms" '{ p += $5 } END { printf "%.4f", (p + r) / 1e3 }')
   cold_check "${MAJ_TIMED:-$MAJ_WHOLE}" "$win"
   if [ -n "$MAJ_TIMED" ]; then
     timed=$MAJ_TIMED
@@ -1426,10 +1534,21 @@ ours_post() {
   # The row names its placement: the arm's --place, or a in the two-card mode with none (the binary's).
   local rowplace=${A_PLACE[$i]}
   [ -n "$rowplace" ] || [ -z "$TIMING_CARDS" ] || rowplace=a
-  echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
-  counted || return 0
-  count_row
-  sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
+  if [ -n "$nslots" ]; then
+    # The aggregate: Σ positions · 1000 / Σ ms over the counted rounds; the SMOKE footer's p50 and mean are
+    # a round's, so 1000 / mean is one stream's rate.
+    local agg
+    agg=$(awk -v p="$sl_pos" -v ms="$sl_ms" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$sl_n, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
+    counted || return 0
+    count_row
+    sums+=("$label|$dep|$r|$agg||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG|$nslots")
+  else
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(mean) $tps_mean @ n=$N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | p50 $p50 ms | mean $mean ms | tok/s(p50) $tps_p50 | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
+    counted || return 0
+    count_row
+    sums+=("$label|$dep|$r|$tps_mean|$tps_p50|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
+  fi
   [ -z "$pps" ] || pass_sums+=("$label|$dep|$r|$pps|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG")
   res_sums_add "$label" "$dep" "$r"
@@ -1578,11 +1697,12 @@ arm_block() {
 # arm_draws <i>: how many token ids arm <i>'s process takes: a llama-bench arm's std::rand() draws at
 # -r 1 (mainline: 2P for a pp arm, whose warm-up is the whole prompt, and D + N + 3 for a decode arm;
 # ik: P + 1 and D + N + 4, or N + 3 at D = 0: its warm-up prompt is 1 token), a mistral.rs arm's ids
-# over its warm-up request and its timed one, an ours or bin arm's prompt length.
+# over its warm-up request and its timed one, an ours or bin arm's prompt length (N·D for an aggregate
+# arm).
 arm_draws() {
   local e=${A_ENG[$1]} d=${A_DEP[$1]}
   if [ "${A_KIND[$1]}" != ref ]; then
-    echo "$d"
+    arm_feed "$1"
     return
   fi
   case $e in
@@ -1613,12 +1733,13 @@ dry_cmd() {
   fi
   ctx=$(arm_ctx "$i")
   [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
-  feed="<lcg_prompt $dep>"
+  feed="<lcg_prompt $(arm_feed "$i")>"
   facts=
   if [ -n "${A_TOK[$i]}" ]; then
-    feed="<prose_prompt $dep>"
-    facts=", $dep of the file's ${PROSE_N:-?} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
+    feed="<prose_prompt $(arm_feed "$i")>"
+    facts=", $(arm_feed "$i") of the file's ${PROSE_N:-?} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
   fi
+  [ -z "${A_SLOTS[$i]}" ] || facts+=", ${A_SLOTS[$i]} slots of $dep ids in one pass (an aggregate row)"
   if lg_grouped "$i"; then
     arm_envs "$i"
     echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
@@ -1769,10 +1890,11 @@ echo "    — the cross-engine ratio reads these. The p50 column is ours only. =
 [ ${#sums[@]} -eq 0 ] || printf '%s\n' "${sums[@]}" | awk -F'|' '{
   k = $1 " d=" $2; s[k] += $4; n[k]++; if ($5 != "") { sp[k] += $5; np[k]++ }
   if ($6 ~ /cold/) c[k]++
+  if ($7 != "") agg[k] = $7
   if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
 } END { for (k in s) {
   spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
-  printf "mean %-14s %8.2f tok/s  [%s..%s, spread %.2f%%]  %s (n=%d)  [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, (np[k] ? sprintf("%.2f tok/s(p50)", sp[k] / np[k]) : ""), n[k], c[k], n[k] } }' | sort
+  printf "mean %-14s %8.2f tok/s  [%s..%s, spread %.2f%%]  %s (n=%d)  [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, (np[k] ? sprintf("%.2f tok/s(p50)", sp[k] / np[k]) : (k in agg ? sprintf("(aggregate of %d slots)", agg[k]) : "")), n[k], c[k], n[k] } }' | sort
 echo
 echo "=== ours / reference per depth: each round's ratio of the pair measured in that round (arms"
 echo "    that ran more than once in a round are averaged first), their mean with its 95 % interval"
@@ -1781,13 +1903,37 @@ deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
 # The prose labels have their own table: their prompt is not the one ours and the references ran. A label
 # fed the prose ids is `ours@prose`, `ours@prose@…` or `<server engine>@prose`.
 prose_re='^ours@prose(@|$)|^[^@]+@prose$'
-refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "$prose_re" | sort -u | tr '\n' ' ')
+# The aggregate arms' labels (the header's <D>@BLOOMERY_GEN_SLOTS=N): their own table below, out of these.
+SLOT_LABELS=''
+for i in "${!ARMS[@]}"; do [ -z "${A_SLOTS[$i]}" ] || SLOT_LABELS+="${A_LABEL[$i]}"$'\n'; done
+# not_slots: the labels on stdin less the aggregate arms'.
+not_slots() { awk -v s="$SLOT_LABELS" 'BEGIN { n = split(s, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") x[a[i]] = 1 } !($0 in x)'; }
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "$prose_re" | not_slots | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 0 6
-prose_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "$prose_re" | grep -vx ours@prose | sort -u | tr '\n' ' ')
+prose_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "$prose_re" | grep -vx ours@prose | not_slots | sort -u | tr '\n' ' ')
 if [ -n "$prose_refs" ]; then
   echo
   echo "=== the prose prompt: ours@prose / each arm on the prose ids per P, the same statistics ==="
   printf '%s\n' "${sums[@]}" | ratio_table "ratio prose d=" "$deps" "$prose_refs" 0 6 ours@prose
+fi
+# The aggregate arms: each one's aggregate over its plain twin's tok/s, the label less its
+# BLOOMERY_GEN_SLOTS item (ours, ours@prose, ours@<the rest of its list>), the same statistics.
+if [ -n "$SLOT_LABELS" ]; then
+  echo
+  echo "=== N slots in one pass: each aggregate arm's tok/s (Σ positions / Σ ms of its rounds) over its plain"
+  echo "    twin's tok/s per depth, the same statistics; above 1 the N streams in one pass outrun one stream ==="
+  while IFS= read -r sl; do
+    [ -n "$sl" ] || continue
+    twin=$(awk -v l="$sl" 'BEGIN {
+      at = index(l, "@prose@") ? index(l, "@prose@") + 6 : index(l, "@"); head = substr(l, 1, at - 1); n = split(substr(l, at + 1), kv, ",")
+      for (i = 1; i <= n; i++) if (kv[i] !~ /^BLOOMERY_GEN_SLOTS=/) rest = rest (rest == "" ? "" : ",") kv[i]
+      print head (rest == "" ? "" : "@" rest) }')
+    if ! printf '%s\n' "${A_LABEL[@]}" | grep -qxF -- "$twin"; then
+      echo "ratio slots: $sl has no plain twin $twin among the arms: no ratio"
+      continue
+    fi
+    printf '%s\n' "${sums[@]}" | ratio_table "ratio slots d=" "$deps" "$twin" 0 6 "$sl"
+  done < <(printf '%s' "$SLOT_LABELS" | sort -u)
 fi
 # The pass time of the MTP rows: a row's tok/s is its pass time over E(4), and E(4) moves with the text
 # two builds generate, so a code change is read on the pass time. The records hold passes a second

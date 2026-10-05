@@ -311,6 +311,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.residency(), None);
     assert_eq!(unset.hoststream(), None);
     assert_eq!(unset.lane_prefetch(), LANE_PREFETCH_DEFAULT);
+    assert_eq!(unset.gen_slots(), 1);
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -348,6 +349,7 @@ fn accessors_read_their_rows() {
             (QWEN3_KV, "q8_0"),
             (LANE_PREFETCH, "on"),
             (PREFILL_GROUP, "8"),
+            (GEN_SLOTS, "2"),
         ]),
         Scope::Every,
     )
@@ -376,6 +378,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.qwen3_kv_set(), Some("q8_0"));
     assert_eq!(set.hoststream(), Some(true));
     assert!(set.lane_prefetch());
+    assert_eq!(set.gen_slots(), 2);
     assert_eq!(
         set.host(),
         HostCfg {
@@ -413,7 +416,8 @@ fn accessors_read_their_rows() {
             QWEN38_EXPERTS,
             HOSTSTREAM,
             QWEN3_KV,
-            LANE_PREFETCH
+            LANE_PREFETCH,
+            GEN_SLOTS
         ]
     );
 }

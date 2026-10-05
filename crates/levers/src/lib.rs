@@ -29,10 +29,11 @@ use std::path::{Path, PathBuf};
 mod registry;
 use registry::REGISTRY;
 pub use registry::{
-    CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
-    HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WINDOWS,
-    PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV,
-    QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS, THREADS,
+    CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, GEN_SLOTS_MAX,
+    HOST_LOCK, HOST_POPULATE, HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
+    MTP_HEAD_ROWS, MTP_WINDOWS, PIN_MAIN, PREFILL, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
+    PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SPIN, STEP_STATS,
+    THREADS,
 };
 
 #[cfg(test)]
@@ -855,6 +856,14 @@ impl Levers {
     #[must_use]
     pub fn lane_prefetch(&self) -> bool {
         self.flag(LANE_PREFETCH)
+    }
+
+    /// `BLOOMERY_GEN_SLOTS`: the streams `generate_qwen3moe` decodes in one
+    /// pass, 1 to [`GEN_SLOTS_MAX`].
+    #[must_use]
+    pub fn gen_slots(&self) -> usize {
+        let n = Levers::defaulted(GEN_SLOTS, self.count(GEN_SLOTS));
+        Levers::usize_of(GEN_SLOTS, n)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],

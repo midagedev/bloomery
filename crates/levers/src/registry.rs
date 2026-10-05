@@ -34,6 +34,7 @@ pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
+pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -47,6 +48,10 @@ pub const PREFILL_GROUP_DEFAULT: u64 = 2;
 /// union holds in a binary that does not act on the lever
 /// (`model::ops::lane_prefetch`).
 pub const LANE_PREFETCH_DEFAULT: bool = false;
+
+/// The largest `BLOOMERY_GEN_SLOTS`: one row a slot in a pass of several
+/// slots, which holds at most the pass's eight rows.
+pub const GEN_SLOTS_MAX: u64 = 8;
 
 /// The rounds that convert the levers still read in place.
 const R03: &str = "[03]";
@@ -554,6 +559,26 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               Both write the same bits. `generate_glm5next` acts on it and prints the value \
               the union holds as its `load` record's `lane_prefetch`; every other binary \
               runs the default and refuses the name set.",
+        site: Site::Parsed { left: &[] },
+    },
+    LeverSpec {
+        name: GEN_SLOTS,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: GEN_SLOTS_MAX,
+            trim: false,
+        },
+        default: Unset::Is("1"),
+        doc: "`generate_qwen3moe` on a whole-card qwen3moe file: N streams decoded in one \
+              pass (`GpuModel::step_slots`). Each arm's ids are N windows of equal length, \
+              window j prefilled into slot j; then `-n` − 1 rounds of one pass of a row a \
+              slot, each slot fed its own argmax. Under `--time` a round prints `time pass \
+              <r> ms= positions=N kind=slots` (the depth runner's aggregate row: Σ positions \
+              / Σ ms); every slot's ids print as `step` lines ending in `slot=<j>`. 1 is the \
+              one-sequence run, the same-binary arm. N ≥ 2 is refused by name on a qwen35moe \
+              or qwen4exp file, a placed load, an id count N does not divide, and beside \
+              `--prompt`, `--seed-depth`, `--last-step`, `--logits` and `--dump-taps`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

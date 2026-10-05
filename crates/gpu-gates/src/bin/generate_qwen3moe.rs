@@ -229,6 +229,26 @@
 //! `arm` line, for one line on stdin: the timing runner takes its witness
 //! blocks there. A failed arm ends the process, naming the arm.
 //!
+//! `BLOOMERY_GEN_SLOTS=N` (2 to 8; unset or 1 is the one-sequence run
+//! above) decodes N streams in one pass (`GpuModel::step_slots`) on a
+//! whole-card qwen3moe file. Each arm's ids (`--tokens`, or an `--arm`'s)
+//! are N windows of equal length P, window j prefilled into slot j from its
+//! reset by `--prefill` (in graph mode a slot past 0 captures its prefill
+//! passes first, outside the prefill's wall); the pass of a row a slot is
+//! captured before the rounds (`capture slots=N rows=1 graph_nodes=`), then
+//! `-n` − 1 rounds of one pass follow, each slot fed its own argmax, so
+//! slot j prints the ids `--tokens <window j>` prints alone. Each slot's
+//! `step 0`, `step` lines carry `slot=<j>` after the token, its `time
+//! prompt`, `stat prompt` and `tokens` lines end in it; under `--time` each
+//! round prints `time pass <r> ms= positions=N kind=slots` (the pass and the
+//! N ids' readback, a `warm` round marked) and the `SMOKE` footer names
+//! `slots=`, the counted `rounds=` and `positions=`, the rounds' `p50_ms=`
+//! and `mean_ms=` and `tok/s(aggregate)=`. Refused by name on a qwen35moe or
+//! qwen4exp file (only the qwen3moe body runs a pass of several slots), on a
+//! placed load (`--place`, or the unplaced default's fallback), for an id
+//! count N does not divide, and beside `--prompt`, `--seed-depth`,
+//! `--last-step`, `--logits` and `--dump-taps`.
+//!
 //! `--logits` prints `logits n= argmax= margin= fnv64=` after the `tokens`
 //! line: the head's last logits row, read back once — the argmax's lead over
 //! the best other logit, and the row by its f32 bits (FNV-1a 64).
@@ -344,6 +364,9 @@ mod cli {
     // A Qwen3.8 pass plan is printed by the same cut; its passes are
     // `Prompt38::PASS_ROWS` long.
     const _: () = assert!(Prompt38::PASS_ROWS == MAX_TOKENS);
+
+    // `BLOOMERY_GEN_SLOTS` runs a row a slot, so its most is a pass's rows.
+    const _: () = assert!(bloomery_levers::GEN_SLOTS_MAX == MAX_PASS_ROWS as u64);
 
     /// The last value of flag `name`, if given.
     fn flag(name: &str) -> Result<Option<String>, GateError> {
@@ -908,6 +931,8 @@ mod cli {
         windows: bool,
         /// `--last-step`: the prompt's last id is a step of its own.
         last_step: bool,
+        /// `BLOOMERY_GEN_SLOTS`: the streams an arm decodes in one pass.
+        slots: usize,
     }
 
     /// A prompt call's streaming picks, each with its ubatch, and its end.
@@ -935,6 +960,7 @@ mod cli {
             bloomery_levers::MTP_WINDOWS,
             bloomery_levers::RESIDENCY,
             bloomery_levers::HOSTSTREAM,
+            bloomery_levers::GEN_SLOTS,
         ];
         if std::env::args().any(|a| a == "--place") {
             acts_on.extend(q3place::PLACED_LEVERS);
@@ -987,6 +1013,14 @@ mod cli {
                 return Err(format!(
                     "BLOOMERY_RESIDENCY={word_set} moves a qwen4exp plan's card experts; \
                      --dump-taps runs a qwen3moe file"
+                )
+                .into());
+            }
+            if levers.gen_slots() > 1 {
+                return Err(format!(
+                    "BLOOMERY_GEN_SLOTS={} decodes several streams in one pass; --dump-taps runs \
+                     each prompt one eager step per id",
+                    levers.gen_slots()
                 )
                 .into());
             }
@@ -1060,6 +1094,21 @@ mod cli {
                 })
                 .collect::<Result<_, GateError>>()?
         };
+        let slots = levers.gen_slots();
+        if slots > 1 {
+            slots_refused(
+                slots,
+                family,
+                &[
+                    ("--place", place.is_some()),
+                    ("--prompt", text.is_some()),
+                    ("--seed-depth", seed_depth.is_some()),
+                    ("--last-step", last_step),
+                    ("--logits", logits),
+                ],
+                &arms,
+            )?;
+        }
         for arm in &arms {
             if arm.ids.is_empty() {
                 return Err("the prompt has no ids".into());
@@ -1069,7 +1118,8 @@ mod cli {
                     format!("-n {} leaves no counted step (warm {warm})", arm.n_gen).into(),
                 );
             }
-            let depth = seed_depth.unwrap_or(arm.ids.len());
+            // Under several slots each slot holds one window of the ids.
+            let depth = seed_depth.unwrap_or(arm.ids.len() / slots);
             if depth + arm.n_gen > ctx {
                 return Err(
                     format!("depth {depth} + {} tokens pass --ctx {ctx}", arm.n_gen).into(),
@@ -1229,23 +1279,24 @@ mod cli {
             stats: levers.step_stats(),
             windows: levers.mtp_windows(),
             last_step,
+            slots,
         };
         match chosen {
-            Chosen::Qwen3(path, place) => drive(
-                open_qwen3(
+            Chosen::Qwen3(path, place) => {
+                let m = open_qwen3(
                     file,
                     (ctx, mode),
                     place.map(|p| (p, &levers)),
                     &levers,
                     kv,
                     t,
-                )?,
-                &run,
-                path,
-                &arms,
-                listed,
-                sync,
-            ),
+                )?;
+                if slots > 1 {
+                    drive_slots(m, &run, path, &arms, listed, sync)
+                } else {
+                    drive(m, &run, path, &arms, listed, sync)
+                }
+            }
             Chosen::Qwen35(path, place) => drive(
                 open_qwen35(
                     file,
@@ -2002,20 +2053,7 @@ mod cli {
                 record::residency_reset(&c).print();
             }
             if listed {
-                println!(
-                    "arm i={i} arms={count} ids={} n={}",
-                    arm.ids.len(),
-                    arm.n_gen
-                );
-                if sync {
-                    let mut line = String::new();
-                    if std::io::stdin().read_line(&mut line)? == 0 {
-                        return Err(
-                            format!("--arm-sync: stdin closed before arm {i} of {count}").into(),
-                        );
-                    }
-                }
-                println!("prompt_ids {:?}", arm.ids);
+                arm_head(i, count, arm, sync)?;
             }
             let ran = run_arm(s.model_mut(), run, path, arm);
             after_passes(s.model_mut(), ran)
@@ -2067,20 +2105,7 @@ mod cli {
                 }
             }
             if listed {
-                println!(
-                    "arm i={i} arms={count} ids={} n={}",
-                    arm.ids.len(),
-                    arm.n_gen
-                );
-                if sync {
-                    let mut line = String::new();
-                    if std::io::stdin().read_line(&mut line)? == 0 {
-                        return Err(
-                            format!("--arm-sync: stdin closed before arm {i} of {count}").into(),
-                        );
-                    }
-                }
-                println!("prompt_ids {:?}", arm.ids);
+                arm_head(i, count, arm, sync)?;
             }
             let ran = run_arm38_mtp(&mut s, &mut spec, path, run, arm);
             after_passes(s.model_mut(), ran)?;
@@ -2207,18 +2232,7 @@ mod cli {
             )
             .into());
         }
-        let prefill_ms = prefill_wall.as_secs_f64() * 1e3;
-        println!(
-            "time prompt n={} ms={prefill_ms:.4} tok/s={:.2} passes={} kind={}",
-            ids.len(),
-            ids.len() as f64 * 1e3 / prefill_ms,
-            plan.count,
-            plan.kind
-        );
-        println!(
-            "stat prompt ubatch_tokens={} (no prompt image)",
-            plan.ubatch_tokens
-        );
+        print_prompt(ids.len(), prefill_wall, &plan, None, "");
         let kept = &sink.emitted[..n_gen - 1];
         for (k, &(pos, tok)) in kept.iter().enumerate() {
             println!("step {} {pos} {tok}", k + 1);
@@ -2228,13 +2242,13 @@ mod cli {
             // wall compares with: one a kept position.
             let mut at = 0usize;
             for (i, &(proposed, rows, per, wall)) in sink.passes.iter().enumerate() {
-                let tag = if i < warm { " warm" } else { "" };
-                println!(
-                    "time pass {}{tag} ms={:.4} positions={rows} kind={}",
-                    i + 1,
-                    wall.as_secs_f64() * 1e3,
-                    if proposed { "mtp" } else { "plain" }
-                );
+                Record::new(&record::TIME_PASS)
+                    .u("i", i + 1)
+                    .flag("warm", i < warm)
+                    .f("ms", wall.as_secs_f64() * 1e3)
+                    .u("positions", rows)
+                    .w("kind", if proposed { "mtp" } else { "plain" })
+                    .print();
                 for _ in 0..rows {
                     if at >= n_gen - 1 {
                         break;
@@ -2425,28 +2439,7 @@ mod cli {
                 probes.extend(B::host_probe(m, probes.last())?);
             }
         }
-        let prefill_ms = prefill_wall.as_secs_f64() * 1e3;
-        println!(
-            "time prompt n={} ms={prefill_ms:.4} tok/s={:.2} passes={} kind={}",
-            ids.len(),
-            ids.len() as f64 * 1e3 / prefill_ms,
-            plan.count,
-            plan.kind
-        );
-        match image {
-            Some(w) => println!(
-                "stat prompt ubatch_tokens={} image_bytes={} fill_us={:.1} copy_us={:.1} \
-                 (runtime values)",
-                w.tokens,
-                w.bytes,
-                w.fill.as_secs_f64() * 1e6,
-                w.copy.as_secs_f64() * 1e6
-            ),
-            None => println!(
-                "stat prompt ubatch_tokens={} (no prompt image)",
-                plan.ubatch_tokens
-            ),
-        }
+        print_prompt(ids.len(), prefill_wall, &plan, image, "");
         for (k, &(pos, tok, ms)) in rows.iter().enumerate() {
             let i = k + 1;
             tokens_out.push(tok);
@@ -2505,6 +2498,268 @@ mod cli {
             );
         }
         print_stats(&probes, warm);
+        Ok(())
+    }
+
+    /// A prompt's `time prompt` and `stat prompt` lines: `n` ids in `wall` by
+    /// the units `plan`, and the image its last ubatch wrote; `tag` ends both
+    /// (a slot's ` slot=<j>`, else nothing).
+    fn print_prompt(n: usize, wall: Duration, plan: &Units, image: Option<ImageWrite>, tag: &str) {
+        let ms = wall.as_secs_f64() * 1e3;
+        println!(
+            "time prompt n={n} ms={ms:.4} tok/s={:.2} passes={} kind={}{tag}",
+            n as f64 * 1e3 / ms,
+            plan.count,
+            plan.kind
+        );
+        match image {
+            Some(w) => println!(
+                "stat prompt ubatch_tokens={} image_bytes={} fill_us={:.1} copy_us={:.1} \
+                 (runtime values){tag}",
+                w.tokens,
+                w.bytes,
+                w.fill.as_secs_f64() * 1e6,
+                w.copy.as_secs_f64() * 1e6
+            ),
+            None => println!(
+                "stat prompt ubatch_tokens={} (no prompt image){tag}",
+                plan.ubatch_tokens
+            ),
+        }
+    }
+
+    /// `BLOOMERY_GEN_SLOTS=slots` beside what it does not run with, each
+    /// refused by name: another family's file (only the qwen3moe body runs a
+    /// pass of several slots), each flag of `given` that is set, and an arm
+    /// whose ids `slots` does not cut into windows of one length.
+    fn slots_refused(
+        slots: usize,
+        family: Family,
+        given: &[(&str, bool)],
+        arms: &[Arm],
+    ) -> Result<(), GateError> {
+        let lever = format!("BLOOMERY_GEN_SLOTS={slots}");
+        let other = match family {
+            Family::Qwen3 => None,
+            Family::Qwen35 => Some("qwen35moe"),
+            Family::Qwen38 => Some("qwen4exp"),
+        };
+        if let Some(arch) = other {
+            return Err(format!(
+                "{lever} decodes several streams in one pass of the qwen3moe body \
+                 (`GpuModel::step_slots`); this is a {arch} file, whose body runs no pass of \
+                 several slots"
+            )
+            .into());
+        }
+        if let Some((flag, _)) = given.iter().find(|(_, set)| *set) {
+            return Err(format!(
+                "{lever} decodes several streams, each slot a window of the --tokens or --arm \
+                 ids, on a whole-card load; {flag} does not run with it"
+            )
+            .into());
+        }
+        if let Some((i, arm)) = arms
+            .iter()
+            .enumerate()
+            .find(|(_, a)| a.ids.len() % slots != 0)
+        {
+            return Err(format!(
+                "{lever} cuts each arm's ids into {slots} windows of one length, one a slot; arm \
+                 {i}'s {} ids do not divide by {slots}",
+                arm.ids.len()
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Every arm of the run as `run.slots` streams in one pass
+    /// (`BLOOMERY_GEN_SLOTS`) on the qwen3moe model `m`, in a session over it
+    /// that serves that many slots; `listed` for an `--arm` list, whose arms
+    /// open with their `arm` lines. A placed load (the unplaced default's
+    /// fallback; `--place` is refused before the load) is refused by name:
+    /// its host tier's ports serve one sequence.
+    fn drive_slots(
+        m: Qwen3moeModel,
+        run: &Run,
+        path: PrefillPath,
+        arms: &[Arm],
+        listed: bool,
+        sync: bool,
+    ) -> Result<(), GateError> {
+        if m.body("generate_qwen3moe")?.placed().is_some() {
+            return Err(format!(
+                "BLOOMERY_GEN_SLOTS={}: the load is placed (its plan line names why), and a pass \
+                 of several slots runs a whole-card load: a placed chain's host tier serves one \
+                 sequence",
+                run.slots
+            )
+            .into());
+        }
+        let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
+        s.add_slots(run.slots)?;
+        let count = arms.len();
+        let ran = s.arms(arms, |s, i, arm| {
+            if listed {
+                arm_head(i, count, arm, sync)?;
+            }
+            run_arm_slots(s, run, path, arm)
+        });
+        ran.map_err(|f| Box::new(f) as GateError)?;
+        Ok(())
+    }
+
+    /// One arm as `run.slots` streams in one pass: slot j from its reset
+    /// prefilled with window j of the arm's ids, in graph mode the pass of a
+    /// row a slot captured, then `-n` − 1 rounds, each slot fed its own
+    /// argmax. Every slot's lines from its `step 0` on; the rounds' lines are
+    /// held and written after them.
+    fn run_arm_slots(
+        s: &mut Session<Body>,
+        run: &Run,
+        path: PrefillPath,
+        arm: &Arm,
+    ) -> Result<(), GateError> {
+        let (n, n_gen, warm) = (run.slots, arm.n_gen, run.warm);
+        let windows: Vec<&[u32]> = arm.ids.chunks_exact(arm.ids.len() / n).collect();
+        // Slot 0 stands where the session left it — fresh, or cleared before
+        // this arm; every other slot starts from its reset here.
+        for j in 1..n {
+            s.select_slot(j)?;
+            s.clear()?;
+        }
+        let mut pos0 = Vec::with_capacity(n);
+        let mut next = Vec::with_capacity(n);
+        let mut prompts = Vec::with_capacity(n);
+        for (j, ids) in windows.iter().enumerate() {
+            s.select_slot(j)?;
+            let m = s.model_mut();
+            // A slot's captured prefill passes travel with its sequence, so a
+            // parked slot holds none: captured here, outside the prefill's
+            // wall, as the load captures slot 0's.
+            if j > 0 && run.mode == StepMode::Graph {
+                m.capture_prefill()?;
+            }
+            let plan = <Body as Prompted>::plan(m, ids.len(), path)?;
+            let t = Instant::now();
+            let tok = <Body as Prompted>::prefill(m, ids, path)?;
+            let wall = t.elapsed();
+            let image = <Body as Prompted>::image(m, &plan)?;
+            println!(
+                "step 0 {} {tok} slot={j} (the {} prompt ids in prefill_steps={} units, plan={}, \
+                 {:.2} s, runtime value)",
+                m.pos() - 1,
+                ids.len(),
+                plan.count,
+                plan.text,
+                wall.as_secs_f64()
+            );
+            pos0.push(usize::try_from(m.pos())?);
+            next.push(tok);
+            prompts.push((ids.len(), wall, plan, image));
+        }
+        s.select_slot(0)?;
+        if run.mode == StepMode::Graph && n_gen > 1 {
+            let key: Vec<(usize, usize)> = (0..n).map(|j| (j, 1)).collect();
+            let nodes = s.model_mut().capture_slots(&key)?;
+            println!("capture slots={n} rows=1 graph_nodes={nodes}");
+        }
+        // Every round's line is held and written after the loop: a write is
+        // a syscall, and the rounds it would separate are the measurement.
+        let mut out_ids: Vec<Vec<u32>> = next
+            .iter()
+            .map(|&t| {
+                let mut v = Vec::with_capacity(n_gen);
+                v.push(t);
+                v
+            })
+            .collect();
+        let mut walls: Vec<f64> = Vec::with_capacity(n_gen - 1);
+        for _ in 1..n_gen {
+            let (out, ms) = {
+                let rows: Vec<(usize, &[u32])> = next
+                    .iter()
+                    .enumerate()
+                    .map(|(j, t)| (j, std::slice::from_ref(t)))
+                    .collect();
+                let t0 = Instant::now();
+                let out = s.step_slots(&rows)?;
+                (out, t0.elapsed().as_secs_f64() * 1e3)
+            };
+            if out.ids.len() != n {
+                return Err(format!(
+                    "a pass of {n} slots at a row each gave {} ids",
+                    out.ids.len()
+                )
+                .into());
+            }
+            walls.push(ms);
+            for (ids, &tok) in out_ids.iter_mut().zip(&out.ids) {
+                ids.push(tok);
+            }
+            next = out.ids;
+        }
+        for (j, (len, wall, plan, image)) in prompts.into_iter().enumerate() {
+            print_prompt(len, wall, &plan, image, &format!(" slot={j}"));
+        }
+        for (k, &ms) in walls.iter().enumerate() {
+            let i = k + 1;
+            for (j, (p, ids)) in pos0.iter().zip(&out_ids).enumerate() {
+                println!("step {i} {} {} slot={j}", p - 1 + i, ids[i]);
+            }
+            if run.timed {
+                Record::new(&record::TIME_PASS)
+                    .u("i", i)
+                    .flag("warm", i <= warm)
+                    .f("ms", ms)
+                    .u("positions", n)
+                    .w("kind", "slots")
+                    .print();
+            }
+        }
+        for (j, ids) in out_ids.iter().enumerate() {
+            println!("tokens {ids:?} slot={j}");
+        }
+        if run.timed {
+            let counted = &walls[warm..];
+            let mut sorted = counted.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            let p50 = sorted[sorted.len() / 2];
+            let ms: f64 = counted.iter().sum();
+            let positions = counted.len() * n;
+            println!(
+                "SMOKE mode={} prompt_tokens={} depth={} slots={n} generated={n_gen} warm={warm} \
+                 rounds={} positions={positions} p50_ms={p50:.4} mean_ms={:.4} \
+                 tok/s(aggregate)={:.2} ctx={}",
+                mode_name(run.mode),
+                windows[0].len(),
+                windows[0].len(),
+                counted.len(),
+                ms / counted.len() as f64,
+                positions as f64 * 1e3 / ms,
+                run.ctx
+            );
+        }
+        Ok(())
+    }
+
+    /// An `--arm` list's arm opening: its `arm` line, under `--arm-sync` the
+    /// wait for one line on stdin (the runner's witness block), then its
+    /// `prompt_ids` line.
+    fn arm_head(i: usize, count: usize, arm: &Arm, sync: bool) -> Result<(), GateError> {
+        println!(
+            "arm i={i} arms={count} ids={} n={}",
+            arm.ids.len(),
+            arm.n_gen
+        );
+        if sync {
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line)? == 0 {
+                return Err(format!("--arm-sync: stdin closed before arm {i} of {count}").into());
+            }
+        }
+        println!("prompt_ids {:?}", arm.ids);
         Ok(())
     }
 

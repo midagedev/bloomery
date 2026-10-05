@@ -2652,16 +2652,18 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
 /// `plan`, or before the load on another family and under `--dump-taps`)
 /// and, drafting nothing, why after the `load` line, drafting, its head
 /// after the `load draft=mtp` line; under `--dump-taps`,
-/// after its `load` line; a drafted arm's `mtp summary` and, under
-/// `BLOOMERY_MTP_WINDOWS`, its `mtp window` records after its lines; and
-/// under `BLOOMERY_STEP_STATS`, after a qwen4exp run's lines; the binary's
-/// other lines are its own.
+/// after its `load` line; under `--time`, a drafted arm's passes and a
+/// `BLOOMERY_GEN_SLOTS` arm's rounds as `time pass` records; a drafted arm's
+/// `mtp summary` and, under `BLOOMERY_MTP_WINDOWS`, its `mtp window` records
+/// after its lines; and under `BLOOMERY_STEP_STATS`, after a qwen4exp run's
+/// lines; the binary's other lines are its own.
 pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &PLAN38,
     &LOAD_DRAFT_OFF38,
     &MTP_HEAD38,
     &TAPS_SEQ,
     &TAPS_DUMP,
+    &TIME_PASS,
     &MTP_SUMMARY,
     &MTP_WINDOW,
     &STAT_STEP_HOST,
