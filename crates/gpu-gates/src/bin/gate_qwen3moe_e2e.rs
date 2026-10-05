@@ -151,18 +151,19 @@
 //!   `cuDeviceTotalMem`'s figure) plans where the refusal is expected and
 //!   answers `Whole` where the placed decision is — every arm red.
 //!
-//! - (n) two resident slots (`add_slots`): prompts A and B — two distinct
-//!   windows of the prose, [`N_IDS`] ids each, the pass path — [`GEN_W`]
-//!   greedy steps a slot. Alone, the load's one sequence: each prompt's ids,
-//!   last logits and every layer's K/V rows hashed (FNV-1a 64). Together, a
-//!   second sequence resident: `resident_bytes` grows by exactly one
-//!   `seq_bytes`, the derived per-sequence KV bytes; the two slots stepped
-//!   token-interleaved leave each the bits its alone run left. A reset of
-//!   slot 1 between runs does not move slot 0: its next [`N_STEPS`] ids are
-//!   its alone run's continuation. A fault raised on one slot refuses the
-//!   other's steps naming the slot, and only the faulting slot's own reset
-//!   lifts it; the select refusals name themselves; and both slots hold
-//!   captures after the interleave, none after a `set_mode` round trip.
+//! - (n) two resident slots (`add_slots`) on the slot harness (`slots_gate`,
+//!   through this gate's [`SlotsQ3`]): prompts A and B — two distinct windows
+//!   of the prose, [`N_IDS`] ids each, the pass path — [`GEN_W`] greedy steps
+//!   a slot. The harness's contracts: H1 every slot's ids, last logits, state
+//!   hash and position its solo run's, bit for bit; H3 `resident_bytes` grows
+//!   by exactly one `seq_bytes`, the derived per-sequence KV bytes; H4 a
+//!   reset of slot 1 between runs does not move slot 0 — its next
+//!   [`N_STEPS`] ids are its alone run's continuation; H6 the select and
+//!   add_slots refusals by name; H7 captures held per slot and dropped by a
+//!   `set_mode` round trip. Kept here — the harness's H5 is unwritten, and
+//!   its plant is qwen3's own FFN half: a fault raised on one slot refuses
+//!   the other's steps naming the slot, and only the faulting slot's own
+//!   reset lifts it.
 //!
 //! - (j) one pass of two slots (`GpuModel::step_slots`): prompts A and B
 //!   ([`J_A`], [`J_B`], distinct lengths, the pass path) prefilled each in
@@ -172,8 +173,13 @@
 //!   slot's position and K/V rows, bit for bit the slot's solo run (slot 0
 //!   alone from a reset, the prompt then a step a token); then slot 1 reset
 //!   and prompted again, and one more pass of both slots bit for bit their
-//!   solo steps (a capture replayed across a reset reads the same planes) —
-//!   in graph mode and again in eager mode. (j2) the captured pass of slots 0 and 1 at a
+//!   solo steps (a capture replayed across a reset reads the same planes);
+//!   then `add_slots(3)` — the count two to three, a third sequence
+//!   resident — and the same busy-set pass again, the graph arm replaying
+//!   the capture taken before the `add_slots` (no capture taken anew, the
+//!   cache survives it) and its ids, logits, positions and K/V rows equal
+//!   the eager arm's — in graph mode and again in eager mode. (j2) the
+//!   captured pass of slots 0 and 1 at a
 //!   row each holds the two-row pass of slot 0's nodes plus one slot's
 //!   ([`J_SLOT_LAYER_NODES`] a layer and its embedding), one memcpy a row
 //!   in each; the one-row pass and the difference from it print, with the
@@ -184,7 +190,7 @@
 //!   refused naming the set, slot 0's reset leaves slot 1's standing, both
 //!   resets lift it, and the next pass is the solo runs' first step bit for
 //!   bit. The last clause on the main model: the model it leaves is
-//!   dropped, its second sequence's planes with it. `--one-pass-only` runs
+//!   dropped, its added sequences' planes with it. `--one-pass-only` runs
 //!   the load and (j).
 //!
 //! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
@@ -252,7 +258,7 @@ mod gate {
     use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
-    use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel, Slots};
+    use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::kld::{KldBase, PplModel, score_ppl};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -260,6 +266,7 @@ mod gate {
     use bloomery_gpu_gates::prompts::{
         GreedyClass, GreedyRow, PromptRow, compare_greedy, read_greedy, read_prompts,
     };
+    use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir,
         ik_q8_2, open_split, q8_1_dequant, ref_ints, ref_model_path, ref_tensor_logical_in,
@@ -555,9 +562,13 @@ mod gate {
         ok &= greedy(m, dump.as_deref(), true)?;
         ok &= rope_table(m, CTX)?;
         ok &= fault_layer(m)?;
-        ok &= slots_two(m)?;
-        ok &= one_pass_two_slots(m)?;
+        // (n) drives the slot harness, which loads its own model, and (j)
+        // loads the next: two whole-card models never share the card.
         drop(s);
+        ok &= slots_two()?;
+        let mut m = open(CTX, StepMode::Graph, KvQ8::F16)?;
+        ok &= one_pass_two_slots(&mut m)?;
+        drop(m);
         ok &= ubatch_sizes()?;
         ok &= placed(host)?;
         ok &= q8_cache()?;
@@ -2401,21 +2412,8 @@ mod gate {
     /// every pair of its steps.
     const GEN_W: usize = 48;
 
-    /// The steps the reset-isolation arm of (n) runs on each slot.
+    /// The steps the reset-isolation contract of (n) runs on each slot.
     const N_STEPS: usize = 8;
-
-    /// Prompt `ids` prefilled on the pass path — the model standing wherever
-    /// it stands, so the caller resets — then `steps` greedy steps; the ids
-    /// cover the prefill's argmax and every step's.
-    fn feed_and_step(
-        m: &mut Qwen3moeModel,
-        ids: &[u32],
-        steps: usize,
-    ) -> Result<Vec<u32>, GateError> {
-        let mut out = vec![m.prefill_with(ids, PrefillPath::Pass)?];
-        step_more(m, &mut out, steps)?;
-        Ok(out)
-    }
 
     /// `steps` more greedy steps on the model as it stands, appended to
     /// `out` (its last id the first step's input).
@@ -2437,118 +2435,75 @@ mod gate {
             .value())
     }
 
-    /// (n) (module doc): two resident slots, interleaved.
-    fn slots_two(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
-        m.set_mode(StepMode::Graph);
-        let prose = prose(N_B + N_IDS)?;
-        let (a, b) = (&prose[N_A..N_A + N_IDS], &prose[N_B..N_B + N_IDS]);
-        // Alone, the load's one sequence: A runs GEN_W steps (what the
-        // interleave compares against) and then N_STEPS more (the
-        // continuation the isolation arm compares against); B runs GEN_W.
-        m.reset()?;
-        let mut a_alone = feed_and_step(m, a, GEN_W)?;
-        let a_logits = Fnv1a64::default().f32s(&m.logits()?).value();
-        let a_kv = kv_fnv(m, usize::try_from(m.pos())?)?;
-        step_more(m, &mut a_alone, N_STEPS)?;
-        let a_cont = a_alone[1 + GEN_W..].to_vec();
-        m.reset()?;
-        let b_alone = feed_and_step(m, b, GEN_W)?;
-        let b_logits = Fnv1a64::default().f32s(&m.logits()?).value();
-        let b_kv = kv_fnv(m, usize::try_from(m.pos())?)?;
-        // Together: a second sequence resident, its bytes counted against
-        // the one owner of the per-sequence KV term.
-        let before = m.resident_bytes();
-        m.add_slots(2)?;
-        let seq_bytes = m.body("slots")?.seq_bytes();
-        let grown = m.resident_bytes() - before;
-        let hp = m.body("slots")?.hparams().clone();
-        let derived = m.layers().len()
-            * CTX
-            * usize::try_from(runtime::stores::kv_row_bytes(hp.n_head_kv, hp.head_dim))?;
-        let bytes_ok = grown == seq_bytes && seq_bytes == derived;
-        println!(
-            "slots bytes: the second sequence grew resident_bytes by {grown}, seq_bytes \
-             {seq_bytes}, the derived {} layers x {CTX} rows x kv_row_bytes({}, {}) = {derived} {}",
-            m.layers().len(),
-            hp.n_head_kv,
-            hp.head_dim,
-            verdict(bytes_ok)
-        );
-        // The interleave: each slot prefilled from its own reset, then a
-        // step of slot 0 and a step of slot 1 a round. Each slot's last
-        // logits are hashed inside that round: the head is the model's one,
-        // so a step of the other slot's replaces what it holds.
-        m.select_slot(0)?;
-        m.reset()?;
-        let mut a_ids = vec![m.prefill_with(a, PrefillPath::Pass)?];
-        m.select_slot(1)?;
-        m.reset()?;
-        let mut b_ids = vec![m.prefill_with(b, PrefillPath::Pass)?];
-        let (mut a_last, mut b_last) = (0u64, 0u64);
-        for r in 0..GEN_W {
-            let last = r + 1 == GEN_W;
-            m.select_slot(0)?;
-            let t = *a_ids.last().ok_or("no token")?;
-            a_ids.push(m.step(&[t])?);
-            if last {
-                a_last = Fnv1a64::default().f32s(&m.logits()?).value();
-            }
-            m.select_slot(1)?;
-            let t = *b_ids.last().ok_or("no token")?;
-            b_ids.push(m.step(&[t])?);
-            if last {
-                b_last = Fnv1a64::default().f32s(&m.logits()?).value();
-            }
+    /// (n)'s body for the slot harness ([`slots_gate`]): the whole-card load
+    /// of [`open`] — its plan one sequence, `add_slots` making the rest —
+    /// stream 0 window A and stream 1 window B of the prose, each the pass
+    /// path from a reset (every K/V row the state hash reads below the
+    /// position is a row a call wrote, so a rewind needs no fill).
+    struct SlotsQ3 {
+        a: Vec<u32>,
+        b: Vec<u32>,
+    }
+
+    impl SlotsAdapter for SlotsQ3 {
+        type Body = Body;
+
+        const STEPS: usize = GEN_W;
+        const TAIL: usize = N_STEPS;
+
+        fn open(&self, _slots: usize) -> Result<Qwen3moeModel, GateError> {
+            open(CTX, StepMode::Graph, KvQ8::F16)
         }
-        m.select_slot(0)?;
-        let a_got = (a_last, kv_fnv(m, usize::try_from(m.pos())?)?);
-        m.select_slot(1)?;
-        let b_got = (b_last, kv_fnv(m, usize::try_from(m.pos())?)?);
-        let off: Vec<&str> = [
-            ("slot 0 ids", a_ids == a_alone[..1 + GEN_W]),
-            ("slot 0 logits", a_got.0 == a_logits),
-            ("slot 0 kv", a_got.1 == a_kv),
-            ("slot 1 ids", b_ids == b_alone),
-            ("slot 1 logits", b_got.0 == b_logits),
-            ("slot 1 kv", b_got.1 == b_kv),
-        ]
-        .into_iter()
-        .filter_map(|(name, same)| (!same).then_some(name))
-        .collect();
-        let together_ok = off.is_empty();
-        println!(
-            "slots interleave: {} interleaved steps a slot against its alone run: {} {}",
-            GEN_W,
-            if together_ok {
-                "every slot's ids, logits and K/V rows bit for bit".to_string()
-            } else {
-                format!("differs in {}", off.join(", "))
-            },
-            verdict(together_ok)
-        );
-        // Captures per slot: both hold their own after the interleave.
-        m.select_slot(0)?;
-        let cap0 = m.has_capture();
-        m.select_slot(1)?;
-        let cap1 = m.has_capture();
-        let caps = cap0 && cap1;
-        // Reset isolation: slot 1 rewinds and runs its prompt again; slot
-        // 0's next ids are its alone run's continuation.
-        m.select_slot(1)?;
-        m.reset()?;
-        feed_and_step(m, b, N_STEPS)?;
-        m.select_slot(0)?;
-        let mut a_tail = vec![*a_ids.last().ok_or("no token")?];
-        step_more(m, &mut a_tail, N_STEPS)?;
-        let iso_ok = a_tail[1..] == a_cont[..];
-        println!(
-            "slots reset isolation: slot 1 reset and re-prompted, slot 0's next {N_STEPS} ids {} \
-             its alone run's continuation {}",
-            if iso_ok { "equal" } else { "differ from" },
-            verdict(iso_ok)
-        );
+
+        fn rewind(&self, m: &mut Qwen3moeModel) -> Result<(), GateError> {
+            Ok(m.reset()?)
+        }
+
+        fn prompt(&self, m: &mut Qwen3moeModel, stream: usize) -> Result<u32, GateError> {
+            Ok(match stream {
+                0 => m.prefill_with(&self.a, PrefillPath::Pass)?,
+                1 => m.prefill_with(&self.b, PrefillPath::Pass)?,
+                _ => return Err(format!("(n) runs streams 0 and 1, not {stream}").into()),
+            })
+        }
+
+        fn state_hash(&self, m: &mut Qwen3moeModel) -> Result<u64, GateError> {
+            kv_fnv(m, usize::try_from(m.pos())?)
+        }
+
+        /// One sequence's K/V planes: its layers' rows at the load's context
+        /// (the terms the old clause printed).
+        fn seq_bytes_derived(&self, m: &Qwen3moeModel) -> Result<Derived, GateError> {
+            let hp = m.body("slots")?.hparams().clone();
+            let row = usize::try_from(runtime::stores::kv_row_bytes(hp.n_head_kv, hp.head_dim))?;
+            let layers = m.layers().len();
+            Ok(Derived {
+                bytes: layers * CTX * row,
+                terms: format!(
+                    "{layers} layers x {CTX} rows x kv_row_bytes({}, {})",
+                    hp.n_head_kv, hp.head_dim
+                ),
+            })
+        }
+    }
+
+    /// (n) (module doc): the slot harness's contracts over two resident
+    /// slots, and between its halves the fault clause the harness's H5 will
+    /// own once written. The clause loads its own model, dropped with its
+    /// second sequence.
+    fn slots_two() -> Result<bool, GateError> {
+        let prose = prose(N_B + N_IDS)?;
+        let body = SlotsQ3 {
+            a: prose[N_A..N_A + N_IDS].to_vec(),
+            b: prose[N_B..N_B + N_IDS].to_vec(),
+        };
+        // PIN(2026-10-05): (n)'s interleave/bytes/reset/select/captures
+        // clauses moved to slots_gate H1/H3/H4/H6/H7.
+        let mut s = slots_gate::interleave(&body)?;
         // A fault on one slot: the other's steps refuse naming the slot, and
-        // only the faulting slot's reset lifts it ((x)'s plant).
+        // only the faulting slot's own reset lifts it ((x)'s plant — the
+        // body's own FFN half raises it).
+        let m = s.model();
         m.select_slot(1)?;
         m.reset()?;
         plant_fault(m)?;
@@ -2576,43 +2531,15 @@ mod gate {
             },
             verdict(fault_ok)
         );
-        // The select refusals name themselves.
-        let sel_named = match m.select_slot(2) {
-            Err(GpuError::Shape {
-                what: "GpuModel::select_slot",
-                detail,
-            }) => detail.contains("serves 0..2"),
-            _ => false,
-        };
-        let add_named = match m.add_slots(1) {
-            Err(GpuError::Shape {
-                what: "GpuModel::add_slots",
-                detail,
-            }) => detail.contains("already serves 2"),
-            _ => false,
-        };
-        let refused_ok = sel_named && add_named;
-        println!(
-            "slots refusals: select 2 of two slots named {sel_named}, add_slots(1) after \
-             add_slots(2) named {add_named} {}",
-            verdict(refused_ok)
-        );
-        // A mode round trip leaves no capture on either slot.
-        m.set_mode(StepMode::Eager);
-        m.set_mode(StepMode::Graph);
+        // The dance resets slot 0, so it goes back on its path for H4, whose
+        // continuation check reads it: its prompt then STEPS greedy steps —
+        // the run H1 held to its solo bits, so the replay is bit for bit.
         m.select_slot(0)?;
-        let gone0 = !m.has_capture();
-        m.select_slot(1)?;
-        let gone1 = !m.has_capture();
-        let gone_ok = gone0 && gone1;
-        println!(
-            "slots captures: both slots held captures after the interleave {caps}; none after a \
-             set_mode round trip ({gone0}, {gone1}) {}",
-            verdict(caps && gone_ok)
-        );
-        let ok = bytes_ok && together_ok && caps && iso_ok && fault_ok && refused_ok && gone_ok;
-        println!("slots: {}", verdict(ok));
-        Ok(ok)
+        m.reset()?;
+        let mut back = vec![body.prompt(m, 0)?];
+        step_more(m, &mut back, SlotsQ3::STEPS)?;
+        let harness_ok = s.finish()?;
+        Ok(fault_ok && harness_ok)
     }
 
     // ------------------------------------------- (j) one pass of two slots
@@ -2709,6 +2636,76 @@ mod gate {
         Ok(b0 == sb.ids[0]
             && out.ids == [a_next.0, sb.ids[1]]
             && logits == [a_next.1, sb.logits[0]])
+    }
+
+    /// (j1)'s add_slots sub-step read back: the pass's ids and per-row
+    /// logits hashes, and each slot's position and K/V hash after it — what
+    /// the graph and eager arms are held equal, bit for bit — and whether
+    /// the graph arm's capture bookkeeping held (the eager arm runs no
+    /// capture, so it reads true there).
+    #[derive(PartialEq)]
+    struct JSub {
+        ids: [u32; 2],
+        logits: [u64; 2],
+        pos: [u32; 2],
+        kv: [u64; 2],
+        caps: bool,
+    }
+
+    /// (j1)'s add_slots sub-step (module doc), on the state the reset
+    /// sub-step leaves: `add_slots(3)` — the count two to three, a third
+    /// sequence resident — then the same busy-set pass again, slot 0 fed
+    /// `t.0` and slot 1 `t.1` (the ids the reset sub-step's pass returned).
+    /// The graph arm's pass must replay the capture the passes before the
+    /// add_slots took: the run key's node list read after it equals the one
+    /// read before, and the one-row pass of slot 1 — captured before, never
+    /// run after — is still held, so no capture was taken anew and the cache
+    /// survived the add_slots. The eager arm's model already serves the
+    /// third sequence, its `add_slots(3)` the no-op that keeps the count.
+    fn j_after_add_slots(
+        m: &mut Qwen3moeModel,
+        t: (u32, u32),
+        graph: bool,
+    ) -> Result<JSub, GateError> {
+        const RUN: [(usize, usize); 2] = [(0, 1), (1, 1)];
+        const LONE: [(usize, usize); 1] = [(1, 1)];
+        let before = graph.then(|| m.slots_graph_nodes(&RUN)).transpose()?;
+        m.add_slots(3)?;
+        if m.slots() != 3 {
+            return Err(format!("(j): add_slots(3) left {} slots", m.slots()).into());
+        }
+        let out = m.step_slots(&[(0, &[t.0]), (1, &[t.1])])?;
+        let logits: Vec<u64> = m
+            .slots_logits()?
+            .iter()
+            .map(|l| Fnv1a64::default().f32s(l).value())
+            .collect();
+        let mut sub = JSub {
+            ids: [0; 2],
+            logits: [0; 2],
+            pos: [0; 2],
+            kv: [0; 2],
+            caps: true,
+        };
+        for slot in 0..2 {
+            m.select_slot(slot)?;
+            sub.pos[slot] = m.pos();
+            sub.kv[slot] = kv_fnv(m, usize::try_from(m.pos())?)?;
+        }
+        match (graph, before) {
+            (true, Some(before)) => {
+                sub.caps =
+                    m.slots_graph_nodes(&RUN)? == before && m.slots_graph_nodes(&LONE).is_ok();
+            }
+            (false, None) => {}
+            _ => return Err("(j): the add_slots sub-step read captures it should not hold".into()),
+        }
+        let ([id0, id1], [h0, h1]) = (out.ids.as_slice(), logits.as_slice()) else {
+            return Err(format!("(j): the add_slots pass gave {:?}", out.ids).into());
+        };
+        sub.ids = [*id0, *id1];
+        sub.logits = [*h0, *h1];
+        Ok(sub)
     }
 
     /// The two slots' runs in passes of several slots: A in slot 0 and B
@@ -2818,10 +2815,12 @@ mod gate {
         let (sa, a_next) = j_solo(m, a, steps)?;
         let (sb, _) = j_solo(m, b, steps)?;
         let mut bits_ok = true;
+        let mut subs: Vec<Option<JSub>> = Vec::with_capacity(2);
         for mode in [StepMode::Graph, StepMode::Eager] {
             m.set_mode(mode);
             // A pass that fails is this arm's failure, named here: the
             // clauses after it still run (and refuse while it poisons).
+            let mut sub = None;
             let off = match j_passes(m, (a, b), &sa.ids) {
                 Ok((ra, rb)) => {
                     let mut off = j_off(0, &ra, &sa);
@@ -2831,10 +2830,21 @@ mod gate {
                         Ok(false) => off.push("the pass after slot 1's reset".to_string()),
                         Err(e) => off.push(format!("the pass after slot 1's reset failed ({e})")),
                     }
+                    // The add_slots sub-step (module doc), on the state the
+                    // reset sub-step leaves.
+                    sub = match j_after_add_slots(m, (a_next.0, sb.ids[1]), mode == StepMode::Graph)
+                    {
+                        Ok(s) => Some(s),
+                        Err(e) => {
+                            off.push(format!("the pass after add_slots failed ({e})"));
+                            None
+                        }
+                    };
                     off
                 }
                 Err(e) => vec![format!("a pass that failed ({e})")],
             };
+            subs.push(sub);
             let ok = off.is_empty();
             println!(
                 "one pass bits {mode:?}: {J_ROUNDS} passes of slots 0 and 1 at one row a slot, a \
@@ -2855,6 +2865,32 @@ mod gate {
             );
             bits_ok &= ok;
         }
+        // The add_slots sub-step's verdict, over both arms: the graph arm's
+        // pass — replaying the capture from before the add_slots — and the
+        // eager arm's the same bits, slot 1's row its solo run's next step.
+        let (same, caps, solo) = match &subs[..] {
+            [Some(g), Some(e)] => (
+                g == e,
+                g.caps,
+                g.ids[1] == sb.ids[2] && g.logits[1] == sb.logits[1],
+            ),
+            _ => (false, false, false),
+        };
+        let add_ok = same && caps && solo;
+        bits_ok &= add_ok;
+        println!(
+            "one pass add_slots: add_slots(3) after the reset sub-step, the same busy-set pass \
+             again: the graph arm — replaying the capture from before the add_slots — and the \
+             eager arm {} on ids, logits, positions and K/V rows; the run key's capture \
+             unchanged and the slot-1 one-row pass's still held {caps}; slot 1's row its solo \
+             run's second step {solo} {}",
+            if same {
+                "agree bit for bit".to_string()
+            } else {
+                "differ".to_string()
+            },
+            verdict(add_ok)
+        );
         m.set_mode(StepMode::Graph);
         // (j2) nodes: the pass of slots 0 and 1 at a row each against the
         // two-row pass of slot 0, one busy slot's launches apart; each pass
@@ -2921,10 +2957,12 @@ mod gate {
             ),
             (
                 "slot out of range",
+                // The add_slots sub-step left the model serving three slots,
+                // so the probe is the first slot past that count.
                 refused(
-                    m.step_slots(&[(2, &[1])]),
+                    m.step_slots(&[(3, &[1])]),
                     WHAT,
-                    "slot 2 of a model that serves 0..2",
+                    "slot 3 of a model that serves 0..3",
                 ),
             ),
             (
