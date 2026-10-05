@@ -92,10 +92,14 @@ pub trait SlotRows: Slots {
 
     /// The pass's host half: each busy slot's input record — its first
     /// position `rows[i].pos0` and its ids `ids[rows[i].rows]` — written into
-    /// the buffers the pass reads. Never inside a capture.
+    /// the buffers the pass reads. `parked` is every busy slot's sequence but
+    /// the live one, in `rows` order, as [`SlotRows::enqueue_slots`] gets it:
+    /// a body whose sequences carry host state plans each slot from its own.
+    /// Never inside a capture.
     fn plan_slots(
         &mut self,
         stream: &CudaStream,
+        parked: &mut [&mut Self::Seq],
         rows: &[SlotRange],
         ids: &[u32],
     ) -> Result<(), GpuError>;
@@ -542,7 +546,13 @@ where
             .flat_map(|&(_, ids)| ids.iter().copied())
             .collect();
         self.canonical_homes(&ranges, WHAT)?;
-        self.body.plan_slots(self.gpu.stream(), &ranges, &ids)?;
+        {
+            let GpuModel {
+                body, parked, gpu, ..
+            } = self;
+            let mut seqs = parked_seqs(parked, &ranges)?;
+            body.plan_slots(gpu.stream(), &mut seqs, &ranges, &ids)?;
+        }
         if self.mode == StepMode::Graph && self.slot_graphs.get(key_of(&ranges)).is_none() {
             self.capture_ranges(&ranges, WHAT)?;
         }
@@ -734,8 +744,7 @@ fn name_slots(refusal: &mut Refusal, ranges: &[SlotRange]) {
 }
 
 /// Enqueue the pass of `rows` through the body, handing it each busy slot's
-/// parked sequence, typed, in `rows` order: with the homes canonical, slot
-/// `s > 0` sits in parked entry `s − 1`, and slot 0 is the live one.
+/// parked sequence ([`parked_seqs`]).
 fn enqueue_ranges<B: SlotRows>(
     gpu: &Gpu,
     w: &Weights,
@@ -744,6 +753,20 @@ fn enqueue_ranges<B: SlotRows>(
     parked: &mut [ParkedSlot<B>],
     rows: &[SlotRange],
 ) -> Result<(), GpuError>
+where
+    B::Seq: 'static,
+{
+    let mut seqs = parked_seqs(parked, rows)?;
+    body.enqueue_slots(gpu, w, heads, &mut seqs, rows)
+}
+
+/// Each busy slot's parked sequence, typed, in `rows` order: with the homes
+/// canonical, slot `s > 0` sits in parked entry `s − 1`, and slot 0 is the
+/// live one, which the body holds.
+fn parked_seqs<'a, B: SlotRows>(
+    parked: &'a mut [ParkedSlot<B>],
+    rows: &[SlotRange],
+) -> Result<Vec<&'a mut B::Seq>, GpuError>
 where
     B::Seq: 'static,
 {
@@ -767,5 +790,5 @@ where
             })?;
         seqs.push(seq);
     }
-    body.enqueue_slots(gpu, w, heads, &mut seqs, rows)
+    Ok(seqs)
 }

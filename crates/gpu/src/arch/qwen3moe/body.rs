@@ -807,6 +807,7 @@ impl SlotRows for Body {
     fn plan_slots(
         &mut self,
         stream: &CudaStream,
+        _parked: &mut [&mut Seq],
         rows: &[SlotRange],
         ids: &[u32],
     ) -> Result<(), GpuError> {
