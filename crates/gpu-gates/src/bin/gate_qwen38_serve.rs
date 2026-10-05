@@ -122,6 +122,45 @@
 //!   before it listens; a context search that ignores the slot count loads
 //!   a plan of one sequence and makes the second slot's load fail (the
 //!   server never listens) or (v4) red.
+//! - the drafted rounds clauses ([`slots_drafted_rounds`], a server of its
+//!   own under `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and
+//!   `BLOOMERY_STEP_STATS=1`): two greedy drafted streamed requests of the
+//!   slots clause's prompts on `--parallel 2`, each first run alone on
+//!   that server and then both together — over the together run every
+//!   `slots round` record is `cmd=pass` of `passes=1` carrying both slots
+//!   (`rows=2`), and each request's together ids and draft counts are its
+//!   alone run's (`slots_drafted_rounds_run_one_pass`). Then the off slot
+//!   ([`slots_drafted_off_slot`]): the break-even clause's long turn fresh,
+//!   then `TURN_A`'s drafted request on the other slot and, once it
+//!   decodes, the turn resent with its reply stripped, cut on the turn's
+//!   slot with its draft off by name — the off slot's plain steps run in
+//!   rounds of two rows beside the drafted windows, its ids the same ids
+//!   fed fresh, and the drafted request's ids and draft counts its alone
+//!   run's (`slots_drafted_off_slot_steps_beside_a_window`). Then the late
+//!   request, in both orders: the first posted alone and the second once a
+//!   few of its rounds have passed, its prompt between the first's rounds,
+//!   both ids again their alone ids — `TURN_A` first
+//!   (`slots_drafted_late_request_together_alone`), then `SLOTS_B` first
+//!   (`slots_drafted_late_request_other_order_together_alone`). Each
+//!   request takes the slot that holds its own last run, so one of the two
+//!   orders lays a round's rows with slot 1's first, which the pass must
+//!   run in slot order (the qwen4exp body holds slot 0's rows from row 0).
+//!   A late request's first window is not empty (its draft's refresh was
+//!   recorded at its prompt's last-id step); the mixed round covered is its
+//!   young window beside the first's decoding one, a window with no
+//!   proposal riding a pass only while its draft skips (`pass_slots`' own
+//!   case). `BLOOMERY_STEP_STATS=1` moves no computation — the seat and
+//!   the fallback loop branch on it only to print the record — so the
+//!   together-equals-alone bits stand for the default server. FAIL-first
+//!   mutants: the seat left on the default loop prints `passes=2` a round,
+//!   red on the round clause alone (the off and late clauses hold, the
+//!   default loop's ids being its own alone ids' — the seat's one-pass bits
+//!   are what the round clause holds); a round that asks the off slot's
+//!   draft to propose (its stale refresh refused by name, the server dead,
+//!   or a proposal from rows another sequence left) turns the off clause
+//!   red; a pass laid in the rows' arrival order is refused by name in the
+//!   order that puts slot 1's row first and the server dies, red on that
+//!   late line and every line after it.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for, and more servers start on the card, one at a time:
@@ -316,6 +355,12 @@ mod gate {
     /// (the module header's (v3) derivation).
     const SLOTS_WINDOW: usize = 16;
     const SLOTS_EACH: usize = 4;
+    /// The drafted rounds clause's late request: the second posted once the
+    /// first has run this many decode calls, polled at
+    /// [`DRAFTED_LATE_POLL`] up to [`DRAFTED_LATE_POLLS`] times.
+    const DRAFTED_LATE_ROUNDS: u64 = 4;
+    const DRAFTED_LATE_POLL: Duration = Duration::from_millis(50);
+    const DRAFTED_LATE_POLLS: usize = 600;
     /// The one chat turn the chat clauses send.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
     /// The chat's reply length.
@@ -2043,6 +2088,344 @@ mod gate {
         Ok(ok)
     }
 
+    /// The drafted rounds clauses (the module header) on one server of
+    /// `--parallel 2` under `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off`
+    /// and `BLOOMERY_STEP_STATS=1`, into its own directory: two greedy
+    /// drafted streamed requests of the slots clause's prompts, each first
+    /// run alone on that server and then both together, the together run's
+    /// `slots round` records read back — every one `cmd=pass` of `passes=1`
+    /// carrying both slots (`rows=2`, `slots=2`), and each request's
+    /// together ids and draft counts its alone run's
+    /// (`slots_drafted_rounds_run_one_pass`: the round is one pass of both
+    /// windows, each row's `out` and `drafted` the fallback loop's). Then
+    /// the off slot ([`slots_drafted_off_slot`]), then the late request in
+    /// both orders ([`late_pair`]): the first posted and the second once
+    /// `/metrics`' `n_decode_total` has moved [`DRAFTED_LATE_ROUNDS`]
+    /// rounds — its prompt between the first's rounds — both requests' ids
+    /// again their alone ids (`slots_drafted_late_request_together_alone`,
+    /// `TURN_A` first; `slots_drafted_late_request_other_order_together_alone`,
+    /// `SLOTS_B` first: one of the two lays slot 1's row first).
+    ///
+    /// The late request's first window is not empty: a request's prompt call
+    /// ends in its last id's step, which records the draft's refresh
+    /// (`genloop`'s prompt), so its first pass proposes beside the first
+    /// request's deep one. A window rides a pass with no proposal only
+    /// while its draft skips, `pass_slots`' own case; a slot a cut turned
+    /// off steps beside the pass ([`slots_drafted_off_slot`]). The mixed
+    /// round these clauses cover is that young window beside the decoding
+    /// one. `BLOOMERY_STEP_STATS=1` moves no computation on this
+    /// server — the seat and the fallback loop branch on it only to print
+    /// the record — so the together-equals-alone bits of these runs stand
+    /// for the default server.
+    fn slots_drafted_rounds(dir: &Path) -> Result<bool, GateError> {
+        let mut ok = true;
+        let d = dir.join("slots-drafted");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        // SERVER_ARGS ends in the one-slot `--parallel 1`; this clause's
+        // server takes the two-slot value, the total context the same 4096.
+        let mut args: Vec<&str> = SERVER_ARGS.to_vec();
+        let parallel = args.len() - 1;
+        args[parallel] = "2";
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "mtp")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env(bloomery_levers::STEP_STATS, "1");
+        let mut served = Served38::spawn_with(&args, &d, &mut cmd)?;
+        println!("slots-drafted server pid {}", served.child.id());
+        let addr = match served.address(&err_log, POLLS, POLL) {
+            Ok(a) => a,
+            // A server that never listens names no round: the checks are red
+            // by name, and the server is stopped.
+            Err(e) => {
+                println!(
+                    "slots-drafted: the server never listened: {e}; it said: {}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                for name in [
+                    "slots_drafted_rounds_run_one_pass",
+                    "slots_drafted_off_slot_steps_beside_a_window",
+                    "slots_drafted_late_request_together_alone",
+                    "slots_drafted_late_request_other_order_together_alone",
+                ] {
+                    check(&mut ok, name, false);
+                }
+                let _ = served.stop();
+                return Ok(ok);
+            }
+        };
+        let url = |p: &str| format!("http://{addr}{p}");
+        let (a_ids, b_ids) = (
+            rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
+            rendered(&url, json!([{ "role": "user", "content": SLOTS_B }]))?,
+        );
+        let mut alone = Vec::new();
+        for (ids, what) in [(&a_ids, "alone A"), (&b_ids, "alone B")] {
+            alone.push(run_streamed(&addr, ids, SLOTS_PREDICT, what)?);
+        }
+        // The alone runs print no record (a round of one active request is a
+        // select and an `advance`), so the window opens empty; taken anyway,
+        // so the together run's records are exactly the ones after this
+        // point.
+        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
+        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "together A"), (second, "together B")] {
+            h.join()
+                .map_err(|_| format!("slots-drafted: the {what} request's thread panicked"))?;
+            let ran = rx.recv().map_err(|_| {
+                format!("slots-drafted: the {what} request's thread gave no answer")
+            })?;
+            match ran {
+                Ok(s) => together.push(Some(s)),
+                Err(e) => {
+                    println!("slots-drafted: the {what} request failed: {e}");
+                    together.push(None);
+                }
+            }
+        }
+        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
+        let window = &rounds[before.min(rounds.len())..];
+        let every = !window.is_empty()
+            && window.iter().all(|r| {
+                r.word("cmd") == Ok("pass")
+                    && r.u64("passes") == Ok(1)
+                    && r.u64("rows") == Ok(2)
+                    && r.u64("slots") == Ok(2)
+            });
+        println!(
+            "slots-drafted: {} record(s) in the together window, {} of them one pass of 2 rows \
+             (alone {} and {} ids, together {} and {} ids, drafts {:?} -> {:?} and {:?} -> {:?})",
+            window.len(),
+            window
+                .iter()
+                .filter(|r| r.word("cmd") == Ok("pass") && r.u64("passes") == Ok(1))
+                .count(),
+            alone[0].as_ref().map_or(0, |s| s.tokens.len()),
+            alone[1].as_ref().map_or(0, |s| s.tokens.len()),
+            together[0].as_ref().map_or(0, |s| s.tokens.len()),
+            together[1].as_ref().map_or(0, |s| s.tokens.len()),
+            alone[0].as_ref().map(|s| s.drafts),
+            together[0].as_ref().map(|s| s.drafts),
+            alone[1].as_ref().map(|s| s.drafts),
+            together[1].as_ref().map(|s| s.drafts),
+        );
+        // One pass a round, and each request's ids and draft counts its
+        // alone run's: the round filled its rows as the fallback loop's
+        // per-row pass would.
+        check(
+            &mut ok,
+            "slots_drafted_rounds_run_one_pass",
+            every
+                && together[0].as_ref().is_some_and(|t| !t.tokens.is_empty())
+                && together[1].as_ref().is_some_and(|t| !t.tokens.is_empty())
+                && alone[0]
+                    .as_ref()
+                    .is_some_and(|a| a.tokens == together[0].as_ref().unwrap().tokens)
+                && alone[1]
+                    .as_ref()
+                    .is_some_and(|a| a.tokens == together[1].as_ref().unwrap().tokens)
+                && alone[0]
+                    .as_ref()
+                    .is_some_and(|a| a.drafts == together[0].as_ref().unwrap().drafts)
+                && alone[1]
+                    .as_ref()
+                    .is_some_and(|a| a.drafts == together[1].as_ref().unwrap().drafts),
+        );
+        // The off slot beside a drafted one (the module header), on the same
+        // server.
+        ok &= slots_drafted_off_slot(&url, &addr, &err_log, &a_ids, alone[0].as_ref())?;
+        // The late request, in both orders: the first decodes alone, and once
+        // a few of its rounds have passed the second arrives — its prompt
+        // between the first's rounds, its first drafted pass in a round
+        // beside the first's deep one. Each request takes the slot that holds
+        // its own last run, so one of the two orders puts slot 1's row first.
+        for (name, order, ids) in [
+            (
+                "slots_drafted_late_request_together_alone",
+                ["A", "B"],
+                [&a_ids[..], &b_ids[..]],
+            ),
+            (
+                "slots_drafted_late_request_other_order_together_alone",
+                ["B", "A"],
+                [&b_ids[..], &a_ids[..]],
+            ),
+        ] {
+            let (polls, late) = late_pair(&url, &addr, ids, order)?;
+            let want = match order {
+                ["A", _] => [&alone[0], &alone[1]],
+                _ => [&alone[1], &alone[0]],
+            };
+            println!(
+                "slots-drafted late {}{}: the second posted after {polls} poll(s); {} and {} ids",
+                order[0],
+                order[1],
+                late[0].as_ref().map_or(0, |s| s.tokens.len()),
+                late[1].as_ref().map_or(0, |s| s.tokens.len()),
+            );
+            check(
+                &mut ok,
+                name,
+                late.iter().zip(want).all(|(l, a)| {
+                    l.as_ref()
+                        .zip(a.as_ref())
+                        .is_some_and(|(l, a)| !l.tokens.is_empty() && l.tokens == a.tokens)
+                }),
+            );
+        }
+        println!("slots-drafted server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
+    /// The late pair of the drafted rounds clauses: `ids[0]` posted, and
+    /// once `/metrics`' `n_decode_total` has moved [`DRAFTED_LATE_ROUNDS`]
+    /// rounds (polled at [`DRAFTED_LATE_POLL`], at most
+    /// [`DRAFTED_LATE_POLLS`] times) `ids[1]`, both streamed greedy for
+    /// [`SLOTS_PREDICT`] tokens: the polls taken and each request's answer,
+    /// `None` a request that failed (a red check, not the clause's end).
+    fn late_pair(
+        url: &dyn Fn(&str) -> String,
+        addr: &str,
+        ids: [&[u32]; 2],
+        what: [&str; 2],
+    ) -> Result<(usize, Vec<Option<Streamed>>), GateError> {
+        let first = streamed(addr, ids[0], SLOTS_PREDICT)?;
+        let decode0 = metric(url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let mut polls = 0;
+        while polls < DRAFTED_LATE_POLLS
+            && metric(url, "n_decode_total")?.unwrap_or(decode0)
+                < decode0 + DRAFTED_LATE_ROUNDS as f64
+        {
+            std::thread::sleep(DRAFTED_LATE_POLL);
+            polls += 1;
+        }
+        let second = streamed(addr, ids[1], SLOTS_PREDICT)?;
+        let mut late = Vec::new();
+        for ((h, rx), what) in [(first, what[0]), (second, what[1])] {
+            h.join()
+                .map_err(|_| format!("slots-drafted: the late {what} request's thread panicked"))?;
+            let ran = rx.recv().map_err(|_| {
+                format!("slots-drafted: the late {what} request's thread gave no answer")
+            })?;
+            match ran {
+                Ok(s) => late.push(Some(s)),
+                Err(e) => {
+                    println!("slots-drafted: the late {what} request failed: {e}");
+                    late.push(None);
+                }
+            }
+        }
+        Ok((polls, late))
+    }
+
+    /// The off slot clause (the module header) on the drafted rounds
+    /// clause's server: the break-even clause's long turn (`BREAK_EVEN_TURNS`'
+    /// first) run fresh on a free slot for a reply its break-even keeps a
+    /// cut for; then `TURN_A`'s drafted request (`a_ids`, [`SLOTS_PREDICT`]
+    /// tokens) posted — it takes the other slot, whose held ids share more
+    /// of its prompt — and once it has run [`DRAFTED_LATE_ROUNDS`] decode
+    /// calls, the turn resent with its reply stripped, which only the turn's
+    /// slot is free to take: that slot keeps the turn's end by a cut, its
+    /// draft off by name (its `mtp keep` record `kept`), and its plain steps
+    /// run in the rounds the drafted request's windows run in (a `slots
+    /// round` record of two rows inside its window). The off slot's ids are
+    /// the same ids fed fresh, and the drafted request's ids and draft
+    /// counts its alone run's (`alone_a`): an off slot steps beside a
+    /// drafted window and is never asked to propose
+    /// (`slots_drafted_off_slot_steps_beside_a_window`).
+    fn slots_drafted_off_slot(
+        url: &dyn Fn(&str) -> String,
+        addr: &str,
+        err_log: &Path,
+        a_ids: &[u32],
+        alone_a: Option<&Streamed>,
+    ) -> Result<bool, GateError> {
+        let k = Keep38::read(err_log)?;
+        let (turn, reply_text) = BREAK_EVEN_TURNS[0];
+        let p1 = rendered(url, json!([{ "role": "user", "content": turn }]))?;
+        let stripped = tokenized(url, reply_text)?;
+        let turn_end = p1.len() - 1;
+        let n = (2..=N_PREDICT)
+            .rev()
+            .find(|&n| k.at(n) <= turn_end)
+            .ok_or_else(|| {
+                format!(
+                    "slots-drafted off: the turn's end {turn_end} is below the break-even of \
+                     every reply of 2 to {N_PREDICT} tokens ({} ids a token): the clause needs \
+                     a longer turn",
+                    k.per_token
+                )
+            })?;
+        let strip: Vec<u32> = p1.iter().chain(&stripped).copied().collect();
+        let x = greedy(url, err_log, &p1, n, false)?;
+        x.show("slots-drafted off: the turn fresh");
+        if stripped.first() == x.tokens.first() {
+            return Err(format!(
+                "slots-drafted off: the stripped reply's first id {:?} is the reply's: the \
+                 shared prefix would not end at the turn",
+                stripped.first()
+            )
+            .into());
+        }
+        let decode0 = metric(url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let (h, rx) = streamed(addr, a_ids, SLOTS_PREDICT)?;
+        let mut polls = 0;
+        while polls < DRAFTED_LATE_POLLS
+            && metric(url, "n_decode_total")?.unwrap_or(decode0)
+                < decode0 + DRAFTED_LATE_ROUNDS as f64
+        {
+            std::thread::sleep(DRAFTED_LATE_POLL);
+            polls += 1;
+        }
+        let before = seat_log(err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let cut = greedy(url, err_log, &strip, n, true)?;
+        cut.show("slots-drafted off: the turn resent stripped beside the drafted request");
+        let rounds = seat_log(err_log)?.all(&record::SLOTS_ROUND)?;
+        let beside = rounds[before.min(rounds.len())..]
+            .iter()
+            .filter(|r| r.u64("rows") == Ok(2))
+            .count();
+        h.join()
+            .map_err(|_| "slots-drafted off: the drafted request's thread panicked")?;
+        let drafted = match rx
+            .recv()
+            .map_err(|_| "slots-drafted off: the drafted request's thread gave no answer")?
+        {
+            Ok(s) => Some(s),
+            Err(e) => {
+                println!("slots-drafted off: the drafted request failed: {e}");
+                None
+            }
+        };
+        let f = greedy(url, err_log, &strip, n, false)?;
+        f.show("slots-drafted off: the same ids fresh");
+        let rec = k.record(n, turn_end as u64, true);
+        let off = cut.cache_n == turn_end as u64
+            && cut.skipped_by_name()
+            && cut.keeps.last() == Some(&rec);
+        let fresh = x.ok && f.ok && f.cache_n == 0 && f.offs.is_empty();
+        let off_same = !cut.tokens.is_empty() && cut.tokens == f.tokens;
+        let drafted_same = drafted.as_ref().zip(alone_a).is_some_and(|(d, a)| {
+            !d.tokens.is_empty() && d.tokens == a.tokens && d.drafts == a.drafts
+        });
+        println!(
+            "slots-drafted off: posted after {polls} poll(s); the cut kept {} of the turn's end \
+             {turn_end} (want {rec:?}), {beside} round(s) of two rows beside the drafted \
+             request; off ids the fresh run's: {off_same}; drafted ids and counts its alone \
+             run's: {drafted_same}",
+            cut.cache_n
+        );
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slots_drafted_off_slot_steps_beside_a_window",
+            off && fresh && off_same && drafted_same && beside > 0,
+        );
+        Ok(ok)
+    }
+
     /// The plan's card expert bytes on the gate card at a slot's `ctx`, the
     /// two resident slots of this clause's flagless server counted
     /// (`plan_with_slots`), plain, as the server makes it; `None` when no
@@ -2523,6 +2906,9 @@ mod gate {
         // The resident slots together (the module header): its own servers,
         // the first with the draft on whatever this binary's lever says.
         ok &= slots_flow_together(&a.dir)?;
+        // The drafted rounds run as one pass (the module header): its own
+        // server, the draft on, the residency off, the round records on.
+        ok &= slots_drafted_rounds(&a.dir)?;
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");
             Ok(())

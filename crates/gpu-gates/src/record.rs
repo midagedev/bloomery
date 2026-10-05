@@ -2590,6 +2590,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = &[
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
     &RESIDENCY_RESET,
+    &SLOTS_ROUND,
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: a `--hf`

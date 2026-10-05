@@ -1,34 +1,40 @@
-//! A seat's MTP draft: the session's prompt, steps, passes and reset through
-//! the shared window ([`app::mtp::MtpDraft`]) when the seat drives one, the
-//! session's own calls when it does not. A seat holds one [`DraftedSeat`]
-//! beside its session and forwards the [`Seat`](bloomery_gpu_gates::bind::Seat)
-//! calls that move positions to it.
+//! The seats' MTP drafts, one a resident slot ([`SlotDrafts`]): each slot's
+//! prompt, steps, passes and reset through the shared window
+//! ([`app::mtp::MtpDraft`]) when the seat drives one, the session's own calls
+//! when it does not. A seat holds one [`SlotDrafts`] beside its session and
+//! forwards the [`Seat`](bloomery_gpu_gates::bind::Seat) calls that move
+//! positions to it, each naming the slot the session has selected: a call
+//! acts on that slot's entry alone. A round of several slots' drafted passes
+//! takes every busy slot's window out of the table at once
+//! (`serve_seats::rounds::pass_rows_one_pass`).
+//!
+//! The table never selects and nothing in it moves on a select: the seat
+//! selects through the session, the draft's device side (its store and the
+//! arenas its waiting rows sit in) travelling with the slot's sequence, and
+//! the slot's entry stays where it is, so the slot's next call drafts as if
+//! no other slot had run. The seat opens each slot's draft (its prompt path
+//! and step mode are the seat's), and the table drives it.
 //!
 //! The draft rejoins a sequence only where its last call left it. A seat
 //! whose saved state keeps the draft's side (its store and the arenas its
-//! waiting rows sit in) parks the draft with the state ([`DraftedSeat::park`])
-//! and puts it back with it ([`DraftedSeat::unpark`]), so a returning
-//! sequence drafts as if no other had run. A seat whose state does not keep
-//! that side turns the draft off after a cut or a put-back state
-//! ([`DraftedSeat::turn_off`]): every call is the session's own until the next
-//! reset, and each prompt call (or the first step when the call is empty)
-//! prints an `mtp prompt` record that names why.
-//!
-//! A seat that serves resident slots keeps the draft's side of each slot but
-//! the live one in the seat's table ([`DraftedSeat::hold_slots`]) and selects
-//! through it ([`DraftedSeat::select`]): the live slot's side parked, the
-//! target slot's put back, so each slot's drafted passes are the passes it
-//! would run alone.
+//! waiting rows sit in) parks the slot's draft with the state
+//! ([`SlotDrafts::park`]) and puts it back with it ([`SlotDrafts::unpark`]),
+//! so a returning sequence drafts as if no other had run. A seat whose state
+//! does not keep that side turns the slot's draft off after a cut or a
+//! put-back state ([`SlotDrafts::turn_off`]): every call on that slot is the
+//! session's own until the slot's next reset, and each prompt call (or the
+//! first step when the call is empty) prints an `mtp prompt` record that
+//! names why.
 
-use app::Session;
 use app::mtp::{MtpBody, MtpDraft, Parked};
-use bloomery_gpu::model::Slots;
+use app::{RowsLog, Session, SessionError};
+use bloomery_gpu::GpuModel;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
 use runtime::{Advance, Draft, Plain, Speculative, Target as _, Want, Widths, Window};
 use serve::Drafted;
 
-/// The draft's side of a saved sequence ([`DraftedSeat::park`]): what the
+/// A slot's draft side of a saved sequence ([`SlotDrafts::park`]): what the
 /// draft held of it, and why the seat had turned it off, if it had.
 #[derive(Clone, Debug)]
 pub(crate) struct ParkedDraft<A> {
@@ -36,48 +42,122 @@ pub(crate) struct ParkedDraft<A> {
     off: Option<&'static str>,
 }
 
-/// The windows a seat drives its session with, `M` = the body's
-/// [`MtpBody::VERIFY_ROWS`], or none: every pass a plain step.
-pub(crate) struct DraftedSeat<B: MtpBody, const M: usize>
+/// One slot's drafted window over its own [`MtpDraft`].
+type Spec<B, const M: usize> = Speculative<MtpDraft<B>, M>;
+
+/// The drafts a seat drives its session's slots with, one a resident slot,
+/// `M` = the body's [`MtpBody::VERIFY_ROWS`], or none: every pass a plain
+/// step.
+pub(crate) struct SlotDrafts<B: MtpBody, const M: usize>
 where
     Window<M>: Widths,
 {
-    spec: Option<Speculative<MtpDraft<B>, M>>,
-    /// Why the draft is off until the next reset, and whether a record has
-    /// said so since it was turned off; `None` while it drafts.
-    off: Option<(&'static str, bool)>,
-    /// The draft's side of each resident slot but the live one, one entry a
-    /// slot ([`DraftedSeat::hold_slots`]); the live slot's entry is empty,
-    /// its side the window's own. Empty until a seat holds slots.
-    parked: Vec<Option<ParkedDraft<B::Arena>>>,
+    /// Each slot's window over its own draft; empty without a draft. An
+    /// entry is `None` only while a round holds its window out
+    /// ([`SlotDrafts::specs_mut`]).
+    specs: Vec<Option<Spec<B, M>>>,
+    /// Why each slot's draft is off until the slot's next reset, and whether
+    /// a record has said so since it was turned off; `None` while it drafts.
+    off: Vec<Option<(&'static str, bool)>>,
 }
 
-impl<B: MtpBody, const M: usize> DraftedSeat<B, M>
+impl<B: MtpBody, const M: usize> SlotDrafts<B, M>
 where
     Window<M>: Widths,
 {
-    /// The seat over `spec`'s windows, or with no draft.
-    pub(crate) fn new(spec: Option<Speculative<MtpDraft<B>, M>>) -> Self {
-        DraftedSeat {
-            spec,
-            off: None,
-            parked: Vec::new(),
+    /// No draft: every call the session's own, every pass one plain step.
+    pub(crate) fn none() -> Self {
+        SlotDrafts {
+            specs: Vec::new(),
+            off: Vec::new(),
         }
     }
 
-    /// The draft off until the next reset, for `why`: the session's position
-    /// moved where the draft holds no rows to rejoin at. Nothing without a
-    /// draft.
-    pub(crate) fn turn_off(&mut self, why: &'static str) {
-        if self.spec.is_some() {
-            self.off = Some((why, false));
+    /// One draft a resident slot, `slots` of them, each opened by the seat's
+    /// `open` (the draft's prompt path and step mode are the seat's): slot
+    /// 0's driven through [`Session::with_draft`], which captures every
+    /// width's verify pass on the model (`log` told of each), each further
+    /// slot's opened beside it, the model's captures shared by every slot's
+    /// draft. Every slot starts as a fresh draft: nothing waits, nothing
+    /// skipped. Load-time, once the session serves its slots; refused by name
+    /// for no slot.
+    pub(crate) fn open(
+        s: &mut Session<B>,
+        slots: usize,
+        log: &mut impl RowsLog,
+        mut open: impl FnMut(&GpuModel<B>) -> Result<MtpDraft<B>, SessionError>,
+    ) -> Result<Self, GateError> {
+        if slots == 0 {
+            return Err("the MTP drafts of no slot".into());
+        }
+        let first = open(s.model())?;
+        let mut specs = Vec::with_capacity(slots);
+        specs.push(Some(s.with_draft(first, log)?));
+        for _ in 1..slots {
+            specs.push(Some(Speculative::new(open(s.model())?)));
+        }
+        Ok(SlotDrafts {
+            specs,
+            off: vec![None; slots],
+        })
+    }
+
+    /// Whether a draft runs.
+    pub(crate) fn drafts(&self) -> bool {
+        !self.specs.is_empty()
+    }
+
+    /// Whether `slot` drafts through a window of the table: false with no
+    /// draft. Refused by name for a slot past the table, or one whose window
+    /// a round holds out.
+    fn has(&self, slot: usize) -> Result<bool, GateError> {
+        if self.specs.is_empty() {
+            return Ok(false);
+        }
+        match self.specs.get(slot) {
+            Some(Some(_)) => Ok(true),
+            Some(None) => Err(format!(
+                "slot {slot}: its MTP draft is out with a round of several slots"
+            )
+            .into()),
+            None => Err(format!(
+                "slot {slot}: the MTP drafts hold {} slots",
+                self.specs.len()
+            )
+            .into()),
         }
     }
 
-    /// The `mtp prompt` record of a call the draft sits out, at the session's
-    /// position.
-    fn print_off(&mut self, s: &Session<B>) {
-        if let Some((why, told)) = &mut self.off {
+    /// `slot`'s window; `None` with no draft, refused as [`SlotDrafts::has`].
+    fn spec_mut(&mut self, slot: usize) -> Result<Option<&mut Spec<B, M>>, GateError> {
+        Ok(if self.has(slot)? {
+            self.specs[slot].as_mut()
+        } else {
+            None
+        })
+    }
+
+    /// Whether `slot`'s draft is off until the slot's next reset
+    /// ([`SlotDrafts::turn_off`]); false for a slot the table holds no draft
+    /// of.
+    pub(crate) fn is_off(&self, slot: usize) -> bool {
+        self.off.get(slot).is_some_and(Option::is_some)
+    }
+
+    /// `slot`'s draft off until the slot's next reset, for `why`: the
+    /// session's position moved where the draft holds no rows to rejoin at.
+    /// Nothing without a draft; refused as [`SlotDrafts::has`].
+    pub(crate) fn turn_off(&mut self, slot: usize, why: &'static str) -> Result<(), GateError> {
+        if self.has(slot)? {
+            self.off[slot] = Some((why, false));
+        }
+        Ok(())
+    }
+
+    /// The `mtp prompt` record of a call `slot`'s draft sits out, at the
+    /// session's position.
+    fn print_off(&mut self, s: &Session<B>, slot: usize) {
+        if let Some(Some((why, told))) = self.off.get_mut(slot) {
             *told = true;
             Record::new(&record::MTP_PROMPT)
                 .u("start", s.pos())
@@ -87,25 +167,21 @@ where
         }
     }
 
-    /// Whether a draft runs.
-    pub(crate) fn drafts(&self) -> bool {
-        self.spec.is_some()
-    }
-
-    /// Whether the draft is off until the next reset ([`DraftedSeat::turn_off`]).
-    pub(crate) fn is_off(&self) -> bool {
-        self.off.is_some()
-    }
-
-    /// The prompt: under the draft the draft's own prompt call, its store
-    /// walked over the prompt's units, then its join record; without it the
-    /// session's prompt call.
-    pub(crate) fn prefill(&mut self, s: &mut Session<B>, ids: &[u32]) -> Result<u32, GateError> {
-        if self.off.is_some() {
-            self.print_off(s);
+    /// The prompt on `slot`, the session's selected one: under the draft the
+    /// draft's own prompt call, its store walked over the prompt's units,
+    /// then its join record; without it, or while it is off, the session's
+    /// prompt call.
+    pub(crate) fn prefill(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        ids: &[u32],
+    ) -> Result<u32, GateError> {
+        if self.is_off(slot) {
+            self.print_off(s, slot);
             return Ok(s.prompt(ids, Want::Argmax)?.argmax());
         }
-        match &mut self.spec {
+        match self.spec_mut(slot)? {
             Some(spec) => {
                 let next = Advance::prompt(spec, s, ids)?;
                 print_join(spec);
@@ -115,25 +191,32 @@ where
         }
     }
 
-    /// One step; under the draft the rows it left waiting walked first
-    /// ([`MtpDraft::before_step`]: a request that continues the held
-    /// sequence joins it here when its prompt call is empty), then the step
-    /// told to the draft ([`Draft::stepped`]).
-    pub(crate) fn step(&mut self, s: &mut Session<B>, last: u32) -> Result<u32, GateError> {
-        self.step_reading(s, last, None)
+    /// One step on `slot`, the session's selected one; under the draft the
+    /// rows it left waiting walked first ([`MtpDraft::before_step`]: a
+    /// request that continues the held sequence joins it here when its
+    /// prompt call is empty), then the step told to the draft
+    /// ([`Draft::stepped`]).
+    pub(crate) fn step(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        last: u32,
+    ) -> Result<u32, GateError> {
+        self.step_reading(s, slot, last, None)
     }
 
-    /// [`DraftedSeat::step`] with the target's logits of the step into `row`
+    /// [`SlotDrafts::step`] with the target's logits of the step into `row`
     /// (`n_vocab` f32), read after the target's step and before the step is
     /// told to the draft: whatever the draft's walks write, the row is the
     /// target's.
     pub(crate) fn step_with_row(
         &mut self,
         s: &mut Session<B>,
+        slot: usize,
         last: u32,
         row: &mut [f32],
     ) -> Result<u32, GateError> {
-        self.step_reading(s, last, Some(row))
+        self.step_reading(s, slot, last, Some(row))
     }
 
     /// The step's order, the one owner of it: the draft's waiting rows, the
@@ -141,14 +224,15 @@ where
     fn step_reading(
         &mut self,
         s: &mut Session<B>,
+        slot: usize,
         last: u32,
         row: Option<&mut [f32]>,
     ) -> Result<u32, GateError> {
-        if matches!(self.off, Some((_, false))) {
-            self.print_off(s);
+        if matches!(self.off.get(slot), Some(Some((_, false)))) {
+            self.print_off(s, slot);
         }
-        let drafting = self.off.is_none();
-        if let Some(spec) = self.spec.as_mut().filter(|_| drafting) {
+        let drafting = !self.is_off(slot);
+        if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
             spec.draft_mut().before_step(s, last)?;
             print_join(spec);
         }
@@ -158,21 +242,24 @@ where
                 .logits_into(row)
                 .map_err(|e| format!("logits of the step: {e}"))?;
         }
-        if let Some(spec) = self.spec.as_mut().filter(|_| drafting) {
+        if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
             Draft::stepped(spec.draft_mut(), s, last, next)?;
         }
         Ok(next)
     }
 
-    /// One pass from `last`: under the draft one window, its kept tokens and
-    /// counts; without it one step ([`DraftedSeat::step`]).
+    /// One pass on `slot`, the session's selected one, from `last`: under the
+    /// draft one window, its kept tokens and counts; without it, or while it
+    /// is off, one step ([`SlotDrafts::step`]).
     pub(crate) fn pass(
         &mut self,
         s: &mut Session<B>,
+        slot: usize,
         last: u32,
         out: &mut Vec<u32>,
     ) -> Result<Drafted, GateError> {
-        match self.spec.as_mut().filter(|_| self.off.is_none()) {
+        let drafting = !self.is_off(slot);
+        match self.spec_mut(slot)?.filter(|_| drafting) {
             Some(spec) => {
                 let c = Advance::pass(spec, s, last, out)?;
                 Ok(Drafted {
@@ -181,120 +268,95 @@ where
                 })
             }
             None => {
-                out.push(self.step(s, last)?);
+                out.push(self.step(s, slot, last)?);
                 Ok(Drafted::default())
             }
         }
     }
 
-    /// The most positions one pass runs: a window's rows while the draft
-    /// runs, one step's without it or while it is off.
-    pub(crate) fn pass_rows(&self) -> usize {
-        match (&self.spec, self.off) {
-            (Some(_), None) => <Speculative<MtpDraft<B>, M> as Advance<Session<B>>>::ROWS,
+    /// The most positions one pass on `slot` runs: a window's rows while its
+    /// draft runs, one step's without it or while it is off.
+    pub(crate) fn pass_rows(&self, slot: usize) -> usize {
+        match (self.specs.get(slot), self.is_off(slot)) {
+            (Some(Some(_)), false) => <Spec<B, M> as Advance<Session<B>>>::ROWS,
             _ => <Plain as Advance<Session<B>>>::ROWS,
         }
     }
 
-    /// The session's reset, then the draft started over and on again.
-    pub(crate) fn reset(&mut self, s: &mut Session<B>) -> Result<(), GateError> {
+    /// The session's reset, then `slot`'s draft — the session's selected
+    /// slot's, the sequence the reset emptied — started over and on again;
+    /// every other slot's draft stands as it is. Refused as
+    /// [`SlotDrafts::has`] refuses, before the reset.
+    pub(crate) fn reset(&mut self, s: &mut Session<B>, slot: usize) -> Result<(), GateError> {
+        let drafting = self.has(slot)?;
         s.reset()?;
-        self.off = None;
-        if let Some(spec) = &mut self.spec {
-            spec.draft_mut().restart();
+        if drafting {
+            self.off[slot] = None;
+            if let Some(spec) = self.specs[slot].as_mut() {
+                spec.draft_mut().restart();
+            }
         }
         Ok(())
     }
-}
 
-impl<B: MtpBody, const M: usize> DraftedSeat<B, M>
-where
-    Window<M>: Widths,
-{
-    /// The draft's side of the session's sequence, for a state the seat
-    /// saves ([`MtpDraft::park`]; the turn-off why with it); `None` without
-    /// a draft. The state keeps the draft's store and the arenas the
-    /// waiting rows sit in.
-    pub(crate) fn park(&self) -> Option<ParkedDraft<B::Arena>> {
-        self.spec.as_ref().map(|spec| ParkedDraft {
+    /// `slot`'s draft side of the session's sequence, for a state the seat
+    /// saves of that slot ([`MtpDraft::park`]; the turn-off why with it);
+    /// `None` without a draft. The state keeps the draft's store and the
+    /// arenas the waiting rows sit in. Refused as [`SlotDrafts::has`].
+    pub(crate) fn park(&self, slot: usize) -> Result<Option<ParkedDraft<B::Arena>>, GateError> {
+        if !self.has(slot)? {
+            return Ok(None);
+        }
+        Ok(self.specs[slot].as_ref().map(|spec| ParkedDraft {
             draft: spec.draft().park(),
-            off: self.off.map(|(why, _)| why),
-        })
+            off: self.off[slot].map(|(why, _)| why),
+        }))
     }
 
     /// Refused by name unless a state whose draft's side is `p` fits this
     /// seat: a side where a draft runs, none where none does.
     pub(crate) fn takes(&self, p: Option<&ParkedDraft<B::Arena>>) -> Result<(), GateError> {
-        if p.is_some() == self.spec.is_some() {
+        if p.is_some() == self.drafts() {
             return Ok(());
         }
         Err(format!(
             "a state saved with the MTP draft {} put back with it {}",
             if p.is_some() { "on" } else { "off" },
-            if self.spec.is_some() { "on" } else { "off" }
+            if self.drafts() { "on" } else { "off" }
         )
         .into())
     }
 
-    /// `p`, which [`DraftedSeat::park`] took with a state, back in place once
-    /// that state is put back after the session's reset: the draft joins the
-    /// sequence's next call where it left it, or stays off for the parked
-    /// why. Refused by name as [`DraftedSeat::takes`] refuses.
-    pub(crate) fn unpark(&mut self, p: Option<&ParkedDraft<B::Arena>>) -> Result<(), GateError> {
+    /// `p`, which [`SlotDrafts::park`] took with a state, back in `slot`'s
+    /// entry once that state is put back on the slot after the session's
+    /// reset: the draft joins the slot's next call where it left it, or
+    /// stays off for the parked why. Refused by name as
+    /// [`SlotDrafts::takes`] and [`SlotDrafts::has`] refuse.
+    pub(crate) fn unpark(
+        &mut self,
+        slot: usize,
+        p: Option<&ParkedDraft<B::Arena>>,
+    ) -> Result<(), GateError> {
         self.takes(p)?;
-        if let (Some(spec), Some(p)) = (&mut self.spec, p) {
+        if let (Some(spec), Some(p)) = (self.spec_mut(slot)?, p) {
             spec.draft_mut().unpark(&p.draft);
-            self.off = p.off.map(|why| (why, false));
+            self.off[slot] = p.off.map(|why| (why, false));
         }
         Ok(())
     }
-}
 
-impl<B: MtpBody + Slots, const M: usize> DraftedSeat<B, M>
-where
-    Window<M>: Widths,
-    B::Seq: 'static,
-{
-    /// The draft's side of each of `slots` resident slots held from here on,
-    /// each a fresh draft's — nothing waits, nothing skipped — the live
-    /// slot's in the window itself; all empty without a draft. Load-time,
-    /// once the session serves its slots.
-    pub(crate) fn hold_slots(&mut self, slots: usize) {
-        self.parked = vec![self.park(); slots];
-    }
-
-    /// Make `slot` the session's live one ([`Session::select_slot`]): the live
-    /// slot's draft side parked into its entry and the target slot's put
-    /// back around the exchange, so the target slot's draft joins its
-    /// sequence where it left it, as if no other had run. Selecting the live
-    /// slot is a no-op. Refused by name, nothing moved: a slot past the table
-    /// [`DraftedSeat::hold_slots`] made, and the exchange's own refusals (a
-    /// verify waiting for its commit, the session's and the body's checks) —
-    /// the parked entry is written only after the exchange takes.
-    pub(crate) fn select(&mut self, s: &mut Session<B>, slot: usize) -> Result<(), GateError> {
-        let was = s.selected();
-        if was == slot {
-            return Ok(());
-        }
-        let held = self.parked.len();
-        if slot >= held || was >= held {
-            return Err(format!(
-                "slot {slot} from slot {was}: the draft holds the sides of {held} slots \
-                 (DraftedSeat::hold_slots)"
-            )
-            .into());
-        }
-        let live = self.park();
-        s.select_slot(slot)?;
-        let back = self.parked[slot].take();
-        self.parked[was] = live;
-        self.unpark(back.as_ref())
+    /// Every slot's window, by slot, for a round that drives several slots'
+    /// drafts at once (`serve_seats::rounds::pass_rows_one_pass`, which
+    /// takes each busy slot's window out and puts it back); empty without a
+    /// draft.
+    pub(crate) fn specs_mut(&mut self) -> &mut [Option<Spec<B, M>>] {
+        &mut self.specs
     }
 }
 
 /// The draft's join to the held sequence, when a call made one: how many
 /// rows it caught up, or why it skips.
-fn print_join<B: MtpBody, const M: usize>(spec: &mut Speculative<MtpDraft<B>, M>) {
+fn print_join<B: MtpBody, const M: usize>(spec: &mut Spec<B, M>) {
     if let Some(j) = spec.draft_mut().take_joined() {
         Record::new(&record::MTP_PROMPT)
             .u("start", j.start)

@@ -29,10 +29,18 @@ fn main() -> std::process::ExitCode {
 #[path = "shared/serve_seats/qwen38.rs"]
 mod qwen38;
 
-// The seat's MTP draft driver, a sibling of the seat as in `bloomery-serve`.
+// The seats' MTP drafts, one a resident slot, a sibling of the seat as in
+// `bloomery-serve`.
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/drafted.rs"]
 mod drafted;
+
+// The seats' one owner of a round run as passes, a sibling of the seat as
+// in `bloomery-serve`: this seat takes its drafted half, the plain half
+// (`step_rows_one_pass`) the qwen3 seat's.
+#[cfg(feature = "gpu")]
+#[path = "shared/serve_seats/rounds.rs"]
+pub mod rounds;
 
 // The seats' shared `--ctx` default rule, a sibling of the seat as in
 // `bloomery-serve`.

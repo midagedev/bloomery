@@ -76,7 +76,7 @@
 //! prompt call's end, each with its PLE history, and under the draft the
 //! layer's side (`Seq38`): its store rows and the step's and the pass's
 //! arena rows with the positions they hold, the draft's waiting rows beside
-//! them ([`DraftedSeat::park`]). A returning session's state comes back
+//! them ([`SlotDrafts::park`]). A returning session's state comes back
 //! whole, and its checkpoints are those two points. Its default is the
 //! lesser of `bind::CACHE_RAM_CAP` and half of what `MemAvailable` leaves at
 //! load past the plan's host need, the residency's churn pool and the
@@ -86,11 +86,15 @@
 //! load, eviction and skip prints as a line.
 //!
 //! `--parallel N` (`-np N`, default 2) serves N resident sequences inside
-//! the one model (`Session::add_slots` over `Body38`'s [`Slots`]): one
-//! drafted pass a slot a round, the sequences switched by pointer exchange,
-//! and the draft's host state parked with its slot on every switch, so each
-//! request's tokens are its solo run's. `--parallel 1` is exactly the
-//! one-sequence server. The context is split as llama-server splits it with
+//! the one model (`Session::add_slots` over `Body38`'s [`Slots`]): the
+//! server's round of the busy slots runs as one pass of their drafted
+//! windows (`app::mtp::pass_slots`, every slot's rows verified together,
+//! the round cut into passes at the body's `SlotRows::MAX_ROWS`), the
+//! sequences switched by pointer exchange, and one draft held a resident
+//! slot — its host state never moved, its device side parking with the
+//! sequence on every switch — so each request's tokens are its solo run's.
+//! `--parallel 1` is exactly the one-sequence server, its rounds one pass
+//! a slot. The context is split as llama-server splits it with
 //! `-np N` and no `-kvu`: the `--ctx-size` the flags named (or the automatic
 //! choice when unset) is the total, each slot `total / N` positions rounded
 //! down, and the search for the default — the largest total whose N-slot
@@ -109,11 +113,11 @@
 //! its prompt calls at the same message starts (the draft's prompt call joins
 //! each run where the one before left it). The draft rejoins a sequence only
 //! where its last call left it: a state put back carries its waiting rows
-//! ([`DraftedSeat::park`]) and it drafts on as if no other sequence had run,
+//! ([`SlotDrafts::park`]) and it drafts on as if no other sequence had run,
 //! while a cut to a checkpoint — the rows past the cut belonging to the
 //! branch the cut dropped — leaves it proposing nothing until a request
 //! starts from position 0. The seat turns the draft off there
-//! (`DraftedSeat::turn_off`), prints a `bloomery-serve-qwen38: the MTP draft
+//! ([`SlotDrafts::turn_off`]), prints a `bloomery-serve-qwen38: the MTP draft
 //! proposes nothing …` line at the cut, and each later prompt call's `mtp
 //! prompt` record names why. A request that keeps every held position with
 //! the draft on keeps the draft. One whose kept prefix would leave the draft
@@ -189,8 +193,9 @@
 //! with this process's values and exits. The Qwen3.8 levers are
 //! `BLOOMERY_QWEN38_EXPERTS` (the plan's expert rule) with
 //! `BLOOMERY_CARD_BUDGET` bounding its card plan, the host
-//! tier's load settings, `BLOOMERY_PIN_MAIN`, the draft's levers and
-//! `BLOOMERY_RESIDENCY`; the ubatch size
+//! tier's load settings, `BLOOMERY_PIN_MAIN`, the draft's levers,
+//! `BLOOMERY_RESIDENCY` and `BLOOMERY_STEP_STATS` (the `slots round` record
+//! a round of several slots prints); the ubatch size
 //! (`BLOOMERY_QWEN3_UBATCH`) is read where the load sizes its arena. The
 //! stderr lines named above are records of the kinds
 //! `bloomery_gpu_gates::record` declares; `--records-schema` prints those
@@ -201,14 +206,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use app::mtp::MtpBody;
+use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
 use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_bytes};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
-    sampler_factory,
+    CacheRam, Seat, SeatEngine, SlotPassRow, Vocab, model_props, nvidia_smi_index,
+    pass_rows_in_turn, placement_props, sampler_factory,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -238,7 +243,7 @@ use serve::{
 };
 use tokenizer::Tokenizer;
 
-use super::drafted::{DraftedSeat, ParkedDraft};
+use super::drafted::{ParkedDraft, SlotDrafts};
 
 /// The levers `bloomery-serve-qwen38` acts on, for its own `main` and for
 /// `gate_qwen38_serve`'s (the gate starts the server with its own
@@ -256,6 +261,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::MTP_HEAD_ROWS,
     bloomery_levers::MTP_DRAFT,
     bloomery_levers::RESIDENCY,
+    bloomery_levers::STEP_STATS,
 ];
 
 const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] [--place a|gate|bp] \
@@ -274,7 +280,7 @@ const CTX_STEP: usize = 256;
 const MESSAGE_START: &str = "<|im_start|>";
 
 /// Why a cut leaves the MTP draft proposing nothing
-/// ([`DraftedSeat::turn_off`]).
+/// ([`SlotDrafts::turn_off`]).
 const DRAFT_OFF_WHY: &str = "the draft rejoins a sequence only where its last call left it, \
                              and it holds no rows at the kept position";
 
@@ -1099,6 +1105,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         draft_bytes,
         draft_off,
         residency,
+        stats: levers.step_stats(),
     };
     let engine = SeatEngine::spawn(
         move || Q38::open(open),
@@ -1168,16 +1175,22 @@ struct SeatArgs {
     draft_off: Option<Draft38Off>,
     /// The residency the load runs ([`residency38`]).
     residency: Residency,
+    /// `BLOOMERY_STEP_STATS`, the round records the seat prints.
+    stats: bool,
 }
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
-/// the draft it drives when one runs (its windows of four rows through
-/// the runtime's speculative loop), the parked draft sides of the sequences
-/// it is not standing on, and the positions its stores were
-/// sized for.
+/// one draft a resident slot (its windows of four rows through the
+/// runtime's speculative loop — every busy slot's draft reachable in one
+/// round, none moved on a [`Q38::select`]), what the open decided about the
+/// rounds of several slots, and the positions its stores were sized for.
 struct Q38 {
     s: app::Session<Body38>,
-    drafted: DraftedSeat<Body38, { <Body38 as MtpBody>::VERIFY_ROWS }>,
+    /// One draft a resident slot ([`SlotDrafts`]): a round of several
+    /// slots' drafted passes verifies every busy slot's rows in one pass
+    /// ([`Q38::pass_slots`]), which needs every busy slot's draft at once,
+    /// with no select between. Empty without a draft.
+    drafts: SlotDrafts<Body38, { <Body38 as MtpBody>::VERIFY_ROWS }>,
     ctx: usize,
     /// The plan's draft card bytes and arena, for `/props`' `draft` class.
     draft_bytes: u64,
@@ -1188,6 +1201,14 @@ struct Q38 {
     residency: bool,
     /// Under the draft, its break-even at the seat's placement.
     break_even: Option<BreakEven>,
+    /// Whether a round of several slots' drafted passes runs as one pass of
+    /// the busy rows ([`Q38::pass_slots`]): a drafted load of more than one
+    /// resident slot — the body runs several slots' rows as one pass
+    /// ([`SlotRows`]), and a round of drafted rows only a drafting server
+    /// runs. A `--parallel 1` load and a plain one keep the fallback loop.
+    one_pass: bool,
+    /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
+    stats: bool,
     /// The branch the last keep query took ([`Q38::draft_keep`]), one a
     /// slot, printed at that slot's next call; a `RefCell` because the keep
     /// query runs on `&self` (the engine thread owns the seat, so the borrow
@@ -1343,10 +1364,11 @@ impl Q38 {
         // step and verify chains stay with it, each parked slot capturing on
         // its first use.
         s.add_slots(a.slots)?;
-        let mut drafted = DraftedSeat::new(match a.mtp {
-            false => None,
+        // One draft a resident slot ([`SlotDrafts`]): every busy slot's
+        // draft reachable in one round with no select between.
+        let drafts = match a.mtp {
+            false => SlotDrafts::none(),
             true => {
-                let draft = app::mtp::MtpDraft::open(s.model(), Prompt38::Auto, StepMode::Graph)?;
                 struct Captures;
                 impl app::RowsLog for Captures {
                     fn capture_rows(
@@ -1358,18 +1380,21 @@ impl Q38 {
                         Ok(())
                     }
                 }
-                Some(s.with_draft(draft, &mut Captures)?)
+                SlotDrafts::open(&mut s, a.slots, &mut Captures, |m| {
+                    MtpDraft::open(m, Prompt38::Auto, StepMode::Graph)
+                })?
             }
-        });
-        drafted.hold_slots(a.slots);
+        };
         Ok(Q38 {
             s,
-            drafted,
+            drafts,
             ctx: a.ctx,
             draft_bytes: a.draft_bytes,
             draft_path: a.draft_path,
             residency,
             break_even: a.mtp.then(|| BreakEven::of(a.place)),
+            one_pass: a.slots > 1 && a.mtp,
+            stats: a.stats,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
         })
     }
@@ -1386,7 +1411,7 @@ impl Q38 {
     fn draft_keep(&self, at: usize, reply: Option<usize>) -> Option<Branch38> {
         let be = self.break_even?;
         let held = self.s.pos() as usize;
-        if at == 0 || (at >= held && !self.drafted.is_off()) {
+        if at == 0 || (at >= held && !self.drafts.is_off(self.s.selected())) {
             return None;
         }
         let reply = reply.map_or(NOMINAL_REPLY, |r| r.min(NOMINAL_REPLY));
@@ -1402,7 +1427,13 @@ impl Q38 {
     /// What the request's reuse left to say, at its first call on the slot
     /// it runs: the `mtp keep` record of the branch its keep took.
     fn before_call(&mut self) {
-        if let Some(b) = self.branch.borrow_mut()[self.s.selected()].take() {
+        self.before_call_at(self.s.selected());
+    }
+
+    /// [`Q38::before_call`] at `slot`, a round's row printing at its own
+    /// slot as the fallback loop's per-row pass would.
+    fn before_call_at(&mut self, slot: usize) {
+        if let Some(b) = self.branch.borrow_mut()[slot].take() {
             Record::new(&record::MTP_KEEP38)
                 .w("branch", if b.kept { "kept" } else { "reset" })
                 .u("prefix", b.prefix)
@@ -1441,7 +1472,7 @@ fn draft_off(pos: u32, what: &str) {
 }
 
 /// A Qwen3.8 sequence state as the server's prompt cache holds it, with the
-/// draft's side of it ([`DraftedSeat::park`]) beside the body's
+/// draft's side of it ([`SlotDrafts::park`]) beside the body's
 /// ([`Seq38`], the draft's rows within it). The cache ranks it by the
 /// seat's rule: every position it holds, or the point it carries at or
 /// below the shared prefix.
@@ -1483,21 +1514,25 @@ impl Seat for Q38 {
         self.s.slots()
     }
 
-    /// The session's slot ([`Session::select_slot`]), the live sequence's
-    /// draft side parked into its entry and the target's put back around the
-    /// exchange: the target slot's draft joins its sequence where it left
-    /// it, as if no other had run. The exchange is refused by name while a
-    /// verify waits for its commit (the session's and the body's own checks;
-    /// nothing has moved then — the parked entry is written only after the
-    /// exchange takes).
+    /// The session's slot ([`Session::select_slot`]): the model exchanges
+    /// its live sequence — the draft's device side with it (its store and
+    /// the step's and the pass's arena rows, [`Seq38`]) — and the slot's own
+    /// draft ([`Q38::drafts`]) needs nothing moved, its host side never
+    /// having left the slot, so the slot's next call drafts as if no other
+    /// had run. The exchange is refused by name while a verify waits for its
+    /// commit (the session's and the body's own checks; nothing has moved
+    /// then).
     fn select(&mut self, slot: usize) -> Result<(), GateError> {
-        self.drafted.select(&mut self.s, slot)
+        if self.s.selected() == slot {
+            return Ok(());
+        }
+        Ok(self.s.select_slot(slot)?)
     }
 
-    /// The draft's state is per slot ([`Q38::select`]): a slot's drafted
+    /// The draft's state is per slot ([`Q38::drafts`]): a slot's drafted
     /// passes are the passes it would run alone.
     fn slot_drafts(&self) -> bool {
-        self.drafted.drafts()
+        self.drafts.drafts()
     }
 
     /// The prompt through the ubatch walk `--prefill auto` takes: `gemm`
@@ -1506,7 +1541,8 @@ impl Seat for Q38 {
     /// the prompt's units.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         self.before_call();
-        let next = self.drafted.prefill(&mut self.s, ids)?;
+        let sel = self.s.selected();
+        let next = self.drafts.prefill(&mut self.s, sel, ids)?;
         self.print_passes()?;
         Ok(next)
     }
@@ -1516,7 +1552,8 @@ impl Seat for Q38 {
     /// sequence joins it here when its prompt call is empty).
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
         self.before_call();
-        let next = self.drafted.step(&mut self.s, last)?;
+        let sel = self.s.selected();
+        let next = self.drafts.step(&mut self.s, sel, last)?;
         self.print_passes()?;
         Ok(next)
     }
@@ -1526,18 +1563,21 @@ impl Seat for Q38 {
     }
 
     /// One step and the target's row of it, read before the step is told
-    /// to the draft ([`DraftedSeat::step_with_row`]).
+    /// to the draft ([`SlotDrafts::step_with_row`]).
     fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
         self.before_call();
-        let next = self.drafted.step_with_row(&mut self.s, last, row)?;
+        let sel = self.s.selected();
+        let next = self.drafts.step_with_row(&mut self.s, sel, last, row)?;
         self.print_passes()?;
         Ok(next)
     }
 
-    /// The session's reset, the MTP draft on again: the residency stays
-    /// where use has taken it (only [`Seat::residency_reset`] moves it back).
+    /// The session's reset, the selected slot's draft on again: the
+    /// residency stays where use has taken it (only [`Seat::residency_reset`]
+    /// moves it back), and the other slots' drafts stand as they are.
     fn reset(&mut self) -> Result<(), GateError> {
-        self.drafted.reset(&mut self.s)
+        let sel = self.s.selected();
+        self.drafts.reset(&mut self.s, sel)
     }
 
     /// [`app::Session::residency_reset`], its `residency reset` record on
@@ -1560,7 +1600,8 @@ impl Seat for Q38 {
     /// its kept tokens and counts; without it one step.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
         self.before_call();
-        let d = self.drafted.pass(&mut self.s, last, out)?;
+        let sel = self.s.selected();
+        let d = self.drafts.pass(&mut self.s, sel, last, out)?;
         self.print_passes()?;
         Ok(d)
     }
@@ -1568,7 +1609,47 @@ impl Seat for Q38 {
     /// The most positions one pass runs: the draft's four rows, or one
     /// step without it.
     fn pass_rows(&self) -> usize {
-        self.drafted.pass_rows()
+        self.drafts.pass_rows(self.s.selected())
+    }
+
+    /// The lever the binary parsed ([`Q38::stats`]).
+    fn step_stats(&self) -> bool {
+        self.stats
+    }
+
+    /// One round of several slots' drafted passes: while the open decided
+    /// so ([`Q38::one_pass`]) one pass of the busy rows — every slot's
+    /// window verified together through [`super::rounds::pass_rows_one_pass`],
+    /// the round cut into passes at the body's `SlotRows::MAX_ROWS`, a slot
+    /// whose draft a cut turned off stepped alone before them — else the
+    /// fallback ([`pass_rows_in_turn`]: a select and a pass a row). The open
+    /// decides once, so a load that cannot run one pass never tries it at
+    /// run time: a refusal on either path is the server's to die on, never
+    /// a fallback. The rows are distinct slots below [`Seat::slots`] (the
+    /// engine's own named refusal), a slot whose draft skips rides the pass
+    /// as one plain row and an off slot runs its own plain step, so no
+    /// row-level fallback exists.
+    fn pass_slots(&mut self, rows: &mut [SlotPassRow]) -> Result<(), String> {
+        if !self.one_pass {
+            return pass_rows_in_turn(self, rows);
+        }
+        // What the fallback loop's per-row `pass` would print at its slot.
+        let round: Vec<usize> = rows.iter().map(|r| r.slot).collect();
+        for slot in round {
+            self.before_call_at(slot);
+        }
+        let passes = super::rounds::pass_rows_one_pass(
+            &mut self.s,
+            rows,
+            &mut self.drafts,
+            <Body38 as MtpBody>::WIDTH,
+        )
+        .map_err(|e| e.to_string())?;
+        self.print_passes().map_err(|e| e.to_string())?;
+        if self.stats {
+            record::slots_round("pass", rows.len(), passes, self.slots()).eprint();
+        }
+        Ok(())
     }
 
     /// The body's rule (`Body38::kept`): every held position, or the
@@ -1611,8 +1692,8 @@ impl Seat for Q38 {
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
         let held = self.s.pos();
         self.s.model_mut().rollback(pos)?;
-        if self.drafted.drafts() && pos < held {
-            self.drafted.turn_off(DRAFT_OFF_WHY);
+        if self.drafts.drafts() && pos < held {
+            self.drafts.turn_off(self.s.selected(), DRAFT_OFF_WHY)?;
             draft_off(pos, &format!("a cut back from {held}"));
         }
         Ok(())
@@ -1638,7 +1719,7 @@ impl Seat for Q38 {
     /// file, its width and its resident bytes as the card's `draft`
     /// class.
     fn props(&self, mut p: EngineProps) -> EngineProps {
-        if !self.drafted.drafts() {
+        if !self.drafts.drafts() {
             return p;
         }
         if let Some(place) = p.placement.as_mut() {
@@ -1663,16 +1744,17 @@ impl Seat for Q38 {
 
     /// The sequence state (`GpuModel::seq_save`, the draft's rows within it)
     /// as the prompt cache holds it, with the draft's side of it
-    /// ([`DraftedSeat::park`]) beside the body's.
+    /// ([`SlotDrafts::park`]) beside the body's.
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
+        let sel = self.s.selected();
         Ok(Arc::new(Saved38 {
             state: self.s.model_mut().seq_save()?,
-            draft: self.drafted.park(),
+            draft: self.drafts.park(sel)?,
         }))
     }
 
     /// The state put back (`GpuModel::seq_resume`) after the session's reset,
-    /// then the draft's side of it ([`DraftedSeat::unpark`]): the sequence's
+    /// then the draft's side of it ([`SlotDrafts::unpark`]): the sequence's
     /// next call runs as it would have with no switch between, its draft
     /// joining where it left. Refused by name, before the reset, for a state
     /// this seat did not take or one saved with the draft on put back with it
@@ -1683,10 +1765,11 @@ impl Seat for Q38 {
             .as_any()
             .downcast_ref::<Saved38>()
             .ok_or("a saved state that is not a qwen4exp body's")?;
-        self.drafted.takes(saved.draft.as_ref())?;
-        self.drafted.reset(&mut self.s)?;
+        let sel = self.s.selected();
+        self.drafts.takes(saved.draft.as_ref())?;
+        self.drafts.reset(&mut self.s, sel)?;
         self.s.model_mut().seq_resume(&saved.state)?;
-        self.drafted.unpark(saved.draft.as_ref())
+        self.drafts.unpark(sel, saved.draft.as_ref())
     }
 
     /// A prefix kept less of than shared is a `cache reuse` record; every

@@ -86,8 +86,8 @@
 //! `--parallel N` (`-np N`, default 2) serves N resident sequences inside
 //! the one model (`Session::add_slots` over the body's `Slots`): the server
 //! steps every running slot in each round, the sequences switched by
-//! pointer exchange and the draft's side of each slot kept with it
-//! ([`DraftedSeat::select`]), so each request's tokens are its solo run's;
+//! pointer exchange and each slot's own draft held beside it
+//! ([`SlotDrafts`]), so each request's tokens are its solo run's;
 //! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
 //! by name. The round's shape the open decided once: a plain load (no
 //! NextN draft) runs it as one pass of the busy rows
@@ -204,7 +204,7 @@ use serve::{
 };
 use tokenizer::Tokenizer;
 
-use super::drafted::{DraftedSeat, ParkedDraft};
+use super::drafted::{ParkedDraft, SlotDrafts};
 use crate::glm_place;
 
 /// The seat's name, as its records and errors print it.
@@ -829,7 +829,7 @@ struct SeatArgs {
 /// for.
 struct Glm {
     s: Session<Body>,
-    drafted: DraftedSeat<Body, VERIFY_ROWS>,
+    drafted: SlotDrafts<Body, VERIFY_ROWS>,
     ctx: usize,
     /// The plan's bytes for the NextN layer, for `/props`' `draft` class.
     draft_bytes: u64,
@@ -899,14 +899,12 @@ impl Glm {
         // chains already captured, each parked slot capturing its own on its
         // first use.
         s.add_slots(a.slots)?;
-        let mut drafted = DraftedSeat::new(match a.draft_off {
-            Some(_) => None,
-            None => {
-                let draft = MtpDraft::open(s.model(), prefill, StepMode::Eager)?;
-                Some(s.with_draft::<MtpDraft<Body>, VERIFY_ROWS>(draft, &mut PairCapture)?)
-            }
-        });
-        drafted.hold_slots(a.slots);
+        let drafted = match a.draft_off {
+            Some(_) => SlotDrafts::none(),
+            None => SlotDrafts::open(&mut s, a.slots, &mut PairCapture, |m| {
+                MtpDraft::open(m, prefill, StepMode::Eager)
+            })?,
+        };
         Ok(Glm {
             s,
             drafted,
@@ -1083,11 +1081,13 @@ impl Seat for Glm {
         self.s.slots()
     }
 
-    /// The session's slot through the draft's table
-    /// ([`DraftedSeat::select`]): the live slot's draft side parked and the
-    /// target's put back around the exchange.
+    /// The session's slot ([`Session::select_slot`]): the slot's draft
+    /// ([`Glm::drafted`], one a slot) needs nothing moved.
     fn select(&mut self, slot: usize) -> Result<(), GateError> {
-        self.drafted.select(&mut self.s, slot)
+        if self.s.selected() == slot {
+            return Ok(());
+        }
+        Ok(self.s.select_slot(slot)?)
     }
 
     /// The draft's state is per slot ([`Glm::select`]): a slot's drafted
@@ -1130,7 +1130,8 @@ impl Seat for Glm {
     /// checkpoints its marks name; under the draft the draft's own prompt
     /// call, its store walked over the prompt's units.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        let next = self.drafted.prefill(&mut self.s, ids)?;
+        let sel = self.s.selected();
+        let next = self.drafted.prefill(&mut self.s, sel, ids)?;
         self.print_passes()?;
         Ok(next)
     }
@@ -1139,7 +1140,8 @@ impl Seat for Glm {
     /// (`MtpDraft::before_step`: a request that continues the held sequence
     /// joins it here when its prompt call is empty).
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
-        let next = self.drafted.step(&mut self.s, last)?;
+        let sel = self.s.selected();
+        let next = self.drafted.step(&mut self.s, sel, last)?;
         self.print_passes()?;
         Ok(next)
     }
@@ -1151,7 +1153,8 @@ impl Seat for Glm {
     /// One step and the target's row of it, read before the step is told to
     /// the draft ([`DraftedSeat::step_with_row`]).
     fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
-        let next = self.drafted.step_with_row(&mut self.s, last, row)?;
+        let sel = self.s.selected();
+        let next = self.drafted.step_with_row(&mut self.s, sel, last, row)?;
         self.print_passes()?;
         Ok(next)
     }
@@ -1159,7 +1162,8 @@ impl Seat for Glm {
     /// One pass from `last`: under the draft the window of two rows, its
     /// kept tokens and counts; without it one step.
     fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
-        let d = self.drafted.pass(&mut self.s, last, out)?;
+        let sel = self.s.selected();
+        let d = self.drafted.pass(&mut self.s, sel, last, out)?;
         self.print_passes()?;
         Ok(d)
     }
@@ -1167,13 +1171,14 @@ impl Seat for Glm {
     /// The most positions one pass runs: the window's two rows, or one step
     /// without the draft.
     fn pass_rows(&self) -> usize {
-        self.drafted.pass_rows()
+        self.drafted.pass_rows(self.s.selected())
     }
 
     /// The session's reset, then the draft started over: the residency stays
     /// where use has taken it (only [`Seat::residency_reset`] moves it back).
     fn reset(&mut self) -> Result<(), GateError> {
-        self.drafted.reset(&mut self.s)
+        let sel = self.s.selected();
+        self.drafted.reset(&mut self.s, sel)
     }
 
     /// [`Session::residency_reset`], its `residency reset` record on stderr;
@@ -1250,7 +1255,7 @@ impl Seat for Glm {
     fn snapshot(&mut self) -> Result<Arc<dyn Saved>, GateError> {
         Ok(Arc::new(SavedGlm {
             state: seq_save(self.s.model_mut())?,
-            draft: self.drafted.park(),
+            draft: self.drafted.park(self.s.selected())?,
         }))
     }
 
@@ -1265,10 +1270,11 @@ impl Seat for Glm {
             .as_any()
             .downcast_ref::<SavedGlm>()
             .ok_or("a saved state that is not a glm5next body's")?;
+        let sel = self.s.selected();
         self.drafted.takes(saved.draft.as_ref())?;
-        self.drafted.reset(&mut self.s)?;
+        self.drafted.reset(&mut self.s, sel)?;
         seq_resume(self.s.model_mut(), &saved.state)?;
-        self.drafted.unpark(saved.draft.as_ref())
+        self.drafted.unpark(sel, saved.draft.as_ref())
     }
 
     /// A prefix kept less of than shared is a `cache reuse` record; every
