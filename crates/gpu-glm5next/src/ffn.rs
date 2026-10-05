@@ -87,8 +87,8 @@ struct CardLayer {
 
 /// The card's routed experts of the step: the family's kernels, each layer's
 /// count and limit from the slot map and the description, and each row's
-/// one-token buffers every card layer's shadow writes (a verify's row reads
-/// its own card sum in its back, after the other row's shadow). Made at load, after the weights,
+/// one-token buffers every card layer's shadow writes (a verify's or a pass's
+/// row reads its own card sum in its back, after the other rows' shadows). Made at load, after the weights,
 /// from the stacks they hold; a layer the map puts experts on holds its three
 /// stacks in a format [`card_routed`] names, at `n_card` experts each, and a
 /// layer it puts none on holds none — anything else is refused by name.

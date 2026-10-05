@@ -1,11 +1,11 @@
 //! The KDA mixer of one layer at one token: `x` (the fold of the streams by
 //! the sub-layer's own mix) in, the update into `out`, the layer's conv ring
 //! written at the token's position and its state read from the committed
-//! lane: the step (row 0) and each row of a pass of two slots write it back
-//! in place, a verify's row 1 into the next lane, on a load of two
-//! (`place::KdaLanes`; the row base, `Parts::base`). The store keeps no
-//! history past its lanes: an earlier position comes back only through a
-//! checkpoint.
+//! lane: the step (row 0) and each row of a plain pass of slots write it
+//! back in place, a verify's row 1 — a verify's own, or a slot's in a NextN
+//! load's pass — into the next lane, on a load of two (`place::KdaLanes`;
+//! the row base, `Parts::base`). The store keeps no history past its
+//! lanes: an earlier position comes back only through a checkpoint.
 //!
 //! The launches, in order (ik `src/llama-kda.cpp`):
 //! 1. `attn_norm` RMS;

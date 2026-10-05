@@ -68,7 +68,7 @@ use runtime::sched::{At, Overlap, Port, PortKind};
 
 use super::prefill::PromptState;
 use super::{
-    Body, Dims, Embedding, Kernels, PAIR_ROWS, RowScratch, Scratch, f32t, f32v, gemv, q8, weight,
+    Body, Dims, Embedding, Kernels, LANES, RowScratch, Scratch, f32t, f32v, gemv, q8, weight,
 };
 use crate::mla::{self, LatentStore};
 use crate::tensors::{FfnNames, LatentNames, LayerNames, MixerNames};
@@ -243,12 +243,15 @@ pub struct NextnSeq {
 impl NextnSeq {
     /// A cut of the sequence's target to `pos` ([`Nextn::cut`]'s rule on a
     /// parked sequence): the store holds no position past it.
-    #[expect(
-        dead_code,
-        reason = "a parked slot's commit cuts its draft with it; the wiring is the drafted pass's"
-    )]
     pub(super) fn cut(&mut self, pos: u32) {
         self.held = self.held.min(pos as usize);
+    }
+
+    /// The parked sequence's verify row-0 copy, which the end of a pass of
+    /// several slots that runs its verify rows fills (`Body::copy_pair0`);
+    /// the live sequence's is the layer's ([`Nextn::pair0_mut`]).
+    pub(super) fn pair0_mut(&mut self) -> &mut DeviceBuffer<f32> {
+        &mut self.pair0
     }
 }
 
@@ -667,12 +670,12 @@ fn hidden_src<'a>(
     };
     let src = match walk {
         GlmArena::Step => Src::Rows {
-            buf: &s.row0.streams[fin],
+            buf: &s.rows[0].streams[fin],
             rows: 1,
         },
         GlmArena::Pair => Src::Pair {
             row0: pair0,
-            row1: &s.row1.streams[fin],
+            row1: &s.rows[1].streams[fin],
         },
         GlmArena::Prefill => {
             let (buf, rows) = prompt
@@ -841,8 +844,13 @@ impl Body {
         }
         let fin = crate::program::final_streams(self.cfg.len());
         let wide = HC_STREAMS * self.dims.embd;
-        let step = read_rows(stream, self.wrote.step, &[&self.s.row0.streams[fin]], wide)?;
-        let pair_rows = [&nx.pair0, &self.s.row1.streams[fin]];
+        let step = read_rows(
+            stream,
+            self.wrote.step,
+            &[&self.s.rows[0].streams[fin]],
+            wide,
+        )?;
+        let pair_rows = [&nx.pair0, &self.s.rows[1].streams[fin]];
         let pair = read_rows(stream, self.wrote.pair, &pair_rows, wide)?;
         Ok(Some(DraftRows {
             held: nx.held as u32,
@@ -868,7 +876,7 @@ impl Body {
             )));
         }
         let wide = HC_STREAMS * self.dims.embd;
-        for (what, (held, v), rows) in [("step", &d.step, 1), ("verify", &d.pair, PAIR_ROWS)] {
+        for (what, (held, v), rows) in [("step", &d.step, 1), ("verify", &d.pair, LANES)] {
             let r = held.rows as usize;
             if r > rows || v.len() != r * wide || (r > 0 && held.first + held.rows > pos) {
                 return Err(shape(format!(
@@ -901,8 +909,8 @@ impl Body {
         let nx = nextn.as_deref_mut().ok_or_else(|| {
             shape("the NextN rows of a state put back on a load without the layer".into())
         })?;
-        write_rows(stream, &d.step.1, &mut [&mut s.row0.streams[fin]], wide)?;
-        let mut pair_rows = [&mut nx.pair0, &mut s.row1.streams[fin]];
+        write_rows(stream, &d.step.1, &mut [&mut s.rows[0].streams[fin]], wide)?;
+        let mut pair_rows = [&mut nx.pair0, &mut s.rows[1].streams[fin]];
         write_rows(stream, &d.pair.1, &mut pair_rows, wide)?;
         nx.held = d.held as usize;
         *wrote = Wrote {
