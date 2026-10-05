@@ -1,65 +1,86 @@
-# Round glmlift's card, for the lead to sit: GLM-5.3-Flash's serving defaults (the NextN MTP draft and adaptive
-# residency mid-p0-s1) on plan (a), the A6000 alone, against plan (b′) (--place bp: plan (a) on the A6000 and the
-# 3090 an expert tier under the host tier), one binary, decode at prose depth 512. The answer decides whether the GLM
-# seat's default moves from --place a to bp (round glmlift lifted the tier's refusals beside both levers; the default
-# stays a until this run).
-# Decomposition [derived], one drafted pass (two rows, the target's next token and one proposal):
-# - the pass on plan (a): 58.3 ms at the clip's acceptance 29/35 (round ncard's report, section 2), its host leg 378
-#   union slots at 0.111..0.117 ms a slot (glmres-ab.card: an expert's 15.2 MB read at ~133 GB/s, flat in its 1..2
-#   columns), 43 ms; the host leg is the per-layer max on the step's sum path (the card's ~66 experts a layer read
-#   in its shadow), so a host slot removed is its 0.114 ms off the wall;
-# - the tier: about 39 experts a layer on 39 routed layers (round ncard: the 3090's 23.67 GB less its batch reserve
-#   at 15.2 MB an expert; the NextN plan's reserve, the layer's card bytes and its 16 MB arena, is also taken off
-#   the tier card by placement::plan_rule, about one expert a layer, 2.5 %); the tier's ids are the ones after the
-#   stage card's id prefix, uncorrelated with how hot they route. Under the residency the card holds the hottest 66
-#   of the 249 non-tier ids instead of 288; the tier carries its ids' share of the routed mass, ~39/288 = 13.5 % of
-#   all slots, and the card's hit drops by less than that (its top-66 loses ~13.5 % of its members, refilled from
-#   ranks 67..76): the host's share falls from 60.5 % (glmres-ab's replay, card hit 39.5 %) to 48.7..51.0 %,
-#   -15..-20 % of the host slots, 57..76 union slots a pass: -6.3..-8.9 ms;
-# - c_two, the two-card fixed cost a step pays (+1.9..+2.5 ms over V4.1's one-card model, rig-log
-#   09-29#chatlist-dspark, docs/plan-triage.md; its source is open): +1.9..+2.5 ms a pass if it is paid once a pass,
-#   +3.8..+5.0 if once a row: +1.9..+5.0;
-# - unchanged: the draft's walk (the NextN layer's experts are host-only in both arms, its walk on the stage card),
-#   the residency's staging, the card front.
-# Pass 58.3 - 8.9 + 1.9 = 51.3 ms .. 58.3 - 6.3 + 5.0 = 57.0 ms: tok/s +2.3 .. +13.6 %, band +2..+14 [derived].
-# Round ncard's -2..+15 took the tier's low edge at 26 slots a row (-3.8 ms a pass); a tier share under 15 % of the
-# host slots needs the tier's ids to route below the mean, which the id-prefix fill gives no reason for. The edge
-# nearest 0 rests on that share and c_two per row; the run reads both together, as d_slots (BLOOMERY_STEP_STATS is
-# refused beside the draft today, so the host slots a pass are not printed: the ratio is the term).
-# Waits for the per-arm place runner (round armplace's tools/ref/depth-glm5next.sh: an arm's `place=<a|gate|bp>` item,
-# the two-card mode BLOOMERY_TIMING_CARDS=a6000+3090 with depth-ds41.sh's witness — both cards' name and power
-# limit, the 3090 at its 250 W cap, Xid before and after every arm — and each ours arm's load record `cards`
-# held to its placement, which generate_glm5next prints since round glmlift). The two arms differ in their place=
-# item alone, so the runner pairs them by round in its `ratio place d=` table (bp / a), the list
-# `tools/ref/card.py verdict` reads. With it:
-#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmbp-ab.card BLOOMERY_AB_ROUNDS=4
-#   BLOOMERY_TIMING_CARDS=a6000+3090' just depth-gpu-glm5next oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1,place=a
-#   oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1,place=bp > <log> 2>&1
-# Wall [derived]: 2 arms x (4 rounds + 1 warm-up) = 10 processes, each a load with its host set preheated (the bp
-# load also uploads the tier's ~23 GB to the 3090, ~1..2 s at PCIe 4.0 x16) plus 512 prompt ids and 96 generated:
-# 1.2..2.0 min a process (glmres-ab's 10..18 min for 8), 12..20 min.
+# Round glm2card's decode card, a rewrite of round glmlift's (its terms predate glmswap, glmgemm2, glmpp3, glmnext,
+# glmtiles and the S4 body): GLM-5.3-Flash at the serving defaults (the NextN MTP draft, residency mid-p0-s1) on
+# plan (a), the A6000 alone, against plan (b′) (--place bp: plan (a) with the 3090 an expert tier under the host
+# tier), one binary, decode at prose depth 512, n 96, ctx 2048, one stream. With docs/cards/glmbp-pp.card (pp512,
+# read from the same log) it decides whether the GLM seat's unset --place moves from a to bp.
+# Decomposition [derived], one drafted pass: two rows one layer apart on one stream (crates/gpu-glm5next/src/pair.rs
+# :1-9), the host serving one row's leg while the card runs the other row's layer, so the pass is the sum over the
+# layers of max(host legs, card work) (V4.1's pair measured 2H, 09-24, specs multiseq2 msstagger):
+# - placement: the 3090 holds 1,501 experts, 38..39 a layer on the 39 card-routable layers (3..10, 13..43; 11, 12
+#   and 44 carry Q6_K downs and stay host-only, glm5next/place.rs card_routed): its 24,176 MiB less the context 512,
+#   scratch 64, margin 1,024, the tier batch reserve 80.7 MiB (placement/workstation.rs:443) and the reserve plan_rule
+#   takes off every card, the tier's Fill included (placement.rs:1792-1801): plan_nextn_slots' NextN bytes, arena
+#   16 MiB, prompt front 144.7 MB, card tiles 153.2 MB, two group units 134.4 MB (glm5next/place.rs:789-791). The
+#   same formulas less the last three give 1,532; glmlift's seat --plan read 1,531. The tier ids follow the stage
+#   card's prefix; the A6000 keeps ~2,568, 65..66 a layer (glmnext's 2,593 plain at ctx 4352, +3 at 2048, -18 the
+#   NextN bytes, -10 the second KDA lane), the same in both arms.
+# - host slots a row, replayed over the ik router set glm5next-prose (tools/ref/router-residency.py's replay, the tier
+#   ids `away`; 24 contexts, 512 prompt ids kept 0, then 96 positions in passes of two rows, both kept at alpha
+#   0.829; the mid rule, 1 spare, live 2 passes on; its plain-step arm gives glmres-ab's 39.5 % hit and 212.8 slots):
+#   plan (a) 206.0 on the 39 layers + 24 on the Q6_K layers, stage hit 34.0 %; bp 166.9 + 24, stage hit 32.7 %, tier
+#   13.8 % of the slots (13.4 % for uniform routing): -39.1 a row (37.3..41.3 over the contexts), -17 %.
+# - host leg: 0.111..0.117 ms a slot (glmres-ab.card), the second row 0.93..1.0 of its own (glmpair-probe.card), F
+#   2.5..3.5 ms a row: 1.25..1.40 ms a layer-pair on (a), 1.03..1.17 on bp; the host leg -8.4..-9.1 ms a pass.
+# - A6000 a layer-pair: 2 x (front 0.23..0.34 ms, latent layers x1.0..1.3 + the shared expert 0.045 + 2.6..2.7 card
+#   slots at 0.025..0.035): 0.70..1.10 ms. The front is C1 = S1 47.7 - h 29.6..31.4 - F (glmpair-probe.card) less
+#   the dense layers and the head, over 42 layers. In the host's shadow on (a) (0..5 layers card-bound); 0..27
+#   card-bound layers on bp, where the card caps the tier's slots.
+# - c_two (V4.1's bp steps sit 1.9..2.5 ms over its plan (a) calibration, docs/plan-triage.md:355, rig-log
+#   09-29#chatlist-dspark; source open): card-side a tiered row-layer (0.050..0.066 ms, in the card term above, hidden
+#   where the host leads), or once a pass (1.9..2.5 ms on the wall). Not both: one term fit V4.1's rows.
+# - the 3090: ~1.1 tier slots a row-layer, ~0.04..0.06 ms, inside the row's 0.47..0.58 ms host leg. PCIe a row-layer:
+#   16 KB of activation to the 3090, ~18 KB of rows back, read by the A6000's join through the mapping: ~2.7 MB a pass
+#   on each link, under 0.1 ms at 26.28 GB/s (docs/facts.md:66). Host DRAM: nothing new (~4 MB a pass).
+# - unchanged: the Q6_K layers (6.0..6.5 ms a pass), the dense lead and heads (3..5), the NextN walk (2.4..2.7,
+#   layer 45 host-only), the commit (0.3..1.0), the residency's landing waits (0..12 ms a pass,
+#   glmresmtp-stage.card's 8..51 ms a landing).
+# Pass (a) 60.6..82.1 ms, bp 52.2..76.3 ms; plan (a) 22.3..30.2 tok/s at alpha 0.829. Effect over the grid of every
+# term above: +4.7..+16.3 %, median +11.7, written outward as +4.5..+16.5. The edge nearest 0 is the front at
+# 0.34 ms, latent layers x1.3 and c_two card-side. A front of 0.37 (h at the 147.7 GB/s peak, not the measured
+# slot rate) would put that edge at +2.5 %.
+# Acceptance: the tier runs its ids (n_l..n_l+t_l, about 66..104) on card kernels where (a) runs them on the host,
+# and the residency picks other flips, so the greedy streams may part and each arm keeps its own positions a
+# pass, the same every round: a bias, not a scatter. The band is a pass-time effect: the verdict reads the tok/s
+# ratio over the arms' positions/pass ratio and reports both.
+# Sitting: one runner invocation serves both cards (its bp/a pair prints `ratio place d=512` and
+# `ratio place pp p=512`); lease_take checks one card, this one, so glmbp-pp.card is checked with card.py check
+# before the sitting and read from the same log. From the tree that holds both cards in docs/cards:
+#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_TIMING_CARDS=a6000+3090
+#   BLOOMERY_LEASE_CARD=docs/cards/glmbp-ab.card' just depth-gpu-glm5next
+#   oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1,place=a oursmtp:512@BLOOMERY_RESIDENCY=mid-p0-s1,place=bp > <log> 2>&1
+# Wall [derived]: 2 arms x (4 rounds + 1 warm-up) = 10 processes at 1.1..2.1 min (a load at 45..75 s, the glmnext
+# and glmlane2 cards; the bp load uploads ~22.8 GB more; each arm's preheat, which after a bp arm re-reads the
+# ~63 GB its load dropped; 512 prompt ids, 96 generated): 12..22 min; at 3 rounds 10..18.
 kind: ab
-question: on the serving defaults (NextN draft + residency mid-p0-s1), does plan (b′) — the 3090 as GLM's expert
-  tier — decode faster than plan (a) on the A6000 alone, by the host slots the tier takes less the two-card cost?
-term: tok/s(mean) @ n=96, depth 512, A6000 (+ 3090 under bp), prose ids (GLM_PROSE from GLM_PROSE_FROM), ctx 2048,
-  BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=mid-p0-s1, --place bp against --place a, same binary, paired by round
+question: on the serving defaults (NextN draft + residency mid-p0-s1), does plan (b′), the 3090 as GLM's expert
+  tier, decode faster than plan (a) on the A6000 alone, by the host slots the tier takes less what the A6000 and
+  the two-card cost hand back?
+term: pass-time effect @ n=96, depth 512, A6000+3090 (the 3090 idle under a), prose ids (GLM_PROSE from
+  GLM_PROSE_FROM), ctx 2048, BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=mid-p0-s1, --place bp against --place a, same
+  binary, paired by round: the runner's `ratio place d=512` (bp / a, tok/s) over the arms' mtp positions/pass
+  ratio (bp / a), less 1
 unit: %
-predict: +2..+14
+predict: +4.5..+16.5
 rounds: 4
 sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
-condition: one binary, both arms in one lease, a fresh process a run (each residency run starts at the seed); every
-  row's SMOKE names the arm's place (a, bp), the bp arm's load record names cards A6000 then 3090 with
-  tier_experts > 0 and its plan record 1,531 fewer host_experts than the a arm's at the same card_experts 2600
-  (the seat's --plan at ctx 2048: 9,496 against 7,965, round glmlift's serve gate log), and the 3090 runs no other
-  compute process (no [other-busy] on the bp rows); each arm prints
-  `residency lever residency=mid-p0-s1 why=set`, a `residency host` record and an `mtp summary`; no row [cold],
-  [cpu-busy] or [other-busy]; no Xid on either card before or after; the full output to a file first
-decide-in: move the GLM seat's unset --place from a to bp (serve_seats/glm.rs parse_args, README and docs/BUILD.md),
-  then sit the bp arm in the public table beside plan (a); the edge reads the tier's host-slot share and c_two
-  together, so a value in the lower third takes one BLOOMERY_STEP_STATS window on the plain bp arm (host slots a
-  step, tier hits) before the public row
-decide-below: keep --place a as the default; the tier takes fewer host slots than its share (the residency's card
-  set overlaps the tier's ids) or c_two is paid per row and larger than V4.1's: one nsys window of the bp arm (the
-  tier's go and join against the host leg per layer) before any tier-slot residency work
-decide-above: move the default to bp, and price tier-slot residency (the 3090's slots moved by the same rule,
-  round ncard's D3 next lever) next: the tier's share is above its ids' mean mass, so a hot-set tier pays more
+condition: one runner invocation, both arms in one lease (BLOOMERY_TIMING_CARDS=a6000+3090), every row's card
+  field A6000+3090, each witness block naming both cards with the 3090 at its 250 W cap and no Xid before or after
+  any arm; a fresh process a run, each starting at the residency seed; every ok row carries the residency column
+  `residency mid-p0-s1 (set)` and its `mtp positions/pass` (the runner fails a row without either); the runner's
+  cards check holds the bp arm's load record to the A6000 then the 3090 and the a arm's to the A6000 alone; on the
+  rows' plan columns card_experts is the same within 1 (2,550..2,590) and host_experts(a) - host_experts(bp), the
+  tier's count, reads 1,490..1,515 (another count rescales the tier's term on paper, 39.1 slots a row x count /
+  1,501, and needs no re-sit); no row carries [cold], [cpu-busy] or [other-busy]; the full output to a file first
+decide-in: two cards decode faster: move the GLM seat's unset --place from a to bp
+  (crates/gpu-gates/src/bin/shared/serve_seats/glm.rs, README, docs/BUILD.md) only when this reading's lower bound
+  is above 0 and glmbp-pp.card's reading of the same log has its lower bound above 0 too (one --place default,
+  flipped only when two cards are not slower, user 2026-10-02); else keep a and act on that card's decision; then
+  sit both rows in the A6000+3090 table and open tier-slot residency as the next decode lever
+decide-below: below +4.5 the A6000's per-layer work caps the tier's slots more than the band's front allows, or
+  c_two sits once a pass above 2.5 ms: with the lower bound still above 0 the default may move as in decide-in,
+  with the pp card; at or below 0 keep --place a whatever the pp card reads; either way one nsys window of the bp
+  pair pass (host legs, the A6000's per-layer work, the tier's go and count words) before any tier lever
+decide-above: above +16.5 move the default as in decide-in, with the pp card; (a)'s host legs or landing waits run
+  longer than the band holds (bp's shorter legs open the staging window more): one functional run of each arm
+  under generate_glm5next for the residency pass records' wait_us (the runner keeps none on an ok row) before
+  pricing the staging-window lever (crates/gpu/src/host/swap.rs:815)
