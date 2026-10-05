@@ -234,16 +234,54 @@
 //!   [`SLOT_RESUMED`] passes and a step bit for bit, counts included, their
 //!   solo runs'.
 //!
-//! An error inside a clause body of (sp), (sc), (sd) or (s3) is that clause's
-//! FAIL, not the gate's end; one in a load, a solo run or the draft's open
-//! ends the gate.
+//! A pass of two slots (`GpuModel::step_slots`: the pair's walk, each row a
+//! plain step of its own slot), residency off, the first two prompts. On the
+//! NextN load, between (sc) and H4, (g5)'s first refusal: a pass of both
+//! slots refused by name, no position moved. Then on the plain load of one
+//! KDA lane, its plan counting [`G_SLOTS`] slots, against each slot's solo run from
+//! a reset (slot 0; the stores digested as (slots) digests them):
+//! - (g1) bits: both slots prompted, [`G_ROUNDS`] passes of both (row order
+//!   0, 1 and 1, 0 in turn), one of slot 1 alone, then a plain step of each
+//!   (its own chain over the buffers the passes bound and gave back): every
+//!   row's id and logits hash, each slot's last logits bit for bit, stores
+//!   and position its solo run's — in graph mode and again in eager mode.
+//! - (g1b) parked, after (g1) in each mode: slots 1 and 2 prompted with the
+//!   same two prompts, [`G1B_ROUNDS`] passes of both while slot 0, the live
+//!   one, stays idle (both rows a parked sequence's): each slot its solo
+//!   run's as in (g1), slot 0's position and stores as they stood.
+//! - (g2) cut: after (g1) in graph mode, slot 1 cut back to its prompt
+//!   call's checkpoint, then [`G_AFTER_CUT`] passes of both: slot 1 its solo
+//!   run from its prompt's step, slot 0 its solo run's continuation — the
+//!   parked slot's cut carried out from its own checkpoints by the pass.
+//!   Slot 1's stores compare up to its position: the cut leaves its rows
+//!   past it as they were, which a run from a reset holds zeroed.
+//! - (g3) fault: a NaN in the head's gain under a pass of both slots ends it
+//!   in the head's fault and poisons both, each slot's step and the pass
+//!   refused naming the set; slot 0's reset leaves slot 1 in it, slot 1's
+//!   lifts it; prompted again, the next pass both solo runs' first step.
+//! - (g5) refusals by name, no position moved, each from both slots
+//!   prompted afresh: three rows in one pass naming the body's bound 2, the
+//!   taps armed, a slot whose step failed past its launch, a slot of two
+//!   rows, a route trace attached.
+//!
+//! Then on a plain load of two KDA lanes:
+//! - (g4) walk: the captured pass of both slots holds the captured verify's
+//!   nodes; the verify replayed after the pass's capture (which re-records
+//!   the pair's go order) and the pass replayed after the verify's capture
+//!   each bit for bit their solo runs; between them, a pass refused by name
+//!   while slot 0's verify waits for its commit.
+//!
+//! An error inside a clause body of (sp), (sc), (sd), (s3) or (g1)-(g5) is
+//! that clause's FAIL, not the gate's end; one in a load, a solo run or the
+//! draft's open ends the gate.
 //!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
 //! at [`CTX`] of one lane, `--only verify` (s) and (v) alone on a load at
 //! [`CTX`] of two (the plain graph run of the batch set they compare against
 //! included), `--only keep` (k) alone on a load at [`CTX`] of two, `--only
-//! slots` the resident slots' clauses alone on their two loads.
+//! slots` the resident slots' clauses alone on their four loads, `--only
+//! stagger` (g1)-(g5) alone on their two plain loads.
 //! `--step-sets short` takes (t)'s two 4-token sets only,
 //! `--step-sets long` the 1,024- and 3,070-position sets only, `--step-sets
 //! all` (the default) all four; it names the sets of the load at [`CTX`], so
@@ -276,6 +314,7 @@ mod card;
 #[cfg(feature = "glm5next")]
 mod gate {
     use crate::card;
+    use std::path::PathBuf;
     use std::time::Instant;
 
     use app::arch::glm5next::{GlmCfg, open_pair};
@@ -284,6 +323,7 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::{Fault, FaultSite, LAYER_HEAD};
     use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, pools_for};
     use bloomery_gpu::model::StepMode;
@@ -2060,10 +2100,7 @@ mod gate {
         /// layer's committed lane and its conv ring, a latent layer's rows
         /// and pools, every row of them).
         fn state_hash(&self, m: &mut Glm5nextModel) -> Result<u64, GateError> {
-            let h = store_digests(m)?
-                .iter()
-                .fold(Fnv1a64::default(), |h, d| h.bytes(&d.fnv.to_le_bytes()));
-            Ok(h.value())
+            stores_hash(m)
         }
 
         /// The stores (`Body::store_bytes`, the allocations the load holds to
@@ -2383,17 +2420,11 @@ mod gate {
     /// the body's own between them on one load, then (sd) and (s3) on a load
     /// of their own.
     fn slots(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
-        let (_, _, prefill) = man.step()?;
-        if prefill.len() < 700 {
-            return Err(
-                format!("{D1K}: {} prefill ids, the clause reads 700", prefill.len()).into(),
-            );
-        }
+        let prefill = slot_prefill()?;
         // Three prompts of distinct ids and lengths: (sc)'s cut restores
         // slot 1's prompt call's checkpoint, which a ledger the slots shared
         // would hold slot 0's in place of.
-        let (a, b, c) = (&prefill[..33], &prefill[300..340], &prefill[600..630]);
+        let (a, b, c) = slot_prompts(&prefill);
         let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
         let inputs = PlanInputs::read(&file)?;
         let nextn = NextnInputs::read(&inputs)?;
@@ -2407,6 +2438,7 @@ mod gate {
         let mut s = slots_gate::interleave(&body)?;
         let mut ok = clause("(sp) plan", slots_plan(&body, s.model()));
         ok &= clause("(sc) cut", slots_cut(&mut s, &body));
+        ok &= clause("(g5) on the NextN load", g5_nextn(s.model()));
         ok &= s.finish()?;
         // (sd) and (s3) drive the MTP draft through a session, which owns
         // its model; the harness lends its own by reference only.
@@ -2445,6 +2477,825 @@ mod gate {
                 ok &= clause("(s3) park/resume", Err("(sd) drafted ended first".into()));
             }
         }
+        // The stagger's loads hold the card next: the drafted load goes first.
+        drop((spec, parked, s));
+        ok &= stagger(levers, &body.inputs, (a, b))?;
+        Ok(ok)
+    }
+
+    /// The prose set's prefill ids the slot clauses cut their prompts from.
+    fn slot_prefill() -> Result<Vec<u32>, GateError> {
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (_, _, prefill) = man.step()?;
+        if prefill.len() < 700 {
+            return Err(
+                format!("{D1K}: {} prefill ids, the clause reads 700", prefill.len()).into(),
+            );
+        }
+        Ok(prefill.to_vec())
+    }
+
+    /// The slot clauses' three prompts out of `prefill` ([`slot_prefill`]):
+    /// distinct ids, lengths 33, 40 and 30.
+    fn slot_prompts(prefill: &[u32]) -> (&[u32], &[u32], &[u32]) {
+        (&prefill[..33], &prefill[300..340], &prefill[600..630])
+    }
+
+    /// Every trunk layer's stores on the selected slot digested into one
+    /// hash ([`store_digests`]: a KDA layer's committed lane and its conv
+    /// ring, a latent layer's rows and pools, every row of them).
+    fn stores_hash(m: &mut Glm5nextModel) -> Result<u64, GateError> {
+        let h = store_digests(m)?
+            .iter()
+            .fold(Fnv1a64::default(), |h, d| h.bytes(&d.fnv.to_le_bytes()));
+        Ok(h.value())
+    }
+
+    // ------------------------------------------ (g) a pass of two slots
+
+    /// (g1)'s passes of both slots, and (g2)'s after slot 1's cut.
+    const G_ROUNDS: usize = 16;
+    const G_AFTER_CUT: usize = 4;
+
+    /// Slot 0's and slot 1's steps past their prompts at the end of (g1):
+    /// the passes of both, slot 1's pass alone, a plain step of each.
+    const G1_STEPS: [usize; 2] = [G_ROUNDS + 1, G_ROUNDS + 2];
+
+    /// (g1b)'s passes of slots 1 and 2.
+    const G1B_ROUNDS: usize = 4;
+
+    /// The one-lane load's slots: (g1b)'s pass of slots 1 and 2 leaves slot
+    /// 0, the live one, idle.
+    const G_SLOTS: usize = 3;
+
+    /// What `GpuModel::step_slots` names its refusals and its poisoned slot
+    /// set by, and the body's refusals.
+    const STEP_SLOTS: &str = "GpuModel::step_slots";
+    const GLM_BODY: &str = "glm5next Body";
+
+    /// The selected slot's stores digested two ways: every row they hold
+    /// ([`stores_hash`]), and only what a step reads ([`live_hash`]).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct GStores {
+        whole: u64,
+        live: u64,
+    }
+
+    impl GStores {
+        fn of(m: &mut Glm5nextModel) -> Result<GStores, GateError> {
+            Ok(GStores {
+                whole: stores_hash(m)?,
+                live: live_hash(m)?,
+            })
+        }
+    }
+
+    /// Which digest of a slot's stores [`g_off`] holds to its solo run's:
+    /// every row, or, for a slot cut back since its reset, the live ones. A
+    /// cut copies the recurrent state back ([`Body::kept`]) and leaves the
+    /// latent rows past its position as they were, which no later step reads
+    /// and a run from a reset holds zeroed.
+    #[derive(Clone, Copy)]
+    enum GCompare {
+        Whole,
+        Live,
+    }
+
+    /// The selected slot's stores up to its position ([`store_rows`]): each
+    /// KDA layer's committed lane and conv ring, each latent layer's rows
+    /// below the position and the pools they complete, digested in order.
+    fn live_hash(m: &mut Glm5nextModel) -> Result<u64, GateError> {
+        let live = usize::try_from(m.pos())?;
+        let h = store_rows(m, live)?
+            .iter()
+            .fold(Fnv1a64::default(), |h, r| {
+                h.bytes(&r.layer.to_le_bytes())
+                    .bytes(r.what.as_bytes())
+                    .f32s(&r.values)
+            });
+        Ok(h.value())
+    }
+
+    /// One slot's solo run on the load from a reset, slot 0 selected: its
+    /// prompt as the server feeds it ([`server_start`]), then greedy steps.
+    /// `ids[0]` is the prompt's argmax and `logits[0]` its last step's
+    /// logits hash; `ids[t + 1]` and `logits[t + 1]` the step that fed
+    /// `ids[t]`. At each step count of the marks, the stores' digests and
+    /// the logits.
+    struct GSolo {
+        ids: Vec<u32>,
+        logits: Vec<u64>,
+        marks: Vec<(usize, GStores, Vec<f32>)>,
+    }
+
+    impl GSolo {
+        /// The stores' digests and the logits after `steps` steps past the
+        /// prompt.
+        fn at(&self, steps: usize) -> Result<(GStores, &[f32]), GateError> {
+            self.marks
+                .iter()
+                .find(|(t, _, _)| *t == steps)
+                .map(|(_, h, l)| (*h, l.as_slice()))
+                .ok_or_else(|| format!("no solo mark at {steps} steps").into())
+        }
+    }
+
+    fn g_solo(
+        m: &mut Glm5nextModel,
+        p: &[u32],
+        steps: usize,
+        marks: &[usize],
+    ) -> Result<GSolo, GateError> {
+        m.select_slot(0)?;
+        m.reset()?;
+        let mut run = GSolo {
+            ids: vec![server_start(m, p)?],
+            logits: vec![fnv_row(&m.logits()?)],
+            marks: Vec::new(),
+        };
+        for t in 0..=steps {
+            if marks.contains(&t) {
+                run.marks.push((t, GStores::of(m)?, m.logits()?));
+            }
+            if t < steps {
+                run.ids.push(m.step(&[run.ids[t]])?);
+                run.logits.push(fnv_row(&m.logits()?));
+            }
+        }
+        Ok(run)
+    }
+
+    /// One slot's ids and per-call logits hashes in passes of both slots,
+    /// laid as its [`GSolo`]'s.
+    #[derive(Default)]
+    struct GRun {
+        ids: Vec<u32>,
+        logits: Vec<u64>,
+    }
+
+    /// One pass of the slots of `order`, in that row order, each fed its
+    /// run's last id; each row's id and logits hash appended to its slot's
+    /// run. Each row's logits, in `order`.
+    fn g_pass(
+        m: &mut Glm5nextModel,
+        runs: &mut [GRun],
+        order: &[usize],
+    ) -> Result<Vec<Vec<f32>>, GateError> {
+        let lasts = order
+            .iter()
+            .map(|&s| runs[s].ids.last().copied().ok_or("a slot run with no id"))
+            .collect::<Result<Vec<u32>, _>>()?;
+        let rows: Vec<(usize, &[u32])> = order
+            .iter()
+            .zip(&lasts)
+            .map(|(&s, t)| (s, std::slice::from_ref(t)))
+            .collect();
+        let out = m.step_slots(&rows)?;
+        let logits = m.slots_logits()?;
+        if out.ids.len() != order.len() || logits.len() != order.len() {
+            return Err(format!(
+                "a pass of slots {order:?} gave {} ids and {} logits rows",
+                out.ids.len(),
+                logits.len()
+            )
+            .into());
+        }
+        for ((&s, &id), row) in order.iter().zip(&out.ids).zip(&logits) {
+            runs[s].ids.push(id);
+            runs[s].logits.push(fnv_row(row));
+        }
+        Ok(logits)
+    }
+
+    /// One plain step of `slot`, fed its run's last id; its id and logits
+    /// hash appended to its run. Its logits.
+    fn g_plain(
+        m: &mut Glm5nextModel,
+        runs: &mut [GRun],
+        slot: usize,
+    ) -> Result<Vec<f32>, GateError> {
+        let run = &mut runs[slot];
+        let last = run.ids.last().copied().ok_or("a slot run with no id")?;
+        m.select_slot(slot)?;
+        run.ids.push(m.step(&[last])?);
+        let logits = m.logits()?;
+        run.logits.push(fnv_row(&logits));
+        Ok(logits)
+    }
+
+    /// Slots 0 and 1 each reset, both before either is prompted (a fault
+    /// that poisoned both refuses every call until both are reset), then
+    /// prompted ([`server_start`]): their runs.
+    fn g_prompted(m: &mut Glm5nextModel, (a, b): (&[u32], &[u32])) -> Result<[GRun; 2], GateError> {
+        for slot in [0, 1] {
+            m.select_slot(slot)?;
+            m.reset()?;
+        }
+        let mut runs = [GRun::default(), GRun::default()];
+        for (slot, p) in [(0, a), (1, b)] {
+            m.select_slot(slot)?;
+            runs[slot] = GRun {
+                ids: vec![server_start(m, p)?],
+                logits: vec![fnv_row(&m.logits()?)],
+            };
+        }
+        Ok(runs)
+    }
+
+    /// The parts of slot `slot`'s state that differ from its solo run `solo`
+    /// after `steps` steps past its prompt `p`: its ids and logits hashes
+    /// from the prompt on (`run`), its last row's logits bit for bit
+    /// (`last`), its stores' digest as `cmp` names it and its position.
+    fn g_off(
+        m: &mut Glm5nextModel,
+        (slot, cmp): (usize, GCompare),
+        (run, last): (&GRun, &[f32]),
+        (solo, p, steps): (&GSolo, &[u32], usize),
+    ) -> Result<Vec<String>, GateError> {
+        let (want, logits) = solo.at(steps)?;
+        m.select_slot(slot)?;
+        let pos = u32::try_from(p.len() + steps)?;
+        let (part, stores) = match cmp {
+            GCompare::Whole => ("stores", stores_hash(m)? == want.whole),
+            GCompare::Live => ("live stores", live_hash(m)? == want.live),
+        };
+        let parts = [
+            ("ids", solo.ids.get(..=steps) == Some(&run.ids[..])),
+            ("logits", solo.logits.get(..=steps) == Some(&run.logits[..])),
+            ("last logits", same_bits(last, logits)),
+            (part, stores),
+            ("position", m.pos() == pos),
+        ];
+        Ok(parts
+            .into_iter()
+            .filter(|&(_, same)| !same)
+            .map(|(part, _)| format!("slot {slot} {part}"))
+            .collect())
+    }
+
+    /// The stagger's load: the plain load (no next-token layer) of `lanes`
+    /// KDA lanes at [`SLOT_CTX`] positions on the gate placement, residency
+    /// off, its plan counting `slots` sequences, every slot made, graph
+    /// steps, the prompt fed in batches.
+    fn g_open(
+        levers: &bloomery_levers::Levers,
+        inputs: &PlanInputs,
+        lanes: KdaLanes,
+        slots: usize,
+    ) -> Result<Glm5nextModel, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let place = PlanLevers::from_levers(levers)?;
+        let plan = inputs.plan_slots(&machine, u64::try_from(SLOT_CTX)?, &place, lanes, slots)?;
+        let term = plan.machine.cards[0].scratch_bytes;
+        let t = Instant::now();
+        let mut m = Body::open_placed_slots(
+            file,
+            &plan,
+            inputs,
+            0,
+            levers.host(),
+            Residency::Off,
+            lanes,
+            slots,
+        )?;
+        set_prefill(&mut m, PrefillMode::Batch)?;
+        m.set_mode(StepMode::Graph);
+        m.add_slots(slots)?;
+        let body = m.body("stagger")?;
+        println!(
+            "stagger load lanes={} resident_bytes={} scratch_bytes={} (the plan's card scratch \
+             term {term}) ctx={SLOT_CTX} slots={slots} in {:.1} s (runtime value)",
+            body.lanes().count(),
+            m.resident_bytes(),
+            body.scratch_bytes(),
+            t.elapsed().as_secs_f64()
+        );
+        Ok(m)
+    }
+
+    /// Whether `r` is `what`'s shape refusal whose words hold `says`.
+    fn refused_by<T>(r: &Result<T, GpuError>, what: &str, says: &str) -> bool {
+        matches!(r, Err(GpuError::Shape { what: w, detail }) if *w == what && detail.contains(says))
+    }
+
+    /// (g1)-(g5) on their two loads (module doc): the one-lane load's, then
+    /// the two-lane load's (g4).
+    fn stagger(
+        levers: &bloomery_levers::Levers,
+        inputs: &PlanInputs,
+        (a, b): (&[u32], &[u32]),
+    ) -> Result<bool, GateError> {
+        let mut m = g_open(levers, inputs, KdaLanes::One, G_SLOTS)?;
+        let [s0, s1] = G1_STEPS;
+        let sa = g_solo(
+            &mut m,
+            a,
+            s0 + G_AFTER_CUT,
+            &[s0, s0 + G_AFTER_CUT, G1B_ROUNDS],
+        )?;
+        let sb = g_solo(&mut m, b, s1, &[s1, G_AFTER_CUT - 1, G1B_ROUNDS])?;
+        let mut ok = true;
+        for mode in [StepMode::Graph, StepMode::Eager] {
+            m.set_mode(mode);
+            match g1_bits(&mut m, (a, b), (&sa, &sb), mode) {
+                Ok((bits, runs)) => {
+                    ok &= bits;
+                    if mode == StepMode::Graph {
+                        ok &= clause("(g2) cut", g2_cut(&mut m, (a, b), runs, (&sa, &sb)));
+                    }
+                }
+                Err(e) => {
+                    ok &= clause(&format!("(g1) bits {mode:?}"), Err(e));
+                    if mode == StepMode::Graph {
+                        ok &= clause("(g2) cut", Err("(g1) ended first".into()));
+                    }
+                }
+            }
+            ok &= clause(
+                &format!("(g1b) parked {mode:?}"),
+                g1b_parked(&mut m, (a, b), (&sa, &sb), mode),
+            );
+        }
+        m.set_mode(StepMode::Graph);
+        ok &= clause("(g3) fault", g3_fault(&mut m, (a, b), (&sa, &sb)));
+        ok &= clause("(g5) refusals", g5_refusals(&mut m, inputs, (a, b)));
+        drop(m);
+        ok &= clause("(g4) walk", g4_walk(levers, inputs, (a, b)));
+        Ok(ok)
+    }
+
+    /// (g1) in `mode`: both slots prompted, [`G_ROUNDS`] passes of both
+    /// (slot 0's row first, then slot 1's, in turn), one of slot 1 alone,
+    /// then a plain step of each; each slot's ids, logits hashes, last
+    /// logits bit for bit, stores and position its solo run's. The runs,
+    /// for (g2).
+    fn g1_bits(
+        m: &mut Glm5nextModel,
+        (a, b): (&[u32], &[u32]),
+        (sa, sb): (&GSolo, &GSolo),
+        mode: StepMode,
+    ) -> Result<(bool, [GRun; 2]), GateError> {
+        let mut runs = g_prompted(m, (a, b))?;
+        let mut last = [Vec::new(), Vec::new()];
+        for r in 0..G_ROUNDS {
+            let order: &[usize] = if r % 2 == 0 { &[0, 1] } else { &[1, 0] };
+            for (&s, row) in order.iter().zip(g_pass(m, &mut runs, order)?) {
+                last[s] = row;
+            }
+        }
+        for row in g_pass(m, &mut runs, &[1])? {
+            last[1] = row;
+        }
+        // Each slot's plain step replays its own chain over the buffers the
+        // passes bound and gave back.
+        for (s, l) in last.iter_mut().enumerate() {
+            *l = g_plain(m, &mut runs, s)?;
+        }
+        let mut off = g_off(
+            m,
+            (0, GCompare::Whole),
+            (&runs[0], &last[0]),
+            (sa, a, G1_STEPS[0]),
+        )?;
+        off.extend(g_off(
+            m,
+            (1, GCompare::Whole),
+            (&runs[1], &last[1]),
+            (sb, b, G1_STEPS[1]),
+        )?);
+        let pass = off.is_empty();
+        println!(
+            "stagger (g1) bits {mode:?}: one lane, {G_ROUNDS} passes of slots 0 and 1 from \
+             positions {} and {} (row order 0,1 then 1,0 in turn), one of slot 1 alone, then a \
+             plain step of each: {} {}",
+            a.len(),
+            b.len(),
+            if pass {
+                "every row's id and logits, each slot's last logits, stores and position bit for \
+                 bit its solo run's"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(pass)
+        );
+        Ok((pass, runs))
+    }
+
+    /// (g1b) in `mode` after (g1): slots 1 and 2 reset and prompted with
+    /// (g1)'s two prompts, then [`G1B_ROUNDS`] passes of both (row order 1,
+    /// 2 and 2, 1 in turn) while slot 0, the live one, stays idle: both rows
+    /// a parked sequence's. Each slot its solo run's as in (g1); slot 0's
+    /// position and stores as before.
+    fn g1b_parked(
+        m: &mut Glm5nextModel,
+        (a, b): (&[u32], &[u32]),
+        (sa, sb): (&GSolo, &GSolo),
+        mode: StepMode,
+    ) -> Result<bool, GateError> {
+        m.select_slot(0)?;
+        let idle = (m.pos(), stores_hash(m)?);
+        let mut runs = [GRun::default(), GRun::default(), GRun::default()];
+        for (slot, p) in [(1, a), (2, b)] {
+            m.select_slot(slot)?;
+            m.reset()?;
+            runs[slot] = GRun {
+                ids: vec![server_start(m, p)?],
+                logits: vec![fnv_row(&m.logits()?)],
+            };
+        }
+        let mut last = [Vec::new(), Vec::new(), Vec::new()];
+        for r in 0..G1B_ROUNDS {
+            let order: &[usize] = if r % 2 == 0 { &[1, 2] } else { &[2, 1] };
+            for (&s, row) in order.iter().zip(g_pass(m, &mut runs, order)?) {
+                last[s] = row;
+            }
+        }
+        let mut off = g_off(
+            m,
+            (1, GCompare::Whole),
+            (&runs[1], &last[1]),
+            (sa, a, G1B_ROUNDS),
+        )?;
+        off.extend(g_off(
+            m,
+            (2, GCompare::Whole),
+            (&runs[2], &last[2]),
+            (sb, b, G1B_ROUNDS),
+        )?);
+        m.select_slot(0)?;
+        if (m.pos(), stores_hash(m)?) != idle {
+            off.push("idle slot 0's position or stores".to_string());
+        }
+        let pass = off.is_empty();
+        println!(
+            "stagger (g1b) parked {mode:?}: {G1B_ROUNDS} passes of slots 1 and 2 from positions \
+             {} and {} (row order 1,2 then 2,1 in turn), slot 0 idle: {} {}",
+            a.len(),
+            b.len(),
+            if pass {
+                "every row's id and logits, each slot's last logits, stores and position bit for \
+                 bit its solo run's; slot 0 as it stood"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// (g2) after (g1) in graph mode: slot 1 cut back to its prompt call's
+    /// checkpoint, then [`G_AFTER_CUT`] passes of both slots, slot 1 fed its
+    /// prompt's last id first: slot 1 its solo run from its prompt's step,
+    /// slot 0 its solo run's continuation — the cut carried out from slot
+    /// 1's own checkpoints by the pass that plans it, slot 1 parked.
+    fn g2_cut(
+        m: &mut Glm5nextModel,
+        (a, b): (&[u32], &[u32]),
+        mut runs: [GRun; 2],
+        (sa, sb): (&GSolo, &GSolo),
+    ) -> Result<bool, GateError> {
+        let (&b_last, _) = b.split_last().ok_or("an empty prompt")?;
+        let at = u32::try_from(b.len() - 1)?;
+        m.select_slot(1)?;
+        let kept = m.body("stagger")?.kept(at, m.pos());
+        m.rollback(at)?;
+        runs[1] = GRun {
+            ids: vec![b_last],
+            logits: Vec::new(),
+        };
+        let mut last = [Vec::new(), Vec::new()];
+        for r in 0..G_AFTER_CUT {
+            let order: &[usize] = if r % 2 == 0 { &[0, 1] } else { &[1, 0] };
+            for (&s, row) in order.iter().zip(g_pass(m, &mut runs, order)?) {
+                last[s] = row;
+            }
+        }
+        // Slot 1 restarted at its prompt's last id: past it, its run is the
+        // solo run's from the prompt's step.
+        let restarted = GRun {
+            ids: runs[1].ids.get(1..).unwrap_or_default().to_vec(),
+            logits: runs[1].logits.clone(),
+        };
+        let mut off = g_off(
+            m,
+            (0, GCompare::Whole),
+            (&runs[0], &last[0]),
+            (sa, a, G1_STEPS[0] + G_AFTER_CUT),
+        )?;
+        // Slot 1's rows past its position still hold its run before the cut.
+        off.extend(g_off(
+            m,
+            (1, GCompare::Live),
+            (&restarted, &last[1]),
+            (sb, b, G_AFTER_CUT - 1),
+        )?);
+        let pass = kept.at == at && off.is_empty();
+        // Not a verdict: whether slot 1's rows past its position still hold
+        // its run before the cut, as the cut leaves them.
+        m.select_slot(1)?;
+        let whole = stores_hash(m)? == sb.at(G_AFTER_CUT - 1)?.0.whole;
+        println!(
+            "stagger (g2) cut: slot 1 cut back to {at} (kept({at}) = {kept}), then {G_AFTER_CUT} \
+             passes of both slots (slot 1's whole stores, rows past its position included, \
+             equal its solo run's: {whole}): {} {}",
+            if off.is_empty() {
+                "slot 1 its solo run from its prompt's step and slot 0 its solo run's \
+                 continuation, ids, logits, last logits, stores (slot 1's up to its position) \
+                 and positions bit for bit"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// (g3) after (g2): a NaN in the head's gain under a pass of both
+    /// slots ends it in the head's fault and poisons both: each slot's step
+    /// and the pass refused naming the set; the gain put back, slot 0's reset
+    /// leaves slot 1 standing in the set, slot 1's lifts it; both slots
+    /// prompted again, the next pass their solo runs' first steps bit for
+    /// bit.
+    fn g3_fault(
+        m: &mut Glm5nextModel,
+        (a, b): (&[u32], &[u32]),
+        (sa, sb): (&GSolo, &GSolo),
+    ) -> Result<bool, GateError> {
+        let want = Fault::at(LAYER_HEAD, FaultSite::Logit);
+        let set = "slots 0 and 1 are poisoned";
+        let old = patch_head_gain(m, f32::NAN.to_le_bytes())?;
+        let read = m.step_slots(&[(0, &[1]), (1, &[1])]);
+        patch_head_gain(m, old)?;
+        let raised = matches!(&read, Err(GpuError::Fault { fault, .. }) if *fault == want)
+            && m.poisoned() == Some(want);
+        m.select_slot(0)?;
+        let named0 = refused_by(&m.step(&[1]), "GpuModel::step", set);
+        m.select_slot(1)?;
+        let named1 = refused_by(&m.step(&[1]), "GpuModel::step", set);
+        let named_pass = refused_by(&m.step_slots(&[(0, &[1]), (1, &[1])]), STEP_SLOTS, set);
+        m.select_slot(0)?;
+        m.reset()?;
+        let stands = refused_by(&m.step(&[1]), "GpuModel::step", "slot 1 is poisoned");
+        m.select_slot(1)?;
+        m.reset()?;
+        let lifted = m.poisoned().is_none();
+        let mut runs = g_prompted(m, (a, b))?;
+        g_pass(m, &mut runs, &[0, 1])?;
+        let again = (0..2).all(|s| {
+            let solo = if s == 0 { sa } else { sb };
+            solo.ids.get(..2) == Some(&runs[s].ids[..])
+                && solo.logits.get(..2) == Some(&runs[s].logits[..])
+        });
+        let pass = raised && named0 && named1 && named_pass && stands && lifted && again;
+        println!(
+            "stagger (g3) fault: NaN in {HEAD_GAIN}[0] under a pass of slots 0 and 1: {}, \
+             poisoned {}; both slots and the pass refused naming the set ({named0}, {named1}, \
+             {named_pass}); after slot 0's reset still refused naming slot 1 {stands}; after \
+             both resets lifted {lifted}; prompted again, the next pass both solo runs' first \
+             step bit for bit {again} {}",
+            match &read {
+                Ok(o) => format!("ids {:?}", o.ids),
+                Err(e) => format!("\"{e}\""),
+            },
+            m.poisoned()
+                .map_or_else(|| "none now".to_string(), |f| f.to_string()),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// (g5)'s cases on the one-lane load, in the order they run: the ones
+    /// whose missing refusal would move a slot last.
+    #[derive(Clone, Copy, Debug)]
+    enum G5 {
+        /// Three rows in one pass: the owner's refusal naming the body's
+        /// bound, 2.
+        Bound,
+        /// The taps armed.
+        Taps,
+        /// Slot 1's step failed past its launch: its stores hold one more
+        /// position than it stands at.
+        Held,
+        /// Slot 0 with two rows.
+        Two,
+        /// A route trace attached.
+        Traced,
+    }
+
+    impl G5 {
+        fn says(self) -> &'static str {
+            match self {
+                G5::Bound => "a pass of three rows (naming the bound 2)",
+                G5::Taps => "a pass with the taps armed",
+                G5::Held => "a pass beside slot 1's step failed past its launch",
+                G5::Two => "a pass of slot 0's two rows",
+                G5::Traced => "a pass with a route trace attached",
+            }
+        }
+    }
+
+    /// Slot 0's and slot 1's positions, slot 0 selected after.
+    fn slot_positions(m: &mut Glm5nextModel) -> Result<[u32; 2], GateError> {
+        m.select_slot(1)?;
+        let p1 = m.pos();
+        m.select_slot(0)?;
+        Ok([m.pos(), p1])
+    }
+
+    /// (g5) on the one-lane load after (g3), its last clause: each case
+    /// ([`G5`]) from both slots prompted afresh, refused by name with no
+    /// slot's position moved, a line a case as it ends.
+    fn g5_refusals(
+        m: &mut Glm5nextModel,
+        inputs: &PlanInputs,
+        (a, b): (&[u32], &[u32]),
+    ) -> Result<bool, GateError> {
+        let mut pass = true;
+        for case in [G5::Bound, G5::Taps, G5::Held, G5::Two, G5::Traced] {
+            let runs = g_prompted(m, (a, b))?;
+            let (named, stood) = g5_case(m, inputs, case, [runs[0].ids[0], runs[1].ids[0]])?;
+            println!(
+                "stagger (g5) {}: refused by name {named}, both positions unmoved {stood} {}",
+                case.says(),
+                verdict(named && stood)
+            );
+            pass &= named && stood;
+        }
+        Ok(pass)
+    }
+
+    /// One (g5) case on both slots prompted, `t` their prompts' argmaxes:
+    /// whether the pass was refused by its name, and whether both slots'
+    /// positions stood (for [`G5::Held`], as the failed step left them).
+    fn g5_case(
+        m: &mut Glm5nextModel,
+        inputs: &PlanInputs,
+        case: G5,
+        [t0, t1]: [u32; 2],
+    ) -> Result<(bool, bool), GateError> {
+        let both: [(usize, &[u32]); 2] = [(0, &[t0]), (1, &[t1])];
+        let mut before = slot_positions(m)?;
+        let named = match case {
+            G5::Bound => refused_by(
+                &m.step_slots(&[(0, &[t0, t0]), (1, &[t1])]),
+                STEP_SLOTS,
+                "3 rows in one pass; this body's pass of several slots holds at most 2",
+            ),
+            G5::Taps => {
+                set_taps(m, true)?;
+                let r = m.step_slots(&both);
+                set_taps(m, false)?;
+                m.set_mode(StepMode::Graph);
+                refused_by(&r, GLM_BODY, "a pass of several slots with the taps armed")
+            }
+            G5::Held => {
+                m.select_slot(1)?;
+                m.body_parts("stagger")?.2.plant(Plant::AfterLaunch);
+                if m.step(&[t1]).is_ok() {
+                    return Err("slot 1's planted step ran".into());
+                }
+                before = slot_positions(m)?;
+                let p1 = before[1];
+                refused_by(
+                    &m.step_slots(&both),
+                    GLM_BODY,
+                    &format!(
+                        "slot 1: position {p1}: the step there failed after its chain was launched"
+                    ),
+                )
+            }
+            G5::Two => refused_by(
+                &m.step_slots(&[(0, &[t0, t0])]),
+                GLM_BODY,
+                "slot 0's 2 rows in a pass of several slots",
+            ),
+            G5::Traced => {
+                let dir = std::env::temp_dir()
+                    .join(format!("gate_glm5next_e2e-g5-{}", std::process::id()));
+                let run = m.body("stagger")?.host_run();
+                let trace = RouteTrace::create(
+                    &dir,
+                    TraceHeader {
+                        model: PathBuf::from(MODEL),
+                        arch: "glm5next".to_owned(),
+                        build: "gate_glm5next_e2e".to_owned(),
+                        n_expert: inputs.hp.n_expert,
+                        n_used: inputs.hp.n_used,
+                        first_layer: run.start,
+                        n_layer: run.len(),
+                        extra: Vec::new(),
+                    },
+                )?;
+                m.body_parts("stagger")?
+                    .2
+                    .hybrid_mut()
+                    .attach_route_trace(trace)?;
+                let r = m.step_slots(&both);
+                drop(m.body_parts("stagger")?.2.hybrid_mut().take_route_trace());
+                std::fs::remove_dir_all(&dir)?;
+                refused_by(
+                    &r,
+                    GLM_BODY,
+                    "a pass of several slots with a route trace attached",
+                )
+            }
+        };
+        Ok((named, slot_positions(m)? == before))
+    }
+
+    /// (g5) on the NextN load, between (sc) and H4: a pass of both slots
+    /// refused by name, every slot's position as it stood.
+    fn g5_nextn(m: &mut Glm5nextModel) -> Result<bool, GateError> {
+        let at = |m: &mut Glm5nextModel| -> Result<[u32; 2], GateError> {
+            m.select_slot(1)?;
+            let p1 = m.pos();
+            m.select_slot(0)?;
+            Ok([m.pos(), p1])
+        };
+        let before = at(m)?;
+        let r = m.step_slots(&[(0, &[1]), (1, &[1])]);
+        let named = refused_by(&r, GLM_BODY, "a pass of several slots on a NextN load");
+        let stood = at(m)? == before;
+        println!(
+            "stagger (g5) NextN: a pass of slots 0 and 1 on the NextN load: {}; positions \
+             unmoved {stood} {}",
+            match &r {
+                Ok(o) => format!("ids {:?}", o.ids),
+                Err(e) => format!("\"{e}\""),
+            },
+            verdict(named && stood)
+        );
+        Ok(named && stood)
+    }
+
+    /// (g4) on a load of two KDA lanes: the captured pass of both slots
+    /// holds the captured verify's nodes; the verify replayed after the
+    /// pass's capture re-recorded the pair's go order, and the pass replayed
+    /// after the verify's capture re-recorded it again, each bit for bit
+    /// its solo runs (the verify on slot 0 its solo run's next two ids and
+    /// logits, the pass each slot's solo step) — the two walks raise their
+    /// goes in one order. Between them, (g5)'s refusal of a pass while slot
+    /// 0's verify waits for its commit. The pass runs after the verify kept
+    /// both rows, so slot 0's committed lane is the second, slot 1's the
+    /// first.
+    fn g4_walk(
+        levers: &bloomery_levers::Levers,
+        inputs: &PlanInputs,
+        (a, b): (&[u32], &[u32]),
+    ) -> Result<bool, GateError> {
+        let mut m = g_open(levers, inputs, KdaLanes::Two, SLOTS)?;
+        let sa = g_solo(&mut m, a, 3, &[])?;
+        let sb = g_solo(&mut m, b, 1, &[])?;
+        let runs = g_prompted(&mut m, (a, b))?;
+        m.select_slot(0)?;
+        let pos = m.pos();
+        let verify_nodes = m.capture_rows::<2>()?;
+        let pass_nodes = m.capture_slots(&[(0, 1), (1, 1)])?;
+        m.select_slot(0)?;
+        let verify = m.step_rows([runs[0].ids[0], sa.ids[1]]);
+        if let Err(e) = &verify {
+            println!(
+                "stagger (g4) walk: two lanes; the captured pass of slots 0 and 1 holds \
+                 {pass_nodes} nodes, the verify {verify_nodes}; the verify replayed after the \
+                 pass's capture ended in \"{e}\" FAIL"
+            );
+            return Ok(false);
+        }
+        let verify_logits: Vec<u64> = m.rows_logits::<2>()?.iter().map(|l| fnv_row(l)).collect();
+        let waits = refused_by(
+            &m.step_slots(&[(0, &[sa.ids[2]]), (1, &[runs[1].ids[0]])]),
+            GLM_BODY,
+            "a pass of several slots: a call at position",
+        );
+        m.rollback(pos + 2)?;
+        let recaptured = m.capture_rows::<2>()?;
+        let out = m.step_slots(&[(0, &[sa.ids[2]]), (1, &[runs[1].ids[0]])])?;
+        let pass_logits: Vec<u64> = m.slots_logits()?.iter().map(|l| fnv_row(l)).collect();
+        let nodes = verify_nodes == pass_nodes && recaptured == verify_nodes;
+        let verify_ok = matches!(&verify, Ok(ids) if ids[..] == sa.ids[1..3])
+            && verify_logits[..] == sa.logits[1..3];
+        let pass_ok =
+            out.ids == [sa.ids[3], sb.ids[1]] && pass_logits == [sa.logits[3], sb.logits[1]];
+        let ok = nodes && verify_ok && waits && pass_ok;
+        println!(
+            "stagger (g4) walk: two lanes; the captured pass of slots 0 and 1 holds \
+             {pass_nodes} nodes, the verify {verify_nodes} (again {recaptured}); the verify \
+             replayed after the pass's capture: {} (solo {:?}), logits {verify_ok}; while it \
+             waits, a pass refused by name {waits}; the pass replayed after the verify's \
+             capture: ids {:?} (solo {:?}), logits {pass_ok} {}",
+            match &verify {
+                Ok(ids) => format!("ids {ids:?}"),
+                Err(e) => format!("\"{e}\""),
+            },
+            &sa.ids[1..3],
+            out.ids,
+            [sa.ids[3], sb.ids[1]],
+            verdict(ok)
+        );
         Ok(ok)
     }
 
@@ -2463,8 +3314,11 @@ mod gate {
         Verify,
         /// (k) alone, on a load at [`CTX`].
         Keep,
-        /// (slots) alone, on their load at [`SLOT_CTX`].
+        /// (slots) alone, on their loads at [`SLOT_CTX`].
         Slots,
+        /// (g1)-(g5) alone, on their two loads at [`SLOT_CTX`] (the NextN
+        /// load's (g5) runs with (slots)).
+        Stagger,
     }
 
     /// Which of (t)'s step sets the load at [`CTX`] runs.
@@ -2524,7 +3378,7 @@ mod gate {
     }
 
     /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, `--only
-    /// keep`, `--only slots`, or every clause.
+    /// keep`, `--only slots`, `--only stagger`, or every clause.
     fn only() -> Result<Only, GateError> {
         let args: Vec<String> = std::env::args().collect();
         match args.iter().position(|a| a == "--only") {
@@ -2536,8 +3390,9 @@ mod gate {
                 Some("verify") => Ok(Only::Verify),
                 Some("keep") => Ok(Only::Keep),
                 Some("slots") => Ok(Only::Slots),
+                Some("stagger") => Ok(Only::Stagger),
                 other => Err(format!(
-                    "--only is main, pp, pplong, verify, keep or slots, not {other:?}"
+                    "--only is main, pp, pplong, verify, keep, slots or stagger, not {other:?}"
                 )
                 .into()),
             },
@@ -2568,6 +3423,14 @@ mod gate {
         }
         if matches!(only, Only::All | Only::Slots) {
             ok &= slots(&levers)?;
+        }
+        if only == Only::Stagger {
+            let prefill = slot_prefill()?;
+            let (a, b, _) = slot_prompts(&prefill);
+            let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let inputs = PlanInputs::read(&file)?;
+            drop(file);
+            ok &= stagger(&levers, &inputs, (a, b))?;
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
