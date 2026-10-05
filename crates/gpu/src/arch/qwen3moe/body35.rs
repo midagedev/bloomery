@@ -41,6 +41,14 @@
 //! and a cut to one of them plans the copy back for the next call
 //! ([`Body35::cut`], [`Rollback`]). The K/V planes are cut by position, as
 //! [`Body`]'s are.
+//!
+//! A load holds several resident sequences ([`Slots`]): each one its
+//! layers' stores, the positions its recurrent stores hold and its
+//! checkpoints ([`Slot35`]), exchanged by pointer on a select. The body
+//! records no capture of its own: the step's and the passes' captures are
+//! the model's, kept a slot, and the prompt call runs eager. A placed load's
+//! placed side holds no sequence's state ([`Slots::new_seq`]), so it serves
+//! every slot as it is.
 
 use super::body::{Kernels, KvQ8, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
@@ -65,7 +73,9 @@ use crate::head::Head;
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
-use crate::model::{ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, block_count};
+use crate::model::{
+    ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, Slots, block_count,
+};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
 use crate::tensor::window;
@@ -398,10 +408,28 @@ pub struct Body35 {
     /// a cut behind the fed positions restores. A prompt call takes them
     /// only while `marks` is on.
     ckpt: Checkpoints,
+    /// The checkpoints' spacing the load chose ([`checkpoint_every`]): every
+    /// sequence's checkpoints take it ([`Slots::new_seq`]).
+    every: u32,
+    /// Whether a prompt call takes checkpoints: the load's, not a
+    /// sequence's — the seat arms it once, and every sequence's prompt calls
+    /// then take their own.
     marks: bool,
     /// Walks the last prompt call ran ([`Body35::prompt_walks`]): one a
-    /// unit, counted from the call's start.
+    /// unit, counted from the call's start, whichever sequence ran it.
     prompt_walks: usize,
+}
+
+/// One Qwen3.6 sequence's own state ([`Slots`], what a select exchanges):
+/// every layer's store — an attention layer's K/V planes, a delta layer's
+/// recurrent state and conv ring —, the positions its recurrent stores hold,
+/// and its checkpoints of those stores on the host. No capture travels with
+/// it: the body records none over the stores (the step's and the passes'
+/// are the model's, kept a slot).
+pub struct Slot35 {
+    stores: Vec<LayerStore>,
+    held: u32,
+    ckpt: Checkpoints,
 }
 
 /// `name` of layer `l`.
@@ -1159,12 +1187,8 @@ impl Body35 {
             })
             .flatten()
             .collect();
-        let ckpt = Checkpoints::new(
-            gpu.context(),
-            lens,
-            HOST_BUDGET,
-            checkpoint_every(asked, &d)?,
-        )?;
+        let every = checkpoint_every(asked, &d)?;
+        let ckpt = Checkpoints::new(gpu.context(), lens, HOST_BUDGET, every)?;
         let s = Arena::with(stream, d, 1, forms)?;
         let sp = StepParams::new(stream, true)?;
         let a = Arena::with(stream, d, MAX_PASS_ROWS, forms)?;
@@ -1203,6 +1227,7 @@ impl Body35 {
             placed,
             held: 0,
             ckpt,
+            every,
             marks: false,
             prompt_walks: 0,
         })
@@ -1271,9 +1296,10 @@ impl Body35 {
         &self.ckpt
     }
 
-    /// Whether a prompt call takes checkpoints at its marks ([`Body35::marked`]):
-    /// off at load, so a binary that never cuts behind the fed positions
-    /// copies nothing; the serve seat turns it on. Off drops none taken.
+    /// Whether a prompt call takes checkpoints at its marks ([`Body35::marked`]),
+    /// on every resident sequence, each into its own: off at load, so a
+    /// binary that never cuts behind the fed positions copies nothing; the
+    /// serve seat turns it on. Off drops none taken.
     pub fn set_checkpoints(&mut self, on: bool) {
         self.marks = on;
     }
@@ -1886,10 +1912,13 @@ impl ChainBody for Body35 {
     }
 
     /// Every delta layer's state lanes and conv ring back to zero, the
-    /// checkpoints dropped and the stores counted at 0, and the records'
-    /// lane word to [`LANE`]. The K/V planes need nothing: the flash never
-    /// loads a key row at or past the live count, and every row below it is
-    /// written by its own step first. Synchronizes.
+    /// checkpoints dropped and the stores counted at 0 — the live
+    /// sequence's, the selected slot's; a parked one keeps its own — and
+    /// the records' lane word to [`LANE`], after a placed load's host tier
+    /// reset — the load's, whichever slot resets: a refused input's poison
+    /// lifted, the words checked at rest. The K/V planes need nothing: the
+    /// flash never loads a key row at or past the live count, and every row
+    /// below it is written by its own step first. Synchronizes.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         if let Some(p) = self.placed.as_mut() {
@@ -1941,6 +1970,80 @@ impl ChainBody for Body35 {
 
     fn host(&mut self) -> Option<&mut Placed> {
         self.placed.as_mut()
+    }
+}
+
+impl Slots for Body35 {
+    type Seq = Slot35;
+
+    /// A sequence of the load's shape in the state the load leaves: each
+    /// layer's store zeroed — K/V planes in the cache format the load chose
+    /// (read back from the live planes), or a recurrent state and conv ring
+    /// of the layer's delta shape —, no position held, and checkpoints of
+    /// the same stores at the load's spacing, no point taken and no host slot
+    /// made. A placed load's sequences share its placed side whole: the card
+    /// experts and the slot map are weights, the host tier's experts
+    /// compute each token apart, its handoff words and health are the
+    /// load's protocol (a go advances them whichever sequence runs), and its
+    /// rows and host sums are a call's scratch. Load-time allocation.
+    fn new_seq(&mut self, gpu: &Gpu) -> Result<Slot35, GpuError> {
+        const WHAT_N: &str = "qwen35moe::Body35::new_seq";
+        let stream = gpu.stream();
+        let d = self.s.dims;
+        let stores = self
+            .plans
+            .iter()
+            .zip(&self.stores)
+            .map(|(p, live)| match (&p.mixer, live) {
+                (MixerPlan::Gqa(_), LayerStore::Kv(planes)) => {
+                    let kv = match planes {
+                        KvPlanes::F16 { .. } => KvQ8::F16,
+                        KvPlanes::Q8 { .. } => KvQ8::Q8,
+                    };
+                    Ok(LayerStore::Kv(KvPlanes::new(stream, &d, kv)?))
+                }
+                (MixerPlan::Delta(dp), LayerStore::Rec(_)) => {
+                    Ok(LayerStore::Rec(RecStore::new(stream, dp.shape, LANES)?))
+                }
+                _ => Err(GpuError::state(
+                    WHAT_N,
+                    "a live store of each layer's own kind",
+                )),
+            })
+            .collect::<Result<Vec<_>, GpuError>>()?;
+        let ckpt = Checkpoints::new(
+            gpu.context(),
+            self.ckpt.lens().to_vec(),
+            HOST_BUDGET,
+            self.every,
+        )?;
+        Ok(Slot35 {
+            stores,
+            held: 0,
+            ckpt,
+        })
+    }
+
+    /// Exchange the live sequence with `seq`: pointer moves only — the
+    /// stores are buffer handles, the held count and the checkpoints host
+    /// values the body holds by value — so nothing is copied, captured or
+    /// synchronized. Nothing refuses: a prompt call waits for its
+    /// checkpoints' copies before it returns, and a cut waits in its own
+    /// sequence's checkpoints for that sequence's next call
+    /// ([`Body35::settle`]), so it travels with it.
+    fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Slot35) -> Result<(), GpuError> {
+        std::mem::swap(&mut self.stores, &mut seq.stores);
+        std::mem::swap(&mut self.held, &mut seq.held);
+        std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
+        Ok(())
+    }
+
+    /// Device bytes one sequence holds: its layers' stores
+    /// ([`Body35::store_bytes`]). Its checkpoints are host bytes, left out:
+    /// pinned slots its prompt calls make as they take points, up to
+    /// [`HOST_BUDGET`] a sequence and none at [`Slots::new_seq`].
+    fn seq_bytes(&self) -> usize {
+        self.store_bytes()
     }
 }
 
