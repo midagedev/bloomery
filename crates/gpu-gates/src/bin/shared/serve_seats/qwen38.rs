@@ -1178,11 +1178,6 @@ struct SeatArgs {
 struct Q38 {
     s: app::Session<Body38>,
     drafted: DraftedSeat<Body38, { <Body38 as MtpBody>::VERIFY_ROWS }>,
-    /// The draft's side of every sequence but the live one
-    /// ([`Q38::select`]): what [`DraftedSeat::park`] took when the seat left
-    /// that slot, put back the next time it stands there. All `None` without
-    /// a draft.
-    drafts: Vec<Option<ParkedDraft<TargetRows>>>,
     ctx: usize,
     /// The plan's draft card bytes and arena, for `/props`' `draft` class.
     draft_bytes: u64,
@@ -1348,7 +1343,7 @@ impl Q38 {
         // step and verify chains stay with it, each parked slot capturing on
         // its first use.
         s.add_slots(a.slots)?;
-        let drafted = DraftedSeat::new(match a.mtp {
+        let mut drafted = DraftedSeat::new(match a.mtp {
             false => None,
             true => {
                 let draft = app::mtp::MtpDraft::open(s.model(), Prompt38::Auto, StepMode::Graph)?;
@@ -1366,13 +1361,10 @@ impl Q38 {
                 Some(s.with_draft(draft, &mut Captures)?)
             }
         });
-        // Every parked slot's draft side starts as a fresh draft's: nothing
-        // waits, nothing skipped. The live slot's lives in the [`DraftedSeat`].
-        let drafts = vec![drafted.park(); a.slots];
+        drafted.hold_slots(a.slots);
         Ok(Q38 {
             s,
             drafted,
-            drafts,
             ctx: a.ctx,
             draft_bytes: a.draft_bytes,
             draft_path: a.draft_path,
@@ -1499,15 +1491,7 @@ impl Seat for Q38 {
     /// nothing has moved then — the parked entry is written only after the
     /// exchange takes).
     fn select(&mut self, slot: usize) -> Result<(), GateError> {
-        let was = self.s.selected();
-        if was == slot {
-            return Ok(());
-        }
-        let live = self.drafted.park();
-        self.s.select_slot(slot)?;
-        let back = self.drafts[slot].take();
-        self.drafts[was] = live;
-        self.drafted.unpark(back.as_ref())
+        self.drafted.select(&mut self.s, slot)
     }
 
     /// The draft's state is per slot ([`Q38::select`]): a slot's drafted
