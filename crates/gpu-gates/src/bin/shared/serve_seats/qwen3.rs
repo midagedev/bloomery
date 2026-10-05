@@ -127,9 +127,7 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
-use bloomery_gpu_gates::bind::{
-    Seat, SeatEngine, SlotStep, Vocab, sampler_factory, step_rows_in_turn,
-};
+use bloomery_gpu_gates::bind::{Seat, SeatEngine, SlotStep, Vocab, sampler_factory};
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, ref_model_path};
@@ -710,25 +708,24 @@ impl<B: Body3> Seat for Q3<B> {
         self.stats
     }
 
-    /// One round of several slots: one pass of the busy rows while the open
-    /// decided so ([`Q3::one_pass`], through [`Body3::one_pass_round`] — a
-    /// whole-card load of a body with one pass, the rows' answers and lent
-    /// logits rows from the pass's own per-row heads, slot 0 left
-    /// selected), else the seat's fallback — a select and a step a row — the
-    /// placed load's round (its body serves each slot's rows in its own
-    /// pass), every round of a body with no one pass of its slots (a
-    /// qwen35moe file's), and the round a load of one slot never runs. A
-    /// refusal on either path is the server's to die on: the open decides
-    /// once, so a load that cannot run one pass never tries it at run time.
+    /// One round of several slots ([`super::rounds::step_round`]): one pass
+    /// of the busy rows while the open decided so ([`Q3::one_pass`], through
+    /// [`Body3::one_pass_round`] — a whole-card load of a body with one pass,
+    /// the rows' answers and lent logits rows from the pass's own per-row
+    /// heads, slot 0 left selected), else the seat's fallback — a select and
+    /// a step a row — the placed load's round (its body serves each slot's
+    /// rows in its own pass), every round of a body with no one pass of its
+    /// slots (a qwen35moe file's), and the round a load of one slot never
+    /// runs.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
-        if !self.one_pass {
-            return step_rows_in_turn(self, rows);
-        }
-        let passes = B::one_pass_round(&mut self.s, rows).map_err(|e| e.to_string())?;
-        if self.stats {
-            record::slots_round("step", rows.len(), passes, self.slots()).eprint();
-        }
-        Ok(())
+        let one_pass = self.one_pass;
+        super::rounds::step_round(
+            self,
+            one_pass,
+            rows,
+            |q, rows| B::one_pass_round(&mut q.s, rows),
+            |_| Ok(()),
+        )
     }
 
     /// The model's reset ([`GpuModel::reset`]): these bodies never hold a

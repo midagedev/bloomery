@@ -84,16 +84,15 @@
 //!   drafted pass, ~40 rounds carry both and a handful of head and tail
 //!   rounds one, (2·N + ~4)/(N + ~4) ≈ 1.9 — while a turn-taking server
 //!   books exactly 1 busy a call, 1.0;
-//!   (v3) the two SSE streams' token arrivals, timestamped by a reader
-//!   thread a stream: while both are live, every window of
-//!   [`SLOTS_WINDOW`] = 16 consecutive arrivals holds at least
-//!   [`SLOTS_EACH`] = 4 of each — one drafted pass a slot a round keeps
-//!   1–4 ids (`advance_rows` = 4), so ideal delivery alternates in runs of
-//!   at most 4, and batching (the server flushes per event; curl and the
-//!   pipe may clump) tolerates up to 12 consecutive same-stream arrivals
-//!   before the minority drops under 4, while a turn-taking server's
-//!   64-token turns put windows of 16 holding 16 of one stream and none of
-//!   the other;
+//!   (v3) the server's own `slots round` records over the together run
+//!   (the server runs under `BLOOMERY_STEP_STATS=1`, which moves no
+//!   computation): at least one round carries both slots (`rows=2`), and
+//!   every such round runs them as one pass (`passes=1`) — both requests
+//!   advance in the same pass while both are live. The records are the
+//!   engine's own count, so no load on the box moves them; how many rounds
+//!   carry both is (v2)'s, from the server's own call counters. A
+//!   turn-taking server prints no round of both, and a seat that runs its
+//!   rounds a slot at a time prints `passes=2`;
 //!   (v4) the `load` line names `slots=2` and `slot_ctx` = the `--ctx-size`
 //!   the server was started at over two (2048 of the 4096 total), the
 //!   `listening` record the same split, and `/props`' `n_ctx` is the slot
@@ -101,10 +100,10 @@
 //!   Then one more server of `--parallel 2` under the seat's own defaults
 //!   — `--place a`, no `BLOOMERY_DRAFT`, no `BLOOMERY_RESIDENCY` (the
 //!   user's case: the A6000 stages, the adaptive residency runs, the draft
-//!   runs) — runs the together pair once and holds (v2) and (v3) alone,
-//!   no id equality: under the adaptive residency the other stream moves
-//!   experts between the host and the card, so a stream's bits need not
-//!   equal its alone run's.
+//!   runs; `BLOOMERY_STEP_STATS=1` for (v3)'s records) — runs the together
+//!   pair once and holds (v2) and (v3) alone, no id equality: under the
+//!   adaptive residency the other stream moves experts between the host and
+//!   the card, so a stream's bits need not equal its alone run's.
 //!   The swap clause this replaces is gone: the turn path it held
 //!   (`serve::SwapEngine`, the park of a preempted request's state) left
 //!   the seat with the resident slots — no load of this seat takes turns
@@ -114,7 +113,9 @@
 //!   request cannot happen (no slot waits for another), and the draft's
 //!   park-and-rejoin under a switch is (v1)'s draft-count equality.
 //!   FAIL-first mutants, each red on its line: the seat still building the
-//!   turn-taking engine leaves (v2) at ~1.0 and (v3) failing; a select
+//!   turn-taking engine leaves (v2) at ~1.0 and (v3) with no round of both;
+//!   the seat's drafted rounds a slot at a time (its open's `one_pass`
+//!   false) print `passes=2`, (v3) red on both servers; a select
 //!   that parks no draft state leaves (v1)'s draft counts red (a slot's
 //!   pass refuses or drafts another's rows); a reply that hands row
 //!   answers back in the wrong order scrambles (v1)'s ids;
@@ -161,6 +162,23 @@
 //!   red; a pass laid in the rows' arrival order is refused by name in the
 //!   order that puts slot 1's row first and the server dies, red on that
 //!   late line and every line after it.
+//! - the sampled rounds clauses ([`slots_sampled_rounds`], a server of its
+//!   own under `BLOOMERY_DRAFT=off`, `BLOOMERY_RESIDENCY=off` and
+//!   `BLOOMERY_STEP_STATS=1`, `--parallel 2`): two sampled streamed
+//!   requests of the slots clause's prompts (temperature
+//!   [`SAMPLED_TEMPERATURE`], a fixed seed each, so their ids are a function
+//!   of their logits rows alone: the server seeds each request's sampler
+//!   from its own `seed`), each first run alone on that server and then
+//!   both together — over the together run every `slots round` record is
+//!   `cmd=step` of `passes=1` carrying both slots (`rows=2`)
+//!   (`slots_sampled_rounds_run_one_pass`: a load that drafts nothing steps
+//!   every request, and the seat runs a round of plain steps as one pass of
+//!   its rows), and each request's together ids are its alone run's
+//!   (`slots_sampled_together_alone`: each row of the pass and its logits
+//!   bit for bit its step alone, each answer and logits row handed back to
+//!   its own request). FAIL-first mutant: the seat's plain rounds a slot at
+//!   a time (its open's `step_pass` false) print `passes=2`, red on the
+//!   round clause alone (the fallback loop's ids are its alone ids too).
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for, and more servers start on the card, one at a time:
@@ -229,7 +247,7 @@ mod gate {
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc;
     use std::thread::JoinHandle;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{checkpoint_bytes, seq_positional_bytes};
@@ -351,10 +369,6 @@ mod gate {
     /// runs past it without an end-of-generation id — no `ignore_eos`, which
     /// steps a request plainly).
     const SLOTS_PREDICT: usize = 96;
-    /// The slots clause's interleave window and its floor for each stream
-    /// (the module header's (v3) derivation).
-    const SLOTS_WINDOW: usize = 16;
-    const SLOTS_EACH: usize = 4;
     /// The drafted rounds clause's late request: the second posted once the
     /// first has run this many decode calls, polled at
     /// [`DRAFTED_LATE_POLL`] up to [`DRAFTED_LATE_POLLS`] times.
@@ -1601,28 +1615,34 @@ mod gate {
         tokens: Vec<u32>,
         /// The last event's `timings.draft_n`/`draft_n_accepted`.
         drafts: (u64, u64),
-        arrivals: Vec<Instant>,
     }
 
     /// A streamed request's answer channel: what its reader thread sends
     /// when the stream ends.
     type StreamedRx = mpsc::Receiver<Result<Streamed, String>>;
 
-    /// `/completion` of `ids` at temperature 0, streamed: a helper thread of
-    /// its own runs `curl -N` and reads the SSE lines as they land, each
-    /// token event timestamped the moment it is read (the module header's
-    /// (v3) reader thread a stream). The final event carries the tokens and
-    /// the request's timings, its draft counts among them.
+    /// `/completion` of `ids` at temperature 0, streamed
+    /// ([`streamed_with`]).
     fn streamed(
         addr: &str,
         ids: &[u32],
         n: usize,
     ) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
+        streamed_with(
+            addr,
+            json!({
+                "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
+                "cache_prompt": false, "stream": true,
+            }),
+        )
+    }
+
+    /// `/completion` of the streamed request `body`: a helper thread of its
+    /// own runs `curl -N` and reads the SSE lines as they land. The final
+    /// event carries the tokens and the request's timings, its draft counts
+    /// among them.
+    fn streamed_with(addr: &str, body: Value) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
         let (tx, rx) = mpsc::channel();
-        let body = json!({
-            "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
-            "cache_prompt": false, "stream": true,
-        });
         let url = format!("http://{addr}/completion");
         let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
             let run = (|| -> Result<Streamed, String> {
@@ -1656,22 +1676,16 @@ mod gate {
                     .stdout
                     .take()
                     .ok_or_else(|| format!("curl {url}: no stdout"))?;
-                let mut arrivals = Vec::new();
                 let mut tokens = Vec::new();
                 let mut drafts = (0, 0);
                 for line in BufReader::new(out).lines() {
                     let line = line.map_err(|e| format!("curl {url}: {e}"))?;
-                    let at = Instant::now();
                     let Some(v) = line
                         .strip_prefix("data: ")
                         .and_then(|d| serde_json::from_str::<Value>(d).ok())
                     else {
                         continue;
                     };
-                    if v["stop"] == json!(false) && !v["content"].as_str().unwrap_or("").is_empty()
-                    {
-                        arrivals.push(at);
-                    }
                     if let (Some(n), Some(a)) = (
                         v["timings"]["draft_n"].as_u64(),
                         v["timings"]["draft_n_accepted"].as_u64(),
@@ -1686,11 +1700,7 @@ mod gate {
                 if !status.success() {
                     return Err(format!("curl {url}: {status}"));
                 }
-                Ok(Streamed {
-                    tokens,
-                    drafts,
-                    arrivals,
-                })
+                Ok(Streamed { tokens, drafts })
             })();
             let _ = tx.send(run);
         })
@@ -1721,6 +1731,48 @@ mod gate {
         }
     }
 
+    /// `/completion` of `ids` sampled at [`SAMPLED_TEMPERATURE`] with
+    /// [`SAMPLED_SEED`], streamed ([`streamed_with`]): a request that never
+    /// drafts (any sampling steps), its ids a function of its logits rows
+    /// and the seed alone (the server seeds each request's sampler from its
+    /// own `seed`).
+    fn sampled_stream(
+        addr: &str,
+        ids: &[u32],
+        n: usize,
+    ) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
+        streamed_with(
+            addr,
+            json!({
+                "prompt": ids, "n_predict": n, "temperature": SAMPLED_TEMPERATURE,
+                "seed": SAMPLED_SEED, "return_tokens": true, "cache_prompt": false, "stream": true,
+            }),
+        )
+    }
+
+    /// One sampled streamed request ([`sampled_stream`]) run to its end on
+    /// its own thread ([`run_streamed`]'s shape).
+    fn run_sampled(
+        addr: &str,
+        ids: &[u32],
+        n: usize,
+        what: &str,
+    ) -> Result<Option<Streamed>, GateError> {
+        let (h, rx) = sampled_stream(addr, ids, n)?;
+        h.join()
+            .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
+        let ran = rx
+            .recv()
+            .map_err(|_| format!("slots: the {what} request's thread gave no answer"))?;
+        match ran {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => {
+                println!("slots: the {what} request failed: {e}");
+                Ok(None)
+            }
+        }
+    }
+
     /// The busy slots the server has booked over its `decodes` engine calls:
     /// `/metrics` carries them as the running mean `n_busy_slots_per_decode`
     /// (`serve::api`'s metrics), so the total is that mean times the calls.
@@ -1728,66 +1780,49 @@ mod gate {
         Ok(metric(url, "n_busy_slots_per_decode")?.unwrap_or(f64::NAN) * decodes)
     }
 
-    /// The (v3) interleave check (the module header's derivation): while both
-    /// streams are live — from the later one's first arrival to the earlier
-    /// one's last — every window of [`SLOTS_WINDOW`] consecutive arrivals
-    /// holds at least [`SLOTS_EACH`] of each stream. `None` a pair a stream
-    /// of which never ran; the check is red on an empty stretch.
-    fn interleave(
+    /// The (v3) round check (the module header) on the server whose stderr
+    /// is `err_log`: its `slots round` records past the first `before` (the
+    /// count read before the together run) — at least one round carried
+    /// both slots (`rows=2`), and every such round ran them as one pass
+    /// (`passes=1`) of the seat's two slots.
+    // PIN(2026-10-05): (v3) reads the engine's own round records, not the SSE
+    // arrival timestamps — a client-side clock on a shared box clumped one
+    // stream's events under load average 15.6 and turned the window rule red
+    // with the server's rounds unchanged. The threshold stays zero: no thin
+    // window then, no round of both run in more than one pass now.
+    fn rounds_carry_both_in_one_pass(
         ok: &mut bool,
         name: &str,
-        together: &[Option<Streamed>],
+        err_log: &Path,
+        before: usize,
     ) -> Result<(), GateError> {
-        let (Some(a), Some(b)) = (together[0].as_ref(), together[1].as_ref()) else {
-            check(ok, name, false);
-            return Ok(());
-        };
-        let mut merged: Vec<(usize, Instant)> = [a, b]
+        let rounds = seat_log(err_log)?.all(&record::SLOTS_ROUND)?;
+        let window = &rounds[before.min(rounds.len())..];
+        let both = window.iter().filter(|r| r.u64("rows") == Ok(2)).count();
+        let split = window
             .iter()
-            .enumerate()
-            .flat_map(|(i, s)| s.arrivals.iter().map(move |&t| (i, t)))
-            .collect();
-        merged.sort_by_key(|&(_, t)| t);
-        let live_from = [a, b]
-            .iter()
-            .map(|s| s.arrivals.first().copied())
-            .max()
-            .flatten();
-        let live_to = [a, b]
-            .iter()
-            .map(|s| s.arrivals.last().copied())
-            .min()
-            .flatten();
-        let tags: Vec<usize> = merged
-            .iter()
-            .filter(|(_, t)| live_from.is_some_and(|f| *t >= f) && live_to.is_some_and(|u| *t < u))
-            .map(|&(i, _)| i)
-            .collect();
-        let mut thin = 0;
-        for w in tags.windows(SLOTS_WINDOW) {
-            let of_first = w.iter().filter(|&&i| i == 0).count();
-            if of_first < SLOTS_EACH || SLOTS_WINDOW - of_first < SLOTS_EACH {
-                thin += 1;
-            }
-        }
+            .filter(|r| {
+                r.u64("rows") == Ok(2) && (r.u64("passes") != Ok(1) || r.u64("slots") != Ok(2))
+            })
+            .count();
         println!(
-            "slots interleave: {} arrivals while both live, {} thin window(s) of {}",
-            tags.len(),
-            thin,
-            SLOTS_WINDOW,
+            "{name}: {} record(s) in the together window, {both} of both slots, {split} of them \
+             in more than one pass",
+            window.len(),
         );
-        check(ok, name, !tags.is_empty() && thin == 0);
+        check(ok, name, both > 0 && split == 0);
         Ok(())
     }
 
     /// The slots clause (the module header) in two parts. The first server,
     /// into `<dir>/slots`, is this gate's own shape at `--parallel 2` with
-    /// the draft on and the residency off: the ids and draft counts of two
-    /// streamed requests run together are their alone runs'
-    /// ((v1) — the per-slot draft park is the rejoin the swap clause held),
-    /// a round carries both slots and nothing swaps ((v2)), the streams
-    /// interleave ((v3)), and the load, `listening` and `/props` name the
-    /// split ((v4)). The second server, into `<dir>/slots-default`, is the
+    /// the draft on, the residency off and `BLOOMERY_STEP_STATS=1`: the ids
+    /// and draft counts of two streamed requests run together are their
+    /// alone runs' ((v1) — the per-slot draft park is the rejoin the swap
+    /// clause held), a round carries both slots and nothing swaps ((v2)),
+    /// every round of both runs one pass ((v3),
+    /// [`rounds_carry_both_in_one_pass`]), and the load, `listening` and
+    /// `/props` name the split ((v4)). The second server, into `<dir>/slots-default`, is the
     /// seat under its own defaults at `--parallel 2` — `--place a`, neither
     /// lever set (the user's case: the A6000 stages, the adaptive residency
     /// and the draft run) — and runs the together pair once, holding (v2)
@@ -1808,7 +1843,8 @@ mod gate {
         args[parallel] = "2";
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::DRAFT, "mtp")
-            .env(bloomery_levers::RESIDENCY, "off");
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env(bloomery_levers::STEP_STATS, "1");
         let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
         println!("slots server pid {}", served.child.id());
         let addr = match served.address(&err_log, POLLS, POLL) {
@@ -1826,7 +1862,7 @@ mod gate {
                     "slots_alone_ids_stay",
                     "slots_alone_draft_counts_stay",
                     "slots_rounds_carry_both_slots",
-                    "slots_streams_interleave",
+                    "slots_rounds_of_both_run_one_pass",
                 ] {
                     check(&mut ok, name, false);
                 }
@@ -1896,6 +1932,11 @@ mod gate {
         }
         let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy0 = busy_total(&url, decode0)?;
+        // The alone runs print no record (a round of one active request is a
+        // select and an `advance`), so the window opens empty; taken anyway,
+        // so the together run's records are exactly the ones after this
+        // point.
+        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
         // Both posted at once: the prompts serialize on the engine thread (a
         // round or two of skew), so nearly every round carries both slots —
         // the (v2) bound's shape.
@@ -1966,8 +2007,13 @@ mod gate {
             "slots_rounds_carry_both_slots",
             swaps.is_none_or(|v| v == 0.0) && ratio >= 1.5,
         );
-        // (v3) While both stream, the arrivals interleave.
-        interleave(&mut ok, "slots_streams_interleave", &together)?;
+        // (v3) While both stream, every round of both runs one pass.
+        rounds_carry_both_in_one_pass(
+            &mut ok,
+            "slots_rounds_of_both_run_one_pass",
+            &err_log,
+            before,
+        )?;
         println!("slots server stopped: {}", served.stop()?);
         slots_default_residency(dir, &mut ok)
     }
@@ -1987,7 +2033,8 @@ mod gate {
         cmd.env_remove(bloomery_levers::DRAFT)
             .env_remove(bloomery_levers::RESIDENCY)
             .env_remove(bloomery_levers::MTP_HEAD_ROWS)
-            .env_remove(bloomery_levers::MTP_DRAFT);
+            .env_remove(bloomery_levers::MTP_DRAFT)
+            .env(bloomery_levers::STEP_STATS, "1");
         let args = [
             "--host",
             "127.0.0.1",
@@ -2008,7 +2055,7 @@ mod gate {
                     std::fs::read_to_string(&err_log).unwrap_or_default()
                 );
                 check(ok, "slots_default_rounds_carry_both_slots", false);
-                check(ok, "slots_default_streams_interleave", false);
+                check(ok, "slots_default_rounds_of_both_run_one_pass", false);
                 let _ = served.stop();
                 return Ok(*ok);
             }
@@ -2028,6 +2075,7 @@ mod gate {
         );
         let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
         let busy0 = busy_total(&url, decode0)?;
+        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
         let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
         let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
         let mut together = Vec::new();
@@ -2060,7 +2108,12 @@ mod gate {
             "slots_default_rounds_carry_both_slots",
             swaps.is_none_or(|v| v == 0.0) && ratio >= 1.5,
         );
-        interleave(ok, "slots_default_streams_interleave", &together)?;
+        rounds_carry_both_in_one_pass(
+            ok,
+            "slots_default_rounds_of_both_run_one_pass",
+            &err_log,
+            before,
+        )?;
         println!("slots-default server stopped: {}", served.stop()?);
         Ok(*ok)
     }
@@ -2423,6 +2476,127 @@ mod gate {
             "slots_drafted_off_slot_steps_beside_a_window",
             off && fresh && off_same && drafted_same && beside > 0,
         );
+        Ok(ok)
+    }
+
+    /// The sampled rounds clauses (the module header) on one server of
+    /// `--parallel 2` under `BLOOMERY_DRAFT=off`, `BLOOMERY_RESIDENCY=off`
+    /// and `BLOOMERY_STEP_STATS=1`, into its own directory: two sampled
+    /// streamed requests of the slots clause's prompts — temperature
+    /// [`SAMPLED_TEMPERATURE`], [`SAMPLED_SEED`] each, so a request's ids
+    /// are a function of its logits rows alone (the server seeds each
+    /// request's sampler from its own `seed`) — each first run alone on
+    /// that server and then both together, the together run's `slots
+    /// round` records read back — every one `cmd=step` of `passes=1`
+    /// carrying both slots (`rows=2`, `slots=2`), and each request's
+    /// together ids its alone run's: the seat runs a round of plain steps
+    /// as one pass of its rows, each row's answer and lent logits row its
+    /// own. The alone runs are on this server, the load the together run
+    /// runs (the plan of 2 sequences); a `--parallel 1` load's ids are no
+    /// reference (the placement differs).
+    fn slots_sampled_rounds(dir: &Path) -> Result<bool, GateError> {
+        let mut ok = true;
+        let d = dir.join("slots-sampled");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        // SERVER_ARGS ends in the one-slot `--parallel 1`; this clause's
+        // server takes the two-slot value, the total context the same 4096.
+        let mut args: Vec<&str> = SERVER_ARGS.to_vec();
+        let parallel = args.len() - 1;
+        args[parallel] = "2";
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::DRAFT, "off")
+            .env(bloomery_levers::RESIDENCY, "off")
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT)
+            .env(bloomery_levers::STEP_STATS, "1");
+        let mut served = Served38::spawn_with(&args, &d, &mut cmd)?;
+        println!("slots-sampled server pid {}", served.child.id());
+        let addr = match served.address(&err_log, POLLS, POLL) {
+            Ok(a) => a,
+            // A server that never listens names no round: the checks are red
+            // by name, and the server is stopped.
+            Err(e) => {
+                println!(
+                    "slots-sampled: the server never listened: {e}; it said: {}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                for name in [
+                    "slots_sampled_rounds_run_one_pass",
+                    "slots_sampled_together_alone",
+                ] {
+                    check(&mut ok, name, false);
+                }
+                let _ = served.stop();
+                return Ok(ok);
+            }
+        };
+        let url = |p: &str| format!("http://{addr}{p}");
+        let (a_ids, b_ids) = (
+            rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?,
+            rendered(&url, json!([{ "role": "user", "content": SLOTS_B }]))?,
+        );
+        let mut alone = Vec::new();
+        for (ids, what) in [(&a_ids, "alone A"), (&b_ids, "alone B")] {
+            alone.push(run_sampled(&addr, ids, SLOTS_PREDICT, what)?);
+        }
+        // The alone runs print no record (a round of one active request is a
+        // select and a step); taken anyway, so the together run's records are
+        // exactly the ones after this point.
+        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let first = sampled_stream(&addr, &a_ids, SLOTS_PREDICT)?;
+        let second = sampled_stream(&addr, &b_ids, SLOTS_PREDICT)?;
+        let mut together = Vec::new();
+        for ((h, rx), what) in [(first, "together A"), (second, "together B")] {
+            h.join()
+                .map_err(|_| format!("slots-sampled: the {what} request's thread panicked"))?;
+            let ran = rx.recv().map_err(|_| {
+                format!("slots-sampled: the {what} request's thread gave no answer")
+            })?;
+            match ran {
+                Ok(s) => together.push(Some(s)),
+                Err(e) => {
+                    println!("slots-sampled: the {what} request failed: {e}");
+                    together.push(None);
+                }
+            }
+        }
+        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
+        let window = &rounds[before.min(rounds.len())..];
+        let every = !window.is_empty()
+            && window.iter().all(|r| {
+                r.word("cmd") == Ok("step")
+                    && r.u64("passes") == Ok(1)
+                    && r.u64("rows") == Ok(2)
+                    && r.u64("slots") == Ok(2)
+            });
+        println!(
+            "slots-sampled: {} record(s) in the together window, {} of them one pass of 2 rows \
+             (alone {} and {} ids, together {} and {} ids)",
+            window.len(),
+            window
+                .iter()
+                .filter(|r| r.word("cmd") == Ok("step") && r.u64("passes") == Ok(1))
+                .count(),
+            alone[0].as_ref().map_or(0, |s| s.tokens.len()),
+            alone[1].as_ref().map_or(0, |s| s.tokens.len()),
+            together[0].as_ref().map_or(0, |s| s.tokens.len()),
+            together[1].as_ref().map_or(0, |s| s.tokens.len()),
+        );
+        check(&mut ok, "slots_sampled_rounds_run_one_pass", every);
+        check(
+            &mut ok,
+            "slots_sampled_together_alone",
+            together[0].as_ref().is_some_and(|t| !t.tokens.is_empty())
+                && together[1].as_ref().is_some_and(|t| !t.tokens.is_empty())
+                && alone[0]
+                    .as_ref()
+                    .is_some_and(|a| a.tokens == together[0].as_ref().unwrap().tokens)
+                && alone[1]
+                    .as_ref()
+                    .is_some_and(|a| a.tokens == together[1].as_ref().unwrap().tokens),
+        );
+        println!("slots-sampled server stopped: {}", served.stop()?);
         Ok(ok)
     }
 
@@ -2909,6 +3083,10 @@ mod gate {
         // The drafted rounds run as one pass (the module header): its own
         // server, the draft on, the residency off, the round records on.
         ok &= slots_drafted_rounds(&a.dir)?;
+        // The plain rounds of a load that drafts nothing run as one pass
+        // (the module header): its own server, sampled requests that step,
+        // the round records on.
+        ok &= slots_sampled_rounds(&a.dir)?;
         if ok {
             println!("gate-gpu-qwen38-serve: PASS");
             Ok(())

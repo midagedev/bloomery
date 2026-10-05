@@ -86,15 +86,23 @@
 //! load, eviction and skip prints as a line.
 //!
 //! `--parallel N` (`-np N`, default 2) serves N resident sequences inside
-//! the one model (`Session::add_slots` over `Body38`'s [`Slots`]): the
-//! server's round of the busy slots runs as one pass of their drafted
-//! windows (`app::mtp::pass_slots`, every slot's rows verified together,
-//! the round cut into passes at the body's `SlotRows::MAX_ROWS`), the
-//! sequences switched by pointer exchange, and one draft held a resident
-//! slot — its host state never moved, its device side parking with the
-//! sequence on every switch — so each request's tokens are its solo run's.
-//! `--parallel 1` is exactly the one-sequence server, its rounds one pass
-//! a slot. The context is split as llama-server splits it with
+//! the one model (`Session::add_slots` over `Body38`'s [`Slots`]): on a
+//! drafted load the server's round of the busy slots' drafted passes runs
+//! as one pass of their windows (`app::mtp::pass_slots`, every slot's rows
+//! verified together, the round cut into passes at the body's
+//! `SlotRows::MAX_ROWS`), and its round of plain steps (a sampling or
+//! id-banning request's) a select and a step a row, each step told to its
+//! slot's draft; on a load that drafts nothing every request steps, and the
+//! round of the busy slots' steps runs as one pass of their rows
+//! (`GpuModel::step_slots`, each row bit for bit its step alone). The
+//! sequences are switched by pointer exchange, and one draft is held a
+//! resident slot — its host state never moved, its device side parking
+//! with the sequence on every switch — so each request's tokens are its
+//! solo run's. Under `--place bp` (an expert tier card, beside which the
+//! body runs no pass of several slots) every round runs a slot at a time,
+//! and the open prints a line that says so. `--parallel 1` is exactly the
+//! one-sequence server, its rounds one pass a slot. The context is split
+//! as llama-server splits it with
 //! `-np N` and no `-kvu`: the `--ctx-size` the flags named (or the automatic
 //! choice when unset) is the total, each slot `total / N` positions rounded
 //! down, and the search for the default — the largest total whose N-slot
@@ -212,7 +220,7 @@ use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Seq38, TargetRows, seq38_by
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
-    CacheRam, Seat, SeatEngine, SlotPassRow, Vocab, model_props, nvidia_smi_index,
+    CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
     pass_rows_in_turn, placement_props, sampler_factory,
 };
 use bloomery_gpu_gates::generate::Place;
@@ -416,6 +424,13 @@ impl Place38 {
     /// treat as plan (a).
     fn stage_a(self) -> bool {
         matches!(self.kind, Kind38::A | Kind38::Bp)
+    }
+
+    /// The placement holds an expert tier card (plan (b′)): the body runs
+    /// no pass of several slots on such a load (`Body38::plan_slots`
+    /// refuses a load with an expert tier card by name).
+    fn tiered(self) -> bool {
+        matches!(self.kind, Kind38::Bp)
     }
 
     /// The machine a plan of `inputs` at `ctx` positions and ubatches of
@@ -1203,10 +1218,20 @@ struct Q38 {
     break_even: Option<BreakEven>,
     /// Whether a round of several slots' drafted passes runs as one pass of
     /// the busy rows ([`Q38::pass_slots`]): a drafted load of more than one
-    /// resident slot — the body runs several slots' rows as one pass
-    /// ([`SlotRows`]), and a round of drafted rows only a drafting server
-    /// runs. A `--parallel 1` load and a plain one keep the fallback loop.
+    /// resident slot with no expert tier card — the body runs several slots'
+    /// rows as one pass ([`SlotRows`]) except beside a tier
+    /// ([`Place38::tiered`]), and a round of drafted rows only a drafting
+    /// server runs. A `--parallel 1` load, a plain one and a tiered one keep
+    /// the fallback loop.
     one_pass: bool,
+    /// Whether a round of several slots' plain steps runs as one pass of the
+    /// busy rows ([`Q38::step_slots`]): a load that drafts nothing, of more
+    /// than one resident slot, with no expert tier card. A drafted load's
+    /// plain rounds — a sampling or id-banning request's steps — keep the
+    /// fallback loop: each of its steps is told to its slot's draft
+    /// ([`SlotDrafts::step_with_row`]), which a pass of plain steps does
+    /// not do.
+    step_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
     /// The branch the last keep query took ([`Q38::draft_keep`]), one a
@@ -1385,6 +1410,17 @@ impl Q38 {
                 })?
             }
         };
+        // The rounds of several slots, decided once: one pass of the busy
+        // rows where the body runs one, the drafted rounds on a drafted load
+        // and the plain rounds on a plain one.
+        let pass_of_slots = a.slots > 1 && !a.place.tiered();
+        if a.slots > 1 && a.place.tiered() {
+            eprintln!(
+                "bloomery-serve-qwen38: --place {}: the rounds of several slots run a slot at a \
+                 time: the body runs no pass of several slots beside an expert tier card",
+                a.place.name()
+            );
+        }
         Ok(Q38 {
             s,
             drafts,
@@ -1393,7 +1429,8 @@ impl Q38 {
             draft_path: a.draft_path,
             residency,
             break_even: a.mtp.then(|| BreakEven::of(a.place)),
-            one_pass: a.slots > 1 && a.mtp,
+            one_pass: pass_of_slots && a.mtp,
+            step_pass: pass_of_slots && !a.mtp,
             stats: a.stats,
             branch: std::cell::RefCell::new(vec![None; a.slots]),
         })
@@ -1615,6 +1652,32 @@ impl Seat for Q38 {
     /// The lever the binary parsed ([`Q38::stats`]).
     fn step_stats(&self) -> bool {
         self.stats
+    }
+
+    /// One round of several slots' plain steps
+    /// ([`super::rounds::step_round`]): while the open decided so
+    /// ([`Q38::step_pass`], a plain load) one pass of the busy rows through
+    /// [`super::rounds::step_rows_one_pass`] — laid in slot order, each
+    /// row's answer and lent logits row its own, slot 0 left selected — and
+    /// the call's `residency pass` records after it, else the fallback
+    /// (`bind::step_rows_in_turn`: a select and a step a row, each step told
+    /// to its slot's draft on a drafted load).
+    fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
+        let one_pass = self.step_pass;
+        super::rounds::step_round(
+            self,
+            one_pass,
+            rows,
+            |q, rows| {
+                // What the fallback loop's per-row step would print at its
+                // slot.
+                for r in rows.iter() {
+                    q.before_call_at(r.slot);
+                }
+                super::rounds::step_rows_one_pass(&mut q.s, rows)
+            },
+            Q38::print_passes,
+        )
     }
 
     /// One round of several slots' drafted passes: while the open decided
