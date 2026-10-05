@@ -2881,4 +2881,38 @@ mod tests {
             (Some(3), "0..3".to_string())
         );
     }
+
+    /// The whole-fit verdict a load of N resident slots opens by is the
+    /// total's, never one slot's share: the cache is linear in the context,
+    /// so on one card a total one position past the whole fit is short while
+    /// its half fits — a verdict asked at the share would open the whole load
+    /// and the slots added after it would hold a cache the verdict never
+    /// counted (the qwen3 seat makes its verdict once, at the total).
+    #[test]
+    fn a_total_past_the_whole_fit_fits_at_half() {
+        const ROW: u64 = 2_048;
+        const TOTAL: u64 = 4_096;
+        let model = layered(3);
+        let load = WholeLoad::Unchecked;
+        let kv = |ctx: u64| ctx * ROW;
+        let at = |free: u64| Card {
+            granule_bytes: NonZeroU64::new(4096).expect("not zero"),
+            free_bytes: Some(free),
+            ..bytes_card("card", u64::MAX, 0..3)
+        };
+        let edge = whole_need(&model, &at(u64::MAX), kv(TOTAL - 1), load)
+            .expect("every tensor has a format")
+            .need;
+        let card = at(edge);
+        let total = whole_need(&model, &card, kv(TOTAL), load).expect("sized");
+        let share = whole_need(&model, &card, kv(TOTAL / 2), load).expect("sized");
+        assert!(
+            whole_need(&model, &card, kv(TOTAL - 1), load)
+                .expect("sized")
+                .fits(),
+            "the reading holds the whole load one position short of the total"
+        );
+        assert!(!total.fits(), "the total does not fit: {total}");
+        assert!(share.fits(), "a slot's share of it does: {share}");
+    }
 }
