@@ -1960,10 +1960,49 @@ fn hw_ignore_eos_bans_every_stop_id() {
     }
 }
 
+/// The mock whose `reset` and `cut` — the prompt cache's engine calls, one of
+/// which every request below makes — each take at least [`SLOW`], so a
+/// request's `cache_ms` is never 0 by the clock's grain.
+struct SlowCut(serve::MockEngine);
+
+const SLOW: std::time::Duration = std::time::Duration::from_millis(5);
+
+impl serve::Engine for SlowCut {
+    fn tokenizer(&self) -> std::sync::Arc<dyn serve::Tokenizer> {
+        self.0.tokenizer()
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), serve::EngineError> {
+        self.0.prefill(ids)
+    }
+    fn next(&mut self, last: u32, out: Option<&mut [f32]>) -> Result<u32, serve::EngineError> {
+        self.0.next(last, out)
+    }
+    fn reset(&mut self) -> Result<(), serve::EngineError> {
+        std::thread::sleep(SLOW);
+        self.0.reset()
+    }
+    fn keepable(&self, n: usize) -> usize {
+        self.0.keepable(n)
+    }
+    fn cut(&mut self, n: usize) -> Result<(), serve::EngineError> {
+        std::thread::sleep(SLOW);
+        self.0.cut(n)
+    }
+    fn ctx_max(&self) -> usize {
+        self.0.ctx_max()
+    }
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+}
+
+/// `/metrics`' totals are the sums of the requests' `timings`: the prompt
+/// tokens evaluated and kept, the prompt cache's time (ours), and the longest
+/// sequence.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_metrics_count_cached_prompt_tokens() {
-    let addr = start(4096);
+    let addr = common::start_with(Box::new(SlowCut(serve::MockEngine::new(4096))));
     let run = |body: Value| post(addr, "/completion", &body).json();
     // A leaves "abcabc" and four generated ids; B keeps 8 of its 9; C keeps none
     // and is the shortest, so the largest sequence is not the last one.
@@ -1977,6 +2016,16 @@ fn hw_metrics_count_cached_prompt_tokens() {
     let sum = |k: &str| replies.iter().map(|v| field(v, k)).sum::<f64>();
     assert_eq!(metric(&body, "prompt_tokens_cached_total"), sum("cache_n"));
     assert_eq!(metric(&body, "prompt_tokens_total"), sum("prompt_n"));
+    let slow = SLOW.as_secs_f64() * 1e3;
+    assert!(
+        sum("cache_ms") >= 3.0 * slow,
+        "the fixture: each request's cache work takes {slow} ms or more: {}",
+        sum("cache_ms")
+    );
+    assert_eq!(
+        metric(&body, "prompt_cache_seconds_total"),
+        sum("cache_ms") / 1e3
+    );
     let longest = replies
         .iter()
         .map(|v| field(v, "n_past"))

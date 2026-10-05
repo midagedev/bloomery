@@ -33,13 +33,16 @@
 //! keeps serving.
 //!
 //! The host prompt cache (llama-server's `--cache-ram`), one for every slot:
-//! before a request drops most of what its slot holds — unless it carries the
-//! slot's last prompt whole, and so drops only that prompt's reply — the
-//! server takes the slot's state as a value ([`Engine::snapshot`]) into a host-RAM LRU of [`Engine::cache_ram`]
-//! bytes, keyed by the ids it covers; a later request that one of those states
-//! serves better than the slot does gets it back ([`Engine::resume`]). What
-//! the cache did, and every prefix the engine keeps less of than a request
-//! shares, reaches the engine's binary as a [`CacheNote`] ([`Engine::note`]).
+//! before a request drops what its slot holds (on a server of one slot, most
+//! of it) — unless it carries the slot's last prompt whole, and so drops only
+//! that prompt's reply — the server takes the slot's state as a value
+//! ([`Engine::snapshot`]) into a host-RAM LRU of [`Engine::cache_ram`] bytes,
+//! keyed by the ids it covers; a later request that one of those states
+//! serves better than the slot does gets it back ([`Engine::resume`]). Slots
+//! that take the engine in turns hand the cache the idle states they stop
+//! parking. What the cache did, and every prefix the engine keeps less of than
+//! a request shares, reaches the engine's binary as a [`CacheNote`]
+//! ([`Engine::note`]).
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -437,13 +440,17 @@ pub enum CacheNote {
         held: usize,
         reason: Option<String>,
     },
-    /// The slot's state of `positions` went into the cache.
+    /// The slot's state of `positions` went into the cache. `copied`: the
+    /// state is a snapshot taken for the save, or for a park that found no
+    /// room; not a state the slot already had, handed over as it is. `ms` is
+    /// the save's own wall clock (a park's snapshot is the switch's).
     Save {
         positions: usize,
         bytes: u64,
         ms: f64,
         entries: usize,
         cache_bytes: u64,
+        copied: bool,
     },
     /// A cached state of `positions` sharing `common` ids with the request
     /// replaced the slot's, which kept `slot_kept` of them; the engine then
@@ -494,10 +501,11 @@ impl std::fmt::Display for CacheNote {
                 ms,
                 entries,
                 cache_bytes,
+                copied,
             } => write!(
                 f,
                 "cache save positions={positions} bytes={bytes} ms={ms:.3} entries={entries} \
-                 cache_bytes={cache_bytes}"
+                 cache_bytes={cache_bytes} copied={copied}"
             ),
             CacheNote::Load {
                 positions,
