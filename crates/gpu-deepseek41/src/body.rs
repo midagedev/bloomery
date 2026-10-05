@@ -109,13 +109,16 @@ mod ced;
 mod prefill;
 mod program;
 mod seq;
+mod slots;
+mod snap;
 pub use ced::{CedLayer, CedState, LayerNeed, Need, exact};
 pub use prefill::{
     BatchObserver, BatchSeam, BatchSeamKind, CHUNK, FeatureRows, FeatureSink, PrefillMode,
     PrefillStats, PromptCounts, T_MAX, batch_count, batches, prefill, prefill_observed,
     prefill_with, prepare_prefill,
 };
-pub use seq::{KeepLimit, Seq, SeqSnapshot, resume, snapshot};
+pub use seq::{KeepLimit, Seq};
+pub use snap::{SeqSnapshot, StateFail, restore_state, resume, save_state, snapshot};
 
 /// The V4.1 engine: the shared skeleton over this body.
 pub type Deepseek41Model = GpuModel<Body>;
