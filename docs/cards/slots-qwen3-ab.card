@@ -1,25 +1,51 @@
 # Round slotbench (multiseq2 T2): Qwen3-30B-A3B whole on the A6000. Two streams decoded in one pass
 # (BLOOMERY_GEN_SLOTS=2, `GpuModel::step_slots`) against one stream, same binary, at depth 6 and at depth 4096.
-# HELD by the lead. The band is today's pass (per-row experts, heads and attention). After the adoption list (an
-# m-column core in qwen3moe_qkv_q4k/o_resid_q4k, one m-row head, an m-row norm-fused router) it becomes ×1.22..1.37
-# at depth 6 and ×1.18..1.29 at depth 4096 [derived], and this card is re-banded before it sits.
+# Ready to sit on the lead's go.
 #
-# [derived] The pricing (design/multistream-pricing.md §1) put N = 2 at ×1.53..1.72. One term was wrong: f ∈ [0.5, 1],
-# the share of the added expert bytes not hidden under the step's latency. The expert kernels stream near 600 GB/s at
-# m = 1 (qwen3moe_gate_up_swiglu_q4k 1.124 ms on 680 MB, rig-log 09-25 #qwen3fuse-regression-nsys). The graph is one
-# serial stream, and at m = 2 every slot reads its own expert rows (grids ×2, no union). So f = 1 on t_E(1) =
-# 1.81..1.99 ms, not 0.5..1 × 1.477 ms. The pricing also left out the second row's head: output.weight is read twice,
-# +0.37..0.39 ms. The second slot's sequence-bound launches cost +0.25..0.46 ms plus their gaps, not 0.10 ms.
-# qwen3moe_qkv_q4k/o_resid_q4k run the one-column body once a column (+0.09..0.61 ms, the weight's second read from
-# L1/L2), and the m-row router adds its norm_quant (+0.08..0.29 ms). The per-class table is in the slotbench report.
-#   depth 6: step(1) = 1000 / 209.2 = 4.78 ms (README, A6000). pass(2) = 4.78 + 2.74..4.12 = 7.52..8.90 ms. The
-#     aggregate 2 × 1000 / pass(2) = 225..266 tok/s is ×1.07..1.27, effect +7..+27 %.
-#   depth 4096: step(1) = 1000 / 175.2 = 5.71 ms. Each slot's own flash adds the measured 0.93 ms a slot at 4096
-#     (1/175.2 − 1/209.2), so pass(2) = 7.52..8.90 + 2 × 0.93 = 9.38..10.76 ms. The aggregate is 186..213 tok/s,
-#     ×1.06..1.22, effect +6..+22 %.
-# The band below is the union of the two depths: +6..+27 %. Each depth's ratio line is read against its own band.
+# PIN(2026-10-05): re-banded by round abplan for the landed one-pass pass, from +6..+27 (the pass of 10-03: per-row
+# experts, heads, projections and attention) to +24..+44. Landed since: A `c31bda7c` (qkvmcol: qwen3moe_qkv_q4k and
+# o_resid_q4k walk each weight row once for all m columns), B `1f012c25` (onehead: one m-row head of every row),
+# C `196881ea` (routermrow: the FFN norm folded into the m-row router), D `22220bf2` (slotattn: the append, segment
+# pass and merge once over every row, each row reading its own slot's planes; J_SLOT_LAYER_NODES 3 -> 0,
+# crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs:2575). [derived] Per class of the slotbench report's table (A6000,
+# depth 6, the Δ of the 2-slot pass over the m = 1 step, ms; specs multiseq2/slotbench-report.md §4):
+#   experts      +1.81..1.99  stays: every slot reads its own expert rows (grids x2, no union); A..D leave it
+#   head         +0.37..0.39  -> +0..0.05: B reads output.weight once for both rows (the m-row head, one row copy)
+#   projections  +0.14..0.77  -> +0..0.19: A reads each weight row once; the second column's arithmetic is at most
+#                             15 % of the m = 1 walk's 1.08..1.24 ms, which runs under the DRAM rate
+#   router       +0.08..0.29  -> +0..0.05: C folds norm_quant into the m-row router launch
+#   attention    +0.25..0.46  -> +0..0.10 at depth 6: D runs one launch of each kind over both rows
+#   launch gaps  +0.08..0.19  -> +0.03..0.10: the pass is 631 nodes [derived from (j2)'s terms, gate_qwen3moe_e2e.rs
+#                             :2926-2932: the one-row pass 605 + a slot's 1 + the m >= 2 step 24 + the m-row head's
+#                             one launch] against the step's 604 (NODES_CHAIN, :380)
+#   host         +0.01..0.03  stays
+#   Δ = 1.85..2.56 ms; the experts are 71..100 % of it.
+#   depth 6: step(1) = 4.73..4.78 ms (the slotbench report's measured 4.73; README 209.2 tok/s = 4.78). pass(2) =
+#     6.58..7.34 ms; the aggregate 2 · step / pass = x1.30..1.44, effect +30..+44 %.
+#   depth 4096: step(1) = 1000 / 175.2 = 5.71 ms (README). The second row's flash reads its own planes: 48 layers x K
+#     and V x 512 x 2 B x 4096 = 403 MB, 0.58..0.67 ms at 600..700 GB/s, up to the measured 0.93 ms a slot (1/175.2 -
+#     1/209.2) when its latency does not overlap the first row's inside D's one launch. pass(2) = 5.71 + 1.85..2.56 +
+#     0.58..0.93 = 8.14..9.20 ms; x1.24..1.40, effect +24..+40 %.
+# The band below is the union of the two depths: +24..+44 %. Each depth's ratio line is read against its own band.
+# The first re-band draft (10-05, a GLM round, never sat) chained the old intervals (x1.22..1.37 for A..C, then D's
+# -0.25..-0.66 ms) to +26..+51 % at depth 6. Its top needs pass(2) = 6.32 ms, below step(1) plus the second row's
+# experts alone (4.73 + 1.81 = 6.54 ms), so it cannot hold; the per-class sum above replaces it.
+#
+# The band before A..D, kept for its classes: the pricing (design/multistream-pricing.md §1) put N = 2 at
+# x1.53..1.72. One term was wrong: f ∈ [0.5, 1], the share of the added expert bytes not hidden under the step's
+# latency. The expert kernels stream near 600 GB/s at m = 1 (qwen3moe_gate_up_swiglu_q4k 1.124 ms on 680 MB, rig-log
+# 09-25 #qwen3fuse-regression-nsys). The graph is one serial stream, and at m = 2 every slot reads its own expert
+# rows. So f = 1 on t_E(1) = 1.81..1.99 ms, not 0.5..1 x 1.477 ms. That pass also read output.weight twice
+# (+0.37..0.39 ms), ran the second slot's sequence-bound launches (+0.25..0.46 ms plus their gaps), the one-column
+# projection body once a column (+0.09..0.61 ms) and the m-row router's norm_quant (+0.08..0.29 ms): pass(2) =
+# 4.78 + 2.74..4.12 ms at depth 6, x1.07..1.27; at depth 4096, x1.06..1.22.
 # The 3090 functional runs (250 W cap, untimed, outside the lease; every slot's ids bit for bit its solo run's at
 # depth 6, 64 and 1024) give direction only; see the slotbench report.
+#
+# Resource timeline of the pass [derived, the slotbench report §4]: the card's one serial stream is ~99 % of the wall;
+# the host 0.02..0.08 ms in series with it (write, replay, sync, read); PCIe the input record and a 4 B id a row; host
+# DRAM and NVMe 0. After A..D the only class that grows with the slots is the experts' bytes: the next lever is the
+# expert union (bulk: an expert read once for the rows that pick it), not a launch or an async overlap.
 #
 # The runner's lines are `ratio slots d=6 ours@BLOOMERY_GEN_SLOTS=2/ours` and `ratio slots d=4096 …`. Each is the
 # aggregate arm's tok/s (Σ positions · 1000 / Σ ms over its counted `time pass … kind=slots` records) over its plain
@@ -30,26 +56,33 @@
 #   just depth-gpu-qwen3moe 6 6@BLOOMERY_GEN_SLOTS=2 4096 4096@BLOOMERY_GEN_SLOTS=2
 # (`depth-qwen3moe.sh --parse-arms …` gives four loads a round: ctx 256 for depth 6, 4352 for depth 4096, the 2-slot
 # arms fed 12 and 8192 ids.)
+# Wall [derived, the slotbench report §5]: 4 rounds x 4 loads + the rotate warm-up, 17 Qwen3-30B processes, 4..8 min.
 kind: ab
-question: do two Qwen3-30B streams decoded in one pass (BLOOMERY_GEN_SLOTS=2) outrun one stream by the corrected
-  ×1.07..1.27 at depth 6 and ×1.06..1.22 at depth 4096?
+question: do two Qwen3-30B streams decoded in one pass (BLOOMERY_GEN_SLOTS=2), with A..D landed, outrun one stream
+  by the re-banded x1.30..1.44 at depth 6 and x1.24..1.40 at depth 4096?
 term: tok/s @ n=96, depth 6 (ctx 256) and depth 4096 (ctx 4352), A6000, Qwen3-30B-A3B Q4_K_M whole card. The 2-slot
   arm's aggregate (`tok/s(aggregate) … @ n=2·95`) against the plain arm's tok/s(mean), same binary, paired by round,
   one ratio line per depth (`ratio slots d=<D> ours@BLOOMERY_GEN_SLOTS=2/ours`)
 unit: %
-predict: 6..27
+predict: 24..44
 rounds: 4
 condition: one binary, every arm in one lease, one load each a round (the load keys differ by the lever and the ctx),
   no [cpu-busy], [other-busy] or [cold] row (the runner's tags). The binary refuses by name a placed load and an id
-  count that 2 does not divide. The runner fails the 2-slot row when it holds no counted kind=slots record or one whose
-  positions is not 2, and a plain row that holds any. Not checked inside the rounds: each slot's ids bit for bit its
-  solo run's. The slotbench functional runs on the 3090 (depth 6, 64 and 1024) and msown's gate (j1) hold that. Read
-  the 2-slot arm's slot 0 tokens line beside the plain arm's after the sitting
-decide-in: today's pass costs what the per-class table says. Land the adoption list (the m-column projection core,
-  one m-row head, the m-row norm-fused router), re-band this card to ×1.22..1.37 / ×1.18..1.29 and sit it again;
-  re-price N = 4 and 8 with experts and attention per slot
-decide-below: a term past the per-class table. Read the sitting's pass ms per depth against the table's classes (the
-  host between replays, the two readbacks, the input record) and take one nsys window of the 2-row prompt pass
-  (nsys-gpu-qwen3moe-prefill 9 10 under BLOOMERY_QWEN3_UBATCH=8) before any change
-decide-above: the second slot costs less than the table (cache reuse across slots, or the one-column body's second
-  read is free). Drop the m-column projection core from the adoption list and re-price N = 4 and 8
+  count that 2 does not divide. The runner fails the 2-slot row when it holds no counted kind=slots record or one
+  whose positions is not 2, and a plain row that holds any. A..D ran: every 2-slot row's `nodes` column (the binary's
+  `capture slots=2 rows=1 graph_nodes=`) reads 631 at both depths [derived; no gate pins the absolute count] and
+  never 634 (a binary before B), 778 (before D) or 826 (before C), and every load line names `cache=f16` (D's one
+  launch runs on an f16 cache with tensor cores; BLOOMERY_QWEN3_KV unset is f16). Not checked inside the rounds: each
+  slot's ids bit for bit its solo run's. msown's gate (j1) holds that on the D path. Read the 2-slot arm's slot 0
+  tokens line beside the plain arm's after the sitting
+decide-in: the one-pass pass costs what the per-class table says: write both depths' aggregate rows to rig-log and
+  cite them in the 0.2.1 note with their conditions (n, depth, A6000, two lcg windows of one walk); re-price N = 4
+  and 8 on the same table (the experts x N, every other class once a pass) and open the expert union (bulk) as
+  qwen3's next multi-stream round
+decide-below: a class past the table: read each depth's `mean … ms/pass` against 6.58..7.34 and 8.14..9.20 ms. The
+  2-row prompt pass is now the 2-slot pass's structure plus one node, so one nsys window of it (nsys-gpu-qwen3moe-
+  prefill 9 10 under BLOOMERY_QWEN3_UBATCH=8: the 2-row tail against the 1-row tail) splits the classes before any
+  change
+decide-above: the second row's experts cost less than f = 1 (rows that share an expert hit L2, or the m = 2 grid
+  streams faster than the m = 1 kernel): re-derive the expert union's gain down from the measured pass before that
+  round opens, and re-price N = 4 and 8

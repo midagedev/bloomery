@@ -1,0 +1,92 @@
+# Round abplan: Qwen3.8-Flash-Next (qwen4exp, UD-Q4_K_XL) on plan a (the A6000, routed experts past each layer's
+# card prefix on the host). Two streams decoded in one plain pass (BLOOMERY_GEN_SLOTS=2, `GpuModel::step_slots`
+# over Body38's SlotRows, crates/gpu/src/arch/qwen3moe/body38.rs:4183) against one stream, same binary, prose 512,
+# ctx 4352, the residency and host streaming unset (mid-p<P>-s1 and on under --place a), the MTP draft off in both
+# arms (BLOOMERY_DRAFT=off: the 2-slot arm runs plain passes and refuses a drafting run by name).
+# Written against round slotbench41's qwen4exp lift (line2; uncommitted in /Users/hckim/repo/bloomery-sb41land when
+# this card was written): generate_qwen3moe's slots path generic over SlotRows, the load planned for N sequences
+# (`PlanInputs::plan_with_slots`). On a tree without it the binary refuses a qwen4exp file by name
+# (crates/gpu-gates/src/bin/generate_qwen3moe.rs:2542-2553 at base 3a482e73) and the 2-slot row is a FAIL row.
+#
+# [derived] One row, the plain step S1: 57.18 tok/s = 17.49 ms (rig-log 09-30#q38seed-ab, residency and streaming
+# on, draft off, prose 512, ctx 4352), less q38hol's card experts on the five host-only layers, -0.76..-0.91 ms on a
+# plain step (q38hol-ab.card, landed 10-01): S1 = 16.6..17.5 ms. Per layer (q38legs-tg.card, q38-public.card): the
+# card front ~194 us (the dense mixes, mixer and router: 4.83 GB a token at ~650 GB/s = 7.4 ms, and the latency floor
+# of ~1,390 nodes), then max(host bridge, card shadow), then the combine. At one row the shadow is the shared expert
+# 24 us + the leg's launches 14 us + 5.3 us a card slot x 7.8..8.6 (the card hit 0.78..0.80: rig-log 09-30
+# #q38res-hit's last-10 0.775, q38seed's 136 host slots a token) = 79..84 us; the bridge, 0..15 us + ~2 host slots x
+# 23.4 us, sits under it.
+# The 2-slot pass against S1, per class (msp2 0134ee5c: the row-wise launches once over both rows, the sequence-bound
+# ones once a busy slot, one head of both rows):
+#   dense front     +0..0.74   read once for both rows by the m-column kernels: 0..10 % of 7.4 ms
+#   row copies      +0.12..0.21  the verify-shaped pass's 84 nodes (NODES_VERIFY_CARD 1475 - NODES_DECODE_CARD 1391,
+#                              crates/gpu-gates/src/bin/gate_qwen4exp_e2e.rs:357-358) at 1.4..2.5 us
+#   second slot     +0.54..0.69  NODES_SLOT 171 (gate_qwen4exp_e2e.rs:331: 36 delta layers' conv and delta step, 12
+#                              selecting layers' 8, the PLE conv, the embedding, the parked rows' copy): its own
+#                              recurrent state, read and written by the delta step (recurrent_bytes' state term,
+#                              crates/runtime/src/stores.rs:57, v_heads x state^2 f32 at V_HEADS 48 and HEAD_V 128
+#                              as the gate passes them: 3.15 MB a layer, 113 MB over 36 layers, 0.35 ms at 650 GB/s
+#                              for both ways), and ~135 small launches at 1.4..2.5 us
+#   routed          +2.0..3.6  each row reads its own ~8 card slots a layer: the shadow 121..131 us; the bridge at two
+#                              rows (4..5 slots, 94..132 us) stays at or under it, unless two streams sharing the pool
+#                              drop each row's hit to 0.70 (6 host slots, ~155 us a layer): +41..75 us a layer x 48
+#   head            +0..0.30   one 675 MB q8_0 read for both rows (the m > 1 gemv: 72 regs, 3 blocks/SM against
+#                              m = 1's 40 and 6, q38head2-ab.card)
+#   Σ = 2.66..5.54 ms.
+# The term the derivation cannot close: the multi-row pass's residual. The MTP window's 4-row verify measures
+# 32.7..34.1 ms (rig-log 10-01#q38head-ab: the 37.43 ms window at P 512, less the draft's chain 1.3..1.6 ms and two
+# or three 1.04 ms head walks of its own), where the same classes give 24.1..27.4 ms (the 4-row bridge's measured leg_us mean
+# 11.65 ms, q38hol-ab.card): 5..10 ms unexplained over 3 added rows (q38mtp-tg.card names the union residual as not
+# decomposed). Taken as 0..3.4 ms per added row, Σ = 2.66..8.94 ms. pass(2) = S1 + Σ; the aggregate 2 · S1 / pass(2)
+# = 2 x 16.6 / 25.54 .. 2 x 17.5 / 20.16 = x1.30..1.74, effect +30..+74 %. Where the row lands in the band says where
+# that residual lives: near +74 it is the verify's within-sequence rows (the delta recurrence and the selection over
+# four rows of one stream), which a pass of one row a slot does not run; near +30 it is per row whatever the slot.
+# Resource timeline of the pass [derived]: the A6000's serial chain is the wall (fronts 9.3..10 ms, the shadows
+# 5.8..6.3 ms, the handoff 1.0..1.7 ms, the head 1.0..1.3 ms); the host bridge 4.5..7.4 ms runs under the shadows;
+# PCIe the go and wait words and the residency's swaps (2..5 experts a token, 3 MB each, under the bridge); host DRAM
+# the bridge's expert reads; NVMe the PLE rows, 0 with the table cached. Latency-bound on the card's chain; the rows
+# a pass (SIMT) is the lever, and this arm is it.
+# The plan: the 2-slot arm's load holds two sequences (plan_with_slots): the second one's stores at ctx 4352 (the
+# recurrent state and conv rings, 3.60 MB a layer by recurrent_bytes, the selecting layers' K/V and index keys, the
+# PLE ring and its rows) take ~45..70 card experts of ~11,700 (<= 0.6 %) and may move the residency's P by one,
+# which each row's residency column names.
+#
+# Runner (lead; the full output to a file first):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/slots-qwen38-ab.card BLOOMERY_GEN_CTX=4352 BLOOMERY_DRAFT=off'
+#   BLOOMERY_AB_ROUNDS=4 just depth-gpu-qwen4exp prose:512 prose:512@BLOOMERY_GEN_SLOTS=2 > <log> 2>&1
+# `depth-qwen3moe.sh --parse-arms` (BLOOMERY_MODEL=qwen4exp, the BOX_ENV above): labels ours@prose and
+# ours@prose@BLOOMERY_GEN_SLOTS=2, two loads a round at ctx 4352, the 2-slot arm fed the corpus's first 1,024 ids
+# (slot 0 the plain arm's 512, slot 1 the next 512). The line read is `ratio slots d=512
+# ours@prose@BLOOMERY_GEN_SLOTS=2/ours@prose`.
+# Wall [derived]: 4 rounds x 2 loads + the rotate warm-up, 9 Qwen3.8 processes at 0.33..0.5 min (the 09-30 windows:
+# q38mtp-tg's 12 processes in 6 min, q38seed's 40 in 13 min), 3..5 min.
+kind: ab
+question: do two Qwen3.8 streams decoded in one plain pass (BLOOMERY_GEN_SLOTS=2) outrun one stream by x1.30..1.74 at
+  prose 512 on plan a, the second row paying its own routed slots, state and launches, and no more of the multi-row
+  verify's unexplained residual than 3.4 ms?
+term: tok/s @ n=96, prose 512 (the first 512 ids of the qwen4exp corpus-prose.ids a slot), ctx 4352, A6000, plan a,
+  residency and host streaming unset, BLOOMERY_DRAFT=off. The 2-slot arm's tok/s(aggregate) against the plain arm's
+  tok/s(mean), same binary, paired by round (`ratio slots d=512 ours@prose@BLOOMERY_GEN_SLOTS=2/ours@prose`)
+unit: %
+predict: 30..74
+rounds: 4
+sd: 2.6 % rig-log 09-30#q38seed-ab, the residency-only P 512 pair 1.056 ± 0.059 over 4 rounds (paired SD 3.7 %,
+  / sqrt 2); Qwen3.8's plain decode under the residency scatters past the 0.6 % default
+condition: one binary from a tree holding slotbench41's qwen4exp lift, both arms in one lease, a fresh process a
+  load (the load keys differ by the lever), no [cpu-busy], [other-busy] or [cold] row, the host set and the PLE table
+  warm (majflt in the timed window near 0). The runner fails the 2-slot row on no counted kind=slots record or one
+  whose positions is not 2, and the plain row on any. Each row's place column reads a, its residency column one
+  mid-p<P>-s1 word (the two arms' P within one: the 2-slot plan holds a second sequence), and its echoed load line
+  names no draft. Not checked by this runner: the 2-slot arm's residency boundaries (slotbench41's slots-arm.sh
+  slots_residency, which only its depth-ds41.sh calls), read by hand after the sitting from the arm's echoed
+  `residency pass` lines (depth-qwen3moe.sh:1506 keeps them): the two prompt calls, then only pass=slots kept=2
+decide-in: cite the aggregate in the 0.2.1 note with its conditions (plain passes, the draft off: the served default
+  drafts, and the seat's drafted round of several slots is one pass from O3c, 285ad4d0 on trainf), write the row to
+  rig-log, and price the drafted two-slot round (two 4-row windows, 8 rows, msp2's path) on the same classes before
+  any claim about the default
+decide-below: the multi-row residual is per row: read the row's mean ms/pass against 19.3..26.4 ms, then split it
+  between the bridge and the card chain with one BLOOMERY_STEP_STATS=1 functional run of the plain step and of a
+  4-row verify (stats are refused beside the slots arm): leg_us and host slots a pass. No Qwen3.8 multi-row lever
+  before that split
+decide-above: the second row costs less than its own slots (its card slots share the first row's reads, or the m > 1
+  head and front are free): re-derive the routed class from the same functional run's card hit before pricing N = 4

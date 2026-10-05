@@ -1,0 +1,93 @@
+# Round abplan: Qwen3.6-35B-A3B (qwen35moe, lmstudio Q4_K_M, the whole model on the A6000) — two streams
+# decoded in one pass (BLOOMERY_GEN_SLOTS=2, `GpuModel::step_slots` over Body35's SlotRows, the pass of
+# crates/gpu/src/arch/qwen3moe/body35_slots.rs) against one stream, same binary, at depth 6 and at depth
+# 4096, no placement (the load is whole-card; a placed load is refused with slots), no residency, no host
+# tier, no draft (the Q4_K_M file has no MTP layers — 40 blocks, none of them nextn).
+# Written against line2's qwen35moe lift (round q36rows' body35_slots, uncommitted in
+# /Users/hckim/repo/bloomery-q36rows when this card was written): generate_qwen3moe's slots path generic
+# over SlotRows and the load planned for N sequences (`PlanInputs::plan_with_slots`). On a tree without it
+# the binary refuses a qwen35moe file by name (crates/gpu-gates/src/bin/generate_qwen3moe.rs:2542-2553 at
+# base 3a482e73: `Family::Qwen35 => Some("qwen35moe")`) and the 2-slot row is a FAIL row.
+#
+# [derived] One row, the plain step S1, is measured: 204.4 tok/s at depth 6 and 195.8 at depth 4096
+# (rig-log 09-28#q36-release, A6000, 3 rounds, no tags), so S1 = 4.89 and 5.11 ms. The step's byte classes
+# (qwennext-lit-report.md's step table, q36-public.card): the routed and shared experts 40 layers x (8
+# used + 1 shared) = 360 slots x 1.77..2.04 MB = 637..734 MB; the GDN projections 633 MB (30 layers x
+# 21.1); the head 417 MB (Q6_K, once); the GDN state read and written 131.7 MB + the conv 0.09 ms; the GQA
+# projections, routers and norms the remainder. At the step's effective 426..455 GB/s the experts are
+# 1.40..1.72 ms, the projections 1.39..1.49, the head 0.92..0.98.
+# The pass (body35_slots.rs: the row-wise launches — the norms, the projections, a delta layer's gated
+# norm, an attention layer's gated quantizer, the router, the experts and the combine — run once over all
+# rows; the launches bound to one sequence run once a busy slot; the pass ends in one head of every row),
+# the second row's add per class:
+#   experts      +1.40..1.72  its own 360 slots: two lcg windows route near-independently (8 of 256 a
+#                            layer each, the expected overlap 8·8/256 = 0.25 of 16 slots a layer), so the
+#                            read set is the union at f = 1; the shared expert's stack is the same read
+#                            twice, 1.8 MB against the A6000's 6 MB L2 with 8 routed stacks between —
+#                            0..0.18 ms of it may hit, read at the sitting (decide-above)
+#   state, conv  +0.31       the second slot's own recurrent state (131.7 MB read and written) and conv
+#                            ring, the launches bound to its sequence (30 layers x 2)
+#   projections  +0..0.22    the weights walk once over both rows; the second column is arithmetic at the
+#                            m = 1 walk's 1.39..1.49 ms, 0..15 % of it (qwen3moe's item A measured 0..17 %
+#                            on its m-column core, slots-qwen3-ab.card)
+#   head         +0..0.10    one m-row head launch reads the 417 MB once (Tail::One); the second row's
+#                            dot products and argmax
+#   gqa, router  +0..0.10    the GQA projections, the routers and the norms once over both rows; the
+#                            second column's arithmetic
+#   launches     +0.03..0.12 the second slot's sequence-bound launches (30 x 2 delta, 10 x 3..4
+#                            attention) ~ 90..100 nodes at 0.37..0.85 us plus their gaps
+#   Σ = 1.74..2.57 ms at depth 6.
+#   depth 6: pass(2) = 4.89 + 1.74..2.57 = 6.63..7.46 ms; the aggregate 2 · S1 / pass(2) = x1.31..1.47,
+#     effect +31..+47 %.
+#   depth 4096: the second slot's flash reads its own K/V planes, 10 GQA layers x 4,096 keys x 20,480
+#     B/key = 84 MB, +0.15..0.29 ms (q36-public.card's depth term). pass(2) = 5.11 + 1.89..2.86 =
+#     7.00..7.97 ms; x1.28..1.46, effect +28..+46 %.
+# The band below is the union of the two depths: +28..+47 %. Each depth's ratio line is read against its
+# own band. The second sequence's stores (its state 2 x 65.8 MB, its conv rings, its K/V planes 89 MB at
+# ctx 4352) are ~350 MB of card bytes against the A6000's ~26 GB free: no plan term.
+#
+# Resource timeline of the pass [derived]: the card's one serial stream is ~99 % of the wall (the byte
+# classes above in one replayed pass graph); the host the write, replay, sync and readback, 0.02..0.08 ms
+# in series; PCIe the input records and a 4 B id a row; host DRAM and NVMe 0 (the whole model is
+# card-resident). The only class that grows with the slots is the experts' bytes: the next lever is the
+# expert union (bulk: an expert read once for the rows that pick it), not a launch or an async overlap.
+#
+# The runner's lines are `ratio slots d=6 ours@BLOOMERY_GEN_SLOTS=2/ours` and `ratio slots d=4096 …`
+# (depth-qwen3moe.sh's aggregate arm, under BLOOMERY_MODEL=qwen35moe): the 2-slot arm's tok/s(aggregate)
+# (Σ positions · 1000 / Σ ms over its counted `time pass … kind=slots` records) over its plain twin's
+# tok/s(mean), per round; the 2-slot arms are fed 12 and 8,192 lcg ids (slot 0 the plain arm's window,
+# slot 1 the next), `--parse-arms` printing `slots=2 feed=N·D`. Sitting (lead; the full output to a file
+# first), from the tree that holds the lift and this card:
+#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/slots-qwen35-ab.card'
+#   just depth-gpu-qwen35moe 6 6@BLOOMERY_GEN_SLOTS=2 4096 4096@BLOOMERY_GEN_SLOTS=2 > <log> 2>&1
+# Wall [derived]: slots-qwen3-ab's basis — 4 rounds x 4 loads (the ctx 256 and 4,352 keys, each plain and
+# 2-slot) + the rotate warm-up, 17 processes of a ~21 GB load, 4..8 min.
+kind: ab
+question: do two Qwen3.6-35B-A3B streams decoded in one pass (BLOOMERY_GEN_SLOTS=2), every weight walk
+  but the experts' slots run once over both rows, outrun one stream by x1.31..1.47 at depth 6 and
+  x1.28..1.46 at depth 4096?
+term: tok/s @ n=96, depth 6 (ctx 256) and depth 4096 (ctx 4352), A6000, Qwen3.6-35B-A3B Q4_K_M whole
+  card, no placement, no residency, no draft. The 2-slot arm's tok/s(aggregate) (`@ n=2·95`) against the
+  plain arm's tok/s(mean), same binary, paired by round, one ratio line per depth (`ratio slots d=<D>
+  ours@BLOOMERY_GEN_SLOTS=2/ours`)
+unit: %
+predict: 28..47
+rounds: 4
+condition: one binary from a tree holding line2's qwen35moe lift, every arm in one lease, one load each a
+  round (the load keys differ by the lever and the ctx), no [cpu-busy], [other-busy] or [cold] row (the
+  runner's tags). The binary refuses by name a placed load and an id count that 2 does not divide. The
+  runner fails the 2-slot row when it holds no counted kind=slots record or one whose positions is not 2,
+  and a plain row that holds any. Not checked inside the rounds: each slot's ids bit for bit its solo
+  run's — line2's gate_qwen35moe_e2e slots clause (a pass of m rows leaves its m steps' bits) holds that;
+  read the 2-slot arm's slot 0 tokens line beside the plain arm's after the sitting
+decide-in: write both depths' aggregate rows to rig-log and cite them in the 0.2.1 note with their
+  conditions (n, depth, A6000, lcg ids); re-price N = 4 and 8 on the same classes (the experts x N, every
+  other class once a pass) and open the expert union (bulk) as qwen3.6's next multi-stream round
+decide-below: a class past the table: read each depth's `mean … ms/pass` against 6.63..7.46 and
+  7.00..7.97 ms and split the pass by class before any change — nsys-gpu.sh has no qwen35moe form (its
+  seed form reads the qwen3moe profile only, q36-public.card's decide-below), so the round that looks
+  gives it one; the terms to re-derive are the second row's expert bytes (f) and the row-wise classes'
+  second-column arithmetic
+decide-above: the second row costs less than its own slots (the two lcg windows' routes sharing more than
+  the 0.25-expert expectation, or the shared expert's second read hitting L2): re-derive f from the
+  measured pass before pricing N = 4 and 8, and re-derive the expert union's gain down from it
