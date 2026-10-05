@@ -96,6 +96,10 @@ mod ds41_open;
 mod residency;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/residency_clauses.rs"]
+mod residency_clauses;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use crate::ds41_open::{fnv, open};
     use crate::residency::{self, StaticProbe};

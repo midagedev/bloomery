@@ -136,7 +136,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/residency_clauses.rs"]
+mod residency_clauses;
+
+#[cfg(feature = "glm5next")]
 mod gate {
+    use crate::residency_clauses::StaticProbe;
     use std::ops::Range;
     use std::time::Instant;
 
@@ -144,10 +149,10 @@ mod gate {
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::swap::{CardTable, Residency, SlotState, SwapMachine, SwapSource};
+    use bloomery_gpu::host::swap::{Residency, SlotState, SwapMachine, SwapSource};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{GpuError, window};
-    use bloomery_gpu_gates::generate::{Residence, ServeFeed, place_table, slot_table};
+    use bloomery_gpu_gates::generate::{Residence, ServeFeed, place_table};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, feed, set_prefill};
@@ -717,55 +722,12 @@ mod gate {
     /// history `held` ends, against the host map, the machine's ledger and
     /// the map the history started from.
     fn table_clause(s: &Session<Body>, held: &History) -> Result<bool, GateError> {
-        let r = residence(s)?;
-        let t = r.table()?;
-        let c = r.check(&t)?;
-        let vs_start = t.differ(&held.start)?;
-        slot_table(&t, &c, vs_start).print();
-        let ok = c.vs_map == 0
-            && c.vs_ledger == Some(0)
-            && c.doubled == 0
-            && vs_start > 0
-            && vs_start <= 2 * held.landed;
-        println!(
-            "table: the card's copy after the history: {} entries off the host map, {:?} off the \
-             ledger, {} slots named twice, {vs_start} off the history's start for {} flips landed \
-             (0 < {vs_start} <= {}): {}",
-            c.vs_map,
-            c.vs_ledger,
-            c.doubled,
+        crate::residency_clauses::table_clause(
+            &residence(s)?,
+            &held.start,
             held.landed,
-            2 * held.landed,
-            verdict(ok)
-        );
-        Ok(ok)
-    }
-
-    /// The residency's half of `static`: the stage card's copy of the map as
-    /// the history left it, the prompt `ids` fed the serve's way after the
-    /// seat's reset, the row of its last id (row 0), and the boundaries that
-    /// feed made.
-    struct StaticProbe {
-        ids: Vec<u32>,
-        table: CardTable,
-        row0: Vec<f32>,
-        /// Each boundary since the seat's reset: the pass it ended, its
-        /// number, the flips that landed there, whether it was made ahead.
-        passes: Vec<(PassKind, u64, usize, bool)>,
-    }
-
-    impl StaticProbe {
-        /// Whether row 0 ran on the copy read: the feed's last boundary is
-        /// the one row 0's step made ahead, after the row, and none before it
-        /// landed a flip.
-        fn quiet(&self) -> bool {
-            match self.passes.split_last() {
-                Some((&(PassKind::Step, _, _, true), before)) => {
-                    !before.is_empty() && before.iter().all(|&(_, _, landed, _)| landed == 0)
-                }
-                _ => false,
-            }
-        }
+            "the history",
+        )
     }
 
     /// [`StaticProbe`] on `s`, after the last history.
@@ -823,54 +785,7 @@ mod gate {
         })?
         .ok_or("the static open stopped at its plan")?;
         let mut s = loaded.ready(&mut Quiet)?;
-        let load_s = t0.elapsed().as_secs_f64();
-        let (no_machine, sets) = {
-            let r = residence(&s)?;
-            (r.machine.is_none(), r.table()?.sets_vs(&p.table)?)
-        };
-        ServeFeed {
-            inner: &mut runtime::Plain,
-        }
-        .prompt(&mut s, &p.ids)?;
-        let row0 = s.model().logits()?;
-        let (mut off, mut max) = (0usize, 0f32);
-        if row0.len() == p.row0.len() {
-            for (a, b) in row0.iter().zip(&p.row0) {
-                if a.to_bits() != b.to_bits() {
-                    off += 1;
-                    max = max.max((a - b).abs());
-                }
-            }
-        }
-        let same = row0.len() == p.row0.len() && off == 0;
-        let quiet = p.quiet();
-        let ok = quiet && no_machine && sets.set == 0 && same;
-        let boundaries: Vec<String> = p
-            .passes
-            .iter()
-            .map(|&(kind, b, landed, ahead)| {
-                format!(
-                    "{b}:{}{}+{landed}",
-                    kind.word(),
-                    if ahead { "(ahead)" } else { "" }
-                )
-            })
-            .collect();
-        println!(
-            "static: the residency's row 0 of the serve's feed of {} ids on its card copy ({} on \
-             the card), boundaries since the seat's reset [{}] (no landing before row 0: {quiet}); \
-             a static load of that copy in {load_s:.1} s (no machine: {no_machine}; {} experts off \
-             its sets, {} at another slot): row 0 bit for bit {same} ({off} of {} entries differ, \
-             max {max}): {}",
-            p.ids.len(),
-            p.table.on_card(),
-            boundaries.join(" "),
-            sets.set,
-            sets.slot,
-            row0.len(),
-            verdict(ok)
-        );
-        Ok(ok)
+        crate::residency_clauses::static_row0(&mut s, residence, p, t0.elapsed().as_secs_f64())
     }
 
     // ------------------------------------ the NextN load under the machine
