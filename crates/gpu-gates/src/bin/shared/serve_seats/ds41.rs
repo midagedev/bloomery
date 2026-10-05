@@ -161,7 +161,7 @@ use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
     Seat, SeatEngine, SlotStep, Vocab, model_props, nvidia_smi_index, placement_props,
-    sampler_factory, step_rows_in_turn,
+    sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -916,26 +916,25 @@ impl Seat for V41 {
         self.stats
     }
 
-    /// One round of several slots: one pass of the busy rows while the open
-    /// decided so ([`V41::one_pass`], through
+    /// One round of several slots ([`super::rounds::step_round`]): one pass
+    /// of the busy rows while the open decided so ([`V41::one_pass`], through
     /// `serve_seats::rounds::step_rows_one_pass` — cut at the body's two
     /// rows, the rows' answers and lent logits rows from the pass's own
     /// per-row heads, slot 0 left selected as [`Session::step_slots_rounds`]
-    /// decides), else the seat's fallback — a select and a step a row —
-    /// every round of a load the open kept on it ([`V41::one_pass`]'s doc).
-    /// A refusal on either path is the server's to die on: the open decides
-    /// once, so a load that cannot run one pass never tries it at run time.
+    /// decides), then the call's `residency pass` records, else the seat's
+    /// fallback — a select and a step a row — every round of a load the open
+    /// kept on it ([`V41::one_pass`]'s doc). A refusal on either path is
+    /// the server's to die on: the open decides once, so a load that cannot
+    /// run one pass never tries it at run time.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
-        if !self.one_pass {
-            return step_rows_in_turn(self, rows);
-        }
-        let passes =
-            super::rounds::step_rows_one_pass(&mut self.s, rows).map_err(|e| e.to_string())?;
-        self.print_passes().map_err(|e| e.to_string())?;
-        if self.stats {
-            record::slots_round("step", rows.len(), passes, self.slots()).eprint();
-        }
-        Ok(())
+        let one_pass = self.one_pass;
+        super::rounds::step_round(
+            self,
+            one_pass,
+            rows,
+            |v, rows| super::rounds::step_rows_one_pass(&mut v.s, rows),
+            V41::print_passes,
+        )
     }
 
     fn reset(&mut self) -> Result<(), GateError> {
