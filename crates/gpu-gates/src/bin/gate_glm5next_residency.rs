@@ -55,6 +55,23 @@
 //! - `c1` (green-only): the history twice gives the same tokens and logits,
 //!   and flips land on at least one layer (mutant: the staging thread stages
 //!   an expert's first part alone).
+//! - `table`: after the history, the stage card's copy of the map read back
+//!   (`generate::Residence`, `CardTable`) is off neither the host map nor
+//!   the machine's ledger, names no slot twice in a layer, and is off the
+//!   map the history started from by at least one entry and at most two a
+//!   landed flip (each moves its admitted expert onto a slot and its victim
+//!   off) (mutant: a landing writes the admitted expert's word and not the
+//!   victim's).
+//! - `static`: the residency computes the placement its card copy holds.
+//!   The copy as the history left it is read; after the seat's reset the
+//!   history's prompt is fed the serve's way (`generate::ServeFeed`), and
+//!   the row of its last id (row 0) is kept, the boundaries before that row
+//!   landing no flip (named). After the teardown, one more load — the
+//!   residency off, each routed layer's card experts the read copy's
+//!   (`Loaded::open_edited`, `generate::place_table`; named: no machine, and
+//!   the card holds the copy's sets) — is fed the same ids the same way:
+//!   its row 0 equals the residency's bit for bit (mutants: `place_table`
+//!   drops each layer's lowest card id).
 //! - `c7`: a residency reset after the history brings every layer's live set
 //!   back to its seed (`diff` 0, and the ledger), and lets go of no host
 //!   byte (`dropped_bytes` 0: the churn pool stays in the host set for the
@@ -127,9 +144,10 @@ mod gate {
     use app::mtp::MtpDraft;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::host::PassKind;
-    use bloomery_gpu::host::swap::{Residency, SlotState, SwapMachine, SwapSource};
+    use bloomery_gpu::host::swap::{CardTable, Residency, SlotState, SwapMachine, SwapSource};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{GpuError, window};
+    use bloomery_gpu_gates::generate::{Residence, ServeFeed, place_table, slot_table};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, feed, set_prefill};
@@ -293,8 +311,8 @@ mod gate {
 
     /// What a history saw: the prompt's argmax, every step's argmax and
     /// logits FNV, each boundary's ended pass (its kind and kept rows) and
-    /// the flips that landed there, and their sum.
-    #[derive(PartialEq)]
+    /// the flips that landed there, and their sum; and the host map's stage
+    /// view after its clear, where those flips started from.
     struct History {
         first: u32,
         tokens: Vec<u32>,
@@ -302,6 +320,30 @@ mod gate {
         passes: Vec<(PassKind, usize)>,
         landings: Vec<usize>,
         landed: usize,
+        start: Vec<u32>,
+    }
+
+    /// Two histories are one when they saw the same: the map one starts from
+    /// is no part of it, since a reset puts the seed back in whichever slots
+    /// are free.
+    impl PartialEq for History {
+        fn eq(&self, other: &History) -> bool {
+            (
+                &self.first,
+                &self.tokens,
+                &self.fnvs,
+                &self.passes,
+                &self.landings,
+                self.landed,
+            ) == (
+                &other.first,
+                &other.tokens,
+                &other.fnvs,
+                &other.passes,
+                &other.landings,
+                other.landed,
+            )
+        }
     }
 
     /// The history from a clear ([`Session::clear`], the residency back to
@@ -312,6 +354,7 @@ mod gate {
         let clear_s = t.elapsed().as_secs_f64();
         let (_, _, b) = s.model_mut().body_parts(NAME)?;
         b.take_residency_passes();
+        let start = s.model().body(NAME)?.hybrid().slots().stage_view();
         let mut next = s.prompt(ids, Want::Argmax)?.argmax();
         let mut h = History {
             first: next,
@@ -320,6 +363,7 @@ mod gate {
             passes: Vec::new(),
             landings: Vec::new(),
             landed: 0,
+            start,
         };
         let t = Instant::now();
         for _ in 0..STEPS {
@@ -659,6 +703,174 @@ mod gate {
             verdict(named && served)
         );
         Ok(named && served)
+    }
+
+    /// The residency views of `s`'s body ([`Residence`]): its stage card's
+    /// copy of the slot map (`Body::slot_copy`) and its host tier.
+    fn residence(s: &Session<Body>) -> Result<Residence<'_>, GateError> {
+        let m = s.model();
+        let b = m.body(NAME)?;
+        Ok(Residence::of(m.gpu(), b.slot_copy(), b.hybrid()))
+    }
+
+    /// `table` (module header): the stage card's copy of the map after the
+    /// history `held` ends, against the host map, the machine's ledger and
+    /// the map the history started from.
+    fn table_clause(s: &Session<Body>, held: &History) -> Result<bool, GateError> {
+        let r = residence(s)?;
+        let t = r.table()?;
+        let c = r.check(&t)?;
+        let vs_start = t.differ(&held.start)?;
+        slot_table(&t, &c, vs_start).print();
+        let ok = c.vs_map == 0
+            && c.vs_ledger == Some(0)
+            && c.doubled == 0
+            && vs_start > 0
+            && vs_start <= 2 * held.landed;
+        println!(
+            "table: the card's copy after the history: {} entries off the host map, {:?} off the \
+             ledger, {} slots named twice, {vs_start} off the history's start for {} flips landed \
+             (0 < {vs_start} <= {}): {}",
+            c.vs_map,
+            c.vs_ledger,
+            c.doubled,
+            held.landed,
+            2 * held.landed,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The residency's half of `static`: the stage card's copy of the map as
+    /// the history left it, the prompt `ids` fed the serve's way after the
+    /// seat's reset, the row of its last id (row 0), and the boundaries that
+    /// feed made.
+    struct StaticProbe {
+        ids: Vec<u32>,
+        table: CardTable,
+        row0: Vec<f32>,
+        /// Each boundary since the seat's reset: the pass it ended, its
+        /// number, the flips that landed there, whether it was made ahead.
+        passes: Vec<(PassKind, u64, usize, bool)>,
+    }
+
+    impl StaticProbe {
+        /// Whether row 0 ran on the copy read: the feed's last boundary is
+        /// the one row 0's step made ahead, after the row, and none before it
+        /// landed a flip.
+        fn quiet(&self) -> bool {
+            match self.passes.split_last() {
+                Some((&(PassKind::Step, _, _, true), before)) => {
+                    !before.is_empty() && before.iter().all(|&(_, _, landed, _)| landed == 0)
+                }
+                _ => false,
+            }
+        }
+    }
+
+    /// [`StaticProbe`] on `s`, after the last history.
+    fn static_probe(s: &mut Session<Body>, ids: &[u32]) -> Result<StaticProbe, GateError> {
+        let table = residence(s)?.table()?;
+        runtime::Target::reset(s)?;
+        let (_, _, b) = s.model_mut().body_parts(NAME)?;
+        b.take_residency_passes();
+        ServeFeed {
+            inner: &mut runtime::Plain,
+        }
+        .prompt(s, ids)?;
+        let row0 = s.model().logits()?;
+        let (_, _, b) = s.model_mut().body_parts(NAME)?;
+        let passes = b
+            .take_residency_passes()
+            .iter()
+            .map(|(k, r)| (*k, r.boundary, r.landed, r.ahead))
+            .collect();
+        Ok(StaticProbe {
+            ids: ids.to_vec(),
+            table,
+            row0,
+            passes,
+        })
+    }
+
+    /// `static`, its other half, after the residency load's teardown: a load
+    /// of the same file on the same machine with the residency off, each
+    /// routed layer's card experts `p`'s copy's (`generate::place_table` on
+    /// the plan), fed `p`'s ids the serve's way; its row 0 against `p`'s,
+    /// bit for bit.
+    fn static_clause(
+        path: &str,
+        machine: &Machine,
+        levers: &bloomery_levers::Levers,
+        p: &StaticProbe,
+    ) -> Result<bool, GateError> {
+        let t0 = Instant::now();
+        let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let args = OpenArgs {
+            place: "gate",
+            machine: move |_| machine.clone(),
+            ctx: CTX,
+            mode: StepMode::Graph,
+            cfg: GlmCfg {
+                place: PlanLevers::from_levers(levers)?,
+                host: levers.host(),
+                prefill: PrefillMode::Batch,
+                group: 1,
+            },
+        };
+        let loaded = Loaded::<Body>::open_edited(file, args, &mut Quiet, |_, plan| {
+            place_table(plan, &p.table).map_err(|e| SessionError::Refused(e.to_string()))
+        })?
+        .ok_or("the static open stopped at its plan")?;
+        let mut s = loaded.ready(&mut Quiet)?;
+        let load_s = t0.elapsed().as_secs_f64();
+        let (no_machine, sets) = {
+            let r = residence(&s)?;
+            (r.machine.is_none(), r.table()?.sets_vs(&p.table)?)
+        };
+        ServeFeed {
+            inner: &mut runtime::Plain,
+        }
+        .prompt(&mut s, &p.ids)?;
+        let row0 = s.model().logits()?;
+        let (mut off, mut max) = (0usize, 0f32);
+        if row0.len() == p.row0.len() {
+            for (a, b) in row0.iter().zip(&p.row0) {
+                if a.to_bits() != b.to_bits() {
+                    off += 1;
+                    max = max.max((a - b).abs());
+                }
+            }
+        }
+        let same = row0.len() == p.row0.len() && off == 0;
+        let quiet = p.quiet();
+        let ok = quiet && no_machine && sets.set == 0 && same;
+        let boundaries: Vec<String> = p
+            .passes
+            .iter()
+            .map(|&(kind, b, landed, ahead)| {
+                format!(
+                    "{b}:{}{}+{landed}",
+                    kind.word(),
+                    if ahead { "(ahead)" } else { "" }
+                )
+            })
+            .collect();
+        println!(
+            "static: the residency's row 0 of the serve's feed of {} ids on its card copy ({} on \
+             the card), boundaries since the seat's reset [{}] (no landing before row 0: {quiet}); \
+             a static load of that copy in {load_s:.1} s (no machine: {no_machine}; {} experts off \
+             its sets, {} at another slot): row 0 bit for bit {same} ({off} of {} entries differ, \
+             max {max}): {}",
+            p.ids.len(),
+            p.table.on_card(),
+            boundaries.join(" "),
+            sets.set,
+            sets.slot,
+            row0.len(),
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     // ------------------------------------ the NextN load under the machine
@@ -1286,6 +1498,9 @@ mod gate {
         );
         pass &= c1;
 
+        pass &= table_clause(&s, &again)?;
+        let probe = static_probe(&mut s, &ids[..PROMPT])?;
+
         let r = s
             .residency_reset()?
             .ok_or("the load runs no residency machine")?;
@@ -1317,6 +1532,7 @@ mod gate {
         pass &= c7;
         drop(s);
 
+        pass &= held("static", static_clause(&path, &machine, &levers, &probe));
         pass &= nextn_clauses(&path, &machine, &levers, &inputs, &prose_ids()?)?;
 
         if pass {
