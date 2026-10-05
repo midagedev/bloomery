@@ -1186,8 +1186,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// Refused by name while a pass of several slots' verify rows waits for
     /// its commit ([`GpuModel::verify_slots`]): a select would move a
     /// waiting slot live, and any other call would run on a sequence whose
-    /// rows are not yet kept.
-    pub(crate) fn refuse_if_slots_wait(&self, what: &'static str) -> Result<(), GpuError> {
+    /// rows are not yet kept. A body crate's own call that reads the
+    /// selected sequence's state (a saved snapshot of it) calls it first.
+    pub fn refuse_if_slots_wait(&self, what: &'static str) -> Result<(), GpuError> {
         match &self.slots_waiting {
             None => Ok(()),
             Some(ranges) => Err(GpuError::shape(

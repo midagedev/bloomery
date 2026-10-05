@@ -602,7 +602,7 @@ where
         const WHAT: &str = "GpuModel::step_slots";
         let ranges = self.plan_pass(rows, SlotPass::Kept, WHAT)?;
         let out = self.run_slots(&ranges, SlotPass::Kept, WHAT);
-        self.note_fault_in(WHAT, out, SlotSet::of(&ranges))
+        self.note_fault_in(WHAT, out, SlotSet::one(0))
     }
 
     /// One pass of several slots' verify rows: `rows` as
@@ -791,7 +791,7 @@ where
         self.refuse_if_slots_wait(what)?;
         let ranges = self.slot_ranges(
             rows.iter().map(|&(slot, ids)| (slot, ids.len())),
-            B::MAX_ROWS,
+            MAX_PASS_ROWS,
             what,
         )?;
         if pass == SlotPass::Kept {

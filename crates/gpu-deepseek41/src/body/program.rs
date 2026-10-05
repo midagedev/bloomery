@@ -2,7 +2,9 @@
 //! port it hands its host leg over through ([`HostLeg`]). Both walks are
 //! [`runtime::sched::walk`] over one point of [`Overlap`]: the step is one
 //! row, `(1, 1, Step)`; the pair pass two rows one layer apart, `(2, 1,
-//! Step)`. The program's parts per row and layer:
+//! Step)`, and a pass of several slots the same walk with each row on its
+//! slot's sequence ([`super::slots`]), so the two share one go order. The
+//! program's parts per row and layer:
 //!
 //! - the front: the engram step where the layer carries a site, the
 //!   attention sub-layer, and the MoE sub-layer up to its go
