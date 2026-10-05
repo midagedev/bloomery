@@ -48,7 +48,10 @@
 //! records no capture of its own: the step's and the passes' captures are
 //! the model's, kept a slot, and the prompt call runs eager. A placed load's
 //! placed side holds no sequence's state ([`Slots::new_seq`]), so it serves
-//! every slot as it is.
+//! every slot as it is. A whole-card load also runs several slots' rows as
+//! one pass (`SlotRows`, `body35_slots`): each slot's record — its first
+//! position and its ids, beside one lane word every slot's rows read — and
+//! each slot's own stores, bound by the slot; a placed load refuses it.
 
 use super::body::{Kernels, KvQ8, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
@@ -65,6 +68,7 @@ use super::scratch::{
     Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, LayerStore, RecStore, RopeRows,
     StepParams, Wants, param_view, put_input,
 };
+use super::slot_pass::SlotIn;
 use super::ubatch::UBATCH;
 use super::wide::{GEMV_COLS, arena_bytes};
 use crate::checkpoint::Checkpoints;
@@ -74,7 +78,7 @@ use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::Chain;
 use crate::linear::{self, LinearShape};
 use crate::model::{
-    ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, Slots, block_count,
+    ChainBody, GpuModel, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots, block_count,
 };
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::site::{self, Order, file_site};
@@ -386,6 +390,14 @@ pub struct Body35 {
     /// A pass's arena of [`MAX_PASS_ROWS`] rows and its input record.
     pub(super) a: Arena,
     pub(super) rp: RowsParams,
+    /// A pass of several slots' input records ([`SlotIn`]: each busy slot's
+    /// first position and ids), the lane word every slot's rows read
+    /// ([`LANE`], the one lane of each slot's own store), and the ranges the
+    /// last plan of such a pass wrote them for, which an eager pass must
+    /// match (`body35_slots`).
+    pub(super) slot_in: SlotIn,
+    pub(super) slot_lane: DeviceBuffer<u32>,
+    pub(super) slots_planned: Option<Vec<SlotRange>>,
     /// The prompt call's ubatch arena, its image, and the ubatch size.
     pub(super) u: Arena,
     pub(super) img: PromptImage,
@@ -427,7 +439,7 @@ pub struct Body35 {
 /// it: the body records none over the stores (the step's and the passes'
 /// are the model's, kept a slot).
 pub struct Slot35 {
-    stores: Vec<LayerStore>,
+    pub(super) stores: Vec<LayerStore>,
     held: u32,
     ckpt: Checkpoints,
 }
@@ -1193,6 +1205,9 @@ impl Body35 {
         let sp = StepParams::new(stream, true)?;
         let a = Arena::with(stream, d, MAX_PASS_ROWS, forms)?;
         let rp = RowsParams::new(stream)?;
+        let slot_in = SlotIn::new(stream)?;
+        let mut slot_lane = DeviceBuffer::<u32>::zeroed(stream, 1)?;
+        slot_lane.copy_from_host(stream, &[LANE])?;
         let k = Kernels::load(gpu, true)?;
         let head_state = HeadArgmaxState::new(stream)?;
         let img = PromptImage::new(stream, ctx, true)?;
@@ -1217,6 +1232,9 @@ impl Body35 {
             sp,
             a,
             rp,
+            slot_in,
+            slot_lane,
+            slots_planned: None,
             u,
             img,
             ubatch,
@@ -1345,7 +1363,7 @@ impl Body35 {
     /// call at `pos` that failed after its launches were enqueued has
     /// already run the recurrence over it, and running it again would apply
     /// the position twice.
-    fn stores_at(&self, pos: u32) -> Result<(), GpuError> {
+    pub(super) fn stores_at(&self, pos: u32) -> Result<(), GpuError> {
         const WHAT_S: &str = "qwen35moe::Body35::stores";
         match self.held {
             h if h == pos => Ok(()),
@@ -1380,7 +1398,12 @@ impl Body35 {
     /// after any waiting cut and a check that they stand at `pos`: what
     /// follows launches, and a call that fails past its launch leaves them
     /// ahead of the model's position, which the next call refuses by name.
-    fn stand_held(&mut self, stream: &CudaStream, pos: u32, m: usize) -> Result<(), GpuError> {
+    pub(super) fn stand_held(
+        &mut self,
+        stream: &CudaStream,
+        pos: u32,
+        m: usize,
+    ) -> Result<(), GpuError> {
         const WHAT_M: &str = "qwen35moe::Body35::stand_held";
         self.settle(stream)?;
         self.stores_at(pos)?;
@@ -1422,6 +1445,15 @@ impl Body35 {
         self.ckpt.cut(pos, self.held)?;
         self.held = pos;
         Ok(())
+    }
+
+    /// Exchange the live sequence with `seq`: its stores, the positions they
+    /// hold and its checkpoints, pointer moves only ([`Slots::swap_seq`],
+    /// and a pass of several slots' per-slot work, `body35_slots`).
+    pub(super) fn exchange(&mut self, seq: &mut Slot35) {
+        std::mem::swap(&mut self.stores, &mut seq.stores);
+        std::mem::swap(&mut self.held, &mut seq.held);
+        std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
     }
 
     /// Keep a copy of every layer's output residual after each layer of the
@@ -1957,6 +1989,8 @@ impl ChainBody for Body35 {
             + self.sp.bytes()
             + self.a.bytes()
             + self.rp.bytes()
+            + self.slot_in.bytes()
+            + self.slot_lane.num_bytes()
             + self.u.bytes()
             + self.img.bytes()
             + self.head_state.bytes()
@@ -2032,9 +2066,7 @@ impl Slots for Body35 {
     /// sequence's checkpoints for that sequence's next call
     /// ([`Body35::settle`]), so it travels with it.
     fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Slot35) -> Result<(), GpuError> {
-        std::mem::swap(&mut self.stores, &mut seq.stores);
-        std::mem::swap(&mut self.held, &mut seq.held);
-        std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
+        self.exchange(seq);
         Ok(())
     }
 
