@@ -25,7 +25,9 @@
 //! - [`Park::Ids`], for an engine that cannot snapshot: a parked request keeps
 //!   its ids, and its next turn feeds them again (re-prefill) before it steps.
 //! - The state of an idle slot (its request finished) is parked when it fits
-//!   and is the first to leave when a live one needs room; the slot then holds
+//!   and is the first to leave when a live one needs room. A state that
+//!   leaves goes into the prompt cache as it is (no copy), as does one that
+//!   found no room to park (its snapshot already taken); the slot then holds
 //!   nothing, and a request on it starts from what the prompt cache holds.
 //!   A request that starts on a slot whose idle state is parked takes that
 //!   state as its slot's own, without a copy: back into the engine only if it
@@ -230,6 +232,10 @@ pub(crate) struct ParkTable {
     clock: u64,
 }
 
+/// An idle state that left the table to make room, and its slot
+/// ([`ParkTable::room`]).
+pub(crate) type LetGo = (usize, Arc<dyn Saved>);
+
 /// Why a state does not fit the table: its bytes, and those the table holds
 /// that no eviction can free.
 #[derive(Debug, PartialEq, Eq)]
@@ -259,13 +265,14 @@ impl ParkTable {
     }
 
     /// Room for a state of `need` bytes: the idle states not in `keep` leave,
-    /// oldest first, until it fits; returns their slots. When even all of them
-    /// leaving leaves no room, none leaves.
+    /// oldest first, until it fits; returns them with their slots, for the
+    /// prompt cache to take as they are. When even all of them leaving leaves
+    /// no room, none leaves.
     ///
     /// # Panics
     ///
     /// Under [`Park::Ids`], which keeps no state.
-    pub(crate) fn room(&mut self, need: u64, keep: &[usize]) -> Result<Vec<usize>, NoRoom> {
+    pub(crate) fn room(&mut self, need: u64, keep: &[usize]) -> Result<Vec<LetGo>, NoRoom> {
         let Park::States { budget } = self.park else {
             panic!("room for a state in a table of ids");
         };
@@ -297,8 +304,10 @@ impl ParkTable {
             if self.bytes.saturating_add(need) <= budget {
                 break;
             }
-            self.take(slot);
-            gone.push(slot);
+            let Some(Entry::State { state, .. }) = self.take(slot) else {
+                unreachable!("slot {slot}'s idle state left the table while it made room");
+            };
+            gone.push((slot, state));
         }
         Ok(gone)
     }
@@ -370,13 +379,19 @@ mod tests {
         }
     }
 
+    /// [`ParkTable::room`] with each state that left read as its bytes.
+    fn room(t: &mut ParkTable, need: u64, keep: &[usize]) -> Result<Vec<(usize, u64)>, NoRoom> {
+        t.room(need, keep)
+            .map(|gone| gone.iter().map(|(slot, s)| (*slot, s.n_bytes())).collect())
+    }
+
     #[test]
     fn a_state_past_what_no_eviction_frees_is_refused_and_nothing_leaves() {
         let mut t = ParkTable::new(Park::States { budget: 100 }, 4);
         t.put(0, state(60, true));
         t.put(1, state(30, false));
         assert_eq!(
-            t.room(50, &[]),
+            room(&mut t, 50, &[]),
             Err(NoRoom {
                 need: 50,
                 pinned: 60,
@@ -392,8 +407,12 @@ mod tests {
         t.put(0, state(30, false));
         t.put(1, state(30, false));
         t.put(2, state(30, true));
-        assert_eq!(t.room(10, &[]), Ok(vec![]));
-        assert_eq!(t.room(40, &[]), Ok(vec![0]));
+        assert_eq!(room(&mut t, 10, &[]), Ok(vec![]));
+        assert_eq!(
+            room(&mut t, 40, &[]),
+            Ok(vec![(0, 30)]),
+            "slot 0's state, handed out"
+        );
         assert_eq!(t.bytes(), 60);
         assert!(t.take(0).is_none(), "slot 0 left the table");
     }
@@ -404,7 +423,7 @@ mod tests {
         t.put(0, state(30, false));
         t.put(1, state(30, false));
         t.put(2, state(30, false));
-        assert_eq!(t.room(40, &[0]), Ok(vec![1]));
+        assert_eq!(room(&mut t, 40, &[0]), Ok(vec![(1, 30)]));
         assert!(t.room(80, &[0]).is_err(), "slot 0 is kept: 30 + 80 > 100");
     }
 }

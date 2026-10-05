@@ -432,15 +432,18 @@ impl Slot {
     ///
     /// With the prompt cache on: a cached state that keeps more of `ids` than
     /// the slot replaces the slot's state; the slot's state goes into the
-    /// cache first whenever it is replaced, or the request keeps less than
-    /// half of it and does not carry the slot's last prompt whole. That last
-    /// condition is ours: llama-server saves on the half alone
-    /// (`f_keep < 0.5`). A request that carries the last prompt whole drops
-    /// only that prompt's reply, which a client that renders the reply again
-    /// (a template that leaves the reasoning out) never sends back; the price
-    /// is that a regenerated reply's old state is not kept. A prefix the
-    /// engine keeps less of than the request shares is noted with the
-    /// engine's reason.
+    /// cache first whenever it is replaced, or the request cuts it and does
+    /// not carry the slot's last prompt whole. On a server of one slot the
+    /// cut saves only when it keeps less than half of the slot, llama-server's
+    /// rule (`f_keep < 0.5`); on one of several, the request sat on this slot
+    /// for the prefix it shares where another slot may have been free, so any
+    /// cut saves and the choice costs the slot's conversation nothing. The
+    /// last-prompt condition is ours: a request that carries the last prompt
+    /// whole drops only that prompt's reply, which a client that renders the
+    /// reply again (a template that leaves the reasoning out) never sends
+    /// back; the price is that a regenerated reply's old state is not kept. A
+    /// prefix the engine keeps less of than the request shares is noted with
+    /// the engine's reason.
     ///
     /// A slot handed its parked state back ([`Slot::hand_back`]) holds it off
     /// the engine: the cache takes that state as it is where the rule saves
@@ -459,9 +462,14 @@ impl Slot {
         };
         let last = self.prompts[self.cur];
         let continues = last > 0 && common >= last;
+        let saves_cut = if self.parked.len() > 1 {
+            k < self.held.len()
+        } else {
+            2 * k < self.held.len()
+        };
         if self.cache.enabled()
             && !self.held.is_empty()
-            && (picked.is_some() || (2 * k < self.held.len() && !continues))
+            && (picked.is_some() || (saves_cut && !continues))
         {
             self.save_held(away.as_ref())?;
         }
@@ -533,37 +541,55 @@ impl Slot {
         if self.cache.covers(&self.held) {
             return Ok(());
         }
-        let positions = self.held.len();
         let t = Instant::now();
-        let state = if let Some(s) = away {
-            Arc::clone(s)
+        let (state, copied) = if let Some(s) = away {
+            (Arc::clone(s), false)
         } else {
             match self.engine.snapshot() {
-                Ok(s) => s,
+                Ok(s) => (s, true),
                 Err(StateError::Engine(e)) => return Err(e),
                 Err(e) => {
                     self.engine.note(&CacheNote::Skip {
-                        positions,
+                        positions: self.held.len(),
                         why: format!("the engine took no snapshot: {e}"),
                     });
                     return Ok(());
                 }
             }
         };
+        self.keep(self.cur, state, copied, t);
+        Ok(())
+    }
+
+    /// `state`, `slot`'s state of the ids it holds, which the slots that take
+    /// the engine in turns let go of, into the prompt cache as a save puts
+    /// it there ([`Slot::reuse`]), unless a cached state already keeps all of
+    /// it; the slot drops it after. `copied`: a snapshot was taken for it,
+    /// not a parked state handed over as it is.
+    pub(crate) fn offer(&mut self, slot: usize, state: Arc<dyn Saved>, copied: bool) {
+        if self.cache.enabled() && !self.cache.covers(self.held_of(slot)) {
+            self.keep(slot, state, copied, Instant::now());
+        }
+    }
+
+    /// `state` of the ids `slot` holds into the prompt cache, timed from `t`.
+    /// A state of other than those positions is noted and not kept.
+    fn keep(&mut self, slot: usize, state: Arc<dyn Saved>, copied: bool, t: Instant) {
+        let ids = self.held_of(slot).to_vec();
+        let positions = ids.len();
         if state.n_tokens() != positions {
             self.engine.note(&CacheNote::Skip {
                 positions,
                 why: format!(
-                    "the engine's snapshot holds {} positions, the slot {positions}",
+                    "the state holds {} positions, slot {slot} holds {positions}",
                     state.n_tokens()
                 ),
             });
-            return Ok(());
+            return;
         }
-        for note in self.cache.insert(self.held.clone(), state, ms_since(t)) {
+        for note in self.cache.insert(ids, state, ms_since(t), copied) {
             self.engine.note(&note);
         }
-        Ok(())
     }
 
     /// A cached `state` of `ids` into the engine, the slot then holding its

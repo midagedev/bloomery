@@ -1,18 +1,21 @@
 //! Gate: N slots (`--parallel N`) over the mock engine of N slots — each slot's
 //! ids are its request's alone, a free slot takes the oldest waiting request,
-//! a request takes the slot whose ids share its prefix, the queue refuses past
-//! its depth, `/slots` serves N ids and no more, and N past what the engine
-//! declares is refused by name. Then the drafting mock of N slots whose draft
-//! state is per slot: two drafted streams interleave by passes, a plain step
-//! row beside a pass row, and a drafting engine without the per-slot
-//! declaration is refused by name. Then N slots that take the one-slot mock in
+//! a request takes the slot whose ids share its prefix, and the conversation
+//! that slot held goes to the prompt cache before the cut (on one slot, only a
+//! cut to less than half), the queue refuses past its depth, `/slots` serves N
+//! ids and no more, and N past what the engine declares is refused by name.
+//! Then the drafting mock of N slots whose draft state is per slot: two
+//! drafted streams interleave by passes, a plain step row beside a pass row,
+//! and a drafting engine without the per-slot declaration is refused by
+//! name. Then N slots that take the one-slot mock in
 //! turns ([`serve::SwapEngine`]): preemption at a step, turns of `QUANTUM`
 //! tokens, shortest prompt first, a newcomer refused by name when the running
 //! request cannot be parked, the re-prefill fallback, `/slots`' turns, the
 //! draft kept, a lone request on the engine's slot among equals, a slot the
 //! engine emptied holding nothing for the next request, an erase of a slot
 //! the engine does not hold leaving the engine's slot and moving no state,
-//! and a parked idle state taken into the prompt cache without a copy.
+//! a parked idle state taken into the prompt cache without a copy, and the
+//! idle states the turns stop parking taken into it too.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -22,8 +25,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use serve::{
-    Drafted, Engine, EngineError, FATAL_LINGER, MockEngine, Park, QUANTUM, SavedState, ServeError,
-    Server, ServerConfig, SlotConfig, SlotRow, StateError, SwapEngine, Tokenizer,
+    CacheNote, Drafted, Engine, EngineError, FATAL_LINGER, MockEngine, MockTokenizer, Park,
+    QUANTUM, SavedState, ServeError, Server, ServerConfig, SlotConfig, SlotRow, StateError,
+    SwapEngine, Tokenizer,
 };
 
 use super::common::{V41_TEMPLATE, call, get, post};
@@ -238,6 +242,57 @@ fn hw_a_request_takes_the_slot_that_shares_its_prefix() {
         0,
         "nothing shared: the least recently used"
     );
+}
+
+/// A new conversation that takes an idle slot for the header it shares cuts
+/// that slot's conversation, which a server of several slots saves first: on
+/// two resident slots, slot 0 holding A and slot 1 empty, D takes slot 0 for
+/// the header, and A back keeps every position it held, from the prompt
+/// cache. A server of one slot keeps llama-server's rule — a cut that keeps
+/// half the slot or more saves nothing — and A back keeps the header alone.
+/// Every request gives its alone ids.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_cut_of_an_idle_conversation_saves_it_on_several_slots() {
+    const HEADER: &str = "system: keep it short. ";
+    let (a, d) = (format!("{HEADER}abcabcab"), format!("{HEADER}xyzxyzxy"));
+    let header = MockTokenizer.encode(HEADER).len();
+    let alone = super::common::start(4096);
+    for n in [2, 1] {
+        let engine = MockEngine::new(4096).with_slots(n).with_cache_ram(1 << 20);
+        let addr = start_n(Box::new(engine), n, None, None);
+        let first = post(addr, "/completion", &completion(&a, 4)).json();
+        let tokens = first["tokens"].as_array().expect("tokens").clone();
+        let held = MockTokenizer.encode(&a).len() + tokens.len() - 1;
+        assert!(
+            tokens.len() == 4
+                && !tokens.contains(&json!(MockTokenizer.eos()))
+                && 2 * header >= held,
+            "the fixture: A's four ids with no end of sequence, the header at least half of the \
+             {held} positions A holds: {first}"
+        );
+        let other = post(addr, "/completion", &completion(&d, 4)).json();
+        assert_eq!(
+            (&other["id_slot"], &other["timings"]["cache_n"]),
+            (&json!(0), &json!(header)),
+            "N = {n}: D takes A's slot for the header: {other}"
+        );
+        let mut back = vec![json!(a)];
+        back.extend(tokens);
+        back.push(json!("zz"));
+        let back = json!({"prompt": back, "n_predict": 4, "temperature": 0, "return_tokens": true});
+        let v = post(addr, "/completion", &back).json();
+        let want = if n > 1 { held } else { header };
+        assert_eq!(
+            (&v["id_slot"], &v["timings"]["cache_n"]),
+            (&json!(0), &json!(want)),
+            "N = {n}: A back keeps {want}: {v}"
+        );
+        for (got, body) in [(&other, completion(&d, 4)), (&v, back)] {
+            let want = post(alone, "/completion", &body).json();
+            assert_eq!(got["tokens"], want["tokens"], "N = {n}: {body}");
+        }
+    }
 }
 
 /// Past the queue's depth a request is a 503 with `Retry-After` at once, never
@@ -900,9 +955,10 @@ enum Snap {
 
 /// An engine of one slot (the mock, unless given another) whose every call
 /// goes into `trace` in order (`prefill <text>`, `next`, `advance`, `reset`,
-/// `snapshot`, `resume`), and whose steps (`next` and `advance`, counted over
-/// the engine's life) block where `holds` say: the `k`-th one waits until its
-/// latch is released. Its prompt cache is off unless [`Turned::caching`].
+/// `snapshot`, `resume`, and `note <line>` for what the prompt cache did),
+/// and whose steps (`next` and `advance`, counted over the engine's life)
+/// block where `holds` say: the `k`-th one waits until its latch is
+/// released. Its prompt cache is off unless [`Turned::caching`].
 struct Turned {
     inner: Box<dyn Engine>,
     trace: Arc<Mutex<Vec<String>>>,
@@ -1018,6 +1074,29 @@ impl Engine for Turned {
         }
         self.inner.restore_state(input)
     }
+    fn note(&self, note: &CacheNote) {
+        self.log(format!("note {note}"));
+    }
+}
+
+/// The prompt cache's saves a [`Turned`] trace holds, in order: each one's
+/// positions and whether its state is a snapshot taken for it (`copied`).
+fn saves(trace: &[String]) -> Vec<(usize, bool)> {
+    trace
+        .iter()
+        .filter_map(|e| e.strip_prefix("note cache save "))
+        .map(|line| {
+            let field = |key: &str| {
+                line.split_whitespace()
+                    .find_map(|w| w.strip_prefix(key))
+                    .unwrap_or_else(|| panic!("no {key} in the save {line:?}"))
+            };
+            (
+                field("positions=").parse().expect("positions"),
+                field("copied=").parse().expect("copied"),
+            )
+        })
+        .collect()
 }
 
 /// A server of `n` slots that take `engine` in turns.
@@ -1614,8 +1693,9 @@ fn past_park(between: &[String]) -> (usize, usize) {
 /// copy past the running request's park — no put back, no snapshot — and the
 /// prompt cache holds the state under its ids: a later request that returns
 /// to it keeps all of it. One that keeps some of it, less than half, puts it
-/// back for the cut and takes no snapshot. Every request gives its alone
-/// ids.
+/// back for the cut and takes no snapshot. The cache's saves say which: a
+/// handed-back state is no copy, the engine's state a snapshot. Every request
+/// gives its alone ids.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_a_parked_idle_state_goes_to_the_cache_without_a_copy() {
@@ -1687,10 +1767,94 @@ fn hw_a_parked_idle_state_goes_to_the_cache_without_a_copy() {
     );
     let want = post(alone, "/completion", &short).json();
     assert_eq!(v["tokens"], want["tokens"], "{v}");
-    let between = before_prefill(&trace.lock().expect("trace"), "mnmnm");
+    let trace = trace.lock().expect("trace").clone();
+    let between = before_prefill(&trace, "mnmnm");
     assert_eq!(
         past_park(&between),
         (1, 0),
         "a request that keeps two ids of R's state: (put back, snapshots) {between:?}"
+    );
+    // B's eleven positions handed back for R; A's forty-seven (its prompt
+    // and thirty-nine fed ids) the engine's, for B back; R's eleven handed
+    // back for the short request.
+    assert_eq!(
+        saves(&trace),
+        [(11, false), (47, true), (11, false)],
+        "the saves' positions and copies: {trace:?}"
+    );
+}
+
+/// The idle states slots that take turns stop parking go into the prompt
+/// cache, so their conversations come back whole: on three slots, B's idle
+/// state leaves the table to make room for A's park when C starts (handed
+/// over as it is), and C's finds no room beside A's when it ends (the
+/// snapshot its park took). B back and C back each keep the eleven positions
+/// their slots held, with their alone ids.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_states_the_turns_let_go_reach_the_prompt_cache() {
+    // A mock state of n positions is 16 + 4n bytes. A parks at ten positions
+    // when B starts (56) and B's eleven park beside it when B ends (60, 116
+    // in all); A parks at thirteen when C starts (68), which B's 60 beside it
+    // pass (128), and C's eleven do not fit beside A's when C ends.
+    const BUDGET: u64 = 120;
+    let bytes = |n: u64| 16 + 4 * n;
+    assert!(
+        bytes(10) + bytes(11) <= BUDGET && bytes(13) + bytes(11) > BUDGET,
+        "the fixture's budget"
+    );
+    let (held, again) = (
+        Arc::new(super::Latch::default()),
+        Arc::new(super::Latch::default()),
+    );
+    // Next #3 is A's third step; B's six steps are #4 to #9; #12 is A's
+    // third after it is put back.
+    let (engine, trace) = Turned::new(Snap::Takes, &[(3, &held), (12, &again)]);
+    let addr = start_swap(
+        Box::new(engine.caching(1 << 20)),
+        3,
+        Park::States { budget: BUDGET },
+    );
+    let bodies = [
+        completion("abcabcab", 40),
+        completion("xyzxyz", 6),
+        completion("pqrpqr", 6),
+    ];
+    let a = post_bg(addr, bodies[0].clone());
+    assert!(held.wait_entered(BOUND), "A never reached next #3");
+    let b = post_bg(addr, bodies[1].clone());
+    wait_deferred(addr, 1, BOUND);
+    held.release();
+    assert!(again.wait_entered(BOUND), "A never reached next #12");
+    let c = post_bg(addr, bodies[2].clone());
+    wait_deferred(addr, 1, BOUND);
+    again.release();
+    let alone = super::common::start(4096);
+    for (slot, (r, body)) in [a, b, c].into_iter().zip(&bodies).enumerate() {
+        let r = r.join().expect("request");
+        assert_eq!(r.status, 200, "{}", r.body);
+        let r = r.json();
+        assert_eq!(
+            r["id_slot"], slot,
+            "the fixture: A, B and C on slots 0 to 2: {r}"
+        );
+        let want = post(alone, "/completion", body).json();
+        assert_eq!(r["tokens"], want["tokens"], "{body}");
+    }
+    let let_go = saves(&trace.lock().expect("trace"));
+    for back in ["xyzxyzxyzxyzx", "pqrpqrpqrpqrp"] {
+        let body = completion(back, 6);
+        let v = post(addr, "/completion", &body).json();
+        assert_eq!(
+            v["timings"]["cache_n"], 11,
+            "{back}: the slot's state kept whole: {v}"
+        );
+        let want = post(alone, "/completion", &body).json();
+        assert_eq!(v["tokens"], want["tokens"], "{back}");
+    }
+    assert_eq!(
+        let_go,
+        [(11, false), (11, true)],
+        "B's state handed over as it left, then C's snapshot that found no room"
     );
 }
