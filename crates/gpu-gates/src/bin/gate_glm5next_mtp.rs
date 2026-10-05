@@ -79,6 +79,17 @@
 //!   `bloomery_gpu_glm5next::seq_bytes` — the plan-time host bytes of a
 //!   state, the elastic `--parallel` default's unit — equal to the state's
 //!   `GlmSeq::bytes` at its positions and its draft setting.
+//! - (z) two windows' drafted rounds as one pass of both slots' verify rows
+//!   a round (`app::mtp::pass_slots`), on a load of its own whose plan
+//!   counts two sequences (the e2e gate's slots load), the prose set's
+//!   prompts the e2e gate's (sd) feeds: each window's draft its own and its
+//!   proposal capped at the seat's depth (`app::mtp::SLOT_DEPTH`: two rows a
+//!   slot, a pass of four), every window's ids, kept rows a round, draft
+//!   store and position its run alone on the load's one sequence before any
+//!   slot exists, through the session's verify of one sequence — with a
+//!   round keeping fewer rows than it ran and a round keeping different
+//!   counts on the two slots, else the clause is red (the per-slot keep
+//!   never ran apart).
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -98,29 +109,31 @@ mod gate {
     use std::time::Instant;
 
     use app::Session;
-    use app::mtp::MtpDraft;
+    use app::mtp::{MtpDraft, SLOT_DEPTH, SlotWindow, pass_slots};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::rounding::q8_32_rel;
-    use bloomery_gpu_gates::{Fnv1a64, GateError, checks_failed, patch_bytes, verdict};
+    use bloomery_gpu_gates::{
+        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, patch_bytes, verdict,
+    };
     use bloomery_gpu_glm5next::{
         Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, GlmPromptSink, GlmSeq, NextnFeed,
         NextnHead, NextnHidden, NextnMode, PrefillMode, WALK_ROWS, feed, nextn_chain, nextn_hidden,
-        nextn_logits, nextn_target_streams, nextn_walk, prompt_with, seq_bytes, seq_resume,
-        seq_save, set_prefill, set_prefill_group,
+        nextn_logits, nextn_store, nextn_target_streams, nextn_walk, prompt_with, seq_bytes,
+        seq_resume, seq_save, set_prefill, set_prefill_group,
     };
     use gguf::Split;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
     use model::placement::{PlanLevers, workstation};
-    use refset::arch::glm5next::{MODEL, MTP, MTP_SET};
+    use refset::arch::glm5next::{D1K, IK, MODEL, MTP, MTP_SET};
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
     use runtime::swaprule::KeptRows;
-    use runtime::{Advance as _, Committed, PassSink};
+    use runtime::{Advance as _, Committed, Draft, PassSink, Target, Verify, Want, accepted_rows};
 
     /// Cache rows: the e2e gate's main load.
     const CTX: usize = 3136;
@@ -1276,6 +1289,219 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------- (z) two slots in one pass
+
+    /// (z)'s drafted rounds a window: the e2e gate's (sd) passes a slot.
+    const Z_ROUNDS: usize = 8;
+
+    /// (z)'s load: a slot's context and the sequences its plan counts, the
+    /// e2e gate's slots load's.
+    const Z_CTX: usize = 256;
+    const Z_SLOTS: usize = 2;
+
+    /// The rows of a window's verify at the seat's depth: the token at the
+    /// slot's position, then the proposal ([`SLOT_DEPTH`] ids).
+    const Z_ROWS: usize = 1 + SLOT_DEPTH;
+
+    /// One drafted window's run: its ids (the first step's, then each
+    /// round's kept ids), every round's [`Committed`], its draft store and
+    /// its position at its end.
+    struct ZRun {
+        ids: Vec<u32>,
+        rounds: Vec<Committed>,
+        store: (Vec<u16>, Vec<u16>),
+        pos: u32,
+    }
+
+    /// The selected slot's draft store, read back at the count its own walks
+    /// hold: the rows the sequence's walks wrote.
+    fn z_store(s: &mut Session<Body>) -> Result<(Vec<u16>, Vec<u16>), GateError> {
+        let n = s
+            .model()
+            .body("(z)")?
+            .nextn()
+            .ok_or("(z)'s load holds no NextN layer")?
+            .held();
+        Ok(nextn_store(s.model_mut(), n)?)
+    }
+
+    /// The selected slot's window from its reset, as the server feeds it and
+    /// the e2e gate's (sd) starts: every id of `ids` but the last through
+    /// the draft's prompt call, then the last one drafted step; its id.
+    fn z_start(
+        s: &mut Session<Body>,
+        d: &mut MtpDraft<Body>,
+        ids: &[u32],
+    ) -> Result<Vec<u32>, GateError> {
+        s.reset()?;
+        d.restart();
+        let (&last, head) = ids.split_last().ok_or("an empty prompt")?;
+        Draft::prompt(d, s, head)?;
+        d.before_step(s, last)?;
+        let next = Target::step(s, last, Want::Argmax)?.argmax();
+        Draft::stepped(d, s, last, next)?;
+        Ok(vec![next])
+    }
+
+    /// Window `ids` alone on the selected slot, [`Z_ROUNDS`] drafted rounds
+    /// through the session's verify of one sequence, each proposal capped at
+    /// the seat's depth: the proposal, the verify of its rows, the draft told
+    /// the rule's kept rows, the commit.
+    fn z_alone(s: &mut Session<Body>, ids: &[u32]) -> Result<ZRun, GateError> {
+        let mut d = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
+        let mut out = z_start(s, &mut d, ids)?;
+        let mut rounds = Vec::with_capacity(Z_ROUNDS);
+        for _ in 0..Z_ROUNDS {
+            let last = *out.last().ok_or("a window with no id")?;
+            let pos = s.model().pos();
+            let mut rows = [last; Z_ROWS];
+            let n = Draft::propose(&mut d, s, last, &mut rows[1..])?;
+            if n != SLOT_DEPTH {
+                return Err(
+                    format!("the draft proposed {n} ids; a round reads {SLOT_DEPTH}").into(),
+                );
+            }
+            let got = Verify::verify(s, rows)?;
+            let kept = accepted_rows(&rows, &got);
+            d.record(pos, &rows, &got, kept)?;
+            Verify::commit(s, kept)?;
+            out.extend_from_slice(&got[..kept]);
+            rounds.push(Committed {
+                pos,
+                kept,
+                rows: Z_ROWS,
+                proposed: true,
+            });
+        }
+        Ok(ZRun {
+            ids: out,
+            rounds,
+            store: z_store(s)?,
+            pos: s.model().pos(),
+        })
+    }
+
+    /// (z) (module doc): the two windows alone on the load's one sequence,
+    /// then on their own slots, every round one pass of both
+    /// ([`pass_slots`]).
+    fn slots_pass(
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+        levers: &bloomery_levers::Levers,
+        windows: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let place = PlanLevers::from_levers(levers)?;
+        let np =
+            inputs.plan_nextn_slots(&machine, u64::try_from(Z_CTX)?, &place, nextn, Z_SLOTS)?;
+        let t = Instant::now();
+        let mut m = Body::open_placed_nextn_slots(
+            file,
+            &np,
+            inputs,
+            nextn,
+            0,
+            levers.host(),
+            Residency::Off,
+            Z_SLOTS,
+        )?;
+        set_prefill(&mut m, PrefillMode::Batch)?;
+        m.set_mode(StepMode::Graph);
+        println!(
+            "(z) the slots load: ctx {Z_CTX}, {Z_SLOTS} sequences, {} resident bytes in {:.1} s \
+             (runtime value)",
+            m.resident_bytes(),
+            t.elapsed().as_secs_f64()
+        );
+        let mut s = Session::from_model(m, u32::try_from(Z_CTX)?);
+        // The references, each alone on the load's one sequence before any
+        // slot exists: what the seat's one-request runs produce.
+        let alone = [z_alone(&mut s, windows[0])?, z_alone(&mut s, windows[1])?];
+        s.add_slots(Z_SLOTS)?;
+        let mut drafts = [
+            MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?,
+            MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?,
+        ];
+        let mut outs = [Vec::new(), Vec::new()];
+        for (slot, ((d, out), ids)) in drafts.iter_mut().zip(&mut outs).zip(windows).enumerate() {
+            s.select_slot(slot)?;
+            *out = z_start(&mut s, d, ids)?;
+        }
+        let mut rounds = [Vec::new(), Vec::new()];
+        for _ in 0..Z_ROUNDS {
+            let [d0, d1] = &mut drafts;
+            let [o0, o1] = &mut outs;
+            let (l0, l1) = (
+                *o0.last().ok_or("slot 0 gave no id")?,
+                *o1.last().ok_or("slot 1 gave no id")?,
+            );
+            let mut w = [
+                SlotWindow {
+                    slot: 0,
+                    draft: d0,
+                    last: l0,
+                    depth: SLOT_DEPTH,
+                    out: o0,
+                },
+                SlotWindow {
+                    slot: 1,
+                    draft: d1,
+                    last: l1,
+                    depth: SLOT_DEPTH,
+                    out: o1,
+                },
+            ];
+            let done = pass_slots(&mut s, &mut w)?;
+            let [c0, c1] = <[Committed; 2]>::try_from(done)
+                .map_err(|d| format!("a pass of 2 slots committed {} slots", d.len()))?;
+            rounds[0].push(c0);
+            rounds[1].push(c1);
+        }
+        let mut off = Vec::new();
+        for (slot, ((out, rs), r)) in outs.iter().zip(&rounds).zip(&alone).enumerate() {
+            s.select_slot(slot)?;
+            let parts = [
+                ("ids", *out == r.ids),
+                ("kept rounds", *rs == r.rounds),
+                ("draft store", z_store(&mut s)? == r.store),
+                ("position", s.model().pos() == r.pos),
+            ];
+            off.extend(
+                parts
+                    .into_iter()
+                    .filter(|&(_, same)| !same)
+                    .map(|(part, _)| format!("slot {slot} {part}")),
+            );
+        }
+        let rejected = rounds.iter().flatten().filter(|c| c.kept < c.rows).count();
+        let apart = rounds[0]
+            .iter()
+            .zip(&rounds[1])
+            .filter(|(x, y)| x.kept != y.kept)
+            .count();
+        let kept = |rs: &[Committed]| rs.iter().map(|c| c.kept).collect::<Vec<_>>();
+        let same = off.is_empty();
+        let ok = same && rejected > 0 && apart > 0;
+        println!(
+            "(z) two slots in one pass: {Z_ROUNDS} rounds, each window's draft its own and its \
+             proposal capped at the seat's depth {SLOT_DEPTH} (a pass of {} rows), kept slot 0 \
+             {:?}, slot 1 {:?}: {}; {rejected} slot rounds kept fewer rows than they ran, \
+             {apart} rounds kept different counts on the two slots {}",
+            2 * Z_ROWS,
+            kept(&rounds[0]),
+            kept(&rounds[1]),
+            if same {
+                "each window's ids, kept rounds, draft store and position its alone run's"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     pub(super) fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&[])?;
         let dir = MTP.path(MTP_SET);
@@ -1445,6 +1671,19 @@ mod gate {
             verdict(with_bytes == with_state.bytes() as u64)
         );
         m.reset()?;
+        // (z) on a load of its own: this one's plan counts one sequence, and
+        // the card holds one load.
+        drop(m);
+        let man = RefManifest::open(&data_dir().join(D1K), &IK)?;
+        let (_, _, prefill) = man.step()?;
+        if prefill.len() < 340 {
+            return Err(format!("{D1K}: {} prefill ids, (z) reads 340", prefill.len()).into());
+        }
+        let windows = [&prefill[..33], &prefill[300..340]];
+        ok &= slots_pass(&inputs, &nextn, &levers, windows).unwrap_or_else(|e| {
+            println!("(z) a call failed: {e} {}", verdict(false));
+            false
+        });
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
 }

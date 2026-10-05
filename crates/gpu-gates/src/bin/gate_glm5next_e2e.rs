@@ -260,9 +260,9 @@
 //!   refused naming the set; slot 0's reset leaves slot 1 in it, slot 1's
 //!   lifts it; prompted again, the next pass both solo runs' first step.
 //! - (g5) refusals by name, no position moved, each from both slots
-//!   prompted afresh: three rows in one pass naming the body's bound 2, the
-//!   taps armed, a slot whose step failed past its launch, a slot of two
-//!   rows, a route trace attached.
+//!   prompted afresh: three rows in one pass, a row a slot, naming the
+//!   points the body's walk lays, the taps armed, a slot whose step failed
+//!   past its launch, a slot of two rows, a route trace attached.
 //!
 //! Then on a plain load of two KDA lanes:
 //! - (g4) walk: the captured pass of both slots holds the captured verify's
@@ -271,9 +271,46 @@
 //!   each bit for bit their solo runs; between them, a pass refused by name
 //!   while slot 0's verify waits for its commit.
 //!
-//! An error inside a clause body of (sp), (sc), (sd), (s3) or (g1)-(g5) is
-//! that clause's FAIL, not the gate's end; one in a load, a solo run or the
-//! draft's open ends the gate.
+//! The drafted pass of both slots' verify rows (`GpuModel::verify_slots` and
+//! `commit_slots` over `SlotRows`: each slot's two rows — the token at its
+//! position and its draft's proposal — in flight at once, a pass of four),
+//! only under `--only stagger-draft`, on a load of (sd)'s plan of its own,
+//! against each slot's solo run from a reset (slot 0, the same prompt
+//! through the session's verify of one sequence, its draft told the same
+//! kept rows):
+//! - (h1) interleave: both slots started under their own drafts as (sd)'s
+//!   are, [`SLOT_PASSES`] rounds of both slots as one pass a round (row
+//!   order 0, 1 and 1, 0 in turn), each slot's kept rows by the rule, then a
+//!   drafted step each: each slot's ids, its kept rows, committed lane and
+//!   position after each round, its last logits bit for bit, its stores up
+//!   to its position, position and committed lane its solo run's — in graph
+//!   mode and again in eager mode.
+//! - (h2) forced keeps, in graph mode: kept rows (slot 0, slot 1) forced to
+//!   (2, 1), (1, 2), (1, 1) and (2, 2) over four rounds, then a round by the
+//!   rule: each slot after every round at its first position plus its kept
+//!   rows, and every part (h1) holds its solo run's of the same counts.
+//! - (h3) refusals: while a pass of both slots waits for its commit, a step,
+//!   a select, a prompt call and a cut each refused by name, slot 0 still
+//!   selected past its rows, the commit standing each slot past its rows;
+//!   then, from both slots prompted afresh, each refused by the body by name
+//!   with no position moved: a slot of one row beside one of two and a slot
+//!   of three rows (a NextN load's slot runs its verify's rows), a pass of
+//!   both slots' two rows that keeps every row (`GpuModel::step_slots`: a
+//!   NextN load's pass is a verify; refused before anything is planned, so
+//!   each slot is selected after it, its draft store as it stood too), the
+//!   taps armed, a route trace attached; last, slot 1 cut back to its prompt
+//!   call's checkpoint and left waiting, the next pass of both carries the
+//!   cut out from slot 1's own checkpoints: both slots' rows, stores up to
+//!   their positions and positions their solo verifies' from the same
+//!   states.
+//! - (h4) walk: the captured four-row pass holds twice the captured verify
+//!   pair's nodes; the pair replayed after the pass's capture (which
+//!   re-records the go order) and the pass replayed after the pair's
+//!   re-capture each bit for bit their solo runs, ids and logits.
+//!
+//! An error inside a clause body of (sp), (sc), (sd), (s3), (g1)-(g5) or
+//! (h1)-(h4) is that clause's FAIL, not the gate's end; one in a load, a
+//! solo run or the draft's open ends the gate.
 //!
 //! `--only main` runs the clauses on the load at [`CTX`] alone, `--only pp`
 //! the prompt batch's load alone, `--only pplong` (pb-long) alone on a load
@@ -281,7 +318,8 @@
 //! [`CTX`] of two (the plain graph run of the batch set they compare against
 //! included), `--only keep` (k) alone on a load at [`CTX`] of two, `--only
 //! slots` the resident slots' clauses alone on their four loads, `--only
-//! stagger` (g1)-(g5) alone on their two plain loads.
+//! stagger` (g1)-(g5) alone on their two plain loads, `--only stagger-draft`
+//! (h1)-(h4), which no other run takes, on the drafted slots' NextN load.
 //! `--step-sets short` takes (t)'s two 4-token sets only,
 //! `--step-sets long` the 1,024- and 3,070-position sets only, `--step-sets
 //! all` (the default) all four; it names the sets of the load at [`CTX`], so
@@ -326,7 +364,7 @@ mod gate {
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, pools_for};
-    use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::model::{SlotsOut, StepMode};
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
@@ -339,7 +377,7 @@ mod gate {
     use bloomery_gpu_glm5next::forced::{ForcedRoute, ForcedRow};
     use bloomery_gpu_glm5next::{
         Body, CHUNK, GEMM_FROM, Glm5nextModel, GlmArena, Plant, PrefillMode, RouteTapRows,
-        StoreDigest, StoreRows, feed, plant_prompt_routes, prefill, prefill_mode,
+        StoreDigest, StoreRows, feed, nextn_store, plant_prompt_routes, prefill, prefill_mode,
         prompt_route_taps, seq_resume, seq_save, set_prefill, set_prefill_group,
         set_prompt_route_taps, set_taps, step_launches, store_digests, store_rows,
     };
@@ -354,7 +392,7 @@ mod gate {
     use refset::family::Family;
     use runtime::layer::{FfnKind, Layer, MixerKind};
     use runtime::swaprule::KeptRows;
-    use runtime::{Out, Target, Want};
+    use runtime::{Out, Target, Verify, Want, accepted_rows};
 
     /// The router's experts and picks a token.
     const N_EXPERT: usize = 288;
@@ -3073,8 +3111,8 @@ mod gate {
     /// whose missing refusal would move a slot last.
     #[derive(Clone, Copy, Debug)]
     enum G5 {
-        /// Three rows in one pass: the owner's refusal naming the body's
-        /// bound, 2.
+        /// Three rows in one pass, a row a slot: the body's refusal naming
+        /// the points its walk lays.
         Bound,
         /// The taps armed.
         Taps,
@@ -3090,7 +3128,7 @@ mod gate {
     impl G5 {
         fn says(self) -> &'static str {
             match self {
-                G5::Bound => "a pass of three rows (naming the bound 2)",
+                G5::Bound => "a pass of three slots' rows (naming the points the walk lays)",
                 G5::Taps => "a pass with the taps armed",
                 G5::Held => "a pass beside slot 1's step failed past its launch",
                 G5::Two => "a pass of slot 0's two rows",
@@ -3141,10 +3179,12 @@ mod gate {
         let both: [(usize, &[u32]); 2] = [(0, &[t0]), (1, &[t1])];
         let mut before = slot_positions(m)?;
         let named = match case {
+            // The owner's bound holds four rows, so three reach the body,
+            // whose walk lays no point for them.
             G5::Bound => refused_by(
-                &m.step_slots(&[(0, &[t0, t0]), (1, &[t1])]),
-                STEP_SLOTS,
-                "3 rows in one pass; this body's pass of several slots holds at most 2",
+                &m.step_slots(&[(0, &[t0]), (1, &[t1]), (2, &[t1])]),
+                GLM_BODY,
+                "the walk lays",
             ),
             G5::Taps => {
                 set_taps(m, true)?;
@@ -3300,10 +3340,747 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------ (h) the drafted slots pass
+
+    /// (h1)'s drafted rounds a slot: (sd)'s first group's passes.
+    const H_ROUNDS: usize = SLOT_PASSES;
+
+    /// (h2)'s forced kept rows a round, slot 0's and slot 1's: every pair of
+    /// one and two rows.
+    const H_FORCED: [[usize; 2]; 4] = [[2, 1], [1, 2], [1, 1], [2, 2]];
+
+    /// One slot's drafted run: its ids (the prompt's step's, each round's
+    /// kept ids, the last step's), each round's proposal and kept rows, its
+    /// committed lane and position after each round's commit, its last
+    /// step's logits; at its end its stores' digests (the rows its position
+    /// holds, and every row), position and committed lane.
+    #[derive(Default)]
+    struct DRun {
+        ids: Vec<u32>,
+        rounds: Vec<(bool, usize)>,
+        lanes: Vec<u32>,
+        positions: Vec<u32>,
+        logits: Vec<f32>,
+        live: u64,
+        whole: u64,
+        pos: u32,
+        lane: u32,
+    }
+
+    impl DRun {
+        fn last(&self) -> Result<u32, GateError> {
+            Ok(*self.ids.last().ok_or("a drafted run with no id")?)
+        }
+
+        /// Slot `slot`'s parts that differ from its solo run `solo`, by
+        /// name; every part but the whole stores.
+        fn off(&self, slot: usize, solo: &DRun) -> Vec<String> {
+            let parts = [
+                ("ids", self.ids == solo.ids),
+                ("kept rounds", self.rounds == solo.rounds),
+                ("committed lanes", self.lanes == solo.lanes),
+                ("positions", self.positions == solo.positions),
+                ("last logits", same_bits(&self.logits, &solo.logits)),
+                ("live stores", self.live == solo.live),
+                ("position", self.pos == solo.pos),
+                ("committed lane", self.lane == solo.lane),
+            ];
+            parts
+                .into_iter()
+                .filter(|&(_, same)| !same)
+                .map(|(part, _)| format!("slot {slot} {part}"))
+                .collect()
+        }
+    }
+
+    /// A draft of the load's NextN layer for one slot's run, opened as (sd)'s
+    /// is: each slot of a pass holds its own, as `app::mtp::pass_slots` takes
+    /// them.
+    fn d_open(s: &Session<Body>) -> Result<MtpDraft<Body>, GateError> {
+        Ok(MtpDraft::open(
+            s.model(),
+            PrefillMode::Batch,
+            StepMode::Eager,
+        )?)
+    }
+
+    /// `slot`'s drafted run from its reset, as (sd)'s starts: every id of
+    /// `p` but the last through the draft's prompt call, then the last one
+    /// drafted step ([`d_step`]).
+    fn d_start(
+        s: &mut Session<Body>,
+        d: &mut MtpDraft<Body>,
+        slot: usize,
+        p: &[u32],
+    ) -> Result<DRun, GateError> {
+        s.select_slot(slot)?;
+        s.reset()?;
+        d.restart();
+        let (&last, head) = p.split_last().ok_or("an empty prompt")?;
+        runtime::Draft::prompt(d, s, head)?;
+        let mut r = DRun::default();
+        d_step(s, d, &mut r, last, false)?;
+        Ok(r)
+    }
+
+    /// One drafted step of `last` on the selected slot, as the seat steps
+    /// ([`drafted_step`]): its id appended, its logits kept when `logits`.
+    fn d_step(
+        s: &mut Session<Body>,
+        d: &mut MtpDraft<Body>,
+        r: &mut DRun,
+        last: u32,
+        logits: bool,
+    ) -> Result<(), GateError> {
+        d.before_step(s, last)?;
+        let next = s.step(last, Want::Argmax)?.argmax();
+        if logits {
+            r.logits = s.model().logits()?;
+        }
+        runtime::Draft::stepped(d, s, last, next)?;
+        r.ids.push(next);
+        Ok(())
+    }
+
+    /// `slot` selected: its committed lane and position appended to `r`, a
+    /// round's commit's.
+    fn d_mark(s: &mut Session<Body>, slot: usize, r: &mut DRun) -> Result<(), GateError> {
+        s.select_slot(slot)?;
+        let m = s.model();
+        r.lanes.push(m.body("stagger-draft")?.lane());
+        r.positions.push(m.pos());
+        Ok(())
+    }
+
+    /// `slot`'s run ended: a drafted step that reads its logits, then its
+    /// stores' digests, position and committed lane.
+    fn d_end(
+        s: &mut Session<Body>,
+        d: &mut MtpDraft<Body>,
+        slot: usize,
+        r: &mut DRun,
+    ) -> Result<(), GateError> {
+        s.select_slot(slot)?;
+        let last = r.last()?;
+        d_step(s, d, r, last, true)?;
+        let m = s.model_mut();
+        r.live = live_hash(m)?;
+        r.whole = stores_hash(m)?;
+        r.pos = m.pos();
+        r.lane = m.body("stagger-draft")?.lane();
+        Ok(())
+    }
+
+    /// The draft's proposal behind `last` on the selected slot: one id, as a
+    /// verify of two rows reads.
+    fn d_propose(
+        s: &mut Session<Body>,
+        d: &mut MtpDraft<Body>,
+        last: u32,
+    ) -> Result<[u32; PAIR], GateError> {
+        let mut rows = [last; PAIR];
+        let n = runtime::Draft::propose(d, s, last, &mut rows[1..])?;
+        if n != PAIR - 1 {
+            return Err(format!(
+                "slot {}'s draft proposed {n} ids; a verify of {PAIR} rows reads {}",
+                s.selected(),
+                PAIR - 1
+            )
+            .into());
+        }
+        Ok(rows)
+    }
+
+    /// `p`'s solo drafted run on slot 0, a round a `forced` entry through the
+    /// session's verify of one sequence — (sd)'s pass of one window written
+    /// out ([`runtime::Speculative`]: the proposal, the verify of its two
+    /// rows, the draft told the kept rows, the commit) — each round's kept
+    /// rows the rule's ([`accepted_rows`]) or the entry's; then [`d_end`].
+    fn h_solo(
+        s: &mut Session<Body>,
+        p: &[u32],
+        forced: &[Option<usize>],
+    ) -> Result<DRun, GateError> {
+        let mut d = d_open(s)?;
+        let mut r = d_start(s, &mut d, 0, p)?;
+        for &f in forced {
+            let pos = s.model().pos();
+            let rows = d_propose(s, &mut d, r.last()?)?;
+            let out = s.verify(rows)?;
+            let kept = f.unwrap_or_else(|| accepted_rows(&rows, &out));
+            d.record(pos, &rows, &out, kept)?;
+            s.commit(kept)?;
+            r.ids.extend_from_slice(&out[..kept]);
+            r.rounds.push((true, kept));
+            d_mark(s, 0, &mut r)?;
+        }
+        d_end(s, &mut d, 0, &mut r)?;
+        Ok(r)
+    }
+
+    /// `a` on slot 0 and `b` on slot 1, each started under its own draft,
+    /// then a round a `rounds` entry `(order, forced)`: both slots' proposals
+    /// (each slot selected in `order`), their two rows each as one pass in
+    /// `order` ([`Session::verify_slots`]), each slot's kept rows the rule's
+    /// or `forced[slot]`, each draft told its own, the commit of both
+    /// ([`Session::commit_slots`]); then [`d_end`] on each slot.
+    fn h_pass(
+        s: &mut Session<Body>,
+        (a, b): (&[u32], &[u32]),
+        rounds: &[([usize; 2], Option<[usize; 2]>)],
+    ) -> Result<[DRun; 2], GateError> {
+        let mut drafts = [d_open(s)?, d_open(s)?];
+        let mut runs = [
+            d_start(s, &mut drafts[0], 0, a)?,
+            d_start(s, &mut drafts[1], 1, b)?,
+        ];
+        for &(order, forced) in rounds {
+            let mut rows = [[0; PAIR]; 2];
+            let mut pos0 = [0; 2];
+            for slot in order {
+                s.select_slot(slot)?;
+                pos0[slot] = s.model().pos();
+                rows[slot] = d_propose(s, &mut drafts[slot], runs[slot].last()?)?;
+            }
+            let pass = order.map(|slot| (slot, &rows[slot][..]));
+            let out = s.verify_slots(&pass)?.ids;
+            if out.len() != 2 * PAIR {
+                return Err(
+                    format!("a pass of {} rows read back {} ids", 2 * PAIR, out.len()).into(),
+                );
+            }
+            let mut kept = [0; 2];
+            for (i, slot) in order.into_iter().enumerate() {
+                let got = &out[i * PAIR..(i + 1) * PAIR];
+                let k = forced.map_or_else(|| accepted_rows(&rows[slot], got), |f| f[slot]);
+                drafts[slot].record(pos0[slot], &rows[slot], got, k)?;
+                runs[slot].ids.extend_from_slice(&got[..k]);
+                runs[slot].rounds.push((true, k));
+                kept[i] = k;
+            }
+            s.commit_slots(&kept)?;
+            for slot in order {
+                d_mark(s, slot, &mut runs[slot])?;
+            }
+        }
+        for (slot, (d, r)) in drafts.iter_mut().zip(&mut runs).enumerate() {
+            d_end(s, d, slot, r)?;
+        }
+        Ok(runs)
+    }
+
+    /// Row order 0,1 on even rounds and 1,0 on odd ones.
+    fn h_order(round: usize) -> [usize; 2] {
+        if round.is_multiple_of(2) {
+            [0, 1]
+        } else {
+            [1, 0]
+        }
+    }
+
+    /// Each slot's kept rows a round, "slot 0 [..], slot 1 [..]".
+    fn h_kept(runs: &[DRun; 2]) -> String {
+        let kept = |r: &DRun| r.rounds.iter().map(|&(_, k)| k).collect::<Vec<_>>();
+        format!("slot 0 {:?}, slot 1 {:?}", kept(&runs[0]), kept(&runs[1]))
+    }
+
+    /// (h1) in `mode` (module doc): [`H_ROUNDS`] rounds of both slots as one
+    /// pass, each slot against its solo run `solos[slot]`.
+    fn h1_bits(
+        s: &mut Session<Body>,
+        (a, b): (&[u32], &[u32]),
+        solos: &[DRun; 2],
+        mode: StepMode,
+    ) -> Result<bool, GateError> {
+        s.model_mut().set_mode(mode);
+        let rounds: Vec<_> = (0..H_ROUNDS).map(|r| (h_order(r), None)).collect();
+        let runs = h_pass(s, (a, b), &rounds)?;
+        let mut off = runs[0].off(0, &solos[0]);
+        off.extend(runs[1].off(1, &solos[1]));
+        let whole = runs.iter().zip(solos).all(|(r, w)| r.whole == w.whole);
+        let pass = off.is_empty();
+        println!(
+            "stagger-draft (h1) interleave {mode:?}: {H_ROUNDS} rounds of both slots' {PAIR} rows \
+             as one pass (row order 0,1 then 1,0 in turn), kept {}, then a drafted step each: {}; \
+             the whole stores the solo runs' {whole} {}",
+            h_kept(&runs),
+            if pass {
+                "each slot's ids, kept rows, committed lanes and positions a round, last logits, \
+                 live stores, position and lane its solo run's"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// (h2) (module doc): the forced rounds [`H_FORCED`], then one by the
+    /// rule, against each slot's solo run of the same counts.
+    fn h2_kept(s: &mut Session<Body>, (a, b): (&[u32], &[u32])) -> Result<bool, GateError> {
+        s.model_mut().set_mode(StepMode::Graph);
+        let forced = |slot: usize| -> Vec<Option<usize>> {
+            H_FORCED
+                .iter()
+                .map(|f| Some(f[slot]))
+                .chain([None])
+                .collect()
+        };
+        let solos = [h_solo(s, a, &forced(0))?, h_solo(s, b, &forced(1))?];
+        let rounds: Vec<_> = H_FORCED
+            .iter()
+            .enumerate()
+            .map(|(r, &f)| (h_order(r), Some(f)))
+            .chain([(h_order(H_FORCED.len()), None)])
+            .collect();
+        let runs = h_pass(s, (a, b), &rounds)?;
+        let mut off = Vec::new();
+        for (slot, (run, p)) in runs.iter().zip([a, b]).enumerate() {
+            let mut at = u32::try_from(p.len())?;
+            for (r, &(_, kept)) in run.rounds.iter().enumerate() {
+                at += u32::try_from(kept)?;
+                if run.positions.get(r) != Some(&at) {
+                    off.push(format!(
+                        "slot {slot} at {:?} after round {r}, want {at}",
+                        run.positions.get(r)
+                    ));
+                }
+            }
+            off.extend(run.off(slot, &solos[slot]));
+        }
+        let whole = runs.iter().zip(&solos).all(|(r, w)| r.whole == w.whole);
+        let pass = off.is_empty();
+        println!(
+            "stagger-draft (h2) forced keeps: (slot 0, slot 1) kept {H_FORCED:?} forced, then a \
+             round by the rule, kept {}: {}; the whole stores the solo runs' {whole} {}",
+            h_kept(&runs),
+            if pass {
+                "each slot after every round at its first position plus its kept rows, and its \
+                 ids, kept rows, committed lanes and positions a round, last logits, live stores, \
+                 position and lane its solo run's of the same counts"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Whether `r` is `what`'s shape refusal whose words hold every one of
+    /// `says`.
+    fn refused_saying<T>(r: &Result<T, GpuError>, what: &str, says: &[&str]) -> bool {
+        says.iter().all(|s| refused_by(r, what, s))
+    }
+
+    /// A refusal's text for a line: the error, or that the call ran.
+    fn outcome<T>(r: &Result<T, GpuError>) -> String {
+        match r {
+            Ok(_) => "ran".to_string(),
+            Err(e) => format!("\"{e}\""),
+        }
+    }
+
+    /// An (h3) arm's pass: the model's outcome, inside the arm's own setup's.
+    type HPass = Result<Result<SlotsOut, GpuError>, GateError>;
+
+    /// One (h3) pass that must be refused, both slots prompted afresh and
+    /// their prompts' argmaxes given to `rows`: the pass `run` makes of the
+    /// rows refused by the body with every one of `says` in its words, no
+    /// position moved. A pass that ran is committed whole before the line
+    /// prints, so the arms after it start from no pass waiting.
+    fn h3_case(
+        s: &mut Session<Body>,
+        (a, b): (&[u32], &[u32]),
+        what: &str,
+        rows: impl Fn([u32; 2]) -> Vec<(usize, Vec<u32>)>,
+        run: impl FnOnce(&mut Glm5nextModel, &[(usize, &[u32])]) -> HPass,
+        says: &[&str],
+    ) -> Result<bool, GateError> {
+        let g = g_prompted(s.model_mut(), (a, b))?;
+        let rows = rows([g[0].ids[0], g[1].ids[0]]);
+        let pass: Vec<(usize, &[u32])> = rows.iter().map(|(slot, r)| (*slot, &r[..])).collect();
+        let before = slot_positions(s.model_mut())?;
+        let r = run(s.model_mut(), &pass)?;
+        if r.is_ok() {
+            let whole: Vec<usize> = rows.iter().map(|(_, r)| r.len()).collect();
+            s.model_mut().commit_slots(&whole)?;
+        }
+        let named = refused_saying(&r, GLM_BODY, says);
+        let stood = r.is_err() && slot_positions(s.model_mut())? == before;
+        println!(
+            "stagger-draft (h3) {what}: {}; refused by name {named}, both positions unmoved \
+             {stood} {}",
+            outcome(&r),
+            verdict(named && stood)
+        );
+        Ok(named && stood)
+    }
+
+    /// (h3) (module doc): the drafted pass's refusals, a line an arm.
+    fn h3_refusals(
+        s: &mut Session<Body>,
+        inputs: &PlanInputs,
+        (a, b): (&[u32], &[u32]),
+    ) -> Result<bool, GateError> {
+        s.model_mut().set_mode(StepMode::Graph);
+        let both = |t: [u32; 2]| vec![(0, vec![t[0]; PAIR]), (1, vec![t[1]; PAIR])];
+        let verify =
+            |m: &mut Glm5nextModel, p: &[(usize, &[u32])]| -> HPass { Ok(m.verify_slots(p)) };
+        let mut ok = h3_waiting(s, (a, b))?;
+        ok &= h3_case(
+            s,
+            (a, b),
+            "a pass of slot 0's two rows and slot 1's one",
+            |t| vec![(0, vec![t[0]; PAIR]), (1, vec![t[1]])],
+            verify,
+            &["slot 1's 1 rows in a pass of several slots", "its verify's"],
+        )?;
+        ok &= h3_case(
+            s,
+            (a, b),
+            "a pass of slot 0's three rows and slot 1's one",
+            |t| vec![(0, vec![t[0]; PAIR + 1]), (1, vec![t[1]])],
+            verify,
+            &["slot 0's 3 rows in a pass of several slots", "its verify's"],
+        )?;
+        ok &= h3_kept(s, (a, b))?;
+        ok &= h3_case(
+            s,
+            (a, b),
+            "a pass with the taps armed",
+            both,
+            |m, p| {
+                set_taps(m, true)?;
+                let r = m.verify_slots(p);
+                set_taps(m, false)?;
+                m.set_mode(StepMode::Graph);
+                Ok(r)
+            },
+            &["a pass of several slots with the taps armed"],
+        )?;
+        let dir = std::env::temp_dir().join(format!("gate_glm5next_e2e-h3-{}", std::process::id()));
+        ok &= h3_case(
+            s,
+            (a, b),
+            "a pass with a route trace attached",
+            both,
+            |m, p| {
+                let run = m.body("stagger-draft")?.host_run();
+                let trace = RouteTrace::create(
+                    &dir,
+                    TraceHeader {
+                        model: PathBuf::from(MODEL),
+                        arch: "glm5next".to_owned(),
+                        build: "gate_glm5next_e2e".to_owned(),
+                        n_expert: inputs.hp.n_expert,
+                        n_used: inputs.hp.n_used,
+                        first_layer: run.start,
+                        n_layer: run.len(),
+                        extra: Vec::new(),
+                    },
+                )?;
+                m.body_parts("stagger-draft")?
+                    .2
+                    .hybrid_mut()
+                    .attach_route_trace(trace)?;
+                let r = m.verify_slots(p);
+                drop(
+                    m.body_parts("stagger-draft")?
+                        .2
+                        .hybrid_mut()
+                        .take_route_trace(),
+                );
+                std::fs::remove_dir_all(&dir)?;
+                Ok(r)
+            },
+            &["a pass of several slots with a route trace attached"],
+        )?;
+        ok &= h3_cut(s, (a, b))?;
+        Ok(ok)
+    }
+
+    /// (h3)'s first arm: while a pass of both slots' two rows waits for its
+    /// commit, a step, a select, a prompt call and a cut each refused by
+    /// name, the live slot standing past its rows; the commit of both then
+    /// standing each slot past its rows.
+    fn h3_waiting(s: &mut Session<Body>, (a, b): (&[u32], &[u32])) -> Result<bool, GateError> {
+        let g = g_prompted(s.model_mut(), (a, b))?;
+        let t = [g[0].ids[0], g[1].ids[0]];
+        let before = slot_positions(s.model_mut())?;
+        let ran = s
+            .model_mut()
+            .verify_slots(&[(0, &[t[0]; PAIR][..]), (1, &[t[1]; PAIR][..])]);
+        if let Err(e) = &ran {
+            println!(
+                "stagger-draft (h3) a pass of both slots waiting for its commit: the pass \
+                 itself: \"{e}\" FAIL"
+            );
+            return Ok(false);
+        }
+        let m = s.model_mut();
+        let rows = u32::try_from(PAIR)?;
+        let waits = "waits for its commit";
+        let step = m.step(&[t[0]]);
+        let select = m.select_slot(1);
+        let prompt = feed(m, &[t[0]]);
+        let cut = m.rollback(before[0]);
+        let arms = [
+            (
+                "a step",
+                refused_by(&step, "GpuModel::step", waits),
+                outcome(&step),
+            ),
+            (
+                "a select",
+                refused_by(&select, "GpuModel::select_slot", waits),
+                outcome(&select),
+            ),
+            (
+                "a prompt call",
+                refused_by(&prompt, GLM_BODY, waits),
+                outcome(&prompt),
+            ),
+            (
+                "a cut",
+                refused_by(&cut, "GpuModel::rollback", waits),
+                outcome(&cut),
+            ),
+        ];
+        let live = (m.selected(), m.pos()) == (0, before[0] + rows);
+        m.commit_slots(&[PAIR, PAIR])?;
+        let after = slot_positions(m)? == [before[0] + rows, before[1] + rows];
+        let named = arms.iter().all(|&(_, n, _)| n);
+        let pass = named && live && after;
+        println!(
+            "stagger-draft (h3) a pass of both slots waiting for its commit: {}; slot 0 still \
+             selected, past its rows {live}; the commit of both rows stands each slot past them \
+             {after} {}",
+            arms.iter()
+                .map(|(what, n, o)| format!("{what} {o} refused by name {n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// A slot's side a pass could move: its position, and its draft store's
+    /// held rows and the store read back at them.
+    type DSide = (u32, usize, (Vec<u16>, Vec<u16>));
+
+    /// Slot 0's and slot 1's [`DSide`], slot 1 selected after.
+    fn d_sides(s: &mut Session<Body>) -> Result<[DSide; 2], GateError> {
+        let mut side = |slot: usize| -> Result<DSide, GateError> {
+            s.select_slot(slot)?;
+            let m = s.model_mut();
+            let held = m
+                .body("stagger-draft")?
+                .nextn()
+                .ok_or("the drafted slots' load holds no NextN layer")?
+                .held();
+            Ok((m.pos(), held, nextn_store(m, held)?))
+        };
+        Ok([side(0)?, side(1)?])
+    }
+
+    /// (h3)'s kept-pass arm: both slots started under their own drafts, then
+    /// a pass of both slots' two rows that keeps every row
+    /// (`GpuModel::step_slots`) refused by name — a NextN load's pass is a
+    /// verify, its kept rows the drafts' to name — before anything is
+    /// planned: each slot then selected without a refusal (no lanes left
+    /// waiting), its position and draft store as they stood.
+    fn h3_kept(s: &mut Session<Body>, (a, b): (&[u32], &[u32])) -> Result<bool, GateError> {
+        let mut drafts = [d_open(s)?, d_open(s)?];
+        let t = [
+            d_start(s, &mut drafts[0], 0, a)?.last()?,
+            d_start(s, &mut drafts[1], 1, b)?.last()?,
+        ];
+        let before = d_sides(s)?;
+        s.select_slot(0)?;
+        let m = s.model_mut();
+        let r = m.step_slots(&[(0, &[t[0]; PAIR][..]), (1, &[t[1]; PAIR][..])]);
+        let named = refused_by(&r, GLM_BODY, "a pass of several slots on a NextN load");
+        // From slot 0, selecting 1 then 0 runs two exchanges, each refused
+        // while the live sequence's lanes wait.
+        let selects = [m.select_slot(1), m.select_slot(0)];
+        let selected = selects.iter().all(Result::is_ok);
+        let said = selects.map(|r| r.map_or_else(|e| format!("\"{e}\""), |()| "ok".to_string()));
+        let stood = selected && d_sides(s)? == before;
+        println!(
+            "stagger-draft (h3) a pass of both slots' {PAIR} rows keeping every row \
+             (GpuModel::step_slots): {}; refused by name {named}; slot 1 then slot 0 selected: \
+             {}; both positions and draft stores as they stood {stood} {}",
+            outcome(&r),
+            said.join(", "),
+            verdict(named && selected && stood)
+        );
+        Ok(named && selected && stood)
+    }
+
+    /// (h3)'s last arm: slot 1 cut back to its prompt call's checkpoint and
+    /// left waiting, then a pass of both slots' two rows: the pass carries
+    /// the cut out from slot 1's own checkpoints — both slots' rows, live
+    /// stores and positions after the commit their solo verifies' from the
+    /// same states, slot 1's from the same cut.
+    fn h3_cut(s: &mut Session<Body>, (a, b): (&[u32], &[u32])) -> Result<bool, GateError> {
+        let (&b_last, _) = b.split_last().ok_or("an empty prompt")?;
+        let at = u32::try_from(b.len() - 1)?;
+        let solo = |s: &mut Session<Body>, rows: [u32; PAIR]| -> Result<_, GateError> {
+            let out = s.verify(rows)?;
+            s.commit(accepted_rows(&rows, &out))?;
+            let m = s.model_mut();
+            Ok((out, live_hash(m)?, m.pos()))
+        };
+        s.select_slot(0)?;
+        s.reset()?;
+        let t0 = server_start(s.model_mut(), a)?;
+        let rows = [[t0; PAIR], [b_last; PAIR]];
+        let want0 = solo(s, rows[0])?;
+        s.select_slot(1)?;
+        s.reset()?;
+        server_start(s.model_mut(), b)?;
+        s.model_mut().rollback(at)?;
+        let want1 = solo(s, rows[1])?;
+        let g = g_prompted(s.model_mut(), (a, b))?;
+        s.select_slot(1)?;
+        let kept = s.model().body("stagger-draft")?.kept(at, s.model().pos());
+        s.model_mut().rollback(at)?;
+        let out = s.verify_slots(&[(0, &rows[0][..]), (1, &rows[1][..])])?.ids;
+        let got = |slot: usize| out.get(slot * PAIR..(slot + 1) * PAIR).unwrap_or_default();
+        s.commit_slots(&[
+            accepted_rows(&rows[0], got(0)),
+            accepted_rows(&rows[1], got(1)),
+        ])?;
+        let mut off = Vec::new();
+        for (slot, want) in [want0, want1].iter().enumerate() {
+            s.select_slot(slot)?;
+            let m = s.model_mut();
+            if got(slot) != want.0 {
+                off.push(format!(
+                    "slot {slot}'s rows {:?} (solo {:?})",
+                    got(slot),
+                    want.0
+                ));
+            }
+            if (live_hash(m)?, m.pos()) != (want.1, want.2) {
+                off.push(format!("slot {slot}'s live stores or position"));
+            }
+        }
+        if g[0].ids[0] != t0 {
+            off.push(format!(
+                "slot 0's prompt argmax {} (solo {t0})",
+                g[0].ids[0]
+            ));
+        }
+        let pass = kept.at == at && off.is_empty();
+        println!(
+            "stagger-draft (h3) a cut left waiting on slot 1 alone: cut to {at} (kept({at}) = \
+             {kept}), then a pass of both slots' {PAIR} rows: {} {}",
+            if off.is_empty() {
+                "it carries the cut out from slot 1's own checkpoints: both slots' rows, live \
+                 stores and positions after the commit their solo verifies' from the same states"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// (h4) (module doc): the four-row pass's capture against the verify
+    /// pair's, each replayed after the other's capture.
+    fn h4_walk(s: &mut Session<Body>, (a, b): (&[u32], &[u32])) -> Result<bool, GateError> {
+        s.model_mut().set_mode(StepMode::Graph);
+        let m = s.model_mut();
+        let sa = g_solo(m, a, 4, &[])?;
+        let sb = g_solo(m, b, 2, &[])?;
+        let g = g_prompted(m, (a, b))?;
+        m.select_slot(0)?;
+        let pos = m.pos();
+        let pair_nodes = m.capture_rows::<PAIR>()?;
+        let pass_nodes = m.capture_slots(&[(0, PAIR), (1, PAIR)])?;
+        let verify = match m.step_rows([g[0].ids[0], sa.ids[1]]) {
+            Ok(ids) => ids,
+            Err(e) => {
+                println!(
+                    "stagger-draft (h4) walk: the captured four-row pass holds {pass_nodes} \
+                     nodes, the verify pair {pair_nodes}; the pair replayed after the pass's \
+                     capture: \"{e}\" FAIL"
+                );
+                return Ok(false);
+            }
+        };
+        let verify_logits: Vec<u64> = m
+            .rows_logits::<PAIR>()?
+            .iter()
+            .map(|l| fnv_row(l))
+            .collect();
+        m.rollback(pos + u32::try_from(PAIR)?)?;
+        let recaptured = m.capture_rows::<PAIR>()?;
+        let rows = [[sa.ids[2], sa.ids[3]], [g[1].ids[0], sb.ids[1]]];
+        let replay = match m.verify_slots(&[(0, &rows[0][..]), (1, &rows[1][..])]) {
+            Ok(out) => out,
+            Err(e) => {
+                println!(
+                    "stagger-draft (h4) walk: the pass replayed after the pair's re-capture: \
+                     \"{e}\" FAIL"
+                );
+                return Ok(false);
+            }
+        };
+        let pass_logits: Vec<u64> = m.slots_logits()?.iter().map(|l| fnv_row(l)).collect();
+        m.commit_slots(&[PAIR, PAIR])?;
+        let nodes = pass_nodes == 2 * pair_nodes && recaptured == pair_nodes;
+        let verify_ok = verify[..] == sa.ids[1..3] && verify_logits[..] == sa.logits[1..3];
+        let want = [sa.ids[3], sa.ids[4], sb.ids[1], sb.ids[2]];
+        let pass_ok = replay.ids == want
+            && pass_logits[..] == [sa.logits[3], sa.logits[4], sb.logits[1], sb.logits[2]];
+        let ok = nodes && verify_ok && pass_ok;
+        println!(
+            "stagger-draft (h4) walk: the captured four-row pass holds {pass_nodes} nodes (want \
+             twice the verify pair's {pair_nodes}; the pair again {recaptured}); the pair \
+             replayed after the pass's capture: ids {verify:?} (solo {:?}), logits {verify_ok}; \
+             the pass replayed after the pair's re-capture: ids {:?} (solo {want:?}), logits \
+             {pass_ok} {}",
+            &sa.ids[1..3],
+            replay.ids,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (h1)-(h4) on a load of (sd)'s plan (module doc): each slot's solo run
+    /// first, then the clauses, each from fresh resets of the slots it runs.
+    fn stagger_draft(
+        s: &mut Session<Body>,
+        inputs: &PlanInputs,
+        (a, b): (&[u32], &[u32]),
+    ) -> Result<bool, GateError> {
+        s.model_mut().set_mode(StepMode::Graph);
+        let solos = [
+            h_solo(s, a, &[None; H_ROUNDS])?,
+            h_solo(s, b, &[None; H_ROUNDS])?,
+        ];
+        let mut ok = true;
+        for mode in [StepMode::Graph, StepMode::Eager] {
+            ok &= clause(
+                &format!("(h1) interleave {mode:?}"),
+                h1_bits(s, (a, b), &solos, mode),
+            );
+        }
+        ok &= clause("(h2) forced keeps", h2_kept(s, (a, b)));
+        ok &= clause("(h3) refusals", h3_refusals(s, inputs, (a, b)));
+        ok &= clause("(h4) walk", h4_walk(s, (a, b)));
+        Ok(ok)
+    }
+
     /// Which clauses a run takes.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Only {
-        /// Every clause, on both loads.
+        /// Every clause but (h1)-(h4), on both loads.
         All,
         /// The load at [`CTX`], (pb-long) included.
         Main,
@@ -3320,6 +4097,9 @@ mod gate {
         /// (g1)-(g5) alone, on their two loads at [`SLOT_CTX`] (the NextN
         /// load's (g5) runs with (slots)).
         Stagger,
+        /// (h1)-(h4), on the NextN load at [`SLOT_CTX`]: no other run takes
+        /// them.
+        StaggerDraft,
     }
 
     /// Which of (t)'s step sets the load at [`CTX`] runs.
@@ -3379,7 +4159,8 @@ mod gate {
     }
 
     /// `--only main`, `--only pp`, `--only pplong`, `--only verify`, `--only
-    /// keep`, `--only slots`, `--only stagger`, or every clause.
+    /// keep`, `--only slots`, `--only stagger`, `--only stagger-draft`, or
+    /// every clause.
     fn only() -> Result<Only, GateError> {
         let args: Vec<String> = std::env::args().collect();
         match args.iter().position(|a| a == "--only") {
@@ -3392,8 +4173,10 @@ mod gate {
                 Some("keep") => Ok(Only::Keep),
                 Some("slots") => Ok(Only::Slots),
                 Some("stagger") => Ok(Only::Stagger),
+                Some("stagger-draft") => Ok(Only::StaggerDraft),
                 other => Err(format!(
-                    "--only is main, pp, pplong, verify, keep, slots or stagger, not {other:?}"
+                    "--only is main, pp, pplong, verify, keep, slots, stagger or stagger-draft, \
+                     not {other:?}"
                 )
                 .into()),
             },
@@ -3432,6 +4215,24 @@ mod gate {
             let inputs = PlanInputs::read(&file)?;
             drop(file);
             ok &= stagger(&levers, &inputs, (a, b))?;
+        }
+        if only == Only::StaggerDraft {
+            let prefill = slot_prefill()?;
+            let (a, b, _) = slot_prompts(&prefill);
+            let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let inputs = PlanInputs::read(&file)?;
+            let nextn = NextnInputs::read(&inputs)?;
+            drop(file);
+            let body = GlmSlots {
+                levers: &levers,
+                inputs,
+                nextn,
+                prompts: [a, b],
+            };
+            let mut s = Session::from_model(body.open(SLOTS)?, u32::try_from(SLOT_CTX)?);
+            s.model_mut().set_mode(StepMode::Graph);
+            s.add_slots(SLOTS)?;
+            ok &= stagger_draft(&mut s, &body.inputs, (a, b))?;
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

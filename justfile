@@ -1696,6 +1696,18 @@ gate-glm5next-meta:
 gate-gpu-glm5next-e2e:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e --step-sets short'
 
+# The same gate's drafted slots pass (`--only stagger-draft`, (h1)-(h4)) on a NextN load of its own at SLOT_CTX, its plan
+# counting two slots: each slot's verify rows, two a slot, as one pass of four (`GpuModel::verify_slots` and
+# `commit_slots`) against each slot's drafted run alone, in graph and eager mode; forced kept rows; the refusals while a
+# pass waits for its commit and of the passes a NextN load does not run, a pass that keeps every row
+# (`GpuModel::step_slots`) among them; the captured four-row pass against the verify pair's. The gate's run with no
+# `--only` leaves these clauses out. Loads the whole model once: alone in a batch, and under the big-load lock the V4.1
+# loads take.
+[group('solo')]
+[group('v41-load')]
+gate-gpu-glm5next-stagger:
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features glm5next --release --bin gate_glm5next_e2e && bash tools/gpu-gate.sh gate_glm5next_e2e --only stagger-draft'
+
 # The same gate's long step sets (`--only main --step-sets long`): the load at CTX and its clauses, with the 1,024-position
 # set and the 3,070-position `--dsa` set, the only comparisons with ik past 4 positions and the only end-to-end run past
 # the dense limit. Weekly: `just weekly` runs it, and `just affected` names it when a file its triggers in
