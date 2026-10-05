@@ -398,6 +398,9 @@ pub enum PassKind {
     /// A pass of resident slots' rows: every row kept, rows of different
     /// sequences.
     Slots,
+    /// A drafted pass of resident slots' verify rows: every row counted, a
+    /// slot's rejected rows included, until the machine takes a set of rows.
+    SlotsDrafted,
     /// A prompt call, one pass whose rows are not counted: 0 kept.
     Prompt,
     /// A pass its caller never kept (a failed pass, a verify a reset drops
@@ -417,6 +420,7 @@ impl PassKind {
             PassKind::Step => "step",
             PassKind::Pair => "pair",
             PassKind::Slots => "slots",
+            PassKind::SlotsDrafted => "slots_drafted",
             PassKind::Prompt => "prompt",
             PassKind::Abandoned => "abandoned",
             PassKind::Driver => "driver",

@@ -77,7 +77,7 @@ impl SlotIn {
 
     /// The `j`-th busy slot's record as its embedding reads it: its ids and
     /// its position word.
-    fn io(&self, j: usize, r: &SlotRange) -> Result<Record<'_>, GpuError> {
+    pub(super) fn io(&self, j: usize, r: &SlotRange) -> Result<Record<'_>, GpuError> {
         let at = record_at(j, r);
         let word = size_of::<u32>();
         Ok(Record {
@@ -98,13 +98,13 @@ fn record_at(j: usize, r: &SlotRange) -> usize {
 }
 
 /// One busy slot's windows onto the records.
-struct Record<'a> {
+pub(super) struct Record<'a> {
     ids: Window<'a, u32>,
     pos0: Window<'a, u32>,
 }
 
 impl Record<'_> {
-    fn io(&self) -> Io<'_> {
+    pub(super) fn io(&self) -> Io<'_> {
         Io {
             ids: &self.ids,
             pos0: &self.pos0,

@@ -40,7 +40,8 @@ pub mod words;
 pub use gate::Gated;
 pub use lookup::Lookup;
 pub use speculative::{
-    Draft, NotBuilt, Program, Speculative, TapNeed, Tapped, Width, Widths, Window, program,
+    Draft, NotBuilt, Program, Speculative, TapNeed, Tapped, Width, Widths, Window, accepted_rows,
+    program,
 };
 pub use stop::{NoTokens, Stop, StopReason};
 

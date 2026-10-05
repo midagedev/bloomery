@@ -9,6 +9,15 @@
 //!   each slot's prompt, then a step a slot a round, a select between every
 //!   token, in server order: every slot's ids, last logits (bit for bit),
 //!   state hash ([`SlotsAdapter::state_hash`]) and position its solo run's.
+//! - H2 one pass, for a body that runs several slots' rows as one pass
+//!   ([`SlotRows`], [`Interleaved::one_pass`]): after H1, [`SlotsAdapter::TAIL`]
+//!   passes of one row a slot ([`GpuModel::step_slots`]), the first half
+//!   captured and the rest eager — every slot's ids, last logits, state hash
+//!   and position its solo run's; and the captured pass of one row a slot
+//!   holds exactly the nodes of the pass of as many rows on one slot plus
+//!   each added slot's sequence-bound launches
+//!   ([`PassAdapter::added_slot_launches`]), each count the body's own
+//!   ([`PassAdapter::slots_launches`]).
 //! - H3 bytes: `resident_bytes` grows by exactly `seq_bytes` a slot added,
 //!   and `seq_bytes` equals its derivation from the owners of its terms
 //!   ([`SlotsAdapter::seq_bytes_derived`]) and, where the body's load builds
@@ -22,24 +31,22 @@
 //!   before its first step while slot 0 holds its solo runs', each slot
 //!   some after the interleave — and none after a `set_mode` round trip.
 //!
-//! The harness's next contracts, once the model runs several slots' rows in
-//! one pass (`GpuModel::step_slots`):
-//! - H2: one pass over N slots gives each slot's solo steps bit for bit —
-//!   ids, logits and stores.
-//! - H5: a fault on a slot, or in a pass over a slot set, refuses every
-//!   other slot naming it, and only its own reset lifts it (the adapter's
-//!   fault planter comes with it).
+//! The harness's next contract: H5, a fault on a slot, or in a pass over a
+//! slot set, refuses every other slot naming it, and only its own reset
+//! lifts it (the adapter's fault planter comes with it).
 //!
 //! The order is the gate's: [`interleave`] runs H3, H6, H1 and H7 and hands
-//! back the model with every slot on its solo path ([`Interleaved`]); the
-//! body gate runs its own fact clauses there, moving at most the last slot
-//! off its path and reading any other slot's continuation through
-//! [`Interleaved::continues`]; [`Interleaved::finish`] runs H4 last, since a
-//! reset that reaches past its slot moves the slots those clauses read. A
-//! call that fails inside a contract is that contract's red with the error
-//! printed, so every contract prints its line whatever an earlier one left.
+//! back the model with every slot on its solo path ([`Interleaved`]); a
+//! [`SlotRows`] body's gate runs H2 there ([`Interleaved::one_pass`]), which
+//! keeps every slot on its path; the body gate runs its own fact clauses
+//! there, moving at most the last slot off its path and reading any other
+//! slot's continuation through [`Interleaved::continues`];
+//! [`Interleaved::finish`] runs H4 last, since a reset that reaches past its
+//! slot moves the slots those clauses read. A call that fails inside a
+//! contract is that contract's red with the error printed, so every
+//! contract prints its line whatever an earlier one left.
 
-use bloomery_gpu::model::{ChainBody, StepMode};
+use bloomery_gpu::model::{ChainBody, SlotRows, StepMode};
 use bloomery_gpu::{GpuError, GpuModel, Slots};
 
 use crate::{GateError, bits_equal, verdict};
@@ -48,6 +55,7 @@ use crate::{GateError, bits_equal, verdict};
 pub const STREAMS: usize = 2;
 
 const H1: &str = "slots H1 interleave";
+const H2: &str = "slots H2 one pass";
 const H3: &str = "slots H3 bytes";
 const H4: &str = "slots H4 reset";
 const H6: &str = "slots H6 refusals";
@@ -96,6 +104,23 @@ pub trait SlotsAdapter {
     }
 }
 
+/// What a [`SlotRows`] body's gate hands H2 besides its [`SlotsAdapter`]:
+/// the launch counts of a pass of several slots.
+pub trait PassAdapter: SlotsAdapter<Body: SlotRows> {
+    /// The launches one more busy slot adds to a pass of the same rows,
+    /// derived from the body's layer kinds and the launches each binds to
+    /// one sequence.
+    fn added_slot_launches(&self, m: &GpuModel<Self::Body>) -> Result<Launches, GateError>;
+
+    /// The body's own count of the launches of the captured pass of `key`
+    /// (each `(slot, rows)`, in pass order).
+    fn slots_launches(
+        &self,
+        m: &GpuModel<Self::Body>,
+        key: &[(usize, usize)],
+    ) -> Result<usize, GateError>;
+}
+
 /// A sequence's device bytes as a derivation gives them, and the
 /// derivation's terms in words for H3's line.
 pub struct Derived {
@@ -103,15 +128,38 @@ pub struct Derived {
     pub terms: String,
 }
 
+/// A slot's launches as a derivation gives them, and the derivation's
+/// terms in words for H2's line.
+pub struct Launches {
+    pub n: usize,
+    pub terms: String,
+}
+
 /// One stream's solo run on the load's one sequence: its prompt's argmax
-/// and then `STEPS + 2·TAIL` greedy ids (the interleave's, the body gate's
-/// continuation, H4's), and after the interleave's steps the last logits,
-/// the state hash and the position.
+/// and then `STEPS + 3·TAIL` greedy ids (the interleave's, H2's, the body
+/// gate's continuation, H4's), and after the interleave's steps and after
+/// H2's the last logits, the state hash and the position.
 struct Solo {
     ids: Vec<u32>,
+    at_steps: Read,
+    at_pass: Read,
+}
+
+/// The selected slot's last logits, state hash and position.
+struct Read {
     logits: Vec<f32>,
     hash: u64,
     pos: u32,
+}
+
+impl Read {
+    fn of<A: SlotsAdapter>(a: &A, m: &mut GpuModel<A::Body>) -> Result<Read, GateError> {
+        Ok(Read {
+            logits: m.logits()?,
+            hash: a.state_hash(m)?,
+            pos: m.pos(),
+        })
+    }
 }
 
 /// A slot's stream: its solo run, and the ids the slot has given since its
@@ -247,6 +295,19 @@ where
     }
 }
 
+impl<A, B> Interleaved<'_, A>
+where
+    A: PassAdapter<Body = B>,
+    B: SlotRows<Seq: 'static>,
+{
+    /// H2 (module doc), its verdict folded into [`Interleaved::finish`]'s.
+    /// Every slot stays on its solo path: its rows are its next steps.
+    pub fn one_pass(&mut self) {
+        let arm = one_pass(self.a, &mut self.model, &mut self.streams);
+        self.ok &= check(H2, arm);
+    }
+}
+
 /// A contract's line, `check <name>: <detail> PASS|FAIL`, and its verdict;
 /// a call that failed inside the contract is its red, the error the detail.
 fn check(name: &str, arm: Result<(bool, String), GateError>) -> bool {
@@ -279,13 +340,14 @@ fn solo<A: SlotsAdapter>(
     a.rewind(m)?;
     let mut ids = vec![a.prompt(m, stream)?];
     greedy(m, &mut ids, A::STEPS)?;
-    let (logits, hash, pos) = (m.logits()?, a.state_hash(m)?, m.pos());
+    let at_steps = Read::of(a, m)?;
+    greedy(m, &mut ids, A::TAIL)?;
+    let at_pass = Read::of(a, m)?;
     greedy(m, &mut ids, 2 * A::TAIL)?;
     Ok(Solo {
         ids,
-        logits,
-        hash,
-        pos,
+        at_steps,
+        at_pass,
     })
 }
 
@@ -406,11 +468,12 @@ where
     for (s, (stream, logits)) in streams.iter().zip(&logits).enumerate() {
         m.select_slot(s)?;
         let solo = &stream.solo;
+        let at = &solo.at_steps;
         let parts = [
             ("ids", stream.given[..] == solo.ids[..=A::STEPS]),
-            ("logits", bits_equal(logits, &solo.logits)),
-            ("state", a.state_hash(m)? == solo.hash),
-            ("position", m.pos() == solo.pos),
+            ("logits", bits_equal(logits, &at.logits)),
+            ("state", a.state_hash(m)? == at.hash),
+            ("position", m.pos() == at.pos),
         ];
         off.extend(
             parts
@@ -430,6 +493,104 @@ where
             } else {
                 format!("differs in {}", off.join(", "))
             }
+        ),
+    ))
+}
+
+/// H2: the passes of one row a slot, then the node counts.
+fn one_pass<A, B>(
+    a: &A,
+    m: &mut GpuModel<B>,
+    streams: &mut [Stream],
+) -> Result<(bool, String), GateError>
+where
+    A: PassAdapter<Body = B>,
+    B: SlotRows<Seq: 'static>,
+{
+    let captured = A::TAIL.div_ceil(2);
+    let mut logits = Vec::new();
+    for r in 0..A::TAIL {
+        m.set_mode(if r < captured {
+            StepMode::Graph
+        } else {
+            StepMode::Eager
+        });
+        let lasts = streams
+            .iter()
+            .enumerate()
+            .map(|(s, stream)| {
+                stream
+                    .given
+                    .last()
+                    .map(|&t| [t])
+                    .ok_or_else(|| format!("slot {s} has given no id"))
+            })
+            .collect::<Result<Vec<[u32; 1]>, String>>()?;
+        let rows: Vec<(usize, &[u32])> = lasts.iter().map(|t| &t[..]).enumerate().collect();
+        let out = m.step_slots(&rows)?;
+        if out.ids.len() != streams.len() {
+            return Err(format!(
+                "a pass of one row a slot over {} slots read back {} ids",
+                streams.len(),
+                out.ids.len()
+            )
+            .into());
+        }
+        for (stream, &id) in streams.iter_mut().zip(&out.ids) {
+            stream.given.push(id);
+        }
+        if r + 1 == A::TAIL {
+            logits = m.slots_logits()?;
+        }
+    }
+    m.set_mode(StepMode::Graph);
+    let mut off = Vec::new();
+    for (s, stream) in streams.iter().enumerate() {
+        m.select_slot(s)?;
+        let solo = &stream.solo;
+        let at = &solo.at_pass;
+        let row = logits
+            .get(s)
+            .ok_or_else(|| format!("no logits row for slot {s}"))?;
+        let parts = [
+            ("ids", stream.given[..] == solo.ids[..=A::STEPS + A::TAIL]),
+            ("logits", bits_equal(row, &at.logits)),
+            ("state", a.state_hash(m)? == at.hash),
+            ("position", m.pos() == at.pos),
+        ];
+        off.extend(
+            parts
+                .into_iter()
+                .filter(|&(_, same)| !same)
+                .map(|(part, _)| format!("slot {s} {part}")),
+        );
+    }
+    let one = [(0, streams.len())];
+    let each: Vec<(usize, usize)> = (0..streams.len()).map(|s| (s, 1)).collect();
+    let (n_one, n_each) = (m.capture_slots(&one)?, m.capture_slots(&each)?);
+    let (own_one, own_each) = (a.slots_launches(m, &one)?, a.slots_launches(m, &each)?);
+    let derived = a.added_slot_launches(m)?;
+    let added = i128::try_from(n_each)? - i128::try_from(n_one)?;
+    let want = i128::try_from((streams.len() - 1) * derived.n)?;
+    let nodes_ok = added == want && n_one == own_one && n_each == own_each;
+    let same = off.is_empty();
+    Ok((
+        same && nodes_ok,
+        format!(
+            "{} passes of one row a slot ({captured} captured, the rest eager) against each \
+             stream's solo run: {}; the pass of one row a slot holds {n_each} nodes and the pass \
+             of {} rows on slot 0 {n_one}, {added} added for {} added slot(s), derived {} a slot \
+             ({}), the body's own counts {own_each} and {own_one}",
+            A::TAIL,
+            if same {
+                "every slot's ids, last logits, state hash and position bit for bit".to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            streams.len(),
+            streams.len() - 1,
+            derived.n,
+            derived.terms,
         ),
     ))
 }

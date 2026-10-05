@@ -141,6 +141,19 @@
 //!   windows diverge from position 0 on (the deep prompt read past the
 //!   set's own whole length), so no per-sequence state the two share by
 //!   content can pass for one the slots exchanged.
+//! - (z) the same two windows' drafted passes run as one pass of both slots'
+//!   verify rows (`app::mtp::pass_slots`, `Session::verify_slots` and
+//!   `commit_slots`), each window's draft its own and capped at depth 1 (a
+//!   pass of 4 rows) and at depth 3 (8 rows): each slot's ids, each pass's
+//!   kept rows, its draft's windows (the proposals, their probabilities and
+//!   acceptances) and its draft store equal its window run alone on the
+//!   load's own sequence before any slot exists through the session's
+//!   verify of one sequence, its proposals capped alike (`Capped`); at least
+//!   one pass at each depth keeps fewer rows than it ran, and one keeps
+//!   different counts on the two slots (else the clause is red: the per-slot
+//!   keep never ran apart); and while a pass of slot 1's rows alone waits
+//!   for its commit a select of slot 1 is refused by name by the model, the
+//!   selection and the positions kept.
 //!
 //! (l) and (h) hold at least one row each off a flip: a run that excuses
 //! every row as a flip fails.
@@ -3066,9 +3079,9 @@ mod gate {
     }
 
     /// One drafted pass from `out`'s last id, its kept ids appended.
-    fn one_pass(
+    fn one_pass<D: Draft<app::Session<Body38>>>(
         s: &mut app::Session<Body38>,
-        spec: &mut Spec38,
+        spec: &mut runtime::Speculative<D, 4>,
         out: &mut Vec<u32>,
     ) -> Result<Committed, GateError> {
         let last = *out.last().ok_or("no token")?;
@@ -3152,6 +3165,14 @@ mod gate {
             let run = drive(&mut s, &mut spec, b, ROUNDS)?;
             (run.0, run.1, slot_store(&s)?)
         };
+        // (z)'s references, as alone as (y)'s.
+        let mut capped = Vec::with_capacity(DEPTHS.len());
+        for depth in DEPTHS {
+            capped.push([
+                capped_run(&mut s, a, depth, ROUNDS)?,
+                capped_run(&mut s, b, depth, ROUNDS)?,
+            ]);
+        }
         s.model_mut().add_slots(2)?;
         // Together, in the server's order: slot 0's prompt call and first
         // plain step run together, then slot 1's, then the drafted passes
@@ -3193,7 +3214,304 @@ mod gate {
             verdict(stores_ok),
             verdict(ids_ok && passes_ok && stores_ok)
         );
-        Ok(ids_ok && passes_ok && stores_ok)
+        let mut z_ok = true;
+        for (depth, refs) in DEPTHS.into_iter().zip(&capped) {
+            z_ok &= z_red(
+                &format!("depth {depth}"),
+                one_pass_windows(&mut s, [a, b], depth, ROUNDS, refs),
+            );
+        }
+        z_ok &= z_red("waiting", waiting_select(&mut s));
+        Ok(ids_ok && passes_ok && stores_ok && z_ok)
+    }
+
+    // ------------------------------------------- (z) two slots in one pass
+
+    /// A (z) arm's verdict: a call that failed inside it is its red, the
+    /// error printed on its line.
+    fn z_red(arm: &str, r: Result<bool, GateError>) -> bool {
+        r.unwrap_or_else(|e| {
+            println!("(z) {arm}: a call failed: {e} {}", verdict(false));
+            false
+        })
+    }
+
+    /// (z)'s proposal caps: the default shape's 2 rows a slot
+    /// (`app::mtp::SLOT_DEPTH`), and 4, the widest pass of two slots.
+    const DEPTHS: [usize; 2] = [app::mtp::SLOT_DEPTH, 3];
+
+    /// The MTP draft with each proposal capped to `depth` ids, as a pass of
+    /// several slots' caller caps each slot's window by the room it hands
+    /// the draft: (z)'s reference, verified through the session's verify of
+    /// one sequence.
+    struct Capped {
+        d: app::mtp::MtpDraft<Body38>,
+        depth: usize,
+    }
+
+    impl Draft<app::Session<Body38>> for Capped {
+        const WIDTH: usize = <app::mtp::MtpDraft<Body38> as Draft<app::Session<Body38>>>::WIDTH;
+        const TAPS: TapNeed = TapNeed::Final;
+
+        fn prompt(
+            &mut self,
+            t: &mut app::Session<Body38>,
+            ids: &[u32],
+        ) -> Result<u32, app::SessionError> {
+            Draft::prompt(&mut self.d, t, ids)
+        }
+
+        fn begin(
+            &mut self,
+            t: &app::Session<Body38>,
+            prompt: &[u32],
+            first: u32,
+        ) -> Result<(), app::SessionError> {
+            Draft::begin(&mut self.d, t, prompt, first)
+        }
+
+        fn propose(
+            &mut self,
+            t: &mut app::Session<Body38>,
+            last: u32,
+            out: &mut [u32],
+        ) -> Result<usize, app::SessionError> {
+            let room = self.depth.min(out.len());
+            Draft::propose(&mut self.d, t, last, &mut out[..room])
+        }
+
+        fn accept(
+            &mut self,
+            t: &mut app::Session<Body38>,
+            rows: &[u32],
+            out: &[u32],
+            accepted: usize,
+        ) -> Result<(), app::SessionError> {
+            Draft::accept(&mut self.d, t, rows, out, accepted)
+        }
+
+        fn stepped(
+            &mut self,
+            t: &mut app::Session<Body38>,
+            last: u32,
+            next: u32,
+        ) -> Result<(), app::SessionError> {
+            Draft::stepped(&mut self.d, t, last, next)
+        }
+
+        fn held(
+            &mut self,
+            t: &mut app::Session<Body38>,
+            last: u32,
+            next: u32,
+        ) -> Result<(), app::SessionError> {
+            Draft::held(&mut self.d, t, last, next)
+        }
+    }
+
+    /// One drafted window's run: its ids (the prompt's argmax, the first
+    /// plain step's, then every pass's kept ids), every pass's kept rows,
+    /// the windows its draft kept and its draft store.
+    #[derive(PartialEq)]
+    struct Drafted {
+        ids: Vec<u32>,
+        passes: Vec<Committed>,
+        windows: Vec<app::mtp::WindowDraft>,
+        store: (Vec<u16>, Vec<u16>),
+    }
+
+    /// A fresh draft of the drafted session's, keeping its windows.
+    fn fresh_draft(s: &app::Session<Body38>) -> Result<app::mtp::MtpDraft<Body38>, GateError> {
+        let mut d = app::mtp::MtpDraft::open(
+            s.model(),
+            Prompt38::Auto,
+            bloomery_gpu::model::StepMode::Graph,
+        )?;
+        d.keep_windows();
+        Ok(d)
+    }
+
+    /// A request's start on the selected slot from its reset, as
+    /// [`begin_request`] runs it, through `d`: the prompt call, then the
+    /// first plain step.
+    fn start(
+        s: &mut app::Session<Body38>,
+        d: &mut app::mtp::MtpDraft<Body38>,
+        ids: &[u32],
+    ) -> Result<Vec<u32>, GateError> {
+        s.reset()?;
+        let first = Draft::prompt(d, s, ids)?;
+        d.before_step(s, first)?;
+        let next = Target::step(s, first, Want::Argmax)?.argmax();
+        Draft::stepped(d, s, first, next)?;
+        Ok(vec![first, next])
+    }
+
+    /// Window `ids` alone on the selected slot, `rounds` drafted passes of
+    /// proposals capped to `depth` ([`Capped`]), each verified through the
+    /// session's verify of one sequence.
+    fn capped_run(
+        s: &mut app::Session<Body38>,
+        ids: &[u32],
+        depth: usize,
+        rounds: usize,
+    ) -> Result<Drafted, GateError> {
+        let mut d = fresh_draft(s)?;
+        let mut out = start(s, &mut d, ids)?;
+        let mut spec = runtime::Speculative::<Capped, 4>::new(Capped { d, depth });
+        let mut passes = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            passes.push(one_pass(s, &mut spec, &mut out)?);
+        }
+        Ok(Drafted {
+            ids: out,
+            passes,
+            windows: spec.draft_mut().d.take_windows(),
+            store: slot_store(s)?,
+        })
+    }
+
+    /// (z) at `depth`: each window's request started alone on its own slot
+    /// (slot 0 window A, slot 1 window B, in the server's order), then
+    /// `rounds` passes of both slots' drafted rows in one pass
+    /// ([`app::mtp::pass_slots`]), each slot's draft its own; against
+    /// `refs`, each window's [`capped_run`].
+    fn one_pass_windows(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+        depth: usize,
+        rounds: usize,
+        refs: &[Drafted; 2],
+    ) -> Result<bool, GateError> {
+        let mut drafts = [fresh_draft(s)?, fresh_draft(s)?];
+        let mut outs = [Vec::new(), Vec::new()];
+        for (slot, ((d, out), ids)) in drafts.iter_mut().zip(&mut outs).zip(windows).enumerate() {
+            s.select_slot(slot)?;
+            *out = start(s, d, ids)?;
+        }
+        let mut passes = [Vec::new(), Vec::new()];
+        let (mut rejected, mut apart) = (0usize, 0usize);
+        for _ in 0..rounds {
+            let [d0, d1] = &mut drafts;
+            let [o0, o1] = &mut outs;
+            let (l0, l1) = (
+                *o0.last().ok_or("slot 0 gave no id")?,
+                *o1.last().ok_or("slot 1 gave no id")?,
+            );
+            let mut w = [
+                app::mtp::SlotWindow {
+                    slot: 0,
+                    draft: d0,
+                    last: l0,
+                    depth,
+                    out: o0,
+                },
+                app::mtp::SlotWindow {
+                    slot: 1,
+                    draft: d1,
+                    last: l1,
+                    depth,
+                    out: o1,
+                },
+            ];
+            let done = app::mtp::pass_slots(s, &mut w)?;
+            let [c0, c1] = <[Committed; 2]>::try_from(done)
+                .map_err(|d| format!("a pass of 2 slots committed {} slots", d.len()))?;
+            rejected += usize::from(c0.kept < c0.rows) + usize::from(c1.kept < c1.rows);
+            apart += usize::from(c0.kept != c1.kept);
+            passes[0].push(c0);
+            passes[1].push(c1);
+        }
+        let mut off = Vec::new();
+        for (slot, (((d, out), passes), r)) in drafts
+            .iter_mut()
+            .zip(outs)
+            .zip(passes)
+            .zip(refs)
+            .enumerate()
+        {
+            s.select_slot(slot)?;
+            let got = Drafted {
+                ids: out,
+                passes,
+                windows: d.take_windows(),
+                store: slot_store(s)?,
+            };
+            let parts = [
+                ("ids", got.ids == r.ids),
+                ("kept rows", got.passes == r.passes),
+                ("draft windows", got.windows == r.windows),
+                ("draft store", got.store == r.store),
+            ];
+            off.extend(
+                parts
+                    .into_iter()
+                    .filter(|&(_, same)| !same)
+                    .map(|(part, _)| format!("slot {slot} {part}")),
+            );
+        }
+        let same = off.is_empty();
+        let ok = same && rejected > 0 && apart > 0;
+        println!(
+            "(z) two slots in one pass at depth {depth} (a pass of {} rows): {rounds} passes; \
+             {}; {rejected} slot passes kept fewer rows than they ran, {apart} passes kept \
+             different counts on the two slots {}",
+            2 * (depth + 1),
+            if same {
+                "each slot's ids, kept rows, draft windows and draft store its window's alone \
+                 run's"
+                    .to_string()
+            } else {
+                format!("differs in {}", off.join(", "))
+            },
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// (z)'s refusal: a pass of slot 1's verify rows alone waiting for its
+    /// commit — slot 0 selected and holding no verify of its own, so only
+    /// the model's own check stands between a select and the waiting slot —
+    /// a select of slot 1 is refused by name by the model, slot 0 still
+    /// selected and both positions kept; the commit then keeps row 0.
+    fn waiting_select(s: &mut app::Session<Body38>) -> Result<bool, GateError> {
+        let pos = |s: &mut app::Session<Body38>| -> Result<[u32; 2], GateError> {
+            let mut p = [0; 2];
+            for (slot, p) in p.iter_mut().enumerate() {
+                s.select_slot(slot)?;
+                *p = s.model().pos();
+            }
+            Ok(p)
+        };
+        let before = pos(s)?;
+        s.verify_slots(&[(1, &[0, 0])])?;
+        let waiting = (s.model().selected(), pos_live(s));
+        let named = match s.model_mut().select_slot(1) {
+            Err(bloomery_gpu::GpuError::Shape { what, detail }) => {
+                what == "GpuModel::select_slot" && detail.contains("waits for its commit")
+            }
+            _ => false,
+        };
+        let kept = (s.model().selected(), pos_live(s)) == waiting && waiting == (0, before[0]);
+        // A select that went through moved the waiting slot live: no commit
+        // of the pass can stand after it, so the clause ends red here.
+        let moved = named && kept && {
+            s.commit_slots(&[1])?;
+            pos(s)? == [before[0], before[1] + 1]
+        };
+        let ok = named && kept && moved;
+        println!(
+            "(z) waiting: a select of slot 1 while a pass of its verify rows waits for its \
+             commit named by the model {named}, slot 0 still selected at its position {kept}; \
+             the commit of one row moved slot 1 one position {moved} {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// The selected slot's position.
+    fn pos_live(s: &app::Session<Body38>) -> u32 {
+        s.model().pos()
     }
 
     pub(super) fn run() -> Result<(), GateError> {

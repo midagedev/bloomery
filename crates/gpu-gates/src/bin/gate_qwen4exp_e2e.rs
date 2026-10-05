@@ -187,8 +187,9 @@
 //! - (y) resident slots: a load made with a plan of two sequences
 //!   (`PlanInputs::plan_with_slots` — its per-load sequence terms counted
 //!   twice, and at one slot the plan every other clause loads by) answers
-//!   the slot harness's contracts (`slots_gate`: H1 interleave, H3 bytes, H4
-//!   reset, H6 refusals, H7 captures), stream 0 window A (four ids) by the
+//!   the slot harness's contracts (`slots_gate`: H1 interleave, H2 one pass,
+//!   H3 bytes, H4 reset, H6 refusals, H7 captures), stream 0 window A (four
+//!   ids) by the
 //!   pass path and stream 1 window B (D1K's prefill) by the ubatch path, its
 //!   state hash every per-sequence store, the PLE ring and the lane word,
 //!   `seq_bytes`' derivation the stores, the lane word and the two arena-row
@@ -236,7 +237,7 @@ mod gate {
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::rounding::q8_32_rel;
-    use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
+    use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_tensor_logical_in,
         topk_ids_logical_within, verdict,
@@ -318,6 +319,18 @@ mod gate {
     const NODES_VERIFY: usize = 1235;
 
     const _: () = assert!(NODES_VERIFY == NODES_DECODE + N_GDN * 2 + N_QSA);
+
+    /// PIN(2026-10-05): the nodes one more busy slot adds to a captured pass
+    /// of several slots' rows, derived before the pass was built: the
+    /// launches bound to one sequence — the embedding row, the PLE site's
+    /// conv on layer 1, each delta layer's conv and delta step, each
+    /// selecting layer's 8 (the indexer key's projection, its append and the
+    /// pool, the selection's two, the q/k norm, turn and append, the
+    /// selected flash's two) — and the copy of a parked slot's rows into its
+    /// own: 1 + 1 + 36·2 + 12·8 + 1.
+    const NODES_SLOT: usize = 171;
+
+    const _: () = assert!(NODES_SLOT == 1 + 1 + N_GDN * 2 + N_QSA * 8 + 1);
 
     /// PIN(2026-09-29): the layers the gate card's card plan puts routed
     /// experts on, derived before the leg was built: the 48 less the five
@@ -3307,6 +3320,27 @@ mod gate {
         }
     }
 
+    impl PassAdapter for Slots38<'_> {
+        /// [`NODES_SLOT`].
+        fn added_slot_launches(&self, _m: &Qwen38Model) -> Result<Launches, GateError> {
+            Ok(Launches {
+                n: NODES_SLOT,
+                terms: format!(
+                    "the embedding 1 + the PLE conv 1 + {N_GDN} delta layers' 2 + {N_QSA} \
+                     selecting layers' 8 + the parked rows' copy 1"
+                ),
+            })
+        }
+
+        fn slots_launches(
+            &self,
+            m: &Qwen38Model,
+            key: &[(usize, usize)],
+        ) -> Result<usize, GateError> {
+            Ok(m.body("slots")?.slots_launches(key))
+        }
+    }
+
     /// (y) the plan's slot count against the owners of the per-sequence
     /// bytes (module doc): the plan of two grows the card's kv class by
     /// exactly the bytes one sequence holds — its stores and PLE ring
@@ -3376,6 +3410,7 @@ mod gate {
         // slots_gate H1/H3; H4/H6/H7 (reset, select, captures) are new to (y),
         // the harness's for every body.
         let mut s = slots_gate::interleave(&body)?;
+        s.one_pass();
         // A third sequence past the plan is refused by name.
         let past = match s.model().add_slots(3) {
             Err(e) => e.to_string().contains("of a plan that counts 2 slots"),

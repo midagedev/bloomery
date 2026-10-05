@@ -62,9 +62,9 @@
 
 use std::fmt;
 
-use bloomery_gpu::model::{Rollback, Rows, StepMode};
+use bloomery_gpu::model::{Rollback, Rows, SlotRows, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
-use runtime::{Draft, TapNeed, Target};
+use runtime::{Draft, TapNeed, Target, accepted_rows};
 
 use crate::{Keep, Prompt, Session, SessionError};
 
@@ -438,6 +438,58 @@ impl<B: MtpBody> MtpDraft<B> {
         }
     }
 
+    /// Whether the draft proposes nothing until the next prompt call from
+    /// position 0 or a restart ([`Join::skipped`] names why).
+    #[must_use]
+    pub fn skipping(&self) -> bool {
+        self.skip.is_some()
+    }
+
+    /// The next refresh recorded for a verify of `rows` that ran from
+    /// position `p0` and read back `out`, keeping its first `accepted` rows,
+    /// before the commit takes the rest back: the kept rows at the positions
+    /// after the verify's first, each with the hidden row the verify's row
+    /// before it wrote ([`MtpBody::VERIFY_ARENA`]), the last row the target's
+    /// own next token. What [`Draft::accept`] records, `p0` given by the
+    /// caller that ran the verify.
+    pub fn record(
+        &mut self,
+        p0: u32,
+        rows: &[u32],
+        out: &[u32],
+        accepted: usize,
+    ) -> Result<(), SessionError> {
+        let last = accepted
+            .checked_sub(1)
+            .and_then(|k| out.get(k))
+            .copied()
+            .ok_or_else(|| {
+                SessionError::Refused(format!(
+                    "{WHAT}: a verify that kept {accepted} rows read back no argmax"
+                ))
+            })?;
+        self.next = Some(Refresh {
+            tokens: rows[1..accepted].iter().copied().chain([last]).collect(),
+            pos0: p0 + 1,
+            walk: B::VERIFY_ARENA,
+            first: 0,
+        });
+        if let Some(w) = &mut self.windows {
+            let (ids, p) = w.pending.take().ok_or_else(|| {
+                SessionError::Refused(format!(
+                    "{WHAT}: an accept of a window whose proposal the draft did not keep"
+                ))
+            })?;
+            w.kept.push(WindowDraft {
+                pos: p0,
+                ids,
+                p,
+                accepted: accepted - 1,
+            });
+        }
+        Ok(())
+    }
+
     /// What the draft holds of the target's sequence between two calls, for
     /// the caller's sequence state ([`MtpDraft::unpark`] puts it back): the
     /// rows waiting for its next walk when they sit in the step's or the
@@ -597,6 +649,123 @@ impl<B: MtpBody> MtpDraft<B> {
     }
 }
 
+/// The proposal depth a caller gives each slot's window of a pass of two
+/// slots ([`SlotWindow::depth`]) unless it chooses another: two rows a slot,
+/// a pass of four rows, the shape the cost model prices first at two slots.
+/// The depth is the caller's data, given a window at a time.
+pub const SLOT_DEPTH: usize = 1;
+
+/// One busy slot's drafted window in a pass of several slots
+/// ([`pass_slots`]): the slot, its own draft (the window's state for that
+/// slot's sequence: each slot holds one), the token at its position, the
+/// most ids its proposal holds, and where its kept ids are appended.
+pub struct SlotWindow<'a, B: MtpBody> {
+    pub slot: usize,
+    pub draft: &'a mut MtpDraft<B>,
+    pub last: u32,
+    pub depth: usize,
+    pub out: &'a mut Vec<u32>,
+}
+
+/// One drafted round of several slots in one pass of the target, each
+/// window's in turn as [`runtime::Speculative`]'s pass runs it for one
+/// sequence, the verifies of every window run together:
+/// - each window's slot selected and its draft's proposal made, at most its
+///   `depth` ids ([`Draft::propose`] into that much room);
+/// - every window's rows — the token at its slot's position, then the
+///   proposal — run as one pass ([`Session::verify_slots`]), each row bit
+///   for bit its step;
+/// - each window's kept rows by the runtime's rule (row 0, then while the
+///   argmax is the next proposed id), recorded by its draft from the
+///   position its rows ran from ([`MtpDraft::record`]) before the commit of
+///   every window's kept rows together ([`Session::commit_slots`]);
+/// - each window's kept ids appended to its `out`.
+///
+/// Each slot's proposals, kept rows and ids are bit for bit its own window
+/// run alone: its verify rows are its steps, and its draft walks its own
+/// store over the hidden rows its own rows left. The session stands with
+/// slot 0 selected. A draft that proposes nothing is one that skips (an
+/// [`MtpDraft`] proposes at least one id otherwise): its row is a plain step
+/// the draft is told nothing of, as its [`Draft::stepped`] would do nothing.
+/// Refused by name: a depth of 0, a draft that proposes nothing while it
+/// drafts, and one that moves its slot's position.
+pub fn pass_slots<B>(
+    t: &mut Session<B>,
+    windows: &mut [SlotWindow<'_, B>],
+) -> Result<Vec<runtime::Committed>, SessionError>
+where
+    B: MtpBody + SlotRows,
+    B::Seq: 'static,
+{
+    let mut rows: Vec<Vec<u32>> = Vec::with_capacity(windows.len());
+    let mut firsts = Vec::with_capacity(windows.len());
+    for w in windows.iter_mut() {
+        if w.depth == 0 {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: slot {}'s window of depth 0 (a plain row is a pass of no draft)",
+                w.slot
+            )));
+        }
+        t.select_slot(w.slot)?;
+        let pos = t.pos();
+        let mut ids = vec![w.last; 1 + w.depth.min(B::WIDTH)];
+        let n = Draft::propose(w.draft, t, w.last, &mut ids[1..])?;
+        if t.pos() != pos {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: slot {}'s proposal moved the target from position {pos} to {}",
+                w.slot,
+                t.pos()
+            )));
+        }
+        if n == 0 && !w.draft.skipping() {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: slot {}'s draft proposed nothing while it drafts",
+                w.slot
+            )));
+        }
+        ids.truncate(1 + n);
+        rows.push(ids);
+        firsts.push(pos);
+    }
+    let pass: Vec<(usize, &[u32])> = windows
+        .iter()
+        .zip(&rows)
+        .map(|(w, r)| (w.slot, &r[..]))
+        .collect();
+    let argmax = t.verify_slots(&pass)?.ids;
+    let mut kept = Vec::with_capacity(windows.len());
+    let mut at = 0;
+    for ((w, r), &p0) in windows.iter_mut().zip(&rows).zip(&firsts) {
+        let got = argmax.get(at..at + r.len()).ok_or_else(|| {
+            SessionError::Refused(format!(
+                "{WHAT}: a pass of {} rows read back {} ids",
+                at + r.len(),
+                argmax.len()
+            ))
+        })?;
+        let k = accepted_rows(r, got);
+        if r.len() > 1 {
+            w.draft.record(p0, r, got, k)?;
+        }
+        kept.push(k);
+        at += r.len();
+    }
+    t.commit_slots(&kept)?;
+    let mut done = Vec::with_capacity(windows.len());
+    let mut at = 0;
+    for (((w, r), &k), &p0) in windows.iter_mut().zip(&rows).zip(&kept).zip(&firsts) {
+        w.out.extend_from_slice(&argmax[at..at + k]);
+        at += r.len();
+        done.push(runtime::Committed {
+            pos: p0,
+            kept: k,
+            rows: r.len(),
+            proposed: r.len() > 1,
+        });
+    }
+    Ok(done)
+}
+
 impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// The most ids a proposal holds: the body's [`MtpBody::WIDTH`].
     const WIDTH: usize = B::WIDTH;
@@ -705,7 +874,9 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
 
     /// One chain, one readback (the module doc): the recorded refresh's
     /// walk — its last row the target's own next token, whose prediction is
-    /// the first proposal — then own walks while the context holds them.
+    /// the first proposal — then own walks while the context holds them and
+    /// the proposal fits `out`: at most `out.len()` ids, so a caller caps a
+    /// window's depth by the room it hands. No room is refused by name.
     fn propose(
         &mut self,
         t: &mut Session<B>,
@@ -733,7 +904,13 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
                 here + 1
             )));
         }
-        let own = (Self::WIDTH - 1).min(t.ctx() as usize - end);
+        let room = out.len().min(Self::WIDTH);
+        if room == 0 {
+            return Err(SessionError::Refused(format!(
+                "{WHAT}: a proposal into no room"
+            )));
+        }
+        let own = (room - 1).min(t.ctx() as usize - end);
         let Some(w) = &mut self.windows else {
             return Ok(B::chain(
                 t.model_mut(),
@@ -759,9 +936,8 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     }
 
     /// The next refresh recorded before the commit takes the rejected rows
-    /// back: the kept rows at the positions after the verify's first, each
-    /// with the hidden row the verify's row before it wrote
-    /// ([`MtpBody::VERIFY_ARENA`]), the last row the target's own next token.
+    /// back ([`MtpDraft::record`]), the verify's first position the one its
+    /// rows stood the target past.
     fn accept(
         &mut self,
         t: &mut Session<B>,
@@ -769,32 +945,7 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
         out: &[u32],
         accepted: usize,
     ) -> Result<(), SessionError> {
-        let p0 = t.pos() - rows.len() as u32;
-        let last = out.get(accepted - 1).copied().ok_or_else(|| {
-            SessionError::Refused(format!(
-                "{WHAT}: a verify that kept {accepted} rows read back no argmax"
-            ))
-        })?;
-        self.next = Some(Refresh {
-            tokens: rows[1..accepted].iter().copied().chain([last]).collect(),
-            pos0: p0 + 1,
-            walk: B::VERIFY_ARENA,
-            first: 0,
-        });
-        if let Some(w) = &mut self.windows {
-            let (ids, p) = w.pending.take().ok_or_else(|| {
-                SessionError::Refused(format!(
-                    "{WHAT}: an accept of a window whose proposal the draft did not keep"
-                ))
-            })?;
-            w.kept.push(WindowDraft {
-                pos: p0,
-                ids,
-                p,
-                accepted: accepted - 1,
-            });
-        }
-        Ok(())
+        self.record(t.pos() - rows.len() as u32, rows, out, accepted)
     }
 
     /// A plain step on `last`: the rows that waited for the next chain —

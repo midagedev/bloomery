@@ -103,14 +103,15 @@ use super::mtp38::{
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
-    Ctx38, Kernels38, Parts38, Pass38, STEP_MEMOPS, Step38, Verify38, step_launches,
-    verify_launches,
+    Ctx38, Kernels38, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38, Step38, Verify38,
+    seq_launches, step_launches, verify_launches,
 };
 use super::scratch::{Io, LANE, RecStore, RopeRows, StepParams, f32_view};
 use super::scratch38::{
     Arena38, LANES, LaneWord, PASS_ROWS, PassRecord, Store38, Taps38, VERIFY_ROWS, WideRecord,
     dims, kept_lane, store_rule_bytes,
 };
+use super::slot_pass::SlotIn;
 use super::swap38::{DEADLINE, LIVE_DELAY, Qwen38Stacks};
 use super::tier38::{TierSide38, open_tier};
 use super::ubatch::UBATCH as UBATCH_MOST;
@@ -129,7 +130,9 @@ use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::tier::TierOpen;
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
-use crate::model::{ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, Slots};
+use crate::model::{
+    ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRows, Slots,
+};
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::tensor::WindowMut;
@@ -195,19 +198,23 @@ impl Seq38 {
 
 /// One Qwen3.8 sequence's resident state ([`Slots`], what a select
 /// exchanges): the per-layer stores, the PLE ring with the hash's history
-/// and its points, the committed lane word, the checkpoints, the positions
-/// the stores hold and where the last call left its rows — and, on a load
-/// with the draft ([`DraftSeq38`]), the draft's store with the captures
-/// that address it and its own record of the positions it holds. The
-/// step's and the pass's final-stream rows travel with it too: a draft
-/// walk reads the rows its sequence's last target walk left in the shared
-/// arenas, so each sequence holds its own and the arenas address whichever
-/// is live — the same rule a slot's own captures follow, each slot's
-/// graphs addressing the buffers that were live at their capture.
+/// and its points, the committed lane word, the verify waiting for its
+/// commit (a pass of several slots leaves one in each of its slots), the
+/// checkpoints, the positions the stores hold and where the last call left
+/// its rows — and, on a load with the draft ([`DraftSeq38`]), the draft's
+/// store with the captures that address it and its own record of the
+/// positions it holds. The step's and the pass's final-stream rows travel
+/// with it too: a draft walk reads the rows its sequence's last target walk
+/// left in the shared arenas, so each sequence holds its own and the arenas
+/// address whichever is live — the same rule a slot's own captures follow,
+/// each slot's graphs addressing the buffers that were live at their
+/// capture. A pass of several slots leaves a parked slot's rows in its own
+/// buffer by a copy ([`RowsCopy`]).
 pub struct Slot38 {
     stores: Vec<Store38>,
     ple_ring: DeviceBuffer<f32>,
     lane: LaneWord,
+    pending: Option<Pending38>,
     ckpt: Checkpoints,
     ple_points: Vec<(u32, History)>,
     ple_hist: History,
@@ -665,6 +672,9 @@ pub struct Body38 {
     /// sequence past the plan is refused by name.
     slots_planned: usize,
     slots_made: usize,
+    /// A pass of several slots' input records, on a load planned for more
+    /// than one sequence.
+    slot_in: Option<SlotIn>,
     /// The arena the last planned call walked (a step's, a pass's or a
     /// verify's the step arena or the pass arena, a ubatch's its own): where
     /// its rows' final streams sit for a caller that reads them back
@@ -1141,6 +1151,10 @@ impl Body38 {
                 ),
             ));
         }
+        // A load planned for several sequences runs a pass of their rows
+        // through the step port's columns, up to the pass arena's rows; a
+        // load for one sequence the verify's.
+        let cols = if planned > 1 { PASS_ROWS } else { VERIFY_ROWS };
         let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
@@ -1149,7 +1163,7 @@ impl Body38 {
                 n_used: geo::N_USED,
             },
             1,
-            VERIFY_ROWS,
+            cols,
         )?;
         let widths = HostWidths {
             embd: geo::HIDDEN,
@@ -1248,6 +1262,7 @@ impl Body38 {
             staged: None,
             slots_planned: planned,
             slots_made: 1,
+            slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,
             last_walk: TargetRows::Step,
             wrote: Wrote38::default(),
             plant: None,
@@ -2325,10 +2340,12 @@ impl Body38 {
                     ctx: *ctx,
                 },
                 plans,
-                stores,
-                ple_ring,
+                seqs: Seqs38::One {
+                    stores,
+                    ple_ring,
+                    io: &io,
+                },
                 s: a,
-                io: &io,
                 m,
                 cur: 0,
                 taps: None,
@@ -3286,10 +3303,12 @@ impl ChainBody for Body38 {
                     ctx: *ctx,
                 },
                 plans,
-                stores,
-                ple_ring,
+                seqs: Seqs38::One {
+                    stores,
+                    ple_ring,
+                    io: &io,
+                },
                 s,
-                io: &io,
                 m: 1,
                 cur: 0,
                 taps: taps.as_mut(),
@@ -3385,6 +3404,7 @@ impl ChainBody for Body38 {
             + self.card.bytes()
             + self.tier.as_ref().map_or(0, TierSide38::bytes)
             + self.lane.bytes()
+            + self.slot_in.as_ref().map_or(0, SlotIn::bytes)
             + self.hybrid.boundary().device_bytes()
             + self.taps.as_ref().map_or(0, Taps38::bytes)
             + self
@@ -3460,6 +3480,7 @@ impl Slots for Body38 {
             stores,
             ple_ring: DeviceBuffer::zeroed(stream, ple::ring_len(geo::STREAMS))?,
             lane: LaneWord::new(stream)?,
+            pending: None,
             ckpt: Checkpoints::new(gpu.context(), lens, HOST_BUDGET, CHECKPOINT_EVERY)?,
             ple_points: Vec::new(),
             ple_hist,
@@ -3475,12 +3496,12 @@ impl Slots for Body38 {
         Ok(seq)
     }
 
-    /// Exchange the live sequence with `seq`: pointer moves only — every
-    /// per-sequence piece is a buffer handle or a host value the body holds
-    /// by value, so nothing is copied, captured or synchronized, and each
-    /// slot's captures keep addressing its own buffers. Refused by name,
-    /// moving nothing, while a call is staged or a verify waits for its
-    /// commit: the staged call's launches are the live sequence's alone.
+    /// Exchange the live sequence with `seq` ([`Body38::exchange`]):
+    /// pointer moves only, so nothing is copied, captured or synchronized,
+    /// and each slot's captures keep addressing its own buffers. Refused by
+    /// name, moving nothing, while a call is staged or the live sequence's
+    /// verify waits for its commit: the staged call's launches are the live
+    /// sequence's alone, and the commit is the live sequence's call.
     fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Slot38) -> Result<(), GpuError> {
         const WHAT_W: &str = "qwen4exp Body38::swap_seq";
         if let Some(s) = &self.staged {
@@ -3510,9 +3531,36 @@ impl Slots for Body38 {
                  each carry one)",
             ));
         }
+        self.exchange(seq);
+        Ok(())
+    }
+
+    /// Device bytes one sequence holds: its stores and PLE ring, its lane
+    /// word, its two arena-row buffers and the draft's store on a load with
+    /// one — the same terms [`seq38_bytes`] counts a host park's read of
+    /// them by.
+    fn seq_bytes(&self) -> usize {
+        let arenas = [&self.s, &self.a, &self.wa];
+        self.stores.iter().map(Store38::bytes).sum::<usize>()
+            + self.ple_ring.num_bytes()
+            + self.lane.bytes()
+            + final_streams(&self.plans, arenas, TargetRows::Step).num_bytes()
+            + final_streams(&self.plans, arenas, TargetRows::Pass).num_bytes()
+            + self.mtp.as_ref().map_or(0, Mtp38::seq_bytes)
+    }
+}
+
+impl Body38 {
+    /// Exchange every per-sequence piece of the live sequence with `seq`'s:
+    /// pointer moves only — each is a buffer handle or a host value the body
+    /// holds by value. [`Slots::swap_seq`]'s exchange after its refusals,
+    /// and the one a pass of several slots plans and commits a parked slot
+    /// through (in and back out, the call on it between).
+    fn exchange(&mut self, seq: &mut Slot38) {
         std::mem::swap(&mut self.stores, &mut seq.stores);
         std::mem::swap(&mut self.ple_ring, &mut seq.ple_ring);
         std::mem::swap(&mut self.lane, &mut seq.lane);
+        std::mem::swap(&mut self.pending, &mut seq.pending);
         std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
         std::mem::swap(&mut self.ple_points, &mut seq.ple_points);
         std::mem::swap(&mut self.ple.hist, &mut seq.ple_hist);
@@ -3533,25 +3581,12 @@ impl Slots for Body38 {
             final_streams_mut(plans, pass, TargetRows::Pass),
             &mut seq.rows_pass,
         );
-        // Checked above: both sides carry a draft or neither does.
+        // Both sides carry a draft or neither does: `new_seq` makes a
+        // sequence's draft side by the load's, and `swap_seq` refuses a
+        // mix.
         if let (Some(d), Some(s)) = (&mut self.mtp, &mut seq.draft) {
             d.swap_slot(s);
         }
-        Ok(())
-    }
-
-    /// Device bytes one sequence holds: its stores and PLE ring, its lane
-    /// word, its two arena-row buffers and the draft's store on a load with
-    /// one — the same terms [`seq38_bytes`] counts a host park's read of
-    /// them by.
-    fn seq_bytes(&self) -> usize {
-        let arenas = [&self.s, &self.a, &self.wa];
-        self.stores.iter().map(Store38::bytes).sum::<usize>()
-            + self.ple_ring.num_bytes()
-            + self.lane.bytes()
-            + final_streams(&self.plans, arenas, TargetRows::Step).num_bytes()
-            + final_streams(&self.plans, arenas, TargetRows::Pass).num_bytes()
-            + self.mtp.as_ref().map_or(0, Mtp38::seq_bytes)
     }
 }
 
@@ -3693,10 +3728,12 @@ impl Body38 {
                     ctx: *ctx,
                 },
                 plans,
-                stores,
-                ple_ring,
+                seqs: Seqs38::One {
+                    stores,
+                    ple_ring,
+                    io: &io,
+                },
                 s: a,
-                io: &io,
                 m,
                 cur: 0,
                 taps: None,
@@ -3706,6 +3743,7 @@ impl Body38 {
                 each: true,
             },
             head,
+            copies: Vec::new(),
         };
         let mut leg = StepLeg::new(gpu.stream(), hybrid);
         prog.walk(&mut leg)?;
@@ -3900,6 +3938,429 @@ impl Rollback for Body38 {
     fn rollback_on(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
         self.commit(gpu, pos)
     }
+}
+
+/// A pass of several resident slots' rows (`GpuModel::step_slots`): every
+/// busy slot's rows walked as one verify of all of them (`Verify38` over
+/// [`Seqs38::Slots`]) — the row-wise launches once over every row, each
+/// slot's sequence-bound launches over its own rows and stores, each the
+/// launch that slot's rows would run alone — into one head of every row.
+/// Each slot is left as a verify of its rows leaves the live sequence:
+/// its stores past its rows and its verify waiting for its commit
+/// ([`Body38::keep_slot`]).
+impl Body38 {
+    /// Plan the pass of `rows` (the busy slots' ranges in pass order, slot
+    /// 0 first when it is busy) over `ids` (every row's token), `parked`
+    /// every busy slot's sequence but slot 0's — the live one — in `rows`
+    /// order. Refused by name before anything moves: ranges that do not
+    /// tile the pass from row 0, slot 0 busy and not first, a parked count
+    /// other than the ranges past slot 0, a load planned for one sequence,
+    /// a load with an expert tier card, the layer taps armed, a route trace
+    /// attached, more rows than the step port's columns, a slot map with a
+    /// routed expert on a tier card ([`MapCheck::refuse`]), and for each
+    /// slot on its own sequence a row count outside `1..=LANES`, a position
+    /// other than its stores' or past them, a verify waiting, an id the
+    /// embedding or the PLE hash does not take. Then each slot's call, on
+    /// its sequence: its waiting cut settled, its PLE rows read into its
+    /// rows of the pass arena, the call launched as a verify of its rows
+    /// ([`Body38::launch`]) — and the slots' input records written.
+    pub(super) fn plan_slots(
+        &mut self,
+        stream: &CudaStream,
+        parked: &mut [&mut Slot38],
+        rows: &[SlotRange],
+        ids: &[u32],
+    ) -> Result<(), GpuError> {
+        let total = slot_rows(rows, parked.len())?;
+        if self.slot_in.is_none() {
+            return Err(GpuError::shape(
+                WHAT_SLOTS,
+                "a pass of several slots on a load planned for one sequence",
+            ));
+        }
+        if self.tier.is_some() {
+            return Err(GpuError::shape(
+                WHAT_SLOTS,
+                "a pass of several slots on a load with an expert tier card",
+            ));
+        }
+        if self.taps.is_some() {
+            return Err(GpuError::state(
+                WHAT_SLOTS,
+                "layer taps off (a pass of several slots writes none)",
+            ));
+        }
+        if self.hybrid.route_traced() {
+            return Err(GpuError::shape(
+                WHAT_SLOTS,
+                "a pass of several slots with a route trace attached: the trace records one \
+                 sequence's positions",
+            ));
+        }
+        let cols = self.hybrid.boundary().layout().cols();
+        if total > cols {
+            return Err(GpuError::shape(
+                WHAT_SLOTS,
+                format!("{total} rows in one pass; the load's step port takes {cols} columns"),
+            ));
+        }
+        self.card_leg.refuse(Walk38::Verify)?;
+        for_slots(self, parked, rows, |b, r| {
+            b.check_slot(r, slot_ids(ids, r)?)
+        })?;
+        planted(&mut self.plant, Plant::BeforeLaunch)?;
+        for_slots(self, parked, rows, |b, r| {
+            b.launch_slot(stream, r, slot_ids(ids, r)?)
+        })?;
+        self.slot_in
+            .as_mut()
+            .ok_or(GpuError::state(WHAT_SLOTS, "the slots' input records"))?
+            .write(stream, rows, ids)
+    }
+
+    /// Refused by name unless the live sequence takes a verify of slot
+    /// `r.slot`'s `tokens` from `r.pos0` as one slot of a pass: `1..=LANES`
+    /// rows (each keeps its state in a lane of its own), from where its
+    /// stores stand, no verify waiting, ids the embedding and the PLE hash
+    /// take.
+    fn check_slot(&self, r: &SlotRange, tokens: &[u32]) -> Result<(), GpuError> {
+        let named = |e: GpuError| GpuError::shape(WHAT_SLOTS, format!("slot {}: {e}", r.slot));
+        let m = tokens.len();
+        if !(1..=LANES).contains(&m) {
+            return Err(GpuError::shape(
+                WHAT_SLOTS,
+                format!(
+                    "slot {}'s {m} rows; a slot's rows each keep their state in a lane of their \
+                     own: 1..={LANES}",
+                    r.slot
+                ),
+            ));
+        }
+        self.check_next(r.pos0, m).map_err(named)?;
+        super::refuse_past_vocab(WHAT_SLOTS, tokens, self.vocab).map_err(named)?;
+        ple_takes(WHAT_SLOTS, self.ple.hash.window(), tokens).map_err(named)
+    }
+
+    /// The live sequence's call as slot `r.slot` of a pass: its waiting cut
+    /// settled, the PLE rows of `tokens` read and copied into rows `r.rows`
+    /// of the pass arena, and the call launched as a verify of its rows,
+    /// waiting for its commit.
+    fn launch_slot(
+        &mut self,
+        stream: &CudaStream,
+        r: &SlotRange,
+        tokens: &[u32],
+    ) -> Result<(), GpuError> {
+        let (m, h) = (tokens.len(), geo::HIDDEN);
+        self.settle(stream)?;
+        let hist = self.ple.fill(r.pos0, tokens)?;
+        self.last_walk = TargetRows::Pass;
+        let byte = r.rows.start * h * size_of::<f32>();
+        WindowMut::<f32>::of_mut(&mut self.a.ple.e, byte, m * h)?
+            .copy_from_host(stream, &self.ple.e[..m * h])?;
+        self.stage(r.pos0, m, hist, Some(tokens.to_vec()))?;
+        self.launch(r.pos0, m)
+    }
+
+    /// Enqueue the pass of `rows` [`Body38::plan_slots`] planned into
+    /// `head`, one head of every row, `parked` as there. An eager pass
+    /// needs each slot's plan; a capture records the launches only.
+    pub(super) fn enqueue_slots(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        head: &mut Head,
+        parked: &mut [&mut Slot38],
+        rows: &[SlotRange],
+    ) -> Result<(), GpuError> {
+        let total = slot_rows(rows, parked.len())?;
+        if !crate::capturing(gpu.stream())? {
+            for_slots(self, parked, rows, |b, r| {
+                let planned = b
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.pos0 == r.pos0 && p.tokens.len() == r.rows.len());
+                if planned {
+                    Ok(())
+                } else {
+                    Err(GpuError::state(
+                        WHAT_SLOTS,
+                        "each slot's rows planned (plan_slots before the pass)",
+                    ))
+                }
+            })?;
+        }
+        let Body38 {
+            hybrid,
+            plans,
+            stores,
+            ple_ring,
+            lane,
+            rope,
+            a,
+            k,
+            slots,
+            card,
+            tier,
+            eps,
+            ctx,
+            plant,
+            slot_in,
+            ..
+        } = self;
+        let ins = slot_in
+            .as_ref()
+            .ok_or(GpuError::state(WHAT_SLOTS, "the slots' input records"))?;
+        let recs = rows
+            .iter()
+            .enumerate()
+            .map(|(j, r)| ins.io(j, r))
+            .collect::<Result<Vec<_>, GpuError>>()?;
+        let mut live = Some((stores.as_mut_slice(), ple_ring, &*lane));
+        let mut others = parked.iter_mut();
+        let mut seqs = Vec::with_capacity(rows.len());
+        let mut copies = Vec::new();
+        for (r, rec) in rows.iter().zip(&recs) {
+            let (stores, ple_ring, lane) = if r.slot == 0 {
+                live.take().ok_or_else(|| slot_twice(r))?
+            } else {
+                let Slot38 {
+                    stores,
+                    ple_ring,
+                    lane,
+                    rows_pass,
+                    ..
+                } = &mut **others.next().ok_or_else(|| no_parked(r))?;
+                copies.push(RowsCopy {
+                    rows: r.rows.clone(),
+                    to: rows_pass,
+                });
+                (stores.as_mut_slice(), ple_ring, &*lane)
+            };
+            seqs.push(SlotSeq38 {
+                stores,
+                ple_ring,
+                io: Io {
+                    lane: Some(lane.word()),
+                    ..rec.io()
+                },
+                rows: r.rows.clone(),
+            });
+        }
+        let prog = Verify38 {
+            p: Parts38 {
+                c: Ctx38 {
+                    gpu,
+                    w,
+                    k,
+                    eps: *eps,
+                    table: &rope.table,
+                    ctx: *ctx,
+                },
+                plans,
+                seqs: Seqs38::Slots(seqs),
+                s: a,
+                m: total,
+                cur: 0,
+                taps: None,
+                slots,
+                card,
+                tier: tier.as_mut(),
+                each: true,
+            },
+            head,
+            copies,
+        };
+        let mut leg = StepLeg::new(gpu.stream(), hybrid);
+        prog.walk(&mut leg)?;
+        planted_eager(plant, gpu)
+    }
+
+    /// The pass's slot keeps its rows below position `at`: the commit of
+    /// its waiting verify ([`Body38::commit`]: the lane word to the last
+    /// kept row's lane, the PLE history replayed over the kept rows, the
+    /// held count and the draft's records cut), on `seq` — a parked slot's
+    /// sequence, exchanged in and back out — or on the live sequence.
+    pub(super) fn keep_slot(
+        &mut self,
+        gpu: &Gpu,
+        seq: Option<&mut Slot38>,
+        at: u32,
+    ) -> Result<(), GpuError> {
+        on_seq(self, seq, |b| b.commit(gpu, at))
+    }
+
+    /// The captured pass of several slots' launches for the slots and row
+    /// counts of `key` (each `(slot, rows)`, in pass order): the verify's
+    /// at every row of the pass, each slot past the first's
+    /// sequence-bound launches ([`super::program38`]'s `seq_launches`), and
+    /// the copy of each parked slot's rows.
+    #[must_use]
+    pub fn slots_launches(&self, key: &[(usize, usize)]) -> usize {
+        let rows = key.iter().map(|&(_, m)| m).sum();
+        self.verify_launches(rows)
+            + key.len().saturating_sub(1) * seq_launches(&self.plans)
+            + key.iter().filter(|&&(slot, _)| slot != 0).count()
+    }
+}
+
+impl SlotRows for Body38 {
+    /// The pass arena's rows, which a load planned for several sequences
+    /// widens the step port to ([`Body38::plan_slots`] refuses past the
+    /// port's columns).
+    const MAX_ROWS: usize = PASS_ROWS;
+    const HEADS: RowHeads = RowHeads::One;
+
+    /// One row of the pass's columns through the step port: the step's
+    /// chain at one row.
+    fn chain_of(rows: &[SlotRange]) -> Chain {
+        match rows.last().map_or(0, |r| r.rows.end) {
+            1 => Chain::Step,
+            m => Chain::Cols(m),
+        }
+    }
+
+    fn plan_slots(
+        &mut self,
+        stream: &CudaStream,
+        parked: &mut [&mut Slot38],
+        rows: &[SlotRange],
+        ids: &[u32],
+    ) -> Result<(), GpuError> {
+        Body38::plan_slots(self, stream, parked, rows, ids)
+    }
+
+    /// The pass into `heads[0]`, a head of its rows; any other heads are
+    /// refused by name.
+    fn enqueue_slots(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        heads: &mut [Head],
+        parked: &mut [&mut Slot38],
+        rows: &[SlotRange],
+    ) -> Result<(), GpuError> {
+        match heads {
+            [head] => Body38::enqueue_slots(self, gpu, w, head, parked, rows),
+            _ => Err(GpuError::shape(
+                WHAT_SLOTS,
+                format!(
+                    "{} heads; a pass of several slots runs into one head of its rows",
+                    heads.len()
+                ),
+            )),
+        }
+    }
+
+    /// The commit of the slot's waiting verify at its first position past
+    /// the kept rows ([`Body38::keep_slot`]).
+    fn keep_slot(
+        &mut self,
+        gpu: &Gpu,
+        seq: Option<&mut Slot38>,
+        r: &SlotRange,
+        kept: usize,
+    ) -> Result<(), GpuError> {
+        let at = r.pos0 + launch_u32(WHAT_SLOTS, "kept rows", kept)?;
+        Body38::keep_slot(self, gpu, seq, at)
+    }
+}
+
+/// What a pass of several slots' refusals name.
+const WHAT_SLOTS: &str = "qwen4exp slots";
+
+/// The pass's rows `R`, once `rows` tile `0..R` in order from row 0 with
+/// no empty range, slot 0 — when busy — first, and `parked` counts the
+/// ranges past slot 0; else refused by name.
+fn slot_rows(rows: &[SlotRange], parked: usize) -> Result<usize, GpuError> {
+    let mut at = 0;
+    for (i, r) in rows.iter().enumerate() {
+        if r.rows.start != at || r.rows.is_empty() {
+            return Err(GpuError::shape(
+                WHAT_SLOTS,
+                format!(
+                    "slot {}'s rows {:?}; the ranges tile the pass in order from row 0",
+                    r.slot, r.rows
+                ),
+            ));
+        }
+        if r.slot == 0 && i != 0 {
+            return Err(GpuError::shape(
+                WHAT_SLOTS,
+                "slot 0's rows past another slot's: slot 0's own rows hold its rows from row 0, \
+                 so a pass that runs slot 0 lays its rows first",
+            ));
+        }
+        at = r.rows.end;
+    }
+    let others = rows.iter().filter(|r| r.slot != 0).count();
+    if at == 0 || parked != others {
+        return Err(GpuError::shape(
+            WHAT_SLOTS,
+            format!(
+                "a pass of {at} rows with {parked} parked sequences for {others} slots past slot 0"
+            ),
+        ));
+    }
+    Ok(at)
+}
+
+/// Slot `r.slot`'s ids of the pass's `ids`.
+fn slot_ids<'i>(ids: &'i [u32], r: &SlotRange) -> Result<&'i [u32], GpuError> {
+    ids.get(r.rows.clone()).ok_or_else(|| {
+        GpuError::shape(
+            WHAT_SLOTS,
+            format!("slot {}'s rows {:?} of {} ids", r.slot, r.rows, ids.len()),
+        )
+    })
+}
+
+/// Slot 0 named twice in one pass, refused.
+fn slot_twice(r: &SlotRange) -> GpuError {
+    GpuError::shape(WHAT_SLOTS, format!("slot {} twice in one pass", r.slot))
+}
+
+/// A busy slot past slot 0 with no parked sequence handed for it, refused.
+fn no_parked(r: &SlotRange) -> GpuError {
+    GpuError::shape(WHAT_SLOTS, format!("slot {}'s parked sequence", r.slot))
+}
+
+/// `f` on `b` with `seq` live — exchanged in and back out
+/// ([`Body38::exchange`]) — or with the live sequence when `None`.
+fn on_seq<T>(
+    b: &mut Body38,
+    seq: Option<&mut Slot38>,
+    f: impl FnOnce(&mut Body38) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    match seq {
+        None => f(b),
+        Some(seq) => {
+            b.exchange(seq);
+            let r = f(b);
+            b.exchange(seq);
+            r
+        }
+    }
+}
+
+/// `f` on `b` for each range of `rows` in order, with that slot's sequence
+/// live ([`on_seq`]): slot 0's the live one, every other slot's the next
+/// of `parked`.
+fn for_slots(
+    b: &mut Body38,
+    parked: &mut [&mut Slot38],
+    rows: &[SlotRange],
+    mut f: impl FnMut(&mut Body38, &SlotRange) -> Result<(), GpuError>,
+) -> Result<(), GpuError> {
+    let mut others = parked.iter_mut();
+    for r in rows {
+        let seq = match r.slot {
+            0 => None,
+            _ => Some(&mut **others.next().ok_or_else(|| no_parked(r))?),
+        };
+        on_seq(b, seq, |b| f(b, r))?;
+    }
+    Ok(())
 }
 
 const _: () = assert!(GDN.n_v == geo::V_HEADS);

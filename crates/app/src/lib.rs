@@ -325,6 +325,7 @@ impl<B: Open> Loaded<B> {
             ctx,
             slots: 1,
             rows: None,
+            slots_waiting: None,
             logits: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
@@ -351,6 +352,9 @@ pub struct Session<B: ChainBody> {
     /// knows them.
     slots: usize,
     rows: Option<RowsInFlight>,
+    /// The slots of a pass of several slots' verify rows waiting for their
+    /// commit ([`Session::verify_slots`]).
+    slots_waiting: Option<usize>,
     /// The last logits row read back ([`Want::Logits`]).
     logits: Vec<f32>,
     /// The last tapped rows read back ([`Tapped::taps`]).
@@ -369,6 +373,7 @@ impl<B: ChainBody> Session<B> {
             ctx,
             slots: 1,
             rows: None,
+            slots_waiting: None,
             logits: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
@@ -395,6 +400,7 @@ impl<B: ChainBody> Session<B> {
         let one = self.slots == 1;
         self.model.reset()?;
         self.rows = None;
+        self.slots_waiting = None;
         self.logits.clear();
         self.tapped.clear();
         self.cleared = if one {
@@ -452,14 +458,19 @@ impl<B: ChainBody> Session<B> {
         &mut self.model
     }
 
-    /// Refused while a verify's rows wait for their commit.
+    /// Refused while a verify's rows, or a pass of several slots' verify
+    /// rows, wait for their commit.
     fn idle(&self, what: &str) -> Result<(), SessionError> {
-        match self.rows {
-            Some(r) => Err(SessionError::Refused(format!(
+        match (self.rows, self.slots_waiting) {
+            (Some(r), _) => Err(SessionError::Refused(format!(
                 "{what}: the verify of {} rows from position {} waits for its commit",
                 r.m, r.first
             ))),
-            None => Ok(()),
+            (None, Some(n)) => Err(SessionError::Refused(format!(
+                "{what}: the pass of {n} slots' verify rows waits for its commit \
+                 (Session::commit_slots)"
+            ))),
+            (None, None) => Ok(()),
         }
     }
 
@@ -536,6 +547,33 @@ where
         self.idle("step_slots")?;
         Ok(self.model.step_slots(rows)?)
     }
+
+    /// One pass of several slots' verify rows ([`GpuModel::verify_slots`]):
+    /// each row's greedy next token, each slot standing past its rows and
+    /// waiting for [`Session::commit_slots`], which every other call waits
+    /// for (refused by name until then). The pass leaves slot 0 selected.
+    pub fn verify_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, SessionError> {
+        self.idle("verify_slots")?;
+        let out = self.model.verify_slots(rows)?;
+        self.slots_waiting = Some(rows.len());
+        Ok(out)
+    }
+
+    /// Keep each slot's first `kept[i]` rows of the pass waiting for its
+    /// commit, in the pass's order ([`GpuModel::commit_slots`]). Refused by
+    /// name with no pass waiting; a count the model refuses leaves the pass
+    /// waiting.
+    pub fn commit_slots(&mut self, kept: &[usize]) -> Result<(), SessionError> {
+        if self.slots_waiting.is_none() {
+            return Err(SessionError::Refused(format!(
+                "a commit of {} slots' rows with no pass of slots waiting",
+                kept.len()
+            )));
+        }
+        self.model.commit_slots(kept)?;
+        self.slots_waiting = None;
+        Ok(())
+    }
 }
 
 impl<B: Prompt + Keep> Target for Session<B> {
@@ -584,6 +622,7 @@ impl<B: Prompt + Keep> Target for Session<B> {
 
     fn reset(&mut self) -> Result<(), SessionError> {
         self.rows = None;
+        self.slots_waiting = None;
         Ok(self.model.reset()?)
     }
 }

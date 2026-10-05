@@ -49,7 +49,7 @@
 
 use super::body::ATTN_SCALE_256;
 use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
-use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, geo, head_site};
+use super::plan38::{GDN, GdnPlan, HcSite, Layer38, Mixer38, PlePlan, QsaPlan, geo, head_site};
 use super::proj::ProjKernels;
 use super::router::gated;
 use super::scratch::{Io, f32_view};
@@ -75,13 +75,14 @@ use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::q38::{
     CardSharedAddArgs, EmbedQ8Args, KeyAppendArgs, OutGateArgs, Q38Kernels, SharedAddArgs,
 };
-use crate::qsa::{PoolArgs, QsaKernels, SelectArgs};
+use crate::qsa::{PoolArgs, QsaKernels, QsaScratch, SelectArgs};
 use crate::rope_neox::{PartialNeoxArgs, RopeNeoxKernels};
-use crate::tensor::DeviceTensor;
+use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
+use std::ops::Range;
 
 /// What the walks' errors name.
 const WHAT: &str = "qwen4exp program";
@@ -322,17 +323,15 @@ impl Ctx38<'_> {
     }
 }
 
-/// The parts of the body one walk writes: the plans, the stores, the PLE
-/// ring, the arena, the unit's input record, its width, the stream buffer
-/// the next site reads, the layer taps when a gate armed them, the slot
-/// map's card copy and the card leg.
+/// The parts of the body one walk writes: the plans, the sequences its
+/// unit binds ([`Seqs38`]), the arena, its width, the stream buffer the
+/// next site reads, the layer taps when a gate armed them, the slot map's
+/// card copy and the card leg.
 pub(super) struct Parts38<'a> {
     pub(super) c: Ctx38<'a>,
     pub(super) plans: &'a [Layer38],
-    pub(super) stores: &'a mut [Store38],
-    pub(super) ple_ring: &'a mut DeviceBuffer<f32>,
+    pub(super) seqs: Seqs38<'a>,
     pub(super) s: &'a mut Arena38,
-    pub(super) io: &'a Io<'a>,
     pub(super) m: usize,
     pub(super) cur: usize,
     pub(super) taps: Option<&'a mut Taps38>,
@@ -344,6 +343,120 @@ pub(super) struct Parts38<'a> {
     /// (`linear::delta`'s `gdn_delta_lanes`); else the last row's back into
     /// the committed lane.
     pub(super) each: bool,
+}
+
+/// The sequences a walk's unit binds: one over every row of the unit — the
+/// step's, a verify's, a pass's — its stores and input record handed to the
+/// launches whole; or several, each over its own rows of the unit (a pass of
+/// several slots), each sequence-bound launch run once a sequence over its
+/// rows' windows and its own stores.
+pub(super) enum Seqs38<'a> {
+    One {
+        stores: &'a mut [Store38],
+        ple_ring: &'a mut DeviceBuffer<f32>,
+        io: &'a Io<'a>,
+    },
+    Slots(Vec<SlotSeq38<'a>>),
+}
+
+/// One busy slot of a pass of several: its stores, its PLE ring, its input
+/// record (its first position, its ids and its lane word) and the rows of
+/// the pass it holds.
+pub(super) struct SlotSeq38<'a> {
+    pub(super) stores: &'a mut [Store38],
+    pub(super) ple_ring: &'a mut DeviceBuffer<f32>,
+    pub(super) io: Io<'a>,
+    pub(super) rows: Range<usize>,
+}
+
+/// The launches one more sequence's rows add to a pass: its embedding,
+/// the PLE site's conv, each delta layer's [`GDN_SEQ_LAUNCHES`] and each
+/// selecting layer's [`QSA_SEQ_LAUNCHES`] — every launch that binds a
+/// sequence's stores or its input record.
+pub(super) fn seq_launches(plans: &[Layer38]) -> usize {
+    1 + plans
+        .iter()
+        .map(|p| {
+            let mixer = match p.mixer {
+                Mixer38::Gdn(_) => GDN_SEQ_LAUNCHES,
+                Mixer38::Qsa(_) => QSA_SEQ_LAUNCHES,
+            };
+            mixer + usize::from(p.ple.is_some())
+        })
+        .sum::<usize>()
+}
+
+/// A delta layer's launches bound to a sequence: the conv over its ring and
+/// the delta step over its state, stamps and lane word.
+pub(super) const GDN_SEQ_LAUNCHES: usize = 2;
+/// A selecting layer's launches bound to a sequence: the indexer key's
+/// projection (its rows row-major, so a sequence's own), its append and the
+/// pool; the selection's two; the q/k norm, turn and append; the selected
+/// flash's two.
+pub(super) const QSA_SEQ_LAUNCHES: usize = 1 + 1 + 1 + 2 + 1 + 2;
+
+/// Rows `r` of `parent`, `width` values a row, shared.
+fn rows_of<'b, T>(
+    parent: &'b DeviceBuffer<T>,
+    r: &Range<usize>,
+    width: usize,
+) -> Result<Window<'b, T>, GpuError> {
+    Window::of(parent, r.start * width * size_of::<T>(), r.len() * width)
+}
+
+/// Rows `r` of `parent`, `width` values a row, to write through.
+fn rows_mut<'b, T>(
+    parent: &'b mut DeviceBuffer<T>,
+    r: &Range<usize>,
+    width: usize,
+) -> Result<WindowMut<'b, T>, GpuError> {
+    WindowMut::of_mut(parent, r.start * width * size_of::<T>(), r.len() * width)
+}
+
+/// Layer `l`'s delta store of `stores`: its state, ring and stamps.
+fn rec_of(
+    stores: &mut [Store38],
+    l: usize,
+) -> Result<(&mut super::scratch::RecStore, &mut DeviceBuffer<u32>), GpuError> {
+    match stores.get_mut(l) {
+        Some(Store38::Rec { rec, stamp }) => Ok((rec, stamp)),
+        Some(Store38::Qsa { .. }) => Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}'s plan and store are of two kinds"),
+        )),
+        None => Err(GpuError::state(WHAT, "a store for every layer")),
+    }
+}
+
+/// Layer `l`'s selecting store of `stores`: its K/V planes, raw and pooled
+/// keys.
+fn qsa_of(
+    stores: &mut [Store38],
+    l: usize,
+) -> Result<
+    (
+        &mut super::scratch::KvPlanes,
+        &mut DeviceBuffer<u16>,
+        &mut DeviceBuffer<u16>,
+    ),
+    GpuError,
+> {
+    match stores.get_mut(l) {
+        Some(Store38::Qsa { kv, raw, pooled }) => Ok((kv, raw, pooled)),
+        Some(Store38::Rec { .. }) => Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}'s plan and store are of two kinds"),
+        )),
+        None => Err(GpuError::state(WHAT, "a store for every layer")),
+    }
+}
+
+/// The lane word of a record, which every chain with delta layers carries.
+fn lane_of<'b>(io: &Io<'b>) -> Result<&'b DeviceBuffer<u32>, GpuError> {
+    io.lane.ok_or(GpuError::state(
+        WHAT,
+        "the record's lane word (a chain with delta layers carries one)",
+    ))
 }
 
 /// Layer `l`'s plan.
@@ -373,7 +486,8 @@ fn tap(
 impl Parts38<'_> {
     /// Layer `l`'s front up to its feed-forward site: the embedding in front
     /// of layer 0, the attention site (with the PLE site on its layer), the
-    /// mixer into `y` (module doc).
+    /// mixer into `y` (module doc). Each launch bound to a sequence runs once
+    /// a sequence of the unit ([`Seqs38`]).
     fn front(&mut self, l: usize) -> Result<(), GpuError> {
         let (plans, gpu, m) = (self.plans, self.c.gpu, self.m);
         let p = plan_of(plans, l)?;
@@ -382,21 +496,7 @@ impl Parts38<'_> {
         let c = &self.c;
         let s = &mut *self.s;
         if l == 0 {
-            let (qs, d) = q8(c.w, &model::arch::qwen35moe::names::token_embd())?;
-            c.k.q38.enqueue_embed_rows(
-                stream,
-                EmbedQ8Args {
-                    qs,
-                    d,
-                    ids: self.io.ids,
-                    pos0: self.io.pos0,
-                    first: self.io.first,
-                    fault: gpu.unlabelled_sink(),
-                    y: &mut s.emb,
-                    pos: &mut s.pos,
-                    n_keys: &mut s.n_keys,
-                },
-            )?;
+            embed(c, &self.seqs, s)?;
             c.mix(
                 &p.attn_hc,
                 &mut s.res[self.cur],
@@ -415,12 +515,7 @@ impl Parts38<'_> {
             let pl = &mut s.ple;
             c.q8_gemv(&pp.key, &pl.e, m, &mut pl.key)?;
             c.q8_gemv(&pp.value, &pl.e, m, &mut pl.value)?;
-            let [r0, r1] = &mut s.res;
-            let (x, out) = if self.cur == 0 {
-                (&*r0, r1)
-            } else {
-                (&*r1, r0)
-            };
+            let x = &s.res[self.cur];
             c.k.ple.enqueue_gate(
                 stream,
                 PleGateArgs {
@@ -439,23 +534,7 @@ impl Parts38<'_> {
                     gate: &mut pl.gate,
                 },
             )?;
-            c.k.ple.enqueue_conv(
-                stream,
-                PleConvArgs {
-                    ngv: &pl.ngv,
-                    gv: &pl.gv,
-                    x,
-                    w: f32_gain(w, &pp.conv)?,
-                    pos: &s.pos,
-                    taps: geo::PLE_TAPS,
-                    dilation: geo::PLE_DILATION,
-                    hc: geo::STREAMS,
-                    m,
-                    fault: sink,
-                    out,
-                    ring: &mut *self.ple_ring,
-                },
-            )?;
+            ple_conv(c, pp, &mut self.seqs, s, (self.cur, m), sink)?;
             self.cur ^= 1;
             c.mix(
                 &p.attn_hc,
@@ -478,25 +557,9 @@ impl Parts38<'_> {
             )?;
             tap(&mut self.taps, &s.res[self.cur], l - 1, gpu)?;
         }
-        let store = self
-            .stores
-            .get_mut(l)
-            .ok_or(GpuError::state(WHAT, "a store for every layer"))?;
-        match (&p.mixer, store) {
-            (Mixer38::Gdn(g), Store38::Rec { rec, stamp }) => {
-                let lane = self.io.lane.ok_or(GpuError::state(
-                    WHAT,
-                    "the record's lane word (a chain with delta layers carries one)",
-                ))?;
-                gdn(c, g, (rec, stamp, lane), s, (m, self.each), sink)
-            }
-            (Mixer38::Qsa(q), Store38::Qsa { kv, raw, pooled }) => {
-                qsa(c, q, (kv, raw, pooled), s, m, sink)
-            }
-            _ => Err(GpuError::shape(
-                WHAT,
-                format!("layer {l}'s plan and store are of two kinds"),
-            )),
+        match &p.mixer {
+            Mixer38::Gdn(g) => gdn(c, g, l, &mut self.seqs, s, (m, self.each), sink),
+            Mixer38::Qsa(q) => qsa(c, q, l, &mut self.seqs, s, m, sink),
         }
     }
 
@@ -735,10 +798,240 @@ impl Parts38<'_> {
     }
 }
 
-/// A delta layer's mixer at `m` rows over its store `r`, its lanes' stamps
-/// and the lane word, in row mode when `each`, the attention site's mix in
-/// `s.mixed`, its output projection into `s.y`.
+/// Each sequence's embedding of its ids into its rows of `s` — `emb`, and
+/// each row's position and live key count — from its own input record.
+fn embed(c: &Ctx38<'_>, seqs: &Seqs38<'_>, s: &mut Arena38) -> Result<(), GpuError> {
+    let (qs, d) = q8(c.w, &model::arch::qwen35moe::names::token_embd())?;
+    let (gpu, stream) = (c.gpu, c.gpu.stream());
+    let Arena38 {
+        emb, pos, n_keys, ..
+    } = s;
+    match seqs {
+        Seqs38::One { io, .. } => c.k.q38.enqueue_embed_rows(
+            stream,
+            EmbedQ8Args {
+                qs,
+                d,
+                ids: io.ids,
+                pos0: io.pos0,
+                first: io.first,
+                fault: gpu.unlabelled_sink(),
+                y: emb,
+                pos,
+                n_keys,
+            },
+        ),
+        Seqs38::Slots(seqs) => {
+            for q in seqs {
+                let r = &q.rows;
+                c.k.q38.enqueue_embed_rows(
+                    stream,
+                    EmbedQ8Args {
+                        qs,
+                        d,
+                        ids: q.io.ids,
+                        pos0: q.io.pos0,
+                        first: q.io.first,
+                        fault: gpu.unlabelled_sink(),
+                        y: &mut *rows_mut(emb, r, geo::HIDDEN)?,
+                        pos: &mut *rows_mut(pos, r, 1)?,
+                        n_keys: &mut *rows_mut(n_keys, r, 1)?,
+                    },
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The PLE site's conv over the gate's rows (`ngv`, `gv`): each
+/// sequence's rows of the streams `res[cur]` into the other stream buffer,
+/// over its own ring.
+fn ple_conv(
+    c: &Ctx38<'_>,
+    pp: &PlePlan,
+    seqs: &mut Seqs38<'_>,
+    s: &mut Arena38,
+    (cur, m): (usize, usize),
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    let (w, stream) = (f32_gain(c.w, &pp.conv)?, c.gpu.stream());
+    let Arena38 {
+        res: [r0, r1],
+        ple: pl,
+        pos,
+        ..
+    } = s;
+    let (x, out) = if cur == 0 { (&*r0, r1) } else { (&*r1, r0) };
+    match seqs {
+        Seqs38::One { ple_ring, .. } => c.k.ple.enqueue_conv(
+            stream,
+            PleConvArgs {
+                ngv: &pl.ngv,
+                gv: &pl.gv,
+                x,
+                w,
+                pos,
+                taps: geo::PLE_TAPS,
+                dilation: geo::PLE_DILATION,
+                hc: geo::STREAMS,
+                m,
+                fault: sink,
+                out,
+                ring: ple_ring,
+            },
+        ),
+        Seqs38::Slots(seqs) => {
+            let wide = geo::STREAMS * geo::HIDDEN;
+            for q in seqs {
+                let r = &q.rows;
+                c.k.ple.enqueue_conv(
+                    stream,
+                    PleConvArgs {
+                        ngv: &*rows_of(&pl.ngv, r, wide)?,
+                        gv: &*rows_of(&pl.gv, r, wide)?,
+                        x: &*rows_of(x, r, wide)?,
+                        w,
+                        pos: &*rows_of(pos, r, 1)?,
+                        taps: geo::PLE_TAPS,
+                        dilation: geo::PLE_DILATION,
+                        hc: geo::STREAMS,
+                        m: r.len(),
+                        fault: sink,
+                        out: &mut *rows_mut(out, r, wide)?,
+                        ring: &mut *q.ple_ring,
+                    },
+                )?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The rows a delta layer's launches bound to one sequence read and write:
+/// the conv's inputs (`x`, β, α, each row's position) and outputs, and the
+/// delta step's output `o`.
+struct GdnIo<'b> {
+    x: &'b DeviceBuffer<f32>,
+    b: &'b DeviceBuffer<f32>,
+    a: &'b DeviceBuffer<f32>,
+    pos: &'b DeviceBuffer<u32>,
+    conv: &'b mut DeviceBuffer<f32>,
+    beta: &'b mut DeviceBuffer<f32>,
+    decay: &'b mut DeviceBuffer<f32>,
+    o: &'b mut DeviceBuffer<f32>,
+}
+
+/// A delta layer's mixer at `m` rows, layer `l` of each sequence of
+/// `seqs`, the attention site's mix in `s.mixed`, its output projection into
+/// `s.y`: the projections over every row ([`gdn_in`]), each sequence's conv
+/// and delta step over its rows and its store, in row mode when `each`
+/// ([`gdn_seq`]), then the gated norm and the output projection over every
+/// row ([`gdn_out`]).
 fn gdn(
+    c: &Ctx38<'_>,
+    gp: &GdnPlan,
+    l: usize,
+    seqs: &mut Seqs38<'_>,
+    s: &mut Arena38,
+    (m, each): (usize, bool),
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    gdn_in(c, gp, s, m)?;
+    let nv = GDN.n_v;
+    {
+        let Arena38 { gdn: g, pos, .. } = &mut *s;
+        let (wb, wa) = beta_alpha_rows(&g.ba, m)?;
+        let (b, a): (&DeviceBuffer<f32>, &DeviceBuffer<f32>) =
+            if m == 1 { (&*wb, &*wa) } else { (&g.b, &g.a) };
+        match seqs {
+            Seqs38::One { stores, io, .. } => {
+                let lane = lane_of(io)?;
+                let (rec, stamp) = rec_of(stores, l)?;
+                gdn_seq(
+                    c,
+                    gp,
+                    (rec, stamp, lane),
+                    GdnIo {
+                        x: &g.x,
+                        b,
+                        a,
+                        pos,
+                        conv: &mut g.conv,
+                        beta: &mut g.beta,
+                        decay: &mut g.decay,
+                        o: &mut g.o,
+                    },
+                    (m, each),
+                    sink,
+                )?;
+            }
+            Seqs38::Slots(seqs) => {
+                let ch = GDN.channels();
+                for q in seqs {
+                    let r = &q.rows;
+                    let lane = lane_of(&q.io)?;
+                    let (rec, stamp) = rec_of(q.stores, l)?;
+                    gdn_seq(
+                        c,
+                        gp,
+                        (rec, stamp, lane),
+                        GdnIo {
+                            x: &*rows_of(&g.x, r, ch)?,
+                            b: &*rows_of(b, r, nv)?,
+                            a: &*rows_of(a, r, nv)?,
+                            pos: &*rows_of(pos, r, 1)?,
+                            conv: &mut *rows_mut(&mut g.conv, r, ch)?,
+                            beta: &mut *rows_mut(&mut g.beta, r, nv)?,
+                            decay: &mut *rows_mut(&mut g.decay, r, nv)?,
+                            o: &mut *rows_mut(&mut g.o, r, nv * linear::HEAD)?,
+                        },
+                        (r.len(), each),
+                        sink,
+                    )?;
+                }
+            }
+        }
+    }
+    gdn_out(c, gp, s, m, sink)
+}
+
+/// A delta layer's projections over every row of `s.mixed`: q·k·v, `z`
+/// and the joined β·α (row-major `[2·n_v][m]`), β and α then copied
+/// token-major at more than one row.
+fn gdn_in(c: &Ctx38<'_>, gp: &GdnPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
+    let stream = c.gpu.stream();
+    let nv = GDN.n_v;
+    let Arena38 { mixed, gdn: g, .. } = s;
+    c.q8_gemv(&gp.qkv, mixed, m, &mut g.x)?;
+    c.q8_gemv(&gp.z, mixed, m, &mut g.z)?;
+    c.f32_gemv(&gp.beta_alpha, mixed, m, &mut g.ba)?;
+    if m > 1 {
+        let (wb, wa) = beta_alpha_rows(&g.ba, m)?;
+        c.k.proj.enqueue_token_major(stream, &wb, nv, m, &mut g.b)?;
+        c.k.proj.enqueue_token_major(stream, &wa, nv, m, &mut g.a)?;
+    }
+    Ok(())
+}
+
+/// β's and α's rows of the joined projection `ba` over `m` columns
+/// (row-major `[2·n_v][m]`): its first `n_v·m` values, then the next.
+fn beta_alpha_rows(
+    ba: &DeviceBuffer<f32>,
+    m: usize,
+) -> Result<(Window<'_, f32>, Window<'_, f32>), GpuError> {
+    let n = GDN.n_v * m;
+    Ok((
+        Window::of(ba, 0, n)?,
+        Window::of(ba, n * size_of::<f32>(), n)?,
+    ))
+}
+
+/// A delta layer's launches bound to one sequence, over `io`'s `m` rows:
+/// the conv over the store's ring `r.ring`, then the delta step over its
+/// state, its lanes' stamps and the lane word `lane`, in row mode when
+/// `each`.
+fn gdn_seq(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
     (r, stamp, lane): (
@@ -746,53 +1039,39 @@ fn gdn(
         &mut DeviceBuffer<u32>,
         &DeviceBuffer<u32>,
     ),
-    s: &mut Arena38,
+    io: GdnIo<'_>,
     (m, each): (usize, bool),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
     let (w, stream) = (c.w, c.gpu.stream());
-    let nv = GDN.n_v;
-    let Arena38 {
-        mixed,
-        gdn: g,
+    let GdnIo {
+        x,
+        b,
+        a,
         pos,
-        attn,
-        y,
-        ..
-    } = s;
-    c.q8_gemv(&gp.qkv, mixed, m, &mut g.x)?;
-    c.q8_gemv(&gp.z, mixed, m, &mut g.z)?;
-    c.f32_gemv(&gp.beta_alpha, mixed, m, &mut g.ba)?;
-    // SAFETY: the joined output is `2·nv` rows of `m` columns inside `ba`
-    // (the arena's `2·nv` a row, `m` at most its rows); β's rows are the
-    // first `nv·m` values and α's the next, and `ba` stays in place while
-    // the windows live (this layer's launches).
-    let (wb, wa) = unsafe { (f32_view(&g.ba, 0, nv * m), f32_view(&g.ba, nv * m, nv * m)) };
-    let (b, a): (&DeviceBuffer<f32>, &DeviceBuffer<f32>) = if m == 1 {
-        (&wb, &wa)
-    } else {
-        c.k.proj.enqueue_token_major(stream, &wb, nv, m, &mut g.b)?;
-        c.k.proj.enqueue_token_major(stream, &wa, nv, m, &mut g.a)?;
-        (&g.b, &g.a)
-    };
+        conv,
+        beta,
+        decay,
+        o,
+    } = io;
     let lin = &c.k.linear;
     lin.conv.enqueue_conv_prep(
         stream,
         ConvArgs {
-            x: &g.x,
+            x,
             b_raw: b,
             a_raw: a,
             w: f32_gain(w, &gp.conv)?,
             dt_bias: f32_gain(w, &gp.dt_bias)?,
             ssm_a: f32_gain(w, &gp.ssm_a)?,
-            pos: &*pos,
+            pos,
             shape: GDN,
             eps: c.eps,
             m,
             fault: sink,
-            y: &mut g.conv,
-            beta: &mut g.beta,
-            decay: &mut g.decay,
+            y: &mut *conv,
+            beta: &mut *beta,
+            decay: &mut *decay,
             ring: &mut r.ring,
         },
     )?;
@@ -800,24 +1079,40 @@ fn gdn(
         stream,
         DeltaLanesArgs {
             delta: DeltaArgs {
-                qkv: &g.conv,
-                beta: &g.beta,
-                decay: &g.decay,
+                qkv: conv,
+                beta,
+                decay,
                 lane,
                 lane_at: 0,
                 lanes: r.lanes,
                 shape: GDN,
                 m,
                 fault: sink,
-                o: &mut g.o,
+                o,
                 state: &mut r.state,
             },
             each,
-            pos: &*pos,
+            pos,
             stamp,
         },
-    )?;
-    lin.norm_gate.enqueue_norm_gate_sigmoid(
+    )
+}
+
+/// A delta layer's gated norm and output projection over every row, into
+/// `s.y`.
+fn gdn_out(
+    c: &Ctx38<'_>,
+    gp: &GdnPlan,
+    s: &mut Arena38,
+    m: usize,
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    let (w, stream) = (c.w, c.gpu.stream());
+    let nv = GDN.n_v;
+    let Arena38 {
+        gdn: g, attn, y, ..
+    } = s;
+    c.k.linear.norm_gate.enqueue_norm_gate_sigmoid(
         stream,
         NormGateArgs {
             o: &g.o,
@@ -834,41 +1129,160 @@ fn gdn(
     c.q8_gemv(&gp.ssm_out, &*attn, m, y)
 }
 
-/// A selecting attention layer's mixer at `m` rows over its store (the K/V
-/// planes, the raw and pooled indexer keys), the attention site's mix in
-/// `s.mixed`, its output projection into `s.y`.
+/// The rows a selecting layer's indexer keys of one sequence read and
+/// write: the mix, the raw keys' projection, each row's position and live
+/// key count.
+struct KeysIo<'b> {
+    x: &'b DeviceBuffer<f32>,
+    kr: &'b mut DeviceBuffer<f32>,
+    pos: &'b DeviceBuffer<u32>,
+    n_keys: &'b DeviceBuffer<u32>,
+}
+
+/// The rows a selecting layer's attention over one sequence reads and
+/// writes: the selection's queries, each row's live key count and
+/// position, the query projection's `[q | gate]` rows, the normed queries,
+/// the keys and values, and the flash's output.
+struct AttendIo<'b> {
+    qsel: &'b DeviceBuffer<f32>,
+    n_keys: &'b DeviceBuffer<u32>,
+    qg: &'b DeviceBuffer<f32>,
+    q: &'b mut DeviceBuffer<f32>,
+    k: &'b mut DeviceBuffer<f32>,
+    v: &'b DeviceBuffer<f32>,
+    pos: &'b DeviceBuffer<u32>,
+    y: &'b mut DeviceBuffer<f32>,
+}
+
+/// A selecting attention layer's mixer at `m` rows, layer `l` of each
+/// sequence of `seqs`, the attention site's mix in `s.mixed`, its output
+/// projection into `s.y`: q, k and v over every row ([`qsa_qkv`]); each
+/// sequence's indexer keys ([`qsa_keys`]) and attention ([`qsa_attend`])
+/// over its rows and its store, the indexer queries over every row between
+/// ([`qsa_query`]: after one sequence's keys, before several sequences'
+/// keys); then the gate and the output projection over every row
+/// ([`qsa_out`]).
 fn qsa(
     c: &Ctx38<'_>,
     qp: &QsaPlan,
-    (kv, raw, pooled): (
-        &mut super::scratch::KvPlanes,
-        &mut DeviceBuffer<u16>,
-        &mut DeviceBuffer<u16>,
-    ),
+    l: usize,
+    seqs: &mut Seqs38<'_>,
     s: &mut Arena38,
     m: usize,
     sink: FaultSink,
 ) -> Result<(), GpuError> {
+    qsa_qkv(c, qp, s, m)?;
+    match seqs {
+        Seqs38::One { stores, .. } => {
+            let (kv, raw, pooled) = qsa_of(stores, l)?;
+            {
+                let Arena38 {
+                    mixed,
+                    qsa: qa,
+                    pos,
+                    n_keys,
+                    ..
+                } = &mut *s;
+                let keys = KeysIo {
+                    x: mixed,
+                    kr: &mut qa.kr,
+                    pos,
+                    n_keys,
+                };
+                qsa_keys(c, qp, (raw, pooled), keys, m, sink)?;
+            }
+            qsa_query(c, qp, s, m)?;
+            let Arena38 {
+                qsa: qa,
+                pos,
+                n_keys,
+                flash,
+                ..
+            } = &mut *s;
+            let qsel: &DeviceBuffer<f32> = if m == 1 { &qa.qr } else { &qa.qi };
+            let io = AttendIo {
+                qsel,
+                n_keys,
+                qg: &qa.qg,
+                q: &mut qa.q,
+                k: &mut qa.k,
+                v: &qa.v,
+                pos,
+                y: flash,
+            };
+            let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
+            qsa_attend(c, qp, (kv, pooled), io, scratch, m, sink)?;
+        }
+        Seqs38::Slots(seqs) => {
+            qsa_query(c, qp, s, m)?;
+            let (h, d) = (geo::HIDDEN, geo::IDX_DIM);
+            let Arena38 {
+                mixed,
+                qsa: qa,
+                pos,
+                n_keys,
+                flash,
+                ..
+            } = &mut *s;
+            for q in seqs {
+                let r = &q.rows;
+                let (kv, raw, pooled) = qsa_of(q.stores, l)?;
+                let (pos, n_keys) = (rows_of(pos, r, 1)?, rows_of(n_keys, r, 1)?);
+                let keys = KeysIo {
+                    x: &*rows_of(mixed, r, h)?,
+                    kr: &mut *rows_mut(&mut qa.kr, r, d)?,
+                    pos: &pos,
+                    n_keys: &n_keys,
+                };
+                qsa_keys(c, qp, (raw, pooled), keys, r.len(), sink)?;
+                let qsel: &DeviceBuffer<f32> = if m == 1 { &qa.qr } else { &qa.qi };
+                let io = AttendIo {
+                    qsel: &*rows_of(qsel, r, geo::IDX_HEADS * d)?,
+                    n_keys: &n_keys,
+                    qg: &*rows_of(&qa.qg, r, geo::Q_ROWS)?,
+                    q: &mut *rows_mut(&mut qa.q, r, geo::ATTN)?,
+                    k: &mut *rows_mut(&mut qa.k, r, geo::KV)?,
+                    v: &*rows_of(&qa.v, r, geo::KV)?,
+                    pos: &pos,
+                    y: &mut *rows_mut(flash, r, geo::ATTN)?,
+                };
+                let scratch = (&mut qa.sel, &mut qa.part_v, &mut qa.part_ms);
+                qsa_attend(c, qp, (kv, pooled), io, scratch, r.len(), sink)?;
+            }
+        }
+    }
+    qsa_out(c, qp, s, m, sink)
+}
+
+/// A selecting layer's q (with each head's gate), k and v over every row
+/// of `s.mixed`.
+fn qsa_qkv(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
+    let Arena38 { mixed, qsa: qa, .. } = s;
+    c.q8_gemv(&qp.q, mixed, m, &mut qa.qg)?;
+    c.q8_gemv(&qp.k, mixed, m, &mut qa.k)?;
+    c.q8_gemv(&qp.v, mixed, m, &mut qa.v)
+}
+
+/// A selecting layer's indexer keys of one sequence's `m` rows: their
+/// projection (row-major `[IDX_DIM][m]`, so a sequence's own launch), the
+/// raw keys appended to the store at the rows' positions, then the pools
+/// those rows complete.
+fn qsa_keys(
+    c: &Ctx38<'_>,
+    qp: &QsaPlan,
+    (raw, pooled): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>),
+    io: KeysIo<'_>,
+    m: usize,
+    sink: FaultSink,
+) -> Result<(), GpuError> {
     let (w, stream, ctx) = (c.w, c.gpu.stream(), c.ctx);
-    let Arena38 {
-        mixed,
-        qsa: q,
-        pos,
-        n_keys,
-        flash,
-        attn,
-        y,
-        ..
-    } = s;
-    c.q8_gemv(&qp.q, mixed, m, &mut q.qg)?;
-    c.q8_gemv(&qp.k, mixed, m, &mut q.k)?;
-    c.q8_gemv(&qp.v, mixed, m, &mut q.v)?;
-    c.f32_gemv(&qp.idx_k, mixed, m, &mut q.kr)?;
+    let KeysIo { x, kr, pos, n_keys } = io;
+    c.f32_gemv(&qp.idx_k, x, m, kr)?;
     c.k.q38.enqueue_key_append(
         stream,
         KeyAppendArgs {
-            kr: &q.kr,
-            pos: &*pos,
+            kr,
+            pos,
             m,
             ctx,
             fault: sink,
@@ -878,39 +1292,80 @@ fn qsa(
     c.k.qsa.enqueue_pool(
         stream,
         PoolArgs {
-            raw: &*raw,
+            raw,
             gain: f32_gain(w, &qp.idx_k_norm)?,
             table: c.table,
-            n_keys: &*n_keys,
+            n_keys,
             eps: c.eps,
             ctx,
             m,
             fault: sink,
-            pooled: &mut *pooled,
+            pooled,
         },
-    )?;
-    c.f32_gemv(&qp.idx_q, mixed, m, &mut q.qr)?;
-    let qsel: &DeviceBuffer<f32> = if m == 1 {
-        &q.qr
-    } else {
-        c.k.proj
-            .enqueue_token_major(stream, &q.qr, geo::IDX_HEADS * geo::IDX_DIM, m, &mut q.qi)?;
-        &q.qi
-    };
+    )
+}
+
+/// A selecting layer's indexer queries over every row of `s.mixed`
+/// (row-major), copied token-major at more than one row.
+fn qsa_query(c: &Ctx38<'_>, qp: &QsaPlan, s: &mut Arena38, m: usize) -> Result<(), GpuError> {
+    let Arena38 { mixed, qsa: qa, .. } = s;
+    c.f32_gemv(&qp.idx_q, mixed, m, &mut qa.qr)?;
+    if m > 1 {
+        let stream = c.gpu.stream();
+        c.k.proj.enqueue_token_major(
+            stream,
+            &qa.qr,
+            geo::IDX_HEADS * geo::IDX_DIM,
+            m,
+            &mut qa.qi,
+        )?;
+    }
+    Ok(())
+}
+
+/// A selecting layer's attention over one sequence's `m` rows and its
+/// K/V planes: the selection of each row's pooled keys (into `sel` from its
+/// first row), the q/k norm and turn with the K/V append at the rows'
+/// positions, then the selected flash over the selection's lists (its
+/// partials from their first row) into `io.y`.
+fn qsa_attend(
+    c: &Ctx38<'_>,
+    qp: &QsaPlan,
+    (kv, pooled): (&mut super::scratch::KvPlanes, &mut DeviceBuffer<u16>),
+    io: AttendIo<'_>,
+    (sel, part_v, part_ms): (
+        &mut QsaScratch,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+    ),
+    m: usize,
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    let (w, stream, ctx) = (c.w, c.gpu.stream(), c.ctx);
+    let AttendIo {
+        qsel,
+        n_keys,
+        qg,
+        q,
+        k,
+        v,
+        pos,
+        y,
+    } = io;
     c.k.qsa.enqueue_select(
         stream,
         SelectArgs {
             q: qsel,
             gain: f32_gain(w, &qp.idx_q_norm)?,
             table: c.table,
-            n_keys: &*n_keys,
+            n_keys,
             pooled: &*pooled,
             eps: c.eps,
             ctx,
             kept: geo::KEPT,
             m,
             fault: sink,
-            scratch: &mut q.sel,
+            scratch: &mut *sel,
         },
     )?;
     // The selecting store is f16 (the qwen38 family's stores carry no q8_0
@@ -919,14 +1374,14 @@ fn qsa(
     c.k.neox.enqueue_head_norm_neox_append_256(
         stream,
         PartialNeoxArgs {
-            qg: &q.qg,
-            q: &mut q.q,
-            k: &mut q.k,
-            v: &q.v,
+            qg,
+            q: &mut *q,
+            k,
+            v,
             gq: f32_gain(w, &qp.q_norm)?,
             gk: f32_gain(w, &qp.k_norm)?,
             table: c.table,
-            pos: &*pos,
+            pos,
             eps: c.eps,
             n_head: geo::N_HEAD,
             n_kv: geo::N_KV,
@@ -938,33 +1393,51 @@ fn qsa(
         },
     )?;
     let (kc, vc) = kv.f16("qwen38::attention")?;
-    let width = q.sel.width();
+    let width = sel.width();
     c.k.flash.enqueue_pass_256_p4_sel(
         stream,
         GqaSelArgs {
-            q: &q.q,
+            q,
             kc,
             vc,
-            list: &q.sel.list,
-            n_sel: &q.sel.n_sel,
+            list: &sel.list,
+            n_sel: &sel.n_sel,
             width,
             scale: ATTN_SCALE_256,
             n_kv: geo::N_KV,
             ctx,
             m,
-            part_v: &mut q.part_v,
-            part_ms: &mut q.part_ms,
+            part_v,
+            part_ms,
             fault: sink,
-            y: &mut *flash,
+            y,
         },
         geo::N_HEAD,
         MMA,
-    )?;
+    )
+}
+
+/// A selecting layer's gate over every row's attention and its output
+/// projection, into `s.y`.
+fn qsa_out(
+    c: &Ctx38<'_>,
+    qp: &QsaPlan,
+    s: &mut Arena38,
+    m: usize,
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    let Arena38 {
+        qsa: qa,
+        flash,
+        attn,
+        y,
+        ..
+    } = s;
     c.k.q38.enqueue_out_gate(
-        stream,
+        c.gpu.stream(),
         OutGateArgs {
             attn: &*flash,
-            qg: &q.qg,
+            qg: &qa.qg,
             n_head: geo::N_HEAD,
             m,
             fault: sink,
@@ -1033,16 +1506,28 @@ impl<'a> LayerProgram for Step38<'a> {
     }
 }
 
-/// The captured verify's walk `(1, m, Step)` over `m` consecutive
-/// positions: every layer through the step port's `Cols(m)` chain — one
-/// handoff launch writing the `m` columns' image, one go, one union call on
-/// the host, one wait — each delta row's state into a lane of its own, then
-/// the head's mix over the `m` columns into `head`, a head of `m` rows (one
-/// projection and one argmax for every row). Each row is bit for bit its
-/// step.
+/// The captured verify's walk `(1, m, Step)` over `m` rows — a verify's
+/// consecutive positions of one sequence, or a pass of several slots'
+/// rows, each slot's consecutive positions ([`Seqs38::Slots`]): every
+/// layer through the step port's `Cols(m)` chain — one handoff launch
+/// writing the `m` columns' image, one go, one union call on the host, one
+/// wait; at one row the step's chain and handoff — each delta row's state
+/// into a lane of its own, then the head's mix over the `m` columns into
+/// `head`, a head of `m` rows (one projection and one argmax for every
+/// row), and each of `copies` after it. Each row is bit for bit its step.
 pub(super) struct Verify38<'a> {
     pub(super) p: Parts38<'a>,
     pub(super) head: &'a mut Head,
+    pub(super) copies: Vec<RowsCopy<'a>>,
+}
+
+/// A parked slot's rows of a pass of several slots copied, once the head's
+/// mix has made the walk's final streams, to the slot's own final-stream
+/// rows from row 0: where its draft's walk reads the target's hidden rows
+/// of its last call, as after a verify of its rows alone.
+pub(super) struct RowsCopy<'a> {
+    pub(super) rows: Range<usize>,
+    pub(super) to: &'a mut DeviceBuffer<f32>,
 }
 
 impl<'a> Verify38<'a> {
@@ -1086,8 +1571,9 @@ impl<'a> LayerProgram for Verify38<'a> {
         let sink = self.p.c.gpu.layer_sink(l)?;
         let stream = self.p.c.gpu.stream();
         let m = self.p.m;
-        self.p.handoff_go(hy, l, |k, h, target, sel| {
-            k.enqueue_handoff_cols(stream, h, geo::N_USED + 1, m, target, sink, sel)
+        self.p.handoff_go(hy, l, |k, h, target, sel| match m {
+            1 => k.enqueue_handoff(stream, h, target, sink, sel),
+            m => k.enqueue_handoff_cols(stream, h, geo::N_USED + 1, m, target, sink, sel),
         })
     }
 
@@ -1108,10 +1594,17 @@ impl<'a> LayerProgram for Verify38<'a> {
     }
 
     /// The head's mix over the `m` columns into the head's input, then the
-    /// head.
+    /// head, then the copies of the parked slots' rows.
     fn end(&mut self, _unit: usize) -> Result<(), GpuError> {
         self.p.head_mix(Some(self.head.input_mut()))?;
-        self.head.enqueue(self.p.c.gpu, self.p.c.w)
+        self.head.enqueue(self.p.c.gpu, self.p.c.w)?;
+        let (wide, stream) = (geo::STREAMS * geo::HIDDEN, self.p.c.gpu.stream());
+        let res = &self.p.s.res[self.p.cur];
+        for c in &mut self.copies {
+            let from = rows_of(res, &c.rows, wide)?;
+            rows_mut(c.to, &(0..c.rows.len()), wide)?.copy_from_device_async(&from, stream)?;
+        }
+        Ok(())
     }
 }
 

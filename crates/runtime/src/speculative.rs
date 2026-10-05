@@ -197,8 +197,8 @@ impl<D, const M: usize> Speculative<D, M> {
 
 /// The rows of a greedy verify that are kept: row 0 always, and row `r + 1`
 /// while row `r`'s argmax is the proposal's id at `r + 1`. `rows` and `out`
-/// have one entry a row.
-pub(crate) fn accepted_rows(rows: &[u32], out: &[u32]) -> usize {
+/// have one entry a row; `rows` holds at least row 0 (an empty one panics).
+pub fn accepted_rows(rows: &[u32], out: &[u32]) -> usize {
     1 + rows[1..]
         .iter()
         .zip(out)
