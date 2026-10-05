@@ -1,6 +1,7 @@
 //! The body's sequence state as a value: the live sequence's state as one
 //! value ([`Seq`]), which the model's resident slots exchange by pointer
-//! moves ([`Slots`]); what a cut keeps ([`keep_rule`], with the reason it
+//! moves ([`Slots`]); which sequence each row of a pass binds
+//! ([`RowSeqs`]); what a cut keeps ([`keep_rule`], with the reason it
 //! keeps less, [`KeepLimit`]); and where a prompt call is cut so a position
 //! inside it stays keepable ([`Body::prefill_splits`]). The whole state saved
 //! to the host and put back is [`super::snap`]'s.
@@ -25,8 +26,9 @@
 //!   ([`Seq`]); the fault word and the host tier's poison are the model's.
 //!
 //! Nothing the body captures records a sequence's buffers: the step and the
-//! pair pass are the model's captures, one cache a slot, so [`Seq`] carries
-//! none ([`Slots::Seq`]'s contract).
+//! pair pass are the model's captures, one cache a slot, and a pass of
+//! several slots is the model's, in its one cache ([`super::slots`]), so
+//! [`Seq`] carries none ([`Slots::Seq`]'s contract).
 //!
 //! [`ChainBody::reset`]: bloomery_gpu::model::ChainBody::reset
 
@@ -220,6 +222,28 @@ impl Seq {
         }
         self.restore = false;
         Ok(())
+    }
+}
+
+/// The sequences a pass's rows bind ([`super::Parts`]): one for every row
+/// — the live one for the step, the verify pair and the prompt call, or the
+/// one slot's of a pass of one slot's two rows — or one a row for a pass of
+/// two slots of one row each ([`super::slots`]).
+pub(super) enum RowSeqs<'a> {
+    One(&'a mut Seq),
+    Two([&'a mut Seq; PAIR_ROWS]),
+}
+
+impl RowSeqs<'_> {
+    /// Row `row`'s sequence; a row past the pass's is refused by name.
+    pub(super) fn of(&mut self, row: usize) -> Result<&mut Seq, GpuError> {
+        match self {
+            RowSeqs::One(seq) => Ok(seq),
+            RowSeqs::Two(seqs) => seqs.get_mut(row).map(|s| &mut **s).ok_or(GpuError::State {
+                what: "deepseek41 Body::enqueue_chain",
+                missing: "the row's sequence",
+            }),
+        }
     }
 }
 
