@@ -13,7 +13,11 @@
 //! `tools/bloomery/records.py` parses a log by that schema, so a reader names a
 //! kind and its fields, never a column or a pattern. The same call registers
 //! those kinds, and a line of any other kind is refused by name: the schema
-//! is every line the binary can print.
+//! is every line the binary can print. [`Log`] reads a log by the same rules
+//! in Rust, a record's values by field name ([`Fields`]), and refuses by name
+//! ([`ReadError`]) a record absent where one is due, a line that opens a
+//! kind's record and does not read whole, and a field the kind lacks, of
+//! another type, or left out.
 //!
 //! The text is the one the lines' readers know: `<head> name=value …`, the
 //! head a fixed run of words and the pairs in a fixed order, so a reader that
@@ -449,6 +453,532 @@ impl Record {
     /// The line on stderr.
     pub fn eprint(self) {
         eprintln!("{}", self.line());
+    }
+}
+
+// ---------------------------------------------------------------- the reader
+
+/// A read of a [`Log`] or of a [`Fields`] value refused, by name: what a
+/// line-splitting reader would read as nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadError {
+    /// The kind is not among the kinds the log is read by.
+    NotPrinted { log: String, kind: &'static str },
+    /// The log holds no record of the kind.
+    Absent { log: String, kind: &'static str },
+    /// The log holds `n` records of a kind read as one.
+    Many {
+        log: String,
+        kind: &'static str,
+        n: usize,
+    },
+    /// Line `at` opens a record of the kind (its head, then its first field,
+    /// or any of its fields when no other kind has the head) and no kind
+    /// reads it whole.
+    Broken {
+        log: String,
+        kind: &'static str,
+        at: usize,
+        line: String,
+    },
+    /// The kind has no value part of that name.
+    NoField { kind: &'static str, field: String },
+    /// The record leaves out the optional part read as present.
+    Missing {
+        kind: &'static str,
+        field: &'static str,
+        line: String,
+    },
+    /// The part is of another type than the read asks for.
+    Type {
+        kind: &'static str,
+        field: &'static str,
+        ty: Ty,
+        asked: &'static str,
+    },
+    /// The value is past its type's range.
+    Value {
+        kind: &'static str,
+        field: &'static str,
+        value: String,
+    },
+}
+
+impl Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::NotPrinted { log, kind } => {
+                write!(f, "{log}: `{kind}` is not among the kinds it is read by")
+            }
+            ReadError::Absent { log, kind } => write!(f, "{log}: no `{kind}` record"),
+            ReadError::Many { log, kind, n } => {
+                write!(f, "{log}: {n} `{kind}` records where one is due")
+            }
+            ReadError::Broken {
+                log,
+                kind,
+                at,
+                line,
+            } => write!(
+                f,
+                "{log}: line {at} opens a `{kind}` record and does not read whole: {line}"
+            ),
+            ReadError::NoField { kind, field } => write!(f, "`{kind}` has no field {field}"),
+            ReadError::Missing { kind, field, line } => {
+                write!(f, "the `{kind}` record leaves out {field}: {line}")
+            }
+            ReadError::Type {
+                kind,
+                field,
+                ty,
+                asked,
+            } => write!(f, "`{kind}`'s {field} is a {}, read as {asked}", ty.name()),
+            ReadError::Value { kind, field, value } => {
+                write!(f, "the `{kind}` record's {field}={value} is out of range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadError {}
+
+/// A log read by the kinds of the binary that wrote it, line by line as
+/// `tools/bloomery/records.py` reads one: the kinds whose head opens the line
+/// (as a word), the longest head first, and of them the first whose whole
+/// pattern reads the line — so kinds that share a head (`plan` and `plan38`,
+/// `cache` and `cache save`) are told apart by the whole line. A line that
+/// no kind reads whole but that opens a kind's record (records.py's loose
+/// read: its head, then its first field, or any of its fields when no other
+/// kind has the head) is broken: every read of that kind is refused by name.
+/// Any other line is no record.
+#[derive(Debug)]
+pub struct Log {
+    what: String,
+    kinds: Vec<&'static Kind>,
+    entries: Vec<Entry>,
+}
+
+#[derive(Debug)]
+enum Entry {
+    Whole(Fields),
+    /// Line `at` (from 1), and every kind whose record it opens.
+    Broken {
+        at: usize,
+        line: String,
+        kinds: Vec<&'static Kind>,
+    },
+}
+
+impl Log {
+    /// The records of `text` by `kinds`, the list the binary that wrote it
+    /// registered; the log is `the log` in an error until [`Log::named`].
+    #[must_use]
+    pub fn of(text: &str, kinds: &[&'static Kind]) -> Log {
+        let mut order = kinds.to_vec();
+        order.sort_by_key(|k| std::cmp::Reverse(k.head.len()));
+        let entries = text
+            .lines()
+            .enumerate()
+            .filter_map(|(i, line)| read_line(&order, i + 1, line))
+            .collect();
+        Log {
+            what: "the log".to_owned(),
+            kinds: kinds.to_vec(),
+            entries,
+        }
+    }
+
+    /// The log as its errors name it.
+    #[must_use]
+    pub fn named(mut self, what: impl Into<String>) -> Log {
+        self.what = what.into();
+        self
+    }
+
+    /// Every record of `kind`, in order; refused when `kind` is not among the
+    /// log's kinds or a line opens one and does not read whole.
+    pub fn all(&self, kind: &Kind) -> Result<Vec<Fields>, ReadError> {
+        if !self.kinds.iter().any(|k| std::ptr::eq(*k, kind)) {
+            return Err(ReadError::NotPrinted {
+                log: self.what.clone(),
+                kind: kind.name,
+            });
+        }
+        let mut out = Vec::new();
+        for e in &self.entries {
+            match e {
+                Entry::Whole(f) if std::ptr::eq(f.kind, kind) => out.push(f.clone()),
+                Entry::Broken { at, line, kinds }
+                    if kinds.iter().any(|k| std::ptr::eq(*k, kind)) =>
+                {
+                    return Err(ReadError::Broken {
+                        log: self.what.clone(),
+                        kind: kind.name,
+                        at: *at,
+                        line: line.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// The first record of `kind`, `None` when there is none; refused as
+    /// [`Log::all`] is.
+    pub fn first(&self, kind: &Kind) -> Result<Option<Fields>, ReadError> {
+        Ok(self.all(kind)?.into_iter().next())
+    }
+
+    /// The one record of `kind`; none, or more than one, is refused by name.
+    pub fn one(&self, kind: &Kind) -> Result<Fields, ReadError> {
+        let mut all = self.all(kind)?;
+        match all.len() {
+            1 => Ok(all.remove(0)),
+            0 => Err(ReadError::Absent {
+                log: self.what.clone(),
+                kind: kind.name,
+            }),
+            n => Err(ReadError::Many {
+                log: self.what.clone(),
+                kind: kind.name,
+                n,
+            }),
+        }
+    }
+}
+
+/// `line` (number `at`) by the kinds in `order`, the longest head first.
+fn read_line(order: &[&'static Kind], at: usize, line: &str) -> Option<Entry> {
+    let opened: Vec<&'static Kind> = order.iter().copied().filter(|k| k.opens(line)).collect();
+    if let Some(f) = opened.iter().find_map(|k| k.read(at, line)) {
+        return Some(Entry::Whole(f));
+    }
+    let kinds: Vec<&'static Kind> = opened
+        .iter()
+        .copied()
+        .filter(|k| {
+            k.opens_fields(
+                line,
+                opened.iter().filter(|o| o.head == k.head).count() == 1,
+            )
+        })
+        .collect();
+    (!kinds.is_empty()).then(|| Entry::Broken {
+        at,
+        line: line.to_owned(),
+        kinds,
+    })
+}
+
+impl Kind {
+    /// Whether `line` opens with the head as a word: a space or the line's
+    /// end after it, unless the head ends in `=` or `:`.
+    fn opens(&self, line: &str) -> bool {
+        line.strip_prefix(self.head).is_some_and(|rest| {
+            rest.is_empty() || rest.starts_with(' ') || self.head.ends_with(['=', ':'])
+        })
+    }
+
+    /// `line` (number `at`) read whole by the parts.
+    fn read(&'static self, at: usize, line: &str) -> Option<Fields> {
+        let mut values = Vec::new();
+        walk(self.parts, &line[self.head.len()..], &mut values).then(|| Fields {
+            kind: self,
+            at,
+            line: line.to_owned(),
+            values,
+        })
+    }
+
+    /// Whether `line`, which opens with the head, goes on with ` name=` of
+    /// the kind's first field — or, `alone` (no other kind has the head), of
+    /// any of its key fields.
+    fn opens_fields(&self, line: &str, alone: bool) -> bool {
+        let first = self.parts.iter().find_map(|p| match p {
+            Part::Lit(_) => None,
+            Part::Key(f) => Some(Some(f.name)),
+            Part::Pos(_) | Part::Flag(_) => Some(None),
+        });
+        let (Some(Some(first)), Some(name)) = (first, key_at(&line[self.head.len()..])) else {
+            return false;
+        };
+        name == first
+            || (alone
+                && self
+                    .parts
+                    .iter()
+                    .any(|p| matches!(p, Part::Key(f) if f.name == name)))
+    }
+}
+
+/// The name of the ` name=` `rest` opens with: a letter or `_`, then
+/// letters, digits, `_`, `/`, `(` or `)` (`tok/s(p50)` is one name).
+fn key_at(rest: &str) -> Option<&str> {
+    let s = rest.strip_prefix(' ')?;
+    let end = s.find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '/' | '(' | ')')))?;
+    let name = &s[..end];
+    (s[end..].starts_with('=') && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'))
+        .then_some(name)
+}
+
+/// Whether `parts` read `rest` to its end, each value pushed onto `values`
+/// as printed (a set flag as empty). An optional part is tried present
+/// first, then left out; a value takes the lengths [`value_ends`] gives, in
+/// its order — the way records.py's pattern backtracks.
+fn walk(parts: &[Part], rest: &str, values: &mut Vec<(&'static str, String)>) -> bool {
+    let Some((p, after)) = parts.split_first() else {
+        return rest.is_empty();
+    };
+    match *p {
+        Part::Lit(t) => rest.strip_prefix(t).is_some_and(|r| walk(after, r, values)),
+        Part::Flag(n) => {
+            if let Some(r) = rest.strip_prefix(' ').and_then(|r| r.strip_prefix(n)) {
+                values.push((n, String::new()));
+                if walk(after, r, values) {
+                    return true;
+                }
+                values.pop();
+            }
+            walk(after, rest, values)
+        }
+        Part::Key(f) | Part::Pos(f) => {
+            let at = match p {
+                Part::Key(_) => rest
+                    .strip_prefix(' ')
+                    .and_then(|r| r.strip_prefix(f.name))
+                    .and_then(|r| r.strip_prefix('=')),
+                _ => Some(rest),
+            };
+            if let Some(v) = at {
+                for end in value_ends(f.ty, v) {
+                    values.push((f.name, v[..end].to_owned()));
+                    if walk(after, &v[end..], values) {
+                        return true;
+                    }
+                    values.pop();
+                }
+            }
+            f.opt && walk(after, rest, values)
+        }
+    }
+}
+
+/// The lengths a value of `ty` may take at the start of `rest`, each at a
+/// char boundary, in the order records.py's pattern tries them: text the
+/// shortest first (it runs up to what follows), a list up to its `]`, any
+/// other the longest first within the run up to whitespace.
+fn value_ends(ty: Ty, rest: &str) -> Vec<usize> {
+    let ends =
+        |s: &str| -> Vec<usize> { s.char_indices().map(|(i, c)| i + c.len_utf8()).collect() };
+    match ty {
+        Ty::Text => ends(rest),
+        Ty::List | Ty::Csv => {
+            if rest.starts_with('[') {
+                rest.find(']').map(|i| vec![i + 1]).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => {
+            let run = &rest[..rest.find(char::is_whitespace).unwrap_or(rest.len())];
+            let mut out: Vec<usize> = ends(run)
+                .into_iter()
+                .filter(|&e| fits(ty, &run[..e]))
+                .collect();
+            out.reverse();
+            out
+        }
+    }
+}
+
+/// Whether `s` is a whole value of `ty` as records.py's pattern reads one.
+fn fits(ty: Ty, s: &str) -> bool {
+    let digits = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    match ty {
+        Ty::U64 => digits(s),
+        Ty::I64 => digits(s.strip_prefix('-').unwrap_or(s)),
+        Ty::F64(_) => {
+            let m = s.strip_prefix('-').unwrap_or(s);
+            m == "inf"
+                || m == "NaN"
+                || m.split_once('.')
+                    .map_or_else(|| digits(m), |(i, f)| digits(i) && digits(f))
+        }
+        Ty::Bool => s == "true" || s == "false",
+        Ty::Word => !s.is_empty() && !s.contains(char::is_whitespace),
+        Ty::Text => !s.is_empty(),
+        Ty::List | Ty::Csv => {
+            s.len() >= 2
+                && s.starts_with('[')
+                && s.ends_with(']')
+                && !s[1..s.len() - 1].contains(']')
+        }
+    }
+}
+
+/// One record a [`Log`] read whole: its kind, its line and the line's
+/// number, and the values its parts carry, as printed. Each read names the field; one the kind does
+/// not have, one of another type than asked, an optional one the line left
+/// out (read as present) and a value past its type's range are refused by
+/// name.
+#[derive(Clone, Debug)]
+pub struct Fields {
+    kind: &'static Kind,
+    at: usize,
+    line: String,
+    values: Vec<(&'static str, String)>,
+}
+
+impl Fields {
+    #[must_use]
+    pub fn kind(&self) -> &'static Kind {
+        self.kind
+    }
+
+    /// The line as printed.
+    #[must_use]
+    pub fn line(&self) -> &str {
+        &self.line
+    }
+
+    /// The line's number in the log, from 1.
+    #[must_use]
+    pub fn at(&self) -> usize {
+        self.at
+    }
+
+    /// The value part `name`, checked to be of a type `is` takes, and its
+    /// text when the line carries it.
+    fn get(
+        &self,
+        name: &str,
+        asked: &'static str,
+        is: fn(Ty) -> bool,
+    ) -> Result<(&'static str, Option<&str>), ReadError> {
+        let f = self
+            .kind
+            .parts
+            .iter()
+            .find_map(|p| match p {
+                Part::Key(f) | Part::Pos(f) if f.name == name => Some(*f),
+                _ => None,
+            })
+            .ok_or_else(|| ReadError::NoField {
+                kind: self.kind.name,
+                field: name.to_owned(),
+            })?;
+        if !is(f.ty) {
+            return Err(ReadError::Type {
+                kind: self.kind.name,
+                field: f.name,
+                ty: f.ty,
+                asked,
+            });
+        }
+        let v = self
+            .values
+            .iter()
+            .find(|(n, _)| *n == f.name)
+            .map(|(_, v)| v.as_str());
+        Ok((f.name, v))
+    }
+
+    /// [`Fields::get`]'s text, refused when the line left the part out.
+    fn need<'a>(&self, (field, v): (&'static str, Option<&'a str>)) -> Result<&'a str, ReadError> {
+        v.ok_or_else(|| ReadError::Missing {
+            kind: self.kind.name,
+            field,
+            line: self.line.clone(),
+        })
+    }
+
+    /// `text` as a number, refused when it is past the type's range.
+    fn number<T: std::str::FromStr>(
+        &self,
+        field: &'static str,
+        text: &str,
+    ) -> Result<T, ReadError> {
+        text.parse().map_err(|_| ReadError::Value {
+            kind: self.kind.name,
+            field,
+            value: text.to_owned(),
+        })
+    }
+
+    /// An unsigned integer part.
+    pub fn u64(&self, name: &str) -> Result<u64, ReadError> {
+        let got = self.get(name, "u64", |t| t == Ty::U64)?;
+        self.number(got.0, self.need(got)?)
+    }
+
+    /// An optional unsigned integer part, `None` when the line left it out.
+    pub fn opt_u64(&self, name: &str) -> Result<Option<u64>, ReadError> {
+        let (field, v) = self.get(name, "u64", |t| t == Ty::U64)?;
+        v.map(|t| self.number(field, t)).transpose()
+    }
+
+    /// A signed integer part.
+    pub fn i64(&self, name: &str) -> Result<i64, ReadError> {
+        let got = self.get(name, "i64", |t| t == Ty::I64)?;
+        self.number(got.0, self.need(got)?)
+    }
+
+    /// A float part.
+    pub fn f64(&self, name: &str) -> Result<f64, ReadError> {
+        let got = self.get(name, "f64", |t| matches!(t, Ty::F64(_)))?;
+        self.number(got.0, self.need(got)?)
+    }
+
+    /// A word part.
+    pub fn word(&self, name: &str) -> Result<&str, ReadError> {
+        let got = self.get(name, "word", |t| t == Ty::Word)?;
+        self.need(got)
+    }
+
+    /// An optional word part, `None` when the line left it out.
+    pub fn opt_word(&self, name: &str) -> Result<Option<&str>, ReadError> {
+        Ok(self.get(name, "word", |t| t == Ty::Word)?.1)
+    }
+
+    /// A text part: the words up to the next part, spaces and all.
+    pub fn text(&self, name: &str) -> Result<&str, ReadError> {
+        let got = self.get(name, "text", |t| t == Ty::Text)?;
+        self.need(got)
+    }
+
+    /// A `true`/`false` part.
+    pub fn bool(&self, name: &str) -> Result<bool, ReadError> {
+        let got = self.get(name, "bool", |t| t == Ty::Bool)?;
+        Ok(self.need(got)? == "true")
+    }
+
+    /// A `[a,b,c]` part's items, trimmed; `[]` none.
+    pub fn csv(&self, name: &str) -> Result<Vec<&str>, ReadError> {
+        let got = self.get(name, "csv", |t| t == Ty::Csv)?;
+        let inner = self.need(got)?;
+        let inner = inner[1..inner.len() - 1].trim();
+        Ok(if inner.is_empty() {
+            Vec::new()
+        } else {
+            inner.split(',').map(str::trim).collect()
+        })
+    }
+
+    /// Whether the flag `name` is set.
+    pub fn flag(&self, name: &str) -> Result<bool, ReadError> {
+        if !self
+            .kind
+            .parts
+            .iter()
+            .any(|p| matches!(p, Part::Flag(n) if *n == name))
+        {
+            return Err(ReadError::NoField {
+                kind: self.kind.name,
+                field: name.to_owned(),
+            });
+        }
+        Ok(self.values.iter().any(|(n, _)| *n == name))
     }
 }
 
@@ -2056,6 +2586,34 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
     &CACHE_REUSE,
 ];
 
+/// What the GLM seat of `bloomery-serve` prints, all on stderr: the
+/// residency lever's word, the `plan`, `load` and `capture` lines
+/// `generate_glm5next` prints, the host set's records of a placed load, the
+/// draft's load line and its verify's capture, the listening line, the reuse
+/// records the checkpoint rule answers, the draft's joins, and the residency
+/// machine's records.
+pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
+    &RESIDENCY_LEVER,
+    &DRAFT_UNSET_GLM,
+    &PLAN,
+    &RESIDENCY_UNSET_GLM,
+    &RESIDENCY_HOST,
+    &LOAD_GENERATOR,
+    &HOST_POPULATE,
+    &HOST_POPULATE_OFF,
+    &HOST_LOCK,
+    &LOAD_DRAFT_GLM,
+    &LOAD_DRAFT_OFF_GLM,
+    &CAPTURE,
+    &CAPTURE_PAIR,
+    &LISTENING_GLM,
+    &CACHE_REUSE,
+    &MTP_PROMPT,
+    &RESIDENCY_PASS,
+    &RESIDENCY_RESET,
+    &RESIDENCY_LEAK,
+];
+
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_LEVER,
@@ -2505,6 +3063,7 @@ mod tests {
             BLOOMERY_SERVE_DS41,
             BLOOMERY_SERVE_QWEN38,
             BLOOMERY_SERVE_QWEN3,
+            BLOOMERY_SERVE_GLM,
             GENERATE_GLM5NEXT,
             GENERATE_QWEN3MOE,
             GATE_DEEPSEEK41_PREFILL,
@@ -2762,5 +3321,341 @@ mod tests {
             .u("ctx", 4096)
             .w("addr", "127.0.0.1:8080")
             .line_under(Some(&generate));
+    }
+
+    // ------------------------------------------------------------ the reader
+
+    /// Lines the servers printed, as the serve gates' logs carry them.
+    const PLAN38_PLACED: &str = "plan place=cuda0 card=3090 arch=qwen35moe experts=card \
+        ctx_max=1088 host_experts=5427 card_experts=4813 n_l=120-121 card_free=25052381184 \
+        devices=[stage:3090:cuda0:25350373376] cuda_order=unset(FASTEST_FIRST)";
+    const PLAN38_NO_FREE: &str = "plan place=cuda0 card=3090 arch=qwen35moe experts=card \
+        ctx_max=1088 host_experts=5427 card_experts=4813 n_l=120-121 \
+        devices=[stage:3090:cuda0:25350373376] cuda_order=unset(FASTEST_FIRST)";
+    const PLAN_BP: &str = "plan place=bp card=A6000 ctx_max=16384 card_experts=2552 \
+        (38801506304 B) host_experts=8045 (123885584384 B) host_shadow=0 B n_l=65..66 on 39 \
+        layers card_budget=none card_free=50668240896 \
+        devices=[stage:A6000:cuda1:50952404992,tier0:3090:cuda0:25350373376] \
+        cuda_order=unset(FASTEST_FIRST)";
+    const RESIDENCY_HOST_GLM: &str = "residency host residency=mid-p0-s1 pinned=0 \
+        churn_experts=2552 churn_bytes=38801506304 headroom=111730458624 \
+        headroom_after=68550098944";
+    const LOAD_QWEN3_LINE: &str = "load arch=qwen3moe resident_bytes=24165631476 cache=f16 \
+        ctx=23552 slots=2 slot_ctx=23552 layers=48 ubatch=4096 graph_nodes=604 in 1.5 s";
+    /// A `residency pass` line of an older text: the reread fields came after it.
+    const PASS_OLD: &str = "residency pass pass=driver boundary=119 kept=1 landed=3 late=0 \
+        made=0 in_flight=0 bytes=0 end_us=0 boundary_us=4 wait_us=0 issue_us=0 stage_us=0 \
+        prepare_us=0";
+    /// Lines under a kind's head that are no record: a placement's and the
+    /// host tier's own text.
+    const TEXT_UNDER_HEADS: &str = "load host_tier r8=on (/models/m-r8/m-r8.gguf)\n\
+        load host_tier type=q3_K k=5120 path=r8\n\
+        plan card bytes 23113320896 (dense 3891325376 + experts 19221995520) host bytes \
+        239830005760\n\
+        plan (b′): A6000 (GPU1) 48642009536 B, tier 3090 (GPU0) 881 experts 14777118720 B";
+
+    /// Every kind of every binary's list, rendered by [`Record`] with every
+    /// part given (each flag set) and with every optional part left out, reads
+    /// back whole under that list as that kind, each value as rendered — text
+    /// and words that are not ASCII included.
+    #[test]
+    fn reads_every_kind_whole() {
+        for set in [
+            GENERATE_DS41,
+            BLOOMERY_CHAT,
+            BLOOMERY_SERVE_DS41,
+            BLOOMERY_SERVE_QWEN38,
+            BLOOMERY_SERVE_QWEN3,
+            BLOOMERY_SERVE_GLM,
+            GENERATE_GLM5NEXT,
+            GENERATE_QWEN3MOE,
+            CLEF_HIDDEN_BIN,
+            GATE_DEEPSEEK41_PREFILL,
+        ] {
+            for &kind in set {
+                for full in [true, false] {
+                    let mut r = Record::new(kind);
+                    let mut want: Vec<(&str, String)> = Vec::new();
+                    for p in kind.parts {
+                        match p {
+                            Part::Lit(_) => {}
+                            Part::Flag(n) => {
+                                if full {
+                                    r = r.flag(n, true);
+                                    want.push((n, String::new()));
+                                }
+                            }
+                            Part::Key(f) | Part::Pos(f) => {
+                                if f.opt && !full {
+                                    continue;
+                                }
+                                let (next, text) = match f.ty {
+                                    Ty::U64 => (r.u(f.name, 7), "7".to_owned()),
+                                    Ty::I64 => (r.u(f.name, -3), "-3".to_owned()),
+                                    Ty::F64(d) => (r.f(f.name, 1.5), format!("{:.d$}", 1.5)),
+                                    Ty::Bool => (r.w(f.name, "true"), "true".to_owned()),
+                                    Ty::Word => (r.w(f.name, "w×1"), "w×1".to_owned()),
+                                    Ty::Text => (r.w(f.name, "a b′ c"), "a b′ c".to_owned()),
+                                    Ty::List => (r.list(f.name, &[1u32, 2]), "[1, 2]".to_owned()),
+                                    Ty::Csv => (r.csv(f.name, ["a", "b′"]), "[a,b′]".to_owned()),
+                                };
+                                r = next;
+                                want.push((f.name, text));
+                            }
+                        }
+                    }
+                    let line = r.line();
+                    let got = Log::of(&line, set)
+                        .one(kind)
+                        .unwrap_or_else(|e| panic!("{}: {e}", kind.name));
+                    assert_eq!(got.values, want, "{}: {line}", kind.name);
+                    for (name, text) in &want {
+                        let Some(Part::Key(f) | Part::Pos(f)) =
+                            kind.parts.iter().find(|p| p.value_name() == Some(name))
+                        else {
+                            assert_eq!(got.flag(name), Ok(true), "{}", kind.name);
+                            continue;
+                        };
+                        let read = match f.ty {
+                            Ty::U64 => got.u64(name).map(|v| v.to_string()),
+                            Ty::I64 => got.i64(name).map(|v| v.to_string()),
+                            Ty::F64(d) => got.f64(name).map(|v| format!("{v:.d$}")),
+                            Ty::Bool => got.bool(name).map(|v| v.to_string()),
+                            Ty::Word => got.word(name).map(str::to_owned),
+                            Ty::Text => got.text(name).map(str::to_owned),
+                            Ty::List => Ok(text.clone()),
+                            Ty::Csv => got.csv(name).map(|v| format!("[{}]", v.join(","))),
+                        };
+                        assert_eq!(read.as_ref(), Ok(text), "{}.{name}: {line}", kind.name);
+                    }
+                }
+            }
+        }
+    }
+
+    /// An optional part the line leaves out reads as absent, and the parts
+    /// after it keep their own values: the server's `plan` lines with and
+    /// without `card_free`, and a qwen4exp `plan` line with no `n_l`.
+    #[test]
+    fn optional_parts_left_out_read_as_absent() {
+        let q3 = |line: &str| Log::of(line, BLOOMERY_SERVE_QWEN3).one(&PLAN38).unwrap();
+        let placed = q3(PLAN38_PLACED);
+        assert_eq!(placed.opt_u64("card_free"), Ok(Some(25_052_381_184)));
+        assert_eq!(placed.word("n_l"), Ok("120-121"));
+        let bare = q3(PLAN38_NO_FREE);
+        assert_eq!(bare.opt_u64("card_free"), Ok(None));
+        assert_eq!(bare.opt_word("tier"), Ok(None));
+        assert_eq!(bare.opt_u64("tier_experts"), Ok(None));
+        assert_eq!(bare.opt_word("why"), Ok(None));
+        assert_eq!(
+            bare.csv("devices"),
+            Ok(vec!["stage:3090:cuda0:25350373376"])
+        );
+        assert_eq!(bare.word("cuda_order"), Ok("unset(FASTEST_FIRST)"));
+        assert!(matches!(
+            bare.u64("card_free"),
+            Err(ReadError::Missing {
+                kind: "plan38",
+                field: "card_free",
+                ..
+            })
+        ));
+        let exp = Record::new(&PLAN38)
+            .w("place", "a")
+            .w("card", "A6000")
+            .w("experts", "card")
+            .u("ctx_max", 4096)
+            .u("host_experts", 11_735)
+            .u("card_experts", 12_841)
+            .u("card_free", 5)
+            .line();
+        let exp = Log::of(&exp, BLOOMERY_SERVE_QWEN38).one(&PLAN38).unwrap();
+        assert_eq!(exp.opt_word("n_l"), Ok(None));
+        assert_eq!(exp.opt_word("arch"), Ok(None));
+        assert_eq!(exp.u64("card_free"), Ok(5));
+        let bp = Log::of(PLAN_BP, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+        assert_eq!(bp.u64("card_free"), Ok(50_668_240_896));
+        assert_eq!(
+            bp.csv("devices"),
+            Ok(vec![
+                "stage:A6000:cuda1:50952404992",
+                "tier0:3090:cuda0:25350373376"
+            ])
+        );
+        assert_eq!(bp.word("card_budget"), Ok("none"));
+    }
+
+    /// Kinds that share a head are told apart by the whole line: a qwen3moe
+    /// `plan` line is a `plan38` record beside a `plan` one, and under the
+    /// V4.1 server's kinds a `cache save` line is a `cache_save` record, not
+    /// the `cache` (config) one, nor is a `cache reuse` line.
+    #[test]
+    fn shared_heads_read_by_the_whole_line() {
+        let both: &[&'static Kind] = &[&PLAN, &PLAN38];
+        let log = Log::of(&format!("{PLAN_BP}\n{PLAN38_PLACED}"), both);
+        assert_eq!(
+            log.one(&PLAN).map(|f| f.line().to_owned()),
+            Ok(PLAN_BP.to_owned())
+        );
+        let plan38 = log.one(&PLAN38).unwrap();
+        assert_eq!((plan38.at(), plan38.line()), (2, PLAN38_PLACED));
+        let ds41 = Log::of(
+            "cache ram=8589934592 headroom=111730458624 user_start=<|User|> in_template=true\n\
+             cache save positions=46 bytes=359555072 ms=103.234 entries=2 cache_bytes=718986240\n\
+             cache reuse common=40 ask=40 kept=38 held=46 reason=the cut at a message start",
+            BLOOMERY_SERVE_DS41,
+        );
+        let config = ds41.one(&CACHE_CONFIG).unwrap();
+        assert_eq!(config.u64("ram"), Ok(8_589_934_592));
+        assert_eq!(config.bool("in_template"), Ok(true));
+        assert_eq!(
+            ds41.one(&CACHE_SAVE).and_then(|f| f.u64("positions")),
+            Ok(46)
+        );
+        assert_eq!(
+            ds41.one(&CACHE_REUSE)
+                .map(|f| f.text("reason").map(str::to_owned)),
+            Ok(Ok("the cut at a message start".to_owned()))
+        );
+        let q3 = Log::of(LOAD_QWEN3_LINE, BLOOMERY_SERVE_QWEN3);
+        assert_eq!(
+            q3.one(&LOAD_QWEN3).and_then(|f| f.u64("slot_ctx")),
+            Ok(23_552)
+        );
+    }
+
+    /// A line that opens a kind's record and does not read whole is refused
+    /// by name on every read of each kind it opens, never read as no record;
+    /// a line under a kind's head that opens no record (a placement's text,
+    /// the host tier's) refuses nothing.
+    #[test]
+    fn a_line_that_opens_a_record_and_does_not_read_whole_is_refused() {
+        let text = format!("{RESIDENCY_HOST_GLM}\n{PASS_OLD}");
+        let log = Log::of(&text, BLOOMERY_SERVE_QWEN38).named("server.err");
+        let broken = ReadError::Broken {
+            log: "server.err".to_owned(),
+            kind: "residency_pass",
+            at: 2,
+            line: PASS_OLD.to_owned(),
+        };
+        assert_eq!(log.all(&RESIDENCY_PASS).unwrap_err(), broken);
+        assert_eq!(log.first(&RESIDENCY_PASS).unwrap_err(), broken);
+        assert_eq!(log.one(&RESIDENCY_PASS).unwrap_err(), broken);
+        assert!(
+            broken
+                .to_string()
+                .contains("server.err: line 2 opens a `residency_pass`")
+        );
+        assert_eq!(
+            log.one(&RESIDENCY_HOST).and_then(|f| f.u64("pinned")),
+            Ok(0)
+        );
+        // `plan` and `plan38` share their head and first field: a line that
+        // opens both and reads as neither refuses both.
+        let both: &[&'static Kind] = &[&PLAN, &PLAN38];
+        let torn = "plan place=a card=A6000 ctx_max=4096 card_experts=12841";
+        let log = Log::of(torn, both);
+        assert!(matches!(
+            log.first(&PLAN),
+            Err(ReadError::Broken { kind: "plan", .. })
+        ));
+        assert!(matches!(
+            log.first(&PLAN38),
+            Err(ReadError::Broken { kind: "plan38", .. })
+        ));
+        let text = format!("{TEXT_UNDER_HEADS}\n{PLAN_BP}");
+        let log = Log::of(&text, BLOOMERY_SERVE_DS41);
+        assert_eq!(
+            log.one(&PLAN).map(|f| f.line().to_owned()),
+            Ok(PLAN_BP.to_owned())
+        );
+        assert_eq!(log.first(&LOAD_GENERATOR).map(|f| f.is_none()), Ok(true));
+    }
+
+    /// `one` names the kind and the log when the log holds none of it, or
+    /// more than one, and `all` refuses a kind the log is not read by.
+    #[test]
+    fn one_names_an_absent_kind_and_the_log() {
+        let log = Log::of(TEXT_UNDER_HEADS, BLOOMERY_SERVE_DS41).named("server.err");
+        let absent = log.one(&PLAN).unwrap_err();
+        assert_eq!(
+            absent,
+            ReadError::Absent {
+                log: "server.err".to_owned(),
+                kind: "plan"
+            }
+        );
+        assert_eq!(absent.to_string(), "server.err: no `plan` record");
+        let twice = Log::of(&format!("{PLAN_BP}\n{PLAN_BP}"), BLOOMERY_SERVE_DS41);
+        assert!(matches!(
+            twice.one(&PLAN),
+            Err(ReadError::Many {
+                kind: "plan",
+                n: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            log.all(&LISTENING38),
+            Err(ReadError::NotPrinted {
+                kind: "listening38",
+                ..
+            })
+        ));
+    }
+
+    /// A field read is refused by name when the kind has no such field, when
+    /// the field is of another type, when the line left it out, and when its
+    /// value is past the type's range.
+    #[test]
+    fn field_reads_refuse_by_name() {
+        let host = Log::of(RESIDENCY_HOST_GLM, BLOOMERY_SERVE_QWEN38)
+            .one(&RESIDENCY_HOST)
+            .unwrap();
+        assert_eq!(host.i64("headroom_after"), Ok(68_550_098_944));
+        assert_eq!(host.word("residency"), Ok("mid-p0-s1"));
+        assert!(matches!(
+            host.u64("landed"),
+            Err(ReadError::NoField {
+                kind: "residency_host",
+                ..
+            })
+        ));
+        assert!(matches!(
+            host.u64("headroom"),
+            Err(ReadError::Type {
+                field: "headroom",
+                ty: Ty::I64,
+                asked: "u64",
+                ..
+            })
+        ));
+        assert!(matches!(
+            host.csv("residency"),
+            Err(ReadError::Type {
+                ty: Ty::Word,
+                asked: "csv",
+                ..
+            })
+        ));
+        let plan = Log::of(PLAN38_NO_FREE, BLOOMERY_SERVE_QWEN3)
+            .one(&PLAN38)
+            .unwrap();
+        assert!(matches!(
+            plan.u64("card_free"),
+            Err(ReadError::Missing {
+                field: "card_free",
+                ..
+            })
+        ));
+        let past = PLAN38_PLACED.replace("card_experts=4813", "card_experts=99999999999999999999");
+        let past = Log::of(&past, BLOOMERY_SERVE_QWEN3).one(&PLAN38).unwrap();
+        assert!(matches!(
+            past.u64("card_experts"),
+            Err(ReadError::Value {
+                field: "card_experts",
+                ..
+            })
+        ));
     }
 }

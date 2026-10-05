@@ -148,7 +148,10 @@ mod gate {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
+    use bloomery_gpu_gates::record::{self, Log};
+    use bloomery_gpu_gates::serve_client::{
+        curl, ids_of, json_of, metric, parse_ids, server_log, stage_usable,
+    };
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::glm5next::place::{NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs};
@@ -399,41 +402,30 @@ mod gate {
             .collect())
     }
 
-    /// The first line of `lines` that starts with `head` and a space.
-    fn record<'a>(lines: &'a [String], head: &str) -> Option<&'a str> {
-        let prefix = format!("{head} ");
-        lines
-            .iter()
-            .find(|l| l.starts_with(&prefix))
-            .map(String::as_str)
+    /// `lines` of the server's stderr, read by the seat's record kinds.
+    fn seat_log(lines: &[String]) -> Log {
+        Log::of(&lines.join("\n"), record::BLOOMERY_SERVE_GLM)
     }
 
-    /// The `group=` of the `load` record in `lines` (the generator's, which
-    /// opens with `resident_bytes=`).
-    fn load_group(lines: &[String]) -> Option<&str> {
-        lines
-            .iter()
-            .find(|l| l.starts_with("load resident_bytes="))
-            .and_then(|l| field(l, "group"))
+    /// The `group` of the one `load` record in `log`.
+    fn load_group(log: &Log) -> Result<Option<u64>, GateError> {
+        Ok(log.one(&record::LOAD_GENERATOR)?.opt_u64("group")?)
     }
 
-    /// The value of `key=` in a record line.
+    /// The value of `key=` in a seat's line that no record kind reads.
     fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         line.split_whitespace()
             .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
     }
 
-    /// The `residency pass` records of `lines`: each pass's kind, the rows
-    /// it kept and the flips that went live at its boundary.
-    fn passes(lines: &[String]) -> Vec<(String, u64, u64)> {
-        lines
-            .iter()
-            .filter(|l| l.starts_with("residency pass "))
-            .filter_map(|l| {
-                let n = |k| field(l, k).and_then(|v| v.parse::<u64>().ok());
-                Some((field(l, "pass")?.to_owned(), n("kept")?, n("landed")?))
-            })
-            .collect()
+    /// The `residency pass` records of `log`: each pass's kind, the rows it
+    /// kept and the flips that went live at its boundary.
+    fn passes(log: &Log) -> Result<Vec<(String, u64, u64)>, GateError> {
+        let mut out = Vec::new();
+        for f in log.all(&record::RESIDENCY_PASS)? {
+            out.push((f.word("pass")?.to_owned(), f.u64("kept")?, f.u64("landed")?));
+        }
+        Ok(out)
     }
 
     /// The tokens a run produced through the first pass whose boundary
@@ -520,13 +512,13 @@ mod gate {
     /// with `--last-step` when `last_step` (the server's cut: the prompt less
     /// its last id, then a step), beside this binary under the arm's levers,
     /// stdout to `<dir>/gen.log` and stderr to `<dir>/gen.err`: its `tokens`
-    /// line and its stdout.
+    /// line and its stdout read by its record kinds.
     fn cli(
         dir: &Path,
         levers: Levers,
         ids: &[u32],
         last_step: bool,
-    ) -> Result<(Vec<u32>, Vec<String>), GateError> {
+    ) -> Result<(Vec<u32>, Log), GateError> {
         let exe = beside("generate_glm5next")?;
         let tokens = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
         let out = dir.join("gen.log");
@@ -561,10 +553,12 @@ mod gate {
             .find_map(|l| l.strip_prefix("tokens "))
             .ok_or_else(|| format!("{}: no `tokens` line", out.display()))?;
         let got = parse_ids(line)?;
-        if let Some(s) = record(&lines, "mtp summary") {
-            println!("generate_glm5next {s}");
+        let log =
+            Log::of(&lines.join("\n"), record::GENERATE_GLM5NEXT).named(out.display().to_string());
+        if let Some(s) = log.first(&record::MTP_SUMMARY)? {
+            println!("generate_glm5next {}", s.line());
         }
-        Ok((got, lines))
+        Ok((got, log))
     }
 
     /// `/props`' `engine` object: the draft it names, and the card's `draft`
@@ -654,30 +648,41 @@ mod gate {
     /// and run the residency's default word, `--place gate` neither.
     fn unset_rule(dir: &Path) -> Result<bool, GateError> {
         let mut ok = true;
-        let picks = |lines: &[String], draft: &str, residency: &str| {
-            let d = format!("draft unset draft={draft} why=");
-            let r = format!("residency unset residency={residency} why=");
-            lines.iter().any(|l| l.starts_with(&d))
-                && lines.iter().any(|l| l.starts_with(&r))
-                && !lines.iter().any(|l| l.contains("listening on"))
+        let picks = |lines: &[String], draft: &str, residency: &str| -> Result<bool, GateError> {
+            let log = seat_log(lines);
+            let d = log.one(&record::DRAFT_UNSET_GLM)?;
+            let r = log.one(&record::RESIDENCY_UNSET_GLM)?;
+            let listening = log.first(&record::LISTENING_GLM)?;
+            let host = log.first(&record::RESIDENCY_HOST)?;
+            println!(
+                "  read: draft unset {}, residency unset {}, residency host {}, listening {}",
+                d.word("draft")?,
+                r.word("residency")?,
+                host.is_some(),
+                listening.is_some()
+            );
+            Ok(d.word("draft")? == draft
+                && r.word("residency")? == residency
+                && listening.is_none()
+                && host.is_some() == (residency != "off"))
         };
         let (a_ok, a) = plan_only(dir, "a")?;
         check(
             &mut ok,
             "unset_place_a_drafts_and_runs_mid_p0_s1",
-            a_ok && picks(&a, "mtp", RESIDENCY_WORD) && record(&a, "residency host").is_some(),
+            a_ok && picks(&a, "mtp", RESIDENCY_WORD)?,
         );
         let (bp_ok, bp) = plan_only(dir, "bp")?;
         check(
             &mut ok,
             "unset_place_bp_drafts_and_runs_mid_p0_s1",
-            bp_ok && picks(&bp, "mtp", RESIDENCY_WORD) && record(&bp, "residency host").is_some(),
+            bp_ok && picks(&bp, "mtp", RESIDENCY_WORD)?,
         );
         let (g_ok, g) = plan_only(dir, "gate")?;
         check(
             &mut ok,
             "unset_place_gate_runs_neither",
-            g_ok && picks(&g, "off", "off") && record(&g, "residency host").is_none(),
+            g_ok && picks(&g, "off", "off")?,
         );
         // Every placement's `ctx` line: a rule word of the default rule's,
         // its context at or past the floor while the card holds it (a card
@@ -700,57 +705,47 @@ mod gate {
         // pinned count (0: no seed expert pinned, the pool every card expert
         // lands in) and the headroom left past it. FAIL-first: a default that
         // pins seed experts, or a pool past the headroom, turns this red.
-        let pool = |lines: &[String]| -> Option<(u64, i128)> {
-            let l = record(lines, "residency host")?;
-            Some((
-                field(l, "pinned")?.parse().ok()?,
-                field(l, "headroom_after")?.parse().ok()?,
-            ))
-        };
+        let mut pools = Vec::new();
+        for lines in [&a, &bp] {
+            let host = seat_log(lines).one(&record::RESIDENCY_HOST)?;
+            pools.push((host.u64("pinned")?, host.i64("headroom_after")?));
+        }
+        println!("--place a and bp: residency host (pinned, headroom_after) {pools:?}");
         check(
             &mut ok,
             "unset_default_pool_is_p0_inside_the_headroom",
-            [&a, &bp]
-                .into_iter()
-                .all(|lines| pool(lines).is_some_and(|(pinned, after)| pinned == 0 && after >= 0)),
+            pools
+                .iter()
+                .all(|&(pinned, after)| pinned == 0 && after >= 0),
         );
         // Every plan line names its stage card's free bytes at plan time, at
         // most its usable bytes — the census term the expert rule filled
         // within (memguard). FAIL-first: a plan line that drops it, or names
         // it past the card's usable bytes, turns this red.
         for (place, lines) in [("a", &a), ("bp", &bp), ("gate", &g)] {
-            let named = record(lines, "plan").is_some_and(|l| {
-                let free = l
-                    .split("card_free=")
-                    .nth(1)
-                    .and_then(|t| t.split(' ').next())
-                    .and_then(|n| n.parse::<u64>().ok());
-                let usable = l
-                    .split("devices=")
-                    .nth(1)
-                    .and_then(|d| d.split([',', ' ', ']']).next())
-                    .and_then(|c| c.rsplit(':').next())
-                    .and_then(|n| n.parse::<u64>().ok());
-                free.is_some_and(|f| usable.is_some_and(|u| f <= u))
-            });
-            println!("--place {place}: card_free named and within usable {named}");
+            let plan = seat_log(lines).one(&record::PLAN)?;
+            let free = plan.opt_u64("card_free")?;
+            let usable = stage_usable(&plan)?;
+            let named = free.is_some_and(|f| f <= usable);
+            println!(
+                "--place {place}: card_free named and within usable {named}: card_free={free:?}, \
+                 usable {usable}"
+            );
             check(&mut ok, "plan_names_the_cards_free_bytes", named);
         }
         Ok(ok)
     }
 
-    /// The stage card's free bytes as a server's own `plan` line read them
-    /// (the census reading its rule searched against).
-    fn server_card_free(err_log: &Path) -> Result<Option<u64>, GateError> {
-        Ok(lines_from(err_log, 0)?
-            .into_iter()
-            .find(|l| l.starts_with("plan "))
-            .and_then(|l| {
-                l.split("card_free=")
-                    .nth(1)
-                    .and_then(|t| t.split(' ').next())
-                    .and_then(|n| n.parse::<u64>().ok())
-            }))
+    /// The stage card's free bytes as a server's own `plan` record read
+    /// them (the census reading its rule searched against). A server that
+    /// printed no `plan` record or more than one, or a record without its
+    /// `card_free`, is a named error, never an uncapped re-plan.
+    fn server_card_free(err_log: &Path) -> Result<u64, GateError> {
+        let free = server_log(err_log, record::BLOOMERY_SERVE_GLM)?
+            .one(&record::PLAN)?
+            .u64("card_free")?;
+        println!("the server's plan record: card_free={free}");
+        Ok(free)
     }
 
     /// The plan's stage-card expert bytes on the gate card at `ctx`, plain,
@@ -864,7 +859,7 @@ mod gate {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inputs = PlanInputs::read(&split)?;
         let plan_levers = PlanLevers::from_levers(levers)?;
-        let free = server_card_free(&err_log)?;
+        let free = Some(server_card_free(&err_log)?);
         let at = |c: usize| card_at(&inputs, &plan_levers, c, free);
         let base = at(CTX)?.ok_or("no plan at the base context")?;
         let lost = |c: usize| -> Result<Option<u64>, GateError> {
@@ -993,14 +988,21 @@ mod gate {
         let addr = served.address(&err_log)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
-        let load = lines_from(&err_log, 0)?;
+        let load = server_log(&err_log, record::BLOOMERY_SERVE_GLM)?;
+        let draft = load.first(&record::LOAD_DRAFT_GLM)?;
+        let lever = load.one(&record::RESIDENCY_LEVER)?;
+        let (word, why) = (lever.word("residency")?, lever.word("why")?);
+        let host = load.first(&record::RESIDENCY_HOST)?;
+        println!(
+            "draft-only records: load draft {:?}, residency lever {word} why={why}, residency \
+             host {:?}",
+            draft.as_ref().map(record::Fields::line),
+            host.as_ref().map(record::Fields::line)
+        );
         check(
             &mut ok,
             "draft_only_loads_the_draft_and_no_residency",
-            record(&load, "load draft=mtp").is_some()
-                && record(&load, "residency lever")
-                    == Some("residency lever residency=off why=set")
-                && record(&load, "residency host").is_none(),
+            draft.is_some() && word == "off" && why == "set" && host.is_none(),
         );
         let c = greedy(&url, ids, N_PREDICT, false)?;
         let got = ids_of(&c["tokens"]);
@@ -1131,11 +1133,8 @@ mod gate {
 
         /// The `mtp prompt` records this request printed that say the draft
         /// skips.
-        fn skips(&self) -> usize {
-            self.lines
-                .iter()
-                .filter(|l| l.starts_with("mtp prompt ") && !l.ends_with(" skipped=none"))
-                .count()
+        fn skips(&self) -> Result<usize, GateError> {
+            skips(&seat_log(&self.lines))
         }
     }
 
@@ -1215,11 +1214,15 @@ mod gate {
             !a2.tokens.is_empty() && a2.tokens == r2.tokens,
         );
         if drafted {
+            let (a2_skips, r2_skips) = (a2.skips()?, r2.skips()?);
+            println!(
+                "cache {label}: draft skips A resent after B {a2_skips}, no switch {r2_skips}"
+            );
             check(
                 &mut ok,
                 "cache_drafted_a_draft_rejoins_where_a_left_it",
-                a2.skips() == 0
-                    && r2.skips() == 0
+                a2_skips == 0
+                    && r2_skips == 0
                     && a2.draft_n > 0
                     && a2.accepted > 0
                     && (a2.draft_n, a2.accepted) == (r2.draft_n, r2.accepted),
@@ -1368,8 +1371,12 @@ mod gate {
         let resend: Vec<u32> = p1.iter().chain(&a1.tokens).chain(&later).copied().collect();
         let a2 = Turn::run(url, err_log, &resend, true)?;
         a2.show("residency resume: A resent after B");
-        let a2_passes = passes(&a2.lines);
-        println!("residency resume: A resent's passes (kind, kept, landed) {a2_passes:?}");
+        let a2_passes = passes(&seat_log(&a2.lines))?;
+        let a2_skips = a2.skips()?;
+        println!(
+            "residency resume: A resent's passes (kind, kept, landed) {a2_passes:?}, draft skips \
+             {a2_skips}"
+        );
         let mut ok = true;
         check(
             &mut ok,
@@ -1380,23 +1387,20 @@ mod gate {
                 && a2.cache_n >= (p1.len() + N_PREDICT - 1) as u64
                 && !a2.tokens.is_empty()
                 && !a2_passes.is_empty()
-                && a2.skips() == 0
+                && a2_skips == 0
                 && a2.draft_n > 0,
         );
         Ok(ok)
     }
 
-    /// `/metrics`' `llamacpp:<name>` value; `None` when it carries none.
-    fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
-        let (st, body) = curl(&url("/metrics"), None, false)?;
-        if st != 200 {
-            return Err(format!("/metrics: HTTP {st}: {body}").into());
+    /// The `mtp prompt` records of `log` that say the draft skips (their
+    /// `skipped` not `none`).
+    fn skips(log: &Log) -> Result<usize, GateError> {
+        let mut n = 0;
+        for f in log.all(&record::MTP_PROMPT)? {
+            n += usize::from(f.text("skipped")? != "none");
         }
-        let key = format!("llamacpp:{name} ");
-        Ok(body
-            .lines()
-            .find_map(|l| l.strip_prefix(&key))
-            .and_then(|v| v.trim().parse().ok()))
+        Ok(n)
     }
 
     /// The swap clause (module header) on a server of two slots started into
@@ -1500,10 +1504,7 @@ mod gate {
                 at,
             ));
         }
-        let skips = lines_from(&err_log, from)?
-            .iter()
-            .filter(|l| l.starts_with("mtp prompt ") && !l.ends_with(" skipped=none"))
-            .count();
+        let skips = skips(&seat_log(&lines_from(&err_log, from)?))?;
         let after = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
         println!(
             "swap together: first {} ids of {} drafts, second {} ids of {} drafts, second back \
@@ -1557,20 +1558,27 @@ mod gate {
             "plain_health_ok",
             st == 200 && body.contains("\"ok\""),
         );
-        let load = lines_from(&err_log, 0)?;
-        let lever = record(&load, "residency lever");
+        let load = server_log(&err_log, record::BLOOMERY_SERVE_GLM)?;
+        let off = load.one(&record::LOAD_DRAFT_OFF_GLM)?;
+        let lever = load.one(&record::RESIDENCY_LEVER)?;
+        let (word, why) = (lever.word("residency")?, lever.word("why")?);
+        let host = load.first(&record::RESIDENCY_HOST)?;
+        let pair = load.first(&record::CAPTURE_PAIR)?;
         println!(
-            "plain records: {:?} {lever:?}",
-            record(&load, "load draft=off")
+            "plain records: load draft=off ({}), residency lever {word} why={why}, residency host \
+             {:?}, pair capture {:?}",
+            off.text("why")?,
+            host.as_ref().map(record::Fields::line),
+            pair.as_ref().map(record::Fields::line)
         );
         check(
             &mut ok,
             "plain_loads_no_draft_and_no_residency",
-            load.iter()
-                .any(|l| l == "load draft=off (BLOOMERY_DRAFT=off)")
-                && lever == Some("residency lever residency=off why=set")
-                && record(&load, "residency host").is_none()
-                && !load.iter().any(|l| l.contains("pair_graph_nodes=")),
+            off.text("why")? == "BLOOMERY_DRAFT=off"
+                && word == "off"
+                && why == "set"
+                && host.is_none()
+                && pair.is_none(),
         );
         ok &= props_draft(&url, None)?;
         let ids = chat_ids(&url)?;
@@ -1586,20 +1594,20 @@ mod gate {
         ok &= cache(&url, &err_log, false)?;
         ok &= round_trip(&url, &err_log)?;
         println!("plain server stopped: {}", served.stop()?);
-        let (reference, cli_lines) = cli(dir, PLAIN, &ids, true)?;
+        let (reference, cli_log) = cli(dir, PLAIN, &ids, true)?;
         println!("generate_glm5next tokens {reference:?}");
         check(
             &mut ok,
             "plain_ids_are_generate_glm5next",
             agree(&got, &stop, &reference),
         );
-        let (seat, cli_group) = (load_group(&load), load_group(&cli_lines));
+        let (seat, cli_group) = (load_group(&load)?, load_group(&cli_log)?);
         println!("plain load groups: the seat's {seat:?}, generate_glm5next's {cli_group:?}");
-        let want = PROMPT_GROUP.to_string();
+        let want = Some(u64::try_from(PROMPT_GROUP)?);
         check(
             &mut ok,
             "plain_loads_run_the_reserved_group",
-            seat == Some(want.as_str()) && cli_group == Some(want.as_str()),
+            seat == want && cli_group == want,
         );
         ok &= draft_only(dir, &ids, &reference)?;
         Ok(ok)
@@ -1620,21 +1628,30 @@ mod gate {
             "drafted_health_ok",
             st == 200 && body.contains("\"ok\""),
         );
-        let load = lines_from(&err_log, 0)?;
-        let named = format!("residency={RESIDENCY_WORD}");
-        let (draft, lever, host) = (
-            record(&load, "load draft=mtp"),
-            record(&load, "residency lever"),
-            record(&load, "residency host"),
+        let load = server_log(&err_log, record::BLOOMERY_SERVE_GLM)?;
+        let draft = load.first(&record::LOAD_DRAFT_GLM)?;
+        let pair = load.first(&record::CAPTURE_PAIR)?;
+        let lever = load.one(&record::RESIDENCY_LEVER)?;
+        let host = load.one(&record::RESIDENCY_HOST)?;
+        let (word, why, host_word) = (
+            lever.word("residency")?,
+            lever.word("why")?,
+            host.word("residency")?,
         );
-        println!("drafted records: {draft:?} {lever:?} {host:?}");
+        println!(
+            "drafted records: load draft {:?}, pair capture {:?}, residency lever {word} \
+             why={why}, residency host {host_word}",
+            draft.as_ref().map(record::Fields::line),
+            pair.as_ref().map(record::Fields::line)
+        );
         check(
             &mut ok,
             "drafted_loads_the_draft_and_the_word",
             draft.is_some()
-                && load.iter().any(|l| l.contains("pair_graph_nodes="))
-                && lever.is_some_and(|l| l.contains(&named) && l.ends_with(" why=set"))
-                && host.is_some_and(|l| l.contains(&named)),
+                && pair.is_some()
+                && word == RESIDENCY_WORD
+                && why == "set"
+                && host_word == RESIDENCY_WORD,
         );
         ok &= props_draft(&url, Some(bytes))?;
         let ids = chat_ids(&url)?;
@@ -1648,7 +1665,7 @@ mod gate {
             "drafted completion tokens {first:?} stop_type={stop} draft_n={} draft_n_accepted={}",
             t["draft_n"], t["draft_n_accepted"]
         );
-        let served_passes = passes(&lines_from(&err_log, before)?);
+        let served_passes = passes(&seat_log(&lines_from(&err_log, before)?))?;
         println!("drafted completion passes (kind, kept, landed) {served_passes:?}");
         check(
             &mut ok,
@@ -1665,15 +1682,30 @@ mod gate {
 
         let (st, body) = curl(&url("/residency/reset"), Some(&json!({})), false)?;
         let reset: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-        let reset_line = record(&lines_from(&err_log, 0)?, "residency reset").map(str::to_owned);
-        println!("drafted residency reset: HTTP {st} {reset}; record {reset_line:?}");
-        let counts = ["cancelled", "copies", "diff"].map(|k| format!("{k}={}", reset[k]));
+        let names = ["cancelled", "copies", "diff"];
+        let counts = match server_log(&err_log, record::BLOOMERY_SERVE_GLM)?
+            .first(&record::RESIDENCY_RESET)?
+        {
+            Some(r) => Some(
+                names
+                    .iter()
+                    .map(|k| r.u64(k))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
+        println!("drafted residency reset: HTTP {st} {reset}; record {names:?} {counts:?}");
         check(
             &mut ok,
             "drafted_reset_is_a_200_with_its_record",
             st == 200
                 && reset["diff"] == json!(0)
-                && reset_line.is_some_and(|l| counts.iter().all(|c| l.contains(&format!(" {c} ")))),
+                && counts.is_some_and(|c| {
+                    names
+                        .iter()
+                        .zip(&c)
+                        .all(|(k, v)| reset[*k].as_u64() == Some(*v))
+                }),
         );
         let again = ids_of(&greedy(&url, &ids, N_PREDICT, false)?["tokens"]);
         println!("drafted completion after the reset tokens {again:?}");
@@ -1693,9 +1725,10 @@ mod gate {
         extended.extend_from_slice(&first);
         let joins_from = lines_from(&err_log, 0)?.len();
         let x = greedy(&url, &extended, 8, true)?;
-        let joins: Vec<String> = lines_from(&err_log, joins_from)?
-            .into_iter()
-            .filter(|l| l.starts_with("mtp prompt "))
+        let joins: Vec<String> = seat_log(&lines_from(&err_log, joins_from)?)
+            .all(&record::MTP_PROMPT)?
+            .iter()
+            .map(|f| f.line().to_owned())
             .collect();
         println!(
             "drafted continuation (not held): cache_n={} draft_n={} tokens {:?} joins {joins:?}",
@@ -1708,8 +1741,8 @@ mod gate {
         println!("drafted server stopped: {}", served.stop()?);
         ok &= swap_rejoins_the_draft(dir)?;
 
-        let (reference, cli_lines) = cli(dir, DRAFTED, &ids, true)?;
-        let cli_passes = passes(&cli_lines);
+        let (reference, cli_log) = cli(dir, DRAFTED, &ids, true)?;
+        let cli_passes = passes(&cli_log)?;
         println!("generate_glm5next tokens {reference:?}");
         println!("generate_glm5next passes (kind, kept, landed) {cli_passes:?}");
         let landing = before_landing(&served_passes, 0).min(before_landing(&cli_passes, 0));
