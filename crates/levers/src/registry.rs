@@ -572,17 +572,17 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             trim: false,
         },
         default: Unset::Is("1"),
-        doc: "`generate_qwen3moe` on a whole-card qwen3moe file or a qwen4exp file, and \
+        doc: "`generate_qwen3moe` on a whole-card qwen3moe or qwen35moe file or a qwen4exp file, and \
               `generate_ds41` (V4.1): N streams decoded in one pass (`GpuModel::step_slots`). \
               Each arm's ids are N windows of equal length, window j prefilled into slot j; then \
               `-n` − 1 rounds of one pass of a row a slot, each slot fed its own argmax. Under \
               `--time` a round prints `time pass <r> ms= positions=N kind=slots` (the depth \
               runners' aggregate row: Σ positions / Σ ms). 1 is the one-sequence run, the \
-              same-binary arm. N past the body's pass rows (`SlotRows::MAX_ROWS`: 8 for qwen3moe \
-              and qwen4exp, 2 for V4.1) and an id count N does not divide are refused by name. \
+              same-binary arm. N past the body's pass rows (`SlotRows::MAX_ROWS`: 8 for qwen3moe, \
+              qwen35moe and qwen4exp, 2 for V4.1) and an id count N does not divide are refused by name. \
               `generate_qwen3moe` prints every slot's ids as `step` lines ending in `slot=<j>`, \
-              plans a qwen4exp load for N resident sequences, and refuses N ≥ 2 on a qwen35moe \
-              file (no `SlotRows`), a placed qwen3moe load, a qwen4exp run that drafts \
+              plans a qwen4exp load for N resident sequences, and refuses N ≥ 2 on a placed \
+              qwen3moe or qwen35moe load, a qwen4exp run that drafts \
               (`BLOOMERY_DRAFT=off` runs it plain), and beside `--prompt`, `--seed-depth`, \
               `--last-step`, `--logits`, `--dump-taps`, and on a qwen4exp file \
               `BLOOMERY_STEP_STATS` and `BLOOMERY_ROUTE_TRACE`. `generate_ds41` loads a plan of N \
