@@ -170,8 +170,10 @@
 //!   back its argmax, a pass of two rows on slot 0 beside one on slot 1,
 //!   and a pass of slot 1 alone. (j1) every row's id and logits, and each
 //!   slot's position and K/V rows, bit for bit the slot's solo run (slot 0
-//!   alone from a reset, the prompt then a step a token) — in graph mode
-//!   and again in eager mode. (j2) the captured pass of slots 0 and 1 at a
+//!   alone from a reset, the prompt then a step a token); then slot 1 reset
+//!   and prompted again, and one more pass of both slots bit for bit their
+//!   solo steps (a capture replayed across a reset reads the same planes) —
+//!   in graph mode and again in eager mode. (j2) the captured pass of slots 0 and 1 at a
 //!   row each holds the two-row pass of slot 0's nodes plus one slot's
 //!   ([`J_SLOT_LAYER_NODES`] a layer and its embedding), one memcpy a row
 //!   in each; the one-row pass and the difference from it print, with the
@@ -2651,8 +2653,14 @@ mod gate {
     }
 
     /// Slot 0 alone from a reset — the state a fresh process stands in,
-    /// (k) — on `prompt`, then `steps` steps each feeding its argmax.
-    fn j_solo(m: &mut Qwen3moeModel, prompt: &[u32], steps: usize) -> Result<JRun, GateError> {
+    /// (k) — on `prompt`, then `steps` steps each feeding its argmax; and
+    /// the id and logits hash of one step more, past the run's position and
+    /// K/V rows.
+    fn j_solo(
+        m: &mut Qwen3moeModel,
+        prompt: &[u32],
+        steps: usize,
+    ) -> Result<(JRun, (u32, u64)), GateError> {
         m.select_slot(0)?;
         m.reset()?;
         let mut ids = vec![m.prefill_with(prompt, PrefillPath::Pass)?];
@@ -2662,12 +2670,45 @@ mod gate {
             logits.push(Fnv1a64::default().f32s(&m.logits()?).value());
         }
         let pos = m.pos();
-        Ok(JRun {
-            ids,
-            logits,
-            pos,
-            kv: kv_fnv(m, usize::try_from(pos)?)?,
-        })
+        let kv = kv_fnv(m, usize::try_from(pos)?)?;
+        let next = m.step(&[ids[steps]])?;
+        let next_logits = Fnv1a64::default().f32s(&m.logits()?).value();
+        Ok((
+            JRun {
+                ids,
+                logits,
+                pos,
+                kv,
+            },
+            (next, next_logits),
+        ))
+    }
+
+    /// After a slot-0 run `ra`: slot 1 reset and prefilled on `b` again,
+    /// then one pass of both slots — slot 0's last id beside slot 1's
+    /// prompt argmax — against slot 0's solo step past its run (`a_next`)
+    /// and slot 1's solo first step (`sb`). A capture replayed across the
+    /// reset reads the same planes, so any other answer is red.
+    fn j_after_reset(
+        m: &mut Qwen3moeModel,
+        b: &[u32],
+        ra: &JRun,
+        a_next: (u32, u64),
+        sb: &JRun,
+    ) -> Result<bool, GateError> {
+        m.select_slot(1)?;
+        m.reset()?;
+        let b0 = m.prefill_with(b, PrefillPath::Pass)?;
+        let a_last = *ra.ids.last().ok_or("(j): slot 0's run holds no id")?;
+        let out = m.step_slots(&[(0, &[a_last]), (1, &[b0])])?;
+        let logits: Vec<u64> = m
+            .slots_logits()?
+            .iter()
+            .map(|l| Fnv1a64::default().f32s(l).value())
+            .collect();
+        Ok(b0 == sb.ids[0]
+            && out.ids == [a_next.0, sb.ids[1]]
+            && logits == [a_next.1, sb.logits[0]])
     }
 
     /// The two slots' runs in passes of several slots: A in slot 0 and B
@@ -2774,7 +2815,8 @@ mod gate {
         // (j1) bits: each slot's ids, logits, position and K/V rows against
         // its solo run, in graph mode and again in eager mode.
         let steps = J_ROUNDS + 2;
-        let (sa, sb) = (j_solo(m, a, steps)?, j_solo(m, b, steps)?);
+        let (sa, a_next) = j_solo(m, a, steps)?;
+        let (sb, _) = j_solo(m, b, steps)?;
         let mut bits_ok = true;
         for mode in [StepMode::Graph, StepMode::Eager] {
             m.set_mode(mode);
@@ -2784,6 +2826,11 @@ mod gate {
                 Ok((ra, rb)) => {
                     let mut off = j_off(0, &ra, &sa);
                     off.extend(j_off(1, &rb, &sb));
+                    match j_after_reset(m, b, &ra, a_next, &sb) {
+                        Ok(true) => {}
+                        Ok(false) => off.push("the pass after slot 1's reset".to_string()),
+                        Err(e) => off.push(format!("the pass after slot 1's reset failed ({e})")),
+                    }
                     off
                 }
                 Err(e) => vec![format!("a pass that failed ({e})")],
@@ -2797,7 +2844,8 @@ mod gate {
                 if ok {
                     format!(
                         "every row's id and logits, each slot's position ({}, {}) and K/V rows \
-                         bit for bit its solo run's",
+                         bit for bit its solo run's; then slot 1 reset and prompted again, and \
+                         the next pass of both slots their solo steps bit for bit",
                         sa.pos, sb.pos
                     )
                 } else {
