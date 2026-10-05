@@ -22,7 +22,7 @@ use model::ops::DEFER_MAX_COLS;
 
 /// Rows a page carries at most: tokens whose handoffs can be in flight at
 /// once, each with its own layer word, image and sum.
-pub const MAX_ROWS: usize = 2;
+pub const MAX_ROWS: usize = 4;
 
 /// A flag word of the page. Each has a 64-byte line of its own, so a thread
 /// spinning on one never shares a line with another.
@@ -240,12 +240,15 @@ mod tests {
     /// V4.1's page — two rows of one column of 4096 values, six slots — is
     /// the fixed layout the handoff kernel and the step port read: the
     /// sequence at word 0, the ids at 16, the weights at 32, the activation
-    /// at 64; row 0's image at byte 512, row 1's 16,640 after it, the sums
-    /// from 33,792 16,384 apart, 66,560 bytes in all.
+    /// at 64; row 0's image at byte 768, row 1's 16,640 after it, the sums
+    /// from 34,048 16,384 apart, 66,816 bytes in all.
+    // PIN(2026-10-05): MAX_ROWS 2→4 moves PAYLOAD_OFF (128·4+64=576, rounded
+    // to 768); the images and sums sit past it, so every offset and the
+    // page's bytes moved +256.
     #[test]
     fn v41_page_is_the_fixed_layout() {
         let p = PageLayout::new(2, 1, 4096, 6).expect("V4.1's page");
-        assert_eq!(PAYLOAD_OFF, 512);
+        assert_eq!(PAYLOAD_OFF, 768);
         assert_eq!(
             p.handoff(),
             HandoffLayout {
@@ -260,19 +263,19 @@ mod tests {
         assert_eq!(p.image_words(), 64 + 4096);
         assert_eq!(
             [p.image_off(0), p.image_off(1)],
-            [Some(512), Some(512 + 16_640)]
+            [Some(768), Some(768 + 16_640)]
         );
         assert_eq!(
             [p.hsum_off(0), p.hsum_off(1)],
-            [Some(33_792), Some(33_792 + 16_384)]
+            [Some(34_048), Some(34_048 + 16_384)]
         );
-        assert_eq!(p.bytes(), Some(66_560));
+        assert_eq!(p.bytes(), Some(66_816));
         assert_eq!(p.image_off(2), None);
         assert_eq!(p.hsum_off(2), None);
     }
 
     /// Every layout of one column of up to `FIELD_MIN` (16) slots keeps the
-    /// fixed field offsets, one row or two — the bound is the smallest
+    /// fixed field offsets, one row or four — the bound is the smallest
     /// routing field, not a routed width; V2-Lite's page (one row of 2048,
     /// six slots), GLM-5.3-Flash's eight and Qwen3.8's ten are among them.
     #[test]
@@ -286,7 +289,9 @@ mod tests {
                     (0, 16, 32, 64),
                     "{rows} {n_used}"
                 );
-                assert_eq!(p.image_off(0), Some(512));
+                // PIN(2026-10-05): row 0's image starts at PAYLOAD_OFF, which
+                // MAX_ROWS 4 moved from 512 to 768.
+                assert_eq!(p.image_off(0), Some(768));
             }
         }
     }
@@ -330,7 +335,9 @@ mod tests {
             Err(PageError::Overflow)
         );
         assert_eq!(PageLayout::new(0, 1, 2048, 6), Err(PageError::Rows(0)));
-        assert_eq!(PageLayout::new(3, 1, 2048, 6), Err(PageError::Rows(3)));
+        // PIN(2026-10-05): 3 rows moved inside 1..=MAX_ROWS (4) — the refused
+        // probe is the bound's new outside, 5.
+        assert_eq!(PageLayout::new(5, 1, 2048, 6), Err(PageError::Rows(5)));
         assert_eq!(PageLayout::new(1, 0, 2048, 6), Err(PageError::Cols(0)));
         assert_eq!(PageLayout::new(1, 9, 2048, 6), Err(PageError::Cols(9)));
         assert_eq!(PageLayout::new(1, 1, 0, 6), Err(PageError::Hidden));
