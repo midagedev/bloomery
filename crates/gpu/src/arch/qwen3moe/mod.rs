@@ -61,7 +61,7 @@ pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHo
 
 /// Qwen3.6-35B-A3B on one card.
 pub type Qwen35moeModel = crate::GpuModel<Body35>;
-pub use prefill::{PrefillPath, PrefillPlan, PrefillStep};
+pub use prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 pub use taps::{KvQ8Host, LayerRun};
 
 /// The first of a prompt call's `tokens` at or past a vocabulary of `vocab`
