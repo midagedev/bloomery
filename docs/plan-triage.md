@@ -241,6 +241,18 @@ round glmq1; F10 was dropped (`GemmFront::act` and `project` differ on purpose: 
   (`crates/gpu-glm5next/src/pair.rs:579`) has none. Make the range set constructible only by `slot_ranges` (private
   fields, or a `SlotRanges` newtype), then delete the two body checks. Proof: move class; the slot gates of the three
   bodies stay green.
+- **From the GLM two-card cards (glm2card, `docs/cards/glmbp-ab.card`, `glmbp-pp.card`) — four tier items:**
+  - *The tier's prompt block on the tile path (M).* `crates/gpu-glm5next/src/tier.rs:281` still serves a prompt
+    block by 8-token chunks of `_sel` launches, which re-read each slot's expert: ~8.6 GB of 3090 reads a
+    layer-batch [derived] where glmnext's tile path would read ~0.6 GB, and fewer enqueue calls on the serve thread.
+  - *Packed tier rows for GLM (S).* `crates/gpu/src/host/tier.rs:831` defaults `block_rows` to `BlockRows::Staged`,
+    which GLM keeps: every slot's row crosses PCIe, 67.1 MB a layer-batch, against ~9.25 MB `Packed` [derived].
+  - *The stage card's reserve taken off the tier too (S).* `crates/placement/src/placement.rs:1792-1801` hands the
+    tier's `Fill` the same `reserve` (NextN bytes, arena, prompt front, card tiles, group units, ~628 MB) though the
+    tier uses none of it: ~45 tier experts fewer (1,546 against 1,501 [derived]), ~+0.3 % decode under bp.
+  - *`BLOOMERY_STEP_STATS` beside the draft (M).* `crates/gpu-gates/src/bin/generate_glm5next.rs:403` refuses the
+    probes beside the NextN draft, so a drafted arm cannot print its host slots or tier hits; the two-card card had
+    to read the tier through `host_experts` differences.
 - **Outside the crate (from the same review).** `crates/gpu/src/weights.rs:549`: `Weights::get` is a
   `BTreeMap<String, _>` lookup, so every body pays name lookups on the step unless it resolves at load; a load-time
   handle is a design question (M). The Q8_0 block geometry has four private owners
