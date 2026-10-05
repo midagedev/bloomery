@@ -133,8 +133,9 @@ const WHAT: &str = "qwen3moe::prefill";
 
 /// The units a [`PrefillPath::Wide`] call of `tokens` ids at a ubatch of
 /// `ub` rows runs, every one of them a ubatch of at least [`WIDE_FROM`] and
-/// at most `ub` rows: whole ubatches, with a tail under [`WIDE_FROM`]
-/// borrowing from the unit before it so the last two units hold
+/// at most `ub` rows: whole ubatches and the tail as one unit, a tail
+/// under [`WIDE_FROM`] borrowing from the unit before it so the last two
+/// units hold
 /// `ub + tail − WIDE_FROM` and `WIDE_FROM` rows. A load whose ubatch holds
 /// no such split — a ubatch under [`WIDE_FROM`] rows, or a tail too short
 /// for the unit before it to lend from (fewer than `2 · WIDE_FROM` rows
@@ -166,8 +167,12 @@ fn wide_steps(tokens: usize, ub: usize) -> Result<Vec<PrefillStep>, GpuError> {
         )
     };
     let (whole, tail) = (tokens / ub, tokens % ub);
-    if tail == 0 {
-        return Ok((0..whole).map(|_| PrefillStep::Ubatch(ub)).collect());
+    if tail == 0 || tail >= WIDE_FROM {
+        let mut v: Vec<PrefillStep> = (0..whole).map(|_| PrefillStep::Ubatch(ub)).collect();
+        if tail > 0 {
+            v.push(PrefillStep::Ubatch(tail));
+        }
+        return Ok(v);
     }
     let mut v: Vec<PrefillStep> = (0..whole - 1).map(|_| PrefillStep::Ubatch(ub)).collect();
     let last = ub + tail;

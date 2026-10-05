@@ -75,6 +75,16 @@
 //!   token, the last logits and every store of the one-ubatch run bit for
 //!   bit. Every unit of these runs is wide: a unit of at most `GEMV_COLS`
 //!   rows is the gemv arm, a band away.
+//! - (w′) the wide plan: for the load's ubatch `ub`, every
+//!   [`PrefillPath::Wide`] plan of [`WIDE_FROM`]..=`3 · ub` ids — one, two
+//!   and three whole ubatches and every tail class of each — holds only
+//!   ubatch units of [`WIDE_FROM`]..=`ub` rows that sum to the call's ids,
+//!   and none is refused (a ubatch of at least `2 · WIDE_FROM` rows splits
+//!   every tail); and a wide call whose tail is past the borrow's floor
+//!   (`ub + 16` ids) runs uncut and as two calls cut at the whole ubatch,
+//!   leaving the last token, last logits and every store bit for bit — the
+//!   schedule's own promise (a row's bits do not depend on the unit it
+//!   lands in), not a band.
 //! - (k) checkpoints, on a second load at [`KCTX`] (the marks' positions
 //!   need the room [`CTX`] does not hold) with the marks armed and an lcg
 //!   prompt of [`KP`] ids on the seat's schedule
@@ -211,7 +221,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
         Body35, Delta35Run, Gqa35Run, KvQ8, LayerKind35, Mixer35Run, Open35, PrefillPath,
-        Qwen35moeModel, StoreHost,
+        PrefillStep, Qwen35moeModel, StoreHost, WIDE_FROM,
     };
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::StepMode;
@@ -1759,6 +1769,96 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------ (w′) the wide plan and its cut
+
+    /// (w′) (module doc): every Wide plan's unit bounds over a sweep of tail
+    /// classes at the load's ubatch, and one wide tail past the borrow's
+    /// floor run uncut and as two calls cut at a whole ubatch, bit for bit.
+    fn wide_plan(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
+        let ub = m.ubatch()?;
+        // (a) the plans: every call length of one, two and three whole
+        // ubatches and every tail class of each (no tail, a tail under the
+        // wide floor that borrows, the floor itself, and every tail past it).
+        let (mut checked, mut refused) = (0usize, Vec::new());
+        let mut bad: Option<String> = None;
+        for tokens in WIDE_FROM..=3 * ub {
+            let plan = m.prefill_plan(tokens, PrefillPath::Wide);
+            let plan = match plan {
+                Ok(p) => p,
+                Err(e) => {
+                    refused.push(format!("{tokens} ids: {e}"));
+                    continue;
+                }
+            };
+            checked += 1;
+            let units: Vec<usize> = plan
+                .steps
+                .iter()
+                .map(|s| match s {
+                    PrefillStep::Ubatch(t) | PrefillStep::Pass(t) => *t,
+                })
+                .collect();
+            if units.iter().sum::<usize>() != tokens
+                || units.iter().any(|&t| !(WIDE_FROM..=ub).contains(&t))
+            {
+                bad.get_or_insert_with(|| format!("{tokens} ids -> {plan}"));
+            }
+        }
+        let plan_ok = refused.is_empty() && bad.is_none();
+        println!(
+            "wide plans at ub {ub}: {checked} lengths checked, {} refused by name (want 0: a \
+             ubatch of at least {} rows splits every tail), first offending plan {}",
+            refused.len(),
+            2 * WIDE_FROM,
+            bad.as_deref().unwrap_or("none")
+        );
+        if let Some(first) = refused.first() {
+            println!("wide plans: first refusal: {first}");
+        }
+        // (b) one tail past the borrow's floor: the uncut call against the
+        // same ids as two calls cut at the whole ubatch. The wide schedule
+        // promises the same bits wherever a call is cut (module doc, (w′)):
+        // every row of the tail runs the wide arm in either plan.
+        let vocab = m.body("wide_plan")?.vocab();
+        let ids = lcg_ids(ub + 16, vocab);
+        fresh(m)?;
+        let uncut = m.prefill_with(&ids, PrefillPath::Wide);
+        let run_ok = match uncut {
+            Ok(tok0) => {
+                let (logits0, stores0) = (m.logits()?, stores(m)?);
+                fresh(m)?;
+                m.prefill_with(&ids[..ub], PrefillPath::Wide)?;
+                let tok = m.prefill_with(&ids[ub..], PrefillPath::Wide)?;
+                let (logits, st) = (m.logits()?, stores(m)?);
+                let differ: Vec<usize> = (0..st.len())
+                    .filter(|&l| !stores0.get(l).is_some_and(|w| same_store(&st[l], w)))
+                    .collect();
+                let same_logits = bits_equal(&logits, &logits0);
+                let pass =
+                    tok == tok0 && same_logits && differ.is_empty() && st.len() == stores0.len();
+                println!(
+                    "wide tail {} of {} ids, uncut and cut at {ub}: token {tok} vs {tok0}, last \
+                     logits bit-identical={same_logits}, every store bit-identical (layers \
+                     differing {differ:?}) {}",
+                    ids.len() - ub,
+                    ids.len(),
+                    verdict(pass)
+                );
+                pass
+            }
+            Err(e) => {
+                println!(
+                    "wide tail {} of {} ids: the uncut call refused: {e} {}",
+                    ids.len() - ub,
+                    ids.len(),
+                    verdict(false)
+                );
+                false
+            }
+        };
+        Ok(plan_ok && run_ok)
+    }
+
     // ---------------------------------------------- (k) the checkpoints
 
     /// (k)'s prompt: past an inner mark of the load's ubatch with a run
@@ -2511,6 +2611,7 @@ mod gate {
         ok &= gemv_arm(&mut m, &toks, &decode)?;
         ok &= wide_arm(&mut m)?;
         ok &= ubatch_bits(&mut m)?;
+        ok &= wide_plan(&mut m)?;
         ok &= refusals(&mut m)?;
         let slots = Q35Slots::new(m.body("gate_qwen35moe_e2e")?.vocab());
         drop(m);
