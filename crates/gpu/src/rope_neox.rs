@@ -56,10 +56,18 @@
 //! of 32), so the block quantization closes inside the warp
 //! ([`q8_block_warp`]). A block holding a non-finite value is refused: a NaN
 //! scale, zero codes and [`FaultSite::KvQuant`], never a plausible block.
+//!
+//! [`RopeNeoxKernels::enqueue_head_norm_neox_append_rows`] is the head-128
+//! launch over several sequences' f16 caches: token `t` appends into the
+//! planes of row `t` of a per-row table ([`RowPlanes`], the launch's
+//! grid-constant parameter). Its body, `norm_neox_append`, is the head-128
+//! entry's written once over the cache format ([`KvSink`]); that entry keeps
+//! its own copy for the reason the q8 entry does.
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::f32_to_f16_bits;
+use crate::flash_gqa::{ROW_PLANES, RowPlanes, RowTable};
 use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{fma_rn_f32, mul_rn_f32};
@@ -286,6 +294,149 @@ unsafe fn norm_partial_append<
             (y0, y1),
             v,
             (dst + i0, dst + i1),
+            fault,
+        )
+    };
+}
+
+/// The norm, NEOX turn and append of [`rope_neox_kernels::head_norm_neox_append`]
+/// into a cache in the format `S`: that entry's block geometry (block
+/// `b = t·(n_head + n_kv) + h` of `HEAD/2` threads), numeric contract,
+/// in-place query and key writes and refusal, with the key and value rows
+/// appended through `sink`. The instance over [`F16Sink`] is
+/// `head_norm_neox_append_rows`', whose block builds the sink over its
+/// token's planes.
+///
+/// SAFETY: the entry's launch contract at [`HEAD`], `sink` over planes of
+/// `n_kv · ctx` rows of [`HEAD`] that no other block writes at this block's
+/// rows, a block of `HEAD/2` threads, and `wsum` this block's two f64 of
+/// shared memory.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
+)]
+unsafe fn norm_neox_append<S: KvSink>(
+    gq: &[f32],
+    gk: &[f32],
+    table: &[f32],
+    pos: &[u32],
+    v: &[f32],
+    eps: f32,
+    n_head: u32,
+    n_kv: u32,
+    ctx: u32,
+    m: u32,
+    fault: FaultSink,
+    mut q: DisjointSlice<f32>,
+    mut k: DisjointSlice<f32>,
+    mut sink: S,
+    wsum: *mut f64,
+) {
+    let heads = (n_head + n_kv) as usize;
+    let b = thread::blockIdx_x() as usize;
+    if b >= m as usize * heads {
+        return; // block-uniform
+    }
+    let t = b / heads;
+    let h = b - t * heads;
+    let tid = thread::threadIdx_x() as usize;
+    let is_q = h < n_head as usize;
+    let kh = h.wrapping_sub(n_head as usize);
+    let base = if is_q {
+        (t * n_head as usize + h) * HEAD
+    } else {
+        (t * n_kv as usize + kh) * HEAD
+    };
+    // SAFETY: t < m <= pos.len() by the launch contract.
+    let p = unsafe { *pos.get_unchecked(t) } as usize;
+
+    // SAFETY: base + tid + 64 < (t·n + h + 1)·128 <= m·n·128, inside the
+    // head's buffer by the launch contract; one thread per value pair.
+    let (x0, x1) = unsafe {
+        if is_q {
+            (
+                *q.get_unchecked_mut(base + tid),
+                *q.get_unchecked_mut(base + tid + THREADS),
+            )
+        } else {
+            (
+                *k.get_unchecked_mut(base + tid),
+                *k.get_unchecked_mut(base + tid + THREADS),
+            )
+        }
+    };
+    let mut acc = f64::from(x0 * x0) + f64::from(x1 * x1);
+    acc += warp::shuffle_xor_f64(acc, 16);
+    acc += warp::shuffle_xor_f64(acc, 8);
+    acc += warp::shuffle_xor_f64(acc, 4);
+    acc += warp::shuffle_xor_f64(acc, 2);
+    acc += warp::shuffle_xor_f64(acc, 1);
+    if warp::lane_id() == 0 {
+        // SAFETY: tid / 32 < 2; one lane per warp writes its slot.
+        unsafe { *wsum.add(tid / 32) = acc };
+    }
+    thread::sync_threads();
+    // SAFETY: both slots were written before the barrier above.
+    let sum = unsafe { *wsum.add(0) + *wsum.add(1) };
+    let mean = (sum / HEAD as f64) as f32;
+    let scale = 1.0 / (mean + eps).sqrt();
+
+    if p >= ctx as usize {
+        if tid == 0 {
+            fault.raise(FaultSite::CachePos);
+        }
+        // SAFETY: the positions read above; this thread owns them.
+        unsafe {
+            if is_q {
+                *q.get_unchecked_mut(base + tid) = f32::NAN;
+                *q.get_unchecked_mut(base + tid + THREADS) = f32::NAN;
+            } else {
+                *k.get_unchecked_mut(base + tid) = f32::NAN;
+                *k.get_unchecked_mut(base + tid + THREADS) = f32::NAN;
+            }
+        }
+        return; // block-uniform: p is the token's
+    }
+    // SAFETY: tid + 64 < 128 <= the gain's length; p < ctx and 2·tid + 1 <
+    // 128, so the table pair is inside row p of the table's ctx rows.
+    let (g0, g1, c, s) = unsafe {
+        let g = if is_q { gq } else { gk };
+        (
+            *g.get_unchecked(tid),
+            *g.get_unchecked(tid + THREADS),
+            *table.get_unchecked(p * HEAD + 2 * tid),
+            *table.get_unchecked(p * HEAD + 2 * tid + 1),
+        )
+    };
+    let n0 = (scale * g0) * x0;
+    let n1 = (scale * g1) * x1;
+    let (y0, y1) = neox_pair(n0, n1, c, s);
+
+    if is_q {
+        // SAFETY: the positions read above; this thread owns them.
+        unsafe {
+            *q.get_unchecked_mut(base + tid) = y0;
+            *q.get_unchecked_mut(base + tid + THREADS) = y1;
+        }
+        return;
+    }
+    // SAFETY: the positions read above; this thread owns them.
+    unsafe {
+        *k.get_unchecked_mut(base + tid) = y0;
+        *k.get_unchecked_mut(base + tid + THREADS) = y1;
+    }
+    // SAFETY: kh < n_kv and p < ctx, so the row is inside the planes; base +
+    // tid + 64 < m·n_kv·128 <= v.len(). One thread per pair of the row, each
+    // warp's values `32·w + lane` and `32·w + 64 + lane`, whole 32-value
+    // blocks; no other block writes the row (this fn's contract).
+    unsafe {
+        sink.append::<HEAD>(
+            kh * ctx as usize + p,
+            (tid, tid + THREADS),
+            (y0, y1),
+            v,
+            (base + tid, base + tid + THREADS),
             fault,
         )
     };
@@ -1013,6 +1164,91 @@ mod rope_neox_kernels {
             )
         };
     }
+
+    /// [`head_norm_neox_append`] over several sequences' f16 caches: token
+    /// `t` appends into the planes of row `t` of `planes` ([`RowPlanes`],
+    /// each `n_kv · ctx` rows of 128). `norm_neox_append` over [`F16Sink`]:
+    /// that entry's norm, turn, in-place writes, append and refusal, token by
+    /// token. The tokens of one sequence hold distinct positions and tokens
+    /// of different sequences write different planes, so no two blocks write
+    /// one row.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(64)]
+    #[launch_contract(
+        domain = 1,
+        block = (64, 1, 1),
+        requires = (
+            m <= 8,
+            q.len() >= m * n_head * 128,
+            k.len() >= m * n_kv * 128,
+            v.len() >= m * n_kv * 128,
+            gq.len() >= 128,
+            gk.len() >= 128,
+            table.len() >= ctx * 128,
+            pos.len() >= m
+        )
+    )]
+    pub fn head_norm_neox_append_rows(
+        gq: &[f32],
+        gk: &[f32],
+        table: &[f32],
+        pos: &[u32],
+        v: &[f32],
+        eps: f32,
+        n_head: u32,
+        n_kv: u32,
+        ctx: u32,
+        m: u32,
+        fault: FaultSink,
+        q: DisjointSlice<f32>,
+        k: DisjointSlice<f32>,
+        #[grid_constant] planes: &RowPlanes,
+    ) {
+        static mut WSUM: SharedArray<f64, 2> = SharedArray::UNINIT;
+
+        let heads = (n_head + n_kv) as usize;
+        let b = thread::blockIdx_x() as usize;
+        if b >= m as usize * heads {
+            return; // block-uniform
+        }
+        let plane = n_kv as usize * ctx as usize * HEAD;
+        // SAFETY: b / heads < m <= ROW_PLANES (the launch contract), and the
+        // launcher built the table over f16 planes of n_kv·ctx·HEAD values
+        // that this launch alone writes.
+        let (pk, pv) = unsafe { planes.f16_mut(b / heads) };
+        // SAFETY: each block writes only its token's rows of its planes
+        // (the tokens of one sequence hold distinct positions, of two
+        // sequences different planes), so the slices' writes are disjoint.
+        // WSUM is this block's own shared allocation; the raw form reaches
+        // it without a reference. The launch contract is
+        // `norm_neox_append`'s over the token's planes.
+        unsafe {
+            norm_neox_append(
+                gq,
+                gk,
+                table,
+                pos,
+                v,
+                eps,
+                n_head,
+                n_kv,
+                ctx,
+                m,
+                fault,
+                q,
+                k,
+                F16Sink {
+                    k: DisjointSlice::from_raw_parts(pk, plane),
+                    v: DisjointSlice::from_raw_parts(pv, plane),
+                },
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+            )
+        };
+    }
 }
 
 /// [`RopeNeoxKernels::enqueue_head_norm_neox_append`]'s arguments: `m`
@@ -1064,6 +1300,25 @@ pub struct PartialNeoxArgs<'a> {
     pub fault: FaultSink,
     pub cache_k: &'a mut DeviceBuffer<u16>,
     pub cache_v: &'a mut DeviceBuffer<u16>,
+}
+
+/// [`RopeNeoxKernels::enqueue_head_norm_neox_append_rows`]' arguments: those
+/// of [`NeoxArgs`] without the cache planes, which the per-row table gives
+/// each token.
+pub(crate) struct NeoxRowsArgs<'a> {
+    pub(crate) q: &'a mut DeviceBuffer<f32>,
+    pub(crate) k: &'a mut DeviceBuffer<f32>,
+    pub(crate) v: &'a DeviceBuffer<f32>,
+    pub(crate) gq: &'a DeviceBuffer<f32>,
+    pub(crate) gk: &'a DeviceBuffer<f32>,
+    pub(crate) table: &'a DeviceBuffer<f32>,
+    pub(crate) pos: &'a DeviceBuffer<u32>,
+    pub(crate) eps: f32,
+    pub(crate) n_head: usize,
+    pub(crate) n_kv: usize,
+    pub(crate) ctx: usize,
+    pub(crate) m: usize,
+    pub(crate) fault: FaultSink,
 }
 
 /// The plane lengths of one side of a q8_0 cache of `n_kv` key heads over
@@ -1447,6 +1702,85 @@ impl RopeNeoxKernels {
             stream, &prep, gq, gk, table, pos, qg, v, eps, n_head, n_kv, ctx, m, fault, q, k, kq,
             kd, vq, vd,
         )?;
+        Ok(())
+    }
+
+    /// [`RopeNeoxKernels::enqueue_head_norm_neox_append`] over several
+    /// sequences' f16 caches: token `t` appends into the planes `planes`
+    /// gives it ([`RowTable`]), its other inputs `args`' rows as that
+    /// launch's. One block per (token, head), `m·(n_head + n_kv)` blocks of
+    /// 64 threads; each token's arithmetic and refusal are that launch's.
+    /// The tokens of one sequence must hold distinct positions below `ctx`;
+    /// a position `>= ctx` raises [`FaultSite::CachePos`] on `args.fault`,
+    /// leaves the token's heads NaN and is not appended. A table of other
+    /// than `m` rows, more than [`ROW_PLANES`], or a plane shorter than
+    /// `n_kv · ctx · HEAD` is refused by name. Asynchronous,
+    /// allocation-free, capturable.
+    pub(crate) fn enqueue_head_norm_neox_append_rows(
+        &self,
+        stream: &CudaStream,
+        planes: &RowTable<'_>,
+        args: NeoxRowsArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_head_norm_neox_append_rows";
+        let NeoxRowsArgs {
+            q,
+            k,
+            v,
+            gq,
+            gk,
+            table,
+            pos,
+            eps,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+        } = args;
+        if n_head == 0 || n_kv == 0 || m == 0 || ctx == 0 || m > ROW_PLANES {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need n_head, n_kv, ctx >= 1 and 1 <= m <= {ROW_PLANES}, got \
+                     n_head={n_head} n_kv={n_kv} ctx={ctx} m={m}"
+                ),
+            ));
+        }
+        let rows = planes.planes(what, m, n_kv * ctx * HEAD)?;
+        let lens = [
+            ("q", q.len(), m * n_head * HEAD),
+            ("k", k.len(), m * n_kv * HEAD),
+            ("v", v.len(), m * n_kv * HEAD),
+            ("gq", gq.len(), HEAD),
+            ("gk", gk.len(), HEAD),
+            ("table", table.len(), ctx * HEAD),
+            ("pos", pos.len(), m),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * (n_head + n_kv))?;
+        let n_head = launch_u32(what, "n_head", n_head)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let m = launch_u32(what, "m", m)?;
+        let prep = self
+            .module
+            .prepare_head_norm_neox_append_rows(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
+        // SAFETY: the table's rows are `planes`' puts, each an f16 plane pair
+        // of at least n_kv·ctx·HEAD values (checked above), borrowed by the
+        // table while this enqueue runs; a graph that captures the launch
+        // replays it over the same planes, which the caller keeps alive and
+        // in place while the graph lives, as for any buffer it captured.
+        unsafe {
+            self.module.head_norm_neox_append_rows(
+                stream, &prep, gq, gk, table, pos, v, eps, n_head, n_kv, ctx, m, fault, q, k, rows,
+            )?;
+        }
         Ok(())
     }
 }

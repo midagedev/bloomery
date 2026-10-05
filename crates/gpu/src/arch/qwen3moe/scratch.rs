@@ -22,14 +22,15 @@ use super::wide::{GEMV_COLS, Wide};
 use crate::GpuError;
 use crate::fault::FaultSink;
 use crate::flash_gqa::{
-    FlashGqaKernels, GqaArgs, GqaQ8Args, HEAD, HEAD_256, partials_ms_len, partials_v_len,
-    partials_v_len_256,
+    FlashGqaKernels, GqaArgs, GqaQ8Args, GqaRowsArgs, HEAD, HEAD_256, RowTable, partials_ms_len,
+    partials_v_len, partials_v_len_256,
 };
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args};
 use crate::gemm::GEMM_MAX_SLOTS;
 use crate::linear::{self, LinearShape};
 use crate::rope_neox::{
-    NeoxArgs, NeoxQ8Args, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels, q8_plane_lens,
+    NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
+    q8_plane_lens,
 };
 use crate::rope_table::{Direction, RopeTable};
 use crate::tensor::{Q8Act, window};
@@ -38,6 +39,7 @@ use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
 use gguf::quant::f32_to_f16_bits;
 use model::quant::quantize_q8_0;
 use std::mem::ManuallyDrop;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 /// Word offsets of a unit's input record: the position of its first row,
@@ -963,6 +965,128 @@ impl KvPlanes {
                 "prefill",
             )),
         }
+    }
+
+    /// Whether the per-row launches over several sequences' planes
+    /// ([`KvPlanes::append_128_rows`], [`KvPlanes::flash_128_rows`]) serve
+    /// these planes under the flash pass `mma`: the f16 cache's tensor-core
+    /// pass. The scalar pass and a q8_0 cache have no per-row entry.
+    pub(super) fn rows_serve(&self, mma: bool) -> bool {
+        mma && matches!(self, KvPlanes::F16 { .. })
+    }
+
+    /// These planes as rows `rows` of a per-row table
+    /// ([`RowTable::put_f16`]); a q8_0 cache's are refused by name.
+    pub(super) fn put_rows<'a>(
+        &'a mut self,
+        table: &mut RowTable<'a>,
+        rows: Range<usize>,
+    ) -> Result<(), GpuError> {
+        match self {
+            KvPlanes::F16 { k, v } => table.put_f16(rows, k, v),
+            KvPlanes::Q8 { .. } => Err(GpuError::shape(
+                "qwen3moe::KvPlanes::put_rows",
+                "a q8_0 cache's planes in a per-row table: no per-row entry reads them \
+                 (KvPlanes::rows_serve)",
+            )),
+        }
+    }
+
+    /// The head-128 norm, turn and append of `s`'s rows over several
+    /// sequences' planes, row `t` into the planes `table` gives it
+    /// ([`RopeNeoxKernels::enqueue_head_norm_neox_append_rows`]): each row
+    /// [`KvPlanes::append_128`]'s row over its own planes. Asynchronous,
+    /// allocation-free, capturable.
+    pub(super) fn append_128_rows(
+        neox: &RopeNeoxKernels,
+        stream: &CudaStream,
+        table: &RowTable<'_>,
+        s: Append128<'_>,
+    ) -> Result<(), GpuError> {
+        let Append128 {
+            q,
+            k,
+            v,
+            gq,
+            gk,
+            table: rope,
+            pos,
+            eps,
+            n_head,
+            n_kv,
+            ctx,
+            m,
+            fault,
+        } = s;
+        neox.enqueue_head_norm_neox_append_rows(
+            stream,
+            table,
+            NeoxRowsArgs {
+                q,
+                k,
+                v,
+                gq,
+                gk,
+                table: rope,
+                pos,
+                eps,
+                n_head,
+                n_kv,
+                ctx,
+                m,
+                fault,
+            },
+        )
+    }
+
+    /// The head-128 tensor-core decode flash of `s`'s rows over several
+    /// sequences' planes, row `t` reading the planes `table` gives it
+    /// ([`FlashGqaKernels::enqueue_pass_rows`]): each row
+    /// [`KvPlanes::flash_128`]'s row over its own planes. The scalar pass
+    /// (`mma` false) is refused by name: no per-row entry serves it.
+    /// Asynchronous, allocation-free, capturable.
+    pub(super) fn flash_128_rows(
+        flash: &FlashGqaKernels,
+        stream: &CudaStream,
+        table: &RowTable<'_>,
+        s: FlashPass<'_>,
+        mma: bool,
+    ) -> Result<(), GpuError> {
+        if !mma {
+            return Err(GpuError::shape(
+                "qwen3moe::KvPlanes::flash_128_rows",
+                "the scalar pass over a per-row table: the per-row flash is the tensor-core \
+                 pass (KvPlanes::rows_serve)",
+            ));
+        }
+        let FlashPass {
+            q,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = s;
+        flash.enqueue_pass_rows(
+            stream,
+            table,
+            GqaRowsArgs {
+                q,
+                n_keys,
+                scale,
+                n_kv,
+                ctx,
+                m,
+                part_v,
+                part_ms,
+                fault,
+                y,
+            },
+        )
     }
 
     pub(super) fn bytes(&self) -> usize {

@@ -144,6 +144,7 @@ generate_ds41   gqa_flash_seg_mma_256_p4                 0           0
 generate_ds41   gqa_flash_seg_mma_256_p4_sel             0           0
 generate_ds41   gqa_flash_seg_mma_256_q8                 0           0
 generate_ds41   gqa_flash_seg_mma_q8                     0           0
+generate_ds41   gqa_flash_seg_mma_rows                   0           0
 generate_ds41   gqa_out_gate_f32                         0           0
 generate_ds41   gqa_prefill_flash                        0           0
 generate_ds41   gqa_prefill_flash_256                    0           0
@@ -168,6 +169,7 @@ generate_ds41   head_norm_neox_append                    0           0
 generate_ds41   head_norm_neox_append_256                0           0
 generate_ds41   head_norm_neox_append_256_q8             0           0
 generate_ds41   head_norm_neox_append_q8                 0           0
+generate_ds41   head_norm_neox_append_rows               0           0
 generate_ds41   index_key_ln_append                      0           0
 generate_ds41   index_pool                               0           0
 generate_ds41   iq2_xs_rows                              0           0
@@ -342,6 +344,7 @@ gate_e2e   gqa_flash_seg_mma_256_p4                 0           0
 gate_e2e   gqa_flash_seg_mma_256_p4_sel             0           0
 gate_e2e   gqa_flash_seg_mma_256_q8                 0           0
 gate_e2e   gqa_flash_seg_mma_q8                     0           0
+gate_e2e   gqa_flash_seg_mma_rows                   0           0
 gate_e2e   gqa_out_gate_f32                         0           0
 gate_e2e   gqa_prefill_flash                        0           0
 gate_e2e   gqa_prefill_flash_256                    0           0
@@ -365,6 +368,7 @@ gate_e2e   head_norm_neox_append                    0           0
 gate_e2e   head_norm_neox_append_256                0           0
 gate_e2e   head_norm_neox_append_256_q8             0           0
 gate_e2e   head_norm_neox_append_q8                 0           0
+gate_e2e   head_norm_neox_append_rows               0           0
 gate_e2e   index_key_ln_append                      0           0
 gate_e2e   index_pool                               0           0
 gate_e2e   iq2_xs_rows                              0           0
