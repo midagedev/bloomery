@@ -3,7 +3,9 @@
 # BLOOMERY_RESIDENCY=mid-p0-s1, the GLM seat's serving default. The GLM plain pass lays one or two slots, a row a slot
 # (gpu-glm5next/src/pair.rs refuse_slots, slot_lanes(2)): N = 2 is the only aggregate; BLOOMERY_GEN_SLOTS=3 and 4 are
 # refused by name before the load. The runner's slots residency clause reads the aggregate arm's passes off the
-# residency's records (none/0, prompt/0 a slot, then slots/2 a round), which this round's box run (g) passes.
+# residency's records (none/0, prompt/0 a slot, then slots/2 a round), which this round's box run (g) passes. Each
+# slot's ids are its window's alone run's at the same plan (2581 card experts against the twin's 2596; see
+# glmslots-ab.card's plan term): the ratio compares rates, not ids.
 #
 # Why noninf, not ab: glmslots-ab.card's residency-off derivation (S1, R2, the plan term) holds, but two functional
 # runs (g) and (h) of this pair under the residency put the 2-slot arm's early rounds far past it, by a term the
