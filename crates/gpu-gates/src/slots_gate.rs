@@ -72,6 +72,9 @@ pub trait SlotsAdapter {
     const STEPS: usize;
     /// Greedy steps of one continuation check ([`Interleaved::continues`]).
     const TAIL: usize;
+    /// Continuation checks the body gate's own clauses read of one slot
+    /// ([`Interleaved::continues`]), [`SlotsAdapter::TAIL`] ids each.
+    const CONTINUES: usize = 1;
 
     /// The body loaded to serve `slots` sequences, its one slot live: the
     /// load's plan counts `slots`, and [`GpuModel::add_slots`] makes the
@@ -136,9 +139,9 @@ pub struct Launches {
 }
 
 /// One stream's solo run on the load's one sequence: its prompt's argmax
-/// and then `STEPS + 3·TAIL` greedy ids (the interleave's, H2's, the body
-/// gate's continuation, H4's), and after the interleave's steps and after
-/// H2's the last logits, the state hash and the position.
+/// and then `STEPS + (2 + CONTINUES)·TAIL` greedy ids (the interleave's,
+/// H2's, the body gate's continuations, H4's), and after the interleave's
+/// steps and after H2's the last logits, the state hash and the position.
 struct Solo {
     ids: Vec<u32>,
     at_steps: Read,
@@ -343,7 +346,7 @@ fn solo<A: SlotsAdapter>(
     let at_steps = Read::of(a, m)?;
     greedy(m, &mut ids, A::TAIL)?;
     let at_pass = Read::of(a, m)?;
-    greedy(m, &mut ids, 2 * A::TAIL)?;
+    greedy(m, &mut ids, (1 + A::CONTINUES) * A::TAIL)?;
     Ok(Solo {
         ids,
         at_steps,

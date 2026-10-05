@@ -108,7 +108,7 @@
 //! - `--slots`, alone (the other clauses pin the gate placement of one
 //!   sequence; refused by name beside them): the resident slots (`Slots for
 //!   Body`) through the slot harness (`bloomery_gpu_gates::slots_gate`: H1
-//!   interleave, H3 bytes, H4 reset, H6 refusals, H7 captures) on a load whose
+//!   interleave, H2 one pass, H3 bytes, H4 reset, H6 refusals, H7 captures) on a load whose
 //!   plan counts two sequences (`body::open_slots`), the residency off as the
 //!   gate placement runs it. Its two streams are two prompts of one length
 //!   fed as one step, then greedy to [`SLOT_POSITIONS`] positions, past the
@@ -122,7 +122,16 @@
 //!   which `Body::seq_shadow_bytes` is); the last slot's state saved
 //!   (`body::snapshot`), the slot rewound and run on the other stream's
 //!   prompt while slot 0 steps on, then put back (`body::resume`): both
-//!   slots continue their solo runs.
+//!   slots continue their solo runs. And the stagger, two slots' rows one
+//!   layer apart on the pair pass's walk (`SlotRows for Body`): its captured
+//!   node sequence is the verify pair's, twice the step's, captured first so
+//!   that H2's captured passes replay it under the pair's go record (G4); a
+//!   pass of three rows, a route trace, a pass of one row, a verify of a
+//!   stagger (the body keeps a pass's rows whole, so no pass waits for a
+//!   commit a snapshot could save) and a feature tap refused by name (G5); after
+//!   a cut that leaves stale ring rows in slot 1 only, staggered passes
+//!   against each slot's solo run from the same state (G2); a fault in a
+//!   stagger poisons both slots, named, each slot's reset lifts its own (G3).
 //!
 //! The envelope (G1). Each sub-layer adds to the streams its own rule
 //! difference from ik's, and carries on the one it read. A rule difference is
@@ -195,9 +204,9 @@ mod gate {
         KIND_CARD, KIND_HOST, KIND_TIER, RouteTrace, TraceHeader, TraceSet,
     };
     use bloomery_gpu::hybrid::{Chain, HostExperts, PoisonKind, RELEASE, Slot};
-    use bloomery_gpu::model::{ChainBody, HostServed};
+    use bloomery_gpu::model::{ChainBody, HostServed, StepMode};
     use bloomery_gpu::weights::{DevWeight, Weights};
-    use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD};
+    use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD, NodeInfo};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PrefillMode, Seam};
     use bloomery_gpu_deepseek41::chain::attn::AttnChain;
     use bloomery_gpu_deepseek41::chain::ffn::{Ds41Host, FfnPiece};
@@ -206,13 +215,15 @@ mod gate {
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED};
     use bloomery_gpu_gates::ik_q8_2::{self, QK};
     use bloomery_gpu_gates::kld::KldBase;
-    use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order, count_kinds};
+    use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order, count_kinds, kind_name};
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
-    use bloomery_gpu_gates::slots_gate::{self, Derived, Interleaved, SlotsAdapter};
+    use bloomery_gpu_gates::slots_gate::{
+        self, Derived, Interleaved, Launches, PassAdapter, SlotsAdapter,
+    };
     use bloomery_gpu_gates::{
-        GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, checks_failed, data_dir,
-        patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
+        GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, bits_equal, checks_failed,
+        data_dir, patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
         topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
     use bloomery_levers::{
@@ -444,11 +455,14 @@ mod gate {
     /// The V4.1 body for the slot harness ([`slots_gate`]): the gate
     /// placement's load of `body::open_slots` at the serving context, the
     /// streams' prompts fed as steps, a slot's state the body's own snapshot
-    /// digested (every part a save copies).
+    /// digested (every part a save copies). `step_nodes` is the one-token
+    /// step's node count once [`stagger_order`] has captured it, which H2's
+    /// launch counts read ([`PassAdapter::slots_launches`]).
     struct SlotsV41<'a> {
         path: &'a str,
         inputs: &'a PlanInputs,
         cfg: &'a body::OpenCfg,
+        step_nodes: std::cell::Cell<Option<usize>>,
     }
 
     impl SlotsAdapter for SlotsV41<'_> {
@@ -456,6 +470,10 @@ mod gate {
 
         const STEPS: usize = SLOT_POSITIONS - SLOT_PROMPTS[0].len();
         const TAIL: usize = 8;
+        /// `put_back`'s and `snap_cut_after_resume`'s continuations of slot 0:
+        /// with the interleave's, H2's and H4's it gives `1 + STEPS + 4·TAIL`
+        /// ids, past a solo of `1 + STEPS + 3·TAIL`.
+        const CONTINUES: usize = 2;
 
         fn open(&self, slots: usize) -> Result<Deepseek41Model, GateError> {
             let slots = NonZeroUsize::new(slots).ok_or("a load of no sequence")?;
@@ -507,9 +525,41 @@ mod gate {
         }
     }
 
+    /// A pass of several slots on V4.1 is the pair pass's walk with each row
+    /// bound to its slot's sequence ([`SlotsV41::step_nodes`]).
+    impl PassAdapter for SlotsV41<'_> {
+        /// None: a row of another slot binds that slot's stores, and every
+        /// row runs the step's launches.
+        fn added_slot_launches(&self, _m: &Deepseek41Model) -> Result<Launches, GateError> {
+            Ok(Launches {
+                n: 0,
+                terms: "row 1 binds another slot's stores; the pass adds no launch".to_owned(),
+            })
+        }
+
+        /// The pass's rows times the one-token step's nodes: every row runs
+        /// the step's launches once (the pair pass's count, which the skew
+        /// structure clause pins).
+        fn slots_launches(
+            &self,
+            _m: &Deepseek41Model,
+            key: &[(usize, usize)],
+        ) -> Result<usize, GateError> {
+            let step = self
+                .step_nodes
+                .get()
+                .ok_or("the step's node count (stagger_order captures it before H2)")?;
+            Ok(key.iter().map(|&(_, rows)| rows).sum::<usize>() * step)
+        }
+    }
+
     /// The `--slots` clauses (module header): the harness's contracts on a
     /// load whose plan counts two sequences, the V4.1 facts between its
-    /// halves.
+    /// halves. G4 and G5's refusals before H2 move no slot (a capture runs
+    /// nothing, a refusal runs nothing); G2 and G3 run passes and go after
+    /// the V4.1 facts, G5's verify between them (a verify that runs is
+    /// committed and cut back inside its line), and the feature tap last
+    /// before H4, since a tap is never taken off.
     fn slots_run(
         path: &str,
         hp: &Hparams,
@@ -530,17 +580,29 @@ mod gate {
             )
             .into());
         }
-        let adapter = SlotsV41 { path, inputs, cfg };
+        let adapter = SlotsV41 {
+            path,
+            inputs,
+            cfg,
+            step_nodes: std::cell::Cell::new(None),
+        };
         // PIN(2026-10-05): the interleave, bytes and reset clauses this gate wrote
         // for V4.1 moved to slots_gate H1/H3/H4; H6/H7 (refusals, captures) are the
         // harness's for every body.
         let mut s = slots_gate::interleave(&adapter)?;
-        let mut pass = past_the_plan(s.model())?;
+        let mut pass = stagger_line("G4 order", stagger_order(s.model(), &adapter));
+        pass &= stagger_refusals(s.model(), hp, path);
+        s.one_pass();
+        pass &= past_the_plan(s.model())?;
         pass &= slot_plan(s.model(), inputs, cfg)?;
         pass &= put_back(&mut s)?;
         pass &= snap_cut_after_resume(&mut s, &adapter, cfg)?;
         pass &= snap_refusals(&mut s, &adapter)?;
         pass &= snap_stream_fails(&mut s, &adapter)?;
+        pass &= stagger_line("G2 stale ring", stagger_stale_ring(&mut s, hp));
+        pass &= stagger_line("G5 verify", stagger_verify_refused(&mut s, &adapter));
+        pass &= stagger_line("G3 fault", stagger_fault(&mut s));
+        pass &= stagger_line("G5 tap", stagger_tap(&mut s));
         pass &= s.finish()?;
         if !pass {
             return Err(checks_failed());
@@ -864,6 +926,85 @@ mod gate {
         ))
     }
 
+    // --------------------------------------------------------- the stagger
+
+    /// The stagger's key: slots 0 and 1, one row each.
+    const STAGGER: [(usize, usize); 2] = [(0, 1), (1, 1)];
+    /// The verify pair's walk as a pass of several slots: slot 0's two rows.
+    const SLOT0_PAIR: [(usize, usize); 1] = [(0, 2)];
+    /// Where G5's route trace goes, as [`TRACE_DIR`]: it records nothing.
+    const TRACE_STAGGER_DIR: &str = "target/route-trace-gate-stagger";
+
+    /// A stagger clause's line, `check slots <name>: <detail> PASS|FAIL`, and
+    /// its verdict; a call that failed inside the clause is its red, the error
+    /// its detail, so every later clause still prints its line.
+    fn stagger_line(name: &str, arm: Result<(bool, String), GateError>) -> bool {
+        let (pass, detail) = arm.unwrap_or_else(|e| (false, format!("a call failed: {e}")));
+        println!("check slots {name}: {detail} {}", verdict(pass));
+        pass
+    }
+
+    /// What G4 compares of a captured node: its kind, a host node's sync mode,
+    /// a kernel's entry and geometry.
+    fn stagger_node(n: &NodeInfo) -> String {
+        match &n.kernel {
+            Some(k) => format!(
+                "{} {} {:?} {:?}",
+                kind_name(n.kind),
+                k.name,
+                k.grid,
+                k.block
+            ),
+            None => format!("{} {:?}", kind_name(n.kind), n.host_sync),
+        }
+    }
+
+    /// G4: the captured stagger's nodes, in enqueue order, are the captured
+    /// one-slot two-row pass's (the verify pair's walk), and both hold twice
+    /// the one-token step's (its capture's count, which H2's launch counts
+    /// then read). The order of the two captures is load-bearing: the step
+    /// port keeps one go record per chain, which each capture of a two-row
+    /// pass writes again, so with the verify pair captured last the record is
+    /// the pair's when H2's first captured passes replay this stagger capture
+    /// — a stagger whose go order is not the pair's is served wrong there.
+    fn stagger_order(
+        m: &mut Deepseek41Model,
+        a: &SlotsV41<'_>,
+    ) -> Result<(bool, String), GateError> {
+        let step = m.capture_step()?;
+        a.step_nodes.set(Some(step));
+        let n_stagger = m.capture_slots(&STAGGER)?;
+        let n_pair = m.capture_slots(&SLOT0_PAIR)?;
+        let stagger: Vec<String> = m
+            .slots_graph_nodes(&STAGGER)?
+            .iter()
+            .map(stagger_node)
+            .collect();
+        let pair: Vec<String> = m
+            .slots_graph_nodes(&SLOT0_PAIR)?
+            .iter()
+            .map(stagger_node)
+            .collect();
+        let same = stagger == pair;
+        let count = n_stagger == n_pair && n_pair == 2 * step;
+        let first = stagger
+            .iter()
+            .zip(&pair)
+            .position(|(x, y)| x != y)
+            .map_or_else(String::new, |i| {
+                format!(" (first at node {i}: {} against {})", stagger[i], pair[i])
+            });
+        Ok((
+            same && count,
+            format!(
+                "the captured stagger's {n_stagger} nodes {} the captured one-slot two-row pass's \
+                 {n_pair} in order{first}; twice the step's {step} {count}; captured first, so H2's \
+                 captured passes replay it under the pair's go record",
+                if same { "are" } else { "are not" },
+            ),
+        ))
+    }
+
     /// A case [`snap_refusals`] restores: its bytes and the words its
     /// refusal must hold.
     struct SnapCase {
@@ -991,6 +1132,180 @@ mod gate {
         ))
     }
 
+    /// Whether `r` is `entry`'s refusal by shape, its words holding `says`.
+    fn stagger_shape_refusal<T>(r: &Result<T, GpuError>, entry: &str, says: &str) -> bool {
+        matches!(r, Err(GpuError::Shape { what, detail }) if *what == entry && detail.contains(says))
+    }
+
+    /// Whether `r` is `entry`'s refusal by a missing state, naming `says`.
+    fn stagger_state_refusal<T>(r: &Result<T, GpuError>, entry: &str, says: &str) -> bool {
+        matches!(r, Err(GpuError::State { what, missing }) if *what == entry && missing.contains(says))
+    }
+
+    /// G5's refusals that run nothing, one line each: a pass of three rows,
+    /// refused by the owner naming the body's bound 2
+    /// (`SlotRows::MAX_ROWS`); a pass with a route trace attached (taken off
+    /// after); a pass of one row of one slot, outside the two shapes the walk
+    /// runs. No slot moves.
+    fn stagger_refusals(m: &mut Deepseek41Model, hp: &Hparams, path: &str) -> bool {
+        const PLAN: &str = "deepseek41 Body::plan_slots";
+        let t = 1;
+        let rows = (|| -> Result<(bool, String), GateError> {
+            let p = stagger_positions(m)?;
+            let r = m.step_slots(&[(0, &[t]), (1, &[t, t])]);
+            let named = stagger_shape_refusal(
+                &r,
+                "GpuModel::step_slots",
+                "holds at most 2 (SlotRows::MAX_ROWS)",
+            );
+            let kept = stagger_positions(m)? == p;
+            Ok((
+                named && kept,
+                format!(
+                    "a pass of slot 0's one row and slot 1's two refused naming the bound 2 \
+                     {named}, the slots where they stood {kept}"
+                ),
+            ))
+        })();
+        let mut pass = stagger_line("G5 rows", rows);
+        let trace = (|| -> Result<(bool, String), GateError> {
+            let p = stagger_positions(m)?;
+            let dir = std::env::current_dir()?.join(TRACE_STAGGER_DIR);
+            free_trace_dir(&dir)?;
+            attach_trace(m, &dir, hp, path)?;
+            let r = m.step_slots(&[(0, &[t]), (1, &[t])]);
+            let named = stagger_state_refusal(&r, PLAN, "route trace");
+            let off = m
+                .body_parts("gate_deepseek41_step stagger trace")?
+                .2
+                .hybrid_mut()
+                .take_route_trace()
+                .is_some();
+            let kept = stagger_positions(m)? == p;
+            Ok((
+                named && off && kept,
+                format!(
+                    "a stagger with a route trace attached refused naming the trace {named}, the \
+                     trace taken off {off}, the slots where they stood {kept}"
+                ),
+            ))
+        })();
+        pass &= stagger_line("G5 trace", trace);
+        let shape = (|| -> Result<(bool, String), GateError> {
+            let p = stagger_positions(m)?;
+            let r = m.step_slots(&[(0, &[t])]);
+            let named = stagger_shape_refusal(
+                &r,
+                PLAN,
+                "two slots of one row each or one slot of two rows",
+            );
+            let kept = stagger_positions(m)? == p;
+            Ok((
+                named && kept,
+                format!(
+                    "a pass of slot 0's one row refused naming the two shapes the walk runs \
+                     {named}, the slots where they stood {kept}"
+                ),
+            ))
+        })();
+        pass &= stagger_line("G5 shape", shape);
+        pass
+    }
+
+    /// Both slots' positions, slot 0 selected after.
+    fn stagger_positions(m: &mut Deepseek41Model) -> Result<[u32; 2], GateError> {
+        m.select_slot(1)?;
+        let p1 = m.pos();
+        m.select_slot(0)?;
+        Ok([m.pos(), p1])
+    }
+
+    /// `n` greedy steps on the selected slot from `first`: the ids, and the
+    /// last step's logits.
+    fn stagger_solo(
+        m: &mut Deepseek41Model,
+        first: u32,
+        n: usize,
+    ) -> Result<(Vec<u32>, Vec<f32>), GateError> {
+        let mut ids = Vec::with_capacity(n);
+        let mut t = first;
+        for _ in 0..n {
+            t = m.step(&[t])?;
+            ids.push(t);
+        }
+        Ok((ids, m.logits()?))
+    }
+
+    /// G2: slot 1 cut back to a point past the window that leaves its ring
+    /// slots of the cut's window holding later rows (stale, restored from its
+    /// shadows by the next refresh), slot 0 as the harness left it; then
+    /// [`SlotsV41::TAIL`] staggered passes, each slot fed its own outputs, and
+    /// each slot's solo run from the same state — slot 0 cut back to where it
+    /// stood, slot 1 to the cut — gives the same ids and last logits, bit for
+    /// bit. Slot 0 ends where the harness's record stands.
+    fn stagger_stale_ring(
+        s: &mut Interleaved<'_, SlotsV41<'_>>,
+        hp: &Hparams,
+    ) -> Result<(bool, String), GateError> {
+        const WHAT: &str = "gate_deepseek41_step stagger_stale_ring";
+        let tail = SlotsV41::TAIL;
+        let window = hp.window;
+        let last0 = s.last(0)?;
+        let m = s.model();
+        m.select_slot(1)?;
+        let hist1 = m.body(WHAT)?.history().to_vec();
+        let p1 = hist1.len();
+        let cut = m.body(WHAT)?.keep_point(p1.saturating_sub(tail));
+        if cut < window || cut + 2 > p1 {
+            return Err(format!(
+                "slot 1 at {p1} cuts back to {cut}: the clause needs a cut at or past the window \
+                 of {window} rows and at least two positions behind"
+            )
+            .into());
+        }
+        let first1 = *hist1.get(cut).ok_or("slot 1's token at the cut")?;
+        m.rollback(u32::try_from(cut)?)?;
+        // The steps from `cut + 1` to `p1 − 1` overwrote the ring slots of
+        // the cut's window rows `cut + 1 − window ..= cut − 1` they share.
+        let stale = (p1 - cut - 1).min(window - 1);
+        m.select_slot(0)?;
+        let p0 = m.pos();
+        let (mut a, mut b) = (last0, first1);
+        let (mut got0, mut got1) = (Vec::with_capacity(tail), Vec::with_capacity(tail));
+        for _ in 0..tail {
+            let out = m.step_slots(&[(0, &[a]), (1, &[b])])?;
+            let [x, y] = out.ids[..] else {
+                return Err(format!("a stagger read back {} ids", out.ids.len()).into());
+            };
+            got0.push(x);
+            got1.push(y);
+            (a, b) = (x, y);
+        }
+        let logits = m.slots_logits()?;
+        let [l0, l1] = &logits[..] else {
+            return Err(format!("a stagger left {} rows of logits", logits.len()).into());
+        };
+        m.select_slot(0)?;
+        m.rollback(p0)?;
+        let (solo0, solo_l0) = stagger_solo(m, last0, tail)?;
+        m.rollback(p0)?;
+        m.select_slot(1)?;
+        m.rollback(u32::try_from(cut)?)?;
+        let (solo1, solo_l1) = stagger_solo(m, first1, tail)?;
+        let ids = got0 == solo0 && got1 == solo1;
+        let bits = bits_equal(l0, &solo_l0) && bits_equal(l1, &solo_l1);
+        Ok((
+            ids && bits,
+            format!(
+                "slot 1 cut from {p1} to {cut} ({stale} ring slots of its window stale [derived]), \
+                 slot 0 at {p0}; {tail} staggered passes against each slot's solo run from \
+                 the same state: ids {} and last logits {}",
+                if ids { "equal" } else { "differ" },
+                if bits { "bit for bit" } else { "differ" },
+            ),
+        ))
+    }
+
     /// A writer that takes `left` bytes, then fails as a full disk does.
     struct SnapFull {
         left: usize,
@@ -1029,6 +1344,143 @@ mod gate {
             }
             std::io::Read::read(&mut self.bytes, buf)
         }
+    }
+
+    /// G5's verify check: a verify of a stagger (`GpuModel::verify_slots`),
+    /// asked with slot 1 selected, refused by name before anything runs —
+    /// this body keeps a pass's rows whole (`SlotRows::SETTLES_PARTIAL_KEEP`),
+    /// so no pass of several slots ever waits for its commit on it and no
+    /// snapshot can save a waiting pass's rows. Slot 1 stays selected, and
+    /// both slots stand where they stood with their state hashes. A verify
+    /// that ran is committed whole and both slots cut back to where they
+    /// stood (a cut of one position is always granted), so its red stays in
+    /// this line.
+    fn stagger_verify_refused(
+        s: &mut Interleaved<'_, SlotsV41<'_>>,
+        a: &SlotsV41<'_>,
+    ) -> Result<(bool, String), GateError> {
+        let (t0, t1) = (s.last(0)?, s.last(1)?);
+        let m = s.model();
+        let at = stagger_positions(m)?;
+        // Both slots' state hashes, slot 1 selected after.
+        let hashes = |m: &mut Deepseek41Model| -> Result<[u64; 2], GateError> {
+            m.select_slot(0)?;
+            let h0 = a.state_hash(m)?;
+            m.select_slot(1)?;
+            Ok([h0, a.state_hash(m)?])
+        };
+        let before = hashes(m)?;
+        let read = m.verify_slots(&[(0, &[t0]), (1, &[t1])]);
+        let named = stagger_shape_refusal(
+            &read,
+            "GpuModel::verify_slots",
+            "SlotRows::SETTLES_PARTIAL_KEEP",
+        );
+        let selected = m.selected();
+        if read.is_ok() {
+            m.commit_slots(&[1, 1])?;
+            let [p0, p1] = at;
+            m.select_slot(1)?;
+            m.rollback(p1)?;
+            m.select_slot(0)?;
+            m.rollback(p0)?;
+        }
+        let kept = stagger_positions(m)? == at && hashes(m)? == before;
+        m.select_slot(0)?;
+        Ok((
+            named && selected == 1 && kept,
+            format!(
+                "a verify of slot 0's row and slot 1's on a body that keeps a pass's rows whole \
+                 {named} ({}), so no pass waits for a commit a snapshot could save; slot \
+                 {selected} selected after it; both slots where they stood with their state \
+                 hashes {kept}",
+                match &read {
+                    Ok(_) => "ran".to_string(),
+                    Err(e) => format!("refused: {e}"),
+                },
+            ),
+        ))
+    }
+
+    /// G3: slot 0's layer-0 window-ring row of position `p0 − 1`, which the
+    /// next step reads, set to NaN; a stagger then returns the fault at layer
+    /// 0 and poisons both slots, the next pass refused naming "slots 0 and
+    /// 1"; slot 0's reset lifts it from slot 0 alone (the next pass refused
+    /// naming "slot 1"), and slot 1's clears the model. Slot 0 is then fed
+    /// its history again from the reset: it gives its last id and stands
+    /// where the harness's record stands.
+    fn stagger_fault(s: &mut Interleaved<'_, SlotsV41<'_>>) -> Result<(bool, String), GateError> {
+        const WHAT: &str = "gate_deepseek41_step stagger_fault";
+        let (t0, t1) = (s.last(0)?, s.last(1)?);
+        let m = s.model();
+        m.select_slot(0)?;
+        let p0 = m.pos() as usize;
+        let hist0 = m.body(WHAT)?.history().to_vec();
+        {
+            let (gpu, _, body) = m.body_parts(WHAT)?;
+            let stream = gpu.stream();
+            let ring = body
+                .state_mut(0)
+                .ok_or("the body does not run layer 0")?
+                .ring;
+            let (width, at) = (
+                ring.cols(),
+                p0.checked_sub(1).ok_or("slot 0 at 0")? % ring.rows(),
+            );
+            let mut host = ring.buf().to_host_vec(stream)?;
+            host[at * width..(at + 1) * width].fill(NAN_F16);
+            ring.buf_mut().copy_from_host(stream, &host)?;
+        }
+        let stagger = [(0, &[t0][..]), (1, &[t1][..])];
+        let faulted = m.step_slots(&stagger);
+        let layer0 = matches!(&faulted, Err(GpuError::Fault { fault, .. }) if fault.layer == 0);
+        let both = matches!(m.step_slots(&stagger), Err(e) if e.to_string().contains("slots 0 and 1 are poisoned"));
+        m.select_slot(0)?;
+        m.reset()?;
+        let one = matches!(m.step_slots(&stagger), Err(e) if e.to_string().contains("slot 1 is poisoned"));
+        m.select_slot(1)?;
+        m.reset()?;
+        let cleared = m.poisoned().is_none() && m.step(&[t1]).is_ok();
+        m.select_slot(0)?;
+        let rebuilt = m.step(&hist0)? == t0 && m.pos() as usize == p0;
+        Ok((
+            layer0 && both && one && cleared && rebuilt,
+            format!(
+                "a stagger over slot 0's NaN ring row {} (the fault at layer 0 {layer0}); the next \
+                 pass named slots 0 and 1 {both}; after slot 0's reset it named slot 1 {one}; \
+                 after slot 1's the model ran clean {cleared}; slot 0 fed its {p0} tokens again \
+                 gave its last id at {p0} {rebuilt}",
+                match &faulted {
+                    Ok(out) => format!("ran ({:?})", out.ids),
+                    Err(e) => format!("returned \"{e}\""),
+                },
+            ),
+        ))
+    }
+
+    /// G5's feature tap: slot 1 reset and the captures dropped (a tap goes on
+    /// before any step and capture), the tap attached, then a stagger refused
+    /// naming the tap with both slots where they stood. Last before H4: a tap
+    /// is never taken off, and H4's steps run with it.
+    fn stagger_tap(s: &mut Interleaved<'_, SlotsV41<'_>>) -> Result<(bool, String), GateError> {
+        let t0 = s.last(0)?;
+        let m = s.model();
+        m.select_slot(1)?;
+        m.reset()?;
+        m.set_mode(StepMode::Eager);
+        m.set_mode(StepMode::Graph);
+        body::attach_features(m, &[1])?;
+        let p = stagger_positions(m)?;
+        let r = m.step_slots(&[(0, &[t0]), (1, &[t0])]);
+        let named = stagger_state_refusal(&r, "deepseek41 Body::plan_slots", "feature tap");
+        let kept = stagger_positions(m)? == p;
+        Ok((
+            named && kept,
+            format!(
+                "a stagger with a feature tap attached refused naming the tap {named}, the slots \
+                 where they stood {kept}"
+            ),
+        ))
     }
 
     // ----------------------------------------------------------- the fault

@@ -68,6 +68,7 @@
 //! the compressed rows, the index keys and the states consistently with each
 //! other.
 
+use std::convert::Infallible;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -118,6 +119,7 @@ pub use prefill::{
     PrefillStats, PromptCounts, T_MAX, batch_count, batches, prefill, prefill_observed,
     prefill_with, prepare_prefill,
 };
+use seq::RowSeqs;
 pub use seq::{KeepLimit, Seq};
 pub use snap::{SeqSnapshot, StateFail, restore_state, resume, save_state, snapshot};
 
@@ -1316,26 +1318,13 @@ impl Body {
     ) -> Result<(), GpuError> {
         self.arrive_eager(gpu.stream())?;
         let (parts, hybrid) = self.parts();
-        if parts.lanes.len() < PAIR_ROWS {
-            return Err(GpuError::State {
-                what: "deepseek41 Body::enqueue_pair",
-                missing: "a second row of buffers",
-            });
-        }
-        if parts.layers.is_empty() {
-            return Err(GpuError::State {
-                what: "deepseek41 Body::enqueue_pair",
-                missing: "a layer",
-            });
-        }
-        let [a, b] = heads;
-        program::walk_step(
+        walk_pair(
             gpu,
             w,
             parts,
             hybrid,
-            [Some(a), Some(b)],
-            &mut |_, _| Ok(()),
+            heads,
+            "deepseek41 Body::enqueue_pair",
         )
     }
 
@@ -1448,6 +1437,20 @@ impl Body {
         input: &StepInput,
         row: usize,
     ) -> Result<(), GpuError> {
+        self.refresh_on(stream, None, input, row)
+    }
+
+    /// [`Body::refresh_row`] on `seq` — a parked slot's sequence, or the
+    /// live one when `None`: that sequence's stale ring slots restored from
+    /// its own shadows by its own holds, and its holds' record of the row's
+    /// position, before the copy into row `row`'s lane.
+    fn refresh_on(
+        &mut self,
+        stream: &CudaStream,
+        seq: Option<&mut Seq>,
+        input: &StepInput,
+        row: usize,
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "deepseek41 Body::refresh";
         if self.image.pos() != Some(input.pos) {
             return Err(GpuError::Shape {
@@ -1460,8 +1463,9 @@ impl Body {
             });
         }
         let pos = input.pos as usize;
-        self.seq.restore_before(stream, pos)?;
-        self.seq.holds.wrote(pos);
+        let seq = seq.unwrap_or(&mut self.seq);
+        seq.restore_before(stream, pos)?;
+        seq.holds.wrote(pos);
         let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
             what: WHAT,
             missing: "the row's buffers",
@@ -1518,12 +1522,69 @@ impl Body {
         self.arrive()
     }
 
+    /// [`ChainBody::decode_input`]'s work after its admission, on `seq` — a
+    /// parked slot's sequence, or the live one when `None`: the rows due
+    /// from before delivered, the position checked against that sequence's
+    /// own history, the step planned after its tokens (the planner holds no
+    /// sequence's state), its rows begun, the image built without them, and
+    /// the token pushed onto that history. Refused as `what`.
+    fn decode_on(
+        &mut self,
+        what: &'static str,
+        seq: Option<&mut Seq>,
+        token: u32,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        self.arrive()?;
+        self.rows.finish()?;
+        let positions = self.positions();
+        let Body {
+            seq: live,
+            planner,
+            plan,
+            rows,
+            image,
+            file,
+            ..
+        } = self;
+        let seq = seq.unwrap_or(live);
+        if seq.history.len() != pos as usize || seq.history.len() >= positions {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "a step at position {pos} after {} tokens, in caches of {positions} positions",
+                    seq.history.len()
+                ),
+            });
+        }
+        planner
+            .plan_into(&[token], pos, seq.history.ids(), plan)
+            .map_err(|e| GpuError::plan(what, e))?;
+        rows.begin(file, plan)?;
+        // The rows section is written again by the arrival; what it holds
+        // here is never read.
+        image.build(plan, rows.embd(), rows.engram())?;
+        seq.history.push(token);
+        Ok(())
+    }
+
     /// The body's buffers a row's launches borrow, apart from the host half,
-    /// and the host tier apart from them.
+    /// and the host tier apart from them: every row bound to the live
+    /// sequence.
     fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<Ds41Host>) {
+        let Ok(parts) = self.parts_with(|seq| Ok::<_, Infallible>(RowSeqs::One(seq)));
+        parts
+    }
+
+    /// [`Body::parts`] with the rows bound to the sequences `bind` makes of
+    /// the live one ([`RowSeqs`]); `bind`'s refusal is the call's.
+    fn parts_with<'a, E>(
+        &'a mut self,
+        bind: impl FnOnce(&'a mut Seq) -> Result<RowSeqs<'a>, E>,
+    ) -> Result<(Parts<'a>, &'a mut Hybrid<Ds41Host>), E> {
         let Body {
             layers,
-            seq: Seq { kv, shadows, .. },
+            seq,
             steps,
             lanes,
             lists,
@@ -1537,11 +1598,10 @@ impl Body {
             tier,
             ..
         } = self;
-        (
+        Ok((
             Parts {
                 layers,
-                kv,
-                shadows,
+                seqs: bind(seq)?,
                 steps,
                 lanes,
                 lists,
@@ -1554,7 +1614,7 @@ impl Body {
                 tier: tier.as_mut(),
             },
             hybrid,
-        )
+        ))
     }
 }
 
@@ -1567,11 +1627,11 @@ pub struct RowBuffers<'a> {
 
 /// The body's step buffers and pieces, borrowed apart from its host half
 /// and its host tier: what one row's launches take besides the tier, which
-/// the step's port lends them ([`program`]).
+/// the step's port lends them ([`program`]). Each row's caches and ring
+/// shadows are its sequence's (`seqs`).
 struct Parts<'a> {
     layers: &'a Range<usize>,
-    kv: &'a mut [LayerKv],
-    shadows: &'a mut Shadows,
+    seqs: RowSeqs<'a>,
     steps: &'a [LayerStep],
     lanes: &'a mut [Lane],
     lists: &'a mut [Vec<DeviceBuffer<u32>>],
@@ -1662,12 +1722,13 @@ impl Parts<'_> {
         })?;
         let (streams_in, streams_out) = ping(&mut lane.hc, cur.s);
         let (fold_in, fold_out) = ping(&mut lane.folds, cur.f);
+        let Seq { kv, shadows, .. } = self.seqs.of(row)?;
         let LayerIo {
             ring,
             shadow,
             compressed,
             selection,
-        } = layer_io(self.kv, self.shadows, lists, i, &step)?;
+        } = layer_io(kv, shadows, lists, i, &step)?;
         self.attn.enqueue_layer_of(
             gpu,
             w,
@@ -1852,6 +1913,41 @@ impl Parts<'_> {
         self.glue
             .enqueue_head(gpu, w, lane.hc[cur.s].buf(), pre, head)
     }
+}
+
+/// The pair walk ([`program::walk_step`]) of `parts`' two rows, row `r` into
+/// `heads[r]`: the pair pass's and a pass of several slots' alike, so the
+/// two share one go order. Refused as `what` without a second row of
+/// buffers or a layer.
+fn walk_pair(
+    gpu: &Gpu,
+    w: &Weights,
+    parts: Parts<'_>,
+    hybrid: &mut Hybrid<Ds41Host>,
+    heads: [&mut Head; PAIR_ROWS],
+    what: &'static str,
+) -> Result<(), GpuError> {
+    if parts.lanes.len() < PAIR_ROWS {
+        return Err(GpuError::State {
+            what,
+            missing: "a second row of buffers",
+        });
+    }
+    if parts.layers.is_empty() {
+        return Err(GpuError::State {
+            what,
+            missing: "a layer",
+        });
+    }
+    let [a, b] = heads;
+    program::walk_step(
+        gpu,
+        w,
+        parts,
+        hybrid,
+        [Some(a), Some(b)],
+        &mut |_, _| Ok(()),
+    )
 }
 
 /// Layer `i`'s window ring and its shadow, the compressed rows its attention
@@ -2469,27 +2565,7 @@ impl ChainBody for Body {
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
         const WHAT: &str = DECODE_INPUT;
         self.admit(WHAT, Entry::Step)?;
-        self.arrive()?;
-        self.rows.finish()?;
-        if self.seq.history.len() != pos as usize || self.seq.history.len() >= self.positions() {
-            return Err(GpuError::Shape {
-                what: WHAT,
-                detail: format!(
-                    "a step at position {pos} after {} tokens, in caches of {} positions",
-                    self.seq.history.len(),
-                    self.positions()
-                ),
-            });
-        }
-        self.planner
-            .plan_into(&[token], pos, self.seq.history.ids(), &mut self.plan)
-            .map_err(|e| GpuError::plan(WHAT, e))?;
-        self.rows.begin(&self.file, &self.plan)?;
-        // The rows section is written again by the arrival; what it holds
-        // here is never read.
-        self.image
-            .build(&self.plan, self.rows.embd(), self.rows.engram())?;
-        self.seq.history.push(token);
+        self.decode_on(WHAT, None, token, pos)?;
         Ok(StepInput { pos })
     }
 
