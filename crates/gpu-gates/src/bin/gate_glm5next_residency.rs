@@ -135,9 +135,12 @@ fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_glm5next_residency", gate::run())
 }
 
+// `pub`: this gate prints its own `transform` line over its own seed list
+// and runs no rule walk, so a private module would count `transform_verdict`,
+// `layer_seeds` and `rule_after` dead in this bin.
 #[cfg(feature = "glm5next")]
 #[path = "shared/residency_clauses.rs"]
-mod residency_clauses;
+pub mod residency_clauses;
 
 #[cfg(feature = "glm5next")]
 mod gate {
@@ -304,14 +307,7 @@ mod gate {
     fn seeds(s: &Session<Body>) -> Result<Vec<(usize, Vec<u32>)>, GateError> {
         let b = s.model().body(NAME)?;
         let machine = machine_of(s)?;
-        let mut out = Vec::new();
-        for l in b.hybrid().slots().layers() {
-            let seed = machine.seed(l)?;
-            if !seed.is_empty() {
-                out.push((l, seed));
-            }
-        }
-        Ok(out)
+        crate::residency_clauses::seeds(machine, b.hybrid().slots().layers())
     }
 
     /// What a history saw: the prompt's argmax, every step's argmax and
@@ -409,11 +405,8 @@ mod gate {
         let pool = ChurnPool::of(plan, 0, pinned).map_err(|e| format!("{path}: {e}"))?;
         pool.check(plan).map_err(|e| format!("{path}: {e}"))?;
         record::residency_host(&word_of(residency), &pool, plan).print();
-        let short = i128::from(machine.host.usable_bytes) - plan.host.headroom_bytes
-            + i128::from(pool.bytes)
-            - 1;
-        let mut small = machine.clone();
-        small.host.usable_bytes = u64::try_from(short)?;
+        let (short, small) =
+            crate::residency_clauses::refuse_head(machine, plan.host.headroom_bytes, pool.bytes)?;
         crate::residency_clauses::refuse_tail(short, pool.bytes, REFUSE_BOUND_S, || {
             open(path, &small, levers, residency)
         })
@@ -1340,15 +1333,8 @@ mod gate {
         pass &= steps_clause(&mut s, &ids)?;
 
         let again = history(&mut s, &ids[..PROMPT])?;
-        let c1 = first == again && first.landed > 0;
-        println!(
-            "c1: the history twice, {} tokens, {} flips landed: same {}: {}",
-            first.tokens.len(),
-            first.landed,
-            first == again,
-            verdict(c1)
-        );
-        pass &= c1;
+        pass &=
+            crate::residency_clauses::c1_clause(first.tokens.len(), first.landed, first == again);
 
         pass &= table_clause(&s, &again)?;
         let probe = static_probe(&mut s, &ids[..PROMPT])?;
