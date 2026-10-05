@@ -12,7 +12,9 @@
 //! Either way each is the launch the row would run with its slot alone, and a row's arithmetic in
 //! every launch of the walk does not depend on the rows beside it (`flash_gqa`'s row contract; the
 //! m-row launches against the steps, `gate_qwen3moe_e2e` (p)), so every row is its slot's own step
-//! bit for bit. Each row then ends in its own head ([`Tail::Rows`]).
+//! bit for bit. The pass then ends in one head of every row ([`Tail::One`]): the rows read the
+//! lm_head once, each row's logits and token bit for bit its one-row head's (`Head`'s rows are
+//! independent).
 //!
 //! [`SlotRows`]: crate::model::SlotRows
 
@@ -142,7 +144,7 @@ fn rows_mut<'a, T>(
 /// One pass of several slots over the prompt arena `s`: `rows` the busy
 /// slots' ranges in pass order, `live` the live sequence's planes (slot 0's,
 /// the homes canonical), `parked` every other busy slot's, in `rows` order;
-/// `ins` their records, `heads` one a row.
+/// `ins` their records, `heads` one head of every row.
 pub(super) struct SlotPass<'a, 'p> {
     pub(super) c: &'a PassCtx<'a>,
     pub(super) live: &'a mut [KvPlanes],
@@ -156,10 +158,10 @@ pub(super) struct SlotPass<'a, 'p> {
 
 impl SlotPass<'_, '_> {
     /// Enqueue the pass (module doc): each slot's embedding, every layer,
-    /// each row's head. Refused by name before any launch: ranges that do
-    /// not tile `0..R` in order, `R` past the arena's gemv rows, a head
-    /// count or a parked count other than the ranges', a layer other than
-    /// head-128 attention.
+    /// the one head of every row. Refused by name before any launch: ranges
+    /// that do not tile `0..R` in order, `R` past the arena's gemv rows, a
+    /// head count other than one or a parked count other than the ranges', a
+    /// layer other than head-128 attention.
     pub(super) fn enqueue(self) -> Result<(), GpuError> {
         let SlotPass {
             c,
@@ -220,13 +222,22 @@ impl SlotPass<'_, '_> {
             dispatch::attn_out(&lc, g, s, total)?;
             dispatch::ffn(&lc, &p.ffn, s, total, None)?;
         }
-        program::enqueue_tail(c, s, total, &mut Tail::Rows { heads, state })
+        let [head] = heads else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} heads; a pass of several slots runs into one head of every row",
+                    heads.len()
+                ),
+            ));
+        };
+        program::enqueue_tail(c, s, total, &mut Tail::One { head, state })
     }
 }
 
 /// The pass's rows `R`, once `rows` tile `0..R` in order with no empty
-/// range, `R` is at most `most`, and the heads and the parked sequences are
-/// as many as the rows and the ranges past slot 0; else refused by name.
+/// range, `R` is at most `most`, and the head is one with the parked
+/// sequences as many as the ranges past slot 0; else refused by name.
 fn check(rows: &[SlotRange], most: usize, heads: usize, parked: usize) -> Result<usize, GpuError> {
     let mut at = 0;
     for r in rows {
@@ -242,12 +253,13 @@ fn check(rows: &[SlotRange], most: usize, heads: usize, parked: usize) -> Result
         at = r.rows.end;
     }
     let others = rows.iter().filter(|r| r.slot != 0).count();
-    if at == 0 || at > most || heads != at || parked != others {
+    if at == 0 || at > most || heads != 1 || parked != others {
         return Err(GpuError::shape(
             WHAT,
             format!(
                 "a pass of {at} rows (1..={most}) with {heads} heads and {parked} parked \
-                 sequences for {others} slots past slot 0"
+                 sequences for {others} slots past slot 0; the pass runs into one head of \
+                 every row"
             ),
         ));
     }

@@ -181,9 +181,10 @@
 //!   the eager arm's — in graph mode and again in eager mode. (j2) the
 //!   captured pass of slots 0 and 1 at a
 //!   row each holds the two-row pass of slot 0's nodes plus one slot's
-//!   ([`J_SLOT_LAYER_NODES`] a layer and its embedding), one memcpy a row
-//!   in each; the one-row pass and the difference from it print, with the
-//!   terms the difference holds. (j3) a pass of nine rows, a slot twice, no
+//!   ([`J_SLOT_LAYER_NODES`] a layer and its embedding), one memcpy in
+//!   each (the pass's rows into the one head's input); the one-row pass
+//!   and the difference from it print, with the terms the difference
+//!   holds. (j3) a pass of nine rows, a slot twice, no
 //!   slot, a slot out of range, a slot of no token and rows past the cache
 //!   refused by name, no position moved. (j4) a fault planted ahead of a
 //!   pass of both slots ((x)'s plant) poisons both: each slot and the pass
@@ -2897,35 +2898,35 @@ mod gate {
         m.set_mode(StepMode::Graph);
         // (j2) nodes: the pass of slots 0 and 1 at a row each against the
         // two-row pass of slot 0, one busy slot's launches apart; each pass
-        // copies one row a head.
+        // copies its rows into the one head's input in one copy.
         let n_layer = m.body("one pass")?.hparams().n_layer;
         let two = m.capture_slots(&[(0, 1), (1, 1)])?;
         let two_row = m.capture_slots(&[(0, 2)])?;
         let one_row = m.capture_slots(&[(0, 1)])?;
+        // PIN(2026-10-05): one memcpy in every pass of several slots — its R
+        // rows into the one head's input in one copy (Tail::One). Was
+        // `== rows`, a head a row with a copy each; the old clause red on
+        // this tree.
         let mut memcpy_ok = true;
-        for (key, rows) in [
-            (&[(0, 1), (1, 1)][..], 2),
-            (&[(0, 2)][..], 2),
-            (&[(0, 1)][..], 1),
-        ] {
+        for key in [&[(0, 1), (1, 1)][..], &[(0, 2)][..], &[(0, 1)][..]] {
             let ([memcpy], _) = count_kinds(
                 &m.slots_graph_nodes(key)?,
                 [sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY],
             );
-            memcpy_ok &= memcpy == rows;
+            memcpy_ok &= memcpy == 1;
         }
         let per_slot = slot_nodes(n_layer);
         let nodes_ok = two == two_row + per_slot && memcpy_ok;
         // Against the one-row pass, the two-slot pass also holds the m = 1 to
-        // m >= 2 step of the row-wise launches and the second row's head: its
-        // three launches (the step's head) and its copy.
-        let head = NODES_CHAIN - NODES_PASS_1 + 1;
-        let from_one = per_slot + (NODES_PASS_M - NODES_PASS_1) + head;
+        // m >= 2 step of the row-wise launches and the one head's m >= 2 arm
+        // over its fused one-row arm: the gemv launch the fused head_argmax
+        // folds, the copy count unchanged at one.
+        let from_one = per_slot + (NODES_PASS_M - NODES_PASS_1) + 1;
         println!(
             "one pass nodes: slots 0 and 1 at a row each {two} = the two-row pass of slot 0 \
              {two_row} + a slot's {per_slot} (want {}); against the one-row pass {one_row}: +{} \
-             (derived +{from_one}: a slot's {per_slot}, the m>=2 launch step {}, a row's head \
-             {head}); one memcpy a row in each {memcpy_ok} {}",
+             (derived +{from_one}: a slot's {per_slot}, the m>=2 launch step {}, the one head's \
+             m>=2 arm 1); one memcpy in each {memcpy_ok} {}",
             two_row + per_slot,
             two.wrapping_sub(one_row),
             NODES_PASS_M - NODES_PASS_1,

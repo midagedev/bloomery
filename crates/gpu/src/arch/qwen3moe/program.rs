@@ -14,6 +14,7 @@ use super::head_argmax::HeadArgmaxState;
 use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, f32_view};
 use crate::head::Head;
 use crate::model::lookup::f32_gain;
+use crate::tensor::Window;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use cuda_core::DeviceBuffer;
@@ -53,6 +54,13 @@ pub(super) enum Tail<'a> {
     /// `heads[r]`'s input and that head, row by row.
     Rows {
         heads: &'a mut [Head],
+        state: &'a mut HeadArgmaxState,
+    },
+    /// A pass whose every row ends in one head of them all: rows `0..m` of
+    /// the arena's `x` — the pass's rows, which its ranges tile from row 0 —
+    /// into `head`'s input in one copy, then the head of the `m` rows.
+    One {
+        head: &'a mut Head,
         state: &'a mut HeadArgmaxState,
     },
     /// A prefill pass: the last layer's output stays in the arena's `x`.
@@ -163,6 +171,7 @@ pub(super) fn enqueue_tail(
             }
             Ok(())
         }
+        Tail::One { head, state } => enqueue_one(gpu, w, k, state, s, m, head),
         Tail::Pass => Ok(()),
         Tail::Last { head, state } => enqueue_last(gpu, w, k, state, s, m, head),
         Tail::Hidden => enqueue_hidden(gpu, w, c.eps, s, m),
@@ -194,6 +203,32 @@ pub(super) fn enqueue_last(
     let row = unsafe { f32_view(&s.x, (m - 1) * h, h) };
     head.input_mut()
         .copy_from_device_async(&row, gpu.stream())?;
+    dispatch::enqueue_head(gpu, w, k, state, head)
+}
+
+/// Enqueue the head after a pass of `m` rows over arena `s`: rows `0..m` of
+/// `x` — the pass's rows, which its ranges tile from row 0 — into the head's
+/// input in one copy, then the head of the `m` rows (the fused arm at one
+/// row, the shared arm past it). A unit of no row, or of more rows than the
+/// arena holds, is refused by name.
+pub(super) fn enqueue_one(
+    gpu: &Gpu,
+    w: &Weights,
+    k: &Kernels,
+    state: &mut HeadArgmaxState,
+    s: &Arena,
+    m: usize,
+    head: &mut Head,
+) -> Result<(), GpuError> {
+    if m == 0 || m > s.rows {
+        return Err(GpuError::shape(
+            "qwen3moe::enqueue_one",
+            format!("a unit of {m} rows on a {}-row arena", s.rows),
+        ));
+    }
+    let rows = Window::of(&s.x, 0, m * s.dims.hidden)?;
+    head.input_mut()
+        .copy_from_device_async(&rows, gpu.stream())?;
     dispatch::enqueue_head(gpu, w, k, state, head)
 }
 

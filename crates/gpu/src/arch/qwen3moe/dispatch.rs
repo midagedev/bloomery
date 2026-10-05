@@ -129,13 +129,17 @@ pub(super) fn enqueue_chain(
     .walk()
 }
 
-/// Enqueue the one-row head: its norm and quantization, then the Q6_K
-/// projection with the argmax folded in (`head_argmax`) in place of the
-/// shared head's gemv and `argmax_fault` — the same logits and the same
-/// (token, fault word) readback. A head of another type (the type the load
-/// read from the file) runs the shared head's own arm: a Q8_0 one the norm,
-/// the q8f32 gemv and the argmax, three launches as the fused head's; a Q4_K
-/// one the norm, the quantizer, the Q4_K gemv and the argmax.
+/// Enqueue the head: a head of one row under a Q6_K `output.weight` runs its
+/// norm and quantization, then the Q6_K projection with the argmax folded in
+/// (`head_argmax`) in place of the shared head's gemv and `argmax_fault` —
+/// the same logits and the same (token, fault word) readback. Every other
+/// head — another weight type (the type the load read from the file), or
+/// more rows than one (the fused projection reads a single activation
+/// column, `head_argmax::enqueue` refuses it) — runs the shared head's own
+/// arm ([`Head::enqueue`]): a Q8_0 one-row head the norm, the q8f32 gemv and
+/// the argmax, three launches as the fused head's; a Q4_K one-row one the
+/// norm, the quantizer, the Q4_K gemv and the argmax; a head of `m` rows
+/// those launches over its rows, its argmax `argmax_rows_fault`.
 pub(super) fn enqueue_head(
     gpu: &Gpu,
     w: &Weights,
@@ -143,13 +147,15 @@ pub(super) fn enqueue_head(
     state: &mut HeadArgmaxState,
     head: &mut Head,
 ) -> Result<(), GpuError> {
-    if !matches!(
-        w.get("output.weight"),
-        Some(DevWeight::KQuant {
-            ty: GgmlType::Q6_K,
-            ..
-        })
-    ) {
+    if head.m() > 1
+        || !matches!(
+            w.get("output.weight"),
+            Some(DevWeight::KQuant {
+                ty: GgmlType::Q6_K,
+                ..
+            })
+        )
+    {
         return head.enqueue(gpu, w);
     }
     let stream = gpu.stream();
