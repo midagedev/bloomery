@@ -85,7 +85,12 @@
 //! plan's KV term by name and prints both (`q3place::open_qwen3_slots`).
 //! One token a slot a round, the sequences switched by pointer exchange, no
 //! park and no re-prefill; the engine is the seat's own (`SeatEngine`), and
-//! the server steps every running slot in one call. `--parallel 1` is
+//! the server steps every running slot in one call — a whole-card load's
+//! rounds one pass of the busy rows (`GpuModel::step_slots`, every row-wise
+//! launch once over them all), a placed load's a select and a step a row
+//! (the seat's fallback loop). Under `BLOOMERY_STEP_STATS=1` each round of
+//! several slots prints a `slots round` record naming its command, rows,
+//! passes and the slots the seat serves. `--parallel 1` is
 //! exactly the one-sequence server. A qwen35moe file's slots take its one
 //! sequence in turns (`serve::SwapEngine`) over the whole context, until its
 //! body holds resident sequences. Under
@@ -122,7 +127,9 @@ use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu::model::{ChainBody, GpuModel, MAX_PASS_ROWS, StepMode};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
-use bloomery_gpu_gates::bind::{Seat, SeatEngine, Vocab, sampler_factory};
+use bloomery_gpu_gates::bind::{
+    Seat, SeatEngine, SlotStep, Vocab, sampler_factory, step_rows_in_turn,
+};
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::{GateError, ref_model_path};
@@ -417,6 +424,28 @@ trait Body3: ChainBody + Sized + 'static {
     /// (`app::Session::select_slot`). `Body35` refuses by name, as
     /// [`Body3::add_slots`] does.
     fn select_slot(s: &mut app::Session<Self>, slot: usize) -> Result<(), GateError>;
+    /// The resident sequences the session's model serves
+    /// (`app::Session::slots`): a qwen3moe file's `--parallel`, one on a
+    /// qwen35moe file's, whose body parks no sequence.
+    fn slots(s: &app::Session<Self>) -> usize {
+        let _ = s;
+        1
+    }
+    /// One round of several slots' steps as one pass of the busy rows
+    /// ([`Q3::step_slots`]'s one-pass arm), each row's answer into `next`
+    /// and each lent logits row filled; the passes it ran back. Refused by
+    /// the default: only a body that runs several slots' rows as one pass
+    /// on a whole-card load takes it — `Body` (a qwen3moe file), through
+    /// [`super::rounds::step_rows_one_pass`]; `Body35` (a qwen35moe file) keeps the
+    /// refusal, its seat serving slot 0 alone (no round of several slots
+    /// ever reaches it).
+    fn one_pass_round(
+        s: &mut app::Session<Self>,
+        rows: &mut [SlotStep],
+    ) -> Result<usize, GateError> {
+        let _ = (s, rows);
+        Err("a round of several slots as one pass: this body runs its slots in turns".into())
+    }
 }
 
 impl Body3 for Body {
@@ -496,6 +525,19 @@ impl Body3 for Body {
     /// The session's slot ([`app::Session::select_slot`]).
     fn select_slot(s: &mut app::Session<Body>, slot: usize) -> Result<(), GateError> {
         Ok(s.select_slot(slot)?)
+    }
+
+    /// The session's resident sequences (`app::Session::slots`).
+    fn slots(s: &app::Session<Body>) -> usize {
+        s.slots()
+    }
+
+    /// The busy rows as one pass ([`super::rounds::step_rows_one_pass`]).
+    fn one_pass_round(
+        s: &mut app::Session<Body>,
+        rows: &mut [SlotStep],
+    ) -> Result<usize, GateError> {
+        super::rounds::step_rows_one_pass(s, rows)
     }
 }
 
@@ -610,13 +652,20 @@ impl Body3 for Body35 {
 }
 
 /// The session on the engine thread, the positions its cache was sized
-/// for, and the resident sequences the seat serves.
+/// for, and what the seat decided once at its open: whether it runs every
+/// round of several slots as one pass, and whether it counts those rounds.
 struct Q3<B: Body3> {
     s: app::Session<B>,
     ctx: usize,
-    /// [`Seat::slots`]: 1, or the `--parallel` the seat made resident
-    /// sequences of.
-    slots: usize,
+    /// Whether a round of several slots runs as one pass of the busy rows
+    /// ([`Q3::step_slots`]): a whole-card load of more than one resident
+    /// slot, the body running several slots' rows as one pass — a placed
+    /// load keeps the fallback loop (its body serves each slot's rows in
+    /// its own pass; [`Body3::one_pass_round`] refuses by name), and a
+    /// load of one slot never runs a round of several.
+    one_pass: bool,
+    /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
+    stats: bool,
 }
 
 impl<B: Body3> Q3<B> {
@@ -637,7 +686,8 @@ impl<B: Body3> Q3<B> {
         let mut m = B::open(file, ctx, slots, by, levers, kv)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
-        if !B::placed(&m)? {
+        let placed = B::placed(&m)?;
+        if !placed {
             B::capture_passes(&mut m)?;
         }
         let at = u32::try_from(ctx).map_err(|_| format!("--ctx {ctx} passes u32"))?;
@@ -657,7 +707,12 @@ impl<B: Body3> Q3<B> {
             .u("graph_nodes", nodes)
             .f("load_s", t.elapsed().as_secs_f64())
             .eprint();
-        Ok(Q3 { s, ctx, slots })
+        Ok(Q3 {
+            s,
+            ctx,
+            one_pass: slots > 1 && !placed,
+            stats: levers.step_stats(),
+        })
     }
 }
 
@@ -682,16 +737,41 @@ impl<B: Body3> Seat for Q3<B> {
         Ok(self.s.model().logits_into(row)?)
     }
 
-    /// The resident sequences the seat made at its open: `--parallel` on a
-    /// qwen3moe file's load, one on a qwen35moe file's.
+    /// The resident sequences the seat made at its open ([`Body3::slots`]):
+    /// `--parallel` on a qwen3moe file's load, one on a qwen35moe file's.
     fn slots(&self) -> usize {
-        self.slots
+        B::slots(&self.s)
     }
 
     /// The session's slot ([`Body3::select_slot`]): the model exchanges its
     /// live sequence with the slot's parked state — pointer moves.
     fn select(&mut self, slot: usize) -> Result<(), GateError> {
         B::select_slot(&mut self.s, slot)
+    }
+
+    /// The lever the binary parsed ([`Q3::stats`]).
+    fn step_stats(&self) -> bool {
+        self.stats
+    }
+
+    /// One round of several slots: one pass of the busy rows while the open
+    /// decided so ([`Q3::one_pass`], through [`Body3::one_pass_round`] — a
+    /// whole-card load, the rows' answers and lent logits rows from the
+    /// pass's own per-row heads, slot 0 left selected), else the seat's
+    /// fallback — a select and a step a row — the placed load's round (its
+    /// body serves each slot's rows in its own pass) and the round a load of
+    /// one slot never runs (the turns take that engine). A refusal on either
+    /// path is the server's to die on: the open decides once, so a load that
+    /// cannot run one pass never tries it at run time.
+    fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
+        if !self.one_pass {
+            return step_rows_in_turn(self, rows);
+        }
+        let passes = B::one_pass_round(&mut self.s, rows).map_err(|e| e.to_string())?;
+        if self.stats {
+            record::slots_round("step", rows.len(), passes, self.slots()).eprint();
+        }
+        Ok(())
     }
 
     /// The model's reset ([`GpuModel::reset`]): these bodies never hold a
@@ -867,7 +947,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // A placed load (`--place`) acts on the placement's levers; set beside
     // an unplaced one, they are refused by name.
     let placed = args.iter().any(|a| a == "--place");
-    let mut acts_on = vec![bloomery_levers::QWEN3_KV];
+    let mut acts_on = vec![bloomery_levers::QWEN3_KV, bloomery_levers::STEP_STATS];
     if placed {
         acts_on.extend(q3place::PLACED_LEVERS);
     }

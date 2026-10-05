@@ -182,7 +182,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               front`) and per layer-batch (`stat prefill lb`); `gate_deepseek41_prefill`: \
               that split line per case; `generate_qwen3moe` on a qwen4exp file: the \
               ubatch walk's `stat prompt split` and its per layer-batch `stat \
-              prompt lb`. Off, nothing is read.",
+              prompt lb`; the qwen3 seat of `bloomery-serve`: a `slots round` record \
+              a round of several slots (its command, rows, the passes the seat ran \
+              them as, the slots it serves). Off, nothing is read.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

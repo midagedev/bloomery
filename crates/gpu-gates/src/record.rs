@@ -2339,6 +2339,23 @@ pub static RESIDENCY_UNSET_GLM: Kind = Kind {
     parts: &[key("residency", Word, ""), key("why", Text, "")],
 };
 
+/// A round of several slots the seat served, under `BLOOMERY_STEP_STATS`.
+pub static SLOTS_ROUND: Kind = Kind {
+    name: "slots round",
+    head: "slots round",
+    doc: "BLOOMERY_STEP_STATS: one round of several slots the seat served — its \
+          command (step: a step a row; pass: a drafted pass a row), the round's \
+          rows, the passes the seat ran them as (the fallback loop's rows, one \
+          a row; a one-pass seat's 1, or its cuts at its body's pass bound), and \
+          the resident sequences the seat serves.",
+    parts: &[
+        key("cmd", Word, ""),
+        key("rows", U64, ""),
+        key("passes", U64, ""),
+        key("slots", U64, ""),
+    ],
+};
+
 /// The server's prompt cache: its budget, the host headroom it was derived
 /// from, and the token a prompt call is cut at.
 pub static CACHE_CONFIG: Kind = Kind {
@@ -2585,6 +2602,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
     &LOAD_QWEN3,
     &LISTENING_QWEN3,
     &CACHE_REUSE,
+    &SLOTS_ROUND,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
@@ -2824,6 +2842,18 @@ pub fn residency_lever(pick: bloomery_levers::ResidencyPick) -> Record {
     Record::new(&RESIDENCY_LEVER)
         .w("residency", pick.word)
         .w("why", pick.why.name())
+}
+
+/// A round of several slots' record ([`SLOTS_ROUND`]): `cmd` the command the
+/// round ran (`step`, a step a row, or `pass`, a drafted pass a row), `rows`
+/// the round's rows, `passes` the passes the seat ran them as, and `slots`
+/// the resident sequences it serves.
+pub fn slots_round(cmd: &str, rows: usize, passes: usize, slots: usize) -> Record {
+    Record::new(&SLOTS_ROUND)
+        .w("cmd", cmd)
+        .u("rows", rows)
+        .u("passes", passes)
+        .u("slots", slots)
 }
 
 /// The record of what the residency lever unset resolved to in

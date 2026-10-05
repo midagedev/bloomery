@@ -34,6 +34,9 @@ pub mod qwen38;
 // The qwen3 seat sits behind the same server-surface feature.
 #[cfg(feature = "deepseek41")]
 pub mod qwen3;
+// The seats' one owner of a round run as passes (`step_rows_one_pass`).
+#[cfg(feature = "deepseek41")]
+pub mod rounds;
 // The decide seat: a decision model's backbone on the card, its head on the host.
 #[cfg(feature = "clef")]
 pub mod decide;

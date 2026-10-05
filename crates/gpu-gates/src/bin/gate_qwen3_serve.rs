@@ -149,6 +149,34 @@
 //!   the card. A whole-fit line that says the load does not fit is a named
 //!   error: the arm is not a whole arm. FAIL-first: a halving that stops a
 //!   step early splits a total whose next grid point still fits, red on (c).
+//! - `slots_rounds_run_one_pass`, on the qwen3moe arm: a whole-card server
+//!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
+//!   record a round of several slots — two greedy streamed requests of the
+//!   slots clause's prompts, each first run alone on that server and then
+//!   both together — and over the together run every record holds
+//!   `passes=1` over `rows` of 2..=`MAX_TOKENS` on `slots=2`
+//!   (`slots_rounds_run_one_pass`), and the rows the records carry plus
+//!   the solo rounds between them (a round of one row is a select and a
+//!   `next`, no record; their count the `/metrics` `n_decode_total` deltas
+//!   give, less the two requests' prompt-phase calls booked at their end)
+//!   sum to the tokens the two requests decoded beyond their
+//!   prompts' first — each request's `n_predict` less one, its first token
+//!   being the prompt's own last step
+//!   (`slots_rounds_rows_sum_the_decoded_tokens`). The same clause on the
+//!   placed arm (`slots-rounds-placed`,
+//!   `--place a` under the slots clause's budget, the lever on too) holds
+//!   `passes=rows`, the default loop (`placed_slots_rounds_run_in_turn`).
+//!   FAIL-first: a seat left on the default loop prints `passes=rows` on
+//!   the whole arm, and only this clause is red.
+//! - `slots_late_request_together_alone`, on the qwen3moe arm: a
+//!   whole-card server of `--parallel 2`, the first request decoding alone
+//!   and the second posted once `/metrics`' `n_decode_total` has moved a
+//!   few rounds — slot 1 taken mid-run, its prompt run between the first's
+//!   rounds — answers with each request's alone ids, the first's included:
+//!   the rounds the two ran together leave each slot's sequence whole
+//!   whatever slot the pass left selected. FAIL-first: a round that leaves
+//!   the wrong slot selected runs the second request's prompt over the
+//!   first's sequence, and both requests' ids move at once.
 //! - `slot_ctx_too_small_is_refused`, on the qwen3moe arm: `--ctx 15`
 //!   under the default two slots — a slot of 7 rows, one under the 8 rows
 //!   the load's widest captured pass writes (`router::MAX_TOKENS`; a placed
@@ -215,7 +243,11 @@
 //! passes `--parallel 2` (qwen35moe, the turns); the slots clause's two
 //! arms pass `--parallel 2` (qwen3moe, resident: the whole-card load and
 //! the budgeted placed one) and the refusal arm passes none (the default
-//! two are what makes the split too small); the host-tier arm pins `--parallel 1` (one prompt on
+//! two are what makes the split too small); the slots-round clause's two
+//! arms pass `--parallel 2` with `BLOOMERY_STEP_STATS=1` in their
+//! environment (the whole-card load and the budgeted placed one), and the
+//! late arm passes `--parallel 2` (whole-card, no lever); the host-tier
+//! arm pins `--parallel 1` (one prompt on
 //! the placed path is the clause).
 //!
 //! The server is stopped by the handle this binary spawned it with before
@@ -330,6 +362,16 @@ mod gate {
 
     /// The slots clause's poll for the refusal arm's exit.
     const SLOTS_POLL: Duration = Duration::from_millis(500);
+
+    /// The late clause's arrival point: the first request this many decode
+    /// rounds in (`/metrics`' `n_decode_total` past its start) when the
+    /// second is posted.
+    const LATE_ROUNDS: u64 = 4;
+
+    /// The late clause's poll of the arrival point, and the most polls it
+    /// takes before the second is posted anyway.
+    const LATE_POLL: Duration = Duration::from_millis(50);
+    const LATE_POLLS: usize = 600;
 
     /// The refusal arm's `--ctx`: two slots of one row under the seat's
     /// least slot context, the widest pass a whole-card load captures
@@ -1835,6 +1877,227 @@ mod gate {
         Ok(())
     }
 
+    /// The slots-round clause (module header) on a server of `--parallel 2`
+    /// started with `BLOOMERY_STEP_STATS=1` and the arm's flags and
+    /// environment into its own directory: two greedy streamed requests of
+    /// the slots clause's prompts, each first run alone on that server and
+    /// then both together, the `slots round` records between read back. On
+    /// the whole-card arm every together-run record holds `passes=1`
+    /// (`slots_rounds_run_one_pass`) and the rows the records carry, with
+    /// the solo rounds the `/metrics` decode deltas count, sum to the
+    /// tokens the two requests decoded beyond their prompts' first
+    /// (`slots_rounds_rows_sum_the_decoded_tokens`); on the placed arm
+    /// every record holds `passes=rows`, the default loop
+    /// (`placed_slots_rounds_run_in_turn`).
+    /// `BLOOMERY_STEP_STATS=1` moves no computation on this server — the seat
+    /// and the fallback loop branch on it only to print the record — so the
+    /// together-equals-alone bits of these runs stand for the default server.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the arm tuple, one line a field (rust-quality R8)"
+    )]
+    fn slots_rounds_run_one_pass(model: &Path, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
+        let arms: [(&str, &str, &[&str], &[(&str, &str)], bool); 2] = [
+            ("slots-rounds", "", &[], &[], true),
+            (
+                "slots-rounds-placed",
+                "placed_",
+                &["--place", "a"],
+                &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
+                false,
+            ),
+        ];
+        for (dir_name, prefix, flags, env, one_pass) in arms {
+            let named = |c: &str| format!("{prefix}{c}");
+            let d = dir.join(dir_name);
+            std::fs::create_dir_all(&d)?;
+            let err_log = d.join("server.err");
+            let mut cmd = Command::new(beside("bloomery-serve")?);
+            cmd.env_remove("BLOOMERY_REF_MODEL")
+                .env(bloomery_levers::STEP_STATS, "1");
+            for &(k, v) in env {
+                cmd.env(k, v);
+            }
+            let m = model.to_str().ok_or("the model path is not UTF-8")?;
+            let mut args = vec![
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "2",
+                "-m",
+                m,
+            ];
+            args.extend_from_slice(flags);
+            let mut s = Served::spawn_cmd(cmd, &args, &d)?;
+            let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+            let url = |p: &str| format!("http://{addr}{p}");
+            let a_ids = rendered(&url, messages())?;
+            let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
+            let b_ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+            let mut alone = Vec::new();
+            for ids in [&a_ids, &b_ids] {
+                let (h, rx) = streamed(&addr, ids, SLOTS_PREDICT)?;
+                h.join()
+                    .map_err(|_| format!("{dir_name}: an alone request's thread panicked"))?;
+                let ran = rx.recv().map_err(|_| {
+                    format!("{dir_name}: an alone request's thread gave no answer")
+                })??;
+                alone.push(ran.tokens);
+            }
+            let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+            // The alone runs print no record (a round of one row is a select
+            // and a `next`), so the window opens empty; taken anyway, so the
+            // together run's records are exactly the ones after this point.
+            let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
+            let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
+            let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
+            let mut together = Vec::new();
+            for ((h, rx), what) in [(first, "first"), (second, "second")] {
+                h.join()
+                    .map_err(|_| format!("{dir_name}: the {what} request's thread panicked"))?;
+                together.push(rx.recv().map_err(|_| {
+                    format!("{dir_name}: the {what} request's thread gave no answer")
+                })??);
+            }
+            let decode1 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+            let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
+            let window = &rounds[before.min(rounds.len())..];
+            let rows: Vec<u64> = window.iter().map(|r| r.u64("rows").unwrap_or(0)).collect();
+            let every = !window.is_empty()
+                && window.iter().all(|r| {
+                    r.word("cmd") == Ok("step")
+                        && r.u64("slots") == Ok(2)
+                        && matches!(r.u64("rows"), Ok(n) if (2..=MAX_TOKENS as u64).contains(&n))
+                        && r.u64("passes") == if one_pass { Ok(1) } else { r.u64("rows") }
+                });
+            println!(
+                "{dir_name}: {} record(s) in the together window, rows {rows:?} (alone {} and \
+                 {} ids, together {} and {})",
+                window.len(),
+                alone[0].len(),
+                alone[1].len(),
+                together[0].tokens.len(),
+                together[1].tokens.len(),
+            );
+            check(
+                ok,
+                &named(if one_pass {
+                    "slots_rounds_run_one_pass"
+                } else {
+                    "slots_rounds_run_in_turn"
+                }),
+                every,
+            );
+            if one_pass {
+                // The tokens decoded beyond the two prompts' first: each
+                // request's `n_predict` less one, its first token being the
+                // prompt's own last step. The records carry the rounds of two
+                // rows or more; the solo rounds beside them (a select and a
+                // `next`, no record) the decode deltas count, less the two
+                // requests' prompt-phase calls, booked at their end
+                // (`worker.rs`'s `end_request`).
+                let solo = decode1 - decode0 - window.len() as f64 - 2.0;
+                let sum: u64 = rows.iter().sum();
+                let want = 2 * (SLOTS_PREDICT - 1) as u64;
+                println!(
+                    "{dir_name}: rows sum {sum} + {solo} solo round(s) against the {want} \
+                     decoded beyond the prompts' first (decode {decode0} -> {decode1})",
+                );
+                check(
+                    ok,
+                    "slots_rounds_rows_sum_the_decoded_tokens",
+                    solo >= 0.0 && sum + solo as u64 == want,
+                );
+            }
+            println!("{dir_name} server stopped: {}", s.stop()?);
+        }
+        Ok(())
+    }
+
+    /// The late-request clause (module header): the first request decodes
+    /// alone on a whole-card server of `--parallel 2`, and the second is
+    /// posted once `/metrics`' `n_decode_total` has moved [`LATE_ROUNDS`]
+    /// rounds — slot 1 taken mid-run, its prompt run between the first's
+    /// rounds. Both answer with their alone ids.
+    fn slots_late_request_together_alone(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let d = dir.join("slots-late");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL");
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mut s = Served::spawn_cmd(
+            cmd,
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "2",
+                "-m",
+                m,
+            ],
+            &d,
+        )?;
+        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let a_ids = rendered(&url, messages())?;
+        let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
+        let b_ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let mut alone = Vec::new();
+        for ids in [&a_ids, &b_ids] {
+            let (h, rx) = streamed(&addr, ids, SLOTS_PREDICT)?;
+            h.join()
+                .map_err(|_| "slots-late: an alone request's thread panicked")?;
+            let ran = rx
+                .recv()
+                .map_err(|_| "slots-late: an alone request's thread gave no answer")??;
+            alone.push(ran.tokens);
+        }
+        // The late run: the first decodes alone, and once a few of its rounds
+        // have passed the second arrives on the empty slot.
+        let first = streamed(&addr, &a_ids, SLOTS_PREDICT)?;
+        let decode0 = metric(&url, "n_decode_total")?.unwrap_or(f64::NAN);
+        let mut polls = 0;
+        while polls < LATE_POLLS
+            && metric(&url, "n_decode_total")?.unwrap_or(decode0) < decode0 + LATE_ROUNDS as f64
+        {
+            std::thread::sleep(LATE_POLL);
+            polls += 1;
+        }
+        let second = streamed(&addr, &b_ids, SLOTS_PREDICT)?;
+        let mut late = Vec::new();
+        for ((h, rx), what) in [(first, "first"), (second, "second")] {
+            h.join()
+                .map_err(|_| format!("slots-late: the {what} request's thread panicked"))?;
+            late.push(rx.recv().map_err(|_| {
+                format!("slots-late: the {what} request's thread gave no answer")
+            })??);
+        }
+        println!(
+            "slots-late: the second posted after {polls} poll(s); {} and {} ids",
+            late[0].tokens.len(),
+            late[1].tokens.len(),
+        );
+        check(
+            ok,
+            "slots_late_request_together_alone",
+            !late[0].tokens.is_empty()
+                && !late[1].tokens.is_empty()
+                && late[0].tokens == alone[0]
+                && late[1].tokens == alone[1],
+        );
+        println!("slots-late server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
     /// The placed slots arm's own terms, from its server's stderr
     /// (`<dir>/slots-placed/server.err`) once it stopped: its `plan` record
     /// keeps routed experts on the card and on the host tier (the arm ran
@@ -2351,6 +2614,8 @@ mod gate {
                 placed_slots_hold_the_plan(&dir, &mut ok)?;
                 slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
+                slots_rounds_run_one_pass(model, &dir, &mut ok)?;
+                slots_late_request_together_alone(model, &dir, &mut ok)?;
             }
             if arch == "qwen35moe" {
                 // The park is the seat's, and the qwen3moe arm's whole-card

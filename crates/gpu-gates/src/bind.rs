@@ -588,24 +588,25 @@ enum Cmd {
     PassSlots(Vec<SlotPassRow>),
 }
 
-/// One row of a [`Cmd::StepSlots`]: the slot, the id it evaluates, the
-/// engine's logits row lent for it (`n_vocab` f32), and the engine's
-/// answer, which the thread sets.
-struct SlotStep {
-    slot: usize,
-    last: u32,
-    logits: Option<Vec<f32>>,
-    next: u32,
+/// One row of a [`Cmd::StepSlots`] and of a [`Seat::step_slots`] round: the
+/// slot, the id it evaluates, the engine's logits row lent for it
+/// (`n_vocab` f32, filled only when the row asked), and the engine's
+/// answer, which the seat sets.
+pub struct SlotStep {
+    pub slot: usize,
+    pub last: u32,
+    pub logits: Option<Vec<f32>>,
+    pub next: u32,
 }
 
-/// One row of a [`Cmd::PassSlots`]: the slot, the id its pass runs, the
-/// caller's buffer of the pass's kept ids, and what the pass drafted, which
-/// the thread sets.
-struct SlotPassRow {
-    slot: usize,
-    last: u32,
-    out: Vec<u32>,
-    drafted: Drafted,
+/// One row of a [`Cmd::PassSlots`] and of a [`Seat::pass_slots`] round: the
+/// slot, the id its pass runs, the caller's buffer of the pass's kept ids,
+/// and what the pass drafted, which the seat sets.
+pub struct SlotPassRow {
+    pub slot: usize,
+    pub last: u32,
+    pub out: Vec<u32>,
+    pub drafted: Drafted,
 }
 
 /// What a reply carries besides its result.
@@ -710,6 +711,45 @@ pub trait Seat: 'static {
     /// needs no declaration. The default is false.
     fn slot_drafts(&self) -> bool {
         false
+    }
+    /// Whether the seat counts its rounds of several slots — a `slots round`
+    /// record a round (`record::slots_round`), under `BLOOMERY_STEP_STATS`:
+    /// the lever's value the binary's `main` parsed, carried by a seat whose
+    /// binary names the lever among those it acts on. The default counts
+    /// nothing: a binary that does not name the lever refuses it set, so its
+    /// seats never count.
+    fn step_stats(&self) -> bool {
+        false
+    }
+    /// One round of several slots' steps (`serve::Engine::step_slots` through
+    /// [`SeatEngine`]): each row's `last` stepped on its own slot, in row
+    /// order, the answers written to `next` and each lent logits row filled.
+    /// A row that fails ends the round there; the error is the server's to
+    /// die on, and the rows cross back with the reply whole whatever the
+    /// result, their lent rows included.
+    ///
+    /// The default is the fallback for a seat with no one-pass override
+    /// ([`step_rows_in_turn`]: a select and a step a row). The seats that
+    /// override it, or will: the qwen3moe whole-card seat (`serve_seats::qwen3`,
+    /// one pass of the busy rows over the session); Qwen3.6 (round O3b, once
+    /// its body serves resident slots); V4.1 (round T3 `stgseat`); GLM
+    /// (line3's `glmseatpass`).
+    fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
+        step_rows_in_turn(self, rows)
+    }
+    /// One round of several slots' drafted passes (`serve::Engine::advance_slots`
+    /// through [`SeatEngine`]): each row's `last` passed on its own slot, in
+    /// row order, the kept ids into `out` and what the draft proposed and
+    /// kept into `drafted`. A row that fails ends the round there; the error
+    /// is the server's to die on.
+    ///
+    /// The default is the fallback for a seat with no one-pass override
+    /// ([`pass_rows_in_turn`]: a select and a pass a row). The seats that
+    /// override it, or will: the Qwen3.8 drafted seat (round O3c, through
+    /// `app::mtp::pass_slots`); V4.1 (round T3 `stgseat`); GLM (line3's
+    /// `glmseatpass`).
+    fn pass_slots(&mut self, rows: &mut [SlotPassRow]) -> Result<(), String> {
+        pass_rows_in_turn(self, rows)
     }
     /// Empty caches at position 0.
     fn reset(&mut self) -> Result<(), GateError>;
@@ -893,51 +933,18 @@ impl SeatEngine {
                             Extra::None,
                         ),
                         Cmd::StepSlots(mut rows) => {
-                            // Select and step each row in order, on the seat:
-                            // one command, a select and a step a row on the
-                            // thread — not two round trips a row. A row that
-                            // fails ends the call there; the error is the
-                            // server's to die on.
-                            let mut failed = None;
-                            for r in rows.iter_mut() {
-                                let run =
-                                    g.select(r.slot).map_err(|e| e.to_string()).and_then(|()| {
-                                        next_row(&mut g, r.last, r.logits.as_deref_mut(), n_vocab)
-                                    });
-                                match run {
-                                    Ok(next) => r.next = next,
-                                    Err(e) => {
-                                        failed = Some(e);
-                                        break;
-                                    }
-                                }
-                            }
-                            (failed.map_or(Ok(0), Err), None, Extra::StepSlots(rows))
+                            // The seat's round ([`Seat::step_slots`]): one
+                            // command on the thread, its rows back with the
+                            // one reply — not two round trips a row.
+                            let r = g.step_slots(&mut rows).map(|()| 0);
+                            (r, None, Extra::StepSlots(rows))
                         }
                         Cmd::PassSlots(mut rows) => {
-                            // Select and pass each row in order, on the seat:
-                            // one command, a select and a drafted pass a row
-                            // on the thread — not two round trips a row. A
-                            // row that fails ends the call there; the error
-                            // is the server's to die on.
-                            let mut failed = None;
-                            for r in rows.iter_mut() {
-                                let at = g.pos();
-                                let run =
-                                    g.select(r.slot).map_err(|e| e.to_string()).and_then(|()| {
-                                        r.out.clear();
-                                        pass(&mut g, r.last, &mut r.out)
-                                            .map_err(|e| format!("pass at position {at}: {e}"))
-                                    });
-                                match run {
-                                    Ok(d) => r.drafted = d,
-                                    Err(e) => {
-                                        failed = Some(e);
-                                        break;
-                                    }
-                                }
-                            }
-                            (failed.map_or(Ok(0), Err), None, Extra::PassSlots(rows))
+                            // The seat's round ([`Seat::pass_slots`]): one
+                            // command on the thread, its rows back with the
+                            // one reply — not two round trips a row.
+                            let r = g.pass_slots(&mut rows).map(|()| 0);
+                            (r, None, Extra::PassSlots(rows))
                         }
                         cmd => {
                             let (result, logits) = serve_cmd(&mut g, cmd, n_vocab);
@@ -1207,7 +1214,7 @@ fn check_feed<S: Seat>(g: &S, n: usize) -> Result<(), String> {
 /// A pass on `g`, refused before it runs when its rows do not fit the
 /// context; one that keeps no token or more than its rows is the seat's
 /// defect, named.
-fn pass<S: Seat>(g: &mut S, last: u32, out: &mut Vec<u32>) -> Result<Drafted, String> {
+fn pass<S: Seat + ?Sized>(g: &mut S, last: u32, out: &mut Vec<u32>) -> Result<Drafted, String> {
     let rows = g.pass_rows();
     if g.pos() + rows > g.ctx_max() {
         return Err(format!(
@@ -1285,6 +1292,27 @@ fn next_row<S: Seat>(
     row: Option<&mut [f32]>,
     n_vocab: usize,
 ) -> Result<u32, String> {
+    if let Some(row) = row.as_ref()
+        && row.len() != n_vocab
+    {
+        let at = g.pos();
+        return Err(format!(
+            "a logits buffer of {} at position {at}, the vocabulary has {n_vocab}",
+            row.len()
+        ));
+    }
+    next_lent_row(g, last, row)
+}
+
+/// [`next_row`] over a row the link already checked against the vocabulary
+/// and lent as its own scratch, so the length guard there cannot fire: the
+/// ctx-full and NaN guards stay, as a round's rows need them too
+/// ([`step_rows_in_turn`]).
+fn next_lent_row<S: Seat + ?Sized>(
+    g: &mut S,
+    last: u32,
+    row: Option<&mut [f32]>,
+) -> Result<u32, String> {
     let at = g.pos();
     if at >= g.ctx_max() {
         return Err(format!(
@@ -1297,12 +1325,6 @@ fn next_row<S: Seat>(
             .step(last)
             .map_err(|e| format!("step at position {at}: {e}"));
     };
-    if row.len() != n_vocab {
-        return Err(format!(
-            "a logits buffer of {} at position {at}, the vocabulary has {n_vocab}",
-            row.len()
-        ));
-    }
     let arg = g
         .step_row(last, row)
         .map_err(|e| format!("step at position {at}: {e}"))?;
@@ -1310,6 +1332,63 @@ fn next_row<S: Seat>(
         return Err(format!("logit {i} is NaN after position {at}"));
     }
     Ok(arg)
+}
+
+/// The fallback round of several slots' steps ([`Seat::step_slots`]'s
+/// default): a select and a step a row, in row order — one command, not two
+/// round trips a row. A row that fails ends the round there; the error is
+/// the server's to die on. A seat that counts its rounds
+/// ([`Seat::step_stats`]) prints the `slots round` record: the fallback's
+/// passes are its rows.
+pub fn step_rows_in_turn<S: Seat + ?Sized>(g: &mut S, rows: &mut [SlotStep]) -> Result<(), String> {
+    let mut failed = None;
+    for r in rows.iter_mut() {
+        let run = g
+            .select(r.slot)
+            .map_err(|e| e.to_string())
+            .and_then(|()| next_lent_row(g, r.last, r.logits.as_deref_mut()));
+        match run {
+            Ok(next) => r.next = next,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    if failed.is_none() && g.step_stats() {
+        crate::record::slots_round("step", rows.len(), rows.len(), g.slots()).eprint();
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+/// The fallback round of several slots' drafted passes ([`Seat::pass_slots`]'s
+/// default): a select and a pass a row, in row order. A row that fails ends
+/// the round there; the error is the server's to die on. A seat that counts
+/// its rounds ([`Seat::step_stats`]) prints the `slots round` record: the
+/// fallback's passes are its rows.
+pub fn pass_rows_in_turn<S: Seat + ?Sized>(
+    g: &mut S,
+    rows: &mut [SlotPassRow],
+) -> Result<(), String> {
+    let mut failed = None;
+    for r in rows.iter_mut() {
+        let at = g.pos();
+        let run = g.select(r.slot).map_err(|e| e.to_string()).and_then(|()| {
+            r.out.clear();
+            pass(g, r.last, &mut r.out).map_err(|e| format!("pass at position {at}: {e}"))
+        });
+        match run {
+            Ok(d) => r.drafted = d,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    if failed.is_none() && g.step_stats() {
+        crate::record::slots_round("pass", rows.len(), rows.len(), g.slots()).eprint();
+    }
+    failed.map_or(Ok(()), Err)
 }
 
 impl Engine for SeatEngine {

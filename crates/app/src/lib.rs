@@ -574,6 +574,61 @@ where
         self.slots_waiting = None;
         Ok(())
     }
+
+    /// One round of several slots' steps as passes of [`GpuModel::step_slots`]
+    /// — the round a seat serves whose body runs several slots' rows as one
+    /// pass: the busy `rows` (one a slot there, the server's rounds being one
+    /// step a running slot) cut into passes of at most [`SlotRows::MAX_ROWS`]
+    /// rows, each row's greedy next token in row order and each slot's
+    /// position moved by its own. With `logits`, every row's logits of each
+    /// pass come back too, read through [`GpuModel::slots_logits`] — never
+    /// [`GpuModel::logits_into`], which a pass of several rows refuses by
+    /// name; a NaN among them is a named error, as a step's row is. The
+    /// round leaves slot 0 selected, as [`Session::step_slots`] does.
+    /// Refused as that refuses the rows, and while a verify's rows wait for
+    /// their commit.
+    pub fn step_slots_rounds(
+        &mut self,
+        rows: &[(usize, &[u32])],
+        logits: bool,
+    ) -> Result<SlotsRound, SessionError> {
+        let mut ids = Vec::with_capacity(rows.iter().map(|(_, r)| r.len()).sum());
+        let mut rows_logits = logits.then(Vec::new);
+        let mut passes = 0;
+        for chunk in rows.chunks(B::MAX_ROWS) {
+            let out = self.step_slots(chunk)?;
+            ids.extend(out.ids);
+            if let Some(all) = rows_logits.as_mut() {
+                let mut pass = self.model.slots_logits()?;
+                for (r, row) in chunk.iter().zip(&pass) {
+                    if let Some(i) = row.iter().position(|v| v.is_nan()) {
+                        return Err(SessionError::Refused(format!(
+                            "slot {}'s logit {i} is NaN",
+                            r.0
+                        )));
+                    }
+                }
+                all.append(&mut pass);
+            }
+            passes += 1;
+        }
+        Ok(SlotsRound {
+            ids,
+            passes,
+            logits: rows_logits,
+        })
+    }
+}
+
+/// What [`Session::step_slots_rounds`] ran: each row's greedy next token in
+/// row order, the passes the round took (one a cut at the body's
+/// [`SlotRows::MAX_ROWS`] bound), and every row's logits when the caller
+/// asked for them, each pass's rows in the round's row order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotsRound {
+    pub ids: Vec<u32>,
+    pub passes: usize,
+    pub logits: Option<Vec<Vec<f32>>>,
 }
 
 impl<B: Prompt + Keep> Target for Session<B> {
