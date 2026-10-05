@@ -77,7 +77,7 @@
 //! a block takes four heads of sixteen positions, an m16 fragment four
 //! positions × four heads, and a key head's group is `group / 4` blocks; a
 //! row's bits are the eight-head kernel's for the same row. Its body is
-//! `prefill_256_p`, a PACK-generic copy of the eight-head kernel's.
+//! `prefill_256_p`, a PACK-generic form of the eight-head kernel's.
 //! [`FlashGqaPrefill::enqueue_256_p2`] runs the same body in packs of two
 //! (`gqa_prefill_flash_256_p2`) for a group that is even and not a multiple of
 //! four (Qwen3.5-9B's 24/4): a block takes two heads of thirty-two positions,
@@ -87,8 +87,13 @@
 //! `_256` kin; no packed q8 entry exists) run the same walks over the Q8_0
 //! cache the quantizing appends write (`rope_neox`'s two-plane layout: a
 //! codes plane of `head/4` u32 a row, a scales plane of `head/32` u16, a
-//! pair of planes a side). The tensor cores need the f16 tile the walk
-//! reads, so the staging becomes two steps: `cp.async` carries each tile's
+//! pair of planes a side). The `_256_p4`, `_256_p2` and `_256_q8` entries
+//! are the instances of one body, `prefill_256_p`, over [`F16Kv`] and
+//! [`Q8Kv`]; `gqa_prefill_flash_q8` holds `gqa_prefill_flash`'s body with the
+//! q8 staging, because moving that f16 entry's kernel body into a helper
+//! changes the entry's code at the toolchain pin. The
+//! tensor cores need the f16 tile the walk reads, so a q8 tile's staging
+//! becomes two steps: `cp.async` carries each tile's
 //! raw code words into the low half of the f16 tile's own rows (a code row
 //! is half a staged row's words) and its scales into a small scales tile,
 //! and a dequant step widens the codes in place — each warp owns whole
@@ -100,19 +105,19 @@
 //! f16 rounding of `code·d`, a key past it four zero words — the f16 walk's
 //! own zeros, so a refused block's NaN scale reaches a row's output only
 //! through a key below its count, never past it. The raw copies keep the
-//! twin's overlap (the value side's landing under the scores, the next key
-//! tile's under the value product); the dequants add the two barriers the
-//! in-place widening needs. The 256 bodies' dynamic shared memory grows by
-//! the two scales tiles (100,352 bytes, still inside the card's opt-in
-//! window); the 128 body's are static. The query staging, the scores, the
-//! softmax and the value products are the twins' verbatim — the q8 read's
+//! f16 walk's overlap (the value side's landing under the scores, the next
+//! key tile's under the value product); the dequants add the two barriers
+//! the in-place widening needs. A q8 256 block's dynamic shared memory grows
+//! by the two scales tiles (100,352 bytes, still inside the card's opt-in
+//! window); the 128 entry's are static. The query staging, the scores, the
+//! softmax and the value products are the f16 walk's — the q8 read's
 //! dequantized values are not the f16 cache's bits, and the owning gates
 //! hold these entries against the dequantized cache with the f16 rounding
 //! of the widened tiles said in their bands.
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{dev_exp, f32x2_to_f16x2_bits, half_bits_to_f32};
-use crate::flash_gqa::{GROUP, HEAD, PACK_2, PACK_4, q8_word_values};
+use crate::flash_gqa::{F16Kv, GROUP, HEAD, KvSrc, PACK_2, PACK_4, Q8Kv, q8_word_values};
 use crate::rope_neox::q8_plane_lens;
 use crate::{GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -331,7 +336,7 @@ const Q_WORDS_256: usize = Q_ROWS_256 * Q_PAIRS_256 / THREADS_256;
 const Q_ROW_STEP_256: usize = THREADS_256 / Q_PAIRS_256;
 const Q_POS_PASSES_256: usize = GROUP / Q_ROW_STEP_256;
 /// Passes of the query staging that cover eight staged rows (the
-/// PACK-generic copy's `q_at`).
+/// PACK-generic body's `q_at`).
 const Q_OCT_PASSES_256: usize = 8 / Q_ROW_STEP_256;
 /// Rows of one m16 row slice: `SLICE_ROWS / PACK` positions of `PACK` heads.
 const SLICE_ROWS: usize = 16;
@@ -529,10 +534,105 @@ const _: () = assert!(
     SLICE_ROWS.is_multiple_of(PACK_2) && SLICES_256 * (SLICE_ROWS / PACK_2) == Q_ROWS_256 / PACK_2
 );
 
+// ----------------------------------------------------- the q8_0 tile staging
+//
+// A q8 cache's tile staging in both bodies (the module doc's `_q8`
+// paragraph): the raw code words of a tile's rows land by `cp.async` in the
+// low half of the rows' own spans of the f16 tile and the rows' scales in a
+// small scales tile, and the in-place widening below writes the dequantized
+// f16 pairs to the permuted layout the `ldmatrix` addresses walk.
+
+/// Word `w`'s offset within its row of a staged tile — the in-row half of
+/// [`staged_word`]/[`staged_word_256`]: the 16-byte chunk `w/4` stored at
+/// chunk `(w/4) ^ xor`, `xor` the row's `row & 7`.
+#[inline(always)]
+const fn staged_off(xor: usize, w: usize) -> usize {
+    (((w >> 2) ^ xor) << 2) | (w & 3)
+}
+
+/// One staged row's in-place widening, as a macro: a pointer into the
+/// dynamic shared window, which the 256 body's tiles are, cannot be passed
+/// to a device helper fn (the toolchain types it in the shared address
+/// space and the helper's parameter in the generic one), so the body expands
+/// at each call site — the file's own `stage!` shape.
+/// Lane `$lane` reads the row's raw code words `$lane + 32·i` (`i < NW` — the
+/// row's `NW·32` words, its low half, landed by the copies) and its scale
+/// `lane/8 + 4·i`, the warp syncs — a row's staged writes may land on its
+/// own raw words — and each word's four widened values ([`q8_word_values`])
+/// go as two staged words to the permuted layout: `$tile` the staged tile,
+/// `$base` the row's first word, `$scales` the row's `4·NW` u16 scales,
+/// `$xor` the row's `row & 7`, `$lane` the calling lane. All 32 lanes of a
+/// warp, together, on one row that is that warp's alone.
+///
+/// SAFETY: the row's span of `$tile` is this warp's alone, `NW·32` is at
+/// most half the tile's row stride, `$scales .. +4·NW` lies inside the
+/// scales tile, `$xor < 8`, and the raw words were published by the barrier
+/// before this expansion.
+macro_rules! dequant_row {
+    ($nw:literal, $tile:expr, $base:expr, $scales:expr, $xor:expr, $lane:expr) => {{
+        let mut cw = [0u32; $nw];
+        for i in 0..$nw {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: lane + 32·i < NW·32 <= half the row's words, this
+            // warp's own row of the tile.
+            unsafe { cw[i] = *$tile.add($base + $lane + 32 * i) };
+        }
+        warp::sync_mask(u32::MAX);
+        for i in 0..$nw {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: lane/8 + 4·i < 4·NW: inside the row's scales.
+            let d = half_bits_to_f32(unsafe { *$scales.add($lane / 8 + 4 * i) });
+            let v = q8_word_values(cw[i], d);
+            let c = $lane + 32 * i;
+            // SAFETY: staged words 2·c and 2·c + 1 of the row, inside its
+            // span.
+            unsafe {
+                *$tile.add($base + staged_off($xor, 2 * c)) = f32x2_to_f16x2_bits(v[0], v[1]);
+                *$tile.add($base + staged_off($xor, 2 * c + 1)) = f32x2_to_f16x2_bits(v[2], v[3]);
+            }
+        }
+    }};
+}
+
+/// A staged row's zero words, the dead key's form, as a macro (the same
+/// boundary as `dequant_row!`'s): lane `$lane` writes the row's staged
+/// words `$lane + 32·j` (`j < 2·NW`) as zero — the f16 walk's own zeros for
+/// a key at or past the block's largest count, so a padded row's NaN scale
+/// reaches no result.
+///
+/// SAFETY: the row's span of `$tile` is this warp's alone, `2·NW·32` the
+/// row's staged word count, `$xor < 8`.
+macro_rules! zero_row {
+    ($nw:literal, $tile:expr, $base:expr, $xor:expr, $lane:expr) => {{
+        for j in 0..2 * $nw {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: lane + 32·j < 64·NW: inside the row's span, this
+            // warp's own row.
+            unsafe { *$tile.add($base + staged_off($xor, $lane + 32 * j)) = 0 };
+        }
+    }};
+}
+
+/// One 256-value-head scales tile of the q8 staging: `KEY_TILE` rows of
+/// `HEAD_256/32` u16.
+const Q8_SCALE_TILE_256: usize = KEY_TILE * (HEAD_256 / 32);
+/// The q8 bytes of dynamic shared memory a 256-value-head block adds to the
+/// f16 window: its two scales tiles.
+const Q8_SCALES_256: usize = 2 * Q8_SCALE_TILE_256;
+/// A q8 256 block's dynamic shared window: the f16 [`DYN_BYTES_256`] plus the
+/// two scales tiles — 100,352 bytes, inside the card's opt-in window
+/// (101,376).
+const DYN_BYTES_256_Q8: usize = DYN_BYTES_256 + Q8_SCALES_256 * 2;
+const DYN_BYTES_256_Q8_U32: u32 = DYN_BYTES_256_Q8 as u32;
+const _: () = assert!(DYN_BYTES_256_Q8_U32 as usize == DYN_BYTES_256_Q8);
+const _: () = assert!(DYN_BYTES_256_Q8 == 100_352);
+
 /// The attention of the module doc over heads of [`HEAD_256`] values, eight
 /// warps a block (the section above), in blocks of `PACK` query heads, `packs`
-/// of them per key head: the body of `gqa_prefill_flash_256_p4` (`PACK = 4`).
-/// `gqa_prefill_flash_256` keeps its own body; this PACK-generic copy computes
+/// of them per key head, over a cache in the format `S`: the body of
+/// `gqa_prefill_flash_256_p4` (`PACK = 4`), `gqa_prefill_flash_256_p2`
+/// (`PACK = 2`) and, over [`Q8Kv`], `gqa_prefill_flash_256_q8` (`PACK = 8`).
+/// `gqa_prefill_flash_256` keeps its own body; this PACK-generic one computes
 /// each row as that body does ([`pack_rows_hold`] at `GROUP` is its layout).
 /// Block `b` is unit `r = b % (n_kv · packs)` — key head `r / packs`, query
 /// heads `head0 = r·PACK ..` — and query tile `n_tiles − 1 − b / (n_kv ·
@@ -540,14 +640,21 @@ const _: () = assert!(
 /// `SLICE_ROWS / PACK` positions × `PACK` heads ([`pack_rows_hold`]). Row `t`'s query head `head0 + j` is read at `q[(t ·
 /// n_head + head0 + j)·256 ..]` and its output written at the same index of
 /// `y`. The key tile, the value tile and the score exchange live in the
-/// block's dynamic shared memory. Every guard around a shuffle or a barrier
+/// block's dynamic shared memory, and a q8 cache's two scales tiles after
+/// them. The formats differ only in a tile's staging: the f16 rows land by
+/// `cp.async` in the permuted layout; a q8 tile's raw code words land in the
+/// low halves of its rows and its scales in its scales tile, and the
+/// in-place widening (`dequant_row`, `zero_row`) and its barrier run before
+/// the tile is read. Every guard
+/// around a shuffle or a barrier
 /// is block- or warp-pair-uniform: `live` and the unmasked path read the
 /// slice's largest and smallest counts; a lane's two rows mask by their own.
 ///
 /// SAFETY: the entry's launch contract at `n_kv · packs · PACK` query heads
-/// (every buffer bound it names), a block of [`THREADS_256`] threads and
-/// [`DYN_BYTES_256`] bytes of dynamic shared memory whose window starts at the
-/// block's shared base (no static shared memory in the entry).
+/// over `src`'s planes (every buffer bound it names), a block of
+/// [`THREADS_256`] threads and [`DYN_BYTES_256`] bytes of dynamic shared
+/// memory for an f16 cache, [`DYN_BYTES_256_Q8`] for a q8 one, whose window
+/// starts at the block's shared base (no static shared memory in the entry).
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -557,10 +664,9 @@ const _: () = assert!(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize>(
+unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize, S: KvSrc>(
     q: &[f32],
-    kc: &[u16],
-    vc: &[u16],
+    src: S,
     n_keys_buf: &[u32],
     scale: f32,
     n_kv: u32,
@@ -577,6 +683,13 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize>(
     let pps = SLICE_POS;
     // The query staging's passes over one position's pack of heads.
     let qpp = PACK / Q_ROW_STEP_256;
+    // The q8 staging: code 16-byte chunks a staged row takes, a thread's
+    // count of a tile's, and the rows of a tile each warp widens.
+    const ROW_CCHUNKS: usize = HEAD_256 / 16;
+    const TILE_CCHUNKS: usize = KEY_TILE * ROW_CCHUNKS / THREADS_256;
+    const _: () = assert!(TILE_CCHUNKS * THREADS_256 == KEY_TILE * ROW_CCHUNKS);
+    const WID_ROWS: usize = KEY_TILE / WARPS_256;
+    const _: () = assert!(WID_ROWS * WARPS_256 == KEY_TILE);
 
     let b = thread::blockIdx_x() as usize;
     let nkv = n_kv as usize;
@@ -614,6 +727,13 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize>(
         DynamicSharedArray::<u32, 16>::get(),
         DynamicSharedArray::<u32, 16>::offset(TILE_WORDS_256 * 4),
         DynamicSharedArray::<f32, 16>::offset(2 * TILE_WORDS_256 * 4),
+    );
+    // A q8 cache's two scales tiles, past the exchange: 16-byte aligned (their
+    // offset DYN_BYTES_256 is), so the 16-byte scale copies land aligned.
+    let sk =
+        DynamicSharedArray::<u16, 16>::offset(2 * TILE_WORDS_256 * 4 + WARPS_256 * EXCH_WARP * 4);
+    let sv = DynamicSharedArray::<u16, 16>::offset(
+        2 * TILE_WORDS_256 * 4 + WARPS_256 * EXCH_WARP * 4 + Q8_SCALE_TILE_256 * 2,
     );
 
     // Every row's count as the walk uses it (the 128 body's rule). Slice `s`
@@ -732,14 +852,22 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize>(
     // Every warp has its fragments before the first key tile lands.
     thread::sync_threads();
 
-    // Thread `tid`'s copies of a tile: pass `i` is key `tid /
-    // ROW_CHUNKS_256 + PASS_KEYS_256·i`, 16-byte column `tid %
+    let [k_rows, k_scales, v_rows, v_scales] = src.words();
+    // The f16 copies: thread `tid`'s copies of a tile are pass `i`'s key
+    // `tid / ROW_CHUNKS_256 + PASS_KEYS_256·i`, 16-byte column `tid %
     // ROW_CHUNKS_256`.
     let src_word = kh * ctx as usize * ROW_WORDS_256 + 4 * tid;
-    let k_src = kc.as_ptr().cast::<u32>().wrapping_add(src_word);
-    let v_src = vc.as_ptr().cast::<u32>().wrapping_add(src_word);
+    let k_src = k_rows.wrapping_add(src_word);
+    let v_src = v_rows.wrapping_add(src_word);
     let dst_col = 4 * (tid % ROW_CHUNKS_256);
     let key_of_pass0 = (tid / ROW_CHUNKS_256) as u32;
+    // The q8 copies: the planes' first rows of this key head, codes and
+    // scales a side (the scales' u32 half-words: a row's HEAD_256/32 u16).
+    let rowq = kh * ctx as usize;
+    let kq_src = k_rows.wrapping_add(rowq * (HEAD_256 / 4));
+    let kd_src = k_scales.wrapping_add(rowq * (HEAD_256 / 32) / 2);
+    let vq_src = v_rows.wrapping_add(rowq * (HEAD_256 / 4));
+    let vd_src = v_scales.wrapping_add(rowq * (HEAD_256 / 32) / 2);
     let tiles = hi.div_ceil(KEY_TILE_U32);
     // Stage tile `kb` of the plane `src` into `dst` (the 128 body's
     // `stage!` at this row width).
@@ -776,11 +904,113 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize>(
             unsafe { cp_async_commit_group() };
         }};
     }
+    // Stage tile `kb` of one side's q8 planes (the module doc's `_q8`
+    // paragraph): the code words as 16-byte `cp.async` copies into the low
+    // half of the f16 tile's rows (four chunks a thread), the scales as one
+    // 16-byte copy a row, a key at or past `hi` zeroed and never read,
+    // committed as one group. `full` (a literal) is the tile lying below
+    // `hi`.
+    macro_rules! stage_q8 {
+        ($tile:expr, $sk:expr, $qs:expr, $ds:expr, $kb:expr, $full:literal) => {{
+            let (tile, sk, qs, ds, kb): (*mut u32, *mut u16, *const u32, *const u32, u32) =
+                ($tile, $sk, $qs, $ds, $kb);
+            let sk32 = sk.cast::<u32>();
+            for i in 0..TILE_CCHUNKS {
+                cuda_device::thread::__unroll_config::<0>();
+                let e = tid + THREADS_256 * i;
+                let row = e / ROW_CCHUNKS;
+                let col = e - row * ROW_CCHUNKS;
+                // SAFETY: row < KEY_TILE and words 4·col .. + 4 are one whole
+                // chunk of the row's low half: the 16 destination bytes are
+                // inside the tile and 16-byte aligned.
+                let d = unsafe { tile.add(row * ROW_WORDS_256 + 4 * col) };
+                if $full || kb * KEY_TILE_U32 + (row as u32) < hi {
+                    // SAFETY: the key is below hi <= ctx, so its row is inside
+                    // this key head's codes plane (launch contract); rows are
+                    // HEAD_256/4 words and the plane starts 16-byte aligned
+                    // (host-checked), so the source is 16-byte aligned.
+                    unsafe {
+                        cp_async_cg_16(
+                            d,
+                            qs.wrapping_add(
+                                (kb as usize * KEY_TILE + row) * (HEAD_256 / 4) + 4 * col,
+                            ),
+                        )
+                    };
+                } else {
+                    // SAFETY: `d` is 16 bytes inside the tile, 16-byte
+                    // aligned, this thread's chunk alone, and no warp reads
+                    // the tile before the barrier after this stage's wait (the
+                    // widening writes the dead row's zeros over it).
+                    unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
+                }
+            }
+            if tid < KEY_TILE {
+                // SAFETY: the row's HEAD_256/32 u16 are one aligned 16-byte
+                // chunk of the scales tile, this thread's row alone.
+                let d = unsafe { sk32.add(4 * tid) };
+                if $full || kb * KEY_TILE_U32 + (tid as u32) < hi {
+                    // SAFETY: the key is below hi <= ctx: its scales are
+                    // inside the plane (launch contract), one 16-byte aligned
+                    // chunk of HEAD_256/32 u16.
+                    unsafe {
+                        cp_async_cg_16(d, ds.wrapping_add((kb as usize * KEY_TILE + tid) * 4))
+                    };
+                } else {
+                    // SAFETY: this thread's chunk alone, read by no one (the
+                    // dead row widens to zeros).
+                    unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
+                }
+            }
+            // SAFETY: closes this thread's copies above as one group.
+            unsafe { cp_async_commit_group() };
+        }};
+    }
+    // Stage tile `kb` of the key (`K`) or value (`V`) side in the cache's
+    // format.
+    macro_rules! stage_side {
+        (K, $kb:expr, $full:literal) => {
+            if S::Q8 {
+                stage_q8!(kt, sk, kq_src, kd_src, $kb, $full);
+            } else {
+                stage!(kt, k_src, $kb, $full);
+            }
+        };
+        (V, $kb:expr, $full:literal) => {
+            if S::Q8 {
+                stage_q8!(vt, sv, vq_src, vd_src, $kb, $full);
+            } else {
+                stage!(vt, v_src, $kb, $full);
+            }
+        };
+    }
+    // A q8 tile's in-place widening, `$tile` with its scales `$scales`:
+    // warp `wid` widens its own rows (`dequant_row` reads before its warp
+    // sync and writes after), a key at or past `hi` four zero words, then a
+    // barrier publishes the tile.
+    macro_rules! widen {
+        ($tile:expr, $scales:expr, $kb:expr) => {{
+            let rows0 = wid * WID_ROWS;
+            for r in 0..WID_ROWS {
+                let row = rows0 + r;
+                let base = row * ROW_WORDS_256;
+                if $kb * KEY_TILE_U32 + (row as u32) < hi {
+                    // SAFETY: the row is this warp's alone, its raw words and
+                    // scales published by the barrier before this expansion.
+                    dequant_row!(2, $tile, base, $scales.wrapping_add(row * 8), row & 7, lane);
+                } else {
+                    // SAFETY: the row is this warp's alone in the tile.
+                    zero_row!(2, $tile, base, row & 7, lane);
+                }
+            }
+            thread::sync_threads();
+        }};
+    }
     if tiles > 0 {
         if KEY_TILE_U32 <= hi {
-            stage!(kt, k_src, 0, true);
+            stage_side!(K, 0, true);
         } else {
-            stage!(kt, k_src, 0, false);
+            stage_side!(K, 0, false);
         }
     }
 
@@ -828,10 +1058,15 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize>(
         // then publishes every thread's copies.
         unsafe { cp_async_wait_group(0) };
         thread::sync_threads();
+        // A q8 key tile landed as raw codes and scales: widened in place
+        // before the scores read it.
+        if S::Q8 {
+            widen!(kt, sk, kb);
+        }
         if end <= hi {
-            stage!(vt, v_src, kb, true);
+            stage_side!(V, kb, true);
         } else {
-            stage!(vt, v_src, kb, false);
+            stage_side!(V, kb, false);
         }
         // Both warps of a pair hold the same rows, so the same `live`.
         let live = KEY_TILE_U32 * kb < warp_hi;
@@ -976,704 +1211,15 @@ unsafe fn prefill_256_p<const PACK: usize, const SLICE_POS: usize>(
         // thread's copies before the value product reads VT.
         unsafe { cp_async_wait_group(0) };
         thread::sync_threads();
+        // A q8 value tile likewise, before the value product reads it.
+        if S::Q8 {
+            widen!(vt, sv, kb);
+        }
         if kb + 1 < tiles {
             if end + KEY_TILE_U32 <= hi {
-                stage!(kt, k_src, kb + 1, true);
+                stage_side!(K, kb + 1, true);
             } else {
-                stage!(kt, k_src, kb + 1, false);
-            }
-        }
-
-        // ---- O += P̂·V over the warp's half.
-        if live {
-            for kk2 in 0..PV_STEPS {
-                cuda_device::thread::__unroll_config::<0>();
-                for nd in 0..DIM_PAIRS_256 {
-                    cuda_device::thread::__unroll_config::<0>();
-                    // Value row 16·kk2 + v_row, chunk 2·nd + lane/16 of
-                    // the warp's half.
-                    let at = v_at[nd % LINE_PAIRS]
-                        + (4 * (16 * kk2 * ROW_WORDS_256 + LINE * (nd / LINE_PAIRS))) as u32;
-                    // SAFETY: the row is below KEY_TILE and the chunk is
-                    // whole inside VT, published by the barrier above;
-                    // every lane issues the load, then both `mma.sync`
-                    // with its own fragments.
-                    unsafe {
-                        let bf = wmma::ldmatrix_x4_trans_shared_u32(at);
-                        o[2 * nd] = wmma::mma_m16n8k16_f32_f16(o[2 * nd], pa[kk2], [bf[0], bf[1]]);
-                        o[2 * nd + 1] =
-                            wmma::mma_m16n8k16_f32_f16(o[2 * nd + 1], pa[kk2], [bf[2], bf[3]]);
-                    }
-                }
-            }
-        }
-        kb += 1;
-    }
-
-    // ---- the row sums over the four lanes of a row, then o · (1/l).
-    let mut inv = [0.0f32; 2];
-    for h in 0usize..2 {
-        cuda_device::thread::__unroll_config::<0>();
-        let a = add_rn_f32(l[h], warp::shuffle_xor_f32(l[h], 1));
-        let s = add_rn_f32(a, warp::shuffle_xor_f32(a, 2));
-        inv[h] = 1.0 / s;
-    }
-    for nd in 0..2 * DIM_PAIRS_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        for j in 0usize..4 {
-            cuda_device::thread::__unroll_config::<0>();
-            let h = j / 2;
-            let t = t0 + pps * rs + row_pos::<PACK>(g, h);
-            if t < rows {
-                let d = HALF_256 * dh + 8 * nd + 2 * t4 + j % 2;
-                let v = if bad[h] {
-                    f32::NAN
-                } else {
-                    mul_rn_f32(o[nd][j], inv[h])
-                };
-                // SAFETY: t < t_rows, head0 + row_head(g) < head0 + PACK <=
-                // n_head and d < HEAD_256: below t_rows·n_head·256 <= y.len()
-                // (launch contract); one owner lane per value.
-                unsafe {
-                    *y.get_unchecked_mut(
-                        (t * n_head + head0 + row_head::<PACK>(g)) * HEAD_256 + d,
-                    ) = v;
-                }
-            }
-        }
-    }
-}
-
-// --------------------------------------------- the q8_0 read-path bodies
-//
-// The `_q8` entries' staging (the module doc's `_q8` paragraph): the raw
-// code words of a tile's rows land by `cp.async` in the low half of the
-// rows' own spans of the f16 tile and the rows' scales in a small scales
-// tile, and the in-place widening below writes the dequantized f16 pairs to
-// the permuted layout the `ldmatrix` addresses walk.
-
-/// Word `w`'s offset within its row of a staged tile — the in-row half of
-/// [`staged_word`]/[`staged_word_256`]: the 16-byte chunk `w/4` stored at
-/// chunk `(w/4) ^ xor`, `xor` the row's `row & 7`.
-#[inline(always)]
-const fn staged_off(xor: usize, w: usize) -> usize {
-    (((w >> 2) ^ xor) << 2) | (w & 3)
-}
-
-/// One staged row's in-place widening, as a macro: a shared tile pointer
-/// cannot cross a device helper fn's boundary (the upstream ledger's #38),
-/// so the body expands at each call site — the file's own `stage!` shape.
-/// Lane `$lane` reads the row's raw code words `$lane + 32·i` (`i < NW` — the
-/// row's `NW·32` words, its low half, landed by the copies) and its scale
-/// `lane/8 + 4·i`, the warp syncs — a row's staged writes may land on its
-/// own raw words — and each word's four widened values ([`q8_word_values`])
-/// go as two staged words to the permuted layout: `$tile` the staged tile,
-/// `$base` the row's first word, `$scales` the row's `4·NW` u16 scales,
-/// `$xor` the row's `row & 7`, `$lane` the calling lane. All 32 lanes of a
-/// warp, together, on one row that is that warp's alone.
-///
-/// SAFETY: the row's span of `$tile` is this warp's alone, `NW·32` is at
-/// most half the tile's row stride, `$scales .. +4·NW` lies inside the
-/// scales tile, `$xor < 8`, and the raw words were published by the barrier
-/// before this expansion.
-macro_rules! dequant_row {
-    ($nw:literal, $tile:expr, $base:expr, $scales:expr, $xor:expr, $lane:expr) => {{
-        let mut cw = [0u32; $nw];
-        for i in 0..$nw {
-            cuda_device::thread::__unroll_config::<0>();
-            // SAFETY: lane + 32·i < NW·32 <= half the row's words, this
-            // warp's own row of the tile.
-            unsafe { cw[i] = *$tile.add($base + $lane + 32 * i) };
-        }
-        warp::sync_mask(u32::MAX);
-        for i in 0..$nw {
-            cuda_device::thread::__unroll_config::<0>();
-            // SAFETY: lane/8 + 4·i < 4·NW: inside the row's scales.
-            let d = half_bits_to_f32(unsafe { *$scales.add($lane / 8 + 4 * i) });
-            let v = q8_word_values(cw[i], d);
-            let c = $lane + 32 * i;
-            // SAFETY: staged words 2·c and 2·c + 1 of the row, inside its
-            // span.
-            unsafe {
-                *$tile.add($base + staged_off($xor, 2 * c)) = f32x2_to_f16x2_bits(v[0], v[1]);
-                *$tile.add($base + staged_off($xor, 2 * c + 1)) = f32x2_to_f16x2_bits(v[2], v[3]);
-            }
-        }
-    }};
-}
-
-/// A staged row's zero words, the dead key's form, as a macro (the same
-/// boundary as `dequant_row!`'s): lane `$lane` writes the row's staged
-/// words `$lane + 32·j` (`j < 2·NW`) as zero — the f16 walk's own zeros for
-/// a key at or past the block's largest count, so a padded row's NaN scale
-/// reaches no result.
-///
-/// SAFETY: the row's span of `$tile` is this warp's alone, `2·NW·32` the
-/// row's staged word count, `$xor < 8`.
-macro_rules! zero_row {
-    ($nw:literal, $tile:expr, $base:expr, $xor:expr, $lane:expr) => {{
-        for j in 0..2 * $nw {
-            cuda_device::thread::__unroll_config::<0>();
-            // SAFETY: lane + 32·j < 64·NW: inside the row's span, this
-            // warp's own row.
-            unsafe { *$tile.add($base + staged_off($xor, $lane + 32 * j)) = 0 };
-        }
-    }};
-}
-
-/// One 256-value-head scales tile of the q8 staging: `KEY_TILE` rows of
-/// `HEAD_256/32` u16.
-const Q8_SCALE_TILE_256: usize = KEY_TILE * (HEAD_256 / 32);
-/// The q8 bytes of dynamic shared memory a 256-value-head block adds to the
-/// twins' window: its two scales tiles.
-const Q8_SCALES_256: usize = 2 * Q8_SCALE_TILE_256;
-/// The `_q8` 256 bodies' dynamic shared window: the twins' [`DYN_BYTES_256`]
-/// plus the two scales tiles — 100,352 bytes, inside the card's opt-in
-/// window (101,376).
-const DYN_BYTES_256_Q8: usize = DYN_BYTES_256 + Q8_SCALES_256 * 2;
-const DYN_BYTES_256_Q8_U32: u32 = DYN_BYTES_256_Q8 as u32;
-const _: () = assert!(DYN_BYTES_256_Q8_U32 as usize == DYN_BYTES_256_Q8);
-const _: () = assert!(DYN_BYTES_256_Q8 == 100_352);
-
-/// [`prefill_256_p`] over the Q8_0 cache (the module doc's `_q8`
-/// paragraph): the counts, the query staging, the scores, the softmax and
-/// the value products are that body's verbatim, and each tile's staging is
-/// the two-step form — the raw code words and scales landing by `cp.async`
-/// (the code chunks into the low half of the f16 tile's own rows, the
-/// scales into their tile), then the in-place widening (`dequant_row`,
-/// `zero_row`), a key past the block's largest count four zero words. The
-/// raw copies keep the twin's overlap; the two dequant barriers a tile add
-/// are the walk's own.
-///
-/// SAFETY: the entry's launch contract at `n_kv · packs · PACK` query heads
-/// over the four Q8_0 planes (every buffer bound it names), a block of
-/// [`THREADS_256`] threads and [`DYN_BYTES_256_Q8`] bytes of dynamic shared
-/// memory whose window starts at the block's shared base (no static shared
-/// memory in the entry).
-#[inline(always)]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
-)]
-#[allow(
-    clippy::needless_range_loop,
-    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
-)]
-unsafe fn prefill_256_p_q8<const PACK: usize, const SLICE_POS: usize>(
-    q: &[f32],
-    kq: &[u32],
-    kd: &[u16],
-    vq: &[u32],
-    vd: &[u16],
-    n_keys_buf: &[u32],
-    scale: f32,
-    n_kv: u32,
-    ctx: u32,
-    t_rows: u32,
-    packs: usize,
-    fault: FaultSink,
-    mut y: DisjointSlice<f32>,
-) {
-    const { assert!(pack_rows_hold::<PACK>() && SLICE_POS * PACK == SLICE_ROWS) };
-    const { assert!(SLICES_256 * SLICE_POS == Q_ROWS_256 / PACK) };
-    // Positions a block covers, and a row slice's.
-    let positions = Q_ROWS_256 / PACK;
-    let pps = SLICE_POS;
-    // The query staging's passes over one position's pack of heads.
-    let qpp = PACK / Q_ROW_STEP_256;
-    // Code 16-byte chunks a staged row of HEAD_256 values takes, and a
-    // thread's chunk and row counts of a tile's copies.
-    const ROW_CCHUNKS: usize = HEAD_256 / 16;
-    const TILE_CCHUNKS: usize = KEY_TILE * ROW_CCHUNKS / THREADS_256;
-    const _: () = assert!(TILE_CCHUNKS * THREADS_256 == KEY_TILE * ROW_CCHUNKS);
-
-    let b = thread::blockIdx_x() as usize;
-    let nkv = n_kv as usize;
-    let rows = t_rows as usize;
-    let n_tiles = rows.div_ceil(positions);
-    let units = nkv * packs;
-    if b >= n_tiles * units {
-        return; // block-uniform
-    }
-    let qt = n_tiles - 1 - b / units;
-    let r = b % units;
-    let kh = r / packs;
-    let head0 = r * PACK;
-    let tid = thread::threadIdx_x() as usize;
-    let lane = warp::lane_id() as usize;
-    let wid = tid / 32;
-    // The warp's row slice (its positions) and dim half.
-    let rs = wid % SLICES_256;
-    let dh = wid / SLICES_256;
-    let g = lane / 4;
-    let t4 = lane % 4;
-    let n_head = units * PACK;
-    let t0 = qt * positions;
-
-    // The block's dynamic shared memory, DYN_BYTES_256_Q8 bytes (the launch
-    // contract): the twins' key tile, value tile and exchange at byte
-    // offsets 0, TILE_WORDS_256·4 and 2·TILE_WORDS_256·4, and the two
-    // scales tiles at 2·TILE_WORDS_256·4 + WARPS_256·EXCH_WARP·4, every
-    // write ordered before its reads by a block barrier (the cp.async
-    // copies by the wait before it). The bases are declared 16-byte aligned
-    // — what the 16-byte copies and `ldmatrix` rows need.
-    let (kt, vt, ex) = (
-        DynamicSharedArray::<u32, 16>::get(),
-        DynamicSharedArray::<u32, 16>::offset(TILE_WORDS_256 * 4),
-        DynamicSharedArray::<f32, 16>::offset(2 * TILE_WORDS_256 * 4),
-    );
-    // SAFETY: the scales tiles are 16-byte aligned (their offset
-    // DYN_BYTES_256 is), so the 16-byte scale copies land aligned.
-    let sk =
-        DynamicSharedArray::<u16, 16>::offset(2 * TILE_WORDS_256 * 4 + WARPS_256 * EXCH_WARP * 4);
-    let sv = DynamicSharedArray::<u16, 16>::offset(
-        2 * TILE_WORDS_256 * 4 + WARPS_256 * EXCH_WARP * 4 + Q8_SCALE_TILE_256 * 2,
-    );
-
-    // Every row's count as the walk uses it (the 128 body's rule). Slice `s`
-    // is positions `s·SLICE_POS ..`; both loop bounds are constants, so every
-    // copy's `s` and `i` are literals and no count is kept in an array indexed
-    // at run time. The warp keeps its own slice's largest and smallest count
-    // (the walk's warp-uniform bounds) and refusal, and its two rows' own
-    // (`row_pos`).
-    let mut hi = 0u32;
-    let mut warp_hi = 0u32;
-    let mut warp_lo = u32::MAX;
-    let mut any_bad = false;
-    let mut cnt = [0u32; 2];
-    let mut bad = [false; 2];
-    for s in 0..SLICES_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        for i in 0..SLICE_POS {
-            cuda_device::thread::__unroll_config::<0>();
-            let t = t0 + s * SLICE_POS + i;
-            let (c, refused) = if t < rows {
-                // SAFETY: t < t_rows <= n_keys_buf.len() (launch contract).
-                let c = unsafe { *n_keys_buf.get_unchecked(t) };
-                if c == 0 || c > ctx {
-                    (0, true)
-                } else {
-                    (c, false)
-                }
-            } else {
-                (0, false)
-            };
-            hi = hi.max(c);
-            if s == rs {
-                warp_hi = warp_hi.max(c);
-                warp_lo = warp_lo.min(c);
-                any_bad = any_bad || refused;
-                if i == row_pos::<PACK>(g, 0) {
-                    cnt[0] = c;
-                    bad[0] = refused;
-                }
-                if i == row_pos::<PACK>(g, 1) {
-                    cnt[1] = c;
-                    bad[1] = refused;
-                }
-            }
-        }
-    }
-    if lane == 0 && dh == 0 && any_bad {
-        fault.raise(FaultSite::KeyCount);
-    }
-
-    // The block's query rows, rounded to f16 pairs, into the key tile:
-    // staged row `lp·PACK + j` is position `t0 + lp`'s head `head0 + j`, so
-    // row slice `r` is rows `16·r ..`. A row past `t_rows` is zero. Thread
-    // `tid` stages word `tid % Q_PAIRS_256` of every row its passes cover —
-    // pass `e` is staged row `Q_ROW_STEP_256·e + r0` — every load issued
-    // before the first conversion.
-    let wd = tid % Q_PAIRS_256;
-    let r0 = tid / Q_PAIRS_256;
-    let q_first = (t0 * n_head + head0 + r0) * Q_PAIRS_256 + wd;
-    let q_pos = n_head * Q_PAIRS_256;
-    let q64 = q.as_ptr().cast::<u64>();
-    let mut raw = [0u64; Q_WORDS_256];
-    for e in 0..Q_WORDS_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        let t = t0 + e / qpp;
-        if t < rows {
-            let at = q_first + (e / qpp) * q_pos + Q_ROW_STEP_256 * (e % qpp) * Q_PAIRS_256;
-            // SAFETY: t < t_rows and the head head0 + Q_ROW_STEP_256·(e % qpp)
-            // + r0 < head0 + PACK <= n_head, so the row lies inside q (launch
-            // contract); a row is 256 f32 = 128 u64 and q starts 8-byte
-            // aligned (host-checked), so the u64 read is aligned.
-            raw[e] = unsafe { *q64.add(at) };
-        }
-    }
-    // The staged word of each pass of the first eight rows; a later pass's is
-    // it plus whole groups of eight rows (staged_offsets_hold_256).
-    let mut q_at = [0usize; Q_OCT_PASSES_256];
-    for j in 0..Q_OCT_PASSES_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        q_at[j] = staged_word_256(Q_ROW_STEP_256 * j + r0, wd);
-    }
-    for e in 0..Q_WORDS_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        let pair = f32x2_to_f16x2_bits(
-            f32::from_bits(raw[e] as u32),
-            f32::from_bits((raw[e] >> 32) as u32),
-        );
-        // SAFETY: row Q_ROW_STEP_256·e + r0 < Q_ROWS_256 <= KEY_TILE and
-        // wd < ROW_WORDS_256: inside KT; one owner per word.
-        unsafe {
-            *kt.add(q_at[e % Q_OCT_PASSES_256] + (e / Q_OCT_PASSES_256) * 8 * ROW_WORDS_256) = pair
-        };
-    }
-    thread::sync_threads();
-
-    // This warp's sixteen query rows over its half, one A fragment per
-    // k16 step.
-    let mut qa = [[0u32; 4]; QK_STEPS_256];
-    for kk in 0..QK_STEPS_256 {
-        cuda_device::thread::__unroll_config::<0>();
-        let row = rs * 16 + lane % 16;
-        // SAFETY: row < Q_ROWS_256 and words HALF_256/2·dh + 8·kk +
-        // 4·(lane/16) .. + 4 <= ROW_WORDS_256 are one whole chunk, which
-        // staged_word_256 keeps whole and 16-byte aligned inside KT,
-        // published by the barrier above; every lane issues the load.
-        qa[kk] = unsafe {
-            let p = kt.add(staged_word_256(
-                row,
-                (HALF_256 / 2) * dh + 8 * kk + 4 * (lane / 16),
-            ));
-            wmma::ldmatrix_x4_shared_u32(shared::cvta_generic_to_shared_u32(
-                p.cast_const().cast::<u8>(),
-            ))
-        };
-    }
-    // Every warp has its fragments before the first key tile lands.
-    thread::sync_threads();
-
-    // The q8 planes' first rows of this key head, codes and scales a side.
-    let rowq = kh * ctx as usize;
-    let kq_src = kq
-        .as_ptr()
-        .wrapping_add(rowq * (HEAD_256 / 4))
-        .cast::<u32>();
-    let kd_src = kd
-        .as_ptr()
-        .cast::<u32>()
-        .wrapping_add(rowq * (HEAD_256 / 32) / 2);
-    let vq_src = vq
-        .as_ptr()
-        .wrapping_add(rowq * (HEAD_256 / 4))
-        .cast::<u32>();
-    let vd_src = vd
-        .as_ptr()
-        .cast::<u32>()
-        .wrapping_add(rowq * (HEAD_256 / 32) / 2);
-    let tiles = hi.div_ceil(KEY_TILE_U32);
-    // Stage tile `kb` of one side's q8 planes (the module doc's `_q8`
-    // paragraph): the code words as 16-byte `cp.async` copies into the low
-    // half of the f16 tile's rows (four chunks a thread), the scales as one
-    // 16-byte copy a row, a key at or past `hi` zeroed and never read,
-    // committed as one group. `full` (a literal) is the tile lying below
-    // `hi`.
-    macro_rules! stage_q8 {
-        ($tile:expr, $sk:expr, $qs:expr, $ds:expr, $kb:expr, $full:literal) => {{
-            let (tile, sk, qs, ds, kb): (*mut u32, *mut u16, *const u32, *const u32, u32) =
-                ($tile, $sk, $qs, $ds, $kb);
-            let tile32 = tile.cast::<u32>();
-            let sk32 = sk.cast::<u32>();
-            for i in 0..TILE_CCHUNKS {
-                cuda_device::thread::__unroll_config::<0>();
-                let e = tid + THREADS_256 * i;
-                let row = e / ROW_CCHUNKS;
-                let col = e - row * ROW_CCHUNKS;
-                // SAFETY: row < KEY_TILE and words 4·col .. + 4 are one whole
-                // chunk of the row's low half: the 16 destination bytes are
-                // inside the tile and 16-byte aligned.
-                let d = unsafe { tile32.add(row * ROW_WORDS_256 + 4 * col) };
-                if $full || kb * KEY_TILE_U32 + (row as u32) < hi {
-                    // SAFETY: the key is below hi <= ctx, so its row is inside
-                    // this key head's codes plane (launch contract); rows are
-                    // HEAD_256/4 words and the plane starts 16-byte aligned
-                    // (host-checked), so the source is 16-byte aligned.
-                    unsafe {
-                        cp_async_cg_16(
-                            d,
-                            qs.wrapping_add(
-                                (kb as usize * KEY_TILE + row) * (HEAD_256 / 4) + 4 * col,
-                            ),
-                        )
-                    };
-                } else {
-                    // SAFETY: `d` is 16 bytes inside the tile, 16-byte
-                    // aligned, this thread's chunk alone, and no warp reads
-                    // the tile before the barrier after this stage's wait (the
-                    // widening writes the dead row's zeros over it).
-                    unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
-                }
-            }
-            if tid < KEY_TILE {
-                // SAFETY: the row's HEAD_256/32 u16 are one aligned 16-byte
-                // chunk of the scales tile, this thread's row alone.
-                let d = unsafe { sk32.add(4 * tid) };
-                if $full || kb * KEY_TILE_U32 + (tid as u32) < hi {
-                    // SAFETY: the key is below hi <= ctx: its scales are
-                    // inside the plane (launch contract), one 16-byte aligned
-                    // chunk of HEAD_256/32 u16.
-                    unsafe {
-                        cp_async_cg_16(d, ds.wrapping_add((kb as usize * KEY_TILE + tid) * 4))
-                    };
-                } else {
-                    // SAFETY: this thread's chunk alone, read by no one (the
-                    // dead row widens to zeros).
-                    unsafe { *d.cast::<U32x4>() = U32x4::splat(0) };
-                }
-            }
-            // SAFETY: closes this thread's copies above as one group.
-            unsafe { cp_async_commit_group() };
-        }};
-    }
-    if tiles > 0 {
-        if KEY_TILE_U32 <= hi {
-            stage_q8!(kt, sk, kq_src, kd_src, 0, true);
-        } else {
-            stage_q8!(kt, sk, kq_src, kd_src, 0, false);
-        }
-    }
-
-    // This lane's `ldmatrix` addresses in the first sixteen rows and the
-    // first line of the warp's half, one per chunk pair `j` (the 128
-    // body's): the half starts HALF_256/2 words, whole lines, into a row,
-    // so every other address of the walk is one of these plus a constant.
-    let k_row = lane % 8 + 8 * (lane / 16);
-    let v_row = lane % 8 + 8 * ((lane / 8) % 2);
-    let half_bytes = (4 * (HALF_256 / 2) * dh) as u32;
-    let mut k_at = [0u32; LINE_PAIRS];
-    let mut v_at = [0u32; LINE_PAIRS];
-    for j in 0..LINE_PAIRS {
-        cuda_device::thread::__unroll_config::<0>();
-        // SAFETY: k_row, v_row < 16 <= KEY_TILE and words 8·j + 4 .. + 4
-        // <= LINE: inside the tiles; only the addresses are formed here
-        // (the half's HALF_256/2 more words stay inside the row).
-        unsafe {
-            k_at[j] = shared::cvta_generic_to_shared_u32(
-                kt.add(staged_word_256(k_row, 8 * j + 4 * ((lane / 8) % 2)))
-                    .cast_const()
-                    .cast::<u8>(),
-            ) + half_bytes;
-            v_at[j] = shared::cvta_generic_to_shared_u32(
-                vt.add(staged_word_256(v_row, 8 * j + 4 * (lane / 16)))
-                    .cast_const()
-                    .cast::<u8>(),
-            ) + half_bytes;
-        }
-    }
-    // This lane's slots of its own and its partner's published scores.
-    let ex_own = ex.wrapping_add(wid * EXCH_WARP + lane);
-    let ex_mate = ex.wrapping_add((wid ^ SLICES_256) * EXCH_WARP + lane);
-    // The rows of the key tile this warp widens: KEY_TILE/WARPS_256 a warp.
-    const WID_ROWS: usize = KEY_TILE / WARPS_256;
-    const _: () = assert!(WID_ROWS * WARPS_256 == KEY_TILE);
-
-    let t4k = 2 * t4 as u32;
-    let mut m = [f32::NEG_INFINITY; 2];
-    let mut l = [0.0f32; 2];
-    let mut o = [[0.0f32; 4]; 2 * DIM_PAIRS_256];
-    let mut kb = 0u32;
-    while kb < tiles {
-        let end = KEY_TILE_U32 * (kb + 1);
-        // The raw codes and scales of key tile kb have landed, and every
-        // warp is done reading the value tile of kb − 1 and the exchange of
-        // kb − 1.
-        // SAFETY: waits for this thread's outstanding groups; the barrier
-        // then publishes every thread's copies.
-        unsafe { cp_async_wait_group(0) };
-        thread::sync_threads();
-
-        // The key tile's in-place widening: warp `wid` widens its own rows
-        // (`dequant_row` reads before its warp sync and writes after), a key
-        // at or past `hi` four zero words.
-        let rows0 = wid * WID_ROWS;
-        for r in 0..WID_ROWS {
-            let row = rows0 + r;
-            let base = row * ROW_WORDS_256;
-            if kb * KEY_TILE_U32 + (row as u32) < hi {
-                // SAFETY: the row is this warp's alone, its raw words
-                // published by the barrier above, its scales by the same
-                // (both landed by the copies this thread waited on).
-                dequant_row!(2, kt, base, sk.wrapping_add(row * 8), row & 7, lane);
-            } else {
-                // SAFETY: the row is this warp's alone in the tile.
-                zero_row!(2, kt, base, row & 7, lane);
-            }
-        }
-        thread::sync_threads();
-
-        // The raw codes and scales of value tile kb, issued to overlap the
-        // scores.
-        if end <= hi {
-            stage_q8!(vt, sv, vq_src, vd_src, kb, true);
-        } else {
-            stage_q8!(vt, sv, vq_src, vd_src, kb, false);
-        }
-        // Both warps of a pair hold the same rows, so the same `live`.
-        let live = KEY_TILE_U32 * kb < warp_hi;
-
-        // ---- S_w = Q·Kᵀ over the warp's half, published.
-        let mut sc = [[0.0f32; 4]; KEY_NT];
-        if live {
-            for kk in 0..QK_STEPS_256 {
-                cuda_device::thread::__unroll_config::<0>();
-                for nj in 0..KEY_NT / 2 {
-                    cuda_device::thread::__unroll_config::<0>();
-                    // Key row 16·nj + k_row, chunk 2·kk + (lane/8) % 2 of
-                    // the warp's half.
-                    let at = k_at[kk % LINE_PAIRS]
-                        + (4 * (16 * nj * ROW_WORDS_256 + LINE * (kk / LINE_PAIRS))) as u32;
-                    // SAFETY: the row is below KEY_TILE and the chunk is
-                    // whole inside KT (staged_word_256,
-                    // staged_offsets_hold_256), published by the barrier
-                    // above; every lane issues the load, then both
-                    // `mma.sync` with its own fragments.
-                    unsafe {
-                        let bf = wmma::ldmatrix_x4_shared_u32(at);
-                        sc[2 * nj] = wmma::mma_m16n8k16_f32_f16(sc[2 * nj], qa[kk], [bf[0], bf[1]]);
-                        sc[2 * nj + 1] =
-                            wmma::mma_m16n8k16_f32_f16(sc[2 * nj + 1], qa[kk], [bf[2], bf[3]]);
-                    }
-                }
-            }
-            for nt in 0..KEY_NT {
-                cuda_device::thread::__unroll_config::<0>();
-                for j in 0usize..4 {
-                    cuda_device::thread::__unroll_config::<0>();
-                    // SAFETY: (4·nt + j)·32 + lane < EXCH_WARP: this
-                    // lane's own slot of this warp's exchange.
-                    unsafe { *ex_own.add((4 * nt + j) * 32) = sc[nt][j] };
-                }
-            }
-        }
-        // Both halves are published.
-        thread::sync_threads();
-
-        let mut pa = [[0u32; 4]; PV_STEPS];
-        let mut f = [1.0f32; 2];
-        if live {
-            // S = S_w + S_mate = S_lo + S_hi: a rounded add is
-            // commutative, so both warps of the pair hold the same bits.
-            for nt in 0..KEY_NT {
-                cuda_device::thread::__unroll_config::<0>();
-                for j in 0usize..4 {
-                    cuda_device::thread::__unroll_config::<0>();
-                    // SAFETY: the partner's slot for the same fragment
-                    // value, written before the barrier above.
-                    let mate = unsafe { *ex_mate.add((4 * nt + j) * 32) };
-                    sc[nt][j] = add_rn_f32(sc[nt][j], mate);
-                }
-            }
-
-            // The softmax over the tile's scores, the 128 body's.
-            macro_rules! softmax {
-                ($masked:literal) => {{
-                    let kb0 = KEY_TILE_U32 * kb + t4k;
-                    let mut tmax = [f32::NEG_INFINITY; 2];
-                    for nt in 0..KEY_NT {
-                        cuda_device::thread::__unroll_config::<0>();
-                        for j in 0usize..4 {
-                            cuda_device::thread::__unroll_config::<0>();
-                            let key = kb0 + (8 * nt + j % 2) as u32;
-                            let v = if !$masked || key < cnt[j / 2] {
-                                mul_rn_f32(sc[nt][j], scale)
-                            } else {
-                                f32::NEG_INFINITY
-                            };
-                            sc[nt][j] = v;
-                            tmax[j / 2] = fmax(tmax[j / 2], v);
-                        }
-                    }
-                    let mut mn = [f32::NEG_INFINITY; 2];
-                    for h in 0usize..2 {
-                        cuda_device::thread::__unroll_config::<0>();
-                        let mut x = tmax[h];
-                        x = fmax(x, warp::shuffle_xor_f32(x, 1));
-                        x = fmax(x, warp::shuffle_xor_f32(x, 2));
-                        let m_new = fmax(m[h], x);
-                        if m_new > m[h] {
-                            f[h] = if m[h] > f32::NEG_INFINITY {
-                                dev_exp(m[h] - m_new)
-                            } else {
-                                0.0
-                            };
-                            m[h] = m_new;
-                        }
-                        mn[h] = m[h];
-                        l[h] = mul_rn_f32(l[h], f[h]);
-                    }
-                    for kk2 in 0..PV_STEPS {
-                        cuda_device::thread::__unroll_config::<0>();
-                        for e in 0usize..4 {
-                            cuda_device::thread::__unroll_config::<0>();
-                            let nt = 2 * kk2 + e / 2;
-                            let j0 = 2 * (e % 2);
-                            let h = e % 2;
-                            let key = kb0 + (8 * nt) as u32;
-                            let p0 = if !$masked || key < cnt[h] {
-                                exp_weight(sc[nt][j0] - mn[h])
-                            } else {
-                                0.0
-                            };
-                            let p1 = if !$masked || key + 1 < cnt[h] {
-                                exp_weight(sc[nt][j0 + 1] - mn[h])
-                            } else {
-                                0.0
-                            };
-                            let packed = cvt_f16x2_f32(p0, p1);
-                            let (r0, r1) = cvt_f32x2_f16x2(packed);
-                            l[h] = add_rn_f32(add_rn_f32(l[h], r0), r1);
-                            pa[kk2][e] = packed;
-                        }
-                    }
-                }};
-            }
-            if end <= warp_lo {
-                softmax!(false);
-            } else {
-                softmax!(true);
-            }
-
-            if warp::any(f[0] != 1.0 || f[1] != 1.0) {
-                for nd in 0..2 * DIM_PAIRS_256 {
-                    cuda_device::thread::__unroll_config::<0>();
-                    for j in 0usize..4 {
-                        cuda_device::thread::__unroll_config::<0>();
-                        o[nd][j] = mul_rn_f32(o[nd][j], f[j / 2]);
-                    }
-                }
-            }
-        }
-
-        // The raw codes and scales of value tile kb have landed, and every
-        // warp is done reading the key tile.
-        // SAFETY: waits until none of this thread's groups is pending —
-        // its copies of value tile kb; the barrier then publishes every
-        // thread's copies before the widening reads VT's raw words.
-        unsafe { cp_async_wait_group(0) };
-        thread::sync_threads();
-
-        // The value tile's in-place widening, the key tile's form.
-        let rows0 = wid * WID_ROWS;
-        for r in 0..WID_ROWS {
-            let row = rows0 + r;
-            let base = row * ROW_WORDS_256;
-            if kb * KEY_TILE_U32 + (row as u32) < hi {
-                // SAFETY: as the key tile's widening.
-                dequant_row!(2, vt, base, sv.wrapping_add(row * 8), row & 7, lane);
-            } else {
-                // SAFETY: as the key tile's zero row.
-                zero_row!(2, vt, base, row & 7, lane);
-            }
-        }
-        thread::sync_threads();
-        if kb + 1 < tiles {
-            if end + KEY_TILE_U32 <= hi {
-                stage_q8!(kt, sk, kq_src, kd_src, kb + 1, true);
-            } else {
-                stage_q8!(kt, sk, kq_src, kd_src, kb + 1, false);
+                stage_side!(K, kb + 1, false);
             }
         }
 
@@ -2747,10 +2293,9 @@ mod flash_gqa_prefill_kernels {
         // heads per key head, and the block is THREADS_256 threads with
         // DYN_BYTES_256 bytes of dynamic shared memory.
         unsafe {
-            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }>(
+            prefill_256_p::<PACK_4, { SLICE_ROWS / PACK_4 }, _>(
                 q,
-                kc,
-                vc,
+                F16Kv { k: kc, v: vc },
                 n_keys_buf,
                 scale,
                 n_kv,
@@ -2801,10 +2346,9 @@ mod flash_gqa_prefill_kernels {
         // heads per key head, and the block is THREADS_256 threads with
         // DYN_BYTES_256 bytes of dynamic shared memory.
         unsafe {
-            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }>(
+            prefill_256_p::<PACK_2, { SLICE_ROWS / PACK_2 }, _>(
                 q,
-                kc,
-                vc,
+                F16Kv { k: kc, v: vc },
                 n_keys_buf,
                 scale,
                 n_kv,
@@ -2817,9 +2361,9 @@ mod flash_gqa_prefill_kernels {
         };
     }
 
-    /// [`gqa_prefill_flash_256`] over the Q8_0 cache ([`prefill_256_p_q8`]
-    /// at `GROUP`): the eight-head layout, the two-step staging and the
-    /// in-place widening of the module doc's `_q8` paragraph.
+    /// [`gqa_prefill_flash_256`] over the Q8_0 cache ([`prefill_256_p`] at
+    /// `GROUP` over [`Q8Kv`]): the eight-head layout, the two-step staging and
+    /// the in-place widening of the module doc's `_q8` paragraph.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -2854,12 +2398,22 @@ mod flash_gqa_prefill_kernels {
         fault: FaultSink,
         y: DisjointSlice<f32>,
     ) {
-        // SAFETY: the launch contract is `prefill_256_p_q8`'s at `GROUP`
-        // heads per key head, and the block is THREADS_256 threads with
-        // DYN_BYTES_256_Q8 bytes of dynamic shared memory.
+        // SAFETY: the launch contract is `prefill_256_p`'s at `GROUP` heads
+        // per key head over the four Q8_0 planes, and the block is
+        // THREADS_256 threads with DYN_BYTES_256_Q8 bytes of dynamic shared
+        // memory.
         unsafe {
-            prefill_256_p_q8::<GROUP, { SLICE_ROWS / GROUP }>(
-                q, kq, kd, vq, vd, n_keys_buf, scale, n_kv, ctx, t_rows, 1, fault, y,
+            prefill_256_p::<GROUP, { SLICE_ROWS / GROUP }, _>(
+                q,
+                Q8Kv { kq, kd, vq, vd },
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                t_rows,
+                1,
+                fault,
+                y,
             )
         };
     }

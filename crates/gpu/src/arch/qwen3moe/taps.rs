@@ -5,6 +5,7 @@
 
 use super::body::Body;
 use super::dispatch;
+use super::plan::Flash;
 use super::scratch::KvPlanes;
 use crate::GpuError;
 use crate::flash_gqa::HEAD;
@@ -106,9 +107,11 @@ impl GpuModel<Body> {
     /// Run the chain's attention on the tensor-core flash pass (`mma`, the
     /// pass a load runs) or the scalar one from here on — the other of the
     /// chain's two gated attention arithmetics, a same-class ruler for a
-    /// gate, and not an engine path. Eager mode only: a captured graph holds
-    /// the pass it was captured with, so in graph mode this is refused; set
-    /// the tensor-core pass back before replaying one.
+    /// gate on an f16 cache, and not an engine path. Eager mode only: a
+    /// captured graph holds the pass it was captured with, so in graph mode
+    /// this is refused; set the tensor-core pass back before replaying one.
+    /// The scalar pass on a q8_0 cache is refused by name here, at the call
+    /// ([`KvPlanes::serves_scalar`]).
     pub fn set_flash_mma(&mut self, mma: bool) -> Result<(), GpuError> {
         const WHAT: &str = "qwen3moe::set_flash_mma";
         if self.mode() != StepMode::Eager {
@@ -117,7 +120,13 @@ impl GpuModel<Body> {
                 "eager mode (the captured graphs hold the flash pass of their capture)",
             ));
         }
-        self.body_parts(WHAT)?.2.mma = mma;
+        let body = self.body_parts(WHAT)?.2;
+        if !mma {
+            for p in &body.kv {
+                p.serves_scalar(WHAT, Flash::Group)?;
+            }
+        }
+        body.mma = mma;
         Ok(())
     }
 

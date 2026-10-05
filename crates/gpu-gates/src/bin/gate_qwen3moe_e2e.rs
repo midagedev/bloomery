@@ -1188,7 +1188,9 @@ mod gate {
     /// block's own quantization step of the f16 model's row 0 (the two
     /// formats round the same f32 append values; a block's `d/2` plus the
     /// f16 rounding, derived at runtime — no measured band). Later rows'
-    /// distance to the f16 run prints as the compounding diagnostic.
+    /// distance to the f16 run prints as the compounding diagnostic. Asking
+    /// the q8 model for the scalar pass is refused by name at the call, and
+    /// its next step still runs.
     fn q8_cache() -> Result<bool, GateError> {
         let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
         let mut ok = q8_budget(&file)?;
@@ -1239,13 +1241,37 @@ mod gate {
             verdict(replay)
         );
         ok &= replay;
+        // The scalar pass on a q8_0 cache: refused by name at the call that
+        // asks for it, in `q8_unserved`'s words, and the model's pass kept —
+        // the next eager step runs.
+        m.set_mode(StepMode::Eager);
+        let named = match m.set_flash_mma(false) {
+            Err(GpuError::Shape {
+                what: "qwen3moe::set_flash_mma",
+                detail,
+            }) => detail.contains(
+                "a q8_0 cache's flash runs the eight-head layout's tensor-core pass only; asked \
+                 for the scalar pass",
+            ),
+            _ => false,
+        };
+        let kept = m.reset().is_ok() && m.step(&[ids[0]]).is_ok();
+        println!(
+            "q8 scalar refusal: set_flash_mma(false) refused by name at the call {named}, the \
+             next step runs {kept} {}",
+            verdict(named && kept)
+        );
+        ok &= named && kept;
         // Row 0 against the f16 model's row 0, block by block.
         ok &= q8_row0(&stepped, &f16_row0, &hp)?;
         Ok(ok)
     }
 
     /// (v)'s budget relation, host-only: the plan's KV term under the two
-    /// formats.
+    /// formats, through qwen3moe's own `KvLayout` and the format's wiring
+    /// into the plan (`PlaceQ3::qwen3`) — no pure test reaches either;
+    /// `qwen35moe::place`'s `q8_layer_bytes` holds the other family's
+    /// layout.
     fn q8_budget(file: &gguf::Split) -> Result<bool, GateError> {
         let levers = PlanLevers::default();
         let f16_kv = PlaceQ3::qwen3(file, Place::parse("cuda0")?, CTX, KvQ8::F16)?
