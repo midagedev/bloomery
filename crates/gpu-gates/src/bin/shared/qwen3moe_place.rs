@@ -706,8 +706,12 @@ fn searched_placed_ctx(
     searched_ctx(file, floor, &fits)
 }
 
-/// The search both `whole_ctx_*` run: the largest `floor + k·CTX_GRAN` that
-/// `fits` takes, `Some(trained)` when the trained context itself fits.
+/// The search both `whole_ctx_*` run: `Some(trained)` when the trained
+/// context itself fits — probed once, after the floor — else the largest
+/// `floor + k·CTX_GRAN` below it that `fits` takes, halved between the
+/// floor, which fits, and the trained context, which does not: every
+/// caller's `fits` is monotone in the context, so the halving finds that
+/// largest one.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -725,6 +729,9 @@ fn searched_ctx(
     }
     if !fits(floor)? {
         return Ok(None);
+    }
+    if fits(trained)? {
+        return Ok(Some(trained));
     }
     let mut lo = floor;
     let mut hi = trained;

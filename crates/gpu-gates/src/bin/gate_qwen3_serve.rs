@@ -106,9 +106,11 @@
 //!   same-stream arrivals before the minority drops under 4, while a
 //!   turn-taking server's `QUANTUM` = 64-token turns put windows of 16
 //!   inside a turn holding 16 of one stream and none of the other;
-//!   (v4) the load record names `slots=2` and `slot_ctx` = the auto default
-//!   the one-slot arm measured over two (a cache row the granularity, the
-//!   floor exact), and `/props`' `n_ctx` is that slot ctx.
+//!   (v4) the load record names `slots=2` and `slot_ctx` = the auto total
+//!   over two (a cache row the granularity, the floor exact) — the total the
+//!   server's own whole-fit line names, which the search for two slots, each
+//!   slot's planes rounded to the granule, may leave under the one-slot
+//!   arm's default (both print) — and `/props`' `n_ctx` is that slot ctx.
 //!   The same clause runs a second time on a placed load, its checks named
 //!   `placed_…`: `--place a` under `BLOOMERY_CARD_BUDGET=12G` (a 12 GiB
 //!   card's budget, which keeps routed experts on the host tier on either
@@ -155,6 +157,19 @@
 //!   counted before the planes went through the allocator is 96 MiB short
 //!   at that ctx on the Qwen3-30B file (every plane half a granule past a
 //!   whole one) and 21.7 MiB on the Qwen3.6 one.
+//! - `ctx_default_is_the_trained_context`, `ctx_default`'s default arm, on
+//!   either card: a card that holds the whole load at the file's trained
+//!   context (read by the seat's own `trained_ctx`) defaults to it; one that
+//!   does not defaults under it to a context the whole load fits at, one
+//!   granule (1024) past which it does not; one whose whole load does not
+//!   fit at the default had nothing at the 4096 floor either (the placed
+//!   arm's relations hold that default). The fits are the seat's own whole-fit
+//!   line at the default — the census reading, its verdict, what the card
+//!   had, the need term by term — with its cache term moved to each
+//!   context's planes. FAIL-first: a search that never probes the trained
+//!   context stops one granule under it on an idle A6000, where both
+//!   contexts' planes take the same granules, and the clause is red on both
+//!   files.
 //! - `placed_slots_are_resident` (qwen3moe) and `placed_slots_take_turns`
 //!   (qwen35moe), `ctx_default`'s placed arm (`--place a --parallel 2`, no
 //!   budget): a qwen3moe file's placed load holds its two slots resident —
@@ -206,6 +221,14 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/qwen3moe_place.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate reads the file's trained context through the seat's own owner; the planner serves the seat and the CLI"
+)]
+mod q3place;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -224,6 +247,8 @@ mod gate {
     use model::placement::workstation::GRANULE;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
+
+    use crate::q3place;
 
     const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir>";
 
@@ -400,19 +425,23 @@ mod gate {
     /// (the placed arm's checks below), its two slots resident on a
     /// qwen3moe file (`placed_slots_are_resident`) and taking the one
     /// sequence in turns on a qwen35moe file (`placed_slots_take_turns`).
+    /// The default is the whole search's answer on either card: the trained
+    /// context where the whole load fits it, else the largest the load fits
+    /// ([`ctx_default_is_the_trained_context`], the default arm).
     /// FAIL-first: a search
     /// that hands back the trained context uncapped makes the default arm's
     /// load a plan the card cannot hold (the spawn never listens), and one
     /// that hands back nothing leaves the default at the floor. Returns the
-    /// default arm's `n_ctx` — the one-slot load's total context, what the
-    /// slots clause's split halves.
+    /// default arm's `n_ctx` — the one-slot load's total context, which the
+    /// slots clause prints beside its own total.
     fn ctx_default(model: &Path, dir: &Path, ok: &mut bool) -> Result<Option<u64>, GateError> {
         // The trained context read from the file beside the server, not the
-        // server's own echo of it.
+        // server's own echo of it, by the owner the seat's search reads it
+        // through.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let trained = split
-            .arch_get_u64("context_length")
+        let trained = q3place::trained_ctx(&split)
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;
+        let trained = u64::try_from(trained)?;
         let props_ctx = |url: &dyn Fn(&str) -> String| -> Result<u64, GateError> {
             let (st, body) = curl(&url("/props"), None, false)?;
             let v = json_of("/props", st, &body)?;
@@ -490,6 +519,8 @@ mod gate {
                         load.word("cache")?
                     );
                     check(ok, "default_load_names_f16", load.word("cache")? == "f16");
+                    let log = std::fs::read_to_string(&err_log)?;
+                    ctx_default_is_the_trained_context(model, &split, &log, n, trained, ok)?;
                     default_n = Some(n);
                 }
                 _ => {
@@ -658,8 +689,93 @@ mod gate {
         );
         check(ok, "q8_resident_drops_by_the_planes", dropped);
         // The default arm's answer, the one-slot load's total context: the
-        // slots clause's split is half of it.
+        // slots clause prints it beside the total its own server names.
         Ok(default_n)
+    }
+
+    /// The seat's `--ctx` floor (`generate_qwen3moe`'s default, the seat's
+    /// `CTX`): the whole search's first probe, and the least default.
+    const SEAT_FLOOR: u64 = 4096;
+
+    /// `ctx_default_is_the_trained_context`, on the default arm's server
+    /// (no `--ctx`, `--parallel 1`, its stderr `log`, its default `n`): the
+    /// default is the whole search's answer on every card. A card that holds
+    /// the whole load at the file's `trained` context defaults to it; one
+    /// that does not defaults under it to a context the load fits at, one
+    /// [`q3place::CTX_GRAN`] past which it does not (or past which is the
+    /// trained context); one whose whole load does not fit at the default
+    /// had nothing at [`SEAT_FLOOR`] either — the default is then the placed
+    /// plan's, which the placed arm's relations hold. The verdicts are the
+    /// seat's own: its one whole-fit line at `n` — the census reading the
+    /// load was decided on, its `fits`, what the card had and the need term
+    /// by term — with the cache term moved from `n` rows to each context
+    /// asked: the need is a sum (`Card::floor_bytes`) whose other terms read
+    /// no context at or past the floor, and the cache at a context is the
+    /// allocator's bytes of [`cache_planes`] there, the list
+    /// [`whole_fit_counts_the_planes_granules`] holds equal to the verdict's
+    /// own. A line missing or without its terms is a named error.
+    /// FAIL-first: a search that never probes the trained context stops one
+    /// granule under it on an idle A6000, where the cache at both contexts
+    /// takes the same granules.
+    fn ctx_default_is_the_trained_context(
+        model: &Path,
+        split: &Split,
+        log: &str,
+        n: u64,
+        trained: u64,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let head = format!("whole fit at ctx {n}: ");
+        let line = log
+            .lines()
+            .find(|l| l.starts_with(&head))
+            .ok_or_else(|| format!("the default arm's seat printed no whole-fit line at {n}"))?;
+        let term = |after: &str| -> Result<u64, GateError> {
+            line.split(after)
+                .nth(1)
+                .and_then(|t| t.split(" B").next())
+                .and_then(|t| t.parse().ok())
+                .ok_or_else(|| format!("the whole-fit line names no `{after}… B`: {line}").into())
+        };
+        let (need, cache) = (term(": need ")?, term(" + cache ")?);
+        let (had, census) = line
+            .split_once(" B the card had (")
+            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
+        let budget: u64 = had
+            .rsplit(", of ")
+            .next()
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
+        let census = census.trim_end_matches(')');
+        let rest = need
+            .checked_sub(cache)
+            .ok_or_else(|| format!("the whole-fit line's cache passes its need: {line}"))?;
+        // The whole load's need at `ctx` positions, the line's other terms kept.
+        let need_at = |ctx: u64| -> Result<u64, GateError> {
+            let planes = cache_planes(model, split, ctx)?;
+            rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
+                .ok_or_else(|| format!("the whole load's need at {ctx} passes u64 bytes").into())
+        };
+        let whole = line.contains(": fits: ");
+        let next = n + q3place::CTX_GRAN as u64;
+        let (at_trained, at_next, at_floor) =
+            (need_at(trained)?, need_at(next)?, need_at(SEAT_FLOOR)?);
+        println!(
+            "default arm: the default {n} of the file's trained {trained}, the whole load {} \
+             there; it needs {need} B at {n}, {at_trained} B at {trained}, {at_next} B at \
+             {next}, {at_floor} B at the floor {SEAT_FLOOR}, of {budget} B the card had \
+             ({census})",
+            if whole { "fits" } else { "does not fit" },
+        );
+        let held = if !whole {
+            at_floor > budget
+        } else if at_trained <= budget {
+            n == trained
+        } else {
+            n < trained && (next >= trained || at_next > budget)
+        };
+        check(ok, "ctx_default_is_the_trained_context", held);
+        Ok(())
     }
 
     /// The ctx [`whole_fit_counts_the_planes_granules`] runs at: an odd
@@ -688,64 +804,7 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let num = |key: &str| -> Result<u64, GateError> {
-            split
-                .arch_get_u64(key)
-                .ok_or_else(|| format!("{}: no {key}", model.display()).into())
-        };
-        let layers = num("block_count")? as usize;
-        let kv_heads = split
-            .arch_get_u64("attention.head_count_kv")
-            .or_else(|| split.arch_get_u64("attention.head_count"))
-            .ok_or_else(|| format!("{}: no attention.head_count(_kv)", model.display()))?
-            as usize;
-        let head_dim = num("attention.key_length")? as usize;
-        let plane = kv_heads as u64 * GRANULE_CTX as u64 * head_dim as u64 * 2;
-        let mut planes = Vec::new();
-        match split.architecture() {
-            Some("qwen3moe") => {
-                for _ in 0..layers {
-                    planes.push(plane);
-                    planes.push(plane);
-                }
-            }
-            Some("qwen35moe") => {
-                let shape = LinearShape {
-                    n_k: num("ssm.group_count")? as usize,
-                    n_v: num("ssm.time_step_rank")? as usize,
-                    // Neither plane's length reads the map; a qwen35moe
-                    // file's delta layers are the tiled ones.
-                    map: KHeadMap::Tiled,
-                };
-                for l in 0..layers {
-                    // The layout's own rule (`hparams::kinds`): a layer with
-                    // the fused `attn_qkv` tensor is a delta layer, one with
-                    // `attn_q` a plain attention layer.
-                    let qkv = format!("blk.{l}.attn_qkv.weight");
-                    let q = format!("blk.{l}.attn_q.weight");
-                    if split.find(&qkv).is_some() {
-                        planes.push(4 * shape.state_len() as u64);
-                        planes.push(4 * shape.ring_len() as u64);
-                    } else if split.find(&q).is_some() {
-                        planes.push(plane);
-                        planes.push(plane);
-                    } else {
-                        return Err(format!(
-                            "{}: layer {l} holds neither attn_qkv.weight nor attn_q.weight",
-                            model.display()
-                        )
-                        .into());
-                    }
-                }
-            }
-            other => {
-                return Err(format!(
-                    "{} is a {other:?} file; the whole-fit clause serves qwen3moe and qwen35moe",
-                    model.display()
-                )
-                .into());
-            }
-        }
+        let planes = cache_planes(model, &split, GRANULE_CTX as u64)?;
         let expected = model::placement::allocator_bytes(GRANULE, planes.iter().copied());
         let raw: u64 = planes.iter().sum();
         let d = dir.join("ctx-granule");
@@ -789,6 +848,74 @@ mod gate {
         );
         check(ok, "whole_fit_counts_the_planes_granules", said == expected);
         Ok(())
+    }
+
+    /// The cache planes the body allocates for one sequence of `ctx` rows of
+    /// `model`'s file (`split`), in its allocation order — the order the
+    /// allocator's shared granules are counted in: f16's `k` and `v` a
+    /// plain-attention layer, a qwen35moe file's recurrent layers' `state`
+    /// and `ring` (`LinearShape`'s lengths, one lane as `Body35` allocates
+    /// them), which no context moves.
+    fn cache_planes(model: &Path, split: &Split, ctx: u64) -> Result<Vec<u64>, GateError> {
+        let num = |key: &str| -> Result<u64, GateError> {
+            split
+                .arch_get_u64(key)
+                .ok_or_else(|| format!("{}: no {key}", model.display()).into())
+        };
+        let layers = num("block_count")? as usize;
+        let kv_heads = split
+            .arch_get_u64("attention.head_count_kv")
+            .or_else(|| split.arch_get_u64("attention.head_count"))
+            .ok_or_else(|| format!("{}: no attention.head_count(_kv)", model.display()))?
+            as usize;
+        let head_dim = num("attention.key_length")? as usize;
+        let plane = kv_heads as u64 * ctx * head_dim as u64 * 2;
+        let mut planes = Vec::new();
+        match split.architecture() {
+            Some("qwen3moe") => {
+                for _ in 0..layers {
+                    planes.push(plane);
+                    planes.push(plane);
+                }
+            }
+            Some("qwen35moe") => {
+                let shape = LinearShape {
+                    n_k: num("ssm.group_count")? as usize,
+                    n_v: num("ssm.time_step_rank")? as usize,
+                    // Neither plane's length reads the map; a qwen35moe
+                    // file's delta layers are the tiled ones.
+                    map: KHeadMap::Tiled,
+                };
+                for l in 0..layers {
+                    // The layout's own rule (`hparams::kinds`): a layer with
+                    // the fused `attn_qkv` tensor is a delta layer, one with
+                    // `attn_q` a plain attention layer.
+                    let qkv = format!("blk.{l}.attn_qkv.weight");
+                    let q = format!("blk.{l}.attn_q.weight");
+                    if split.find(&qkv).is_some() {
+                        planes.push(4 * shape.state_len() as u64);
+                        planes.push(4 * shape.ring_len() as u64);
+                    } else if split.find(&q).is_some() {
+                        planes.push(plane);
+                        planes.push(plane);
+                    } else {
+                        return Err(format!(
+                            "{}: layer {l} holds neither attn_qkv.weight nor attn_q.weight",
+                            model.display()
+                        )
+                        .into());
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "{} is a {other:?} file; the planes are listed for qwen3moe and qwen35moe",
+                    model.display()
+                )
+                .into());
+            }
+        }
+        Ok(planes)
     }
 
     /// `bloomery-serve --model qwen3 -m <model> --port 0 --parallel 1` beside
@@ -1316,13 +1443,15 @@ mod gate {
         Ok((h, rx))
     }
 
-    /// Where a slots arm's total context comes from: the one-slot default
-    /// arm's answer (`ctx_default`'s, the whole-card load's total), or the
-    /// server's own `plan` record (`ctx_max`: the placed search's answer,
-    /// the total the plan was made at).
+    /// Where a slots arm's total context comes from: the server's own one
+    /// whole-fit line (`whole fit at ctx T`: the whole search's answer for
+    /// its slots, each slot's planes rounded to the granule, so it may sit
+    /// under the one-slot default arm's answer, carried here to print
+    /// beside it), or its own `plan` record (`ctx_max`: the placed search's
+    /// answer, the total the plan was made at).
     #[derive(Clone, Copy, Debug)]
     enum Total {
-        Default(Option<u64>),
+        Verdict { one_slot: Option<u64> },
         Plan,
     }
 
@@ -1337,15 +1466,16 @@ mod gate {
         total: Total,
     }
 
-    /// The whole-card arm: no `--place`, no `--ctx`, the one-slot default
-    /// `total` split.
-    fn whole_slots(total: Option<u64>) -> SlotsArm<'static> {
+    /// The whole-card arm: no `--place`, no `--ctx`, the total its own
+    /// whole-fit line names split; `one_slot` the one-slot default arm's
+    /// answer, printed beside it.
+    fn whole_slots(one_slot: Option<u64>) -> SlotsArm<'static> {
         SlotsArm {
             dir: "slots",
             prefix: "",
             flags: &[],
             env: &[],
-            total: Total::Default(total),
+            total: Total::Verdict { one_slot },
         }
     }
 
@@ -1418,10 +1548,6 @@ mod gate {
         let (load, _) = load_and_listening(&log);
         let field = |name: &str| field_u64(load, name);
         let plan = log.lines().find(|l| l.starts_with("plan ")).unwrap_or("");
-        let total = match arm.total {
-            Total::Default(t) => t,
-            Total::Plan => field_u64(plan, "ctx_max"),
-        };
         // The load's decision, printed: the whole-fit verdicts the seat ran
         // (one, at the total, when it made one) and its plan record.
         let verdicts: Vec<&str> = log
@@ -1433,6 +1559,26 @@ mod gate {
             arm.dir,
             verdicts.len()
         );
+        let total = match arm.total {
+            Total::Verdict { one_slot } => {
+                // One verdict, at the total the seat decided its slots at;
+                // none or more names no total, and the split's checks are red.
+                let said = match verdicts[..] {
+                    [line] => line
+                        .strip_prefix("whole fit at ctx ")
+                        .and_then(|t| t.split(':').next())
+                        .and_then(|t| t.parse::<u64>().ok()),
+                    _ => None,
+                };
+                println!(
+                    "{}: the total {said:?} its whole-fit line names, the one-slot default \
+                     {one_slot:?}",
+                    arm.dir
+                );
+                said
+            }
+            Total::Plan => field_u64(plan, "ctx_max"),
+        };
         let (st, body) = curl(&url("/props"), None, false)?;
         let props = json_of("/props", st, &body)?;
         let n_ctx = props["n_ctx"].as_u64().unwrap_or(u64::MAX);
