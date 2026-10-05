@@ -299,7 +299,9 @@ text. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
   the history of passes (the requests before it and the streams beside it): the same history gives the same tokens
   bit for bit, another history can reword an answer at a near tie, since an expert on the card and the same expert
   on the host round their activations differently. `POST /residency/reset` returns to the load's placement;
-  `BLOOMERY_RESIDENCY=off` gives repeatable tokens at residency's cost in speed.
+  `BLOOMERY_RESIDENCY=off` gives repeatable tokens at residency's cost in speed. The placement also depends on
+  `--parallel`: each slot's cache takes card room, so a two-slot V4.1 load holds 8 fewer experts on the card than a
+  one-slot load, and its answers can differ from a `--parallel 1` server's at a near tie.
 - Clef takes text states only, and reads backbone weights of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 (not the IQ
   types, Q2_K, Q4_0 or Q4_1).
 - V4.1 decode is bound by host memory bandwidth in each step's expert part, and by the card's own serial work
