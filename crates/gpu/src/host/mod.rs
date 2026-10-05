@@ -118,6 +118,7 @@ use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
 use residency::HostResidency;
 use route_trace::RouteTrace;
+use runtime::swaprule::KeptRows;
 use slots::{MAX_TIERS, SlotMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -360,8 +361,8 @@ pub(crate) fn drain_within(
 /// no pass open, which no boundary would fold.
 fn pass_kept(
     open: bool,
-    kept: Option<(usize, PassKind)>,
-) -> Result<Option<(usize, PassKind)>, GpuError> {
+    kept: Option<(KeptRows, PassKind)>,
+) -> Result<Option<(KeptRows, PassKind)>, GpuError> {
     const WHAT: &str = "HostTier::swap_boundary";
     match (open, kept) {
         (true, Some(k)) => Ok(Some(k)),
@@ -374,13 +375,14 @@ fn pass_kept(
     }
 }
 
-/// A kept count with no pass open, refused by name at the write
+/// Kept rows with no pass open, refused by name at the write
 /// ([`HostTier::keep_rows`]) and at the read ([`pass_kept`], the next
 /// boundary): one wording, one owner.
-fn kept_with_no_pass(rows: usize, kind: PassKind) -> String {
+fn kept_with_no_pass(kept: KeptRows, kind: PassKind) -> String {
     format!(
-        "{rows} rows kept as a {} pass with no pass open: no boundary opened the pass \
+        "{} rows kept as a {} pass with no pass open: no boundary opened the pass \
          they would end",
+        kept.count(),
         kind.word()
     )
 }
@@ -398,8 +400,8 @@ pub enum PassKind {
     /// A pass of resident slots' rows: every row kept, rows of different
     /// sequences.
     Slots,
-    /// A drafted pass of resident slots' verify rows: every row counted, a
-    /// slot's rejected rows included, until the machine takes a set of rows.
+    /// A drafted pass of resident slots' verify rows: each slot's accepted
+    /// rows kept, a rejected row leaves no trace.
     SlotsDrafted,
     /// A prompt call, one pass whose rows are not counted: 0 kept.
     Prompt,
@@ -695,7 +697,7 @@ pub struct HostTier<H> {
     /// The residency machine over the stage card's slots, once started
     /// ([`HostTier::start_swap`]), and the rows the open pass keeps.
     swap: Option<swap::SwapMachine>,
-    swap_kept: Option<(usize, PassKind)>,
+    swap_kept: Option<(KeptRows, PassKind)>,
     /// The stage card's copy of the map the machine writes: after `swap`, so
     /// it outlives the machine that holds its address.
     swap_view: Option<Arc<DeviceTensor<u32>>>,
@@ -800,13 +802,14 @@ impl<H: HostExperts> HostTier<H> {
         self.swap.as_ref()
     }
 
-    /// The pass that just ran, a `kind`, keeps its first `kept` rows (a
-    /// step 1, a verify its accepted rows, a prompt call 0): what the next
-    /// boundary folds. Refused by name — the write side of the refusal the
-    /// next boundary makes ([`pass_kept`]) — a count given with no pass
-    /// open, and one given while a boundary made ahead waits for its launch
+    /// The pass that just ran, a `kind`, keeps `kept` rows (a step its one
+    /// row, a verify its accepted rows, a drafted slots pass each slot's
+    /// accepted rows, a prompt call none): what the next boundary folds.
+    /// Refused by name — the write side of the refusal the
+    /// next boundary makes ([`pass_kept`]) — rows kept with no pass
+    /// open, and ones kept while a boundary made ahead waits for its launch
     /// (the pass it opened has not run). Nothing without a machine.
-    pub fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
+    pub fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::keep_rows";
         let Some(m) = self.swap.as_ref() else {
             return Ok(());
@@ -1601,7 +1604,7 @@ impl<H: HostExperts> HostTier<H> {
             && self.swap_kept.is_none()
         {
             self.step.tally.clear();
-            self.swap_kept = Some((0, PassKind::Abandoned));
+            self.swap_kept = Some((KeptRows::prefix(0), PassKind::Abandoned));
         }
     }
 
@@ -2154,7 +2157,7 @@ mod tests {
 
     #[test]
     fn a_boundary_takes_kept_rows_only_for_an_open_pass() {
-        let step = Some((1, PassKind::Step));
+        let step = Some((super::KeptRows::prefix(1), PassKind::Step));
         assert_eq!(pass_kept(true, step).ok(), Some(step));
         assert_eq!(pass_kept(false, None).ok(), Some(None));
         let open_unkept = pass_kept(true, None).expect_err("an open pass with no kept count");

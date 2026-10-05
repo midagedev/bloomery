@@ -74,6 +74,72 @@ pub struct Shape {
     pub max_rows: usize,
 }
 
+/// The rows a pass keeps, as [`SwapRule::end_pass`] folds them: a set of
+/// rows below the shape's `max_rows`, one bit a row. Every pass's kept rows
+/// are a prefix ([`KeptRows::prefix`]) but a drafted slots pass's, each
+/// slot's accepted rows ([`KeptRows::of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeptRows {
+    /// Bit `r`: row `r` kept.
+    mask: u64,
+}
+
+impl KeptRows {
+    /// The first `k` rows, `k` at most the mask's 64.
+    #[must_use]
+    pub fn prefix(k: usize) -> KeptRows {
+        assert!(
+            k <= 64,
+            "a pass keeps at most 64 rows: a KeptRows mask's width"
+        );
+        KeptRows {
+            mask: if k == 0 { 0 } else { u64::MAX >> (64 - k) },
+        }
+    }
+
+    /// Exactly `rows`, each below 64; a row twice keeps the row once.
+    #[must_use]
+    pub fn of(rows: impl IntoIterator<Item = usize>) -> KeptRows {
+        let mut mask = 0u64;
+        for row in rows {
+            assert!(row < 64, "a kept row is below 64: a KeptRows mask's width");
+            mask |= 1u64 << row;
+        }
+        KeptRows { mask }
+    }
+
+    /// How many rows it keeps.
+    #[must_use]
+    pub fn count(self) -> usize {
+        self.mask.count_ones() as usize
+    }
+
+    /// Whether row `row` is one it keeps; a row past the mask's width never
+    /// is.
+    #[must_use]
+    pub fn keeps(self, row: usize) -> bool {
+        row < 64 && self.mask & (1u64 << row) != 0
+    }
+
+    /// The lowest kept row at or past `rows`, when there is one: the row a
+    /// caller that holds a pass's own bound refuses by name.
+    #[must_use]
+    pub fn past(self, rows: usize) -> Option<usize> {
+        let over = if rows >= 64 {
+            self.mask
+        } else {
+            self.mask >> rows
+        };
+        (over != 0).then(|| rows + over.trailing_zeros() as usize)
+    }
+
+    /// The mask itself, bit `r` = row `r` kept: a report field.
+    #[must_use]
+    pub fn mask(self) -> u64 {
+        self.mask
+    }
+}
+
 /// One expert admitted to a layer's card set in place of another, live from
 /// boundary `live_at` on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -551,6 +617,12 @@ impl SwapRule {
         if shape.max_rows == 0 {
             return shape_err("max_rows must be 1 or more", shape.max_rows);
         }
+        if shape.max_rows > 64 {
+            return shape_err(
+                "max_rows must be 1 to 64 (a KeptRows mask's width)",
+                shape.max_rows,
+            );
+        }
         let layers = seed.len();
         if layers == 0 {
             return shape_err("a rule needs 1 or more layers", layers);
@@ -798,36 +870,44 @@ impl SwapRule {
         Ok(())
     }
 
-    /// End the pass: fold its first `kept` rows into the counts and drop the
-    /// rest, so a rejected row leaves no trace. Every layer but the ones no
-    /// pass routes must have observed every kept row.
-    pub fn end_pass(&mut self, kept: usize) -> Result<(), SwapRuleError> {
+    /// End the pass: fold `kept`'s rows into the counts and drop the rest,
+    /// so a rejected row leaves no trace. Every layer but the ones no pass
+    /// routes must have observed every kept row.
+    pub fn end_pass(&mut self, kept: KeptRows) -> Result<(), SwapRuleError> {
         if self.planned != self.passes {
             return Err(SwapRuleError::PlanSkipped {
                 boundary: self.passes,
             });
         }
-        if kept > self.pass_rows {
+        if kept.past(self.pass_rows).is_some() {
             return Err(SwapRuleError::KeptPastRows {
-                kept,
+                kept: kept.count(),
                 rows: self.pass_rows,
             });
         }
         let (l_n, top_k, e) = (self.layers, self.shape.top_k, self.shape.experts);
-        for row in 0..kept {
+        for row in 0..self.shape.max_rows {
+            if !kept.keeps(row) {
+                continue;
+            }
             for layer in 0..l_n {
                 if !self.seen[row * l_n + layer] && !self.unrouted[layer] {
                     return Err(SwapRuleError::RowMissing { layer, row });
                 }
             }
         }
-        for cell in 0..kept * l_n {
-            let layer = cell % l_n;
-            if self.unrouted[layer] {
+        for row in 0..self.shape.max_rows {
+            if !kept.keeps(row) {
                 continue;
             }
-            for &id in &self.rows[cell * top_k..(cell + 1) * top_k] {
-                self.counts[layer * e + id as usize] += 1.0;
+            for layer in 0..l_n {
+                if self.unrouted[layer] {
+                    continue;
+                }
+                let cell = row * l_n + layer;
+                for &id in &self.rows[cell * top_k..(cell + 1) * top_k] {
+                    self.counts[layer * e + id as usize] += 1.0;
+                }
             }
         }
         self.seen[..self.pass_rows * l_n].fill(false);
@@ -1177,7 +1257,7 @@ impl SwapRule {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flip, Shape, SwapParams, SwapRule, SwapRuleError};
+    use super::{Flip, KeptRows, Shape, SwapParams, SwapRule, SwapRuleError};
 
     // The residency rule's hand-computed cases, its protocol, and its refusals.
     //
@@ -1222,7 +1302,7 @@ mod tests {
                     .count();
                 r.observe(layer, 0, ids).unwrap();
             }
-            r.end_pass(1).unwrap();
+            r.end_pass(KeptRows::prefix(1)).unwrap();
             flips.extend_from_slice(r.plan(s as u64 + 1).unwrap());
         }
         (hits, flips)
@@ -1368,15 +1448,51 @@ mod tests {
             a.observe(0, 0, &[2]).unwrap();
             a.observe(0, 1, &[3]).unwrap();
             a.observe(0, 2, &[4]).unwrap();
-            a.end_pass(1).unwrap();
+            a.end_pass(KeptRows::prefix(1)).unwrap();
             fa.extend_from_slice(a.plan(s).unwrap());
             b.observe(0, 0, &[2]).unwrap();
-            b.end_pass(1).unwrap();
+            b.end_pass(KeptRows::prefix(1)).unwrap();
             fb.extend_from_slice(b.plan(s).unwrap());
         }
         assert_eq!(fa, [flip(0, 2, 0, 2)]);
         assert_eq!(fa, fb);
         assert_eq!(a, b);
+    }
+
+    /// A drafted slots pass keeps each slot's accepted rows, a set that is no
+    /// prefix: two slots of two rows, one row accepted each, keeps {0, 2}.
+    /// The fold counts the kept rows alone — rows 1 and 3 leave no trace —
+    /// while the two wrong prefix folds (all the pass's rows, a prefix of
+    /// the kept count) each count a row the pass rejected or drop a kept
+    /// one.
+    #[test]
+    fn a_set_of_kept_rows_counts_alone() {
+        let counts = |end: fn(&mut SwapRule) -> Result<(), SwapRuleError>| {
+            let mut r = rule(params(1, 96, 1.5, 2.0, 1.0), 8, 1, &[&[0]]);
+            for (row, &id) in [2u32, 3, 4, 5].iter().enumerate() {
+                r.observe(0, row, &[id]).unwrap();
+            }
+            end(&mut r).unwrap();
+            r.counts.clone()
+        };
+        let mut want = vec![0.0; 8];
+        want[2] = 1.0;
+        want[4] = 1.0;
+        assert_eq!(
+            counts(|r| r.end_pass(KeptRows::of([0, 2]))),
+            want.clone(),
+            "the set {{0, 2}} counts rows 0 and 2 alone"
+        );
+        assert_ne!(
+            counts(|r| r.end_pass(KeptRows::prefix(4))),
+            want.clone(),
+            "all the pass's rows is the wrong fold"
+        );
+        assert_ne!(
+            counts(|r| r.end_pass(KeptRows::prefix(2))),
+            want.clone(),
+            "a prefix of the kept count is the wrong fold"
+        );
     }
 
     /// A small deterministic history: 3 layers of 16 experts, top-2, passes of 1
@@ -1400,7 +1516,7 @@ mod tests {
                 }
             }
             let kept = (next() as usize) % rows + 1;
-            r.end_pass(kept).unwrap();
+            r.end_pass(KeptRows::prefix(kept)).unwrap();
             flips.extend_from_slice(r.plan(b).unwrap());
         }
         flips
@@ -1671,6 +1787,20 @@ mod tests {
                 experts: 4
             }
         );
+        assert!(matches!(
+            SwapRule::new(
+                p,
+                Shape {
+                    experts: 4,
+                    top_k: 2,
+                    max_rows: 65
+                },
+                &[&[0]],
+                &[1]
+            )
+            .unwrap_err(),
+            E::Shape { .. }
+        ));
         let mut bad = p;
         bad.decay = 1.5;
         assert!(matches!(
@@ -1745,11 +1875,29 @@ mod tests {
             Err(E::RowObservedTwice { layer: 0, row: 0 })
         );
         assert_eq!(r.open(&[0; 8], 1), Err(E::RowsPending { rows: 1 }));
-        assert_eq!(r.end_pass(2), Err(E::KeptPastRows { kept: 2, rows: 1 }));
-        assert_eq!(r.end_pass(1), Err(E::RowMissing { layer: 1, row: 0 }));
+        assert_eq!(
+            r.end_pass(KeptRows::prefix(2)),
+            Err(E::KeptPastRows { kept: 2, rows: 1 })
+        );
+        assert_eq!(
+            r.end_pass(KeptRows::prefix(1)),
+            Err(E::RowMissing { layer: 1, row: 0 })
+        );
+        assert_eq!(
+            r.end_pass(KeptRows::of([1])),
+            Err(E::KeptPastRows { kept: 1, rows: 1 })
+        );
+        r.observe(0, 1, &[2, 3]).unwrap();
+        assert_eq!(
+            r.end_pass(KeptRows::of([1])),
+            Err(E::RowMissing { layer: 1, row: 1 })
+        );
         r.observe(1, 0, &[0, 1]).unwrap();
-        r.end_pass(1).unwrap();
-        assert_eq!(r.end_pass(0), Err(E::PlanSkipped { boundary: 1 }));
+        r.end_pass(KeptRows::prefix(1)).unwrap();
+        assert_eq!(
+            r.end_pass(KeptRows::prefix(0)),
+            Err(E::PlanSkipped { boundary: 1 })
+        );
         assert_eq!(
             r.plan(2),
             Err(E::Boundary {
@@ -1762,7 +1910,7 @@ mod tests {
     }
 
     mod fixture {
-        use super::super::{Flip, Shape, SwapParams, SwapRule};
+        use super::super::{Flip, KeptRows, Shape, SwapParams, SwapRule};
 
         // The residency rule against the fixtures of `tools/ref/router-residency.py`
         // (`tests/data/swaprule-fixture.json` for `plan`, `swaprule-open-fixture.json`
@@ -2000,7 +2148,7 @@ mod tests {
                         r.observe(layer, row, &ints_u32(ids)).unwrap();
                     }
                 }
-                r.end_pass(k).unwrap();
+                r.end_pass(KeptRows::prefix(k)).unwrap();
                 let b = pass as u64 + 1;
                 got.extend(r.plan(b).unwrap().iter().map(|&fl| (b, fl)));
             }
@@ -2282,14 +2430,15 @@ mod tests {
             r.observe(0, row, &[0, 2]).unwrap();
             r.observe(1, row, &[1, 3]).unwrap();
         }
-        r.end_pass(2).expect("the listed layer needs no kept row");
+        r.end_pass(KeptRows::prefix(2))
+            .expect("the listed layer needs no kept row");
         assert!(r.counts[2 * 4..3 * 4].iter().all(|&c| c == 0.0));
         assert_eq!(r.counts[4..8], [0.0, 2.0, 0.0, 2.0]);
         let mut unlisted = unrouted_rule(&[]).unwrap();
         unlisted.observe(0, 0, &[0, 2]).unwrap();
         unlisted.observe(1, 0, &[1, 3]).unwrap();
         assert_eq!(
-            unlisted.end_pass(1),
+            unlisted.end_pass(KeptRows::prefix(1)),
             Err(SwapRuleError::RowMissing { layer: 2, row: 0 })
         );
     }

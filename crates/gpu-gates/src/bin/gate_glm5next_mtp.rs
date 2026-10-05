@@ -119,6 +119,7 @@ mod gate {
     use refset::arch::glm5next::{MODEL, MTP, MTP_SET};
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
+    use runtime::swaprule::KeptRows;
     use runtime::{Advance as _, Committed, PassSink};
 
     /// Cache rows: the e2e gate's main load.
@@ -811,7 +812,7 @@ mod gate {
         let v = pair_row(m)?;
         let verify_ok = rows == [t1, t2] && bits(&v) == plain;
         m.rollback(p + 2)?;
-        m.keep_rows(2, PassKind::Pair)?;
+        m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
         m.step(&[t2])?;
         let kept_ok = bits(&pair_row(m)?) == plain && bits(&step_row(m)?) == bits(&s2);
         ok &= verify_ok && kept_ok;
@@ -828,7 +829,7 @@ mod gate {
         let q = m.pos();
         m.step_rows::<2>([t2, t2])?;
         m.rollback(q + 1)?;
-        m.keep_rows(1, PassKind::Pair)?;
+        m.keep_rows(KeptRows::prefix(1), PassKind::Pair)?;
         let pair = |first: usize| NextnHidden::Target {
             walk: GlmArena::Pair,
             first,

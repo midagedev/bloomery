@@ -35,7 +35,7 @@ pub(crate) use lookup::f32_gain;
 pub use probe::{OpTime, StepProbe};
 pub use slots::{SlotRange, SlotRows, Slots, SlotsOut};
 
-use slots::{ParkedSlot, SlotFault, SlotGraphs, SlotSet};
+use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
 use crate::fault::Fault;
 use crate::head::{Head, HeadNorm};
@@ -177,13 +177,18 @@ pub trait HostServed {
         Ok(())
     }
 
-    /// The pass the last boundary opened, a `kind`, keeps its first `kept`
-    /// rows: a step 1, a verify its accepted rows, a prompt call 0. The
+    /// The pass the last boundary opened, a `kind`, keeps `kept` rows: a
+    /// step its one row, a verify its accepted rows, a drafted slots pass
+    /// each slot's accepted rows, a prompt call none. The
     /// caller that knows the pass's outcome says so before the next
-    /// boundary, which refuses a pass with no kept count by name; a count
-    /// with no pass open is refused here, the write side of that refusal. A
+    /// boundary, which refuses a pass with no kept rows by name; rows kept
+    /// with no pass open are refused here, the write side of that refusal. A
     /// body with no machine ignores it.
-    fn keep_rows(&mut self, kept: usize, kind: crate::host::PassKind) -> Result<(), GpuError> {
+    fn keep_rows(
+        &mut self,
+        kept: runtime::swaprule::KeptRows,
+        kind: crate::host::PassKind,
+    ) -> Result<(), GpuError> {
         let _ = (kept, kind);
         Ok(())
     }
@@ -992,7 +997,10 @@ impl<B: ChainBody> GpuModel<B> {
                 StepMode::Graph => self.replay(1, Chain::Step),
             };
             self.name_host_refusal(r)?;
-            self.keep_rows(1, crate::host::PassKind::Step)?;
+            self.keep_rows(
+                runtime::swaprule::KeptRows::prefix(1),
+                crate::host::PassKind::Step,
+            )?;
             self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
             self.stand_at(pos + 1);
         }
@@ -1038,10 +1046,14 @@ impl<B: ChainBody> GpuModel<B> {
         }
     }
 
-    /// The pass the last boundary opened keeps its first `kept` rows
+    /// The pass the last boundary opened keeps `kept` rows
     /// ([`HostServed::keep_rows`]): what its caller, which knows the pass's
     /// outcome, says before the next pass.
-    pub fn keep_rows(&mut self, kept: usize, kind: crate::host::PassKind) -> Result<(), GpuError> {
+    pub fn keep_rows(
+        &mut self,
+        kept: runtime::swaprule::KeptRows,
+        kind: crate::host::PassKind,
+    ) -> Result<(), GpuError> {
         match self.body.host() {
             Some(host) => host.keep_rows(kept, kind),
             None => Ok(()),
@@ -1191,31 +1203,43 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// A step, or a gate/debug instrument's call, on a poisoned model is
     /// refused, naming the fault — and, once the model serves more than one
-    /// slot, the slots it ran on that are not reset yet.
+    /// slot, the slots it ran on that are not reset yet. A commit of
+    /// several slots' rows that failed partway poisons the same way,
+    /// naming the slot its keep failed at.
     pub(crate) fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
-        match &self.poisoned {
-            None => Ok(()),
+        let (slots, why) = match &self.poisoned {
+            None => return Ok(()),
+            Some(p) => (&p.slots, &p.why),
+        };
+        let (is, which) = if slots.as_slice().len() == 1 {
+            ("is", "that slot")
+        } else {
+            ("are", "each of them")
+        };
+        match why {
             // The one-sequence refusal stays the load's own: no other slot
             // exists for the fault to name.
-            Some(p) if self.parked.is_empty() => Err(GpuError::Poisoned {
+            PoisonWhy::Fault(fault) if self.parked.is_empty() => Err(GpuError::Poisoned {
                 what,
-                fault: p.fault,
+                fault: *fault,
             }),
-            Some(p) => {
-                let (is, which) = if p.slots.as_slice().len() == 1 {
-                    ("is", "that slot")
-                } else {
-                    ("are", "each of them")
-                };
-                Err(GpuError::shape(
-                    what,
-                    format!(
-                        "{} {is} poisoned by an earlier device fault at {:#}; select {which} and \
-                         reset() to clear it",
-                        p.slots, p.fault
-                    ),
-                ))
-            }
+            PoisonWhy::Fault(fault) => Err(GpuError::shape(
+                what,
+                format!(
+                    "{} {is} poisoned by an earlier device fault at {fault:#}; select {which} and \
+                     reset() to clear it",
+                    slots
+                ),
+            )),
+            PoisonWhy::SlotKeep { slot, error } => Err(GpuError::shape(
+                what,
+                format!(
+                    "{} {is} poisoned by a commit of several slots' rows that failed at slot \
+                     {slot}, after the keeps before it had run ({error}); select {which} and \
+                     reset() to clear it",
+                    slots
+                ),
+            )),
         }
     }
 
@@ -1251,7 +1275,7 @@ impl<B: ChainBody> GpuModel<B> {
             *fault = fault.in_arch(B::arch());
             self.poisoned = Some(SlotFault {
                 slots,
-                fault: *fault,
+                why: PoisonWhy::Fault(*fault),
             });
         }
         Err(e)
@@ -1285,10 +1309,22 @@ impl<B: ChainBody> GpuModel<B> {
 
     /// The fault that poisons this model, if a step has read one back. The
     /// slot it was live on is the refusal's to name
-    /// ([`GpuModel::reset`] lifts the fault on that slot alone).
+    /// ([`GpuModel::reset`] lifts the fault on that slot alone). `None`
+    /// also when the poison is a commit's half-settled keep, which names no
+    /// device fault: a reader that must not continue past any poison goes
+    /// through the model's own refusal instead.
     #[must_use]
     pub fn poisoned(&self) -> Option<Fault> {
-        self.poisoned.map(|p| p.fault)
+        match &self.poisoned {
+            Some(p) => match &p.why {
+                PoisonWhy::Fault(fault) => Some(*fault),
+                // A half-settled commit names no device fault; a reader that
+                // must not continue past any poison goes through the model's
+                // own refusal instead.
+                PoisonWhy::SlotKeep { .. } => None,
+            },
+            None => None,
+        }
     }
 
     /// The head's logits of the last `step` (`n_vocab` f32). Blocking read;

@@ -353,6 +353,7 @@ mod gate {
     use refset::arch::glm5next::{BATCH, D1K, D3K_DSA, IK, IK_DSA, MODEL, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::{FfnKind, Layer, MixerKind};
+    use runtime::swaprule::KeptRows;
     use runtime::{Out, Target, Want};
 
     /// The router's experts and picks a token.
@@ -1701,7 +1702,7 @@ mod gate {
         let refused = matches!(&waiting, Err(e) if e.to_string().contains("waits for its commit"))
             && m.pos() == at;
         m.rollback(3)?;
-        m.keep_rows(2, PassKind::Pair)?;
+        m.keep_rows(KeptRows::prefix(2), PassKind::Pair)?;
         let accept_stores = same_stores(&store_digests(m)?, d3);
         let next = m.step(&toks[3..4]);
         let accept_ok = matches!(next, Ok(t) if t == graph.tokens[3])
@@ -1728,7 +1729,7 @@ mod gate {
         let row0 = m.rows_logits::<2>()?;
         let row0_ok = rows[0] == graph.tokens[1] && same_bits(&row0[0], &graph.logits[1]);
         m.rollback(2)?;
-        m.keep_rows(1, PassKind::Pair)?;
+        m.keep_rows(KeptRows::prefix(1), PassKind::Pair)?;
         let at2 = m.step(&toks[2..3]);
         let at2_ok =
             matches!(at2, Ok(t) if t == graph.tokens[2]) && logits_are(m, graph.logits.get(2));

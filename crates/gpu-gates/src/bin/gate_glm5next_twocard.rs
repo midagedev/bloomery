@@ -167,6 +167,7 @@ mod gate {
         workstation,
     };
     use refset::arch::glm5next::{D1K, IK, MODEL};
+    use runtime::swaprule::KeptRows;
     use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Want};
 
     const NAME: &str = "gate_glm5next_twocard";
@@ -513,7 +514,7 @@ mod gate {
             let [a, b] = m.rows_logits::<2>()?;
             let kept = if rows[0] == draft { 2 } else { 1 };
             m.rollback(at + u32::try_from(kept)?)?;
-            m.keep_rows(kept, PassKind::Pair)?;
+            m.keep_rows(KeptRows::prefix(kept), PassKind::Pair)?;
             leg.tokens.extend_from_slice(&rows[..kept]);
             leg.logits.push(a);
             leg.logits.push(b);

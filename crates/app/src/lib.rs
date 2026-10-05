@@ -37,6 +37,7 @@ use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
 use runtime::seqstate::Kept;
+use runtime::swaprule::KeptRows;
 use runtime::{Draft, Out, Speculative, Target, Verify, Want, Width, Widths, Window};
 
 /// What a session call failed with. Its text is the failure's own: a card
@@ -712,7 +713,8 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
             + u32::try_from(accepted)
                 .map_err(|_| SessionError::Refused(format!("{accepted} accepted rows pass u32")))?;
         self.model.rollback(back)?;
-        self.model.keep_rows(accepted, PassKind::Pair)?;
+        self.model
+            .keep_rows(KeptRows::prefix(accepted), PassKind::Pair)?;
         Ok(())
     }
 }

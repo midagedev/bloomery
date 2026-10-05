@@ -1648,8 +1648,10 @@ pub static RESIDENCY_PASS: Kind = Kind {
     head: "residency pass",
     doc: "A residency boundary: what the pass before it was (none, step, pair, slots — a pass \
           of resident slots' rows, all kept — slots_drafted — a drafted pass of resident slots' \
-          verify rows, every row counted, rejected rows included — prompt — a prompt call's \
-          rows are not counted — abandoned, or driver: the machine's own test driver), its passes since the load or the last reset, the rows the pass before it kept, the flips that went live there (late: their copies had not completed and \
+          verify rows, each slot's accepted rows kept — prompt — a prompt call's \
+          rows are not counted — abandoned, or driver: the machine's own test driver), its passes since the load or the last reset, the rows the pass before it kept (their \
+          count, and as a bit mask, bit r: row r kept — a prefix's mask \
+          for every pass but a drafted slots pass's), the flips that went live there (late: their copies had not completed and \
           the engine stream waited), the flips the rule made, the flips in flight after it, and \
           the bytes its flips copy; the host's microseconds folding the pass into the rule and in \
           the whole boundary call, of \
@@ -1661,6 +1663,7 @@ pub static RESIDENCY_PASS: Kind = Kind {
         key("pass", Word, ""),
         key("boundary", U64, ""),
         key("kept", U64, ""),
+        key("rows", U64, ""),
         key("landed", U64, ""),
         key("late", U64, ""),
         key("made", U64, ""),
@@ -2912,6 +2915,7 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .w("pass", kind.word())
         .u("boundary", r.boundary)
         .u("kept", r.kept)
+        .u("rows", r.rows)
         .u("landed", r.landed)
         .u("late", r.late)
         .u("made", r.made)

@@ -123,6 +123,7 @@ use model::arch::glm5next::place::{self, FrontWidths};
 use model::moe::UNION_MAX_COLS;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
+use runtime::swaprule::KeptRows;
 
 use super::nextn::GlmArena;
 use super::{
@@ -843,7 +844,7 @@ fn call<T>(
 ) -> Result<T, GpuError> {
     m.pass_boundary()?;
     let r = run(m);
-    let kept = m.keep_rows(0, bloomery_gpu::host::PassKind::Prompt);
+    let kept = m.keep_rows(KeptRows::prefix(0), bloomery_gpu::host::PassKind::Prompt);
     // The call's own error first: a keep refused after a failed call is its echo.
     let v = r?;
     kept?;
