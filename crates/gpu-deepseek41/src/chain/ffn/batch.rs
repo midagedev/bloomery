@@ -1713,6 +1713,15 @@ impl FfnBatch {
         hc_set(&self.hc, set)
     }
 
+    /// The last route's buffers, for a reader that runs the selection again
+    /// on the host: the router's scores ([`N_EXPERT`] a token from the
+    /// block's first) and the routed ids ([`N_USED`] a token from the
+    /// batch's token 0), which the next route rewrites.
+    #[must_use]
+    pub fn route_rows(&self) -> (&DeviceBuffer<f32>, &DeviceBuffer<u32>) {
+        (&self.probs, &self.ids)
+    }
+
     /// Of [`FfnBatch::device_bytes`], the HC_PRE results of every batch of a
     /// group.
     #[must_use]
@@ -2012,6 +2021,37 @@ pub struct BlockIo<'a> {
     pub fold_in: &'a DeviceBuffer<f32>,
 }
 
+/// A run of one kind's tokens of a block, with the bias its tokens pick
+/// with (`vl` on media tokens, `text` on the rest).
+type PickRun<'a> = (Range<usize>, &'a DeviceBuffer<f32>);
+
+/// The block `at .. u` of a batch whose tokens are media positions where
+/// `media` says so, as block-relative runs of one kind, each with the bias it
+/// picks with: `vl` on media tokens, `text` on the rest.
+fn pick_runs<'a>(
+    media: &[bool],
+    at: usize,
+    u: usize,
+    [text, vl]: [&'a DeviceBuffer<f32>; 2],
+) -> Result<Vec<PickRun<'a>>, GpuError> {
+    let flags = media.get(at..u).ok_or_else(|| GpuError::Shape {
+        what: WHAT,
+        detail: format!(
+            "the media flags of a block {at}..{u} of a batch of {} tokens",
+            media.len()
+        ),
+    })?;
+    let mut runs = Vec::new();
+    let mut from = 0;
+    for k in 1..=flags.len() {
+        if k == flags.len() || flags[k] != flags[from] {
+            runs.push((from..k, if flags[from] { vl } else { text }));
+            from = k;
+        }
+    }
+    Ok(runs)
+}
+
 /// The buffers a batch join shares with the rest of the batch: its streams
 /// and folds, the batch's tokens from 0 on — the join reads and writes the
 /// tokens it is given.
@@ -2050,8 +2090,13 @@ impl FfnPiece {
     /// The route of `bl`'s layer for the block `io` of a batch: per chunk the
     /// norm with its q8_1 form; then, over the block's tokens, the router
     /// ([`RouterKernels::enqueue_router_rows`], two launches) and each slot's
-    /// place from `slots`, the map's card copy (one launch). Asynchronous,
-    /// allocation-free.
+    /// place from `slots`, the map's card copy (one launch). With `vl`, a
+    /// media call's — the layer's `exp_probs_b_vl` row, and per token of the
+    /// batch whether it is a media position — the block's media tokens pick
+    /// with that bias: the router's scores once over the block, then a pick
+    /// launch per run of tokens of one kind
+    /// ([`RouterKernels::enqueue_router_rows_runs`]). Returns the router's
+    /// pick launches. Asynchronous, allocation-free without `vl`.
     pub fn enqueue_batch_route(
         &mut self,
         gpu: &Gpu,
@@ -2059,7 +2104,8 @@ impl FfnPiece {
         b: &mut FfnBatch,
         io: &BlockIo<'_>,
         slots: &DeviceTensor<u32>,
-    ) -> Result<(), GpuError> {
+        vl: Option<(&DeviceBuffer<f32>, &[bool])>,
+    ) -> Result<usize, GpuError> {
         let (layer, lw) = (bl.layer, &bl.lw);
         let (i, at, u) = self.batch_block(layer, b, io)?;
         let (stream, n) = (gpu.stream(), self.n_embd);
@@ -2089,16 +2135,29 @@ impl FfnPiece {
             )?;
         }
         let t = u - at;
-        {
+        let picks = {
             let x = span(WHAT, &b.x, at * n, t * n)?;
             let mut probs = span_mut(WHAT, &mut b.probs, 0, t * N_EXPERT)?;
             let mut ids = span_mut(WHAT, &mut b.ids, at * N_USED, t * N_USED)?;
             let mut wts = span_mut(WHAT, &mut b.weights, at * N_USED, t * N_USED)?;
-            self.router.enqueue_router_rows(
-                stream, lw.router, &x, lw.bias, self.scale, t, &mut probs, &mut ids, &mut wts,
-                fault,
-            )?;
-        }
+            match vl {
+                None => {
+                    self.router.enqueue_router_rows(
+                        stream, lw.router, &x, lw.bias, self.scale, t, &mut probs, &mut ids,
+                        &mut wts, fault,
+                    )?;
+                    1
+                }
+                Some((vl, media)) => {
+                    let runs = pick_runs(media, at, u, [lw.bias, vl])?;
+                    self.router.enqueue_router_rows_runs(
+                        stream, lw.router, &x, self.scale, t, &runs, &mut probs, &mut ids,
+                        &mut wts, fault,
+                    )?;
+                    runs.len()
+                }
+            }
+        };
         let slots_n = t * N_USED;
         let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
         let mut sel = span_mut(WHAT, &mut b.sel, at * N_USED, slots_n)?;
@@ -2109,7 +2168,8 @@ impl FfnPiece {
             row_off: c.row_off,
             n_expert: self.n_expert,
         };
-        b.kernels.enqueue_places(stream, &places, fault, &mut sel)
+        b.kernels.enqueue_places(stream, &places, fault, &mut sel)?;
+        Ok(picks)
     }
 
     /// The expert tier's places of the block `io`'s slots, after the batch's

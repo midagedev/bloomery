@@ -142,6 +142,15 @@ pub fn exp_probs_b(block: usize) -> String {
     format!("blk.{block}.exp_probs_b.bias")
 }
 
+/// `blk.{block}.exp_probs_b_vl.bias` — the selection bias a media (vision)
+/// position picks its experts with in place of [`exp_probs_b`]'s (the
+/// reference's `Gate.bias_vl`). Its role is `Role::Unread` ([`super::roles`]):
+/// the text plan leaves it in the file, and the media load reads it by this
+/// name.
+pub fn exp_probs_b_vl(block: usize) -> String {
+    format!("blk.{block}.exp_probs_b_vl.bias")
+}
+
 /// `blk.{block}.ffn_gate_exps.weight` — the routed experts' gate stack.
 pub fn ffn_gate_exps(block: usize) -> String {
     format!("blk.{block}.ffn_gate_exps.weight")

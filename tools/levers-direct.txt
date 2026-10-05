@@ -33,6 +33,7 @@ crates/gpu-gates/src/lib.rs	BLOOMERY_REF_CUDA,BLOOMERY_REF_SET	gatestoml
 crates/gpu-gates/src/kld.rs	BLOOMERY_KLD_FILE	gatestoml
 crates/gpu-gates/src/bin/gate_block.rs	BLOOMERY_REF_CPU_SET	gatestoml
 crates/gpu-gates/src/bin/gate_vision_encoder.rs	BLOOMERY_VISION_SET	gatestoml
+crates/gpu-gates/src/bin/gate_ds41_media.rs	BLOOMERY_VISION_SET	gatestoml
 # Runner handshakes (audit TL-7).
 crates/model/src/bin/bench_v41_host.rs	BLOOMERY_HOST_LEASE	TL-7
 crates/engram-lab/src/bin/engram-rate.rs	BLOOMERY_ENGRAM_LEASE	TL-7
