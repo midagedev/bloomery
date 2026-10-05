@@ -1,0 +1,93 @@
+# Round glmslots' residency-on card, the lead's pick for the sitting: the same plain 2-slot pass
+# (BLOOMERY_GEN_SLOTS=2) against its plain 1-slot twin, one binary, A6000, plan (a), decode at depth 6, both arms at
+# BLOOMERY_RESIDENCY=mid-p0-s1, the GLM seat's serving default. The GLM plain pass lays one or two slots, a row a slot
+# (gpu-glm5next/src/pair.rs refuse_slots, slot_lanes(2)): N = 2 is the only aggregate; BLOOMERY_GEN_SLOTS=3 and 4 are
+# refused by name before the load. The runner's slots residency clause reads the aggregate arm's passes off the
+# residency's records (none/0, prompt/0 a slot, then slots/2 a round), which this round's box run (g) passes.
+#
+# Why noninf, not ab: glmslots-ab.card's residency-off derivation (S1, R2, the plan term) holds, but two functional
+# runs (g) and (h) of this pair under the residency put the 2-slot arm's early rounds far past it, by a term the
+# records do not carry. Their residency pass records, round by round [measured counts, the engine's own records;
+# the walls are functional, contended, not admissible, quoted only to place the term]:
+#   the rule's cadence is the same in both arms: a make boundary every 4 (11 or 22 flips first, then 24, 365 MB),
+#     staged over the next pass, landed at the one after; made 563 against 574;
+#   rounds 1..3 of the 2-slot arm carry no landing and round 1 no flip at all (made, landed, in_flight 0), yet ran
+#     134, 112, 105 ms (h) and 158, 217, 128 ms (g) against the residency-off round's 64..68 ms (run a); the twin's
+#     round 1 ran 62 ms (h) and 47 ms (g) against S1 47.7;
+#   the same process's per-slot prompt call (6 ids, one batch, no flip) ran 416/357 ms (h) and 760/632 ms (g),
+#     against 230/224 ms in the residency-off 2-slot process and 302 and 249 ms in the twins; its load took 43.7 s and
+#     52.6 s against 20.7..27.2 s in the residency-off and twin processes;
+#   the late flips (27 and 45) and the host's waits for staging (41.5 and 62.7 ms over 95 rounds) sit at rounds
+#     8..28 and cost at most the wait plus each late flip's copy (15.2 MB at 26 GB/s, 0.58 ms): 57..89 ms a run,
+#     0.6..0.9 ms a round [derived]; rounds 1..10 hold 5.4 ms (h) and 13.6 ms (g) of it against an excess of 485 and
+#     667 ms over the residency-off round;
+#   the copy stream carries 365 MB, 14.0 ms at 26 GB/s, in the two passes between a make and its landing (210..245 ms
+#     in the 2-slot arm's early rounds, 110 ms in the twin's): under 13 % busy in either arm [derived].
+#   So neither a late copy nor a landing against the captured slots pass carries the early rounds: the excess is
+#   process-wide and opens before the first flip and before the slots pass is captured (the load, the prompt calls,
+#   round 1). Both 2-slot runs were the first process of their pair, run (h)'s beside a peer's bloomery-serve and a
+#   rustc at ~99 % CPU each, with kswapd and memory pressure (psi some avg10 3.98) after it: first suspect, not
+#   asserted, the host page state, its experts faulting back in as each round first touches them. The field that
+#   names it is the process's major faults over the timed window, which this runner's rows carry (majflt, [cold]).
+# Decomposition of the sat ratio r = 2 T / R, T the twin's mean step and R the 2-slot arm's mean round over the 95
+#   rounds:
+#   T: S1 47.7 ms at round 1 [measured: rig-log 09-28#glm-release], run (g)'s twin 47.4 ms there, then the
+#     residency's gain to 31.5..34 ms by rounds 86..95 [functional, both twins]: T = 38..46 ms [derived from the
+#     twins' 39.2 and 45.5 ms means and glmres-ab.card's 2.4..5.1 ms gain at its round count].
+#   R if the excess is the host page state (H1, the sitting's preheat and warm-up process clearing it): the
+#     residency-off round 64.8..71.3 ms (glmslots-ab.card; run (a) 66.3 ms) less the 2-slot residency gain, 0..5 ms on
+#     the mean (run (h)'s rounds 86..95 at 64.3 ms, its rounds 91..95 at 56.5..62.8 ms: the union of two windows'
+#     routes takes the same flips a pass as the twin's one window, so it gains less) plus the boundary's host calls,
+#     under 0.2 ms a round: R = 60..71 ms; r = 2 x 38 / 71 .. 2 x 46 / 60: +7..+53 %.
+#   If the excess is an engine term (H2): r as the functional runs read it, 2 x 39.16 / 84.39 = -7.2 % (g) and
+#     2 x 45.48 / 82.33 = +10.5 % (h).
+#   The band covers both: -8..+53 %.
+# The margin from the ruler: h_p = t(0.975, N - 1) x 0.6 x sqrt(2 / N) is 7.62 % at 2 rounds, 2.11 at 3, 1.35 at 4,
+#   0.89 at 6, and card.py wants lo - h_p > -M: with lo = -8, M = 16 at 2 rounds, 11 at 3, 10 at 4, 9 at 6. The
+#   sitting's window takes 4 rounds (wall below): M = 10 %.
+# The floor M holds at: the verdict passes when the per-round ratios' mean less their half-interval is above 0.90,
+#   so at the ruler's 1.35 % the mean ratio must reach 0.9135: the 2-slot aggregate at least 0.9135 of the twin's
+#   tok/s, its mean round under 2.19 twin steps. With T at 38..46 ms (21.7..26.3 tok/s) that is an aggregate floor of
+#   19.9..24.0 tok/s and a mean round under 83..101 ms. Run (g)'s 84.4 ms round over its 39.2 ms twin (ratio 0.928)
+#   clears it by 1.4 %; a measured half-interval past 2.8 % (a per-round ratio SD past 1.76 % at 4 rounds) would
+#   sink it.
+# Resource timeline (N = 2) [derived]: as glmslots-ab.card's, the host leg the wall (63..70 ms a round off the
+#   residency, falling as flips land), the card's two fronts under it; plus the residency's staging, 8.6..8.7 GB a run
+#   through host DRAM on its own thread (stage 18..37 ms a make in both arms), and its copies on PCIe, under 13 % of
+#   the copy stream; NVMe 0 when the host set is resident (the preheat), and the early excess's suspect when not.
+#
+# Sitting: the lead's, after the go, one lease run of 4 rounds:
+#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmslots-res.card' just depth-gpu-glm5next \
+#     6@BLOOMERY_RESIDENCY=mid-p0-s1 6@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=mid-p0-s1 > <log> 2>&1
+# The verdict reads `ratio slots d=6 ours@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=mid-p0-s1/ours@BLOOMERY_RESIDENCY=
+# mid-p0-s1`'s per-round list (python3 tools/ref/card.py verdict docs/cards/glmslots-res.card <the list>): the
+# 2-slot arm is the changed one. Check: python3 tools/ref/card.py check docs/cards/glmslots-res.card --rounds 4.
+# Wall [derived]: 10 processes (each arm's warm-up, then 4 rounds x 2 arms), 1.0..1.5 min each at run (a)'s loads
+# and 95 rounds of 40..85 ms: 10..15 min.
+kind: noninf
+question: under the seat's residency (mid-p0-s1), does the plain 2-slot pass's aggregate lose no more than 10 % to one
+  stream, where two functional runs put its early rounds past the residency-off round by a term opening before the
+  first flip?
+term: ratio slots d=6, the 2-slot arm's tok/s(aggregate) over its plain twin's tok/s(mean) @ n=96, depth 6 (a 6-id
+  prose window a slot, 12 fed ids), A6000, plan (a), BLOOMERY_RESIDENCY=mid-p0-s1 on both arms, ctx 2048, same
+  binary, paired by round
+unit: %
+predict: -8..+53
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+margin: 10.0 % at a 10 % loss two users each get 0.45 of one stream's rate at once, against 0.5 each served in turns
+  with the other's turn as a stall; past it the turns serve better and the seat keeps them
+condition: one binary, every arm its own process in the run's one lease, one lease run of 4 rounds; no FAIL row (the
+  runner's slots clauses: counted kind=slots records of 2 positions, the slots residency clause after the seed's
+  none/0, no kind=slots record in the twin's row); no row [cold], [cpu-busy] or [other-busy]; every row's majflt and
+  its first10_p50 against its last10_p50 read beside the ratio (the 2-slot row's residency column reads passes 0:
+  cold-blocks.sh res_sums counts step and pair passes only); the full output to a file first
+decide-in: the verdict passes: keep mid-p0-s1 for the seat's two-slot rows; then the 2-slot rows' first10_p50 says
+  which hypothesis held: within ~5 ms of their last10_p50 plus the residency's gain (no 100 ms rounds) closes the
+  early excess as the host page state; 100 ms rounds again on a quiet machine open the diagnosis round on the
+  engine term
+decide-below: the verdict fails: the seat serves two users in turns under its residency; the diagnosis round comes
+  first, with one nsys window of the 2-slot arm's first 10 rounds against its last 10 and the process's majflt over
+  each
+decide-above: r past +53: the residency serves two windows better than its derivation allows; re-derive the 2-slot
+  gain from the run's residency pass records (made, landed, late a round) before any seat default

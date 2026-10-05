@@ -1,0 +1,71 @@
+# Round glmslots' card, for the lead to sit: GLM-5.3-Flash's plain 2-slot pass (BLOOMERY_GEN_SLOTS=2,
+# generate_glm5next's arm of this round) against its plain 1-slot twin, one binary, A6000, plan (a), decode at depth
+# 6 (a 6-id prose window a slot), both arms with the residency off (generate_glm5next's unset). The GLM body's plain
+# pass lays one or two slots, a row a slot (gpu-glm5next/src/pair.rs refuse_slots; SlotRows::MAX_ROWS 4 is a NextN
+# load's two slots of two verify rows): N = 2 is the only aggregate. Its residency-on twin is glmslots-res.card.
+#
+# Prerequisite, met at 0bf691d4 (line2's tools/ref/slots-arm.sh): the runner's slots residency clause passes an
+# aggregate arm with no residency record, its passes pinned by its `time pass … kind=slots` records alone. The stub's
+# slots-res-off case holds it for this runner (a ROW, rc 0; red on the slots-arm.sh before it), and this round's box
+# run (a)'s residency-off 2-slot output passes the runner's readers (slots_count rc 0 over 15 rounds of 2 positions,
+# slots_residency rc 0).
+#
+# Decomposition, one decode pass (A6000, plan (a), prose ids from GLM_PROSE_FROM):
+#   S1, the plain step: 47.7 ms [measured: rig-log 09-28#glm-release, 20.95 tok/s @ depth 512; 48.3 ms, 20.72 tok/s
+#     @ P 512 n=8, rig-log 10-01#glmpp-depth]. S1 = C1 + F + h: the host leg h 29.6..31.4 ms (4,055 MB a row at
+#     129..137 GB/s), the host's fixed cost F 2.5..3.5 ms, the card front C1 the rest, 12.8..15.6 ms
+#     (glmpair-probe.card's corrected terms) [derived]. Depth 6 against 512: the attention term is under 0.1 ms
+#     (glmslots-deep.card: 0.52 ms from P 512 to 4096) [derived].
+#   R2, the round: a plain pass of two slots, a row a slot, is the walk's pair point (runtime::sched::slot_lanes(2):
+#     2 units of 1 column on the step port; gpu-glm5next/src/program.rs slots_point), the chain the two-row verify
+#     runs, and the row-to-slot binding is pointer moves (gpu-glm5next/src/pair.rs binding, exchange). So
+#     glmpair-probe.card's derivation carries: per MoE layer the host serves both rows' legs while the card runs both
+#     fronts under them, R2 = (1 + rho) h + 2F + edge, edge 1.5 ms. rho is the second row's host bytes that miss the
+#     first row's reads: 0.93..1.0 for one sequence's two rows (0.288 of its bytes shared, 0.119 CCD-local); two
+#     windows of unrelated prose share fewer, 0.97..1.0 [derived]. R2 = 1.97 x 29.6 + 5.0 + 1.5 = 64.8 ..
+#     2.0 x 31.4 + 7.0 + 1.5 = 71.3 ms, R2/S1 = 1.36..1.50.
+#   The plan term: the 2-slot load plans two resident sequences (app::arch::glm5next::open_resident_slots,
+#     PlanInputs::plan_slots at one KDA lane), the twin one: card_experts 2581 against 2596 at ctx 2048, host_experts
+#     9515 against 9500 [measured at load: the two plan records of this round's box run (a)]. 15 more host experts of
+#     9,500 move h by at most +0.16 %, 0.05 ms [derived]: inside the band's slack.
+#   The ratio r = 2 S1 / R2 = 2 / (R2/S1) = 2 / 1.50 .. 2 / 1.36: +34..+47 %.
+# Resource timeline of the round (N = 2) [derived]: host CPU, the two rows' host legs and fixed costs, 63..70 ms of
+#   the 64.8..71.3 (the wall); card SMs, the two fronts, 25.6..31.2 ms under it; PCIe, a row's activations each way,
+#   under 0.1 ms; host DRAM, the union's expert bytes 8.0..8.1 GB at 129..137 GB/s (the host leg itself); NVMe 0 (the
+#   host set populated at load, preheated). The wall is the host's: the second stream adds its own host leg, the card's
+#   fronts ride under it. The arm changes nothing but the slot count: no flow lever is in play.
+# The term this derivation cannot close: rho for two windows (no route trace of two windows) — the sitting reads it
+#   with the ratio.
+#
+# Sitting: the lead's, after the go, as two lease runs of 2 rounds each:
+#   BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmslots-ab.card' just depth-gpu-glm5next \
+#     6 6@BLOOMERY_GEN_SLOTS=2 > <log> 2>&1
+# The runner reads the 2-slot arm as the aggregate row (`ours@BLOOMERY_GEN_SLOTS=2`, fed GLM_PROSE ids 50000..50011,
+# slot 0 the twin's 6) and prints `ratio slots d=6 ours@BLOOMERY_GEN_SLOTS=2/ours`. Check at that count:
+# python3 tools/ref/card.py check docs/cards/glmslots-ab.card --rounds 2 (±2.6 % at 2 rounds; the two runs' rounds
+# read together are 4, ±1.0 %).
+# Wall per run [derived]: 6 processes (each arm's warm-up, then 2 rounds x 2 arms), each a load (20.7..25.0 s in this
+# round's box run (a)), the preheat of GLM_PREHEAT_K's 186 GB host set from the page cache, a 6-id prompt (0.2 s)
+# and 95 passes (4.5..6.8 s): 1.0..1.5 min a process, 6..9 min a run.
+kind: ab
+question: does the plain 2-slot pass decode two GLM-5.3-Flash streams at the pair chain's rate, its round the
+  verify's wall (glmpair-probe's V2)?
+term: ratio slots d=6, the 2-slot arm's tok/s(aggregate) over its plain twin's tok/s(mean) @ n=96, depth 6 (a 6-id
+  prose window a slot, 12 fed ids), A6000, plan (a), residency off on both arms, ctx 2048, same binary, paired by
+  round
+unit: %
+predict: +34..+47
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, every arm its own process in its run's one lease, two lease runs of 2 rounds; no FAIL row (the
+  runner's slots clauses: counted kind=slots records of 2 positions, no kind=slots record in the twin's row, and the
+  slots residency clause passing an arm with no residency record); no row [cold],
+  [cpu-busy] or [other-busy]; the full output to a file first. Not checked inside the rounds: each slot's ids bit for
+  bit its window's alone run's on an equal plan, which this round's box runs (a) and (c) hold
+decide-in: land the arm, sit glmslots-deep.card next, and write the slots row into rig-log as GLM's first aggregate
+  decode row; then the residency-on twin (glmslots-res.card) prices what the seat's residency takes from it
+decide-below: the round pays more than the verify's derivation: read its time pass ms against glmpair-probe's V2
+  band, then one nsys window of the pass (the binding's exchanges, the two heads' readback, the host legs against
+  the card fronts) before any serve-side concurrency round
+decide-above: r past +47 says the two windows' routed sets share more than rho's band allows: re-derive rho from two
+  windows' route traces before believing the aggregate row
