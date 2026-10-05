@@ -173,6 +173,28 @@
 //!   drafted row lends no logits row). Mutant: the seat running a NextN
 //!   load's step round as one pass — the body refuses it by name, the
 //!   server dies, and the sampled clauses go red.
+//! - then on the same server the drafted round's skip path
+//!   ([`slots_skipping`]): a slot whose draft skips steps alone beside a
+//!   drafting one. The first turn greedy leaves its slot holding the turn
+//!   and its reply, the draft's waiting rows at the reply's end; a request
+//!   that carries the turn with [`STRIPPED_A`] in place of the reply (greedy,
+//!   `cache_prompt` on) keeps the checkpoint the turn's prompt call took at
+//!   its end and its prompt call starts there, where the waiting rows do not
+//!   end — the draft skips, its `mtp prompt` record naming why, and the
+//!   request steps plainly (no draft counts). Run alone first; then both
+//!   slots dropped, the history built again and the second turn run alone
+//!   (`cache_prompt` off — a resend of it with the cache on would cut its own
+//!   held end the same way and skip too), and the two posted at once: both
+//!   answer, each request's ids — the drafting one's counts too — its alone
+//!   run's, the skipping request keeping the turn's end (`cache_n` the turn
+//!   less one), and the seat turns the skipping slot off before each one-pass
+//!   round (its own `mtp prompt` record naming why), every `cmd=pass` record
+//!   of the together window reading `slots=2`, `rows=2` and `passes=2` — the
+//!   off slot's plain pass beside the drafting slot's window, where a round
+//!   of two drafting slots runs one pass. Mutant: the seat not turning a
+//!   skipping slot off — the slot joins the pass as its one plain row, which
+//!   the body's NextN pass of several slots refuses by name, the server dies
+//!   and the clause goes red.
 //! - against the CLI under the same levers: the ids agree, all of them or a
 //!   prefix ending in the end-of-generation id — the CLI takes the server's
 //!   cut (`--last-step`), so both run the same batches, count the rule's
@@ -306,6 +328,12 @@ mod gate {
     const TURN_C: &str = "List the planets of the solar system in order from the Sun and say \
                           which of them is the largest.";
     const LATER_C: &str = "And which of them has the most moons?";
+    /// The skipping clause's halves of the `mtp prompt` records that name a
+    /// skip: why the draft skips at a prompt call that cut the held sequence
+    /// (the join's reason, `app::mtp`'s), and why the seat turns such a slot
+    /// off before a round of one pass (`serve_seats::glm`'s turn-off why).
+    const SKIP_AT_JOIN: &str = "do not end at the call's first position";
+    const SKIP_TURNED_OFF: &str = "a NextN pass of several slots takes each slot's whole verify";
     /// The drafted arm's residency word: no seed expert pinned, one spare a
     /// layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
@@ -1160,11 +1188,13 @@ mod gate {
         Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
     }
 
-    /// The slot dropped and not saved (`POST /slots/0?action=erase`): the
-    /// prompt cache keeps what it held, and nothing more.
-    fn erase(url: &dyn Fn(&str) -> String) -> Result<(), GateError> {
-        let (st, body) = curl(&url("/slots/0?action=erase"), Some(&json!({})), false)?;
-        json_of("/slots/0?action=erase", st, &body)?;
+    /// The slot `slot` dropped and not saved (`POST
+    /// /slots/<slot>?action=erase`): the prompt cache keeps what it held, and
+    /// nothing more.
+    fn erase(url: &dyn Fn(&str) -> String, slot: usize) -> Result<(), GateError> {
+        let at = format!("/slots/{slot}?action=erase");
+        let (st, body) = curl(&url(&at), Some(&json!({})), false)?;
+        json_of(&at, st, &body)?;
         Ok(())
     }
 
@@ -1280,7 +1310,7 @@ mod gate {
         let resend = with(&p1, &r1.tokens, &later);
         let r2 = Turn::run(url, err_log, &resend, true)?;
         r2.show(&format!("cache {label}: A resent, no switch"));
-        erase(url)?;
+        erase(url, 0)?;
         let a1 = Turn::run(url, err_log, &p1, false)?;
         a1.show(&format!("cache {label}: A's turn fresh again"));
         let b1 = Turn::run(url, err_log, &pb, true)?;
@@ -1331,11 +1361,11 @@ mod gate {
             .into());
         }
         let strip = with(&p1, &stripped, &[]);
-        erase(url)?;
+        erase(url, 0)?;
         let c1 = Turn::run(url, err_log, &p1, false)?;
         let s1 = Turn::run(url, err_log, &strip, true)?;
         s1.show(&format!("cache {label}: A's turn replaced, no switch"));
-        erase(url)?;
+        erase(url, 0)?;
         let c2 = Turn::run(url, err_log, &p1, false)?;
         let b2 = Turn::run(url, err_log, &pb, true)?;
         let s2 = Turn::run(url, err_log, &strip, true)?;
@@ -1374,7 +1404,7 @@ mod gate {
     /// rule alone (llama-server's `f_keep < 0.5`), which saves the state
     /// here.
     fn round_trip(url: &dyn Fn(&str) -> String, err_log: &Path) -> Result<bool, GateError> {
-        erase(url)?;
+        erase(url, 0)?;
         let first = json!([{ "role": "user", "content": TURN_C }]);
         let p1 = rendered(url, first.clone())?;
         // Past the prompt less one, so the slot then holds more than twice
@@ -1680,6 +1710,7 @@ mod gate {
         print_rounds("slots", &window, &pass_rounds);
         check(&mut ok, "slots_pass_rounds_run_one_pass", one_pass);
         ok &= slots_sampled(&url, &err_log, [&a_ids, &c_ids], &alone[0])?;
+        ok &= slots_skipping(&url, &err_log, [&a_ids, &c_ids])?;
         println!("slots server stopped: {}", served.stop()?);
         Ok(ok)
     }
@@ -1796,6 +1827,152 @@ mod gate {
         Ok(ok)
     }
 
+    /// The (s5) skipping clause (the module header): a slot whose draft skips
+    /// steps alone beside a drafting one. `ids[0]` greedy leaves its slot
+    /// holding the turn and its reply, the draft's waiting rows at the
+    /// reply's end; the strip — that prompt with [`STRIPPED_A`] in place of
+    /// the reply, `cache_prompt` on — keeps the checkpoint the turn's prompt
+    /// call took at its end and its prompt call starts there, where the
+    /// waiting rows do not end, so the draft skips and the request steps
+    /// plainly. The strip alone first; then both slots dropped (a dropped
+    /// slot saves no state the together strip could take back in place of
+    /// the cut), the history built again, the second turn `ids[1]` run alone
+    /// on the other slot (`cache_prompt` off: a resend of it with the cache
+    /// on would cut its own held end the same way and skip too), and the
+    /// strip beside that turn posted at once: the seat turns the skipping
+    /// slot off before each one-pass round, the round running its plain pass
+    /// beside the drafting slot's window, and each request's ids — the
+    /// drafting one's counts too — are its alone run's. Mutant: the seat not
+    /// turning a skipping slot off — the slot joins the pass as its one
+    /// plain row, which the body's NextN pass of several slots refuses by
+    /// name, the server dies and this clause goes red.
+    fn slots_skipping(
+        url: &dyn Fn(&str) -> String,
+        err_log: &Path,
+        ids: [&[u32]; 2],
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let stripped = tokenized(url, STRIPPED_A)?;
+        let strip: Vec<u32> = ids[0].iter().chain(&stripped).copied().collect();
+        // The fixture: the first turn's reply greedy to the limit, and the
+        // replacement text parting at the reply, so the strip shares exactly
+        // the turn and cuts to its prompt call's end.
+        let first = greedy(url, ids[0], SLOTS_PREDICT, false)?;
+        let reply = ids_of(&first["tokens"]);
+        let stopped = first["stop_type"].as_str().unwrap_or("");
+        if stopped != "limit" || reply.len() != SLOTS_PREDICT {
+            return Err(format!(
+                "the skipping clause's first turn stopped at {} tokens ({stopped}): the clause \
+                 needs {SLOTS_PREDICT}",
+                reply.len()
+            )
+            .into());
+        }
+        if stripped.first() == reply.first() {
+            return Err(format!(
+                "the replacement text's first id {:?} is the reply's: the strip would carry the \
+                 reply's start, not part at the turn",
+                stripped.first()
+            )
+            .into());
+        }
+        let turn_end = ids[0].len() as u64 - 1;
+        let plain = |v: &Value| v["timings"].get("draft_n").is_none();
+        let cache_n = |v: &Value| v["timings"]["cache_n"].as_u64();
+        let run_of = |v: &Value| {
+            (
+                ids_of(&v["tokens"]),
+                v["timings"]["draft_n"].as_u64().unwrap_or(0),
+                v["timings"]["draft_n_accepted"].as_u64().unwrap_or(0),
+            )
+        };
+        // The `mtp prompt` records of `lines` that say the draft skips, their
+        // `skipped` texts.
+        let skips_of = |lines: &[String]| -> Result<Vec<String>, GateError> {
+            seat_log(lines)
+                .all(&record::MTP_PROMPT)?
+                .iter()
+                .filter(|f| f.text("skipped").is_ok_and(|s| s != "none"))
+                .map(|f| Ok(f.text("skipped")?.to_owned()))
+                .collect()
+        };
+        // The strip alone on that history: the checkpoint the turn's prompt
+        // call took at its end kept, the draft skipping from its prompt call
+        // (its rounds one request's, a select and a plain pass, printing no
+        // round record and no turn-off record).
+        let from = lines_from(err_log, 0)?.len();
+        let alone = greedy(url, &strip, SLOTS_PREDICT, true)?;
+        let alone_ids = ids_of(&alone["tokens"]);
+        let alone_skips = skips_of(&lines_from(err_log, from)?)?;
+        println!(
+            "slots skipping: the strip alone {} ids ({}) cache_n {:?} (the turn's end \
+             {turn_end}) draft_n {}, skips {alone_skips:?}",
+            alone_ids.len(),
+            alone["stop_type"].as_str().unwrap_or(""),
+            cache_n(&alone),
+            alone["timings"]["draft_n"],
+        );
+        // The history again and the fresh drafting turn alone; then both at
+        // once, the strip's slot the one holding the history (the prefix it
+        // shares) and the turn's the other.
+        erase(url, 0)?;
+        erase(url, 1)?;
+        greedy(url, ids[0], SLOTS_PREDICT, false)?;
+        let turn_alone = run_of(&greedy(url, ids[1], SLOTS_PREDICT, false)?);
+        let before = round_count(err_log)?;
+        let from = lines_from(err_log, 0)?.len();
+        let together = both_at_once(
+            url,
+            [strip_body(&strip), greedy_body(ids[1])],
+            ["slots strip", "slots drafting turn"],
+        )?;
+        let window = rounds_from(err_log, before)?;
+        let passes = of_cmd(&window, "pass");
+        let skips = skips_of(&lines_from(err_log, from)?)?;
+        let strip_at = together[0].as_ref();
+        let turn_at = together[1].as_ref();
+        let strip_ids = strip_at.map(|v| ids_of(&v["tokens"]));
+        println!(
+            "slots skipping: together the strip {:?} ids cache_n {:?} draft_n {}, the turn (ids, \
+             drafts, accepted) {:?} of alone {turn_alone:?}; skips {skips:?}",
+            strip_ids.as_ref().map(Vec::len),
+            strip_at.and_then(cache_n),
+            strip_at
+                .map(|v| v["timings"]["draft_n"].as_u64().unwrap_or(0))
+                .unwrap_or(0),
+            turn_at.map(run_of),
+        );
+        print_rounds("slots skipping", &window, &passes);
+        check(
+            &mut ok,
+            "slots_skipping_slot_steps_alone_beside_a_drafting_one",
+            !alone_ids.is_empty()
+                && alone_skips.iter().any(|s| s.contains(SKIP_AT_JOIN))
+                && plain(&alone)
+                && cache_n(&alone) == Some(turn_end)
+                && strip_ids.as_deref() == Some(alone_ids.as_slice())
+                && strip_at.is_some_and(plain)
+                && strip_at.and_then(cache_n) == Some(turn_end)
+                && turn_at.map(run_of).as_ref() == Some(&turn_alone)
+                && turn_alone.1 > 0,
+        );
+        check(
+            &mut ok,
+            "slots_skipping_rounds_step_the_off_slot_alone",
+            !passes.is_empty()
+                && passes.iter().all(|r| {
+                    r.u64("rows") == Ok(2) && r.u64("slots") == Ok(2) && r.u64("passes") == Ok(2)
+                }),
+        );
+        check(
+            &mut ok,
+            "slots_skipping_records_name_the_skip_and_the_turn_off",
+            skips.iter().any(|s| s.contains(SKIP_AT_JOIN))
+                && skips.iter().any(|s| s.contains(SKIP_TURNED_OFF)),
+        );
+        Ok(ok)
+    }
+
     /// A greedy `/completion` body of `ids`: [`SLOTS_PREDICT`] tokens at
     /// temperature 0, `cache_prompt` off.
     fn greedy_body(ids: &[u32]) -> Value {
@@ -1812,6 +1989,17 @@ mod gate {
         json!({
             "prompt": ids, "n_predict": SLOTS_PREDICT, "temperature": 0.8, "top_k": 40,
             "seed": seed, "return_tokens": true, "cache_prompt": false,
+        })
+    }
+
+    /// The skipping clause's request of `ids` (the first turn's prompt with
+    /// [`STRIPPED_A`] in place of its reply): greedy, `cache_prompt` on — the
+    /// request that keeps the turn's prompt call's end, where the draft's
+    /// waiting rows do not end, and so skips.
+    fn strip_body(ids: &[u32]) -> Value {
+        json!({
+            "prompt": ids, "n_predict": SLOTS_PREDICT, "temperature": 0,
+            "return_tokens": true, "cache_prompt": true,
         })
     }
 
