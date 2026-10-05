@@ -1,0 +1,59 @@
+# Round slotbench41 (multiseq2 T2 for V4.1): two V4.1 streams decoded in one pass (BLOOMERY_GEN_SLOTS=2, the
+# stagger's pair of two slots, `GpuModel::step_slots`) against one stream, same binary, A6000, plan (a), the default
+# residency (unset: mid-p40-s1 under --place a), prose:512 then 96 tokens.
+#
+# [derived] (design ~/.claude/projects/-Users-hckim-repo-bloomery/specs/multiseq2/design/multistream-stagger.md §2.1,
+# §5.2):
+#   one stream: 43.3 tok/s [measured, rig-log 2026-09-30#callstream-pp-a, decode after prose 512]: step 23.09 ms =
+#     D 11.22 (card) + H 11.87 (host leg), the card's shadow S 4.2-5.5 under H.
+#   N = 2, the pair of two slots: card 2(D + S) = 30.8-33.4 ms, host 2 × 11.87 × 1.16 = 27.5 ms (two slots sharing
+#     the host pool), work bound 31.4 + fill 0.5 -> ceiling 58-64 tok/s. With the 09-25 pair's per-layer excess the
+#     round is 36.5-37.2 ms (53.8-54.8 tok/s); twoeng's C_p + 2H is 38.7 ms (51.7). Band 51-55 tok/s = ×1.18-1.27.
+#   Resource timeline of the round (N = 2): the card's serial chain 31.4 ms (85 % of the round), the host leg 27.5
+#     (75 %), host DRAM 24.6 (67 %), card DRAM 18.8 (51 %), PCIe < 3 async. The wall is the per-layer max: a
+#     latency-bound pass, no byte lever in play; the arm changes nothing but the slot count.
+#   The one term the arm adds beside the slot count: its load plans two resident sequences
+#     (PlanInputs::plan_with_slots), the plain arm one. The second sequence's card stores at ctx_max 32,768 are
+#     ~110 MB (docs/v41-placement.md §4: 110,125,056 B a sequence), 6-7 card experts of ~16.8 MB at the plan's
+#     budget, ≤ 0.3 % of the card's ~2,668; they move the host leg by < 0.1 ms a round [derived], inside the band's
+#     slack. Its ring shadows, 32,768 × 512 × 2 B × 40 layers = 1.34 GB, are page-locked host bytes off the host
+#     headroom, no time term. The `plan` record of each arm prints its card_experts.
+# Effect = (two-slot aggregate − one stream) / one stream: +18..+27 %.
+#
+# The runner's line is `ratio slots d=512 prose@BLOOMERY_GEN_SLOTS=2/prose`: per round the 2-slot arm's
+# tok/s(aggregate) (Σ positions · 1000 / Σ ms over its counted `time pass … kind=slots` records) over the plain arm's
+# tok/s(mean). The 2-slot arm feeds the corpus's first 1,024 ids: slot 0 holds exactly the plain arm's 512 (a prefix
+# of one fixed file), slot 1 the next 512. The runner fails the 2-slot row on no counted kind=slots record, one whose
+# positions is not 2, and the slots residency clause (after the seed's none/0: only pass=prompt kept=0, at least one
+# a slot, up to the first pass=slots, then only pass=slots kept=2); and the plain row on any kind=slots record.
+#
+# Sitting: the lead's, after the go, as TWO lease runs of 2 rounds each (never one lumped run), each under 10 min,
+# from a tree that holds the stagger body (stgv41b) and this arm:
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/stgv41-ab.card' BLOOMERY_AB_ROUNDS=2 \
+#     just depth-gpu-ds41 prose:512 prose:512@BLOOMERY_GEN_SLOTS=2 > <log> 2>&1
+# Check at that count: python3 tools/ref/card.py check docs/cards/stgv41-ab.card --rounds 2. At 2 rounds the ruler is
+# t(0.975, 2) · 0.6 % · √(2/2) = ±2.6 %, far inside the band's near edge (18 %); the two runs' per-round ratios read
+# together are 4 rounds, t(0.975, 6) · 0.6 % · √(2/4) = ±1.0 %.
+# Wall per run [derived]: 6-9 min. Five processes (the rotate warm-up, then 2 rounds × 2 arms, every arm its own
+# load: the two arms' load keys differ by the lever), 1.2-1.8 min each: rig-log 2026-09-30#callstream-pp-a ran five
+# processes of two arms (P 512 and 4096, 96 tokens each) in 12 min, 2.4 min each; one P-512 arm a process here is
+# 0.3-0.5 min less, and the load's upload has fallen by ~20 s since (rig-log 2026-09-30#v41-load-upload).
+kind: ab
+question: do two V4.1 streams decoded in one pass (BLOOMERY_GEN_SLOTS=2, the stagger's pair of two slots) outrun one
+  stream by the derived ×1.18..1.27 at prose 512 on plan (a)?
+term: tok/s @ n=96, prose P 512, A6000, plan (a), residency unset (mid-p40-s1). The 2-slot arm's tok/s(aggregate)
+  (`tok/s(aggregate) … @ n=2·95`) against the plain arm's tok/s(mean), same binary, paired by round, the line
+  `ratio slots d=512 prose@BLOOMERY_GEN_SLOTS=2/prose`
+unit: %
+predict: 18..27
+rounds: 4
+condition: one binary, every arm's load its own process (the two arms' load keys differ by the lever), every arm in
+  its run's one lease, no [cold], [cpu-busy] or [other-busy] row (the runner's tags), no FAIL row (the runner's slots
+  clauses above: counted kind=slots records of 2 positions, the slots residency clause, no kind=slots record in the
+  plain row). Run as two lease runs of 2 rounds each, each under 10 min. Not checked inside the rounds: each slot's
+  ids bit for bit its solo run's (stgv41b's H2 on the same owner path holds that)
+decide-in: land the stagger as the ds41 default (the seat's rounds through one pass of its slots)
+decide-below: take one nsys window of the stagger pass (per-layer host legs against the card fronts and shadows)
+  before any change; the term to re-derive is the round's per-layer excess over its work bound
+decide-above: re-price N = 4 (two lanes of two columns against two pairs a round, design §5.5) before the next
+  round is opened

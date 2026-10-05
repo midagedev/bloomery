@@ -572,15 +572,20 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             trim: false,
         },
         default: Unset::Is("1"),
-        doc: "`generate_qwen3moe` on a whole-card qwen3moe file: N streams decoded in one \
-              pass (`GpuModel::step_slots`). Each arm's ids are N windows of equal length, \
-              window j prefilled into slot j; then `-n` − 1 rounds of one pass of a row a \
-              slot, each slot fed its own argmax. Under `--time` a round prints `time pass \
-              <r> ms= positions=N kind=slots` (the depth runner's aggregate row: Σ positions \
-              / Σ ms); every slot's ids print as `step` lines ending in `slot=<j>`. 1 is the \
-              one-sequence run, the same-binary arm. N ≥ 2 is refused by name on a qwen35moe \
-              or qwen4exp file, a placed load, an id count N does not divide, and beside \
-              `--prompt`, `--seed-depth`, `--last-step`, `--logits` and `--dump-taps`.",
+        doc: "`generate_qwen3moe` on a whole-card qwen3moe file and `generate_ds41` (V4.1): N \
+              streams decoded in one pass (`GpuModel::step_slots`). Each arm's ids are N \
+              windows of equal length, window j prefilled into slot j; then `-n` − 1 rounds of \
+              one pass of a row a slot, each slot fed its own argmax. Under `--time` a round \
+              prints `time pass <r> ms= positions=N kind=slots` (the depth runners' aggregate \
+              row: Σ positions / Σ ms). 1 is the one-sequence run, the same-binary arm. N past \
+              the body's pass rows (`SlotRows::MAX_ROWS`: 8 for qwen3moe, 2 for V4.1) and an id \
+              count N does not divide are refused by name. `generate_qwen3moe` prints every \
+              slot's ids as `step` lines ending in `slot=<j>`, and refuses N ≥ 2 on a qwen35moe \
+              or qwen4exp file, a placed load, and beside `--prompt`, `--seed-depth`, \
+              `--last-step`, `--logits` and `--dump-taps`. `generate_ds41` loads a plan of N \
+              resident sequences, runs each slot's window as the plain run's prompt call, prints \
+              each slot's records in slot order, and refuses N ≥ 2 beside `BLOOMERY_DRAFT`, \
+              `BLOOMERY_CHECK_FINITE`, `BLOOMERY_STEP_STATS` and `--logits`.",
         site: Site::Parsed { left: &[] },
     },
     LeverSpec {

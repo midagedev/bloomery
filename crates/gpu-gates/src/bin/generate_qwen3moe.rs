@@ -311,7 +311,12 @@ mod taps;
 mod q3place;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/gen_slots.rs"]
+mod gen_slots;
+
+#[cfg(feature = "gpu")]
 mod cli {
+    use super::gen_slots;
     use super::q3place::{self, PlaceQ3};
     use super::taps;
     use app::Session;
@@ -2530,15 +2535,16 @@ mod cli {
 
     /// `BLOOMERY_GEN_SLOTS=slots` beside what it does not run with, each
     /// refused by name: another family's file (only the qwen3moe body runs a
-    /// pass of several slots), each flag of `given` that is set, and an arm
-    /// whose ids `slots` does not cut into windows of one length.
+    /// pass of several slots), what every body refuses
+    /// ([`gen_slots::refused`]: each flag of `given` that is set), and an
+    /// arm whose ids `slots` does not cut into windows of one length
+    /// ([`gen_slots::windows`]).
     fn slots_refused(
         slots: usize,
         family: Family,
         given: &[(&str, bool)],
         arms: &[Arm],
     ) -> Result<(), GateError> {
-        let lever = format!("BLOOMERY_GEN_SLOTS={slots}");
         let other = match family {
             Family::Qwen3 => None,
             Family::Qwen35 => Some("qwen35moe"),
@@ -2546,30 +2552,15 @@ mod cli {
         };
         if let Some(arch) = other {
             return Err(format!(
-                "{lever} decodes several streams in one pass of the qwen3moe body \
-                 (`GpuModel::step_slots`); this is a {arch} file, whose body runs no pass of \
+                "BLOOMERY_GEN_SLOTS={slots} decodes several streams in one pass of the qwen3moe \
+                 body (`GpuModel::step_slots`); this is a {arch} file, whose body runs no pass of \
                  several slots"
             )
             .into());
         }
-        if let Some((flag, _)) = given.iter().find(|(_, set)| *set) {
-            return Err(format!(
-                "{lever} decodes several streams, each slot a window of the --tokens or --arm \
-                 ids, on a whole-card load; {flag} does not run with it"
-            )
-            .into());
-        }
-        if let Some((i, arm)) = arms
-            .iter()
-            .enumerate()
-            .find(|(_, a)| a.ids.len() % slots != 0)
-        {
-            return Err(format!(
-                "{lever} cuts each arm's ids into {slots} windows of one length, one a slot; arm \
-                 {i}'s {} ids do not divide by {slots}",
-                arm.ids.len()
-            )
-            .into());
+        gen_slots::refused::<Body>(slots, "qwen3moe", given)?;
+        for (i, arm) in arms.iter().enumerate() {
+            gen_slots::windows(&arm.ids, slots, &format!("arm {i}'s ids"))?;
         }
         Ok(())
     }
@@ -2622,7 +2613,7 @@ mod cli {
         arm: &Arm,
     ) -> Result<(), GateError> {
         let (n, n_gen, warm) = (run.slots, arm.n_gen, run.warm);
-        let windows: Vec<&[u32]> = arm.ids.chunks_exact(arm.ids.len() / n).collect();
+        let windows = gen_slots::windows(&arm.ids, n, "the arm's ids")?;
         // Slot 0 stands where the session left it — fresh, or cleared before
         // this arm; every other slot starts from its reset here.
         for j in 1..n {
@@ -2661,45 +2652,15 @@ mod cli {
         }
         s.select_slot(0)?;
         if run.mode == StepMode::Graph && n_gen > 1 {
-            let key: Vec<(usize, usize)> = (0..n).map(|j| (j, 1)).collect();
-            let nodes = s.model_mut().capture_slots(&key)?;
+            let nodes = gen_slots::capture(s, n)?;
             println!("capture slots={n} rows=1 graph_nodes={nodes}");
         }
         // Every round's line is held and written after the loop: a write is
         // a syscall, and the rounds it would separate are the measurement.
-        let mut out_ids: Vec<Vec<u32>> = next
-            .iter()
-            .map(|&t| {
-                let mut v = Vec::with_capacity(n_gen);
-                v.push(t);
-                v
-            })
-            .collect();
-        let mut walls: Vec<f64> = Vec::with_capacity(n_gen - 1);
-        for _ in 1..n_gen {
-            let (out, ms) = {
-                let rows: Vec<(usize, &[u32])> = next
-                    .iter()
-                    .enumerate()
-                    .map(|(j, t)| (j, std::slice::from_ref(t)))
-                    .collect();
-                let t0 = Instant::now();
-                let out = s.step_slots(&rows)?;
-                (out, t0.elapsed().as_secs_f64() * 1e3)
-            };
-            if out.ids.len() != n {
-                return Err(format!(
-                    "a pass of {n} slots at a row each gave {} ids",
-                    out.ids.len()
-                )
-                .into());
-            }
-            walls.push(ms);
-            for (ids, &tok) in out_ids.iter_mut().zip(&out.ids) {
-                ids.push(tok);
-            }
-            next = out.ids;
-        }
+        let gen_slots::Rounds {
+            ids: out_ids,
+            walls,
+        } = gen_slots::rounds(s, next, n_gen)?;
         for (j, (len, wall, plan, image)) in prompts.into_iter().enumerate() {
             print_prompt(len, wall, &plan, image, &format!(" slot={j}"));
         }
@@ -2722,22 +2683,18 @@ mod cli {
             println!("tokens {ids:?} slot={j}");
         }
         if run.timed {
-            let counted = &walls[warm..];
-            let mut sorted = counted.to_vec();
-            sorted.sort_by(f64::total_cmp);
-            let p50 = sorted[sorted.len() / 2];
-            let ms: f64 = counted.iter().sum();
-            let positions = counted.len() * n;
+            let c = gen_slots::counted(&walls, warm, n)?;
             println!(
                 "SMOKE mode={} prompt_tokens={} depth={} slots={n} generated={n_gen} warm={warm} \
-                 rounds={} positions={positions} p50_ms={p50:.4} mean_ms={:.4} \
-                 tok/s(aggregate)={:.2} ctx={}",
+                 rounds={} positions={} p50_ms={:.4} mean_ms={:.4} tok/s(aggregate)={:.2} ctx={}",
                 mode_name(run.mode),
                 windows[0].len(),
                 windows[0].len(),
-                counted.len(),
-                ms / counted.len() as f64,
-                positions as f64 * 1e3 / ms,
+                c.rounds,
+                c.positions,
+                c.p50,
+                c.mean,
+                c.aggregate,
                 run.ctx
             );
         }
