@@ -1,0 +1,15 @@
+# The 0.2.1 release clip sitting's toktape tapes: one bloomery-serve (the release binary) a scenario, each
+# scenario behind its own hold — V4.1 (--model ds41, the default --place a), GLM-5.3 (--model glm, the default
+# placement and once --place bp), Qwen3.8 (--model qwen38, the default placement), Qwen3.6 and Qwen3-30B
+# (--model qwen3, the whole A6000) — at the serving defaults (every BLOOMERY_* lever unset), the clip41 prompts
+# (the RateLimiter review and the Rust and Korean chats; GLM reasoning_effort low, its template always opens
+# <think>), greedy, thinking off, one discarded warm-up a load, one tape a prompt and session count (--sessions
+# 1 and 2, 4 on the qwen3 files). The clips carry the release's point, concurrent requests on one model; the
+# morning table's numbers stay the depth runners'.
+kind: exclusive
+reason: six model loads (347 GB, 132 GB twice, 111 GB, 21 GB and 18.5 GB; 0.4..1.5 min a load — GLM's 42 s
+  measured 2026-10-03, V4.1's 16..37 s rig-log 2026-09-30, the rest derived) and twenty timed requests whose
+  per-token times are the clip, so the box must be quiet (a build or a load beside them moves the decode, and
+  memory pressure re-reads the churn pool); why now: the 0.2.1 release clips, recorded from the release binary
+  the morning the user posts it
+minutes: 30..45
