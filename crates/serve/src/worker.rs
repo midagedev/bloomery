@@ -30,7 +30,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::api::{End, EngineFailure, relock};
-use crate::engine::{Drafted, EngineError, SamplerFactory, SlotPass, SlotRow, StateError};
+use crate::engine::{Drafted, EngineError, SamplerFactory, Saved, SlotPass, SlotRow, StateError};
 use crate::genloop::{
     Event, Gen, GenError, GenParams, Need, Outcome, Slot, StopKind, Timings, ms_since,
 };
@@ -45,6 +45,9 @@ pub(crate) struct Stats {
     /// Prompt tokens the cache kept instead (every request's `cache_n`).
     pub n_prompt_cached_total: u64,
     pub t_prompt_ms_total: f64,
+    /// The prompt cache's work before each prompt (every request's
+    /// `cache_ms`).
+    pub t_cache_ms_total: f64,
     pub n_predicted_total: u64,
     pub t_predicted_ms_total: f64,
     /// Engine calls: a prompt's, and each step of one slot or several.
@@ -574,6 +577,7 @@ impl Worker {
             s.n_prompt_cached_total += t.cache_n as u64;
             s.n_tokens_max = s.n_tokens_max.max(t.n_past as u64);
             s.t_prompt_ms_total += t.prompt_ms;
+            s.t_cache_ms_total += t.cache_ms;
             s.n_predicted_total += dn;
             s.t_predicted_ms_total += t.predicted_ms;
             // The prompt's engine call, whose logits give the first generated
@@ -872,8 +876,10 @@ impl Worker {
     /// the slot instead of put back: that request's prompt puts it back only
     /// if it keeps some of it, and hands it to the prompt cache without a
     /// copy where the cache's rule saves it ([`Slot::hand_back`]). A slot
-    /// whose state leaves the table, or that is left with no room, holds
-    /// nothing after, and its `/slots` view says so.
+    /// whose idle state leaves the table, or that is left with no room, holds
+    /// nothing after, and its `/slots` view says so; the state goes into the
+    /// prompt cache first ([`Slot::offer`]), the one that left as it is, the
+    /// one left with no room as the snapshot its park took.
     fn switch(&mut self, to: usize, prompt: bool) -> Result<Switched, Dead> {
         let from = self.t().on;
         if from == to {
@@ -885,6 +891,9 @@ impl Worker {
         let keep = self.kept_slots(to);
         let held = self.slot.held_of(from).len();
         let mut voids = Vec::new();
+        // The states of the voids the prompt cache takes, and whether each is
+        // a snapshot taken here.
+        let mut offers: Vec<(usize, Arc<dyn Saved>, bool)> = Vec::new();
         let mut moved = false;
         if held > 0 {
             let refused = match self.t().table.park() {
@@ -903,7 +912,10 @@ impl Worker {
                     )),
                     Ok(state) => match self.t_mut().table.room(state.n_bytes(), &keep) {
                         Ok(gone) => {
-                            voids.extend(gone);
+                            for (j, s) in gone {
+                                voids.push(j);
+                                offers.push((j, s, false));
+                            }
                             let entry = Entry::State {
                                 state,
                                 live: live_from,
@@ -917,10 +929,15 @@ impl Worker {
                             need,
                             pinned,
                             budget,
-                        }) => Some(format!(
-                            "its {need} bytes beside the {pinned} parked for live requests pass \
-                             the park budget of {budget} bytes"
-                        )),
+                        }) => {
+                            if !live_from {
+                                offers.push((from, state, true));
+                            }
+                            Some(format!(
+                                "its {need} bytes beside the {pinned} parked for live requests \
+                                 pass the park budget of {budget} bytes"
+                            ))
+                        }
                     },
                 },
             };
@@ -938,6 +955,9 @@ impl Worker {
             let t = self.t_mut();
             t.clock += 1;
             self.active[i].left = self.t().clock;
+        }
+        for (j, state, copied) in offers {
+            self.slot.offer(j, state, copied);
         }
         for &j in &voids {
             if let Err(e) = self

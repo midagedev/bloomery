@@ -1014,6 +1014,7 @@ impl Seat for V41 {
                 ms,
                 entries,
                 cache_bytes,
+                copied: _,
             } => Record::new(&record::CACHE_SAVE)
                 .u("positions", positions)
                 .u("bytes", bytes)

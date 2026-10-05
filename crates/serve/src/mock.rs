@@ -19,6 +19,8 @@
 //! [`MockEngine::with_slots`] serves several slots, each a context of its own
 //! of `ctx_max` positions, so a slot's ids are what it would give alone; its
 //! steps of several slots are [`Engine::step_slots`]'s default.
+//! [`MockEngine::with_cache_ram`] gives the server a prompt cache of the
+//! mock's states.
 //!
 //! [`DraftMock`] is the same engine behind a draft of one id: each pass
 //! verifies a proposal after `last`, the mock's own next token on two passes of
@@ -75,6 +77,9 @@ pub struct MockEngine {
     /// Counts [`Engine::residency_reset`] calls when the mock has a
     /// residency ([`MockEngine::with_residency`]).
     resets: Option<Arc<AtomicUsize>>,
+    /// [`Engine::cache_ram`]: 0, the prompt cache off, unless
+    /// [`MockEngine::with_cache_ram`].
+    cache_ram: u64,
 }
 
 impl MockEngine {
@@ -90,6 +95,7 @@ impl MockEngine {
             nexts: 0,
             fail_at: None,
             resets: None,
+            cache_ram: 0,
         }
     }
 
@@ -123,6 +129,15 @@ impl MockEngine {
         assert!(n > 0, "a mock of no slots");
         MockEngine {
             parked: vec![Vec::new(); n],
+            ..self
+        }
+    }
+
+    /// The same mock with a prompt cache of `bytes` over its saved states.
+    #[must_use]
+    pub fn with_cache_ram(self, bytes: u64) -> Self {
+        MockEngine {
+            cache_ram: bytes,
             ..self
         }
     }
@@ -276,6 +291,10 @@ impl Engine for MockEngine {
 
     fn ctx_max(&self) -> usize {
         self.ctx_max
+    }
+
+    fn cache_ram(&self) -> u64 {
+        self.cache_ram
     }
 
     fn slots(&self) -> usize {

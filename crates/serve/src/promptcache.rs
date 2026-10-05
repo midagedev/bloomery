@@ -108,13 +108,15 @@ impl PromptCache {
 
     /// Keeps `state` of `ids` (as many ids as it holds positions): the
     /// states it keeps all of leave, then the oldest until it fits. Returns
-    /// what happened, in order; a state over the whole budget is refused
-    /// (a `Skip`), and the cache is then as it was.
+    /// what happened, in order, the `Save` carrying `ms` and `copied`
+    /// ([`CacheNote::Save`]); a state over the whole budget is refused (a
+    /// `Skip`), and the cache is then as it was.
     pub(crate) fn insert(
         &mut self,
         ids: Vec<u32>,
         state: Arc<dyn Saved>,
         ms: f64,
+        copied: bool,
     ) -> Vec<CacheNote> {
         let bytes = state.n_bytes();
         let positions = ids.len();
@@ -156,6 +158,7 @@ impl PromptCache {
             ms,
             entries: self.entries.len(),
             cache_bytes: self.bytes(),
+            copied,
         });
         notes
     }
@@ -219,8 +222,8 @@ mod tests {
         let a = ids(100, 1);
         let mut b = a[..60].to_vec();
         b.extend(ids(40, 1000));
-        c.insert(a.clone(), state(100, 10, Some(10)), 0.0);
-        c.insert(b.clone(), state(100, 10, None), 0.0);
+        c.insert(a.clone(), state(100, 10, Some(10)), 0.0, true);
+        c.insert(b.clone(), state(100, 10, None), 0.0, true);
         let mut req = a[..80].to_vec();
         req.push(5);
         let p = c.best(&req, 0).expect("a pick");
@@ -236,15 +239,15 @@ mod tests {
     fn insert_prunes_then_evicts_the_oldest() {
         let mut c = PromptCache::new(100);
         let a = ids(50, 1);
-        c.insert(a[..20].to_vec(), state(20, 30, None), 0.0);
-        c.insert(ids(30, 9), state(30, 30, None), 0.0);
-        let notes = c.insert(a.clone(), state(50, 30, None), 0.0);
+        c.insert(a[..20].to_vec(), state(20, 30, None), 0.0, true);
+        c.insert(ids(30, 9), state(30, 30, None), 0.0, true);
+        let notes = c.insert(a.clone(), state(50, 30, None), 0.0, true);
         assert!(
             matches!(notes[0], CacheNote::Evict { positions: 20, why, .. }
                 if why == "a newer state keeps all of it")
         );
         assert_eq!(c.len(), 2);
-        let notes = c.insert(ids(40, 77), state(40, 60, None), 0.0);
+        let notes = c.insert(ids(40, 77), state(40, 60, None), 0.0, true);
         assert!(
             matches!(
                 notes[0],
@@ -257,7 +260,7 @@ mod tests {
             "{notes:?}"
         );
         assert_eq!((c.len(), c.bytes()), (2, 90));
-        let notes = c.insert(ids(10, 5), state(10, 101, None), 0.0);
+        let notes = c.insert(ids(10, 5), state(10, 101, None), 0.0, true);
         assert!(matches!(notes[..], [CacheNote::Skip { positions: 10, .. }]));
         assert_eq!((c.len(), c.bytes()), (2, 90));
     }
@@ -268,8 +271,8 @@ mod tests {
     fn insert_keeps_what_the_newer_state_cannot_keep() {
         let mut c = PromptCache::new(1 << 20);
         let a = ids(100, 3);
-        c.insert(a[..40].to_vec(), state(40, 1, None), 0.0);
-        c.insert(a.clone(), state(100, 1, Some(10)), 0.0);
+        c.insert(a[..40].to_vec(), state(40, 1, None), 0.0, true);
+        c.insert(a.clone(), state(100, 1, Some(10)), 0.0, true);
         assert_eq!(c.len(), 2);
         assert!(c.covers(&a[..40]));
         assert!(!c.covers(&a[..60]), "the newer state keeps 0 of 60");
@@ -279,12 +282,12 @@ mod tests {
     #[test]
     fn take_makes_the_state_the_most_recent() {
         let mut c = PromptCache::new(60);
-        c.insert(ids(10, 1), state(10, 20, None), 0.0);
-        c.insert(ids(10, 2), state(10, 20, None), 0.0);
+        c.insert(ids(10, 1), state(10, 20, None), 0.0, true);
+        c.insert(ids(10, 2), state(10, 20, None), 0.0, true);
         let p = c.best(&ids(10, 1), 0).expect("the first state");
         let (got, _) = c.take(p);
         assert_eq!(got, ids(10, 1));
-        c.insert(ids(10, 3), state(10, 30, None), 0.0);
+        c.insert(ids(10, 3), state(10, 30, None), 0.0, true);
         assert!(
             c.best(&ids(10, 1), 0).is_some(),
             "the taken state was evicted"

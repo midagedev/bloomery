@@ -1248,7 +1248,7 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
         } else {
             0.0
         };
-        let rows: [(&str, &str, &str, String); 17] = [
+        let rows: [(&str, &str, &str, String); 18] = [
             (
                 "counter",
                 "prompt_tokens_total",
@@ -1266,6 +1266,13 @@ fn metrics(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> 
                 "prompt_seconds_total",
                 "Prompt process time",
                 (s.t_prompt_ms_total / 1e3).to_string(),
+            ),
+            (
+                "counter",
+                "prompt_cache_seconds_total",
+                "Prompt cache time before the prompts (the requests' cache_ms: a slot state saved, \
+                 a cached state put back, the cut); bloomery's own, llama-server has no such counter",
+                (s.t_cache_ms_total / 1e3).to_string(),
             ),
             (
                 "counter",
@@ -2050,6 +2057,9 @@ fn completion(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<boo
 /// The one `prompt_progress` this server sends, once the prompt is evaluated:
 /// `processed` is then what the cache holds of the prompt, all of it, as
 /// llama-server's last progress event counts it (`slot.prompt.tokens.size()`).
+/// `time_ms` is `prompt_ms`, which leaves the prompt cache's work
+/// (`cache_ms`) out, as llama-server's progress clock starts after its slot's
+/// cache work.
 fn progress(t: &Timings) -> Value {
     json!({ "total": t.n_prompt, "cache": t.cache_n, "processed": t.n_prompt, "time_ms": t.prompt_ms })
 }
