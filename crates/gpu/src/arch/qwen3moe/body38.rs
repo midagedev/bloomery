@@ -147,6 +147,7 @@ use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::placement::Plan;
 use runtime::seqstate::{HOST_BUDGET, Kept, Take, Why};
+use runtime::swaprule::KeptRows;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
@@ -2731,12 +2732,7 @@ impl GpuModel<Body38> {
         if tokens.is_empty() {
             return Err(GpuError::shape(WHAT_P, "empty token slice"));
         }
-        if let Some(fault) = self.poisoned() {
-            return Err(GpuError::Poisoned {
-                what: WHAT_P,
-                fault,
-            });
-        }
+        self.refuse_if_poisoned(WHAT_P)?;
         let body = self.body(WHAT_P)?;
         super::refuse_past_vocab(WHAT_P, tokens, body.vocab)?;
         ple_takes(WHAT_P, body.ple.hash.window(), tokens)?;
@@ -2768,7 +2764,7 @@ impl GpuModel<Body38> {
         // failed call is its echo. A failed call's streaming ends with each
         // layer back at the set it started with.
         let ended = self.stream_end(r.is_ok());
-        let kept = self.keep_rows(0, PassKind::Prompt);
+        let kept = self.keep_rows(KeptRows::prefix(0), PassKind::Prompt);
         let next = r?;
         ended?;
         kept?;
@@ -3086,12 +3082,7 @@ impl GpuModel<Body38> {
         mode: MtpMode,
     ) -> Result<MtpDraft, GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_draft";
-        if let Some(fault) = self.poisoned() {
-            return Err(GpuError::Poisoned {
-                what: WHAT_D,
-                fault,
-            });
-        }
+        self.refuse_if_poisoned(WHAT_D)?;
         let (gpu, w, body) = self.body_parts(WHAT_D)?;
         let r = body.mtp_run(gpu, w, feed, head, mode);
         // A fault the draft raised poisons the model as the target's would.
@@ -3109,12 +3100,7 @@ impl GpuModel<Body38> {
         mode: MtpMode,
     ) -> Result<(), GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_walk";
-        if let Some(fault) = self.poisoned() {
-            return Err(GpuError::Poisoned {
-                what: WHAT_D,
-                fault,
-            });
-        }
+        self.refuse_if_poisoned(WHAT_D)?;
         let (gpu, w, body) = self.body_parts(WHAT_D)?;
         let r = body.mtp_run_walk(gpu, w, feed, head, mode).map(|_| ());
         self.note_fault(WHAT_D, r)
@@ -3142,12 +3128,7 @@ impl GpuModel<Body38> {
         mode: MtpMode,
     ) -> Result<MtpDraft, GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_chain";
-        if let Some(fault) = self.poisoned() {
-            return Err(GpuError::Poisoned {
-                what: WHAT_D,
-                fault,
-            });
-        }
+        self.refuse_if_poisoned(WHAT_D)?;
         let (gpu, w, body) = self.body_parts(WHAT_D)?;
         let r = body.mtp_run_chain(gpu, w, refresh, own, head, mode);
         // A fault a walk of the chain raised poisons the model as the
@@ -3191,12 +3172,7 @@ impl GpuModel<Body38> {
     /// past its launch.
     pub fn seq_save(&mut self) -> Result<Seq38, GpuError> {
         const WHAT_S: &str = "qwen4exp snapshot";
-        if let Some(fault) = self.poisoned() {
-            return Err(GpuError::Poisoned {
-                what: WHAT_S,
-                fault,
-            });
-        }
+        self.refuse_if_poisoned(WHAT_S)?;
         let pos = self.pos();
         let (gpu, _, body) = self.body_parts(WHAT_S)?;
         body.save_state(gpu.stream(), pos)
@@ -3612,7 +3588,7 @@ impl HostServed for Body38 {
             .at_boundary(&mut self.hybrid, stream, at)
     }
 
-    fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
+    fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
     }
 
@@ -4210,6 +4186,9 @@ impl SlotRows for Body38 {
     /// port's columns).
     const MAX_ROWS: usize = PASS_ROWS;
     const HEADS: RowHeads = RowHeads::One;
+    /// The commit settles a partial keep ([`Body38::keep_slot`]: the lane
+    /// word, the PLE history and the held count cut to the kept rows).
+    const SETTLES_PARTIAL_KEEP: bool = true;
 
     /// One row of the pass's columns through the step port: the step's
     /// chain at one row.

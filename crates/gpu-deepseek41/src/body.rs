@@ -93,6 +93,7 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::placement::{Machine, Plan, PlanLevers};
+use runtime::swaprule::KeptRows;
 
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
@@ -2592,7 +2593,7 @@ impl HostServed for Body {
             .at_boundary(&mut self.hybrid, stream, at)
     }
 
-    fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
+    fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
     }
 

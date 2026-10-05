@@ -127,7 +127,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, sys};
-use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
+use runtime::swaprule::{Flip, KeptRows, Shape, SwapParams, SwapRule};
 
 use super::slots::{HOST, Slot, SlotMap};
 use super::{Drain, drain_within, poll_drained};
@@ -959,6 +959,10 @@ pub struct PassReport {
     pub boundary: u64,
     /// The rows the pass before it kept (0 at boundary 0).
     pub kept: usize,
+    /// The kept rows as a mask, bit `r` = row `r` kept (0 at boundary 0):
+    /// a prefix's mask for every pass but a drafted slots pass's, each
+    /// slot's accepted rows.
+    pub rows: u64,
     /// Flips that went live here.
     pub landed: usize,
     /// Of those, the ones whose copy had not completed when the host reached
@@ -1273,7 +1277,7 @@ pub struct SwapMachine {
     /// A boundary made ahead of its pass ([`SwapMachine::boundary_ahead`])
     /// that no launch has taken yet ([`SwapMachine::take_ahead`]).
     ahead: Option<u64>,
-    kept: usize,
+    kept: KeptRows,
     /// Host microseconds the last pass's end took (the fold into the rule),
     /// for the next boundary's report.
     end_us: u64,
@@ -1442,7 +1446,7 @@ impl SwapMachine {
             planned: None,
             ahead: None,
             end_us: 0,
-            kept: 0,
+            kept: KeptRows::prefix(0),
             ops: Vec::with_capacity(BATCH_OPS),
             changed: Vec::new(),
             broken: None,
@@ -1801,14 +1805,14 @@ impl SwapMachine {
         Err(GpuError::plan(what, e))
     }
 
-    /// End the pass the last boundary opened: fold `tally`'s first `kept`
-    /// rows into the rule and clear it. Refused by name, the machine
+    /// End the pass the last boundary opened: fold `tally`'s `kept` rows
+    /// into the rule and clear it. Refused by name, the machine
     /// unchanged: a pass no boundary opened, a tally of another shape or off
-    /// ([`SwapMachine::tally`]), `kept` past the rows, a kept row with a
-    /// layer not every slot of which was noted, a row with some slots of a
-    /// layer noted and not all, and a noted row routing an id twice or past
-    /// the experts. A failure of the fold itself breaks the machine.
-    pub fn end_pass(&mut self, tally: &mut Tally, kept: usize) -> Result<(), GpuError> {
+    /// ([`SwapMachine::tally`]), a kept row past the pass's rows, a kept row
+    /// with a layer not every slot of which was noted, a row with some slots
+    /// of a layer noted and not all, and a noted row routing an id twice or
+    /// past the experts. A failure of the fold itself breaks the machine.
+    pub fn end_pass(&mut self, tally: &mut Tally, kept: KeptRows) -> Result<(), GpuError> {
         const WHAT: &str = "SwapMachine::end_pass";
         let start = Instant::now();
         self.refuse_if_broken(WHAT)?;
@@ -1838,10 +1842,14 @@ impl SwapMachine {
                 ),
             ));
         }
-        if kept > r.max_rows {
+        if let Some(row) = kept.past(r.max_rows) {
             return Err(GpuError::shape(
                 WHAT,
-                format!("{kept} rows kept of a pass of at most {}", r.max_rows),
+                format!(
+                    "row {row} of {} rows kept of a pass of at most {}",
+                    kept.count(),
+                    r.max_rows
+                ),
             ));
         }
         self.check_tally(tally, kept, WHAT)?;
@@ -1854,10 +1862,10 @@ impl SwapMachine {
         Ok(())
     }
 
-    /// `tally` holds, for each row below `kept`, every slot of every layer
+    /// `tally` holds, for each kept row, every slot of every layer
     /// but the ones no pass routes, and for each other row every slot of a
     /// layer or none; every noted row names distinct ids below the experts.
-    fn check_tally(&self, t: &Tally, kept: usize, what: &'static str) -> Result<(), GpuError> {
+    fn check_tally(&self, t: &Tally, kept: KeptRows, what: &'static str) -> Result<(), GpuError> {
         let n = self.layers.len();
         let full = t.full();
         for row in 0..t.max_rows {
@@ -1865,7 +1873,7 @@ impl SwapMachine {
                 let cell = row * n + l;
                 let mask = t.filled[cell];
                 let layer = self.layers.start + l;
-                if mask == 0 && (row >= kept || unrouted) {
+                if mask == 0 && (!kept.keeps(row) || unrouted) {
                     continue;
                 }
                 if mask != full {
@@ -1875,8 +1883,9 @@ impl SwapMachine {
                         what,
                         format!(
                             "row {row} at layer {layer}: slots {missing:?} of top-{} not noted \
-                             ({kept} rows kept)",
-                            t.top_k
+                             ({} rows kept)",
+                            t.top_k,
+                            kept.count()
                         ),
                     ));
                 }
@@ -1899,8 +1908,8 @@ impl SwapMachine {
     }
 
     /// Every fully noted cell of `t` into the rule, then the pass ended at
-    /// `kept` rows: the rule drops the rows past it.
-    fn fold(&mut self, t: &Tally, kept: usize, what: &'static str) -> Result<(), GpuError> {
+    /// `kept`'s rows: the rule drops the rows outside the set.
+    fn fold(&mut self, t: &Tally, kept: KeptRows, what: &'static str) -> Result<(), GpuError> {
         let n = self.layers.len();
         for row in 0..t.max_rows {
             for l in 0..n {
@@ -1950,7 +1959,8 @@ impl SwapMachine {
         let landing = self.after_change(landing, || format!("boundary {b}"))?;
         let mut report = PassReport {
             boundary: b,
-            kept: if b == 0 { 0 } else { self.kept },
+            kept: if b == 0 { 0 } else { self.kept.count() },
+            rows: if b == 0 { 0 } else { self.kept.mask() },
             end_us: std::mem::take(&mut self.end_us),
             ..PassReport::default()
         };
@@ -2498,7 +2508,7 @@ impl SwapMachine {
         self.rule.reset();
         self.planned = None;
         self.ahead = None;
-        self.kept = 0;
+        self.kept = KeptRows::prefix(0);
         self.end_us = 0;
         for (i, l) in self.layers.clone().enumerate() {
             let seed = self.rule.seed(i).map_err(|e| rule_err(WHAT, e))?;

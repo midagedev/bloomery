@@ -107,6 +107,7 @@ use model::placement::Plan;
 use models::{Act, Ffn, LayerSpec, Mixer, Score};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{HOST_BUDGET, Kept, Take};
+use runtime::swaprule::KeptRows;
 
 use crate::ffn::CardExperts;
 use crate::host::GlmHost;
@@ -2314,7 +2315,7 @@ impl HostServed for Body {
             .at_boundary(&mut self.hybrid, stream, at)
     }
 
-    fn keep_rows(&mut self, kept: usize, kind: PassKind) -> Result<(), GpuError> {
+    fn keep_rows(&mut self, kept: KeptRows, kind: PassKind) -> Result<(), GpuError> {
         self.residency_glue.keep_rows(&mut self.hybrid, kept, kind)
     }
 

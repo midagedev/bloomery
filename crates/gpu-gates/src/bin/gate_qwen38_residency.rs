@@ -4,7 +4,10 @@
 //! card), the residency machine over the card's routed stacks at
 //! `mid-p<P>-s1`, set here with `P` taken from the plan's card experts a
 //! layer (the lever itself is refused, so the environment cannot move it).
-//! One load, one card, no MTP draft.
+//! One card, no MTP draft, two loads one after the other: the gate's own,
+//! planned for one sequence, and the slots clauses' (`slots_drafted`,
+//! `commit_counts`), planned for the two slots they serve — a pass of
+//! several slots on a load planned for one is refused by name.
 //!
 //! A history is: the session cleared (the residency back to its seed), the
 //! first [`PROMPT`] ids of the prose corpus as one prompt call (a ubatch), a
@@ -69,6 +72,20 @@
 //!   while the union reads the moved map, so an admitted expert's columns
 //!   run nowhere and the logits part); the short prompt's guard removed (its
 //!   call opens and ends, admitting nothing).
+//! - `slots_drafted`: a drafted pass of two slots' verify rows folds each
+//!   slot's accepted rows — slot 0 keeping one of its three rows, slot 1
+//!   two of theirs — so the boundary that ends it reports 3 kept rows as
+//!   the mask {0, 3, 4}, no prefix (mutant: `commit_slots` passing a prefix
+//!   of the kept total).
+//! - `commit_counts`: a pass of two slots' three verify rows each, then a
+//!   commit with a count a slot cannot keep — slot 0 keeping none, or
+//!   slot 1 keeping past its rows while slot 0's count is one it can keep
+//!   — refused by name before any slot moves: slot 0 still stands past
+//!   its rows and the pass still waits (the session's select and the
+//!   model's own refused until its commit); a commit of every row then
+//!   lands and a step runs (mutant: each count checked in the keeps' loop,
+//!   just before its slot's keep, so slot 0 keeps its row before slot 1's
+//!   count is refused).
 
 #[cfg(not(feature = "gpu"))]
 fn main() {
@@ -588,6 +605,123 @@ mod gate {
         Ok(ok)
     }
 
+    /// The load the slots clauses share: planned for the two slots it serves
+    /// ([`PlanInputs::plan_with_slots`]; the gate's own load plans one, and
+    /// a pass of several slots on it is refused by name), opened after the
+    /// gate's session is dropped — the card holds one load — and serving
+    /// both slots, the boundaries its load made taken.
+    fn open_slots(
+        path: &Path,
+        inputs: &PlanInputs,
+        machine: &Machine,
+        host: bloomery_levers::HostCfg,
+        ub: usize,
+    ) -> Result<Session<Body38>, GateError> {
+        let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        if file.architecture() != Some("qwen4exp") {
+            return Err(format!("{} is not qwen4exp", path.display()).into());
+        }
+        let plan = inputs
+            .plan_with_slots(
+                machine,
+                CTX as u64,
+                &PlanLevers::default(),
+                Experts::Card,
+                2,
+            )
+            .map_err(|e| format!("the plan: {e}"))?;
+        let residency = residency_of(&plan)
+            .ok_or("the two-slot plan's card experts leave the machine no room")?;
+        let mut s = Session::from_model(
+            Body38::open_placed_residency(file, &plan, inputs, 0, host, ub, residency, 2)?,
+            CTX as u32,
+        );
+        s.model_mut().body_parts(NAME)?.2.log_residency(0);
+        take_passes(&mut s)?;
+        s.add_slots(2)?;
+        Ok(s)
+    }
+
+    /// `slots_drafted`: a drafted pass of two slots' verify rows folds each
+    /// slot's accepted rows — slot 0 keeping one of its three rows, slot 1
+    /// two of theirs — so the boundary that ends it kept 3 rows as the mask
+    /// {0, 3, 4}, row 1 and row 2 rejected, not the prefix a count of the
+    /// kept rows folds (mutant: `commit_slots` passing `KeptRows::prefix`
+    /// of the kept total). On the slots clauses' load ([`open_slots`]).
+    fn slots_drafted_clause(s: &mut Session<Body38>, ids: &[u32]) -> Result<bool, GateError> {
+        let mut last = [0u32; 2];
+        for (slot, last) in last.iter_mut().enumerate() {
+            s.select_slot(slot)?;
+            *last = s.prompt(ids, Want::Argmax)?.argmax();
+        }
+        let drafted: Vec<Vec<u32>> = last.iter().map(|&t| vec![t; 3]).collect();
+        let rows: Vec<(usize, &[u32])> = drafted
+            .iter()
+            .enumerate()
+            .map(|(slot, ids)| (slot, &ids[..]))
+            .collect();
+        s.verify_slots(&rows)?;
+        s.commit_slots(&[1, 2])?;
+        s.model_mut().pass_boundary()?;
+        let (kind, r) = take_passes(s)?
+            .pop()
+            .ok_or("slots_drafted: the commit's boundary")?;
+        let want: u64 = [0usize, 3, 4].iter().map(|&r| 1u64 << r).sum();
+        let ok = kind == PassKind::SlotsDrafted && r.kept == 3 && r.rows == want;
+        println!(
+            "slots_drafted: a pass of two slots' three drafted rows, slot 0 keeping 1 and slot 1 \
+             2: the boundary ends a {} pass of {} kept rows, mask 0b{:b} ({{0, 3, 4}}: {}): {}",
+            kind.word(),
+            r.kept,
+            r.rows,
+            r.rows == want,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `commit_counts` (module doc), on the slots clauses' load
+    /// ([`open_slots`]): slot 0 from a clear and its prompt, slot 1 where
+    /// `slots_drafted` left it. The second refused commit keeps slot 0's
+    /// row by a count it can keep, so a check made slot by slot would have
+    /// moved slot 0 before refusing slot 1.
+    fn commit_counts_clause(s: &mut Session<Body38>, ids: &[u32]) -> Result<bool, GateError> {
+        s.select_slot(0)?;
+        s.clear()?;
+        take_passes(s)?;
+        let t = s.prompt(ids, Want::Argmax)?.argmax();
+        let verified = s.model().pos() + 3;
+        s.verify_slots(&[(0, &[t, t, t]), (1, &[t, t, t])])?;
+        let under = s.commit_slots(&[0, 3]).err().map(|e| e.to_string());
+        let over = s.commit_slots(&[1, 4]).err().map(|e| e.to_string());
+        let named = under
+            .as_deref()
+            .is_some_and(|e| e.contains("slot 0 keeping 0 of its 3 rows"))
+            && over
+                .as_deref()
+                .is_some_and(|e| e.contains("slot 1 keeping 4 of its 3 rows"));
+        // The pass leaves slot 0 selected: its position is the model's.
+        let at = s.model().pos();
+        let unmoved = at == verified;
+        let waits = |e: Option<String>| e.is_some_and(|e| e.contains("waits for its commit"));
+        let session_waits = waits(s.select_slot(0).err().map(|e| e.to_string()));
+        let model_waits = waits(s.model_mut().select_slot(0).err().map(|e| e.to_string()));
+        let landed = s.commit_slots(&[3, 3]).is_ok();
+        let stepped = landed && s.step(t, Want::Argmax).is_ok();
+        let ok = named && unmoved && session_waits && model_waits && stepped;
+        println!(
+            "commit_counts: a verify of two slots' three rows each, a commit keeping slot 0 none \
+             and one keeping slot 1 four (slot 0 one) refused by name {named} ({} / {}), slot 0 \
+             at {at} where the verify stood it ({verified}) {unmoved}, the pass waiting for the \
+             session {session_waits} and the model {model_waits}, a commit of every row then a \
+             step {stepped}: {}",
+            under.as_deref().unwrap_or("committed"),
+            over.as_deref().unwrap_or("committed"),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     /// `refuse`: the host one byte short of the churn pool.
     fn refuse_clause(
         path: &Path,
@@ -665,7 +799,7 @@ mod gate {
 
         let t0 = Instant::now();
         let mut s = Session::from_model(
-            open(path, &inputs, machine, residency, host, ub)?,
+            open(path, &inputs, machine.clone(), residency, host, ub)?,
             CTX as u32,
         );
         s.model_mut().body_parts(NAME)?.2.log_residency(0);
@@ -775,6 +909,12 @@ mod gate {
         pass &= c7;
 
         pass &= stream_clause(&mut s)?;
+        // The gate's load is done: the card holds one load, and the slots
+        // clauses bring their own.
+        drop(s);
+        let mut s = open_slots(path, &inputs, &machine, host, ub)?;
+        pass &= slots_drafted_clause(&mut s, &ids)?;
+        pass &= commit_counts_clause(&mut s, &ids)?;
 
         if pass {
             println!("{NAME}: every clause passed");

@@ -16,6 +16,7 @@ use bloomery_gpu_deepseek41::body::{
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, Plan};
+use runtime::swaprule::KeptRows;
 use runtime::{Tapped, Target};
 
 use crate::{Keep, Open, Prompt, Session, SessionError};
@@ -142,7 +143,7 @@ fn call<T>(
 ) -> Result<T, GpuError> {
     m.pass_boundary()?;
     let r = run(m);
-    let kept = m.keep_rows(0, PassKind::Prompt);
+    let kept = m.keep_rows(KeptRows::prefix(0), PassKind::Prompt);
     // The call's own error first: a keep refused after a failed call is its echo.
     let v = r?;
     kept?;

@@ -43,6 +43,7 @@ use gguf::quant::GgmlType;
 use model::placement::host_lock::{HostFile, HostSet, expert_run};
 use model::placement::{ModelTensor, Plan};
 use model::r8file::R8Pair;
+use runtime::swaprule::KeptRows;
 
 use super::HostExperts;
 use super::swap::{
@@ -696,12 +697,12 @@ impl ResidencyGlue {
         Ok(())
     }
 
-    /// The pass the last boundary opened, a `kind`, keeps its first `kept`
-    /// rows ([`HostTier::keep_rows`]). Nothing without a machine.
+    /// The pass the last boundary opened, a `kind`, keeps `kept` rows
+    /// ([`HostTier::keep_rows`]). Nothing without a machine.
     pub fn keep_rows<H: HostExperts>(
         &mut self,
         tier: &mut HostTier<H>,
-        kept: usize,
+        kept: KeptRows,
         kind: PassKind,
     ) -> Result<(), GpuError> {
         tier.keep_rows(kept, kind)

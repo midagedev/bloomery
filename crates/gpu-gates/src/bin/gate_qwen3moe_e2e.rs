@@ -193,6 +193,13 @@
 //!   bit. The last clause on the main model: the model it leaves is
 //!   dropped, its added sequences' planes with it. `--one-pass-only` runs
 //!   the load and (j).
+//! - (e) a verify of two slots' rows on this body, which keeps a pass's
+//!   rows whole, is refused by name before anything runs
+//!   ([`SlotRows::SETTLES_PARTIAL_KEEP`]): no slot moves and the next pass
+//!   is the plain continuation from the prompt. Until that refusal a
+//!   partial `commit_slots` failed inside the body's keep after slot 0's
+//!   had run, and the next pass still ran — slot 1 from its rejected rows,
+//!   its id not its one-row continuation's.
 //!
 //! `--gemm-only` runs the load, (u), (t) and (w), `--ubatch-only` (w) alone,
 //! `--rope-only` the load and (t), `--fault-only` the load and (x),
@@ -570,6 +577,7 @@ mod gate {
         ok &= slots_two()?;
         let mut m = open(CTX, StepMode::Graph, KvQ8::F16)?;
         ok &= one_pass_two_slots(&mut m)?;
+        ok &= commit_partial(&mut m)?;
         drop(m);
         ok &= ubatch_sizes()?;
         ok &= placed(host)?;
@@ -3059,6 +3067,85 @@ mod gate {
         );
         let ok = bits_ok && nodes_ok && refused_ok && fault_ok;
         println!("one pass: {}", verdict(ok));
+        Ok(ok)
+    }
+
+    // ------------------------------------------------- (e) the partial commit
+
+    /// (e) (module doc): a verify of two slots' rows on a body that keeps a
+    /// pass's rows whole is refused by name before anything runs. Every
+    /// slot holds the same prompt, so either's continuation is the other's
+    /// reference: slot 2 feeds the probe id at the prompt's end, slot 3 one
+    /// verify row first — what slot 1 keeping one of its three rows would
+    /// stand at.
+    fn commit_partial(m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+        const WHAT: &str = "GpuModel::verify_slots";
+        let prose = prose(J_B.0 + J_B.1)?;
+        let a = &prose[J_A.0..J_A.0 + J_A.1];
+        // The ids the rejected rows and the continuations feed: plain ids
+        // of no prose, so the continuation of three rejected rows — which
+        // reads them — need not agree with the one kept row's.
+        let (x, y, probe) = (7u32, 9, 13);
+        m.add_slots(4)?;
+        let mut t = [0u32; 4];
+        for (slot, t) in t.iter_mut().enumerate() {
+            m.select_slot(slot)?;
+            m.reset()?;
+            *t = m.prefill_with(a, PrefillPath::Pass)?;
+        }
+        // Each reference's id and logits hash: the logits differ wherever
+        // the state does, where the greedy id can tie.
+        let row_hash = |m: &Qwen3moeModel, row: usize| -> Result<u64, GateError> {
+            Ok(Fnv1a64::default().f32s(&m.slots_logits()?[row]).value())
+        };
+        let from_prompt = m.step_slots(&[(2, &[probe])])?.ids[0];
+        let hash_prompt = row_hash(m, 0)?;
+        m.step_slots(&[(3, &[t[3]])])?;
+        let from_one_row = m.step_slots(&[(3, &[probe])])?.ids[0];
+        let hash_one_row = row_hash(m, 0)?;
+        let read = m.verify_slots(&[(0, &[t[0]]), (1, &[t[1], x, y])]);
+        let refused = matches!(&read, Err(GpuError::Shape { what, detail }) if *what == WHAT
+            && detail.contains("whole"));
+        // Before the refusal this ran the pass and the partial commit
+        // failed inside the body's keep, after slot 0's whole keep had run;
+        // with it nothing runs. Either way the next pass shows where each
+        // slot stands.
+        let commit_named = match &read {
+            Ok(_) => m
+                .commit_slots(&[1, 1])
+                .err()
+                .is_some_and(|e| e.to_string().contains("whole")),
+            Err(_) => false,
+        };
+        let at = {
+            let mut at = [0u32; 2];
+            for (slot, at) in at.iter_mut().enumerate() {
+                m.select_slot(slot)?;
+                *at = m.pos();
+            }
+            at
+        };
+        let out = m.step_slots(&[(0, &[probe]), (1, &[probe])])?;
+        let ids = out.ids;
+        let hash = row_hash(m, 1)?;
+        let still = at == [a.len() as u32; 2];
+        let ok = refused && still && ids == [from_prompt, from_prompt] && hash == hash_prompt;
+        println!(
+            "(e) commit partial: a verify of slot 0's one row and slot 1's three, keeping one, \
+             on a body that keeps a pass's rows whole: {}; the partial commit {}named; the slots \
+             at {} and {}; the next pass's ids {:?} and logits row 1 hashed {hash} (the one-row \
+             continuation {from_one_row} / {hash_one_row}, the prompt's {from_prompt} / \
+             {hash_prompt}): {}",
+            match &read {
+                Ok(_) => "ran".to_string(),
+                Err(e) => format!("refused \"{e}\""),
+            },
+            if commit_named { "" } else { "un" },
+            at[0],
+            at[1],
+            ids,
+            verdict(ok)
+        );
         Ok(ok)
     }
 

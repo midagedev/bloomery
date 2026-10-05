@@ -38,6 +38,7 @@ use crate::hybrid::{Chain, Refusal};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use cuda_core::CudaStream;
+use runtime::swaprule::KeptRows;
 use std::fmt;
 use std::ops::Range;
 
@@ -125,6 +126,14 @@ pub trait SlotRows: Slots {
         parked: &mut [&mut Self::Seq],
         rows: &[SlotRange],
     ) -> Result<(), GpuError>;
+
+    /// Whether this body settles a partial keep of a pass's rows at
+    /// [`GpuModel::commit_slots`]: a body that does overrides
+    /// [`SlotRows::keep_slot`] with the settling. A body without it keeps
+    /// every row as it runs (the default keep), so
+    /// [`GpuModel::verify_slots`] — whose commit keeps each slot's accepted
+    /// rows alone — refuses by name before anything runs.
+    const SETTLES_PARTIAL_KEEP: bool = false;
 
     /// The slot of `r` keeps the first `kept` rows (1 to its rows) of the
     /// pass that just ran, after its readback, on `seq` — its parked
@@ -234,10 +243,23 @@ impl fmt::Display for SlotSet {
 /// The fault that poisons the model and the slots whose state it condemned
 /// ([`SlotSet`]): what every later call refuses by, and what
 /// [`GpuModel::reset`] lifts once each of those slots has been reset.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct SlotFault {
     pub(super) slots: SlotSet,
-    pub(super) fault: Fault,
+    pub(super) why: PoisonWhy,
+}
+
+/// Why the model is poisoned ([`SlotFault`]): the card's fault word a call
+/// read back, or a commit of several slots' rows that settled some slots
+/// and failed on one.
+#[derive(Clone)]
+pub(super) enum PoisonWhy {
+    /// The fault word, raised by a kernel and read by the call that carried
+    /// it.
+    Fault(Fault),
+    /// [`GpuModel::commit_slots`] failed at `slot`'s keep, after the keeps
+    /// before it had run: `error`, the failure's text.
+    SlotKeep { slot: usize, error: String },
 }
 
 /// The captured passes of several slots ([`GpuModel::step_slots`]), one per
@@ -583,9 +605,20 @@ where
     /// until then every call but that commit and [`GpuModel::reset`] is
     /// refused by name. No rows are kept for the residency machine and no
     /// boundary is made ahead: the kept counts are known after the
-    /// readback. Refused, run and poisoned as `step_slots` is.
+    /// readback. Refused by name before anything runs on a body that keeps
+    /// a pass's rows whole ([`SlotRows::SETTLES_PARTIAL_KEEP`]): its commit
+    /// could not keep a part of them. Refused, run and poisoned as
+    /// `step_slots` is.
     pub fn verify_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, GpuError> {
         const WHAT: &str = "GpuModel::verify_slots";
+        if !B::SETTLES_PARTIAL_KEEP {
+            return Err(GpuError::shape(
+                WHAT,
+                "this body keeps a pass's rows whole (SlotRows::keep_slot's default), so a \
+                 commit cannot keep a slot's accepted rows of them \
+                 (SlotRows::SETTLES_PARTIAL_KEEP)",
+            ));
+        }
         let ranges = self.plan_pass(rows, WHAT)?;
         let out = self.run_slots(&ranges, SlotPass::Verify, WHAT);
         let out = self.note_fault_in(WHAT, out, SlotSet::of(&ranges))?;
@@ -598,12 +631,17 @@ where
     /// back: each slot's body state ([`SlotRows::keep_slot`]) and its
     /// position, then the pass's rows for the residency machine. A count
     /// list of another length, or a count outside 1 to its slot's rows, is
-    /// refused by name with the pass left waiting; with no pass waiting the
-    /// call is refused.
+    /// refused by name with the pass left waiting — every count is checked
+    /// before any slot moves; with no pass waiting the call is refused. A
+    /// keep that fails inside the body leaves the slots where the keeps
+    /// that ran left them — a state no caller chose — so the model is
+    /// poisoned until each slot of the pass is reset
+    /// ([`GpuModel::reset`]) and the error names the slot.
     ///
-    /// The residency machine folds a prefix of a pass's rows, and each slot
-    /// keeps a prefix of its own: the machine is told every row of the pass
-    /// ([`PassKind::SlotsDrafted`]), a slot's rejected rows counted as use.
+    /// The residency machine folds each slot's accepted rows
+    /// ([`PassKind::SlotsDrafted`]): the kept rows of the pass are the union
+    /// of each slot's prefix, no prefix of the pass, so a rejected row
+    /// leaves no trace.
     pub fn commit_slots(&mut self, kept: &[usize]) -> Result<(), GpuError> {
         const WHAT: &str = "GpuModel::commit_slots";
         let ranges = self.slots_waiting.as_deref().ok_or(GpuError::state(
@@ -635,10 +673,44 @@ where
             ));
         }
         let ranges = self.slots_waiting.take().unwrap_or_default();
-        let out = self
-            .keep_ranges(&ranges, kept, WHAT)
-            .and_then(|()| self.keep_rows(rows_of(&ranges), PassKind::SlotsDrafted));
+        let accepted = KeptRows::of(
+            ranges
+                .iter()
+                .zip(kept)
+                .flat_map(|(r, &k)| r.rows.start..r.rows.start + k),
+        );
+        let mut settled = Ok(());
+        for (r, &k) in ranges.iter().zip(kept) {
+            if let Err(e) = self.keep_one(r, k, WHAT) {
+                settled = Err(self.commit_failed(&ranges, r.slot, e));
+                break;
+            }
+        }
+        let out = settled.and_then(|()| self.keep_rows(accepted, PassKind::SlotsDrafted));
         self.note_fault_in(WHAT, out, SlotSet::of(&ranges))
+    }
+
+    /// A keep of slot `slot` that failed inside the body, after the pass's
+    /// waiting was taken: the slots of `ranges` stand where the keeps that
+    /// ran left them — the settled ones at their kept rows, the rest past
+    /// their rejected rows — a state no caller chose, so the model is
+    /// poisoned until each of them is reset ([`GpuModel::reset`], a select
+    /// and a reset a slot) and the error names the slot.
+    fn commit_failed(&mut self, ranges: &[SlotRange], slot: usize, e: GpuError) -> GpuError {
+        self.poisoned = Some(SlotFault {
+            slots: SlotSet::of(ranges),
+            why: PoisonWhy::SlotKeep {
+                slot,
+                error: e.to_string(),
+            },
+        });
+        GpuError::shape(
+            "GpuModel::commit_slots",
+            format!(
+                "slot {slot}'s keep failed, the model poisoned until each slot of the pass is \
+                 reset: {e}"
+            ),
+        )
     }
 
     /// Capture the pass whose slots and row counts, in pass order, are
@@ -738,18 +810,25 @@ where
         what: &'static str,
     ) -> Result<(), GpuError> {
         for (r, &k) in ranges.iter().zip(kept) {
-            let GpuModel {
-                parked, body, gpu, ..
-            } = self;
-            let seq = match r.slot {
-                0 => None,
-                s => Some(parked_seq(parked, s, what)?),
-            };
-            body.keep_slot(gpu, seq, r, k)?;
-            let k = crate::launch_u32(what, "rows", k)?;
-            self.stand_slot(r.slot, r.pos0 + k, what)?;
+            self.keep_one(r, k, what)?;
         }
         Ok(())
+    }
+
+    /// One slot of a pass's keeps: its body state settled
+    /// ([`SlotRows::keep_slot`]) on its home, and its position stood at its
+    /// kept rows.
+    fn keep_one(&mut self, r: &SlotRange, k: usize, what: &'static str) -> Result<(), GpuError> {
+        let GpuModel {
+            parked, body, gpu, ..
+        } = self;
+        let seq = match r.slot {
+            0 => None,
+            s => Some(parked_seq(parked, s, what)?),
+        };
+        body.keep_slot(gpu, seq, r, k)?;
+        let k = crate::launch_u32(what, "rows", k)?;
+        self.stand_slot(r.slot, r.pos0 + k, what)
     }
 
     /// Before a pass of `ranges`: the homes canonical (slot 0 selected:
@@ -844,7 +923,7 @@ where
         };
         self.name_host_refusal_by(r, |refusal| name_slots(refusal, ranges))?;
         if pass == SlotPass::Kept {
-            self.keep_rows(total, PassKind::Slots)?;
+            self.keep_rows(KeptRows::prefix(total), PassKind::Slots)?;
             self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
         }
         for r in ranges {

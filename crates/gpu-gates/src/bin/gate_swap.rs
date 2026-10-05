@@ -209,7 +209,7 @@ mod gate {
     use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
     use model::Tensor2;
-    use runtime::swaprule::{Flip, Shape, SwapParams, SwapRule};
+    use runtime::swaprule::{Flip, KeptRows, Shape, SwapParams, SwapRule};
 
     const LAYERS: Range<usize> = 2..6;
     const L: usize = LAYERS.end - LAYERS.start;
@@ -1186,7 +1186,7 @@ mod gate {
                 flags.enqueue_wait(stream, 0)?;
                 run.card.launch(gpu)?;
                 note_rows(&mut tally, rows)?;
-                m.end_pass(&mut tally, *kept)?;
+                m.end_pass(&mut tally, KeptRows::prefix(*kept))?;
                 let held_map = run.slots.clone();
                 if p + 1 < end {
                     match m.boundary(stream, &mut run.slots) {
@@ -1233,7 +1233,7 @@ mod gate {
             run.reports.push(report);
             run.sets.push(card_sets(&run.slots));
             note_rows(&mut tally, rows)?;
-            m.end_pass(&mut tally, *kept)?;
+            m.end_pass(&mut tally, KeptRows::prefix(*kept))?;
         }
         window.store(1, Ordering::Release);
         run.pinned_kept = LAYERS.zip(&pinned_slots).all(|(l, pins)| {
@@ -1279,7 +1279,7 @@ mod gate {
             run.slot_moves += report.landed;
             run.card.launch(gpu)?;
             note_rows(&mut tally, rows)?;
-            m.end_pass(&mut tally, *kept)?;
+            m.end_pass(&mut tally, KeptRows::prefix(*kept))?;
             let ran_on = run.slots.clone();
             if p + 1 < end {
                 pre = Some(m.boundary_ahead(stream, &mut run.slots)?);
@@ -1323,12 +1323,12 @@ mod gate {
         let b = m.boundary_ahead(stream, slots)?.boundary;
         let boundary = refused_ahead(m.boundary(stream, slots));
         let mut t = m.tally();
-        let end = refused_ahead(m.end_pass(&mut t, 0));
+        let end = refused_ahead(m.end_pass(&mut t, KeptRows::prefix(0)));
         let call = refused_ahead(m.begin_call(stream, CallCfg { floor: 1 }));
         let took = m.take_ahead().ok() == Some(b);
         let again = m.take_ahead().err().map(|e| e.to_string());
         let twice = again.as_deref().is_some_and(|e| e.contains("none waits"));
-        m.end_pass(&mut t, 0)?;
+        m.end_pass(&mut t, KeptRows::prefix(0))?;
         m.boundary_ahead(stream, slots)?;
         m.reset(stream, slots)?;
         let dropped = m.ahead().is_none() && m.take_ahead().is_err();
@@ -1525,7 +1525,7 @@ mod gate {
                     r.observe(i, row, layer_ids)?;
                 }
             }
-            r.end_pass(*kept)?;
+            r.end_pass(KeptRows::prefix(*kept))?;
         }
         Ok(flips)
     }
@@ -2117,14 +2117,14 @@ mod gate {
                 }
             }
         }
-        let missing = m.end_pass(&mut t, 1);
+        let missing = m.end_pass(&mut t, KeptRows::prefix(1));
         let missing_named = missing.as_ref().is_err_and(|e| {
             e.to_string()
                 .contains(&format!("row 0 at layer {}: slots [2]", skip.0))
         });
         let unbroken = m.broken().is_none();
         t.note(skip.0, 0, skip.1, rows[0][1][2])?;
-        let taken = m.end_pass(&mut t, 1).is_ok();
+        let taken = m.end_pass(&mut t, KeptRows::prefix(1)).is_ok();
         let ok = twice_named && outside == shapes.len() && missing_named && unbroken && taken;
         println!(
             "tally: a slot noted twice {:?}; notes outside the shape refused {outside} of {}; a kept \
@@ -2168,12 +2168,12 @@ mod gate {
         )?;
         tier.swap_boundary(gpu.stream())?
             .ok_or("gate_swap: the tier's boundary")?;
-        let kept_open = tier.keep_rows(1, PassKind::Step).is_ok();
+        let kept_open = tier.keep_rows(KeptRows::prefix(1), PassKind::Step).is_ok();
         tier.swap_reset(gpu.stream())?
             .ok_or("gate_swap: the tier's reset")?;
         let no_pass = tier.swap().is_some_and(|m| !m.pass_open());
         let refused = tier
-            .keep_rows(1, PassKind::Step)
+            .keep_rows(KeptRows::prefix(1), PassKind::Step)
             .err()
             .map(|e| e.to_string());
         let named = refused
@@ -2212,7 +2212,10 @@ mod gate {
             .err()
             .map(|e| e.to_string());
         let mut t = m.tally();
-        let end = m.end_pass(&mut t, 0).err().map(|e| e.to_string());
+        let end = m
+            .end_pass(&mut t, KeptRows::prefix(0))
+            .err()
+            .map(|e| e.to_string());
         let reset = m
             .reset(gpu.stream(), &mut r.slots)
             .err()
@@ -2571,7 +2574,7 @@ mod gate {
                 tier.swap_tally().ok_or("gate_swap: the tier's tally")?,
                 rows,
             )?;
-            tier.keep_rows(*kept, PassKind::Driver)?;
+            tier.keep_rows(KeptRows::prefix(*kept), PassKind::Driver)?;
         }
         window.store(0, Ordering::Release);
         let made = tier
@@ -2837,7 +2840,7 @@ mod gate {
             }
         }
         let mut tally = m.tally();
-        m.end_pass(&mut tally, 0)?;
+        m.end_pass(&mut tally, KeptRows::prefix(0))?;
         Ok(seen)
     }
 
