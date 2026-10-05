@@ -1,4 +1,5 @@
-//! The whole encoder over card buffers: the weights of one `deepseek41v` file uploaded once, and
+//! The whole encoder over card buffers: the weights of one `deepseek41v` file uploaded once, the
+//! activations of the largest image a plan makes allocated once beside them, and
 //! [`Encoder::encode`], from an image's bf16 patches to its aligner rows.
 //!
 //! The chain, op by op, with the reference line of `inference/vision.py` each launch
@@ -37,8 +38,8 @@ use crate::attn::{AttnArgs, AttnKernels, QkvLayout};
 use crate::gemm_bf16::{Epilogue, GemmArgs, GemmKernels};
 use crate::mlp::MlpKernels;
 use crate::norm::NormKernels;
-use crate::rope2d::{RopeArgs, RopeKernels, RopeTable};
-use bloomery_gpu::{DeviceTensor, GpuError};
+use crate::rope2d::{PAIRS, RopeArgs, RopeKernels, RopeTable};
+use bloomery_gpu::{DeviceTensor, GpuError, TensorWindow, Window, WindowMut};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::Gguf;
 use std::sync::Arc;
@@ -94,7 +95,8 @@ impl Weights {
 /// attention residual), `.norm2`, `.w1`, `.act`, `.mlp`, then `vit`, `aligner.x` (the unfolded
 /// rows), `aligner.w1`, `aligner.h`. `blk{b}.attn`, `blk{b}.mlp` and `aligner.w1` are the
 /// branch outputs before their fused epilogue: asking for one runs its GEMM a second time without
-/// the epilogue, into a buffer of its own, which leaves the chain's buffers untouched.
+/// the epilogue, into the buffer the fused launch then overwrites in full, so the chain reads none
+/// of it.
 pub trait TapSink {
     fn wants(&self, name: &str) -> bool;
     fn take(&mut self, name: &str, cols: usize, bits: Vec<u16>);
@@ -111,14 +113,25 @@ impl TapSink for NoTaps {
 }
 
 /// An encode's result: the aligner rows (`n_llm_h · n_llm_w` rows of `out_dim` bf16, reading
-/// order) and the chain launches it took.
-pub struct Encoded {
-    pub rows: DeviceTensor<u16>,
+/// order), a window of the encoder's own buffer that lives until its next call, and the chain
+/// launches it took.
+pub struct Encoded<'a> {
+    pub rows: TensorWindow<'a, u16>,
     pub launches: usize,
 }
 
-/// The loaded encoder: the kernels and the weights of one file.
+/// The loaded encoder: the chain of one file, the activations of the largest image a plan makes,
+/// and the stream every call runs on. A call takes `&mut self`: one image at a time owns the
+/// activations, which are reused in the stream's order, and the rows it returns borrow them until
+/// the next call.
 pub struct Encoder {
+    chain: Chain,
+    s: Scratch,
+    stream: Arc<CudaStream>,
+}
+
+/// What an encode reads and never writes: the hyperparameters, the kernels and the weights.
+struct Chain {
     hp: Hparams,
     gemm: GemmKernels,
     rope: RopeKernels,
@@ -130,10 +143,17 @@ pub struct Encoder {
     weight_bytes: usize,
 }
 
-/// The activations of one encode, sized for its patch count, and its RoPE table.
+/// The activations of the largest image a plan makes (`GridParams::max_patches` patches,
+/// `GridParams::max_cells` aligner rows), allocated at load. An image of `n` patches uses the
+/// first `n` rows of each buffer: its patches and its RoPE table are copied in, and every launch
+/// reads only rows that a copy or an earlier launch of the same image wrote, so nothing a larger
+/// image left behind is read.
 struct Scratch {
-    n_h: usize,
-    n_w: usize,
+    /// Patches and aligner rows the buffers hold.
+    max_patches: usize,
+    max_cells: usize,
+    /// The image's patches and its RoPE table.
+    patches: DeviceBuffer<u16>,
     cs: DeviceBuffer<f32>,
     /// The block input and output, and the aligner's input rows when `h` holds the final norm.
     xa: DeviceBuffer<u16>,
@@ -143,8 +163,10 @@ struct Scratch {
     att: DeviceBuffer<u16>,
     u: DeviceBuffer<u16>,
     act: DeviceBuffer<u16>,
-    /// `h` already holds the final norm's output (a forced tail from it): the tail skips the norm.
-    vit_given: bool,
+    /// The aligner's unfolded rows, its hidden rows and its output rows.
+    un: DeviceBuffer<u16>,
+    hh: DeviceBuffer<u16>,
+    rows: DeviceBuffer<u16>,
 }
 
 fn err(what: &'static str, e: impl std::error::Error + Send + Sync + 'static) -> GpuError {
@@ -153,10 +175,11 @@ fn err(what: &'static str, e: impl std::error::Error + Send + Sync + 'static) ->
 
 impl Encoder {
     /// Read the file's hyperparameters and tensor table (both refused by name when they are not
-    /// the V4.1 encoder's) and upload every weight. Load-time only.
+    /// the V4.1 encoder's), upload every weight and allocate the activations; every later call
+    /// runs on `stream`. Load-time only.
     pub fn load(
         ctx: &Arc<CudaContext>,
-        stream: &CudaStream,
+        stream: &Arc<CudaStream>,
         file: &Gguf,
     ) -> Result<Encoder, GpuError> {
         let what = "Encoder::load";
@@ -195,30 +218,41 @@ impl Encoder {
             mm2_b: f32s(names::mm2_bias())?,
         };
         let bytes = w.bytes();
+        let s = Scratch::new(stream, &hp)?;
         stream.synchronize()?;
         Ok(Encoder {
-            gemm: GemmKernels::load(ctx, stream)?,
-            rope: RopeKernels::load(ctx)?,
-            attn: AttnKernels::load(ctx)?,
-            norm: NormKernels::load(ctx)?,
-            mlp: MlpKernels::load(ctx)?,
-            aligner: AlignerKernels::load(ctx)?,
-            hp,
-            w,
-            weight_bytes: bytes,
+            chain: Chain {
+                gemm: GemmKernels::load(ctx, stream)?,
+                rope: RopeKernels::load(ctx)?,
+                attn: AttnKernels::load(ctx)?,
+                norm: NormKernels::load(ctx)?,
+                mlp: MlpKernels::load(ctx)?,
+                aligner: AlignerKernels::load(ctx)?,
+                hp,
+                w,
+                weight_bytes: bytes,
+            },
+            s,
+            stream: Arc::clone(stream),
         })
     }
 
     /// The file's hyperparameters.
     #[must_use]
     pub fn hparams(&self) -> &Hparams {
-        &self.hp
+        &self.chain.hp
     }
 
     /// Bytes of weights on the card.
     #[must_use]
     pub fn weight_bytes(&self) -> usize {
-        self.weight_bytes
+        self.chain.weight_bytes
+    }
+
+    /// Bytes of activations on the card: the buffers of the largest image a plan makes.
+    #[must_use]
+    pub fn scratch_bytes(&self) -> usize {
+        self.s.bytes()
     }
 
     /// Chain launches of one encode at `n_layer` blocks: the patch GEMM, nine per block, the
@@ -228,21 +262,22 @@ impl Encoder {
         1 + 9 * n_layer + 1 + 3
     }
 
-    /// Encode one image's patches. Eager: allocates the activations for this patch count,
-    /// enqueues the chain on `stream` and returns without synchronizing.
-    pub fn encode(&self, stream: &CudaStream, patches: &Patches) -> Result<Encoded, GpuError> {
-        self.encode_tapped(stream, patches, &mut NoTaps)
+    /// Encode one image's patches. Eager: copies the patches and their RoPE table into the
+    /// encoder's buffers, enqueues the chain on the encoder's stream and returns the rows without
+    /// waiting for it; read them on that stream.
+    pub fn encode(&mut self, patches: &Patches) -> Result<Encoded<'_>, GpuError> {
+        self.encode_tapped(patches, &mut NoTaps)
     }
 
     /// [`Encoder::encode`] handing the named intermediate tensors to `taps` ([`TapSink`]).
     pub fn encode_tapped(
-        &self,
-        stream: &CudaStream,
+        &mut self,
         patches: &Patches,
         taps: &mut dyn TapSink,
-    ) -> Result<Encoded, GpuError> {
+    ) -> Result<Encoded<'_>, GpuError> {
         let what = "Encoder::encode";
-        let hp = &self.hp;
+        let (chain, s, stream) = (&self.chain, &mut self.s, &*self.stream);
+        let hp = &chain.hp;
         let (n_h, n_w) = (patches.n_vit_h, patches.n_vit_w);
         let n = n_h * n_w;
         let k_patch = 3 * hp.patch * hp.patch;
@@ -256,14 +291,15 @@ impl Encoder {
                 ),
             });
         }
-        let x_in = DeviceBuffer::from_host(stream, &patches.bf16)?;
-        let mut s = self.scratch(stream, n_h, n_w)?;
-        self.gemm.enqueue(
+        s.start(stream, hp, (n_h, n_w), what)?;
+        WindowMut::<u16>::of_mut(&mut s.patches, 0, n * k_patch)?
+            .copy_from_host(stream, &patches.bf16)?;
+        chain.gemm.enqueue(
             stream,
             GemmArgs {
-                a: &x_in,
-                b: &self.w.patch_w,
-                bias: Some(&self.w.patch_b),
+                a: &s.patches,
+                b: &chain.w.patch_w,
+                bias: Some(&chain.w.patch_b),
                 epilogue: Epilogue::None,
                 resid: None,
                 m: n,
@@ -273,13 +309,13 @@ impl Encoder {
             },
         )?;
         let mut launches = 1;
-        tap(stream, taps, "embed", &s.xa, hp.dim)?;
+        tap(stream, taps, "embed", &s.xa, n, hp.dim)?;
         for b in 0..hp.n_layer {
-            launches += self.block(stream, b, &mut s, taps)?;
+            launches += chain.block(stream, b, n, s, taps)?;
         }
-        let (rows, tail) = self.tail(stream, &mut s, taps)?;
+        let (n_llm, tail) = chain.tail(stream, (n_h, n_w), s, false, taps)?;
         Ok(Encoded {
-            rows,
+            rows: DeviceTensor::window_of(&s.rows, 0, n_llm, hp.out_dim)?,
             launches: launches + tail,
         })
     }
@@ -288,44 +324,67 @@ impl Encoder {
     /// of block `b` from `x` and the block's output — a teacher-forced step, for a gate that feeds
     /// the reference's input to each block in turn.
     pub fn forced_block(
-        &self,
-        stream: &CudaStream,
+        &mut self,
         (n_h, n_w): (usize, usize),
         b: usize,
         x: &[u16],
     ) -> Result<Vec<u16>, GpuError> {
-        let mut s = self.forced_scratch(stream, (n_h, n_w), x)?;
-        self.block(stream, b, &mut s, &mut NoTaps)?;
-        to_host(stream, &s.xa)
+        self.forced_input((n_h, n_w), x)?;
+        let (chain, s, stream) = (&self.chain, &mut self.s, &*self.stream);
+        let n = n_h * n_w;
+        chain.block(stream, b, n, s, &mut NoTaps)?;
+        to_host(stream, &s.xa, n * chain.hp.dim)
     }
 
     /// The chain after the last block alone on the host rows `x`: the final norm's output and the
     /// aligner rows, teacher-forced as [`Encoder::forced_block`]. With `from_vit`, `x` is taken as
     /// the final norm's output and only the aligner runs.
     pub fn forced_tail(
-        &self,
-        stream: &CudaStream,
+        &mut self,
         (n_h, n_w): (usize, usize),
         x: &[u16],
         from_vit: bool,
     ) -> Result<(Vec<u16>, Vec<u16>), GpuError> {
-        let mut s = self.forced_scratch(stream, (n_h, n_w), x)?;
-        if from_vit {
-            s.vit_given = true;
-        }
-        let (rows, _) = self.tail(stream, &mut s, &mut NoTaps)?;
-        Ok((to_host(stream, &s.h)?, to_host(stream, rows.buf())?))
+        self.forced_input((n_h, n_w), x)?;
+        let (chain, s, stream) = (&self.chain, &mut self.s, &*self.stream);
+        let (n_llm, _) = chain.tail(stream, (n_h, n_w), s, from_vit, &mut NoTaps)?;
+        Ok((
+            to_host(stream, &s.h, n_h * n_w * chain.hp.dim)?,
+            to_host(stream, &s.rows, n_llm * chain.hp.out_dim)?,
+        ))
     }
 
-    /// The activations of an `n_h × n_w` image and its RoPE table.
-    fn scratch(&self, stream: &CudaStream, n_h: usize, n_w: usize) -> Result<Scratch, GpuError> {
-        let hp = &self.hp;
-        let (dim, ff, n) = (hp.dim, hp.ff, n_h * n_w);
-        let table = RopeTable::new(n_h, n_w, hp.rope_theta);
+    /// Start an `n_h × n_w` image whose host rows `x` are the block input (`xa`) and the final
+    /// norm's output (`h`).
+    fn forced_input(&mut self, (n_h, n_w): (usize, usize), x: &[u16]) -> Result<(), GpuError> {
+        let what = "Encoder::forced";
+        let (hp, s, stream) = (&self.chain.hp, &mut self.s, &*self.stream);
+        if n_h == 0 || n_w == 0 || x.len() != n_h * n_w * hp.dim {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!("{} values for {n_h}x{n_w} rows of {}", x.len(), hp.dim),
+            });
+        }
+        s.start(stream, hp, (n_h, n_w), what)?;
+        for buf in [&mut s.xa, &mut s.h] {
+            WindowMut::<u16>::of_mut(buf, 0, x.len())?.copy_from_host(stream, x)?;
+        }
+        Ok(())
+    }
+}
+
+impl Scratch {
+    /// The buffers of `hp`'s largest plan, zero-filled. Load-time only.
+    fn new(stream: &CudaStream, hp: &Hparams) -> Result<Scratch, GpuError> {
+        let grid = hp.grid();
+        let (n, n_llm) = (grid.max_patches(), grid.max_cells());
+        let (dim, ff) = (hp.dim, hp.ff);
+        let unfold_w = dim * hp.downsample * hp.downsample;
         Ok(Scratch {
-            n_h,
-            n_w,
-            cs: DeviceBuffer::from_host(stream, &table.cs)?,
+            max_patches: n,
+            max_cells: n_llm,
+            patches: DeviceBuffer::zeroed(stream, n * 3 * hp.patch * hp.patch)?,
+            cs: DeviceBuffer::zeroed(stream, n * 2 * PAIRS)?,
             xa: DeviceBuffer::zeroed(stream, n * dim)?,
             xb: DeviceBuffer::zeroed(stream, n * dim)?,
             h: DeviceBuffer::zeroed(stream, n * dim)?,
@@ -333,43 +392,71 @@ impl Encoder {
             att: DeviceBuffer::zeroed(stream, n * dim)?,
             u: DeviceBuffer::zeroed(stream, n * 2 * ff)?,
             act: DeviceBuffer::zeroed(stream, n * ff)?,
-            vit_given: false,
+            un: DeviceBuffer::zeroed(stream, n_llm * unfold_w)?,
+            hh: DeviceBuffer::zeroed(stream, n_llm * hp.out_dim)?,
+            rows: DeviceBuffer::zeroed(stream, n_llm * hp.out_dim)?,
         })
     }
 
-    /// [`Encoder::scratch`] with the host rows `x` as the block input (`xa`) and as the final
-    /// norm's output (`h`).
-    fn forced_scratch(
-        &self,
-        stream: &CudaStream,
-        (n_h, n_w): (usize, usize),
-        x: &[u16],
-    ) -> Result<Scratch, GpuError> {
-        let dim = self.hp.dim;
-        if n_h == 0 || n_w == 0 || x.len() != n_h * n_w * dim {
-            return Err(GpuError::Shape {
-                what: "Encoder::forced",
-                detail: format!("{} values for {n_h}x{n_w} rows of {dim}", x.len()),
-            });
-        }
-        let mut s = self.scratch(stream, n_h, n_w)?;
-        s.xa = DeviceBuffer::from_host(stream, x)?;
-        s.h = DeviceBuffer::from_host(stream, x)?;
-        Ok(s)
+    /// Bytes on the card.
+    fn bytes(&self) -> usize {
+        let bf16 = [
+            &self.patches,
+            &self.xa,
+            &self.xb,
+            &self.h,
+            &self.qkv,
+            &self.att,
+            &self.u,
+            &self.act,
+            &self.un,
+            &self.hh,
+            &self.rows,
+        ];
+        self.cs.num_bytes() + bf16.iter().map(|b| b.num_bytes()).sum::<usize>()
     }
 
-    /// Block `b` of the chain on `s.xa`, its output back in `s.xa`; returns the launches.
+    /// Start an `n_h × n_w` image: refuse a grid larger than the buffers (no plan makes one),
+    /// then write its RoPE table.
+    fn start(
+        &mut self,
+        stream: &CudaStream,
+        hp: &Hparams,
+        (n_h, n_w): (usize, usize),
+        what: &'static str,
+    ) -> Result<(), GpuError> {
+        let (ch, cw) = cells(n_h, n_w, hp.downsample);
+        let (n, n_llm) = (n_h * n_w, ch * cw);
+        if n > self.max_patches || n_llm > self.max_cells {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "a {n_h}x{n_w} grid ({n} patches, {n_llm} aligner rows) does not fit the encoder's buffers, sized for the largest grid a plan makes: {} patches, {} aligner rows",
+                    self.max_patches, self.max_cells
+                ),
+            });
+        }
+        let table = RopeTable::new(n_h, n_w, hp.rope_theta);
+        WindowMut::<f32>::of_mut(&mut self.cs, 0, table.cs.len())?
+            .copy_from_host(stream, &table.cs)?;
+        Ok(())
+    }
+}
+
+impl Chain {
+    /// Block `b` of the chain on the first `n` rows of `s.xa`, its output back in `s.xa`; returns
+    /// the launches.
     fn block(
         &self,
         stream: &CudaStream,
         b: usize,
+        n: usize,
         s: &mut Scratch,
         taps: &mut dyn TapSink,
     ) -> Result<usize, GpuError> {
         let hp = &self.hp;
         let bw = &self.w.blocks[b];
         let (dim, ff, heads) = (hp.dim, hp.ff, hp.n_head);
-        let n = s.n_h * s.n_w;
         let lay = QkvLayout {
             row_width: 3 * dim,
             q0: 0,
@@ -381,7 +468,7 @@ impl Encoder {
         let name = |op: &str| format!("blk{b}.{op}");
         self.norm
             .enqueue(stream, &s.xa, &bw.ln1, hp.eps, n, &mut s.h)?;
-        tap(stream, taps, &name("norm1"), &s.h, dim)?;
+        tap(stream, taps, &name("norm1"), &s.h, n, dim)?;
         self.gemm.enqueue(
             stream,
             GemmArgs {
@@ -396,7 +483,7 @@ impl Encoder {
                 c: &mut s.qkv,
             },
         )?;
-        tap(stream, taps, &name("qkv"), &s.qkv, 3 * dim)?;
+        tap(stream, taps, &name("qkv"), &s.qkv, n, 3 * dim)?;
         self.rope.enqueue(
             stream,
             RopeArgs {
@@ -411,7 +498,7 @@ impl Encoder {
         )?;
         for (op, c0) in [("qrot", 0), ("krot", dim)] {
             if taps.wants(&name(op)) {
-                let all = to_host(stream, &s.qkv)?;
+                let all = to_host(stream, &s.qkv, n * 3 * dim)?;
                 let cols: Vec<u16> = all
                     .chunks_exact(3 * dim)
                     .flat_map(|r| r[c0..c0 + dim].iter().copied())
@@ -430,13 +517,14 @@ impl Encoder {
                 out: &mut s.att,
             },
         )?;
-        tap(stream, taps, &name("sdpa"), &s.att, dim)?;
+        tap(stream, taps, &name("sdpa"), &s.att, n, dim)?;
         self.side(
             stream,
             taps,
             &name("attn"),
             (&s.att, &bw.o_w, Some(&bw.o_b)),
             (n, dim, dim),
+            &mut s.xb,
         )?;
         self.gemm.enqueue(
             stream,
@@ -452,10 +540,10 @@ impl Encoder {
                 c: &mut s.xb,
             },
         )?;
-        tap(stream, taps, &name("resid1"), &s.xb, dim)?;
+        tap(stream, taps, &name("resid1"), &s.xb, n, dim)?;
         self.norm
             .enqueue(stream, &s.xb, &bw.ln2, hp.eps, n, &mut s.h)?;
-        tap(stream, taps, &name("norm2"), &s.h, dim)?;
+        tap(stream, taps, &name("norm2"), &s.h, n, dim)?;
         self.gemm.enqueue(
             stream,
             GemmArgs {
@@ -470,15 +558,16 @@ impl Encoder {
                 c: &mut s.u,
             },
         )?;
-        tap(stream, taps, &name("w1"), &s.u, 2 * ff)?;
+        tap(stream, taps, &name("w1"), &s.u, n, 2 * ff)?;
         self.mlp.enqueue(stream, &s.u, ff, n, &mut s.act)?;
-        tap(stream, taps, &name("act"), &s.act, ff)?;
+        tap(stream, taps, &name("act"), &s.act, n, ff)?;
         self.side(
             stream,
             taps,
             &name("mlp"),
             (&s.act, &bw.w2, None),
             (n, dim, ff),
+            &mut s.xa,
         )?;
         self.gemm.enqueue(
             stream,
@@ -494,33 +583,34 @@ impl Encoder {
                 c: &mut s.xa,
             },
         )?;
-        tap(stream, taps, &format!("blk{b}"), &s.xa, dim)?;
+        tap(stream, taps, &format!("blk{b}"), &s.xa, n, dim)?;
         Ok(9)
     }
 
-    /// The chain after the last block: the final norm of `s.xa` into `s.h` (skipped when
-    /// `s.vit_given`), the unfold and the aligner's two GEMMs; returns the rows and the launches.
+    /// The chain after the last block on an `n_h × n_w` grid: the final norm of `s.xa` into `s.h`
+    /// (skipped when `vit_given`: `s.h` holds it already), the unfold and the aligner's two GEMMs
+    /// into `s.rows`; returns the aligner rows and the launches.
     fn tail(
         &self,
         stream: &CudaStream,
+        (n_h, n_w): (usize, usize),
         s: &mut Scratch,
+        vit_given: bool,
         taps: &mut dyn TapSink,
-    ) -> Result<(DeviceTensor<u16>, usize), GpuError> {
+    ) -> Result<(usize, usize), GpuError> {
         let hp = &self.hp;
         let dim = hp.dim;
-        let (n_h, n_w) = (s.n_h, s.n_w);
         let n = n_h * n_w;
         let (ch, cw) = cells(n_h, n_w, hp.downsample);
         let n_llm = ch * cw;
         let unfold_w = dim * hp.downsample * hp.downsample;
         let mut launches = 0;
-        if !s.vit_given {
+        if !vit_given {
             self.norm
                 .enqueue(stream, &s.xa, &self.w.post_ln, hp.eps, n, &mut s.h)?;
             launches += 1;
         }
-        tap(stream, taps, "vit", &s.h, dim)?;
-        let mut un = DeviceBuffer::zeroed(stream, n_llm * unfold_w)?;
+        tap(stream, taps, "vit", &s.h, n, dim)?;
         self.aligner.enqueue(
             stream,
             UnfoldArgs {
@@ -529,22 +619,22 @@ impl Encoder {
                 n_w,
                 dim,
                 r: hp.downsample,
-                y: &mut un,
+                y: &mut s.un,
             },
         )?;
-        tap(stream, taps, "aligner.x", &un, unfold_w)?;
+        tap(stream, taps, "aligner.x", &s.un, n_llm, unfold_w)?;
         self.side(
             stream,
             taps,
             "aligner.w1",
-            (&un, &self.w.mm1_w, Some(&self.w.mm1_b)),
+            (&s.un, &self.w.mm1_w, Some(&self.w.mm1_b)),
             (n_llm, hp.out_dim, unfold_w),
+            &mut s.hh,
         )?;
-        let mut hh = DeviceBuffer::zeroed(stream, n_llm * hp.out_dim)?;
         self.gemm.enqueue(
             stream,
             GemmArgs {
-                a: &un,
+                a: &s.un,
                 b: &self.w.mm1_w,
                 bias: Some(&self.w.mm1_b),
                 epilogue: Epilogue::Gelu,
@@ -552,15 +642,14 @@ impl Encoder {
                 m: n_llm,
                 n: hp.out_dim,
                 k: unfold_w,
-                c: &mut hh,
+                c: &mut s.hh,
             },
         )?;
-        tap(stream, taps, "aligner.h", &hh, hp.out_dim)?;
-        let mut rows = DeviceTensor::zeroed(stream, n_llm, hp.out_dim)?;
+        tap(stream, taps, "aligner.h", &s.hh, n_llm, hp.out_dim)?;
         self.gemm.enqueue(
             stream,
             GemmArgs {
-                a: &hh,
+                a: &s.hh,
                 b: &self.w.mm2_w,
                 bias: Some(&self.w.mm2_b),
                 epilogue: Epilogue::None,
@@ -568,15 +657,16 @@ impl Encoder {
                 m: n_llm,
                 n: hp.out_dim,
                 k: hp.out_dim,
-                c: rows.buf_mut(),
+                c: &mut s.rows,
             },
         )?;
         launches += 3;
-        Ok((rows, launches))
+        Ok((n_llm, launches))
     }
 
     /// A branch GEMM without its fused epilogue, for a tap only: `a · bᵀ (+ bias)` of shape
-    /// `(m, n, k)` into a buffer of its own, handed to `taps` under `name`.
+    /// `(m, n, k)` into `c`, the buffer the fused launch after it overwrites in full, handed to
+    /// `taps` under `name`.
     #[allow(
         clippy::type_complexity,
         reason = "the operand triple and the shape triple of one GEMM, named at the call"
@@ -592,11 +682,11 @@ impl Encoder {
             Option<&DeviceBuffer<f32>>,
         ),
         (m, n, k): (usize, usize, usize),
+        c: &mut DeviceBuffer<u16>,
     ) -> Result<(), GpuError> {
         if !taps.wants(name) {
             return Ok(());
         }
-        let mut c = DeviceBuffer::zeroed(stream, m * n)?;
         self.gemm.enqueue(
             stream,
             GemmArgs {
@@ -608,31 +698,34 @@ impl Encoder {
                 m,
                 n,
                 k,
-                c: &mut c,
+                c,
             },
         )?;
-        tap(stream, taps, name, &c, n)
+        tap(stream, taps, name, c, m, n)
     }
 }
 
-/// Hand `buf` to `taps` under `name` when it asks for it.
+/// Hand the first `rows` rows of `buf` (`cols` values each) to `taps` under `name` when it asks
+/// for them.
 fn tap(
     stream: &CudaStream,
     taps: &mut dyn TapSink,
     name: &str,
     buf: &DeviceBuffer<u16>,
+    rows: usize,
     cols: usize,
 ) -> Result<(), GpuError> {
     if taps.wants(name) {
-        let v = to_host(stream, buf)?;
+        let v = to_host(stream, buf, rows * cols)?;
         taps.take(name, cols, v);
     }
     Ok(())
 }
 
-fn to_host(stream: &CudaStream, buf: &DeviceBuffer<u16>) -> Result<Vec<u16>, GpuError> {
+/// The first `len` values of `buf`, after the stream's work so far.
+fn to_host(stream: &CudaStream, buf: &DeviceBuffer<u16>, len: usize) -> Result<Vec<u16>, GpuError> {
     stream.synchronize()?;
-    Ok(buf.to_host_vec(stream)?)
+    Ok(Window::<u16>::of(buf, 0, len)?.to_host_vec(stream)?)
 }
 
 fn tensor_bytes<'a>(file: &'a Gguf, name: &str) -> Result<&'a [u8], GpuError> {

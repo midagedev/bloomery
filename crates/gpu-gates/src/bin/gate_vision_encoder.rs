@@ -21,6 +21,11 @@
 //! 4. The plain encode run twice is bit-identical to itself and to the tapped run, and takes
 //!    `Encoder::launches` launches.
 //!
+//! Then once, after every image: an encode does not depend on the larger images encoded before it
+//! in the encoder's reused buffers — `odd-777x513`, the set's largest grid, the largest grid a plan
+//! makes (a synthetic strip that fills the buffers to their last row), then `odd-777x513` again,
+//! bit for bit equal to its first encode.
+//!
 //! The bands of the patch embedding, block 0 and every teacher-forced tap are measurements of this
 //! build against this set, pinned per tap name as the widest over the images. A free-running tap
 //! after block 0 is held to a multiple of the reference's distance from itself under one-ulp
@@ -55,16 +60,19 @@ mod gate {
     use bloomery_gpu_vision::norm::rms_norm_ref;
     use bloomery_gpu_vision::rope2d::{RopeTable, rope_ref};
     use bloomery_gpu_vision::{bf16_f32, f32_bf16};
-    use cuda_core::CudaContext;
+    use cuda_core::{CudaContext, CudaStream};
     use gguf::Gguf;
     use refset::arch::deepseek41v::{VISION, VISION_SET};
     use refset::vision::{Image, VisionSet};
     use vision::arch::deepseek41v::names;
-    use vision::{Rgb8, preprocess};
+    use vision::{Patches, Rgb8, preprocess};
 
     const NAME: &str = "gate_vision_encoder";
     /// The image whose every block and block-0 ops the set holds.
     const FULL: &str = "grad-448";
+    /// The image encoded on both sides of the larger grids: it pads on both axes, so its unfold
+    /// writes zero cells where a larger grid has patches.
+    const SMALL: &str = "odd-777x513";
     /// Threads the host rules run on.
     const HOST_THREADS: usize = 8;
     /// A free-running tap after block 0 passes when `rms(ours − ref) / rms(ref)` is at most this
@@ -1068,6 +1076,70 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------------------ reused buffers
+
+    /// The encoder's buffers are sized for the largest grid a plan makes and reused by every
+    /// image: [`SMALL`]'s rows are bit for bit the same after the set's largest grid and the
+    /// largest plan (a strip of one row of cells as wide as the token budget allows, built here,
+    /// whose encode fills every buffer to its last row) as before them.
+    fn stale_rows(
+        enc: &mut Encoder,
+        set: &Set,
+        images_dir: &Path,
+        stream: &CudaStream,
+    ) -> Result<bool, GateError> {
+        let grid = enc.hparams().grid();
+        let png = |img: &Image| -> Result<Patches, GateError> {
+            let bytes = std::fs::read(images_dir.join(&img.name))
+                .map_err(|e| format!("{}: {e}", img.name))?;
+            Ok(preprocess(&Rgb8::from_png(&bytes)?, &grid)?)
+        };
+        let small = set
+            .images
+            .iter()
+            .find(|i| i.stem() == SMALL)
+            .ok_or_else(|| format!("{SMALL} is not in the set"))?;
+        let largest = set
+            .images
+            .iter()
+            .max_by_key(|i| i.n_vit_h * i.n_vit_w)
+            .ok_or("the set has no image")?;
+        let side = grid.patch * grid.downsample;
+        let (width, height) = (side * grid.max_cells(), side);
+        let strip = Rgb8 {
+            width,
+            height,
+            data: (0..width * height * 3)
+                .map(|i| (i * 37 % 251) as u8)
+                .collect(),
+        };
+        let strip = preprocess(&strip, &grid)?;
+        let (patches, cells) = (
+            strip.n_vit_h * strip.n_vit_w,
+            strip.n_vit_h.div_ceil(grid.downsample) * strip.n_vit_w.div_ceil(grid.downsample),
+        );
+        let full = (patches, cells) == (grid.max_patches(), grid.max_cells());
+        let mut rows = |p: &Patches| -> Result<Vec<u16>, GateError> {
+            Ok(enc.encode(p)?.rows.buf().to_host_vec(stream)?)
+        };
+        let small_p = png(small)?;
+        let first = rows(&small_p)?;
+        rows(&png(largest)?)?;
+        rows(&strip)?;
+        let again = rows(&small_p)?;
+        let pass = full && first == again;
+        println!(
+            "reuse {SMALL} after {} and the largest plan ({}x{} patches, {patches} of {}, {cells} aligner rows of {}): bit-identical to its first encode: {}",
+            largest.stem(),
+            strip.n_vit_h,
+            strip.n_vit_w,
+            grid.max_patches(),
+            grid.max_cells(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     // ------------------------------------------------------------ run
 
     pub fn run() -> Result<(), GateError> {
@@ -1075,17 +1147,20 @@ mod gate {
         let file = Gguf::open(&set.mmproj)?;
         let ctx = CudaContext::new(0)?;
         let stream = ctx.new_stream()?;
-        let enc = Encoder::load(&ctx, &stream, &file)?;
+        let mut enc = Encoder::load(&ctx, &stream, &file)?;
         let hp = enc.hparams().clone();
         let want_launches = Encoder::launches(hp.n_layer);
         println!(
-            "load: {} blocks, dim {}, heads {}, ff {}, out {}; weights on the card {} B; {} launches per image",
+            "load: {} blocks, dim {}, heads {}, ff {}, out {}; weights on the card {} B; activations {} B for the largest plan ({} patches, {} aligner rows); {} launches per image",
             hp.n_layer,
             hp.dim,
             hp.n_head,
             hp.ff,
             hp.out_dim,
             enc.weight_bytes(),
+            enc.scratch_bytes(),
+            hp.grid().max_patches(),
+            hp.grid().max_cells(),
             want_launches
         );
         let hw = host_w(&file)?;
@@ -1121,9 +1196,11 @@ mod gate {
                 want,
                 got: HashMap::new(),
             };
-            let tapped = enc.encode_tapped(&stream, &patches, &mut sink)?;
-            stream.synchronize()?;
-            let out = tapped.rows.buf().to_host_vec(&stream)?;
+            let (out, tapped_launches) = {
+                let tapped = enc.encode_tapped(&patches, &mut sink)?;
+                stream.synchronize()?;
+                (tapped.rows.buf().to_host_vec(&stream)?, tapped.launches)
+            };
 
             for tap in taps.iter().map(String::as_str).chain(["aligner"]) {
                 let ours = if tap == "aligner" {
@@ -1169,7 +1246,7 @@ mod gate {
                 if !(set.files.contains_key(&fi) && set.files.contains_key(&fo)) {
                     continue;
                 }
-                let got = enc.forced_block(&stream, grid, b, &read_bits(&set.dir, &fi)?)?;
+                let got = enc.forced_block(grid, b, &read_bits(&set.dir, &fi)?)?;
                 ok &= band_check(
                     &set.sensitivity,
                     &stem,
@@ -1180,8 +1257,7 @@ mod gate {
             }
             let last = format!("{stem}.blk{}.bf16", hp.n_layer - 1);
             if set.files.contains_key(&last) {
-                let (vit, _) =
-                    enc.forced_tail(&stream, grid, &read_bits(&set.dir, &last)?, false)?;
+                let (vit, _) = enc.forced_tail(grid, &read_bits(&set.dir, &last)?, false)?;
                 ok &= band_check(
                     &set.sensitivity,
                     &stem,
@@ -1191,7 +1267,6 @@ mod gate {
                 );
             }
             let (_, rows) = enc.forced_tail(
-                &stream,
                 grid,
                 &read_bits(&set.dir, &format!("{stem}.vit.bf16"))?,
                 true,
@@ -1208,23 +1283,22 @@ mod gate {
                 ok &= host_rules(&enc, &hw, &sink.got, &patches.bf16, img, &out)?;
             }
 
-            let a = enc.encode(&stream, &patches)?;
-            let b = enc.encode(&stream, &patches)?;
-            stream.synchronize()?;
-            let (va, vb) = (
-                a.rows.buf().to_host_vec(&stream)?,
-                b.rows.buf().to_host_vec(&stream)?,
-            );
+            let (va, a_launches) = {
+                let a = enc.encode(&patches)?;
+                (a.rows.buf().to_host_vec(&stream)?, a.launches)
+            };
+            let vb = enc.encode(&patches)?.rows.buf().to_host_vec(&stream)?;
             let twice = va == vb && va == out;
-            let launches = a.launches == want_launches && tapped.launches == want_launches;
+            let launches = a_launches == want_launches && tapped_launches == want_launches;
             println!(
                 "image {stem}: eager twice bit-identical and equal to the tapped run: {}; launches {} (want {want_launches}): {}",
                 verdict(twice),
-                a.launches,
+                a_launches,
                 verdict(launches)
             );
             ok &= twice && launches;
         }
+        ok &= stale_rows(&mut enc, &set, &images_dir, &stream)?;
 
         println!("widest per tap (the pin table's measured values; a ratio for a ruled tap):");
         let mut names: Vec<&String> = widest.keys().collect();

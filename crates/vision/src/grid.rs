@@ -22,6 +22,23 @@ pub struct GridParams {
     pub min_pixels: usize,
 }
 
+impl GridParams {
+    /// The most aligner cells a plan takes: `max_tokens − 3`. A plan's `h × w` cells cost
+    /// `h·(w + 1) + 2 ≤ max_tokens` tokens, so `h·w = h·(w + 1) − h ≤ max_tokens − 2 − 1`, met by one
+    /// row of `max_tokens − 3` cells (`solve_resize_ratio`'s widest grid). 0 where no cell fits.
+    #[must_use]
+    pub fn max_cells(&self) -> usize {
+        self.max_tokens.saturating_sub(3)
+    }
+
+    /// The most ViT patches a plan takes: `downsample²` per cell of [`GridParams::max_cells`]
+    /// (an axis of `n` patches has `ceil(n / downsample)` cells), met by the same row of full cells.
+    #[must_use]
+    pub fn max_patches(&self) -> usize {
+        self.downsample * self.downsample * self.max_cells()
+    }
+}
+
 /// The plan for one image: its pixel size before patching (`best_*`, multiples of the patch) and
 /// the token grid of the aligner (`n_llm_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,5 +176,34 @@ mod tests {
                 "{w}x{h}"
             );
         }
+    }
+
+    /// `max_cells` and `max_patches` hold for every plan and are met. A boundary sweep, not an
+    /// exhaustive one (images have no largest size): every image of whole patches up to
+    /// `downsample · max_tokens` patches a side, a bound that does not lean on the values under
+    /// test. Those sides hold every grid the budget check passes as it is (a longer axis alone is
+    /// over budget), and every larger image takes the `solve_resize_ratio` grid of its aspect ratio
+    /// (its own size enters only through rounding), which the ratios of those sides sweep. The
+    /// maximum, one row of cells as wide as the budget allows, is among them.
+    #[test]
+    fn max_patches_bound_every_plan() {
+        let side = V41.downsample * V41.max_tokens;
+        let mut most = (0, 0);
+        for a in 1..=side {
+            for b in 1..=side {
+                let plan = plan_image_grid(b * V41.patch, a * V41.patch, &V41);
+                let cells = plan.n_llm_h * plan.n_llm_w;
+                let patches = plan.n_vit_h(&V41) * plan.n_vit_w(&V41);
+                assert!(
+                    plan.n_tokens() <= V41.max_tokens
+                        && cells <= V41.max_cells()
+                        && patches <= V41.max_patches(),
+                    "{a}x{b} patches: {plan:?}"
+                );
+                most = most.max((patches, cells));
+            }
+        }
+        assert_eq!(most, (V41.max_patches(), V41.max_cells()));
+        assert_eq!((V41.max_patches(), V41.max_cells()), (9189, 1021));
     }
 }
