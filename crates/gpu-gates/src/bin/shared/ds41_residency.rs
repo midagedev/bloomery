@@ -246,22 +246,6 @@ fn take_passes(
     Ok(b.take_residency_passes())
 }
 
-/// The rule after `pass` from a clear: the prompt, `pass`, then the next
-/// boundary, which folds the pass's kept rows.
-fn rule_after(
-    s: &mut Session<Body>,
-    ids: &[u32],
-    pass: impl FnOnce(&mut Session<Body>, u32) -> Result<(), GateError>,
-) -> Result<SwapRule, GateError> {
-    s.clear()?;
-    let next = s.prompt(ids, Want::Argmax)?.argmax();
-    pass(s, next)?;
-    s.model_mut().pass_boundary()?;
-    let rule = rule_of(s)?;
-    take_passes(s)?;
-    Ok(rule)
-}
-
 /// Each seed layer's live experts, sorted, in `seeds`' order.
 fn live_sets(s: &Session<Body>, seeds: &[(usize, Vec<u32>)]) -> Result<Vec<Vec<u32>>, GateError> {
     let m = s.model();
@@ -313,11 +297,8 @@ pub fn refuse_clause(
     let plan = inputs.plan(&machine, workstation::CTX_MAX, &cfg.place)?;
     let pool = swap::churn(&plan, 0, RESIDENCY)?.ok_or("no churn pool under mid")?;
     record::residency_host("mid-p40-s1", &pool, &plan).print();
-    let short = i128::from(machine.host.usable_bytes) - plan.host.headroom_bytes
-        + i128::from(pool.bytes)
-        - 1;
-    let mut small = machine.clone();
-    small.host.usable_bytes = u64::try_from(short)?;
+    let (short, small) =
+        crate::residency_clauses::refuse_head(&machine, plan.host.headroom_bytes, pool.bytes)?;
     crate::residency_clauses::refuse_tail(short, pool.bytes, REFUSE_BOUND_S, move || {
         open(path, place, move |_| small.clone(), cfg)
     })
@@ -331,14 +312,7 @@ fn seeds(s: &Session<Body>) -> Result<Vec<(usize, Vec<u32>)>, GateError> {
         .hybrid()
         .swap()
         .ok_or("the load runs no residency machine")?;
-    let mut out = Vec::new();
-    for l in b.hybrid().slots().layers() {
-        let seed = machine.seed(l)?;
-        if !seed.is_empty() {
-            out.push((l, seed));
-        }
-    }
-    Ok(out)
+    crate::residency_clauses::seeds(machine, b.hybrid().slots().layers())
 }
 
 /// Per layer, every tier entry of the host map.
@@ -375,22 +349,10 @@ fn transform_clause(s: &Session<Body>) -> Result<bool, GateError> {
         );
         return Ok(false);
     }
-    let mut layers = Vec::new();
-    for l in b.hybrid().slots().layers() {
-        layers.push((l, machine.seed(l)?));
-    }
+    let layers = crate::residency_clauses::layer_seeds(machine, b.hybrid().slots().layers())?;
     let (checked, bad) =
         crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers, |_| 3)?;
-    let ok = checked > 0 && bad.is_empty();
-    println!(
-        "transform: {checked} admitted experts, {} parts differ from a static load{}: {}",
-        bad.len(),
-        bad.first()
-            .map(|f| format!(" (first {f})"))
-            .unwrap_or_default(),
-        verdict(ok)
-    );
-    Ok(ok)
+    Ok(crate::residency_clauses::transform_verdict(checked, &bad))
 }
 
 /// `resident`: the churn pool and the host experts in, the pinned out.
@@ -513,16 +475,16 @@ pub fn clauses(
     let tier_at_load = tier_entries(s)?;
     let seeds = seeds(s)?;
 
-    let step = rule_after(s, &ids, |s, t| {
+    let step = crate::residency_clauses::rule_after(s, &ids, rule_of, take_passes, |s, t| {
         s.step(t, Want::Argmax)?;
         Ok(())
     })?;
-    let one = rule_after(s, &ids, |s, t| {
+    let one = crate::residency_clauses::rule_after(s, &ids, rule_of, take_passes, |s, t| {
         s.verify::<2>([t, t])?;
         s.commit(1)?;
         Ok(())
     })?;
-    let both = rule_after(s, &ids, |s, t| {
+    let both = crate::residency_clauses::rule_after(s, &ids, rule_of, take_passes, |s, t| {
         s.verify::<2>([t, t])?;
         s.commit(2)?;
         Ok(())
@@ -541,15 +503,7 @@ pub fn clauses(
     pass &= transform_clause(s)?;
     pass &= resident_clause(s, &seeds)?;
     let again = history(s, &ids, None)?;
-    let c1 = first == again && first.landed > 0;
-    println!(
-        "c1: the history twice, {} tokens, {} flips landed: same {}: {}",
-        first.tokens.len(),
-        first.landed,
-        first == again,
-        verdict(c1)
-    );
-    pass &= c1;
+    pass &= crate::residency_clauses::c1_clause(first.tokens.len(), first.landed, first == again);
 
     pass &= crate::residency_clauses::passes_clause(&first.passes, STEPS);
 
