@@ -180,7 +180,9 @@ mod gate {
     use bloomery_gpu_gates::bind::nvidia_smi_index;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
-    use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
+    use bloomery_gpu_gates::serve_client::{
+        Served, curl, ids_of, json_of, metric, parse_ids, server_log,
+    };
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -996,19 +998,6 @@ mod gate {
         })
     }
 
-    /// `/metrics`' `llamacpp:<name>` value; `None` when it carries none.
-    fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
-        let (st, body) = curl(&url("/metrics"), None, false)?;
-        if st != 200 {
-            return Err(format!("/metrics: HTTP {st}: {body}").into());
-        }
-        let key = format!("llamacpp:{name} ");
-        Ok(body
-            .lines()
-            .find_map(|l| l.strip_prefix(&key))
-            .and_then(|v| v.trim().parse().ok()))
-    }
-
     /// The swap clause (module header) on a server of two slots started into
     /// `<dir>/swap`.
     fn swap(a: &Args) -> Result<bool, GateError> {
@@ -1442,16 +1431,12 @@ mod gate {
 
         ok &= drafted_reuse(&url, &a.ids, hp.window)?;
 
-        let (st, m) = curl(&url("/metrics"), None, false)?;
-        let drafted_total = m.lines().find_map(|l| {
-            l.strip_prefix("llamacpp:spec_decode_num_draft_tokens_total ")
-                .and_then(|v| v.parse::<f64>().ok())
-        });
+        let drafted_total = metric(&url, "spec_decode_num_draft_tokens_total")?;
         println!("metrics spec_decode_num_draft_tokens_total {drafted_total:?}");
         check(
             &mut ok,
             "draft_metrics_count_the_drafts",
-            st == 200 && drafted_total.is_some_and(|v| v > 0.0),
+            drafted_total.is_some_and(|v| v > 0.0),
         );
 
         println!("server stopped: {}", served.stop()?);
@@ -1757,33 +1742,15 @@ mod gate {
     /// re-derivations plan with the same reading — a census read here would
     /// see the loaded server's own bytes as taken and size another plan, and a
     /// census-free re-plan (`workstation::plan_gate`) misses the cap the server
-    /// planned under. A server that printed no `plan` record, or a record
-    /// without its `card_free`, is a named error, never an uncapped re-plan.
+    /// planned under. A server that printed no `plan` record or more than
+    /// one, or a record without its `card_free`, is a named error, never an
+    /// uncapped re-plan.
     fn server_card_free(err_log: &Path) -> Result<u64, GateError> {
-        let kind = &record::PLAN;
-        let head = format!("{} ", kind.head);
-        let line = std::fs::read_to_string(err_log)?
-            .lines()
-            .find(|l| l.starts_with(&head))
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                format!(
-                    "{}: the server printed no `{}` record",
-                    err_log.display(),
-                    kind.name
-                )
-            })?;
-        line.split(" card_free=")
-            .nth(1)
-            .and_then(|t| t.split(' ').next())
-            .and_then(|n| n.parse::<u64>().ok())
-            .ok_or_else(|| {
-                format!(
-                    "the server's `{}` record carries no card_free: {line}",
-                    kind.name
-                )
-                .into()
-            })
+        let free = server_log(err_log, record::BLOOMERY_SERVE_DS41)?
+            .one(&record::PLAN)?
+            .u64("card_free")?;
+        println!("the server's plan record: card_free={free}");
+        Ok(free)
     }
 
     pub fn run() -> Result<(), GateError> {

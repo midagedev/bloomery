@@ -117,9 +117,10 @@
 //! 2`) names the cards the model runs on — `cards` the A6000 alone under
 //! `--place a` with no tier fields, the A6000 then the 3090 under `--place bp`
 //! with the tier's experts (`tier_experts` > 0) — as a V4.1 binary's load
-//! record names them (`generate::with_cards`): the field read as
-//! `tools/bloomery/records.py` reads a csv field, each item exactly the
-//! driver name of the device the placement resolves to; the same check on
+//! record names them (`generate::with_cards`): the record read by the
+//! binary's kinds (`record::Log`, `tools/bloomery/records.py`'s rules), each
+//! `cards` item exactly the driver name of the device the placement resolves
+//! to; the same check on
 //! the line with its first card's name grown by a letter inside the brackets
 //! is red. Two loads, one a process.
 
@@ -151,6 +152,7 @@ mod gate {
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
     use bloomery_gpu_glm5next::{
         Body, Glm5nextModel, NEXTN_ON_TIER, PrefillMode, TIER_BEFORE_UPLOAD, feed,
@@ -1354,8 +1356,9 @@ mod gate {
     // ------------------------------------------------ the load record's cards
 
     /// The `load` record `generate_glm5next --place <place>` prints: the
-    /// binary beside this one, a short run of `ids`, stdout read whole.
-    fn load_line(place: &str, ids: &[u32]) -> Result<String, GateError> {
+    /// binary beside this one, a short run of `ids`, stdout read whole by its
+    /// kinds.
+    fn load_record(place: &str, ids: &[u32]) -> Result<Fields, GateError> {
         let exe = std::env::current_exe()?.with_file_name("generate_glm5next");
         let tokens: Vec<String> = ids.iter().map(u32::to_string).collect();
         let out = std::process::Command::new(&exe)
@@ -1371,44 +1374,17 @@ mod gate {
             )
             .into());
         }
-        String::from_utf8(out.stdout)?
-            .lines()
-            .find(|l| l.starts_with("load resident_bytes="))
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                format!("generate_glm5next --place {place} printed no load record").into()
-            })
+        let stdout = String::from_utf8(out.stdout)?;
+        let log = record::Log::of(&stdout, record::GENERATE_GLM5NEXT)
+            .named(format!("generate_glm5next --place {place}"));
+        Ok(log.one(&record::LOAD_GENERATOR)?)
     }
 
-    /// The value of `key=` on a record line, `None` when the line has none.
-    fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-        line.split(' ')
-            .find_map(|w| w.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
-    }
-
-    /// The items of the csv field `key` on a record line, read by
-    /// `tools/bloomery/records.py`'s rule: the value is `[` items `]`, the
-    /// items split on `,` and trimmed, `[]` none; a line with no such field,
-    /// or a value not in brackets, is refused by name.
-    fn csv_field<'a>(line: &'a str, key: &str) -> Result<Vec<&'a str>, String> {
-        let v = field(line, key).ok_or_else(|| format!("no {key}= field"))?;
-        let inner = v
-            .strip_prefix('[')
-            .and_then(|v| v.strip_suffix(']'))
-            .ok_or_else(|| format!("{key}={v} is not a [..] csv value"))?
-            .trim();
-        Ok(if inner.is_empty() {
-            Vec::new()
-        } else {
-            inner.split(',').map(str::trim).collect()
-        })
-    }
-
-    /// Whether `line`'s `cards` are exactly `want`, in order: each the
+    /// Whether `load`'s `cards` are exactly `want`, in order: each the
     /// driver's name of the device the placement resolved, each space
     /// written `_` (`generate::with_cards`).
-    fn cards_named(line: &str, want: &[String]) -> Result<bool, String> {
-        Ok(csv_field(line, "cards")? == want.iter().map(String::as_str).collect::<Vec<_>>())
+    fn cards_named(load: &Fields, want: &[String]) -> Result<bool, ReadError> {
+        Ok(load.csv("cards")? == want.iter().map(String::as_str).collect::<Vec<_>>())
     }
 
     /// The record words of `place`'s cards on this process's devices: the
@@ -1442,31 +1418,35 @@ mod gate {
             let want = card_words(place)?;
             let line = held(
                 "records",
-                load_line(place.name(), ids).map(|l| {
+                load_record(place.name(), ids).and_then(|l| {
                     let named = cards_named(&l, &want);
-                    let mutant = l.replacen(
+                    let mutant = l.line().replacen(
                         &format!("cards=[{}", want[0]),
                         &format!("cards=[{}X", want[0]),
                         1,
                     );
-                    let mutant_red = mutant != l && cards_named(&mutant, &want) == Ok(false);
-                    let tier = field(&l, "tier_experts").and_then(|v| v.parse::<u64>().ok());
+                    let mutant = record::Log::of(&mutant, record::GENERATE_GLM5NEXT)
+                        .one(&record::LOAD_GENERATOR)?;
+                    let mutant_red =
+                        mutant.line() != l.line() && cards_named(&mutant, &want) == Ok(false);
+                    let tier = l.opt_u64("tier_experts")?;
+                    let tier_bytes = l.opt_u64("tier_bytes")?;
                     let tier_ok = match place.tier_cards().is_empty() {
-                        true => tier.is_none() && field(&l, "tier_bytes").is_none(),
+                        true => tier.is_none() && tier_bytes.is_none(),
                         false => tier.is_some_and(|n| n > 0),
                     };
                     let ok = named == Ok(true) && mutant_red && tier_ok;
                     println!(
                         "records --place {}: cards {:?} (want {want:?}), a mutant first card red \
-                     {mutant_red}, tier_experts {tier:?}: {}",
+                     {mutant_red}, tier_experts {tier:?} tier_bytes {tier_bytes:?}: {}",
                         place.name(),
-                        csv_field(&l, "cards"),
+                        l.csv("cards"),
                         verdict(ok)
                     );
                     if !ok {
-                        println!("  {l}");
+                        println!("  {}", l.line());
                     }
-                    ok
+                    Ok(ok)
                 }),
             );
             pass &= line;
