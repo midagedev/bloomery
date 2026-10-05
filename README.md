@@ -125,12 +125,12 @@ all of them: on a whole-card Qwen3-30B, on V4.1 (two slots' rows a pass), and on
 request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows). A
 placed Qwen3-30B (`--place a`), Qwen3.6, a sampled request on a drafting GLM-5.3 or Qwen3.8 load, V4.1 with the
 lookup draft and Qwen3.8 under `--place bp` step their slots in turn, a select and a step a slot each round. At a
-fixed expert placement every request answers its solo run's tokens exactly; under adaptive residency the placement
-follows every stream's passes (see [Limits](#limits)). The context splits as llama-server splits it with `-np N` and
-no `-kvu`: `--ctx-size` (or the automatic choice) is the total and each slot holds `total / N` rows, except on V4.1,
-where every slot holds the whole context; `--parallel 1` keeps one sequence with the whole context. The plan counts
-every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by name. A new
-request's prompt runs in one call between rounds, and the other streams wait for it.
+fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
+the placement follows every stream's passes (see [Limits](#limits)). The context splits as llama-server splits it
+with `-np N` and no `-kvu`: `--ctx-size` (or the automatic choice) is the total and each slot holds `total / N` rows,
+except on V4.1, where every slot holds the whole context; `--parallel 1` keeps one sequence with the whole context.
+The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
+name. A new request's prompt runs in one call between rounds, and the other streams wait for it.
 
 **Small cards.** Qwen3.6 and Qwen3-30B at `Q4_K_M` (19-21 GB) run whole on a 24 GB card, or on a 12-16 GB card
 with `--place a`: the routed experts go to the CPU. With no `--place` at all, a file that does not fit the
@@ -299,9 +299,9 @@ text. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
   the history of passes (the requests before it and the streams beside it): the same history gives the same tokens
   bit for bit, another history can reword an answer at a near tie, since an expert on the card and the same expert
   on the host round their activations differently. `POST /residency/reset` returns to the load's placement;
-  `BLOOMERY_RESIDENCY=off` gives repeatable tokens at residency's cost in speed. The placement also depends on
-  `--parallel`: each slot's cache takes card room, so a two-slot V4.1 load holds 8 fewer experts on the card than a
-  one-slot load, and its answers can differ from a `--parallel 1` server's at a near tie.
+  `BLOOMERY_RESIDENCY=off` gives repeatable tokens at residency's cost in speed.
+- A placed load's plan counts every slot's cache, so `--parallel 2` puts fewer experts on the card than
+  `--parallel 1` (8 fewer on V4.1), and the two servers' answers can differ at a near tie, with residency on or off.
 - Clef takes text states only, and reads backbone weights of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0 and F32 (not the IQ
   types, Q2_K, Q4_0 or Q4_1).
 - V4.1 decode is bound by host memory bandwidth in each step's expert part, and by the card's own serial work
