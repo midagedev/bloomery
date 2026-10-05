@@ -7,7 +7,9 @@
 //!
 //! `generate_glm5next --tokens a,b,c [-n N] [--ctx C] [--place a|gate|bp|<stage>[+<tier>…]]
 //! [--mode graph|eager] [--prefill batch|steps] [--last-step]
-//! [--time [--warm W]] [--pair] [--logits] [--plan]`
+//! [--time [--warm W]] [--pair] [--logits] [--plan]
+//! [--top2 K [--rows FILE]] [--repeat R] [--table] [--ignore-eos] [--serve-feed]
+//! [--dump-table FILE] [--card-table FILE]`
 //!
 //! - `--tokens`: the prompt's ids (the file's own vocabulary, no BOS added).
 //! - `--ctx`: the positions the caches hold; the plan refuses more than the
@@ -92,6 +94,17 @@
 //! as are `--pair`, `--logits` and the route trace beside the draft. Unset or
 //! `off`, the load, the plan and every step are the plain run's.
 //!
+//! `--top2 K [--rows FILE]`, `--repeat R`, `--table`, `--ignore-eos`,
+//! `--serve-feed`, `--dump-table FILE` and `--card-table FILE` are the
+//! generate binaries' shared diagnosis flags (`generate::Diag`, whose doc is
+//! theirs). They act on the plain run of the prompt flags, and each is
+//! refused by name beside the MTP draft, `--pair` (the verify probe) and
+//! `BLOOMERY_ROUTE_TRACE`. `--card-table` needs `BLOOMERY_RESIDENCY=off` (a
+//! machine would move the experts it places) and loads through
+//! `app::Loaded::open_edited`. The stage card's copy of the map the table
+//! flags read is `Body::slot_copy`, the host tier's map and machine
+//! `Body::hybrid` (`generate::Residence`).
+//!
 //! `BLOOMERY_RESIDENCY` runs adaptive expert residency (`host::swap`) over
 //! the card's routed stacks: unset or `off`, the load's slot map for the
 //! model's life; set, the word prints as a `residency lever` record before
@@ -165,8 +178,9 @@
 //! (`SlotRows::MAX_ROWS`) is, and the drafted pass of several slots is not
 //! built. `--plan` prints the plan of the N resident sequences and exits
 //! before the load. Refused by name before the load beside `--pair`,
-//! `BLOOMERY_DRAFT=mtp`, `--logits`, `--last-step`, `BLOOMERY_ROUTE_TRACE`
-//! and `BLOOMERY_STEP_STATS=1`, which this arm does not run.
+//! `BLOOMERY_DRAFT=mtp`, `--logits`, `--last-step`, `BLOOMERY_ROUTE_TRACE`,
+//! `BLOOMERY_STEP_STATS=1` and the shared diagnosis flags (`generate::Diag`),
+//! which this arm does not run.
 
 #[cfg(not(feature = "glm5next"))]
 fn main() {
@@ -201,7 +215,10 @@ mod cli {
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::generate::{Place, with_cards};
+    use bloomery_gpu_gates::generate::{
+        Diag, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table, dump_table,
+        place_table, read_table, repeat_runs, seed_path, slot_table, with_cards, write_table,
+    };
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
@@ -421,6 +438,18 @@ mod cli {
                     .into(),
             );
         }
+        // The shared diagnosis flags (`generate::Diag`, the module doc's
+        // paragraph), taken from the same arguments beside the bin's own;
+        // their cross-flag refusals are `Diag::finish`'s.
+        let mut diag = Diag::default();
+        {
+            let mut it = std::env::args().skip(1);
+            while let Some(flag) = it.next() {
+                diag.take(&flag, &mut it)?;
+            }
+        }
+        diag.finish(n_gen, &ref_model_path()?)?;
+        diag.check_feed(ids.len())?;
         let drafted = match levers.draft() {
             None | Some("off") => false,
             Some("mtp") => true,
@@ -455,6 +484,27 @@ mod cli {
                 return Err(format!("BLOOMERY_DRAFT=mtp is refused beside {what}").into());
             }
         }
+        // The diagnosis flags act on the plain run; every mode that is not it
+        // refuses them by name.
+        let beside = [
+            (
+                drafted,
+                "BLOOMERY_DRAFT=mtp (the drafted run's windows are not the plain steps)",
+            ),
+            (
+                pair,
+                "--pair (its verifies run after a cut back to the prompt's end)",
+            ),
+            (
+                levers.route_trace().is_some(),
+                "BLOOMERY_ROUTE_TRACE (the trace records a fixed placement's routing)",
+            ),
+        ];
+        if let Some(flag) = diag.set().first()
+            && let Some(&(_, what)) = beside.iter().find(|(set, _)| *set)
+        {
+            return Err(format!("{flag} acts on the plain run: not beside {what}").into());
+        }
         let ctx: usize = flag("--ctx")?.map_or(Ok(2048), |s| s.parse())?;
         let placement = match flag("--place")? {
             None => Place::Gate,
@@ -481,18 +531,16 @@ mod cli {
             );
         }
         if slots > 1 {
-            gen_slots::refused::<Body>(
-                slots,
-                "glm5next",
-                &[
-                    ("--pair", pair),
-                    ("BLOOMERY_DRAFT=mtp", drafted),
-                    ("--logits", has("--logits")),
-                    ("--last-step", last_step),
-                    ("BLOOMERY_ROUTE_TRACE", levers.route_trace().is_some()),
-                    ("BLOOMERY_STEP_STATS=1", levers.step_stats()),
-                ],
-            )?;
+            let mut beside = vec![
+                ("--pair", pair),
+                ("BLOOMERY_DRAFT=mtp", drafted),
+                ("--logits", has("--logits")),
+                ("--last-step", last_step),
+                ("BLOOMERY_ROUTE_TRACE", levers.route_trace().is_some()),
+                ("BLOOMERY_STEP_STATS=1", levers.step_stats()),
+            ];
+            beside.extend(diag.set().into_iter().map(|flag| (flag, true)));
+            gen_slots::refused::<Body>(slots, "glm5next", &beside)?;
             if slots > PLAIN_PASS_SLOTS {
                 return Err(format!(
                     "BLOOMERY_GEN_SLOTS={slots}: the glm5next body's plain pass lays one or two \
@@ -572,6 +620,19 @@ mod cli {
             residency,
             beside: 0,
         };
+        // `--card-table`: the table the load is placed by, read here; a load
+        // that runs the residency machine would move the experts it places.
+        let card_file = match &diag.card_table {
+            Some(p) if residency.is_none() => Some(read_table(p)?),
+            Some(_) => {
+                return Err(
+                    "--card-table places the experts itself: set BLOOMERY_RESIDENCY=off \
+                     (the machine would move them)"
+                        .into(),
+                );
+            }
+            None => None,
+        };
         let args = OpenArgs {
             place,
             machine,
@@ -603,6 +664,14 @@ mod cli {
                 return Ok(());
             };
             s
+        } else if let Some(t) = &card_file {
+            let Some(loaded) = Loaded::<Body>::open_edited(file, args, &mut log, |_, plan| {
+                place_table(plan, t).map_err(|e| SessionError::Refused(e.to_string()))
+            })?
+            else {
+                return Ok(());
+            };
+            loaded.ready(&mut log)?
         } else {
             let Some(loaded) = Loaded::<Body>::open(file, args, &mut log)? else {
                 return Ok(());
@@ -615,6 +684,9 @@ mod cli {
                 .2
                 .hybrid_mut()
                 .attach_route_trace(t)?;
+        }
+        if let (Some(t), Some(p)) = (&card_file, &diag.card_table) {
+            card_table(&residence(&s)?.table()?, t, p)?.print();
         }
         if residency.is_some() {
             // The prompt call's boundary, then one a generated step; under
@@ -639,10 +711,17 @@ mod cli {
             };
             return slots_run(&mut s, &arm);
         }
+        // Under `--serve-feed` the call runs every id but the last, the last
+        // a pass of the run's pick.
+        let called = ids.len() - usize::from(diag.serve_feed);
         let passes = match prefill {
-            PrefillMode::Batch => bloomery_gpu_glm5next::batches_of(s.model(), ids.len())?.len(),
+            PrefillMode::Batch => {
+                bloomery_gpu_glm5next::batches_of(s.model(), called)?.len()
+                    + usize::from(diag.serve_feed)
+            }
             PrefillMode::Steps => ids.len(),
         };
+        let stats = levers.step_stats();
         if drafted {
             let arm = Arm {
                 ids: &ids,
@@ -654,149 +733,89 @@ mod cli {
                 prefill,
                 passes,
                 last_step,
+                logits: has("--logits"),
+                pair,
             };
             return drafted_run(&mut s, &arm);
         }
-        if levers.step_stats() {
+        if stats {
             bloomery_gpu_glm5next::set_prompt_stats(s.model_mut(), true)?;
         }
-        fed(&ids);
-        let t_feed = Instant::now();
-        if prefill == PrefillMode::Steps {
-            let pos = s.pos();
-            s.model_mut()
-                .body_parts("generate_glm5next")?
-                .2
-                .hybrid_mut()
-                .route_prompt(pos, ids.len())?;
-        }
-        let mut next = match ids.split_last() {
-            Some((&last, head)) if last_step => {
-                if !head.is_empty() {
-                    s.prompt(head, Want::Argmax)?;
-                }
-                s.step(last, Want::Argmax)?.argmax()
-            }
-            _ => s.prompt(&ids, Want::Argmax)?.argmax(),
-        };
-        let feed = t_feed.elapsed();
-        Record::new(&record::STEP0)
-            .u("pos", s.pos() - 1)
-            .u("token", next)
-            .u("fed", ids.len())
-            .f("feed_s", feed.as_secs_f64())
-            .print();
-        if let Some(st) = bloomery_gpu_glm5next::take_prompt_stats(s.model_mut())? {
-            for r in record::prompt_stats(&st) {
-                r.print();
-            }
-        }
-        let fed_end = s.pos();
-        let mut tokens = vec![next];
-        // (i, pos, token, ms): printed after the last step.
-        let mut rows: Vec<(usize, u32, u32, f64)> = Vec::with_capacity(n_gen);
-        let stats = levers.step_stats();
-        let mut probes: Vec<Probe> = Vec::with_capacity(if stats { n_gen } else { 0 });
-        if stats {
-            probes.push(probe5(s.model(), None)?);
-        }
-        for i in 1..n_gen {
-            let pos = s.pos();
-            let t = Instant::now();
-            next = s.step(next, Want::Argmax)?.argmax();
-            rows.push((i, pos, next, t.elapsed().as_secs_f64() * 1e3));
-            tokens.push(next);
-            if stats {
-                probes.push(probe5(s.model(), probes.last())?);
-            }
-        }
-        let passes_ms = if pair {
-            Some(pairs(&mut s, mode, fed_end, &tokens)?)
+        // The plain run(s): the shared diagnosis flags' (`generate::Diag`),
+        // each after the first from the serve seat's reset; `--table` holds
+        // the map the first run started from.
+        diag.begin()?;
+        let at_load = if diag.table {
+            Some(
+                s.model()
+                    .body("generate_glm5next")?
+                    .hybrid()
+                    .slots()
+                    .stage_view(),
+            )
         } else {
             None
         };
-        if timed {
-            let ms = feed.as_secs_f64() * 1e3;
-            Record::new(&record::TIME_PROMPT)
-                .u("n", ids.len())
-                .f("ms", ms)
-                .f("tok/s", ids.len() as f64 * 1e3 / ms)
-                .u("passes", passes)
-                .w("kind", prefill.name())
-                .print();
+        if let Some(p) = diag.dump_table.as_deref() {
+            write_table(&seed_path(p), &residence(&s)?.table()?)?;
         }
-        for &(i, pos, token, ms) in &rows {
-            Record::new(&record::STEP)
-                .u("i", i)
-                .u("pos", pos)
-                .u("token", token)
-                .print();
-            if timed {
-                Record::new(&record::TIME_STEP)
-                    .u("i", i)
-                    .flag("warm", i <= warm)
-                    .f("ms", ms)
-                    .print();
+        let arm = Arm {
+            ids: &ids,
+            n_gen,
+            timed,
+            warm,
+            mode,
+            place,
+            prefill,
+            passes,
+            last_step,
+            logits: has("--logits"),
+            pair,
+        };
+        let each = |s: &mut Session<Body>, i: usize| -> Result<(), GateError> {
+            if i == 1
+                && let Some(p) = diag.dump_table.as_deref()
+            {
+                write_table(&before_path(p), &residence(s)?.table()?)?;
             }
-        }
-        if let (true, Some(ms)) = (timed, &passes_ms) {
-            for (k, &ms) in ms.iter().enumerate() {
-                let i = k + 1;
-                Record::new(&record::TIME_PASS)
-                    .u("i", i)
-                    .flag("warm", 2 * i - 1 <= warm)
-                    .f("ms", ms)
-                    .u("positions", 2)
-                    .w("kind", "pair")
-                    .print();
+            if diag.ignore_eos.is_empty() {
+                plain_run(s, &arm, &mut runtime::Plain, &diag, i == 1, stats)?;
+            } else {
+                plain_run(
+                    s,
+                    &arm,
+                    &mut NoEog::new(diag.ignore_eos.clone()),
+                    &diag,
+                    i == 1,
+                    stats,
+                )?;
             }
+            for (kind, r) in s
+                .model_mut()
+                .body_parts("generate_glm5next")?
+                .2
+                .take_residency_passes()
+            {
+                record::residency_pass_of(kind, &r).print();
+            }
+            Ok(())
+        };
+        if diag.repeat > 1 {
+            repeat_runs(
+                &mut s,
+                diag.repeat,
+                ids.len(),
+                n_gen,
+                "generate_glm5next",
+                each,
+            )?;
+        } else {
+            each(&mut s, 0)?;
         }
-        Record::new(&record::TOKENS).list("tokens", &tokens).print();
-        if has("--logits") {
-            let row = s.model().logits()?;
-            let argmax = row
-                .iter()
-                .enumerate()
-                .max_by(|x, y| x.1.total_cmp(y.1).then(y.0.cmp(&x.0)))
-                .map_or(0, |(i, _)| i);
-            let fnv = row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
-                v.to_bits().to_le_bytes().iter().fold(h, |h, &b| {
-                    (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-                })
-            });
-            Record::new(&record::LOGITS)
-                .u("n", row.len())
-                .u("argmax", argmax)
-                .w("fnv64", format!("{fnv:016x}"))
-                .print();
-        }
-        if timed {
-            let kept: Vec<f64> = rows[warm..].iter().map(|r| r.3).collect();
-            let mut sorted = kept.clone();
-            sorted.sort_by(f64::total_cmp);
-            let p50 = sorted[sorted.len() / 2];
-            let mean = kept.iter().sum::<f64>() / kept.len() as f64;
-            Record::new(&record::SMOKE)
-                .w("mode", mode_name(mode))
-                .w("place", place)
-                .u("prompt_tokens", ids.len())
-                .u("depth", ids.len())
-                .u("generated", n_gen)
-                .u("warm", warm)
-                .u("steps", kept.len())
-                .f("p50_ms", p50)
-                .f("mean_ms", mean)
-                .f("tok/s(p50)", 1e3 / p50)
-                .print();
-        }
-        print_stats(&probes, warm);
-        for (kind, r) in s
-            .model_mut()
-            .body_parts("generate_glm5next")?
-            .2
-            .take_residency_passes()
-        {
-            record::residency_pass_of(kind, &r).print();
+        if let Some(v) = at_load {
+            let r = residence(&s)?;
+            let t = r.table()?;
+            slot_table(&t, &r.check(&t)?, t.differ(&v)?).print();
         }
         if let Some(t) = s
             .model_mut()
@@ -837,7 +856,16 @@ mod cli {
             .print();
     }
 
-    /// What a drafted run is asked for.
+    /// The residency views of `s`'s body ([`Residence`]): its stage card's
+    /// copy of the slot map (`Body::slot_copy`) and its host tier.
+    fn residence(s: &Session<Body>) -> Result<Residence<'_>, GateError> {
+        let m = s.model();
+        let b = m.body("generate_glm5next")?;
+        Ok(Residence::of(m.gpu(), b.slot_copy(), b.hybrid()))
+    }
+
+    /// What a generation run is asked for: the drafted run's windows or the
+    /// plain run's steps.
     struct Arm<'a> {
         ids: &'a [u32],
         n_gen: usize,
@@ -851,6 +879,168 @@ mod cli {
         /// `--last-step`: the prompt less its last id fed as `--prefill`
         /// says, then the last id as a decode step — the server's cut.
         last_step: bool,
+        /// `--logits`: the `logits` record after the loop.
+        logits: bool,
+        /// `--pair`: the verify probe's passes after the plain run's loop.
+        pair: bool,
+    }
+
+    /// One plain run of `a.ids`: the prompt fed whole through `adv`'s prompt,
+    /// or by the serve's cut (`--last-step`, `--serve-feed`) through
+    /// [`ServeFeed`] — every id but the last in one call, then the last as a
+    /// pass of `adv`'s pick — then `-n` greedy steps a pass of that pick (the
+    /// plain argmax, or `--ignore-eos`'s over the end-of-generation ids),
+    /// `--top2`'s rows read after each of them, `--dump-table`'s read after
+    /// the feed, and every line after the loop; `--pair`'s verifies between
+    /// the loop and them. Nothing between two timed steps: the `step` and
+    /// `time step` records print after the last.
+    fn plain_run<A: Advance<Session<Body>>>(
+        s: &mut Session<Body>,
+        a: &Arm<'_>,
+        adv: &mut A,
+        diag: &Diag,
+        dump_now: bool,
+        stats: bool,
+    ) -> Result<(), GateError> {
+        fed(a.ids);
+        let t_feed = Instant::now();
+        if a.prefill == PrefillMode::Steps {
+            let pos = s.pos();
+            s.model_mut()
+                .body_parts("generate_glm5next")?
+                .2
+                .hybrid_mut()
+                .route_prompt(pos, a.ids.len())?;
+        }
+        let mut next = if diag.serve_feed || a.last_step {
+            ServeFeed { inner: &mut *adv }.prompt(s, a.ids)?
+        } else {
+            adv.prompt(s, a.ids)?
+        };
+        let feed = t_feed.elapsed();
+        Record::new(&record::STEP0)
+            .u("pos", s.pos() - 1)
+            .u("token", next)
+            .u("fed", a.ids.len())
+            .f("feed_s", feed.as_secs_f64())
+            .print();
+        if let Some(st) = bloomery_gpu_glm5next::take_prompt_stats(s.model_mut())? {
+            for r in record::prompt_stats(&st) {
+                r.print();
+            }
+        }
+        if let (true, Some(p)) = (dump_now, diag.dump_table.as_deref()) {
+            dump_table(&residence(s)?, p)?.print();
+        }
+        let fed_end = s.pos();
+        let mut tokens = vec![next];
+        // (i, pos, token, ms): printed after the last step.
+        let mut rows: Vec<(usize, u32, u32, f64)> = Vec::with_capacity(a.n_gen);
+        let mut probes: Vec<Probe> = Vec::with_capacity(if stats { a.n_gen } else { 0 });
+        if stats {
+            probes.push(probe5(s.model(), None)?);
+        }
+        let mut tops = TopRows::new(diag);
+        if tops.wants() {
+            tops.read(&s.model().logits()?, next)?;
+        }
+        for i in 1..a.n_gen {
+            let pos = s.pos();
+            let t = Instant::now();
+            let mut out = Vec::with_capacity(1);
+            adv.pass(s, next, &mut out)?;
+            next = *out.first().ok_or("the pass kept no token")?;
+            rows.push((i, pos, next, t.elapsed().as_secs_f64() * 1e3));
+            tokens.push(next);
+            if tops.wants() {
+                tops.read(&s.model().logits()?, next)?;
+            }
+            if stats {
+                probes.push(probe5(s.model(), probes.last())?);
+            }
+        }
+        let passes_ms = if a.pair {
+            Some(pairs(s, a.mode, fed_end, &tokens)?)
+        } else {
+            None
+        };
+        if a.timed {
+            let ms = feed.as_secs_f64() * 1e3;
+            Record::new(&record::TIME_PROMPT)
+                .u("n", a.ids.len())
+                .f("ms", ms)
+                .f("tok/s", a.ids.len() as f64 * 1e3 / ms)
+                .u("passes", a.passes)
+                .w("kind", a.prefill.name())
+                .print();
+        }
+        for &(i, pos, token, ms) in &rows {
+            Record::new(&record::STEP)
+                .u("i", i)
+                .u("pos", pos)
+                .u("token", token)
+                .print();
+            if a.timed {
+                Record::new(&record::TIME_STEP)
+                    .u("i", i)
+                    .flag("warm", i <= a.warm)
+                    .f("ms", ms)
+                    .print();
+            }
+        }
+        if let (true, Some(ms)) = (a.timed, &passes_ms) {
+            for (k, &ms) in ms.iter().enumerate() {
+                let i = k + 1;
+                Record::new(&record::TIME_PASS)
+                    .u("i", i)
+                    .flag("warm", 2 * i - 1 <= a.warm)
+                    .f("ms", ms)
+                    .u("positions", 2)
+                    .w("kind", "pair")
+                    .print();
+            }
+        }
+        Record::new(&record::TOKENS).list("tokens", &tokens).print();
+        if a.logits {
+            let row = s.model().logits()?;
+            let argmax = row
+                .iter()
+                .enumerate()
+                .max_by(|x, y| x.1.total_cmp(y.1).then(y.0.cmp(&x.0)))
+                .map_or(0, |(i, _)| i);
+            let fnv = row.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
+                v.to_bits().to_le_bytes().iter().fold(h, |h, &b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+                })
+            });
+            Record::new(&record::LOGITS)
+                .u("n", row.len())
+                .u("argmax", argmax)
+                .w("fnv64", format!("{fnv:016x}"))
+                .print();
+        }
+        if a.timed {
+            let kept: Vec<f64> = rows[a.warm..].iter().map(|r| r.3).collect();
+            let mut sorted = kept.clone();
+            sorted.sort_by(f64::total_cmp);
+            let p50 = sorted[sorted.len() / 2];
+            let mean = kept.iter().sum::<f64>() / kept.len() as f64;
+            Record::new(&record::SMOKE)
+                .w("mode", mode_name(a.mode))
+                .w("place", a.place)
+                .u("prompt_tokens", a.ids.len())
+                .u("depth", a.ids.len())
+                .u("generated", a.n_gen)
+                .u("warm", a.warm)
+                .u("steps", kept.len())
+                .f("p50_ms", p50)
+                .f("mean_ms", mean)
+                .f("tok/s(p50)", 1e3 / p50)
+                .print();
+        }
+        tops.finish(diag.rows.as_deref())?;
+        print_stats(&probes, a.warm);
+        Ok(())
     }
 
     /// What the several-slot arm (`BLOOMERY_GEN_SLOTS`) runs: the plain
