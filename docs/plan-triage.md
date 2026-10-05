@@ -195,6 +195,53 @@
 - **memguard 뒤에 남은 것**: 홀드된 카드 위 serve 응답 비교 한 줄(에이전트 보고 §7); auto-placed 실행의
   `--prefill gemm` 거부가 적재 뒤에 온다(좌석 문서에 이미 적힘).
 
+### What glmquality left (line3, 10-05 — a read-only review of `crates/gpu-glm5next/src`, 16 files)
+
+No silent-failure violation found. F6 (three copies of the embedding-row read) and F11 (host `as u32` narrowing) are
+round glmq1; F10 was dropped (`GemmFront::act` and `project` differ on purpose: `project` refuses the SwiGLU rows).
+
+- **F2 — `GlmHost` is a copy of the common `HostRun` (M). First round after 0.2.1.** `crates/gpu-glm5next/src/host.rs:23`
+  repeats `crates/gpu/src/host/run.rs:30` field for field, with the same `experts_into`/`experts_union_into` bodies and
+  the same refusal strings, and no measured-gain note. `HostRun::prepare_union` is also the stricter of the two (it
+  refuses `cols` past what was made). Fix: `GlmHost` becomes `HostRun` built with GLM's layer lookup closure. Proof:
+  move class (ptx-scan `generate_glm5next` equal); a gate clause matching a `GlmHost::` refusal text re-pins with its
+  dated attribution. `Ds41Host` (`crates/gpu-deepseek41/src/chain/ffn.rs:1736`) is a third variant of the same
+  adapter and follows in the same round.
+- **F1 — the Steps feed has two marks walks with different failure rules (S, needs a decision).**
+  `crates/gpu-glm5next/src/body.rs:1954` (`prompt`, reached by `feed` Steps and `prompt_with(Steps, None)`) steps a
+  segment between marks at a time and passes a failed step's error up with the model standing mid-prompt.
+  `crates/gpu-glm5next/src/prefill.rs:882` (`steps_with`, reached only with a sink) steps one id at a time and takes
+  the model back to the call's start (`take_back`). Whether a failure rolls back depends on whether a sink was passed.
+  Pick one rule, then one loop. Opt-in path only (`BLOOMERY_PREFILL=steps`, refused under a residency).
+- **F3 — `refuse_steps_under_residency` twice (S).** `crates/gpu-glm5next/src/body.rs:2447` and
+  `crates/gpu-deepseek41/src/body.rs:193`, the same rule and the same user-facing text; only ds41's has a unit test.
+  One function beside `Residency` in `crates/gpu/src/host/swap.rs`, with the test moved beside it.
+- **F4 — `take_back` twice (S/M).** `crates/gpu-glm5next/src/prefill.rs:1267` and
+  `crates/gpu-deepseek41/src/body/prefill.rs:637`: the same branch (a fault passes, else `keep_point` and `rollback`),
+  the rollback-failed message word for word. One helper beside `GpuModel::rollback`.
+- **F5 — `PrefillMode` twice (S).** `crates/gpu-glm5next/src/prefill.rs:161` and
+  `crates/gpu-deepseek41/src/body/prefill.rs:166`, the enum, `from_name` and `name` byte for byte; it is the type of
+  the one lever row `BLOOMERY_PREFILL`. It moves into `bloomery_levers`, re-exported by each body.
+- **F7 — routed stack names formatted on the step path (S/M, A/B).** `crates/gpu-glm5next/src/ffn.rs:296`
+  (`stack_names`: three fresh `String`s and three map lookups a card layer a row a step, from `card_slots`, `card_rows`
+  and the tier) breaks the crate's own contract (`crates/gpu-glm5next/src/tensors.rs:1`: names made once at load, the
+  step "formats none"). The three names go into `FfnNames::Moe` at load. Dispatch-path touch: a same-lease A/B with an
+  A/A arm.
+- **F8 — a third FNV-1a, this one in a library crate (S).** `crates/gpu-glm5next/src/prefill.rs:1400` beside
+  `crates/gpu-gates/src/lib.rs:446` (`Fnv1a64`, public) and `crates/gpu/src/host/swap.rs:2963` (`counts_digest`).
+  `Fnv1a64` moves into `bloomery_gpu` (gpu-gates re-exports it) with a `u16`-words method for the f16 planes.
+- **F9 — the Q4_K/Q5_K entry dispatch written four times (M).** `crates/gpu-glm5next/src/ffn.rs:536` (`card_slots`),
+  `ffn.rs:719` (`card_rows`), `crates/gpu-glm5next/src/tier.rs:297` (`enqueue_block`) and `tier.rs:376`
+  (`enqueue_layer`); a new routable type is four edits. One gate·up/down helper pair in `ffn.rs` for both pairs.
+  Proof: ptx-scan equal.
+- **Outside the crate (from the same review).** `crates/gpu/src/weights.rs:549`: `Weights::get` is a
+  `BTreeMap<String, _>` lookup, so every body pays name lookups on the step unless it resolves at load; a load-time
+  handle is a design question (M). The Q8_0 block geometry has four private owners
+  (`crates/gpu-deepseek41/src/chain/glue.rs:82`, `crates/gpu-glm5next/src/body.rs:658` writes `n_embd / 32 * 34`,
+  and two in `crates/gpu/src`) while `gguf::quant` exposes `blck_size`/`type_size` (S). The attention scale
+  `1 / sqrt(head_k)` is computed at each call site (`crates/gpu-glm5next/src/prefill.rs:2362`,
+  `crates/gpu-glm5next/src/mla.rs:338`); one `Dims` field set at load (XS).
+
 ### What jitonce, relfollow, sysone and decideseat phase 1 left (line3, 10-03 — 412367f3, 2e0189f2)
 
 - **Raw bundle loads outside `shared_module!` (S).** `crates/gpu-vision/src/{attn,mlp,norm,rope2d,aligner,gemm_bf16}.rs`
