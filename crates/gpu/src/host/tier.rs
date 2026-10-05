@@ -910,9 +910,9 @@ struct Stage {
     fault: Arc<DeviceBuffer<u32>>,
 }
 
-/// The tier graphs' slots: the step, the pair, and one per [`Chain::Cols`]
-/// width `2..=DEFER_MAX_COLS` ([`chain_slot`]).
-const TIER_CHAINS: usize = 1 + DEFER_MAX_COLS;
+/// The tier graphs' slots: the step, the pair, the quad, and one per
+/// [`Chain::Cols`] width `2..=DEFER_MAX_COLS` ([`chain_slot`]).
+const TIER_CHAINS: usize = 2 + DEFER_MAX_COLS;
 
 /// An expert tier's card: its `Gpu` (its own stream and fault word), its
 /// resident stacks, its tier on the host tier's page, one captured graph per
@@ -1285,7 +1285,7 @@ impl TierCard {
     /// Enqueue layer `layer` of row `row` of `chain` on the tier's stream
     /// now, for an eager chain or a fed pass ([`Pass::Feed`]), over the
     /// chain's columns, its fault copy with it; the host then expects one
-    /// layer more. A chain wider than the tier's rows is refused by name.
+    /// layer more. A chain wider than the tier's columns is refused by name.
     pub(super) fn enqueue_eager(
         &mut self,
         page: &TierPage,
@@ -1337,7 +1337,7 @@ impl TierCard {
 
     fn issue(&mut self, n: usize) {
         let n32 =
-            u32::try_from(n).expect("a pass lists at most two rows a layer, far below u32::MAX");
+            u32::try_from(n).expect("a pass lists at most four rows a layer, far below u32::MAX");
         self.issued = self.issued.wrapping_add(n32);
         self.stats.issued += n as u64;
     }
@@ -1516,13 +1516,14 @@ pub(super) enum Pass {
     Feed,
 }
 
-/// The tier graph's slot of `chain`: the step 0, the pair 1, a
-/// [`Chain::Cols`] of `m` columns `m` for `2..=DEFER_MAX_COLS`; any other
-/// width is refused by name.
+/// The tier graph's slot of `chain`: the step 0, the pair 1, the quad the
+/// last slot, a [`Chain::Cols`] of `m` columns `m` for `2..=DEFER_MAX_COLS`;
+/// any other width is refused by name.
 fn chain_slot(chain: Chain) -> Result<usize, GpuError> {
     match chain {
         Chain::Step => Ok(0),
         Chain::Pair => Ok(1),
+        Chain::Quad => Ok(2 + DEFER_MAX_COLS),
         Chain::Cols(m) if (2..=DEFER_MAX_COLS).contains(&m) => Ok(m),
         Chain::Cols(m) => Err(GpuError::shape(
             WHAT,
@@ -1531,7 +1532,7 @@ fn chain_slot(chain: Chain) -> Result<usize, GpuError> {
     }
 }
 
-const _: () = assert!(TIER_CHAINS == DEFER_MAX_COLS + 1);
+const _: () = assert!(TIER_CHAINS == DEFER_MAX_COLS + 2);
 
 /// A tier card's staging of a row's activation, in its image's form
 /// ([`TierAct`]).
@@ -1715,6 +1716,7 @@ mod tests {
     use super::{TIER_FLAGS, TWord, TierAct, TierLayout, TierSet, TierShape, chain_slot};
     use crate::host::slots::{HOST, Slot, SlotMap, TIER};
     use crate::host::step::Chain;
+    use model::ops::DEFER_MAX_COLS;
 
     /// A set's rows are ascending ids below the stack, each once; a map's
     /// set of a tier is that tier's entries in its slot order, and a layer
@@ -1770,14 +1772,17 @@ mod tests {
     /// the q8_1 codes of 16 super-blocks (512 u64) and their 32 scales; every
     /// field apart and inside the page, the flag words each on a line of
     /// their own — and every offset the one-tier page's: the flag words at
-    /// 0, 64, 128, 192, 256 and 320, the images from byte 512.
+    /// 0, 64, 128, 192, 512 and 576, the images from byte 768.
+    // PIN(2026-10-05): page::MAX_ROWS 2→4 moves the tier's flag lines —
+    // TIER_FLAGS 128·4+128=640, Prog 512, Fault 576 — so the words'
+    // offsets and the images' start (payload_off 768) moved with them.
     #[test]
     fn v41_tier_page_keeps_its_fields_apart() {
         let l = TierLayout::new(V41, 512, 32, 1).expect("V4.1's tier page");
         let i = l.image(0).expect("tier 0");
         assert_eq!((i.sel, i.q3, i.d8), (0, 64, 64 + 1024));
         assert!(i.sel + i.n_used <= i.q3 && i.q3 + i.q3_words <= i.d8);
-        assert_eq!(l.payload_off(), 512);
+        assert_eq!(l.payload_off(), 768);
         assert!(l.image_off(1) >= l.image_off(0) + 4 * i.words());
         assert!(l.rows_off(0) >= l.image_off(1) + 4 * i.words());
         assert!(l.rows_off(1) >= l.rows_off(0) + 4 * 6 * 4096);
@@ -1787,10 +1792,12 @@ mod tests {
             offs.extend([l.word_off(0, TWord::Go(r)), l.word_off(0, TWord::Cnt(r))]);
         }
         offs.sort_unstable();
-        assert_eq!(offs, [0, 64, 128, 192, 256, 320]);
+        assert_eq!(offs, [0, 64, 128, 192, 512, 576]);
         assert!(offs.iter().all(|&o| o + 64 <= l.payload_off()));
         assert!(l.image(1).is_err());
-        assert!(TierLayout::new(TierShape { rows: 3, ..V41 }, 512, 32, 1).is_err());
+        // PIN(2026-10-05): 3 rows moved inside 1..=MAX_ROWS (4); the refusal
+        // probe is the bound's new outside, 5.
+        assert!(TierLayout::new(TierShape { rows: 5, ..V41 }, 512, 32, 1).is_err());
         assert!(TierLayout::new(V41, 512, 32, 0).is_err());
         assert!(TierLayout::new(V41, 512, 32, 9).is_err());
     }
@@ -1857,7 +1864,8 @@ mod tests {
     /// four columns from the first 256-byte boundary past them, the routed
     /// rows forty slots — and at one column every offset the one-column
     /// page's; a width of 0 or past the host's columns is refused; the
-    /// graph slots are the step's, the pair's and one per width 2..=8.
+    /// graph slots are the step's, the pair's, the quad's and one per width
+    /// 2..=8, the existing slots where they were.
     #[test]
     fn a_tier_page_of_four_columns_keeps_its_fields_apart() {
         let q38 = TierShape {
@@ -1883,6 +1891,7 @@ mod tests {
         assert!(TierLayout::with_cols(q38, 9, 0, 0, 1).is_err());
         assert_eq!(chain_slot(Chain::Step).ok(), Some(0));
         assert_eq!(chain_slot(Chain::Pair).ok(), Some(1));
+        assert_eq!(chain_slot(Chain::Quad).ok(), Some(2 + DEFER_MAX_COLS));
         assert_eq!(chain_slot(Chain::Cols(4)).ok(), Some(4));
         assert!(chain_slot(Chain::Cols(1)).is_err());
         assert!(chain_slot(Chain::Cols(9)).is_err());

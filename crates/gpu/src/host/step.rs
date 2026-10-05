@@ -507,21 +507,22 @@ impl Boundary {
 
 // ------------------------------------------------------------------ chains
 
-/// A chain the host tier serves: the one-token step, the two-row pass
-/// whose rows run one layer apart (row `r`'s go of layer `l` and the other
-/// row's of the layer before can both be in flight), or one row of `m`
+/// A chain the host tier serves: the one-token step, a pass of two or four
+/// rows whose rows run one layer apart (row `r`'s go of layer `l` and the
+/// next row's of the layer before can both be in flight), or one row of `m`
 /// columns (2..=`DEFER_MAX_COLS`) — `m` consecutive positions whose layer is
 /// served by one go, one union call and one wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Chain {
     Step,
     Pair,
+    Quad,
     Cols(usize),
 }
 
-/// Chains with a capture record of their own: the step, the pair and one per
-/// column count up to `DEFER_MAX_COLS` ([`Chain::index`]).
-const CHAINS: usize = 2 + DEFER_MAX_COLS;
+/// Chains with a capture record of their own: the step, the pair, the quad
+/// and one per column count up to `DEFER_MAX_COLS` ([`Chain::index`]).
+const CHAINS: usize = 3 + DEFER_MAX_COLS;
 
 impl Chain {
     /// The chain's capture record; a `Cols` chain is made only by
@@ -530,6 +531,7 @@ impl Chain {
         match self {
             Chain::Step => 0,
             Chain::Pair => 1,
+            Chain::Quad => 2 + DEFER_MAX_COLS,
             Chain::Cols(m) => 1 + m,
         }
     }
@@ -540,6 +542,7 @@ impl Chain {
         match self {
             Chain::Step | Chain::Cols(_) => 1,
             Chain::Pair => 2,
+            Chain::Quad => 4,
         }
     }
 
@@ -547,20 +550,21 @@ impl Chain {
     #[must_use]
     pub fn cols(self) -> usize {
         match self {
-            Chain::Step | Chain::Pair => 1,
+            Chain::Step | Chain::Pair | Chain::Quad => 1,
             Chain::Cols(m) => m,
         }
     }
 
     /// The chain of a walk of `units` rows of `cols` columns on a page of
     /// `page_cols` columns a row: one row of one column is the step, two the
-    /// pair, one row of 2..=`page_cols` columns `Cols`; `None` for any other
-    /// point.
+    /// pair, four the quad, one row of 2..=`page_cols` columns `Cols`;
+    /// `None` for any other point.
     #[must_use]
     pub fn of(units: usize, cols: usize, page_cols: usize) -> Option<Chain> {
         match (units, cols) {
             (1, 1) => Some(Chain::Step),
             (2, 1) => Some(Chain::Pair),
+            (4, 1) => Some(Chain::Quad),
             (1, m) if (2..=page_cols.min(DEFER_MAX_COLS)).contains(&m) => Some(Chain::Cols(m)),
             _ => None,
         }
@@ -727,6 +731,9 @@ impl StepPort {
             captured: std::array::from_fn(|i| match i {
                 0 => Vec::with_capacity(layers),
                 1 => Vec::with_capacity(Chain::Pair.in_flight() * layers),
+                i if i == Chain::Quad.index() => {
+                    Vec::with_capacity(Chain::Quad.in_flight() * layers)
+                }
                 i if i <= cols + 1 => Vec::with_capacity(layers),
                 _ => Vec::new(),
             }),
@@ -758,7 +765,8 @@ impl StepPort {
         &self.boundary
     }
 
-    /// Open `chain` on `stream`; a pair needs a boundary of two rows.
+    /// Open `chain` on `stream`; a pair needs a boundary of two rows, a
+    /// quad of four.
     pub(super) fn begin(&mut self, stream: &CudaStream, chain: Chain) -> Result<(), GpuError> {
         let what = "Hybrid::begin_chain";
         if let Chain::Cols(m) = chain
@@ -803,9 +811,10 @@ impl StepPort {
             GpuError::shape(
                 "Hybrid::begin_chain",
                 format!(
-                    "{units} rows of {cols} columns: the step port serves one row or {} of one \
-                     column, or one row of 2..={} columns (the page's)",
+                    "{units} rows of {cols} columns: the step port serves one row, {} or {} rows \
+                     of one column, or one row of 2..={} columns (the page's)",
                     Chain::Pair.in_flight(),
+                    Chain::Quad.in_flight(),
                     page_cols.min(DEFER_MAX_COLS)
                 ),
             )
@@ -1311,13 +1320,15 @@ mod tests {
     }
 
     /// A walk's point names its chain: one row of one column the step, two
-    /// the pair, one row of 2 up to the page's columns `Cols`, one go a
-    /// layer each; anything else has none. Every chain has a capture record
-    /// of its own.
+    /// the pair, four the quad, one row of 2 up to the page's columns
+    /// `Cols`, one go a layer each; anything else has none. Every chain has
+    /// a capture record of its own, the existing ones where they were and
+    /// the quad's after them.
     #[test]
     fn a_walk_point_names_its_chain() {
         assert_eq!(Chain::of(1, 1, 1), Some(Chain::Step));
         assert_eq!(Chain::of(2, 1, 4), Some(Chain::Pair));
+        assert_eq!(Chain::of(4, 1, 4), Some(Chain::Quad));
         assert_eq!(Chain::of(1, 4, 4), Some(Chain::Cols(4)));
         for bad in [
             (1, 5, 4),
@@ -1326,18 +1337,31 @@ mod tests {
             (0, 1, 1),
             (1, 0, 4),
             (3, 1, 4),
+            (5, 1, 4),
         ] {
             assert_eq!(Chain::of(bad.0, bad.1, bad.2), None, "{bad:?}");
         }
         let mut seen = [false; CHAINS];
-        let chains = [Chain::Step, Chain::Pair]
+        let chains = [Chain::Step, Chain::Pair, Chain::Quad]
             .into_iter()
             .chain((2..=DEFER_MAX_COLS).map(Chain::Cols));
         for c in chains {
             assert!(!std::mem::replace(&mut seen[c.index()], true), "{c:?}");
-            assert_eq!(c.in_flight(), if c == Chain::Pair { 2 } else { 1 });
+            let rows = match c {
+                Chain::Step | Chain::Cols(_) => 1,
+                Chain::Pair => 2,
+                Chain::Quad => 4,
+            };
+            assert_eq!(c.in_flight(), rows);
             assert_eq!(Chain::of(c.in_flight(), c.cols(), DEFER_MAX_COLS), Some(c));
         }
+        assert_eq!(Chain::Step.index(), 0);
+        assert_eq!(Chain::Pair.index(), 1);
+        for m in 2..=DEFER_MAX_COLS {
+            assert_eq!(Chain::Cols(m).index(), 1 + m, "Cols({m})");
+        }
+        assert_eq!(Chain::Quad.index(), 2 + DEFER_MAX_COLS);
+        assert_eq!(Chain::Quad.index(), CHAINS - 1);
     }
 
     /// A boundary gives back every context handle its windows took: the
