@@ -6,6 +6,14 @@
 //! [`Engine::next`] (or one drafted pass) when one runs. It runs the slot
 //! actions the board reserved between those calls.
 //!
+//! On an engine that names a prompt quantum ([`Engine::prompt_quantum`]), a
+//! prompt that takes a slot while another slot is busy generating, and has
+//! more than one quantum left after what the cache kept, runs as calls of a
+//! quantum, one a round, each round's decode of the busy slots between them:
+//! a long prompt does not stall the streams already answering. Its request
+//! takes no decode round until its prompt ends. Without another busy slot, or
+//! on an engine that names none, a prompt runs in one go.
+//!
 //! A request's events reach its HTTP thread over a channel of its own. Its
 //! counters, its `/slots` view and its slot's release are booked before its
 //! last event is sent, so the response a client reads finds the slot free
@@ -22,6 +30,7 @@
 //! panic on this thread ends the server the same way, by name.
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -32,7 +41,7 @@ use serde_json::Value;
 use crate::api::{End, EngineFailure, relock};
 use crate::engine::{Drafted, EngineError, SamplerFactory, Saved, SlotPass, SlotRow, StateError};
 use crate::genloop::{
-    Event, Gen, GenError, GenParams, Need, Outcome, Slot, StopKind, Timings, ms_since,
+    Event, Gen, GenError, GenParams, Need, Outcome, Prompt, Slot, StopKind, Timings, ms_since,
 };
 use crate::sched::{Board, Reserve, SlotView};
 use crate::swap::{Entry, NoRoom, Park, ParkTable, QUANTUM, Turn};
@@ -218,11 +227,23 @@ enum Switched {
     Lost(String),
 }
 
+/// A request whose prompt runs a call a round ([`Prompt`]).
+struct Prompting {
+    a: Active,
+    plan: Prompt,
+}
+
 struct Worker {
     slot: Slot,
     sh: Arc<Shared>,
     /// The requests running, in the order they took their slots.
     active: Vec<Active>,
+    /// The requests whose prompts run a call a round, in the order they took
+    /// their slots; none is in a decode round until its prompt ends.
+    prompting: Vec<Prompting>,
+    /// The engine's prompt quantum; `None` when its slots take it in turns,
+    /// where it holds one request's sequence at a time.
+    quantum: Option<NonZeroUsize>,
     turns: Option<Turns>,
 }
 
@@ -247,10 +268,17 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
             batches: 0,
         }
     });
+    let quantum = if turns.is_some() {
+        None
+    } else {
+        slot.engine.prompt_quantum()
+    };
     let mut w = Worker {
         slot,
         sh: Arc::clone(&sh),
         active: Vec::new(),
+        prompting: Vec::new(),
+        quantum,
         turns,
     };
     let ran = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -310,7 +338,11 @@ impl Worker {
                 loop {
                     let actions = b.take_actions();
                     let admitted = b.admit(|i| self.slot.held_of(i), None);
-                    if !actions.is_empty() || !admitted.is_empty() || !self.active.is_empty() {
+                    if !actions.is_empty()
+                        || !admitted.is_empty()
+                        || !self.active.is_empty()
+                        || !self.prompting.is_empty()
+                    {
                         break (actions, admitted);
                     }
                     b = self.sh.work.wait(b).unwrap_or_else(|e| e.into_inner());
@@ -322,9 +354,12 @@ impl Worker {
                 }
             }
             for (slot, ids, sub) in admitted {
-                if self.start(slot, &ids, sub).is_err() {
+                if self.start(slot, ids, sub).is_err() {
                     return;
                 }
+            }
+            if self.prompts().is_err() {
+                return;
             }
             if self.step().is_err() {
                 return;
@@ -390,9 +425,11 @@ impl Worker {
         Ok(())
     }
 
-    /// A request that took `slot`: its prompt, run now. Returns whether it
-    /// runs on (an error ended it otherwise).
-    fn start(&mut self, slot: usize, ids: &[u32], sub: Submit) -> Result<bool, Dead> {
+    /// A request that took `slot`: its prompt, run now, or planned as calls
+    /// of the engine's quantum that [`Worker::prompts`] runs one a round
+    /// ([`Worker::interleaves`]). Returns whether it runs on (an error ended
+    /// it otherwise).
+    fn start(&mut self, slot: usize, ids: Vec<u32>, sub: Submit) -> Result<bool, Dead> {
         let Submit {
             p,
             prompt,
@@ -412,10 +449,22 @@ impl Worker {
         if self.turns.is_some() {
             self.show_turns();
         }
-        let mut job = Gen::new(&self.slot, &self.sh.sampler, ids.len(), &p);
-        let r = match self.slot.select(slot) {
-            Ok(()) => job.prompt(&mut self.slot, ids, &p, &mut sink_of(&events)),
+        let n = ids.len();
+        let mut job = Gen::new(&self.slot, &self.sh.sampler, n, &p);
+        let kept = match self.slot.select(slot) {
+            Ok(()) => job.open(&mut self.slot, &ids, &p),
             Err(e) => Err(GenError::Engine(e)),
+        };
+        let r = match kept {
+            Ok(kept) => match self.interleaves(n, kept.cache_n) {
+                Some(q) => job
+                    .plan(&self.slot, ids, kept, q, p.return_progress)
+                    .map(Some),
+                None => job
+                    .prompt_whole(&mut self.slot, &ids, kept, &p, &mut sink_of(&events))
+                    .map(|()| None),
+            },
+            Err(e) => Err(e),
         };
         let a = Active {
             slot,
@@ -426,8 +475,12 @@ impl Worker {
             batch: 0,
         };
         match r {
-            Ok(()) => {
+            Ok(None) => {
                 self.active.push(a);
+                Ok(true)
+            }
+            Ok(Some(plan)) => {
+                self.prompting.push(Prompting { a, plan });
                 Ok(true)
             }
             Err(GenError::Engine(e)) => {
@@ -440,6 +493,58 @@ impl Worker {
                 Ok(false)
             }
         }
+    }
+
+    /// The quantum a prompt of `n` ids whose cache kept `cache_n` runs in,
+    /// one call a round: the engine names one, another slot is busy
+    /// generating, and more than one quantum of the prompt call
+    /// (`cache_n..n-1`) is left.
+    fn interleaves(&self, n: usize, cache_n: usize) -> Option<NonZeroUsize> {
+        self.quantum
+            .filter(|q| !self.active.is_empty() && n - 1 - cache_n > q.get())
+    }
+
+    /// One call of each prompt run a call a round, in the order they took
+    /// their slots. It runs after the starts and before the decode round
+    /// ([`Worker::step`]), so a prompt's consecutive calls have a round of
+    /// the busy slots between them. A prompt whose last call ran joins the
+    /// running requests; a request whose client left ends, its slot freed;
+    /// an engine error is fatal, as at a start.
+    fn prompts(&mut self) -> Result<(), Dead> {
+        let mut k = 0;
+        while k < self.prompting.len() {
+            let Prompting { a, plan } = &mut self.prompting[k];
+            let r = match self.slot.select(a.slot) {
+                Ok(()) => a
+                    .job
+                    .prompt_call(&mut self.slot, plan, &mut sink_of(&a.events)),
+                Err(e) => Err(GenError::Engine(e)),
+            };
+            let slot = a.slot;
+            match r {
+                Ok(more) => {
+                    // `/slots` shows the prompt's positions as its calls run.
+                    relock(&self.sh.board).view_mut(slot).n_past = self.slot.held_of(slot).len();
+                    if more {
+                        k += 1;
+                    } else {
+                        let p = self.prompting.remove(k);
+                        self.active.push(p.a);
+                    }
+                }
+                Err(GenError::Engine(e)) => {
+                    let f = self.fail(&e);
+                    let p = self.prompting.remove(k);
+                    self.end_request(p.a, Err(GenError::Engine(e)));
+                    return Err(self.end(f));
+                }
+                Err(e) => {
+                    let p = self.prompting.remove(k);
+                    self.end_request(p.a, Err(e));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Takes every running request's tokens to its next engine call, and makes
@@ -557,10 +662,12 @@ impl Worker {
     }
 
     /// An engine failure in a call every running request waits on: each gets
-    /// the error, and the server ends.
+    /// the error, those between their prompt's calls too, and the server ends.
     fn die(&mut self, e: &EngineError) -> Dead {
         let f = self.fail(e);
-        for a in std::mem::take(&mut self.active) {
+        let mut ended = std::mem::take(&mut self.active);
+        ended.extend(std::mem::take(&mut self.prompting).into_iter().map(|p| p.a));
+        for a in ended {
             self.end_request(a, Err(GenError::Engine(EngineError(e.0.clone()))));
         }
         self.end(f)
@@ -757,7 +864,7 @@ impl Worker {
         t.running = Some(p.slot);
         t.turn_from = 0;
         t.stuck = false;
-        if !self.start(p.slot, &p.ids, p.sub)? {
+        if !self.start(p.slot, p.ids, p.sub)? {
             self.t_mut().running = None;
         } else if let Some(i) = self.index_of(p.slot) {
             self.active[i].batch = p.batch;

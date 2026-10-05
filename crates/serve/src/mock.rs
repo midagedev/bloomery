@@ -20,7 +20,8 @@
 //! of `ctx_max` positions, so a slot's ids are what it would give alone; its
 //! steps of several slots are [`Engine::step_slots`]'s default.
 //! [`MockEngine::with_cache_ram`] gives the server a prompt cache of the
-//! mock's states.
+//! mock's states, and [`MockEngine::with_prompt_quantum`] lets the server
+//! interleave its prompts with the other slots' decode rounds.
 //!
 //! [`DraftMock`] is the same engine behind a draft of one id: each pass
 //! verifies a proposal after `last`, the mock's own next token on two passes of
@@ -32,6 +33,7 @@
 //! and the ids, little-endian.
 
 use std::io::{Read, Write};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -80,6 +82,9 @@ pub struct MockEngine {
     /// [`Engine::cache_ram`]: 0, the prompt cache off, unless
     /// [`MockEngine::with_cache_ram`].
     cache_ram: u64,
+    /// [`Engine::prompt_quantum`]: `None`, prompts never interleave, unless
+    /// [`MockEngine::with_prompt_quantum`].
+    prompt_quantum: Option<NonZeroUsize>,
 }
 
 impl MockEngine {
@@ -96,6 +101,7 @@ impl MockEngine {
             fail_at: None,
             resets: None,
             cache_ram: 0,
+            prompt_quantum: None,
         }
     }
 
@@ -138,6 +144,25 @@ impl MockEngine {
     pub fn with_cache_ram(self, bytes: u64) -> Self {
         MockEngine {
             cache_ram: bytes,
+            ..self
+        }
+    }
+
+    /// The same mock naming `quantum` as the length its prompt calls are
+    /// bit-neutral to cut at ([`Engine::prompt_quantum`]), so the server may
+    /// run one of its prompts a call a round between the other busy slots'
+    /// decode rounds. The mock's bits are the ids themselves, which any cut
+    /// leaves unchanged: it lends the gates the cutting, not the neutrality —
+    /// a seat proves its own quantum with a gate of its own.
+    ///
+    /// # Panics
+    ///
+    /// When `quantum` is 0: a quantum names a call length.
+    #[must_use]
+    pub fn with_prompt_quantum(self, quantum: usize) -> Self {
+        assert!(quantum > 0, "a prompt quantum of 0 ids");
+        MockEngine {
+            prompt_quantum: NonZeroUsize::new(quantum),
             ..self
         }
     }
@@ -295,6 +320,10 @@ impl Engine for MockEngine {
 
     fn cache_ram(&self) -> u64 {
         self.cache_ram
+    }
+
+    fn prompt_quantum(&self) -> Option<NonZeroUsize> {
+        self.prompt_quantum
     }
 
     fn slots(&self) -> usize {

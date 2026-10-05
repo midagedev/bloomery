@@ -15,7 +15,10 @@
 //! engine emptied holding nothing for the next request, an erase of a slot
 //! the engine does not hold leaving the engine's slot and moving no state,
 //! a parked idle state taken into the prompt cache without a copy, and the
-//! idle states the turns stop parking taken into it too.
+//! idle states the turns stop parking taken into it too. A prompt run a call a
+//! round beside the decoding slots is [`yields`]'s.
+
+mod yields;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
