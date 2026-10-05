@@ -186,17 +186,17 @@
 //!   position kept.
 //! - (y) resident slots: a load made with a plan of two sequences
 //!   (`PlanInputs::plan_with_slots` — its per-load sequence terms counted
-//!   twice, and at one slot the plan every other clause loads by), window A
-//!   (four ids) by the pass path and window B (D1K's prefill) by the ubatch
-//!   path, each alone on its own slot and then together with
-//!   token-interleaved selects: every slot's ids, last logits and whole
-//!   resident state — every per-sequence store, the PLE ring, the lane word
-//!   — bit for bit its alone run's; the second sequence grows
-//!   `resident_bytes` by exactly `seq_bytes`, itself held to its derivation
-//!   from the owners of its terms; a select with a verify waiting for its
-//!   commit is refused by name, moving nothing; a third `add_slots` past the
-//!   plan is refused by name; and a rollback of slot 1 (a verify's commit)
-//!   leaves slot 0's continuation its alone run's.
+//!   twice, and at one slot the plan every other clause loads by) answers
+//!   the slot harness's contracts (`slots_gate`: H1 interleave, H3 bytes, H4
+//!   reset, H6 refusals, H7 captures), stream 0 window A (four ids) by the
+//!   pass path and stream 1 window B (D1K's prefill) by the ubatch path, its
+//!   state hash every per-sequence store, the PLE ring and the lane word,
+//!   `seq_bytes`' derivation the stores, the lane word and the two arena-row
+//!   buffers; and between the harness's halves the body's own: a third
+//!   `add_slots` past the plan is refused by name; a select with a verify
+//!   waiting for its commit is refused by name, moving nothing; and a
+//!   rollback of slot 1 (a verify's commit) leaves slot 0's continuation its
+//!   solo run's.
 //!
 //! Named differences, not banded away: ik combines the block as
 //! `routed + σ(g)·shared`, ours as `hsum + shared·w` with the sigmoid weight
@@ -231,11 +231,12 @@ mod gate {
     use bloomery_gpu::host::batch::HOT_COLS;
     use bloomery_gpu::host::handoff::{HandoffKernels, Places};
     use bloomery_gpu::hybrid::{HOST, Slot, SlotMap};
-    use bloomery_gpu::model::{ChainBody, Slots, StepMode};
+    use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_HEAD};
     use bloomery_gpu_gates::flip::{self, Flip};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::rounding::q8_32_rel;
+    use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_tensor_logical_in,
         topk_ids_logical_within, verdict,
@@ -3229,10 +3230,6 @@ mod gate {
 
     // ------------------------------------------------- (y) resident slots
 
-    /// Steps of the interleave a slot, and of the continuation after it.
-    const SLOT_STEPS: usize = 8;
-    const SLOT_TAIL: usize = 4;
-
     /// Set `name`'s prefill ids.
     fn prefill_of(name: &str) -> Result<Vec<u32>, GateError> {
         let man = RefManifest::open(&data_dir().join(name), &IK)?;
@@ -3240,20 +3237,10 @@ mod gate {
         Ok(prefill.to_vec())
     }
 
-    /// `n` greedy steps from `first`, each fed the id before it.
-    fn greedy(m: &mut Qwen38Model, first: u32, n: usize) -> Result<Vec<u32>, GateError> {
-        let mut out = Vec::with_capacity(n);
-        let mut last = first;
-        for _ in 0..n {
-            last = m.step(&[last])?;
-            out.push(last);
-        }
-        Ok(out)
-    }
-
     /// The digest of the selected slot's whole resident state: every store
-    /// and the PLE ring ([`stores`]) and the lane word — one value a slot's
-    /// alone run and its together run are read against each other by.
+    /// and the PLE ring ([`stores`]) and the lane word — the state hash a
+    /// slot's solo run and its interleaved run are read against each other
+    /// by ([`SlotsAdapter::state_hash`]).
     fn slot_digest(m: &mut Qwen38Model) -> Result<u64, GateError> {
         let (stores, ring) = stores(m)?;
         let lane = m.body("slots")?.lane();
@@ -3270,9 +3257,54 @@ mod gate {
         Ok(h.f32s(&ring).bytes(&lane.to_le_bytes()).value())
     }
 
-    /// The last logits' digest of the selected slot.
-    fn logits_digest(m: &mut Qwen38Model) -> Result<u64, GateError> {
-        Ok(Fnv1a64::default().f32s(&m.logits()?).value())
+    /// (y)'s body for the slot harness ([`slots_gate`]): the load of
+    /// [`open_slots`], stream 0 window A by the pass path and stream 1
+    /// window B by the ubatch path, each from [`fresh`] (the selecting
+    /// planes filled, which [`slot_digest`] reads whole).
+    struct Slots38<'a> {
+        experts: Experts,
+        plan_levers: &'a PlanLevers,
+        a: Vec<u32>,
+        b: Vec<u32>,
+    }
+
+    impl SlotsAdapter for Slots38<'_> {
+        type Body = Body38;
+
+        const STEPS: usize = 8;
+        const TAIL: usize = 4;
+
+        fn open(&self, slots: usize) -> Result<Qwen38Model, GateError> {
+            open_slots(self.experts, self.plan_levers, slots)
+        }
+
+        fn rewind(&self, m: &mut Qwen38Model) -> Result<(), GateError> {
+            fresh(m)
+        }
+
+        fn prompt(&self, m: &mut Qwen38Model, stream: usize) -> Result<u32, GateError> {
+            Ok(match stream {
+                0 => m.prompt38(&self.a, Prompt38::Pass)?,
+                1 => m.prompt38(&self.b, Prompt38::Gemm)?,
+                _ => return Err(format!("(y) runs streams 0 and 1, not {stream}").into()),
+            })
+        }
+
+        fn state_hash(&self, m: &mut Qwen38Model) -> Result<u64, GateError> {
+            slot_digest(m)
+        }
+
+        /// The stores ([`Body38::store_bytes`], held to the header's
+        /// derivation by (s)), the lane word (one device word) and the two
+        /// arena-row buffers (`(1 + PASS_ROWS) · STREAMS · HIDDEN` f32).
+        fn seq_bytes_derived(&self, m: &Qwen38Model) -> Result<Derived, GateError> {
+            let stores = m.body("slots")?.store_bytes();
+            let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
+            Ok(Derived {
+                bytes: stores + 4 + rows,
+                terms: format!("store_bytes {stores} + the lane word 4 + the arena rows {rows}"),
+            })
+        }
     }
 
     /// (y) the plan's slot count against the owners of the per-sequence
@@ -3330,30 +3362,22 @@ mod gate {
         Ok(ok)
     }
 
-    /// (y) (module doc): the alone runs, the interleave, the bytes, the
-    /// refusals and the rollback isolation. The clause's model is dropped
-    /// with its second sequence.
+    /// (y) (module doc): the harness's contracts over the plan of two and,
+    /// between its halves, the body's own clauses. The clause's model is
+    /// dropped with its second sequence.
     fn slots_two(experts: Experts, plan_levers: &PlanLevers) -> Result<bool, GateError> {
-        let (a, b) = (prefill_of(STEP4)?, prefill_of(D1K)?);
-        let mut m = open_slots(experts, plan_levers, 2)?;
-        // The second sequence's bytes, and the plan's count, against the
-        // owners of the terms.
-        let before = m.resident_bytes();
-        m.add_slots(2)?;
-        let (grown, seq_bytes) = (m.resident_bytes() - before, m.body("slots")?.seq_bytes());
-        let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
-        let derived = m.body("slots")?.store_bytes() + 4 + rows;
-        let bytes_ok = grown == seq_bytes && seq_bytes == derived;
-        println!(
-            "slots bytes: the second sequence grew resident_bytes by {grown}, seq_bytes \
-             {seq_bytes}, the derived {} (store_bytes {} + the lane word 4 + the arena rows {rows}) \
-             {}",
-            m.body("slots")?.store_bytes() + 4 + rows,
-            m.body("slots")?.store_bytes(),
-            verdict(bytes_ok)
-        );
+        let body = Slots38 {
+            experts,
+            plan_levers,
+            a: prefill_of(STEP4)?,
+            b: prefill_of(D1K)?,
+        };
+        // PIN(2026-10-05): (y)'s interleave and bytes clauses moved to
+        // slots_gate H1/H3; H4/H6/H7 (reset, select, captures) are new to (y),
+        // the harness's for every body.
+        let mut s = slots_gate::interleave(&body)?;
         // A third sequence past the plan is refused by name.
-        let past = match m.add_slots(3) {
+        let past = match s.model().add_slots(3) {
             Err(e) => e.to_string().contains("of a plan that counts 2 slots"),
             Ok(()) => false,
         };
@@ -3361,116 +3385,12 @@ mod gate {
             "slots past the plan: add_slots(3) on a plan of 2 named the plan and the ask {past} {}",
             verdict(past)
         );
-        // Alone: each slot from its own reset; A runs SLOT_TAIL more steps
-        // past the interleave's count for the isolation arm.
-        m.select_slot(0)?;
-        fresh(&mut m)?;
-        let mut a_ids = vec![m.prompt38(&a, Prompt38::Pass)?];
-        a_ids.extend(greedy(
-            &mut m,
-            *a_ids.last().ok_or("no token")?,
-            SLOT_STEPS,
-        )?);
-        let a_here = (
-            logits_digest(&mut m)?,
-            slot_digest(&mut m)?,
-            m.pos(),
-            m.body("slots")?.lane(),
-        );
-        let a_tail = greedy(&mut m, *a_ids.last().ok_or("no token")?, SLOT_TAIL)?;
-        m.select_slot(1)?;
-        fresh(&mut m)?;
-        let mut b_ids = vec![m.prompt38(&b, Prompt38::Gemm)?];
-        b_ids.extend(greedy(
-            &mut m,
-            *b_ids.last().ok_or("no token")?,
-            SLOT_STEPS,
-        )?);
-        let b_here = (
-            logits_digest(&mut m)?,
-            slot_digest(&mut m)?,
-            m.pos(),
-            m.body("slots")?.lane(),
-        );
-        // Together: each slot prefetched from its own reset, then a step a
-        // slot a round, the select between every step.
-        m.select_slot(0)?;
-        fresh(&mut m)?;
-        let mut t_a = vec![m.prompt38(&a, Prompt38::Pass)?];
-        m.select_slot(1)?;
-        fresh(&mut m)?;
-        let mut t_b = vec![m.prompt38(&b, Prompt38::Gemm)?];
-        // The last logits are hashed inside the final round: the head is the
-        // model's one, so a step of the other slot's replaces what it holds.
-        let mut t_a_logits = 0u64;
-        let mut t_b_logits = 0u64;
-        for r in 0..SLOT_STEPS {
-            let last = r + 1 == SLOT_STEPS;
-            m.select_slot(0)?;
-            t_a.push(m.step(&[*t_a.last().ok_or("no token")?])?);
-            if last {
-                t_a_logits = logits_digest(&mut m)?;
-            }
-            m.select_slot(1)?;
-            t_b.push(m.step(&[*t_b.last().ok_or("no token")?])?);
-            if last {
-                t_b_logits = logits_digest(&mut m)?;
-            }
-        }
-        let off: Vec<&str> = [
-            (
-                "slot 0 ids",
-                t_a == a_ids[..1 + SLOT_STEPS] && !t_a.is_empty(),
-            ),
-            ("slot 1 ids", t_b == b_ids),
-        ]
-        .into_iter()
-        .filter_map(|(name, same)| (!same).then_some(name))
-        .collect();
-        let ids_ok = off.is_empty();
-        println!(
-            "slots interleave: {} interleaved steps a slot against its alone run: {} {}",
-            SLOT_STEPS,
-            if ids_ok {
-                "every slot's ids bit for bit".to_string()
-            } else {
-                format!("differs in {}", off.join(", "))
-            },
-            verdict(ids_ok)
-        );
-        m.select_slot(0)?;
-        let g_a = (
-            t_a_logits,
-            slot_digest(&mut m)?,
-            m.pos(),
-            m.body("slots")?.lane(),
-        );
-        m.select_slot(1)?;
-        let g_b = (
-            t_b_logits,
-            slot_digest(&mut m)?,
-            m.pos(),
-            m.body("slots")?.lane(),
-        );
-        let same: Vec<&str> = [("slot 0", g_a == a_here), ("slot 1", g_b == b_here)]
-            .into_iter()
-            .filter_map(|(name, same)| (!same).then_some(name))
-            .collect();
-        let state_ok = same.is_empty();
-        println!(
-            "slots state: after the interleave each slot's last logits, whole resident state \
-             (every store, the PLE ring, the lane word), position and lane {} {}",
-            if state_ok {
-                "bit for bit its alone run's".to_string()
-            } else {
-                format!("differs for {}", same.join(", "))
-            },
-            verdict(state_ok)
-        );
         // A verify waiting for its commit refuses a select by name, moving
         // nothing; its commit (a rollback of slot 1) then stands.
+        let t = s.last(1)?;
+        let m = s.model();
+        m.select_slot(1)?;
         let at = m.pos();
-        let t = *t_b.last().ok_or("no token")?;
         m.step_rows::<4>([t, t, t, t])?;
         let before = (m.pos(), m.body("slots")?.lane());
         let named = match m.select_slot(0) {
@@ -3485,18 +3405,17 @@ mod gate {
             verdict(pending_ok)
         );
         m.rollback(at + 2)?;
-        // The rollback of slot 1 leaves slot 0's continuation its alone run's.
-        m.select_slot(0)?;
-        let tail = greedy(&mut m, *t_a.last().ok_or("no token")?, SLOT_TAIL)?;
-        let iso_ok = tail == a_tail;
+        // The rollback of slot 1 leaves slot 0's continuation its solo run's.
+        let iso_ok = s.continues(0)?;
         println!(
             "slots rollback isolation: slot 1's verify committed 2 of its 4 rows; slot 0's next \
-             {} ids {} its alone run's continuation {}",
-            SLOT_TAIL,
+             {} ids {} its solo run's continuation {}",
+            Slots38::TAIL,
             if iso_ok { "equal" } else { "differ from" },
             verdict(iso_ok)
         );
-        Ok(past && bytes_ok && ids_ok && state_ok && pending_ok && iso_ok)
+        let harness_ok = s.finish()?;
+        Ok(past && pending_ok && iso_ok && harness_ok)
     }
 
     pub fn run() -> Result<(), GateError> {

@@ -42,6 +42,8 @@ pub mod residency38;
 pub mod rounding;
 #[cfg(feature = "deepseek41")]
 pub mod serve_client;
+#[cfg(feature = "gpu")]
+pub mod slots_gate;
 
 use gguf::quant::{GgmlType, dequant_row};
 use gguf::{Gguf, Split, TensorInfo};
