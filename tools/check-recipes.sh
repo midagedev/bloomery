@@ -172,6 +172,14 @@ if ! cb=$(bash "$(dirname "$0")/ref/cold-blocks.sh" --self-test 2>&1); then
   exit 1
 fi
 echo "${cb##*$'\n'}"
+# slots-arm.sh is the depth runners' aggregate arm (<arm>@BLOOMERY_GEN_SLOTS=N): its N, its plain twin, the
+# environment's refusal, its time pass and residency clauses and the plain tables' labels, no box.
+if ! sat=$(bash "$(dirname "$0")/ref/slots-arm.sh" --self-test 2>&1); then
+  echo "$sat" >&2
+  echo "check-recipes: the slots-arm self-test failed" >&2
+  exit 1
+fi
+echo "${sat##*$'\n'}"
 # lcpp-warm.sh is the depth runners' llama-server arms: its flag translation (against V4.1's LCPP_CLI_FLAGS),
 # its refusals, the context, the --help probe and a stub server's start, requests, checks and stop (python3
 # and curl, 127.0.0.1) are tested here, no box.

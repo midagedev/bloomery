@@ -2,7 +2,7 @@
 # The depth-ds41.sh stub test: the runner's arm loop with no lease, no card and no model. It copies the
 # runner (DEPTH_DS41_RUNNER, default this tree's) into a fresh temporary tree beside this tree's
 # timing-card.sh, lease-probe.sh, tdist.py, gguf-ranges.py, load-groups.sh, lcpp-fit.sh, arm-place.sh,
-# cold-blocks.sh, lcpp-warm.sh and tools/bloomery, and a copy of lease.sh whose lease_take is replaced by a
+# slots-arm.sh, cold-blocks.sh, lcpp-warm.sh and tools/bloomery, and a copy of lease.sh whose lease_take is replaced by a
 # line that takes nothing; cards.sh there is depth-stub-cards.sh's, two made-up UUIDs; ref-paths.sh there
 # is a stub
 # profile whose engines are stub scripts (llama-bench, llama-server, generate_ds41, nvidia-smi) and whose
@@ -209,7 +209,7 @@ cp "$RUNNER" "$T/tools/ref/depth-ds41.sh"
 cp "$ROOT/tools/ref/timing-card.sh" "$ROOT/tools/ref/lease-probe.sh" \
   "$ROOT/tools/ref/lease.sh" "$ROOT/tools/ref/tdist.py" "$ROOT/tools/ref/gguf-ranges.py" \
   "$ROOT/tools/ref/load-groups.sh" "$ROOT/tools/ref/lcpp-fit.sh" "$ROOT/tools/ref/cold-blocks.sh" \
-  "$ROOT/tools/ref/arm-place.sh" "$T/tools/ref/"
+  "$ROOT/tools/ref/arm-place.sh" "$ROOT/tools/ref/slots-arm.sh" "$T/tools/ref/"
 [ ! -f "$ROOT/tools/ref/lcpp-warm.sh" ] || cp "$ROOT/tools/ref/lcpp-warm.sh" "$T/tools/ref/"
 cp -R "$ROOT/tools/bloomery/records.py" "$ROOT/tools/bloomery/schema" "$T/tools/bloomery/"
 echo 'lease_take() { echo "[stub] no lease: the stub test'"'"'s copy of lease.sh takes nothing"; }' >> "$T/tools/ref/lease.sh"
