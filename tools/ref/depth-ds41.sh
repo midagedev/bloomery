@@ -656,101 +656,28 @@ res_curve() {
   }' <<< "$w")
   echo "residency curve $1 r$2 d=$3 $w flips=$(awk '{ s += $1 } END { print s + 0 }' <<< "$RP_MADE") | $ROW_TAG slot $4 | seed ${RES_SEED:-not checked}"
 }
-# The aggregate arm (the header's <arm>@BLOOMERY_GEN_SLOTS=N).
-# arm_slots <arm> <its NAME=VALUE list>: N into ASLOTS, empty when the list names none or N = 1 (a plain lever
-# arm); an N that is not a whole number is refused by name (exit 64), the feed being N·D ids. Its range is the
-# binary's: at_main and the body's pass refuse it by name, a FAIL row.
-arm_slots() {
-  local e
-  local -a kv=()
-  ASLOTS=''
-  [ -z "$2" ] || IFS=, read -r -a kv <<< "$2"
-  for e in ${kv[@]+"${kv[@]}"}; do
-    case $e in BLOOMERY_GEN_SLOTS=*) ASLOTS=${e#*=} ;; esac
-  done
-  case $ASLOTS in
-    '') return 0 ;;
-    0* | *[!0-9]*)
-      echo "depth-ds41.sh: arm '$1': BLOOMERY_GEN_SLOTS=$ASLOTS is no slot count (a whole number from 1, no leading zero), and the arm feeds N·D ids" >&2
-      exit 64
-      ;;
-  esac
-  [ "$ASLOTS" != 1 ] || ASLOTS=''
-}
-# slots_twin <label> <its @ list as given>: an aggregate arm's plain twin into TWIN, the label with its list less
-# the BLOOMERY_GEN_SLOTS item (`prose@BLOOMERY_GEN_SLOTS=2,X=1` -> `prose@X=1`, `ours@BLOOMERY_GEN_SLOTS=2` ->
-# `ours`, `bin:t@prose@BLOOMERY_GEN_SLOTS=2` -> `bin:t@prose`).
-slots_twin() {
-  local e rest=''
-  local -a kv=()
-  IFS=, read -r -a kv <<< "$2"
-  for e in ${kv[@]+"${kv[@]}"}; do
-    case $e in BLOOMERY_GEN_SLOTS=*) ;; *) rest+=${rest:+,}$e ;; esac
-  done
-  TWIN=${1%@"$2"}${rest:+@$rest}
-}
-# slots_check <N, empty for a plain arm> <output>: the aggregate arm's FAIL clauses (the header's
-# <arm>@BLOOMERY_GEN_SLOTS=N) over an output res_read has read, by kind and field. Into SL_N, SL_POS and SL_MS
-# (the counted kind=slots rounds, their positions and ms), SL_ALL and SL_ALL_MS (every kind=slots record and
-# its ms) and SL_PP_MS (every time prompt row's ms). Returns 1 with FAIL_WHY and FAIL_RC (residency for the
-# residency clause, empty for the others) when a clause fails. ours_post and `--parse FILE ARM` both run it.
+# The aggregate arm (the header's <arm>@BLOOMERY_GEN_SLOTS=N): its N (arm_slots), its plain twin
+# (slots_twin), its time pass and residency clauses (slots_count, slots_residency), the environment's
+# refusal and the plain tables' labels: tools/ref/slots-arm.sh, shared with depth-qwen3moe.sh.
+SLOTS_RUNNER=depth-ds41.sh
+# shellcheck source=tools/ref/slots-arm.sh
+source "${BASH_SOURCE[0]%/*}/slots-arm.sh" || exit 2
+# slots_check <N, empty for a plain arm> <output>: the aggregate arm's FAIL clauses over an output res_read
+# has read, its time pass and time prompt records read here by kind and field: slots-arm.sh's slots_count
+# (into SL_*, and SL_PP_MS, every time prompt row's ms) and, for an aggregate arm, slots_residency over
+# res_read's RH_WORD and RP_* columns. Returns 1 with FAIL_WHY and FAIL_RC (residency for the residency
+# clause, empty for the others) when a clause fails. ours_post and `--parse FILE ARM` both run it.
 slots_check() {
-  local n=$1 rec bad v what b p k m s PASS_MS='' PASS_POS='' PASS_KIND='' PASS_WARM='' PROMPT_MS=''
+  local n=$1 rec PASS_MS='' PASS_POS='' PASS_KIND='' PASS_WARM='' PROMPT_MS=''
   SL_N=0 SL_POS=0 SL_MS=0 SL_ALL=0 SL_ALL_MS=0 SL_PP_MS=0 FAIL_RC='' FAIL_WHY=''
   rec=$(python3 "$RECORDS" sh - 'PASS_MS=time_pass.ms*' 'PASS_POS=time_pass.positions*' 'PASS_KIND=time_pass.kind*' \
     'PASS_WARM=time_pass.warm*' 'PROMPT_MS=time_prompt.ms*' <<< "$2") || { FAIL_WHY="records.py did not read its time pass and time prompt records"; return 1; }
   eval "$rec"
-  read -r SL_N SL_POS SL_MS bad SL_ALL SL_ALL_MS < <(paste -d' ' <(printf '%s\n' "$PASS_MS") <(printf '%s\n' "$PASS_POS") \
-    <(printf '%s\n' "$PASS_KIND") <(printf '%s\n' "$PASS_WARM") | awk -v want="${n:-0}" '$3 == "slots" {
-      all++; all_ms += $1
-      if ($4 == "1") next
-      c++; p += $2; ms += $1; if ($2 != want) bad++
-    } END { printf "%d %d %.4f %d %d %.4f\n", c, p, ms, bad, all, all_ms }')
   SL_PP_MS=$(awk 'NF { s += $1 } END { printf "%.4f", s }' <<< "$PROMPT_MS")
-  if [ -z "$n" ]; then
-    [ "$SL_ALL" != 0 ] || return 0
-    FAIL_WHY="its output holds $SL_ALL time pass record(s) of kind=slots and the arm names no BLOOMERY_GEN_SLOTS: its row would read one stream's rate off several"
-    return 1
-  fi
-  if [ "$SL_N" = 0 ]; then
-    FAIL_WHY="the arm runs BLOOMERY_GEN_SLOTS=$n and printed no counted time pass record of kind=slots: no aggregate to read"
-    return 1
-  fi
-  if [ "$bad" != 0 ]; then
-    FAIL_WHY="$bad of its $SL_N counted kind=slots records hold positions other than its $n slots"
-    return 1
-  fi
-  # The residency clause: after the seed's none/0 (res_seed holds it), the prompt calls (pass=prompt kept=0,
-  # at least one a slot: a slot's prompt may take more than one call) up to the first pass=slots, then only
-  # pass=slots kept=N, one a round.
+  slots_count "$n" "$PASS_MS" "$PASS_POS" "$PASS_KIND" "$PASS_WARM" || return 1
+  [ -n "$n" ] || return 0
+  slots_residency "$n" "$RH_WORD" "$RP_PASS" "$RP_KEEP" "$RP_BOUNDARY" && return 0
   FAIL_RC=residency
-  if [ -z "$RH_WORD" ]; then
-    FAIL_WHY="the slots residency clause needs the residency on: a slots arm's passes are read off its residency pass records, and this arm has no residency host record (BLOOMERY_RESIDENCY off, or unset under a placement that resolves it off)"
-    return 1
-  fi
-  v=$(paste -d' ' <(printf '%s\n' "$RP_PASS") <(printf '%s\n' "$RP_KEEP") <(printf '%s\n' "$RP_BOUNDARY") | awk -v n="$n" '
-    NR == 1 { next }
-    $1 == "slots" { in_slots = 1 }
-    !in_slots { if ($1 != "prompt" || $2 != 0) { print "prompt", $3, $1, $2; bad = 1; exit } m++; next }
-    { s++; if ($1 != "slots" || $2 != n) { print "slots", $3, $1, $2; bad = 1; exit } }
-    END { if (!bad) print "ok", m + 0, s + 0 }')
-  read -r what b p k <<< "$v"
-  case $what in
-    prompt) FAIL_WHY="the slots residency clause: the residency pass at boundary=$b reads pass=$p kept=$k before its first pass=slots, where only its $n slots' prompt calls (pass=prompt kept=0) stand" ;;
-    slots) FAIL_WHY="the slots residency clause: the residency pass at boundary=$b reads pass=$p kept=$k, not pass=slots kept=$n: a decode pass that was not one pass of its $n slots" ;;
-    ok)
-      m=$b s=$p
-      if [ "$s" = 0 ]; then
-        FAIL_WHY="the slots residency clause: no pass=slots kept=$n record after its $n slots' prompt calls: no decode pass of its $n slots reached the residency"
-      elif [ "$m" -lt "$n" ]; then
-        FAIL_WHY="the slots residency clause: $m pass=prompt kept=0 record(s) before its first pass=slots, fewer than one a slot of its $n"
-      else
-        FAIL_RC=''
-        return 0
-      fi
-      ;;
-    *) FAIL_WHY="the slots residency clause: its residency pass records did not read ($v)" ;;
-  esac
   return 1
 }
 # The cold tag's constants and cold_check, the fault counter and majflt_mark, ROW_TAG and counted, the
@@ -1070,10 +997,7 @@ split_at() {
 }
 # The aggregate arm's lever is an arm's own (the header's <arm>@BLOOMERY_GEN_SLOTS=N): set here it would
 # reach every generate_ds41 arm, whose plain rows would read a per stream rate under a plain label.
-if [ -n "${BLOOMERY_GEN_SLOTS+x}" ]; then
-  echo "depth-ds41.sh: BLOOMERY_GEN_SLOTS=$BLOOMERY_GEN_SLOTS is set in the runner's own environment, which every arm inherits: name it per arm (<arm>@BLOOMERY_GEN_SLOTS=N), whose row reads the aggregate" >&2
-  exit 64
-fi
+slots_env_check
 # An aggregate arm's N (N >= 2; empty for every other arm) and its plain twin's label (slots_twin).
 A_SLOTS=() A_TWIN=()
 for a in "${ARMS[@]}"; do
@@ -2234,8 +2158,6 @@ corpus_re=${CORPORA// /|}
 # decode tables, whose base is one stream.
 SLOT_LABELS=''
 for i in "${!ARMS[@]}"; do [ -z "${A_SLOTS[$i]}" ] || SLOT_LABELS+="${A_LABEL[$i]}"$'\n'; done
-# not_slots: the labels on stdin less the aggregate arms'.
-not_slots() { awk -v s="$SLOT_LABELS" 'BEGIN { n = split(s, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") x[a[i]] = 1 } !($0 in x)'; }
 refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)(@|$)" | not_slots | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 6 ours
 for c in $CORPORA; do

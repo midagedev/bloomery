@@ -669,12 +669,15 @@ esac
 case $GEN_CTX in
   *[!0-9]* | 0) echo "depth-qwen3moe.sh: BLOOMERY_GEN_CTX is a positive integer, got '$GEN_CTX'" >&2; exit 64 ;;
 esac
-# The aggregate arm's lever is an arm's own (the header's <D>@BLOOMERY_GEN_SLOTS=N): set here it would
-# reach every ours arm, whose plain rows would read a per stream rate under the label `ours`.
-if [ -n "${BLOOMERY_GEN_SLOTS+x}" ]; then
-  echo "depth-qwen3moe.sh: BLOOMERY_GEN_SLOTS=$BLOOMERY_GEN_SLOTS is set in the runner's own environment, which every arm inherits: name it per arm (<D>@BLOOMERY_GEN_SLOTS=N), whose row reads the aggregate" >&2
-  exit 64
-fi
+# The aggregate arm (the header's <D>@BLOOMERY_GEN_SLOTS=N): its N (arm_slots), its plain twin (slots_twin),
+# its time pass clauses (slots_count), the environment's refusal and the plain tables' labels:
+# tools/ref/slots-arm.sh, shared with depth-ds41.sh.
+SLOTS_RUNNER=depth-qwen3moe.sh
+# shellcheck source=tools/ref/slots-arm.sh
+source "${BASH_SOURCE[0]%/*}/slots-arm.sh" || exit 2
+# The aggregate arm's lever is an arm's own: set here it would reach every ours arm, whose plain rows would
+# read a per stream rate under the label `ours`.
+slots_env_check
 # The fault witness, the cold tag, ROW_TAG, the order's blocks and the FAIL rows: shared with
 # depth-ds41.sh. A failed arm's whole output goes to
 # ${TMPDIR:-/tmp}/depth-qwen3moe-<label>-<d|p><key>-r<round>.log.
@@ -769,23 +772,6 @@ split_at() {
   if [ -n "$APLACE" ] && [ "$MODEL_NAME" != qwen4exp ]; then
     place_refuse "$1" "place=$APLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)"
   fi
-}
-# arm_slots <arm> <lever list>: an aggregate arm's N into ASLOTS (the header's <D>@BLOOMERY_GEN_SLOTS=N),
-# empty when the list names none or N = 1 (a plain lever arm); an N that is not a whole number is refused
-# by name, the feed being N·D ids. Its range is the binary's (at_main refuses it by name).
-arm_slots() {
-  local e
-  local -a kv=()
-  ASLOTS=''
-  [ -z "$2" ] || IFS=, read -r -a kv <<< "$2"
-  for e in ${kv[@]+"${kv[@]}"}; do
-    case $e in BLOOMERY_GEN_SLOTS=*) ASLOTS=${e#*=} ;; esac
-  done
-  case $ASLOTS in
-    '') return 0 ;;
-    0* | *[!0-9]*) arm_refuse "$1" "BLOOMERY_GEN_SLOTS=$ASLOTS is no slot count (a whole number from 1, no leading zero), and the arm feeds N·D ids" ;;
-  esac
-  [ "$ASLOTS" != 1 ] || ASLOTS=''
 }
 # arm_feed <i>: the ids arm <i> feeds: its depth, N·D for an aggregate arm.
 arm_feed() { echo $((A_DEP[$1] * ${A_SLOTS[$1]:-1})); }
@@ -1456,27 +1442,12 @@ ours_post() {
   eval "$rec"
   # An aggregate arm (the header's <D>@BLOOMERY_GEN_SLOTS=N) reads its rounds from the `time pass …
   # kind=slots` records: the counted ones (`warm` left out), each of N positions, and every one for the
-  # timed window; an arm that names no N prints none. sl_*: the counted rounds, their positions and ms,
-  # those whose positions is not N, then every kind=slots record and its ms.
-  local nslots=${A_SLOTS[$i]} sl_n sl_pos sl_ms sl_bad sl_all sl_all_ms
-  read -r sl_n sl_pos sl_ms sl_bad sl_all sl_all_ms < <(paste -d' ' <(printf '%s\n' "$SP_MS") <(printf '%s\n' "$SP_POS") \
-    <(printf '%s\n' "$SP_KIND") <(printf '%s\n' "$SP_WARM") | awk -v want="${nslots:-0}" '$3 == "slots" {
-      all++; all_ms += $1
-      if ($4 == "1") next
-      n++; p += $2; ms += $1; if ($2 != want) bad++
-    } END { printf "%d %d %.4f %d %d %.4f\n", n, p, ms, bad, all, all_ms }')
-  if [ -z "$nslots" ] && [ "$sl_all" -gt 0 ]; then
-    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its output holds $sl_all time pass record(s) of kind=slots and the arm names no BLOOMERY_GEN_SLOTS: its row would read one stream's rate off several" "$out"
+  # timed window; an arm that names no N prints none (slots-arm.sh's slots_count, into SL_*).
+  local nslots=${A_SLOTS[$i]}
+  slots_count "$nslots" "$SP_MS" "$SP_POS" "$SP_KIND" "$SP_WARM" || {
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"
     return 0
-  fi
-  if [ -n "$nslots" ] && [ "$sl_n" = 0 ]; then
-    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "the arm runs BLOOMERY_GEN_SLOTS=$nslots and printed no counted time pass record of kind=slots: no aggregate to read" "$out"
-    return 0
-  fi
-  if [ -n "$nslots" ] && [ "$sl_bad" -gt 0 ]; then
-    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$sl_bad of its $sl_n counted kind=slots records hold positions other than its $nslots slots" "$out"
-    return 0
-  fi
+  }
   mtp=''
   if [ "$n_mtp" -gt 0 ]; then
     [ -n "$MK" ] && [ -n "$MP" ] && [ -n "$MQ" ] || { arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "its mtp summary record has no kept, positions or passes (kept='$MK' positions='$MP' passes='$MQ')" "$out"; return 0; }
@@ -1521,7 +1492,7 @@ ours_post() {
   # The timed window: the prompt's wall and the N generated steps at the mean; an aggregate arm's, every
   # slot's prompt and every round.
   win=$(awk -v p="${PP_MS:-0}" -v n="$N" -v m="$mean" 'BEGIN { printf "%.4f", (p + n * m) / 1e3 }')
-  [ -z "$nslots" ] || win=$(echo "$out" | pp_rows | awk -v r="$sl_all_ms" '{ p += $5 } END { printf "%.4f", (p + r) / 1e3 }')
+  [ -z "$nslots" ] || win=$(echo "$out" | pp_rows | awk -v r="$SL_ALL_MS" '{ p += $5 } END { printf "%.4f", (p + r) / 1e3 }')
   cold_check "${MAJ_TIMED:-$MAJ_WHOLE}" "$win"
   if [ -n "$MAJ_TIMED" ]; then
     timed=$MAJ_TIMED
@@ -1538,8 +1509,8 @@ ours_post() {
     # The aggregate: Σ positions · 1000 / Σ ms over the counted rounds; the SMOKE footer's p50 and mean are
     # a round's, so 1000 / mean is one stream's rate.
     local agg
-    agg=$(awk -v p="$sl_pos" -v ms="$sl_ms" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
-    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$sl_n, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
+    agg=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
+    echo "$ROW_TAG r$r $label d=$dep n=$N ctx=$ctx | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME${rowplace:+ | place $rowplace} | slots $nslots | tok/s(per stream, mean) $tps_mean | p50 $p50 ms/pass | mean $mean ms/pass | warm ${warmcol:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok | nodes ${nodes:-?}$PP_COL$mtp$slot | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG | majflt $MAJ_WHOLE (timed $timed; ≤ $MAJ_BOUND % of W ${win} s)$COLD_TAG"
     counted || return 0
     count_row
     sums+=("$label|$dep|$r|$agg||$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG|$nslots")
@@ -1906,8 +1877,6 @@ prose_re='^ours@prose(@|$)|^[^@]+@prose$'
 # The aggregate arms' labels (the header's <D>@BLOOMERY_GEN_SLOTS=N): their own table below, out of these.
 SLOT_LABELS=''
 for i in "${!ARMS[@]}"; do [ -z "${A_SLOTS[$i]}" ] || SLOT_LABELS+="${A_LABEL[$i]}"$'\n'; done
-# not_slots: the labels on stdin less the aggregate arms'.
-not_slots() { awk -v s="$SLOT_LABELS" 'BEGIN { n = split(s, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") x[a[i]] = 1 } !($0 in x)'; }
 refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "$prose_re" | not_slots | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 0 6
 prose_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "$prose_re" | grep -vx ours@prose | not_slots | sort -u | tr '\n' ' ')
@@ -1924,10 +1893,8 @@ if [ -n "$SLOT_LABELS" ]; then
   echo "    twin's tok/s per depth, the same statistics; above 1 the N streams in one pass outrun one stream ==="
   while IFS= read -r sl; do
     [ -n "$sl" ] || continue
-    twin=$(awk -v l="$sl" 'BEGIN {
-      at = index(l, "@prose@") ? index(l, "@prose@") + 6 : index(l, "@"); head = substr(l, 1, at - 1); n = split(substr(l, at + 1), kv, ",")
-      for (i = 1; i <= n; i++) if (kv[i] !~ /^BLOOMERY_GEN_SLOTS=/) rest = rest (rest == "" ? "" : ",") kv[i]
-      print head (rest == "" ? "" : "@" rest) }')
+    slots_twin "$sl"
+    twin=$TWIN
     if ! printf '%s\n' "${A_LABEL[@]}" | grep -qxF -- "$twin"; then
       echo "ratio slots: $sl has no plain twin $twin among the arms: no ratio"
       continue
