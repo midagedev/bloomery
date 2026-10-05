@@ -194,8 +194,10 @@ mod gate {
 
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{checkpoint_bytes, seq_positional_bytes};
-    use bloomery_gpu_gates::record;
-    use bloomery_gpu_gates::serve_client::{curl, ids_of, json_of, parse_ids};
+    use bloomery_gpu_gates::record::{self, Fields, ReadError};
+    use bloomery_gpu_gates::serve_client::{
+        curl, ids_of, json_of, metric, parse_ids, server_log, stage_usable,
+    };
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::models::Mixer;
@@ -701,20 +703,50 @@ mod gate {
         Ok(ok)
     }
 
-    /// The records on the server's stderr so far whose line starts with
-    /// `head` and a space.
-    fn records(err_log: &Path, head: &str) -> Result<Vec<String>, GateError> {
-        let prefix = format!("{head} ");
-        Ok(std::fs::read_to_string(err_log)?
-            .lines()
-            .filter(|l| l.starts_with(&prefix))
-            .map(str::to_owned)
-            .collect())
+    /// The server's stderr so far, read by the seat's record kinds.
+    fn seat_log(err_log: &Path) -> Result<record::Log, GateError> {
+        server_log(err_log, record::BLOOMERY_SERVE_QWEN38)
     }
 
-    /// The `mtp prompt` records on the server's stderr so far.
-    fn mtp_prompts(err_log: &Path) -> Result<Vec<String>, GateError> {
-        records(err_log, "mtp prompt")
+    /// An `mtp prompt` record's join ([`record::MTP_PROMPT`]): its start, the
+    /// rows the draft caught up and why it skipped (`none` when it drafts).
+    #[derive(Debug)]
+    struct Join {
+        start: u64,
+        caught_up: u64,
+        skipped: String,
+    }
+
+    impl Join {
+        fn read(f: &Fields) -> Result<Join, ReadError> {
+            Ok(Join {
+                start: f.u64("start")?,
+                caught_up: f.u64("caught_up")?,
+                skipped: f.text("skipped")?.to_owned(),
+            })
+        }
+    }
+
+    /// An `mtp keep` record ([`record::MTP_KEEP38`]): its branch (`kept` or
+    /// `reset`), the prefix the keep rule granted, the break-even and the
+    /// reply tokens it was derived for.
+    #[derive(Debug, PartialEq)]
+    struct MtpKeep {
+        branch: String,
+        prefix: u64,
+        break_even: u64,
+        reply: u64,
+    }
+
+    impl MtpKeep {
+        fn read(f: &Fields) -> Result<MtpKeep, ReadError> {
+            Ok(MtpKeep {
+                branch: f.word("branch")?.to_owned(),
+                prefix: f.u64("prefix")?,
+                break_even: f.u64("break_even")?,
+                reply: f.u64("reply")?,
+            })
+        }
     }
 
     /// The drafted seat's break-even as its `draft keep` line prints it: the
@@ -759,13 +791,13 @@ mod gate {
 
         /// The `mtp keep` record a request of `n` tokens that weighed a
         /// prefix of `prefix` positions prints, its branch `kept` or `reset`.
-        fn record(self, n: usize, prefix: u64, kept: bool) -> String {
-            format!(
-                "mtp keep branch={} prefix={prefix} break_even={} reply={}",
-                if kept { "kept" } else { "reset" },
-                self.at(n),
-                self.reply(n)
-            )
+        fn record(self, n: usize, prefix: u64, kept: bool) -> MtpKeep {
+            MtpKeep {
+                branch: if kept { "kept" } else { "reset" }.to_owned(),
+                prefix,
+                break_even: self.at(n) as u64,
+                reply: self.reply(n) as u64,
+            }
         }
     }
 
@@ -779,19 +811,6 @@ mod gate {
             .collect())
     }
 
-    /// An `mtp prompt` record's join: its start, the rows the draft caught
-    /// up and why it skipped (`none` when it drafts; the text runs to the
-    /// line's end).
-    fn join_of(line: &str) -> Option<(u64, u64, &str)> {
-        let key = |name: &str| {
-            line.split_whitespace()
-                .find_map(|w| w.strip_prefix(name)?.strip_prefix('='))
-                .and_then(|v| v.parse().ok())
-        };
-        let (_, skipped) = line.split_once(" skipped=")?;
-        Some((key("start")?, key("caught_up")?, skipped))
-    }
-
     /// One greedy `/completion` of the token array `ids`: its status, ids,
     /// `cache_n` and `draft_n`, and the `mtp prompt` records and draft-off
     /// lines it made the server print. A request the server does not answer is a status of 0
@@ -803,9 +822,10 @@ mod gate {
         n: usize,
         cache: bool,
     ) -> Result<Greedy, GateError> {
-        let before = mtp_prompts(err_log)?.len();
+        let log = seat_log(err_log)?;
+        let before = log.all(&record::MTP_PROMPT)?.len();
         let offs_before = draft_offs(err_log)?.len();
-        let keeps_before = records(err_log, "mtp keep")?.len();
+        let keeps_before = log.all(&record::MTP_KEEP38)?.len();
         let body = json!({
             "prompt": ids, "n_predict": n, "temperature": 0, "return_tokens": true,
             "cache_prompt": cache,
@@ -827,9 +847,12 @@ mod gate {
             Ok((st, text)) => Greedy::failed(format!("HTTP {st}: {text}")),
             Err(e) => Greedy::failed(e.to_string()),
         };
-        let joins = mtp_prompts(err_log)?.split_off(before);
+        let log = seat_log(err_log)?;
+        let joins = log.all(&record::MTP_PROMPT)?.split_off(before);
+        let joins = joins.iter().map(Join::read).collect::<Result<_, _>>()?;
         let offs = draft_offs(err_log)?.split_off(offs_before);
-        let keeps = records(err_log, "mtp keep")?.split_off(keeps_before);
+        let keeps = log.all(&record::MTP_KEEP38)?.split_off(keeps_before);
+        let keeps = keeps.iter().map(MtpKeep::read).collect::<Result<_, _>>()?;
         Ok(Greedy {
             joins,
             offs,
@@ -843,10 +866,10 @@ mod gate {
         tokens: Vec<u32>,
         cache_n: u64,
         draft_n: u64,
-        joins: Vec<String>,
+        joins: Vec<Join>,
         offs: Vec<String>,
         /// The `mtp keep` records the request made the server print.
-        keeps: Vec<String>,
+        keeps: Vec<MtpKeep>,
         said: String,
     }
 
@@ -884,27 +907,29 @@ mod gate {
             self.ok
                 && self.draft_n == 0
                 && self.offs.last().is_some_and(|l| l.contains(&at))
-                && self.joins.iter().any(|l| {
-                    join_of(l).is_some_and(|(s, c, k)| s == self.cache_n && c == 0 && k != "none")
-                })
+                && self
+                    .joins
+                    .iter()
+                    .any(|j| j.start == self.cache_n && j.caught_up == 0 && j.skipped != "none")
         }
 
         /// Under the draft, a request that reset below the break-even: it
         /// kept nothing, printed `record` (its `mtp keep`) and no draft-off
         /// line, and drafted.
-        fn reset_by_rule(&self, record: &str) -> bool {
+        fn reset_by_rule(&self, record: &MtpKeep) -> bool {
             self.ok
                 && self.cache_n == 0
                 && self.draft_n > 0
                 && self.offs.is_empty()
-                && self.keeps.last().is_some_and(|l| l == record)
+                && self.keeps.last() == Some(record)
         }
 
         /// One join printed for this request, at `start`, that walked the
         /// draft up to it and skipped nothing.
         fn joined_at(&self, start: u64) -> bool {
-            matches!(self.joins.as_slice(), [l] if join_of(l)
-                .is_some_and(|(s, c, k)| s == start && c >= 1 && k == "none"))
+            matches!(self.joins.as_slice(), [j] if j.start == start
+                && j.caught_up >= 1
+                && j.skipped == "none")
         }
     }
 
@@ -1003,7 +1028,7 @@ mod gate {
         let skips_at_p = x3
             .joins
             .iter()
-            .any(|l| join_of(l).is_some_and(|(s, c, k)| s == p && c == 0 && k != "none"));
+            .any(|j| j.start == p && j.caught_up == 0 && j.skipped != "none");
         let x3_ok = if x3_kept {
             x3.ok
                 && x3.cache_n == p
@@ -1084,34 +1109,19 @@ mod gate {
     /// ([`record::PLAN38`]) named: its census reading at its load. The
     /// gate's re-derivations take the same one — a fresh census read beside
     /// the loaded server would see the server's own bytes as taken and size
-    /// another plan. A server that printed no `plan` record, or a record
-    /// without its `card_free`, is a named error, never an uncapped re-plan:
-    /// the seat prints its `ctx` line before its `plan` record, so a reader
-    /// that stops the server at the `ctx` line waits for the record too.
+    /// another plan. A server that printed no `plan` record or more than
+    /// one, or a record without its `card_free`, is a named error, never an
+    /// uncapped re-plan: the seat prints its `ctx` line before its `plan`
+    /// record, so a reader that stops the server at the `ctx` line waits for
+    /// the record too.
     fn server_card_free(err_log: &Path) -> Result<u64, GateError> {
-        let kind = &record::PLAN38;
-        let line = record_line(err_log, kind.head)?.ok_or_else(|| {
-            format!(
-                "{}: the server printed no `{}` record",
-                err_log.display(),
-                kind.name
-            )
-        })?;
-        line.split(" card_free=")
-            .nth(1)
-            .and_then(|t| t.split(' ').next())
-            .and_then(|n| n.parse::<u64>().ok())
-            .ok_or_else(|| {
-                format!(
-                    "the server's `{}` record carries no card_free: {line}",
-                    kind.name
-                )
-                .into()
-            })
+        let free = seat_log(err_log)?.one(&record::PLAN38)?.u64("card_free")?;
+        println!("the server's plan record: card_free={free}");
+        Ok(free)
     }
 
-    /// The first record on the server's stderr at `err_log` whose line
-    /// starts with `head` and a space.
+    /// The first line on the server's stderr at `err_log` that starts with
+    /// `head` and a space: a seat's own line no record kind reads.
     fn record_line(err_log: &Path, head: &str) -> Result<Option<String>, GateError> {
         let prefix = format!("{head} ");
         Ok(std::fs::read_to_string(err_log)?
@@ -1140,48 +1150,63 @@ mod gate {
         let addr = served.address(&err_log, POLLS, POLL)?;
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
-        let lever = record_line(&err_log, "residency lever")?;
-        let host = record_line(&err_log, "residency host")?;
-        println!("residency records: {lever:?} {host:?}");
-        let named = format!("residency={word}");
+        let log = seat_log(&err_log)?;
+        let lever = log.one(&record::RESIDENCY_LEVER)?;
+        let host = log.one(&record::RESIDENCY_HOST)?;
+        let (lever_word, why, host_word) = (
+            lever.word("residency")?,
+            lever.word("why")?,
+            host.word("residency")?,
+        );
+        println!("residency records: lever {lever_word} why={why}, host {host_word}");
         check(
             &mut ok,
             "residency_loads_the_word",
-            lever.is_some_and(|l| l.contains(&named) && l.ends_with(" why=set"))
-                && host.is_some_and(|l| l.contains(&named)),
+            lever_word == word && why == "set" && host_word == word,
         );
         let (st, body) = curl(&url("/completion"), Some(completion), false)?;
         let ids = ids_of(&json_of("/completion", st, &body)?["tokens"]);
         println!("residency completion tokens {ids:?}");
-        let passes = |kind: &str| -> Result<bool, GateError> {
-            let want = format!("residency pass pass={kind} ");
-            Ok(std::fs::read_to_string(&err_log)?
-                .lines()
-                .any(|l| l.starts_with(&want)))
-        };
+        let passes = seat_log(&err_log)?.all(&record::RESIDENCY_PASS)?;
+        let kinds = passes
+            .iter()
+            .map(|f| f.word("pass").map(str::to_owned))
+            .collect::<Result<Vec<_>, _>>()?;
+        println!("residency passes over the request: {kinds:?}");
         check(
             &mut ok,
             "residency_request_ends_prompt_and_step_passes",
-            passes("prompt")? && passes("step")?,
+            kinds.iter().any(|k| k == "prompt") && kinds.iter().any(|k| k == "step"),
         );
-        let landed: u64 = std::fs::read_to_string(&err_log)?
-            .lines()
-            .filter(|l| l.starts_with("residency pass "))
-            .filter_map(|l| l.split(' ').find_map(|w| w.strip_prefix("landed=")))
-            .filter_map(|n| n.parse::<u64>().ok())
-            .sum();
+        let landed = passes
+            .iter()
+            .map(|f| f.u64("landed"))
+            .sum::<Result<u64, _>>()?;
         println!("residency flips landed over the request: {landed}");
         let (st, body) = curl(&url("/residency/reset"), Some(&json!({})), false)?;
         let reset: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-        let record = record_line(&err_log, "residency reset")?;
-        println!("residency reset: HTTP {st} {reset}; record {record:?}");
-        let counts = ["cancelled", "copies", "diff"].map(|k| format!("{k}={}", reset[k]));
+        let names = ["cancelled", "copies", "diff"];
+        let counts = match seat_log(&err_log)?.first(&record::RESIDENCY_RESET)? {
+            Some(r) => Some(
+                names
+                    .iter()
+                    .map(|k| r.u64(k))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
+        println!("residency reset: HTTP {st} {reset}; record {names:?} {counts:?}");
         check(
             &mut ok,
             "residency_reset_is_a_200_with_its_record",
             st == 200
                 && reset["diff"] == json!(0)
-                && record.is_some_and(|l| counts.iter().all(|c| l.contains(&format!(" {c} ")))),
+                && counts.is_some_and(|c| {
+                    names
+                        .iter()
+                        .zip(&c)
+                        .all(|(k, v)| reset[*k].as_u64() == Some(*v))
+                }),
         );
         let (st, body) = curl(&url("/completion"), Some(completion), false)?;
         let again = ids_of(&json_of("/completion", st, &body)?["tokens"]);
@@ -1493,19 +1518,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// `/metrics`' `llamacpp:<name>` value; `None` when it carries none.
-    fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
-        let (st, body) = curl(&url("/metrics"), None, false)?;
-        if st != 200 {
-            return Err(format!("/metrics: HTTP {st}: {body}").into());
-        }
-        let key = format!("llamacpp:{name} ");
-        Ok(body
-            .lines()
-            .find_map(|l| l.strip_prefix(&key))
-            .and_then(|v| v.trim().parse().ok()))
-    }
-
     /// The server's `parallel` line (the seat's own, printed before its
     /// load).
     fn parallel_line(err_log: &Path) -> Result<Option<String>, GateError> {
@@ -1799,16 +1811,14 @@ mod gate {
                 .find_map(|w| w.strip_prefix(&format!("{k}=")))
                 .and_then(|v| v.parse::<u64>().ok())
         };
-        let listening = std::fs::read_to_string(&err_log)?
-            .lines()
-            .find(|l| l.starts_with(record::LISTENING38.head))
-            .unwrap_or("")
-            .to_owned();
+        let listening = seat_log(&err_log)?.one(&record::LISTENING38)?;
+        let (l_slots, l_slot_ctx) = (listening.u64("slots")?, listening.u64("slot_ctx")?);
         let (st, body) = curl(&url("/props"), None, false)?;
         let props = json_of("/props", st, &body)?;
         let n_ctx = props["n_ctx"].as_u64().unwrap_or(u64::MAX);
         println!(
-            "slots: {load}; {listening}; props n_ctx {n_ctx}, load slots={:?} slot_ctx={:?}",
+            "slots: {load}; props n_ctx {n_ctx}, load slots={:?} slot_ctx={:?}, listening \
+             slots={l_slots} slot_ctx={l_slot_ctx}",
             field(&load, "slots"),
             field(&load, "slot_ctx"),
         );
@@ -1817,8 +1827,8 @@ mod gate {
             "slots_load_names_the_split",
             field(&load, "slots") == Some(2)
                 && field(&load, "slot_ctx") == Some(u64::try_from(CTX / 2).unwrap())
-                && field(&listening, "slots") == Some(2)
-                && field(&listening, "slot_ctx") == Some(u64::try_from(CTX / 2).unwrap())
+                && l_slots == 2
+                && l_slot_ctx == u64::try_from(CTX / 2).unwrap()
                 && n_ctx == u64::try_from(CTX / 2).unwrap(),
         );
         // Two distinct prompts, each first run alone, then both together.
@@ -2111,8 +2121,13 @@ mod gate {
             // below take ([`server_card_free`]), and the seat prints its `ctx`
             // line before it: both must be in the log before the server
             // stops, or the reading is raced away.
-            let head = format!("{} ", record::PLAN38.head);
-            let plan = text.lines().any(|l| l.starts_with(&head));
+            // A poll of a log still being written: a line that does not read
+            // whole yet is not there yet ([`server_card_free`] reads it once
+            // the server stops).
+            let plan = matches!(
+                record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38).first(&record::PLAN38),
+                Ok(Some(_))
+            );
             if (line.is_some() && plan) || served.child.try_wait()?.is_some() {
                 break;
             }
@@ -2291,8 +2306,11 @@ mod gate {
                  implemented"
             )
         };
+        let listened = record::Log::of(&text, record::BLOOMERY_SERVE_QWEN38)
+            .first(&record::LISTENING38)?
+            .is_some();
         println!(
-            "ctx: --ctx-size {over}: exit {status:?}; named {}",
+            "ctx: --ctx-size {over}: exit {status:?}; named {}; listened {listened}",
             text.contains(&named)
         );
         if status.is_none() {
@@ -2301,9 +2319,7 @@ mod gate {
         check(
             &mut ok,
             "ctx_past_the_fit_is_refused_by_name",
-            status.is_some_and(|s| !s.success())
-                && text.contains(&named)
-                && !text.contains("listening on http://"),
+            status.is_some_and(|s| !s.success()) && text.contains(&named) && !listened,
         );
         Ok(ok)
     }
@@ -2351,21 +2367,14 @@ mod gate {
         // time, at most the device's usable bytes — the census term the
         // expert rule filled within (memguard). FAIL-first: a plan line that
         // drops it, or names it past the usable bytes, turns this red.
-        let free_named = record_line(&err_log, "plan")?.is_some_and(|l| {
-            let free = l
-                .split("card_free=")
-                .nth(1)
-                .and_then(|t| t.split(' ').next())
-                .and_then(|n| n.parse::<u64>().ok());
-            let usable = l
-                .split("devices=")
-                .nth(1)
-                .and_then(|d| d.split([',', ' ', ']']).next())
-                .and_then(|c| c.rsplit(':').next())
-                .and_then(|n| n.parse::<u64>().ok());
-            free.is_some_and(|f| usable.is_some_and(|u| f <= u))
-        });
-        println!("plan names the stage card's free bytes {free_named}");
+        let plan = seat_log(&err_log)?.one(&record::PLAN38)?;
+        let free = plan.opt_u64("card_free")?;
+        let usable = stage_usable(&plan)?;
+        let free_named = free.is_some_and(|f| f <= usable);
+        println!(
+            "plan names the stage card's free bytes {free_named}: card_free={free:?}, usable \
+             {usable}"
+        );
         check(&mut ok, "plan_names_the_cards_free_bytes", free_named);
         let argv: Vec<String> = std::iter::once(exe.to_string_lossy().into_owned())
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))

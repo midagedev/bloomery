@@ -201,7 +201,10 @@ mod gate {
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
-    use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, parse_ids};
+    use bloomery_gpu_gates::record::{self, Fields};
+    use bloomery_gpu_gates::serve_client::{
+        Served, curl, ids_of, json_of, metric, parse_ids, server_log,
+    };
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use gguf::Split;
     use serde_json::{Value, json};
@@ -317,24 +320,16 @@ mod gate {
         Ok(std::env::current_exe()?.with_file_name(name))
     }
 
-    /// `/metrics`' `llamacpp:<name>` value; `None` when it carries none.
-    fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
-        let (st, body) = curl(&url("/metrics"), None, false)?;
-        if st != 200 {
-            return Err(format!("/metrics: HTTP {st}: {body}").into());
-        }
-        let key = format!("llamacpp:{name} ");
-        Ok(body
-            .lines()
-            .find_map(|l| l.strip_prefix(&key))
-            .and_then(|v| v.trim().parse().ok()))
-    }
-
     /// The busy slots the server has booked over its `decodes` engine calls:
     /// `/metrics` carries them as the running mean `n_busy_slots_per_decode`
     /// (`serve::api`'s metrics), so the total is that mean times the calls.
     fn busy_total(url: &dyn Fn(&str) -> String, decodes: f64) -> Result<f64, GateError> {
         Ok(metric(url, "n_busy_slots_per_decode")?.unwrap_or(f64::NAN) * decodes)
+    }
+
+    /// The server's stderr so far, read by the seat's record kinds.
+    fn seat_log(err_log: &Path) -> Result<record::Log, GateError> {
+        server_log(err_log, record::BLOOMERY_SERVE_QWEN3)
     }
 
     /// The whole-number field ` name=…` of a record line; `None` when the
@@ -452,12 +447,13 @@ mod gate {
                     // or allocation that ignores the flag leaves the delta
                     // wrong or 0; a comparison across the two auto contexts
                     // is red on any card where the q8_0 answer grows.
-                    let log = std::fs::read_to_string(&err_log)?;
-                    let loads = log.lines().filter(|l| l.starts_with("load ")).count();
-                    let says_q8 = log
-                        .lines()
-                        .any(|l| l.starts_with("load ") && l.contains("cache=q8_0"));
-                    check(ok, "q8_load_names_its_cache", loads == 1 && says_q8);
+                    let loads = seat_log(&err_log)?.all(&record::LOAD_QWEN3)?;
+                    let caches = loads
+                        .iter()
+                        .map(|l| l.word("cache"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    println!("q8 arm: the load records' cache {caches:?}");
+                    check(ok, "q8_load_names_its_cache", caches == ["q8_0"]);
                     check(
                         ok,
                         "q8_ctx_never_below_the_f16_answer",
@@ -473,11 +469,12 @@ mod gate {
                         "ctx_default_is_capped_to_the_card",
                         n >= 4096 && n % 1024 == 0 && n > 4096,
                     );
-                    let log = std::fs::read_to_string(&err_log)?;
-                    let says_f16 = log
-                        .lines()
-                        .any(|l| l.starts_with("load ") && l.contains("cache=f16"));
-                    check(ok, "default_load_names_f16", says_f16);
+                    let load = seat_log(&err_log)?.one(&record::LOAD_QWEN3)?;
+                    println!(
+                        "default arm: the load record's cache {}",
+                        load.word("cache")?
+                    );
+                    check(ok, "default_load_names_f16", load.word("cache")? == "f16");
                     default_n = Some(n);
                 }
                 _ => {
@@ -503,19 +500,12 @@ mod gate {
                     // sequence of `ctx_max` in turns; mutant: the seat's
                     // placed load kept on the turns serves `ctx_max`.
                     let log = std::fs::read_to_string(&err_log)?;
-                    let plan_ctx = log.lines().find(|l| l.starts_with("plan ")).and_then(|l| {
-                        l.split("ctx_max=")
-                            .nth(1)?
-                            .split(' ')
-                            .next()?
-                            .parse::<u64>()
-                            .ok()
-                    });
+                    let records = seat_log(&err_log)?;
+                    let total = records.one(&record::PLAN38)?.u64("ctx_max")?;
                     let resident = split.architecture() == Some("qwen3moe");
-                    let total = plan_ctx.unwrap_or(u64::MAX);
                     let slot = if resident { total / 2 } else { total };
                     println!(
-                        "placed arm: plan ctx_max {plan_ctx:?}, resident slots {resident}, props \
+                        "placed arm: plan ctx_max {total}, resident slots {resident}, props \
                          n_ctx {n} against a slot's {slot}"
                     );
                     check(
@@ -523,11 +513,7 @@ mod gate {
                         "placed_ctx_keeps_the_floor_and_the_granule",
                         total >= 4096 && total % 1024 == 0,
                     );
-                    check(
-                        ok,
-                        "placed_ctx_is_the_plans_ctx_max",
-                        plan_ctx.is_some() && n == slot,
-                    );
+                    check(ok, "placed_ctx_is_the_plans_ctx_max", n == slot);
                     let said: Vec<u64> = log
                         .lines()
                         .filter(|l| l.contains("--ctx defaults to "))
@@ -553,34 +539,23 @@ mod gate {
                     // a slot's share each; a qwen35moe file's take the
                     // placed load's one sequence in turns over the whole
                     // context (the module header).
-                    let (load, listening) = load_and_listening(&log);
-                    println!(
-                        "placed arm: plan record {:?}; load record {load:?}",
-                        log.lines().find(|l| l.starts_with("plan ")).unwrap_or("")
-                    );
+                    let load = records.one(&record::LOAD_QWEN3)?;
+                    let listening = records.one(&record::LISTENING_QWEN3)?;
                     let terms = [
-                        field_u64(load, "slots"),
-                        field_u64(load, "slot_ctx"),
-                        field_u64(listening, "slots"),
-                        field_u64(listening, "slot_ctx"),
+                        load.u64("slots")?,
+                        load.u64("slot_ctx")?,
+                        listening.u64("slots")?,
+                        listening.u64("slot_ctx")?,
                     ];
                     println!(
-                        "placed arm: load slots={:?} slot_ctx={:?}, listening slots={:?} \
-                         slot_ctx={:?}",
+                        "placed arm: load slots={} slot_ctx={}, listening slots={} \
+                         slot_ctx={}",
                         terms[0], terms[1], terms[2], terms[3]
                     );
                     if resident {
-                        check(
-                            ok,
-                            "placed_slots_are_resident",
-                            terms == [Some(2), Some(slot), Some(2), Some(slot)],
-                        );
+                        check(ok, "placed_slots_are_resident", terms == [2, slot, 2, slot]);
                     } else {
-                        check(
-                            ok,
-                            "placed_slots_take_turns",
-                            terms == [Some(1), Some(total), Some(2), Some(total)],
-                        );
+                        check(ok, "placed_slots_take_turns", terms == [1, total, 2, total]);
                     }
                 }
             }
@@ -602,12 +577,10 @@ mod gate {
             println!("ctx arm {name}: server stopped: {}", s.stop()?);
         }
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
-        let resident = |log: &str| {
-            log.lines()
-                .find(|l| l.starts_with("load arch="))
-                .and_then(|l| l.split("resident_bytes=").nth(1))
-                .and_then(|r| r.split(' ').next())
-                .and_then(|r| r.parse::<u64>().ok())
+        let resident = |log: &str| -> Result<u64, GateError> {
+            Ok(record::Log::of(log, record::BLOOMERY_SERVE_QWEN3)
+                .one(&record::LOAD_QWEN3)?
+                .u64("resident_bytes")?)
         };
         let kv_heads = split
             .arch_get_u64("attention.head_count_kv")
@@ -658,20 +631,15 @@ mod gate {
         let same_log = std::fs::read_to_string(&same_err)?;
         let ceiling = layers * same_n * kv_heads * head_dim * 15 / 8;
         let f16_log = std::fs::read_to_string(dir.join("ctx-default").join("server.err"))?;
-        let dropped = resident(&f16_log)
-            .zip(resident(&same_log))
-            .is_some_and(|(a, b)| {
-                let d = a.saturating_sub(b);
-                match split.architecture() {
-                    Some("qwen3moe") => d == ceiling,
-                    _ => d > 0 && d <= ceiling,
-                }
-            });
+        let (f16_resident, q8_resident) = (resident(&f16_log)?, resident(&same_log)?);
+        let d = f16_resident.saturating_sub(q8_resident);
+        let dropped = match split.architecture() {
+            Some("qwen3moe") => d == ceiling,
+            _ => d > 0 && d <= ceiling,
+        };
         println!(
-            "ctx arm q8: residents f16 {:?} q8_0 {:?} at the f16 context {same_n}, \
-                 the planes' delta at most {ceiling} B",
-            resident(&f16_log),
-            resident(&same_log)
+            "ctx arm q8: residents f16 {f16_resident} q8_0 {q8_resident} at the f16 context \
+                 {same_n}, the planes' delta at most {ceiling} B",
         );
         check(ok, "q8_resident_drops_by_the_planes", dropped);
         // The default arm's answer, the one-slot load's total context: the
@@ -1659,23 +1627,22 @@ mod gate {
         check(ok, "default_seat_listens", true);
         let url = |p: &str| format!("http://{addr}{p}");
         let log = std::fs::read_to_string(&err_log)?;
-        let load = log.lines().position(|l| l.starts_with("load arch="));
-        let listen = log.lines().position(|l| l.contains("listening on http://"));
-        let arch = log
-            .lines()
-            .find_map(|l| l.strip_prefix("load arch="))
-            .and_then(|r| r.split(' ').next())
-            .unwrap_or("")
-            .to_owned();
+        let records = seat_log(&err_log)?;
+        let load = records.first(&record::LOAD_QWEN3)?;
+        let listen = records.first(&record::LISTENING_QWEN3)?;
+        let arch = match &load {
+            Some(l) => l.word("arch")?.to_owned(),
+            None => String::new(),
+        };
         println!(
             "server {} at {addr}; load record {:?}",
             model.display(),
-            load.and_then(|i| log.lines().nth(i))
+            load.as_ref().map(Fields::line)
         );
         check(
             ok,
             "load_and_listen",
-            matches!((load, listen), (Some(a), Some(b)) if a < b),
+            matches!((&load, &listen), (Some(a), Some(b)) if a.at() < b.at()),
         );
         // The server ran with no `--place`: the default is exactly one of
         // two things — the whole-card load, printing no `plan` record (a
@@ -1683,10 +1650,16 @@ mod gate {
         // record naming `whole_does_not_fit`. FAIL-first: a default that
         // plans without the why, or prints more than one plan record, turns
         // this red.
-        let plans: Vec<&str> = log.lines().filter(|l| l.starts_with("plan ")).collect();
-        let default_ok =
-            plans.is_empty() || (plans.len() == 1 && plans[0].contains("why=whole_does_not_fit"));
-        println!("unplaced default: {} plan record(s) {plans:?}", plans.len());
+        let plans = records.all(&record::PLAN38)?;
+        let whys = plans
+            .iter()
+            .map(|p| p.opt_word("why"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let default_ok = whys.is_empty() || whys == [Some("whole_does_not_fit")];
+        println!(
+            "unplaced default: {} plan record(s), why {whys:?}",
+            plans.len()
+        );
         check(
             ok,
             "unplaced_default_names_itself",
@@ -1700,9 +1673,10 @@ mod gate {
             .lines()
             .filter(|l| l.starts_with("whole fit at ctx "))
             .collect();
-        let loaded_ctx = load
-            .and_then(|i| log.lines().nth(i))
-            .and_then(|l| field_u64(l, "ctx"));
+        let loaded_ctx = match &load {
+            Some(l) => Some(l.u64("ctx")?),
+            None => None,
+        };
         println!("whole-fit verdicts {verdicts:?}");
         check(
             ok,
@@ -1909,10 +1883,12 @@ mod gate {
         let url = |p: &str| format!("http://{addr}{p}");
         let (st, body) = curl(&url("/props"), None, false)?;
         json_of("/props", st, &body)?;
-        let log = std::fs::read_to_string(&err_log)?;
-        let f16 = log
-            .lines()
-            .any(|l| l.starts_with("load ") && l.contains("cache=f16"));
+        let cache = seat_log(&err_log)?
+            .one(&record::LOAD_QWEN3)?
+            .word("cache")?
+            .to_owned();
+        let f16 = cache == "f16";
+        println!("cache arm flag-wins: the load record's cache {cache}");
         println!("cache arm flag-wins: server stopped: {}", s.stop()?);
         check(ok, "cache_type_k_wins_over_the_lever", f16);
         Ok(())

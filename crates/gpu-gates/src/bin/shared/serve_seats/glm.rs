@@ -166,7 +166,7 @@ use bloomery_gpu_gates::bind::{
     sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
-use bloomery_gpu_gates::record::{self, Kind, Record};
+use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{GLM_CARD, residency_room, residency_set};
 use bloomery_gpu_gates::{GateError, ref_model_path};
 use bloomery_gpu_glm5next::{
@@ -208,34 +208,6 @@ const CTX: usize = 2048;
 /// The default context is a multiple of this many positions
 /// (`serve_seats::ctx`'s guard rounds to it).
 const CTX_STEP: usize = 256;
-
-/// What this seat prints, all on stderr (its `--records-schema`): the
-/// residency lever's word, the `plan`, `load` and `capture` lines
-/// `generate_glm5next` prints, the host set's records of a placed load, the
-/// draft's load line and its verify's capture, the listening line, the reuse
-/// records the checkpoint rule answers, the draft's joins, and the residency
-/// machine's records.
-static KINDS: &[&Kind] = &[
-    &record::RESIDENCY_LEVER,
-    &record::DRAFT_UNSET_GLM,
-    &record::PLAN,
-    &record::RESIDENCY_UNSET_GLM,
-    &record::RESIDENCY_HOST,
-    &record::LOAD_GENERATOR,
-    &record::HOST_POPULATE,
-    &record::HOST_POPULATE_OFF,
-    &record::HOST_LOCK,
-    &record::LOAD_DRAFT_GLM,
-    &record::LOAD_DRAFT_OFF_GLM,
-    &record::CAPTURE,
-    &record::CAPTURE_PAIR,
-    &record::LISTENING_GLM,
-    &record::CACHE_REUSE,
-    &record::MTP_PROMPT,
-    &record::RESIDENCY_PASS,
-    &record::RESIDENCY_RESET,
-    &record::RESIDENCY_LEAK,
-];
 
 /// The levers this seat acts on: those `generate_glm5next` reads for its load
 /// and its draft (`BLOOMERY_ROUTE_TRACE` and `BLOOMERY_STEP_STATS` left out —
@@ -571,7 +543,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
 /// carries why the server ended.
 pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let levers = bloomery_levers::at_main(ACTS_ON)?;
-    record::at_main(WHAT, KINDS);
+    record::at_main(WHAT, record::BLOOMERY_SERVE_GLM);
     let a = parse_args(args)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let path = ref_model_path()?;

@@ -2,7 +2,8 @@
 //! `soak_ds41_serve` on `bloomery-serve-ds41`, `gate_qwen3_serve` on
 //! `bloomery-serve`): the server started beside the
 //! calling binary and killed by its handle on every way out, its address read
-//! from its stderr, and one request through curl.
+//! from its stderr, one request through curl, a `/metrics` value, and the
+//! server's stderr read by its binary's record kinds ([`server_log`]).
 
 use std::fs::File;
 use std::io::Write;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::GateError;
+use crate::record::{Fields, Kind, Log};
 
 /// The server this binary started; killed and reaped on every way out.
 pub struct Served {
@@ -147,6 +149,47 @@ pub fn curl(url: &str, body: Option<&Value>, stream: bool) -> Result<(u16, Strin
         .rsplit_once('\n')
         .ok_or_else(|| format!("curl {url}: no status line"))?;
     Ok((code.trim().parse()?, body.to_owned()))
+}
+
+/// `/metrics`' `llamacpp:<name>` value; `None` when it carries none, and a
+/// value that is no number refused by name.
+pub fn metric(url: &dyn Fn(&str) -> String, name: &str) -> Result<Option<f64>, GateError> {
+    let (st, body) = curl(&url("/metrics"), None, false)?;
+    if st != 200 {
+        return Err(format!("/metrics: HTTP {st}: {body}").into());
+    }
+    let key = format!("llamacpp:{name} ");
+    let Some(v) = body.lines().find_map(|l| l.strip_prefix(&key)) else {
+        return Ok(None);
+    };
+    match v.trim().parse() {
+        Ok(x) => Ok(Some(x)),
+        Err(e) => Err(format!("/metrics: llamacpp:{name} {v:?}: {e}").into()),
+    }
+}
+
+/// The server's stderr at `err_log` so far, read by `kinds`, the record
+/// kinds its binary registered ([`Log`]); its errors name the file.
+pub fn server_log(err_log: &Path, kinds: &[&'static Kind]) -> Result<Log, GateError> {
+    let text =
+        std::fs::read_to_string(err_log).map_err(|e| format!("{}: {e}", err_log.display()))?;
+    Ok(Log::of(&text, kinds).named(err_log.display().to_string()))
+}
+
+/// The usable bytes of a `plan` record's stage card (`record::PLAN` or
+/// `record::PLAN38`): the last term of its first `devices` item
+/// (`stage:<name>:<ordinal>:<usable bytes>`, `record::plan_devices`).
+pub fn stage_usable(plan: &Fields) -> Result<u64, GateError> {
+    let devices = plan.csv("devices")?;
+    let stage = devices
+        .first()
+        .ok_or_else(|| format!("a `plan` record with no device: {}", plan.line()))?;
+    let usable = stage
+        .rsplit(':')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("a `plan` record's stage device {stage:?} names no bytes"))?;
+    Ok(usable)
 }
 
 /// The JSON of a 200 response; any other status is an error naming it.
