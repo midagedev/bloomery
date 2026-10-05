@@ -65,6 +65,31 @@
 #             BLOOMERY_RESIDENCY and prints no lever record is a FAIL row; a schema that declares none reads
 #             none, and an arm that runs BLOOMERY_RESIDENCY under it is a FAIL row naming the schema
 #             (depth-qwen3moe.sh's rule).
+#   <D>@BLOOMERY_GEN_SLOTS=N[,NAME=VALUE...]  the aggregate arm, a lever arm read as an aggregate row:
+#             generate_glm5next decodes N streams in one pass (the lever's row in
+#             crates/levers/src/registry.rs; the binary refuses by name an N its body's plain pass does not
+#             lay, and the lever beside the draft, each a FAIL row here). It feeds N·D prose ids from
+#             GLM_PROSE_FROM — slot 0 holds exactly the D ids its plain twin feeds, slot j the next D — which
+#             the binary cuts into N windows, window j slot j's prompt call; each slot holds its window and the
+#             N - 1 ids after it at its own positions, so D + N <= C as for ours, and N·D ids past the prose
+#             file are refused before the lease. Its row reads the counted (`warm` left out) `time pass …
+#             kind=slots` records through records.py: `tok/s(aggregate) <Σ positions · 1000 / Σ ms> @
+#             n=N·<rounds>, depth D, <card>`, then `slots N`, the per stream rate and the SMOKE footer's p50
+#             and mean ms a pass; its pp column is slot 0's prompt call, its timed window every slot's prompt
+#             call and every round. The per-arm means hold it as `(aggregate of N slots)`; it stays out of the
+#             `ratio d=` table (its prefill row stays in the pp table: slot 0's call on the N-sequence plan),
+#             and `ratio slots d=` is its aggregate over its plain twin's tok/s(mean) per round, the twin its
+#             label less the BLOOMERY_GEN_SLOTS item (`ours`, `ours@<the rest>`) — above 1 the N streams in one
+#             pass outrun one. Refused before anything runs: an N that is not a whole number and
+#             BLOOMERY_GEN_SLOTS in the runner's own environment (an arm names its own); N = 1 is a plain
+#             lever arm. FAIL rows: a slots arm with no counted kind=slots record or one whose positions is
+#             not N; a plain arm with any kind=slots record; and the slots residency clause: of the arm's
+#             `residency pass` records after the seed's none/0, every one before its first `pass=slots` is a
+#             prompt call (`pass=prompt kept=0`), at least N of them, and every one from it on `pass=slots
+#             kept=N`. An arm with no residency host record (generate_glm5next's unset residency is off)
+#             has no residency pass to read and passes the clause on its time pass records alone; residency
+#             pass records under it fail the clause by name (`rc=residency`). The pieces are
+#             tools/ref/slots-arm.sh's, shared with depth-ds41.sh and depth-qwen3moe.sh.
 #   lcpp27752:<D>, lcpp27754:<D>   the PR branch's llama-bench -p 0 -n N -d D -r 1 at the profile's
 #             LCPP27752_GPU_FLAGS / LCPP27754_GPU_FLAGS (the second under LCPP27754_ENV). -d prefills
 #             D of llama-bench's own std::rand() ids before its clock starts; its row label is `tgN @
@@ -282,6 +307,19 @@ source "${BASH_SOURCE[0]%/*}/lever-arms.sh" || exit 2
 PLACE_RUNNER=depth-glm5next.sh PLACE_BIN=generate_glm5next PLACE_WORDS='a gate bp' PLACE_LOAD_KIND=load_generator PLACE_LOAD_BIN=generate_glm5next
 # shellcheck source=tools/ref/arm-place.sh
 source "${BASH_SOURCE[0]%/*}/arm-place.sh" || exit 2
+# The aggregate arm (the header's <D>@BLOOMERY_GEN_SLOTS=N): its N (arm_slots), its plain twin (slots_twin),
+# its time pass and residency clauses (slots_count, slots_residency), the environment's refusal and the plain
+# tables' labels: tools/ref/slots-arm.sh, shared with depth-ds41.sh and depth-qwen3moe.sh.
+SLOTS_RUNNER=depth-glm5next.sh
+# shellcheck source=tools/ref/slots-arm.sh
+source "${BASH_SOURCE[0]%/*}/slots-arm.sh" || exit 2
+# The lever is an arm's own: set here, every ours arm would inherit it and a plain row would read a per
+# stream rate under a plain label.
+slots_env_check
+# An aggregate arm's N (N >= 2; empty for every other arm) and its plain twin's label (slots_twin).
+A_SLOTS=() A_TWIN=()
+# arm_feed <i>: the prose ids arm <i> feeds: its depth, N·D for an aggregate arm.
+arm_feed() { echo $((A_DEP[$1] * ${A_SLOTS[$1]:-1})); }
 # The fit arms' flags, probe and column (lcpp-fit.sh); fit_eng names this runner's fit engines.
 # shellcheck source=tools/ref/lcpp-fit.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
@@ -295,7 +333,7 @@ fit_eng() { case $1 in lcpp2775[24]fit | lcpp2775[24]ppfit | lcpp2775[24]ppfit[1
 gpu_flags() { case $1 in lcpp27752*) echo "$LCPP27752_GPU_FLAGS" ;; *) echo "$LCPP27754_GPU_FLAGS" ;; esac; }
 for a in "${ARMS[@]}"; do
   # `@` is ours only: split at it first, so a value with a `:` is not read as an engine's arm.
-  arm_head=${a%%@*} envs='' at='' aplace=''
+  arm_head=${a%%@*} envs='' at='' aplace='' ASLOTS='' TWIN=''
   eng=${arm_head%%:*} dep=${arm_head#*:} pp=0 ub=''
   [ "$arm_head" != "$eng" ] || { eng=ours dep=$arm_head; }
   if [ "$arm_head" != "$a" ]; then
@@ -322,6 +360,8 @@ for a in "${ARMS[@]}"; do
         ;;
     esac
     [ -z "$envs" ] || levers=1
+    # The aggregate arm's N (the header's <D>@BLOOMERY_GEN_SLOTS=N): empty for a plain lever arm.
+    arm_slots "$a" "$envs"
   fi
   case $dep in '' | *[!0-9]*) usage "$a" ;; esac
   if [ "${eng%%+*}" != "$eng" ]; then
@@ -375,6 +415,8 @@ for a in "${ARMS[@]}"; do
   case $eng in exl3*) ;; *) gguf=1 ;; esac
   A_ENG+=("$eng") A_PP+=("$pp") A_UB+=("$ub") A_DEP+=("$dep") A_LABEL+=("$eng${at:+@$at}") A_ENV+=("$envs")
   case $eng in ours | oursmtp) A_PLACE+=("${aplace:-$PLACE}") A_PLACE_SET+=("${aplace:+1}") ;; *) A_PLACE+=('') A_PLACE_SET+=('') ;; esac
+  [ -z "$ASLOTS" ] || slots_twin "$eng${at:+@$at}" "$at"
+  A_SLOTS+=("$ASLOTS") A_TWIN+=("$TWIN")
 done
 # The draft is the oursmtp arm's alone: set here, every ours arm would draft and their ratio would read 1.
 if [ "$ours" = 1 ] && [ -n "${BLOOMERY_DRAFT+set}" ]; then
@@ -443,7 +485,8 @@ if [ "$ours" = 1 ] || [ "$srv" = 1 ]; then
   else
     for i in "${!ARMS[@]}"; do
       case ${A_ENG[$i]} in exl3* | lcpp2775[24] | lcpp2775[24]fit | lcpp2775[24]pp*) continue ;; esac
-      [ $((PROSE_FROM + A_DEP[i])) -le "$(wc -l < "$PROSE")" ] || check 64 "arm ${ARMS[$i]}: $PROSE holds fewer than GLM_PROSE_FROM + ${A_DEP[$i]} = $((PROSE_FROM + A_DEP[i])) ids"
+      f=$(arm_feed "$i")
+      [ $((PROSE_FROM + f)) -le "$(wc -l < "$PROSE")" ] || check 64 "arm ${ARMS[$i]}: $PROSE holds fewer than GLM_PROSE_FROM + $f = $((PROSE_FROM + f)) ids${A_SLOTS[$i]:+ (${A_SLOTS[$i]} slots × ${A_DEP[$i]})}"
     done
   fi
 fi
@@ -574,7 +617,8 @@ arm_cmd() {
   CMD=() LABEL_TEST='' BATCH='' FIT_NOTE='' SRV_ENVS=() SRV_NP=$N
   case ${eng%%+*} in
     ours | oursmtp)
-      CMD=("$BIN" --tokens "$(prompt_ids "$dep" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
+      # An aggregate arm's N·D ids (arm_feed), which the binary cuts into N windows.
+      CMD=("$BIN" --tokens "$(prompt_ids "$(arm_feed "$i")" | paste -sd, -)" -n "$N" --ctx "$CTX" --place "${A_PLACE[$i]}" --time ${WARM:+--warm "$WARM"} ${PAIR:+--pair})
       # A lever arm's variables, after oursmtp's draft.
       arm_envs "$i"
       [ ${#ARM_ENVS[@]} -eq 0 ] || CMD=("${ARM_ENVS[@]}" "${CMD[@]}")
@@ -773,10 +817,10 @@ if [ -n "$DRY" ]; then
   for i in "${!ARMS[@]}"; do
     arm_cmd "$i"
     row=${LABEL_TEST% |}
-    echo "[dry] ${ARMS[$i]}:${row:+ row \"$row\"}${BATCH:+, $BATCH}${FIT_NOTE:+, $FIT_NOTE}"
+    echo "[dry] ${ARMS[$i]}:${row:+ row \"$row\"}${BATCH:+, $BATCH}${FIT_NOTE:+, $FIT_NOTE}${A_SLOTS[$i]:+ slots=${A_SLOTS[$i]} feed=$(arm_feed "$i") twin=${A_TWIN[$i]}}"
     pre="timeout --kill-after=10 $BOUND " post=''
     ! srv_glm "${A_ENG[$i]}" || [ ${#SRV_ENVS[@]} -eq 0 ] || pre+="env ${SRV_ENVS[*]} "
-    echo "[dry]     $pre$(printf '%q ' "${CMD[@]}" | sed -E 's/--tokens [^ ]+/--tokens <GLM_PROSE ids '"$PROSE_FROM..$((PROSE_FROM + A_DEP[i] - 1))"'>/')$post"
+    echo "[dry]     $pre$(printf '%q ' "${CMD[@]}" | sed -E 's/--tokens [^ ]+/--tokens <GLM_PROSE ids '"$PROSE_FROM..$((PROSE_FROM + $(arm_feed "$i") - 1))"'>/')$post"
     [ -n "${A_PHK[$i]:-}" ] || continue
     ph_k "$i"
     b=$(ph_bytes "$PHK" "$PHNGL")
@@ -983,6 +1027,23 @@ run_arm() {
         [ -n "$MK" ] && [ -n "$MP" ] && [ -n "$MQ" ] || { fail_row "" "${r_tag#r}" "$i" 0 "its mtp summary record has no kept, positions or passes (kept='$MK' positions='$MP' passes='$MQ')" "$out"; return; }
         MTP_COL=" | mtp positions/pass $(awk -v p="$MP" -v q="$MQ" 'BEGIN { printf "%.3f", (q > 0) ? p / q : 0 }') = positions $MP / passes $MQ, kept $MK"
       fi
+      # The aggregate arm's clauses (the header's <D>@BLOOMERY_GEN_SLOTS=N), and a plain arm's leak of them:
+      # slots-arm.sh's slots_count over the time pass records (into SL_*) and, for an aggregate arm,
+      # slots_residency over its residency host and pass records; every time prompt row's ms (PP_ALL) for
+      # its timed window.
+      local nslots=${A_SLOTS[$i]} srec SP_MS='' SP_POS='' SP_KIND='' SP_WARM='' PP_ALL='' RH_WORD='' RP_PASS='' RP_KEEP='' RP_BOUNDARY=''
+      srec=$(python3 "$RECORDS" sh --bin generate_glm5next - 'SP_MS=time_pass.ms*' 'SP_POS=time_pass.positions*' \
+        'SP_KIND=time_pass.kind*' 'SP_WARM=time_pass.warm*' 'PP_ALL=time_prompt.ms*' <<< "$out" 2>&1) ||
+        { fail_row "" "${r_tag#r}" "$i" 0 "records.py did not read its time pass records: $srec" "$out"; return; }
+      eval "$srec"
+      slots_count "$nslots" "$SP_MS" "$SP_POS" "$SP_KIND" "$SP_WARM" || { fail_row "" "${r_tag#r}" "$i" 0 "$FAIL_WHY" "$out"; return; }
+      if [ -n "$nslots" ]; then
+        srec=$(python3 "$RECORDS" sh --bin generate_glm5next - RH_WORD=residency_host.residency 'RP_PASS=residency_pass.pass*' \
+          'RP_KEEP=residency_pass.kept*' 'RP_BOUNDARY=residency_pass.boundary*' <<< "$out" 2>&1) ||
+          { fail_row "" "${r_tag#r}" "$i" residency "records.py did not read its residency records: $srec" "$out"; return; }
+        eval "$srec"
+        slots_residency "$nslots" "$RH_WORD" "$RP_PASS" "$RP_KEEP" "$RP_BOUNDARY" || { fail_row "" "${r_tag#r}" "$i" residency "$FAIL_WHY" "$out"; return; }
+      fi
       # The residency records: the lever and the timed passes' sums (cold-blocks.sh's residency sums).
       RS_WORD='' RS_COL=''
       if [ "$G_RES" = 0 ]; then
@@ -996,24 +1057,37 @@ run_arm() {
         return
       fi
       echo "$out" | grep -E '^(plan|load|capture|fed|step 0|time prompt) '
-      local h10 t10 uniq tps tps50
+      local h10 t10 uniq tps tps50 agg
+      # An aggregate arm's series are its rounds.
+      [ -z "$nslots" ] || SERIES=$(paste -d' ' <(printf '%s\n' "$SP_MS") <(printf '%s\n' "$SP_KIND") | awk '$2 == "slots" { print $1 }')
       h10=$(echo "$SERIES" | head -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
       t10=$(echo "$SERIES" | tail -n 10 | sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}')
       uniq=$(echo "$TOKENS" | sort -u | grep -c .)
       tps=$(awk -v m="$MEAN" 'BEGIN{printf "%.2f", 1e3/m}')
       tps50=$(awk -v p="$P50" 'BEGIN{printf "%.2f", 1e3/p}')
+      # The timed window: the prompt's wall and the N - 1 steps at the mean; an aggregate arm's, every slot's
+      # prompt call and every round.
       w=$(awk -v a="$PP_MS" -v m="$MEAN" -v n="$N" 'BEGIN{print (a + (n - 1) * m) / 1e3}')
+      [ -z "$nslots" ] || w=$(printf '%s\n' "$PP_ALL" | awk -v r="$SL_ALL_MS" 'NF { s += $1 } END { print (s + r) / 1e3 }')
       if [ -n "$mark" ]; then
         cold_col "$((m1 - mark))" "$w" "timed, from the fed line; whole process $((m1 - m0))"
       else
         cold_col "$((m1 - m0))" "$w" "whole process: no fed line"
       fi
       cold_pass "$tag" "$r" "$i"
-      prompt_col "$dep"
+      prompt_col "$(arm_feed "$i")"
       rowtags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-      echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$RS_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
+      if [ -n "$nslots" ]; then
+        # The aggregate: Σ positions · 1000 / Σ ms over the counted rounds; the SMOKE footer's p50 and mean are
+        # a round's, so 1000 / mean is one stream's rate.
+        agg=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
+        echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(aggregate) $agg @ n=$nslots·$SL_N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | slots $nslots | tok/s(per stream, mean) $tps | p50 $P50 ms/pass | mean $MEAN ms/pass | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$RS_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
+      else
+        echo "$PTAG $r_tag $label d=$dep n=$N ctx=$CTX | tok/s(mean) $tps @ n=$N, depth $dep, $CARD_NAME | place $PLACE_RAN card_experts $CARD_EXP host_experts $HOST_EXP$PROMPT_COL | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $tps50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq | pp_tok/s $PP_TPS (n=$PP_N, passes=$PP_PASSES, kind=$PP_KIND)$MTP_COL$RS_COL$MAJ_COL | wall $((t1 - t0))s$rowtags"
+      fi
       [ "$PTAG" = ROW ] || { cold_count "$tag"; return 0; }
-      sums+=("$label|$dep|$r|$tps")
+      # An aggregate row's record names its N (the means' `(aggregate of N slots)`).
+      if [ -n "$nslots" ]; then sums+=("$label|$dep|$r|$agg|$nslots"); else sums+=("$label|$dep|$r|$tps"); fi
       pp_sums+=("$label|$PP_N|$r|$PP_TPS")
       res_sums_add "$label" "$dep" "$r"
       # The drafted run's ids are held to ours' as a server row's are; it is never the ours side. A lever
@@ -1166,11 +1240,13 @@ place_pairs() {
     done
   done
 }
-means() { # means <unit>: `label|key|round|value` on stdin, one mean line per label and key
+means() { # means <unit>: `label|key|round|value[|N]` on stdin, one mean line per label and key; an aggregate
+  # row's N (the header's <D>@BLOOMERY_GEN_SLOTS=N) marks its line `(aggregate of N slots)`
   awk -F'|' -v unit="$1" '{
     k = $1 " " $2; s[k] += $4; n[k]++
+    if ($5 != "") agg[k] = $5
     if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
-  } END { for (k in s) printf "mean %-26s %9.2f %s  [%s..%s, spread %.2f%%]  (n=%d)\n", k, s[k] / n[k], unit, mn[k], mx[k], (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0, n[k] }' | sort
+  } END { for (k in s) printf "mean %-26s %9.2f %s  [%s..%s, spread %.2f%%]  %s(n=%d)\n", k, s[k] / n[k], unit, mn[k], mx[k], (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0, (k in agg) ? sprintf("(aggregate of %d slots) ", agg[k]) : "", n[k] }' | sort
 }
 
 majflt_require depth-glm5next.sh
@@ -1241,12 +1317,36 @@ echo "=== per-arm prefill means (tok/s(pp) @ n=0, prompt P, $CARD_NAME; ours its
 # id; llama-bench feeds std::rand() ids and places whole layers, whose host bytes a token do not depend on
 # the ids; exllamav3 feeds wikitext-2 and adapts its placement to that stream.
 same_file() { grep -vE '^exl3|^oursmtp(@|$)' | grep -vx ours; }
+# The aggregate arms' labels (the header's <D>@BLOOMERY_GEN_SLOTS=N): their own table below, out of the decode
+# table, whose base is one stream.
+SLOT_LABELS=''
+for i in "${!ARMS[@]}"; do [ -z "${A_SLOTS[$i]}" ] || SLOT_LABELS+="${A_LABEL[$i]}"$'\n'; done
 if [ ${#sums[@]} -gt 0 ]; then
   echo
   echo "=== ours / each engine on the same file, per depth: each round's ratio, their mean ± 95 % (t, rounds - 1 df) ==="
   keys=$(printf '%s\n' "${sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
-  refs=$(printf '%s\n' "${sums[@]}" | cut -d'|' -f1 | sort -u | same_file | tr '\n' ' ')
+  refs=$(printf '%s\n' "${sums[@]}" | cut -d'|' -f1 | sort -u | same_file | not_slots | tr '\n' ' ')
   printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$keys" "$refs"
+fi
+# The aggregate arms: each one's aggregate over its plain twin's tok/s(mean) (A_TWIN, slots_twin), the same
+# statistics.
+if [ -n "$SLOT_LABELS" ] && [ ${#sums[@]} -gt 0 ]; then
+  echo
+  echo "=== N slots in one pass: each aggregate arm's tok/s (Σ positions / Σ ms of its rounds) over its plain"
+  echo "    twin's tok/s per depth, the same statistics; above 1 the N streams in one pass outrun one stream ==="
+  keys=$(printf '%s\n' "${sums[@]}" | cut -d'|' -f2 | sort -un | tr '\n' ' ')
+  slots_done=''
+  for i in "${!ARMS[@]}"; do
+    [ -n "${A_SLOTS[$i]}" ] || continue
+    sl=${A_LABEL[$i]} twin=${A_TWIN[$i]}
+    case " $slots_done " in *" $sl "*) continue ;; esac
+    slots_done+=" $sl"
+    if ! printf '%s\n' "${A_LABEL[@]}" | grep -qxF -- "$twin"; then
+      echo "ratio slots: $sl has no plain twin $twin among the arms: no ratio"
+      continue
+    fi
+    printf '%s\n' "${sums[@]}" | ratio_table "ratio slots d=" "$keys" "$twin" "$sl"
+  done
 fi
 if [ ${#pp_sums[@]} -gt 0 ]; then
   echo
