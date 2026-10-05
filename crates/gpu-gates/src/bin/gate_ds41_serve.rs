@@ -2,7 +2,7 @@
 //! driven over HTTP, as one process under the GPU gate lock.
 //!
 //!     gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out>
-//!                     [--plain <the plain run's --dir> | --place bp]
+//!                     [--plain <the plain run's --dir> | --place bp | --slots]
 //!
 //! Starts the server beside this binary (`--port 0 --place gate --parallel
 //! 1`, the plain engine this gate's body holds), reads its
@@ -79,24 +79,44 @@
 //!   `cache_prompt: false`.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
-//! waited for, and a second server of two slots that take the body in turns
-//! (`--parallel 2`, `serve::SwapEngine`) is started into `<dir>/swap`:
+//! waited for. A server asked for [`SLOTS_OVER`] slots of the default context
+//! (`<dir>/slots-over`), whose plan counts that many whole sequences, ends
+//! before it loads (s4): no `plan` record, and the plan's own refusal names
+//! the gate card and its KV term (the card's floor, or its usable bytes past
+//! the plan's total) — the same context as one slot is the server above.
+//! Then a second server of two resident sequences (`--parallel 2`, the
+//! default context each, the residency off as the gate placement runs it,
+//! the slot actions on) is started into `<dir>/slots`:
 //!
-//! - two greedy requests (`ignore_eos`, `cache_prompt: false`), each alone,
-//!   then together, the second sent once `/slots` shows the first decoding
-//!   and long enough to run past a turn ([`serve::QUANTUM`]), so each
-//!   request's state is parked and put back mid-reply: the second's response
-//!   comes back before the first's, each request's ids are its alone ids, and
-//!   `/metrics` counts switches and no refusal.
+//! - its `parallel` line names the rule, the two slots, the default context
+//!   a slot and their total; its `slots` line two sequences made of two
+//!   planned; `/props`' `n_ctx` the default context;
+//! - (s5) two greedy requests (`ignore_eos`, `cache_prompt: false`), each
+//!   alone, then both posted at once: each request's ids are its alone ids,
+//!   and the decode rounds over the pair carry at least [`SLOTS_BUSY`] busy
+//!   slots each (`/metrics`' `n_busy_slots_per_decode` and `n_decode_total`,
+//!   before and after) with no swap counted — the slots flow together, not
+//!   in turns;
+//! - (s3) a slot's save to a file is refused by name (501, the engine does
+//!   not support slot save/restore): the body's state goes to the prompt
+//!   cache in host RAM, not to a file;
+//! - (s2) `--ids` and a prompt sharing nothing with it, each on its own
+//!   slot (`cache_prompt`); the second's slot erased; then `--ids` plus its
+//!   greedy ids takes the first's slot and keeps all but its last id, and
+//!   its ids are those of `cache_prompt: false`.
 //!
 //! That server is killed and waited for the same way. Last, the same
 //! `--parallel 2` under `BLOOMERY_DRAFT=dspark` (set on that process alone)
-//! ends before it listens, naming both: a state put back starts the DSpark
-//! draft over. Logs and the raw stream go to `--dir`, the first
+//! ends before it listens, naming both: the draft's window is one
+//! sequence's. Logs and the raw stream go to `--dir`, the first
 //! `/completion`'s ids to `completion.ids` in it, and the greedy ids of the
 //! probe — [`DRAFT_PREDICT`] ids after a long document, a prompt whose
 //! continuation both keeps and rejects DSpark proposals — to `probe.ids`,
 //! and the first sampled request's ids to `sampled.ids`.
+//!
+//! With `--slots` (no draft), the gate runs the slots clauses above alone —
+//! too many slots refused, the two-slot server, the DSpark refusal — and nothing
+//! else: a run of the slots path that loads the model once.
 //!
 //! With `--plain`, under `BLOOMERY_DRAFT=dspark` (refused otherwise), the gate
 //! checks the server's DSpark draft instead, and nothing above:
@@ -175,7 +195,7 @@ mod gate {
     use std::process::Command;
     use std::sync::mpsc::{self, Receiver};
     use std::thread::JoinHandle;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use bloomery_gpu_gates::bind::nvidia_smi_index;
     use bloomery_gpu_gates::generate::Place;
@@ -195,7 +215,7 @@ mod gate {
 
     use crate::dspark;
 
-    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir> | --place bp]";
+    const USAGE: &str = "usage: gate_ds41_serve --gen <generate_ds41 log> --prompt <text> --ids <a,b,…> --dir <out> [--plain <the plain run's --dir> | --place bp | --slots]";
     /// Where the first `/completion`'s ids go in `--dir`, for the draft run.
     const COMPLETION_IDS: &str = "completion.ids";
     /// Where the probe's ids go in `--dir`, for the draft run.
@@ -207,8 +227,8 @@ mod gate {
     /// The server's arguments after its path; `/props` must echo them. The
     /// plain engine is pinned (`--parallel 1`): this gate's body holds the
     /// one-slot path's prompt-cache clauses, and the draft runs below would
-    /// refuse the default's two slots by name; the swap clause's server runs
-    /// the turns on its own.
+    /// refuse the default's two slots by name; the slots clause's server
+    /// runs two on its own.
     const SERVER_ARGS: [&str; 8] = [
         "--host",
         "127.0.0.1",
@@ -231,8 +251,13 @@ mod gate {
         "--parallel",
         "1",
     ];
-    /// The swap clause's server: two slots that take the body in turns.
-    const SWAP_SERVER_ARGS: [&str; 8] = [
+    // PIN(2026-10-05): the swap clause (two slots taking this seat in turns through
+    // serve::SwapEngine) is replaced by the slots clause below; SwapEngine stays only as the
+    // fallback for bodies without Slots, and crates/serve's mock suite owns its turns
+    // (tests/slots: hw_live_requests_take_turns_…, hw_slots_that_take_turns_keep_the_draft).
+    /// The slots clause's server: two resident sequences of the default
+    /// context each (the slot actions' directory added at the spawn).
+    const SLOTS_SERVER_ARGS: [&str; 8] = [
         "--host",
         "127.0.0.1",
         "--port",
@@ -242,17 +267,19 @@ mod gate {
         "--parallel",
         "2",
     ];
-    /// The swap clause's requests: the second runs past a turn, so each one's
-    /// state is parked and put back mid-reply, and ends while the first, sent
-    /// before it, still has a turn's tokens and more left.
-    const SWAP_FIRST_PREDICT: usize = 200;
-    const SWAP_SECOND_PREDICT: usize = 100;
-    const _: () = assert!(
-        SWAP_SECOND_PREDICT > serve::QUANTUM
-            && SWAP_FIRST_PREDICT > SWAP_SECOND_PREDICT + serve::QUANTUM
-    );
-    /// How often the swap clause reads `/slots` while the first request starts.
-    const SWAP_POLL: Duration = Duration::from_millis(20);
+    /// The slots clause's pair: each request this long, so nearly every
+    /// round after the second prompt call carries both slots.
+    const SLOTS_PREDICT: usize = 48;
+    /// (s4) Slots of the default context past what the gate card holds: each
+    /// one's KV is the plan's card KV of one sequence, about 110 MB at the
+    /// default context, so this many need about 28 GB beside the dense trunk
+    /// on a card of 24 GB.
+    const SLOTS_OVER: usize = 256;
+    /// (s5) Busy slots a decode round carries over the pair posted at once:
+    /// both prompt calls run before their first rounds, a round or two of
+    /// skew, so the rounds carry `2·P / (P + skew)` slots each, about 1.9 at
+    /// [`SLOTS_PREDICT`]; turns or one slot a round carry 1.
+    const SLOTS_BUSY: f64 = 1.5;
     /// The load takes tens of seconds; the bound is the spec's 120 polls × 5 s.
     const POLLS: usize = 120;
     const POLL: Duration = Duration::from_secs(5);
@@ -402,13 +429,19 @@ mod gate {
         plain: Option<PathBuf>,
         /// `--place bp`: the two-card run.
         bp: bool,
+        /// `--slots`: the slots clauses alone.
+        slots: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut gen_log, mut prompt, mut ids, mut dir) = (None, None, None, None);
-        let (mut plain, mut bp) = (None, false);
+        let (mut plain, mut bp, mut slots) = (None, false, false);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
+            if flag == "--slots" {
+                slots = true;
+                continue;
+            }
             let v = it
                 .next()
                 .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
@@ -447,6 +480,7 @@ mod gate {
                 dir,
                 plain,
                 bp,
+                slots,
             }),
             _ => Err(USAGE.into()),
         }
@@ -990,145 +1024,268 @@ mod gate {
         Ok(ok)
     }
 
-    /// One greedy `/completion` body of the swap clause.
-    fn swap_body(prompt: &str, n: usize) -> Value {
+    /// One greedy `/completion` body of the slots clause's pair.
+    fn pair_body(prompt: &str) -> Value {
         json!({
-            "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
+            "prompt": prompt, "n_predict": SLOTS_PREDICT, "temperature": 0, "ignore_eos": true,
             "return_tokens": true, "cache_prompt": false,
         })
     }
 
-    /// The swap clause (module header) on a server of two slots started into
-    /// `<dir>/swap`.
-    fn swap(a: &Args) -> Result<bool, GateError> {
-        let dir = a.dir.join("swap");
+    /// `/metrics`' decode rounds and the busy slots they carried in all; a
+    /// server that counts neither is refused by name.
+    fn rounds(url: &dyn Fn(&str) -> String) -> Result<(f64, f64), GateError> {
+        let read = |name: &str| -> Result<f64, GateError> {
+            metric(url, name)?.ok_or_else(|| format!("/metrics carries no llamacpp:{name}").into())
+        };
+        let decodes = read("n_decode_total")?;
+        Ok((decodes, read("n_busy_slots_per_decode")? * decodes))
+    }
+
+    /// One greedy `/completion` of `prompt` ([`REUSE_PREDICT`] ids, run past
+    /// the end-of-generation id): the slot that served it, its ids and
+    /// `timings.cache_n`.
+    fn on_slot(
+        url: &dyn Fn(&str) -> String,
+        prompt: &[u32],
+        cache: bool,
+    ) -> Result<(u64, Vec<u32>, Value), GateError> {
+        let body = json!({
+            "prompt": prompt, "n_predict": REUSE_PREDICT, "temperature": 0,
+            "ignore_eos": true, "return_tokens": true, "cache_prompt": cache,
+        });
+        let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+        let v = json_of("/completion", st, &text)?;
+        let slot = v["id_slot"].as_u64().unwrap_or(u64::MAX);
+        let ids = ids_of(&v["tokens"]);
+        println!(
+            "slot {slot}: prompt {} ids cache_prompt={cache}: cache_n={} tokens {ids:?}",
+            prompt.len(),
+            v["timings"]["cache_n"]
+        );
+        Ok((slot, ids, v["timings"]["cache_n"].clone()))
+    }
+
+    /// (s4) [`SLOTS_OVER`] slots of the default context, which the gate
+    /// card cannot hold, refused before the load (module header), into
+    /// `<dir>/slots-over`.
+    fn over_refused(a: &Args) -> Result<bool, GateError> {
+        let dir = a.dir.join("slots-over");
         std::fs::create_dir_all(&dir)?;
-        let mut served = Served::spawn(&SWAP_SERVER_ARGS, &dir)?;
-        println!("swap server pid {}", served.child.id());
-        let addr = served.address(&dir.join("server.err"), POLLS, POLL)?;
-        let url = |p: &str| format!("http://{addr}{p}");
-        let bodies = [
-            swap_body(&a.prompt, SWAP_FIRST_PREDICT),
-            swap_body(OTHER, SWAP_SECOND_PREDICT),
+        let n = SLOTS_OVER.to_string();
+        let args = [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--place",
+            "gate",
+            "--parallel",
+            &n,
         ];
+        let err_log = dir.join("server.err");
+        let mut served = Served::spawn(&args, &dir)?;
+        let refused = match served.address(&err_log, POLLS, POLL) {
+            Ok(addr) => format!("listening on {addr}"),
+            Err(e) => e.to_string(),
+        };
+        let planned = server_log(&err_log, record::BLOOMERY_SERVE_DS41)?
+            .first(&record::PLAN)?
+            .is_some();
+        // The card the server's `--place gate` resolves to, as it resolves it.
+        let card = Place::Gate
+            .on_host()?
+            .card_specs()?
+            .first()
+            .map(|c| c.name)
+            .ok_or("--place gate resolved to no card")?;
+        println!("slots over the card {card}: planned {planned}; {refused}");
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slots_over_the_card_refused_before_the_load",
+            refused.contains("before listening")
+                && refused.contains(&format!("card {card}: "))
+                && refused.contains("KV")
+                && !planned,
+        );
+        Ok(ok)
+    }
+
+    /// The slots clause (module header) on a server of two resident slots
+    /// started into `<dir>/slots`, after too many refused: the context a
+    /// slot it names, (s5) the pair served together, (s3) a slot save
+    /// refused by name, (s2) an erase of one slot leaving the other's
+    /// continuation.
+    fn slots(a: &Args) -> Result<bool, GateError> {
+        let mut ok = over_refused(a)?;
+        let dir = a.dir.join("slots");
+        let save = dir.join("save");
+        std::fs::create_dir_all(&save)?;
+        let save = save
+            .to_str()
+            .ok_or_else(|| format!("{}: not UTF-8", save.display()))?
+            .to_owned();
+        let mut args = SLOTS_SERVER_ARGS.to_vec();
+        args.extend(["--slot-save-path", save.as_str()]);
+        let mut served = Served::spawn(&args, &dir)?;
+        println!("slots server pid {}", served.child.id());
+        let err_log = dir.join("server.err");
+        let addr = served.address(&err_log, POLLS, POLL)?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        ok &= slots_ctx(&url, &err_log)?;
+        ok &= slots_together(&url, a)?;
+        ok &= slots_actions(&url, a)?;
+        println!("slots server stopped: {}", served.stop()?);
+        Ok(ok)
+    }
+
+    /// The context the slots server names: its `parallel` line (the rule,
+    /// two slots, the default context a slot and their total), its `slots`
+    /// line (two sequences made of two planned) and `/props`' `n_ctx`.
+    fn slots_ctx(url: &dyn Fn(&str) -> String, err_log: &Path) -> Result<bool, GateError> {
+        let text = std::fs::read_to_string(err_log)?;
+        let line = |head: &str| {
+            text.lines()
+                .find(|l| l.starts_with(head))
+                .unwrap_or("")
+                .to_owned()
+        };
+        let (parallel, made) = (line("parallel rule="), line("slots made="));
+        let (st, body) = curl(&url("/props"), None, false)?;
+        let n_ctx = json_of("/props", st, &body)?["n_ctx"].as_u64();
+        let whole = served_positions()?;
+        println!("slots: {parallel}; {made}; /props n_ctx {n_ctx:?}");
+        let mut ok = true;
+        check(
+            &mut ok,
+            "slots_name_a_whole_context_each",
+            parallel
+                == format!(
+                    "parallel rule=slots slots=2 slot_ctx={whole} total={} from=flag",
+                    2 * whole
+                )
+                && made.starts_with("slots made=2 planned=2 ")
+                && n_ctx == u64::try_from(whole).ok(),
+        );
+        Ok(ok)
+    }
+
+    /// (s5) The pair, each request alone, then both posted at once (module
+    /// header).
+    fn slots_together(url: &dyn Fn(&str) -> String, a: &Args) -> Result<bool, GateError> {
+        let bodies = [pair_body(&a.prompt), pair_body(OTHER)];
         let mut alone = Vec::new();
-        for (body, n) in bodies.iter().zip([SWAP_FIRST_PREDICT, SWAP_SECOND_PREDICT]) {
+        for body in &bodies {
             let (st, text) = curl(&url("/completion"), Some(body), false)?;
-            let v = json_of("/completion", st, &text)?;
-            let ids = ids_of(&v["tokens"]);
-            println!(
-                "swap alone: {} ids of {n}, {} tok/s",
-                ids.len(),
-                v["timings"]["predicted_per_second"]
-            );
-            alone.push((ids, n));
+            alone.push(ids_of(&json_of("/completion", st, &text)?["tokens"]));
         }
-        let swaps = metric(&url, "swaps_total")?.unwrap_or(f64::NAN);
-        // A request on a helper thread of its own: its handle, and its
-        // answer with when it came back.
-        type Answer = (Result<(u16, String), String>, Instant);
+        let (decode0, busy0) = rounds(url)?;
+        type Answer = Result<(u16, String), String>;
         let post = |body: Value| -> Result<(JoinHandle<()>, Receiver<Answer>), GateError> {
             let u = url("/completion");
             let (tx, rx) = mpsc::channel();
-            let (h, _) = spawn_helper("swap-request", Placement::Float, move || {
-                let r = curl(&u, Some(&body), false).map_err(|e| e.to_string());
-                let _ = tx.send((r, Instant::now()));
+            let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
+                let _ = tx.send(curl(&u, Some(&body), false).map_err(|e| e.to_string()));
             })
-            .map_err(|e| format!("swap: {}", e.what()))?;
+            .map_err(|e| format!("slots: {}", e.what()))?;
             Ok((h, rx))
         };
         let first = post(bodies[0].clone())?;
-        loop {
-            if first.0.is_finished() {
-                return Err(
-                    "swap: the first request ended before /slots showed it decoding".into(),
-                );
-            }
-            let (st, text) = curl(&url("/slots"), None, false)?;
-            let slots = json_of("/slots", st, &text)?;
-            let decoding = slots.as_array().is_some_and(|l| {
-                l.iter().any(|s| {
-                    s["turn"] == "running"
-                        && s["next_token"]["n_decoded"].as_u64().is_some_and(|n| n > 0)
-                })
-            });
-            if decoding {
-                break;
-            }
-            std::thread::sleep(SWAP_POLL);
-        }
         let second = post(bodies[1].clone())?;
         let mut together = Vec::new();
         for ((h, rx), what) in [(first, "first"), (second, "second")] {
             h.join()
-                .map_err(|_| format!("swap: the {what} request's thread panicked"))?;
-            let (r, at) = rx
+                .map_err(|_| format!("slots: the {what} request's thread panicked"))?;
+            let (st, text) = rx
                 .recv()
-                .map_err(|_| format!("swap: the {what} request's thread gave no answer"))?;
-            let (st, text) = r?;
-            let v = json_of("/completion", st, &text)?;
-            together.push((ids_of(&v["tokens"]), at));
+                .map_err(|_| format!("slots: the {what} request's thread gave no answer"))??;
+            together.push(ids_of(&json_of("/completion", st, &text)?["tokens"]));
         }
-        let (after, refused, swap_s) = (
-            metric(&url, "swaps_total")?.unwrap_or(f64::NAN),
-            metric(&url, "swap_refusals_total")?.unwrap_or(f64::NAN),
-            metric(&url, "swap_seconds_total")?.unwrap_or(f64::NAN),
-        );
+        let (decode1, busy1) = rounds(url)?;
+        let swaps = metric(url, "swaps_total")?;
+        let carried = (busy1 - busy0) / (decode1 - decode0);
         println!(
-            "swap together: first {} ids, second {} ids, second back {:?} before the first; \
-             switches {swaps} -> {after} ({swap_s} s in all, the server's wall clock), \
-             refusals {refused}",
-            together[0].0.len(),
-            together[1].0.len(),
-            together[0].1.checked_duration_since(together[1].1)
+            "slots alone {} and {} ids, together {} and {} ids; decode rounds {decode0} -> \
+             {decode1}, busy slots {busy0} -> {busy1} ({carried} a round); swaps {swaps:?}",
+            alone[0].len(),
+            alone[1].len(),
+            together[0].len(),
+            together[1].len()
         );
         let mut ok = true;
         check(
             &mut ok,
-            "swap_alone_ran_to_n_predict",
-            alone.iter().all(|(ids, n)| ids.len() == *n),
+            "slots_together_ids_are_alone",
+            alone.iter().all(|ids| ids.len() == SLOTS_PREDICT) && together == alone,
         );
         check(
             &mut ok,
-            "swap_second_back_before_the_first",
-            together[1].1 < together[0].1,
+            "slots_rounds_carry_both_slots",
+            swaps.is_none_or(|v| v == 0.0) && carried >= SLOTS_BUSY,
+        );
+        Ok(ok)
+    }
+
+    /// (s3) and (s2), the slot actions, on a pair that keeps its prompts
+    /// (module header).
+    fn slots_actions(url: &dyn Fn(&str) -> String, a: &Args) -> Result<bool, GateError> {
+        let mut ok = true;
+        let other: Vec<u32> = a.ids.iter().rev().copied().collect();
+        let (sa, ga, _) = on_slot(url, &a.ids, true)?;
+        let (st, text) = curl(
+            &url(&format!("/slots/{sa}?action=save")),
+            Some(&json!({"filename": "slot.bin"})),
+            false,
+        )?;
+        println!("slots save of slot {sa}: HTTP {st}: {text}");
+        check(
+            &mut ok,
+            "slots_save_refused_by_name",
+            st == 501 && text.contains("does not support slot save/restore"),
+        );
+        let (sb, _, _) = on_slot(url, &other, true)?;
+        // A POST, as llama-server's slot actions are: curl sends one with a body.
+        let (st, text) = curl(
+            &url(&format!("/slots/{sb}?action=erase")),
+            Some(&json!({})),
+            false,
+        )?;
+        let erased = json_of("/slots erase", st, &text)?;
+        println!("slots erase of slot {sb}: {erased}");
+        let cont: Vec<u32> = a.ids.iter().chain(&ga).copied().collect();
+        let (sc, gc, cc) = on_slot(url, &cont, true)?;
+        let (_, gf, cf) = on_slot(url, &cont, false)?;
+        check(
+            &mut ok,
+            "slots_erase_empties_the_other_slot",
+            sb != sa && erased["n_erased"].as_u64().is_some_and(|n| n > 0),
         );
         check(
             &mut ok,
-            "swap_first_ids_are_alone",
-            together[0].0 == alone[0].0,
+            "slots_erase_leaves_the_slot_beside_it",
+            sc == sa && cc == json!(cont.len() - 1) && gc == gf && cf == json!(0),
         );
-        check(
-            &mut ok,
-            "swap_second_ids_are_alone",
-            together[1].0 == alone[1].0,
-        );
-        check(
-            &mut ok,
-            "swap_switched_and_refused_none",
-            after > swaps && refused == 0.0,
-        );
-        println!("swap server stopped: {}", served.stop()?);
         Ok(ok)
     }
 
     /// `--parallel 2` under the DSpark draft (module header), into
-    /// `<dir>/swap-dspark`.
-    fn swap_refuses_dspark(a: &Args) -> Result<bool, GateError> {
-        let dir = a.dir.join("swap-dspark");
+    /// `<dir>/slots-dspark`.
+    fn slots_refuse_dspark(a: &Args) -> Result<bool, GateError> {
+        let dir = a.dir.join("slots-dspark");
         std::fs::create_dir_all(&dir)?;
         let mut cmd = Command::new(Served::exe()?);
         cmd.env("BLOOMERY_DRAFT", "dspark");
-        let mut served = Served::spawn_cmd(cmd, &SWAP_SERVER_ARGS, &dir)?;
+        let mut served = Served::spawn_cmd(cmd, &SLOTS_SERVER_ARGS, &dir)?;
         let refused = match served.address(&dir.join("server.err"), POLLS, POLL) {
             Ok(addr) => format!("listening on {addr}"),
             Err(e) => e.to_string(),
         };
-        println!("swap under the DSpark draft: {refused}");
+        println!("slots under the DSpark draft: {refused}");
         let mut ok = true;
         check(
             &mut ok,
-            "swap_under_dspark_is_refused_by_name",
+            "slots_under_dspark_is_refused_by_name",
             refused.contains("--parallel 2 under BLOOMERY_DRAFT=dspark"),
         );
         Ok(ok)
@@ -1769,6 +1926,15 @@ mod gate {
                 .into());
             }
             (Some(plain), Some("dspark")) => return drafted(&a, plain, &place),
+            (None, None) if a.slots => {
+                std::fs::create_dir_all(&a.dir)?;
+                let ok = slots(&a)? & slots_refuse_dspark(&a)?;
+                if ok {
+                    println!("weekly-gpu-ds41-serve slots: PASS");
+                    return Ok(());
+                }
+                return Err(checks_failed());
+            }
             (None, None) => {}
             (plain, draft) => {
                 return Err(format!(
@@ -2012,8 +2178,8 @@ mod gate {
         ok &= shared_system(&url)?;
 
         println!("server stopped: {}", served.stop()?);
-        ok &= swap(&a)?;
-        ok &= swap_refuses_dspark(&a)?;
+        ok &= slots(&a)?;
+        ok &= slots_refuse_dspark(&a)?;
         if ok {
             println!("weekly-gpu-ds41-serve: PASS");
             Ok(())

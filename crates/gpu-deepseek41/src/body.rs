@@ -69,6 +69,7 @@
 //! other.
 
 use std::mem::ManuallyDrop;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -114,7 +115,7 @@ pub use prefill::{
     PrefillStats, PromptCounts, T_MAX, batch_count, batches, prefill, prefill_observed,
     prefill_with, prepare_prefill,
 };
-pub use seq::{KeepLimit, SeqSnapshot, resume, snapshot};
+pub use seq::{KeepLimit, Seq, SeqSnapshot, resume, snapshot};
 
 /// The V4.1 engine: the shared skeleton over this body.
 pub type Deepseek41Model = GpuModel<Body>;
@@ -289,15 +290,7 @@ pub fn open(
     const WHAT: &str = "deepseek41 body::open";
     let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
     let machine = machine(inputs.model.layers);
-    if machine.cards.len() != 1 {
-        return Err(GpuError::Shape {
-            what: WHAT,
-            detail: format!(
-                "the placement puts the layers on {} cards; the chain runs on one",
-                machine.cards.len()
-            ),
-        });
-    }
+    refuse_cards(WHAT, &machine)?;
     refuse_expert_tiers(WHAT, &machine)?;
     let plan = inputs
         .plan(&machine, ctx_max as u64, &cfg.place)
@@ -307,6 +300,49 @@ pub fn open(
         levers: cfg.body,
     };
     Body::open_placed(file, &plan, 0, &meta)
+}
+
+/// The whole V4.1 model as [`open`] makes it, by a plan that counts `slots`
+/// resident sequences of `ctx_max` positions each
+/// (`PlanInputs::plan_with_slots`: every one's caches on the card and ring
+/// shadows on the host), with the plan's expert tier cards, when `machine`
+/// names any, hung under the host tier ([`Body::open_placed_slots`]). The
+/// model serves one slot until [`GpuModel::add_slots`] makes the rest.
+pub fn open_slots(
+    file: Split,
+    machine: impl FnOnce(usize) -> Machine,
+    ctx_max: usize,
+    cfg: &OpenCfg,
+    slots: NonZeroUsize,
+) -> Result<Deepseek41Model, GpuError> {
+    const WHAT: &str = "deepseek41 body::open_slots";
+    let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+    let machine = machine(inputs.model.layers);
+    refuse_cards(WHAT, &machine)?;
+    let plan = inputs
+        .plan_with_slots(&machine, ctx_max as u64, &cfg.place, slots)
+        .map_err(|e| GpuError::plan(WHAT, e))?;
+    let meta = BodyMeta {
+        hp: inputs.hp.clone(),
+        levers: cfg.body,
+    };
+    let tiers = TierOpen::of_machine(plan.machine);
+    Body::open_placed_slots(file, &plan, 0, tiers, &meta, slots)
+}
+
+/// A placement that puts the layers on other than one card, refused by name
+/// as `what`: the chain runs on one.
+fn refuse_cards(what: &'static str, machine: &Machine) -> Result<(), GpuError> {
+    if machine.cards.len() == 1 {
+        return Ok(());
+    }
+    Err(GpuError::Shape {
+        what,
+        detail: format!(
+            "the placement puts the layers on {} cards; the chain runs on one",
+            machine.cards.len()
+        ),
+    })
 }
 
 /// Build the feature tap a draft reads ([`Body::read_features`]): for every
@@ -731,10 +767,14 @@ struct Cursor {
 pub struct Body {
     /// The layers this card runs.
     layers: Range<usize>,
-    /// Per layer of `layers`, in order.
-    kv: Vec<LayerKv>,
-    /// Every layer's ring shadow, in page-locked host memory.
-    shadows: Shadows,
+    /// The live sequence: every layer's cache and ring shadow, the token
+    /// history and the host's record of them ([`Seq`]). A resident slot past
+    /// the first holds its own, exchanged with this one ([`Slots`]).
+    seq: Seq,
+    /// The resident sequences the load's plan counts, and the ones made so
+    /// far, the live one included ([`Slots::new_seq`]).
+    slots_planned: usize,
+    slots_made: usize,
     steps: Vec<LayerStep>,
     /// Per row of the pair pass: its streams, folds and image copy.
     lanes: Vec<Lane>,
@@ -760,32 +800,13 @@ pub struct Body {
     /// The row whose image copy waits for the rows in flight: refreshed, not
     /// delivered yet ([`Body::arrive`]).
     due: Option<usize>,
-    /// A step's rows failed after its launch: the card ran it on the rows
-    /// the staging held before, and every step is refused until a reset.
-    rows_failed: bool,
     /// Host time in the step's synchronous copy of its parameters to the
     /// card, summed over steps (ns).
     params_ns: u64,
-    /// The tokens decoded so far, one per position: `ctx_max` reserved.
-    history: Vec<u32>,
-    /// Which position's row each ring slot and each compressor state slot
-    /// holds, as the steps refreshed since the last known state left them.
-    holds: Holds,
-    /// The first position whose shadow row a step of the current history
-    /// wrote: rows below it hold nothing a cut may restore (a caller wrote
-    /// the caches itself, [`Body::set_history`]).
-    shadow_from: usize,
-    /// Positions of the history whose shadow rows some layer never wrote:
-    /// each prompt call's [`Need::hole`], in position order. A cut whose
-    /// restore reads one is not granted.
-    holes: Vec<Range<usize>>,
     /// Which positions each layer of a prompt call runs ([`ced`]), and the
-    /// last call's needs.
+    /// live sequence's last call's needs.
     ced: ced::Ced,
     need: Option<Need>,
-    /// A cut left ring slots the next step reads holding other positions'
-    /// rows: the next refresh restores them before the step runs.
-    restore: bool,
     /// The file, for the tensors the plan leaves on the host: the one
     /// mapping the host tier reads and the load populated.
     file: Arc<Split>,
@@ -835,7 +856,7 @@ impl Body {
     #[must_use]
     pub fn state_buffers(&self, layer: usize) -> Option<[(&'static str, usize); 5]> {
         let i = layer.checked_sub(self.layers.start)?;
-        self.kv.get(i).map(LayerKv::buffers)
+        self.seq.kv.get(i).map(LayerKv::buffers)
     }
 
     /// Layer `layer`'s cache and compressor bytes — the figure `KvLayout`
@@ -852,7 +873,7 @@ impl Body {
     #[must_use]
     pub fn shadow_bytes(&self, layer: usize) -> Option<usize> {
         let i = layer.checked_sub(self.layers.start)?;
-        self.kv.get(i).map(|_| self.shadows.layer_bytes())
+        self.seq.kv.get(i).map(|_| self.seq.shadows.layer_bytes())
     }
 
     /// Where the ring shadows live: the page-locked host allocation's bytes
@@ -860,8 +881,8 @@ impl Body {
     #[must_use]
     pub fn shadow_host(&self) -> ShadowHost {
         ShadowHost {
-            bytes: self.shadows.host.num_bytes(),
-            unified_addressing: self.shadows.unified_addressing,
+            bytes: self.seq.shadows.host.num_bytes(),
+            unified_addressing: self.seq.shadows.unified_addressing,
         }
     }
 
@@ -869,7 +890,7 @@ impl Body {
     /// a state into them itself; `None` for a layer this card does not run.
     pub fn state_mut(&mut self, layer: usize) -> Option<StateMut<'_>> {
         let i = layer.checked_sub(self.layers.start)?;
-        self.kv.get_mut(i).map(|k| StateMut {
+        self.seq.kv.get_mut(i).map(|k| StateMut {
             ring: &mut k.ring,
             rows: k.rows.as_mut(),
             keys: k.keys.as_mut(),
@@ -943,7 +964,7 @@ impl Body {
     /// The tokens decoded so far, one per position.
     #[must_use]
     pub fn history(&self) -> &[u32] {
-        &self.history
+        self.seq.history.ids()
     }
 
     /// Device bytes of one row's own buffers — its streams, folds, image
@@ -1067,7 +1088,7 @@ impl Body {
             Entry::Step => self.hybrid.refuse_if_poisoned(what)?,
             Entry::Group => self.hybrid.begin_group()?,
         }
-        if self.rows_failed {
+        if self.seq.rows_failed {
             return Err(GpuError::State {
                 what,
                 missing: "a reset: an earlier step's engram rows failed after its launch, and \
@@ -1099,13 +1120,12 @@ impl Body {
                 ),
             });
         }
-        self.history.clear();
-        self.history.extend_from_slice(history);
-        self.holds.known(history.len());
-        self.shadow_from = history.len();
-        self.holes.clear();
+        self.seq.history.set(history);
+        self.seq.holds.known(history.len());
+        self.seq.shadow_from = history.len();
+        self.seq.holes.clear();
         self.need = None;
-        self.restore = false;
+        self.seq.restore = false;
         Ok(())
     }
 
@@ -1168,15 +1188,15 @@ impl Body {
         else {
             return Ok(None);
         };
-        let n = self.shadows.rows * self.shadows.width;
-        Ok(self.shadows.host.get(i * n..(i + 1) * n))
+        let n = self.seq.shadows.rows * self.seq.shadows.width;
+        Ok(self.seq.shadows.host.get(i * n..(i + 1) * n))
     }
 
     /// [`attach_features`] on the body: refused once a step has run, and
     /// when a tap exists already.
     fn attach_features(&mut self, gpu: &Gpu, layers: &[usize]) -> Result<(), GpuError> {
         const WHAT: &str = "deepseek41 Body::attach_features";
-        if self.tap.is_some() || !self.history.is_empty() {
+        if self.tap.is_some() || !self.seq.history.is_empty() {
             return Err(GpuError::State {
                 what: WHAT,
                 missing: "a fresh body: one tap, attached before the first step",
@@ -1214,7 +1234,7 @@ impl Body {
     /// for a position the history no longer holds (taken back).
     pub fn read_features(&mut self, gpu: &Gpu, rows: usize) -> Result<Features<'_>, GpuError> {
         const WHAT: &str = "deepseek41 Body::read_features";
-        let len = self.history.len();
+        let len = self.seq.history.len();
         let tap = self.tap.as_mut().ok_or(GpuError::State {
             what: WHAT,
             missing: "a feature tap (attach_features)",
@@ -1387,7 +1407,7 @@ impl Body {
     /// the engine stream and outside any graph (this call has no stream);
     /// nothing else on the device is touched.
     pub fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
-        let (to, len) = (pos as usize, self.history.len());
+        let (to, len) = (pos as usize, self.seq.history.len());
         let kept = self.keep_point(to);
         if to > len || kept != to {
             return Err(GpuError::Shape {
@@ -1401,14 +1421,14 @@ impl Body {
         // Every hole keeps only its part below the cut, also at `to == len`:
         // a hole that starts at or past it holds no position the history
         // keeps.
-        self.holes.retain_mut(|h| {
+        self.seq.holes.retain_mut(|h| {
             h.end = h.end.min(to);
             h.start < h.end
         });
         if to < len {
-            self.history.truncate(to);
-            self.shadow_from = self.shadow_from.min(to);
-            self.restore = self.holds.stale(to).next().is_some();
+            self.seq.history.truncate(to);
+            self.seq.shadow_from = self.seq.shadow_from.min(to);
+            self.seq.restore = self.seq.holds.stale(to).next().is_some();
         }
         Ok(())
     }
@@ -1436,17 +1456,8 @@ impl Body {
             });
         }
         let pos = input.pos as usize;
-        if self.restore {
-            for run in self.holds.stale_runs(pos) {
-                for (i, layer) in self.kv.iter_mut().enumerate() {
-                    self.shadows
-                        .restore(i, &mut layer.ring, stream, run.clone())?;
-                }
-                run.for_each(|q| self.holds.ring_wrote(q));
-            }
-            self.restore = false;
-        }
-        self.holds.wrote(pos);
+        self.seq.restore_before(stream, pos)?;
+        self.seq.holds.wrote(pos);
         let lane = self.lanes.get_mut(row).ok_or(GpuError::State {
             what: WHAT,
             missing: "the row's buffers",
@@ -1482,12 +1493,12 @@ impl Body {
         let result = match taken {
             Ok(taken) => taken.and(delivered),
             Err(p) => {
-                self.rows_failed = true;
+                self.seq.rows_failed = true;
                 std::panic::resume_unwind(p)
             }
         };
         if result.is_err() {
-            self.rows_failed = true;
+            self.seq.rows_failed = true;
         }
         result
     }
@@ -1508,8 +1519,7 @@ impl Body {
     fn parts(&mut self) -> (Parts<'_>, &mut Hybrid<Ds41Host>) {
         let Body {
             layers,
-            kv,
-            shadows,
+            seq: Seq { kv, shadows, .. },
             steps,
             lanes,
             lists,
@@ -1916,7 +1926,7 @@ fn layer_io<'a>(
 /// position overwrites holds — the raw window ring's `slots` and each
 /// compressed stream's state ring of `ratio` — every layer alike, since every
 /// step writes every layer's slots. [`Body::keep_point`] reads it.
-#[derive(Clone)]
+#[derive(Clone, Hash)]
 struct Holds {
     ring: Vec<Option<usize>>,
     /// Per stream of the plan, above ratio 1: its ratio and its slots.
@@ -2132,13 +2142,31 @@ impl Body {
     /// loads modules, which waits on a context whose tier stream a lost card
     /// holds. More tier cards than the host tier serves are refused by name
     /// before anything uploads ([`refuse_tier_count`]). Without a tier it is
-    /// [`Body::open_placed`], launch for launch.
+    /// [`Body::open_placed`], launch for launch. The plan counts one
+    /// sequence: [`Body::open_placed_slots`] loads one that counts more.
     pub fn open_placed_tiered(
         file: Split,
         plan: &Plan<'_>,
         card: usize,
         tiers: impl IntoIterator<Item = TierOpen>,
         meta: &BodyMeta,
+    ) -> Result<Deepseek41Model, GpuError> {
+        Body::open_placed_slots(file, plan, card, tiers, meta, NonZeroUsize::MIN)
+    }
+
+    /// [`Body::open_placed_tiered`] by a plan that counts `slots` resident
+    /// sequences (`PlanInputs::plan_with_slots`): the model then makes up to
+    /// `slots` of them, the live one included ([`GpuModel::add_slots`]), and
+    /// refuses one past them by name ([`Slots::new_seq`]) — a sequence the
+    /// plan did not count is card and page-locked host memory nothing
+    /// reserved.
+    pub fn open_placed_slots(
+        file: Split,
+        plan: &Plan<'_>,
+        card: usize,
+        tiers: impl IntoIterator<Item = TierOpen>,
+        meta: &BodyMeta,
+        slots: NonZeroUsize,
     ) -> Result<Deepseek41Model, GpuError> {
         meta.levers.check()?;
         let tiers: Vec<TierOpen> = tiers.into_iter().collect();
@@ -2178,16 +2206,8 @@ impl Body {
             residency,
             Body::derive,
             |gpu, file, _w, residency, residency_glue| {
-                Body::load_placed(
-                    gpu,
-                    file,
-                    plan,
-                    card,
-                    tiers,
-                    meta,
-                    residency,
-                    residency_glue,
-                )
+                let on = LoadOn { card, tiers, slots };
+                Body::load_placed(gpu, file, plan, on, meta, residency, residency_glue)
             },
         )?;
         if tiered && meta.levers.prefill == PrefillMode::Batch {
@@ -2209,23 +2229,19 @@ impl Body {
         join_projections(stream, &hp, layers, w)
     }
 
-    /// The body of card `card`: its buffers sized from `meta`'s hparams — the
-    /// hyperparameters the plan was made from — at the plan's `ctx_max`, its
-    /// slot map from the plan's routed segments on the card, the host tier
-    /// over the file holding `residency`, the load's host set, and the three
-    /// pieces, under `meta`'s levers. `residency_glue` is the load's residency
+    /// The body of card `on.card`: its buffers sized from `meta`'s hparams —
+    /// the hyperparameters the plan was made from — at the plan's `ctx_max`,
+    /// its slot map from the plan's routed segments on the card, the host
+    /// tier over the file holding `residency`, the load's host set, the
+    /// three pieces, under `meta`'s levers, and the live sequence of the
+    /// `on.slots` the plan counts. `residency_glue` is the load's residency
     /// side ([`ResidencyGlue`]), whose machine the body starts once its
     /// pieces are sized.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the placed load's card, file, plan, tiers, levers, host set and residency glue (rust-quality R8)"
-    )]
     fn load_placed(
         gpu: &Gpu,
         file: &Arc<Split>,
         plan: &Plan<'_>,
-        card: usize,
-        tiers: Vec<TierOpen>,
+        on: LoadOn,
         meta: &BodyMeta,
         residency: HostResidency,
         residency_glue: ResidencyGlue,
@@ -2233,6 +2249,11 @@ impl Body {
         const WHAT: &str = "deepseek41 Body::load_placed";
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
         let (hp, cfg) = (&meta.hp, meta.levers);
+        let LoadOn {
+            card,
+            tiers,
+            slots: planned,
+        } = on;
         prefill::check_group(cfg.group)?;
         let spec = plan
             .machine
@@ -2258,14 +2279,9 @@ impl Body {
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
 
-        let kv = layers
-            .clone()
-            .map(|l| layer_kv(stream, hp, l, ctx_max))
-            .collect::<Result<Vec<_>, _>>()?;
-        let shadows = Shadows::new(gpu, layers.len(), ctx_max, hp.head_dim)?;
-
         let planner =
             Planner::from_file(file, hp, plan.ctx_max).map_err(|e| GpuError::plan(WHAT, e))?;
+        let seq = Seq::new(gpu, hp, layers.clone(), ctx_max, planner.stream_ratios())?;
         let row_bytes = engram_row_bytes(file, hp)?;
         let rows = StepRows::open(file, hp, STEP_TOKENS, cfg.rows)?;
         if rows.row_bytes() != row_bytes {
@@ -2296,7 +2312,7 @@ impl Body {
             AttnChain::with_rows(gpu, hp, layers.clone(), image.layout(), &planner, PAIR_ROWS)?;
         let ffn = FfnPiece::with_rows(gpu, hp, &map, PAIR_ROWS)?;
         let glue = Glue::with_rows(gpu, hp, image.layout(), PAIR_ROWS)?;
-        let steps = layer_steps(hp, &layers, &kv, &ffn, &glue)?;
+        let steps = layer_steps(hp, &layers, &seq.kv, &ffn, &glue)?;
         let writers = steps
             .iter()
             .filter(|s| matches!(s.list, ListOf::Writes { .. }))
@@ -2339,14 +2355,13 @@ impl Body {
             hybrid.check_tier_reserves(plan.machine, &cards)?;
             Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?)
         };
-        let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
-        let holds = Holds::new(ring_rows, planner.stream_ratios());
-        let ced = ced::Ced::new(&CedLayer::table(hp), ring_rows, cfg.ced);
+        let ced = ced::Ced::new(&CedLayer::table(hp), seq.ring_rows(), cfg.ced);
 
         let mut body = Body {
             layers,
-            kv,
-            shadows,
+            seq,
+            slots_planned: planned.get(),
+            slots_made: 1,
             steps,
             lanes,
             lists,
@@ -2361,15 +2376,9 @@ impl Body {
             rows,
             arrival,
             due: None,
-            rows_failed: false,
             params_ns: 0,
-            history: Vec::with_capacity(ctx_max),
-            holds,
-            shadow_from: 0,
-            holes: Vec::new(),
             ced,
             need: None,
-            restore: false,
             file,
             eps: hp.rms_eps,
             tap: None,
@@ -2385,6 +2394,15 @@ impl Body {
         body.start_residency(gpu)?;
         Ok(body)
     }
+}
+
+/// Where a placed load lands besides its plan ([`Body::load_placed`]): the
+/// stage card, the tier cards hung under the host tier, and the resident
+/// sequences the plan counts.
+struct LoadOn {
+    card: usize,
+    tiers: Vec<TierOpen>,
+    slots: NonZeroUsize,
 }
 
 /// The tier card `t` of `plan`, tier `tier` of the map, for the stage card
@@ -2449,25 +2467,25 @@ impl ChainBody for Body {
         self.admit(WHAT, Entry::Step)?;
         self.arrive()?;
         self.rows.finish()?;
-        if self.history.len() != pos as usize || self.history.len() >= self.positions() {
+        if self.seq.history.len() != pos as usize || self.seq.history.len() >= self.positions() {
             return Err(GpuError::Shape {
                 what: WHAT,
                 detail: format!(
                     "a step at position {pos} after {} tokens, in caches of {} positions",
-                    self.history.len(),
+                    self.seq.history.len(),
                     self.positions()
                 ),
             });
         }
         self.planner
-            .plan_into(&[token], pos, &self.history, &mut self.plan)
+            .plan_into(&[token], pos, self.seq.history.ids(), &mut self.plan)
             .map_err(|e| GpuError::plan(WHAT, e))?;
         self.rows.begin(&self.file, &self.plan)?;
         // The rows section is written again by the arrival; what it holds
         // here is never read.
         self.image
             .build(&self.plan, self.rows.embd(), self.rows.engram())?;
-        self.history.push(token);
+        self.seq.history.push(token);
         Ok(StepInput { pos })
     }
 
@@ -2481,10 +2499,12 @@ impl ChainBody for Body {
         self.enqueue_observed(gpu, w, head, &mut |_, _| Ok(()))
     }
 
-    /// Every ring, compressed row, index key, compressor state, the source
-    /// compressor's pooled rows, and every row's streams, folds and lists are
-    /// zeroed in place — a captured chain keeps their addresses — and the
-    /// token history is emptied. The ring shadows are not: a cut reads only
+    /// The live sequence's every ring, compressed row, index key and
+    /// compressor state, the source compressor's pooled rows, and every row's
+    /// streams, folds and lists are zeroed in place — a captured chain keeps
+    /// their addresses — and its token history is emptied ([`Seq::clear`]);
+    /// a parked slot's sequence is not touched. The ring shadows are not: a
+    /// cut reads only
     /// shadow rows a step since wrote. Rows due or in flight are taken back
     /// first; a failure there is returned before anything is zeroed, and a
     /// second reset finds nothing in flight. A reset clears what a failed step
@@ -2495,11 +2515,8 @@ impl ChainBody for Body {
         self.rows.finish()?;
         self.hybrid.reset(gpu.stream())?;
         self.attn.reset(gpu.stream())?;
-        self.rows_failed = false;
         let stream = gpu.stream();
-        for layer in &mut self.kv {
-            layer.zero(stream)?;
-        }
+        self.seq.clear(stream)?;
         for lane in &mut self.lanes {
             for t in &mut lane.hc {
                 t.buf_mut().zero_async(stream)?;
@@ -2514,12 +2531,7 @@ impl ChainBody for Body {
         if let Some(tap) = self.tap.as_mut() {
             tap.pos = [None; PAIR_ROWS];
         }
-        self.history.clear();
-        self.holds.known(0);
-        self.shadow_from = 0;
-        self.holes.clear();
         self.need = None;
-        self.restore = false;
         Ok(())
     }
 
@@ -2532,12 +2544,7 @@ impl ChainBody for Body {
     /// The ring shadows are page-locked host memory, not counted here
     /// ([`Body::shadow_host`]); a feature tap's device buffer is.
     fn resident_bytes(&self) -> usize {
-        let caches: usize = self
-            .kv
-            .iter()
-            .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>())
-            .sum();
-        caches
+        self.seq.device_bytes()
             + self.step_buffers().iter().map(|&(_, n)| n).sum::<usize>()
             + self.feature_bytes()
             + self.batch_bytes()

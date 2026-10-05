@@ -6,7 +6,7 @@
 //!
 //!     bloomery-serve-ds41 [--host 127.0.0.1] [--port 8080] [--place PLACE]
 //!                         [--ctx C] [--alias NAME] [--cache-ram MIB]
-//!                         [--parallel N] [--queue-depth Q] [--park-ram MIB]
+//!                         [--parallel N] [--queue-depth Q] [--slot-save-path DIR]
 //!
 //! `PLACE` is `a`, `gate`, `bp` or a card list `<stage>[+<tier>…]`
 //! (`generate::Place`, as `generate_ds41` takes it); a list whose stage card
@@ -32,9 +32,10 @@
 //! batch, and a lost tier card is an engine error like any other: the
 //! request's 500 and `/health`'s 503 carry its message, which names the card.
 //!
-//! The server serves `--ctx` positions: `/props`' `n_ctx` is that number, a
+//! Each slot serves `--ctx` positions (below): that is `/props`' `n_ctx`, a
 //! prompt that long is a 400 before it reaches the engine, and generation
-//! stops there with `truncated`. `/props`' `engine.ctx_verified` is the
+//! stops there with `truncated`.
+//! `/props`' `engine.ctx_verified` is the
 //! deepest context the reference sets hold our numbers to ik's at
 //! (`refset::arch::deepseek41::VERIFIED_POSITIONS`), which bounds nothing.
 //!
@@ -47,30 +48,36 @@
 //! whether the chat template writes it). Every cache event and every prefix
 //! the body keeps less of than a request shares is a record line.
 //!
-//! `--parallel N` (`-np N`) serves N slots that take the one body
-//! in turns (`serve::SwapEngine`); the default is what the parked states'
-//! budget holds of one slot's whole-context state — the plan's KV rows, the
-//! ring shadows and the history, at the ctx the server loads — the lesser of
-//! `bind::PARALLEL_CAP`, it and the engine's own turn bound
-//! (`bind::Seat::turn_slots`: one slot under the DSpark draft), never below
-//! the plain engine, and the flag an upper bound on the same, so
-//! `--parallel 1` keeps the plain engine: a request that arrives while
-//! another decodes preempts it at the next step, the running request's
-//! sequence state parked in host RAM, and the live requests then take turns
-//! of `serve::QUANTUM` tokens. The parked states'
-//! budget is `--park-ram` (MiB), by default the lesser of [`CACHE_RAM_CAP`]
-//! and the host headroom the prompt cache leaves (`/metrics`'
-//! `swap_park_budget_bytes`); a request that would park a state past it is a
-//! 503 naming the budget. A `parallel` line on stderr names the rule
-//! (`plain`, `budget`, `engine` or `flag`), the slots and each term, after
-//! the load — the turn bound is read from the opened seat. `--queue-depth Q`
-//! bounds the requests that wait for a slot. Several slots are refused by
-//! name under the DSpark draft (a state put back starts the draft over, and a
-//! turn has no prompt call to feed it its window) — the elastic default
-//! resolves to one slot there, the `parallel` line naming the engine — and
-//! under `BLOOMERY_ROUTE_TRACE` (a turn's steps would follow another
-//! request's call row); the lookup draft rebuilds its tables from the
-//! target's history at a turn's first pass and drafts on.
+//! `--parallel N` (`-np N`, default [`SLOTS`]) serves N resident sequences
+//! inside the one model (`Session::add_slots` over the body's `Slots`): the
+//! server steps the busy slots together, a select and a step a slot each
+//! round, the sequences switched by pointer exchange, so each request's
+//! tokens are its solo run's; nothing parks and no slot waits for another.
+//! `--parallel 1` is exactly the one-sequence server, and `--parallel 0` is
+//! refused by name. Every slot holds a whole context: each serves the full
+//! `--ctx` positions, refused by name before the load below the pair pass's
+//! rows ([`slot_ctx`]). The plan counts every sequence — each one's caches on
+//! the card and ring shadows on the host (`PlanInputs::plan_with_slots`) — so
+//! slots the machine cannot hold are refused before the load by the plan's
+//! own refusal, as one sequence's are (the card's floor or its usable bytes
+//! past its dense trunk, KV, context, scratch, reserves and margin; the
+//! host's usable bytes past its tensors, ring shadows and reserves); and
+//! `--park-ram` is refused by name: resident slots hold their state in the
+//! plan. A `parallel` line on stderr names the rule (`slots`), the slots, a
+//! slot's context, the total and what set the count (`flag`, `default`, or
+//! one slot under the DSpark draft and under a route trace); a `slots` line
+//! after the load names each sequence's card and page-locked host bytes.
+//! `--queue-depth Q` bounds the requests that wait for a slot. Several slots
+//! are refused by name under the DSpark draft (its window is one sequence's,
+//! on its own card: a select would start it over) and under
+//! `BLOOMERY_ROUTE_TRACE` (the trace records one sequence's steps after its
+//! call row); the lookup draft rebuilds its tables from the selected slot's
+//! history at that slot's next pass, so its passes are the slot's alone.
+//!
+//! `--slot-save-path DIR` turns on the slot actions as llama-server's: an
+//! erase empties that slot alone; a save or a restore to a file is refused
+//! by name (the engine answers 501: the body's sequence state goes to the
+//! prompt cache in host RAM, not to a file).
 //!
 //! An engine error ends the process: the request gets a 500, `/health` a 503
 //! for a moment, then the crash block (card, position, error) goes to stderr
@@ -120,6 +127,7 @@
 //! token history at a request's first token.
 
 use std::any::Any;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -128,13 +136,12 @@ use app::arch::deepseek41::{CardDraft, Ds41Cfg};
 use app::{Loaded, OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::model::StepMode;
+use bloomery_gpu::model::{Slots, StepMode};
 use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS, SeqSnapshot};
 use bloomery_gpu_deepseek41::draft::DraftBody;
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::bind::{
-    Parallel, Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props,
-    sampler_factory,
+    Seat, SeatEngine, Vocab, model_props, nvidia_smi_index, placement_props, sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name};
 use bloomery_gpu_gates::record::{self, Record};
@@ -148,9 +155,8 @@ use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
 use runtime::{Committed, Lookup, Speculative, Target, Want};
 use serve::{
-    CacheNote, DeviceProps, DraftProps, Drafted, Engine, EngineProps, FATAL_LINGER, Park,
-    PlacementProps, ResidencyReset, Saved, ServeError, Server, ServerConfig, SlotConfig,
-    SwapEngine,
+    CacheNote, DeviceProps, DraftProps, Drafted, EngineProps, FATAL_LINGER, PlacementProps,
+    ResidencyReset, Saved, ServeError, Server, ServerConfig, SlotConfig,
 };
 use tokenizer::Tokenizer;
 
@@ -159,7 +165,11 @@ use crate::{dspark, place};
 
 const USAGE: &str = "usage: bloomery-serve-ds41 [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C] [--alias NAME] \
-                     [--cache-ram MIB] [--parallel N] [--queue-depth Q] [--park-ram MIB]";
+                     [--cache-ram MIB] [--parallel N] [--queue-depth Q] \
+                     [--slot-save-path DIR]";
+
+/// The resident sequences the seat serves when `--parallel` is not given.
+pub const SLOTS: usize = 2;
 
 /// The token V4.1's chat template opens every user and tool message with.
 pub const USER_START: &str = "<｜User｜>";
@@ -184,12 +194,13 @@ struct Args {
     alias: Option<String>,
     /// `--cache-ram` in bytes; `None` takes the default.
     cache_ram: Option<u64>,
-    /// `--parallel`: slots that take the body in turns past 1; `None` takes
-    /// the elastic default ([`Parallel`]).
+    /// `--parallel`: the resident sequences the seat serves; `None` takes
+    /// [`slot_count`]'s default.
     parallel: Option<usize>,
     queue_depth: Option<usize>,
-    /// `--park-ram` in bytes; `None` takes the default.
-    park_ram: Option<u64>,
+    /// `--slot-save-path`: the directory the slot actions answer from;
+    /// `None` refuses every one, as llama-server does.
+    slot_save_path: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, GateError> {
@@ -200,14 +211,11 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         ctx: usize::try_from(workstation::CTX_MAX)?,
         alias: None,
         cache_ram: None,
-        // The elastic default ([`Parallel`]): the turns act only on a second
-        // arrival, and a lone request stays on the slot the engine holds
-        // unless another slot's parked state shares more of its prompt;
-        // `--parallel 1` keeps the plain engine.
         parallel: None,
         queue_depth: None,
-        park_ram: None,
+        slot_save_path: None,
     };
+    let mut park_ram = false;
     let mut it = args.iter().map(|s| s.as_str());
     while let Some(flag) = it.next() {
         if flag == "--help" || flag == "-h" {
@@ -225,21 +233,23 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             "--cache-ram" => a.cache_ram = Some(mib_bytes(flag, v)?),
             "--parallel" | "-np" => a.parallel = Some(v.parse()?),
             "--queue-depth" => a.queue_depth = Some(v.parse()?),
-            "--park-ram" => a.park_ram = Some(mib_bytes(flag, v)?),
+            "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
+            "--park-ram" => {
+                mib_bytes(flag, v)?;
+                park_ram = true;
+            }
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
-    match a.park_ram {
-        Some(_) if a.parallel.is_some_and(|n| n < 2) => {
-            return Err(format!(
-                "--park-ram holds the states of slots that take the body in turns; \
-                 --parallel {} has none to park",
-                a.parallel.unwrap_or(0)
-            )
-            .into());
-        }
-        Some(0) => return Err("--park-ram 0 parks no state: give the slots room".into()),
-        _ => {}
+    if a.parallel == Some(0) {
+        return Err("--parallel 0: the server serves no slot".into());
+    }
+    if park_ram {
+        return Err(
+            "--park-ram holds the states of slots that take the model in turns; this seat's \
+             slots are resident sequences, which park nothing — the plan counts their state"
+                .into(),
+        );
     }
     a.place = a.place.on_host()?;
     Ok(a)
@@ -253,41 +263,50 @@ fn mib_bytes(flag: &str, v: &str) -> Result<u64, GateError> {
         .ok_or_else(|| format!("{flag} {mib} MiB passes u64 bytes"))?)
 }
 
-/// The parked states' budget of `--parallel n` slots: `park_ram`, else the
-/// lesser of [`CACHE_RAM_CAP`] and the plan's host headroom less the prompt
-/// cache's `cache_ram`; refused by name when that leaves nothing.
-fn park_budget(
-    park_ram: Option<u64>,
-    headroom: i64,
-    cache_ram: u64,
-    n: usize,
-) -> Result<u64, GateError> {
-    if let Some(b) = park_ram {
-        return Ok(b);
-    }
-    let left = park_left(None, headroom, cache_ram);
-    if left == 0 {
+/// The resident sequences the seat serves and what set the count:
+/// `parallel` (`--parallel`) as given, else [`SLOTS`] — one under the DSpark
+/// draft, whose window is one sequence's on its own card, and one under a
+/// route trace (`traced`), which records one sequence's steps. Several under
+/// the DSpark draft are refused by name here; under a route trace,
+/// [`route_trace`] refuses them.
+fn slot_count(
+    parallel: Option<usize>,
+    draft: Draft,
+    traced: bool,
+) -> Result<(NonZeroUsize, &'static str), GateError> {
+    let (n, from) = match parallel {
+        Some(n) if n > 1 && draft == Draft::Dspark => {
+            return Err(format!(
+                "--parallel {n} under BLOOMERY_DRAFT=dspark: the draft's window is one \
+                 sequence's, on its own card, and a select would start it over; serve one \
+                 slot, or the lookup draft"
+            )
+            .into());
+        }
+        Some(n) => (n, "flag"),
+        None if draft == Draft::Dspark => (1, "dspark"),
+        None if traced => (1, "route-trace"),
+        None => (SLOTS, "default"),
+    };
+    let n = NonZeroUsize::new(n).ok_or("--parallel 0: the server serves no slot")?;
+    Ok((n, from))
+}
+
+/// The positions each of `slots` slots serves for `--ctx` `ctx`: the whole
+/// of it, every slot a full context, so the plan counts `slots` times one
+/// sequence's bytes. The one place the rule lives: a split (⌊ctx / slots⌋,
+/// llama-server's `-np` without `-kvu`) is this function's body. Refused by
+/// name below [`PAIR_ROWS`], the pair pass's rows: the most one call of a
+/// slot runs on a capture.
+fn slot_ctx(ctx: usize, slots: NonZeroUsize) -> Result<usize, GateError> {
+    if ctx < PAIR_ROWS {
         return Err(format!(
-            "--parallel {n}: the plan's host headroom of {headroom} B less the prompt cache's \
-             {cache_ram} B leaves no room to park a slot's state; give --park-ram MIB or a \
-             smaller --cache-ram"
+            "--ctx {ctx}: each of the {slots} slots serves {ctx} positions, below the \
+             {PAIR_ROWS} a slot serves at least (the pair pass's rows)"
         )
         .into());
     }
-    Ok(left)
-}
-
-/// [`park_budget`]'s terms, 0 when nothing is left: the elastic
-/// `--parallel` default's budget, which falls to the plain engine there
-/// instead of refusing. `park_ram` as given, as `park_budget` takes it.
-fn park_left(park_ram: Option<u64>, headroom: i64, cache_ram: u64) -> u64 {
-    if let Some(b) = park_ram {
-        return b;
-    }
-    u64::try_from(headroom)
-        .unwrap_or(0)
-        .saturating_sub(cache_ram)
-        .min(CACHE_RAM_CAP)
+    Ok(ctx)
 }
 
 /// Loads the model and serves until the listener or the engine fails;
@@ -315,15 +334,13 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .into());
     }
     let draft = Draft::from_levers(&levers)?;
-    if a.parallel.is_some_and(|n| n > 1) && draft == Draft::Dspark {
-        return Err(format!(
-            "--parallel {} under BLOOMERY_DRAFT=dspark: a slot's state put back starts the \
-             DSpark draft over, and a turn has no prompt call to feed it its window; serve one \
-             slot, or the lookup draft",
-            a.parallel.unwrap_or(0)
-        )
-        .into());
-    }
+    let (slots, from) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
+    // Before anything is read or planned: a context no slot can serve.
+    let ctx = slot_ctx(a.ctx, slots)?;
+    eprintln!(
+        "parallel rule=slots slots={slots} slot_ctx={ctx} total={} from={from}",
+        slots.get() * ctx
+    );
     // The draft's file is read before the target's load, which takes a minute.
     let draft_file = match draft {
         Draft::Dspark => Some(dspark::draft_hparams()?),
@@ -357,27 +374,22 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         &levers,
         &cfg,
         residency,
-        (draft, a.parallel),
+        (draft, slots),
         a.place,
         &path,
         &inputs,
     )?;
-    let (card, placement, headroom, state) = print_plan(
+    let (card, placement, headroom) = print_plan(
         &inputs,
         a.place,
-        reserve,
-        tier_batch,
-        a.ctx,
+        (reserve, tier_batch),
+        (ctx, slots),
         &cfg.place,
         (cfg.body.residency, residency),
     )?;
     let cache_ram = a
         .cache_ram
         .unwrap_or_else(|| u64::try_from(headroom / 2).map_or(0, |half| half.min(CACHE_RAM_CAP)));
-    let budget = match a.parallel {
-        Some(n) if n >= 2 => park_budget(a.park_ram, headroom, cache_ram, n)?,
-        _ => park_left(a.park_ram, headroom, cache_ram),
-    };
     Record::new(&record::CACHE_CONFIG)
         .u("ram", cache_ram)
         .u("headroom", headroom)
@@ -392,7 +404,8 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     };
     let open = SeatArgs {
         place: a.place,
-        ctx: a.ctx,
+        ctx,
+        slots,
         cfg,
         pin_main: levers.pin_main(),
         want_top_k: inputs.hp.indexer.top_k,
@@ -404,49 +417,31 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         tier_batch,
         trace,
     };
-    let engine = SeatEngine::spawn(
-        move || V41::open(open),
-        a.ctx,
-        vocab,
-        card,
-        props,
-        cache_ram,
-    )?;
-    // The elastic slot count ([`Parallel`]): one slot's whole-context state
-    // the budget's unit, the flag an upper bound, the default what the
-    // budget holds within the engine's own turn bound — read from the opened
-    // seat ([`Seat::turn_slots`]), one slot under the DSpark draft, whose
-    // state does not survive a park.
-    let parallel = Parallel::of_turn_slots(a.parallel, budget, state, engine.turn_slots());
-    eprintln!("{}", parallel.line());
-    let park = (parallel.slots > 1).then_some((parallel.slots, budget));
-
+    let engine = SeatEngine::spawn(move || V41::open(open), ctx, vocab, card, props, cache_ram)?;
     let config = ServerConfig {
         model_alias: a.alias.unwrap_or(name),
         model_path: path.display().to_string(),
         chat_template: template,
         sampler: Some(sampler_factory()),
         fatal_linger: FATAL_LINGER,
-        slot_save_path: None,
+        slot_save_path: a.slot_save_path,
     };
-    // One slot stays the plain engine; several take it in turns.
-    let engine: Box<dyn Engine> = match park {
-        Some((slots, budget)) => Box::new(SwapEngine::new(
-            Box::new(engine),
-            slots,
-            Park::States { budget },
-        )?),
-        None => Box::new(engine),
-    };
-    let slots = SlotConfig {
-        parallel: parallel.slots,
+    // The seat's resident slots are the server's, one sequence each: the
+    // server selects and steps them together, no turns and no park.
+    let config_slots = SlotConfig {
+        parallel: slots.get(),
         queue_depth: a.queue_depth,
         ..SlotConfig::default()
     };
-    let server = Server::bind_with((a.host.as_str(), a.port), engine, config, slots)?;
+    let server = Server::bind_with(
+        (a.host.as_str(), a.port),
+        Box::new(engine),
+        config,
+        config_slots,
+    )?;
     Record::new(&record::LISTENING)
         .w("place", a.place.name())
-        .u("ctx", a.ctx)
+        .u("ctx", ctx)
         .w("addr", server.local_addr()?)
         .eprint();
     Ok(server.run())
@@ -454,12 +449,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
 
 /// The route trace `BLOOMERY_ROUTE_TRACE` asks for, its directory made
 /// now, before the load; refused by name under the batched feed, a draft or
-/// several slots (`parallel`), which it does not record.
+/// several resident slots (`slots`), which it does not record.
 fn route_trace(
     levers: &bloomery_levers::Levers,
     cfg: &body::OpenCfg,
     residency: ResidencyPick,
-    (draft, parallel): (Draft, Option<usize>),
+    (draft, slots): (Draft, NonZeroUsize),
     place: Place,
     path: &Path,
     inputs: &PlanInputs,
@@ -482,18 +477,10 @@ fn route_trace(
         )
         .into());
     }
-    let Some(parallel) = parallel else {
-        return Err(
-            "BLOOMERY_ROUTE_TRACE records one sequence's steps after its call row; the elastic \
-             --parallel default may put a parked request's steps after another's; --parallel 1 \
-             names the plain engine"
-                .into(),
-        );
-    };
-    if parallel > 1 {
+    if slots.get() > 1 {
         return Err(format!(
             "BLOOMERY_ROUTE_TRACE records one sequence's steps after its call row; \
-             --parallel {parallel} puts a parked request's steps after another's"
+             --parallel {slots} puts another sequence's steps between them"
         )
         .into());
     }
@@ -536,7 +523,8 @@ fn route_trace(
 
 /// The plan the engine is about to load under the placement's `levers`
 /// (with `reserve`, the DSpark draft's, and `tier_batch`, the tier's
-/// prompt-batch bytes, on its tier card), on stderr;
+/// prompt-batch bytes, on its tier card), `slots` resident sequences of
+/// `ctx` positions each (`PlanInputs::plan_with_slots`), on stderr;
 /// returns its cards' names, the plan's placement for `/props` (`None`,
 /// and a line saying why, when a card's nvidia-smi index cannot be found)
 /// and the plan's host headroom in bytes. Under `residency` (the rule and
@@ -546,14 +534,13 @@ fn route_trace(
 fn print_plan(
     inputs: &PlanInputs,
     place: Place,
-    reserve: Option<u64>,
-    tier_batch: Option<TierBatchBytes>,
-    ctx: usize,
+    (reserve, tier_batch): (Option<u64>, Option<TierBatchBytes>),
+    (ctx, slots): (usize, NonZeroUsize),
     levers: &PlanLevers,
     residency: (Residency, ResidencyPick),
-) -> Result<(String, Option<PlacementProps>, i64, u64), GateError> {
+) -> Result<(String, Option<PlacementProps>, i64), GateError> {
     let machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
-    let plan = inputs.plan(&machine, u64::try_from(ctx)?, levers)?;
+    let plan = inputs.plan_with_slots(&machine, u64::try_from(ctx)?, levers, slots)?;
     record::plan(place.name(), &machine, &plan).eprint();
     let mut host_headroom = plan.host.headroom_bytes;
     if let Some(pool) = swap::churn(&plan, 0, residency.0)? {
@@ -583,14 +570,7 @@ fn print_plan(
     let headroom = i64::try_from(host_headroom)
         .map_err(|_| format!("the plan's host headroom {host_headroom} B passes i64"))?;
     let cards: Vec<&str> = machine.all_cards().map(|c| c.name.as_str()).collect();
-    // One slot's whole-context state, the parked states' budget's unit: the
-    // snapshot's own terms at the ctx the server loads — the plan's KV rows
-    // (each layer's window ring, compressed rows and keys, and the pooling
-    // state), the ring shadows' rows, the history a position a u32.
-    let state = plan.cards.iter().map(|c| c.kv_bytes).sum::<u64>()
-        + plan.host.shadow_bytes
-        + 4 * u64::try_from(ctx).unwrap_or(u64::MAX);
-    Ok((cards.join("+"), placement.ok(), headroom, state))
+    Ok((cards.join("+"), placement.ok(), headroom))
 }
 
 const WHAT: &str = "bloomery-serve-ds41";
@@ -598,7 +578,10 @@ const WHAT: &str = "bloomery-serve-ds41";
 /// What the engine thread opens the seat with.
 struct SeatArgs {
     place: Place,
+    /// A slot's context: the positions each resident sequence serves.
     ctx: usize,
+    /// The resident sequences the plan counts and the load makes.
+    slots: NonZeroUsize,
     cfg: body::OpenCfg,
     pin_main: bool,
     /// The file's `top_k` and layer count, from its headers.
@@ -670,20 +653,20 @@ impl V41 {
         let pinned = a.pin_main && threads::pool().pin_caller();
         let t = Instant::now();
         let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
-        let args = app::OpenArgs {
-            place: a.place.name(),
-            machine: a.place.machine(a.reserve, a.tier_batch)?,
-            ctx: a.ctx,
-            mode: StepMode::Graph,
-            cfg: Ds41Cfg {
-                feed: a.cfg.body.prefill,
-                open: a.cfg.clone(),
-                card_timing: false,
-            },
-        };
+        // The plan counts every resident sequence, which the session's own
+        // open (one sequence) does not: the model is opened here by that
+        // plan, then handed to the session.
+        let machine = a.place.machine(a.reserve, a.tier_batch)?;
+        let mut m = body::open_slots(file, machine, a.ctx, &a.cfg, a.slots)?;
+        m.set_mode(StepMode::Graph);
         let mut log = Log { a: &a, pinned, t };
-        let mut loaded = Loaded::<Body>::open(file, args, &mut log)?
-            .ok_or("bloomery-serve-ds41: the open planned nothing")?;
+        log.load(&m)?;
+        let cfg = Ds41Cfg {
+            feed: a.cfg.body.prefill,
+            open: a.cfg.clone(),
+            card_timing: false,
+        };
+        let mut loaded = Loaded::<Body>::from_model(m, cfg, u32::try_from(a.ctx)?);
         let spark = match &a.draft_file {
             Some(file) => {
                 let (d, load) = open_dspark(&mut loaded, file, &a.path, WHAT, a.place, a.reserve)?;
@@ -718,6 +701,18 @@ impl V41 {
                 return Err("bloomery-serve-ds41: the DSpark draft did not load".into());
             }
         };
+        // The resident sequences, made after the captures: the live slot's
+        // chains stay with it, each other slot capturing on its first use.
+        s.add_slots(a.slots.get())?;
+        let b = s.model().body(WHAT)?;
+        eprintln!(
+            "slots made={} planned={} seq_bytes={} seq_shadow_bytes={} resident_bytes={}",
+            s.slots(),
+            b.slots_planned(),
+            b.seq_bytes(),
+            b.seq_shadow_bytes(),
+            s.model().resident_bytes()
+        );
         Ok(V41 {
             s,
             ctx: a.ctx,
@@ -854,16 +849,31 @@ impl Seat for V41 {
         }
     }
 
-    /// One slot under the DSpark draft ([`Seat::turn_slots`]): a slot's
-    /// state put back starts the draft over, and a turn has no prompt call
-    /// to feed it its window, so the engine's one sequence never survives a
-    /// park. The lookup rebuilds its tables at a turn's first pass, so it
-    /// takes turns like the plain path.
-    fn turn_slots(&self) -> usize {
-        match self.draft {
-            Served::Dspark(_) => 1,
-            Served::Off | Served::Lookup(..) => usize::MAX,
+    /// The resident sequences the load made ([`Session::slots`]): one a
+    /// `--parallel 1` load (and under the DSpark draft), the `--parallel`
+    /// the seat served past it.
+    fn slots(&self) -> usize {
+        self.s.slots()
+    }
+
+    /// The session's slot ([`Session::select_slot`]): the target stands
+    /// on another sequence, so the draft no longer follows it
+    /// ([`V41::moved`]) — the lookup rebuilds its tables from that slot's
+    /// history at its next pass. Selecting the live slot moves nothing.
+    fn select(&mut self, slot: usize) -> Result<(), GateError> {
+        if slot == self.s.selected() {
+            return Ok(());
         }
+        self.s.select_slot(slot)?;
+        self.moved();
+        Ok(())
+    }
+
+    /// The lookup's state is a function of the selected slot's history,
+    /// rebuilt at each select ([`V41::select`]): a slot's drafted passes are
+    /// the passes it would run alone. The DSpark draft serves one slot.
+    fn slot_drafts(&self) -> bool {
+        matches!(self.draft, Served::Lookup(..))
     }
 
     fn reset(&mut self) -> Result<(), GateError> {

@@ -11,6 +11,9 @@
 //! [`PlanInputs::describe`] is the same read without that refusal, for what
 //! only describes a file (its inventory gate).
 
+use std::num::NonZeroUsize;
+
+use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::Split;
 use models::ModelSpec;
 
@@ -107,19 +110,56 @@ impl PlanInputs {
 
     /// The placement of the file on `machine` at `ctx_max` positions under
     /// the placement's `levers`, refused when it cannot be built or breaks an
-    /// invariant.
+    /// invariant: the plan of one resident sequence
+    /// ([`PlanInputs::plan_with_slots`]).
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
     ) -> Result<Plan<'a>, PlaceError> {
-        let plan = placement::plan(&self.model, machine, ctx_max, &self.kv, levers)?;
+        self.plan_with_slots(machine, ctx_max, levers, NonZeroUsize::MIN)
+    }
+
+    /// The placement of a load that serves `slots` resident sequences of
+    /// `ctx_max` positions each: every layer's cache counted `slots` times on
+    /// its card and every ring shadow `slots` times on the host
+    /// ([`SeqTerms::slots_of`] over [`PlanInputs::seq_terms`]), refused as
+    /// [`PlanInputs::plan`] refuses. A sequence holds nothing beside its
+    /// stores, so the card's kv class is `slots` sequences' stores.
+    pub fn plan_with_slots<'a>(
+        &'a self,
+        machine: &'a Machine,
+        ctx_max: u64,
+        levers: &PlanLevers,
+        slots: NonZeroUsize,
+    ) -> Result<Plan<'a>, PlaceError> {
+        let kv = self.seq_terms().slots_of(slots.get() as u64);
+        let plan = placement::plan(&self.model, machine, ctx_max, &kv, levers)?;
         let broken = plan.violations();
         if broken.is_empty() {
             Ok(plan)
         } else {
             Err(PlaceError::Broken(broken))
+        }
+    }
+
+    /// What one resident sequence of a load of the file holds on its card
+    /// ([`SeqTerms`]): its stores over the file's layers ([`KvLayout`]: each
+    /// layer's window ring, compressed rows, index keys and compressor
+    /// state), no draft (the DSpark draft's window is its own card's), and
+    /// nothing beside them — the body's sequence is its layers' caches alone.
+    /// Its ring shadows are host bytes, which [`SeqTerms::slots_of`] counts
+    /// on the host ([`crate::placement::KvBytes::shadow_bytes`]).
+    #[must_use]
+    pub fn seq_terms(&self) -> SeqTerms<'_> {
+        SeqTerms {
+            layers: Stores {
+                kv: &self.kv,
+                count: self.model.layers,
+            },
+            draft: None,
+            beside: 0,
         }
     }
 }

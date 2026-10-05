@@ -1631,7 +1631,7 @@ impl Body {
         let end = runs.last().map_or(b, |r| r.end);
         let joined = runs.windows(2).all(|p| p[0].end == p[1].start);
         let sized = runs.iter().all(|r| (1..=T_MAX).contains(&r.len()));
-        if self.history.len() != b
+        if self.seq.history.len() != b
             || runs.is_empty()
             || runs.len() > sets
             || !joined
@@ -1645,7 +1645,7 @@ impl Body {
                     "a group of batches {runs:?} (each 1..={T_MAX} positions, consecutive, at \
                      most {sets} of them) of {} ids after {} tokens, in caches of {} positions",
                     ids.len(),
-                    self.history.len(),
+                    self.seq.history.len(),
                     self.positions()
                 ),
             });
@@ -1660,16 +1660,7 @@ impl Body {
                 missing: "a call's needs that cover the group (begin_call)",
             });
         }
-        if self.restore {
-            for run in self.holds.stale_runs(b) {
-                for (i, layer) in self.kv.iter_mut().enumerate() {
-                    self.shadows
-                        .restore(i, &mut layer.ring, stream, run.clone())?;
-                }
-                run.for_each(|q| self.holds.ring_wrote(q));
-            }
-            self.restore = false;
-        }
+        self.seq.restore_before(stream, b)?;
         let mut members: Vec<Member> = runs
             .iter()
             .enumerate()
@@ -1686,7 +1677,7 @@ impl Body {
         self.plan_group(stream, ids, &members)?;
         let prologue = nanos(t0.elapsed());
         for p in b..end {
-            self.holds.wrote(p);
+            self.seq.holds.wrote(p);
         }
         if let Some(tap) = self.tap.as_mut() {
             tap.pos = [None; PAIR_ROWS];
@@ -1802,9 +1793,8 @@ impl Body {
         let Body {
             batch,
             planner,
-            history,
+            seq: Seq { history, holes, .. },
             file,
-            holes,
             need,
             ..
         } = self;
@@ -1820,9 +1810,9 @@ impl Body {
             for (plan, r) in batch.plans.iter_mut().zip(&m.cuts) {
                 let toks = &ids[r.start - first..r.end - first];
                 planner
-                    .plan_into(toks, r.start as u32, history, plan)
+                    .plan_into(toks, r.start as u32, history.ids(), plan)
                     .map_err(|e| GpuError::plan(WHAT, e))?;
-                history.extend_from_slice(toks);
+                history.extend(toks);
             }
             batch.rows.fill(file, &batch.plans[..n])?;
             for (k, r) in m.cuts.iter().enumerate() {
@@ -1871,8 +1861,7 @@ impl Body {
         let on_tier = self.tier_counts()?;
         let Body {
             layers,
-            kv,
-            shadows,
+            seq: Seq { kv, shadows, .. },
             steps,
             slots,
             hybrid,

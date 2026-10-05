@@ -1,11 +1,14 @@
-//! The body's sequence state as a value: what a cut keeps ([`keep_rule`],
-//! with the reason it keeps less, [`KeepLimit`]), the whole state saved to the
-//! host ([`snapshot`]) and put back ([`resume`]), and where a prompt call is
-//! cut so a position inside it stays keepable ([`Body::prefill_splits`]).
+//! The body's sequence state as a value: the live sequence's state as one
+//! value ([`Seq`]), which the model's resident slots exchange by pointer
+//! moves ([`Slots`]); what a cut keeps ([`keep_rule`], with the reason it
+//! keeps less, [`KeepLimit`]); the whole state saved to the host
+//! ([`snapshot`]) and put back ([`resume`]); and where a prompt call is cut
+//! so a position inside it stays keepable ([`Body::prefill_splits`]).
 //!
 //! The state a later step reads, as [`ChainBody::reset`] empties it:
 //!
-//! - saved: per layer the window ring, the compressed rows and index keys of
+//! - one sequence's own ([`Seq`]), saved and exchanged: per layer the window
+//!   ring, the compressed rows and index keys of
 //!   the positions held (`⌈n / ratio⌉` rows; a row past them is written by the
 //!   step that completes it before any step reads it), the compressor state;
 //!   the ring shadows' rows a cut may restore (from `shadow_from`, outside the
@@ -18,21 +21,283 @@
 //!   completes — and a prompt call's needs, which the call's start sets;
 //! - a failed step's refusal and the fault word: [`resume`] resets first,
 //!   and a snapshot of a poisoned model or of a step whose rows failed is
-//!   refused.
+//!   refused. Whether a step's rows failed belongs to the sequence it ran on
+//!   ([`Seq`]); the fault word and the host tier's poison are the model's.
+//!
+//! Nothing the body captures records a sequence's buffers: the step and the
+//! pair pass are the model's captures, one cache a slot, so [`Seq`] carries
+//! none ([`Slots::Seq`]'s contract).
 //!
 //! [`ChainBody::reset`]: bloomery_gpu::model::ChainBody::reset
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
+use bloomery_gpu::model::Slots;
 use bloomery_gpu::{Gpu, GpuError};
-use cuda_core::{DeviceBuffer, DeviceCopy};
+use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
+use model::arch::deepseek41::hparams::Hparams;
 
 use super::prefill::batches;
-use super::{Body, Deepseek41Model, Holds, PAIR_ROWS};
+use super::{Body, Deepseek41Model, Holds, LayerKv, PAIR_ROWS, Shadows, layer_kv};
 use crate::span::{span, span_mut};
 
 const WHAT: &str = "deepseek41 sequence state";
+
+/// The tokens a sequence holds, one per position: what each step's engram
+/// n-grams read back from (`Planner::plan_into`'s `before`), cut, cleared and
+/// saved with the sequence. The one owner of the sequence's per-position
+/// record: vision's engram mask (the image positions whose engram step is
+/// off) joins it here as a second per-position field, cut and cleared with
+/// the ids.
+#[derive(Clone, Debug, Default, Hash)]
+pub(super) struct History {
+    ids: Vec<u32>,
+}
+
+impl History {
+    /// An empty history with room for `positions` tokens.
+    fn with_capacity(positions: usize) -> History {
+        History {
+            ids: Vec::with_capacity(positions),
+        }
+    }
+
+    /// The tokens, in position order.
+    pub(super) fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    /// The token at the next position.
+    pub(super) fn push(&mut self, id: u32) {
+        self.ids.push(id);
+    }
+
+    /// `ids` at the next positions, in order.
+    pub(super) fn extend(&mut self, ids: &[u32]) {
+        self.ids.extend_from_slice(ids);
+    }
+
+    /// The positions from `n` on taken back.
+    pub(super) fn truncate(&mut self, n: usize) {
+        self.ids.truncate(n);
+    }
+
+    /// No position.
+    pub(super) fn clear(&mut self) {
+        self.ids.clear();
+    }
+
+    /// Exactly `ids`, from position 0.
+    pub(super) fn set(&mut self, ids: &[u32]) {
+        self.ids.clear();
+        self.ids.extend_from_slice(ids);
+    }
+}
+
+/// One sequence's state (the module comment's own parts): every layer's
+/// cache and its ring shadow, the token history, which position each ring
+/// and state slot holds, where the shadow is written from and its holes, a
+/// pending ring restore, and whether a step's rows failed on it. The body
+/// holds the live one; each resident slot past it holds its own, exchanged
+/// with the live one by pointer moves ([`Slots::swap_seq`]).
+pub struct Seq {
+    /// Per layer of the body's layers, in order.
+    pub(super) kv: Vec<LayerKv>,
+    /// Every layer's ring shadow, in page-locked host memory.
+    pub(super) shadows: Shadows,
+    /// The tokens decoded so far: `ctx_max` reserved.
+    pub(super) history: History,
+    /// Which position's row each ring slot and each compressor state slot
+    /// holds, as the steps refreshed since the last known state left them.
+    pub(super) holds: Holds,
+    /// The first position whose shadow row a step of the current history
+    /// wrote: rows below it hold nothing a cut may restore (a caller wrote
+    /// the caches itself, [`Body::set_history`]).
+    pub(super) shadow_from: usize,
+    /// Positions of the history whose shadow rows some layer never wrote:
+    /// each prompt call's [`super::Need::hole`], in position order. A cut
+    /// whose restore reads one is not granted.
+    pub(super) holes: Vec<Range<usize>>,
+    /// A cut left ring slots the next step reads holding other positions'
+    /// rows: the next refresh restores them before the step runs.
+    pub(super) restore: bool,
+    /// A step's rows failed after its launch: the card ran it on the rows
+    /// the staging held before, and every step on this sequence is refused
+    /// until its reset.
+    pub(super) rows_failed: bool,
+}
+
+impl Seq {
+    /// A sequence of `layers` of the model `hp` describes at `ctx_max`
+    /// positions in the state the load leaves: zeroed caches and shadows, no
+    /// history, the slots' record over the streams of `ratios`. Allocates on
+    /// `gpu`'s card and pins host memory: load-time only.
+    pub(super) fn new(
+        gpu: &Gpu,
+        hp: &Hparams,
+        layers: Range<usize>,
+        ctx_max: usize,
+        ratios: &[u32],
+    ) -> Result<Seq, GpuError> {
+        gpu.context().bind_to_thread()?;
+        let stream = gpu.stream();
+        let kv = layers
+            .clone()
+            .map(|l| layer_kv(stream, hp, l, ctx_max))
+            .collect::<Result<Vec<_>, _>>()?;
+        let shadows = Shadows::new(gpu, layers.len(), ctx_max, hp.head_dim)?;
+        let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
+        Ok(Seq {
+            kv,
+            shadows,
+            history: History::with_capacity(ctx_max),
+            holds: Holds::new(ring_rows, ratios),
+            shadow_from: 0,
+            holes: Vec::new(),
+            restore: false,
+            rows_failed: false,
+        })
+    }
+
+    /// Rows of each layer's window ring.
+    pub(super) fn ring_rows(&self) -> usize {
+        self.holds.ring.len()
+    }
+
+    /// Device bytes: every layer's cache and compressor state.
+    pub(super) fn device_bytes(&self) -> usize {
+        self.kv
+            .iter()
+            .map(|l| l.buffers().iter().map(|&(_, n)| n).sum::<usize>())
+            .sum()
+    }
+
+    /// Page-locked host bytes: every layer's ring shadow.
+    pub(super) fn shadow_bytes(&self) -> usize {
+        self.shadows.host.num_bytes()
+    }
+
+    /// Back to the state the load leaves, on `stream`: every cache zeroed in
+    /// place (a captured chain keeps their addresses), the history emptied,
+    /// the record of a known empty state. The shadows keep their rows: a cut
+    /// reads only rows a step since wrote.
+    pub(super) fn clear(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        for layer in &mut self.kv {
+            layer.zero(stream)?;
+        }
+        self.history.clear();
+        self.holds.known(0);
+        self.shadow_from = 0;
+        self.holes.clear();
+        self.restore = false;
+        self.rows_failed = false;
+        Ok(())
+    }
+
+    /// Before the step or batch whose first position is `at`: the ring slots
+    /// a cut left holding other positions' rows put back from the shadows,
+    /// host to device on `stream`, when a restore is pending.
+    pub(super) fn restore_before(
+        &mut self,
+        stream: &CudaStream,
+        at: usize,
+    ) -> Result<(), GpuError> {
+        if !self.restore {
+            return Ok(());
+        }
+        for run in self.holds.stale_runs(at) {
+            for (i, layer) in self.kv.iter_mut().enumerate() {
+                self.shadows
+                    .restore(i, &mut layer.ring, stream, run.clone())?;
+            }
+            run.for_each(|q| self.holds.ring_wrote(q));
+        }
+        self.restore = false;
+        Ok(())
+    }
+}
+
+impl Slots for Body {
+    type Seq = Seq;
+
+    /// A sequence of the live one's shape at the load's `ctx_max`, in the
+    /// state the load leaves ([`Seq::new`]); refused by name past the
+    /// sequences the load's plan counts ([`Body::open_placed_slots`]), the
+    /// live one included.
+    fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
+        if self.slots_made >= self.slots_planned {
+            return Err(GpuError::Shape {
+                what: "deepseek41 Body::new_seq",
+                detail: format!(
+                    "sequence {} of a plan that counts {} slots; plan the load for as many \
+                     resident sequences as it serves (body::open_slots)",
+                    self.slots_made + 1,
+                    self.slots_planned
+                ),
+            });
+        }
+        let seq = Seq::new(
+            gpu,
+            &self.hp,
+            self.layers.clone(),
+            self.positions(),
+            self.planner.stream_ratios(),
+        )?;
+        self.slots_made += 1;
+        Ok(seq)
+    }
+
+    /// The pointer form of a save and a load: the rows in flight delivered
+    /// first, as a save takes them — a failure there is returned with
+    /// nothing exchanged, and marks the live sequence's rows failed — then
+    /// the live sequence and `seq` exchanged, and what a load clears
+    /// cleared: the last call's needs and the feature rows' positions, which
+    /// were the other sequence's. No device work.
+    fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
+        self.arrive()?;
+        self.rows.finish()?;
+        std::mem::swap(&mut self.seq, seq);
+        self.need = None;
+        if let Some(tap) = self.tap.as_mut() {
+            tap.pos = [None; PAIR_ROWS];
+        }
+        Ok(())
+    }
+
+    /// The live sequence's device bytes ([`Seq`]'s caches and compressor
+    /// states); its ring shadows are page-locked host memory
+    /// ([`Body::seq_shadow_bytes`]).
+    fn seq_bytes(&self) -> usize {
+        self.seq.device_bytes()
+    }
+}
+
+impl Body {
+    /// Page-locked host bytes one sequence holds: its ring shadows, which
+    /// the plan counts on the host (`KvBytes::shadow_bytes`) and
+    /// [`Slots::seq_bytes`] leaves out.
+    #[must_use]
+    pub fn seq_shadow_bytes(&self) -> usize {
+        self.seq.shadow_bytes()
+    }
+
+    /// The resident sequences the load's plan counts
+    /// ([`Body::open_placed_slots`]): the most the model makes.
+    #[must_use]
+    pub fn slots_planned(&self) -> usize {
+        self.slots_planned
+    }
+}
 
 /// Why [`Body::keep_point`] keeps less than it was asked: the last rule that
 /// moved the cut down.
@@ -138,11 +403,36 @@ pub struct SeqSnapshot {
     /// The shadow positions saved, as runs; per run, per layer, its rows.
     runs: Vec<Range<usize>>,
     shadow: Vec<u16>,
-    history: Vec<u32>,
+    history: History,
     holds: Holds,
     shadow_from: usize,
     holes: Vec<Range<usize>>,
     restore: bool,
+}
+
+/// Every part a save copies, in the order [`snapshot`] lays it out, the f32
+/// states by their bits: two snapshots hash alike when a [`resume`] of either
+/// puts back the same sequence.
+impl Hash for SeqSnapshot {
+    fn hash<H: Hasher>(&self, h: &mut H) {
+        self.layers.hash(h);
+        for l in &self.kv {
+            l.ring.hash(h);
+            l.rows.hash(h);
+            l.keys.hash(h);
+            for v in l.values.iter().chain(&l.scores) {
+                v.to_bits().hash(h);
+            }
+        }
+        self.width.hash(h);
+        self.runs.hash(h);
+        self.shadow.hash(h);
+        self.history.hash(h);
+        self.holds.hash(h);
+        self.shadow_from.hash(h);
+        self.holes.hash(h);
+        self.restore.hash(h);
+    }
 }
 
 impl SeqSnapshot {
@@ -219,10 +509,10 @@ impl Body {
     #[must_use]
     pub fn keep_why(&self, n: usize) -> (usize, Option<KeepLimit>) {
         keep_rule(
-            self.history.len(),
-            &self.holds,
-            self.shadow_from,
-            &self.holes,
+            self.seq.history.len(),
+            &self.seq.holds,
+            self.seq.shadow_from,
+            &self.seq.holes,
             n,
         )
     }
@@ -255,7 +545,7 @@ impl Body {
         marks: &[usize],
         min: usize,
     ) -> Vec<usize> {
-        let window = self.holds.ring.len();
+        let window = self.seq.holds.ring.len();
         let mut at = Vec::new();
         let mut from = first;
         for &u in marks {
@@ -277,16 +567,16 @@ impl Body {
     fn save(&mut self, gpu: &Gpu) -> Result<SeqSnapshot, GpuError> {
         self.arrive()?;
         self.rows.finish()?;
-        if self.rows_failed {
+        if self.seq.rows_failed {
             return Err(GpuError::State {
                 what: WHAT,
                 missing: "a reset: an earlier step's engram rows failed after its launch",
             });
         }
         gpu.stream().synchronize()?;
-        let n = self.history.len();
-        let mut kv = Vec::with_capacity(self.kv.len());
-        for (i, l) in self.kv.iter().enumerate() {
+        let n = self.seq.history.len();
+        let mut kv = Vec::with_capacity(self.seq.kv.len());
+        for (i, l) in self.seq.kv.iter().enumerate() {
             let layer = self.layers.start + i;
             let held = |rows: usize| -> Result<usize, GpuError> {
                 let ratio = self.hp.layers.get(layer).map_or(0, |k| k.ratio() as usize);
@@ -318,9 +608,9 @@ impl Body {
                 scores: whole(l.scores.as_ref())?,
             });
         }
-        let runs = kept_runs(self.shadow_from, n, &self.holes);
-        let (width, per) = (self.shadows.width, self.shadows.rows);
-        let layers = self.kv.len();
+        let runs = kept_runs(self.seq.shadow_from, n, &self.seq.holes);
+        let (width, per) = (self.seq.shadows.width, self.seq.shadows.rows);
+        let layers = self.seq.kv.len();
         let total = runs.iter().map(|r| r.len()).sum::<usize>() * layers * width;
         let mut shadow: Vec<u16> = Vec::new();
         shadow
@@ -329,7 +619,7 @@ impl Body {
                 what: WHAT,
                 detail: format!("{total} shadow values of host memory for a snapshot: {e}"),
             })?;
-        let host = self.shadows.host.as_slice();
+        let host = self.seq.shadows.host.as_slice();
         for r in &runs {
             for i in 0..layers {
                 let at = (i * per + r.start) * width;
@@ -342,11 +632,11 @@ impl Body {
             width,
             runs,
             shadow,
-            history: self.history.clone(),
-            holds: self.holds.clone(),
-            shadow_from: self.shadow_from,
-            holes: self.holes.clone(),
-            restore: self.restore,
+            history: self.seq.history.clone(),
+            holds: self.seq.holds.clone(),
+            shadow_from: self.seq.shadow_from,
+            holes: self.seq.holes.clone(),
+            restore: self.seq.restore,
         })
     }
 
@@ -356,10 +646,10 @@ impl Body {
     fn load(&mut self, gpu: &Gpu, s: &SeqSnapshot) -> Result<(), GpuError> {
         let n = s.history.len();
         let fits = s.layers == self.layers
-            && s.kv.len() == self.kv.len()
-            && s.width == self.shadows.width
-            && s.runs.last().is_none_or(|r| r.end <= self.shadows.rows)
-            && s.kv.iter().zip(&self.kv).all(|(a, b)| {
+            && s.kv.len() == self.seq.kv.len()
+            && s.width == self.seq.shadows.width
+            && s.runs.last().is_none_or(|r| r.end <= self.seq.shadows.rows)
+            && s.kv.iter().zip(&self.seq.kv).all(|(a, b)| {
                 a.ring.len() == b.ring.buf().len()
                     && a.values.len() == b.values.as_ref().map_or(0, |t| t.buf().len())
                     && a.scores.len() == b.scores.as_ref().map_or(0, |t| t.buf().len())
@@ -375,13 +665,13 @@ impl Body {
                     s.kv.len(),
                     s.width,
                     self.layers,
-                    self.kv.len(),
-                    self.shadows.width,
+                    self.seq.kv.len(),
+                    self.seq.shadows.width,
                     self.positions()
                 ),
             });
         }
-        for (l, saved) in self.kv.iter_mut().zip(&s.kv) {
+        for (l, saved) in self.seq.kv.iter_mut().zip(&s.kv) {
             write(gpu, l.ring.buf_mut(), &saved.ring)?;
             if let Some(t) = l.rows.as_mut() {
                 write(gpu, t.buf_mut(), &saved.rows)?;
@@ -398,8 +688,12 @@ impl Body {
         }
         // No step in flight writes a shadow row while the host does.
         gpu.stream().synchronize()?;
-        let (width, per, layers) = (self.shadows.width, self.shadows.rows, self.kv.len());
-        let host = self.shadows.host.as_mut_slice();
+        let (width, per, layers) = (
+            self.seq.shadows.width,
+            self.seq.shadows.rows,
+            self.seq.kv.len(),
+        );
+        let host = self.seq.shadows.host.as_mut_slice();
         let mut from = 0;
         for r in &s.runs {
             for i in 0..layers {
@@ -409,12 +703,11 @@ impl Body {
                 from += len;
             }
         }
-        self.history.clear();
-        self.history.extend_from_slice(&s.history);
-        self.holds.clone_from(&s.holds);
-        self.shadow_from = s.shadow_from;
-        self.holes.clone_from(&s.holes);
-        self.restore = s.restore;
+        self.seq.history.clone_from(&s.history);
+        self.seq.holds.clone_from(&s.holds);
+        self.seq.shadow_from = s.shadow_from;
+        self.seq.holes.clone_from(&s.holes);
+        self.seq.restore = s.restore;
         self.need = None;
         if let Some(tap) = self.tap.as_mut() {
             tap.pos = [None; PAIR_ROWS];

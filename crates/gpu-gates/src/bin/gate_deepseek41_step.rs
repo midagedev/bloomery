@@ -105,6 +105,24 @@
 //! - `--skew-structure`, `--skew-sets`, `--skew-api` (C4): the pair pass's
 //!   clauses (`shared/ds41_skew.rs`) on the same load, after the clauses
 //!   above, from a reset.
+//! - `--slots`, alone (the other clauses pin the gate placement of one
+//!   sequence; refused by name beside them): the resident slots (`Slots for
+//!   Body`) through the slot harness (`bloomery_gpu_gates::slots_gate`: H1
+//!   interleave, H3 bytes, H4 reset, H6 refusals, H7 captures) on a load whose
+//!   plan counts two sequences (`body::open_slots`), the residency off as the
+//!   gate placement runs it. Its two streams are two prompts of one length
+//!   fed as one step, then greedy to [`SLOT_POSITIONS`] positions, past the
+//!   window ring's rows and the largest compression ratio (both checked: every
+//!   ring wraps, every layer kind writes and reads its compressed rows); a
+//!   slot's state is the body's own snapshot, digested (`SeqSnapshot`'s
+//!   `Hash`: every part a save copies). Between the harness's halves, the
+//!   V4.1 facts: a third sequence past the plan refused by name; the plan of
+//!   two counts each sequence's stores on the card (`SeqTerms::plan_kv`) and
+//!   its page-locked ring shadows on the host (Σ `KvLayout::shadow_bytes`,
+//!   which `Body::seq_shadow_bytes` is); the last slot's state saved
+//!   (`body::snapshot`), the slot rewound and run on the other stream's
+//!   prompt while slot 0 steps on, then put back (`body::resume`): both
+//!   slots continue their solo runs.
 //!
 //! The envelope (G1). Each sub-layer adds to the streams its own rule
 //! difference from ik's, and carries on the one it read. A rule difference is
@@ -166,6 +184,8 @@ mod skew;
 mod gate {
     use crate::shadow;
     use crate::skew;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -189,6 +209,7 @@ mod gate {
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order, count_kinds};
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
+    use bloomery_gpu_gates::slots_gate::{self, Derived, Interleaved, SlotsAdapter};
     use bloomery_gpu_gates::{
         GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, checks_failed, data_dir,
         patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
@@ -206,7 +227,7 @@ mod gate {
     use model::arch::deepseek41::names;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::plan::{Planner, StepPlan};
-    use model::placement::workstation;
+    use model::placement::{KvBytes, workstation};
 
     // ------------------------------------------------------------ constants
 
@@ -256,11 +277,12 @@ mod gate {
         select: bool,
         ppl: Option<String>,
         skew: skew::Clauses,
+        slots: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--ppl TAG] \
-             [--skew-structure] [--skew-sets] [--skew-api]";
+             [--skew-structure] [--skew-sets] [--skew-api] [--slots]";
         let mut a = Args {
             structure: false,
             sets: false,
@@ -271,6 +293,7 @@ mod gate {
                 sets: false,
                 api: false,
             },
+            slots: false,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -281,6 +304,7 @@ mod gate {
                 "--skew-structure" => a.skew.structure = true,
                 "--skew-sets" => a.skew.sets = true,
                 "--skew-api" => a.skew.api = true,
+                "--slots" => a.slots = true,
                 "--ppl" => {
                     a.ppl = Some(
                         it.next()
@@ -290,8 +314,17 @@ mod gate {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.structure || a.sets || a.select || a.ppl.is_some() || a.skew.any()) {
+        let others = a.structure || a.sets || a.select || a.ppl.is_some() || a.skew.any();
+        if !(others || a.slots) {
             return Err(USAGE.into());
+        }
+        if others && a.slots {
+            return Err(format!(
+                "--slots beside another clause: its load's plan counts {} sequences, and the \
+                 other clauses pin the gate placement of one; run it alone: {USAGE}",
+                slots_gate::STREAMS
+            )
+            .into());
         }
         Ok(a)
     }
@@ -322,6 +355,9 @@ mod gate {
         let split = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&split)?;
         let inputs = PlanInputs::read(&split)?;
+        if args.slots {
+            return slots_run(&path, &hp, &inputs, &cfg);
+        }
         let machine = workstation::plan_gate(inputs.model.layers);
         let plan = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
         let planned = &plan.cards[0];
@@ -387,6 +423,223 @@ mod gate {
         }
         println!("PASSED: gate_deepseek41_step");
         Ok(())
+    }
+
+    // ----------------------------------------------------------- the slots
+
+    /// The two streams' prompts, of one length, each fed as one step.
+    const SLOT_PROMPTS: [[u32; 8]; slots_gate::STREAMS] = [
+        [4_096, 9_001, 12_345, 2_026, 777, 31_337, 1_234, 56_789],
+        [
+            10_000, 20_000, 30_000, 40_000, 50_000, 60_000, 70_000, 80_000,
+        ],
+    ];
+    /// The positions each stream holds at the end of the harness's
+    /// interleave: past the window ring's rows (the file's
+    /// `attention.sliding_window`) and the largest compression ratio, both
+    /// checked, so every ring wraps and every layer kind writes and reads its
+    /// compressed rows.
+    const SLOT_POSITIONS: usize = 160;
+
+    /// The V4.1 body for the slot harness ([`slots_gate`]): the gate
+    /// placement's load of `body::open_slots` at the serving context, the
+    /// streams' prompts fed as steps, a slot's state the body's own snapshot
+    /// digested (every part a save copies).
+    struct SlotsV41<'a> {
+        path: &'a str,
+        inputs: &'a PlanInputs,
+        cfg: &'a body::OpenCfg,
+    }
+
+    impl SlotsAdapter for SlotsV41<'_> {
+        type Body = Body;
+
+        const STEPS: usize = SLOT_POSITIONS - SLOT_PROMPTS[0].len();
+        const TAIL: usize = 8;
+
+        fn open(&self, slots: usize) -> Result<Deepseek41Model, GateError> {
+            let slots = NonZeroUsize::new(slots).ok_or("a load of no sequence")?;
+            let file = Split::open(self.path).map_err(|e| format!("open {}: {e}", self.path))?;
+            let ctx = usize::try_from(CTX_MAX)?;
+            Ok(body::open_slots(
+                file,
+                workstation::plan_gate,
+                ctx,
+                self.cfg,
+                slots,
+            )?)
+        }
+
+        fn rewind(&self, m: &mut Deepseek41Model) -> Result<(), GateError> {
+            Ok(m.reset()?)
+        }
+
+        fn prompt(&self, m: &mut Deepseek41Model, stream: usize) -> Result<u32, GateError> {
+            let ids = SLOT_PROMPTS.get(stream).ok_or_else(|| {
+                format!("the V4.1 slots clauses run streams 0 and 1, not {stream}")
+            })?;
+            Ok(m.step(ids)?)
+        }
+
+        fn state_hash(&self, m: &mut Deepseek41Model) -> Result<u64, GateError> {
+            let mut h = DefaultHasher::new();
+            body::snapshot(m)?.hash(&mut h);
+            Ok(h.finish())
+        }
+
+        /// Every layer's cache at the load's context, as `KvLayout` (the
+        /// plan's owner of a layer's bytes) gives it.
+        fn seq_bytes_derived(&self, _m: &Deepseek41Model) -> Result<Derived, GateError> {
+            let layers = self.inputs.model.layers;
+            let bytes: u64 = (0..layers)
+                .map(|l| self.inputs.kv.layer_bytes(l, CTX_MAX))
+                .sum();
+            Ok(Derived {
+                bytes: usize::try_from(bytes)?,
+                terms: format!("Σ KvLayout::layer_bytes over {layers} layers at {CTX_MAX}"),
+            })
+        }
+
+        fn seq_terms_bytes(&self, _m: &Deepseek41Model) -> Result<Option<usize>, GateError> {
+            Ok(Some(usize::try_from(
+                self.inputs.seq_terms().bytes(CTX_MAX, 1),
+            )?))
+        }
+    }
+
+    /// The `--slots` clauses (module header): the harness's contracts on a
+    /// load whose plan counts two sequences, the V4.1 facts between its
+    /// halves.
+    fn slots_run(
+        path: &str,
+        hp: &Hparams,
+        inputs: &PlanInputs,
+        cfg: &body::OpenCfg,
+    ) -> Result<(), GateError> {
+        let ratio = hp
+            .layers
+            .iter()
+            .map(|k| k.ratio() as usize)
+            .max()
+            .unwrap_or(0);
+        if SLOT_POSITIONS <= hp.window.max(ratio) {
+            return Err(format!(
+                "the slots streams' {SLOT_POSITIONS} positions do not run past the file's window \
+                 of {} rows and its largest compression ratio {ratio}",
+                hp.window
+            )
+            .into());
+        }
+        let adapter = SlotsV41 { path, inputs, cfg };
+        // PIN(2026-10-05): the interleave, bytes and reset clauses this gate wrote
+        // for V4.1 moved to slots_gate H1/H3/H4; H6/H7 (refusals, captures) are the
+        // harness's for every body.
+        let mut s = slots_gate::interleave(&adapter)?;
+        let mut pass = past_the_plan(s.model())?;
+        pass &= slot_plan(s.model(), inputs, cfg)?;
+        pass &= put_back(&mut s)?;
+        pass &= s.finish()?;
+        if !pass {
+            return Err(checks_failed());
+        }
+        println!("PASSED: gate_deepseek41_step");
+        Ok(())
+    }
+
+    /// A sequence past the ones the load's plan counts, refused by name
+    /// (`Slots::new_seq`): card and page-locked host memory nothing reserved.
+    fn past_the_plan(m: &mut Deepseek41Model) -> Result<bool, GateError> {
+        let n = slots_gate::STREAMS;
+        let past = m.add_slots(n + 1);
+        let refused = matches!(&past, Err(e) if e.to_string().contains(&format!(
+            "of a plan that counts {n} slots"
+        ))) && m.slots() == n;
+        println!(
+            "slots past the plan: add_slots({}) {}; slots {} {}",
+            n + 1,
+            match &past {
+                Ok(()) => "made it".to_string(),
+                Err(e) => format!("refused: {e}"),
+            },
+            m.slots(),
+            verdict(refused)
+        );
+        Ok(refused)
+    }
+
+    /// The plan of two sequences against one: the card's kv class is each
+    /// sequence's stores (`SeqTerms::plan_kv`), the host's ring shadows each
+    /// sequence's page-locked shadows (Σ `KvLayout::shadow_bytes`, which
+    /// the load's `Body::seq_shadow_bytes` holds), and one sequence is the
+    /// plan every other clause loads by.
+    fn slot_plan(
+        m: &Deepseek41Model,
+        inputs: &PlanInputs,
+        cfg: &body::OpenCfg,
+    ) -> Result<bool, GateError> {
+        let n = slots_gate::STREAMS;
+        let machine = workstation::plan_gate(inputs.model.layers);
+        let one = inputs.plan(&machine, CTX_MAX, &cfg.place)?;
+        let two = inputs.plan_with_slots(
+            &machine,
+            CTX_MAX,
+            &cfg.place,
+            NonZeroUsize::new(n).ok_or("a plan of no sequence")?,
+        )?;
+        let terms = inputs.seq_terms();
+        let shadows: u64 = (0..inputs.model.layers)
+            .map(|l| inputs.kv.shadow_bytes(l, CTX_MAX))
+            .sum();
+        let held = u64::try_from(m.body("gate_deepseek41_step slots")?.seq_shadow_bytes())?;
+        let n = n as u64;
+        let card = one.cards[0].kv_bytes == terms.plan_kv(CTX_MAX, 1)
+            && two.cards[0].kv_bytes == terms.plan_kv(CTX_MAX, n);
+        let host = held == shadows
+            && one.host.shadow_bytes == shadows
+            && two.host.shadow_bytes == n * shadows;
+        println!(
+            "slots plan: the card's kv class {} of one sequence, {} of {n} (SeqTerms::plan_kv \
+             {} and {}); one sequence's page-locked shadows {held} (KvLayout sum {shadows}), \
+             the host's {} of one sequence and {} of {n} {}",
+            one.cards[0].kv_bytes,
+            two.cards[0].kv_bytes,
+            terms.plan_kv(CTX_MAX, 1),
+            terms.plan_kv(CTX_MAX, n),
+            one.host.shadow_bytes,
+            two.host.shadow_bytes,
+            verdict(card && host)
+        );
+        Ok(card && host)
+    }
+
+    /// The last slot's state saved (`body::snapshot`), the slot rewound and
+    /// run on stream 0's prompt while slot 0 steps on, then put back
+    /// (`body::resume`): slot 0's continuation and the last slot's are their
+    /// solo runs'.
+    fn put_back(s: &mut Interleaved<'_, SlotsV41<'_>>) -> Result<bool, GateError> {
+        let last = slots_gate::STREAMS - 1;
+        let m = s.model();
+        m.select_slot(last)?;
+        let saved = body::snapshot(m)?;
+        m.reset()?;
+        m.step(&SLOT_PROMPTS[0])?;
+        let beside = s.continues(0)?;
+        let m = s.model();
+        m.select_slot(last)?;
+        body::resume(m, &saved)?;
+        let back = s.continues(last)?;
+        println!(
+            "slots put back: slot {last} saved at {} positions, rewound and run on stream 0's \
+             prompt, put back: slot 0's next {} ids {} its solo run's, slot {last}'s next {} \
+             ids {} its solo run's {}",
+            saved.positions(),
+            SlotsV41::TAIL,
+            if beside { "are" } else { "are not" },
+            SlotsV41::TAIL,
+            if back { "are" } else { "are not" },
+            verdict(beside && back)
+        );
+        Ok(beside && back)
     }
 
     // ----------------------------------------------------------- the fault

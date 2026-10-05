@@ -1153,7 +1153,7 @@ gate-gpu-ds41-chain-attn:
 # then the deep cuts. One load.
 [group('v41-load')]
 gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-sets --skew-api':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && bash tools/gpu-gate.sh gate_deepseek41_step --slots'
 
 # V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
 # The gate plan puts each layer's id prefix [0, n_l) on the card; the tier plan moves its last 23 ids (n_l−23 … n_l) to
