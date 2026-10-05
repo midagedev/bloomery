@@ -1938,16 +1938,20 @@ mod gate {
     const SLOT_B: usize = 1056;
 
     /// Greedy steps a stream takes past its prompt in the interleave, and
-    /// of one continuation check: each solo run steps `SLOT_STEPS + 2 ·
-    /// SLOT_TAIL` (`slots_gate`), inside [`CTX`] for B.
+    /// of one continuation check: each solo run steps `SLOT_STEPS + 3 ·
+    /// SLOT_TAIL` (`slots_gate`'s `solo`), inside [`CTX`] for B.
     const SLOT_STEPS: usize = 16;
-    const SLOT_TAIL: usize = 8;
+    // PIN(2026-10-05): 8 -> 5. The harness's solo run grew to STEPS + 3·TAIL
+    // (msp2's H2 tail); B's 1056 + 16 + 3·8 = 1096 stepped past the 1088-row
+    // cache ("GpuModel::step: pos 1088 + 1 exceeds"), and 1056 + 16 + 3·5 =
+    // 1087 fits. The checks keep their shape; each continuation reads 5 ids.
+    const SLOT_TAIL: usize = 5;
 
     const _: () = assert!(
         SLOT_A >= U_GATE + 9
             && SLOT_B >= U_GATE + 9
-            && SLOT_A + SLOT_STEPS + 2 * SLOT_TAIL <= CTX
-            && SLOT_B + SLOT_STEPS + 2 * SLOT_TAIL <= CTX
+            && SLOT_A + SLOT_STEPS + 3 * SLOT_TAIL <= CTX
+            && SLOT_B + SLOT_STEPS + 3 * SLOT_TAIL <= CTX
     );
 
     /// Qwen3.6's adapter: the whole-card load at [`CTX`] with the
