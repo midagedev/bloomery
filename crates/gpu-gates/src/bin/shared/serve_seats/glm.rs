@@ -189,7 +189,7 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{SlotRows, StepMode};
 use bloomery_gpu_gates::bind::{
     CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
-    pass_rows_in_turn, placement_props, sampler_factory, step_rows_in_turn,
+    placement_props, sampler_factory,
 };
 use bloomery_gpu_gates::generate::{Place, mode_name, with_cards};
 use bloomery_gpu_gates::record::{self, Record};
@@ -1187,56 +1187,57 @@ impl Seat for Glm {
         self.stats
     }
 
-    /// One round of several slots: one pass of the busy rows on a plain load
-    /// ([`Rounds::Steps`], through `serve_seats::rounds::step_rows_one_pass`
-    /// — cut at the body's [`SlotRows::MAX_ROWS`], the rows' answers and
-    /// lent logits rows from the pass's own per-row heads, slot 0 left
-    /// selected), else the seat's fallback — a select and a step a row — the
-    /// NextN load's step round, whose body refuses a pass of plain steps by
-    /// name (each of its slots is drafted, and such a pass tells no slot's
-    /// draft what it ran). A refusal on either path is the server's to die
-    /// on: the open decides once, so a load that cannot run one pass never
-    /// tries it at run time.
+    /// One round of several slots ([`super::rounds::step_round`]): one pass
+    /// of the busy rows on a plain load ([`Rounds::Steps`], through
+    /// `serve_seats::rounds::step_rows_one_pass` — cut at the body's
+    /// [`SlotRows::MAX_ROWS`], the rows' answers and lent logits rows from
+    /// the pass's own per-row heads, slot 0 left selected), then the call's
+    /// `residency pass` records, else the seat's fallback — a select and a
+    /// step a row — the NextN load's step round, whose body refuses a pass
+    /// of plain steps by name (each of its slots is drafted, and such a pass
+    /// tells no slot's draft what it ran). A refusal on either path is the
+    /// server's to die on: the open decides once, so a load that cannot run
+    /// one pass never tries it at run time.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
-        if self.rounds != Rounds::Steps {
-            return step_rows_in_turn(self, rows);
-        }
-        let passes =
-            super::rounds::step_rows_one_pass(&mut self.s, rows).map_err(|e| e.to_string())?;
-        self.print_passes().map_err(|e| e.to_string())?;
-        if self.stats {
-            record::slots_round("step", rows.len(), passes, self.slots()).eprint();
-        }
-        Ok(())
+        let one_pass = self.rounds == Rounds::Steps;
+        super::rounds::step_round(
+            self,
+            one_pass,
+            rows,
+            |g, rows| super::rounds::step_rows_one_pass(&mut g.s, rows),
+            Glm::print_passes,
+        )
     }
 
-    /// One round of several slots' drafted passes: one pass of the busy
-    /// slots' windows while the open decided so ([`Rounds::Windows`],
-    /// through `serve_seats::rounds::pass_rows_one_pass` — each slot's
-    /// window over its own draft at the depth a one-slot pass proposes, the
-    /// windows laid in slot order and cut between them at the body's
+    /// One round of several slots' drafted passes
+    /// ([`super::rounds::pass_round`]): one pass of the busy slots' windows
+    /// while the open decided so ([`Rounds::Windows`], through
+    /// `serve_seats::rounds::pass_rows_one_pass` — each slot's window over
+    /// its own draft at the depth a one-slot pass proposes, the windows laid
+    /// in slot order and cut between them at the body's
     /// [`SlotRows::MAX_ROWS`], slot 0 left selected), each slot whose draft
-    /// skips turned off first ([`Glm::off_skipping`]) and stepped alone;
-    /// else the fallback ([`pass_rows_in_turn`]: a select and a pass a row,
-    /// which prints its own `slots round` record). A refusal on either path
-    /// is the server's to die on, never a fallback: the open decides once.
+    /// skips turned off first ([`Glm::off_skipping`]) and stepped alone,
+    /// then the call's `residency pass` records; else the fallback (a select
+    /// and a pass a row, which prints its own `slots round` record). A
+    /// refusal on either path is the server's to die on, never a fallback:
+    /// the open decides once.
     fn pass_slots(&mut self, rows: &mut [SlotPassRow]) -> Result<(), String> {
-        if self.rounds != Rounds::Windows {
-            return pass_rows_in_turn(self, rows);
-        }
-        self.off_skipping(rows).map_err(|e| e.to_string())?;
-        let passes = super::rounds::pass_rows_one_pass(
-            &mut self.s,
+        let one_pass = self.rounds == Rounds::Windows;
+        super::rounds::pass_round(
+            self,
+            one_pass,
             rows,
-            &mut self.drafted,
-            <Body as MtpBody>::WIDTH,
+            |g, rows| {
+                g.off_skipping(rows)?;
+                super::rounds::pass_rows_one_pass(
+                    &mut g.s,
+                    rows,
+                    &mut g.drafted,
+                    <Body as MtpBody>::WIDTH,
+                )
+            },
+            Glm::print_passes,
         )
-        .map_err(|e| e.to_string())?;
-        self.print_passes().map_err(|e| e.to_string())?;
-        if self.stats {
-            record::slots_round("pass", rows.len(), passes, self.slots()).eprint();
-        }
-        Ok(())
     }
 
     /// The body's feed ([`bloomery_gpu_glm5next::feed`]): the batched prompt

@@ -221,7 +221,7 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::bind::{
     CacheRam, Seat, SeatEngine, SlotPassRow, SlotStep, Vocab, model_props, nvidia_smi_index,
-    pass_rows_in_turn, placement_props, sampler_factory,
+    placement_props, sampler_factory,
 };
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::nodes::count_kinds;
@@ -1680,39 +1680,41 @@ impl Seat for Q38 {
         )
     }
 
-    /// One round of several slots' drafted passes: while the open decided
-    /// so ([`Q38::one_pass`]) one pass of the busy rows — every slot's
-    /// window verified together through [`super::rounds::pass_rows_one_pass`],
-    /// the round cut into passes at the body's `SlotRows::MAX_ROWS`, a slot
-    /// whose draft a cut turned off stepped alone before them — else the
-    /// fallback ([`pass_rows_in_turn`]: a select and a pass a row). The open
-    /// decides once, so a load that cannot run one pass never tries it at
-    /// run time: a refusal on either path is the server's to die on, never
-    /// a fallback. The rows are distinct slots below [`Seat::slots`] (the
+    /// One round of several slots' drafted passes
+    /// ([`super::rounds::pass_round`]): while the open decided so
+    /// ([`Q38::one_pass`]) one pass of the busy rows — every slot's window
+    /// verified together through [`super::rounds::pass_rows_one_pass`], the
+    /// round cut into passes at the body's `SlotRows::MAX_ROWS`, a slot
+    /// whose draft a cut turned off stepped alone before them, and what the
+    /// fallback loop's per-row `pass` would print at its slot printed first
+    /// — else the fallback (a select and a pass a row). The open decides
+    /// once, so a load that cannot run one pass never tries it at run time:
+    /// a refusal on either path is the server's to die on, never a
+    /// fallback. The rows are distinct slots below [`Seat::slots`] (the
     /// engine's own named refusal), a slot whose draft skips rides the pass
     /// as one plain row and an off slot runs its own plain step, so no
     /// row-level fallback exists.
     fn pass_slots(&mut self, rows: &mut [SlotPassRow]) -> Result<(), String> {
-        if !self.one_pass {
-            return pass_rows_in_turn(self, rows);
-        }
-        // What the fallback loop's per-row `pass` would print at its slot.
-        let round: Vec<usize> = rows.iter().map(|r| r.slot).collect();
-        for slot in round {
-            self.before_call_at(slot);
-        }
-        let passes = super::rounds::pass_rows_one_pass(
-            &mut self.s,
+        let one_pass = self.one_pass;
+        super::rounds::pass_round(
+            self,
+            one_pass,
             rows,
-            &mut self.drafts,
-            <Body38 as MtpBody>::WIDTH,
+            |q, rows| {
+                // What the fallback loop's per-row `pass` would print at its
+                // slot.
+                for r in rows.iter() {
+                    q.before_call_at(r.slot);
+                }
+                super::rounds::pass_rows_one_pass(
+                    &mut q.s,
+                    rows,
+                    &mut q.drafts,
+                    <Body38 as MtpBody>::WIDTH,
+                )
+            },
+            Q38::print_passes,
         )
-        .map_err(|e| e.to_string())?;
-        self.print_passes().map_err(|e| e.to_string())?;
-        if self.stats {
-            record::slots_round("pass", rows.len(), passes, self.slots()).eprint();
-        }
-        Ok(())
     }
 
     /// The body's rule (`Body38::kept`): every held position, or the
