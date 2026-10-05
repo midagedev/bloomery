@@ -112,21 +112,26 @@
 //!   red).
 //! - (n) resident slots (`add_slots`), on their own load with the
 //!   checkpoints armed, as the seat arms them: the slot harness's contracts
-//!   (`slots_gate`: H1 interleave, H3 bytes, H4 reset, H6 refusals, H7
-//!   captures) over two lcg streams, A of [`SLOT_A`] ids and B of
+//!   (`slots_gate`: H1 interleave, H2 one pass, H3 bytes, H4 reset, H6
+//!   refusals, H7 captures) over two lcg streams, A of [`SLOT_A`] ids and B of
 //!   [`SLOT_B`] — each past the load's first mark (its ubatch, [`U_GATE`])
 //!   by a run the mark keeps — prompted by the session's schedule (the wide
 //!   walk), [`SLOT_STEPS`] steps a stream, each slot's state digest every
 //!   attention layer's K/V rows below its position and every delta layer's
-//!   state and ring, and `seq_bytes` held to [`store_bytes`]. Between the
-//!   harness's halves, each slot's checkpoints are its own: after the
-//!   interleave slot 0 holds its points at the mark and its prompt's end,
+//!   state and ring, `seq_bytes` held to [`store_bytes`], and H2's pass of
+//!   one row a slot holding [`NODES_PASS`] + [`NODES_SLOT`] + its head's
+//!   five nodes. Between the harness's halves: a pass of nine rows, a slot
+//!   twice, a slot out of range, a slot of no token, an id past the
+//!   vocabulary and a pass with the layer taps armed are each refused by
+//!   name, every slot's position kept; and each slot's checkpoints are its
+//!   own: after the interleave and H2 slot 0 holds its points at the mark
+//!   and its prompt's end,
 //!   slot 1 at the mark and its own end; slot 1 cut back to the mark, slot
 //!   0 — selected before slot 1 runs again, so a cut that waited in the
 //!   wrong checkpoints is carried out on it — holds its points and digest
 //!   and its next ids are its solo run's continuation; slot 1, the rest of
-//!   B re-fed from the mark and stepped as far as the interleave stepped
-//!   it, stands with the interleave's last id, digest, points and position;
+//!   B re-fed from the mark and stepped as far as the interleave and H2
+//!   stepped it, stands with H2's last id, digest, points and position;
 //!   a reset of slot 1 leaves slot 0's points standing.
 //! - (r) refusals: a ubatch size of 0 or past `UBATCH` is refused by name
 //!   with the size and the resident bytes kept; a prompt past the cache is
@@ -151,9 +156,9 @@
 //!   unit runs every card launch and every host dot the way its one-row
 //!   step does; (o2) (c) on it, the same [`FREE_BAND`] — a host expert runs
 //!   ik's own 8-bit rule (Q8_K activations) where the card runs q8_1, so no
-//!   layer's error grows; (o3) a GEMM prompt and a ubatch resize refused by
-//!   name, the ubatch kept; (o4) the host tier served slots on both of its
-//!   ports. `--placed-only` runs (o) alone.
+//!   layer's error grows; (o3) a GEMM prompt, a ubatch resize and a pass of
+//!   two resident slots refused by name, the ubatch kept; (o4) the host tier
+//!   served slots on both of its ports. `--placed-only` runs (o) alone.
 //!
 //! (m) the memory guard, `--memguard-only` (no model loaded): the census
 //!   free reading, the quiet-card whole decision, the held-card refusal by
@@ -229,7 +234,7 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError, GpuModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::nodes::count_kinds;
-    use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
+    use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir,
         ik_q8_2, q8_1_dequant, ref_ints, ref_tensor_logical_in, split_f32, topk_ids_logical_within,
@@ -344,11 +349,27 @@ mod gate {
     /// of the row's residual and three launches.
     const NODES_PASS: usize = 537;
 
+    /// PIN(2026-10-05): the launches one more busy slot adds to a captured
+    /// pass of several slots (`step_slots`), derived from the launches that
+    /// bind one sequence's stores or record: its embedding, each delta
+    /// layer's conv and delta step, each attention layer's rope with the
+    /// cache append and the flash's segment pass and merge: 1 + 30·2 + 10·3.
+    const NODES_SLOT: usize = 91;
+
     const _: () = assert!(
         NODES_DECODE == 1 + N_DELTA * 13 + N_ATTN * 12 + Q6_V + 3
             && NODES_PASS == 1 + N_DELTA * 13 + Q6_QKV + N_ATTN * 12 + 2 * Q6_V
+            && NODES_SLOT == 1 + N_DELTA * 2 + N_ATTN * 3
             && N_DELTA + N_ATTN == N_LAYER
     );
+
+    /// The nodes of a pass's one head of `rows` rows over the file's Q6_K
+    /// lm_head: the copy of the rows into its input, then the fused head's
+    /// three at one row, or the norm, the quantizer, the gemv and the rows'
+    /// argmax past it.
+    fn pass_head_nodes(rows: usize) -> usize {
+        1 + if rows == 1 { 3 } else { 4 }
+    }
 
     /// PIN(2026-09-27): the teacher-forced bound on a tap's error ratio — its
     /// relative error over the relative distance between the two sides'
@@ -2149,6 +2170,130 @@ mod gate {
         }
     }
 
+    impl PassAdapter for Q35Slots {
+        /// [`NODES_SLOT`].
+        fn added_slot_launches(&self, _m: &Qwen35moeModel) -> Result<Launches, GateError> {
+            Ok(Launches {
+                n: NODES_SLOT,
+                terms: format!(
+                    "the embedding 1 + {N_DELTA} delta layers' conv and delta 2 + {N_ATTN} \
+                     attention layers' rope-append and flash segment pass and merge 3"
+                ),
+            })
+        }
+
+        /// The body's count without the head (`Body35::slots_launches`),
+        /// plus the pass's one head ([`pass_head_nodes`]).
+        fn slots_launches(
+            &self,
+            m: &Qwen35moeModel,
+            key: &[(usize, usize)],
+        ) -> Result<usize, GateError> {
+            let rows = key.iter().map(|&(_, r)| r).sum();
+            Ok(m.body("slots")?.slots_launches(key) + pass_head_nodes(rows))
+        }
+    }
+
+    /// `r`, a call that must be refused by `what` with a detail holding
+    /// `phrase`.
+    fn refused<T>(r: Result<T, GpuError>, what: &str, phrase: &str) -> bool {
+        match r {
+            Err(GpuError::Shape { what: w, detail }) => w == what && detail.contains(phrase),
+            Err(GpuError::State { what: w, missing }) => w == what && missing.contains(phrase),
+            _ => false,
+        }
+    }
+
+    /// (n)'s pass refusals (module doc): each pass refused by name before
+    /// anything runs, every slot's position kept and no slot poisoned.
+    /// `last` is each slot's last id, its next step's input.
+    fn pass_refusals(m: &mut Qwen35moeModel, last: [u32; 2]) -> Result<bool, GateError> {
+        const COMMON: &str = "GpuModel::step_slots";
+        const BODY: &str = "qwen35moe slots";
+        let positions = |m: &mut Qwen35moeModel| -> Result<Vec<u32>, GateError> {
+            (0..2)
+                .map(|s| {
+                    m.select_slot(s)?;
+                    Ok(m.pos())
+                })
+                .collect()
+        };
+        let before = positions(m)?;
+        let vocab = u32::try_from(m.body("slots")?.vocab())?;
+        let five = [last[0]; 5];
+        let four = [last[1]; 4];
+        let arms = [
+            (
+                "nine rows",
+                refused(
+                    m.step_slots(&[(0, &five[..]), (1, &four[..])]),
+                    COMMON,
+                    "9 rows in one pass",
+                ),
+            ),
+            (
+                "a slot twice",
+                refused(
+                    m.step_slots(&[(0, &[last[0]]), (0, &[last[0]])]),
+                    COMMON,
+                    "slot 0 twice",
+                ),
+            ),
+            (
+                "a slot out of range",
+                refused(
+                    m.step_slots(&[(2, &[last[0]])]),
+                    COMMON,
+                    "slot 2 of a model that serves 0..2",
+                ),
+            ),
+            (
+                "a slot of no token",
+                refused(m.step_slots(&[(1, &[])]), COMMON, "slot 1 with no token"),
+            ),
+            (
+                "an id past the vocabulary",
+                refused(
+                    m.step_slots(&[(0, &[last[0]]), (1, &[vocab])]),
+                    BODY,
+                    "slot 1:",
+                ),
+            ),
+        ];
+        let taps = {
+            m.set_layer_taps(true)?;
+            let named = refused(
+                m.step_slots(&[(0, &[last[0]]), (1, &[last[1]])]),
+                BODY,
+                "layer taps off",
+            );
+            m.set_layer_taps(false)?;
+            m.set_mode(StepMode::Graph);
+            named
+        };
+        let missed: Vec<&str> = arms
+            .iter()
+            .filter(|(_, named)| !named)
+            .map(|(arm, _)| *arm)
+            .chain((!taps).then_some("the layer taps armed"))
+            .collect();
+        let after = positions(m)?;
+        let kept = after == before;
+        let pass = missed.is_empty() && kept;
+        println!(
+            "slots pass refusals: nine rows, a slot twice, a slot out of range, a slot of no \
+             token, an id past the vocabulary and the layer taps armed each refused by name{}; \
+             positions {after:?} kept {kept} {}",
+            if missed.is_empty() {
+                String::new()
+            } else {
+                format!(" — not named: {}", missed.join(", "))
+            },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     /// The selected slot's checkpoints' positions.
     fn points(m: &Qwen35moeModel) -> Result<Vec<u32>, GateError> {
         Ok(m.body("slots")?.checkpoints().positions())
@@ -2169,9 +2314,12 @@ mod gate {
     /// slot. The clause's model is dropped with its second sequence.
     fn slots_two(a: &Q35Slots) -> Result<bool, GateError> {
         let mut s = slots_gate::interleave(a)?;
+        s.one_pass();
         let mark = u32::try_from(U_GATE)?;
         let ends = [u32::try_from(SLOT_A)?, u32::try_from(SLOT_B)?];
         let b_last = s.last(1)?;
+        let last = [s.last(0)?, b_last];
+        let refusals_ok = pass_refusals(s.model(), last)?;
         let m = s.model();
         // Each slot's points as its prompt in the interleave took them, and
         // where each stands.
@@ -2215,14 +2363,16 @@ mod gate {
             .get(U_GATE..)
             .ok_or("stream B shorter than the first mark")?;
         let mut ids = vec![<Body35 as app::Prompt>::prompt(m, rest)?];
-        greedy(m, &mut ids, SLOT_STEPS)?;
+        greedy(m, &mut ids, SLOT_STEPS + SLOT_TAIL)?;
         let b_now = (a.state_hash(m)?, points(m)?, m.pos());
         let last = ids.last().copied();
         let refed_ok = last == Some(b_last) && b_now == b_held;
         println!(
-            "slots cut: slot 1 re-fed {} ids from {mark} and stepped {SLOT_STEPS}: last id {last:?} \
-             vs {b_last}, state digest equal={}, points {:?} vs {:?}, position {} vs {} {}",
+            "slots cut: slot 1 re-fed {} ids from {mark} and stepped {} (the interleave's steps \
+             and H2's passes): last id {last:?} vs {b_last}, state digest equal={}, points {:?} vs \
+             {:?}, position {} vs {} {}",
             rest.len(),
+            SLOT_STEPS + SLOT_TAIL,
             b_now.0 == b_held.0,
             b_now.1,
             b_held.1,
@@ -2241,7 +2391,7 @@ mod gate {
             verdict(kept_ok)
         );
         let harness_ok = s.finish()?;
-        Ok(taken && held_ok && refed_ok && kept_ok && harness_ok)
+        Ok(taken && held_ok && refed_ok && kept_ok && refusals_ok && harness_ok)
     }
 
     // ---------------------------------------------------- (r) refusals
@@ -2431,12 +2581,19 @@ mod gate {
         let u0 = m.ubatch()?;
         let gemm = m.prefill_plan(toks.len(), PrefillPath::Gemm).err();
         let resize = m.set_ubatch(U_GATE).err();
-        let refused = gemm.is_some() && resize.is_some() && m.ubatch()? == u0;
+        m.add_slots(2)?;
+        let pass = refused(
+            m.step_slots(&[(0, &[tok]), (1, &[tok])]),
+            "qwen35moe slots",
+            "on a placed load",
+        );
+        let named = gemm.is_some() && resize.is_some() && m.ubatch()? == u0 && pass;
         println!(
-            "placed refusals: a GEMM prompt: {}; ubatches of {U_GATE}: {} (ubatch {u0} kept) {}",
+            "placed refusals: a GEMM prompt: {}; ubatches of {U_GATE}: {} (ubatch {u0} kept); a \
+             pass of two resident slots named {pass} {}",
             gemm.map_or("accepted".to_string(), |e| e.to_string()),
             resize.map_or("accepted".to_string(), |e| e.to_string()),
-            verdict(refused)
+            verdict(named)
         );
         // (o4)
         let stats = m
@@ -2452,7 +2609,7 @@ mod gate {
             stats.batch_host_slots,
             verdict(served)
         );
-        Ok(ok && refused && served)
+        Ok(ok && named && served)
     }
 
     /// The batch set's manifest and its five tokens.

@@ -18,6 +18,7 @@
 
 mod body;
 mod body35;
+mod body35_slots;
 mod body38;
 mod card38;
 mod delta;

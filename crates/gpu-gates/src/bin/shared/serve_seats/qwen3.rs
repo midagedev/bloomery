@@ -96,12 +96,11 @@
 //! One token a slot a round, the sequences switched by pointer exchange, no
 //! park and no re-prefill; the engine is the seat's own (`SeatEngine`), and
 //! the server steps every running slot in one call — one pass of the busy
-//! rows on a whole-card load of a body that runs several slots' rows as one
-//! pass (a qwen3moe file's `Body`, `GpuModel::step_slots`, every row-wise
-//! launch once over them all), else a select and a step a row (the seat's
-//! fallback loop): a placed load's, and a qwen35moe file's, whose `Body35`
-//! has no `SlotRows` yet — one pass of its slots is that body's next item,
-//! not the seat's. Under `BLOOMERY_STEP_STATS=1` each round of several slots
+//! rows on a whole-card load, whose body runs several slots' rows as one
+//! pass (a qwen3moe file's `Body` and a qwen35moe file's `Body35`,
+//! `GpuModel::step_slots`, every row-wise launch once over them all), else a
+//! select and a step a row (the seat's fallback loop), a placed load's.
+//! Under `BLOOMERY_STEP_STATS=1` each round of several slots
 //! prints a `slots round` record naming its command, rows, passes and the
 //! slots the seat serves. `--parallel 1` is exactly the one-sequence server.
 //! `--queue-depth Q` bounds the requests that wait for a slot; `--park-ram`
@@ -388,10 +387,8 @@ trait Body3: Slots<Seq: 'static> + Sized + 'static {
     /// The file's `general.architecture`, as the `load` record names it.
     const ARCH: &'static str;
     /// Whether the body runs several slots' rows as one pass on a
-    /// whole-card load (`SlotRows`): `Body` (a qwen3moe file) does, through
-    /// [`Body3::one_pass_round`]; `Body35` (a qwen35moe file) has no
-    /// `SlotRows` yet, so its rounds take the seat's fallback loop — one
-    /// pass of its slots is that body's next item.
+    /// whole-card load (`SlotRows`), through [`Body3::one_pass_round`]:
+    /// `Body` (a qwen3moe file) and `Body35` (a qwen35moe file) both do.
     const ONE_PASS: bool = false;
     /// The model of `file` with a `ctx`-row cache by `load`, decided before
     /// the open at the total its `slots` sequences of that shape split
@@ -428,9 +425,9 @@ trait Body3: Slots<Seq: 'static> + Sized + 'static {
     /// ([`Q3::step_slots`]'s one-pass arm), each row's answer into `next`
     /// and each lent logits row filled; the passes it ran back. Refused by
     /// the default: only a body of [`Body3::ONE_PASS`] takes it — `Body` (a
-    /// qwen3moe file), through [`super::rounds::step_rows_one_pass`];
-    /// `Body35` (a qwen35moe file) keeps the refusal, which no round reaches
-    /// (the seat decides at its open from [`Body3::ONE_PASS`]).
+    /// qwen3moe file) and `Body35` (a qwen35moe file), through
+    /// [`super::rounds::step_rows_one_pass`] (the seat decides at its open
+    /// from [`Body3::ONE_PASS`]).
     fn one_pass_round(
         s: &mut app::Session<Self>,
         rows: &mut [SlotStep],
@@ -519,6 +516,7 @@ impl Body3 for Body {
 
 impl Body3 for Body35 {
     const ARCH: &'static str = "qwen35moe";
+    const ONE_PASS: bool = true;
 
     /// As `load` decided before the open, making no fit call of its own: the
     /// whole model on device 0, or the placed plan made at the total, its
@@ -601,6 +599,14 @@ impl Body3 for Body35 {
             }
         }
         at
+    }
+
+    /// The busy rows as one pass ([`super::rounds::step_rows_one_pass`]).
+    fn one_pass_round(
+        s: &mut app::Session<Body35>,
+        rows: &mut [SlotStep],
+    ) -> Result<usize, GateError> {
+        super::rounds::step_rows_one_pass(s, rows)
     }
 }
 
@@ -715,8 +721,7 @@ impl<B: Body3> Seat for Q3<B> {
     /// heads, slot 0 left selected), else the seat's fallback — a select and
     /// a step a row — the placed load's round (its body serves each slot's
     /// rows in its own pass), every round of a body with no one pass of its
-    /// slots (a qwen35moe file's), and the round a load of one slot never
-    /// runs.
+    /// slots, and the round a load of one slot never runs.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
         let one_pass = self.one_pass;
         super::rounds::step_round(

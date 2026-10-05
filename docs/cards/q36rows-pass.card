@@ -1,0 +1,59 @@
+# q36rows (multiseq2): Qwen3.6-35B-A3B, two streams decoded in one pass (Body35's `SlotRows`,
+# `GpuModel::step_slots`) against one stream, same binary, at depth 6. HELD by the lead: the runner's
+# generate_qwen3moe still refuses GEN_SLOTS on a qwen35moe file (`slots_refused`); the sitting waits
+# on that file's round (Family::Qwen35 → None, the Chosen::Qwen35 arm calling drive_slots,
+# drive_slots/run_arm_slots generic over B: SlotRows + Prompted with a body hook for the per-slot
+# prefill capture). This round's gates (gate_qwen35moe_e2e (n) H2, gate_qwen3_serve's
+# slots_rounds_run_one_pass) hold the pass's bits, not its speed.
+#
+# [measured] step(1) = 1000 / 204.4 = 4.89 ms at depth 6 (rig-log 09-28 #q36-release, A6000, Q4_K_M
+# whole card); two slots in turn = 9.78 ms, aggregate 204.4 tok/s.
+# [derived] The pass shares every row-wise launch once over both rows — each delta layer's norm,
+# quantizer and four input projections, its gated norm and output projection, each attention layer's
+# q/k/v and out projections, every layer's router, experts and combine, and the one head of every
+# row (`Tail::One`, HEADS = One: the lm_head is read once, not twice). Per busy slot it runs its own
+# 91 launches (the embedding 1, each of the 30 delta layers' conv over its ring and delta step over
+# its state lane 2, each of the 10 attention layers' rope-append, flash segment pass and merge 3 —
+# NODES_SLOT) over its row window, its own K/V planes, ring and state: the pass graph holds 633
+# nodes against the two steps' 2 × 520, and no kernel, launch signature or byte formula changes
+# (ptx-scan equal to base; the flash's row contract and the delta launches already take a per-row
+# lane, as Body38's). The experts do not share: at m = 2 every slot reads its own expert rows
+# (f = 1, the qwen3moe sitting's finding; the expert kernels stream ~600 GB/s at m = 1, rig-log
+# 09-25 #qwen3fuse-regression-nsys), so the expert bytes stay 2 × a single row's.
+# [derived] The saving is the second read of the shared weights and the launch gaps the one walk
+# drops: pass(2) = 6.6..7.4 ms, aggregate 271..304 tok/s, effect +32..+48 %. The band's floor is
+# widened to +19 % for the terms the launch count cannot close — the 91 per-slot launches still
+# serialise on the one stream with their gaps, and the host work between replays grows with the
+# pass's rows (the qwen3moe sitting priced those at +0.25..0.46 ms a slot past the first); the
+# ceiling keeps every shared weight's second read off the pass.
+# The runner's line is `ratio slots d=6 ours@BLOOMERY_GEN_SLOTS=2/ours`: the 2-slot arm's aggregate
+# (Σ positions · 1000 / Σ ms over its counted kind=slots records) over the plain arm's tok/s(mean),
+# per round; the effect is (changed − base) / base, the 2-slot arm the changed one. The 2-slot arm
+# feeds lcg_prompt 2·6 ids (slot 0 the plain arm's 6, prefix-stable; slot 1 the next 6).
+# Runner (lead, after the generate_qwen3moe round lands): BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=
+# docs/cards/q36rows-pass.card' BLOOMERY_AB_ROUNDS=4 just depth-gpu-qwen35moe 6 6@BLOOMERY_GEN_SLOTS=2
+kind: ab
+question: do two Qwen3.6 streams decoded in one pass (BLOOMERY_GEN_SLOTS=2) outrun one stream by
+  +19..+49 % aggregate at depth 6?
+term: tok/s @ n=96, depth 6 (ctx 256), A6000, Qwen3.6-35B-A3B Q4_K_M whole card. The 2-slot arm's
+  aggregate (`ratio slots d=6 ours@BLOOMERY_GEN_SLOTS=2/ours`) against the plain arm's tok/s(mean),
+  same binary, paired by round
+unit: %
+predict: 19..49
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」, the same-binary scatter the depth runners' ratio lines carry
+condition: one binary, both arms in one lease, one load each a round (the load keys differ by the
+  lever), no [cpu-busy], [other-busy] or [cold] row (the runner's tags). The binary refuses by name
+  a placed load and an id count that 2 does not divide. The runner fails the 2-slot row when it
+  holds no counted kind=slots record or one whose positions is not 2, and a plain row that holds
+  any. Not checked inside the rounds: each slot's ids bit for bit its solo run's —
+  gate_qwen35moe_e2e (n) H2 and gate_qwen3_serve's slots_rounds_run_one_pass hold that at every
+  depth the seat serves
+decide-in: the pass costs what the node classes say. Re-price N = 4 and 8 (the per-slot 91 launches
+  and the expert bytes both scale with the busy slots; MAX_PASS_ROWS = 8) and card the next sitting
+decide-below: a term past the classes. Read the sitting's pass ms against them (the per-slot launch
+  gaps, the host between replays, the input record) and take one nsys window of the 2-slot pass
+  before any change
+decide-above: the second slot costs less than the classes (cache reuse across slots' expert rows —
+  f < 1 at m = 2 for this file's routes). Re-measure f from the sitting's rows and re-price N = 4
+  and 8 before the next card

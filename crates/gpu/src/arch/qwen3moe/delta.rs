@@ -179,7 +179,7 @@ pub(super) fn delta(
 /// The gemv arm's input half at `m <= GEMV_COLS` rows: the fused norm and
 /// q8_1 quantizer of `x`, then the four input projections in two launches
 /// (module doc, 1–2).
-fn project(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+pub(super) fn project(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     const WHAT: &str = "qwen3moe::delta::project";
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let stream = gpu.stream();
@@ -294,7 +294,7 @@ fn project(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Result<(), Gp
 /// Q4_K projection with the residual add folded in, any other through
 /// `dispatch::out_resid` — a K-quant on the gated norm's rows quantized, any
 /// other type on them as f32.
-fn output(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
+pub(super) fn output(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let i = s.col(m)?;
     let hidden = s.dims.hidden;
