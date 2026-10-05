@@ -2401,6 +2401,28 @@ pub static LOAD_DRAFT_OFF_GLM: Kind = Kind {
     parts: &[lit(" ("), pos("why", Text, ""), lit(")")],
 };
 
+/// The placement the GLM seat runs by: `--place` set, or unset and what the
+/// cards call for (`generate::Place::by_cards`, `Place::keep_tier`).
+pub static PLACE_UNSET_GLM: Kind = Kind {
+    name: "place_unset_glm",
+    head: "place unset",
+    doc: "The placement the GLM seat runs by, after the levers' records and before the ctx line and \
+          the plan, and why: set (--place, its word as the plan line prints it), or unset and what \
+          the cards call for — on two cards the plan of bp (the largest the stage, the next-largest \
+          its expert tier) kept when its tier holds at least the break-even (two cards, tier at or \
+          past the break-even), else a (two cards, tier under the break-even), or a when that plan \
+          is refused (two cards, the tier's plan refused; the refusal on stderr); on one card a \
+          (one card). tier_experts is the experts the tier cards hold in that plan of bp, or under \
+          --place in the placement's own plan (0 with no tier card or a refused plan); break_even \
+          is the seat's threshold.",
+    parts: &[
+        key("place", Word, ""),
+        key("why", Text, ""),
+        key("tier_experts", U64, "experts"),
+        key("break_even", U64, "experts"),
+    ],
+};
+
 /// What `BLOOMERY_DRAFT` unset resolved to on the GLM seat
 /// ([`bloomery_levers::glm_unset`]).
 pub static DRAFT_UNSET_GLM: Kind = Kind {
@@ -2700,15 +2722,16 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = &[
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
-/// residency lever's word, the `plan`, `load` and `capture` lines
-/// `generate_glm5next` prints, the host set's records of a placed load, the
-/// draft's load line and its verify's capture, the listening line, the reuse
-/// records the checkpoint rule answers, the draft's joins, the residency
-/// machine's records, and the rounds of several slots a
-/// `BLOOMERY_STEP_STATS` run counts.
+/// residency lever's word, the placement and why, the `plan`, `load` and
+/// `capture` lines `generate_glm5next` prints, the host set's records of a
+/// placed load, the draft's load line and its verify's capture, the
+/// listening line, the reuse records the checkpoint rule answers, the
+/// draft's joins, the residency machine's records, and the rounds of several
+/// slots a `BLOOMERY_STEP_STATS` run counts.
 pub static BLOOMERY_SERVE_GLM: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &DRAFT_UNSET_GLM,
+    &PLACE_UNSET_GLM,
     &PLAN,
     &RESIDENCY_UNSET_GLM,
     &RESIDENCY_HOST,

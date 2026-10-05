@@ -36,7 +36,7 @@ use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::placement::workstation::{
-    self, CardSpec, DeviceId, DeviceInfo, Pick, TierBatchBytes, TierDraft,
+    self, CardSpec, DeviceId, DeviceInfo, Pick, PickError, PickWhy, TierBatchBytes, TierDraft,
 };
 use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row};
 use runtime::{Advance, Committed, Out, Target, Want};
@@ -202,6 +202,44 @@ impl Place {
             resolved: true,
             ..self
         })
+    }
+
+    /// The placement the cards in `census` offer, resolved against it
+    /// ([`Place::on`]): [`Place::Bp`] when its picks find two devices (the
+    /// largest the stage, the next-largest its tier), else [`Place::A`]. Its
+    /// tier is kept only by the plan's count ([`Place::keep_tier`]). A census
+    /// with no device is `a`'s refusal by name; a refusal of `bp`'s other
+    /// than too few devices is `bp`'s.
+    pub fn by_cards(census: &[DeviceInfo]) -> Result<Place, GateError> {
+        match workstation::resolve(Place::Bp.picks(), census) {
+            Ok(_) => Place::Bp.on(census),
+            Err(PickError {
+                why: PickWhy::Few(_),
+                ..
+            }) => Place::A.on(census),
+            Err(e) => Err(format!("--place bp: {e}").into()),
+        }
+    }
+
+    /// [`Place::by_cards`]'s offer kept or dropped by its plan, and why in
+    /// the words a record prints: a placement with a tier card keeps it when
+    /// its tier cards hold `tier_experts`, at least `break_even` (`two cards,
+    /// tier at or past the break-even`), else it is [`Place::A`] resolved
+    /// against `census` (`two cards, tier under the break-even`); one with
+    /// no tier card is itself (`one card`).
+    pub fn keep_tier(
+        self,
+        census: &[DeviceInfo],
+        tier_experts: u64,
+        break_even: u64,
+    ) -> Result<(Place, &'static str), GateError> {
+        if self.n == 1 {
+            return Ok((self, "one card"));
+        }
+        if tier_experts >= break_even {
+            return Ok((self, "two cards, tier at or past the break-even"));
+        }
+        Ok((Place::A.on(census)?, "two cards, tier under the break-even"))
     }
 
     /// The word as typed: an alias's own word, or the picks of a list
@@ -1475,6 +1513,80 @@ mod tests {
         assert_eq!(bp.cards(), vec!["3090", "3090"]);
         let m = bp.machine(None, Some(BATCH)).expect("stage + tier")(43);
         assert_eq!(m.tiers[0].device.map(|d| d.ordinal), Some(1));
+    }
+
+    /// The placement the cards call for ([`Place::by_cards`], then
+    /// [`Place::keep_tier`] at a break-even of 526 tier experts): one card is
+    /// `a` on it, whichever card it is, whatever the count; two keep `bp` —
+    /// the larger the stage and the other its tier, in both enumeration
+    /// orders; two of one name across both; of three, the two largest — at
+    /// the break-even and past it, and are `a` on the larger below it; no
+    /// device is `a`'s refusal by name.
+    #[test]
+    fn the_cards_call_for_a_or_bp() {
+        const BREAK_EVEN: u64 = 526;
+        const PAYS: &str = "two cards, tier at or past the break-even";
+        const SHORT: &str = "two cards, tier under the break-even";
+        let at = |names: &[&str], tier_experts: u64| {
+            let c = census(names);
+            Place::by_cards(&c)
+                .and_then(|p| p.keep_tier(&c, tier_experts, BREAK_EVEN))
+                .map(|(p, why)| {
+                    (
+                        p.name(),
+                        p.cards(),
+                        p.draft_device().map(|d| d.ordinal),
+                        why,
+                    )
+                })
+                .map_err(|e| e.to_string())
+        };
+        for e in [0, BREAK_EVEN - 1, BREAK_EVEN] {
+            assert_eq!(
+                at(&["A6000"], e),
+                Ok(("a", vec!["A6000"], None, "one card"))
+            );
+            assert_eq!(at(&["3090"], e), Ok(("a", vec!["3090"], None, "one card")));
+        }
+        for (order, tier) in [(["3090", "A6000"], 0), (["A6000", "3090"], 1)] {
+            for e in [BREAK_EVEN, BREAK_EVEN + 1] {
+                assert_eq!(
+                    at(&order, e),
+                    Ok(("bp", vec!["A6000", "3090"], Some(tier), PAYS)),
+                    "{order:?} {e}"
+                );
+            }
+            for e in [0, BREAK_EVEN - 1] {
+                assert_eq!(
+                    at(&order, e),
+                    Ok(("a", vec!["A6000"], None, SHORT)),
+                    "{order:?} {e}"
+                );
+            }
+        }
+        assert_eq!(
+            at(&["3090", "3090"], BREAK_EVEN),
+            Ok(("bp", vec!["3090", "3090"], Some(1), PAYS))
+        );
+        assert_eq!(
+            at(
+                &["3090", "NVIDIA RTX 6000 Ada Generation", "A6000"],
+                BREAK_EVEN
+            ),
+            Ok((
+                "bp",
+                vec!["RTX_6000_Ada_Generation", "A6000"],
+                Some(2),
+                PAYS
+            ))
+        );
+        let e = at(&[], BREAK_EVEN).expect_err("no device");
+        assert!(
+            e.starts_with(
+                "--place a: the placement takes the largest visible card, and 0 devices are visible"
+            ),
+            "{e}"
+        );
     }
 
     /// A fake census of devices by short name, each its measured total

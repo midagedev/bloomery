@@ -21,7 +21,7 @@
 //! arm's (s5) alone — its server and clauses, nothing else — for a run of
 //! those clauses by name; the recipe runs them inside `drafted`.
 //!
-//! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after three runs of
+//! `plain` (`BLOOMERY_DRAFT=off BLOOMERY_RESIDENCY=off`), after four runs of
 //! the seat with both levers unset and `--plan`, which print the unset rule's
 //! records and the plan and exit 0 before any card is opened: under `--place
 //! a` and under `--place bp` (plan (b′), the 3090 an expert tier) a `draft
@@ -29,7 +29,12 @@
 //! the `residency host` record of the word — its pinned count 0 and the
 //! headroom past the churn pool non-negative, the pool inside the plan's
 //! host terms — every placement's `ctx` line naming a default context at or
-//! past the floor; under `--place gate` both `off`, no `residency host`:
+//! past the floor; under `--place gate` both `off`, no `residency host`;
+//! each of the three a `place unset` record of its word and `why=set`; and
+//! with no `--place`, on this box's two cards, `place unset place=bp`
+//! (why `two cards, tier at or past the break-even`, its `tier_experts` in
+//! [`BP_TIER_EXPERTS`] and at least its `break_even`), the unset rule's
+//! `mtp` and `mid-p0-s1`, and a plan on the cards `--place bp` plans:
 //!
 //! - the seat's `--ctx` rule ([`ctx`], on the gate card, one slot): the
 //!   default's `ctx` line against this gate's own plans of the file — the
@@ -337,6 +342,9 @@ mod gate {
     /// The drafted arm's residency word: no seed expert pinned, one spare a
     /// layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
+    /// The experts the seat's plan of `bp` puts on this box's 3090 at the
+    /// seat's defaults, a band for the free bytes each census reads.
+    const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 1490..=1515;
 
     /// The arms, one a process: `slots` is the drafted arm's (s5) alone,
     /// its server and clauses, which `drafted` runs too.
@@ -735,15 +743,21 @@ mod gate {
         Ok(plan.nextn_card_bytes() + plan.arena_bytes)
     }
 
-    /// `bloomery-serve --model glm --place <place> --plan` with both levers
-    /// unset and no `--ctx`, so the default context rule runs: its exit
-    /// status and stderr. It plans and exits before the load, so it opens no
-    /// card.
-    fn plan_only(dir: &Path, place: &str) -> Result<(bool, Vec<String>), GateError> {
+    /// `bloomery-serve --model glm [--place <place>] --plan` with both
+    /// levers unset and no `--ctx`, so the default context rule runs (and,
+    /// with no `--place`, the cards' rule): its exit status and stderr. It
+    /// plans and exits before the load, so it opens no card.
+    fn plan_only(dir: &Path, place: Option<&str>) -> Result<(bool, Vec<String>), GateError> {
         let exe = beside("bloomery-serve")?;
-        let err = dir.join(format!("plan-{place}.err"));
-        let status = Command::new(&exe)
-            .args(["--model", "glm", "--place", place, "--plan"])
+        let name = place.unwrap_or("unset");
+        let err = dir.join(format!("plan-{name}.err"));
+        let mut cmd = Command::new(&exe);
+        cmd.args(["--model", "glm"]);
+        if let Some(p) = place {
+            cmd.args(["--place", p]);
+        }
+        let status = cmd
+            .arg("--plan")
             .env_remove(bloomery_levers::DRAFT)
             .env_remove(bloomery_levers::RESIDENCY)
             .envs(UNSET.iter().copied())
@@ -753,7 +767,7 @@ mod gate {
             .status()
             .map_err(|e| format!("spawn {}: {e}", exe.display()))?;
         let lines = lines_from(&err, 0)?;
-        println!("--place {place} --plan with the levers unset: {status}");
+        println!("--place {name} --plan with the levers unset: {status}");
         for l in &lines {
             println!("  {l}");
         }
@@ -761,7 +775,9 @@ mod gate {
     }
 
     /// The unset rule's lines (the module header): `--place a` and `bp` draft
-    /// and run the residency's default word, `--place gate` neither.
+    /// and run the residency's default word, `--place gate` neither; each
+    /// names its word `set`, and a run with no `--place` takes the cards'
+    /// rule.
     fn unset_rule(dir: &Path) -> Result<bool, GateError> {
         let mut ok = true;
         let picks = |lines: &[String], draft: &str, residency: &str| -> Result<bool, GateError> {
@@ -782,24 +798,78 @@ mod gate {
                 && listening.is_none()
                 && host.is_some() == (residency != "off"))
         };
-        let (a_ok, a) = plan_only(dir, "a")?;
+        let (a_ok, a) = plan_only(dir, Some("a"))?;
         check(
             &mut ok,
             "unset_place_a_drafts_and_runs_mid_p0_s1",
             a_ok && picks(&a, "mtp", RESIDENCY_WORD)?,
         );
-        let (bp_ok, bp) = plan_only(dir, "bp")?;
+        let (bp_ok, bp) = plan_only(dir, Some("bp"))?;
         check(
             &mut ok,
             "unset_place_bp_drafts_and_runs_mid_p0_s1",
             bp_ok && picks(&bp, "mtp", RESIDENCY_WORD)?,
         );
-        let (g_ok, g) = plan_only(dir, "gate")?;
+        let (g_ok, g) = plan_only(dir, Some("gate"))?;
         check(
             &mut ok,
             "unset_place_gate_runs_neither",
             g_ok && picks(&g, "off", "off")?,
         );
+        // The placement every run names (`place unset`): under the flag its
+        // word, `why=set`; with none, on this box's two cards, the plan of
+        // `bp` kept — its tier at or past the break-even, the experts in
+        // [`BP_TIER_EXPERTS`] — the unset rules of a serving placement, and
+        // its plan on the cards `--place bp` plans (the `devices` list holds
+        // each card's usable bytes, not its free ones). FAIL-first: a seat
+        // that keeps `a` unset, or drops the tier it should keep, prints
+        // `place=a` and a plan of one card; a seat that drops the flag names
+        // the cards' rule under `--place a` and `gate`.
+        let placed = |lines: &[String]| -> Result<(String, String, u64, u64), GateError> {
+            let r = seat_log(lines).one(&record::PLACE_UNSET_GLM)?;
+            Ok((
+                r.word("place")?.to_owned(),
+                r.text("why")?.to_owned(),
+                r.u64("tier_experts")?,
+                r.u64("break_even")?,
+            ))
+        };
+        let devices = |lines: &[String]| -> Result<(String, Vec<String>), GateError> {
+            let plan = seat_log(lines).one(&record::PLAN)?;
+            let cards = plan
+                .csv("devices")?
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            Ok((plan.word("place")?.to_owned(), cards))
+        };
+        let mut named = true;
+        for (word, lines) in [("a", &a), ("bp", &bp), ("gate", &g)] {
+            let (place, why, tier, _) = placed(lines)?;
+            println!("--place {word}: place unset place={place} why={why} tier_experts={tier}");
+            named &= place == word && why == "set";
+        }
+        check(&mut ok, "set_place_is_named_set", named);
+        let (u_ok, unset) = plan_only(dir, None)?;
+        let follows = u_ok && {
+            let (place, why, tier, break_even) = placed(&unset)?;
+            let (plan_place, cards) = devices(&unset)?;
+            let (_, bp_cards) = devices(&bp)?;
+            println!(
+                "no --place: place unset place={place} why={why} tier_experts={tier} \
+                 break_even={break_even}; plan place={plan_place} devices {cards:?} (--place bp: \
+                 {bp_cards:?})"
+            );
+            place == "bp"
+                && why == "two cards, tier at or past the break-even"
+                && BP_TIER_EXPERTS.contains(&tier)
+                && tier >= break_even
+                && picks(&unset, "mtp", RESIDENCY_WORD)?
+                && plan_place == "bp"
+                && cards.len() == 2
+                && cards == bp_cards
+        };
+        check(&mut ok, "unset_place_follows_the_census", follows);
         // Every placement's `ctx` line: a rule word of the default rule's,
         // its context at or past the floor while the card holds it (a card
         // that holds less plans fewer, `card`, as qwen38 does). FAIL-first:
