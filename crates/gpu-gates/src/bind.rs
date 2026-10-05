@@ -416,44 +416,6 @@ impl CacheRam {
         })
     }
 
-    /// The parked states' budget of `n` slots that take one model in turns
-    /// (`serve::SwapEngine`): `set` (`--park-ram`) as given, else the lesser
-    /// of [`CACHE_RAM_CAP`] and what `MemAvailable` leaves past the plan's
-    /// host need, the churn pool, the checkpoints' host budget and the prompt
-    /// cache's budget; refused by name when that leaves nothing.
-    pub fn park(&self, set: Option<u64>, n: usize) -> Result<u64, GateError> {
-        if let Some(b) = set {
-            return Ok(b);
-        }
-        let b = self.park_or_none(None);
-        if b > 0 {
-            return Ok(b);
-        }
-        Err(format!(
-            "--parallel {n}: MemAvailable {} B less the plan's host need {} B, the churn \
-             pool {} B, the checkpoints {HOST_BUDGET} B and the prompt cache {} B leaves no \
-             room to park a slot's state; give --park-ram MIB or a smaller --cache-ram",
-            self.available, self.need, self.pool, self.ram
-        )
-        .into())
-    }
-
-    /// [`CacheRam::park`]'s terms, 0 when nothing is left: the elastic
-    /// `--parallel` default's budget, which falls to the plain engine there
-    /// instead of refusing. `set` (`--park-ram`) as given, as `park` takes it.
-    #[must_use]
-    pub fn park_or_none(&self, set: Option<u64>) -> u64 {
-        if let Some(b) = set {
-            return b;
-        }
-        let left = i128::from(self.available)
-            - i128::from(self.need)
-            - i128::from(self.pool)
-            - i128::from(HOST_BUDGET)
-            - i128::from(self.ram);
-        u64::try_from(left).map_or(0, |b| b.min(CACHE_RAM_CAP))
-    }
-
     /// The `cache` line's terms, the seat's own fields to follow: `cache
     /// ram=… rule=set|default available=… need=… pool=… checkpoints=…`.
     #[must_use]
@@ -465,87 +427,6 @@ impl CacheRam {
             self.available,
             self.need,
             self.pool
-        )
-    }
-}
-
-/// The most slots an elastic `--parallel` default names: the turns
-/// serialize the one engine's decode and each switch moves a whole state,
-/// so past a small group every slot the budget names only lengthens each
-/// live request's wall; a caller that wants more names it.
-pub const PARALLEL_CAP: usize = 4;
-
-/// `--parallel`'s slot count and what decided it, for the `parallel` line a
-/// seat that parks states prints: the parked states' `budget` holding one
-/// whole-context `state` a slot (one parked while the others run), the flag
-/// an upper bound on what it holds, [`PARALLEL_CAP`] the default's, the
-/// engine's own turn bound ([`Seat::turn_slots`]) another on the default's,
-/// never below 1 (the plain engine, nothing parked).
-pub struct Parallel {
-    /// The slots, the `--parallel` the server serves.
-    pub slots: usize,
-    /// `flag` (the flag's bound, what it holds of it), `budget` (the
-    /// default, what the budget holds), `engine` (the default, what the
-    /// engine's own turn bound takes), `plain` (one slot: the flag's, or a
-    /// budget that holds no state).
-    pub rule: &'static str,
-    /// The parked states' budget, 0 with none.
-    pub budget: u64,
-    /// One slot's whole-context state, the budget's unit.
-    pub state: u64,
-}
-
-impl Parallel {
-    /// The count and the rule (the type's doc), the engine taking its turns
-    /// in however many slots it serves ([`Seat::turn_slots`]'s default: no
-    /// limit).
-    #[must_use]
-    pub fn of(flag: Option<usize>, budget: u64, state: u64) -> Parallel {
-        Parallel::of_turn_slots(flag, budget, state, usize::MAX)
-    }
-
-    /// [`Parallel::of`] with the engine's own turn bound
-    /// ([`Seat::turn_slots`]): the elastic default holds no more slots than
-    /// the engine takes its one sequence in turns in, the rule naming the
-    /// engine when its bound is what held the count. The flag stays the
-    /// operator's ask, bounded by the budget's holds alone — a flag past
-    /// what the engine takes is the seat's to refuse by name.
-    #[must_use]
-    pub fn of_turn_slots(
-        flag: Option<usize>,
-        budget: u64,
-        state: u64,
-        turn_slots: usize,
-    ) -> Parallel {
-        let holds = 1 + usize::try_from(budget / state.max(1)).unwrap_or(usize::MAX);
-        let (slots, rule) = match flag {
-            Some(0 | 1) => (1, "plain"),
-            Some(f) => (f.min(holds).max(1), "flag"),
-            None if holds < 2 => (1, "plain"),
-            None => {
-                let want = PARALLEL_CAP.min(holds);
-                if turn_slots < want {
-                    (turn_slots.max(1), "engine")
-                } else {
-                    (want, "budget")
-                }
-            }
-        };
-        Parallel {
-            slots,
-            rule,
-            budget,
-            state,
-        }
-    }
-
-    /// The `parallel` line's terms: `parallel rule=… slots=… park=…
-    /// state=… cap=…`.
-    #[must_use]
-    pub fn line(&self) -> String {
-        format!(
-            "parallel rule={} slots={} park={} state={} cap={PARALLEL_CAP}",
-            self.rule, self.slots, self.budget, self.state
         )
     }
 }
@@ -705,18 +586,10 @@ pub trait Seat: 'static {
     fn pass_rows(&self) -> usize {
         1
     }
-    /// The most slots that may take this seat's one sequence in turns
-    /// (`serve::SwapEngine`): a seat whose engine's state does not survive
-    /// a park caps it, and the elastic `--parallel` default holds no more
-    /// ([`Parallel::of_turn_slots`]). The default is no limit.
-    fn turn_slots(&self) -> usize {
-        usize::MAX
-    }
     /// The sequences this seat serves at once, each a sequence of its own
     /// the seat keeps resident (the server steps them together, one
     /// [`Seat::step`] each in one round). The default is 1: the seat serves
-    /// one sequence, and several slots take it in turns
-    /// ([`Seat::turn_slots`], `serve::SwapEngine`).
+    /// one sequence, and several slots take it in turns (`serve::SwapEngine`).
     fn slots(&self) -> usize {
         1
     }
@@ -860,8 +733,6 @@ pub struct SeatEngine {
     ctx_max: usize,
     /// [`Seat::pass_rows`].
     rows: usize,
-    /// [`Seat::turn_slots`], the opened seat's.
-    turn_slots: usize,
     /// [`Seat::slots`], the opened seat's.
     slots: usize,
     /// [`Seat::slot_drafts`], the opened seat's.
@@ -898,8 +769,8 @@ impl SeatEngine {
     /// [`placement_props`]), which the seat completes ([`Seat::props`]);
     /// `cache_ram` is the server's prompt cache budget
     /// (`serve::Engine::cache_ram`). The seat's whole-load capabilities —
-    /// [`Seat::pass_rows`], [`Seat::turn_slots`], [`Seat::slots`],
-    /// [`Seat::slot_drafts`] — cross with the load.
+    /// [`Seat::pass_rows`], [`Seat::slots`], [`Seat::slot_drafts`] — cross
+    /// with the load.
     pub fn spawn<S, F>(
         open: F,
         defined: usize,
@@ -915,7 +786,7 @@ impl SeatEngine {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let (opened, loaded) =
-            mpsc::channel::<Result<(usize, usize, usize, usize, bool, EngineProps), String>>();
+            mpsc::channel::<Result<(usize, usize, usize, bool, EngineProps), String>>();
         let n_vocab = vocab.n_vocab();
         let worker = std::thread::Builder::new()
             .name("engine".to_owned())
@@ -931,7 +802,6 @@ impl SeatEngine {
                     .send(Ok((
                         g.ctx_max(),
                         g.pass_rows(),
-                        g.turn_slots(),
                         g.slots(),
                         g.slot_drafts(),
                         g.props(props),
@@ -1017,8 +887,8 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, turn_slots, slots, slot_drafts, props) = match loaded.recv() {
-            Ok(Ok((c, rows, t, n, d, props))) => (c.min(defined), rows, t, n, d, props),
+        let (ctx_max, rows, slots, slot_drafts, props) = match loaded.recv() {
+            Ok(Ok((c, rows, n, d, props))) => (c.min(defined), rows, n, d, props),
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
@@ -1033,7 +903,6 @@ impl SeatEngine {
             vocab,
             ctx_max,
             rows,
-            turn_slots,
             slots,
             slot_drafts,
             card,
@@ -1042,14 +911,6 @@ impl SeatEngine {
             note: S::note,
             reply: None,
         })
-    }
-
-    /// The most slots that may take the engine in turns, the opened seat's
-    /// answer ([`Seat::turn_slots`]): no limit unless the seat's state does
-    /// not survive a park.
-    #[must_use]
-    pub fn turn_slots(&self) -> usize {
-        self.turn_slots
     }
 
     /// The sequences the engine serves at once, the opened seat's answer
@@ -2207,84 +2068,6 @@ mod tests {
         assert!(e.0.contains("holds 7, the engine's 8"), "{e}");
         link.tx = None;
         worker.join().expect("the echo thread");
-    }
-
-    /// The elastic slot count (the `Parallel` doc): the default what the
-    /// budget holds capped, the flag an upper bound on the same, and every
-    /// road's floor the plain engine.
-    #[test]
-    fn parallel_slots_hold_what_the_budget_holds() {
-        use super::{CacheRam, HOST_BUDGET, PARALLEL_CAP, Parallel};
-        let s = 1 << 30;
-        // The default: one parked state beside the running slot, capped.
-        assert_eq!(Parallel::of(None, 0, s).slots, 1);
-        assert_eq!(Parallel::of(None, 1, s).slots, 1);
-        for (park, want) in [
-            (s, 2),
-            (2 * s, 3),
-            (9 * s, PARALLEL_CAP),
-            (90 * s, PARALLEL_CAP),
-        ] {
-            let p = Parallel::of(None, park, s);
-            assert_eq!((p.slots, p.rule), (want, "budget"), "park {park}");
-        }
-        // The flag: an upper bound on the same holds, never past it.
-        for (flag, park, want) in [
-            (1, 5 * s, 1),
-            (2, 0, 1),
-            (2, s, 2),
-            (8, 2 * s, 3),
-            (8, 90 * s, 8),
-        ] {
-            let p = Parallel::of(Some(flag), park, s);
-            assert_eq!(p.slots, want, "flag {flag} park {park}");
-        }
-        // The elastic default's budget takes a set `--park-ram` as `park`
-        // does, uncapped by the derived terms; without one it is the derived
-        // headroom, capped, 0 when nothing is left.
-        let ram = CacheRam {
-            ram: 1 << 30,
-            set: false,
-            available: HOST_BUDGET + (5 << 30),
-            need: 0,
-            pool: 0,
-        };
-        assert_eq!(ram.park_or_none(None), 4 << 30);
-        assert_eq!(ram.park_or_none(Some(2 << 30)), 2 << 30);
-        assert_eq!(ram.park_or_none(Some(99 << 30)), 99 << 30);
-        let tight = CacheRam {
-            available: 1 << 20,
-            ..ram
-        };
-        assert_eq!(tight.park_or_none(None), 0);
-    }
-
-    /// The engine's own turn bound ([`Seat::turn_slots`],
-    /// [`Parallel::of_turn_slots`]): the elastic default holds no more slots
-    /// than the engine takes its one sequence in turns in, the rule naming
-    /// the engine when its bound is what held the count; the flag's bound is
-    /// the operator's ask, held by the budget's holds alone.
-    #[test]
-    fn the_engines_turn_bound_holds_the_elastic_default() {
-        use super::{PARALLEL_CAP, Parallel};
-        let s = 1 << 30;
-        // The default: the budget holds the cap, the engine fewer turn slots.
-        for bound in [1, 2] {
-            let p = Parallel::of_turn_slots(None, 90 * s, s, bound);
-            assert_eq!((p.slots, p.rule), (bound, "engine"), "bound {bound}");
-        }
-        // A bound past what the cap or the budget holds names nothing.
-        let p = Parallel::of_turn_slots(None, 90 * s, s, usize::MAX);
-        assert_eq!((p.slots, p.rule), (PARALLEL_CAP, "budget"));
-        let p = Parallel::of_turn_slots(None, 2 * s, s, 4);
-        assert_eq!((p.slots, p.rule), (3, "budget"), "the budget holds three");
-        // A budget that holds no state stays the plain engine.
-        let p = Parallel::of_turn_slots(None, 0, s, 1);
-        assert_eq!((p.slots, p.rule), (1, "plain"));
-        // The flag: bounded by the budget's holds alone, never the engine's
-        // bound — a flag past what the engine takes is the seat's refusal.
-        let p = Parallel::of_turn_slots(Some(3), 90 * s, s, 1);
-        assert_eq!(p.slots, 3, "the flag's bound unchanged by the engine's");
     }
 
     /// A MiB value past u64 bytes names the flag it parsed

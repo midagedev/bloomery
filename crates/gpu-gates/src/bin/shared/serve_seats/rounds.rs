@@ -1,9 +1,9 @@
 //! The serve seats' one owner of a round run as passes: a seat whose body
 //! has [`SlotRows`] and decided at its open to run one pass overrides
 //! [`Seat::step_slots`] through [`step_round`] with [`step_rows_one_pass`]
-//! and its drafted twin [`Seat::pass_slots`] with [`pass_rows_one_pass`];
-//! any other seat keeps the defaults, [`bind::step_rows_in_turn`] and
-//! [`bind::pass_rows_in_turn`].
+//! and its drafted twin [`Seat::pass_slots`] through [`pass_round`] with
+//! [`pass_rows_one_pass`]; any other seat keeps the defaults,
+//! [`bind::step_rows_in_turn`] and [`bind::pass_rows_in_turn`].
 //!
 //! [`bind::step_rows_in_turn`]: bloomery_gpu_gates::bind::step_rows_in_turn
 //! [`bind::pass_rows_in_turn`]: bloomery_gpu_gates::bind::pass_rows_in_turn
@@ -11,7 +11,7 @@
 use app::mtp::{MtpBody, SlotWindow};
 use bloomery_gpu::model::SlotRows;
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::bind::{Seat, SlotPassRow, SlotStep, step_rows_in_turn};
+use bloomery_gpu_gates::bind::{Seat, SlotPassRow, SlotStep, pass_rows_in_turn, step_rows_in_turn};
 use bloomery_gpu_gates::record;
 use runtime::{Widths, Window};
 use serve::Drafted;
@@ -41,6 +41,35 @@ pub fn step_round<S: Seat>(
     after(seat).map_err(|e| e.to_string())?;
     if seat.step_stats() {
         record::slots_round("step", rows.len(), passes, seat.slots()).eprint();
+    }
+    Ok(())
+}
+
+/// One round of several slots' drafted passes, a seat's [`Seat::pass_slots`]
+/// override, its one owner: the fallback loop ([`pass_rows_in_turn`], which
+/// prints its own record) unless the seat's open decided `one_pass`; else
+/// `run`, the seat's pass of the rows — what it first does to the rows a
+/// seat's own rule asks (GLM turns a skipping slot's draft off before the
+/// pass, Qwen3.8 prints each slot's own pre-call) stays seat code inside
+/// the closure — then `after`, what the seat prints of the call (its
+/// `residency pass` records), then — while the seat counts its rounds
+/// ([`Seat::step_stats`]) — the `slots round` record, cmd `pass`. A
+/// refusal on either path is the server's to die on: the open decides
+/// once, so a load that cannot run one pass never tries it at run time.
+pub fn pass_round<S: Seat>(
+    seat: &mut S,
+    one_pass: bool,
+    rows: &mut [SlotPassRow],
+    run: impl FnOnce(&mut S, &mut [SlotPassRow]) -> Result<usize, GateError>,
+    after: impl FnOnce(&mut S) -> Result<(), GateError>,
+) -> Result<(), String> {
+    if !one_pass {
+        return pass_rows_in_turn(seat, rows);
+    }
+    let passes = run(seat, rows).map_err(|e| e.to_string())?;
+    after(seat).map_err(|e| e.to_string())?;
+    if seat.step_stats() {
+        record::slots_round("pass", rows.len(), passes, seat.slots()).eprint();
     }
     Ok(())
 }

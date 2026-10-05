@@ -122,14 +122,14 @@ impl KeptRows {
     }
 
     /// The lowest kept row at or past `rows`, when there is one: the row a
-    /// caller that holds a pass's own bound refuses by name.
+    /// caller that holds a pass's own bound refuses by name. A mask holds
+    /// rows 0..64 alone, so a bound of 64 or more holds no kept row.
     #[must_use]
     pub fn past(self, rows: usize) -> Option<usize> {
-        let over = if rows >= 64 {
-            self.mask
-        } else {
-            self.mask >> rows
-        };
+        if rows >= 64 {
+            return None;
+        }
+        let over = self.mask >> rows;
         (over != 0).then(|| rows + over.trailing_zeros() as usize)
     }
 
@@ -1493,6 +1493,20 @@ mod tests {
             want.clone(),
             "a prefix of the kept count is the wrong fold"
         );
+    }
+
+    /// A mask holds rows 0..64 alone, so a pass bound of 64 or more holds no
+    /// kept row at or past it: a legal keep checked against one is granted
+    /// ([`SwapRule::end_pass`]'s `KeptPastRows` refusal names a row the pass
+    /// observed).
+    #[test]
+    fn a_pass_bound_of_64_holds_no_kept_row() {
+        assert_eq!(KeptRows::of([0, 63]).past(64), None);
+        assert_eq!(KeptRows::prefix(64).past(64), None);
+        // A bound under 64 still names its lowest kept row at or past it.
+        assert_eq!(KeptRows::of([2, 40]).past(3), Some(40));
+        assert_eq!(KeptRows::of([2, 40]).past(2), Some(2));
+        assert_eq!(KeptRows::of([2, 40]).past(41), None);
     }
 
     /// A small deterministic history: 3 layers of 16 experts, top-2, passes of 1
