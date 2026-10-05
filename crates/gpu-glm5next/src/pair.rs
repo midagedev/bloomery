@@ -965,10 +965,17 @@ impl SlotRows for Body {
     /// The chain of the point the walk lays ([`slots_chain`]): the step for
     /// one row, the pair for two, the quad for four. A point the walk does
     /// not lay is refused by name before any capture or launch of it
-    /// ([`Body::refuse_slots`]), so no replay of one is served and its arm
-    /// is never read.
+    /// ([`Body::refuse_slots`]), so no point the walk does not lay reaches
+    /// here; one that does is a named panic.
     fn chain_of(rows: &[SlotRange]) -> Chain {
-        slots_chain(rows).unwrap_or(Chain::Step)
+        slots_chain(rows).unwrap_or_else(|| {
+            panic!(
+                "glm5next SlotRows::chain_of: a pass of {} slots and {} rows, a point the walk \
+                 does not lay; Body::refuse_slots refuses it before any capture or launch",
+                rows.len(),
+                pass_rows(rows)
+            )
+        })
     }
 
     /// Each slot's rows planned from its own sequence (module doc): refused
