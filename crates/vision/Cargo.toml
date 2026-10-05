@@ -13,11 +13,16 @@ workspace = true
 
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
-# PNG decode only. Pinned exactly: the preprocessing gate is bit-exact against the reference's
-# decoded pixels, so the decoder is part of what it proves.
+# PNG and JPEG decode. Pinned exactly: the preprocessing gate compares against the reference's
+# decoded pixels, so the decoders are part of what it proves. zune-core holds the JPEG decoder's
+# options and its SIMD dispatch, and is pinned to the release that decoder was published against.
 png = "=0.18.1"
 thiserror = { workspace = true }
+zune-core = "=0.5.1"
+zune-jpeg = "=0.5.15"
 
 [dev-dependencies]
 # The gates read the oracle set through the reference-set reader, which checks its provenance.
 bloomery-refset = { path = "../refset" }
+# The JPEG fixtures' manifest names each file by its sha256.
+sha2 = { workspace = true }

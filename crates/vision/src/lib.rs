@@ -3,7 +3,7 @@
 //!
 //! No device code and no encoder arithmetic live here. What does:
 //!
-//! * [`image`] — decode a PNG into 8-bit RGB, the reference's `Image.convert("RGB")`.
+//! * [`image`] — decode a PNG or a JPEG into 8-bit RGB, the reference's `Image.convert("RGB")`.
 //! * [`grid`] — the resize plan (`plan_image_grid`, `safe_resize` of the reference
 //!   `image_processor.py`), integer-identical to it.
 //! * [`resample`] — Pillow's bicubic resize and `ImageOps.pad`, ported to the integer: the
@@ -11,6 +11,8 @@
 //! * [`preprocess`] — normalize the padded image to bf16 and cut it into patches in the reference's
 //!   order.
 //! * [`span`] — the token layout of one image in the prompt.
+//! * [`media`] — what a model tells the server about its image input ([`MediaModel`]): data plus
+//!   one prepare.
 //! * [`arch`] — per projector type, the names and hyperparameters of the encoder file (the mmproj
 //!   GGUF), each read once and refused by name when this crate does not run it.
 //!
@@ -21,12 +23,14 @@
 pub mod arch;
 pub mod grid;
 pub mod image;
+pub mod media;
 pub mod preprocess;
 pub mod resample;
 pub mod span;
 
 pub use grid::{GridParams, GridPlan, plan_image_grid};
-pub use image::Rgb8;
+pub use image::{FileKind, Rgb8};
+pub use media::{MediaModel, Prepared};
 pub use preprocess::{Patches, preprocess};
 pub use span::{ImageSpan, SpanType, image_span};
 

@@ -5436,7 +5436,8 @@ def narrow_self_test(expect, side: Side) -> None:
     # each refused by name; a trigger-only row is held to no gate's module (it maps nothing for --narrow)
     got = gate_paths_problems(tree, recipes, [row("crates/serve/src/**", ["weekly-nope"])])
     expect(len(got) == 1 and "weekly-nope is not a weekly-* recipe" in got[0], f"gate-paths: an unknown weekly trigger not refused: {got}")
-    got = gate_paths_problems(tree, recipes, [row("crates/vision/src/**", ["weekly-gpu-ds41-serve"])])
+    # engram-lab is a lab crate: no engine binary links it, so no gate's build reads its files
+    got = gate_paths_problems(tree, recipes, [row("crates/engram-lab/src/**", ["weekly-gpu-ds41-serve"])])
     expect(len(got) == 1 and "weekly-gpu-ds41-serve reads none of the" in got[0], f"gate-paths: a trigger off its gate not refused: {got}")
     got = gate_paths_problems(tree, recipes, [row("crates/gpu-deepseek41/src/{body.rs,body/**}", ["weekly-gpu-ds41-flowcounts"])])
     expect(not got, f"gate-paths: a trigger-only row held to the gates that name its module: {got[:2]}")

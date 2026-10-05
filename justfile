@@ -1660,10 +1660,27 @@ markov-accept *ARGS:
 dump-ref-vision:
     ./tools/box.sh 'bash tools/ref/vision/dump-vision.sh'
 
+# JPEG decoder fixtures: dump-jpeg.py on the box encodes crops of tools/ref/vision/images/ with the system Pillow and
+# decodes each file the way the reference does (its header lists the files); the set comes back whole into
+# crates/vision/tests/fixtures/jpeg/, which the image tests read. Another libjpeg writes other bytes: commit the set whole.
+dump-ref-jpeg:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out=/tmp/$(basename "$PWD")-dump-jpeg
+    ./tools/box.sh "rm -rf $out && /home/user/ft/bin/python3 tools/ref/vision/dump-jpeg.py --out $out"
+    got=$(mktemp -d) && chmod 755 "$got"
+    BLOOMERY_BOX_READONLY=1 ./tools/box.sh "tar -C $out -cf - ." | tar -C "$got" -xf -
+    grep -q '^# complete' "$got/MANIFEST.tsv"
+    rm -rf crates/vision/tests/fixtures/jpeg
+    mkdir -p crates/vision/tests/fixtures
+    mv "$got" crates/vision/tests/fixtures/jpeg
+    ls -l crates/vision/tests/fixtures/jpeg
+
 # V4.1 비전 호스트 게이트(V1): 리사이즈 플랜과 패드 기하, 패드된 u8 이미지와 bf16 패치(리샘플 유무 모두 비트 동일),
 # 스팬 id·타입을 그 세트와 대조하고, mmproj 헤더의 hparams와 모든 텐서의 이름을 검사한다.
+# It also runs tests/jpeg.rs: the JPEG decoder against Pillow on the fixtures of dump-ref-jpeg, within the pinned frontier.
 gate-vision:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-vision --lib --test vision -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-vision --lib --test vision --test jpeg -- --include-ignored --nocapture'
 
 # V4.1 이미지 인코더 카드 게이트(V2): 전체 사슬(ViT 32블록 + aligner, bf16 텐서코어 GEMM, 비인과 어텐션, 2D RoPE)을
 # 비전 오라클 세트의 모든 이미지에 돌려 공식 vision.py와 탭별로 대조한다 — embed·blk0·forced 탭은 절대 핀, 자유 실행 탭은
