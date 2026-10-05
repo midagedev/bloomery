@@ -156,9 +156,9 @@
 //!   the card. A whole-fit line that says the load does not fit is a named
 //!   error: the arm is not a whole arm. FAIL-first: a halving that stops a
 //!   step early splits a total whose next grid point still fits, red on (c).
-//! - `slots_rounds_run_one_pass`, on the qwen3moe arm (the body with one
-//!   pass of its slots, `SlotRows`; a qwen35moe file's rounds take the
-//!   seat's fallback loop on either load): a whole-card server
+//! - `slots_rounds_run_one_pass`, on both arms (both bodies run one pass of
+//!   their slots, `SlotRows`: a qwen3moe file's `Body`, a qwen35moe file's
+//!   `Body35`): a whole-card server
 //!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
 //!   record a round of several slots — two greedy streamed requests of the
 //!   slots clause's prompts, each first run alone on that server and then
@@ -183,11 +183,10 @@
 //!   few rounds — slot 1 taken mid-run, its prompt run between the first's
 //!   rounds — answers with each request's alone ids, the first's included:
 //!   the rounds the two ran together leave each slot's sequence whole
-//!   whatever slot the pass left selected (a qwen35moe file's: whatever slot
-//!   the fallback loop's last row left selected, the second's prompt call
-//!   taking its checkpoints in its own sequence). FAIL-first: a round that
-//!   leaves the wrong slot selected runs the second request's prompt over
-//!   the first's sequence, and both requests' ids move at once.
+//!   whatever slot the pass left selected (a qwen35moe file's second
+//!   prompt call taking its checkpoints in its own sequence). FAIL-first: a
+//!   round that leaves the wrong slot selected runs the second request's
+//!   prompt over the first's sequence, and both requests' ids move at once.
 //! - `slot_ctx_too_small_is_refused`, on both arms: `--ctx 15`
 //!   under the default two slots — a slot of 7 rows, one under the 8 rows
 //!   a slot loads at (`router::MAX_TOKENS`: the widest pass a whole-card
@@ -252,7 +251,7 @@
 //! two arms pass `--parallel 2` (resident on both files: the whole-card load
 //! and the budgeted placed one) and the refusal arm passes none (the default
 //! two are what makes the split too small); the slots-round clause's two
-//! arms (qwen3moe) pass `--parallel 2` with `BLOOMERY_STEP_STATS=1` in their
+//! arms (both files) pass `--parallel 2` with `BLOOMERY_STEP_STATS=1` in their
 //! environment (the whole-card load and the budgeted placed one), and the
 //! late arm passes `--parallel 2` (whole-card, no lever); the host-tier
 //! arm (qwen3moe) pins `--parallel 1` (one prompt on
@@ -2527,11 +2526,11 @@ mod gate {
             slots_count_their_checkpoints(model, &dir, &mut ok)?;
             slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
             slots_late_request_together_alone(model, &dir, &mut ok)?;
+            slots_rounds_run_one_pass(model, &dir, &mut ok)?;
             if arch == "qwen3moe" {
                 // The qwen3moe arm alone: the placed prompt past the GEMM
-                // walk, and the one pass a body with `SlotRows` runs.
+                // walk.
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
-                slots_rounds_run_one_pass(model, &dir, &mut ok)?;
             }
         }
         if ok {
