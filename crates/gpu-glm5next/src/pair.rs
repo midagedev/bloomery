@@ -24,29 +24,23 @@
 //! load, [`Body::open_placed_lanes`] at two); on a load of one lane a verify
 //! is refused by name before anything moves, its plan and its capture alike.
 //!
-//! A pass of two slots ([`SlotRows`], `GpuModel::step_slots`) walks the same
-//! two rows one layer apart, each row a plain step of its own slot: its
-//! embedding at its slot's position, its KDA launches in place on its
-//! slot's committed lane (row base 0, whatever the load's lanes), its latent
-//! rows and conv ring in its slot's stores, and its final streams in its
-//! slot's own step row ([`binding`]), so each row is bit for bit its slot's
-//! step alone. The rows in flight are the load's, so a load of one lane runs
-//! it as a load of two does. The host half plans each row from its own
-//! slot's sequence: the stores standing at its position, its waiting cut
-//! carried out from its own checkpoints, its held position and step row
-//! moved.
-//!
-//! The drafted pass of a NextN load — each slot's two verify rows in flight
-//! at once, over the busy slots — is not built yet: the pass is refused by
-//! name ([`Body::refuse_slots`]) and what it needs stands named and
-//! refusing, the per-slot planning ([`Body::plan_slot_rows`]) and the
-//! pass's commit (`keep_slot`) here, the draft side's cut
-//! (`NextnSeq::cut`) beside the layer. The pieces it will not change are in
-//! place: [`LOAD_ROWS`] counts the load's rows in flight, and the walk binds
-//! each row to its slot's sequence through [`RowBind`] in [`Parts`], which
-//! exchanges the sequences only at a slot's range boundary and numbers a
-//! row by its offset in its slot's rows — the plain pass's binding already
-//! that rule, at a row a slot.
+//! A pass of slots ([`SlotRows`], `GpuModel::step_slots`,
+//! `GpuModel::verify_slots`) walks its rows one layer apart the same way,
+//! each row a row of its own slot's sequence: its embedding at its row's
+//! position, its KDA launches on its slot's lanes (row base 0 in place on
+//! its committed lane, a verify's row 1 from the lane its row 0 wrote into
+//! the next), its latent rows and conv ring in its slot's stores, and its
+//! final streams in its slot's own row ([`binding`]), so each row is bit for
+//! bit its slot's row alone. A plain load runs a row a slot, a plain step; a
+//! NextN load each slot's verify's two — a pass of two slots four rows in
+//! flight — and each slot then waits for its commit ([`Lanes`]) as its own
+//! verify does, `GpuModel::commit_slots` keeping its accepted rows slot by
+//! slot (`SlotRows::keep_slot`). The rows in flight are the load's, so a
+//! load of one lane runs a plain pass as a load of two does. The host half
+//! plans each slot's rows from its own sequence ([`Body::plan_slot_rows`]):
+//! the stores standing at its first position, its waiting cut carried out
+//! once from its own checkpoints before its row 0, its held position and
+//! rows' records moved.
 
 use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::head::Head;
@@ -55,8 +49,7 @@ use bloomery_gpu::linear::delta::row_lane;
 use bloomery_gpu::model::{ChainBody, Rows, SlotRange, SlotRows};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, capturing};
-use cuda_core::CudaStream;
-use runtime::sched;
+use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::seqstate::{Kept, Why};
 
 use model::arch::glm5next::place::KdaLanes;
@@ -71,17 +64,15 @@ use crate::program;
 /// The rows one load holds in flight, whatever its KDA lanes: every
 /// load-sized term counts them — the pass's row buffers ([`Scratch`]), the
 /// card experts' rows, the host boundary's, the expert tier's. A verify's
-/// two (a row a lane of the one sequence) and a pass of two slots' two (a
-/// row a slot) today; the drafted pass of a NextN load, each slot's rows
-/// its verify's, is not built yet and widens them when it is.
-pub const LOAD_ROWS: usize = 2;
+/// two (a row a lane of the one sequence), a plain pass's two (a row a
+/// slot) and a NextN load's drafted pass's four (each slot's verify's
+/// rows).
+pub const LOAD_ROWS: usize = 4;
 
-/// The load's rows in flight, as [`LOAD_ROWS`] names them; the verify's own
-/// two rows are [`LANES`], a row a lane.
-pub const PAIR_ROWS: usize = LOAD_ROWS;
-
-// A verify keeps the state after each of its rows in a lane of its own.
-const _: () = assert!(PAIR_ROWS == LANES && LANES >= 1 && LANES <= u32::MAX as usize);
+// The load's rows run the verifies of the most sequences a walk binds at
+// once, a slot's rows a verify's, a row a lane.
+const _: () =
+    assert!(LOAD_ROWS == RowBind::SEQS * LANES && LANES >= 1 && LANES <= u32::MAX as usize);
 
 /// The host's side of the KDA lanes: the committed lane every launch reads
 /// (the lane word's value), and the verify waiting for its commit.
@@ -128,6 +119,13 @@ impl Lanes {
             at,
             why,
         })
+    }
+
+    /// Whether the verify waiting for its commit is one of `rows` rows from
+    /// `pos0`.
+    fn waits_for(&self, pos0: u32, rows: usize) -> bool {
+        self.waiting
+            .is_some_and(|w| w.pos0 == pos0 && w.rows as usize == rows)
     }
 
     /// Refused by name while a verify waits for its commit: a call at `pos`
@@ -181,7 +179,7 @@ impl Body {
         let r = self
             .s
             .row_mut(row)
-            .ok_or_else(|| shape(format!("row {row} of a pass on a load of {PAIR_ROWS} rows")))?;
+            .ok_or_else(|| shape(format!("row {row} of a pass on a load of {LOAD_ROWS} rows")))?;
         write_row(stream, r, &self.embd.streams, p)?;
         self.held = p + 1;
         if row == 0 {
@@ -204,9 +202,9 @@ impl Body {
         pos: u32,
     ) -> Result<(), GpuError> {
         self.refuse_one_lane()?;
-        if tokens.len() != PAIR_ROWS {
+        if tokens.len() != LANES {
             return Err(shape(format!(
-                "a verify of {} rows; the lanes hold {PAIR_ROWS}",
+                "a verify of {} rows; the lanes hold {LANES}",
                 tokens.len()
             )));
         }
@@ -222,15 +220,15 @@ impl Body {
             )));
         }
         let carried = self.hybrid.boundary().rows();
-        if carried < PAIR_ROWS {
+        if carried < LANES {
             return Err(shape(format!(
-                "a verify of {PAIR_ROWS} rows on a host boundary of {carried}: the load makes the \
+                "a verify of {LANES} rows on a host boundary of {carried}: the load makes the \
                  boundary with a row for each of the verify's rows"
             )));
         }
-        if pos as usize + PAIR_ROWS > self.ctx {
+        if pos as usize + LANES > self.ctx {
             return Err(shape(format!(
-                "a verify of {PAIR_ROWS} rows at position {pos} in stores of {}",
+                "a verify of {LANES} rows at position {pos} in stores of {}",
                 self.ctx
             )));
         }
@@ -242,9 +240,9 @@ impl Body {
         }
         self.s.lanes.waiting = Some(Waiting {
             pos0: pos,
-            rows: PAIR_ROWS as u32,
+            rows: LANES as u32,
         });
-        self.wrote.pair = super::nextn::Held::at(pos, PAIR_ROWS as u32);
+        self.wrote.pair = super::nextn::Held::at(pos, LANES as u32);
         Ok(())
     }
 
@@ -254,40 +252,43 @@ impl Body {
         match self.lanes {
             KdaLanes::Two => Ok(()),
             KdaLanes::One => Err(shape(format!(
-                "a verify of {PAIR_ROWS} rows on a load of one KDA lane: only a load that \
+                "a verify of {LANES} rows on a load of one KDA lane: only a load that \
                  verifies holds the second (Body::open_placed_lanes at KdaLanes::Two, or the \
                  NextN load)"
             ))),
         }
     }
 
-    /// Keep the first `pos − pos0` rows of the verify waiting for its commit:
-    /// the lane word to the lane the last kept row wrote, or where it stands
-    /// when that is row 0's. With no verify waiting, or a `pos` outside its
-    /// rows, the cut [`Body::cut`] takes.
+    /// Keep the first `pos − pos0` rows of the verify waiting for its commit
+    /// ([`Body::commit_live`]). With no verify waiting, or a `pos` outside
+    /// its rows, the cut [`Body::cut`] takes.
     pub(super) fn commit(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
-        let Some(w) = self.s.lanes.waiting else {
-            return self.cut(pos);
-        };
-        let end = w.pos0 + w.rows;
-        if pos <= w.pos0 || pos > end || self.held != end {
-            return self.cut(pos);
+        if self.commit_live(gpu, pos)? {
+            return Ok(());
         }
-        let c = self.s.lanes.committed;
-        let lane = row_lane(c, pos - w.pos0 - 1, self.lanes.count() as u32);
-        if lane != c {
-            self.s.lane.copy_from_host(gpu.stream(), &[lane])?;
-        }
-        self.s.lanes = Lanes {
-            committed: lane,
-            waiting: None,
-        };
-        self.held = pos;
-        self.wrote.cut(pos);
-        if let Some(n) = self.nextn.as_deref_mut() {
+        self.cut(pos)
+    }
+
+    /// The live sequence's verify waiting for its commit kept up to `pos`
+    /// ([`commit_lanes`]: the lane word to the lane the last kept row
+    /// wrote, or where it stands when that is row 0's), the draft's records
+    /// cut with it. Whether a verify waited with `pos` inside its rows;
+    /// nothing moves otherwise.
+    fn commit_live(&mut self, gpu: &Gpu, pos: u32) -> Result<bool, GpuError> {
+        let count = self.lanes.count() as u32;
+        let Body {
+            s,
+            held,
+            wrote,
+            nextn,
+            ..
+        } = self;
+        let Scratch { lane, lanes, .. } = s;
+        let done = commit_lanes(gpu.stream(), lane, lanes, held, wrote, pos, count)?;
+        if let Some(n) = nextn.as_deref_mut().filter(|_| done) {
             n.cut(pos);
         }
-        Ok(())
+        Ok(done)
     }
 
     /// A cut to `pos`: nothing at the fed position; the empty model at 0;
@@ -344,7 +345,7 @@ impl Rows for Body {
         self.refuse_one_lane()?;
         let [a, b] = heads else {
             return Err(shape(format!(
-                "{} heads; the verify runs {PAIR_ROWS}",
+                "{} heads; the verify runs {LANES}",
                 heads.len()
             )));
         };
@@ -360,7 +361,7 @@ impl Rows for Body {
         if let Some(n) = self.nextn.as_deref_mut() {
             let fin = program::final_streams(self.cfg.len());
             n.pair0_mut()
-                .copy_from_device_async(&self.s.row0.streams[fin], gpu.stream())?;
+                .copy_from_device_async(&self.s.rows[0].streams[fin], gpu.stream())?;
         }
         self.planted(Plant::AfterLaunch)
     }
@@ -372,25 +373,38 @@ impl Rows for Body {
 /// and position: what an enqueue outside a capture runs on, and only on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SlotsPlanned {
-    at: [(usize, u32); PAIR_ROWS],
+    at: [(usize, u32); LOAD_ROWS],
     n: usize,
 }
 
 impl SlotsPlanned {
+    /// Each row's slot and position, the first [`LOAD_ROWS`] of them, and
+    /// the pass's rows.
     fn of(rows: &[SlotRange]) -> SlotsPlanned {
-        let mut at = [(0, 0); PAIR_ROWS];
-        for (a, r) in at.iter_mut().zip(rows) {
-            *a = (r.slot, r.pos0);
+        let mut at = [(0, 0); LOAD_ROWS];
+        let each = rows
+            .iter()
+            .flat_map(|r| (r.pos0..).take(r.rows.len()).map(|p| (r.slot, p)));
+        for (a, row) in at.iter_mut().zip(each) {
+            *a = row;
         }
-        SlotsPlanned { at, n: rows.len() }
+        SlotsPlanned {
+            at,
+            n: pass_rows(rows),
+        }
     }
 }
 
-/// The chain a pass of `slots` slots runs: [`sched::slot_lanes`]' point on a
-/// page of one column a row — the step for one slot, the pair for two;
-/// `None` for a point the walk does not lay.
-fn slots_chain(slots: usize) -> Option<Chain> {
-    let o = sched::slot_lanes(slots).ok()?.overlap;
+/// The rows of a pass of `rows`: where its last slot's range ends.
+fn pass_rows(rows: &[SlotRange]) -> usize {
+    rows.last().map_or(0, |r| r.rows.end)
+}
+
+/// The chain a pass of `rows` runs: [`program::slots_point`]'s point on a
+/// page of one column a row — the step for one row, the pair for two, the
+/// quad for four; `None` for a point the walk does not lay.
+fn slots_chain(rows: &[SlotRange]) -> Option<Chain> {
+    let o = program::slots_point(rows.len(), pass_rows(rows)).ok()?;
     Chain::of(o.units, o.cols, 1)
 }
 
@@ -398,36 +412,54 @@ fn slots_chain(slots: usize) -> Option<Chain> {
 /// ([`binding`]).
 #[derive(Clone, Copy, Debug)]
 enum Swap {
-    /// Row 0's final streams with row 1's.
-    Rows,
-    /// Row `row`'s final streams with the step row of the pass's parked
-    /// sequence `seq`.
-    Parked { row: usize, seq: usize },
+    /// Pass row `row`'s final streams with the live sequence's own row
+    /// `own`'s — the load's row `own`'s, wherever the pass lays the live
+    /// slot.
+    Live { row: usize, own: usize },
+    /// Pass row `row`'s final streams with the parked sequence `seq`'s own
+    /// row `own`'s.
+    Parked { row: usize, seq: usize, own: usize },
 }
 
-/// The exchanges that put each row's slot's own step row of final streams
-/// (its [`GlmSlot`] row 0, which the draft's walks and the sequence's state
+/// The exchanges that put each pass row's slot's own row of final streams
+/// (`r − range.start`, the buffer its draft's walks and its sequence's state
 /// read) in that row's buffer for a pass of `rows`, in order: the live
-/// sequence's is row 0's buffer, so a live slot in row 1 first exchanges the
-/// two rows', then each parked slot's goes into its row. Pointer moves
-/// only; [`exchange`] undoes them in reverse order. A pass of at most
-/// [`PAIR_ROWS`] slots ([`Body::refuse_slots`]) takes at most two.
-fn binding(rows: &[SlotRange]) -> [Option<Swap>; PAIR_ROWS] {
-    let mut out = [None; PAIR_ROWS];
-    let rows_first = rows
-        .get(1)
-        .is_some_and(|r| r.slot == 0)
-        .then_some(Swap::Rows);
+/// slot's own rows first when the pass does not lay it at row 0 — its rows
+/// are the load's first, so they trade places with the rows laid there —
+/// then each parked slot's rows into theirs. Pointer moves only;
+/// [`exchange`] undoes them in reverse order. An exchange a row at most:
+/// a pass past the load's [`LOAD_ROWS`] rows is refused by name.
+fn binding(rows: &[SlotRange]) -> Result<[Option<Swap>; LOAD_ROWS], GpuError> {
+    let live = rows
+        .iter()
+        .filter(|r| r.slot == 0 && r.rows.start > 0)
+        .flat_map(|r| {
+            (0..r.rows.len()).map(|own| Swap::Live {
+                row: r.rows.start + own,
+                own,
+            })
+        });
     let parked = rows
         .iter()
+        .filter(|r| r.slot != 0)
         .enumerate()
-        .filter(|(_, r)| r.slot != 0)
-        .enumerate()
-        .map(|(seq, (row, _))| Swap::Parked { row, seq });
-    for (o, sw) in out.iter_mut().zip(rows_first.into_iter().chain(parked)) {
-        *o = Some(sw);
+        .flat_map(|(seq, r)| {
+            (0..r.rows.len()).map(move |own| Swap::Parked {
+                row: r.rows.start + own,
+                seq,
+                own,
+            })
+        });
+    let mut out = [None; LOAD_ROWS];
+    for (i, sw) in live.chain(parked).enumerate() {
+        *out.get_mut(i).ok_or_else(|| {
+            shape(format!(
+                "a pass of {} rows on a load of {LOAD_ROWS}",
+                pass_rows(rows)
+            ))
+        })? = Some(sw);
     }
-    out
+    Ok(out)
 }
 
 /// Carry out the exchanges `swaps` ([`binding`]) between the rows' buffers
@@ -437,27 +469,24 @@ fn exchange(
     s: &mut Scratch,
     parked: &mut [&mut GlmSlot],
     fin: usize,
-    swaps: &[Option<Swap>; PAIR_ROWS],
+    swaps: &[Option<Swap>; LOAD_ROWS],
     undo: bool,
 ) -> Result<(), GpuError> {
     let mut one = |sw: Swap| -> Result<(), GpuError> {
         match sw {
-            Swap::Rows => {
-                let Scratch { row0, row1, .. } = &mut *s;
-                std::mem::swap(&mut row0.streams[fin], &mut row1.streams[fin]);
-            }
-            Swap::Parked { row, seq } => {
+            Swap::Live { row, own } => s.swap_streams(row, own, fin),
+            Swap::Parked { row, seq, own } => {
                 let r = s
                     .row_mut(row)
                     .ok_or_else(|| shape(format!("row {row} of a pass of several slots")))?;
-                let own = parked
+                let buf = parked
                     .get_mut(seq)
-                    .and_then(|p| p.rows.first_mut())
-                    .ok_or_else(|| shape(format!("parked sequence {seq}'s step row")))?;
-                std::mem::swap(&mut r.streams[fin], own);
+                    .and_then(|p| p.rows.get_mut(own))
+                    .ok_or_else(|| shape(format!("parked sequence {seq}'s own row {own}")))?;
+                std::mem::swap(&mut r.streams[fin], buf);
+                Ok(())
             }
         }
-        Ok(())
     };
     if undo {
         swaps.iter().rev().flatten().try_for_each(|&sw| one(sw))
@@ -477,11 +506,49 @@ fn prefixed(e: GpuError, what: &str) -> GpuError {
     }
 }
 
-/// One sequence's host side a pass of several slots plans a row of, lent
+/// The commit at `pos` of the verify waiting on one sequence's `lanes`, its
+/// KDA layers holding `count` lanes ([`Body::commit`]'s rule, its one
+/// owner): the lane word `lane` to the lane the last kept row wrote
+/// ([`row_lane`] of the kept rows, uploaded when it moves), the waiting
+/// dropped, `held` to `pos` and every arena's record cut. Whether a verify
+/// waited, ran whole and holds `pos` inside its rows; nothing moves
+/// otherwise, and what that means is the caller's — the cut
+/// [`Body::commit`] takes, the refusal `SlotRows::keep_slot` names.
+fn commit_lanes(
+    stream: &CudaStream,
+    lane: &mut DeviceBuffer<u32>,
+    lanes: &mut Lanes,
+    held: &mut u32,
+    wrote: &mut Wrote,
+    pos: u32,
+    count: u32,
+) -> Result<bool, GpuError> {
+    let Some(w) = lanes.waiting else {
+        return Ok(false);
+    };
+    let end = w.pos0 + w.rows;
+    if pos <= w.pos0 || pos > end || *held != end {
+        return Ok(false);
+    }
+    let c = lanes.committed;
+    let at = row_lane(c, pos - w.pos0 - 1, count);
+    if at != c {
+        lane.copy_from_host(stream, &[at])?;
+    }
+    *lanes = Lanes {
+        committed: at,
+        waiting: None,
+    };
+    *held = pos;
+    wrote.cut(pos);
+    Ok(true)
+}
+
+/// One sequence's host side a pass of several slots plans its rows of, lent
 /// apart: the live sequence's fields or a parked [`GlmSlot`]'s.
 struct SeqHost<'a> {
     stores: &'a mut [Store],
-    lanes: &'a Lanes,
+    lanes: &'a mut Lanes,
     held: &'a mut u32,
     ckpt: &'a mut Checkpoints,
     wrote: &'a mut Wrote,
@@ -491,7 +558,7 @@ impl<'a> SeqHost<'a> {
     fn parked(p: &'a mut GlmSlot) -> SeqHost<'a> {
         SeqHost {
             stores: &mut p.stores,
-            lanes: &p.lanes,
+            lanes: &mut p.lanes,
             held: &mut p.held,
             ckpt: &mut p.ckpt,
             wrote: &mut p.wrote,
@@ -501,19 +568,15 @@ impl<'a> SeqHost<'a> {
 
 impl Body {
     /// Refused by name before anything moves, a pass of several slots of
-    /// `rows` whose busy slots other than slot 0 are `parked`: on a NextN
-    /// load, with the taps armed or a route trace attached, at a point the
-    /// walk does not lay, a slot of other than one row, while the live
-    /// sequence's verify waits for its commit, and `parked` not the pass's
-    /// other sequences.
+    /// `rows` whose busy slots other than slot 0 are `parked`: with the taps
+    /// armed or a route trace attached; a slot of other rows than the load
+    /// runs a slot — one, its plain step, or on a NextN load two, its
+    /// verify's; at a point the walk does not lay ([`slots_chain`]); more
+    /// slots than the walk binds sequences ([`RowBind`]); and `parked` not
+    /// the pass's other sequences. A verify waiting on the live sequence is
+    /// refused by the plan, and by the enqueue unless it is the pass's own
+    /// ([`SlotRows::enqueue_slots`]).
     fn refuse_slots(&self, parked: &[&mut GlmSlot], rows: &[SlotRange]) -> Result<(), GpuError> {
-        if self.nextn.is_some() {
-            return Err(shape(
-                "a pass of several slots on a NextN load: each of its slots is drafted, and a \
-                 pass of plain steps tells no slot's draft what it ran"
-                    .to_string(),
-            ));
-        }
         if self.taps.is_some() {
             return Err(shape(
                 "a pass of several slots with the taps armed: a tap holds one row's streams"
@@ -527,18 +590,44 @@ impl Body {
                     .to_string(),
             ));
         }
-        if slots_chain(rows.len()).is_none() {
+        let (each, load) = if self.nextn.is_some() {
+            (
+                LANES,
+                format!(
+                    " on a NextN load: each slot's rows are its verify's {LANES}, its step's and \
+                     its drafted token's"
+                ),
+            )
+        } else {
+            (
+                1,
+                ": each slot's row is one plain step; a verify of one slot's rows is \
+                 Rows::step_rows"
+                    .to_string(),
+            )
+        };
+        if let Some(r) = rows.iter().find(|r| r.rows.len() != each) {
             return Err(shape(format!(
-                "a pass of {} slots: the walk lays one or {PAIR_ROWS}, a row a slot",
-                rows.len()
-            )));
-        }
-        if let Some(r) = rows.iter().find(|r| r.rows.len() != 1) {
-            return Err(shape(format!(
-                "slot {}'s {} rows in a pass of several slots: each slot's row is one plain \
-                 step; a verify of one slot's rows is Rows::step_rows",
+                "slot {}'s {} rows in a pass of several slots{load}",
                 r.slot,
                 r.rows.len()
+            )));
+        }
+        if slots_chain(rows).is_none() {
+            return Err(shape(format!(
+                "a pass of {} slots' {} rows: the walk lays a plain pass's one or two slots, a \
+                 row a slot, or a NextN load's one or two slots' verify rows, {LANES} a slot, one \
+                 column a row",
+                rows.len(),
+                pass_rows(rows)
+            )));
+        }
+        if rows.len() > RowBind::SEQS {
+            return Err(shape(format!(
+                "a pass of {} slots: the walk binds {} sequences, the live one's and one parked \
+                 or two parked",
+                rows.len(),
+                RowBind::SEQS
             )));
         }
         let want = rows.iter().filter(|r| r.slot != 0).count();
@@ -548,35 +637,52 @@ impl Body {
                 parked.len()
             )));
         }
+        Ok(())
+    }
+
+    /// Refused by name while a verify waits on the live sequence: a pass
+    /// would run a slot on lanes the commit has not named.
+    fn refuse_live_waiting(&self) -> Result<(), GpuError> {
         self.s
             .lanes
             .refuse_if_waiting(self.held)
             .map_err(|e| prefixed(e, "a pass of several slots"))
     }
 
-    /// Each row's slot's sequence standing at its row's position, its token
-    /// in the vocabulary and its position in the stores (`tokens[i]` row
-    /// `i`'s), refused by name naming the slot.
+    /// Each slot's ids in the pass's `ids`, every id in the vocabulary,
+    /// every row's position in the stores and its sequence standing at its
+    /// first position with no verify waiting ([`held_at`]), refused by name
+    /// naming the slot.
     fn refuse_slot_rows(
         &self,
         parked: &[&mut GlmSlot],
         rows: &[SlotRange],
-        tokens: &[u32; PAIR_ROWS],
+        ids: &[u32],
     ) -> Result<(), GpuError> {
         let mut parked = parked.iter();
-        for (r, &t) in rows.iter().zip(tokens) {
+        for r in rows {
             let named = |e| prefixed(e, &format!("slot {}", r.slot));
-            if t as usize >= self.embd.n_vocab {
-                return Err(named(shape(format!(
-                    "token {t} is past the {} embedding rows",
-                    self.embd.n_vocab
-                ))));
-            }
-            if r.pos0 as usize >= self.ctx {
-                return Err(named(shape(format!(
-                    "a step at position {} in stores of {}",
-                    r.pos0, self.ctx
-                ))));
+            let own = ids.get(r.rows.clone()).ok_or_else(|| {
+                named(shape(format!(
+                    "rows {:?} past the pass's {} ids",
+                    r.rows,
+                    ids.len()
+                )))
+            })?;
+            for (o, &t) in own.iter().enumerate() {
+                if t as usize >= self.embd.n_vocab {
+                    return Err(named(shape(format!(
+                        "token {t} is past the {} embedding rows",
+                        self.embd.n_vocab
+                    ))));
+                }
+                if r.pos0 as usize + o >= self.ctx {
+                    return Err(named(shape(format!(
+                        "a step at position {} in stores of {}",
+                        r.pos0 as usize + o,
+                        self.ctx
+                    ))));
+                }
             }
             let (lanes, held) = if r.slot == 0 {
                 (&self.s.lanes, self.held)
@@ -591,17 +697,46 @@ impl Body {
         Ok(())
     }
 
-    /// Each row's inputs into its buffer, as the step's refresh writes row
-    /// 0's, and its slot's sequence moved as the step moves the live one:
-    /// its waiting cut carried out, its stores holding the row's position,
-    /// its step row holding it. The rows' buffers are bound ([`binding`]).
-    fn write_slot_rows(
+    /// One slot's rows of a pass planned from its own sequence (`None` the
+    /// live one's), [`SlotRows::plan_slots`]'s per-slot entry. Refused by
+    /// name before anything moves: other than one row or the verify's
+    /// [`LANES`], other than an id a row, rows past the stores, the sequence
+    /// not standing at `r.pos0` or a verify of it waiting ([`held_at`]).
+    /// Then its waiting cut carried out once before its row 0 ([`cut_into`]
+    /// on its sequence), each row's inputs written into its pass row's
+    /// buffers (bound, [`binding`]) and its `held` moved past them, its step
+    /// row's record moved to `r.pos0` — and for a verify's rows
+    /// [`Body::plan_pair`]'s rule on its own sequence: its lanes left
+    /// waiting for the pass's commit and its verify rows' record named.
+    fn plan_slot_rows(
         &mut self,
         stream: &CudaStream,
-        parked: &mut [&mut GlmSlot],
-        rows: &[SlotRange],
-        tokens: &[u32; PAIR_ROWS],
+        seq: Option<&mut GlmSlot>,
+        r: &SlotRange,
+        ids: &[u32],
     ) -> Result<(), GpuError> {
+        let n = r.rows.len();
+        if n != 1 && n != LANES {
+            return Err(shape(format!(
+                "slot {}'s {n} rows in a pass: a slot's rows are its plain step's one or its \
+                 verify's {LANES}",
+                r.slot
+            )));
+        }
+        if ids.len() != n {
+            return Err(shape(format!(
+                "slot {}'s {} ids for its {n} rows",
+                r.slot,
+                ids.len()
+            )));
+        }
+        let pos0 = r.pos0;
+        if pos0 as usize + n > self.ctx {
+            return Err(shape(format!(
+                "slot {}'s {n} rows from position {pos0} in stores of {}",
+                r.slot, self.ctx
+            )));
+        }
         let Body {
             embd,
             s,
@@ -611,59 +746,120 @@ impl Body {
             wrote,
             ..
         } = self;
-        let Scratch {
-            row0, row1, lanes, ..
-        } = s;
-        let mut live = Some(SeqHost {
-            stores,
-            lanes,
-            held,
-            ckpt,
-            wrote,
-        });
-        let mut parked = parked.iter_mut();
-        for ((r, &t), buf) in rows.iter().zip(tokens).zip([row0, row1]) {
-            let seq = if r.slot == 0 {
-                live.take()
-            } else {
-                parked.next().map(|p| SeqHost::parked(p))
-            }
-            .ok_or_else(|| shape(format!("slot {}'s sequence in the pass", r.slot)))?;
+        let Scratch { rows, lanes, .. } = s;
+        let seq = match seq {
+            Some(p) => SeqHost::parked(p),
+            None => SeqHost {
+                stores,
+                lanes,
+                held,
+                ckpt,
+                wrote,
+            },
+        };
+        held_at(seq.lanes, *seq.held, pos0)
+            .map_err(|e| prefixed(e, &format!("slot {}", r.slot)))?;
+        cut_into(
+            stream,
+            seq.ckpt,
+            seq.stores,
+            seq.lanes.committed(),
+            *seq.held,
+        )?;
+        for (o, (&t, p)) in ids.iter().zip(pos0..).enumerate() {
             embd.fill(t)?;
-            let lane = seq.lanes.committed();
-            cut_into(stream, seq.ckpt, seq.stores, lane, *seq.held)?;
-            write_row(stream, buf, &embd.streams, r.pos0)?;
-            *seq.held = r.pos0 + 1;
-            seq.wrote.step = Held::at(r.pos0, 1);
+            let row = r.rows.start + o;
+            let buf = rows.get_mut(row).ok_or_else(|| {
+                shape(format!("row {row} of a pass on a load of {LOAD_ROWS} rows"))
+            })?;
+            write_row(stream, buf, &embd.streams, p)?;
+        }
+        *seq.held = pos0 + n as u32;
+        seq.wrote.step = Held::at(pos0, 1);
+        if n == LANES {
+            seq.lanes.waiting = Some(Waiting {
+                pos0,
+                rows: n as u32,
+            });
+            seq.wrote.pair = Held::at(pos0, n as u32);
         }
         Ok(())
     }
 
-    /// One slot's rows of a drafted pass planned from its own sequence
-    /// (`None` the live one's), the per-slot entry the drafted
-    /// [`SlotRows::plan_slots`] fills each busy slot from: its waiting cut
-    /// carried out once before its row 0 ([`cut_into`] on its sequence),
-    /// its rows' inputs written — `pos0` and the positions after it, each
-    /// inside its stores — its `held` moved past them, its lanes left
-    /// waiting for the pass's commit and its `wrote` naming its rows. Not
-    /// built yet: refused by name, nothing moved.
-    #[expect(
-        dead_code,
-        reason = "the drafted pass's planning entry; its wiring is that pass's"
-    )]
-    fn plan_slot_rows(
+    /// Each slot's rows of `rows` planned in pass order
+    /// ([`Body::plan_slot_rows`]), each on its own sequence — slot 0's the
+    /// live one, every other the next of `parked` — the first refusal
+    /// ending the plan.
+    fn plan_each_slot(
         &mut self,
         stream: &CudaStream,
-        seq: Option<&mut GlmSlot>,
-        r: &SlotRange,
+        parked: &mut [&mut GlmSlot],
+        rows: &[SlotRange],
         ids: &[u32],
     ) -> Result<(), GpuError> {
-        let _ = (stream, seq, r, ids);
-        Err(shape(
-            "a drafted pass of several slots — each slot's rows its verify's — is not built \
-             yet"
-            .to_string(),
-        ))
+        let mut parked = parked.iter_mut();
+        for r in rows {
+            let seq = match r.slot {
+                0 => None,
+                slot => Some(
+                    parked
+                        .next()
+                        .map(|p| &mut **p)
+                        .ok_or_else(|| shape(format!("slot {slot}'s parked sequence")))?,
+                ),
+            };
+            let own = ids.get(r.rows.clone()).ok_or_else(|| {
+                shape(format!(
+                    "slot {}'s rows {:?} past the pass's {} ids",
+                    r.slot,
+                    r.rows,
+                    ids.len()
+                ))
+            })?;
+            self.plan_slot_rows(stream, seq, r, own)?;
+        }
+        Ok(())
+    }
+
+    /// Each slot's verify row 0's final streams into its own pair-0 copy at
+    /// the pass's end, after the rows' buffers went home ([`exchange`]'s
+    /// undo) — the per-slot form of the verify's copy ([`Rows::enqueue_rows`]):
+    /// a NextN load keeps them past the step that writes the row's buffers
+    /// next. Nothing on a plain load.
+    fn copy_pair0(
+        &mut self,
+        gpu: &Gpu,
+        parked: &mut [&mut GlmSlot],
+        rows: &[SlotRange],
+        fin: usize,
+    ) -> Result<(), GpuError> {
+        let Body { nextn, s, .. } = self;
+        let Some(nx) = nextn.as_deref_mut() else {
+            return Ok(());
+        };
+        let mut parked = parked.iter_mut();
+        for r in rows {
+            if r.slot == 0 {
+                nx.pair0_mut()
+                    .copy_from_device_async(&s.rows[0].streams[fin], gpu.stream())?;
+                continue;
+            }
+            let GlmSlot {
+                rows: own, draft, ..
+            } = parked
+                .next()
+                .map(|p| &mut **p)
+                .ok_or_else(|| shape(format!("slot {}'s sequence in the pass", r.slot)))?;
+            let row0 = own
+                .first()
+                .ok_or_else(|| shape(format!("slot {}'s own row 0", r.slot)))?;
+            let d = draft.as_mut().ok_or(GpuError::State {
+                what: "glm5next Body::enqueue_slots",
+                missing: "the slot's NextN side (a NextN load's sequences each carry one)",
+            })?;
+            d.pair0_mut().copy_from_device_async(row0, gpu.stream())?;
+        }
+        Ok(())
     }
 
     /// The pass of `rows` walked with each row bound to its slot's lane word
@@ -690,7 +886,7 @@ impl Body {
             ..
         } = self;
         let Scratch {
-            row0, row1, lane, ..
+            rows: s_rows, lane, ..
         } = s;
         let mut live = Some(SeqParts {
             lane: &*lane,
@@ -713,13 +909,15 @@ impl Body {
         }
         let [first, other] = seqs;
         let first = first.ok_or_else(|| shape("a pass of no slot".to_string()))?;
+        let [row0, a, b, c] = s_rows;
         let parts = Parts {
             k,
             d: dims,
             cfg,
             names,
             s: row0,
-            idle: row1,
+            idle: [a, b, c],
+            idle_at: [1, 2, 3],
             row: 0,
             lane: first.lane,
             stores: first.stores,
@@ -728,29 +926,55 @@ impl Body {
             card,
             taps: None,
         };
-        program::walk_slots(gpu, w, parts, hybrid, heads)
+        program::walk_slots(gpu, w, parts, hybrid, rows.len(), heads)
     }
 }
 
 impl SlotRows for Body {
     /// The load's rows in flight ([`LOAD_ROWS`]): the plain pass's two, a
-    /// row a slot.
+    /// row a slot, a NextN load's drafted pass's four, each slot's verify's
+    /// two.
     const MAX_ROWS: usize = LOAD_ROWS;
 
-    /// [`sched::slot_lanes`]' point over the busy slots: the step for one,
-    /// the pair for two. A count the walk does not lay is refused by name
-    /// before any capture or launch of it ([`Body::refuse_slots`]), so no
-    /// replay of one is served and its arm is never read.
-    fn chain_of(rows: &[SlotRange]) -> Chain {
-        slots_chain(rows.len()).unwrap_or(Chain::Step)
+    /// Refused by name on a NextN load, a pass that keeps every row as it
+    /// runs (`GpuModel::step_slots`) with a slot of several rows: a slot's
+    /// rows there are its verify's, which wait for its commit, and a kept
+    /// pass tells no slot's draft what it ran. A slot of one row is
+    /// [`Body::refuse_slots`]' to refuse; nothing on a plain load.
+    fn refuse_kept(&self, ranges: &[SlotRange]) -> Result<(), GpuError> {
+        let Some(r) = ranges
+            .iter()
+            .find(|r| r.rows.len() > 1)
+            .filter(|_| self.nextn.is_some())
+        else {
+            return Ok(());
+        };
+        Err(shape(format!(
+            "a pass of several slots on a NextN load that keeps every row as it runs \
+             (GpuModel::step_slots), slot {}'s {} rows among them: each slot's rows are its \
+             verify's, and a kept pass tells no slot's draft what it ran; run them through \
+             GpuModel::verify_slots and keep them at GpuModel::commit_slots",
+            r.slot,
+            r.rows.len()
+        )))
     }
 
-    /// Each row planned from its own slot's sequence (module doc): refused
+    /// The chain of the point the walk lays ([`slots_chain`]): the step for
+    /// one row, the pair for two, the quad for four. A point the walk does
+    /// not lay is refused by name before any capture or launch of it
+    /// ([`Body::refuse_slots`]), so no replay of one is served and its arm
+    /// is never read.
+    fn chain_of(rows: &[SlotRange]) -> Chain {
+        slots_chain(rows).unwrap_or(Chain::Step)
+    }
+
+    /// Each slot's rows planned from its own sequence (module doc): refused
     /// by name before anything moves as [`Body::refuse_slots`] and each
-    /// row's slot ([`Body::refuse_slot_rows`]) refuse, and on a failure
-    /// planted before the launch; then each row's inputs written and its
-    /// slot's sequence moved, every row's final streams its own slot's step
-    /// row's while they are written.
+    /// slot's rows ([`Body::refuse_slot_rows`]) refuse, while a verify waits
+    /// on the live sequence, and on a failure planted before the launch;
+    /// then each slot's rows' inputs written and its sequence moved
+    /// ([`Body::plan_slot_rows`]), every row's final streams its own slot's
+    /// own row's while they are written.
     fn plan_slots(
         &mut self,
         stream: &CudaStream,
@@ -759,22 +983,13 @@ impl SlotRows for Body {
         ids: &[u32],
     ) -> Result<(), GpuError> {
         self.refuse_slots(parked, rows)?;
-        let mut tokens = [0; PAIR_ROWS];
-        for (t, r) in tokens.iter_mut().zip(rows) {
-            *t = *ids.get(r.rows.start).ok_or_else(|| {
-                shape(format!(
-                    "slot {}'s id past the pass's {}",
-                    r.slot,
-                    ids.len()
-                ))
-            })?;
-        }
-        self.refuse_slot_rows(parked, rows, &tokens)?;
+        self.refuse_live_waiting()?;
+        self.refuse_slot_rows(parked, rows, ids)?;
         self.planted(Plant::BeforeLaunch)?;
         let fin = program::final_streams(self.cfg.len());
-        let swaps = binding(rows);
+        let swaps = binding(rows)?;
         exchange(&mut self.s, parked, fin, &swaps, false)?;
-        let wrote = self.write_slot_rows(stream, parked, rows, &tokens);
+        let wrote = self.plan_each_slot(stream, parked, rows, ids);
         exchange(&mut self.s, parked, fin, &swaps, true)?;
         wrote?;
         self.planned = Some(SlotsPlanned::of(rows));
@@ -782,11 +997,15 @@ impl SlotRows for Body {
     }
 
     /// The pass's walk, each row bound to its own slot's lane word, stores
-    /// and step row, row `r` into `heads[r]`. Outside a capture it needs its
+    /// and own row, row `r` into `heads[r]`. Outside a capture it needs its
     /// plan ([`SlotRows::plan_slots`] of the same rows); a capture records
     /// the launches, which read every per-row value from the rows' words and
-    /// every slot's buffers by address. Refused by name as
-    /// [`Body::refuse_slots`] refuses, and for other than a head a row.
+    /// every slot's buffers by address. On a NextN load each slot's
+    /// verify row 0's final streams are then copied into its own pair-0
+    /// copy ([`Body::copy_pair0`]). Refused by name as [`Body::refuse_slots`]
+    /// refuses, while a verify other than the pass's own (slot 0's rows of
+    /// its plan) waits on the live sequence, and for other than a head a
+    /// row.
     fn enqueue_slots(
         &mut self,
         gpu: &Gpu,
@@ -796,11 +1015,20 @@ impl SlotRows for Body {
         rows: &[SlotRange],
     ) -> Result<(), GpuError> {
         self.refuse_slots(parked, rows)?;
-        if heads.len() != rows.len() {
+        // A verify waiting on the live sequence is the pass's own when its
+        // plan laid slot 0's verify rows: those lanes are the ones it runs.
+        let own = rows
+            .iter()
+            .find(|r| r.slot == 0)
+            .is_some_and(|r| self.s.lanes.waits_for(r.pos0, r.rows.len()));
+        if !own {
+            self.refuse_live_waiting()?;
+        }
+        let total = pass_rows(rows);
+        if heads.len() != total {
             return Err(shape(format!(
-                "{} heads for a pass of {} rows",
-                heads.len(),
-                rows.len()
+                "{} heads for a pass of {total} rows",
+                heads.len()
             )));
         }
         let captured = capturing(gpu.stream())?;
@@ -812,21 +1040,25 @@ impl SlotRows for Body {
             ));
         }
         let fin = program::final_streams(self.cfg.len());
-        let swaps = binding(rows);
+        let swaps = binding(rows)?;
         exchange(&mut self.s, parked, fin, &swaps, false)?;
         let walked = self.walk_slot_rows(gpu, w, heads, parked, rows);
         exchange(&mut self.s, parked, fin, &swaps, true)?;
         walked?;
+        self.copy_pair0(gpu, parked, rows, fin)?;
         if !captured {
             self.planned = None;
         }
         self.planted(Plant::AfterLaunch)
     }
 
-    /// A pass's rows kept whole, the plain pass's a slot a row: a count
-    /// short of its slot's rows is the drafted pass's commit — each kept
-    /// row's lane named on its own sequence, the slot's draft's `held` cut
-    /// with it — which is not built yet, and refused by name.
+    /// A pass's rows kept: a slot of one row keeps it as it ran (a plain
+    /// step, nothing waiting); a slot of two — its verify's rows, standing
+    /// in its lanes until the commit — keeps its first `kept` by
+    /// [`Body::commit`]'s rule on its own sequence ([`commit_lanes`];
+    /// [`Body::commit_live`] on the live one), the slot's draft's records
+    /// cut with it (`nextn::NextnSeq::cut` on a parked one). A count outside
+    /// its rows, or rows not waiting for their commit, is refused by name.
     fn keep_slot(
         &mut self,
         gpu: &Gpu,
@@ -834,15 +1066,42 @@ impl SlotRows for Body {
         r: &SlotRange,
         kept: usize,
     ) -> Result<(), GpuError> {
-        let _ = (gpu, seq);
-        if kept == r.rows.len() {
+        let n = r.rows.len();
+        if kept == 0 || kept > n {
+            return Err(shape(format!(
+                "slot {} keeping {kept} of its {n} rows (row 0 always)",
+                r.slot
+            )));
+        }
+        if n == 1 {
             return Ok(());
         }
-        Err(shape(format!(
-            "slot {} keeping {kept} of its {} rows: a drafted pass of several slots — each \
-             slot's rows its verify's — is not built yet",
-            r.slot,
-            r.rows.len()
-        )))
+        let pos = r.pos0 + kept as u32;
+        let done = match seq {
+            None => self.commit_live(gpu, pos)?,
+            Some(GlmSlot {
+                lane,
+                lanes,
+                held,
+                wrote,
+                draft,
+                ..
+            }) => {
+                let count = self.lanes.count() as u32;
+                let done = commit_lanes(gpu.stream(), lane, lanes, held, wrote, pos, count)?;
+                if let Some(d) = draft.as_mut().filter(|_| done) {
+                    d.cut(pos);
+                }
+                done
+            }
+        };
+        if !done {
+            return Err(shape(format!(
+                "slot {} keeping {kept} of its {n} rows: its rows are not waiting for their \
+                 commit (GpuModel::commit_slots after the pass that ran them)",
+                r.slot
+            )));
+        }
+        Ok(())
     }
 }

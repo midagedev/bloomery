@@ -54,7 +54,7 @@ pub use body::prefill::{
 };
 pub use body::seq::{GlmSeq, seq_bytes, seq_resume, seq_save};
 pub use body::{
-    Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, NEXTN_ON_TIER, PAIR_ROWS, Plant,
+    Body, CHECKPOINT_EVERY, Glm5nextModel, LANES, LOAD_ROWS, NEXTN_ON_TIER, Plant,
     TIER_BEFORE_UPLOAD, prompt, set_taps,
 };
 pub use host::GlmHost;
