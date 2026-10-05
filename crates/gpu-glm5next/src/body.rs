@@ -87,7 +87,9 @@ use bloomery_gpu::hybrid::{
 use bloomery_gpu::kpool::{self, KpoolKernels};
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, LatentKernels, POOL, pools_for};
 use bloomery_gpu::linear::{self, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
-use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Slots, StepKernels, StepMode};
+use bloomery_gpu::model::{
+    ChainBody, HostServed, Rollback, SlotRange, Slots, StepKernels, StepMode,
+};
 use bloomery_gpu::qsa::{QsaKernels, list_width};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer};
@@ -817,11 +819,9 @@ pub(crate) struct Parts<'s> {
     /// reads, and its stores.
     pub lane: &'s DeviceBuffer<u32>,
     pub stores: &'s mut [Store],
-    /// The other row's sequence when the rows are two sequences' (a pass of
-    /// two slots), exchanged with the current row's at each
-    /// [`Parts::at_row`]; `None` when every row runs the sequence above (the
-    /// step, a verify, a prompt batch).
-    other: Option<SeqParts<'s>>,
+    /// The rows' sequences ([`RowBind`]): which sequence's lane word and
+    /// stores each row of the walk runs on.
+    bind: RowBind<'s>,
     pub slots: &'s DeviceTensor<u32>,
     pub card: &'s mut CardExperts,
     pub taps: Option<&'s mut [DeviceBuffer<f32>]>,
@@ -832,6 +832,64 @@ pub(crate) struct Parts<'s> {
 pub(crate) struct SeqParts<'s> {
     pub lane: &'s DeviceBuffer<u32>,
     pub stores: &'s mut [Store],
+}
+
+/// A walk's rows bound each to its sequence: the current row's, which
+/// [`Parts`] holds, and the one alternate a pass holds beside it from its
+/// `alt`, the first row of the second sequence's range. A pass of several
+/// slots binds at most two sequences — the live and one parked, or two
+/// parked with the live idle; every other walk (the step, a verify, a
+/// prompt batch) runs one sequence's rows whole, with no alternate. The
+/// sequences exchange their lane word and stores only at the boundary
+/// ([`Parts::at_row`]), and a row numbers by its offset in its sequence's
+/// rows of the pass ([`RowBind::base`]).
+pub(crate) struct RowBind<'s> {
+    /// The first row of the alternate's range; past every row when there is
+    /// no alternate.
+    alt: usize,
+    other: Option<SeqParts<'s>>,
+}
+
+impl<'s> RowBind<'s> {
+    /// Every row the one sequence's: no exchange, a row its own offset.
+    fn one() -> RowBind<'s> {
+        RowBind {
+            alt: usize::MAX,
+            other: None,
+        }
+    }
+
+    /// The rows of a pass of `rows` — each busy slot's range — with `other`
+    /// the second sequence's part when the pass binds two, its rows from the
+    /// second range's start on.
+    fn of_pass(rows: &[SlotRange], other: Option<SeqParts<'s>>) -> RowBind<'s> {
+        RowBind {
+            alt: rows.get(1).map_or(usize::MAX, |r| r.rows.start),
+            other,
+        }
+    }
+
+    /// The alternate's part, when a move of the walk's row `from` → `to`
+    /// crosses into its rows: only at that boundary do the sequences
+    /// exchange.
+    fn crossed(&mut self, from: usize, to: usize) -> Option<&mut SeqParts<'s>> {
+        self.other
+            .as_mut()
+            .filter(|_| (from < self.alt) != (to < self.alt))
+    }
+
+    /// Row `row`'s offset in its sequence's rows of the pass: its row when
+    /// the walk runs one sequence's rows (a verify's row 1 reads the
+    /// committed lane and writes the next), its offset in its slot's range
+    /// when it runs several sequences' (a plain pass's every row steps its
+    /// own sequence in place, offset 0).
+    fn base(&self, row: usize) -> usize {
+        if self.other.is_some() && row >= self.alt {
+            row - self.alt
+        } else {
+            row
+        }
+    }
 }
 
 impl<'s> Parts<'s> {
@@ -861,7 +919,7 @@ impl<'s> Parts<'s> {
             row: 0,
             lane: &s.lane,
             stores,
-            other: None,
+            bind: RowBind::one(),
             slots,
             card,
             taps,
@@ -880,20 +938,21 @@ impl<'s> Parts<'s> {
             return Ok(());
         }
         std::mem::swap(&mut self.s, &mut self.idle);
-        if let Some(o) = self.other.as_mut() {
-            std::mem::swap(&mut self.lane, &mut o.lane);
-            std::mem::swap(&mut self.stores, &mut o.stores);
+        if let Some(SeqParts { lane, stores }) = self.bind.crossed(self.row, row) {
+            std::mem::swap(&mut self.lane, lane);
+            std::mem::swap(&mut self.stores, stores);
         }
         self.row = row;
         Ok(())
     }
 
-    /// The current row's KDA row base: its row on a pass of one sequence (a
-    /// verify's row 1 reads the committed lane and writes the next), 0 on a
-    /// pass of two slots, whose rows each step their own sequence in place
-    /// on its committed lane.
+    /// The current row's KDA row base: its row on a walk of one sequence (a
+    /// verify's row 1 reads the committed lane and writes the next), its
+    /// offset in its slot's range on a pass of several sequences', whose
+    /// rows each step their own sequence in place on its committed lane
+    /// ([`RowBind::base`]).
     pub(crate) fn base(&self) -> usize {
-        if self.other.is_some() { 0 } else { self.row }
+        self.bind.base(self.row)
     }
 
     /// Layer `l`'s streams, `cur`, copied into its tap when a gate armed
