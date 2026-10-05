@@ -53,6 +53,17 @@
 //! (the word stays) or both (the word moves to row 1's lane) and copies
 //! nothing. The conv ring and the latent rows are indexed by position, so a
 //! row taken back is written again by the next step there.
+//!
+//! The body serves resident sequence slots ([`Slots`],
+//! `GpuModel::add_slots`): a sequence's stores, its lane word and lanes, its
+//! checkpoints, the positions its stores and the arenas hold, the final
+//! streams of each row a pass runs, and on a NextN load the layer's store and
+//! row-0 copy travel together ([`GlmSlot`]), exchanged by pointer on a
+//! select; the host tier and its residency, the weights, the heads and every
+//! buffer a call writes before it reads are the load's. The plan counts the
+//! sequences the load serves (`place::PlanInputs::plan_slots`,
+//! `plan_nextn_slots`), the load holds its plan to them, and a sequence past
+//! their count is refused by name.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -71,7 +82,7 @@ use bloomery_gpu::hybrid::{
 use bloomery_gpu::kpool::{self, KpoolKernels};
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, LatentKernels, POOL, pools_for};
 use bloomery_gpu::linear::{self, HEAD, KHeadMap, LinearKernels, LinearShape, PASS_ROWS};
-use bloomery_gpu::model::{ChainBody, HostServed, Rollback, StepKernels, StepMode};
+use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Slots, StepKernels, StepMode};
 use bloomery_gpu::qsa::{QsaKernels, list_width};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer};
@@ -430,6 +441,11 @@ impl Scratch {
     }
 
     /// Every row's buffers, row 0 first.
+    fn rows(&self) -> impl Iterator<Item = &RowScratch> {
+        std::iter::once(&self.row0).chain(self.row1.as_ref())
+    }
+
+    /// Every row's buffers, row 0 first, to write.
     fn rows_mut(&mut self) -> impl Iterator<Item = &mut RowScratch> {
         std::iter::once(&mut self.row0).chain(self.row1.as_mut())
     }
@@ -733,6 +749,10 @@ pub struct Body {
     nextn: Option<Box<nextn::Nextn>>,
     /// What a sequence state of this load belongs to ([`seq`]).
     who: Identity,
+    /// The resident sequences the plan counted, and those made, the live one
+    /// counted ([`Slots`]).
+    slots_planned: usize,
+    slots_made: usize,
 }
 
 /// Every KDA layer's committed lane `lane` of its state and its conv ring,
@@ -897,14 +917,18 @@ fn limit_of(act: Act) -> f32 {
     limit.unwrap_or(0.0)
 }
 
-/// Refused by name unless `plan`'s card `card` holds the stores of `inputs`'
-/// layout at `lanes` KDA lanes: a plan made for other lanes than the load's
-/// would place its card experts over the stores' bytes, or leave them unused.
+/// Refused by name unless `plan`'s card `card` counts the KV term of
+/// `inputs`' layout at `lanes` KDA lanes for `slots` resident sequences
+/// (`nextn` the next-token layer the load carries,
+/// [`PlanInputs::kv_term`]): a plan made for other lanes or another count
+/// than the load's would place its card experts over the stores' bytes, or
+/// leave them unused. Zero slots is refused by name.
 fn refuse_other_lanes(
     plan: &Plan<'_>,
     inputs: &PlanInputs,
     card: usize,
-    lanes: KdaLanes,
+    (lanes, slots): (KdaLanes, usize),
+    nextn: Option<&NextnInputs>,
 ) -> Result<(), GpuError> {
     let (layers, planned) = plan
         .machine
@@ -913,11 +937,14 @@ fn refuse_other_lanes(
         .zip(plan.cards.get(card))
         .map(|(c, t)| (c.layers.clone(), t.kv_bytes))
         .ok_or_else(|| shape(format!("the plan has no card {card}")))?;
-    let want = inputs.kv.with_lanes(lanes).bytes(layers, plan.ctx_max);
+    let want = inputs
+        .kv_term(layers, plan.ctx_max, lanes, nextn, slots)
+        .map_err(|e| GpuError::plan(WHAT, e))?;
     if planned != want {
         return Err(shape(format!(
-            "the plan counts {planned} store bytes on card {card}; a load of {} KDA lanes holds \
-             {want} (plan it with PlanInputs::plan_lanes at the load's lanes)",
+            "the plan counts {planned} store bytes on card {card}; a load of {} KDA lanes and \
+             {slots} resident sequences holds {want} (plan it with PlanInputs::plan_slots or \
+             plan_nextn_slots at the load's lanes and sequences)",
             lanes.count()
         )));
     }
@@ -1062,9 +1089,31 @@ impl Body {
         residency: Residency,
         lanes: KdaLanes,
     ) -> Result<Glm5nextModel, GpuError> {
+        Body::open_placed_slots(file, plan, inputs, card, host, residency, lanes, 1)
+    }
+
+    /// [`Body::open_placed_lanes`] for a load that serves `slots` resident
+    /// sequences ([`Slots`]): the plan must have counted them
+    /// ([`PlanInputs::plan_slots`]), and a sequence past the count is
+    /// refused by name. Refused as [`Body::open_placed_lanes`] refuses, a
+    /// plan made for another count among them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the load's file, plan, inputs and card, the host tier's levers and residency, the KDA lanes and the resident sequences (rust-quality R8)"
+    )]
+    pub fn open_placed_slots(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        card: usize,
+        host: HostCfg,
+        residency: Residency,
+        lanes: KdaLanes,
+        slots: usize,
+    ) -> Result<Glm5nextModel, GpuError> {
         let tiers = TierOpen::of_machine(plan.machine);
         refuse_tiers_before_upload(plan, inputs, card, &tiers, None)?;
-        refuse_other_lanes(plan, inputs, card, lanes)?;
+        refuse_other_lanes(plan, inputs, card, (lanes, slots), None)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         // The host tier's run — the layers the body's slot map holds, which
         // the machine's per-layer lists cover.
@@ -1095,7 +1144,7 @@ impl Body {
                     set,
                     glue,
                     residency,
-                    lanes,
+                    (lanes, slots),
                     None,
                 )
             },
@@ -1149,10 +1198,34 @@ impl Body {
         host: HostCfg,
         residency: Residency,
     ) -> Result<Glm5nextModel, GpuError> {
+        Body::open_placed_nextn_slots(file, plan, inputs, nextn, card, host, residency, 1)
+    }
+
+    /// [`Body::open_placed_nextn_with`] for a load that serves `slots`
+    /// resident sequences ([`Slots`]): the plan must have counted them
+    /// ([`PlanInputs::plan_nextn_slots`]: the trunk's stores and the
+    /// next-token layer's store each for every sequence), and a sequence
+    /// past the count is refused by name. Refused as
+    /// [`Body::open_placed_nextn_with`] refuses, a plan made for another
+    /// count among them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the load's file, plans, inputs and card, the host tier's levers and residency, and the resident sequences (rust-quality R8)"
+    )]
+    pub fn open_placed_nextn_slots(
+        file: Split,
+        plan: &NextnPlan<'_>,
+        inputs: &PlanInputs,
+        nextn: &NextnInputs,
+        card: usize,
+        host: HostCfg,
+        residency: Residency,
+        slots: usize,
+    ) -> Result<Glm5nextModel, GpuError> {
         let target = &plan.plan;
         let tiers = TierOpen::of_machine(target.machine);
         refuse_tiers_before_upload(target, inputs, card, &tiers, Some(nextn.index))?;
-        refuse_other_lanes(target, inputs, card, KdaLanes::Two)?;
+        refuse_other_lanes(target, inputs, card, (KdaLanes::Two, slots), Some(nextn))?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
         // The slot map's layers: the trunk's routed run and the next-token
         // layer after it, which the machine's per-layer lists cover.
@@ -1184,7 +1257,7 @@ impl Body {
                     set,
                     glue,
                     residency,
-                    KdaLanes::Two,
+                    (KdaLanes::Two, slots),
                     Some((plan, nextn)),
                 )
             },
@@ -1241,12 +1314,13 @@ impl Body {
     /// `lever` the load ran under, whose machine the body starts once its
     /// pieces are sized. Each KDA layer's state holds `lanes` lanes, the
     /// step's rows, the card experts' and the host boundary's a row a lane;
-    /// stores whose bytes are not the plan's are refused by name. With
-    /// `nextn` the next-token layer joins the host run's end and loads beside
-    /// the chain ([`Body::open_placed_nextn`]).
+    /// stores whose bytes are not a sequence of the plan's are refused by
+    /// name. The plan counted `seqs` resident sequences, the most the body
+    /// serves ([`Slots`]). With `nextn` the next-token layer joins the host
+    /// run's end and loads beside the chain ([`Body::open_placed_nextn`]).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the load's card, file, weights, plan, inputs and tiers, the host tier's residency and levers, the residency glue, the KDA lanes and the NextN plan (rust-quality R8)"
+        reason = "the load's card, file, weights, plan, inputs and tiers, the host tier's residency and levers, the residency glue, the KDA lanes and resident sequences, and the NextN plan (rust-quality R8)"
     )]
     fn load_placed(
         gpu: &Gpu,
@@ -1257,7 +1331,7 @@ impl Body {
         residency: HostResidency,
         glue: ResidencyGlue,
         lever: Residency,
-        lanes: KdaLanes,
+        (lanes, seqs): (KdaLanes, usize),
         nextn: Option<(&NextnPlan<'_>, &NextnInputs)>,
     ) -> Result<Body, GpuError> {
         let hp = &inputs.hp;
@@ -1313,11 +1387,14 @@ impl Body {
             .map(|c| store(stream, c.kind, &dims, ctx, lanes))
             .collect::<Result<Vec<_>, _>>()?;
         let held_bytes: usize = stores.iter().map(Store::bytes).sum();
-        let planned = plan.cards.get(card).map_or(0, |t| t.kv_bytes);
+        let planned = inputs
+            .kv
+            .with_lanes(lanes)
+            .bytes(layers.clone(), plan.ctx_max);
         if held_bytes as u64 != planned {
             return Err(shape(format!(
-                "the stores hold {held_bytes} device bytes at {} KDA lanes; the plan counts \
-                 {planned}",
+                "the stores hold {held_bytes} device bytes at {} KDA lanes; a sequence of the \
+                 plan's counts {planned}",
                 lanes.count()
             )));
         }
@@ -1420,6 +1497,8 @@ impl Body {
             residency: lever,
             nextn: None,
             who,
+            slots_planned: seqs,
+            slots_made: 1,
         };
         body.s.lane.copy_from_host(stream, &lane)?;
         stream.synchronize()?;
@@ -1432,7 +1511,7 @@ impl Body {
                 ni,
                 w,
                 &body.dims,
-                ctx,
+                (ctx, seqs),
                 host.card_dontneed,
             )?;
             body.nextn = Some(Box::new(layer));
@@ -1975,6 +2054,158 @@ impl Rollback for Body {
     /// A verify's commit, or else a cut ([`Body::commit`]).
     fn rollback_on(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
         self.commit(gpu, pos)
+    }
+}
+
+/// One resident sequence of the load ([`Slots`], what a select exchanges):
+/// its per-layer stores, the lane word every KDA launch reads and the host's
+/// side of the lanes, the positions the stores hold, the KDA layers'
+/// checkpoints, the positions each target arena's rows hold and the final
+/// streams of each row a pass runs (the step's row and the verify's, which
+/// the draft's walks read by position), and on a NextN load the layer's side
+/// ([`nextn::NextnSeq`]). Every one is a buffer handle or a host value, so a
+/// select moves pointers, and each slot's captured chains keep addressing
+/// the buffers that were live when they were captured.
+pub struct GlmSlot {
+    stores: Vec<Store>,
+    lane: DeviceBuffer<u32>,
+    lanes: pair::Lanes,
+    held: u32,
+    ckpt: Checkpoints,
+    wrote: nextn::Wrote,
+    /// Each row's final streams, row 0's (the step's) first.
+    rows: Vec<DeviceBuffer<f32>>,
+    draft: Option<nextn::NextnSeq>,
+}
+
+impl Slots for Body {
+    type Seq = GlmSlot;
+
+    /// A sequence of the load's shape in the state the load leaves: zeroed
+    /// stores with lane 0 stamped at position 0, the lane word at lane 0, no
+    /// position held and no checkpoint, every arena holding no position, its
+    /// rows zeroed, and on a NextN load the layer's side as
+    /// [`nextn::Nextn::new_seq`] makes it. Refused by name past the
+    /// sequences the plan counted ([`Body::open_placed_slots`]): a sequence
+    /// the plan did not count would take card bytes the plan gave to
+    /// experts. Load-time allocation.
+    fn new_seq(&mut self, gpu: &Gpu) -> Result<GlmSlot, GpuError> {
+        const WHAT_N: &str = "glm5next Body::new_seq";
+        if self.slots_made >= self.slots_planned {
+            return Err(GpuError::Shape {
+                what: WHAT_N,
+                detail: format!(
+                    "sequence {} of a load whose plan counted {} resident sequences; plan and \
+                     open it for as many as it serves (PlanInputs::plan_slots, \
+                     Body::open_placed_slots)",
+                    self.slots_made + 1,
+                    self.slots_planned
+                ),
+            });
+        }
+        let stream = gpu.stream();
+        let stores = self
+            .cfg
+            .iter()
+            .map(|c| store(stream, c.kind, &self.dims, self.ctx, self.lanes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let ckpt = Checkpoints::new(
+            gpu.context(),
+            self.ckpt.lens().to_vec(),
+            HOST_BUDGET,
+            CHECKPOINT_EVERY,
+        )?;
+        let wide = HC_STREAMS * self.dims.embd;
+        let rows = self
+            .s
+            .rows()
+            .map(|_| DeviceBuffer::zeroed(stream, wide))
+            .collect::<Result<Vec<_>, _>>()?;
+        let draft = self
+            .nextn
+            .as_deref()
+            .map(|n| n.new_seq(stream))
+            .transpose()?;
+        let slot = GlmSlot {
+            stores,
+            lane: DeviceBuffer::zeroed(stream, 1)?,
+            lanes: pair::Lanes::default(),
+            held: 0,
+            ckpt,
+            wrote: nextn::Wrote::default(),
+            rows,
+            draft,
+        };
+        // Last, so a sequence whose allocation failed is not counted.
+        self.slots_made += 1;
+        Ok(slot)
+    }
+
+    /// Exchange the live sequence with `seq`: pointer moves only, nothing
+    /// copied, captured or synchronized. The prompt batch's arena is the
+    /// load's, so after the exchange its rows are neither side's: both
+    /// records of it are emptied, and a walk that would read it is refused
+    /// by name. Refused by name, moving nothing, while a verify waits for
+    /// its commit (its rows stand in the live state's lanes), and for a
+    /// sequence whose NextN side or rows do not match the load's.
+    fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut GlmSlot) -> Result<(), GpuError> {
+        const WHAT_W: &str = "glm5next Body::swap_seq";
+        self.s
+            .lanes
+            .refuse_if_waiting(self.held)
+            .map_err(|e| GpuError::Shape {
+                what: WHAT_W,
+                detail: format!("a select: {e}"),
+            })?;
+        if self.nextn.is_some() != seq.draft.is_some() {
+            return Err(GpuError::State {
+                what: WHAT_W,
+                missing: "the NextN side of every sequence (a NextN load serves sequences that \
+                          each carry one)",
+            });
+        }
+        let rows = self.s.rows().count();
+        if seq.rows.len() != rows {
+            return Err(GpuError::Shape {
+                what: WHAT_W,
+                detail: format!(
+                    "a sequence of {} rows' streams on a load of {rows} rows a pass",
+                    seq.rows.len()
+                ),
+            });
+        }
+        std::mem::swap(&mut self.stores, &mut seq.stores);
+        std::mem::swap(&mut self.s.lane, &mut seq.lane);
+        std::mem::swap(&mut self.s.lanes, &mut seq.lanes);
+        std::mem::swap(&mut self.held, &mut seq.held);
+        std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
+        std::mem::swap(&mut self.wrote, &mut seq.wrote);
+        self.wrote.prefill = nextn::Held::NONE;
+        seq.wrote.prefill = nextn::Held::NONE;
+        let fin = program::final_streams(self.cfg.len());
+        for (row, own) in self.s.rows_mut().zip(seq.rows.iter_mut()) {
+            std::mem::swap(&mut row.streams[fin], own);
+        }
+        if let (Some(n), Some(d)) = (self.nextn.as_deref_mut(), seq.draft.as_mut()) {
+            n.swap_seq(d);
+        }
+        Ok(())
+    }
+
+    /// Device bytes one sequence holds: its stores, its lane word, each
+    /// row's final streams and, on a NextN load, the layer's side — the
+    /// terms a plan counts a sequence by (`place::PlanInputs::seq_terms`,
+    /// one sequence's `SeqTerms::bytes`), which a gate holds equal.
+    fn seq_bytes(&self) -> usize {
+        let fin = program::final_streams(self.cfg.len());
+        self.store_bytes()
+            + self.s.lane.num_bytes()
+            + self
+                .s
+                .rows()
+                .map(|r| r.streams[fin].num_bytes())
+                .sum::<usize>()
+            + self.nextn.as_deref().map_or(0, nextn::Nextn::seq_bytes)
     }
 }
 
