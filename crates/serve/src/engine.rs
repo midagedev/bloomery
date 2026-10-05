@@ -15,7 +15,11 @@
 //! cache already holds and the engine can keep ([`Engine::keepable`]): `cut(k)`,
 //! or `reset` when `k` is 0; then `prefill(ids[k..n-1])`, and `next(ids[n-1])`
 //! yields the first generated token and every later `next(prev)` the one after
-//! it. `timings.cache_n` and `usage.prompt_tokens_details.cached_tokens` are
+//! it. An engine that names a prompt quantum `q` ([`Engine::prompt_quantum`])
+//! may see that `prefill` arrive instead as calls ending at `k + j·q`, the grid
+//! starting again at each cut [`Engine::prefill_splits`] asks for, one a round
+//! between the other busy slots' decode rounds; the quantum's contract makes
+//! the request's bits those of the one call. `timings.cache_n` and `usage.prompt_tokens_details.cached_tokens` are
 //! `k`, `timings.prompt_n` is the `n − k` ids evaluated, and
 //! `tokens_evaluated` and `usage.prompt_tokens` count the whole prompt, `n`, as
 //! llama-server's do.
@@ -47,6 +51,7 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::swap::Park;
@@ -347,6 +352,24 @@ pub trait Engine: Send {
     fn prefill_splits(&self, first: usize, end: usize, marks: &[usize]) -> Vec<usize> {
         let _ = (first, end, marks);
         Vec::new()
+    }
+    /// The call length `q` at which this engine's prompt work is bit-neutral
+    /// to cut: the calls `ids[a..a + k·q]` then `ids[a + k·q..b]` leave the
+    /// same bits as the one call `ids[a..b]` (every cell of the cache, every
+    /// other state, the next logits, and what a later request keeps of them)
+    /// for any `k`, from any position `a` the engine stands at. While another
+    /// slot is busy generating, the server runs a prompt call of more than one
+    /// quantum as such calls, one a round, a decode round of the busy slots
+    /// between them, so a long prompt does not stall the streams already
+    /// answering. The grid starts at each call the prompt call would run as
+    /// otherwise: its own start, and every cut [`Engine::prefill_splits`]
+    /// asks for, which still cuts. The cuts are then the same whatever the
+    /// load, and each one this contract covers. A seat that answers `Some(q)`
+    /// proves it with a gate of its own: the cut calls against the one call,
+    /// those bits and every id equal. `None` (the default): every prompt call
+    /// runs in one go.
+    fn prompt_quantum(&self) -> Option<NonZeroUsize> {
+        None
     }
     /// What the prompt cache did, for this engine's binary to print. The
     /// default writes one plain line to stderr.

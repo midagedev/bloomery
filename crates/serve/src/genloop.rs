@@ -8,7 +8,10 @@
 //! spans `predicted_n - 1` decode steps. `cache_ms`, which llama-server does
 //! not report, is the phase before the prompt's: the prompt cache's work on
 //! the slot (its state saved, a cached state put back, the cut), which
-//! `prompt_ms` does not count.
+//! `prompt_ms` does not count. Nor does it count, on a prompt the engine
+//! thread runs a call a round ([`Prompt`]), the other slots' decode rounds
+//! between its calls: `prompt_ms`, and so `prompt_per_second`, are the
+//! prompt's own engine time alone.
 //!
 //! An engine that drafts ([`Engine::advance_rows`] past 1) takes every greedy
 //! token after the first through [`Engine::advance`]: a pass keeps one token
@@ -24,10 +27,14 @@
 //! thread can make one call of several slots' steps: each running request's
 //! next step a row of one [`Engine::step_slots`], its next drafted pass a row
 //! of one [`Engine::advance_slots`]. A drafting engine serves one slot unless
-//! it keeps its draft's state per slot ([`Engine::slot_drafts`]).
+//! it keeps its draft's state per slot ([`Engine::slot_drafts`]). Its prompt
+//! is one call, cut where the engine asks at its messages, or on an engine
+//! that names a prompt quantum ([`Engine::prompt_quantum`]) calls the engine
+//! thread runs one a round ([`Prompt`]).
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -74,6 +81,9 @@ pub(crate) struct Timings {
     /// Prompt tokens evaluated by this request: the prompt less what the
     /// cache kept (`cache_n`).
     pub prompt_n: usize,
+    /// The prompt's own engine time: its calls and its last id's step, not
+    /// the other slots' decode rounds between the calls of a prompt run a
+    /// call a round ([`Prompt`]).
     pub prompt_ms: f64,
     pub predicted_n: usize,
     pub predicted_ms: f64,
@@ -174,7 +184,9 @@ pub(crate) struct Outcome {
 pub(crate) enum Event<'a> {
     /// The prompt is evaluated (llama-server's `prompt_progress`, sent once, complete).
     Prompt(&'a Timings),
-    /// Text safe to stream.
+    /// Text safe to stream. Empty between the calls of a prompt run a call a
+    /// round ([`Prompt`]): the event a client gone fails on, as a token's
+    /// text does, its timings the prompt's so far.
     Text(&'a str, &'a Timings),
 }
 
@@ -648,10 +660,11 @@ impl Slot {
         }
     }
 
-    /// Feeds `ids[from..to]`, cut into calls where the engine asks
+    /// Where the engine cuts the prompt call `ids[from..to]` into calls
     /// ([`Engine::prefill_splits`]) at the messages the prompt opens
     /// ([`Tokenizer::user_start`]): its first and its last inside the range.
-    fn prefill_marked(&mut self, ids: &[u32], from: usize, to: usize) -> Result<(), EngineError> {
+    /// An answer not among those marks in order is the engine's error.
+    fn marked_cuts(&self, ids: &[u32], from: usize, to: usize) -> Result<Vec<usize>, EngineError> {
         let marks = message_starts(&ids[..to], &self.vocab.user_start(), from);
         let at = if marks.is_empty() {
             Vec::new()
@@ -664,20 +677,29 @@ impl Slot {
                  {marks:?} in order"
             )));
         }
+        Ok(at)
+    }
+
+    /// Feeds `ids[from..to]`, cut into calls where the engine asks
+    /// ([`Slot::marked_cuts`]).
+    fn prefill_marked(&mut self, ids: &[u32], from: usize, to: usize) -> Result<(), EngineError> {
+        let at = self.marked_cuts(ids, from, to)?;
         let mut first = from;
         for &u in &at {
             self.prefill(&ids[first..u])?;
             first = u;
         }
         self.prefill(&ids[first..to])?;
-        if !at.is_empty() {
-            self.engine.note(&CacheNote::Split {
-                first: from,
-                end: to,
-                at,
-            });
-        }
+        self.note_split(from, to, at);
         Ok(())
+    }
+
+    /// The note of a prompt call `first..end` the engine cut at its marks
+    /// `at`; none when it cut nowhere.
+    fn note_split(&self, first: usize, end: usize, at: Vec<usize>) {
+        if !at.is_empty() {
+            self.engine.note(&CacheNote::Split { first, end, at });
+        }
     }
 
     /// `prefill` that books what it fed.
@@ -859,6 +881,49 @@ fn partial_path(path: &Path) -> PathBuf {
     static SAVES: AtomicU64 = AtomicU64::new(0);
     let n = SAVES.fetch_add(1, Ordering::Relaxed);
     path.with_file_name(format!(".bloomery-slot-{}-{n}:partial", std::process::id()))
+}
+
+/// What a prompt's opening kept ([`Gen::open`]): the positions the cache
+/// keeps of it, where its prompt call starts, and the wall time of the cache's
+/// work (`cache_ms`).
+#[derive(Clone, Copy)]
+pub(crate) struct Kept {
+    pub cache_n: usize,
+    cache_ms: f64,
+}
+
+/// A prompt the engine thread runs a call a round, between the other busy
+/// slots' decode rounds ([`Engine::prompt_quantum`], [`Gen::plan`]): its
+/// prompt call cut where the engine asks at its messages
+/// ([`Slot::marked_cuts`]), and each of those calls cut again every quantum
+/// from its own start. The cuts follow from the prompt and what the cache
+/// kept, whatever the load, and each is one the quantum makes bit-neutral, so
+/// the request's bits are those of the prompt run in one go.
+pub(crate) struct Prompt {
+    ids: Vec<u32>,
+    kept: Kept,
+    /// The engine's cuts at the messages, which the prompt call's note names
+    /// as an uninterrupted call's does: a quantum's cut keeps nothing more.
+    marks: Vec<usize>,
+    /// Every call's end, ascending; the last is the prompt call's, `n - 1`.
+    ends: Vec<usize>,
+    /// The calls run.
+    ran: usize,
+    progress: bool,
+}
+
+/// The ends of the calls the prompt call `from..to` runs as: cut at `marks`
+/// (ascending, inside the range), and each of those calls every `q` ids from
+/// its own start.
+fn quantum_ends(from: usize, to: usize, marks: &[usize], q: usize) -> Vec<usize> {
+    let mut ends = Vec::new();
+    let mut start = from;
+    for &end in marks.iter().chain([&to]) {
+        ends.extend((start + q..end).step_by(q));
+        ends.push(end);
+        start = end;
+    }
+    ends
 }
 
 /// What a generation needs next ([`Gen::pump`]).
@@ -1068,6 +1133,7 @@ impl Gen {
 
     /// The prompt on the selected slot: what the cache keeps of `ids`, the
     /// rest fed, and the first token's logits read.
+    #[cfg(test)]
     pub(crate) fn prompt(
         &mut self,
         slot: &mut Slot,
@@ -1075,7 +1141,19 @@ impl Gen {
         p: &GenParams,
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
     ) -> Result<(), GenError> {
-        let n = self.n;
+        let kept = self.open(slot, ids, p)?;
+        self.prompt_whole(slot, ids, kept, p, sink)
+    }
+
+    /// The prompt's opening on the selected slot: the engine told the reply
+    /// the request may make, and the cache brought to the longest prefix of
+    /// `ids` it keeps. No id of the prompt is fed yet.
+    pub(crate) fn open(
+        &mut self,
+        slot: &mut Slot,
+        ids: &[u32],
+        p: &GenParams,
+    ) -> Result<Kept, GenError> {
         // Only a greedy request with no banned id passes, and its first token is
         // the prompt's step: the passes make at most the rest.
         let passes = self.sampler.is_none() && self.banned.is_empty();
@@ -1086,23 +1164,124 @@ impl Gen {
         });
         let t = Instant::now();
         let cache_n = slot.reuse(ids, p.cache_prompt)?;
-        let cache_ms = ms_since(t);
+        Ok(Kept {
+            cache_n,
+            cache_ms: ms_since(t),
+        })
+    }
+
+    /// The prompt after its opening in one go: `ids[cache_n..n-1]` fed as one
+    /// call, cut where the engine asks at its messages, and the last id
+    /// stepped.
+    pub(crate) fn prompt_whole(
+        &mut self,
+        slot: &mut Slot,
+        ids: &[u32],
+        kept: Kept,
+        p: &GenParams,
+        sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+    ) -> Result<(), GenError> {
         let t0 = Instant::now();
-        slot.prefill_marked(ids, cache_n, n - 1)?;
-        let greedy = slot.next(ids[n - 1], out(&mut self.logits))?;
+        slot.prefill_marked(ids, kept.cache_n, self.n - 1)?;
+        self.close(slot, ids[self.n - 1], kept, t0, p.return_progress, sink)
+    }
+
+    /// The prompt after its opening as calls the engine thread runs one a
+    /// round ([`Gen::prompt_call`]), its prompt call cut where the engine asks
+    /// at its messages and each of those calls every `q` ids from its start
+    /// ([`Prompt`]). No call runs here; from here the timings carry the prompt
+    /// so far.
+    pub(crate) fn plan(
+        &mut self,
+        slot: &Slot,
+        ids: Vec<u32>,
+        kept: Kept,
+        q: NonZeroUsize,
+        progress: bool,
+    ) -> Result<Prompt, GenError> {
+        let t = Instant::now();
+        let to = self.n - 1;
+        let marks = slot.marked_cuts(&ids, kept.cache_n, to)?;
+        let ends = quantum_ends(kept.cache_n, to, &marks, q.get());
+        self.tim = Timings {
+            prompt_ms: ms_since(t),
+            n_ctx: self.ctx_max,
+            n_past: kept.cache_n,
+            cache_n: kept.cache_n,
+            cache_ms: kept.cache_ms,
+            n_prompt: self.n,
+            ..Timings::default()
+        };
+        Ok(Prompt {
+            ids,
+            kept,
+            marks,
+            ends,
+            ran: 0,
+            progress,
+        })
+    }
+
+    /// The next call of `p` on the selected slot; true while calls remain.
+    /// Every call but the first follows an empty text event, which fails as a
+    /// token's text does once the client is gone, so a request whose client
+    /// left ends between its calls. The last call notes the engine's cuts at
+    /// the messages, as the prompt run in one go does, and steps the prompt's
+    /// last id.
+    pub(crate) fn prompt_call(
+        &mut self,
+        slot: &mut Slot,
+        p: &mut Prompt,
+        sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+    ) -> Result<bool, GenError> {
+        if p.ran > 0 {
+            sink(Event::Text("", &self.tim))?;
+        }
+        let from = p.ran.checked_sub(1).map_or(p.kept.cache_n, |i| p.ends[i]);
+        let to = p.ends[p.ran];
+        let t = Instant::now();
+        slot.prefill(&p.ids[from..to])?;
+        p.ran += 1;
+        self.tim.prompt_ms += ms_since(t);
+        self.tim.prompt_n = to - p.kept.cache_n;
+        self.tim.n_past = to;
+        if p.ran < p.ends.len() {
+            return Ok(true);
+        }
+        let t = Instant::now();
+        slot.note_split(p.kept.cache_n, to, std::mem::take(&mut p.marks));
+        self.close(slot, p.ids[self.n - 1], p.kept, t, p.progress, sink)?;
+        Ok(false)
+    }
+
+    /// The prompt's end: its last id stepped and the first token's logits
+    /// read, its timings, its event and the first token in hand. Its engine
+    /// time is what the timings hold of it (nothing for a prompt run in one
+    /// go) and the time since `t`.
+    fn close(
+        &mut self,
+        slot: &mut Slot,
+        last: u32,
+        kept: Kept,
+        t: Instant,
+        progress: bool,
+        sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
+    ) -> Result<(), GenError> {
+        let n = self.n;
+        let greedy = slot.next(last, out(&mut self.logits))?;
         slot.prompts[slot.cur] = n;
         self.tim = Timings {
-            prompt_n: n - cache_n,
-            prompt_ms: ms_since(t0),
+            prompt_n: n - kept.cache_n,
+            prompt_ms: self.tim.prompt_ms + ms_since(t),
             n_ctx: self.ctx_max,
             n_past: n,
-            cache_n,
-            cache_ms,
+            cache_n: kept.cache_n,
+            cache_ms: kept.cache_ms,
             n_prompt: n,
             ..Timings::default()
         };
         self.t1 = Instant::now();
-        if p.return_progress {
+        if progress {
             sink(Event::Prompt(&self.tim))?;
         }
         if self.budget > 0 {
