@@ -1,0 +1,58 @@
+# Round glmslots' deep twin, for the lead to sit after glmslots-ab.card: the same plain 2-slot pass
+# (BLOOMERY_GEN_SLOTS=2) against its plain 1-slot twin at depth 4096 (a 4096-id prose window a slot), one binary,
+# A6000, plan (a), both arms with the residency off, ctx 4200 (a slot takes D + N - 1 = 4191 positions of its own
+# cache; the plan counts every sequence). The GLM plain pass lays one or two slots (gpu-glm5next/src/pair.rs
+# refuse_slots): N = 2 is the only aggregate. Prerequisite, met at 0bf691d4: glmslots-ab.card's (the runner's slots
+# residency clause passing an arm with the residency off, line2's change in tools/ref/slots-arm.sh). A residency-on
+# deep twin is not drafted: glmslots-res.card decides whether one is worth sitting.
+#
+# Decomposition: the depth-4096 terms over glmslots-ab.card's (r(6) = +34..+47 %, its S1 and R2):
+#   A, one row's attention from depth 6 to 4096: 0.52 ms from P 512 to 4096 [measured: rig-log 10-01#glmpp-depth,
+#     decode 20.72 -> 20.50 tok/s, n=8, ctx 4200] plus under 0.1 ms from 6 to 512 [derived]: A <= 0.6 ms. The 34 KDA
+#     layers' state is depth-free; the 11 latent layers attend the selector's top_k 2048 of 4096 positions
+#     (docs/research/linear-attn.md) [derived].
+#   In the plain step the card front and the host leg run one after the other: S1(4096) = S1 + A. In the pair chain
+#     the card's two fronts run under the host's two legs (0.25..0.86 ms of slack a MoE layer, glmpair-probe.card's
+#     per-layer terms, against 2 x 0.6 / 11 = 0.11 ms more a latent layer): R2(4096) = R2 + delta, delta 0..2A
+#     [derived].
+#   The plan term at ctx 4200: card_experts 2576 against 2593, host_experts 9520 against 9503 [measured at plan: the
+#     two `--plan` records of this round's box run (c)]: 17 more host experts of 9,503 move h by at most +0.18 %,
+#     0.06 ms [derived]; each run's plan records print both arms' card_experts.
+#   The ratio r(4096) = 2 (S1 + A) / (R2 + delta) parts from r(6) by (1 + A / S1) at delta 0 (+1.3 %) down to
+#     (1 + A / S1) R2 / (R2 + 2A) at delta 2A (-0.6 %): r(4096) / r(6) = 0.994..1.013, so +33..+49 %.
+# Resource timeline of the round [derived]: as glmslots-ab.card's, the host leg the wall (63..70 ms of 65..72), the
+#   card's two fronts plus 2A under it, PCIe under 0.1 ms, host DRAM the union's expert bytes, NVMe 0. Each slot's
+#   prompt call (4096 ids at 92 tok/s, rig-log 10-01#glmpp-depth: 44.5 s) sits before the timed rounds, outside them.
+# The term this derivation cannot close: whether the pair chain hides the second row's deeper attention (delta at 0)
+#   or pays it (2A) — the sitting reads it as this ratio against glmslots-ab.card's.
+#
+# Sitting: the lead's, after the go, one lease run of 2 rounds:
+#   BLOOMERY_AB_ROUNDS=2 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmslots-deep.card BLOOMERY_GEN_CTX=4200' \
+#     just depth-gpu-glm5next 4096 4096@BLOOMERY_GEN_SLOTS=2 > <log> 2>&1
+# The 2-slot arm is fed GLM_PROSE ids 50000..58191 (the profile's file holds 71,727, so 21,727 from GLM_PROSE_FROM),
+# slot 0 the twin's 4096. Check at that count: python3 tools/ref/card.py check docs/cards/glmslots-deep.card --rounds 2
+# (±2.6 % at 2 rounds).
+# Wall [derived]: 6 processes (each arm's warm-up, then 2 rounds x 2 arms), each a load (21..25 s), the preheat, the
+# prompt calls (44.5 s for the twin, 89 s for the two slots) and 95 passes (4.5..7 s): 1.3..2.2 min a process,
+# 10..14 min the run.
+kind: ab
+question: does the plain 2-slot pass hold its depth-6 rate at depth 4096, where each slot's latent layers attend the
+  selector's 2048 of 4096 positions and the KDA state stays depth-free?
+term: ratio slots d=4096, the 2-slot arm's tok/s(aggregate) over its plain twin's tok/s(mean) @ n=96, depth 4096 (a
+  4096-id prose window a slot, 8192 fed ids), A6000, plan (a), residency off on both arms, ctx 4200, same binary,
+  paired by round
+unit: %
+predict: +33..+49
+rounds: 2
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: one binary, every arm its own process in the run's one lease; no FAIL row (the runner's slots clauses:
+  counted kind=slots records of 2 positions, no kind=slots record in the twin's row, the slots residency clause
+  passing an arm with no residency record); each ours row's load record at ctx 4200 and its prompt 8192 (2-slot) or
+  4096 (twin) prose ids; no row [cold], [cpu-busy] or [other-busy]; the full output to a file first
+decide-in: write both depths' slots rows into rig-log as GLM's aggregate decode rows and price the seat's
+  concurrency from the pair: the depth term flat means two slots scale with the host leg alone
+decide-below: the deep ratio parts from glmslots-ab.card's by more than the attention band: read the twin's
+  depth-4096 tok/s against its depth-6 row (its slowdown is A) and the 2-slot arm's round walls; an A past 0.6 ms
+  names the selector's list work, one nsys window of a round at both depths before any seat round
+decide-above: r past +49 says the deep windows route more alike than the depth-6 ones, or the pair chain hides more
+  than the twin's attention: re-derive rho from the deep windows' route traces before believing the row
