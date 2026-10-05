@@ -234,6 +234,13 @@ round glmq1; F10 was dropped (`GemmFront::act` and `project` differ on purpose: 
   `ffn.rs:719` (`card_rows`), `crates/gpu-glm5next/src/tier.rs:297` (`enqueue_block`) and `tier.rs:376`
   (`enqueue_layer`); a new routable type is four edits. One gate·up/down helper pair in `ffn.rs` for both pairs.
   Proof: ptx-scan equal.
+- **Seal `SlotRange` (S/M, after 0.2.1; qual1-M3).** `crates/gpu/src/model/slots.rs:178` has public fields, while
+  its one constructor, `GpuModel::slot_ranges` (`slots.rs:507-551`), lays the ranges from row 0 with no gap or overlap.
+  So the bodies' own tiling checks guard a state no caller can reach today: `crates/gpu/src/arch/qwen3moe/body38.rs:4254`
+  (`slot_rows`) and `crates/gpu/src/arch/qwen3moe/slot_pass.rs:241` (`check`). GLM's `Body::refuse_slots`
+  (`crates/gpu-glm5next/src/pair.rs:579`) has none. Make the range set constructible only by `slot_ranges` (private
+  fields, or a `SlotRanges` newtype), then delete the two body checks. Proof: move class; the slot gates of the three
+  bodies stay green.
 - **Outside the crate (from the same review).** `crates/gpu/src/weights.rs:549`: `Weights::get` is a
   `BTreeMap<String, _>` lookup, so every body pays name lookups on the step unless it resolves at load; a load-time
   handle is a design question (M). The Q8_0 block geometry has four private owners
