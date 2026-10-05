@@ -935,6 +935,9 @@ impl SlotRows for Body {
     /// row a slot, a NextN load's drafted pass's four, each slot's verify's
     /// two.
     const MAX_ROWS: usize = LOAD_ROWS;
+    /// The commit settles a partial keep ([`Body::keep_slot`]: each slot's
+    /// lane word, held count and draft cut to its kept rows).
+    const SETTLES_PARTIAL_KEEP: bool = true;
 
     /// Refused by name on a NextN load, a pass that keeps every row as it
     /// runs (`GpuModel::step_slots`) with a slot of several rows: a slot's
