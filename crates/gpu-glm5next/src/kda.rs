@@ -1,8 +1,9 @@
 //! The KDA mixer of one layer at one token: `x` (the fold of the streams by
 //! the sub-layer's own mix) in, the update into `out`, the layer's conv ring
 //! written at the token's position and its state read from the committed
-//! lane: the step (row 0) writes it back in place, a verify's row 1 into the
-//! next lane, on a load of two (`place::KdaLanes`). The store keeps no
+//! lane: the step (row 0) and each row of a pass of two slots write it back
+//! in place, a verify's row 1 into the next lane, on a load of two
+//! (`place::KdaLanes`; the row base, `Parts::base`). The store keeps no
 //! history past its lanes: an earlier position comes back only through a
 //! checkpoint.
 //!
@@ -45,6 +46,7 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
     let Some(MixerNames::Kda(n)) = p.names.get(l).map(|n| &n.mixer) else {
         return Err(other_kind("glm5next kda", l));
     };
+    let base = p.base();
     let s = &mut *p.s;
     let Some(Store::Kda { state, stamp, ring }) = p.stores.get_mut(l) else {
         return Err(GpuError::State {
@@ -106,11 +108,11 @@ pub(crate) fn kda(gpu: &Gpu, w: &Weights, p: &mut Parts<'_>, l: usize) -> Result
                     o: &mut s.o,
                     state: state.whole_mut(),
                 },
-                each: p.row > 0,
+                each: base > 0,
                 pos: &s.pos,
                 stamp,
             },
-            row: p.row,
+            row: base,
         },
     )?;
     lin.norm_gate.enqueue_norm_gate_sigmoid(

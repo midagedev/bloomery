@@ -57,7 +57,7 @@ use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::GgmlType;
 use model::arch::glm5next::names;
-use model::arch::glm5next::place::{KdaLanes, card_routed, card_tile_bytes};
+use model::arch::glm5next::place::{card_routed, card_tile_bytes};
 use models::{Ffn, LayerSpec};
 
 use crate::body::{Parts, f32t, f32v, gemv, weight};
@@ -101,7 +101,8 @@ pub(crate) struct CardExperts {
     layers: Vec<Option<CardLayer>>,
     /// Routed expert width: a gate·up slot's rows.
     ff: usize,
-    /// Each row's buffers, row 0 the step's: a row a KDA lane of the load.
+    /// Each row's buffers, row 0 the step's: a row of the load's rows in
+    /// flight.
     rows: Vec<CardRow>,
     /// The stage card's side of the tier layers, on a load with a tier card.
     tier: Option<TierSide>,
@@ -147,7 +148,8 @@ impl CardRow {
 impl CardExperts {
     /// The card experts of `layers` (the description) as `map` places them
     /// and `w` holds them, `n_embd` wide with routed experts `ff` wide, a
-    /// row's buffers for each of the load's `lanes`. Load-time only.
+    /// row's buffers for each of the load's `rows` in flight. Load-time
+    /// only.
     pub(crate) fn new(
         gpu: &Gpu,
         w: &Weights,
@@ -155,7 +157,7 @@ impl CardExperts {
         map: &SlotMap,
         n_embd: usize,
         ff: usize,
-        lanes: KdaLanes,
+        rows: usize,
     ) -> Result<CardExperts, GpuError> {
         let mut per = Vec::with_capacity(layers.len());
         for (l, spec) in layers.iter().enumerate() {
@@ -207,12 +209,12 @@ impl CardExperts {
             batch: FfnBatchKernels::load(gpu.context())?,
             layers: per,
             ff,
-            rows: (0..lanes.count())
+            rows: (0..rows)
                 .map(|_| CardRow::new(stream, n_embd, ff))
                 .collect::<Result<Vec<_>, _>>()?,
             tier: match map.tiers() {
                 0 => None,
-                _ => Some(TierSide::new(gpu, map, layers.len(), lanes.count())?),
+                _ => Some(TierSide::new(gpu, map, layers.len(), rows)?),
             },
         })
     }

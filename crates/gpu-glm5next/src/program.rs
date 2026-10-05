@@ -1,9 +1,11 @@
-//! The GLM layer program of the one-token step and of the verify's two rows
-//! ([`StepProgram`]) and the port its host legs go through ([`HostLeg`]):
-//! [`runtime::sched::walk`] over the point `(1, 1, Step)`, or `(2, 1, Step)`
-//! for the verify, whose rows run one layer apart, each row's launches the
-//! step's on its own buffers (`crate::body::Parts::at_row`). Each layer's
-//! parts, by its programs (`runtime::layer::Layer`), never its number:
+//! The GLM layer program of the one-token step, of the verify's two rows and
+//! of a pass of two slots' rows ([`StepProgram`]) and the port its host legs
+//! go through ([`HostLeg`]): [`runtime::sched::walk`] over the point `(1, 1,
+//! Step)`, or `(2, 1, Step)` for the verify and for two slots
+//! ([`runtime::sched::slot_lanes`]), whose rows run one layer apart, each
+//! row's launches the step's on its own buffers and its own sequence's
+//! stores (`crate::body::Parts::at_row`). Each layer's parts, by its programs
+//! (`runtime::layer::Layer`), never its number:
 //!
 //! - the front: the mixer sub-layer whole — `hc_pre`, the fold, the KDA or
 //!   latent mixer, `hc_post` — then the feed-forward sub-layer's `hc_pre`
@@ -83,6 +85,13 @@ pub(crate) const fn final_streams(layers: usize) -> usize {
     (2 * layers) % 2
 }
 
+/// The step's point, `(1, 1, Step)`.
+const STEP: Overlap = Overlap {
+    units: 1,
+    cols: 1,
+    port: PortKind::Step,
+};
+
 /// Walk the step over `parts`, the host tier opened for it first, into
 /// `head`.
 pub(crate) fn walk_step(
@@ -92,7 +101,7 @@ pub(crate) fn walk_step(
     hybrid: &mut Hybrid<GlmHost>,
     head: &mut Head,
 ) -> Result<(), GpuError> {
-    walk(gpu, w, parts, hybrid, [Some(head), None])
+    walk(gpu, w, parts, hybrid, STEP, [Some(head), None])
 }
 
 /// Walk the verify's two rows over `parts`, the host tier opened for them
@@ -104,23 +113,57 @@ pub(crate) fn walk_pair(
     hybrid: &mut Hybrid<GlmHost>,
     heads: [&mut Head; PAIR_ROWS],
 ) -> Result<(), GpuError> {
-    walk(gpu, w, parts, hybrid, heads.map(Some))
+    let o = Overlap {
+        units: PAIR_ROWS,
+        ..STEP
+    };
+    walk(gpu, w, parts, hybrid, o, heads.map(Some))
 }
 
-/// Walk one row per head in `heads` (the step's one, or the verify's two).
+/// Walk a pass of `heads.len()` slots' rows over `parts`, whose rows are
+/// bound each to its own slot's sequence, the host tier opened for them
+/// first, row `r` into `heads[r]`: the point [`sched::slot_lanes`] gives
+/// that many slots — the step's for one, the pair's for two. More slots
+/// than [`PAIR_ROWS`] (two lanes of columns, which the step port does not
+/// serve) are refused by name before anything is enqueued.
+pub(crate) fn walk_slots(
+    gpu: &Gpu,
+    w: &Weights,
+    parts: Parts<'_>,
+    hybrid: &mut Hybrid<GlmHost>,
+    heads: &mut [Head],
+) -> Result<(), GpuError> {
+    let o = sched::slot_lanes(heads.len())
+        .map_err(HostLeg::refused)?
+        .overlap;
+    let heads = match heads {
+        [a] => [Some(a), None],
+        [a, b] => [Some(a), Some(b)],
+        _ => {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a pass of {} slots at the point {o:?}: the walk runs at most \
+                     {PAIR_ROWS} rows, one a slot",
+                    heads.len()
+                ),
+            });
+        }
+    };
+    walk(gpu, w, parts, hybrid, o, heads)
+}
+
+/// Walk one row per head in `heads` at the point `o` (the step's one row,
+/// the verify's two, a pass of slots' one or two).
 fn walk(
     gpu: &Gpu,
     w: &Weights,
     parts: Parts<'_>,
     hybrid: &mut Hybrid<GlmHost>,
+    o: Overlap,
     heads: [Option<&mut Head>; PAIR_ROWS],
 ) -> Result<(), GpuError> {
     let layers = parts.cfg.len();
-    let o = Overlap {
-        units: heads.iter().flatten().count(),
-        cols: 1,
-        port: PortKind::Step,
-    };
     let mut port = HostLeg {
         stream: gpu.stream(),
         hybrid,

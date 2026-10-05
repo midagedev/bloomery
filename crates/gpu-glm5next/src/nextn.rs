@@ -67,7 +67,9 @@ use runtime::layer::{FfnKind, Layer, MixerKind};
 use runtime::sched::{At, Overlap, Port, PortKind};
 
 use super::prefill::PromptState;
-use super::{Body, Dims, Embedding, Kernels, RowScratch, Scratch, f32t, f32v, gemv, q8, weight};
+use super::{
+    Body, Dims, Embedding, Kernels, PAIR_ROWS, RowScratch, Scratch, f32t, f32v, gemv, q8, weight,
+};
 use crate::mla::{self, LatentStore};
 use crate::tensors::{FfnNames, LatentNames, LayerNames, MixerNames};
 
@@ -658,10 +660,7 @@ fn hidden_src<'a>(
         },
         GlmArena::Pair => Src::Pair {
             row0: pair0,
-            row1: &s
-                .row(1)
-                .ok_or_else(|| shape("the pair arena on a load of one KDA lane".to_string()))?
-                .streams[fin],
+            row1: &s.row1.streams[fin],
         },
         GlmArena::Prefill => {
             let (buf, rows) = prompt
@@ -831,9 +830,7 @@ impl Body {
         let fin = crate::program::final_streams(self.cfg.len());
         let wide = HC_STREAMS * self.dims.embd;
         let step = read_rows(stream, self.wrote.step, &[&self.s.row0.streams[fin]], wide)?;
-        let pair_rows: Vec<&DeviceBuffer<f32>> = std::iter::once(&nx.pair0)
-            .chain(self.s.row1.as_ref().map(|r| &r.streams[fin]))
-            .collect();
+        let pair_rows = [&nx.pair0, &self.s.row1.streams[fin]];
         let pair = read_rows(stream, self.wrote.pair, &pair_rows, wide)?;
         Ok(Some(DraftRows {
             held: nx.held as u32,
@@ -859,8 +856,7 @@ impl Body {
             )));
         }
         let wide = HC_STREAMS * self.dims.embd;
-        let pair = 1 + usize::from(self.s.row1.is_some());
-        for (what, (held, v), rows) in [("step", &d.step, 1), ("verify", &d.pair, pair)] {
+        for (what, (held, v), rows) in [("step", &d.step, 1), ("verify", &d.pair, PAIR_ROWS)] {
             let r = held.rows as usize;
             if r > rows || v.len() != r * wide || (r > 0 && held.first + held.rows > pos) {
                 return Err(shape(format!(
@@ -894,9 +890,7 @@ impl Body {
             shape("the NextN rows of a state put back on a load without the layer".into())
         })?;
         write_rows(stream, &d.step.1, &mut [&mut s.row0.streams[fin]], wide)?;
-        let mut pair_rows: Vec<&mut DeviceBuffer<f32>> = std::iter::once(&mut nx.pair0)
-            .chain(s.row1.as_mut().map(|r| &mut r.streams[fin]))
-            .collect();
+        let mut pair_rows = [&mut nx.pair0, &mut s.row1.streams[fin]];
         write_rows(stream, &d.pair.1, &mut pair_rows, wide)?;
         nx.held = d.held as usize;
         *wrote = Wrote {
