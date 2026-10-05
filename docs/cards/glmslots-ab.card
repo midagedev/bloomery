@@ -27,7 +27,10 @@
 #   The plan term: the 2-slot load plans two resident sequences (app::arch::glm5next::open_resident_slots,
 #     PlanInputs::plan_slots at one KDA lane), the twin one: card_experts 2581 against 2596 at ctx 2048, host_experts
 #     9515 against 9500 [measured at load: the two plan records of this round's box run (a)]. 15 more host experts of
-#     9,500 move h by at most +0.16 %, 0.05 ms [derived]: inside the band's slack.
+#     9,500 move h by at most +0.16 %, 0.05 ms [derived]: inside the band's slack. The ids read at the same plan:
+#     slot j's ids equal window j's alone run's with its card experts brought to 2581 (BLOOMERY_CARD_BUDGET), runs (a)
+#     and r3b; against the twin's 2596-expert plan slot 1's ids part (a card expert's arithmetic is not the host's
+#     bit for bit), placement arithmetic, not a slots defect, so the rounds' distinct_tokens may differ by arm.
 #   The ratio r = 2 S1 / R2 = 2 / (R2/S1) = 2 / 1.50 .. 2 / 1.36: +34..+47 %.
 # Resource timeline of the round (N = 2) [derived]: host CPU, the two rows' host legs and fixed costs, 63..70 ms of
 #   the 64.8..71.3 (the wall); card SMs, the two fronts, 25.6..31.2 ms under it; PCIe, a row's activations each way,

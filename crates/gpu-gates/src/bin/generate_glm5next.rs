@@ -153,7 +153,11 @@
 //! and mean are a round's, `prompt_tokens` and `depth` a window's, `steps`
 //! the counted rounds, and its `positions` and `tok/s(positions)` the counted
 //! rounds' positions and Σ positions · 1000 / Σ ms, the aggregate rate (the
-//! depth runner's aggregate row). The residency boundaries are the slots'
+//! depth runner's aggregate row). Slot j's ids are window j's run alone at
+//! the same plan, its card experts equal (`BLOOMERY_CARD_BUDGET`): the
+//! N-sequence plan leaves fewer experts on the card than one sequence's, and
+//! a card expert's arithmetic is not the host's bit for bit, so against the
+//! one-sequence plan the ids may part. The residency boundaries are the slots'
 //! prompt calls, then one a round. A plain pass of this body lays one or two
 //! slots, a row a slot (from three slots the walk's point is two lanes of
 //! two columns or more, which its step port does not serve): N over 2 is
