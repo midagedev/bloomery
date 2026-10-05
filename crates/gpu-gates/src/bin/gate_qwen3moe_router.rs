@@ -49,6 +49,17 @@
 //! captured graph: one node, two replays bit-identical to the eager launch,
 //! the count zero after each.
 //!
+//! The m-row launch with the FFN norm folded in (`qwen3moe_router_norm_m`,
+//! the chain's at two to eight tokens) at m = 2, 5 and 8 against
+//! `fused::norm_quant` then `qwen3moe_router_fused` at m, on the first m
+//! rows of `l_out-12` then `l_out-46` through layer 13's `ffn_norm` and
+//! router weight: the q8_1 bytes (all five planes of the m columns, the
+//! scales by bits), logits, probabilities, ids and weights BIT-EQUAL, the
+//! ticket count zero. A refused row — row 1 of five with a NaN: both raise
+//! `NormQuant` and `Router`, write the same q8_1 bytes with row 1's scales
+//! NaN, refuse token 1 with its ids kept, and leave every other token the
+//! clean run's.
+//!
 //! The ubatch router the GEMM prefill routes with
 //! (`RouterKernels::enqueue_ubatch`: the logits launch, then the routing
 //! launch) runs on the file's layer-0 router weight for T ∈ {1, 7, 8, 9, 15,
@@ -330,18 +341,20 @@ mod gate {
         norm: &'a FusedKernels,
     }
 
-    /// The two launches the norm-fused entry replaces, on one token `x`.
+    /// The two launches the norm-fused entries replace, on the `m` token
+    /// rows `x`.
     fn norm_split(
         gpu: &Gpu,
         k: &RouterKernels,
         nl: &NormLayer<'_>,
         x: &DeviceBuffer<f32>,
+        m: usize,
         out: &mut RouterOut,
     ) -> Result<NormRouted, GateError> {
         let stream = gpu.stream();
         let kk = nl.w.cols();
-        let mut act = Q8Act::with_k(stream, 1, kk)?;
-        let mut normed = DeviceBuffer::<f32>::zeroed(stream, kk)?;
+        let mut act = Q8Act::with_k(stream, m, kk)?;
+        let mut normed = DeviceBuffer::<f32>::zeroed(stream, m * kk)?;
         nl.norm.enqueue_norm_quant(
             stream,
             x,
@@ -351,11 +364,11 @@ mod gate {
             &mut normed,
             gpu.unlabelled_sink(),
         )?;
-        k.enqueue_fused(stream, nl.w, &normed, 1, gpu.unlabelled_sink(), out)?;
+        k.enqueue_fused(stream, nl.w, &normed, m, gpu.unlabelled_sink(), out)?;
         stream.synchronize()?;
         Ok(NormRouted {
             act: readback_q8act(stream, &act)?,
-            routed: read_fused(stream, out, 1)?,
+            routed: read_fused(stream, out, m)?,
         })
     }
 
@@ -383,6 +396,36 @@ mod gate {
         let run = NormRouted {
             act: readback_q8act(stream, &act)?,
             routed: read_fused(stream, out, 1)?,
+        };
+        Ok((run, out.tickets(stream)?))
+    }
+
+    /// The m-row norm-fused entry on the `m` token rows `x`, and the ticket
+    /// count after it.
+    fn norm_fused_m(
+        gpu: &Gpu,
+        k: &RouterKernels,
+        nl: &NormLayer<'_>,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        out: &mut RouterOut,
+    ) -> Result<(NormRouted, u32), GateError> {
+        let stream = gpu.stream();
+        let mut act = Q8Act::with_k(stream, m, nl.w.cols())?;
+        k.enqueue_norm_fused_m(
+            stream,
+            nl.w,
+            x,
+            nl.gain,
+            nl.eps,
+            &mut act,
+            gpu.unlabelled_sink(),
+            out,
+        )?;
+        stream.synchronize()?;
+        let run = NormRouted {
+            act: readback_q8act(stream, &act)?,
+            routed: read_fused(stream, out, m)?,
         };
         Ok((run, out.tickets(stream)?))
     }
@@ -562,7 +605,7 @@ mod gate {
             let mut tickets_ok = true;
             for t in 0..m {
                 let x = DeviceBuffer::from_host(stream, &rows[t * kk..(t + 1) * kk])?;
-                let want = norm_split(gpu, k, &nl, &x, &mut out_s)?;
+                let want = norm_split(gpu, k, &nl, &x, 1, &mut out_s)?;
                 let (got, tickets) = norm_fused(gpu, k, &nl, &x, &mut out_f)?;
                 let eq = q8_equal(&got.act, &want.act) && fused_equal(&got.routed, &want.routed);
                 same += usize::from(eq);
@@ -608,7 +651,7 @@ mod gate {
             xn[77] = v;
             let xn = DeviceBuffer::from_host(stream, &xn)?;
             gpu.clear_fault()?;
-            let split = norm_split(gpu, k, &nl, &xn, &mut out_s)?;
+            let split = norm_split(gpu, k, &nl, &xn, 1, &mut out_s)?;
             let f_split = gpu.take_fault()?;
             let (fused, tickets) = norm_fused(gpu, k, &nl, &xn, &mut out_f)?;
             let f_fused = gpu.take_fault()?;
@@ -667,6 +710,100 @@ mod gate {
         println!(
             "graph op=qwen3moe_router_norm two_replays_bit_identical={replays_ok} \
              tickets_after={tickets_after:?} graph_nodes={nodes} {}",
+            verdict(pass)
+        );
+        Ok(ok && pass)
+    }
+
+    /// Token counts of the m-row norm-fused clause: the 2-slot pass, an odd
+    /// count, and the most one launch routes.
+    const NORM_M: [usize; 3] = [2, 5, MAX_TOKENS];
+
+    /// The m-row norm-fused section (module doc).
+    fn norm_m_section(
+        gpu: &Gpu,
+        gguf: &gguf::Gguf,
+        k: &RouterKernels,
+        eps: f32,
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let cpu = &sets()?[0].1;
+        let norm = FusedKernels::load(gpu.context())?;
+        let w = router_weight(gpu, gguf, 13)?;
+        let gain = ffn_gain(gpu, gguf, 13)?;
+        let nl = NormLayer {
+            w: &w,
+            gain: &gain,
+            eps,
+            norm: &norm,
+        };
+        let kk = w.cols();
+        let mut rows = Vec::new();
+        for src in ["l_out-12", "l_out-46"] {
+            rows.extend(ref_tensor_logical_in(&cpu.dir, cpu.tensor(src, 0)?)?);
+        }
+        if rows.len() < MAX_TOKENS * kk || rows.len() % kk != 0 {
+            return Err(format!(
+                "l_out-12 and l_out-46 hold {} values, want at least {MAX_TOKENS} rows of {kk}",
+                rows.len()
+            )
+            .into());
+        }
+        let mut out_s = RouterOut::with_tokens(stream, dims(N_USED)?, MAX_TOKENS)?;
+        let mut out_f = RouterOut::with_tokens(stream, dims(N_USED)?, MAX_TOKENS)?;
+        let mut ok = true;
+        for m in NORM_M {
+            let x = DeviceBuffer::from_host(stream, &rows[..m * kk])?;
+            let want = norm_split(gpu, k, &nl, &x, m, &mut out_s)?;
+            let (got, tickets) = norm_fused_m(gpu, k, &nl, &x, m, &mut out_f)?;
+            let q8 = q8_equal(&got.act, &want.act);
+            let routed = fused_equal(&got.routed, &want.routed);
+            let pass = q8 && routed && tickets == 0;
+            println!(
+                "norm_m m={m} layer=13 rows of l_out-12 then l_out-46 vs norm_quant+router_fused at \
+                 m={m}: q8_1 planes bit-identical {q8}, logits, probs, ids and weights \
+                 bit-identical {routed}, tickets={tickets} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+
+        // A refused row: row 1 of five holds a NaN. Each path's buffers hold
+        // its clean run first, so a refused token's kept ids are that run's.
+        let m = 5;
+        let x = DeviceBuffer::from_host(stream, &rows[..m * kk])?;
+        let clean_s = norm_split(gpu, k, &nl, &x, m, &mut out_s)?;
+        let (clean_f, _) = norm_fused_m(gpu, k, &nl, &x, m, &mut out_f)?;
+        let mut xn = rows[..m * kk].to_vec();
+        xn[kk + 77] = f32::NAN;
+        let xn = DeviceBuffer::from_host(stream, &xn)?;
+        let want = Some(Fault::of_sites(
+            LAYER_NONE,
+            &[FaultSite::NormQuant, FaultSite::Router],
+        ));
+        gpu.clear_fault()?;
+        let split = norm_split(gpu, k, &nl, &xn, m, &mut out_s)?;
+        let f_split = gpu.take_fault()?;
+        let (fused, tickets) = norm_fused_m(gpu, k, &nl, &xn, m, &mut out_f)?;
+        let f_fused = gpu.take_fault()?;
+        let q8_same = q8_equal(&split.act, &fused.act);
+        let scales_nan = col(&fused.act.d8, m, 1).iter().all(|d| d.is_nan());
+        let (refused_s, others_s) = tokens_verdict(&split.routed, &clean_s.routed, m, &[1]);
+        let (refused_f, others_f) = tokens_verdict(&fused.routed, &clean_f.routed, m, &[1]);
+        let pass = f_split == want
+            && f_fused == want
+            && q8_same
+            && scales_nan
+            && refused_s
+            && refused_f
+            && others_s
+            && others_f
+            && tickets == 0;
+        println!(
+            "norm_m refused row: m={m}, row 1 with a NaN: split fault={f_split:?} m-row fault={f_fused:?} \
+             (want {want:?}), q8_1 bytes equal {q8_same}, row 1's scales NaN {scales_nan}, token 1 \
+             refused {refused_s}/{refused_f}, the other tokens the clean run's {others_s}/{others_f}, \
+             tickets={tickets} {}",
             verdict(pass)
         );
         Ok(ok && pass)
@@ -1417,6 +1554,7 @@ mod gate {
 
         ok &= picks_section(&gpu, &k, &w, &cols, kk)?;
         ok &= norm_section(&gpu, &gguf, &k, hp.rms_eps)?;
+        ok &= norm_m_section(&gpu, &gguf, &k, hp.rms_eps)?;
         let (w0, k0) = router_weight_host(&gguf, 0)?;
         ok &= ubatch_section(&gpu, &k, &w0, k0)?;
         ok &= fault_section(&gpu, &gguf, &k, hp.rms_eps)?;

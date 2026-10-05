@@ -306,18 +306,18 @@ mod gate {
     /// three: 1 + 30·13 + 10·12 + 6 + 3.
     const NODES_DECODE: usize = 520;
 
-    /// PIN(2026-09-27): a captured pass of `m >= 2` rows without its heads,
-    /// derived the same way at more than one row: each delta layer 8 + 6
-    /// (the router's norm its own launch), one more on the 14 whose
-    /// `attn_qkv` is Q6_K (its token-major copy); each attention layer
-    /// 7 + 6, two more on the 6 Q6_K `attn_v` layers (gemv and copy):
-    /// 1 + 30·14 + 14 + 10·13 + 12. Each row's head adds a copy of the
-    /// row's residual and three launches.
-    const NODES_PASS: usize = 577;
+    /// PIN(2026-10-05): a captured pass of `m >= 2` rows without its heads,
+    /// derived the same way at more than one row: each delta layer 8 + 5
+    /// (the norm with the gated router in one launch, as at one row), one
+    /// more on the 14 whose `attn_qkv` is Q6_K (its token-major copy); each
+    /// attention layer 7 + 5, two more on the 6 Q6_K `attn_v` layers (gemv
+    /// and copy): 1 + 30·13 + 14 + 10·12 + 12. Each row's head adds a copy
+    /// of the row's residual and three launches.
+    const NODES_PASS: usize = 537;
 
     const _: () = assert!(
         NODES_DECODE == 1 + N_DELTA * 13 + N_ATTN * 12 + Q6_V + 3
-            && NODES_PASS == 1 + N_DELTA * 14 + Q6_QKV + N_ATTN * 13 + 2 * Q6_V
+            && NODES_PASS == 1 + N_DELTA * 13 + Q6_QKV + N_ATTN * 12 + 2 * Q6_V
             && N_DELTA + N_ATTN == N_LAYER
     );
 

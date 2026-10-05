@@ -244,6 +244,7 @@ generate_ds41   qwen35moe_router_fused_512               0           0
 generate_ds41   qwen35moe_router_logits                  0           0
 generate_ds41   qwen35moe_router_logits_512              0           0
 generate_ds41   qwen35moe_router_norm                    0           0
+generate_ds41   qwen35moe_router_norm_m                  0           0
 generate_ds41   qwen35moe_router_route                   0           0
 generate_ds41   qwen35moe_router_route_512               0           0
 generate_ds41   qwen3moe_combine                         0           0
@@ -259,6 +260,7 @@ generate_ds41   qwen3moe_qkv_q4k_mcol                    0           0
 generate_ds41   qwen3moe_router_fused                    0           0
 generate_ds41   qwen3moe_router_logits                   0           0
 generate_ds41   qwen3moe_router_norm                     0           0
+generate_ds41   qwen3moe_router_norm_m                   0           0
 generate_ds41   qwen3moe_router_route                    0           0
 generate_ds41   qwen3moe_token_major                     0           0
 generate_ds41   rms_norm                                 0           0
@@ -439,6 +441,7 @@ gate_e2e   qwen35moe_router_fused_512               0           0
 gate_e2e   qwen35moe_router_logits                  0           0
 gate_e2e   qwen35moe_router_logits_512              0           0
 gate_e2e   qwen35moe_router_norm                    0           0
+gate_e2e   qwen35moe_router_norm_m                  0           0
 gate_e2e   qwen35moe_router_route                   0           0
 gate_e2e   qwen35moe_router_route_512               0           0
 gate_e2e   qwen3moe_combine                         0           0
@@ -454,6 +457,7 @@ gate_e2e   qwen3moe_qkv_q4k_mcol                    0           0
 gate_e2e   qwen3moe_router_fused                    0           0
 gate_e2e   qwen3moe_router_logits                   0           0
 gate_e2e   qwen3moe_router_norm                     0           0
+gate_e2e   qwen3moe_router_norm_m                   0           0
 gate_e2e   qwen3moe_router_route                    0           0
 gate_e2e   qwen3moe_token_major                     0           0
 gate_e2e   rms_norm                                 0           0

@@ -706,7 +706,7 @@ gate-gpu-qwen3moe-router:
 gate-gpu-qwen35moe-moe *ARGS:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_moe {{ARGS}}'
 
-# Qwen3.6-35B-A3B 전 체인 게이트(한 장): 노드 수 핀(디코드 520, 패스 577 + 4m), 디코드 다섯 스텝 = 다섯 행 패스 = eager
+# Qwen3.6-35B-A3B 전 체인 게이트(한 장): 노드 수 핀(디코드 520, 패스 537 + 4m), 디코드 다섯 스텝 = 다섯 행 패스 = eager
 # = 리셋 뒤 반복(logits·저장소 비트 동일), 층별 teacher-forced 탭(GDN·어텐션·MoE)과 자유 주행 l_out을 ik 배치 세트에,
 # step4·d1k 세트는 ik의 프리필 상태(cache_s·cache_k·cache_v)를 실어 한 스텝을 댄다.
 gate-gpu-qwen35moe-e2e:

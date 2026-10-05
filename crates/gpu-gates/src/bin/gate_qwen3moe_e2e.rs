@@ -381,18 +381,19 @@ mod gate {
     /// with the two q8_1 launches of [`NODES_CHAIN`]'s note folded.
     const NODES_PASS_1: usize = 601;
 
-    /// PIN(2026-09-25): the captured prefill pass's node count at every `m`
+    /// PIN(2026-10-05): the captured prefill pass's node count at every `m`
     /// from two to `MAX_TOKENS`, derived the same way: the embedding rows,
     /// then per layer the attention half's 7 (norm+quant, q·k·v,
     /// QK-norm+rope+append, flash segment pass, flash merge, the attention
     /// rows' q8_1, attn_output with the residual) plus 2 on each of the 24
     /// layers whose value projection is Q6_K (its gemv, the token-major
-    /// copy), and the FFN half's 6 (norm+quant, the m-token router,
-    /// gate·up·SwiGLU, one q8_1 over every token's slots, one down `_sel`
-    /// over every token's slots, the combine): 1 + 24·13 + 24·15. Every
-    /// launch covers all of the pass's tokens, so the count does not grow
-    /// with m. The head after the last pass runs eager.
-    const NODES_PASS_M: usize = 673;
+    /// copy), and the FFN half's 5 (the FFN norm with the m-token router in
+    /// one launch, gate·up·SwiGLU, one q8_1 over every token's slots, one
+    /// down `_sel` over every token's slots, the combine): 1 + 24·12 +
+    /// 24·14. Every launch covers all of the pass's tokens, so the count
+    /// does not grow with m. The head after the last pass runs eager. Was
+    /// 673, the FFN norm its own launch (`norm_quant`) before the router.
+    const NODES_PASS_M: usize = 625;
 
     /// PIN(2026-09-24): the teacher-forced bound on each half's error ratio
     /// — its relative error over the relative distance between the two

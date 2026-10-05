@@ -256,16 +256,16 @@ pub(super) fn enqueue_pass(
 ///   launches, conv, delta, gated norm, quantizer and output projection —
 ///   8 — plus a Q6_K q·k·v projection's token-major copy at more than one
 ///   row.
-/// - FFN: the norm with the router (one launch at one row, two at more),
-///   gate·up, one quantizer over every token's slots, the down `_sel` over
-///   every token's slots, and the combine — 5 or 6.
+/// - FFN: the norm with the router (one launch), gate·up, one quantizer
+///   over every token's slots, the down `_sel` over every token's slots,
+///   and the combine — 5.
 ///
 /// - A dense FFN: `norm_quant` and the four launches after the router — 5;
 ///   an unfused gate·up is the gate, the up and the SwiGLU; a Q8_0 down is
 ///   one launch with no quantizer, a Q3_K or Q5_K one the quantizer and its
 ///   projection ([`site_launches`]).
 ///
-/// So a qwen3moe layer is 12 or 13 launches at one row and 13 or 15 at
+/// So a qwen3moe layer is 12 or 13 launches at one row and 12 or 14 at
 /// every `m` from two to [`GEMV_COLS`]. Past it (the wide arm, `wide`) the
 /// embedding is followed by the unit's dense route table, and a layer is
 /// its mixer — the gated attention's norm, quantizer, three GEMMs, rope,
@@ -309,7 +309,7 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
         let f = &p.ffn;
         let ffn = match (&f.route, wide) {
             (FfnRoute::Router { .. }, true) => 10,
-            (FfnRoute::Router { .. }, false) => 5 + many,
+            (FfnRoute::Router { .. }, false) => 5,
             (FfnRoute::Dense, true) => 1 + wide_quants(&[f.gate_ty, f.up_ty]) + 5,
             (FfnRoute::Dense, false) => {
                 let gate_up = if f.gate_up_fused() {
@@ -841,9 +841,9 @@ fn gated_256(
 /// all at that index, so each slot's row is the row a one-token launch
 /// writes. Its input is one quantizer launch over every token's slots (each
 /// 128-value block is quantized on its own, so a column's bytes do not
-/// depend on the columns beside it). At one token the norm runs inside the
-/// router's launch (`enqueue_norm_fused`, `norm_quant`'s bytes); at more,
-/// `norm_quant` and the `m`-token router.
+/// depend on the columns beside it). The norm runs inside the router's
+/// launch, `norm_quant`'s bytes: `enqueue_norm_fused` at one token,
+/// `enqueue_norm_fused_m` at more.
 pub(super) fn ffn(
     c: &Ctx<'_>,
     n: &FfnPlan,
@@ -886,19 +886,16 @@ pub(super) fn ffn(
             c.sink,
             s.route.plain(WHAT)?,
         )?,
-        None => {
-            gpu.fused().enqueue_norm_quant(
-                stream,
-                &s.ffn_inp,
-                gain,
-                c.eps,
-                &mut s.act_ffn[i],
-                &mut s.normed,
-                c.sink,
-            )?;
-            k.router
-                .enqueue_fused(stream, router, &s.normed, m, c.sink, s.route.plain(WHAT)?)?;
-        }
+        None => k.router.enqueue_norm_fused_m(
+            stream,
+            router,
+            &s.ffn_inp,
+            gain,
+            c.eps,
+            &mut s.act_ffn[i],
+            c.sink,
+            s.route.plain(WHAT)?,
+        )?,
         Some(_) if m == 1 => k.q35(WHAT)?.router.enqueue_norm_fused(
             stream,
             router,
@@ -909,25 +906,16 @@ pub(super) fn ffn(
             c.sink,
             s.route.gated(WHAT)?,
         )?,
-        Some(_) => {
-            gpu.fused().enqueue_norm_quant(
-                stream,
-                &s.ffn_inp,
-                gain,
-                c.eps,
-                &mut s.act_ffn[i],
-                &mut s.normed,
-                c.sink,
-            )?;
-            k.q35(WHAT)?.router.enqueue_fused(
-                stream,
-                router,
-                &s.normed,
-                m,
-                c.sink,
-                s.route.gated(WHAT)?,
-            )?;
-        }
+        Some(_) => k.q35(WHAT)?.router.enqueue_norm_fused_m(
+            stream,
+            router,
+            &s.ffn_inp,
+            gain,
+            c.eps,
+            &mut s.act_ffn[i],
+            c.sink,
+            s.route.gated(WHAT)?,
+        )?,
     }
     slots_down(c, n, s, m, out)
 }
