@@ -229,12 +229,16 @@
 //! `arm` line, for one line on stdin: the timing runner takes its witness
 //! blocks there. A failed arm ends the process, naming the arm.
 //!
-//! `BLOOMERY_GEN_SLOTS=N` (2 to 8; unset or 1 is the one-sequence run
-//! above) decodes N streams in one pass (`GpuModel::step_slots`) on a
-//! whole-card qwen3moe file. Each arm's ids (`--tokens`, or an `--arm`'s)
-//! are N windows of equal length P, window j prefilled into slot j from its
-//! reset by `--prefill` (in graph mode a slot past 0 captures its prefill
-//! passes first, outside the prefill's wall); the pass of a row a slot is
+//! `BLOOMERY_GEN_SLOTS=N` (2 to the body's pass rows, 8 on either file;
+//! unset or 1 is the one-sequence run above) decodes N streams in one pass
+//! (`GpuModel::step_slots`) on a whole-card qwen3moe file or a qwen4exp
+//! file, whose load is then planned for N sequences
+//! (`PlanInputs::plan_with_slots`). Each arm's ids (`--tokens`, or an
+//! `--arm`'s) are N windows of equal length P, window j prefilled into slot
+//! j from its reset by `--prefill` (on a qwen3moe file in graph mode a slot
+//! past 0 captures its prefill passes first, outside the prefill's wall);
+//! an arm after the first starts from the residency's seed too (its
+//! `residency reset` record before its `arm` line); the pass of a row a slot is
 //! captured before the rounds (`capture slots=N rows=1 graph_nodes=`), then
 //! `-n` − 1 rounds of one pass follow, each slot fed its own argmax, so
 //! slot j prints the ids `--tokens <window j>` prints alone. Each slot's
@@ -243,11 +247,17 @@
 //! round prints `time pass <r> ms= positions=N kind=slots` (the pass and the
 //! N ids' readback, a `warm` round marked) and the `SMOKE` footer names
 //! `slots=`, the counted `rounds=` and `positions=`, the rounds' `p50_ms=`
-//! and `mean_ms=` and `tok/s(aggregate)=`. Refused by name on a qwen35moe or
-//! qwen4exp file (only the qwen3moe body runs a pass of several slots), on a
-//! placed load (`--place`, or the unplaced default's fallback), for an id
-//! count N does not divide, and beside `--prompt`, `--seed-depth`,
-//! `--last-step`, `--logits` and `--dump-taps`.
+//! and `mean_ms=` and `tok/s(aggregate)=`; a qwen4exp arm's `residency pass`
+//! records follow its lines. Refused by name on a qwen35moe file (its body
+//! holds resident sequences, `Slots`, but runs no pass of several slots: it
+//! has no `SlotRows`), on a placed qwen3moe load (`--place`, or the unplaced
+//! default's fallback), on a qwen4exp run that drafts (`BLOOMERY_DRAFT=mtp`,
+//! or unset under `--place a` with the draft file there: the plain pass
+//! runs under `BLOOMERY_DRAFT=off`), for an id count N does not divide, and
+//! beside `--prompt`, `--seed-depth`, `--last-step`, `--logits`,
+//! `--dump-taps`, and on a qwen4exp file `BLOOMERY_STEP_STATS=1` and
+//! `BLOOMERY_ROUTE_TRACE`; the qwen4exp body refuses a pass of several
+//! slots on a load with an expert tier card (`--place bp`) by name.
 //!
 //! `--logits` prints `logits n= argmax= margin= fnv64=` after the `tokens`
 //! line: the head's last logits row, read back once — the argmax's lead over
@@ -332,7 +342,7 @@ mod cli {
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
     use bloomery_gpu::hybrid::HybridStats;
-    use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, StepMode};
+    use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
@@ -530,6 +540,20 @@ mod cli {
         fn stream_records(_m: &mut GpuModel<Self>) -> Result<StreamRecords, GateError> {
             Ok((Vec::new(), None))
         }
+
+        /// What the body refuses of the load `m` before a run of `slots`
+        /// streams in one pass (`BLOOMERY_GEN_SLOTS`), by name; nothing for a
+        /// body whose own pass names its refusals.
+        fn slots_load(_m: &GpuModel<Self>, _slots: usize) -> Result<(), GateError> {
+            Ok(())
+        }
+
+        /// Before a parked slot's prompt in graph mode, outside its wall, the
+        /// captures that prompt would otherwise take inside it; nothing for
+        /// a body whose prompt captures nothing a slot holds.
+        fn capture_slot_prompt(_m: &mut GpuModel<Self>) -> Result<(), GateError> {
+            Ok(())
+        }
     }
 
     impl Prompted for Body {
@@ -557,6 +581,29 @@ mod cli {
 
         fn seed(m: &mut Qwen3moeModel, rows: usize) -> Result<(), GateError> {
             Ok(m.seed_depth(rows)?)
+        }
+
+        /// A placed load (the unplaced default's fallback; `--place` is
+        /// refused before the load), refused by name: its host tier's ports
+        /// serve one sequence ([`Body`]'s `whole_card`).
+        fn slots_load(m: &Qwen3moeModel, slots: usize) -> Result<(), GateError> {
+            if m.body("generate_qwen3moe")?.placed().is_some() {
+                return Err(format!(
+                    "BLOOMERY_GEN_SLOTS={slots}: the load is placed (its plan line names why), \
+                     and a pass of several slots runs a whole-card load: a placed chain's host \
+                     tier serves one sequence"
+                )
+                .into());
+            }
+            Ok(())
+        }
+
+        /// A slot's captured prefill passes travel with its sequence, so a
+        /// parked slot holds none: captured here, as the load captures slot
+        /// 0's.
+        fn capture_slot_prompt(m: &mut Qwen3moeModel) -> Result<(), GateError> {
+            m.capture_prefill()?;
+            Ok(())
         }
     }
 
@@ -1105,11 +1152,15 @@ mod cli {
                 slots,
                 family,
                 &[
-                    ("--place", place.is_some()),
                     ("--prompt", text.is_some()),
                     ("--seed-depth", seed_depth.is_some()),
                     ("--last-step", last_step),
                     ("--logits", logits),
+                ],
+                &[
+                    ("--place", place.is_some()),
+                    ("BLOOMERY_STEP_STATS=1", levers.step_stats()),
+                    ("BLOOMERY_ROUTE_TRACE", levers.route_trace().is_some()),
                 ],
                 &arms,
             )?;
@@ -1148,6 +1199,15 @@ mod cli {
                 }
                 let place = Place38::parse(place.as_deref())?;
                 let (draft, off) = draft38(&levers, place, logits, &arms, ctx)?;
+                if slots > 1 && draft == Draft38::Mtp {
+                    return Err(format!(
+                        "BLOOMERY_GEN_SLOTS={slots} decodes several streams in one plain pass, \
+                         and this run drafts (BLOOMERY_DRAFT=mtp, or unset under --place a with \
+                         the draft file there): the MTP draft verifies one sequence's window; \
+                         set BLOOMERY_DRAFT=off"
+                    )
+                    .into());
+                }
                 (Chosen::Qwen38(Body38::path(prefill)?, place, draft), off)
             }
         };
@@ -1329,12 +1389,12 @@ mod cli {
                     let (mut m, residency) = open_qwen38(
                         file,
                         &levers,
-                        (ctx, mode),
+                        (ctx, mode, slots),
                         (path, place, experts),
                         (lever38, draft_off.as_ref()),
                         t,
                     )?;
-                    log38(&mut m, residency, &arms)?;
+                    log38(&mut m, residency, &arms, run.slots)?;
                     stream38(&mut m, &levers, place, residency)?;
                     if let Some(t) = trace {
                         m.body_parts("generate_qwen3moe")?
@@ -1343,7 +1403,11 @@ mod cli {
                             .attach_route_trace(t)?;
                     }
                     m.set_prompt38_stats(run.stats)?;
-                    drive(m, &run, path, &arms, listed, sync)
+                    if slots > 1 {
+                        drive_slots(m, &run, path, &arms, listed, sync)
+                    } else {
+                        drive(m, &run, path, &arms, listed, sync)
+                    }
                 }
                 Draft38::Mtp => {
                     if levers.route_trace().is_some() {
@@ -1361,7 +1425,7 @@ mod cli {
                         lever38,
                         t,
                     )?;
-                    log38(&mut m, residency, &arms)?;
+                    log38(&mut m, residency, &arms, run.slots)?;
                     stream38(&mut m, &levers, place, residency)?;
                     m.set_prompt38_stats(run.stats)?;
                     drive38_mtp(m, cfg, &run, &arms, listed, sync)
@@ -1799,7 +1863,9 @@ mod cli {
     }
 
     /// The Qwen3.8-Flash-Next model of `file`, placed by its plan on the
-    /// card `place` names, its routed experts where `experts` says, under
+    /// card `place` names, its routed experts where `experts` says, its plan
+    /// counting `slots` resident sequences (`BLOOMERY_GEN_SLOTS`; one is the
+    /// one-sequence plan), under
     /// the residency `lever` resolves over the plan ([`residency38`]): the
     /// `plan` line, the `residency unset` line when the lever is unset, under
     /// `mid` the `residency host` line, the `load` line, `load draft=off`
@@ -1809,7 +1875,7 @@ mod cli {
     fn open_qwen38(
         file: Split,
         levers: &Levers,
-        (ctx, mode): (usize, StepMode),
+        (ctx, mode, slots): (usize, StepMode, usize),
         (path, place, experts): (Prompt38, Place38, Experts),
         (lever, draft_off): (Lever38<'static>, Option<&Draft38Off>),
         t: Instant,
@@ -1818,11 +1884,13 @@ mod cli {
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.hp)?;
         let ub = ubatch_for(ctx)?;
         let machine = place.machine(&inputs, u64::try_from(ub)?, experts, None);
-        let plan = inputs.plan_with(
+        // One slot is `plan_with` itself.
+        let plan = inputs.plan_with_slots(
             &machine,
             u64::try_from(ctx)?,
             &PlanLevers::from_levers(levers)?,
             experts,
+            slots,
         )?;
         println!("{}", plan38_line(place, experts, &plan));
         let residency = residency38(&plan, lever, Record::print)?;
@@ -1834,7 +1902,7 @@ mod cli {
             levers.host(),
             ub,
             residency,
-            1,
+            slots,
         )?;
         m.set_mode(mode);
         let body = m.body("generate_qwen3moe")?;
@@ -1969,13 +2037,19 @@ mod cli {
 
     /// Under `mid`, keep the residency boundaries' reports for the `residency
     /// pass` records each arm prints after its lines; nothing under `off`.
-    fn log38(m: &mut Qwen38Model, residency: Residency, arms: &[Arm]) -> Result<(), GateError> {
+    fn log38(
+        m: &mut Qwen38Model,
+        residency: Residency,
+        arms: &[Arm],
+        slots: usize,
+    ) -> Result<(), GateError> {
         if residency == Residency::Off {
             return Ok(());
         }
-        // An arm's boundaries: its prompt call's, then at most one a
-        // generated token (a step, or a verify keeping at least one).
-        let passes = arms.iter().map(|a| a.n_gen).max().unwrap_or(0) + 1;
+        // An arm's boundaries: its slots' prompt calls, then at most one a
+        // generated token (a step, a pass of its slots, or a verify keeping
+        // at least one).
+        let passes = arms.iter().map(|a| a.n_gen).max().unwrap_or(0) + slots;
         m.body_parts("generate_qwen3moe")?.2.log_residency(passes);
         Ok(())
     }
@@ -2534,31 +2608,40 @@ mod cli {
     }
 
     /// `BLOOMERY_GEN_SLOTS=slots` beside what it does not run with, each
-    /// refused by name: another family's file (only the qwen3moe body runs a
-    /// pass of several slots), what every body refuses
-    /// ([`gen_slots::refused`]: each flag of `given` that is set), and an
-    /// arm whose ids `slots` does not cut into windows of one length
-    /// ([`gen_slots::windows`]).
+    /// refused by name: a qwen35moe file (its body runs no pass of several
+    /// slots), what every body refuses ([`gen_slots::refused`]: each flag of
+    /// `given` that is set, and of the three after it the qwen3moe file's
+    /// `--place` — a placed load's host tier serves one sequence — or the
+    /// qwen4exp file's step stats and route trace, which record one
+    /// sequence's steps), and an arm whose ids `slots` does not cut into
+    /// windows of one length ([`gen_slots::windows`]).
     fn slots_refused(
         slots: usize,
         family: Family,
         given: &[(&str, bool)],
+        &[place, stats, trace]: &[(&str, bool); 3],
         arms: &[Arm],
     ) -> Result<(), GateError> {
-        let other = match family {
-            Family::Qwen3 => None,
-            Family::Qwen35 => Some("qwen35moe"),
-            Family::Qwen38 => Some("qwen4exp"),
-        };
-        if let Some(arch) = other {
-            return Err(format!(
-                "BLOOMERY_GEN_SLOTS={slots} decodes several streams in one pass of the qwen3moe \
-                 body (`GpuModel::step_slots`); this is a {arch} file, whose body runs no pass of \
-                 several slots"
-            )
-            .into());
+        let mut beside = given.to_vec();
+        match family {
+            Family::Qwen3 => {
+                beside.push(place);
+                gen_slots::refused::<Body>(slots, "qwen3moe", &beside)?;
+            }
+            Family::Qwen35 => {
+                return Err(format!(
+                    "BLOOMERY_GEN_SLOTS={slots} decodes several streams in one pass \
+                     (`GpuModel::step_slots`, a body with `SlotRows`); this is a qwen35moe file, \
+                     whose body holds resident sequences (`Slots`) but runs no pass of several \
+                     slots: it has no `SlotRows`"
+                )
+                .into());
+            }
+            Family::Qwen38 => {
+                beside.extend([stats, trace]);
+                gen_slots::refused::<Body38>(slots, "qwen4exp", &beside)?;
+            }
         }
-        gen_slots::refused::<Body>(slots, "qwen3moe", given)?;
         for (i, arm) in arms.iter().enumerate() {
             gen_slots::windows(&arm.ids, slots, &format!("arm {i}'s ids"))?;
         }
@@ -2566,77 +2649,72 @@ mod cli {
     }
 
     /// Every arm of the run as `run.slots` streams in one pass
-    /// (`BLOOMERY_GEN_SLOTS`) on the qwen3moe model `m`, in a session over it
-    /// that serves that many slots; `listed` for an `--arm` list, whose arms
-    /// open with their `arm` lines. A placed load (the unplaced default's
-    /// fallback; `--place` is refused before the load) is refused by name:
-    /// its host tier's ports serve one sequence.
-    fn drive_slots(
-        m: Qwen3moeModel,
+    /// (`BLOOMERY_GEN_SLOTS`) on the model `m`, in a session over it that
+    /// serves that many slots; `listed` for an `--arm` list, whose arms open
+    /// with their `arm` lines. What the body refuses of the load first
+    /// ([`Prompted::slots_load`]); each arm from every slot's reset and, past
+    /// the first, the residency's seed ([`gen_slots::fresh`]), its record
+    /// before the arm's; each arm's `residency pass` records after its lines.
+    fn drive_slots<B: Prompted + SlotRows>(
+        m: GpuModel<B>,
         run: &Run,
-        path: PrefillPath,
+        path: B::Path,
         arms: &[Arm],
         listed: bool,
         sync: bool,
-    ) -> Result<(), GateError> {
-        if m.body("generate_qwen3moe")?.placed().is_some() {
-            return Err(format!(
-                "BLOOMERY_GEN_SLOTS={}: the load is placed (its plan line names why), and a pass \
-                 of several slots runs a whole-card load: a placed chain's host tier serves one \
-                 sequence",
-                run.slots
-            )
-            .into());
-        }
+    ) -> Result<(), GateError>
+    where
+        B::Seq: 'static,
+    {
+        B::slots_load(&m, run.slots)?;
         let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         s.add_slots(run.slots)?;
         let count = arms.len();
         let ran = s.arms(arms, |s, i, arm| {
+            if let Some(c) = gen_slots::fresh(s, run.slots, i > 0)? {
+                record::residency_reset(&c).print();
+            }
             if listed {
                 arm_head(i, count, arm, sync)?;
             }
-            run_arm_slots(s, run, path, arm)
+            let ran = run_arm_slots(s, run, path, arm);
+            after_passes(s.model_mut(), ran)
         });
         ran.map_err(|f| Box::new(f) as GateError)?;
         Ok(())
     }
 
-    /// One arm as `run.slots` streams in one pass: slot j from its reset
-    /// prefilled with window j of the arm's ids, in graph mode the pass of a
-    /// row a slot captured, then `-n` − 1 rounds, each slot fed its own
-    /// argmax. Every slot's lines from its `step 0` on; the rounds' lines are
-    /// held and written after them.
-    fn run_arm_slots(
-        s: &mut Session<Body>,
+    /// One arm as `run.slots` streams in one pass, every slot from its reset
+    /// and slot 0 selected ([`gen_slots::fresh`]): slot j prefilled with
+    /// window j of the arm's ids, in graph mode the pass of a row a slot
+    /// captured, then `-n` − 1 rounds, each slot fed its own argmax. Every
+    /// slot's lines from its `step 0` on; the rounds' lines are held and
+    /// written after them.
+    fn run_arm_slots<B: Prompted + SlotRows>(
+        s: &mut Session<B>,
         run: &Run,
-        path: PrefillPath,
+        path: B::Path,
         arm: &Arm,
-    ) -> Result<(), GateError> {
+    ) -> Result<(), GateError>
+    where
+        B::Seq: 'static,
+    {
         let (n, n_gen, warm) = (run.slots, arm.n_gen, run.warm);
         let windows = gen_slots::windows(&arm.ids, n, "the arm's ids")?;
-        // Slot 0 stands where the session left it — fresh, or cleared before
-        // this arm; every other slot starts from its reset here.
-        for j in 1..n {
-            s.select_slot(j)?;
-            s.clear()?;
-        }
         let mut pos0 = Vec::with_capacity(n);
         let mut next = Vec::with_capacity(n);
         let mut prompts = Vec::with_capacity(n);
         for (j, ids) in windows.iter().enumerate() {
             s.select_slot(j)?;
             let m = s.model_mut();
-            // A slot's captured prefill passes travel with its sequence, so a
-            // parked slot holds none: captured here, outside the prefill's
-            // wall, as the load captures slot 0's.
             if j > 0 && run.mode == StepMode::Graph {
-                m.capture_prefill()?;
+                B::capture_slot_prompt(m)?;
             }
-            let plan = <Body as Prompted>::plan(m, ids.len(), path)?;
+            let plan = B::plan(m, ids.len(), path)?;
             let t = Instant::now();
-            let tok = <Body as Prompted>::prefill(m, ids, path)?;
+            let tok = B::prefill(m, ids, path)?;
             let wall = t.elapsed();
-            let image = <Body as Prompted>::image(m, &plan)?;
+            let image = B::image(m, &plan)?;
             println!(
                 "step 0 {} {tok} slot={j} (the {} prompt ids in prefill_steps={} units, plan={}, \
                  {:.2} s, runtime value)",

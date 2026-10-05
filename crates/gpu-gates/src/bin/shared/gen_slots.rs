@@ -7,6 +7,7 @@
 //! counted rate are here, for `generate_qwen3moe` and `generate_ds41` alike.
 
 use app::Session;
+use bloomery_gpu::host::swap::ResetReport;
 use bloomery_gpu::model::SlotRows;
 use bloomery_gpu_gates::GateError;
 use std::time::Instant;
@@ -56,6 +57,28 @@ pub fn windows<'a>(ids: &'a [u32], n: usize, what: &str) -> Result<Vec<&'a [u32]
         .into());
     }
     Ok(ids.chunks_exact(ids.len() / n).collect())
+}
+
+/// An arm's `n` slots from their reset, slot 0 selected: slots 1 to n − 1
+/// cleared (slot 0 stands where the session left it — fresh, or cleared
+/// before this arm by `Session::arms`) and, for an arm after the first
+/// (`later`), the residency back to its seed, which `Session::clear` makes
+/// only on a one-slot model, so each arm runs as in a fresh process. That
+/// reset's report; `None` for the first arm or with no residency machine.
+pub fn fresh<B: SlotRows>(
+    s: &mut Session<B>,
+    n: usize,
+    later: bool,
+) -> Result<Option<ResetReport>, GateError>
+where
+    B::Seq: 'static,
+{
+    for j in 1..n {
+        s.select_slot(j)?;
+        s.clear()?;
+    }
+    s.select_slot(0)?;
+    Ok(if later { s.residency_reset()? } else { None })
 }
 
 /// The pass of a row a slot over slots `0..n`, captured into the model-wide
