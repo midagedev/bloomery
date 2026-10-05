@@ -13,6 +13,7 @@ use super::program::Tail;
 use super::proj::ProjKernels;
 use super::router::{RouterDims, RouterKernels, gated};
 use super::scratch::{Arena, Dims, KvPlanes, RopeRows, StepParams, f32_view};
+use super::slot_pass::{SlotIn, SlotPass};
 use super::ubatch::{Ubatch, ubatch_size};
 use crate::flash_gqa::{FlashGqaKernels, GROUP, HEAD};
 use crate::flash_gqa_prefill::FlashGqaPrefill;
@@ -21,7 +22,9 @@ use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
 use crate::host::StepLeg;
 use crate::linear::LinearKernels;
-use crate::model::{ChainBody, GpuModel, Instrumented, Rollback, Slots, block_count};
+use crate::model::{
+    ChainBody, GpuModel, Instrumented, Rollback, SlotRange, SlotRows, Slots, block_count,
+};
 use crate::q6k_sel::Q6kSelKernels;
 use crate::q38::Q38Kernels;
 use crate::rope_neox::RopeNeoxKernels;
@@ -151,6 +154,9 @@ pub struct Body {
     /// The decode step's one-row arena and its input record.
     pub(super) s: Arena,
     pub(super) sp: StepParams,
+    /// A pass of several slots' input records ([`SlotRows`]); the pass
+    /// runs on the prompt arena.
+    pub(super) slot_in: SlotIn,
     pub(super) k: Kernels,
     /// The fused head argmax's key and ticket, back at their seeds after
     /// every launch.
@@ -666,6 +672,7 @@ impl Body {
             rope: RopeRows::new(stream, &rope, HEAD, dims.ctx)?,
             s: Arena::new(stream, dims, 1)?,
             sp: StepParams::new(stream, false)?,
+            slot_in: SlotIn::new(stream)?,
             hp,
             plans,
             kv,
@@ -723,6 +730,7 @@ impl ChainBody for Body {
             + self.rope.table.num_bytes()
             + self.s.bytes()
             + self.sp.bytes()
+            + self.slot_in.bytes()
             + self.head_state.bytes()
             + self.prefill.bytes()
             + self.ub.bytes()
@@ -780,6 +788,84 @@ impl Slots for Body {
     /// Device bytes one sequence holds: its layers' K/V planes.
     fn seq_bytes(&self) -> usize {
         self.kv.iter().map(KvPlanes::bytes).sum()
+    }
+}
+
+impl SlotRows for Body {
+    /// Each busy slot's input record, in one copy ([`SlotIn`]). A placed
+    /// load is refused by name.
+    fn plan_slots(
+        &mut self,
+        stream: &CudaStream,
+        rows: &[SlotRange],
+        ids: &[u32],
+    ) -> Result<(), GpuError> {
+        self.whole_card("qwen3moe::Body::plan_slots")?;
+        self.slot_in.write(stream, rows, ids)
+    }
+
+    /// The pass on the prompt arena ([`SlotPass`]): the live planes are slot
+    /// 0's, each parked sequence's its own. A placed load is refused by
+    /// name.
+    fn enqueue_slots(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        heads: &mut [Head],
+        parked: &mut [&mut Seq],
+        rows: &[SlotRange],
+    ) -> Result<(), GpuError> {
+        self.whole_card("qwen3moe::Body::enqueue_slots")?;
+        let Body {
+            hp,
+            plans,
+            kv,
+            rope,
+            prefill,
+            slot_in,
+            k,
+            head_state,
+            mma,
+            ..
+        } = self;
+        let c = PassCtx {
+            gpu,
+            w,
+            plans,
+            k,
+            mma: *mma,
+            eps: hp.rms_eps,
+            table: &rope.table,
+        };
+        let mut planes: Vec<&mut [KvPlanes]> =
+            parked.iter_mut().map(|seq| seq.kv.as_mut_slice()).collect();
+        SlotPass {
+            c: &c,
+            live: kv,
+            parked: &mut planes,
+            rows,
+            ins: slot_in,
+            s: &mut prefill.a,
+            heads,
+            state: head_state,
+        }
+        .enqueue()
+    }
+}
+
+impl Body {
+    /// Refused by name on a placed load: its prompt runs through the host
+    /// tier's batch port and its step through the placed chain, one
+    /// sequence each, and neither runs a pass of several slots.
+    fn whole_card(&self, what: &'static str) -> Result<(), GpuError> {
+        if self.placed.is_some() {
+            return Err(GpuError::shape(
+                what,
+                "a pass of several slots on a placed load: its host tier's batch port and its \
+                 placed chain run one sequence",
+            ));
+        }
+        Ok(())
     }
 }
 

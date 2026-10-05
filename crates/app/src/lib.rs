@@ -32,7 +32,7 @@ pub mod mtp;
 
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::swap::ResetReport;
-use bloomery_gpu::model::{ChainBody, Rollback, Rows, Slots, StepMode};
+use bloomery_gpu::model::{ChainBody, Rollback, Rows, SlotRows, Slots, SlotsOut, StepMode};
 use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
@@ -520,6 +520,21 @@ where
     pub fn select_slot(&mut self, slot: usize) -> Result<(), SessionError> {
         self.idle("select_slot")?;
         Ok(self.model.select_slot(slot)?)
+    }
+}
+
+impl<B: SlotRows> Session<B>
+where
+    B::Seq: 'static,
+{
+    /// One pass of several slots' tokens ([`GpuModel::step_slots`]): each
+    /// row's greedy next token, each slot's ids bit for bit its tokens
+    /// stepped alone. The pass leaves slot 0 selected. Refused by name
+    /// while a verify's rows wait for their commit: the pass selects, and
+    /// a select between would move them onto another slot's sequence.
+    pub fn step_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, SessionError> {
+        self.idle("step_slots")?;
+        Ok(self.model.step_slots(rows)?)
     }
 }
 

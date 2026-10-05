@@ -17,9 +17,23 @@
 //! is live holds slot 0's state. A switch to or from slot 0 is one
 //! exchange; a switch between two parked slots is two (the live slot's
 //! state home first, the target's out) — pointer swaps either way.
+//!
+//! One pass of several slots ([`GpuModel::step_slots`], a body that is
+//! [`SlotRows`]) runs every busy slot's rows at once: the row-wise launches
+//! over all of them, each slot's sequence-bound launches over its own rows
+//! and stores. The homes are made canonical first — slot 0 selected, so
+//! every slot's state sits in its home — and the body binds each slot's
+//! stores by the slot alone. Those captures live in one model-wide cache
+//! keyed by the busy slots and their row counts ([`SlotGraphs`]).
 
-use super::{ChainBody, GpuModel, Graphs};
-use crate::{Gpu, GpuError};
+use super::{ChainBody, GpuModel, Graphs, MAX_PASS_ROWS, RowHeads, StepMode, no_head};
+use crate::fault::Fault;
+use crate::head::Head;
+use crate::weights::Weights;
+use crate::{Gpu, GpuError, Graph, NodeInfo};
+use cuda_core::CudaStream;
+use std::fmt;
+use std::ops::Range;
 
 /// A [`ChainBody`] that can hold several sequences at once: N resident
 /// sequences inside one model over one set of weights, switched by pointer
@@ -49,6 +63,164 @@ pub trait Slots: ChainBody {
     fn seq_bytes(&self) -> usize;
 }
 
+/// A [`Slots`] body that runs several resident sequences' rows as one pass
+/// ([`GpuModel::step_slots`]): its row-wise launches once over all `R` rows,
+/// the launches bound to one sequence's stores once per busy slot over that
+/// slot's rows and stores, each the launch that slot's rows would run
+/// alone. Row `r` ends in its own head,
+/// as a [`RowHeads::PerRow`] pass's rows do. A body without it serves
+/// several slots by a select and a step a slot.
+pub trait SlotRows: Slots {
+    /// The pass's host half: each busy slot's input record — its first
+    /// position `rows[i].pos0` and its ids `ids[rows[i].rows]` — written into
+    /// the buffers the pass reads. Never inside a capture.
+    fn plan_slots(
+        &mut self,
+        stream: &CudaStream,
+        rows: &[SlotRange],
+        ids: &[u32],
+    ) -> Result<(), GpuError>;
+
+    /// Enqueue the pass of `rows` the last [`SlotRows::plan_slots`] planned,
+    /// row `r` into `heads[r]`. The homes are canonical: slot 0's sequence
+    /// is the live one, and `parked` holds every other busy slot's, in
+    /// `rows` order. Reads no per-call value from `rows` but the slots and
+    /// their row ranges, so one capture serves every call of the same
+    /// slots and counts. Asynchronous as [`ChainBody::enqueue_chain`] is.
+    fn enqueue_slots(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        heads: &mut [Head],
+        parked: &mut [&mut Self::Seq],
+        rows: &[SlotRange],
+    ) -> Result<(), GpuError>;
+}
+
+/// One busy slot's rows in a pass of several slots: the slot, the range of
+/// the pass's rows it holds, and the position of its first row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotRange {
+    pub slot: usize,
+    pub rows: Range<usize>,
+    pub pos0: u32,
+}
+
+/// What [`GpuModel::step_slots`] returns: every row's greedy next token in
+/// the pass's row order — the order of the rows it was handed, each slot's
+/// tokens in turn. Row `r`'s logits are its own head's, as a
+/// [`RowHeads::PerRow`] pass of [`GpuModel::step_rows`] leaves them, and
+/// [`GpuModel::slots_logits`] reads them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotsOut {
+    pub ids: Vec<u32>,
+}
+
+/// The slots a faulted call ran on, ascending: the live slot of a step,
+/// every busy slot of a pass — at most [`MAX_PASS_ROWS`], a slot holding a
+/// row at least.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SlotSet {
+    ids: [usize; MAX_PASS_ROWS],
+    len: usize,
+}
+
+impl SlotSet {
+    /// The one slot `slot`.
+    pub(super) fn one(slot: usize) -> SlotSet {
+        let mut ids = [0; MAX_PASS_ROWS];
+        ids[0] = slot;
+        SlotSet { ids, len: 1 }
+    }
+
+    /// The slots of a pass's ranges (distinct, at most [`MAX_PASS_ROWS`]:
+    /// [`GpuModel::step_slots`] refuses any other set before it runs).
+    fn of(rows: &[SlotRange]) -> SlotSet {
+        let mut ids = [0; MAX_PASS_ROWS];
+        let len = rows.len().min(MAX_PASS_ROWS);
+        for (id, r) in ids.iter_mut().zip(rows) {
+            *id = r.slot;
+        }
+        ids[..len].sort_unstable();
+        SlotSet { ids, len }
+    }
+
+    pub(super) fn as_slice(&self) -> &[usize] {
+        &self.ids[..self.len]
+    }
+
+    /// Take `slot` out of the set; true when that left it empty.
+    pub(super) fn lift(&mut self, slot: usize) -> bool {
+        if let Some(i) = self.as_slice().iter().position(|&s| s == slot) {
+            self.ids.copy_within(i + 1..self.len, i);
+            self.len -= 1;
+        }
+        self.len == 0
+    }
+}
+
+/// "slot 1", "slots 0 and 1", "slots 0, 1 and 2".
+impl fmt::Display for SlotSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.as_slice() {
+            [] => write!(f, "no slot"),
+            [one] => write!(f, "slot {one}"),
+            [head @ .., last] => {
+                let head: Vec<String> = head.iter().map(usize::to_string).collect();
+                write!(f, "slots {} and {last}", head.join(", "))
+            }
+        }
+    }
+}
+
+/// The fault that poisons the model and the slots whose state it condemned
+/// ([`SlotSet`]): what every later call refuses by, and what
+/// [`GpuModel::reset`] lifts once each of those slots has been reset.
+#[derive(Clone, Copy)]
+pub(super) struct SlotFault {
+    pub(super) slots: SlotSet,
+    pub(super) fault: Fault,
+}
+
+/// The captured passes of several slots ([`GpuModel::step_slots`]), one per
+/// key: the busy slots in pass order and each one's row count. Model-wide,
+/// never exchanged on a select.
+///
+/// Every capture here addresses each busy slot's own stores, and the
+/// model-wide buffers (the pass arena, the input records, the heads, the
+/// weights). A select exchanges the handles of the slots' stores, never
+/// their memory, and nothing else a capture addresses moves while the model
+/// lives, so a capture replays over the same slots' stores after any later
+/// select. Declared before the parked slots and the body in
+/// [`GpuModel`]: a capture is destroyed while every buffer it addresses is
+/// alive.
+pub(super) struct SlotGraphs(Vec<(Vec<(usize, usize)>, Graph)>);
+
+impl SlotGraphs {
+    pub(super) fn new() -> SlotGraphs {
+        SlotGraphs(Vec::new())
+    }
+
+    /// The capture of the pass whose slots and row counts, in pass order,
+    /// are `key`, if one is held.
+    fn get(&self, key: impl Iterator<Item = (usize, usize)> + Clone) -> Option<&Graph> {
+        self.0
+            .iter()
+            .find(|(k, _)| k.iter().copied().eq(key.clone()))
+            .map(|(_, g)| g)
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// The key of a pass of `rows`: each busy slot and its row count, in pass
+/// order.
+fn key_of(rows: &[SlotRange]) -> impl Iterator<Item = (usize, usize)> + Clone + '_ {
+    rows.iter().map(|r| (r.slot, r.rows.len()))
+}
+
 /// A parked sequence as the model holds it: type-erased only as far as the
 /// parking needs, and given back to the body's exchange whole — the blanket
 /// impl below is the only `ParkedSeq` a `B::Seq` ever becomes, so a box
@@ -57,11 +229,21 @@ pub(super) trait ParkedSeq<B: ChainBody>: Send {
     /// Exchange this parked sequence with `body`'s live one
     /// ([`Slots::swap_seq`]).
     fn exchange(&mut self, gpu: &Gpu, body: &mut B) -> Result<(), GpuError>;
+
+    /// The parked sequence itself, typed: what a pass of several slots
+    /// hands the body ([`SlotRows::enqueue_slots`]).
+    fn seq(&mut self) -> &mut B::Seq
+    where
+        B: Slots;
 }
 
 impl<B: Slots> ParkedSeq<B> for B::Seq {
     fn exchange(&mut self, gpu: &Gpu, body: &mut B) -> Result<(), GpuError> {
         body.swap_seq(gpu, self)
+    }
+
+    fn seq(&mut self) -> &mut B::Seq {
+        self
     }
 }
 
@@ -150,6 +332,7 @@ where
         // the slot they hold after each step, so a refusal mid-switch leaves
         // slot 0 (or the old slot) live and named, never a mix.
         self.one_pass = None;
+        self.slot_rows = None;
         if self.selected != 0 {
             self.swap_parked(self.selected - 1)?;
             self.selected = 0;
@@ -181,4 +364,325 @@ where
         std::mem::swap(pos, &mut p.pos);
         Ok(())
     }
+
+    /// Where slot `slot`'s state lives (the homes rule, module doc): `None`
+    /// for the live fields, else the index of its parked entry. `slot` is
+    /// below [`GpuModel::slots`].
+    fn parked_home(&self, slot: usize) -> Option<usize> {
+        if slot == self.selected {
+            None
+        } else if slot == 0 {
+            Some(self.selected - 1)
+        } else {
+            Some(slot - 1)
+        }
+    }
+
+    /// The cache row slot `slot`'s next token lands in, wherever its state
+    /// lives.
+    fn slot_pos(&self, slot: usize, what: &'static str) -> Result<u32, GpuError> {
+        match self.parked_home(slot) {
+            None => Ok(self.pos),
+            Some(i) => self
+                .parked
+                .get(i)
+                .map(|p| p.pos)
+                .ok_or_else(|| GpuError::shape(what, format!("slot {slot}'s parked entry {i}"))),
+        }
+    }
+
+    /// Stand slot `slot` at `pos`, wherever its state lives.
+    fn stand_slot(&mut self, slot: usize, pos: u32, what: &'static str) -> Result<(), GpuError> {
+        match self.parked_home(slot) {
+            None => self.stand_at(pos),
+            Some(i) => {
+                self.parked
+                    .get_mut(i)
+                    .ok_or_else(|| {
+                        GpuError::shape(what, format!("slot {slot}'s parked entry {i}"))
+                    })?
+                    .pos = pos;
+            }
+        }
+        Ok(())
+    }
+
+    /// The ranges of a pass of `rows` — each `(slot, tokens)` in pass order —
+    /// with each slot's first position, or the named refusal of a pass of no
+    /// slot, a slot out of range or twice, a slot of no token, more than
+    /// [`MAX_PASS_ROWS`] rows, or a slot's rows past the resident cache.
+    fn slot_ranges(
+        &self,
+        rows: impl Iterator<Item = (usize, usize)>,
+        what: &'static str,
+    ) -> Result<Vec<SlotRange>, GpuError> {
+        let n = self.slots();
+        let mut out: Vec<SlotRange> = Vec::new();
+        let mut at = 0;
+        for (slot, m) in rows {
+            if slot >= n {
+                return Err(GpuError::shape(
+                    what,
+                    format!("slot {slot} of a model that serves 0..{n}"),
+                ));
+            }
+            if out.iter().any(|r| r.slot == slot) {
+                return Err(GpuError::shape(
+                    what,
+                    format!("slot {slot} twice in one pass"),
+                ));
+            }
+            if m == 0 {
+                return Err(GpuError::shape(what, format!("slot {slot} with no token")));
+            }
+            let pos0 = self.slot_pos(slot, what)?;
+            out.push(SlotRange {
+                slot,
+                rows: at..at + m,
+                pos0,
+            });
+            at += m;
+        }
+        if out.is_empty() {
+            return Err(GpuError::shape(what, "a pass of no slot"));
+        }
+        if at > MAX_PASS_ROWS {
+            return Err(GpuError::shape(
+                what,
+                format!("{at} rows in one pass; a pass holds at most {MAX_PASS_ROWS}"),
+            ));
+        }
+        for r in &out {
+            if r.pos0 as usize + r.rows.len() > self.ctx_max {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "slot {}'s {} rows from position {} pass the resident cache's {} rows",
+                        r.slot,
+                        r.rows.len(),
+                        r.pos0,
+                        self.ctx_max
+                    ),
+                ));
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl<B: SlotRows> GpuModel<B>
+where
+    B::Seq: 'static,
+{
+    /// One pass of several slots' tokens: `rows[i]` is slot `rows[i].0`'s
+    /// tokens at that slot's next positions, laid into the pass in this
+    /// order ([`SlotRows`]). Returns each row's greedy next token
+    /// ([`SlotsOut`]); each row's ids and logits are bit for bit those of
+    /// the slot's own tokens stepped alone, and each slot's position moves
+    /// by its tokens, no other's.
+    ///
+    /// Refused by name before anything runs: a pass of no slot, a slot out
+    /// of range or twice, a slot of no token, more than [`MAX_PASS_ROWS`]
+    /// rows, a slot's rows past the resident cache, a poisoned model, and a
+    /// load whose chain holds host work (a pass of slots has no chain for
+    /// its host service). The homes are made canonical first — slot 0
+    /// selected, so every slot's state sits in its home and the body binds
+    /// each slot's stores by the slot alone — and the call leaves slot 0
+    /// selected. The first pass of a key (the busy slots in pass order and
+    /// their row counts) makes the heads it needs and, in graph mode,
+    /// captures it into the model-wide cache ([`SlotGraphs`]); eager mode
+    /// runs the same enqueues uncaptured. A fault the pass raised is its
+    /// error and poisons every slot of the pass: only a
+    /// [`GpuModel::reset`] of each of them lifts it.
+    pub fn step_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, GpuError> {
+        const WHAT: &str = "GpuModel::step_slots";
+        self.refuse_if_poisoned(WHAT)?;
+        let ranges = self.slot_ranges(rows.iter().map(|&(slot, ids)| (slot, ids.len())), WHAT)?;
+        let ids: Vec<u32> = rows
+            .iter()
+            .flat_map(|&(_, ids)| ids.iter().copied())
+            .collect();
+        self.canonical_homes(&ranges, WHAT)?;
+        self.body.plan_slots(self.gpu.stream(), &ranges, &ids)?;
+        if self.mode == StepMode::Graph && self.slot_graphs.get(key_of(&ranges)).is_none() {
+            self.capture_ranges(&ranges, WHAT)?;
+        }
+        let out = self.run_slots(&ranges);
+        self.note_fault_in(WHAT, out, SlotSet::of(&ranges))
+    }
+
+    /// Capture the pass whose slots and row counts, in pass order, are
+    /// `key` (each `(slot, rows)`) into the model-wide cache without running
+    /// it — the homes made canonical and the heads made first, as
+    /// [`GpuModel::step_slots`] does — and return its node count. Refused
+    /// as `step_slots` refuses the same rows.
+    pub fn capture_slots(&mut self, key: &[(usize, usize)]) -> Result<usize, GpuError> {
+        const WHAT: &str = "GpuModel::capture_slots";
+        let ranges = self.slot_ranges(key.iter().copied(), WHAT)?;
+        self.canonical_homes(&ranges, WHAT)?;
+        self.capture_ranges(&ranges, WHAT)
+    }
+
+    /// Every node of the captured pass of `key` ([`GpuModel::capture_slots`]),
+    /// as the driver lists them.
+    pub fn slots_graph_nodes(&self, key: &[(usize, usize)]) -> Result<Vec<NodeInfo>, GpuError> {
+        self.slot_graphs
+            .get(key.iter().copied())
+            .ok_or(GpuError::state(
+                "GpuModel::slots_graph_nodes",
+                "no captured pass of these slots and rows",
+            ))?
+            .nodes()
+    }
+
+    /// Each row's logits of the last call, in its row order, when it was a
+    /// [`GpuModel::step_slots`] (`n_vocab` f32 each): row `r`'s head's.
+    /// Blocking read; gate/debug use.
+    pub fn slots_logits(&self) -> Result<Vec<Vec<f32>>, GpuError> {
+        const WHAT: &str = "GpuModel::slots_logits";
+        let rows = self.slot_rows.ok_or(GpuError::state(
+            WHAT,
+            "a pass of several slots as the last call",
+        ))?;
+        self.heads
+            .get(..rows)
+            .ok_or(no_head(WHAT))?
+            .iter()
+            .map(|h| h.logits_to_host(&self.gpu))
+            .collect()
+    }
+
+    /// Before a pass of `ranges`: a load with host work refused by name,
+    /// the homes canonical (slot 0 selected: pointer moves only, nothing
+    /// when it is already) and the pass's heads made.
+    fn canonical_homes(
+        &mut self,
+        ranges: &[SlotRange],
+        what: &'static str,
+    ) -> Result<(), GpuError> {
+        if self.body.host().is_some() {
+            return Err(GpuError::shape(
+                what,
+                "a pass of several slots on a load whose chain holds host work: its host service \
+                 serves a step's or a pass's chain, and a pass of slots has none",
+            ));
+        }
+        self.select_slot(0)?;
+        self.make_heads(rows_of(ranges), RowHeads::PerRow, what)
+    }
+
+    /// Capture the pass of `ranges` into the model-wide cache (replacing a
+    /// capture of the same key) and return its node count.
+    fn capture_ranges(
+        &mut self,
+        ranges: &[SlotRange],
+        what: &'static str,
+    ) -> Result<usize, GpuError> {
+        let GpuModel {
+            slot_graphs,
+            parked,
+            heads,
+            body,
+            weights,
+            gpu,
+            ..
+        } = self;
+        let heads = heads.get_mut(..rows_of(ranges)).ok_or(no_head(what))?;
+        let graph =
+            gpu.capture(|_| enqueue_ranges(gpu, weights, body.as_mut(), heads, parked, ranges))?;
+        let nodes = graph.node_count();
+        slot_graphs
+            .0
+            .retain(|(k, _)| !k.iter().copied().eq(key_of(ranges)));
+        slot_graphs.0.push((key_of(ranges).collect(), graph));
+        Ok(nodes)
+    }
+
+    /// [`GpuModel::step_slots`]' pass once planned: the enqueue or the
+    /// replay, each slot's position moved, then every row's readback in
+    /// row order. An error here can follow launches, so the caller passes
+    /// it through [`GpuModel::note_fault_in`].
+    fn run_slots(&mut self, ranges: &[SlotRange]) -> Result<SlotsOut, GpuError> {
+        const WHAT: &str = "GpuModel::step_slots";
+        let total = rows_of(ranges);
+        self.one_pass = None;
+        self.slot_rows = None;
+        match self.mode {
+            StepMode::Eager => {
+                let GpuModel {
+                    parked,
+                    heads,
+                    body,
+                    weights,
+                    gpu,
+                    ..
+                } = self;
+                let heads = heads.get_mut(..total).ok_or(no_head(WHAT))?;
+                enqueue_ranges(gpu, weights, body.as_mut(), heads, parked, ranges)?;
+            }
+            // The capture addresses each busy slot's own stores, which no
+            // select since has moved ([`SlotGraphs`]).
+            StepMode::Graph => self
+                .slot_graphs
+                .get(key_of(ranges))
+                .ok_or(GpuError::state(WHAT, "no captured pass of these slots"))?
+                .launch(self.gpu.stream())?,
+        }
+        for r in ranges {
+            let m = crate::launch_u32(WHAT, "rows", r.rows.len())?;
+            self.stand_slot(r.slot, r.pos0 + m, WHAT)?;
+        }
+        self.slot_rows = Some(total);
+        self.reads += 1;
+        let ids = self
+            .heads
+            .get(..total)
+            .ok_or(no_head(WHAT))?
+            .iter()
+            .map(|h| h.token(&self.gpu))
+            .collect::<Result<Vec<u32>, GpuError>>()?;
+        Ok(SlotsOut { ids })
+    }
+}
+
+/// The rows of a pass of `ranges`: where its last range ends.
+fn rows_of(ranges: &[SlotRange]) -> usize {
+    ranges.last().map_or(0, |r| r.rows.end)
+}
+
+/// Enqueue the pass of `rows` through the body, handing it each busy slot's
+/// parked sequence, typed, in `rows` order: with the homes canonical, slot
+/// `s > 0` sits in parked entry `s − 1`, and slot 0 is the live one.
+fn enqueue_ranges<B: SlotRows>(
+    gpu: &Gpu,
+    w: &Weights,
+    body: &mut B,
+    heads: &mut [Head],
+    parked: &mut [ParkedSlot<B>],
+    rows: &[SlotRange],
+) -> Result<(), GpuError>
+where
+    B::Seq: 'static,
+{
+    let mut homes: Vec<Option<&mut B::Seq>> = parked
+        .iter_mut()
+        // Called by name, as `swap_parked` calls `exchange`.
+        .map(|p| Some(ParkedSeq::<B>::seq(p.seq.as_mut())))
+        .collect();
+    let mut seqs = Vec::with_capacity(rows.len());
+    for r in rows.iter().filter(|r| r.slot != 0) {
+        let seq = r
+            .slot
+            .checked_sub(1)
+            .and_then(|i| homes.get_mut(i))
+            .and_then(Option::take)
+            .ok_or_else(|| {
+                GpuError::shape(
+                    "GpuModel::step_slots",
+                    format!("slot {}'s parked sequence, at entry {}", r.slot, r.slot - 1),
+                )
+            })?;
+        seqs.push(seq);
+    }
+    body.enqueue_slots(gpu, w, heads, &mut seqs, rows)
 }
