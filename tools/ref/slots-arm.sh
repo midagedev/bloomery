@@ -88,13 +88,15 @@ slots_count() {
 # pass it ended, so after the seed's come the prompt calls (pass=prompt kept=0, at least one a slot: a
 # slot's prompt may take more than one call) up to the first pass=slots, then only pass=slots kept=N, one a
 # round; a step a slot or a pair in place of the pass fails, naming the record. An arm with no residency
-# host record (the residency off, or a placement that resolves it off) fails it by name: the clause reads the
-# passes off the residency's records. Returns 1 with FAIL_WHY when it fails.
+# host record (the residency off, or a placement that resolves it off) has no residency pass to read and
+# passes the clause, its passes pinned by slots_count's `time pass … kind=slots` records alone; residency pass
+# records under such an arm fail it by name. Returns 1 with FAIL_WHY when it fails.
 slots_residency() {
   local n=$1 v what b p k m s
   FAIL_WHY=''
   if [ -z "$2" ]; then
-    FAIL_WHY="the slots residency clause needs the residency on: a slots arm's passes are read off its residency pass records, and this arm has no residency host record (BLOOMERY_RESIDENCY off, or unset under a placement that resolves it off)"
+    [ -z "$3" ] && return 0
+    FAIL_WHY="the slots residency clause: residency pass records under an arm with no residency host record (BLOOMERY_RESIDENCY off, or unset under a placement that resolves it off)"
     return 1
   fi
   v=$(paste -d' ' <(printf '%s\n' "$3") <(printf '%s\n' "$4") <(printf '%s\n' "$5") | awk -v n="$n" '
@@ -204,8 +206,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check res-kept "${out%%,*}" "1|the slots residency clause: the residency pass at boundary=3 reads pass=slots kept=1"
   res none/0 prompt/0 prompt/0
   check res-nopass "${out%%:*}" "1|the slots residency clause"
+  RH='' res
+  check res-off "$out" "0|"
   RH='' res none/0 prompt/0 prompt/0 slots/2
-  check res-off "${out%%:*}" "1|the slots residency clause needs the residency on"
+  check res-off-records "${out%%:*}" "1|the slots residency clause"
   # The aggregate labels out of a plain table.
   SLOT_LABELS=$'ours@BLOOMERY_GEN_SLOTS=2\nprose@BLOOMERY_GEN_SLOTS=2\n'
   check not-slots "$(printf '%s\n' ours ours@BLOOMERY_GEN_SLOTS=2 prose prose@BLOOMERY_GEN_SLOTS=2 ik | not_slots | paste -sd' ' -)" "ours prose ik"
