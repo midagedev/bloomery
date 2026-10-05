@@ -100,6 +100,12 @@
 //! A key at or past the segment's end stages zeros, so a refused block's NaN
 //! scale reaches a live result only as the f16 twin's NaN rows do — through a
 //! key below its row's count, never past it.
+//!
+//! The `_rows` entry ([`FlashGqaKernels::enqueue_pass_rows`]) is the
+//! head-128 tensor-core segment pass over several sequences' f16 caches: row
+//! `t` reads the planes of row `t` of a per-row table ([`RowPlanes`], the
+//! launch's grid-constant parameter) and is otherwise `seg_mma`'s row over
+//! them; the merge is [`flash_gqa_kernels::gqa_flash_merge`].
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
@@ -115,6 +121,9 @@ use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, shared, thread, warp, wmma,
 };
 use cuda_host::cuda_module;
+use std::marker::PhantomData;
+use std::ops::Range;
+use std::ptr;
 use std::sync::Arc;
 
 /// Values per head.
@@ -525,6 +534,153 @@ fn q8_value_word(cw: u32, dbits: u16) -> u64 {
     let v = q8_word_values(cw, d);
     let lo = f32x2_to_f16x2_bits(v[0], v[1]);
     u64::from(lo) | (u64::from(f32x2_to_f16x2_bits(v[2], v[3])) << 32)
+}
+
+// --------------------------------------- the rows of several sequences
+//
+// A launch over the rows of several sequences — a pass of resident slots,
+// each slot's rows over its own cache — finds each row's planes in a per-row
+// table, the launch's grid-constant parameter ([`RowPlanes`]). A captured
+// launch holds the table as it holds every buffer address it was given, so a
+// replay reads the planes the capture read; the rows' other inputs (the
+// queries, the live counts, the partials) are row-indexed as in a launch of
+// one sequence. The `_rows` entries serve the f16 cache.
+
+/// Rows one launch over several sequences' caches takes: a pass of resident
+/// slots holds at most this many (`model::MAX_PASS_ROWS`).
+pub(crate) const ROW_PLANES: usize = 8;
+// The `_rows` launch contracts spell ROW_PLANES out as 8.
+const _: () = assert!(ROW_PLANES == 8);
+
+/// The per-row table of a launch over several sequences' caches, its
+/// grid-constant parameter: row `t`'s planes in [`KvSrc::words`]'s order —
+/// key rows, key scales, value rows, value scales, the f16 cache's scales
+/// null — for each row below the launch's `m`, null past it. Built on the
+/// host by [`RowTable`] alone.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct RowPlanes {
+    rows: [[*mut u32; 4]; ROW_PLANES],
+}
+
+impl RowPlanes {
+    /// Row `t`'s f16 key and value planes, each `plane` u16 — the planes a
+    /// launch of one sequence takes as its two slices.
+    ///
+    /// # Safety
+    /// `t` is below the launch's rows, whose table [`RowTable::planes`] built
+    /// over f16 planes of at least `plane` values each; nothing writes the
+    /// planes while the launch reads them.
+    #[inline(always)]
+    pub(crate) unsafe fn f16(&self, t: usize, plane: usize) -> F16Kv<'_> {
+        // SAFETY: t < m <= ROW_PLANES (this fn's contract).
+        let w = unsafe { *self.rows.get_unchecked(t) };
+        // SAFETY: the row's words 0 and 2 are live f16 planes of at least
+        // `plane` values that only this launch's reads touch (this fn's
+        // contract).
+        unsafe {
+            F16Kv {
+                k: std::slice::from_raw_parts(w[0].cast_const().cast::<u16>(), plane),
+                v: std::slice::from_raw_parts(w[2].cast_const().cast::<u16>(), plane),
+            }
+        }
+    }
+
+    /// Row `t`'s f16 key and value planes to write through, each `plane`
+    /// u16: [`RowPlanes::f16`]'s planes as raw pointers.
+    ///
+    /// # Safety
+    /// As [`RowPlanes::f16`], with the launch the one writer of the planes.
+    #[inline(always)]
+    pub(crate) unsafe fn f16_mut(&self, t: usize) -> (*mut u16, *mut u16) {
+        // SAFETY: t < m <= ROW_PLANES (this fn's contract).
+        let w = unsafe { *self.rows.get_unchecked(t) };
+        (w[0].cast::<u16>(), w[2].cast::<u16>())
+    }
+}
+
+/// [`RowPlanes`] built on the host: each sequence's planes put in row order,
+/// each put borrowing them for the table's life, so the launches the table
+/// feeds ([`FlashGqaKernels::enqueue_pass_rows`] and
+/// `RopeNeoxKernels::enqueue_head_norm_neox_append_rows`) read and write
+/// planes nothing else holds while they are enqueued.
+pub(crate) struct RowTable<'a> {
+    planes: RowPlanes,
+    /// The rows put so far: `0..rows`.
+    rows: usize,
+    /// The shortest plane put, in u16.
+    plane: usize,
+    _planes: PhantomData<&'a mut DeviceBuffer<u16>>,
+}
+
+impl Default for RowTable<'_> {
+    /// No row put.
+    fn default() -> Self {
+        RowTable {
+            planes: RowPlanes {
+                rows: [[ptr::null_mut(); 4]; ROW_PLANES],
+            },
+            rows: 0,
+            plane: usize::MAX,
+            _planes: PhantomData,
+        }
+    }
+}
+
+impl<'a> RowTable<'a> {
+    /// Rows `rows` of the launch read and write the f16 planes `k` and `v`.
+    /// Refused by name unless `rows` hold a row, start where the last put
+    /// ended (the first at row 0) and end within [`ROW_PLANES`].
+    pub(crate) fn put_f16(
+        &mut self,
+        rows: Range<usize>,
+        k: &'a mut DeviceBuffer<u16>,
+        v: &'a mut DeviceBuffer<u16>,
+    ) -> Result<(), GpuError> {
+        if rows.start != self.rows || rows.is_empty() || rows.end > ROW_PLANES {
+            return Err(GpuError::shape(
+                "flash_gqa::RowTable::put_f16",
+                format!(
+                    "rows {rows:?} after rows 0..{}: a sequence's rows follow the last put's, \
+                     hold a row and end within {ROW_PLANES}",
+                    self.rows
+                ),
+            ));
+        }
+        let words = [
+            k.cu_deviceptr() as *mut u32,
+            ptr::null_mut(),
+            v.cu_deviceptr() as *mut u32,
+            ptr::null_mut(),
+        ];
+        for row in &mut self.planes.rows[rows.clone()] {
+            *row = words;
+        }
+        self.rows = rows.end;
+        self.plane = self.plane.min(k.len()).min(v.len());
+        Ok(())
+    }
+
+    /// The table of a launch of `m` rows over planes of `need` u16 each, or
+    /// the named refusal of a table of other rows or a shorter plane.
+    pub(crate) fn planes(
+        &self,
+        what: &'static str,
+        m: usize,
+        need: usize,
+    ) -> Result<RowPlanes, GpuError> {
+        if self.rows != m || self.plane < need {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a launch of {m} rows over planes of {need} values; the table holds {} rows, \
+                     its shortest plane {}",
+                    self.rows, self.plane
+                ),
+            ));
+        }
+        Ok(self.planes)
+    }
 }
 
 // ------------------------------------------------ the head-generic bodies
@@ -3426,6 +3582,81 @@ mod flash_gqa_kernels {
         };
     }
 
+    /// [`gqa_flash_seg_mma`] over several sequences' f16 caches: row `t`'s
+    /// keys and values are the planes of row `t` of `planes` ([`RowPlanes`],
+    /// each `n_kv · ctx` rows of 128). `seg_mma` at [`HEAD`] over [`F16Kv`],
+    /// the body of the one-sequence tensor-core passes: the grid, the
+    /// partials' index and every row's arithmetic are a launch of one
+    /// sequence's over that row's planes, and [`gqa_flash_merge`] folds them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            m <= 8,
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            q.len() >= m * n_kv * 8 * 128,
+            part_v.len() >= m * n_kv * 8 * segs * 128,
+            part_ms.len() >= m * n_kv * 8 * segs * 2
+        )
+    )]
+    pub fn gqa_flash_seg_mma_rows(
+        q: &[f32],
+        n_keys_buf: &[u32],
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+        #[grid_constant] planes: &RowPlanes,
+    ) {
+        static mut QT: SharedArray<u32, { MMA_ROWS * MMA_ROW_W }> = SharedArray::UNINIT;
+        static mut KT: SharedArray<u32, { KEY_TILE * MMA_ROW_W }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { GROUP * KEY_TILE }> = SharedArray::UNINIT;
+
+        let b = thread::blockIdx_x() as usize;
+        let rows = m as usize;
+        if b >= rows * n_kv as usize * segs as usize {
+            return; // block-uniform
+        }
+        // SAFETY: b % m < m <= ROW_PLANES (the launch contract), and the
+        // launcher built the table over f16 planes of n_kv·ctx·HEAD values
+        // that this launch only reads.
+        let src = unsafe { planes.f16(b % rows, n_kv as usize * ctx as usize * HEAD) };
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation; the raw form reaches it without a reference. The
+        // launch contract is `seg_mma`'s at HEAD over the row's planes.
+        unsafe {
+            seg_mma::<HEAD, 1, _>(
+                q,
+                src,
+                n_keys_buf,
+                scale,
+                n_kv,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QT),
+                SharedArray::as_raw_mut_ptr(&raw mut KT),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+            )
+        };
+    }
+
     /// [`gqa_flash_seg_mma_256`] over the Q8_0 cache (`seg_mma` at
     /// [`HEAD_256`] over [`Q8Kv`]): [`gqa_flash_seg_mma_q8`] at the wide head.
     #[allow(
@@ -3573,6 +3804,21 @@ pub struct GqaQ8Args<'a> {
     pub part_ms: &'a mut DeviceBuffer<f32>,
     pub fault: FaultSink,
     pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashGqaKernels::enqueue_pass_rows`]'s arguments: those of [`GqaArgs`]
+/// without the planes, which the per-row table gives each row.
+pub(crate) struct GqaRowsArgs<'a> {
+    pub(crate) q: &'a DeviceBuffer<f32>,
+    pub(crate) n_keys: &'a DeviceBuffer<u32>,
+    pub(crate) scale: f32,
+    pub(crate) n_kv: usize,
+    pub(crate) ctx: usize,
+    pub(crate) m: usize,
+    pub(crate) part_v: &'a mut DeviceBuffer<f32>,
+    pub(crate) part_ms: &'a mut DeviceBuffer<f32>,
+    pub(crate) fault: FaultSink,
+    pub(crate) y: &'a mut DeviceBuffer<f32>,
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -4088,6 +4334,93 @@ impl FlashGqaKernels {
             stream, &prep, q, kq, kd, vq, vd, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v,
             part_ms,
         )?;
+        let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
+            merge_grid,
+            MERGE_THREADS,
+            0,
+        ))?;
+        self.module.gqa_flash_merge(
+            stream, &prep, part_v, part_ms, n_keys, heads, ctx, segs, seg_keys, m, fault, y,
+        )?;
+        Ok(())
+    }
+
+    /// [`FlashGqaKernels::enqueue_pass`]'s tensor-core pass over several
+    /// sequences' f16 caches: row `t` attends the planes `planes` gives it
+    /// ([`RowTable`]), the rest of its inputs `args`' rows as
+    /// `enqueue_pass`'s. The segment pass `gqa_flash_seg_mma_rows` and
+    /// `gqa_flash_merge` at `m` rows: `enqueue_pass`'s grid, partials and
+    /// refusals, and a table of other than `m` rows, more than
+    /// [`ROW_PLANES`], or a plane shorter than `n_kv · ctx · HEAD` refused by
+    /// name. Each row's segments and its merge are cut from its own count
+    /// and the fixed [`SEGMENTS`], so its bits are a launch of one sequence's
+    /// over its own planes. Two launches. Asynchronous, allocation-free,
+    /// capturable.
+    pub(crate) fn enqueue_pass_rows(
+        &self,
+        stream: &CudaStream,
+        planes: &RowTable<'_>,
+        args: GqaRowsArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "flash_gqa::enqueue_rows";
+        let GqaRowsArgs {
+            q,
+            n_keys,
+            scale,
+            n_kv,
+            ctx,
+            m,
+            part_v,
+            part_ms,
+            fault,
+            y,
+        } = args;
+        if n_kv == 0 || ctx == 0 || m == 0 || m > ROW_PLANES {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need n_kv, ctx >= 1 and 1 <= m <= {ROW_PLANES}, got n_kv={n_kv} ctx={ctx} \
+                     m={m}"
+                ),
+            ));
+        }
+        let rows = planes.planes(what, m, n_kv * ctx * HEAD)?;
+        let n_head = n_kv * GROUP;
+        let segs = SEGMENTS;
+        let lens = [
+            ("q", q.len(), m * n_head * HEAD),
+            ("n_keys", n_keys.len(), m),
+            ("part_v", part_v.len(), partials_v_len(m, n_head)),
+            ("part_ms", part_ms.len(), partials_ms_len(m, n_head)),
+            ("y", y.len(), m * n_head * HEAD),
+        ];
+        if let Some((name, got, need)) = lens.iter().find(|(_, got, need)| got < need) {
+            return Err(GpuError::shape(
+                what,
+                format!("{name}.len() {got} < {need}"),
+            ));
+        }
+        let grid = launch_u32(what, "grid", m * n_kv * segs)?;
+        let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
+        let heads = launch_u32(what, "n_head", n_head)?;
+        let n_kv = launch_u32(what, "n_kv", n_kv)?;
+        let ctx = launch_u32(what, "ctx", ctx)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", SEG_KEYS)?;
+        let m = launch_u32(what, "m", m)?;
+        let cfg = LaunchConfig1D::new(grid, THREADS_U32, 0);
+        let prep = self.module.prepare_gqa_flash_seg_mma_rows(cfg)?;
+        // SAFETY: the table's rows are `planes`' puts, each an f16 plane pair
+        // of at least n_kv·ctx·HEAD values (checked above), borrowed by the
+        // table while this enqueue runs; a graph that captures the launch
+        // replays it over the same planes, which the caller keeps alive and
+        // in place while the graph lives, as for any buffer it captured.
+        unsafe {
+            self.module.gqa_flash_seg_mma_rows(
+                stream, &prep, q, n_keys, scale, n_kv, ctx, segs, seg_keys, m, part_v, part_ms,
+                rows,
+            )?;
+        }
         let prep = self.module.prepare_gqa_flash_merge(LaunchConfig1D::new(
             merge_grid,
             MERGE_THREADS,

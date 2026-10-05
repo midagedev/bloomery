@@ -2555,13 +2555,15 @@ mod gate {
 
     /// PIN(2026-10-05): the nodes a pass of several slots adds per layer for
     /// each busy slot past the first, at the same rows, derived before the
-    /// pass was built: the launches bound to one sequence's planes run once
-    /// a slot over its row window — the head norm and rope with the cache
-    /// append, the flash's segment pass and its merge (`slot_pass`: the
-    /// flash runs whole per slot) — 3; every other launch covers all of the
-    /// pass's rows. With its embedding from its own record, a slot adds
-    /// `1 + 3 · n_layer` ([`slot_nodes`]).
-    const J_SLOT_LAYER_NODES: usize = 3;
+    /// per-row launches were built: every launch of a layer covers all of
+    /// the pass's rows — the head norm and rope with the cache append and
+    /// the flash's segment pass read each row's own slot's planes through
+    /// the per-row table, a launch parameter and no node of its own, and the
+    /// merge reads row-indexed partials (`slot_pass`, `flash_gqa`'s `_rows`
+    /// entry) — 0. A slot adds its embedding from its own record alone,
+    /// `1 + 0 · n_layer` ([`slot_nodes`]), and the table adds no memcpy.
+    /// Was 3: the append, the segment pass and the merge ran once a slot.
+    const J_SLOT_LAYER_NODES: usize = 0;
 
     /// The nodes a busy slot adds to a pass of several slots at the same
     /// rows ([`J_SLOT_LAYER_NODES`]).

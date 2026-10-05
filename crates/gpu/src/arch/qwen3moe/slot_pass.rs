@@ -1,14 +1,18 @@
 //! qwen3moe's pass of several resident slots ([`SlotRows`], `GpuModel::step_slots`): every busy
 //! slot's rows in one walk over the prompt arena. Each layer's row-wise launches — the norms, the
 //! q·k·v and output projections, the router, the experts and the combine — run once over all `R`
-//! rows; the launches bound to one sequence's stores run once per busy slot, over that slot's row
-//! window of the arena and that slot's own K/V planes: the embedding from the slot's own input
-//! record (its first position and its ids), and per layer the head norm and rope with the cache
-//! append, and the flash's segment pass. Each of those is the launch the slot's rows would run
-//! alone, and a row's arithmetic in every launch of the walk does not depend on the rows beside it
-//! (`flash_gqa`'s row contract; the m-row launches against the steps, `gate_qwen3moe_e2e` (p)), so
-//! every row is its slot's own step bit for bit. Each row then ends in its own head
-//! ([`Tail::Rows`]).
+//! rows. The embedding runs once per busy slot, over that slot's row window, from the slot's own
+//! input record (its first position and its ids). Each layer's launches bound to the sequences'
+//! K/V planes — the head norm and rope with the cache append, the flash's segment pass and its
+//! merge — run once over all `R` rows when several slots are busy and the flash is the tensor-core
+//! pass over an f16 cache: row `t` reads and writes the planes of its own slot through the per-row
+//! table ([`RowTable`]), built from the slots' planes in pass order. A q8_0 cache, the scalar pass
+//! (the eager measurement tool, `set_flash_mma`) and a pass of one slot run them once per busy slot
+//! instead, over that slot's row window and its own planes: no per-row entry serves the first two.
+//! Either way each is the launch the row would run with its slot alone, and a row's arithmetic in
+//! every launch of the walk does not depend on the rows beside it (`flash_gqa`'s row contract; the
+//! m-row launches against the steps, `gate_qwen3moe_e2e` (p)), so every row is its slot's own step
+//! bit for bit. Each row then ends in its own head ([`Tail::Rows`]).
 //!
 //! [`SlotRows`]: crate::model::SlotRows
 
@@ -22,7 +26,7 @@ use super::scratch::{
 };
 use super::wide::GEMV_COLS;
 use crate::GpuError;
-use crate::flash_gqa::{partials_ms_len, partials_v_len};
+use crate::flash_gqa::{ROW_PLANES, RowTable, partials_ms_len, partials_v_len};
 use crate::head::Head;
 use crate::model::lookup::f32_gain;
 use crate::model::{MAX_PASS_ROWS, SlotRange};
@@ -35,6 +39,9 @@ const WHAT: &str = "qwen3moe::slot_pass";
 /// Words of the pass's input records: a pass of `R` rows over `n` slots
 /// fills `R + n`, at most two a row.
 const SLOT_IN_WORDS: usize = 2 * MAX_PASS_ROWS;
+
+// The per-row table holds every row of a pass.
+const _: () = assert!(MAX_PASS_ROWS <= ROW_PLANES);
 
 /// The input records of a pass of several slots, packed in pass order: the
 /// `j`-th busy slot's, whose rows start at pass row `r`, at word `r + j` —
@@ -165,6 +172,10 @@ impl SlotPass<'_, '_> {
             state,
         } = self;
         let total = check(rows, s.rows.min(GEMV_COLS), heads.len(), parked.len())?;
+        // The per-row launches when several slots are busy and they serve the
+        // planes (the module doc): the load's one cache format, read from the
+        // live planes.
+        let per_row = rows.len() > 1 && live.first().is_some_and(|p| p.rows_serve(c.mma));
         let hidden = s.dims.hidden;
         for (j, r) in rows.iter().enumerate() {
             let rec = ins.io(j, r)?;
@@ -189,17 +200,19 @@ impl SlotPass<'_, '_> {
                 }
             };
             dispatch::attn_in(&lc, g, s, total)?;
-            let mut others = parked.iter_mut();
-            for r in rows {
-                let planes = if r.slot == 0 {
-                    live.get_mut(l)
-                } else {
-                    others.next().and_then(|p| p.get_mut(l))
-                };
-                let kv = planes.ok_or_else(|| {
-                    GpuError::shape(WHAT, format!("slot {}'s planes of layer {l}", r.slot))
-                })?;
-                slot_attention(&lc, g, kv, s, &r.rows)?;
+            let slots = layer_planes(live, parked, rows, l);
+            if per_row {
+                let mut table = RowTable::default();
+                for slot in slots {
+                    let (r, kv) = slot?;
+                    kv.put_rows(&mut table, r.rows.clone())?;
+                }
+                attention(&lc, g, Planes::Rows(&table), s, &(0..total))?;
+            } else {
+                for slot in slots {
+                    let (r, kv) = slot?;
+                    attention(&lc, g, Planes::Slot(kv), s, &r.rows)?;
+                }
             }
             let i = s.col(total)?;
             c.gpu
@@ -241,16 +254,47 @@ fn check(rows: &[SlotRange], most: usize, heads: usize, parked: usize) -> Result
     Ok(at)
 }
 
-/// One busy slot's sequence-bound attention over its planes `kv`, rows `r`
-/// of the arena: the head norm and rope with the cache append, then the
-/// flash — each over the slot's row window alone, so each is the launch of
-/// those rows alone. The flash's partials are row-indexed (row `t`'s at
-/// `t · n_head · SEGMENTS` of `part_v`/`part_ms`, `flash_gqa`), so the
-/// slot's window of them sits where a pass of all the rows would put them.
-fn slot_attention(
+/// Each busy slot of `rows` with its planes of layer `l`, in pass order: slot
+/// 0's are the live ones, every other slot's the next parked sequence's; a
+/// slot whose planes are missing is refused by name.
+fn layer_planes<'a>(
+    live: &'a mut [KvPlanes],
+    parked: &'a mut [&mut [KvPlanes]],
+    rows: &'a [SlotRange],
+    l: usize,
+) -> impl Iterator<Item = Result<(&'a SlotRange, &'a mut KvPlanes), GpuError>> {
+    let mut live = Some(live);
+    let mut others = parked.iter_mut();
+    rows.iter().map(move |r| {
+        let planes = if r.slot == 0 {
+            live.take().and_then(|p| p.get_mut(l))
+        } else {
+            others.next().and_then(|p| p.get_mut(l))
+        };
+        planes
+            .map(|kv| (r, kv))
+            .ok_or_else(|| GpuError::shape(WHAT, format!("slot {}'s planes of layer {l}", r.slot)))
+    })
+}
+
+/// The K/V planes a layer's sequence-bound launches read and write: one busy
+/// slot's, or every busy slot's through the per-row table.
+enum Planes<'k, 't> {
+    Slot(&'k mut KvPlanes),
+    Rows(&'k RowTable<'t>),
+}
+
+/// The sequence-bound attention of rows `r` of the arena over `planes`: the
+/// head norm and rope with the cache append, then the flash — one slot's
+/// launches over its row window alone, or the per-row launches over all the
+/// pass's rows; either way each row's is the launch of its slot's rows
+/// alone. The flash's partials are row-indexed (row `t`'s at `t · n_head ·
+/// SEGMENTS` of `part_v`/`part_ms`, `flash_gqa`), so a slot's window of them
+/// sits where a launch over all the rows puts them.
+fn attention(
     c: &Ctx<'_>,
     n: &GqaPlan,
-    kv: &mut KvPlanes,
+    mut planes: Planes<'_, '_>,
     s: &mut Arena,
     r: &Range<usize>,
 ) -> Result<(), GpuError> {
@@ -272,44 +316,43 @@ fn slot_attention(
     let mut k = rows_mut(k, r, d.kv_len())?;
     let v = rows(v, r, d.kv_len())?;
     let pos = rows(pos, r, 1)?;
-    kv.append_128(
-        &c.k.neox,
-        stream,
-        Append128 {
-            q: &mut q,
-            k: &mut k,
-            v: &v,
-            gq: f32_gain(c.w, &n.attn_q_norm)?,
-            gk: f32_gain(c.w, &n.attn_k_norm)?,
-            table: c.table,
-            pos: &pos,
-            eps: c.eps,
-            n_head: d.n_head,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m,
-            fault: c.sink,
-        },
-    )?;
+    let append = Append128 {
+        q: &mut q,
+        k: &mut k,
+        v: &v,
+        gq: f32_gain(c.w, &n.attn_q_norm)?,
+        gk: f32_gain(c.w, &n.attn_k_norm)?,
+        table: c.table,
+        pos: &pos,
+        eps: c.eps,
+        n_head: d.n_head,
+        n_kv: d.n_kv,
+        ctx: d.ctx,
+        m,
+        fault: c.sink,
+    };
+    match &mut planes {
+        Planes::Slot(kv) => kv.append_128(&c.k.neox, stream, append)?,
+        Planes::Rows(table) => KvPlanes::append_128_rows(&c.k.neox, stream, table, append)?,
+    }
     let n_keys = rows(n_keys, r, 1)?;
     let mut part_v = rows_mut(part_v, r, partials_v_len(1, d.n_head))?;
     let mut part_ms = rows_mut(part_ms, r, partials_ms_len(1, d.n_head))?;
     let mut y = rows_mut(attn, r, d.attn_len())?;
-    kv.flash_128(
-        &c.k.flash,
-        stream,
-        FlashPass {
-            q: &q,
-            n_keys: &n_keys,
-            scale: ATTN_SCALE,
-            n_kv: d.n_kv,
-            ctx: d.ctx,
-            m,
-            part_v: &mut part_v,
-            part_ms: &mut part_ms,
-            fault: c.sink,
-            y: &mut y,
-        },
-        c.mma,
-    )
+    let flash = FlashPass {
+        q: &q,
+        n_keys: &n_keys,
+        scale: ATTN_SCALE,
+        n_kv: d.n_kv,
+        ctx: d.ctx,
+        m,
+        part_v: &mut part_v,
+        part_ms: &mut part_ms,
+        fault: c.sink,
+        y: &mut y,
+    };
+    match planes {
+        Planes::Slot(kv) => kv.flash_128(&c.k.flash, stream, flash, c.mma),
+        Planes::Rows(table) => KvPlanes::flash_128_rows(&c.k.flash, stream, table, flash, c.mma),
+    }
 }
