@@ -162,6 +162,14 @@ pub trait SlotRows: Slots {
             ),
         ))
     }
+
+    /// A `step_slots` pass (every row kept) of these ranges refused by name when
+    /// this load gives several rows of one slot another meaning (a verify's rows
+    /// on a drafted load). Default: nothing refused.
+    fn refuse_kept(&self, ranges: &[SlotRange]) -> Result<(), GpuError> {
+        let _ = ranges;
+        Ok(())
+    }
 }
 
 /// One busy slot's rows in a pass of several slots: the slot, the range of
@@ -592,7 +600,7 @@ where
     /// compile.
     pub fn step_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, GpuError> {
         const WHAT: &str = "GpuModel::step_slots";
-        let ranges = self.plan_pass(rows, WHAT)?;
+        let ranges = self.plan_pass(rows, SlotPass::Kept, WHAT)?;
         let out = self.run_slots(&ranges, SlotPass::Kept, WHAT);
         self.note_fault_in(WHAT, out, SlotSet::of(&ranges))
     }
@@ -619,7 +627,7 @@ where
                  (SlotRows::SETTLES_PARTIAL_KEEP)",
             ));
         }
-        let ranges = self.plan_pass(rows, WHAT)?;
+        let ranges = self.plan_pass(rows, SlotPass::Verify, WHAT)?;
         let out = self.run_slots(&ranges, SlotPass::Verify, WHAT);
         let out = self.note_fault_in(WHAT, out, SlotSet::of(&ranges))?;
         self.slots_waiting = Some(ranges);
@@ -769,10 +777,13 @@ where
 
     /// The pass of `rows` refused, planned and, in graph mode, captured:
     /// [`GpuModel::step_slots`]' and [`GpuModel::verify_slots`]' first
-    /// half, which returns its ranges.
+    /// half, which returns its ranges. A `pass` that keeps every row the
+    /// body refuses ([`SlotRows::refuse_kept`]) is refused before anything
+    /// is selected, made or planned.
     fn plan_pass(
         &mut self,
         rows: &[(usize, &[u32])],
+        pass: SlotPass,
         what: &'static str,
     ) -> Result<Vec<SlotRange>, GpuError> {
         const { slots_fit::<B>() };
@@ -783,6 +794,9 @@ where
             B::MAX_ROWS,
             what,
         )?;
+        if pass == SlotPass::Kept {
+            self.body.refuse_kept(&ranges)?;
+        }
         let ids: Vec<u32> = rows
             .iter()
             .flat_map(|&(_, ids)| ids.iter().copied())
