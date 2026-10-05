@@ -82,10 +82,10 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use app::{Session, SessionError};
+use bloomery_gpu::HostFlags;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::slots::Slot;
 use bloomery_gpu::host::swap::{Residency, SlotState, SwapSource};
-use bloomery_gpu::{HostFlags, window};
 use bloomery_gpu_deepseek41::body::{Body, OpenCfg};
 use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::generate::{Place, Residence, ServeFeed, place_table};
@@ -318,23 +318,9 @@ pub fn refuse_clause(
         - 1;
     let mut small = machine.clone();
     small.host.usable_bytes = u64::try_from(short)?;
-    let t0 = Instant::now();
-    let opened = open(path, place, move |_| small.clone(), cfg);
-    let secs = t0.elapsed().as_secs_f64();
-    let (ok, why) = match opened {
-        Err(e) => {
-            let text = e.to_string();
-            (text.contains("churn pool") && secs < REFUSE_BOUND_S, text)
-        }
-        Ok(_) => (false, "the open loaded".to_string()),
-    };
-    println!(
-        "refuse: a host of {short} B, one byte short of the {} B churn pool: {} in {secs:.1} \
-         s — {why}",
-        pool.bytes,
-        verdict(ok)
-    );
-    Ok(ok)
+    crate::residency_clauses::refuse_tail(short, pool.bytes, REFUSE_BOUND_S, move || {
+        open(path, place, move |_| small.clone(), cfg)
+    })
 }
 
 /// The layers the stage card holds routed experts of, with their seeds.
@@ -389,39 +375,12 @@ fn transform_clause(s: &Session<Body>) -> Result<bool, GateError> {
         );
         return Ok(false);
     }
-    let (gpu, stream) = (m.gpu(), m.gpu().stream());
-    stream.synchronize()?;
-    let (mut checked, mut bad) = (0usize, Vec::new());
+    let mut layers = Vec::new();
     for l in b.hybrid().slots().layers() {
-        let seed = machine.seed(l)?;
-        let Some(row) = machine.ledger().row(l) else {
-            continue;
-        };
-        for (slot, st) in row.iter().enumerate() {
-            let SlotState::Live(e) = *st else { continue };
-            if seed.contains(&e) {
-                continue;
-            }
-            checked += 1;
-            for part in 0..3 {
-                let want = source.card_bytes(l, e, part)?;
-                let at = source.dest(l, part, slot as u32)?;
-                // SAFETY: `at` is slot `slot` of the stage card's stack
-                // of layer `l`, which holds `want.len()` bytes there and
-                // stays allocated while the model lives.
-                let view = unsafe { window::<u32>(at, want.len() / 4, gpu.context()) };
-                let mut got = vec![0u32; want.len() / 4];
-                view.copy_to_host(stream, &mut got)?;
-                let got: Vec<u8> = got.iter().flat_map(|w| w.to_le_bytes()).collect();
-                if got != want {
-                    let first = got.iter().zip(want).position(|(a, b)| a != b);
-                    bad.push(format!(
-                        "layer {l} expert {e} slot {slot} part {part} at {first:?}"
-                    ));
-                }
-            }
-        }
+        layers.push((l, machine.seed(l)?));
     }
+    let (checked, bad) =
+        crate::residency_clauses::transform_check(m.gpu(), machine, source, &layers, |_| 3)?;
     let ok = checked > 0 && bad.is_empty();
     println!(
         "transform: {checked} admitted experts, {} parts differ from a static load{}: {}",
@@ -509,16 +468,7 @@ fn static_probe(s: &mut Session<Body>, ids: &[u32]) -> Result<StaticProbe, GateE
     }
     .prompt(s, ids)?;
     let row0 = s.model().logits()?;
-    let passes = take_passes(s)?
-        .iter()
-        .map(|(k, r)| (*k, r.boundary, r.landed, r.ahead))
-        .collect();
-    Ok(StaticProbe {
-        ids: ids.to_vec(),
-        table,
-        row0,
-        passes,
-    })
+    Ok(StaticProbe::of(ids, table, row0, &take_passes(s)?))
 }
 
 /// `static`, its second half, after the residency load's teardown: a load by
@@ -601,20 +551,7 @@ pub fn clauses(
     );
     pass &= c1;
 
-    // The prompt call is one pass that keeps 0 rows; each step keeps 1. A
-    // step's own boundary is made ahead of its readback, so the history's
-    // last step ends one too.
-    // PIN(2026-10-01): STEPS steps, not STEPS - 1: the last one's boundary runs ahead.
-    let mut want = vec![(PassKind::None, 0), (PassKind::Prompt, 0)];
-    want.extend(std::iter::repeat_n((PassKind::Step, 1), STEPS));
-    let passes_ok = first.passes == want;
-    println!(
-        "passes: a history's boundaries end none, the prompt call (0 kept), then {STEPS} steps \
-         (1 kept each): {} boundaries, same {passes_ok}: {}",
-        first.passes.len(),
-        verdict(passes_ok)
-    );
-    pass &= passes_ok;
+    pass &= crate::residency_clauses::passes_clause(&first.passes, STEPS);
 
     let tier_ok = if place == Place::A {
         let after = tier_entries(s)?.len();
@@ -682,32 +619,11 @@ pub fn clauses(
         .residency_reset()?
         .ok_or("the load runs no residency machine")?;
     record::residency_reset(&r).print();
-    let live_is_seed = {
+    let machine = {
         let m = s.model();
         let b = m.body(NAME)?;
-        let machine = b.hybrid().swap().ok_or("no machine")?;
-        seeds.iter().all(|(l, seed)| {
-            let live: Vec<u32> = machine
-                .ledger()
-                .row(*l)
-                .unwrap_or(&[])
-                .iter()
-                .filter_map(|st| match st {
-                    SlotState::Live(e) => Some(*e),
-                    _ => None,
-                })
-                .collect();
-            live.len() == seed.len() && seed.iter().all(|e| live.contains(e))
-        })
+        b.hybrid().swap().ok_or("no machine")?
     };
-    let c7 = r.diff == 0 && live_is_seed && r.dropped_bytes == 0;
-    println!(
-        "c7: the reset's diff {}, live sets the seed {live_is_seed}, dropped {} B (0: the \
-         churn pool stays): {}",
-        r.diff,
-        r.dropped_bytes,
-        verdict(c7)
-    );
-    pass &= c7;
+    pass &= crate::residency_clauses::c7_clause(&r, machine, &seeds);
     Ok((pass, probe))
 }
