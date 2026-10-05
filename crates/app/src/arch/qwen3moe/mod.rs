@@ -92,9 +92,13 @@ pub const GEMM_FROM: usize = MAX_TOKENS + 1;
 impl Prompt for Body {
     /// The GEMM ubatch walk from [`GEMM_FROM`] rows on, passes below (the
     /// `Auto` of a prompt shorter than one ubatch, resolved without the
-    /// tail pass): the argmax after the last id.
+    /// tail pass): the argmax after the last id. A placed load has no GEMM
+    /// walk — its prompt runs as passes through the host tier's batch port,
+    /// and `prefill_plan` refuses the walk by name — so it takes passes at
+    /// every length.
     fn prompt(m: &mut Qwen3moeModel, ids: &[u32]) -> Result<u32, GpuError> {
-        let path = if ids.len() >= GEMM_FROM {
+        let placed = m.body("app::Prompt for Body")?.placed().is_some();
+        let path = if ids.len() >= GEMM_FROM && !placed {
             PrefillPath::Gemm
         } else {
             PrefillPath::Pass

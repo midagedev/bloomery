@@ -135,6 +135,13 @@
 //!   listening record two slots of the arm's `n_ctx` each. FAIL-first: a
 //!   placed load made resident adds a sequence its plan never counted, and
 //!   either never listens or names two in its load.
+//! - `placed_answers_a_prompt_past_the_gemm_walk`, a placed server whose
+//!   card budget is [`HOST_TIER_BUDGET`] (`--place a --parallel 1`): its
+//!   plan record puts routed experts on the host, and a greedy
+//!   `/completion` of [`PROSE`]'s ids (at least [`GEMM_FROM`]) answers 200
+//!   with tokens — a placed load's prompt call runs passes at every length.
+//!   FAIL-first: a prompt call that asks a placed load for the GEMM walk is
+//!   refused by `prefill_plan` and the request answers no tokens.
 //!
 //! The spawn census, every server this gate starts and its `--parallel`:
 //! [`spawn`] and `ctx_default`'s default, flag and q8 arms pin
@@ -145,7 +152,8 @@
 //! pins `--parallel 1`; the swap clause passes `--parallel 2` (qwen35moe,
 //! the turns); the slots clause passes `--parallel 2` (qwen3moe, resident)
 //! and the refusal arm passes none (the default two are what makes the
-//! split too small).
+//! split too small); the host-tier arm pins `--parallel 1` (one prompt on
+//! the placed path is the clause).
 //!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
@@ -1307,6 +1315,87 @@ mod gate {
         Ok(())
     }
 
+    /// The card budget the host-tier clause plans under: a card this size
+    /// holds the trunk and only part of the routed experts of the qwen3moe
+    /// file, so the placed plan puts the rest on the host on either box card.
+    const HOST_TIER_BUDGET: &str = "12G";
+
+    /// The host-tier prompt clause (module header): a placed server under
+    /// [`HOST_TIER_BUDGET`] — a large card planning as the smallest one the
+    /// placed path serves — whose plan record names routed experts on the
+    /// host, answers a prompt of at least [`GEMM_FROM`] ids. A plan with no
+    /// host experts opens the whole-card body, which never meets the placed
+    /// prompt path, so the clause asks for both.
+    fn placed_answers_a_prompt_past_the_gemm_walk(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let d = dir.join("host-tier");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL");
+        cmd.env(bloomery_levers::CARD_BUDGET, HOST_TIER_BUDGET);
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let mut s = Served::spawn_cmd(
+            cmd,
+            &[
+                "--model",
+                "qwen3",
+                "--port",
+                "0",
+                "--parallel",
+                "1",
+                "--place",
+                "a",
+                "--ctx",
+                "2048",
+                "-m",
+                m,
+            ],
+            &d,
+        )?;
+        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let log = std::fs::read_to_string(&err_log)?;
+        let host = log
+            .lines()
+            .find(|l| l.starts_with("plan "))
+            .and_then(|l| field_u64(l, "host_experts"));
+        let ids = tokenized(&url, PROSE)?;
+        let body = json!({
+            "prompt": ids, "n_predict": N, "temperature": 0,
+            "return_tokens": true, "cache_prompt": false,
+        });
+        let (st, text) = match curl(&url("/completion"), Some(&body), false) {
+            Ok(r) => r,
+            Err(e) => (0, e.to_string()),
+        };
+        let tokens = match st {
+            200 => serde_json::from_str::<Value>(&text)
+                .map(|v| ids_of(&v["tokens"]))
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        println!(
+            "host-tier arm: plan host_experts={host:?}; a prompt of {} ids answers HTTP {st} \
+             with {} tokens",
+            ids.len(),
+            tokens.len()
+        );
+        check(
+            ok,
+            "placed_answers_a_prompt_past_the_gemm_walk",
+            host.is_some_and(|h| h > 0)
+                && ids.len() >= GEMM_FROM
+                && st == 200
+                && !tokens.is_empty(),
+        );
+        println!("host-tier server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
     /// The refusal clause (module header): `--ctx` [`SLOTS_REFUSED_CTX`]
     /// under the default two slots ends the process before the load,
     /// naming the total, the slot count and the slot ctx it split, one row
@@ -1672,6 +1761,7 @@ mod gate {
                 // clause below is the qwen35moe arm's now).
                 slots_flow_together(model, &dir, total, &mut ok)?;
                 slot_ctx_too_small_is_refused(model, &dir, &mut ok)?;
+                placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
             }
             if arch == "qwen35moe" {
                 // The park is the seat's, and the qwen3moe arm's whole-card
