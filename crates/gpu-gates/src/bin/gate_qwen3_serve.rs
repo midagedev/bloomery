@@ -144,6 +144,17 @@
 //!   probes and its census readings on one line, and every one read the
 //!   census once for all its probes. FAIL-first: a placed search that
 //!   resolves its placement per probe reads it once a probe.
+//! - `whole_fit_counts_the_planes_granules`: a server at a flagged `--ctx`
+//!   (an odd multiple of 1024, so the rounding binds) and `--parallel 1`
+//!   prints the seat's one whole-fit line before any load — fits or not,
+//!   the term prints either way — and its cache term equals the
+//!   allocator's bytes of the file's own planes at the card's 2 MiB
+//!   granule: f16's `k` and `v` a plain-attention layer, a qwen35moe
+//!   file's recurrent layers' `state` and `ring` (the layers its
+//!   `attn_qkv` tensor marks). FAIL-first: the raw sum the verdict
+//!   counted before the planes went through the allocator is 96 MiB short
+//!   at that ctx on the Qwen3-30B file (every plane half a granule past a
+//!   whole one) and 21.7 MiB on the Qwen3.6 one.
 //! - `placed_slots_are_resident` (qwen3moe) and `placed_slots_take_turns`
 //!   (qwen35moe), `ctx_default`'s placed arm (`--place a --parallel 2`, no
 //!   budget): a qwen3moe file's placed load holds its two slots resident —
@@ -166,7 +177,9 @@
 //! [`spawn`] and `ctx_default`'s default, flag and q8 arms pin
 //! `--parallel 1` (the prefix and ctx clauses hold the one-slot path's
 //! keeps and defaults), its placed arm passes `--parallel 2` (resident on
-//! qwen3moe, the turns on qwen35moe, above); `cache_refusals`' two refusal
+//! qwen3moe, the turns on qwen35moe, above), and its whole-fit clause pins
+//! `--parallel 1` at a flagged `--ctx` (one sequence's planes; the resident
+//! split's clause is the slots clause's); `cache_refusals`' two refusal
 //! arms pass none — they die at flag parsing before the seat splits
 //! anything — and its flag-wins arm pins `--parallel 1`; the swap clause
 //! passes `--parallel 2` (qwen35moe, the turns); the slots clause's two
@@ -201,12 +214,14 @@ mod gate {
     use std::time::{Duration, Instant};
 
     use bloomery_gpu::arch::qwen3moe::router::MAX_TOKENS;
+    use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
         Served, curl, ids_of, json_of, metric, parse_ids, server_log,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use gguf::Split;
+    use model::placement::workstation::GRANULE;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
 
@@ -645,6 +660,135 @@ mod gate {
         // The default arm's answer, the one-slot load's total context: the
         // slots clause's split is half of it.
         Ok(default_n)
+    }
+
+    /// The ctx [`whole_fit_counts_the_planes_granules`] runs at: an odd
+    /// multiple of 1024 over the seat's floor, so a qwen3moe file's every
+    /// f16 plane is half a granule past a whole one and the allocator's
+    /// rounding moves the verdict's cache term off the raw sum.
+    const GRANULE_CTX: usize = 5 * 1024;
+
+    /// `whole_fit_counts_the_planes_granules`: the whole-fit verdict's cache
+    /// term is the allocator's bytes of the planes the body allocates, one
+    /// sequence at [`GRANULE_CTX`] rows. A server at that flagged ctx prints
+    /// its one whole-fit line before any load — fits or not, the term prints
+    /// either way — and the clause reads the line's cache bytes and holds
+    /// them equal to `allocator_bytes` over the file's own planes at the
+    /// card's 2 MiB granule: f16's `k` and `v` a plain-attention layer, a
+    /// qwen35moe file's recurrent layers' `state` and `ring`
+    /// (`LinearShape`'s lengths, one lane as `Body35` allocates them).
+    /// FAIL-first: the raw sum the verdict counted before the planes went
+    /// through the allocator is 96 MiB short at this ctx on the Qwen3-30B
+    /// file (every plane half a granule past a whole one) and 21.7 MiB on
+    /// the Qwen3.6 one (its GQA planes 2.5 granules each, its delta rings
+    /// sharing granules), so the clause is red on it.
+    fn whole_fit_counts_the_planes_granules(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let num = |key: &str| -> Result<u64, GateError> {
+            split
+                .arch_get_u64(key)
+                .ok_or_else(|| format!("{}: no {key}", model.display()).into())
+        };
+        let layers = num("block_count")? as usize;
+        let kv_heads = split
+            .arch_get_u64("attention.head_count_kv")
+            .or_else(|| split.arch_get_u64("attention.head_count"))
+            .ok_or_else(|| format!("{}: no attention.head_count(_kv)", model.display()))?
+            as usize;
+        let head_dim = num("attention.key_length")? as usize;
+        let plane = kv_heads as u64 * GRANULE_CTX as u64 * head_dim as u64 * 2;
+        let mut planes = Vec::new();
+        match split.architecture() {
+            Some("qwen3moe") => {
+                for _ in 0..layers {
+                    planes.push(plane);
+                    planes.push(plane);
+                }
+            }
+            Some("qwen35moe") => {
+                let shape = LinearShape {
+                    n_k: num("ssm.group_count")? as usize,
+                    n_v: num("ssm.time_step_rank")? as usize,
+                    // Neither plane's length reads the map; a qwen35moe
+                    // file's delta layers are the tiled ones.
+                    map: KHeadMap::Tiled,
+                };
+                for l in 0..layers {
+                    // The layout's own rule (`hparams::kinds`): a layer with
+                    // the fused `attn_qkv` tensor is a delta layer, one with
+                    // `attn_q` a plain attention layer.
+                    let qkv = format!("blk.{l}.attn_qkv.weight");
+                    let q = format!("blk.{l}.attn_q.weight");
+                    if split.find(&qkv).is_some() {
+                        planes.push(4 * shape.state_len() as u64);
+                        planes.push(4 * shape.ring_len() as u64);
+                    } else if split.find(&q).is_some() {
+                        planes.push(plane);
+                        planes.push(plane);
+                    } else {
+                        return Err(format!(
+                            "{}: layer {l} holds neither attn_qkv.weight nor attn_q.weight",
+                            model.display()
+                        )
+                        .into());
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "{} is a {other:?} file; the whole-fit clause serves qwen3moe and qwen35moe",
+                    model.display()
+                )
+                .into());
+            }
+        }
+        let expected = model::placement::allocator_bytes(GRANULE, planes.iter().copied());
+        let raw: u64 = planes.iter().sum();
+        let d = dir.join("ctx-granule");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove("BLOOMERY_REF_MODEL");
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let ctx = GRANULE_CTX.to_string();
+        let args = [
+            "--model",
+            "qwen3",
+            "--port",
+            "0",
+            "-m",
+            m,
+            "--parallel",
+            "1",
+            "--ctx",
+            ctx.as_str(),
+        ];
+        let mut s = Served::spawn_cmd(cmd, &args, &d)?;
+        // The verdict's line prints before the open, so a listening server
+        // has printed it; the address itself is not asked for.
+        s.address(&err_log, 600, Duration::from_secs(1))?;
+        let log = std::fs::read_to_string(&err_log)?;
+        println!("granule arm: server stopped: {}", s.stop()?);
+        let line = log
+            .lines()
+            .find(|l| l.starts_with(&format!("whole fit at ctx {GRANULE_CTX}:")))
+            .ok_or("the seat printed no whole-fit line at the flagged ctx")?;
+        let said = line
+            .split(" + cache ")
+            .nth(1)
+            .and_then(|t| t.split(" B").next())
+            .and_then(|t| t.parse::<u64>().ok())
+            .ok_or("the whole-fit line names no cache bytes")?;
+        println!(
+            "granule arm: the verdict's cache {said} B of {raw} B of planes, the allocator's \
+             bytes {expected} B"
+        );
+        check(ok, "whole_fit_counts_the_planes_granules", said == expected);
+        Ok(())
     }
 
     /// `bloomery-serve --model qwen3 -m <model> --port 0 --parallel 1` beside
@@ -1917,6 +2061,7 @@ mod gate {
             }
             check(&mut ok, "completion_ids_are_the_cli_ids", agree);
             let total = ctx_default(model, &dir, &mut ok)?;
+            whole_fit_counts_the_planes_granules(model, &dir, &mut ok)?;
             cache_refusals(model, &dir, &mut ok)?;
             if arch == "qwen3moe" {
                 // The qwen3moe arm: the resident slots and the split they

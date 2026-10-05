@@ -14,7 +14,8 @@
 //! The same two binaries' `--place`-unset default lives here too
 //! ([`unplaced_qwen3`]): today's whole model on device 0 while that fits
 //! what the card had — the whole-fit verdict (`placement::whole_need`) over
-//! what the whole load asks for: its weights' granules, its cache, and the
+//! what the whole load asks for: its weights' granules, its cache planes'
+//! granules for every resident slot the load serves ([`kv_bytes`]), and the
 //! program's own arena and the reserve its load keeps free past it — and
 //! when it does not, the placed plan on `a`'s card. The serve seat's unset
 //! `--ctx` defaults live here too ([`whole_ctx_qwen3`] for the whole load,
@@ -25,7 +26,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel};
+use bloomery_gpu::linear::{KHeadMap, LinearShape};
 use bloomery_gpu::model::{GpuModel, Slots};
+use bloomery_gpu::rope_neox::q8_plane_lens;
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
@@ -33,11 +36,11 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
 use model::arch::qwen3moe::place::{self as q3, card_routed};
+use model::arch::qwen35moe::hparams::Kind;
 use model::arch::qwen35moe::place as q35;
-use model::placement::workstation::{CardSpec, DeviceInfo};
+use model::placement::workstation::{CardSpec, DeviceInfo, GRANULE};
 use model::placement::{
-    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role, WholeLoad,
-    WholeNeed,
+    self, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Role, WholeLoad, WholeNeed,
 };
 
 /// The census readings this module took and the probes its context searches
@@ -122,6 +125,9 @@ pub struct PlaceQ3 {
     place: Place,
     arch: &'static str,
     inputs: Inputs,
+    /// The cache format this load counts in — the same choice `inputs.kv`
+    /// carries, kept beside it for the plane list [`kv_bytes`] splits.
+    kv: KvQ8,
     machine: Machine,
 }
 
@@ -160,6 +166,7 @@ impl PlaceQ3 {
             place,
             arch: "qwen3moe",
             inputs: Inputs::Qwen3(inputs),
+            kv,
             machine,
         })
     }
@@ -189,6 +196,7 @@ impl PlaceQ3 {
             place,
             arch: "qwen35moe",
             inputs: Inputs::Qwen35(Box::new(inputs)),
+            kv: o.kv,
             machine,
         })
     }
@@ -226,23 +234,25 @@ impl PlaceQ3 {
         ))
     }
 
-    /// The card experts the plan over `machine` at `ctx` keeps: one probe of
-    /// a placed `--ctx` search. `None` when no plan builds, or when the plan
-    /// keeps every routed expert on the card — a load [`open_qwen3`] opens
-    /// whole, its arena the whole load's — and the whole-fit verdict at
-    /// `ctx` ([`Self::whole_at`], what the program holds past its cache as
-    /// `load` gives it) does not take that load.
+    /// The card experts the plan over `machine` at `ctx` keeps, for `slots`
+    /// resident sequences: one probe of a placed `--ctx` search. `None` when
+    /// no plan builds, or when the plan keeps every routed expert on the
+    /// card — a load [`open_qwen3`] opens whole, its arena the whole load's
+    /// — and the whole-fit verdict at `ctx` ([`Self::whole_at`], what the
+    /// program holds past its cache as `load` gives it) does not take that
+    /// load.
     fn card_experts(
         &self,
         machine: &Machine,
         ctx: usize,
         levers: &PlanLevers,
+        slots: usize,
         load: impl FnOnce() -> Result<WholeLoad, String>,
     ) -> Result<Option<u64>, GateError> {
         let Ok(plan) = self.plan_over(machine, ctx, levers) else {
             return Ok(None);
         };
-        if plan.host.experts == 0 && !self.whole_at(u64::try_from(ctx)?, load())?.fits() {
+        if plan.host.experts == 0 && !self.whole_at(u64::try_from(ctx)?, slots, load())?.fits() {
             return Ok(None);
         }
         Ok(Some(plan.cards[0].experts))
@@ -271,11 +281,17 @@ impl PlaceQ3 {
     }
 
     /// The whole-fit verdict of this file on the card's device at `ctx`
-    /// positions ([`whole_on`]), the cache in the planes' format this load
-    /// counts, `load` what the program holds past it or its refusal.
-    fn whole_at(&self, ctx: u64, load: Result<WholeLoad, String>) -> Result<Whole, GateError> {
+    /// positions for `slots` resident sequences ([`whole_on`]), the cache in
+    /// the planes' format this load counts, `load` what the program holds
+    /// past it or its refusal.
+    fn whole_at(
+        &self,
+        ctx: u64,
+        slots: usize,
+        load: Result<WholeLoad, String>,
+    ) -> Result<Whole, GateError> {
         let layers = 0..self.layers();
-        let kv = kv_bytes(&layers, &self.inputs, ctx);
+        let kv = kv_bytes(&layers, &self.inputs, self.kv, slots, ctx);
         whole_on(
             self.place.card_specs()?[0],
             inputs_model(&self.inputs),
@@ -321,16 +337,80 @@ impl PlaceQ3 {
     }
 }
 
-/// The KV bytes of the model `inputs` holds at `ctx` positions over
-/// `layers`, its own layout's.
-fn kv_bytes(layers: &std::ops::Range<usize>, inputs: &Inputs, ctx: u64) -> u64 {
-    layers
-        .clone()
-        .map(|l| match inputs {
-            Inputs::Qwen3(i) => i.kv.layer_bytes(l, ctx),
-            Inputs::Qwen35(i) => i.kv.layer_bytes(l, ctx),
-        })
-        .sum()
+/// The allocator's bytes of the cache the body of `inputs`'s model allocates
+/// for `slots` resident sequences of a load asked for `ctx` positions: the
+/// seat splits the total across its slots, each `ctx / slots` rows (never
+/// past it: a cache row is the granularity, the floor exact), and every
+/// slot, layer by layer, holds the planes this function lists through the
+/// card's allocation granule ([`placement::allocator_bytes`]) — the engine allocates
+/// each plane its own buffer per layer (`KvPlanes::new`, mirrored by
+/// [`gqa_planes`]) and each added slot repeats the set
+/// ([`Slots::new_seq`]), so the verdict counts the granules those
+/// allocations round to, not the raw sum a `KvBytes` layer gives. One slot
+/// is the one-sequence load, plus that rounding. `slots` is at least one;
+/// the raw plane bytes of the list sum to what `layer_bytes` gives over the
+/// same layers.
+fn kv_bytes(
+    layers: &std::ops::Range<usize>,
+    inputs: &Inputs,
+    kv: KvQ8,
+    slots: usize,
+    ctx: u64,
+) -> u64 {
+    let rows = ctx / slots as u64;
+    let mut planes = Vec::new();
+    for _ in 0..slots {
+        for l in layers.clone() {
+            match inputs {
+                Inputs::Qwen3(i) => {
+                    gqa_planes(&mut planes, i.hp.n_head_kv, i.hp.head_dim, kv, rows);
+                }
+                Inputs::Qwen35(i) => match i.hp.kinds.get(l) {
+                    Some(Kind::Attention) => {
+                        gqa_planes(&mut planes, i.hp.n_head_kv, i.hp.head_dim, kv, rows);
+                    }
+                    // The shape of the file's own delta layers, its lengths
+                    // the two buffers `RecStore::new` zeroes; the head map
+                    // enters neither length, and a qwen3.6 delta layer is
+                    // the tiled one (`delta_shape` of the gpu side's plan).
+                    Some(Kind::DeltaRule) => {
+                        let shape = LinearShape {
+                            n_k: i.hp.k_heads,
+                            n_v: i.hp.v_heads,
+                            map: KHeadMap::Tiled,
+                        };
+                        // One state lane, `Body35`'s `LANES`.
+                        planes.push(4 * shape.state_len() as u64);
+                        planes.push(4 * shape.ring_len() as u64);
+                    }
+                    None => {}
+                },
+            }
+        }
+    }
+    placement::allocator_bytes(GRANULE, planes)
+}
+
+/// The GQA cache planes' bytes at `rows` positions onto `planes`, in the
+/// order the body allocates them: f16's `k` and `v`, q8_0's `kq,kd,vq,vd` —
+/// the buffers `KvPlanes::new` zeroes, their lengths and widths
+/// (`q8_plane_lens`'s u32 words and u16 scales) that owner's own.
+fn gqa_planes(planes: &mut Vec<u64>, n_kv: usize, head: usize, kv: KvQ8, rows: u64) {
+    match kv {
+        KvQ8::F16 => {
+            let bytes = n_kv as u64 * rows * head as u64 * 2;
+            planes.push(bytes);
+            planes.push(bytes);
+        }
+        KvQ8::Q8 => {
+            let rows = usize::try_from(rows).expect("a cache of usize rows");
+            let (words, scales) = q8_plane_lens(head, n_kv, rows);
+            planes.push(4 * words as u64);
+            planes.push(2 * scales as u64);
+            planes.push(4 * words as u64);
+            planes.push(2 * scales as u64);
+        }
+    }
 }
 
 /// The model of `inputs`'s file as it holds it.
@@ -450,17 +530,33 @@ impl PlaceQ3 {
     }
 }
 
+/// What a run with `--place` unset loads for one sequence
+/// ([`unplaced_qwen3_slots`]), as the CLI's own runs do.
+pub fn unplaced_qwen3(file: &Split, ctx: usize, kv: KvQ8) -> Result<Unplaced, GateError> {
+    unplaced_qwen3_slots(file, ctx, 1, kv)
+}
+
 /// What a run with `--place` unset loads, decided before any load on one
 /// census reading: the whole model on device 0 (`Whole` — no plan, no
-/// record, today's load byte for byte) while the whole-fit verdict takes it
-/// ([`whole_on`]: the qwen3moe body's whole load, [`QWEN3_WHOLE`]); else the
-/// placed plan on `a`'s card (`Placed`). The verdict's line goes to stderr;
-/// a file with no routed experts the verdict does not take is refused by
-/// name.
-pub fn unplaced_qwen3(file: &Split, ctx: usize, kv: KvQ8) -> Result<Unplaced, GateError> {
+/// record, today's load byte for byte) while the whole-fit verdict at `ctx`
+/// for `slots` resident sequences takes it ([`whole_on`]: the qwen3moe
+/// body's whole load, [`QWEN3_WHOLE`], the cache [`kv_bytes`] counts at the
+/// slots' shares); else the placed plan on `a`'s card (`Placed`). The
+/// verdict's line goes to stderr; a file with no routed experts the verdict
+/// does not take is refused by name.
+#[allow(
+    dead_code,
+    reason = "the serve seat decides its load at the total for its --parallel slots; the CLI and the e2e gates load one sequence"
+)]
+pub fn unplaced_qwen3_slots(
+    file: &Split,
+    ctx: usize,
+    slots: usize,
+    kv: KvQ8,
+) -> Result<Unplaced, GateError> {
     let census = census()?;
     let probe = PlaceQ3::qwen3_on(file, Place::parse("cuda0")?, &census, ctx, kv)?;
-    let whole = probe.whole_at(u64::try_from(ctx)?, Ok(QWEN3_WHOLE))?;
+    let whole = probe.whole_at(u64::try_from(ctx)?, slots, Ok(QWEN3_WHOLE))?;
     probe.unplaced(&census, ctx, &whole)
 }
 
@@ -477,26 +573,36 @@ pub fn trained_ctx(file: &Split) -> Option<usize> {
 
 /// The `--ctx` a whole-card load defaults to when the flag is unset: the
 /// file's trained context ([`trained_ctx`]) capped to the largest multiple
-/// of [`CTX_GRAN`] at or above `floor` whose whole load the whole-fit
-/// verdict takes on device 0 ([`whole_on`], one census reading for every
-/// probe): a context whose load fits what the card had with its arena and
-/// reserve counted. `None` when the file states no trained context or
-/// nothing at `floor` fits — the caller keeps `floor`, and the load falls to
-/// the placed plan, whose own default [`placed_ctx_qwen3`] searches.
+/// of [`CTX_GRAN`] at or above `floor` whose whole load for `slots` resident
+/// sequences the whole-fit verdict takes on device 0 ([`whole_on`], one
+/// census reading for every probe): a context whose load fits what the card
+/// had with its arena and reserve counted. `None` when the file states no
+/// trained context or nothing at `floor` fits — the caller keeps `floor`,
+/// and the load falls to the placed plan, whose own default
+/// [`placed_ctx_qwen3`] searches.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
 )]
-pub fn whole_ctx_qwen3(file: &Split, floor: usize, kv: KvQ8) -> Result<Option<usize>, GateError> {
+pub fn whole_ctx_qwen3(
+    file: &Split,
+    floor: usize,
+    slots: usize,
+    kv: KvQ8,
+) -> Result<Option<usize>, GateError> {
     let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, floor, kv)?;
     let fits = |ctx: usize| {
         probed();
-        Ok(probe.whole_at(u64::try_from(ctx)?, Ok(QWEN3_WHOLE))?.fits())
+        Ok(probe
+            .whole_at(u64::try_from(ctx)?, slots, Ok(QWEN3_WHOLE))?
+            .fits())
     };
     searched_ctx(file, floor, &fits)
 }
 
-/// [`whole_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context terms.
+/// [`whole_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context
+/// terms: one sequence — the body parks no sequence, so however many slots
+/// the seat serves, they take turns over the one the verdict counts.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -512,7 +618,7 @@ pub fn whole_ctx_qwen35(
         let mut at = *o;
         at.ctx = ctx;
         Ok(probe
-            .whole_at(u64::try_from(ctx)?, qwen35_whole(file, at))?
+            .whole_at(u64::try_from(ctx)?, 1, qwen35_whole(file, at))?
             .fits())
     };
     searched_ctx(file, floor, &fits)
@@ -524,10 +630,10 @@ pub fn whole_ctx_qwen35(
 /// experts the floor's plan keeps — the solver's context-for-experts trade
 /// never below the floor's split, so the search spends only the plan's own
 /// headroom — and, when that plan keeps every routed expert on the card (a
-/// load that opens whole), whose whole load the whole-fit verdict takes
-/// ([`PlaceQ3::card_experts`]). `None` when the file states no trained
-/// context or no plan at `floor` builds — the caller keeps `floor`, and the
-/// load's own plan call names what refused it.
+/// load that opens whole), whose whole load for `slots` resident sequences
+/// the whole-fit verdict takes ([`PlaceQ3::card_experts`]). `None` when the
+/// file states no trained context or no plan at `floor` builds — the caller
+/// keeps `floor`, and the load's own plan call names what refused it.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -537,18 +643,20 @@ pub fn placed_ctx_qwen3(
     place: Place,
     floor: usize,
     levers: &PlanLevers,
+    slots: usize,
     kv: KvQ8,
 ) -> Result<Option<usize>, GateError> {
     let probe = PlaceQ3::qwen3(file, place, floor, kv)?;
     let experts = |ctx: usize| {
         probed();
         let machine = probe.machine_at(Qwen3moeModel::placed_arena_bytes(file, ctx)?)?;
-        probe.card_experts(&machine, ctx, levers, || Ok(QWEN3_WHOLE))
+        probe.card_experts(&machine, ctx, levers, slots, || Ok(QWEN3_WHOLE))
     };
     searched_placed_ctx(file, floor, &experts)
 }
 
-/// [`placed_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context terms.
+/// [`placed_ctx_qwen3`] of a qwen35moe file, `o` giving its non-context
+/// terms: one sequence, as [`whole_ctx_qwen35`] counts it.
 #[allow(
     dead_code,
     reason = "the serve seat defaults its --ctx through these; the CLI and the e2e gates include the planner without them"
@@ -566,7 +674,7 @@ pub fn placed_ctx_qwen35(
         let mut at = *o;
         at.ctx = ctx;
         let machine = probe.machine_at(Qwen35moeModel::placed_arena_bytes(file, at)?)?;
-        probe.card_experts(&machine, ctx, levers, || qwen35_whole(file, at))
+        probe.card_experts(&machine, ctx, levers, 1, || qwen35_whole(file, at))
     };
     searched_placed_ctx(file, floor, &experts)
 }
@@ -636,11 +744,12 @@ fn searched_ctx(
 
 /// What a run with `--place` unset loads, as [`unplaced_qwen3`] decides it,
 /// of a qwen35moe file under `o`: the whole-fit verdict over the program's
-/// own arena at `o.ubatch` and its reserve ([`qwen35_whole`]).
+/// own arena at `o.ubatch` and its reserve ([`qwen35_whole`]) — one
+/// sequence, as [`whole_ctx_qwen35`] counts it.
 pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> {
     let census = census()?;
     let probe = PlaceQ3::qwen35_on(file, Place::parse("cuda0")?, &census, *o)?;
-    let whole = probe.whole_at(u64::try_from(o.ctx)?, qwen35_whole(file, *o))?;
+    let whole = probe.whole_at(u64::try_from(o.ctx)?, 1, qwen35_whole(file, *o))?;
     probe.unplaced(&census, o.ctx, &whole)
 }
 

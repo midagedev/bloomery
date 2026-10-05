@@ -158,13 +158,17 @@ const CTX: usize = 4096;
 /// context whose plan keeps the card experts the [`CTX`]-floor's plan keeps,
 /// so the solver's context-for-experts trade never sits below the floor's
 /// split, and whose whole load the verdict takes when that plan keeps every
-/// expert on the card (the load then opens whole). One line names the answer, at the floor or past it, and every
+/// expert on the card (the load then opens whole). On a qwen3moe file the
+/// verdict counts the cache of all `parallel` resident sequences, each at
+/// its share of the answer (`q3place::kv_bytes`); a qwen35moe file's holds
+/// the one sequence its slots take turns over. One line names the answer, at the floor or past it, and every
 /// search one line more: its probes and the census readings it took
 /// ([`searched_line`]).
 fn default_ctx(
     split: &Split,
     arch: Arch,
     place: Option<Place>,
+    parallel: usize,
     levers: &Levers,
     kv: KvQ8,
 ) -> Result<usize, GateError> {
@@ -175,7 +179,9 @@ fn default_ctx(
     let placed_default = |place: Place| -> Result<usize, GateError> {
         let before = q3place::reads();
         let searched = match arch {
-            Arch::Qwen3moe => q3place::placed_ctx_qwen3(split, place, CTX, &plan_levers, kv)?,
+            Arch::Qwen3moe => {
+                q3place::placed_ctx_qwen3(split, place, CTX, &plan_levers, parallel, kv)?
+            }
             Arch::Qwen35moe => {
                 let o = Open35 {
                     ctx: CTX,
@@ -216,7 +222,7 @@ fn default_ctx(
     }
     let before = q3place::reads();
     let searched = match arch {
-        Arch::Qwen3moe => q3place::whole_ctx_qwen3(split, CTX, kv)?,
+        Arch::Qwen3moe => q3place::whole_ctx_qwen3(split, CTX, parallel, kv)?,
         Arch::Qwen35moe => {
             let o = Open35 {
                 ctx: CTX,
@@ -759,22 +765,25 @@ enum Q3Load {
     },
 }
 
-/// What a qwen3moe file loads as at `total` positions ([`Q3Load`]):
-/// `--place`'s plan on its card, else the whole-fit verdict at the total
-/// (`q3place::unplaced_qwen3`, its line on stderr) — the whole model on
-/// device 0, or the placed plan on `a`'s card. Made at the total, never at a
-/// slot's share: a card whose whole load fits a slot's rows and not the
-/// total's would open whole, and the slots added after the open would hold
-/// a cache the verdict never counted.
+/// What a qwen3moe file loads as at `total` positions for `parallel`
+/// resident sequences ([`Q3Load`]): `--place`'s plan on its card, else the
+/// whole-fit verdict at the total (`q3place::unplaced_qwen3_slots`, its
+/// line on stderr) — the whole model on device 0, or the placed plan on
+/// `a`'s card. Made at the total, never at a slot's share: a card whose
+/// whole load fits a slot's rows and not the total's would open whole, and
+/// the slots added after the open would hold a cache the verdict never
+/// counted; the verdict's own cache term is every slot's planes at its
+/// share of the total.
 fn decide_qwen3(
     split: &Split,
     total: usize,
     place: Option<Place>,
+    parallel: usize,
     kv: KvQ8,
 ) -> Result<Q3Load, GateError> {
     let (q, why) = match place {
         Some(p) => (Box::new(PlaceQ3::qwen3(split, p, total, kv)?), None),
-        None => match q3place::unplaced_qwen3(split, total, kv)? {
+        None => match q3place::unplaced_qwen3_slots(split, total, parallel, kv)? {
             q3place::Unplaced::Whole => return Ok(Q3Load::Whole),
             q3place::Unplaced::Placed(q) => (q, Some(q3place::WHY_NOT_WHOLE)),
         },
@@ -884,12 +893,12 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         .to_owned();
     let ctx = match a.ctx {
         Some(c) => c,
-        None => default_ctx(&split, arch, a.place, &levers, kv)?,
+        None => default_ctx(&split, arch, a.place, a.parallel, &levers, kv)?,
     };
     // What the file loads as is decided here, once, at the total: the open
     // makes no fit call of its own (`decide_qwen3`).
     let seated = match arch {
-        Arch::Qwen3moe => Seated::Qwen3(decide_qwen3(&split, ctx, a.place, kv)?),
+        Arch::Qwen3moe => Seated::Qwen3(decide_qwen3(&split, ctx, a.place, a.parallel, kv)?),
         Arch::Qwen35moe => Seated::Qwen35,
         other => {
             return Err(format!(
