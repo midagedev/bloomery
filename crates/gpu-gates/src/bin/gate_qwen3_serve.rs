@@ -134,6 +134,21 @@
 //!   a placed load kept on the turns leaves the placed arm's (v2), (v3) and
 //!   (v4) red, no `placed slots` line, and `ctx_default`'s placed arm's
 //!   `placed_slots_are_resident` and `placed_ctx_is_the_plans_ctx_max` red.
+//! - `slots_default_is_the_whole_search`, the whole slots arm: the total its
+//!   server's one whole-fit line names is the two-slot whole search's own
+//!   answer, not merely a total the server split. The line's need less its
+//!   cache term is the rest no context moves, and the two-slot need at a
+//!   total `t` is that rest plus the allocator's bytes of the two slots'
+//!   planes — each slot one slot's list at ⌊t/2⌋ rows, the per-slot list the
+//!   seat's own verdict counts (`q3place::kv_bytes`: N copies of one slot's
+//!   planes) — so the relation holds (a) the line says the load fits and
+//!   that need at the total is inside what the card had, (b) the total
+//!   never passes the one-slot default arm's answer, and (c) the search's
+//!   grid — the total in `q3place::CTX_GRAN` steps off the floor — ends
+//!   there: one step past it the trained context stands or the need passes
+//!   the card. A whole-fit line that says the load does not fit is a named
+//!   error: the arm is not a whole arm. FAIL-first: a halving that stops a
+//!   step early splits a total whose next grid point still fits, red on (c).
 //! - `slot_ctx_too_small_is_refused`, on the qwen3moe arm: `--ctx 15`
 //!   under the default two slots — a slot of 7 rows, one under the 8 rows
 //!   the load's widest captured pass writes (`router::MAX_TOKENS`; a placed
@@ -697,6 +712,49 @@ mod gate {
     /// `CTX`): the whole search's first probe, and the least default.
     const SEAT_FLOOR: u64 = 4096;
 
+    /// The terms of one whole-fit line (`whole fit at ctx …: the whole load
+    /// on …`): its `need`, that need less its cache term (the terms no
+    /// context moves at or past the floor), what the card had, the census
+    /// reading inside its parentheses, and whether it says the load fits. A
+    /// line without its terms is a named error.
+    struct WholeTerms<'a> {
+        need: u64,
+        rest: u64,
+        budget: u64,
+        census: &'a str,
+        fits: bool,
+    }
+
+    /// The terms of `line`, the whole-fit verdict's own words.
+    fn whole_terms(line: &str) -> Result<WholeTerms<'_>, GateError> {
+        let term = |after: &str| -> Result<u64, GateError> {
+            line.split(after)
+                .nth(1)
+                .and_then(|t| t.split(" B").next())
+                .and_then(|t| t.parse().ok())
+                .ok_or_else(|| format!("the whole-fit line names no `{after}… B`: {line}").into())
+        };
+        let (need, cache) = (term(": need ")?, term(" + cache ")?);
+        let (had, census) = line
+            .split_once(" B the card had (")
+            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
+        let budget: u64 = had
+            .rsplit(", of ")
+            .next()
+            .and_then(|t| t.parse().ok())
+            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
+        let rest = need
+            .checked_sub(cache)
+            .ok_or_else(|| format!("the whole-fit line's cache passes its need: {line}"))?;
+        Ok(WholeTerms {
+            need,
+            rest,
+            budget,
+            census: census.trim_end_matches(')'),
+            fits: line.contains(": fits: "),
+        })
+    }
+
     /// `ctx_default_is_the_trained_context`, on the default arm's server
     /// (no `--ctx`, `--parallel 1`, its stderr `log`, its default `n`): the
     /// default is the whole search's answer on every card. A card that holds
@@ -730,33 +788,19 @@ mod gate {
             .lines()
             .find(|l| l.starts_with(&head))
             .ok_or_else(|| format!("the default arm's seat printed no whole-fit line at {n}"))?;
-        let term = |after: &str| -> Result<u64, GateError> {
-            line.split(after)
-                .nth(1)
-                .and_then(|t| t.split(" B").next())
-                .and_then(|t| t.parse().ok())
-                .ok_or_else(|| format!("the whole-fit line names no `{after}… B`: {line}").into())
-        };
-        let (need, cache) = (term(": need ")?, term(" + cache ")?);
-        let (had, census) = line
-            .split_once(" B the card had (")
-            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
-        let budget: u64 = had
-            .rsplit(", of ")
-            .next()
-            .and_then(|t| t.parse().ok())
-            .ok_or_else(|| format!("the whole-fit line names no bytes the card had: {line}"))?;
-        let census = census.trim_end_matches(')');
-        let rest = need
-            .checked_sub(cache)
-            .ok_or_else(|| format!("the whole-fit line's cache passes its need: {line}"))?;
+        let WholeTerms {
+            need,
+            rest,
+            budget,
+            census,
+            fits: whole,
+        } = whole_terms(line)?;
         // The whole load's need at `ctx` positions, the line's other terms kept.
         let need_at = |ctx: u64| -> Result<u64, GateError> {
             let planes = cache_planes(model, split, ctx)?;
             rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
                 .ok_or_else(|| format!("the whole load's need at {ctx} passes u64 bytes").into())
         };
-        let whole = line.contains(": fits: ");
         let next = n + q3place::CTX_GRAN as u64;
         let (at_trained, at_next, at_floor) =
             (need_at(trained)?, need_at(next)?, need_at(SEAT_FLOOR)?);
@@ -1600,6 +1644,11 @@ mod gate {
             &named("props_names_the_slot_ctx"),
             total.is_some_and(|t| n_ctx == t / 2),
         );
+        // The whole arm's total is its own two-slot whole search's answer,
+        // held by relation; the placed arm's is the plan's.
+        if let Total::Verdict { one_slot } = arm.total {
+            slots_default_is_the_whole_search(model, &verdicts, one_slot, ok)?;
+        }
         // Two distinct prompts, each first run alone, then both together.
         let a_ids = rendered(&url, messages())?;
         let (st, body) = curl(&url("/tokenize"), Some(&json!({ "content": PROSE })), false)?;
@@ -1700,6 +1749,89 @@ mod gate {
             !tags.is_empty() && thin == 0,
         );
         println!("{} server stopped: {}", arm.dir, s.stop()?);
+        Ok(())
+    }
+
+    /// `slots_default_is_the_whole_search` (the module header), on the whole
+    /// slots arm's server: its one whole-fit line (`verdicts`) names the
+    /// total `t` the server split, and the clause holds that total to be the
+    /// two-slot whole search's own answer. The line's terms — its need, its
+    /// cache, what the card had, its `fits` ([`whole_terms`]) — leave a rest
+    /// no context moves, and the two-slot need at a total `x` is that rest
+    /// plus the allocator's bytes of the two slots' planes: each slot the
+    /// one-slot list [`cache_planes`] gives at ⌊x/2⌋ rows, once per slot
+    /// concatenated — the per-slot list the seat's own verdict counts
+    /// (`q3place::kv_bytes` over `PlaceQ3::whole_at`: N copies of one slot's
+    /// planes, each slot `ctx / N` rows, through the card's granule). The
+    /// relation, every branch printed: (a) the line says the load fits and
+    /// the two-slot need at `t` is inside what the card had; (b) `t` never
+    /// passes the one-slot default arm's answer `one_slot`; (c) the search's
+    /// grid — the total in `q3place::CTX_GRAN` steps off the seat's floor,
+    /// `searched_ctx`'s halving grid — ends at `t`: one step past it the
+    /// trained context stands or the need passes the card. A line that says
+    /// the load does not fit is a named error: the arm is not a whole arm,
+    /// its total no whole search's answer. FAIL-first: a halving that stops
+    /// a step early splits a total whose next grid point still fits, red on
+    /// (c) with the need at `t + CTX_GRAN` inside the card.
+    fn slots_default_is_the_whole_search(
+        model: &Path,
+        verdicts: &[&str],
+        one_slot: Option<u64>,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let trained = q3place::trained_ctx(&split)
+            .ok_or_else(|| format!("{}: no context_length", model.display()))?;
+        let trained = u64::try_from(trained)?;
+        let line = match verdicts {
+            [line] => *line,
+            _ => {
+                return Err(format!(
+                    "the whole slots arm's server printed {} whole-fit line(s), not the one its \
+                     total comes from",
+                    verdicts.len()
+                )
+                .into());
+            }
+        };
+        let t = line
+            .strip_prefix("whole fit at ctx ")
+            .and_then(|x| x.split(':').next())
+            .and_then(|x| x.parse::<u64>().ok())
+            .ok_or_else(|| format!("the whole-fit line names no context: {line}"))?;
+        let WholeTerms {
+            rest, budget, fits, ..
+        } = whole_terms(line)?;
+        if !fits {
+            return Err(format!(
+                "the whole slots arm's whole-fit line at {t} says the load does not fit: the arm \
+                 is not a whole arm"
+            )
+            .into());
+        }
+        // The two-slot whole load's need at a total `x`: the line's other
+        // terms plus two slots' planes, each slot one slot's list at half
+        // the total, as the allocator rounds them.
+        let need2 = |x: u64| -> Result<u64, GateError> {
+            let rows = x / 2;
+            let mut planes = cache_planes(model, &split, rows)?;
+            planes.extend(cache_planes(model, &split, rows)?);
+            rest.checked_add(model::placement::allocator_bytes(GRANULE, planes))
+                .ok_or_else(|| {
+                    format!("the two-slot whole load's need at {x} passes u64 bytes").into()
+                })
+        };
+        let next = t + q3place::CTX_GRAN as u64;
+        let (at_t, at_next) = (need2(t)?, need2(next)?);
+        println!(
+            "slots arm: the total {t} of the one-slot default {one_slot:?} and the file's \
+             trained {trained}; the two-slot load needs {at_t} B at {t}, {at_next} B at {next}, \
+             of {budget} B the card had",
+        );
+        let held = at_t <= budget
+            && one_slot.is_none_or(|o| t <= o)
+            && (next >= trained || at_next > budget);
+        check(ok, "slots_default_is_the_whole_search", held);
         Ok(())
     }
 
