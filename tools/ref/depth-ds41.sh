@@ -11,7 +11,10 @@
 #   BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 just depth-gpu-ds41 6 lcpp:6    # the command lines, no lease, no load
 #   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-ds41 6 512 lcpp:6 lcpppp:512   # engine blocks
 #   BLOOMERY_BOX_ENV='BLOOMERY_AB_ORDER=blocks' just depth-gpu-ds41 6 512 lcpp:6 lcpppp:512 lcppfit:6 lcppppfit:512
-#   tools/ref/depth-ds41.sh --parse FILE    # an ours arm's lines, row and residency curve from a saved output
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/stgv41-ab.card' BLOOMERY_AB_ROUNDS=2 just depth-gpu-ds41 prose:512 prose:512@BLOOMERY_GEN_SLOTS=2
+#   tools/ref/depth-ds41.sh --parse FILE [ARM]  # an ours arm's lines, row and residency curve from a saved output
+#   tools/ref/depth-ds41.sh --parse-arms <arms...>  # the arms as a run parses them and round 1's load lines (Mac)
+#   tools/ref/depth-ds41.sh --self-test     # the aggregate arm's parse, refusals and FAIL rows on stub outputs (Mac)
 #
 # The V4.1 sibling of depth-gpu.sh, and it blocks the same failure: a ratio read at one depth and
 # quoted as "decode is faster" — a step's attention term grows with the cached keys, so the depth
@@ -118,6 +121,32 @@
 #            prose:<P> or code:<P> arm feeds this tree's binary: row label `bin:<tree>@prose` (`@code`),
 #            plus `@NAME=VALUE[,...]` when given, in that corpus's tables — <corpus> / each label, at the
 #            same P, beside the <corpus>@ arms.
+#   <arm>@BLOOMERY_GEN_SLOTS=N[,NAME=VALUE...]  (the <D>, prose:<P>, code:<P> and bin: forms) the aggregate
+#            arm: generate_ds41 decodes N streams in one pass (the lever's row in
+#            crates/levers/src/registry.rs; the binary refuses N past the V4.1 pass's 2 rows by name, a FAIL
+#            row here). Its load plans N resident sequences and feeds N·D ids — lcg_prompt N·D or the
+#            corpus's first N·P, each a prefix-stable list, so slot 0 holds exactly the ids its plain twin
+#            feeds and slot j the next D — which the binary cuts into N windows, window j slot j's prompt
+#            call; `--parse-arms` names the arm `slots=N feed=N·D twin=<label>`. Its row reads the counted
+#            (`warm` left out) `time pass … kind=slots` records through records.py: `tok/s(aggregate) <Σ
+#            positions · 1000 / Σ ms> @ n=N·<rounds>, depth D, <card>`, then `slots N`, the per stream rate
+#            and the SMOKE footer's p50 and mean ms a pass; its pp column is slot 0's prompt call, its
+#            window W every slot's prompt call and every round. The per-arm means hold it as `(aggregate of
+#            N slots)`; it stays out of the `ratio d=` and corpus decode tables (its prefill row stays in the
+#            pp tables: slot 0's call on the N-sequence plan), and `ratio slots d=` is its aggregate over its
+#            plain twin's tok/s(mean) per round, the twin its label less the BLOOMERY_GEN_SLOTS item (ours,
+#            prose, prose@<the rest>, bin:<tree>@prose) — above 1 the N streams in one pass outrun one.
+#            Refused before anything runs: an N that is not a whole number, N·P past the corpus, and
+#            BLOOMERY_GEN_SLOTS in the runner's own environment (an arm names its own). N = 1 is a plain
+#            lever arm. FAIL rows (each through slots_check, which `--parse FILE ARM` runs too): a slots arm
+#            with no counted kind=slots record or one whose positions is not N; a plain arm with any
+#            kind=slots record; and the slots residency clause: of a slots arm's `residency pass` records
+#            after its seed's none/0, every one before its first `pass=slots` is a prompt call (`pass=prompt
+#            kept=0`: a prompt call is a pass of its own, and a slot's prompt may run as more than one), at
+#            least N of them, and every one from it on `pass=slots kept=N` — a step a slot or a pair in
+#            place of the pass fails, naming the record; an arm with no residency host record
+#            (BLOOMERY_RESIDENCY off, or a placement that resolves it off) fails it by name, the clause
+#            needing the residency on (`rc=residency`).
 # Every label is its own engine in the per-arm means and in the ratio table (ours / each other label,
 # the corpus labels excepted; <corpus> / each <corpus>@ label, and each label on that corpus, in that
 # corpus's tables). A bin: arm with variables is also paired with this binary's arm on the same prompt with
@@ -468,7 +497,10 @@ pp_col() {
   fi
 }
 # ours_row <arm kind> <label> <depth> <round> <output> <wall s>: an ours or bin arm's lines — the
-# records it echoes, then its row — from its output; into TPS_MEAN, TPS_P50 and DRAFT for the sums.
+# records it echoes, then its row — from its output; into TPS_MEAN, TPS_P50 and DRAFT for the sums, and
+# TPS_ROW, the row's headline rate. Under ROW_SLOTS=N (an aggregate arm, the header's
+# <arm>@BLOOMERY_GEN_SLOTS=N; slots_check has read its rounds into SL_*) the row is the aggregate's and
+# TPS_ROW its tok/s(aggregate); otherwise TPS_ROW is TPS_MEAN.
 # The majflt column and the cold tag come from MAJ_WHOLE and MAJ_TIMED (ours_arm; empty under
 # --parse: no column). An output with no row, or one that ran another placement than PLACE_ARM (the arm's,
 # ours_post; `-` under --parse), prints
@@ -493,14 +525,24 @@ ours_row() {
   uniq_tok=$(printf '%s' "$TOKENS" | sort -u | grep -c .)
   TPS_MEAN=$(awk -v m="$MEAN" 'BEGIN{printf "%.2f", 1e3/m}')
   TPS_P50=$(awk -v p="$P50" 'BEGIN{printf "%.2f", 1e3/p}')
-  # The timed window: the prompt's wall and the N generated steps at the mean.
+  TPS_ROW=$TPS_MEAN
+  # The timed window: the prompt's wall and the N generated steps at the mean; an aggregate arm's, every
+  # slot's prompt call and every round.
   MAJ_COL='' COLD_TAG=''
   if [ -n "${MAJ_WHOLE:-}" ]; then
     win=$(awk -v p="${PP_MS:-0}" -v n="$N" -v m="$MEAN" 'BEGIN { printf "%.4f", (p + n * m) / 1e3 }')
+    [ -z "${ROW_SLOTS:-}" ] || win=$(awk -v p="$SL_PP_MS" -v r="$SL_ALL_MS" 'BEGIN { printf "%.4f", (p + r) / 1e3 }')
     cold_check "${MAJ_TIMED:-$MAJ_WHOLE}" "$win"
     MAJ_COL=" | majflt $MAJ_WHOLE (timed ${MAJ_TIMED:-? (no fed line)}; ≤ $MAJ_BOUND % of W ${win} s)"
     # 3: a retry cold again, whose FAIL row cold_verdict printed (cold-blocks.sh).
     cold_verdict "$r" "$label" "d=$dep" "${MAJ_TIMED:-$MAJ_WHOLE}" "$win" || return 3
+  fi
+  if [ -n "${ROW_SLOTS:-}" ]; then
+    # The aggregate: Σ positions · 1000 / Σ ms over the counted rounds; the SMOKE footer's p50 and mean are
+    # a round's, so 1000 / mean is one stream's rate.
+    TPS_ROW=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
+    echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(aggregate) $TPS_ROW @ n=$ROW_SLOTS·$SL_N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE_ARM} | slots $ROW_SLOTS | tok/s(per stream, mean) $TPS_MEAN | p50 $P50 ms/pass | mean $MEAN ms/pass | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
+    return 0
   fi
   echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE_ARM} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
 }
@@ -513,7 +555,7 @@ res_value() {
   local e v=${BLOOMERY_RESIDENCY:-}
   local -a kv=()
   [ -z "${A_ENV[$1]}" ] || IFS=, read -r -a kv <<< "${A_ENV[$1]}"
-  for e in "${kv[@]}"; do
+  for e in ${kv[@]+"${kv[@]}"}; do
     case $e in BLOOMERY_RESIDENCY=*) v=${e#*=} ;; esac
   done
   echo "$v"
@@ -521,7 +563,7 @@ res_value() {
 # res_read <output> [<its load's lines>]: the residency records and timed passes of an arm's output, by
 # kind and field, into RH_WORD (the word of the `residency host` record the binary printed before its load,
 # in the output or, for an arm of a shared load, in the load's lines; empty when there is none: the binary
-# resolved the lever to off), RP_PASS, RP_BOUNDARY, RP_MADE (every `residency pass`, one a line), RR_ALL
+# resolved the lever to off), RP_PASS, RP_BOUNDARY, RP_KEEP, RP_MADE (every `residency pass`, one a line), RR_ALL
 # (every `residency reset`'s diff) and RR_TAIL (the `residency reset` lines after the last record of
 # another kind: the report of a clear that follows the arm), CV_STEP (the `time step` walls), CV_PASS and
 # CV_POS (the `time pass` walls and positions). Returns 2 with RES_WHY set when records.py cannot read
@@ -530,7 +572,7 @@ res_read() {
   local rec rh
   RES_WHY="records.py did not read the output"
   rec=$(python3 "$RECORDS" sh - 'RP_PASS=residency_pass.pass*' 'RP_BOUNDARY=residency_pass.boundary*' \
-    'RP_MADE=residency_pass.made*' 'RR_ALL=residency_reset.diff*' 'CV_STEP=time_step.ms*' \
+    'RP_KEEP=residency_pass.kept*' 'RP_MADE=residency_pass.made*' 'RR_ALL=residency_reset.diff*' 'CV_STEP=time_step.ms*' \
     'CV_PASS=time_pass.ms*' 'CV_POS=time_pass.positions*' <<< "$1") || return 2
   RR_TAIL=$(python3 "$RECORDS" tail - residency_reset <<< "$1") || return 2
   rh=$(python3 "$RECORDS" sh - 'RH_WORD=residency_host.residency*' <<< "$1"$'\n'"${2:-}") || return 2
@@ -614,23 +656,308 @@ res_curve() {
   }' <<< "$w")
   echo "residency curve $1 r$2 d=$3 $w flips=$(awk '{ s += $1 } END { print s + 0 }' <<< "$RP_MADE") | $ROW_TAG slot $4 | seed ${RES_SEED:-not checked}"
 }
+# The aggregate arm (the header's <arm>@BLOOMERY_GEN_SLOTS=N).
+# arm_slots <arm> <its NAME=VALUE list>: N into ASLOTS, empty when the list names none or N = 1 (a plain lever
+# arm); an N that is not a whole number is refused by name (exit 64), the feed being N·D ids. Its range is the
+# binary's: at_main and the body's pass refuse it by name, a FAIL row.
+arm_slots() {
+  local e
+  local -a kv=()
+  ASLOTS=''
+  [ -z "$2" ] || IFS=, read -r -a kv <<< "$2"
+  for e in ${kv[@]+"${kv[@]}"}; do
+    case $e in BLOOMERY_GEN_SLOTS=*) ASLOTS=${e#*=} ;; esac
+  done
+  case $ASLOTS in
+    '') return 0 ;;
+    0* | *[!0-9]*)
+      echo "depth-ds41.sh: arm '$1': BLOOMERY_GEN_SLOTS=$ASLOTS is no slot count (a whole number from 1, no leading zero), and the arm feeds N·D ids" >&2
+      exit 64
+      ;;
+  esac
+  [ "$ASLOTS" != 1 ] || ASLOTS=''
+}
+# slots_twin <label> <its @ list as given>: an aggregate arm's plain twin into TWIN, the label with its list less
+# the BLOOMERY_GEN_SLOTS item (`prose@BLOOMERY_GEN_SLOTS=2,X=1` -> `prose@X=1`, `ours@BLOOMERY_GEN_SLOTS=2` ->
+# `ours`, `bin:t@prose@BLOOMERY_GEN_SLOTS=2` -> `bin:t@prose`).
+slots_twin() {
+  local e rest=''
+  local -a kv=()
+  IFS=, read -r -a kv <<< "$2"
+  for e in ${kv[@]+"${kv[@]}"}; do
+    case $e in BLOOMERY_GEN_SLOTS=*) ;; *) rest+=${rest:+,}$e ;; esac
+  done
+  TWIN=${1%@"$2"}${rest:+@$rest}
+}
+# slots_check <N, empty for a plain arm> <output>: the aggregate arm's FAIL clauses (the header's
+# <arm>@BLOOMERY_GEN_SLOTS=N) over an output res_read has read, by kind and field. Into SL_N, SL_POS and SL_MS
+# (the counted kind=slots rounds, their positions and ms), SL_ALL and SL_ALL_MS (every kind=slots record and
+# its ms) and SL_PP_MS (every time prompt row's ms). Returns 1 with FAIL_WHY and FAIL_RC (residency for the
+# residency clause, empty for the others) when a clause fails. ours_post and `--parse FILE ARM` both run it.
+slots_check() {
+  local n=$1 rec bad v what b p k m s PASS_MS='' PASS_POS='' PASS_KIND='' PASS_WARM='' PROMPT_MS=''
+  SL_N=0 SL_POS=0 SL_MS=0 SL_ALL=0 SL_ALL_MS=0 SL_PP_MS=0 FAIL_RC='' FAIL_WHY=''
+  rec=$(python3 "$RECORDS" sh - 'PASS_MS=time_pass.ms*' 'PASS_POS=time_pass.positions*' 'PASS_KIND=time_pass.kind*' \
+    'PASS_WARM=time_pass.warm*' 'PROMPT_MS=time_prompt.ms*' <<< "$2") || { FAIL_WHY="records.py did not read its time pass and time prompt records"; return 1; }
+  eval "$rec"
+  read -r SL_N SL_POS SL_MS bad SL_ALL SL_ALL_MS < <(paste -d' ' <(printf '%s\n' "$PASS_MS") <(printf '%s\n' "$PASS_POS") \
+    <(printf '%s\n' "$PASS_KIND") <(printf '%s\n' "$PASS_WARM") | awk -v want="${n:-0}" '$3 == "slots" {
+      all++; all_ms += $1
+      if ($4 == "1") next
+      c++; p += $2; ms += $1; if ($2 != want) bad++
+    } END { printf "%d %d %.4f %d %d %.4f\n", c, p, ms, bad, all, all_ms }')
+  SL_PP_MS=$(awk 'NF { s += $1 } END { printf "%.4f", s }' <<< "$PROMPT_MS")
+  if [ -z "$n" ]; then
+    [ "$SL_ALL" != 0 ] || return 0
+    FAIL_WHY="its output holds $SL_ALL time pass record(s) of kind=slots and the arm names no BLOOMERY_GEN_SLOTS: its row would read one stream's rate off several"
+    return 1
+  fi
+  if [ "$SL_N" = 0 ]; then
+    FAIL_WHY="the arm runs BLOOMERY_GEN_SLOTS=$n and printed no counted time pass record of kind=slots: no aggregate to read"
+    return 1
+  fi
+  if [ "$bad" != 0 ]; then
+    FAIL_WHY="$bad of its $SL_N counted kind=slots records hold positions other than its $n slots"
+    return 1
+  fi
+  # The residency clause: after the seed's none/0 (res_seed holds it), the prompt calls (pass=prompt kept=0,
+  # at least one a slot: a slot's prompt may take more than one call) up to the first pass=slots, then only
+  # pass=slots kept=N, one a round.
+  FAIL_RC=residency
+  if [ -z "$RH_WORD" ]; then
+    FAIL_WHY="the slots residency clause needs the residency on: a slots arm's passes are read off its residency pass records, and this arm has no residency host record (BLOOMERY_RESIDENCY off, or unset under a placement that resolves it off)"
+    return 1
+  fi
+  v=$(paste -d' ' <(printf '%s\n' "$RP_PASS") <(printf '%s\n' "$RP_KEEP") <(printf '%s\n' "$RP_BOUNDARY") | awk -v n="$n" '
+    NR == 1 { next }
+    $1 == "slots" { in_slots = 1 }
+    !in_slots { if ($1 != "prompt" || $2 != 0) { print "prompt", $3, $1, $2; bad = 1; exit } m++; next }
+    { s++; if ($1 != "slots" || $2 != n) { print "slots", $3, $1, $2; bad = 1; exit } }
+    END { if (!bad) print "ok", m + 0, s + 0 }')
+  read -r what b p k <<< "$v"
+  case $what in
+    prompt) FAIL_WHY="the slots residency clause: the residency pass at boundary=$b reads pass=$p kept=$k before its first pass=slots, where only its $n slots' prompt calls (pass=prompt kept=0) stand" ;;
+    slots) FAIL_WHY="the slots residency clause: the residency pass at boundary=$b reads pass=$p kept=$k, not pass=slots kept=$n: a decode pass that was not one pass of its $n slots" ;;
+    ok)
+      m=$b s=$p
+      if [ "$s" = 0 ]; then
+        FAIL_WHY="the slots residency clause: no pass=slots kept=$n record after its $n slots' prompt calls: no decode pass of its $n slots reached the residency"
+      elif [ "$m" -lt "$n" ]; then
+        FAIL_WHY="the slots residency clause: $m pass=prompt kept=0 record(s) before its first pass=slots, fewer than one a slot of its $n"
+      else
+        FAIL_RC=''
+        return 0
+      fi
+      ;;
+    *) FAIL_WHY="the slots residency clause: its residency pass records did not read ($v)" ;;
+  esac
+  return 1
+}
 # The cold tag's constants and cold_check, the fault counter and majflt_mark, ROW_TAG and counted, the
 # order and the blocks' planner and loops: shared with depth-qwen3moe.sh.
 # shellcheck source=tools/ref/cold-blocks.sh
 source "${BASH_SOURCE[0]%/*}/cold-blocks.sh" || exit 2
-# `--parse FILE`: ours_row over a saved output (`-` for stdin) — its depth and N the SMOKE footer's,
-# the runner's context (round, card, contention) `-` — and nothing loaded, timed or leased.
+# `--parse FILE [ARM]`: ours_row over a saved output (`-` for stdin) — its depth and N the SMOKE footer's,
+# the runner's context (round, card, contention) `-` — and nothing loaded, timed or leased. With no ARM the
+# row is an aggregate one when the output holds kind=slots passes (N their positions), and no seed verdict
+# is read. With ARM — an ours or corpus arm as a run takes it, `<D>`, `prose:<P>` or `code:<P>`, each with
+# its @ list — the label, depth and variables are the arm's, and the clauses a run holds an arm of its own
+# process to run first: the residency seed at slot 1 (res_seed) and the aggregate arm's (slots_check); a
+# failed one prints the run's FAIL row, `FAIL r- <label> d=<D> rc=<rc> | <why> | full output: FILE`, exit 1.
 if [ "${1:-}" = --parse ]; then
-  [ $# -eq 2 ] || { echo "usage: depth-ds41.sh --parse FILE" >&2; exit 64; }
+  [ $# -eq 2 ] || [ $# -eq 3 ] || { echo "usage: depth-ds41.sh --parse FILE [ARM]" >&2; exit 64; }
   out=$(cat -- "$2") || exit 2
   ours_parse <<< "$out" || { echo "$2: $FAIL_WHY" >&2; exit 2; }
-  ROW_TAG=ROW N=${GEN:--} CARD_NAME=- CPU_BUSY_TAG='' OTHER_BUSY_TAG='' PLACE_ARM=-
-  ours_row ours ours "${DEPTH:--}" - "$out" - || { echo "$2: $FAIL_WHY" >&2; exit 1; }
-  # No arm environment here: the curve without the seed verdict.
   res_read "$out" || { echo "$2: $RES_WHY" >&2; exit 2; }
-  res_curve ours - "${DEPTH:--}" -
+  ROW_TAG=ROW N=${GEN:--} CARD_NAME=- CPU_BUSY_TAG='' OTHER_BUSY_TAG='' PLACE_ARM=-
+  label=ours dep=${DEPTH:--} at=''
+  if [ $# -eq 3 ]; then
+    a=$3 head=${3%%@*}
+    case $a in *@*) at=${a#*@} ;; esac
+    case $head in
+      prose:* | code:*) label=${head%%:*} dep=${head#*:} ;;
+      *) dep=$head ;;
+    esac
+    case $dep in '' | *[!0-9]*) echo "depth-ds41.sh --parse: ARM '$a' is <D>, prose:<P> or code:<P>, each with an optional @NAME=VALUE[,...] list" >&2; exit 64 ;; esac
+    label+=${at:+@$at}
+    A_ENV=("$at")
+    arm_slots "$a" "$at"
+    ROW_SLOTS=$ASLOTS
+    res_seed 0 1 || { echo "FAIL r- $label d=$dep rc=residency | $RES_WHY | full output: $2"; exit 1; }
+  else
+    sl=$(python3 "$RECORDS" sh - 'SLK=time_pass.kind*' 'SLP=time_pass.positions*' <<< "$out") || { echo "$2: records.py did not read its time pass records" >&2; exit 2; }
+    eval "$sl"
+    ROW_SLOTS=$(paste -d' ' <(printf '%s\n' "$SLK") <(printf '%s\n' "$SLP") | awk '$1 == "slots" { print $2; exit }')
+  fi
+  slots_check "$ROW_SLOTS" "$out" || { echo "FAIL r- $label d=$dep rc=${FAIL_RC:-0} | $FAIL_WHY | full output: $2"; exit 1; }
+  ours_row ours "$label" "$dep" - "$out" - || { echo "$2: $FAIL_WHY" >&2; exit 1; }
+  res_curve "$label" - "$dep" -
   exit 0
 fi
+# ds41_self_test: `depth-ds41.sh --self-test`, on the Mac (bash 3.2; no card, binary or lease). The aggregate
+# arm (the header's <arm>@BLOOMERY_GEN_SLOTS=N): its parse, feed, twin and refusals through --parse-arms
+# against a temp corpus in the self-test's own temp dir, and its FAIL clauses through `--parse FILE ARM`
+# against stub outputs of generate_ds41's records (slots_check, the code ours_post runs). One line per check,
+# `ok <name>` or `FAIL <name>: …`; the last line is the verdict.
+ds41_self_test() {
+  local fails=0 checks=0 out rc me=$0 st bin=target/release/generate_ds41 i
+  st=$(mktemp -d "${TMPDIR:-/tmp}/depth-ds41-self-test.XXXXXX") || return 2
+  mkdir -p "$st/data/engram"
+  seq 100 900 > "$st/data/engram/corpus-prose.ids"
+  # run_parse [NAME=VALUE...] -- <arms...>: this file's --parse-arms under env -i, into out and rc.
+  run_parse() {
+    local -a pre=()
+    while [ "$1" != -- ]; do
+      pre+=("$1")
+      shift
+    done
+    shift
+    out=$(env -i PATH="$PATH" BLOOMERY_MODEL=deepseek41 BLOOMERY_DATA="$st/data" ${pre[@]+"${pre[@]}"} "$BASH" "$me" --parse-arms "$@" 2>&1)
+    rc=$?
+  }
+  # run_file <stub file> <arm>: this file's --parse FILE ARM, into out and rc.
+  run_file() {
+    out=$(env -i PATH="$PATH" "$BASH" "$me" --parse "$st/$1" "$2" 2>&1)
+    rc=$?
+  }
+  # want <name> <rc> <text>...: rc as given; each text a whole line of the output (rc 0) or a part of it.
+  want() {
+    local name=$1 want_rc=$2 t bad=''
+    shift 2
+    checks=$((checks + 1))
+    [ "$rc" = "$want_rc" ] || bad="rc $rc, want $want_rc"
+    for t in "$@"; do
+      if [ "$want_rc" = 0 ]; then
+        grep -qxF -- "$t" <<< "$out" || bad="${bad:+$bad; }no line [$t]"
+      else
+        grep -qF -- "$t" <<< "$out" || bad="${bad:+$bad; }no [$t]"
+      fi
+    done
+    if [ -z "$bad" ]; then
+      echo "ok $name"
+    else
+      echo "FAIL $name: $bad"
+      while IFS= read -r t; do echo "    | $t"; done <<< "$out"
+      fails=$((fails + 1))
+    fi
+  }
+  # The stub outputs: one arm of P = 4 ids a slot, -n 4 (three rounds, the first warm), at 20 ms then 8 ms a
+  # pass. rp <pass> <boundary> <kept>: a residency pass record.
+  rp() { echo "residency pass pass=$1 boundary=$2 kept=$3 landed=0 late=0 made=0 in_flight=0 bytes=0 end_us=1 boundary_us=1 wait_us=0 issue_us=0 stage_us=0 prepare_us=0 rereads=0 reread_bytes=0 reread_us=0"; }
+  res_on() {
+    echo "residency lever residency=mid-p40-s1 why=place"
+    echo "residency host residency=mid-p40-s1 pinned=1 churn_experts=1 churn_bytes=1 headroom=-1 headroom_after=-1"
+  }
+  # slots_out <positions of round 3>: two slots' lines in slot order, as generate_ds41 prints them.
+  slots_out() {
+    echo "fed ids=4 first=[100,101,102,103] last=[100,101,102,103] depth_sequence_from=4"
+    echo "step 0 3 7 (the 4 fed steps in 0.0 s, runtime value)"
+    echo "fed ids=4 first=[104,105,106,107] last=[104,105,106,107] depth_sequence_from=0"
+    echo "step 0 3 9 (the 4 fed steps in 0.0 s, runtime value)"
+    echo "time prompt n=4 ms=10.0000 tok/s=400.00 passes=1 kind=batch"
+    echo "time prompt n=4 ms=10.0000 tok/s=400.00 passes=1 kind=batch"
+    printf 'step 1 4 11\nstep 1 4 12\ntime pass 1 warm ms=20.0000 positions=2 kind=slots\n'
+    printf 'step 2 5 13\nstep 2 5 14\ntime pass 2 ms=8.0000 positions=2 kind=slots\n'
+    printf 'step 3 6 15\nstep 3 6 16\ntime pass 3 ms=8.0000 positions=%s kind=slots\n' "$1"
+    printf 'tokens [7,11,13,15]\ntokens [9,12,14,16]\n'
+    echo "SMOKE mode=graph place=a prompt_tokens=4 depth=4 generated=4 warm=1 steps=2 p50_ms=8.0000 mean_ms=8.0000 tok/s(p50)=125.00 positions=4 tok/s(positions)=250.00"
+  }
+  plain_out() {
+    echo "fed ids=4 first=[100,101,102,103] last=[100,101,102,103] depth_sequence_from=4"
+    echo "step 0 3 7 (the 4 fed steps in 0.0 s, runtime value)"
+    echo "time prompt n=4 ms=10.0000 tok/s=400.00 passes=1 kind=batch"
+    printf 'step 1 4 11\ntime step 1 warm ms=20.0000\nstep 2 5 13\ntime step 2 ms=5.0000\nstep 3 6 15\ntime step 3 ms=5.0000\n'
+    echo "tokens [7,11,13,15]"
+    echo "SMOKE mode=graph place=a prompt_tokens=4 depth=4 generated=4 warm=1 steps=2 p50_ms=5.0000 mean_ms=5.0000 tok/s(p50)=200.00"
+  }
+  { res_on; slots_out 2; rp none 0 0; rp prompt 1 0; rp prompt 2 0; rp slots 3 2; rp slots 4 2; rp slots 5 2; } > "$st/slots.out"
+  { slots_out 2; } > "$st/slots-off.out"
+  { res_on; slots_out 2; rp none 0 0; rp prompt 1 0; rp prompt 2 0; rp slots 3 2; rp pair 4 2; rp slots 5 2; } > "$st/slots-pair.out"
+  { res_on; slots_out 2; rp none 0 0; rp prompt 1 0; rp slots 2 2; rp slots 3 2; rp slots 4 2; } > "$st/slots-oneprompt.out"
+  { res_on; slots_out 2; rp none 0 0; rp prompt 1 0; rp prompt 2 0; rp prompt 3 0; rp slots 4 2; rp slots 5 2; rp slots 6 2; } > "$st/slots-manyprompt.out"
+  { res_on; slots_out 2; rp none 0 0; rp prompt 1 0; rp prompt 2 0; rp step 3 1; rp slots 4 2; rp slots 5 2; } > "$st/slots-stepfirst.out"
+  { res_on; slots_out 2; rp none 0 0; rp prompt 1 0; rp prompt 2 0; rp slots 3 2; rp prompt 4 0; rp slots 5 2; } > "$st/slots-promptafter.out"
+  { res_on; slots_out 2; rp none 0 0; rp prompt 1 0; rp prompt 2 0; } > "$st/slots-nopass.out"
+  { res_on; slots_out 1; rp none 0 0; rp prompt 1 0; rp prompt 2 0; rp slots 3 2; rp slots 4 2; rp slots 5 2; } > "$st/slots-pos.out"
+  { res_on; plain_out; rp none 0 0; rp prompt 1 0; rp step 2 1; rp step 3 1; rp step 4 1; } > "$st/plain.out"
+
+  # The aggregate row: the counted rounds (the warm one left out), Σ positions · 1000 / Σ ms; the window W
+  # every prompt call and every round; the curve over every pass.
+  run_file slots.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-row 0 \
+    "ROW r- prose@BLOOMERY_GEN_SLOTS=2 d=4 n=4 | tok/s(aggregate) 250.00 @ n=2·2, depth 4, - | place a | slots 2 | tok/s(per stream, mean) 125.00 | p50 8.0000 ms/pass | mean 8.0000 ms/pass | warm 1 | first10_p50 8.0000 | last10_p50 8.0000 | distinct_tokens 6 | pp_tok/s 400.00 (n=4, passes=1, kind=batch) | wall -s" \
+    "residency curve prose@BLOOMERY_GEN_SLOTS=2 r- d=4 windows=1 tok/s=166.67 flips=0 | ROW slot - | seed first pass none/0"
+  run_file plain.out prose:4
+  want plain-row 0 \
+    "ROW r- prose d=4 n=4 | tok/s(mean) 200.00 @ n=4, depth 4, - | place a | p50 5.0000 ms | mean 5.0000 ms | tok/s(p50) 200.00 | warm 1 | first10_p50 5.0000 | last10_p50 5.0000 | distinct_tokens 3 | pp_tok/s 400.00 (n=4, passes=1, kind=batch) | wall -s"
+  # The FAIL rows (red on the runner before them, which read a slots output as one stream's row).
+  run_file slots-off.out prose:512@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off
+  want slots-resoff 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off d=512 rc=residency | the slots residency clause needs the residency on"
+  run_file slots-pair.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-pair 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2 d=4 rc=residency | the slots residency clause: the residency pass at boundary=4 reads pass=pair kept=2, not pass=slots kept=2"
+  run_file slots-oneprompt.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-oneprompt 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2 d=4 rc=residency | the slots residency clause: 1 pass=prompt kept=0 record(s) before its first pass=slots, fewer than one a slot of its 2"
+  # A slot's prompt may run as more than one prompt call: three before the first pass=slots read as the
+  # plain two do.
+  run_file slots-manyprompt.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-manyprompt 0 \
+    "ROW r- prose@BLOOMERY_GEN_SLOTS=2 d=4 n=4 | tok/s(aggregate) 250.00 @ n=2·2, depth 4, - | place a | slots 2 | tok/s(per stream, mean) 125.00 | p50 8.0000 ms/pass | mean 8.0000 ms/pass | warm 1 | first10_p50 8.0000 | last10_p50 8.0000 | distinct_tokens 6 | pp_tok/s 400.00 (n=4, passes=1, kind=batch) | wall -s"
+  run_file slots-stepfirst.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-stepfirst 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2 d=4 rc=residency | the slots residency clause: the residency pass at boundary=3 reads pass=step kept=1 before its first pass=slots, where only its 2 slots' prompt calls (pass=prompt kept=0) stand"
+  run_file slots-promptafter.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-promptafter 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2 d=4 rc=residency | the slots residency clause: the residency pass at boundary=4 reads pass=prompt kept=0, not pass=slots kept=2"
+  run_file slots-nopass.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-nopass 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2 d=4 rc=residency | the slots residency clause: no pass=slots kept=2 record after its 2 slots' prompt calls"
+  run_file slots-pos.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-pos 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2 d=4 rc=0 | 1 of its 2 counted kind=slots records hold positions other than its 2 slots"
+  run_file plain.out prose:4@BLOOMERY_GEN_SLOTS=2
+  want slots-none 1 "FAIL r- prose@BLOOMERY_GEN_SLOTS=2 d=4 rc=0 | the arm runs BLOOMERY_GEN_SLOTS=2 and printed no counted time pass record of kind=slots"
+  run_file slots.out prose:4
+  want slots-leak 1 "FAIL r- prose d=4 rc=0 | its output holds 3 time pass record(s) of kind=slots and the arm names no BLOOMERY_GEN_SLOTS"
+
+  # The parse: N·D ids fed (lcg_prompt N·D, or the corpus's first N·P: slot 0 the plain twin's ids), the
+  # twin, N = 1 a plain lever arm, and each refusal by name.
+  run_parse -- 6 6@BLOOMERY_GEN_SLOTS=2 6@BLOOMERY_GEN_SLOTS=1
+  want parse-slots 0 \
+    "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|place=a|" \
+    "[parse] 6@BLOOMERY_GEN_SLOTS=2: kind=ours depth=6 label=ours@BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=$bin|place=a|BLOOMERY_GEN_SLOTS=2 slots=2 feed=12 twin=ours" \
+    "[parse] 6@BLOOMERY_GEN_SLOTS=1: kind=ours depth=6 label=ours@BLOOMERY_GEN_SLOTS=1 env=BLOOMERY_GEN_SLOTS=1 load=$bin|place=a|BLOOMERY_GEN_SLOTS=1" \
+    "[parse] load: $bin --arm 6 -n 96 --place a --time --arm-sync" \
+    "[parse] load: env BLOOMERY_GEN_SLOTS=2 $bin --arm 12 -n 96 --place a --time --arm-sync" \
+    "[parse] load: env BLOOMERY_GEN_SLOTS=1 $bin --arm 6 -n 96 --place a --time --arm-sync"
+  run_parse -- prose:4 prose:4@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off
+  want parse-prose 0 \
+    "[parse] prose:4: kind=corpus depth=4 label=prose env=- load=$bin|place=a| ids=100..103" \
+    "[parse] prose:4@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off: kind=corpus depth=4 label=prose@BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off env=BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off load=$bin|place=a|BLOOMERY_GEN_SLOTS=2,BLOOMERY_RESIDENCY=off slots=2 feed=8 twin=prose@BLOOMERY_RESIDENCY=off ids=100..107" \
+    "[parse] load: $bin --arm prose:4 -n 96 --place a --time --arm-sync" \
+    "[parse] load: env BLOOMERY_GEN_SLOTS=2 BLOOMERY_RESIDENCY=off $bin --arm prose:8 -n 96 --place a --time --arm-sync"
+  run_parse -- prose:4@place=gate,BLOOMERY_GEN_SLOTS=2 bin:/root/r/t/target/release/generate_ds41:prose:4@BLOOMERY_GEN_SLOTS=2
+  want parse-twin 0 \
+    "[parse] prose:4@place=gate,BLOOMERY_GEN_SLOTS=2: kind=corpus depth=4 label=prose@place=gate,BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=$bin|place=gate|BLOOMERY_GEN_SLOTS=2 slots=2 feed=8 twin=prose@place=gate ids=100..107" \
+    "[parse] bin:/root/r/t/target/release/generate_ds41:prose:4@BLOOMERY_GEN_SLOTS=2: kind=bin depth=4 label=bin:t@prose@BLOOMERY_GEN_SLOTS=2 env=BLOOMERY_GEN_SLOTS=2 load=/root/r/t/target/release/generate_ds41|place=a|BLOOMERY_GEN_SLOTS=2 slots=2 feed=8 twin=bin:t@prose ids=100..107"
+  run_parse -- 6@BLOOMERY_GEN_SLOTS=x
+  want parse-count 64 "BLOOMERY_GEN_SLOTS=x is no slot count"
+  run_parse -- prose:500@BLOOMERY_GEN_SLOTS=2
+  want parse-past 64 "a prose prompt of 1000 ids (2 slots × 500); $st/data/engram/corpus-prose.ids holds 801 (1..801)"
+  run_parse BLOOMERY_GEN_SLOTS=2 -- 6
+  want parse-env 64 "BLOOMERY_GEN_SLOTS=2 is set in the runner's own environment"
+  rm -rf "$st"
+  echo "self-test: $([ "$fails" = 0 ] && echo ok || echo FAIL) ($checks checks, $fails failures)"
+  [ "$fails" = 0 ]
+}
+# The modes that run nothing on the box: --self-test above, and --parse-arms, which prints the arms as a run
+# parses them and round 1's load command lines, then exits before the card, the binaries and the lease.
+PARSE_ONLY=
+case ${1:-} in
+  --self-test)
+    ds41_self_test
+    exit
+    ;;
+  --parse-arms)
+    PARSE_ONLY=1
+    shift
+    ;;
+esac
 # The profile (MODEL, IK, IKBIN, IK_GPU_FLAGS, IK_GPU_ENV, LCPP, LCPPBIN, LCPP_GPU_FLAGS,
 # LCPP_NCMOE); tools/box.sh exports its MODEL to our binary as BLOOMERY_REF_MODEL, so the three
 # engines open one file.
@@ -718,7 +1045,8 @@ arm_envs_ok() {
     [[ $e =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:],]+$ ]] || arm_usage "$1"
   done
 }
-# corpus_check <arm> <name> <P>: the file's id count read once; P outside 1..count is refused.
+# corpus_check <arm> <name> <P> [<note>]: the file's id count read once; P outside 1..count is refused, the
+# note (an aggregate arm's `N slots × D`) named beside it.
 corpus_check() {
   local file var
   file=$(corpus_file "$2") var=CORPUS_N_$2
@@ -727,7 +1055,7 @@ corpus_check() {
     printf -v "$var" '%s' "$(($(wc -l < "$file")))"
   fi
   if [ "$3" -lt 1 ] || [ "$3" -gt "${!var}" ]; then
-    echo "depth-ds41.sh: arm '$1': a $2 prompt of $3 ids; $file holds ${!var} (1..${!var})" >&2
+    echo "depth-ds41.sh: arm '$1': a $2 prompt of $3 ids${4:+ ($4)}; $file holds ${!var} (1..${!var})" >&2
     exit 64
   fi
 }
@@ -740,8 +1068,16 @@ split_at() {
   ENVS=$ARM_REST APLACE=$ARM_PLACE
   [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
 }
+# The aggregate arm's lever is an arm's own (the header's <arm>@BLOOMERY_GEN_SLOTS=N): set here it would
+# reach every generate_ds41 arm, whose plain rows would read a per stream rate under a plain label.
+if [ -n "${BLOOMERY_GEN_SLOTS+x}" ]; then
+  echo "depth-ds41.sh: BLOOMERY_GEN_SLOTS=$BLOOMERY_GEN_SLOTS is set in the runner's own environment, which every arm inherits: name it per arm (<arm>@BLOOMERY_GEN_SLOTS=N), whose row reads the aggregate" >&2
+  exit 64
+fi
+# An aggregate arm's N (N >= 2; empty for every other arm) and its plain twin's label (slots_twin).
+A_SLOTS=() A_TWIN=()
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' ids='' AT='' APLACE=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' ids='' AT='' APLACE='' ASLOTS='' TWIN=''
   # place= on a reference or server arm is refused by name (the header's Placement); any other @ there is
   # arm usage, below.
   case $a in
@@ -763,7 +1099,7 @@ for a in "${ARMS[@]}"; do
     [ "$dep" -ge 1 ] || { echo "depth-ds41.sh: arm '$a': a server arm sends at least one id" >&2; exit 64; }
     srv_check_arm "$a" || { echo "depth-ds41.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_ENV+=('') A_TOK+=("$tok") A_IDS+=("$ids")
-    A_AT+=('') A_PLACE+=('') A_PLACE_SET+=('')
+    A_AT+=('') A_PLACE+=('') A_PLACE_SET+=('') A_SLOTS+=('') A_TWIN+=('')
     continue
   fi
   case $a in
@@ -771,8 +1107,10 @@ for a in "${ARMS[@]}"; do
       kind=corpus bin=$BIN label=$eng
       case $dep in *@*) split_at "$a" "${dep#*@}" && envs=$ENVS dep=${dep%%@*} label=$eng@$AT ;; esac
       case $dep in '' | *[!0-9]*) arm_usage "$a" ;; esac
-      corpus_check "$a" "$eng" "$dep"
-      tok=$(head -n "$dep" "$(corpus_file "$eng")" | paste -sd, -)
+      # An aggregate arm feeds the corpus's first N·P ids, slot j the window j.
+      arm_slots "$a" "$envs"
+      corpus_check "$a" "$eng" "$((dep * ${ASLOTS:-1}))" "${ASLOTS:+$ASLOTS slots × $dep}"
+      tok=$(head -n "$((dep * ${ASLOTS:-1}))" "$(corpus_file "$eng")" | paste -sd, -)
       ours=1 gen=1
       ;;
     bin:*)
@@ -787,9 +1125,10 @@ for a in "${ARMS[@]}"; do
       tree=${bin%/target/*}
       [ "$tree" != "$bin" ] || tree=${bin%/*}
       label=bin:${tree##*/}${ids:+@$ids}${AT:+@$AT}
+      arm_slots "$a" "$envs"
       if [ -n "$ids" ]; then
-        corpus_check "$a" "$ids" "$dep"
-        tok=$(head -n "$dep" "$(corpus_file "$ids")" | paste -sd, -)
+        corpus_check "$a" "$ids" "$((dep * ${ASLOTS:-1}))" "${ASLOTS:+$ASLOTS slots × $dep}"
+        tok=$(head -n "$((dep * ${ASLOTS:-1}))" "$(corpus_file "$ids")" | paste -sd, -)
       fi
       gen=1
       ;;
@@ -797,6 +1136,7 @@ for a in "${ARMS[@]}"; do
       kind=ours eng=ours dep=${a%%@*} bin=$BIN
       split_at "$a" "${a#*@}"
       envs=$ENVS label=ours@$AT
+      arm_slots "$a" "$envs"
       ours=1 gen=1
       ;;
     *:*)
@@ -831,6 +1171,8 @@ for a in "${ARMS[@]}"; do
     fi
   fi
   A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_ENV+=("$envs") A_TOK+=("$tok") A_IDS+=("$ids")
+  [ -z "$ASLOTS" ] || slots_twin "$label" "$AT"
+  A_SLOTS+=("$ASLOTS") A_TWIN+=("$TWIN")
   # A generate_ds41 arm's placement: its place=, else BLOOMERY_GEN_PLACE; none for a reference arm.
   A_AT+=("$AT")
   if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
@@ -855,6 +1197,55 @@ for i in "${!ARMS[@]}"; do
     *) LG_KEY[i]= ;;
   esac
 done
+# The variables arm <i> of ours runs with, into ARM_ENVS: its own, and for a DSpark arm
+# (BLOOMERY_DRAFT=dspark) the other card's visibility and the draft file (timing-card.sh dspark_env).
+# The dry run prints the same list.
+arm_envs() {
+  local envs
+  ARM_ENVS=()
+  envs=''
+  [ -z "${A_ENV[$1]}" ] || envs=$(lg_strip_solo "${A_ENV[$1]}")
+  [ -z "$envs" ] || IFS=, read -r -a ARM_ENVS <<< "$envs"
+  if [[ ",${A_ENV[$1]}," == *",BLOOMERY_DRAFT=dspark,"* ]]; then
+    local -a extra=()
+    mapfile -t extra < <(dspark_env)
+    ARM_ENVS=("${extra[@]}" "${ARM_ENVS[@]}")
+  fi
+}
+# The prompt generate_ds41 arm <i> feeds, into ARM_FEED: --tokens <the corpus ids> for a corpus arm or a
+# bin: arm on a corpus, else --depth <D> (the binary's LCG prompt); an aggregate arm's N·D of them
+# (arm_ids).
+arm_feed() {
+  if [ -n "$(arm_corpus "$1")" ]; then ARM_FEED=(--tokens "${A_TOK[$1]}"); else ARM_FEED=(--depth "$(arm_ids "$1")"); fi
+}
+# arm_ids <i>: the ids generate_ds41 arm <i> feeds: its depth or P, N times that for an aggregate arm.
+arm_ids() { echo $((A_DEP[$1] * ${A_SLOTS[$1]:-1})); }
+# arm_corpus <i>: the corpus generate_ds41 arm <i> is fed from (a corpus arm's name, a bin: arm's ids), or
+# nothing for the LCG prompt.
+arm_corpus() {
+  case ${A_KIND[$1]} in
+    corpus) echo "${A_ENG[$1]}" ;;
+    bin) echo "${A_IDS[$1]}" ;;
+  esac
+}
+# The driver's hooks (tools/ref/load-groups.sh): a load's command line and environment here, an arm's
+# guards and witness blocks around it (lg_pre, lg_post) below. The load's lines echoed once: its plan,
+# load, host set, capture and prompt buffer lines.
+LG_HEADER_RE='^(plan|load|host|capture|prefill|residency host|residency lever) '
+lg_cmd() {
+  local i c
+  arm_envs "$1"
+  LG_ENV=(${ARM_ENVS[@]+"${ARM_ENVS[@]}"})
+  # The unit's arms share a load key, which holds the binary and the placement: the first arm's are every
+  # arm's.
+  LG_CMD=("${A_BIN[$1]}")
+  for i in "$@"; do
+    c=$(arm_corpus "$i")
+    LG_CMD+=(--arm "${c:+$c:}$(arm_ids "$i")")
+  done
+  # shellcheck disable=SC2206 # an empty WARM adds nothing
+  LG_CMD+=(-n "$N" --place "${A_PLACE[$1]}" --time ${WARM:+--warm "$WARM"} --arm-sync)
+}
 # The arms that may run the residency machine (the header's Residency): every generate_ds41 arm, since the
 # binary resolves an unset lever by its placement and prints what it resolved; the ones that set it, and the
 # profile's reset bytes a residency arm's later slots are held to: refused before the lease when the profile
@@ -884,6 +1275,24 @@ res_config() {
     echo "residency: arms that set BLOOMERY_RESIDENCY: ${RES_SET[*]:-none}; each of ${RES_ARMS[*]} runs as its binary's residency host record says (unset follows the placement): an arm with the record starts from the seed (its first residency pass none/0, and at slot k > 1 one residency reset before its arm line with diff=0 and dropped_bytes=$RESIDENCY_RESET_DROPPED_BYTES, the profile's) or is a FAIL rc=residency row, with a residency curve line after each row, windows of $RES_WINDOW passes; an arm without it that prints a residency pass or reset record, or one whose record disagrees with the value it sets, is a FAIL rc=residency row"
   fi
 }
+# --parse-arms: each arm as parsed (an aggregate arm's N, feed and twin; a corpus arm's first and last id),
+# then round 1's loads as their command lines; nothing past here runs.
+if [ -n "$PARSE_ONLY" ]; then
+  for i in "${!ARMS[@]}"; do
+    facts=''
+    [ -z "${A_SLOTS[$i]}" ] || facts=" slots=${A_SLOTS[$i]} feed=$(arm_ids "$i") twin=${A_TWIN[$i]}"
+    [ -z "${A_TOK[$i]}" ] || facts+=" ids=${A_TOK[$i]%%,*}..${A_TOK[$i]##*,}"
+    echo "[parse] ${ARMS[$i]}: kind=${A_KIND[$i]} depth=${A_DEP[$i]} label=${A_LABEL[$i]} env=${A_ENV[$i]:--} load=${LG_KEY[$i]:-(a process of its own)}$facts"
+  done
+  lg_units "${!ARMS[@]}"
+  while IFS= read -r line; do
+    read -r -a idx <<< "$line"
+    if [ ${#idx[@]} -eq 0 ] || ! lg_grouped "${idx[0]}"; then continue; fi
+    lg_cmd "${idx[@]}"
+    echo "[parse] load: ${LG_ENV[*]:+env ${LG_ENV[*]} }${LG_CMD[*]}"
+  done < <(lg_round 1)
+  exit 0
+fi
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
 # has the two-card mode (the header's Two cards).
 TIMING_CARDS_RUNNER=1
@@ -1321,33 +1730,6 @@ count_row() {
   [ -z "$COLD_TAG" ] || cold_rows=$((cold_rows + 1))
 }
 
-# The variables arm <i> of ours runs with, into ARM_ENVS: its own, and for a DSpark arm
-# (BLOOMERY_DRAFT=dspark) the other card's visibility and the draft file (timing-card.sh dspark_env).
-# The dry run prints the same list.
-arm_envs() {
-  local envs
-  ARM_ENVS=()
-  envs=$(lg_strip_solo "${A_ENV[$1]}")
-  [ -z "$envs" ] || IFS=, read -r -a ARM_ENVS <<< "$envs"
-  if [[ ",${A_ENV[$1]}," == *",BLOOMERY_DRAFT=dspark,"* ]]; then
-    local -a extra=()
-    mapfile -t extra < <(dspark_env)
-    ARM_ENVS=("${extra[@]}" "${ARM_ENVS[@]}")
-  fi
-}
-# The prompt generate_ds41 arm <i> feeds, into ARM_FEED: --tokens <the corpus ids> for a corpus arm or a
-# bin: arm on a corpus, else --depth <D> (the binary's LCG prompt).
-arm_feed() {
-  if [ -n "$(arm_corpus "$1")" ]; then ARM_FEED=(--tokens "${A_TOK[$1]}"); else ARM_FEED=(--depth "${A_DEP[$1]}"); fi
-}
-# arm_corpus <i>: the corpus generate_ds41 arm <i> is fed from (a corpus arm's name, a bin: arm's ids), or
-# nothing for the LCG prompt.
-arm_corpus() {
-  case ${A_KIND[$1]} in
-    corpus) echo "${A_ENG[$1]}" ;;
-    bin) echo "${A_IDS[$1]}" ;;
-  esac
-}
 # One arm of a generate_ds41 at its placement (A_PLACE) in a process of its own, with the one-arm command line:
 # a bin: arm whose @ list holds BLOOMERY_AB_LOAD=arm (a base binary that may know no --arm). The row and the sum under the arm's label, or
 # a FAIL row (ours_post). The output passes through majflt_mark on its way into `out`, so the fault
@@ -1429,6 +1811,11 @@ ours_post() {
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" residency "$RES_WHY" "$out"
     return 0
   }
+  # The aggregate arm's clauses (the header's <arm>@BLOOMERY_GEN_SLOTS=N), and a plain arm's leak of them.
+  slots_check "${A_SLOTS[$i]}" "$out" || {
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "${FAIL_RC:-$rc}" "$FAIL_WHY" "$out"
+    return 0
+  }
   # Beside a server arm, the context our row ran at is the one the servers were given (the header's
   # A server arm's -c): its load record, or its load's.
   if [ -n "$SRV_CTX_PLAN" ]; then
@@ -1439,6 +1826,7 @@ ours_post() {
       return 0
     fi
   fi
+  ROW_SLOTS=${A_SLOTS[$i]}
   ours_row "${A_KIND[$i]}" "$label" "$dep" "$r" "$out" "$wall" || {
     [ $? = 3 ] || arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$FAIL_WHY" "$out"
     return 0
@@ -1456,29 +1844,17 @@ ours_post() {
     corpus:prose | corpus:code) xc_add ours "$label" "$dep" "$r" "$label" "$XC_TOK" ;;
   esac
   tags="$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
-  if [ -n "$DRAFT" ]; then TPS_MEAN=${DRAFT##*tok/s(positions)=}; fi
-  sums+=("$label|$dep|$r|$TPS_MEAN|$TPS_P50|$tags")
+  if [ -n "$DRAFT" ]; then TPS_MEAN=${DRAFT##*tok/s(positions)=} TPS_ROW=$TPS_MEAN; fi
+  # An aggregate row's record carries no p50 rate and names its N (the means' `(aggregate of N slots)`).
+  if [ -n "$ROW_SLOTS" ]; then
+    sums+=("$label|$dep|$r|$TPS_ROW||$tags|$ROW_SLOTS")
+  else
+    sums+=("$label|$dep|$r|$TPS_MEAN|$TPS_P50|$tags")
+  fi
   [ -z "$PP_N" ] || pp_sums+=("$label|$PP_N|$r|$PP_TPS|$tags")
-  [ -z "$SLOT_COL" ] || slot_sums+=("$label|${SLOT_COL##*slot }|$PP_N|${PP_TPS:-}|$TPS_MEAN")
+  [ -z "$SLOT_COL" ] || slot_sums+=("$label|${SLOT_COL##*slot }|$PP_N|${PP_TPS:-}|$TPS_ROW")
 }
-# The driver's hooks (tools/ref/load-groups.sh): a load's command line and environment, and an arm's
-# guards and witness blocks around it. The load's lines echoed once: its plan, load, host set, capture
-# and prompt buffer lines.
-LG_HEADER_RE='^(plan|load|host|capture|prefill|residency host|residency lever) '
-lg_cmd() {
-  local i c
-  arm_envs "$1"
-  LG_ENV=("${ARM_ENVS[@]}")
-  # The unit's arms share a load key, which holds the binary and the placement: the first arm's are every
-  # arm's.
-  LG_CMD=("${A_BIN[$1]}")
-  for i in "$@"; do
-    c=$(arm_corpus "$i")
-    LG_CMD+=(--arm "${c:+$c:}${A_DEP[$i]}")
-  done
-  # shellcheck disable=SC2206 # an empty WARM adds nothing
-  LG_CMD+=(-n "$N" --place "${A_PLACE[$1]}" --time ${WARM:+--warm "$WARM"} --arm-sync)
-}
+# The driver's per-arm hooks (load-groups.sh): an arm's guards and witness block before it, its row after.
 lg_pre() {
   prime_tag "$1"
   CPU_BUSY_TAG=
@@ -1603,13 +1979,13 @@ dry_cmd() {
     echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${LG_ENV[*]:+env ${LG_ENV[*]} }${LG_CMD[*]}   # row label '${A_LABEL[$i]}', load key ${LG_KEY[$i]}"
     return
   fi
-  feedline="--depth $dep"
+  feedline="--depth $(arm_ids "$i")"
   [ "${A_LABEL[$i]}" = ours ] || note="   # row label '${A_LABEL[$i]}'"
   c=$(arm_corpus "$i")
   if [ -n "$c" ]; then
     var=CORPUS_N_$c
-    feedline="--tokens \"\$(head -n $dep $(corpus_file "$c") | paste -sd, -)\""
-    note="$note, $dep of the file's ${!var} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
+    feedline="--tokens \"\$(head -n $(arm_ids "$i") $(corpus_file "$c") | paste -sd, -)\""
+    note="$note, $(arm_ids "$i") of the file's ${!var} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
   fi
   arm_envs "$i"
   echo "timeout --kill-after=10 $BOUND ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} $feedline -n $N --place ${A_PLACE[$i]} --time${WARM:+ --warm $WARM}$note"
@@ -1842,10 +2218,11 @@ echo "    column is ours only. ==="
 [ ${#sums[@]} -eq 0 ] || printf '%s\n' "${sums[@]}" | awk -F'|' '{
   k = $1 " d=" $2; s[k] += $4; n[k]++; if ($5 != "") { sp[k] += $5; np[k]++ }
   if ($6 ~ /cold/) c[k]++
+  if ($7 != "") agg[k] = $7
   if (mn[k] == "" || $4 + 0 < mn[k] + 0) mn[k] = $4; if (mx[k] == "" || $4 + 0 > mx[k] + 0) mx[k] = $4
 } END { for (k in s) {
   spread = (mn[k] > 0) ? 100 * (mx[k] - mn[k]) / mn[k] : 0
-  printf "mean %-14s %8.2f tok/s  [%s..%s, spread %.2f%%]  %s (n=%d)  [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, (np[k] ? sprintf("%.2f tok/s(p50)", sp[k] / np[k]) : ""), n[k], c[k], n[k] } }' | sort
+  printf "mean %-14s %8.2f tok/s  [%s..%s, spread %.2f%%]  %s (n=%d)  [cold %d/%d]\n", k, s[k] / n[k], mn[k], mx[k], spread, (np[k] ? sprintf("%.2f tok/s(p50)", sp[k] / np[k]) : (k in agg ? sprintf("(aggregate of %d slots)", agg[k]) : "")), n[k], c[k], n[k] } }' | sort
 echo
 echo "=== ours / reference per depth: each round's ratio of the pair measured in that round, their"
 echo "    mean with its 95 % interval (Student t, rounds - 1 degrees of freedom; 2.0 past 21 rounds),"
@@ -1853,15 +2230,39 @@ echo "    the ratio of the arm means, and each side's tagged rows ==="
 deps=$(printf '%s\n' "${A_DEP[@]}" | sort -un | tr '\n' ' ')
 # The corpus labels have their own tables: their prompt is not the one ours and the references ran.
 corpus_re=${CORPORA// /|}
-refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)(@|$)" | sort -u | tr '\n' ' ')
+# The aggregate arms' labels (the header's <arm>@BLOOMERY_GEN_SLOTS=N): their own table below, out of the
+# decode tables, whose base is one stream.
+SLOT_LABELS=''
+for i in "${!ARMS[@]}"; do [ -z "${A_SLOTS[$i]}" ] || SLOT_LABELS+="${A_LABEL[$i]}"$'\n'; done
+# not_slots: the labels on stdin less the aggregate arms'.
+not_slots() { awk -v s="$SLOT_LABELS" 'BEGIN { n = split(s, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") x[a[i]] = 1 } !($0 in x)'; }
+refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -vx ours | grep -vE "^($corpus_re)(@|$)|@($corpus_re)(@|$)" | not_slots | sort -u | tr '\n' ' ')
 printf '%s\n' "${sums[@]}" | ratio_table "ratio d=" "$deps" "$refs" 6 ours
 for c in $CORPORA; do
-  c_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "^$c@|@$c(@|$)" | sort -u | tr '\n' ' ')
+  c_refs=$(printf '%s\n' "${A_LABEL[@]}" | grep -E "^$c@|@$c(@|$)" | not_slots | sort -u | tr '\n' ' ')
   [ -n "$c_refs" ] || continue
   echo
   echo "=== the $c prompt: $c / each $c@ arm per P, the same statistics ==="
   printf '%s\n' "${sums[@]}" | ratio_table "ratio $c d=" "$deps" "$c_refs" 6 "$c"
 done
+# The aggregate arms: each one's aggregate over its plain twin's tok/s(mean) (A_TWIN, slots_twin), the same
+# statistics.
+if [ -n "$SLOT_LABELS" ]; then
+  echo
+  echo "=== N slots in one pass: each aggregate arm's tok/s (Σ positions / Σ ms of its rounds) over its plain"
+  echo "    twin's tok/s per D or P, the same statistics; above 1 the N streams in one pass outrun one stream ==="
+  for i in "${!ARMS[@]}"; do
+    [ -n "${A_SLOTS[$i]}" ] || continue
+    sl=${A_LABEL[$i]} twin=${A_TWIN[$i]}
+    case " ${slots_done:-} " in *" $sl "*) continue ;; esac
+    slots_done="${slots_done:-} $sl"
+    if ! printf '%s\n' "${A_LABEL[@]}" | grep -qxF -- "$twin"; then
+      echo "ratio slots: $sl has no plain twin $twin among the arms: no ratio"
+      continue
+    fi
+    printf '%s\n' "${sums[@]}" | ratio_table "ratio slots d=" "$deps" "$twin" 6 "$sl"
+  done
+fi
 xbin_pairs
 xbin_tables decode sums "ratio xbin" "$deps" 6
 if [ ${#pp_sums[@]} -gt 0 ]; then

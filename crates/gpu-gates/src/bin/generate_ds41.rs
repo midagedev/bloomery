@@ -213,6 +213,37 @@
 //! the positions it keeps. The rows and lines are the lookup's; a
 //! `load draft=dspark` line follows the `load` line.
 //!
+//! `BLOOMERY_GEN_SLOTS=N` (unset or 1 is the one-sequence run above, line
+//! for line) decodes N streams in one pass (`GpuModel::step_slots`, the
+//! body's `SlotRows` pass of a row a slot; N past its `MAX_ROWS` is refused
+//! by name). The load plans N resident sequences
+//! (`PlanInputs::plan_with_slots`: each one's caches on the card, its ring
+//! shadows on the host), the `plan` record that plan's, and the session then
+//! serves N slots. Each arm's fed ids are N windows of equal length P, an id
+//! count N does not divide refused by name: slot j, from its reset, runs
+//! window j as the plain run's prompt call (its `fed`, `step 0` and, under a
+//! batched feed, `stat prefill` lines; the call's printed plan is a window's,
+//! P ids from position 0, and each slot's call is held to it). In graph mode
+//! the pass of a row a slot is captured next, outside every timed window;
+//! then `-n` − 1 rounds of one pass, each slot fed its own argmax, nothing
+//! printed between two rounds. After the rounds: each slot's `time prompt`,
+//! then per round each slot's `step` record and, under `--time`, the round's
+//! `time pass <i> ms= positions=N kind=slots` (the pass and its N ids'
+//! readback; `warm` on a round `--warm` drops), then each slot's `tokens`;
+//! every per-slot record in slot order. The `SMOKE` footer's p50 and mean
+//! are a round's, `prompt_tokens` and `depth` a window's, `steps` the counted
+//! rounds, and its `positions` and `tok/s(positions)` the counted rounds'
+//! positions and Σ positions · 1000 / Σ ms, the aggregate rate. Every arm of
+//! an `--arm` list after the first starts from every slot's reset and, on a
+//! load that runs the residency machine, the residency's seed (its `residency
+//! reset` record before its `arm` record), so it runs as in a fresh process.
+//! The residency boundaries after the seed's are the slots' prompt calls
+//! (`pass=prompt kept=0`, one or more a slot), then one a round
+//! (`pass=slots kept=N`, printed after the arm's lines). Refused by name before the load beside
+//! `BLOOMERY_DRAFT` (a draft verifies one sequence; the DSpark draft's feature
+//! tap is one sequence's), `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_STEP_STATS=1`
+//! and `--logits`, which this arm does not run.
+//!
 //! `BLOOMERY_CHECK_FINITE=1` runs every position the run steps — the fed ids
 //! and each generated token — first through the finite probe
 //! (`shared/ds41_finite.rs`): the position's step eagerly, outside the graph,
@@ -259,24 +290,32 @@ mod split;
 mod place;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/gen_slots.rs"]
+mod gen_slots;
+
+#[cfg(feature = "deepseek41")]
 mod drive {
+    use std::num::NonZeroUsize;
     use std::ops::Range;
     use std::time::{Duration, Instant};
 
     use app::arch::deepseek41::Ds41Cfg;
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
+    use bloomery_gpu::GpuError;
     use bloomery_gpu::head::Head;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, PAIR_ROWS};
+    use bloomery_gpu_deepseek41::body::{
+        self, Body, BodyMeta, Deepseek41Model, PAIR_ROWS, TierOpen,
+    };
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_deepseek41::swap;
     use bloomery_gpu_gates::generate::{Place, mode_name};
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{GateError, data_dir, ref_model_path};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, HOST_LOCK,
+        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LOCK,
         HOST_POPULATE, HOSTSTREAM, Levers, PIN_MAIN, PREFILL, PREFILL_GROUP, R8, RESIDENCY,
         ResidencyAt, ResidencyPick, ResidencyWhy, STEP_STATS,
     };
@@ -290,7 +329,7 @@ mod drive {
     };
 
     use crate::draft::{Draft, open_dspark};
-    use crate::{dspark, finite, place, split};
+    use crate::{dspark, finite, gen_slots, place, split};
 
     const USAGE: &str = "usage: generate_ds41 [--prompt-id P | --tokens a,b,c] [--depth D] \
                          [-n N] [--ctx C] [--place a|gate|bp|<stage>[+<tier>…]] \
@@ -626,6 +665,7 @@ mod drive {
         R8,
         RESIDENCY,
         HOSTSTREAM,
+        GEN_SLOTS,
     ];
 
     pub fn run() -> Result<(), GateError> {
@@ -661,9 +701,27 @@ mod drive {
         if a.plan {
             refuse_plan(&a, draft, batched)?;
         }
+        let slots = levers.gen_slots();
+        if slots > 1 {
+            gen_slots::refused::<Body>(
+                slots,
+                "deepseek41",
+                &[
+                    ("BLOOMERY_DRAFT", draft != Draft::Off),
+                    ("BLOOMERY_CHECK_FINITE=1", check_finite),
+                    ("BLOOMERY_STEP_STATS=1", a.stats),
+                    ("--logits", a.logits),
+                ],
+            )?;
+        }
         let pin_main = levers.pin_main();
         let pinned = pin_main && threads::pool().pin_caller();
         let runs = arm_runs(&a)?;
+        if slots > 1 {
+            for (i, r) in runs.iter().enumerate() {
+                gen_slots::windows(&r.ids, slots, &format!("arm {i}'s fed ids"))?;
+            }
+        }
         if runs.len() > 1 && (draft != Draft::Off || check_finite) {
             return Err(format!(
                 "{} arms after one load are refused with {}: its state has no clear",
@@ -686,12 +744,13 @@ mod drive {
         }
         // Positions 0 .. depth − 1 are the fed ids; the N − 1 feedback steps
         // take depth .. depth + N − 2. The plan is checked against the arm
-        // that steps the most positions.
+        // that steps the most positions. Under several slots each slot holds
+        // one window of the fed ids at its own positions.
         let widest = runs
             .iter()
-            .max_by_key(|r| r.ids.len() + r.a.n_gen)
+            .max_by_key(|r| r.ids.len() / slots + r.a.n_gen)
             .ok_or("generate_ds41: no arm to run")?;
-        let (depth, fed_n) = (widest.ids.len(), widest.a.n_gen);
+        let (depth, fed_n) = (widest.ids.len() / slots, widest.a.n_gen);
         let fed = depth + fed_n - 1;
         let draft_file = match draft {
             Draft::Dspark => Some(dspark::draft_hparams()?),
@@ -746,7 +805,11 @@ mod drive {
             ctx_max: 0,
             call: None,
         };
-        let Some(mut loaded) = Loaded::<Body>::open(file, args, &mut log)? else {
+        let opened = match NonZeroUsize::new(slots).filter(|n| n.get() > 1) {
+            Some(n) => open_slots(file, args, n, &mut log)?,
+            None => Loaded::<Body>::open(file, args, &mut log)?,
+        };
+        let Some(mut loaded) = opened else {
             return Ok(());
         };
         let hp = log
@@ -769,13 +832,16 @@ mod drive {
         // nothing.
         let mut s = loaded.ready(&mut log)?;
         if cfg.body.residency != Residency::Off {
-            // An arm's boundaries: its prompt call's, then at most one a
-            // generated token.
-            let passes = runs.iter().map(|r| r.a.n_gen).max().unwrap_or(0) + 2;
+            // An arm's boundaries: one a slot's prompt call, the first
+            // pass's, then at most one a generated token.
+            let passes = runs.iter().map(|r| r.a.n_gen).max().unwrap_or(0) + slots + 1;
             s.model_mut()
                 .body_parts("generate_ds41")?
                 .2
                 .log_residency(passes);
+        }
+        if slots > 1 {
+            s.add_slots(slots)?;
         }
         let mut check = if check_finite {
             let (gpu, w, _) = s.model_mut().body_parts("generate_ds41")?;
@@ -796,7 +862,16 @@ mod drive {
             call: batched && draft != Draft::Dspark,
             sync: a.sync,
             arms: runs.len(),
+            slots,
         };
+        if slots > 1 {
+            return s
+                .arms(&runs, |s, i, r| {
+                    let ran = arm_slots(s, &pre, i, r, feed_mode, call.as_ref());
+                    after_passes(s, ran)
+                })
+                .map_err(|f| Box::new(f) as GateError);
+        }
         if draft == Draft::Off && !check_finite {
             return s
                 .arms(&runs, |s, i, r| {
@@ -871,6 +946,129 @@ mod drive {
         Ok(())
     }
 
+    /// The load of a plan that counts `slots` resident sequences
+    /// (`PlanInputs::plan_with_slots`), told to `log` step for step as
+    /// [`Loaded::open`] tells it (`false` from its plan stops here:
+    /// `Ok(None)`), loaded by that same plan with the placement's expert tier
+    /// cards hung under the host tier ([`Body::open_placed_slots`]). The
+    /// session over it serves one slot until [`Session::add_slots`].
+    fn open_slots<M: Fn(usize) -> Machine>(
+        file: Split,
+        args: OpenArgs<Ds41Cfg, M>,
+        slots: NonZeroUsize,
+        log: &mut Log<'_>,
+    ) -> Result<Option<Loaded<Body>>, GateError> {
+        const WHAT: &str = "generate_ds41 open_slots";
+        let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let machine = (args.machine)(inputs.model.layers);
+        let plan = inputs
+            .plan_with_slots(
+                &machine,
+                u64::try_from(args.ctx)?,
+                &args.cfg.open.place,
+                slots,
+            )
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        if !log.plan(args.place, &inputs, &machine, &plan)? {
+            return Ok(None);
+        }
+        let ctx = u32::try_from(plan.ctx_max)
+            .map_err(|_| format!("the plan's ctx_max {} passes u32", plan.ctx_max))?;
+        let meta = BodyMeta {
+            hp: inputs.hp.clone(),
+            levers: args.cfg.open.body,
+        };
+        let tiers = TierOpen::of_machine(plan.machine);
+        let mut m = Body::open_placed_slots(file, &plan, 0, tiers, &meta, slots)?;
+        m.set_mode(args.mode);
+        log.load(&m)?;
+        Ok(Some(Loaded::from_model(m, args.cfg, ctx)))
+    }
+
+    /// Arm `i` as `pre.slots` streams in one pass (`BLOOMERY_GEN_SLOTS`, the
+    /// module doc): every slot past 0 back to its reset (slot 0 is fresh or
+    /// cleared by the arm list) and, past the first arm, the residency to
+    /// its seed, its record before the arm's; the arm's records; slot j's
+    /// window through the plain run's feed (`mode`, `call` the printed
+    /// plan's needs); in graph mode the pass of a row a slot captured; then
+    /// the rounds, and every line after them.
+    fn arm_slots(
+        s: &mut Session<Body>,
+        pre: &Prelude<'_>,
+        i: usize,
+        r: &ArmRun,
+        mode: body::PrefillMode,
+        call: Option<&CallView>,
+    ) -> Result<(), GateError> {
+        let (n, a) = (pre.slots, &r.a);
+        for j in 1..n {
+            s.select_slot(j)?;
+            s.clear()?;
+        }
+        s.select_slot(0)?;
+        if i > 0
+            && let Some(c) = s.residency_reset()?
+        {
+            record::residency_reset(&c).print();
+        }
+        let view = pre.arm(i, r)?;
+        let call = view.as_ref().or(call);
+        let windows = gen_slots::windows(&r.ids, n, "the arm's fed ids")?;
+        let w = windows[0].len();
+        let mut first = Vec::with_capacity(n);
+        let mut pos0 = Vec::with_capacity(n);
+        let mut feeds = Vec::with_capacity(n);
+        for (j, ids) in windows.into_iter().enumerate() {
+            s.select_slot(j)?;
+            let f = Fed {
+                ids,
+                prompt_len: r.prompt_len.saturating_sub(j * w).min(w),
+                mode,
+                need: call.map(|c| &c.need),
+                base: s.model().body("generate_ds41")?.hybrid().stats(),
+            };
+            let (tok, time) = feed(s, &mut runtime::Plain, &f, "steps")?;
+            first.push(tok);
+            pos0.push(s.pos());
+            feeds.push(time);
+        }
+        s.select_slot(0)?;
+        if a.mode == StepMode::Graph && a.n_gen > 1 {
+            gen_slots::capture(s, n)?;
+        }
+        let rounds = gen_slots::rounds(s, first, a.n_gen)?;
+        let warm = a.warm.unwrap_or(0);
+        for t in &feeds {
+            t.print();
+        }
+        for (k, &ms) in rounds.walls.iter().enumerate() {
+            let i = k + 1;
+            for (&p, ids) in pos0.iter().zip(&rounds.ids) {
+                print_step(i, p - 1 + u32::try_from(i)?, ids[i]);
+            }
+            if a.timed {
+                Record::new(&record::TIME_PASS)
+                    .u("i", i)
+                    .flag("warm", i <= warm)
+                    .f("ms", ms)
+                    .u("positions", n)
+                    .w("kind", "slots")
+                    .print();
+            }
+        }
+        for ids in &rounds.ids {
+            Record::new(&record::TOKENS).list("tokens", ids).print();
+        }
+        if a.timed {
+            let c = gen_slots::counted(&rounds.walls, warm, n)?;
+            smoke(a, r.prompt_len.min(w), w, warm, c.rounds, c.p50, c.mean)
+                .u("positions", c.positions)
+                .f("tok/s(positions)", c.aggregate)
+                .print();
+        }
+        Ok(())
+    }
+
     /// One arm of the run: its arguments (its own `-n`), its fed ids, how
     /// many of them are the prompt's, and the `--arm` it came from (none for
     /// a run of the prompt flags).
@@ -938,11 +1136,15 @@ mod drive {
         call: bool,
         sync: bool,
         arms: usize,
+        /// `BLOOMERY_GEN_SLOTS`: each slot's call runs one window of an arm's
+        /// fed ids.
+        slots: usize,
     }
 
     impl Prelude<'_> {
         /// Arm `i`'s records and its pacing; its call's plan, which a run of
-        /// the prompt flags printed before the load instead.
+        /// the prompt flags printed before the load instead — under several
+        /// slots a window's call, which each slot runs.
         fn arm(&self, i: usize, r: &ArmRun) -> Result<Option<CallView>, GateError> {
             let Some(spec) = r.spec else {
                 return Ok(None);
@@ -966,7 +1168,7 @@ mod drive {
             }
             let view = self
                 .call
-                .then(|| CallView::of(self.cfg, self.hp, self.ctx_max, r.ids.len()));
+                .then(|| CallView::of(self.cfg, self.hp, self.ctx_max, r.ids.len() / self.slots));
             if let Some(c) = &view {
                 c.print(false, self.hp, &[]);
             }
@@ -1334,10 +1536,11 @@ mod drive {
         draft: Draft,
         batched: bool,
         check_finite: bool,
-        /// The fed ids of the arm that steps the most positions.
+        /// The fed ids of the arm that steps the most positions; under
+        /// several slots, one window of them, a slot's.
         depth: usize,
-        /// The positions that arm steps: its fed ids and its N − 1 feedback
-        /// steps.
+        /// The positions that arm steps (a slot of it steps): its fed ids
+        /// and its N − 1 feedback steps.
         fed: usize,
         /// That arm's `-n`.
         fed_n: usize,
