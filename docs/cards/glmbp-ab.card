@@ -38,6 +38,13 @@
 # term above: +4.7..+16.3 %, median +11.7, written outward as +4.5..+16.5. The edge nearest 0 is the front at
 # 0.34 ms, latent layers x1.3 and c_two card-side. A front of 0.37 (h at the 147.7 GB/s peak, not the measured
 # slot rate) would put that edge at +2.5 %.
+# Break-even for the census rule: the seat's unset --place picks bp only when the bp plan's tier holds at least E*
+# experts, E* = 526 [derived] (13.5 a layer on the 39 card-routable layers). The same band, every grid term above, with
+# the tier's count swept (the replay's away set spread over the layers as the plan spreads it; the A6000's 2,566, alpha
+# 0.829): lower bound -0.33 % at 468 experts, -0.01 at 507, +0.09 at 526, +1.64 at 780, +4.69 at 1,501 (this pair).
+# The gain grows with the host slots the tier takes off the host leg; the A6000 front and c_two stay per row-layer or
+# per pass, so a small tier pays them for little. A sitting whose lower bound reads below the band's re-derives E*
+# from the measured gain before the rule ships.
 # Acceptance: the tier runs its ids (n_l..n_l+t_l, about 66..104) on card kernels where (a) runs them on the host,
 # and the residency picks other flips, so the greedy streams may part and each arm keeps its own positions a
 # pass, the same every round: a bias, not a scatter. The band is a pass-time effect: the verdict reads the tok/s
