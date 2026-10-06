@@ -47,11 +47,19 @@
 //!   of it by the HC_POST launch's own rule — the new streams and, except
 //!   into an engram layer and after the last layer, the next sub-layer's
 //!   fold. The combine's output is written too, for a gate to read.
+//! - Where the boundary's page carries host rows — the rows form, a page
+//!   whose join sums every slot in slot order from wherever its place
+//!   computes it — the join's launch is the rows form's instead
+//!   (`ds41_ffn_post_rows`, `ds41_ffn_post_rows_streams`;
+//!   [`FfnKernels::enqueue_post_rows`]): the combine ([`combine_rows_elem`])
+//!   of every slot, a card slot's row the card's `down` and a host slot's
+//!   the page's rows at its host ordinal, then [`join_rows_elem`].
 //! - The join is built for 6 slots a token (this piece's) and 8 (`_8`
 //!   entries, for a program with eight), the handoff also for 10: their
 //!   launchers ([`FfnKernels::enqueue_handoff`], [`FfnKernels::enqueue_post`])
 //!   pick the entry from the slot count (the handoff's own table,
-//!   [`Slots::of`] for the join) and refuse any other by name.
+//!   [`Slots::of`] for the join) and refuse any other by name. The rows
+//!   join's entries are built for this piece's six alone.
 //!
 //! Launches per layer: ten kernels with card experts, seven without (one more
 //! each for a shared down projection that reads q8_1), and
@@ -108,7 +116,7 @@ pub use batch::{
     BatchLayer, BlockIo, CardAcc, CardAccTier, CardGather, ChunkIo, FfnBatch, FfnBatchKernels,
     JoinIo, Places, TiledGateUp,
 };
-pub use tier::{Ds41Tier, STAGE_TIER, TierPiece};
+pub use tier::{Ds41Tier, STAGE_TIER, TierPiece, load_tier_kernels};
 
 /// What the enqueue path's errors name.
 const ENQUEUE: &str = "FfnPiece::enqueue";
@@ -170,6 +178,39 @@ pub fn card_sum_elem(down: [f32; N_USED], w: [f32; N_USED], card: [bool; N_USED]
 #[inline(always)]
 pub fn join_elem(acc: f32, hsum: f32, shexp: f32) -> f32 {
     (acc + hsum) + shexp
+}
+
+/// The rows join's chain: every slot's row in slot order, `acc =
+/// fma(row_j, w_j, acc)` from zero — the tier-blind rule, the same bits
+/// whichever of the stage card, the tier or the host computed each row
+/// ([`combine_rows_elem`]'s half).
+#[inline(always)]
+pub fn sum_rows_elem(down: [f32; N_USED], w: [f32; N_USED]) -> f32 {
+    let mut acc = 0.0f32;
+    let mut j = 0usize;
+    while j < N_USED {
+        acc = down[j].mul_add(w[j], acc);
+        j += 1;
+    }
+    acc
+}
+
+/// The rows join's final add: the slot-order sum, then the shared expert's
+/// output, as [`join_elem`] reads an empty host sum — `(acc + 0.0) + shexp`.
+/// The `+ 0.0` is the sum an empty host list wrote under the split join, kept
+/// so a layer whose slots all sit on the stage card keeps its bits.
+#[inline(always)]
+pub fn join_rows_elem(acc: f32, shexp: f32) -> f32 {
+    join_elem(acc, 0.0, shexp)
+}
+
+/// The combine of one output value under the rows join: [`sum_rows_elem`]
+/// over every slot's row in slot order, then [`join_rows_elem`]. The rows
+/// arrive gathered from wherever each slot's place computes it; the one rule
+/// the device and a gate's host side both run.
+#[inline(always)]
+pub fn combine_rows_elem(down: [f32; N_USED], w: [f32; N_USED], shexp: f32) -> f32 {
+    join_rows_elem(sum_rows_elem(down, w), shexp)
 }
 
 #[cuda_module]
@@ -430,6 +471,140 @@ mod ffn_kernels {
             store4(&mut out, rows, d, o);
         }
     }
+
+    /// The rows join's combine and HC_POST with the next fold —
+    /// [`combine_post_rows_at`] — of six slots a token: every slot summed in
+    /// slot order, its row read from the stage card's `down` or the host's
+    /// `hrows` by its place. `k_host` is the page's rows bound, at least the
+    /// token's host slots (the caller sized it from the plan).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 6 * rows,
+            w.len() >= 6,
+            sel.len() >= 6,
+            hrows.len() >= k_host * rows,
+            k_host <= 6,
+            shexp.len() >= rows,
+            res.len() >= 4 * rows,
+            hc.len() >= 24,
+            y.len() >= rows,
+            out.len() >= 4 * rows,
+            fold.len() >= rows
+        )
+    )]
+    pub fn ds41_ffn_post_rows(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        hrows: &[f32],
+        shexp: &[f32],
+        res: &[f32],
+        hc: &[f32],
+        rows: u32,
+        n_card: u32,
+        k_host: u32,
+        mut y: DisjointSlice<f32>,
+        mut out: DisjointSlice<f32>,
+        mut fold: DisjointSlice<f32>,
+    ) {
+        let d = thread::index_1d().get();
+        let rows = rows as usize;
+        if d >= rows {
+            return;
+        }
+        let a = PostRowsIn {
+            down,
+            w,
+            sel,
+            hrows,
+            shexp,
+            res,
+            hc,
+        };
+        // SAFETY: d < rows, and the launch contract gives every length the
+        // helper's contract asks for.
+        let (yv, o, pre) = unsafe { combine_post_rows_at(&a, rows, [n_card, k_host], d) };
+        // SAFETY: d < rows <= y.len() and fold.len(), and d + 3·rows < 4·rows
+        // <= out.len(), by the launch contract; thread d is the only writer
+        // of y[d], fold[d] and the four stream values at d.
+        unsafe {
+            *y.get_unchecked_mut(d) = yv;
+            store4(&mut out, rows, d, o);
+            *fold.get_unchecked_mut(d) = hc_fold_elem(o, pre);
+        }
+    }
+
+    /// [`ds41_ffn_post_rows`] without the fold: into an engram layer and
+    /// after the last layer.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 6 * rows,
+            w.len() >= 6,
+            sel.len() >= 6,
+            hrows.len() >= k_host * rows,
+            k_host <= 6,
+            shexp.len() >= rows,
+            res.len() >= 4 * rows,
+            hc.len() >= 24,
+            y.len() >= rows,
+            out.len() >= 4 * rows
+        )
+    )]
+    pub fn ds41_ffn_post_rows_streams(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        hrows: &[f32],
+        shexp: &[f32],
+        res: &[f32],
+        hc: &[f32],
+        rows: u32,
+        n_card: u32,
+        k_host: u32,
+        mut y: DisjointSlice<f32>,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let d = thread::index_1d().get();
+        let rows = rows as usize;
+        if d >= rows {
+            return;
+        }
+        let a = PostRowsIn {
+            down,
+            w,
+            sel,
+            hrows,
+            shexp,
+            res,
+            hc,
+        };
+        // SAFETY: d < rows (checked above), and the launch contract gives
+        // every length the helper's contract asks for.
+        let (yv, o, _) = unsafe { combine_post_rows_at(&a, rows, [n_card, k_host], d) };
+        // SAFETY: d < rows <= y.len() and d + 3·rows < 4·rows <= out.len(),
+        // by the launch contract; thread d is the only writer of y[d] and the
+        // four stream values at d.
+        unsafe {
+            *y.get_unchecked_mut(d) = yv;
+            store4(&mut out, rows, d, o);
+        }
+    }
 }
 
 /// What the combine-and-HC_POST launches read: `down` the six slots' down
@@ -540,6 +715,109 @@ unsafe fn store4(out: &mut DisjointSlice<f32>, rows: usize, d: usize, o: [f32; 4
         *out.get_unchecked_mut(d + 2 * rows) = o[2];
         *out.get_unchecked_mut(d + 3 * rows) = o[3];
     }
+}
+
+/// What the rows join's combine-and-HC_POST launches read: `down` the six
+/// slots' down outputs slot-major (`rows` each), `w` the six routing
+/// weights, `sel` each slot's place (the card's below `n_card`), `hrows` the
+/// host's rows — its host slots' unweighted down outputs, packed in slot
+/// order, `rows` each — `shexp` the shared expert's output, `res` the four
+/// streams the sub-layer read (`rows` each) and `hc` its HC_PRE result.
+struct PostRowsIn<'a> {
+    down: &'a [f32],
+    w: &'a [f32],
+    sel: &'a [u32],
+    hrows: &'a [f32],
+    shexp: &'a [f32],
+    res: &'a [f32],
+    hc: &'a [f32],
+}
+
+/// Value `d`'s combine under the rows join ([`combine_rows_elem`]), then
+/// HC_POST of it (`hc_post_elem`, the HC_POST launch's own rule): every slot
+/// `j` in slot order — a card slot's row `a.down[j·rows + d]`, a host slot's
+/// `a.hrows[k·rows + d]` at its host ordinal `k`, the host slots counted in
+/// the same scan — then [`join_rows_elem`]. The combine's `y`, the four new
+/// stream values and `pre`.
+///
+/// SAFETY: `d < rows`, `down.len() >= 6 * rows`, `w.len()` and `sel.len() >=
+/// 6`, `hrows.len() >= n[1] * rows` with the token's host slots at most
+/// `n[1]`, `shexp.len() >= rows`, `res.len() >= 4 * rows` and `hc.len() >=
+/// 24`.
+#[inline(always)]
+unsafe fn combine_post_rows_at(
+    a: &PostRowsIn<'_>,
+    rows: usize,
+    n: [u32; 2],
+    d: usize,
+) -> (f32, [f32; 4], [f32; 4]) {
+    let mut dv = [0.0f32; N_USED];
+    let mut wv = [0.0f32; N_USED];
+    let mut k_host = 0usize;
+    let mut j = 0usize;
+    while j < N_USED {
+        // SAFETY: j < 6 <= sel.len() and w.len() by this fn's contract.
+        let (place, wj) = unsafe { (*a.sel.get_unchecked(j), *a.w.get_unchecked(j)) };
+        wv[j] = wj;
+        if place < n[0] {
+            // SAFETY: j < 6 and d < rows, so j·rows + d < 6·rows <=
+            // down.len() by this fn's contract.
+            dv[j] = unsafe { *a.down.get_unchecked(j * rows + d) };
+        } else {
+            // SAFETY: the host slots before this one number `k_host`, at
+            // most the token's host slots minus one, so k_host < n[1] and
+            // k_host·rows + d < n[1]·rows <= hrows.len() by this fn's
+            // contract.
+            dv[j] = unsafe { *a.hrows.get_unchecked(k_host * rows + d) };
+            k_host += 1;
+        }
+        j += 1;
+    }
+    // SAFETY: d < rows <= shexp.len(); d + 3·rows < 4·rows <= res.len();
+    // 23 < 24 <= hc.len() — all by this fn's contract.
+    let (sh, r, pre, post, comb) = unsafe {
+        (
+            *a.shexp.get_unchecked(d),
+            [
+                *a.res.get_unchecked(d),
+                *a.res.get_unchecked(d + rows),
+                *a.res.get_unchecked(d + 2 * rows),
+                *a.res.get_unchecked(d + 3 * rows),
+            ],
+            [
+                *a.hc.get_unchecked(0),
+                *a.hc.get_unchecked(1),
+                *a.hc.get_unchecked(2),
+                *a.hc.get_unchecked(3),
+            ],
+            [
+                *a.hc.get_unchecked(4),
+                *a.hc.get_unchecked(5),
+                *a.hc.get_unchecked(6),
+                *a.hc.get_unchecked(7),
+            ],
+            [
+                *a.hc.get_unchecked(8),
+                *a.hc.get_unchecked(9),
+                *a.hc.get_unchecked(10),
+                *a.hc.get_unchecked(11),
+                *a.hc.get_unchecked(12),
+                *a.hc.get_unchecked(13),
+                *a.hc.get_unchecked(14),
+                *a.hc.get_unchecked(15),
+                *a.hc.get_unchecked(16),
+                *a.hc.get_unchecked(17),
+                *a.hc.get_unchecked(18),
+                *a.hc.get_unchecked(19),
+                *a.hc.get_unchecked(20),
+                *a.hc.get_unchecked(21),
+                *a.hc.get_unchecked(22),
+                *a.hc.get_unchecked(23),
+            ],
+        )
+    };
+    let y = combine_rows_elem(dv, wv, sh);
+    (y, hc_post_elem(y, r, post, &comb), pre)
 }
 
 /// Value `d`'s combine of `N` slots, then HC_POST of it: [`combine_post_at`]
@@ -890,6 +1168,62 @@ impl FfnKernels {
         }
         Ok(())
     }
+
+    /// Enqueue the rows join's combine and HC_POST of `p.n_used` slots a
+    /// token (`ds41_ffn_post_rows`/`ds41_ffn_post_rows_streams` for 6; any
+    /// other count is refused by name — the entries below six slots are the
+    /// next model's to add), one thread per value `d < p.rows`: every slot
+    /// summed in slot order, its row the card's `down` or the host's `hrows`
+    /// by its place, the combine's `y[d]`, the four new streams at `d` into
+    /// `out` and, when `fold` is given, their fold by the HC_PRE result's
+    /// `pre` into it. One launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_post_rows(
+        &self,
+        stream: &CudaStream,
+        p: &PostRows<'_>,
+        y: &mut DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+        fold: Option<&mut DeviceBuffer<f32>>,
+    ) -> Result<(), GpuError> {
+        let what = match fold.is_some() {
+            true => "ds41_ffn_post_rows",
+            false => "ds41_ffn_post_rows_streams",
+        };
+        if p.n_used != N_USED {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{} slots a token: the rows join's entries are built for {N_USED}",
+                    p.n_used
+                ),
+            });
+        }
+        let grid = launch_u32(what, "grid", p.rows.div_ceil(POST_THREADS as usize))?;
+        let cfg = LaunchConfig1D::new(grid, POST_THREADS, 0);
+        let (rows, n_card, k_host) = (
+            launch_u32(what, "rows", p.rows)?,
+            launch_u32(what, "n_card", p.n_card)?,
+            launch_u32(what, "k_host", p.host_rows)?,
+        );
+        let m = &self.module;
+        match fold {
+            Some(fold) => {
+                let prep = m.prepare_ds41_ffn_post_rows(cfg)?;
+                m.ds41_ffn_post_rows(
+                    stream, &prep, p.down, p.w, p.sel, p.hrows, p.shexp, p.res, p.hc, rows, n_card,
+                    k_host, y, out, fold,
+                )?;
+            }
+            None => {
+                let prep = m.prepare_ds41_ffn_post_rows_streams(cfg)?;
+                m.ds41_ffn_post_rows_streams(
+                    stream, &prep, p.down, p.w, p.sel, p.hrows, p.shexp, p.res, p.hc, rows, n_card,
+                    k_host, y, out,
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// What [`FfnKernels::enqueue_post`] reads: `down` the `n_used` slots' down
@@ -909,6 +1243,25 @@ pub struct Post<'a> {
     pub rows: usize,
     pub n_card: usize,
     pub n_used: usize,
+}
+
+/// What [`FfnKernels::enqueue_post_rows`] reads: [`Post`]'s, with the host's
+/// `hrows` — its host slots' unweighted down rows, packed in slot order,
+/// `rows` each, `host_rows` of them — in place of `hsum`, and every slot
+/// summed in slot order by its place (`ds41_ffn_post_rows` for 6 slots; any
+/// other count is refused by name).
+pub struct PostRows<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub hrows: &'a DeviceBuffer<f32>,
+    pub shexp: &'a DeviceBuffer<f32>,
+    pub res: &'a DeviceBuffer<f32>,
+    pub hc: &'a DeviceBuffer<f32>,
+    pub rows: usize,
+    pub n_card: usize,
+    pub n_used: usize,
+    pub host_rows: usize,
 }
 
 /// The join's instance for `n_used` slots a token ([`Slots::of`]), or
@@ -1650,8 +2003,10 @@ impl FfnPiece {
         Ok(())
     }
 
-    /// The join on row `row`'s buffers and host sum: the combine and HC_POST
-    /// in one launch, with the next fold where the layer folds.
+    /// The join on row `row`'s buffers and host side: the combine and HC_POST
+    /// in one launch, with the next fold where the layer folds — the rows
+    /// join where the boundary's page carries host rows, the split sum's
+    /// entries where it carries the host's weighted sum.
     fn enqueue_join(
         &mut self,
         gpu: &Gpu,
@@ -1660,13 +2015,36 @@ impl FfnPiece {
         io: FfnIo<'_>,
         boundary: &Boundary,
     ) -> Result<(), GpuError> {
-        let hsum = boundary.hsum_of(row)?;
+        let host_rows = boundary.layout().host_rows();
+        let host = boundary.hsum_of(row)?;
         let r = &mut self.rows[row];
+        if host_rows > 0 {
+            let p = PostRows {
+                down: &r.down,
+                w: &r.rout.weights,
+                sel: &r.sel,
+                hrows: host,
+                shexp: &r.sh_y,
+                res: io.streams,
+                hc: &r.hc_out,
+                rows: self.n_embd,
+                n_card: self.cfg[i].n_card,
+                n_used: N_USED,
+                host_rows,
+            };
+            return self.kernels.enqueue_post_rows(
+                gpu.stream(),
+                &p,
+                &mut r.y,
+                io.streams_out,
+                io.fold_out,
+            );
+        }
         let p = Post {
             down: &r.down,
             w: &r.rout.weights,
             sel: &r.sel,
-            hsum,
+            hsum: host,
             shexp: &r.sh_y,
             res: io.streams,
             hc: &r.hc_out,
@@ -1856,6 +2234,49 @@ impl HostExperts for Ds41Host {
             None => union.insert(union_scratch(*embd, *ff, *n_used)?),
         };
         view.experts_union_into(file.source(), x, lists, out, scratch)?;
+        Ok(())
+    }
+
+    fn experts_rows_into(
+        &mut self,
+        layer: usize,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let view = host_view(
+            &self.layers,
+            self.first,
+            layer,
+            "Ds41Host::experts_rows_into",
+        )?;
+        view.experts_rows_into(self.file.source(), x, experts, out, &mut self.scratch)?;
+        Ok(())
+    }
+
+    fn experts_union_rows_into(
+        &mut self,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let Ds41Host {
+            file,
+            layers,
+            first,
+            union,
+            embd,
+            ff,
+            n_used,
+            ..
+        } = self;
+        let view = host_view(layers, *first, layer, "Ds41Host::experts_union_rows_into")?;
+        let scratch = match union {
+            Some(s) => s,
+            None => union.insert(union_scratch(*embd, *ff, *n_used)?),
+        };
+        view.experts_union_rows_into(file.source(), x, lists, out, scratch)?;
         Ok(())
     }
 }

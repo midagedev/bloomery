@@ -120,7 +120,14 @@ gpu 1573 171 6
 # chain/ffn/batch.rs 57 -> 41 blocks, 5 -> 6 fns: the bucket pass moved to the gpu crate, the gather and the tile
 # prologue taken from it, and Q3GateUpTiles::run and Q3Planes::copy (the two methods its tile cores call) in place
 # of gather_at; each with its SAFETY line.
-gpu-deepseek41 448 53 0
+# PIN(2026-10-06): gpu-deepseek41 448 -> 486 blocks, 53 -> 58 fns, new kernel entries, not old code relaxed:
+# the rows join (every slot in slot order from wherever its place computes it) adds its device halves —
+# ds41_ffn_post_rows and _rows_streams (ffn.rs), ds41_ffn_post_rows_tier and _rows_streams_tier (ffn/tier.rs),
+# ds41_ffn_card_acc_rows, _8, _rows_tier, _8_tier, ds41_ffn_post_batch_rows and _rows_streams (ffn/batch.rs) —
+# each entry its helper call and store blocks, and the helpers combine_post_rows_at, combine_post_rows_tier_at,
+# card_acc_rows_at, card_acc_rows_tier_at and join_post_rows_at (the unsafe fns, their place and row reads), each
+# with its SAFETY line.
+gpu-deepseek41 486 58 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.
@@ -138,7 +145,11 @@ levers 0 0 0
 # PIN(2026-10-06): model 114 -> 117 blocks, 11 -> 13 impls, new code, not old code relaxed: bench_v41_host's
 # unioncard arm hands its pool chunks disjoint cells through ChunkPtr (the Send and Sync impls; write, read and
 # with_mut, one block each), each with its SAFETY line.
-model 117 30 13
+# PIN(2026-10-06): model 117 -> 119 blocks, 30 -> 31 fns, 13 -> 15 impls, new code, not old code relaxed: the
+# union's rows handback (moe.rs, each column's host slots' unweighted down rows) copies the downs its call left in
+# the store slab out to the caller's rows — RowsOut with its Send/Sync impls and rows_mut (the one unsafe fn), the
+# pool split's per-column slice, each with its SAFETY line.
+model 119 31 15
 models 0 0 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row

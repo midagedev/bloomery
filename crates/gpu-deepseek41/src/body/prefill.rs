@@ -61,6 +61,14 @@
 //! join. The tier's fault word is read beside the card's at a group's end and
 //! when a group fails, the tier's stream drained first.
 //!
+//! Under the rows join (the boundary page's host rows, every V4.1 load): the
+//! exchange hands each host slot's unweighted down row back, and the shadow
+//! holds every block's routing — its card sum reads the uploaded rows, so it
+//! waits for the post, past the group's next route — tiered or not. The post
+//! uploads, then runs the card sum over every slot in slot order from
+//! wherever its place computes it ([`FfnPiece::enqueue_batch_acc_rows`], or
+//! `_tier` once the tier's rows have landed), then the rows join.
+//!
 //! Under host streaming (`BLOOMERY_HOSTSTREAM=on`, a residency machine, a
 //! call of at least [`STREAM_MIN_P`] positions) a group moves each layer's
 //! residency pool toward the experts its first batch with a block routes
@@ -1333,9 +1341,10 @@ fn reads_q8(w: &Weights, name: &str) -> bool {
 /// form when the down reads one, the down and past one token its copy
 /// token-major; then over the block the buckets, the tile table, the gather
 /// into run order, the gate·up, its q8_1 form and the down when there are
-/// card experts, and the card sum — or, on a `tiered` layer, whose card sum
-/// the post runs, the three copies of the block's routing it holds for it.
-fn shadow_entries(w: &Weights, l: usize, chunks: &[Range<usize>], card: bool, tiered: bool) -> u64 {
+/// card experts, and the card sum — or, when `held` (a `tiered` layer, whose
+/// card sum the post runs, or the rows join, whose card sum waits for the
+/// host's upload), the three copies of the block's routing it holds for it.
+fn shadow_entries(w: &Weights, l: usize, chunks: &[Range<usize>], card: bool, held: bool) -> u64 {
     let q3k = |name: &str| {
         matches!(
             w.get(name),
@@ -1356,7 +1365,7 @@ fn shadow_entries(w: &Weights, l: usize, chunks: &[Range<usize>], card: bool, ti
             2 + routed + gate_up + u64::from(down_q8) + 1 + u64::from(m > 1)
         })
         .sum();
-    per_chunk + if card { 6 } else { 0 } + if tiered { 3 } else { 1 }
+    per_chunk + if card { 6 } else { 0 } + if held { 3 } else { 1 }
 }
 
 /// The positions `b .. b + u` cut into chunks: at every multiple of
@@ -1659,7 +1668,14 @@ impl Body {
         let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
         let params = DeviceBuffer::zeroed(stream, sets * CHUNKS_MAX * words)?;
         let glue = self.glue.batch(gpu, image.layout())?;
-        let mut ffn = FfnBatch::new(gpu, n, hp.experts.ff, [T_MAX, sets], self.tier.is_some())?;
+        let mut ffn = FfnBatch::new(
+            gpu,
+            n,
+            hp.experts.ff,
+            [T_MAX, sets],
+            self.tier.is_some(),
+            self.hybrid.boundary().layout().host_rows(),
+        )?;
         if self.levers.hoststream {
             ffn.enable_stream(stream)?;
         }
@@ -2760,7 +2776,13 @@ impl<'a> GroupCx<'a> {
         let batch = &mut *self.batch;
         let own = set_of(&mut batch.sets, m.set)?;
         let card = CardStacks::of(w, l)?;
-        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.is_some(), tiered);
+        let entries = shadow_entries(
+            w,
+            l,
+            &m.cuts[r.full..],
+            card.is_some(),
+            tiered || batch.ffn.host_rows() > 0,
+        );
         let block = BlockIo {
             set: m.set,
             chunks: &m.cuts[r.full..],
@@ -2830,7 +2852,13 @@ impl<'a> GroupCx<'a> {
         self.ffn
             .enqueue_batch_block_kept(gpu, bl, card, &mut batch.ffn, &block)?;
         // The shadow's entries and the places taken again.
-        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.is_some(), tiered);
+        let entries = shadow_entries(
+            w,
+            l,
+            &m.cuts[r.full..],
+            card.is_some(),
+            tiered || batch.ffn.host_rows() > 0,
+        );
         self.tally.shadow(i, m.set, entries + 1)
     }
 
@@ -2918,21 +2946,63 @@ impl<'a> GroupCx<'a> {
         let own = set_of(&mut batch.sets, m.set)?;
         if r.block.is_some() {
             let key = m.key(l, r.at);
+            let rows_form = batch.ffn.host_rows() > 0;
             if tiered {
-                let rows = self.hybrid.tier_rows_of(key, STAGE_TIER)?;
-                self.ffn.enqueue_batch_acc_tier(
-                    gpu,
-                    &mut batch.ffn,
-                    [l, m.set, n_tier],
-                    [r.at, m.u],
-                    rows,
-                )?;
-                // The card sum over both cards' slots, one launch.
+                if rows_form {
+                    // The tier's rows settle, the host's rows upload, and the
+                    // tier's come back for the card sum that follows it on
+                    // the stream — it reads the uploaded rows and the tier's
+                    // together.
+                    let rows = self.hybrid.upload_and_tier_rows(
+                        gpu.stream(),
+                        batch.ffn.handback_mut(),
+                        key,
+                        STAGE_TIER,
+                    )?;
+                    // The host's rows' copy to the card.
+                    self.tally.route(i, m.set, 1)?;
+                    self.ffn.enqueue_batch_acc_rows_tier(
+                        gpu,
+                        &mut batch.ffn,
+                        [l, m.set, n_tier],
+                        [r.at, m.u],
+                        rows,
+                    )?;
+                    // The card sum over both cards' and the host's slots, one
+                    // launch.
+                    self.tally.route(i, m.set, 1)?;
+                } else {
+                    let rows = self.hybrid.tier_rows_of(key, STAGE_TIER)?;
+                    self.ffn.enqueue_batch_acc_tier(
+                        gpu,
+                        &mut batch.ffn,
+                        [l, m.set, n_tier],
+                        [r.at, m.u],
+                        rows,
+                    )?;
+                    // The card sum over both cards' slots, one launch.
+                    self.tally.route(i, m.set, 1)?;
+                    batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
+                    // The host sums' copy to the card.
+                    self.tally.route(i, m.set, 1)?;
+                }
+            } else {
+                batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
+                // The host's handback's copy to the card.
                 self.tally.route(i, m.set, 1)?;
+                if rows_form {
+                    // The shadow held the routing for the rows join's card
+                    // sum, which reads the uploaded rows: past the group's
+                    // next route, one launch.
+                    self.ffn.enqueue_batch_acc_rows(
+                        gpu,
+                        &mut batch.ffn,
+                        [l, m.set],
+                        [r.at, m.u],
+                    )?;
+                    self.tally.route(i, m.set, 1)?;
+                }
             }
-            batch.ffn.enqueue_upload(gpu, self.hybrid, key)?;
-            // The host sums' copy to the card.
-            self.tally.route(i, m.set, 1)?;
             let (sin, sout) = ping(&mut own.hc, m.cur.s);
             let (_, fout) = ping(&mut own.folds, m.cur.f);
             self.ffn.enqueue_batch_join(

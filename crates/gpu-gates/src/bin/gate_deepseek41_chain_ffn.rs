@@ -117,7 +117,8 @@ mod gate {
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError, NodeInfo, Q8Act};
     use bloomery_gpu_deepseek41::chain::ffn::{
-        CardStacks, Ds41Host, FfnIo, FfnKernels, FfnPiece, Post, combine_elem,
+        CardStacks, Ds41Host, FfnIo, FfnKernels, FfnPiece, Post, PostRows, combine_elem,
+        combine_rows_elem, load_tier_kernels,
     };
     use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels};
@@ -133,7 +134,7 @@ mod gate {
         no_local_depot, q8_1_dequant, ref_model_path, ref_tensor_of_in, row_bytes,
         topk_ids_logical_within, verdict,
     };
-    use cuda_core::{CudaStream, DeviceBuffer, sys};
+    use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D, sys};
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row};
     use model::Tensor2;
@@ -930,7 +931,9 @@ mod gate {
         down: Vec<f32>,
         sh_h: Vec<f32>,
         sh: Vec<f32>,
-        hsum: Vec<f32>,
+        /// The page's host rows, its written ones: row `i` the `i`-th host
+        /// slot's unweighted down, in slot order.
+        host_rows: Vec<f32>,
         y: Vec<f32>,
         hc: Vec<f32>,
         streams: Vec<f32>,
@@ -951,7 +954,7 @@ mod gate {
             ("down", bits_equal(&a.down, &b.down)),
             ("shexp_h", bits_equal(&a.sh_h, &b.sh_h)),
             ("shexp", bits_equal(&a.sh, &b.sh)),
-            ("hsum", bits_equal(&a.hsum, &b.hsum)),
+            ("host_rows", bits_equal(&a.host_rows, &b.host_rows)),
             ("y", bits_equal(&a.y, &b.y)),
             ("hc", bits_equal(&a.hc, &b.hc)),
             ("streams", bits_equal(&a.streams, &b.streams)),
@@ -1172,7 +1175,8 @@ mod gate {
         let s_in = streams.to_host_vec(stream)?;
 
         // The host's share: the slots the map sends to the host, in slot
-        // order, with the op path's own activation.
+        // order, with the op path's own activation — the rows form, each
+        // listed slot's unweighted down row, the join to weight.
         let list: Vec<(u32, f32)> = (0..N_USED)
             .filter(|&j| sel[j] as usize >= lc.n_card)
             .map(|j| (ids[j], weights[j]))
@@ -1180,13 +1184,13 @@ mod gate {
         let slots: Vec<usize> = (0..N_USED)
             .filter(|&j| sel[j] as usize >= lc.n_card)
             .collect();
-        let mut hsum = vec![0.0f32; n];
+        let mut rows = vec![0.0f32; N_USED * n];
         let mut host_slots = Vec::with_capacity(list.len());
         let hl = lc
             .host
             .ok_or_else(|| format!("layer {l}: no host view of a routed layer"))?;
         let xt = Tensor2::from_vec(n, 1, x.clone());
-        hl.experts_into(R8Source::rows(split), &xt, &list, &mut hsum, &mut op.host)?;
+        hl.experts_rows_into(R8Source::rows(split), &xt, &list, &mut rows, &mut op.host)?;
         for (i, &slot) in slots.iter().enumerate() {
             host_slots.push(HostSlot {
                 slot,
@@ -1194,14 +1198,24 @@ mod gate {
                 down: op.host.down(i).data.clone(),
             });
         }
+        let host_rows = rows[..slots.len() * n].to_vec();
 
-        let card: [bool; N_USED] = std::array::from_fn(|j| (sel[j] as usize) < lc.n_card);
-        let wv: [f32; N_USED] = std::array::from_fn(|j| if card[j] { weights[j] } else { 0.0 });
+        // The combine under the rows join: every slot's row in slot order —
+        // the card's from its down buffer, a host slot's from its row — then
+        // the shared expert's output.
+        let row_of = |j: usize, dd: usize| -> f32 {
+            if (sel[j] as usize) < lc.n_card {
+                down[j * n + dd]
+            } else {
+                let i = slots.iter().position(|&s| s == j).expect("a host slot");
+                host_rows[i * n + dd]
+            }
+        };
+        let wv: [f32; N_USED] = std::array::from_fn(|j| weights[j]);
         let y: Vec<f32> = (0..n)
             .map(|dd| {
-                let dv: [f32; N_USED] =
-                    std::array::from_fn(|j| if card[j] { down[j * n + dd] } else { 0.0 });
-                combine_elem(dv, wv, card, hsum[dd], sh[dd])
+                let dv: [f32; N_USED] = std::array::from_fn(|j| row_of(j, dd));
+                combine_rows_elem(dv, wv, sh[dd])
             })
             .collect();
         let mut st = vec![0.0f32; HC_STREAMS * n];
@@ -1226,7 +1240,7 @@ mod gate {
             down,
             sh_h,
             sh,
-            hsum,
+            host_rows,
             y,
             hc,
             streams: st,
@@ -1294,6 +1308,12 @@ mod gate {
         let t = piece.taps();
         let sel = t.sel.to_host_vec(stream)?;
         let (n, ff) = (io.fold_in.len(), t.shexp_h.len());
+        // The page's rows, its written ones: the service writes a row a host
+        // slot in slot order, so rows past the host slots hold an earlier
+        // layer's and are never read.
+        let page_rows = hybrid.hsum_copy()?;
+        let k = sel.iter().filter(|&&p| (p as usize) >= lc.n_card).count();
+        let host_rows = page_rows[..k * n].to_vec();
         Ok(Out {
             x: hybrid.boundary().normed().to_host_vec(stream)?,
             logits: t.router.logits.to_host_vec(stream)?,
@@ -1305,7 +1325,7 @@ mod gate {
             sel,
             sh_h: t.shexp_h.to_host_vec(stream)?,
             sh: t.shexp.to_host_vec(stream)?,
-            hsum: hybrid.hsum_copy()?,
+            host_rows,
             y: t.y.to_host_vec(stream)?,
             hc: t.hc.to_host_vec(stream)?,
             streams: io.streams_out.to_host_vec(stream)?,
@@ -1420,7 +1440,9 @@ mod gate {
     }
 
     /// The combine's pin per value (module doc), from our run `o` (its host
-    /// slots' rows in `hs`), ik's dump `d` and the down weights.
+    /// slots' rows in `hs`), ik's dump `d` and the down weights. Our side's
+    /// association is the rows join's: one fused multiply-add a slot in slot
+    /// order over all six, then the `+ 0.0` and the shared expert's add.
     fn pred_y(
         o: &Out,
         hs: &[HostSlot],
@@ -1443,13 +1465,11 @@ mod gate {
             .ik;
         let mut pred = vec![0.0f64; n];
         let mut bound = vec![0.0f64; n];
-        // Per value: the magnitudes our card chain, the host's sum and ik's
-        // sum add, and those the gate's own f64 sums add.
+        // Per value: the magnitudes our slot chain and ik's sum add, and
+        // those the gate's own f64 sums add.
         let mut sum_o = vec![0.0f64; n];
-        let mut sum_host = vec![0.0f64; n];
         let mut sum_k = vec![0.0f64; n];
         let mut mag64 = vec![0.0f64; n];
-        let n_host = hs.len();
         for j in 0..N_USED {
             let e = o.ids[j];
             let wd = bw
@@ -1484,37 +1504,26 @@ mod gate {
                 pred[dd] += wo * s.ours - wk * s.ik;
                 bound[dd] += wo.abs() * own_n * U * s.abs_ours + wk.abs() * ik_n * U * s.abs_ik;
                 mag64[dd] += wo.abs() * s.abs_ours + wk.abs() * s.abs_ik;
-                let term = (wo * f64::from(dv[dd])).abs();
-                if card {
-                    sum_o[dd] += term;
-                } else {
-                    sum_host[dd] += term;
-                }
+                sum_o[dd] += (wo * f64::from(dv[dd])).abs();
                 sum_k[dd] += (wk * f64::from(dk[dd])).abs();
             }
         }
         let (xo, own_sh, ik_sh) = shared_down_rule(bw.sh_ty, &o.sh_h)?;
         let st = row_stats(&bw.sh_down, &xo, &Act::Q8_2.reconstruct(&d.sh_h))?;
-        let (g_o, g_h, g_k) = (
-            gamma(n_card_slots(o, n_card) + 2),
-            gamma(2 * n_host.max(1)),
-            gamma(N_USED + 1),
-        );
+        // Ours: one rounding a slot's fma (all six), the `+ 0.0` and the
+        // shared add — `join_rows_elem`; ik's: its six-slot sum and the
+        // shared add.
+        let (g_o, g_k) = (gamma(N_USED + 2), gamma(N_USED + 1));
         let slack = (ff + N_USED + 2) as f64 * U64;
         for (dd, s) in st.iter().enumerate() {
             pred[dd] += s.ours - s.ik;
             bound[dd] += own_sh * U * s.abs_ours
                 + ik_sh * U * s.abs_ik
-                + g_o * (sum_o[dd] + f64::from(o.hsum[dd]).abs() + f64::from(o.sh[dd]).abs())
-                + g_h * sum_host[dd]
+                + g_o * (sum_o[dd] + f64::from(o.sh[dd]).abs())
                 + g_k * (sum_k[dd] + f64::from(d.sh[dd]).abs())
                 + slack * (mag64[dd] + s.abs_ours + s.abs_ik);
         }
         Ok(Pred { pred, bound })
-    }
-
-    fn n_card_slots(o: &Out, n_card: usize) -> usize {
-        o.sel.iter().filter(|&&p| (p as usize) < n_card).count()
     }
 
     /// The streams' pin per (stream, value), `[4][n]`, carried from the
@@ -1802,6 +1811,218 @@ mod gate {
         Ok(ok)
     }
 
+    // ------------------------------------------------- the rows join
+
+    /// One layer's real join inputs, stashed by the layer loop for the rows
+    /// join's clauses: every slot's down row (the card's or the host's, the
+    /// op path's), the routing weights and the shared expert's output.
+    struct RowsProbe {
+        rows: [Vec<f32>; N_USED],
+        w: [f32; N_USED],
+        sh: Vec<f32>,
+    }
+
+    /// The rows join's clauses (module doc): over `probe`'s real rows,
+    /// `ds41_ffn_post_rows` — plain, and `_rows_tier` through the tier
+    /// entries — writes the same bits under every assignment of the same
+    /// slots to the stage card, the tier and the host (each side fed the
+    /// identical row bits); on an all-card assignment it equals the old
+    /// `combine_elem` with the empty host sum (+0.0) bit for bit; and the
+    /// old split rule — the card sum, the host's weighted sum, the join —
+    /// moves its bits across those assignments, the red the clause exists to
+    /// hold out against. The same all-card equality holds over random inputs
+    /// on the host, `combine_rows_elem` against `combine_elem` at +0.0.
+    fn rows_join_cases(gpu: &Gpu, probe: &RowsProbe) -> Result<bool, GateError> {
+        const WHAT: &str = "rows_join";
+        let kernels = FfnKernels::load(gpu.context())?;
+        let tier_kernels = load_tier_kernels(gpu.context())?;
+        let stream = gpu.stream();
+        let n = probe.sh.len();
+        if probe.rows.iter().any(|r| r.len() != n) {
+            return Err(format!("{WHAT}: a probe row of another width").into());
+        }
+        // Each assignment spells a side a slot: 'c' the stage card, 't' the
+        // tier, 'h' the host.
+        let assignments = ["cccccc", "cctthh", "ctchth", "tttthh", "hhhhhh", "chttch"];
+        let dev = |v: &[f32]| -> Result<DeviceBuffer<f32>, GateError> {
+            Ok(DeviceBuffer::from_host(stream, v)?)
+        };
+        let dev_u = |v: &[u32; N_USED]| -> Result<DeviceBuffer<u32>, GateError> {
+            Ok(DeviceBuffer::from_host(stream, v)?)
+        };
+        let (w, shexp) = (dev(&probe.w)?, dev(&probe.sh)?);
+        let res = dev(&activations(n, HC_STREAMS, 851))?;
+        let hc = dev(&activations(HC_MIX, 1, 852))?;
+        let rows32 = u32::try_from(n).map_err(|_| format!("{WHAT}: {n} values"))?;
+        let grid = u32::try_from(n.div_ceil(256)).map_err(|_| format!("{WHAT}: {n} values"))?;
+        let mut ys: Vec<(&str, Vec<f32>)> = Vec::with_capacity(assignments.len());
+        let mut old_ys: Vec<(&str, Vec<f32>)> = Vec::with_capacity(assignments.len());
+        for &spec in &assignments {
+            let bytes = spec.as_bytes();
+            let (mut down, mut trows, mut hrows) = (
+                vec![f32::NAN; N_USED * n],
+                vec![f32::NAN; N_USED * n],
+                vec![0.0f32; N_USED * n],
+            );
+            let (mut sel, mut tsel) = ([HOST; N_USED], [HOST; N_USED]);
+            let (mut n_card, mut n_tier, mut k) = (0u32, 0u32, 0usize);
+            for (j, &side) in bytes.iter().enumerate() {
+                match side {
+                    b'c' => {
+                        sel[j] = n_card;
+                        n_card += 1;
+                        down[j * n..(j + 1) * n].copy_from_slice(&probe.rows[j]);
+                    }
+                    b't' => {
+                        tsel[j] = n_tier;
+                        n_tier += 1;
+                        trows[j * n..(j + 1) * n].copy_from_slice(&probe.rows[j]);
+                    }
+                    _ => {
+                        hrows[k * n..(k + 1) * n].copy_from_slice(&probe.rows[j]);
+                        k += 1;
+                    }
+                }
+            }
+            let (down, trows, hrows, sel_d, tsel_d) = (
+                dev(&down)?,
+                dev(&trows)?,
+                dev(&hrows)?,
+                dev_u(&sel)?,
+                dev_u(&tsel)?,
+            );
+            let mut y = dev(&vec![SENT; n])?;
+            let mut out = dev(&vec![0.0f32; HC_STREAMS * n])?;
+            if n_tier > 0 {
+                let m = &tier_kernels;
+                let cfg = LaunchConfig1D::new(grid, 256, 0);
+                let prep = m.prepare_ds41_ffn_post_rows_streams_tier(cfg)?;
+                m.ds41_ffn_post_rows_streams_tier(
+                    stream,
+                    &prep,
+                    &down,
+                    &trows,
+                    &w,
+                    &sel_d,
+                    &tsel_d,
+                    &hrows,
+                    &shexp,
+                    &res,
+                    &hc,
+                    rows32,
+                    n_card,
+                    n_tier,
+                    N_USED as u32,
+                    &mut y,
+                    &mut out,
+                )?;
+            } else {
+                let p = PostRows {
+                    down: &down,
+                    w: &w,
+                    sel: &sel_d,
+                    hrows: &hrows,
+                    shexp: &shexp,
+                    res: &res,
+                    hc: &hc,
+                    rows: n,
+                    n_card: n_card as usize,
+                    n_used: N_USED,
+                    host_rows: N_USED,
+                };
+                kernels.enqueue_post_rows(stream, &p, &mut y, &mut out, None)?;
+            }
+            let y = y.to_host_vec(stream)?;
+            stream.synchronize()?;
+            // The old rule on the same rows: the card's fma chain, the host's
+            // weighted sum in host order, the join — what the split combine
+            // computed before the rows form.
+            let old_y: Vec<f32> = (0..n)
+                .map(|d| {
+                    let mut dv = [0.0f32; N_USED];
+                    let mut card = [false; N_USED];
+                    let mut hsum = 0.0f32;
+                    for j in 0..N_USED {
+                        if bytes[j] == b'c' {
+                            card[j] = true;
+                            dv[j] = probe.rows[j][d];
+                        }
+                    }
+                    for j in 0..N_USED {
+                        if bytes[j] == b'h' {
+                            hsum += probe.w[j] * probe.rows[j][d];
+                        }
+                    }
+                    combine_elem(dv, probe.w, card, hsum, probe.sh[d])
+                })
+                .collect();
+            ys.push((spec, y));
+            old_ys.push((spec, old_y));
+        }
+        // Every assignment the same bits.
+        let mut moved = 0usize;
+        for (_, y) in &ys[1..] {
+            moved += y
+                .iter()
+                .zip(&ys[0].1)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+        }
+        let blind = moved == 0;
+        // The all-card assignment equals the old rule's bits: the empty host
+        // sum was +0.0, and the chain over all-card slots is the card sum's.
+        let eq = ys[0]
+            .1
+            .iter()
+            .zip(&old_ys[0].1)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let all_card_ok = eq == 0;
+        // The old split rule moves its bits across the assignments: the red
+        // the tier-blind clause holds out against. The rows are the same in
+        // every assignment, so a stationary old rule would make the clause
+        // pointless.
+        let mut old_moved = 0usize;
+        for (_, y) in &old_ys[1..] {
+            old_moved += y
+                .iter()
+                .zip(&old_ys[0].1)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+        }
+        let old_moves = old_moved > 0;
+        // The same all-card equality over random inputs on the host,
+        // `combine_rows_elem` against `combine_elem` at the empty host sum.
+        let mut rnd_diff = 0usize;
+        for seed in 0..8u32 {
+            let raw = activations(n, N_USED, 900 + seed);
+            let wr = activations(N_USED, 1, 950 + seed);
+            let shr = activations(n, 1, 970 + seed);
+            for d in 0..n {
+                let dv: [f32; N_USED] =
+                    std::array::from_fn(|j| raw[j * n + d] * (1 + j % 3) as f32);
+                let wv: [f32; N_USED] = std::array::from_fn(|j| wr[j]);
+                rnd_diff += usize::from(
+                    combine_rows_elem(dv, wv, shr[d]).to_bits()
+                        != combine_elem(dv, wv, [true; N_USED], 0.0, shr[d]).to_bits(),
+                );
+            }
+        }
+        let rnd_ok = rnd_diff == 0;
+        let ok = blind && all_card_ok && old_moves && rnd_ok;
+        println!(
+            "{WHAT}: {} assignments of one layer's six slots ({} all-card): the rows join's y moves {moved} values across them: {}; all-card against the old combine_elem at +0.0: {eq} of {n} differ: {}; the old split rule moves {old_moved} of {n} across the same assignments: {}; all-card host rule over random inputs, rows against split at +0.0: {rnd_diff} of {} differ: {}",
+            ys.len(),
+            ys[0].0,
+            verdict(blind),
+            verdict(all_card_ok),
+            verdict(old_moves),
+            8 * n,
+            verdict(rnd_ok)
+        );
+        Ok(ok)
+    }
+
     // ---------------------------------------------------------- driver
 
     #[derive(Default)]
@@ -1874,7 +2095,11 @@ mod gate {
             hidden: n,
             n_used: N_USED,
         };
-        let boundary = Boundary::new(gpu.context(), stream, shape)?;
+        // The rows form — the page every V4.1 load serves through: the host's
+        // handback is its slots' unweighted rows and the join sums every slot
+        // in slot order. Six rows: the synthetic map leaves host experts on
+        // every layer that routes, so a token can hold six host slots.
+        let boundary = Boundary::with_host_rows(gpu.context(), stream, shape, 1, N_USED)?;
         let tier = Ds41Host::build(Split::open(&path)?, &hp, 0..hp.n_layer, r8)?;
         let mut hybrid = Hybrid::new(boundary, map.clone(), tier, hp.n_layer)?;
         let mut piece = FfnPiece::new(&gpu, &hp, &map)?;
@@ -1908,8 +2133,14 @@ mod gate {
             "ds41_ffn_post_8",
             "ds41_ffn_post_streams_8",
             "ds41_ffn_handoff_10",
+            "ds41_ffn_post_rows",
+            "ds41_ffn_post_rows_streams",
+            "ds41_ffn_post_rows_tier",
+            "ds41_ffn_post_rows_streams_tier",
         ])?);
         tally.add(join8_cases(&gpu)?);
+        // Stashed by the layer loop below, driven once the layers have run.
+        let mut probe: Option<RowsProbe> = None;
         let stage = map.stage_view();
         for l in 0..hp.n_layer {
             let w = layer_weights(stream, &split, l)?;
@@ -1970,6 +2201,27 @@ mod gate {
                     op_path(&gpu, &mut op, &split, &hp, &lc, &io.streams, &io.fold_in)?;
                 let diff = first_diff(&got, &want);
                 let op_ok = diff == "-";
+                // The rows join's clauses run once, on the first layer's real
+                // rows: every slot's row, whichever side computed it.
+                if probe.is_none() {
+                    let mut rows: [Vec<f32>; N_USED] = std::array::from_fn(|_| Vec::new());
+                    let mut k = 0usize;
+                    for j in 0..N_USED {
+                        if (got.sel[j] as usize) < lc.n_card {
+                            rows[j] = got.down[j * n..(j + 1) * n].to_vec();
+                        } else {
+                            rows[j] = got.host_rows[k * n..(k + 1) * n].to_vec();
+                            k += 1;
+                        }
+                    }
+                    let w: [f32; N_USED] =
+                        got.w.clone().try_into().expect("the routing's six weights");
+                    probe = Some(RowsProbe {
+                        rows,
+                        w,
+                        sh: got.sh.clone(),
+                    });
+                }
 
                 // 3. Against the dump.
                 let margin = tie_margin(d, &got.logits, &bias, &got.probs);
@@ -2086,6 +2338,8 @@ mod gate {
             println!("{line} {}", verdict(pass));
             tally.add(pass);
         }
+        let probe = probe.ok_or("no layer ran to probe the rows join")?;
+        tally.add(rows_join_cases(&gpu, &probe)?);
         let stats = hybrid.stats();
         let pass = tally.failed == 0;
         println!(

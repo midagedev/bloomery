@@ -956,6 +956,41 @@ fn serve<'w>(
     out: &mut [f32],
     s: &mut HostScratch,
 ) -> Result<(), ModelError> {
+    serve_form(weights, limit, x, experts, Form::Sum(out), s)
+}
+
+/// [`serve`] in its rows form: the unweighted down rows, one a listed slot
+/// in list order, instead of the weighted sum.
+fn serve_rows<'w>(
+    weights: impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
+    limit: Option<f32>,
+    x: &Tensor2,
+    experts: &[(u32, f32)],
+    out: &mut [f32],
+    s: &mut HostScratch,
+) -> Result<(), ModelError> {
+    serve_form(weights, limit, x, experts, Form::Rows(out), s)
+}
+
+/// Which end a host leg writes: the weighted sum over `out`, or the listed
+/// slots' unweighted down rows into it, one row a slot in list order.
+enum Form<'a> {
+    Sum(&'a mut [f32]),
+    Rows(&'a mut [f32]),
+}
+
+/// The body of [`serve`] and [`serve_rows`]: each listed expert's weights
+/// resolved in list order into the scratch's view lists, then the form's
+/// [`serve_resolved`] over them. The lists go back to the scratch, emptied,
+/// whether the call succeeds or not.
+fn serve_form<'w>(
+    weights: impl Fn(u32) -> Result<[Weight<'w>; 3], ModelError>,
+    limit: Option<f32>,
+    x: &Tensor2,
+    experts: &[(u32, f32)],
+    form: Form<'_>,
+    s: &mut HostScratch,
+) -> Result<(), ModelError> {
     let mut gu: Vec<Weight<'w>> = relist(std::mem::take(&mut s.gu_w));
     let mut down: Vec<Weight<'w>> = relist(std::mem::take(&mut s.down_w));
     let r = experts
@@ -966,7 +1001,7 @@ fn serve<'w>(
             down.push(d);
             Ok(())
         })
-        .and_then(|()| serve_resolved(&gu, &down, limit, x, experts, out, s));
+        .and_then(|()| serve_resolved(&gu, &down, limit, x, experts, form, s));
     s.gu_w = relist(gu);
     s.down_w = relist(down);
     r
@@ -976,18 +1011,20 @@ fn serve<'w>(
 /// expert's gate and up interleaved, `down` its down. One group dispatch for
 /// every gate and up (`x` quantized once), one for every down with each
 /// combine — clamped when `limit` is given — produced inside it, then the
-/// weighted sum in list order into `out` (already zeroed). Profile level 1
-/// records the leg in five parts that do not overlap: `host_x_quant` (x's
-/// quantization), `host_gate_up` (the gate/up rows, per weight type),
-/// `host_h_quant` (the combines and their quantization), `host_down` (the
-/// down rows, per weight type) and `host_sum`.
+/// form's tail: the weighted sum in list order into `out` (already zeroed),
+/// or each listed slot's unweighted down row, one row of `x`'s width a slot
+/// in list order, into the rows form's `out`. Profile level 1 records the leg
+/// in five parts that do not overlap: `host_x_quant` (x's quantization),
+/// `host_gate_up` (the gate/up rows, per weight type), `host_h_quant` (the
+/// combines and their quantization), `host_down` (the down rows, per weight
+/// type) and `host_sum` (the weighted sum, or the rows' copy).
 fn serve_resolved(
     gu: &[Weight<'_>],
     down: &[Weight<'_>],
     limit: Option<f32>,
     x: &Tensor2,
     experts: &[(u32, f32)],
-    out: &mut [f32],
+    form: Form<'_>,
     s: &mut HostScratch,
 ) -> Result<(), ModelError> {
     let n = experts.len();
@@ -1020,9 +1057,19 @@ fn serve_resolved(
     *srcs = relist(sl);
     let dt = dt?;
     let t_sum = if lvl > 0 { Some(Instant::now()) } else { None };
-    for (&(_, w), d) in experts.iter().zip(&downs[..n]) {
-        for (o, &dv) in out.iter_mut().zip(d.col(0)) {
-            *o += w * dv;
+    match form {
+        Form::Sum(out) => {
+            for (&(_, w), d) in experts.iter().zip(&downs[..n]) {
+                for (o, &dv) in out.iter_mut().zip(d.col(0)) {
+                    *o += w * dv;
+                }
+            }
+        }
+        Form::Rows(out) => {
+            let w_col = x.ne0;
+            for (i, d) in downs[..n].iter().enumerate() {
+                out[i * w_col..][..w_col].copy_from_slice(d.col(0));
+            }
         }
     }
     if let Some(t_sum) = t_sum {
@@ -1391,6 +1438,103 @@ fn check_union_call(
     Ok(())
 }
 
+/// The rows-form host call's shape conditions, each its own error: `x` one
+/// token, its width the row width, the list at most the scratch's routed
+/// width, and `out` holding a row a listed expert at least.
+fn check_host_rows_call(
+    x: &Tensor2,
+    experts: &[(u32, f32)],
+    out: &[f32],
+    n_used: usize,
+) -> Result<(), ModelError> {
+    if x.ne1 != 1 {
+        return Err(ModelError::Shape {
+            what: "host experts: x must be one token",
+            want_ne0: x.ne0,
+            want_ne1: 1,
+            got_ne0: x.ne0,
+            got_ne1: x.ne1,
+        });
+    }
+    if out.len() < experts.len() * x.ne0 {
+        return Err(ModelError::Shape {
+            what: "host experts: out must hold a row a listed expert",
+            want_ne0: x.ne0,
+            want_ne1: 1,
+            got_ne0: out.len(),
+            got_ne1: 1,
+        });
+    }
+    if experts.len() > n_used {
+        return Err(ModelError::Shape {
+            what: "host experts: at most the experts the scratch was made for",
+            want_ne0: n_used,
+            want_ne1: 1,
+            got_ne0: experts.len(),
+            got_ne1: 1,
+        });
+    }
+    Ok(())
+}
+
+/// [`check_union_call`] for the rows form: the same conditions over `x`, the
+/// lists and the scratch, `out` holding whole rows a column — its length
+/// `rows · width` over the columns, `rows` at least the widest list, and a
+/// length that is not whole rows a named error. Returns the rows a column.
+fn check_union_rows_call(
+    x: Tensor2View<'_>,
+    lists: &[&[(u32, f32)]],
+    out: &[f32],
+    ff: usize,
+    scratch: &UnionScratch,
+) -> Result<usize, ModelError> {
+    let (embd, cols) = (x.ne0(), x.ne1());
+    if cols > scratch.max_cols {
+        return Err(ModelError::Shape {
+            what: "host union: at most the columns the scratch was made for",
+            want_ne0: embd,
+            want_ne1: scratch.max_cols,
+            got_ne0: embd,
+            got_ne1: cols,
+        });
+    }
+    if cols != lists.len() {
+        return Err(ModelError::Shape {
+            what: "host union: x must have one column per list",
+            want_ne0: embd,
+            want_ne1: lists.len(),
+            got_ne0: embd,
+            got_ne1: cols,
+        });
+    }
+    let whole = embd.checked_mul(cols);
+    let rows = whole
+        .filter(|&w| w > 0 && out.len().is_multiple_of(w))
+        .map(|w| out.len() / w);
+    let stride = match rows {
+        Some(stride) if lists.iter().all(|l| l.len() <= stride) => stride,
+        _ => {
+            return Err(ModelError::Shape {
+                what: "host union: out must hold whole rows a column, a row a listed expert",
+                want_ne0: embd,
+                want_ne1: cols,
+                got_ne0: out.len(),
+                got_ne1: 1,
+            });
+        }
+    };
+    if (scratch.embd, scratch.ff) != (embd, ff) {
+        return Err(ModelError::Shape {
+            what: "host union: the scratch must be made for the block's widths",
+            want_ne0: embd,
+            want_ne1: ff,
+            got_ne0: scratch.embd,
+            got_ne1: scratch.ff,
+        });
+    }
+    Ok(stride)
+}
+
 /// The host leg of `k` tokens over the union of their experts: column `j`
 /// of `out` (`out[j·embd..(j+1)·embd]`) is exactly what [`serve`] writes for
 /// column `j` of `x` and `lists[j]`, bit for bit, in five pool passes
@@ -1474,6 +1618,157 @@ fn serve_planned(
         claims: &mut s.claims,
     };
     call.run(slabs, lists, out, &mut s.passes)
+}
+
+/// The rows copy of a union call whose downs the scratch's `store` slab
+/// holds: each column's listed slots' unweighted down rows, row `i` of
+/// column `j` at `out[(j · stride + i) · w ..][.. w]`, `w` the row width —
+/// the plan naming the slot each listed (expert, column) pair's down sits
+/// at, so every row is bit for bit the one-column call's. On the caller up
+/// to [`DEFER_MAX_COLS`] columns — the sum pass's inline bound — else one
+/// dispatch over the columns, its split. Returns whether it dispatched.
+fn copy_union_rows(
+    plan: &UnionPlan,
+    store: &[f32],
+    lists: &[&[(u32, f32)]],
+    stride: usize,
+    w: usize,
+    out: &mut [f32],
+) -> bool {
+    /// The rows copy's per-column slice of `out`, split over the pool by
+    /// pointer: each participant writes only its own columns' rows.
+    struct RowsOut(*mut f32);
+
+    // SAFETY: the pointer is into the copy's own output block, which outlives
+    // the split, and it is only ever written through — never read, never
+    // freed, by a worker.
+    unsafe impl Send for RowsOut {}
+    // SAFETY: sharing adds no aliasing — the split's column spans are
+    // disjoint, so a worker writes only cells no other worker touches, and
+    // the join precedes every read.
+    unsafe impl Sync for RowsOut {}
+
+    impl RowsOut {
+        /// Column `j`'s `stride` rows of `w` values.
+        ///
+        /// SAFETY: column `j`'s span lies inside `out` (this fn's contract:
+        /// `stride · lists.len() · w` values), and no other participant
+        /// writes it while the slice lives.
+        unsafe fn rows_mut<'a>(&self, j: usize, stride: usize, w: usize) -> &'a mut [f32] {
+            // SAFETY: this fn's contract.
+            unsafe { std::slice::from_raw_parts_mut(self.0.add(j * stride * w), stride * w) }
+        }
+    }
+    let col = |plan: &UnionPlan, list: &[(u32, f32)], j: usize, o: &mut [f32]| {
+        for (i, &(e, _)) in list.iter().enumerate() {
+            let d = plan
+                .ids
+                .binary_search(&e)
+                .expect("every listed expert is in the union");
+            let t = plan.cols[plan.off[d]..plan.off[d + 1]]
+                .binary_search(&j)
+                .expect("a listing column is in its expert's columns");
+            let q = plan.off[d] + t;
+            o[i * w..][..w].copy_from_slice(&store[q * w..(q + 1) * w]);
+        }
+    };
+    let cols = lists.len();
+    if cols <= DEFER_MAX_COLS {
+        for (j, o) in out.chunks_exact_mut(stride * w).enumerate() {
+            col(plan, lists[j], j, o);
+        }
+        return false;
+    }
+    // SAFETY (construction site): `out` holds `cols` columns of `stride` rows
+    // of `w` values (the caller's check), borrowed for the whole dispatch;
+    // each participant writes only the columns of its own chunk of `0..cols`,
+    // the chunks partition them, and the join publishes the writes.
+    let out = RowsOut(out.as_mut_ptr());
+    threads::pool().for_each_chunk(cols, |js| {
+        for j in js {
+            // SAFETY: the construction site above.
+            let o = unsafe { out.rows_mut(j, stride, w) };
+            col(plan, lists[j], j, o);
+        }
+    });
+    true
+}
+
+/// [`serve_union`] in its rows form: each column's listed slots' unweighted
+/// down rows, `stride` rows a column, instead of its weighted sum — bit for
+/// bit what the one-column rows call writes for each column alone.
+fn serve_union_rows(
+    stacks: [ExpertStack<'_>; 3],
+    limit: Option<f32>,
+    x: Tensor2View<'_>,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    stride: usize,
+    s: &mut UnionScratch,
+) -> Result<(), ModelError> {
+    s.plan.build(lists, s.per_list)?;
+    if s.plan.fits(s.max_slots) {
+        return serve_planned_rows(stacks, limit, x, lists, out, stride, s);
+    }
+    s.cut_calls += 1;
+    let embd = x.ne0();
+    let mut c0 = 0;
+    while c0 < lists.len() {
+        let c1 = (c0 + UNION_MAX_COLS).min(lists.len());
+        let part = Tensor2View::new(&x.data()[c0 * embd..c1 * embd], embd, c1 - c0)?;
+        s.plan.build(&lists[c0..c1], s.per_list)?;
+        assert!(
+            s.plan.fits(s.max_slots),
+            "host union: a batch's columns fit every scratch (union_batch_slots or more)"
+        );
+        serve_planned_rows(
+            stacks,
+            limit,
+            part,
+            &lists[c0..c1],
+            &mut out[c0 * stride * embd..c1 * stride * embd],
+            stride,
+            s,
+        )?;
+        c0 = c1;
+    }
+    Ok(())
+}
+
+/// [`serve_planned`] in its rows form ([`serve_union_rows`]): the call run
+/// through the scratch — its sums dropped into the rows' own front, the one
+/// pass the rows join replaces — then each column's listed rows copied from
+/// the downs the call left in the scratch's store slab. Rows past a column's
+/// list hold what the dropped sums left there; the join reads only a
+/// column's listed rows.
+fn serve_planned_rows(
+    stacks: [ExpertStack<'_>; 3],
+    limit: Option<f32>,
+    x: Tensor2View<'_>,
+    lists: &[&[(u32, f32)]],
+    out: &mut [f32],
+    stride: usize,
+    s: &mut UnionScratch,
+) -> Result<(), ModelError> {
+    if s.plan.n() == 0 {
+        return Ok(());
+    }
+    let cols = lists.len();
+    let embd = x.ne0();
+    let call = UnionCall::new(s.plan.view(), stacks, x, limit, s.ff)?;
+    let slabs = UnionSlabs {
+        xq: &mut s.xq,
+        xq_up: &mut s.xq_up,
+        gu: &mut s.gu,
+        qc: &mut s.qc,
+        store: &mut s.store,
+        claims: &mut s.claims,
+    };
+    call.run(slabs, lists, &mut out[..cols * embd], &mut s.passes)?;
+    if copy_union_rows(&s.plan, &s.store, lists, stride, embd, out) {
+        s.passes += 1;
+    }
+    Ok(())
 }
 
 /// [`experts_into`] for many tokens at once — up to the columns `scratch` was
@@ -1775,6 +2070,74 @@ impl HostLayer {
             x,
             lists,
             out,
+            scratch,
+        )
+    }
+
+    /// The rows form of [`HostLayer::experts_into`]: each listed slot's
+    /// unweighted down row, row `i` at `out[i · width ..][.. width]` for the
+    /// list's `i`-th slot in list order, instead of the weighted sum — bit
+    /// for bit the down the sum's term `i` adds. Rows past the list are left
+    /// as they were; a join reads a column's listed rows alone. `out` holding
+    /// fewer rows than the list, and a list past the scratch's routed width,
+    /// are named errors.
+    pub fn experts_rows_into(
+        &self,
+        src: R8Source<'_>,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+        scratch: &mut HostScratch,
+    ) -> Result<(), ModelError> {
+        self.read_beside(src)?;
+        let split = src.split();
+        check_host_rows_call(x, experts, out, scratch.n_used)?;
+        if experts.is_empty() {
+            return Ok(());
+        }
+        let weights = |e: u32| -> Result<[Weight<'_>; 3], ModelError> {
+            let e = e as usize;
+            Ok([
+                self.gate.expert(split, e)?,
+                self.up.expert(split, e)?,
+                self.down.expert(split, e)?,
+            ])
+        };
+        serve_rows(weights, Some(self.limit), x, experts, out, scratch)
+    }
+
+    /// The rows form of [`HostLayer::experts_union_into`]: each column's
+    /// listed slots' unweighted down rows, `out`'s length over its width and
+    /// the columns naming the rows a column holds, row `i` of column `j` at
+    /// `out[(j · rows + i) · width ..]` — bit for bit what
+    /// [`HostLayer::experts_rows_into`] writes for that column and list
+    /// alone, whatever the call's width. `src` is the pair the layer was
+    /// built from.
+    pub fn experts_union_rows_into<'x>(
+        &self,
+        src: R8Source<'_>,
+        x: impl Into<Tensor2View<'x>>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        scratch: &mut UnionScratch,
+    ) -> Result<(), ModelError> {
+        self.read_beside(src)?;
+        let split = src.split();
+        let x = x.into();
+        let stride = check_union_rows_call(
+            x,
+            lists,
+            out,
+            self.gate.source().info().dims[1] as usize,
+            scratch,
+        )?;
+        serve_union_rows(
+            self.stacks_of(split)?,
+            Some(self.limit),
+            x,
+            lists,
+            out,
+            stride,
             scratch,
         )
     }
@@ -2081,6 +2444,122 @@ mod tests {
             );
         }
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The rows forms — the one-column call and the union — write, column
+    /// for column and bit for bit, the same rows: each listed slot's
+    /// unweighted down output, one row of the width a slot in list order,
+    /// into a region of `stride` rows a column, narrow (3 columns, the
+    /// stride wider than every list) and wide (12, the rows' copy
+    /// dispatched over the pool). A region whose length is not whole rows a
+    /// column, one without a row a listed expert, and a one-column `out`
+    /// shorter than a row a listed expert are refused by name; a column
+    /// listing no expert leaves its rows as they were.
+    #[test]
+    fn union_rows_call_matches_its_columns() {
+        let (embd, ff, n_expert) = (256, 256, 6);
+        let tys = [GgmlType::Q3_K, GgmlType::Q4_K, GgmlType::Q4_K];
+        let path = layer_file("rows", tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        let mut us = UnionScratch::new_routed(embd, ff, 16, 3).unwrap();
+        let mut host = HostScratch::new(embd, ff, 3).unwrap();
+        for cols in [3, 12] {
+            let stride = 3;
+            let x = Tensor2::from_vec(
+                embd,
+                cols,
+                (0..embd * cols)
+                    .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                    .collect(),
+            );
+            let lists: Vec<Vec<(u32, f32)>> = (0..cols)
+                .map(|j| {
+                    if j % 5 == 4 {
+                        Vec::new()
+                    } else {
+                        [0, 1, 3]
+                            .map(|s| (((j + s) % n_expert) as u32, 0.25 + 0.125 * s as f32))
+                            .to_vec()
+                    }
+                })
+                .collect();
+            let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+            let mut want = vec![f32::NAN; cols * stride * embd];
+            for (j, list) in lists.iter().enumerate() {
+                let xj = Tensor2::from_vec(embd, 1, x.col(j).to_vec());
+                layer
+                    .experts_rows_into(
+                        R8Source::rows(&split),
+                        &xj,
+                        list,
+                        &mut want[j * stride * embd..][..stride * embd],
+                        &mut host,
+                    )
+                    .unwrap();
+            }
+            let mut got = vec![f32::NAN; cols * stride * embd];
+            layer
+                .experts_union_rows_into(R8Source::rows(&split), &x, &slices, &mut got, &mut us)
+                .unwrap();
+            let mut diff = 0usize;
+            for (j, list) in lists.iter().enumerate() {
+                for i in 0..list.len() {
+                    let (w, g) = (
+                        &want[(j * stride + i) * embd..][..embd],
+                        &got[(j * stride + i) * embd..][..embd],
+                    );
+                    diff += w
+                        .iter()
+                        .zip(g)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                }
+            }
+            println!("rows k={cols}: diff_cells={diff}",);
+            assert_eq!(
+                diff, 0,
+                "{cols} columns: the union's rows differ from its columns'"
+            );
+            // A column listing no expert leaves its rows as they were.
+            if let Some(j) = (0..cols).find(|&j| lists[j].is_empty()) {
+                assert!(
+                    got[j * stride * embd..][..embd].iter().all(|v| v.is_nan()),
+                    "an empty column's rows were written"
+                );
+            }
+        }
+        // The refusals: a region not whole rows a column, and one without a
+        // row a listed expert.
+        let cols = 2;
+        let stride = 3;
+        let x = Tensor2::zeros(embd, cols);
+        let (two, three) = (
+            [(0u32, 1.0f32), (1, 1.0)],
+            [(0u32, 1.0f32), (1, 1.0), (2, 1.0)],
+        );
+        let slices: Vec<&[(u32, f32)]> = vec![&two[..], &three[..]];
+        let mut out = vec![0.0f32; cols * stride * embd + 1];
+        let e = layer
+            .experts_union_rows_into(R8Source::rows(&split), &x, &slices, &mut out, &mut us)
+            .expect_err("a region not whole rows a column is refused")
+            .to_string();
+        assert!(e.contains("out must hold whole rows a column"), "{e}");
+        let mut out = vec![0.0f32; cols * 2 * embd];
+        let e = layer
+            .experts_union_rows_into(R8Source::rows(&split), &x, &slices, &mut out, &mut us)
+            .expect_err("a region without a row a listed expert is refused")
+            .to_string();
+        assert!(e.contains("out must hold whole rows a column"), "{e}");
+        let x1 = Tensor2::zeros(embd, 1);
+        let mut small = vec![0.0f32; 2 * embd];
+        let e = layer
+            .experts_rows_into(R8Source::rows(&split), &x1, &three, &mut small, &mut host)
+            .expect_err("a one-column out shorter than a row a listed expert")
+            .to_string();
+        assert!(e.contains("out must hold a row a listed expert"), "{e}");
+        std::fs::remove_file(&path).unwrap();
+        println!("rows refusals: {e}");
     }
 
     /// GLM-5.3-Flash's routed stacks — Q4_K gates and ups over a Q5_K or a
