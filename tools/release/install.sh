@@ -26,6 +26,22 @@ fail() { echo "install.sh: $*" >&2; exit 1; }
 [ "$(uname -s)" = "Linux" ] || fail "this release is Linux x86-64 (Windows: run it inside WSL2; macOS: no build)."
 [ "$(uname -m)" = "x86_64" ] || fail "this release is x86-64; uname -m says $(uname -m)."
 
+# The release's host code is built for x86-64-v3: on a CPU without AVX2, FMA or BMI2 it dies of
+# SIGILL ("Illegal instruction") at the first such instruction, so the install stops here instead.
+FLAGS=$(grep -m1 '^flags' /proc/cpuinfo 2> /dev/null || true)
+if [ -n "$FLAGS" ]; then
+    MISSING=
+    for f in avx2 fma bmi2; do
+        case " $FLAGS " in
+            *" $f "*) ;;
+            *) MISSING="$MISSING $f" ;;
+        esac
+    done
+    [ -z "$MISSING" ] || fail "this CPU lacks${MISSING}, which the release's x86-64-v3 code needs (a virtual machine: pass the host's CPU type through)."
+else
+    echo "install.sh: could not read the CPU flags (/proc/cpuinfo); the release needs AVX2, FMA and BMI2 (x86-64-v3)." >&2
+fi
+
 GLIBC=$(ldd --version 2>/dev/null | head -1 | grep -o '[0-9]*\.[0-9]*$' || true)
 if [ -n "$GLIBC" ]; then
     OLDER=$(printf '%s\n2.34\n' "$GLIBC" | sort -V | head -1)
