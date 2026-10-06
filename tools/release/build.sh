@@ -29,7 +29,7 @@ fi
 
 GLIBC_FLOOR=2.34
 BINS=(bloomery-serve)
-DISPATCHED='^(sha2::sha256::x86::digest_blocks|sha1::compress::x86::digest_blocks)$'
+DISPATCHED='^(sha2::sha256::x86::digest_blocks|sha1::compress::x86::digest_blocks|crc32fast::specialized::pclmulqdq::calculate_avx(512|2))$'
 ALLOWED_NEEDED='^(libc\.so\.6|libm\.so\.6|libgcc_s\.so\.1|ld-linux-x86-64\.so\.2)$'
 if [ -n "$CHECK_ONLY" ]; then
   BIN_DIR=$CHECK_ONLY
@@ -65,7 +65,7 @@ for b in "${BINS[@]}"; do
   fi
 
   # Instructions past x86-64-v3 may sit only in functions that run behind a runtime CPU check (sha2's and sha1's SHA-NI arms,
-  # selected by cpufeatures); anywhere else they mean the host code was built for this box's CPU.
+  # selected by cpufeatures; crc32fast's AVX-512 and AVX2+VPCLMULQDQ arms under png, selected by is_x86_feature_detected!); anywhere else they mean the host code was built for this box's CPU.
   past_v3=$(objdump -d --no-show-raw-insn -C "$f" | awk -v allow="$DISPATCHED" '
     /^[0-9a-f]+ <.*>:$/ { fn = $0; sub(/^[0-9a-f]+ </, "", fn); sub(/>:$/, "", fn); next }
     /\t(sha1|sha256)[a-z0-9]* |\t(extrq|insertq|clzero|monitorx|mwaitx|rdpid|vaes[a-z]*|vpclmulqdq|vpdpbusd)[ \t]|%zmm/ {
