@@ -327,17 +327,83 @@ pub(crate) enum Drain {
     Late(Duration),
 }
 
-/// Poll `stream` until it has drained, at most `deadline`.
+/// Poll `stream` until it has drained, at most `deadline`, sleeping
+/// between polls from the first.
 pub(crate) fn poll_drained(stream: &CudaStream, deadline: Duration) -> Result<(), Drain> {
+    match await_within("poll_drained", deadline, Duration::ZERO, || stream.query()) {
+        Ok(()) => Ok(()),
+        Err(GpuError::Stalled { waited, .. }) => Err(Drain::Late(waited)),
+        Err(e) => Err(Drain::Driver(e)),
+    }
+}
+
+/// The bound on an engine-thread wait for the card on the step and prompt
+/// path ([`await_done`]): past the longest such wait that is not a fault —
+/// one ubatch of a prompt on the slowest card, behind a copy that takes the
+/// residency machine's whole [`MachineCfg::deadline`] — so the machine's
+/// own error comes first when it has one.
+///
+/// [`MachineCfg::deadline`]: swap::MachineCfg::deadline
+pub(crate) const ENGINE_BOUND: Duration = Duration::from_secs(60);
+
+/// How long [`await_done`] spins on its query before it sleeps between
+/// polls: longer than any decode step, so a step's readback never waits out
+/// a sleep, and a wait past it shows its thread asleep.
+const SPIN: Duration = Duration::from_secs(1);
+
+/// The sleep between polls once the spin has passed.
+const POLL: Duration = Duration::from_micros(50);
+
+/// Wait, on the engine thread, until `done` — a stream's or an event's
+/// query — says the work it covers has finished, within [`ENGINE_BOUND`]:
+/// the query spun on for [`SPIN`], then polled every [`POLL`]. Past the
+/// bound, [`GpuError::Stalled`] of `what`, with no note; a caller that holds
+/// the host tier adds its note ([`HostTier::noted`]).
+pub(crate) fn await_done(
+    what: &'static str,
+    done: impl FnMut() -> Result<bool, cuda_core::DriverError>,
+) -> Result<(), GpuError> {
+    await_within(what, ENGINE_BOUND, SPIN, done)
+}
+
+/// The one polling loop: `done` asked until it says done, at most `bound`,
+/// spun on for `spin`, then polled every [`POLL`]; past the bound
+/// [`GpuError::Stalled`] of `what`, with no note.
+fn await_within(
+    what: &'static str,
+    bound: Duration,
+    spin: Duration,
+    mut done: impl FnMut() -> Result<bool, cuda_core::DriverError>,
+) -> Result<(), GpuError> {
     let t0 = Instant::now();
     loop {
-        match stream.query() {
-            Ok(true) => return Ok(()),
-            Ok(false) if t0.elapsed() > deadline => return Err(Drain::Late(t0.elapsed())),
-            Ok(false) => std::thread::sleep(Duration::from_micros(50)),
-            Err(e) => return Err(Drain::Driver(e.into())),
+        if done()? {
+            return Ok(());
+        }
+        let waited = t0.elapsed();
+        if waited > bound {
+            return Err(GpuError::Stalled {
+                what,
+                waited,
+                bound,
+                note: String::new(),
+            });
+        }
+        if waited < spin {
+            std::hint::spin_loop();
+        } else {
+            std::thread::sleep(POLL);
         }
     }
+}
+
+/// `e` with `swap`'s note ([`swap::SwapMachine::stall_note`]) when it is a
+/// [`GpuError::Stalled`] and there is a machine; any other error as it is.
+fn stall_noted(swap: Option<&swap::SwapMachine>, mut e: GpuError) -> GpuError {
+    if let (GpuError::Stalled { note, .. }, Some(m)) = (&mut e, swap) {
+        *note = m.stall_note();
+    }
+    e
 }
 
 /// Wait, polling, until `stream` has drained, at most `deadline`; past it
@@ -808,6 +874,14 @@ impl<H: HostExperts> HostTier<H> {
     #[must_use]
     pub fn swap(&self) -> Option<&swap::SwapMachine> {
         self.swap.as_ref()
+    }
+
+    /// `e` with what the residency machine holds now when it is a
+    /// [`GpuError::Stalled`] and the tier runs one ([`stall_noted`]); any
+    /// other error as it is.
+    #[must_use]
+    pub fn noted(&self, e: GpuError) -> GpuError {
+        stall_noted(self.swap.as_ref(), e)
     }
 
     /// The pass that just ran, a `kind`, keeps `kept` rows (a step its one
@@ -1405,7 +1479,12 @@ impl<H: HostExperts> HostTier<H> {
     /// by name — and hand back its routed ids without serving it
     /// ([`BatchPort::routed_ids`]).
     pub fn routed_ids(&mut self, key: BatchKey) -> Result<&[u32], GpuError> {
-        self.port_mut("HostTier::routed_ids")?.routed_ids(key)
+        let swap = self.swap.as_ref();
+        let port = self.port.as_mut().ok_or(GpuError::State {
+            what: "HostTier::routed_ids",
+            missing: "the batch port's sets (HostTier::prepare_batch)",
+        })?;
+        port.routed_ids(key).map_err(|e| stall_noted(swap, e))
     }
 
     /// Wait for the oldest download not served yet — `key`'s, else refused
@@ -2343,7 +2422,40 @@ pub fn name_refusal(r: &Refusal, fault: Option<Fault>) -> GpuError {
 
 #[cfg(test)]
 mod tests {
-    use super::{PassKind, SERVED_TIERS, pass_kept, refuse_tier_count};
+    use super::{PassKind, SERVED_TIERS, await_within, pass_kept, refuse_tier_count};
+    use crate::GpuError;
+    use std::time::Duration;
+
+    /// A bounded engine wait returns once its query says done, and past its
+    /// bound is a named stall that carries the wait, its time and the bound.
+    #[test]
+    fn a_bounded_wait_ends_done_or_stalled_by_name() {
+        let mut polls = 0;
+        let done = await_within("t", Duration::from_secs(5), Duration::ZERO, || {
+            polls += 1;
+            Ok(polls == 3)
+        });
+        assert!(done.is_ok() && polls == 3);
+        let bound = Duration::from_millis(20);
+        let err = await_within("Head::tokens", bound, Duration::from_millis(5), || {
+            Ok(false)
+        })
+        .expect_err("never done");
+        match &err {
+            GpuError::Stalled {
+                what,
+                waited,
+                bound: b,
+                note,
+            } => assert!(*what == "Head::tokens" && waited > b && *b == bound && note.is_empty()),
+            e => panic!("not a stall: {e}"),
+        }
+        assert!(
+            err.to_string()
+                .starts_with("Head::tokens: the card's work did not finish in "),
+            "{err}"
+        );
+    }
 
     /// A load of one tier card, or none, passes; a second tier card is
     /// refused by name before anything uploads.

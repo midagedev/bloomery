@@ -102,6 +102,11 @@ check-levers:
 check-unsafe:
     bash tools/check-unsafe.sh
 
+# The engine thread's bounded waits on the card (Mac, text only, no build): each function tools/check-waits.sh
+# lists waits with host::await_done before any blocking copy and never calls .synchronize(); rule in its header.
+check-waits:
+    ./tools/check-waits.sh
+
 # The one-bundle-load ratchet (Mac, grep only, no build): a `#[cuda_module]` family's raw `load` outside the
 # shared_module! slot — the rule and exit codes are tools/check-loads.sh's header.
 check-loads:
@@ -1000,7 +1005,7 @@ gate-1-1:
     ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/ref/build-dequant.sh && "$BLOOMERY_DATA/bin/dequant_ref" && S=$(. tools/ref/models/deepseek41.sh && printf %s "$V41_SET_SUFFIX") && "$BLOOMERY_DATA/bin/dequant_ref" "$BLOOMERY_V41_MODEL" "$BLOOMERY_DATA/ref-v41$S" && "$BLOOMERY_DATA/bin/dequant_ref" --synthetic && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 
 # 커밋 전에 치는 것. 측정은 포함하지 않는다(조용한 기계가 필요하다).
-gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-loads fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
+gate: check-recipes check-rustflags check-arch check-comments check-levers check-unsafe check-waits check-loads fmt-check lint gate-1-1 gate-vision gate-gpu-gates-lib gate-gpu-lib gate-sampler gate-levers
 
 # The smoke tier (docs/gates-plan.md 3.1): the static checks, the V4.1 decode step, the V4.1 prompt batch at
 # P = 512 alone, V2-Lite end to end — a subset run of unchanged gates, never the landing batch. Two lanes
