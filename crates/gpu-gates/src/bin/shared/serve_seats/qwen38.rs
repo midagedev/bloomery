@@ -237,11 +237,12 @@ use gguf::Split;
 use model::arch::models::Mixer;
 use model::arch::qwen35moe::head_list::{HeadPick, head_rows_of};
 use model::arch::qwen35moe::place::{
-    Experts, MtpInputs, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx, tier_batch,
+    Experts, MtpInputs, PlaceError, PlanInputs, machine_bp_on, machine_for_experts, serve_ctx,
+    tier_batch,
 };
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{CardSpec, HostNeed, MARGIN};
-use model::placement::{Machine, Plan, PlanLevers};
+use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
 use refset::arch::qwen4exp::mtp::{DraftFrom, draft_file};
 use runtime::Target as _;
@@ -435,22 +436,25 @@ impl Place38 {
 
     /// The machine a plan of `inputs` at `ctx` positions and ubatches of
     /// `ub` runs on under `experts`, `mtp` the draft when it runs beside
-    /// the target: plan (b′) reserves the draft's card bytes at `ctx` on its
-    /// stage card (`place::machine_bp_on`), the one-card plans count them in
-    /// `plan_mtp_with`.
+    /// the target, for `slots` resident sequences: plan (b′) reserves the
+    /// draft's card bytes at `ctx` for every slot on its stage card
+    /// (`MtpInputs::card_bytes_of`, the reserve `plan_mtp_with_slots`
+    /// checks; `place::machine_bp_on`), the one-card plans count them in
+    /// `plan_mtp_with_slots`.
     fn machine(
         self,
         inputs: &PlanInputs,
         (ctx, ub): (u64, u64),
         experts: Experts,
         mtp: Option<&MtpInputs>,
+        slots: usize,
     ) -> Result<Machine, GateError> {
         let layers = inputs.spec.layers.len();
         Ok(match self.kind {
             Kind38::A | Kind38::Gate => machine_for_experts(self.spec()?, layers, ub, experts),
             Kind38::Bp => {
                 let cards = self.cards.card_specs()?;
-                let draft = mtp.map(|m| m.card_bytes(ctx)).transpose()?;
+                let draft = mtp.map(|m| m.card_bytes_of(ctx, slots)).transpose()?;
                 machine_bp_on(
                     (cards[0], cards[1]),
                     layers,
@@ -485,10 +489,13 @@ fn experts38(levers: &bloomery_levers::Levers) -> Result<Experts, GateError> {
 }
 
 /// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions,
-/// `file` the MTP draft file the load would open: `mtp` the draft, `off` the
-/// plain path; unset, `generate_qwen3moe`'s rule
-/// (`bloomery_levers::draft38_unset`); and, drafting nothing, why (the `load
-/// draft=off` record's). The V4.1 words and any other are refused by name.
+/// `file` the MTP draft file the load would open, `inputs` the target's:
+/// `mtp` the draft, `off` the plain path; unset, `generate_qwen3moe`'s rule
+/// (`bloomery_levers::draft38_unset`), then `off` when the target's matrices
+/// the draft borrows are not its format (`PlanInputs::mtp_borrows`, which
+/// refuses a set `mtp` at `MtpInputs::read`); and, drafting nothing, why (the
+/// `load draft=off` record's). The V4.1 words and any other are refused by
+/// name.
 ///
 /// The rule's run conditions as the seat meets them: no `--logits` (a
 /// request that reads the logits row steps plainly, the row the target's),
@@ -501,6 +508,7 @@ fn draft38(
     place: Place38,
     ctx: usize,
     file: &Path,
+    inputs: &PlanInputs,
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
     match levers.draft() {
         Some("mtp") => Ok((true, None)),
@@ -521,7 +529,14 @@ fn draft38(
                 ctx,
             };
             Ok(match draft38_unset(&at) {
-                None => (true, None),
+                None => match inputs.mtp_borrows() {
+                    Ok(()) => (true, None),
+                    Err(PlaceError::DraftBorrow { name, ty }) => {
+                        let ty = ty.map_or("absent".to_string(), |t| t.to_string());
+                        (false, Some(Draft38Off::Borrowed { name, ty }))
+                    }
+                    Err(e) => return Err(e.into()),
+                },
                 Some(off) => (false, Some(off)),
             })
         }
@@ -581,6 +596,7 @@ impl Plans<'_> {
             (ctx, u64::try_from(ub)?),
             self.experts,
             self.mtp,
+            self.slots,
         )?;
         let plan = match self.mtp {
             None => {
@@ -606,9 +622,13 @@ impl Plans<'_> {
     fn host(&self, ctx: usize, set: Option<(Residency, &str)>) -> Result<(u64, u64), GateError> {
         let ub = ubatch_for(ctx)?;
         let c = u64::try_from(ctx)?;
-        let machine =
-            self.place
-                .machine(self.inputs, (c, u64::try_from(ub)?), self.experts, self.mtp)?;
+        let machine = self.place.machine(
+            self.inputs,
+            (c, u64::try_from(ub)?),
+            self.experts,
+            self.mtp,
+            self.slots,
+        )?;
         let plan = match self.mtp {
             None => {
                 self.inputs
@@ -675,19 +695,19 @@ struct Fit38 {
 /// The largest slot context any plan of the file and the placement takes —
 /// every plan counting the seat's slots — up to the file's serving cap
 /// (`place::serve_ctx`: its `context_length`): the most a `--ctx-size`'s
-/// split may give a slot.
+/// split may give a slot. A tier card the plan leaves idle is refused as
+/// itself (`PlacementError::IdleTier`): no context gives it an expert.
 fn fit38(plans: &Plans<'_>) -> Result<Fit38, GateError> {
     let fits = |c: usize| Ok(plans.card(c).is_ok());
-    if !fits(1)? {
-        return Err(format!(
-            "no context fits the card: the plan at 1 position is refused ({})",
-            plans
-                .card(1)
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default()
-        )
-        .into());
+    if let Err(e) = plans.card(1) {
+        if let Some(PlaceError::Placement(PlacementError::IdleTier { .. })) =
+            e.downcast_ref::<PlaceError>()
+        {
+            return Err(e);
+        }
+        return Err(
+            format!("no context fits the card: the plan at 1 position is refused ({e})").into(),
+        );
     }
     let most = usize::try_from(serve_ctx(1, &plans.inputs.hp)?)?;
     let ctx = super::ctx::largest(1, most, fits)?;
@@ -914,9 +934,11 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     let a = parse_args(args)?;
     let path = ref_model_path()?;
     let (draft_path, draft_from) = draft_file(levers.mtp_draft(), &path);
+    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let inputs = PlanInputs::describe(&split)?;
     // The draft's one context condition (a window's positions) holds at any
     // context the rule grants; it is asked again at the final context below.
-    let (mtp, draft_off) = draft38(&levers, a.place, a.ctx.unwrap_or(CTX), &draft_path)?;
+    let (mtp, draft_off) = draft38(&levers, a.place, a.ctx.unwrap_or(CTX), &draft_path, &inputs)?;
     // A draft lever set on a server that drafts nothing is refused, with why.
     if let Some(why) = &draft_off {
         if levers.mtp_head_rows().is_some() {
@@ -969,8 +991,6 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
     // The plan record, and `/props` from the same plan the load runs by:
     // under the draft `plan_mtp_with`'s, its draft's card bytes (granules,
     // store, row map) and its program's arena the card's `draft` class.
-    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let inputs = PlanInputs::describe(&split)?;
     let model = model_props(&split, &inputs.model);
     // The head is picked once, here; the load prints the pick.
     let head = match mtp {
@@ -1028,7 +1048,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         );
     }
     let ctx = rule.ctx;
-    if draft38(&levers, a.place, ctx, &draft_path)?.0 != mtp {
+    if draft38(&levers, a.place, ctx, &draft_path, &inputs)?.0 != mtp {
         return Err(format!(
             "a slot's context of {ctx} leaves no positions for the MTP draft's window; \
              --ctx-size names a total one past {}",
@@ -1042,6 +1062,7 @@ pub fn run(args: &[String]) -> Result<ServeError, GateError> {
         (u64::try_from(ctx)?, u64::try_from(ub)?),
         experts,
         mtp_inputs.as_ref(),
+        slots,
     )?;
     let (plan, draft_bytes) = match &mtp_inputs {
         None => (
@@ -1263,7 +1284,7 @@ impl Q38 {
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
         let mut m = match a.mtp {
             false => {
-                let machine = a.place.machine(&inputs, ctx_ub, a.experts, None)?;
+                let machine = a.place.machine(&inputs, ctx_ub, a.experts, None, a.slots)?;
                 let plan = inputs.plan_with_slots(
                     &machine,
                     u64::try_from(a.ctx)?,
@@ -1289,7 +1310,9 @@ impl Q38 {
                     .ok_or("a drafted load with no head picked")?;
                 let draft = open_draft(&a.draft_path, a.draft_from)?;
                 let mtp = MtpInputs::read(&draft, &file, &inputs, head.rows.clone())?;
-                let machine = a.place.machine(&inputs, ctx_ub, a.experts, Some(&mtp))?;
+                let machine = a
+                    .place
+                    .machine(&inputs, ctx_ub, a.experts, Some(&mtp), a.slots)?;
                 let plan = inputs.plan_mtp_with_slots(
                     &machine,
                     u64::try_from(a.ctx)?,

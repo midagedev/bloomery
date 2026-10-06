@@ -55,6 +55,7 @@ pub fn residency38(
                     let need = HostNeed::of(plan, 0).bytes();
                     residency38_at_plan(
                         plan.n_l.iter().copied(),
+                        plan.host.experts,
                         |pinned| ChurnPool::of(plan, CARD38, pinned).map(|pool| pool.bytes),
                         plan.host.headroom_bytes,
                         i128::from(available) - i128::from(need),

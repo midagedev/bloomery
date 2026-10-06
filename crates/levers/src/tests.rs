@@ -599,9 +599,10 @@ fn residency38_unset_follows_the_plan() {
     // The pool is 10 B an expert past the pinned ones, on two layers of the
     // fewest; the headroom takes it or does not.
     let pool = |fewest: usize| move |p: usize| Ok::<u64, ()>(2 * 10 * (fewest - p) as u64);
+    // The host holds one expert unless a case says otherwise.
     let pick_mem = |n_l: &[u64], headroom: i128, mem_left: i128| {
         let fewest = n_l.iter().copied().filter(|&n| n > 0).min().unwrap_or(0) as usize;
-        residency38_at_plan(n_l.iter().copied(), pool(fewest), headroom, mem_left)
+        residency38_at_plan(n_l.iter().copied(), 1, pool(fewest), headroom, mem_left)
             .expect("no pool error")
     };
     let pick = |n_l: &[u64], headroom: i128| pick_mem(n_l, headroom, 1 << 40);
@@ -634,6 +635,29 @@ fn residency38_unset_follows_the_plan() {
         );
         assert_eq!(p.word(), "off");
     }
+    // A plan that leaves the host no routed expert: the pool would serve
+    // none, whatever room the card and the host have.
+    let all_on_cards =
+        residency38_at_plan([512u64, 512], 0, pool(512), 1 << 40, 1 << 40).expect("no pool error");
+    assert_eq!(
+        all_on_cards,
+        Residency38Pick {
+            pinned: None,
+            why: Residency38Why::NoHostExperts
+        }
+    );
+    assert_eq!(all_on_cards.word(), "off");
+    assert_eq!(
+        all_on_cards.why.to_string(),
+        "unset: the plan holds every routed expert on a card; a churn pool would serve none"
+    );
+    assert_eq!(
+        residency38_at_plan([0u64, 0], 0, pool(0), 1 << 40, 1 << 40)
+            .expect("no pool error")
+            .why,
+        Residency38Why::NoCardExperts,
+        "no card expert is the first why"
+    );
     for fewest in [1u64, 2] {
         assert_eq!(
             pick(&[fewest, 9], 1 << 40),
@@ -684,7 +708,7 @@ fn residency38_unset_follows_the_plan() {
         "unset: the churn pool needs 2980 B, MemAvailable leaves 2979 B past the plan's host need"
     );
     assert_eq!(
-        residency38_at_plan([297u64], |_| Err::<u64, &str>("the pool"), 0, 0),
+        residency38_at_plan([297u64], 1, |_| Err::<u64, &str>("the pool"), 0, 0),
         Err("the pool"),
         "the pool's error is the call's"
     );
@@ -732,6 +756,14 @@ fn draft38_unset_follows_the_place_and_the_file() {
     assert_eq!(
         Draft38Off::NoFile(file.to_path_buf()).to_string(),
         "no file at /models/q/mtp.gguf"
+    );
+    assert_eq!(
+        Draft38Off::Borrowed {
+            name: "output.weight".to_string(),
+            ty: "q6_K".to_string()
+        }
+        .to_string(),
+        "unset: the target's output.weight is q6_K; the MTP draft reads it as Q8_0"
     );
 }
 

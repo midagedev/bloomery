@@ -1046,6 +1046,9 @@ pub enum Residency38Why {
     PrefillStep,
     /// The plan holds no routed expert on the card.
     NoCardExperts,
+    /// The plan leaves no routed expert on the host: the churn pool would
+    /// serve none.
+    NoHostExperts,
     /// The plan's fewest card experts a layer, `fewest`, leave no room for
     /// half of them pinned, the spares and one that moves.
     NoRoom { fewest: usize },
@@ -1078,6 +1081,9 @@ impl fmt::Display for Residency38Why {
             Residency38Why::NoCardExperts => {
                 f.write_str("unset: the plan holds no routed expert on the card")
             }
+            Residency38Why::NoHostExperts => f.write_str(
+                "unset: the plan holds every routed expert on a card; a churn pool would serve none",
+            ),
             Residency38Why::NoRoom { fewest } => write!(
                 f,
                 "unset: the plan's fewest card experts a layer ({fewest}) leave no room for half \
@@ -1143,16 +1149,19 @@ pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
 }
 
 /// [`RESIDENCY`] unset on plan (a), from the plan: `card_experts` its card
-/// experts a layer (a layer holding none left out), `pool_bytes` the churn
-/// pool's bytes at P pinned, `headroom` the plan's host headroom and
-/// `mem_left` what the host's `MemAvailable` leaves past the plan's own host
-/// need (the load's check before any upload). P is half the fewest; `off`
-/// when no layer holds one, when the fewest leave no room for P pinned, the
-/// spares and one that moves, or when the pool at P does not fit the
-/// headroom or `mem_left` — a default the user did not set never refuses the
-/// load. An error of `pool_bytes` is the call's.
+/// experts a layer (a layer holding none left out), `host_experts` the
+/// routed experts it leaves on no card, `pool_bytes` the churn pool's bytes
+/// at P pinned, `headroom` the plan's host headroom and `mem_left` what the
+/// host's `MemAvailable` leaves past the plan's own host need (the load's
+/// check before any upload). P is half the fewest; `off` when no layer holds
+/// one, when the host holds none (the pool would serve nothing), when the
+/// fewest leave no room for P pinned, the spares and one that moves, or when
+/// the pool at P does not fit the headroom or `mem_left` — a default the
+/// user did not set never refuses the load. An error of `pool_bytes` is the
+/// call's.
 pub fn residency38_at_plan<E>(
     card_experts: impl IntoIterator<Item = u64>,
+    host_experts: u64,
     pool_bytes: impl FnOnce(usize) -> Result<u64, E>,
     headroom: i128,
     mem_left: i128,
@@ -1160,6 +1169,9 @@ pub fn residency38_at_plan<E>(
     let Some(fewest) = card_experts.into_iter().filter(|&n| n > 0).min() else {
         return Ok(Residency38Pick::off(Residency38Why::NoCardExperts));
     };
+    if host_experts == 0 {
+        return Ok(Residency38Pick::off(Residency38Why::NoHostExperts));
+    }
     let fewest = usize::try_from(fewest).unwrap_or(usize::MAX);
     let pinned = fewest / 2;
     if pinned == 0 || fewest < pinned + RESIDENCY38_SPARES + 1 {
@@ -1221,6 +1233,9 @@ pub enum Draft38Off {
     NoFile(PathBuf),
     /// Unset, and the last window needs `need` positions of `ctx`.
     Ctx { need: usize, ctx: usize },
+    /// Unset on the Qwen3.8 seat, and the target's `name`, a matrix the
+    /// draft borrows, is `ty` (or `absent`), not the Q8_0 the draft reads.
+    Borrowed { name: String, ty: String },
 }
 
 impl fmt::Display for Draft38Off {
@@ -1238,6 +1253,10 @@ impl fmt::Display for Draft38Off {
             Draft38Off::Ctx { need, ctx } => write!(
                 f,
                 "unset: the last window needs {need} positions, past --ctx {ctx}"
+            ),
+            Draft38Off::Borrowed { name, ty } => write!(
+                f,
+                "unset: the target's {name} is {ty}; the MTP draft reads it as Q8_0"
             ),
         }
     }

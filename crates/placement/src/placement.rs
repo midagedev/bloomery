@@ -38,6 +38,9 @@ pub mod churn;
 pub mod devices;
 pub mod workstation;
 
+#[cfg(test)]
+mod qwen38_cards;
+
 pub use models::{Role, Unimplemented};
 
 /// `features` grouped by feature in first-seen order, each with its layers:
@@ -859,11 +862,11 @@ pub enum PlacementError {
         usable: u64,
     },
     /// An expert tier card left with no expert, because the cards before it
-    /// already hold every routed expert of the model: a tier the plan does
+    /// already hold every routed expert a card can: a tier the plan does
     /// not need.
     #[error(
         "tier card {card} (tier {tier}) holds no expert: the cards before it hold every routed \
-         expert of the model; plan without it"
+         expert of the layers whose stacks a card can hold; plan without it"
     )]
     IdleTier { card: String, tier: usize },
     /// A draft reserve on a tier the plan does not have.
@@ -1802,9 +1805,15 @@ fn plan_rule<'a>(
         };
         let mut own = vec![0u64; model.layers];
         fill.run(&mut own, &held)?;
-        let left = (0..model.layers)
-            .filter(|&l| !stacks[l].is_empty())
-            .any(|l| held[l] < model.experts);
+        // Under a card format only a layer whose stacks a card can hold
+        // leaves the tier work; the planner that puts every routed stack on
+        // the host leaves its caller the tier.
+        let left = match routed {
+            Some(_) => eligible.iter().any(|&l| held[l] < model.experts),
+            None => (0..model.layers)
+                .filter(|&l| !stacks[l].is_empty())
+                .any(|l| held[l] < model.experts),
+        };
         if !left && own.iter().all(|&n| n == 0) {
             return Err(PlacementError::IdleTier {
                 card: tier.name.clone(),
@@ -2559,7 +2568,7 @@ mod tests {
             Err(e @ PlacementError::IdleTier { .. }) => assert_eq!(
                 e.to_string(),
                 "tier card tier (tier 0) holds no expert: the cards before it hold every routed \
-                 expert of the model; plan without it"
+                 expert of the layers whose stacks a card can hold; plan without it"
             ),
             Err(e) => panic!("{e}, not IdleTier"),
             Ok(_) => panic!("the idle tier was planned"),

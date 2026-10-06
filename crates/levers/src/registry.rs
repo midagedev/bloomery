@@ -262,11 +262,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `--place gate`, beside `--logits` or `BLOOMERY_ROUTE_TRACE`, with no file there, \
               and when an arm's last four-row window would pass `--ctx` (depth + n + 2 \
               positions) — each printed as a `load draft=off (<why>)` record after the `load` \
-              line (`no file at <path>` for the missing file), never a refusal. \
+              line (`no file at <path>` for the missing file), never a refusal; with the file \
+              there, a target whose `token_embd` or `output` is not Q8_0, the format the draft \
+              reads them in, is refused by name before the load. \
               `bloomery-serve-qwen38` follows the same rule, its conditions the seat's: under \
               `--place a` the draft when its file is there; the plain path under `--place gate`, \
-              with no file there, and with stores too short for one window (`--ctx-size` under \
-              5: the server takes a window only while its rows fit), with the same record; it \
+              with no file there, with stores too short for one window (`--ctx-size` under \
+              5: the server takes a window only while its rows fit), and when the target's \
+              `token_embd` or `output` is not Q8_0, the format the draft reads them in (a set \
+              `mtp` is refused there by name before the load), with the same record; it \
               has no `--logits` (a request that reads the logits row steps plainly) and takes \
               no route trace. The GLM seat of `bloomery-serve` takes `mtp` and `off`; unset \
               (`bloomery_levers::glm_unset`, a `draft unset` record before the plan) it drafts \
@@ -449,7 +453,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               the load runs (the plain or the MTP plan, at its `--ctx`), derived at load so \
               the default always fits the plan; `off` under `--place gate`, beside \
               `BLOOMERY_ROUTE_TRACE`, with `--prefill step`, under `--dump-taps`, on a \
-              qwen3moe or qwen35moe file, when the plan holds no card expert or its fewest \
+              qwen3moe or qwen35moe file, when the plan holds no card expert, when it leaves \
+              no routed expert on the host (the pool would serve none) or its fewest \
               leave no room for P pinned, one spare and one that moves, and when the churn \
               pool at P does not fit the plan's host headroom or what the host's \
               `MemAvailable` leaves past the plan's host need — never a refusal; the word and \

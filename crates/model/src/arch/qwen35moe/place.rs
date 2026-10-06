@@ -45,7 +45,7 @@ use models::{DraftSpec, Ffn, HcKind, HeadRows, Mixer, ModelSpec, MtpDraft, MtpSo
 use sha2::{Digest, Sha256};
 
 use super::hparams::{Hparams, Kind};
-use super::{mtp, roles, spec};
+use super::{mtp, names, roles, spec};
 use crate::arch::chat_of;
 use crate::arch::coverage;
 use crate::fileio::hex;
@@ -211,6 +211,14 @@ pub enum PlaceError {
     /// A plan of no resident sequence slot.
     #[error("{slots} resident sequence slots: a plan serves at least one")]
     Slots { slots: usize },
+    /// A target matrix an MTP draft file borrows ([`PlanInputs::mtp_borrows`])
+    /// absent, or in another format than the one the draft's program reads.
+    #[error(
+        "the target's {name} is {}; the MTP draft reads the target's token_embd and output as \
+         Q8_0",
+        ty.map_or("absent".to_string(), |t| t.to_string())
+    )]
+    DraftBorrow { name: String, ty: Option<GgmlType> },
 }
 
 /// The violations, `; `-separated.
@@ -232,6 +240,26 @@ impl PlanInputs {
         } else {
             Err(PlacementError::Unimplemented(missing))
         }
+    }
+
+    /// The target's matrices an MTP draft file borrows, `token_embd` and
+    /// `output`, each in the format the draft's program reads them in, Q8_0;
+    /// else the first that is absent or another format, by name
+    /// ([`PlaceError::DraftBorrow`]). [`MtpInputs::read`] refuses a draft by
+    /// it; the Qwen3.8 seat's unset `BLOOMERY_DRAFT` drafts nothing by it.
+    pub fn mtp_borrows(&self) -> Result<(), PlaceError> {
+        for name in [names::token_embd(), names::output()] {
+            let ty = self
+                .model
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.ty);
+            if ty != Some(GgmlType::Q8_0) {
+                return Err(PlaceError::DraftBorrow { name, ty });
+            }
+        }
+        Ok(())
     }
 
     /// [`PlanInputs::read`] without the refusal of unimplemented features.
@@ -1557,18 +1585,30 @@ impl MtpInputs {
     /// The bytes the draft adds to the target's card at `ctx_max` positions
     /// ([`MtpPlan::draft_card_bytes`] and its arena): the stage card's
     /// [`MTP_RESERVE`] row of a plan (b′) machine that runs the draft
-    /// ([`machine_bp`]). Refused as [`PlanInputs::plan_mtp`] refuses the
-    /// context and the draft's plan.
+    /// ([`machine_bp`]) for one sequence. Refused as [`PlanInputs::plan_mtp`]
+    /// refuses the context and the draft's plan.
     pub fn card_bytes(&self, ctx_max: u64) -> Result<u64, PlaceError> {
+        self.card_bytes_of(ctx_max, 1)
+    }
+
+    /// [`MtpInputs::card_bytes`] for a load that serves `slots` resident
+    /// sequences: the reserve [`PlanInputs::plan_mtp_with_slots`] checks a
+    /// plan (b′) machine for, from the one owner of both,
+    /// [`MtpInputs::draft_plan_of`].
+    pub fn card_bytes_of(&self, ctx_max: u64, slots: usize) -> Result<u64, PlaceError> {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
         }
-        self.draft_plan(ctx_max).map(|(_, bytes)| bytes)
+        if slots == 0 {
+            return Err(PlaceError::Slots { slots });
+        }
+        self.draft_plan_of(ctx_max, slots).map(|(_, bytes)| bytes)
     }
 
     /// The MTP draft `draft` read against the target `target` that `inputs`
     /// describes (`mtp::mtp_of`), its head scoring `rows`. Refused by name:
-    /// what `mtp_of` refuses; a draft file that carries its own `token_embd`
+    /// a target whose borrowed matrices are not the draft's format
+    /// ([`PlanInputs::mtp_borrows`]); what `mtp_of` refuses; a draft file that carries its own `token_embd`
     /// or `output` (this load borrows the target's); a row list of another
     /// tokenizer than the target's; and what [`MtpInputs::from_parts`]
     /// refuses.
@@ -1578,6 +1618,7 @@ impl MtpInputs {
         inputs: &PlanInputs,
         rows: HeadRows,
     ) -> Result<MtpInputs, PlaceError> {
+        inputs.mtp_borrows()?;
         let d = match mtp::mtp_of(draft, target, &inputs.spec)? {
             DraftSpec::Mtp(d) => *d,
             DraftSpec::Block(_) => {
@@ -2860,8 +2901,8 @@ mod tests {
         use models::{Arch, ChatSpec, HeadRows, ModelSpec};
 
         use super::super::{
-            Experts, KvLayout, MtpInputs, PlanInputs, draft_card_bytes, mtp_arena_bytes,
-            slot_resident_bytes,
+            Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, draft_card_bytes, machine_bp,
+            mtp_arena_bytes, slot_resident_bytes, tier_batch_of,
         };
         use super::mtp::{draft, file};
         use crate::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
@@ -3109,6 +3150,99 @@ mod tests {
                     inputs.seq_terms(Some(&mtp)).plan_kv(CTX, slots),
                     "{n} slots"
                 );
+            }
+        }
+
+        /// The target's `token_embd` and `output`, which an MTP draft file
+        /// borrows, pass only as Q8_0; the first absent or of another format
+        /// is named (the UD-Q3_K_XL file's `output` is Q6_K).
+        #[test]
+        fn mtp_borrows_name_a_matrix_not_q8_0() {
+            let matrix = |name: &str, ty: GgmlType| ModelTensor {
+                name: name.to_string(),
+                shard: 0,
+                layer: None,
+                role: Role::Head,
+                ty,
+                dims: vec![2560, 248_320],
+                file_bytes: 0,
+                gathered_rows: None,
+            };
+            let with = |embd: Option<GgmlType>, out: Option<GgmlType>| {
+                let mut i = inputs();
+                i.model.tensors.extend(
+                    [("token_embd.weight", embd), ("output.weight", out)]
+                        .into_iter()
+                        .filter_map(|(n, ty)| ty.map(|ty| matrix(n, ty))),
+                );
+                i.mtp_borrows()
+            };
+            assert!(with(Some(GgmlType::Q8_0), Some(GgmlType::Q8_0)).is_ok());
+            for (embd, out, name, ty) in [
+                (
+                    Some(GgmlType::Q8_0),
+                    Some(GgmlType::Q6_K),
+                    "output.weight",
+                    Some(GgmlType::Q6_K),
+                ),
+                (
+                    Some(GgmlType::Q4_K),
+                    Some(GgmlType::Q6_K),
+                    "token_embd.weight",
+                    Some(GgmlType::Q4_K),
+                ),
+                (Some(GgmlType::Q8_0), None, "output.weight", None),
+            ] {
+                match with(embd, out) {
+                    Err(PlaceError::DraftBorrow { name: n, ty: t }) => {
+                        assert_eq!((n.as_str(), t), (name, ty));
+                    }
+                    other => panic!("{embd:?} {out:?}: {other:?}"),
+                }
+            }
+            match with(Some(GgmlType::Q8_0), Some(GgmlType::Q6_K)) {
+                Err(e) => assert_eq!(
+                    e.to_string(),
+                    "the target's output.weight is q6_K; the MTP draft reads the target's \
+                     token_embd and output as Q8_0"
+                ),
+                Ok(()) => panic!("a Q6_K output passed"),
+            }
+        }
+
+        /// A plan (b′) machine that reserves the draft's card bytes for the
+        /// slots it plans (`MtpInputs::card_bytes_of`, the serve seat's
+        /// reserve) passes the drafted plan's reserve check at 1, 2 and 4
+        /// slots; the one-sequence reserve (`MtpInputs::card_bytes`) is
+        /// refused by name at 2, the draft's store counting both.
+        #[test]
+        fn bp_reserves_the_drafts_slots() {
+            let inputs = inputs();
+            let mtp =
+                MtpInputs::from_parts(draft(HeadRows::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            let batch = tier_batch_of(2560, 10, 4096);
+            for n in [1, 2, 4] {
+                let reserve = mtp.card_bytes_of(CTX, n).expect("the draft's card bytes");
+                let machine = machine_bp(LAYERS, 4096, Some(reserve), batch);
+                let r = inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Card, n);
+                assert!(
+                    !matches!(r, Err(PlaceError::DraftReserve { .. })),
+                    "{n} slots: {:?}",
+                    r.err()
+                );
+            }
+            let one = mtp.card_bytes(CTX).expect("one sequence's card bytes");
+            let two = mtp
+                .card_bytes_of(CTX, 2)
+                .expect("two sequences' card bytes");
+            assert!(two > one, "{two} B for two sequences, {one} B for one");
+            let machine = machine_bp(LAYERS, 4096, Some(one), batch);
+            match inputs.plan_mtp_with_slots(&machine, CTX, &levers, &mtp, Experts::Card, 2) {
+                Err(PlaceError::DraftReserve { got, want, .. }) => {
+                    assert_eq!((got, want), (vec![one], Some(two)));
+                }
+                other => panic!("want the draft reserve refused: {:?}", other.err()),
             }
         }
     }

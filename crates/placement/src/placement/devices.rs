@@ -889,6 +889,53 @@ mod tests {
         }
     }
 
+    /// A card no measured figure names, as its driver names it, of a 96 GB
+    /// class total [assumed: a 97,887 MiB total less the 548 MiB reserve
+    /// measured on the A6000].
+    const NAME_PRO6000: &str = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition";
+    const TOTAL_PRO6000: u64 = 97_339 * MIB;
+
+    /// One, two and four such cards: each its census total, labelled from
+    /// the driver name; `a` the lowest ordinal among equal usable bytes —
+    /// whatever each card read free, so a card another process holds is
+    /// still picked first — `bp` the two lowest, and `gate`, the 3090 by
+    /// name, none. A card of fewer usable bytes (ECC on, say) ranks below
+    /// the others.
+    #[test]
+    fn equal_large_cards_rank_by_ordinal() {
+        let label = "RTX_PRO_6000_Blackwell_Max-Q_Workstation_Edition";
+        for n in [1, 2, 4] {
+            let mut c = census(&vec![(NAME_PRO6000, TOTAL_PRO6000); n]);
+            let s = spec_of_device(&c[0]);
+            assert_eq!(
+                (s.name, s.usable_bytes(), s.driver_reserve_bytes),
+                (label, TOTAL_PRO6000, 0)
+            );
+            assert_eq!(place("a", &c), Ok(vec![(label, 0)]), "{n} cards");
+            let bp = if n == 1 {
+                Err(PickWhy::Few(1))
+            } else {
+                Ok(vec![(label, 0), (label, 1)])
+            };
+            assert_eq!(place("bp", &c).map_err(|e| e.why), bp, "{n} cards");
+            assert_eq!(
+                place("gate", &c).map_err(|e| e.why),
+                Err(PickWhy::Missing),
+                "{n} cards"
+            );
+            c[0].free_bytes = 8192 * MIB;
+            assert_eq!(
+                place("a", &c),
+                Ok(vec![(label, 0)]),
+                "{n} cards, cuda0 held"
+            );
+        }
+        let mut c = census(&[(NAME_PRO6000, TOTAL_PRO6000); 4]);
+        c[0].total_bytes -= 2048 * MIB;
+        assert_eq!(place("a", &c), Ok(vec![(label, 1)]));
+        assert_eq!(place("bp", &c), Ok(vec![(label, 1), (label, 2)]));
+    }
+
     /// Two 3090s plan as a stage and its tier ([`plan_tiers`]), where the
     /// same two cards by name (no census) are one device listed twice; the
     /// box's resolved `a` and `bp` are plan (a) and plan (b′) but for the
