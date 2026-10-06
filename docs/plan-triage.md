@@ -46,6 +46,22 @@ second term. His `/metrics` (asked on #1) settle E and W.
 ### The next release: IQ quants and the two-channel host (the user, 2026-10-07)
 
 The user: these two lead and go out together.
+
+**Schedule (the user, 2026-10-07 08:10: gatewall first; everything, prefill included, done before 15:00; Claude
+rounds allowed freely).** One release train instead of a batch per piece (every `crates/gpu` piece selects the same
+~120 gates):
+1. iqwire lands alone when its batch ends (~09:00).
+2. gatewall (opus `gatewallr`, worker2): lane-A work stealing, per-family arch rows and a `weights.rs` row, every
+   functional 3090 pin that is not a public-number fact converted to `any`, AGENTS.md's card paragraph. It moves
+   every key, so it lands alone, as soon as it is green.
+3. Rounds on `relbase` (main + iqwire + wslfix6b): xstream R2+R3 (`xstream23`) and the profile seed
+   (`resprofile`), both opus.
+4. 11:30–12:30 sittings on the round trees, the decisive one first: xstream-pp, then the decode cards (resclock,
+   draftgate, the wslfix6b A/B).
+5. 12:15 cut-off: every piece Mac-green with its owning gates green on its round ledger: wslfix6b, resclock2,
+   draftgate, xstreamrule, xstream23, resprofile, ple64r, q3seat. A piece that misses it goes to the next release.
+6. One train branch in that order, the check scripts, `records-refresh`, one union batch (`--ledger`). Land all
+   (~13:45), release notes, tag (~14:30).
 - **IQ quants:**
   - iqwire (Qwen3.8 UD-Q3_K_XL: IQ3_XXS/IQ4_XS gate·up, IQ4_NL down, on the card and the host; landing batch
     running).
