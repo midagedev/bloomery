@@ -66,7 +66,8 @@
 //!   The copy as the history left it is read; after the seat's reset the
 //!   history's prompt is fed the serve's way (`generate::ServeFeed`), and
 //!   the row of its last id (row 0) is kept, the boundaries before that row
-//!   landing no flip (named). After the teardown, one more load — the
+//!   landing no flip (fed again, up to `SETTLE_FEEDS` feeds, until one lands
+//!   none; named). After the teardown, one more load — the
 //!   residency off, each routed layer's card experts the read copy's
 //!   (`Loaded::open_edited`, `generate::place_table`; named: no machine, and
 //!   the card holds the copy's sets) — is fed the same ids the same way:
@@ -155,7 +156,7 @@ mod gate {
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{Residency, SlotState, SwapMachine, SwapSource};
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu_gates::generate::{Residence, ServeFeed, place_table};
+    use bloomery_gpu_gates::generate::{Residence, place_table};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_gpu_glm5next::{Body, Glm5nextModel, PrefillMode, feed, set_prefill};
@@ -680,22 +681,10 @@ mod gate {
 
     /// [`StaticProbe`] on `s`, after the last history.
     fn static_probe(s: &mut Session<Body>, ids: &[u32]) -> Result<StaticProbe, GateError> {
-        let table = residence(s)?.table()?;
-        runtime::Target::reset(s)?;
-        let (_, _, b) = s.model_mut().body_parts(NAME)?;
-        b.take_residency_passes();
-        ServeFeed {
-            inner: &mut runtime::Plain,
-        }
-        .prompt(s, ids)?;
-        let row0 = s.model().logits()?;
-        let (_, _, b) = s.model_mut().body_parts(NAME)?;
-        Ok(StaticProbe::of(
-            ids,
-            table,
-            row0,
-            &b.take_residency_passes(),
-        ))
+        crate::residency_clauses::static_probe(s, ids, residence, |s| {
+            let (_, _, b) = s.model_mut().body_parts(NAME)?;
+            Ok(b.take_residency_passes())
+        })
     }
 
     /// `static`, its other half, after the residency load's teardown: a load
