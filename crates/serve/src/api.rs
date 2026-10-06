@@ -66,6 +66,11 @@ use crate::slotfile;
 use crate::template::{ChatTemplate, TemplateError};
 use crate::worker::{self, Acted, Action, Msg, Shared, Submit};
 
+/// Anthropic's Messages API, a child of this module so it runs the chat path's
+/// own steps.
+#[path = "anthropic.rs"]
+mod anthropic;
+
 /// What the server says about itself and how it samples.
 pub struct ServerConfig {
     /// `model` in responses and the `/v1/models` id.
@@ -768,6 +773,8 @@ fn route(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
         ("POST", "/residency/reset") => return residency_reset(state, req, w),
         ("POST", "/completion" | "/completions") => return completion(state, req, w),
         ("POST", "/v1/chat/completions" | "/chat/completions") => return chat(state, req, w),
+        ("POST", "/v1/messages") => return anthropic::messages(state, req, w),
+        ("POST", "/v1/messages/count_tokens") => return anthropic::count_tokens(state, req, w),
         ("POST", "/tokenize") => body(req).and_then(|b| tokenize(state, &b)),
         ("POST", "/detokenize") => body(req).and_then(|b| detokenize(state, &b)),
         ("POST", "/apply-template") => body(req).and_then(|b| apply_template(state, &b)),

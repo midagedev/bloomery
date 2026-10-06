@@ -1,6 +1,8 @@
 //! bloomery-serve: a llama-server-compatible HTTP API over an [`Engine`].
 //!
-//! Endpoints: `POST /v1/chat/completions`, `POST /completion`, `POST /tokenize`,
+//! Endpoints: `POST /v1/chat/completions`, `POST /v1/messages` and
+//! `POST /v1/messages/count_tokens` (Anthropic's Messages API on the chat
+//! path), `POST /completion`, `POST /tokenize`,
 //! `POST /detokenize`, `POST /apply-template`, `GET /v1/models`, `GET /health`,
 //! `GET /props`, `GET /slots`, `POST /slots/{id}?action=save|restore|erase`,
 //! `GET /metrics`, and `POST /residency/reset` (bloomery's own). JSON field names, defaults and stream framing are

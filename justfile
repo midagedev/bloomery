@@ -928,8 +928,9 @@ gate-decision-clef:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-decision --lib --test clef -- --include-ignored --nocapture'
 # HTTP 서버 게이트(모의 엔진): llama-server JSON 형태, SSE 프레이밍, 정지 규칙(정지 id 목록 전부), V4.1·GLM 채팅 템플릿 렌더링,
 # GLM 도구 호출 파서(glmxml), 연결 상한·유휴 연결 종료·컨텍스트 끝의 정지(limits). 박스 자원 불필요.
+# Anthropic's Messages API on the chat path (anthropic).
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test limits -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test limits --test anthropic -- --include-ignored --nocapture'
 
 # engram IO 실험실의 시험(crates/engram-lab, 엔진 사용처 없음): 컨텍스트 창의 슬롯 순서, 행 캐시의 LRU를 스택
 # 거리 모의와 대조, 캐시가 내주는 바이트. 이름이 gate-가 아니라 lab-이라 `just affected`가 엔진 착륙에서 고르지
