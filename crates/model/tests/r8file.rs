@@ -861,7 +861,8 @@ fn hw_a_host_tier_load_refuses_a_sidecar_whose_source_differs() {
     assert_eq!(
         r8.to_string(),
         format!(
-            "r8=off (no sidecar at {}: just r8-sidecar)",
+            "r8=off (no sidecar at {}; optional: a source checkout writes it with just \
+             r8-sidecar)",
             layer.sidecar.display()
         )
     );
