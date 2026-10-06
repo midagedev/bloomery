@@ -7,8 +7,11 @@
 //! `<entry>\t<regs>\t<local>\t<shared>\t<max_threads>` —
 //! `CU_FUNC_ATTRIBUTE_NUM_REGS`, `LOCAL_SIZE_BYTES`, `SHARED_SIZE_BYTES`
 //! (static) and `MAX_THREADS_PER_BLOCK` — after one `#` line that names the
-//! card and the driver's CUDA version. `tools/ptx-scan.sh` joins the first
-//! two as its `jit_regs` and `jit_local` columns.
+//! card, its compute capability and the driver's CUDA version.
+//! `tools/ptx-scan.sh` joins the first two as its `jit_regs` and `jit_local`
+//! columns, and a scan pair compares the capability (`jit-cc`), never the
+//! card name: the JIT columns follow the capability and the driver, not which
+//! card of one capability JIT-ed the module.
 //!
 //! The kernels reach the card as PTX, so the registers a launch occupies are
 //! the ones the driver's JIT compiler allocates, not the toolkit ptxas's the
@@ -54,9 +57,12 @@ fn run() -> Result<(), bloomery_gpu_gates::GateError> {
     if rc != sys::cudaError_enum_CUDA_SUCCESS {
         return Err(DriverError(rc).into());
     }
+    let (cc_major, cc_minor) = ctx.compute_capability()?;
     println!(
-        "# card={} cuda_driver={}.{}",
+        "# card={} cc={}.{} cuda_driver={}.{}",
         ctx.device_name()?.replace(' ', "_"),
+        cc_major,
+        cc_minor,
         version / 1000,
         version % 1000 / 10
     );

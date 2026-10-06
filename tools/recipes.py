@@ -1875,9 +1875,12 @@ def cmd_box_command(args: argparse.Namespace) -> int:
 
 GATE_PATHS = "tools/gate-paths.tsv"
 PTX_CANON = "tools/ref/ptx-canon.py"
-# The banner fields two scans of a pair must agree on: another digest rule, assembler, arch or driver
-# makes the columns incomparable, which is not the same as a kernel that moved.
-SCAN_SAME = ("method", "ptxas-version", "arch", "jit-card", "jit-cuda")
+# The banner fields two scans of a pair must agree on: another digest rule, assembler, arch, JIT
+# capability or driver makes the columns incomparable, which is not the same as a kernel that moved.
+# The JIT columns follow the card's compute capability, not its name (both cards here are sm_86 under
+# one driver, measured equal entry by entry): a pair scanned on either card of one capability
+# compares, so the name (jit-card) is never a compared field.
+SCAN_SAME = ("method", "ptxas-version", "arch", "jit-cc", "jit-cuda")
 NOT_HOST = re.compile(r"^docs/|\.card$|\.md$")
 # In a narrowed list only when the PTX or its own pins can have moved (narrow() owns the rule): the
 # spill ratchet over the scanned bins.
@@ -1956,10 +1959,17 @@ def scan_verdict(base: ScanLog, new: ScanLog) -> ScanVerdict:
     digest changed, or an entry removed). A pair of two binaries or of two scan setups is refused."""
     if base.bin != new.bin:
         raise RecipeError(f"scan pair {base.path} {new.path}: bin {base.bin} against bin {new.bin} — a pair is two scans of one binary")
-    for k in SCAN_SAME:
+    # A banner older than jit-cc names only the card: two such logs compare as before, by the card's
+    # name; one of each is refused, since the old side's capability is unknown.
+    olds = ("jit-cc" not in base.fields) + ("jit-cc" not in new.fields)
+    if olds == 1:
+        raise RecipeError(f"scan pair {base.path} {new.path}: one banner names no jit-cc (an older ptx-scan) — "
+                          "rescan it with this tree's tools before comparing")
+    same = SCAN_SAME if olds == 0 else tuple("jit-card" if k == "jit-cc" else k for k in SCAN_SAME)
+    for k in same:
         if base.fields.get(k) != new.fields.get(k):
             raise RecipeError(f"scan pair {base.path} {new.path}: {k}={base.fields.get(k)} against {k}={new.fields.get(k)} — "
-                              "rescan both under one toolchain and card before comparing")
+                              "rescan both under one toolchain and card capability before comparing")
     if base.header != new.header:
         raise RecipeError(f"scan pair {base.path} {new.path}: the tables have other columns")
     if sorted(base.bundles) != sorted(new.bundles):
@@ -4775,7 +4785,7 @@ def manifest_self_test(expect) -> None:
         # covers, pick nothing: a new entry changes no kernel
         lines = ["ptx-scan: mod1 bundle=bloomery-gpu bytes=100",
                  "ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 modules=1 "
-                 "jit-card=NVIDIA_RTX_A6000 jit-cuda=13.4",
+                 "jit-card=NVIDIA_RTX_A6000 jit-cc=8.6 jit-cuda=13.4",
                  "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local",
                  f"{'alpha':<24} 256 no 0 0 0 0 12 0 0 6 12 0", "ptx-scan-md5: method=decl1", f"alpha {'1' * 32} 41"]
         log = os.path.join(tmp, "scan.log")
@@ -5347,12 +5357,13 @@ def narrow_self_test(expect, side: Side) -> None:
     header = "entry reqntid depot ld.local st.local fma cvt.f16 regs smem spill blk/SM(static) jit_regs jit_local"
     h1, h2, h3 = "1" * 32, "2" * 32, "3" * 32
 
-    def scan(tmp: str, name: str, rows: dict[str, str], banner_extra: str = "", bundles=("bloomery-gpu",), md5_rows=None, banners=1) -> str:
+    def scan(tmp: str, name: str, rows: dict[str, str], banner_extra: str = "", bundles=("bloomery-gpu",), md5_rows=None, banners=1,
+             cc: str = "8.6") -> str:
         lines = ["./tools/box.sh 'cargo oxide build …'", "   Compiling bloomery-gpu v0.1.0 (/root/x/crates/gpu)"]
         lines += [f"ptx-scan: mod{i + 1} bundle={b} bytes=100" for i, b in enumerate(bundles)]
         for _ in range(banners):
             lines.append(f"ptx-scan bin=target/release/gx section=.oxart bytes=9 ptxas=/p ptxas-version=13.3.73 arch=sm_86 "
-                         f"modules={len(bundles)} jit-card=NVIDIA_RTX_A6000 jit-cuda=13.4{banner_extra}")
+                         f"modules={len(bundles)} jit-card=NVIDIA_RTX_A6000{' jit-cc=' + cc if cc else ''} jit-cuda=13.4{banner_extra}")
         lines.append(header)
         lines += [f"{e:<24} 256 no 0 0 0 0 12 0 0 6 12 0" for e in rows]
         lines.append("ptx-scan-md5: method=decl1")
@@ -5391,9 +5402,22 @@ def narrow_self_test(expect, side: Side) -> None:
         expect(refused(lambda: read_scan(scan(tmp, "cut.log", {"alpha": h1, "beta": h2}, md5_rows={"alpha": h1})), "only one of the table and the md5 block"),
                "narrow: a table row with no digest not refused")
         expect(refused(lambda: read_scan(os.path.join(tmp, "missing.log")), "missing.log"), "narrow: a missing log not refused by name")
-        other = read_scan(scan(tmp, "card.log", {"alpha": h1, "beta": h2}).replace("card.log", "card.log"))
+        # the JIT columns follow the card's compute capability, not its name: a pair scanned on either
+        # card of one capability is one table, a pair of two capabilities is refused, and an older
+        # banner that names no capability is refused by name — its JIT columns are not comparable
+        other = read_scan(scan(tmp, "card.log", {"alpha": h1, "beta": h2}))
         other.fields["jit-card"] = "NVIDIA_GeForce_RTX_3090"
-        expect(refused(lambda: scan_verdict(base, other), "jit-card="), "narrow: a pair scanned on two cards not refused")
+        expect(scan_verdict(base, other).kind == "identical",
+               "narrow: a pair scanned on two cards of one capability not read as identical")
+        other.fields["jit-cc"] = "9.0"
+        expect(refused(lambda: scan_verdict(base, other), "jit-cc="), "narrow: a pair scanned on two capabilities not refused")
+        old = read_scan(scan(tmp, "old.log", {"alpha": h1, "beta": h2}, cc=""))
+        expect(refused(lambda: scan_verdict(base, old), "names no jit-cc"),
+               "narrow: a pair of one older banner (no jit-cc) and one new not refused")
+        old2 = read_scan(scan(tmp, "old2.log", {"alpha": h1, "beta": h2}, cc=""))
+        expect(scan_verdict(old, old2).kind == "identical", "narrow: two older banners of one card no longer compare")
+        old2.fields["jit-card"] = "NVIDIA_GeForce_RTX_3090"
+        expect(refused(lambda: scan_verdict(old, old2), "jit-card="), "narrow: two older banners of two cards not refused")
         other = read_scan(scan(tmp, "bin.log", {"alpha": h1, "beta": h2}))
         other.bin = "gy"
         expect(refused(lambda: scan_verdict(base, other), "a pair is two scans of one binary"), "narrow: a pair of two binaries not refused")

@@ -102,8 +102,9 @@
 # module the way cuda-core does (cuModuleLoadData, default JIT options) and reads, per entry:
 #   jit_regs   CU_FUNC_ATTRIBUTE_NUM_REGS — the registers a launch of the entry occupies
 #   jit_local  CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES — per-thread local memory (spill and local arrays)
-# The banner names the card and the driver's CUDA version they came from (jit-card, jit-cuda). The
-# load needs a card, so it runs under the gate lock: a scan waits while another GPU gate holds it.
+# The banner names the card, its compute capability and the driver's CUDA version they came from
+# (jit-card, jit-cc, jit-cuda). The load needs a card, so it runs under the gate lock: a scan waits
+# while another GPU gate holds it.
 set -uo pipefail
 NAME=${1:-}
 FILTER=${2:-}
@@ -202,18 +203,20 @@ for MOD in "${MODFILES[@]}"; do
   ' "$MOD.err" >>"$TBL"
 done
 [ -z "$FAILED" ] || fail "$SEC $TOOLS modules=$NMOD ptxas-failed=$FAILED"
-# The driver's JIT on the box's card, the same section: one `# card=… cuda_driver=…` line, then
-# `<entry>\t<regs>\t<local>\t<shared>\t<max_threads>` per entry. Either card, the `any` form: both
-# are GA102 (sm_86) under one driver, so the table does not depend on which one JITs it — only the
-# `# card=` line does — and the scan does not queue behind the 3090's gate lock.
+# The driver's JIT on the box's card, the same section: one `# card=… cc=… cuda_driver=…` line, then
+# `<entry>\t<regs>\t<local>\t<shared>\t<max_threads>` per entry. Either card, the `any` form: the JIT
+# columns follow the card's compute capability and the driver, not its name — both cards are GA102
+# (sm_86) under one driver, so the table does not depend on which one JITs it — and the scan does not
+# queue behind the 3090's gate lock. A scan pair (tools/recipes.py) compares the capability
+# (jit-cc) and the driver (jit-cuda), never the card name.
 JITTBL=$MODS/jit
 if ! BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh "$JIT" "$PTX" >"$JITTBL" 2>"$MODS/jit.err"; then
   echo "ptx-scan: the driver JIT ($JIT) failed: $(tail -1 "$MODS/jit.err")" >&2
   fail "$SEC $TOOLS modules=$NMOD jit=failed"
 fi
-JITS=$(sed -n 's/^# card=\([^ ]*\) cuda_driver=\([^ ]*\)$/jit-card=\1 jit-cuda=\2/p' "$JITTBL")
+JITS=$(sed -n 's/^# card=\([^ ]*\) cc=\([^ ]*\) cuda_driver=\([^ ]*\)$/jit-card=\1 jit-cc=\2 jit-cuda=\3/p' "$JITTBL")
 if [ -z "$JITS" ]; then
-  echo "ptx-scan: $JIT printed no card line" >&2
+  echo "ptx-scan: $JIT printed no '# card=… cc=… cuda_driver=…' line (an older oxart_jit names no cc)" >&2
   fail "$SEC $TOOLS modules=$NMOD jit=failed"
 fi
 ROWS=$MODS/rows
