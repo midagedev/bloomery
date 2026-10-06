@@ -30,7 +30,11 @@ A recipe's inputs are:
     by table: its shared tables and the recipe's own targets' [[bin]]/[[test]]/[[bench]]/[[example]]
     entries, so another target's entry selects nothing; `manifest_view`) and build script, and
     repository paths named by a whole string literal (`"../../tools/ref/prompts.tsv"`
-    joined to CARGO_MANIFEST_DIR is read at run time and is in no dep-info). A module declared under
+    joined to CARGO_MANIFEST_DIR is read at run time and is in no dep-info) — except a literal that
+    resolves to a `.rs` file of a workspace package: source is reached by compilation (the module
+    walk of whatever compiles it), and a whole-string `.rs` literal in this tree is documentation of
+    an owner (levers' InPlace rows), never a run-time read. A `.rs` literal outside every package
+    (an excluded crate) is still an input. A module declared under
     `#[cfg(test)]` (or `cfg(all(…, test, …))`), and whatever it includes or names, belongs to the test
     builds of its own target — a lib's test target (`--lib` under cargo test, `--tests`,
     `--all-targets`), a test, a bench, and a bin's or example's own tree — never to the lib as a
@@ -828,6 +832,9 @@ class Tree:
                 targets=targets,
             )
         self.manifest_paths = {p.manifest for p in self.packages.values()}
+        # `dir/` of every workspace package: a .rs literal under one of these is source, not data
+        # (`_resolve_literals`); a .rs outside them (an excluded crate) stays an input.
+        self.pkg_dirs = tuple(sorted(p.dir + "/" for p in self.packages.values() if p.dir not in ("", ".")))
         self._walk_cache: dict[str, ModuleTree] = {}
         self.unresolved: list[str] = []
         self.depinfo: dict[str, tuple[set[str], float]] = {}  # bin name -> (files, mtime)
@@ -1041,6 +1048,12 @@ class Tree:
             else:
                 p = os.path.normpath(lit)
             if self.exists(p):
+                if p.endswith(".rs") and p.startswith(self.pkg_dirs):
+                    # a workspace package's source, not data: what compiles it reaches it through the
+                    # module walk, and nothing in this tree opens a .rs path at run time (levers'
+                    # InPlace rows name files as documentation). A run-time reader of one is a new
+                    # kind of read this rule must learn by name, in its own round.
+                    continue
                 out.append(p)
             elif self.isdir(p):
                 out.append(p.rstrip("/") + "/")
@@ -1851,7 +1864,8 @@ def cmd_box_command(args: argparse.Namespace) -> int:
 #   - a file under docs/, a `.card` or a `*.md` needs no row (not a host path);
 #   - the gates of a kernel carrier no scan pair covers: a device lib whose bundle is in no pair's
 #     banner, or a bin with kernels of its own, whenever the change touches that carrier's closure.
-# Then the static checks (ALWAYS), gate-ptx-spill, and every recipe the diff adds.
+# Then the static checks (ALWAYS), gate-ptx-spill when the PTX or its own pins can have moved (a
+# scan pair not identical, or a changed file the recipe reads), and every recipe the diff adds.
 #
 # The same table holds the weekly tier's triggers. A `weekly-*` name in a row is a trigger: a changed file
 # the row's glob matches names that recipe, with or without --narrow and whatever the scans say, and so
@@ -1865,7 +1879,8 @@ PTX_CANON = "tools/ref/ptx-canon.py"
 # makes the columns incomparable, which is not the same as a kernel that moved.
 SCAN_SAME = ("method", "ptxas-version", "arch", "jit-card", "jit-cuda")
 NOT_HOST = re.compile(r"^docs/|\.card$|\.md$")
-# In every narrowed list, whatever the rows say: the spill ratchet over the scanned bins.
+# In a narrowed list only when the PTX or its own pins can have moved (narrow() owns the rule): the
+# spill ratchet over the scanned bins.
 NARROW_ALWAYS = ["gate-ptx-spill"]
 KERNEL_ATTR = re.compile(r"#\s*\[\s*(?:kernel|cuda_module)\b")
 
@@ -2427,9 +2442,26 @@ def narrow(changed: list[str], a: Side | None, b: Side, scans: list[tuple[ScanLo
                     pick(n, f"{f} [{c.label}: kernels no scan pair covers]")
                 rule.append(f"{c.label} not scanned -> {len(c.recipes)} recipes")
         res.files.append(f"{f}: {'; '.join(rule)}")
-    for n in NARROW_ALWAYS:
-        if n in b.recipes:
-            picks.setdefault(n, "the spill ratchet over the scanned bins")
+    # The spill ratchet joins the narrowed list only when the PTX or its own pins can have moved: a
+    # scan pair that is not identical (a new entry has spill bytes no row pins), or a changed file
+    # the recipe itself reads — its scripts, tools/ref/ptx-shapes.tsv, the cargo globals (a
+    # toolchain move changes ptxas). Every pair identical under one toolchain means byte-equal PTX,
+    # so equal spill columns against equal pins: the check would read its own green back.
+    if any(v.kind != "identical" for v in res.verdicts):
+        for n in NARROW_ALWAYS:
+            if n in b.recipes:
+                picks.setdefault(n, "the spill ratchet: a scan pair is not identical")
+    else:
+        for n in NARROW_ALWAYS:
+            if n not in b.recipes:
+                continue
+            for f in changed:
+                if f == "justfile":
+                    continue
+                side = b if b.tree.exists(f) or a is None else a
+                if n in side.recipes and side.graph.inputs(n).match(f) is not None:
+                    picks.setdefault(n, f"the spill ratchet: its own input {f} moved")
+                    break
     res.picks = {n: picks[n] for n in gates if n in picks}
     return res
 
@@ -5375,8 +5407,15 @@ def narrow_self_test(expect, side: Side) -> None:
         expect(not n.full and set(n.picks) == {"gate-sampler", *NARROW_ALWAYS}, f"narrow: an added pair does not narrow: {n.full}")
         n = narrow(["rust-toolchain.toml"], side, side, [(base, md5)], rows)
         expect(any("ptx-scan gx: moved beta" in r for r in n.full), f"narrow: one md5 changed does not keep the full list: {n.full}")
+        expect(set(NARROW_ALWAYS) <= set(n.picks), f"narrow: a moved pair must keep the spill ratchet: {sorted(n.picks)}")
         n = narrow(["rust-toolchain.toml"], side, side, [(base, gone)], rows)
         expect(any("ptx-scan gx: moved beta (1 removed)" in r for r in n.full), f"narrow: a removed entry does not keep the full list: {n.full}")
+        expect(set(NARROW_ALWAYS) <= set(n.picks), f"narrow: a removed entry must keep the spill ratchet: {sorted(n.picks)}")
+        # a change of the ratchet's own pin file keeps it even with every pair identical: the tsv is
+        # the recipe's own script's read, so its own-target pick names it and nothing else moves
+        n = narrow(["tools/ref/ptx-shapes.tsv"], side, side, [(base, same)], rows)
+        expect(not n.full and set(n.picks) == set(NARROW_ALWAYS),
+               f"narrow: a ptx-shapes.tsv change keeps the spill ratchet alone: full={n.full} picks={sorted(n.picks)}")
         n = narrow(["rust-toolchain.toml"], side, side, [], rows)
         expect(any("no --scan pair" in r for r in n.full), f"narrow: no scan pair does not keep the full list: {n.full}")
         n = narrow(["Cargo.lock", "rust-toolchain.toml"], side, side, [(base, same)], rows)
@@ -5385,13 +5424,14 @@ def narrow_self_test(expect, side: Side) -> None:
         n = narrow(["rust-toolchain.toml"], side, side, [(base, same)], [row("rust-toolchain.toml", ["*"], 7)])
         expect(any(f"{GATE_PATHS}:7" in r for r in n.full), f"narrow: a `*` row does not keep the full list: {n.full}")
         n = narrow(["docs/plan.md"], side, side, [(base, same)], rows)
-        expect(not n.full and set(n.picks) == {"gate-tokenizer", *NARROW_ALWAYS} and "not a host path" in n.files[0],
-               f"narrow: docs/plan.md (walked by gate-tokenizer's oracle only): full={n.full} picks={sorted(n.picks)}")
+        expect(not n.full and set(n.picks) == {"gate-tokenizer"} and "not a host path" in n.files[0],
+               f"narrow: docs/plan.md (walked by gate-tokenizer's oracle only), an equal-scan host change, drops the spill ratchet: "
+               f"full={n.full} picks={sorted(n.picks)}")
         n = narrow(["crates/vision/src/lib.rs"], side, side, [(base, same)], rows)
         expect(not n.full and {"gate-vision", "gate-gpu-vision"} <= set(n.picks) and "lib bloomery-gpu-vision not scanned" in n.files[0],
                f"narrow: a kernel carrier no pair covers does not keep its gates: {n.files} {sorted(n.picks)}")
         n = narrow(["crates/gpu-gates/src/bin/gate_p1.rs"], side, side, [(base, same)], rows)
-        expect(not n.full and set(n.picks) == {"gate-gpu-p1", *NARROW_ALWAYS}, f"narrow: a bin's own file: {n.full} {sorted(n.picks)}")
+        expect(not n.full and set(n.picks) == {"gate-gpu-p1"}, f"narrow: a bin's own file, an equal-scan change the ratchet does not read: {n.full} {sorted(n.picks)}")
         # a trigger names its weekly recipe and maps nothing: a file only a trigger row matches, which every gate reads
         # through a dependency, keeps the full list; beside a gate row it narrows as that row says
         trig = [row("rust-toolchain.toml", ["weekly-gpu-ds41-serve"], 9)]
@@ -5679,6 +5719,16 @@ def self_test() -> int:
     expect(fixture == {"gate-serve"}, f"serve fixture selects {sorted(fixture)}")
     spill = sel("tools/ref/ptx-shapes.tsv")
     expect(spill == {"gate-ptx-spill"}, f"ptx-shapes.tsv selects {sorted(spill)}")
+    # a whole-string .rs literal of a workspace package is documentation, not a run-time read: levers'
+    # registry names the in-place lever files, and only the targets that compile such a file select it
+    dspark = sel("crates/gpu-gates/src/bin/shared/ds41_dspark.rs")
+    expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
+                      "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-glm5next-serve",
+                      "gate-gpu-qwen3-serve", "gate-ptx-spill"},
+           f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
+    hybrid = sel("crates/gpu/src/hybrid.rs")
+    expect("gate-gpu-e2e" in hybrid and "gate-ops" not in hybrid and len(hybrid) < len(gates) - 20,
+           f"a gpu lib file levers' registry names selects the gpu-linking gates only: {len(hybrid)} of {len(gates)}")
     qprof = sel("tools/ref/models/qwen3moe.sh")
     expect("gate-gpu-qwen3moe-e2e" in qprof and "gate-gpu-e2e" not in qprof, f"qwen3moe profile selects {sorted(qprof)[:5]}")
     # oracle.sh builds its Korean corpus with `find "$ROOT/docs" -name '*.md'`: a docs change selects that
@@ -5723,7 +5773,7 @@ def self_test() -> int:
             'const N: &str = include_str!("../data/normal.txt");\n',
         )
         put("p/src/tests.rs", 'mod deep;\nconst T: &str = include_str!("../data/test.txt");\n')
-        put("p/src/tests/deep.rs", 'const D: &str = "../tools/deep.txt";\n')
+        put("p/src/tests/deep.rs", 'const D: &str = "../tools/deep.txt";\nconst M: &str = "../q/src/main.rs";\n')
         for f in ("p/src/a.rs", "p/src/b.rs", "p/src/c.rs", "p/data/normal.txt", "p/data/test.txt", "p/data/inline.txt", "tools/deep.txt", "q/src/main.rs"):
             put(f)
 
@@ -5745,6 +5795,10 @@ def self_test() -> int:
         expect(built <= lib and not lib & only_test, f"cfg(test) walk: the lib build reads {sorted(lib & only_test)}, misses {sorted(built - lib)}")
         expect(built | only_test <= libtest, f"cfg(test) walk: the lib tests miss {sorted((built | only_test) - libtest)}")
         expect(built <= dep and not dep & only_test, f"cfg(test) walk: a dependent reads {sorted(dep & only_test)}, misses {sorted(built - dep)}")
+        # a .rs literal names a workspace package's source: documentation of an owner, not a run-time
+        # read — the module walk of whatever compiles it is its only route in (q's own bin keeps its
+        # file, as every target keeps its own; p's views must not gain it)
+        expect("q/src/main.rs" not in lib | libtest, "a .rs literal of a workspace package is an input")
         expect(not st.unresolved, f"cfg(test) walk: unresolved {st.unresolved[:2]}")
 
     # pure crates: the cfg reader, then a synthetic workspace with a lock file — a device root reached
