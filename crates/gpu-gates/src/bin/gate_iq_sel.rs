@@ -1001,7 +1001,7 @@ mod gate {
                     }
                     let yv = f64::from(y_card[si * d.rows_per + r]);
                     let yh = f64::from(
-                        qdot::dot_row(d.ty, d.row((e as usize + 1) % 4, r), &host_cols[si], d.k)
+                        qdot::dot_row(d.ty, d.row(e as usize, r), &host_cols[si], d.k)
                             .expect("a fused dot"),
                     );
                     // The card's band over the read-back column: the
