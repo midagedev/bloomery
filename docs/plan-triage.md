@@ -60,10 +60,20 @@ The user: these two lead and go out together.
     default (`BLOOMERY_RES_PROFILE=off` turns it off), one file per model file shared by every seat. It touches
     `host/swap.rs`, so it opens after wslfix6 lands.
     It is the retired corpus-learned list's idea with the in-sample defect removed (the engine's own routing, scored
-    held-out). Its remaining risk is that list's: a profile learned on one genre seeding another (the list caught
-    7–8 % on chat, below the id prefix's 18 %). So default-on lands only with a cross-genre replay gate (learn on code, score on chat,
-    and every other pair) that is never below the id prefix; if one pair is, the seed decays toward recent use or
-    fills only part of the card. Public rows say "after N tokens of own use, held-out".
+    held-out). Its remaining risk is that list's: a profile learned on one genre seeding another.
+    The cross-genre replay (round `profxgenre`, V4.1 traces prose/code/korean/chat, 16 learn→score pairs, shares
+    18 % and 22.3 %, report in the leader's `specs/leader/profxgenre/`): 15 pairs clear the id prefix by +6…+58
+    points static. One is below beyond noise: a mixed chat profile on code, −3.1/−3.3 static, −2.2 after 96 tokens,
+    −0.7 after 672 (the lead recomputed the static cell independently: 16.3 vs 19.4). The cause is the genre mix in
+    one file, not the sample size (chat's code requests alone give +11.8 on code). Neither partial fill (any f) nor
+    decay toward recent use (any half-life) clears it.
+    **Decision (the user, 2026-10-07): default-on stays; the gate is re-pinned** from "never below the id prefix" to
+    "never worse than the measured worst-pair loss": a regression catcher with a `PIN(2026-10-07)` attribution, the
+    derivation from that report, and FAIL-first from a deliberately mixed smoke pair. Public rows say "after N
+    tokens of own use, held-out".
+    Gap: all of this is V4.1. Qwen3.8, the #1 reporter's model, has no second-genre trace. Closing it takes
+    `BLOOMERY_ROUTE_TRACE` in the qwen38 seat (resclock §8.2, S) and one chat dump; the piece 3 round carries it so
+    the gate covers q38 too (the gate refuses a family with fewer than two genres).
   - G1 phase 1 (xstream R1 rule → R2 lane → R3 Qwen3.8 wiring → R4 sitting): pp4096 +85…+180 % on our A6000, about
     +380…+480 % on the common-machine arm [derived, `xstream` report §3.2, §6]. R2/R3 open after wslfix6 and iqwire
     land (`host/*`, `body38.rs`).
@@ -116,6 +126,13 @@ Order:
 5. The llama.cpp b11443 speed changes (GLM rounds `lcpp-cuda` and `lcpp-host`). Mainline now runs GLM-5.3 and
    Qwen3.8 MTP, so those two bench rows re-sit against mainline, not a PR branch.
 
+- **Functional gates are card-agnostic** (the user via worker2, 2026-10-07: "the 3090 basis exists mainly to write
+  benchmark numbers in public documents; for general gates avoid a specific card and optimize for resources").
+  A gate runs on any card it fits, picked by availability. Card-specific plans and pins (`--place gate`, the n3090
+  rows) stay only where a public 3090 number is produced. The iqwire batch's remaining wall was the 3090 lock
+  (lane A 1,363 s of `gpu-gate.sh 3090` v41-load items, lane X 3,345 s mostly `BLOOMERY_GATE_CARD=3090`, 295 s
+  balanced). Order: gatewall's census of card-pinned gates (the fact that pins each, whether a per-card derivation
+  replaces it) → one round that converts them and moves AGENTS.md's "the 3090 is the gate-and-build card" line.
 - **Gate wall from the iqwire landing batch** (worker2, 2026-10-07; two S items, they move every ledger key, so they
   land between batches):
   - Lock waiting, not running: at 74 of 120 items lane A (3090) had run 2,825 s and waited 2,433 s on the 3090 gate
