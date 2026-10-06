@@ -1,0 +1,31 @@
+# E1 of the eqdesign plan (lever A): the host union over qdot's card-rule kernels against the engine's
+# union at the same shape, in one host-rate sitting. Derived before the sitting (eqdesign report, "the
+# levers", A): per superblock-column the Q3_K walk trades hsum_i32 + one convert + two multiplies + one add
+# for two converts, two multiplies and two FMAs over the same integer adds kept in two registers: -5..+10 %
+# of the gate/up compute; the Q4_K down's eight sub-block terms fit one vector, about 6 ops against 8:
+# -10..+10 %. The x quantizer adds a true divide per value (q8_1, 128-value blocks) against a multiply by
+# the inverse. At m = 1 the union is bound by W (a + c = 67.4 us under W 126.4 us, docs/plan.md host-union
+# row), so the decode term is 0 [derived]; the prefill term is c, predicted within -5..+10 %, and a moves by
+# +0..+5 us [derived]. Small at prefill only if c lands within +3 % (the eqdesign verdict's threshold).
+kind: noninf
+question: does the card-rule host union (unioncard) cost no more per expert-layer than the engine's union
+  (union5) at the prefill tile widths, so lever A's host side stays small at prefill?
+term: bench_v41_host layer-tokens per second at m = 16 columns an expert (arms x16u0.0625, n_host 4),
+  (unioncard - union5) / union5, per round, 32 threads; the q4_K-down layers only (unioncard runs those;
+  union5's rows read on the same layers); the m = 1 and m = 8 arms ride along as recorded rows
+unit: %
+predict: -9..5
+rounds: 6
+margin: 10 % <the derivation allows a 9 % loss at m = 16; the sitting sorts the result against the eqdesign
+  threshold (small at prefill only under a 3 % loss) rather than failing a loss the derivation predicts>
+condition: the lead runs BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/eqa1-host-rate.card'
+  just time-cpu-v41-host --threads 32 --rounds 6 --arms union5:4,unioncard:4,union5:4x8u0.125,unioncard:4x8u0.125,union5:4x16u0.0625,unioncard:4x16u0.0625
+  on the eqA1 tree; arm order rotates every round; netdata frozen under the lease; no other compute on the box
+decide-in: the band holds: under a 3 % loss record a and c of the card-rule union beside the engine's in docs/plan.md's host-union row, and
+  open the wiring round (eqA2: the V4.1 host tier on the card rule, the e2e A/64B/A gate, run13 FAIL-first);
+  a loss of 3..9 % goes to the user with the prefill price [derived from it] before eqA2
+decide-below: the loss passes 9 %, a term the derivation missed: profile the arm (perf -e cpu-clock on
+  bench_v41_host --time --arms unioncard:4x16u0.0625) before eqA2; the suspects are the per-value divide of
+  the x and h quantizers and the Q3_K walk's two-register integer adds
+decide-above: the card rule is faster by more than 5 %: re-derive the Q3_K walk's op count, record a and c,
+  and open eqA2
