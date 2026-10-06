@@ -5,11 +5,12 @@
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
 use bloomery_gpu_gates::GateError;
+use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
 use model::arch::models::Arch;
 use model::arch::qwen3moe::place as q3;
 use model::arch::qwen35moe::place as q35;
-use model::placement::workstation::spec_of_device;
+use model::placement::workstation::CardSpec;
 use model::placement::{KvBytes, whole_need};
 use std::path::Path;
 
@@ -49,9 +50,12 @@ pub fn read_ids(path: &Path, n: Option<usize>) -> Result<Vec<u32>, GateError> {
 /// pairs' pass, which has no tensor-core form and is refused with `mma` at
 /// load; Clef-Flash's group of 4 would take it, but `gate_clef_hidden` holds
 /// the scalar pass, so every file opens with it. A file of any other
-/// architecture is refused by name, and so is a load the whole-fit verdict
-/// does not take on device 0 — the card it opens on — before any upload,
-/// with the verdict's terms ([`refuse_unless_whole_fits`]): a dense
+/// architecture is refused by name. The card is `a`'s on one census
+/// reading ([`Place::A`]: the largest visible card by usable bytes, ties to
+/// the lower ordinal — the qwen3 seat's whole load takes the same pick,
+/// `PlaceQ3::unplaced_on`), whatever the CUDA order puts at device 0; a
+/// load the whole-fit verdict does not take there is refused before any
+/// upload, with the verdict's terms ([`refuse_unless_whole_fits`]): a dense
 /// backbone has no routed experts to move to the host tier.
 pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, Split), GateError> {
     let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -70,30 +74,28 @@ pub fn open(path: &Path, ctx: usize, ubatch: usize) -> Result<(Qwen35moeModel, S
         ubatch,
         kv: KvQ8::F16,
     };
-    refuse_unless_whole_fits(&split, o).map_err(|e| format!("{}: {e}", path.display()))?;
-    let model = Qwen35moeModel::open(Gpu::new()?, Split::open(path)?, o)?;
+    let census = bloomery_gpu_gates::gpu_census::census()?;
+    let card = Place::A.on(&census)?.card_specs()?[0];
+    refuse_unless_whole_fits(&split, o, card).map_err(|e| format!("{}: {e}", path.display()))?;
+    let gpu = Gpu::open_card(card.name, card.device)?;
+    let model = Qwen35moeModel::open(gpu, Split::open(path)?, o)?;
     Ok((model, split))
 }
 
 /// Refuse the whole load of `split` under `o` unless the whole-fit verdict
-/// (`placement::whole_need`, its one owner) takes it on device 0 at census
-/// time: every tensor's granules, the cache of `o.ctx` rows, the card the
-/// program's plan lays out (`q3::machine`: context and step arenas'
-/// scratch), and the ubatch arena with the reserve the load's own fit check
-/// keeps free past it (`GpuModel::whole_load`). The verdict's line goes to
-/// stderr; a refusal names its terms, the card and its holders. A census
-/// that reads no device 0 is refused by name.
-fn refuse_unless_whole_fits(split: &Split, o: Open35) -> Result<(), GateError> {
-    let census = bloomery_gpu_gates::gpu_census::census()?;
-    let d0 = census
-        .iter()
-        .find(|d| d.ordinal == 0)
-        .ok_or("the census reads no device 0, the card the whole load opens on")?;
+/// (`placement::whole_need`, its one owner) takes it on `card`, the card it
+/// opens on, as the census read it: every tensor's granules, the cache of
+/// `o.ctx` rows, the card the program's plan lays out (`q3::machine`:
+/// context and step arenas' scratch), and the ubatch arena with the reserve
+/// the load's own fit check keeps free past it (`GpuModel::whole_load`). The
+/// verdict's line goes to stderr; a refusal names its terms, the card and
+/// its holders.
+fn refuse_unless_whole_fits(split: &Split, o: Open35, card: CardSpec) -> Result<(), GateError> {
     let inputs = q35::PlanInputs::describe(split)?;
     let layers = inputs.hp.n_layer;
     let ctx = u64::try_from(o.ctx)?;
     let kv = (0..layers).map(|l| inputs.kv.layer_bytes(l, ctx)).sum();
-    let machine = q3::machine(spec_of_device(d0), layers, 0);
+    let machine = q3::machine(card, layers, 0);
     let need = whole_need(
         &inputs.model,
         &machine.cards[0],
