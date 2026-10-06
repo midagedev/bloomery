@@ -21,7 +21,8 @@
 //! candidates. The one exception is the MTP draft: a resolve given the file
 //! name the family's draft goes by also fetches the repo's file of that name
 //! ([`mtp_draft`]) beside the set's first shard, where the engine opens it
-//! from; a repo holding no file of the name is fetched as it is.
+//! from, when the caller's predicate says the set can run it
+//! ([`fetch::Draft`]); a repo holding no file of the name is fetched as it is.
 
 pub mod card;
 pub mod fetch;
@@ -77,6 +78,10 @@ pub enum HfError {
     NoFile { repo: String, name: String },
     #[error("no cache directory: set BLOOMERY_CACHE, or HOME for ~/.cache/bloomery/hf")]
     NoCache,
+    #[error(
+        "HF_HUB_OFFLINE={0:?}: it is 1, true, yes or on to stay offline, 0, false, no, off or empty not to"
+    )]
+    HubOffline(String),
     #[error("{0}")]
     Source(String),
     #[error("{file}: {bytes} bytes on disk, and the repo's file has {want}")]
@@ -92,9 +97,9 @@ pub enum HfError {
     Curl { what: String, why: String },
     #[error("curl {what}: {why} (the network, not the hub, refused)")]
     Network { what: String, why: String },
-    #[error(
-        "{repo}: the listing failed at the network ({why}), and the cache cannot stand in: {cache}"
-    )]
+    #[error("curl {what}: {why} (the hub is busy or down)")]
+    Unavailable { what: String, why: String },
+    #[error("{repo}: no listing ({why}), and the cache cannot stand in: {cache}")]
     Offline {
         repo: String,
         why: String,

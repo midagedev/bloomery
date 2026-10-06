@@ -136,6 +136,9 @@ dispatch=(
   'crates/gpu-gates/src/lib.rs fn ref_dir'
   # The --hf resolve's draft name: it reads only the file name of qwen4exp's DRAFT constant.
   'crates/gpu-gates/src/model_file.rs fn draft_name'
+  # The --hf resolve's draft predicate: the plan's own rule (qwen35moe's PlanInputs::mtp_borrows, which
+  # the qwen4exp seat plans with), called read-only so the fetch and the plan keep one owner.
+  'crates/gpu-gates/src/model_file.rs fn draft_usable'
 )
 # construct_lines <file> <fn|type|use> [name]: "first last" for each line span of that construct.
 construct_lines() {
