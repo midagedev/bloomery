@@ -2,6 +2,39 @@
 
 여기는 **아직 할 일만** 있다. 2026-09-25 새벽에 다시 썼다 — 그 전 판(라운드 보고 절 스무 개와 09-23 GPU 선 목록의 원문, 155 KB)은 [`plan-ledger.md`](plan-ledger.md) 「plan-triage.md 2026-09-25 이전 판」에 원문 그대로 있고, 항목의 근거·수치·기제가 필요하면 거기서 찾는다. 항목은 받을 라운드별로 한 줄씩이고 크기는 XS·S·M·L이다. 착륙한 줄은 지운다(원문은 장부, 결과는 커밋 메시지와 rig-log). 수치는 `[유도]`가 아니면 실측이다.
 
+## Direction: development speed first (the user, 2026-10-06)
+
+Whether development slows down or speeds up depends on code quality, so quality work leads, ranked by how much it
+cheapens the next change. Speed and coverage ride the same lever, one common owner per shared concept (AGENTS.md
+"Common code first"). The lead tracks these per landing:
+
+| Measure | Now | Way |
+|---|---|---|
+| Timed gate recipes, sum of last-5 medians | 203, 248 min (`gate-times.tsv`) | down |
+| Recipes a `crates/gpu` change selects | 77–119 | down |
+| Gate wall of one landing | serve union of 6, 1,770 s (0.2.5) | down |
+| Files and lines a new model or format touches outside its own crate | baseline from the GLM-5.3 and Qwen3.8 landings (kolibri1/mimo26 design) | down |
+| Rounds lost to a wrong premise or a regression | counted from round reports | down |
+
+Order:
+1. **gatecost** (GLM census, running): duplicate clauses, repeated loads, over-selection, and the structural cut
+   behind 77–119. Implementation rounds follow its ranked list. Every merge names the gate that still pins each
+   contract.
+2. Then the files a new model touches outside its own crate. Next are big files by owner (R15), never a kernel or a
+   `#[target_feature]` body (R12).
+3. **Next models** (the user): Xiaomi MiMo-V2.6-Flash (`mimo2`, in llama.cpp mainline) and Aleph Alpha Kolibri-1
+   (`kolibri1`, a patch beside its GGUF upload, not in mainline). GLM design rounds `mimo26` and `kolibri1` are running.
+   Their attachment is also the test of the files-outside-its-crate measure.
+4. The IQ stacks (iqtrain → iqwire → iqoracle) open Qwen3.8 UD-Q3_K_XL. They are also the kernels the V4-Flash port
+   needs (IQ3_XXS + MXFP4).
+5. The llama.cpp b11443 speed changes (GLM rounds `lcpp-cuda` and `lcpp-host`). Mainline now runs GLM-5.3 and
+   Qwen3.8 MTP, so those two bench rows re-sit against mainline, not a PR branch.
+
+- **WSL2 one-queue boundary cost** (worker1, wslfix, derived from `stage_us`): under one hardware queue the readback
+  after a planning boundary waits behind that boundary's staging and HtoD, once per 4 steps. That is about 5–7 ms on
+  Qwen3.8, 24–35 ms on GLM and 32 ms on V4.1. It is a decode cost, not a hang. Open: measure it on sihyung, and decide
+  whether the boundary staging can move off the readback's queue.
+
 ## 열린 라운드 카드
 
 | id | 라운드 | 경계 | 게이트(끝의 숫자) | 앞 | 크기 |
