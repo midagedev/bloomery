@@ -321,11 +321,13 @@ blocks_run() {
 # its load (the word it runs by and why) and a `residency pass` record at every boundary
 # (crates/gpu-gates/src/record.rs). res_sums carries them into the row, read through records.py by kind
 # and field: the lever's word and why (the arm's own output, else its load's lines), and over the pass
-# records whose pass is step or pair — the first boundary's (none) and a prompt call's are not a timed pass
-# — their count and the sums of kept (the rows the pass kept), landed (flips that went live), late (of
-# them, flips whose copy had not completed), made (flips the rule made) and bytes (the bytes they copy).
+# records whose pass is a timed one — step, pair, slots (a pass of resident slots' rows, all kept) or
+# slots_drafted (a drafted pass of resident slots' verify rows) — their count and the sums of kept (the
+# rows the pass kept), landed (flips that went live), late (of them, flips whose copy had not completed),
+# made (flips the rule made) and bytes (the bytes they copy); none (the first boundary), prompt (a prompt
+# call's rows), abandoned and driver (the machine's own test driver) are not a timed pass and stay out.
 # The record carries no hit rate; these are its fields. res_sums_table prints each label's per-pass means
-# over its counted rows.
+# over its counted rows; kept/pass over a slots pass there is the rows it keeps, one a slot.
 RS_RECORDS="${BASH_SOURCE[0]%/*}/../bloomery/records.py"
 RS_ROWS=()
 # res_kinds <bin>: 0 when <bin>'s checked-in schema declares the residency records, 1 when records.py
@@ -354,7 +356,8 @@ res_sums() {
   RS_WORD=$RW RS_WHYW=$RY
   [ -n "$RS_WORD" ] || return 0
   read -r RS_N RS_KEPT RS_LANDED RS_LATE RS_MADE_SUM RS_BYTES < <(paste -d' ' <(echo "$P") <(echo "$K") <(echo "$L") \
-    <(echo "$T") <(echo "$M") <(echo "$B") | awk '$1 == "step" || $1 == "pair" { n++; k += $2; l += $3; t += $4; m += $5; b += $6 }
+    <(echo "$T") <(echo "$M") <(echo "$B") | awk '$1 == "step" || $1 == "pair" || $1 == "slots" ||
+      $1 == "slots_drafted" { n++; k += $2; l += $3; t += $4; m += $5; b += $6 }
       END { printf "%d %d %d %d %d %d\n", n, k, l, t, m, b }')
   RS_COL=" | residency $RS_WORD ($RS_WHYW) passes $RS_N kept $RS_KEPT landed $RS_LANDED late $RS_LATE made $RS_MADE_SUM bytes $RS_BYTES"
 }
@@ -367,7 +370,7 @@ res_sums_add() {
 # kept, landed, late and made a pass over those rows (0 passes: `-`).
 res_sums_table() {
   [ ${#RS_ROWS[@]} -gt 0 ] || return 0
-  echo "=== residency per arm: the residency pass records' fields a timed pass (step or pair), over the counted rows ==="
+  echo "=== residency per arm: the residency pass records' fields a timed pass (step, pair, slots or slots_drafted), over the counted rows ==="
   printf '%s\n' "${RS_ROWS[@]}" | awk -F'|' '{
     k = $1 " d=" $2 " " $4; r[k]++; n[k] += $5; kp[k] += $6; l[k] += $7; t[k] += $8; m[k] += $9
   } END {
@@ -495,6 +498,14 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   res_sums generate_ds41 "$(echo "residency lever residency=mid-p40-s1 why=place"; rp step 2 20 1 1 1 100; rp pair 3 10 0 0 1 100)"
   res_sums_add ours@X 512 2
   check res-sums-table "$(res_sums_table | tail -n +2)" "residency mean ours@X d=512 mid-p40-s1: rows 2, passes/row 2.0, kept/pass 13.00, landed/pass 1.000, late/pass 0.500, made/pass 0.750"
+  # The timed kinds past step and pair: slots passes count, none and prompt around them do not, and a
+  # slots_drafted pass counts.
+  res_sums generate_ds41 "$(echo "residency lever residency=mid-p40-s1 why=place"; rp slots 1 4 2 0 1 50; rp slots 2 6 1 0 0 0)" && r=0 || r=$?
+  check res-sums-slots "$r|$RS_N|$RS_KEPT|$RS_LANDED|$RS_COL" "0|2|10|3| | residency mid-p40-s1 (place) passes 2 kept 10 landed 3 late 0 made 1 bytes 50"
+  res_sums generate_ds41 "$(echo "residency lever residency=mid-p40-s1 why=place"; rp none 0 0 0 0 3 300; rp prompt 1 50 1 0 2 200; rp slots 2 8 1 0 1 64)" && r=0 || r=$?
+  check res-sums-slots-only "$r|$RS_N|$RS_KEPT|$RS_LANDED" "0|1|8|1"
+  res_sums generate_ds41 "$(echo "residency lever residency=mid-p40-s1 why=place"; rp slots_drafted 3 5 2 1 2 80)" && r=0 || r=$?
+  check res-sums-slotsdrafted "$r|$RS_N|$RS_KEPT|$RS_LANDED" "0|1|5|2"
   res_kinds generate_ds41 && r=0 || r=$?
   check res-kinds "$r" 0
   res_kinds generate_qwen3moe && r=0 || r=$?
