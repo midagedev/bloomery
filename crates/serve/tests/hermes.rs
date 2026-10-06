@@ -351,7 +351,8 @@ fn hw_parse_does_not_depend_on_chunking() {
 /// source spells `<tool_call>` with neither GLM's nor the DSML token — the
 /// rendered call names it — and GLM's for the GLM template, which spells
 /// `<tool_call>` too: its tags come first, and its rendered call body is not
-/// JSON. V4.1 stays DSML and Qwen3.8's `<function>` tags stay unparsed.
+/// JSON. V4.1 stays DSML (the templates the source spells for another family
+/// — Qwen's XML among them — have their own gates).
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_detection_follows_the_template() {
@@ -366,13 +367,9 @@ fn hw_detection_follows_the_template() {
         ToolFormat::of_chat_template(&parsed(V41_TEMPLATE)),
         ToolFormat::Dsml
     );
-    assert_eq!(
-        ToolFormat::of_chat_template(&parsed(QWEN38)),
-        ToolFormat::Unparsed
-    );
-    // The source spellings alone type none of the `<tool_call>` templates.
+    // The source spellings alone type none of the `<tool_call>` templates
+    // left to the probe.
     assert_eq!(ToolFormat::of_template(TEMPLATE), ToolFormat::Unparsed);
-    assert_eq!(ToolFormat::of_template(QWEN38), ToolFormat::Unparsed);
 }
 
 // ---------------------------------------------------------------- the server

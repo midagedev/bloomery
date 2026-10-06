@@ -1,7 +1,8 @@
 //! DSML tool calls for the V4.1 chat template, and the parser that turns one
 //! generation into `reasoning_content`, `content` and `tool_calls` under the
 //! tool-call markup its template teaches ([`ToolFormat`]: DSML here, GLM's in
-//! [`crate::glmxml`], Hermes' in [`crate::hermes`]).
+//! [`crate::glmxml`], Hermes' in [`crate::hermes`], Qwen3-Coder's in
+//! [`crate::qwenxml`]).
 //!
 //! The markup is the template's own (its `tools_header` and the assistant
 //! `tool_calls` branch):
@@ -28,6 +29,7 @@ use serde_json::{Map, json};
 
 use crate::glmxml::{self, ArgTypes, GlmScan, GlmXmlError};
 use crate::hermes::{self, HermesError, HermesScan};
+use crate::qwenxml::{self, ParamKinds, QwenScan, QwenXmlError};
 use crate::reasoning::{ReasoningFormat, Split, THINK_CLOSE, ThinkSplit, partial_suffix};
 use crate::template::ChatTemplate;
 
@@ -272,23 +274,34 @@ pub enum ToolFormat {
     /// Hermes' `<tool_call>` around one JSON object naming `name` and
     /// `arguments` (Qwen3's markup).
     Hermes,
-    /// None the server parses (Qwen3.8's `<function>` tags, say): a chat
-    /// request that asks for tool calls is refused.
+    /// Qwen3-Coder's `<tool_call>` around `<function=NAME>` and
+    /// `<parameter=KEY>` blocks (Qwen3.6's and Qwen3.8's markup).
+    QwenXml,
+    /// None the server parses: a chat request that asks for tool calls is
+    /// refused.
     Unparsed,
 }
 
 impl ToolFormat {
     /// The markup the template `source` spells for a call: GLM's when it
-    /// spells `<tool_call>`, `<arg_key>` and `<arg_value>`, DSML's when it
-    /// spells the DSML token, else nothing the source alone can name — a
-    /// `<tool_call>` template may carry Hermes' JSON body or Qwen3.8's
-    /// `<function>` tags, which only a rendered call tells apart
+    /// spells `<tool_call>`, `<arg_key>` and `<arg_value>`, Qwen3-Coder's
+    /// when it spells `<tool_call>`, `<function=` and `<parameter=` (llama.cpp
+    /// reads the three spellings), DSML's when it spells the DSML token, else
+    /// nothing the source alone can name — a `<tool_call>` template may carry
+    /// Hermes' JSON body, which only a rendered call tells apart
     /// ([`ToolFormat::of_chat_template`]).
     #[must_use]
     pub fn of_template(source: &str) -> ToolFormat {
         let glm = [glmxml::CALL_OPEN, glmxml::KEY_OPEN, glmxml::VALUE_OPEN];
+        let qwen = [
+            qwenxml::CALL_OPEN,
+            qwenxml::FUNCTION_OPEN,
+            qwenxml::PARAM_OPEN,
+        ];
         if glm.iter().all(|tag| source.contains(tag)) {
             ToolFormat::GlmXml
+        } else if qwen.iter().all(|tag| source.contains(tag)) {
+            ToolFormat::QwenXml
         } else if source.contains(DSML) {
             ToolFormat::Dsml
         } else {
@@ -297,12 +310,12 @@ impl ToolFormat {
     }
 
     /// The markup a chat template teaches, read the way llama.cpp's
-    /// autoparser reads it: the source's own spellings first (GLM's tags, the
-    /// DSML token), then a rendered assistant call for a `<tool_call>`
-    /// template the source cannot type by spelling — Hermes' when some
-    /// rendered `<tool_call>`…`</tool_call>` holds a JSON body naming `name`
-    /// and `arguments`. A template whose probe render fails teaches nothing
-    /// this server parses.
+    /// autoparser reads it: the source's own spellings first (GLM's tags,
+    /// Qwen3-Coder's, the DSML token), then a rendered assistant call for a
+    /// `<tool_call>` template the source cannot type by spelling — Hermes'
+    /// when some rendered `<tool_call>`…`</tool_call>` holds a JSON body
+    /// naming `name` and `arguments`. A template whose probe render fails
+    /// teaches nothing this server parses.
     #[must_use]
     pub fn of_chat_template(t: &ChatTemplate) -> ToolFormat {
         let spelled = ToolFormat::of_template(t.source());
@@ -371,6 +384,9 @@ pub enum Tools {
     GlmXml(ArgTypes),
     /// Hermes' markup.
     Hermes,
+    /// Qwen3-Coder's markup, typing each parameter by the request's tool
+    /// schemas.
+    QwenXml(ParamKinds),
 }
 
 #[derive(Debug)]
@@ -378,6 +394,7 @@ enum Scan {
     Dsml(DsmlScan),
     Glm(GlmScan),
     Hermes(HermesScan),
+    Qwen(QwenScan),
 }
 
 /// A generation whose tool-call markup does not parse: which scan refused,
@@ -390,6 +407,9 @@ pub enum MarkupError {
     /// The Hermes scan's refusal.
     #[error("{0}")]
     Hermes(#[from] HermesError),
+    /// The Qwen3-Coder scan's refusal.
+    #[error("{0}")]
+    Qwen(#[from] QwenXmlError),
 }
 
 impl PartialEq<GlmXmlError> for MarkupError {
@@ -428,13 +448,24 @@ impl ChatParser {
     #[must_use]
     pub fn with_tools(prompt: &str, format: ReasoningFormat, tools: Option<Tools>) -> Self {
         let split = format == ReasoningFormat::Deepseek || tools.is_some();
+        // Qwen3-Coder's call ends an open span without `</think>`, as
+        // llama.cpp's parser for the markup reads it.
+        let call_ends_span = matches!(tools, Some(Tools::QwenXml(_)));
         ChatParser {
             format,
-            think: split.then(|| ThinkSplit::for_prompt(prompt)),
+            think: split.then(|| {
+                let t = ThinkSplit::for_prompt(prompt);
+                if call_ends_span {
+                    t.ending_at(qwenxml::CALL_OPEN)
+                } else {
+                    t
+                }
+            }),
             scan: tools.map(|t| match t {
                 Tools::Dsml => Scan::Dsml(DsmlScan::default()),
                 Tools::GlmXml(types) => Scan::Glm(GlmScan::new(types)),
                 Tools::Hermes => Scan::Hermes(HermesScan::default()),
+                Tools::QwenXml(kinds) => Scan::Qwen(QwenScan::new(kinds)),
             }),
             total: Message::default(),
         }
@@ -450,12 +481,12 @@ impl ChatParser {
     }
 
     /// Feeds generated text; returns what may be sent now. For a parser with
-    /// no scan or the DSML scan, which cannot fail; a GLM or Hermes parser's
-    /// caller uses [`ChatParser::try_push`].
+    /// no scan or the DSML scan, which cannot fail; a GLM, Hermes or Qwen
+    /// parser's caller uses [`ChatParser::try_push`].
     ///
     /// # Panics
     ///
-    /// On markup a GLM or Hermes scan refuses, naming it.
+    /// On markup a GLM, Hermes or Qwen scan refuses, naming it.
     pub fn push(&mut self, text: &str) -> Message {
         self.try_push(text)
             .unwrap_or_else(|e| panic!("ChatParser::push on a scan that failed: {e}"))
@@ -466,7 +497,7 @@ impl ChatParser {
     ///
     /// # Panics
     ///
-    /// On markup a GLM or Hermes scan refuses, naming it.
+    /// On markup a GLM, Hermes or Qwen scan refuses, naming it.
     pub fn finish(&mut self) -> Message {
         self.try_finish()
             .unwrap_or_else(|e| panic!("ChatParser::finish on a scan that failed: {e}"))
@@ -487,6 +518,7 @@ impl ChatParser {
             Some(Scan::Dsml(d)) => Some(d.push(&split.content)),
             Some(Scan::Glm(g)) => Some(g.push(&split.content)?),
             Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
+            Some(Scan::Qwen(q)) => Some(q.push(&split.content)?),
         };
         Ok(self.emit(split, scanned))
     }
@@ -505,6 +537,7 @@ impl ChatParser {
             Some(Scan::Dsml(d)) => Some(d.finish()),
             Some(Scan::Glm(g)) => Some(g.finish()?),
             Some(Scan::Hermes(h)) => Some(h.finish()?),
+            Some(Scan::Qwen(q)) => Some(q.finish()?),
         };
         Ok(self.emit(split, scanned))
     }

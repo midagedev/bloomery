@@ -1,0 +1,8 @@
+Source of qwen36-chat-template.jinja (kept byte-exact; this file records it):
+
+https://huggingface.co/Qwen/Qwen3.6-35B-A3B/raw/main/chat_template.jinja
+sha256 e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259  qwen36-chat-template.jinja
+
+The repo's `chat_template.jinja`, fetched verbatim. Its tool-call branch teaches the
+same Qwen3-Coder XML markup as Qwen3.8's fixture (`<tool_call>` around `<function=`
+and `<parameter=`), and its generation prompt opens `<think>\n` when thinking is on.

@@ -22,6 +22,7 @@ pub mod media;
 pub mod mock;
 mod models;
 mod promptcache;
+pub mod qwenxml;
 pub mod reasoning;
 pub mod sampling;
 mod sched;

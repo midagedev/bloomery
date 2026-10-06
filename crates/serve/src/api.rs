@@ -59,6 +59,7 @@ use crate::engine::{
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
 use crate::http::{self, EventStream, Request};
+use crate::qwenxml::ParamKinds;
 use crate::reasoning::{ReasoningFormat, ThinkEntry};
 use crate::sampling;
 use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
@@ -2218,14 +2219,15 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
         ToolFormat::Dsml => Tools::Dsml,
         ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(b.get("tools"))),
         ToolFormat::Hermes => Tools::Hermes,
+        ToolFormat::QwenXml => Tools::QwenXml(ParamKinds::of_tools(b.get("tools"))),
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,
                 code: 501,
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
-                          (DSML, GLM's and Hermes' are parsed): send the request without tools \
-                          or with tool_choice \"none\""
+                          (DSML, GLM's, Hermes' and Qwen's XML are parsed): send the request \
+                          without tools or with tool_choice \"none\""
                     .to_owned(),
             });
         }

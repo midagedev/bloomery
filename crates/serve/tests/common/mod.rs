@@ -15,6 +15,18 @@ use serve::{Engine, FATAL_LINGER, MockEngine, Server, ServerConfig};
 pub const V41_TEMPLATE: &str = include_str!("../fixtures/v41-chat-template.jinja");
 pub const FIELDS: &str = include_str!("../fixtures/llama-server-fields.json");
 
+/// A synthetic chat template that teaches no tool-call markup the server
+/// parses: its source spells none of the families' tags and a rendered
+/// assistant call carries no `<tool_call>` the probe could read, so it types
+/// [`serve::dsml::ToolFormat::Unparsed`]. No real model's template is left in
+/// that state — the refusal's own contract needs one to refuse.
+pub const NO_MARKUP_TEMPLATE: &str = concat!(
+    "{%- for message in messages %}",
+    "{{- '<' + message.role + '>\\n' + message.content }}",
+    "{%- endfor %}",
+    "{%- if add_generation_prompt %}{{- '<assistant>\\n' }}{%- endif %}",
+);
+
 /// Starts a server on the mock engine (context `ctx`) and the V4.1 template.
 pub fn start(ctx: usize) -> SocketAddr {
     start_with(Box::new(MockEngine::new(ctx)))

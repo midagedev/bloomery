@@ -8,8 +8,10 @@
 //! (Qwen3's thinking-on prompt ends at `assistant`) lets the model open it
 //! on a leading `<think>`, as llama-server's parser takes an optional
 //! leading span and its budget sampler starts counting at the start tag.
-//! Inside the span everything up to the first `</think>` is reasoning; the
-//! span is not re-entered, so a later `<think>` is content. A span still
+//! Inside the span everything up to the first `</think>` is reasoning (or up
+//! to a call opener the parser names, which ends the span and stays in the
+//! output — [`ThinkSplit::ending_at`]); the span is not re-entered, so a later
+//! `<think>` is content. A span still
 //! open when the stream ends leaves all its text in reasoning and none in
 //! content.
 
@@ -109,6 +111,9 @@ pub struct ThinkSplit {
     /// the output names the tag, or names any other text first.
     may_open: bool,
     held: String,
+    /// A tag that ends the span too and stays in the output: a call the
+    /// markup lets follow the reasoning without `</think>`.
+    ends_too: Option<&'static str>,
 }
 
 impl ThinkSplit {
@@ -125,7 +130,17 @@ impl ThinkSplit {
             inside: entry == ThinkEntry::Open,
             may_open: entry == ThinkEntry::MayOpen,
             held: String::new(),
+            ends_too: None,
         }
+    }
+
+    /// The same splitter, its span also ended by `tag`, which stays in the
+    /// output as the first text past the span (Qwen3-Coder's `<tool_call>`,
+    /// one of llama.cpp's `thinking_end_tags` for its markup).
+    #[must_use]
+    pub fn ending_at(mut self, tag: &'static str) -> Self {
+        self.ends_too = Some(tag);
+        self
     }
 
     /// Whether the output is inside the span: the reasoning budget counts
@@ -176,11 +191,23 @@ impl ThinkSplit {
         }
     }
 
-    /// Inside the span: everything up to the first `</think>` is reasoning,
-    /// a tail that could still grow into the close held back.
+    /// Inside the span: everything up to the first `</think>` (or the tag
+    /// that ends it too) is reasoning, a tail that could still grow into
+    /// either held back.
     fn in_span_step(&mut self, piece: &str) -> Split {
         self.held.push_str(piece);
-        if let Some(at) = self.held.find(THINK_CLOSE) {
+        let close = self.held.find(THINK_CLOSE);
+        let call = self.ends_too.and_then(|tag| self.held.find(tag));
+        if let Some(at) = call.filter(|&c| close.is_none_or(|t| c < t)) {
+            self.inside = false;
+            let content = self.held.split_off(at);
+            return Split {
+                reasoning: std::mem::take(&mut self.held),
+                content,
+                ..Split::default()
+            };
+        }
+        if let Some(at) = close {
             self.inside = false;
             let content = self.held[at + THINK_CLOSE.len()..].to_owned();
             self.held.truncate(at);
@@ -191,7 +218,10 @@ impl ThinkSplit {
                 ..Split::default()
             };
         }
-        let keep = partial_suffix(&self.held, THINK_CLOSE);
+        let keep = self
+            .ends_too
+            .map_or(0, |tag| partial_suffix(&self.held, tag))
+            .max(partial_suffix(&self.held, THINK_CLOSE));
         let rest = self.held.split_off(self.held.len() - keep);
         Split {
             reasoning: std::mem::replace(&mut self.held, rest),
