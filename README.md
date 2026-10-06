@@ -41,6 +41,13 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The API**: `/v1/chat/completions`, `/completion`, streaming, tool calls, `reasoning_content`,
   `cache_prompt`, `/tokenize`, `/detokenize`, `/slots`, `/metrics`, `/v1/models`, `/props`. OpenAI SDKs, curl,
   and llama-server tutorials apply as they are.
+- **The Anthropic Messages API**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves
+  them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
+- **Tool calls, by model**: DeepSeek-V4.1-Flash, GLM-5.3-Flash and Qwen3-30B parse tool calls, so agent
+  clients work against them. **Qwen3.6-35B and Qwen3.8-Flash-Next do not yet**: their templates use the
+  `<function=…><parameter=…>` markup, which has no parser yet, and a request with `tools` gets a 501 that says
+  so. The parser is in progress for the next release; until then, use these two models for chat without
+  tools.
 - **`timings`** carry llama-server's fields and one of ours, `cache_ms`: the prompt cache's work before the
   prompt (the slot's state saved, a cached state put back, the cut), which `prompt_ms` does not count.
 - **`reasoning_budget`**, per request on `/v1/chat/completions` and `/completion`: llama-server's
@@ -320,6 +327,8 @@ text. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
 ## Limits
 
 - **sm_86+** GPUs; the prebuilt archive carries sm_86 PTX.
+- No tool calls on Qwen3.6 and Qwen3.8 yet (in progress): a request with `tools` gets a 501 naming the missing
+  parser. V4.1, GLM-5.3 and Qwen3-30B parse tool calls.
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B, on V4.1, GLM-5.3 and Qwen3.8; a placed Qwen3-30B,
   Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
