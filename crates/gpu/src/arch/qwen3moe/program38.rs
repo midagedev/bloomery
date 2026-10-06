@@ -113,6 +113,20 @@ pub(super) const STEP_MEMOPS: usize = 2;
 /// The head: its mix, the projection and the argmax.
 pub(super) const HEAD_LAUNCHES: usize = 3 + 2;
 
+/// The head's launches in a captured walk for its borrowed form — the one
+/// owner of the form is `model::arch::qwen35moe::mtp` (`head_kind`, its
+/// `output_form` the borrow check asks): [`HEAD_LAUNCHES`] for the Q8_0
+/// planes, whose projection reads the normed f32 rows; a Q6_K word plane's
+/// walk quantizes its input rows to q8_1 first, one launch more
+/// (`Head::enqueue`'s `enqueue_quantize_q8_1_head`).
+fn head_launches(head: model::arch::qwen35moe::mtp::BorrowedHead) -> usize {
+    HEAD_LAUNCHES
+        + usize::from(matches!(
+            head,
+            model::arch::qwen35moe::mtp::BorrowedHead::Q6K
+        ))
+}
+
 /// A delta layer's launches past [`GDN_LAUNCHES`] at more than one row: β
 /// and α copied token-major out of the joined projection.
 pub(super) const GDN_ROWS_LAUNCHES: usize = 2;
@@ -122,8 +136,13 @@ pub(super) const QSA_ROWS_LAUNCHES: usize = 1;
 
 /// The captured decode step's launches for `plans` with `card`'s card
 /// experts and `tier`'s tier layers (module doc).
-pub(super) fn step_launches(plans: &[Layer38], card: &Card38, tier: Option<&TierSide38>) -> usize {
-    walk_launches(plans, card, tier, 1)
+pub(super) fn step_launches(
+    plans: &[Layer38],
+    card: &Card38,
+    tier: Option<&TierSide38>,
+    head: model::arch::qwen35moe::mtp::BorrowedHead,
+) -> usize {
+    walk_launches(plans, card, tier, 1, head)
 }
 
 /// The captured verify's launches for `plans` with `card`'s card experts and
@@ -136,11 +155,18 @@ pub(super) fn verify_launches(
     card: &Card38,
     tier: Option<&TierSide38>,
     m: usize,
+    head: model::arch::qwen35moe::mtp::BorrowedHead,
 ) -> usize {
-    walk_launches(plans, card, tier, m)
+    walk_launches(plans, card, tier, m, head)
 }
 
-fn walk_launches(plans: &[Layer38], card: &Card38, tier: Option<&TierSide38>, m: usize) -> usize {
+fn walk_launches(
+    plans: &[Layer38],
+    card: &Card38,
+    tier: Option<&TierSide38>,
+    m: usize,
+    head: model::arch::qwen35moe::mtp::BorrowedHead,
+) -> usize {
     let rows = m > 1;
     1 + plans
         .iter()
@@ -161,7 +187,7 @@ fn walk_launches(plans: &[Layer38], card: &Card38, tier: Option<&TierSide38>, m:
                 }
         })
         .sum::<usize>()
-        + HEAD_LAUNCHES
+        + head_launches(head)
 }
 
 /// Every module a Qwen3.8 walk launches besides the `Gpu`'s own.
