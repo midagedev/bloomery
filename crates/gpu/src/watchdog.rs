@@ -49,7 +49,7 @@ const NO_BOUNDARY: u64 = u64::MAX;
 /// row's index ([`Call`]), so the wedge line prints a name no allocation
 /// carries. A new guarded entry point adds its row here and its [`Call`]
 /// beside it.
-const CALLS: [&str; 11] = [
+const CALLS: [&str; 12] = [
     "GpuModel::step",
     "GpuModel::run_rows",
     "GpuModel::pass_boundary",
@@ -61,6 +61,7 @@ const CALLS: [&str; 11] = [
     "GpuModel::step_slots",
     "GpuModel::verify_slots",
     "GpuModel::commit_slots",
+    "a prompt call",
 ];
 
 /// One guarded call's name row of [`CALLS`]: what a guarded entry point
@@ -79,6 +80,7 @@ pub(crate) const SEED_DEPTH: Call = Call(7);
 pub(crate) const STEP_SLOTS: Call = Call(8);
 pub(crate) const VERIFY_SLOTS: Call = Call(9);
 pub(crate) const COMMIT_SLOTS: Call = Call(10);
+pub(crate) const PROMPT: Call = Call(11);
 
 impl Call {
     fn name(self) -> &'static str {
@@ -201,7 +203,7 @@ pub(crate) fn busy(watch: &Arc<Watch>, call: Call, reads: u64) -> Option<Busy> {
 /// The engine thread's busy mark: clears the busy word and bumps progress
 /// when dropped, and puts the previously guarded watch (another model's,
 /// when calls nest across models) back.
-pub(crate) struct Busy {
+pub struct Busy {
     prev: Option<Arc<Watch>>,
 }
 

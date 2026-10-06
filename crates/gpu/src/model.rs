@@ -847,6 +847,16 @@ impl<B: ChainBody> GpuModel<B> {
         self.pos
     }
 
+    /// Mark the engine thread busy in a prompt call until the returned
+    /// guard drops, for the engine watchdog: a
+    /// family's prompt walks the body through [`GpuModel::body_parts`], past
+    /// the guarded calls, so the session that drives the prompt holds this
+    /// mark. `None` while a guarded call of this model runs on this thread.
+    #[must_use]
+    pub fn prompt_busy(&self) -> Option<crate::EngineBusy> {
+        watchdog::busy(&self.watch, watchdog::PROMPT, self.reads)
+    }
+
     /// The step and pass readbacks begun since the load — one a
     /// [`GpuModel::step`] call, one a [`GpuModel::step_rows`] pass: a
     /// residency boundary's report carries the count it ran after
