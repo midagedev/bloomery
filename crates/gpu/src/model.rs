@@ -42,6 +42,7 @@ use crate::head::{Head, HeadNorm};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Chain, HostResidency, Refusal, name_refusal};
+use crate::watchdog;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use bloomery_levers::HostCfg;
@@ -468,14 +469,14 @@ pub struct LoadTimes {
 /// One resident model on one card. Everything `step` touches is allocated at
 /// load, never per step. A second card is another `GpuModel` (a draft's).
 ///
-/// Fields drop in declaration order, after the drop has stopped the body's
-/// residency machine, and a graph must be destroyed while
-/// every buffer it addresses is still alive: the captured chains first — the
-/// live slot's, the passes of several slots', then each parked slot's
-/// ([`ParkedSlot`]: its graph cache before its sequence) — then the heads,
-/// the body (which drops its own captures first, and its host tier's lock
-/// over the host set before the mappings under it), the weights they all
-/// address, and the card last.
+/// Fields drop in declaration order, after the drop has stopped the engine
+/// watchdog and then the body's residency machine, and a graph must be
+/// destroyed while every buffer it addresses is still alive: the captured
+/// chains first — the live slot's, the passes of several slots', then each
+/// parked slot's ([`ParkedSlot`]: its graph cache before its sequence) —
+/// then the heads, the body (which drops its own captures first, and its
+/// host tier's lock over the host set before the mappings under it), the
+/// weights they all address, and the card last.
 pub struct GpuModel<B: ChainBody> {
     /// The captured chains, keyed by rows: the live slot's cache, exchanged
     /// with the parked slots' on a [`GpuModel::select_slot`].
@@ -530,13 +531,23 @@ pub struct GpuModel<B: ChainBody> {
     /// The step and pass readbacks begun ([`GpuModel::reads`]): the stamp
     /// every residency boundary carries ([`BoundaryAt`]).
     reads: u64,
+    /// The engine thread's progress words ([`crate::watchdog`]), written by
+    /// the guarded calls below with relaxed stores only.
+    watch: Arc<watchdog::Watch>,
+    /// The watchdog thread over `watch`, from `new` to `drop`: a reset
+    /// leaves it in place, and the drop stops and joins it before anything
+    /// of the model is freed.
+    watchdog: watchdog::Watchdog,
 }
 
 impl<B: ChainBody> Drop for GpuModel<B> {
-    /// The residency machine stops first ([`HostServed::stop_residency`]):
-    /// the chains, the heads and the body free card memory as they drop, and
-    /// a free waits for a copy the machine left queued behind a staging word.
+    /// The engine watchdog stops and joins first, then the residency machine
+    /// ([`HostServed::stop_residency`]): the chains, the heads and the body
+    /// free card memory as they drop, and a free waits for a copy the
+    /// machine left queued behind a staging word — a wait the watchdog
+    /// would otherwise name.
     fn drop(&mut self) {
+        self.watchdog.stop();
         if let Some(host) = self.body.host() {
             host.stop_residency();
         }
@@ -545,7 +556,7 @@ impl<B: ChainBody> Drop for GpuModel<B> {
 
 impl<B: ChainBody> GpuModel<B> {
     /// The model over `r`, standing at position 0 in graph mode with nothing
-    /// captured.
+    /// captured, and its engine watchdog started ([`crate::watchdog`]).
     pub fn new(r: Resident<B>) -> GpuModel<B> {
         let Resident {
             gpu,
@@ -554,6 +565,8 @@ impl<B: ChainBody> GpuModel<B> {
             head,
             ctx_max,
         } = r;
+        let watch = Arc::new(watchdog::Watch::new());
+        let watchdog = watchdog::Watchdog::start(Arc::clone(&watch));
         GpuModel {
             graphs: Graphs::new(),
             slot_graphs: SlotGraphs::new(),
@@ -573,6 +586,8 @@ impl<B: ChainBody> GpuModel<B> {
             poisoned: None,
             load_times: None,
             reads: 0,
+            watch,
+            watchdog,
         }
     }
 
@@ -909,6 +924,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// A residency machine's map stays where use has taken it
     /// ([`GpuModel::residency_reset`] is the explicit call).
     pub fn reset(&mut self) -> Result<(), GpuError> {
+        let _busy = watchdog::busy(&self.watch, watchdog::RESET, self.reads);
         // The body owns its row store, so it owns what "empty" means there.
         self.body.reset(&self.gpu)?;
         // Empty caches hold nothing a fault condemned — once every slot the
@@ -1033,6 +1049,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// head carries every layer: each constructor that makes the head loads
     /// the whole chain.
     pub fn step(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
+        let _busy = watchdog::busy(&self.watch, watchdog::STEP, self.reads);
         self.refuse_if_poisoned("GpuModel::step")?;
         self.refuse_if_slots_wait("GpuModel::step")?;
         if tokens.is_empty() {
@@ -1108,6 +1125,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// [`BoundaryAt::Launch`]: the boundary a step made ahead of this pass
     /// taken, else made now). Nothing for a body with no host service.
     pub fn pass_boundary(&mut self) -> Result<(), GpuError> {
+        let _busy = watchdog::busy(&self.watch, watchdog::PASS_BOUNDARY, self.reads);
         self.boundary_at(BoundaryAt::Launch { reads: self.reads })
     }
 
@@ -1139,6 +1157,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// `None` for a body with no machine. Only an explicit call does this:
     /// [`GpuModel::reset`] leaves the residency where use has taken it.
     pub fn residency_reset(&mut self) -> Result<Option<crate::host::swap::ResetReport>, GpuError> {
+        let _busy = watchdog::busy(&self.watch, watchdog::RESIDENCY_RESET, self.reads);
         let GpuModel { body, gpu, .. } = self;
         match body.host() {
             Some(host) => host.residency_reset(gpu.stream()),
@@ -1583,6 +1602,7 @@ impl<B: ChainBody> GpuModel<B> {
         what: &'static str,
         pass: impl FnOnce(&Gpu, &Weights, &mut B, &mut Head, u32) -> Result<bool, GpuError>,
     ) -> Result<Option<u32>, GpuError> {
+        let _busy = watchdog::busy(&self.watch, watchdog::RUN_ROWS, self.reads);
         self.refuse_if_poisoned(what)?;
         self.refuse_if_slots_wait(what)?;
         if n == 0 {
@@ -1754,6 +1774,7 @@ impl<B: Rows> GpuModel<B> {
     pub fn step_rows<const M: usize>(&mut self, tokens: [u32; M]) -> Result<[u32; M], GpuError> {
         const WHAT: &str = "GpuModel::step_rows";
         const { rows_fit::<B>(M) };
+        let _busy = watchdog::busy(&self.watch, watchdog::STEP_ROWS, self.reads);
         self.refuse_if_poisoned(WHAT)?;
         self.refuse_if_slots_wait(WHAT)?;
         let pos = self.pos;
@@ -1965,6 +1986,7 @@ impl<B: Rollback> GpuModel<B> {
     /// Take back the positions from `pos` on ([`Rollback::rollback`]): the
     /// next step runs at `pos`.
     pub fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        let _busy = watchdog::busy(&self.watch, watchdog::ROLLBACK, self.reads);
         self.refuse_if_slots_wait("GpuModel::rollback")?;
         if pos > self.pos {
             return Err(GpuError::shape(
@@ -1992,6 +2014,7 @@ impl<B: Instrumented> GpuModel<B> {
     ///
     /// Synchronizes; never inside a capture.
     pub fn seed_depth(&mut self, rows: usize) -> Result<(), GpuError> {
+        let _busy = watchdog::busy(&self.watch, watchdog::SEED_DEPTH, self.reads);
         if rows == 0 {
             return Err(GpuError::shape(
                 "GpuModel::seed_depth",
