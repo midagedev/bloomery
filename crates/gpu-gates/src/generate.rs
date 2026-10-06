@@ -369,23 +369,23 @@ fn ordinal_word(o: u32) -> &'static str {
     s
 }
 
-/// `r`, a `load` record ([`record::LOAD_GENERATOR`]) written up to its
-/// `unified_addressing` field, with the devices the model runs on (`cards`:
-/// the stage card `stage`, then the expert tier cards `tiers`), by the names
-/// their drivers report — each space written `_`, since the field is one
-/// word — and, when the placement has an expert tier card, the tier's
-/// experts and resident bytes. A device that is not the placement's card —
+/// The devices a model runs on, the stage card `stage` then the expert tier
+/// cards `tiers`, as a `load` line's `cards` field names them: by the names
+/// their drivers report, each space written `_`, since the field is one
+/// word. `planned` is the placement `--place <word>`'s cards by the names
+/// the plan gives them, and `specs` the devices it resolved to on this
+/// process's census (`None` for a census-free placement). Another count of
+/// devices than the placement's cards, and a device that is not its card —
 /// of a resolved placement, another device; of a census-free one, a name
-/// that does not hold the card's —, tiers that do not match the placement's
-/// — another count, or a tier on another card — and more than the one tier
-/// the record's fields hold are refused by name. Every body's load record
-/// names its cards here.
-pub fn with_cards(
-    r: Record,
-    place: Place,
+/// that does not hold the card's — are refused by name. Every body's load
+/// line names its cards here.
+pub fn card_words(
+    word: &str,
+    planned: &[&str],
+    specs: Option<&[CardSpec]>,
     stage: &Gpu,
     tiers: &[TierCard],
-) -> Result<Record, GateError> {
+) -> Result<Vec<String>, GateError> {
     let mut gpus = vec![stage];
     gpus.extend(tiers.iter().map(TierCard::gpu));
     let mut devices = Vec::with_capacity(gpus.len());
@@ -394,21 +394,18 @@ pub fn with_cards(
         devices.push(g.device_name()?);
         ids.push(g.device_id()?);
     }
-    let planned = place.cards();
     let named = devices.len() == planned.len()
-        && if place.resolved {
-            let specs = place.card_specs()?;
-            ids.iter()
-                .zip(&specs)
-                .all(|(id, s)| s.device.is_some_and(|d| d.uuid == id.uuid))
-        } else {
-            devices.iter().zip(&planned).all(|(d, p)| d.contains(p))
+        && match specs {
+            Some(specs) => ids
+                .iter()
+                .zip(specs)
+                .all(|(id, s)| s.device.is_some_and(|d| d.uuid == id.uuid)),
+            None => devices.iter().zip(planned).all(|(d, p)| d.contains(p)),
         };
     if !named {
         return Err(format!(
-            "--place {}: the model runs on {devices:?} ({}), the placement's cards are \
+            "--place {word}: the model runs on {devices:?} ({}), the placement's cards are \
              {planned:?}",
-            place.name(),
             ids.iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
@@ -416,7 +413,29 @@ pub fn with_cards(
         )
         .into());
     }
-    let r = r.csv("cards", devices.iter().map(|d| d.replace(' ', "_")));
+    Ok(devices.iter().map(|d| d.replace(' ', "_")).collect())
+}
+
+/// `r`, a `load` record ([`record::LOAD_GENERATOR`]) written up to its
+/// `unified_addressing` field, with the devices the model runs on (`cards`,
+/// [`card_words`] of the placement's cards) and, when the placement has an
+/// expert tier card, the tier's experts and resident bytes. A device that is
+/// not the placement's card ([`card_words`]), tiers that do not match the
+/// placement's — another count, or a tier on another card — and more than
+/// the one tier the record's fields hold are refused by name.
+pub fn with_cards(
+    r: Record,
+    place: Place,
+    stage: &Gpu,
+    tiers: &[TierCard],
+) -> Result<Record, GateError> {
+    let specs = if place.resolved {
+        Some(place.card_specs()?)
+    } else {
+        None
+    };
+    let words = card_words(place.name(), &place.cards(), specs.as_deref(), stage, tiers)?;
+    let r = r.csv("cards", words);
     let want = place.tier_cards();
     let got: Vec<&str> = tiers.iter().map(TierCard::name).collect();
     match (tiers, want.as_slice()) {

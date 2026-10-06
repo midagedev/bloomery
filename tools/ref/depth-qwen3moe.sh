@@ -399,8 +399,9 @@
 # an a arm plan (a) on the A6000 with the 3090 idle, its row in the A6000+3090 table all the same, and a gate
 # arm (a 3090-only row) is refused by name. After each of our arms the `cards=` field of its load line
 # (tools/ref/arm-place.sh place_arm_cards) must name the A6000 and the 3090 under bp and the A6000 alone
-# under a, or the arm is a FAIL row; a load line with no cards= field (generate_qwen3moe's prints none
-# today) is one too. ik and mistral.rs arms are refused by name (no two-card line). Before the lease a card that does not answer, a 3090 off its cap or an unpatched lease.sh
+# under a, or the arm is a FAIL row (generate_qwen3moe's names them by generate::card_words, V4.1's rule:
+# the stage card, then the expert tier card, each driver name with its spaces written `_`); a load line
+# with no cards= field is one too. ik and mistral.rs arms are refused by name (no two-card line). Before the lease a card that does not answer, a 3090 off its cap or an unpatched lease.sh
 # refuses the run; after every arm an Xid since the last arm, a card lost or off its cap, or a
 # llama-bench or llama-server that did not see both cards (its ggml_cuda_init lines) makes the arm a FAIL
 # row. A compute

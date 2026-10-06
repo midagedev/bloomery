@@ -344,7 +344,7 @@ mod cli {
     use bloomery_gpu::hybrid::HybridStats;
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
     use bloomery_gpu::{Gpu, GpuModel, Qwen3moeModel};
-    use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::generate::{Place, card_words};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::record::{self, Record};
@@ -919,6 +919,14 @@ mod cli {
         /// The stage card's spec.
         fn card(self) -> CardSpec {
             self.stage
+        }
+
+        /// The cards the placement resolved to: the stage card, then the
+        /// expert tier card when it has one.
+        fn specs(self) -> Vec<CardSpec> {
+            let mut specs = vec![self.stage];
+            specs.extend(self.tier);
+            specs
         }
 
         /// The stage card is the A6000: the placement the Qwen3.8 defaults
@@ -1904,6 +1912,18 @@ mod cli {
         Ok(Some(RouteTrace::create(dir, header)?))
     }
 
+    /// The cards `m` loaded at `place`, its `load` line's `cards=` field:
+    /// `generate::card_words` of the placement's cards (the stage card, then
+    /// the expert tier card; a device that is not the placement's refused by
+    /// name), as a record's csv field writes them.
+    fn cards38(m: &Qwen38Model, place: Place38) -> Result<String, GateError> {
+        let specs = place.specs();
+        let planned: Vec<&str> = specs.iter().map(|s| s.name).collect();
+        let tiers = m.body("generate_qwen3moe")?.hybrid().tiers();
+        let words = card_words(place.name(), &planned, Some(&specs), m.gpu(), tiers)?;
+        Ok(format!("[{}]", words.join(",")))
+    }
+
     /// The Qwen3.8-Flash-Next model of `file`, placed by its plan on the
     /// card `place` names, its routed experts where `experts` says, its plan
     /// counting `slots` resident sequences (`BLOOMERY_GEN_SLOTS`; one is the
@@ -1951,7 +1971,7 @@ mod cli {
         println!(
             "load arch=qwen4exp resident_bytes={} ctx={ctx} ctx_max={cap} ctx_train={} \
              verified={VERIFIED_POSITIONS} layers={} mode={} store_bytes={} prefill={} ubatch={} \
-             place={} card_layers={} card_stacks={} in {:.1} s (runtime value)",
+             place={} cards={} card_layers={} card_stacks={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             inputs.hp.n_ctx_train,
             m.layers().len(),
@@ -1960,6 +1980,7 @@ mod cli {
             path.name(),
             body.ubatch_rows(),
             place.name(),
+            cards38(&m, place)?,
             body.card_layers(),
             body.card_stacks(),
             t.elapsed().as_secs_f64()
@@ -2034,7 +2055,7 @@ mod cli {
         println!(
             "load arch=qwen4exp resident_bytes={} ctx={ctx} ctx_max={cap} ctx_train={} \
              verified={VERIFIED_POSITIONS} layers={} mode={} store_bytes={} prefill={} ubatch={} \
-             place={} card_layers={} card_stacks={} in {:.1} s (runtime value)",
+             place={} cards={} card_layers={} card_stacks={} in {:.1} s (runtime value)",
             m.resident_bytes(),
             inputs.hp.n_ctx_train,
             m.layers().len(),
@@ -2043,6 +2064,7 @@ mod cli {
             path.name(),
             body.ubatch_rows(),
             place.name(),
+            cards38(&m, place)?,
             body.card_layers(),
             body.card_stacks(),
             t.elapsed().as_secs_f64()

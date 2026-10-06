@@ -110,7 +110,8 @@
 #                (STUB_GEN_CARDS_ON): each placement its own load (--place bp, --place a), the ours rows
 #                `place bp` and `place a` with the mode's card field, the [config] placements line; rc 0.
 #   twocard-place-3090  an a arm whose load line names the 3090 (STUB_GEN_CARDS_A): its FAIL row; rc 1.
-#   twocard-nocards  a load line with no cards= field, as generate_qwen3moe's is today: the FAIL row; rc 1.
+#   twocard-nocards  a load line with no cards= field (a binary from before generate_qwen3moe named its
+#                cards): the FAIL row; rc 1.
 #   twocard-place-dry  the dry run: each arm's --place and load key, the placements line.
 # An arm's place= under one card (red on the runner before it, which reads place= as a lever and refuses
 # it as no registry row, rc 64 with another text):
@@ -319,9 +320,10 @@ touch "$T/Cargo.toml"
 # STUB_GEN_MTP an `mtp summary` of 10 positions in 4 passes and the MTP form of the SMOKE line (steps= the
 # summary's positions, passes= its passes, no seeded=): STUB_GEN_PASSES=5 is 10 positions in 5 passes, 0 none
 # in none, any other value an error. Every process appends its --place to $TMPDIR/stub-gen-place (`-` when
-# none). A variable named `place` in its environment ends it at rc 9. Its load line names no cards, as
-# generate_qwen3moe's does not; under STUB_GEN_CARDS_ON=1 it names the cards its --place loads (`cards=`:
-# the A6000 under a or none, STUB_GEN_CARDS_A in their stead; the 3090 under gate; both under bp).
+# none). A variable named `place` in its environment ends it at rc 9. Its load line names no cards unless
+# STUB_GEN_CARDS_ON=1 (twocard-nocards keeps a load line without them); under it the line names the cards
+# its --place loads, as generate_qwen3moe's does (`cards=`: the A6000 under a or none, STUB_GEN_CARDS_A in
+# their stead; the 3090 under gate; both under bp).
 # Under BLOOMERY_GEN_SLOTS=N (N >= 2, or STUB_GEN_SLOTS_LEAK=N on any arm) each arm is N slots of depth / N
 # ids: their step, time prompt and tokens lines tagged `slot=<j>`, a `capture slots=` line, each round a
 # `time pass … kind=slots` at 8 ms of N positions (STUB_GEN_SLOTS_POS in its stead), and the slots' SMOKE
