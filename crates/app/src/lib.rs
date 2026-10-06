@@ -668,6 +668,7 @@ impl<B: Prompt + Keep> Target for Session<B> {
 
     fn prompt(&mut self, ids: &[u32], want: Want) -> Result<Out<'_>, SessionError> {
         self.idle("prompt")?;
+        let _busy = self.model.prompt_busy();
         let argmax = B::prompt(&mut self.model, ids)?;
         self.read(argmax, want)
     }
