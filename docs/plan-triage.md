@@ -2,7 +2,60 @@
 
 여기는 **아직 할 일만** 있다. 2026-09-25 새벽에 다시 썼다 — 그 전 판(라운드 보고 절 스무 개와 09-23 GPU 선 목록의 원문, 155 KB)은 [`plan-ledger.md`](plan-ledger.md) 「plan-triage.md 2026-09-25 이전 판」에 원문 그대로 있고, 항목의 근거·수치·기제가 필요하면 거기서 찾는다. 항목은 받을 라운드별로 한 줄씩이고 크기는 XS·S·M·L이다. 착륙한 줄은 지운다(원문은 장부, 결과는 커밋 메시지와 rig-log). 수치는 `[유도]`가 아니면 실측이다.
 
+## Top priority: the common-machine gap (GitHub #1, the user, 2026-10-07)
+
+A user measured bloomery 0.2.5 against Strata on one machine and one file: RTX 5090 32 GB, Core Ultra 9 285K (AVX2 +
+AVX-VNNI, no AVX-512), dual-channel DDR5, 196 GB, WSL2; Qwen3.8-Flash-Next UD-Q4_K_XL; MTP on; greedy chat, thinking
+off; 256 tokens; medians of 3. Strata is ahead 1.6–2.0× on decode (79.0 / 108.5 / 86.4 against 48.8 / 53.0 / 47.4
+tok/s at a short, ~3.8K and ~29.6K prompt) and 3.8–7.1× on prefill (1,554 / 2,779 against 407 / 390 tok/s; first token
+2.4 / 10.7 against 9.3 / 76.0 s). The machine is the common shape: a strong card and link, a weak host (about half our
+147.7 GB/s [derived from the DIMM count]). Our engine was tuned on the opposite shape (8-channel host, PCIe 4.0), so the
+goal is one rule that picks per machine from numbers it measures, not a second hard-coded shape. Strata's numbers stay
+out of our tables. Sources: the lead's specs `strata/report.md` (agy, Strata `82f46a8c`, mechanisms re-read by the
+lead) and the Sonnet cross-check round.
+
+What the code shows (Strata, re-read by the lead):
+- Prefill: from a 1,024-token chunk on, every expert the card does not hold streams through a card ring and runs as a
+  card GEMM; the CPU computes none (`src/prefill/prefill.cpp:99-115`, `:2540-2572`). Chunks reach 8,192, so the ~60 GB
+  stream is paid once per chunk; that is why its rate rises with the prompt.
+- Decode verify windows: a share of each layer's distinct missed experts (0.55, scaled by an H2D probe) is read by the
+  card over PCIe while the CPU computes the rest (`src/program/generate.cpp:548-551`, `:2355-2368`); misses are read
+  once for all rows (`src/core/expert_source.cpp:2620-2650`).
+- Draft width: chosen each window from measured round costs by size and an acceptance EMA; no draft unless it beats
+  plain by 5 % (`src/spec/controller.cpp:35-55`, `src/spec/draft_policy.cpp`).
+- Cache: seeded from an offline profile; every slot adapts, up to 96 swaps every 4 rounds.
+
+Ours: the prefill's host experts run on the CPU, which is about 2.5 ms a token on that host and grows linearly. A
+4-row window is fixed, and `Gated` (`crates/runtime/src/gate.rs`) has no caller in the Qwen3.8 seat. Half the card set
+is pinned by id prefix (`mid-p57`). The residency clock counts passes, not tokens. The draft holds 933 card experts,
+17 % of that card's set. The MTP gain on chat is mostly the genre: our +31…+52 % rows are prose (E = 3.0–3.7), our
+chat runs E = 2.17–2.46, and our own W 2.07–2.25 gives −4…+19 % [derived]. The host share of W on his machine is the
+second term. His `/metrics` (asked on #1) settle E and W.
+
+| # | Track | Size | Band [derived] | State |
+|---|---|---|---|---|
+| G1 | Expert stream, one common owner: a prompt ubatch streams the non-card experts to a card ring and runs card GEMMs, with the host computing a balanced share so both finish together; the threshold and the share come from a load-time H2D probe and the host's measured rate | L | Qwen3.8 at ~4K on the 5090 407 → ~3,700 tok/s ceiling (4096 / 1.1 s), on our A6000 7.4 → ~1.6 s an ubatch; card GEMM not counted, and on his host the staging copies and the CPU share draw on one DRAM | design round `xstream` |
+| G2 | The same owner in decode: the card reads a probed share of a window's distinct misses over PCIe | L | miss term 1.25–1.5× on a Gen5 link | in `xstream`'s design |
+| G3 | Draft gate and width: wire `Gated` into the Qwen3.8 seat and CLI, and cut a window at a draft probability floor or by a measured cost per width; serve prints the windows' E | S–M | +3…+10 % on his machine's chat, 0 on our prose | round `draftgate` |
+| G4 | Residency: count tokens, not passes; un-pin the id-prefix half; size the swap cap from the link | M | hit +2…+4 points | round `resclock` |
+| G5 | Rulers for the common shape: a chat-corpus arm in `depth-qwen3moe.sh`, and a "common machine" arm on our box (card budget at his 5,482 experts, host threads capped); read E and W on English chat | S | — | round `chatarm` |
+| G6 | A lighter draft (its 2.91 GB back to target experts) | M | +450–600 card experts on 32 GB | after G3 |
+| G7 | AVX-VNNI host kernels | M | prefill share only; decode 0 | after G1 |
+| G8 | drafted ≠ plain: verify row 0 differs from the plain step by ≥ 0.44 logits at the first divergence (Q4, row 0; Q3 rows 1); the README / `generate_qwen3moe.rs:164` equality claim is false on both files | S–M | — | worker2, opus narrowing |
+
 ## Direction: development speed first (the user, 2026-10-06)
+
+Decisions of 2026-10-07 (the user: "proceed with the recommended defaults"):
+- **P4** (clef/qwen3 serve gates to weekly): no, until the wall is re-measured with gatecut in.
+- **gate_glm5next_e2e PP list:** no cut. 7, 8 and 9 are a chunk short, whole and one past it (the list's own doc,
+  `gate_glm5next_e2e.rs`), so they are distinct boundary cases, not one path proven four times.
+- **Kolibri-1:** flagship Q4_K_M + host tier + residency on the A6000 (Q3_K_M whole-card also lands); oracle by
+  porting `build_kolibri1.cpp` into an ik tree; Q2_K refused by name in v1.
+- **MiMo-V2.6-Flash:** the MOPD checkpoint; all experts on the host first, then card experts; one nextn layer first.
+- **Model downloads** (MOPD ~170 GB, Kolibri 37.5 + 47.5 GB) and the llama.cpp mainline re-sit at b11443 are box
+  jobs over 30 minutes and wait for the user's approval.
+- **Per-step sync sweep:** not now.
+
 
 Whether development slows down or speeds up depends on code quality, so quality work leads, ranked by how much it
 cheapens the next change. Speed and coverage ride the same lever, one common owner per shared concept (AGENTS.md
