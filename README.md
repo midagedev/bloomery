@@ -41,9 +41,10 @@ What runs today and what does not, for people and for coding agents sizing up th
 | Area | State |
 |---|---|
 | Linux x86-64 with an NVIDIA sm_86 card (RTX 3090, RTX A6000, RTX 3060) | Runs. Every number in this README comes from these cards |
-| Ada and Blackwell cards (sm_89, sm_120) | Not yet run here. The archive's sm_86 PTX compiles at the first start with the card's driver (R570+ for Blackwell); please report the result in an issue |
+| Ada and Blackwell cards (sm_89, sm_120) | Not yet run here. The archive's sm_86 PTX compiles at the first start with the card's driver (R570+ for Blackwell). Reports welcome (below) |
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel: the release binary is built and checked for x86-64-v3. The numbers here ran on a 32-core AMD Threadripper |
-| macOS, Apple silicon, AMD GPUs (ROCm), Windows without WSL2 | Not supported |
+| macOS, Apple silicon | Not supported yet |
+| AMD GPUs (ROCm), Windows without WSL2 | Not supported |
 | OpenAI and Anthropic APIs, streaming, tool calls | Work on every generative model |
 | Several requests at once (`--parallel`, default 2) | Work. One pass for every stream on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B; in turn on the rest |
 | MTP draft (Qwen3.8, GLM-5.3) | On by default. Greedy requests always; sampled requests while one request runs |
@@ -52,6 +53,11 @@ What runs today and what does not, for people and for coding agents sizing up th
 | Vision input (V4.1) | Not in this release |
 
 The full list is under [Limits](#limits).
+
+**Help wanted: hardware we have not run.** We test on Ampere cards (RTX 3090, RTX A6000, RTX 3060) and one AMD CPU. If you have an Ada or Blackwell
+card (RTX 40xx or 50xx, L40S, RTX PRO 6000), an Intel host, or a multi-card machine, please run the checklist below and
+file a [hardware report](https://github.com/midagedev/bloomery/issues/new?template=hardware-report.md). A report that
+it worked helps as much as one that it failed.
 
 ## Evaluating bloomery
 
