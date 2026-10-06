@@ -136,9 +136,13 @@ v0.2.3 is 2647030c. Everything below is 0.2.4 work. The handoffs it was read fro
 - placeunset: one common rule for an unset `--place` (the user, 10-06). Design final in the lead specs
   `release/placeunset/report.md`: keep a tier only when the plan's next-card tier experts reach the family's
   break-even and exceed 0. V4.1 bp has never been sat; `docs/cards/v41bp-ab.card` predates f2593a62.
-- The q38big bugs: an empty host tier is built anyway (`body38.rs:1159-1211`); bp on 2× 96 GB reads "no context fits";
-  Q3_K_XL plans an empty tier and nothing refuses it; residency takes a 38.5 GB pool on a full card; DraftReserve
-  under seat bp plus a draft (`qwen38.rs:453` vs `place.rs:645-651`).
+- The q38big bugs still open (0fee5846 closed q1 DraftReserve, q2 the idle-tier misreport, q4 NoHostExperts, q5 the
+  idle tier's eligible layers and q6 Borrowed): q3 an empty host tier is built anyway (`body38.rs:1159-1211`, a
+  q38tslots file); q7 the test census's free_bytes; q8 rank by free. The placeunset report's "bp + draft refuses on
+  DraftReserve" is stale for the same reason.
+- Qwen3.x's unset whole load opens `Gpu::new()`, device 0 (`qwen3.rs:458,535`; the probe `qwen3moe_place.rs:680`,
+  `:715`, `:741`, `:900`), not `a`'s largest card: on two cards in another order it can land on the smaller one. Needs
+  a crates/gpu public constructor by device. M.
 - q38big (c): an empty host tier still costs about 48 round trips a step on a 96 GB card.
 - q38tslots-ab: re-derive with the tier copy-out (~800 KB a layer at 8 columns, 30–40 µs [derived]).
 - Copy-out packing: the tier copies all n_used·cols·hidden; packing only the tier slots' rows is S, ~60 lines.
