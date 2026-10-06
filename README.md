@@ -16,8 +16,8 @@
 - **MoE models larger than the card.** Routed experts live on the GPU and in host RAM; the engine counts its own
   routing and moves the experts it calls most onto the card while it runs. On one RTX 3090 24 GB beside a 256 GB
   host, DeepSeek-V4.1-Flash `Q3_K_M` (347 GB) serves two requests at 34.4 tok/s in total and GLM-5.3-Flash at 26.9;
-  Qwen3-30B runs whole on the card, two requests at 254 tok/s in total ([Numbers](#numbers)). Qwen3.6-35B fits a 12–16 GB card with
-  `--place a`.
+  Qwen3-30B runs whole on the card, two requests at 254 tok/s in total ([Numbers](#numbers)). Qwen3.6-35B also runs on a 12–16 GB card:
+  the load splits it between the card and the CPU by itself.
 - **Several requests, one pass.** With `--parallel 2` two busy streams run through the model together: 25–37 %
   more tokens a second in total than one stream, on V4.1, GLM-5.3, Qwen3.8 and Qwen3-30B
   ([measured on the A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)).
@@ -56,9 +56,12 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   `BLOOMERY_QWEN3_KV` lever — q8_0 halves the KV bytes a position, so the auto context nearly doubles on the
   same card; `--cache-type-v` does not exist, both planes quantize together), `--host/--port`,)
   `--alias`.
+- **No placement flag needed**: leave `--place` out on every model and the load picks for you — the largest
+  visible card, a split onto the CPU when the file does not fit it, and on GLM-5.3 the second card as an expert
+  tier when its plan puts enough experts there to pay for it (the GLM row of the A6000 + 3090 table below). The
+  plan line names what was picked.
 - **Two-card serving like `-ts`**: `--place a` for the largest visible card, `--place bp` to add the next one
-  as an expert tier, or a list (`0+1`) by CUDA index; unset, the glm seat takes `bp` when its plan puts enough
-  experts on the second card to pay for it (the GLM row of the A6000 + 3090 table below).
+  as an expert tier, or a list (`0+1`) by CUDA index.
 - **Clef-Flash's `/v1/systemone`** follows llama.cpp's decision server wire (`model` optional, `/v1/models`,
   501 for images and video, upstream's `confidence` formula).
 
@@ -141,9 +144,9 @@ except on V4.1, where every slot holds the whole context; `--parallel 1` keeps o
 The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
 name. A new request's prompt runs in one call between rounds, and the other streams wait for it.
 
-**Small cards.** Qwen3.6 and Qwen3-30B at `Q4_K_M` (19-21 GB) run whole on a 24 GB card, or on a 12-16 GB card
-with `--place a`: the routed experts go to the CPU. With no `--place` at all, a file that does not fit the
-card's free bytes plans that split itself and says so on its plan line.
+**Small cards.** Qwen3.6 and Qwen3-30B at `Q4_K_M` (19-21 GB) run whole on a 24 GB card. On a 12-16 GB card
+the load sees that the file does not fit the card's free bytes, sends the routed experts to the CPU, and says so
+on its plan line; no flag is needed (`--place a` asks for that split on any card).
 
 **A plan that fits the card you have.** The load reads each card's free bytes and the host's available RAM
 before anything uploads; the expert share sizes to them, and a plan that cannot fit is refused by name with
@@ -156,7 +159,7 @@ default in their servers); `BLOOMERY_DRAFT=dspark` drafts V4.1 with DeepSeek's D
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so
-decode starts warm (on by default under `--place a`/`bp`).
+decode starts warm (on by default, with `--place` unset, `a` or `bp`).
 
 **The engines behind the server.** `generate_ds41` takes token ids and prints greedy ids; `bloomery-chat`
 streams text; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are the standalone V4.1 and Qwen3.8 servers.
@@ -169,8 +172,8 @@ Every seat and flag is its binary's `--help`.
 | DeepSeek-V4.1-Flash | [`Q3_K_M`](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF) (vcruz305) | GPU + CPU experts; 256 GB of RAM |
 | GLM-5.3-Flash | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts; sparse attention past 2,051 positions |
 | Qwen3.8-Flash-Next | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (unsloth) | GPU + CPU experts |
-| Qwen3.6-35B-A3B | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole on one 24 GB card, or `--place a` on 12-16 GB |
-| Qwen3-30B-A3B-Instruct-2507 | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole on one 24 GB card, or `--place a` on 12-16 GB |
+| Qwen3.6-35B-A3B | [`Q4_K_M`](https://huggingface.co/lmstudio-community/Qwen3.6-35B-A3B-GGUF) (lmstudio-community) | whole on one 24 GB card, or split onto the CPU on 12-16 GB (automatic) |
+| Qwen3-30B-A3B-Instruct-2507 | [`Q4_K_M`](https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF) (unsloth) | whole on one 24 GB card, or split onto the CPU on 12-16 GB (automatic) |
 | Clef-Flash | [`Q8_0` to `Q3_K_S`](https://huggingface.co/bartowski/Cloudflare_clef-flash-GGUF) (bartowski), plus the release's [head file](docs/BUILD.md#clef-flash) | whole on one GPU, its head on the CPU |
 | DeepSeek-V2-Lite-Chat | [`Q3_K_M`](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) (mradermacher) | CPU or GPU; the first model, still gated |
 
@@ -299,8 +302,8 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | Model | GPU | Host RAM | Disk (the file) |
 |---|---|---|---|
 | Clef-Flash | 12 GB covers every quantization (the files run 4.26–9.55 GB) | any | 4.3–9.6 GB, plus the head (243 MB, fetched) |
-| Qwen3.6-35B `Q4_K_M` | 24 GB whole, or 12–16 GB with `--place a` | 32 GB whole; about 10 GB free beside a small card | 21.2 GB |
-| Qwen3-30B `Q4_K_M` | 24 GB whole, or 12–16 GB with `--place a` | 32 GB whole; about 8 GB free beside a small card | 18.6 GB |
+| Qwen3.6-35B `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 10 GB free beside a small card | 21.2 GB |
+| Qwen3-30B `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 8 GB free beside a small card | 18.6 GB |
 | Qwen3.8-Flash-Next | 24 GB recommended (the expert share sizes to the card's free bytes) | 256 GB | 111.3 GB, plus the 2.8 GB MTP draft |
 | GLM-5.3-Flash | 24 GB recommended | 256 GB | 199.7 GB |
 | DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB | 347.3 GB, plus 155.7 GB for the optional r8 sidecar |
