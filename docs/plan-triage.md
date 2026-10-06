@@ -119,7 +119,32 @@
 
 ## 열린 항목 — 받을 라운드별
 
-### The 0.2.2 cut (10-06, line1 — the user: the simple fixes, Qwen3.8's two-card passes, vision, residency invariance, llama-server parity; light verification)
+### The 0.2.2 cut (10-06, line1 — re-cut at 11:50 by the user: "too big; cut it, and finish 0.2.2 faster")
+
+**Freeze 14:00 KST, release right after.** 0.2.2 holds what has landed and the following:
+- glmbpdef: on main directly if glmresdiag is not green by 13:15;
+- anthropic;
+- qualmig;
+- glmresdiag, only if green by 13:45;
+- slotpoison, only if R1–R4 match by 13:30;
+- num3090run (tools; not gating).
+
+**Moved to 0.2.3, still running:**
+- q38tslots and q38tseat: bp is slower than one A6000, so they ship with the bp step-penalty fix;
+- vision, after visref's verdict;
+- residency invariance (E1, eqC, eqA*);
+- parity1;
+- structured output.
+
+**What makes it fast:**
+- no new A/B (glmbpdef's effect is glmbp-ab; qualmig is host-only with ptx equal to base);
+- the README re-sit is not gating;
+- a warm-up `release-build` at 11:55 so the freeze build is incremental;
+- the release notes drafted before the freeze;
+- no new release clips (0.2.1's stand).
+
+The table below is the morning plan, kept for the items that moved.
+
 
 Verification is light by the user's rule ("the big verification ran in 0.2.1; verify the changed parts only"). Each
 piece lands on its owning gates plus the static checks, with ptx-scan wherever a kernel could move. There is no
