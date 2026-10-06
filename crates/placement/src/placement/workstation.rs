@@ -472,8 +472,10 @@ pub fn spec_of(card: &Card) -> Option<CardSpec> {
     CARDS.into_iter().find(|s| s.name == card.name)
 }
 
-/// What a placed load needs of the host's memory, which `MemAvailable` must
-/// cover ([`HostNeed::check`]): the plan's host experts and tables, the
+/// What a placed load needs of the host's memory, which the host's
+/// available bytes must cover ([`HostNeed::check`]) — `MemAvailable`, or
+/// the smaller room under a cgroup v2 limit ([`host_room`]): the plan's
+/// host experts and tables, the
 /// cards' ring shadows, the host's reserves and `extra` (a residency churn
 /// pool the host set also holds), less the reserve named [`OS_RESERVE`] —
 /// `MemAvailable` already leaves out what the OS and every other process
@@ -522,8 +524,9 @@ impl HostNeed {
             .saturating_sub(self.os)
     }
 
-    /// `available` bytes (`MemAvailable`) cover the need, or the refusal
-    /// that names both, each term and what lowers the need.
+    /// `available` bytes (the host's reading, [`host_room`]'s) cover the
+    /// need, or the refusal that names both, each term and what lowers the
+    /// need.
     pub fn check(self, available: u64) -> Result<(), HostShort> {
         if self.bytes() <= available {
             Ok(())
@@ -536,7 +539,8 @@ impl HostNeed {
     }
 }
 
-/// A placed load whose host need passes `MemAvailable` ([`HostNeed::check`]).
+/// A placed load whose host need passes the host's available bytes
+/// ([`HostNeed::check`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostShort {
     pub need: HostNeed,
@@ -549,7 +553,8 @@ impl fmt::Display for HostShort {
         let need = n.bytes();
         write!(
             f,
-            "the host has {} B available (MemAvailable in /proc/meminfo), under the {need} B \
+            "the host has {} B available (MemAvailable, or the smaller room under a cgroup v2 \
+             limit — host_room's reading), under the {need} B \
              this load needs by {} B: host experts {} B + tables {} B + ring shadows {} B + \
              reserves {} B",
             self.available,
@@ -603,12 +608,199 @@ pub fn mem_available(meminfo: &str) -> Result<u64, String> {
         })
 }
 
+/// Which reading of the host's available bytes decided ([`host_room`]):
+/// `MemAvailable`, or the room under a cgroup v2 memory limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostRead {
+    /// `/proc/meminfo`'s `MemAvailable`.
+    MemAvailable,
+    /// The room under the cgroup v2 memory limit at `path`, as
+    /// [`cgroup_v2_path`] names it under `/sys/fs/cgroup`.
+    Cgroup { path: String },
+}
+
+impl fmt::Display for HostRead {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HostRead::MemAvailable => write!(f, "MemAvailable in /proc/meminfo"),
+            HostRead::Cgroup { path } => write!(
+                f,
+                "the room under the cgroup v2 memory limit at /sys/fs/cgroup{path} \
+                 (memory.max − memory.current + active_file + inactive_file)"
+            ),
+        }
+    }
+}
+
+impl HostRead {
+    /// One word for a `key=value` line: `MemAvailable`, or `cgroup:<path>`.
+    #[must_use]
+    pub fn word(&self) -> String {
+        match self {
+            HostRead::MemAvailable => "MemAvailable".to_string(),
+            HostRead::Cgroup { path } => format!("cgroup:{path}"),
+        }
+    }
+}
+
+/// The process's own cgroup v2 path of a `/proc/self/cgroup` text: the
+/// `0::` line names it under `/sys/fs/cgroup`. `Ok(None)` when the text has
+/// no `0::` line — the unified hierarchy holds this process nowhere, so no
+/// `memory.max` of it binds (a cgroup v1 system among them; v1 limits are
+/// not read). Two `0::` lines, or one whose path is not absolute or climbs
+/// with a `..` component (the path joins `/sys/fs/cgroup`), are refused by
+/// name.
+pub fn cgroup_v2_path(text: &str) -> Result<Option<String>, String> {
+    let mut own = None;
+    for line in text.lines() {
+        let Some(path) = line.strip_prefix("0::") else {
+            continue;
+        };
+        if own.is_some() {
+            return Err("the /proc/self/cgroup text has two unified-hierarchy lines".to_owned());
+        }
+        if !path.starts_with('/') {
+            return Err(format!(
+                "the /proc/self/cgroup text's unified-hierarchy path {path:?} is not absolute"
+            ));
+        }
+        if path.split('/').any(|c| c == "..") {
+            return Err(format!(
+                "the /proc/self/cgroup text's unified-hierarchy path {path:?} climbs with .."
+            ));
+        }
+        own = Some(path.to_owned());
+    }
+    Ok(own)
+}
+
+/// One cgroup v2 level above the process, as its files' texts: its `path`
+/// under `/sys/fs/cgroup` ([`cgroup_v2_path`]'s), and that cgroup's
+/// `memory.max`, `memory.current` and `memory.stat`.
+#[derive(Clone, Copy, Debug)]
+pub struct CgroupLevel<'a> {
+    pub path: &'a str,
+    pub max: &'a str,
+    pub current: &'a str,
+    pub stat: &'a str,
+}
+
+/// One cgroup v2 `memory.max` text: `Ok(None)` for `max`, the level sets no
+/// memory limit; the limit's bytes otherwise. A value that is neither is
+/// refused by name.
+fn memory_max(text: &str) -> Result<Option<u64>, String> {
+    let t = text.trim();
+    if t == "max" {
+        return Ok(None);
+    }
+    t.parse::<u64>().map(Some).map_err(|_| {
+        format!("the cgroup's memory.max is {t:?}, neither `max` nor a whole number of bytes")
+    })
+}
+
+/// One cgroup v2 counter text (`memory.current`): a whole number of bytes,
+/// else refused by name.
+fn memory_bytes(what: &str, text: &str) -> Result<u64, String> {
+    text.trim().parse::<u64>().map_err(|_| {
+        format!(
+            "the cgroup's {what} is {:?}, not a whole number of bytes",
+            text.trim()
+        )
+    })
+}
+
+/// The file pages a cgroup v2 `memory.stat` text charges: `active_file` +
+/// `inactive_file`, in bytes. `memory.current` counts the page cache, and
+/// the model's shards are page cache once populated, while `MemAvailable`
+/// counts those LRU file pages as available — so a limit's room gives them
+/// back, or the host set is subtracted twice (once in `memory.current`,
+/// once as the plan's [`HostNeed`]) and a plan that fits is refused after
+/// any populate. Locked and unevictable pages sit in neither line and stay
+/// charged. A text missing either line, or holding a value that is not a
+/// whole number of bytes, is refused by name.
+fn memory_file_pages(stat: &str) -> Result<u64, String> {
+    let mut active = None;
+    let mut inactive = None;
+    for line in stat.lines() {
+        if let Some(v) = line.strip_prefix("active_file ") {
+            active = Some(v.trim());
+        } else if let Some(v) = line.strip_prefix("inactive_file ") {
+            inactive = Some(v.trim());
+        }
+    }
+    let page = |what: &str, v: Option<&str>| -> Result<u64, String> {
+        v.ok_or_else(|| format!("the cgroup's memory.stat has no {what} line"))?
+            .parse::<u64>()
+            .map_err(|_| format!("the cgroup's memory.stat {what} is not a whole number of bytes"))
+    };
+    page("active_file", active)?
+        .checked_add(page("inactive_file", inactive)?)
+        .ok_or_else(|| "the cgroup's memory.stat file pages pass u64".to_owned())
+}
+
+/// The room under one cgroup v2 level's memory limit, from its files' texts
+/// ([`CgroupLevel`]): `memory.max − memory.current + active_file +
+/// inactive_file` ([`memory_file_pages`] says why the file pages come
+/// back). `Ok(None)` when the level's `memory.max` is `max`: it binds
+/// nothing. A usage over the limit, or a room that passes u64, is refused
+/// by name.
+pub fn cgroup_room(level: &CgroupLevel<'_>) -> Result<Option<u64>, String> {
+    let Some(max) = memory_max(level.max)? else {
+        return Ok(None);
+    };
+    let current = memory_bytes("memory.current", level.current)?;
+    let pages = memory_file_pages(level.stat)?;
+    max.checked_sub(current)
+        .ok_or_else(|| {
+            format!(
+                "the cgroup at {} charges memory.current {current} B over its memory.max {max} B",
+                level.path
+            )
+        })?
+        .checked_add(pages)
+        .ok_or_else(|| {
+            format!(
+                "the cgroup at {} sums its room past u64 (memory.max {max} B, file pages \
+                 {pages} B)",
+                level.path
+            )
+        })
+        .map(Some)
+}
+
+/// The host's available bytes of a `/proc/meminfo` text and the cgroup v2
+/// levels above the process (its own cgroup first, every ancestor after):
+/// the smaller of `MemAvailable` and every level's room ([`cgroup_room`])
+/// — inside a container (`docker run --memory`), a systemd scope
+/// (`MemoryMax`) or a pod, `/proc/meminfo` still shows the whole machine,
+/// so a limit's room is the reading that binds — with the reading that
+/// decided ([`HostRead`]), for every refusal and line that prints the
+/// bytes to name. A level that sets no limit does not bind; no levels is
+/// `MemAvailable` alone; a tie leaves `MemAvailable` the named one.
+pub fn host_room(meminfo: &str, levels: &[CgroupLevel<'_>]) -> Result<(u64, HostRead), String> {
+    let mut best = (mem_available(meminfo)?, HostRead::MemAvailable);
+    for level in levels {
+        if let Some(room) = cgroup_room(level)?
+            && room < best.0
+        {
+            best = (
+                room,
+                HostRead::Cgroup {
+                    path: level.path.to_owned(),
+                },
+            );
+        }
+    }
+    Ok(best)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        A6000, CardSpec, DRAFT_RESERVE, HostNeed, Machine, PlacementError, RTX_3090,
-        TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, card, host,
-        mem_available, plan_a, plan_bp, plan_gate, plan_tiers, tier, tier_batch_bytes,
+        A6000, CardSpec, CgroupLevel, DRAFT_RESERVE, HostNeed, HostRead, Machine, PlacementError,
+        RTX_3090, TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE, TierBatchBytes, TierDraft, card,
+        cgroup_room, cgroup_v2_path, host, host_room, mem_available, plan_a, plan_bp, plan_gate,
+        plan_tiers, tier, tier_batch_bytes,
     };
 
     /// Plan (a), the gate plan and plan (b′) as their own bodies built them
@@ -781,6 +973,179 @@ mod tests {
         assert!(mem_available("MemAvailable:   12x kB\n").is_err());
         assert!(mem_available("MemAvailable:   12 MB\n").is_err());
         assert!(mem_available("MemAvailable:    kB\n").is_err());
+    }
+
+    /// One level's texts, its files as the kernel writes them: `pages` its
+    /// `active_file` and `inactive_file` bytes, held beside the texts so
+    /// [`CgroupLevel`] can borrow them.
+    fn level(path: &str, max: &str, current: &str, pages: (u64, u64)) -> OwnedLevel {
+        OwnedLevel {
+            path: path.to_owned(),
+            max: max.to_owned(),
+            current: current.to_owned(),
+            stat: format!(
+                "anon 1048576\nactive_file {}\ninactive_file {}\nslab 2048\n",
+                pages.0, pages.1
+            ),
+        }
+    }
+
+    /// A [`CgroupLevel`]'s own texts ([`level`]'s).
+    struct OwnedLevel {
+        path: String,
+        max: String,
+        current: String,
+        stat: String,
+    }
+
+    impl OwnedLevel {
+        fn as_level(&self) -> CgroupLevel<'_> {
+            CgroupLevel {
+                path: &self.path,
+                max: &self.max,
+                current: &self.current,
+                stat: &self.stat,
+            }
+        }
+    }
+
+    /// Every level's [`CgroupLevel`], borrowing them ([`level`]'s).
+    fn as_levels(levels: &[OwnedLevel]) -> Vec<CgroupLevel<'_>> {
+        levels.iter().map(OwnedLevel::as_level).collect()
+    }
+
+    /// The unified-hierarchy line of a `/proc/self/cgroup` text: the path it
+    /// names; no `0::` line (cgroup v1 only, or a process outside the
+    /// unified hierarchy) is `None`; a second line, a path that is not
+    /// absolute and one climbing with `..` are refused by name.
+    #[test]
+    fn cgroup_v2_path_reads_the_unified_line() {
+        let v2 = "12:devices:/user.slice\n0::/user.slice/user-1000.slice/session-3.scope\n";
+        assert_eq!(
+            cgroup_v2_path(v2),
+            Ok(Some(
+                "/user.slice/user-1000.slice/session-3.scope".to_owned()
+            ))
+        );
+        assert_eq!(cgroup_v2_path("0::/\n"), Ok(Some("/".to_owned())));
+        let v1 = "11:blkio:/init.scope\n12:devices:/user.slice\n";
+        assert_eq!(cgroup_v2_path(v1), Ok(None));
+        assert_eq!(cgroup_v2_path(""), Ok(None));
+        assert!(cgroup_v2_path("0::user.slice\n").is_err());
+        assert!(cgroup_v2_path("0::/a/../b\n").is_err());
+        assert!(cgroup_v2_path("0::/a\n0::/b\n").is_err());
+    }
+
+    /// One cgroup's room under its v2 memory limit: `max` binds nothing;
+    /// the room gives the file pages `memory.current` charges back; a usage
+    /// over the limit, and every malformed file, are refused by name.
+    #[test]
+    fn cgroup_room_reads_the_limit_and_gives_file_pages_back() {
+        let gib = 1 << 30;
+        let n = |b: u64| format!("{}\n", b);
+        // A limit with usage: 61 − 20 + 12 (file) = 53 GiB.
+        assert_eq!(
+            cgroup_room(&level("/", &n(61 * gib), &n(20 * gib), (6 * gib, 6 * gib)).as_level()),
+            Ok(Some(53 * gib))
+        );
+        // `max` sets no limit, whatever the usage says.
+        assert_eq!(
+            cgroup_room(&level("/", "max\n", "0\n", (0, 0)).as_level()),
+            Ok(None)
+        );
+        // The file pages a populated host set holds do not eat the room: a
+        // cgroup 20 GiB full of file pages under a 61 GiB limit still
+        // reports 61 GiB, the room `MemAvailable` would give those pages.
+        assert_eq!(
+            cgroup_room(
+                &level("/scope", &n(61 * gib), &n(20 * gib), (10 * gib, 10 * gib)).as_level()
+            ),
+            Ok(Some(61 * gib))
+        );
+        // Malformed files, each by name.
+        assert!(
+            cgroup_room(&level("/", "61G\n", "0\n", (0, 0)).as_level()).is_err(),
+            "memory.max"
+        );
+        assert!(
+            cgroup_room(&level("/", &n(8 * gib), "  \n", (0, 0)).as_level()).is_err(),
+            "memory.current"
+        );
+        let owned = level("/", &n(8 * gib), "0\n", (0, 0));
+        for stat in [
+            "",
+            "active_file 4096\n",
+            "active_file 4k\ninactive_file 4096\n",
+        ] {
+            let bad = CgroupLevel {
+                stat,
+                ..owned.as_level()
+            };
+            assert!(cgroup_room(&bad).is_err(), "{stat:?}");
+        }
+        assert!(
+            cgroup_room(&level("/", &n(8 * gib), &n(16 * gib), (0, 0)).as_level()).is_err(),
+            "usage over the limit"
+        );
+    }
+
+    /// The host's available bytes are the smaller of `MemAvailable` and
+    /// every cgroup v2 level's room, the deciding reading named: no levels
+    /// and a level without a limit leave `MemAvailable`; a nested limit
+    /// binds through the smaller parent; a tie names `MemAvailable`.
+    #[test]
+    fn host_room_takes_the_smaller_reading() {
+        let meminfo = "MemTotal:       263741212 kB\nMemAvailable:   257300180 kB\n";
+        let mem = 257_300_180 * 1024;
+        assert_eq!(host_room(meminfo, &[]), Ok((mem, HostRead::MemAvailable)));
+        let unlimited = [level("/", "max\n", "0\n", (0, 0))];
+        assert_eq!(
+            host_room(meminfo, &as_levels(&unlimited)),
+            Ok((mem, HostRead::MemAvailable))
+        );
+        // The scope's limit binds: the room is under MemAvailable.
+        let scope = [level(
+            "/user.slice/session-3.scope",
+            "65539000000\n",
+            "1073741824\n",
+            (512 << 20, 512 << 20),
+        )];
+        assert_eq!(
+            host_room(meminfo, &as_levels(&scope)),
+            Ok((
+                65_539_000_000,
+                HostRead::Cgroup {
+                    path: "/user.slice/session-3.scope".to_owned()
+                }
+            ))
+        );
+        // A nested limit: the smaller parent decides, and the deciding
+        // reading's text names its path.
+        let nested = [
+            level(
+                "/user.slice/session-3.scope",
+                "107374182400\n",
+                "0\n",
+                (0, 0),
+            ),
+            level("/user.slice", "65539000000\n", "0\n", (0, 0)),
+        ];
+        let (bytes, read) = host_room(meminfo, &as_levels(&nested)).expect("the room");
+        assert_eq!(
+            (bytes, &read.to_string()),
+            (
+                65_539_000_000,
+                &"the room under the cgroup v2 memory limit at /sys/fs/cgroup/user.slice \
+                 (memory.max − memory.current + active_file + inactive_file)"
+                    .to_owned()
+            )
+        );
+        // A tie leaves MemAvailable the named reading.
+        let tie = [level("/scope", &format!("{}\n", mem), "0\n", (0, 0))];
+        assert_eq!(
+            host_room(meminfo, &as_levels(&tie)),
+            Ok((mem, HostRead::MemAvailable))
+        );
     }
 
     /// The need is the plan's host terms less the OS reserve; exactly the

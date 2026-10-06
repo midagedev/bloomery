@@ -56,7 +56,9 @@
 #             every arm, so the plain rows' labels would hide it); and `@` on a reference, server or bin:
 #             arm — a lever of ours is not a reference's. The item place=<a|gate|bp> is no lever: it is the
 #             arm's placement (Placement below), in its load key and its --place, never a variable its
-#             process gets; the label keeps it.
+#             process gets; the label keeps it. The item mem=<N>G is no lever either: it is the arm's
+#             host memory (Mem below), a systemd-run scope of the arm's process, never a variable
+#             its process gets; the label keeps it.
 #             `depth-qwen3moe.sh --parse-arms [--registry <registry.rs>] <arms...>` parses the arms as a
 #             run does and prints each arm's kind, depth, label, variables and load key — a prose arm's
 #             line also its corpus path and the file's first three ids (`-` when the file is not readable
@@ -387,6 +389,21 @@
 # card is not the timing card is refused (64), bp too; every row of an arm with a --place names it (`place
 # <p>`), and one whose load line names another placement is a FAIL row.
 #
+# Mem. An ours arm's own list may name the host memory it runs under, `mem=<N>G` among its NAME=VALUE
+# items (`6@mem=61G`, `prose:512@mem=61G,BLOOMERY_QWEN38_EXPERTS=host`, N ≥ 1): that arm's process runs in
+# `systemd-run --scope -p MemoryMax=<N>G -p MemorySwapMax=0` (the box has no swap), the arm bound's
+# timeout outside the scope, its TERM forwarded by systemd-run and by the shell inside it to the binary.
+# The item is the runner's, never a variable the binary sees; the label keeps it (`ours@mem=61G`), and the
+# arm runs in a process of its own — no load key, as a bin: arm — so the scope is one arm's. The arm's
+# witness prints the scope's `memory.peak` after it, read inside the scope before systemd takes the
+# cgroup back. The engine's host guard reads the scope's room (host_available: memory.max −
+# memory.current + the file pages), so the model's shards in the page cache do not eat the limit whether
+# the scope or an earlier arm outside one faulted them in; the pages another arm cached stay charged
+# where that arm ran, so the scope simulates the small host for the guard's arithmetic, not the cold
+# reads of one. mem= on a reference, server or bin: arm rides the '@' refusal those arms take; an empty
+# value, one with no G, a value that is not a whole number of GiB and mem given twice are refused by
+# name before anything runs.
+#
 # Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh has the mode) runs the arms on both cards,
 # the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table (AGENTS.md, user
 # 2026-09-28: a model that does not fit one card; the reference on the same two cards, in the same
@@ -610,6 +627,26 @@ q3_self_test() {
   want place-arm-ref 64 "depth-qwen3moe.sh: arm 'lcpp:6@place=a': place= sets generate_qwen3moe's --place, and lcpp is a reference engine's arm, which takes no placement of ours"
   run_parse -- 6@place=a,FOO=1
   want place-arm-lever 64 "FOO is no row of the lever registry"
+  # The mem= item (the header's Mem): the runner's own, a process of the arm's own under a
+  # systemd-run scope; the lever list beside it still gated by the registry; each refusal by name.
+  run_parse -- 6 6@mem=61G
+  want mem-arm 0 \
+    "[parse] 6: kind=ours depth=6 label=ours env=- load=$bin|ctx=256" \
+    "[parse] 6@mem=61G: kind=ours depth=6 label=ours@mem=61G env=- load=(a process of its own) mem=61G" \
+    "[parse] round 1 loads: [6] 6@mem=61G"
+  run_parse -- 6@mem=61G,BLOOMERY_THREADS=8
+  want mem-lever 0 \
+    "[parse] 6@mem=61G,BLOOMERY_THREADS=8: kind=ours depth=6 label=ours@mem=61G,BLOOMERY_THREADS=8 env=BLOOMERY_THREADS=8 load=(a process of its own) mem=61G"
+  run_parse -- 6@mem=61
+  want mem-no-g 64 "mem=61: the item is mem=<N>G"
+  run_parse -- 6@mem=abcG
+  want mem-not-num 64 "mem=abcG: the item is mem=<N>G"
+  run_parse -- 6@mem=0G
+  want mem-zero 64 "mem=0G: the item is mem=<N>G"
+  run_parse -- 6@mem=61G,mem=62G
+  want mem-twice 64 "mem is given twice"
+  run_parse -- lcpp:6@mem=61G
+  want mem-ref 64 "a lever of ours is not a reference's"
   run_parse BLOOMERY_DATA="$pt/data" -- prose:4 bin:/root/r/t/target/release/generate_qwen3moe:prose:4
   want prose-bin 0 \
     "[parse] bin:/root/r/t/target/release/generate_qwen3moe:prose:4: kind=bin depth=4 label=bin:t@prose env=- load=(a process of its own) corpus=$pt/data/qwen3moe/corpus-prose.ids ids=100,101,102"
@@ -706,6 +743,9 @@ A_ENV=()
 # An ours or bin: arm's placement (its place= word, else BLOOMERY_GEN_PLACE; empty: no --place) and whether
 # place= set it (1, or empty); empty for a reference or server arm.
 A_PLACE=() A_PLACE_SET=()
+# An ours arm's mem= item (the header's Mem): its N, the whole GiB the arm's systemd-run scope holds
+# (empty for every other arm).
+A_MEM=()
 # A prose arm's prompt, the corpus's first P ids comma-separated as --tokens takes them (empty for
 # every other arm); under --parse-arms the placeholder `<prose_prompt P>` its load lines print.
 A_TOK=()
@@ -762,13 +802,45 @@ source "${BASH_SOURCE[0]%/*}/lever-arms.sh" || exit 2
 PLACE_RUNNER=depth-qwen3moe.sh PLACE_BIN=generate_qwen3moe PLACE_WORDS='a gate bp'
 # shellcheck source=tools/ref/arm-place.sh
 source "${BASH_SOURCE[0]%/*}/arm-place.sh" || exit 2
+# arm_mem_split <arm> <NAME=VALUE list>: the list's mem= item into ARM_MEM (empty without one) and the
+# rest, every other item as given and in order, into ARM_MEM_REST. The item is the runner's own (the
+# header's Mem), never a variable the binary sees. An empty value, one that is not a whole number of
+# GiB (with the G), a 0 and mem given twice are refused by name.
+arm_mem_split() {
+  local a=$1 s="$2," e rest='' seen=''
+  ARM_MEM=''
+  while [ -n "$s" ]; do
+    e=${s%%,*} s=${s#*,}
+    case $e in
+      mem=*)
+        [ -z "$ARM_MEM" ] || arm_refuse "$a" "mem is given twice"
+        ARM_MEM=${e#mem=}
+        local why="mem=$ARM_MEM: the item is mem=<N>G, N a whole number of GiB at least 1 (the arm's systemd-run --scope MemoryMax)"
+        case $ARM_MEM in
+          *G) ;;
+          *) arm_refuse "$a" "$why" ;;
+        esac
+        ARM_MEM=${ARM_MEM%G}
+        case $ARM_MEM in
+          '' | *[!0-9]*) arm_refuse "$a" "$why" ;;
+        esac
+        [ "$((ARM_MEM + 0))" -ge 1 ] 2> /dev/null || arm_refuse "$a" "$why"
+        ;;
+      *) rest+="${seen:+,}$e" seen=1 ;;
+    esac
+  done
+  # shellcheck disable=SC2034 # read by split_at below
+  ARM_MEM_REST=$rest
+}
 # split_at <arm> <list>: an ours arm's @ list into AT (as given: its label's), ENVS (its lever list, checked
-# by lever-arms.sh) and APLACE (its place= word, empty without one), which only a qwen4exp file takes.
+# by lever-arms.sh), APLACE (its place= word, empty without one) and AMEM (its mem= N, empty without one);
+# place= only a qwen4exp file takes.
 split_at() {
   AT=$2
   [ -n "$2" ] || arm_envs_ok "$1" "$2"
   arm_place_split "$1" "$2"
-  ENVS=$ARM_REST APLACE=$ARM_PLACE
+  arm_mem_split "$1" "$ARM_REST"
+  ENVS=$ARM_MEM_REST APLACE=$ARM_PLACE AMEM=$ARM_MEM
   [ -z "$ENVS" ] || arm_envs_ok "$1" "$ENVS"
   if [ -n "$APLACE" ] && [ "$MODEL_NAME" != qwen4exp ]; then
     place_refuse "$1" "place=$APLACE: only a qwen4exp file takes --place (generate_qwen3moe refuses it on $MODEL_NAME's)"
@@ -787,7 +859,7 @@ source "${BASH_SOURCE[0]%/*}/lcpp-fit.sh" || exit 2
 # shellcheck source=tools/ref/lcpp-warm.sh
 source "${BASH_SOURCE[0]%/*}/lcpp-warm.sh" || exit 2
 for a in "${ARMS[@]}"; do
-  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS=''
+  kind=ref eng=${a%%:*} dep=${a#*:} label='' bin='' envs='' tok='' AT='' APLACE='' ASLOTS='' AMEM=''
   # `@` is ours only (a <D> arm's or a prose arm's list): split at it first, so a value with a `:` is
   # not read as a reference's arm. place= on a reference arm is refused by name (the header's Placement).
   case ${a%%@*} in
@@ -814,7 +886,7 @@ for a in "${ARMS[@]}"; do
     srv_check_arm "$a" || { echo "depth-qwen3moe.sh: arm '$a': $SRV_WHY" >&2; exit 64; }
     srv=1
     A_KIND+=(srv) A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=('') A_IDS+=("$ids") A_ENV+=('') A_TOK+=("$tok") A_SLOTS+=('')
-    A_PLACE+=('') A_PLACE_SET+=('')
+    A_PLACE+=('') A_PLACE_SET+=('') A_MEM+=('')
     continue
   fi
   case $a in
@@ -902,7 +974,7 @@ for a in "${ARMS[@]}"; do
     echo "depth-qwen3moe.sh: our arm '$a' feeds $ASLOTS slots × $dep = $((dep * ASLOTS)) ids, past the 20000 one --tokens argument holds" >&2
     exit 64
   fi
-  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok") A_SLOTS+=("$ASLOTS")
+  A_KIND+=("$kind") A_DEP+=("$dep") A_LABEL+=("$label") A_ENG+=("$eng") A_BIN+=("$bin") A_IDS+=('') A_ENV+=("$envs") A_TOK+=("$tok") A_SLOTS+=("$ASLOTS") A_MEM+=("${AMEM:-}")
   # An ours or bin: arm's placement: its place=, else BLOOMERY_GEN_PLACE (empty: no --place, the binary's a).
   if [ "$kind" = ref ]; then A_PLACE+=('') A_PLACE_SET+=(''); else A_PLACE+=("${APLACE:-$PLACE}") A_PLACE_SET+=("${APLACE:+1}"); fi
 done
@@ -932,6 +1004,9 @@ arm_env_list() {
 for i in "${!ARMS[@]}"; do
   LG_KEY[i]=
   [ "${A_KIND[$i]}" = ours ] || continue
+  # A mem= arm's scope is its process's, so the arm never shares a load (the header's Mem): no key,
+  # as a bin: arm.
+  [ -z "${A_MEM[$i]}" ] || continue
   LG_KEY[i]="$BIN|ctx=$(arm_ctx "$i")${A_PLACE[$i]:+|place=${A_PLACE[$i]}}"
   [ -n "${A_ENV[$i]}" ] || continue
   env_key=$(lg_env_key "$(arm_env_list "$i")")
@@ -974,6 +1049,7 @@ if [ -n "$PARSE_ONLY" ]; then
       extra=" corpus=$f ids=$three"
     fi
     [ -z "${A_SLOTS[$i]}" ] || extra+=" slots=${A_SLOTS[$i]} feed=$(arm_feed "$i")"
+    [ -z "${A_MEM[$i]}" ] || extra+=" mem=${A_MEM[$i]}G"
     echo "[parse] ${ARMS[$i]}: kind=${A_KIND[$i]} depth=${A_DEP[$i]} label=${A_LABEL[$i]} env=$(e=$(arm_env_list "$i"); echo "${e:--}") load=${LG_KEY[$i]:-(a process of its own)}$extra"
   done
   echo "[parse] order: $ORDER"
@@ -1070,6 +1146,16 @@ if [ "$lcppfit" = 1 ]; then
   lcpp_fit_probe "$LCPPBIN" || { echo "depth-qwen3moe.sh: the lcppfit/lcppppfit arms need llama-bench's fit: $FIT_WHY (tree $LCPP)" >&2; exit 64; }
 fi
 if [ "$mrs" = 1 ]; then [ -x "$MRSBIN" ] || { echo "depth-qwen3moe.sh: no mistralrs at $MRSBIN" >&2; exit 2; }; fi
+# A mem= arm runs in a systemd-run scope (the header's Mem): the tool must be there before the lease.
+MEM_ARMS=0
+for i in "${!ARMS[@]}"; do [ -z "${A_MEM[$i]}" ] || MEM_ARMS=1; done
+[ "$MEM_ARMS" = 0 ] || command -v systemd-run > /dev/null || { echo "depth-qwen3moe.sh: a mem= arm runs in a systemd-run --scope, and this host has no systemd-run" >&2; exit 2; }
+# mem_arms_line: the [config] mem line's arms, `<arm> <N>G` each.
+mem_arms_line() {
+  local i o=''
+  for i in "${!ARMS[@]}"; do [ -z "${A_MEM[$i]}" ] || o+="${o:+, }${ARMS[$i]} ${A_MEM[$i]}G"; done
+  echo "$o"
+}
 SRVBIN=
 [ "$srv" = 0 ] || srv_preflight depth-qwen3moe.sh
 # The CPU guard's names: builds and the engines this runner did not start (its own arms run under its pid);
@@ -1358,8 +1444,25 @@ pp_col() {
   fi
 }
 
+# What a mem= arm's scope runs (the header's Mem): the arm's command as given — a child this shell
+# forwards the bound's TERM to, the signal systemd-run already forwarded to the shell — then the
+# scope's own memory.peak, read while the scope lives (its cgroup goes with its last process), one
+# line the arm's witness reads. Run as `bash -c` with the command in "$@" after `--`.
+MEM_SCOPE_SCRIPT='
+"$@" &
+child=$!
+trap "kill -TERM $child 2> /dev/null" TERM INT
+wait "$child"
+rc=$?
+trap - TERM INT
+cg=$(awk -F: "/^0::/{print \$3}" /proc/self/cgroup) || cg=
+peak=$(cat "/sys/fs/cgroup$cg/memory.peak" 2> /dev/null) || peak=?
+echo "scope mem=peak:$peak cgroup:$cg"
+exit $rc
+'
 # One arm of a generate_qwen3moe in a process of its own with the one-arm command line: a second
-# binary (bin:), which may know no --arm. The row and the sum under the arm's label. Its prompt ids
+# binary (bin:), which may know no --arm, or an ours arm that runs under a mem= scope (its process
+# of its own: no load key). The row and the sum under the arm's label. Its prompt ids
 # print before its load, so its fault count is the whole process's (MAJ_TIMED empty).
 # ours_arm <index> <round>
 ours_arm() {
@@ -1367,7 +1470,16 @@ ours_arm() {
   ours_pre "$i" "$r"
   t0=$(date +%s)
   f0=$(majflt_now)
-  out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
+  if [ -n "${A_MEM[$i]}" ]; then
+    arm_envs "$i"
+    out=$(timeout --kill-after=10 "$BOUND" systemd-run --scope --quiet \
+      -p "MemoryMax=${A_MEM[$i]}G" -p MemorySwapMax=0 \
+      env ${ARM_ENVS[@]+"${ARM_ENVS[@]}"} bash -c "$MEM_SCOPE_SCRIPT" -- \
+      "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" \
+      ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
+  else
+    out=$(timeout --kill-after=10 "$BOUND" "${A_BIN[$i]}" --tokens "$(arm_prompt "$i")" -n "$N" --ctx "$(arm_ctx "$i")" ${A_PLACE[$i]:+--place "${A_PLACE[$i]}"} --time ${WARM:+--warm "$WARM"} 2>&1)
+  fi
   rc=$?
   f1=$(majflt_now)
   t1=$(date +%s)
@@ -1384,6 +1496,12 @@ ours_post() {
   local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label ctx smoke p50 mean warmcol nodes series h10 t10 uniq_tok tps_mean tps_p50 a slot='' win timed ran mtp=''
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} ctx=$(arm_ctx "$i")
   witness "post r$r $label d=$dep n=$N ctx=$ctx"
+  # A mem= arm's witness names its scope's peak (the header's Mem), read inside the scope.
+  if [ -n "${A_MEM[$i]}" ]; then
+    p=$(sed -n 's/^scope mem=peak:\([^ ]*\) cgroup:\(.*\)$/\1 \2/p' <<< "$out" | tail -n 1)
+    p=${p:-"? ?"}
+    echo "    mem scope: MemoryMax=${A_MEM[$i]}G MemorySwapMax=0 peak=${p%% *} B cgroup=${p#* }"
+  fi
   guard_cpu "post r$r $label d=$dep"
   a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
   [ -z "$a" ] || slot=" | slot $((${a% *} + 1))/${a#* }"
@@ -1712,11 +1830,14 @@ dry_cmd() {
     facts=", $(arm_feed "$i") of the file's ${PROSE_N:-?} ids, first ${A_TOK[$i]%%,*}, last ${A_TOK[$i]##*,}"
   fi
   [ -z "${A_SLOTS[$i]}" ] || facts+=", ${A_SLOTS[$i]} slots of $dep ids in one pass (an aggregate row)"
+  [ -z "${A_MEM[$i]}" ] || facts+=", the arm's process in systemd-run --scope -p MemoryMax=${A_MEM[$i]}G -p MemorySwapMax=0 (its peak in the arm's witness)"
   if lg_grouped "$i"; then
     arm_envs "$i"
     echo "one arm of a load: timeout --kill-after=10 \$((BOUND x arms + BOUND)) ${ARM_ENVS[*]:+env ${ARM_ENVS[*]} }${A_BIN[$i]} --arm $feed ... -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM} --arm-sync   # load key ${LG_KEY[$i]}$facts"
   else
-    echo "timeout --kill-after=10 $BOUND ${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM}$note"
+    local mem=''
+    [ -z "${A_MEM[$i]}" ] || mem="systemd-run --scope --quiet -p MemoryMax=${A_MEM[$i]}G -p MemorySwapMax=0 "
+    echo "timeout --kill-after=10 $BOUND ${mem}${A_BIN[$i]} --tokens $feed -n $N --ctx $ctx${A_PLACE[$i]:+ --place ${A_PLACE[$i]}} --time${WARM:+ --warm $WARM}$note"
   fi
 }
 
@@ -1807,6 +1928,7 @@ timing_cards_start
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} card=$CARD_NAME arm_bound=${BOUND}s"
 echo "[config] ours: $BIN ctx=${GEN_CTX:-D+N rounded up to 256}${PLACE:+ --place $PLACE}"
 [ -z "$PLACES_SET" ] || echo "[config] placements: $(place_line "${PLACE_ARMS[@]}")"
+[ "$MEM_ARMS" = 0 ] || echo "[config] mem: $(mem_arms_line) — each arm's process in systemd-run --scope -p MemoryMax=<N>G -p MemorySwapMax=0, its peak in the arm's witness"
 echo "[config] cpu guard: comms=[$CPU_BUSY_COMMS] threshold=${CPU_BUSY_PCT}% strict=${BLOOMERY_OTHER_STRICT:-0}"
 [ -z "$PROSE_N" ] || echo "[config] prose: the first P ids of $(corpus_file) (${PROSE_N} ids), in prose's own tables"
 blocks_config

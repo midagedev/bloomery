@@ -47,9 +47,8 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::JoinHandle;
 
 use gguf::Split;
-use model::placement::workstation::{self, DeviceId};
+use model::placement::workstation::{self, DeviceId, HostRead};
 use model::placement::{Device, ModelTensors, Plan, Role};
-use runtime::seqstate::HOST_BUDGET;
 use sampler::{Sampler, SamplerParams};
 use serve::{
     CacheNote, Decoder, DeviceProps, Drafted, Engine, EngineError, EngineProps, ModelProps,
@@ -58,6 +57,7 @@ use serve::{
 };
 
 use crate::GateError;
+use crate::residency38::checkpoint_bytes;
 
 /// The file's vocabulary as the server reads it.
 pub struct Vocab {
@@ -374,15 +374,19 @@ pub const CACHE_RAM_CAP: u64 = 8192 << 20;
 /// The prompt cache's budget of a seat whose saved states live in host RAM
 /// beside a load's host set (llama-server's `--cache-ram`, in MiB; 0 turns
 /// it off), and its terms: set, as given; else the lesser of
-/// [`CACHE_RAM_CAP`] and half of what `MemAvailable` leaves past the plan's
-/// host need, the residency's churn pool and the checkpoints' host budget
-/// ([`HOST_BUDGET`]), 0 when nothing is left.
+/// [`CACHE_RAM_CAP`] and half of what the host's available bytes —
+/// `MemAvailable`, or the smaller room under a cgroup v2 limit
+/// (`workstation::host_available_read`) — leave past the plan's host need,
+/// the residency's churn pool and one sequence's checkpoints
+/// ([`checkpoint_bytes`]), 0 when nothing is left.
 pub struct CacheRam {
     pub ram: u64,
     /// `--cache-ram` given, or the default's terms.
     pub set: bool,
-    /// `MemAvailable` before the load.
+    /// The host's available bytes before the load.
     pub available: u64,
+    /// Which reading gave `available` ([`HostRead`]).
+    pub reading: HostRead,
     /// The plan's host need.
     pub need: u64,
     /// The residency's churn pool, 0 without one.
@@ -401,34 +405,39 @@ impl CacheRam {
     /// The budget (the type's doc): `set` in bytes as given, else the
     /// default over `need` and `pool`.
     pub fn of(set: Option<u64>, need: u64, pool: u64) -> Result<CacheRam, GateError> {
-        let available = workstation::host_available()?;
+        let (available, reading) = workstation::host_available_read()?;
         let ram = set.unwrap_or_else(|| {
             let left = i128::from(available)
                 - i128::from(need)
                 - i128::from(pool)
-                - i128::from(HOST_BUDGET);
+                - i128::from(checkpoint_bytes(1));
             u64::try_from((left / 2).max(0)).map_or(CACHE_RAM_CAP, |h| h.min(CACHE_RAM_CAP))
         });
         Ok(CacheRam {
             ram,
             set: set.is_some(),
             available,
+            reading,
             need,
             pool,
         })
     }
 
     /// The `cache` line's terms, the seat's own fields to follow: `cache
-    /// ram=… rule=set|default available=… need=… pool=… checkpoints=…`.
+    /// ram=… rule=set|default available=… read=… need=… pool=…
+    /// checkpoints=…`, `read` the reading that gave `available`
+    /// ([`HostRead::word`]).
     #[must_use]
     pub fn line(&self) -> String {
         format!(
-            "cache ram={} rule={} available={} need={} pool={} checkpoints={HOST_BUDGET}",
+            "cache ram={} rule={} available={} read={} need={} pool={} checkpoints={}",
             self.ram,
             if self.set { "set" } else { "default" },
             self.available,
+            self.reading.word(),
             self.need,
-            self.pool
+            self.pool,
+            checkpoint_bytes(1)
         )
     }
 }
@@ -2277,6 +2286,76 @@ mod tests {
         let e = e.to_string();
         assert!(e.contains("--park-ram 17592186044416 MiB"), "{e}");
         assert!(!e.contains("--cache-ram"), "{e}");
+    }
+
+    /// The checkpoints a load holds beside the plan's need grow one
+    /// [`HOST_BUDGET`] a sequence ([`checkpoint_bytes`]), the count every
+    /// room and cache budget that subtracts them uses.
+    #[test]
+    fn checkpoint_bytes_grow_a_budget_a_sequence() {
+        use crate::residency38::checkpoint_bytes;
+        let budget = runtime::seqstate::HOST_BUDGET;
+        assert_eq!(checkpoint_bytes(0), 0);
+        assert_eq!(checkpoint_bytes(1), budget);
+        assert_eq!(checkpoint_bytes(3), 3 * budget);
+        assert_eq!(checkpoint_bytes(usize::MAX), u64::MAX);
+    }
+
+    /// The unset residency rule's room subtracts the checkpoints the load
+    /// holds ([`mem_left_38`]): a plan whose churn pool fits what the host
+    /// leaves past the plan's need alone, and does not fit it once the
+    /// checkpoints are counted, turns `MemShort` whose `leaves` is the
+    /// room — the checkpoint bytes named in it.
+    #[test]
+    fn the_residency38_room_subtracts_the_checkpoints() {
+        use crate::residency38::{checkpoint_bytes, mem_left_38};
+        // A plan of one card layer of 100 experts, its host the rest: the
+        // unset rule's P is half the fewest (50), the pool a fixed 10 GiB
+        // whatever P is.
+        let pick = |mem_left: i128| {
+            bloomery_levers::residency38_at_plan(
+                [100u64],
+                384,
+                |_pinned: usize| Ok::<u64, std::convert::Infallible>(10u64 << 30),
+                i128::MAX,
+                mem_left,
+            )
+            .expect("the pick")
+        };
+        let (available, need, slots) = (24 << 30, 12 << 30, 1usize);
+        // Without the checkpoints the pool fits: the word runs at P.
+        assert_eq!(
+            pick(i128::from(available) - i128::from(need)).pinned,
+            Some(50)
+        );
+        // With them it does not (12 − 4 GiB < 10 GiB): off, MemShort naming
+        // the pool's bytes and the room the checkpoints leave.
+        let short = pick(mem_left_38(available, need, slots));
+        assert_eq!(
+            short.why,
+            bloomery_levers::Residency38Why::MemShort {
+                needs: 10u64 << 30,
+                leaves: mem_left_38(available, need, slots),
+            }
+        );
+        assert_eq!(
+            short.why.to_string(),
+            format!(
+                "unset: the churn pool needs {} B, MemAvailable leaves {} B past the plan's host \
+                 need",
+                10u64 << 30,
+                i128::from(available) - i128::from(need) - i128::from(checkpoint_bytes(slots))
+            )
+        );
+        // Two sequences hold twice the budget: the room shrinks by it.
+        assert_eq!(
+            mem_left_38(available, need, 2),
+            i128::from(available) - i128::from(need) - i128::from(2 * checkpoint_bytes(1))
+        );
+        assert!(matches!(
+            pick(mem_left_38(available, need, 2)).why,
+            bloomery_levers::Residency38Why::MemShort { .. }
+        ));
     }
 
     mod slot_files {
