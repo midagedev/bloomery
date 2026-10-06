@@ -25,15 +25,25 @@
 //! - H4 reset: a reset of the last slot rewinds it alone — its prompt run
 //!   again gives its solo run's first ids, and every other slot's
 //!   continuation is its solo run's.
+//! - H5 poison: a failed round of both slots — the host service's refusal
+//!   (a), a card fault the readback carries (b) — poisons every slot it ran
+//!   on: every call refused by name, the tier's own refusal standing with
+//!   it, a reset of one slot of the set alone lifting nothing, and after each
+//!   slot's own reset both slots running their solo paths from their
+//!   prompts again ([`Interleaved::poisons`], the adapter's planter
+//!   [`SlotsAdapter::plant_refusal`] and window read
+//!   [`SlotsAdapter::tier_poisoned`]); a prompt call on slot 0 refused by
+//!   the host poisons the same way, slot 0 alone (c); and the load of one
+//!   sequence keeps the load's own rule — its step's host refusal standing
+//!   until its reset, the next step refused by name,
+//!   the reset lifting it, the fresh-context prompt bit for bit
+//!   ([`one_slot`]). A probe step that never returns is its clause's red
+//!   line, by name ([`watched`]).
 //! - H6 refusals: a select out of range, an `add_slots` under the slots held
 //!   and one of 0 are refused by name, the selection and the count kept.
 //! - H7 captures: every slot holds its own captures — an added slot none
 //!   before its first step while slot 0 holds its solo runs', each slot
 //!   some after the interleave — and none after a `set_mode` round trip.
-//!
-//! The harness's next contract: H5, a fault on a slot, or in a pass over a
-//! slot set, refuses every other slot naming it, and only its own reset
-//! lifts it (the adapter's fault planter comes with it).
 //!
 //! The order is the gate's: [`interleave`] runs H3, H6, H1 and H7 and hands
 //! back the model with every slot on its solo path ([`Interleaved`]); a
@@ -41,13 +51,17 @@
 //! keeps every slot on its path; the body gate runs its own fact clauses
 //! there, moving at most the last slot off its path and reading any other
 //! slot's continuation through [`Interleaved::continues`];
-//! [`Interleaved::finish`] runs H4 last, since a reset that reaches past its
-//! slot moves the slots those clauses read. A call that fails inside a
-//! contract is that contract's red with the error printed, so every
-//! contract prints its line whatever an earlier one left.
+//! [`Interleaved::finish`] runs H4, then H5 — both its resets move both
+//! slots off their paths, so nothing may read a path behind it. A call that
+//! fails inside a contract is that contract's red with the error printed,
+//! so every contract prints its line whatever an earlier one left.
+
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::Duration;
 
 use bloomery_gpu::model::{ChainBody, SlotRows, StepMode};
-use bloomery_gpu::{GpuError, GpuModel, Slots};
+use bloomery_gpu::{Fault, FaultSite, GpuError, GpuModel, LAYER_HEAD, Slots};
+use threads::helper::{Placement, spawn_helper};
 
 use crate::{GateError, bits_equal, verdict};
 
@@ -58,7 +72,22 @@ const H1: &str = "slots H1 interleave";
 const H2: &str = "slots H2 one pass";
 const H3: &str = "slots H3 bytes";
 const H4: &str = "slots H4 reset";
+const H5: &str = "slots H5 poison";
+const H5R: &str = "slots H5 one-slot";
 const H6: &str = "slots H6 refusals";
+/// How long one of H5's probe steps may take: a single step, which returns
+/// in well under a second; one still out past this waits on the card for a
+/// host service that will never come.
+const PROBE_BOUND: Duration = Duration::from_secs(60);
+/// How long the watchdog waits after naming a blocked probe before it ends
+/// the process: a stack watch (`BLOOMERY_GATE_STACKS` above
+/// [`PROBE_BOUND`] and under this) dumps the blocked threads in between.
+const PROBE_GRACE: Duration = Duration::from_secs(120);
+/// The slot sets a round of both slots poisons ([`SlotsAdapter::step_all`]):
+/// both, by one pass of a [`SlotRows`] body (the qwen3moe, Qwen3.8 and GLM
+/// adapters), or slot 0 alone, by the seat fallback (the V4.1 and qwen35moe
+/// adapters), whose first step's error ends the round.
+const ROUND_SETS: [&str; 2] = ["slots 0 and 1", "slot 0"];
 const H7: &str = "slots H7 captures";
 
 /// What a body's e2e gate hands the harness: how its body loads, rewinds,
@@ -104,6 +133,64 @@ pub trait SlotsAdapter {
     /// names the equality skipped.
     fn seq_terms_bytes(&self, _m: &GpuModel<Self::Body>) -> Result<Option<usize>, GateError> {
         Ok(None)
+    }
+
+    /// H5's planter: the next host service's refusal planted on the load's
+    /// host tier, one reach a family through its body's own mut path to
+    /// the tier. The tier's input checks fire on state the card should
+    /// already have refused, which no sound card produces, so the harness
+    /// reaches them through this seam
+    /// ([`bloomery_gpu::host::HostTier::plant_refusal`]). `false` when the
+    /// load serves no host work: no host service to refuse, so H5's host
+    /// cases do not reach it, and its line says so. A test seam; never on
+    /// a serving path.
+    fn plant_refusal(&self, m: &mut GpuModel<Self::Body>) -> Result<bool, GateError>;
+
+    /// Whether the load's host tier is still poisoned: H5's window reads it
+    /// after a reset of the slot that did not fail — the tier a refused
+    /// round poisoned stays poisoned until the model's own poison lifts
+    /// ([`GpuModel::reset`]), which a reset of one slot of the set is not.
+    fn tier_poisoned(&self, m: &mut GpuModel<Self::Body>) -> Result<bool, GateError>;
+
+    /// H5's round of several slots: every slot's last id `last` stepped on
+    /// its own slot, each slot's greedy next token back, by the way the
+    /// body serves several slots together — one pass
+    /// ([`GpuModel::step_slots`], a body that implements [`SlotRows`]) or
+    /// a select and a step a slot (the seat fallback, [`step_rows_in_turn`]
+    /// of `gpu-gates`' bind). The default is the fallback: a body without
+    /// [`SlotRows`] serves no pass.
+    fn step_all(&self, m: &mut GpuModel<Self::Body>, last: &[u32]) -> Result<Vec<u32>, GpuError>
+    where
+        <Self::Body as Slots>::Seq: 'static,
+    {
+        let mut out = Vec::with_capacity(last.len());
+        for (s, &t) in last.iter().enumerate() {
+            m.select_slot(s)?;
+            out.push(m.step(&[t])?);
+        }
+        Ok(out)
+    }
+}
+
+/// What H5 plants: the next host service's refusal
+/// ([`SlotsAdapter::plant_refusal`]), or the card's fault word at the head's
+/// quant column — the fault the next readback carries ([`GpuError::Fault`],
+/// [`GpuModel::plant_fault`]).
+#[derive(Clone, Copy)]
+pub enum Planted {
+    /// The next step service refuses its input, the tier poisoned as
+    /// refused ([`bloomery_gpu::host::HostTier::plant_refusal`]).
+    Refusal,
+    /// The card's fault word raised at `fault` ([`GpuModel::plant_fault`]).
+    Fault(Fault),
+}
+
+impl Planted {
+    /// The head's quant-column fault every family plants
+    /// ([`Planted::Fault`]): no model layer claimed, the readback's own.
+    #[must_use]
+    pub fn fault() -> Planted {
+        Planted::Fault(Fault::at(LAYER_HEAD, FaultSite::QuantColumn))
     }
 }
 
@@ -253,11 +340,175 @@ where
         Ok(stream.given[from..] == *want)
     }
 
-    /// H4, and the harness's verdict over every contract it ran. The model
-    /// drops here, its added sequences with it.
+    /// H4, H5, and the harness's verdict over every contract it ran. The
+    /// model drops here, its added sequences with it.
     pub fn finish(mut self) -> Result<bool, GateError> {
-        let reset = self.reset_isolation();
-        Ok(check(H4, reset) && self.ok)
+        let reset = check(H4, self.reset_isolation());
+        let poison = check(H5, self.poisons());
+        let Interleaved { a, model, ok, .. } = self;
+        // H5's one-slot clause opens a load of its own: the harness's goes
+        // first, so the card holds one load at a time.
+        drop(model);
+        let one_slot = check(H5R, one_slot(a));
+        Ok(reset && poison && one_slot && ok)
+    }
+
+    /// H5 (module doc), on the harness's model after H4: a round of both
+    /// slots refused by the host (a), then one the card faulted (b), then a
+    /// prompt call on slot 0 refused by the host (c) — each poison checked
+    /// through its whole life: the call's error, every call refused naming
+    /// the slots, a reset of one slot of the set alone lifting nothing, and after
+    /// each slot's own reset both slots running their solo paths from their
+    /// prompts again.
+    fn poisons(&mut self) -> Result<(bool, String), GateError> {
+        let refusal = self.poison_round(Planted::Refusal)?;
+        let fault = self.poison_round(Planted::fault())?;
+        let prompt = self.poison_prompt()?;
+        let say = |case: &Option<(bool, bool, bool)>| match case {
+            Some((held, window, back)) => format!(
+                "the call's error named it {held}, every call and the tier refusing through the \
+                 other slot's reset {window}, both slots their solo paths from their prompts \
+                 again {back}"
+            ),
+            None => "not reached: the load serves no host work".to_string(),
+        };
+        let pass = [refusal, fault, prompt]
+            .iter()
+            .all(|c| c.is_none_or(|(held, window, back)| held && window && back));
+        Ok((
+            pass,
+            format!(
+                "(a) a two-slot round refused by the host: {}; (b) the same with a card fault: \
+                 {}; (c) a prompt call on slot 0 refused by the host: {}",
+                say(&refusal),
+                say(&fault),
+                say(&prompt)
+            ),
+        ))
+    }
+
+    /// Plant `what` for H5: `false` when it is a host refusal and the load
+    /// serves no host work ([`SlotsAdapter::plant_refusal`]).
+    fn plant(&mut self, what: Planted) -> Result<bool, GateError> {
+        match what {
+            Planted::Refusal => self.a.plant_refusal(&mut self.model),
+            Planted::Fault(fault) => {
+                self.model.plant_fault(fault)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// One H5 case: plant `what`, run a round of both slots
+    /// ([`SlotsAdapter::step_all`]), and check the poison it leaves through
+    /// [`Interleaved::poison_life`]; `None` when the load has nothing to
+    /// plant it on.
+    fn poison_round(&mut self, what: Planted) -> Result<Option<(bool, bool, bool)>, GateError> {
+        let lasts: Vec<u32> = (0..STREAMS)
+            .map(|s| self.last(s))
+            .collect::<Result<_, GateError>>()?;
+        if !self.plant(what)? {
+            return Ok(None);
+        }
+        let round = self.a.step_all(&mut self.model, &lasts);
+        let held = match &what {
+            Planted::Refusal => round
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("host saw undefined input")),
+            // The readback carries the planted word as its own fault
+            // ([`Head::token`]); which fault it is belongs to the planter.
+            Planted::Fault(_) => matches!(round, Err(GpuError::Fault { .. })),
+        };
+        let tier = matches!(what, Planted::Refusal);
+        let (life, back) = self.poison_life(lasts[0], &ROUND_SETS, tier)?;
+        Ok(Some((held, life, back)))
+    }
+
+    /// H5(c) (module doc): a prompt call on slot 0 refused by the host —
+    /// the service a prompt call runs, whatever port it serves by, the same
+    /// poison through the recording owner a step's refusal takes
+    /// ([`GpuModel::run_rows`]): the refusing slot's own set, checked
+    /// through [`Interleaved::poison_life`].
+    fn poison_prompt(&mut self) -> Result<Option<(bool, bool, bool)>, GateError> {
+        let last = self.last(0)?;
+        self.model.select_slot(0)?;
+        if !self.plant(Planted::Refusal)? {
+            return Ok(None);
+        }
+        let prompt = self.a.prompt(&mut self.model, 0);
+        let held = prompt.is_err_and(|e| e.to_string().contains("host saw undefined input"));
+        let (life, back) = self.poison_life(last, &["slot 0"], true)?;
+        Ok(Some((held, life, back)))
+    }
+
+    /// The poison a failed call on slot 0 leaves, through its life: every
+    /// call refused naming the call's slots (one of `sets`), one slot's
+    /// reset alone lifting nothing — the step of a slot it left in the set
+    /// still the model's poison refusal of that slot alone, not a step on
+    /// the part-written state, and a host refusal's tier standing with it,
+    /// lifted only with the model's ([`SlotsAdapter::tier_poisoned`]) — and
+    /// both slots' solo paths from their prompts after each own reset. A
+    /// set of slot 0 alone has slot 1 reset and slot 0 stepped; a pass's
+    /// set of both has slot 0 reset and slot 1 stepped. Every reset follows
+    /// the recovery order a failed pass forces: a pass that fails keeps
+    /// each slot's rows waiting for a commit, and a body refuses to select
+    /// away from a live slot whose rows wait (`Body38::swap_seq`, the GLM
+    /// body's), so the live slot is reset first, then each other slot
+    /// selected and reset — reset slot 0, select slot 1, reset slot 1 after
+    /// a pass of both. Each probe step runs under a watchdog ([`watched`]):
+    /// one that never returns is this clause's red line, by name.
+    fn poison_life(
+        &mut self,
+        last: u32,
+        sets: &[&str],
+        tier: bool,
+    ) -> Result<(bool, bool), GateError> {
+        self.model.select_slot(0)?;
+        let model = &mut self.model;
+        let named = watched(H5, "slot 0's step after the failed call", || {
+            model.step(&[last])
+        })?;
+        let set = poisoned_set(&named).map(str::to_string);
+        let named = set.as_deref().is_some_and(|s| sets.contains(&s));
+        let (reset, probe) = if set.as_deref() == Some(ROUND_SETS[0]) {
+            (0, STREAMS - 1)
+        } else {
+            (STREAMS - 1, 0)
+        };
+        self.model.select_slot(reset)?;
+        self.a.rewind(&mut self.model)?;
+        self.model.select_slot(probe)?;
+        let model = &mut self.model;
+        let still = watched(H5, "a set slot's step after the other's reset", || {
+            model.step(&[last])
+        })?;
+        let alone = format!("slot {probe}");
+        let still = poisoned_set(&still) == Some(alone.as_str());
+        let held = if tier {
+            self.a.tier_poisoned(&mut self.model)?
+        } else {
+            // A card fault never poisons the tier; the model's poison is
+            // the whole of it.
+            true
+        };
+        // Every slot reset before any prompt — a slot of the set still
+        // poisoned refuses every call, a prompt on a slot already reset
+        // included — the live slot first, in the recovery order above.
+        self.a.rewind(&mut self.model)?;
+        for s in (0..STREAMS).filter(|&s| s != probe) {
+            self.model.select_slot(s)?;
+            self.a.rewind(&mut self.model)?;
+        }
+        let mut back = true;
+        for s in 0..STREAMS {
+            self.model.select_slot(s)?;
+            let first = self.a.prompt(&mut self.model, s)?;
+            let stream = &mut self.streams[s];
+            stream.given = vec![first];
+            greedy(&mut self.model, &mut stream.given, A::TAIL)?;
+            back &= stream.given[..] == stream.solo.ids[..=A::TAIL];
+        }
+        Ok((named && still && held, back))
     }
 
     /// H4: the last slot rewound and its prompt run again, then every other
@@ -419,6 +670,115 @@ fn refused(r: Result<(), GpuError>, entry: &str, says: &str) -> bool {
     match r {
         Err(GpuError::Shape { what, detail }) => what == entry && detail.contains(says),
         _ => false,
+    }
+}
+
+/// H5's one-slot clause (module doc): a host refusal in a single-slot step
+/// on a load of one sequence — no parked slot for the poison to name — is
+/// the load's own: the next step before the reset refused by name — the
+/// tier's poison, or the body's own refusal ahead of it — with its stream
+/// drained (a probe under [`watched`]), and the load's reset lifting it
+/// exactly as before slots: the next step served, the fresh-context prompt
+/// the first's bit for bit. Then a prompt call's host refusal on the same
+/// load: the step after it, which only the tier's poison refuses, drained
+/// and refused by name, and the reset lifting it.
+fn one_slot<A, B>(a: &A) -> Result<(bool, String), GateError>
+where
+    A: SlotsAdapter<Body = B>,
+    B: Slots<Seq: 'static>,
+{
+    let mut m = a.open(1)?;
+    m.set_mode(StepMode::Graph);
+    a.rewind(&mut m)?;
+    let first = a.prompt(&mut m, 0)?;
+    if !a.plant_refusal(&mut m)? {
+        return Ok((
+            true,
+            "not reached: the load of one sequence serves no host work".to_string(),
+        ));
+    }
+    let refused = m
+        .step(&[first])
+        .is_err_and(|e| e.to_string().contains("host saw undefined input"));
+    let before = watched(H5R, "the step before the load's reset", || m.step(&[first]))?;
+    let held = before.is_err();
+    a.rewind(&mut m)?;
+    let again = a.prompt(&mut m, 0)?;
+    let served = m.step(&[again]).is_ok();
+    let fresh = again == first;
+    // A prompt call's host refusal on the same load: no parked slot for the
+    // model to record it by and no failed step for the body to refuse by,
+    // so the tier's poison alone stands until the reset — the next step,
+    // launched, must be refused by it with its stream drained, not left
+    // waiting on a host service that will not come.
+    a.rewind(&mut m)?;
+    a.plant_refusal(&mut m)?;
+    let prompt_refused = a
+        .prompt(&mut m, 0)
+        .is_err_and(|e| e.to_string().contains("host saw undefined input"));
+    let after = watched(H5R, "the step after the refused prompt call", || {
+        m.step(&[first])
+    })?;
+    let drained = after.is_err();
+    a.rewind(&mut m)?;
+    let lifted = a.prompt(&mut m, 0)? == first;
+    let said = |r: &Result<u32, GpuError>| match r {
+        Ok(id) => format!("served id {id}"),
+        Err(e) => format!("\"{e}\""),
+    };
+    Ok((
+        refused && held && served && fresh && prompt_refused && drained && lifted,
+        format!(
+            "a one-slot step's host refusal {refused}; the next step before the reset refused by \
+             name {held} ({}); the load's reset lifted it, the next step served \
+             {served} and the prompt after it the first's bit for bit {fresh}; a prompt call's \
+             host refusal {prompt_refused}, the step after it refused by name {drained} ({}), \
+             the reset lifting it, the prompt the first's bit for bit {lifted}",
+            said(&before),
+            said(&after)
+        ),
+    ))
+}
+
+/// `run` on this thread under a watchdog, as `gate_swap`'s queue arm runs
+/// its clauses: past [`PROBE_BOUND`] the watchdog prints `name`'s red line
+/// naming `what` and, after [`PROBE_GRACE`], ends the process — a host
+/// blocked inside the driver has nothing that returns it. A panic in `run`
+/// is not a hang: it unwinds as it would unwatched.
+fn watched<T>(name: &str, what: &str, run: impl FnOnce() -> T) -> Result<T, GateError> {
+    let fail = format!(
+        "check {name}: {what} did not return in {PROBE_BOUND:?}: the card waits on a host \
+         service that will never come {}",
+        verdict(false)
+    );
+    let (done, watch) = mpsc::channel::<()>();
+    let (watchdog, _) = spawn_helper("slots-h5-watch", Placement::Float, move || {
+        if matches!(
+            watch.recv_timeout(PROBE_BOUND),
+            Err(RecvTimeoutError::Timeout)
+        ) {
+            println!("{fail}");
+            std::thread::sleep(PROBE_GRACE);
+            std::process::abort();
+        }
+    })?;
+    let ran = run();
+    let _ = done.send(());
+    let _ = watchdog.join();
+    Ok(ran)
+}
+
+/// The slot set the model's poison refusal `r` names, as the model prints
+/// it ("slot 0", "slots 0 and 1"); `None` for any other result — a step
+/// served, or another refusal (the tier's own, a body's), which no poison
+/// set of the model's names.
+fn poisoned_set(r: &Result<u32, GpuError>) -> Option<&str> {
+    match r {
+        Err(GpuError::Shape { detail, .. }) => detail
+            .split_once(" is poisoned")
+            .or_else(|| detail.split_once(" are poisoned"))
+            .map(|(set, _)| set),
+        _ => None,
     }
 }
 

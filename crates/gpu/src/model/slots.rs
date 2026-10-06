@@ -220,6 +220,25 @@ impl SlotSet {
         SlotSet { ids, len }
     }
 
+    /// Every slot of a model that serves `n`, 1 to [`MAX_PASS_ROWS`]: the
+    /// set an unrecorded tier refusal poisons — the slot it ran on is
+    /// unknown, so every slot owes its reset. A larger lot is refused by
+    /// name: a poison's set holds what a pass can, and no load builds a
+    /// lot a pass cannot serve.
+    pub(super) fn every(n: usize, what: &'static str) -> Result<SlotSet, GpuError> {
+        if n == 0 || n > MAX_PASS_ROWS {
+            return Err(GpuError::shape(
+                what,
+                format!("{n} slots; a poison's slot set holds 1 to {MAX_PASS_ROWS}"),
+            ));
+        }
+        let mut ids = [0; MAX_PASS_ROWS];
+        for (i, id) in ids.iter_mut().enumerate().take(n) {
+            *id = i;
+        }
+        Ok(SlotSet { ids, len: n })
+    }
+
     pub(super) fn as_slice(&self) -> &[usize] {
         &self.ids[..self.len]
     }
@@ -258,13 +277,18 @@ pub(super) struct SlotFault {
 }
 
 /// Why the model is poisoned ([`SlotFault`]): the card's fault word a call
-/// read back, or a commit of several slots' rows that settled some slots
-/// and failed on one.
+/// read back, a host service's refusal of the call's input, or a commit of
+/// several slots' rows that settled some slots and failed on one.
 #[derive(Clone)]
 pub(super) enum PoisonWhy {
     /// The fault word, raised by a kernel and read by the call that carried
     /// it.
     Fault(Fault),
+    /// The host tier refused the call's input ([`Refusal`]): the layers
+    /// before the refused one had already written the slots' in-place state,
+    /// so each of them owes its own reset before the tier serves again
+    /// ([`GpuModel::reset`] lifts the tier once the set is empty).
+    Refused(Refusal),
     /// [`GpuModel::commit_slots`] failed at `slot`'s keep, after the keeps
     /// before it had run: `error`, the failure's text.
     SlotKeep { slot: usize, error: String },
@@ -595,7 +619,9 @@ where
     /// named with its row's slot, every row kept ([`PassKind::Slots`]) and
     /// the next pass's boundary made ahead before the readback. A fault the
     /// pass raised is its error and poisons every slot of the pass: only a
-    /// [`GpuModel::reset`] of each of them lifts it. A body whose
+    /// [`GpuModel::reset`] of each of them lifts it. So does a host
+    /// service's refusal of the pass's input, whose slots' state the layers
+    /// before the refused one had already written. A body whose
     /// [`SlotRows::MAX_ROWS`] is not 1 to [`MAX_PASS_ROWS`] does not
     /// compile.
     pub fn step_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, GpuError> {
@@ -935,7 +961,9 @@ where
                 launch_served(graph, body.as_mut(), gpu, *reads, B::chain_of(ranges))
             }
         };
-        self.name_host_refusal_by(r, |refusal| name_slots(refusal, ranges))?;
+        self.name_host_refusal_by(r, SlotSet::of(ranges), |refusal| {
+            name_slots(refusal, ranges)
+        })?;
         if pass == SlotPass::Kept {
             self.keep_rows(KeptRows::prefix(total), PassKind::Slots)?;
             self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;

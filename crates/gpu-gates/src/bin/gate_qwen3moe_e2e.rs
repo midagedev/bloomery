@@ -264,7 +264,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{Body, KvQ8, KvQ8Host, PrefillPath};
     use bloomery_gpu::flash_gqa::HEAD;
-    use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::{Gpu, GpuError, GpuModel, Qwen3moeModel};
     use bloomery_gpu_gates::generate::Place;
@@ -2494,6 +2494,38 @@ mod gate {
                     hp.n_head_kv, hp.head_dim
                 ),
             })
+        }
+
+        /// H5's planter ([`SlotsAdapter::plant_refusal`]): the tier through
+        /// the body's placed side, the host service of this body; `false`
+        /// on a load with no placed side, which serves no host work.
+        fn plant_refusal(&self, m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+            let Some(placed) = m.body_parts("gate_qwen3moe_e2e slots")?.2.host() else {
+                return Ok(false);
+            };
+            placed
+                .hybrid_mut()
+                .plant_refusal("a planted refusal (the slots harness's seam)");
+            Ok(true)
+        }
+
+        /// H5's round of several slots: the body's one pass
+        /// ([`GpuModel::step_slots`], this body's [`SlotRows`]).
+        fn step_all(&self, m: &mut Qwen3moeModel, last: &[u32]) -> Result<Vec<u32>, GpuError> {
+            let ones: Vec<[u32; 1]> = last.iter().map(|&t| [t]).collect();
+            let rows: Vec<(usize, &[u32])> = ones.iter().map(|t| &t[..]).enumerate().collect();
+            Ok(m.step_slots(&rows)?.ids)
+        }
+
+        /// H5's window: the tier's own refusal, read through the body's
+        /// placed side.
+        fn tier_poisoned(&self, m: &mut Qwen3moeModel) -> Result<bool, GateError> {
+            let placed = m
+                .body_parts("gate_qwen3moe_e2e slots")?
+                .2
+                .host()
+                .ok_or("the placed side (the host tier)")?;
+            Ok(placed.hybrid().refuse_if_poisoned("slots H5").is_err())
         }
     }
 

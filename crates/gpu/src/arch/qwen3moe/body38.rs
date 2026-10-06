@@ -3310,7 +3310,7 @@ impl ChainBody for Body38 {
     /// Synchronizes.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
-        self.hybrid.reset(stream)?;
+        self.hybrid.settle(stream)?;
         let most = self
             .stores
             .iter()
@@ -3574,6 +3574,19 @@ impl HostServed for Body38 {
 
     fn take_host_refusal(&mut self) -> Option<Refusal> {
         self.hybrid.take_step_refusal()
+    }
+
+    /// The host tier's refusal poison lifted
+    /// ([`Hybrid::lift_refusal`]) — the settling a reset runs is
+    /// [`Hybrid::settle`]'s ([`Body38::reset`]).
+    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.hybrid.lift_refusal(stream)
+    }
+
+    /// The refusal the host tier is poisoned by now
+    /// ([`Hybrid::refusal_poison`]).
+    fn refusal_poison(&self) -> Option<Refusal> {
+        self.hybrid.refusal_poison()
     }
 
     fn host_residency(&self) -> Option<&HostResidency> {

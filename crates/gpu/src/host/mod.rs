@@ -290,7 +290,8 @@ pub struct HybridStats {
     /// Services, step or batch, that met input the card should already have
     /// refused ([`HostTier::refusal`] names the first).
     pub refusals: u64,
-    /// Resets that lifted a refusal's poison ([`HostTier::reset`]).
+    /// Resets that lifted a refusal's poison ([`HostTier::reset`],
+    /// [`HostTier::lift_refusal`]).
     pub resets: u64,
     /// The last poison's kind, service and layer; [`HostTier::last_poison`]
     /// holds what it saw. Kept across a reset.
@@ -675,6 +676,12 @@ pub struct HostTier<H> {
     /// what a batch service that meets refused input reads to name the
     /// card's fault.
     fault: Option<Arc<DeviceBuffer<u32>>>,
+    /// A planted refusal the next host service returns — a step service's
+    /// ([`HostTier::serve`]) or a batch service's ([`HostTier::serve_key`],
+    /// [`HostTier::serve_batch`]) — for [`HostTier::plant_refusal`]: a test
+    /// seam for the slots harness's poison clauses, never set on a serving
+    /// path.
+    planted: Option<String>,
     health: Health,
     /// Which experts each layer's card stack holds; the host serves the rest.
     slots: SlotMap,
@@ -749,6 +756,7 @@ impl<H: HostExperts> HostTier<H> {
             residency: None,
             experts,
             fault: None,
+            planted: None,
             health: Health::default(),
             slots,
             step: StepPort::new(boundary, layers),
@@ -1404,11 +1412,33 @@ impl<H: HostExperts> HostTier<H> {
     /// by name — and serve its layer's host experts for its tokens in one
     /// union call ([`HostTier::serve_batch`]'s service), the sums into the
     /// set the upload sends; a tiered set's tier service is enqueued between
-    /// the wait and the union ([`HostTier::serve_port`]). Returns the host
-    /// time outside the union call.
+    /// the wait and the union ([`HostTier::serve_port`]). A batch service's
+    /// refusal reached no step port, so it is handed to the caller's naming
+    /// ([`HostTier::take_step_refusal`]) here, as a step service's refusal
+    /// is by its own record. A planted refusal
+    /// ([`HostTier::plant_refusal`]) is returned here, as the service's own
+    /// refusal of this layer's input. Returns the host time outside the
+    /// union call.
     pub fn serve_key(&mut self, key: BatchKey) -> Result<ServeTimes, GpuError> {
         self.refuse_traced_batch("HostTier::serve_key")?;
-        self.serve_port(key)
+        let r = match self.planted.take() {
+            Some(detail) => Err(self.refuse_planted_batch(key.layer, detail)),
+            None => self.serve_port(key),
+        };
+        self.hand_refusal_to_step();
+        r
+    }
+
+    /// A batch service's refusal reached no step port: hand the poison's own
+    /// refusal to the caller's naming ([`HostTier::take_step_refusal`]), as
+    /// a step service's refusal hands itself — once, by the take.
+    fn hand_refusal_to_step(&mut self) {
+        if self.step.step_refusal.is_none()
+            && self.health.poisoned
+            && let Some(Poison::Refused(r)) = &self.health.poison
+        {
+            self.step.step_refusal = Some(r.clone());
+        }
     }
 
     /// Enqueue the copy of the oldest served set's host sums — `key`'s, else
@@ -1432,6 +1462,22 @@ impl<H: HostExperts> HostTier<H> {
         self.health.refusal.as_ref()
     }
 
+    /// The refusal the tier is poisoned by now, if it is [`Poison::Refused`]:
+    /// what a model that parks another slot asks of a tier refusal it never
+    /// recorded ([`crate::model::HostServed::refusal_poison`]), whose slot is
+    /// unknown. A refusal a reset lifted is kept, not poisoned: this is
+    /// none for it.
+    #[must_use]
+    pub fn refusal_poison(&self) -> Option<Refusal> {
+        if !self.health.poisoned {
+            return None;
+        }
+        match &self.health.poison {
+            Some(Poison::Refused(r)) => Some(r.clone()),
+            _ => None,
+        }
+    }
+
     /// The refusal that failed the last step service, once: what the step's
     /// caller names with [`name_refusal`] after the stream has drained. `None`
     /// when the step failed for another reason, or was already named.
@@ -1452,6 +1498,21 @@ impl<H: HostExperts> HostTier<H> {
     /// failed service the poison is the cause.
     pub fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
         self.health.refuse_if_poisoned(what)
+    }
+
+    /// Plant a refusal the next host service returns — a step service's
+    /// ([`HostTier::serve`]) or a batch service's ([`HostTier::serve_key`],
+    /// [`HostTier::serve_batch`]) — refusing its layer's input as `detail`
+    /// says: a test seam for the slots harness's poison clauses
+    /// (`crates/gpu-gates/src/slots_gate.rs` H5), the tier's input checks
+    /// fire on state the card should already have refused, which no sound
+    /// card produces, so a gate reaches a refusal through here. The service
+    /// runs the whole of a refusing one's path: the refusal recorded for the
+    /// caller's naming, the tier poisoned as [`Poison::Refused`], a step
+    /// service's every wait released, the service's error returned. Gate
+    /// use; never on a serving path.
+    pub fn plant_refusal(&mut self, detail: &str) {
+        self.planted = Some(detail.to_string());
     }
 
     /// The protocol's words as they stand now. On a drained stream a sound
@@ -1503,61 +1564,125 @@ impl<H: HostExperts> HostTier<H> {
     /// nothing, and fails by name when the stream has drained and the words
     /// are not at rest; a stream still running may hold a signal its wait has
     /// yet to take back.
+    ///
+    /// A refusal whose slots the model poisoned ([`PoisonWhy::Refused`])
+    /// does not lift here: a body that serves several slots settles on every
+    /// reset ([`HostTier::settle`]) and its model lifts the tier once every
+    /// slot the refused call ran on has been reset
+    /// ([`HostTier::lift_refusal`]).
     pub fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         const WHAT: &str = "Hybrid::reset";
         self.abandon_pass();
         if !self.health.poisoned {
-            if !stream_idle(stream)? {
-                return Ok(());
-            }
-            let w = self.words();
-            if let Some(page) = self.tier_page.as_ref() {
-                for t in &mut self.tiers {
-                    drain_within(
-                        t.gpu().stream(),
-                        DRAIN_DEADLINE,
-                        "Hybrid::reset: the expert tier's stream",
-                    )?;
-                    if !t.at_rest(page) {
-                        return Err(GpuError::protocol(
-                            WHAT,
-                            format!(
-                                "the stream has drained and the expert tier is not at rest \
-                                 (progress {} of {} asked): a go the tier never took, or a signal \
-                                 no wait took back",
-                                t.progress(page),
-                                t.issued()
-                            ),
-                        ));
-                    }
-                    t.clear_fault(page)?;
-                }
-            }
-            if !w.at_rest() {
-                return Err(GpuError::protocol(
-                    WHAT,
-                    format!(
-                        "the stream has drained and the host tier is not at rest ({w}): a go the \
-                         host never served, or a signal no wait took back"
-                    ),
-                ));
-            }
+            return self.settle_checks(stream, WHAT);
+        }
+        if let Some(e) = self.unlifted(WHAT) {
+            return Err(e);
+        }
+        self.lift_words(stream, WHAT)
+    }
+
+    /// [`HostTier::reset`] without the refusal lift: the settling every
+    /// reset of a body that serves several slots runs
+    /// ([`crate::model::ChainBody::reset`]), the model naming when the
+    /// tier's refusal poison lifts ([`HostTier::lift_refusal`], called
+    /// through [`crate::model::HostServed`]). A sound tier is checked at
+    /// rest as [`HostTier::reset`] checks it; a poisoned one is left as it
+    /// stands — a refusal's poison waiting for the model's lift, any other
+    /// poison failing by name as the reset's own arm does.
+    pub fn settle(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        const WHAT: &str = "Hybrid::settle";
+        self.abandon_pass();
+        if !self.health.poisoned {
+            return self.settle_checks(stream, WHAT);
+        }
+        match self.unlifted(WHAT) {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// [`HostTier::reset`]'s refusal lift alone, for
+    /// [`crate::GpuModel::reset`] to call through
+    /// [`crate::model::HostServed::lift_refusal`] once every slot a refused
+    /// call ran on has been reset — or on any reset, for a tier refusal the
+    /// model never recorded. Nothing on a sound tier; any poison but a
+    /// refusal fails by name as [`HostTier::reset`]'s own arm does.
+    pub fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        const WHAT: &str = "Hybrid::lift_refusal";
+        if !self.health.poisoned {
             return Ok(());
         }
-        let cause = match &self.health.poison {
-            Some(Poison::Refused(_)) => None,
-            Some(p) => Some(p.to_string()),
-            None => Some("a failure with no cause recorded".to_string()),
-        };
-        if let Some(cause) = cause {
+        if let Some(e) = self.unlifted(WHAT) {
+            return Err(e);
+        }
+        self.lift_words(stream, WHAT)
+    }
+
+    /// A sound tier's reset check: once the stream has drained, every tier
+    /// at rest and its faults cleared, the words at rest. A stream still
+    /// running passes — it may hold a signal its wait has yet to take back.
+    fn settle_checks(&mut self, stream: &CudaStream, what: &'static str) -> Result<(), GpuError> {
+        if !stream_idle(stream)? {
+            return Ok(());
+        }
+        let w = self.words();
+        if let Some(page) = self.tier_page.as_ref() {
+            for t in &mut self.tiers {
+                drain_within(
+                    t.gpu().stream(),
+                    DRAIN_DEADLINE,
+                    "Hybrid::reset: the expert tier's stream",
+                )?;
+                if !t.at_rest(page) {
+                    return Err(GpuError::protocol(
+                        what,
+                        format!(
+                            "the stream has drained and the expert tier is not at rest \
+                             (progress {} of {} asked): a go the tier never took, or a signal \
+                             no wait took back",
+                            t.progress(page),
+                            t.issued()
+                        ),
+                    ));
+                }
+                t.clear_fault(page)?;
+            }
+        }
+        if !w.at_rest() {
             return Err(GpuError::protocol(
-                WHAT,
+                what,
                 format!(
-                    "the host tier is poisoned ({cause}); a reset lifts only refused input — \
-                     reload the model"
+                    "the stream has drained and the host tier is not at rest ({w}): a go the \
+                     host never served, or a signal no wait took back"
                 ),
             ));
         }
+        Ok(())
+    }
+
+    /// A poison no reset lifts, as the error that says so; `None` for a
+    /// refusal, the one a reset can lift.
+    fn unlifted(&self, what: &'static str) -> Option<GpuError> {
+        let cause = match &self.health.poison {
+            Some(Poison::Refused(_)) => return None,
+            Some(p) => p.to_string(),
+            None => "a failure with no cause recorded".to_string(),
+        };
+        Some(GpuError::protocol(
+            what,
+            format!(
+                "the host tier is poisoned ({cause}); a reset lifts only refused input — \
+                 reload the model"
+            ),
+        ))
+    }
+
+    /// The refusal lift itself ([`HostTier::reset`]'s protocol): the stream
+    /// synchronized, the card's generation and sequence checked equal, every
+    /// counter back to 0, `served` at the generation, every tier reset, the
+    /// route trace's cut-short position dropped and the poison cleared.
+    fn lift_words(&mut self, stream: &CudaStream, what: &'static str) -> Result<(), GpuError> {
         stream.synchronize()?;
         let boundary = &self.step.boundary;
         let generation = word(&boundary.page, Word::Gen).load(Ordering::Acquire);
@@ -1565,7 +1690,7 @@ impl<H: HostExperts> HostTier<H> {
         boundary.seq_word().copy_to_host(stream, &mut seq)?;
         if seq[0] != generation {
             return Err(GpuError::protocol(
-                WHAT,
+                what,
                 format!(
                     "the card's generation is {generation} and its sequence {}: a go added to one \
                      and not the other — reload the model",
@@ -1745,7 +1870,7 @@ impl<H: HostExperts> HostTier<H> {
             return Ok(());
         }
         let chain = self.step.chain();
-        self.health.refuse_if_poisoned(SERVE)?;
+        self.refuse_released(SERVE)?;
         let mask = self.tier_mask_in_service(layer)?;
         if mask != 0 {
             self.feed_tiers(layer, row, mask, chain)?;
@@ -1778,7 +1903,7 @@ impl<H: HostExperts> HostTier<H> {
         let mut pass = [Pass::Graph; MAX_TIERS];
         let (mut listed, mut last) = (0u32, None);
         if k > 0 {
-            self.health.refuse_if_poisoned(SERVE)?;
+            self.refuse_released(SERVE)?;
             for list in &mut self.tier_lists {
                 list.clear();
             }
@@ -1974,6 +2099,19 @@ impl<H: HostExperts> HostTier<H> {
         }
     }
 
+    /// Refuse `what` on a poisoned tier, naming the poison, with every
+    /// card's waits released first: a step service is asked after its
+    /// chain's launch, so the card already waits on the host for it, and a
+    /// refusal that left those waits standing would hang the next read of
+    /// the stream instead of naming the poison.
+    fn refuse_released(&self, what: &'static str) -> Result<(), GpuError> {
+        let r = self.health.refuse_if_poisoned(what);
+        if r.is_err() {
+            self.release_all();
+        }
+        r
+    }
+
     /// Serve layer `layer` for an eager batch of `x.ne1()` tokens in one
     /// union call, outside the go/wait protocol: the caller has brought the
     /// batch's handoffs to the host — `x`, one normed activation per column,
@@ -1993,7 +2131,9 @@ impl<H: HostExperts> HostTier<H> {
     /// The caller brought the handoffs down behind the card's event, so the
     /// kernels that wrote them have finished and a watched read of the fault
     /// word sees what they raised. Refused on a poisoned tier; a failure, or
-    /// a panic inside the host experts, poisons it.
+    /// a panic inside the host experts, poisons it. A planted refusal
+    /// ([`HostTier::plant_refusal`]) is returned here, as the service's own
+    /// refusal of this layer's input.
     pub fn serve_batch(
         &mut self,
         layer: usize,
@@ -2005,6 +2145,9 @@ impl<H: HostExperts> HostTier<H> {
     ) -> Result<(), GpuError> {
         self.refuse_tier_batch("Hybrid::serve_batch")?;
         self.refuse_traced_batch("Hybrid::serve_batch")?;
+        if let Some(detail) = self.planted.take() {
+            return Err(self.refuse_planted_batch(layer, detail));
+        }
         let h = self.step.boundary.layout.handoff();
         let t = Tier {
             experts: &mut self.experts,
@@ -2019,8 +2162,11 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// Serve layer `layer` of row `row` in `chain`. Any failure — an error
-    /// or a panic inside the host experts — releases every pending wait
-    /// first, so the stream drains instead of hanging a later synchronize.
+    /// or a panic inside the host experts, or a poisoned tier's refusal —
+    /// releases every pending wait first, so the stream drains instead of
+    /// hanging a later synchronize. A planted refusal
+    /// ([`HostTier::plant_refusal`]) is returned here, as the service's own
+    /// refusal of this layer's input.
     fn serve(
         &mut self,
         layer: usize,
@@ -2028,7 +2174,10 @@ impl<H: HostExperts> HostTier<H> {
         opens_replay: bool,
         chain: Chain,
     ) -> Result<(), GpuError> {
-        self.health.refuse_if_poisoned(SERVE)?;
+        self.refuse_released(SERVE)?;
+        if let Some(detail) = self.planted.take() {
+            return Err(self.refuse_planted(layer, detail));
+        }
         let (step, experts, health) = (&mut self.step, &mut self.experts, &mut self.health);
         let slots = &self.slots;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -2077,6 +2226,62 @@ impl<H: HostExperts> HostTier<H> {
                 std::panic::resume_unwind(p)
             }
         }
+    }
+
+    /// A planted refusal of layer `layer`
+    /// ([`HostTier::plant_refusal`]): the refusing service's whole path —
+    /// the refusal recorded for the caller's naming
+    /// ([`HostTier::take_step_refusal`], [`HostTier::refusal`]), the tier
+    /// poisoned as [`Poison::Refused`] with the refusal its cause, every
+    /// wait released so the stream drains ([`HostTier::serve`]'s failure
+    /// arm) — and the error a refusing service returns.
+    fn refuse_planted(&mut self, layer: usize, detail: String) -> GpuError {
+        let r = Refusal {
+            what: SERVE,
+            layer,
+            detail,
+        };
+        let e = GpuError::protocol(
+            SERVE,
+            format!(
+                "host saw undefined input: layer {}, {}; the card's fault word is read once the \
+                 step drains",
+                r.layer, r.detail
+            ),
+        );
+        self.step.step_refusal = Some(r.clone());
+        self.health.record_refusal(r, true);
+        self.health.set_poison(SERVE, layer, None, None);
+        self.release_all();
+        e
+    }
+
+    /// A planted refusal of layer `layer`, a batch service's
+    /// ([`HostTier::plant_refusal`], [`HostTier::serve_key`],
+    /// [`HostTier::serve_batch`]): the refusing batch service's path — the
+    /// refusal recorded ([`HostTier::refusal`]), the tier poisoned as
+    /// [`Poison::Refused`] with the refusal its cause — with the error a
+    /// failing batch service returns. Like a batch service's own refusal it
+    /// reaches no step port: [`HostTier::serve_key`] hands it to the
+    /// caller's naming. No wait to release: a service that has not run left
+    /// none.
+    fn refuse_planted_batch(&mut self, layer: usize, detail: String) -> GpuError {
+        let r = Refusal {
+            what: batch::SERVE_BATCH,
+            layer,
+            detail,
+        };
+        let e = GpuError::protocol(
+            batch::SERVE_BATCH,
+            format!(
+                "host saw undefined input: layer {}, column 0: {}",
+                r.layer, r.detail
+            ),
+        );
+        self.health.record_refusal(r, true);
+        self.health
+            .set_poison(batch::SERVE_BATCH, layer, None, None);
+        e
     }
 }
 

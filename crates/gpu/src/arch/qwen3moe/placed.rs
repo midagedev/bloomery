@@ -350,10 +350,18 @@ impl Placed {
         &self.hybrid
     }
 
-    /// The host tier's reset ([`crate::host::HostTier::reset`]): a
-    /// refusal's poison lifted, the words back where a load leaves them.
+    /// The host tier, for a gate's instrument or test seam
+    /// ([`crate::host::HostTier::plant_refusal`]).
+    pub fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+        &mut self.hybrid
+    }
+
+    /// The host tier's settling ([`crate::host::HostTier::settle`]): the
+    /// words checked back where a load leaves them; a refusal's poison the
+    /// model lifts once every slot the refused call ran on has been reset
+    /// ([`crate::host::HostTier::lift_refusal`]).
     pub(super) fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.hybrid.reset(stream)
+        self.hybrid.settle(stream)
     }
 }
 
@@ -455,6 +463,19 @@ impl HostServed for Placed {
 
     fn take_host_refusal(&mut self) -> Option<Refusal> {
         self.hybrid.take_step_refusal()
+    }
+
+    /// The host tier's refusal poison lifted
+    /// ([`crate::host::HostTier::lift_refusal`]) — the settling a reset
+    /// runs is [`crate::host::HostTier::settle`]'s ([`Placed::reset`]).
+    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.hybrid.lift_refusal(stream)
+    }
+
+    /// The refusal the host tier is poisoned by now
+    /// ([`crate::host::HostTier::refusal_poison`]).
+    fn refusal_poison(&self) -> Option<Refusal> {
+        self.hybrid.refusal_poison()
     }
 
     fn host_residency(&self) -> Option<&HostResidency> {
