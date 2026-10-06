@@ -5,26 +5,33 @@
   </picture>
 </p>
 
-# bloomery
+<h1 align="center">bloomery</h1>
 
-An LLM inference engine for mixture-of-experts models, in Rust from the HTTP server down to the CUDA
-kernels, and a **drop-in [llama-server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server)**: the
-same API and the same GGUF files.
+<p align="center">
+  <b>A fast inference engine for mixture-of-experts models, built for offloading.</b><br>
+  Written in Rust from the HTTP server down to the CUDA kernels. A drop-in
+  <a href="https://github.com/ggml-org/llama.cpp/blob/master/tools/server">llama-server</a>.
+</p>
 
-- **MoE models larger than the card.** Routed experts split between the GPU and host RAM, and the experts a
-  workload calls most move onto the card as it runs. DeepSeek-V4.1-Flash (347 GB) runs on one card with 256 GB
-  of RAM; Qwen3.6-35B fits a 12–16 GB card with `--place a`.
-- **Built around that split.** The card and the CPU work on a prompt at once, and rows kept on disk are read
-  ahead of the step. Each choice comes with the measurement that isolates it: [Why it is fast](#why-it-is-fast).
-- **Five model families:** DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B and Qwen3-30B,
-  and the decision model Clef-Flash.
+- **MoE models larger than the card.** Routed experts live on the GPU and in host RAM; the engine counts its own
+  routing and moves the experts it calls most onto the card while it runs. DeepSeek-V4.1-Flash `Q3_K_M` (347 GB)
+  decodes at 44.0 tok/s after a 512-token prompt on one RTX A6000 and the CPU
+  ([conditions](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots), [a recorded session](https://tape.midagedev.com/r/un7mimv23csn2pyhfk3d));
+  Qwen3.6-35B fits a 12–16 GB card with `--place a`.
+- **Several requests, one pass.** With `--parallel 2` two busy streams run through the model together: 25–37 %
+  more tokens a second in total than one stream, on V4.1, GLM-5.3, Qwen3.8 and Qwen3-30B ([Numbers](#numbers)).
+- **llama-server compatible.** The same HTTP API and GGUF files, and llama-server's spelling for the flags both
+  have: your OpenAI client works unchanged.
+- **Rust all the way down.** Every CUDA kernel is written in Rust and compiled with
+  [cuda-oxide](https://github.com/NVIDIA/cuda-rust).
 
 ```sh
-brew install midagedev/tap/bloomery
+brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-Other ways to install: [Install](#install). What each model needs: [Hardware](#hardware).
+Models: DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B, and the decision
+model Clef-Flash — [what each needs](#hardware) · [all install channels](#install) · [numbers](#numbers)
 
 ## llama-server compatibility
 
@@ -172,20 +179,38 @@ request).
 
 ## Numbers
 
-Single-stream tok/s on the development machine (an RTX A6000 48 GB and a 32-core AVX2 CPU; decode `n = 96`).
-Every number comes from the runners in `tools/ref/` under the quiet-machine protocol, and every measured row,
-the other engines, and progress over time live on [rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md).
+Single-stream tok/s on the development machine (an RTX A6000 48 GB and a 32-core AVX2 CPU; decode `n = 96`). Every
+number comes from the runners in `tools/ref/` under the quiet-machine protocol, and each row links the rig-log
+section that holds its conditions. The measured history and the other engines' rows live on
+[rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md).
 
-Today's defaults ([per-row conditions in rig-log](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md)):
+Today's defaults:
 
-| Model | Decode | Prompt |
-|---|---|---|
-| V4.1-Flash `Q3_K_M`, A6000 + CPU | 43.30 after P = 512, 36.77 after 4096 | 191.97 (P = 512), 376.67 (P = 4096) |
-| V4.1-Flash, A6000 + 3090 (`--place bp`) | 44.28 / 37.45 | 205.48 / 388.93 |
-| GLM-5.3-Flash `UD-Q4_K_XL`, A6000 + CPU | 20.95 (depth 512) | — (the batched prompt and the MTP draft landed after this window) |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL`, A6000 + CPU | 91.24 after P = 512, 79.33 after 4096 | 861.7 (P = 512), 1,024.3 (P = 4096) |
-| Qwen3.6-35B `Q4_K_M`, A6000 whole | 204.4 (depth 6), 195.8 (depth 4096) | 6,464 (P = 512), 8,311 (P = 4096) |
-| Qwen3-30B `Q4_K_M`, A6000 whole | 209.2 (depth 6), 175.2 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) |
+| Model | Decode | Prompt | Recorded |
+|---|---|---|---|
+| V4.1-Flash `Q3_K_M`, A6000 + CPU | 44.0 after P = 512, 36.77 after 4096 | 191.97 (P = 512), 376.67 (P = 4096) | [10-06](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots), [09-30](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#callstream-pp-a) |
+| V4.1-Flash, A6000 + 3090 (`--place bp`) | 44.28 / 37.45 | 205.48 / 388.93 | [09-30](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#callstream-pp-bp) |
+| GLM-5.3-Flash `UD-Q4_K_XL`, A6000 + CPU | 25.38 after P = 512 | 200.2 (P = 512) | [10-06](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#glmbp-ab) |
+| GLM-5.3-Flash, A6000 + 3090 (`--place bp`) | 28.67 after P = 512 | 222.3 (P = 512) | [10-06](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#glmbp-ab) |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL`, A6000 + CPU | 96.21 after P = 512, 83.54 after 4096 | 907.0 (P = 512), 1,224.1 (P = 4096) | [10-01](https://github.com/midagedev/rig-log/blob/main/log/2026-10-01.md#q38hol-ab) |
+| Qwen3.6-35B `Q4_K_M`, A6000 whole | 204.4 (depth 6), 195.8 (depth 4096) | 6,464 (P = 512), 8,311 (P = 4096) | [09-28](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q36-release) |
+| Qwen3-30B `Q4_K_M`, A6000 whole | 209.23 (depth 6), 175.62 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) | [10-06](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots), [09-27](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng) |
+
+The GLM-5.3 and Qwen3.8 rows run the MTP draft and adaptive residency, their servers' defaults; V4.1's run
+adaptive residency.
+
+**Two requests at once.** `--parallel 2` with both slots busy, against one request, the same binary, A6000
+([conditions](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)):
+
+| Model | One request | Two requests, in total | |
+|---|---|---|---|
+| Qwen3-30B `Q4_K_M`, whole card, depth 6 | 209.23 | 282.22 | ×1.35 |
+| Qwen3-30B, depth 4096 | 175.62 | 232.18 | ×1.32 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL`, after P = 512, MTP draft off | 61.22 | 82.70 | ×1.35 |
+| V4.1-Flash `Q3_K_M`, after P = 512 | 44.0 | 55.0 | ×1.25 |
+| GLM-5.3-Flash `UD-Q4_K_XL`, residency on, MTP draft off, depth 6 | 25.52 | 34.90 | ×1.37 |
+
+Each of the two requests runs at 0.62–0.68× its speed alone, so one user waits longer and the machine serves more.
 
 A first start compiles the GPU code for the card (tens of seconds); later starts take seconds. A warm V4.1
 load takes about 16 s.
@@ -339,7 +364,11 @@ generate, serve, and `--place gate` on a single RTX 3090). In short: Linux x86-6
 - How bloomery uses cuda-oxide: [`docs/cuda-oxide.md`](docs/cuda-oxide.md). Every other page, reference and
   working records: [`docs/README.md`](docs/README.md).
 - Measurements and command lines: [rig-log](https://github.com/midagedev/rig-log) (Korean).
-- Recorded sessions, not benchmark rows: [V4.1 on two cards answering a coding
+- Recorded sessions, not benchmark rows. bloomery 0.2.1: [V4.1 answering a code review on one
+  A6000](https://tape.midagedev.com/r/un7mimv23csn2pyhfk3d), [GLM-5.3 on two cards
+  (`--place bp`)](https://tape.midagedev.com/r/wcp952uyjebbpui7sgch), [Qwen3.8 on one
+  A6000](https://tape.midagedev.com/r/9d6bv7ssftr4e9cu8wdi), [Qwen3-30B serving four streams on one
+  3090](https://tape.midagedev.com/r/uxkad26d6jjr26nixrkh). Earlier: [V4.1 on two cards answering a coding
   review](https://tape.midagedev.com/r/6w4t9r5nqwtt5c9sagn3); [GLM-5.3's server at its
   defaults](https://tape.midagedev.com/r/6kf3sxuqpza6m7k7iwi6) against [llama.cpp's GLM pull request on the
   same card](https://tape.midagedev.com/r/6nn6grc6hztpssp88hz5); [Clef-Flash answering seven Korean SystemOne
