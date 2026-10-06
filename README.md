@@ -43,6 +43,14 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Cards | One card, or one card plus one expert-tier card (`--place bp`) |
 | Vision input (V4.1) | Not in this release |
 
+**Known issues in 0.2.3** (fixed in 0.2.4):
+
+- **DeepSeek-V4.1 on one 24 GB card (RTX 3090, 4090) with no flags refuses to load**, naming
+  `SwapMachine::new: … card slots for 40 pinned`. The default adaptive residency asks for more card room than the
+  plan leaves. Start it with `BLOOMERY_RESIDENCY=off`.
+- **Qwen3-30B and Qwen3.6 on a machine with two cards of different sizes** load on CUDA device 0, which may be the
+  smaller card. Pick the larger one with `CUDA_VISIBLE_DEVICES`.
+
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
 [`docs/serving.md`](docs/serving.md#limits).
 
