@@ -1179,7 +1179,7 @@ PY
     fail slots "rc $RC, want 0" "$L"
   elif [ "$(paste -sd' ' "$tmp/tmp/stub-gen-slots")" != "slots=none depth=6 slots=2 depth=12 slots=2 depth=12 slots=none depth=6" ]; then
     fail slots "the lever and the feed per process, want the twin's none of 6 ids and the aggregate arm's 2 of 12, in the rotation's order" "$tmp/tmp/stub-gen-slots"
-  elif want slots "$L" 2 "^ROW r[12] $SL d=6 n=4 ctx=2048 \\| tok/s\\(aggregate\\) 45\\.45 @ n=2·3, depth 6, A6000 \\(stub\\) \\| place a card_experts 2627 host_experts 9469 \\| prompt ids 50000\\.\\.50011 \\| slots 2 \\| tok/s\\(per stream, mean\\) 22\\.73 \\| p50 44\\.0000 ms/pass \\| mean 44\\.0000 ms/pass \\| warm 0 \\| first10_p50 44\\.0000 \\| last10_p50 44\\.0000 \\| distinct_tokens 6 \\| pp_tok/s 60\\.00 \\(n=6, passes=1, kind=batch\\) \\| residency mid-p0-s1 \\(set\\) passes 0 " &&
+  elif want slots "$L" 2 "^ROW r[12] $SL d=6 n=4 ctx=2048 \\| tok/s\\(aggregate\\) 45\\.45 @ n=2·3, depth 6, A6000 \\(stub\\) \\| place a card_experts 2627 host_experts 9469 \\| prompt ids 50000\\.\\.50011 \\| slots 2 \\| tok/s\\(per stream, mean\\) 22\\.73 \\| p50 44\\.0000 ms/pass \\| mean 44\\.0000 ms/pass \\| warm 0 \\| first10_p50 44\\.0000 \\| last10_p50 44\\.0000 \\| distinct_tokens 6 \\| pp_tok/s 60\\.00 \\(n=6, passes=1, kind=batch\\) \\| residency mid-p0-s1 \\(set\\) passes 3 kept 6 landed 3 " &&
     want slots "$L" 2 "^ROW r[12] $TW d=6 n=4 ctx=2048 \\| tok/s\\(mean\\) 30\\.30 @ n=4, depth 6, .*\\| prompt ids 50000\\.\\.50005 \\| " &&
     want slots "$L" 1 "^mean $SL 6 +45\\.45 tok/s  \\[45\\.45\\.\\.45\\.45, spread 0\\.00%\\]  \\(aggregate of 2 slots\\) \\(n=2\\)$" &&
     want slots "$L" 1 "^mean $TW 6 +30\\.30 tok/s  \\[30\\.30\\.\\.30\\.30, spread 0\\.00%\\]  \\(n=2\\)$" &&
