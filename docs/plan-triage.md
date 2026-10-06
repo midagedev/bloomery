@@ -43,6 +43,35 @@ second term. His `/metrics` (asked on #1) settle E and W.
 | G7 | AVX-VNNI host kernels | M | prefill share only; decode 0 | after G1 |
 | G8 | drafted ≠ plain: verify row 0 differs from the plain step by ≥ 0.44 logits at the first divergence (Q4, row 0; Q3 rows 1); the README / `generate_qwen3moe.rs:164` equality claim is false on both files | S–M | — | worker2, opus narrowing |
 
+### The next release: IQ quants and the two-channel host (the user, 2026-10-07)
+
+The user: these two lead and go out together.
+- **IQ quants:**
+  - iqwire (Qwen3.8 UD-Q3_K_XL: IQ3_XXS/IQ4_XS gate·up, IQ4_NL down, on the card and the host; landing batch
+    running).
+  - The Q3 serve-seat refusal (worker1; `Violation::CardOver` in `crates/placement`, the drafted gate plan, 8044 B).
+  - ple64 (the 28.8 GB PLE table placed by host room, so a 64 GiB host loads the Q3 file).
+  - The iq4xs maddubs saturation stays ik-faithful, banded by its clause.
+- **Two-channel host** (rows G1–G5 above), each judged on the common-machine arm as well as our own:
+  - G3 draftgate (width by cost, the gate, common across draft families).
+  - G4 pieces 1+2, round resclock2: the token clock, and unpinned by default. Replay at a 22 % card share: +4.5…+9.9
+    points of hit, decode +2…+4 % [derived]. Piece 3, the engine's own routing profile as the seed: +19…+47 % decode
+    on that machine [derived]; the user chose (2026-10-07): the file lives in the user's cache dir (`~/.cache/bloomery/profiles/<model key>`), on by
+    default (`BLOOMERY_RES_PROFILE=off` turns it off), one file per model file shared by every seat. It touches
+    `host/swap.rs`, so it opens after wslfix6 lands.
+    It is the retired corpus-learned list's idea with the in-sample defect removed (the engine's own routing, scored
+    held-out). Its remaining risk is that list's: a profile learned on one genre seeding another (the list caught
+    7–8 % on chat, below the id prefix's 18 %). So default-on lands only with a cross-genre replay gate (learn on code, score on chat,
+    and every other pair) that is never below the id prefix; if one pair is, the seed decays toward recent use or
+    fills only part of the card. Public rows say "after N tokens of own use, held-out".
+  - G1 phase 1 (xstream R1 rule → R2 lane → R3 Qwen3.8 wiring → R4 sitting): pp4096 +85…+180 % on our A6000, about
+    +380…+480 % on the common-machine arm [derived, `xstream` report §3.2, §6]. R2/R3 open after wslfix6 and iqwire
+    land (`host/*`, `body38.rs`).
+  - G5 rulers (chatarm).
+- G2 (decode misses over PCIe) is out of phase 1: about 0 to negative on PCIe 4.0, +8…+15 % on his machine [derived].
+- Also in: the 0.2.6 watchdog (wslfix-watchdog). The release asks the #1 reporter to re-run his table on the
+  candidate.
+
 ## Direction: development speed first (the user, 2026-10-06)
 
 Decisions of 2026-10-07 (the user: "proceed with the recommended defaults"):
@@ -86,6 +115,17 @@ Order:
    needs (IQ3_XXS + MXFP4).
 5. The llama.cpp b11443 speed changes (GLM rounds `lcpp-cuda` and `lcpp-host`). Mainline now runs GLM-5.3 and
    Qwen3.8 MTP, so those two bench rows re-sit against mainline, not a PR branch.
+
+- **Gate wall from the iqwire landing batch** (worker2, 2026-10-07; two S items, they move every ledger key, so they
+  land between batches):
+  - Lock waiting, not running: at 74 of 120 items lane A (3090) had run 2,825 s and waited 2,433 s on the 3090 gate
+    lock behind other tracks (`gate-gpu-qwen3moe-rope` waited 726 of its 730 s); lane B waited 1 s. `gate-batch.sh`
+    moves a lane-A item to an idle A6000 while the 3090 lock is contended and no timing lease is held, the rule
+    `BLOOMERY_GATE_CARD=any` already applies per run.
+  - Narrowing over-selects: `crates/model/src/arch/coverage.rs` and `arch/qwen35moe/mtp.rs` map to `*`
+    (`tools/gate-paths.tsv:68`), and `crates/gpu/src/weights.rs` has no row. Map them by the family that reads them,
+    and give `weights.rs` its row. (iqwire moved kernels, so its full list was right; the `*` rows widen every later
+    coverage or mtp change.)
 
 - **WSL2 one-queue boundary cost** (worker1, wslfix, derived from `stage_us`): under one hardware queue the readback
   after a planning boundary waits behind that boundary's staging and HtoD, once per 4 steps. That is about 5–7 ms on
