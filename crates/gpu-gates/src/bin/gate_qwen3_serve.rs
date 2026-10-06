@@ -4,6 +4,14 @@
 //!
 //!     gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir>
 //!
+//! Before any file, touching no card, it holds
+//! `unplaced_card_is_the_largest`: on fake censuses of this workstation's
+//! two cards, the card a run with `--place` unset loads on — whole or placed
+//! (`q3place::PlaceQ3::unplaced_on`) — is the A6000 at its own ordinal with
+//! the 3090 at device 0 and with it at device 1, a lone 3090 is itself, and
+//! a census of no device is `a`'s refusal by name. FAIL-first: a card that
+//! is the census's first device turns the 3090-first census red.
+//!
 //! For each file it starts `bloomery-serve --model qwen3 -m <file> --port 0
 //! --parallel 1` (beside this binary, `BLOOMERY_REF_MODEL` removed from its
 //! environment: the file is named once, by `-m`; the plain engine pinned,
@@ -314,7 +322,7 @@ mod gate {
     };
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use gguf::Split;
-    use model::placement::workstation::GRANULE;
+    use model::placement::workstation::{A6000, DeviceInfo, GRANULE, RTX_3090};
     use runtime::seqstate::HOST_BUDGET;
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
@@ -418,6 +426,59 @@ mod gate {
     fn check(ok: &mut bool, name: &str, pass: bool) {
         println!("check {name}: {}", verdict(pass));
         *ok &= pass;
+    }
+
+    /// A fake census of this workstation's cards by short name, in the
+    /// order given: each its CUDA ordinal by position, its measured total,
+    /// all of it free.
+    fn fake_census(names: &[&str]) -> Vec<DeviceInfo> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let (name, total_bytes) = match *n {
+                    "3090" => ("NVIDIA GeForce RTX 3090", 25_351_356_416),
+                    "A6000" => ("NVIDIA RTX A6000", 50_952_536_064),
+                    other => panic!("no fake device {other}"),
+                };
+                let ordinal = u32::try_from(i).expect("a short list");
+                DeviceInfo {
+                    ordinal,
+                    name: name.to_owned(),
+                    total_bytes,
+                    free_bytes: total_bytes,
+                    uuid: [u8::try_from(i + 1).expect("a short list"); 16],
+                    pci_bus: format!("0000:{:02x}:00.0", 0x41 + i),
+                    held_by: None,
+                }
+            })
+            .collect()
+    }
+
+    /// `unplaced_card_is_the_largest` (module doc): the card the unset
+    /// default loads on, by name and ordinal, on each fake census.
+    fn unplaced_card_is_the_largest(ok: &mut bool) {
+        let card = |census: &[DeviceInfo]| {
+            q3place::PlaceQ3::unplaced_on(census)
+                .and_then(|p| p.card_specs())
+                .map(|s| (s[0].name, s[0].device.map(|d| d.ordinal)))
+                .map_err(|e| e.to_string())
+        };
+        let mut pass = true;
+        for (order, a6000) in [(["3090", "A6000"], 1), (["A6000", "3090"], 0)] {
+            let got = card(&fake_census(&order));
+            println!("unplaced card on {order:?}: {got:?}");
+            pass &= got == Ok((A6000.name, Some(a6000)));
+        }
+        let lone = card(&fake_census(&["3090"]));
+        println!("unplaced card on [\"3090\"]: {lone:?}");
+        pass &= lone == Ok((RTX_3090.name, Some(0)));
+        let none = card(&[]);
+        println!("unplaced card on []: {none:?}");
+        pass &= none.is_err_and(|e| {
+            e.starts_with("--place a: the placement takes the largest visible card, and 0 devices")
+        });
+        check(ok, "unplaced_card_is_the_largest", pass);
     }
 
     /// A binary beside this one.
@@ -2505,6 +2566,7 @@ mod gate {
         bloomery_levers::at_main(&[])?;
         let a = parse_args()?;
         let mut ok = true;
+        unplaced_card_is_the_largest(&mut ok);
         for (i, model) in a.models.iter().enumerate() {
             let dir = a.dir.join(i.to_string());
             std::fs::create_dir_all(&dir)?;

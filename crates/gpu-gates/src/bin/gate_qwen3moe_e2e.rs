@@ -1068,7 +1068,7 @@ mod gate {
         // The quiet card: the unset load is today's whole-card one.
         let whole = matches!(
             q3place::unplaced_qwen3(&file, CTX, KvQ8::F16)?,
-            q3place::Unplaced::Whole
+            q3place::Unplaced::Whole(_)
         );
         println!("memguard quiet: whole decision {whole} {}", verdict(whole));
         ok &= whole;
@@ -1146,7 +1146,7 @@ mod gate {
         // reading is live, not a constant.
         let whole = matches!(
             q3place::unplaced_qwen3(&file, CTX, KvQ8::F16)?,
-            q3place::Unplaced::Whole
+            q3place::Unplaced::Whole(_)
         );
         println!(
             "memguard released: whole decision {whole} {}",

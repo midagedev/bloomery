@@ -12,12 +12,13 @@
 //! other opens the body's placed load.
 //!
 //! The same two binaries' `--place`-unset default lives here too
-//! ([`unplaced_qwen3`]): today's whole model on device 0 while that fits
-//! what the card had — the whole-fit verdict (`placement::whole_need`) over
-//! what the whole load asks for: its weights' granules, its cache planes'
-//! granules for every resident slot the load serves ([`kv_bytes`]), and the
-//! program's own arena and the reserve its load keeps free past it — and
-//! when it does not, the placed plan on `a`'s card. The serve seat's unset
+//! ([`unplaced_qwen3`]), on `a`'s card, the largest visible card
+//! ([`PlaceQ3::unplaced_on`]): the whole model while that fits what the card
+//! had — the whole-fit verdict (`placement::whole_need`) over what the whole
+//! load asks for: its weights' granules, its cache planes' granules for
+//! every resident slot the load serves ([`kv_bytes`]), and the program's own
+//! arena and the reserve its load keeps free past it — and when it does
+//! not, the placed plan on the same card. The serve seat's unset
 //! `--ctx` defaults live here too ([`whole_ctx_qwen3`] for the whole load,
 //! [`placed_ctx_qwen3`] for a placed one), and its resident slots open a
 //! placed plan through [`open_qwen3_slots`] and [`open_qwen35_slots`]. A
@@ -204,8 +205,8 @@ fn fixed_seq_bytes(inputs: &Inputs) -> u64 {
 /// slot's share and the fixed stores once — none where they are 0; on the
 /// host, a [`CHECKPOINTS_RESERVE`] of every sequence's checkpoints
 /// ([`checkpoint_bytes`]) when they take them. The one owner of a placed
-/// load's machine, so a relaid machine ([`PlaceQ3::machine_at`],
-/// [`PlaceQ3::moved_to`]) keeps the rows.
+/// load's machine, so a relaid machine ([`PlaceQ3::machine_at`]) keeps the
+/// rows.
 fn laid(spec: CardSpec, inputs: &Inputs, arena: u64, seqs: Seqs) -> Machine {
     let mut machine = q3::machine(spec, layers_of(inputs), arena);
     let past = u64::try_from(seqs.slots.saturating_sub(1))
@@ -279,6 +280,10 @@ impl PlaceQ3 {
     /// A qwen35moe file's placed load under `o` on `place`'s card, its
     /// attention planes in `o.kv`'s format, resolved against one census of
     /// this process's devices: one sequence taking no checkpoints, the CLI's.
+    #[allow(
+        dead_code,
+        reason = "the CLI's and the e2e gates' load; the serve seat's holds its slots (qwen35_seqs)"
+    )]
     pub fn qwen35(file: &Split, place: Place, o: Open35) -> Result<PlaceQ3, GateError> {
         PlaceQ3::qwen35_on(file, place, &census()?, o, Seqs::ONE)
     }
@@ -388,20 +393,6 @@ impl PlaceQ3 {
         layers_of(&self.inputs)
     }
 
-    /// The same placed load on `place`'s card, resolved against `census`:
-    /// the inputs and the sequences this one read stay, and the machine is
-    /// relaid on that card over the arena this one's counts.
-    fn moved_to(self, place: Place, census: &[DeviceInfo]) -> Result<PlaceQ3, GateError> {
-        let place = PlaceQ3::resolve(place, census)?;
-        let arena = q3::counted_arena_bytes(&self.machine.cards[0]);
-        let machine = laid(place.card_specs()?[0], &self.inputs, arena, self.seqs);
-        Ok(PlaceQ3 {
-            place,
-            machine,
-            ..self
-        })
-    }
-
     /// The whole-fit verdict of this file on the card's device at `ctx`
     /// positions for `slots` resident sequences ([`whole_on`]), the cache in
     /// the planes' format this load counts, `load` what the program holds
@@ -421,6 +412,15 @@ impl PlaceQ3 {
             kv,
             load,
         )
+    }
+
+    /// The placement's word, as the `plan` record prints it.
+    #[allow(
+        dead_code,
+        reason = "the serve seat names its load's card in a crash report; the CLI prints the plan record"
+    )]
+    pub fn name(&self) -> &'static str {
+        self.place.name()
     }
 
     /// The `plan` record of `plan`: the card, the architecture, the expert
@@ -626,20 +626,26 @@ fn whole_on(
 }
 
 impl PlaceQ3 {
+    /// The placement a run with `--place` unset probes and loads on,
+    /// resolved against `census`: `a` ([`Place::A`]), the largest visible
+    /// card by usable bytes, ties to the lower ordinal — whatever the CUDA
+    /// order puts at device 0. Its card takes the whole model when the
+    /// whole-fit verdict on it does, else this file's placed plan, so both
+    /// loads sit on one card. With no visible device, `a`'s refusal by name.
+    pub fn unplaced_on(census: &[DeviceInfo]) -> Result<Place, GateError> {
+        Place::A.on(census)
+    }
+
     /// The load a run with `--place` unset takes by `whole`, this probe's
-    /// verdict at `ctx`, its line on stderr: the whole load when the verdict
-    /// takes it, else this file's placed plan on `a`'s card, resolved against
-    /// `census` — the probe's own reading. A model with no routed expert that
-    /// the verdict does not take is refused by name with its terms.
-    fn unplaced(
-        self,
-        census: &[DeviceInfo],
-        ctx: usize,
-        whole: &Whole,
-    ) -> Result<Unplaced, GateError> {
+    /// verdict at `ctx`, its line on stderr; the probe is on
+    /// [`PlaceQ3::unplaced_on`]'s placement. The whole load on the probe's
+    /// card when the verdict takes it, else the probe itself, this file's
+    /// placed plan on that card. A model with no routed expert that the
+    /// verdict does not take is refused by name with its terms.
+    fn unplaced(self, ctx: usize, whole: &Whole) -> Result<Unplaced, GateError> {
         eprintln!("{}", whole.line(ctx));
         if whole.fits() {
-            return Ok(Unplaced::Whole);
+            return Ok(Unplaced::Whole(self.place.card_specs()?[0]));
         }
         let routed = inputs_model(&self.inputs)
             .tensors
@@ -648,7 +654,7 @@ impl PlaceQ3 {
         if !routed {
             return Err(whole.dense_refusal(ctx));
         }
-        Ok(Unplaced::Placed(Box::new(self.moved_to(Place::A, census)?)))
+        Ok(Unplaced::Placed(Box::new(self)))
     }
 }
 
@@ -659,13 +665,13 @@ pub fn unplaced_qwen3(file: &Split, ctx: usize, kv: KvQ8) -> Result<Unplaced, Ga
 }
 
 /// What a run with `--place` unset loads, decided before any load on one
-/// census reading: the whole model on device 0 (`Whole` — no plan, no
-/// record, today's load byte for byte) while the whole-fit verdict at `ctx`
-/// for `slots` resident sequences takes it ([`whole_on`]: the qwen3moe
+/// census reading, on `a`'s card ([`PlaceQ3::unplaced_on`]): the whole
+/// model there (`Whole` — no plan, no record) while the whole-fit verdict at
+/// `ctx` for `slots` resident sequences takes it ([`whole_on`]: the qwen3moe
 /// body's whole load, [`QWEN3_WHOLE`], the cache [`kv_bytes`] counts at the
-/// slots' shares); else the placed plan on `a`'s card (`Placed`). The
-/// verdict's line goes to stderr; a file with no routed experts the verdict
-/// does not take is refused by name.
+/// slots' shares); else the placed plan there (`Placed`). The verdict's line
+/// goes to stderr; a file with no routed experts the verdict does not take
+/// is refused by name.
 #[allow(
     dead_code,
     reason = "the serve seat decides its load at the total for its --parallel slots; the CLI and the e2e gates load one sequence"
@@ -677,9 +683,9 @@ pub fn unplaced_qwen3_slots(
     kv: KvQ8,
 ) -> Result<Unplaced, GateError> {
     let census = census()?;
-    let probe = PlaceQ3::qwen3_on(file, Place::parse("cuda0")?, &census, ctx, kv)?;
+    let probe = PlaceQ3::qwen3_on(file, PlaceQ3::unplaced_on(&census)?, &census, ctx, kv)?;
     let whole = probe.whole_at(u64::try_from(ctx)?, slots, Ok(QWEN3_WHOLE))?;
-    probe.unplaced(&census, ctx, &whole)
+    probe.unplaced(ctx, &whole)
 }
 
 /// The step the searched default context moves in ([`whole_ctx_qwen3`]):
@@ -696,8 +702,9 @@ pub fn trained_ctx(file: &Split) -> Option<usize> {
 /// The `--ctx` a whole-card load defaults to when the flag is unset: the
 /// file's trained context ([`trained_ctx`]) capped to the largest multiple
 /// of [`CTX_GRAN`] at or above `floor` whose whole load for `slots` resident
-/// sequences the whole-fit verdict takes on device 0 ([`whole_on`], one
-/// census reading for every probe): a context whose load fits what the card
+/// sequences the whole-fit verdict takes on `a`'s card
+/// ([`PlaceQ3::unplaced_on`]; [`whole_on`], one census reading for every
+/// probe): a context whose load fits what the card
 /// had with its arena and reserve counted. `None` when the file states no
 /// trained context or nothing at `floor` fits — the caller keeps `floor`,
 /// and the load falls to the placed plan, whose own default
@@ -712,7 +719,8 @@ pub fn whole_ctx_qwen3(
     slots: usize,
     kv: KvQ8,
 ) -> Result<Option<usize>, GateError> {
-    let probe = PlaceQ3::qwen3(file, Place::parse("cuda0")?, floor, kv)?;
+    let census = census()?;
+    let probe = PlaceQ3::qwen3_on(file, PlaceQ3::unplaced_on(&census)?, &census, floor, kv)?;
     let fits = |ctx: usize| {
         probed();
         Ok(probe
@@ -738,7 +746,8 @@ pub fn whole_ctx_qwen35(
     floor: usize,
     slots: usize,
 ) -> Result<Option<usize>, GateError> {
-    let probe = PlaceQ3::qwen35(file, Place::parse("cuda0")?, *o)?;
+    let census = census()?;
+    let probe = PlaceQ3::qwen35_on(file, PlaceQ3::unplaced_on(&census)?, &census, *o, Seqs::ONE)?;
     let fits = |ctx: usize| {
         probed();
         Ok(probe
@@ -897,26 +906,26 @@ pub fn unplaced_qwen35(file: &Split, o: &Open35) -> Result<Unplaced, GateError> 
 pub fn unplaced_qwen35_slots(file: &Split, o: &Open35, seqs: Seqs) -> Result<Unplaced, GateError> {
     let census = census()?;
     let at = share(o, o.ctx, seqs.slots);
-    let probe = PlaceQ3::qwen35_on(file, Place::parse("cuda0")?, &census, at, seqs)?;
+    let probe = PlaceQ3::qwen35_on(file, PlaceQ3::unplaced_on(&census)?, &census, at, seqs)?;
     let whole = probe.whole_at(u64::try_from(o.ctx)?, seqs.slots, qwen35_whole(file, at))?;
-    probe.unplaced(&census, o.ctx, &whole)
+    probe.unplaced(o.ctx, &whole)
 }
 
-/// The load a run with `--place` unset takes ([`unplaced_qwen3`]): today's
-/// whole model on device 0, or the placed plan on `a`'s card.
+/// The load a run with `--place` unset takes ([`unplaced_qwen3`]), on `a`'s
+/// card ([`PlaceQ3::unplaced_on`]): the whole model, or the placed plan.
 pub enum Unplaced {
-    /// The whole-card load on device 0, as before the free-bytes rule.
-    Whole,
+    /// The whole-card load on this card, the one the verdict counted.
+    Whole(CardSpec),
     /// The placed plan on `a`'s card: its `plan` record prints with
     /// `why=whole_does_not_fit` before the open.
     Placed(Box<PlaceQ3>),
 }
 
-/// What a run with `--place` unset loads: today's whole model on device 0,
-/// byte for byte — no plan, no record — while the whole-fit verdict takes it
-/// ([`unplaced_qwen3`]); else the placed plan on `a`'s card, its
-/// `plan` record with `why=whole_does_not_fit` handed to `emit` before the
-/// open, the host set as `levers` asks.
+/// What a run with `--place` unset loads: the whole model on `a`'s card —
+/// no plan, no record — while the whole-fit verdict takes it
+/// ([`unplaced_qwen3`]); else the placed plan on that card, its `plan`
+/// record with `why=whole_does_not_fit` handed to `emit` before the open,
+/// the host set as `levers` asks.
 #[allow(
     dead_code,
     reason = "generate_qwen3moe opens its unset load through it; the serve seat decides its load at the total before the open"
@@ -929,7 +938,11 @@ pub fn open_unplaced_qwen3(
     emit: fn(Record),
 ) -> Result<Qwen3moeModel, GateError> {
     match unplaced_qwen3(&file, ctx, opts.kv)? {
-        Unplaced::Whole => Ok(Qwen3moeModel::open(Gpu::new()?, file, opts)?),
+        Unplaced::Whole(card) => Ok(Qwen3moeModel::open(
+            Gpu::open_card(card.name, card.device)?,
+            file,
+            opts,
+        )?),
         Unplaced::Placed(q) => {
             let plan = q.plan(ctx, &PlanLevers::from_levers(levers)?)?;
             emit(q.record(&plan, Some(WHY_NOT_WHOLE)));
@@ -951,7 +964,11 @@ pub fn open_unplaced_qwen35(
     emit: fn(Record),
 ) -> Result<Qwen35moeModel, GateError> {
     match unplaced_qwen35(&file, &o)? {
-        Unplaced::Whole => Ok(Qwen35moeModel::open(Gpu::new()?, file, o)?),
+        Unplaced::Whole(card) => Ok(Qwen35moeModel::open(
+            Gpu::open_card(card.name, card.device)?,
+            file,
+            o,
+        )?),
         Unplaced::Placed(q) => {
             let plan = q.plan(o.ctx, &PlanLevers::from_levers(levers)?)?;
             emit(q.record(&plan, Some(WHY_NOT_WHOLE)));

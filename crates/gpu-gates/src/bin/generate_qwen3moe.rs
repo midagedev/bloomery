@@ -91,11 +91,11 @@
 //! port and the prompt as eager passes of up to eight ids through its batch
 //! port (`auto` and `pass`; `--prefill gemm` refused by name), and in graph
 //! mode captures the step only. Unset, the load is the whole-card one on
-//! device 0 while that fits the card's free bytes — the plan's own test of
-//! the whole file's card bytes plus its KV, context, scratch and margin
-//! against the census's free reading — and when it does not, the placed
-//! plan on `a`'s card runs instead, its `plan` line naming why
-//! (`why=whole_does_not_fit`). The placement's levers
+//! `a`'s card, the largest visible card, while that fits the card's free
+//! bytes — the plan's own test of the whole file's card bytes plus its KV,
+//! context, scratch and margin against the census's free reading — and when
+//! it does not, the placed plan on that card runs instead, its `plan` line
+//! naming why (`why=whole_does_not_fit`). The placement's levers
 //! (`BLOOMERY_CARD_BUDGET` and the host set's, `q3place::PLACED_LEVERS`)
 //! act on a run that names `--place`, on any file; set without it they are
 //! refused by name.
@@ -1695,9 +1695,9 @@ mod cli {
 
     /// The Qwen3-30B-A3B model of `file` — under `place` by its plan
     /// (`q3place`), the `plan` line first, and with `place` unset the
-    /// default ([`q3place::open_unplaced_qwen3`]): today's whole-card load
-    /// on device 0 while that fits the card's free bytes, else the placed
-    /// plan on `a`'s card with its why — its `load` line, and in graph mode
+    /// default ([`q3place::open_unplaced_qwen3`]): the whole-card load on
+    /// `a`'s card while that fits the card's free bytes, else the placed
+    /// plan on that card with its why — its `load` line, and in graph mode
     /// the step captured and, unplaced, every prefill pass, with their
     /// `capture` lines.
     fn open_qwen3(
@@ -1767,9 +1767,9 @@ mod cli {
     /// The Qwen3.6-35B-A3B model of `file` with the tensor-core decode
     /// flash (the engine's) — under `place` by its plan (`q3place`), the
     /// `plan` line first, and with `place` unset the default
-    /// ([`q3place::open_unplaced_qwen35`]): today's whole-card load on
-    /// device 0 while that fits the card's free bytes, else the placed
-    /// plan on `a`'s card with its why — its `load` line, and in graph
+    /// ([`q3place::open_unplaced_qwen35`]): the whole-card load on `a`'s
+    /// card while that fits the card's free bytes, else the placed plan on
+    /// that card with its why — its `load` line, and in graph
     /// mode the step captured and, unplaced, the passes of 2 to
     /// [`MAX_PASS_ROWS`] rows, with their `capture` lines.
     fn open_qwen35(
