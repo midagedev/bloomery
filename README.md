@@ -14,12 +14,13 @@
 </p>
 
 - **MoE models larger than the card.** Routed experts live on the GPU and in host RAM; the engine counts its own
-  routing and moves the experts it calls most onto the card while it runs. DeepSeek-V4.1-Flash `Q3_K_M` (347 GB)
-  decodes at 44.0 tok/s after a 512-token prompt on one RTX A6000 and the CPU
-  ([conditions](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots), [a recorded session](https://tape.midagedev.com/r/un7mimv23csn2pyhfk3d));
-  Qwen3.6-35B fits a 12–16 GB card with `--place a`.
+  routing and moves the experts it calls most onto the card while it runs. On one RTX 3090 24 GB beside a 256 GB
+  host, DeepSeek-V4.1-Flash `Q3_K_M` (347 GB) serves two requests at 34.4 tok/s in total and GLM-5.3-Flash at 26.9;
+  Qwen3-30B runs whole on the card, two requests at 254 tok/s in total ([Numbers](#numbers)). Qwen3.6-35B fits a 12–16 GB card with
+  `--place a`.
 - **Several requests, one pass.** With `--parallel 2` two busy streams run through the model together: 25–37 %
-  more tokens a second in total than one stream, on V4.1, GLM-5.3, Qwen3.8 and Qwen3-30B ([Numbers](#numbers)).
+  more tokens a second in total than one stream, on V4.1, GLM-5.3, Qwen3.8 and Qwen3-30B
+  ([measured on the A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)).
 - **llama-server compatible.** The same HTTP API and GGUF files, and llama-server's spelling for the flags both
   have: your OpenAI client works unchanged.
 - **Rust all the way down.** Every CUDA kernel is written in Rust and compiled with
@@ -179,38 +180,39 @@ request).
 
 ## Numbers
 
-Single-stream tok/s on the development machine (an RTX A6000 48 GB and a 32-core AVX2 CPU; decode `n = 96`). Every
-number comes from the runners in `tools/ref/` under the quiet-machine protocol, and each row links the rig-log
-section that holds its conditions. The measured history and the other engines' rows live on
-[rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md).
+Two requests at once (`--parallel 2`, both busy) after a 512-token prompt, decode tok/s of both together. The host
+is the development machine's: a 32-core AVX2 CPU with 8 DDR4 channels and 256 GB of RAM. The RTX 3090 runs at a
+250 W cap (a stock 3090 draws 350 W). Each number comes from the runners in `tools/ref/` under the quiet-machine
+protocol ([conditions](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#num3090)); one-request rows, the A6000's own rows, the measured history and the other
+engines' rows live on [rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md).
 
-Today's defaults:
+**One RTX 3090 24 GB**
 
-| Model | Decode | Prompt | Recorded |
+| Model | Where it runs | Two requests, tok/s in total | Prompt tok/s (P = 512) |
 |---|---|---|---|
-| V4.1-Flash `Q3_K_M`, A6000 + CPU | 44.0 after P = 512, 36.77 after 4096 | 191.97 (P = 512), 376.67 (P = 4096) | [10-06](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots), [09-30](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#callstream-pp-a) |
-| V4.1-Flash, A6000 + 3090 (`--place bp`) | 44.28 / 37.45 | 205.48 / 388.93 | [09-30](https://github.com/midagedev/rig-log/blob/main/log/2026-09-30.md#callstream-pp-bp) |
-| GLM-5.3-Flash `UD-Q4_K_XL`, A6000 + CPU | 25.38 after P = 512 | 200.2 (P = 512) | [10-06](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#glmbp-ab) |
-| GLM-5.3-Flash, A6000 + 3090 (`--place bp`) | 28.67 after P = 512 | 222.3 (P = 512) | [10-06](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#glmbp-ab) |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL`, A6000 + CPU | 96.21 after P = 512, 83.54 after 4096 | 907.0 (P = 512), 1,224.1 (P = 4096) | [10-01](https://github.com/midagedev/rig-log/blob/main/log/2026-10-01.md#q38hol-ab) |
-| Qwen3.6-35B `Q4_K_M`, A6000 whole | 204.4 (depth 6), 195.8 (depth 4096) | 6,464 (P = 512), 8,311 (P = 4096) | [09-28](https://github.com/midagedev/rig-log/blob/main/log/2026-09-28.md#q36-release) |
-| Qwen3-30B `Q4_K_M`, A6000 whole | 209.23 (depth 6), 175.62 (depth 4096) | 7,827 (P = 512), 9,276 (P = 4096) | [10-06](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots), [09-27](https://github.com/midagedev/rig-log/blob/main/log/2026-09-27.md#qwen3-xeng) |
+| Qwen3-30B-A3B `Q4_K_M` | the whole model on the card | 254.0 | 6,482 |
+| Qwen3.6-35B-A3B `Q4_K_M` | the whole model on the card | 193.9 ¹ | 5,834 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | card + CPU | 60.7 | 486 |
+| GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 26.9 | 179 |
+| DeepSeek-V4.1-Flash `Q3_K_M` | card + CPU | 34.4 ² | 199 |
 
-The GLM-5.3 and Qwen3.8 rows run the MTP draft and adaptive residency, their servers' defaults; V4.1's run
-adaptive residency.
+**RTX A6000 48 GB + RTX 3090 24 GB (`--place bp`)**
 
-**Two requests at once.** `--parallel 2` with both slots busy, against one request, the same binary, A6000
-([conditions](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)):
+| Model | Two requests, tok/s in total | Prompt tok/s (P = 512) |
+|---|---|---|
+| DeepSeek-V4.1-Flash `Q3_K_M` | 55.9 | 206 |
+| GLM-5.3-Flash `UD-Q4_K_XL` | 35.3 | 223 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | — ³ | — ³ |
 
-| Model | One request | Two requests, in total | |
-|---|---|---|---|
-| Qwen3-30B `Q4_K_M`, whole card, depth 6 | 209.23 | 282.22 | ×1.35 |
-| Qwen3-30B, depth 4096 | 175.62 | 232.18 | ×1.32 |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL`, after P = 512, MTP draft off | 61.22 | 82.70 | ×1.35 |
-| V4.1-Flash `Q3_K_M`, after P = 512 | 44.0 | 55.0 | ×1.25 |
-| GLM-5.3-Flash `UD-Q4_K_XL`, residency on, MTP draft off, depth 6 | 25.52 | 34.90 | ×1.37 |
+- Qwen3.8 and GLM-5.3 ran with the MTP draft off and adaptive residency on.
+- ¹ Qwen3.6 runs two requests in turn today, so its total is one request's rate.
+- ² A fixed placement with adaptive residency off: a server with the 3090 alone turns residency on, which this row
+  does not count yet.
+- ³ On two cards Qwen3.8 runs one-row steps only: two requests take turns and the prompt runs a position at a time.
+  Batched passes over the second card are in progress.
 
-Each of the two requests runs at 0.62–0.68× its speed alone, so one user waits longer and the machine serves more.
+Each of two requests runs at 0.62–0.68× its speed alone, so one user waits longer and the machine serves more
+([A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)).
 
 A first start compiles the GPU code for the card (tens of seconds); later starts take seconds. A warm V4.1
 load takes about 16 s.
