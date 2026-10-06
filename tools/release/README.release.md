@@ -70,7 +70,7 @@ Every generative seat takes `--parallel N` (two by default): the slots are resid
 
 `--place` picks the cards for the models with CPU experts: `a` runs the model on the visible card with the most memory,
 `bp` adds the next card as an expert tier, and `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` makes it `nvidia-smi`'s numbering). The single-card models run on
-device 0; set `CUDA_VISIBLE_DEVICES` to pick another.
+the visible card with the most memory; set `CUDA_VISIBLE_DEVICES` to pick another.
 
 ## Licence
 
