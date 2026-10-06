@@ -119,6 +119,31 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### The 0.2.2 cut (10-06, line1 — the user: simple fixes plus Qwen3.8's two-card passes, then release)
+
+What the cut holds. Each item lands through its owning gates; one union batch and one A/B run at the freeze.
+- **q38tier (line1):** Qwen3.8's pass and ubatch walk serve the expert tier card.
+  - Today `body38.rs:3957-3961` refuses several slots on a `bp` load, and `:15-30` feeds a `bp` prompt by steps.
+  - Design round running; the implementation rounds follow it.
+  - A/B: two-slot aggregate and pp512/pp4096 on A6000 + 3090 against today's step-fed rows.
+- **q3ilv (line2):** Qwen3.6's busy slots as one pass (q36rows, q35gen, q3ilv; three commits on b83f1269). It is
+  landing-ready; ptx-scan equals base. After it lands, re-time the 3090 two-request row (README footnote ¹).
+- **slotpoison, qualmig (line2):** state pending.
+- **glmresdiag (line3):** GLM's residency diagnosis flags and one residency clause owner across V4.1, GLM and Qwen3.8
+  (gate code). Landing after its four-key rerun.
+- **glmbpdef (line3):** the GLM seat's unset `--place` becomes `bp` when a second card is visible and the plan has room.
+  glmbp-ab +13.0 % ± 2.8 decode, +11.1 % ± 0.5 pp512, inside the card's band; its decide-in moves the default.
+- **iqhost (line1):** IQ4_NL / IQ4_XS host dots, 0 ULP against ik on real rows. gate-qdot is green. qdot-rate lease
+  pending.
+- **num3090run (line1, tools):** the runners time `--place a` on a lone 3090 (the server's own plan and residency), and
+  Qwen3.8's load line names its cards. Then re-sit V4.1 3090, Qwen3.8 bp and Qwen3.6 two-request rows for the README
+  (rig-log 10-06#num3090).
+
+Outside the cut:
+- iqsel, iqgemm, q6khead (i-quant card experts) stay on their own track.
+- The vision rounds (visinj, visserve).
+- GLM bp two-request 35.26 sits below its card's 36..43 band; the cause is not determined.
+
 ### The 0.2.1 cut (10-05 night → 10-06, line1 — the hold below is lifted: 0.2.1 waited for multistream on every family)
 
 **In the train** (on main `6bcb1168`, version `c7eb555e`): every generative seat's slots are resident sequences
