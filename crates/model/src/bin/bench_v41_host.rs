@@ -111,6 +111,15 @@
 //! run. The call is timed whole, as one `union5` dispatch entry whose bytes
 //! are the layer's distinct experts.
 //!
+//! The `unioncard` shape is the `union5` pass over qdot's card-rule kernels
+//! — the card engine's own rule (q8_1 per 128 values, the Q3_K/Q4_K lane
+//! walks and the warp tree, the SwiGLU through `v_expf`) on the host, so a
+//! routed expert's contribution holds the same bits whichever tier computes
+//! it: x quantized once per column, each distinct expert's gate·up and down
+//! as m-column walks, the h quantizer, the plain combine. Its `--check`
+//! holds every row's output equal to the one-column card-rule calls, bit
+//! for bit; E1 times it beside `union5` at m = 1, 8 and 16.
+//!
 //! The `union` shape is the same pass in the chunked flow the host tier ran
 //! before (see [`union_chunks_call`]): the distinct experts in chunks of
 //! [`UNION_CHUNK`], a gate/up and a down group dispatch per chunk
@@ -201,6 +210,10 @@ const R8_CHECK_ARMS: &str = "union5:4x8u0.125,unionr8:4x8u0.125,unionq:4x8u0.125
 /// The arms a `qwen4exp` file's `--check` runs the pre-timing arm check for:
 /// [`R8_CHECK_ARMS`]' `union5` arms (its gates and ups are not Q3_K).
 const Q38_CHECK_ARMS: &str = "union5:4x8u0.125,union5:4x16u0.0625";
+/// The `unioncard` arms a plain `--check` runs on the checked layers: the
+/// card-rule pass at one, eight and sixteen columns an expert — the `m`
+/// points the host-union row's `t(m) = max(W, a + c·m)` was fit from.
+const CARD_CHECK_ARMS: &str = "unioncard:4,unioncard:4x8u0.125,unioncard:4x16u0.0625";
 /// The `(rows, n_host, distinct)` tokens the `unionr8` check runs on every
 /// checked layer: columns per expert 1–2, 3, 3–4 over three chunks, 6, 7–8,
 /// 8, 10 (a run of 8 and one of 2) and 16 (two runs of 8).
@@ -221,11 +234,12 @@ const ENGINE_DISPATCHES: usize = 2;
 const USAGE: &str = "usage: bench_v41_host --check [--arms A,B,...]
        bench_v41_host --time [--rounds N] [--seconds S] [--warmup W] [--arms A,B,...]
        bench_v41_host --time ... [--union R]
-  an arm is <engine|engine-sep|union|union5|unionr8|unionq|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]][b<B>]; the default is engine:6,engine:5,engine:3,per-matrix:6
+  an arm is <engine|engine-sep|union|union5|unionr8|unionq|unioncard|per-matrix|read-mmap|read-thp>:<n_host>[x<rows>[u<r>]][b<B>]; the default is engine:6,engine:5,engine:3,per-matrix:6
   union: one union call per layer over the rows in the chunked flow (rows <= 512, n_host <= 8)
   union5: the engine's union call, five pool dispatches a layer (same bounds)
   unionr8: the union call with gate and up through the row-lane Q3_K tile (same bounds)
   unionq: the unionr8 call with the union call's column tile (its control: same dispatch)
+  unioncard: the union5 pass over qdot's card-rule kernels (the card's own bits; same bounds)
   u<r> (or --union R for every multi-row arm without its own): the rows share experts, the layer's distinct experts
   are round(r x n_host x rows), 1/rows <= r <= 1
   b<B> (unionr8 and unionq only): the gate/up dispatch hands out B units a claim, default 1
@@ -673,6 +687,8 @@ struct Blocks {
     union: Option<UnionBlocks>,
     /// The `unionr8` shape's, `None` for the others.
     r8: Option<R8Blocks>,
+    /// The `unioncard` shape's, `None` for the others.
+    card: Option<CardBlocks>,
 }
 
 /// The rows' activation blocks of a union shape: block `o` holds the `rows`
@@ -716,6 +732,72 @@ impl UnionBlocks {
     }
 }
 
+/// A raw pointer the pool's Sync closures can carry: each dispatch's chunks
+/// partition the buffer's index space, one owner an index (the ops.rs pool
+/// pattern), and the join publishes the writes.
+struct ChunkPtr<T>(*mut T);
+// SAFETY: the pointer is shared between a dispatch's closures only, which
+// the pool runs over disjoint index chunks; the join before the next read
+// publishes every write.
+unsafe impl<T> Send for ChunkPtr<T> {}
+// SAFETY: as `Send` — no closure reads an index another chunk writes.
+unsafe impl<T> Sync for ChunkPtr<T> {}
+impl<T: Copy> ChunkPtr<T> {
+    fn write(&self, i: usize, v: T) {
+        // SAFETY: this closure's pool chunk owns index `i` — the chunks
+        // partition the index space and the join publishes the writes.
+        unsafe {
+            *self.0.add(i) = v;
+        }
+    }
+
+    fn read(&self, i: usize) -> T {
+        // SAFETY: as `write` — the index is this chunk's, and the joins
+        // before this dispatch published every write it reads.
+        unsafe { *self.0.add(i) }
+    }
+}
+
+impl<T> ChunkPtr<T> {
+    /// `f` on element `i`, which this closure's pool chunk owns.
+    fn with_mut<R>(&self, i: usize, f: impl FnOnce(&mut T) -> R) -> R {
+        // SAFETY: as `write` — the chunks partition the index space, so no
+        // other closure touches element `i` while `f` holds it.
+        f(unsafe { &mut *self.0.add(i) })
+    }
+}
+
+/// The `unioncard` shape's blocks, made before the round's first token: the
+/// rows' activation blocks and the pass's buffers — x's q8_1 form (one a
+/// column, refilled every call), each slot's h and its q8_1 form, the
+/// downs, the output. The pass itself owns no allocation.
+struct CardBlocks {
+    xs: Vec<Tensor2>,
+    xcols: Vec<qdot::CardQ81>,
+    hbuf: Vec<f32>,
+    hcols: Vec<qdot::CardQ81>,
+    downbuf: Vec<f32>,
+    out: Vec<f32>,
+    /// Whether the pass has said it skips a layer yet (its down is not
+    /// q4_K — the card rule covers q4_K downs only, this round).
+    skip_said: bool,
+}
+
+impl CardBlocks {
+    fn new(xs: &[Tensor2], rows: usize, embd: usize, ff: usize, n_used: usize) -> CardBlocks {
+        let slots = rows * n_used;
+        CardBlocks {
+            xs: union_xs(xs, rows, embd),
+            xcols: (0..rows).map(|_| qdot::CardQ81::for_k(embd)).collect(),
+            hbuf: vec![0.0; slots * ff],
+            hcols: (0..slots).map(|_| qdot::CardQ81::for_k(ff)).collect(),
+            downbuf: vec![0.0; slots * embd],
+            out: vec![0.0; embd * rows],
+            skip_said: false,
+        }
+    }
+}
+
 impl Blocks {
     /// Blocks for `slots` experts of `layers`, whose matrices must all have
     /// the first layer's row counts.
@@ -734,6 +816,7 @@ impl Blocks {
             chunks: None,
             union: None,
             r8: None,
+            card: None,
         })
     }
 }
@@ -783,6 +866,183 @@ fn union5_layer(
         &mut u.scratch,
     )?;
     tally.add("union5", distinct as u64 * l.expert_bytes(), t0);
+    Ok(())
+}
+
+/// The `unioncard` shape: the `union5` pass over qdot's card-rule kernels —
+/// the card engine's own bits, on the host. Five pool dispatches a layer:
+/// x quantized once per column (q8_1 per 128 values), every distinct
+/// expert's gate·up rows over the columns that list it (one m-column card
+/// walk a row, SwiGLU inline), each slot's h quantized, every distinct
+/// expert's down rows over its slots' h columns, then each row's weighted
+/// sum in its list order from zero — the union call's combine. Each
+/// column's every value is the one-column kernels' bit for bit. Tallied
+/// whole, under the bytes of the layer's distinct experts.
+fn unioncard_layer(
+    l: &Layer<'_>,
+    slots: &[usize],
+    n_host: usize,
+    c: &mut CardBlocks,
+    x: usize,
+    tally: &mut Tally,
+) -> Result<(), BenchError> {
+    let rows = slots.len() / n_host;
+    let (embd, ff) = (c.xs[0].ne0, c.hbuf.len() / (rows * n_host));
+    if l.stacks[GATE].info.ty != GgmlType::Q3_K || l.stacks[UP].info.ty != GgmlType::Q3_K {
+        return Err(format!(
+            "the unioncard shape takes q3_K gates and ups; layer {}'s are {:?} and {:?}",
+            l.index, l.stacks[GATE].info.ty, l.stacks[UP].info.ty
+        )
+        .into());
+    }
+    if l.stacks[DOWN].info.ty != GgmlType::Q4_K {
+        // The card rule this round covers the q4_K down; a q5_K down layer
+        // (V4.1's first two) is the host tier's in every plan and has no
+        // card path to mirror. Said once; the pass skips the layer.
+        if !c.skip_said {
+            println!(
+                "unioncard: layers whose down is not q4_K (layer {} is {}) are skipped — no card rule this round",
+                l.index, l.stacks[DOWN].info.ty
+            );
+            c.skip_said = true;
+        }
+        return Ok(());
+    }
+    // The pass's plan: the distinct experts in first-appearance order, each
+    // with its slots (row, list position).
+    let mut plan: Vec<(usize, Vec<(usize, usize)>)> = Vec::new();
+    for row in 0..rows {
+        for j in 0..n_host {
+            let s = slots[row * n_host + j];
+            match plan.iter_mut().find(|(e, _)| *e == s) {
+                Some((_, es)) => es.push((row, j)),
+                None => plan.push((s, vec![(row, j)])),
+            }
+        }
+    }
+    let w = 1.0 / n_host as f32;
+    let m = plan.iter().map(|(_, es)| es.len()).max().unwrap_or(1);
+    let t0 = Instant::now();
+    // x quantized once per column, each form its chunk's own.
+    let CardBlocks {
+        xs,
+        xcols,
+        hbuf,
+        hcols,
+        downbuf,
+        out,
+        skip_said: _,
+    } = c;
+    {
+        let forms = ChunkPtr(xcols.as_mut_ptr());
+        let x = &xs[x];
+        threads::pool().for_each_chunk(rows, |range| {
+            for r in range {
+                forms.with_mut(r, |f| {
+                    qdot::card_q8_1_fill(&x.data[r * embd..(r + 1) * embd], f);
+                });
+            }
+        });
+    }
+    // Gate·up·SwiGLU: one dispatch over every distinct expert's rows, each
+    // row's m-column walk over the x forms of the rows that list it. The
+    // SwiGLU limit is 0, the union shapes' own (their layers clamp nothing).
+    {
+        let xcols = &*xcols;
+        let hbuf = ChunkPtr(hbuf.as_mut_ptr());
+        /// One distinct expert's walk inputs: its gate and up stacks and the
+        /// slots (row, list position) that list it.
+        type ExpertWalk<'a> = (&'a [u8], &'a [u8], &'a [(usize, usize)]);
+        let gates: Vec<ExpertWalk<'_>> = plan
+            .iter()
+            .map(|(s, es)| {
+                let g = l.weight(*s, GATE);
+                let u = l.weight(*s, UP);
+
+                (g.bytes(), u.bytes(), es.as_slice())
+            })
+            .collect();
+        let rb = gates.first().ok_or("unioncard: no experts")?.0.len() / ff;
+        threads::pool().for_each_chunk(plan.len() * ff, |range| {
+            let (mut gu, mut up) = (vec![0.0f32; m], vec![0.0f32; m]);
+            let mut cols: Vec<&qdot::CardQ81> = Vec::with_capacity(m);
+            for r in range {
+                let (gb, ub, es) = &gates[r / ff];
+                cols.clear();
+                for &(row, _) in es.iter() {
+                    cols.push(&xcols[row]);
+                }
+                qdot::card_q3k_dot_row_cols(&gb[r % ff * rb..][..rb], &cols, &mut gu[..es.len()])
+                    .unwrap();
+                qdot::card_q3k_dot_row_cols(&ub[r % ff * rb..][..rb], &cols, &mut up[..es.len()])
+                    .unwrap();
+                for (j, &(row, lj)) in es.iter().enumerate() {
+                    hbuf.write(
+                        (row * n_host + lj) * ff + r % ff,
+                        qdot::card_swiglu_clamp_1(gu[j], up[j], 0.0),
+                    );
+                }
+            }
+        });
+    }
+    // Each slot's h quantized, each form its chunk's own.
+    {
+        let hbuf = &*hbuf;
+        let forms = ChunkPtr(hcols.as_mut_ptr());
+        threads::pool().for_each_chunk(rows * n_host, |range| {
+            for s in range {
+                forms.with_mut(s, |f| qdot::card_q8_1_fill(&hbuf[s * ff..(s + 1) * ff], f));
+            }
+        });
+    }
+    // The downs: one dispatch over every distinct expert's down rows.
+    {
+        let hcols = &*hcols;
+        let downbuf = ChunkPtr(downbuf.as_mut_ptr());
+        /// One distinct expert's down inputs: its stack and its slots.
+        type ExpertDown<'a> = (&'a [u8], &'a [(usize, usize)]);
+        let downs: Vec<ExpertDown<'_>> = plan
+            .iter()
+            .map(|(s, es)| (l.weight(*s, DOWN).bytes(), es.as_slice()))
+            .collect();
+        let rb = downs.first().ok_or("unioncard: no experts")?.0.len() / embd;
+        threads::pool().for_each_chunk(plan.len() * embd, |range| {
+            let mut dv = vec![0.0f32; m];
+            let mut cols: Vec<&qdot::CardQ81> = Vec::with_capacity(m);
+            for r in range {
+                let (db, es) = &downs[r / embd];
+                cols.clear();
+                for &(row, lj) in es.iter() {
+                    cols.push(&hcols[row * n_host + lj]);
+                }
+                qdot::card_q4k_dot_row_cols(&db[r % embd * rb..][..rb], &cols, &mut dv[..es.len()])
+                    .unwrap();
+                for (j, &(row, lj)) in es.iter().enumerate() {
+                    downbuf.write((row * n_host + lj) * embd + r % embd, dv[j]);
+                }
+            }
+        });
+    }
+    // Each row's weighted sum, its list order from zero (the union call's
+    // combine: a multiply and an add, in that order).
+    {
+        let (downbuf, out) = (&*downbuf, ChunkPtr(out.as_mut_ptr()));
+        threads::pool().for_each_chunk(rows, |range| {
+            for row in range {
+                for i in 0..embd {
+                    out.write(row * embd + i, 0.0);
+                }
+                for j in 0..n_host {
+                    let dv = &downbuf[(row * n_host + j) * embd..(row * n_host + j + 1) * embd];
+                    for (i, &v) in dv.iter().enumerate() {
+                        let at = row * embd + i;
+                        out.write(at, out.read(at) + w * v);
+                    }
+                }
+            }
+        });
+    }
+    tally.add("unioncard", plan.len() as u64 * l.expert_bytes(), t0);
     Ok(())
 }
 
@@ -3045,6 +3305,104 @@ fn check_r8_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<()
     Ok(())
 }
 
+/// Before any timing (every layer), and under `--check` (the checked
+/// layers, or every layer for `--arms`): one token of every `unioncard` arm
+/// through its shape, layer by layer over `layers`, against the one-column
+/// card-rule calls — each row's output the list-order sum from zero of
+/// `w · down(h(gate·up·SwiGLU))` its list names, every expert computed one
+/// column at a time, bit for bit. A mismatch is the named error.
+fn check_card_arms(bench: &Bench<'_>, arms: &[Arm], layers: &[usize]) -> Result<(), BenchError> {
+    let embd = bench.xs.first().ok_or("no activation columns")?.ne0;
+    for arm in arms.iter().filter(|a| matches!(a.shape, Shape::UnionCard)) {
+        let ids = bench.draw(*arm, 0, 0);
+        let mut differ = Vec::new();
+        let mut skipped = 0usize;
+        for &l in layers {
+            let layer = &bench.layers[l];
+            if layer.stacks[DOWN].info.ty != GgmlType::Q4_K {
+                skipped += 1;
+                continue;
+            }
+            let ff = layer.weight(0, GATE).n();
+            let x = l % N_X;
+            let mut tally = Tally::default();
+            let mut c = CardBlocks::new(&bench.xs, arm.rows, embd, ff, arm.n_host);
+            unioncard_layer(layer, &ids[l], arm.n_host, &mut c, x, &mut tally)?;
+            // The reference: one column at a time, on the pool.
+            let n = arm.rows * arm.n_host;
+            let mut downs = vec![0.0f32; n * embd];
+            {
+                let slots = &ids[l];
+                let downs = std::sync::Mutex::new(&mut downs);
+                threads::pool().for_each_chunk(n, |range| {
+                    for s in range {
+                        let row = s / arm.n_host;
+                        let wslot = slots[s];
+                        let xcol = qdot::card_q8_1(&bench.xs[(x + row) % N_X].data);
+                        let (rb_gu, rb_d) = (
+                            layer.weight(wslot, GATE).bytes().len() / ff,
+                            layer.weight(wslot, DOWN).bytes().len() / embd,
+                        );
+                        let (gb, ub, db) = (
+                            layer.weight(wslot, GATE).bytes(),
+                            layer.weight(wslot, UP).bytes(),
+                            layer.weight(wslot, DOWN).bytes(),
+                        );
+
+                        let mut hcol = vec![0.0f32; ff];
+                        for r in 0..ff {
+                            let g =
+                                qdot::card_q3k_dot_row(&gb[r * rb_gu..][..rb_gu], &xcol).unwrap();
+                            let u =
+                                qdot::card_q3k_dot_row(&ub[r * rb_gu..][..rb_gu], &xcol).unwrap();
+                            hcol[r] = qdot::card_swiglu_clamp_1(g, u, 0.0);
+                        }
+                        let hq = qdot::card_q8_1(&hcol);
+                        let mut out = downs.lock().unwrap();
+                        for r in 0..embd {
+                            out[s * embd + r] =
+                                qdot::card_q4k_dot_row(&db[r * rb_d..][..rb_d], &hq).unwrap();
+                        }
+                    }
+                });
+            }
+            let w = 1.0 / arm.n_host as f32;
+            let mut ok = true;
+            for row in 0..arm.rows {
+                let mut want = vec![0.0f32; embd];
+                for j in 0..arm.n_host {
+                    let dv = &downs[(row * arm.n_host + j) * embd..][..embd];
+                    for (o, &v) in want.iter_mut().zip(dv) {
+                        *o += w * v;
+                    }
+                }
+                ok &= bits_equal(&c.out[row * embd..(row + 1) * embd], &want);
+            }
+            if !ok {
+                differ.push(layer.index);
+            }
+        }
+        let (lo, hi) = drawn_cols(&ids, layers);
+        println!(
+            "check arm={} layers={} skipped_non_q4k_down={skipped} distinct={} \
+             cols_per_expert={:.2} cols_drawn={lo}..{hi} outputs_bits_equal_one_column={}",
+            arm.label(),
+            layers.len() - skipped,
+            arm.union,
+            arm.cols_per_expert(),
+            differ.is_empty()
+        );
+        if !differ.is_empty() {
+            return Err(format!(
+                "arm {}: its output differs from the one-column card-rule calls on layers {differ:?}",
+                arm.label()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// The layers the check covers: 0, 1, 2, the last and every layer whose
 /// stacks span more than one shard; for a `qwen4exp` file also the first
 /// layer of every routed type triple (gate, up, down) those lack.
@@ -3136,6 +3494,11 @@ enum Shape {
     /// The `unionr8` call with the column tile on the file's rows: its
     /// dispatch, the union shape's kernel.
     UnionQ,
+    /// The `union5` pass over qdot's card-rule kernels (the card's own
+    /// bits on the host): x quantized once per column, each distinct
+    /// expert's gate·up·SwiGLU, the h quantizer, its down, the weighted
+    /// sums — five pool dispatches a layer.
+    UnionCard,
     /// One dispatch per expert matrix.
     PerMatrix,
     /// The engine shape's dispatches reading the file mapping, no kernel.
@@ -3145,13 +3508,14 @@ enum Shape {
 }
 
 impl Shape {
-    const ALL: [Shape; 9] = [
+    const ALL: [Shape; 10] = [
         Shape::Engine,
         Shape::EngineSep,
         Shape::Union,
         Shape::Union5,
         Shape::UnionR8,
         Shape::UnionQ,
+        Shape::UnionCard,
         Shape::PerMatrix,
         Shape::ReadMmap,
         Shape::ReadThp,
@@ -3165,6 +3529,7 @@ impl Shape {
             Shape::Union5 => "union5",
             Shape::UnionR8 => "unionr8",
             Shape::UnionQ => "unionq",
+            Shape::UnionCard => "unioncard",
             Shape::PerMatrix => "per-matrix",
             Shape::ReadMmap => "read-mmap",
             Shape::ReadThp => "read-thp",
@@ -3180,7 +3545,7 @@ impl Shape {
     fn is_union(self) -> bool {
         matches!(
             self,
-            Shape::Union | Shape::Union5 | Shape::UnionR8 | Shape::UnionQ
+            Shape::Union | Shape::Union5 | Shape::UnionR8 | Shape::UnionQ | Shape::UnionCard
         )
     }
 
@@ -3336,8 +3701,16 @@ impl Arm {
     fn union_bytes_per_token(self, layers: &[Layer<'_>]) -> u64 {
         layers
             .iter()
+            .filter(|l| self.runs(l))
             .map(|l| self.union as u64 * l.expert_bytes())
             .sum()
+    }
+
+    /// Whether this arm's pass runs layer `l`: every arm runs every layer
+    /// but `unioncard`, which runs the q4_K-down layers only (the card rule's
+    /// down) — its per-token sums cover those layers alone.
+    fn runs(self, l: &Layer<'_>) -> bool {
+        !matches!(self.shape, Shape::UnionCard) || l.stacks[DOWN].info.ty == GgmlType::Q4_K
     }
 
     /// Pool dispatches one token of this arm issues, by construction — for
@@ -3349,6 +3722,7 @@ impl Arm {
             Shape::EngineSep => ENGINE_DISPATCHES * self.rows * layers.len(),
             Shape::Union5 if self.rows > DEFER_MAX_COLS => 5 * layers.len(),
             Shape::Union5 => ENGINE_DISPATCHES * layers.len(),
+            Shape::UnionCard => 5 * layers.iter().filter(|l| self.runs(l)).count(),
             Shape::Union | Shape::UnionR8 | Shape::UnionQ => {
                 ENGINE_DISPATCHES * self.union.div_ceil(UNION_CHUNK) * layers.len()
             }
@@ -3532,6 +3906,11 @@ impl Bench<'_> {
                         host, self.split, layer, slots, arm.n_host, arm.union, u, x, tally,
                     )?;
                 }
+                Shape::UnionCard => {
+                    let c = b.card.as_mut().ok_or("unioncard arm without its blocks")?;
+                    let x = (t + l) % N_X;
+                    unioncard_layer(layer, slots, arm.n_host, c, x, tally)?;
+                }
                 Shape::UnionR8 | Shape::UnionQ => {
                     let u = b.r8.as_mut().ok_or("unionr8 arm without its blocks")?;
                     let host = self.hosts.get(l).ok_or("unionr8 arm without host layers")?;
@@ -3569,6 +3948,9 @@ impl Bench<'_> {
                 Shape::Union5 => {
                     blocks.union =
                         Some(UnionBlocks::new(&self.xs, arm.rows, embd, ff, self.n_used)?);
+                }
+                Shape::UnionCard => {
+                    blocks.card = Some(CardBlocks::new(&self.xs, arm.rows, embd, ff, arm.n_host));
                 }
                 // `unionr8` and `unionq` share the blocks.
                 _ => {
@@ -3908,12 +4290,26 @@ fn run(mode: Mode) -> Result<(), BenchError> {
                 .split(',')
                 .map(|a| Arm::parse(a, None))
                 .collect::<Result<Vec<_>, _>>()?;
-            check_r8_arms(&bench, &arms, &covered_layers(&bench.layers, &family))
+            check_r8_arms(&bench, &arms, &covered_layers(&bench.layers, &family))?;
+            let card_arms = CARD_CHECK_ARMS
+                .split(',')
+                .map(|a| Arm::parse(a, None))
+                .collect::<Result<Vec<_>, _>>()?;
+            if matches!(family, Family::Discovered) {
+                check_card_arms(&bench, &card_arms, &covered_layers(&bench.layers, &family))
+            } else {
+                println!(
+                    "check unioncard arms skipped: {CARD_CHECK_ARMS} take q3_K gates and ups, \
+                     this file's routed stacks are not them"
+                );
+                Ok(())
+            }
         }
         Mode::Check(arms) => {
             check(&bench, meta.n_used, true)?;
             let every: Vec<usize> = (0..bench.layers.len()).collect();
-            check_r8_arms(&bench, &arms, &every)
+            check_r8_arms(&bench, &arms, &every)?;
+            check_card_arms(&bench, &arms, &every)
         }
         Mode::Time(opts) => {
             let lease = std::env::var("BLOOMERY_HOST_LEASE").is_ok_and(|v| v == "1");
@@ -3925,6 +4321,7 @@ fn run(mode: Mode) -> Result<(), BenchError> {
             check(&bench, meta.n_used, false)?;
             let every: Vec<usize> = (0..bench.layers.len()).collect();
             check_r8_arms(&bench, &opts.arms, &every)?;
+            check_card_arms(&bench, &opts.arms, &every)?;
             time(&bench, &opts, lease)
         }
     }

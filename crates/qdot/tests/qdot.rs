@@ -4920,3 +4920,449 @@ fn hw_lanes_refuse_bad_shapes() {
         "{e}"
     );
 }
+
+// ------------------------------------------------ V4.1 card-rule kernels
+//
+// The pure gates of the card-rule kernels (q8_1, the Q3_K/Q4_K dots, the
+// SwiGLU): AVX2 against the scalar mirror bit for bit on random and edge
+// inputs, and every m-column call against its columns' one-column calls.
+// The bits the card itself produces are the box gate's to check
+// (gate_deepseek41_moe's `cardrule` site).
+
+/// The deterministic generator the card-rule gates draw from.
+struct CardRng(u64);
+
+impl CardRng {
+    fn new(seed: u64) -> CardRng {
+        CardRng(seed | 1)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    /// A finite f32 in `[-span, span]`, every 61st scaled up so a block's
+    /// amax is not always near the span.
+    fn value(&mut self, span: f32) -> f32 {
+        let u = (self.next_u64() >> 40) as f32 / 8_388_608.0 - 1.0;
+        if self.next_u64().is_multiple_of(61) {
+            u * 8.0 * span
+        } else {
+            u * span
+        }
+    }
+
+    fn byte(&mut self) -> u8 {
+        (self.next_u64() >> 56) as u8
+    }
+}
+
+/// A random finite f16 bit pattern with a small exponent (a super-block
+/// scale a real row carries).
+fn small_f16(rng: &mut CardRng) -> u16 {
+    let e = 12 + rng.next_u64() % 8; // 2^-15 .. 2^-8 times the mantissa
+    ((e as u16) << 10) | (rng.next_u64() as u16 & 0x3ff)
+}
+
+/// A random Q3_K weight row of `n_sb` super-blocks with finite scales.
+fn card_q3k_row(rng: &mut CardRng, n_sb: usize) -> Vec<u8> {
+    let mut row = vec![0u8; 110 * n_sb];
+    for sb in &mut row.chunks_mut(110) {
+        for b in sb.iter_mut() {
+            *b = rng.byte();
+        }
+        let d = small_f16(rng);
+        sb[108] = d as u8;
+        sb[109] = (d >> 8) as u8;
+    }
+    row
+}
+
+/// A random Q4_K weight row of `n_sb` super-blocks with finite scales.
+fn card_q4k_row(rng: &mut CardRng, n_sb: usize) -> Vec<u8> {
+    let mut row = vec![0u8; 144 * n_sb];
+    for sb in &mut row.chunks_mut(144) {
+        for b in sb.iter_mut() {
+            *b = rng.byte();
+        }
+        let (d, dmin) = (small_f16(rng), small_f16(rng));
+        sb[0] = d as u8;
+        sb[1] = (d >> 8) as u8;
+        sb[2] = dmin as u8;
+        sb[3] = (dmin >> 8) as u8;
+    }
+    row
+}
+
+/// A random activation column of `n_sb` super-blocks (256 values each).
+fn card_act_col(rng: &mut CardRng, n_sb: usize) -> Vec<f32> {
+    (0..256 * n_sb).map(|_| rng.value(2.0)).collect()
+}
+
+fn card_bits_named(a: f32, b: f32, what: &str) {
+    assert_eq!(
+        a.to_bits(),
+        b.to_bits(),
+        "card kernel bits differ ({what}): {a:?} ({:#x}) vs {b:?} ({:#x})",
+        a.to_bits(),
+        b.to_bits()
+    );
+}
+
+/// One column's q8_1 forms by both bodies, held equal field by field.
+fn card_q8_1_both(col: &[f32], what: &str) -> qdot::CardQ81 {
+    let (avx, scal) = (qdot::card_q8_1(col), qdot::card_q8_1_scalar(col));
+    let diff: Vec<String> = avx
+        .codes()
+        .iter()
+        .zip(scal.codes())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .take(12)
+        .map(|(i, (a, b))| format!("{i}: {a}!={b} (x={:?})", col[i]))
+        .collect();
+    assert!(diff.is_empty(), "{what}: codes differ: {}", diff.join(", "));
+    assert_eq!(avx.s8(), scal.s8(), "{what}: sums differ");
+    assert_eq!(avx.refused(), scal.refused(), "{what}: refusals differ");
+    for (b, (a, s)) in avx.d8().iter().zip(scal.d8()).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            s.to_bits(),
+            "{what}: block {b}'s scale differs"
+        );
+    }
+    avx
+}
+
+#[test]
+#[ignore = "hw: needs the box's AVX2 (card_q8_1's vector body)"]
+fn hw_card_q8_1_scalar_matches_avx2_and_edges() {
+    let mut rng = CardRng::new(0xC0DE_41A1);
+    // Ties: every block holds 127 (scale exactly 1) and the values ±(j +
+    // 0.5), ±j and ±(j + 0.25) for j = 0..42 — a half-even rounding moves
+    // every even j's tie down by one.
+    let mut ties = vec![0.0f32; 512];
+    for (i, v) in ties.iter_mut().enumerate() {
+        let j = i % 128;
+        let sign = if (i / 128) % 2 == 0 { 1.0 } else { -1.0 };
+        *v = match j {
+            0 => 127.0,
+            _ => {
+                let m = ((j - 1) / 3) as f32;
+                sign * [m + 0.5, m, m + 0.25][(j - 1) % 3]
+            }
+        };
+    }
+    let q = card_q8_1_both(&ties, "ties");
+    for (i, (&v, &c)) in ties.iter().zip(q.codes()).enumerate() {
+        let want = (v.abs() + 0.5).floor().min(127.0) * v.signum();
+        assert_eq!(c as f32, want, "value {i} = {v} rounds half away from zero");
+    }
+    // Edges around ties at every code magnitude (scale 1), the clamp, and
+    // the near-tie neighbours a half-even or truncating body misplaces.
+    let mut near = vec![0.0f32; 1024];
+    near[0] = 127.0;
+    let mut i = 1;
+    for m in 0..=126i32 {
+        for frac in [0.5f32, 0.49999997, 0.50000006] {
+            if i + 1 < near.len() {
+                near[i] = m as f32 + frac;
+                near[i + 1] = -(m as f32 + frac);
+                i += 2;
+            }
+        }
+    }
+    for b in 1..near.len() / 128 {
+        near[128 * b] = 127.0;
+    }
+    card_q8_1_both(&near, "near ties");
+    // An all-zero block (scale 1, codes 0), a block whose scale is
+    // subnormal, and one whose scale underflows to 0: |v|/0 is inf (code
+    // ±127) and 0/0 NaN (code 0), as the card's saturating convert gives.
+    let mut tiny = vec![0.0f32; 512];
+    for (j, v) in tiny[128..256].iter_mut().enumerate() {
+        *v = (j as f32 - 64.0) * 1e-40;
+    }
+    tiny[256] = f32::from_bits(1);
+    tiny[257] = -f32::from_bits(1);
+    tiny[384] = f32::MIN_POSITIVE;
+    tiny[385] = -f32::MIN_POSITIVE / 3.0;
+    let q = card_q8_1_both(&tiny, "tiny");
+    assert_eq!(q.d8()[0].to_bits(), 1.0f32.to_bits());
+    assert!(q.codes()[..128].iter().all(|&c| c == 0));
+    assert_eq!(
+        q.d8()[2].to_bits(),
+        0.0f32.to_bits(),
+        "the underflowed scale"
+    );
+    assert_eq!(
+        (q.codes()[256], q.codes()[257], q.codes()[258]),
+        (127, -127, 0)
+    );
+    // Random columns of every shape the walks take, with an all-zero block
+    // and a non-finite block (refused: NaN scale, zero codes and sums).
+    for n_sb in [1usize, 2, 3, 9, 16] {
+        for case in 0..8 {
+            let mut col = card_act_col(&mut rng, n_sb);
+            match case % 4 {
+                1 => col[..128].fill(0.0),
+                2 => col[129] = f32::NAN,
+                3 => *col.last_mut().unwrap() = f32::NEG_INFINITY,
+                _ => {}
+            }
+            let q = card_q8_1_both(&col, &format!("random n_sb={n_sb} case={case}"));
+            for (b, &bad) in q.refused().iter().enumerate() {
+                let blk = &col[128 * b..128 * b + 128];
+                assert_eq!(
+                    bad,
+                    blk.iter().any(|v| !v.is_finite()),
+                    "block {b}'s refusal"
+                );
+                if bad {
+                    assert!(q.d8()[b].is_nan());
+                    assert!(q.codes()[128 * b..128 * b + 128].iter().all(|&c| c == 0));
+                    assert!(q.s8()[4 * b..4 * b + 4].iter().all(|&s| s == 0));
+                }
+            }
+            for g in 0..q.s8().len() {
+                let sum: i32 = q.codes()[32 * g..32 * g + 32]
+                    .iter()
+                    .map(|&c| c as i32)
+                    .sum();
+                assert_eq!(q.s8()[g], sum, "group {g}'s sum");
+            }
+        }
+    }
+}
+
+/// The f64 dot of a dequantized weight row against a card-q8_1 column's
+/// decoded values (`code · d8`), and the sum of the terms' magnitudes.
+fn card_dot_f64(ty: GgmlType, row: &[u8], col: &qdot::CardQ81) -> (f64, f64) {
+    let mut w = vec![0.0f32; col.k()];
+    dequant_row(ty, row, &mut w).unwrap();
+    let (mut dot, mut mag) = (0.0f64, 0.0f64);
+    for (j, &wj) in w.iter().enumerate() {
+        let a = col.codes()[j] as f64 * col.d8()[j / 128] as f64;
+        dot += wj as f64 * a;
+        mag += (wj as f64 * a).abs();
+    }
+    (dot, mag)
+}
+
+#[test]
+#[ignore = "hw: needs the box's AVX2 (the card dots' vector bodies)"]
+fn hw_card_dots_scalar_match_avx2_and_columns_match_one() {
+    let mut rng = CardRng::new(0xC0DE_41A2);
+    // Odd super-block counts run the Q3_K walk's guarded tail, counts off a
+    // multiple of four the Q4_K walk's, and 8, 9, 16 its split prefix.
+    for n_sb in [1usize, 2, 3, 5, 8, 9, 16] {
+        let q3k = card_q3k_row(&mut rng, n_sb);
+        let q4k = card_q4k_row(&mut rng, n_sb);
+        for m in [1usize, 2, 3, 8, 9, 16] {
+            let cols: Vec<qdot::CardQ81> = (0..m)
+                .map(|_| qdot::card_q8_1(&card_act_col(&mut rng, n_sb)))
+                .collect();
+            let refs: Vec<&qdot::CardQ81> = cols.iter().collect();
+            for (ty, row) in [(GgmlType::Q3_K, &q3k), (GgmlType::Q4_K, &q4k)] {
+                let mut avx = vec![0.0f32; m];
+                let mut scal = vec![0.0f32; m];
+                if ty == GgmlType::Q3_K {
+                    qdot::card_q3k_dot_row_cols(row, &refs, &mut avx).unwrap();
+                    qdot::card_q3k_dot_row_cols_scalar(row, &refs, &mut scal).unwrap();
+                } else {
+                    qdot::card_q4k_dot_row_cols(row, &refs, &mut avx).unwrap();
+                    qdot::card_q4k_dot_row_cols_scalar(row, &refs, &mut scal).unwrap();
+                }
+                for c in 0..m {
+                    let one = if ty == GgmlType::Q3_K {
+                        qdot::card_q3k_dot_row(row, &cols[c]).unwrap()
+                    } else {
+                        qdot::card_q4k_dot_row(row, &cols[c]).unwrap()
+                    };
+                    let at = format!("{ty:?} n_sb={n_sb} m={m} c={c}");
+                    card_bits_named(avx[c], one, &format!("{at}: m-column vs one-column"));
+                    card_bits_named(avx[c], scal[c], &format!("{at}: AVX2 vs scalar"));
+                    // The walk is a dot of this row: the f64 dot of its
+                    // dequantized values within f32 rounding of the terms.
+                    let (want, mag) = card_dot_f64(ty, row, &cols[c]);
+                    assert!(
+                        (avx[c] as f64 - want).abs() <= 1e-5 * mag.max(f64::MIN_POSITIVE),
+                        "{at}: {} against the f64 dot {want} (terms' magnitude {mag})",
+                        avx[c]
+                    );
+                }
+            }
+        }
+        // A refused activation block gives a NaN dot on both bodies.
+        let mut bad = card_act_col(&mut rng, n_sb);
+        bad[100] = f32::NAN;
+        let col = qdot::card_q8_1(&bad);
+        assert!(col.refused_any());
+        for v in [
+            qdot::card_q3k_dot_row(&q3k, &col).unwrap(),
+            qdot::card_q3k_dot_row_scalar(&q3k, &col).unwrap(),
+            qdot::card_q4k_dot_row(&q4k, &col).unwrap(),
+            qdot::card_q4k_dot_row_scalar(&q4k, &col).unwrap(),
+        ] {
+            assert!(v.is_nan(), "a refused block's dot is NaN");
+        }
+    }
+}
+
+#[test]
+fn card_dots_reject_bad_shapes() {
+    let mut rng = CardRng::new(7);
+    let col = qdot::card_q8_1(&card_act_col(&mut rng, 2));
+    let q3k = card_q3k_row(&mut rng, 2);
+    // A short row, and a Q3_K row handed to the Q4_K walk, are named errors
+    // on every entry point.
+    for r in [
+        qdot::card_q3k_dot_row(&q3k[..109 * 2], &col),
+        qdot::card_q3k_dot_row_scalar(&q3k[..109 * 2], &col),
+        qdot::card_q4k_dot_row(&q3k, &col),
+        qdot::card_q4k_dot_row_scalar(&q3k, &col),
+    ] {
+        assert!(matches!(r, Err(QdotError::ShortWeightRow { .. })), "{r:?}");
+    }
+    // An output slice that does not hold one value per column, and no
+    // columns at all.
+    let other = qdot::card_q8_1(&card_act_col(&mut rng, 2));
+    let mut out = [0.0f32; 2];
+    let r = qdot::card_q3k_dot_row_cols(&q3k, &[&other, &col], &mut out[..1]);
+    assert!(
+        matches!(r, Err(QdotError::TileShape { cols: 2, outs: 1 })),
+        "{r:?}"
+    );
+    let r = qdot::card_q4k_dot_row_cols_scalar(&q3k, &[], &mut out[..0]);
+    assert!(
+        matches!(r, Err(QdotError::TileShape { cols: 0, outs: 0 })),
+        "{r:?}"
+    );
+    // Columns of two lengths.
+    let short = qdot::card_q8_1(&card_act_col(&mut rng, 1));
+    let r = qdot::card_q3k_dot_row_cols(&q3k, &[&col, &short], &mut out);
+    assert!(
+        matches!(r, Err(QdotError::ShortActivationCol { .. })),
+        "{r:?}"
+    );
+    // A column that is not whole super-blocks never becomes a form.
+    let r = std::panic::catch_unwind(|| qdot::card_q8_1(&[0.5f32; 128]));
+    assert!(r.is_err());
+}
+
+#[test]
+fn expf_ik_scalar_tracks_libm() {
+    // A sanity net for the port (the bit-exact claim is the box sweep
+    // below): within 2 ulp of libm over silu's whole input range.
+    let mut x = -104.0f32;
+    while x < 104.0 {
+        let got = qdot::expf_ik_scalar(x);
+        let want = x.exp();
+        let both_inf = got.is_infinite() && want.is_infinite();
+        let ulp = (want.abs().max(f32::MIN_POSITIVE)) * 2.0f32.powi(-23);
+        assert!(
+            both_inf || (got - want).abs() <= 2.0 * ulp,
+            "expf_ik({x}) = {got} against libm {want}"
+        );
+        x += 0.03125;
+    }
+    // The escape paths: overflow to inf past 192*ln2, underflow to 0 far
+    // below, and exp(0) = 1 exactly.
+    assert_eq!(qdot::expf_ik_scalar(0.0).to_bits(), 1.0f32.to_bits());
+    assert!(qdot::expf_ik_scalar(200.0).is_infinite());
+    assert_eq!(qdot::expf_ik_scalar(-200.0).to_bits(), 0.0f32.to_bits());
+}
+
+#[test]
+#[ignore = "hw: needs the box's AVX2 (card_expf's vector body, v_expf)"]
+fn hw_v_expf_equals_expf_ik_over_f32_range() {
+    // Every f32 whose exponent field is 112..=143 — all of [2^-15, 2^17) in
+    // magnitude, both signs, 2^29 values: the polynomial path (|n| <= 126),
+    // both escape steps and the overflow to inf all inside — and every
+    // 4099th pattern of the rest, zeros, subnormals, infinities and NaNs
+    // included. The vector side is `card_expf` (the SwiGLU's `v_expf`), the
+    // scalar `expf_ik_scalar` (the device's `expf_ik`); a NaN input must give
+    // a NaN on both, every other input the same bits.
+    const BATCH: usize = 1 << 16;
+    let mut xs = Vec::with_capacity(BATCH);
+    let mut out = vec![0.0f32; BATCH];
+    let mut checked = 0u64;
+    let mut run = |xs: &mut Vec<f32>, out: &mut [f32]| {
+        qdot::card_expf(xs, &mut out[..xs.len()]);
+        for (&x, &got) in xs.iter().zip(out.iter()) {
+            let want = qdot::expf_ik_scalar(x);
+            assert!(
+                got.to_bits() == want.to_bits() || (got.is_nan() && want.is_nan()),
+                "v_expf({x:e} = {:#010x}) = {got:e} ({:#010x}) against expf_ik {want:e} ({:#010x})",
+                x.to_bits(),
+                got.to_bits(),
+                want.to_bits()
+            );
+        }
+        checked += xs.len() as u64;
+        xs.clear();
+    };
+    let dense = (112u32 << 23)..(144u32 << 23);
+    let sparse = (0..(1u32 << 31))
+        .step_by(4099)
+        .filter(|b| !dense.contains(b))
+        .chain([0x7f80_0000, 0x7f80_0001, 0x7fc0_0000]);
+    for sign in [0u32, 0x8000_0000] {
+        for bits in dense.clone().chain(sparse.clone()) {
+            xs.push(f32::from_bits(sign | bits));
+            if xs.len() == BATCH {
+                run(&mut xs, &mut out);
+            }
+        }
+    }
+    run(&mut xs, &mut out);
+    assert!(checked > 1 << 29, "the sweep covered {checked} inputs");
+}
+
+#[test]
+#[ignore = "hw: needs the box's AVX2 (card_swiglu_clamp's vector body)"]
+fn hw_card_swiglu_clamp_scalar_matches_avx2() {
+    let mut rng = CardRng::new(0xC0DE_41A3);
+    let mut gate = vec![0.0f32; 257];
+    let mut up = vec![0.0f32; 257];
+    for i in 0..257 {
+        gate[i] = rng.value(30.0);
+        up[i] = rng.value(30.0);
+    }
+    // Clamp crossings both ways, the clamp off, the escape paths (|g| past
+    // 87), and NaN operands (a NaN silu passes its clamp, a NaN up becomes
+    // limit).
+    gate[0] = 20.0;
+    up[0] = 20.0;
+    gate[1] = -20.0;
+    up[1] = -20.0;
+    gate[2] = f32::NAN;
+    up[3] = f32::NAN;
+    gate[4] = 95.0;
+    gate[5] = -95.0;
+    gate[6] = 150.0;
+    gate[7] = -150.0;
+    let mut avx = vec![0.0f32; 257];
+    let mut scal = vec![0.0f32; 257];
+    for limit in [0.0f32, 5.0, 11.5, 1e-6] {
+        qdot::card_swiglu_clamp(&gate, &up, limit, &mut avx);
+        for i in 0..257 {
+            scal[i] = qdot::card_swiglu_clamp_1(gate[i], up[i], limit);
+        }
+        for i in 0..257 {
+            assert!(
+                avx[i].to_bits() == scal[i].to_bits() || (avx[i].is_nan() && scal[i].is_nan()),
+                "swiglu({}, {}, {limit}) = {} against {}",
+                gate[i],
+                up[i],
+                avx[i],
+                scal[i]
+            );
+        }
+    }
+}

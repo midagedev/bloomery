@@ -27,6 +27,12 @@
 //! - Q3_K row-lane tile: [`Q3K_R8_ROWS`] rows repacked into one lane-interleaved layout
 //!   ([`repack_q3k_r8`], undone by [`unpack_q3k_r8`]) against up to [`TILE_COLS`] columns,
 //!   every (row, column) value bit-identical to [`dot_row`] ([`dot_q3k_r8_cols`]).
+//! - The card-rule kernels ([`card_q8_1`], [`card_q3k_dot_row_cols`],
+//!   [`card_q4k_dot_row_cols`], [`card_swiglu_clamp`]): V4.1's routed expert
+//!   as the card engine computes it — q8_1 activations per 128 values, the
+//!   warp-lane walks and the xor butterfly — so an expert holds the same
+//!   bits whichever tier runs it. Ours, not ik's: the host tier's other
+//!   columns keep the kernels above.
 //!
 //! Super-block geometry (block_q3_K, 110 bytes / 256 values): hmask[32] @+0,
 //! qs[64] @+32, scales[12] @+96, f16 d @+108.
@@ -2104,7 +2110,1077 @@ unsafe fn dot_q3k_r8_tile_avx2<const C: usize>(
     }
 }
 
-// --------------------------------------------------------- Q4_K x Q8_2_X4
+// ------------------------------------- V4.1 card-rule kernels (q8_1, Q3_K, Q4_K)
+//
+// The card engine's own rule for a routed expert's contribution — q8_1
+// activations per 128 values, the warp-lane walks and the xor butterfly —
+// as host kernels, so an expert computes the same bits whichever tier runs
+// it. Everything here transcribes the device cores; each doc names the
+// function it copies, and the float op spellings (a true division, `round`
+// half away from zero, which products contract into an FMA) were read from
+// the PTX the backend emits for them, not assumed from the Rust source.
+// These kernels are ours, not ik's: the host tier's other columns keep
+// q8_K / q8_2_x4 and the dots above.
+
+/// The card's q8_1 form of one activation column, in the host's own layout:
+/// `k` codes in value order, one scale per 128-value block (`d8`), one
+/// signed sum per 32 values (`s8`) and the per-block refusal flags. The
+/// codes and scales are the bytes every card quantizer writes
+/// (`q8_1_quant_block`, crates/gpu/src/lib.rs); only the plane
+/// permutations the card's gemv geometries read are dropped — the dots below
+/// take their words from `codes` directly.
+#[derive(Clone, Debug)]
+pub struct CardQ81 {
+    k: usize,
+    codes: Vec<i8>,
+    d8: Vec<f32>,
+    s8: Vec<i32>,
+    refused: Vec<bool>,
+}
+
+impl CardQ81 {
+    /// The zeroed form of a column of `k` values (a positive multiple of
+    /// 256), its buffers owned for [`card_q8_1_fill`].
+    #[must_use]
+    pub fn for_k(k: usize) -> CardQ81 {
+        assert!(
+            k > 0 && k.is_multiple_of(256),
+            "card q8_1 columns are whole 256-value super-blocks, k = {k}"
+        );
+        let n_sb = k / 256;
+        CardQ81 {
+            k,
+            codes: vec![0i8; k],
+            d8: vec![0.0; 2 * n_sb],
+            s8: vec![0; 8 * n_sb],
+            refused: vec![false; 2 * n_sb],
+        }
+    }
+
+    /// Values in the column (a positive multiple of 256).
+    #[must_use]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// The q8_1 codes in value order: `codes()[j]` is value `j`'s code,
+    /// zero for every value of a refused block.
+    #[must_use]
+    pub fn codes(&self) -> &[i8] {
+        &self.codes
+    }
+
+    /// One scale per 128-value block, `d8()[b]` = `amax / 127` of block `b`
+    /// (`1.0` for an all-zero block, NaN for a refused one).
+    #[must_use]
+    pub fn d8(&self) -> &[f32] {
+        &self.d8
+    }
+
+    /// One exact signed code sum per 32 values: `s8()[g]` sums values
+    /// `32g .. 32g + 31`, zero for a refused block's groups.
+    #[must_use]
+    pub fn s8(&self) -> &[i32] {
+        &self.s8
+    }
+
+    /// One flag per 128-value block: whether it held a non-finite value and
+    /// was stored as a NaN scale with zero codes and sums (the card's one
+    /// q8_1 refusal rule, `q8_1_quant_vals`, crates/gpu/src/lib.rs).
+    #[must_use]
+    pub fn refused(&self) -> &[bool] {
+        &self.refused
+    }
+
+    /// Whether any block was refused.
+    #[must_use]
+    pub fn refused_any(&self) -> bool {
+        self.refused.contains(&true)
+    }
+}
+
+/// The card's q8_1 quantizer of one column of `k` values (a positive
+/// multiple of 256), AVX2 where available: per 128-value block `b`,
+/// `d = if amax > 0 { amax / 127 } else { 1 }` over the block's |v| (a
+/// true division, `div.rn.f32` in the PTX), codes
+/// `(v / d).round().clamp(-127, 127)` — `round` half away from zero: the
+/// PTX spells it `cvt.rzi(x + copysign(0.5, x))`, `cvt.rzi(x)` where
+/// `|x| < 0.5` and `x` itself where `|x| > 2^23`, which is `f32::round` on
+/// every finite `x`, not the ties-even `cvt.rni` — and the exact signed
+/// code sums per 32 values. No operation flushes subnormals: a block whose
+/// scale underflows to zero gives `±inf` quotients (codes `±127`) and `0/0`
+/// (code 0), as the card's saturating convert does. A block holding any non-finite
+/// value is refused: NaN scale, zero codes, zero sums. The value semantics
+/// are `q8_1_quant_vals` + `q8_quad` (crates/gpu/src/lib.rs,
+/// crates/gpu/src/cores.rs); the warp's lane partition is gone because a
+/// block's bytes do not depend on it.
+pub fn card_q8_1(x: &[f32]) -> CardQ81 {
+    card_q8_1_check(x);
+    let mut out = CardQ81::for_k(x.len());
+    card_q8_1_fill(x, &mut out);
+    out
+}
+
+/// The scalar mirror behind [`card_q8_1`], and the oracle its bit-identity
+/// gate compares against.
+pub fn card_q8_1_scalar(x: &[f32]) -> CardQ81 {
+    card_q8_1_check(x);
+    let mut out = CardQ81::for_k(x.len());
+    card_q8_1_fill_scalar(x, &mut out);
+    out
+}
+
+/// [`card_q8_1`] into a form [`CardQ81::for_k`] made for `x.len()` — the
+/// per-column scratch a caller refills every call, no allocation inside.
+pub fn card_q8_1_fill(x: &[f32], out: &mut CardQ81) {
+    card_q8_1_check(x);
+    assert_eq!(out.k, x.len(), "card_q8_1_fill: the form's k is x.len()");
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected; card_q8_1_check pinned
+        // x.len() to whole 128-value blocks and the assert the form's shape.
+        unsafe { card_q8_1_fill_avx2(x, out) };
+        return;
+    }
+    card_q8_1_fill_scalar(x, out);
+}
+
+/// The scalar mirror behind [`card_q8_1_fill`].
+pub fn card_q8_1_fill_scalar(x: &[f32], out: &mut CardQ81) {
+    card_q8_1_check(x);
+    assert_eq!(out.k, x.len(), "card_q8_1_fill: the form's k is x.len()");
+    let (blocks, _) = x.as_chunks::<128>();
+    for (b, blk) in blocks.iter().enumerate() {
+        let bad = blk.iter().any(|v| !v.is_finite());
+        let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+        let d = if bad {
+            f32::NAN
+        } else if amax > 0.0 {
+            amax / 127.0
+        } else {
+            1.0
+        };
+        for g in 0..4 {
+            let mut sum = 0i32;
+            for j in 0..32 {
+                let v = blk[32 * g + j];
+                let q = if bad {
+                    0
+                } else {
+                    (v / d).round().clamp(-127.0, 127.0) as i32
+                };
+                out.codes[b * 128 + 32 * g + j] = q as i8;
+                sum += q;
+            }
+            out.s8[b * 4 + g] = sum;
+        }
+        out.d8[b] = d;
+        out.refused[b] = bad;
+    }
+}
+
+/// The shape contract every [`card_q8_1`] entry point enforces first.
+fn card_q8_1_check(x: &[f32]) {
+    assert!(
+        !x.is_empty() && x.len().is_multiple_of(256),
+        "card q8_1 columns are whole 256-value super-blocks, x.len() = {}",
+        x.len()
+    );
+}
+
+/// # Safety
+/// The CPU must support AVX2 and FMA, and `x` whole 128-value blocks with
+/// `out` the form [`CardQ81::for_k`] made for them.
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn card_q8_1_fill_avx2(x: &[f32], out: &mut CardQ81) {
+    let (blocks, _) = x.as_chunks::<128>();
+    let abs_mask = _mm256_set1_ps(-0.0);
+    for (b, blk) in blocks.iter().enumerate() {
+        // SAFETY: blk is 128 f32; every load and store below stays inside
+        // blk or the form's buffers by these indices.
+        unsafe {
+            // The block's first four vectors (values 0..32); the loop
+            // below walks vectors 4..16 to the block's end.
+            let v0 = _mm256_loadu_ps(blk.as_ptr());
+            let v1 = _mm256_loadu_ps(blk.as_ptr().add(8));
+            let v2 = _mm256_loadu_ps(blk.as_ptr().add(16));
+            let v3 = _mm256_loadu_ps(blk.as_ptr().add(24));
+            let a0 = _mm256_andnot_ps(abs_mask, v0);
+            let a1 = _mm256_andnot_ps(abs_mask, v1);
+            let a2 = _mm256_andnot_ps(abs_mask, v2);
+            let a3 = _mm256_andnot_ps(abs_mask, v3);
+            // Finite test over all sixteen vectors: |v| <= MAX is false
+            // for NaN and for inf, and the whole block refuses if any lane
+            // fails it (the ballot's value).
+            let fmax = _mm256_set1_ps(f32::MAX);
+            let mut finite = _mm256_and_ps(
+                _mm256_and_ps(
+                    _mm256_cmp_ps(a0, fmax, _CMP_LE_OQ),
+                    _mm256_cmp_ps(a1, fmax, _CMP_LE_OQ),
+                ),
+                _mm256_and_ps(
+                    _mm256_cmp_ps(a2, fmax, _CMP_LE_OQ),
+                    _mm256_cmp_ps(a3, fmax, _CMP_LE_OQ),
+                ),
+            );
+            // amax: the block's max |v| over all sixteen vectors, exact in
+            // any order over non-NaN, folded to lane 0.
+            let mut m = _mm256_max_ps(_mm256_max_ps(a0, a1), _mm256_max_ps(a2, a3));
+            for w in 4..16 {
+                let v = _mm256_loadu_ps(blk.as_ptr().add(8 * w));
+                let a = _mm256_andnot_ps(abs_mask, v);
+                finite = _mm256_and_ps(finite, _mm256_cmp_ps(a, fmax, _CMP_LE_OQ));
+                m = _mm256_max_ps(m, a);
+            }
+            let bad = _mm256_movemask_ps(finite) != 0xff;
+            m = _mm256_max_ps(m, _mm256_permute2f128_ps(m, m, 0x01));
+            m = _mm256_max_ps(m, _mm256_permute_ps(m, 78));
+            m = _mm256_max_ps(m, _mm256_permute_ps(m, 177));
+            let amax = _mm256_cvtss_f32(m);
+            let d = if bad {
+                f32::NAN
+            } else if amax > 0.0 {
+                amax / 127.0
+            } else {
+                1.0
+            };
+            let dv = _mm256_set1_ps(d);
+            for g in 0..4 {
+                let mut sum = _mm256_setzero_si256();
+                for j in 0..4 {
+                    // SAFETY: 8 readable values of the block at 32g + 8j.
+                    let v = _mm256_loadu_ps(blk.as_ptr().add(32 * g + 8 * j));
+                    // codes: (v / d).round() half away from zero, clamped.
+                    // roundps has no ties-away mode: round to nearest even,
+                    // then step the exact +.5 differences up — |v/d| at a tie
+                    // rounds to the even neighbour, half away wants the larger,
+                    // and the ax - e difference is exact (Sterbenz), so the
+                    // compare sees a tie only at a real one.
+                    let q = if bad {
+                        _mm256_setzero_ps()
+                    } else {
+                        let r = _mm256_div_ps(v, dv);
+                        let ax = _mm256_andnot_ps(abs_mask, r);
+                        let e = _mm256_round_ps(ax, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+                        let dif = _mm256_sub_ps(ax, e);
+                        let tie = _mm256_cmp_ps(dif, _mm256_set1_ps(0.5), _CMP_EQ_OQ);
+                        let away = _mm256_add_ps(e, _mm256_and_ps(tie, _mm256_set1_ps(1.0)));
+                        _mm256_xor_ps(away, _mm256_and_ps(abs_mask, r))
+                    };
+                    // The clamp in floats, as the card's: `max_ps`/`min_ps`
+                    // return their second operand on a NaN, so a NaN (`0/0`
+                    // of an underflowed scale) passes it and ±inf clamps to
+                    // ±127; the convert's NaN then becomes code 0, the card's
+                    // saturating `cvt.rzi.s32` value.
+                    let qc = _mm256_min_ps(
+                        _mm256_set1_ps(127.0),
+                        _mm256_max_ps(_mm256_set1_ps(-127.0), q),
+                    );
+                    let cl = _mm256_and_si256(
+                        _mm256_cvtps_epi32(qc),
+                        _mm256_castps_si256(_mm256_cmp_ps(qc, qc, _CMP_ORD_Q)),
+                    );
+                    // SAFETY: 8 writable code bytes of the form's column; the
+                    // values are inside ±127, so both packs are saturation-free.
+                    let packed = _mm_packs_epi32(
+                        _mm256_castsi256_si128(cl),
+                        _mm256_extracti128_si256(cl, 1),
+                    );
+                    let packed = _mm_packs_epi16(packed, packed);
+                    _mm_storel_epi64(
+                        out.codes.as_mut_ptr().add(b * 128 + 32 * g + 8 * j) as *mut __m128i,
+                        packed,
+                    );
+                    // The sub-vector's exact signed sum, from the clamped
+                    // codes; the four add into the group's (exact i32).
+                    let s = _mm256_add_epi32(cl, _mm256_permute2f128_si256(cl, cl, 0x01));
+                    let s = _mm256_hadd_epi32(s, s);
+                    let s = _mm256_hadd_epi32(s, s);
+                    sum = _mm256_add_epi32(sum, s);
+                }
+                out.s8[b * 4 + g] = _mm256_cvtsi256_si32(sum);
+            }
+            out.d8[b] = d;
+            out.refused[b] = bad;
+        }
+    }
+}
+
+/// The warp's xor-butterfly sum of 32 lane values held as four `__m256`
+/// (vector `v` = lanes `8v .. 8v+7`), lane 0's value: the tree
+/// `warp::reduce_sum_f32` builds at lane 0 (cuda-device `warp.rs`, strides
+/// 16, 8, 4, 2, 1 — each step adds the partner's value as it stands after
+/// the steps before it). Only lane 0 is reduced: every consumer of a row's
+/// dot reads lane 0's store.
+///
+/// # Safety
+/// AVX2 must be available on the target. Register-only.
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn card_warp_sum(f: [__m256; 4]) -> f32 {
+    // stride 16 (f0+f2, f1+f3) folded with stride 8 (their sum): after
+    // both, lane j of `c` holds (oj + oj^16) + (oj^8 + oj^24).
+    let c = _mm256_add_ps(_mm256_add_ps(f[0], f[2]), _mm256_add_ps(f[1], f[3]));
+    // stride 4 crosses the two 128-bit halves: lanes 0..3 take 4..7.
+    let c = _mm256_add_ps(c, _mm256_permute2f128_ps(c, c, 0x01));
+    // stride 2 and 1 stay inside each half: src lanes [2,3,0,1] (78 =
+    // _MM_SHUFFLE(1,0,3,2)), then [1,0,3,2] (177 = _MM_SHUFFLE(2,3,0,1)).
+    let c = _mm256_add_ps(c, _mm256_permute_ps(c, 78));
+    let c = _mm256_add_ps(c, _mm256_permute_ps(c, 177));
+    _mm256_cvtss_f32(c)
+}
+
+/// The little-endian u32 at `p[i .. i + 4]`.
+#[inline(always)]
+fn le32(p: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(p[i..i + 4].try_into().unwrap())
+}
+
+/// The little-endian u16 at `p[i .. i + 2]`.
+#[inline(always)]
+fn le16(p: &[u8], i: usize) -> u16 {
+    u16::from_le_bytes(p[i..i + 2].try_into().unwrap())
+}
+
+/// `dp4a(vi, w, 0)` over the four byte lanes: the exact i32 sum of the
+/// signed-byte products. Integer arithmetic, so any order gives these bits.
+#[inline(always)]
+fn card_dp4a(vi: u32, w: u32) -> i32 {
+    (0..4).fold(0i32, |a, b| {
+        a + (vi.to_le_bytes()[b] as i8 as i32) * (w.to_le_bytes()[b] as i8 as i32)
+    })
+}
+
+/// The code word of values `4 * v4 .. 4 * v4 + 3` of a column.
+#[inline(always)]
+fn card_word(codes: &[i8], v4: usize) -> u32 {
+    let b = &codes[4 * v4..4 * v4 + 4];
+    u32::from_le_bytes([b[0] as u8, b[1] as u8, b[2] as u8, b[3] as u8])
+}
+
+/// The card's `q3k_dequant` (crates/gpu/src/cores.rs) field `f` of the
+/// lane's qs/hmask words: the signed weight byte `nib - 4*hbit` packed four
+/// to a u32.
+#[inline(always)]
+fn card_q3k_field(vl: u32, vh1: u32, f: u32) -> u32 {
+    let sh = 2 * f;
+    let hb = match f {
+        0 => vh1 << 2,
+        1 => (vh1 >> 1) << 2,
+        2 => (vh1 >> 2) << 2,
+        _ => (vh1 >> 3) << 2,
+    };
+    ((((vl >> sh) & 0x0303_0303) | 0x8080_8080).wrapping_sub(hb & 0x0404_0404)) ^ 0x8080_8080
+}
+
+/// The card's `q3k_sub_scales4` (crates/gpu/src/cores.rs) for one lane:
+/// the four sub-block scales `[sc(s0), sc(s0+2), sc(s0+4), sc(s0+6)]`, each
+/// a 6-bit field minus the 32 offset, from the lane-parity scales window.
+#[inline(always)]
+fn card_q3k_sub_scales(a0w: u32, a1w: u32, a2w: u32, s0: usize) -> [i32; 4] {
+    let sh = (((s0 & 1) << 3) | ((s0 >> 3) << 2)) as u32;
+    let p0 = ((a0w >> sh) & 0x000f_000f) | (((a2w >> sh) & 0x0003_0003) << 4);
+    let p1 = ((a1w >> sh) & 0x000f_000f) | (((a2w >> (sh + 2)) & 0x0003_0003) << 4);
+    [
+        (p0 & 0xff) as i32 - 32,
+        (p0 >> 16) as i32 - 32,
+        (p1 & 0xff) as i32 - 32,
+        (p1 >> 16) as i32 - 32,
+    ]
+}
+
+/// The card's `q4k_scale_min` (crates/gpu/src/cores.rs): sub-block `s`'s
+/// 6-bit scale and min out of the super-block's three scale words.
+#[inline(always)]
+fn card_q4k_scale_min(s: usize, w1: u32, w2: u32, w3: u32) -> (i32, i32) {
+    if s < 4 {
+        let sh = 8 * s as u32;
+        (((w1 >> sh) & 63) as i32, ((w2 >> sh) & 63) as i32)
+    } else {
+        let sh = 8 * (s - 4) as u32;
+        let qs = (w2 >> sh) & 0xff;
+        let qs4 = (w3 >> sh) & 0xff;
+        let qsm = (w1 >> sh) & 0xff;
+        (
+            ((qs4 & 0x0f) as i32) | (((qsm >> 6) as i32) << 4),
+            ((qs4 >> 4) as i32) | (((qs >> 6) as i32) << 4),
+        )
+    }
+}
+
+/// The card's `q4k_nibble` (crates/gpu/src/cores.rs): the nibble field's
+/// `nib - 8` signed bytes packed four to a u32.
+#[inline(always)]
+fn card_q4k_nibble(qsw: u32, nib_sh: u32) -> u32 {
+    ((((qsw >> nib_sh) & 0x0f0f_0f0f) | 0x8080_8080).wrapping_sub(0x0808_0808)) ^ 0x8080_8080
+}
+
+/// The shape contract every card-rule dot entry point enforces, as a named
+/// error before any load: at least one column and one output per column
+/// ([`QdotError::TileShape`]), every column the first one's `k`
+/// ([`QdotError::ShortActivationCol`]), and a row of exactly `blk · k/256`
+/// bytes — a whole Q3_K (110) or Q4_K (144) row ([`QdotError::ShortWeightRow`]).
+/// Returns the super-block count. Both walks read their windows as unaligned
+/// bytes — the device's parity funnels reconstitute the same windows from its
+/// aligned words — and each walk's guard skips the tail an odd super-block
+/// count leaves, as the card's does.
+fn card_dot_check(
+    wrow: &[u8],
+    blk: usize,
+    cols: &[&CardQ81],
+    out: &[f32],
+) -> Result<usize, QdotError> {
+    if cols.is_empty() || out.len() != cols.len() {
+        return Err(QdotError::TileShape {
+            cols: cols.len(),
+            outs: out.len(),
+        });
+    }
+    let k = cols[0].k;
+    if let Some(c) = cols.iter().find(|c| c.k != k) {
+        return Err(QdotError::ShortActivationCol {
+            have: c.k,
+            need: k,
+            k,
+        });
+    }
+    // CardQ81::for_k holds every form to whole 256-value super-blocks.
+    let n_sb = k / 256;
+    if wrow.len() != blk * n_sb {
+        return Err(QdotError::ShortWeightRow {
+            have: wrow.len(),
+            need: blk * n_sb,
+            k,
+        });
+    }
+    Ok(n_sb)
+}
+
+/// The Q3_K walk one card lane runs (crates/gpu/src/cores.rs,
+/// `q3k_row_dot_1col_span`): iteration `it` folds the lane's integer chain
+/// through `q3k_acc` — `fma(mul(e0, drow), a as f32, f)`, the product rounded
+/// first, both operations spelled on the device — into the lane's
+/// accumulator. This is the value every host body computes per lane; the
+/// lane partition is the gemv's: `w16 = lane & 15`, `half = lane >> 4`,
+/// `s0 = 8·(w16>>3) + ((w16&7)>>2)`, `d8_base = w16>>3`, and field `f`'s
+/// code word is value word
+/// `128·it + 64·half + 32·d8_base + 16·(f>>1) + 8·(f&1) + (lane&7)`.
+#[inline(always)]
+fn card_q3k_lane_walk(wrow: &[u8], codes: &[i8], d8: &[f32], n_sb: usize, lane: usize) -> f32 {
+    let iters = n_sb.div_ceil(2);
+    let w16 = lane & 15;
+    let half = lane >> 4;
+    let s0 = 8 * (w16 >> 3) + ((w16 & 7) >> 2);
+    let d8_base = w16 >> 3;
+    let mut f = 0.0f32;
+    for it in 0..iters {
+        let sbp = 2 * it + half;
+        // The walk's guard, as the card's; live on an odd tail.
+        if sbp >= n_sb {
+            continue;
+        }
+        let base = sbp * 110;
+        // `q3k_sb_decode`'s windows, as unaligned byte reads: the device's
+        // parity funnels reconstitute exactly these windows from its aligned
+        // words, so the host needs no parity of its own.
+        let vl = le32(wrow, base + 32 + 4 * w16);
+        let hm = le32(wrow, base + 4 * (w16 & 7));
+        let vh1 = (!hm) >> (4 * (w16 >> 3)) as u32;
+        let (a0w, a1w, a2w) = (
+            le32(wrow, base + 96),
+            le32(wrow, base + 100),
+            le32(wrow, base + 104),
+        );
+        let sc = card_q3k_sub_scales(a0w, a1w, a2w, s0);
+        let drow = half_to_f32(le16(wrow, base + 108));
+        let v4 = 128 * it + 64 * half + 32 * d8_base + (lane & 7);
+        let mut a = 0i32;
+        for (fld, &scf) in sc.iter().enumerate() {
+            let w = card_word(codes, v4 + 16 * (fld >> 1) + 8 * (fld & 1));
+            a += card_dp4a(card_q3k_field(vl, vh1, fld as u32), w) * scf;
+        }
+        let e0 = d8[2 * sbp + d8_base];
+        f = (e0 * drow).mul_add(a as f32, f);
+    }
+    f
+}
+
+/// The Q4_K walk one card lane runs (crates/gpu/src/cores.rs,
+/// `q4k_row_dot_1col`): sub-block value by `q4k_sub_value` —
+/// `fma(cda, a as f32, cdb * (b as f32))`, the `cdb` product rounded first —
+/// folded by `q4k_acc`'s rounding: the first iteration of each pair of the
+/// guard-free prefix adds a separately rounded `e0·x`, every other iteration
+/// contracts into `fma(e0, x, f)` (`Q4K_ITER_UNROLL` = 2). Lane partition:
+/// `s = lane & 7` (the sub-block), `grp = lane >> 3`; chain word `i` reads
+/// value word `256·it + 64·grp + 8·s + i`, and the lane's 32 codes are
+/// group `32·it + lane` of `s8`, its block scale `d8[2·sbp + s>>2]`.
+#[inline(always)]
+fn card_q4k_lane_walk(wrow: &[u8], act: &CardQ81, n_sb: usize, lane: usize) -> f32 {
+    let iters = n_sb.div_ceil(4);
+    let full = n_sb / 4;
+    let s = lane & 7;
+    let grp = lane >> 3;
+    let (codes, s8, d8) = (act.codes(), act.s8(), act.d8());
+    let mut f = 0.0f32;
+    for it in 0..iters {
+        let sbp = 4 * it + grp;
+        // The walk's guard, as the card's; live on an odd tail.
+        if sbp >= n_sb {
+            continue;
+        }
+        let sb = sbp * 144;
+        let d = half_to_f32(le16(wrow, sb));
+        let dmin = half_to_f32(le16(wrow, sb + 2));
+        let (w1, w2, w3) = (le32(wrow, sb + 4), le32(wrow, sb + 8), le32(wrow, sb + 12));
+        let (sc, mi) = card_q4k_scale_min(s, w1, w2, w3);
+        let cda = d * sc as f32;
+        let cdb = (8.0 * d).mul_add(sc as f32, -dmin * mi as f32);
+        let nib_sh = (s as u32 & 1) * 4;
+        // `q4k_sb_decode`'s qs window: words 4 + 8·(s>>1) of the super-block.
+        let qsk = sb + 16 + 32 * (s >> 1);
+        let mut a = 0i32;
+        for i in 0..8 {
+            a += card_dp4a(
+                card_q4k_nibble(le32(wrow, qsk + 4 * i), nib_sh),
+                card_word(codes, 256 * it + 64 * grp + 8 * s + i),
+            );
+        }
+        let b = s8[32 * it + lane];
+        let e0 = d8[2 * sbp + (s >> 2)];
+        let x = cda.mul_add(a as f32, cdb * b as f32);
+        let split = it & 1 == 0 && it + 2 <= full;
+        f = if split { f + e0 * x } else { e0.mul_add(x, f) };
+    }
+    f
+}
+
+/// The scalar butterfly over 32 lane values (the mirror of
+/// [`card_warp_sum`]): each step adds the partner's current value, so lane
+/// 0 ends with the device tree's value.
+#[inline(always)]
+fn card_warp_sum_scalar(v: &mut [f32; 32]) -> f32 {
+    for stride in [16, 8, 4, 2, 1] {
+        for l in 0..32 {
+            if l & stride == 0 {
+                v[l] += v[l | stride];
+            }
+        }
+    }
+    v[0]
+}
+
+/// One Q3_K weight row (`110 · k/256` bytes) against one card-q8_1 column:
+/// the card gemv's value — every lane's walk ([`card_q3k_lane_walk`]) summed
+/// by the warp butterfly. AVX2 where available; the scalar mirror is
+/// [`card_q3k_dot_row_scalar`].
+pub fn card_q3k_dot_row(wrow: &[u8], act: &CardQ81) -> Result<f32, QdotError> {
+    let mut out = [0.0f32];
+    card_q3k_dot_row_cols(wrow, &[act], &mut out)?;
+    Ok(out[0])
+}
+
+/// The scalar mirror behind [`card_q3k_dot_row`], and the oracle the AVX2
+/// body's bit-identity gate compares against.
+pub fn card_q3k_dot_row_scalar(wrow: &[u8], act: &CardQ81) -> Result<f32, QdotError> {
+    let mut out = [0.0f32];
+    card_q3k_dot_row_cols_scalar(wrow, &[act], &mut out)?;
+    Ok(out[0])
+}
+
+/// The scalar walks of every lane over one row, one column.
+fn card_q3k_dot_row_scalar_into(wrow: &[u8], n_sb: usize, cols: &[&CardQ81], out: &mut [f32]) {
+    let mut v = [0.0f32; 32];
+    for (c, col) in cols.iter().enumerate() {
+        for (lane, slot) in v.iter_mut().enumerate() {
+            *slot = card_q3k_lane_walk(wrow, col.codes(), col.d8(), n_sb, lane);
+        }
+        out[c] = card_warp_sum_scalar(&mut v);
+    }
+}
+
+/// One Q3_K weight row against any number of card-q8_1 columns, the weight
+/// decoded once per [`CARD_TILE_COLS`] of them: `out[j]` is
+/// [`card_q3k_dot_row`] of column `j`, bit for bit — each column's lanes run
+/// the same walk whatever else the call carries.
+pub fn card_q3k_dot_row_cols(
+    wrow: &[u8],
+    cols: &[&CardQ81],
+    out: &mut [f32],
+) -> Result<(), QdotError> {
+    let n_sb = card_dot_check(wrow, Q3K_BLOCK, cols, out)?;
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected; card_dot_check pinned the
+        // row to n_sb super-blocks and every column to k = 256·n_sb.
+        unsafe { card_q3k_dot_row_cols_avx2(wrow, n_sb, cols, out) };
+        return Ok(());
+    }
+    card_q3k_dot_row_scalar_into(wrow, n_sb, cols, out);
+    Ok(())
+}
+
+/// The card-q8_1 columns one weight decode of the card-rule dots serves (the
+/// card's tile width, `q4k_sel::TILE_COLS`); a call of more runs one tile
+/// per this many.
+pub const CARD_TILE_COLS: usize = 8;
+
+/// The scalar mirror behind [`card_q3k_dot_row_cols`].
+pub fn card_q3k_dot_row_cols_scalar(
+    wrow: &[u8],
+    cols: &[&CardQ81],
+    out: &mut [f32],
+) -> Result<(), QdotError> {
+    let n_sb = card_dot_check(wrow, Q3K_BLOCK, cols, out)?;
+    card_q3k_dot_row_scalar_into(wrow, n_sb, cols, out);
+    Ok(())
+}
+
+/// # Safety
+/// The CPU must support AVX2 and FMA; [`card_dot_check`] pinned `wrow` to
+/// `n_sb` super-blocks, every column to `k = 256·n_sb` and `out` to one
+/// value per column.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn card_q3k_dot_row_cols_avx2(wrow: &[u8], n_sb: usize, cols: &[&CardQ81], out: &mut [f32]) {
+    let iters = n_sb.div_ceil(2);
+    // SAFETY: AVX2+FMA+F16C present per the dispatchers' detection, and
+    // card_dot_check pinned the row and column shapes; every load below
+    // stays inside them by the offsets the walk computes.
+    unsafe {
+        let m3 = _mm256_set1_epi32(0x0303_0303);
+        let m4b = _mm256_set1_epi32(0x0404_0404);
+        let four8 = _mm256_set1_epi8(4);
+        // Columns in tiles of CARD_TILE_COLS: each tile's accumulators live
+        // in registers across the walk; a call of fewer columns runs one
+        // shorter tile (every column an independent walk).
+        for (c0, chunk) in cols.chunks(CARD_TILE_COLS).enumerate() {
+            let mut acc = [[_mm256_setzero_ps(); 4]; CARD_TILE_COLS];
+            for it in 0..iters {
+                #[allow(
+                    clippy::needless_range_loop,
+                    reason = "`v` names the lane vector: it derives the decode windows and selects \
+                              the accumulator slot acc[t][v]"
+                )]
+                for v in 0..4usize {
+                    let half = v >> 1;
+                    let b8 = v & 1;
+                    let sbp = 2 * it + half;
+                    if sbp >= n_sb {
+                        continue;
+                    }
+                    let base = sbp * 110;
+                    // SAFETY: the loads below stay inside wrow's checked
+                    // 110*n_sb bytes by `base` and these windows.
+                    let drow = half_to_f32(le16(wrow, base + 108));
+                    // The eight lanes' qs and hmask words are each 32
+                    // consecutive bytes: w16 = l + 8*b8 gives qs bytes
+                    // 32 + 32*b8 + 4l, hmask bytes 4l.
+                    let vl = _mm256_loadu_si256(
+                        wrow.as_ptr().add(base + 32 + 32 * b8) as *const __m256i
+                    );
+                    let hm = _mm256_loadu_si256(wrow.as_ptr().add(base) as *const __m256i);
+                    // hm >> (4*(w16>>3)) with w16>>3 = b8, uniform per vector:
+                    // the hmask bits themselves, not the card's inverted
+                    // `vh1` — the unsigned weight word below adds 4 where
+                    // the bit is set.
+                    let vh = if b8 == 0 {
+                        hm
+                    } else {
+                        _mm256_srli_epi32(hm, 4)
+                    };
+                    // The scales window and the two per-lane shifts of
+                    // `q3k_sub_scales4` (sh = 8*((l>>2)&1) | 4*b8): the
+                    // same unaligned bytes whatever the super-block's
+                    // parity.
+                    let (a0w, a1w, a2w) = (
+                        le32(wrow, base + 96),
+                        le32(wrow, base + 100),
+                        le32(wrow, base + 104),
+                    );
+                    // Each lane's four scales as i16 pairs (the scale in both
+                    // halves of its i32), the multiplier `madd` takes below.
+                    let sh = [4 * b8, 4 * b8 + 8];
+                    let mut sc = [_mm256_setzero_si256(); 4];
+                    for (h, &s) in sh.iter().enumerate() {
+                        let s = s as u32;
+                        let p0 = ((a0w >> s) & 0x000f_000f) | (((a2w >> s) & 0x0003_0003) << 4);
+                        let p1 =
+                            ((a1w >> s) & 0x000f_000f) | (((a2w >> (s + 2)) & 0x0003_0003) << 4);
+                        let vals = [
+                            (p0 & 0xff) as i32 - 32,
+                            (p0 >> 16) as i32 - 32,
+                            (p1 & 0xff) as i32 - 32,
+                            (p1 >> 16) as i32 - 32,
+                        ];
+                        for fld in 0..4 {
+                            let v16 = vals[fld] as u32 & 0xffff;
+                            let bcast = _mm256_set1_epi32((v16 | (v16 << 16)) as i32);
+                            // lanes 4h..4h+3 take this shift's scales.
+                            sc[fld] = if h == 0 {
+                                _mm256_blend_epi32(sc[fld], bcast, 0x0f)
+                            } else {
+                                _mm256_blend_epi32(sc[fld], bcast, 0xf0)
+                            };
+                        }
+                    }
+                    // Field f's weight word `w' = nib | 4*hbit` (unsigned,
+                    // 0..7, `hbit` the hmask bit): the card's signed weight
+                    // `nib - 4*(1-hbit)` is `w' - 4`. Per byte pair,
+                    // `maddubs(w', cw) - maddubs(4, cw)` is that weight's
+                    // products as an i16 (both terms under 2·7·127), and `madd`
+                    // by the lane's scale pair sums them into the card's
+                    // `dp4a(w, cw)·sc` — integers, exact in any order. The
+                    // shifts are immediates, so the four fields unroll.
+                    let v4base = 128 * it + 64 * half + 32 * b8;
+                    let mut a = [_mm256_setzero_si256(); CARD_TILE_COLS];
+                    // (field, vl shift, hbit selector, value-word offset in words)
+                    let terms: [(u32, u32, u8, usize); 4] =
+                        [(0, 0, 0, 0), (1, 2, 1, 8), (2, 4, 2, 16), (3, 6, 3, 24)];
+                    for (fld, vsh, hsel, woff) in terms {
+                        let nib = match vsh {
+                            0 => _mm256_and_si256(vl, m3),
+                            2 => _mm256_and_si256(_mm256_srli_epi32(vl, 2), m3),
+                            4 => _mm256_and_si256(_mm256_srli_epi32(vl, 4), m3),
+                            _ => _mm256_and_si256(_mm256_srli_epi32(vl, 6), m3),
+                        };
+                        let hb = match hsel {
+                            0 => _mm256_slli_epi32(vh, 2),
+                            1 => _mm256_slli_epi32(vh, 1),
+                            2 => vh,
+                            _ => _mm256_srli_epi32(vh, 1),
+                        };
+                        let w8 = _mm256_or_si256(nib, _mm256_and_si256(hb, m4b));
+                        let off = 4 * (v4base + woff);
+                        for (t, col) in chunk.iter().enumerate() {
+                            // 32 readable code bytes of the column: v4base +
+                            // woff + 7 <= 64·sbp + 63 < 64·n_sb, its words.
+                            let cw =
+                                _mm256_loadu_si256(col.codes().as_ptr().add(off) as *const __m256i);
+                            let p = _mm256_sub_epi16(
+                                _mm256_maddubs_epi16(w8, cw),
+                                _mm256_maddubs_epi16(four8, cw),
+                            );
+                            a[t] = _mm256_add_epi32(a[t], _mm256_madd_epi16(p, sc[fld as usize]));
+                        }
+                    }
+                    for (t, col) in chunk.iter().enumerate() {
+                        let e0 = *col.d8().get_unchecked(2 * sbp + b8);
+                        let ed = e0 * drow;
+                        acc[t][v] = _mm256_fmadd_ps(
+                            _mm256_set1_ps(ed),
+                            _mm256_cvtepi32_ps(a[t]),
+                            acc[t][v],
+                        );
+                    }
+                }
+            }
+            for (t, _) in chunk.iter().enumerate() {
+                out[c0 * CARD_TILE_COLS + t] = card_warp_sum(acc[t]);
+            }
+        }
+    }
+}
+
+/// One Q4_K weight row (`144 · k/256` bytes) against one card-q8_1 column:
+/// the card down gemv's value — every lane's walk ([`card_q4k_lane_walk`])
+/// summed by the warp butterfly. AVX2 where available; the scalar mirror is
+/// [`card_q4k_dot_row_scalar`].
+pub fn card_q4k_dot_row(wrow: &[u8], act: &CardQ81) -> Result<f32, QdotError> {
+    let mut out = [0.0f32];
+    card_q4k_dot_row_cols(wrow, &[act], &mut out)?;
+    Ok(out[0])
+}
+
+/// The scalar mirror behind [`card_q4k_dot_row`], and the oracle the AVX2
+/// body's bit-identity gate compares against.
+pub fn card_q4k_dot_row_scalar(wrow: &[u8], act: &CardQ81) -> Result<f32, QdotError> {
+    let mut out = [0.0f32];
+    card_q4k_dot_row_cols_scalar(wrow, &[act], &mut out)?;
+    Ok(out[0])
+}
+
+/// One Q4_K weight row against any number of card-q8_1 columns, the weight
+/// decoded once per [`CARD_TILE_COLS`] of them: `out[j]` is
+/// [`card_q4k_dot_row`] of column `j`, bit for bit.
+pub fn card_q4k_dot_row_cols(
+    wrow: &[u8],
+    cols: &[&CardQ81],
+    out: &mut [f32],
+) -> Result<(), QdotError> {
+    let n_sb = card_dot_check(wrow, Q4K_BLOCK, cols, out)?;
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected; card_dot_check pinned the
+        // row to n_sb super-blocks and every column to k = 256·n_sb.
+        unsafe { card_q4k_dot_row_cols_avx2(wrow, n_sb, cols, out) };
+        return Ok(());
+    }
+    card_q4k_dot_row_scalar_into(wrow, n_sb, cols, out);
+    Ok(())
+}
+
+/// The scalar mirror behind [`card_q4k_dot_row_cols`].
+pub fn card_q4k_dot_row_cols_scalar(
+    wrow: &[u8],
+    cols: &[&CardQ81],
+    out: &mut [f32],
+) -> Result<(), QdotError> {
+    let n_sb = card_dot_check(wrow, Q4K_BLOCK, cols, out)?;
+    card_q4k_dot_row_scalar_into(wrow, n_sb, cols, out);
+    Ok(())
+}
+
+/// The scalar walks of every lane over one Q4_K row.
+fn card_q4k_dot_row_scalar_into(wrow: &[u8], n_sb: usize, cols: &[&CardQ81], out: &mut [f32]) {
+    let mut v = [0.0f32; 32];
+    for (c, col) in cols.iter().enumerate() {
+        for (lane, slot) in v.iter_mut().enumerate() {
+            *slot = card_q4k_lane_walk(wrow, col, n_sb, lane);
+        }
+        out[c] = card_warp_sum_scalar(&mut v);
+    }
+}
+
+/// # Safety
+/// The CPU must support AVX2 and FMA; [`card_dot_check`] pinned `wrow` to
+/// `n_sb` super-blocks, every column to `k = 256·n_sb` and `out` to one
+/// value per column.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn card_q4k_dot_row_cols_avx2(wrow: &[u8], n_sb: usize, cols: &[&CardQ81], out: &mut [f32]) {
+    let iters = n_sb.div_ceil(4);
+    let full = n_sb / 4;
+    // SAFETY: AVX2+FMA+F16C present per the dispatchers' detection, and
+    // card_dot_check pinned the row and column shapes; every load below
+    // stays inside them by the offsets the walk computes.
+    unsafe {
+        let ones16 = _mm256_set1_epi16(1);
+        let lo_mask = _mm256_set1_epi8(0x0f);
+        for (c0, chunk) in cols.chunks(CARD_TILE_COLS).enumerate() {
+            let mut acc = [[_mm256_setzero_ps(); 4]; CARD_TILE_COLS];
+            for it in 0..iters {
+                #[allow(
+                    clippy::needless_range_loop,
+                    reason = "`v` names the lane vector: it derives the super-block and selects \
+                              the accumulator slot acc[t][v]"
+                )]
+                for v in 0..4usize {
+                    // This vector's eight lanes, s = 0..7, share super-block
+                    // sbp = 4*it + v.
+                    let sbp = 4 * it + v;
+                    if sbp >= n_sb {
+                        continue;
+                    }
+                    let sb = sbp * 144;
+                    let d = half_to_f32(le16(wrow, sb));
+                    let dmin = half_to_f32(le16(wrow, sb + 2));
+                    let (w1, w2, w3) =
+                        (le32(wrow, sb + 4), le32(wrow, sb + 8), le32(wrow, sb + 12));
+                    // The eight lanes' (sc, mi) and the two chain coefficients.
+                    let mut scm = [0i32; 8];
+                    let mut mim = [0i32; 8];
+                    for s in 0..8 {
+                        (scm[s], mim[s]) = card_q4k_scale_min(s, w1, w2, w3);
+                    }
+                    let scv =
+                        _mm256_cvtepi32_ps(_mm256_loadu_si256(scm.as_ptr() as *const __m256i));
+                    let miv =
+                        _mm256_cvtepi32_ps(_mm256_loadu_si256(mim.as_ptr() as *const __m256i));
+                    // cda = d*sc (one rounded product); cdb = fma(8d, sc,
+                    // -(dmin*mi)): the PTX's spelling of `q4k_coeff`.
+                    let cda = _mm256_mul_ps(_mm256_set1_ps(d), scv);
+                    let cdb = _mm256_fmadd_ps(
+                        _mm256_set1_ps(8.0 * d),
+                        scv,
+                        _mm256_mul_ps(_mm256_set1_ps(-dmin), miv),
+                    );
+                    // Lane s's 32 unsigned nibbles: qs bytes 32·(s>>1) ..
+                    // +32 of the super-block, the low nibbles for even s, the
+                    // high for odd — the window `q4k_sb_decode` reads.
+                    let mut nib = [_mm256_setzero_si256(); 8];
+                    for j in 0..4 {
+                        let q = _mm256_loadu_si256(
+                            wrow.as_ptr().add(sb + 16 + 32 * j) as *const __m256i
+                        );
+                        nib[2 * j] = _mm256_and_si256(q, lo_mask);
+                        nib[2 * j + 1] = _mm256_and_si256(_mm256_srli_epi16(q, 4), lo_mask);
+                    }
+                    for (t, col) in chunk.iter().enumerate() {
+                        // Lane s's codes are value words 256·it + 64·v + 8·s
+                        // .. +7: 32 consecutive bytes. Its A chain, Σ (nib −
+                        // 8)·code, is Σ nib·code − 8·B with B its s8 group
+                        // (the exact sum of the same 32 codes): integers, so
+                        // any order gives the card's dp4a chain's value.
+                        let cb = col.codes().as_ptr().add(4 * (256 * it + 64 * v));
+                        let mut p = [_mm256_setzero_si256(); 8];
+                        for (s, ps) in p.iter_mut().enumerate() {
+                            let cw = _mm256_loadu_si256(cb.add(32 * s) as *const __m256i);
+                            *ps = _mm256_madd_epi16(_mm256_maddubs_epi16(nib[s], cw), ones16);
+                        }
+                        // The eight lanes' sums into i32 lanes 0..7.
+                        let h01 = _mm256_hadd_epi32(p[0], p[1]);
+                        let h23 = _mm256_hadd_epi32(p[2], p[3]);
+                        let h45 = _mm256_hadd_epi32(p[4], p[5]);
+                        let h67 = _mm256_hadd_epi32(p[6], p[7]);
+                        let q03 = _mm256_hadd_epi32(h01, h23);
+                        let q47 = _mm256_hadd_epi32(h45, h67);
+                        let sums = _mm256_add_epi32(
+                            _mm256_permute2x128_si256(q03, q47, 0x20),
+                            _mm256_permute2x128_si256(q03, q47, 0x31),
+                        );
+                        // B: groups 32·it + 8·v + s, eight consecutive i32.
+                        let bi = _mm256_loadu_si256(
+                            col.s8().as_ptr().add(32 * it + 8 * v) as *const __m256i
+                        );
+                        let a = _mm256_sub_epi32(sums, _mm256_slli_epi32(bi, 3));
+                        let x = _mm256_fmadd_ps(
+                            cda,
+                            _mm256_cvtepi32_ps(a),
+                            _mm256_mul_ps(cdb, _mm256_cvtepi32_ps(bi)),
+                        );
+                        // e0 = d8[2·sbp + s>>2]: lanes 0..3 block 2·sbp, 4..7
+                        // block 2·sbp + 1.
+                        let d8 = col.d8();
+                        let e0 = _mm256_set_m128(
+                            _mm_set1_ps(*d8.get_unchecked(2 * sbp + 1)),
+                            _mm_set1_ps(*d8.get_unchecked(2 * sbp)),
+                        );
+                        let split = it & 1 == 0 && it + 2 <= full;
+                        acc[t][v] = if split {
+                            _mm256_add_ps(acc[t][v], _mm256_mul_ps(e0, x))
+                        } else {
+                            _mm256_fmadd_ps(e0, x, acc[t][v])
+                        };
+                    }
+                }
+            }
+            for (t, _) in chunk.iter().enumerate() {
+                out[c0 * CARD_TILE_COLS + t] = card_warp_sum(acc[t]);
+            }
+        }
+    }
+}
+
+/// The device `expf_ik` (crates/gpu/src/linear/mod.rs), one lane, op for
+/// op: ik's AVX2 `v_expf` as scalar Rust. Every product that meets an add is
+/// a `mul_add` and the escape paths are the reference's, so it equals the
+/// vector path [`v_expf`] bit for bit — the pure gate sweeps f32 bit
+/// patterns over the whole relevant exponent range and holds them equal.
+#[inline]
+#[must_use]
+pub fn expf_ik_scalar(x: f32) -> f32 {
+    const SHIFT: f32 = f32::from_bits(0x4b40_0000); // 0x1.8p23
+    const LOG2E: f32 = f32::from_bits(0x3fb8_aa3b); // 0x1.715476p+0
+    const LN2_HI: f32 = f32::from_bits(0x3f31_7200); // 0x1.62e4p-1
+    const LN2_LO: f32 = f32::from_bits(0x35bf_be8e); // 0x1.7f7d1cp-20
+    const C0: f32 = f32::from_bits(0x3f7f_fff6); // 0x1.ffffecp-1
+    const C1: f32 = f32::from_bits(0x3eff_fedb); // 0x1.fffdb6p-2
+    const C2: f32 = f32::from_bits(0x3e2a_af33); // 0x1.555e66p-3
+    const C3: f32 = f32::from_bits(0x3d2b_9f17); // 0x1.573e2ep-5
+    const C4: f32 = f32::from_bits(0x3c07_2010); // 0x1.0e4020p-7
+    let z = x.mul_add(LOG2E, SHIFT);
+    let n = z - SHIFT;
+    let b = (-n).mul_add(LN2_LO, (-n).mul_add(LN2_HI, x));
+    let e = z.to_bits() << 23;
+    let k = f32::from_bits(e.wrapping_add(0x3f80_0000));
+    let u = b * b;
+    let j = C4
+        .mul_add(b, C3)
+        .mul_add(u, C2.mul_add(b, C1))
+        .mul_add(u, C0 * b);
+    // An ordered compare, as the device's: a NaN `n` takes the main path.
+    if n.abs() > 126.0 {
+        let g: u32 = if n <= 0.0 { 0x8200_0000 } else { 0 };
+        let s1 = f32::from_bits(g.wrapping_add(0x7f00_0000));
+        let s2 = f32::from_bits(e.wrapping_sub(g));
+        return if n.abs() > 192.0 {
+            s1 * s1
+        } else {
+            s2.mul_add(j, s2) * s1
+        };
+    }
+    j.mul_add(k, k)
+}
+
+/// The card's clamped SwiGLU for one value (crates/gpu-deepseek41/src/
+/// experts.rs, `swiglu_clamp`): `min(silu(g), limit) · clamp(u, -limit,
+/// limit)` — the clamp bites on the silu output, and neither applies when
+/// `limit <= 1e-6`. The `min`/`max` are the device's comparison chains: a
+/// NaN silu passes its clamp, a NaN up becomes `limit`. The silu is
+/// `g / (1 + expf_ik(0 - g))` with the scalar mirror of the device
+/// exponential.
+#[inline]
+#[must_use]
+pub fn card_swiglu_clamp_1(g: f32, u: f32, limit: f32) -> f32 {
+    let mut s = g / (1.0 + expf_ik_scalar(0.0 - g));
+    let mut uc = u;
+    if limit > 1e-6 {
+        s = if limit < s { limit } else { s };
+        uc = if u < limit { u } else { limit };
+        uc = if -limit < uc { uc } else { -limit };
+    }
+    uc * s
+}
+
+/// The card's clamped SwiGLU over slices, AVX2 where available: `out[i] =
+/// card_swiglu_clamp_1(gate[i], up[i], limit)` — the AVX2 lanes are
+/// `v_silu` / [`v_expf`], which the pure gate holds equal to
+/// [`expf_ik_scalar`] bit for bit, and the clamp's `min_ps`/`max_ps`
+/// operand orders spell the same comparison chains as the scalar.
+pub fn card_swiglu_clamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
+    assert!(
+        gate.len() == up.len() && gate.len() == out.len(),
+        "card_swiglu_clamp: gate, up and out are one length"
+    );
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected; the slices are equal
+        // length, and both bodies spell the same value per lane as
+        // `card_swiglu_clamp_1`.
+        unsafe {
+            if limit > 1e-6 {
+                swiglu_clamp_avx2(gate, up, limit, out);
+            } else {
+                swiglu_avx2(gate, up, out);
+            }
+        };
+        return;
+    }
+    for ((o, &g), &u) in out.iter_mut().zip(gate).zip(up) {
+        *o = card_swiglu_clamp_1(g, u, limit);
+    }
+}
+
+/// The exponential [`card_swiglu_clamp`]'s silu runs, over a slice: `v_expf`
+/// eight lanes at a time where AVX2 is available (a zero-padded last vector),
+/// [`expf_ik_scalar`] elsewhere — the one door its gate holds to
+/// [`expf_ik_scalar`] bit for bit.
+pub fn card_expf(x: &[f32], out: &mut [f32]) {
+    assert_eq!(x.len(), out.len(), "card_expf: one output per input");
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        // SAFETY: the features were just detected; the slices are one length.
+        unsafe { card_expf_avx2(x, out) };
+        return;
+    }
+    for (o, &v) in out.iter_mut().zip(x) {
+        *o = expf_ik_scalar(v);
+    }
+}
+
+/// # Safety
+/// The CPU must support AVX2 and FMA, and `x` and `out` must be one length.
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn card_expf_avx2(x: &[f32], out: &mut [f32]) {
+    let (body, tail) = x.as_chunks::<8>();
+    // SAFETY: vector `i` reads x[8i .. 8i + 8] and writes the same span of
+    // `out`, the same length as `x`; the tail goes through 8-lane arrays.
+    unsafe {
+        for (i, v) in body.iter().enumerate() {
+            let e = v_expf(_mm256_loadu_ps(v.as_ptr()));
+            _mm256_storeu_ps(out.as_mut_ptr().add(8 * i), e);
+        }
+        if !tail.is_empty() {
+            let (mut xp, mut op) = ([0.0f32; 8], [0.0f32; 8]);
+            xp[..tail.len()].copy_from_slice(tail);
+            _mm256_storeu_ps(op.as_mut_ptr(), v_expf(_mm256_loadu_ps(xp.as_ptr())));
+            out[8 * body.len()..].copy_from_slice(&op[..tail.len()]);
+        }
+    }
+}
 
 /// `block_q4_K` (ggml-common.h): d f16 @0, dmin f16 @2, scales u8[12] @4, qs u8[128] @16.
 const Q4K_BLOCK: usize = 144;

@@ -125,7 +125,10 @@ levers 0 0 0
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.
-model 114 30 11
+# PIN(2026-10-06): model 114 -> 117 blocks, 11 -> 13 impls, new code, not old code relaxed: bench_v41_host's
+# unioncard arm hands its pool chunks disjoint cells through ChunkPtr (the Send and Sync impls; write, read and
+# with_mut, one block each), each with its SAFETY line.
+model 117 30 13
 models 0 0 0
 placement 0 0 0
 # PIN(2026-10-02): qdot 69 -> 77 blocks, 36 -> 41 fns, new kernels, not old code relaxed: the Q4_K/Q5_K row
@@ -140,7 +143,11 @@ placement 0 0 0
 # PIN(2026-10-06): qdot 80 -> 86 blocks, 45 -> 47 fns, new kernels, not old code relaxed: the IQ4_NL and IQ4_XS
 # dots (dot_iq4nl_q82x4_avx2, dot_iq4xs_q8k_avx2: two unsafe fns, one block each) and the four dispatch arms that
 # call them; mxfp4_codes became lut4_codes for three users, each with its SAFETY line.
-qdot 86 47 0
+# PIN(2026-10-06): qdot 86 -> 95 blocks, 47 -> 52 fns, new kernels, not old code relaxed: V4.1's card-rule
+# kernels — the q8_1 quantizer, the Q3_K and Q4_K dots, the warp butterfly and card_expf (five unsafe fns: four
+# AVX2 bodies, one block each, and the register-only card_warp_sum) and the five dispatch arms that call them,
+# each with its SAFETY line.
+qdot 95 52 0
 refset 0 0 0
 runtime 0 0 0
 sampler 4 4 1

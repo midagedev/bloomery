@@ -20,6 +20,12 @@
 //!   `dot_q5k`) on the dump's own h give `ffn_moe_down` (every layer) and a
 //!   K-quant `ffn_shexp` bit for bit — the codes the bands read ik's rounding
 //!   from;
+//! - `cardrule`: qdot's card-rule host kernels (q8_1 per 128 values, the
+//!   Q3_K/Q4_K lane walks and the warp tree) against the card's own bytes at
+//!   every q4_K-down layer — the x and h quantizer planes, the fused
+//!   gate·up's h, the sel gemv's down, bit for bit — and once a run the
+//!   grouped tile path (`ds41_expert_gate_up_tiles`, `q4k_gemv_tiles`) at
+//!   two columns an expert against the host's one-column calls;
 //!
 //! PIN(2026-09-24): removed — the `combine` site and the combine launch of the layer graph pinned `ds41_moe_combine`, which the engine never runs (its combine is `ds41_ffn_post`'s, pinned by the MoE chain gate against `ffn_out`); the kernel is gone.
 //!
@@ -90,9 +96,12 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
+    use bloomery_gpu::kquant::{TileTable, TiledDown};
+    use bloomery_gpu::q4k_sel::tile_cap;
     use bloomery_gpu::route_core::renorm_divisor;
     use bloomery_gpu::weights::{DevWeight, Q8Block, q8_0_planes};
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
+    use bloomery_gpu_deepseek41::chain::ffn::{FfnBatchKernels, TiledGateUp};
     use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels, silu_ik, swiglu_clamp};
     use bloomery_gpu_deepseek41::router::{
@@ -104,8 +113,8 @@ mod gate {
     use bloomery_gpu_gates::oracle::{self, Set};
     use bloomery_gpu_gates::rounding::U;
     use bloomery_gpu_gates::{
-        GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
-        max_rel_err, open_split, q8_1_dequant, ref_tensor_of_in, row_bytes,
+        GateError, KERNEL_BAND, RefManifest, RefRow, activations, bits_equal, bytes_to_words,
+        checks_failed, max_rel_err, open_split, q8_1_dequant, ref_tensor_of_in, row_bytes,
         topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
@@ -1707,6 +1716,9 @@ mod gate {
         for ((set, inp), st) in sets.iter().zip(ins).zip(&stats) {
             verdicts.push(routed_set(cx, ly, set, inp, st, &stacks, dv)?);
         }
+        for (set, inp) in sets.iter().zip(ins) {
+            verdicts.push(cardrule_set(cx, ly, set, inp, &stacks, &file, dv)?);
+        }
         let mut extra = Vec::new();
         if synthetic {
             let k = cx.meta.n_embd;
@@ -1722,6 +1734,8 @@ mod gate {
                 cx.meta.clamp_exp[l],
             )?);
             extra.push(graph(cx, dv, ly, &stacks, &sel, x)?);
+            extra.push(cardrule_ties(cx, dv)?);
+            extra.push(cardrule_tiles(cx, ly, &stacks, &file)?);
         }
         Ok((verdicts, extra))
     }
@@ -1837,6 +1851,442 @@ mod gate {
             verdict(pass)
         );
         Ok(pass)
+    }
+
+    /// `cores::q3_slot` (crates/gpu/src/cores.rs): the q3 plane's u64
+    /// pair slot of value-order word `v4`; bit 3 of `v4` picks the half.
+    /// Same copy as the hc gate's, one binary to a table.
+    fn card_q3_slot(v4: usize) -> usize {
+        64 * (v4 >> 7)
+            + 32 * ((v4 >> 4) & 1)
+            + 16 * ((v4 >> 6) & 1)
+            + 8 * ((v4 >> 5) & 1)
+            + (v4 & 7)
+    }
+
+    /// One column's card q8_1 planes against the host quantizer's bytes:
+    /// every block scale's bits and every code word, read back through the
+    /// q3 permutation's slots (the q4 plane holds the same words in its own
+    /// permutation, and the s8 plane is the exact signed sum of the codes
+    /// these words already pin, so both stay covered by this one). The
+    /// q3/d8 spans are the column's own.
+    fn card_act_bits(host: &qdot::CardQ81, q3: &[u64], d8: &[f32], k: usize) -> (bool, String) {
+        // The q3 plane holds 64*ceil(n_sb/2) u64 a column (an odd tail's
+        // group is allocated but never written).
+        let col_slots = 64 * (k / 256).div_ceil(2);
+        if q3.len() < col_slots {
+            return (false, format!("short q3 plane: {} < {col_slots}", q3.len()));
+        }
+        if d8.len() < host.d8().len()
+            || d8
+                .iter()
+                .zip(host.d8())
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+        {
+            let at = d8
+                .iter()
+                .zip(host.d8())
+                .position(|(a, b)| a.to_bits() != b.to_bits())
+                .map_or("short plane".to_string(), |i| format!("block {i}"));
+            return (false, format!("d8 {at}"));
+        }
+        for v4 in 0..k / 4 {
+            let mut word = 0u32;
+            for j in 0..4 {
+                word |= ((host.codes()[4 * v4 + j] as u32) & 0xff) << (8 * j);
+            }
+            let slot = card_q3_slot(v4);
+            let pair = q3[slot];
+            let got = if v4 & 8 == 0 {
+                pair as u32
+            } else {
+                (pair >> 32) as u32
+            };
+            if got != word {
+                return (
+                    false,
+                    format!("word {v4}: card {got:#010x} host {word:#010x}"),
+                );
+            }
+        }
+        (true, String::new())
+    }
+
+    /// The `cardrule` site of one set at one layer: the card's own q8_1
+    /// bytes of x and of the dump's h, the fused `ds41_expert_gate_up`'s h
+    /// and `q4k_gemv_sel`'s down — against `qdot`'s card-rule kernels on the
+    /// same inputs, bit for bit, every token. The first mismatch of each
+    /// comparison prints its place and both values. The host dots run on
+    /// the pool's width (`par_chunks`), a row a chunk.
+    fn cardrule_set(
+        cx: &Cx,
+        ly: &Layer,
+        set: &SetData,
+        inp: &RoutedIn,
+        stacks: &Stacks,
+        file: &RoutedFile<'_>,
+        dv: &mut Dev,
+    ) -> Result<bool, GateError> {
+        let stream = cx.gpu.stream();
+        let (k, ff, l) = (cx.meta.n_embd, cx.meta.n_ff, ly.l);
+        let limit = cx.meta.clamp_exp[l];
+        let rb_gu = row_bytes(GgmlType::Q3_K, k)?;
+        let rb_d = row_bytes(GgmlType::Q4_K, ff)?;
+        let (mut x_ok, mut h_ok, mut hq_ok, mut d_ok) = (true, true, true, true);
+        let (mut x_first, mut h_first, mut hq_first, mut d_first) = (
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+        );
+        for tt in 0..set.t {
+            let sel = stacks.sel(&inp.ids, tt);
+            if sel.iter().any(|&p| p as usize >= stacks.experts.len()) {
+                return Err(format!(
+                    "cardrule: {}/{} layer {l}: a token's expert is outside the uploaded stacks",
+                    set.name, tt
+                )
+                .into());
+            }
+            let sel_dev = DeviceBuffer::from_host(stream, &sel)?;
+            let ids: Vec<usize> = sel
+                .iter()
+                .map(|&p| stacks.experts[p as usize] as usize)
+                .collect();
+            // x: the card quantizer's planes against the host's bytes.
+            dv.x.copy_from_host(stream, &inp.x[tt * k..(tt + 1) * k])?;
+            cx.gpu.enqueue_quantize_q8_1(&dv.x, &mut dv.act_x)?;
+            let xact = qdot::card_q8_1(&inp.x[tt * k..(tt + 1) * k]);
+            let (ok, first) = card_act_bits(
+                &xact,
+                &dv.act_x.q3().to_host_vec(stream)?,
+                &dv.act_x.d8().to_host_vec(stream)?,
+                k,
+            );
+            if !ok {
+                x_ok = false;
+                if x_first == "-" {
+                    x_first = format!("token {tt} {first}");
+                }
+            }
+            // The fused gate·up over the card's own q8_1 of x.
+            let args = ExpertGateUp {
+                wg: &stacks.wg,
+                wu: &stacks.wu,
+                act: &dv.act_x,
+                sel: &sel_dev,
+                n_slots: N_USED,
+                rows_per_expert: ff,
+                limit,
+            };
+            cx.experts
+                .enqueue_expert_gate_up(stream, &args, &mut dv.h6)?;
+            let hk = dv.h6.to_host_vec(stream)?;
+            let mut h_host = vec![0.0f32; N_USED * ff];
+            {
+                let xact = &xact;
+                let (gate, up) = (file.gate, file.up);
+                par_chunks(&mut h_host, 1, |i, o| {
+                    let (s, r) = (i / ff, i % ff);
+                    let e = ids[s];
+                    let g =
+                        qdot::card_q3k_dot_row(&gate[e * ff * rb_gu + r * rb_gu..][..rb_gu], xact)
+                            .map_err(|e| e.to_string())?;
+                    let u =
+                        qdot::card_q3k_dot_row(&up[e * ff * rb_gu + r * rb_gu..][..rb_gu], xact)
+                            .map_err(|e| e.to_string())?;
+                    o[0] = qdot::card_swiglu_clamp_1(g, u, limit);
+                    Ok(())
+                })?;
+            }
+            for s in 0..N_USED {
+                for r in 0..ff {
+                    let i = s * ff + r;
+                    if hk[i].to_bits() != h_host[i].to_bits() {
+                        h_ok = false;
+                        if h_first == "-" {
+                            h_first = format!(
+                                "token {tt} slot {s} row {r}: card {:?} ({:#010x}) host {:?} ({:#010x})",
+                                hk[i],
+                                hk[i].to_bits(),
+                                h_host[i],
+                                h_host[i].to_bits()
+                            );
+                        }
+                    }
+                }
+            }
+            // The dump's h quantized (the card down's own input), then the
+            // sel gemv against the host down.
+            let h_d = &inp.h[tt * N_USED * ff..(tt + 1) * N_USED * ff];
+            dv.hin.copy_from_host(stream, h_d)?;
+            cx.gpu.enqueue_quantize_q8_1(&dv.hin, &mut dv.act_h)?;
+            let q4 = cx.gpu.q4k_sel();
+            q4.enqueue_gemv_q4k_sel(
+                stream, &stacks.wd, &dv.act_h, &sel_dev, N_USED, k, &mut dv.d6,
+            )?;
+            let dk = dv.d6.to_host_vec(stream)?;
+            let (q3h, d8h) = (
+                dv.act_h.q3().to_host_vec(stream)?,
+                dv.act_h.d8().to_host_vec(stream)?,
+            );
+            let col_slots = 64 * (ff / 256).div_ceil(2);
+            let n_sb = ff / 256;
+            let cols: Vec<qdot::CardQ81> = (0..N_USED)
+                .map(|s| qdot::card_q8_1(&h_d[s * ff..(s + 1) * ff]))
+                .collect();
+            for s in 0..N_USED {
+                let (ok, first) = card_act_bits(
+                    &cols[s],
+                    &q3h[s * col_slots..(s + 1) * col_slots],
+                    &d8h[s * 2 * n_sb..(s + 1) * 2 * n_sb],
+                    ff,
+                );
+                if !ok {
+                    hq_ok = false;
+                    if hq_first == "-" {
+                        hq_first = format!("token {tt} slot {s} {first}");
+                    }
+                }
+            }
+            let mut d_host = vec![0.0f32; N_USED * k];
+            {
+                let down = file.down;
+                let cols = &cols;
+                par_chunks(&mut d_host, 1, |i, o| {
+                    let (s, r) = (i / k, i % k);
+                    let e = ids[s];
+                    o[0] =
+                        qdot::card_q4k_dot_row(&down[e * k * rb_d + r * rb_d..][..rb_d], &cols[s])
+                            .map_err(|e| e.to_string())?;
+                    Ok(())
+                })?;
+            }
+            for s in 0..N_USED {
+                for r in 0..k {
+                    let i = s * k + r;
+                    if dk[i].to_bits() != d_host[i].to_bits() {
+                        d_ok = false;
+                        if d_first == "-" {
+                            d_first = format!(
+                                "token {tt} slot {s} row {r}: card {:?} ({:#010x}) host {:?} ({:#010x})",
+                                dk[i],
+                                dk[i].to_bits(),
+                                d_host[i],
+                                d_host[i].to_bits()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        stream.synchronize()?;
+        let fault = cx.gpu.take_fault()?;
+        let pass = x_ok && h_ok && hq_ok && d_ok && fault.is_none();
+        println!(
+            "cardrule set={} layer={l} tokens={} experts={} limit={limit} \
+             x_bits={x_ok}({x_first}) h_bits={h_ok}({h_first}) hquant_bits={hq_ok}({hq_first}) \
+             down_bits={d_ok}({d_first}) fault={fault:?} {}",
+            set.name,
+            set.t,
+            stacks.experts.len(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The `cardrule` rounding site, once a gate run: a column whose every
+    /// 128-value block holds 127 (scale exactly 1) and the values `±(j +
+    /// 0.5)`, `±j` and `±(j + 0.25)` — every quotient a tie or an exact
+    /// integer, where a half-even rounding and a half-away one part (the
+    /// dump's columns land on a tie too rarely to pin the mode) — through
+    /// the card's quantizer and `qdot::card_q8_1`, bit for bit.
+    fn cardrule_ties(cx: &Cx, dv: &mut Dev) -> Result<bool, GateError> {
+        let stream = cx.gpu.stream();
+        let k = cx.meta.n_embd;
+        let col: Vec<f32> = (0..k)
+            .map(|i| {
+                let j = i % 128;
+                let sign = if (i / 128) % 2 == 0 { 1.0 } else { -1.0 };
+                match j {
+                    0 => 127.0,
+                    _ => {
+                        let m = ((j - 1) / 3) as f32;
+                        sign * match (j - 1) % 3 {
+                            0 => m + 0.5,
+                            1 => m,
+                            _ => m + 0.25,
+                        }
+                    }
+                }
+            })
+            .collect();
+        dv.x.copy_from_host(stream, &col)?;
+        stream.synchronize()?;
+        cx.gpu.clear_fault()?;
+        cx.gpu.enqueue_quantize_q8_1(&dv.x, &mut dv.act_x)?;
+        let host = qdot::card_q8_1(&col);
+        let (ok, first) = card_act_bits(
+            &host,
+            &dv.act_x.q3().to_host_vec(stream)?,
+            &dv.act_x.d8().to_host_vec(stream)?,
+            k,
+        );
+        stream.synchronize()?;
+        let fault = cx.gpu.take_fault()?;
+        let ties = col.iter().filter(|v| v.fract().abs() == 0.5).count();
+        let pass = ok && fault.is_none();
+        println!(
+            "cardrule ties k={k} ties={ties} x_bits={ok}({}) fault={fault:?} {}",
+            if ok { "-" } else { first.as_str() },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The `cardrule` tile site, once a gate run: the grouped prompt path
+    /// (`ds41_expert_gate_up_tiles`, `q4k_gemv_tiles`) over two tokens that
+    /// list the same experts — every expert serves two columns, `m = 2` —
+    /// against the host card-rule kernels' one-column calls, bit for bit.
+    fn cardrule_tiles(
+        cx: &Cx,
+        ly: &Layer,
+        stacks: &Stacks,
+        file: &RoutedFile<'_>,
+    ) -> Result<bool, GateError> {
+        let stream = cx.gpu.stream();
+        let (k, ff, l) = (cx.meta.n_embd, cx.meta.n_ff, ly.l);
+        let limit = cx.meta.clamp_exp[l];
+        let rb_gu = row_bytes(GgmlType::Q3_K, k)?;
+        let rb_d = row_bytes(GgmlType::Q4_K, ff)?;
+        if stacks.experts.len() < N_USED {
+            return Err("cardrule tiles: fewer uploaded experts than slots".into());
+        }
+        // Two tokens over the first N_USED places: token t's slot e + t*N_USED
+        // reads place e, so entry order groups each expert's two columns.
+        // The table covers every place the stacks hold (the launcher counts
+        // the stack's experts); the places past the first N_USED get empty
+        // runs.
+        let n_tbl = stacks.experts.len();
+        let slots = 2 * N_USED;
+        let order: Vec<u32> = (0..N_USED)
+            .flat_map(|e| [e as u32, (e + N_USED) as u32])
+            .collect();
+        let start: Vec<u32> = (0..=n_tbl).map(|e| (2 * e.min(N_USED)) as u32).collect();
+        let x = activations(k, 2, 0xE0A1_1757);
+        let x_ord: Vec<f32> = (0..slots)
+            .flat_map(|j| {
+                let t = order[j] as usize / N_USED;
+                x[t * k..(t + 1) * k].to_vec()
+            })
+            .collect();
+        let x_ord = DeviceBuffer::from_host(stream, &x_ord)?;
+        let mut act_ord = Q8Act::with_slots(stream, slots, k)?;
+        cx.gpu.enqueue_quantize_q8_1(&x_ord, &mut act_ord)?;
+        let start_dev = DeviceBuffer::from_host(stream, &start)?;
+        let order_dev = DeviceBuffer::from_host(stream, &order)?;
+        let mut tiles = DeviceBuffer::from_host(stream, &vec![0u32; tile_cap(slots, n_tbl) + 1])?;
+        let mut h = DeviceBuffer::from_host(stream, &vec![f32::NAN; slots * ff])?;
+        let kernels = FfnBatchKernels::load(cx.gpu.context())?;
+        stream.synchronize()?;
+        cx.gpu.clear_fault()?;
+        cx.gpu.q4k_sel().enqueue_grouped_tiles(
+            stream,
+            &start_dev,
+            n_tbl,
+            slots,
+            cx.gpu.unlabelled_sink(),
+            &mut tiles,
+        )?;
+        let g = TiledGateUp {
+            wg: stacks.wg.buf(),
+            wu: stacks.wu.buf(),
+            q3: act_ord.q3(),
+            d8: act_ord.d8(),
+            start: &start_dev,
+            tiles: &tiles,
+            n_experts: n_tbl,
+            rows_per_expert: ff,
+            n_slots: slots,
+            n_sb: k / 256,
+            limit,
+        };
+        kernels.enqueue_gate_up_tiles(stream, &g, cx.gpu.unlabelled_sink(), &mut h)?;
+        let h = h; // entry-major: entry j is slot order[j]'s
+        let mut act_h = Q8Act::with_slots(stream, slots, ff)?;
+        cx.gpu.enqueue_quantize_q8_1(&h, &mut act_h)?;
+        let table = TileTable {
+            order: &order_dev,
+            start: &start_dev,
+            tiles: &tiles,
+            n_experts: n_tbl,
+            n_slots: slots,
+        };
+        let down = TiledDown {
+            w: &stacks.wd,
+            act: &act_h,
+            table,
+            rows_per_expert: k,
+        };
+        let mut y = DeviceBuffer::from_host(stream, &vec![f32::NAN; slots * k])?;
+        cx.gpu
+            .q4k_sel()
+            .enqueue_gemv_q4k_tiles(stream, &down, cx.gpu.unlabelled_sink(), &mut y)?;
+        let (hv, yv) = (h.to_host_vec(stream)?, y.to_host_vec(stream)?);
+        stream.synchronize()?;
+        let fault = cx.gpu.take_fault()?;
+        // The host side, one column a time: each token's x, each expert's
+        // gate·up·SwiGLU rows, its h quantized, its down rows.
+        let mut want_h = vec![0.0f32; slots * ff];
+        let mut want_y = vec![0.0f32; slots * k];
+        for t in 0..2 {
+            let xcol = qdot::card_q8_1(&x[t * k..(t + 1) * k]);
+            for e in 0..N_USED {
+                let e_id = stacks.experts[e] as usize;
+                let base = e_id * ff * rb_gu;
+                let mut hcol = vec![0.0f32; ff];
+                for (r, o) in hcol.iter_mut().enumerate() {
+                    let g = qdot::card_q3k_dot_row(&file.gate[base + r * rb_gu..][..rb_gu], &xcol)?;
+                    let u = qdot::card_q3k_dot_row(&file.up[base + r * rb_gu..][..rb_gu], &xcol)?;
+                    *o = qdot::card_swiglu_clamp_1(g, u, limit);
+                }
+                // The tile gate·up's entry for (expert e, token t) is entry
+                // 2e + t of the grouped order; the down's slot is
+                // e + t*N_USED.
+                want_h[(2 * e + t) * ff..(2 * e + t + 1) * ff].copy_from_slice(&hcol);
+                let q = qdot::card_q8_1(&hcol);
+                let base_d = e_id * k * rb_d;
+                for (r, o) in want_y[(e + t * N_USED) * k..][..k].iter_mut().enumerate() {
+                    *o = qdot::card_q4k_dot_row(&file.down[base_d + r * rb_d..][..rb_d], &q)?;
+                }
+            }
+        }
+        let (h_ok, h_first) = bits_first(&hv, &want_h, "entry");
+        let (y_ok, y_first) = bits_first(&yv, &want_y, "slot");
+        let pass = h_ok && y_ok && fault.is_none();
+        println!(
+            "cardrule tiles layer={l} tokens=2 experts={N_USED} columns_per_expert=2 \
+             h_bits={h_ok}({h_first}) down_bits={y_ok}({y_first}) fault={fault:?} {}",
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The first bit mismatch of two equal-length f32 slices, as (ok, place).
+    fn bits_first(got: &[f32], want: &[f32], what: &str) -> (bool, String) {
+        for (i, (a, b)) in got.iter().zip(want).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                return (
+                    false,
+                    format!(
+                        "{what} {i}: card {a:?} ({:#010x}) host {b:?} ({:#010x})",
+                        a.to_bits(),
+                        b.to_bits()
+                    ),
+                );
+            }
+        }
+        (true, String::new())
     }
 
     /// The smallest power of two `c` with `c·v >= target` (at least 1): a
