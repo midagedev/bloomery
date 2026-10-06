@@ -119,30 +119,80 @@
 
 ## 열린 항목 — 받을 라운드별
 
-### The 0.2.2 cut (10-06, line1 — the user: simple fixes plus Qwen3.8's two-card passes, then release)
+### The 0.2.2 cut (10-06, line1 — the user: the simple fixes, Qwen3.8's two-card passes, vision, residency invariance, llama-server parity; light verification)
 
-What the cut holds. Each item lands through its owning gates; one union batch and one A/B run at the freeze.
-- **q38tier (line1):** Qwen3.8's pass and ubatch walk serve the expert tier card.
-  - Today `body38.rs:3957-3961` refuses several slots on a `bp` load, and `:15-30` feeds a `bp` prompt by steps.
-  - Design round running; the implementation rounds follow it.
-  - A/B: two-slot aggregate and pp512/pp4096 on A6000 + 3090 against today's step-fed rows.
-- **q3ilv (line2):** Qwen3.6's busy slots as one pass (q36rows, q35gen, q3ilv; three commits on b83f1269). It is
-  landing-ready; ptx-scan equals base. After it lands, re-time the 3090 two-request row (README footnote ¹).
-- **slotpoison, qualmig (line2):** state pending.
-- **glmresdiag (line3):** GLM's residency diagnosis flags and one residency clause owner across V4.1, GLM and Qwen3.8
-  (gate code). Landing after its four-key rerun.
-- **glmbpdef (line3):** the GLM seat's unset `--place` becomes `bp` when a second card is visible and the plan has room.
-  glmbp-ab +13.0 % ± 2.8 decode, +11.1 % ± 0.5 pp512, inside the card's band; its decide-in moves the default.
-- **iqhost (line1):** IQ4_NL / IQ4_XS host dots, 0 ULP against ik on real rows. gate-qdot is green. qdot-rate lease
-  pending.
-- **num3090run (line1, tools):** the runners time `--place a` on a lone 3090 (the server's own plan and residency), and
-  Qwen3.8's load line names its cards. Then re-sit V4.1 3090, Qwen3.8 bp and Qwen3.6 two-request rows for the README
-  (rig-log 10-06#num3090).
+Verification is light by the user's rule ("the big verification ran in 0.2.1; verify the changed parts only"). Each
+piece lands on its owning gates plus the static checks, with ptx-scan wherever a kernel could move. There is no
+full union batch. A same-lease A/B runs only for a piece that moves a dispatch path.
 
-Outside the cut:
-- iqsel, iqgemm, q6khead (i-quant card experts) stay on their own track.
-- The vision rounds (visinj, visserve).
-- GLM bp two-request 35.26 sits below its card's 36..43 band; the cause is not determined.
+**Landed (main):**
+- `4bf06411`, `61c05232`, `23ff9777` q3ilv (line2): Qwen3.6's busy slots in one pass; gate-gpu-qwen35moe-e2e and
+  gate-gpu-qwen3-serve green.
+- `6cc3e868` iqhost (line1): IQ4_NL / IQ4_XS host dots, 0 ULP against ik on real rows; gate-qdot and
+  gate-gpu-qwen4exp-e2e green. Its qdot-rate lease (`docs/cards/iqhost-rate.card`) is still to sit.
+- `01d8b285` coldslots (line2), `dbc7951a`: the depth runners' residency column counts the slots passes.
+- `c194026b`, `52b163c4`: README numbers on one RTX 3090 and on A6000 + 3090 (rig-log 10-06#num3090); CONTRIBUTING
+  welcomes AI-assisted pull requests and pull requests for hardware we do not have.
+
+**In flight:**
+
+| Item | Owner | What it does | State |
+|---|---|---|---|
+| q38tslots | line1, GLM round | Qwen3.8 several slots in one pass on `--place bp` (the tier sized to the step port's 8 columns, `body38.rs:3957-3962` refusal gone) | running; spec `specs/release/q38tier/specs/q38tslots.md` |
+| q38tseat | line1, after q38tslots + num3090run + qualmig | the qwen38 seat runs one pass on every placement (`pass_of_slots` loses `!tiered`) | spec ready |
+| num3090run | line1, opus round | the runners time `--place a` on a lone 3090 (the server's own plan and residency); Qwen3.8's load line names its cards through `generate::card_words` | running |
+| qualmig | line2 | every seat's rounds through `rounds::step_round` / `pass_round`; host only, ptx equal to base | gates on the round ledger |
+| slotpoison | line2 | a host tier that refused after a launch releases the card's waits (no server hang) | in only if R1–R4 match today |
+| glmresdiag | line3 | GLM's residency diagnosis flags and one residency clause owner | four-key rerun; GLM static may miss 0.2.2 |
+| glmbpdef | line3 | the GLM seat's unset `--place` is `bp` when a second card is visible and the plan has room (glmbp-ab +13.0 % ± 2.8 decode, +11.1 % ± 0.5 pp512) | after glmresdiag |
+| vision V3b/V4b/V3c/V4c | line3 owns the landing | V4.1 images: visinj (engine injection), visserve (API), visref (the smalinin-fork oracle, KLD and top-1 against a text-only control band, real-image answers to a vision judge), visseat (the seat) | visserve rebased; visinj in mutants; visref on the box; visseat to spec |
+| eqA1, eqC, E1 | line2 | residency invariance as the default (below) | eqA1 and eqC running |
+| anthropic | line1, opus round | `/v1/messages` and `/v1/messages/count_tokens` as llama-server serves them | running |
+| parity1 | line1, after anthropic lands | `--api-key`, `/v1/responses` (+ `/input_tokens`), `/v1/completions`, `/chat/completions/input_tokens` | to spec |
+
+**Re-sit for the README** (one hold, after num3090run): the following rows.
+- V4.1 on the 3090 at `--place a` (residency on).
+- Qwen3.8 bp, one stream and two.
+- Qwen3.6 two-request on the 3090. The 10-06 window read 254.3 / 254.7 / 254.8 but carried [cpu-busy] [other-busy]
+  [cold], so it is void.
+- `q38tbp-gap` (where the bp step's +5.92 ms sits).
+
+**Decisions of the day:**
+- **Qwen3.8 on two cards** (design `specs/release/q38tier/report`):
+  - The prompt is already batched over the tier (`d6ca8ed2`). Only the several-slots pass was missing.
+  - bp is slower than the A6000 alone. One stream measures 44.95 tok/s (runner-rejected rows) against 61.22. Two
+    streams after q38tslots are predicted at 63..78 against 82.70 [derived].
+  - So Qwen3.8 keeps `--place a` as its recommendation and gets no bp default.
+  - The lever is the bp step penalty, 123 µs a layer, up to +36 % [derived].
+- **Residency invariance** (eqdesign, `specs/multiseq2/eqdesign/report.md`):
+  - The user first chose an opt-in `--strict`, then withdrew it ("decided too early; handle it as fully as we can").
+  - The goal is invariance on by default: the host takes the card's q8_1 rule (A), and one slot-order combine runs
+    across the tiers (C).
+  - Predicted cost [derived]: V4.1 decode −0.1..−0.4 %, prose prefill 0..−1.8 %, lcg prefill 0..−10 %. GLM decode
+    ≤ −0.8 %. Qwen3.8 0..−1 %.
+  - E1, the host bench of the card rule, measures the one open term before eqA2 wires V4.1.
+  - If E1 shows a real cost, bring the number to the user before any opt-in mode.
+  - 0.2.2 takes E1 and C if they are green today. eqA2 (V4.1), GLM and Qwen3.8 follow.
+
+### llama-server parity (10-06, line1 — the user: "what llama-server does that we do not"; read from llama.cpp `9e47962ef` `tools/server/server.cpp:250-372` against our `crates/serve/src/api.rs:769`, `:849-865`)
+
+| Gap | What uses it | Size | Release |
+|---|---|---|---|
+| `/v1/messages`, `/v1/messages/count_tokens` (Anthropic) | Claude Code, the Anthropic SDK (`ANTHROPIC_BASE_URL`) | S–M, serve only | 0.2.2 (round anthropic) |
+| `--api-key` | any server reachable past localhost; today there is no key check at all | S | 0.2.2 (parity1) |
+| `/v1/responses`, `/responses`, `/v1/responses/input_tokens` (OpenAI Responses API) | Codex CLI, new OpenAI SDK clients | S–M, a conversion layer like anthropic's | 0.2.2 (parity1) |
+| `/v1/completions` (OpenAI text completion) | OpenAI-compatible text clients; we serve `/completion` and `/completions` only | XS | 0.2.2 (parity1) |
+| `/chat/completions/input_tokens`, `/v1/chat/completions/input_tokens` | token counting before a request | XS, shares count_tokens' core | 0.2.2 (parity1) |
+| `response_format` (JSON mode), `json_schema`, `grammar` | structured output for agents and apps; refused by name today (`api.rs:849-865`) | M–L: a grammar-constrained sampler on every seat | 0.2.3, first |
+| `logprobs`, `top_logprobs`, `n_probs` | eval harnesses, some clients; refused today | S–M: per-token top-k of the head's logits | 0.2.3 |
+| `n > 1` | several answers a request | M: the slots | later |
+| `/infill` (FIM) | editor completion plugins; needs a model with FIM tokens | S | later, with a FIM-capable model |
+| `/v1/chat/completions/control`, `GET/DELETE /v1/stream`, `/v1/streams/lookup` | stop a running generation, reattach a dropped stream | M | later |
+| embeddings, rerank, audio transcription, LoRA adapters, `/models/load`·`/unload` (router mode), web UI, `/tools`, `/cors-proxy` | — | — | out of scope: no such model or mode in bloomery |
+
+Rule for each row: llama-server's handler and its `tools/server/tests/unit/test_*.py` cases are the oracle. The cases
+port to `crates/serve/tests/`, one test per contract. An unsupported field stays refused by name until its row
+lands.
 
 ### The 0.2.1 cut (10-05 night → 10-06, line1 — the hold below is lifted: 0.2.1 waited for multistream on every family)
 
