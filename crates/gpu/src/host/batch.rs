@@ -509,7 +509,8 @@ impl BatchPort {
                 ),
             });
         }
-        set.routed.synchronize()?;
+        let routed = &set.routed;
+        super::await_done("BatchPort::routed_ids", || routed.query())?;
         Ok(&set.ids[at * s..u * s])
     }
 
@@ -550,7 +551,8 @@ impl BatchPort {
             });
         }
         let t0 = Instant::now();
-        set.routed.synchronize()?;
+        let routed = &set.routed;
+        super::await_done("BatchPort::serve", || routed.query())?;
         let t1 = Instant::now();
         for (t, port) in self.tiers.iter_mut().enumerate() {
             let TierPort {
@@ -1251,7 +1253,7 @@ impl<H: HostExperts> HostTier<H> {
                 .set_poison(SERVE_BATCH, key.layer, Some(e), None);
             self.release_all();
         }
-        r
+        r.map_err(|e| self.noted(e))
     }
 
     /// The last batch service's [`UnionCols`] — the per-expert column counts

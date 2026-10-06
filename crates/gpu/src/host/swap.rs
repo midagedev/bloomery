@@ -1926,6 +1926,52 @@ impl SwapMachine {
         Arc::clone(&self.shared.window)
     }
 
+    /// What the machine holds, for the error of an engine wait that ran out
+    /// of its bound: the copies still waiting for staging, each ring slot's
+    /// staged and drained tickets, the window, the due line and flush, and
+    /// the next boundary a flip lands at.
+    #[must_use]
+    pub(crate) fn stall_note(&self) -> String {
+        let s = &self.shared;
+        let waiting = self
+            .jobs_issued
+            .saturating_sub(s.served.load(Ordering::Acquire));
+        let ring = (0..RING_SLOTS)
+            .map(|k| {
+                format!(
+                    "{}/{}",
+                    s.staged(k).load(Ordering::Acquire),
+                    s.drained(k).load(Ordering::Acquire)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lands = self
+            .layers
+            .clone()
+            .filter_map(|l| self.ledger.row(l))
+            .flatten()
+            .filter_map(|st| match st {
+                SlotState::Filling { live_at, .. } => Some(*live_at),
+                _ => None,
+            })
+            .min();
+        format!(
+            "the residency machine holds {waiting} of {} copies waiting for staging (ring \
+             staged/drained {ring}), the staging window {}, due below job {}, flush {}, the next \
+             flip landing at boundary {}",
+            self.jobs_issued,
+            if s.window.load(Ordering::Acquire) != 0 {
+                "open"
+            } else {
+                "closed"
+            },
+            s.due.load(Ordering::Acquire),
+            s.flush.load(Ordering::Acquire),
+            lands.map_or_else(|| "none".to_string(), |b| b.to_string()),
+        )
+    }
+
     /// The machine's copy stream, for a gate that holds its copies to show
     /// the engine stream waits for them; nothing else enqueues on it.
     #[must_use]

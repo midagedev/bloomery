@@ -3307,10 +3307,14 @@ impl ChainBody for Body38 {
     /// host tier's reset. The K/V planes and the
     /// raw and pooled keys need nothing: nothing reads a row at or past a
     /// live count, and every row below it is written by its own step first.
-    /// Synchronizes.
+    /// Synchronizes: the engine stream waited for within
+    /// [`crate::host::ENGINE_BOUND`] before the first blocking copy and at
+    /// the end ([`crate::host::await_done`]).
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        const WHAT: &str = "Body38::reset";
         let stream = gpu.stream();
         self.hybrid.settle(stream)?;
+        crate::host::await_done(WHAT, || stream.query()).map_err(|e| self.hybrid.noted(e))?;
         let most = self
             .stores
             .iter()
@@ -3350,8 +3354,7 @@ impl ChainBody for Body38 {
         }
         self.sp.write(stream, 0, 0)?;
         debug_assert_eq!(LANE, 0);
-        stream.synchronize()?;
-        Ok(())
+        crate::host::await_done(WHAT, || stream.query()).map_err(|e| self.hybrid.noted(e))
     }
 
     fn head_eps(&self) -> f32 {
@@ -3570,6 +3573,10 @@ impl HostServed for Body38 {
     fn serve_captured(&mut self, chain: Chain) -> Result<(), GpuError> {
         self.hybrid.serve_captured_of(chain)?;
         planted(&mut self.plant, Plant::AfterLaunch)
+    }
+
+    fn noted(&self, e: GpuError) -> GpuError {
+        self.hybrid.noted(e)
     }
 
     fn take_host_refusal(&mut self) -> Option<Refusal> {
