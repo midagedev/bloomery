@@ -7,7 +7,9 @@
 //! (`geo::FF` rows of `geo::HIDDEN` values each) and the down (`geo::HIDDEN`
 //! rows of `geo::FF`), each of its layer's own type as the file holds it —
 //! most layers a Q4_K gate and up and a Q5_1 down, some a Q5_K gate and up or
-//! a Q8_0 down ([`Qwen38Stacks::of`] reads each layer's from the plan). On
+//! a Q8_0 down, and the UD-Q3_K_XL file's an IQ3_XXS or IQ4_XS gate and up
+//! with an IQ4_NL down
+//! ([`Qwen38Stacks::of`] reads each layer's from the plan). On
 //! the card each part of slot `s` is the file's bytes of that expert at byte
 //! `s · part` of its layer's stack, which the placed load uploads as file
 //! bytes in slot order ([`place::card_routed`] keeps all three stacks in
@@ -65,9 +67,15 @@ pub const LIVE_DELAY: u64 = 2;
 pub const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The types the card leg runs a routed stack in, by its place: the gate and
-/// up Q4_K or Q5_K, the down Q5_1 or Q8_0 ([`place::card_routed`]).
-const GATE_UP: [GgmlType; 2] = [GgmlType::Q4_K, GgmlType::Q5_K];
-const DOWN: [GgmlType; 2] = [GgmlType::Q5_1, GgmlType::Q8_0];
+/// up Q4_K, Q5_K, IQ3_XXS or IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL
+/// ([`place::card_routed`]).
+const GATE_UP: [GgmlType; 4] = [
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::IQ3_XXS,
+    GgmlType::IQ4_XS,
+];
+const DOWN: [GgmlType; 3] = [GgmlType::Q5_1, GgmlType::Q8_0, GgmlType::IQ4_NL];
 
 /// Qwen3.8's [`FileStacks`] for the common file source: each layer's gate, up
 /// and down by name, each layer's types as the plan holds them, and nothing
@@ -86,7 +94,8 @@ impl Qwen38Stacks {
     /// three stacks, and a layer whose stacks are all card types
     /// ([`place::card_routed`]), so that the plan puts its experts on the
     /// card, but not as the card leg runs them — a gate and an up of one
-    /// type, Q4_K or Q5_K, and a down Q5_1 or Q8_0. A layer with a stack of
+    /// type, Q4_K, Q5_K, IQ3_XXS or IQ4_XS, and a down Q5_1, Q8_0 or
+    /// IQ4_NL. A layer with a stack of
     /// another type keeps its experts on the host and is listed as the file
     /// holds it. Load-time only.
     pub fn of(model: &ModelTensors) -> Result<Qwen38Stacks, GpuError> {
@@ -165,7 +174,8 @@ impl FileStacks for Qwen38Stacks {
                 "Qwen38Stacks::open",
                 "an r8 sidecar beside a qwen4exp file: the sidecar holds Q3_K \
                  stacks (qdot::repack_q3k_r8), and this model's routed gate and up \
-                 are Q4_K or Q5_K and its down Q5_1 or Q8_0 — undefined input, not a \
+                 are Q4_K, Q5_K, IQ3_XXS or IQ4_XS and its down Q5_1, Q8_0 or IQ4_NL \
+                 — undefined input, not a \
                  conversion",
             ));
         }

@@ -60,6 +60,26 @@
 //! 8. **Refusals by name.** A wrong type, short words, `k` off the block,
 //!    m outside 1..=8, short `sel` or `y`: each an `Err(Shape)` of its
 //!    launcher naming the case.
+//! 9. **Route vs host dot, a real file** (`--model <path>`): the Qwen3.8
+//!    UD-Q3_K_XL first shard's own stacks, four experts a layer of layers 0
+//!    (IQ3_XXS/IQ4_NL), 4 (IQ3_XXS/Q8_0) and 2 (IQ4_XS/Q8_0), read from the
+//!    split and uploaded as the plan's word streams. The card entries
+//!    (`iq_sel`'s, and `q8_0_gemv_sel32` for the Q8_0 downs) and
+//!    `qdot::dot_row` on the same rows, each side through its own activation
+//!    quantizer (the device's q8_1 of 128 values the gate·ups and 32 the
+//!    downs, qdot's own column for the host), rule-composed for the gate·ups
+//!    — per output `|card − host| ≤ bound_card + bound_host`, each side
+//!    within its own bound of the f64 reference. `bound_card` is clause 3's
+//!    derivation; `bound_host` the same activation term at qdot's block size
+//!    (256 the K-quants, 32 the others) with the host kernel's arithmetic
+//!    band `γ_n·Σ|leaves|`, `n` and the leaf bound `qwen4exp_host`'s
+//!    over-count (`4·k/256 + 12` and `k/32 + 12`, a leaf at most
+//!    `127·d_B·Σ_{i∈B}|w_i|`), and for IQ4_XS beside those the kernel's
+//!    `maddubs` saturation term ([`iq4xs_saturation`]): its pairs of
+//!    `(kv + 128)·q` products saturate the i16 lane on real weights, a
+//!    deviation from the dequant reference the term counts exactly — qdot's
+//!    iq kernels are ik's rule, which saturates, and the card entries
+//!    ggml's, which does not.
 //!
 //! The bound of clause 3 (gate_iq.rs's derivation). A value `x` of a
 //! 128-value q8_1 block with scale `d = amax/127` is stored as `q·d` with
@@ -101,10 +121,12 @@ mod gate {
     use bloomery_gpu::kquant::act::{self, Act};
     use bloomery_gpu::kquant::walk_a_planes;
     use bloomery_gpu::q5::Q8Blocks32;
+    use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels};
     use bloomery_gpu::{DeviceTensor, Q8Act};
     use bloomery_gpu_gates::rounding::{U, butterfly, gamma};
     use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, data_dir, verdict};
     use cuda_core::{CudaStream, DeviceBuffer};
+    use gguf::Split;
     use gguf::iq_tables::KVALUES_IQ4NL;
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
     use runtime::words::stream_words;
@@ -573,9 +595,473 @@ mod gate {
         gpu: Gpu,
         iqsel: IqSelKernels,
         iq: IqKernels,
+        q80: Q80SelKernels,
     }
 
-    /// Clauses 1, 2 and 3 over one gate·up geometry (`band` and `cross` off
+    /// One side's dot band of a dequantized row `w` with an activation
+    /// column `x` quantized in `block`-value blocks of scale `amax/127`: the
+    /// activation term `Σ_B (d_B/2)(1+256u)·Σ_{i∈B}|w_i|` plus the kernel's
+    /// arithmetic band `γ_n·Σ|leaves|`, `n` over-counted as
+    /// `qwen4exp_host`'s (`4·k/256 + 12` at 256, `k/32 + 12` at 32). The
+    /// iq and K-quant kernels sum each block's `ŵ·x̂` in exact integers
+    /// under one scale product a term pair (the value sum and the min
+    /// term's block sums, `dot_iq4xs_q8k_emul`), so a leaf's magnitude is
+    /// the block's real value: at most `max|x̂|·Σ_{i∈B}|w_i|`, and
+    /// `|x̂| ≤ 127·d_B` (clause 9).
+    fn host_dot_band(w: &[f32], x: &[f32], block: usize) -> f64 {
+        let n = if block == 256 {
+            4 * w.len() / 256 + 12
+        } else {
+            w.len() / 32 + 12
+        };
+        let (mut act_t, mut leaf_t) = (0.0f64, 0.0f64);
+        for (wb, xb) in w.chunks(block).zip(x.chunks(block)) {
+            let amax = xb.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            let d = f64::from(amax / 127.0);
+            let sw: f64 = wb.iter().map(|&v| f64::from(v.abs())).sum();
+            act_t += d / 2.0 * (1.0 + 256.0 * U) * sw;
+            leaf_t += 127.0 * d * sw;
+        }
+        act_t + gamma(n) * leaf_t
+    }
+
+    /// The IQ4_XS host dot's saturation term (clause 9): qdot's kernel sums
+    /// each pair of `(kv + 128)·q` products in one i16 `maddubs` lane, which
+    /// saturates at 32,767 — `kv`'s largest entry is 113, a code at most
+    /// 127, a pair at most `2·241·127 = 61,214` — and a pair that passes it
+    /// loses its excess to the clamp, `dot_iq4xs_q8k_emul`'s own mirror of
+    /// the instruction. The excess is an exact integer over the row's codes
+    /// and the column's codes (`quantize_col_scalar`, the bit-identical
+    /// twin the crate documents); each pair's weight in the dot is
+    /// `d·dy·sc`, so this returns the lost excess times that scale, block
+    /// by block. IQ3_XXS cannot saturate (`|kv + 64| ≤ 71`, a pair at most
+    /// `2·71·127 = 18,034`), and the 32-value cells fold the weight's sign
+    /// into the activation with `|w| ≤ 128` (`2·128·127 = 32,512`), so the
+    /// downs need no term.
+    fn iq4xs_saturation(row: &[u8], x: &[f32]) -> f64 {
+        let kb = x.len() / 256;
+        let mut cb = vec![0u8; qdot::col_bytes(GgmlType::IQ4_XS, x.len())];
+        qdot::quantize_col_scalar(GgmlType::IQ4_XS, x, &mut cb);
+        const KV: [i32; 16] = [
+            -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+        ];
+        let mut out = 0.0f64;
+        for i in 0..kb {
+            let blk = &row[136 * i..136 * (i + 1)];
+            let d = f64::from(half_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
+            let dy = f64::from(f32::from_le_bytes(
+                cb[296 * i..296 * i + 4]
+                    .try_into()
+                    .expect("the block's scale"),
+            ));
+            let scales_h = u16::from_le_bytes([blk[2], blk[3]]);
+            let scales_l = &blk[4..8];
+            let sc = |b: usize| {
+                let lo = (scales_l[b / 2] >> (4 * (b % 2))) & 0x0f;
+                let hi = ((scales_h >> (2 * b)) & 3) as u8;
+                i32::from(lo | (hi << 4)) - 32
+            };
+            for b in 0..8 {
+                let qs = &blk[8 + 16 * b..8 + 16 * b + 16];
+                let qc = |n: usize| i32::from(cb[296 * i + 8 + 32 * b + n] as i8);
+                for p in 0..16 {
+                    let mut v = 0i64;
+                    for j in [2 * p, 2 * p + 1] {
+                        let kv = if j < 16 {
+                            KV[usize::from(qs[j] & 0x0f)]
+                        } else {
+                            KV[usize::from(qs[j - 16] >> 4)]
+                        };
+                        v += i64::from(kv + 128) * i64::from(qc(j));
+                    }
+                    let excess = v.unsigned_abs().saturating_sub(32_767);
+                    out += f64::from(u32::try_from(excess).unwrap_or(0))
+                        * (d * dy * f64::from(sc(b))).abs();
+                }
+            }
+        }
+        out
+    }
+
+    /// One stack of the real file over four experts, as the plan uploads it:
+    /// their file bytes in id order, the word stream, and the per-row byte
+    /// width of its type.
+    struct FileStack {
+        ty: GgmlType,
+        k: usize,
+        rows_per: usize,
+        words: Vec<u32>,
+        bytes: Vec<u8>,
+        per: usize,
+        row_bytes: usize,
+    }
+
+    /// Layer `l`'s stack `name` of `ty` over `ids`, read from `split`.
+    fn file_stack(
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        split: &Split,
+        name: &str,
+        ty: GgmlType,
+        ids: &[u32],
+    ) -> Result<FileStack, GateError> {
+        let t = inputs
+            .model
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| format!("the file holds no {name}"))?;
+        if t.ty != ty {
+            return Err(format!("{name} is {}, the clause reads a {ty} stack", t.ty).into());
+        }
+        let experts = inputs.model.experts;
+        let per = usize::try_from(t.file_bytes / experts).unwrap_or(0);
+        let (s, info) = split
+            .find(name)
+            .ok_or_else(|| format!("the split holds no {name}"))?;
+        let whole = split
+            .shard(s)
+            .ok_or_else(|| format!("shard {s}"))?
+            .data(info)
+            .map_err(|e| format!("{name}: {e}"))?;
+        let mut bytes = Vec::with_capacity(per * ids.len());
+        for &id in ids {
+            let at = id as usize * per;
+            bytes.extend_from_slice(
+                whole
+                    .get(at..at + per)
+                    .ok_or_else(|| format!("{name}: expert {id} past its bytes"))?,
+            );
+        }
+        let (k, rows_per) = (
+            usize::try_from(t.dims[0]).unwrap_or(0),
+            usize::try_from(t.dims[1]).unwrap_or(0),
+        );
+        let row_bytes =
+            (k as u64 / ty.blck_size().unwrap_or(1) * ty.type_size().unwrap_or(1)) as usize;
+        let rows = rows_per * ids.len();
+        let words = stream_words_of(&bytes, rows)?;
+        Ok(FileStack {
+            ty,
+            k,
+            rows_per,
+            words,
+            bytes,
+            per,
+            row_bytes,
+        })
+    }
+
+    impl FileStack {
+        /// Expert `e`'s row `r`, its file bytes and its dequantized values.
+        fn row(&self, e: usize, r: usize) -> &[u8] {
+            &self.bytes[self.per * e + r * self.row_bytes..][..self.row_bytes]
+        }
+
+        fn dequant(&self, e: usize, r: usize, out: &mut [f32]) -> Result<(), GateError> {
+            dequant_row(self.ty, self.row(e, r), out).map_err(|e| e.to_string().into())
+        }
+
+        /// The device upload of the four experts' rows.
+        fn upload(&self, s: &CudaStream) -> Result<DeviceTensor<u32>, GateError> {
+            let rows = self.rows_per * 4;
+            Ok(DeviceTensor::upload(
+                s,
+                &self.words,
+                rows,
+                self.words.len() / rows,
+            )?)
+        }
+    }
+
+    /// The rule-composed band of one side's `h` against the f64 reference
+    /// (clause 3's composition, `silu' ≤ 1.1`): `1.1·Eg·|u| + |silu(g)|·Eu`
+    /// over that side's own two dot bands.
+    fn silu_band(eg: f64, g64: f64, eu: f64, u64v: f64) -> f64 {
+        1.1 * eg * u64v.abs() + silu64(g64).abs() * eu
+    }
+
+    /// Clause 9 (module doc): the route-vs-host dots over the real file's
+    /// own stacks. Returns whether every assertion held.
+    fn check_real_file(c: &Ctx, path: &str) -> Result<bool, GateError> {
+        let split = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let inputs = model::arch::qwen35moe::place::PlanInputs::describe(&split)
+            .map_err(|e| format!("describe {path}: {e}"))?;
+        let ids: [u32; 4] = [0, 1, 17, 299];
+        // The layer, its gate·up type and its down type, as the design
+        // table reads the file.
+        let layers: [(usize, GgmlType, GgmlType); 3] = [
+            (0, GgmlType::IQ3_XXS, GgmlType::IQ4_NL),
+            (4, GgmlType::IQ3_XXS, GgmlType::Q8_0),
+            (2, GgmlType::IQ4_XS, GgmlType::Q8_0),
+        ];
+        let s = c.gpu.stream();
+        let mut ok = true;
+        for (l, gu_ty, down_ty) in layers {
+            let [gn, un, dn] = [
+                model::arch::qwen35moe::names::ffn_gate_exps(l),
+                model::arch::qwen35moe::names::ffn_up_exps(l),
+                model::arch::qwen35moe::names::ffn_down_exps(l),
+            ];
+            let (g, u, d) = (
+                file_stack(&inputs, &split, &gn, gu_ty, &ids)?,
+                file_stack(&inputs, &split, &un, gu_ty, &ids)?,
+                file_stack(&inputs, &split, &dn, down_ty, &ids)?,
+            );
+            let (mut card_max, mut host_max, mut cross_max, mut ref_max) =
+                (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+            let (mut card_ok, mut host_ok, mut cross_ok) = (true, true, true);
+            let (mut worst_si, mut worst_r, mut worst) = (0usize, 0usize, f64::NEG_INFINITY);
+            let (mut worst_part, mut worst_vals) = (String::new(), String::new());
+
+            // The gate·ups: four columns of ten slots, every slot one of the
+            // four experts, the card leg's own rule composing the dots.
+            let m = 4usize;
+            let fmt = match gu_ty {
+                GgmlType::IQ3_XXS => IqFormat::Iq3Xxs,
+                _ => IqFormat::Iq4Xs,
+            };
+            let x = seeded(m * g.k, 5101 + l as u32, -2.0, 4.0);
+            let xd = DeviceBuffer::from_host(s, &x)?;
+            let mut act = Q8Act::with_k(s, m, g.k)?;
+            c.gpu.enqueue_quantize_q8_1_cols(&xd, &mut act, m, 0)?;
+            s.synchronize()?;
+            let cols = act_cols(&act, s)?;
+            let sel: Vec<u32> = (0..m)
+                .flat_map(|_| [0u32, 1, 2, 3, 0, 1, 2, 3, 0, 1])
+                .collect();
+            let sel_dev = DeviceBuffer::from_host(s, &sel)?;
+            let (wg, wu) = (g.upload(s)?, u.upload(s)?);
+            let mut h = DeviceBuffer::from_host(s, &vec![SENT; sel.len() * g.rows_per])?;
+            c.iqsel.enqueue_gate_up(
+                s,
+                &IqGateUp {
+                    ty: gu_ty,
+                    wg: &wg,
+                    wu: &wu,
+                    act: &act,
+                    sel: &sel_dev,
+                    n_slots: sel.len(),
+                    rows_per_expert: g.rows_per,
+                    slots_per_col: SLOTS,
+                    rule: Act::SiluMul,
+                },
+                c.gpu.unlabelled_sink(),
+                &mut h,
+            )?;
+            s.synchronize()?;
+            let h_card = h.to_host_vec(s)?;
+            // The host's own columns, qdot's quantizer a token.
+            let host_cols: Vec<Vec<u8>> = (0..m)
+                .map(|col| {
+                    let mut cb = vec![0u8; qdot::col_bytes(gu_ty, g.k)];
+                    qdot::quantize_col(gu_ty, &x[col * g.k..][..g.k], &mut cb);
+                    cb
+                })
+                .collect();
+            let mut w_f32 = vec![0.0f32; g.k];
+            let mut w_up = vec![0.0f32; u.k];
+            for (si, &e) in sel.iter().enumerate() {
+                let col = si / SLOTS;
+                for r in 0..g.rows_per {
+                    // The f64 reference and the card's band: clause 3's
+                    // machinery over the same rows.
+                    g.dequant(e as usize, r, &mut w_f32)?;
+                    let (g64, eg) = dot_ref(
+                        fmt,
+                        g.row(e as usize, r),
+                        &w_f32,
+                        &x[col * g.k..],
+                        &cols[col],
+                    );
+                    u.dequant(e as usize, r, &mut w_up)?;
+                    let (u64v, eu) = dot_ref(
+                        fmt,
+                        u.row(e as usize, r),
+                        &w_up,
+                        &x[col * g.k..],
+                        &cols[col],
+                    );
+                    let hv = f64::from(h_card[si * g.rows_per + r]);
+                    let reference = silu64(g64) * u64v;
+                    let bound_card = 1.1 * eg * u64v.abs()
+                        + silu64(g64).abs() * eu
+                        + 16.0 * U * (g64 * u64v).abs().max(hv.abs());
+                    // The host's dots and their band over its own columns.
+                    let (gh, uh) = (
+                        f64::from(
+                            qdot::dot_row(g.ty, g.row(e as usize, r), &host_cols[col], g.k)
+                                .expect("a fused dot"),
+                        ),
+                        f64::from(
+                            qdot::dot_row(u.ty, u.row(e as usize, r), &host_cols[col], u.k)
+                                .expect("a fused dot"),
+                        ),
+                    );
+                    let (ehg, ehu) = (
+                        host_dot_band(&w_f32, &x[col * g.k..], 256)
+                            + if gu_ty == GgmlType::IQ4_XS {
+                                iq4xs_saturation(
+                                    g.row(e as usize, r),
+                                    &x[col * g.k..(col + 1) * g.k],
+                                )
+                            } else {
+                                0.0
+                            },
+                        host_dot_band(&w_up, &x[col * u.k..], 256)
+                            + if gu_ty == GgmlType::IQ4_XS {
+                                iq4xs_saturation(
+                                    u.row(e as usize, r),
+                                    &x[col * u.k..(col + 1) * u.k],
+                                )
+                            } else {
+                                0.0
+                            },
+                    );
+                    let host_h = silu64(gh) * uh;
+                    let bound_host = silu_band(ehg, gh, ehu, uh);
+                    let host_err = (host_h - reference).abs();
+                    if host_err - bound_host > worst {
+                        (worst_si, worst_r, worst) = (si, r, host_err - bound_host);
+                        worst_part = "gu".to_string();
+                        worst_vals = format!(
+                            "g64 {g64:.4} u64 {u64v:.4} gh {gh:.4} eg {eg:.3e} uh {uh:.4} eu \
+                             {eu:.3e} host {host_h:.4} ref {reference:.4} band {bound_host:.3e} \
+                             row_u {row_u:02x?} x {xv:?} w_up {wu:?} w_tail {wt:?} x_tail {xt:?}",
+                            row_u = &u.row(e as usize, r)[..16],
+                            xv = &x[col * g.k..][..4],
+                            wu = &w_up[..2],
+                            wt = &w_up[1000..1004],
+                            xt = &x[col * g.k + 1000..][..4],
+                        );
+                    }
+                    card_ok &= (hv - reference).abs() <= bound_card;
+                    host_ok &= host_err <= bound_host;
+                    cross_ok &= (hv - host_h).abs() <= bound_card + bound_host;
+                    card_max = card_max.max((hv - reference).abs());
+                    host_max = host_max.max(host_err);
+                    cross_max = cross_max.max((hv - host_h).abs());
+                    ref_max = ref_max.max(reference.abs());
+                }
+            }
+
+            // The downs: one column a slot, the IQ4_NL entry or the Q8_0
+            // one against qdot's own column.
+            let n_slots = sel.len();
+            let x = seeded(n_slots * d.k, 5201 + l as u32, -2.0, 4.0);
+            let (act_d, cols_d) = blocks32_cols(&c.gpu, &x, d.k, n_slots)?;
+            let wd = d.upload(s)?;
+            let mut y = DeviceBuffer::from_host(s, &vec![SENT; n_slots * d.rows_per])?;
+            match down_ty {
+                GgmlType::IQ4_NL => {
+                    c.iqsel.enqueue_down(
+                        s,
+                        &IqDown {
+                            w: &wd,
+                            act: &act_d,
+                            sel: &sel_dev,
+                            n_slots,
+                            rows_per_expert: d.rows_per,
+                        },
+                        c.gpu.unlabelled_sink(),
+                        &mut y,
+                    )?;
+                }
+                GgmlType::Q8_0 => {
+                    c.q80.enqueue_gemv_q8_0_sel32(
+                        s,
+                        &Q80SelDown {
+                            w: &wd,
+                            act: &act_d,
+                            sel: &sel_dev,
+                            n_slots,
+                            rows_per_expert: d.rows_per,
+                        },
+                        c.gpu.unlabelled_sink(),
+                        &mut y,
+                    )?;
+                }
+                other => panic!("the down clause reads IQ4_NL or Q8_0, not {other}"),
+            }
+            s.synchronize()?;
+            let y_card = y.to_host_vec(s)?;
+            let host_cols: Vec<Vec<u8>> = (0..n_slots)
+                .map(|si| {
+                    let mut cb = vec![0u8; qdot::col_bytes(down_ty, d.k)];
+                    qdot::quantize_col(down_ty, &x[si * d.k..][..d.k], &mut cb);
+                    cb
+                })
+                .collect();
+            let mut w_d = vec![0.0f32; d.k];
+            for (si, &e) in sel.iter().enumerate() {
+                for r in 0..d.rows_per {
+                    d.dequant(e as usize, r, &mut w_d)?;
+                    let mut reference = 0.0f64;
+                    for (wi, xi) in w_d.iter().zip(&x[si * d.k..][..d.k]) {
+                        reference += f64::from(*wi) * f64::from(*xi);
+                    }
+                    let yv = f64::from(y_card[si * d.rows_per + r]);
+                    let yh = f64::from(
+                        qdot::dot_row(d.ty, d.row((e as usize + 1) % 4, r), &host_cols[si], d.k)
+                            .expect("a fused dot"),
+                    );
+                    // The card's band over the read-back column: the
+                    // activation term of its 32-value blocks and its
+                    // `(A·d_w)·e` terms bounded by `127·|e_B|·Σ|w|`, the
+                    // arithmetic `γ(3·n_it + 6)` (check_nl's derivation).
+                    let kb = d.k / 32;
+                    let (mut act_t, mut mag) = (0.0f64, 0.0f64);
+                    for b in 0..kb {
+                        let e_b = f64::from(cols_d[si].1[b]);
+                        let sw: f64 = w_d[32 * b..32 * b + 32]
+                            .iter()
+                            .map(|&v| f64::from(v.abs()))
+                            .sum();
+                        act_t += e_b / 2.0 * (1.0 + 256.0 * U) * sw;
+                        mag += 127.0 * e_b * sw;
+                    }
+                    let n_it = kb.div_ceil(32);
+                    let bound_card = act_t + gamma(3 * n_it + 6) * mag;
+                    let bound_host =
+                        host_dot_band(&w_d, &x[si * d.k..][..d.k], qdot::k_granularity(down_ty));
+                    let host_err = (yh - reference).abs();
+                    if host_err - bound_host > worst {
+                        (worst_si, worst_r, worst) = (si, r, host_err - bound_host);
+                        worst_part = "down".to_string();
+                        worst_vals = format!(
+                            "yh {yh:.4} ref {reference:.4} band {bound_host:.3e} card {yv:.4}"
+                        );
+                    }
+                    card_ok &= (yv - reference).abs() <= bound_card;
+                    host_ok &= host_err <= bound_host;
+                    cross_ok &= (yv - yh).abs() <= bound_card + bound_host;
+                    card_max = card_max.max((yv - reference).abs());
+                    host_max = host_max.max(host_err);
+                    cross_max = cross_max.max((yv - yh).abs());
+                    ref_max = ref_max.max(reference.abs());
+                }
+            }
+            let no_fault = c.gpu.take_fault()?.is_none();
+            ok &= card_ok && host_ok && cross_ok && no_fault;
+            if !host_ok {
+                println!(
+                    "real[l={l}] worst host offender ({worst_part}): slot {worst_si} row \
+                     {worst_r}, over its band by {worst:.3e}: {worst_vals}",
+                );
+            }
+            println!(
+                "real[l={l} gu={gu_ty} down={down_ty}] card_band={} host_band={} cross_band={}                  fault=none {}",
+                verdict(card_ok),
+                verdict(host_ok),
+                verdict(cross_ok),
+                verdict(card_ok && host_ok && cross_ok && no_fault),
+            );
+            println!(
+                "real[l={l}] max errs card {card_max:.3e} host {host_max:.3e} cross                  {cross_max:.3e} against |ref| {ref_max:.3e}",
+            );
+        }
+        Ok(ok)
+    }
+
     /// for the 640-row case, whose rows the 4 × 80 geometries already
     /// cover), and the geometry's largest relative error for clause 3's pin.
     fn check_gu(
@@ -1371,6 +1857,7 @@ mod gate {
         let c = Ctx {
             iqsel: IqSelKernels::load(gpu.context(), gpu.fault_word())?,
             iq: IqKernels::load(gpu.context())?,
+            q80: Q80SelKernels::load(gpu.context(), gpu.fault_word())?,
             gpu,
         };
         let s = c.gpu.stream();
@@ -1432,6 +1919,14 @@ mod gate {
         ok &= check_ids_and_nan(&c)?;
         ok &= check_capture(&c)?;
         ok &= check_refusals(&c)?;
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(p) = args
+            .iter()
+            .position(|a| a == "--model")
+            .and_then(|i| args.get(i + 1))
+        {
+            ok &= check_real_file(&c, p)?;
+        }
         println!("gate_iq_sel: {}", verdict(ok));
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

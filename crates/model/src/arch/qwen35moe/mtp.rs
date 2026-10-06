@@ -520,21 +520,30 @@ pub fn head_kind(target: &Split, hidden: u32, vocab: u32) -> Result<BorrowedHead
                  {vocab}] matrix"
             ),
         })?;
-    match found.ty {
-        GgmlType::Q8_0 if found.dims == [u64::from(hidden), u64::from(vocab)] => {
-            Ok(BorrowedHead::Q8_0)
-        }
-        GgmlType::Q6_K if found.dims == [u64::from(hidden), u64::from(vocab)] => {
-            Ok(BorrowedHead::Q6K)
-        }
-        ty => Err(PlacementError::Tensor {
+    match output_form(found.ty) {
+        Some(kind) if found.dims == [u64::from(hidden), u64::from(vocab)] => Ok(kind),
+        _ => Err(PlacementError::Tensor {
             name: HEAD.to_string(),
             detail: format!(
-                "is {ty} {:?} in the target file; the MTP layer reads a Q8_0 or Q6_K [{hidden}, \
+                "is {} {:?} in the target file; the MTP layer reads a Q8_0 or Q6_K [{hidden}, \
                  {vocab}] matrix",
-                found.dims
+                found.ty, found.dims
             ),
         }),
+    }
+}
+
+/// The form the draft's borrowed head reads an `output` matrix of, `None`
+/// for a type no gemv of its program runs — the one owner of that list,
+/// matched by [`head_kind`] and asked by
+/// [`PlanInputs::mtp_borrows`](super::place::PlanInputs::mtp_borrows), so
+/// the borrow check and the reader admit the same types.
+#[must_use]
+pub fn output_form(ty: GgmlType) -> Option<BorrowedHead> {
+    match ty {
+        GgmlType::Q8_0 => Some(BorrowedHead::Q8_0),
+        GgmlType::Q6_K => Some(BorrowedHead::Q6K),
+        _ => None,
     }
 }
 
