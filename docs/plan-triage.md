@@ -132,6 +132,11 @@
 **Moved to 0.2.3, still running:**
 - q38tslots and q38tseat: bp is slower than one A6000, so they ship with the bp step-penalty fix;
 - vision, after visref's verdict;
+- Clef vision (`clefvis`): Clef-Flash is multimodal (Qwen3.5-9B backbone; bartowski ships
+  `mmproj-Cloudflare_clef-flash-{bf16,f16}.gguf`), and llama.cpp's `/v1/systemone` takes its images through mtmd
+  (a4cb4c61 `server-decision.cpp:199-242`, data URLs, at most 8). We refuse them by name
+  (`crates/decision/src/request.rs:144`). Needs the Qwen3.5 vision tower on `gpu-vision`'s kernels, the mmproj reader,
+  and visinj's injection lifted to a common owner for Body35. Design round after visinj lands;
 - residency invariance (E1, eqC, eqA*);
 - parity1;
 - structured output.
