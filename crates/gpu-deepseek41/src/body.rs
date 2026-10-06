@@ -2716,6 +2716,10 @@ impl HostServed for Body {
         self.hybrid.serve_captured_of(chain).and(rows)
     }
 
+    fn noted(&self, e: GpuError) -> GpuError {
+        self.hybrid.noted(e)
+    }
+
     /// The host tier's refusal that failed the step's service, once
     /// ([`Hybrid::take_step_refusal`]).
     fn take_host_refusal(&mut self) -> Option<Refusal> {

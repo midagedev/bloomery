@@ -2414,6 +2414,10 @@ impl HostServed for Body {
         self.planted(Plant::AfterLaunch)
     }
 
+    fn noted(&self, e: GpuError) -> GpuError {
+        self.hybrid.noted(e)
+    }
+
     fn take_host_refusal(&mut self) -> Option<Refusal> {
         self.hybrid.take_step_refusal()
     }

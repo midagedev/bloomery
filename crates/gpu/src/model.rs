@@ -170,6 +170,13 @@ pub trait HostServed {
     /// `None` on any other load.
     fn host_residency(&self) -> Option<&HostResidency>;
 
+    /// `e` with what the host tier's residency machine holds now when it is
+    /// a [`GpuError::Stalled`] ([`crate::host::HostTier::noted`]): a body
+    /// with a machine forwards to its tier; the default leaves `e` as it is.
+    fn noted(&self, e: GpuError) -> GpuError {
+        e
+    }
+
     /// The residency boundary at `at` on the engine stream `stream`
     /// ([`crate::host::HostTier::swap_at`]): the flips live there land and
     /// the next ones are issued. Before a launch ([`BoundaryAt::Launch`]) it
@@ -1390,6 +1397,12 @@ impl<B: ChainBody> GpuModel<B> {
         let mut e = match r {
             Ok(v) => return Ok(v),
             Err(e @ GpuError::Fault { .. }) => e,
+            // The stream did not drain within the bound: the fault word's
+            // read would wait it out again.
+            Err(e @ GpuError::Stalled { .. }) => match self.body.host() {
+                Some(h) => h.noted(e),
+                None => e,
+            },
             Err(e) => self.fault_behind(what, e),
         };
         if let GpuError::Fault { fault, .. } = &mut e {

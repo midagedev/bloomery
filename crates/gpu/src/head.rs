@@ -473,11 +473,15 @@ impl Head {
         Ok(self.tokens(gpu)?[0])
     }
 
-    /// The argmax tokens of the last run, one per row. Blocking read; a
-    /// raised fault is [`GpuError::Fault`], and a readback no argmax ever
-    /// wrote a state error, as [`Head::token`].
+    /// The argmax tokens of the last run, one per row. Blocking read: the
+    /// engine stream waited for within [`crate::host::ENGINE_BOUND`]
+    /// ([`crate::host::await_done`], past it [`GpuError::Stalled`]), then
+    /// the words copied back; a raised fault is [`GpuError::Fault`], and a
+    /// readback no argmax ever wrote a state error, as [`Head::token`].
     pub fn tokens(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
-        let mut out = self.token_out.to_host_vec(gpu.stream())?;
+        let stream = gpu.stream();
+        crate::host::await_done("Head::tokens", || stream.query())?;
+        let mut out = self.token_out.to_host_vec(stream)?;
         let (Some(sites), Some(word)) = (out.pop(), out.pop()) else {
             return Err(GpuError::state(
                 "Head::tokens",
