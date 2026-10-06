@@ -53,8 +53,6 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
   seats refuse at the start).
 - **Qwen3-30B, Qwen3.6 and Clef-Flash on a machine with two cards of different sizes** load on CUDA device 0, which
   may be the smaller card. Pick the larger one with `CUDA_VISIBLE_DEVICES`.
-- **Docker:** the image's server listens on 127.0.0.1 inside the container, so `-p 8080:8080` does not reach it. Add
-  `--host 0.0.0.0` after the image name.
 
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
 [`docs/serving.md`](docs/serving.md#limits).
@@ -73,7 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/relea
 
 # or Docker (needs the host's NVIDIA Container Toolkit; model downloads live in the bloomery-cache volume)
 docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
-  ghcr.io/midagedev/bloomery --host 0.0.0.0 --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
+  ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
 tar -xzf bloomery-0.2.3-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.3-linux-x86_64-cuda-sm86
