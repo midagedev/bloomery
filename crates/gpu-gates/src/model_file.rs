@@ -9,7 +9,7 @@
 //! repo's model card says it quantizes ([`quantized_from`]), fetched by
 //! [`fetch_exact`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use hf::HfError;
@@ -99,15 +99,29 @@ fn print(e: &Event<'_>) {
     }
 }
 
+/// The MTP draft file name a `--hf` resolve also fetches when the repo
+/// holds a file of it, landing it beside the picked set where the engine's
+/// draft rule opens it from: the qwen4exp family's shared draft
+/// ([`refset::arch::qwen4exp::mtp::DRAFT`]'s file name), the one family
+/// whose draft is a file of its own beside the target — GLM's NextN is
+/// inside the target, so it needs none.
+fn draft_name() -> &'static str {
+    Path::new(refset::arch::qwen4exp::mtp::DRAFT)
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("the qwen4exp DRAFT path names no file")
+}
+
 /// The local path of what `flags` and `env` (the gates' variable, `None`
 /// for a binary that reads none) name: a path as given, a repo's set
-/// fetched and checked (its first shard). `None` when nothing names one.
+/// fetched and checked (its first shard), the family's MTP draft beside it
+/// when the repo holds the file. `None` when nothing names one.
 pub fn resolve(flags: &Flags, env: Option<&str>) -> Result<Option<PathBuf>, GateError> {
     match source::resolve(flags, env)? {
         None => Ok(None),
         Some(Source::File(p)) => Ok(Some(PathBuf::from(p))),
         Some(Source::Hf(r)) => {
-            let files = client()?.resolve(&r, &mut print)?;
+            let files = client()?.resolve(&r, Some(draft_name()), &mut print)?;
             Ok(Some(files.into_iter().next().ok_or_else(|| {
                 format!("--hf {r}: the picked set has no file")
             })?))

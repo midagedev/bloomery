@@ -4,8 +4,9 @@
 //! `--fail --location --continue-at -`, so an HTTP error is an exit code and
 //! a partial file resumes where it stopped.
 //!
-//! A file lands at its cache path ([`crate::cache_path`]) only after its
-//! size and its digest ([`crate::Check`]) match the listing's: curl writes
+//! A file lands at its cache path ([`crate::cache_path`]) — the MTP draft
+//! beside the set's first shard instead — only after its size and its
+//! digest ([`crate::Check`]) match the listing's: curl writes
 //! `<file>.part`, the check reads it whole, and the rename makes it the
 //! file. Beside it, `<file>.verified` holds the digest it was checked
 //! against, so a later start trusts a file of the right size whose marker
@@ -275,11 +276,24 @@ impl Client {
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<PathBuf, HfError> {
         let dest = cache_path(&self.root, repo, &entry.path)?;
-        let part = with_suffix(&dest, ".part");
-        let marker = with_suffix(&dest, ".verified");
+        self.fetch_to(repo, entry, &dest, events)
+    }
+
+    /// `entry` of `repo` fetched to `dest` — the MTP draft's `dest` is
+    /// beside the set's first shard, not its cache path — checked and marked
+    /// as the module says; `dest`.
+    fn fetch_to(
+        &self,
+        repo: &str,
+        entry: &Entry,
+        dest: &Path,
+        events: &mut dyn FnMut(&Event<'_>),
+    ) -> Result<PathBuf, HfError> {
+        let part = with_suffix(dest, ".part");
+        let marker = with_suffix(dest, ".verified");
         let file = entry.path.as_str();
         let mut state = State::Fetch;
-        if let Some(len) = size_of(&dest)? {
+        if let Some(len) = size_of(dest)? {
             if len > entry.size {
                 return Err(HfError::Size {
                     file: dest.display().to_string(),
@@ -296,9 +310,9 @@ impl Client {
                         state: State::Cached,
                         from: entry.size,
                     });
-                    return Ok(dest);
+                    return Ok(dest.to_path_buf());
                 }
-                let got = digest(&dest, entry.check, entry.size)?;
+                let got = digest(dest, entry.check, entry.size)?;
                 if got == entry.digest {
                     events(&Event::File {
                         file,
@@ -313,12 +327,12 @@ impl Client {
                         check: entry.check,
                         digest: &got,
                     });
-                    return Ok(dest);
+                    return Ok(dest.to_path_buf());
                 }
-                remove(&dest)?;
+                remove(dest)?;
                 state = State::Stale;
             } else {
-                rename(&dest, &part)?;
+                rename(dest, &part)?;
             }
             let _ = fs::remove_file(&marker);
         }
@@ -361,14 +375,14 @@ impl Client {
             });
         }
         write_marker(&marker, &got)?;
-        rename(&part, &dest)?;
+        rename(&part, dest)?;
         events(&Event::Done {
             file,
             fetched: entry.size - from,
             check: entry.check,
             digest: &got,
         });
-        Ok(dest)
+        Ok(dest.to_path_buf())
     }
 
     /// curl from the end of `part` to the end of the file, a `Progress`
@@ -438,10 +452,17 @@ impl Client {
     }
 
     /// The set `r` picks in its repo, every file fetched and checked; the
-    /// local paths in shard order (the first shard first).
+    /// local paths in shard order (the first shard first). `draft`, the MTP
+    /// draft file name a model family runs beside its set, is fetched too
+    /// when the repo holds a file of the name ([`crate::mtp_draft`]):
+    /// beside the set's first shard, under its own name, not at its repo
+    /// path. A repo holding none is fetched as it is, and offline the draft
+    /// is not looked for: the file an earlier fetch landed beside the
+    /// shards is found by the engine's own rule.
     pub fn resolve(
         &self,
         r: &RepoRef,
+        draft: Option<&str>,
         events: &mut dyn FnMut(&Event<'_>),
     ) -> Result<Vec<PathBuf>, HfError> {
         let entries = match self.listing(&r.repo) {
@@ -451,10 +472,19 @@ impl Client {
         let sets = gguf_sets(&r.repo, &entries)?;
         let set = crate::pick(&r.repo, &sets, r.quant.as_deref())?;
         events(&Event::Set { repo: &r.repo, set });
-        set.files
-            .iter()
-            .map(|e| self.fetch(&r.repo, e, events))
-            .collect()
+        let mut files = Vec::with_capacity(set.files.len());
+        for e in &set.files {
+            files.push(self.fetch(&r.repo, e, events)?);
+        }
+        if let Some(name) = draft
+            && let Some(e) = crate::mtp_draft(&r.repo, &entries, name)?
+        {
+            // Beside the first shard, under the name the engine opens it by:
+            // wherever the repo keeps the draft, the run finds it there.
+            let dest = files[0].with_file_name(name);
+            self.fetch_to(&r.repo, e, &dest, events)?;
+        }
+        Ok(files)
     }
 
     /// The one verified set of the cache `r` picks, the network having
@@ -681,6 +711,39 @@ mod tests {
         (0..300_000u32).map(|i| (i * 7 % 251) as u8).collect()
     }
 
+    /// A `file://` hub under `dir/hub` as `Client::listing` reads it: the
+    /// `files` (repo path → content) served at `resolve/main`, and the tree
+    /// listing that names them (`curl` reads `tree/main`, the query of the
+    /// API's URL dropped); a client caching under `dir/cache`.
+    fn hub(dir: &Path, repo: &str, files: &[(&str, &[u8])]) -> Client {
+        let mut json = Vec::new();
+        for (path, content) in files {
+            let src = dir.join("hub").join(repo).join("resolve/main").join(path);
+            fs::create_dir_all(src.parent().expect("parent")).expect("hub dir");
+            fs::write(&src, content).expect("hub file");
+            json.push(format!(
+                "{{\"type\":\"file\",\"path\":\"{path}\",\"size\":{},\"lfs\":{{\"oid\":\"{}\",\"size\":{}}}}}",
+                content.len(),
+                hex(&sha2::Sha256::digest(content)),
+                content.len()
+            ));
+        }
+        let tree = dir.join("hub/api/models").join(repo).join("tree");
+        fs::create_dir_all(&tree).expect("tree dir");
+        fs::write(tree.join("main"), format!("[{}]", json.join(","))).expect("listing");
+        Client {
+            base: format!("file://{}", dir.join("hub").display()),
+            token: None,
+            root: dir.join("cache"),
+            curl: "curl".into(),
+        }
+    }
+
+    /// `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`: the qwen4exp family's
+    /// draft file name, what a resolve is given and what the engine's draft
+    /// rule looks for beside the target.
+    const DRAFT: &str = "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+
     fn states(events: &[String]) -> Vec<String> {
         events
             .iter()
@@ -848,7 +911,7 @@ mod tests {
     fn offline_run(c: &Client, r: &str) -> (Result<Vec<PathBuf>, HfError>, Vec<String>) {
         let r = RepoRef::parse(r).expect("repo");
         let mut seen = Vec::new();
-        let got = c.resolve(&r, &mut |ev| {
+        let got = c.resolve(&r, None, &mut |ev| {
             seen.push(match ev {
                 Event::Offline { why, .. } => format!("offline {why}"),
                 Event::File { file, state, .. } => format!("file {file} {}", state.name()),
@@ -966,6 +1029,110 @@ mod tests {
             c.resolve_exact("c/h", &["nope.json"], &mut |_| {}),
             Err(HfError::Offline { .. })
         ));
+    }
+
+    #[test]
+    fn a_resolve_fetches_the_set_and_the_draft_beside_its_first_shard() {
+        let d = scratch("draft-beside");
+        let body = content();
+        let c = hub(
+            &d,
+            "a/b",
+            &[
+                ("UD-Q4_K_XL/m-UD-Q4_K_XL-00001-of-00002.gguf", &body),
+                ("UD-Q4_K_XL/m-UD-Q4_K_XL-00002-of-00002.gguf", &body),
+                ("MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", b"draft"),
+            ],
+        );
+        let r = RepoRef::parse("a/b:UD-Q4_K_XL").expect("repo");
+        let mut seen = Vec::new();
+        let got = c
+            .resolve(&r, Some(DRAFT), &mut |ev| {
+                if let Event::File { file, state, .. } = ev {
+                    seen.push(format!("file {file} {}", state.name()));
+                }
+            })
+            .expect("resolve");
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(
+            got[0],
+            d.join("cache/a/b/UD-Q4_K_XL/m-UD-Q4_K_XL-00001-of-00002.gguf")
+        );
+        // The draft lands beside the first shard under its own name — where
+        // the engine's draft rule looks for it — and nowhere else: not at
+        // its repo path under MTP/.
+        let beside = got[0].with_file_name(DRAFT);
+        assert_eq!(beside, d.join("cache/a/b/UD-Q4_K_XL").join(DRAFT));
+        assert_eq!(fs::read(&beside).expect("draft"), b"draft");
+        assert!(
+            !d.join("cache/a/b/MTP").exists(),
+            "the repo path was fetched"
+        );
+        assert_eq!(
+            seen,
+            [
+                "file UD-Q4_K_XL/m-UD-Q4_K_XL-00001-of-00002.gguf fetch".to_owned(),
+                "file UD-Q4_K_XL/m-UD-Q4_K_XL-00002-of-00002.gguf fetch".to_owned(),
+                format!("file MTP/{DRAFT} fetch"),
+            ]
+        );
+        // A second resolve fetches nothing: the draft too is `cached`.
+        let mut again = Vec::new();
+        c.resolve(&r, Some(DRAFT), &mut |ev| {
+            if let Event::File { state, .. } = ev {
+                again.push(state.name());
+            }
+        })
+        .expect("again");
+        assert_eq!(again, ["cached", "cached", "cached"]);
+    }
+
+    #[test]
+    fn a_repo_without_the_drafts_file_fetches_only_the_set() {
+        let d = scratch("draft-none");
+        let body = content();
+        let c = hub(&d, "a/b", &[("m-Q4_K_M.gguf", &body)]);
+        let r = RepoRef::parse("a/b:Q4_K_M").expect("repo");
+        let mut seen = Vec::new();
+        let got = c
+            .resolve(&r, Some(DRAFT), &mut |ev| {
+                if let Event::File { file, .. } = ev {
+                    seen.push(file.to_string());
+                }
+            })
+            .expect("resolve");
+        assert_eq!(got, [d.join("cache/a/b/m-Q4_K_M.gguf")]);
+        assert_eq!(seen, ["m-Q4_K_M.gguf"]);
+    }
+
+    #[test]
+    fn offline_the_draft_is_not_looked_for_but_stands_beside_the_shards() {
+        let d = scratch("draft-offline");
+        let body = content();
+        let online = hub(
+            &d,
+            "a/b",
+            &[("Q4_K_XL/m-Q4_K_XL.gguf", &body), (DRAFT, b"draft")],
+        );
+        let r = RepoRef::parse("a/b:Q4_K_XL").expect("repo");
+        online.resolve(&r, Some(DRAFT), &mut |_| {}).expect("fetch");
+        assert!(
+            d.join("cache/a/b/Q4_K_XL").join(DRAFT).is_file(),
+            "the online fetch landed the draft beside the set"
+        );
+        // The network gone: the set stands in from the cache and the draft
+        // is not looked for — the engine finds the fetched file by its name.
+        let c = unreachable(&d.join("cache"));
+        let mut seen = Vec::new();
+        let got = c
+            .resolve(&r, Some(DRAFT), &mut |ev| {
+                if let Event::File { file, state, .. } = ev {
+                    seen.push(format!("file {file} {}", state.name()));
+                }
+            })
+            .expect("offline");
+        assert_eq!(got, [d.join("cache/a/b/Q4_K_XL/m-Q4_K_XL.gguf")]);
+        assert_eq!(seen, ["file Q4_K_XL/m-Q4_K_XL.gguf offline-cached"]);
     }
 
     #[test]

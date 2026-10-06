@@ -5,7 +5,8 @@
 //! The pure part is here: the repo string ([`RepoRef`]), the listing the API
 //! answers (`api/models/<repo>/tree/main?recursive=true`, [`listing`]), the
 //! GGUF sets in it ([`gguf_sets`]) and the one a quant tag picks ([`pick`]),
-//! the files named exactly ([`exact`]), the cache paths ([`cache_root`],
+//! the files named exactly ([`exact`]), the MTP draft by its file name
+//! ([`mtp_draft`]), the cache paths ([`cache_root`],
 //! [`cache_path`]), where a model file comes from ([`source`]) and what a
 //! model card says ([`card`]). The network part, [`fetch`], is `curl`, the
 //! checks of what it wrote, and the cache standing in when the network
@@ -17,7 +18,10 @@
 //! `dspark-` in the name) are left out. It is stricter where llama.cpp takes
 //! the first match: a tag that matches two sets, a set missing a shard, and
 //! no tag on a repo of several sets are each refused by name, with the
-//! candidates.
+//! candidates. The one exception is the MTP draft: a resolve given the file
+//! name the family's draft goes by also fetches the repo's file of that name
+//! ([`mtp_draft`]) beside the set's first shard, where the engine opens it
+//! from; a repo holding no file of the name is fetched as it is.
 
 pub mod card;
 pub mod fetch;
@@ -55,6 +59,12 @@ pub enum HfError {
         repo: String,
         quant: String,
         sets: Vec<String>,
+    },
+    #[error("{repo}: the MTP draft {name:?} matches {} files: {}", .paths.len(), .paths.join(", "))]
+    TwoDrafts {
+        repo: String,
+        name: String,
+        paths: Vec<String>,
     },
     #[error("{repo}: the split set {set} of {count} shards lacks shard(s) {missing:?}")]
     IncompleteSet {
@@ -477,6 +487,28 @@ pub fn exact<'a>(
         .collect()
 }
 
+/// The repo's MTP draft file: the one entry whose file name is exactly
+/// `name`, the name the draft goes by wherever in the repo it sits (a root
+/// file or an `MTP/` folder). `None` when the repo holds no file of the
+/// name — nothing changes and nothing is refused; two entries of the name
+/// are [`HfError::TwoDrafts`] with both paths.
+pub fn mtp_draft<'a>(
+    repo: &str,
+    entries: &'a [Entry],
+    name: &str,
+) -> Result<Option<&'a Entry>, HfError> {
+    let hits: Vec<&Entry> = entries.iter().filter(|e| e.name() == name).collect();
+    match hits.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one)),
+        _ => Err(HfError::TwoDrafts {
+            repo: repo.to_owned(),
+            name: name.to_owned(),
+            paths: hits.iter().map(|e| e.path.clone()).collect(),
+        }),
+    }
+}
+
 /// The cache's root: `$BLOOMERY_CACHE` (`cache`) when set and non-empty,
 /// else `$HOME/.cache/bloomery/hf`; neither is [`HfError::NoCache`].
 pub fn cache_root(cache: Option<OsString>, home: Option<OsString>) -> Result<PathBuf, HfError> {
@@ -721,6 +753,68 @@ mod tests {
             exact("Cloudflare/clef-flash", &e, &["nope.json"]),
             Err(HfError::NoFile { .. })
         ));
+    }
+
+    /// unsloth's Qwen3.8-Flash-Next layout: the quants in a subfolder each,
+    /// the MTP drafts in an `MTP/` one, three shared quants and the
+    /// non-shared Q8_0 beside them at the root too.
+    fn qwen38_listing() -> Vec<Entry> {
+        let json = r#"[
+            {"type":"file","path":"README.md","size":3,"oid":"0123456789012345678901234567890123456789"},
+            {"type":"file","path":"UD-Q4_K_XL/m-UD-Q4_K_XL-00001-of-00002.gguf","size":10,"lfs":{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":10}},
+            {"type":"file","path":"UD-Q4_K_XL/m-UD-Q4_K_XL-00002-of-00002.gguf","size":10,"lfs":{"oid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":10}},
+            {"type":"file","path":"MTP/mtp-m-shared-BF16.gguf","size":10,"lfs":{"oid":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":10}},
+            {"type":"file","path":"MTP/mtp-m-shared-Q4_K_M.gguf","size":10,"lfs":{"oid":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","size":10}},
+            {"type":"file","path":"MTP/mtp-m-shared-Q8_0.gguf","size":10,"lfs":{"oid":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","size":10}},
+            {"type":"file","path":"MTP/mtp-m-Q8_0.gguf","size":10,"lfs":{"oid":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","size":10}},
+            {"type":"file","path":"mtp-m-Q8_0.gguf","size":10,"lfs":{"oid":"abababababababababababababababababababababababababababababababab","size":10}}
+        ]"#;
+        listing("a/b", json).expect("listing")
+    }
+
+    #[test]
+    fn the_mtp_draft_is_the_file_of_the_name_asked_wherever_it_sits() {
+        let e = qwen38_listing();
+        // No draft, root or MTP/, is a set.
+        let sets = gguf_sets("a/b", &e).expect("sets");
+        assert_eq!(sets.len(), 1, "{sets:#?}");
+        assert_eq!(sets[0].count, 2);
+        // The name picks the one file of it in the repo, and only that
+        // name: the shared draft's other quants are not it.
+        let d = mtp_draft("a/b", &e, "mtp-m-shared-Q8_0.gguf")
+            .expect("pick")
+            .expect("some");
+        assert_eq!(d.path, "MTP/mtp-m-shared-Q8_0.gguf");
+        assert_eq!(d.size, 10);
+        assert!(
+            mtp_draft("a/b", &e, "mtp-m-shared-Q4_K_M.gguf")
+                .expect("pick")
+                .is_some()
+        );
+        // A name the repo holds none of: nothing, not a refusal.
+        assert!(
+            mtp_draft("a/b", &e, "mtp-m-shared-Q6_K.gguf")
+                .expect("pick")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_draft_name_the_repo_holds_twice_is_refused_with_both_paths() {
+        let e = qwen38_listing();
+        // The non-shared Q8_0 draft sits in MTP/ and at the root: a name
+        // matching both is refused, as a quant matching two sets is.
+        match mtp_draft("a/b", &e, "mtp-m-Q8_0.gguf") {
+            Err(HfError::TwoDrafts { paths, .. }) => {
+                assert_eq!(paths, ["MTP/mtp-m-Q8_0.gguf", "mtp-m-Q8_0.gguf"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        let said = mtp_draft("a/b", &e, "mtp-m-Q8_0.gguf")
+            .expect_err("twice")
+            .to_string();
+        assert!(said.contains("MTP/mtp-m-Q8_0.gguf"), "{said}");
+        assert!(said.contains("the MTP draft"), "{said}");
     }
 
     #[test]

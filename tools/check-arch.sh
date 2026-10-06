@@ -134,6 +134,8 @@ dispatch=(
   'crates/gpu-gates/src/engine.rs use'
   # 디스패치가 아닌 유일한 항목: 하네스의 기본 참조 세트. ref_dir 가 Arch 를 받기 전까지 남는다.
   'crates/gpu-gates/src/lib.rs fn ref_dir'
+  # The --hf resolve's draft name: it reads only the file name of qwen4exp's DRAFT constant.
+  'crates/gpu-gates/src/model_file.rs fn draft_name'
 )
 # construct_lines <file> <fn|type|use> [name]: "first last" for each line span of that construct.
 construct_lines() {
