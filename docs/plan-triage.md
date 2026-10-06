@@ -132,6 +132,13 @@ v0.2.3 is 2647030c. Everything below is 0.2.4 work. The handoffs it was read fro
   9, so its clause (c) reads 9·t + 1.
 - Remove the worktrees that landed in 0.2.3 and their box dirs.
 
+- **parkfix (opus round, open defect):** the q38tslots round's `slots solo` clause found a parked slot's first plain
+  step after a partial keep diverging from its solo run (Qwen3.8; claimed on one card too, so in 0.2.3). Unverified;
+  the round reproduces it at main, narrows it, fixes it at one owner and checks every `SlotRows` implementor. It owns
+  `body38.rs`, `gpu-glm5next/src/pair.rs` and `model/slots.rs` until it lands. If confirmed, docs/serving.md's "each
+  request answers the tokens of its run alone" needs a Limits line or a patch release (the user's call). q38tslots
+  (WIP 88116629) waits on it, then rebases and reads clause (c) as 9·t + 1.
+
 **worker1 — placement and Qwen3.8 serve**
 - placeunset: one common rule for an unset `--place` (the user, 10-06). Design final in the lead specs
   `release/placeunset/report.md`: keep a tier only when the plan's next-card tier experts reach the family's
