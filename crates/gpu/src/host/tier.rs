@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! stage: router → handoff (+ q8_1 x, tier places) → go (+ tier go) → [shadow] → wait (host, tier) → join
-//! tier:  wait tier go, −1 → copy x, places in → [gate·up → h q8_1 → down → rows] → barrier → cnt +1, prog +1
+//! tier:  wait tier go, −1 → copy x, places in → [gate·up → h q8_1 → down] → copy rows out → barrier → cnt +1, prog +1
 //! ```
 //!
 //! The tiers' words live in one host-mapped page ([`TierPage`], laid out by
@@ -19,8 +19,14 @@
 //! reads, and the tier's fault copy. Per row it holds the image the stage
 //! card's handoff writes — each tier's places of the routed slots, then the
 //! stage card's q8_1 activation, which every tier reads — and the rows the
-//! tiers' downs write, one per routed slot, each tier its own slots, which
+//! tiers' downs computed, one per routed slot, each tier its own slots, which
 //! the stage card's join reads in place.
+//!
+//! A tier's launches write their rows into the tier card's own memory
+//! ([`TierIo::rows`]), and one copy a layer moves the go's columns of them
+//! to the page: the downs store a value a row, and a store of four bytes
+//! into host-mapped memory crosses the bus as a transaction of its own,
+//! which the copy engine's bulk write does not.
 //!
 //! A row may carry several columns ([`TierCard::open_cols`]): a
 //! [`Chain::Cols`] go hands the tier `m` consecutive positions in one image,
@@ -776,7 +782,10 @@ mod tier_kernels {
 /// (`n_used` places a column, a tier slot or [`super::slots::HOST`]) is a
 /// tier slot runs its expert and writes its down output over
 /// `rows[j · hidden ..]` for its routed slot `j` (column `j / n_used`); no
-/// other row is written. The staging holds the tier's columns
+/// other row is written. `rows` is the tier card's own buffer
+/// (`n_used · cols · hidden` of the tier's columns), which the protocol
+/// copies to the row's routed rows on the page after the launches. The
+/// staging holds the tier's columns
 /// ([`TierCard::open_cols`]), of which a go of the step or the pair fills
 /// one and a [`Chain::Cols`] go its width.
 pub struct TierIo<'a> {
@@ -888,9 +897,16 @@ pub struct TierStats {
     pub settle_ns: u64,
     /// Settles whose tier had already signalled when the host began to wait.
     pub settle_early: u64,
+    /// Passes of a captured chain that launched the tier's graph held for
+    /// it ([`TierCard::replay`]), passes fed a layer at a time for want of
+    /// one, and the graphs captured after those: a chain is fed and captured
+    /// once, at its first pass, and replayed by every later one.
+    pub replays: u64,
+    pub feeds: u64,
+    pub captures: u64,
 }
 
-/// One row's routed rows on the page as the tier's down writes them (the
+/// One row's routed rows on the page as the tier's copy out writes them (the
 /// tier's context).
 struct TierRows(ManuallyDrop<DeviceBuffer<f32>>);
 
@@ -933,6 +949,10 @@ pub struct TierCard {
     /// from the row's image.
     act: Staged,
     sel: DeviceBuffer<u32>,
+    /// The architecture's routed rows of the layer being served, on this
+    /// card ([`TierIo::rows`]): `n_used · cols · hidden`, copied to the
+    /// row's routed rows on the page after the launches.
+    out: DeviceBuffer<f32>,
     /// Per row, the page's routed rows in this card's context: made when the
     /// host tier binds the card to its page ([`TierCard::bind`]).
     rows: Vec<TierRows>,
@@ -1010,6 +1030,7 @@ impl TierCard {
             experts,
             module,
             sel: DeviceBuffer::zeroed(stream, cols * shape.n_used)?,
+            out: DeviceBuffer::zeroed(stream, cols * shape.n_used * shape.hidden)?,
             act,
             rows: Vec::new(),
             index: 0,
@@ -1100,19 +1121,20 @@ impl TierCard {
         self.stats.clone()
     }
 
-    /// Device bytes the tier holds besides its weights: the staging.
+    /// Device bytes the tier holds besides its weights: the staging and the
+    /// routed rows.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
-        self.act.device_bytes() + self.sel.num_bytes()
+        self.act.device_bytes() + self.sel.num_bytes() + self.out.num_bytes()
     }
 
     /// Nodes per tier layer of a captured tier graph whose image carries
     /// `act`: the go wait, the copies in ([`TierAct::copies`]), the
-    /// architecture's launches (`launches`) and the signal; the graph's last
-    /// layer adds the fault copy.
+    /// architecture's launches (`launches`), the routed rows' copy out and
+    /// the signal; the graph's last layer adds the fault copy.
     #[must_use]
     pub const fn nodes_per_layer(act: TierAct, launches: usize) -> usize {
-        1 + act.copies() + launches + 1
+        1 + act.copies() + launches + 1 + 1
     }
 
     /// Nodes of `chain`'s captured tier graph; `None` before its first
@@ -1244,11 +1266,13 @@ impl TierCard {
             return Ok(Pass::Graph);
         }
         let Some(graph) = self.graphs[i].as_ref().filter(|_| self.captured[i] == list) else {
+            self.stats.feeds += 1;
             return Ok(Pass::Feed);
         };
         self.gpu.context().bind_to_thread()?;
         graph.launch(self.gpu.stream())?;
         self.issue(list.len());
+        self.stats.replays += 1;
         self.rebind_stage()?;
         Ok(Pass::Graph)
     }
@@ -1279,6 +1303,7 @@ impl TierCard {
         })?;
         self.graphs[i] = Some(graph);
         self.captured[i] = list.to_vec();
+        self.stats.captures += 1;
         self.rebind_stage()
     }
 
@@ -1307,6 +1332,7 @@ impl TierCard {
             module,
             act,
             sel,
+            out,
             rows,
             index,
             weights,
@@ -1318,6 +1344,7 @@ impl TierCard {
             module,
             act,
             sel,
+            out,
             rows,
             page,
             index: *index,
@@ -1572,6 +1599,7 @@ struct Parts<'a> {
     module: &'a tier_kernels::LoadedModule,
     act: &'a mut Staged,
     sel: &'a mut DeviceBuffer<u32>,
+    out: &'a mut DeviceBuffer<f32>,
     rows: &'a mut [TierRows],
     page: &'a TierPage,
     index: usize,
@@ -1584,7 +1612,8 @@ impl Parts<'_> {
     /// first `cols` columns: wait for the row's go and take it back, copy
     /// those columns of the row's image — the activation (the q8_1 codes and
     /// their scales, or the f32 values), this tier's places — into the
-    /// staging, the architecture's launches into the row's routed rows, then
+    /// staging, the architecture's launches into the card's routed rows, one
+    /// copy of those columns' rows to the row's routed rows on the page, then
     /// (when `copy_fault`) the fault copy, a system barrier and the row's
     /// counter and the progress word each plus one.
     fn enqueue_layer(
@@ -1618,7 +1647,12 @@ impl Parts<'_> {
             Staged::Q8(a) => a.q3.len() * 2 == img.q3_words && a.d8.len() == img.d8_len,
             Staged::F32(x) => x.len() == img.x_len && img.q3_words + img.d8_len == 0,
         };
-        if !staged || self.sel.len() != img.n_used * img.cols {
+        let routed = img.n_used * cols * img.hidden;
+        if !staged
+            || self.sel.len() != img.n_used * img.cols
+            || self.out.len() < routed
+            || self.rows[row].0.len() < routed
+        {
             return Err(GpuError::shape(
                 WHAT,
                 "the staging is not the image's shape".to_string(),
@@ -1629,33 +1663,32 @@ impl Parts<'_> {
         let part = |len: usize| len / img.cols * cols;
         match &*self.act {
             Staged::Q8(a) => {
-                copy_in(
+                copy_page(
                     stream,
                     a.q3.cu_deviceptr(),
                     page.page.dev_at(at + 4 * img.q3),
                     4 * part(img.q3_words),
                 )?;
-                copy_in(
+                copy_page(
                     stream,
                     a.d8.cu_deviceptr(),
                     page.page.dev_at(at + 4 * img.d8),
                     4 * part(img.d8_len),
                 )?;
             }
-            Staged::F32(x) => copy_in(
+            Staged::F32(x) => copy_page(
                 stream,
                 x.cu_deviceptr(),
                 page.page.dev_at(at + 4 * img.x),
                 4 * part(img.x_len),
             )?,
         }
-        copy_in(
+        copy_page(
             stream,
             self.sel.cu_deviceptr(),
             page.page.dev_at(at + 4 * img.sel),
             4 * img.n_used * cols,
         )?;
-        let r = &mut self.rows[row];
         self.experts.enqueue_layer(
             self.gpu,
             self.weights,
@@ -1663,9 +1696,15 @@ impl Parts<'_> {
             TierIo {
                 act: self.act.input(),
                 sel: self.sel,
-                rows: &mut r.0,
+                rows: self.out,
                 cols,
             },
+        )?;
+        copy_page(
+            stream,
+            self.rows[row].0.cu_deviceptr(),
+            self.out.cu_deviceptr(),
+            4 * routed,
         )?;
         if copy_fault {
             let ctx = self.gpu.context();
@@ -1696,19 +1735,20 @@ impl Parts<'_> {
     }
 }
 
-/// Copy `bytes` from `src` to `dst` on `stream`: one copy node when
-/// captured.
-fn copy_in(
+/// Copy `bytes` from `src` to `dst` on `stream`, one span a device buffer of
+/// the tier's context and the other a span of the tier page (a field of a
+/// row's image in, a row's routed rows out): one copy node when captured.
+fn copy_page(
     stream: &CudaStream,
     dst: sys::CUdeviceptr,
     src: sys::CUdeviceptr,
     bytes: usize,
 ) -> Result<(), GpuError> {
-    // SAFETY: both spans are the caller's: `dst` a device buffer of the
-    // tier's context of at least `bytes`, `src` a span of the tier page
+    // SAFETY: both spans are the caller's, each at least `bytes`: one a
+    // device buffer of the tier's context, the other a span of the tier page
     // inside its allocation; both outlive every graph that captured the copy.
     let rc = unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, bytes, stream.cu_stream()) };
-    cu(rc, "cuMemcpyDtoDAsync_v2 (tier stage-in)")
+    cu(rc, "cuMemcpyDtoDAsync_v2 (tier page copy)")
 }
 
 #[cfg(test)]

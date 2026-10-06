@@ -1,0 +1,60 @@
+# Round q38bpbug (2026-10-06): Qwen3.8-Flash-Next UD-Q4_K_XL, one stream, after the expert tier's routed rows moved
+# from the downs' own stores into the host-mapped page to the tier card's memory and one copy a layer
+# (crates/gpu/src/host/tier.rs Parts::enqueue_layer, TierIo::rows). --place bp (A6000 + the 3090 as its expert
+# tier, 250 W cap) against --place a (the A6000 alone), same binary, same lease, draft off, prose 512, ctx 4352,
+# residency unset (mid-p130-s1 on both plans' load lines).
+#
+# Cause [measured, functional, not admissible: generate_qwen3moe --place bp, BLOOMERY_STEP_STATS=1, a temporary
+# probe, 63 steps]: the tier's down `_sel` stored each output row as one 4-byte store from lane 0 of its warp, straight
+# into the host-mapped page, ~6,400 stores a layer (2.5 tier slots x 2,560 rows). The tier's step graph free-run on the
+# 3090 alone over its 48 layers took 13.26 ms (276 us a layer); the same graph with the rows into a device buffer
+# 2.04 ms (42.5 us); the go wait, the copies in and the signal 0.70 ms; the wait and signal 0.28 ms. In place, the
+# host saw the tier's signal 204 us (p50) after the go, after its own in 2,883 of 3,024 services.
+#
+# [derived] The step from the host's view of a layer, period = host leg + the tier's lag past the host's signal + the
+# card's gap from there to the next go, plus c = 1.70 ms a step outside the layers (fitted to both pre-fix rows:
+# a 16.33 ms = 48 x 305.6 us + 1.66; bp 22.25 ms = 48 x 427.5 us + 1.73), from the functional records:
+#   a:          leg 79.1 + gap 226.5 (host signal to next go)            = 305.6 us -> 16.37 ms
+#   bp before:  leg 39.6 + lag 167.4 + gap 220.5 (tier signal to next go) = 427.5 us -> 22.22 ms
+#   bp after:   leg 35.3 + lag  25.8 + gap 225.6                         = 286.7 us -> 15.46 ms
+# bp after against a: 16.37 / 15.46 - 1 = +5.9 %. The tier now signals 58 us (p50) after the go, under the A6000's
+# shadow (its card leg and shared expert) where its 2.2..2.9 tier slots came off the host's leg; the gap past the
+# tier's signal grew 5 us (the shadow now outlasts the tier on some layers). Band +1..+9: the functional rows' window
+# scatter (+-3 % a row, the two arms from different runs) and the probe's spin on the host thread.
+# Read beside, not judged: GLM-5.3 bp before/after (the lead's sitting) [derived ~0]: its ~1.1 tier slots a row-layer
+# x 4,096 rows stored the same way cost ~0.17 ms at ~27 M stores/s [derived from the free runs above], under its 0.47..0.58 ms host
+# leg a row-layer (glmbp-ab.card); V4.1's c_two (1.9..2.5 ms a pass over its plan (a) calibration, source open,
+# glmbp-ab.card) may hold the same term [not measured].
+#
+# Resource timeline per bp layer after the fix [derived from the records above]: A6000 front ~194 us, then the wait on
+# max(host leg 35, tier 58 from the go, the A6000's shadow ~70), then the join and the next front (the gap, 226); the
+# 3090 busy ~55 us of the layer's ~287 (its 2.2..2.9 slots, 2 copies in, one ~100 KB copy out); PCIe ~10 KB in and
+# ~100 KB out a layer on the 3090's link, ~25 KB of mapped reads on the A6000's; host DRAM the 0.7 host slots a layer
+# (~2 MB); NVMe 0. The wall is the A6000's chain; nothing left on it is the tier's.
+#
+# Runner (the lead's sitting; the full output to a file first; arms as q38tslots-ab.card's one-stream twins, which the
+# runner's --parse-arms took on 2026-10-06; the bare arm is bp, the changed one, so the ratio line's bp / a is
+# card.py verdict's changed / base as printed):
+#   BLOOMERY_AB_ROUNDS=4 BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38bpbug-ab.card
+#   BLOOMERY_TIMING_CARDS=a6000+3090 BLOOMERY_GEN_PLACE=bp BLOOMERY_GEN_CTX=4352 BLOOMERY_DRAFT=off'
+#   just depth-gpu-qwen4exp prose:512 prose:512@place=a > <log> 2>&1
+# Wall [derived]: 2 arms x 4 rounds, a Qwen3.8 load 25..45 s, the prompt 0.4 s, 96 steps ~1.6 s: 6..9 min.
+kind: noninf
+question: with the expert tier's routed rows written to the 3090's memory and copied to the page once a layer, does
+  one Qwen3.8 stream on A6000 + 3090 (--place bp) decode no slower than on the A6000 alone (--place a)?
+term: decode tok/s @ n=96, prose 512, ctx 4352, draft off, residency unset, one stream, A6000 + RTX 3090 (250 W cap) +
+  host, --place bp against --place a, same binary, same lease, rounds rotated: (bp - a) / a, paired by round
+unit: %
+predict: +1..+9
+rounds: 4
+condition: one runner invocation from a tree holding this round's tier.rs, every arm a fresh load, the order rotated
+  each round; the bp arms' load lines name cards=[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090] with tier=3090 on their
+  plan line and the a arms' the A6000 alone; both arms' residency lines read mid-p130-s1 (or the same P); no FAIL row,
+  no [cold], [cpu-busy] or [other-busy] row among the counted rounds; the 3090 at 250 W and no Xid in any witness
+  block; the full output to a file first
+decide-in: bp is not slower: write the bp and a rows to rig-log's A6000 + 3090 table with the fix's commit, and re-sit
+  q38tslots-ab.card's two-stream arms on this binary, whose -24..-6 % band assumed the old tier chain
+decide-below: bp still loses or gains under +1 %: one functional BLOOMERY_STEP_STATS=1 run of each arm to re-read the
+  gap and the leg (the A6000's shadow, not the tier, now bounds the phase) before any README change
+decide-above: bp gains past +9 %: re-derive the gap term, which then fell with the tier's lag (the A6000's join and
+  front), before writing the row

@@ -36,9 +36,12 @@
 //!   tier's stage step graph and each verify graph hold the reference's
 //!   nodes less one a tier layer (its card leg drops the card sum, which the
 //!   join takes after the wait); the tier's graph of the step and of each
-//!   verify width holds eight nodes a tier layer (the go wait, the two copies
-//!   in, the four launches, the signal) and the fault copy. Precondition:
-//!   every tier layer was sent a routed slot by the steps.
+//!   verify width holds nine nodes a tier layer (the go wait, the two copies
+//!   in, the four launches into the tier card's rows, the rows' copy out to
+//!   the page, the signal) and the fault copy; each chain the history runs
+//!   is fed and captured once, at its first pass, and replayed by every
+//!   later one. Precondition: every tier layer was sent a routed slot by the
+//!   steps.
 //! - `--residency`: the tier load under `mid-p<P>-s1`, `P` half the plan's
 //!   fewest stage experts a layer (the stage's count, not the union's): the
 //!   history twice the same, flips landed; against the residency-off tier
@@ -127,9 +130,12 @@ mod gate {
     const BUDGETS: [u64; 10] = [26, 25, 24, 23, 22, 21, 20, 19, 18, 16];
     /// The go deadline and the grace a lost card is named within, plus room.
     const LOST_BOUND_S: f64 = 25.0;
-    /// Nodes of a tier graph a tier layer: the go wait, the activation's and
-    /// the places' copies in, the card leg's four launches, the signal.
+    /// Nodes of a tier graph a tier layer, nine: the go wait, the
+    /// activation's and the places' copies in, the card leg's four launches
+    /// into the tier card's rows, the rows' copy out to the page, the signal.
     const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(TierAct::F32, 4);
+    // PIN(2026-10-06): 8 -> 9, the rows' copy out; launches storing into the page held 385 against 433.
+    const _: () = assert!(TIER_LAYER_NODES == 9);
 
     struct Args {
         union: bool,
@@ -488,6 +494,26 @@ mod gate {
         );
         ok &= graphs_ok;
         let st = tier.stats();
+        // The history's passes: the steps, then one verify a window; its
+        // chains: the step's and one a distinct window width. Each chain's
+        // first pass is fed and its graph captured after it.
+        let mut widths: Vec<usize> = WINDOWS.iter().map(|w| w.0).collect();
+        widths.sort_unstable();
+        widths.dedup();
+        let chains = 1 + widths.len() as u64;
+        let passes = (PROMPT + 2 * STEPS + WINDOWS.len()) as u64;
+        let replay_ok = (st.feeds, st.captures, st.replays) == (chains, chains, passes - chains);
+        println!(
+            "structure: the tier's chains fed {} and captured {} times, replayed {} times; each of \
+             the history's {chains} chains fed and captured once, its {passes} passes' others \
+             replayed ({chains}, {chains}, {}): {}",
+            st.feeds,
+            st.captures,
+            st.replays,
+            passes - chains,
+            verdict(replay_ok)
+        );
+        ok &= replay_ok;
         let first = tier.set().layers().start;
         let hits = |l: usize| st.layer_hits.get(l - first).copied().unwrap_or(0);
         let missing: Vec<usize> = layers.iter().copied().filter(|&l| hits(l) == 0).collect();
