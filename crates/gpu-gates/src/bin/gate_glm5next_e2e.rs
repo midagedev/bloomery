@@ -325,6 +325,11 @@
 //! all` (the default) all four; it names the sets of the load at [`CTX`], so
 //! beside `--only pp` or `--only pplong` it is refused by name.
 //!
+//! Every clause prints one elapsed line when it ends — `clause (c) free in
+//! 3.2 s (runtime value)`, the load line's own shape — the header's code for
+//! it, the set's name in (t), the `--only` arm's name for a load's whole
+//! group of clauses.
+//!
 //! Named differences, not banded away: ik clamps each KDA state to ±1e6
 //! after every token, ours raises its fault site where the state stops being
 //! finite and clamps nothing; ik renormalizes the router's eight weights by
@@ -592,6 +597,15 @@ mod gate {
     /// A set's tap `name` in its logical order.
     fn tap(man: &RefManifest, name: &str) -> Result<Vec<f32>, GateError> {
         Ok(ref_tensor_logical_in(&man.dir, man.tensor(name, 0)?)?)
+    }
+
+    /// One clause's elapsed line when it ends: the module header's code for
+    /// it and its wall in seconds, the load line's own shape.
+    fn elapsed(what: &str, t: &Instant) {
+        println!(
+            "clause {what} in {:.1} s (runtime value)",
+            t.elapsed().as_secs_f64()
+        );
     }
 
     /// The open's records, as the gate prints them.
@@ -2487,6 +2501,15 @@ mod gate {
         })
     }
 
+    /// A slot clause's verdict with its elapsed line: the work timed inside
+    /// the closure, then [`clause`]'s FAIL line when it ended in one.
+    fn clause_timed(what: &str, body: impl FnOnce() -> Result<bool, GateError>) -> bool {
+        let t = Instant::now();
+        let r = body();
+        elapsed(what, &t);
+        clause(what, r)
+    }
+
     /// The (slots) clauses (the module header): the harness's contracts and
     /// the body's own between them on one load, then (sd) and (s3) on a load
     /// of their own.
@@ -2506,11 +2529,15 @@ mod gate {
             nextn,
             prompts: [a, b],
         };
+        let t = Instant::now();
         let mut s = slots_gate::interleave(&body)?;
-        let mut ok = clause("(sp) plan", slots_plan(&body, s.model()));
-        ok &= clause("(sc) cut", slots_cut(&mut s, &body));
-        ok &= clause("(g5) on the NextN load", g5_nextn(s.model()));
+        elapsed("(slots) harness open (H1, H3, H6, H7)", &t);
+        let mut ok = clause_timed("(sp) plan", || slots_plan(&body, s.model()));
+        ok &= clause_timed("(sc) cut", || slots_cut(&mut s, &body));
+        ok &= clause_timed("(g5) on the NextN load", || g5_nextn(s.model()));
+        let t = Instant::now();
         ok &= s.finish()?;
+        elapsed("(slots) harness finish (H4, H5, H5R)", &t);
         // (sd) and (s3) drive the MTP draft through a session, which owns
         // its model; the harness lends its own by reference only.
         let mut s = Session::from_model(body.open(SLOTS)?, u32::try_from(SLOT_CTX)?);
@@ -2519,6 +2546,7 @@ mod gate {
         let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
         let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut Quiet)?;
         let mut parked = vec![spec.draft().park(); SLOTS];
+        let t = Instant::now();
         let solo_a = drafted_solo(&mut s, &mut spec, &mut parked, 0, a)?;
         let solo_b = drafted_solo(&mut s, &mut spec, &mut parked, 0, b)?;
         let solo_passes = || solo_a[1].passes.iter().chain(&solo_b[1].passes);
@@ -2529,19 +2557,24 @@ mod gate {
             verdict(proposed)
         );
         ok &= proposed;
+        elapsed("(sd) solo runs", &t);
         let solos = (&solo_a[0], &solo_b[0]);
-        match slots_drafted(&mut s, &mut spec, &mut parked, (a, b), solos) {
+        let t = Instant::now();
+        let sd = slots_drafted(&mut s, &mut spec, &mut parked, (a, b), solos);
+        elapsed("(sd) drafted", &t);
+        match sd {
             Ok((sd, runs)) => {
                 ok &= sd;
-                let r = slots_resume(
-                    &mut s,
-                    &mut spec,
-                    &mut parked,
-                    c,
-                    runs,
-                    (&solo_a[1], &solo_b[1]),
-                );
-                ok &= clause("(s3) park/resume", r);
+                ok &= clause_timed("(s3) park/resume", || {
+                    slots_resume(
+                        &mut s,
+                        &mut spec,
+                        &mut parked,
+                        c,
+                        runs,
+                        (&solo_a[1], &solo_b[1]),
+                    )
+                });
             }
             Err(e) => {
                 ok &= clause("(sd) drafted", Err(e));
@@ -2550,7 +2583,9 @@ mod gate {
         }
         // The stagger's loads hold the card next: the drafted load goes first.
         drop((spec, parked, s));
+        let t = Instant::now();
         ok &= stagger(levers, &body.inputs, (a, b))?;
+        elapsed("arm stagger", &t);
         Ok(ok)
     }
 
@@ -2859,6 +2894,7 @@ mod gate {
     ) -> Result<bool, GateError> {
         let mut m = g_open(levers, inputs, KdaLanes::One, G_SLOTS)?;
         let [s0, s1] = G1_STEPS;
+        let t = Instant::now();
         let sa = g_solo(
             &mut m,
             a,
@@ -2866,14 +2902,18 @@ mod gate {
             &[s0, s0 + G_AFTER_CUT, G1B_ROUNDS],
         )?;
         let sb = g_solo(&mut m, b, s1, &[s1, G_AFTER_CUT - 1, G1B_ROUNDS])?;
+        elapsed("(g) solo runs", &t);
         let mut ok = true;
         for mode in [StepMode::Graph, StepMode::Eager] {
             m.set_mode(mode);
-            match g1_bits(&mut m, (a, b), (&sa, &sb), mode) {
+            let t = Instant::now();
+            let g1 = g1_bits(&mut m, (a, b), (&sa, &sb), mode);
+            elapsed(&format!("(g1) bits {mode:?}"), &t);
+            match g1 {
                 Ok((bits, runs)) => {
                     ok &= bits;
                     if mode == StepMode::Graph {
-                        ok &= clause("(g2) cut", g2_cut(&mut m, (a, b), runs, (&sa, &sb)));
+                        ok &= clause_timed("(g2) cut", || g2_cut(&mut m, (a, b), runs, (&sa, &sb)));
                     }
                 }
                 Err(e) => {
@@ -2883,16 +2923,15 @@ mod gate {
                     }
                 }
             }
-            ok &= clause(
-                &format!("(g1b) parked {mode:?}"),
-                g1b_parked(&mut m, (a, b), (&sa, &sb), mode),
-            );
+            ok &= clause_timed(&format!("(g1b) parked {mode:?}"), || {
+                g1b_parked(&mut m, (a, b), (&sa, &sb), mode)
+            });
         }
         m.set_mode(StepMode::Graph);
-        ok &= clause("(g3) fault", g3_fault(&mut m, (a, b), (&sa, &sb)));
-        ok &= clause("(g5) refusals", g5_refusals(&mut m, inputs, (a, b)));
+        ok &= clause_timed("(g3) fault", || g3_fault(&mut m, (a, b), (&sa, &sb)));
+        ok &= clause_timed("(g5) refusals", || g5_refusals(&mut m, inputs, (a, b)));
         drop(m);
-        ok &= clause("(g4) walk", g4_walk(levers, inputs, (a, b)));
+        ok &= clause_timed("(g4) walk", || g4_walk(levers, inputs, (a, b)));
         Ok(ok)
     }
 
@@ -4092,20 +4131,21 @@ mod gate {
         (a, b): (&[u32], &[u32]),
     ) -> Result<bool, GateError> {
         s.model_mut().set_mode(StepMode::Graph);
+        let t = Instant::now();
         let solos = [
             h_solo(s, a, &[None; H_ROUNDS])?,
             h_solo(s, b, &[None; H_ROUNDS])?,
         ];
+        elapsed("(h) solo runs", &t);
         let mut ok = true;
         for mode in [StepMode::Graph, StepMode::Eager] {
-            ok &= clause(
-                &format!("(h1) interleave {mode:?}"),
-                h1_bits(s, (a, b), &solos, mode),
-            );
+            ok &= clause_timed(&format!("(h1) interleave {mode:?}"), || {
+                h1_bits(s, (a, b), &solos, mode)
+            });
         }
-        ok &= clause("(h2) forced keeps", h2_kept(s, (a, b)));
-        ok &= clause("(h3) refusals", h3_refusals(s, inputs, (a, b)));
-        ok &= clause("(h4) walk", h4_walk(s, (a, b)));
+        ok &= clause_timed("(h2) forced keeps", || h2_kept(s, (a, b)));
+        ok &= clause_timed("(h3) refusals", || h3_refusals(s, inputs, (a, b)));
+        ok &= clause_timed("(h4) walk", || h4_walk(s, (a, b)));
         Ok(ok)
     }
 
@@ -4221,24 +4261,36 @@ mod gate {
         let sets = step_sets(only)?;
         let mut ok = true;
         if matches!(only, Only::All | Only::Main) {
+            let t = Instant::now();
             ok &= main_clauses(&levers, sets)?;
+            elapsed("arm main", &t);
         }
         if only == Only::Verify {
+            let t = Instant::now();
             ok &= verify_only(&levers)?;
+            elapsed("arm verify", &t);
         }
         if only == Only::Keep {
+            let t = Instant::now();
             let (mut s, _) = open(&levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
             ok &= keep_groups(&mut s)?;
+            elapsed("arm keep", &t);
         }
         if only == Only::PpLong {
+            let t = Instant::now();
             let (mut s, _) = open(&levers, CTX, PrefillMode::Steps, KdaLanes::One)?;
             ok &= prompt_long(s.model_mut())?;
+            elapsed("arm pplong", &t);
         }
         if matches!(only, Only::All | Only::Pp) {
+            let t = Instant::now();
             ok &= prompt_batch(&levers)?;
+            elapsed("arm pp", &t);
         }
         if matches!(only, Only::All | Only::Slots) {
+            let t = Instant::now();
             ok &= slots(&levers)?;
+            elapsed("arm slots", &t);
         }
         if only == Only::Stagger {
             let prefill = slot_prefill()?;
@@ -4246,7 +4298,9 @@ mod gate {
             let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
             let inputs = PlanInputs::read(&file)?;
             drop(file);
+            let t = Instant::now();
             ok &= stagger(&levers, &inputs, (a, b))?;
+            elapsed("arm stagger", &t);
         }
         if only == Only::StaggerDraft {
             let prefill = slot_prefill()?;
@@ -4264,7 +4318,9 @@ mod gate {
             let mut s = Session::from_model(body.open(SLOTS)?, u32::try_from(SLOT_CTX)?);
             s.model_mut().set_mode(StepMode::Graph);
             s.add_slots(SLOTS)?;
+            let t = Instant::now();
             ok &= stagger_draft(&mut s, &body.inputs, (a, b))?;
+            elapsed("arm stagger-draft", &t);
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }
@@ -4273,28 +4329,46 @@ mod gate {
     /// lanes: (v) verifies on it.
     fn main_clauses(levers: &bloomery_levers::Levers, sets: StepSets) -> Result<bool, GateError> {
         let (mut s, opened) = open(levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
+        let t = Instant::now();
         let mut ok = card::clauses(&mut s, &opened.n_l, opened.experts, opened.budgeted)?;
+        elapsed("(card)", &t);
         let m = s.model_mut();
+        let t = Instant::now();
         ok &= structure(m, &opened)?;
+        elapsed("(s)", &t);
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();
+        let t = Instant::now();
         let graph = run_steps(m, &toks, StepMode::Graph)?;
         let eager = run_steps(m, &toks, StepMode::Eager)?;
         ok &= one_chain(&graph, &eager);
+        elapsed("(p)", &t);
+        let t = Instant::now();
         ok &= taps_after_capture(m, &toks, &eager)?;
+        elapsed("(a)", &t);
+        let t = Instant::now();
         ok &= position_owner(m, &toks, &graph)?;
+        elapsed("(o)", &t);
+        let t = Instant::now();
         ok &= head_fault(m, toks[0], graph.tokens[0])?;
+        elapsed("(h)", &t);
         let routes = ik_routes(&man)?;
+        let t = Instant::now();
         let layered = layered(m, &toks)?;
         let layered_ok = layered_is_chain(&layered, &eager);
         ok &= layered_ok;
+        elapsed("(l)", &t);
+        let t = Instant::now();
         let (free_ok, firsts) = free(&man, &eager, (&layered, layered_ok), &routes)?;
         ok &= free_ok;
+        elapsed("(c)", &t);
         drop(layered);
         let last = *firsts.last().ok_or("no positions")?;
+        let t = Instant::now();
         let (forced_ok, _) = forced(m, &man, &routes)?;
         ok &= forced_ok;
+        elapsed("(f)", &t);
         let mut ties = 0usize;
         let band = Some((&toks[..], last));
         let mut ran = Vec::new();
@@ -4305,7 +4379,9 @@ mod gate {
             ((D3K_DSA, &IK_DSA), None),
         ] {
             if sets.takes(set.0) {
+                let t = Instant::now();
                 ok &= step_set(m, set, band, &mut ties)?;
+                elapsed(&format!("(t) {}", set.0), &t);
                 ran.push(set.0);
             }
         }
@@ -4314,9 +4390,15 @@ mod gate {
             sets.name(),
             ran.join(" ")
         );
+        let t = Instant::now();
         ok &= keep_groups(&mut s)?;
+        elapsed("(k)", &t);
+        let t = Instant::now();
         ok &= prompt_long(s.model_mut())?;
+        elapsed("(pb-long)", &t);
+        let t = Instant::now();
         ok &= verify_clause(s.model_mut(), &toks, &graph, opened.nodes);
+        elapsed("(v)", &t);
         Ok(ok)
     }
 
@@ -4325,12 +4407,18 @@ mod gate {
     fn verify_only(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let (mut s, opened) = open(levers, CTX, PrefillMode::Steps, KdaLanes::Two)?;
         let m = s.model_mut();
+        let t = Instant::now();
         let mut ok = structure(m, &opened)?;
+        elapsed("(s)", &t);
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();
+        let t = Instant::now();
         let graph = run_steps(m, &toks, StepMode::Graph)?;
+        elapsed("(v) the plain graph run", &t);
+        let t = Instant::now();
         ok &= verify_clause(m, &toks, &graph, opened.nodes);
+        elapsed("(v)", &t);
         Ok(ok)
     }
 
@@ -5184,7 +5272,9 @@ mod gate {
         let (mut s, _) = open(levers, CTX_PP, PrefillMode::Batch, KdaLanes::One)?;
         let m = s.model_mut();
         let ids = lcg_ids(CTX_PP + 1);
+        let t = Instant::now();
         let mut ok = one_lane(m, &ids[..3])?;
+        elapsed("(l1)", &t);
         // (pb): the steps' record, then the chunk calls' against it.
         m.reset()?;
         let t = Instant::now();
@@ -5206,13 +5296,16 @@ mod gate {
             t.elapsed().as_secs_f64(),
             after.first().map_or(0, |a| a.stores.len())
         );
+        elapsed("(pb) steps", &t);
         set_prefill_group(m, 1)?;
         set_prompt_route_taps(m, CTX_PP)?;
+        let t = Instant::now();
         let Reference {
             ok: chunks_ok,
             held: reference,
             routes,
         } = chunk_calls(m, &ids, &after)?;
+        elapsed("(pb) chunk calls", &t);
         ok &= chunks_ok;
         let bands = gemm_bands(&m.body("prompt batch")?.kinds());
         let bias = biases(m)?;
@@ -5230,6 +5323,7 @@ mod gate {
         );
         // Groups of one: a call of at most a chunk the steps' bits, one past
         // it against the chunk calls.
+        let t = Instant::now();
         let mut ones = Vec::with_capacity(after.len());
         for (a, r) in after.iter().zip(&reference) {
             if a.p < GEMM_FROM {
@@ -5246,17 +5340,21 @@ mod gate {
                 ones.push(got);
             }
         }
+        elapsed("(pb) groups of one", &t);
         // The forced arm: the reference's routes planted.
         set_prompt_route_taps(m, 0)?;
+        let t = Instant::now();
         plant_prompt_routes(m, Some((&routes, CTX_PP)))?;
         for r in reference.iter().filter(|r| r.after.p >= GEMM_FROM) {
             ok &= gemm_forced(m, &ids, r, &bands)?;
         }
+        elapsed("(pb) forced", &t);
         plant_prompt_routes(m, None)?;
         drop(reference);
         // Groups of two and four: the calls at groups of one, bit for bit.
         for g in GROUPS.into_iter().filter(|&g| g > 1) {
             set_prefill_group(m, g)?;
+            let t = Instant::now();
             for one in &ones {
                 let Some(one) = one else {
                     println!("prompt batch G={g}: no call at groups of one to hold it to FAIL");
@@ -5265,16 +5363,23 @@ mod gate {
                 };
                 ok &= batch_bits(m, &ids, one, g, "groups of one")?;
             }
+            elapsed(&format!("(pb) groups of {g}"), &t);
         }
         set_prefill_group(m, 1)?;
+        let t = Instant::now();
         ok &= refused_past(m, &ids)?;
+        elapsed("(pr)", &t);
         set_prefill_group(m, 2)?;
+        let t = Instant::now();
         ok &= planted_group(m, &ids)?;
+        elapsed("(pg)", &t);
         let clean = ones.iter().flatten().find(|a| a.p == 9).map(|a| a.argmax);
+        let t = Instant::now();
         for g in [1, 2] {
             set_prefill_group(m, g)?;
             ok &= batch_fault(m, &ids[..9], &ids[..513], clean, g)?;
         }
+        elapsed("(pf)", &t);
         set_prefill_group(m, 1)?;
         Ok(ok)
     }
