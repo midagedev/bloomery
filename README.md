@@ -38,16 +38,17 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Ada and Blackwell (sm_89, sm_120) | Not yet run here. The sm_86 PTX compiles for the card at the first start. [Reports welcome](docs/evaluating.md#help-wanted-hardware-we-have-not-run) |
 | Host CPU | x86-64 with AVX2 (x86-64-v3), AMD or Intel |
 | macOS, Apple silicon · AMD GPUs, Windows without WSL2 | Not supported yet · Not supported |
+| WSL2 (Windows) | Qwen3.8, GLM-5.3 and DeepSeek-V4.1 run only with `BLOOMERY_RESIDENCY=off` for now ([#1](https://github.com/midagedev/bloomery/issues/1)); the other models run as they are |
 | OpenAI and Anthropic APIs, streaming, tool calls | Every generative model |
 | Several requests at once (`--parallel`, default 2) | One pass on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B or Qwen3.6; in turn on the rest |
 | MTP draft (Qwen3.8, GLM-5.3) | On by default |
 | Cards | One card, or one card plus one expert-tier card (`--place bp`) |
 | Vision input (V4.1) | Not in this release |
 
-**Known issue in 0.2.4** (fixed in 0.2.5, [#1](https://github.com/midagedev/bloomery/issues/1)): under WSL2, Qwen3.8,
-GLM-5.3 and DeepSeek-V4.1 can stop answering a few tokens into a request, with one CPU core busy and the GPU idle.
-Adaptive residency's expert swap waits on a word that a WSL2 driver queues behind the request's own readback. Start
-the server with the setting in front: `BLOOMERY_RESIDENCY=off bloomery-serve …`.
+**WSL2 limit** ([#1](https://github.com/midagedev/bloomery/issues/1)): adaptive residency's expert swap waits on a
+word that a WSL2 driver queues behind the request's own readback, so Qwen3.8, GLM-5.3 and DeepSeek-V4.1 stop a few
+tokens into a request (one CPU core busy, the GPU idle). On WSL2, start them with the setting in front:
+`BLOOMERY_RESIDENCY=off bloomery-serve …`. Native Linux is not affected.
 
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
 [`docs/serving.md`](docs/serving.md#limits).
