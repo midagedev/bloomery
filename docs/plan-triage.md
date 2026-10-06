@@ -411,6 +411,14 @@ Qwen3.8 test against Strata). Owners:
   - `cuStreamBatchMemOp_v2` (`graph.rs:611`) runs without checking `CAN_USE_STREAM_WAIT_VALUE_NOR`, so a card or
     driver without it fails on a driver code rather than a named error. Size S;
   - WSL2 limits pinned host memory. A large host tier there is unmeasured beyond sih022's 3060.
+  - Prebuilt cubins (the user asked, 2026-10-07; after 0.2.6): ship sm_89 and sm_120 cubins beside the sm_86 PTX,
+    and have the loader pick by the card's compute capability with the PTX as the fallback. Speed gain 0 by the model:
+    the driver JIT and offline ptxas already allocate the same registers on all 72 entries (gates3a). What it removes
+    is the first start's JIT (10–25 s measured on the A6000; unmeasured on a 5090), the JIT stretching the upload
+    (ledger #37), and the risk of a JIT failure. Work: a multi-arch `cargo oxide` bundle, `load_bundle` choosing by
+    CC (today it prefers any cubin), the ptx-scan readers that refuse a bundle where a cubin hides the PTX, and the
+    release checks and asset name (`cuda-sm86`, pinned by install.sh and the Homebrew formula). An sm_120 cubin
+    needs one run on a Blackwell card before it ships; we have none. Size M.
 - The audit's "grid 1 on 188 SMs" for norms and the router is a latency term the step already pays on 84 SMs: 0 by
   the model, no round.
 
