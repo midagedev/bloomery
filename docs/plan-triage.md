@@ -119,6 +119,64 @@
 
 ## 열린 항목 — 받을 라운드별
 
+### After 0.2.3 (10-06, leader — the 18:00 restart; owners leader, worker1, worker2)
+
+v0.2.3 is 2647030c. Everything below is 0.2.4 work. The handoffs it was read from: the lead specs
+`line1-handoff-2026-10-06.md`, `line3-handoff-2026-10-06.md`, `multiseq2/carry-forward.md`, `leader/intake-2026-10-06.md`.
+
+**leader**
+- Vision landing, in order: visinj (de979fe3) → visref (284d3304) → visserve (f55d7aa8). visinj's ptx-scan of
+  `generate_ds41` and `gate_e2e` equals 2647030c (267 and 196 entries); its gates and visserve's gate-serve run in
+  line3's runner.
+- q38tslots (GLM round, tree bloomery-q38tslots): review when it ends. Its spec predates f2593a62: TIER_LAYER_NODES is
+  9, so its clause (c) reads 9·t + 1.
+- Remove the worktrees that landed in 0.2.3 and their box dirs.
+
+**worker1 — placement and Qwen3.8 serve**
+- placeunset: one common rule for an unset `--place` (the user, 10-06). Design final in the lead specs
+  `release/placeunset/report.md`: keep a tier only when the plan's next-card tier experts reach the family's
+  break-even and exceed 0. V4.1 bp has never been sat; `docs/cards/v41bp-ab.card` predates f2593a62.
+- The q38big bugs: an empty host tier is built anyway (`body38.rs:1159-1211`); bp on 2× 96 GB reads "no context fits";
+  Q3_K_XL plans an empty tier and nothing refuses it; residency takes a 38.5 GB pool on a full card; DraftReserve
+  under seat bp plus a draft (`qwen38.rs:453` vs `place.rs:645-651`).
+- q38big (c): an empty host tier still costs about 48 round trips a step on a 96 GB card.
+- q38tslots-ab: re-derive with the tier copy-out (~800 KB a layer at 8 columns, 30–40 µs [derived]).
+- Copy-out packing: the tier copies all n_used·cols·hidden; packing only the tier slots' rows is S, ~60 lines.
+- q38bp long steps: bp's mean is 1.008 ± 0.047 of a while p50 is 3 % shorter in every round; the long-step source is
+  unread (rig-log 10-06#q38bp). GLM bp +13 % was measured before the tier fix; V4.1 c_two (1.9–2.5 ms a pass) may be the
+  same mapped-store term.
+- Qwen3.8's drafted sampled clause (`gate_qwen38_serve.rs` `sampled_served`) runs only under BLOOMERY_DRAFT=mtp, which
+  the recipe's server does not set: it has never run. Add an arm or a recipe.
+- num3090run (tree, uncommitted): plan (a) on a lone 3090; one functional `--place a` run on the 3090, then land. The
+  README V4.1 3090 row (footnote 2) waits on it.
+- visseat (V4c, GLM round running; base visref + visserve) and the visref follow-up (`tools/ref/vision/visref_ds41.rs`
+  → a gpu-gates bin with a recipe). visref's mutant m2 (text bias on media) is invisible to the KLD band; only
+  gate_ds41_media (ii) guards it; the paired design is proposed, not run.
+
+**worker2 — eq and iq**
+- eqA1 (tree, uncommitted, three writers): the AVX2 Q3_K hmask inversion, the scalar Q4_K qs offset, the q8_1 clamp, a
+  cardrule_ties gate site; `crates/qdot/tests/qdot.rs` may still be broken. eqC (tree, uncommitted): owning gates green,
+  gate-ptx-spill red on exactly 10 new entries; left the report, a rebase, the pin and the A/B; it touches
+  gpu-deepseek41 `chain/ffn` and rebases onto visinj. E1 never ran (eqA1's card-rule arm in bench_v41_host plus a
+  host-rate lease). Plan: the lead specs `multiseq2/eqdesign/report.md`.
+- iqgemm (gemm_iq3xxs, iq4xs, iq4nl; 6 ptx-shapes rows), iqsel (check-unsafe red), q6khead (two edits outside its
+  whitelist; `tools/unsafe-ratchet.txt` 1530 → 1552 against iqgemm's 1535): review, reconcile the ratchet, gate, land.
+  Then iqwire and iqoracle, which let the Q3 file's IQ stacks run on the card.
+- The penalty window: llama-server feeds the prompt ids into the sampler (`tools/server/server-context.cpp:420-424`);
+  we feed only the generated ids. Change `Gen::answer` (via `choose`) and `Gen::advance_sampled`'s history together;
+  `hw_drafted_sampled_ids_are_the_plain_ids` (`crates/serve/tests/sampdraft.rs`) guards the pair.
+
+**Unowned, small**
+- `content: "\n\n"` before a tool call (Qwen3.8, OpenAI tools): from the shared ThinkSplit and emit.
+- sched floor: `crates/serve/src/sched.rs:345-375` best_slot lets a 1-id shared prefix beat an empty slot; llama-server
+  uses a 0.1 similarity floor. ~10 lines plus a gate.
+- Blackwell audit: log the JIT error (`cuModuleLoadData`); `cuStreamBatchMemOp` lacks an attribute check.
+- clefvis design (the lead specs `release/clefvis/design.md`): llama.cpp mtmd preprocessing (black pad, 8–4096 tokens)
+  chosen over the release's stretch rule; open.
+- sih.sh: the job's ssh is not retried on a kex reset with no start line (the lead specs `sihyung/sih.sh:36`).
+- line2's carry-forward items (the lead specs `multiseq2/carry-forward.md`, `[open]` rows) stay there until a round
+  takes them.
+
 ### The 0.2.2 cut (10-06, line1 — re-cut at 11:50 by the user: "too big; cut it, and finish 0.2.2 faster")
 
 **Freeze 14:00 KST, release right after.** 0.2.2 holds what has landed and the following:
