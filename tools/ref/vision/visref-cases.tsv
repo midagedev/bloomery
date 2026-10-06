@@ -1,0 +1,4 @@
+# name	image	question (one user turn: the image, then this text)
+chart	chart-bars	What does this chart show? Give the label and the value of every bar.
+term	screen-term	Transcribe all the text in this screenshot exactly, line by line.
+photo	photo-toaster	Describe this photo in detail, including any text you can read in it.

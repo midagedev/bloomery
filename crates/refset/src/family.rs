@@ -33,6 +33,11 @@ pub enum Identity {
     /// `# checkpoint\t<repo>@<revision>\t<dir>`: the checkpoint's revision,
     /// which the family pins.
     Checkpoint { revision: &'static str },
+    /// `# model\t<path>` in a fork comparison set's `MANIFEST.tsv`
+    /// (`tools/ref/vision/visref.sh`), `# build` naming the fork's commit, and
+    /// `# rows\t<vision set>\t<repo>@<revision>`: the checkpoint the image
+    /// rows came from, whose revision the family pins.
+    ForkManifest { rows_revision: &'static str },
 }
 
 /// The ik build a family's sets must name.
@@ -86,7 +91,8 @@ pub struct Family {
     pub identity: Identity,
     /// The `# arch` every set must carry, for a manifest family.
     pub arch: Option<&'static str>,
-    /// The ik build every set must name.
+    /// The build every set must name: ik's, or for a fork comparison
+    /// family the fork's commit.
     pub build: Option<Build>,
     /// The model file the tree runs, for a family whose identity is a file.
     pub runs: Option<fn() -> String>,
@@ -271,6 +277,14 @@ impl Family {
                     dumped_from: stated(run.model.as_deref()),
                     draft: None,
                     build: run.head,
+                })
+            }
+            Identity::ForkManifest { .. } => {
+                let set = crate::visref::VisrefSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.model.as_deref()),
+                    draft: None,
+                    build: set.build,
                 })
             }
             Identity::Checkpoint { .. } => {
