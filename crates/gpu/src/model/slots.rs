@@ -38,6 +38,7 @@ use crate::hybrid::{Chain, Refusal};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use cuda_core::CudaStream;
+
 use runtime::swaprule::KeptRows;
 use std::fmt;
 use std::ops::Range;
@@ -626,6 +627,7 @@ where
     /// compile.
     pub fn step_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, GpuError> {
         const WHAT: &str = "GpuModel::step_slots";
+        let _busy = crate::watchdog::busy(&self.watch, crate::watchdog::STEP_SLOTS, self.reads);
         let ranges = self.plan_pass(rows, SlotPass::Kept, WHAT)?;
         let out = self.run_slots(&ranges, SlotPass::Kept, WHAT);
         self.note_fault_in(WHAT, out, SlotSet::of(&ranges))
@@ -645,6 +647,7 @@ where
     /// `step_slots` is.
     pub fn verify_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, GpuError> {
         const WHAT: &str = "GpuModel::verify_slots";
+        let _busy = crate::watchdog::busy(&self.watch, crate::watchdog::VERIFY_SLOTS, self.reads);
         if !B::SETTLES_PARTIAL_KEEP {
             return Err(GpuError::shape(
                 WHAT,
@@ -678,6 +681,7 @@ where
     /// leaves no trace.
     pub fn commit_slots(&mut self, kept: &[usize]) -> Result<(), GpuError> {
         const WHAT: &str = "GpuModel::commit_slots";
+        let _busy = crate::watchdog::busy(&self.watch, crate::watchdog::COMMIT_SLOTS, self.reads);
         let ranges = self.slots_waiting.as_deref().ok_or(GpuError::state(
             WHAT,
             "a pass of several slots' verify rows waiting (verify_slots)",

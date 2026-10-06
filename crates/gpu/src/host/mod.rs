@@ -343,6 +343,14 @@ pub(crate) fn poll_drained(stream: &CudaStream, deadline: Duration) -> Result<()
 /// residency machine's whole [`MachineCfg::deadline`] — so the machine's
 /// own error comes first when it has one.
 ///
+/// The bound sees only a stall the engine thread can observe from its own
+/// polling loop: its own stream's work not finishing. A driver that runs
+/// every stream on one hardware queue can instead wedge the thread inside a
+/// driver call no bound here ends — a copy enqueued behind work that copy
+/// itself feeds — and that wedge is named, not ended, by the engine
+/// watchdog ([`crate::watchdog`]). The staging-window rule (`host::step`'s
+/// `Closed`) is what keeps that cycle from closing.
+///
 /// [`MachineCfg::deadline`]: swap::MachineCfg::deadline
 pub(crate) const ENGINE_BOUND: Duration = Duration::from_secs(60);
 
@@ -368,7 +376,8 @@ pub(crate) fn await_done(
 
 /// The one polling loop: `done` asked until it says done, at most `bound`,
 /// spun on for `spin`, then polled every [`POLL`]; past the bound
-/// [`GpuError::Stalled`] of `what`, with no note.
+/// [`GpuError::Stalled`] of `what`, with no note. A finished wait bumps the
+/// engine watchdog's progress ([`crate::watchdog`]) when one is guarded.
 fn await_within(
     what: &'static str,
     bound: Duration,
@@ -378,6 +387,7 @@ fn await_within(
     let t0 = Instant::now();
     loop {
         if done()? {
+            crate::watchdog::wait_done();
             return Ok(());
         }
         let waited = t0.elapsed();
@@ -925,7 +935,9 @@ impl<H: HostExperts> HostTier<H> {
     /// service and kept rows and before its readback, the next pass's
     /// boundary made now ([`swap::SwapMachine::boundary_ahead`]). `None`
     /// without a machine. Refused by name: [`HostTier::swap_boundary`]'s
-    /// refusals, and a boundary made ahead while another waits.
+    /// refusals, and a boundary made ahead while another waits. Every
+    /// boundary an engine call lands also moves the engine watchdog's
+    /// progress and names its machine there ([`crate::watchdog`]).
     pub fn swap_at(
         &mut self,
         stream: &CudaStream,
@@ -934,15 +946,24 @@ impl<H: HostExperts> HostTier<H> {
         let ahead = match (at, self.swap.as_mut()) {
             (_, None) => return Ok(None),
             (swap::BoundaryAt::Launch { .. }, Some(m)) if m.ahead().is_some() => {
-                m.take_ahead()?;
+                crate::watchdog::machine(m.shared());
+                let b = m.take_ahead()?;
+                crate::watchdog::boundary_landed(b);
                 return Ok(None);
             }
-            (swap::BoundaryAt::Launch { .. }, Some(_)) => false,
-            (swap::BoundaryAt::Ahead { .. }, Some(_)) => true,
+            (swap::BoundaryAt::Launch { .. }, Some(m)) => {
+                crate::watchdog::machine(m.shared());
+                false
+            }
+            (swap::BoundaryAt::Ahead { .. }, Some(m)) => {
+                crate::watchdog::machine(m.shared());
+                true
+            }
         };
         let mut made = self.boundary_of(stream, ahead)?;
         if let Some((_, r)) = made.as_mut() {
             r.reads = at.reads();
+            crate::watchdog::boundary_landed(r.boundary);
         }
         Ok(made)
     }

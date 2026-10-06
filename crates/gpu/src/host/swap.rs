@@ -1051,7 +1051,7 @@ impl Rereads {
 }
 
 /// What the staging thread and the machine share.
-struct Shared {
+pub(crate) struct Shared {
     source: Arc<dyn SwapSource>,
     ring: Ring,
     /// Per ring slot: `staged` (the thread's ticket once the slot holds the
@@ -1084,9 +1084,57 @@ struct Shared {
     stop: AtomicBool,
     /// The first staging failure, which the next boundary or reset returns.
     failed: Mutex<Option<StagingFailure>>,
+    /// The machine's own job count and the next boundary one of its flips
+    /// lands at, mirrored for a reader that holds no machine (the stall
+    /// note, [`Shared::stall_note`]; the engine watchdog): stored where the
+    /// machine changes them. [`NO_FLIP_LANDING`] when no flip fills a slot.
+    jobs_issued: AtomicU64,
+    next_landing: AtomicU64,
 }
 
+/// The `next_landing` mirror while no flip is filling a slot.
+const NO_FLIP_LANDING: u64 = u64::MAX;
+
 impl Shared {
+    /// What the machine holds, for the error of an engine wait that ran out
+    /// of its bound and for the engine watchdog that names a wedge: the
+    /// copies still waiting for staging, each ring slot's staged and drained
+    /// tickets, the window, the due line and flush, and the next boundary a
+    /// flip lands at. A reader with no machine sees the mirrors, which
+    /// trail it only inside the change that stores them.
+    pub(crate) fn stall_note(&self) -> String {
+        let issued = self.jobs_issued.load(Ordering::Relaxed);
+        let waiting = issued.saturating_sub(self.served.load(Ordering::Acquire));
+        let ring = (0..RING_SLOTS)
+            .map(|k| {
+                format!(
+                    "{}/{}",
+                    self.staged(k).load(Ordering::Acquire),
+                    self.drained(k).load(Ordering::Acquire)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lands = self.next_landing.load(Ordering::Relaxed);
+        format!(
+            "the residency machine holds {waiting} of {issued} copies waiting for staging (ring \
+             staged/drained {ring}), the staging window {}, due below job {}, flush {}, the next \
+             flip landing at boundary {}",
+            if self.window.load(Ordering::Acquire) != 0 {
+                "open"
+            } else {
+                "closed"
+            },
+            self.due.load(Ordering::Acquire),
+            self.flush.load(Ordering::Acquire),
+            if lands == NO_FLIP_LANDING {
+                "none".to_string()
+            } else {
+                lands.to_string()
+            },
+        )
+    }
+
     fn word(&self, i: usize) -> &AtomicU32 {
         self.words
             .atomic_u32(i * WORD_STRIDE)
@@ -1881,6 +1929,8 @@ impl SwapMachine {
             rereads,
             stop: AtomicBool::new(false),
             failed: Mutex::new(None),
+            jobs_issued: AtomicU64::new(0),
+            next_landing: AtomicU64::new(NO_FLIP_LANDING),
         });
         let (tx, rx) = mpsc::channel::<Job>();
         let (bound_tx, bound_rx) = mpsc::channel::<Result<(), GpuError>>();
@@ -1927,25 +1977,25 @@ impl SwapMachine {
     }
 
     /// What the machine holds, for the error of an engine wait that ran out
-    /// of its bound: the copies still waiting for staging, each ring slot's
-    /// staged and drained tickets, the window, the due line and flush, and
-    /// the next boundary a flip lands at.
+    /// of its bound: the shared state's own rendering
+    /// ([`Shared::stall_note`]), which the engine watchdog reads too.
     #[must_use]
     pub(crate) fn stall_note(&self) -> String {
-        let s = &self.shared;
-        let waiting = self
-            .jobs_issued
-            .saturating_sub(s.served.load(Ordering::Acquire));
-        let ring = (0..RING_SLOTS)
-            .map(|k| {
-                format!(
-                    "{}/{}",
-                    s.staged(k).load(Ordering::Acquire),
-                    s.drained(k).load(Ordering::Acquire)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        self.shared.stall_note()
+    }
+
+    /// The shared state, for the engine watchdog's stall note
+    /// ([`crate::watchdog`]).
+    #[must_use]
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
+    }
+
+    /// The next boundary a filling flip lands at, mirrored onto the shared
+    /// state for a reader that holds no machine ([`Shared::stall_note`]):
+    /// stored at the end of the two calls that fill or empty a slot — a
+    /// boundary and a reset — so once each.
+    fn mirror_landing(&self) {
         let lands = self
             .layers
             .clone()
@@ -1956,20 +2006,9 @@ impl SwapMachine {
                 _ => None,
             })
             .min();
-        format!(
-            "the residency machine holds {waiting} of {} copies waiting for staging (ring \
-             staged/drained {ring}), the staging window {}, due below job {}, flush {}, the next \
-             flip landing at boundary {}",
-            self.jobs_issued,
-            if s.window.load(Ordering::Acquire) != 0 {
-                "open"
-            } else {
-                "closed"
-            },
-            s.due.load(Ordering::Acquire),
-            s.flush.load(Ordering::Acquire),
-            lands.map_or_else(|| "none".to_string(), |b| b.to_string()),
-        )
+        self.shared
+            .next_landing
+            .store(lands.unwrap_or(NO_FLIP_LANDING), Ordering::Relaxed);
     }
 
     /// The machine's copy stream, for a gate that holds its copies to show
@@ -2337,6 +2376,7 @@ impl SwapMachine {
         report.prepare_us = self.shared.prepare_ns.swap(0, Ordering::Relaxed) / 1000;
         (report.rereads, report.reread_bytes, report.reread_us) = self.shared.rereads.take();
         self.planned = Some(b);
+        self.mirror_landing();
         report.boundary_us = micros(start);
         Ok(report)
     }
@@ -2591,6 +2631,9 @@ impl SwapMachine {
         };
         let d = dispatch::send(self.tx.as_ref(), job, WHAT)?;
         self.jobs_issued += 1;
+        self.shared
+            .jobs_issued
+            .store(self.jobs_issued, Ordering::Relaxed);
         let copy = Arc::clone(&self.copy);
         if gate == Gate::Boundary && !self.copy_waits_boundary {
             copy.wait(&self.boundary_event)?;
@@ -2704,7 +2747,9 @@ impl SwapMachine {
         self.drain_copies(WHAT)?;
         self.refuse_staging_failure(WHAT, None)?;
         let r = self.relayout(stream, slots);
-        self.after_change(r, || "reset".to_string())
+        let out = self.after_change(r, || "reset".to_string());
+        self.mirror_landing();
+        out
     }
 
     /// The reset's changes, the first on ([`SwapMachine::reset`]): the flips
