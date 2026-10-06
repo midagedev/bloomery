@@ -99,7 +99,10 @@ gguf 9 2 0
 # RowPlanes::f16/f16_mut (a row's own slot's plane pointers out of the grid-constant table, under the table's
 # row contract). rope_neox.rs 37 -> 49 blocks, 5 -> 6 fns: head_norm_neox_append_rows and its norm_neox_append
 # body over KvSink. Each block and fn carries its SAFETY line (undocumented_unsafe_blocks is deny).
-gpu 1530 171 6
+# PIN(2026-10-05): gpu 1530 -> 1531 blocks, new code, not old code relaxed: GpuModel::plant_fault (slotpoison),
+# the slots harness's one card-fault seam for every family (H5(b)): one cuMemcpyHtoDAsync of the fault word, the
+# Gpu::clear_fault pattern; no safe host-to-device write of the shared fault allocation exists. Its SAFETY line holds.
+gpu 1531 171 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

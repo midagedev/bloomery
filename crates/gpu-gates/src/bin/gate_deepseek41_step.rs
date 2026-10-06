@@ -523,6 +523,30 @@ mod gate {
                 self.inputs.seq_terms().bytes(CTX_MAX, 1),
             )?))
         }
+
+        /// H5's planter ([`SlotsAdapter::plant_refusal`]): the tier through
+        /// the body's own mut path.
+        fn plant_refusal(&self, m: &mut Deepseek41Model) -> Result<bool, GateError> {
+            m.body_parts("gate_deepseek41_step slots")?
+                .2
+                .hybrid_mut()
+                .plant_refusal("a planted refusal (the slots harness's seam)");
+            Ok(true)
+        }
+
+        // H5's round of both slots is the default's, a select and a step a
+        // slot: this body refuses a pass of several slots by name (its
+        // per-slot host half is not built, `SlotRows::plan_slots`).
+
+        /// H5's window: the tier's own refusal, read through the body's
+        /// tier.
+        fn tier_poisoned(&self, m: &mut Deepseek41Model) -> Result<bool, GateError> {
+            Ok(m.body_parts("gate_deepseek41_step slots")?
+                .2
+                .hybrid()
+                .refuse_if_poisoned("slots H5")
+                .is_err())
+        }
     }
 
     /// A pass of several slots on V4.1 is the pair pass's walk with each row

@@ -3318,6 +3318,34 @@ mod gate {
                 terms: format!("store_bytes {stores} + the lane word 4 + the arena rows {rows}"),
             })
         }
+
+        /// H5's planter ([`SlotsAdapter::plant_refusal`]): the tier through
+        /// the body's own mut path.
+        fn plant_refusal(&self, m: &mut Qwen38Model) -> Result<bool, GateError> {
+            m.body_parts("gate_qwen4exp_e2e slots")?
+                .2
+                .hybrid_mut()
+                .plant_refusal("a planted refusal (the slots harness's seam)");
+            Ok(true)
+        }
+
+        /// H5's round of several slots: the body's one pass
+        /// ([`GpuModel::step_slots`], this body's [`SlotRows`]).
+        fn step_all(&self, m: &mut Qwen38Model, last: &[u32]) -> Result<Vec<u32>, GpuError> {
+            let ones: Vec<[u32; 1]> = last.iter().map(|&t| [t]).collect();
+            let rows: Vec<(usize, &[u32])> = ones.iter().map(|t| &t[..]).enumerate().collect();
+            Ok(m.step_slots(&rows)?.ids)
+        }
+
+        /// H5's window: the tier's own refusal, read through the body's
+        /// tier.
+        fn tier_poisoned(&self, m: &mut Qwen38Model) -> Result<bool, GateError> {
+            Ok(m.body_parts("gate_qwen4exp_e2e slots")?
+                .2
+                .hybrid()
+                .refuse_if_poisoned("slots H5")
+                .is_err())
+        }
     }
 
     impl PassAdapter for Slots38<'_> {

@@ -2593,7 +2593,7 @@ impl ChainBody for Body {
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         self.arrive()?;
         self.rows.finish()?;
-        self.hybrid.reset(gpu.stream())?;
+        self.hybrid.settle(gpu.stream())?;
         self.attn.reset(gpu.stream())?;
         let stream = gpu.stream();
         self.seq.clear(stream)?;
@@ -2654,6 +2654,19 @@ impl HostServed for Body {
     /// ([`Hybrid::take_step_refusal`]).
     fn take_host_refusal(&mut self) -> Option<Refusal> {
         self.hybrid.take_step_refusal()
+    }
+
+    /// The host tier's refusal poison lifted
+    /// ([`Hybrid::lift_refusal`]) — the settling a reset runs is
+    /// [`Hybrid::settle`]'s ([`Body::reset`]).
+    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        self.hybrid.lift_refusal(stream)
+    }
+
+    /// The refusal the host tier is poisoned by now
+    /// ([`Hybrid::refusal_poison`]).
+    fn refusal_poison(&self) -> Option<Refusal> {
+        self.hybrid.refusal_poison()
     }
 
     /// The host set the placed load read in and locked, which the host tier

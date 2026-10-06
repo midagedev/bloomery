@@ -2166,6 +2166,38 @@ mod gate {
         fn seq_terms_bytes(&self, _m: &Glm5nextModel) -> Result<Option<usize>, GateError> {
             Ok(Some(usize::try_from(self.seq_terms_one()?)?))
         }
+
+        /// H5's planter ([`SlotsAdapter::plant_refusal`]): the tier through
+        /// the body's own mut path.
+        fn plant_refusal(&self, m: &mut Glm5nextModel) -> Result<bool, GateError> {
+            m.body_parts("gate_glm5next_e2e slots")?
+                .2
+                .hybrid_mut()
+                .plant_refusal("a planted refusal (the slots harness's seam)");
+            Ok(true)
+        }
+
+        /// H5's round of several slots: the way a NextN load serves them,
+        /// one pass of each slot's verify rows ([`GpuModel::verify_slots`];
+        /// a kept pass of several slots is refused there, (g5)) — its last
+        /// id and the same id as the drafted token, each row's next token
+        /// back. H5 plants a failure in every round, so none reaches a
+        /// commit.
+        fn step_all(&self, m: &mut Glm5nextModel, last: &[u32]) -> Result<Vec<u32>, GpuError> {
+            let pairs: Vec<[u32; PAIR]> = last.iter().map(|&t| [t; PAIR]).collect();
+            let rows: Vec<(usize, &[u32])> = pairs.iter().map(|t| &t[..]).enumerate().collect();
+            Ok(m.verify_slots(&rows)?.ids)
+        }
+
+        /// H5's window: the tier's own refusal, read through the body's
+        /// tier.
+        fn tier_poisoned(&self, m: &mut Glm5nextModel) -> Result<bool, GateError> {
+            Ok(m.body_parts("gate_glm5next_e2e slots")?
+                .2
+                .hybrid()
+                .refuse_if_poisoned("slots H5")
+                .is_err())
+        }
     }
 
     /// The prompt as the server feeds it: every id but the last in one call

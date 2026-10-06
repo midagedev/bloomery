@@ -143,6 +143,28 @@ pub trait HostServed {
     /// failure is named from after the stream has drained.
     fn take_host_refusal(&mut self) -> Option<Refusal>;
 
+    /// Lift the host tier's refusal poison
+    /// ([`crate::host::HostTier::lift_refusal`]) on `stream`, which
+    /// [`GpuModel::reset`] calls once every slot a refused call ran on has
+    /// been reset. A body whose tier lifts a refusal in its own
+    /// [`ChainBody::reset`] ([`crate::host::HostTier::reset`], the whole
+    /// of it) needs nothing here; a body that only settles its tier on a
+    /// reset forwards to its tier.
+    fn lift_refusal(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        let _ = stream;
+        Ok(())
+    }
+
+    /// The refusal the host tier is poisoned by now
+    /// ([`crate::host::HostTier::refusal_poison`]): what
+    /// [`GpuModel::reset`] asks of a tier refusal the model never recorded,
+    /// to poison every slot by. The default is none: a body whose tier
+    /// names its refusals in its own [`ChainBody::reset`]
+    /// ([`crate::host::HostTier::reset`]) records none for the model.
+    fn refusal_poison(&self) -> Option<Refusal> {
+        None
+    }
+
     /// What a placed load did to the plan's host set — populated, locked —
     /// held by the host tier for its lifetime ([`GpuModel::load_placed`]);
     /// `None` on any other load.
@@ -866,7 +888,15 @@ impl<B: ChainBody> GpuModel<B> {
     /// once when no other slot is parked — a one-slot model's reset clears a
     /// word whatever raised it; a reset of a slot outside the set rewinds it
     /// and leaves the fault standing, a raised word no call recorded
-    /// included. A caller that must not continue past one checks
+    /// included. A host service's refusal poisons the slots of its call the
+    /// same way, and the host tier's own refusal poison is lifted with it —
+    /// a reset of one slot of the set settles the tier and leaves the
+    /// refusal standing, so the slots the refused call partly wrote cannot
+    /// step again until each has been reset ([`HostServed::lift_refusal`]).
+    /// A tier refusal the model never recorded — a service no
+    /// recording owner saw, so neither its slots nor its call are known —
+    /// poisons every slot at the first reset that meets it, and lifts only
+    /// then. A caller that must not continue past one checks
     /// [`GpuModel::poisoned`] first.
     ///
     /// A residency machine's map stays where use has taken it
@@ -885,6 +915,21 @@ impl<B: ChainBody> GpuModel<B> {
         if self.parked.is_empty() || lifted {
             self.gpu.clear_fault()?;
             self.poisoned = None;
+            self.lift_host_refusal()?;
+        } else if self.poisoned.is_none()
+            && let Some(refusal) = self.host_refusal()?
+        {
+            // A tier refusal this model never recorded (a service that
+            // reached no recording owner): the slots it ran on are unknown,
+            // so every slot is poisoned until each has been reset — this
+            // reset's slot has just been rewound — and no one slot's reset
+            // lifts the tier.
+            let mut poison = SlotFault {
+                slots: SlotSet::every(self.parked.len() + 1, "GpuModel::reset")?,
+                why: PoisonWhy::Refused(refusal),
+            };
+            poison.slots.lift(selected);
+            self.poisoned = Some(poison);
         }
         self.one_pass = None;
         self.slot_rows = None;
@@ -893,6 +938,29 @@ impl<B: ChainBody> GpuModel<B> {
         self.slots_waiting = None;
         self.stand_at(0);
         Ok(())
+    }
+
+    /// Lift the host tier's refusal poison
+    /// ([`HostServed::lift_refusal`]): what [`GpuModel::reset`] does once
+    /// the slots a refused call ran on have all been reset. Nothing for a
+    /// body whose chain holds no host work.
+    fn lift_host_refusal(&mut self) -> Result<(), GpuError> {
+        let GpuModel { body, gpu, .. } = self;
+        match body.host() {
+            Some(host) => host.lift_refusal(gpu.stream()),
+            None => Ok(()),
+        }
+    }
+
+    /// The refusal the host tier is poisoned by now
+    /// ([`HostServed::refusal_poison`]): an unrecorded tier refusal, what a
+    /// reset that meets one poisons every slot by. Nothing for a body whose
+    /// chain holds no host work.
+    fn host_refusal(&mut self) -> Result<Option<Refusal>, GpuError> {
+        Ok(match self.body.host() {
+            Some(host) => host.refusal_poison(),
+            None => None,
+        })
     }
 
     /// Capture the whole chain — every resident layer plus the head — into
@@ -1071,43 +1139,60 @@ impl<B: ChainBody> GpuModel<B> {
         }
     }
 
-    /// A step's enqueue or replay result, with a host refusal named: when the
-    /// body's host service refused input the card should already have
-    /// refused, it released every wait of the step, so the step drains, and
-    /// the fault word read on the engine stream behind it names the refusal
-    /// ([`name_refusal`]) — the card's fault when the card raised one at or
-    /// before that layer, else the host's error. When the word holds a later
-    /// layer's fault, the caller's [`GpuModel::note_fault`] returns that fault
-    /// with the host's error behind it, so the call ends poisoned and still
-    /// names the refusal's layer, which came first. A failed read names the
-    /// refusal and the step's error beside its own. Any other result passes
-    /// through.
-    pub(crate) fn name_host_refusal(&mut self, r: Result<(), GpuError>) -> Result<(), GpuError> {
-        self.name_host_refusal_by(r, |_| {})
+    /// A step's, pass's or prompt call's result, with a host refusal named:
+    /// when the body's host service refused input the card should already
+    /// have refused, it released every wait of the step, so the call drains,
+    /// and the fault word read on the engine stream behind it names the
+    /// refusal ([`name_refusal`]) — the card's fault when the card raised one
+    /// at or before that layer, else the host's error. When the word holds a
+    /// later layer's fault, the caller's [`GpuModel::note_fault`] returns
+    /// that fault with the host's error behind it, so the call ends poisoned
+    /// and still names the refusal's layer, which came first. A failed read
+    /// names the refusal and the call's error beside its own. Any other
+    /// result passes through.
+    ///
+    /// On a model that parks another slot the refusal also poisons the slots
+    /// the call ran on (`slots`, [`PoisonWhy::Refused`]): the layers before
+    /// the refused one had already written their in-place state, so every
+    /// later call is refused by name until each of those slots has been
+    /// reset, and the tier's own refusal poison is lifted only then
+    /// ([`GpuModel::reset`]). A model with no parked slot keeps the load's
+    /// own refusal: the tier's, lifted by the load's reset.
+    pub(crate) fn name_host_refusal<T>(&mut self, r: Result<T, GpuError>) -> Result<T, GpuError> {
+        let slots = SlotSet::one(self.selected);
+        self.name_host_refusal_by(r, slots, |_| {})
     }
 
-    /// [`GpuModel::name_host_refusal`] with the refusal's detail rewritten
-    /// by `name` first: what a pass whose rows are not one sequence's
-    /// positions adds to say whose row it was.
-    fn name_host_refusal_by(
+    /// [`GpuModel::name_host_refusal`] of a call that ran on `slots`, with
+    /// the refusal's detail rewritten by `name` first: what a pass whose
+    /// rows are not one sequence's positions adds to say whose row it was.
+    fn name_host_refusal_by<T>(
         &mut self,
-        r: Result<(), GpuError>,
+        r: Result<T, GpuError>,
+        slots: SlotSet,
         name: impl FnOnce(&mut Refusal),
-    ) -> Result<(), GpuError> {
+    ) -> Result<T, GpuError> {
         const WHAT: &str = "GpuModel::name_host_refusal";
-        let Err(e) = r else {
-            return Ok(());
+        let e = match r {
+            Err(e) => e,
+            Ok(v) => return Ok(v),
         };
         let Some(mut refusal) = self.body.host().and_then(HostServed::take_host_refusal) else {
             return Err(e);
         };
         name(&mut refusal);
+        if !self.parked.is_empty() && self.poisoned.is_none() {
+            self.poisoned = Some(SlotFault {
+                slots,
+                why: PoisonWhy::Refused(refusal.clone()),
+            });
+        }
         match self.gpu.fault() {
             Ok(word) => Err(name_refusal(&refusal, word)),
             Err(s) => Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "{} refused the input of layer {} ({}) and the step failed ({e}), and reading \
+                    "{} refused the input of layer {} ({}) and the call failed ({e}), and reading \
                      the fault word behind it failed too ({s})",
                     refusal.what, refusal.layer, refusal.detail
                 ),
@@ -1201,11 +1286,39 @@ impl<B: ChainBody> GpuModel<B> {
         }
     }
 
+    /// Plant `fault` in the card's fault word, ordered on the engine stream:
+    /// the next readback carries it ([`GpuError::Fault`]), as a raised word
+    /// does — a test seam for the slots harness's poison clauses
+    /// (`crates/gpu-gates/src/slots_gate.rs` H5), on any load, whether or
+    /// not its chain holds host work. Gate use; never on a serving path.
+    pub fn plant_fault(&self, fault: Fault) -> Result<(), GpuError> {
+        let word = self.gpu.fault_word();
+        let mut words = vec![0u32; word.len()];
+        words[0] = fault.word();
+        words[crate::fault::mask_index(fault.layer)] = fault.sites;
+        // SAFETY: `words` spans the fault allocation's own length, so both
+        // the source and the destination ranges lie inside live host and
+        // device memory of this context, and the copy is ordered on the
+        // engine stream like every launch that touches the allocation
+        // ([`Gpu::clear_fault`]).
+        let rc = unsafe {
+            cuda_core::sys::cuMemcpyHtoDAsync_v2(
+                word.cu_deviceptr(),
+                words.as_ptr().cast(),
+                std::mem::size_of_val(&words[..]),
+                self.gpu.stream().cu_stream(),
+            )
+        };
+        crate::graph::cu(rc, "cuMemcpyHtoDAsync_v2 (fault word)")?;
+        Ok(())
+    }
+
     /// A step, or a gate/debug instrument's call, on a poisoned model is
     /// refused, naming the fault — and, once the model serves more than one
-    /// slot, the slots it ran on that are not reset yet. A commit of
-    /// several slots' rows that failed partway poisons the same way,
-    /// naming the slot its keep failed at.
+    /// slot, the slots it ran on that are not reset yet. A host service's
+    /// refusal of the call's input and a commit of several slots' rows that
+    /// failed partway poison the same way, naming the refusal's layer and
+    /// the slot its keep failed at.
     pub(crate) fn refuse_if_poisoned(&self, what: &'static str) -> Result<(), GpuError> {
         let (slots, why) = match &self.poisoned {
             None => return Ok(()),
@@ -1229,6 +1342,14 @@ impl<B: ChainBody> GpuModel<B> {
                     "{} {is} poisoned by an earlier device fault at {fault:#}; select {which} and \
                      reset() to clear it",
                     slots
+                ),
+            )),
+            PoisonWhy::Refused(r) => Err(GpuError::shape(
+                what,
+                format!(
+                    "{} {is} poisoned by the host service's refusal of layer {} ({}); select \
+                     {which} and reset() to clear it",
+                    slots, r.layer, r.detail
                 ),
             )),
             PoisonWhy::SlotKeep { slot, error } => Err(GpuError::shape(
@@ -1310,18 +1431,19 @@ impl<B: ChainBody> GpuModel<B> {
     /// The fault that poisons this model, if a step has read one back. The
     /// slot it was live on is the refusal's to name
     /// ([`GpuModel::reset`] lifts the fault on that slot alone). `None`
-    /// also when the poison is a commit's half-settled keep, which names no
-    /// device fault: a reader that must not continue past any poison goes
-    /// through the model's own refusal instead.
+    /// also when the poison is a commit's half-settled keep or a host
+    /// service's refusal, which name no device fault: a reader that must
+    /// not continue past any poison goes through the model's own refusal
+    /// instead.
     #[must_use]
     pub fn poisoned(&self) -> Option<Fault> {
         match &self.poisoned {
             Some(p) => match &p.why {
                 PoisonWhy::Fault(fault) => Some(*fault),
-                // A half-settled commit names no device fault; a reader that
-                // must not continue past any poison goes through the model's
-                // own refusal instead.
-                PoisonWhy::SlotKeep { .. } => None,
+                // A half-settled commit or a host refusal names no device
+                // fault; a reader that must not continue past any poison goes
+                // through the model's own refusal instead.
+                PoisonWhy::Refused(_) | PoisonWhy::SlotKeep { .. } => None,
             },
             None => None,
         }
@@ -1417,7 +1539,10 @@ impl<B: ChainBody> GpuModel<B> {
     /// enqueued the head, return the head's token (a blocking read); a pass
     /// that does not is not read back. A fault the pass returns, the head's
     /// readback carries, or the word holds behind any other error of the pass
-    /// ([`GpuModel::note_fault`]) poisons the model.
+    /// ([`GpuModel::note_fault`]) poisons the model. So does the host
+    /// service's refusal of the pass's input, named with the selected
+    /// slot — the slot every prompt walk's pass runs on
+    /// ([`GpuModel::name_host_refusal`]).
     ///
     /// The prompt call's fault-read contract has two named modes, and each
     /// body runs one:
@@ -1458,6 +1583,7 @@ impl<B: ChainBody> GpuModel<B> {
             Ok(false) => Ok(None),
             Err(e) => Err(e),
         };
+        let token = self.name_host_refusal(token);
         let token = self.note_fault(what, token)?;
         self.stand_at(pos + n);
         Ok(token)

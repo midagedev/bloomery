@@ -229,7 +229,7 @@ mod gate {
         PrefillStep, Qwen35moeModel, StoreHost, WIDE_FROM,
     };
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
-    use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::route_core::sigmoid;
     use bloomery_gpu::{Gpu, GpuError, GpuModel};
     use bloomery_gpu_gates::generate::Place;
@@ -2167,6 +2167,30 @@ mod gate {
                      {N_V} x {HEAD_V} x {HEAD_V} + ring {RING_ROWS} x {C}) f32"
                 ),
             })
+        }
+
+        /// H5's planter ([`SlotsAdapter::plant_refusal`]): the tier through
+        /// the body's placed side, the host service of this body; `false`
+        /// on a load with no placed side, which serves no host work.
+        fn plant_refusal(&self, m: &mut Qwen35moeModel) -> Result<bool, GateError> {
+            let Some(placed) = m.body_parts("gate_qwen35moe_e2e slots")?.2.host() else {
+                return Ok(false);
+            };
+            placed
+                .hybrid_mut()
+                .plant_refusal("a planted refusal (the slots harness's seam)");
+            Ok(true)
+        }
+
+        /// H5's window: the tier's own refusal, read through the body's
+        /// placed side.
+        fn tier_poisoned(&self, m: &mut Qwen35moeModel) -> Result<bool, GateError> {
+            let placed = m
+                .body_parts("gate_qwen35moe_e2e slots")?
+                .2
+                .host()
+                .ok_or("the placed side (the host tier)")?;
+            Ok(placed.hybrid().refuse_if_poisoned("slots H5").is_err())
         }
     }
 
