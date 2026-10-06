@@ -147,6 +147,40 @@
 - parity1;
 - structured output.
 
+**0.2.3 is Qwen-centred** (user, 2026-10-06, after a public tester with RTX PRO 6000 Blackwell 96 GB cards announced a
+Qwen3.8 test against Strata). Owners:
+- line1:
+  - qwenxml: the Qwen3-Coder `<function=…><parameter=…>` tool-call parser for Qwen3.6/3.8, `ToolFormat::QwenXml`;
+    0.2.2 answers their `tools` requests with a named 501;
+  - sampdraft: design for MTP drafts on sampled requests. Only greedy requests draft today (`engine.rs:156-163`), and
+    an absent `temperature` is 0.8;
+  - q38tslots, q38tseat;
+  - the IQ card rounds (iqsel, iqgemm, q6khead) for `UD-Q3_K_XL`.
+- line2: q38big — the Qwen3.8 plan on 1/2/4 × 96 GB cards (host need, auto ctx, an empty tier on a file that fits),
+  with the README's host-RAM rows by card size.
+- line3: placeunset — one rule for an unset `--place`, Qwen3.8's bp default included.
+- Vision (V3b/V4c), eqA1, eqC, E1: 0.2.4. visserve rides along if it is green after qwenxml.
+- After qwenxml: a gate that every shipped seat's template maps to a parsed `ToolFormat`. 0.2.2 shipped two seats
+  whose markup had no parser, and nothing pinned it.
+- Docker: `container.yml` runs on the tag push before `publish.sh` uploads the assets. Its first attempt failed on
+  v0.2.2 with a 404, and the rerun succeeded. Trigger it on the release's publish, or wait on the assets.
+
+**Blackwell readiness** (bwready, an agy audit, 2026-10-06; lead-checked):
+- The sm_86 PTX (`.version 8.7`) JITs on sm_120 with driver R570+, which every Blackwell card needs anyway.
+- No instruction the kernels use is missing on sm_120.
+- The largest dynamic shared request, 100,352 B (`flash_gqa_prefill.rs:2376`), is under the 99 KiB per-block opt-in
+  on both 8.6 and 12.x.
+- The JIT output fits the 1 GiB default compute cache.
+- An unknown card is sized from the driver's census (`devices.rs:145-166`).
+- Open:
+  - a failed JIT reports only the driver's code: `cuda-core` calls `cuModuleLoadData` with no
+    `CU_JIT_ERROR_LOG_BUFFER`. Size M, in the fork; an upstream candidate;
+  - `cuStreamBatchMemOp_v2` (`graph.rs:611`) runs without checking `CAN_USE_STREAM_WAIT_VALUE_NOR`, so a card or
+    driver without it fails on a driver code rather than a named error. Size S;
+  - WSL2 limits pinned host memory. A large host tier there is unmeasured beyond sih022's 3060.
+- The audit's "grid 1 on 188 SMs" for norms and the router is a latency term the step already pays on 84 SMs: 0 by
+  the model, no round.
+
 **What makes it fast:**
 - no new A/B (glmbpdef's effect is glmbp-ab; qualmig is host-only with ptx equal to base);
 - the README re-sit is not gating;
