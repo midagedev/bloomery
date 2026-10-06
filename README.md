@@ -43,11 +43,9 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   and llama-server tutorials apply as they are.
 - **The Anthropic Messages API**: `POST /v1/messages` and `/v1/messages/count_tokens`, as llama-server serves
   them. Point Claude Code or the Anthropic SDK at `ANTHROPIC_BASE_URL=http://localhost:8080`.
-- **Tool calls, by model**: DeepSeek-V4.1-Flash, GLM-5.3-Flash and Qwen3-30B parse tool calls, so agent
-  clients work against them. **Qwen3.6-35B and Qwen3.8-Flash-Next do not yet**: their templates use the
-  `<function=…><parameter=…>` markup, which has no parser yet, and a request with `tools` gets a 501 that says
-  so. The parser is in progress for the next release; until then, use these two models for chat without
-  tools.
+- **Tool calls on every generative model**: DeepSeek-V4.1-Flash (DSML), GLM-5.3-Flash (its XML), Qwen3-30B
+  (Hermes JSON), Qwen3.6-35B and Qwen3.8-Flash-Next (the `<function=…><parameter=…>` markup) parse into
+  `tool_calls` and `tool_use` blocks, so agent clients work against each of them.
 - **`timings`** carry llama-server's fields and one of ours, `cache_ms`: the prompt cache's work before the
   prompt (the slot's state saved, a cached state put back, the cut), which `prompt_ms` does not count.
 - **`reasoning_budget`**, per request on `/v1/chat/completions` and `/completion`: llama-server's
@@ -56,7 +54,8 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
 - **The files**: the GGUF uploads as downloaded, the same quantizations, the chat template read from the file,
   and a tokenizer bit-identical to `llama-tokenize`.
 - **The flags**: `-m`/`--model-file`, `--hf <repo>[:<quant>]` (download, resume, sha256 check, never fetched
-  twice), `--parallel/-np`, `--queue-depth`, `--cache-ram`, `--ctx/--ctx-size` (the qwen3, qwen38 and glm
+  twice; it also fetches the model's MTP draft when the repo publishes it, as unsloth's Qwen3.8-Flash-Next GGUFs
+  do under `MTP/`, landing it beside the set, where the run picks it up), `--parallel/-np`, `--queue-depth`, `--cache-ram`, `--ctx/--ctx-size` (the qwen3, qwen38 and glm
   seats default it to what the card's free memory fits — the trained context capped to it on the qwen3 seat's
   whole-card loads, the largest context that keeps the card's experts on the qwen38 seat, the placed plan's
   margin on the glm seat), `--cache-type-k f16|q8_0` (the qwen3 seats; llama-server's spelling, also the
@@ -99,11 +98,11 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
 The plain tarball, when you want to lay it down yourself:
 
 ```sh
-tar -xzf bloomery-0.2.1-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.1-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.2.3-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.3-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-[bloomery 0.2.1](https://github.com/midagedev/bloomery/releases/tag/v0.2.1) · [all releases](https://github.com/midagedev/bloomery/releases)
+[bloomery 0.2.3](https://github.com/midagedev/bloomery/releases/tag/v0.2.3) · [all releases](https://github.com/midagedev/bloomery/releases)
 
 From source: [`docs/BUILD.md`](docs/BUILD.md) (Linux x86-64, CUDA 13.3, LLVM/Clang 21, `cargo-oxide` from our
 cuda-oxide fork).
@@ -162,7 +161,11 @@ loading, not after.
 
 **Speculative decoding.** `BLOOMERY_DRAFT=mtp` drafts with the model's own MTP head (Qwen3.8 and GLM-5.3, on by
 default in their servers); `BLOOMERY_DRAFT=dspark` drafts V4.1 with DeepSeek's DSpark head on a second card
-(`--place bp`).
+(`--place bp`). The drafts run on greedy requests (`"temperature": 0`), and the MTP drafts also on sampled ones
+(the default, temperature 0.8 as in llama-server) while one request runs: each kept id is the request's own
+sampler's draw from its verified row, as llama.cpp's speculative decoding takes it. A sampled request beside
+another running one, a request that bans an id (`ignore_eos`), and a sampled request under DSpark decode one token
+a step.
 
 **Adaptive residency.** V4.1, Qwen3.8 and GLM-5.3 count their own routing as they run and swap routed experts
 between the card and the host between steps; a prompt call streams its hottest host experts onto the card, so
@@ -311,9 +314,14 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | Clef-Flash | 12 GB covers every quantization (the files run 4.26–9.55 GB) | any | 4.3–9.6 GB, plus the head (243 MB, fetched) |
 | Qwen3.6-35B `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 10 GB free beside a small card | 21.2 GB |
 | Qwen3-30B `Q4_K_M` | 24 GB whole, or 12–16 GB split (automatic) | 32 GB whole; about 8 GB free beside a small card | 18.6 GB |
-| Qwen3.8-Flash-Next | 24 GB recommended (the expert share sizes to the card's free bytes) | 256 GB | 111.3 GB, plus the 2.8 GB MTP draft |
+| Qwen3.8-Flash-Next | 24 GB recommended (the expert share sizes to the card's free bytes); a 96 GB card holds every routed expert at a 4k context, and a second card adds none | 128 GB beside a 24 or 48 GB card, 64 GB beside a 96 GB card (about 101, 75 and 34 GB free, plus adaptive residency's pool where the host has it) | 111.3 GB, plus the 2.8 GB MTP draft |
 | GLM-5.3-Flash | 24 GB recommended | 256 GB | 199.7 GB |
 | DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB | 347.3 GB, plus 155.7 GB for the optional r8 sidecar |
+
+Qwen3.8's 28.8 GB PLE table is read from host RAM whatever the cards, so no number of cards holds the whole
+file. `UD-Q3_K_XL` (90.0 GB, not yet run) keeps every routed expert on the host whatever the card, since no card
+kernel reads its IQ3_XXS and IQ4_NL stacks: about 89 GB free. The MTP draft reads a Q8_0 head and this file's is
+Q6_K, so the draft is off on it by name (a set `BLOOMERY_DRAFT=mtp` is refused at the load).
 
 **Recommended** (the configuration every number in this README ran on): a 32-core AVX2 CPU with 8 DDR4
 channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for `--place bp`. Cards are found
@@ -327,8 +335,6 @@ text. Costs per part: [`docs/HARDWARE.md`](docs/HARDWARE.md).
 ## Limits
 
 - **sm_86+** GPUs; the prebuilt archive carries sm_86 PTX.
-- No tool calls on Qwen3.6 and Qwen3.8 yet (in progress): a request with `tools` gets a 501 naming the missing
-  parser. V4.1, GLM-5.3 and Qwen3-30B parse tool calls.
 - One model a server; one expert tier card at most (`--place bp`).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B, on V4.1, GLM-5.3 and Qwen3.8; a placed Qwen3-30B,
   Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
