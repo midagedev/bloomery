@@ -61,7 +61,8 @@
 //!   copy holds. The copy as the held history left it is read; after the
 //!   seat's reset the history's prompt is fed the serve's way
 //!   (`generate::ServeFeed`), and the row of its last id (row 0) is kept,
-//!   the boundaries before that row landing no flip (named). After the
+//!   the boundaries before that row landing no flip (fed again, up to
+//!   `SETTLE_FEEDS` feeds, until one lands none; named). After the
 //!   teardown, one more load — residency off, host streaming off as the
 //!   history ran, each routed layer's card experts the read copy's
 //!   (`Loaded::open_edited`, `generate::place_table`; named: no machine, and
@@ -88,13 +89,13 @@ use bloomery_gpu::host::slots::Slot;
 use bloomery_gpu::host::swap::{Residency, SlotState, SwapSource};
 use bloomery_gpu_deepseek41::body::{Body, OpenCfg};
 use bloomery_gpu_deepseek41::swap;
-use bloomery_gpu_gates::generate::{Place, Residence, ServeFeed, place_table};
+use bloomery_gpu_gates::generate::{Place, Residence, place_table};
 use bloomery_gpu_gates::record;
 use bloomery_gpu_gates::{GateError, data_dir, verdict};
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::{Machine, workstation};
 use runtime::swaprule::SwapRule;
-use runtime::{Advance, Target, Verify, Want};
+use runtime::{Target, Verify, Want};
 
 pub use crate::residency_clauses::StaticProbe;
 
@@ -422,15 +423,7 @@ fn table_clause(s: &Session<Body>, held: &History) -> Result<bool, GateError> {
 
 /// [`StaticProbe`] on `s`, after the held history and `keep`.
 fn static_probe(s: &mut Session<Body>, ids: &[u32]) -> Result<StaticProbe, GateError> {
-    let table = residence(s)?.table()?;
-    runtime::Target::reset(s)?;
-    take_passes(s)?;
-    ServeFeed {
-        inner: &mut runtime::Plain,
-    }
-    .prompt(s, ids)?;
-    let row0 = s.model().logits()?;
-    Ok(StaticProbe::of(ids, table, row0, &take_passes(s)?))
+    crate::residency_clauses::static_probe(s, ids, residence, take_passes)
 }
 
 /// `static`, its second half, after the residency load's teardown: a load by

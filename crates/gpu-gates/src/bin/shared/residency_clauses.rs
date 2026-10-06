@@ -9,7 +9,7 @@
 //! ([`transform_check`]: every
 //! admitted expert's slot against its static bytes, [`transform_verdict`]
 //! the line), the card table's verdict and its printed line
-//! ([`table_clause`]), `static`'s two halves ([`StaticProbe::of`] the read,
+//! ([`table_clause`]), `static`'s two halves ([`static_probe`] the read,
 //! [`static_row0`] the compare on the static load), the history verdicts
 //! ([`c1_clause`], [`passes_clause`], [`c7_clause`]) and the rule walk
 //! ([`rule_after`]); a gate supplies what its body forces — its body type
@@ -218,9 +218,15 @@ pub fn table_clause(
     Ok(ok)
 }
 
-/// The residency's half of `static`: the stage card's copy of the map as
-/// the history left it, the prompt `ids` the serve's way after the seat's
-/// reset, the row of its last id (row 0), and the boundaries that feed made.
+/// The feeds [`static_probe`] makes at most before it names the phase as
+/// never quiet.
+pub const SETTLE_FEEDS: usize = 4;
+
+/// The residency's half of `static` ([`static_probe`]): the stage card's
+/// copy of the map as the seat's reset found it, the prompt `ids` fed the
+/// serve's way after the reset, the row of its last id (row 0), the
+/// boundaries that feed made, and the feeds it took to find one that landed
+/// nothing before row 0.
 pub struct StaticProbe {
     pub ids: Vec<u32>,
     pub table: CardTable,
@@ -228,34 +234,17 @@ pub struct StaticProbe {
     /// Each boundary since the seat's reset: the pass it ended, its number,
     /// the flips that landed there, whether it was made ahead.
     pub passes: Vec<(PassKind, u64, usize, bool)>,
+    /// The flips each earlier feed landed before its row 0, in order: the
+    /// feeds that were not quiet; this probe's feed is the next.
+    pub unsettled: Vec<usize>,
 }
 
 impl StaticProbe {
-    /// The probe of a history's end: the `ids` its prompt fed, the card's
-    /// copy `table` as the history left it, the row of its last id `row0`,
-    /// and the boundaries `reports` ended since the seat's reset — each the
-    /// pass it ended, its number, the flips that landed there, whether it
-    /// was made ahead.
-    pub fn of(
-        ids: &[u32],
-        table: CardTable,
-        row0: Vec<f32>,
-        reports: &[(PassKind, PassReport)],
-    ) -> StaticProbe {
-        StaticProbe {
-            ids: ids.to_vec(),
-            table,
-            row0,
-            passes: reports
-                .iter()
-                .map(|(k, r)| (*k, r.boundary, r.landed, r.ahead))
-                .collect(),
-        }
-    }
-
-    /// Whether row 0 ran on the copy read: the feed's last boundary is the
-    /// one row 0's step made ahead, after the row, and none before it
-    /// landed a flip.
+    /// Whether the whole feed ran on the copy read: the feed's last boundary
+    /// is the one row 0's step made ahead, after the row, and none before
+    /// it landed a flip. A flip that lands at the boundary ending the prompt
+    /// pass reaches row 0 but not the prompt's rows, a placement no static
+    /// load holds.
     pub fn quiet(&self) -> bool {
         match self.passes.split_last() {
             Some((&(PassKind::Step, _, _, true), before)) => {
@@ -263,6 +252,54 @@ impl StaticProbe {
             }
             _ => false,
         }
+    }
+}
+
+/// `static`'s first half on `s`, after a history: the stage card's copy
+/// read through `residence`, the seat's reset, the serve's feed of `ids`
+/// ([`ServeFeed`]: every id but the last in one call, then the last id as a
+/// plain pass, whose row is row 0), and the boundaries `take_passes` hands
+/// back from the gate's body — repeated, up to [`SETTLE_FEEDS`] feeds,
+/// until one is [`StaticProbe::quiet`]: flips a history leaves in flight
+/// land at the feed's first boundary, and a feed of the same ids again
+/// starts where they landed. The last feed's probe is returned, quiet or
+/// not.
+pub fn static_probe<B: Prompt + Keep>(
+    s: &mut Session<B>,
+    ids: &[u32],
+    residence: impl Fn(&Session<B>) -> Result<Residence<'_>, GateError>,
+    take_passes: impl Fn(&mut Session<B>) -> Result<Vec<(PassKind, PassReport)>, GateError>,
+) -> Result<StaticProbe, GateError> {
+    let mut unsettled = Vec::new();
+    loop {
+        let table = residence(s)?.table()?;
+        runtime::Target::reset(s)?;
+        take_passes(s)?;
+        ServeFeed {
+            inner: &mut runtime::Plain,
+        }
+        .prompt(s, ids)?;
+        let row0 = s.model().logits()?;
+        let probe = StaticProbe {
+            ids: ids.to_vec(),
+            table,
+            row0,
+            passes: take_passes(s)?
+                .iter()
+                .map(|(k, r)| (*k, r.boundary, r.landed, r.ahead))
+                .collect(),
+            unsettled: unsettled.clone(),
+        };
+        if probe.quiet() || unsettled.len() + 1 == SETTLE_FEEDS {
+            return Ok(probe);
+        }
+        let before = probe.passes.len().saturating_sub(1);
+        unsettled.push(
+            probe.passes[..before]
+                .iter()
+                .map(|&(_, _, landed, _)| landed)
+                .sum(),
+        );
     }
 }
 
@@ -320,13 +357,16 @@ pub fn static_row0<B: Prompt + Keep>(
         .collect();
     println!(
         "static: the residency's row 0 of the serve's feed of {} ids on its card copy ({} on \
-         the card), boundaries since the seat's reset [{}] (no landing before row 0: {quiet}); \
+         the card), boundaries since the seat's reset [{}] (feed {} of at most {SETTLE_FEEDS}, \
+         the earlier feeds landing {:?} before their row 0; no landing before row 0: {quiet}); \
          a static load of that copy in {load_s:.1} s (no machine: {no_machine}; {} experts off \
          its sets, {} at another slot): row 0 bit for bit {same} ({off} of {} entries differ, \
          max {max}{lens}): {}",
         p.ids.len(),
         p.table.on_card(),
         boundaries.join(" "),
+        p.unsettled.len() + 1,
+        p.unsettled,
         sets.set,
         sets.slot,
         row0.len(),
