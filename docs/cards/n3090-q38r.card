@@ -1,0 +1,17 @@
+# README headline, rerun. Qwen3.8 UD-Q4_K_XL on the 3090 alone (gate plan), ctx 4352, draft off, two busy slots
+# after a 512-id prose prompt, BLOOMERY_RESIDENCY=mid-p32-s1: the word bloomery-serve-qwen38 chose on this card
+# today (serve log, plan place=a card=3090). [derived] The residency-off run gave 58.27 (n3090-q38, r2); the A6000's
+# residency pair on one stream was 1.056 +- 0.059 (rig-log 09-30#q38seed-ab): x0.95..1.20.
+kind: baseline
+question: what do two Qwen3.8 streams decode at, in total, on the RTX 3090 alone with the server's residency word?
+term: tok/s(aggregate) @ n=2·95, prose 512, RTX 3090 (250 W cap) + host, --place gate, ctx 4352, draft off, BLOOMERY_RESIDENCY=mid-p32-s1, BLOOMERY_GEN_SLOTS=2
+unit: tok/s
+predict: 55..70
+condition: the runner's one arm in its own lease; no FAIL row, no [cold], [cpu-busy] or [other-busy] row among the
+  counted rounds; the 3090 at its 250 W cap and no Xid in the witness blocks; the full output to a file first
+reason: sets the README's headline row on the 3090 / A6000 + 3090 at the server's own residency (the user,
+  2026-10-06); why now: the first 3090 runs used --place gate, whose residency default is off, while a server with
+  the 3090 alone plans --place a with residency on (crates/levers/src/registry.rs:415-426)
+decide-in: write the row into rig-log 10-06 and the README's numbers with its conditions
+decide-below: read the residency pass records and the plan line before the row goes out
+decide-above: re-derive the host share from the plan line before the row goes out

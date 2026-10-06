@@ -1,0 +1,18 @@
+# README headline, rerun. V4.1 Q3_K_M on the 3090 alone (gate plan), two busy slots after a 512-id prose prompt,
+# BLOOMERY_RESIDENCY=mid-p40-s1: the word V4.1 takes unset under --place a, the plan a server with the 3090 alone
+# makes. The gate plan holds 29..30 card experts a layer (n3090-v41's plan line), under the word's P = 40. [derived]
+# If the word pins every card expert the run equals the residency-off run, 34.42 / 34.31; if it swaps, up to the
+# A6000's residency gain on two slots: x1.0..1.25.
+kind: baseline
+question: what do two V4.1 streams decode at, in total, on the RTX 3090 alone with the residency word of --place a?
+term: tok/s(aggregate) @ n=2·95, prose 512, RTX 3090 (250 W cap) + host, --place gate, BLOOMERY_RESIDENCY=mid-p40-s1, BLOOMERY_GEN_SLOTS=2
+unit: tok/s
+predict: 33..44
+condition: the runner's one arm in its own lease; no FAIL row, no [cold], [cpu-busy] or [other-busy] row among the
+  counted rounds; the 3090 at its 250 W cap and no Xid in the witness blocks; the full output to a file first
+reason: sets the README's headline row on the 3090 / A6000 + 3090 at the server's own residency (the user,
+  2026-10-06); why now: the first 3090 runs used --place gate, whose residency default is off, while a server with
+  the 3090 alone plans --place a with residency on (crates/levers/src/registry.rs:415-426)
+decide-in: write the row into rig-log 10-06 and the README's numbers with its conditions
+decide-below: read the residency pass records and the plan line before the row goes out
+decide-above: re-derive the host share from the plan line before the row goes out

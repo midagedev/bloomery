@@ -1,0 +1,17 @@
+# README headline. GLM-5.3-Flash UD-Q4_K_XL on A6000 + 3090 (--place bp), two busy slots after a 512-id prose
+# prompt, residency mid-p0-s1, draft off. [derived] A6000 (a) two-slot 34.90 (depth 6); one stream bp/a 1.130
+# (rig-log 10-06#glmbp-ab, MTP on): the 3090 takes host experts, the host legs shrink: ×1.05..1.22.
+# Wall [derived]: 3 processes of 1.0..1.5 min.
+kind: baseline
+question: what do two GLM-5.3 streams decode at, in total, on A6000 + 3090 (--place bp) after a 512-id prose prompt?
+term: tok/s(aggregate) @ n=2·95, prose 512, A6000 + RTX 3090 (250 W cap) + host, --place bp, BLOOMERY_GEN_SLOTS=2, residency mid-p0-s1
+unit: tok/s
+predict: 36..43
+condition: the runner's one arm in its own lease, warm-up + 2 rounds; no FAIL row, no [cold], [cpu-busy] or
+  [other-busy] row; the 3090 at its 250 W cap and no Xid in the witness blocks; the full output to a file first
+reason: sets the README's headline row on the 3090 / A6000 + 3090 (the user, 2026-10-06: few own an A6000); why now:
+  0.2.1 is out and the README's numbers are A6000 rows
+decide-in: write the row into rig-log 10-06 and the README's numbers with its conditions
+decide-below: read the plan line (card_experts, host_experts) and the pass ms against the derivation before the row
+  goes out; the term that moved is the finding
+decide-above: re-derive the host share from the plan line before the row goes out

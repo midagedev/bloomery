@@ -1,0 +1,17 @@
+# README headline. Qwen3.6-35B Q4_K_M whole on the 3090 (250 W cap), one stream after a 512-id prompt: on the
+# server a Qwen3.6 load's two streams step in turn (README Limits), so the two-stream total is one stream's rate.
+# [derived] A6000 204.4 at depth 6, 195.8 at 4096 (rig-log 09-28#q36-release): ~200 at 512, × 0.85..1.25.
+# Wall [derived]: 3 processes of 0.3..0.5 min.
+kind: baseline
+question: what does one Qwen3.6-35B stream decode at, whole on the RTX 3090, after a 512-id prompt?
+term: tok/s @ n=96, depth 512, RTX 3090 (250 W cap) whole card
+unit: tok/s
+predict: 170..250
+condition: the runner's one arm in its own lease, warm-up + 2 rounds; no FAIL row, no [cold], [cpu-busy] or
+  [other-busy] row; the 3090 at its 250 W cap and no Xid in the witness blocks; the full output to a file first
+reason: sets the README's headline row on the 3090 / A6000 + 3090 (the user, 2026-10-06: few own an A6000); why now:
+  0.2.1 is out and the README's numbers are A6000 rows
+decide-in: write the row into rig-log 10-06 and the README's numbers with its conditions
+decide-below: read the plan line (card_experts, host_experts) and the pass ms against the derivation before the row
+  goes out; the term that moved is the finding
+decide-above: re-derive the host share from the plan line before the row goes out

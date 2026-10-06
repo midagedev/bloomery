@@ -1,0 +1,19 @@
+# README headline (2026-10-06, the user: numbers on one RTX 3090, and on A6000 + 3090, two streams, one input).
+# V4.1-Flash Q3_K_M on the 3090 alone (the gate plan, the plan a server with only the 3090 in view takes; 250 W cap),
+# two busy slots after a 512-id prose prompt. [derived] A6000 (a) two-slot aggregate 54.96 / 55.02 (rig-log
+# 10-06#rel021-slots). The decode is bound by the host's expert leg (README Limits); on the 3090 the plan holds fewer
+# card experts, so the host leg grows by the share that moves off the card: 0.65..1.0 of the A6000 value.
+# Wall [derived]: warm-up + 2 rounds, 3 processes of 1.5..2.5 min.
+kind: baseline
+question: what do two V4.1 streams decode at, in total, on the RTX 3090 alone after a 512-id prose prompt?
+term: tok/s(aggregate) @ n=2·95, prose 512, RTX 3090 (250 W cap) + host, --place gate, BLOOMERY_GEN_SLOTS=2
+unit: tok/s
+predict: 35..56
+condition: the runner's one arm in its own lease, warm-up + 2 rounds; no FAIL row, no [cold], [cpu-busy] or
+  [other-busy] row; the 3090 at its 250 W cap and no Xid in the witness blocks; the full output to a file first
+reason: sets the README's headline row on the 3090 / A6000 + 3090 (the user, 2026-10-06: few own an A6000); why now:
+  0.2.1 is out and the README's numbers are A6000 rows
+decide-in: write the row into rig-log 10-06 and the README's numbers with its conditions
+decide-below: read the plan line (card_experts, host_experts) and the pass ms against the derivation before the row
+  goes out; the term that moved is the finding
+decide-above: re-derive the host share from the plan line before the row goes out

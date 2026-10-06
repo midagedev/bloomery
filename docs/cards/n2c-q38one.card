@@ -1,0 +1,18 @@
+# README headline. Qwen3.8 UD-Q4_K_XL on A6000 + 3090 (--place bp), ctx 4352, draft off, ONE stream after a 512-id
+# prose prompt: generate_qwen3moe refuses a pass of several slots on a load with an expert tier card (n2c-q38, both
+# rounds FAIL by that name), so two streams on this load step in turn and their total is one stream's rate.
+# [derived] A6000 (a) one stream 61.22 draft off (rig-log 10-06#rel021-slots); the 3090 tier takes host experts off
+# the step's host leg: x1.0..1.3.
+kind: baseline
+question: what does one Qwen3.8 stream decode at on A6000 + 3090 (--place bp), draft off, after a 512-id prose prompt?
+term: tok/s @ n=96, prose 512, A6000 + RTX 3090 (250 W cap) + host, --place bp, ctx 4352, draft off
+unit: tok/s
+predict: 60..80
+condition: the runner's one arm in its own lease; no FAIL row, no [cold], [cpu-busy] or [other-busy] row among the
+  counted rounds; the 3090 at its 250 W cap and no Xid in the witness blocks; the full output to a file first
+reason: sets the README's headline row on the 3090 / A6000 + 3090 at the server's own residency (the user,
+  2026-10-06); why now: the first 3090 runs used --place gate, whose residency default is off, while a server with
+  the 3090 alone plans --place a with residency on (crates/levers/src/registry.rs:415-426)
+decide-in: write the row into rig-log 10-06 and the README's numbers with its conditions
+decide-below: read the residency pass records and the plan line before the row goes out
+decide-above: re-derive the host share from the plan line before the row goes out
