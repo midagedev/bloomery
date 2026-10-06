@@ -1461,6 +1461,15 @@ impl<B: ChainBody> GpuModel<B> {
             .logits_to_host(&self.gpu)
     }
 
+    /// The vocabulary size: the logits a row holds.
+    pub fn n_vocab(&self) -> Result<usize, GpuError> {
+        Ok(self
+            .heads
+            .first()
+            .ok_or(no_head("GpuModel::n_vocab"))?
+            .n_vocab())
+    }
+
     /// [`GpuModel::logits`] into `out` (`n_vocab` f32), for a caller that reads
     /// them every token into one buffer. Blocking read.
     pub fn logits_into(&self, out: &mut [f32]) -> Result<(), GpuError> {
@@ -1830,30 +1839,78 @@ impl<B: Rows> GpuModel<B> {
     }
 
     /// Each row's logits of the last [`GpuModel::step_rows`] of `M` rows
-    /// (`n_vocab` f32 each). Blocking read; gate/debug use.
+    /// (`n_vocab` f32 each), each through [`GpuModel::pass_row_into`], the
+    /// read a sampled pass takes its rows by. Blocking read; gate/debug use.
     pub fn rows_logits<const M: usize>(&self) -> Result<[Vec<f32>; M], GpuError> {
-        const WHAT: &str = "GpuModel::rows_logits";
         const { rows_fit::<B>(M) };
-        let mut out: [Vec<f32>; M] = std::array::from_fn(|_| Vec::new());
-        match B::HEADS {
-            RowHeads::PerRow => {
-                let heads = self
-                    .heads
-                    .get(..M)
-                    .ok_or(GpuError::state(WHAT, "no pass of these rows has run"))?;
-                for (o, head) in out.iter_mut().zip(heads) {
-                    *o = head.logits_to_host(&self.gpu)?;
-                }
-            }
-            RowHeads::One => {
-                // The head's layout is `[v·m + r]`: row r is every m-th value.
-                let all = self.pass_head(M, WHAT)?.logits_to_host(&self.gpu)?;
-                for (r, o) in out.iter_mut().enumerate() {
-                    *o = all.iter().skip(r).step_by(M).copied().collect();
-                }
-            }
+        let n_vocab = self.n_vocab()?;
+        let mut pass = Vec::new();
+        let mut out: [Vec<f32>; M] = std::array::from_fn(|_| vec![0.0; n_vocab]);
+        for (r, o) in out.iter_mut().enumerate() {
+            self.pass_row_into(M, r, &mut pass, r > 0, o)?;
         }
         Ok(out)
+    }
+
+    /// Row `r`'s logits of the last [`GpuModel::step_rows`] of `m` rows into
+    /// `row` (`n_vocab` f32), the read a sampled pass takes each row by:
+    /// [`RowHeads::PerRow`] copies head `r` alone; [`RowHeads::One`] copies
+    /// the pass's one head into `pass` (grown to `m · n_vocab` f32 once, then
+    /// reused) unless `fetched` says this pass's head is there already, and
+    /// takes row `r` from it (`[v·m + r]`). Blocking read. Refused by name
+    /// for a row past `m`, a `row` of another length, and under
+    /// [`RowHeads::One`] when the last call was not a pass of `m` rows.
+    pub fn pass_row_into(
+        &self,
+        m: usize,
+        r: usize,
+        pass: &mut Vec<f32>,
+        fetched: bool,
+        row: &mut [f32],
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "GpuModel::pass_row_into";
+        if r >= m {
+            return Err(GpuError::shape(WHAT, format!("row {r} of a pass of {m}")));
+        }
+        match B::HEADS {
+            RowHeads::PerRow => self
+                .heads
+                .get(r)
+                .ok_or(GpuError::state(WHAT, "no pass of these rows has run"))?
+                .logits_into_host(&self.gpu, row),
+            RowHeads::One => {
+                if self.one_pass != Some(m) {
+                    return Err(GpuError::state(
+                        WHAT,
+                        "the last call was not a pass of these rows",
+                    ));
+                }
+                let head = self.pass_head(m, WHAT)?;
+                let n_vocab = head.n_vocab();
+                if row.len() != n_vocab {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!("a row of {} f32 for {n_vocab} logits", row.len()),
+                    ));
+                }
+                if !fetched {
+                    pass.resize(m * n_vocab, 0.0);
+                    head.logits_into_host(&self.gpu, pass)?;
+                } else if pass.len() != m * n_vocab {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "a fetched pass of {} f32 for {m} rows of {n_vocab}",
+                            pass.len()
+                        ),
+                    ));
+                }
+                for (o, &v) in row.iter_mut().zip(pass.iter().skip(r).step_by(m)) {
+                    *o = v;
+                }
+                Ok(())
+            }
+        }
     }
 }
 

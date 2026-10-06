@@ -31,8 +31,10 @@ use app::{RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
-use runtime::{Advance, Draft, Plain, Speculative, Target as _, Want, Widths, Window};
-use serve::Drafted;
+use runtime::{
+    Advance, Argmax, Draft, Pick, Plain, Sample, Speculative, Target as _, Want, Widths, Window,
+};
+use serve::{Drafted, Sampler};
 
 /// A slot's draft side of a saved sequence ([`SlotDrafts::park`]): what the
 /// draft held of it, and why the seat had turned it off, if it had.
@@ -248,9 +250,8 @@ where
         Ok(next)
     }
 
-    /// One pass on `slot`, the session's selected one, from `last`: under the
-    /// draft one window, its kept tokens and counts; without it, or while it
-    /// is off, one step ([`SlotDrafts::step`]).
+    /// One greedy pass on `slot`, the session's selected one, from `last`
+    /// ([`SlotDrafts::pass_taking`] by each row's argmax).
     pub(crate) fn pass(
         &mut self,
         s: &mut Session<B>,
@@ -258,17 +259,59 @@ where
         last: u32,
         out: &mut Vec<u32>,
     ) -> Result<Drafted, GateError> {
+        self.pass_taking(s, slot, last, &mut Argmax, out)
+    }
+
+    /// One sampled pass on `slot`, the session's selected one, from `last`
+    /// (`serve::Engine::advance_sampled`): [`SlotDrafts::pass_taking`] with
+    /// each row's id drawn by `sampler` from that row's logits, given
+    /// `history` and the ids this pass took before it. `history` comes back
+    /// as it was given.
+    pub(crate) fn pass_sampled(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        last: u32,
+        history: &mut Vec<u32>,
+        sampler: &mut Sampler,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
+        let from = history.len();
+        let mut pick = Sample(|row: &[f32]| {
+            let id = sampler(row, history);
+            history.push(id);
+            id
+        });
+        let d = self.pass_taking(s, slot, last, &mut pick, out);
+        history.truncate(from);
+        d
+    }
+
+    /// One pass on `slot`, the session's selected one, from `last`, each
+    /// row's id taken by `pick`: under the draft one window
+    /// ([`Speculative::pass_picking`]), its taken ids and counts; without
+    /// it, or while it is off, one step ([`SlotDrafts::step`]: no draft walk
+    /// follows it) and its row's id.
+    fn pass_taking<P: Pick<Session<B>>>(
+        &mut self,
+        s: &mut Session<B>,
+        slot: usize,
+        last: u32,
+        pick: &mut P,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
         let drafting = !self.is_off(slot);
         match self.spec_mut(slot)?.filter(|_| drafting) {
             Some(spec) => {
-                let c = Advance::pass(spec, s, last, out)?;
+                let c = spec.pass_picking(s, last, pick, out)?;
                 Ok(Drafted {
                     proposed: if c.proposed { c.rows - 1 } else { 0 },
                     accepted: c.kept - 1,
                 })
             }
             None => {
-                out.push(self.step(s, slot, last)?);
+                let argmax = self.step(s, slot, last)?;
+                out.push(pick.pick(s, 0, argmax)?);
                 Ok(Drafted::default())
             }
         }

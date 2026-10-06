@@ -10,7 +10,7 @@ use std::fmt;
 use models::{BlockDraft, DraftSpec};
 
 use crate::stores::PASS_ROWS;
-use crate::{Advance, Committed, Verify, Want};
+use crate::{Advance, Committed, Target, Verify, Want};
 
 /// Which hidden rows of the target a draft reads. The rows themselves — which
 /// layers, how wide — are the draft file's and the target's to agree on at
@@ -77,11 +77,12 @@ pub trait Draft<T: Verify> {
     /// and the pass panics by name.
     fn propose(&mut self, t: &mut T, last: u32, out: &mut [u32]) -> Result<usize, T::Error>;
 
-    /// The verify of `rows` read back `out`, one argmax a row, and keeps its
-    /// first `accepted` rows; runs before [`Verify::commit`] takes the rest
-    /// back, so the target's taps still hold every row. `rows` is the
-    /// proposal's `n + 1`, fewer than `WIDTH + 1` when the draft proposed
-    /// fewer.
+    /// The verify of `rows` keeps its first `accepted` rows; `out` holds one
+    /// id a row, the id the pass took at each kept row ([`Pick`]: the
+    /// argmax on a greedy pass, the draw on a sampled one) and the argmax
+    /// past them. Runs before [`Verify::commit`] takes the rest back, so the
+    /// target's taps still hold every row. `rows` is the proposal's `n + 1`,
+    /// fewer than `WIDTH + 1` when the draft proposed fewer.
     fn accept(
         &mut self,
         t: &mut T,
@@ -90,7 +91,8 @@ pub trait Draft<T: Verify> {
         accepted: usize,
     ) -> Result<(), T::Error>;
 
-    /// A pass with no proposal stepped `last`; its argmax is `next`.
+    /// A pass with no proposal stepped `last`; the id it took after it is
+    /// `next`.
     fn stepped(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error>;
 
     /// [`Draft::stepped`] of a pass whose proposal was held back (a closed
@@ -206,12 +208,51 @@ pub fn accepted_rows(rows: &[u32], out: &[u32]) -> usize {
         .count()
 }
 
+/// A target that reads back the logits of its last call's rows.
+pub trait RowLogits: Target {
+    /// Row `r`'s logits (one a vocabulary id): a step's or a prompt call's
+    /// row 0, or row `r` of a verify waiting for its commit. Refused by name
+    /// for a row the call did not run, and for a row holding a NaN.
+    fn row_logits(&mut self, r: usize) -> Result<&[f32], Self::Error>;
+}
+
+/// Which id a pass takes at each row it ran, asked row by row in position
+/// order and never past the first row whose id is not the proposal's next.
+pub trait Pick<T: Target> {
+    /// The id taken at row `r` of `t`'s last call (a step's row 0, or row
+    /// `r` of a verify waiting for its commit), whose argmax is `argmax`.
+    fn pick(&mut self, t: &mut T, r: usize, argmax: u32) -> Result<u32, T::Error>;
+}
+
+/// The greedy pick: each row's argmax. It reads nothing back.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Argmax;
+
+impl<T: Target> Pick<T> for Argmax {
+    #[inline]
+    fn pick(&mut self, _t: &mut T, _r: usize, argmax: u32) -> Result<u32, T::Error> {
+        Ok(argmax)
+    }
+}
+
+/// The sampled pick: each row's id drawn by the closure from that row's
+/// logits ([`RowLogits::row_logits`]), one call a taken id.
+pub struct Sample<F>(pub F);
+
+impl<T: RowLogits, F: FnMut(&[f32]) -> u32> Pick<T> for Sample<F> {
+    fn pick(&mut self, t: &mut T, r: usize, _argmax: u32) -> Result<u32, T::Error> {
+        Ok((self.0)(t.row_logits(r)?))
+    }
+}
+
 /// One verify of the proposal in `rows`, [`Width::run`] at the proposal's
-/// width: the rows the target agrees with kept, the draft hearing of them
-/// before the rest is taken back.
-struct VerifyRows<'a, T, D> {
+/// width: each row's id taken by `pick` in position order, the rows through
+/// the first whose id is not the proposal's next kept, the draft hearing of
+/// them before the rest is taken back.
+struct VerifyRows<'a, T, D, P> {
     t: &'a mut T,
     draft: &'a mut D,
+    pick: &'a mut P,
     /// The token at the target's position, then the proposal; at least the
     /// width's rows.
     rows: &'a [u32],
@@ -219,7 +260,7 @@ struct VerifyRows<'a, T, D> {
     kept: usize,
 }
 
-impl<T: Verify, D: Draft<T>> Width for VerifyRows<'_, T, D> {
+impl<T: Verify, D: Draft<T>, P: Pick<T>> Width for VerifyRows<'_, T, D, P> {
     type Error = T::Error;
 
     fn run<const R: usize>(&mut self) -> Result<(), T::Error> {
@@ -227,10 +268,18 @@ impl<T: Verify, D: Draft<T>> Width for VerifyRows<'_, T, D> {
             .try_into()
             .expect("a slice of R ids is an array of R");
         let argmax = self.t.verify(rows)?;
-        let kept = accepted_rows(&rows, &argmax);
-        self.draft.accept(self.t, &rows, &argmax, kept)?;
+        let mut taken = argmax;
+        let mut kept = R;
+        for (r, (id, &a)) in taken.iter_mut().zip(&argmax).enumerate() {
+            *id = self.pick.pick(self.t, r, a)?;
+            if rows.get(r + 1).is_some_and(|&d| d != *id) {
+                kept = r + 1;
+                break;
+            }
+        }
+        self.draft.accept(self.t, &rows, &taken, kept)?;
         self.t.commit(kept)?;
-        self.out.extend_from_slice(&argmax[..kept]);
+        self.out.extend_from_slice(&taken[..kept]);
         self.kept = kept;
         Ok(())
     }
@@ -252,13 +301,44 @@ where
 
     /// Propose, verify the `n` ids behind `last` in one pass of `n + 1`
     /// rows, keep the rows the target agrees with, the draft hearing of them
-    /// before the rest is taken back; with no proposal, one step.
+    /// before the rest is taken back; with no proposal, one step: the greedy
+    /// pass, [`Speculative::pass_picking`] by [`Argmax`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Speculative::pass_picking`].
+    fn pass(&mut self, t: &mut T, last: u32, out: &mut Vec<u32>) -> Result<Committed, T::Error> {
+        self.pass_picking(t, last, &mut Argmax, out)
+    }
+}
+
+impl<D, const M: usize> Speculative<D, M>
+where
+    Window<M>: Widths,
+{
+    /// One pass whose ids `pick` takes, by llama.cpp's
+    /// `common_sampler_sample_and_accept_n`: propose `n` ids behind `last`
+    /// and verify them in one pass of `n + 1` rows; then, row by row in
+    /// position order, the id `pick` takes is appended to `out`, until the
+    /// first that is not the proposal's next id, or the last row. Those rows
+    /// are kept, the draft hearing of the taken ids before the rest is taken
+    /// back. With no proposal, one step and its row's id. Each row is picked
+    /// once, before the draft hears of it.
     ///
     /// # Panics
     ///
     /// When the draft proposes more than its [`Draft::WIDTH`] ids, or moves
     /// the target's position.
-    fn pass(&mut self, t: &mut T, last: u32, out: &mut Vec<u32>) -> Result<Committed, T::Error> {
+    pub fn pass_picking<T: Verify, P: Pick<T>>(
+        &mut self,
+        t: &mut T,
+        last: u32,
+        pick: &mut P,
+        out: &mut Vec<u32>,
+    ) -> Result<Committed, T::Error>
+    where
+        D: Draft<T>,
+    {
         let () = D::FITS;
         const {
             assert!(
@@ -276,7 +356,8 @@ where
             "a draft's proposal moved the target from position {pos} to {now}"
         );
         if n == 0 {
-            let next = t.step(last, Want::Argmax)?.argmax();
+            let argmax = t.step(last, Want::Argmax)?.argmax();
+            let next = pick.pick(t, 0, argmax)?;
             self.draft.stepped(t, last, next)?;
             out.push(next);
             return Ok(Committed {
@@ -289,6 +370,7 @@ where
         let mut v = VerifyRows {
             t,
             draft: &mut self.draft,
+            pick,
             rows: &rows,
             out,
             kept: 0,
@@ -345,8 +427,8 @@ mod tests {
     use super::{NotBuilt, Program, Width, Widths, Window, accepted_rows, program};
     use crate::mock::{Call, Mock, MockError, Quiet};
     use crate::{
-        Advance, Committed, Draft, Lookup, Out, PassSink, Plain, Speculative, Stop, StopReason,
-        TapNeed, Verify, Want, generate,
+        Advance, Committed, Draft, Lookup, Out, PassSink, Plain, RowLogits, Sample, Speculative,
+        Stop, StopReason, TapNeed, Verify, Want, generate,
     };
 
     /// Row 0 always; then while the argmax of row r is row r + 1's id.
@@ -610,6 +692,235 @@ mod tests {
             self.stepped += 1;
             Ok(())
         }
+    }
+
+    /// A draft of width 3 whose proposals are the target's own greedy ids
+    /// after `last`, counts by `plan` in turn, that keeps every id it hears:
+    /// each accept's kept ids and each step's next, and how many windows it
+    /// heard kept whole and cut short.
+    struct Heard {
+        plan: Vec<usize>,
+        next: usize,
+        heard: Vec<u32>,
+        whole: usize,
+        cut: usize,
+    }
+
+    impl Heard {
+        fn new(plan: &[usize]) -> Heard {
+            Heard {
+                plan: plan.to_vec(),
+                next: 0,
+                heard: Vec::new(),
+                whole: 0,
+                cut: 0,
+            }
+        }
+    }
+
+    impl Draft<Mock> for Heard {
+        const WIDTH: usize = 3;
+        const TAPS: TapNeed = TapNeed::None;
+
+        fn begin(&mut self, _t: &Mock, _prompt: &[u32], _first: u32) -> Result<(), MockError> {
+            Ok(())
+        }
+
+        fn propose(
+            &mut self,
+            t: &mut Mock,
+            last: u32,
+            out: &mut [u32],
+        ) -> Result<usize, MockError> {
+            let n = self.plan[self.next % self.plan.len()];
+            self.next += 1;
+            out[..n].copy_from_slice(&t.greedy_after(last, n));
+            Ok(n)
+        }
+
+        fn accept(
+            &mut self,
+            _t: &mut Mock,
+            rows: &[u32],
+            out: &[u32],
+            accepted: usize,
+        ) -> Result<(), MockError> {
+            self.heard.extend_from_slice(&out[..accepted]);
+            if accepted == rows.len() {
+                self.whole += 1;
+            } else {
+                self.cut += 1;
+            }
+            Ok(())
+        }
+
+        fn stepped(&mut self, _t: &mut Mock, _last: u32, next: u32) -> Result<(), MockError> {
+            self.heard.push(next);
+            Ok(())
+        }
+    }
+
+    /// One seeded draw from `row` at temperature 0.8, a repeat of the
+    /// history's last id held back by 0.5, so a draw reads the ids before it:
+    /// xorshift, one step of the generator a call.
+    fn draw(rng: &mut u64, row: &[f32], history: &[u32]) -> u32 {
+        *rng ^= *rng << 13;
+        *rng ^= *rng >> 7;
+        *rng ^= *rng << 17;
+        let u = (*rng >> 40) as f32 / (1u64 << 24) as f32;
+        let last = history.last().copied();
+        let w: Vec<f32> = (0u32..)
+            .zip(row)
+            .map(|(v, &l)| ((l - if Some(v) == last { 0.5 } else { 0.0 }) / 0.8).exp())
+            .collect();
+        let total: f32 = w.iter().sum();
+        let mut acc = 0.0;
+        for (v, &x) in (0u32..).zip(&w) {
+            acc += x / total;
+            if u < acc {
+                return v;
+            }
+        }
+        u32::try_from(w.len() - 1).unwrap()
+    }
+
+    /// The generator's state for `seed`: never the fixed point 0.
+    fn rng_of(seed: u64) -> u64 {
+        seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1
+    }
+
+    /// The prompt's row's draw, then plain steps, each step's row drawn,
+    /// until `n` ids.
+    fn plain_sampled(prompt: &[u32], seed: u64, n: usize) -> Vec<u32> {
+        let mut t = Mock::new();
+        let mut rng = rng_of(seed);
+        let mut ids = Vec::new();
+        t.prompt(prompt, Want::Argmax).unwrap();
+        while ids.len() < n {
+            if let Some(&last) = ids.last() {
+                t.step(last, Want::Argmax).unwrap();
+            }
+            let id = draw(&mut rng, t.row_logits(0).unwrap(), &ids);
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// The prompt's row's draw, then sampled passes of `spec` until `n` ids
+    /// at least: the ids, the draws made, and the target.
+    fn drafted_sampled<D: Draft<Mock>, const M: usize>(
+        spec: &mut Speculative<D, M>,
+        prompt: &[u32],
+        seed: u64,
+        n: usize,
+    ) -> (Vec<u32>, usize, Mock)
+    where
+        Window<M>: Widths,
+    {
+        let mut t = Mock::new();
+        let mut rng = rng_of(seed);
+        let mut ids = Vec::new();
+        spec.prompt(&mut t, prompt).unwrap();
+        let first = draw(&mut rng, t.row_logits(0).unwrap(), &ids);
+        ids.push(first);
+        spec.begin(&t, prompt, first).unwrap();
+        let mut draws = 1;
+        while ids.len() < n {
+            let (from, last) = (ids.len(), ids[ids.len() - 1]);
+            let mut out = Vec::new();
+            let mut pick = Sample(|row: &[f32]| {
+                draws += 1;
+                let id = draw(&mut rng, row, &ids);
+                ids.push(id);
+                id
+            });
+            spec.pass_picking(&mut t, last, &mut pick, &mut out)
+                .unwrap();
+            assert_eq!(out, ids[from..], "a pass's ids are the ones it took");
+        }
+        (ids, draws, t)
+    }
+
+    /// Identity: over many seeds, sampled passes take the ids plain sampled
+    /// steps take, one draw a taken id, with windows both kept whole and
+    /// cut short at a draw that is not the proposal's id.
+    #[test]
+    fn a_sampled_pass_takes_the_plain_steps_ids() {
+        let prompt = [1, 2, 3, 1, 2];
+        let (mut whole, mut cut, mut off_greedy) = (0, 0, 0);
+        let greedy = run(&mut Plain, &prompt, &Stop::new(48, 1000).unwrap())
+            .0
+            .tokens;
+        for seed in 0..64 {
+            let want = plain_sampled(&prompt, seed, 48);
+            let mut spec = Speculative::<Heard, 4>::new(Heard::new(&[3, 1, 0, 2]));
+            let (got, draws, _) = drafted_sampled(&mut spec, &prompt, seed, 48);
+            assert_eq!(got[..48], want[..], "seed {seed}");
+            assert_eq!(draws, got.len(), "seed {seed}: one draw a taken id");
+            whole += spec.draft().whole;
+            cut += spec.draft().cut;
+            off_greedy += usize::from(got[..48] != greedy[..]);
+        }
+        assert!(whole > 0 && cut > 0, "whole {whole}, cut {cut}");
+        assert!(off_greedy > 0, "no seed drew off the greedy ids");
+    }
+
+    /// The draft hears the taken ids: every accept's kept ids and every
+    /// step's next, in order, are the ids the passes took after the first —
+    /// a cut window's last kept id the draw, not its row's argmax.
+    #[test]
+    fn a_draft_hears_the_taken_ids() {
+        let prompt = [1, 2, 3, 1, 2];
+        for seed in 0..16 {
+            let mut spec = Speculative::<Heard, 4>::new(Heard::new(&[3, 1, 0, 2]));
+            let (got, _, _) = drafted_sampled(&mut spec, &prompt, seed, 40);
+            assert!(spec.draft().cut > 0, "seed {seed}: no window was cut");
+            assert_eq!(spec.draft().heard, got[1..], "seed {seed}");
+        }
+    }
+
+    /// The greedy pick is the pass by each row's argmax and reads no row:
+    /// [`Advance::pass`] gives the ids, the target's calls and what the draft
+    /// hears that a sampled pick taking each row's largest logit gives, and
+    /// reads nothing back while that one reads every row it takes.
+    #[test]
+    fn the_greedy_pick_reads_no_row() {
+        let prompt = [1, 2, 3, 1, 2];
+        let drive = |sampled: bool| {
+            let mut t = Mock::new();
+            let mut spec = Speculative::<Heard, 4>::new(Heard::new(&[3, 1, 0, 2]));
+            let mut ids = vec![spec.prompt(&mut t, &prompt).unwrap()];
+            spec.begin(&t, &prompt, ids[0]).unwrap();
+            let mut largest = Sample(|row: &[f32]| {
+                (0u32..)
+                    .zip(row)
+                    .fold(
+                        (0, f32::NEG_INFINITY),
+                        |b, (v, &l)| if l > b.1 { (v, l) } else { b },
+                    )
+                    .0
+            });
+            while ids.len() < 40 {
+                let last = ids[ids.len() - 1];
+                if sampled {
+                    spec.pass_picking(&mut t, last, &mut largest, &mut ids)
+                } else {
+                    Advance::pass(&mut spec, &mut t, last, &mut ids)
+                }
+                .unwrap();
+            }
+            let reads = t.logit_reads();
+            (ids, t.calls().to_vec(), spec.draft().heard.clone(), reads)
+        };
+        let (ids, calls, heard, reads) = drive(false);
+        let (s_ids, s_calls, s_heard, s_reads) = drive(true);
+        assert_eq!((&ids, &calls, &heard), (&s_ids, &s_calls, &s_heard));
+        assert_eq!(reads, 0, "the greedy pass read {reads} rows back");
+        assert!(
+            s_reads >= ids.len() - 1,
+            "{s_reads} reads for {} ids",
+            ids.len()
+        );
     }
 
     /// A sink that keeps every pass's [`Committed`].

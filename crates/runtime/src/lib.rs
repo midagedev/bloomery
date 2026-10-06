@@ -8,9 +8,10 @@
 //! lets a draft's verify passes run only while they pay. [`generate`] is the
 //! one loop over both, until the [`Stop`] rule ends it.
 //!
-//! Everything here is greedy: a pass keeps the target's argmax, so a draft
-//! changes which passes run and never a token. Sampling — the sampler chain,
-//! and verification by sampling each verified row — needs the rows' logits.
+//! A pass takes each row's id by a [`Pick`]: the target's argmax
+//! ([`Argmax`], the greedy pass), or a draw from the row's logits ([`Sample`]
+//! over a [`RowLogits`] target), one call a taken id. Either way a draft
+//! changes which passes run and never a token.
 //!
 //! Beneath a target's call: [`sched`], the order in which a schedule runs a
 //! layer program's parts over its units ([`sched::walk`]), [`state`], the
@@ -40,8 +41,8 @@ pub mod words;
 pub use gate::Gated;
 pub use lookup::Lookup;
 pub use speculative::{
-    Draft, NotBuilt, Program, Speculative, TapNeed, Tapped, Width, Widths, Window, accepted_rows,
-    program,
+    Argmax, Draft, NotBuilt, Pick, Program, RowLogits, Sample, Speculative, TapNeed, Tapped, Width,
+    Widths, Window, accepted_rows, program,
 };
 pub use stop::{NoTokens, Stop, StopReason};
 

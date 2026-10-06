@@ -1399,6 +1399,28 @@ impl Seat for Glm {
         self.drafted.pass_rows(self.s.selected())
     }
 
+    /// One sampled pass from `last` ([`SlotDrafts::pass_sampled`]): under
+    /// the draft the window of two rows, each row's id the sampler's draw.
+    fn pass_sampled(
+        &mut self,
+        last: u32,
+        history: &mut Vec<u32>,
+        sampler: &mut serve::Sampler,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
+        let sel = self.s.selected();
+        let d = self
+            .drafted
+            .pass_sampled(&mut self.s, sel, last, history, sampler, out)?;
+        self.print_passes()?;
+        Ok(d)
+    }
+
+    /// The sampled pass drafts while the MTP draft runs.
+    fn drafts_sampled(&self) -> bool {
+        self.drafted.drafts()
+    }
+
     /// The session's reset, then the draft started over: the residency stays
     /// where use has taken it (only [`Seat::residency_reset`] moves it back).
     fn reset(&mut self) -> Result<(), GateError> {

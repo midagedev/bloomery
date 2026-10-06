@@ -446,12 +446,14 @@ impl<B: MtpBody> MtpDraft<B> {
     }
 
     /// The next refresh recorded for a verify of `rows` that ran from
-    /// position `p0` and read back `out`, keeping its first `accepted` rows,
-    /// before the commit takes the rest back: the kept rows at the positions
-    /// after the verify's first, each with the hidden row the verify's row
-    /// before it wrote ([`MtpBody::VERIFY_ARENA`]), the last row the target's
-    /// own next token. What [`Draft::accept`] records, `p0` given by the
-    /// caller that ran the verify.
+    /// position `p0`, keeping its first `accepted` rows, `out` the id the
+    /// pass took at each ([`Draft::accept`]), before the commit takes the
+    /// rest back: the kept rows at the positions after the verify's first,
+    /// each with the hidden row the verify's row before it wrote
+    /// ([`MtpBody::VERIFY_ARENA`]), the last row the id the pass took after
+    /// the last kept row — the argmax on a greedy pass, the draw on a
+    /// sampled one. What [`Draft::accept`] records, `p0` given by the caller
+    /// that ran the verify.
     pub fn record(
         &mut self,
         p0: u32,
@@ -465,7 +467,7 @@ impl<B: MtpBody> MtpDraft<B> {
             .copied()
             .ok_or_else(|| {
                 SessionError::Refused(format!(
-                    "{WHAT}: a verify that kept {accepted} rows read back no argmax"
+                    "{WHAT}: a verify that kept {accepted} rows took no id"
                 ))
             })?;
         self.next = Some(Refresh {
@@ -873,20 +875,23 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     }
 
     /// One chain, one readback (the module doc): the recorded refresh's
-    /// walk — its last row the target's own next token, whose prediction is
-    /// the first proposal — then own walks while the context holds them and
-    /// the proposal fits `out`: at most `out.len()` ids, so a caller caps a
-    /// window's depth by the room it hands. No room is refused by name.
+    /// walk — its last row `last`, the token at the target's position, whose
+    /// prediction is the first proposal — then own walks while the context
+    /// holds them and the proposal fits `out`: at most `out.len()` ids, so a
+    /// caller caps a window's depth by the room it hands. No room is refused
+    /// by name. The refresh's last row is `last` whatever the call that
+    /// recorded it took there: a step tells the draft its argmax, and a
+    /// sampled request feeds its draw.
     fn propose(
         &mut self,
         t: &mut Session<B>,
-        _last: u32,
+        last: u32,
         out: &mut [u32],
     ) -> Result<usize, SessionError> {
         if self.skip.is_some() {
             return Ok(0);
         }
-        let Some(r) = self.next.take() else {
+        let Some(mut r) = self.next.take() else {
             return Err(SessionError::Refused(format!(
                 "{WHAT}: a proposal before the draft's refresh (its prompt call, or the accept \
                  before it)"
@@ -909,6 +914,9 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
             return Err(SessionError::Refused(format!(
                 "{WHAT}: a proposal into no room"
             )));
+        }
+        if let Some(l) = r.tokens.last_mut() {
+            *l = last;
         }
         let own = (room - 1).min(t.ctx() as usize - end);
         let Some(w) = &mut self.windows else {
@@ -953,8 +961,8 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// the anchor (`last` at the prompt's end), or on a first step at
     /// position 0 its row beside a zero hidden row — walked now, since
     /// the step's row follows them and the store must hold every position
-    /// below the next chain's; then the token `next` at the position the
-    /// step's argmax names, with the hidden row the step wrote
+    /// below the next chain's; then `next`, the id taken after the step, at
+    /// the position after it, with the hidden row the step wrote
     /// ([`MtpBody::STEP_ARENA`]), as the next refresh. Refused by name when
     /// the waiting rows read the step's own arena, which the step has
     /// overwritten.

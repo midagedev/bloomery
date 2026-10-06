@@ -38,7 +38,7 @@ use gguf::Split;
 use model::placement::{Machine, Plan};
 use runtime::seqstate::Kept;
 use runtime::swaprule::KeptRows;
-use runtime::{Draft, Out, Speculative, Target, Verify, Want, Width, Widths, Window};
+use runtime::{Draft, Out, RowLogits, Speculative, Target, Verify, Want, Width, Widths, Window};
 
 /// What a session call failed with. Its text is the failure's own: a card
 /// error reads as the card's error.
@@ -342,17 +342,21 @@ impl<B: Open> Loaded<B> {
             rows: None,
             slots_waiting: None,
             logits: Vec::new(),
+            pass: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
         })
     }
 }
 
-/// The rows of a verify waiting for their commit.
+/// The rows of a verify waiting for their commit, and whether a row read
+/// ([`RowLogits::row_logits`]) has fetched the pass's head into the
+/// session's copy.
 #[derive(Clone, Copy, Debug)]
 struct RowsInFlight {
     first: u32,
     m: usize,
+    fetched: bool,
 }
 
 /// One model on its card behind [`Target`] and [`Verify`].
@@ -370,8 +374,12 @@ pub struct Session<B: ChainBody> {
     /// The slots of a pass of several slots' verify rows waiting for their
     /// commit ([`Session::verify_slots`]).
     slots_waiting: Option<usize>,
-    /// The last logits row read back ([`Want::Logits`]).
+    /// The last logits row read back ([`Want::Logits`],
+    /// [`RowLogits::row_logits`]).
     logits: Vec<f32>,
+    /// The pass's head as a row read fetched it ([`GpuModel::pass_row_into`]),
+    /// grown once and reused.
+    pass: Vec<f32>,
     /// The last tapped rows read back ([`Tapped::taps`]).
     tapped: Vec<f32>,
     /// The residency reset the last clear made, until taken.
@@ -390,6 +398,7 @@ impl<B: ChainBody> Session<B> {
             rows: None,
             slots_waiting: None,
             logits: Vec::new(),
+            pass: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
         }
@@ -704,7 +713,11 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
         self.idle("verify")?;
         let first = self.model.pos();
         let out = self.model.step_rows::<M>(rows)?;
-        self.rows = Some(RowsInFlight { first, m: M });
+        self.rows = Some(RowsInFlight {
+            first,
+            m: M,
+            fetched: false,
+        });
         Ok(out)
     }
 
@@ -730,6 +743,43 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
         self.model
             .keep_rows(KeptRows::prefix(accepted), PassKind::Pair)?;
         Ok(())
+    }
+}
+
+impl<B: Prompt + Keep + Rows + Rollback> RowLogits for Session<B> {
+    /// Row 0 of the last step or prompt call ([`GpuModel::logits_into`]), or
+    /// row `r` of the verify waiting for its commit
+    /// ([`GpuModel::pass_row_into`]: a pass laid in one head is fetched at
+    /// the first row asked, the rows after it read from the session's copy),
+    /// into the session's row, grown once and reused. Refused by name for a
+    /// row the call did not run, for row 0 while a pass of several slots
+    /// waits, and for a row holding a NaN, as a step's row is.
+    fn row_logits(&mut self, r: usize) -> Result<&[f32], SessionError> {
+        let n_vocab = self.model.n_vocab()?;
+        self.logits.resize(n_vocab, 0.0);
+        match &mut self.rows {
+            None if r == 0 => {
+                self.idle("row_logits")?;
+                self.model.logits_into(&mut self.logits)?;
+            }
+            None => {
+                return Err(SessionError::Refused(format!(
+                    "row {r} read back with no verify waiting"
+                )));
+            }
+            Some(f) => {
+                self.model
+                    .pass_row_into(f.m, r, &mut self.pass, f.fetched, &mut self.logits)?;
+                f.fetched = true;
+            }
+        }
+        if let Some(i) = self.logits.iter().position(|v| v.is_nan()) {
+            return Err(SessionError::Refused(format!(
+                "row {r}'s logit {i} is NaN after position {}",
+                self.model.pos()
+            )));
+        }
+        Ok(&self.logits)
     }
 }
 

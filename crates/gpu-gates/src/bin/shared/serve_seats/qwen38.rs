@@ -1649,6 +1649,29 @@ impl Seat for Q38 {
         self.drafts.pass_rows(self.s.selected())
     }
 
+    /// One sampled pass from `last` ([`SlotDrafts::pass_sampled`]): under
+    /// the draft the draft's window of four rows, each row's id the sampler's draw.
+    fn pass_sampled(
+        &mut self,
+        last: u32,
+        history: &mut Vec<u32>,
+        sampler: &mut serve::Sampler,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
+        self.before_call();
+        let sel = self.s.selected();
+        let d = self
+            .drafts
+            .pass_sampled(&mut self.s, sel, last, history, sampler, out)?;
+        self.print_passes()?;
+        Ok(d)
+    }
+
+    /// The sampled pass drafts while the MTP draft runs.
+    fn drafts_sampled(&self) -> bool {
+        self.drafts.drafts()
+    }
+
     /// The lever the binary parsed ([`Q38::stats`]).
     fn step_stats(&self) -> bool {
         self.stats

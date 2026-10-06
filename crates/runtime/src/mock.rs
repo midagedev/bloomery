@@ -6,7 +6,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::gate::{Clock, GateError};
-use crate::{Committed, Out, PassSink, Target, Verify, Want};
+use crate::{Committed, Out, PassSink, RowLogits, Target, Verify, Want};
+
+/// The ids the mock's rows span.
+pub(crate) const VOCAB: usize = 5;
 
 /// One call the mock ran, at the position it started from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -77,6 +80,11 @@ pub(crate) struct Mock {
     rows: Option<(usize, usize)>,
     ctx: u32,
     clock: Option<Rc<Clockwork>>,
+    /// The last row read back ([`RowLogits::row_logits`]).
+    row: [f32; VOCAB],
+    /// Rows read back: [`RowLogits::row_logits`] calls and calls that asked
+    /// [`Want::Logits`].
+    logit_reads: usize,
 }
 
 impl Mock {
@@ -89,7 +97,14 @@ impl Mock {
             rows: None,
             ctx: 1000,
             clock: None,
+            row: [0.0; VOCAB],
+            logit_reads: 0,
         }
+    }
+
+    /// Rows read back so far.
+    pub(crate) fn logit_reads(&self) -> usize {
+        self.logit_reads
     }
 
     /// Each step and verify advances `clock` by its cost.
@@ -178,6 +193,24 @@ fn rule(n: usize, a: u32, b: u32) -> u32 {
     (a * 3 + b + u32::from((n / 7) % 2 == 1)) % 5
 }
 
+/// The logits after `hist` (at least one id): the rule's argmax 2 above a
+/// noise in [0, 1) that hashes the whole of `hist`, so a row moves with every
+/// id before it and its argmax is the rule's.
+fn logits_after(hist: &[u32], out: &mut [f32; VOCAB]) {
+    let n = hist.len();
+    let b = if n >= 2 { hist[n - 2] } else { 0 };
+    let top = rule(n, hist[n - 1], b);
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &id in hist {
+        h = (h ^ u64::from(id)).wrapping_mul(0x0100_0000_01b3);
+    }
+    for (v, o) in (0u32..).zip(out.iter_mut()) {
+        h = (h ^ u64::from(v)).wrapping_mul(0x0100_0000_01b3);
+        let noise = (h >> 40) as f32 / (1u64 << 24) as f32;
+        *o = noise + if v == top { 2.0 } else { 0.0 };
+    }
+}
+
 impl Target for Mock {
     type Error = MockError;
 
@@ -189,8 +222,9 @@ impl Target for Mock {
         self.ctx
     }
 
-    fn prompt(&mut self, ids: &[u32], _want: Want) -> Result<Out<'_>, MockError> {
+    fn prompt(&mut self, ids: &[u32], want: Want) -> Result<Out<'_>, MockError> {
         self.calls.push(Call::Prompt(self.at(), ids.len()));
+        self.logit_reads += usize::from(want == Want::Logits);
         self.idle()?;
         if self.fail_prompt {
             return Err(MockError::Mock("the prompt call failed"));
@@ -200,8 +234,9 @@ impl Target for Mock {
         Ok(Out::Argmax(self.argmax()))
     }
 
-    fn step(&mut self, id: u32, _want: Want) -> Result<Out<'_>, MockError> {
+    fn step(&mut self, id: u32, want: Want) -> Result<Out<'_>, MockError> {
         self.calls.push(Call::Step(self.at()));
+        self.logit_reads += usize::from(want == Want::Logits);
         self.idle()?;
         if self.fail_at == Some(self.at()) {
             return Err(MockError::Mock("the step failed"));
@@ -261,6 +296,19 @@ impl Verify for Mock {
         }
         self.history.truncate(first + accepted);
         Ok(())
+    }
+}
+
+impl RowLogits for Mock {
+    fn row_logits(&mut self, r: usize) -> Result<&[f32], MockError> {
+        let end = match self.rows {
+            Some((first, m)) if r < m => first + r + 1,
+            None if r == 0 && !self.history.is_empty() => self.history.len(),
+            _ => return Err(MockError::Mock("a row the last call did not run")),
+        };
+        self.logit_reads += 1;
+        logits_after(&self.history[..end], &mut self.row);
+        Ok(&self.row)
     }
 }
 

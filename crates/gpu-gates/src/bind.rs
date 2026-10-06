@@ -454,6 +454,15 @@ enum Cmd {
         last: u32,
         out: Vec<u32>,
     },
+    /// A sampled pass from `last` ([`Seat::pass_sampled`]): the request's
+    /// ids so far and its sampler cross to the thread and back with the
+    /// reply, the sampler's state with it.
+    PassSampled {
+        last: u32,
+        history: Vec<u32>,
+        sampler: serve::Sampler,
+        out: Vec<u32>,
+    },
     Reset,
     /// Take back the positions from this one on.
     Rollback(u32),
@@ -530,6 +539,14 @@ enum Extra {
     /// A `Pass`'s buffer, holding its kept tokens on success, and what its
     /// draft proposed and kept.
     Pass(Vec<u32>, Drafted),
+    /// A `PassSampled`'s buffer, holding its taken ids on success, what its
+    /// draft proposed and kept, and the history and sampler it was sent.
+    PassSampled {
+        out: Vec<u32>,
+        drafted: Drafted,
+        history: Vec<u32>,
+        sampler: serve::Sampler,
+    },
     /// A `ResidencyReset`'s report; `None` for a seat with no residency.
     Residency(Option<ResidencyReset>),
     /// A `StepSlots`' rows, their answers set and their lent rows filled.
@@ -587,6 +604,30 @@ pub trait Seat: 'static {
     /// The most positions [`Seat::pass`] runs.
     fn pass_rows(&self) -> usize {
         1
+    }
+    /// One sampled pass from `last` (`serve::Engine::advance_sampled`): the
+    /// draft's proposal verified, each row's id drawn by `sampler` from that
+    /// row's logits given `history` and the ids this pass took before it,
+    /// up to the first that is not the proposal's next; the taken ids into
+    /// `out`, and what the draft proposed and kept. `history` comes back as
+    /// it was given, the sampler with its state moved one draw a taken id.
+    /// Asked only of a seat that [`Seat::drafts_sampled`]; the default
+    /// refuses by name.
+    fn pass_sampled(
+        &mut self,
+        last: u32,
+        history: &mut Vec<u32>,
+        sampler: &mut serve::Sampler,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
+        let _ = (last, history, sampler, out);
+        Err("this seat does not draft a sampled request".into())
+    }
+    /// Whether the seat runs [`Seat::pass_sampled`]: it drafts and reads its
+    /// verify rows' logits (`serve::Engine::drafts_sampled`). The default is
+    /// false.
+    fn drafts_sampled(&self) -> bool {
+        false
     }
     /// The sequences this seat serves at once, each a sequence of its own
     /// the seat keeps resident (the server steps them together, one
@@ -739,6 +780,8 @@ pub struct SeatEngine {
     slots: usize,
     /// [`Seat::slot_drafts`], the opened seat's.
     slot_drafts: bool,
+    /// [`Seat::drafts_sampled`], the opened seat's.
+    drafts_sampled: bool,
     card: String,
     props: EngineProps,
     cache_ram: u64,
@@ -771,8 +814,8 @@ impl SeatEngine {
     /// [`placement_props`]), which the seat completes ([`Seat::props`]);
     /// `cache_ram` is the server's prompt cache budget
     /// (`serve::Engine::cache_ram`). The seat's whole-load capabilities —
-    /// [`Seat::pass_rows`], [`Seat::slots`], [`Seat::slot_drafts`] — cross
-    /// with the load.
+    /// [`Seat::pass_rows`], [`Seat::slots`], [`Seat::slot_drafts`],
+    /// [`Seat::drafts_sampled`] — cross with the load.
     pub fn spawn<S, F>(
         open: F,
         defined: usize,
@@ -788,7 +831,7 @@ impl SeatEngine {
         let (tx, cmds) = mpsc::channel::<Cmd>();
         let (replies, rx) = mpsc::channel::<Reply>();
         let (opened, loaded) =
-            mpsc::channel::<Result<(usize, usize, usize, bool, EngineProps), String>>();
+            mpsc::channel::<Result<(usize, usize, usize, bool, bool, EngineProps), String>>();
         let n_vocab = vocab.n_vocab();
         let worker = std::thread::Builder::new()
             .name("engine".to_owned())
@@ -806,6 +849,7 @@ impl SeatEngine {
                         g.pass_rows(),
                         g.slots(),
                         g.slot_drafts(),
+                        g.drafts_sampled(),
                         g.props(props),
                     )))
                     .is_err()
@@ -838,6 +882,31 @@ impl SeatEngine {
                                     Extra::Pass(out, Drafted::default()),
                                 ),
                             }
+                        }
+                        Cmd::PassSampled {
+                            last,
+                            mut history,
+                            mut sampler,
+                            mut out,
+                        } => {
+                            let at = g.pos();
+                            out.clear();
+                            let r =
+                                pass_sampled(&mut g, last, &mut history, &mut sampler, &mut out);
+                            let (result, drafted) = match r {
+                                Ok(d) => (Ok(0), d),
+                                Err(e) => (
+                                    Err(format!("sampled pass at position {at}: {e}")),
+                                    Drafted::default(),
+                                ),
+                            };
+                            let extra = Extra::PassSampled {
+                                out,
+                                drafted,
+                                history,
+                                sampler,
+                            };
+                            (result, None, extra)
                         }
                         Cmd::Save => (Ok(0), None, Extra::Saved(snapshot_of(&mut g))),
                         Cmd::ResidencyReset => match g.residency_reset() {
@@ -889,8 +958,8 @@ impl SeatEngine {
                     }
                 }
             })?;
-        let (ctx_max, rows, slots, slot_drafts, props) = match loaded.recv() {
-            Ok(Ok((c, rows, n, d, props))) => (c.min(defined), rows, n, d, props),
+        let (ctx_max, rows, slots, slot_drafts, drafts_sampled, props) = match loaded.recv() {
+            Ok(Ok((c, rows, n, d, ds, props))) => (c.min(defined), rows, n, d, ds, props),
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvError) => return Err("the engine thread ended during the load".into()),
         };
@@ -907,6 +976,7 @@ impl SeatEngine {
             rows,
             slots,
             slot_drafts,
+            drafts_sampled,
             card,
             props,
             cache_ram,
@@ -1040,6 +1110,70 @@ impl Link {
             _ => Err(EngineError(
                 "the engine thread answered a pass with no tokens".to_owned(),
             )),
+        }
+    }
+
+    /// A sampled pass into the caller's `out` ([`Cmd::PassSampled`]): the
+    /// history and the sampler cross to the engine thread and come back with
+    /// the reply, or with the command when the thread is gone before it took
+    /// it. Only a thread that ended mid-call keeps the sampler: a stand-in
+    /// that refuses by name comes back beside the error.
+    fn pass_sampled(
+        &mut self,
+        last: u32,
+        history: Vec<u32>,
+        sampler: serve::Sampler,
+        out: &mut Vec<u32>,
+    ) -> (Result<Drafted, EngineError>, Vec<u32>, serve::Sampler) {
+        let gone = |why: &str| EngineError(why.to_owned());
+        let cmd = Cmd::PassSampled {
+            last,
+            history,
+            sampler,
+            out: std::mem::take(out),
+        };
+        let sent = match self.tx.as_ref() {
+            Some(tx) => tx.send(cmd).map_err(|mpsc::SendError(cmd)| cmd),
+            None => Err(cmd),
+        };
+        if let Err(cmd) = sent {
+            let Cmd::PassSampled {
+                history,
+                sampler,
+                out: back,
+                ..
+            } = cmd
+            else {
+                unreachable!("the command that did not cross is the sampled pass built here")
+            };
+            *out = back;
+            return (Err(gone("the engine thread is gone")), history, sampler);
+        }
+        let reply = match self.reply() {
+            Ok(r) => r,
+            Err(e) => return (Err(e), Vec::new(), lost_sampler()),
+        };
+        match reply.extra {
+            Extra::PassSampled {
+                out: taken,
+                drafted,
+                history,
+                sampler,
+            } => {
+                *out = taken;
+                (
+                    reply.result.map(|_| drafted).map_err(EngineError),
+                    history,
+                    sampler,
+                )
+            }
+            _ => (
+                Err(gone(
+                    "the engine thread answered a sampled pass with no ids",
+                )),
+                Vec::new(),
+                lost_sampler(),
+            ),
         }
     }
 
@@ -1207,6 +1341,49 @@ fn pass<S: Seat + ?Sized>(g: &mut S, last: u32, out: &mut Vec<u32>) -> Result<Dr
     Ok(d)
 }
 
+/// A sampled pass on `g` ([`Seat::pass_sampled`]), refused before it runs as
+/// [`pass`] refuses one; a seat that keeps no id or more than its rows, or
+/// hands `history` back changed, is the seat's defect, named.
+fn pass_sampled<S: Seat + ?Sized>(
+    g: &mut S,
+    last: u32,
+    history: &mut Vec<u32>,
+    sampler: &mut serve::Sampler,
+    out: &mut Vec<u32>,
+) -> Result<Drafted, String> {
+    let rows = g.pass_rows();
+    if g.pos() + rows > g.ctx_max() {
+        return Err(format!(
+            "a pass of {rows} rows from position {} passes the context {}",
+            g.pos(),
+            g.ctx_max()
+        ));
+    }
+    let given = history.len();
+    let d = g
+        .pass_sampled(last, history, sampler, out)
+        .map_err(|e| e.to_string())?;
+    if out.is_empty() || out.len() > rows {
+        return Err(format!("a pass of {rows} rows kept {} tokens", out.len()));
+    }
+    if history.len() != given {
+        return Err(format!(
+            "a sampled pass handed back a history of {} ids, given {given}",
+            history.len()
+        ));
+    }
+    Ok(d)
+}
+
+/// The sampler a [`Link::pass_sampled`] hands back when the engine thread
+/// ended holding the request's own: it refuses by name if anything draws
+/// from it.
+fn lost_sampler() -> serve::Sampler {
+    Box::new(|_: &[f32], _: &[u32]| -> u32 {
+        panic!("this request's sampler ended with the engine thread")
+    })
+}
+
 /// One command on the engine thread, and the logits buffer a `Next` was lent,
 /// handed back whatever the result.
 fn serve_cmd<S: Seat>(
@@ -1247,6 +1424,7 @@ fn serve_cmd<S: Seat>(
         | Cmd::SaveState(_)
         | Cmd::RestoreState(_)
         | Cmd::Pass { .. }
+        | Cmd::PassSampled { .. }
         | Cmd::StepSlots(..)
         | Cmd::PassSlots(..)
         | Cmd::ResidencyReset => Err(
@@ -1621,6 +1799,24 @@ impl Engine for SeatEngine {
 
     fn advance_rows(&self) -> usize {
         self.rows
+    }
+
+    /// One command ([`Cmd::PassSampled`]): the seat's sampled pass on the
+    /// engine thread, the history and sampler back with the reply.
+    fn advance_sampled(
+        &mut self,
+        last: u32,
+        history: Vec<u32>,
+        sampler: serve::Sampler,
+        out: &mut Vec<u32>,
+    ) -> (Result<Drafted, EngineError>, Vec<u32>, serve::Sampler) {
+        self.link.pass_sampled(last, history, sampler, out)
+    }
+
+    /// The seat's declaration ([`Seat::drafts_sampled`]), read once at the
+    /// spawn.
+    fn drafts_sampled(&self) -> bool {
+        self.drafts_sampled
     }
 
     /// The seat's slots ([`Seat::slots`]), read once at the spawn: the
