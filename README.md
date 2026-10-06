@@ -208,8 +208,7 @@ engines' rows live on [rig-log's bench page](https://github.com/midagedev/rig-lo
 - ¹ Qwen3.6 runs two requests in turn today, so its total is one request's rate.
 - ² A fixed placement with adaptive residency off: a server with the 3090 alone turns residency on, which this row
   does not count yet.
-- ³ On two cards Qwen3.8 runs one-row steps only: two requests take turns and the prompt runs a position at a time.
-  Batched passes over the second card are in progress.
+- ³ On two cards Qwen3.8 runs two requests in turn today; one pass of both over the second card is in progress.
 
 Each of two requests runs at 0.62–0.68× its speed alone, so one user waits longer and the machine serves more
 ([A6000](https://github.com/midagedev/rig-log/blob/main/log/2026-10-06.md#rel021-slots)).
@@ -375,7 +374,9 @@ generate, serve, and `--place gate` on a single RTX 3090). In short: Linux x86-6
   defaults](https://tape.midagedev.com/r/6kf3sxuqpza6m7k7iwi6) against [llama.cpp's GLM pull request on the
   same card](https://tape.midagedev.com/r/6nn6grc6hztpssp88hz5); [Clef-Flash answering seven Korean SystemOne
   requests](https://tape.midagedev.com/r/zd3asiqegffcmvky9hti).
-- Working contract: [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- Working contract: [`AGENTS.md`](AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md). AI-assisted pull requests are
+  welcome, and pull requests for hardware we do not have most of all: bloomery has run only on the cards and the host
+  named under [Hardware](#hardware).
 
 ## References and credits
 

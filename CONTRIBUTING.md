@@ -8,6 +8,28 @@ Thank you for looking. Issues and pull requests are welcome. Three rules matter 
 
 **No number without its conditions.** Write `tok/s @ n=96, depth 4096, RTX A6000`, not `29 tok/s`. Say which placement, which prompt and whether instrumentation was on. A derived number says [derived]. A number that turns out wrong is struck through and corrected in place, not silently edited.
 
+**AI-assisted pull requests are welcome.** Use whatever tools you like; much of bloomery itself was written with AI
+help. Point your agent at `AGENTS.md` first: it is the working contract, written to be followed by an agent. Three
+things we ask:
+
+- Say in the pull request that AI helped, and with which parts.
+- You answer for the change: you have read the diff and can explain it.
+- Paste the real output of the gates you ran. Do not paste output you did not run, or numbers that did not come from
+  the runners.
+
+**Pull requests for your own hardware are especially welcome.** bloomery has run on very little: one RTX A6000 48 GB,
+one RTX 3090 24 GB, an RTX 3060 12 GB under WSL2, a 32-core AVX2 CPU (Zen 3) with 256 GB of RAM, and Linux. Other
+cards, other memory sizes, other CPUs (AVX-512, fewer cores, less RAM), two cards of the same kind, and native Windows
+are untested. If bloomery fails or runs slowly on your machine, a fix is worth more to us than almost anything else.
+
+- Run the gates your change touches on your machine, and paste their output with the machine (`--version`, the card,
+  the driver, the CPU and the RAM).
+- We run the same gates on our cards before merging, so a change for your hardware does not break the cards we have.
+- Make the new path follow from what the machine reports (the card, its memory, the CPU's features) rather than a
+  flag only you would set, where the hardware allows.
+- A speed claim comes from the runners in `tools/ref/`, with the conditions written out as above. We cannot repeat it
+  on hardware we do not have, so say how you measured it.
+
 Also:
 
 - Code comments and anything that goes upstream are in English. Comments state what is true now; history belongs in the commit message.
