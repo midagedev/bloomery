@@ -1448,8 +1448,10 @@ pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
 /// experts a layer (a layer holding none left out), `host_experts` the
 /// routed experts it leaves on no card, `pool_bytes` the churn pool's bytes
 /// at P pinned, `headroom` the plan's host headroom and `mem_left` what the
-/// host's `MemAvailable` leaves past the plan's own host need (the load's
-/// check before any upload). P is half the fewest, the target [`room_for`]
+/// host's available bytes leave past the plan's own host need and whatever
+/// the caller counts beside it (the load's check before any upload; the
+/// Qwen3.8 room subtracts the checkpoints the load holds,
+/// gpu-gates' `mem_left_38`). P is half the fewest, the target [`room_for`]
 /// checks; `off` when no layer holds one, when the host holds none (the pool
 /// would serve nothing), when the fewest leave no room for P pinned, the
 /// spares and one that moves, or when no pool the card side leaves fits the

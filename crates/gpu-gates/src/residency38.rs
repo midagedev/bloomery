@@ -12,6 +12,33 @@ use bloomery_levers::{RESIDENCY38_SPARES, Residency38Pick, residency38_at_plan};
 use model::placement::Plan;
 use model::placement::churn::ChurnPool;
 use model::placement::workstation::{HostNeed, host_available};
+use runtime::seqstate::HOST_BUDGET;
+
+/// The host bytes the checkpoints of `slots` sequences hold at most,
+/// beside the plan's own need: one [`HOST_BUDGET`] a sequence — every
+/// resident sequence's state carries its own `Checkpoints` with the full
+/// budget (a `Slot38` of the Qwen3.8 body; a GLM sequence the same), its
+/// pinned buffers made as its prompt calls take points — so the rooms a
+/// load's host memory must leave ([`mem_left_38`], `CacheRam::of`'s
+/// prompt-cache budget) count them. The bin-shared
+/// `q3place::checkpoint_bytes` holds the same rule for the qwen3 and
+/// qwen35moe seats, which reserve their checkpoints in a placed plan; this
+/// is the lib's own, the bins' module being out of its reach.
+#[must_use]
+pub fn checkpoint_bytes(slots: usize) -> u64 {
+    u64::try_from(slots).map_or(u64::MAX, |n| n.saturating_mul(HOST_BUDGET))
+}
+
+/// What the host's available bytes leave the unset residency rule's room:
+/// past the plan's own host need and the checkpoints the load holds beside
+/// it ([`checkpoint_bytes`]) — the load's own live sequence's, the one
+/// every load holds: [`residency38`] reads the plan only, and a seat's
+/// further sequences are its cache budget's term (`CacheRam::of`) and its
+/// `checkpoints_fit` check, which know the seat's slot count.
+#[must_use]
+pub fn mem_left_38(available: u64, need: u64, slots: usize) -> i128 {
+    i128::from(available) - i128::from(need) - i128::from(checkpoint_bytes(slots))
+}
 
 /// The plan's card a qwen4exp open loads: its one card.
 pub const CARD38: usize = 0;
@@ -49,8 +76,11 @@ pub fn residency38(
             let pick = match pre {
                 Some(off) => off,
                 None => {
-                    // The load refuses a host set past `MemAvailable` before
-                    // any upload; the default leaves the pool out instead.
+                    // The load refuses a host set past the host's available
+                    // bytes before any upload; the default leaves the pool
+                    // out instead, but counts the checkpoints the load holds
+                    // beside the plan's need — its own live sequence's, as
+                    // `CacheRam::of` counts the same term.
                     let available = host_available()?;
                     let need = HostNeed::of(plan, 0).bytes();
                     residency38_at_plan(
@@ -58,7 +88,7 @@ pub fn residency38(
                         plan.host.experts,
                         |pinned| ChurnPool::of(plan, CARD38, pinned).map(|pool| pool.bytes),
                         plan.host.headroom_bytes,
-                        i128::from(available) - i128::from(need),
+                        mem_left_38(available, need, 1),
                     )
                     .map_err(|e| format!("BLOOMERY_RESIDENCY unset: the churn pool: {e}"))?
                 }

@@ -74,7 +74,8 @@ on its plan line; no flag is needed (`--place a` asks for that split on any card
 **A plan that fits the card you have.** The load reads each card's free bytes and the host's available RAM
 before anything uploads; the expert share sizes to them, and a plan that cannot fit is refused by name with
 every term (dense, KV, context, scratch, margin) and the processes holding the card — before minutes of
-loading, not after.
+loading, not after. Inside a container the host's RAM is the smaller of `MemAvailable` and the cgroup's own
+memory limit (`docker run --memory`, a systemd scope's `MemoryMax`), read the same way.
 
 **Speculative decoding.** `BLOOMERY_DRAFT=mtp` drafts with the model's own MTP head (Qwen3.8 and GLM-5.3, on by
 default in their servers); `BLOOMERY_DRAFT=dspark` drafts V4.1 with DeepSeek's DSpark head on a second card
