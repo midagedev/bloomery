@@ -76,18 +76,9 @@ Order:
 2. Then the files a new model touches outside its own crate. Next are big files by owner (R15), never a kernel or a
    `#[target_feature]` body (R12).
 3. **Next models** (the user). Order:
-   - **Mistral Large 4 "Le Chonk" first** (2026-10-07).
-     - Announced 10-06: 1.05T total, 49B active, a granular MoE, a 1.6B vision encoder, 1M context.
-     - Open weights are due by the end of October. Its architecture is not published yet.
-     - It does not fit our box at the common quants [derived, 1.05e12 × bpw / 8]: Q4_K_M ≈ 636 GB, Q2_K ≈ 388 GB,
-       IQ2_XXS ≈ 270 GB, IQ1_M ≈ 230 GB, against 256 GB RAM + 72 GB on the cards. So anything past ~2.2 bpw needs
-       routed experts on an NVMe tier.
-     - Decode reads ≈ 12.6 GB a token at 2.06 bpw [derived].
-     - Until the weights land, the work is architecture-free and common: an NVMe expert tier for files past RAM (the
-       engram IO lab is its start), the IQ1/IQ2 stacks (the IQ chain), xstream (G1/G2), and the 1M-context KV
-       sizing. If it keeps Mistral Large 3's DeepSeek-V3-style layout (unconfirmed), the V4.1 MLA path is the base.
-     - On release day: a design round from its config.json, then the reader.
-   - Then Xiaomi MiMo-V2.6-Flash (`mimo2`, in llama.cpp mainline).
+   - Mistral Large 4 "Le Chonk": passed until its open weights are out (due by the end of October; the user,
+     2026-10-07).
+   - Xiaomi MiMo-V2.6-Flash (`mimo2`, in llama.cpp mainline).
    - Then Aleph Alpha Kolibri-1 (`kolibri1`, a patch beside its GGUF upload, not in mainline).
    - The design reports `mimo26` and `kolibri1` are in. These attachments are also the test of the
      files-outside-its-crate measure.
