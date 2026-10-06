@@ -172,20 +172,29 @@ pub fn mtp_of(
     layer_tensors(draft, index)?;
     let borrows = borrows(draft)?;
     let (hidden_u, vocab_u) = (u64::from(spec.hidden), u64::from(spec.vocab));
-    // Q8_0 as well as the shape: the card head and embedding read Q8_0 only,
-    // where ik checks the shape alone and clones any type it has kernels for.
-    for (name, borrowed) in [(EMBEDDING, borrows.embedding), (HEAD, borrows.head)] {
+    // The types as well as the shape: the embedding runs as Q8_0 planes, the
+    // head as Q8_0 planes or Q6_K rows (`gpu::q6k_ids`), where ik checks the
+    // shape alone and clones any type it has kernels for.
+    for (name, borrowed, kinds) in [
+        (EMBEDDING, borrows.embedding, "Q8_0"),
+        (HEAD, borrows.head, "Q8_0 or Q6_K"),
+    ] {
         let (file, whose) = if borrowed {
             (target, "the target's")
         } else {
             (draft, "the draft's")
         };
         let found = file.find(name).map(|(_, t)| t);
-        if !found.is_some_and(|t| t.ty == GgmlType::Q8_0 && t.dims == [hidden_u, vocab_u]) {
+        let ok = |t: &TensorInfo| {
+            t.dims == [hidden_u, vocab_u]
+                && (t.ty == GgmlType::Q8_0 || (name == HEAD && t.ty == GgmlType::Q6_K))
+        };
+        if !found.is_some_and(ok) {
             return Err(PlacementError::Tensor {
                 name: name.to_string(),
                 detail: format!(
-                    "is {} in {whose} file; the MTP layer reads a Q8_0 [{hidden_u}, {vocab_u}] matrix",
+                    "is {} in {whose} file; the MTP layer reads a {kinds} [{hidden_u}, {vocab_u}] \
+                     matrix",
                     found.map_or("absent".to_string(), |t| format!("{} {:?}", t.ty, t.dims))
                 ),
             });
@@ -487,13 +496,55 @@ fn borrows(draft: &Split) -> Result<Borrows, PlacementError> {
     }
 }
 
+/// The borrowed `output.weight`'s form, as [`mtp_of`] admitted it: Q8_0
+/// planes, or the Q6_K rows the card head's quantizer feeds
+/// (`bloomery_gpu::q6k_ids`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BorrowedHead {
+    Q8_0,
+    Q6K,
+}
+
+/// The head [`mtp_of`] admitted for the `target`'s `output.weight`: the form
+/// its card program launches. [`mtp_of`] refused every other type and shape,
+/// so a tensor of one here is refused by name — the admission and this
+/// reading stay one contract.
+pub fn head_kind(target: &Split, hidden: u32, vocab: u32) -> Result<BorrowedHead, PlacementError> {
+    let found = target
+        .find(HEAD)
+        .map(|(_, t)| t)
+        .ok_or_else(|| PlacementError::Tensor {
+            name: HEAD.to_string(),
+            detail: format!(
+                "is absent in the target file; the MTP layer reads a Q8_0 or Q6_K [{hidden}, \
+                 {vocab}] matrix"
+            ),
+        })?;
+    match found.ty {
+        GgmlType::Q8_0 if found.dims == [u64::from(hidden), u64::from(vocab)] => {
+            Ok(BorrowedHead::Q8_0)
+        }
+        GgmlType::Q6_K if found.dims == [u64::from(hidden), u64::from(vocab)] => {
+            Ok(BorrowedHead::Q6K)
+        }
+        ty => Err(PlacementError::Tensor {
+            name: HEAD.to_string(),
+            detail: format!(
+                "is {ty} {:?} in the target file; the MTP layer reads a Q8_0 or Q6_K [{hidden}, \
+                 {vocab}] matrix",
+                found.dims
+            ),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use models::{Borrows, DraftSpec, Mixer, ModelSpec, MtpDraft, MtpSource};
 
     use super::super::hparams::tests::{keys, tensors};
     use super::super::hparams::{ATTN_STEMS, EXP_LAYER_STEMS};
-    use super::{EMBEDDING, HEAD, NEXTN_STEMS, mtp_of};
+    use super::{BorrowedHead, EMBEDDING, HEAD, NEXTN_STEMS, head_kind, mtp_of};
     use crate::arch::synthetic::{Ty, V, header_typed};
 
     /// The small target of the `hparams` tests: four layers, the last one
@@ -596,7 +647,8 @@ mod tests {
         kv: Vec<(&'static str, V)>,
         global: Vec<(&'static str, V)>,
         tensors: Vec<(String, Vec<u64>, Ty)>,
-        /// The target's tensors.
+        /// The target's keys and tensors.
+        target_kv: Vec<(&'static str, V)>,
         target: Vec<(String, Vec<u64>, Ty)>,
     }
 
@@ -607,7 +659,51 @@ mod tests {
                 kv: draft_keys(),
                 global: tokens(),
                 tensors: draft_tensors(),
+                target_kv: keys(),
                 target: target_tensors(),
+            }
+        }
+
+        /// [`Case::shared`] at `embedding_length` 256, the smallest hidden a
+        /// Q6_K or Q4_K block divides: the reader refuses a K-quant row
+        /// whose width is not whole blocks, so a target head of one needs a
+        /// hidden the block divides.
+        fn wide() -> Case {
+            let kv = |mut kv: Vec<(&'static str, V)>| {
+                kv.iter_mut().for_each(|(k, v)| {
+                    if *k == "embedding_length" {
+                        *v = V::U32(256);
+                    } else if *k == "embedding_length_per_layer_input" {
+                        // Four PLE rows a ngram: heads·row stays the
+                        // embedding's width.
+                        *v = V::U32(64);
+                    }
+                });
+                kv
+            };
+            let tensors = |ts: Vec<(String, Vec<u64>, Ty)>| {
+                ts.into_iter()
+                    .map(|(n, d, ty)| {
+                        let d = match n.rsplit('.').next().unwrap_or("") {
+                            "weight" if d == [64] => vec![256],
+                            "weight" if d == [128, 64] => vec![512, 256],
+                            "weight" if d == [256] => vec![1024],
+                            "weight" if d == [64, 128] => vec![256, 128],
+                            "weight" if d == [64, 2] => vec![256, 2],
+                            "weight" if d == [16, 20] => vec![64, 20],
+                            _ => d,
+                        };
+                        (n, d, ty)
+                    })
+                    .collect()
+            };
+            Case {
+                arch: "qwen4exp",
+                kv: kv(draft_keys()),
+                global: tokens(),
+                tensors: tensors(draft_tensors()),
+                target_kv: kv(keys()),
+                target: tensors(target_tensors()),
             }
         }
 
@@ -626,7 +722,7 @@ mod tests {
             let tpath = header_typed(
                 &format!("{tag}-t"),
                 "qwen4exp",
-                &keys(),
+                &self.target_kv,
                 &tokens(),
                 &self.target,
             );
@@ -930,19 +1026,99 @@ mod tests {
         );
     }
 
-    /// A borrowed matrix is the target's, held to the same form.
+    /// A borrowed matrix is the target's, held to the forms it reads: an
+    /// F32 or Q4_K target head is refused by name.
     #[test]
-    fn a_target_matrix_not_q8_0_is_refused() {
-        let mut c = Case::shared();
+    fn a_target_head_not_q8_0_or_q6_k_is_refused() {
+        for (tag, ty, shown) in [
+            ("mtp-thead-f32", Ty::F32, "f32"),
+            ("mtp-thead-q4k", Ty::Q4K, "q4_K"),
+        ] {
+            let mut c = Case::wide();
+            for t in &mut c.target {
+                if t.0 == HEAD {
+                    t.2 = ty;
+                }
+            }
+            c.refused(
+                tag,
+                &format!("tensor output.weight: is {shown} [256, 2] in the target's file"),
+            );
+        }
+    }
+
+    /// A Q6_K target head is admitted: the card program reads its rows
+    /// through the row-map gemv, and `head_kind` records the form.
+    #[test]
+    fn a_q6_k_target_head_is_admitted() {
+        let mut c = Case::wide();
         for t in &mut c.target {
+            if t.0 == HEAD {
+                t.2 = Ty::Q6K;
+            }
+        }
+        let m = c.read("mtp-thead-q6k").expect("the draft reads");
+        assert_eq!(
+            borrows_of(&m),
+            Borrows {
+                embedding: true,
+                head: true
+            }
+        );
+        let mut tk = keys();
+        tk.iter_mut().for_each(|(k, v)| {
+            if *k == "embedding_length" {
+                *v = V::U32(256);
+            }
+        });
+        let path = header_typed("mtp-hk-q6k", "qwen4exp", &tk, &tokens(), &c.target);
+        let target = gguf::Split::open(&path).expect("the synthetic target opens");
+        let got = head_kind(&target, 256, 2).expect("the target's head reads");
+        assert_eq!(got, BorrowedHead::Q6K);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The embedding stays Q8_0 whatever the head: a Q6_K `token_embd` is
+    /// refused by name.
+    #[test]
+    fn a_q6_k_token_embd_is_still_refused() {
+        let mut c = Case::wide();
+        for t in &mut c.target {
+            if t.0 == EMBEDDING {
+                t.2 = Ty::Q6K;
+            }
+        }
+        c.refused(
+            "mtp-temb-q6k",
+            "tensor token_embd.weight: is q6_K [256, 2] in the target's file",
+        );
+    }
+
+    /// `head_kind` names the target's `output` form, refusing what `mtp_of`
+    /// would have refused.
+    #[test]
+    fn head_kind_reads_the_targets_head_form() {
+        let path = header_typed("mtp-hk", "qwen4exp", &keys(), &tokens(), &target_tensors());
+        let target = gguf::Split::open(&path).expect("the synthetic target opens");
+        let got = head_kind(&target, 64, 2).expect("the target's head reads");
+        assert_eq!(got, BorrowedHead::Q8_0);
+        let _ = std::fs::remove_file(&path);
+        let mut f32s = target_tensors();
+        for t in &mut f32s {
             if t.0 == HEAD {
                 t.2 = Ty::F32;
             }
         }
-        c.refused(
-            "mtp-thead-ty",
-            "tensor output.weight: is f32 [64, 2] in the target's file",
+        let path = header_typed("mtp-hk-f32", "qwen4exp", &keys(), &tokens(), &f32s);
+        let target = gguf::Split::open(&path).expect("the synthetic target opens");
+        let err = head_kind(&target, 64, 2)
+            .err()
+            .map_or("read".to_string(), |e| e.to_string());
+        assert!(
+            err.contains("tensor output.weight: is f32 [64, 2] in the target file"),
+            "{err}"
         );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

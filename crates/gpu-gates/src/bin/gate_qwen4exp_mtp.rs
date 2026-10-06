@@ -196,7 +196,7 @@ mod gate {
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, data_dir, verdict};
     use gguf::Split;
-    use gguf::quant::half_to_f32;
+    use gguf::quant::{GgmlType, half_to_f32};
     use model::arch::models::{Borrows, HeadRows, MtpSource};
     use model::arch::qwen35moe::head_list::{HeadWhy, SHIPPED, head_rows_of};
     use model::arch::qwen35moe::place::{
@@ -2873,11 +2873,18 @@ mod gate {
     }
 
     /// A Q8_0 weight's two planes' device addresses.
+    /// The addresses a borrowed matrix's form holds: a Q8_0 weight's two
+    /// planes, a Q6_K one's word plane and a zero.
     fn planes(dw: Option<&DevWeight>) -> Option<[u64; 2]> {
         match dw {
             Some(DevWeight::Q8_0 { qs, d, .. }) => {
                 Some([qs.buf().cu_deviceptr(), d.buf().cu_deviceptr()])
             }
+            Some(DevWeight::KQuant {
+                ty: GgmlType::Q6_K,
+                w,
+                ..
+            }) => Some([w.buf().cu_deviceptr(), 0]),
             _ => None,
         }
     }

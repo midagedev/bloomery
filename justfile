@@ -170,6 +170,13 @@ gate-gpu-iq:
 gate-gpu-iq-sel *ARGS:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel {{ARGS}}'
 
+# 행 사상 Q6_K gemv(bloomery_gpu::q6k_ids): MTP 드래프트가 빌리는 Q6_K `output` 머리. 합성 70,000행 "어휘"(K = 2,560,
+# UD-Q3_K_XL 머리의 형상)를 고정 시드로 짓고, m ∈ {1,2,4,8} × (1·7·65,536 정렬 id 맵 + 맵 없음)의 매 로짓을
+# enqueue_gemv_q6k의 모은 행 스택과 비트 대조하고, ggml 디퀀트 × f32의 f64 합 대비 유도 밴드(PIN), id 범위 밖의 이름 붙은
+# 폴트와 NaN 행, 캡처 재생, 런처의 이름 붙은 거부를 본다. 모델 파일 없음.
+gate-gpu-q6k-ids:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_q6k_ids && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_q6k_ids'
+
 # V4.1 하이퍼커넥션(B4): 사슬 커널(RMS·분할 K hc_fn gemv·HC_PRE), HC_POST와 접기를 우리 규칙과 V4.1 ik 덤프에 서브층마다
 # 대조한다. engram 층(1·14)의 분리 짝(HC_POST 단독 → 접기 단독)이 융합 런치와 비트 동일한지도 본다.
 gate-gpu-ds41-hc:

@@ -62,6 +62,7 @@ pub mod q38;
 pub mod q4k_sel;
 pub mod q5;
 pub mod q5_1_sel;
+pub mod q6k_ids;
 pub mod q6k_sel;
 pub mod q8_0_sel32;
 pub mod q8f32;

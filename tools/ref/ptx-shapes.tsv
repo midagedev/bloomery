@@ -228,6 +228,8 @@ generate_ds41   q5_quantize_q8_sel                       0           0
 generate_ds41   q5k_gemv_sel                             0           0
 generate_ds41   q5k_gemv_tiles                           0           0
 generate_ds41   q6k_gemv                                 0           0
+generate_ds41   q6k_gemv_ids                            0           0
+generate_ds41   q6k_gemv_ids_mcol                       0           0
 generate_ds41   q6k_gemv_sel                             0           0
 generate_ds41   q8_0_gemv                                0           0
 generate_ds41   q8_0_gemv_heads                          0           0
@@ -433,6 +435,8 @@ gate_e2e   q5_quantize_q8_sel                       0           0
 gate_e2e   q5k_gemv_sel                             0           0
 gate_e2e   q5k_gemv_tiles                           0           0
 gate_e2e   q6k_gemv                                 0           0
+gate_e2e   q6k_gemv_ids                            0           0
+gate_e2e   q6k_gemv_ids_mcol                       0           0
 gate_e2e   q6k_gemv_sel                             0           0
 gate_e2e   q8_0_gemv                                0           0
 gate_e2e   q8_0_gemv_heads                          0           0

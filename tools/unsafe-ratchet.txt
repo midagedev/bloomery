@@ -109,7 +109,10 @@ gguf 9 2 0
 # entries (iq_sel.rs: iq3_xxs_gate_up_sel, iq4_xs_gate_up_sel, iq4_nl_gemv_sel32) add their id loads, raw-block
 # window loads, fault NaN stores and lane stores, fifteen blocks under safe crate-internal helpers, each with its
 # SAFETY line.
-gpu 1551 171 6
+# PIN(2026-10-06): gpu 1551 -> 1573 blocks, a new kernel pair, not old code relaxed: q6k_gemv_ids and
+# q6k_gemv_ids_mcol (the MTP draft's Q6_K head over the target's output through a row map, q6k_ids.rs) add the
+# two entries' id loads, fault NaN stores, byte-window loads and lane stores, each with its SAFETY line.
+gpu 1573 171 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

@@ -576,7 +576,8 @@ impl PlanInputs {
             });
         };
         let (draft, reserve) = mtp.draft_plan(ctx_max)?;
-        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab));
+        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab))
+            + mtp_head_act_bytes(mtp.borrowed_head, u64::from(mtp.draft.hidden));
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let plan = self.target(machine, ctx_max, levers, experts, 0)?;
@@ -671,7 +672,8 @@ impl PlanInputs {
             });
         };
         let (draft, reserve) = mtp.draft_plan_of(ctx_max, slots)?;
-        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab));
+        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab))
+            + mtp_head_act_bytes(mtp.borrowed_head, u64::from(mtp.draft.hidden));
         let terms = self.seq_terms(Some(mtp));
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
@@ -838,6 +840,36 @@ pub fn mtp_arena_bytes(vocab: u64) -> u64 {
 /// partials for: `flash_gqa::SEGMENTS` restated, the model crate not reading
 /// the gpu crate's. `gate_qwen4exp_mtp`'s arena clause holds the two equal.
 const MTP_FLASH_SEGMENTS: u64 = 80;
+
+/// The most rows one walk of the draft takes, the head's activation's
+/// columns: `MTP_ROWS` restated, the model crate not reading the gpu crate's.
+const MTP_HEAD_ROWS: u64 = 8;
+
+/// Card bytes a Q6_K borrowed head's walk adds to the program's arena beside
+/// [`mtp_arena_bytes`]: the head's input rows quantized to q8_1, 0 for a
+/// Q8_0 head whose projection reads the f32 rows. [derived: `Q8Act::with_k`
+/// at `MTP_HEAD_ROWS` columns of `hidden` values — per column, at n_sb =
+/// hidden/256 super-blocks, q3 `64 · ⌈n_sb/2⌉` u64, q4 `256 · ⌈n_sb/4⌉`
+/// u32, q6 `128 · ⌈n_sb/2⌉` u32, s8 `8 · n_sb` i32 and d8 `2 · n_sb` f32,
+/// `tensor::Q8Act`'s layout — at the file's hidden 2,560 (n_sb 10): 2,560 +
+/// 3,072 + 2,560 + 320 + 80 = 8,592 B a column, 68,736 B the eight.]
+///
+/// [`MtpArena::new`]: bloomery_gpu::arch::qwen3moe::Mtp38
+#[must_use]
+pub fn mtp_head_act_bytes(head: mtp::BorrowedHead, hidden: u64) -> u64 {
+    match head {
+        mtp::BorrowedHead::Q8_0 => 0,
+        mtp::BorrowedHead::Q6K => {
+            let n_sb = hidden / 256;
+            let per = 8 * 64 * n_sb.div_ceil(2)
+                + 4 * 256 * n_sb.div_ceil(4)
+                + 4 * 128 * n_sb.div_ceil(2)
+                + 4 * 8 * n_sb
+                + 4 * 2 * n_sb;
+            MTP_HEAD_ROWS * per
+        }
+    }
+}
 
 /// A qwen4exp plan with its MTP draft ([`PlanInputs::plan_mtp`]).
 #[derive(Debug)]
@@ -1530,6 +1562,12 @@ pub struct MtpInputs {
     /// The head's row → id map, one `u32` a vocabulary id whatever the head,
     /// so the plan with a row list is the plan with the full head.
     pub map_bytes: u64,
+    /// The borrowed `output`'s form as [`MtpInputs::read`] read it from the
+    /// target ([`mtp::head_kind`]): a Q6_K head's walk quantizes its input
+    /// rows, which the plan counts beside the arena
+    /// ([`mtp_head_act_bytes`]). [`MtpInputs::from_parts`] reads no target,
+    /// so it records the Q8_0 form.
+    pub borrowed_head: mtp::BorrowedHead,
 }
 
 impl MtpInputs {
@@ -1682,7 +1720,12 @@ impl MtpInputs {
                 ..d
             },
             &file,
-        )?)
+        )?
+        .with_head(mtp::head_kind(
+            target,
+            inputs.spec.hidden,
+            inputs.spec.vocab,
+        )?))
     }
 
     /// The inputs of `draft` over `file`, the draft file's tensors in its
@@ -1776,7 +1819,16 @@ impl MtpInputs {
             machine: draft_machine(),
             kv,
             map_bytes,
+            borrowed_head: mtp::BorrowedHead::Q8_0,
         })
+    }
+
+    /// [`MtpInputs`] with its borrowed head's form `head`: the one record
+    /// [`MtpInputs::read`] adds over [`MtpInputs::from_parts`], which reads
+    /// no target.
+    fn with_head(mut self, head: mtp::BorrowedHead) -> MtpInputs {
+        self.borrowed_head = head;
+        self
     }
 }
 

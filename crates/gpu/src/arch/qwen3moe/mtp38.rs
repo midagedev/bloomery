@@ -10,10 +10,11 @@
 //!   expert's gate are joined as the target's are (`plan38::router`).
 //! - `token_embd` and `output` are the target's: nothing is uploaded for
 //!   them. The body holds their names and the device addresses they had at
-//!   open; the target's `Weights`, which `GpuModel` drops after the body,
-//!   own the buffers, and a walk reads them through the `&Weights` it is
-//!   handed ([`Mtp38::borrowed`]), which refuses by name an address that
-//!   moved.
+//!   open — the embedding's two Q8_0 planes, the head's two Q8_0 planes or
+//!   its one Q6_K word plane; the target's `Weights`, which `GpuModel` drops
+//!   after the body, own the buffers, and a walk reads them through the
+//!   `&Weights` it is handed ([`Mtp38::borrowed`]), which refuses by name an
+//!   address that moved.
 //! - The store is every position's K and V, `[n_kv][ctx][head]` f16 each,
 //!   the target's attention layers' K/V planes ([`KvPlanes`]).
 //! - The head's row → id map, one `u32` a vocabulary id whatever the head
@@ -29,7 +30,8 @@
 //! its hidden the draft's own streams). Every launch is an entry the
 //! target's chain has, but two of its own (`crate::mtp`), the routed
 //! experts' `q8_0_gemv_sel_f32` and a listed head's `q8_0_gemv_ids` (one
-//! row) or `q8_0_gemv_ids_mcol`:
+//! row) or `q8_0_gemv_ids_mcol`, and over a Q6_K `output` its quantize and
+//! `q6k_gemv_ids` pair (`crate::q6k_ids`):
 //! - the target's embedding rows (`embed_rows_q8_0`, the borrowed
 //!   `token_embd`), the input pack (`mtp_input`: `rms(e)·enorm` beside
 //!   `rms(h)·hnorm` over all four streams, a row's four `[e | h_s]`), and
@@ -50,9 +52,12 @@
 //!   and its gated sum (`q38_shared_add`);
 //! - the head site's mix (`nextn.hc_head_*`, the block's combine first, so
 //!   the streams are then the layer's output, `l_out`), the head's
-//!   projection — the target's `output` ([`MtpHead::Full`]), or its rows of
-//!   the list read in place through the map (`q8_0_gemv_ids`, or
-//!   `q8_0_gemv_ids_mcol` past one row; [`MtpHead::Rows`]) — and
+//!   projection — a Q8_0 `output`'s planes ([`MtpHead::Full`]) or its rows
+//!   of the list read in place through the map (`q8_0_gemv_ids`, or
+//!   `q8_0_gemv_ids_mcol` past one row; [`MtpHead::Rows`]); a Q6_K one
+//!   quantizes the head's input rows to q8_1 in the arena first (one launch
+//!   a Q8_0 walk has not), then reads its rows, full or listed, through
+//!   `q6k_gemv_ids`/`_mcol` — and
 //!   `argmax_p_rows_fault`, which names each
 //!   row's token and the draft's largest probability among the head's rows;
 //! - the last row's token and streams copied beside the arena, where the
@@ -100,9 +105,11 @@ use crate::hc_gated::{Before, HcScratch, HcWideScratch, SiteWeights, WideMixArgs
 use crate::host::handoff::Places;
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};
+use crate::q6k_ids::{Q6kIdsArgs, Q6kIdsKernels};
 use crate::q8f32::{GemvOut, Q8_0GemvIdsArgs, Q8_0GemvMcolArgs, Q8_0SelArgs};
 use crate::q38::{CardAccArgs, EmbedQ8Args, OutGateArgs, SharedAddArgs};
 use crate::rope_neox::PartialNeoxArgs;
+use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -124,6 +131,33 @@ pub struct BorrowedPlanes {
     pub planes: [u64; 2],
 }
 
+/// The target's `output` the draft reads in place: its Q8_0 planes' device
+/// addresses at open, or its Q6_K word plane's with the row width and rows
+/// the gemv reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BorrowedHead {
+    Q8_0(BorrowedPlanes),
+    Q6K {
+        name: String,
+        plane: u64,
+        k: usize,
+        rows: usize,
+    },
+}
+
+/// The head's `output` of the target as the form the draft was opened
+/// beside, its addresses re-checked ([`Mtp38::borrowed`]): what a walk's
+/// projection launches.
+pub enum HeadOut<'w> {
+    Q8_0 {
+        qs: &'w DeviceTensor<u32>,
+        d: &'w DeviceTensor<u16>,
+    },
+    Q6K {
+        w: &'w DeviceTensor<u32>,
+    },
+}
+
 /// The head's row → vocabulary id map, one word a vocabulary id: with a row
 /// list its first `rows` words are the list's ids (each a row of the
 /// target's `output`) and the rest 0; with the full head every word is 0
@@ -140,8 +174,11 @@ pub struct Mtp38 {
     w: Weights,
     store: KvPlanes,
     head: HeadMap,
-    /// `token_embd`, then `output`.
-    borrowed: [BorrowedPlanes; 2],
+    /// `token_embd`, then `output` in the form its walk launches.
+    embd: BorrowedPlanes,
+    head_w: BorrowedHead,
+    /// The Q6_K head's row-map gemv, loaded with the body.
+    q6k_ids: Q6kIdsKernels,
     /// The layer's `blk.` index in the draft file.
     index: u32,
     ctx: usize,
@@ -184,7 +221,8 @@ impl Mtp38 {
     /// the plan's store term counts them all, this load's one sequence among
     /// them. Refused by name: a draft that is not the target's shape, a
     /// draft file that carries its own matrices, a borrowed matrix absent or
-    /// not Q8_0 `[hidden, vocab]`, a listed id at or past the vocabulary, an
+    /// not of its read form (`token_embd` Q8_0, `output` Q8_0 or Q6_K, each
+    /// `[hidden, vocab]`), a listed id at or past the vocabulary, an
     /// upload whose bytes are not the plan's.
     #[allow(
         clippy::too_many_arguments,
@@ -228,13 +266,18 @@ impl Mtp38 {
             .ok_or_else(|| GpuError::shape(WHAT, format!("ctx_max {}", plan.plan.ctx_max)))?;
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
-        let borrowed = [
+        let embd = borrowed_planes(
+            target_w,
             model::arch::qwen35moe::names::token_embd(),
+            hidden,
+            vocab,
+        )?;
+        let head_w = borrowed_head(
+            target_w,
             model::arch::qwen35moe::names::output(),
-        ]
-        .map(|name| borrowed_planes(target_w, name, hidden, vocab));
-        let [embd, out] = borrowed;
-        let borrowed = [embd?, out?];
+            hidden,
+            vocab,
+        )?;
         let mut w = Weights::load_placed(
             stream,
             draft_file,
@@ -297,7 +340,9 @@ impl Mtp38 {
             w,
             store,
             head,
-            borrowed,
+            embd,
+            head_w,
+            q6k_ids: Q6kIdsKernels::load(gpu.context())?,
             index: d.index,
             ctx,
             a: None,
@@ -338,35 +383,61 @@ impl Mtp38 {
         (self.head.ids.len() * std::mem::size_of::<u32>()) as u64
     }
 
-    /// The target's matrices the draft reads, with their addresses at open.
+    /// The target's matrices the draft reads, with the device addresses
+    /// each holds at open: `token_embd`'s and a Q8_0 head's two planes, a
+    /// Q6_K head's word plane and a zero.
     #[must_use]
-    pub fn borrowed_planes(&self) -> &[BorrowedPlanes; 2] {
-        &self.borrowed
+    pub fn borrowed_planes(&self) -> [BorrowedPlanes; 2] {
+        let head = match &self.head_w {
+            BorrowedHead::Q8_0(b) => b.clone(),
+            BorrowedHead::Q6K { name, plane, .. } => BorrowedPlanes {
+                name: name.clone(),
+                planes: [*plane, 0],
+            },
+        };
+        [self.embd.clone(), head]
     }
 
     /// `token_embd` and `output` of `target`, the weights the draft was
-    /// opened beside. Refused by name when either is absent or its planes are
-    /// not where they were at open.
+    /// opened beside, the head in the form its walk launches. Refused by
+    /// name when either is absent or not where it was at open.
     pub fn borrowed<'w>(
         &self,
         target: &'w Weights,
-    ) -> Result<(&'w DevWeight, &'w DevWeight), GpuError> {
-        let get = |b: &BorrowedPlanes| -> Result<&'w DevWeight, GpuError> {
-            let dw = target
-                .get(&b.name)
-                .ok_or_else(|| GpuError::tensor(WHAT, b.name.clone(), "resident"))?;
-            match planes(dw) {
-                Some(p) if p == b.planes => Ok(dw),
-                p => Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "{} sits at {p:?}, the draft was opened beside {:?}",
-                        b.name, b.planes
-                    ),
-                )),
+    ) -> Result<(&'w DevWeight, HeadOut<'w>), GpuError> {
+        let embd = at_open(target, &self.embd)?;
+        let head = match &self.head_w {
+            BorrowedHead::Q8_0(b) => {
+                let DevWeight::Q8_0 { qs, d, .. } = at_open(target, b)? else {
+                    return Err(GpuError::tensor(WHAT, b.name.clone(), "Q8_0 planes"));
+                };
+                HeadOut::Q8_0 { qs, d }
             }
+            BorrowedHead::Q6K {
+                name,
+                plane,
+                k,
+                rows,
+            } => match target.get(name) {
+                Some(DevWeight::KQuant {
+                    ty: GgmlType::Q6_K,
+                    w,
+                    k: kw,
+                }) if *kw == *k && w.rows() == *rows && w.buf().cu_deviceptr() == *plane => {
+                    HeadOut::Q6K { w }
+                }
+                _ => {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{name} is not the Q6_K word plane of {rows} rows of {k} values at \
+                             {plane:#x} the draft was opened beside"
+                        ),
+                    ));
+                }
+            },
         };
-        Ok((get(&self.borrowed[0])?, get(&self.borrowed[1])?))
+        Ok((embd, head))
     }
 
     /// The draft's own weights: its file's tensors by name, the widened
@@ -507,6 +578,24 @@ fn planes(dw: &DevWeight) -> Option<[u64; 2]> {
     }
 }
 
+/// `name` of the target's weights, the Q8_0 matrix at the addresses `b`
+/// records; the refusal names what moved.
+fn at_open<'w>(target: &'w Weights, b: &BorrowedPlanes) -> Result<&'w DevWeight, GpuError> {
+    let dw = target
+        .get(&b.name)
+        .ok_or_else(|| GpuError::tensor(WHAT, b.name.clone(), "resident"))?;
+    match planes(dw) {
+        Some(p) if p == b.planes => Ok(dw),
+        p => Err(GpuError::shape(
+            WHAT,
+            format!(
+                "{} sits at {p:?}, the draft was opened beside {:?}",
+                b.name, b.planes
+            ),
+        )),
+    }
+}
+
 /// `name` of the target's weights `w`, resident as a Q8_0 `[hidden, vocab]`
 /// matrix: its planes' addresses.
 fn borrowed_planes(
@@ -529,6 +618,45 @@ fn borrowed_planes(
                 shape.1, shape.0
             ),
         )),
+    }
+}
+
+/// `name` of the target's weights `w`, resident as the head's read form over
+/// a `[hidden, vocab]` matrix: its Q8_0 planes, or its Q6_K word plane with
+/// the row width and rows the gemv reads.
+fn borrowed_head(
+    w: &Weights,
+    name: String,
+    hidden: usize,
+    vocab: usize,
+) -> Result<BorrowedHead, GpuError> {
+    let dw = w
+        .get(&name)
+        .ok_or_else(|| GpuError::tensor(WHAT, name.clone(), "resident on the target's card"))?;
+    match dw {
+        DevWeight::Q8_0 { .. } if (dw.k(), dw.rows()) == (hidden, vocab) => {
+            Ok(BorrowedHead::Q8_0(borrowed_planes(w, name, hidden, vocab)?))
+        }
+        DevWeight::KQuant {
+            ty: GgmlType::Q6_K,
+            w: plane,
+            k,
+        } if (*k, plane.rows()) == (hidden, vocab) => Ok(BorrowedHead::Q6K {
+            plane: plane.buf().cu_deviceptr(),
+            k: *k,
+            rows: plane.rows(),
+            name,
+        }),
+        _ => {
+            let (k, rows) = (dw.k(), dw.rows());
+            Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the target's {name} is {rows} rows of {k} values in another format than \
+                     Q8_0 or Q6_K; the draft reads a [{hidden}, {vocab}] matrix of one of them"
+                ),
+            ))
+        }
     }
 }
 
@@ -615,11 +743,17 @@ const EH_COLS: usize = 8;
 /// two, the gate and the output projection; the feed-forward site's mix
 /// (3), the router and the places, the routed gate, up, SwiGLU and down,
 /// the slots' sum, the shared expert's four and its gated sum; the head
-/// site's mix (3), the projection and the argmax; the two copies of the last
-/// row.
+/// site's mix (3), the projection — a Q6_K head's quantize launch before
+/// it, `q6k_head` — and the argmax; the two copies of the last row. A Q6_K
+/// walk holds one launch more than a Q8_0 one.
 #[must_use]
-pub fn walk_launches(m: usize) -> usize {
-    2 + (4 * m).div_ceil(EH_COLS) + (3 + 3 + 1 + 2 + 1 + 1) + (3 + 2 + 4 + 1 + 4 + 1) + (3 + 2) + 2
+pub fn walk_launches(m: usize, q6k_head: bool) -> usize {
+    2 + (4 * m).div_ceil(EH_COLS)
+        + (3 + 3 + 1 + 2 + 1 + 1)
+        + (3 + 2 + 4 + 1 + 4 + 1)
+        + (3 + 1 + 1)
+        + usize::from(q6k_head)
+        + 2
 }
 
 /// Which projection the draft's head runs.
@@ -1014,6 +1148,10 @@ struct MtpArena {
     sh_h: DeviceBuffer<f32>,
     sh_y: DeviceBuffer<f32>,
     head_x: DeviceBuffer<f32>,
+    /// The head's input rows quantized to q8_1: a Q6_K head's projection
+    /// reads them ([`MTP_ROWS`] columns of the hidden width); `None` for a
+    /// Q8_0 head, whose projection reads the f32 rows.
+    head_act: Option<Q8Act>,
     /// The head's logits, `[row][m]` as the gemv writes them, for the full
     /// vocabulary.
     logits: DeviceBuffer<f32>,
@@ -1032,7 +1170,12 @@ struct MtpArena {
 }
 
 impl MtpArena {
-    fn new(stream: &CudaStream, dims: RouterDims, vocab: usize) -> Result<MtpArena, GpuError> {
+    fn new(
+        stream: &CudaStream,
+        dims: RouterDims,
+        vocab: usize,
+        head_act: bool,
+    ) -> Result<MtpArena, GpuError> {
         let r = MTP_ROWS;
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
@@ -1081,6 +1224,7 @@ impl MtpArena {
             sh_h: f(r * geo::FF)?,
             sh_y: f(r * h)?,
             head_x: f(r * h)?,
+            head_act: head_act.then(|| Q8Act::with_k(stream, r, h)).transpose()?,
             logits: f(r * vocab)?,
             out: u(2 * r + 2)?,
             done: u(1)?,
@@ -1127,6 +1271,7 @@ impl MtpArena {
             &self.head_x,
             &self.logits,
         ];
+        let act = self.head_act.as_ref().map_or(0, Q8Act::device_bytes);
         let u32s = [
             &self.own_id,
             &self.pos,
@@ -1140,6 +1285,7 @@ impl MtpArena {
         ];
         f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
             + u32s.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + act
             + self.inbox.bytes()
             + self.route.bytes()
             + self.st.bytes()
@@ -1227,7 +1373,9 @@ impl Mtp38 {
     /// The program's arena beside the loaded body: the router's dims, the
     /// vocabulary the head writes and the rope table's rows, which must
     /// cover the store's positions, held to `arena` device bytes — the plan's
-    /// count ([`model::arch::qwen35moe::place::mtp_arena_bytes`]). Load-time
+    /// count ([`model::arch::qwen35moe::place::mtp_arena_bytes`] and, for a
+    /// Q6_K head,
+    /// [`model::arch::qwen35moe::place::mtp_head_act_bytes`]). Load-time
     /// only.
     pub(super) fn arm(
         &mut self,
@@ -1246,7 +1394,8 @@ impl Mtp38 {
                 ),
             ));
         }
-        let a = MtpArena::new(stream, dims, vocab)?;
+        let q6k = matches!(self.head_w, BorrowedHead::Q6K { .. });
+        let a = MtpArena::new(stream, dims, vocab, q6k)?;
         let got = a.bytes() as u64;
         if got != arena {
             return Err(GpuError::shape(
@@ -1669,7 +1818,7 @@ impl Mtp38 {
     /// the card's stream (what a capture records).
     fn walk(&mut self, c: &MtpCtx<'_>, key: MtpKey) -> Result<(), GpuError> {
         let MtpKey { m, own, head } = key;
-        let (embd, output) = self.borrowed(c.tw)?;
+        let (embd, head_out) = self.borrowed(c.tw)?;
         let Mtp38 {
             w,
             store,
@@ -1677,6 +1826,7 @@ impl Mtp38 {
             index,
             ctx,
             a,
+            q6k_ids,
             ..
         } = self;
         let a = a
@@ -1977,11 +2127,12 @@ impl Mtp38 {
         if let (Some(t), false) = (a.taps.as_mut(), capturing) {
             t.node(stream, MtpNode::HeadIn, &a.head_x, m)?;
         }
-        let DevWeight::Q8_0 { qs, d, .. } = output else {
-            return Err(GpuError::tensor(WHAT, "output.weight", "Q8_0 planes"));
+        let full_rows = match &head_out {
+            HeadOut::Q8_0 { d, .. } => d.rows(),
+            HeadOut::Q6K { w } => w.rows(),
         };
         let (rows, map) = match head {
-            MtpHead::Full => (d.rows(), None),
+            MtpHead::Full => (full_rows, None),
             MtpHead::Rows => (
                 hm.rows
                     .ok_or(GpuError::state(WHAT, "a row list for the head"))?,
@@ -1993,23 +2144,44 @@ impl Mtp38 {
         // at open otherwise), m <= MTP_ROWS; the window lives for the
         // projection and the argmax.
         let mut lg = unsafe { f32_view(&a.logits, 0, rows * m) };
-        match map {
-            None => gpu
-                .q8f32()
-                .enqueue_q8_0_gemv(stream, qs, d, &a.head_x, m, &mut lg)?,
-            Some(ids) => gpu.q8f32().enqueue_q8_0_gemv_ids(
-                stream,
-                Q8_0GemvIdsArgs {
-                    qs,
-                    d,
-                    ids,
-                    rows,
-                    x: &a.head_x,
-                    m,
-                    y: &mut lg,
-                },
-                sink,
-            )?,
+        match head_out {
+            HeadOut::Q8_0 { qs, d } => match map {
+                None => gpu
+                    .q8f32()
+                    .enqueue_q8_0_gemv(stream, qs, d, &a.head_x, m, &mut lg)?,
+                Some(ids) => gpu.q8f32().enqueue_q8_0_gemv_ids(
+                    stream,
+                    Q8_0GemvIdsArgs {
+                        qs,
+                        d,
+                        ids,
+                        rows,
+                        x: &a.head_x,
+                        m,
+                        y: &mut lg,
+                    },
+                    sink,
+                )?,
+            },
+            HeadOut::Q6K { w: out_w } => {
+                let act = a.head_act.as_mut().ok_or_else(|| {
+                    GpuError::state(WHAT, "the head's q8_1 activation (a Q6_K head's arena)")
+                })?;
+                gpu.enqueue_quantize_q8_1_head(&a.head_x, act)?;
+                q6k_ids.enqueue_gemv_q6k_ids(
+                    stream,
+                    Q6kIdsArgs {
+                        w: out_w,
+                        act,
+                        map,
+                        no_map: &a.no_map,
+                        rows,
+                        m,
+                        y: &mut lg,
+                        fault: sink,
+                    },
+                )?;
+            }
         }
         k.mtp.enqueue_argmax_p_rows_fault(
             stream,
