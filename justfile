@@ -164,6 +164,12 @@ gate-gpu-glm-router:
 gate-gpu-iq:
     ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq'
 
+# i-quant expert 선택 엔트리(bloomery_gpu::iq_sel): IQ3_XXS·IQ4_XS gate·up과 IQ4_NL down `_sel32`를 파일 그대로의
+# 블록 워드 스트림 위에서 합성 스택(ref-synth + 시드 IQ4_NL)으로 본다. 호스트 규칙·플레인 커널과 비트 동일, f64 밴드와 핀,
+# silu 규칙 밴드, 폴트·NaN d·캡처·이름 붙은 거부.
+gate-gpu-iq-sel *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel {{ARGS}}'
+
 # V4.1 하이퍼커넥션(B4): 사슬 커널(RMS·분할 K hc_fn gemv·HC_PRE), HC_POST와 접기를 우리 규칙과 V4.1 ik 덤프에 서브층마다
 # 대조한다. engram 층(1·14)의 분리 짝(HC_POST 단독 → 접기 단독)이 융합 런치와 비트 동일한지도 본다.
 gate-gpu-ds41-hc:
