@@ -21,17 +21,18 @@
 //! (b′), `place::machine_bp`) hangs that card under the host tier (`tier38`:
 //! its routed segments, its set the map's tier rows, its computation, the
 //! tiers' page), the slot map then the plan's of both cards
-//! (`SlotMap::of_plan_tiers`); the step and the verify serve its layers, the
-//! pass and the ubatch walk refuse its map by name, so such a load feeds its
-//! prompt by steps. Under an explicit `BLOOMERY_RESIDENCY`
+//! (`SlotMap::of_plan_tiers`); the step, the verify and a pass of several
+//! slots serve its layers, and the ubatch walk serves its map at every
+//! prompt length; the eager prompt pass (`Pass38`, [`Prompt38::Pass`])
+//! refuses its map by name. Under an explicit `BLOOMERY_RESIDENCY`
 //! word the load also runs the residency machine over the card's stacks
 //! (`swap38`: the common machine, Qwen3.8's parts and live delay), which
 //! moves the map between passes; unset keeps the load's map (the tier's
 //! experts are no part of the machine: held away, never moved). Every walk
-//! runs its card side — the step, the verify and the pass the card leg, the
-//! ubatch walk its card route (`wide38`) — and a walk with no tier leg (the
-//! pass and the ubatch walk, and every walk of a load that hung no tier)
-//! refuses by name a map with an expert on a tier card.
+//! runs its card side — the step, the verify and the passes the card leg,
+//! the ubatch walk its card route (`wide38`) — and a walk with no tier leg
+//! (the eager pass, and every walk of a load that hung no tier) refuses by
+//! name a map with an expert on a tier card.
 //! [`Body38::open_placed_mtp`] also opens the MTP draft layer on the same
 //! card ([`Mtp38`]: its weights, its store, the reduced head's rows) and
 //! arms its program's arena; its walks ([`GpuModel::mtp_draft`]) read the
@@ -1139,8 +1140,13 @@ impl Body38 {
                 ),
             ));
         }
+        // A load planned for several sequences runs a pass of their rows
+        // through the step port's columns, up to the pass arena's rows; a
+        // load for one sequence the verify's. The tier side, the tier card's
+        // step leg and its page take the same columns.
+        let cols = if planned > 1 { PASS_ROWS } else { VERIFY_ROWS };
         let tier = (!tiers.is_empty())
-            .then(|| TierSide38::new(gpu, &map))
+            .then(|| TierSide38::new(gpu, &map, cols))
             .transpose()?;
         let wide = Wide38::new(stream, ub, &card, tier.is_some())?;
         let wide_bytes = (wa.bytes() + wr.bytes() + wide_hsum.num_bytes() + wide.bytes()) as u64;
@@ -1152,10 +1158,6 @@ impl Body38 {
                 ),
             ));
         }
-        // A load planned for several sequences runs a pass of their rows
-        // through the step port's columns, up to the pass arena's rows; a
-        // load for one sequence the verify's.
-        let cols = if planned > 1 { PASS_ROWS } else { VERIFY_ROWS };
         let boundary = Boundary::with_cols(
             gpu.context(),
             stream,
@@ -1175,12 +1177,14 @@ impl Body38 {
             model::arch::qwen35moe::host::layers(src, hp, run.clone())
         })?;
         experts.prepare_union(host_cols)?;
-        // The plan reserves the tier's block scratch for blocks of the batch
-        // port's columns: the block route's bytes there.
-        let block = usize::try_from(model::arch::qwen35moe::place::tier_route_scratch_bytes(
+        // The tier serves two ports: the step port's `cols` columns a row
+        // (the step, the verify and a pass of several slots walk it) and the
+        // batch port's `host_cols`, whose block scratch the plan reserves for
+        // the block route's bytes.
+        let tier_ports = usize::try_from(model::arch::qwen35moe::place::tier_route_scratch_bytes(
             host_cols as u64,
         ))
-        .map(|b| (host_cols, b))
+        .map(|b| (cols, host_cols, b))
         .map_err(|_| GpuError::shape(WHAT, "the tier's block scratch passes usize"))?;
         let tier_cards = tiers
             .iter()
@@ -1194,7 +1198,7 @@ impl Body38 {
                     &map,
                     &stacks,
                     n,
-                    block,
+                    tier_ports,
                     host.card_dontneed,
                 )
             })
@@ -1205,6 +1209,23 @@ impl Body38 {
         let tiered = !tier_cards.is_empty();
         if tiered {
             hybrid.attach_tiers(tier_cards, gpu)?;
+            // A pass of several slots walks the step port and the tier's
+            // leg of it at the pass's width, so the two must carry the same
+            // columns.
+            let cols = hybrid.boundary().layout().cols();
+            for t in hybrid.tiers() {
+                if t.cols() != cols {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "the tier card {} opened for {} columns a row and the step port's \
+                             {cols}: the step, the verify and a pass of several slots walk both",
+                            t.name(),
+                            t.cols()
+                        ),
+                    ));
+                }
+            }
         }
         // With a tier the batch port's tier legs are made here too, which the
         // plan reserves on the tier card and the host.
@@ -3931,7 +3952,7 @@ impl Body38 {
     /// order. Refused by name before anything moves: ranges that do not
     /// tile the pass from row 0, slot 0 busy and not first, a parked count
     /// other than the ranges past slot 0, a load planned for one sequence,
-    /// a load with an expert tier card, the layer taps armed, a route trace
+    /// the layer taps armed, a route trace
     /// attached, more rows than the step port's columns, a slot map with a
     /// routed expert on a tier card ([`MapCheck::refuse`]), and for each
     /// slot on its own sequence a row count outside `1..=LANES`, a position
@@ -3952,12 +3973,6 @@ impl Body38 {
             return Err(GpuError::shape(
                 WHAT_SLOTS,
                 "a pass of several slots on a load planned for one sequence",
-            ));
-        }
-        if self.tier.is_some() {
-            return Err(GpuError::shape(
-                WHAT_SLOTS,
-                "a pass of several slots on a load with an expert tier card",
             ));
         }
         if self.taps.is_some() {

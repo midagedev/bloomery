@@ -1386,13 +1386,17 @@ gate-gpu-qwen38-residency:
 # the history twice the same with flips landed, its ids the residency-off run's or parted at a near tie, the streamed
 # 600-id prompt call by the same rule, the tier's set the live map's tier rows, no tier expert's bytes in the host set.
 # --prompt4k: plan (b′) and its union at 4,352 positions, a 4,096-id prompt call (the full ubatch window) and 8 greedy
-# steps bit for bit. --lost: the tier's stream held behind a host flag, the step named as a lost card, CardLost, the
-# next step refused. Up to five loads, one after the other. Both cards (BLOOMERY_CARD=both: both gate locks), alone in a
-# batch.
+# steps bit for bit. --slots: two slots of plan (b′) (the plan of two sequences) through the slots harness, then passes
+# of 5..8 rows — both slots' verify rows in one pass at fixed keeps, then rounds of one row a slot — against their
+# union bit for bit, each slot's rows against its solo run, the tier's graphs of 5..8 columns eight nodes a tier layer.
+# --lost: the tier's stream held behind a host flag, the step named as a lost card, CardLost, the
+# next step refused. Up to eight loads, one after the other. Both cards (BLOOMERY_CARD=both: both gate locks), alone in
+# a batch. --slots runs as the recipe's own second gpu-gate invocation: the four clauses together pass the 750 s a
+# single run is judged by.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k':
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}}'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen38_twocard && bash tools/gpu-gate.sh gate_qwen38_twocard {{ARGS}} && bash tools/gpu-gate.sh gate_qwen38_twocard --slots'
 
 # The HTTP server on the Qwen3.8 engine (3090, placement gate). The prompt is the profile's five-id text
 # ("The capital of France is") and its ids the profile's REF_TOKENS — ik's llama-tokenize on this model's

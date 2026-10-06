@@ -27,15 +27,16 @@
 //!   experts, plus the gated shared expert into `y`, the next site's combine
 //!   input.
 //!
-//! On a load with an expert tier (`tier38`) the step and the verify serve
-//! its layers: a tier layer's handoff is `ds41_ffn_handoff_10_cols_tier`
-//! (the step's of one column), which also writes the tier's places and the
-//! normed rows into the row's tier image, its go and its wait the tier's
-//! too ([`crate::hybrid::Hybrid::enqueue_tier_go`], `_back`), its card leg
+//! On a load with an expert tier (`tier38`) the step, the verify and a
+//! pass of several slots serve its layers: a tier layer's handoff is
+//! `ds41_ffn_handoff_10_cols_tier` (the step's of one column), which also
+//! writes the tier's places and the normed rows into the row's tier image,
+//! its go and its wait the tier's too
+//! ([`crate::hybrid::Hybrid::enqueue_tier_go`], `_back`), its card leg
 //! the launches but the card sum, and its back the join over both cards'
 //! slots in slot order with the combine in one launch
-//! (`q38_card_tier_shared_add`). The pass has no tier leg (`card38`'s map
-//! check refuses it first).
+//! (`q38_card_tier_shared_add`). The eager pass (`Pass38`) has no tier leg
+//! (`card38`'s map check refuses it first).
 //!
 //! After the last layer the head's mix (its norm applies the last combine)
 //! writes the head's input. Launches of the captured step

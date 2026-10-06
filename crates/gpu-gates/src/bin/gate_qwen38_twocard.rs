@@ -60,6 +60,19 @@
 //!   of two card-route runs, the tier's block route over both) and
 //!   [`PROMPT_STEPS`] greedy steps, bit for bit the reference's as under
 //!   `--union`.
+//! - `--slots` (residency off): the plan of two sequences through the slot
+//!   harness (`slots_gate`: H1 interleave, H2 one pass, H3 bytes, H4 reset,
+//!   H6 refusals, H7 captures; two disjoint [`PROMPT_U`]-id prose windows,
+//!   both by the ubatch path the tier load serves), then, on the tier load
+//!   and its union reference of the same plan, each slot's prompt and the
+//!   windows 4+4, 4+3, 3+4, 4+2 and 3+2 rows as one `verify_slots` pass of
+//!   both slots, committed at fixed counts, and [`STEPS`] rounds of one row
+//!   a slot: every row's id, each slot's state hash after the history and
+//!   its next step's logits row bit for bit the reference's (a); each slot's
+//!   rows its solo run's on the tier load, the same windows as verifies of
+//!   that slot alone, the other parked (b); and the tier's graphs of the
+//!   history's widths, 5 to 8 columns, eight nodes a tier layer and the
+//!   fault copy (c).
 //! - `--lost`: on the last load, the tier's stream held behind a host flag
 //!   before a step — the tier stops signalling: within the go deadline and
 //!   its grace the step fails naming the lost card, the host tier is
@@ -89,12 +102,13 @@ mod gate {
     use app::Session;
     use bloomery_gpu::HostFlags;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
-    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model};
+    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, Store38Host};
     use bloomery_gpu::host::swap::{PassReport, Residency};
     use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet};
     use bloomery_gpu::host::{PassKind, PoisonKind};
     use bloomery_gpu::hybrid::Chain;
-    use bloomery_gpu_gates::{GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
+    use bloomery_gpu_gates::{Fnv1a64, GREEDY_MARGIN, GateError, checks_failed, data_dir, verdict};
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HostCfg};
     use gguf::Split;
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_bp, tier_batch};
@@ -130,22 +144,52 @@ mod gate {
     /// Nodes of a tier graph a tier layer: the go wait, the activation's and
     /// the places' copies in, the card leg's four launches, the signal.
     const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(TierAct::F32, 4);
+    /// The f16 pattern every selecting store's planes hold before a run
+    /// (100.0): `reset` leaves those rows as they were, so a path that reads
+    /// a row it did not write must read this, not a previous run's value —
+    /// gate_qwen4exp_e2e's `PLANE_FILL`, the same rule.
+    const PLANE_FILL: u16 = 0x5640;
+    /// The model's delta and selecting layers, the e2e gate's terms of the
+    /// launches a slot binds.
+    const N_GDN: usize = 36;
+    const N_QSA: usize = 12;
+    /// The model's streams, hidden width and pass rows, the e2e gate's terms
+    /// of a sequence's arena rows.
+    const STREAMS: usize = 4;
+    const HIDDEN: usize = 2560;
+    const PASS_ROWS: usize = 8;
+    /// PIN(2026-10-06): the nodes one more busy slot adds to a captured pass
+    /// of several slots' rows, derived before the pass was built
+    /// (gate_qwen4exp_e2e's `NODES_SLOT`, the same derivation): the
+    /// launches bound to one sequence — the embedding row, the PLE site's
+    /// conv on layer 1, each delta layer's conv and delta step, each
+    /// selecting layer's 8 — and the copy of a parked slot's rows into its
+    /// own: 1 + 1 + 36·2 + 12·8 + 1.
+    const NODES_SLOT: usize = 171;
+    /// The verify windows of `--slots`'s history: each pass's rows a slot.
+    const SLOT_WINDOWS: [(usize, usize); 5] = [(4, 4), (4, 3), (3, 4), (4, 2), (3, 2)];
+    /// Each [`SLOT_WINDOWS`] pass's kept rows a slot, fixed counts.
+    const SLOT_KEEPS: [(usize, usize); 5] = [(2, 3), (4, 1), (1, 2), (3, 2), (2, 1)];
+
+    const _: () = assert!(NODES_SLOT == 1 + 1 + N_GDN * 2 + N_QSA * 8 + 1);
 
     struct Args {
         union: bool,
         residency: bool,
         lost: bool,
         prompt4k: bool,
+        slots: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str =
-            "usage: gate_qwen38_twocard [--union] [--residency] [--lost] [--prompt4k]";
+            "usage: gate_qwen38_twocard [--union] [--residency] [--lost] [--prompt4k] [--slots]";
         let mut a = Args {
             union: false,
             residency: false,
             lost: false,
             prompt4k: false,
+            slots: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
@@ -153,10 +197,11 @@ mod gate {
                 "--residency" => a.residency = true,
                 "--lost" => a.lost = true,
                 "--prompt4k" => a.prompt4k = true,
+                "--slots" => a.slots = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.union || a.residency || a.lost || a.prompt4k) {
+        if !(a.union || a.residency || a.lost || a.prompt4k || a.slots) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -274,18 +319,19 @@ mod gate {
         Ok(out)
     }
 
-    /// A load of `plan` under `residency`, its session over `ctx`
-    /// positions.
+    /// A load of `plan` under `residency` for `slots` sequences, its session
+    /// over `ctx` positions.
     fn open(
         path: &Path,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         (host, ub, ctx): (HostCfg, usize, usize),
         residency: Residency,
+        slots: usize,
     ) -> Result<Session<Body38>, GateError> {
         let t0 = Instant::now();
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let m = Body38::open_placed_residency(file, plan, inputs, 0, host, ub, residency, 1)?;
+        let m = Body38::open_placed_residency(file, plan, inputs, 0, host, ub, residency, slots)?;
         let tiers = m.body(NAME)?.hybrid().tiers();
         let tier = match tiers.first() {
             Some(t) => format!(
@@ -723,13 +769,29 @@ mod gate {
         bp: &'a Machine,
         ctx: usize,
     ) -> Result<Plan<'a>, GateError> {
+        chosen_plan_slots(inputs, bp, ctx, 1)
+    }
+
+    /// [`chosen_plan`] for a load that serves `slots` sequences
+    /// (`PlanInputs::plan_with_slots`; at 1 the plan itself): two sequences'
+    /// stores shrink the union's room on the A6000, so the search runs on
+    /// the plan it picks.
+    fn chosen_plan_slots<'a>(
+        inputs: &'a PlanInputs,
+        bp: &'a Machine,
+        ctx: usize,
+        slots: usize,
+    ) -> Result<Plan<'a>, GateError> {
         for gib in BUDGETS {
             let levers = PlanLevers {
                 card_budget_bytes: Some(gib << 30),
             };
-            let plan = inputs
-                .plan_with(bp, ctx as u64, &levers, Experts::Card)
-                .map_err(|e| format!("plan (b′) under {gib} GiB: {e}"))?;
+            let plan = if slots == 1 {
+                inputs.plan_with(bp, ctx as u64, &levers, Experts::Card)
+            } else {
+                inputs.plan_with_slots(bp, ctx as u64, &levers, Experts::Card, slots)
+            }
+            .map_err(|e| format!("plan (b′) under {gib} GiB: {e}"))?;
             if let Some(why) = unfit(&plan) {
                 println!("budget {gib} GiB at {ctx} positions: {why}; next");
                 continue;
@@ -741,8 +803,9 @@ mod gate {
                 )
             };
             println!(
-                "plan (b′) at {ctx} positions under a card budget of {gib} GiB: stage {} experts \
-                 (a layer {:?}), tier {} experts (a layer {:?}) on {} layers, host {} experts",
+                "plan (b′) of {slots} at {ctx} positions under a card budget of {gib} GiB: stage \
+                 {} experts (a layer {:?}), tier {} experts (a layer {:?}) on {} layers, host {} \
+                 experts",
                 plan.cards[0].experts,
                 held(&plan.n_l),
                 plan.cards.get(1).map_or(0, |c| c.experts),
@@ -922,13 +985,13 @@ mod gate {
         let mut um = bp.clone();
         um.tiers.clear();
         let uplan = union_plan(&plan, &um)?;
-        let mut r = open(path, &uplan, inputs, (host, ub, CTX_4K), Residency::Off)?;
+        let mut r = open(path, &uplan, inputs, (host, ub, CTX_4K), Residency::Off, 1)?;
         if !r.model().body(NAME)?.hybrid().tiers().is_empty() {
             return Err("the reference load holds a tier card".into());
         }
         let want = prompt_run(&mut r, &ids, false)?;
         drop(r);
-        let mut t = open(path, &plan, inputs, (host, ub, CTX_4K), Residency::Off)?;
+        let mut t = open(path, &plan, inputs, (host, ub, CTX_4K), Residency::Off, 1)?;
         let (got, served) = served_prompt(&mut t, &ids)?;
         let ok = same(
             &format!("two cards, a {PROMPT_4K}-id prompt call at {CTX_4K} positions"),
@@ -936,6 +999,392 @@ mod gate {
             &got,
         );
         Ok(batch_precondition(served, Some(&tl)) && ok)
+    }
+
+    // ---------------------------------------------- --slots: (s2) and (s8)
+
+    /// `reset`, then every selecting store's planes set to [`PLANE_FILL`]:
+    /// gate_qwen4exp_e2e's `fresh`, the same rule (the digest reads the
+    /// planes whole, and `reset` leaves their rows as they were).
+    fn tier_fresh(m: &mut Qwen38Model) -> Result<(), GateError> {
+        m.reset()?;
+        let (gpu, _, b) = m.body_parts("fresh")?;
+        b.fill_planes(gpu, PLANE_FILL)?;
+        Ok(())
+    }
+
+    /// The digest of the selected slot's whole resident state: every store
+    /// and the PLE ring ([`Body38::stores_host`]) and the lane word —
+    /// gate_qwen4exp_e2e's `slot_digest`, the same rule.
+    fn slot_digest(m: &mut Qwen38Model) -> Result<u64, GateError> {
+        let (gpu, _, b) = m.body_parts("stores")?;
+        let (stores, ring) = b.stores_host(gpu)?;
+        let lane = m.body("slots")?.lane();
+        let mut h = Fnv1a64::default();
+        let u16s = |h: Fnv1a64, v: &[u16]| v.iter().fold(h, |h, &w| h.bytes(&w.to_le_bytes()));
+        for s in &stores {
+            match s {
+                Store38Host::Rec { state, ring } => h = h.f32s(state).f32s(ring),
+                Store38Host::Qsa { k, v, raw, pooled } => {
+                    h = u16s(u16s(u16s(u16s(h, k), v), raw), pooled);
+                }
+            }
+        }
+        Ok(h.f32s(&ring).bytes(&lane.to_le_bytes()).value())
+    }
+
+    /// (s2)'s body for the slot harness ([`slots_gate`]): the tier load of
+    /// the plan of two, stream 0 window `a` and stream 1 window `b` (two
+    /// disjoint [`PROMPT_U`]-id prose windows) by the ubatch path — the tier
+    /// load's prompt path; the eager pass is refused there by name.
+    struct TierSlots<'a> {
+        path: &'a Path,
+        inputs: &'a PlanInputs,
+        plan: &'a Plan<'a>,
+        host: HostCfg,
+        ub: usize,
+        a: Vec<u32>,
+        b: Vec<u32>,
+    }
+
+    impl SlotsAdapter for TierSlots<'_> {
+        type Body = Body38;
+
+        const STEPS: usize = 8;
+        const TAIL: usize = 4;
+
+        fn open(&self, slots: usize) -> Result<Qwen38Model, GateError> {
+            let t0 = Instant::now();
+            let file =
+                Split::open(self.path).map_err(|e| format!("open {}: {e}", self.path.display()))?;
+            let m = Body38::open_placed_residency(
+                file,
+                self.plan,
+                self.inputs,
+                0,
+                self.host,
+                self.ub,
+                Residency::Off,
+                slots,
+            )?;
+            println!(
+                "slots load in {:.1} s: stage {} ({} B)",
+                t0.elapsed().as_secs_f64(),
+                m.gpu().device_name()?,
+                m.resident_bytes()
+            );
+            Ok(m)
+        }
+
+        fn rewind(&self, m: &mut Qwen38Model) -> Result<(), GateError> {
+            tier_fresh(m)
+        }
+
+        fn prompt(&self, m: &mut Qwen38Model, stream: usize) -> Result<u32, GateError> {
+            Ok(match stream {
+                0 => m.prompt38(&self.a, Prompt38::Gemm)?,
+                1 => m.prompt38(&self.b, Prompt38::Gemm)?,
+                _ => return Err(format!("--slots runs streams 0 and 1, not {stream}").into()),
+            })
+        }
+
+        fn state_hash(&self, m: &mut Qwen38Model) -> Result<u64, GateError> {
+            slot_digest(m)
+        }
+
+        /// The stores ([`Body38::store_bytes`]), the lane word (one device
+        /// word) and the two arena-row buffers (`(1 + PASS_ROWS) · STREAMS ·
+        /// HIDDEN` f32) — (y)'s derivation in gate_qwen4exp_e2e.
+        fn seq_bytes_derived(&self, m: &Qwen38Model) -> Result<Derived, GateError> {
+            let stores = m.body("slots")?.store_bytes();
+            let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
+            Ok(Derived {
+                bytes: stores + 4 + rows,
+                terms: format!("store_bytes {stores} + the lane word 4 + the arena rows {rows}"),
+            })
+        }
+    }
+
+    impl PassAdapter for TierSlots<'_> {
+        /// [`NODES_SLOT`], (y)'s terms.
+        fn added_slot_launches(&self, _m: &Qwen38Model) -> Result<Launches, GateError> {
+            Ok(Launches {
+                n: NODES_SLOT,
+                terms: format!(
+                    "the embedding 1 + the PLE conv 1 + {N_GDN} delta layers' 2 + {N_QSA} \
+                     selecting layers' 8 + the parked rows' copy 1"
+                ),
+            })
+        }
+
+        fn slots_launches(
+            &self,
+            m: &Qwen38Model,
+            key: &[(usize, usize)],
+        ) -> Result<usize, GateError> {
+            Ok(m.body("slots")?.slots_launches(key))
+        }
+    }
+
+    /// One run of (s8)'s history: the ids each slot gave (its prompt's
+    /// argmax, every verify row's, every step's), each slot's state hash
+    /// after them and its next step's token and logits row.
+    struct SlotsRun {
+        ids: [Vec<u32>; 2],
+        hash: [u64; 2],
+        step: [(u32, Vec<f32>); 2],
+    }
+
+    /// (s8)'s history (module doc) over `s`: each slot's prompt window (`a`,
+    /// `b`) by the session's prompt call, the [`SLOT_WINDOWS`] each as one
+    /// `verify_slots` pass of both slots (each slot's greedy token, then
+    /// `fill`'s next ids) committed at its [`SLOT_KEEPS`], [`STEPS`] rounds
+    /// of one row a slot — then each slot's state hash and its next step's
+    /// token and logits row. Both slots' ids count `2 · PROMPT_U` plus the
+    /// windows' rows plus [`STEPS`] positions.
+    fn slots_history(
+        s: &mut Session<Body38>,
+        (a, b): (&[u32], &[u32]),
+        fill: &[u32],
+    ) -> Result<SlotsRun, GateError> {
+        let windows = [a, b];
+        let mut last = [0; 2];
+        let mut ids = [Vec::new(), Vec::new()];
+        for slot in 0..2 {
+            s.select_slot(slot)?;
+            s.clear()?;
+            let out = s.prompt(windows[slot], Want::Argmax)?;
+            last[slot] = out.argmax();
+            ids[slot].push(last[slot]);
+        }
+        let mut at = [0; 2];
+        for (&(m0, m1), &(k0, k1)) in SLOT_WINDOWS.iter().zip(&SLOT_KEEPS) {
+            let mut rows = [Vec::new(), Vec::new()];
+            for (slot, m) in [(0, m0), (1, m1)] {
+                let f = fill
+                    .get(at[slot]..at[slot] + m - 1)
+                    .ok_or("the corpus holds too few ids for the slots' windows")?;
+                rows[slot] = vec![last[slot]; m];
+                rows[slot][1..].copy_from_slice(f);
+                at[slot] += m;
+            }
+            let out = s.verify_slots(&[(0, &rows[0]), (1, &rows[1])])?;
+            if out.ids.len() != m0 + m1 {
+                return Err(format!(
+                    "a pass of {m0} and {m1} rows read back {} ids",
+                    out.ids.len()
+                )
+                .into());
+            }
+            ids[0].extend_from_slice(&out.ids[..m0]);
+            ids[1].extend_from_slice(&out.ids[m0..]);
+            last = [out.ids[k0 - 1], out.ids[m0 + k1 - 1]];
+            s.commit_slots(&[k0, k1])?;
+        }
+        for _ in 0..STEPS {
+            let out = s.step_slots(&[(0, &[last[0]]), (1, &[last[1]])])?;
+            if out.ids.len() != 2 {
+                return Err(
+                    format!("a pass of one row a slot read back {} ids", out.ids.len()).into(),
+                );
+            }
+            last = [out.ids[0], out.ids[1]];
+            ids[0].push(last[0]);
+            ids[1].push(last[1]);
+        }
+        let mut hash = [0; 2];
+        let mut step = [(0, Vec::new()), (0, Vec::new())];
+        for slot in 0..2 {
+            s.select_slot(slot)?;
+            hash[slot] = slot_digest(s.model_mut())?;
+            let out = s.step(last[slot], Want::Logits)?;
+            let Out::Logits { argmax, row } = out else {
+                return Err("a step asked for its logits gave the argmax alone".into());
+            };
+            step[slot] = (argmax, row.to_vec());
+        }
+        Ok(SlotsRun { ids, hash, step })
+    }
+
+    /// Slot `slot`'s half of (s8)'s history alone, the other slot parked
+    /// from its clear: its prompt window, the same windows as `verify_slots`
+    /// passes of it alone committed at the same counts, then greedy steps —
+    /// its ids.
+    fn slots_solo(
+        s: &mut Session<Body38>,
+        slot: usize,
+        window: &[u32],
+        fill: &[u32],
+    ) -> Result<Vec<u32>, GateError> {
+        s.select_slot(slot)?;
+        s.clear()?;
+        let mut last = s.prompt(window, Want::Argmax)?.argmax();
+        let mut ids = vec![last];
+        let mut at = 0;
+        for (&(m0, m1), &(k0, k1)) in SLOT_WINDOWS.iter().zip(&SLOT_KEEPS) {
+            let (m, k) = if slot == 0 { (m0, k0) } else { (m1, k1) };
+            let f = fill
+                .get(at..at + m - 1)
+                .ok_or("the corpus holds too few ids for the slots' windows")?;
+            let mut rows = vec![last; m];
+            rows[1..].copy_from_slice(f);
+            at += m;
+            let out = s.verify_slots(&[(slot, &rows)])?;
+            if out.ids.len() != m {
+                return Err(format!("a pass of {m} rows read back {} ids", out.ids.len()).into());
+            }
+            ids.extend_from_slice(&out.ids);
+            last = out.ids[k - 1];
+            s.commit_slots(&[k])?;
+        }
+        for _ in 0..STEPS {
+            last = s.step(last, Want::Argmax)?.argmax();
+            ids.push(last);
+        }
+        Ok(ids)
+    }
+
+    /// (s8)(a): every row's id, each slot's state hash after the history and
+    /// its next step's token and logits row bit for bit the union
+    /// reference's.
+    fn slots_union_clause(want: &SlotsRun, got: &SlotsRun) -> bool {
+        let mut off = Vec::new();
+        for slot in 0..2 {
+            if want.ids[slot] != got.ids[slot] {
+                let at = want.ids[slot]
+                    .iter()
+                    .zip(&got.ids[slot])
+                    .position(|(a, b)| a != b);
+                off.push(format!("slot {slot}'s ids apart at {at:?}"));
+            }
+            if want.hash[slot] != got.hash[slot] {
+                off.push(format!("slot {slot}'s state hash"));
+            }
+            let (w, g) = (&want.step[slot], &got.step[slot]);
+            let row =
+                w.1.iter()
+                    .zip(&g.1)
+                    .position(|(x, y)| x.to_bits() != y.to_bits());
+            if w.0 != g.0 || w.1.len() != g.1.len() || row.is_some() {
+                off.push(format!("slot {slot}'s next step's logits row"));
+            }
+        }
+        println!(
+            "slots union: each slot's {} ids, its state hash after the history and its next \
+             step's logits row bit for bit the union reference's{}: {}",
+            got.ids[0].len(),
+            if off.is_empty() {
+                String::new()
+            } else {
+                format!(" (differs in {})", off.join(", "))
+            },
+            verdict(off.is_empty())
+        );
+        off.is_empty()
+    }
+
+    /// (s8)(b): on the tier load each slot's rows its solo run's (the same
+    /// windows as verifies of that slot alone, the other parked).
+    fn slots_solo_clause(got: &SlotsRun, solo: &[Vec<u32>; 2]) -> bool {
+        let mut off = Vec::new();
+        for slot in 0..2 {
+            if got.ids[slot] != solo[slot] {
+                let at = got.ids[slot]
+                    .iter()
+                    .zip(&solo[slot])
+                    .position(|(a, b)| a != b);
+                let a = at.unwrap_or(0);
+                let around =
+                    |v: &[u32]| format!("{:?}", &v[a.saturating_sub(3)..(a + 4).min(v.len())]);
+                off.push(format!(
+                    "slot {slot}'s ids apart at {at:?} (joint {} solo {})",
+                    around(&got.ids[slot]),
+                    around(&solo[slot])
+                ));
+            }
+        }
+        println!(
+            "slots solo: on the tier load each slot's rows its solo run's, the same windows as \
+             verifies of that slot alone{}: {}",
+            if off.is_empty() {
+                String::new()
+            } else {
+                format!(" (differs in {})", off.join(", "))
+            },
+            verdict(off.is_empty())
+        );
+        off.is_empty()
+    }
+
+    /// (s8)(c): after the history the tier's graphs of its widths (5 to 8
+    /// columns) hold eight nodes a tier layer and the fault copy.
+    fn slots_tier_graphs(s: &Session<Body38>, layers: usize) -> Result<bool, GateError> {
+        let tier = s
+            .model()
+            .body(NAME)?
+            .hybrid()
+            .tiers()
+            .first()
+            .ok_or("the load holds no tier")?;
+        let want = Some(TIER_LAYER_NODES * layers + 1);
+        let got: Vec<Option<usize>> = (5..=8).map(|m| tier.graph_nodes(Chain::Cols(m))).collect();
+        let ok = got.iter().all(|&g| g == want);
+        println!(
+            "slots structure: the tier's graphs of the history's widths 5..=8 columns hold \
+             {got:?} nodes, {TIER_LAYER_NODES} a tier layer and the fault copy ({want:?}): {}",
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `--slots` (module doc): (s2) the slot harness over the tier load of
+    /// the plan of two, then (s8) the passes of 5..8 rows on that load and
+    /// its union reference. Three loads.
+    fn slots_clauses(
+        path: &Path,
+        inputs: &PlanInputs,
+        bp: &Machine,
+        host: HostCfg,
+        ub: usize,
+    ) -> Result<bool, GateError> {
+        let plan = chosen_plan_slots(inputs, bp, CTX, 2)?;
+        let tl = tier_layers(&plan);
+        let ids = prose38(2 * PROMPT_U + 32)?;
+        let (a, b) = (&ids[..PROMPT_U], &ids[PROMPT_U..2 * PROMPT_U]);
+        let fill = &ids[2 * PROMPT_U..];
+        let body = TierSlots {
+            path,
+            inputs,
+            plan: &plan,
+            host,
+            ub,
+            a: a.to_vec(),
+            b: b.to_vec(),
+        };
+        let mut s = slots_gate::interleave(&body)?;
+        s.one_pass();
+        let mut ok = s.finish()?;
+        let mut um = bp.clone();
+        um.tiers.clear();
+        let uplan = union_plan(&plan, &um)?;
+        let mut r = open(path, &uplan, inputs, (host, ub, CTX), Residency::Off, 2)?;
+        if !r.model().body(NAME)?.hybrid().tiers().is_empty() {
+            return Err("the reference load holds a tier card".into());
+        }
+        r.add_slots(2)?;
+        let want = slots_history(&mut r, (a, b), fill)?;
+        drop(r);
+        let mut t = open(path, &plan, inputs, (host, ub, CTX), Residency::Off, 2)?;
+        t.add_slots(2)?;
+        let got = slots_history(&mut t, (a, b), fill)?;
+        ok &= slots_union_clause(&want, &got);
+        let solo = [
+            slots_solo(&mut t, 0, a, fill)?,
+            slots_solo(&mut t, 1, b, fill)?,
+        ];
+        ok &= slots_solo_clause(&got, &solo);
+        ok &= slots_tier_graphs(&t, tl.len())?;
+        Ok(ok)
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -964,7 +1413,7 @@ mod gate {
                 "reference: the A6000 holds {} experts, the union of the stage's and the tier's",
                 uplan.n_l.iter().sum::<u64>()
             );
-            let mut r = open(path, &uplan, &inputs, (host, ub, CTX), Residency::Off)?;
+            let mut r = open(path, &uplan, &inputs, (host, ub, CTX), Residency::Off, 1)?;
             if !r.model().body(NAME)?.hybrid().tiers().is_empty() {
                 return Err("the reference load holds a tier card".into());
             }
@@ -972,7 +1421,7 @@ mod gate {
             let want_prompt = prompt_run(&mut r, &prompt_ids, false)?;
             let want_short = gemm_run(&mut r, &prompt_ids[..PROMPT_SHORT])?;
             drop(r);
-            let mut t = open(path, &plan, &inputs, (host, ub, CTX), Residency::Off)?;
+            let mut t = open(path, &plan, &inputs, (host, ub, CTX), Residency::Off, 1)?;
             let got = history(&mut t, &ids)?;
             pass &= same("two cards", &want, &got);
             pass &= structure(&t, &want, &got, &tl)?;
@@ -1016,7 +1465,7 @@ mod gate {
                 "residency: mid-p{}-s1 over the plan's {slots} stage experts a layer at least",
                 slots / 2
             );
-            let mut t = open(path, &plan, &inputs, (host, ub, CTX), residency)?;
+            let mut t = open(path, &plan, &inputs, (host, ub, CTX), residency, 1)?;
             pass &= residency_clauses(
                 &mut t,
                 (&ids, &prompt_ids),
@@ -1028,13 +1477,17 @@ mod gate {
         if args.lost {
             let mut s = match last.take() {
                 Some(s) => s,
-                None => open(path, &plan, &inputs, (host, ub, CTX), Residency::Off)?,
+                None => open(path, &plan, &inputs, (host, ub, CTX), Residency::Off, 1)?,
             };
             pass &= lost_case(s.model_mut(), &ids)?;
         }
         if args.prompt4k {
             drop(last.take());
             pass &= prompt4k(path, &inputs, host)?;
+        }
+        if args.slots {
+            drop(last.take());
+            pass &= slots_clauses(path, &inputs, &bp, host, ub)?;
         }
         if !pass {
             return Err(checks_failed());
