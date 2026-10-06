@@ -71,12 +71,10 @@
 //!   BLOOMERY_RESIDENCY=off`: it prints `load draft=mtp` and no `residency
 //!   host`, the same `/completion` carries the draft's counts, and its ids
 //!   are the plain CLI's, all of them; a sampled `/completion` cut to
-//!   `top_k` 1 (temperature 0.8, a fixed seed) is served through plain steps,
-//!   drafting nothing, each step's row read before the step is told to the
-//!   draft, and its ids are the plain CLI's too. Green-only for the row's
-//!   read: the NextN walk writes no row of the target's head, so a `step_row`
-//!   left at the default reads the same row; the clause holds the sampled
-//!   path's ids end to end; and `cache` again under the draft, where the
+//!   `top_k` 1 (temperature 0.8, a fixed seed) drafts — its passes' rows
+//!   each drawn by the request's sampler (`Engine::advance_sampled`), so it
+//!   carries the draft's counts — and its ids are the plain CLI's too: the
+//!   clause holds the sampled path's ids end to end; and `cache` again under the draft, where the
 //!   draft also rejoins A where A left it, its counts the no-switch run's.
 //!   Exact: with no residency nothing
 //!   moves between the host and the card, every kept token is the target's
@@ -163,10 +161,10 @@
 //!   split planned, red there); the open deciding turns (the fallback loop's
 //!   `passes=rows`, so `passes=2` on a round of two rows, and `pass=turns`).
 //!   Then on the same server, sampled requests (temperature 0.8, top-k 40,
-//!   a fixed seed a turn, `cache_prompt` off), which the server steps and
-//!   never drafts: each turn alone, then both at once — each one's ids its
-//!   alone run's, no draft counts, every `cmd=step` record of the window
-//!   `slots=2` and `passes=rows` (one with `rows=2`) and no `cmd=pass`
+//!   a fixed seed a turn, `cache_prompt` off), which the server drafts alone
+//!   and steps beside another busy slot: each turn alone (its draft counts
+//!   present), then both at once — each one's ids its alone run's, every
+//!   `cmd=step` record of the window `slots=2` and `passes=rows` (one with `rows=2`) and no `cmd=pass`
 //!   record; then the greedy [`TURN_A`] beside the sampled [`TURN_C`] — the
 //!   greedy one's ids and draft counts its alone run's, the sampled one's
 //!   ids its alone run's, every `cmd=pass` record of the window `slots=2`,
@@ -1225,8 +1223,9 @@ mod gate {
         );
         check(
             &mut ok,
-            "draft_only_top1_sample_is_the_plain_generate_glm5next",
-            k1["timings"].get("draft_n").is_none() && agree(&sampled, &k1_stop, reference),
+            "draft_only_top1_sample_drafts_the_plain_generate_glm5next",
+            k1["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0)
+                && agree(&sampled, &k1_stop, reference),
         );
         ok &= cache(&url, &err_log, true)?;
         println!("draft-only server stopped: {}", served.stop()?);
@@ -1790,10 +1789,14 @@ mod gate {
     /// the greedy `ids[0]` beside the sampled `ids[1]`, `greedy_alone` the
     /// greedy request's alone run (its ids, draft count and accepted).
     ///
-    /// A sampled request steps on the server — a `next` a token, its row
-    /// read for the sampler — and its round of steps is the server's call
-    /// apart from the drafted passes' (`Engine::step_slots` beside
-    /// `Engine::advance_slots`). The default seat runs neither as one pass
+    /// A sampled request alone drafts (`Engine::advance_sampled`, its
+    /// sampler drawing each kept id from the verified rows), so its alone run
+    /// carries draft counts. Beside another busy slot it steps — a `next` a
+    /// token, its row read for the sampler — and its round of steps is the
+    /// server's call apart from the drafted passes' (`Engine::step_slots`
+    /// beside `Engine::advance_slots`); a slot left alone drafts again on the
+    /// one-slot path, which prints no `slots round` record. The default seat
+    /// runs neither as one pass
     /// with the drafted rows: a sampled row would be a window that proposes
     /// nothing, which `app::mtp::pass_slots` refuses (depth 0, and every
     /// window's draft proposes), the body's NextN pass of several slots
@@ -1827,7 +1830,7 @@ mod gate {
         let window = rounds_from(err_log, before)?;
         let steps = of_cmd(&window, "step");
         let ids_of_v = |v: &Value| ids_of(&v["tokens"]);
-        let plain = |v: &Value| v["timings"].get("draft_n").is_none();
+        let drafted = |v: &Value| v["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0);
         println!(
             "slots sampled alone {:?} and {:?} ids, together {:?} and {:?}",
             ids_of_v(&alone[0]).len(),
@@ -1839,11 +1842,11 @@ mod gate {
         check(
             &mut ok,
             "slots_sampled_together_ids_are_alone",
-            alone.iter().all(|v| !ids_of_v(v).is_empty() && plain(v))
-                && together.iter().zip(&alone).all(|(t, a)| {
-                    t.as_ref()
-                        .is_some_and(|t| ids_of_v(t) == ids_of_v(a) && plain(t))
-                }),
+            alone.iter().all(|v| !ids_of_v(v).is_empty() && drafted(v))
+                && together
+                    .iter()
+                    .zip(&alone)
+                    .all(|(t, a)| t.as_ref().is_some_and(|t| ids_of_v(t) == ids_of_v(a))),
         );
         check(
             &mut ok,
@@ -1884,7 +1887,7 @@ mod gate {
             greedy_mixed.as_ref() == Some(greedy_alone)
                 && mixed[1]
                     .as_ref()
-                    .is_some_and(|v| ids_of_v(v) == ids_of_v(&alone[1]) && plain(v)),
+                    .is_some_and(|v| ids_of_v(v) == ids_of_v(&alone[1])),
         );
         check(
             &mut ok,

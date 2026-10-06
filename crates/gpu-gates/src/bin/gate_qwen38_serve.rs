@@ -56,9 +56,9 @@
 //!   resent keeps its end by a cut, after which the extension drafts
 //!   nothing, by name, with the same prompt's ids fed fresh; `/props`' `engine.draft` names the draft file
 //!   `refset::arch::qwen4exp::mtp::draft_file` picks, by name and path;
-//!   and a sampled `/completion` (temperature 0.8, a fixed seed) is served
-//!   through plain steps, drafting nothing, and the same request at `top_k`
-//!   1 gives this server's greedy ids;
+//!   and a sampled `/completion` (temperature 0.8, a fixed seed) drafts, its
+//!   passes' rows drawn by its sampler (`Engine::advance_sampled`), and the
+//!   same request at `top_k` 1 drafts and gives this server's greedy ids;
 //! - the seats' `parallel` lines ([`parallel_agrees`]): the resident-slot
 //!   rule names its slots, and the line's own terms hold them — the slots
 //!   are the flag's (`--parallel 2`) or the default's (2, the `ctx` clause's
@@ -1121,11 +1121,12 @@ mod gate {
         Ok(ok)
     }
 
-    /// The drafted server's sampled requests, served through plain steps with
-    /// the target's logits row read after each step: `sampled` (answered `st`
-    /// `body`) is served and counts no draft; `top1` (answered `st1` `body1`),
-    /// the same request cut to `top_k` 1, samples the row's own argmax, so its
-    /// ids are this server's greedy `first`. A plain server is no reference
+    /// The drafted server's sampled requests, each drafted, every kept id the
+    /// sampler's draw from its verified row: `sampled` (answered `st` `body`)
+    /// is served and carries the draft's counts; `top1` (answered `st1`
+    /// `body1`), the same request cut to `top_k` 1, samples each row's own
+    /// argmax, so it drafts too and its ids are this server's greedy
+    /// `first`. A plain server is no reference
     /// for the sampled ids: the drafted load plans fewer target experts on the
     /// card (the draft takes card bytes), and an expert served on the host
     /// rounds its sums another way, so a sampled id can differ at a near tie.
@@ -1149,8 +1150,10 @@ mod gate {
         );
         check(
             &mut ok,
-            "drafted_sampled_request_drafts_nothing",
-            drafted["timings"].get("draft_n").is_none(),
+            "drafted_sampled_request_drafts",
+            drafted["timings"]["draft_n"]
+                .as_u64()
+                .is_some_and(|n| n > 0),
         );
         let (st1, body1) = top1;
         let k1 = json_of("/completion", st1, body1)?;
@@ -1159,7 +1162,7 @@ mod gate {
         check(
             &mut ok,
             "drafted_top1_sample_is_the_greedy_ids",
-            got1 == first && k1["timings"].get("draft_n").is_none(),
+            got1 == first && k1["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
         );
         Ok(ok)
     }
