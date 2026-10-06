@@ -338,6 +338,10 @@ name = "gate_iq"
 required-features = ["gpu"]
 
 [[bin]]
+name = "gate_iq_sel"
+required-features = ["gpu"]
+
+[[bin]]
 name = "gate_kquant"
 required-features = ["gpu"]
 

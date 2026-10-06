@@ -105,7 +105,11 @@ gguf 9 2 0
 # PIN(2026-10-06): gpu 1531 -> 1536 blocks, new kernel entries, not old code relaxed: the i-quant arms of the
 # grouped GEMMs (gemm/iqgemm) add iq3xxs_lane's grid reads (one block) and its decode macro's load (one),
 # iq4xs_dec's load (one), and gemm32's iq4nl relay load and store (one each), each with its SAFETY line.
-gpu 1536 171 6
+# PIN(2026-10-06): gpu 1536 -> 1551 blocks, new kernel entries, not old code relaxed: the i-quant expert-select
+# entries (iq_sel.rs: iq3_xxs_gate_up_sel, iq4_xs_gate_up_sel, iq4_nl_gemv_sel32) add their id loads, raw-block
+# window loads, fault NaN stores and lane stores, fifteen blocks under safe crate-internal helpers, each with its
+# SAFETY line.
+gpu 1551 171 6
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
