@@ -8,6 +8,10 @@
 //!     [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] [--chat-template-file PATH]
 //!     [--prefill batch|steps] [--parallel N] [--queue-depth Q] [--plan]
 //!
+//! `--ctx` is also spelled `--ctx-size` and `-c`, as llama-server spells it
+//! (`serve::flag::CTX`); a number flag's value that is not a number is
+//! refused naming the flag and the value.
+//!
 //! The model is `$BLOOMERY_REF_MODEL`; its first shard gives the vocabulary,
 //! `tokenizer.chat_template` the chat template (`--chat-template-file`
 //! replaces it, as the qwen38 seat takes it) and `general.name` the default
@@ -223,6 +227,7 @@ use model::placement::workstation::{HostNeed, MARGIN, TierBatchBytes, host_avail
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::Target;
 use runtime::seqstate::Why;
+use serve::flag::number;
 use serve::{
     CacheNote, DraftProps, Drafted, EngineProps, FATAL_LINGER, ResidencyReset, Saved, ServeError,
     Server, ServerConfig, SlotConfig,
@@ -671,14 +676,14 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             .ok_or_else(|| format!("{flag} needs a value, or is unknown: {USAGE}"))?;
         match flag {
             "--host" => a.host = v.to_owned(),
-            "--port" => a.port = v.parse()?,
+            "--port" => a.port = number(flag, v)?,
             "--place" => a.place = Some(glm_place::parse(v)?),
-            "--ctx" => a.ctx = Some(v.parse()?),
+            f if serve::flag::CTX.contains(&f) => a.ctx = Some(number(flag, v)?),
             "--alias" => a.alias = Some(v.to_owned()),
             "--cache-ram" => a.cache_ram = Some(CacheRam::parse_mib(flag, v)?),
             "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
-            "--parallel" | "-np" => a.parallel = v.parse()?,
-            "--queue-depth" => a.queue_depth = Some(v.parse()?),
+            "--parallel" | "-np" => a.parallel = number(flag, v)?,
+            "--queue-depth" => a.queue_depth = Some(number(flag, v)?),
             "--park-ram" => {
                 return Err(format!(
                     "--park-ram {v}: it holds the states of slots that take the model in turns; \
