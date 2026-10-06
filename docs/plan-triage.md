@@ -132,10 +132,13 @@ v0.2.3 is 2647030c. Everything below is 0.2.4 work. The handoffs it was read fro
   9, so its clause (c) reads 9·t + 1.
 - Remove the worktrees that landed in 0.2.3 and their box dirs.
 
-- **parkfix (opus round):** q38tslots' `slots solo` red is its harness, not the engine: `verify_slots` leaves slot 0
-  selected (`model/slots.rs:608-611`) and `slots_solo` never re-selects before its plain steps, so slot 1's "solo"
-  steps ran on slot 0. Serve resets the selection (`genloop.rs:393`, `:426`). The round adds the missing parked-slot
-  plain-step clause to the mtp gate (z). q38tslots (WIP 88116629): add the select, rebase, read clause (c) as 9·t + 1.
+- **parkfix (closed, db3a78d8):** the q38tslots red was its harness (no `select_slot` after `verify_slots`); the mtp
+  gate now holds a parked slot's plain steps after a partial keep. q38tslots (WIP 88116629): add
+  `s.select_slot(slot)?;` before its STEPS loop (`gate_qwen38_twocard.rs:1240`), rebase, read clause (c) as 9·t + 1.
+- **slot-select guard (0.2.5, half a round, a crates/gpu train):** after a pass of several slots the model leaves slot
+  0 selected silently, and a single-slot call then runs on slot 0 — a defined wrong output. Refuse it by name until
+  `select_slot` (also on the no-op path, `model/slots.rs:441`); ~15 gate files add a `select_slot(0)`. Serve is
+  unaffected (genloop clears its selection).
 
 **worker1 — placement and Qwen3.8 serve**
 - placeunset: one common rule for an unset `--place` (the user, 10-06). Design final in the lead specs
