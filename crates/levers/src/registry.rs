@@ -417,18 +417,22 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::C,
         kind: Kind::Residency,
         default: Unset::Means(
-            "V4.1 follows the placement: `mid-p40-s1` under `--place a` and `bp`, `off` under \
-             `gate`, beside `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or \
-             `BLOOMERY_PREFILL=steps`; `generate_qwen3moe` on a qwen4exp file follows its plan: \
+            "V4.1 follows the placement and the plan: `mid-p40-s1` under `--place a` and `bp` \
+             where the plan has room for it, half the plan's fewest card experts a layer \
+             (`mid-p<P>-s<S>`, P at least 1) where its card slots leave less, `off` where they \
+             leave no room for the word or half of them, or no churn pool the card side leaves \
+             fits the plan's host headroom or `MemAvailable`; `off` under `gate`, beside \
+             `BLOOMERY_CHECK_FINITE=1`, `BLOOMERY_ROUTE_TRACE` or `BLOOMERY_PREFILL=steps`; \
+             `generate_qwen3moe` on a qwen4exp file follows its plan: \
              `mid-p<P>-s1` under `--place a`, P half the plan's fewest card experts a layer, \
              `off` under `--place gate`, beside `BLOOMERY_ROUTE_TRACE`, `--prefill step` or \
              `--dump-taps`, on a qwen3moe or qwen35moe file, and on plan (a) when the plan \
-             leaves no room for the word, or its host headroom or `MemAvailable` none for its \
-             churn pool; `bloomery-serve-qwen38` by the same rule under `--place a` and `off` \
-             under `gate`; the GLM seat of `bloomery-serve` `mid-p0-s1` under `--place a` or `bp` where \
-             the plan has room, `off` under `gate` (`bloomery_levers::glm_unset`, \
-             `glm_residency_at_plan`), with a `residency unset` record; `off` in every other \
-             binary",
+             leaves no room for the word, or no churn pool the card side leaves fits its host \
+             headroom or `MemAvailable`; `bloomery-serve-qwen38` by the same rule under \
+             `--place a` and `off` under `gate`; the GLM seat of `bloomery-serve` `mid-p0-s1` \
+             under `--place a` or `bp` where the plan has room, `off` under `gate` \
+             (`bloomery_levers::glm_unset`, `glm_residency_at_plan`), with a `residency unset` \
+             record; `off` in every other binary",
         ),
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
@@ -440,11 +444,17 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               every pass prints `residency pass`; only an explicit call resets it (an arm's \
               clear, the server's `POST /residency/reset`), with a `residency reset` record. \
               Unset follows the placement (`bloomery_levers::residency_unset`): the serving \
-              default `mid-p40-s1` under `--place a` and `bp`, and `off` where the machine \
-              does not run — `--place gate`, beside `BLOOMERY_CHECK_FINITE=1`, beside \
+              default `mid-p40-s1` under `--place a` and `bp`, checked against the plan there \
+              (`bloomery_levers::residency_at_plan`) — half the plan's fewest card experts a \
+              layer where its card slots leave the default no room, `off` where they leave the \
+              word or half of it none, or no churn pool the card side leaves fits the plan's \
+              host headroom or `MemAvailable` — and `off` where the machine does not run — \
+              `--place gate`, beside `BLOOMERY_CHECK_FINITE=1`, beside \
               `BLOOMERY_ROUTE_TRACE` (a fixed placement's routing) and beside \
               `BLOOMERY_PREFILL=steps` (each prompt id would end a pass the rule counts); both \
-              binaries print the word and why as a `residency lever` record before the load. \
+              binaries print the word and why as a `residency lever` record before the plan \
+              record, the plan-side detail on the line beside it when the plan moved or \
+              refused the word. \
               Set, `mid-…` is refused by name under `--place gate`, beside the finite probe, \
               the route trace and the step feed. Qwen3.8 (`generate_qwen3moe` on a qwen4exp \
               file, `--place a` or `gate`, plain or `BLOOMERY_DRAFT=mtp`): unset follows the \
