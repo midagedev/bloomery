@@ -32,7 +32,7 @@
 //! the whole family.
 //!
 //! The 32-value family is the same shape for the weights whose scales come
-//! per 32 values (Q8_0, Q5_1), over [`GemmAct32`] activations (one scale and
+//! per 32 values (Q8_0, IQ4_NL, Q5_1), over [`GemmAct32`] activations (one scale and
 //! one code sum per 32 values, K any multiple of 32), in a device module of
 //! its own ([`Gemm32Kernels`], `kernels32.rs`): `gemm32.rs` the GEMM and its
 //! numeric contract, `act32.rs` the activations and their two quantizers,

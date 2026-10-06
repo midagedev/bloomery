@@ -118,6 +118,9 @@ generate_ds41   gdn_delta                                0           0
 generate_ds41   gdn_delta_lanes                          0           0
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
+generate_ds41   gemm_iq3xxs              0  0
+generate_ds41   gemm_iq4nl               0  0
+generate_ds41   gemm_iq4xs               0  0
 generate_ds41   gemm_q3k                                 0           0
 generate_ds41   gemm_q4k                                 0           0
 generate_ds41   gemm_q5_1                                0           0
@@ -321,6 +324,9 @@ gate_e2e   gdn_delta                                0           0
 gate_e2e   gdn_delta_lanes                          0           0
 gate_e2e   gdn_norm_gate                            0           0
 gate_e2e   gdn_norm_gate_sigmoid                    0           0
+gate_e2e   gemm_iq3xxs              0  0
+gate_e2e   gemm_iq4nl               0  0
+gate_e2e   gemm_iq4xs               0  0
 gate_e2e   gemm_q3k                                 0           0
 gate_e2e   gemm_q4k                                 0           0
 gate_e2e   gemm_q5_1                                0           0

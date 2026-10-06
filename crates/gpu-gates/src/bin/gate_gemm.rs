@@ -16,6 +16,17 @@
 //! only, and slots dealt to experts round-robin (one slot per expert while
 //! there are fewer slots than experts).
 //!
+//! The Qwen3.8 i-quant cases (`q38_*`, the card route `wide38.rs` wires):
+//! synthetic IQ3_XXS and IQ4_XS stacks of the routed gate shape (64 experts
+//! of 640 rows, K 2560, top-10, every slot its token's column; the blocks
+//! cycled from the ref-synth dump) and an IQ3_XXS stack of 400 rows an
+//! expert, each under the four routings — at T ∈ {1, 15, 16, 17, 64, 511,
+//! 512, 3686} for the top-10 cases, ten slots a token capping the route
+//! table at 36,864 slots — with the same checks, the T = 1 outputs against
+//! the i-quant row cores (`iq3_xxs_rows`, `iq4_xs_rows`) over the repacked
+//! stack as a diagnostic, a NaN `d` super-block's outputs NaN, and
+//! `from_ggml`'s acceptance of the two types beside its refusal of IQ2_XS.
+//!
 //! Checks per run:
 //! 1. Every output of every slot written (`y` starts at a sentinel).
 //! 2. Every checked output within its derived band of the f64 reference:
@@ -123,6 +134,12 @@
 //!   column; a Q8_0 plane stack of 8 experts at K 2560 whose two slots a
 //!   token share its column; a Q5_1 stack of 8 × 2560 rows at K 640 (the
 //!   routed down's shape) up to 4096 slots.
+//! - `g38_iq4nl`: the IQ4_NL down of the Qwen3.8 card route (`gemm_iq4nl`)
+//!   — a synthetic 64 × 2560-row stack at K 640 (random nibble codes, finite
+//!   f16 `d`), each slot its own column, under the four routings of the
+//!   K-quant cases' token counts; its decode against ggml's `dequant_row`,
+//!   a NaN `d` block's outputs NaN, a rerun bit-identical, and the host
+//!   API's refusal of the stack at another K.
 //! - `g32_remap`: `enqueue_route_remap` over 48 experts, every third on a
 //!   16-expert card stack in reversed slots and the rest `HOST`: the listed
 //!   slots and tiles the host grouping of the mapped ids less the host slots,
@@ -169,13 +186,16 @@ mod gate {
         GemmWeight,
     };
     use bloomery_gpu::hybrid::HOST;
+    use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
     use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act};
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::{
-        GateError, activations, bits_equal, bytes_to_words, checks_failed, open_model, verdict,
+        GateError, activations, bits_equal, bytes_to_words, checks_failed, data_dir, open_model,
+        verdict,
     };
     use cuda_core::DeviceBuffer;
+    use gguf::iq_tables::{IQ3XXS_GRID, KMASK_IQ2XS, KSIGNS_IQ2XS, KVALUES_IQ4NL};
     use gguf::quant::{GgmlType, dequant_row, half_to_f32};
     use model::arch::models::shape::{MoeShape, rules};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -327,7 +347,7 @@ mod gate {
         let n_sb = k / 256;
         let bpb = ty.block_bytes();
         let grp = match ty {
-            GemmWeight::Q4K | GemmWeight::Q5K => 32,
+            GemmWeight::Q4K | GemmWeight::Q5K | GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => 32,
             GemmWeight::Q6K | GemmWeight::Q3K => 16,
         };
         let mut dec = Dec {
@@ -395,6 +415,58 @@ mod gate {
                         let low = ((b[32 + 32 * n + l] >> (2 * j)) & 3) as i8;
                         let high = b[l] & (1 << (4 * n + j)) != 0;
                         dec.q.push(low - if high { 0 } else { 4 });
+                    }
+                }
+                GemmWeight::Iq3Xxs => {
+                    // The kernel's epilogue scales by d/4 and keeps `2s + 1`
+                    // whole in the integer scale (iq.rs's rule); d/4 is exact
+                    // in f64, so both the band and the contract read it.
+                    dec.d.push(f16(&b[0..2]) / 4.0);
+                    dec.dmin.push(0.0);
+                    for c in 0..8 {
+                        let aux = u32::from_le_bytes([
+                            b[66 + 4 * c],
+                            b[67 + 4 * c],
+                            b[68 + 4 * c],
+                            b[69 + 4 * c],
+                        ]);
+                        dec.sc.push(2 * (aux >> 28) as i32 + 1);
+                        let idx = |j: usize| usize::from(b[2 + 8 * c + j]);
+                        let signs = |l: usize| KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+                        for v in 0..32 {
+                            let (l, j) = (v / 8, v % 8);
+                            let (ib, m) = if j < 4 {
+                                (idx(2 * l), j)
+                            } else {
+                                (idx(2 * l + 1), j - 4)
+                            };
+                            let g = i32::from(IQ3XXS_GRID[ib].to_le_bytes()[m]);
+                            let sgn = if signs(l) & KMASK_IQ2XS[j] != 0 {
+                                -1
+                            } else {
+                                1
+                            };
+                            dec.q.push((g * sgn) as i8);
+                        }
+                    }
+                }
+                GemmWeight::Iq4Xs => {
+                    dec.d.push(f16(&b[0..2]));
+                    dec.dmin.push(0.0);
+                    let sh = u16::from_le_bytes([b[2], b[3]]);
+                    for c in 0..8 {
+                        let ls = (i32::from((b[4 + c / 2] >> (4 * (c % 2))) & 0x0f)
+                            | (i32::from((sh >> (2 * c)) & 3) << 4))
+                            - 32;
+                        dec.sc.push(ls);
+                        for j in 0..16 {
+                            dec.q
+                                .push(KVALUES_IQ4NL[usize::from(b[8 + 16 * c + j] & 0x0f)]);
+                        }
+                        for j in 0..16 {
+                            dec.q
+                                .push(KVALUES_IQ4NL[usize::from(b[8 + 16 * c + j] >> 4)]);
+                        }
                     }
                 }
             }
@@ -541,6 +613,8 @@ mod gate {
             GemmWeight::Q4K => GgmlType::Q4_K,
             GemmWeight::Q5K => GgmlType::Q5_K,
             GemmWeight::Q6K => GgmlType::Q6_K,
+            GemmWeight::Iq3Xxs => GgmlType::IQ3_XXS,
+            GemmWeight::Iq4Xs => GgmlType::IQ4_XS,
         };
         let nb = st.k / 128;
         let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
@@ -618,6 +692,7 @@ mod gate {
         gpu: &'g Gpu,
         gk: GemmKernels,
         q6s: Q6kSelKernels,
+        iqk: IqKernels,
     }
 
     /// The case's resident stack and scratch.
@@ -633,12 +708,17 @@ mod gate {
 
     impl Dev<'_> {
         fn resident(&self, st: &Stack<'_>) -> Result<Resident, GateError> {
+            self.resident_at(st, TOKENS[TOKENS.len() - 1] * st.input.top_k())
+        }
+
+        /// [`Self::resident`] for a case whose largest run is `max_slots`
+        /// slots (the Qwen3.8 top-10 cases stop below TOKENS' last count).
+        fn resident_at(&self, st: &Stack<'_>, max_slots: usize) -> Result<Resident, GateError> {
             let stream = self.gpu.stream();
             let n_rows = st.n_exp * st.rows;
             let mut words = bytes_to_words(&st.bytes);
             words.resize(words.len().div_ceil(n_rows) * n_rows, 0);
             let cols = words.len() / n_rows;
-            let max_slots = TOKENS[TOKENS.len() - 1] * st.input.top_k();
             let acts = (1..=8)
                 .map(|m| Q8Act::with_k(stream, m, st.k))
                 .collect::<Result<Vec<_>, _>>()?;
@@ -712,6 +792,9 @@ mod gate {
             let mut ybuf = DeviceBuffer::<f32>::zeroed(stream, 8 * st.rows)?;
             match (st.ty, st.input) {
                 (GemmWeight::Q5K, _) | (GemmWeight::Q3K, Input::PerSlot(_)) => return Ok(None),
+                // The i-quant types' diagnostic is `iq_rows_diag`, not a
+                // `_sel` gemv.
+                (GemmWeight::Iq3Xxs, _) | (GemmWeight::Iq4Xs, _) => return Ok(None),
                 (GemmWeight::Q3K, Input::Shared(top_k)) => {
                     // One launch per token: every slot of it reads the one column.
                     for t in 0..n_slots / top_k {
@@ -788,6 +871,9 @@ mod gate {
                     .q6s
                     .enqueue_gemv_q6k_sel(stream, &res.w, act, &sel, m, st.rows, &mut y)?,
                 GemmWeight::Q5K => return Err("Q5_K has no _sel gemv".into()),
+                GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => {
+                    return Err("an i-quant stack has no _sel gemv".into());
+                }
             }
             stream.synchronize()?;
             Ok(y.to_host_vec(stream)?)
@@ -988,15 +1074,27 @@ mod gate {
 
     /// Every case: T × routing runs, then the rerun and graph checks.
     fn run_case(dev: &Dev<'_>, st: &Stack<'_>, seed: u64) -> Result<bool, GateError> {
+        run_case_at(dev, st, seed, &TOKENS)
+    }
+
+    /// [`run_case`] at a case's own token counts: ten slots a token (the
+    /// Qwen3.8 gate) would take TOKENS' last count past the route table's
+    /// 36,864-slot cap, so those cases stop at 3686 tokens.
+    fn run_case_at(
+        dev: &Dev<'_>,
+        st: &Stack<'_>,
+        seed: u64,
+        tokens: &[usize],
+    ) -> Result<bool, GateError> {
         if !wanted(&st.name) {
             return Ok(true);
         }
         let t0 = std::time::Instant::now();
         let stream = dev.gpu.stream();
-        let mut res = dev.resident(st)?;
+        let mut res = dev.resident_at(st, tokens[tokens.len() - 1] * st.input.top_k())?;
         let top_k = st.input.top_k();
         let mut ok = true;
-        for &n_tok in &TOKENS {
+        for &n_tok in tokens {
             for (ri, &r) in ROUTINGS.iter().enumerate() {
                 let n_slots = n_tok * top_k;
                 let ids = route_ids(
@@ -1148,9 +1246,33 @@ mod gate {
                 }
                 GemmWeight::Q6K => sb[208..210].copy_from_slice(&a),
                 GemmWeight::Q3K => sb[108..110].copy_from_slice(&a),
+                GemmWeight::Iq3Xxs | GemmWeight::Iq4Xs => sb[0..2].copy_from_slice(&a),
             }
         }
         v
+    }
+
+    /// The super-blocks of an i-quant stack: `$BLOOMERY_DATA/ref-synth/
+    /// <type>.blocks` (`dequant_ref --synthetic`'s dump, `just gate-1-1`)
+    /// cycled to `n_sb_total`, or seeded random super-blocks of [`synthetic`]
+    /// when the dump is not there.
+    fn synth_blocks(ty: GemmWeight, n_sb_total: usize, seed: u64) -> Vec<u8> {
+        let name = match ty {
+            GemmWeight::Iq3Xxs => "iq3_xxs",
+            GemmWeight::Iq4Xs => "iq4_xs",
+            _ => return synthetic(ty, n_sb_total, seed),
+        };
+        let path = data_dir().join("ref-synth").join(format!("{name}.blocks"));
+        if let Ok(all) = std::fs::read(&path) {
+            let bb = ty.block_bytes();
+            if !all.is_empty() && all.len().is_multiple_of(bb) {
+                let n = all.len() / bb;
+                return (0..n_sb_total)
+                    .flat_map(|i| all[bb * (i % n)..][..bb].iter().copied())
+                    .collect();
+            }
+        }
+        synthetic(ty, n_sb_total, seed)
     }
 
     /// The first layer's tensor named by `stem` (`blk.{l}.<stem>`) of type
@@ -1305,6 +1427,10 @@ mod gate {
         let mut y = DeviceBuffer::<f32>::zeroed(stream, 64 * rows)?;
         let mut refusals: Vec<(&str, bool)> = vec![
             ("type_q8_0", GemmWeight::from_ggml(GgmlType::Q8_0).is_err()),
+            (
+                "type_iq2_xs",
+                GemmWeight::from_ggml(GgmlType::IQ2_XS).is_err(),
+            ),
             ("k_not_256", GemmAct::new(stream, 8, 1000).is_err()),
             (
                 "slots_over_limit",
@@ -1861,6 +1987,7 @@ mod gate {
             gpu: &gpu,
             gk: GemmKernels::load(gpu.context())?,
             q6s: Q6kSelKernels::load(gpu.context(), gpu.fault_word())?,
+            iqk: IqKernels::load(gpu.context())?,
         };
         let mut ok = true;
 
@@ -1971,6 +2098,7 @@ mod gate {
         if wanted("v41_gate_q3k") {
             ok &= v41_cases(&dev, dims)?;
         }
+        ok &= q38_cases(&dev)?;
         ok &= dense_case(&dev)?;
         ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
@@ -2038,6 +2166,205 @@ mod gate {
         Ok(ok)
     }
 
+    /// Token counts of the Qwen3.8 i-quant cases: ten slots a token cap the
+    /// route table at 36,864 slots, so the largest count is 3686 tokens.
+    const Q38_TOKENS: [usize; 8] = [1, 15, 16, 17, 64, 511, 512, 3686];
+
+    /// The q8_1 quantizer's Q4_K slot of value-order word `v` (gate_iq's
+    /// helper): the i-quant row kernels read their columns in that
+    /// permutation.
+    fn q4_slot(v: usize) -> usize {
+        256 * (v >> 8) + 32 * (v & 7) + 8 * ((v >> 6) & 3) + ((v >> 3) & 7)
+    }
+
+    /// The max relative difference of the grouped GEMM's T = 1 outputs to the
+    /// i-quant row cores (`iq3_xxs_rows`, `iq4_xs_rows`) over the same host
+    /// q8_1 codes: the row kernels run the whole repacked stack
+    /// (`IqFormat::repack`) against the run's columns, each slot read at its
+    /// expert's rows of the launch's `y`. A diagnostic, not a pin.
+    fn iq_rows_diag(
+        dev: &Dev<'_>,
+        st: &Stack<'_>,
+        res: &mut Resident,
+        seed: u64,
+    ) -> Result<f64, GateError> {
+        let stream = dev.gpu.stream();
+        let fmt = match st.ty {
+            GemmWeight::Iq3Xxs => IqFormat::Iq3Xxs,
+            GemmWeight::Iq4Xs => IqFormat::Iq4Xs,
+            _ => return Err("iq_rows_diag: not an i-quant stack".into()),
+        };
+        let ids = route_ids(
+            Routing::Uniform,
+            1,
+            st.input.top_k(),
+            st.n_exp,
+            seed ^ 0xd1a6,
+        );
+        let n_slots = ids.len();
+        let x = activations(st.k, st.input.cols(n_slots), (seed as u32) ^ 0xd1a7);
+        let xd = DeviceBuffer::from_host(stream, &x)?;
+        let y = dev.run(st, res, &xd, &ids)?;
+        let rows = IqRows::upload(stream, fmt, &st.bytes, st.n_exp * st.rows, st.k)?;
+        let total = st.n_exp * st.rows;
+        let (codes, d8) = q8_column(&x[..st.k]);
+        let col_words = 256 * (st.k / 256).div_ceil(4);
+        let mut out = vec![0.0f32; n_slots * st.rows];
+        let mut ybuf = DeviceBuffer::<f32>::zeroed(stream, 8 * total)?;
+        for s0 in (0..n_slots).step_by(8) {
+            let m = (n_slots - s0).min(8);
+            // Every slot of the one token reads its one column.
+            let mut q = vec![0u32; m * col_words];
+            for c in 0..m {
+                for v in 0..st.k / 4 {
+                    q[c * col_words + q4_slot(v)] =
+                        u32::from_le_bytes(std::array::from_fn(|i| codes[4 * v + i] as u8));
+                }
+            }
+            let (qd, dd) = (
+                DeviceBuffer::from_host(stream, &q)?,
+                DeviceBuffer::from_host(stream, &d8.repeat(m))?,
+            );
+            dev.iqk
+                .enqueue_rows(stream, &rows, &qd, &dd, m, &mut ybuf)?;
+            let got = ybuf.to_host_vec(stream)?;
+            for s in s0..s0 + m {
+                let at = (s - s0) * total + ids[s] as usize * st.rows;
+                out[s * st.rows..(s + 1) * st.rows].copy_from_slice(&got[at..at + st.rows]);
+            }
+        }
+        Ok(rel_diff(&y, &out))
+    }
+
+    /// A NaN f16 `d` in the first super-block of every row of expert 0 makes
+    /// every output of the slots that read it NaN — no silent failure: a
+    /// T = 1 run with every slot on expert 0.
+    fn iq_nan_d(dev: &Dev<'_>, st: &Stack<'_>, seed: u64) -> Result<bool, GateError> {
+        let stream = dev.gpu.stream();
+        let top_k = st.input.top_k();
+        let bb = st.ty.block_bytes() * st.k / 256;
+        let mut bytes = st.bytes.to_vec();
+        for r in 0..st.rows {
+            bytes[r * bb..r * bb + 2].copy_from_slice(&0x7e00u16.to_le_bytes());
+        }
+        let st = Stack {
+            name: format!("{}_nan_d", st.name),
+            ty: st.ty,
+            bytes: bytes.into(),
+            n_exp: st.n_exp,
+            rows: st.rows,
+            k: st.k,
+            input: st.input,
+        };
+        let mut res = dev.resident_at(&st, top_k)?;
+        let ids = vec![0u32; top_k];
+        let x = activations(st.k, 1, (seed as u32) ^ 0xd1a9);
+        let xd = DeviceBuffer::from_host(stream, &x)?;
+        let y = dev.run(&st, &mut res, &xd, &ids)?;
+        let nan = y.iter().all(|v| v.is_nan());
+        println!(
+            "gemm case={}_nan_d ty={:?} every_output_nan={nan} {}",
+            st.name,
+            st.ty,
+            verdict(nan)
+        );
+        Ok(nan)
+    }
+
+    /// The Qwen3.8 i-quant cases (the card route `arch/qwen3moe/wide38.rs`
+    /// wires): synthetic IQ3_XXS and IQ4_XS stacks of the routed gate shape —
+    /// 64 experts of 640 rows, K 2560, top-10, every slot its token's column,
+    /// the blocks cycled from the ref-synth dump — and an IQ3_XXS stack of
+    /// 400 rows an expert (a partial 128-row slab). Each runs the four
+    /// routings at [`Q38_TOKENS`] through [`run_case_at`], the T = 1 outputs
+    /// against the i-quant row cores, a NaN `d` super-block's outputs NaN,
+    /// `from_ggml`'s acceptance of the two types, and the host API's refusal
+    /// of the other i-quant type's stack.
+    fn q38_cases(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if ![
+            "q38_iq3xxs_gate_synth",
+            "q38_iq4xs_gate_synth",
+            "q38_iq3xxs_ragged_rows_synth",
+        ]
+        .iter()
+        .any(|&n| wanted(n))
+        {
+            return Ok(true);
+        }
+        let accept = GemmWeight::from_ggml(GgmlType::IQ3_XXS)
+            .is_ok_and(|t| t == GemmWeight::Iq3Xxs)
+            && GemmWeight::from_ggml(GgmlType::IQ4_XS).is_ok_and(|t| t == GemmWeight::Iq4Xs);
+        println!(
+            "gemm case=q38_types from_ggml(iq3_xxs, iq4_xs)={} {}",
+            if accept { "accepted" } else { "REFUSED" },
+            verdict(accept)
+        );
+        let mut ok = accept;
+        for (name, ty, seed) in [
+            ("q38_iq3xxs_gate_synth", GemmWeight::Iq3Xxs, 0x5e7u64),
+            ("q38_iq4xs_gate_synth", GemmWeight::Iq4Xs, 0x5e9),
+        ] {
+            if !wanted(name) {
+                continue;
+            }
+            let (n_exp, rows, k, top_k) = (64usize, 640usize, 2560usize, 10usize);
+            let st = Stack {
+                name: name.into(),
+                ty,
+                bytes: synth_blocks(ty, n_exp * rows * k / 256, seed).into(),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(top_k),
+            };
+            let mut res = dev.resident_at(&st, Q38_TOKENS[Q38_TOKENS.len() - 1] * top_k)?;
+            ok &= run_case_at(dev, &st, seed ^ 0x61, &Q38_TOKENS)?;
+            let diag = iq_rows_diag(dev, &st, &mut res, seed)?;
+            println!("gemm case={name} rows_diag_max_rel_diff_vs_iq_rows={diag:.3e} (diagnostic)");
+            ok &= iq_nan_d(dev, &st, seed)?;
+            // The host API refuses the other i-quant type on this stack.
+            let stream = dev.gpu.stream();
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, top_k * rows)?;
+            let other = if ty == GemmWeight::Iq3Xxs {
+                GemmWeight::Iq4Xs
+            } else {
+                GemmWeight::Iq3Xxs
+            };
+            let refused = dev.gk.enqueue_gemm(
+                stream,
+                GemmArgs {
+                    ty: other,
+                    w: &res.w,
+                    rows_per_expert: rows,
+                    act: &res.act,
+                    route: &res.route,
+                    input: GemmInput::Shared { top_k },
+                    y: &mut y,
+                },
+            );
+            let pass = refused.is_err();
+            println!(
+                "gemm case={name} other_iq_type_on_stack_refused={pass} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        if wanted("q38_iq3xxs_ragged_rows_synth") {
+            let (n_exp, rows, k) = (16usize, 400usize, 2560usize);
+            let st = Stack {
+                name: "q38_iq3xxs_ragged_rows_synth".into(),
+                ty: GemmWeight::Iq3Xxs,
+                bytes: synthetic(GemmWeight::Iq3Xxs, n_exp * rows * k / 256, 0x5ea).into(),
+                n_exp,
+                rows,
+                k,
+                input: Input::Shared(4),
+            };
+            ok &= run_case_at(dev, &st, 0x73, &TOKENS)?;
+        }
+        Ok(ok)
+    }
+
     /// `--bench-kernels`: the grouped int8 GEMM's launch cost, the eager
     /// burst and the graph replay of each arm (`bench op=` rows), timed by
     /// `tools/ref/time-gate.sh` under the machine lease. Weight and activation
@@ -2073,13 +2400,14 @@ mod gate {
                     }
                 };
             if let Some(arm) = only.as_deref() {
-                return if gemm_arms(gpu, Some(arm))? {
+                return if gemm_arms(gpu, Some(arm))? || iq_gemm_arms(gpu, Some(arm))? {
                     Ok(())
                 } else {
                     Err(format!("gate_gemm: --bench-arm {arm} names no grouped-GEMM arm").into())
                 };
             }
             gemm_arms(gpu, None)?;
+            iq_gemm_arms(gpu, None)?;
             Ok(())
         }
 
@@ -2198,6 +2526,136 @@ mod gate {
             Ok(ran)
         }
 
+        /// The i-quant arms of the two GEMM families at the Qwen3.8 card
+        /// route's shapes (`gate_gemm`'s q38 cases): the routed gate — 64
+        /// experts of 640 × 2560, top-10's shape — for IQ3_XXS and IQ4_XS, and
+        /// the routed down — 64 experts of 2560 rows × K 640, each slot its
+        /// own column — for IQ4_NL. Ten slots a token pass the route table's
+        /// 36,864-slot cap at 4096 tokens, so every arm runs 4096 tokens of
+        /// nine slots: the table's cap, the heaviest launch of the shape.
+        /// `only` keeps the one arm of that name; the return says whether any
+        /// arm ran.
+        fn iq_gemm_arms(gpu: &bloomery_gpu::Gpu, only: Option<&str>) -> Result<bool, GateError> {
+            use bloomery_gpu::gemm::{
+                Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput,
+                GemmKernels, GemmRoute, GemmWeight,
+            };
+            let stream = gpu.stream();
+            let mut ran = false;
+            let gk = GemmKernels::load(gpu.context())?;
+            let sink = gpu.unlabelled_sink();
+            for (ty, op, words, bb) in [
+                (
+                    GemmWeight::Iq3Xxs,
+                    "gemm_iq3xxs_moe_t4096",
+                    245usize,
+                    98usize,
+                ),
+                (GemmWeight::Iq4Xs, "gemm_iq4xs_moe_t4096", 340, 136),
+            ] {
+                if only.is_some_and(|o| o != op) {
+                    continue;
+                }
+                ran = true;
+                let (n_exp, top_k, rows, k, t) = (64usize, 9usize, 640usize, 2560usize, 4096usize);
+                let n_rows = n_exp * rows;
+                let w = DeviceTensor::<u32>::upload(
+                    stream,
+                    &fill_pattern(n_rows * words),
+                    n_rows,
+                    words,
+                )?;
+                let n_slots = t * top_k;
+                let xs = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(t * k))?;
+                let mut act = GemmAct::new(stream, t, k)?;
+                gpu.enqueue_quantize_gemm(&xs, t, &mut act, sink)?;
+                let ids = gemm_ids(t, top_k, n_exp);
+                let ids_d = DeviceBuffer::<u32>::from_host(stream, &ids)?;
+                let mut route = GemmRoute::new(stream, n_slots, n_exp)?;
+                let mut rt =
+                    |s: &CudaStream| gk.enqueue_route(s, &ids_d, n_slots, &mut route, sink);
+                rt(stream)?;
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, n_slots * rows)?;
+                let mut enq = |s: &CudaStream| {
+                    gk.enqueue_gemm(
+                        s,
+                        GemmArgs {
+                            ty,
+                            w: &w,
+                            rows_per_expert: rows,
+                            act: &act,
+                            route: &route,
+                            input: GemmInput::Shared { top_k },
+                            y: &mut y,
+                        },
+                    )
+                };
+                let e = burst(stream, &mut enq)?;
+                let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+                let r = replay(stream, &g)?;
+                let mut hit = vec![false; n_exp];
+                for &i in &ids {
+                    hit[i as usize] = true;
+                }
+                let experts = hit.iter().filter(|&&h| h).count();
+                let n_sb = k / 256;
+                // The weights of the experts a slot picked, the activation
+                // buffers the launch reads, and the outputs it writes.
+                let bytes = (experts * rows * bb * n_sb
+                    + t * (4 * 128 * n_sb.div_ceil(2) + 4 * 8 * n_sb + 4 * 2 * n_sb)
+                    + 4 * n_slots * rows) as u64;
+                print_arm(op, rows, bytes, g.node_count(), e, r);
+            }
+            {
+                let op = "gemm_iq4nl_down_t4096";
+                if only.is_some_and(|o| o != op) {
+                    return Ok(ran);
+                }
+                ran = true;
+                let g32 = Gemm32Kernels::load(gpu.context())?;
+                let (n_exp, top_k, rows, k, t) = (64usize, 9usize, 2560usize, 640usize, 4096usize);
+                let n_rows = n_exp * rows;
+                // 18 bytes a block, 20 blocks: 360 bytes = 90 words a row.
+                let w =
+                    DeviceTensor::<u32>::upload(stream, &fill_pattern(n_rows * 90), n_rows, 90)?;
+                let n_slots = t * top_k;
+                let xs = DeviceBuffer::<f32>::from_host(stream, &fill_pattern_f32(n_slots * k))?;
+                let mut act = GemmAct32::new(stream, n_slots, k)?;
+                g32.enqueue_quantize_gemm32(stream, &xs, n_slots, &mut act, sink)?;
+                let ids = gemm_ids(t, top_k, n_exp);
+                let ids_d = DeviceBuffer::<u32>::from_host(stream, &ids)?;
+                let mut route = GemmRoute::new(stream, n_slots, n_exp)?;
+                gk.enqueue_route(stream, &ids_d, n_slots, &mut route, sink)?;
+                let mut y = DeviceBuffer::<f32>::zeroed(stream, n_slots * rows)?;
+                let mut enq = |s: &CudaStream| {
+                    g32.enqueue_gemm32(
+                        s,
+                        Gemm32Args {
+                            w: Gemm32Weight::Iq4NlFile(&w),
+                            rows_per_expert: rows,
+                            act: &act,
+                            route: &route,
+                            input: GemmInput::PerSlot,
+                            y: &mut y,
+                        },
+                    )
+                };
+                let e = burst(stream, &mut enq)?;
+                let g = gpu.capture(|s| (0..N).try_for_each(|_| enq(s)))?;
+                let r = replay(stream, &g)?;
+                let mut hit = vec![false; n_exp];
+                for &i in &ids {
+                    hit[i as usize] = true;
+                }
+                let experts = hit.iter().filter(|&&h| h).count();
+                let bytes = (experts * rows * 18 * (k / 32)
+                    + n_slots * (4 * 16 * act.steps() + 4 * 2 * act.steps())
+                    + 4 * n_slots * rows) as u64;
+                print_arm(op, rows, bytes, g.node_count(), e, r);
+            }
+            Ok(ran)
+        }
+
         /// The int8 dense tensor peak of the card named `name`, in TOPS — GA102
         /// whitepaper figures, the denominator the prefill literature report uses —
         /// or `None` for a card not listed.
@@ -2236,7 +2694,8 @@ mod gate {
     /// The 32-value family (`Gemm32Kernels`): module doc, last part.
     mod g32 {
         use super::{
-            Lcg, Routing, SENT, fnv, pad, route_ids, route_ref, row_checked, synthetic, wanted,
+            Lcg, ROUTINGS, Routing, SENT, TOKENS, fnv, pad, route_ids, route_ref, row_checked,
+            synthetic, wanted,
         };
         use bloomery_gpu::gemm::{
             Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput,
@@ -2249,6 +2708,7 @@ mod gate {
         use bloomery_gpu_gates::rounding::gamma;
         use bloomery_gpu_gates::{GateError, activations, bits_equal, bytes_to_words, verdict};
         use cuda_core::DeviceBuffer;
+        use gguf::iq_tables::KVALUES_IQ4NL;
         use gguf::quant::{GgmlType, dequant_row, half_to_f32};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2261,11 +2721,12 @@ mod gate {
         /// Rows of a dense case: two full 128-row slabs and one of 16.
         const ROWS: usize = 272;
 
-        /// The three layouts under test.
+        /// The four layouts under test.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum Lay {
             Q8Plane,
             Q8File,
+            Iq4Nl,
             Q51,
         }
 
@@ -2346,6 +2807,59 @@ mod gate {
                 }
             }
             Ok((Wts { k, bytes, d, m, q }, decode_ok))
+        }
+
+        /// `n_rows` rows of IQ4_NL blocks from `seed`, decoded: per block a
+        /// finite f16 `d` and 16 random code bytes, their low nibbles values
+        /// `0..16` and their high nibbles `16..32`, each a `kvalues_iq4nl`
+        /// entry; the decode is checked against ggml's `dequant_row` bit for
+        /// bit (d·kv is one f32 product on both sides).
+        fn weights_iq4nl(n_rows: usize, k: usize, seed: u64) -> Result<(Wts, bool), GateError> {
+            let mut g = Lcg(seed);
+            let kb = k / 32;
+            let mut bytes = vec![0u8; n_rows * kb * 18];
+            let (mut d, mut q) = (
+                Vec::with_capacity(n_rows * kb),
+                Vec::with_capacity(n_rows * k),
+            );
+            for blk in bytes.as_chunks_mut::<18>().0 {
+                for b in blk.iter_mut() {
+                    *b = g.next() as u8;
+                }
+                let db = f16_bits(&mut g, false);
+                blk[0..2].copy_from_slice(&db.to_le_bytes());
+                d.push(half_to_f32(db));
+                for j in 0..16 {
+                    q.push(KVALUES_IQ4NL[usize::from(blk[2 + j] & 0x0f)]);
+                }
+                for j in 0..16 {
+                    q.push(KVALUES_IQ4NL[usize::from(blk[2 + j] >> 4)]);
+                }
+            }
+            let mut want = vec![0.0f32; k];
+            let mut decode_ok = true;
+            for r in 0..n_rows {
+                dequant_row(
+                    GgmlType::IQ4_NL,
+                    &bytes[r * kb * 18..(r + 1) * kb * 18],
+                    &mut want,
+                )?;
+                for (v, &w) in want.iter().enumerate() {
+                    let b = r * kb + v / 32;
+                    let mine = f64::from(d[b]) * f64::from(q[r * k + v]);
+                    decode_ok &= mine as f32 == w;
+                }
+            }
+            Ok((
+                Wts {
+                    k,
+                    bytes,
+                    d,
+                    m: vec![0.0; n_rows * kb],
+                    q,
+                },
+                decode_ok,
+            ))
         }
 
         /// The device planes of the first `n` columns equal the host's bit
@@ -2508,10 +3022,17 @@ mod gate {
         }
 
         impl Res {
-            fn new(dev: &Dev<'_>, w: &Wts, q51: bool, n_rows: usize) -> Result<Res, GateError> {
+            /// `no_plane` for the layouts without q8f32 planes (Q5_1,
+            /// IQ4_NL): the stack goes up as the file's words alone.
+            fn new(
+                dev: &Dev<'_>,
+                w: &Wts,
+                no_plane: bool,
+                n_rows: usize,
+            ) -> Result<Res, GateError> {
                 let stream = dev.gpu.stream();
                 let kb = w.k / 32;
-                let plane = if q51 {
+                let plane = if no_plane {
                     None
                 } else {
                     let qs: Vec<u32> =
@@ -2550,6 +3071,7 @@ mod gate {
                         Gemm32Weight::Q8_0Plane { qs, d }
                     }
                     Lay::Q8File => Gemm32Weight::Q8_0File(&self.file),
+                    Lay::Iq4Nl => Gemm32Weight::Iq4NlFile(&self.file),
                     Lay::Q51 => Gemm32Weight::Q5_1File(&self.file),
                 })
             }
@@ -3106,7 +3628,7 @@ mod gate {
                                 "-".to_string()
                             }
                             Lay::Q8File => bits_equal(&got, &y8).to_string(),
-                            Lay::Q51 => "-".to_string(),
+                            Lay::Iq4Nl | Lay::Q51 => "-".to_string(),
                         };
                         let fault = gpu.take_fault()?;
                         let pass = act_ok
@@ -3306,6 +3828,200 @@ mod gate {
                         ok &= pass;
                     }
                 }
+            }
+            Ok(ok)
+        }
+
+        /// The IQ4_NL down of the Qwen3.8 card route (`gemm_iq4nl`): a
+        /// synthetic stack of 64 experts × 2560 rows at K 640 (random nibble
+        /// codes, finite f16 `d`), each slot its own column, the four routings
+        /// at TOKENS; the decode against ggml's `dequant_row`, every output
+        /// in its band and bit for bit the contract with `y_fnv`, a rerun
+        /// bit-identical, a NaN `d` block's outputs NaN, and the host API's
+        /// refusal of the stack at another K.
+        fn iq4nl_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g38_iq4nl") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let (n_exp, rows, k) = (64usize, 2560usize, 640usize);
+            let (w, dec) = weights_iq4nl(n_exp * rows, k, 0x3600)?;
+            let res = Res::new(dev, &w, true, n_exp * rows)?;
+            let max_slots = TOKENS[TOKENS.len() - 1];
+            let mut route = GemmRoute::new(stream, max_slots, n_exp)?;
+            let mut ids_d = DeviceBuffer::<u32>::zeroed(stream, max_slots)?;
+            let mut act = GemmAct32::new(stream, max_slots, k)?;
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, max_slots * rows)?;
+            let mut ok = true;
+            gpu.clear_fault()?;
+            for &t in &TOKENS {
+                for (ri, &r) in ROUTINGS.iter().enumerate() {
+                    let ids = route_ids(r, t, 1, n_exp, 0x39 ^ (t as u64) << 6 ^ ri as u64);
+                    let n_slots = ids.len();
+                    let x = activations(k, n_slots, 9900 + (t + ri) as u32);
+                    let xd = DeviceBuffer::from_host(stream, &x)?;
+                    dev.g32
+                        .enqueue_quantize_gemm32(stream, &xd, n_slots, &mut act, sink)?;
+                    ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
+                    dev.gk
+                        .enqueue_route(stream, &ids_d, n_slots, &mut route, sink)?;
+                    let got = gemm(
+                        dev,
+                        &res,
+                        Lay::Iq4Nl,
+                        rows,
+                        &act,
+                        &route,
+                        GemmInput::PerSlot,
+                        &mut y,
+                        n_slots,
+                    )?;
+                    let (ha, _) = host_act(&x, k, n_slots);
+                    let unwritten = got.iter().filter(|v| v.to_bits() == SENT.to_bits()).count();
+                    let Checked {
+                        checked,
+                        band_off,
+                        bits_off,
+                        worst,
+                        first,
+                        ..
+                    } = check(
+                        &w,
+                        false,
+                        rows,
+                        &ha,
+                        &|s| Some(ids[s] as usize),
+                        &|s| s,
+                        &got,
+                        n_slots,
+                    );
+                    let fault = gpu.take_fault()?;
+                    let pass =
+                        dec && unwritten == 0 && band_off == 0 && bits_off == 0 && fault.is_none();
+                    println!(
+                        "gemm32 case=g38_iq4nl down T={t} routing={r:?} slots={n_slots} \
+                         decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
+                         worst_err_over_band={worst:.3} band_off={band_off} \
+                         contract_bits_differ={bits_off} y_fnv={:016x} {}",
+                        fnv(&got),
+                        verdict(pass)
+                    );
+                    if let Some(f) = first {
+                        println!("gemm32 case=g38_iq4nl down T={t} first_failure: {f}");
+                    }
+                    ok &= pass;
+                }
+            }
+            // A rerun at 64 tokens is bit for bit the first run.
+            {
+                let t = 64;
+                let ids = route_ids(Routing::Uniform, t, 1, n_exp, 0x3a);
+                let x = activations(k, ids.len(), 9950);
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
+                dev.gk
+                    .enqueue_route(stream, &ids_d, ids.len(), &mut route, sink)?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &xd, ids.len(), &mut act, sink)?;
+                let a = gemm(
+                    dev,
+                    &res,
+                    Lay::Iq4Nl,
+                    rows,
+                    &act,
+                    &route,
+                    GemmInput::PerSlot,
+                    &mut y,
+                    ids.len(),
+                )?;
+                let b = gemm(
+                    dev,
+                    &res,
+                    Lay::Iq4Nl,
+                    rows,
+                    &act,
+                    &route,
+                    GemmInput::PerSlot,
+                    &mut y,
+                    ids.len(),
+                )?;
+                let same = bits_equal(&a, &b);
+                println!("gemm32 case=g38_iq4nl rerun_bits={same} {}", verdict(same));
+                ok &= same;
+            }
+            // A NaN f16 `d` in block 0 of expert 0's row 0: the outputs of
+            // the slots on that expert's row 0 are NaN, every other output
+            // finite — no silent failure.
+            {
+                let mut bytes = w.bytes.clone();
+                bytes[0..2].copy_from_slice(&0x7e00u16.to_le_bytes());
+                let wn = Wts {
+                    k,
+                    bytes,
+                    d: w.d.clone(),
+                    m: w.m.clone(),
+                    q: w.q.clone(),
+                };
+                let resn = Res::new(dev, &wn, true, n_exp * rows)?;
+                let ids = [0u32; 8];
+                let x = activations(k, ids.len(), 9960);
+                let xd = DeviceBuffer::from_host(stream, &x)?;
+                ids_d.copy_from_host(stream, &pad(&ids, ids_d.len()))?;
+                dev.gk
+                    .enqueue_route(stream, &ids_d, ids.len(), &mut route, sink)?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &xd, ids.len(), &mut act, sink)?;
+                let got = gemm(
+                    dev,
+                    &resn,
+                    Lay::Iq4Nl,
+                    rows,
+                    &act,
+                    &route,
+                    GemmInput::PerSlot,
+                    &mut y,
+                    ids.len(),
+                )?;
+                let row0_nan = (0..ids.len()).all(|s| got[s * rows].is_nan());
+                let rest_finite = (0..ids.len()).all(|s| {
+                    got[s * rows + 1..(s + 1) * rows]
+                        .iter()
+                        .all(|v| v.is_finite())
+                });
+                let pass = row0_nan && rest_finite;
+                println!(
+                    "gemm32 case=g38_iq4nl fault=nan_d row0_nan={row0_nan} other_rows_finite={rest_finite} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+            // The host API refuses the stack at another K's words.
+            {
+                let mut other = GemmAct32::new(stream, 8, 672)?;
+                let xd = DeviceBuffer::from_host(stream, &activations(672, 8, 9970))?;
+                dev.g32
+                    .enqueue_quantize_gemm32(stream, &xd, 8, &mut other, sink)?;
+                let wgt = res.weight(Lay::Iq4Nl)?;
+                let mut y8 = DeviceBuffer::<f32>::zeroed(stream, 8 * rows)?;
+                let err = dev.g32.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w: wgt,
+                        rows_per_expert: rows,
+                        act: &other,
+                        route: &route,
+                        input: GemmInput::PerSlot,
+                        y: &mut y8,
+                    },
+                );
+                let pass = err.is_err_and(|e| e.to_string().contains("IQ4_NL rows at K = 672"));
+                println!(
+                    "gemm32 case=g38_iq4nl refusal_other_k_refused={pass} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
             }
             Ok(ok)
         }
@@ -3772,6 +4488,17 @@ mod gate {
                     "Q5_1 rows at K =",
                 ),
                 (
+                    "iq4nl_layout_at_q8_0_words",
+                    gemm(
+                        Gemm32Weight::Iq4NlFile(&r8.file),
+                        rows,
+                        &act,
+                        &route,
+                        &mut y,
+                    ),
+                    "IQ4_NL rows at K =",
+                ),
+                (
                     "plane_shape",
                     gemm(
                         Gemm32Weight::Q8_0Plane { qs, d: &d_wide },
@@ -3856,6 +4583,7 @@ mod gate {
             ok &= swiglu_act_case(&dev)?;
             ok &= dense_case(&dev)?;
             ok &= routed_case(&dev)?;
+            ok &= iq4nl_case(&dev)?;
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
             ok &= refusals(&dev)?;
