@@ -29,7 +29,7 @@ brew install midagedev/tap/bloomery        # Linux x86-64, NVIDIA sm_86+
 bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
-## Status (0.2.3)
+## Status (0.2.4)
 
 | Area | State |
 |---|---|
@@ -43,16 +43,6 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | MTP draft (Qwen3.8, GLM-5.3) | On by default |
 | Cards | One card, or one card plus one expert-tier card (`--place bp`) |
 | Vision input (V4.1) | Not in this release |
-
-**Known issues in 0.2.3** (fixed in 0.2.4):
-
-- **DeepSeek-V4.1 on one 24 GB card (RTX 3090, 4090) with no flags refuses to load**, naming
-  `SwapMachine::new: … card slots for 40 pinned`. The default adaptive residency asks for more card room than the
-  plan leaves. Start that one command with the setting in front:
-  `BLOOMERY_RESIDENCY=off bloomery-serve --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M` (exported, it makes the other
-  seats refuse at the start).
-- **Qwen3-30B, Qwen3.6 and Clef-Flash on a machine with two cards of different sizes** load on CUDA device 0, which
-  may be the smaller card. Pick the larger one with `CUDA_VISIBLE_DEVICES`.
 
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
 [`docs/serving.md`](docs/serving.md#limits).
@@ -74,12 +64,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.2.3-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.3-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.2.4-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.2.4-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.2.3](https://github.com/midagedev/bloomery/releases/tag/v0.2.3)). From source: [`docs/BUILD.md`](docs/BUILD.md).
+([0.2.4](https://github.com/midagedev/bloomery/releases/tag/v0.2.4)). From source: [`docs/BUILD.md`](docs/BUILD.md).
 
 ## Use
 
