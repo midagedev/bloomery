@@ -19,7 +19,8 @@
 #
 # Environment: VISION_PYTHON (default /home/user/ft/bin/python3, the torch environment), VISION_CKPT
 # (default /models/DeepSeek-V4.1-Flash-fp8), VISION_MMPROJ (default: smalinin's BF16 mmproj under the
-# checkpoint's mmproj/), BLOOMERY_VISION_SET (default deepseek41v).
+# checkpoint's mmproj/), BLOOMERY_VISION_SET (default deepseek41v), VISION_IMAGES (default images/ beside this
+# script; the fork comparison's set deepseek41v-scenes is dumped from scenes/, `just dump-ref-visref`).
 set -euo pipefail
 HERE=${BASH_SOURCE[0]%/*}
 # shellcheck source=tools/ref/ref-paths.sh
@@ -37,7 +38,7 @@ case $BOUND in
 esac
 [ -x "$PY" ] || { echo "dump-vision.sh: no python at $PY" >&2; exit 2; }
 [ -f "$MMPROJ" ] || { echo "dump-vision.sh: no mmproj at $MMPROJ" >&2; exit 2; }
-IMAGES=$(cd "$HERE/images" && pwd)
+IMAGES=$(cd "${VISION_IMAGES:-$HERE/images}" && pwd) || { echo "dump-vision.sh: no image directory ${VISION_IMAGES:-}" >&2; exit 2; }
 
 ROOT="$BLOOMERY_DATA/ref-vision"
 REF="$ROOT/$SET"

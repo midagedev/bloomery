@@ -1682,6 +1682,18 @@ markov-accept *ARGS:
 dump-ref-vision:
     ./tools/box.sh 'bash tools/ref/vision/dump-vision.sh'
 
+# The V4.1 vision fork comparison (tools/ref/vision/): smalinin's llama.cpp fork at its pin, built under
+# ~/repo/bloomery-visref-fork on the box with its row-injection harness visref_fork (build-fork.sh, CPU only, ~4 min).
+build-visref-fork:
+    ./tools/box.sh 'bash tools/ref/vision/build-fork.sh'
+
+# The fork comparison's set: the official encoder's rows of tools/ref/vision/scenes/ (dump-vision.sh, set
+# deepseek41v-scenes), then the fork's greedy answers and logits on each scene and two text controls per scene
+# (visref.sh) into $BLOOMERY_DATA/ref-visref/deepseek41-scenes, family visref-deepseek41. Not timed, no lease; the
+# fork runs under the card's gate lock and the V4.1 load lock.
+dump-ref-visref:
+    ./tools/box.sh 'BLOOMERY_VISION_SET=deepseek41v-scenes VISION_IMAGES=tools/ref/vision/scenes bash tools/ref/vision/dump-vision.sh && bash tools/ref/vision/visref.sh'
+
 # JPEG decoder fixtures: dump-jpeg.py on the box encodes crops of tools/ref/vision/images/ with the system Pillow and
 # decodes each file the way the reference does (its header lists the files); the set comes back whole into
 # crates/vision/tests/fixtures/jpeg/, which the image tests read. Another libjpeg writes other bytes: commit the set whole.

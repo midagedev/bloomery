@@ -19,6 +19,7 @@
 //! - [`greedy`]: ik's greedy continuations (`tools/ref/argmax_ref.cpp`).
 //! - [`kld`]: ik's KL-divergence base runs (`tools/ref/ik-ppl.sh`).
 //! - [`vision`]: the vision encoder's oracle (`tools/ref/vision/dump_vision.py`).
+//! - [`visref`]: the V4.1 vision fork comparison (`tools/ref/vision/visref.sh`).
 //!
 //! Every manifest row is read by the column names its header line gives
 //! that kind of row, never by position.
@@ -34,6 +35,7 @@ pub mod ik;
 pub mod kld;
 pub mod mtpref;
 pub mod vision;
+pub mod visref;
 
 /// Why a reference set cannot be used.
 #[derive(Debug, thiserror::Error)]
