@@ -574,6 +574,16 @@ dump-ref-mtp-qwen4exp:
 dump-ref-qwen4exp *VARIANT:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
 
+# The Qwen3.8-Flash-Next UD-Q3_K_XL oracle: the same dump tool under the qwen4exp-q3 profile
+# (tools/ref/models/qwen4exp-q3.sh) — ik on the CPU over the Q3 split set, into
+# $BLOOMERY_DATA/ref_qwen4exp_q3/ (refset family ik-qwen4exp-q3, one name for one with the Q4
+# family's sets). VARIANT (step4, d1k, d3k and the -every-node suffix) dumps a decode step into its
+# own set, as dump-ref-qwen4exp's does, over the same corpus ids (the same model's tokenizer). Each
+# dump lifts the whole 90.0 GB split set into the page cache under the CPU lease, so it needs a card
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q38q3ref-dump.card').
+dump-ref-qwen4exp-q3 *VARIANT:
+    BLOOMERY_MODEL=qwen4exp-q3 ./tools/box.sh 'bash tools/ref/dump.sh {{VARIANT}}'
+
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
 build-ref-dump-draft:

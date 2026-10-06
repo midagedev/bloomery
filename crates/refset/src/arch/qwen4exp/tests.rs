@@ -1,5 +1,6 @@
-use super::{ARCH, IK, IK_BUILD, MODEL};
+use super::{ARCH, IK, IK_BUILD, IK_Q3, MODEL, MODEL_Q3, Q3, Q4, dumps_of};
 use crate::RefError;
+use crate::family::Family;
 use std::path::{Path, PathBuf};
 
 /// A fresh directory for one test's set; tests of one process run in
@@ -16,7 +17,14 @@ fn set_dir(what: &str) -> Result<PathBuf, RefError> {
 /// The family's check of a set of the node dumps' shape at `dir`: the
 /// header lines given, one tensor row, and the completion trailer when
 /// `complete`.
-fn check(dir: &Path, model: &str, build: &str, arch: &str, complete: bool) -> Result<(), RefError> {
+fn check(
+    dir: &Path,
+    family: &Family,
+    model: &str,
+    build: &str,
+    arch: &str,
+    complete: bool,
+) -> Result<(), RefError> {
     let mut lines = vec![
         "# dump_ref — ik_llama.cpp intermediate tensors, raw f32, little-endian".to_string(),
         format!("# model\t{model}"),
@@ -31,7 +39,7 @@ fn check(dir: &Path, model: &str, build: &str, arch: &str, complete: bool) -> Re
     let path = dir.join("MANIFEST.tsv");
     std::fs::write(&path, lines.join("\n") + "\n")
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    IK.check_set(dir).map(|_| ())
+    family.check_set(dir).map(|_| ())
 }
 
 fn remove(dir: &Path) -> Result<(), RefError> {
@@ -43,7 +51,7 @@ fn remove(dir: &Path) -> Result<(), RefError> {
 #[test]
 fn the_family_takes_a_set_of_its_file_build_and_arch() -> Result<(), RefError> {
     let dir = set_dir("own")?;
-    check(&dir, MODEL, IK_BUILD, ARCH, true)?;
+    check(&dir, &IK, MODEL, IK_BUILD, ARCH, true)?;
     let p = IK.check_set(&dir)?;
     assert_eq!(p.dumped_from, MODEL);
     assert_eq!(p.build.as_deref(), Some(IK_BUILD));
@@ -63,7 +71,7 @@ fn the_family_refuses_a_set_of_another_file() -> Result<(), RefError> {
         "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
         "/models/elsewhere/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
     ] {
-        match check(&dir, other, IK_BUILD, ARCH, true) {
+        match check(&dir, &IK, other, IK_BUILD, ARCH, true) {
             Err(e @ RefError::Stale { .. }) => {
                 let e = e.to_string();
                 assert!(
@@ -85,7 +93,7 @@ fn the_family_refuses_a_set_of_another_file() -> Result<(), RefError> {
 fn the_family_refuses_a_set_of_another_build() -> Result<(), RefError> {
     let dir = set_dir("build")?;
     for build in ["c10fbbcc", "db517b69-dirty"] {
-        match check(&dir, MODEL, build, ARCH, true) {
+        match check(&dir, &IK, MODEL, build, ARCH, true) {
             Err(RefError::Foreign {
                 field: "build",
                 family: "ik-qwen4exp",
@@ -107,7 +115,7 @@ fn the_family_refuses_a_set_of_another_build() -> Result<(), RefError> {
 fn the_family_refuses_a_set_of_another_arch() -> Result<(), RefError> {
     let dir = set_dir("arch")?;
     for arch in ["qwen35moe", "deepseek41"] {
-        match check(&dir, MODEL, IK_BUILD, arch, true) {
+        match check(&dir, &IK, MODEL, IK_BUILD, arch, true) {
             Err(RefError::Foreign {
                 field: "arch",
                 family: "ik-qwen4exp",
@@ -126,11 +134,87 @@ fn the_family_refuses_a_set_of_another_arch() -> Result<(), RefError> {
 fn the_family_refuses_a_set_without_its_trailer() -> Result<(), RefError> {
     let dir = set_dir("trailer")?;
     let set = dir.display().to_string();
-    match check(&dir, MODEL, IK_BUILD, ARCH, false) {
+    match check(&dir, &IK, MODEL, IK_BUILD, ARCH, false) {
         Err(RefError::Unfinished { set: s }) if s == set => {}
         r => panic!("a set without its trailer: {r:?}"),
     }
     remove(&dir)
+}
+
+/// A complete set of the UD-Q3_K_XL file, the pinned build and this
+/// architecture passes the Q3 family, and states that file and that build.
+#[test]
+fn the_q3_family_takes_a_set_of_its_file_build_and_arch() -> Result<(), RefError> {
+    let dir = set_dir("own-q3")?;
+    check(&dir, &IK_Q3, MODEL_Q3, IK_BUILD, ARCH, true)?;
+    let p = IK_Q3.check_set(&dir)?;
+    assert_eq!(p.dumped_from, MODEL_Q3);
+    assert_eq!(p.build.as_deref(), Some(IK_BUILD));
+    remove(&dir)
+}
+
+/// A set of the Q3 file offered to the Q4 family is stale, and the refusal
+/// names the set, the file it states and the Q4 file the tree runs.
+#[test]
+fn the_q4_family_refuses_a_set_of_the_q3_file() -> Result<(), RefError> {
+    let dir = set_dir("cross-q3")?;
+    let set = dir.display().to_string();
+    match check(&dir, &IK, MODEL_Q3, IK_BUILD, ARCH, true) {
+        Err(e @ RefError::Stale { .. }) => {
+            let e = e.to_string();
+            assert!(
+                e.contains(&set)
+                    && e.contains(&format!("dumped from {MODEL_Q3}"))
+                    && e.contains(&format!("the tree runs {MODEL}")),
+                "{e}"
+            );
+        }
+        r => panic!("the Q4 family reading a set of {MODEL_Q3}: {r:?}"),
+    }
+    remove(&dir)
+}
+
+/// The reverse: a set of the Q4 file offered to the Q3 family is stale,
+/// naming the set, the file it states and the Q3 file the tree runs.
+#[test]
+fn the_q3_family_refuses_a_set_of_the_q4_file() -> Result<(), RefError> {
+    let dir = set_dir("cross-q4")?;
+    let set = dir.display().to_string();
+    match check(&dir, &IK_Q3, MODEL, IK_BUILD, ARCH, true) {
+        Err(e @ RefError::Stale { .. }) => {
+            let e = e.to_string();
+            assert!(
+                e.contains(&set)
+                    && e.contains(&format!("dumped from {MODEL}"))
+                    && e.contains(&format!("the tree runs {MODEL_Q3}")),
+                "{e}"
+            );
+        }
+        r => panic!("the Q3 family reading a set of {MODEL}: {r:?}"),
+    }
+    remove(&dir)
+}
+
+/// [`dumps_of`] picks each file's row by first shard, the row's family and
+/// set names its file's, and refuses any other file naming it and the two
+/// the program runs.
+#[test]
+fn dumps_of_picks_the_files_row_and_refuses_any_other() -> Result<(), RefError> {
+    let (q4, q3) = (dumps_of(Path::new(MODEL))?, dumps_of(Path::new(MODEL_Q3))?);
+    assert!(std::ptr::eq(q4, &Q4) && std::ptr::eq(q4.family, &IK));
+    assert!(std::ptr::eq(q3, &Q3) && std::ptr::eq(q3.family, &IK_Q3));
+    assert_eq!((q3.batch, q3.d3k), (super::BATCH_Q3, super::D3K_Q3));
+    let other = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
+    match dumps_of(Path::new(other)) {
+        Err(RefError::Missing { what, .. }) => {
+            assert!(
+                what.contains(other) && what.contains(MODEL) && what.contains(MODEL_Q3),
+                "{what}"
+            );
+        }
+        r => panic!("a file that is neither of the two: {r:?}"),
+    }
+    Ok(())
 }
 
 /// An MTP set's manifest at `dir` stating `model`, `draft` (no line when

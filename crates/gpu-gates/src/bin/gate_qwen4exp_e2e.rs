@@ -5,10 +5,13 @@
 //! card plan each eligible layer's id prefix on the card) beside a
 //! sigmoid-gated shared expert on the card, the head's mix, the q8_0 head and
 //! the argmax — loaded by its placement on the gate card, against ik's
-//! CPU oracle sets (`refset::arch::qwen4exp`: the 5-token batch set, the step
-//! after a fused 4-token prefill, the same after a prefill run node by node,
-//! the steps at positions 1,024 and 3,000 of the prose), every set read
-//! through its family.
+//! CPU oracle sets of the file it loads (`refset::arch::qwen4exp`:
+//! [`dumps`] picks the family and the set names by the first shard, the Q4
+//! file's or the Q3 file's, and refuses any other by name — the 5-token
+//! batch set, the step after a fused 4-token prefill, the same after a
+//! prefill run node by node, the steps at positions 1,024 and 3,000 of the
+//! prose), every set read through its file's family. The node counts and
+//! the clauses below are the program's: they do not depend on the file.
 //!
 //! The file opens through `PlanInputs::describe` and `Body38::open_placed`,
 //! which refuses by name every coverage item past the two the program
@@ -239,8 +242,8 @@ mod gate {
     use bloomery_gpu_gates::rounding::q8_32_rel;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_tensor_logical_in,
-        topk_ids_logical_within, verdict,
+        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_model_path,
+        ref_tensor_logical_in, topk_ids_logical_within, verdict,
     };
     use cuda_core::{DeviceBuffer, sys};
     use gguf::Split;
@@ -248,7 +251,7 @@ mod gate {
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
     use model::placement::PlanLevers;
     use model::placement::workstation::RTX_3090;
-    use refset::arch::qwen4exp::{BATCH, D1K, D3K, IK, MODEL, STEP4, STEP4_EVERY_NODE};
+    use refset::arch::qwen4exp::{Dumps, dumps_of};
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
@@ -490,6 +493,15 @@ mod gate {
         Ok(ik[at..].to_vec())
     }
 
+    /// The split set this gate loads — `$BLOOMERY_REF_MODEL`, box.sh's export
+    /// of the model profile's file (`qwen4exp` or `qwen4exp-q3`) — with its
+    /// node-dump family and set names. The node counts and the clauses are
+    /// the program's and do not depend on the file; the oracle sets are the
+    /// loaded file's, and any other file is refused by name.
+    fn dumps() -> Result<&'static Dumps, GateError> {
+        Ok(dumps_of(&ref_model_path()?)?)
+    }
+
     /// The model placed on the gate card by its plan, the routed experts
     /// where `experts` says under the placement's `plan_levers`.
     fn open(experts: Experts, plan_levers: &PlanLevers) -> Result<Qwen38Model, GateError> {
@@ -505,9 +517,10 @@ mod gate {
         slots: usize,
     ) -> Result<Qwen38Model, GateError> {
         let levers = bloomery_levers::at_main(&[])?;
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let model = dumps()?.model;
+        let file = Split::open(model).map_err(|e| format!("open {model}: {e}"))?;
         if file.architecture() != Some("qwen4exp") {
-            return Err(format!("{MODEL} is {:?}, not qwen4exp", file.architecture()).into());
+            return Err(format!("{model} is {:?}, not qwen4exp", file.architecture()).into());
         }
         let t = Instant::now();
         // `describe`, not `read`: `read` refuses the chat surface's two
@@ -993,7 +1006,7 @@ mod gate {
         band: Option<(&[u32], usize)>,
         ties: &mut usize,
     ) -> Result<(bool, Run), GateError> {
-        let man = RefManifest::open(&data_dir().join(name), &IK)?;
+        let man = RefManifest::open(&data_dir().join(name), dumps()?.family)?;
         let (pos, step, prefill) = man.step()?;
         let (pos, step, prefill) = (pos, step.to_vec(), prefill.to_vec());
         let [tok] = step[..] else {
@@ -1055,11 +1068,12 @@ mod gate {
     /// D3K's prefill by passes against `steps`, its step-fed run: the step's
     /// token, logits, layer outputs and every store bit for bit.
     fn pass_selects(m: &mut Qwen38Model, steps: &Run) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let d3k = dumps()?.d3k;
+        let man = RefManifest::open(&data_dir().join(d3k), dumps()?.family)?;
         let (_, step, prefill) = man.step()?;
         let (step, prefill) = (step.to_vec(), prefill.to_vec());
         let [tok] = step[..] else {
-            return Err(format!("{D3K}: a step of {} tokens, not one", step.len()).into());
+            return Err(format!("{d3k}: a step of {} tokens, not one", step.len()).into());
         };
         fresh(m)?;
         let t = Instant::now();
@@ -1070,7 +1084,7 @@ mod gate {
             && r.taps.iter().zip(&steps.taps).all(|(a, b)| same_bits(a, b));
         let mut ok = taps;
         println!(
-            "pass {D3K}: {} ids by passes of up to {} ({fed:.1} s, runtime value), then the \
+            "pass {d3k}: {} ids by passes of up to {} ({fed:.1} s, runtime value), then the \
              step: layer outputs bit for bit the step-fed run's: {taps}",
             prefill.len(),
             Prompt38::PASS_ROWS
@@ -1489,11 +1503,12 @@ mod gate {
     /// those rows; the pooled rows past the count poisoned, then the two
     /// steps after, the prefill's next ids.
     fn verify_deep(m: &mut Qwen38Model) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let d3k = dumps()?.d3k;
+        let man = RefManifest::open(&data_dir().join(d3k), dumps()?.family)?;
         let (_, _, prefill) = man.step()?;
         let ids = prefill
             .get(..DEEP + LANES)
-            .ok_or_else(|| format!("{D3K}: a prefill of {} ids", prefill.len()))?
+            .ok_or_else(|| format!("{d3k}: a prefill of {} ids", prefill.len()))?
             .to_vec();
         let (prefix, rows) = (Prefix::Pass(&ids[..DEEP]), &ids[DEEP..]);
         let rows: [u32; LANES] = std::array::from_fn(|i| rows[i]);
@@ -2472,7 +2487,8 @@ mod gate {
     /// every store bit for bit; the walk's cut of the selecting layers' rows
     /// against the rule's; then the step after the ubatch against ik's.
     fn gemm_d3k(m: &mut Qwen38Model, ties: &mut usize) -> Result<bool, GateError> {
-        let man = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let d3k = dumps()?.d3k;
+        let man = RefManifest::open(&data_dir().join(d3k), dumps()?.family)?;
         let (_, _, prefill) = man.step()?;
         let prefill = prefill.to_vec();
         let rows = m.body("gemm_d3k")?.ubatch_rows();
@@ -2503,7 +2519,7 @@ mod gate {
         let want = (dense, prefill.len() - dense);
         let split_ok = rows >= prefill.len() && split == Some(want);
         println!(
-            "gemm {D3K}: {} ids in one ubatch (the load's size {rows}; {fed:.1} s, runtime \
+            "gemm {d3k}: {} ids in one ubatch (the load's size {rows}; {fed:.1} s, runtime \
              value); the selecting layers' rows by the prefill flash and by the selection {split:?} \
              (want {want:?}, from KEPT and POOL) {}",
             prefill.len(),
@@ -2523,13 +2539,13 @@ mod gate {
             ple_ring: cut_ring,
         };
         ok &= same_run(
-            &format!("D3K by ubatches cut at {SPLIT} vs one ubatch"),
+            &format!("{d3k} by ubatches cut at {SPLIT} vs one ubatch"),
             &cut,
             &one,
             true,
         );
         ok &= gemm_timed(m, &prefill, &one)?;
-        ok &= step_set(m, D3K, Prompt38::Gemm, None, ties)?.0;
+        ok &= step_set(m, d3k, Prompt38::Gemm, None, ties)?.0;
         Ok(ok)
     }
 
@@ -2543,6 +2559,7 @@ mod gate {
     /// exactly when none summed, each hot expert past [`HOT_COLS`]), and
     /// `Σ m² ≥ slots²/experts` (Cauchy–Schwarz).
     fn gemm_timed(m: &mut Qwen38Model, prefill: &[u32], one: &Run) -> Result<bool, GateError> {
+        let d3k = dumps()?.d3k;
         m.set_prompt38_stats(true)?;
         fresh(m)?;
         let tok = m.prompt38(prefill, Prompt38::Gemm)?;
@@ -2582,7 +2599,7 @@ mod gate {
         };
         let rec_ok = ubatches == 1 && rows == N_LAYER && spans == N_LAYER;
         println!(
-            "gemm {D3K}: the timed walk's record: {ubatches} ubatch(es) (want 1), {rows} layer rows \
+            "gemm {d3k}: the timed walk's record: {ubatches} ubatch(es) (want 1), {rows} layer rows \
              (want {N_LAYER}), {spans} with every card span read (want {N_LAYER}) {}",
             verdict(rec_ok)
         );
@@ -2610,7 +2627,7 @@ mod gate {
         let want = rows as u64 * prefill.len() as u64 * N_USED as u64;
         let counts_ok = rec_ok && bad == 0 && sum == want;
         println!(
-            "gemm {D3K}: the timed walk's routing counts: {bad} layer row(s) off of {rows} (Σ slots \
+            "gemm {d3k}: the timed walk's routing counts: {bad} layer row(s) off of {rows} (Σ slots \
              {sum}, want rows·P·N_USED {want}; m_max {m_max}) {}",
             verdict(counts_ok)
         );
@@ -3103,7 +3120,8 @@ mod gate {
         );
         // D3K's prefill, one walk and two cut inside the selecting rows, bit
         // for bit — the only walk that crosses the route's run boundary.
-        let d3k = RefManifest::open(&data_dir().join(D3K), &IK)?;
+        let name = dumps()?.d3k;
+        let d3k = RefManifest::open(&data_dir().join(name), dumps()?.family)?;
         let (_, _, prefill) = d3k.step()?;
         let prefill = prefill.to_vec();
         fresh(m)?;
@@ -3130,7 +3148,7 @@ mod gate {
             ple_ring: cut_ring,
         };
         ok &= same_run(
-            &format!("card plan: {D3K} by ubatches cut at {SPLIT} vs one ubatch"),
+            &format!("card plan: {name} by ubatches cut at {SPLIT} vs one ubatch"),
             &cut,
             &one,
             true,
@@ -3245,7 +3263,7 @@ mod gate {
 
     /// Set `name`'s prefill ids.
     fn prefill_of(name: &str) -> Result<Vec<u32>, GateError> {
-        let man = RefManifest::open(&data_dir().join(name), &IK)?;
+        let man = RefManifest::open(&data_dir().join(name), dumps()?.family)?;
         let (_, _, prefill) = man.step()?;
         Ok(prefill.to_vec())
     }
@@ -3387,7 +3405,8 @@ mod gate {
             let rows = (1 + PASS_ROWS) * STREAMS * HIDDEN * 4;
             u64::try_from(N_GDN)? * rec + u64::try_from(N_QSA)? * sel + ple + 4 + rows as u64
         };
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let model = dumps()?.model;
+        let file = Split::open(model).map_err(|e| format!("open {model}: {e}"))?;
         let inputs = PlanInputs::describe(&file)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine_for_experts(
@@ -3431,8 +3450,8 @@ mod gate {
         let body = Slots38 {
             experts,
             plan_levers,
-            a: prefill_of(STEP4)?,
-            b: prefill_of(D1K)?,
+            a: prefill_of(dumps()?.step4)?,
+            b: prefill_of(dumps()?.d1k)?,
         };
         // PIN(2026-10-05): (y)'s interleave and bytes clauses moved to
         // slots_gate H1/H3; H4/H6/H7 (reset, select, captures) are new to (y),
@@ -3484,7 +3503,7 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let mut m = open(Experts::Host, &PlanLevers::default())?;
         let mut ok = structure(&mut m)?;
-        let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
+        let man = RefManifest::open(&data_dir().join(dumps()?.batch), dumps()?.family)?;
         let (_, toks, _) = man.step()?;
         let toks = toks.to_vec();
         ok &= head_rows(&mut m, &toks)?;
@@ -3497,13 +3516,18 @@ mod gate {
         let last = *firsts.last().ok_or("no positions")?;
         let mut ties = 0usize;
         let band = Some((&toks[..], last));
-        for (name, band) in [(STEP4, band), (STEP4_EVERY_NODE, band), (D1K, None)] {
+        for (name, band) in [
+            (dumps()?.step4, band),
+            (dumps()?.step4_every_node, band),
+            (dumps()?.d1k, None),
+        ] {
             ok &= step_set(&mut m, name, Prompt38::Step, band, &mut ties)?.0;
         }
-        let (d3k_ok, d3k) = step_set(&mut m, D3K, Prompt38::Step, None, &mut ties)?;
+        let d3k_set = dumps()?.d3k;
+        let (d3k_ok, d3k) = step_set(&mut m, d3k_set, Prompt38::Step, None, &mut ties)?;
         ok &= d3k_ok;
         println!(
-            "{D3K}: ik cuts its selection by cells and keeps up to three keys of the 513th pool \
+            "{d3k_set}: ik cuts its selection by cells and keeps up to three keys of the 513th pool \
              ours does not read (a named difference, its logits printed)"
         );
         println!("step sets: {ties} named tie(s)");

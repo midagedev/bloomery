@@ -1,0 +1,21 @@
+# Round q38q3ref: ik's CPU node dumps of the Qwen3.8-Flash-Next UD-Q3_K_XL split set (three shards,
+# 89,986,353,824 B, summed from the shards on the box), each one `just dump-ref-qwen4exp-q3
+# [VARIANT]` under this card: the batch set, then step4, step4-every-node, d1k and d3k, one lease
+# each, back to back. dump_ref loads without --defer-experts, so ik's loader populates every shard in
+# turn (one stream), then computes on 32 threads, then writes the nodes to /root/bloomery-data; the
+# three phases run one after the other and the wall is their sum, as the Q4 file's card
+# (q38ref-dump.card) derives. Minutes per dump [derived], that card's 0.2..2.2 scaled by the file
+# size, 89,986,353,824 / 111,334,654,784 = 0.808: 0.16..1.78, rounded outward. The scaling is the
+# populate term's (it reads the whole split set cold, and it dominates the cold upper bound); the
+# warm step dumps' fixed lease, witness and metadata seconds do not shrink with the file, which the
+# rounded lower bound absorbs. The compute term is the Q4 card's unchanged — the same 6.6 B active
+# parameters over the same token counts; this file's quant packs smaller expert stacks, which moves
+# bytes read, not FLOPs. A step dump that reads the file from the device again costs the populate
+# term again; all five cold is under 9 min.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and populates the whole 90.0 GB split set into the page
+  cache, evicting that much of what else is cached (the V4.1 host set or the Q4 set among it);
+  beside a timed run or a gate batch it would take their cores, their memory bandwidth and their
+  cache, so it holds the lease; why now: the ik-qwen4exp-q3 oracle family the Qwen3.8 program's e2e
+  gate is judged against on the Q3 file (round q38q3ref)
+minutes: 0.15..1.8
