@@ -159,6 +159,12 @@ Order:
     (`tools/gate-paths.tsv:68`), and `crates/gpu/src/weights.rs` has no row. Map them by the family that reads them,
     and give `weights.rs` its row. (iqwire moved kernels, so its full list was right; the `*` rows widen every later
     coverage or mtp change.)
+- **IQ types on the threaded host leg have no gate** (worker2, 2026-10-07; after 0.2.6, S). No gate in iqwire's batch
+  runs IQ3_XXS/IQ4_XS through `moe.rs`'s threaded host leg. `gate-moe` has no IQ type. The qwen4exp/qwen38 e2e gates
+  load UD-Q4_K_XL, whose routed stacks hold no IQ type. qdot's tests pin the IQ dots, but serially. So iq-sel-2's
+  harness mutant cleared only that one defect; it is not a race check of the leg. The only evidence today is
+  functional: dprober's plain = drafted ids, 32/32 on the Q3 file at residency off. That is weak, not a check. Close
+  it with a real-file arm of `gate-gpu-qwen4exp-e2e` on the Q3 file, with host experts, run twice and bit-equal.
 
 - **WSL2 one-queue boundary cost** (worker1, wslfix, derived from `stage_us`): under one hardware queue the readback
   after a planning boundary waits behind that boundary's staging and HtoD, once per 4 steps. That is about 5–7 ms on
