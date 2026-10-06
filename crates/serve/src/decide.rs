@@ -5,7 +5,8 @@
 //! with a `timings` object appended as its last key), `GET /props` ([`Decide::props`], read once at
 //! bind, with the `engine` object the generative server gives), `GET /v1/models` and `/models` (the
 //! seated model's listing, as the generative server's), `GET /health`, `OPTIONS` on any path (the
-//! CORS answer [`crate::Server`] gives), and a 404 error object for anything else. A refused request
+//! CORS answer [`crate::Server`] gives), and a 404 error object naming the routes for anything
+//! else ([`not_found`]: a chat client finds what to post instead). A refused request
 //! is a 400 carrying the decider's message, a request the engine cannot answer (an image) a 501
 //! `not_supported_error`. The decider runs one request at a time behind a mutex; connections are
 //! accepted and kept alive by the same owner as [`crate::Server`]'s (at most
@@ -393,8 +394,17 @@ fn reply(s: &Shared, req: &Request) -> Reply {
             };
             decide(s, body)
         }
-        _ => Reply::error(404, "not_found_error", "File Not Found"),
+        _ => Reply::error(404, "not_found_error", &not_found(s.fixed.routes)),
     }
+}
+
+/// The 404's message: what this server answers instead, its decider's `routes`.
+fn not_found(routes: &[&str]) -> String {
+    format!(
+        "File Not Found: this server seats a decision model, which answers POST {} and no \
+         chat or completion route",
+        routes.join(", POST ")
+    )
 }
 
 /// One request body through the decider. An engine error, a panic in the decider and a lock a
@@ -599,7 +609,20 @@ mod tests {
                     .starts_with(r#"{"a":1,"timings":"#)
             );
         }
+        let missed = reply(&s, &post("/v1/chat/completions"));
+        let body: Value = serde_json::from_slice(&missed.body).unwrap();
+        assert_eq!(
+            (missed.status, &body["error"]["message"]),
+            (
+                404,
+                &json!(
+                    "File Not Found: this server seats a decision model, which answers POST \
+                     /v1/rerank, POST /rerank and no chat or completion route"
+                )
+            )
+        );
         assert_eq!(reply(&s, &post("/v1/systemone")).status, 404);
+        assert!(not_found(&["/v1/systemone"]).contains("POST /v1/systemone and"));
         assert!(check_routes(&[]).unwrap_err().contains("no route"));
         assert!(check_routes(&["v1/x"]).is_err() && check_routes(&["/props"]).is_err());
         assert!(check_routes(routes).is_ok());

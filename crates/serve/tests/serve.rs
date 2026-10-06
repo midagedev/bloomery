@@ -487,8 +487,7 @@ fn hw_media_parts_are_refused() {
         assert_eq!(e["message"], message, "{e}");
     };
     let user = |content: Value| json!({"messages": [{"role": "user", "content": content}]});
-    let hint =
-        "input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
+    let hint = "input is not supported: this server reads text only";
     let parts = [
         (
             json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}),

@@ -1656,7 +1656,7 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
 fn content_text(parts: &[Value]) -> Result<String, ApiError> {
     let no_media = |kind: &str| {
         invalid(format!(
-            "{kind} input is not supported - hint: if this is unexpected, you may need to provide the mmproj"
+            "{kind} input is not supported: this server reads text only"
         ))
     };
     let mut text = Vec::with_capacity(parts.len());
@@ -2578,9 +2578,9 @@ mod tests {
         );
         assert_eq!(content_text(&[text("hi")]).ok().as_deref(), Some("hi"));
         assert_eq!(content_text(&[]).ok().as_deref(), Some(""));
-        let image = "image input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
-        let audio = "audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
-        let video = "video input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
+        let image = "image input is not supported: this server reads text only";
+        let audio = "audio input is not supported: this server reads text only";
+        let video = "video input is not supported: this server reads text only";
         let unsupported = "unsupported content[].type";
         let not_string = "content[].text must be a string";
         let refused = [

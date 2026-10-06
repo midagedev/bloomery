@@ -774,15 +774,20 @@ impl HostR8 {
 }
 
 /// The load line's words: `r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or
-/// `r8=off (no sidecar at <path>: just r8-sidecar)`.
+/// `r8=off (no sidecar at <path>; optional: …)`. The sidecar is an optional
+/// file only a source checkout writes, so its absence says so rather than
+/// asking a release user for a step they cannot run.
 impl fmt::Display for HostR8 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HostR8::On(s) => write!(f, "r8=on ({})", s.path.display()),
             HostR8::Lever => write!(f, "r8=off (BLOOMERY_R8=off)"),
-            HostR8::Missing(p) => {
-                write!(f, "r8=off (no sidecar at {}: just r8-sidecar)", p.display())
-            }
+            HostR8::Missing(p) => write!(
+                f,
+                "r8=off (no sidecar at {}; optional: a source checkout writes it with just \
+                 r8-sidecar)",
+                p.display()
+            ),
         }
     }
 }
