@@ -20,8 +20,9 @@
 //! set; `--hf` fetches a Hugging Face repo's GGUF set by its quant tag into
 //! the cache (`$BLOOMERY_CACHE`, else `~/.cache/bloomery/hf`), its `hf`
 //! records on stderr, and opens its first shard (a listing the network
-//! refuses leaves the cache's one verified set of that quant to stand in,
-//! after an `hf offline` record); with neither,
+//! refuses or the hub answers busy or down, and every start under
+//! `HF_HUB_OFFLINE`, leaves the cache's one verified set of that quant to
+//! stand in, after an `hf offline` record); with neither,
 //! `$BLOOMERY_REF_MODEL`, the gates' variable. A model named twice — a flag
 //! given twice, `-m` beside `--hf`, a flag beside a variable that names
 //! another file — is refused by name (`bloomery_gpu_gates::model_file`).
@@ -39,6 +40,12 @@
 //! seat words; a file whose architecture does not match an explicit
 //! `--model` is refused by name before any load.
 //! `--version` prints this crate's version and the build's commit and exits.
+//!
+//! Two checks run before anything is fetched or loaded, each a named refusal
+//! (`serve::preflight`): first of all, on a CPU that does not run the
+//! release's x86-64-v3 host code, `cpu_gate` prints what it lacks and exits
+//! 1; after `--version` and `--help`, a driver below R580 (CUDA 13), or one
+//! whose `libcuda.so.1` does not load, ends the start with what it reported.
 //! Each seat's flags, records, `/props` fields and exit codes are its
 //! module's doc; `bloomery-serve-ds41` and `bloomery-serve-qwen38` are this
 //! binary's ds41 and qwen38 seats alone.
@@ -53,6 +60,10 @@ fn main() {
 
 #[cfg(feature = "glm5next")]
 fn main() -> std::process::ExitCode {
+    // Before any x86-64-v3 code: `drive::run` is not inlined, so `main` holds
+    // nothing but the two calls.
+    #[cfg(target_arch = "x86_64")]
+    serve::preflight::cpu_gate("bloomery-serve");
     drive::run()
 }
 
@@ -102,10 +113,12 @@ mod drive {
     use std::process::ExitCode;
 
     use bloomery_gpu_gates::{GateError, exit_with, model_file, ref_model_path};
+    use cuda_core::sys;
     use gguf::Split;
     use model::arch::DEEPSEEK4;
     use serve::ServeError;
     use serve::decide::Ask;
+    use serve::preflight::Driver;
 
     use crate::serve_seats::{decide, ds41, glm, qwen3, qwen38};
 
@@ -315,6 +328,25 @@ models (the --model word is optional with a model file: the file's architecture 
         Ok((from, rest))
     }
 
+    /// What the driver answers a start: its library's load as cuda-bindings
+    /// loads it (`dyn_load`: `libcuda.so.1`, then `libcuda.so`, and its
+    /// `cuDriverGetVersion` refused as too old below the CUDA major the
+    /// build's toolkit is), read through that crate's own
+    /// `cuda_driver_load_error`.
+    fn driver_found() -> Driver {
+        match sys::cuda_driver_load_error() {
+            None => Driver::Loaded,
+            Some(sys::DynLoadError::RuntimeTooOld {
+                runtime_version, ..
+            }) => i32::try_from(*runtime_version).map_or_else(
+                |_| Driver::Missing(format!("a runtime version {runtime_version}")),
+                Driver::Version,
+            ),
+            Some(e) => Driver::Missing(e.to_string()),
+        }
+    }
+
+    #[inline(never)]
     pub fn run() -> ExitCode {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if args.iter().any(|a| a == "--version") {
@@ -328,6 +360,11 @@ models (the --model word is optional with a model file: the file's architecture 
         if word.is_none() && (args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h")) {
             // No seat chosen yet; the seat's own usage follows once one is.
             return exit_with(NAME, Err(format!("{USAGE}\n{MODELS}").into()));
+        }
+        // A driver that cannot run the CUDA 13 code ends the start before any
+        // download.
+        if let Err(e) = serve::preflight::driver(&driver_found()) {
+            return exit_with(NAME, Err(e.into()));
         }
         eprintln!("{FIRST_START}");
         // The model file is named before any seat parses: `-m`, or a `--hf`
