@@ -4,6 +4,9 @@ An LLM inference engine for one workstation: Rust host, CUDA-Rust kernels (cuda-
 kernels for the CPU expert tier. The plan lives in `docs/plan.md`. This file is the working contract, and it holds only
 rules in force; their history is in rig-log, the commit log, and this file at `4e7fa8af`.
 
+To run or evaluate bloomery rather than develop it, read the README's "Status" and "Evaluating bloomery"
+sections instead: the rules below are for the maintainers' workstation.
+
 ## Never
 
 - **Never build a device crate with plain `cargo`.** `crates/gpu` and every crate that links it (`gpu-deepseek41`,

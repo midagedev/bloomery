@@ -34,6 +34,58 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 Models: DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B, and the decision
 model Clef-Flash — [what each needs](#hardware) · [all install channels](#install) · [numbers](#numbers)
 
+## Status (0.2.3)
+
+What runs today and what does not, for people and for coding agents sizing up the repo:
+
+| Area | State |
+|---|---|
+| Linux x86-64 with an NVIDIA sm_86 card (RTX 3090, RTX A6000, RTX 3060) | Runs. Every number in this README comes from these cards |
+| Ada and Blackwell cards (sm_89, sm_120) | Not yet run here. The archive's sm_86 PTX compiles at the first start with the card's driver (R570+ for Blackwell); please report the result in an issue |
+| macOS, Apple silicon, AMD cards, Windows without WSL2 | Not supported |
+| OpenAI and Anthropic APIs, streaming, tool calls | Work on every generative model |
+| Several requests at once (`--parallel`, default 2) | Work. One pass for every stream on V4.1, GLM-5.3, Qwen3.8 and a whole-card Qwen3-30B; in turn on the rest |
+| MTP draft (Qwen3.8, GLM-5.3) | On by default. Greedy requests always; sampled requests while one request runs |
+| Cards | One card, or one card plus one expert-tier card (`--place bp`). A third card is not used |
+| Qwen3.8 `UD-Q3_K_XL` | Not yet run; its IQ expert stacks stay on the host and its draft is off |
+| Vision input (V4.1) | Not in this release |
+
+The full list is under [Limits](#limits).
+
+## Evaluating bloomery
+
+A checklist for a person or a coding agent (Claude Code, Codex) who wants to run it and judge it fairly:
+
+1. **Check the machine.** `nvidia-smi` (card, driver, free memory), `ldd --version` (glibc 2.34+), `free -g` (host
+   RAM). Find the model's row under [Hardware](#hardware): the card it needs, the host RAM, the file size.
+2. **Use a release binary** ([Install](#install)). Building from source needs a pinned nightly and our cuda-oxide fork
+   ([`docs/BUILD.md`](docs/BUILD.md)); a release binary is the same code.
+3. **Start it with `--hf`**, for example
+   `bloomery-serve --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --port 8080`. The first start downloads the files
+   (and the MTP draft where the repo has one). On a card other than sm_86 it also compiles the kernels once. The plan
+   line in the log names the cards and how the experts are split. Wait until `GET /health` answers 200.
+4. **Pick the cards with `CUDA_VISIBLE_DEVICES`.** With `--place` unset the load takes the largest visible card and
+   adds the host for the experts that do not fit it; on GLM-5.3 it also adds the next card as an expert tier when
+   the plan finds that pays.
+5. **Warm up first.** Send one request and discard its numbers. Adaptive residency then moves the experts the model
+   calls most onto the card, so the first requests run slower than later ones. `BLOOMERY_RESIDENCY=off` gives
+   repeatable tokens at some speed.
+6. **Read the speed from the response's `timings`**, not from wall time that includes the download or the load:
+   `predicted_per_second` (decode), `prompt_per_second` (prefill), `draft_n` and `draft_n_accepted` (the MTP draft).
+7. **Compare with llama-server on equal terms**: the same GGUF file, the same `--ctx-size`, the same `--parallel`
+   (`-np`), and the same request body (messages, `max_tokens`, `temperature`, `top_p`, `top_k`, `seed`,
+   `chat_template_kwargs`). Time one request alone for single-stream speed, and two at once for the total.
+8. **Use the model card's sampling.** Qwen3.8 without thinking: `"temperature": 0.7, "top_p": 0.8, "top_k": 20,
+   "presence_penalty": 1.5, "chat_template_kwargs": {"enable_thinking": false}`. With thinking on, the answer carries
+   `reasoning_content`.
+9. **Agents.** Claude Code: `ANTHROPIC_BASE_URL=http://localhost:8080`. OpenAI clients: base URL
+   `http://localhost:8080/v1`. Tool calls work on every generative model.
+10. **When something fails**, the error names the cause (a plan that does not fit lists every term and the
+    processes holding the card). Open an issue with `bloomery-serve --version`, `nvidia-smi`, the command and the log.
+
+`AGENTS.md`, the `justfile`'s `gate-*` recipes and `tools/` are the maintainers' development contract. They run on
+the maintainers' workstation with its cards and reference dumps, and they are not a test suite for an evaluator.
+
 ## llama-server compatibility
 
 Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and reads the same files:
