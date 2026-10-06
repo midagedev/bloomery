@@ -9,12 +9,16 @@ here.
 
 | Page | What it covers |
 |---|---|
+| [`evaluating.md`](evaluating.md) | A checklist to run bloomery and compare it fairly; hardware reports |
+| [`serving.md`](serving.md) | llama-server compatibility, the flags, the seats, concurrent requests, drafts, residency, limits |
+| [`models.md`](models.md) | The recommended files and what each model needs in GPU, RAM and disk |
+| [`performance.md`](performance.md) | The numbers' conditions, why it is fast, how it is verified, recorded sessions |
 | [`BUILD.md`](BUILD.md) | Building from source: the toolchain, the cuda-oxide fork, one command block per model |
 | [`HARDWARE.md`](HARDWARE.md) | What each part of the machine costs in a DeepSeek-V4.1 decode step, and the RAM floor |
 | [`cuda-oxide.md`](cuda-oxide.md) | How the GPU kernels are written in Rust with cuda-oxide |
-| [`upstream/`](upstream/) | Toolchain defects (`nvlabs-ledger.md`) and the notes behind upstream pull requests |
+| [`upstream/`](upstream/) | Our upstream pull requests, toolchain defects (`nvlabs-ledger.md`) and the notes behind them |
 
-The top-level [`README.md`](../README.md) covers install, use, the models, the numbers and why it is fast;
+The top-level [`README.md`](../README.md) covers the status, install, use and the headline numbers;
 [`AGENTS.md`](../AGENTS.md) is the working contract.
 
 ## Working records (Korean, dated)
