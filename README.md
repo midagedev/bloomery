@@ -44,6 +44,11 @@ bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080
 | Cards | One card, or one card plus one expert-tier card (`--place bp`) |
 | Vision input (V4.1) | Not in this release |
 
+**Known issue in 0.2.4** (fixed in 0.2.5, [#1](https://github.com/midagedev/bloomery/issues/1)): under WSL2, Qwen3.8,
+GLM-5.3 and DeepSeek-V4.1 can stop answering a few tokens into a request, with one CPU core busy and the GPU idle.
+Adaptive residency's expert swap waits on a word that a WSL2 driver queues behind the request's own readback. Start
+the server with the setting in front: `BLOOMERY_RESIDENCY=off bloomery-serve …`.
+
 To try it and judge it fairly (against llama-server too): [`docs/evaluating.md`](docs/evaluating.md). Full limits:
 [`docs/serving.md`](docs/serving.md#limits).
 
