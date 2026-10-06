@@ -1,6 +1,7 @@
 //! Token sampling over one row of logits, in the order of the reference's
-//! default chain (ik_llama.cpp `common/sampling.cpp`): repetition penalty
-//! (`llama_sampling_prepare`), then top-k, top-p, min-p and temperature
+//! default chain (ik_llama.cpp `common/sampling.cpp`): the repetition,
+//! frequency and presence penalties (`llama_sampling_prepare`), then top-k,
+//! top-p, min-p and temperature
 //! (`sampler_queue`, `samplers_sequence` in `common/sampling.h`), then a
 //! seeded draw from the softmax of what survives
 //! (`llama_sample_token_with_rng_impl`). Top-p and min-p therefore judge the
@@ -17,10 +18,10 @@ use std::cmp::Ordering;
 use std::fmt;
 
 /// The sampling chain's knobs. Each stage has a value that switches it off:
-/// `temperature <= 0` is greedy (the argmax, after the repetition penalty),
+/// `temperature <= 0` is greedy (the argmax, after the penalties),
 /// `top_k == 0` keeps every candidate, `top_p >= 1` and `min_p <= 0` keep
-/// every candidate, and `repeat_penalty == 1` or `repeat_last_n == 0`
-/// penalizes nothing.
+/// every candidate, and `repeat_last_n == 0`, or `repeat_penalty == 1` with
+/// `frequency_penalty == 0` and `presence_penalty == 0`, penalizes nothing.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplerParams {
     /// Divides the surviving logits before the draw; `<= 0` samples greedily.
@@ -34,6 +35,10 @@ pub struct SamplerParams {
     /// Divides a positive logit and multiplies a non-positive one, once per
     /// distinct token in the window.
     pub repeat_penalty: f32,
+    /// Subtracted from a token's logit once per occurrence in the window.
+    pub frequency_penalty: f32,
+    /// Subtracted from a token's logit once if it occurs in the window.
+    pub presence_penalty: f32,
     /// How many of the most recent tokens the penalty window covers.
     pub repeat_last_n: usize,
     /// Seeds the draw; the same seed and inputs give the same tokens.
@@ -42,8 +47,8 @@ pub struct SamplerParams {
 
 impl Default for SamplerParams {
     /// The reference's defaults (`X_COMMON_PARAMS_SAMPLING`): temperature
-    /// 0.8, top-k 40, top-p 0.95, min-p 0.05, no repetition penalty over a
-    /// 64-token window. The reference seeds from the clock by default; this
+    /// 0.8, top-k 40, top-p 0.95, min-p 0.05, no penalty over a 64-token
+    /// window. The reference seeds from the clock by default; this
     /// one uses seed 0 so a default sampler is reproducible.
     fn default() -> Self {
         Self {
@@ -52,6 +57,8 @@ impl Default for SamplerParams {
             top_p: 0.95,
             min_p: 0.05,
             repeat_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             repeat_last_n: 64,
             seed: 0,
         }
@@ -68,6 +75,8 @@ impl SamplerParams {
             top_p: 1.0,
             min_p: 0.0,
             repeat_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
             repeat_last_n: 0,
             seed: 0,
         }
@@ -115,8 +124,8 @@ pub struct Sampler {
     rng: Xoshiro256,
     cand: Vec<Candidate>,
     cum: Vec<f64>,
-    // Tokens already penalized in this call; cleared again before `sample` returns.
-    seen: Vec<bool>,
+    // Occurrences of each token in the penalty window; zero again before `sample` returns.
+    count: Vec<u32>,
 }
 
 impl Sampler {
@@ -145,15 +154,19 @@ impl Sampler {
         check(
             "repeat_penalty",
             r,
-            r.is_finite() && r > 0.0,
-            "a finite number > 0",
+            r.is_finite() && r > 0.0 && (1.0 / r).is_finite(),
+            "a finite number > 0 with a finite reciprocal",
         )?;
+        let f = params.frequency_penalty;
+        check("frequency_penalty", f, f.is_finite(), "a finite number")?;
+        let pr = params.presence_penalty;
+        check("presence_penalty", pr, pr.is_finite(), "a finite number")?;
         Ok(Self {
             params,
             rng: Xoshiro256::seeded(params.seed),
             cand: Vec::new(),
             cum: Vec::new(),
-            seen: Vec::new(),
+            count: Vec::new(),
         })
     }
 
@@ -177,7 +190,8 @@ impl Sampler {
             return 0;
         }
         let window = &recent[recent.len().saturating_sub(p.repeat_last_n)..];
-        let penalize = p.repeat_penalty != 1.0 && !window.is_empty();
+        let penalize = !window.is_empty()
+            && (p.repeat_penalty != 1.0 || p.frequency_penalty != 0.0 || p.presence_penalty != 0.0);
         if p.temperature <= 0.0 && !penalize {
             let (id, logit) = argmax(ids(logits));
             self.cand.push(Candidate { id, logit });
@@ -209,27 +223,36 @@ impl Sampler {
         &self.cand
     }
 
-    /// The reference's repetition penalty (`llama_sample_repetition_penalties_impl`):
-    /// once per distinct in-vocabulary token of `window`, a logit `<= 0` is
-    /// multiplied by the penalty and a positive one divided by it.
+    /// The reference's penalties (`llama_sample_repetition_penalties_impl`,
+    /// llama.cpp's `llama_sampler_penalties_apply`): once per distinct
+    /// in-vocabulary token of `window`, occurring `count` times, a logit `<= 0`
+    /// is multiplied by the repetition penalty and a positive one divided by
+    /// it, then `count * frequency + presence` is subtracted, in `f32`.
     fn penalize(&mut self, window: &[u32]) {
-        let r = self.params.repeat_penalty;
+        let p = self.params;
         let n = self.cand.len();
-        if self.seen.len() < n {
-            self.seen.resize(n, false);
+        if self.count.len() < n {
+            self.count.resize(n, 0);
         }
         for &t in window {
             let i = t as usize;
-            if i < n && !self.seen[i] {
-                self.seen[i] = true;
-                let c = &mut self.cand[i];
-                let l = c.logit;
-                c.logit = sanitize(if l <= 0.0 { l * r } else { l / r });
+            if i < n {
+                self.count[i] += 1;
             }
         }
         for &t in window {
-            if let Some(s) = self.seen.get_mut(t as usize) {
-                *s = false;
+            let i = t as usize;
+            if i < n && self.count[i] > 0 {
+                let k = self.count[i] as f32;
+                self.count[i] = 0;
+                let c = &mut self.cand[i];
+                let l = c.logit;
+                let l = if l <= 0.0 {
+                    l * p.repeat_penalty
+                } else {
+                    l / p.repeat_penalty
+                };
+                c.logit = sanitize(l - (k * p.frequency_penalty + p.presence_penalty));
             }
         }
     }

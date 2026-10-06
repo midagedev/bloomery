@@ -1,7 +1,10 @@
 //! The server's own sampler, used until the sampler crate is plugged in through a
 //! [`SamplerFactory`]. llama-server's default chain restricted to the knobs this
-//! server accepts: top_k, then top_p, then min_p, then temperature, then a draw.
+//! server accepts: the penalties over the last `repeat_last_n` ids of the history,
+//! then top_k, then top_p, then min_p, then temperature, then a draw; temperature
+//! `<= 0` takes the best candidate after the penalties.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::engine::{Sampler, SamplerFactory, SamplingParams};
@@ -13,7 +16,9 @@ pub fn reference_factory() -> SamplerFactory {
         let p = p.clone();
         let mut rng = SplitMix64(p.seed);
         let mut cand: Vec<(u32, f32)> = Vec::new();
-        Box::new(move |logits: &[f32], _history: &[u32]| sample(&p, &mut rng, &mut cand, logits))
+        Box::new(move |logits: &[f32], history: &[u32]| {
+            sample(&p, &mut rng, &mut cand, logits, history)
+        })
     })
 }
 
@@ -35,6 +40,7 @@ fn sample(
     rng: &mut SplitMix64,
     cand: &mut Vec<(u32, f32)>,
     logits: &[f32],
+    history: &[u32],
 ) -> u32 {
     cand.clear();
     cand.extend(
@@ -43,7 +49,20 @@ fn sample(
             .enumerate()
             .map(|(i, &l)| (u32::try_from(i).expect("a vocabulary fits u32"), l)),
     );
+    if p.penalizes() {
+        penalize(
+            p,
+            cand,
+            &history[history.len().saturating_sub(p.repeat_last_n)..],
+        );
+    }
     let by_logit_desc = |a: &(u32, f32), b: &(u32, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+    if p.temperature <= 0.0 {
+        return cand
+            .iter()
+            .min_by(|a, b| by_logit_desc(a, b))
+            .map_or(0, |c| c.0);
+    }
     if let Ok(k) = usize::try_from(p.top_k)
         && k > 0
         && k < cand.len()
@@ -94,6 +113,27 @@ fn sample(
     cand.last().map_or(first, |c| c.0)
 }
 
+/// llama.cpp's penalties (`llama_sampler_penalties_apply`): a token counted
+/// `k > 0` times in `window` has its logit divided by `repeat_penalty` when
+/// positive and multiplied by it otherwise, then `k * frequency_penalty +
+/// presence_penalty` subtracted. `cand` is indexed by id.
+fn penalize(p: &SamplingParams, cand: &mut [(u32, f32)], window: &[u32]) {
+    let mut count: BTreeMap<u32, u32> = BTreeMap::new();
+    for &t in window {
+        *count.entry(t).or_insert(0) += 1;
+    }
+    for (t, k) in count {
+        if let Some((_, l)) = usize::try_from(t).ok().and_then(|i| cand.get_mut(i)) {
+            let r = if *l <= 0.0 {
+                *l * p.repeat_penalty
+            } else {
+                *l / p.repeat_penalty
+            };
+            *l = r - (k as f32 * p.frequency_penalty + p.presence_penalty);
+        }
+    }
+}
+
 struct SplitMix64(u64);
 
 impl SplitMix64 {
@@ -124,6 +164,7 @@ mod tests {
             top_p: 1.0,
             min_p: 0.0,
             seed: 7,
+            ..SamplingParams::default()
         };
         let f = reference_factory();
         let a: Vec<u32> = {
@@ -142,5 +183,12 @@ mod tests {
         let mut k1 = f(&SamplingParams { top_k: 1, ..p });
         assert!((0..16).all(|_| k1(&logits, &[]) == 2));
         assert_eq!(argmax(&logits), 2);
+        let mut greedy = f(&SamplingParams {
+            temperature: 0.0,
+            presence_penalty: 0.5,
+            ..p
+        });
+        assert_eq!(greedy(&logits, &[]), 2);
+        assert_eq!(greedy(&logits, &[2]), 1, "1.1 - 0.5 < 1.0");
     }
 }

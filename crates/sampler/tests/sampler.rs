@@ -135,6 +135,8 @@ fn open(seed: u64) -> SamplerParams {
         top_p: 1.0,
         min_p: 0.0,
         repeat_penalty: 1.0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
         repeat_last_n: 0,
         seed,
     }
@@ -348,35 +350,62 @@ fn min_p_drops_below_its_fraction_of_the_max() {
     );
 }
 
+/// llama.cpp's penalty on one logit (`src/llama-sampler.cpp:2970-2976`,
+/// `llama_sampler_penalties_apply`; ik's `llama_sample_repetition_penalties_impl`
+/// is the same): a token counted `count > 0` times in the window has its
+/// logit divided by `r` when positive, multiplied by it otherwise, then
+/// `float(count) * freq + float(count > 0) * present` subtracted, in `f32`.
+fn llama_penalty(logit: f32, count: u32, r: f32, freq: f32, present: f32) -> f32 {
+    if count == 0 {
+        return logit;
+    }
+    let l = if logit <= 0.0 { logit * r } else { logit / r };
+    l - (count as f32 * freq + f32::from(u8::from(count > 0)) * present)
+}
+
 #[test]
-fn repetition_penalty_divides_positive_multiplies_non_positive() {
+fn penalties_follow_the_reference_formula() {
     const R: f32 = 1.3;
+    const FREQ: f32 = 0.37;
+    const PRESENT: f32 = 1.5;
     let row: [f32; 16] = [
         2.0, -1.5, 0.0, 3.0, -0.25, 1.0, 0.75, -3.0, 0.1, -0.1, 4.0, -4.0, 0.5, -0.5, 1.5, -2.5,
     ];
-    // Window = the last 7: [3, 1, 3, 1000, 2, 0, 5]. Token 4 is older than the
-    // window; 3 appears twice and is penalized once; 1000 is past the vocabulary.
-    let recent = [4u32, 3, 1, 3, 1000, 2, 0, 5];
-    let in_window = [3u32, 1, 2, 0, 5];
-    let mut s = sampler(SamplerParams {
-        repeat_penalty: R,
-        repeat_last_n: 7,
-        ..open(0)
-    });
-    let _ = s.sample(&row, &recent);
-    assert_eq!(s.candidates().len(), row.len());
-    for c in s.candidates() {
-        let l = row[c.id as usize];
-        let want = if !in_window.contains(&c.id) {
-            l
-        } else if l <= 0.0 {
-            l * R
-        } else {
-            l / R
-        };
-        assert_eq!(c.logit.to_bits(), (want + 0.0).to_bits(), "id {}", c.id);
+    // Window = the last 9: [3, 1, 3, 1000, 2, 3, 0, 5, 1]. Token 4 is older
+    // than the window; 3 occurs three times and 1 twice, so frequency and
+    // presence part; 1000 is past the vocabulary.
+    let recent = [4u32, 3, 1, 3, 1000, 2, 3, 0, 5, 1];
+    let count = |id: u32| recent[1..].iter().filter(|&&t| t == id).count() as u32;
+    let arms = [
+        ("repeat", R, 0.0, 0.0),
+        ("frequency", 1.0, FREQ, 0.0),
+        ("presence", 1.0, 0.0, PRESENT),
+        ("all three", R, FREQ, PRESENT),
+        ("negative frequency and presence", R, -FREQ, -PRESENT),
+    ];
+    for (name, r, freq, present) in arms {
+        let mut s = sampler(SamplerParams {
+            repeat_penalty: r,
+            frequency_penalty: freq,
+            presence_penalty: present,
+            repeat_last_n: 9,
+            ..open(0)
+        });
+        let _ = s.sample(&row, &recent);
+        assert_eq!(s.candidates().len(), row.len(), "{name}");
+        for c in s.candidates() {
+            let want = llama_penalty(row[c.id as usize], count(c.id), r, freq, present);
+            assert_eq!(
+                c.logit.to_bits(),
+                (want + 0.0).to_bits(),
+                "{name}: id {} (count {})",
+                c.id,
+                count(c.id)
+            );
+        }
     }
-    // Greedy sees the penalized logits, as the reference's greedy branch does.
+    // Greedy sees the penalized logits, as llama.cpp's temperature 0 takes the
+    // argmax after the penalties (`src/llama-sampler.cpp:270-285`).
     let mut greedy = sampler(SamplerParams {
         repeat_penalty: 2.0,
         repeat_last_n: 1,
@@ -389,7 +418,85 @@ fn repetition_penalty_divides_positive_multiplies_non_positive() {
         0,
         "the other token penalized"
     );
-    println!("penalty: 16 logits bit-exact, greedy flips on both signs");
+    let mut present = sampler(SamplerParams {
+        presence_penalty: 1.5,
+        repeat_last_n: 64,
+        ..SamplerParams::greedy()
+    });
+    assert_eq!(present.sample(&[5.0, 4.0], &[0, 0]), 1, "5 - 1.5 < 4");
+    println!(
+        "penalty: 16 logits bit-exact on five arms, greedy flips on both signs and on presence"
+    );
+}
+
+#[test]
+fn window_is_the_last_repeat_last_n_tokens() {
+    // Each id occurs once, at its own position: id i is `recent[i]`, so the
+    // window of the last n holds exactly the ids `len - n .. len`.
+    const LEN: u32 = 12;
+    let recent: Vec<u32> = (0..LEN).collect();
+    let row = [1.0f32; LEN as usize];
+    for n in [0usize, 1, 5, 11, 12, 13, 1 << 20] {
+        let mut s = sampler(SamplerParams {
+            presence_penalty: 1.0,
+            repeat_last_n: n,
+            ..open(0)
+        });
+        let _ = s.sample(&row, &recent);
+        let first_in = LEN.saturating_sub(u32::try_from(n).unwrap_or(u32::MAX));
+        for c in s.candidates() {
+            let want = if c.id >= first_in { 0.0 } else { 1.0 };
+            assert_eq!(c.logit, want, "repeat_last_n {n}: id {}", c.id);
+        }
+    }
+    println!(
+        "window: the last n of {LEN} tokens for n in 0, 1, 5, 11, 12, 13 and 2^20 (a window past the history covers all of it)"
+    );
+}
+
+#[test]
+fn neutral_penalties_leave_the_chain_unchanged() {
+    let mut g = Gen(9);
+    // `-0.0 == 0.0`, so a negative zero is neutral too, as in llama.cpp.
+    let neutral = SamplerParams {
+        repeat_penalty: 1.0,
+        frequency_penalty: 0.0,
+        presence_penalty: -0.0,
+        repeat_last_n: 64,
+        ..SamplerParams::default()
+    };
+    let greedy = SamplerParams {
+        presence_penalty: -0.0,
+        repeat_last_n: 64,
+        ..SamplerParams::greedy()
+    };
+    for p in [neutral, greedy] {
+        let mut a = sampler(p);
+        let mut b = sampler(SamplerParams {
+            repeat_last_n: 0,
+            ..p
+        });
+        for r in 0..1000 {
+            let n = 1 + g.below(512) as usize;
+            let row = if r % 2 == 0 {
+                g.nasty_row(n)
+            } else {
+                g.normal_row(n, 3.0)
+            };
+            let recent: Vec<u32> = (0..64).map(|_| g.below(n as u64) as u32).collect();
+            assert_eq!(a.sample(&row, &recent), b.sample(&row, &[]), "row {r}");
+            let bits = |s: &Sampler| -> Vec<(u32, u32)> {
+                s.candidates()
+                    .iter()
+                    .map(|c| (c.id, c.logit.to_bits()))
+                    .collect()
+            };
+            assert_eq!(bits(&a), bits(&b), "row {r}: candidates");
+        }
+    }
+    println!(
+        "neutral: 2000 rows, the same ids and candidate bits with and without a 64-token window"
+    );
 }
 
 #[test]
@@ -451,6 +558,14 @@ fn no_allocation_after_the_first_call() {
                 repeat_penalty: 1.1,
                 repeat_last_n: 64,
                 ..SamplerParams::greedy()
+            },
+        ),
+        (
+            "frequency + presence + default chain",
+            SamplerParams {
+                frequency_penalty: 0.5,
+                presence_penalty: 1.5,
+                ..SamplerParams::default()
             },
         ),
     ];

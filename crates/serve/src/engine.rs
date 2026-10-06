@@ -695,6 +695,16 @@ pub struct SamplingParams {
     pub top_k: i32,
     pub top_p: f32,
     pub min_p: f32,
+    /// Divides a positive logit and multiplies a non-positive one of each
+    /// token in the window; 1 is off.
+    pub repeat_penalty: f32,
+    /// Subtracted from a token's logit once per occurrence in the window.
+    pub frequency_penalty: f32,
+    /// Subtracted from a token's logit once if it occurs in the window.
+    pub presence_penalty: f32,
+    /// The window: the last `repeat_last_n` ids (a request's `-1` is
+    /// replaced by the context size); 0 is off.
+    pub repeat_last_n: usize,
     /// The effective seed (a request's `-1` is replaced by a clock-derived one).
     pub seed: u64,
 }
@@ -706,8 +716,24 @@ impl Default for SamplingParams {
             top_k: 40,
             top_p: 0.95,
             min_p: 0.05,
+            repeat_penalty: 1.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            repeat_last_n: 64,
             seed: u64::from(u32::MAX),
         }
+    }
+}
+
+impl SamplingParams {
+    /// Whether the penalties change any logit: a non-empty window and one
+    /// penalty off its neutral value (llama.cpp's `is_disabled`, negated).
+    #[must_use]
+    pub fn penalizes(&self) -> bool {
+        self.repeat_last_n > 0
+            && (self.repeat_penalty != 1.0
+                || self.frequency_penalty != 0.0
+                || self.presence_penalty != 0.0)
     }
 }
 

@@ -874,10 +874,18 @@ fn stop_list(v: Option<&Value>) -> Result<Vec<String>, ApiError> {
 ///
 /// A field this server cannot honor is a 400 naming it, never a 200 that ignores it:
 /// `n_probs > 0`, `response_format` other than `{"type":"text"}`, `json_schema`, a
-/// non-empty `grammar`, `logprobs: true`, `top_logprobs > 0`, `n > 1`, and
+/// non-empty `grammar`, `logprobs: true`, `top_logprobs > 0`, `n > 1`,
 /// `tool_choice` other than `"none"` or `"auto"` (nothing forces a call without a
-/// grammar). `null` counts as absent. Other unknown fields
-/// are ignored.
+/// grammar), and a non-empty `logit_bias`. `null` counts as absent. Other unknown
+/// fields are ignored.
+///
+/// The penalties take llama-server's names and defaults (`repeat_penalty` 1,
+/// `frequency_penalty` 0, `presence_penalty` 0, `repeat_last_n` 64) and
+/// llama.cpp's checks (`common_sampler_init`): a non-finite penalty, or a
+/// `repeat_penalty` that is not `> 0` with a finite reciprocal, is a 400
+/// naming it. `repeat_last_n` outside llama-server's `0..=i32::MAX` is a 400. A
+/// greedy request takes the engine's argmax, which no penalty reaches, so
+/// penalties that change a logit with `temperature <= 0` are a 400.
 fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiError> {
     let set = |k: &str| o.get(k).filter(|v| !v.is_null());
     let refused = [
@@ -902,6 +910,14 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             "tool_choice",
             set("tool_choice").is_some_and(|v| !matches!(v.as_str(), Some("none" | "auto"))),
         ),
+        (
+            "logit_bias",
+            set("logit_bias").is_some_and(|v| match v {
+                Value::Array(a) => !a.is_empty(),
+                Value::Object(m) => !m.is_empty(),
+                _ => true,
+            }),
+        ),
     ];
     if let Some((field, _)) = refused.iter().find(|(_, hit)| *hit) {
         return Err(invalid(format!("{field} is not supported by this server")));
@@ -916,15 +932,62 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
         .or(get_i(o, "max_completion_tokens")?)
         .unwrap_or(-1);
     let top_k = get_i(o, "top_k")?;
+    let penalty = |k: &str, d: f32, ok: fn(f32) -> bool, rule: &str| match set(k) {
+        None => Ok(d),
+        Some(v) => v
+            .as_f64()
+            .map(|x| x as f32)
+            .filter(|&x| ok(x))
+            .ok_or_else(|| invalid(format!("{k} must be {rule}, not {v}"))),
+    };
+    let finite = "a finite number";
+    let repeat_last_n = match (set("repeat_last_n"), get_i(o, "repeat_last_n")?) {
+        (None, _) => d.repeat_last_n,
+        (Some(v), n) => n
+            .filter(|&n| (0..=i64::from(i32::MAX)).contains(&n))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| {
+                invalid(format!(
+                    "repeat_last_n must be an integer in 0..={}, as llama-server takes it, not {v}",
+                    i32::MAX
+                ))
+            })?,
+    };
+    let sampling = SamplingParams {
+        temperature: get_f(o, "temperature").map_or(d.temperature, |t| t as f32),
+        top_k: top_k.map_or(d.top_k, |k| i32::try_from(k).unwrap_or(i32::MAX)),
+        top_p: get_f(o, "top_p").map_or(d.top_p, |t| t as f32),
+        min_p: get_f(o, "min_p").map_or(d.min_p, |t| t as f32),
+        repeat_penalty: penalty(
+            "repeat_penalty",
+            d.repeat_penalty,
+            |r| r.is_finite() && r > 0.0 && (1.0 / r).is_finite(),
+            "a finite number > 0 with a finite reciprocal",
+        )?,
+        frequency_penalty: penalty(
+            "frequency_penalty",
+            d.frequency_penalty,
+            f32::is_finite,
+            finite,
+        )?,
+        presence_penalty: penalty(
+            "presence_penalty",
+            d.presence_penalty,
+            f32::is_finite,
+            finite,
+        )?,
+        repeat_last_n,
+        seed,
+    };
+    if sampling.temperature <= 0.0 && sampling.penalizes() {
+        return Err(invalid(
+            "repeat_penalty, frequency_penalty and presence_penalty need temperature > 0 \
+             on this server: a greedy request takes the engine's argmax",
+        ));
+    }
     let p = GenParams {
         n_predict: if n_predict < 0 { -1 } else { n_predict },
-        sampling: SamplingParams {
-            temperature: get_f(o, "temperature").map_or(d.temperature, |t| t as f32),
-            top_k: top_k.map_or(d.top_k, |k| i32::try_from(k).unwrap_or(i32::MAX)),
-            top_p: get_f(o, "top_p").map_or(d.top_p, |t| t as f32),
-            min_p: get_f(o, "min_p").map_or(d.min_p, |t| t as f32),
-            seed,
-        },
+        sampling,
         stop: stop_list(o.get("stop"))?,
         ignore_eos: get_b(o, "ignore_eos").unwrap_or(false),
         stream: get_b(o, "stream").unwrap_or(false),
@@ -1017,10 +1080,10 @@ fn generation_settings(state: &State, p: &GenParams) -> Value {
         "min_p": p.sampling.min_p,
         "tfs_z": 1.0,
         "typical_p": 1.0,
-        "repeat_last_n": 0,
-        "repeat_penalty": 1.0,
-        "presence_penalty": 0.0,
-        "frequency_penalty": 0.0,
+        "repeat_last_n": p.sampling.repeat_last_n,
+        "repeat_penalty": p.sampling.repeat_penalty,
+        "presence_penalty": p.sampling.presence_penalty,
+        "frequency_penalty": p.sampling.frequency_penalty,
         "penalty_prompt_tokens": [],
         "use_penalty_prompt_tokens": false,
         "mirostat": 0,
@@ -1037,7 +1100,7 @@ fn generation_settings(state: &State, p: &GenParams) -> Value {
         "n_probs": 0,
         "min_keep": 0,
         "grammar": "",
-        "samplers": ["top_k", "top_p", "min_p", "temperature"],
+        "samplers": ["penalties", "top_k", "top_p", "min_p", "temperature"],
     })
 }
 

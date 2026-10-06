@@ -192,10 +192,10 @@ impl Decoder for VocabDecoder {
     }
 }
 
-/// The server's `SamplingParams` as the sampler crate's chain: no repetition
-/// penalty (llama-server's default `repeat_penalty = 1.0`), `top_k <= 0`
-/// keeps every candidate. The server never builds a sampler for
-/// `temperature <= 0`: those requests take the engine's argmax.
+/// The server's `SamplingParams` as the sampler crate's chain: the penalties
+/// over the request's window, `top_k <= 0` keeps every candidate. The server
+/// never builds a sampler for `temperature <= 0`: those requests take the
+/// engine's argmax.
 pub fn sampler_params(p: &SamplingParams) -> SamplerParams {
     SamplerParams {
         temperature: p.temperature,
@@ -203,8 +203,10 @@ pub fn sampler_params(p: &SamplingParams) -> SamplerParams {
         top_p: p.top_p,
         // Past 1 keeps only the best candidate, as 1 does; the chain refuses it.
         min_p: p.min_p.min(1.0),
-        repeat_penalty: 1.0,
-        repeat_last_n: 0,
+        repeat_penalty: p.repeat_penalty,
+        frequency_penalty: p.frequency_penalty,
+        presence_penalty: p.presence_penalty,
+        repeat_last_n: p.repeat_last_n,
         seed: p.seed,
     }
 }
