@@ -52,10 +52,12 @@
 //! the generation word (a pool job: a worker inside a job is not parked, and
 //! the expert dispatch that follows starts inside the spin window the job
 //! leaves it in), checks the handoff's sequence number and layer, has the
-//! host computation write the host experts' sum into the page and adds one to
-//! the counter. The combine reads that sum in place through the mapping. The
-//! protocol — the words, the sequence, the service loop — is this module's
-//! alone; a model supplies only what one service computes.
+//! host computation write the host experts' handback into the page — its
+//! weighted sum, or under the rows form (`page::PageLayout::host_rows`) each
+//! host slot's unweighted down row, one row a slot in slot order — and adds
+//! one to the counter. The combine reads that handback in place through the
+//! mapping. The protocol — the words, the sequence, the service loop — is
+//! this module's alone; a model supplies only what one service computes.
 //!
 //! An eager batch of prompt tokens is served outside that protocol
 //! ([`HostTier::serve_batch`]): the caller brings the batch's handoffs to the
@@ -223,6 +225,48 @@ pub trait HostExperts {
         Err(GpuError::state(
             "HostExperts::experts_union_into",
             "a batched host path: this architecture's host tier serves one column a call",
+        ))
+    }
+
+    /// The rows form of [`HostExperts::experts_into`], the handback of a page
+    /// whose sum region holds host rows ([`page::PageLayout::host_rows`]):
+    /// each listed slot's unweighted down row, one row of `x`'s width a slot
+    /// in the list's order (which is slot order), into `out` — its first
+    /// `experts.len()` rows — instead of the weighted sum. The routing weight
+    /// is not applied: the join multiplies it. Refused by an architecture
+    /// whose host tier serves only the weighted sum.
+    fn experts_rows_into(
+        &mut self,
+        layer: usize,
+        x: &Tensor2,
+        experts: &[(u32, f32)],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let _ = (layer, x, experts, out);
+        Err(GpuError::state(
+            "HostExperts::experts_rows_into",
+            "a rows handback: this architecture's host tier serves the weighted sum",
+        ))
+    }
+
+    /// The rows form of [`HostExperts::experts_union_into`]: each column's
+    /// listed slots' unweighted down rows, `out`'s length over its width and
+    /// column count naming the rows a column holds (the page's host rows),
+    /// row `i` of column `j` at `out[(j · rows + i) · width ..]` — bit for
+    /// bit what [`HostExperts::experts_rows_into`] writes for that column
+    /// and list alone, whatever the call's width. Refused by an architecture
+    /// whose host tier serves only the weighted sum.
+    fn experts_union_rows_into(
+        &mut self,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        let _ = (layer, x, lists, out);
+        Err(GpuError::state(
+            "HostExperts::experts_union_rows_into",
+            "a rows handback: this architecture's host tier serves the weighted sum",
         ))
     }
 }
@@ -1341,7 +1385,8 @@ impl<H: HostExperts> HostTier<H> {
         match self.port.as_ref().map(BatchPort::cap) {
             None => {
                 let h = self.step.boundary.layout.handoff();
-                self.port = Some(BatchPort::new(ctx, h.hidden, h.n_used, cap)?);
+                let rows = self.step.boundary.layout.host_rows();
+                self.port = Some(BatchPort::new_rows(ctx, h.hidden, h.n_used, cap, rows)?);
             }
             Some(made) if made != cap => {
                 return Err(GpuError::shape(
@@ -2148,7 +2193,8 @@ impl<H: HostExperts> HostTier<H> {
         if let Some(detail) = self.planted.take() {
             return Err(self.refuse_planted_batch(layer, detail));
         }
-        let h = self.step.boundary.layout.handoff();
+        let layout = self.step.boundary.layout;
+        let h = layout.handoff();
         let t = Tier {
             experts: &mut self.experts,
             health: &mut self.health,
@@ -2156,6 +2202,7 @@ impl<H: HostExperts> HostTier<H> {
             fault: self.fault.as_ref(),
             hidden: h.hidden,
             n_used: h.n_used,
+            host_rows: layout.host_rows(),
         };
         self.batch
             .serve_guarded(t, layer, x, ids, weights, exclude, out)

@@ -14,6 +14,11 @@
 //!   [`card_sum_elem`]'s rule over that mask, then [`join_elem`]. With the
 //!   union of both cards' experts on one card the combine reads the same
 //!   values in the same order, so the two agree bit for bit.
+//! - `ds41_ffn_post_rows_tier` (`_rows_streams_tier` without the fold) is
+//!   the same join where the boundary's page carries host rows: every slot
+//!   in slot order, its row the stage card's, the tier's or the host's by
+//!   its places, [`combine_rows_elem`] then [`join_rows_elem`] — the
+//!   tier-blind rule, the same bits whichever side computed each row.
 //!
 //! The tier's own layer ([`Ds41Tier`], the architecture's
 //! [`TierExperts`]) is the stage card's routed launches over the tier's
@@ -36,6 +41,15 @@ const TIER_WHAT: &str = "FfnPiece::enqueue (tier layer)";
 /// image and join one tier's rows, so a load holds one tier card
 /// ([`bloomery_gpu::host::refuse_tier_count`]).
 pub const STAGE_TIER: usize = 0;
+
+/// The tier entries' device bundle, loaded alone by a gate that drives the
+/// tier join with inputs a body cannot produce (a [`TierPiece`]'s own load
+/// path).
+pub fn load_tier_kernels(ctx: &Arc<CudaContext>) -> Result<tier_kernels::LoadedModule, GpuError> {
+    // SAFETY: this crate owns the embedded device bundle produced for the
+    // module above; each launcher checks its launch contract.
+    unsafe { bloomery_gpu::shared_module!(tier_kernels, ctx) }
+}
 
 #[cuda_module]
 mod tier_kernels {
@@ -312,6 +326,273 @@ mod tier_kernels {
             store4(&mut out, rows, d, o);
         }
     }
+
+    /// The rows join's combine and HC_POST with the next fold of a tier
+    /// layer ([`combine_post_rows_tier_at`]): `ds41_ffn_post_rows`'s outputs,
+    /// every slot summed in slot order, its row read from the stage card's
+    /// `down`, the tier's `trows` or the host's `hrows` by its places.
+    /// `k_host` is the page's rows bound, at least the token's host slots.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 6 * rows,
+            trows.len() >= 6 * rows,
+            w.len() >= 6,
+            sel.len() >= 6,
+            tsel.len() >= 6,
+            hrows.len() >= k_host * rows,
+            k_host <= 6,
+            shexp.len() >= rows,
+            res.len() >= 4 * rows,
+            hc.len() >= 24,
+            y.len() >= rows,
+            out.len() >= 4 * rows,
+            fold.len() >= rows
+        )
+    )]
+    pub fn ds41_ffn_post_rows_tier(
+        down: &[f32],
+        trows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        hrows: &[f32],
+        shexp: &[f32],
+        res: &[f32],
+        hc: &[f32],
+        rows: u32,
+        n_card: u32,
+        n_tier: u32,
+        k_host: u32,
+        mut y: DisjointSlice<f32>,
+        mut out: DisjointSlice<f32>,
+        mut fold: DisjointSlice<f32>,
+    ) {
+        let d = thread::index_1d().get();
+        let rows = rows as usize;
+        if d >= rows {
+            return;
+        }
+        let a = PostRowsTierIn {
+            down,
+            trows,
+            w,
+            sel,
+            tsel,
+            hrows,
+            shexp,
+            res,
+            hc,
+        };
+        // SAFETY: d < rows, and the launch contract gives every length the
+        // helper's contract asks for.
+        let (yv, o, pre) =
+            unsafe { combine_post_rows_tier_at(&a, rows, [n_card, n_tier, k_host], d) };
+        // SAFETY: d < rows <= y.len() and fold.len(), and d + 3·rows < 4·rows
+        // <= out.len(), by the launch contract; thread d is the only writer
+        // of y[d], fold[d] and the four stream values at d.
+        unsafe {
+            *y.get_unchecked_mut(d) = yv;
+            store4(&mut out, rows, d, o);
+            *fold.get_unchecked_mut(d) = hc_fold_elem(o, pre);
+        }
+    }
+
+    /// [`ds41_ffn_post_rows_tier`] without the fold: into an engram layer
+    /// and after the last layer.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 6 * rows,
+            trows.len() >= 6 * rows,
+            w.len() >= 6,
+            sel.len() >= 6,
+            tsel.len() >= 6,
+            hrows.len() >= k_host * rows,
+            k_host <= 6,
+            shexp.len() >= rows,
+            res.len() >= 4 * rows,
+            hc.len() >= 24,
+            y.len() >= rows,
+            out.len() >= 4 * rows
+        )
+    )]
+    pub fn ds41_ffn_post_rows_streams_tier(
+        down: &[f32],
+        trows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        hrows: &[f32],
+        shexp: &[f32],
+        res: &[f32],
+        hc: &[f32],
+        rows: u32,
+        n_card: u32,
+        n_tier: u32,
+        k_host: u32,
+        mut y: DisjointSlice<f32>,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let d = thread::index_1d().get();
+        let rows = rows as usize;
+        if d >= rows {
+            return;
+        }
+        let a = PostRowsTierIn {
+            down,
+            trows,
+            w,
+            sel,
+            tsel,
+            hrows,
+            shexp,
+            res,
+            hc,
+        };
+        // SAFETY: d < rows (checked above), and the launch contract gives
+        // every length the helper's contract asks for.
+        let (yv, o, _) =
+            unsafe { combine_post_rows_tier_at(&a, rows, [n_card, n_tier, k_host], d) };
+        // SAFETY: d < rows <= y.len() and d + 3·rows < 4·rows <= out.len(),
+        // by the launch contract; thread d is the only writer of y[d] and the
+        // four stream values at d.
+        unsafe {
+            *y.get_unchecked_mut(d) = yv;
+            store4(&mut out, rows, d, o);
+        }
+    }
+}
+
+/// What the rows join's tier combine-and-HC_POST launches read: `down` the
+/// six slots' down outputs slot-major (`rows` each), `trows` the tier's (as
+/// `down`), `w` the six routing weights, `sel` each slot's stage place (the
+/// card's below `n_card`), `tsel` its tier place (the tier's below `n_tier`),
+/// `hrows` the host's rows (`k_host` of them, packed in slot order, `rows`
+/// each), `shexp` the shared expert's output, `res` the four streams the
+/// sub-layer read (`rows` each) and `hc` its HC_PRE result.
+struct PostRowsTierIn<'a> {
+    down: &'a [f32],
+    trows: &'a [f32],
+    w: &'a [f32],
+    sel: &'a [u32],
+    tsel: &'a [u32],
+    hrows: &'a [f32],
+    shexp: &'a [f32],
+    res: &'a [f32],
+    hc: &'a [f32],
+}
+
+/// Value `d`'s combine under the rows join of a tier layer
+/// ([`combine_rows_elem`]), then HC_POST of it: every slot `j` in slot order
+/// — a stage card slot's row `a.down[j·rows + d]`, a tier slot's
+/// `a.trows[j·rows + d]`, a host slot's `a.hrows[k·rows + d]` at its host
+/// ordinal `k`, the host slots counted in the same scan — then
+/// [`join_rows_elem`]. The combine's `y`, the four new stream values and
+/// `pre`.
+///
+/// SAFETY: `d < rows`, `down.len()` and `trows.len() >= 6 * rows`,
+/// `w.len()`, `sel.len()` and `tsel.len() >= 6`, `hrows.len() >= n[2] *
+/// rows` with the token's host slots at most `n[2]`, `shexp.len() >= rows`,
+/// `res.len() >= 4 * rows` and `hc.len() >= 24`.
+#[inline(always)]
+unsafe fn combine_post_rows_tier_at(
+    a: &PostRowsTierIn<'_>,
+    rows: usize,
+    n: [u32; 3],
+    d: usize,
+) -> (f32, [f32; 4], [f32; 4]) {
+    let mut dv = [0.0f32; N_USED];
+    let mut wv = [0.0f32; N_USED];
+    let mut k_host = 0usize;
+    let mut j = 0usize;
+    while j < N_USED {
+        // SAFETY: j < 6 <= sel.len(), tsel.len() and w.len() by this fn's
+        // contract.
+        let (place, tplace, wj) = unsafe {
+            (
+                *a.sel.get_unchecked(j),
+                *a.tsel.get_unchecked(j),
+                *a.w.get_unchecked(j),
+            )
+        };
+        wv[j] = wj;
+        if place < n[0] {
+            // SAFETY: j < 6 and d < rows, so j·rows + d < 6·rows <=
+            // down.len() by this fn's contract.
+            dv[j] = unsafe { *a.down.get_unchecked(j * rows + d) };
+        } else if tplace < n[1] {
+            // SAFETY: as above, for trows.
+            dv[j] = unsafe { *a.trows.get_unchecked(j * rows + d) };
+        } else {
+            // SAFETY: the host slots before this one number `k_host`, at
+            // most the token's host slots minus one, so k_host < n[2] and
+            // k_host·rows + d < n[2]·rows <= hrows.len() by this fn's
+            // contract.
+            dv[j] = unsafe { *a.hrows.get_unchecked(k_host * rows + d) };
+            k_host += 1;
+        }
+        j += 1;
+    }
+    // SAFETY: d < rows <= shexp.len(); d + 3·rows < 4·rows <= res.len();
+    // 23 < 24 <= hc.len() — all by this fn's contract.
+    let (sh, r, pre, post, comb) = unsafe {
+        (
+            *a.shexp.get_unchecked(d),
+            [
+                *a.res.get_unchecked(d),
+                *a.res.get_unchecked(d + rows),
+                *a.res.get_unchecked(d + 2 * rows),
+                *a.res.get_unchecked(d + 3 * rows),
+            ],
+            [
+                *a.hc.get_unchecked(0),
+                *a.hc.get_unchecked(1),
+                *a.hc.get_unchecked(2),
+                *a.hc.get_unchecked(3),
+            ],
+            [
+                *a.hc.get_unchecked(4),
+                *a.hc.get_unchecked(5),
+                *a.hc.get_unchecked(6),
+                *a.hc.get_unchecked(7),
+            ],
+            [
+                *a.hc.get_unchecked(8),
+                *a.hc.get_unchecked(9),
+                *a.hc.get_unchecked(10),
+                *a.hc.get_unchecked(11),
+                *a.hc.get_unchecked(12),
+                *a.hc.get_unchecked(13),
+                *a.hc.get_unchecked(14),
+                *a.hc.get_unchecked(15),
+                *a.hc.get_unchecked(16),
+                *a.hc.get_unchecked(17),
+                *a.hc.get_unchecked(18),
+                *a.hc.get_unchecked(19),
+                *a.hc.get_unchecked(20),
+                *a.hc.get_unchecked(21),
+                *a.hc.get_unchecked(22),
+                *a.hc.get_unchecked(23),
+            ],
+        )
+    };
+    let y = combine_rows_elem(dv, wv, sh);
+    (y, hc_post_elem(y, r, post, &comb), pre)
 }
 
 /// Value `d`'s combine of a tier layer, then HC_POST of it: slot `j` is on
@@ -544,6 +825,9 @@ impl FfnPiece {
 
     /// [`FfnPiece::enqueue_join_half`] of a tier layer: the wait for the
     /// host's counter and the tier's ([`Hybrid::enqueue_tier_back`]), then
+    /// `ds41_ffn_post_rows_tier` (or `_rows_streams_tier`) where the
+    /// boundary's page carries host rows — every slot summed in slot order
+    /// from the stage card's, the tier's or the host's side — else
     /// `ds41_ffn_post_tier` (or `_streams_tier`), then the host tier told the
     /// row's layer is enqueued.
     pub fn enqueue_join_half_tier<H: HostExperts>(
@@ -557,27 +841,91 @@ impl FfnPiece {
     ) -> Result<(), GpuError> {
         let i = self.check_io(layer, hybrid.slots(), &io, row)?;
         let n_tier = hybrid.on_tier_of(STAGE_TIER, layer)?;
+        let k_host = hybrid.boundary().layout().host_rows();
         let stream = gpu.stream();
         hybrid.enqueue_tier_back(stream, layer, row)?;
         {
-            let hsum = hybrid.boundary().hsum_of(row)?;
+            let host = hybrid.boundary().hsum_of(row)?;
             let trows = hybrid.tier_rows(row)?;
             let r = &mut self.rows[row];
+            let rows = self.n_embd;
+            let tsel = tier.tsel(row)?;
+            let m = &tier.module;
+            if k_host > 0 {
+                let what = if io.fold_out.is_some() {
+                    "ds41_ffn_post_rows_tier"
+                } else {
+                    "ds41_ffn_post_rows_streams_tier"
+                };
+                let grid = launch_u32(what, "grid", rows.div_ceil(POST_THREADS as usize))?;
+                let cfg = LaunchConfig1D::new(grid, POST_THREADS, 0);
+                let (rows32, n_card, n_tier32, k) = (
+                    launch_u32(what, "rows", rows)?,
+                    launch_u32(what, "n_card", self.cfg[i].n_card)?,
+                    launch_u32(what, "n_tier", n_tier)?,
+                    launch_u32(what, "k_host", k_host)?,
+                );
+                match io.fold_out {
+                    Some(fold) => {
+                        let prep = m.prepare_ds41_ffn_post_rows_tier(cfg)?;
+                        m.ds41_ffn_post_rows_tier(
+                            stream,
+                            &prep,
+                            &r.down,
+                            trows,
+                            &r.rout.weights,
+                            &r.sel,
+                            tsel,
+                            host,
+                            &r.sh_y,
+                            io.streams,
+                            &r.hc_out,
+                            rows32,
+                            n_card,
+                            n_tier32,
+                            k,
+                            &mut r.y,
+                            io.streams_out,
+                            fold,
+                        )?;
+                    }
+                    None => {
+                        let prep = m.prepare_ds41_ffn_post_rows_streams_tier(cfg)?;
+                        m.ds41_ffn_post_rows_streams_tier(
+                            stream,
+                            &prep,
+                            &r.down,
+                            trows,
+                            &r.rout.weights,
+                            &r.sel,
+                            tsel,
+                            host,
+                            &r.sh_y,
+                            io.streams,
+                            &r.hc_out,
+                            rows32,
+                            n_card,
+                            n_tier32,
+                            k,
+                            &mut r.y,
+                            io.streams_out,
+                        )?;
+                    }
+                }
+                return hybrid.row_enqueued(layer, row);
+            }
             let what = if io.fold_out.is_some() {
                 "ds41_ffn_post_tier"
             } else {
                 "ds41_ffn_post_streams_tier"
             };
-            let rows = self.n_embd;
             let grid = launch_u32(what, "grid", rows.div_ceil(POST_THREADS as usize))?;
             let cfg = LaunchConfig1D::new(grid, POST_THREADS, 0);
-            let (rows32, n_card, n_tier) = (
+            let (rows32, n_card, n_tier32) = (
                 launch_u32(what, "rows", rows)?,
                 launch_u32(what, "n_card", self.cfg[i].n_card)?,
                 launch_u32(what, "n_tier", n_tier)?,
             );
-            let tsel = tier.tsel(row)?;
-            let m = &tier.module;
             match io.fold_out {
                 Some(fold) => {
                     let prep = m.prepare_ds41_ffn_post_tier(cfg)?;
@@ -589,13 +937,13 @@ impl FfnPiece {
                         &r.rout.weights,
                         &r.sel,
                         tsel,
-                        hsum,
+                        host,
                         &r.sh_y,
                         io.streams,
                         &r.hc_out,
                         rows32,
                         n_card,
-                        n_tier,
+                        n_tier32,
                         &mut r.y,
                         io.streams_out,
                         fold,
@@ -611,13 +959,13 @@ impl FfnPiece {
                         &r.rout.weights,
                         &r.sel,
                         tsel,
-                        hsum,
+                        host,
                         &r.sh_y,
                         io.streams,
                         &r.hc_out,
                         rows32,
                         n_card,
-                        n_tier,
+                        n_tier32,
                         &mut r.y,
                         io.streams_out,
                     )?;

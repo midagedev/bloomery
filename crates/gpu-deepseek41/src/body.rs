@@ -209,6 +209,20 @@ fn refuse_steps_under_residency(
     }
 }
 
+/// The most host slots a token of `map`'s plan can hold: per layer its host
+/// experts bounded by the routed width — a token's slots are distinct
+/// experts — over the map's layers. The boundary page's rows bound, what the
+/// join's host-ordinal scan reads within; 0 when every layer keeps every
+/// expert off the host, naming the weighted-sum form instead.
+fn host_rows(map: &SlotMap, n_used: usize) -> usize {
+    map.layers()
+        .filter_map(|l| {
+            Some(n_used.min(map.n_expert() - map.capacity(l).ok()? - map.on_tier(l).ok()?))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// `BLOOMERY_HOSTSTREAM` as the load takes it: unset follows the residency
 /// (on under one, off without one), and `on` without one is refused by name.
 fn hoststream_under(set: Option<bool>, residency: Residency) -> Result<bool, GpuError> {
@@ -2491,7 +2505,7 @@ impl Body {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let boundary = Boundary::with_rows(
+        let boundary = Boundary::with_host_rows(
             gpu.context(),
             stream,
             BoundaryShape {
@@ -2499,6 +2513,7 @@ impl Body {
                 n_used: hp.experts.n_used,
             },
             PAIR_ROWS,
+            host_rows(&map, hp.experts.n_used),
         )?;
         let file = Arc::clone(file);
         let host = Ds41Host::build(Arc::clone(&file), hp, layers.clone(), cfg.host.r8)?;

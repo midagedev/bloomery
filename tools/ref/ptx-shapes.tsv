@@ -40,6 +40,10 @@ generate_ds41   ds41_expert_gate_up_tiles                0           0
 generate_ds41   ds41_ffn_card_acc                        0           0
 generate_ds41   ds41_ffn_card_acc_8                      0           0
 generate_ds41   ds41_ffn_card_acc_8_tier                 0           0
+generate_ds41   ds41_ffn_card_acc_rows                   0           0
+generate_ds41   ds41_ffn_card_acc_rows_8                 0           0
+generate_ds41   ds41_ffn_card_acc_rows_8_tier            0           0
+generate_ds41   ds41_ffn_card_acc_rows_tier              0           0
 generate_ds41   ds41_ffn_card_acc_tier                   0           0
 generate_ds41   ds41_ffn_handoff                         0           0
 generate_ds41   ds41_ffn_handoff_10                      0           0
@@ -53,7 +57,13 @@ generate_ds41   ds41_ffn_places_10_cols                  0           0
 generate_ds41   ds41_ffn_post                            0           0
 generate_ds41   ds41_ffn_post_8                          0           0
 generate_ds41   ds41_ffn_post_batch                      0           0
+generate_ds41   ds41_ffn_post_batch_rows                 0           0
+generate_ds41   ds41_ffn_post_batch_rows_streams         0           0
 generate_ds41   ds41_ffn_post_batch_streams              0           0
+generate_ds41   ds41_ffn_post_rows                       0           0
+generate_ds41   ds41_ffn_post_rows_streams               0           0
+generate_ds41   ds41_ffn_post_rows_streams_tier          0           0
+generate_ds41   ds41_ffn_post_rows_tier                  0           0
 generate_ds41   ds41_ffn_post_streams                    0           0
 generate_ds41   ds41_ffn_post_streams_8                  0           0
 generate_ds41   ds41_ffn_post_streams_tier               0           0

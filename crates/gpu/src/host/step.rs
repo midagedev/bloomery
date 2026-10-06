@@ -229,8 +229,35 @@ impl Boundary {
         rows: usize,
         cols: usize,
     ) -> Result<Boundary, GpuError> {
+        Boundary::with_form(ctx, stream, shape, rows, cols, 0)
+    }
+
+    /// [`Boundary::with_rows`] with the page's sum region in its rows form
+    /// ([`PageLayout::new_host_rows`]): `host_rows` unweighted down rows a
+    /// column, what a service hands the join per host slot — the page a model
+    /// whose join sums every slot in slot order serves through. The rows
+    /// bound's refusal is the layout's. Load-time only.
+    pub fn with_host_rows(
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        shape: BoundaryShape,
+        rows: usize,
+        host_rows: usize,
+    ) -> Result<Boundary, GpuError> {
+        Boundary::with_form(ctx, stream, shape, rows, 1, host_rows)
+    }
+
+    /// The boundary of either sum form: `host_rows` 0 names the weighted sum.
+    fn with_form(
+        ctx: &Arc<CudaContext>,
+        stream: &CudaStream,
+        shape: BoundaryShape,
+        rows: usize,
+        cols: usize,
+        host_rows: usize,
+    ) -> Result<Boundary, GpuError> {
         let what = "Boundary::new";
-        let layout = PageLayout::new(rows, cols, shape.hidden, shape.n_used)
+        let layout = PageLayout::new_host_rows(rows, cols, shape.hidden, shape.n_used, host_rows)
             .map_err(|e| GpuError::shape(what, e.to_string()))?;
         let bytes = layout
             .bytes()
@@ -250,7 +277,7 @@ impl Boundary {
         let weights = unsafe { window::<f32>(base + 4 * h.weights as u64, h.n_used, ctx) };
         // SAFETY: as above, for the activation's `cols · hidden` words at
         // `h.x`, the region's tail.
-        let normed = unsafe { window::<f32>(base + 4 * h.x as u64, layout.hsum_len(), ctx) };
+        let normed = unsafe { window::<f32>(base + 4 * h.x as u64, layout.x_len(), ctx) };
         // SAFETY: as for the ids, for the sequence's one word at `h.seq`.
         let seq = unsafe { window::<u32>(base + 4 * h.seq as u64, 1, ctx) };
         let pages = (0..rows)
@@ -1021,22 +1048,32 @@ impl StepPort {
         }
         // A handoff the card should already have refused — an id no slot
         // knows, a non-finite activation (the norm that wrote it tests every
-        // value it writes) — runs no host expert: its sum is NaN, and the
-        // service fails by name; the tier then releases the stream.
+        // value it writes) — runs no host expert: its sum — under the rows
+        // form every row — is NaN, and the service fails by name; the tier
+        // then releases the stream.
         let saw = match unknown {
             Some((s, id)) => Some(unknown_id(s, id, slots.n_expert())),
             None => non_finite(&self.x.data),
         };
+        // One column's sum: the weighted sum, or its host rows. The page may
+        // hold more columns (`hsum_len`); a one-token call writes the first.
+        let host_rows = self.boundary.layout().host_rows();
+        let rows_form = host_rows > 0;
+        let out_len = host_rows.max(1) * h.hidden;
         let out = self
             .boundary
             .page
-            .f32_mut(hsum_off, h.hidden)
+            .f32_mut(hsum_off, out_len)
             .ok_or(GpuError::state(what, "the sum is outside the page"))?;
         if let Some(saw) = saw {
             out.fill(f32::NAN);
             return Err(self.refuse(health, layer, format!("row {row}: {saw}")));
         }
-        experts.experts_into(layer, &self.x, &self.list, out)?;
+        if rows_form {
+            experts.experts_rows_into(layer, &self.x, &self.list, out)?;
+        } else {
+            experts.experts_into(layer, &self.x, &self.list, out)?;
+        }
         self.stats.host_calls += 1;
         // The page holds the handoff until the signal: the ids are read
         // before it, the finished position is written after it.
@@ -1145,10 +1182,14 @@ impl StepPort {
             refused = (0..m)
                 .find_map(|j| non_finite(&xs[j * h.hidden..][..h.hidden]).map(|saw| (j, saw)));
         }
+        let (per_col, rows) = {
+            let layout = self.boundary.layout();
+            (layout.host_rows().max(1) * h.hidden, layout.host_rows() > 0)
+        };
         let out = self
             .boundary
             .page
-            .f32_mut(go.hsum_off, m * h.hidden)
+            .f32_mut(go.hsum_off, m * per_col)
             .ok_or(GpuError::state(what, "the sum is outside the page"))?;
         if let Some((j, saw)) = refused {
             out.fill(f32::NAN);
@@ -1163,7 +1204,11 @@ impl StepPort {
                 .enumerate()
                 .map(|(j, &len)| &self.lists[j * n..][..len]),
         );
-        let r = experts.experts_union_into(layer, x, &lists, out);
+        let r = if rows {
+            experts.experts_union_rows_into(layer, x, &lists, out)
+        } else {
+            experts.experts_union_into(layer, x, &lists, out)
+        };
         self.stats.host_calls += 1;
         self.slices = reuse_slices(lists);
         r?;

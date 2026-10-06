@@ -17,7 +17,8 @@
 //!    [`FfnBatch::enqueue_upload`], through the host tier's batch port):
 //!    the block's activations and routing to the host, one union call over
 //!    its tokens for the layer's host experts ([`Hybrid::serve_key`]), the
-//!    sums back;
+//!    sums back — under the rows form each host slot's unweighted down row,
+//!    the page's rows;
 //! 3. the shadow ([`FfnPiece::enqueue_batch_shadow`]), enqueued before the
 //!    host computes: per chunk HC_PRE, the norm's q8_1 form again and the
 //!    shared expert; then over the whole block the card's routed experts by
@@ -25,11 +26,18 @@
 //!    each weight row read once for the tile's slots (the table
 //!    `q4k_sel::grouped_buckets` and its tiles, `ds41_card_gather`,
 //!    `ds41_expert_gate_up_tiles`, the q8_1 of the table's entries,
-//!    `q4k_gemv_tiles`: [`enqueue_tiled_experts`]), and their sum
-//!    (`ds41_ffn_card_acc`);
+//!    `q4k_gemv_tiles`: [`enqueue_tiled_experts`]), and — unless the layer
+//!    is `tiered` — the card sum (`ds41_ffn_card_acc`); under the rows form
+//!    the shadow holds the block's routing instead (its card sum reads the
+//!    host's uploaded rows, so it waits for the post), tiered or not;
 //! 4. the join ([`FfnPiece::enqueue_batch_join`]), one launch over the block:
 //!    the card sum, the host sum and the shared expert combined, then HC_POST
-//!    with the next fold where the layer folds.
+//!    with the next fold where the layer folds. Under the rows form the card
+//!    sum runs after the host's upload ([`FfnPiece::enqueue_batch_acc_rows`],
+//!    or `_tier` once the tier's rows have landed:
+//!    `ds41_ffn_card_acc_rows[_8][_tier]`) and the join's launch is the rows
+//!    form's (`ds41_ffn_post_batch_rows`), the slot-order sum already
+//!    complete in `acc`.
 //!
 //! The feature tap of a batch's kept tokens is one launch here too
 //! ([`FfnBatch::enqueue_tap_means`], `ds41_tap_means`).
@@ -783,6 +791,323 @@ mod ffn_batch_kernels {
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
+
+    /// The rows join's card half of `m` tokens: thread `i < m·n` (token
+    /// `t = i / n`, value `d = i % n`) writes [`sum_rows_elem`] of its six
+    /// slots to `acc[i]` — every slot in slot order, a card slot's row
+    /// `down[(6t + j)·n + d]`, a host slot's `hrows[(t·k_host + k)·n + d]`
+    /// at its host ordinal `k`, the host slots counted in the same scan.
+    /// `k_host` is the page's rows bound, at least every token's host slots.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 6 * n * m,
+            hrows.len() >= k_host * n * m,
+            w.len() >= 6 * m,
+            sel.len() >= 6 * m,
+            k_host <= 6,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_rows(
+        down: &[f32],
+        hrows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        k_host: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for.
+        let v = unsafe { card_acc_rows_at::<N_USED>(down, hrows, w, sel, n, [n_card, k_host], i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// [`ds41_ffn_card_acc_rows`] of eight slots a token
+    /// ([`card_acc_rows_at`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 8 * n * m,
+            hrows.len() >= k_host * n * m,
+            w.len() >= 8 * m,
+            sel.len() >= 8 * m,
+            k_host <= 8,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_rows_8(
+        down: &[f32],
+        hrows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        k_host: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_8 slots.
+        let v = unsafe { card_acc_rows_at::<SLOTS_8>(down, hrows, w, sel, n, [n_card, k_host], i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// [`ds41_ffn_card_acc_rows`] over the stage card's, the expert tier's
+    /// and the host's slots ([`card_acc_rows_tier_at`]): a slot on the stage
+    /// card read from `down`, one on the tier from `trows`, a host slot from
+    /// `hrows` at its host ordinal, each at its turn in slot order — the one
+    /// chain over every slot wherever its place computes it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 6 * n * m,
+            trows.len() >= 6 * n * m,
+            hrows.len() >= k_host * n * m,
+            w.len() >= 6 * m,
+            sel.len() >= 6 * m,
+            tsel.len() >= 6 * m,
+            k_host <= 6,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_rows_tier(
+        down: &[f32],
+        trows: &[f32],
+        hrows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        n_tier: u32,
+        k_host: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let a = AccRowsTierIn {
+            down,
+            trows,
+            hrows,
+            w,
+            sel,
+            tsel,
+            n_card,
+            n_tier,
+            k_host,
+        };
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for.
+        let v = unsafe { card_acc_rows_tier_at::<N_USED>(&a, n, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// [`ds41_ffn_card_acc_rows_tier`] of eight slots a token
+    /// ([`card_acc_rows_tier_at`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 8 * n * m,
+            trows.len() >= 8 * n * m,
+            hrows.len() >= k_host * n * m,
+            w.len() >= 8 * m,
+            sel.len() >= 8 * m,
+            tsel.len() >= 8 * m,
+            k_host <= 8,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_rows_8_tier(
+        down: &[f32],
+        trows: &[f32],
+        hrows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        n_tier: u32,
+        k_host: u32,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let a = AccRowsTierIn {
+            down,
+            trows,
+            hrows,
+            w,
+            sel,
+            tsel,
+            n_card,
+            n_tier,
+            k_host,
+        };
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_8 slots.
+        let v = unsafe { card_acc_rows_tier_at::<SLOTS_8>(&a, n, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// The rows join of `m` tokens: thread `i < m·n` (token `t = i / n`,
+    /// value `d = i % n`) writes `y = join_rows_elem(acc[i], shexp[i])`,
+    /// then HC_POST of it (`hc_post_elem`) by token `t`'s HC_PRE result
+    /// `hc[24t ..]` and its four streams `res[4nt + kn + d]`, into `out` in
+    /// the same layout, and their fold by the result's `pre` into `fold[i]`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            acc.len() >= n * m,
+            shexp.len() >= n * m,
+            res.len() >= 4 * n * m,
+            hc.len() >= 24 * m,
+            out.len() >= 4 * n * m,
+            fold.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_post_batch_rows(
+        acc: &[f32],
+        shexp: &[f32],
+        res: &[f32],
+        hc: &[f32],
+        n: u32,
+        m: u32,
+        mut out: DisjointSlice<f32>,
+        mut fold: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let a = JoinRowsIn {
+            acc,
+            shexp,
+            res,
+            hc,
+        };
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for.
+        let (o, pre) = unsafe { join_post_rows_at(&a, n, i) };
+        let b = 4 * (i / n) * n + i % n;
+        // SAFETY: b + 3n < 4n(t + 1) <= 4nm <= out.len(), i < nm <= fold.len(),
+        // by the launch contract; thread i is the only writer of the four
+        // stream values at b and of fold[i].
+        unsafe {
+            store4(&mut out, n, b, o);
+            *fold.get_unchecked_mut(i) = hc_fold_elem(o, pre);
+        }
+    }
+
+    /// [`ds41_ffn_post_batch_rows`] without the fold: into an engram layer
+    /// and after the last layer.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            acc.len() >= n * m,
+            shexp.len() >= n * m,
+            res.len() >= 4 * n * m,
+            hc.len() >= 24 * m,
+            out.len() >= 4 * n * m
+        )
+    )]
+    pub fn ds41_ffn_post_batch_rows_streams(
+        acc: &[f32],
+        shexp: &[f32],
+        res: &[f32],
+        hc: &[f32],
+        n: u32,
+        m: u32,
+        mut out: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        let a = JoinRowsIn {
+            acc,
+            shexp,
+            res,
+            hc,
+        };
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for.
+        let (o, _) = unsafe { join_post_rows_at(&a, n, i) };
+        let b = 4 * (i / n) * n + i % n;
+        // SAFETY: b + 3n < 4n(t + 1) <= 4nm <= out.len() by the launch
+        // contract; thread i is the only writer of the four stream values at
+        // b.
+        unsafe { store4(&mut out, n, b, o) };
+    }
 }
 
 /// The step's Q3_K gate·up·SwiGLU as a tile entry's work
@@ -948,6 +1273,169 @@ unsafe fn card_acc_tier_at<const N: usize>(a: &AccTierIn<'_>, n: usize, i: usize
         }
     }
     acc
+}
+
+/// The rows join's card half of value `i` (token `t = i / n`, value
+/// `d = i % n`) of `N` slots a token: [`sum_rows_elem`]'s chain, a card
+/// slot's row `down[(Nt + j)·n + d]`, a host slot's `hrows[(t·n_host + k)·n +
+/// d]` at its host ordinal `k`, the host slots counted in the same slot-order
+/// scan (this order is the gate). `n_host` is the page's rows bound, at least
+/// every token's host slots.
+///
+/// SAFETY: `i < n · m` for an `m` with `down.len() >= N · n · m`, `hrows.len()
+/// >= n_host · n · m`, `w.len()` and `sel.len() >= N · m`, and every token's
+/// host slots at most `n_host`.
+#[inline(always)]
+unsafe fn card_acc_rows_at<const N: usize>(
+    down: &[f32],
+    hrows: &[f32],
+    w: &[f32],
+    sel: &[u32],
+    n: usize,
+    [n_card, n_host]: [u32; 2],
+    i: usize,
+) -> f32 {
+    let (t, d) = (i / n, i % n);
+    let mut acc = 0.0f32;
+    let mut k_host = 0usize;
+    for j in 0..N {
+        cuda_device::thread::__unroll_config::<0>();
+        let s = t * N + j;
+        // SAFETY: s < N·m <= sel.len() and w.len() by this fn's contract.
+        let (place, ws) = unsafe { (*sel.get_unchecked(s), *w.get_unchecked(s)) };
+        if place < n_card {
+            // SAFETY: s < N·m and d < n, so s·n + d < N·n·m <= down.len().
+            let ds = unsafe { *down.get_unchecked(s * n + d) };
+            acc = ds.mul_add(ws, acc);
+        } else {
+            // SAFETY: the host slots of token t before this one number
+            // k_host < the token's host slots <= n_host, so the index is
+            // below n_host·n·m <= hrows.len().
+            let hs = unsafe { *hrows.get_unchecked((t * n_host as usize + k_host) * n + d) };
+            acc = hs.mul_add(ws, acc);
+            k_host += 1;
+        }
+    }
+    acc
+}
+
+/// What a tier rows card sum of `N` slots a token reads
+/// ([`card_acc_rows_tier_at`]): the stage card's down outputs, the tier's
+/// (`trows`, slot-major as `down`), the host's rows (`n_host` a token,
+/// packed in slot order), the weights, each slot's stage and tier place, and
+/// the two cards' expert counts.
+struct AccRowsTierIn<'a> {
+    down: &'a [f32],
+    trows: &'a [f32],
+    hrows: &'a [f32],
+    w: &'a [f32],
+    sel: &'a [u32],
+    tsel: &'a [u32],
+    n_card: u32,
+    n_tier: u32,
+    k_host: u32,
+}
+
+/// [`card_acc_rows_at`]'s sum with the expert tier's slots in it: slot `j`'s
+/// row the stage card's `down[(Nt + j)·n + d]` when its place is below
+/// `n_card`, else the tier's `trows[(Nt + j)·n + d]` when its tier place is
+/// below `n_tier`, else the host's `hrows[(t·n_host + k)·n + d]` at its host
+/// ordinal `k`, the host slots counted in the same slot-order scan — the one
+/// chain over every slot wherever its place computes it (this order is the
+/// gate).
+///
+/// SAFETY: `i < n · m` for an `m` with `down.len()` and `trows.len() >= N ·
+/// n · m`, `hrows.len() >= n_host · n · m`, `w.len()`, `sel.len()` and
+/// `tsel.len() >= N · m`, and every token's host slots at most `n_host`.
+#[inline(always)]
+unsafe fn card_acc_rows_tier_at<const N: usize>(a: &AccRowsTierIn<'_>, n: usize, i: usize) -> f32 {
+    let (t, d) = (i / n, i % n);
+    let mut acc = 0.0f32;
+    let mut k_host = 0usize;
+    for j in 0..N {
+        cuda_device::thread::__unroll_config::<0>();
+        let s = t * N + j;
+        // SAFETY: s < N·m <= sel.len(), tsel.len() and w.len() by this fn's
+        // contract.
+        let (place, tplace, ws) = unsafe {
+            (
+                *a.sel.get_unchecked(s),
+                *a.tsel.get_unchecked(s),
+                *a.w.get_unchecked(s),
+            )
+        };
+        if place < a.n_card {
+            // SAFETY: s < N·m and d < n, so s·n + d < N·n·m <= down.len().
+            let ds = unsafe { *a.down.get_unchecked(s * n + d) };
+            acc = ds.mul_add(ws, acc);
+        } else if tplace < a.n_tier {
+            // SAFETY: as above, for trows.
+            let ds = unsafe { *a.trows.get_unchecked(s * n + d) };
+            acc = ds.mul_add(ws, acc);
+        } else {
+            // SAFETY: as in `card_acc_rows_at`, for hrows.
+            let hs = unsafe {
+                *a.hrows
+                    .get_unchecked((t * a.k_host as usize + k_host) * n + d)
+            };
+            acc = hs.mul_add(ws, acc);
+            k_host += 1;
+        }
+    }
+    acc
+}
+
+/// What the rows batch join reads, `m` tokens token-major: `acc` the
+/// slot-order sums, `shexp` the shared expert's outputs (`n` a token), `res`
+/// the streams the sub-layer read (`4n` a token) and `hc` its HC_PRE results
+/// (24 a token).
+struct JoinRowsIn<'a> {
+    acc: &'a [f32],
+    shexp: &'a [f32],
+    res: &'a [f32],
+    hc: &'a [f32],
+}
+
+/// Value `i` of the rows batch join (token `i / n`): its combine
+/// ([`join_rows_elem`]), then HC_POST of it (`hc_post_elem`): the four new
+/// stream values and `pre`.
+///
+/// SAFETY: every buffer of `a` holds the token `i / n`: `acc` and `shexp`
+/// more than `i` values, `res` at least `4n(i / n + 1)`, `hc` at least
+/// `24(i / n + 1)`.
+#[inline(always)]
+unsafe fn join_post_rows_at(a: &JoinRowsIn<'_>, n: usize, i: usize) -> ([f32; 4], [f32; 4]) {
+    let (t, d) = (i / n, i % n);
+    let (b, h) = (4 * t * n + d, t * HC_MIX);
+    // SAFETY: i < acc/shexp lengths; b + 3n < 4n(t + 1) <= res.len();
+    // h + 23 < 24(t + 1) <= hc.len() — all by this fn's contract.
+    let (ac, sh, r, hc) = unsafe {
+        let mut hc = [0.0f32; HC_MIX];
+        let mut k = 0usize;
+        while k < HC_MIX {
+            hc[k] = *a.hc.get_unchecked(h + k);
+            k += 1;
+        }
+        (
+            *a.acc.get_unchecked(i),
+            *a.shexp.get_unchecked(i),
+            [
+                *a.res.get_unchecked(b),
+                *a.res.get_unchecked(b + n),
+                *a.res.get_unchecked(b + 2 * n),
+                *a.res.get_unchecked(b + 3 * n),
+            ],
+            hc,
+        )
+    };
+    let pre = [hc[0], hc[1], hc[2], hc[3]];
+    let post = [hc[4], hc[5], hc[6], hc[7]];
+    let comb = [
+        hc[8], hc[9], hc[10], hc[11], hc[12], hc[13], hc[14], hc[15], hc[16], hc[17], hc[18],
+        hc[19], hc[20], hc[21], hc[22], hc[23],
+    ];
+    let y = join_rows_elem(ac, sh);
+    (hc_post_elem(y, r, post, &comb), pre)
 }
 
 /// What the tile path reads for one block ([`enqueue_tiled_experts`]): the
@@ -1139,6 +1627,43 @@ pub struct CardAccTier<'a> {
     pub n_card: usize,
     pub n_tier: usize,
     pub n_used: usize,
+}
+
+/// What [`FfnBatchKernels::enqueue_card_acc_rows`] reads, `m` tokens of
+/// `n_used` slots: `down` the slots' down outputs slot-major (`n` each,
+/// token `t`'s slots `n_used · t ..`), `w` their routing weights, `sel`
+/// their places (the card's below `n_card`) and `hrows` the host's rows —
+/// its host slots' unweighted downs, packed in slot order, `host_rows` a
+/// token — every slot summed in slot order by its place.
+pub struct CardAccRows<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub hrows: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub m: usize,
+    pub n_card: usize,
+    pub n_used: usize,
+    pub host_rows: usize,
+}
+
+/// What [`FfnBatchKernels::enqueue_card_acc_rows_tier`] reads, `m` tokens of
+/// `n_used` slots: [`CardAccRows`]'s, and the expert tier's down outputs
+/// `trows` (slot-major as `down`) and each slot's tier place `tsel` (the
+/// tier's below `n_tier`).
+pub struct CardAccRowsTier<'a> {
+    pub down: &'a DeviceBuffer<f32>,
+    pub trows: &'a DeviceBuffer<f32>,
+    pub hrows: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub tsel: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub m: usize,
+    pub n_card: usize,
+    pub n_tier: usize,
+    pub n_used: usize,
+    pub host_rows: usize,
 }
 
 impl FfnBatchKernels {
@@ -1356,6 +1881,93 @@ impl FfnBatchKernels {
         Ok(())
     }
 
+    /// Enqueue the rows join's card sums of `a.m` tokens of `a.n_used` slots
+    /// (`ds41_ffn_card_acc_rows` for 6, `ds41_ffn_card_acc_rows_8` for 8;
+    /// any other count is refused by name): value `i` of token `t = i / a.n`
+    /// into `acc[i]`, every slot summed in slot order, its row the card's
+    /// `down` or the host's `hrows` by its place. One launch. Asynchronous,
+    /// allocation-free.
+    pub fn enqueue_card_acc_rows(
+        &self,
+        stream: &CudaStream,
+        a: &CardAccRows<'_>,
+        acc: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let slots = slots_of("ds41_ffn_card_acc_rows", a.n_used)?;
+        let what = match slots {
+            Slots::Six => "ds41_ffn_card_acc_rows",
+            Slots::Eight => "ds41_ffn_card_acc_rows_8",
+        };
+        let grid = launch_u32(what, "grid", (a.m * a.n).div_ceil(THREADS as usize))?;
+        let cfg = LaunchConfig1D::new(grid, THREADS, 0);
+        let (n, m, n_card, k_host) = (
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "m", a.m)?,
+            launch_u32(what, "n_card", a.n_card)?,
+            launch_u32(what, "k_host", a.host_rows)?,
+        );
+        match slots {
+            Slots::Six => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_rows(cfg)?;
+                self.module.ds41_ffn_card_acc_rows(
+                    stream, &prep, a.down, a.hrows, a.w, a.sel, n, m, n_card, k_host, acc,
+                )?;
+            }
+            Slots::Eight => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_rows_8(cfg)?;
+                self.module.ds41_ffn_card_acc_rows_8(
+                    stream, &prep, a.down, a.hrows, a.w, a.sel, n, m, n_card, k_host, acc,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue `ds41_ffn_card_acc_rows_tier`: the rows join's card sums of
+    /// `a.m` tokens over the stage card's, the tier's and the host's slots,
+    /// value `i` of token `t = i / a.n` into `acc[i]`:
+    /// `ds41_ffn_card_acc_rows_tier` for six slots a token,
+    /// `ds41_ffn_card_acc_rows_8_tier` for eight; any other count is refused
+    /// by name. One launch. Asynchronous, allocation-free.
+    pub fn enqueue_card_acc_rows_tier(
+        &self,
+        stream: &CudaStream,
+        a: &CardAccRowsTier<'_>,
+        acc: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let slots = slots_of("ds41_ffn_card_acc_rows_tier", a.n_used)?;
+        let what = match slots {
+            Slots::Six => "ds41_ffn_card_acc_rows_tier",
+            Slots::Eight => "ds41_ffn_card_acc_rows_8_tier",
+        };
+        let grid = launch_u32(what, "grid", (a.m * a.n).div_ceil(THREADS as usize))?;
+        let cfg = LaunchConfig1D::new(grid, THREADS, 0);
+        let (n, m, n_card, n_tier, k_host) = (
+            launch_u32(what, "n", a.n)?,
+            launch_u32(what, "m", a.m)?,
+            launch_u32(what, "n_card", a.n_card)?,
+            launch_u32(what, "n_tier", a.n_tier)?,
+            launch_u32(what, "k_host", a.host_rows)?,
+        );
+        match slots {
+            Slots::Six => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_rows_tier(cfg)?;
+                self.module.ds41_ffn_card_acc_rows_tier(
+                    stream, &prep, a.down, a.trows, a.hrows, a.w, a.sel, a.tsel, n, m, n_card,
+                    n_tier, k_host, acc,
+                )?;
+            }
+            Slots::Eight => {
+                let prep = self.module.prepare_ds41_ffn_card_acc_rows_8_tier(cfg)?;
+                self.module.ds41_ffn_card_acc_rows_8_tier(
+                    stream, &prep, a.down, a.trows, a.hrows, a.w, a.sel, a.tsel, n, m, n_card,
+                    n_tier, k_host, acc,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Enqueue `ds41_expert_gate_up_tiles`: the SwiGLU outputs of `g`'s
     /// table entries by tiles, entry `j`'s rows into `h[j ·
     /// g.rows_per_expert ..]`. One launch of `tile_cap · row_tiles`
@@ -1499,9 +2111,12 @@ pub struct FfnBatch {
     ff: usize,
     /// Per token: the norm's f32 output (the router's input and the host's
     /// activation, `n_embd`), the routing (six ids and weights), each slot's
-    /// place, the card sum, the shared expert's output and the host sum
-    /// (`n_embd` each); per batch of a group, per token, the HC_PRE result,
-    /// which the join, the next layer's engram step and the head read.
+    /// place, the card sum, the shared expert's output and the host's
+    /// handback — its weighted sum (`n_embd` a token), or under the rows form
+    /// its host slots' unweighted rows (`host_rows · n_embd` a token, packed
+    /// in slot order; `host_rows` 0 names the sum); per batch of a group,
+    /// per token, the HC_PRE result, which the join, the next layer's engram
+    /// step and the head read.
     x: DeviceBuffer<f32>,
     ids: DeviceBuffer<u32>,
     weights: DeviceBuffer<f32>,
@@ -1530,12 +2145,19 @@ pub struct FfnBatch {
     d8_all: DeviceBuffer<f32>,
     down_all: DeviceBuffer<f32>,
     tile: Q3TileScratch,
+    /// The host's handback's form: 0 — a token's weighted sum; `k` — its
+    /// first `k` host slots' unweighted rows (the boundary page's `host_rows`
+    /// bound), the rows join's input.
+    host_rows: usize,
     /// With an expert tier, per token each slot's place in the tier's routed
     /// stacks, which the route writes and the tier computes by; and per
     /// batch of a group the shadow's copy of a tiered block's routing — the
     /// weights, the card places and the tier places — which the card sum in
     /// the post reads: in a group the next layer-batch's route rewrites the
-    /// batch-wide ones before this one's post.
+    /// batch-wide ones before this one's post. Under the rows form the held
+    /// routing is kept without a tier too — the rows join's card sum runs
+    /// after the host's upload, past that rewrite — with the tier places
+    /// zeroed and unread.
     tsel: Option<DeviceBuffer<u32>>,
     held: Vec<HeldRouting>,
     /// Under host streaming, per token each slot's streamed place
@@ -1598,13 +2220,17 @@ impl FfnBatch {
     /// The buffers for groups of up to `sets` batches of up to `cap` tokens
     /// (at most [`UNION_MAX_COLS`], the host union's columns) of rows of
     /// `n_embd` through experts of `ff`, on `gpu`; with `tier`, the tier
-    /// places of a model with an expert tier.
+    /// places of a model with an expert tier; `host_rows` naming the host's
+    /// handback (0 — the weighted sum, `k` — `k` host rows a token, the
+    /// boundary page's rows form, which keeps its routing held without a
+    /// tier too).
     pub fn new(
         gpu: &Gpu,
         n_embd: usize,
         ff: usize,
         [cap, sets]: [usize; 2],
         tier: bool,
+        host_rows: usize,
     ) -> Result<FfnBatch, GpuError> {
         if cap == 0 || cap > UNION_MAX_COLS || sets == 0 {
             return Err(GpuError::Shape {
@@ -1622,6 +2248,7 @@ impl FfnBatch {
         let n_sb = n_embd / 256;
         let kernels = FfnBatchKernels::load(ctx)?;
         let slot_cols = cap * N_USED;
+        let hold = tier || host_rows > 0;
         Ok(FfnBatch {
             kernels,
             cap,
@@ -1636,7 +2263,7 @@ impl FfnBatch {
                 .collect::<Result<_, _>>()?,
             acc: z(cap * n_embd)?,
             shexp: z(cap * n_embd)?,
-            hsum: z(cap * n_embd)?,
+            hsum: z(cap * host_rows.max(1) * n_embd)?,
             probs: z(cap * N_EXPERT)?,
             normed: z(c * n_embd)?,
             act_x: counts
@@ -1653,12 +2280,13 @@ impl FfnBatch {
             d8_all: z(cap * 2 * n_sb)?,
             down_all: z(slot_cols * n_embd)?,
             tile: Q3TileScratch::new(stream, slot_cols, n_embd, ff)?,
-            tsel: if tier {
+            host_rows,
+            tsel: if hold {
                 Some(DeviceBuffer::zeroed(stream, slot_cols)?)
             } else {
                 None
             },
-            held: if tier {
+            held: if hold {
                 (0..sets)
                     .map(|_| -> Result<HeldRouting, GpuError> {
                         Ok(HeldRouting {
@@ -1698,6 +2326,14 @@ impl FfnBatch {
     #[must_use]
     pub fn cap(&self) -> usize {
         self.cap
+    }
+
+    /// The host's handback's form: 0 — a token's weighted sum; `k` — its
+    /// first `k` host slots' unweighted rows (the boundary page's rows
+    /// bound).
+    #[must_use]
+    pub fn host_rows(&self) -> usize {
+        self.host_rows
     }
 
     /// Batches a group holds at most: the sets of HC_PRE results.
@@ -1862,6 +2498,13 @@ impl FfnBatch {
     ) -> Result<(), GpuError> {
         self.check_key(key)?;
         tier.enqueue_upload(gpu.stream(), &mut self.hsum, key)
+    }
+
+    /// The batch's host handback on the card — its weighted sum, or its host
+    /// rows — for a caller that uploads it through the host tier's own
+    /// combined step ([`Hybrid::upload_and_tier_rows`]).
+    pub fn handback_mut(&mut self) -> &mut DeviceBuffer<f32> {
+        &mut self.hsum
     }
 
     /// A key's tokens `at .. u` of a batch: at least one, at most the cap;
@@ -2499,9 +3142,10 @@ impl FfnPiece {
         Ok(())
     }
 
-    /// The block's card sum of every token, or for a `tiered` layer, whose
-    /// card sum waits for the tier's rows, the copy of the block's weights,
-    /// card places and tier places into the batch's held routing.
+    /// The block's card sum of every token, or — for a `tiered` layer, whose
+    /// card sum waits for the tier's rows, and under the rows form, whose
+    /// card sum waits for the host's upload — the copy of the block's
+    /// weights, card places and tier places into the batch's held routing.
     fn enqueue_block_finish(
         &self,
         gpu: &Gpu,
@@ -2514,7 +3158,7 @@ impl FfnPiece {
         let (stream, n) = (gpu.stream(), self.n_embd);
         let c = &self.cfg[i];
         let slots_n = (u - at) * N_USED;
-        if tiered {
+        if tiered || b.host_rows > 0 {
             return hold_routing(stream, b, set, at * N_USED, slots_n);
         }
         let m = u - at;
@@ -2532,6 +3176,113 @@ impl FfnPiece {
             n_used: N_USED,
         };
         b.kernels.enqueue_card_acc(stream, &a, &mut acc)
+    }
+
+    /// The block's card sum under the rows form, tokens `at .. u` of the
+    /// group's batch `set`, after the host's rows' upload
+    /// ([`FfnBatch::enqueue_upload`]): each token's six slots in slot order,
+    /// from the card's down outputs or the host's rows by their places, with
+    /// the weights and places the shadow held for the batch. Before the
+    /// join. One launch. Asynchronous, allocation-free.
+    pub fn enqueue_batch_acc_rows(
+        &self,
+        gpu: &Gpu,
+        b: &mut FfnBatch,
+        [layer, set]: [usize; 2],
+        [at, u]: [usize; 2],
+    ) -> Result<(), GpuError> {
+        let i = self.layer_index(layer, WHAT)?;
+        let n = self.n_embd;
+        let k = b.host_rows;
+        if at >= u || u > b.cap {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {layer}'s rows card sum of tokens {at}..{u} (batches of {})",
+                    b.cap
+                ),
+            });
+        }
+        let (m, slots_n) = (u - at, (u - at) * N_USED);
+        let held = held_of(&b.held, set)?;
+        let down = span(WHAT, &b.down_all, at * N_USED * n, slots_n * n)?;
+        let hrows = span(WHAT, &b.hsum, at * k * n, m * k * n)?;
+        let sel = span(WHAT, &held.sel, at * N_USED, slots_n)?;
+        let wts = span(WHAT, &held.w, at * N_USED, slots_n)?;
+        let mut acc = span_mut(WHAT, &mut b.acc, at * n, m * n)?;
+        let a = CardAccRows {
+            down: &down,
+            hrows: &hrows,
+            w: &wts,
+            sel: &sel,
+            n,
+            m,
+            n_card: self.cfg[i].n_card,
+            n_used: N_USED,
+            host_rows: k,
+        };
+        b.kernels.enqueue_card_acc_rows(gpu.stream(), &a, &mut acc)
+    }
+
+    /// The block's card sum under the rows form over the stage card's, the
+    /// expert tier's and the host's slots, tokens `at .. u` of the group's
+    /// batch `set`, once the tier's rows have landed (`trows`: the tier's
+    /// down outputs of the block's slots, slot-major from the block's first
+    /// slot, as the host tier hands them over after the tier's service) and
+    /// the host's rows' upload has been enqueued: each token's six slots in
+    /// slot order, from the card's down outputs, the tier's rows or the
+    /// host's by their places, with the weights and places the shadow held
+    /// for the batch. Before the join. One launch. Asynchronous,
+    /// allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the layer, its batch and tokens, and the tier's rows (rust-quality R8)"
+    )]
+    pub fn enqueue_batch_acc_rows_tier(
+        &self,
+        gpu: &Gpu,
+        b: &mut FfnBatch,
+        [layer, set, n_tier]: [usize; 3],
+        [at, u]: [usize; 2],
+        trows: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let i = self.layer_index(layer, WHAT)?;
+        let n = self.n_embd;
+        let k = b.host_rows;
+        if at >= u || u > b.cap {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {layer}'s tier rows card sum of tokens {at}..{u} (batches of {})",
+                    b.cap
+                ),
+            });
+        }
+        let (m, slots_n) = (u - at, (u - at) * N_USED);
+        let held = held_of(&b.held, set)?;
+        let tsel = span(WHAT, &held.tsel, at * N_USED, slots_n)?;
+        let down = span(WHAT, &b.down_all, at * N_USED * n, slots_n * n)?;
+        let hrows = span(WHAT, &b.hsum, at * k * n, m * k * n)?;
+        let trows = span(WHAT, trows, 0, slots_n * n)?;
+        let sel = span(WHAT, &held.sel, at * N_USED, slots_n)?;
+        let wts = span(WHAT, &held.w, at * N_USED, slots_n)?;
+        let mut acc = span_mut(WHAT, &mut b.acc, at * n, m * n)?;
+        let a = CardAccRowsTier {
+            down: &down,
+            trows: &trows,
+            hrows: &hrows,
+            w: &wts,
+            sel: &sel,
+            tsel: &tsel,
+            n,
+            m,
+            n_card: self.cfg[i].n_card,
+            n_tier,
+            n_used: N_USED,
+            host_rows: k,
+        };
+        b.kernels
+            .enqueue_card_acc_rows_tier(gpu.stream(), &a, &mut acc)
     }
 
     /// Layer `layer`'s shadow work for the chunk `io`, after the batch's
@@ -2699,11 +3450,32 @@ impl FfnPiece {
         let (nn, mm) = (launch_u32(what, "n", n)?, launch_u32(what, "m", m)?);
         let stream = gpu.stream();
         let acc = span(WHAT, &b.acc, at * n, m * n)?;
-        let hsum = span(WHAT, &b.hsum, at * n, m * n)?;
         let shexp = span(WHAT, &b.shexp, at * n, m * n)?;
         let hc = span(WHAT, hc_set(&b.hc, set)?, at * HC_MIX, m * HC_MIX)?;
         let res = span(WHAT, streams, at * s4, m * s4)?;
         let mut out = span_mut(WHAT, streams_out, at * s4, m * s4)?;
+        if b.host_rows > 0 {
+            match fold_out {
+                Some(fold) => {
+                    let mut fold = span_mut(WHAT, fold, at * n, m * n)?;
+                    let prep = b.kernels.module.prepare_ds41_ffn_post_batch_rows(cfg)?;
+                    b.kernels.module.ds41_ffn_post_batch_rows(
+                        stream, &prep, &acc, &shexp, &res, &hc, nn, mm, &mut out, &mut fold,
+                    )?;
+                }
+                None => {
+                    let prep = b
+                        .kernels
+                        .module
+                        .prepare_ds41_ffn_post_batch_rows_streams(cfg)?;
+                    b.kernels.module.ds41_ffn_post_batch_rows_streams(
+                        stream, &prep, &acc, &shexp, &res, &hc, nn, mm, &mut out,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        let hsum = span(WHAT, &b.hsum, at * n, m * n)?;
         match fold_out {
             Some(fold) => {
                 let mut fold = span_mut(WHAT, fold, at * n, m * n)?;

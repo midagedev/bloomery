@@ -13,6 +13,15 @@
 //! after another, then every row's sum (`cols · hidden` f32), each at a
 //! 256-byte boundary.
 //!
+//! The sum region holds one of two forms. The sum form — every page before
+//! the rows join — carries each column's weighted sum, `hidden` f32. The rows
+//! form ([`PageLayout::new_host_rows`], a page whose join sums every slot in
+//! slot order from wherever its place computes it) carries each column's
+//! first `host_rows` host slots' unweighted down rows, packed in slot order,
+//! `host_rows · hidden` f32; the host slots' ordinal in the join's slot scan
+//! names the row, so rows past a column's host slots are never read and hold
+//! what an earlier service left.
+//!
 //! The routed width `n_used` is the model's, any count from one: the page
 //! holds what it was built for, and a call that brings more slots than that
 //! is refused where it meets the page — the batch service's routing count,
@@ -89,6 +98,8 @@ pub enum PageError {
     Hidden,
     /// No routed slot a token.
     Used,
+    /// Host rows past the routed width: no token holds that many host slots.
+    HostRows(usize),
     /// A size past `usize`.
     Overflow,
 }
@@ -103,6 +114,10 @@ impl std::fmt::Display for PageError {
             ),
             PageError::Hidden => write!(f, "a model width of 0"),
             PageError::Used => write!(f, "0 routed slots a token: a page carries at least one"),
+            PageError::HostRows(k) => write!(
+                f,
+                "{k} host rows a column: a token holds at most its routed slots"
+            ),
             PageError::Overflow => write!(f, "the page's size passes usize"),
         }
     }
@@ -117,6 +132,10 @@ pub struct PageLayout {
     handoff: HandoffLayout,
     image_stride: usize,
     hsum_stride: usize,
+    /// The sum region's form: 0 — each column's weighted sum, one row; `k` —
+    /// each column's first `k` host slots' unweighted down rows, the rows
+    /// join's handback.
+    host_rows: usize,
 }
 
 impl PageLayout {
@@ -127,6 +146,37 @@ impl PageLayout {
         cols: usize,
         hidden: usize,
         n_used: usize,
+    ) -> Result<PageLayout, PageError> {
+        PageLayout::with_form(rows, cols, hidden, n_used, 0)
+    }
+
+    /// [`PageLayout::new`] with the sum region in its rows form: each
+    /// column's first `host_rows` host slots' unweighted down rows, packed in
+    /// slot order, instead of its weighted sum. `host_rows` past `n_used` is
+    /// refused: no token holds more host slots than routed slots, and the
+    /// join's slot scan reads row `host_rows ·` the column's host-slot
+    /// ordinal, so a smaller region than a token's host slots can hold would
+    /// be read past its end.
+    pub fn new_host_rows(
+        rows: usize,
+        cols: usize,
+        hidden: usize,
+        n_used: usize,
+        host_rows: usize,
+    ) -> Result<PageLayout, PageError> {
+        if host_rows > n_used {
+            return Err(PageError::HostRows(host_rows));
+        }
+        PageLayout::with_form(rows, cols, hidden, n_used, host_rows)
+    }
+
+    /// The layout of either form: `host_rows` 0 names the sum form.
+    fn with_form(
+        rows: usize,
+        cols: usize,
+        hidden: usize,
+        n_used: usize,
+        host_rows: usize,
     ) -> Result<PageLayout, PageError> {
         if !(1..=MAX_ROWS).contains(&rows) {
             return Err(PageError::Rows(rows));
@@ -158,7 +208,8 @@ impl PageLayout {
             .and_then(|b| b.checked_next_multiple_of(256))
             .ok_or(o.clone())?;
         let hsum_stride = x_words
-            .checked_mul(4)
+            .checked_mul(host_rows.max(1))
+            .and_then(|v| v.checked_mul(4))
             .and_then(|b| b.checked_next_multiple_of(256))
             .ok_or(o.clone())?;
         let layout = PageLayout {
@@ -174,6 +225,7 @@ impl PageLayout {
             },
             image_stride,
             hsum_stride,
+            host_rows,
         };
         layout.bytes().ok_or(o)?;
         Ok(layout)
@@ -197,6 +249,14 @@ impl PageLayout {
         self.handoff
     }
 
+    /// The sum region's form: 0 — the weighted sum; `k` — `k` host rows a
+    /// column, the rows join's handback. What a service writes into the region
+    /// and a join reads from it branch on this.
+    #[must_use]
+    pub fn host_rows(&self) -> usize {
+        self.host_rows
+    }
+
     /// Words of one unit's image and of the handoff region it copies: the
     /// fields, then the activation.
     #[must_use]
@@ -204,10 +264,17 @@ impl PageLayout {
         self.handoff.x + self.cols * self.handoff.hidden
     }
 
-    /// Values of one unit's host sum.
+    /// Values of one unit's activation.
+    #[must_use]
+    pub fn x_len(&self) -> usize {
+        self.cols * self.handoff.hidden
+    }
+
+    /// Values of one unit's host sum: its weighted sum, or its `host_rows`
+    /// host rows.
     #[must_use]
     pub fn hsum_len(&self) -> usize {
-        self.cols * self.handoff.hidden
+        self.cols * self.host_rows.max(1) * self.handoff.hidden
     }
 
     /// Byte offset of row `row`'s image; `None` past the rows.
@@ -272,6 +339,38 @@ mod tests {
         assert_eq!(p.bytes(), Some(66_816));
         assert_eq!(p.image_off(2), None);
         assert_eq!(p.hsum_off(2), None);
+    }
+
+    /// The rows form grows the sum region by its host rows and keeps
+    /// everything else where the sum form has it: a page of two rows of one
+    /// column of 4096 values (V4.1's shape at a 4096 width; its own is 5120), six slots and six host rows — the plan's
+    /// most host slots a token — carries row 0's rows from byte 34,048 as one
+    /// 98,304-byte stride, the images untouched, 230,656 bytes in all against
+    /// the sum form's 66,816. A host-rows count past the routed width is
+    /// refused by name.
+    #[test]
+    fn v41_rows_page_grows_the_sum_region() {
+        let sum = PageLayout::new(2, 1, 4096, 6).expect("the sum form");
+        let rows = PageLayout::new_host_rows(2, 1, 4096, 6, 6).expect("the rows form");
+        assert_eq!(rows.host_rows(), 6);
+        assert_eq!(sum.host_rows(), 0);
+        assert_eq!(rows.handoff(), sum.handoff());
+        assert_eq!(
+            [rows.image_off(0), rows.image_off(1)],
+            [sum.image_off(0), sum.image_off(1)]
+        );
+        assert_eq!(rows.hsum_off(0), sum.hsum_off(0));
+        assert_eq!(rows.hsum_off(1), Some(34_048 + 98_304));
+        assert_eq!(rows.x_len(), 4096);
+        assert_eq!((sum.hsum_len(), rows.hsum_len()), (4096, 6 * 4096));
+        assert_eq!(sum.bytes(), Some(66_816));
+        assert_eq!(rows.bytes(), Some(230_656));
+        assert_eq!(
+            PageLayout::new_host_rows(1, 1, 2048, 6, 7),
+            Err(PageError::HostRows(7))
+        );
+        let e = PageError::HostRows(9).to_string();
+        assert!(e.contains("9 host rows"), "{e}");
     }
 
     /// Every layout of one column of up to `FIELD_MIN` (16) slots keeps the

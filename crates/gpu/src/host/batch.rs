@@ -101,7 +101,8 @@ enum Stage {
 }
 
 /// One set: page-locked copies of a block's activations, routing and host
-/// sums, the event its route's copies complete at, and its stage.
+/// sums — a column's weighted sum, or under the rows form its host slots'
+/// unweighted rows — the event its route's copies complete at, and its stage.
 struct Set {
     x: PinnedHostBuffer<f32>,
     ids: PinnedHostBuffer<u32>,
@@ -112,14 +113,16 @@ struct Set {
 }
 
 /// Where a set's tier leg stands: no tiered layer, a tiered layer routed
-/// (its places downloaded), the tier's service enqueued, or its rows waited
-/// for — which the set's upload requires.
+/// (its places downloaded), the tier's service enqueued, its rows waited
+/// for — which the set's upload requires — or uploaded, the rows still the
+/// leg's own until its next route downloads over them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leg {
     Idle,
     Routed(BatchKey),
     Issued(BatchKey),
     Settled(BatchKey),
+    Rows(BatchKey),
 }
 
 /// A set's tier leg: the slots' tier places the route downloads, the rows
@@ -183,6 +186,9 @@ pub struct BatchPort {
     tiers: Vec<TierPort>,
     n_embd: usize,
     n_used: usize,
+    /// The sets' sums' form: 0 — a column's weighted sum; `k` — its first `k`
+    /// host slots' unweighted rows, the rows join's handback.
+    host_rows: usize,
     cap: usize,
     down: usize,
     serve: usize,
@@ -209,13 +215,29 @@ struct TierServe<'a> {
 
 impl BatchPort {
     /// Two sets for blocks of up to `cap` tokens of rows of `n_embd`, each
-    /// routed to `n_used` experts. Load-time only.
+    /// routed to `n_used` experts, every column's host side its weighted sum.
+    /// Load-time only.
     pub fn new(
         ctx: &Arc<CudaContext>,
         n_embd: usize,
         n_used: usize,
         cap: usize,
     ) -> Result<BatchPort, GpuError> {
+        BatchPort::new_rows(ctx, n_embd, n_used, cap, 0)
+    }
+
+    /// [`BatchPort::new`] with the sets' sums in their rows form (the
+    /// boundary page's `host_rows`): `host_rows` unweighted down rows a
+    /// column — the page rows a join sums per host slot — instead of one
+    /// weighted sum. Load-time only.
+    pub fn new_rows(
+        ctx: &Arc<CudaContext>,
+        n_embd: usize,
+        n_used: usize,
+        cap: usize,
+        host_rows: usize,
+    ) -> Result<BatchPort, GpuError> {
+        let per = host_rows.max(1);
         let pinned = |what: &'static str, n: usize| {
             PinnedHostBuffer::<f32>::zeroed(ctx, n).map_err(|source| GpuError::Driver {
                 op: Some(what),
@@ -232,7 +254,7 @@ impl BatchPort {
                     }
                 })?,
                 w: pinned("cuMemAllocHost (the batch's routing)", cap * n_used)?,
-                sum: pinned("cuMemAllocHost (the batch's host sums)", cap * n_embd)?,
+                sum: pinned("cuMemAllocHost (the batch's host sums)", cap * per * n_embd)?,
                 routed: ctx.new_event(None)?,
                 stage: Stage::Free,
             })
@@ -242,6 +264,7 @@ impl BatchPort {
             tiers: Vec::new(),
             n_embd,
             n_used,
+            host_rows,
             cap,
             down: 0,
             serve: 0,
@@ -448,7 +471,7 @@ impl BatchPort {
                 ));
             };
             let l = &port.legs[self.down];
-            if l.leg != Leg::Idle {
+            if !matches!(l.leg, Leg::Idle | Leg::Rows(_)) {
                 return Err(GpuError::Shape {
                     what: PORT,
                     detail: format!(
@@ -596,6 +619,7 @@ impl BatchPort {
             }
         }
         let x = Tensor2View::new(&set.x[at * n..u * n], n, u - at)?;
+        let per = self.host_rows.max(1) * n;
         let times = ServeTimes {
             wait_ns: nanos(t1 - t0),
             copy_ns: nanos(t1.elapsed()),
@@ -605,7 +629,7 @@ impl BatchPort {
             x,
             &set.ids[at * s..u * s],
             &set.w[at * s..u * s],
-            &mut set.sum[at * n..u * n],
+            &mut set.sum[at * per..u * per],
         )?;
         set.stage = Stage::Served(key);
         self.serve ^= 1;
@@ -714,9 +738,10 @@ impl BatchPort {
         self.tiers.iter().map(|t| t.stats).collect()
     }
 
-    /// Enqueue the copy of the oldest served set's sums, which must be
-    /// `key`'s, to `hsum`; the set is free again. A tiered set's tier rows
-    /// must have been waited for ([`BatchPort::settle_tiers`]) — a join
+    /// Enqueue the copy of the oldest served set's sums — a column's weighted
+    /// sum, or under the rows form its host rows — which must be `key`'s, to
+    /// `hsum` at the same values; the set is free again. A tiered set's tier
+    /// rows must have been waited for ([`BatchPort::settle_tiers`]) — a join
     /// without them is refused by name.
     pub fn upload(
         &mut self,
@@ -724,7 +749,7 @@ impl BatchPort {
         hsum: &mut DeviceBuffer<f32>,
         key: BatchKey,
     ) -> Result<(), GpuError> {
-        let n = self.n_embd;
+        let per = self.host_rows.max(1) * self.n_embd;
         let BatchKey { at, u, .. } = key;
         let set = &mut self.sets[self.up];
         if set.stage != Stage::Served(key) {
@@ -752,16 +777,49 @@ impl BatchPort {
             }
         }
         for port in &mut self.tiers {
-            port.legs[self.up].leg = Leg::Idle;
+            if port.legs[self.up].leg == Leg::Settled(key) {
+                port.legs[self.up].leg = Leg::Rows(key);
+            }
         }
-        // SAFETY: the copy writes values at·n .. u·n of `hsum` from this
+        // SAFETY: the copy writes values at·per .. u·per of `hsum` from this
         // set's page-locked sums, which the host writes again only in this
         // set's next serve, after a wait on the event of its next download —
         // enqueued after this copy, since the set is free from here on.
-        unsafe { htod(stream, hsum, &set.sum, at * n..u * n)? };
+        unsafe { htod(stream, hsum, &set.sum, at * per..u * per)? };
         set.stage = Stage::Free;
         self.up ^= 1;
         Ok(())
+    }
+
+    /// Tier `tier`'s rows of the set whose upload just left them — the
+    /// port's own just-uploaded set, `key` naming the upload: the same
+    /// buffer [`BatchPort::tier_rows`] vetted, still the leg's own until the
+    /// set's next route downloads over it, so a launch enqueued between the
+    /// upload and that route reads them complete (the rows join's card sum,
+    /// over the host's uploaded rows and the tier's). Any other leg, and a
+    /// tier the port has no side of, is refused by name.
+    pub fn tier_rows_uploaded(
+        &self,
+        tier: usize,
+        key: BatchKey,
+    ) -> Result<&DeviceBuffer<f32>, GpuError> {
+        const WHAT: &str = "BatchPort::tier_rows_uploaded";
+        let set = self.up ^ 1;
+        let l = self
+            .tiers
+            .get(tier)
+            .map(|p| &p.legs[set])
+            .ok_or(GpuError::state(WHAT, "a tier leg (BatchPort::attach_tier)"))?;
+        if l.leg != Leg::Rows(key) {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "tier {tier}'s rows of {key:?}; the set just uploaded's leg holds {:?}, want its upload's",
+                    l.leg
+                ),
+            });
+        }
+        Ok(&l.rows_stage)
     }
 }
 
@@ -1221,6 +1279,7 @@ impl<H: HostExperts> HostTier<H> {
             &mut self.tiers,
         );
         let (slots, fault) = (&self.slots, self.fault.as_ref());
+        let host_rows = self.step.boundary.layout.host_rows();
         let mut tier_failed = false;
         let r = port.serve_tiered(
             key,
@@ -1240,6 +1299,7 @@ impl<H: HostExperts> HostTier<H> {
                     fault,
                     hidden: h.hidden,
                     n_used: h.n_used,
+                    host_rows,
                 };
                 batch.serve_guarded(t, layer, x, ids, w, &[], out)
             },
@@ -1312,6 +1372,43 @@ impl<H: HostExperts> HostTier<H> {
             }));
         }
         self.port_mut(WHAT)?.tier_rows(tier, key)
+    }
+
+    /// [`HostTier::tier_rows_of`] with the host handback's upload in
+    /// between: `key`'s tier rows settle (the host wait the upload requires),
+    /// the set's sums — its weighted sum, or its host rows — go to `hsum`,
+    /// and the tier's rows come back for the launch that follows the upload
+    /// on the stream: the rows join's card sum reads the uploaded rows and
+    /// the tier's together. Refused as the two it wraps are.
+    pub fn upload_and_tier_rows(
+        &mut self,
+        stream: &CudaStream,
+        hsum: &mut DeviceBuffer<f32>,
+        key: BatchKey,
+        tier: usize,
+    ) -> Result<&DeviceBuffer<f32>, GpuError> {
+        const WHAT: &str = "HostTier::upload_and_tier_rows";
+        let deadline = Instant::now() + GO_DEADLINE;
+        let late = self.port_mut(WHAT)?.settle_tiers(key, deadline)?;
+        if late != 0 {
+            return Err(self.lose_tiers_as(SERVE_BATCH, key.layer, late, |t, _| {
+                format!(
+                    "the expert tier on {} did not finish its service of the prompt block's \
+                     columns {}..{} in {GO_DEADLINE:?}: the card is lost",
+                    t.name(),
+                    key.at,
+                    key.u
+                )
+            }));
+        }
+        self.port_mut(WHAT)?.upload(stream, hsum, key)?;
+        self.port
+            .as_ref()
+            .ok_or(GpuError::State {
+                what: WHAT,
+                missing: "the batch port's sets (HostTier::prepare_batch)",
+            })?
+            .tier_rows_uploaded(tier, key)
     }
 
     /// The expert tiers' fault words once their streams have drained,
@@ -1406,6 +1503,9 @@ pub(super) struct Tier<'a, H> {
     pub(super) fault: Option<&'a Arc<DeviceBuffer<u32>>>,
     pub(super) hidden: usize,
     pub(super) n_used: usize,
+    /// The sums' form: 0 — a column's weighted sum; `k` — its first `k` host
+    /// slots' unweighted rows (the boundary page's `host_rows`).
+    pub(super) host_rows: usize,
 }
 
 impl BatchService {
@@ -1428,22 +1528,24 @@ impl BatchService {
     ) -> Result<(), GpuError> {
         const WHAT: &str = SERVE_BATCH;
         let (hidden, n_used) = (t.hidden, t.n_used);
+        let per = t.host_rows.max(1) * hidden;
         let cols = x.ne1();
         if x.ne0() != hidden
             || cols == 0
             || ids.len() != cols * n_used
             || weights.len() != cols * n_used
-            || out.len() != cols * hidden
+            || out.len() != cols * per
         {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
                     "{cols} columns of {} values with {} ids, {} weights and {} sums; the \
-                     boundary carries {n_used} slots of {hidden} values a column",
+                     boundary carries {n_used} slots of {hidden} values a column, {} host rows",
                     x.ne0(),
                     ids.len(),
                     weights.len(),
-                    out.len()
+                    out.len(),
+                    t.host_rows
                 ),
             ));
         }
@@ -1506,7 +1608,11 @@ impl BatchService {
                 .map(|(j, &n)| &self.lists[j * n_used..][..n]),
         );
         let Some((first, saw)) = refused else {
-            let r = t.experts.experts_union_into(layer, x, &lists, out);
+            let r = if t.host_rows > 0 {
+                t.experts.experts_union_rows_into(layer, x, &lists, out)
+            } else {
+                t.experts.experts_union_into(layer, x, &lists, out)
+            };
             self.slices = reuse_slices(lists);
             r?;
             self.count(cols, host_slots, excluded, t0);
@@ -1518,13 +1624,17 @@ impl BatchService {
         for &j in &self.refused {
             clean.col_mut(j).fill(0.0);
         }
-        let r = t
-            .experts
-            .experts_union_into(layer, clean.view(), &lists, out);
+        let r = if t.host_rows > 0 {
+            t.experts
+                .experts_union_rows_into(layer, clean.view(), &lists, out)
+        } else {
+            t.experts
+                .experts_union_into(layer, clean.view(), &lists, out)
+        };
         self.slices = reuse_slices(lists);
         r?;
         for &j in &self.refused {
-            out[j * hidden..][..hidden].fill(f32::NAN);
+            out[j * per..][..per].fill(f32::NAN);
         }
         self.count(cols, host_slots, excluded, t0);
         let r = Refusal {
@@ -1563,6 +1673,7 @@ impl BatchService {
             fault,
             hidden,
             n_used,
+            host_rows,
         } = t;
         health.refuse_if_poisoned(SERVE_BATCH)?;
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1573,6 +1684,7 @@ impl BatchService {
                 fault,
                 hidden,
                 n_used,
+                host_rows,
             };
             self.serve_one(t, layer, x, ids, weights, exclude, out)
         }));
