@@ -101,8 +101,6 @@ binary's `--help`.
   `exceed_context_size_error`. A 12–16 GB card's split Qwen3 load picks a small context (2,048 positions a slot at
   `--parallel 2`); agent clients with long system prompts want `--parallel 1` there.
 - One model a server; one expert tier card at most (`--place bp`).
-- Under WSL2, Qwen3.8, GLM-5.3 and DeepSeek-V4.1 run only with `BLOOMERY_RESIDENCY=off` for now: the residency
-  swap's wait on a host word queues behind the request's readback there, and the request stops ([#1](https://github.com/midagedev/bloomery/issues/1)).
 - Concurrent streams run as one pass on a whole-card Qwen3-30B or Qwen3.6, on V4.1, GLM-5.3 and Qwen3.8; a placed
   Qwen3-30B or Qwen3.6 and a sampled request on a drafting load step in turn. A new request's prompt runs whole while the other
   streams wait. The decide seat serves one request at a time; DSpark drafts never rejoin — `--parallel > 1` with
