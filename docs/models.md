@@ -35,9 +35,8 @@ recommended — a load streams the file to the card, and V4.1 reads its engram t
 | DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB | 347.3 GB (a source build can add a 155.7 GB r8 sidecar; the release does not use one) |
 
 Qwen3.8's 28.8 GB PLE table is read from host RAM whatever the cards, so no number of cards holds the whole
-file. `UD-Q3_K_XL` (90.0 GB, not yet run) keeps every routed expert on the host whatever the card, since no card
-kernel reads its IQ3_XXS and IQ4_NL stacks: about 89 GB free. The MTP draft reads a Q8_0 head and this file's is
-Q6_K, so the draft is off on it by name (a set `BLOOMERY_DRAFT=mtp` is refused at the load).
+file. `UD-Q3_K_XL` (90.0 GB) does not run yet: the load refuses its IQ3_XXS and IQ4_NL expert stacks and its Q6_K
+MTP head. Card kernels for those types are in progress.
 
 **Recommended** (the configuration every number in the README ran on): a 32-core AVX2 CPU with 8 DDR4
 channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for `--place bp`. Cards are found
