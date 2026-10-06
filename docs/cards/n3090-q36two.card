@@ -1,0 +1,16 @@
+# README headline. Qwen3.6-35B Q4_K_M whole on the 3090 (250 W cap), two busy slots in one pass after a 512-id
+# prompt, now that q36rows landed (4bf06411: Body35 SlotRows). [derived] One stream 193.85 on this card
+# (n3090-q36); Qwen3-30B's two-slot pass on the same card gave x1.31 of its one stream (253.99 against ~194 [derived
+# from the A6000 ratio 1.32..1.35]); Qwen3.6's hybrid attention adds the second row's recurrent state reads:
+# x1.15..1.40 of 193.85.
+kind: baseline
+question: what do two Qwen3.6-35B streams decode at, in total, whole on the RTX 3090, in one pass?
+term: tok/s(aggregate) @ n=2·95, depth 512, RTX 3090 (250 W cap) whole card, BLOOMERY_GEN_SLOTS=2
+unit: tok/s
+predict: 223..272
+condition: the runner's one arm in its own lease, 3 rounds; no FAIL row, no [cold], [cpu-busy] or [other-busy] row
+  among the counted rounds; the 3090 at its 250 W cap and no Xid in the witness blocks; the full output to a file first
+reason: sets the README's Qwen3.6 row on the 3090 (footnote 1 goes); why now: q36rows landed on main
+decide-in: write the row into rig-log 10-06 and the README with its conditions
+decide-below: read the pass ms against the one-stream step and the nodes column before the row goes out
+decide-above: check the slots record's positions before the row goes out
