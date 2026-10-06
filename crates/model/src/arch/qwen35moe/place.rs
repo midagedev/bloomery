@@ -576,8 +576,7 @@ impl PlanInputs {
             });
         };
         let (draft, reserve) = mtp.draft_plan(ctx_max)?;
-        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab))
-            + mtp_head_act_bytes(mtp.borrowed_head, u64::from(mtp.draft.hidden));
+        let arena = mtp.arena_bytes();
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let plan = self.target(machine, ctx_max, levers, experts, 0)?;
@@ -599,7 +598,9 @@ impl PlanInputs {
         }
         check_draft_reserve(machine, None)?;
         let plan = self.target(machine, ctx_max, levers, experts, reserve)?;
-        let (t, d) = (&plan.cards[0], &draft.cards[0]);
+        let t = &plan.cards[0];
+        // The draft's term is the reserve the expert rule spread within, so
+        // the bound and the budget count one number.
         let total = [
             t.dense_bytes,
             t.expert_bytes,
@@ -607,8 +608,7 @@ impl PlanInputs {
             t.kv_bytes,
             t.scratch_bytes,
             t.context_bytes,
-            draft_card_bytes(d, mtp.map_bytes),
-            arena,
+            reserve,
         ]
         .iter()
         .sum::<u64>();
@@ -672,8 +672,7 @@ impl PlanInputs {
             });
         };
         let (draft, reserve) = mtp.draft_plan_of(ctx_max, slots)?;
-        let arena = mtp_arena_bytes(u64::from(mtp.draft.vocab))
-            + mtp_head_act_bytes(mtp.borrowed_head, u64::from(mtp.draft.hidden));
+        let arena = mtp.arena_bytes();
         let terms = self.seq_terms(Some(mtp));
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
@@ -700,7 +699,9 @@ impl PlanInputs {
         check_draft_reserve(machine, None)?;
         let mut plan = self.target_of(machine, ctx_max, levers, experts, reserve + rows, &kv)?;
         plan.cards[0].kv_bytes += rows;
-        let (t, d) = (&plan.cards[0], &draft.cards[0]);
+        let t = &plan.cards[0];
+        // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
+        // reserve the expert rule spread within.
         let total = [
             t.dense_bytes,
             t.expert_bytes,
@@ -708,8 +709,7 @@ impl PlanInputs {
             t.kv_bytes,
             t.scratch_bytes,
             t.context_bytes,
-            draft_card_bytes(d, mtp.map_bytes),
-            arena,
+            reserve,
         ]
         .iter()
         .sum::<u64>();
@@ -887,9 +887,10 @@ pub struct MtpPlan<'a> {
     pub draft: Plan<'a>,
     /// The head's row → id map, one `u32` a vocabulary id whatever the head.
     pub map_bytes: u64,
-    /// The draft program's arena ([`mtp_arena_bytes`] at the draft's
-    /// vocabulary), counted beside the draft's card bytes; the load's
-    /// `Mtp38::arm` holds the arena it allocates to it.
+    /// The draft program's arena ([`MtpInputs::arena_bytes`]: at the
+    /// draft's vocabulary, with its borrowed head's activation), counted
+    /// beside the draft's card bytes; the load's `Mtp38::arm` holds the arena
+    /// it allocates to it.
     pub arena_bytes: u64,
     /// The card's usable bytes (capped by the card budget) less the target's
     /// and the draft's card terms; the margin is inside it.
@@ -1571,11 +1572,23 @@ pub struct MtpInputs {
 }
 
 impl MtpInputs {
+    /// Card bytes the draft's program arena holds: [`mtp_arena_bytes`] at
+    /// the draft's vocabulary and its borrowed head's activation
+    /// ([`mtp_head_act_bytes`]). The one owner of the arena term: the
+    /// reserve the target's expert rule spreads within
+    /// ([`MtpInputs::draft_plan`]), the drafted plan's card bound and its
+    /// [`MtpPlan::arena_bytes`] all take it from here.
+    #[must_use]
+    pub fn arena_bytes(&self) -> u64 {
+        mtp_arena_bytes(u64::from(self.draft.vocab))
+            + mtp_head_act_bytes(self.borrowed_head, u64::from(self.draft.hidden))
+    }
+
     /// The draft's plan at `ctx_max` positions on its own card
     /// ([`MtpInputs::machine`]), and the bytes it adds to the target's card:
     /// its granules, its store, the head's row map and its program's arena
-    /// ([`mtp_arena_bytes`]). Refused by name when the plan keeps a routed
-    /// expert off the card.
+    /// ([`MtpInputs::arena_bytes`]). Refused by name when the plan keeps a
+    /// routed expert off the card.
     fn draft_plan(&self, ctx_max: u64) -> Result<(Plan<'_>, u64), PlaceError> {
         self.draft_plan_of(ctx_max, 1)
     }
@@ -1606,8 +1619,7 @@ impl MtpInputs {
                 experts: self.model.experts,
             });
         }
-        let arena = mtp_arena_bytes(u64::from(self.draft.vocab));
-        let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + arena;
+        let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + self.arena_bytes();
         Ok((draft, bytes))
     }
 
@@ -2954,7 +2966,7 @@ mod tests {
 
         use super::super::{
             Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, draft_card_bytes, machine_bp,
-            mtp_arena_bytes, slot_resident_bytes, tier_batch_of,
+            slot_resident_bytes, tier_batch_of,
         };
         use super::mtp::{draft, file};
         use crate::arch::qwen35moe::hparams::{Exp, FfnKind, Hparams, Kind, Ple, Variant};
@@ -3147,8 +3159,7 @@ mod tests {
                 CardFormat::of_routed,
             )
             .expect("the draft's plan");
-            let bytes = draft_card_bytes(&plan.cards[0], mtp.map_bytes)
-                + mtp_arena_bytes(u64::from(mtp.draft.vocab));
+            let bytes = draft_card_bytes(&plan.cards[0], mtp.map_bytes) + mtp.arena_bytes();
             (plan, bytes)
         }
 

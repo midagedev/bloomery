@@ -1845,9 +1845,10 @@ gen-glm5next *ARGS:
 # 서술·역할별 텐서·커버리지 검사의 목록과 헤더에서 세운 계획(카드·호스트·캐시 바이트). 헤더만, 초 단위. 마지막 호출은
 # 호스트 티어가 48층을 모두 서빙하는지와 네 층의 단계별 밴드다(네 층에서 expert 30개의 행을 읽는다, 초 단위). 샤드 넷이 다 있어야 한다.
 # 그 사이에 MTP 초안 파일 둘(shared와 아닌 것)을 타깃 헤더에 대어 읽은 서술을 고정한다. 앞 호출이 빨개도 뒤 호출은 모두 돌고,
-# 종료 코드는 넷 중 하나라도 0이 아니면 0이 아니다.
+# 종료 코드는 어느 하나라도 0이 아니면 0이 아니다.
+# The drafted plan's card bound on a synthetic file (qwen4exp_mtp_reserve, no file read) runs after the lib tests.
 gate-qwen4exp-meta:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe arch::tests::a_qwen4exp --nocapture; lib=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_meta -- --ignored --nocapture; meta=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_mtp_meta -- --ignored --nocapture; mtp=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_host -- --ignored --nocapture; host=$?; echo "gate-qwen4exp-meta rc: lib $lib meta $meta mtp $mtp host $host"; [ "$lib" = 0 ] && [ "$meta" = 0 ] && [ "$mtp" = 0 ] && [ "$host" = 0 ]'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::qwen35moe arch::tests::a_qwen4exp --nocapture; lib=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_mtp_reserve -- --nocapture; reserve=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_meta -- --ignored --nocapture; meta=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_mtp_meta -- --ignored --nocapture; mtp=$?; bash tools/gate.sh --release -p bloomery-model --test qwen4exp_host -- --ignored --nocapture; host=$?; echo "gate-qwen4exp-meta rc: lib $lib reserve $reserve meta $meta mtp $mtp host $host"; [ "$lib" = 0 ] && [ "$reserve" = 0 ] && [ "$meta" = 0 ] && [ "$mtp" = 0 ] && [ "$host" = 0 ]'
 
 # The chat route trace (D2's input, not a gate, lead-only, in the lead's A6000 window): one bloomery-serve-ds41
 # process (one load, plan (a) on the A6000) with BLOOMERY_ROUTE_TRACE=OUT and the step feed runs every prompt row of
