@@ -136,7 +136,13 @@
   `mmproj-Cloudflare_clef-flash-{bf16,f16}.gguf`), and llama.cpp's `/v1/systemone` takes its images through mtmd
   (a4cb4c61 `server-decision.cpp:199-242`, data URLs, at most 8). We refuse them by name
   (`crates/decision/src/request.rs:144`). Needs the Qwen3.5 vision tower on `gpu-vision`'s kernels, the mmproj reader,
-  and visinj's injection lifted to a common owner for Body35. Design round after visinj lands;
+  and visinj's injection lifted to a common owner for Body35. Design done (clefvis, 2026-10-06, kept outside the
+  repo): tower `qwen3vl_merger` (27 × 1152, heads of 72, learned 48×48 positions, 2×2 merge to 4096, no DeepStack);
+  `vis_gemm_bf16` as it is plus five new `vis_` entries (V4.1 md5 unmoved); M-RoPE injection through a per-call rope
+  table with no new kernel. Rounds R0 oracle sets (mainline llama.cpp) · R1 preprocess (Mac) · R2 tower (L) · R3
+  injection after visinj · R4 decide seat (`--mmproj`, `--image-min/max-tokens`; the refusal's "backbone reads text
+  only" wording goes) · R5 one sitting. Preprocessing follows llama.cpp's mtmd (black pad, 8–4096 tokens), which can be
+  proven byte for byte; the release's stretch rule is the open alternative;
 - residency invariance (E1, eqC, eqA*);
 - parity1;
 - structured output.
