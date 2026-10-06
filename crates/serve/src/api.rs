@@ -45,21 +45,21 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value, json};
 
-use crate::dsml::{ChatParser, Message, ToolCall, ToolFormat, Tools};
+use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
 use crate::engine::{
     DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps, SamplerFactory,
     SamplingParams, StateError, Tokenizer,
 };
 use crate::genloop::{self, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
-use crate::glmxml::{ArgTypes, GlmXmlError};
+use crate::glmxml::ArgTypes;
 use crate::http::{self, EventStream, Request};
-use crate::reasoning::{ReasoningFormat, ThinkSplit};
+use crate::reasoning::{ReasoningFormat, ThinkEntry};
 use crate::sampling;
 use crate::sched::{Board, Refusal, Reserve, SlotConfig, Use, default_depth};
 use crate::slotfile;
@@ -275,7 +275,7 @@ impl Server {
             parallel,
             tok,
             fatal_linger: config.fatal_linger,
-            tool_format: ToolFormat::of_template(template.source()),
+            tool_format: ToolFormat::of_chat_template(&template),
             template,
             alias: config.model_alias,
             model_path: config.model_path,
@@ -438,16 +438,35 @@ impl State {
         let t = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64);
-        format!(
-            "{:016x}{:016x}",
-            mix(t ^ n),
-            mix(n.wrapping_add(0x5bd1_e995))
-        )
+        format!("{:016x}{:016x}", mix(t ^ n), id_half(process_seed(), n))
     }
 
     fn fatal(&self) -> Option<String> {
         relock(&self.shared.fatal).clone()
     }
+}
+
+/// The id's second half: the request counter under the process's seed, never
+/// the counter alone — with the counter alone every process drew the same
+/// half at the same request number.
+fn id_half(seed: u64, n: u64) -> u64 {
+    mix(seed ^ n.wrapping_add(0x5bd1_e995))
+}
+
+/// A seed no other process shares, drawn once. The workspace links no OS
+/// entropy source, so it mixes what the OS varies per process: the clock, the
+/// pid, and this static's own address (its placement varies with the
+/// process's address space).
+fn process_seed() -> u64 {
+    static SEED: OnceLock<u64> = OnceLock::new();
+    *SEED.get_or_init(|| {
+        let t = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let pid = u64::from(std::process::id());
+        let addr = std::ptr::addr_of!(SEED) as u64;
+        mix(mix(t) ^ pid) ^ mix(addr)
+    })
 }
 
 fn mix(mut z: u64) -> u64 {
@@ -917,6 +936,7 @@ fn gen_params(state: &State, o: &Map<String, Value>) -> Result<GenParams, ApiErr
             .unwrap_or(false),
         cache_prompt: get_b(o, "cache_prompt").unwrap_or(true),
         reasoning_budget: reasoning_budget(o)?,
+        think_entry: ThinkEntry::Closed,
     };
     Ok(p)
 }
@@ -963,13 +983,19 @@ fn json_type(v: &Value) -> &'static str {
     }
 }
 
-/// The think-span budget lives only while the prompt opens the span: a prompt
-/// whose text ends with `<think>` starts the model inside it, and one that
-/// already closed it (the template with thinking off) has no reasoning to cap,
+/// The think-span budget lives only where a span can open: a prompt that
+/// ends with the start tag starts the model inside it, one that ends with
+/// the closed span (the template with thinking off) has no reasoning to cap,
 /// so the budget is silently ignored there — llama-server ignores
-/// `--reasoning-budget` when thinking is already off by other means.
+/// `--reasoning-budget` when thinking is already off by other means — and one
+/// that ends with neither leaves the span to the model, where the budget
+/// starts counting at the start tag, as llama-server's sampler does. The
+/// entry lands in `p` for the generation's budget tracker whatever the
+/// budget: the ids before a model-opened span spend nothing, and its close
+/// ids are not forced until the span opens.
 fn gate_reasoning_budget(p: &mut GenParams, prompt: &str) {
-    if p.reasoning_budget.is_some() && !ThinkSplit::prompt_opens_span(prompt) {
+    p.think_entry = ThinkEntry::of_prompt(prompt);
+    if p.reasoning_budget.is_some() && p.think_entry == ThinkEntry::Closed {
         p.reasoning_budget = None;
     }
 }
@@ -1027,6 +1053,7 @@ fn default_params() -> GenParams {
         include_usage: false,
         cache_prompt: true,
         reasoning_budget: None,
+        think_entry: ThinkEntry::Closed,
     }
 }
 
@@ -2190,14 +2217,15 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
     Ok(Some(match state.tool_format {
         ToolFormat::Dsml => Tools::Dsml,
         ToolFormat::GlmXml => Tools::GlmXml(ArgTypes::of_tools(b.get("tools"))),
+        ToolFormat::Hermes => Tools::Hermes,
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,
                 code: 501,
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
-                          (DSML and GLM's are parsed): send the request without tools or with \
-                          tool_choice \"none\""
+                          (DSML, GLM's and Hermes' are parsed): send the request without tools \
+                          or with tool_choice \"none\""
                     .to_owned(),
             });
         }
@@ -2206,7 +2234,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
 
 /// A generation whose tool-call markup does not parse: the server's error,
 /// as llama-server answers output its chat parser refuses.
-fn tool_markup_error(e: &GlmXmlError) -> ApiError {
+fn tool_markup_error(e: &MarkupError) -> ApiError {
     ApiError {
         retry_after: false,
         code: 500,
@@ -2266,7 +2294,7 @@ fn chat(state: &State, req: &Request, w: &mut TcpStream) -> io::Result<bool> {
     let tpt = p.timings_per_token;
     // Markup that does not parse stops the generation (the sink fails) and
     // ends the stream with an error event instead of a dropped connection.
-    let mut markup: Option<GlmXmlError> = None;
+    let mut markup: Option<MarkupError> = None;
     let r = {
         let meta = &ids_meta;
         let mut sink = |ev: Event<'_>, _slot: usize| -> io::Result<()> {
@@ -2392,7 +2420,7 @@ fn chat_final(meta: &ChatIds, o: &Outcome, m: &Message) -> Value {
 mod tests {
     use super::{
         ACCEPT_BACKOFF, EBADF, EFAULT, EINVAL, EMFILE, ENFILE, EngineProps, SlotQueue,
-        after_accept_error, carries_media, content_text, engine_object,
+        after_accept_error, carries_media, content_text, engine_object, id_half,
     };
     use serde_json::{Value, json};
     use std::io;
@@ -2531,5 +2559,19 @@ mod tests {
         assert_eq!(q.try_draw(), None, "one ticket still waits");
         q.pass(2);
         assert_eq!(q.try_draw(), Some(3), "idle again after every turn passed");
+    }
+
+    /// The id's second half is the request counter under the process's seed:
+    /// two seeds never draw the same half at the same request number — with
+    /// the counter alone every process did.
+    #[test]
+    fn id_halves_differ_per_seed_at_the_same_counter() {
+        let mut seen = std::collections::HashSet::new();
+        for seed in 0..1000u64 {
+            assert!(
+                seen.insert(id_half(seed, 7)),
+                "seed {seed} draws a half another seed drew at the same counter"
+            );
+        }
     }
 }

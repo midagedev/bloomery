@@ -47,7 +47,7 @@ use crate::engine::{
     Saved, SlotPass, SlotRow, StateError, Tokenizer,
 };
 use crate::promptcache::{self, PromptCache};
-use crate::reasoning::{THINK_CLOSE, ThinkSplit};
+use crate::reasoning::{THINK_CLOSE, ThinkEntry, ThinkSplit};
 use crate::sampling;
 use crate::slotfile::{self, Counting};
 use crate::stop::StopScan;
@@ -69,10 +69,14 @@ pub(crate) struct GenParams {
     /// The think-span budget, in generated ids taken while the span is open:
     /// spending it force-feeds the span's close id, which the model's context
     /// then really carries (llama-server's `--reasoning-budget` per request).
-    /// `Some` only when the prompt's text opened the span — a prompt that
-    /// already closed it has no reasoning to cap and the budget is silently
-    /// ignored, as llama-server ignores the flag when thinking is off.
+    /// `Some` only where a span can open — a prompt that already closed it has
+    /// no reasoning to cap and the budget is silently ignored, as llama-server
+    /// ignores the flag when thinking is off.
     pub reasoning_budget: Option<usize>,
+    /// Where the prompt left the think span, for the budget's tracker: the
+    /// ids before a model-opened span spends nothing, and its close ids are
+    /// not forced until the span opens.
+    pub think_entry: ThinkEntry,
 }
 
 /// llama-server's `timings` object, as the server clocked it.
@@ -944,7 +948,8 @@ pub(crate) enum Need {
 /// ids of the close, `at` naming the next of them the loop force-feeds —
 /// `close.len()` while the budget holds.
 struct Think {
-    /// Budget left; the id whose text closes the span does not spend.
+    /// Budget left; the id whose text opens a model-opened span and the id
+    /// whose text closes the span do not spend.
     left: usize,
     split: ThinkSplit,
     close: Vec<u32>,
@@ -952,21 +957,23 @@ struct Think {
 }
 
 impl Think {
-    /// A budget of `left` generated ids over a span the prompt opened; at 0 the
-    /// close is forced from the first taken id.
-    fn new(left: usize, close: Vec<u32>) -> Think {
+    /// A budget of `left` generated ids over a span the prompt left at
+    /// `entry`; at 0 the close is forced from the first taken id inside the
+    /// span, which for a model-opened span is the first after its `<think>`.
+    fn new(entry: ThinkEntry, left: usize, close: Vec<u32>) -> Think {
         let n = close.len();
         Think {
             left,
-            split: ThinkSplit::inside(),
+            split: ThinkSplit::for_entry(entry),
             close,
             at: if left == 0 { 0 } else { n },
         }
     }
 
-    /// Whether a close id is queued to force.
+    /// Whether a close id is queued to force: the budget spent with the span
+    /// open — a span the model may still open forces nothing.
     fn forcing(&self) -> bool {
-        self.at < self.close.len()
+        self.split.in_span() && self.at < self.close.len()
     }
 
     /// The next close id to force.
@@ -1012,7 +1019,7 @@ pub(crate) struct Gen {
     /// The token the loop takes next; `None` once there is none.
     tok: Option<u32>,
     /// The think-span budget, `None` on a request without one (or whose prompt
-    /// never opened the span) and once the span closed.
+    /// closed the span) and once the span closed.
     think: Option<Think>,
 }
 
@@ -1063,7 +1070,7 @@ impl Gen {
             tok: None,
             think: p
                 .reasoning_budget
-                .map(|left| Think::new(left, slot.vocab.encode(THINK_CLOSE))),
+                .map(|left| Think::new(p.think_entry, left, slot.vocab.encode(THINK_CLOSE))),
         }
     }
 
@@ -1111,16 +1118,25 @@ impl Gen {
     }
 
     /// One taken id against the think budget: its text first — a piece that
-    /// closes the span retires the tracker, the closing id spending nothing —
-    /// then the count, which arms the forced close at zero.
+    /// closes the span retires the tracker, the closing id spending nothing,
+    /// and a piece that opens a model-opened span spending nothing either —
+    /// then the count, only for a span already open, which arms the forced
+    /// close at zero.
     fn spend(&mut self, piece: Option<&str>) {
         let Some(t) = self.think.as_mut() else {
             return;
         };
-        if let Some(text) = piece
-            && t.split.push(text).closed
-        {
-            self.think = None;
+        if let Some(text) = piece {
+            let s = t.split.push(text);
+            if s.closed {
+                self.think = None;
+                return;
+            }
+            if s.opened {
+                return;
+            }
+        }
+        if !t.split.in_span() {
             return;
         }
         if t.left > 0 {
@@ -1498,6 +1514,7 @@ mod cache_tests {
         CacheNote, Decoder, Engine, EngineError, SamplingParams, Saved, StateError, Tokenizer,
     };
     use crate::mock::{MockEngine, MockTokenizer};
+    use crate::reasoning::ThinkEntry;
     use crate::sampling;
 
     /// The mock vocabulary, whose `<｜User｜>` (id 2) opens a message.
@@ -1724,6 +1741,7 @@ mod cache_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: None,
+            think_entry: ThinkEntry::Closed,
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -1848,6 +1866,7 @@ mod cache_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: None,
+            think_entry: ThinkEntry::Closed,
         };
         let mut tim = Timings::default();
         let r = generate(
@@ -1943,6 +1962,7 @@ mod cache_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: None,
+            think_entry: ThinkEntry::Closed,
         };
         let factory = sampling::reference_factory();
         let mut tim = Timings::default();
@@ -2116,6 +2136,7 @@ mod think_tests {
     use super::{GenParams, Outcome, Slot, StopKind, Timings, generate};
     use crate::engine::{Drafted, Engine, EngineError, SamplingParams, Tokenizer};
     use crate::mock::{DraftMock, MockEngine, MockTokenizer};
+    use crate::reasoning::ThinkEntry;
     use crate::sampling;
 
     /// An engine behind a log of every id fed to it: `prefill`'s, every
@@ -2188,6 +2209,7 @@ mod think_tests {
             include_usage: false,
             cache_prompt: true,
             reasoning_budget: budget,
+            think_entry: ThinkEntry::of_prompt(prompt),
         };
         let mut tim = Timings::default();
         let o = generate(
@@ -2269,5 +2291,32 @@ mod think_tests {
             fed,
             vec![Q, 4, A, A, 4, A, 4, A, 4, CLOSE, MockTokenizer.eos()]
         );
+    }
+
+    /// The mock ids the model-opened cases spell: `x` and `y`. A prompt
+    /// `x<think>yx` ends in plain text, and the mock's first answer is the
+    /// `<think>` its earlier occurrence taught (the prompt's `x` follows with
+    /// it): the model opens the span itself.
+    const X: u32 = 6 + 120;
+    const Y: u32 = 6 + 121;
+
+    /// A span the model opens itself: the opening id spends nothing, no close
+    /// id is forced before it, and the budget counts the ids after it until
+    /// the forced close retires the tracker.
+    #[test]
+    fn a_model_opened_span_spends_from_its_open_tag() {
+        let (fed, o) = run("x<think>yx", Some(2));
+        assert_eq!(o.tokens, vec![4, Y, X, CLOSE, MockTokenizer.eos()]);
+        assert_eq!(fed, vec![X, 4, Y, X, 4, Y, X, CLOSE]);
+    }
+
+    /// A budget of 0 over a model-opened span forces the close from the first
+    /// id inside it — the model's opening `<think>` passes, as the start tag
+    /// is where the sampler begins, and the second taken id is the close.
+    #[test]
+    fn a_budget_of_zero_forces_after_the_model_opens() {
+        let (fed, o) = run("x<think>yx", Some(0));
+        assert_eq!(o.tokens, vec![4, CLOSE, MockTokenizer.eos()]);
+        assert_eq!(fed, vec![X, 4, Y, X, 4, CLOSE]);
     }
 }

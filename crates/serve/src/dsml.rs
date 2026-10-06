@@ -1,7 +1,7 @@
 //! DSML tool calls for the V4.1 chat template, and the parser that turns one
 //! generation into `reasoning_content`, `content` and `tool_calls` under the
 //! tool-call markup its template teaches ([`ToolFormat`]: DSML here, GLM's in
-//! [`crate::glmxml`]).
+//! [`crate::glmxml`], Hermes' in [`crate::hermes`]).
 //!
 //! The markup is the template's own (its `tools_header` and the assistant
 //! `tool_calls` branch):
@@ -24,8 +24,12 @@
 //! Every decision depends on the text only, never on how it was cut into pieces,
 //! so a stream and a whole response parse to the same message.
 
+use serde_json::{Map, json};
+
 use crate::glmxml::{self, ArgTypes, GlmScan, GlmXmlError};
+use crate::hermes::{self, HermesError, HermesScan};
 use crate::reasoning::{ReasoningFormat, Split, THINK_CLOSE, ThinkSplit, partial_suffix};
+use crate::template::ChatTemplate;
 
 /// The template's `dsml_token`.
 pub const DSML: &str = "｜DSML｜";
@@ -265,15 +269,21 @@ pub enum ToolFormat {
     Dsml,
     /// GLM's `<tool_call>NAME<arg_key>…</arg_key><arg_value>…</arg_value></tool_call>`.
     GlmXml,
-    /// Neither (Qwen3's `<tool_call>` JSON, say): no parser reads its calls, so
-    /// a chat request that asks for tool calls is refused.
+    /// Hermes' `<tool_call>` around one JSON object naming `name` and
+    /// `arguments` (Qwen3's markup).
+    Hermes,
+    /// None the server parses (Qwen3.8's `<function>` tags, say): a chat
+    /// request that asks for tool calls is refused.
     Unparsed,
 }
 
 impl ToolFormat {
-    /// The markup the template `source` writes for a call: GLM's when it
+    /// The markup the template `source` spells for a call: GLM's when it
     /// spells `<tool_call>`, `<arg_key>` and `<arg_value>`, DSML's when it
-    /// spells the DSML token, else [`ToolFormat::Unparsed`].
+    /// spells the DSML token, else nothing the source alone can name — a
+    /// `<tool_call>` template may carry Hermes' JSON body or Qwen3.8's
+    /// `<function>` tags, which only a rendered call tells apart
+    /// ([`ToolFormat::of_chat_template`]).
     #[must_use]
     pub fn of_template(source: &str) -> ToolFormat {
         let glm = [glmxml::CALL_OPEN, glmxml::KEY_OPEN, glmxml::VALUE_OPEN];
@@ -285,6 +295,72 @@ impl ToolFormat {
             ToolFormat::Unparsed
         }
     }
+
+    /// The markup a chat template teaches, read the way llama.cpp's
+    /// autoparser reads it: the source's own spellings first (GLM's tags, the
+    /// DSML token), then a rendered assistant call for a `<tool_call>`
+    /// template the source cannot type by spelling — Hermes' when some
+    /// rendered `<tool_call>`…`</tool_call>` holds a JSON body naming `name`
+    /// and `arguments`. A template whose probe render fails teaches nothing
+    /// this server parses.
+    #[must_use]
+    pub fn of_chat_template(t: &ChatTemplate) -> ToolFormat {
+        let spelled = ToolFormat::of_template(t.source());
+        if spelled != ToolFormat::Unparsed {
+            return spelled;
+        }
+        let mut vars = Map::new();
+        vars.insert(
+            "messages".into(),
+            json!([
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"type": "function", "function": {
+                        "name": "get_weather", "arguments": {"location": "Seoul"},
+                    }},
+                ]},
+            ]),
+        );
+        vars.insert("add_generation_prompt".into(), json!(false));
+        vars.insert(
+            "tools".into(),
+            json!([{"type": "function", "function": {
+                "name": "get_weather", "parameters": {"type": "object"},
+            }}]),
+        );
+        vars.insert("enable_thinking".into(), json!(true));
+        if t.render(&vars).is_ok_and(|p| hermes_markup(&p)) {
+            ToolFormat::Hermes
+        } else {
+            spelled
+        }
+    }
+}
+
+/// Whether a rendered template spells the Hermes call markup: some
+/// `<tool_call>`…`</tool_call>` whose body is a JSON object naming `name` and
+/// `arguments` (Qwen3's header spells it with placeholders, its assistant
+/// branch with the call itself; Qwen3.8's `<function>` body does not match).
+fn hermes_markup(rendered: &str) -> bool {
+    let mut at = 0;
+    while let Some(open) = rendered[at..].find(hermes::CALL_OPEN) {
+        let body = at + open + hermes::CALL_OPEN.len();
+        match rendered[body..].find(hermes::CALL_CLOSE) {
+            Some(close) => {
+                let inner = rendered[body..body + close].trim();
+                if inner.starts_with('{')
+                    && inner.ends_with('}')
+                    && inner.contains("\"name\"")
+                    && inner.contains("\"arguments\"")
+                {
+                    return true;
+                }
+                at = body + close;
+            }
+            None => return false,
+        }
+    }
+    false
 }
 
 /// The tool-call scan a parser runs.
@@ -293,12 +369,35 @@ pub enum Tools {
     Dsml,
     /// GLM's markup, typing each argument by the request's tool schemas.
     GlmXml(ArgTypes),
+    /// Hermes' markup.
+    Hermes,
 }
 
 #[derive(Debug)]
 enum Scan {
     Dsml(DsmlScan),
     Glm(GlmScan),
+    Hermes(HermesScan),
+}
+
+/// A generation whose tool-call markup does not parse: which scan refused,
+/// and its refusal.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MarkupError {
+    /// The GLM scan's refusal.
+    #[error("{0}")]
+    Glm(#[from] GlmXmlError),
+    /// The Hermes scan's refusal.
+    #[error("{0}")]
+    Hermes(#[from] HermesError),
+}
+
+impl PartialEq<GlmXmlError> for MarkupError {
+    /// A GLM refusal equals its own form, so a caller holding the scan's
+    /// error and one GLM refusal compares them directly.
+    fn eq(&self, other: &GlmXmlError) -> bool {
+        matches!(self, MarkupError::Glm(e) if e == other)
+    }
 }
 
 /// The streaming parser for one chat generation.
@@ -335,6 +434,7 @@ impl ChatParser {
             scan: tools.map(|t| match t {
                 Tools::Dsml => Scan::Dsml(DsmlScan::default()),
                 Tools::GlmXml(types) => Scan::Glm(GlmScan::new(types)),
+                Tools::Hermes => Scan::Hermes(HermesScan::default()),
             }),
             total: Message::default(),
         }
@@ -350,12 +450,12 @@ impl ChatParser {
     }
 
     /// Feeds generated text; returns what may be sent now. For a parser with
-    /// no scan or the DSML scan, which cannot fail; a GLM parser's caller
-    /// uses [`ChatParser::try_push`].
+    /// no scan or the DSML scan, which cannot fail; a GLM or Hermes parser's
+    /// caller uses [`ChatParser::try_push`].
     ///
     /// # Panics
     ///
-    /// On markup a GLM scan refuses, naming it.
+    /// On markup a GLM or Hermes scan refuses, naming it.
     pub fn push(&mut self, text: &str) -> Message {
         self.try_push(text)
             .unwrap_or_else(|e| panic!("ChatParser::push on a scan that failed: {e}"))
@@ -366,7 +466,7 @@ impl ChatParser {
     ///
     /// # Panics
     ///
-    /// On markup a GLM scan refuses, naming it.
+    /// On markup a GLM or Hermes scan refuses, naming it.
     pub fn finish(&mut self) -> Message {
         self.try_finish()
             .unwrap_or_else(|e| panic!("ChatParser::finish on a scan that failed: {e}"))
@@ -374,7 +474,7 @@ impl ChatParser {
 
     /// Feeds generated text; returns what may be sent now, or the tool-call
     /// markup that does not parse.
-    pub fn try_push(&mut self, text: &str) -> Result<Message, GlmXmlError> {
+    pub fn try_push(&mut self, text: &str) -> Result<Message, MarkupError> {
         let split = match &mut self.think {
             Some(t) => t.push(text),
             None => Split {
@@ -386,13 +486,14 @@ impl ChatParser {
             None => None,
             Some(Scan::Dsml(d)) => Some(d.push(&split.content)),
             Some(Scan::Glm(g)) => Some(g.push(&split.content)?),
+            Some(Scan::Hermes(h)) => Some(h.push(&split.content)?),
         };
         Ok(self.emit(split, scanned))
     }
 
     /// Releases everything held at the end of the generation, or names the
     /// tool call still open.
-    pub fn try_finish(&mut self) -> Result<Message, GlmXmlError> {
+    pub fn try_finish(&mut self) -> Result<Message, MarkupError> {
         // An open span's tail is reasoning; the scanner has seen none of it.
         let split = self
             .think
@@ -403,6 +504,7 @@ impl ChatParser {
             None => None,
             Some(Scan::Dsml(d)) => Some(d.finish()),
             Some(Scan::Glm(g)) => Some(g.finish()?),
+            Some(Scan::Hermes(h)) => Some(h.finish()?),
         };
         Ok(self.emit(split, scanned))
     }

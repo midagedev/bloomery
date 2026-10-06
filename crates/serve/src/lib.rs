@@ -16,6 +16,7 @@ pub mod dsml;
 pub mod engine;
 mod genloop;
 pub mod glmxml;
+pub mod hermes;
 mod http;
 pub mod media;
 pub mod mock;

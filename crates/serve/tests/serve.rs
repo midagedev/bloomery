@@ -1873,17 +1873,18 @@ fn hw_tool_schema_keys_keep_the_request_order() {
     );
 }
 
-/// A template whose tool-call markup the server does not parse (Qwen3's
-/// `<tool_call>` JSON) refuses a chat request that asks for tool calls, by
-/// name, instead of returning the calls as `content`; with `tool_choice`
-/// `"none"` or no tools the request runs, and `/apply-template` still renders
-/// the tools.
+/// A template whose tool-call markup the server does not parse (Qwen3.8's
+/// `<function>` tags inside `<tool_call>`; Qwen3's JSON markup is parsed now,
+/// the hermes gate covers it) refuses a chat request that asks for tool
+/// calls, by name, instead of returning the calls as `content`; with
+/// `tool_choice` `"none"` or no tools the request runs, and
+/// `/apply-template` still renders the tools.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_tools_under_an_unparsed_markup_are_refused() {
     let addr = common::start_templated(
         Box::new(serve::MockEngine::new(4096)),
-        include_str!("fixtures/qwen3-chat-template.jinja"),
+        include_str!("fixtures/qwen38-chat-template.jinja"),
     );
     let tools =
         json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);

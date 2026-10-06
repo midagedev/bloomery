@@ -17,7 +17,7 @@ mod common;
 
 use common::post;
 use serde_json::{Map, Value, json};
-use serve::dsml::{ChatParser, Message, ToolCall, ToolFormat, Tools};
+use serve::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
 use serve::glmxml::{ArgTypes, GlmXmlError};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
@@ -287,7 +287,7 @@ fn streamed(
     prompt: &str,
     format: ReasoningFormat,
     pieces: &[&str],
-) -> Result<Message, GlmXmlError> {
+) -> Result<Message, MarkupError> {
     let mut p = ChatParser::with_tools(prompt, format, glm());
     let mut total = Message::default();
     let mut add = |d: Message| {
@@ -381,11 +381,15 @@ fn hw_glm_parse_does_not_depend_on_chunking() {
     let cases = fixtures()
         .into_iter()
         .map(|(name, prompt, format, raw, want)| (name, prompt, format, raw, Ok(want)))
-        .chain(
-            malformed()
-                .into_iter()
-                .map(|(name, raw, e)| (name, ON, ReasoningFormat::Deepseek, raw, Err(e))),
-        );
+        .chain(malformed().into_iter().map(|(name, raw, e)| {
+            (
+                name,
+                ON,
+                ReasoningFormat::Deepseek,
+                raw,
+                Err(MarkupError::from(e)),
+            )
+        }));
     for (name, prompt, format, raw, want) in cases {
         for pieces in every_chunking(raw) {
             assert_eq!(
@@ -453,9 +457,10 @@ fn hw_glm_fixtures_are_the_templates_markup() {
     }
 }
 
-/// The server reads the markup from its template: GLM's for the GLM
-/// template, DSML for V4.1's, none for Qwen3's (its `<tool_call>` JSON has
-/// no parser here).
+/// The server reads the markup from its template's source spellings: GLM's
+/// for the GLM template, DSML for V4.1's; Qwen3's source spells `<tool_call>`
+/// with neither family's other tags, so the source alone names no parser —
+/// its rendered call does, which the hermes gate pins.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_tool_format_follows_the_template() {
